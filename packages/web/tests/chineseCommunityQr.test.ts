@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import {
   CHINESE_COMMUNITY_QR_CONFIG_URL,
+  chineseCommunityQrCropStyle,
   getChineseCommunityQrConfigUrl,
   isChineseCommunityQrExpired,
   normalizeChineseCommunityQrConfig,
@@ -85,4 +86,22 @@ test("Chinese community QR expiry ignores invalid dates and flags past dates", (
 
 test("Chinese community QR config URL defaults to the static assets site", () => {
   assert.equal(getChineseCommunityQrConfigUrl(), CHINESE_COMMUNITY_QR_CONFIG_URL);
+});
+
+test("QR crop uses an explicit square in source pixels and ignores unsafe metadata", () => {
+  const crop = { sourceWidth: 966, sourceHeight: 1518, x: 88, y: 523, size: 790 };
+  const config = normalizeChineseCommunityQrConfig({ imageUrl: "/community/qr.jpg", crop });
+  assert.deepEqual(config?.crop, crop);
+  const style = chineseCommunityQrCropStyle(config?.crop)!;
+  const displayedWidth = 320;
+  // Both axes map source pixels at exactly the same scale, without stretching
+  // QR modules; the configured top-left maps onto the viewport origin.
+  assert.ok(Math.abs(parseFloat(style.width) / 100 * displayedWidth / crop.sourceWidth - displayedWidth / crop.size) < 1e-9);
+  assert.ok(Math.abs(parseFloat(style.height) / 100 * displayedWidth / crop.sourceHeight - displayedWidth / crop.size) < 1e-9);
+  assert.ok(Math.abs(parseFloat(style.left) / 100 * displayedWidth + crop.x * displayedWidth / crop.size) < 1e-9);
+  assert.ok(Math.abs(parseFloat(style.top) / 100 * displayedWidth + crop.y * displayedWidth / crop.size) < 1e-9);
+  assert.equal(chineseCommunityQrCropStyle(undefined), undefined);
+  for (const bad of [{ ...crop, x: -1 }, { ...crop, size: 1000 }, { ...crop, y: NaN }, { ...crop, size: 0 }, { ...crop, sourceWidth: "966" }]) {
+    assert.equal(normalizeChineseCommunityQrConfig({ imageUrl: "/community/qr.jpg", crop: bad })?.crop, undefined);
+  }
 });

@@ -25,7 +25,10 @@ import {
   managedMcpAssignments,
   managedMcpCredentials,
   managedMcpOAuthAttempts,
+  managedMcpPersonalGrants,
   managedMcpServers,
+  serverMembers,
+  users,
 } from "../db/schema";
 import {
   decryptManagedMcpHeaders,
@@ -41,14 +44,9 @@ import {
   validateManagedMcpEndpoint,
 } from "./managedMcpGateway";
 import { recordIntegrationAuditEvent } from "./integrationAuditService";
+import { actorHasServerCapabilityInServer } from "../lib/actorPermissions";
 import { connectionAudienceMatches } from "./managedMcpConnectionAudience";
-import { mcpAgentGrant, mcpAgentGrantAllows, mcpAutoGrantResolver } from "./managedMcpAgentGrant";
-import {
-  MCP_CONNECTION_NOT_USABLE_CALL_MESSAGE,
-  MCP_CONNECTION_NOT_USABLE_MESSAGE,
-  mcpAgentOwnerUserId,
-  mcpConnectionUsableByAgent,
-} from "./managedMcpConnectionOwnership";
+import { mcpAgentGrant, mcpAgentGrantAllows, mcpAutoGrantCoversAgent } from "./managedMcpAgentGrant";
 import {
   postgresConstraintName,
   postgresErrorCode,
@@ -56,13 +54,9 @@ import {
 } from "./managedMcpConnectionCardService";
 import { ManagedMcpOAuthError, withManagedMcpOAuth } from "./managedMcpOAuthService";
 import { findActiveMcpAppTemplate, listMcpAppTemplates } from "./mcpAppTemplates";
-import { mapWithConcurrency } from "../lib/mapWithConcurrency";
 // Cyclic on purpose (the inventory reads this module's catalogue); used only inside functions.
 import { listAgentMcpAppsForIntegrationInventory } from "./managedMcpIntegrationInventory";
 import { notifyMcpConnectionNeedsSignIn } from "./managedMcpSignInNotice";
-
-/** Apps resolved at once when a list asks whether each App's creator may grant it automatically. */
-const MCP_AUTO_GRANT_CONCURRENCY = 4;
 
 export class ManagedMcpServiceError extends Error {
   constructor(
@@ -73,9 +67,23 @@ export class ManagedMcpServiceError extends Error {
       // Also the answer for "exists, but belongs to another App". Deliberately indistinguishable;
       // see `resolveAssignmentBinding`.
       | "managed_mcp_connection_not_found"
-      // The Connection exists in this App but this Agent may not use it: neither the server default
-      // nor created by the Agent's owner (403; see `mcpConnectionUsableByAgent`).
+      // The Connection exists in this App but cannot be pinned: it is a member's personal account
+      // (403; see `resolveAssignmentBinding`).
       | "managed_mcp_connection_not_usable"
+      // Changing which shared Connection an Agent uses (pin, or back to the default) is an admin's
+      // (`manageExternalAuth`) decision (403).
+      | "managed_mcp_pin_forbidden"
+      // RFC 087 (managedMcpPersonalAccounts.ts, managedMcpAccountsService.ts): the Server flag
+      // `mcp_personal_accounts` is off (409); the App doesn't let members connect (403); the person
+      // is not a member who may own one (403); a personal Connection of an API-key App (400).
+      | "managed_mcp_personal_accounts_off"
+      | "managed_mcp_members_cannot_connect"
+      | "managed_mcp_personal_not_member"
+      | "managed_mcp_personal_oauth_only"
+      // Choosing a Connection's agents, or deleting it, by someone it is not theirs to manage (403).
+      | "managed_mcp_connection_forbidden"
+      // A request a Connection's kind does not take, e.g. `allAgents` for a personal one (400).
+      | "managed_mcp_connection_request_invalid"
       | "managed_mcp_assignment_not_found"
       | "managed_mcp_assignment_stale"
       | "managed_mcp_config_stale"
@@ -157,7 +165,65 @@ type UsageRow = {
  * The Connection columns admission and the catalogue read. Never the encrypted secrets: a reader
  * that only needs "is there one" gets `hasSecret`.
  */
-type ConnectionFacts = Pick<CredentialRow, "id" | "mcpServerId" | "isServerDefault" | "createdByUserId" | "authStatus" | "name" | "authorizedEndpointUrl" | "headerNames">;
+type ConnectionFacts = Pick<CredentialRow, "id" | "mcpServerId" | "isServerDefault" | "ownerKind" | "authStatus" | "name" | "authorizedEndpointUrl" | "headerNames">;
+
+/** `ConnectionFacts` as select columns. */
+const connectionFactColumns = {
+  id: managedMcpCredentials.id,
+  mcpServerId: managedMcpCredentials.mcpServerId,
+  isServerDefault: managedMcpCredentials.isServerDefault,
+  ownerKind: managedMcpCredentials.ownerKind,
+  authStatus: managedMcpCredentials.authStatus,
+  name: managedMcpCredentials.name,
+  authorizedEndpointUrl: managedMcpCredentials.authorizedEndpointUrl,
+  headerNames: managedMcpCredentials.headerNames,
+};
+
+/**
+ * A personal grant as admission reads it (RFC 087 §5): the Connection a member gave the Agent, and
+ * whether that member may still act on this Server (a member or above, not a guest, account not
+ * retired). Read in the same query as the grant, so no caller looks membership up per Agent or App.
+ */
+export interface McpPersonalGrantFacts<C extends ConnectionFacts = ConnectionFacts> {
+  connection: C;
+  ownerIsMember: boolean;
+}
+
+const personalOwnerIsMember = sql<boolean>`exists (
+  select 1 from ${serverMembers} join ${users} on ${users.id} = ${serverMembers.userId}
+   where ${serverMembers.serverId} = ${managedMcpCredentials.serverId}
+     and ${serverMembers.userId} = ${managedMcpCredentials.ownerUserId}
+     and ${serverMembers.role} <> 'guest'
+     and ${users.retiredAt} is null
+)`;
+
+/**
+ * The personal grants on this Server, of one Agent or of one App, with their Connection's facts:
+ * one query whatever the number of Agents and Apps.
+ */
+export async function loadPersonalGrants(
+  executor: DatabaseExecutor,
+  serverId: string,
+  scope: { agentId: string; mcpServerId?: undefined } | { agentId?: undefined; mcpServerId: string },
+): Promise<Array<McpPersonalGrantFacts & { agentId: string; mcpServerId: string }>> {
+  const rows = await executor
+    .select({
+      agentId: managedMcpPersonalGrants.agentId,
+      mcpServerId: managedMcpPersonalGrants.mcpServerId,
+      connection: connectionFactColumns,
+      ownerIsMember: personalOwnerIsMember,
+    })
+    .from(managedMcpPersonalGrants)
+    .innerJoin(managedMcpCredentials, eq(managedMcpCredentials.id, managedMcpPersonalGrants.connectionId))
+    .where(and(
+      eq(managedMcpPersonalGrants.serverId, serverId),
+      scope.agentId !== undefined
+        ? eq(managedMcpPersonalGrants.agentId, scope.agentId)
+        : eq(managedMcpPersonalGrants.mcpServerId, scope.mcpServerId),
+    ));
+  return rows.map((row) => ({ ...row, ownerIsMember: row.ownerIsMember === true }));
+}
+
 type CredentialSummary = Pick<CredentialRow, "headerNames"> & (
   | Pick<CredentialRow, "encryptedHeaders" | "encryptedOAuth">
   | { hasSecret: boolean }
@@ -519,6 +585,8 @@ export async function applyMcpAppServerChange(
     ...(keepKeys ? {} : {
       encryptedHeaders: null,
       authStatus: "needs_auth" as const,
+      // The secret is gone, so the Connection acts as nobody until someone signs it in again.
+      signedInByUserId: null,
       // The names stay for the same auth kind, so the UI can ask for the values again.
       ...(authChanged ? { headerNames: [] } : {}),
     }),
@@ -552,14 +620,14 @@ function agentConnectionView(
   connections: { byId: Map<string, ConnectionFacts>; defaultConnection: ConnectionFacts | null },
   includeConnectionName: boolean,
   autoGranted: boolean,
-  agentOwnerUserId: string | null,
+  personalGrant: McpPersonalGrantFacts | null,
 ): ManagedMcpAgentConnectionView {
   // The call path's decision, from the rows this catalogue already loaded.
   const decision = admitFromRows({
     server,
     assignment,
     autoGranted,
-    agentOwnerUserId,
+    personalGrant,
     boundCredential: assignment?.boundConnectionId ? connections.byId.get(assignment.boundConnectionId) ?? null : null,
     defaultCredential: connections.defaultConnection,
   });
@@ -569,11 +637,11 @@ function agentConnectionView(
     : decision.connection.allowed
       ? "ready"
       : decision.used?.authStatus === "expired" ? "authorization_expired" : "login_required";
-  // As the call path judges a pin (`admitFromRows`): this App's own Connection, usable by this Agent.
+  // As the call path judges a pin (`admitFromRows`): this App's own shared Connection.
   // `connections.byId` spans the whole server, so another App's Connection is checked out here too.
   const bound = assignment?.boundConnectionId ? connections.byId.get(assignment.boundConnectionId) ?? null : null;
   const connectionMissing = mode === "pinned"
-    && (bound === null || bound.mcpServerId !== server.id || !mcpConnectionUsableByAgent(bound, agentOwnerUserId));
+    && (bound === null || bound.mcpServerId !== server.id || bound.ownerKind !== "shared");
   return {
     mode,
     status,
@@ -594,9 +662,7 @@ export async function listAgentManagedMcpCatalog(
   } = {},
 ): Promise<ManagedMcpAgentCatalogResponse> {
   const agent = options.agent ?? await requireAgent(serverId, agentId);
-  const agentOwnerUserId = mcpAgentOwnerUserId(agent);
-  const autoGranted = mcpAutoGrantResolver(getDb(), serverId, agent);
-  const [rows, credentialRows, usageRows] = await Promise.all([
+  const [rows, credentialRows, usageRows, personalGrants] = await Promise.all([
     getDb()
       .select({
         server: managedMcpServers,
@@ -617,14 +683,7 @@ export async function listAgentManagedMcpCatalog(
     // Only what admission and the view read; the encrypted secrets are never selected here.
     getDb()
       .select({
-        id: managedMcpCredentials.id,
-        mcpServerId: managedMcpCredentials.mcpServerId,
-        isServerDefault: managedMcpCredentials.isServerDefault,
-        createdByUserId: managedMcpCredentials.createdByUserId,
-        authStatus: managedMcpCredentials.authStatus,
-        name: managedMcpCredentials.name,
-        authorizedEndpointUrl: managedMcpCredentials.authorizedEndpointUrl,
-        headerNames: managedMcpCredentials.headerNames,
+        ...connectionFactColumns,
         hasSecret: sql<boolean>`(${managedMcpCredentials.encryptedHeaders} IS NOT NULL OR ${managedMcpCredentials.encryptedOAuth} IS NOT NULL)`,
       })
       .from(managedMcpCredentials)
@@ -649,7 +708,9 @@ export async function listAgentManagedMcpCatalog(
         eq(integrationAuditEvents.targetType, "managed_mcp_server"),
       ))
       .groupBy(integrationAuditEvents.targetId),
+    loadPersonalGrants(getDb(), serverId, { agentId }),
   ]);
+  const personalGrantByMcpServerId = new Map(personalGrants.map((grant) => [grant.mcpServerId, grant]));
   const credentialById = new Map(credentialRows.map((credential) => [credential.id, credential]));
   const credentialByMcpServerId = new Map<string, typeof credentialRows[number]>();
   for (const credential of credentialRows) {
@@ -672,9 +733,8 @@ export async function listAgentManagedMcpCatalog(
     });
   }
   return {
-    // Each row may ask whether its App's creator can manage external auth (one query per creator,
-    // memoized by the resolver): bounded so a server with many Apps never borrows the whole pool.
-    servers: await mapWithConcurrency(rows, MCP_AUTO_GRANT_CONCURRENCY, async (row) => {
+    // The automatic grant reads only the App row (its vouch and creator): no query per App.
+    servers: rows.map((row) => {
       const defaultConnection = credentialByMcpServerId.get(row.server.id) ?? null;
       return {
         ...serializeServer(row.server, row.assignment, defaultConnection, usageByMcpServerId.get(row.server.id) ?? null),
@@ -685,8 +745,8 @@ export async function listAgentManagedMcpCatalog(
           row.assignment,
           { byId: credentialById, defaultConnection },
           options.includeConnectionNames === true,
-          await autoGranted(row.server),
-          agentOwnerUserId,
+          mcpAutoGrantCoversAgent(row.server, agent),
+          personalGrantByMcpServerId.get(row.server.id) ?? null,
         ),
       };
     }),
@@ -712,6 +772,56 @@ export async function listManagedMcpServerCatalog(serverId: string): Promise<Man
   };
 }
 
+export type McpServerVouchReason = "created_by_admin" | "vouched" | "unvouched";
+
+/** `app.server_vouched` / `app.server_unvouched` for an MCP App, by a person, in the caller's transaction. */
+export async function recordMcpServerVouchEvent(
+  tx: DatabaseExecutor,
+  app: Pick<ServerRow, "id" | "serverId" | "name">,
+  actorUserId: string,
+  vouched: boolean,
+  reason: McpServerVouchReason,
+): Promise<void> {
+  await recordIntegrationAuditEvent({
+    serverId: app.serverId,
+    eventType: vouched ? "app.server_vouched" : "app.server_unvouched",
+    outcome: "success",
+    source: "web",
+    actor: { type: "human", id: actorUserId },
+    subject: { type: "app", id: app.id },
+    // As every MCP audit row names the App (no oauth_clients row, so no client_id).
+    target: { type: "managed_mcp_server", id: app.id },
+    metadata: { appName: app.name, reason },
+  }, tx);
+}
+
+/**
+ * The vouch columns of a new MCP App: set when its creator is a person in their own session
+ * (`vouchAsCreator`: the route decides, `isPersonsOwnSession`) who holds manageExternalAuth on
+ * the Server now, read in the creating transaction. Nothing otherwise: a member's App reaches only
+ * their own Agents until an owner or admin vouches for it.
+ */
+async function vouchAtCreation(tx: DatabaseExecutor, serverId: string, userId: string, vouchAsCreator: boolean | undefined) {
+  if (vouchAsCreator !== true) return null;
+  if (!await actorHasServerCapabilityInServer(serverId, "user", userId, "manageExternalAuth", tx)) return null;
+  return { serverVouchedAt: sql`now()`, serverVouchedByUserId: userId };
+}
+
+/**
+ * Inserts a new MCP App row (both create paths), vouched for and audited when `vouchAsCreator`
+ * holds (`vouchAtCreation`), in the caller's transaction.
+ */
+export async function insertMcpAppRow(
+  tx: DatabaseExecutor,
+  values: typeof managedMcpServers.$inferInsert & { createdByUserId: string },
+  vouchAsCreator: boolean | undefined,
+): Promise<ServerRow> {
+  const vouch = await vouchAtCreation(tx, values.serverId, values.createdByUserId, vouchAsCreator);
+  const [row] = await tx.insert(managedMcpServers).values({ ...values, ...(vouch ?? {}) }).returning();
+  if (vouch) await recordMcpServerVouchEvent(tx, row, values.createdByUserId, true, "created_by_admin");
+  return row;
+}
+
 export async function createManagedMcpServer(input: {
   serverId: string;
   userId: string;
@@ -722,12 +832,17 @@ export async function createManagedMcpServer(input: {
   endpointUrl: string;
   enabled?: boolean;
   headers?: Record<string, string>;
+  /**
+   * The creator is a person in their own session (POST /api/mcp/servers): the App is vouched for
+   * (`server_vouched_at`) when they hold manageExternalAuth on the Server now.
+   */
+  vouchAsCreator?: boolean;
 }): Promise<ManagedMcpServerView> {
   const provider = input.provider ?? "custom";
   const authMode = input.authMode ?? (input.headers === undefined ? "none" : "headers");
   const { endpointUrl, preparedHeaders } = await normalizeConnection({ ...input, provider, authMode });
   const result = await getDb().transaction(async (tx) => {
-    const [row] = await tx.insert(managedMcpServers).values({
+    const row = await insertMcpAppRow(tx, {
       serverId: input.serverId,
       name: input.name,
       description: input.description ?? null,
@@ -738,13 +853,15 @@ export async function createManagedMcpServer(input: {
       enabled: input.enabled ?? true,
       createdByUserId: input.userId,
       updatedByUserId: input.userId,
-    }).returning();
+    }, input.vouchAsCreator);
     const credential = authMode === "none" ? null : (await tx.insert(managedMcpCredentials).values({
       serverId: input.serverId,
       mcpServerId: row.id,
       ...(preparedHeaders ?? {}),
       ...newConnectionFields({ authMode, name: row.name, userId: input.userId }),
       ...(authMode === "headers" ? { authorizedEndpointUrl: endpointUrl } : {}),
+      // API-key values saved now act as whoever saved them; an OAuth one is signed in later.
+      ...(preparedHeaders?.encryptedHeaders ? { signedInByUserId: input.userId } : {}),
     }).returning())[0];
     return { row, credential };
   }).catch(rethrowIfMcpAppNameTaken);
@@ -867,6 +984,7 @@ export async function updateManagedMcpServer(input: {
           ...audience,
           authKind: "headers",
           authStatus: "ready",
+          signedInByUserId: preparedHeaders.encryptedHeaders ? input.userId : null,
           lastError: null,
           credentialVersion: sql`${managedMcpCredentials.credentialVersion} + 1`,
           updatedAt: currentDate(),
@@ -878,6 +996,7 @@ export async function updateManagedMcpServer(input: {
           ...(preparedHeaders ?? {}),
           ...newConnectionFields({ authMode: connectionAuthKind, name: row.name, userId: input.userId }),
           ...audience,
+          ...(preparedHeaders?.encryptedHeaders ? { signedInByUserId: input.userId } : {}),
         }).returning();
       }
     }
@@ -984,6 +1103,10 @@ export async function __refreshManagedMcpCatalogWithLoaderForTest(
   return refreshManagedMcpCatalogWithLoader(serverId, mcpServerId, loader);
 }
 
+/** Refusing a pin to a member's personal Connection (`managed_mcp_connection_not_usable`). */
+export const MCP_CONNECTION_NOT_PINNABLE_MESSAGE =
+  "This Connection is a member's own account. An agent can be pinned only to a shared Connection.";
+
 /**
  * Resolves which Connection an Agent should use, from what the caller asked for.
  *
@@ -993,23 +1116,22 @@ export async function __refreshManagedMcpCatalogWithLoaderForTest(
  * ⚠️ A Connection that does not exist and one that belongs to another App produce the IDENTICAL
  * error, so the response cannot be used to probe ids. Same stance as `resolveMcpCallOrigin`.
  *
- * A pin must also name a Connection this Agent may use: the App's server default, or one the Agent's
- * OWNER created (`mcpConnectionUsableByAgent`). Anything else is refused with
- * `managed_mcp_connection_not_usable`, so managing an Agent never lets someone act with another
- * person's account. Following the default (`null`) is always allowed.
+ * A pin names a SHARED Connection (RFC 087 §4: "only these agents" for a shared account is the set
+ * of Agents pinned to it), whoever created it. A member's personal Connection is given to Agents by
+ * its owner through a personal grant, never pinned: refused with `managed_mcp_connection_not_usable`.
+ * Who may pin at all (admins, `manageExternalAuth`) is the route's check, under its membership
+ * fence. Following the default (`null`) is always allowed.
  */
 async function resolveAssignmentBinding(input: {
   serverId: string;
   mcpServerId: string;
   connectionId: string | null | undefined;
-  /** `mcpAgentOwnerUserId` of the Agent being bound; required so no caller can skip the check. */
-  agentOwnerUserId: string | null;
   db: DatabaseExecutor;
 }): Promise<{ connectionMode: "default" | "pinned"; boundConnectionId: string | null } | null> {
   if (input.connectionId === undefined) return null;
   if (input.connectionId === null) return { connectionMode: "default", boundConnectionId: null };
   const [credential] = await input.db
-    .select({ id: managedMcpCredentials.id, isServerDefault: managedMcpCredentials.isServerDefault, createdByUserId: managedMcpCredentials.createdByUserId })
+    .select({ id: managedMcpCredentials.id, ownerKind: managedMcpCredentials.ownerKind })
     .from(managedMcpCredentials)
     .where(and(
       eq(managedMcpCredentials.id, input.connectionId),
@@ -1020,8 +1142,8 @@ async function resolveAssignmentBinding(input: {
   if (!credential) {
     throw new ManagedMcpServiceError("MCP connection not found", "managed_mcp_connection_not_found");
   }
-  if (!mcpConnectionUsableByAgent(credential, input.agentOwnerUserId)) {
-    throw new ManagedMcpServiceError(MCP_CONNECTION_NOT_USABLE_MESSAGE, "managed_mcp_connection_not_usable");
+  if (credential.ownerKind !== "shared") {
+    throw new ManagedMcpServiceError(MCP_CONNECTION_NOT_PINNABLE_MESSAGE, "managed_mcp_connection_not_usable");
   }
   return { connectionMode: "pinned", boundConnectionId: credential.id };
 }
@@ -1054,7 +1176,6 @@ export async function setManagedMcpAssignment(input: {
     serverId: input.serverId,
     mcpServerId: input.mcpServerId,
     connectionId: input.connectionId,
-    agentOwnerUserId: mcpAgentOwnerUserId(agent),
     db,
   });
   // Granting needs no usable Connection (yezizp, #wg-mcp b3f9feed 1): the Agent is offered the
@@ -1063,7 +1184,7 @@ export async function setManagedMcpAssignment(input: {
   const current = await currentAssignment(db, input);
   // A first row written without `enabled` keeps what the Agent had: the automatic grant decides.
   const enabledForNewRow = input.enabled
-    ?? (current ? current.enabled : await mcpAutoGrantResolver(db, input.serverId, agent)(server));
+    ?? (current ? current.enabled : mcpAutoGrantCoversAgent(server, agent));
   // The upsert is the authority write; with an executor it joins the caller's fenced transaction.
   const [assignment] = await db.insert(managedMcpAssignments).values({
     serverId: input.serverId,
@@ -1137,7 +1258,6 @@ export async function writeManagedMcpAssignments(input: {
 }, options: { executor?: DatabaseExecutor; closedCards?: string[] } = {}): Promise<void> {
   const db = options.executor ?? getDb();
   const agent = await requireAgent(input.serverId, input.agentId, db);
-  const autoGranted = mcpAutoGrantResolver(db, input.serverId, agent);
   const uniqueIds = new Set(input.assignments.map((assignment) => assignment.mcpServerId));
   if (uniqueIds.size !== input.assignments.length) {
     throw new ManagedMcpServiceError("MCP assignment updates must be unique", "managed_mcp_assignment_stale");
@@ -1163,7 +1283,6 @@ export async function writeManagedMcpAssignments(input: {
         serverId: input.serverId,
         mcpServerId: assignment.mcpServerId,
         connectionId: assignment.connectionId,
-        agentOwnerUserId: mcpAgentOwnerUserId(agent),
         db: tx,
       });
       const current = await currentAssignment(tx, { agentId: input.agentId, mcpServerId: assignment.mcpServerId });
@@ -1171,7 +1290,7 @@ export async function writeManagedMcpAssignments(input: {
         serverId: input.serverId,
         agentId: input.agentId,
         mcpServerId: assignment.mcpServerId,
-        enabled: assignment.enabled ?? (current ? current.enabled : await autoGranted(servers[index])),
+        enabled: assignment.enabled ?? (current ? current.enabled : mcpAutoGrantCoversAgent(servers[index], agent)),
         allowedTools: assignment.allowedTools ?? null,
         ...(binding ?? {}),
         updatedByUserId: input.userId,
@@ -1361,7 +1480,7 @@ function listToolsResult(server: ServerRow, assignment: AssignmentRow | null): M
 
 export async function getManagedMcpRuntimeSnapshot(serverId: string, agentId: string): Promise<ManagedMcpRuntimeSnapshot> {
   const agent = await requireAgent(serverId, agentId);
-  const autoGranted = mcpAutoGrantResolver(getDb(), serverId, agent);
+  const personalGrantByMcpServerId = new Map((await loadPersonalGrants(getDb(), serverId, { agentId })).map((grant) => [grant.mcpServerId, grant]));
   const rows = await getDb().select({ server: managedMcpServers, assignment: managedMcpAssignments })
     .from(managedMcpServers)
     .leftJoin(managedMcpAssignments, and(
@@ -1374,40 +1493,32 @@ export async function getManagedMcpRuntimeSnapshot(serverId: string, agentId: st
       eq(managedMcpServers.enabled, true),
     ))
     .orderBy(asc(managedMcpServers.name));
-  // Not granted to this Agent (revoked, or never granted automatically): no tools at all.
-  const granted = await mapWithConcurrency(rows, MCP_AUTO_GRANT_CONCURRENCY, async ({ server, assignment }) => (
-    mcpAgentGrantAllows(mcpAgentGrant(assignment, await autoGranted(server)))
-  ));
+  // Not granted to this Agent (revoked, or never granted automatically or by a person, a member's
+  // personal grant included): no tools at all. The same decision as the call path (`admitFromRows`).
+  const decisionInputs = rows.map(({ server, assignment }) => ({
+    server,
+    assignment,
+    autoGranted: mcpAutoGrantCoversAgent(server, agent),
+    personalGrant: personalGrantByMcpServerId.get(server.id) ?? null,
+  }));
+  const granted = decisionInputs.map((input) => mcpAgentGrantAllows(admitFromRows({ ...input, boundCredential: null, defaultCredential: null }).grant));
   // An App this Agent has but cannot use yet (no usable Connection: never signed in, signing in,
   // expired, or the OAuth sign-in dropped) is ALSO listed apart, so an agent that reads this list
   // (raft-sdk) can tell the user it needs (re)connecting instead of acting as if it were never set
   // up. Its tools stay offered below: a call is what raises the Connect card. Judged by the call
   // path's own rule (`admitFromRows`), from the Connections loaded once for the whole snapshot.
-  const needsConnection = rows.filter(({ server }, index) => granted[index] && server.authMode !== "none");
+  const needsConnection = decisionInputs.filter(({ server }, index) => granted[index] && server.authMode !== "none");
   const connectionRows = needsConnection.length === 0 ? [] : await getDb()
-    .select({
-      id: managedMcpCredentials.id,
-      mcpServerId: managedMcpCredentials.mcpServerId,
-      isServerDefault: managedMcpCredentials.isServerDefault,
-      createdByUserId: managedMcpCredentials.createdByUserId,
-      authStatus: managedMcpCredentials.authStatus,
-      name: managedMcpCredentials.name,
-      authorizedEndpointUrl: managedMcpCredentials.authorizedEndpointUrl,
-      headerNames: managedMcpCredentials.headerNames,
-    })
+    .select(connectionFactColumns)
     .from(managedMcpCredentials)
     .where(eq(managedMcpCredentials.serverId, serverId));
-  const agentOwnerUserId = mcpAgentOwnerUserId(agent);
   const connectionById = new Map(connectionRows.map((row) => [row.id, row]));
   const unavailable = needsConnection
-    .filter(({ server, assignment }) => {
+    .filter((input) => {
       const decision = admitFromRows({
-        server,
-        assignment,
-        autoGranted: true,
-        agentOwnerUserId,
-        boundCredential: assignment?.boundConnectionId ? connectionById.get(assignment.boundConnectionId) ?? null : null,
-        defaultCredential: connectionRows.find((row) => row.mcpServerId === server.id && row.isServerDefault) ?? null,
+        ...input,
+        boundCredential: input.assignment?.boundConnectionId ? connectionById.get(input.assignment.boundConnectionId) ?? null : null,
+        defaultCredential: connectionRows.find((row) => row.mcpServerId === input.server.id && row.isServerDefault) ?? null,
       });
       return decision.block === null && !decision.connection.allowed;
     })
@@ -1439,56 +1550,60 @@ export async function getManagedMcpRuntimeSnapshot(serverId: string, agentId: st
 
 
 /**
- * Which Connection, if any, an Agent's MCP call may use. One rule for every MCP App.
+ * Which Connection, if any, an Agent's MCP call may use. One rule for every MCP App (RFC 087 §5).
  *
- * Inputs are already narrowed to THIS App: `boundCredential` is the Connection the Agent is pinned
- * to (looked up by id and scoped to this App, null if it no longer exists), and `defaultCredential`
- * is the App's server default. The caller must send exactly the credential this names and no other.
+ * Inputs are already narrowed to THIS App: `personal` is the member's Connection given to this Agent
+ * (a personal grant), `boundCredential` the shared Connection the Agent is pinned to (looked up by id
+ * and scoped to this App, null if it no longer exists), and `defaultCredential` the App's server
+ * default. The caller must send exactly the credential this names and no other.
  *
- *   no assignment row          → follow the default (the long-standing "every Agent inherits")
- *   assignment, enabled=false  → off; refused before this function (managed_mcp_app_off)
- *   connection_mode 'default'  → the server default; none means login_required
- *   connection_mode 'pinned'   → that Connection; gone means login_required, and so does one this
- *                                Agent may not use (`mcpConnectionUsableByAgent`: not the server
- *                                default and not created by the Agent's owner), with `detail`
- *                                `not_usable` so the refusal can say what to do
+ * Whether the Agent has the App at all (an explicit off, never granted) is decided before this
+ * function (`admitFromRows`: managed_mcp_app_off). Then:
  *
- * The rule with teeth: a pin whose Connection was deleted, or may not be used by this Agent, does
- * NOT fall back to the server default. Falling back would silently re-grant, through another
- * credential, access that was deliberately scoped. Every denial is the same `login_required`, so
- * nothing here tells a caller whether a Connection exists.
+ *   1. personal grant, Connection ready, authorized for this endpoint, its owner still a member
+ *      (not a guest) of the Server            → that Connection (`accountKind: 'personal'`)
+ *   2. otherwise the admin layer, only for an Agent that holds the App apart from the personal
+ *      grant (`sharedAccess`):
+ *      connection_mode 'pinned'               → the bound shared Connection, or nothing
+ *      no assignment row / 'default'          → the server default
+ *   3. nothing usable                         → login_required (the Connect card)
+ *
+ * The rule with teeth: a pin whose Connection was deleted (or is not a shared Connection of this
+ * App) does NOT fall back to the server default. A pin is an admin's deliberate narrowing; falling
+ * back would silently re-grant, through another credential, access nobody chose. A personal grant
+ * DOES fall back, because the shared account below it is one the admins already gave this Agent;
+ * an Agent that has the App only through the personal grant has no shared account to fall back to.
+ * Every denial is the same `login_required`, so nothing here tells a caller whether a Connection
+ * exists.
  *
  * An App whose auth mode is `none` needs no Connection: it is admitted with `credentialId: null`.
  */
+export type McpAccountKind = "personal" | "shared";
+
 type ManagedMcpAdmission =
-  | { allowed: true; credentialId: string | null }
-  | {
-    allowed: false;
-    reason: "login_required";
-    /** `not_usable`: the pinned Connection exists but belongs to someone other than the Agent's owner. */
-    detail?: "not_usable";
-  };
+  | { allowed: true; credentialId: null; accountKind: null }
+  /** `accountKind`: whose account the call acts as (RFC 087 §8; surfaced on the call by a later change). */
+  | { allowed: true; credentialId: string; accountKind: McpAccountKind }
+  | { allowed: false; reason: "login_required" };
 
 type AdmissionConnection = {
   id: string;
   authStatus: string;
   isServerDefault: boolean;
-  /** Who signed it in; null when unknown (usable only as the server default). */
-  createdByUserId: string | null;
+  ownerKind: McpAccountKind;
   /** `connectionAudienceMatches`: false when the secret was recorded for another server. */
   audienceMatches?: boolean;
 };
 
 export function admitManagedMcpCall(input: {
   requiresCredential: boolean;
+  /** The member's Connection given to this Agent, and whether its owner may still act on this Server. */
+  personal: (AdmissionConnection & { ownerIsMember: boolean }) | null;
+  /** The Agent holds the App through the admin layer (granted automatically or by an enabled row), not only through `personal`. */
+  sharedAccess: boolean;
   assignment: { connectionMode: "default" | "pinned"; boundConnectionId: string | null } | null;
   boundCredential: AdmissionConnection | null;
   defaultCredential: AdmissionConnection | null;
-  /**
-   * The Agent's owner (`mcpAgentOwnerUserId`); null when it has none. Required, so every caller says
-   * whose Agent this is: a pinned Connection is admitted only if this Agent may use it.
-   */
-  agentOwnerUserId: string | null;
   /**
    * For an OAuth App: `server.oauth_status === 'connected'`, the mirror of its default Connection
    * that older binaries maintain. Only consulted when the admitted Connection IS the default, so a
@@ -1497,23 +1612,21 @@ export function admitManagedMcpCall(input: {
   appOAuthConnected?: boolean;
 }): ManagedMcpAdmission {
   const deny = { allowed: false, reason: "login_required" } as const;
-  if (!input.requiresCredential) return { allowed: true, credentialId: null };
+  if (!input.requiresCredential) return { allowed: true, credentialId: null, accountKind: null };
+  // Waiting for sign-in, expired, or authorized for a different server than the App now points at.
+  const usable = (connection: AdmissionConnection) => connection.authStatus === "ready" && connection.audienceMatches !== false;
+  const { personal } = input;
+  if (personal && personal.ownerKind === "personal" && personal.ownerIsMember && usable(personal)) {
+    return { allowed: true, credentialId: personal.id, accountKind: "personal" };
+  }
+  if (!input.sharedAccess) return deny;
   const pinned = input.assignment?.connectionMode === "pinned";
   const connection = pinned
     ? (input.assignment?.boundConnectionId ? input.boundCredential : null)
     : input.defaultCredential;
-  if (!connection) return deny;
-  // Someone else's Connection: refused before its state is looked at (signing it in again would not
-  // help), and never replaced by the default.
-  if (pinned && !mcpConnectionUsableByAgent(connection, input.agentOwnerUserId)) {
-    return { ...deny, detail: "not_usable" };
-  }
-  // A Connection that is waiting for sign-in, or whose sign-in expired, cannot be used yet.
-  if (connection.authStatus !== "ready") return deny;
-  // Authorized for a different server than the App now points at: never send that secret.
-  if (connection.audienceMatches === false) return deny;
+  if (!connection || connection.ownerKind !== "shared" || !usable(connection)) return deny;
   if (connection.isServerDefault && input.appOAuthConnected === false) return deny;
-  return { allowed: true, credentialId: connection.id };
+  return { allowed: true, credentialId: connection.id, accountKind: "shared" };
 }
 
 /**
@@ -1533,14 +1646,14 @@ export function managedMcpServerCallBlock(
   return null;
 }
 
-/** What admission reads from one App, one assignment row and the Connections it names. */
+/** What admission reads from one App, one assignment row, one personal grant and the Connections they name. */
 export interface McpAdmissionRows<C extends ConnectionFacts = ConnectionFacts> {
   server: Pick<ServerRow, "id" | "enabled" | "authMode" | "oauthStatus" | "endpointUrl">;
   assignment: Pick<AssignmentRow, "enabled" | "connectionMode" | "boundConnectionId"> | null;
-  /** `mcpAutoGrantResolver` for this Agent and App. */
+  /** `mcpAutoGrantCoversAgent` for this Agent and App. */
   autoGranted: boolean;
-  /** `mcpAgentOwnerUserId` of this Agent (null: it has no owner, so only the default is usable). */
-  agentOwnerUserId: string | null;
+  /** This Agent's personal grant for the App, as loaded (its Connection is scoped here). */
+  personalGrant: McpPersonalGrantFacts<C> | null;
   /** The row named by `boundConnectionId`, as looked up (it may belong to another App; it is scoped here). */
   boundCredential: C | null;
   /** The App's server-default Connection. */
@@ -1553,19 +1666,28 @@ export interface McpAdmissionDecision<C extends ConnectionFacts = ConnectionFact
   grant: ManagedMcpAgentGrant;
   /** Whether the Connection this Agent would use is admitted, judged even when `block` is set. */
   connection: ReturnType<typeof admitManagedMcpCall>;
-  /** That Connection (scoped to this App), or null. */
+  /** That Connection (scoped to this App), or the one a refusal is about; null when there is none. */
   used: C | null;
 }
 
 /**
  * THE admission decision, from rows already loaded. Pure, so the call path (`executeManagedMcpCall`),
- * `isMcpConnectionAuthorized` and an Agent's catalogue (`agentConnectionView`) cannot disagree: each
- * loads the rows its own way and asks this. Order: a disabled App, then the grant (revoked / never
- * granted), then the Connection (pin scoped to this App, its audience, the OAuth mirror).
+ * `isMcpConnectionAuthorized`, the runtime snapshot and an Agent's catalogue (`agentConnectionView`)
+ * cannot disagree: each loads the rows its own way and asks this. Order: a disabled App, then the
+ * grant (revoked / never granted; a member's personal grant counts, an explicit off beats it), then
+ * the Connection (`admitManagedMcpCall`).
  */
 export function admitFromRows<C extends ConnectionFacts>(input: McpAdmissionRows<C>): McpAdmissionDecision<C> {
   const { server, assignment } = input;
-  const grant = mcpAgentGrant(assignment, input.autoGranted);
+  const requiresCredential = server.authMode !== "none";
+  // A personal grant counts only for an App that has accounts, with a personal Connection of this
+  // App (the table's trigger guarantees it; checked again here) whose owner is still a member.
+  const personalGrant = requiresCredential && input.personalGrant?.connection.mcpServerId === server.id
+    && input.personalGrant.connection.ownerKind === "personal"
+    ? input.personalGrant
+    : null;
+  const grant = mcpAgentGrant(assignment, input.autoGranted, personalGrant?.ownerIsMember === true);
+  const sharedAccess = mcpAgentGrantAllows(mcpAgentGrant(assignment, input.autoGranted, false));
   const pinned = assignment?.connectionMode === "pinned";
   // A bound id from another App is not this App's Connection: refused, never followed.
   const boundCredential = pinned && assignment?.boundConnectionId && input.boundCredential?.mcpServerId === server.id
@@ -1577,11 +1699,12 @@ export function admitFromRows<C extends ConnectionFacts>(input: McpAdmissionRows
     : null;
   const judged = (row: C | null) => row && { ...row, audienceMatches: connectionAudienceMatches(row, server) };
   const connection = admitManagedMcpCall({
-    requiresCredential: server.authMode !== "none",
+    requiresCredential,
+    personal: personalGrant && { ...judged(personalGrant.connection)!, ownerIsMember: personalGrant.ownerIsMember },
+    sharedAccess,
     assignment: assignment ? { connectionMode: assignment.connectionMode, boundConnectionId: assignment.boundConnectionId } : null,
     boundCredential: judged(boundCredential),
     defaultCredential: judged(defaultCredential),
-    agentOwnerUserId: input.agentOwnerUserId,
     ...(server.authMode === "oauth" ? { appOAuthConnected: server.oauthStatus === "connected" } : {}),
   });
   const serverBlock = managedMcpServerCallBlock(server);
@@ -1592,35 +1715,55 @@ export function admitFromRows<C extends ConnectionFacts>(input: McpAdmissionRows
       : grant === "not_granted"
         ? { code: "managed_mcp_app_off" as const, message: "This MCP App is not granted to this agent" }
         : null;
-  return { block, grant, connection, used: server.authMode === "none" ? null : pinned ? boundCredential : defaultCredential };
+  const adminLayer = pinned ? boundCredential : defaultCredential;
+  const used = !requiresCredential
+    ? null
+    : connection.allowed
+      ? connection.accountKind === "personal" ? personalGrant!.connection : adminLayer
+      // Refused: the shared account it fell back to, else the personal one it could not use.
+      : (sharedAccess ? adminLayer : null) ?? (personalGrant?.ownerIsMember ? personalGrant.connection : null);
+  return { block, grant, connection, used };
 }
 
 /**
- * Loads the Connections admission needs (scoped to this App) and runs `admitManagedMcpCall`.
+ * Loads the rows admission needs (scoped to this App and Agent) and runs `admitFromRows`.
  * The ONLY place the call path and `isMcpConnectionAuthorized` get their answer from, so the
  * "would the runtime admit this now?" question cannot be answered two ways.
  */
 async function admitWithConnections(
   executor: DatabaseExecutor,
   serverId: string,
+  agentId: string,
   server: McpAdmissionRows["server"],
   assignment: Pick<AssignmentRow, "enabled" | "connectionMode" | "boundConnectionId"> | null,
   autoGranted: boolean,
-  agentOwnerUserId: string | null,
-): Promise<McpAdmissionDecision<CredentialRow> & { boundCredential: CredentialRow | null; defaultCredential: CredentialRow | null }> {
+): Promise<McpAdmissionDecision<CredentialRow> & { credentials: CredentialRow[] }> {
   const pinned = assignment?.connectionMode === "pinned";
-  const boundCredential = pinned && assignment?.boundConnectionId
-    ? (await executor.select().from(managedMcpCredentials).where(and(
-        eq(managedMcpCredentials.id, assignment.boundConnectionId),
-        eq(managedMcpCredentials.serverId, serverId),
-        eq(managedMcpCredentials.mcpServerId, server.id),
-      )).limit(1))[0] ?? null
-    : null;
-  const defaultCredential = pinned ? null : await loadDefaultConnection(serverId, server.id, executor);
+  const [boundCredential, defaultCredential, personalGrant] = await Promise.all([
+    pinned && assignment?.boundConnectionId
+      ? executor.select().from(managedMcpCredentials).where(and(
+          eq(managedMcpCredentials.id, assignment.boundConnectionId),
+          eq(managedMcpCredentials.serverId, serverId),
+          eq(managedMcpCredentials.mcpServerId, server.id),
+        )).limit(1).then((rows) => rows[0] ?? null)
+      : null,
+    pinned ? null : loadDefaultConnection(serverId, server.id, executor),
+    // The grant, its whole Connection (the call sends its secret) and its owner's membership: one read.
+    executor
+      .select({ connection: managedMcpCredentials, ownerIsMember: personalOwnerIsMember })
+      .from(managedMcpPersonalGrants)
+      .innerJoin(managedMcpCredentials, eq(managedMcpCredentials.id, managedMcpPersonalGrants.connectionId))
+      .where(and(
+        eq(managedMcpPersonalGrants.serverId, serverId),
+        eq(managedMcpPersonalGrants.agentId, agentId),
+        eq(managedMcpPersonalGrants.mcpServerId, server.id),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ? { connection: rows[0].connection, ownerIsMember: rows[0].ownerIsMember === true } : null),
+  ]);
   return {
-    ...admitFromRows({ server, assignment, autoGranted, agentOwnerUserId, boundCredential, defaultCredential }),
-    boundCredential,
-    defaultCredential,
+    ...admitFromRows({ server, assignment, autoGranted, personalGrant, boundCredential, defaultCredential }),
+    credentials: [personalGrant?.connection, boundCredential, defaultCredential].filter((row): row is CredentialRow => row != null),
   };
 }
 
@@ -1654,17 +1797,34 @@ export async function admittedMcpConnectionId(
   return admission.authorized ? admission.credentialId : null;
 }
 
+/**
+ * The account this Agent's calls to the App are admitted with right now (RFC 087 §5: its personal
+ * grant first, then its shared pin or the default), or null when they are refused or the App needs
+ * no Connection. Same decision as `isMcpConnectionAuthorized`; for the Connect card's "Uses …".
+ */
+export async function admittedMcpAccount(
+  executor: DatabaseExecutor,
+  serverId: string,
+  agentId: string,
+  mcpServerId: string,
+): Promise<{ connectionId: string; kind: McpAccountKind } | null> {
+  const admission = await agentMcpAdmission(executor, serverId, agentId, mcpServerId);
+  return admission.authorized && admission.credentialId && admission.accountKind
+    ? { connectionId: admission.credentialId, kind: admission.accountKind }
+    : null;
+}
+
 async function agentMcpAdmission(
   executor: DatabaseExecutor,
   serverId: string,
   agentId: string,
   mcpServerId: string,
-): Promise<{ authorized: boolean; credentialId: string | null }> {
+): Promise<{ authorized: boolean; credentialId: string | null; accountKind: McpAccountKind | null }> {
   const [row] = await executor
     .select({
       server: managedMcpServers,
       assignment: managedMcpAssignments,
-      agent: { creatorType: agents.creatorType, creatorId: agents.creatorId, assistantOwnerUserId: agents.assistantOwnerUserId },
+      agent: { creatorType: agents.creatorType, creatorId: agents.creatorId },
     })
     .from(managedMcpServers)
     .innerJoin(agents, and(eq(agents.id, agentId), eq(agents.serverId, serverId)))
@@ -1675,13 +1835,15 @@ async function agentMcpAdmission(
     ))
     .where(and(eq(managedMcpServers.id, mcpServerId), eq(managedMcpServers.serverId, serverId)))
     .limit(1);
-  if (!row) return { authorized: false, credentialId: null };
+  if (!row) return { authorized: false, credentialId: null, accountKind: null };
   // The call path's own decision (`admitFromRows`): a disabled App, a revoked or never-granted App,
   // and a Connection problem all mean "not authorized".
-  const autoGranted = await mcpAutoGrantResolver(executor, serverId, row.agent)(row.server);
-  const decision = await admitWithConnections(executor, serverId, row.server, row.assignment, autoGranted, mcpAgentOwnerUserId(row.agent));
+  const autoGranted = mcpAutoGrantCoversAgent(row.server, row.agent);
+  const decision = await admitWithConnections(executor, serverId, agentId, row.server, row.assignment, autoGranted);
   const authorized = decision.block === null && decision.connection.allowed;
-  return { authorized, credentialId: decision.connection.allowed ? decision.connection.credentialId : null };
+  return decision.connection.allowed
+    ? { authorized, credentialId: decision.connection.credentialId, accountKind: decision.connection.accountKind }
+    : { authorized, credentialId: null, accountKind: null };
 }
 
 /**
@@ -1748,13 +1910,10 @@ async function recordManagedMcpUsage(input: {
 
 /**
  * The call path's refusal for a Connection admission denied. Always `login_required`, which raises the
- * Connect card so a human can fix it; when the cause is a pin to someone else's Connection the message
- * says what fixes it (worded for the agent, so the agent API sends it as is).
+ * Connect card so a human can fix it.
  */
-function connectionRefusal(admission: Extract<ManagedMcpAdmission, { allowed: false }>): ManagedMcpServiceError {
-  return admission.detail === "not_usable"
-    ? new ManagedMcpServiceError(MCP_CONNECTION_NOT_USABLE_CALL_MESSAGE, "managed_mcp_login_required", true)
-    : new ManagedMcpServiceError("MCP connection is not authorized for this agent", "managed_mcp_login_required");
+function connectionRefusal(): ManagedMcpServiceError {
+  return new ManagedMcpServiceError("MCP connection is not authorized for this agent", "managed_mcp_login_required");
 }
 
 type ManagedMcpToolCaller = typeof callManagedMcpTool;
@@ -1809,18 +1968,19 @@ export async function executeManagedMcpCall(
   // The credential this call may use, and the ONLY one it may send. Lookups are scoped to THIS App,
   // so a pin naming another App's Connection resolves to nothing and is refused, not followed.
   // Revoked / never granted is decided here too (`admitFromRows`), before any Connection question.
-  const autoGranted = await mcpAutoGrantResolver(db, serverId, agent)(row.server);
-  const { block, connection: admission, boundCredential, defaultCredential, used } = await admitWithConnections(
-    db, serverId, row.server, row.assignment, autoGranted, mcpAgentOwnerUserId(agent),
+  const autoGranted = mcpAutoGrantCoversAgent(row.server, agent);
+  const { block, connection: admission, credentials, used } = await admitWithConnections(
+    db, serverId, agentId, row.server, row.assignment, autoGranted,
   );
   if (block) throw new ManagedMcpServiceError(block.message, block.code);
   if (!admission.allowed) {
-    // A Connection that needs signing in again: tell whoever can (once per expiry; a retry costs no
-    // query), since a call without a conversation raises no Connect card (#proj-apps:#70).
-    if (used && row.server.authMode === "oauth" && admission.detail !== "not_usable") {
+    // A shared Connection that needs signing in again: tell whoever can (once per expiry; a retry
+    // costs no query), since a call without a conversation raises no Connect card (#proj-apps:#70).
+    // A personal one is its owner's to fix; telling them is RFC 087 §7.3's, not the admins' notice.
+    if (used && used.ownerKind === "shared" && row.server.authMode === "oauth") {
       await notifyMcpConnectionNeedsSignIn({ trigger: "admission", serverId, mcpServerId: row.server.id, connection: used });
     }
-    throw connectionRefusal(admission);
+    throw connectionRefusal();
   }
   if (generic === "list") return listToolsResult(row.server, row.assignment);
   if (generic === "call") {
@@ -1850,9 +2010,7 @@ export async function executeManagedMcpCall(
   // Take the credential admission NAMED; never re-derive one.
   const credential = admission.credentialId === null
     ? null
-    : boundCredential?.id === admission.credentialId
-      ? boundCredential
-      : defaultCredential?.id === admission.credentialId ? defaultCredential : null;
+    : credentials.find((row) => row.id === admission.credentialId) ?? null;
   if (!credential && admission.credentialId !== null) {
     throw new ManagedMcpServiceError("MCP connection is not authorized for this agent", "managed_mcp_login_required");
   }
@@ -1967,10 +2125,10 @@ async function admitAgentForApp(serverId: string, agentId: string, appId: string
     .where(and(eq(managedMcpServers.id, appId), eq(managedMcpServers.serverId, serverId)))
     .limit(1);
   if (!row) throw new ManagedMcpServiceError("MCP server not found", "managed_mcp_server_not_found");
-  const autoGranted = await mcpAutoGrantResolver(db, serverId, agent)(row.server);
-  const { block, connection } = await admitWithConnections(db, serverId, row.server, row.assignment, autoGranted, mcpAgentOwnerUserId(agent));
+  const autoGranted = mcpAutoGrantCoversAgent(row.server, agent);
+  const { block, connection } = await admitWithConnections(db, serverId, agentId, row.server, row.assignment, autoGranted);
   if (block) throw new ManagedMcpServiceError(block.message, block.code);
-  if (!connection.allowed) throw connectionRefusal(connection);
+  if (!connection.allowed) throw connectionRefusal();
   return row;
 }
 

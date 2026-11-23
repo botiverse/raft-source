@@ -206,7 +206,7 @@ test("GET /api/integrations/marketplace keeps its App array; listings carry the 
     "botGrant", "publisherName", "publisherServerName", "privateShared", "appNotificationGroups", "appNotificationEvents",
     "appNotificationReviewPending", "appNotificationPendingRevisionId", "appNotificationPendingGroups",
     "appNotificationPendingEvents", "official", "purpose", "permissionApprovalRequired", "promptTextConfirmationRequired",
-    "marketplaceInstallBadge", "uninstalledHereAt", "needsAdminReview",
+    "marketplaceInstallBadge", "uninstalledHereAt", "needsAdminReview", "agentAccess",
   ]);
   assert.equal(array.some((client) => "kind" in client || "installCount" in client), false, "no listing fields leak into the array");
   assert.equal(alpha.uninstalledHereAt, null, "no one here ever uninstalled Alpha");
@@ -219,9 +219,9 @@ test("GET /api/integrations/marketplace keeps its App array; listings carry the 
   assert.equal(listings.cacheControl, "private, no-store");
   const alphaListing = listings.body.items.find((item) => item.kind === "app" && item.app.id === f.alpha.id);
   assert.ok(alphaListing && alphaListing.kind === "app");
-  // `needsAdminReview` is an installed-App signal for admins (/marketplace and
-  // /clients rows); listings do not carry it.
-  const { needsAdminReview: _needsAdminReview, ...alphaRecord } = alpha;
+  // `needsAdminReview` (for admins) and `agentAccess` are installed-App signals
+  // (/marketplace and /clients rows); listings do not carry them.
+  const { needsAdminReview: _needsAdminReview, agentAccess: _agentAccess, ...alphaRecord } = alpha;
   assert.deepEqual(alphaListing.app, alphaRecord, "a listing's app is the array's record, unchanged");
   assert.equal(alphaListing.id, `app:${f.alpha.id}`);
   assert.equal(alphaListing.name, "Alpha");
@@ -269,6 +269,7 @@ test("type and category filter Apps and MCP App templates; q searches name and d
     installed: true,
     templateKey: "linear",
     homepageUrl: "https://linear.app",
+    publisherName: "Linear",
   });
   const notion = mcp.body.items.find((item) => item.id === "mcp:notion");
   assert.equal(notion?.installBucket, null);

@@ -14,11 +14,12 @@ import { createTickingClock } from "./tickingClock";
 
 const QUARTER_HOUR_MS = 15 * 60 * 1000;
 
-// A beat past the boundary, so the day has turned when it fires.
-const subscribe = createTickingClock(() => QUARTER_HOUR_MS - (currentTimeMs() % QUARTER_HOUR_MS) + 50);
+// A beat past the boundary, so the day has turned when it fires. Exported for
+// a reader whose words turn with the day but are not the day itself ("Today at 15:00").
+export const subscribeDayTurn = createTickingClock(() => QUARTER_HOUR_MS - (currentTimeMs() % QUARTER_HOUR_MS) + 50);
 
 /** Today in `timeZone` (the browser's when undefined), "YYYY-MM-DD"; updates when the day ends. */
 export function useCurrentDay(timeZone?: string): string {
   const read = () => calendarDayKey(new Date(currentTimeMs()), { timeZone });
-  return useSyncExternalStore(subscribe, read, read);
+  return useSyncExternalStore(subscribeDayTurn, read, read);
 }

@@ -99,6 +99,11 @@ export type DesktopServerSwitchRequest = { serverId: string } | { delta: -1 | 1 
  * - switch-server: the Server menu (⌘1…⌘9 by id, ⌘⇧[ ⌘⇧] by delta)
  * - open-route: a raft:// link or a notification click; main has already
  *   checked the path against DESKTOP_DEEP_LINK_ROUTE_PREFIXES (desktopRoutes.ts)
+ * - object-window: about one object window (DesktopObjectWindowsBridge),
+ *   always sent to the MAIN window's web app, which owns every object window's
+ *   document: Window › Open in Main Window ("open-in-main"), and View › Reload
+ *   with that object window focused ("reload": remount its object; the main
+ *   renderer is not reloaded)
  */
 export type HostCommand =
   | { type: "history"; direction: "back" | "forward" }
@@ -111,7 +116,11 @@ export type HostCommand =
   // The tray / Dock menu's "Open This Device…", Help › "Raft Computer
   // Troubleshooting…" and a Computer notification's click: the web opens this
   // machine's Computer panel (on the current server), with that section open.
-  | { type: "open-this-device"; section?: DesktopThisDeviceSection };
+  | { type: "open-this-device"; section?: DesktopThisDeviceSection }
+  | { type: "object-window"; frameName: string; action: DesktopObjectWindowAction };
+
+/** What a host command asks of one object window. */
+export type DesktopObjectWindowAction = "open-in-main" | "reload";
 
 /** A section of the This device panel a host command opens. */
 export type DesktopThisDeviceSection = "troubleshoot";
@@ -120,6 +129,56 @@ export type DesktopThisDeviceSection = "troubleshoot";
 export interface DesktopHostFacts {
   /** The shell opens a second in-app window or tab for window.open (Raft Desktop: no, it has none). */
   canOpenNewWindow: boolean;
+  /**
+   * The shell hosts object windows (DesktopObjectWindowsBridge): it allows
+   * `window.open("about:blank", "raft-object-window-<n>", "popup")` from the
+   * main window and gives the child a window of its own, which the web
+   * renders into. Absent on shells that predate them.
+   */
+  objectWindows?: true;
+}
+
+/**
+ * Object windows: a platform object (an Artifact first) in a window of its
+ * own, its document rendered by the MAIN window's web app (a portal into the
+ * child's about:blank document), so it shares the main window's login, live
+ * data and state. The web opens one with
+ * `window.open("about:blank", "raft-object-window-<n>", "popup")` (n from 1,
+ * at most 8 open; a refused open returns null) and must use the main window's
+ * bridge for everything: the child document has none. The shell keeps every
+ * object window from navigating (own-app links become open-route commands for
+ * the main window, outside links open in the system browser), closes them all
+ * when the main window closes, reloads or crashes, and counts the app focused
+ * while any Raft window is (isFocused, onFocusChange, getWindowActivity).
+ */
+export interface DesktopObjectWindowsBridge {
+  /**
+   * Bring a window forward: "main" or an object window's frame name. Resolves
+   * true once it has the focus (at once when it already had it), false when
+   * the shell did not focus it (unknown window, timeout, the app is not active).
+   */
+  raise(target: "main" | string): Promise<boolean>;
+  /**
+   * The object window a plain open reuses (its place is remembered for the
+   * next one), or null when there is none.
+   */
+  setReusable(frameName: string | null): void;
+  /**
+   * An object window's own head row, the window's title bar (the Artifact
+   * viewer's head): its background and icon colour and its height (CSS px).
+   * Windows / Linux paint that window's caption buttons in them (never the
+   * main window's frame colours once it has reported); macOS centres its
+   * traffic lights in the row. Absent on shells that predate it.
+   */
+  setTitleBarOverlay?(frameName: string, overlay: DesktopTitleBarOverlay): void;
+  /**
+   * An object window entered or left full screen (macOS hides its traffic
+   * lights there, Windows / Linux its caption buttons), by frame name; also
+   * sent when one is shown already in full screen. Object windows open out of
+   * full screen otherwise, so there is no query. Returns the unsubscribe.
+   * Absent on shells that predate it.
+   */
+  onFullScreenChange?(listener: (frameName: string, fullScreen: boolean) => void): () => void;
 }
 
 /** An OS notification the renderer asks the shell to post (the shell validates it). */
@@ -635,6 +694,18 @@ export interface DesktopWebPreviewTabList {
 }
 
 /**
+ * What the kept pages of one conversation the window is not on are doing (DesktopWebPreviewTabListBridge.onInUse):
+ * the sidebar's mark on its row. `audible`: sound comes out of one (not muted); `muted`: one plays and the person
+ * muted it; `media`: the devices they use (in a fixed order: microphone, camera).
+ */
+export interface DesktopWebPreviewInUse {
+  owner: string;
+  audible: boolean;
+  muted: boolean;
+  media: DesktopWebPreviewMediaKind[];
+}
+
+/**
  * What the web asks of the shell's tab list. The shell validates every part
  * (an address by the same rule as an open) and keeps its own caps:
  * - `open`: `url` in front, in the tab already on it, else a new tab (at the
@@ -700,10 +771,29 @@ export interface DesktopWebPreviewTabListBridge {
    * behind plays on, heard, as a Chrome background tab, and a page of a conversation left that plays keeps playing
    * (#proj-workspace:#299). Absent (a web from before): every tab not in front is muted and the pages of a
    * conversation left are destroyed, as before. A shell from before ignores it.
+   *
+   * `options.inUseMarks`: this web marks a conversation whose kept pages play or use the microphone or the camera
+   * on its sidebar row (`onInUse`), so a page of a conversation left that uses a device is kept (under the kept
+   * pages' rules, its clock stopped while it does), but only while its conversation is one the web said it can mark
+   * (`setMarkable`). Absent (a web from before): such a page is closed on leaving.
    */
-  present(owner: string | null, showing: boolean, options?: { backgroundMedia?: boolean }): void;
+  present(owner: string | null, showing: boolean, options?: { backgroundMedia?: boolean; inUseMarks?: boolean }): void;
   /** The list after each change. Returns unsubscribe. */
   onChange(handler: (list: DesktopWebPreviewTabList) => void): () => void;
+  /**
+   * The conversations whose kept pages (off the strip the window is on) play or use a device, after each change and
+   * once more on every `get` and `present`; an empty list: none. Returns unsubscribe. Absent on a shell from before
+   * it: the web marks no row (and does not say `inUseMarks`).
+   */
+  onInUse?(handler: (inUse: DesktopWebPreviewInUse[]) => void): () => void;
+  /**
+   * The conversations this web can mark now: the ones with a row in the sidebar on screen (in a folded section too,
+   * whose head shows the mark), the whole list each time it changes. With `inUseMarks`, a kept page using a device is
+   * kept only while its conversation is in the latest list; one that drops out (another server, a DM closed, a
+   * channel left) is closed then. None sent yet for this account: none (fail safe). The list stays across a reload
+   * of the app's page until the new page sends its own. Absent on a shell from before it.
+   */
+  setMarkable?(owners: string[]): void;
   /**
    * The shell has pinned tabs (#proj-workspace:#297): `pin`, `unpin`, `duplicate`, `close-others` and `close-right`
    * are intents it knows, and its list carries `pinned`. Absent on a shell from before them: the web offers none
@@ -750,7 +840,9 @@ export interface DesktopWebPreviewTabsBridge {
   /** Where the showing tab's view goes; every tab shares the one placeholder. */
   setBounds(bounds: DesktopWebPreviewBounds): void;
   /** As DesktopWebPreviewBridge.setVisible, for the active tab's view. */
-  setVisible(visible: boolean): Promise<string | null>;
+  setVisible(visible: boolean, options?: DesktopWebPreviewHideOptions): Promise<string | null>;
+  /** As DesktopWebPreviewBridge.capture, of the active tab's page. */
+  capture?(): Promise<string | null>;
   /** Each tab's page after each change. Returns unsubscribe. */
   onState(handler: (state: DesktopWebPreviewTabState) => void): () => void;
   /** What a tab's page asks the browser for. Returns unsubscribe. Absent on shells that predate it: a page's new windows go to the system browser. */
@@ -852,6 +944,11 @@ export interface DesktopWebPreviewRaftSignInBridge {
   refuse?(requestId: string): void;
 }
 
+/** setVisible(false)'s options. `snapshot: false` hides without taking a snapshot (the web already shows its still). */
+export interface DesktopWebPreviewHideOptions {
+  snapshot?: boolean;
+}
+
 /**
  * The web preview's real browser view (desktop_web_preview_view_v0): one
  * Electron WebContentsView per window, in its own session partition, laid
@@ -872,9 +969,19 @@ export interface DesktopWebPreviewBridge {
    * Show or hide the view (it always draws above the page). Hiding resolves
    * with a snapshot of the page as a data URL, taken just before it hid, for
    * the placeholder to show while it is hidden (null when there is none);
-   * showing resolves null.
+   * showing resolves null. With `{ snapshot: false }` (shells that have
+   * `capture`) hiding takes no snapshot: it hides at once and resolves null.
    */
-  setVisible(visible: boolean): Promise<string | null>;
+  setVisible(visible: boolean, options?: DesktopWebPreviewHideOptions): Promise<string | null>;
+  /**
+   * A snapshot of the page as it shows now (a data URL, null when there is
+   * none), without hiding the view. With it the web hides the view only once
+   * that still is painted in the placeholder (setVisible(false, { snapshot:
+   * false })), so the placeholder is never blank in between. Absent on shells
+   * that predate it: the web hides with setVisible(false), which snapshots
+   * and hides at once.
+   */
+  capture?(): Promise<string | null>;
   /** The view's page after each change. Returns unsubscribe. */
   onState(handler: (state: DesktopWebPreviewState) => void): () => void;
   /**
@@ -955,6 +1062,14 @@ export interface RaftDesktopBridge {
     get(): Promise<boolean>;
     set(enabled: boolean): Promise<boolean>;
   };
+  /** Object windows (DesktopObjectWindowsBridge; facts.objectWindows). Absent on shells that predate them. */
+  objectWindows?: DesktopObjectWindowsBridge;
+  /**
+   * Open an http(s) URL in the system browser, never as an in-app route (an
+   * own-app link through window.open opens in the app). Absent on shells that
+   * predate it.
+   */
+  openInSystemBrowser?(url: string): void;
   /** Native menus, gestures, deep links and notification clicks (see HostCommand). */
   commands: {
     /** Commands that arrived before the first subscriber (cold start) replay to it. Returns unsubscribe. */

@@ -224,9 +224,9 @@ test("thread presentation follows the phone, iPad orientation, and desktop width
   expect(threadOnlyGeometry.leftDelta).toBe(0);
   expect(threadOnlyGeometry.rightDelta).toBe(0);
 
-  // Layout changes do not change navigation ownership: this regular thread
-  // was opened with one PUSH, so its visible Back consumes that entry and
-  // restores the exact parent channel surface.
+  // Folded, Back closes the thread in place and shows the exact parent channel
+  // surface under it, never a step back in history (#proj-workspace:#331;
+  // folded-back-stays-in-channel.spec.ts covers a thread with no entry of its own).
   await page.getByTestId("thread-mobile-back").click();
   await expect(threadPanel).not.toBeVisible();
   await expect(channelComposer).toBeVisible();

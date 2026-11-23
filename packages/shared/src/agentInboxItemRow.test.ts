@@ -2,12 +2,13 @@ import assert from "node:assert/strict";
 
 import { ATTENTION_HINT_COPY_VERSION, ATTENTION_HINT_SCHEMA, type AttentionHint } from "./attentionDependencyOracle";
 
-import { formatAgentReplyAffordance, formatAttentionHintField } from "./agentInbox";
+import { formatAgentReplyAffordance } from "./agentInbox";
 import {
   agentInboxItemRowFromPendingTarget,
   agentInboxReadCommand,
   formatAgentInboxItemRow,
   formatAgentInboxItemRows,
+  formatAttentionHintLine,
   type AgentInboxItemRow,
 } from "./agentInboxItemRow";
 
@@ -90,7 +91,7 @@ test("[D6][D8] an app row names its app and the conversation it is about, never 
     preview: "checks failed on 9ed73d5",
   }), { nowMs: NOW, inboxRead: true });
   assert.deepEqual(lines, [
-    "app:stamp/pr-13754 · 2 unread · from Stamp · about #proj-workspace:#232 · latest 5m ago",
+    "app:stamp/pr-13754 · 2 unread · about #proj-workspace:#232 · latest 5m ago",
     "  \"checks failed on 9ed73d5\" (preview)",
     "  read: raft inbox read --target \"app:stamp/pr-13754\"",
   ]);
@@ -99,8 +100,16 @@ test("[D6][D8] an app row names its app and the conversation it is about, never 
 test("[D7] an app's fallback item without a related conversation leaves out about", () => {
   assert.deepEqual(
     formatAgentInboxItemRow(row({ target: "app:stamp", kind: "app_fallback", unread: 5, app: { key: "stamp", name: "Stamp" }, related: null }), { inboxRead: true }),
-    ["app:stamp · 5 unread · from Stamp", "  read: raft inbox read --target \"app:stamp\""],
+    ["app:stamp · 5 unread", "  read: raft inbox read --target \"app:stamp\""],
   );
+});
+
+test("an app row names the app only when its name says more than the address", () => {
+  const summary = (app: { key: string; name: string }, target = `app:${app.key}`) =>
+    formatAgentInboxItemRow(row({ target, kind: "app_fallback", unread: 1, app, related: null }), { inboxRead: true })[0];
+  assert.equal(summary({ key: "stamp", name: "Stamp" }), "app:stamp · 1 unread");
+  assert.equal(summary({ key: "system.reaction-notices", name: "Reaction notices" }), "app:system.reaction-notices · 1 unread");
+  assert.equal(summary({ key: "gh-7f3a", name: "GitHub" }), "app:gh-7f3a · 1 unread · from GitHub");
 });
 
 test("[D13] a reminder row counts fired revisions and prints one ack line each", () => {
@@ -214,7 +223,7 @@ test("[D16] a daemon-pending target maps to one row for inbox check and the wake
     "dm:@richard · 2 unread · mentions you · latest @richard");
 });
 
-test("[D16] the wake-up's own details keep today's words: first msg, suppressed, attention hint, non-member guidance", () => {
+test("[D16] the wake-up's own details: the non-member guidance and the attention hint as a sentence and its command, no JSON", () => {
   const hint: AttentionHint = {
     schema: ATTENTION_HINT_SCHEMA,
     trigger: "M2",
@@ -231,17 +240,21 @@ test("[D16] the wake-up's own details keep today's words: first msg, suppressed,
     notDelivered: 3,
     mentions: 1,
     latestSender: { name: "tygg", type: "user" },
-    firstUnreadMsgId: "00000001-0000-4000-8000-000000000000",
-    suppressed: 2,
     attentionHint: hint,
     nonMemberMention: true,
   }), { inboxRead: true });
   assert.deepEqual(lines, [
-    `#proj-runtime · first msg=00000001 · mentions you · 3 new, not yet delivered · 2 suppressed (not delivered) · latest @tygg · attention_hint=${formatAttentionHintField(hint)}`,
+    "#proj-runtime · mentions you · 3 new, not yet delivered · latest @tygg",
     `  ${formatAgentReplyAffordance({ non_member_mention: true })}`,
     "  read: raft inbox read --target \"#proj-runtime\"",
+    "  hint: You've received 12 updates from #proj-runtime with no action taken. Run: raft channel mute \"#proj-runtime\"",
   ]);
-  assert.match(lines[0]!, /attention_hint=\{"schema":/);
+  assert.doesNotMatch(lines.join("\n"), /attention_hint|first msg|suppressed|\{"/);
+  // A sentence that already holds the command (the Server's own copy) is not followed by it again, and stays one line.
+  assert.equal(
+    formatAttentionHintLine({ ...hint, copy: "No action taken.\nIf this channel doesn't need you: raft channel mute \"#proj-runtime\" -- @mentions still reach you." }),
+    "No action taken. If this channel doesn't need you: raft channel mute \"#proj-runtime\" -- @mentions still reach you.",
+  );
   assert.match(lines[1]!, /^ {2}\[Raft notice: You were notified as a non-member/);
   // Unset (as `inbox check` leaves them), the row is as before.
   assert.equal(formatAgentInboxItemRow(row({ target: "#proj-runtime", unread: 2 }))[0], "#proj-runtime · 2 unread");

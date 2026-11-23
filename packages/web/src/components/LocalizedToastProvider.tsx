@@ -1,4 +1,4 @@
-import type { CSSProperties, PropsWithChildren } from "react";
+import type { ComponentProps, CSSProperties, PropsWithChildren } from "react";
 import { TraceIdNote } from "./errors/TraceIdNote";
 import { CircleCheck, Info, TriangleAlert, X } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -19,7 +19,7 @@ import {
 } from "@botiverse/raft-ui";
 import { useEffect, useMemo, useRef } from "react";
 import { useIntl } from "react-intl";
-import { setToastManager } from "./toastBridge";
+import { registerObjectWindowToastManager, setToastManager } from "./toastBridge";
 import { takeRecentFailedRequestTraceId } from "../utils/requestTraceId";
 import { useToastViewportBottom } from "./toastViewportBottom";
 import AvatarSlot from "./ui/AvatarSlot";
@@ -88,6 +88,17 @@ function useErrorToastTraceIds(toasts: ReadonlyArray<{ id: string; type?: string
     toastObject.data?.traceId ?? known.get(toastObject.id) ?? null;
 }
 
+/**
+ * A closing toast fades out of the flow. The toasts are laid out inline (in
+ * flow, newest first) on the viewport's floor, and a closing one stays mounted
+ * for its fade: kept in flow, it would hold its slot under the newer toast that
+ * replaces it, lifting that one a slot, which then drops when it goes (an
+ * Activity row's Done twice in quick succession). Out of flow, on the floor and
+ * under the newer one, it fades where it was and the newer takes its place.
+ * It takes no presses meant for the newer one's action.
+ */
+const CLOSING_TOAST_CLASS = "absolute inset-x-0 bottom-0 z-below pointer-events-none";
+
 function LocalizedToastList() {
   const { formatMessage } = useIntl();
   const { toasts } = useToastManager<LocalizedToastData>();
@@ -102,7 +113,13 @@ function LocalizedToastList() {
     const intent = toastObject.data?.intent ?? toastObject.type;
     const person = toastObject.data?.person;
     return (
-      <ToastRoot key={toastObject.id} toast={toastObject} layout="inline" data-testid="localized-toast-row">
+      <ToastRoot
+        key={toastObject.id}
+        toast={toastObject}
+        layout="inline"
+        className={toastObject.transitionStatus === "ending" ? CLOSING_TOAST_CLASS : undefined}
+        data-testid="localized-toast-row"
+      >
         <ToastContent
           className={[
             "!grid-cols-[auto_minmax(0,1fr)_auto] !items-center !gap-x-3 !gap-y-0",
@@ -149,14 +166,27 @@ function LocalizedToastList() {
   });
 }
 
-/** Publishes the live manager to `toastBridge` for surfaces that may render without a provider. */
-function ToastManagerBridge() {
+/**
+ * Publishes the live manager to `toastBridge` for surfaces that may render without a provider: the app's, or an
+ * object window's (`objectWindowDocument`), which showToast uses while that window has the focus.
+ */
+function ToastManagerBridge({ objectWindowDocument }: { objectWindowDocument?: Document }) {
   const manager = useToastManager();
   useEffect(() => {
+    if (objectWindowDocument) return registerObjectWindowToastManager(objectWindowDocument, manager);
     setToastManager(manager);
     return () => setToastManager(null);
-  }, [manager]);
+  }, [manager, objectWindowDocument]);
   return null;
+}
+
+/** An object window's viewport: the window's bottom (it has no composer or tab bar to sit above). */
+function ObjectWindowToastViewport() {
+  return (
+    <ToastViewport data-testid="localized-toast-viewport" data-toast-viewport="">
+      <LocalizedToastList />
+    </ToastViewport>
+  );
 }
 
 /** The toast viewport, offset by `useToastViewportBottom`, which holds its page height while a toast shows. */
@@ -184,13 +214,26 @@ function LocalizedToastViewport() {
  * height while a toast shows; raft-design #1217); a page with no floor gets
  * 0, the window's bottom.
  */
-export default function LocalizedToastProvider({ children }: PropsWithChildren) {
+export default function LocalizedToastProvider({
+  children,
+  toastManager,
+  objectWindowDocument,
+}: PropsWithChildren<{
+  /**
+   * The manager this provider shows: an object window's own (default: raft-ui's app-wide one). Its viewport
+   * portals to the nearest PortalContainerProvider's container (the object window's body), and useToast() under it
+   * shows there.
+   */
+  toastManager?: ComponentProps<typeof ToastProvider>["toastManager"];
+  /** The object window this provider serves (features/objectWindows): showToast reaches it while it has the focus. */
+  objectWindowDocument?: Document;
+}>) {
   return (
-    <ToastProvider renderViewport={false}>
-      <ToastManagerBridge />
+    <ToastProvider renderViewport={false} {...(toastManager ? { toastManager } : null)}>
+      <ToastManagerBridge objectWindowDocument={objectWindowDocument} />
       {children}
       <ToastPortal>
-        <LocalizedToastViewport />
+        {objectWindowDocument ? <ObjectWindowToastViewport /> : <LocalizedToastViewport />}
       </ToastPortal>
     </ToastProvider>
   );

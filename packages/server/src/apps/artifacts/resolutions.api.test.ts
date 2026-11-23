@@ -3,15 +3,16 @@
 // author, the server's owners and admins; anyone else 403, a reply 409, an
 // unseen Artifact 404), the resolution on every list (`resolvedAt`,
 // `resolvedBy`), a reply reopening the thread, a note posted as the
-// resolver's reply, the agent's hold, the thread author's notice (an agent)
-// or Activity (a person, with its `activity:changed` ping), and a reopen
-// telling no one.
+// resolver's reply, the agent's hold, the thread author's notice (an agent:
+// queued, never pushed) or Activity (a person, with its `activity:changed`
+// ping, without an unread) and only theirs (#proj-workspace:#340), and a
+// reopen telling no one.
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import { artifactWebPaths, asArtifactCommentId, asArtifactId, type AgentMessage, type ArtifactAgentAppEvent, type ArtifactId } from "@botiverse/raft-shared";
 import { getDb } from "../../db/index";
-import { objectEventRecipients, objectEvents } from "../../db/schema";
+import { objectEventRecipients, objectEvents, objectInboxStates, thirdPartyAgentEvents } from "../../db/schema";
 import { accessTokenForTest } from "../../test/integration/credentials";
 import { createAgent } from "../../services/agentService";
 import { AGENT_API_KEY_HMAC_SECRET_ENV, mintAgentCredential } from "../../services/agentCredentialService";
@@ -120,6 +121,12 @@ const eventsOf = (itemId: string, eventKind: string) => getDb().select().from(ob
 const recipientsOf = async (eventId: string) => (await getDb().select().from(objectEventRecipients).where(eq(objectEventRecipients.eventId, eventId)))
   .map((row) => `${row.recipientType}:${row.recipientId}:${row.reason}`).sort();
 const noticesTo = (world: World, agentId: string) => world.delivered.filter((entry) => entry.agentId === agentId).map((entry) => entry.message.app_event as ArtifactAgentAppEvent);
+/** An agent's resolve notices in its queue (pushed or not), with their summary and status. */
+const resolvesQueuedTo = async (agentId: string) => (await getDb().select().from(thirdPartyAgentEvents)
+  .where(and(eq(thirdPartyAgentEvents.agentId, agentId), eq(thirdPartyAgentEvents.systemApp, "system.artifacts")))
+  .orderBy(asc(thirdPartyAgentEvents.createdAt)))
+  .map((row) => ({ status: row.status, summary: row.summary, event: (row.payload as { app_event?: ArtifactAgentAppEvent }).app_event! }))
+  .filter((row) => row.event.reason === "your_comment_resolved");
 
 /** B's thread on a.html, A having read it (so A's resolve isn't held). */
 async function threadByB(app: App, world: World): Promise<string> {
@@ -228,7 +235,7 @@ test("a reply in a resolved thread reopens it, in the reply's transaction; every
   assert.equal((await rowOf(thread)).resolvedAt, null);
 });
 
-test("a note is the resolver's reply in the thread; the thread's author (an agent) is told once, of the resolve, and the note's mention as a mention", async ({ app, seed }) => {
+test("a note is the resolver's reply in the thread; the thread's author (an agent) is told once, of the resolve, queued and never pushed, and the note's mention as a mention", async ({ app, seed }) => {
   const world = await seedWorld(seed, app);
   const thread = await threadByB(app, world);
   const resolved = await resolve(app, world.keys.a, world.site, thread, { note: `Done in v1, @${world.agentC.name} please check` });
@@ -240,18 +247,26 @@ test("a note is the resolver's reply in the thread; the thread's author (an agen
   assert.equal(note.resolvedAt, null);
   assert.equal((await rowOf(note.id)).replyTo, thread);
   assert.equal(typeof (await rowOf(thread)).resolvedAt?.toISOString(), "string", "the note didn't leave it open");
-  assert.deepEqual(resolved.body.notified.map((n: { actor: { name: string }; reason: string }) => `${n.actor.name}:${n.reason}`).sort(), [`${world.agentB.name}:resolved`, `${world.agentC.name}:mentioned`].sort());
+  // With how each was told (#proj-workspace:#340): the author in its inbox, the note's mention woken.
+  assert.deepEqual(resolved.body.notified.map((n: { actor: { name: string }; reason: string; delivery: string }) => `${n.actor.name}:${n.reason}:${n.delivery}`).sort(), [`${world.agentB.name}:resolved:inbox`, `${world.agentC.name}:mentioned:wake`].sort());
 
-  // B follows (it commented), but hears of the resolve alone, not of the note as a follower too.
-  const toB = noticesTo(world, world.agentB.id);
-  assert.equal(toB.length, 1, JSON.stringify(toB));
+  // B follows (it commented), but hears of the resolve alone, not of the note
+  // as a follower too; in its inbox, never pushed: a resolve asks nothing of
+  // it, so it wakes no one (#proj-workspace:#340).
+  assert.deepEqual(noticesTo(world, world.agentB.id), [], "nothing pushed to the thread's author");
+  const queued = await resolvesQueuedTo(world.agentB.id);
+  assert.equal(queued.length, 1, JSON.stringify(queued));
+  assert.equal(queued[0]!.status, "queued");
+  const toB = queued.map((row) => row.event);
   assert.equal(toB[0]!.reason, "your_comment_resolved");
   assert.equal(toB[0]!.resolved?.comment.id, thread);
   assert.equal(toB[0]!.resolved?.noteExcerpt, `Done in v1, @${world.agentC.name} please check`);
   assert.deepEqual(toB[0]!.resolved?.by, { type: "agent", name: world.agentA.name });
-  const summary = world.delivered.find((entry) => entry.agentId === world.agentB.id)!.message.content;
+  const summary = queued[0]!.summary;
   assert.ok(summary.includes(`@${world.agentA.name} resolved your comment on "Site" (a.html), noting: "Done in v1`), summary);
+  // The note's mention is a mention: that one is pushed.
   assert.equal(noticesTo(world, world.agentC.id)[0]?.reason, "mentioned");
+  assert.deepEqual(await resolvesQueuedTo(world.agentC.id), [], "only the thread's author hears of the resolve");
 
   // A reopen tells no one.
   world.delivered.length = 0;
@@ -261,7 +276,7 @@ test("a note is the resolver's reply in the thread; the thread's author (an agen
   assert.deepEqual(await recipientsOf(reopened!.id), []);
 });
 
-test("a person's thread: resolving it records comment_resolved for them and pings their Activity; an agent's resolve is held as a reply there would be", async ({ app, seed }) => {
+test("a person's thread: resolving it records comment_resolved for them and pings their Activity, without an unread; an agent's resolve is held as a reply there would be", async ({ app, seed }) => {
   const world = await seedWorld(seed, app);
   const posted = await web(app, "POST", artifactWebPaths.comments(world.site), world.who.reader, { version: 1, target: { scope: "file", path: "a.html", anchor: null }, replyTo: null, body: [{ type: "text", text: "Spacing looks off." }] });
   assert.equal(posted.status, 201, JSON.stringify(posted.body));
@@ -275,12 +290,27 @@ test("a person's thread: resolving it records comment_resolved for them and ping
     assert.equal(held.status, 409, JSON.stringify(held.body));
     assert.equal(held.body.code, "UNSEEN_CHANGES");
     assert.equal((await rowOf(thread)).resolvedAt, null);
+    // The hold's range lists again the thread and C's reply, which it showed (#proj-workspace:#340).
+    const again = await agentCall(app, "GET", `/artifacts/${world.site}/comments?held=${held.body.details.seenFrom}..${held.body.details.seen}`, world.keys.a);
+    assert.equal(again.status, 200, JSON.stringify(again.body));
+    assert.ok(again.body.comments.some((c: { id: string }) => c.id === thread), JSON.stringify(again.body));
+    // The reader has read everything so far (as opening the Artifact would).
+    const activityOf = async () => (await getDb().select().from(objectInboxStates)
+      .where(and(eq(objectInboxStates.userId, world.reader.id), eq(objectInboxStates.objectId, world.site))))[0]!;
+    await getDb().update(objectInboxStates).set({ readThroughSeq: (await activityOf()).lastEventSeq })
+      .where(and(eq(objectInboxStates.userId, world.reader.id), eq(objectInboxStates.objectId, world.site)));
     const resolved = await resolve(app, world.keys.a, world.site, thread);
     assert.equal(resolved.status, 200, JSON.stringify(resolved.body));
+    // The resolver is told who heard: the thread's author, a person.
+    assert.deepEqual(resolved.body.notified.map((n: { actor: { type: string }; reason: string; delivery: string }) => `${n.actor.type}:${n.reason}:${n.delivery}`), ["user:resolved:activity"]);
     const [event] = await eventsOf(world.site, "comment_resolved");
     assert.ok(event, "the event is recorded");
     assert.deepEqual(await recipientsOf(event.id), [`user:${world.reader.id}:following`]);
     assert.ok(rooms.some((room) => room.includes(world.reader.id)), `activity:changed for the thread's author: ${rooms.join(", ")}`);
+    // Their Activity row moved to the resolve, already read: a state change adds no unread.
+    const row = await activityOf();
+    assert.equal(row.lastEventSeq, event.seq);
+    assert.ok((row.readThroughSeq ?? 0) >= row.lastEventSeq, JSON.stringify(row));
     // The web's own resolve by the person whose thread it is: no recipient (it is theirs).
     assert.equal((await webReopen(app, world.who.reader, world.site, thread)).status, 200);
     assert.equal((await webResolve(app, world.who.reader, world.site, thread, { note: [{ type: "text", text: "fixed now" }] })).body.note.body[0].text, "fixed now");
@@ -306,7 +336,8 @@ test("the person who manages an agent author resolves and reopens as its author 
   assert.equal(resolved.status, 200, JSON.stringify(resolved.body));
   assert.equal(resolved.body.changed, true);
   assert.equal(resolved.body.comment.resolvedBy.id, world.manager.id);
-  assert.equal(noticesTo(world, world.agentB.id)[0]?.reason, "your_comment_resolved", "the thread's author is told");
+  assert.equal((await resolvesQueuedTo(world.agentB.id))[0]?.event.reason, "your_comment_resolved", "the thread's author is told");
+  assert.deepEqual(noticesTo(world, world.agentB.id), [], "queued, never pushed");
   const reopened = await webReopen(app, world.who.manager, world.site, thread);
   assert.equal(reopened.status, 200, JSON.stringify(reopened.body));
   assert.equal(reopened.body.comment.resolvedAt, null);

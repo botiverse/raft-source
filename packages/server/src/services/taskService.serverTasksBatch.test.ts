@@ -20,7 +20,7 @@ import * as channelService from "./channelService";
 import { createServer } from "./serverService";
 import { resolveTaskChannelSurface } from "./taskChannelSurface";
 import * as taskService from "./taskService";
-import { seedBoundGuest } from "../test/guestFixture";
+import { seedBoundGuest, seedStrayGuestChannelRow } from "../test/guestFixture";
 
 /**
  * GET /api/tasks/server used to fan out per channel (access check, surface
@@ -139,7 +139,7 @@ async function buildFixture() {
   // A guest of a private channel, its one channel (#wg-rbac:#15): its tasks are on the guest's board, as canView allows.
   await seedBoundGuest({ serverId: host.id, userId: guest.id, channelId: priv.id });
   // A guest in a guest-visible public channel that is not its own: nothing of it on its board.
-  await channelService.addHuman(guestOpen.id, guest.id);
+  await seedStrayGuestChannelRow({ channelId: guestOpen.id, userId: guest.id });
 
   // Joint: canonical storage row on the host server (itself a `channel`, so
   // it is a candidate that must be excluded), host + participant projections,

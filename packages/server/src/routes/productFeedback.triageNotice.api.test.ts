@@ -18,6 +18,7 @@ import { openTestApp } from "../test/integration/app";
 import { vi } from "vitest";
 import { INBOX_ITEMS_LAUNCH_AT_ENV, inboxItemsLaunch, listAgentAppItems } from "../services/agentInboxItems";
 import { AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY, createFeatureFlag } from "../services/featureFlagService";
+import { recordAgentCliInboxItems } from "../services/agentCliInboxItems";
 import { asServerId } from "@botiverse/raft-shared";
 import { sendFeedbackCard } from "../services/productFeedbackSendService";
 import {
@@ -397,6 +398,8 @@ test("a second submission while the row is unread joins it without a second wake
   try {
     await withTriageHarness({ triageAgent: true }, async (h) => {
       await createFeatureFlag({ key: AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY, randomizationUnit: "server", defaultEnabled: true });
+      // Merging needs the triage agent's CLI to list app inbox items (#proj-apps:#88).
+      await recordAgentCliInboxItems(h.triageAgentId, null, true);
       const pushed = recordingDeliverer();
       assert.equal((await h.submit("first")).status, 201);
       await settleProductFeedbackTriageNoticesForTest();

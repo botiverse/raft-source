@@ -6,6 +6,8 @@
  */
 import api from "../../api/client";
 import { getApiErrorResponse } from "../../utils/apiErrorResponse";
+import { otherRpsOf, rpBody } from "../auth/passkeyRpGroups";
+import type { PasskeyRpGroup, StartedPasskeyAssertion } from "../auth/passkeyRpGroups";
 import { parseMethods } from "../auth/secondFactorSignIn";
 import type { SignInSecondFactorMethod } from "../auth/secondFactorSignIn";
 import type {
@@ -77,7 +79,7 @@ export async function regenerateBackupCodes(answer: { code: string } | { webauth
  * methods, agent keys) ask for it the same way: secondFactorStepUp.ts.
  */
 export async function stepUpThisSignIn(answer: StepUpAnswer): Promise<void> {
-  await api.post(`${BASE}/step-up`, answer);
+  await api.post<unknown>(`${BASE}/step-up`, answer);
 }
 
 /**
@@ -102,10 +104,19 @@ export async function stepUpBeforeApproval(): Promise<SignInSecondFactorMethod[]
   ];
 }
 
-/** POST /passkeys/assertion/options {}: a passkey assertion bound to this sign-in, to answer step-up (or /enable) with. */
+/**
+ * POST /passkeys/assertion/options { rp? }: a passkey assertion bound to this
+ * sign-in, to answer step-up (or /enable) with, in the server's default RP
+ * group or `rp`, and the person's other groups (auth/passkeyRpGroups.ts).
+ */
+export async function startStepUpPasskeyAssertionIn(rp?: PasskeyRpGroup): Promise<StartedPasskeyAssertion> {
+  const { data } = await api.post<{ options: PasskeyRequestOptionsJSON; otherRps?: unknown }>(`${BASE}/passkeys/assertion/options`, rpBody(rp));
+  return { options: data.options, otherRps: otherRpsOf(data.otherRps) };
+}
+
+/** startStepUpPasskeyAssertionIn's options in the server's default group. */
 export async function startStepUpPasskeyAssertion(): Promise<PasskeyRequestOptionsJSON> {
-  const { data } = await api.post<{ options: PasskeyRequestOptionsJSON }>(`${BASE}/passkeys/assertion/options`, {});
-  return data.options;
+  return (await startStepUpPasskeyAssertionIn()).options;
 }
 
 // ── Passkeys (Settings › Account › Passkeys) ──

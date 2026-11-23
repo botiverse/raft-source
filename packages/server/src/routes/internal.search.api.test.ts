@@ -318,6 +318,20 @@ test("internal agent search reports invisible or unknown sender handles as membe
   assert.match(body.error ?? "", /Member not found/);
 });
 
+test("internal agent search refuses a sender that would break the sentence with the same 404, leaving it out", async ({ app }) => {
+  const { agent, apiKey } = await seedSearchFixture();
+  for (const sender of ["a\nb", "x raft y", "a --b", "y".repeat(600)]) {
+    const params = new URLSearchParams({ q: "zebraneedle", sender });
+    const res = await fetch(`${app.baseUrl}/internal/agent/${agent.id}/search?${params}`, {
+      headers: machineHeaders(apiKey),
+    });
+    assert.equal(res.status, 404, JSON.stringify(sender));
+    const body = await res.json() as { errorCode?: string; error?: string };
+    assert.equal(body.errorCode, "member_not_found");
+    assert.equal(body.error, "Member not found: no one here has that name");
+  }
+});
+
 test("internal agent search reports ambiguous human/agent sender handles", async ({ app }) => {
   const db = getDb();
   const { server, agent, apiKey } = await seedSearchFixture();

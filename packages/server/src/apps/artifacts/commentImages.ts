@@ -270,7 +270,7 @@ export function createCommentImageOperations() {
   return {
     /** artifactCommentImageUpload: the flag and the Artifact (one 404), an agent who takes part in it (403), then the upload. */
     uploadCommentImage: (agent: ArtifactAgent, params: AgentApiArtifactParams, input: ImageUploadInput): Promise<ArtifactApiResult<AgentApiArtifactCommentImage>> => answer(async () => {
-      const item = await resolveVisibleItem(agent, params.artifact);
+      const item = await resolveVisibleItem(agent, params.artifact, "write");
       if (!(await takesPartIn(viewActor(agent), item))) return mayNotTakePart("comment on it");
       if (input.contentType?.split(";")[0]!.trim().toLowerCase() !== "application/octet-stream") {
         return fail(400, { code: "agent_api_contract_invalid", error: "An image upload's body is the image's bytes, sent as application/octet-stream: send it with that Content-Type." });
@@ -299,7 +299,7 @@ export function createCommentImageOperations() {
      * one 404 IMAGE_NOT_FOUND.
      */
     commentImage: (agent: ArtifactAgent, params: AgentApiArtifactCommentImageParams): Promise<ArtifactApiBytes | ArtifactApiError> => answer(async () => {
-      const item = await resolveVisibleItem(agent, params.artifact);
+      const item = await resolveVisibleItem(agent, params.artifact, "read");
       // One answer for an id that names no image of a comment the agent can read, whatever the reason.
       const notFound = (): ArtifactApiError => fail(404, {
         code: "IMAGE_NOT_FOUND",

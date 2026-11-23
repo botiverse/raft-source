@@ -34,11 +34,15 @@ async function seed() {
   const tools = [{ name: "search", inputSchema: { type: "object" as const } }, { name: "write", inputSchema: { type: "object" as const } }];
   // No sign-in needed: ready, every tool.
   const [open] = await db.insert(managedMcpServers).values({
+    // No recorded creator: vouched, as migration 0732 does for legacy Apps (fail-closed rule).
+    serverVouchedAt: new Date(),
     serverId: server.id, name: "Open Docs", description: "Docs search", homepageUrl: "https://docs.example.test",
     endpointUrl: "https://open.example.test/mcp", authMode: "none", toolCatalog: tools, catalogVersion: 1,
   }).returning();
   // Needs a key nobody has entered: login_required; restricted to one tool for this Agent.
   const [keyed] = await db.insert(managedMcpServers).values({
+    // No recorded creator: vouched, as migration 0732 does for legacy Apps (fail-closed rule).
+    serverVouchedAt: new Date(),
     serverId: server.id, name: "Team Notion", endpointUrl: "https://notion.example.test/mcp",
     authMode: "headers", requiredHeaderNames: ["X-Api-Key"], toolCatalog: tools, catalogVersion: 1,
   }).returning();
@@ -47,6 +51,8 @@ async function seed() {
   });
   // Revoked for this Agent: not its App, not listed.
   const [revoked] = await db.insert(managedMcpServers).values({
+    // No recorded creator: vouched, as migration 0732 does for legacy Apps (fail-closed rule).
+    serverVouchedAt: new Date(),
     serverId: server.id, name: "Revoked Wiki", endpointUrl: "https://wiki.example.test/mcp",
     authMode: "none", toolCatalog: tools, catalogVersion: 1,
   }).returning();
@@ -55,6 +61,8 @@ async function seed() {
   });
   // Switched off on the server: listed as disabled, so the Agent can say why its tools are missing.
   const [disabled] = await db.insert(managedMcpServers).values({
+    // No recorded creator: vouched, as migration 0732 does for legacy Apps (fail-closed rule).
+    serverVouchedAt: new Date(),
     serverId: server.id, name: "Paused Tracker", endpointUrl: "https://tracker.example.test/mcp",
     authMode: "none", enabled: false, toolCatalog: tools, catalogVersion: 1,
   }).returning();
@@ -126,7 +134,7 @@ test("a reserved OAuth key never falls through to an MCP App with the same displ
   assert.equal(ordinary.body.errorCode, "INTEGRATION_MCP_APP_DISABLED", "ordinary MCP names remain case insensitive");
   for (const service of [reservedKey, reservedKey.toUpperCase(), reservedKey[0].toUpperCase() + reservedKey.slice(1)]) {
     const refused = await loginAs(app, f.apiKey, { service, target: `#${f.channel.name}` });
-    assert.deepEqual(refused, { status: 404, body: { error: "Registered service not found" } });
+    assert.deepEqual(refused, { status: 404, body: { error: "Registered service not found", code: "service_not_found", errorCode: "service_not_found" } });
   }
   assert.deepEqual(await openCards(f.agentId), [], "no request is posted for a different App");
 });

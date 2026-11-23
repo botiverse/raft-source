@@ -776,7 +776,10 @@ function makeTempCtx(overrides: Partial<SpawnContext["config"]> = {}): {
   const base = makeSpawnContext(overrides);
   const root = path.join(os.tmpdir(), `kimi-role-${randomUUID()}`);
   const home = path.join(root, "home");
-  fsMkdirSync(home, { recursive: true });
+  // Signed in to Kimi Code: a start in a home with neither a token nor a
+  // config is refused before the harness (kimiCodeStartNeedsSignIn).
+  fsMkdirSync(path.join(home, "credentials"), { recursive: true });
+  fsWriteFileSync(path.join(home, "credentials", "kimi-code.json"), JSON.stringify({ access_token: "test-token" }));
   return { ctx: { ...base, workingDirectory: path.join(root, "work") }, home };
 }
 
@@ -1233,7 +1236,8 @@ test("KimiSdkRuntimeSession resumes with the fresh roleAdditional after Stop→S
   const workingDirectory = path.join(os.tmpdir(), `kimi-resume-${randomUUID()}`);
   fsMkdirSync(workingDirectory, { recursive: true });
   const home = path.join(workingDirectory, "home");
-  fsMkdirSync(home, { recursive: true });
+  fsMkdirSync(path.join(home, "credentials"), { recursive: true });
+  fsWriteFileSync(path.join(home, "credentials", "kimi-code.json"), JSON.stringify({ access_token: "test-token" }));
 
   function makeCtx(standingPrompt: string): SpawnContext {
     return {
@@ -2481,4 +2485,40 @@ test("#proj-runtime:#41: a Kimi subagent the main agent started stops through it
   assert.equal(runtime.interruptSubagent("bg-sub"), "not_running", "ended");
   assert.equal(stopped.length, 2);
   assert.equal(new KimiSdkDriver().stopsSubagentsInSession, true);
+});
+
+test("a kimi-sdk start that is not signed in to Kimi Code fails as runtime_login_required before the harness", async () => {
+  const { ctx, home } = makeTempCtx({ sessionId: null });
+  rmSync(path.join(home, "credentials"), { recursive: true, force: true });
+  const { harness, createCalls } = makeCapturingHarness();
+  const createHarnessCalls: Array<Record<string, unknown>> = [];
+  const deps = makeFakeDeps(home, harness, createHarnessCalls);
+  const error = await createKimiAgentSessionForContext(ctx, "sess-signed-out", deps).then(
+    () => assert.fail("a signed-out start must fail"),
+    (err: unknown) => err,
+  );
+  const classification = classifySpawnFailure(error);
+  assert.equal(classification.reason, "runtime_login_required");
+  assert.match(classification.detail, /not signed in/);
+  assert.equal(createHarnessCalls.length, 0, "no harness is created");
+  assert.equal(createCalls.length, 0, "no session is created");
+});
+
+test("a kimi-sdk start whose sign-in status cannot be read goes on as before", async () => {
+  const { ctx, home } = makeTempCtx({ sessionId: null });
+  const { harness, createCalls } = makeCapturingHarness();
+  for (const startNeedsSignIn of [async () => false, async () => { throw new Error("EACCES"); }]) {
+    const deps = { ...makeFakeDeps(home, harness), startNeedsSignIn };
+    await createKimiAgentSessionForContext(ctx, "sess-unknown", deps);
+  }
+  assert.equal(createCalls.length, 2, "both starts reached the session");
+});
+
+test("a kimi-sdk start with a model from the environment (KIMI_MODEL_NAME) is not refused for a missing sign-in", async () => {
+  const { ctx, home } = makeTempCtx({ sessionId: null });
+  rmSync(path.join(home, "credentials"), { recursive: true, force: true });
+  const { harness, createCalls } = makeCapturingHarness();
+  const deps = makeFakeDeps(home, harness, [], undefined, undefined, { KIMI_MODEL_NAME: "kimi-k2", KIMI_MODEL_API_KEY: "test-key" });
+  await createKimiAgentSessionForContext(ctx, "sess-env-model", deps);
+  assert.equal(createCalls.length, 1, "the start reached the session");
 });

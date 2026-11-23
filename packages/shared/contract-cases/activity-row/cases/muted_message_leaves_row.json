@@ -1,0 +1,27 @@
+{
+  "formatVersion": 1,
+  "id": "muted_message_leaves_row",
+  "rule": "position",
+  "title": "Past a mute, a message without a mention of the viewer leaves the row as it is, with no re-read",
+  "why": "RisingWave keeps a muted channel or DM row at its last message before the mute: the muted prefix's latest_seq stops at mute_from_seq (rw_inbox_muted_prefix_v2) and rw_inbox_serving_v9 shows it as the row's latest_activity_seq. A message past the mute (moves: false) that does not mention the viewer changes nothing and asks for no re-read; the next answer, still at 100, is not older than the row. Decided: Tenny, #triage:#244, 2026-11-16 (follow RisingWave).",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow, applyLive: moves false)",
+      "packages/web/src/store/socketBridge.ts (isMessageActivitySuppressedByMute: such a message does not reach Activity)"
+    ],
+    "server": [
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (rw_inbox_muted_prefix_v2: latest_seq below mute_from_seq)",
+      "infra/risingwave/sql/078-task-conversations.sql (rw_inbox_serving_v9: latest_activity_seq)"
+    ]
+  },
+  "given": { "row": { "unreadCount": 1, "hasMention": false, "position": "100", "mentionOnly": false } },
+  "steps": [
+    { "act": "liveMessage", "seq": "101", "counts": false, "mentionsViewer": false, "moves": false },
+    { "act": "answer", "row": { "unreadCount": 1, "hasMention": false, "position": "100", "mentionOnly": false } }
+  ],
+  "checkpoints": [
+    { "afterStep": 1, "row": { "unreadCount": 1, "hasMention": false, "position": "100", "mentionOnly": false }, "reread": false }
+  ],
+  "expect": { "row": { "unreadCount": 1, "hasMention": false, "position": "100", "mentionOnly": false }, "reread": false }
+}

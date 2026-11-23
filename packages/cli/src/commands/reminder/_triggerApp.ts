@@ -1,6 +1,7 @@
-// Shared by `raft reminder trigger` and `raft reminder log --key`: both call the
-// Reminder App's agent actions (`trigger`, `list-trigger-log`) through the same
-// path as `raft integration invoke --service reminder --action <name>`.
+// Shared by the `raft reminder` commands that call the Reminder App's agent
+// actions (`trigger`, `list-trigger-log`, and on a server whose reminders live
+// in the app, `create-reminder` and the rest: _app.ts) through the same path as
+// `raft integration invoke --service reminder --action <name>`.
 
 import type { CommandContext } from "../../core/context";
 import { CliError, cliError } from "../../core/errors";
@@ -39,9 +40,19 @@ export async function invokeReminderApp(
   payload: Record<string, unknown>,
   nothingDone: string,
 ): Promise<unknown> {
+  return unwrapAppAnswer(await callReminderApp(ctx, action, payload, nothingDone));
+}
+
+/** invokeReminderApp without unwrapping: the app's whole answer (reply `text` included). */
+export async function callReminderApp(
+  ctx: CommandContext,
+  action: string,
+  payload: Record<string, unknown>,
+  nothingDone: string,
+): Promise<unknown> {
   try {
     const { value } = await invokeAppAction(ctx, { service: REMINDER_APP_SERVICE, action, payload, requireOfficial: true });
-    return unwrapAppAnswer(value);
+    return value;
   } catch (error) {
     if (error instanceof CliError && error.code === "INTEGRATION_NOT_FOUND") {
       throw cliError(

@@ -10,17 +10,18 @@ export function changePasswordSettingsPath(serverSlug: string): string {
   return `/s/${encodeURIComponent(serverSlug)}/settings/account?open=${CHANGE_PASSWORD_SETTINGS_OPEN_VALUE}`;
 }
 
+/** Entering a server from `/`: its place (placeMemory), unless the password intent asks for Settings › Account. */
 export function serverEntryPath({
   serverSlug,
-  rememberedSurface,
+  place,
   changePasswordIntent,
 }: {
   serverSlug: string;
-  rememberedSurface: string | null;
+  place: string;
   changePasswordIntent: boolean;
 }): string {
   if (changePasswordIntent) return changePasswordSettingsPath(serverSlug);
-  return rememberedSurface ?? `/s/${serverSlug}`;
+  return place;
 }
 
 export function isChangePasswordSettingsIntent(search: string): boolean {

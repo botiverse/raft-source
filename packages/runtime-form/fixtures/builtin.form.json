@@ -129,7 +129,21 @@
             "anthropic",
             "google",
             "xai",
-            "xiaomi"
+            "xiaomi",
+            "xiaomi-token-plan-cn",
+            "xiaomi-token-plan-sgp",
+            "xiaomi-token-plan-ams",
+            "ant-ling",
+            "baseten",
+            "cerebras",
+            "groq",
+            "meta",
+            "mistral",
+            "nvidia",
+            "qwen-token-plan-individual",
+            "qwen-token-plan-individual-cn",
+            "together",
+            "vercel-ai-gateway"
           ]
         }
       },
@@ -155,7 +169,21 @@
             "anthropic",
             "google",
             "xai",
-            "xiaomi"
+            "xiaomi",
+            "xiaomi-token-plan-cn",
+            "xiaomi-token-plan-sgp",
+            "xiaomi-token-plan-ams",
+            "ant-ling",
+            "baseten",
+            "cerebras",
+            "groq",
+            "meta",
+            "mistral",
+            "nvidia",
+            "qwen-token-plan-individual",
+            "qwen-token-plan-individual-cn",
+            "together",
+            "vercel-ai-gateway"
           ]
         }
       }

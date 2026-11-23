@@ -302,6 +302,58 @@ test("phone overflow: measured at the mobile viewport only", async () => {
   assert.deepEqual(run.report.phoneOverflow, { contentWidth: 1024, viewportWidth: 390 });
 });
 
+test("phone overflow: a zoomed-out phone window is reported at the phone's width", async () => {
+  const deps = depsWith();
+  const { browser } = fakeBrowser({ measure: (viewport) => (viewport.mobile ? { textLength: 5, scrollWidth: 1600, innerWidth: 1560 } : { textLength: 5, scrollWidth: viewport.width, innerWidth: viewport.width }) }, { now: deps.now });
+  const run = await runCheck(browser, leaseFor(), deps);
+  assert.equal(run.kind, "ran");
+  if (run.kind !== "ran") return;
+  assert.deepEqual(run.report.phoneOverflow, { contentWidth: 1600, viewportWidth: 390 });
+});
+
+/** A page held to one screen at `heldAt` viewports (html and body hidden), its content 2340 px down. */
+const heldAt = (shots: string[]) => (viewport: { shot: string; width: number; height: number }) => ({
+  textLength: 5,
+  scrollWidth: viewport.width,
+  innerWidth: viewport.width,
+  scroll: {
+    innerHeight: viewport.height,
+    contentBottom: shots.includes(viewport.shot) ? 2340 : viewport.height,
+    rootScrollHeight: viewport.height,
+    rootClientHeight: viewport.height,
+    htmlOverflowY: "hidden",
+    bodyOverflowY: "hidden",
+    bodyBottom: viewport.height,
+    innerScroller: false,
+    holder: null,
+  },
+});
+
+test("can't scroll: a soft hint at each viewport where the page is held to one screen; none where it isn't, or nothing was measured", async () => {
+  const both = depsWith();
+  const run = await runCheck(fakeBrowser({ measure: heldAt(["desktop", "phone"]) }, { now: both.now }).browser, leaseFor(), both);
+  assert.equal(run.kind, "ran");
+  if (run.kind !== "ran") return;
+  const heldBy = [{ element: "html", style: "overflow: hidden" }, { element: "body", style: "overflow: hidden" }];
+  assert.deepEqual(run.report.pageCantScroll, [
+    { shot: "desktop", viewportWidth: 1280, viewportHeight: 800, contentHeight: 2340, hiddenHeight: 1540, heldBy },
+    { shot: "phone", viewportWidth: 390, viewportHeight: 844, contentHeight: 2340, hiddenHeight: 1496, heldBy },
+  ]);
+  assert.deepEqual(run.report.consoleErrors, [], "a hint, not an error");
+
+  const phone = depsWith();
+  const phoneRun = await runCheck(fakeBrowser({ measure: heldAt(["phone"]) }, { now: phone.now }).browser, leaseFor(), phone);
+  assert.deepEqual(phoneRun.kind === "ran" && phoneRun.report.pageCantScroll?.map((entry) => entry.shot), ["phone"]);
+
+  const fits = depsWith();
+  const fitsRun = await runCheck(fakeBrowser({ measure: heldAt([]) }, { now: fits.now }).browser, leaseFor(), fits);
+  assert.deepEqual(fitsRun.kind === "ran" && fitsRun.report.pageCantScroll, [], "measured at both, held at neither");
+
+  const unmeasured = depsWith();
+  const unmeasuredRun = await runCheck(fakeBrowser({}, { now: unmeasured.now }).browser, leaseFor(), unmeasured);
+  assert.equal(unmeasuredRun.kind === "ran" && unmeasuredRun.report.pageCantScroll, undefined);
+});
+
 test("a screenshot that fails, or isn't a PNG, is left out; the check still reports", async () => {
   const deps = depsWith();
   const { browser } = fakeBrowser({ screenshot: (viewport) => (viewport.mobile ? new Error(`shot failed at ${TICKET_URL}`) : new TextEncoder().encode("jpeg?")) }, { now: deps.now });

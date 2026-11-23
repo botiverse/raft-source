@@ -1,0 +1,42 @@
+host: legacy
+runtime: claude
+scenario: runtime-profile-control
+promptSource: runtime_profile_control_with_memory
+note: driver: supportsNativeStandingPrompt=true standingPromptRefreshesOnResume=false deferSpawnUntilMessage=false
+
+## standing prompt
+= standing-prompt.md with:
+===================================================================
+--- standing-prompt.md
++++ this-case
+@@ -62,0 +63,1 @@
++0. If this system prompt contains a **Runtime Profile Control** section, read that notice first. It is informational only; no runtime control action or chat reply is required. Do not read MEMORY.md, check messages, or respond to inbox messages before reading it.
+@@ -68,0 +70,8 @@
++## Runtime Profile Control
++
++This section is a trusted daemon release notice. Read it before normal startup work; it does not require a runtime control action, chat reply, or migration acknowledgment.
++
++Read the daemon release notice below before handling normal inbox messages. No chat reply is required for this notice.
++
++Daemon updated from 1.0.0 to 1.0.1.
++
+
+
+## carrier
+SpawnContext.standingPrompt: = standing prompt
+
+## first input (253 chars, sha256:5316b5a003713f70, does not contain the standing prompt)
+<memory-index file="MEMORY.md" size="0.1 KB" complete="true" note="no need to re-read MEMORY.md unless you change it">
+# Alice
+
+## Role
+Keeps the release notes
+
+## Key Knowledge
+- No notes yet.
+
+## Active Context
+- First startup.
+</memory-index>
+
+Start.

@@ -21,7 +21,7 @@
 //     normally).
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { ComputerAttachClient, type AttachResult as AttachClientResult } from "../apiClient";
+import { ComputerAttachClient, type AttachResult as AttachClientResult, type DevicePairingRequest } from "../apiClient";
 import {
   deriveDefaultComputerName,
   serverAttachmentPath,
@@ -31,6 +31,7 @@ import { formatServerSlugDisplay, normalizeServerSlug, resolveAttachedServerSlug
 import { canonicalizeServerUrl, resolveServerUrl, resolveServerUrlEnv } from "../serverUrl";
 import type { ComputerApiEvent } from "../lib/events";
 import { ComputerServiceError } from "./errors";
+import type { LoopbackLoginOptions } from "./login";
 import {
   ensureUsableUserSession,
   readUserSessionIdentity,
@@ -74,6 +75,10 @@ export interface AttachResult {
 export interface AttachOptions {
   signal?: AbortSignal;
   onEvent?: (event: ComputerApiEvent) => void;
+  /** The one-time approval's loopback offer (services/login.ts); unused by the session attach. */
+  loopback?: LoopbackLoginOptions;
+  /** `--pair` (services/login.ts `LoginOptions.pairing`); unused by the session attach. */
+  pairing?: DevicePairingRequest;
 }
 
 export function emitAttachEvent(opts: AttachOptions | undefined, event: ComputerApiEvent): void {

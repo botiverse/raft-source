@@ -45,6 +45,101 @@ test("a comment at a place: the notice names it in Raft's words, never the page'
   assert.ok(followed.includes(`(components.html · row 4; you follow it because you pushed v12)`), followed);
 });
 
+test("a comment at a place in a section (Porthole P152): the notice names the section too, still without the selector or the page's quote", () => {
+  const at = (context: Record<string, unknown>) => formatArtifactNotice(notice({ reason: "mentioned", comments: { count: 1, latest: [excerpt({ anchor: { type: "annotation", data: {
+    kind: "element", label: "h2#states Card states", selectors: [{ type: "CssSelector", value: "#states" }, { type: "TextQuoteSelector", exact: "Card states" }], context,
+  } } })] } }));
+  const both = at({ headings: ["Agent 收件箱现状", "P5 · 读取页"], region: "设计" });
+  assert.ok(both.includes(`(components.html · element <h2> · in "Agent 收件箱现状 › P5 · 读取页" · region "设计"): "Can you`), both);
+  assert.ok(!both.includes("#states") && !both.includes("Card states"), both);
+  assert.ok(at({ headings: ["Plans"] }).includes(`(components.html · element <h2> · in "Plans"): "Can you`));
+  assert.ok(at({ region: "Design" }).includes(`(components.html · element <h2> · region "Design"): "Can you`));
+  assert.ok(at({}).includes(`(components.html · element <h2>): "Can you`));
+  // A heading's own ` › ` reads ` > `.
+  assert.ok(at({ headings: ["Docs › API", "Auth"] }).includes(`(components.html · element <h2> · in "Docs > API › Auth"): "Can you`));
+});
+
+test("a long section gives way before the title or the place is cut: the region, then the middle headings, then the outermost, then all of it; a quote is never cut", () => {
+  const long = (context: Record<string, unknown>, over: Record<string, unknown> = {}) => formatArtifactNotice(notice({ reason: "mentioned", comments: { count: 1, latest: [excerpt({
+    path: "docs/pricing.html", excerpt: "y".repeat(300),
+    anchor: { type: "annotation", data: { kind: "element", label: "h2 Plans", selectors: [{ type: "CssSelector", value: "#plans" }], context } },
+    ...over,
+  })] } }));
+  const headings = ["一".repeat(80), "二".repeat(80), "三".repeat(80), "Plans \"tiers\""];
+  const balanced = (line: string) => {
+    assert.ok(line.length <= ARTIFACT_NOTICE_MAX_CHARS, `${line.length} chars: ${line}`);
+    assert.ok(line.includes(`on "Workspace prototype" (docs/pricing.html · element <h2>`), `the title and the place whole: ${line}`);
+    assert.equal(line.replace(/\\"/g, "").split('"').length % 2, 1, `quotes balance: ${line}`);
+    assert.doesNotMatch(line, /\\(?:u[0-9a-f]{0,3})?…/, `no escape cut: ${line}`);
+    // A `…` in the chain stands for whole headings (` › … › `, `"… › `), never for the end of one.
+    assert.doesNotMatch(line, /· in "[^"]*[^\s"]…/, `no heading cut: ${line}`);
+  };
+  // No room for all of it: the region goes, then the middle headings; the outermost and the section's own heading stay, each whole.
+  const some = long({ headings, region: "区".repeat(80) });
+  balanced(some);
+  assert.ok(some.includes(`· in "${"一".repeat(80)} › … › Plans \\"tiers\\""): "y`), some);
+  assert.ok(!some.includes("region") && !some.includes("区") && !some.includes("二") && !some.includes("三"), some);
+  // Six headings: the outermost and the innermost, the four between them one `…`.
+  const ends = long({ headings: Array.from({ length: 6 }, (_, index) => `${index}${"节".repeat(79)}`), region: "区".repeat(80) });
+  balanced(ends);
+  assert.ok(ends.includes(`· in "0${"节".repeat(79)} › … › 5${"节".repeat(79)}"): "y`), ends);
+  assert.ok(!/[1-4]节/.test(ends) && !ends.includes("区"), ends);
+  for (const style of ["cli", "tool"] as const) balanced(formatArtifactNotice(notice({ reason: "subscribed", following: { kind: "followed", version: null }, comments: { count: 1, latest: [excerpt({
+    path: "docs/pricing.html", excerpt: "y".repeat(300), anchor: { type: "annotation", data: { kind: "element", label: "h2 Plans", selectors: [{ type: "CssSelector", value: "#plans" }], context: { headings, region: "区".repeat(80) } } },
+  })] } }), style));
+});
+
+test("a section's steps, as the title grows: the region first, then the middle headings (`A › … › D`), then the outermost (`… › D`), then the whole section (`· …`)", () => {
+  // Each place a notice gives, in order, as a longer title leaves it less room.
+  const placesOf = (context: Record<string, unknown> | undefined, path = "docs/plan.html") => {
+    const places: string[] = [];
+    for (let n = 0; n <= 400; n += 1) {
+      const line = formatArtifactNotice(notice({ artifact: { ...artifact, title: "T".repeat(n) }, reason: "mentioned", comments: { count: 1, latest: [excerpt({
+        path, excerpt: "y".repeat(300),
+        anchor: { type: "annotation", data: { kind: "element", label: "h3 Plans", selectors: [{ type: "CssSelector", value: "#f-deliver > div > h3" }], ...(context ? { context } : {}) } },
+      })] } }));
+      assert.ok(line.length <= ARTIFACT_NOTICE_MAX_CHARS, `${line.length} chars: ${line}`);
+      const place = line.slice(line.indexOf(" (") + 2, line.indexOf("): "));
+      if (places[places.length - 1] !== place) places.push(place);
+    }
+    return places;
+  };
+  const sage = ["P2 · 条目行", "数据模型", "条目行的组成", "统一视图：固定部分 + 条件插入"];
+  assert.deepEqual(placesOf({ headings: sage, region: "设计" }), [
+    `docs/plan.html · element <h3> · in "P2 · 条目行 › 数据模型 › 条目行的组成 › 统一视图：固定部分 + 条件插入" · region "设计"`,
+    `docs/plan.html · element <h3> · in "P2 · 条目行 › 数据模型 › 条目行的组成 › 统一视图：固定部分 + 条件插入"`,
+    `docs/plan.html · element <h3> · in "P2 · 条目行 › … › 统一视图：固定部分 + 条件插入"`,
+    `docs/plan.html · element <h3> · in "… › 统一视图：固定部分 + 条件插入"`,
+    `docs/plan.html · element <h3> · …`,
+  ]);
+  // Two headings: no middle to give up; the outermost goes, marked.
+  assert.deepEqual(placesOf({ headings: ["P2 · 条目行", "统一视图：固定部分 + 条件插入"] }), [
+    `docs/plan.html · element <h3> · in "P2 · 条目行 › 统一视图：固定部分 + 条件插入"`,
+    `docs/plan.html · element <h3> · in "… › 统一视图：固定部分 + 条件插入"`,
+    `docs/plan.html · element <h3> · …`,
+  ]);
+  // One heading, or only a region: the section whole, then marked gone.
+  assert.deepEqual(placesOf({ headings: ["统一视图：固定部分 + 条件插入"] }), [
+    `docs/plan.html · element <h3> · in "统一视图：固定部分 + 条件插入"`,
+    `docs/plan.html · element <h3> · …`,
+  ]);
+  assert.deepEqual(placesOf({ region: "设计".repeat(40) }), [`docs/plan.html · element <h3> · region "${"设计".repeat(40)}"`, `docs/plan.html · element <h3> · …`]);
+  // No section (an older comment): nothing given up, nothing marked.
+  assert.deepEqual(placesOf(undefined), [`docs/plan.html · element <h3>`]);
+  // A path over 40: the place's parts go, then the path is cut, a `…` part still where they were.
+  const path = `docs/${"very-long-folder-name/".repeat(2)}pricing.html`;
+  assert.deepEqual(placesOf({ headings: ["P2 · 条目行", "统一视图：固定部分 + 条件插入"] }, path), [
+    `${path} · element <h3> · in "P2 · 条目行 › 统一视图：固定部分 + 条件插入"`,
+    `${path} · element <h3> · in "… › 统一视图：固定部分 + 条件插入"`,
+    `${path} · element <h3> · …`,
+    `docs/very-long-folder-name/very-lon… · …`,
+  ]);
+  assert.deepEqual(placesOf(undefined, path), [`${path} · element <h3>`, `docs/very-long-folder-name/very-lon… · …`]);
+  // A shorter path: only the parts that don't fit in 40 go, one `…` for them all.
+  assert.deepEqual(placesOf({ headings: ["节".repeat(80)] }, `${"d".repeat(10)}.html`).slice(-1), [`${"d".repeat(10)}.html · element <h3> · …`]);
+  assert.deepEqual(placesOf({ headings: ["节".repeat(80)] }, `${"d".repeat(30)}.html`).slice(-2), [`${"d".repeat(30)}.html · element <h3> · …`, `${"d".repeat(30)}.html · …`]);
+});
+
 test("your file changed: who, which version, which of your files, read it if your work depends on it", () => {
   assert.equal(
     formatArtifactNotice(notice({ reason: "your_file_changed", version: { number: 14, publisher: { type: "agent", name: "Tenny" }, note: "new tech section", yourFiles: ["tech.html"], yourVersion: 12 } })),
@@ -185,4 +280,28 @@ test("a resolve (#249): who resolved your thread, its note (or the comment), how
   assert.ok(tool.includes(`artifacts_reopen({ artifact: "pt_abc", comment: "c_812" })`) && !tool.includes("raft "), tool);
   const long = formatArtifactNotice(notice({ reason: "your_comment_resolved", resolved: { by: remy, comment: excerpt({ excerpt: "x".repeat(300) }), noteExcerpt: "y\n".repeat(150) } }));
   assert.ok(long.length <= ARTIFACT_NOTICE_MAX_CHARS && long.endsWith("raft artifact reopen pt_abc c_812. Otherwise no reply is needed.") && !long.includes("\n"), long);
+});
+
+test("settled (#334): who settled it at which version, or took it back to Working; no reply needed, and how to stop", () => {
+  assert.equal(
+    formatArtifactNotice(notice({ reason: "subscribed", following: { kind: "published", version: 12 }, settlement: { by: xxchan, settled: true, version: 12 } })),
+    `@xxchan settled "Workspace prototype" at v12 (you follow it because you pushed v12): it is done, and a new version takes it back to Working. To read it: raft artifact read pt_abc. No reply is needed. To stop these: raft artifact unfollow pt_abc`,
+  );
+  assert.equal(
+    formatArtifactNotice(notice({ reason: "subscribed", following: { kind: "commented", version: null }, settlement: { by: remy, settled: false, version: 12 } })),
+    `@Remy took "Workspace prototype" back to Working (it was settled at v12); you follow it because you commented. To read it: raft artifact read pt_abc. No reply is needed. To stop these: raft artifact unfollow pt_abc`,
+  );
+  // Its author, told though it doesn't follow it: nothing to stop.
+  assert.equal(
+    formatArtifactNotice(notice({ reason: "subscribed", following: null, settlement: { by: xxchan, settled: true, version: 12 } })),
+    `@xxchan settled "Workspace prototype" at v12: it is done, and a new version takes it back to Working. To read it: raft artifact read pt_abc. No reply is needed.`,
+  );
+  assert.equal(
+    formatArtifactNotice(notice({ reason: "subscribed", following: null, settlement: { by: remy, settled: false, version: 12 } })),
+    `@Remy took "Workspace prototype" back to Working (it was settled at v12). To read it: raft artifact read pt_abc. No reply is needed.`,
+  );
+  const tool = formatArtifactNotice(notice({ reason: "subscribed", settlement: { by: remy, settled: true, version: 12 } }), "tool");
+  assert.ok(!tool.includes("raft "), tool);
+  const long = formatArtifactNotice(notice({ reason: "subscribed", artifact: { id: "pt_abc", title: "a".repeat(800) }, settlement: { by: remy, settled: true, version: 12 } }));
+  assert.ok([...long].length <= ARTIFACT_NOTICE_MAX_CHARS, long);
 });

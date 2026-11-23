@@ -4,6 +4,7 @@ import { useServerStore } from "../store/serverStore";
 import { noteMonthlyUploadQuota } from "../store/monthlyUploadQuotaStore";
 import { readMonthlyUploadQuota } from "./monthlyUploadQuota";
 import type { MonthlyUploadQuota } from "./monthlyUploadQuota";
+import { ATTACHMENT_UPLOAD_CONTROL_TIMEOUT_MS, withAttachmentUploadDeadline } from "./directAttachmentUpload";
 
 /**
  * The single-file upload ceiling is server-owned.
@@ -48,7 +49,7 @@ export interface AttachmentUploadLimits {
 }
 
 export interface AttachmentUploadLimitSource {
-  get<T>(path: string): Promise<{ data: T }>;
+  get<T>(path: string, config?: Readonly<{ signal?: AbortSignal }>): Promise<{ data: T }>;
 }
 
 /**
@@ -94,7 +95,14 @@ export async function resolveAttachmentUploadLimits(
 async function fetchLimits(source: AttachmentUploadLimitSource): Promise<AttachmentUploadLimits | null> {
   const serverId = useServerStore.getState().current?.id;
   try {
-    const { data } = await source.get<UploadCapabilityResponse>("/attachments/upload-capabilities");
+    // Bounded (#triage:#545): an unanswered probe used to keep the selection
+    // "validating" forever and queue every later pick behind it. Running out
+    // of time is an unknown ceiling, like any other failed probe.
+    const { data } = await withAttachmentUploadDeadline({
+      phase: "capability",
+      timeoutMs: ATTACHMENT_UPLOAD_CONTROL_TIMEOUT_MS,
+      run: ({ signal }) => source.get<UploadCapabilityResponse>("/attachments/upload-capabilities", { signal }),
+    });
     // A non-positive or non-finite ceiling is not a usable rule; treat it as
     // unknown rather than letting it read as "everything is too large".
     if (!Number.isFinite(data?.maxBytes) || data.maxBytes <= 0) return null;

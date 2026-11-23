@@ -4,6 +4,7 @@ import { useIntl } from "react-intl";
 import { currentTimeMs } from "@botiverse/raft-shared";
 
 import ConfirmDialog from "../../components/ConfirmDialog";
+import { useOwnerDocument } from "../../utils/ownerDocument";
 import { createPageOpenGate } from "./artifactPageOpenGate";
 import { ArtifactPageForkContext } from "./artifactPageForkContext";
 
@@ -29,13 +30,15 @@ export function useArtifactPageForkAsk(): { offered: boolean; ask: () => void; d
   const forking = useRef(false);
   // What had focus as the page asked: its frame, where the press was.
   const askedFrom = useRef<Element | null>(null);
+  // The document the page is drawn in (an object window's own focus, #337 PR3).
+  const ownDoc = useOwnerDocument();
   const ask = useCallback(() => {
     if (!asks.ask(currentTimeMs(), askedNow.current)) return;
     forking.current = false;
-    askedFrom.current = document.activeElement;
+    askedFrom.current = ownDoc.activeElement;
     askedNow.current = true;
     setAsked(true);
-  }, [asks]);
+  }, [asks, ownDoc]);
   const choose = useCallback(() => {
     forking.current = true;
     asks.acted();
@@ -50,14 +53,16 @@ export function useArtifactPageForkAsk(): { offered: boolean; ask: () => void; d
   // put it there). Focus the person put elsewhere stays.
   const finalFocus = useCallback(() => {
     if (forking.current) return false;
-    const frame = askedFrom.current;
-    if (!(frame instanceof HTMLIFrameElement)) return true;
+    const asked = askedFrom.current;
+    if (asked?.localName !== "iframe") return true;
+    const frame = asked as HTMLIFrameElement;
+    const doc = frame.ownerDocument;
     // After React's commit, which leaves focus on the body as the question goes.
     queueMicrotask(() => {
-      const active = document.activeElement;
-      if (active && active !== document.body && active !== frame) return;
+      const active = doc.activeElement;
+      if (active && active !== doc.body && active !== frame) return;
       frame.closest<HTMLElement>("[data-artifact-focus]")?.focus({ preventScroll: true });
-      if (document.activeElement === frame) frame.blur();
+      if (doc.activeElement === frame) frame.blur();
     });
     return false;
   }, []);

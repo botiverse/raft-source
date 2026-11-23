@@ -18,7 +18,7 @@ import { signAccessToken } from "../middleware/auth";
 import { __setEmailDeliveryObserverForTests, type EmailDelivery } from "../services/emailService";
 import { leaveRetiredSecondFactorFlagRowOff } from "../test/integration/secondFactor";
 import { base32Decode, hotp, totpStepAt } from "../services/secondFactor/totp";
-import { TOTP_SECRET_KEY_ENV } from "../services/secondFactor/totpSecretCrypto";
+import { encryptTotpSecret, TOTP_SECRET_KEY_ENV } from "../services/secondFactor/totpSecretCrypto";
 import { createSession } from "../services/sessionService";
 import { proofForDeviceLogin } from "../services/sessionIssueGate";
 import { signInForTest } from "../test/integration/credentials";
@@ -542,4 +542,26 @@ test("one code turns it on: /enable right after /totp/setup confirms the app and
   assert.ok(totp.lastUsedStep !== null, "that code's step is the replay guard");
   const status = await call(app.baseUrl, session.token, "GET", "/status");
   assert.deepEqual(await status.json(), { enabled: true, methods: { totp: true, passkeys: 0, backupCodesRemaining: 10 }, sessionVerified: true, recovery: null });
+});
+
+test("an unverified email can't add an authenticator app or turn it on; verified, it can (passkeys: secondFactorPasskeys.api.test.ts)", async ({ app, seed }) => {
+  const human = await seed.human({ emailVerified: false }) as Human;
+  const session = await webSession(human.id);
+  const refusedCode = async (res: Response) => {
+    assert.equal(res.status, 403);
+    return (await res.json() as { code: string }).code;
+  };
+
+  assert.equal(await refusedCode(await call(app.baseUrl, session.token, "POST", "/totp/setup")), "email_verification_required");
+  assert.equal((await getDb().select().from(userTotp).where(eq(userTotp.userId, human.id))).length, 0);
+
+  // An authenticator app confirmed before this rule (or written some other
+  // way) still can't turn two-step verification on.
+  const secret = "JBSWY3DPEHPK3PXP";
+  await getDb().insert(userTotp).values({ userId: human.id, secretCiphertext: encryptTotpSecret(secret, human.id), confirmedAt: new Date(), lastUsedStep: null });
+  assert.equal(await refusedCode(await call(app.baseUrl, session.token, "POST", "/enable", { code: totpCode(secret, 0) })), "email_verification_required");
+  assert.equal((await getDb().select({ at: users.secondFactorRequiredAt }).from(users).where(eq(users.id, human.id)))[0]?.at, null);
+
+  await getDb().update(users).set({ emailVerified: true }).where(eq(users.id, human.id));
+  assert.equal((await call(app.baseUrl, session.token, "POST", "/enable", { code: totpCode(secret, 0) })).status, 200);
 });

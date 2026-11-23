@@ -325,6 +325,33 @@ test("agent-api v2 binds typed mentions while v1 keeps its existing raw-handle b
     assert.equal((await latestChannelMessages(fixture.channelId)).length, 4);
 });
 
+test("agent-api v2 refuses a mention bound twice under a handle ending in raft with the sentence naming it", async ({ app }) => {
+    // The refusal quotes the handle; "@ops-raft is" once read as the `raft` command and refuse() threw.
+    const fixture = await seedFixture();
+    const db = getDb();
+    const [human] = await db.insert(users).values({
+      email: `ops-raft-${randomUUID()}@slock.test`,
+      name: "ops-raft",
+      passwordHash: await fixturePasswordHash("password123"),
+      emailVerified: true,
+    }).returning();
+    await db.insert(serverMembers).values({ serverId: fixture.serverId, userId: human.id, role: "member" });
+    const agent = await createAgent(fixture.serverId, "ops-raft", { runtime: "claude", model: "sonnet" });
+
+    const conflict = await sendViaAgentApiV2(app.baseUrl, fixture, {
+      target: `#${fixture.channelName}`,
+      content: "conflict @ops-raft",
+      mentions: [
+        { type: "user", id: human.id, name: "ops-raft" },
+        { type: "agent", id: agent.id, name: "ops-raft" },
+      ],
+      idempotencyKey: "typed-ops-raft-conflict",
+    });
+    assert.equal(conflict.status, 400);
+    assert.equal(conflict.body.code, "mention_binding_conflict");
+    assert.match(String(conflict.body.error), /@ops-raft is bound to more than one actor/);
+});
+
 test("agent-api v2 idempotent replay reads the original durable mention facts after rename", async ({ app }) => {
     const emitted = installFakeIo(app);
     const fixture = await seedFixture();
@@ -503,7 +530,8 @@ test("agent-api send rejects malformed attachment ids with a 400 instead of a da
     assert.equal(res.status, 400, JSON.stringify(res.body));
     assert.equal(res.body.code, "attachment_id_invalid");
     assert.ok(res.body.error.startsWith(`Not sent: attachmentIds entry ${entry} is not a single attachment ID.`), res.body.error);
-    assert.match(res.body.error, /one ID per --attachment-id/);
+    assert.doesNotMatch(res.body.error, /--attachment-id/, "the flag is the step, not the sentence");
+    assert.match(String(res.body.suggestedNextAction), /one ID per --attachment-id/);
     assert.equal(JSON.stringify(res.body).includes(first), false, "the rejected value is not echoed");
   }
   const persisted = await latestChannelMessages(fixture.channelId);

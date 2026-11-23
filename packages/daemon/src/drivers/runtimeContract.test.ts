@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { getDriver, registeredRuntimeIds, runtimeIdsShippedWithComputer } from "./index";
 
-const runtimeIds = ["builtin", "claude", "codex", "grok", "kimi", "cursor", "gemini", "copilot", "opencode", "pi"] as const;
-const stdinSteerablePersistentRuntimeIds = ["claude", "codex", "grok", "kimi"] as const;
+const runtimeIds = ["builtin", "claude", "grok", "kimi", "cursor", "gemini", "copilot", "opencode", "pi"] as const;
+const stdinSteerablePersistentRuntimeIds = ["claude", "grok", "kimi"] as const;
 const perTurnRuntimeIds = ["cursor", "gemini", "copilot", "opencode"] as const;
 
 const expectedContracts = {
@@ -22,14 +22,6 @@ const expectedContracts = {
     modelVerifiedAs: "launchable",
     nativeStandingPrompt: true,
     stdinDuringCompaction: true,
-  },
-  codex: {
-    lifecycle: { kind: "persistent", stdin: "direct", inFlightWake: "steer" },
-    communication: { chat: "slock_cli", runtimeControl: "none" },
-    stdoutChannel: "structured_protocol",
-    session: { recovery: "resume_or_fresh", compaction: "reported", compactionFailure: "does_not_stick" },
-    modelVerifiedAs: "launchable",
-    nativeStandingPrompt: true,
   },
   grok: {
     lifecycle: { kind: "persistent", stdin: "direct", inFlightWake: "steer" },
@@ -156,19 +148,8 @@ test("stdin steerable persistent sessions distinguish idle prompt from busy stee
     const driver = getDriver(runtimeId);
     const sessionId = `${runtimeId}-session`;
 
-    if (runtimeId === "codex") {
-      driver.parseLine(JSON.stringify({ method: "thread/started", params: { thread: { id: sessionId } } }));
-    }
-
     const idleEncoded = driver.encodeStdinMessage("idle prompt", sessionId, { mode: "idle" });
     assert.ok(idleEncoded, `${runtimeId} must accept idle stdin prompt`);
-
-    if (runtimeId === "codex") {
-      driver.parseLine(JSON.stringify({
-        method: "turn/started",
-        params: { threadId: sessionId, turn: { id: `${runtimeId}-turn` } },
-      }));
-    }
 
     const busyEncoded = driver.encodeStdinMessage("busy steering", sessionId, { mode: "busy" });
     assert.ok(busyEncoded, `${runtimeId} must accept busy stdin steering`);

@@ -24,6 +24,7 @@ import { SkeletonTextBar } from "../ui/Skeleton";
 import { SKELETON_BADGE_CLASS } from "../ui/skeletonBoxes";
 import { TaskBacklogReasonPopover } from "./TaskBacklogReasonPopover";
 
+import { useCanWriteTaskChannel } from "./taskChannelWrite";
 import { STATUS_STYLES, canEditTaskStatus, getTaskStatusOptions, toRuiTaskStatus } from "./taskStatusUi";
 
 // The card's parts, shared with its placeholder (TaskCardSkeleton): the open
@@ -62,7 +63,7 @@ function TaskCard({ task, onOpen, showChannelName = true, footerEnd, titleEnd, c
   const statusChipRef = useRef<HTMLButtonElement>(null);
   const [busy, setBusy] = useState(false);
   const canManageServer = capabilities.deleteAnyTask;
-  const canEditStatus = canEditTaskStatus(task, currentUser?.id, canManageServer);
+  const canEditStatus = canEditTaskStatus(task, currentUser?.id, canManageServer, useCanWriteTaskChannel(task.channelId));
   const { formatMessage } = useIntl();
   const currentUserId = currentUser?.id;
   const taskV2 = useServerFeatureFlag(TASK_V2_CONVERSATIONS_FLAG_KEY).enabled;

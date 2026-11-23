@@ -5,7 +5,7 @@ import { createServer, type Server } from "node:http";
 import { createConnection, type AddressInfo, type Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS, BUILTIN_RUNTIME_HOST_PROVIDER_ENV_SCRUB_KEYS, eventsForSpan, PI_BUILTIN_PROVIDER_CONNECTION_PROBES, providerRequestId, RUNTIME_CONFIG_VERSION } from "@botiverse/raft-shared";
+import { BasicTracer, BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS, BUILTIN_RUNTIME_HOST_PROVIDER_ENV_SCRUB_KEYS, createSpanAttrContractTracer, eventsForSpan, MemoryTraceSink, PI_BUILTIN_PROVIDER_CONNECTION_PROBES, providerRequestId, RUNTIME_CONFIG_VERSION } from "@botiverse/raft-shared";
 import fc from "fast-check";
 import {
   BuiltInDriver,
@@ -23,6 +23,7 @@ import {
   resolveBuiltInThinkingLevel,
   type AnthropicGatewayThinkingContract,
   createPiSdkEventMappingState,
+  PI_PROVIDER_FINISH_ERROR_CONTINUE_MESSAGE,
   detectPiModels,
   detectPiModelsFromRegistry,
   mapPiSdkEventToParsedEvents,
@@ -38,6 +39,7 @@ import {
   __piPromptsInFlightForTest,
 } from "./pi";
 import { piSessionMemoryAttrs } from "./piSessionMemory";
+import { DAEMON_CORE_TRACE_ATTR_CONTRACTS } from "../core";
 import { waitForState } from "../testing/drydock";
 import type { ProviderRequestObserver } from "../providerRequestFetch";
 import {
@@ -195,7 +197,6 @@ test("Built-in driver is a separate preset runtime with static launchable models
       runtime: "builtin",
       runtimeVersion: driver.probe().version,
       customModelProviderIds: [...BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS],
-      customModelConnectionProviderIds: [...BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS],
     });
     assert.equal(detected.value.models.some((model) => model.id === "deepseek/deepseek-v4-pro" && model.verified === "launchable"), true);
     // 0.86.0 renamed this entry: deepseek-v4-flash -> deepseek-flash ("DeepSeek V4.1 Flash").
@@ -884,70 +885,6 @@ test("Built-in records a transcript persistence failure outside the transcript",
     );
   } finally {
     session?.dispose();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("managed compatible connection materializes a secret-free gateway projection for SDK launch", async () => {
-  const root = mkdtempSync(path.join(os.tmpdir(), "slock-managed-provider-model-"));
-  const workingDirectory = path.join(root, "workspace");
-  const { sink, tracer, traceId } = makeDeterministicTracer();
-  mkdirSync(workingDirectory, { recursive: true });
-
-  try {
-    const session = await createPiAgentSessionForContext(
-      makeSpawnContext({
-        runtime: "builtin",
-        model: "managed-e2e-model",
-        envVars: {
-          OPENAI_API_KEY: "managed-launch-key",
-          OPENAI_BASE_URL: "http://127.0.0.1:8788/v1",
-        },
-        providerConnection: {
-          providerId: "openai-compatible",
-          endpointUrl: "http://127.0.0.1:8788/v1",
-          supportsImageInput: true,
-        },
-        runtimeConfig: {
-          version: RUNTIME_CONFIG_VERSION,
-          runtime: "builtin",
-          provider: {
-            kind: "connection",
-            connectionId: "11111111-1111-4111-8111-111111111111",
-          },
-          hostUserState: "forbidden",
-          model: { kind: "custom", name: "managed-e2e-model" },
-          mode: { kind: "default" },
-        },
-      }, { workingDirectory, launchId: "managed-launch-1", tracer }),
-      "managed-provider-session",
-      {
-        agentDir: buildBuiltInAgentDir(workingDirectory),
-        sessionDir: buildBuiltInSessionDir(workingDirectory),
-        traceName: "daemon.builtin.managed.session.create",
-        exposeLaunchTraceEvidence: true,
-        exposeLaunchEnvToTools: false,
-        isolateHostProviderEnv: true,
-      },
-    );
-
-    try {
-      assert.equal(session.model?.provider, "openai");
-      assert.equal(session.model?.id, "managed-e2e-model");
-      assert.equal(session.model?.baseUrl, "http://127.0.0.1:8788/v1");
-      assert.deepEqual(session.model?.input, ["text", "image"]);
-      assert.equal((await session.modelRuntime.getAuth("openai"))?.auth.apiKey, "managed-launch-key");
-      const traceSpan = traceRows(sink, traceId)
-        .find((span) => span.name === "daemon.builtin.managed.session.create");
-      assert.equal(traceSpan?.attrs?.provider_id, "openai-compatible");
-      assert.equal(traceSpan?.attrs?.base_url_present, true);
-      assert.equal(traceSpan?.attrs?.provider_key_present, true);
-      assert.equal(traceSpan?.attrs?.provider_key_source, "server_managed_connection");
-      assert.equal(JSON.stringify(traceSpan).includes("managed-launch-key"), false);
-    } finally {
-      session.dispose();
-    }
-  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -1900,6 +1837,410 @@ test("SDK event mapping fails closed when retry terminal sequencing is incomplet
   assert.deepEqual(missingRetryEndEvents.filter((event) => event.kind === "error"), [
     { kind: "error", message: "provider failed" },
   ]);
+});
+
+// task #triage:#431: pi-ai maps an OpenAI-compatible `finish_reason: "error"` to this
+// non-retryable error; right after committed tool results it used to just stop the turn.
+const PROVIDER_FINISH_ERROR = "Provider finish_reason: error";
+
+function piToolRunThenAssistant(callId: string, final: Record<string, unknown>): AgentSessionEvent[] {
+  return [
+    { type: "agent_start" },
+    {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        stopReason: "toolUse",
+        content: [{ type: "toolCall", id: callId, name: "bash", arguments: { command: "ls" } }],
+      },
+    },
+    { type: "tool_execution_start", toolCallId: callId, toolName: "bash", args: { command: "ls" } },
+    { type: "tool_execution_end", toolCallId: callId, toolName: "bash", isError: false },
+    { type: "message_end", message: { role: "toolResult", toolCallId: callId, content: [{ type: "text", text: "ok" }] } },
+    { type: "message_end", message: { role: "assistant", ...final } },
+    { type: "agent_end", messages: [], willRetry: false },
+    { type: "agent_settled", aborted: false },
+  ] as unknown as AgentSessionEvent[];
+}
+
+function piToolRunThenFinishError(callId: string): AgentSessionEvent[] {
+  return piToolRunThenAssistant(callId, { stopReason: "error", errorMessage: PROVIDER_FINISH_ERROR, content: [] });
+}
+
+function piContinuationRun(): AgentSessionEvent[] {
+  return [
+    { type: "agent_start" },
+    {
+      type: "message_end",
+      message: { role: "custom", customType: "raft_provider_finish_error_continue", content: "continue", display: false },
+    },
+    { type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] } },
+    { type: "agent_end", messages: [], willRetry: false },
+    { type: "agent_settled", aborted: false },
+  ] as unknown as AgentSessionEvent[];
+}
+
+test("⭐ SDK event mapping continues once past an empty finish_reason error after committed tool results (task #triage:#431)", () => {
+  const state = createPiSdkEventMappingState("pi-session-finish-error");
+  const first = piToolRunThenFinishError("call-1").flatMap((event) => mapPiSdkEventToParsedEvents(event, state));
+
+  assert.deepEqual(first.filter((event) => event.kind === "error"), [], "the error is held, not surfaced");
+  assert.equal(first.filter((event) => event.kind === "turn_end").length, 0, "the daemon turn stays open");
+  assert.equal(state.providerFinishErrorContinueRequested, true);
+  state.providerFinishErrorContinueRequested = false; // what the driver does when it continues
+
+  const continuation = piContinuationRun().flatMap((event) => mapPiSdkEventToParsedEvents(event, state));
+  assert.deepEqual(continuation.filter((event) => event.kind === "error"), []);
+  assert.equal(continuation.filter((event) => event.kind === "tool_call").length, 0, "no tool is replayed");
+  assert.deepEqual(continuation.filter((event) => event.kind === "turn_end"), [
+    { kind: "turn_end", sessionId: "pi-session-finish-error" },
+  ]);
+  assert.equal(state.providerFinishErrorContinueRequested, false);
+});
+
+test("SDK event mapping surfaces a second finish_reason error in the same turn, and the next turn may continue again", () => {
+  const state = createPiSdkEventMappingState("pi-session-finish-error-twice");
+  piToolRunThenFinishError("call-1").forEach((event) => mapPiSdkEventToParsedEvents(event, state));
+  assert.equal(state.providerFinishErrorContinueRequested, true);
+  state.providerFinishErrorContinueRequested = false;
+
+  const second = piToolRunThenFinishError("call-2").flatMap((event) => mapPiSdkEventToParsedEvents(event, state));
+  assert.deepEqual(second.filter((event) => event.kind === "error"), [{ kind: "error", message: PROVIDER_FINISH_ERROR }]);
+  assert.equal(second.filter((event) => event.kind === "turn_end").length, 1);
+  assert.equal(state.providerFinishErrorContinueRequested, false);
+  assert.equal(state.providerFinishErrorSurfacedSecond, true, "the driver traces the second occurrence");
+  state.providerFinishErrorSurfacedSecond = false;
+
+  // A new daemon turn has its own single continuation.
+  piToolRunThenFinishError("call-3").forEach((event) => mapPiSdkEventToParsedEvents(event, state));
+  assert.equal(state.providerFinishErrorContinueRequested, true);
+});
+
+test("SDK event mapping surfaces finish errors it cannot safely continue past", () => {
+  const cases: Array<{ name: string; sequence: AgentSessionEvent[] }> = [
+    {
+      name: "no committed tool result before it",
+      sequence: [
+        { type: "agent_start" },
+        { type: "message_end", message: { role: "user", content: [{ type: "text", text: "hi" }] } },
+        { type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: PROVIDER_FINISH_ERROR, content: [] } },
+        { type: "agent_end", messages: [], willRetry: false },
+        { type: "agent_settled", aborted: false },
+      ] as unknown as AgentSessionEvent[],
+    },
+    {
+      name: "the failed response produced output",
+      sequence: piToolRunThenAssistant("call-1", {
+        stopReason: "error",
+        errorMessage: PROVIDER_FINISH_ERROR,
+        content: [{ type: "text", text: "partial answer" }],
+      }),
+    },
+    {
+      name: "the failed response started a tool call",
+      sequence: piToolRunThenAssistant("call-1", {
+        stopReason: "error",
+        errorMessage: PROVIDER_FINISH_ERROR,
+        content: [{ type: "toolCall", id: "call-2", name: "bash", arguments: {} }],
+      }),
+    },
+    {
+      name: "a different finish reason",
+      sequence: piToolRunThenAssistant("call-1", {
+        stopReason: "error",
+        errorMessage: "Provider finish_reason: content_filter",
+        content: [],
+      }),
+    },
+    {
+      name: "the run was aborted",
+      sequence: piToolRunThenFinishError("call-1").map((event) => (
+        event.type === "agent_settled" ? { ...event, aborted: true } : event
+      )),
+    },
+  ];
+  for (const { name, sequence } of cases) {
+    const state = createPiSdkEventMappingState(`pi-session-${name}`);
+    const events = sequence.flatMap((event) => mapPiSdkEventToParsedEvents(event, state));
+    assert.equal(events.filter((event) => event.kind === "error").length, 1, name);
+    assert.equal(events.filter((event) => event.kind === "turn_end").length, 1, name);
+    assert.equal(state.providerFinishErrorContinueRequested, false, name);
+  }
+});
+
+/** Defers what an agent_settled listener starts until the listeners return, as Pi's AgentSession does. */
+function createSettleDeferringFakeSession(
+  sessionId: string,
+  runs: AgentSessionEvent[][],
+  calls: string[],
+  options?: { continuationError?: Error },
+) {
+  let listener: ((event: AgentSessionEvent) => void) | null = null;
+  let emittingSettled = false;
+  let runIndex = 0;
+  const deferred: Array<() => Promise<void>> = [];
+  const run = async () => {
+    for (const event of runs[runIndex++] ?? []) {
+      if (event.type !== "agent_settled") {
+        listener?.(event);
+        continue;
+      }
+      emittingSettled = true;
+      try {
+        listener?.(event);
+      } finally {
+        emittingSettled = false;
+      }
+      for (const action of deferred.splice(0)) await action();
+    }
+  };
+  const fake = {
+    sessionId,
+    isStreaming: false,
+    subscribe(cb: (event: AgentSessionEvent) => void) {
+      listener = cb;
+      return () => {
+        listener = null;
+      };
+    },
+    async prompt(text: string) {
+      calls.push(`prompt:${text}`);
+      await run();
+    },
+    async sendCustomMessage(
+      message: { customType: string; display: boolean },
+      sendOptions?: { triggerTurn?: boolean },
+    ): Promise<void> {
+      if (emittingSettled) {
+        deferred.push(() => fake.sendCustomMessage(message, sendOptions));
+        return;
+      }
+      calls.push(`custom:${message.customType}:display=${message.display}:triggerTurn=${sendOptions?.triggerTurn}`);
+      if (options?.continuationError) throw options.continuationError;
+      await run();
+    },
+    async steer() {},
+    async abort() {},
+    dispose() {
+      calls.push("dispose");
+    },
+  };
+  return fake;
+}
+
+async function runFinishErrorRuntime(
+  runs: AgentSessionEvent[][],
+  options?: { continuationError?: Error; idleSend?: boolean },
+) {
+  const { sink, tracer } = makeDeterministicTracer();
+  const calls: string[] = [];
+  const events: ParsedEvent[] = [];
+  const fake = createSettleDeferringFakeSession("pi-session-finish-error-runtime", runs, calls, options);
+  const workingDirectory = mkdtempSync(path.join(os.tmpdir(), "pi-finish-error-"));
+  const runtime = new PiSdkRuntimeSession(
+    makeSpawnContext({}, { tracer, launchId: "launch-finish-error", workingDirectory }),
+    () => undefined,
+    async () => fake as unknown as AgentSession,
+  );
+  runtime.on("runtime_event", (event) => events.push(event));
+  try {
+    if (options?.idleSend) {
+      // The start prompt is a plain wake turn; the delivered (turn/start) idle prompt is the second run.
+      assert.deepEqual(await runtime.start({ text: "wake" }), { ok: true, acceptedAs: "prompt" });
+      await waitForState(() => events.some((event) => event.kind === "turn_end"), "the wake turn ended", { timeoutMs: 1_000, pollIntervalMs: 10 });
+      events.length = 0;
+      assert.deepEqual(runtime.send({ mode: "idle", text: "do the work" }), { ok: true, acceptedAs: "prompt" });
+    } else {
+      assert.deepEqual(await runtime.start({ text: "do the work" }), { ok: true, acceptedAs: "prompt" });
+    }
+    await waitForState(
+      () => events.some((event) => event.kind === "turn_end"),
+      "the daemon turn ended",
+      { timeoutMs: 1_000, pollIntervalMs: 10 },
+    );
+    // Let a late failure or a second turn_end show up before asserting there is none.
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    rmSync(workingDirectory, { recursive: true, force: true });
+  }
+  const rows = traceRows(sink).filter((row) => row.name === "daemon.pi.provider_finish_error.continued");
+  return { calls, events, continued: rows.map((row) => row.attrs?.outcome), rows };
+}
+
+test("⭐ PiSdkRuntimeSession continues the session once past a finish_reason error, without re-prompting or replaying tools", async () => {
+  const { calls, events, continued, rows } = await runFinishErrorRuntime([piToolRunThenFinishError("call-1"), piContinuationRun()]);
+
+  assert.deepEqual(calls, [
+    "prompt:do the work",
+    "custom:raft_provider_finish_error_continue:display=false:triggerTurn=true",
+  ]);
+  assert.equal(events.filter((event) => event.kind === "tool_call").length, 1);
+  assert.deepEqual(events.filter((event) => event.kind === "error" || event.kind === "delivery_error"), []);
+  assert.equal(events.filter((event) => event.kind === "turn_end").length, 1);
+  assert.deepEqual(continued, ["requested"]);
+  assert.equal(rows[0]?.attrs?.error_class, "provider_finish_reason_error");
+  assert.equal(rows[0]?.attrs?.session_id, "pi-session-finish-error-runtime");
+  assert.equal(rows[0]?.attrs?.session_id_present, true);
+});
+
+test("PiSdkRuntimeSession surfaces a second finish_reason error in the same turn instead of continuing again", async () => {
+  const { calls, events, continued } = await runFinishErrorRuntime([
+    piToolRunThenFinishError("call-1"),
+    piToolRunThenFinishError("call-2"),
+  ]);
+
+  assert.equal(calls.filter((call) => call.startsWith("custom:")).length, 1);
+  assert.deepEqual(events.filter((event) => event.kind === "error"), [{ kind: "error", message: PROVIDER_FINISH_ERROR }]);
+  assert.equal(events.filter((event) => event.kind === "turn_end").length, 1);
+  assert.deepEqual(continued, ["requested", "surfaced_second"]);
+});
+
+test("PiSdkRuntimeSession surfaces the real reason a continuation could not start, then ends the held turn", async () => {
+  const { events, continued, rows } = await runFinishErrorRuntime([piToolRunThenFinishError("call-1")], {
+    continuationError: new Error("No API key for provider: openai"),
+  });
+
+  // The start failure keeps its own text (and kind), not the provider stop it was continuing past.
+  assert.deepEqual(events.filter((event) => event.kind === "error" || event.kind === "delivery_error"), [
+    { kind: "error", message: "No API key for provider: openai" },
+  ]);
+  const kinds = events.map((event) => event.kind);
+  assert.equal(kinds.filter((kind) => kind === "turn_end").length, 1);
+  assert.ok(kinds.lastIndexOf("turn_end") > kinds.indexOf("error"), "the held turn ends after the failure");
+  assert.deepEqual(continued, ["requested", "start_failed"]);
+  assert.equal(rows[1]?.attrs?.error_class, "Error");
+});
+
+test("PiSdkRuntimeSession never turns a delivered prompt's continuation failure into a delivery_error (APM would redeliver it)", async () => {
+  const wake = [
+    { type: "agent_start" },
+    { type: "agent_end", messages: [], willRetry: false },
+    { type: "agent_settled", aborted: false },
+  ] as unknown as AgentSessionEvent[];
+  const { events, continued } = await runFinishErrorRuntime([wake, piToolRunThenFinishError("call-1")], {
+    continuationError: new Error("No API key for provider: openai"),
+    idleSend: true,
+  });
+
+  assert.deepEqual(events.filter((event) => event.kind === "error" || event.kind === "delivery_error"), [
+    { kind: "error", message: "No API key for provider: openai" },
+  ]);
+  assert.equal(events.filter((event) => event.kind === "turn_end").length, 1);
+  assert.deepEqual(continued, ["requested", "start_failed"]);
+});
+
+/**
+ * A loopback OpenAI-compatible gateway for the real Pi chain: a bash tool call, then a response
+ * that is nothing but `finish_reason: "error"`, then (the continuation) a plain answer.
+ */
+function startFinishErrorGateway(command: string): { server: Server; bodies: Array<Record<string, any>> } {
+  const bodies: Array<Record<string, any>> = [];
+  const server = createServer((req, res) => {
+    if (answerGatewayModelListRead(req, res)) return;
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      const id = `chatcmpl-finish-error-${bodies.length}`;
+      const chunk = (choice: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+        `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: 1, model: "gateway-finish-error-model", choices: [{ index: 0, ...choice }], ...extra })}\n\n`;
+      const usage = { usage: { prompt_tokens: 10, completion_tokens: 1, total_tokens: 11 } };
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+      if (bodies.length === 1) {
+        res.write(chunk({
+          delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_finish_1", type: "function", function: { name: "bash", arguments: JSON.stringify({ command }) } }] },
+          finish_reason: null,
+        }));
+        res.write(chunk({ delta: {}, finish_reason: "tool_calls" }, usage));
+      } else if (bodies.length === 2) {
+        // pi-ai 1.5.2 maps this to stopReason "error", errorMessage "Provider finish_reason: error", no content.
+        res.write(chunk({ delta: {}, finish_reason: "error" }, usage));
+      } else {
+        res.write(chunk({ delta: { content: "done" }, finish_reason: null }));
+        res.write(chunk({ delta: {}, finish_reason: "stop" }, usage));
+      }
+      res.end("data: [DONE]\n\n");
+    });
+  });
+  return { server, bodies };
+}
+
+test("⭐ real Pi chain: an empty finish_reason error after a tool result continues once inside the same prompt, without re-running the tool", { timeout: 30_000 }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "slock-pi-finish-error-"));
+  const workingDirectory = path.join(root, "workspace");
+  mkdirSync(workingDirectory, { recursive: true });
+  const marker = path.join(root, "tool-ran.txt");
+  const gateway = startFinishErrorGateway(`echo ran >> ${JSON.stringify(marker)}`);
+  const port = await listenOnLoopback(gateway.server);
+  const sink = new MemoryTraceSink();
+  const runtime = new BuiltInDriver().createSession(makeSpawnContext({
+    runtime: "builtin",
+    model: "gateway-finish-error-model",
+    runtimeConfig: {
+      version: RUNTIME_CONFIG_VERSION,
+      runtime: "builtin",
+      provider: {
+        kind: "gateway",
+        providerId: "openai-compatible",
+        baseUrl: `http://127.0.0.1:${port}/v1`,
+        apiKey: "sk-finish-error",
+        supportsImageInput: false,
+      },
+      hostUserState: "forbidden",
+      model: { kind: "custom", name: "gateway-finish-error-model" },
+      mode: { kind: "default" },
+    },
+  }, {
+    workingDirectory,
+    launchId: "launch-finish-error-real",
+    // The production layering: attrs outside DAEMON_CORE_TRACE_ATTR_CONTRACTS are dropped.
+    tracer: createSpanAttrContractTracer(new BasicTracer({ sink }), DAEMON_CORE_TRACE_ATTR_CONTRACTS),
+  }));
+  const events: ParsedEvent[] = [];
+  const promptSpans = () => traceRows(sink).filter((row) => row.name === "daemon.pi.prompt");
+  let promptSpansAtTurnEnd: number | null = null;
+  runtime.on("runtime_event", (event) => {
+    events.push(event);
+    if (event.kind === "turn_end") promptSpansAtTurnEnd = promptSpans().length;
+  });
+  try {
+    await runtime.start({ text: "do the work", sessionId: "pi-finish-error-real" });
+    await waitForState(() => events.some((event) => event.kind === "turn_end"), "the daemon turn ended", { timeoutMs: 20_000, pollIntervalMs: 10 });
+    await waitForState(() => promptSpans().length === 1, "the original prompt resolved", { timeoutMs: 5_000, pollIntervalMs: 10 });
+
+    // Tool call, the empty error stop, the continuation: and nothing after it.
+    assert.equal(gateway.bodies.length, 3, JSON.stringify(gateway.bodies.map((body) => body.messages?.at(-1))));
+    // The tool ran once: neither Pi nor the continuation replayed it.
+    assert.equal(readFileSync(marker, "utf8"), "ran\n");
+    assert.equal(events.filter((event) => event.kind === "tool_call").length, 1);
+    assert.deepEqual(events.filter((event) => event.kind === "error" || event.kind === "delivery_error"), []);
+    assert.equal(events.filter((event) => event.kind === "turn_end").length, 1);
+
+    // Deferred inside agent_settled: the continuation ran within the original prompt, which
+    // resolved only after the continuation's turn_end (one daemon.pi.prompt span, ended later).
+    assert.equal(promptSpansAtTurnEnd, 0, "the original prompt was still in flight at the turn end");
+    assert.equal(promptSpans()[0]?.status, "ok");
+
+    // What the model received: the committed tool result, the failed empty response skipped by
+    // pi-ai's replay, and the hidden note last.
+    const continuation = gateway.bodies[2]!.messages as Array<{ role: string; content?: unknown; tool_calls?: unknown }>;
+    assert.equal(continuation.filter((message) => message.role === "assistant").length, 1, "only the tool-call response is replayed");
+    assert.equal(continuation.filter((message) => message.role === "tool").length, 1);
+    const last = continuation.at(-1)!;
+    assert.equal(last.role, "user");
+    assert.ok(JSON.stringify(last.content).includes(PI_PROVIDER_FINISH_ERROR_CONTINUE_MESSAGE.content), JSON.stringify(last));
+
+    const traced = traceRows(sink).filter((row) => row.name === "daemon.pi.provider_finish_error.continued");
+    assert.deepEqual(traced.map((row) => row.attrs?.outcome), ["requested"]);
+    assert.equal(traced[0]?.attrs?.provider_id, "openai-compatible");
+    assert.equal(traced[0]?.attrs?.error_class, "provider_finish_reason_error");
+    assert.equal(traced[0]?.attrs?.session_id_present, true);
+    assert.equal(traced[0]?.attrs?.model_id, undefined, "a custom model's name is not a trace attr");
+  } finally {
+    await runtime.stop();
+    await closeServer(gateway.server);
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("SDK event mapping emits token_usage from message_end usage on a successful turn", () => {
@@ -3067,32 +3408,6 @@ test("Pi auth seeding keeps SDK model refresh offline", async () => {
   ] as Parameters<typeof seedPiSessionModelRuntime>[1][];
 
   for (const config of configs) await seedPiSessionModelRuntime(modelRuntime, config);
-  await seedPiSessionModelRuntime(
-    modelRuntime,
-    {
-      version: RUNTIME_CONFIG_VERSION,
-      runtime: "builtin",
-      provider: { kind: "connection", connectionId: "11111111-1111-4111-8111-111111111111" },
-      hostUserState: "forbidden",
-      model: { kind: "preset", id: "deepseek/deepseek-v4-pro" },
-      mode: { kind: "default" },
-    },
-    { providerId: "deepseek", endpointUrl: null, supportsImageInput: false },
-    { DEEPSEEK_API_KEY: "managed-key" },
-  );
-  await seedPiSessionModelRuntime(
-    modelRuntime,
-    {
-      version: RUNTIME_CONFIG_VERSION,
-      runtime: "builtin",
-      provider: { kind: "connection", connectionId: "22222222-2222-4222-8222-222222222222" },
-      hostUserState: "forbidden",
-      model: { kind: "preset", id: "google/gemini-3.1-pro-preview" },
-      mode: { kind: "default" },
-    },
-    { providerId: "google", endpointUrl: null, supportsImageInput: false },
-    { GEMINI_API_KEY: "managed-google-key" },
-  );
 
   // Sole refresh-option guard for every setRuntimeApiKey branch; new provider paths must extend this expected call log.
   assert.deepEqual(calls, [
@@ -3100,67 +3415,25 @@ test("Pi auth seeding keeps SDK model refresh offline", async () => {
     { providerId: "kimi-coding", apiKey: "preset-key", argCount: 2 },
     { providerId: "openai", apiKey: "gateway-key", argCount: 2 },
     { providerId: "anthropic", apiKey: "anthropic-gateway-key", argCount: 2 },
-    { providerId: "deepseek", apiKey: "managed-key", argCount: 2 },
-    { providerId: "google", apiKey: "managed-google-key", argCount: 2 },
   ]);
 });
 
-test("managed provider launches seed credentials from ephemeral env and keep gateway metadata secret-free", async () => {
-  const deepseekConfig = {
+test("a config bound to a removed saved provider connection seeds no key and fails the start", async () => {
+  const connectionConfig = {
     version: RUNTIME_CONFIG_VERSION,
     runtime: "builtin",
     provider: { kind: "connection", connectionId: "11111111-1111-4111-8111-111111111111" },
     hostUserState: "forbidden",
-    model: { kind: "preset", id: "deepseek/deepseek-v4-pro" },
+    model: { kind: "custom", name: "managed-model" },
     mode: { kind: "default" },
   } as const;
-  const deepseekRuntime = await ModelRuntime.create({
-    credentials: new InMemoryCredentialStore(),
-    modelsPath: null,
-    allowModelNetwork: false,
-  });
-  await seedPiSessionModelRuntime(
-    deepseekRuntime,
-    deepseekConfig,
-    { providerId: "deepseek", endpointUrl: null, supportsImageInput: false },
-    { DEEPSEEK_API_KEY: "managed-deepseek-key" },
-  );
-  assert.equal((await deepseekRuntime.getAuth("deepseek"))?.auth.apiKey, "managed-deepseek-key");
-  assert.deepEqual(buildPiSessionCreateEnvPatch(deepseekConfig, {
-    DEEPSEEK_API_KEY: "managed-deepseek-key",
-    SAFE_FLAG: "enabled",
-  }), { SAFE_FLAG: "enabled" });
-
-  const gatewayConfig = {
-    ...deepseekConfig,
-    model: { kind: "custom", name: "managed-model" },
-  } as const;
-  const gatewayProjection = {
-    providerId: "openai-compatible",
-    endpointUrl: "https://gateway.example.test/v1",
-    supportsImageInput: true,
-  } as const;
-  const gatewayRuntime = await ModelRuntime.create({
-    credentials: new InMemoryCredentialStore(),
-    modelsPath: null,
-    allowModelNetwork: false,
-  });
-  await seedPiSessionModelRuntime(
-    gatewayRuntime,
-    gatewayConfig,
-    gatewayProjection,
-    { OPENAI_API_KEY: "managed-gateway-key", OPENAI_BASE_URL: gatewayProjection.endpointUrl },
-  );
-  assert.equal((await gatewayRuntime.getAuth("openai"))?.auth.apiKey, "managed-gateway-key");
-  assert.deepEqual(resolveBuiltInGatewayLaunch(gatewayConfig, gatewayProjection), {
-    providerId: "openai-compatible",
-    baseUrl: gatewayProjection.endpointUrl,
-    supportsImageInput: true,
-  });
+  const calls: unknown[][] = [];
   await assert.rejects(
-    () => seedPiSessionModelRuntime(gatewayRuntime, gatewayConfig),
-    /launch metadata is missing/,
+    () => seedPiSessionModelRuntime({ setRuntimeApiKey: async (...args: unknown[]) => { calls.push(args); } }, connectionConfig),
+    /Saved provider connections were removed/,
   );
+  assert.deepEqual(calls, []);
+  assert.equal(resolveBuiltInGatewayLaunch(connectionConfig), null);
 });
 
 test("Pi auth seeding captures pi-builtin keys without process env", async () => {
@@ -4223,11 +4496,14 @@ async function freshBuiltInModelRegistry(): Promise<ModelRegistry> {
   return new ModelRegistry(runtime);
 }
 
-function builtInConnectionCustomConfig(name: string) {
+function builtInGatewayCustomConfig(
+  name: string,
+  providerId: "openai-compatible" | "anthropic-compatible" = "openai-compatible",
+) {
   return {
     version: RUNTIME_CONFIG_VERSION,
     runtime: "builtin",
-    provider: { kind: "connection", connectionId: "11111111-1111-4111-8111-111111111111" },
+    provider: { kind: "gateway", providerId, baseUrl: "https://gateway.example.test/v1", apiKey: "gateway-test-key" },
     hostUserState: "forbidden",
     model: { kind: "custom", name },
     mode: { kind: "default" },
@@ -4238,69 +4514,65 @@ for (const [providerId, registryProvider] of [
   ["openai-compatible", "openai"],
   ["anthropic-compatible", "anthropic"],
 ] as const) {
-  test(`managed ${providerId} connection custom model selects its own gateway entry, not a same-name catalog model`, async () => {
+  test(`${providerId} gateway custom model selects its own gateway entry, not a same-name catalog model`, async () => {
     const registry = await freshBuiltInModelRegistry();
     // The first catalog entry is what a by-name fallback returns for its id, so
     // naming the custom model after it makes the collision real for both
     // gateway providers regardless of where they sit in catalog order.
     const colliding = registry.getAll()[0]!;
     assert.notEqual(colliding.provider, registryProvider, "fixture precondition: collision must come from another provider");
-    const config = builtInConnectionCustomConfig(colliding.id);
-    const projection = { providerId, endpointUrl: "https://gateway.example.test/v1", supportsImageInput: false } as const;
-    configureBuiltInGatewayCustomModel(registry, config, projection);
+    const config = builtInGatewayCustomConfig(colliding.id, providerId);
+    configureBuiltInGatewayCustomModel(registry, config);
 
-    const model = resolvePiModelFromRegistry(colliding.id, registry, config, projection);
+    const model = resolvePiModelFromRegistry(colliding.id, registry, config);
     assert.equal(model?.provider, registryProvider);
     assert.equal(model?.id, colliding.id);
   });
 }
 
-test("field case: managed openai-compatible connection kimi-k3 does not select github-copilot/kimi-k3", async () => {
+test("field case: openai-compatible gateway kimi-k3 does not select github-copilot/kimi-k3", async () => {
   const registry = await freshBuiltInModelRegistry();
   assert.equal(registry.getAll().find((model) => model.id === "kimi-k3")?.provider, "github-copilot",
     "fixture precondition: the SDK catalog lists github-copilot/kimi-k3 first");
-  const config = builtInConnectionCustomConfig("kimi-k3");
-  const projection = { providerId: "openai-compatible", endpointUrl: "https://gateway.example.test/v1", supportsImageInput: false } as const;
-  configureBuiltInGatewayCustomModel(registry, config, projection);
+  const config = builtInGatewayCustomConfig("kimi-k3");
+  configureBuiltInGatewayCustomModel(registry, config);
 
-  const model = resolvePiModelFromRegistry("kimi-k3", registry, config, projection);
+  const model = resolvePiModelFromRegistry("kimi-k3", registry, config);
   assert.equal(model?.provider, "openai");
   assert.equal(model?.id, "kimi-k3");
 });
 
-test("managed connection custom model name containing a slash stays one gateway model id", async () => {
+test("gateway custom model name containing a slash stays one gateway model id", async () => {
   const registry = await freshBuiltInModelRegistry();
-  const config = builtInConnectionCustomConfig("moonshotai/kimi-k3");
-  const projection = { providerId: "openai-compatible", endpointUrl: "https://gateway.example.test/v1", supportsImageInput: false } as const;
-  configureBuiltInGatewayCustomModel(registry, config, projection);
+  const config = builtInGatewayCustomConfig("moonshotai/kimi-k3");
+  configureBuiltInGatewayCustomModel(registry, config);
 
-  const model = resolvePiModelFromRegistry("moonshotai/kimi-k3", registry, config, projection);
+  const model = resolvePiModelFromRegistry("moonshotai/kimi-k3", registry, config);
   assert.equal(model?.provider, "openai");
   assert.equal(model?.id, "moonshotai/kimi-k3");
 });
 
-test("managed connection custom model that was not registered fails closed instead of falling back by name", async () => {
+test("gateway custom model that was not registered fails closed instead of falling back by name", async () => {
   const registry = await freshBuiltInModelRegistry();
-  const config = builtInConnectionCustomConfig("kimi-k3");
-  const projection = { providerId: "openai-compatible", endpointUrl: "https://gateway.example.test/v1", supportsImageInput: false } as const;
+  const config = builtInGatewayCustomConfig("kimi-k3");
 
-  assert.equal(resolvePiModelFromRegistry("kimi-k3", registry, config, projection), undefined);
+  assert.equal(resolvePiModelFromRegistry("kimi-k3", registry, config), undefined);
 });
 
 test("direct gateway custom models and ordinary catalog presets keep resolving as before", async () => {
   const registry = await freshBuiltInModelRegistry();
   const gatewayConfig = {
-    ...builtInConnectionCustomConfig("kimi-k3"),
+    ...builtInGatewayCustomConfig("kimi-k3"),
     provider: { kind: "gateway", providerId: "anthropic-compatible", baseUrl: "https://gateway.example.test", apiKey: "gateway-test-key" },
   } as const;
-  configureBuiltInGatewayCustomModel(registry, gatewayConfig, null);
-  assert.equal(resolvePiModelFromRegistry("kimi-k3", registry, gatewayConfig, null)?.provider, "anthropic");
+  configureBuiltInGatewayCustomModel(registry, gatewayConfig);
+  assert.equal(resolvePiModelFromRegistry("kimi-k3", registry, gatewayConfig)?.provider, "anthropic");
 
   const presetConfig = {
-    ...builtInConnectionCustomConfig("unused"),
+    ...builtInGatewayCustomConfig("unused"),
     model: { kind: "preset", id: "moonshotai/kimi-k3" },
   } as const;
-  const preset = resolvePiModelFromRegistry("moonshotai/kimi-k3", registry, presetConfig, null);
+  const preset = resolvePiModelFromRegistry("moonshotai/kimi-k3", registry, presetConfig);
   assert.equal(preset?.provider, "moonshotai");
   assert.equal(preset?.id, "kimi-k3");
 });
@@ -4416,7 +4688,7 @@ test("a provider key that cannot go into an HTTP header is refused with a readab
   const config = {
     version: RUNTIME_CONFIG_VERSION,
     runtime: "builtin",
-    provider: { kind: "connection", connectionId: "11111111-1111-4111-8111-111111111111" },
+    provider: { kind: "preset", providerId: "deepseek", apiKey: badKey },
     hostUserState: "forbidden",
     model: { kind: "preset", id: "deepseek/deepseek-flash" },
     mode: { kind: "default" },
@@ -4427,15 +4699,10 @@ test("a provider key that cannot go into an HTTP header is refused with a readab
     allowModelNetwork: false,
   });
   await assert.rejects(
-    seedPiSessionModelRuntime(
-      runtime,
-      config,
-      { providerId: "deepseek", endpointUrl: null, supportsImageInput: false },
-      { DEEPSEEK_API_KEY: badKey },
-    ),
+    seedPiSessionModelRuntime(runtime, config),
     (error: unknown) => {
       assert.ok(error instanceof Error);
-      assert.match(error.message, /^DEEPSEEK_API_KEY contains a character that cannot be sent in an HTTP header \(position 1, code 27993\)/);
+      assert.match(error.message, /^The deepseek API key contains a character that cannot be sent in an HTTP header \(position 1, code 27993\)/);
       assert.doesNotMatch(error.message, /deepseek-key/, "the key value must not be echoed");
       return true;
     },
@@ -4545,8 +4812,8 @@ test("MiniMax-M3.1-Flash-Preview on its documented hosts registers the adaptive-
   for (const baseUrl of ["https://api.minimax.cn/anthropic", "https://api.minimax.io/anthropic", "https://API.MINIMAX.CN/anthropic/"]) {
     const registry = await freshBuiltInModelRegistry();
     const config = anthropicGatewayConfig(baseUrl, "MiniMax-M3.1-Flash-Preview");
-    configureBuiltInGatewayCustomModel(registry, config, null);
-    const model = resolvePiModelFromRegistry("MiniMax-M3.1-Flash-Preview", registry, config, null) as Model<"anthropic-messages"> | undefined;
+    configureBuiltInGatewayCustomModel(registry, config);
+    const model = resolvePiModelFromRegistry("MiniMax-M3.1-Flash-Preview", registry, config) as Model<"anthropic-messages"> | undefined;
     assert.ok(model, baseUrl);
     assert.equal(model.compat?.forceAdaptiveThinking, true, baseUrl);
     assert.deepEqual(model.thinkingLevelMap, { off: null, minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
@@ -4567,8 +4834,8 @@ test("MiniMax-M3.1-Flash-Preview on its documented hosts registers the adaptive-
     assert.equal(findAnthropicGatewayThinkingContract(baseUrl, name), undefined, `${baseUrl} ${name}`);
     const registry = await freshBuiltInModelRegistry();
     const config = anthropicGatewayConfig(baseUrl, name);
-    configureBuiltInGatewayCustomModel(registry, config, null);
-    const model = resolvePiModelFromRegistry(name, registry, config, null) as Model<"anthropic-messages"> | undefined;
+    configureBuiltInGatewayCustomModel(registry, config);
+    const model = resolvePiModelFromRegistry(name, registry, config) as Model<"anthropic-messages"> | undefined;
     assert.ok(model, `${baseUrl} ${name}`);
     assert.equal(model.compat, undefined, `${baseUrl} ${name}: no contract inherited`);
     assert.equal(model.thinkingLevelMap, undefined, `${baseUrl} ${name}`);
@@ -4581,8 +4848,8 @@ test("an Anthropic-compatible gateway inherits the SDK catalog entry only for th
   const catalog = registry.getAll().find((model) => model.api === "anthropic-messages" && model.id === "MiniMax-M3" && model.provider === "minimax-cn");
   assert.ok(catalog, "fixture precondition: the SDK catalog knows minimax-cn/MiniMax-M3");
   const config = anthropicGatewayConfig(`${catalog.baseUrl}/`, "MiniMax-M3");
-  configureBuiltInGatewayCustomModel(registry, config, null);
-  const model = resolvePiModelFromRegistry("MiniMax-M3", registry, config, null);
+  configureBuiltInGatewayCustomModel(registry, config);
+  const model = resolvePiModelFromRegistry("MiniMax-M3", registry, config);
   assert.equal(model?.provider, "anthropic", "registered under the gateway provider, not the catalog provider");
   assert.equal(model?.contextWindow, catalog.contextWindow);
   assert.equal(model?.maxTokens, catalog.maxTokens);
@@ -4590,8 +4857,8 @@ test("an Anthropic-compatible gateway inherits the SDK catalog entry only for th
 
   const other = await freshBuiltInModelRegistry();
   const otherConfig = anthropicGatewayConfig("https://gateway.example.test/anthropic", "MiniMax-M3");
-  configureBuiltInGatewayCustomModel(other, otherConfig, null);
-  const unknown = resolvePiModelFromRegistry("MiniMax-M3", other, otherConfig, null);
+  configureBuiltInGatewayCustomModel(other, otherConfig);
+  const unknown = resolvePiModelFromRegistry("MiniMax-M3", other, otherConfig);
   assert.equal(unknown?.contextWindow, 200_000, "an unknown endpoint keeps the gateway defaults");
   assert.equal(unknown?.compat, undefined);
 
@@ -4599,16 +4866,16 @@ test("an Anthropic-compatible gateway inherits the SDK catalog entry only for th
   // that provider's catalog entries, as it always did) is untouched by this change.
   const presetRegistry = await freshBuiltInModelRegistry();
   const presetConfig = { ...config, model: { kind: "preset", id: "anthropic/claude-fable-5" } } as any;
-  const preset = resolvePiModelFromRegistry("anthropic/claude-fable-5", presetRegistry, presetConfig, null) as Model<"anthropic-messages"> | undefined;
+  const preset = resolvePiModelFromRegistry("anthropic/claude-fable-5", presetRegistry, presetConfig) as Model<"anthropic-messages"> | undefined;
   assert.equal(preset?.provider, "anthropic");
   assert.equal(preset?.compat?.forceAdaptiveThinking, true);
-  assert.equal(configureBuiltInGatewayCustomModel(presetRegistry, presetConfig, null).thinkingContract, null, "presets never take a gateway contract");
+  assert.equal(configureBuiltInGatewayCustomModel(presetRegistry, presetConfig).thinkingContract, null, "presets never take a gateway contract");
 });
 
 test("resolveBuiltInThinkingLevel: unset effort takes the contract's documented default only for a contract model, and otherwise stays exactly what it was", async () => {
   const registry = await freshBuiltInModelRegistry();
   const contractConfig = anthropicGatewayConfig("https://api.minimax.cn/anthropic", "MiniMax-M3.1-Flash-Preview");
-  const { thinkingContract } = configureBuiltInGatewayCustomModel(registry, contractConfig, null);
+  const { thinkingContract } = configureBuiltInGatewayCustomModel(registry, contractConfig);
   assert.ok(thinkingContract, "the documented pair registers with its contract");
   assert.equal(resolveBuiltInThinkingLevel(null, thinkingContract), "max");
   assert.equal(resolveBuiltInThinkingLevel(undefined, thinkingContract), "max");
@@ -4620,7 +4887,7 @@ test("resolveBuiltInThinkingLevel: unset effort takes the contract's documented 
 
   const plain = await freshBuiltInModelRegistry();
   const plainConfig = anthropicGatewayConfig("https://gateway.example.test/anthropic", "MiniMax-M3.1-Flash-Preview");
-  assert.equal(configureBuiltInGatewayCustomModel(plain, plainConfig, null).thinkingContract, null, "no contract for an unknown endpoint");
+  assert.equal(configureBuiltInGatewayCustomModel(plain, plainConfig).thinkingContract, null, "no contract for an unknown endpoint");
   // The launch fields carry `null` for an unset effort and the SDK clamps null
   // to its first supported level ("off"): that value must reach the SDK unchanged.
   assert.strictEqual(resolveBuiltInThinkingLevel(null, null), null as unknown as undefined);
@@ -4629,11 +4896,11 @@ test("resolveBuiltInThinkingLevel: unset effort takes the contract's documented 
 
   const catalog = await freshBuiltInModelRegistry();
   const catalogConfig = anthropicGatewayConfig("https://api.minimaxi.com/anthropic", "MiniMax-M3");
-  assert.equal(configureBuiltInGatewayCustomModel(catalog, catalogConfig, null).thinkingContract, null, "a catalog pair is the SDK's business");
+  assert.equal(configureBuiltInGatewayCustomModel(catalog, catalogConfig).thinkingContract, null, "a catalog pair is the SDK's business");
 
   const openai = await freshBuiltInModelRegistry();
   const openaiConfig = { ...plainConfig, provider: { kind: "gateway", providerId: "openai-compatible", baseUrl: "https://api.minimax.cn/v1", apiKey: "k" } } as const;
-  assert.equal(configureBuiltInGatewayCustomModel(openai, openaiConfig, null).thinkingContract, null);
+  assert.equal(configureBuiltInGatewayCustomModel(openai, openaiConfig).thinkingContract, null);
 });
 
 /** A loopback Anthropic Messages server that records request bodies and answers one short text turn. */

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import AgentActivityLog from "../src/components/agent/AgentActivityLog";
+import AgentActivityLog, { RawActivityLog } from "../src/components/agent/AgentActivityLog";
 import { useAgentStore } from "../src/store/agentStore";
 import type { TrajectoryLogEntry } from "../src/store/agentStore";
 import { MAX_TRAJECTORY_ENTRIES } from "../src/store/events/agentActivityEvents";
@@ -14,6 +14,7 @@ import { MAX_TRAJECTORY_ENTRIES } from "../src/store/events/agentActivityEvents"
 export const AGENT_ACTIVITY_LOG_CASE_IDS = [
   "components.agent-activity-log.follow",
   "components.agent-activity-log.new-steps",
+  "components.agent-activity-log.status-rows",
 ] as const;
 
 const AGENT_ID = "visual-activity-agent";
@@ -38,8 +39,31 @@ declare global {
   interface Window { __appendActivitySteps?: (count: number) => void }
 }
 
-function prime() {
+// Status rows (#proj-raft-ui:59aa78ae): the status word on the first line, the
+// explanation (when there is one) below it in the detail style; a sub-agent's
+// badge stays on the first line.
+function statusRows(): TrajectoryLogEntry[] {
+  const at = (seq: number) => START + seq * 1000;
+  const rows: TrajectoryLogEntry["entry"][] = [
+    { kind: "status", activity: "working", detail: "Message received from #proj-raft-ui:59aa78ae" },
+    { kind: "thinking", text: "Reading the status row layout before changing it." },
+    { kind: "status", activity: "working", detail: "Running Bash" },
+    { kind: "status", activity: "working", detail: "Running Read", subagent: { subagentType: "Explore", taskId: "visual-task" } },
+    { kind: "status", activity: "thinking", detail: "" },
+    { kind: "status", activity: "error", detail: "The provider returned 529 overloaded; retrying in 30 seconds with the same request so nothing is lost" },
+    { kind: "status", activity: "online", detail: "" },
+    { kind: "status", activity: "offline", detail: "Stopped by the Computer shutting down", detailKind: "stopped" },
+    { kind: "status", activity: "offline", detail: "--dangerously-skip-permissions cannot be used with root/sudo privileges", detailKind: "claude_root_privileges" },
+  ];
+  return rows.map((entry, seq) => ({ timestamp: at(seq), serverSeq: seq, entry }));
+}
+
+function prime(caseId: string) {
   nextSeq = 0;
+  if (caseId.endsWith(".status-rows")) {
+    useAgentStore.setState({ trajectoryLogs: { [AGENT_ID]: statusRows() }, loadTrajectoryLog: async () => {} } as never);
+    return;
+  }
   useAgentStore.setState({ trajectoryLogs: {}, loadTrajectoryLog: async () => {} } as never);
   append(MAX_TRAJECTORY_ENTRIES);
   window.__appendActivitySteps = append;
@@ -47,7 +71,7 @@ function prime() {
 
 export function AgentActivityLogCase({ caseId }: { caseId: string }) {
   useState(() => {
-    prime();
+    prime(caseId);
     return true;
   });
   useEffect(() => {
@@ -67,7 +91,7 @@ export function AgentActivityLogCase({ caseId }: { caseId: string }) {
   return (
     <main className="flex h-screen justify-end bg-layer-sidebar">
       <section data-visual-case={caseId} className="flex h-full w-[440px] min-w-0 flex-col border-s border-line-seam bg-layer-canvas">
-        <AgentActivityLog agentId={AGENT_ID} />
+        {caseId.endsWith(".status-rows") ? <RawActivityLog agentId={AGENT_ID} /> : <AgentActivityLog agentId={AGENT_ID} />}
       </section>
     </main>
   );

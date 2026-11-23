@@ -19,6 +19,8 @@ import {
   readSearchState,
   recordSearchEntityOpen,
   removeSearchHistoryEntry,
+  searchFilterBarShown,
+  searchHomeFilterConversationId,
   searchParamsHaveExplicitState,
   selectFrequentSearchEntities,
 } from "../searchHome";
@@ -220,4 +222,25 @@ test("search history remove control is hover-revealed on desktop and edit-gated 
   // The touch default renders no control at all, not a transparent one.
   assert.equal(shouldRenderSearchHistoryRemove({ isTouchViewport: true, editing: false }), false);
   assert.equal(shouldRenderSearchHistoryRemove({ isTouchViewport: true, editing: true }), true);
+});
+
+test("the overlay home shows the filter bar only for a filter its opener set (Cmd+F in a channel, #triage:#542)", () => {
+  // Cmd+F in a channel: overlay home, deferred, filtered to the channel -> the channel chip shows (and can be cleared).
+  assert.equal(searchFilterBarShown({ overlayHome: true, deferUntilQuery: true, hasActiveFilters: true }), true);
+  // Cmd+K with nothing typed: the home, no filter bar.
+  assert.equal(searchFilterBarShown({ overlayHome: true, deferUntilQuery: false, hasActiveFilters: false }), false);
+  // Cleared the channel chip before typing: back to the plain home.
+  assert.equal(searchFilterBarShown({ overlayHome: true, deferUntilQuery: true, hasActiveFilters: false }), false);
+  // Not the overlay home (a query, or the full page): as before.
+  assert.equal(searchFilterBarShown({ overlayHome: false, deferUntilQuery: false, hasActiveFilters: false }), true);
+});
+
+test("Cmd+F's filtered overlay home is about that channel, not recent conversations (#triage:#542)", () => {
+  const base = { scoped: false, overlayHome: true, deferUntilQuery: true, channelFilterParam: "channel-1" };
+  assert.equal(searchHomeFilterConversationId(base), "channel-1");
+  // Filter cleared, Cmd+K (no defer), a query typed, or a conversation's own search: recent conversations / as before.
+  assert.equal(searchHomeFilterConversationId({ ...base, channelFilterParam: "" }), "");
+  assert.equal(searchHomeFilterConversationId({ ...base, deferUntilQuery: false }), "");
+  assert.equal(searchHomeFilterConversationId({ ...base, overlayHome: false }), "");
+  assert.equal(searchHomeFilterConversationId({ ...base, scoped: true }), "");
 });

@@ -63,7 +63,7 @@ test("createRaft wires identity, inbox, read, send, and tasks over one credentia
   const eventsCall = calls.find((c) => c.path.startsWith("/internal/agent-api/events"));
   assert.equal(eventsCall?.path, "/internal/agent-api/events?since=latest&ack=cursor");
   assert.equal(eventsCall?.init.cache, "no-store");
-  assert.equal(eventsCall?.init.redirect, "error");
+  assert.equal(eventsCall?.init.redirect, "manual");
 
   // Before reading, a send attests only the exact seq the drain rendered.
   await raft.messages.reply(batch.ok ? batch.data.messages[0]! : { target: "#general" }, { content: "hi", idempotencyKey: "k-1" });

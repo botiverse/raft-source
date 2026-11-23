@@ -8,6 +8,7 @@ import vm from "node:vm";
 import { afterEach, test, vi } from "vitest";
 
 import {
+  SEA_ASSET_BEDROCK,
   SEA_ASSET_CLI,
   SEA_ASSET_CLI_UNDICI,
   SEA_ASSET_FULL,
@@ -28,6 +29,7 @@ const DIGESTS = {
   [SEA_ASSET_FULL]: "fulldigest",
   [SEA_ASSET_LITE]: "litedigest",
   [SEA_ASSET_KIMI]: "kimidigest",
+  [SEA_ASSET_BEDROCK]: "bedrockdigest",
   [SEA_ASSET_CLI]: "clidigest",
   [SEA_ASSET_CLI_UNDICI]: "undicidigest",
 };
@@ -64,7 +66,7 @@ const SRC = fileURLToPath(new URL("../../src", import.meta.url));
 // daemon (SEA_RUNNER_ENTRIES, or the agent CLI's own bundle).
 const DAEMON_IMPORT_SITES = {
   "cli.ts @botiverse/raft-daemon/bundled-cli": "__cli",
-  "cli.ts @botiverse/raft-daemon/core": ["__verify-bundled-oauth", "__verify-bundled-kimi", "__verify-bundled-oar"],
+  "cli.ts @botiverse/raft-daemon/core": ["__verify-bundled-oauth", "__verify-bundled-kimi", "__verify-bundled-bedrock", "__verify-bundled-oar"],
   "index.ts @botiverse/raft-daemon/bundled-cli": "__cli",
   "runtimeDetectionEntry.ts @botiverse/raft-daemon/runtime-detection-child": "__detect-runtimes",
   "runtimeDetectionEntry.ts @botiverse/raft-daemon/context-view-restore-child": "__restore-context-view",
@@ -150,6 +152,7 @@ test("the full bundle gets a hook that compiles each lazy asset once, on first u
   const assets = {
     [SEA_ASSET_FULL]: "",
     [SEA_ASSET_KIMI]: "module.exports = { createKimiHarness() {}, loadedAt: Symbol('once') };",
+    [SEA_ASSET_BEDROCK]: "module.exports = { BedrockRuntimeClient: class {}, NodeHttpHandler: class {} };",
   };
   const hook = Symbol.for(SEA_LAZY_ASSET_HOOK);
   try {
@@ -159,7 +162,10 @@ test("the full bundle gets a hook that compiles each lazy asset once, on first u
     const second = globalThis[hook]("@botiverse/kimi-code-sdk");
     assert.equal(typeof first.createKimiHarness, "function");
     assert.equal(first, second, "compiled once and cached");
-    assert.deepEqual(compiled, [SEA_ASSET_FULL, SEA_ASSET_KIMI]);
+    assert.deepEqual(compiled, [SEA_ASSET_FULL, SEA_ASSET_KIMI], "each asset is compiled only when its own package is asked for");
+    const bedrock = globalThis[hook]("@aws-sdk/client-bedrock-runtime");
+    assert.equal(typeof bedrock.NodeHttpHandler, "function", "one asset carries the Bedrock client and its HTTP handler");
+    assert.deepEqual(compiled, [SEA_ASSET_FULL, SEA_ASSET_KIMI, SEA_ASSET_BEDROCK]);
     assert.throws(() => globalThis[hook]("left-pad"), /no lazy SEA asset for left-pad/);
   } finally {
     delete globalThis[hook];

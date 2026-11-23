@@ -355,7 +355,42 @@ test("plain HTTP is allowed only to this machine, and no request follows a redir
     await raft.servers();
     assert.equal(seen.length, 1, baseUrl);
     assert.ok(seen[0]!.url.startsWith(`${baseUrl}/api/oauth/servers`), seen[0]!.url);
-    assert.equal(seen[0]!.redirect, "error", baseUrl);
+    assert.equal(seen[0]!.redirect, "manual", baseUrl);
+  }
+});
+
+test("on a runtime that rejects redirect \"error\" (Cloudflare Workers), every read still reaches Raft", async () => {
+  const raft = createRaftAppClient({
+    accessToken: TOKEN,
+    fetch: async (_input, init) => {
+      if (init?.redirect !== "follow" && init?.redirect !== "manual") {
+        throw new TypeError("Invalid redirect value, must be one of \"follow\" or \"manual\"");
+      }
+      return json(humanUserinfo);
+    },
+  });
+  assert.equal((await raft.userinfo()).sub, humanUserinfo.sub);
+});
+
+test("a redirect is refused, never followed: Workers reject redirect \"error\", so the SDK asks for \"manual\" and refuses the 3xx itself", async () => {
+  for (const redirect of [
+    new Response(null, { status: 302, headers: { location: "https://elsewhere.example/steal" } }),
+    // A browser's answer to redirect "manual": status 0, type "opaqueredirect".
+    Object.defineProperty(new Response(null, { status: 200 }), "type", { value: "opaqueredirect" }) as Response,
+  ]) {
+    const seen: string[] = [];
+    const raft = createRaftAppClient({
+      accessToken: TOKEN,
+      fetch: async (input, init) => {
+        seen.push(String(input));
+        if (init?.redirect === "error") throw new TypeError("Invalid redirect value, must be one of \"follow\" or \"manual\"");
+        return redirect;
+      },
+    });
+    const error = await raft.userinfo().then(() => assert.fail("a redirect must not resolve"), (e: unknown) => e as RaftAppError);
+    assert.equal(error.code, "network_error");
+    assert.equal(seen.length, 1, "the redirect's target is never requested");
+    assert.equal(String(error.message).includes(TOKEN), false);
   }
 });
 

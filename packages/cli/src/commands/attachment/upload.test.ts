@@ -3,8 +3,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { CliError } from "../../core/errors";
+import { CliError, CliExit } from "../../core/errors";
+import type { CliIo } from "../../core/io";
 import { renderError } from "../../core/renderer";
+import { buildRaftProgram } from "../../program";
 import {
   AttachmentUploadArgError,
   MAX_ATTACHMENT_UPLOAD_BYTES,
@@ -15,8 +17,8 @@ import {
   validateUploadFileSize,
 } from "./upload";
 import { globalFetchJsonTransport, setJsonTransportForTests } from "../../client";
-import { ATTACHMENT_UPLOAD_MAX_SIZE_BYTES } from "@botiverse/raft-shared/src/agentCliSurface";
-import { afterEach, beforeEach } from "vitest";
+import { ATTACHMENT_UPLOAD_MAX_SIZE_BYTES, formatAttachmentPreferArtifactHold } from "@botiverse/raft-shared/src/agentCliSurface";
+import { afterAll, afterEach, beforeEach } from "vitest";
 // These tests stub globalThis.fetch; route the client's JSON transport (node:http
 // in production) through it.
 let previousJsonTransport: ReturnType<typeof setJsonTransportForTests>;
@@ -160,9 +162,9 @@ test("attachment upload preserves server quota error code and next action", asyn
             ok: false,
             status: 403,
             data: null,
-            error: "Monthly file upload quota exceeded. Free includes 100 MB of file uploads per month; upgrade to Pro for higher file upload limits.",
+            error: "Monthly file upload quota exceeded. Free includes 100 MB of file uploads per month; Pro has no monthly upload limit.",
             errorCode: "FILE_UPLOAD_QUOTA_EXCEEDED",
-            suggestedNextAction: "Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: https://app.example.test/s/team/settings/billing",
+            suggestedNextAction: "Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Plan & billing: https://app.example.test/s/team/settings/billing",
           };
         },
       }),
@@ -178,7 +180,7 @@ test("attachment upload preserves server quota error code and next action", asyn
         assert.match(err.message, /Monthly file upload quota exceeded/);
         assert.equal(
           err.suggestedNextAction,
-          "Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: https://app.example.test/s/team/settings/billing",
+          "Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Plan & billing: https://app.example.test/s/team/settings/billing",
         );
         return true;
       },
@@ -641,6 +643,200 @@ test("attachment upload sends a declared over-limit file through the session the
     assert.match(output, /Attachment ID: 44444444-4444-4444-8444-444444444444/);
   } finally {
     globalThis.fetch = originalFetch;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── an HTML or Markdown file uploaded, held once (#347) ──
+// Through the real parser, so the held text is the one an agent reads. The
+// text itself is asserted once, in shared agentText/artifacts.test.ts
+// (formatAttachmentPreferArtifactHold); here, where it lands and what it names.
+
+// The agent ledger these runs keep held uploads in: a temporary one, never the real Raft home.
+const UPLOAD_HOLD_LEDGER = fs.mkdtempSync(path.join(os.tmpdir(), "raft-attachment-ledger-"));
+afterAll(() => fs.rmSync(UPLOAD_HOLD_LEDGER, { recursive: true, force: true }));
+
+async function runUpload(argv: string[], options: { now?: () => number; stateDir?: string; enabledApps?: string | null } = {}) {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const requests: string[] = [];
+  const io: CliIo = {
+    stdout: { write: (chunk: string | Uint8Array) => { stdout.push(String(chunk)); return true; } },
+    stderr: { write: (chunk: string | Uint8Array) => { stderr.push(String(chunk)); return true; } },
+  };
+  const program = buildRaftProgram({
+    io,
+    // Artifacts on, as the daemon says it (RAFT_ENABLED_APPS); null: an older daemon that doesn't say.
+    env: { SLOCK_CLI_STATE_DIR: options.stateDir ?? UPLOAD_HOLD_LEDGER, ...(options.enabledApps === null ? {} : { RAFT_ENABLED_APPS: options.enabledApps ?? "artifacts,tasks" }) },
+    ...(options.now ? { now: options.now } : {}),
+    loadAgentContext: () => ({ agentId: "agent-1", serverUrl: "https://raft.example", serverId: "server-1", token: "secret-token", clientMode: "self-hosted-runner", secretSource: "profile-credential-file", activeCapabilities: null }),
+    createApiClient: () => ({
+      request: async (method: string, pathname: string) => {
+        requests.push(`${method} ${pathname}`);
+        if (pathname === "/internal/agent-api/attachment-upload-capabilities") {
+          return { ok: true, status: 200, data: { directUploadEnabled: false, directUploadThresholdBytes: null, maxBytes: MAX_ATTACHMENT_UPLOAD_BYTES, sessionExpiresInSeconds: null }, error: null };
+        }
+        return { ok: true, status: 200, data: { channelId: "channel-1" }, error: null };
+      },
+      requestMultipart: async (method: string, pathname: string, form: FormData) => {
+        requests.push(`${method} ${pathname}`);
+        const file = form.get("file") as File;
+        return { ok: true, status: 200, data: { id: "attachment-1", filename: file.name, mimeType: file.type, sizeBytes: file.size, thumbnailUrl: null }, error: null };
+      },
+    }) as any,
+  });
+  let error: unknown = null;
+  try {
+    await program.parseAsync(argv, { from: "user" });
+  } catch (caught) {
+    error = caught;
+  }
+  return { stdout: stdout.join(""), stderr: stderr.join(""), requests, error };
+}
+
+const UPLOADED = ["GET /internal/agent-api/attachment-upload-capabilities", "POST /internal/agent-api/resolve-channel", "POST /internal/agent-api/upload"];
+const isPreferArtifactHeld = (r: { stderr: string; requests: string[] }) => r.stderr.startsWith("Error: Held — not sent.") && !r.stderr.includes("Code:") && r.requests.length === 0;
+
+test("attachment upload of a Markdown file: held once before any request (exit 1, no code line), copied into a directory of its own and pushed; the same command again uploads it", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "raft-attachment-prefer-"));
+  const filePath = path.join(dir, "plan.md");
+  fs.writeFileSync(filePath, "# Plan\n");
+  fs.writeFileSync(path.join(dir, "notes.txt"), "other work");
+  try {
+    const argv = ["attachment", "upload", "--path", filePath, "--target", "#proj-workspace"];
+    const held = await runUpload(argv);
+    assert.ok(held.error instanceof CliExit && held.error.exitCode === 1, "exits 1");
+    assert.deepEqual(held.requests, [], "nothing sent, nothing uploaded");
+    assert.equal(held.stdout, "");
+    const text = formatAttachmentPreferArtifactHold({ file: "plan.md", target: "#proj-workspace", title: "plan", dir: path.join(dir, "plan"), copyFrom: filePath });
+    assert.equal(held.stderr, `Error: ${text.message}\nNext action: ${text.nextAction}\n`);
+    assert.ok(held.stderr.includes(`\n  mkdir -p ${dir}/plan && cp ${dir}/plan.md ${dir}/plan/\n  raft artifact push ${dir}/plan --target "#proj-workspace" --title "plan"\n`), held.stderr);
+    assert.deepEqual(fs.readdirSync(dir).sort(), ["notes.txt", "plan.md"], "nothing made beside the file");
+
+    const again = await runUpload(argv);
+    assert.equal(again.error, null, again.stderr);
+    assert.deepEqual(again.requests, UPLOADED, "the same command again uploads it");
+    assert.match(again.stdout, /Attachment ID: attachment-1/);
+
+    assert.ok(isPreferArtifactHeld(await runUpload(argv)), "once it went through, the hold is forgotten: held again");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("attachment upload of an HTML file alone in its directory: push its directory; with its own <title> no --title; a taken name gets -artifact", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "raft-attachment-prefer-"));
+  try {
+    const alone = path.join(root, "Q3 plan");
+    fs.mkdirSync(alone);
+    fs.writeFileSync(path.join(alone, "index.HTML"), "<html><head><title>Q3 plan</title></head><body>x</body></html>");
+    fs.writeFileSync(path.join(alone, ".notes"), "hidden files are not pushed");
+    const titled = await runUpload(["attachment", "upload", "--path", path.join(alone, "index.HTML"), "--target", "dm:@alice"]);
+    assert.ok(isPreferArtifactHeld(titled), titled.stderr);
+    const text = formatAttachmentPreferArtifactHold({ file: "index.HTML", target: "dm:@alice", dir: alone });
+    assert.equal(titled.stderr, `Error: ${text.message}\nNext action: ${text.nextAction}\n`);
+    assert.ok(titled.stderr.includes(`\nNext action: Push its directory:\n  raft artifact push '${alone}' --target "dm:@alice"\nthen post the link it prints.\n`), titled.stderr);
+
+    const shared = path.join(root, "work");
+    fs.mkdirSync(path.join(shared, "spec"), { recursive: true });
+    fs.writeFileSync(path.join(shared, "spec.htm"), "<p>no title</p>");
+    const untitled = await runUpload(["attachment", "upload", "--path", path.join(shared, "spec.htm"), "--target", "#ops"]);
+    assert.ok(isPreferArtifactHeld(untitled), untitled.stderr);
+    assert.ok(untitled.stderr.includes(`\n  mkdir -p ${shared}/spec-artifact && cp ${shared}/spec.htm ${shared}/spec-artifact/\nCopy the files it loads (images, styles, scripts) into ${shared}/spec-artifact too, then:\n  raft artifact push ${shared}/spec-artifact --target "#ops" --title "spec"\n`), untitled.stderr);
+
+    const pulled = path.join(root, "pulled");
+    fs.mkdirSync(pulled);
+    fs.writeFileSync(path.join(pulled, "guide.markdown"), "# Guide");
+    fs.writeFileSync(path.join(pulled, ".raft-artifact.json"), "{}");
+    const inPulled = await runUpload(["attachment", "upload", "--path", path.join(pulled, "guide.markdown"), "--target", "#ops"]);
+    assert.ok(inPulled.stderr.includes(`\n  mkdir -p ${pulled}/guide && cp ${pulled}/guide.markdown ${pulled}/guide/\n`), `a pulled artifact's directory is never pushed with --target: ${inPulled.stderr}`);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("attachment upload of an HTML or Markdown file is held again once its content or target changes, or when run again more than 10 minutes later", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "raft-attachment-prefer-"));
+  const filePath = path.join(dir, "notes.md");
+  let now = Date.parse("2026-11-20T10:00:00.000Z");
+  const clock = { now: () => now };
+  try {
+    fs.writeFileSync(filePath, "# v1");
+    const argv = (target = "#ops") => ["attachment", "upload", "--path", filePath, "--target", target];
+    assert.ok(isPreferArtifactHeld(await runUpload(argv(), clock)));
+    now += 60_000;
+    fs.writeFileSync(filePath, "# v2");
+    assert.ok(isPreferArtifactHeld(await runUpload(argv(), clock)), "the content changed: held again");
+    assert.ok(isPreferArtifactHeld(await runUpload(argv("#other"), clock)), "another target: held");
+    now += 10 * 60_000 + 1;
+    assert.ok(isPreferArtifactHeld(await runUpload(argv(), clock)), "more than 10 minutes later: held again");
+    now += 5 * 60_000;
+    const within = await runUpload(argv(), clock);
+    assert.equal(within.error, null, within.stderr);
+    assert.deepEqual(within.requests, UPLOADED, "the same command within 10 minutes uploads it");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("attachment upload never holds a file that is not HTML or Markdown, nor any file when the ledger can't keep the hold", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "raft-attachment-prefer-"));
+  try {
+    for (const name of ["report.pdf", "chart.png", "log.txt", "data.csv", "page.html.zip", "README"]) {
+      fs.writeFileSync(path.join(dir, name), "%PDF-1.4");
+      const r = await runUpload(["attachment", "upload", "--path", path.join(dir, name), "--target", "#ops"]);
+      assert.equal(r.error, null, `${name}: ${r.stderr}`);
+      assert.deepEqual(r.requests, UPLOADED, `${name}: uploaded at once`);
+    }
+    // The ledger's directory is a file: nothing can be read or written there, so the upload goes through.
+    const notADir = path.join(dir, "ledger-is-a-file");
+    fs.writeFileSync(notADir, "");
+    fs.writeFileSync(path.join(dir, "plan.md"), "# Plan");
+    const r = await runUpload(["attachment", "upload", "--path", path.join(dir, "plan.md"), "--target", "#ops"], { stateDir: notADir });
+    assert.equal(r.error, null, r.stderr);
+    assert.deepEqual(r.requests, UPLOADED, "a store that can't record never holds");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("attachment upload holds only where Artifacts is known to be on: off, or unknown (no RAFT_ENABLED_APPS), uploads at once", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "raft-attachment-prefer-"));
+  try {
+    fs.writeFileSync(path.join(dir, "plan.md"), "# Plan");
+    const argv = ["attachment", "upload", "--path", path.join(dir, "plan.md"), "--target", "#ops"];
+    for (const [enabledApps, why] of [["tasks", "Artifacts off"], ["", "no app on"], [null, "unknown: an older daemon"]] as const) {
+      const r = await runUpload(argv, { enabledApps });
+      assert.equal(r.error, null, `${why}: ${r.stderr}`);
+      assert.deepEqual(r.requests, UPLOADED, `${why}: uploaded at once`);
+    }
+    assert.ok(isPreferArtifactHeld(await runUpload(argv)), "Artifacts on: held");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("attachment upload into a thread pushes into that thread's target; into a task, pushes into the task's conversation and posts the link in the task; a target push can't name is never held", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "raft-attachment-prefer-"));
+  try {
+    const filePath = path.join(dir, "plan.md");
+    fs.writeFileSync(filePath, "# Plan");
+    const thread = await runUpload(["attachment", "upload", "--path", filePath, "--target", "#proj-workspace:abcd1234"]);
+    assert.ok(isPreferArtifactHeld(thread), thread.stderr);
+    const threadText = formatAttachmentPreferArtifactHold({ file: "plan.md", target: "#proj-workspace:abcd1234", title: "plan", dir });
+    assert.equal(thread.stderr, `Error: ${threadText.message}\nNext action: ${threadText.nextAction}\n`);
+    assert.ok(thread.stderr.includes(`\n  raft artifact push ${dir} --target "#proj-workspace:abcd1234" --title "plan"\nthen post the link it prints.\n`), thread.stderr);
+
+    const task = await runUpload(["attachment", "upload", "--path", filePath, "--target", "#proj-workspace:#7"]);
+    assert.ok(isPreferArtifactHeld(task), task.stderr);
+    const taskText = formatAttachmentPreferArtifactHold({ file: "plan.md", target: "#proj-workspace", postIn: "#proj-workspace:#7", title: "plan", dir });
+    assert.equal(task.stderr, `Error: ${taskText.message}\nNext action: ${taskText.nextAction}\n`);
+    assert.ok(task.stderr.includes(`\n  raft artifact push ${dir} --target "#proj-workspace" --title "plan"\nthen post the link it prints in #proj-workspace:#7.\n`), task.stderr);
+
+    const legacyTask = await runUpload(["attachment", "upload", "--path", filePath, "--target", "task #7"]);
+    assert.equal(legacyTask.error, null, legacyTask.stderr);
+    assert.deepEqual(legacyTask.requests, UPLOADED, "a task ref naming no conversation: uploaded at once");
+  } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
 import { Badge } from "@botiverse/raft-ui";
@@ -5,6 +6,9 @@ import type { ArtifactActor, ArtifactCommentAnchor } from "@botiverse/raft-share
 
 import AvatarSlot from "../../components/ui/AvatarSlot";
 import type { AvatarContext } from "../../components/ui/AvatarSlot";
+import Tooltip from "../../components/ui/Tooltip";
+import { anchorSection } from "./artifactAnchorSection";
+import type { ArtifactAnchorSection } from "./artifactAnchorSection";
 
 /**
  * A person's or an agent's avatar through the app's AvatarSlot (raft-ui
@@ -130,25 +134,46 @@ function MessageWithPageText({ id, anchor, quote }: PlaceMessage) {
   return <>{intl.formatMessage({ id }, { place, quote: quote === null ? "" : <PageText key="quote" text={quote} /> })}</>;
 }
 
-/** What a thread's anchor line says (anchorMetaMessage), as text. */
+/** What a thread's anchor line says (anchorMetaMessage), as text, after the section it is in (anchorSection). */
 export function anchorMetaText(anchor: ArtifactCommentAnchor, found: boolean, intl: IntlShape): string {
-  return messageText(anchorMetaMessage(anchor, found), intl);
+  const text = messageText(anchorMetaMessage(anchor, found), intl);
+  const section = anchorSection(anchor);
+  return section ? intl.formatMessage({ id: "artifacts.comments.anchorInSection" }, { section: section.shown, place: text }) : text;
 }
 
 /**
- * anchorMetaText, drawn: the page's label and quote isolated (PageText). A place no longer found is the place alone,
- * dimmed (DS States › Dimmed), after the caller's MapPinOff (#250: no "position not found" on screen); a screen reader
- * still hears the words.
+ * The section on a thread's anchor line: its own heading, the whole chain in a tooltip when there is more of it
+ * (`tooltip` false: the words alone, for the screen reader's copy of a lost place's line).
+ */
+function AnchorSection({ section, tooltip }: { section: ArtifactAnchorSection; tooltip: boolean }) {
+  const shown = <span data-testid="artifact-comment-anchor-section"><PageText text={section.shown} /></span>;
+  if (!tooltip || section.full === section.shown) return shown;
+  return <Tooltip content={<PageText text={section.full} />}>{shown}</Tooltip>;
+}
+
+/** A place after the section it is in (`{section} · {place}`), or the place alone where there is none. */
+function InSection({ section, tooltip, children }: { section: ArtifactAnchorSection | null; tooltip: boolean; children: ReactNode }) {
+  const intl = useIntl();
+  if (!section) return <>{children}</>;
+  return <>{intl.formatMessage({ id: "artifacts.comments.anchorInSection" }, { section: <AnchorSection key="section" section={section} tooltip={tooltip} />, place: <span key="place">{children}</span> })}</>;
+}
+
+/**
+ * anchorMetaText, drawn: the page's label and quote isolated (PageText), after the section it is in (Porthole P152)
+ * first, so a long place truncates before it does. A place no longer found is the place alone, section and all
+ * dimmed (DS States › Dimmed), after the caller's MapPinOff (#250: no "position not found" on screen); a screen
+ * reader still hears the words.
  */
 export function AnchorMeta({ anchor, found }: { anchor: ArtifactCommentAnchor; found: boolean }) {
-  if (found) return <MessageWithPageText {...anchorMetaMessage(anchor, true)} />;
+  const section = anchorSection(anchor);
+  if (found) return <InSection section={section} tooltip><MessageWithPageText {...anchorMetaMessage(anchor, true)} /></InSection>;
   return (
     <>
       <span aria-hidden className="text-foreground-hint" data-anchor-lost="">
-        <MessageWithPageText id={null} anchor={anchor} quote={null} />
+        <InSection section={section} tooltip><MessageWithPageText id={null} anchor={anchor} quote={null} /></InSection>
       </span>
       <span className="sr-only">
-        <MessageWithPageText {...anchorMetaMessage(anchor, false)} />
+        <InSection section={section} tooltip={false}><MessageWithPageText {...anchorMetaMessage(anchor, false)} /></InSection>
       </span>
     </>
   );

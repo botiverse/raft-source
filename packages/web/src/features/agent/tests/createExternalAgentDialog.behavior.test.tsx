@@ -84,6 +84,8 @@ test("Next makes the agent, records an existing agent, makes the one credential;
   assert.deepEqual(calls.find((call) => call.method === "put")?.body, { method: "existing_agent" });
   assert.deepEqual(calls.find((call) => call.url === `/agents/${AGENT_ID}/credentials`)?.body, { name: PAGE_CREDENTIAL_NAME });
   assert.match(screen.getByTestId("create-external-agent-prompt").textContent ?? "", /raft agent login --server .* --agent 11111111-1111-4111-8111-111111111111 --profile-slug Nathan/);
+  // After signing in (Sage, #wg-ax:2438df62): use the profile, and check the inbox, since Raft won't start it.
+  assert.match(screen.getByTestId("create-external-agent-prompt").textContent ?? "", /raft --profile Nathan inbox check/);
   assert.equal(screen.getByTestId("create-external-agent-credential").textContent, KEY);
   assert.match(screen.getByTestId("create-external-agent-status").textContent ?? "", /Waiting for Nathan to connect/);
 });

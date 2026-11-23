@@ -1,0 +1,27 @@
+host: legacy
+runtime: pi
+scenario: cold-fresh
+promptSource: cold_start_with_memory
+note: driver: supportsNativeStandingPrompt=true standingPromptRefreshesOnResume=true deferSpawnUntilMessage=false
+
+## standing prompt
+= standing-prompt.md
+
+## carrier
+SpawnContext.standingPrompt: = standing prompt
+
+## first input (253 chars, sha256:5316b5a003713f70, does not contain the standing prompt)
+<memory-index file="MEMORY.md" size="0.1 KB" complete="true" note="no need to re-read MEMORY.md unless you change it">
+# Alice
+
+## Role
+Keeps the release notes
+
+## Key Knowledge
+- No notes yet.
+
+## Active Context
+- First startup.
+</memory-index>
+
+Start.

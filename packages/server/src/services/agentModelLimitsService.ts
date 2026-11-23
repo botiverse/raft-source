@@ -28,10 +28,11 @@
  * default, read as nothing to show.
  */
 import { and, eq, inArray, sql } from "drizzle-orm";
+import { openAgentRowSecretsIsolated } from "./agentSecretCrypto";
 import {
   hydrateRuntimeConfig,
+  isBuiltInRuntimeConfigMissingProvider,
   isBuiltInRuntimeCustomModelPresetProviderId,
-  isBuiltInRuntimeGatewayProviderId,
   modelLimitsHaveDefaultValues,
   parseModelLimits,
   type AgentModelLimitsFrame,
@@ -40,7 +41,7 @@ import {
   type RuntimeConfigHydrationInput,
 } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../db/index";
-import { agentModelLimitsReports, agentProviderConnections, agents, providerConnections } from "../db/schema";
+import { agentModelLimitsReports, agents } from "../db/schema";
 
 export interface StoredAgentModelLimitsReport {
   machineId: string;
@@ -153,28 +154,21 @@ function storedReportOf(row: typeof agentModelLimitsReports.$inferSelect): Store
 
 /**
  * Whether the agent's saved config is a Built-in custom model reached through
- * a gateway: a direct gateway provider, or a provider connection whose
- * provider is a gateway one and that has an endpoint (`connection`). The
- * daemon reports limits for exactly these (`resolveBuiltInGatewayLaunch`,
- * `configureBuiltInGatewayCustomModel`), and for a typed model on a preset
- * provider that takes one (task #10: OpenRouter, Qwen Token Plan, ...;
- * `configureBuiltInPresetCustomModel`), chosen directly or through a saved
- * connection to it.
+ * a gateway provider. The daemon reports limits for exactly these
+ * (`resolveBuiltInGatewayLaunch`, `configureBuiltInGatewayCustomModel`), and
+ * for a typed model on a preset provider that takes one (task #10:
+ * OpenRouter, Qwen Token Plan, ...; `configureBuiltInPresetCustomModel`).
  */
-export function isBuiltInGatewayCustomModelConfig(
-  runtimeConfig: RuntimeConfig | null | undefined,
-  connection: { providerId: string; endpointUrl: string | null } | null,
-): boolean {
+export function isBuiltInGatewayCustomModelConfig(runtimeConfig: RuntimeConfig | null | undefined): boolean {
   if (!runtimeConfig || runtimeConfig.runtime !== "builtin") return false;
   if (runtimeConfig.model.kind !== "custom") return false;
+  // A Built-in row that lost its provider (lenient hydration) reaches no gateway.
+  if (isBuiltInRuntimeConfigMissingProvider(runtimeConfig)) return false;
   if (runtimeConfig.provider.kind === "gateway") return true;
   if (runtimeConfig.provider.kind === "preset") {
     return isBuiltInRuntimeCustomModelPresetProviderId(runtimeConfig.provider.providerId);
   }
-  return runtimeConfig.provider.kind === "connection"
-    && connection !== null
-    && ((isBuiltInRuntimeGatewayProviderId(connection.providerId) && Boolean(connection.endpointUrl))
-      || isBuiltInRuntimeCustomModelPresetProviderId(connection.providerId));
+  return false;
 }
 
 /** The signal the agent detail, the directory and the PATCH answer carry. */
@@ -212,7 +206,7 @@ export async function getAgentModelLimitsWarnings(input: {
 }): Promise<Map<string, AgentModelLimitsWarning>> {
   const db = input.db ?? getDb();
   const warnings = new Map<string, AgentModelLimitsWarning>();
-  const eligible = await modelLimitsEligible(input.agents, db);
+  const eligible = modelLimitsEligible(input.agents);
   if (eligible.length === 0) return warnings;
   const eligibleIds = eligible.map((agent) => agent.id);
   const agentRows = await db.select({ id: agents.id, machineId: agents.machineId, configRevision: agents.configRevision, sessionId: agents.sessionId })
@@ -229,23 +223,11 @@ export async function getAgentModelLimitsWarnings(input: {
   return warnings;
 }
 
-/** The agents (of those given) whose saved config gets a `modelLimits` status: one query for their connections. */
-async function modelLimitsEligible<T extends { id: string; serverId: string; runtimeConfig: RuntimeConfig | null | undefined }>(
-  candidatesIn: ReadonlyArray<T>,
-  db: DatabaseExecutor,
-): Promise<T[]> {
-  const candidates = candidatesIn.filter((agent) => agent.runtimeConfig?.runtime === "builtin" && agent.runtimeConfig.model.kind === "custom");
-  if (candidates.length === 0) return [];
-  const connectionIds = candidates.filter((agent) => agent.runtimeConfig?.runtime === "builtin" && agent.runtimeConfig.provider.kind === "connection").map((agent) => agent.id);
-  const connectionRows = connectionIds.length === 0 ? [] : await db.select({ agentId: agentProviderConnections.agentId, serverId: agentProviderConnections.serverId, providerId: providerConnections.providerId, endpointUrl: providerConnections.endpointUrl })
-    .from(agentProviderConnections)
-    .innerJoin(providerConnections, and(
-      eq(providerConnections.serverId, agentProviderConnections.serverId),
-      eq(providerConnections.id, agentProviderConnections.connectionId),
-    ))
-    .where(inArray(agentProviderConnections.agentId, connectionIds));
-  const connectionOf = new Map(connectionRows.map((row) => [`${row.serverId}:${row.agentId}`, { providerId: row.providerId, endpointUrl: row.endpointUrl }]));
-  return candidates.filter((agent) => isBuiltInGatewayCustomModelConfig(agent.runtimeConfig, connectionOf.get(`${agent.serverId}:${agent.id}`) ?? null));
+/** The agents (of those given) whose saved config gets a `modelLimits` status. */
+function modelLimitsEligible<T extends { id: string; runtimeConfig: RuntimeConfig | null | undefined }>(
+  candidates: ReadonlyArray<T>,
+): T[] {
+  return candidates.filter((agent) => isBuiltInGatewayCustomModelConfig(agent.runtimeConfig));
 }
 
 /**
@@ -273,12 +255,13 @@ export async function listModelLimitsAgents(
   ));
   const hydrated = rows.flatMap((row) => {
     try {
-      return [{ ...row, runtimeConfig: hydrateRuntimeConfig(row as RuntimeConfigHydrationInput) }];
+      const opened = openAgentRowSecretsIsolated(row);
+      return [{ ...opened, runtimeConfig: hydrateRuntimeConfig(opened as RuntimeConfigHydrationInput) }];
     } catch {
       return [];
     }
   });
-  return (await modelLimitsEligible(hydrated, db)).map(({ id, serverId, assistantOwnerUserId }) => ({ id, serverId, assistantOwnerUserId }));
+  return modelLimitsEligible(hydrated).map(({ id, serverId, assistantOwnerUserId }) => ({ id, serverId, assistantOwnerUserId }));
 }
 
 /** One agent's `modelLimits`, or null when its saved config is not a Built-in custom gateway model. */

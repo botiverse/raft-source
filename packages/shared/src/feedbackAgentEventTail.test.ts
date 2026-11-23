@@ -320,3 +320,37 @@ test("A.3 three-way identity: report serverId, ledger server_id and machine_id a
     assert.equal(read.downloadAllowed, false, name);
   }
 });
+
+test("runtime_input_source accepts fresh_unread_summary, fresh_open_tasks, and constructed_* sources (#proj-runtime:#80)", () => {
+  const sources = [
+    "fresh_unread_summary",
+    "fresh_open_tasks",
+    "fresh_unread_summary_with_memory",
+    "constructed_cold_start",
+    "constructed_fresh_unread_summary",
+    "constructed_fresh_open_tasks",
+    "constructed_wake_inbox_update",
+  ];
+  for (const source of sources) {
+    const built = build([
+      {
+        type: "span",
+        schema_version: 1,
+        name: "daemon.runtime.turn",
+        surface: "daemon",
+        start_time: at(1),
+        duration_ms: 100,
+        status: "ok",
+        attrs: {
+          agentId: AGENT,
+          reason: "spawn",
+          runtime_input_source: source,
+        },
+      },
+    ]);
+    assert.equal(built.ok, true, source);
+    if (!built.ok) continue;
+    const parsed = asOk(parseFeedbackAgentEventTailJson(built.json));
+    assert.equal(parsed.events[0]?.attrs.runtime_input_source, source);
+  }
+});

@@ -265,29 +265,23 @@ test.describe.serial("Settings › Server tab", () => {
         await expect(page.getByText("Only server owners and admins can install, edit, or remove apps.")).toBeVisible();
         await expect(page.getByRole("button", { name: "Add app" })).toHaveCount(0);
 
-        await page.getByTestId("connected-apps-tab-installed").click();
-        const installedTab = page.getByTestId("connected-apps-installed-tab");
-        // Apps v4 D3: a Raft App this server builds and has not installed is under Developer only.
-        await expect(installedTab.getByText(appName)).toHaveCount(0);
-        await expect(installedTab.getByRole("button", { name: "Edit" })).toHaveCount(0);
-        await expect(installedTab.getByRole("button", { name: "Uninstall" })).toHaveCount(0);
-
-        await page.getByTestId("connected-apps-tab-my-apps").click();
-        const myAppsTab = page.getByTestId("connected-apps-my-apps-tab");
-        const myAppsCollection = myAppsTab.getByTestId("connected-apps-my-apps-collection");
-        await expect(myAppsTab.getByText(appName)).toBeVisible();
-        // Grid by default (yezizp, #11723): cards show no description; the list shows it.
-        await expect(myAppsCollection).toHaveAttribute("data-view", "grid");
-        await expect(myAppsTab.getByText("Visible to every active server member.")).toHaveCount(0);
-        await page
-          .getByTestId("connected-apps-view-toggle")
-          .getByRole("radio", { name: "List view" })
-          .click();
-        await expect(myAppsCollection).toHaveAttribute("data-view", "list");
-        await expect(myAppsCollection.getByText("Visible to every active server member.")).toBeVisible();
-        await expect(myAppsTab.getByRole("button", { name: "Edit" })).toHaveCount(0);
-        await expect(myAppsTab.getByRole("button", { name: "Request offline review" })).toHaveCount(0);
-        await expect(myAppsTab.getByRole("button", { name: "Delete" })).toHaveCount(0);
+        // Members have no Discover (R15): the page is Yours alone, with no scope switch to click.
+        await expect(page.getByTestId("connected-apps-tab-yours")).toHaveCount(0);
+        await expect(page.getByTestId("connected-apps-tab-discover")).toHaveCount(0);
+        // Yours lists every App this server has, a Raft App it builds and has not installed included.
+        const yoursTab = page.getByTestId("connected-apps-yours-tab");
+        const yoursCollection = yoursTab.getByTestId("connected-apps-yours-collection");
+        await expect(yoursTab.getByText(appName)).toBeVisible();
+        // Cards, each with its description; a member's card has no button.
+        await expect(yoursCollection.getByText("Visible to every active server member.")).toBeVisible();
+        await expect(yoursTab.getByRole("button", { name: "Edit" })).toHaveCount(0);
+        await expect(yoursTab.getByRole("button", { name: "Uninstall" })).toHaveCount(0);
+        // A member opens no editor: the card of an App that is not installed here is not a button.
+        await expect(yoursTab.getByRole("button", { name: appName })).toHaveCount(0);
+        // Cards only: no view switch.
+        await expect(page.getByTestId("connected-apps-view-toggle")).toHaveCount(0);
+        await expect(yoursTab.getByRole("button", { name: "Request offline review" })).toHaveCount(0);
+        await expect(yoursTab.getByRole("button", { name: "Delete" })).toHaveCount(0);
       } finally {
         await context.close();
       }
@@ -302,7 +296,7 @@ test.describe.serial("Settings › Server tab", () => {
     }
   });
 
-  test("owner: the Apps toolbar's search, filter buttons and view switch share one row", async ({ page }) => {
+  test("owner: the Apps toolbar's search and filter buttons share one row, with no view switch", async ({ page }) => {
     const seedState = await waitForSeedState();
 
     await page.goto(`/s/${seedState.server.slug}/apps`);
@@ -311,21 +305,17 @@ test.describe.serial("Settings › Server tab", () => {
     // Raft DS › Tabs › A tab's own controls: search, then the filter buttons,
     // in one row under the tabs on a desktop, centred on one line.
     const search = page.getByRole("searchbox", { name: "Search connected apps" });
-    const category = page.getByRole("combobox", { name: "All categories" });
+    // Yours has one filter, where the App came from (Discover has Category).
+    const origin = page.getByTestId("apps-filter-origin");
     const searchBox = await search.boundingBox();
-    const categoryBox = await category.boundingBox();
+    const originBox = await origin.boundingBox();
     expect(searchBox).not.toBeNull();
-    expect(categoryBox).not.toBeNull();
+    expect(originBox).not.toBeNull();
     const searchMid = searchBox!.y + searchBox!.height / 2;
-    const categoryMid = categoryBox!.y + categoryBox!.height / 2;
-    expect(Math.abs(searchMid - categoryMid)).toBeLessThanOrEqual(1);
-    // The grid/list switch is back at the row's right end (yezizp, #11723).
-    const toggle = page.getByTestId("connected-apps-view-toggle");
-    await expect(toggle).toBeVisible();
-    const toggleBox = await toggle.boundingBox();
-    expect(toggleBox).not.toBeNull();
-    expect(Math.abs(toggleBox!.y + toggleBox!.height / 2 - searchMid)).toBeLessThanOrEqual(1);
-    expect(toggleBox!.x).toBeGreaterThan(categoryBox!.x + categoryBox!.width);
+    const originMid = originBox!.y + originBox!.height / 2;
+    expect(Math.abs(searchMid - originMid)).toBeLessThanOrEqual(1);
+    // Apps are cards only: the grid/list switch is gone.
+    await expect(page.getByTestId("connected-apps-view-toggle")).toHaveCount(0);
   });
 
   test("owner: delete dialog gates submit on exact slug match", async ({ page, request }) => {

@@ -29,6 +29,7 @@ import {
   type AgentMigrationControlManifest,
   type StreamAgentMigrationResumableBundleInput,
 } from "./agentMigrationResumableBundle";
+import { AgentMigrationKeyPathUnreadableError } from "./agentMigrationExport";
 import { AgentMigrationObjectStoreEntryCountLimitError } from "./agentMigrationObjectStoreBundle";
 import { archiveCompletedAgentMigrationSourceWorkspace } from "./agentMigrationWorkspaceArchive";
 
@@ -896,6 +897,80 @@ test("streaming the same workspace twice yields the same chunks", async () => {
     assert.deepEqual(second.control.bundle, first.control.bundle);
     assert.equal(second.controlSha256, first.controlSha256);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("unreadable files and directories are left behind, and named only for ends that accept it", { skip: process.getuid?.() === 0 }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "migration-streamed-unreadable-"));
+  const workspace = path.join(root, "agents", "agent-unreadable");
+  const lockedFile = path.join(workspace, "gradle", "daemon.out.log");
+  const lockedSmall = path.join(workspace, "a-small.txt");
+  const lockedDir = path.join(workspace, "docker-data");
+  try {
+    await mkdir(path.join(workspace, "gradle"), { recursive: true });
+    await mkdir(lockedDir, { recursive: true });
+    await writeFile(path.join(workspace, "MEMORY.md"), "memory\n");
+    await writeFile(path.join(workspace, "kept.txt"), "kept");
+    await writeFile(lockedSmall, "small");
+    // Over the read-ahead size, so it takes the streamed path.
+    await writeFile(lockedFile, Buffer.alloc(2 * 1024 * 1024, 1));
+    await writeFile(path.join(lockedDir, "inside"), "x");
+    await chmod(lockedFile, 0o000);
+    await chmod(lockedSmall, 0o000);
+    await chmod(lockedDir, 0o000);
+
+    const named = await streamToMemory(workspace, { reportSkippedUnreadable: () => true }, 0);
+    assert.equal(named.control.transferSummary.includedFileCount, 2, "MEMORY.md and kept.txt only");
+    assert.deepEqual(named.control.transferSummary.skippedUnreadable, {
+      count: 3,
+      paths: ["a-small.txt", "docker-data/", "gradle/daemon.out.log"],
+    });
+
+    const older = await streamToMemory(workspace, { reportSkippedUnreadable: () => false }, 0);
+    assert.equal(older.control.transferSummary.includedFileCount, 2, "skipped either way");
+    assert.equal("skippedUnreadable" in older.control.transferSummary, false, "an older end gets the summary it always got");
+  } finally {
+    for (const locked of [lockedFile, lockedSmall]) await chmod(locked, 0o644).catch(() => undefined);
+    await chmod(lockedDir, 0o755).catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an unreadable MEMORY.md or notes/ still fails the move, naming the path", { skip: process.getuid?.() === 0 }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "migration-streamed-key-unreadable-"));
+  const workspace = path.join(root, "agents", "agent-key-unreadable");
+  const memory = path.join(workspace, "MEMORY.md");
+  const notesFile = path.join(workspace, "notes", "a.md");
+  const notesDir = path.join(workspace, "notes", "deep");
+  try {
+    await mkdir(notesDir, { recursive: true });
+    await writeFile(memory, "memory\n");
+    await writeFile(notesFile, "note");
+    await writeFile(path.join(notesDir, "b.md"), "note");
+    const fails = (relativePath: string) => assert.rejects(
+      streamToMemory(workspace, { reportSkippedUnreadable: () => true }, 0),
+      (error: unknown) => {
+        assert.ok(error instanceof AgentMigrationKeyPathUnreadableError);
+        assert.equal(error.message, `MIGRATION_WORKSPACE_KEY_PATH_UNREADABLE:path=${encodeURIComponent(relativePath)}`);
+        return true;
+      },
+    );
+
+    await chmod(memory, 0o000);
+    await fails("MEMORY.md");
+    await chmod(memory, 0o644);
+
+    await chmod(notesFile, 0o000);
+    await fails("notes/a.md");
+    await chmod(notesFile, 0o644);
+
+    await chmod(notesDir, 0o000);
+    await fails("notes/deep");
+  } finally {
+    await chmod(memory, 0o644).catch(() => undefined);
+    await chmod(notesFile, 0o644).catch(() => undefined);
+    await chmod(notesDir, 0o755).catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   }
 });

@@ -261,11 +261,12 @@ export function useMyAssistant({ ask = true }: {
 
 /**
  * One UI per assistant (Tenny, #17 item 2): the viewer's own assistant's DM
- * is the assistant page, so `/dm/<that DM>` goes there instead (a sidebar
- * row, a link, a typed URL). The query and hash go along: the page's DM is
- * the same ChatPanel, which reads `msg` (scroll to and highlight a message)
- * and `thread` from the URL as the DM route did. Null for every other DM,
- * and while the assistant is still answering.
+ * is the assistant page (a sidebar row, a link, a typed URL). On a desktop
+ * DmRoute shows that page in place, beside the sidebar with the DM's row
+ * selected; on a phone `/dm/<that DM>` goes to this path instead. The query
+ * and hash go along: the page's DM is the same ChatPanel, which reads `msg`
+ * (scroll to and highlight a message) and `thread` from the URL as the DM
+ * route did. Null for every other DM, and while the assistant is still answering.
  */
 export function useOwnAssistantPageForDm(dmId: string | undefined): string | null {
   const mine = useMyAssistant();
@@ -278,7 +279,7 @@ export function useOwnAssistantPageForDm(dmId: string | undefined): string | nul
 /**
  * The viewer's own assistant's DM, as far as already known (asks the server
  * nothing): that DM's route is the assistant page (useOwnAssistantPageForDm),
- * so it is no place for the Chat tab to go back to (useTabRouteMemory).
+ * so it is no place for the Chat tab to go back to (navigation/surfaces.ts).
  * Undefined while that is not known yet; null: none.
  */
 export function useOwnAssistantDmId(): string | null | undefined {

@@ -355,7 +355,17 @@ test("owner can update and self-transfer; old owner loses lifecycle capability",
     actorAgentId: ownerAgent.id,
     returnUrl: null,
   });
-  assert.equal(clearCallback.status, "invalid_return_url");
+  // Clearing the callback leaves a token-only App; an unsafe one is still refused.
+  assert.equal(clearCallback.status, "ok");
+  if (clearCallback.status !== "ok") throw new Error("owner clear failed");
+  assert.equal(clearCallback.value.returnUrl, null);
+  const unsafeCallback = await updateOAuthClientForAgent({
+    serverId: server.id,
+    clientKey,
+    actorAgentId: ownerAgent.id,
+    returnUrl: "javascript:alert(1)",
+  });
+  assert.equal(unsafeCallback.status, "invalid_return_url");
 
   await assert.rejects(
     prepareActionCard({
@@ -1219,12 +1229,21 @@ test("rotate-secret route: owner gets 200, same-server non-owner gets 403, and u
     headers: { Authorization: `Bearer ${ownerKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({ clientKey, returnUrl: "" }),
   });
-  assert.equal(clearCallbackRes.status, 400, "owner cannot remove the registered OAuth callback");
-  const [afterClearAttempt] = await getDb()
+  // An empty return URL clears it: a token-only App, which nobody can sign in to.
+  assert.equal(clearCallbackRes.status, 200, "owner can clear the registered OAuth callback");
+  assert.deepEqual((await clearCallbackRes.json() as { updatedFields: string[] }).updatedFields, ["returnUrl"]);
+  const [afterClear] = await getDb()
     .select({ returnUrl: oauthClients.returnUrl })
     .from(oauthClients)
     .where(eq(oauthClients.id, registeredClient.id));
-  assert.equal(afterClearAttempt?.returnUrl, "https://app.example/auth/raft/callback");
+  assert.equal(afterClear?.returnUrl, null);
+  const unsafeCallbackRes = await fetch(`${app.baseUrl}/internal/agent-api/integrations/app/update`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${ownerKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ clientKey, returnUrl: "http://plain.example/callback" }),
+  });
+  assert.equal(unsafeCallbackRes.status, 400, "a callback that isn't HTTPS (or loopback HTTP) is still refused");
+  assert.equal((await unsafeCallbackRes.json() as { code: string }).code, "RETURN_URL_INVALID");
 
   const replacementCallback = "https://replacement.example/auth/raft/callback";
   const replaceCallbackRes = await fetch(`${app.baseUrl}/internal/agent-api/integrations/app/update`, {

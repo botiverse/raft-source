@@ -12,7 +12,7 @@ import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 
-import { DAEMON_CAPABILITY_RUNTIME_HOST_OAR, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE, type ServerToMachineMessage } from "@botiverse/raft-shared";
+import { DAEMON_CAPABILITY_RUNTIME_HOST_OAR, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CLAUDE, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_PI, type ServerToMachineMessage } from "@botiverse/raft-shared";
 
 import { getDb } from "../db/index";
 import { agents, machines, serverMembers, servers, users } from "../db/schema";
@@ -60,7 +60,17 @@ async function seed(slug: string, runtime: string) {
     name: "oar-agent",
     status: "inactive",
     runtime,
-    model: runtime === "grok" ? "grok-4.5" : "sonnet",
+    model: runtime === "grok" ? "grok-4.5" : runtime === "builtin" ? "deepseek/deepseek-chat" : "sonnet",
+    ...(runtime === "builtin" ? {
+      runtimeConfig: {
+        version: 1,
+        runtime: "builtin",
+        hostUserState: "forbidden",
+        provider: { kind: "preset", providerId: "deepseek", apiKey: "sk-test" },
+        model: { kind: "custom", name: "deepseek/deepseek-chat" },
+        mode: { kind: "default" },
+      },
+    } : {}),
     executionMode: "byoc",
     machineId: machine!.id,
   }).returning();
@@ -137,7 +147,7 @@ test("OAR host: the grok flag moves only grok agents; a runtime the OAR host doe
   await createFeatureFlag({ key: GROK_OAR_FLAG, randomizationUnit: "server", defaultEnabled: true });
   assert.equal((await startConfig("oar-claude", { runtime: "claude" })).runtimeHost, undefined);
   assert.equal(agentRuntimeOarFeatureFlagKey("grok"), "agent_runtime_oar_grok");
-  assert.equal(agentRuntimeOarFeatureFlagKey("claude"), null);
+  assert.equal(agentRuntimeOarFeatureFlagKey("kimi-sdk"), null);
   assert.equal(agentRuntimeOarFeatureFlagKey("__proto__"), null);
   assert.equal(agentRuntimeOarFeatureFlagKey(undefined), null);
 });
@@ -154,24 +164,29 @@ test("OAR host: a Computer with runtime-host:oar but not runtime-host:oar:codex 
   assert.equal((await startConfig("oar-codex-old-computer", { runtime: "codex" })).runtimeHost, undefined);
 });
 
-test("OAR host: the antigravity flag asks a daemon that advertised runtime-host:oar; an older one hands the start back itself", async ({ db: _db }) => {
-  assert.equal((await startConfig("oar-antigravity-off", { runtime: "antigravity" })).runtimeHost, undefined);
-  await createFeatureFlag({ key: AGENT_RUNTIME_OAR_FEATURE_FLAG_KEYS.antigravity, randomizationUnit: "server", defaultEnabled: true });
-  assert.equal(agentRuntimeOarFeatureFlagKey("antigravity"), "agent_runtime_oar_antigravity");
+test("OAR host: Antigravity runs on the OAR host with no flag row wherever the daemon advertised runtime-host:oar (#oar-raft:#46)", async ({ db: _db }) => {
+  assert.equal(agentRuntimeOarFeatureFlagKey("antigravity"), null, "Antigravity has no OAR host flag (retired, #oar-raft:#46)");
   assert.equal((await startConfig("oar-antigravity-on", { runtime: "antigravity" })).runtimeHost, "oar");
   assert.equal((await startConfig("oar-antigravity-no-host", { runtime: "antigravity", capabilities: [] })).runtimeHost, undefined);
+  assert.equal((await startConfig("oar-antigravity-other-grok", { runtime: "grok" })).runtimeHost, undefined);
 });
 
 test("OAR host: a Computer with only runtime-host:oar:codex keeps its drivers", async ({ db: _db }) => {
   assert.equal((await startConfig("oar-codex-lone-cap", { runtime: "codex", capabilities: [DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX] })).runtimeHost, undefined);
 });
 
-test("OAR host: the server kill switch keeps Codex on its driver", async ({ db: _db }) => {
+test("OAR host: the server kill switch keeps Codex, Antigravity and OpenCode on their drivers", async ({ db: _db }) => {
   const previous = process.env[AGENT_RUNTIME_OAR_DISABLED_ENV];
   process.env[AGENT_RUNTIME_OAR_DISABLED_ENV] = "1";
   try {
-    const ready = [DAEMON_CAPABILITY_RUNTIME_HOST_OAR, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX];
+    const ready = [
+      DAEMON_CAPABILITY_RUNTIME_HOST_OAR,
+      DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX,
+      DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE,
+    ];
     assert.equal((await startConfig("oar-codex-killed", { runtime: "codex", capabilities: ready })).runtimeHost, undefined);
+    assert.equal((await startConfig("oar-antigravity-killed", { runtime: "antigravity", capabilities: ready })).runtimeHost, undefined);
+    assert.equal((await startConfig("oar-opencode-killed", { runtime: "opencode", capabilities: ready })).runtimeHost, undefined);
   } finally {
     if (previous === undefined) delete process.env[AGENT_RUNTIME_OAR_DISABLED_ENV];
     else process.env[AGENT_RUNTIME_OAR_DISABLED_ENV] = previous;
@@ -184,6 +199,8 @@ test("OAR host: an OAR-only runtime (Qwen Code) always asks for the OAR host fro
   assert.equal((await startConfig("oar-qwen-no-cap", { runtime: "qwen", capabilities: [] })).runtimeHost, undefined);
   assert.equal(agentRuntimeOarFeatureFlagKey("qwen"), null);
   assert.equal(agentRuntimeOarFeatureFlagKey("qoder"), null);
+  assert.equal((await startConfig("oar-dsh-no-flag", { runtime: "dsh" })).runtimeHost, "oar");
+  assert.equal(agentRuntimeOarFeatureFlagKey("dsh"), null);
 });
 
 test("OAR host: a Computer with runtime-host:oar but not runtime-host:oar:grok keeps the Grok driver with the flag on (#oar-raft:#4)", async ({ db: _db }) => {
@@ -206,17 +223,36 @@ test("OAR host: Cursor needs agent_runtime_oar_cursor on and a Computer with run
   assert.equal((await startConfig("oar-cursor-flag-grok", { capabilities: [...cursorReady, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK] })).runtimeHost, undefined);
 });
 
-test("OAR host: OpenCode needs agent_runtime_oar_opencode on and a Computer with runtime-host:oar:opencode", async ({ db: _db }) => {
+test("OAR host: OpenCode runs on the OAR host with no flag row wherever the daemon advertised runtime-host:oar:opencode (#oar-raft:#46)", async ({ db: _db }) => {
   const opencodeReady = [DAEMON_CAPABILITY_RUNTIME_HOST_OAR, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE];
-  assert.equal(agentRuntimeOarFeatureFlagKey("opencode"), "agent_runtime_oar_opencode");
-  // Flag x capability: only both together ask for the OAR host.
-  assert.equal((await startConfig("oar-opencode-no-flag", { runtime: "opencode", capabilities: opencodeReady })).runtimeHost, undefined, "default off: no flag row");
-  await createFeatureFlag({ key: AGENT_RUNTIME_OAR_FEATURE_FLAG_KEYS.opencode, randomizationUnit: "server", defaultEnabled: true });
+  assert.equal(agentRuntimeOarFeatureFlagKey("opencode"), null, "OpenCode has no OAR host flag (retired, #oar-raft:#46)");
   assert.equal((await startConfig("oar-opencode-on", { runtime: "opencode", capabilities: opencodeReady })).runtimeHost, "oar");
-  assert.equal((await startConfig("oar-opencode-no-cap", { runtime: "opencode", capabilities: [DAEMON_CAPABILITY_RUNTIME_HOST_OAR] })).runtimeHost, undefined, "an older Computer (or Windows) keeps the driver");
+  assert.equal((await startConfig("oar-opencode-no-cap", { runtime: "opencode", capabilities: [DAEMON_CAPABILITY_RUNTIME_HOST_OAR] })).runtimeHost, undefined, "an older Computer (or Windows) keeps the legacy driver");
   assert.equal((await startConfig("oar-opencode-lone-cap", { runtime: "opencode", capabilities: [DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE] })).runtimeHost, undefined, "the OpenCode capability alone is not the OAR host");
-  // The OpenCode flag moves no other runtime.
-  assert.equal((await startConfig("oar-opencode-flag-grok", { capabilities: [...opencodeReady, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK] })).runtimeHost, undefined);
+  assert.equal((await startConfig("oar-opencode-other-grok", { capabilities: [...opencodeReady, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK] })).runtimeHost, undefined);
+});
+
+test("OAR host: Pi needs agent_runtime_oar_pi on and a Computer with runtime-host:oar:pi (#oar-raft:#48)", async ({ db: _db }) => {
+  const piReady = [DAEMON_CAPABILITY_RUNTIME_HOST_OAR, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_PI];
+  assert.equal(agentRuntimeOarFeatureFlagKey("pi"), "agent_runtime_oar_pi");
+  assert.equal(agentRuntimeOarFeatureFlagKey("builtin"), null, "builtin stays on BuiltInDriver");
+  assert.equal((await startConfig("oar-pi-no-flag", { runtime: "pi", capabilities: piReady })).runtimeHost, undefined, "default off: no flag row");
+  await createFeatureFlag({ key: AGENT_RUNTIME_OAR_FEATURE_FLAG_KEYS.pi, randomizationUnit: "server", defaultEnabled: true });
+  assert.equal((await startConfig("oar-pi-on", { runtime: "pi", capabilities: piReady })).runtimeHost, "oar");
+  assert.equal((await startConfig("oar-pi-no-cap", { runtime: "pi", capabilities: [DAEMON_CAPABILITY_RUNTIME_HOST_OAR] })).runtimeHost, undefined, "older Computer or Windows/SEA keeps legacy PiDriver");
+  assert.equal((await startConfig("oar-pi-lone-cap", { runtime: "pi", capabilities: [DAEMON_CAPABILITY_RUNTIME_HOST_OAR_PI] })).runtimeHost, undefined, "the Pi capability alone is not the OAR host");
+  // Built-in never follows Pi's OAR flag.
+  assert.equal((await startConfig("oar-pi-flag-builtin", { runtime: "builtin", capabilities: piReady })).runtimeHost, undefined);
+});
+
+test("OAR host: Claude needs agent_runtime_oar_claude on and a Computer with runtime-host:oar:claude (#oar-raft:#48)", async ({ db: _db }) => {
+  const claudeReady = [DAEMON_CAPABILITY_RUNTIME_HOST_OAR, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CLAUDE];
+  assert.equal(agentRuntimeOarFeatureFlagKey("claude"), "agent_runtime_oar_claude");
+  assert.equal((await startConfig("oar-claude-no-flag", { runtime: "claude", capabilities: claudeReady })).runtimeHost, undefined, "default off: no flag row");
+  await createFeatureFlag({ key: AGENT_RUNTIME_OAR_FEATURE_FLAG_KEYS.claude, randomizationUnit: "server", defaultEnabled: true });
+  assert.equal((await startConfig("oar-claude-on", { runtime: "claude", capabilities: claudeReady })).runtimeHost, "oar");
+  assert.equal((await startConfig("oar-claude-no-cap", { runtime: "claude", capabilities: [DAEMON_CAPABILITY_RUNTIME_HOST_OAR] })).runtimeHost, undefined, "older Computer or Windows keeps legacy ClaudeDriver");
+  assert.equal((await startConfig("oar-claude-lone-cap", { runtime: "claude", capabilities: [DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CLAUDE] })).runtimeHost, undefined, "the Claude capability alone is not the OAR host");
 });
 
 test("OAR host: the server kill switch keeps Cursor on its driver with the flag on", async ({ db: _db }) => {

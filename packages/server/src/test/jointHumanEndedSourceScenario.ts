@@ -174,7 +174,7 @@ export async function jointHumanEndedSourceScenario({
   await changeChannelMembershipRole({
     serverId: h.id,
     channelId: created.channel.id,
-    requesterUserId: owner.id,
+    requester: { type: "user", id: owner.id },
     targetType: "user",
     targetId: person.id,
     nextRole: "admin",

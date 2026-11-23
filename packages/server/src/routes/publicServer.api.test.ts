@@ -298,13 +298,15 @@ test("public server: anonymous message history is a narrow public projection", a
       displayName: "Stored Avatar Agent",
       handle: "stored-avatar-agent",
       avatarUrl: storedAgentAvatar,
-      description: "Public agent description",
+      // A signed-out visitor is no member of the agent's server
+      // (descriptionVisibility, cindyz 2026-11-17).
+      description: null,
     });
     assert.deepEqual(agentProjection.messages.find((row) => row.id === externalAgentMessage.id)?.sender, {
       displayName: "External Avatar Agent",
       handle: "external-avatar-agent",
       avatarUrl: null,
-      description: "External avatar is filtered",
+      description: null,
     }, "third-party or signed avatar URLs must not cross the anonymous boundary");
     assert.deepEqual(agentProjection.messages.find((row) => row.id === otherServerAgentMessage.id)?.sender, {
       displayName: "Unknown agent",

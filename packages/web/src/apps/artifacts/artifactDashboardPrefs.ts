@@ -3,9 +3,9 @@ import type { ArtifactDashboardAllSort } from "@botiverse/raft-shared";
 
 /**
  * What the Artifacts home page keeps on the device (#proj-workspace:#133): the
- * view (grid or list), the table's column widths (design D21) and the list's
+ * view (grid or list), the table's column widths (design D21), the list's
  * sort (the server sorts it: `dashboardAll`'s `sort`, each in its default
- * direction). Local storage, one key; anything unreadable is the default, so a newer or older
+ * direction) and whether the Other group is unfolded (#334; folded by default). Local storage, one key; anything unreadable is the default, so a newer or older
  * build never breaks on another's value.
  */
 
@@ -48,11 +48,13 @@ export interface ArtifactDashboardPrefs {
    * first says nothing about a choice, and read as one it would keep those readers off the new default.
    */
   listSort: ArtifactHomeSort;
+  /** Other, the home page's second group (#334), is unfolded. */
+  otherOpen: boolean;
 }
 
 export const ARTIFACT_DASHBOARD_PREFS_KEY = "raft:artifacts:dashboard:v1";
 
-const DEFAULT_PREFS: ArtifactDashboardPrefs = { view: "grid", widths: ARTIFACT_TABLE_DEFAULT_WIDTHS, listSort: ARTIFACT_HOME_DEFAULT_SORT };
+const DEFAULT_PREFS: ArtifactDashboardPrefs = { view: "grid", widths: ARTIFACT_TABLE_DEFAULT_WIDTHS, listSort: ARTIFACT_HOME_DEFAULT_SORT, otherOpen: false };
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const oneOf = <T extends string>(values: readonly T[], value: unknown): value is T => typeof value === "string" && (values as readonly string[]).includes(value);
@@ -76,7 +78,8 @@ export function readArtifactDashboardPrefs(raw: string | null): ArtifactDashboar
     if (typeof width === "number" && Number.isFinite(width)) widths[column] = clampWidth(width);
   }
   const listSort = oneOf(ARTIFACT_HOME_SORTS, parsed.listSort) ? parsed.listSort : DEFAULT_PREFS.listSort;
-  return { view, widths, listSort };
+  const otherOpen = parsed.otherOpen === true;
+  return { view, widths, listSort, otherOpen };
 }
 
 function load(): ArtifactDashboardPrefs {
@@ -111,5 +114,6 @@ export function useArtifactDashboardPrefs() {
     widths: { ...p.widths, [column]: width === null ? ARTIFACT_TABLE_DEFAULT_WIDTHS[column] : clampWidth(width) },
   })), [update]);
   const setSort = useCallback((listSort: ArtifactHomeSort) => update((p) => ({ ...p, listSort })), [update]);
-  return { prefs, setView, setWidth, setSort };
+  const setOtherOpen = useCallback((otherOpen: boolean) => update((p) => ({ ...p, otherOpen })), [update]);
+  return { prefs, setView, setWidth, setSort, setOtherOpen };
 }

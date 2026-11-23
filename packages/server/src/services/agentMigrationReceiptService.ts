@@ -231,12 +231,21 @@ function formatCompletedReceiptBody(input: {
       `按 ${ignoredSources.chineseFiles} 未迁移：${ignored.count} 个路径${ignoredSources.chineseBreakdown}，${ignoredAtBound ? "至少 " : ""}${ignored.fileCount} 个文件（${formatReceiptBytes(ignored.bytes)}${ignoredAtBound ? " 以上" : ""}）。旧工作区归档在 ${input.sourceMachineName} 上，最多保留 7 天，缺了可以从那里找回。`,
     ]
     : [];
+  const unreadable = summary.skippedUnreadable;
+  const unreadableNamed = unreadable ? `${unreadable.paths.join(", ")}${unreadable.count > unreadable.paths.length ? ", …" : ""}` : "";
+  const unreadableLines = unreadable
+    ? [
+      `Not moved, because the source had no permission to read them: ${countNoun(unreadable.count, "path")} (${unreadableNamed}). They are still in the old workspace archived on ${input.sourceMachineName} for up to 7 days.`,
+      `没有读取权限、未迁移：${unreadable.count} 个路径（${unreadableNamed}）。它们还在 ${input.sourceMachineName} 上归档的旧工作区里，最多保留 7 天。`,
+    ]
+    : [];
 
   return [
     `Migration completed. Moved from ${input.sourceMachineName} to ${input.targetMachineName}.`,
     `Migration support ref: ${input.supportRef}.`,
     `Moved ${summary.includedFileCount} files (${formatReceiptBytes(summary.includedBytes)}). Filtered ${summary.excludedRegenerableCount} regenerable entries: third-party dependencies ${excluded.thirdPartyDependencies}, caches ${excluded.caches}, build outputs ${excluded.buildArtifacts}, other regenerable files ${excluded.otherRegenerable}.`,
     ...ignoredLines,
+    ...unreadableLines,
     `The workspace moved successfully.${keyEntrySentence}`,
     `迁移过程中会过滤部分第三方依赖、缓存、构建产物等可重新生成的非关键文件；工作区已迁移${chineseKeyEntrySentence}`,
   ].join("\n");
@@ -332,6 +341,28 @@ export function formatAgentMigrationWorkspaceSizeLines(
   ];
 }
 
+/**
+ * The source had no permission to read MEMORY.md, notes/ or the workspace
+ * (MIGRATION_WORKSPACE_KEY_PATH_UNREADABLE:path=<URI-encoded>). Retrying
+ * without fixing the permission fails the same way, so say which path.
+ */
+export function formatAgentMigrationKeyPathUnreadableLines(rawMessage: string | null | undefined): string[] {
+  if (!rawMessage?.startsWith("MIGRATION_WORKSPACE_KEY_PATH_UNREADABLE:")) return [];
+  let unreadable: string;
+  try {
+    unreadable = decodeURIComponent(wireValue(rawMessage, "path") ?? "");
+  } catch {
+    return [];
+  }
+  if (!unreadable || unreadable.length > 256 || /[\u0000-\u001f\u007f]/.test(unreadable)) return [];
+  const shown = unreadable === "." ? "the workspace folder" : unreadable;
+  const chineseShown = unreadable === "." ? "工作区目录" : unreadable;
+  return [
+    `The source had no permission to read ${shown}. MEMORY.md and notes/ always move with the agent, so the migration stopped instead of leaving it behind. Make it readable by the agent's user (for example with chown or chmod), then start the migration again.`,
+    `源电脑没有权限读取 ${chineseShown}。MEMORY.md 和 notes/ 必须随 agent 一起迁移，所以迁移停止了，没有把它留下。请让 agent 的用户能读取它（比如用 chown 或 chmod），再重新开始迁移。`,
+  ];
+}
+
 export function formatAgentMigrationTerminalReceipt(input: {
   kind: Exclude<AgentMigrationReceiptKind, "completed">;
   sourceMachineName: string;
@@ -376,10 +407,12 @@ export function formatAgentMigrationTerminalReceipt(input: {
     isRetry: input.isRetry === true,
     targetMachineName: input.targetMachineName,
   });
+  const keyPathLines = formatAgentMigrationKeyPathUnreadableLines(input.detail);
   return [
     `Migration failed. The migration ${direction} did not complete.`,
     placement,
     `Migration support ref: ${input.supportRef}.${reason}`,
+    ...keyPathLines,
     ...(sizeLines.length > 0 ? sizeLines : input.isRetry ? [AGENT_MIGRATION_RETRY_ALSO_FAILED_LINE] : []),
     "This migration has ended; a new migration can be started separately.",
   ].join("\n");

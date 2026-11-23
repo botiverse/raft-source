@@ -1,5 +1,6 @@
 // Runtime environment and the minimal R2-shaped storage interface the handlers use.
 import type { ScopeDbTraceEventProjectorClient } from "./traces/traceEventProjector";
+import type { DevEventsScopeDbClient } from "./external/devEvents";
 
 type R2PutValue = ArrayBuffer | ArrayBufferView | string | ReadableStream;
 
@@ -64,6 +65,14 @@ export interface TraceUploadRuntimeEnv {
   EXTERNAL_GITHUB_REFRESH_TOKEN?: string;
   /** Bearer token for POST /api/external/antiproton-trace (antiproton agent trace rows). Unset = endpoint off (404). */
   EXTERNAL_ANTIPROTON_TRACE_TOKEN?: string;
+  /** Write-only bearer tokens for POST /api/dev-events (#proj-dev-trace); the token decides `source`. Neither set = endpoint off (404). */
+  DEV_TRACE_CI_TOKEN?: string;
+  DEV_TRACE_DEV_TOKEN?: string;
+  /** ScopeDB endpoint and write key for the `dev` database; unset = the SCOPEDB_TRACE_EVENTS_* pair. */
+  DEV_TRACE_SCOPEDB_ENDPOINT?: string;
+  DEV_TRACE_SCOPEDB_WRITE_KEY?: string;
+  /** Test-only structural injection; production constructs the SDK client. */
+  DEV_TRACE_SCOPEDB_CLIENT?: DevEventsScopeDbClient;
   DEPLOYMENT_ENV?: string;
   SLOCK_RELEASE_SHA?: string;
 }

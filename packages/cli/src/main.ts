@@ -12,12 +12,14 @@
 //   raft channel unarchive --target "#name"
 //   raft channel add-member --target "#name" --user @name
 //   raft channel remove-member --target "#name" --user @name
+//   raft channel set-role --target "#name" --user @name --role admin
 //   raft channel join --target "#name"
 //   raft channel leave --target "#name"
 //   raft channel mute --target "#name"
 //   raft channel unmute --target "#name"
 //   raft thread list
 //   raft thread unfollow --target "#name:shortid"
+//   raft focus ["<target>"] / raft unfocus "<target>"
 //   raft manual get <topic>
 //   raft manual search <keywords>
 //   raft context search/read
@@ -28,7 +30,7 @@
 //   raft mention pending/notify/invite
 //   raft profile show/update
 //   raft integration list/marketplace/login/env/invoke/app prepare|rotate-secret|update|transfer-owner
-//   raft reminder schedule/list/cancel/snooze/update/log/trigger
+//   raft reminder schedule/list/show/cancel/snooze/update/log/trigger
 //   raft action prepare/withdraw
 //   raft migration retry
 //   raft proc start/list/logs/stop

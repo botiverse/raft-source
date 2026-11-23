@@ -21,7 +21,7 @@ import { ExternalAgentCredentialList } from "./ExternalAgentCredentialList";
 import { CopyBlock, CopyField } from "./ExternalSetupCopy";
 import { trackExternalAgentSetupAction, trackExternalAgentSetupProgress } from "../../analytics/externalAgentSetup";
 import type { ExternalAgentSetupAction } from "../../analytics/externalAgentSetup";
-import { existingAgentPrompt, externalConnectionState, RAFT_SDK_DOCS_URL, SDK_INSTALL_COMMAND, sdkStarterCode, STATUS_POLL_MS } from "./externalAgentSetup";
+import { existingAgentPrompt, usePromptRecipientHandle, externalConnectionState, RAFT_SDK_DOCS_URL, SDK_INSTALL_COMMAND, sdkStarterCode, STATUS_POLL_MS } from "./externalAgentSetup";
 import type { ExternalSetupMethod } from "./externalAgentSetup";
 import { useExternalAgentCredentials } from "./useExternalAgentCredentials";
 
@@ -94,6 +94,7 @@ export function ExternalAgentConnectionCard({ agent, status, canIssueCredentials
   onStatus: (status: ExternalAgentStatus) => void;
 }) {
   const { formatMessage } = useIntl();
+  const promptRecipient = usePromptRecipientHandle();
   const fetchExternalAgentStatus = useAgentStore((s) => s.fetchExternalAgentStatus);
   const display = useAgentDisplayState(agent.id, agent);
   const credentials = useExternalAgentCredentials(agent.id, canIssueCredentials);
@@ -215,7 +216,7 @@ export function ExternalAgentConnectionCard({ agent, status, canIssueCredentials
               <>
                 <section className="stack-y-2">
                   <h3 className="text-body font-semibold">{formatMessage({ id: credentialStep ? "agent.createExternal.step1Existing" : "agent.externalCard.promptStep" })}</h3>
-                  <CopyBlock text={existingAgentPrompt(agent, formatMessage)} label={formatMessage({ id: "agent.createExternal.copyPrompt" })} testId="external-agent-prompt" primary collapsed onCopied={handlePromptCopied} />
+                  <CopyBlock text={existingAgentPrompt(agent, formatMessage, promptRecipient)} label={formatMessage({ id: "agent.createExternal.copyPrompt" })} testId="external-agent-prompt" primary collapsed onCopied={handlePromptCopied} />
                 </section>
                 {credentialStep ? (
                   <section className="stack-y-2">

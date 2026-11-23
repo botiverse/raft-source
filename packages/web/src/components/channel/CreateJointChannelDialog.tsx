@@ -26,6 +26,7 @@ import type { MemberChoice } from "./MemberChoiceList";
 import { findSameAdminJointTarget, parseInvitedPeopleText } from "../../utils/jointSameAdmin";
 import { DialogCardFooter, DialogCommit } from "../ui/NarrowDialog";
 import { ArchivedNameCollisionBanner } from "./ArchivedNameCollisionBanner";
+import { isAddableToNewChannel } from "../../utils/channelLocalMembership";
 import { parseArchivedNameCollision } from "./archivedNameCollision";
 import type { ArchivedNameCollision } from "./archivedNameCollision";
 
@@ -90,7 +91,8 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
           ? <AppBadge className="shrink-0" appName={agent.managedByApp?.name} botName={agent.displayName || agent.name} />
           : undefined,
       })),
-      ...members.filter((member) => member.userId !== currentUser?.id).map((member) => ({
+      // No Guest: a new channel is never its bound one (403 guest_other_channel).
+      ...members.filter((member) => member.userId !== currentUser?.id && isAddableToNewChannel(member)).map((member) => ({
         kind: "human" as const,
         id: member.userId,
         value: member,

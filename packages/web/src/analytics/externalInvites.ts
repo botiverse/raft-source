@@ -43,6 +43,19 @@ export function externalInviteSendResult(result: {
   return result.serversFailed || (result.servers ?? []).some((server) => server.state === "refused") ? "partial" : "sent";
 }
 
+/** Create Channel's create refused for its name: marked where the create fails, read by the send's failure. */
+const nameTakenFailures = new WeakSet<object>();
+
+/** Marks a failed create of Create Channel's channel as refused for its name (`channel_name_taken`). */
+export function noteChannelNameTaken(err: unknown): void {
+  if (err && typeof err === "object") nameTakenFailures.add(err);
+}
+
+/** A failed send's code: `channel_name_taken` for a create marked by noteChannelNameTaken, else the server's code. */
+export function externalInviteSendFailureCode(err: unknown, serverCode: string | null): string | null {
+  return err && typeof err === "object" && nameTakenFailures.has(err) ? "channel_name_taken" : serverCode;
+}
+
 /** The server's code for a failed send, when the dialog has a sentence for it; anything else (or none) is `other`. */
 export function externalInviteSendErrorCode(code: string | null | undefined): ExternalInviteSendErrorCode {
   return (EXTERNAL_INVITE_SEND_ERROR_CODES as readonly string[]).includes(code ?? "")

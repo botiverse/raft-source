@@ -7,25 +7,44 @@ import Banner from "../../components/ui/Banner";
 import { COMPOSER_EDGE_CLASS } from "../../components/message/composerHost";
 import { PaywallShown, usePaywallShown } from "../../analytics/paywall";
 import { usePaywallUpgrade } from "../../hooks/usePaywallUpgrade";
+import { formatFreezeDeadline } from "../../components/billing/upgradeGateCopy";
 import type { Channel } from "../../store/channelStore";
 import { channelLimitLockedMessageId, externalFreezeUpcomingAt, isExternalFreezeActive } from "../../utils/jointChannelLimit";
 
 /**
  * The free plan's external channel freeze, before its time: this server is
  * over the limit and will be read-only here from then on. Shown instead of
- * the joint grace notice when both apply (jointChannelGraceEndsAt).
+ * the joint grace notice when both apply (jointChannelGraceEndsAt). Its
+ * button, by role as ExternalFrozenBanner's, opens the upgrade dialog for
+ * `external_channel_frozen` with the deadline (`freeze_upcoming`), so the
+ * dialog says from when, not "again". No paywall_shown here: the freeze's
+ * paywall is met once it starts (ExternalFrozenBanner).
  */
 export function ExternalFreezeNotice({ channel }: { channel: Pick<Channel, "externalFreezeAt"> }) {
   const { formatMessage, formatDate } = useIntl();
+  const role = useServerStore((s) => s.current?.role);
+  // The same reading usePaywallUpgrade uses (billing first), so label and action agree.
+  const plan = useServerStore((s) => s.billing?.plan || s.current?.plan);
+  const paywallUpgrade = usePaywallUpgrade();
   const deadline = externalFreezeUpcomingAt(channel);
+  const openUpgrade = useCallback(
+    () => { if (deadline) paywallUpgrade("external_channel_frozen", "channel_banner", undefined, { kind: "freeze_upcoming", deadline }); },
+    [paywallUpgrade, deadline],
+  );
   if (!deadline) return null;
+  const button = plan && plan !== "free" ? "message.chatPanel.viewBilling" : role === "owner" ? "billing.upgradeToPro" : "planBilling.upgrade.askOwner";
   return (
     <div className={`bg-layer-canvas ${COMPOSER_EDGE_CLASS} pt-2`}>
-      <Banner intent="warning" className="justify-center text-center font-bold" data-testid="external-freeze-notice-banner">
-        {formatMessage(
-          { id: "message.chatPanel.externalLimitFreezeNotice" },
-          { deadline: formatDate(new Date(deadline), { dateStyle: "medium", timeStyle: "short" }) },
+      <Banner
+        intent="warning"
+        data-testid="external-freeze-notice-banner"
+        actions={(
+          <TextLink onClick={openUpgrade} variant="strong" data-testid="external-freeze-notice-upgrade">
+            {formatMessage({ id: button })}
+          </TextLink>
         )}
+      >
+        {formatMessage({ id: "message.chatPanel.externalLimitFreezeNotice" }, { deadline: formatFreezeDeadline(formatDate, deadline) })}
       </Banner>
     </div>
   );

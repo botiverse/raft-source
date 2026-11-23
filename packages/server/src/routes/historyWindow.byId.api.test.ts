@@ -116,7 +116,7 @@ test("a person's by-id actions on a message behind the window answer history_lim
 
   const oldReaction = await human(base, fx, `/api/messages/${fx.old.id}/reactions`, { method: "POST", body: { emoji: "👍" } });
   assert.equal(oldReaction.status, 404);
-  assert.deepEqual(await oldReaction.json(), { error: HUMAN, code: "history_limited" });
+  assert.deepEqual(await oldReaction.json(), { error: HUMAN, code: "history_limited", errorCode: "history_limited" });
   assert.equal((await human(base, fx, `/api/messages/${fx.recent.id}/reactions`, { method: "POST", body: { emoji: "👍" } })).status, 200);
 
   assert.equal((await human(base, fx, `/api/attachments/${fx.oldFile.id}/comments`)).status, 404, "a file in an old message is behind the window too");

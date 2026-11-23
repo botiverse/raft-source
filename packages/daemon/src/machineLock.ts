@@ -10,7 +10,7 @@ import {
   startIdentityReadSpawns,
 } from "./drivers/processTree";
 import { resolveRaftHomePath } from "./raftHome";
-import { PID_REUSE_TOLERANCE_MS, startedAfterRecord } from "@botiverse/raft-shared";
+import { type LinuxProcStatReads, linuxPidShowsExited, PID_REUSE_TOLERANCE_MS, startedAfterRecord } from "@botiverse/raft-shared";
 
 const INCOMPLETE_LOCK_STALE_MS = 30_000;
 
@@ -167,19 +167,32 @@ function lockAgeMs(lockDir: string): number | null {
   }
 }
 
-function isProcessAlive(pid: number): boolean {
+export interface LockOwnerLivenessDeps extends Partial<LinuxProcStatReads> {
+  platform?: NodeJS.Platform;
+}
+
+/**
+ * Liveness via signal 0; on Linux an exited but unreaped owner (a zombie)
+ * still answers it, so /proc/<pid>/stat has the last word there.
+ */
+export function isLockOwnerProcessAlive(pid: number, deps: LockOwnerLivenessDeps = {}): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
-    return true;
   } catch (err) {
     const code = typeof err === "object" && err && "code" in err ? (err as { code?: string }).code : undefined;
     return code !== "ESRCH";
   }
+  if ((deps.platform ?? process.platform) !== "linux") return true;
+  return !linuxPidShowsExited(pid, {
+    readProcStat: deps.readProcStat ?? ((id) => readFileSync(`/proc/${id}/stat`, "utf8")),
+    readSelfStat: deps.readSelfStat ?? (() => readFileSync("/proc/self/stat", "utf8")),
+    selfPid: deps.selfPid ?? process.pid,
+  });
 }
 
 const defaultProcessProbe: MachineLockProcessProbe = {
-  isAlive: isProcessAlive,
+  isAlive: (pid) => isLockOwnerProcessAlive(pid),
   // Linux derives a start time from the current boot time, so a clock stepped
   // forward after boot (no RTC, late NTP) would make a live owner look newer
   // than its lock and hand the lock to a second daemon. On Linux only the

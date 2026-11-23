@@ -12,6 +12,16 @@ export function conversationLabel(conversation: Extract<ArtifactHome, { kind: "c
   return conversation.name;
 }
 
+/**
+ * conversationLabel where words can be localized: a joint the reader's server
+ * has no copy of comes with no name (the server never names the joint's own
+ * storage), and reads "Shared channel".
+ */
+export function homeConversationLabel(formatMessage: IntlShape["formatMessage"], conversation: Extract<ArtifactHome, { kind: "conversation" }>["conversation"]): string {
+  if (conversation.type === "joint" && conversation.name === "") return formatMessage({ id: "artifacts.scope.sharedChannel" });
+  return conversationLabel(conversation);
+}
+
 /** A conversation by the name the sidebar shows: a DM by its peer's display name, else the handle; any other by its name. */
 export function conversationName(conversation: Extract<ArtifactHome, { kind: "conversation" }>["conversation"]): string {
   return conversation.peerDisplayName || conversation.name;
@@ -29,5 +39,5 @@ export function artifactHomeWords(formatMessage: IntlShape["formatMessage"], hom
   if (home.kind === "public" && fromAnotherServer) return formatMessage({ id: "artifacts.scope.publicFromAnotherServer" });
   if (home.kind !== "conversation") return formatMessage({ id: home.kind === "server" ? "artifacts.scope.server" : "artifacts.scope.public" }, server);
   if (home.conversation.type === "dm") return formatMessage({ id: "artifacts.dashboard.inDm" }, { name: conversationName(home.conversation) });
-  return conversationLabel(home.conversation);
+  return homeConversationLabel(formatMessage, home.conversation);
 }

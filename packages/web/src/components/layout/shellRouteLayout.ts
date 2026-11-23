@@ -31,7 +31,9 @@ export function shellRouteLayout(path: string, pathBase: string, { isDesktop, se
    * The viewer is a Guest of this server: bound to one channel, they get no
    * navigation sidebar (no Saved, Drafts, channel sections or DMs) and land
    * in that channel (DefaultRoute), which on a phone is the Home tab's
-   * top-level page (isGuestHomePath). Only the Settings list stays.
+   * top-level page (isGuestHomePath). Only the Settings list stays. Their
+   * Saved list is a page of its own (/saved, no sidebar beside it), opened
+   * from the rail on desktop and the server tab on a phone (#triage:#551).
    */
   guest?: boolean;
 }) {

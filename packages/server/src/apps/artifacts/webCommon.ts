@@ -7,6 +7,7 @@
 import { eq } from "drizzle-orm";
 import { z } from "zod";
 import {
+  artifactAnchorContextSchema,
   ARTIFACT_PAGE_ANCHOR_MAX_LABEL,
   ARTIFACT_PAGE_ANCHOR_MAX_QUOTE,
   ARTIFACT_PAGE_ANCHOR_NAME,
@@ -15,6 +16,8 @@ import {
   asArtifactReviewId,
   structuredRaftMentionRanges,
   type ArtifactActor,
+  type ArtifactAnnotationAnchor,
+  type ArtifactAnnotationAnchorContext,
   type ArtifactComment,
   type ArtifactCommentAnchor,
   type ArtifactCommentPart,
@@ -36,7 +39,9 @@ import {
   fileNotFoundError,
   INVALID_PATH_ERROR,
   isArtifactSystemActor,
-  itemServerEnabled,
+  CLOSED_SERVER_READ_ONLY,
+  itemReadable,
+  itemWritable,
   NOT_VISIBLE_ERROR,
   readsAsOutsider,
   STORAGE_UNAVAILABLE_ERROR,
@@ -257,12 +262,14 @@ const refuseNotEnabled = (): never => refuse(403, { code: "ARTIFACTS_NOT_ENABLED
 
 /**
  * Artifacts on for this deployment (403 ARTIFACTS_NOT_ENABLED), then the
- * Artifact if the reader can see it and its own server still exists
- * (apiCommon itemServerEnabled), else one 404 NOT_VISIBLE for every
- * reason. Every write route and the write-side reads (`@` candidates, who a
- * comment would notify, review drafts, the share audience, the narrowing
- * preview) resolve with this; the read routes the viewer uses with
- * readableItemFor, which answers the same. Writes need the reader to take
+ * Artifact if the reader can see it and it is read at all (apiCommon
+ * itemReadable), else one 404 NOT_VISIBLE for every reason; then, one of a
+ * closed server (kept in a joint, read-only) is 403 FORBIDDEN (apiCommon
+ * CLOSED_SERVER_READ_ONLY, as requireWritable). Every write route and the write-side reads (`@`
+ * candidates, who a comment would notify, review drafts, the share
+ * audience, the narrowing preview) resolve with this; the read routes the
+ * viewer uses with readableItemFor, which answers the same short of the
+ * read-only refusal. Writes need the reader to take
  * part in the item (apiCommon takesPartIn: its own server's, or a joint's).
  * The reader stands in `reader.serverId`: core's requireServer checks the
  * membership on every request.
@@ -271,13 +278,14 @@ export async function visibleItemFor(reader: ArtifactWebReader, id: string): Pro
   await requireWebEnabled(reader);
   const item = await itemSeenBy(reader, id);
   if (!item) throw new ArtifactWebFailure(webNotVisible());
+  if (!(await itemWritable(item))) throw new ArtifactWebFailure(webFail(403, CLOSED_SERVER_READ_ONLY));
   return item;
 }
 
-/** The item `id` if the reader can see it (canViewArtifacts) and its own server still exists (itemServerEnabled), else null. */
+/** The item `id` if the reader can see it (canViewArtifacts) and it is read at all (itemReadable), else null. */
 async function itemSeenBy(reader: ArtifactWebReader, id: string): Promise<ArtifactItemRow | null> {
   const [item] = await getDb().select().from(artifactItems).where(eq(artifactItems.id, id)).limit(1);
-  const visible = item !== undefined && (await canViewArtifacts(readerViewActor(reader), [item]))[0]! && await itemServerEnabled(item);
+  const visible = item !== undefined && (await canViewArtifacts(readerViewActor(reader), [item]))[0]! && await itemReadable(item);
   return visible ? item : null;
 }
 
@@ -289,7 +297,8 @@ async function itemSeenBy(reader: ArtifactWebReader, id: string): Promise<Artifa
  * this): Artifacts off on this deployment is 403 ARTIFACTS_NOT_ENABLED for
  * every id (unknown, deleted, not theirs, public), so nothing tells an
  * Artifact from no Artifact; on, the item if the reader sees it
- * (canViewArtifacts) and its own server still exists (itemServerEnabled),
+ * (canViewArtifacts) and it is read at all (itemReadable: its server live,
+ * or closed and the Artifact kept in a joint it is still in, read-only),
  * else the one 404 NOT_VISIBLE. A public Artifact of another server is seen
  * by sight alone: the reader reads it as an outsider (the current version, no
  * comments, no presence, and `capabilities` offer no write).
@@ -301,8 +310,8 @@ export async function readableItemFor(reader: ArtifactWebReader, id: string): Pr
   ]);
   if (!enabled) refuseNotEnabled();
   if (!item) throw new ArtifactWebFailure(webNotVisible());
-  const [[visible], itemServerOn] = await Promise.all([canViewArtifacts(readerViewActor(reader), [item]), itemServerEnabled(item)]);
-  if (!visible || !itemServerOn) throw new ArtifactWebFailure(webNotVisible());
+  const [[visible], readable] = await Promise.all([canViewArtifacts(readerViewActor(reader), [item]), itemReadable(item)]);
+  if (!visible || !readable) throw new ArtifactWebFailure(webNotVisible());
   return item;
 }
 
@@ -354,20 +363,25 @@ const plainText = (max: number) => z.string().max(max).refine((text) => isArtifa
 
 const lineRange = z.object({ start: z.number().int().nonnegative(), end: z.number().int().nonnegative(), quote: z.string().optional() })
   .refine((range) => range.end >= range.start);
-/** ArtifactCommentAnchor, as the web sends and reads it. */
-export const webCommentAnchorSchema: z.ZodType<ArtifactCommentAnchor> = z.discriminatedUnion("type", [
-  z.object({
-    type: z.literal("annotation"),
-    data: z.object({
-      kind: z.enum(["element", "text"]),
-      selectors: z.array(z.union([
-        z.object({ type: z.literal("CssSelector"), value: z.string() }),
-        z.object({ type: z.literal("TextQuoteSelector"), exact: z.string(), prefix: z.string().optional(), suffix: z.string().optional() }),
-        z.object({ type: z.literal("TextPositionSelector"), start: z.number().int().nonnegative(), end: z.number().int().nonnegative() }),
-      ])),
-      label: z.string(),
-    }),
-  }),
+/**
+ * An annotation anchor's data. Its `context` (Porthole P152: the headings down
+ * to its section, the named region around it) within Porthole's limits
+ * (shared artifactAnchorContextSchema: 6 headings, 80 characters each and for
+ * the region), each text cleaned and trimmed; one with nothing left is none.
+ */
+const annotationData = (context: z.ZodType<ArtifactAnnotationAnchorContext | undefined>) => z.object({
+  kind: z.enum(["element", "text"]),
+  selectors: z.array(z.union([
+    z.object({ type: z.literal("CssSelector"), value: z.string() }),
+    z.object({ type: z.literal("TextQuoteSelector"), exact: z.string(), prefix: z.string().optional(), suffix: z.string().optional() }),
+    z.object({ type: z.literal("TextPositionSelector"), start: z.number().int().nonnegative(), end: z.number().int().nonnegative() }),
+  ])),
+  label: z.string(),
+  context: context.optional(),
+}).transform(({ context: shown, ...rest }): ArtifactAnnotationAnchor => (shown === undefined ? rest : { ...rest, context: shown }));
+
+const anchorSchemaOf = (context: z.ZodType<ArtifactAnnotationAnchorContext | undefined>): z.ZodType<ArtifactCommentAnchor> => z.discriminatedUnion("type", [
+  z.object({ type: z.literal("annotation"), data: annotationData(context) }),
   z.object({
     type: z.literal("page"),
     // The page's word (P108): an identifier and plain text, each bounded; blank text is no text.
@@ -380,6 +394,14 @@ export const webCommentAnchorSchema: z.ZodType<ArtifactCommentAnchor> = z.discri
   z.object({ type: z.literal("lines"), data: lineRange }),
   z.object({ type: z.literal("csv-rows"), data: lineRange }),
 ]);
+
+/**
+ * ArtifactCommentAnchor as the web sends it (a comment, a draft) and reads it back. A context that isn't what
+ * Porthole keeps (malformed, past its limits; or an agent's stored before contexts were checked) is left out and the
+ * place kept: a section is only shown beside the place, so it never stops a comment from being sent (Tenny on
+ * #15709), as on the agent API (keepArtifactAnchorContext).
+ */
+export const webCommentAnchorSchema = anchorSchemaOf(artifactAnchorContextSchema.catch(undefined));
 
 /**
  * A stored comment's text as parts: each `@handle` of an actor the comment

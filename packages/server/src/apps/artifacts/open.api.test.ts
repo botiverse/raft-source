@@ -175,8 +175,9 @@ const readPositionOf = async (itemId: string, userId: string) => (await getDb().
 )))[0]?.position ?? null;
 
 /** The answer without its frame (each answer signs a new ticket). */
-const withoutFrame = (body: Record<string, unknown>) => {
-  const { frame: _frame, ...rest } = body;
+/** An answer without what differs from one open to the next: the frame's ticket, and what was new before it. */
+const withoutOpening = (body: Record<string, unknown>) => {
+  const { frame: _frame, unseenAtOpen: _unseen, ...rest } = body;
   return rest;
 };
 
@@ -209,9 +210,10 @@ test("a member who reads it in its server: that server, and the viewer's own ans
   assert.deepEqual([claims.artifact, claims.version, claims.viewer, claims.subject], [page.id, world.versions.pageV2.id, `user:${world.reader.id}`, claims.subject]);
   // The ticket names the reader's sign-in (every access token has a family now).
   assert.match(claims.subject, new RegExp(`^v1:${world.server.id}:${world.reader.id}:[0-9a-f-]{36}$`));
-  // Exactly what the viewer route answers in that server (but for the frame's new ticket).
+  // Exactly what the viewer route answers in that server (but for the frame's new ticket, and what is new: this open read it all).
   const viewed = await viewer(app.baseUrl, { userId: world.reader.id, serverId: world.server.id, artifact: page.id });
-  assert.deepEqual(withoutFrame(res.body.viewer), withoutFrame(viewed.body));
+  assert.deepEqual(withoutOpening(res.body.viewer), withoutOpening(viewed.body));
+  assert.deepEqual(viewed.body.unseenAtOpen, { newerVersion: false, newComments: 0, firstNewComment: null });
 
   // ?version=: as the viewer: an older version for a member, its frame that version's; an unknown one the viewer's refusal.
   const older = await open(app.baseUrl, { userId: world.reader.id, artifact: page.id, version: 1 });

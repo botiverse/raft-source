@@ -6,11 +6,14 @@
  * account). Web only (conditional
  * mediation); native apps have no passkeys in v1.
  *
- *   POST /api/auth/passkey/options (startPasskeySignIn): assertion options
+ *   POST /api/auth/passkey/options { rp? } (startPasskeySignIn): assertion options
  *     `{ options, expiresAt }` with an empty allowCredentials (the browser offers whatever passkey it
  *     holds for the RP ID), user verification required, and a new
  *     `auth_challenges` row (kind `webauthn_assertion`, flow `passkey_login`,
- *     no user, 5 minutes).
+ *     no user, 5 minutes). Under WEBAUTHN_RP_ID, or with `rp: "legacy"`
+ *     under WEBAUTHN_LEGACY_RP_ID (the challenge records which, payload
+ *     `rpId`; the body then also carries `rp`, present only while a legacy
+ *     RP ID is set). `rp: "legacy"` without one: 404 `passkey_rp_unavailable`.
  *   POST /api/auth/passkey/verify { challenge (options.challenge), response }
  *     (verifyPasskeySignIn), answered exactly like POST /api/auth/login:
  *     1. the challenge's only answer is claimed and committed
@@ -18,7 +21,8 @@
  *     2. the passkey is found by its credential id (never by user handle),
  *        not removed; its person must be one passkey sign-in is open to;
  *     3. the assertion is verified (origin, RP ID, user verification,
- *        signature) against that passkey;
+ *        signature) against that passkey, with the passkey's own RP ID,
+ *        which must be the one the challenge was issued under;
  *     4. ONE transaction: the challenge consumed, the gate's proof
  *        (proofForPasskeyLogin, under the person's row lock), the passkey's
  *        use recorded (counter and last used, design §5: a counter that does
@@ -40,18 +44,27 @@ import { currentDate } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../../db/index";
 import { isPasskeySignInOpen, PASSKEY_LOGIN_FLOW, proofForPasskeyLogin, type SessionIssueProof } from "../sessionIssueGate";
 import { claimOnlyAuthChallengeAnswer, consumeAuthChallenge, createAuthChallenge, type AuthChallengeToken } from "./authChallenges";
-import { findActivePasskeyByCredentialId, PASSKEY_CEREMONY_TTL_MS, recordPasskeyUse, sendPasskeyCounterWarning } from "./passkeys";
+import {
+  challengeRpId,
+  challengeRpPayload,
+  findActivePasskeyByCredentialId,
+  PASSKEY_CEREMONY_TTL_MS,
+  recordPasskeyUse,
+  sendPasskeyCounterWarning,
+  verifyStoredPasskey,
+} from "./passkeys";
 import { afterRecoveryAutoCancel, autoCancelRecoveryInTransaction, type RecoveryAutoCancelled } from "./recovery";
 import {
   assertionCredentialId,
   passkeyAssertionOptions,
-  verifyPasskeyAssertion,
+  rpIdOfGroup,
   webauthnRelyingParty,
   type PasskeyAssertionResponse,
+  type PasskeyRpGroup,
   type RelyingParty,
 } from "./webauthn";
 
-export type PasskeySignInErrorCode = "passkeys_unavailable" | "challenge_expired" | "passkey_not_recognized";
+export type PasskeySignInErrorCode = "passkeys_unavailable" | "passkey_rp_unavailable" | "challenge_expired" | "passkey_not_recognized";
 
 const STATUS_OF: Record<PasskeySignInErrorCode, number> = {
   // 404, not 503: the login page asks for options on every load (browser
@@ -59,6 +72,8 @@ const STATUS_OF: Record<PasskeySignInErrorCode, number> = {
   // Web pages already out read only `code` and hide the passkey entry.
   // The signed-in management routes keep 503 (a deliberate action).
   passkeys_unavailable: 404,
+  // `rp: "legacy"` asked of a server without a legacy RP ID.
+  passkey_rp_unavailable: 404,
   challenge_expired: 410,
   passkey_not_recognized: 401,
 };
@@ -83,18 +98,23 @@ function relyingParty(): RelyingParty {
 }
 
 /** POST /api/auth/passkey/options: discoverable assertion options and their challenge. */
-export async function startPasskeySignIn(now: Date = currentDate()) {
+export async function startPasskeySignIn(now: Date = currentDate(), group: PasskeyRpGroup = "current") {
   const rp = relyingParty();
+  const rpID = rpIdOfGroup(rp, group);
+  if (!rpID) throw new PasskeySignInError("passkey_rp_unavailable", "There are no earlier passkeys to sign in with.");
+  const payload = challengeRpPayload(rp, rpID);
   const created = await createAuthChallenge({
     kind: "webauthn_assertion",
     userId: null,
     flow: PASSKEY_LOGIN_FLOW,
+    payload: Object.keys(payload).length > 0 ? payload : null,
     ttlMs: PASSKEY_CEREMONY_TTL_MS,
     now,
   });
   return {
-    options: await passkeyAssertionOptions(rp, { challenge: created.challenge, allow: [] }),
+    options: await passkeyAssertionOptions(rp, { challenge: created.challenge, allow: [], rpID }),
     expiresAt: created.expiresAt.toISOString(),
+    ...(rp.legacyRpID === undefined ? {} : { rp: group }),
   };
 }
 
@@ -116,9 +136,8 @@ export async function verifyPasskeySignIn<T>(
 
   const passkey = await findActivePasskeyByCredentialId(getDb(), assertionCredentialId(input.response));
   if (!passkey || !(await isPasskeySignInOpen(passkey.userId))) throw notRecognized();
-  const verified = await verifyPasskeyAssertion(rp, input.response, input.challenge, passkey);
-  if (!verified) throw notRecognized();
-  const checked = { passkeyId: passkey.id, storedCounter: passkey.signCount, counter: verified.counter, backupState: verified.backupState };
+  const checked = await verifyStoredPasskey(rp, { response: input.response, challenge: input.challenge, challengeRpId: challengeRpId(rp, claimed), passkey });
+  if (!checked) throw notRecognized();
 
   let counterRegressed = false;
   let recoveryCancelled: RecoveryAutoCancelled = null;

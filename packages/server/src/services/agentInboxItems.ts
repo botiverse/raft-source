@@ -16,7 +16,7 @@ import {
   AGENT_INBOX_MAX_REMINDER_ROWS,
   AGENT_INBOX_OBJECT_REF_MAX_CHARS,
   AGENT_INBOX_OBJECT_REF_PATTERN,
-  AGENT_INBOX_PREVIEW_MAX_CHARS,
+  agentInboxPreview,
   AGENT_INBOX_READ_MAX_CHARS,
   AGENT_INBOX_READ_REMAINING_CAP,
   AGENT_INBOX_REMINDER_TARGET_PREFIX,
@@ -27,13 +27,16 @@ import {
   type AgentApiInboxItemRow,
   type AgentApiInboxLatestSender,
   type AgentMessage,
+  type ServerId,
 } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import { agents, channels, messages, oauthClients, tasks, thirdPartyAgentEvents, users } from "../db/schema";
 import { resolveAgentTaskRefConversation, taskRefOfMessageTarget } from "../routes/agentWritableTarget";
+import { isThreadTarget, resolveOrCreateThreadTarget } from "./agentThreadTarget";
 import * as channelService from "./channelService";
 import { THIRD_PARTY_EVENT_APP_COLUMNS, buildThirdPartyAgentMessage } from "./oauthService";
 import { filterReadableSystemAppEvents } from "./systemAppDeliveryGuards";
+import { localConversationIds } from "./visibilityService";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import { NOT_ITEM_SYSTEM_APPS, appEventInboxItemTarget, type InboxItemsLaunch } from "./inboxItemsLaunch";
 
@@ -111,8 +114,19 @@ export function isItemAppKey(appKey: string): boolean {
  * id when the agent can open it, else null (no such conversation, or not
  * the agent's: the app is told the same either way). Task refs and threads
  * resolve as `message read` resolves them.
+ *
+ * `createThread` (an app's notice): a thread target naming a message no one
+ * has replied to yet resolves to that message's thread, created as
+ * `message send --target` creates it (agentThreadTarget: the root must be in
+ * the named channel or DM, and the agent able to post there). Without it (an
+ * inbox dismiss) a thread that doesn't exist is not found.
  */
-export async function resolveRelatedConversationForAgent(serverId: string, agentId: string, target: string): Promise<string | null> {
+export async function resolveRelatedConversationForAgent(
+  serverId: string,
+  agentId: string,
+  target: string,
+  opts: { createThread?: boolean } = {},
+): Promise<string | null> {
   try {
     const taskRef = taskRefOfMessageTarget(target);
     let channelId: string | null = null;
@@ -121,6 +135,10 @@ export async function resolveRelatedConversationForAgent(serverId: string, agent
       channelId = found && typeof found === "object" && found.kind === "conversation" ? found.channelId : null;
     } else {
       channelId = (await channelService.resolveChannelByName(serverId, agentId, target))?.channelId ?? null;
+      if (!channelId && opts.createThread && isThreadTarget(target)) {
+        const thread = await resolveOrCreateThreadTarget(serverId, agentId, target);
+        channelId = thread === "forbidden" ? null : thread;
+      }
     }
     if (!channelId) return null;
     return await channelService.canAgentAccessChannel(channelId, agentId) ? channelId : null;
@@ -140,53 +158,54 @@ export async function renderRelatedTargets(serverId: string, agentId: string, ch
   const out = new Map<string, string>();
   const ids = [...new Set(channelIds.filter(Boolean))];
   if (ids.length === 0) return out;
-  const rows = await getDb().select({
+  const select = (wanted: readonly string[]) => getDb().select({
     id: channels.id,
+    serverId: channels.serverId,
     type: channels.type,
     parentChannelId: channels.parentChannelId,
     parentMessageId: channels.parentMessageId,
     taskNumber: tasks.taskNumber,
   }).from(channels)
     .leftJoin(tasks, eq(tasks.id, channels.taskId))
-    .where(inArray(channels.id, ids));
+    .where(inArray(channels.id, wanted));
+  // An object homed in a joint names the joint's canonical channel (or
+  // another server's projection): rendered as the agent's server's
+  // projection of it, the conversation the agent opens, and only when the
+  // agent can open that one (localConversationIds; nothing else maps).
+  const stored = await select(ids);
+  const notLocal = stored.filter((row) => row.serverId !== serverId).map((row) => row.id);
+  const localOf = notLocal.length === 0 ? new Map<string, string>() : await localConversationIds(serverId as ServerId, notLocal);
+  const projected = localOf.size === 0 ? [] : await select([...new Set(localOf.values())]);
+  const rows = [...stored.filter((row) => !localOf.has(row.id)), ...projected];
+  const refs = new Map<string, string>();
   for (const row of rows) {
     try {
       if (!await channelService.canAgentAccessChannel(row.id, agentId)) continue;
       if (row.type === "thread" && row.parentChannelId && row.parentMessageId) {
         const parent = await channelService.resolveAgentFacingChannelRef(serverId, agentId, row.parentChannelId);
-        if (parent) out.set(row.id, `${parent}:${row.parentMessageId.slice(0, 8)}`);
+        if (parent) refs.set(row.id, `${parent}:${row.parentMessageId.slice(0, 8)}`);
         continue;
       }
       if (row.type === "task" && row.parentChannelId && row.taskNumber != null) {
         const board = await channelService.resolveAgentFacingChannelRef(serverId, agentId, row.parentChannelId);
-        if (board) out.set(row.id, `${board}${RAFT_TASK_REF_SEPARATOR}${row.taskNumber}`);
+        if (board) refs.set(row.id, `${board}${RAFT_TASK_REF_SEPARATOR}${row.taskNumber}`);
         continue;
       }
       const ref = await channelService.resolveAgentFacingChannelRef(serverId, agentId, row.id);
-      if (ref) out.set(row.id, ref);
+      if (ref) refs.set(row.id, ref);
     } catch (err) {
       console.warn("[AgentInboxItems] related conversation not rendered", serializeErrorForLog(err));
     }
+  }
+  for (const id of ids) {
+    const ref = refs.get(localOf.get(id) ?? id);
+    if (ref) out.set(id, ref);
   }
   return out;
 }
 
 // ---------------------------------------------------------------------------
 // Previews
-
-/** One folded, inert line of at most AGENT_INBOX_PREVIEW_MAX_CHARS, and whether it was cut. */
-export function inboxPreview(text: string | null | undefined, inert: boolean): { preview: string | null; previewTruncated: boolean } {
-  if (!text) return { preview: null, previewTruncated: false };
-  const firstLine = text.split(/\r\n|[\r\n\u0085\u2028\u2029]/).find((line) => line.trim()) ?? "";
-  const folded = foldAgentOneLineText(inert ? renderThirdPartyInertText({ field: "tool_result", value: firstLine }) : firstLine);
-  if (!folded) return { preview: null, previewTruncated: false };
-  const cutForLines = firstLine.length < text.trim().length;
-  if (folded.length <= AGENT_INBOX_PREVIEW_MAX_CHARS) return { preview: folded, previewTruncated: cutForLines };
-  let cut = AGENT_INBOX_PREVIEW_MAX_CHARS;
-  const last = folded.charCodeAt(cut - 1);
-  if (last >= 0xd800 && last <= 0xdbff) cut -= 1; // never split a surrogate pair
-  return { preview: folded.slice(0, cut), previewTruncated: true };
-}
 
 type MessageFacts = { seq: number; createdAt: string; content: string; senderName: string | null; senderType: AgentApiInboxLatestSender["type"]; inert: boolean };
 
@@ -250,7 +269,7 @@ export async function conversationItemRows(input: {
       activitySeq: item.activitySeq,
       unread: item.unread,
       latestSender: latest?.senderName ? { name: latest.senderName, type: latest.senderType } : null,
-      ...inboxPreview(latest?.content, latest?.inert ?? false),
+      ...agentInboxPreview(latest?.content, latest?.inert ?? false),
       firstUnreadAt: firstUnread?.createdAt ?? null,
       latestAt: item.latestAt,
       preLaunch: input.preLaunchBefore !== null && item.latestAt !== null && Date.parse(item.latestAt) < input.preLaunchBefore.getTime(),
@@ -344,7 +363,7 @@ export async function listAgentAppItems(input: { serverId: string; agentId: stri
       related: relatedChannelId ? { target: related.get(relatedChannelId)! } : null,
       unread: group.length,
       latestSender: { name, type: latest.event.clientId === null ? "system" : "app" },
-      ...inboxPreview(latest.event.summary, latest.event.clientId !== null),
+      ...agentInboxPreview(latest.event.summary, latest.event.clientId !== null),
       firstUnreadAt: oldest.event.createdAt.toISOString(),
       latestAt: latest.event.createdAt.toISOString(),
       preLaunch: false,
@@ -555,8 +574,7 @@ export type ReminderFire = { reminderId: string; title: string; revision: number
  */
 export async function unackedReminderFires(input: { serverId: string; agentId: string; since: Date; reminderId?: string }): Promise<ReminderFire[]> {
   const rows = await getDb().execute<{ reminder_id: string; title: string; revision: number; event_id: string; fired_at: Date | string }>(sql`
-    select distinct on (e.reminder_id, e.revision) e.reminder_id, r.title, e.revision, e.id as event_id, e.occurred_at as fired_at
-    from (
+    with e as (
       select ev.id, ev.reminder_id, ev.server_id, ev.owner_agent_id, ev.occurred_at,
         case when (ev.metadata->>'sourceVersion') ~ '^[1-9][0-9]{0,8}$' then (ev.metadata->>'sourceVersion')::int end as revision
       from reminder_events ev
@@ -566,19 +584,30 @@ export async function unackedReminderFires(input: { serverId: string; agentId: s
         and ev.metadata->>'fired' = 'true'
         and ev.occurred_at >= ${input.since}
         ${input.reminderId ? sql`and ev.reminder_id = ${input.reminderId}` : sql``}
-    ) e
+    ),
+    -- Each listed reminder's latest fired revision, once per reminder (one
+    -- pass over its fires on idx_reminder_events_reminder). The earlier
+    -- per-row "no newer fire" subquery rescanned every fire for every fire:
+    -- quadratic, so a recurring reminder that fires often timed the read out
+    -- (#triage:#388).
+    latest_fire as (
+      select latest.reminder_id,
+        max(case when (latest.metadata->>'sourceVersion') ~ '^[1-9][0-9]{0,8}$' then (latest.metadata->>'sourceVersion')::int end) as revision
+      from reminder_events latest
+      where latest.reminder_id in (select distinct reminder_id from e)
+        and latest.event_type = 'fired'
+        and latest.metadata->>'fired' = 'true'
+      group by latest.reminder_id
+    )
+    select distinct on (e.reminder_id, e.revision) e.reminder_id, r.title, e.revision, e.id as event_id, e.occurred_at as fired_at
+    from e
     join reminders r on r.id = e.reminder_id
     join agents owner on owner.id = e.owner_agent_id
+    left join latest_fire on latest_fire.reminder_id = e.reminder_id
     where e.revision is not null
       and r.status <> 'canceled'
       and owner.deleted_at is null
-      and (r.recurrence is null or not exists (
-        select 1 from reminder_events newer
-        where newer.reminder_id = e.reminder_id
-          and newer.event_type = 'fired'
-          and newer.metadata->>'fired' = 'true'
-          and case when (newer.metadata->>'sourceVersion') ~ '^[1-9][0-9]{0,8}$' then (newer.metadata->>'sourceVersion')::int end > e.revision
-      ))
+      and (r.recurrence is null or latest_fire.revision is null or e.revision >= latest_fire.revision)
       and not exists (
         select 1 from reminder_source_acknowledgements a
         where a.server_id = e.server_id and a.owner_agent_id = e.owner_agent_id
@@ -643,7 +672,7 @@ export async function listAgentReminderItems(input: { serverId: string; agentId:
         ack: group.map(reminderAckRef),
         unread: group.length,
         latestSender: { name: REMINDER_APP.name, type: "system" },
-        ...inboxPreview(latest.title, false),
+        ...agentInboxPreview(latest.title, false),
         firstUnreadAt: group[0]!.firedAt.toISOString(),
         latestAt: latest.firedAt.toISOString(),
         preLaunch: false,

@@ -1,11 +1,21 @@
 /**
- * The emailed code that confirms an account deletion request for a person
- * with neither a password nor two-step verification (design §4, decided by
- * Tenny): POST /api/me/account/deletion/email-code sends it, POST
- * /api/me/account/deletion takes it back as `{ emailCode }`.
+ * The emailed code that confirms a sensitive request for a person with
+ * neither a password nor two-step verification (design §4, decided by
+ * Tenny). One flow per request it confirms, each with its own
+ * `auth_challenges` kind, flow and digest key, so a code sent for one never
+ * confirms the other:
+ *   - account deletion: POST /api/me/account/deletion/email-code sends it,
+ *     POST /api/me/account/deletion takes it back as `{ emailCode }`;
+ *   - data export (services/sensitiveReauth.ts): POST
+ *     /api/me/data-exports/email-code sends it, creating an export takes it
+ *     back as `{ emailCode }`.
  *
- * Stored as an `auth_challenges` row (kind `account_deletion_email_code`,
- * flow `account_deletion`), so it shares that table's single use and expiry:
+ * Stored as an `auth_challenges` row (the flow's kind and flow), so it shares
+ * that table's single use and expiry. A code is bound to the person and the
+ * sign-in that asked, not to what it confirms within its flow: a data export
+ * code sent from the personal page also confirms a server export of the same
+ * person on the same sign-in (both are "export my data from Raft"; each still
+ * runs that request's own permission checks).
  *   - bound to the person and to the sign-in (session family) that asked;
  *     another sign-in of the same person cannot use it;
  *   - six digits, valid 10 minutes, used at most once (consumed by
@@ -25,30 +35,50 @@ import { createHash, createHmac, randomInt, randomUUID, timingSafeEqual, randomB
 import { and, desc, eq, gt, isNull, lt, sql } from "drizzle-orm";
 
 import { getDb, type DatabaseExecutor } from "../../db/index";
-import { authChallenges, users } from "../../db/schema";
-import { sendAccountDeletionEmail } from "../emailService";
+import { authChallenges, users, type AuthChallengeKind } from "../../db/schema";
+import { sendAccountDeletionEmail, sendDataExportEmail } from "../emailService";
 import { AUTH_CHALLENGE_MAX_ATTEMPTS } from "../secondFactor/authChallenges";
 import { claimSecondFactorAttempt, releaseSecondFactorAttempt } from "../secondFactor/attemptWindow";
 
 export const ACCOUNT_DELETION_EMAIL_CODE_TTL_MS = 10 * 60_000;
 /** The shortest time between two codes for one person. */
 export const ACCOUNT_DELETION_EMAIL_CODE_RESEND_MS = 60_000;
-const KIND = "account_deletion_email_code" as const;
-const FLOW = "account_deletion";
 const CODE_RE = /^[0-9]{6}$/;
 
-function digestKey(): Buffer {
-  const secret = process.env.JWT_SECRET;
-  if (!secret) throw new Error("JWT_SECRET environment variable is required");
-  return createHash("sha256").update(`raft:account-deletion-email-code:v1:${secret}`).digest();
+/** What a code confirms: its row's kind and flow, its digest key, and its email. */
+export interface EmailCodeFlow {
+  kind: AuthChallengeKind;
+  flow: string;
+  digestLabel: string;
+  send(to: string, name: string, input: { code: string; expiresInMinutes: number }): Promise<void>;
 }
 
-function codeDigest(challengeId: string, code: string): string {
-  return createHmac("sha256", digestKey()).update(`${challengeId}:${code}`).digest("hex");
+export const ACCOUNT_DELETION_EMAIL_CODE_FLOW: EmailCodeFlow = {
+  kind: "account_deletion_email_code",
+  flow: "account_deletion",
+  digestLabel: "raft:account-deletion-email-code:v1",
+  send: (to, name, input) => sendAccountDeletionEmail(to, name, { kind: "email_code", ...input }),
+};
+
+export const DATA_EXPORT_EMAIL_CODE_FLOW: EmailCodeFlow = {
+  kind: "data_export_email_code",
+  flow: "data_export",
+  digestLabel: "raft:data-export-email-code:v1",
+  send: (to, name, input) => sendDataExportEmail(to, name, { kind: "email_code", ...input }),
+};
+
+function digestKey(flow: EmailCodeFlow): Buffer {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) throw new Error("JWT_SECRET environment variable is required");
+  return createHash("sha256").update(`${flow.digestLabel}:${secret}`).digest();
+}
+
+function codeDigest(flow: EmailCodeFlow, challengeId: string, code: string): string {
+  return createHmac("sha256", digestKey(flow)).update(`${challengeId}:${code}`).digest("hex");
 }
 
 /** An answer as typed: six digits, spaces and dashes ignored; null when it cannot be a code. */
-export function parseAccountDeletionEmailCode(raw: unknown): string | null {
+export function parseEmailCode(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const code = raw.replace(/[\s-]/g, "");
   return CODE_RE.test(code) ? code : null;
@@ -62,29 +92,30 @@ export type SendEmailCodeResult =
  * Create a code for this sign-in and email it. Ends the person's earlier live
  * code; refused (with how long to wait) within a minute of the last one.
  */
-export async function sendAccountDeletionEmailCode(input: { userId: string; familyId: string; now: Date }): Promise<SendEmailCodeResult> {
+export async function sendEmailCode(flow: EmailCodeFlow, input: { userId: string; familyId: string; now: Date }): Promise<SendEmailCodeResult> {
   const { userId, familyId, now } = input;
+  const { kind, flow: flowName } = flow;
   const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
   const id = randomUUID();
   const expiresAt = new Date(now.getTime() + ACCOUNT_DELETION_EMAIL_CODE_TTL_MS);
   const created = await getDb().transaction(async (tx) => {
     const [user] = await tx.select({ email: users.email, displayName: users.displayName, name: users.name, retiredAt: users.retiredAt })
       .from(users).where(eq(users.id, userId)).for("update");
-    if (!user || user.retiredAt) throw new Error("sendAccountDeletionEmailCode: the account is not active");
+    if (!user || user.retiredAt) throw new Error("sendEmailCode: the account is not active");
     const [last] = await tx.select({ createdAt: authChallenges.createdAt }).from(authChallenges)
-      .where(and(eq(authChallenges.userId, userId), eq(authChallenges.kind, KIND)))
+      .where(and(eq(authChallenges.userId, userId), eq(authChallenges.kind, kind)))
       .orderBy(desc(authChallenges.createdAt))
       .limit(1);
     const wait = last ? last.createdAt.getTime() + ACCOUNT_DELETION_EMAIL_CODE_RESEND_MS - now.getTime() : 0;
     if (wait > 0) return { ok: false as const, retryAfterSeconds: Math.ceil(wait / 1000) };
     await tx.update(authChallenges).set({ consumedAt: now })
-      .where(and(eq(authChallenges.userId, userId), eq(authChallenges.kind, KIND), isNull(authChallenges.consumedAt)));
+      .where(and(eq(authChallenges.userId, userId), eq(authChallenges.kind, kind), isNull(authChallenges.consumedAt)));
     await tx.insert(authChallenges).values({
       id,
-      kind: KIND,
+      kind,
       userId,
-      flow: FLOW,
-      payload: { familyId, digest: codeDigest(id, code) },
+      flow: flowName,
+      payload: { familyId, digest: codeDigest(flow, id, code) },
       // Never handed out: the code is the answer, the row is found by person and sign-in.
       challengeHash: createHash("sha256").update(randomBytes(32)).digest("hex"),
       expiresAt,
@@ -93,8 +124,7 @@ export async function sendAccountDeletionEmailCode(input: { userId: string; fami
     return { ok: true as const, email: user.email, name: user.displayName || user.name };
   });
   if (!created.ok) return created;
-  await sendAccountDeletionEmail(created.email, created.name, {
-    kind: "email_code",
+  await flow.send(created.email, created.name, {
     code,
     expiresInMinutes: Math.round(ACCOUNT_DELETION_EMAIL_CODE_TTL_MS / 60_000),
   });
@@ -110,19 +140,20 @@ export type ClaimEmailCodeResult =
  * Check an answer, claim first: the person's attempt, then one of the live
  * code's own (this sign-in's newest unexpired, unconsumed code with attempts
  * left), each committed on its own whatever the answer. A right answer is
- * not used yet: consumeAccountDeletionEmailCode uses it, in the transaction
- * that records the request.
+ * not used yet: consumeEmailCode uses it, in the transaction that records
+ * the request. Only a code of this flow is looked at.
  */
-export async function claimAccountDeletionEmailCode(input: { userId: string; familyId: string; code: string; now: Date }): Promise<ClaimEmailCodeResult> {
+export async function claimEmailCode(flow: EmailCodeFlow, input: { userId: string; familyId: string; code: string; now: Date }): Promise<ClaimEmailCodeResult> {
   const { userId, familyId, code, now } = input;
+  const { kind, flow: flowName } = flow;
   const db = getDb();
   const claim = await claimSecondFactorAttempt(db, userId, now);
   if (!claim.ok) return { ok: false, reason: "locked", lockedUntil: claim.lockedUntil };
   const live = db.select({ id: authChallenges.id }).from(authChallenges)
     .where(and(
       eq(authChallenges.userId, userId),
-      eq(authChallenges.kind, KIND),
-      eq(authChallenges.flow, FLOW),
+      eq(authChallenges.kind, kind),
+      eq(authChallenges.flow, flowName),
       isNull(authChallenges.consumedAt),
       gt(authChallenges.expiresAt, now),
       sql`${authChallenges.payload}->>'familyId' = ${familyId}`,
@@ -135,7 +166,7 @@ export async function claimAccountDeletionEmailCode(input: { userId: string; fam
     .returning({ id: authChallenges.id, payload: authChallenges.payload });
   const stored = typeof row?.payload?.digest === "string" ? row.payload.digest : null;
   if (!row || !stored) return { ok: false, reason: "invalid" };
-  const expected = Buffer.from(codeDigest(row.id, code), "hex");
+  const expected = Buffer.from(codeDigest(flow, row.id, code), "hex");
   const actual = Buffer.from(stored, "hex");
   if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) return { ok: false, reason: "invalid" };
   return { ok: true, challengeId: row.id };
@@ -146,12 +177,12 @@ export async function claimAccountDeletionEmailCode(input: { userId: string; fam
  * still live marks it consumed and gives the person's attempt back. False
  * when it was used or ended in between (refuse; nothing else may commit).
  */
-export async function consumeAccountDeletionEmailCode(tx: DatabaseExecutor, input: { userId: string; challengeId: string; now: Date }): Promise<boolean> {
+export async function consumeEmailCode(flow: EmailCodeFlow, tx: DatabaseExecutor, input: { userId: string; challengeId: string; now: Date }): Promise<boolean> {
   const used = await tx.update(authChallenges).set({ consumedAt: input.now })
     .where(and(
       eq(authChallenges.id, input.challengeId),
       eq(authChallenges.userId, input.userId),
-      eq(authChallenges.kind, KIND),
+      eq(authChallenges.kind, flow.kind),
       isNull(authChallenges.consumedAt),
       gt(authChallenges.expiresAt, input.now),
     ))
@@ -160,3 +191,4 @@ export async function consumeAccountDeletionEmailCode(tx: DatabaseExecutor, inpu
   await releaseSecondFactorAttempt(tx, input.userId, input.now);
   return true;
 }
+

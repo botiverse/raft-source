@@ -19,7 +19,7 @@ import type { NotificationLevelTarget } from "../notifications/NotificationLevel
  * the channel one: a DM has no name/description form, but section and display
  * prefs apply to it unchanged (only a DM with an App bot can be muted, so the
  * mute row only ever appears when the caller passes `activityMute`). Each row is
- * its title and its control; only Mute keeps a line (who isn't notified).
+ * its title and, at its end, its control; only Mute keeps a line (who isn't notified).
  *
  * In the channel details (raft-design channel.md, stdrc 2026-11-10) it is the
  * "Your preferences" group: settings rows in a ListRowGroup under a
@@ -91,24 +91,32 @@ export function ChannelPreferencesSection({
         icon={<UserRound size={16} aria-hidden="true" />}
         label={<span id="channel-settings-preferences-heading">{formatMessage({ id: "channel.details.yourPreferences" })}</span>}
       />
-      {/* Settings rows like the Settings pages' (DS Forms, "A setting's row"): a select of phrases sits under
-          the row's text, a switch ends its row. */}
-      <ListRowGroup>
+      {/* Settings rows like the Settings pages' (DS Forms, "A setting's row"): every control ends its row;
+          a select goes under the row's text only while the group is under 32rem wide (a phone, a narrow
+          details column), as on the Settings pages (cindyz, #triage:bd0eeedc). */}
+      <ListRowGroup className="@container">
         {isPanel && levelTarget && (
-          <ListRow variant="plain" interactive={false} data-testid="channel-settings-notification-level">
+          <ListRow variant="plain" interactive={false} className="@max-lg:flex-wrap" data-testid="channel-settings-notification-level">
             <ListRowBody>
               <ListRowTitle id="channel-settings-notification-level-label">
                 {formatMessage({ id: "notifications.level.menuLabel" })}
               </ListRowTitle>
-              <div className="pt-2">
-                <NotificationLevelSelect
-                  target={levelTarget}
-                  disabled={activityMute?.busy === true}
-                  aria-labelledby="channel-settings-notification-level-label"
-                  testId="channel-settings-notification-level-select"
-                />
-              </div>
+              {/* What Mute means, while it is the choice: in the row's text, not under the select at its end
+                  (DS Forms: what belongs to a setting but isn't its control goes under its text). */}
+              {levelTarget.scope === "channel" && levelTarget.mute?.muted && (
+                <ListRowDescription id="channel-settings-notification-level-note" wrap data-testid="notification-level-notes">
+                  {formatMessage({ id: "notifications.level.muteNote" })}
+                </ListRowDescription>
+              )}
             </ListRowBody>
+            <div className="shrink-0 @max-lg:basis-full">
+              <NotificationLevelSelect
+                target={levelTarget}
+                disabled={activityMute?.busy === true}
+                aria-labelledby="channel-settings-notification-level-label"
+                testId="channel-settings-notification-level-select"
+              />
+            </div>
           </ListRow>
         )}
         {isPanel && activityMute && !levelTarget && (
@@ -132,15 +140,15 @@ export function ChannelPreferencesSection({
           </ListRow>
         )}
         {!isLounge && (
-          <ListRow variant="plain" interactive={false} data-testid="channel-settings-section">
+          <ListRow variant="plain" interactive={false} className="@max-lg:flex-wrap" data-testid="channel-settings-section">
             <ListRowBody>
               <ListRowTitle id="channel-settings-section-label">
                 {formatMessage({ id: "channel.details.sidebarSection" })}
               </ListRowTitle>
-              <div className="pt-2">
-                <ChannelSectionSelect section={sidebarSection} aria-labelledby="channel-settings-section-label" />
-              </div>
             </ListRowBody>
+            <div className="shrink-0 @max-lg:basis-full">
+              <ChannelSectionSelect section={sidebarSection} aria-labelledby="channel-settings-section-label" />
+            </div>
           </ListRow>
         )}
         {collapseLongMessages && (

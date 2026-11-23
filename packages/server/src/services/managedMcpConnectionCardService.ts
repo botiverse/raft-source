@@ -5,7 +5,7 @@
  * Moved out of the former registry service when the official-registry import was removed
  * (#wg-mcp, 2026-10-14). Behaviour is unchanged by the move.
  */
-import { and, desc, eq, gt, gte, lt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, sql } from "drizzle-orm";
 import type { ActionCardAction } from "@botiverse/raft-shared";
 import { ACTION_CARD_EXPIRY_MS, currentDate, type ActionCardMetadata } from "@botiverse/raft-shared";
 import { actionCardPresentationFor, storedActionCardSpecNames } from "./actionCardPresentation";
@@ -19,6 +19,7 @@ import {
   managedMcpAssignments,
   managedMcpCredentials,
   managedMcpOAuthAttempts,
+  managedMcpPersonalGrants,
   managedMcpServers,
   messages,
   users,
@@ -29,8 +30,9 @@ import {
   userCanActOnAgentResource,
 } from "../lib/actorPermissions";
 import { prepareActionCard } from "./actionCardsService";
-import { admittedMcpConnectionId } from "./managedMcpService";
-import { mcpAgentOwnerUserId, mcpConnectionUsableByAgent } from "./managedMcpConnectionOwnership";
+import { agentFindableBy } from "./agentMemberListPolicy";
+import { mcpPersonalAccountsEnabled, personalOwnerRefusal } from "./managedMcpPersonalAccounts";
+import { admittedMcpAccount, admittedMcpConnectionId } from "./managedMcpService";
 
 /**
  * Drizzle wraps driver errors, so the Postgres SQLSTATE lives on the cause chain rather than on the
@@ -74,11 +76,12 @@ export function postgresErrorCode(err: unknown): string | undefined {
  * (@peng): the durable `integration:connect_mcp` row holds App id, Agent id, reason and revision
  * and nothing else, so what a viewer is offered always reflects the App's Connections now.
  *
- * The candidates are the Connections THIS AGENT may use (`mcpConnectionUsableByAgent`: the App's
- * server default, and the ones its owner created), whoever is looking: a server manager still manages
- * every Connection in the App's settings, but may only pin this Agent to one of these. Who may DO
- * something is the viewer role (an observer gets no ids and no counts). It is only a PROJECTION: which
- * Connection an Agent may use is decided by `admitManagedMcpCall` on the call path.
+ * The candidates are the App's shared Connections this VIEWER may give the Agent: the server default
+ * (followed, for anyone who may manage the Agent), and the others only for someone who may pin
+ * (`manageExternalAuth`: pinning to a shared Connection is admin-only, RFC 087 §6). A member's
+ * personal Connection is never a candidate here. Who may DO something is the viewer role (an observer
+ * gets no ids and no counts). It is only a PROJECTION: which Connection an Agent may use is decided by
+ * `admitManagedMcpCall` on the call path.
  */
 export type McpConnectionViewerRole = "server_manager" | "agent_manager" | "observer";
 
@@ -106,8 +109,8 @@ export interface McpConnectionBindingState {
   present: boolean;
   /**
    * That Connection is among this viewer's candidates, i.e. they may see and re-select it. False for a
-   * deleted Connection and for one this Agent may no longer use (someone else's); either way calls are
-   * refused until the binding is changed.
+   * deleted Connection (calls are refused until the binding is changed) and for a pin this viewer may
+   * not make (only the default is theirs to choose).
    */
   visibleToViewer: boolean;
   /** The exact id, ONLY when this viewer may see it. Never populated for an unreachable binding. */
@@ -147,11 +150,65 @@ export interface McpConnectionAuthorizationView {
   /** May make a Connection the server default for every Agent (D1); never for an Agent manager. */
   canSetServerDefault: boolean;
   /**
-   * A Connection this viewer creates now could be pinned to this Agent: the viewer is the Agent's
-   * owner. Otherwise the Agent could use it only once it is the App's server default.
+   * A Connection this viewer creates now could be pinned to this Agent: the viewer may pin
+   * (`manageExternalAuth`). Otherwise the Agent could use it only once it is the App's server default.
    */
   newConnectionPinnable: boolean;
   pendingGrant: McpPendingGrant | null;
+  /**
+   * RFC 087 §7.1 (D6): what this viewer may give the Agent, as choices. Present only while the
+   * Server flag `mcp_personal_accounts` is on (off: the view is exactly the fields above). An empty
+   * `personal` and no `shared` is "nothing to press: ask an admin".
+   */
+  options?: McpConnectionCardOptions;
+  /**
+   * RFC 087 §7.1: the account the Agent's calls use now (admission's own decision, the personal
+   * grant first), for "Uses ops@acme.com"; null when its calls are refused, and for a viewer with
+   * nothing to do here. Present only while the flag is on.
+   */
+  account?: McpConnectionCardAccount | null;
+}
+
+/** One account the viewer may give the Agent from the card. */
+export interface McpConnectionCardAccountOption {
+  connectionId: string;
+  name: string | null;
+  /** The provider's account label (an email, a workspace). */
+  label: string | null;
+  status: McpConnectionCandidate["status"];
+  /** The Agents it is given to (personal grants) or pinned to it (shared), of those the viewer can find. */
+  agentIds: string[];
+}
+
+export interface McpConnectionCardOptions {
+  /**
+   * The viewer's own ready personal Connections of this App (any may be given to the Agent: PUT
+   * /api/mcp/connections/:connectionId/agents/:agentId), listed while the viewer may hold one (a
+   * member, not a guest) and the Agent is one they can find. `canConnectPersonal`: they may also sign
+   * in a new one (`oauth/start` with `kind: "personal"`): the App's members_can_connect is on and it
+   * signs in with OAuth.
+   */
+  personal: { connections: McpConnectionCardAccountOption[]; canConnectPersonal: boolean };
+  /**
+   * Server managers only (`viewerRole: "server_manager"`): every ready shared Connection and the
+   * default (`allAgents`, whatever its status), each with the Agents pinned to it. Choosing one pins
+   * the Agent. `canConnectShared` is `canAuthorizeNew`.
+   */
+  shared?: { connections: Array<McpConnectionCardAccountOption & { allAgents: boolean }>; canConnectShared: boolean };
+}
+
+/**
+ * The account an Agent uses (as the App view's `myAgents`, R15). `name`, `label` only for a server
+ * manager, the Agent's manager or the personal account's owner; `connectionId` only for a server
+ * manager or that owner. A personal account always says whose it is.
+ */
+export interface McpConnectionCardAccount {
+  kind: "personal" | "shared";
+  connectionId?: string;
+  name: string | null;
+  label: string | null;
+  ownerUserId?: string;
+  ownerDisplayName?: string | null;
 }
 
 /**
@@ -195,17 +252,21 @@ export async function projectMcpConnectionAuthorization(opts: {
 
   const viewerRole = await resolveMcpConnectionViewerRole(opts.serverId, opts.viewerUserId, agent ?? null);
   const [appRow] = await db
-    .select({ name: managedMcpServers.name, authMode: managedMcpServers.authMode })
+    .select({ name: managedMcpServers.name, authMode: managedMcpServers.authMode, membersCanConnect: managedMcpServers.membersCanConnect })
     .from(managedMcpServers)
     .where(and(eq(managedMcpServers.id, opts.mcpServerId), eq(managedMcpServers.serverId, opts.serverId)))
     .limit(1);
   const app = appRow ? { name: appRow.name, authKind: appRow.authMode } : null;
 
+  // RFC 087 §7.1 (flag on): the viewer's own accounts and, for a server manager, the shared ones.
+  const accountChoices = (view: McpConnectionAuthorizationView, canAuthorizeNew: boolean) =>
+    withAccountChoices(view, { ...opts, agentFound: Boolean(agent), viewerRole, canAuthorizeNew, app: appRow ?? null });
   // An observer is told an authorization is pending and nothing else -- no Connection ids, no
   // counts, no hint about who could act. Returning early is what keeps that true: there is no
-  // later filter that could be forgotten.
+  // later filter that could be forgotten. (With the flag on, accountChoices adds only what is the
+  // observer's own: their personal accounts, and the Agent's account once they have one to give.)
   if (viewerRole === "observer" || !agent || !app) {
-    return {
+    return accountChoices({
       mcpServerId: opts.mcpServerId,
       agentId: opts.agentId,
       viewerRole: "observer",
@@ -217,7 +278,7 @@ export async function projectMcpConnectionAuthorization(opts: {
       canSetServerDefault: false,
       newConnectionPinnable: false,
       pendingGrant: null,
-    };
+    }, false);
   }
 
   const rows = await db
@@ -228,10 +289,9 @@ export async function projectMcpConnectionAuthorization(opts: {
       eq(managedMcpCredentials.mcpServerId, opts.mcpServerId),
     ));
 
-  // Only the Connections this Agent may use: the server default and its owner's own. Another
-  // person's Connection carries their account; it is never offered, whoever is looking.
-  const agentOwnerUserId = mcpAgentOwnerUserId(agent);
-  const candidates: McpConnectionCandidate[] = rows.filter((row) => mcpConnectionUsableByAgent(row, agentOwnerUserId)).map((row) => ({
+  // Shared Connections only; besides the default (followed), only for a viewer who may pin.
+  const viewerMayPin = await actorHasServerCapabilityInServer(opts.serverId, "user", opts.viewerUserId, "manageExternalAuth");
+  const candidates: McpConnectionCandidate[] = rows.filter((row) => mcpConnectionOffered(row, viewerMayPin)).map((row) => ({
     connectionId: row.id,
     name: row.name,
     isServerDefault: row.isServerDefault,
@@ -253,20 +313,17 @@ export async function projectMcpConnectionAuthorization(opts: {
   // present binding the viewer cannot see, which the UI offers to replace.
   const boundExists = boundId !== null && candidates.some((c) => c.connectionId === boundId);
   const isServerManager = viewerRole === "server_manager";
-  const canAuthorizeNew = isServerManager && app.authKind !== "none" && (
-    app.authKind !== "oauth"
-    || await actorHasServerCapabilityInServer(opts.serverId, "user", opts.viewerUserId, "manageExternalAuth")
-  );
+  const canAuthorizeNew = isServerManager && app.authKind !== "none" && (app.authKind !== "oauth" || viewerMayPin);
 
-  return {
+  return accountChoices({
     mcpServerId: opts.mcpServerId,
     agentId: opts.agentId,
     viewerRole,
     app,
     candidates,
     binding: {
-      // Pinned, including a pin whose Connection was deleted or is no longer usable by this Agent:
-      // the Agent is then refused, and the UI must still offer a way out.
+      // Pinned, including a pin whose Connection was deleted: the Agent is then refused, and the UI
+      // must still offer a way out.
       present: pinned,
       visibleToViewer: boundExists,
       connectionId: boundExists ? boundId : null,
@@ -274,15 +331,149 @@ export async function projectMcpConnectionAuthorization(opts: {
     // Creating a Connection is a decision about the App, so it needs manageIntegrations.
     canAuthorizeNew,
     canSetServerDefault: isServerManager && app.authKind !== "none",
-    newConnectionPinnable: agentOwnerUserId !== null && agentOwnerUserId === opts.viewerUserId,
-    pendingGrant: await findPendingMcpGrant(opts, agentOwnerUserId),
+    newConnectionPinnable: viewerMayPin,
+    pendingGrant: await findPendingMcpGrant(opts, viewerMayPin),
+  }, canAuthorizeNew);
+}
+
+/**
+ * Adds `options` and `account` (RFC 087 §7.1) while `mcp_personal_accounts` is on; otherwise the
+ * view is returned as it is. Who may do what is §6's: a member's own accounts are theirs to give
+ * (to any Agent they can find), shared ones a server manager's. Each choice is re-checked by the
+ * write it leads to; this only lists them.
+ */
+async function withAccountChoices(view: McpConnectionAuthorizationView, ctx: {
+  serverId: string;
+  viewerUserId: string;
+  mcpServerId: string;
+  agentId: string;
+  agentFound: boolean;
+  viewerRole: McpConnectionViewerRole;
+  canAuthorizeNew: boolean;
+  app: { authMode: string; membersCanConnect: boolean } | null;
+}): Promise<McpConnectionAuthorizationView> {
+  const db = getDb();
+  if (!await mcpPersonalAccountsEnabled(ctx.serverId, db)) return view;
+  const nothing: McpConnectionAuthorizationView = { ...view, options: { personal: { connections: [], canConnectPersonal: false } }, account: null };
+  if (!ctx.app) return nothing;
+  // `agentFound` is the Agent on this Server; a deleted one, or one the viewer can't find (the route
+  // already reads those as no Agent), is nothing to give an account to.
+  const [agent] = ctx.agentFound ? await db
+    .select({ id: agents.id })
+    .from(agents)
+    .where(and(eq(agents.id, ctx.agentId), eq(agents.serverId, ctx.serverId), isNull(agents.deletedAt), agentFindableBy({ userId: ctx.viewerUserId })))
+    .limit(1) : [];
+  if (!agent) return nothing;
+
+  const mayHoldPersonal = await personalOwnerRefusal(db, { serverId: ctx.serverId, userId: ctx.viewerUserId }) === null;
+  const isServerManager = ctx.viewerRole === "server_manager";
+  const rows = await db
+    .select({
+      id: managedMcpCredentials.id,
+      name: managedMcpCredentials.name,
+      accountLabel: managedMcpCredentials.accountLabel,
+      authStatus: managedMcpCredentials.authStatus,
+      isServerDefault: managedMcpCredentials.isServerDefault,
+      ownerKind: managedMcpCredentials.ownerKind,
+      ownerUserId: managedMcpCredentials.ownerUserId,
+    })
+    .from(managedMcpCredentials)
+    .where(and(eq(managedMcpCredentials.serverId, ctx.serverId), eq(managedMcpCredentials.mcpServerId, ctx.mcpServerId)))
+    .orderBy(asc(managedMcpCredentials.createdAt), asc(managedMcpCredentials.id));
+  const mine = mayHoldPersonal
+    ? rows.filter((row) => row.ownerKind === "personal" && row.ownerUserId === ctx.viewerUserId && row.authStatus === "ready")
+    : [];
+  const shared = isServerManager
+    ? rows.filter((row) => row.ownerKind === "shared" && (row.authStatus === "ready" || row.isServerDefault))
+    : [];
+  const agentsOf = await agentsGivenConnections(db, ctx.serverId, ctx.viewerUserId, mine.map((row) => row.id), shared.map((row) => row.id));
+  const option = (row: (typeof rows)[number]): McpConnectionCardAccountOption => ({
+    connectionId: row.id,
+    name: row.name,
+    label: row.accountLabel,
+    status: row.authStatus,
+    agentIds: agentsOf.get(row.id) ?? [],
+  });
+  const options: McpConnectionCardOptions = {
+    personal: {
+      connections: mine.map(option),
+      canConnectPersonal: mayHoldPersonal && ctx.app.authMode === "oauth" && ctx.app.membersCanConnect,
+    },
+    ...(isServerManager
+      ? { shared: { connections: shared.map((row) => ({ ...option(row), allAgents: row.isServerDefault })), canConnectShared: ctx.canAuthorizeNew } }
+      : {}),
   };
+  // Someone with nothing to do here learns nothing more than an observer did (no account, no owner).
+  const mayAct = ctx.viewerRole !== "observer" || options.personal.connections.length > 0 || options.personal.canConnectPersonal;
+  return { ...view, options, account: mayAct ? await currentAccount(ctx, rows) : null };
+}
+
+/** The Agents each Connection is given (personal grants) or pinned (shared), of those the viewer can find. */
+async function agentsGivenConnections(
+  db: DatabaseExecutor,
+  serverId: string,
+  viewerUserId: string,
+  personalIds: readonly string[],
+  sharedIds: readonly string[],
+): Promise<Map<string, string[]>> {
+  const visible = and(eq(agents.serverId, serverId), isNull(agents.deletedAt), agentFindableBy({ userId: viewerUserId }));
+  const [grants, pins] = await Promise.all([
+    personalIds.length === 0 ? [] : db
+      .select({ connectionId: managedMcpPersonalGrants.connectionId, agentId: managedMcpPersonalGrants.agentId })
+      .from(managedMcpPersonalGrants)
+      .innerJoin(agents, eq(agents.id, managedMcpPersonalGrants.agentId))
+      .where(and(inArray(managedMcpPersonalGrants.connectionId, [...personalIds]), visible))
+      .orderBy(asc(agents.createdAt), asc(agents.id)),
+    sharedIds.length === 0 ? [] : db
+      .select({ connectionId: sql<string>`${managedMcpAssignments.boundConnectionId}`, agentId: managedMcpAssignments.agentId })
+      .from(managedMcpAssignments)
+      .innerJoin(agents, eq(agents.id, managedMcpAssignments.agentId))
+      .where(and(eq(managedMcpAssignments.connectionMode, "pinned"), inArray(managedMcpAssignments.boundConnectionId, [...sharedIds]), visible))
+      .orderBy(asc(agents.createdAt), asc(agents.id)),
+  ]);
+  const byConnection = new Map<string, string[]>();
+  for (const row of [...grants, ...pins]) byConnection.set(row.connectionId, [...byConnection.get(row.connectionId) ?? [], row.agentId]);
+  return byConnection;
+}
+
+/** The Agent's account now (admittedMcpAccount), as this viewer may see it (McpConnectionCardAccount). */
+async function currentAccount(
+  ctx: { serverId: string; viewerUserId: string; mcpServerId: string; agentId: string; viewerRole: McpConnectionViewerRole },
+  rows: ReadonlyArray<{ id: string; name: string | null; accountLabel: string | null; ownerKind: "shared" | "personal"; ownerUserId: string | null }>,
+): Promise<McpConnectionCardAccount | null> {
+  const admitted = await admittedMcpAccount(getDb(), ctx.serverId, ctx.agentId, ctx.mcpServerId);
+  const used = admitted ? rows.find((row) => row.id === admitted.connectionId) : undefined;
+  if (!admitted || !used) return null;
+  const ownsIt = used.ownerKind === "personal" && used.ownerUserId === ctx.viewerUserId;
+  const seeLabel = ctx.viewerRole !== "observer" || ownsIt;
+  const seeId = ctx.viewerRole === "server_manager" || ownsIt;
+  let owner: Pick<McpConnectionCardAccount, "ownerUserId" | "ownerDisplayName"> = {};
+  if (used.ownerKind === "personal" && used.ownerUserId) {
+    const [person] = await getDb()
+      .select({ name: users.name, displayName: users.displayName })
+      .from(users)
+      .where(eq(users.id, used.ownerUserId))
+      .limit(1);
+    owner = { ownerUserId: used.ownerUserId, ownerDisplayName: person?.displayName ?? person?.name ?? null };
+  }
+  return {
+    kind: admitted.kind,
+    ...(seeId ? { connectionId: used.id } : {}),
+    name: seeLabel ? used.name : null,
+    label: seeLabel ? used.accountLabel : null,
+    ...owner,
+  };
+}
+
+/** Whether the card offers this Connection to a viewer who may (or may not) pin. */
+function mcpConnectionOffered(row: { isServerDefault: boolean; ownerKind: "shared" | "personal" }, viewerMayPin: boolean): boolean {
+  return row.ownerKind === "shared" && (row.isServerDefault || viewerMayPin);
 }
 
 /**
  * The newest sign-in this viewer finished for this Agent within `MCP_PENDING_GRANT_WINDOW_MS` whose
  * Connection is ready and still exists, unless the Agent already uses it (`admittedMcpConnectionId`,
- * the call path's decision) or may not use it (another person's, see `mcpConnectionUsableByAgent`).
+ * the call path's decision) or the viewer could not give it (`mcpConnectionOffered`).
  * See `McpPendingGrant`.
  */
 async function findPendingMcpGrant(opts: {
@@ -290,14 +481,14 @@ async function findPendingMcpGrant(opts: {
   viewerUserId: string;
   mcpServerId: string;
   agentId: string;
-}, agentOwnerUserId: string | null): Promise<McpPendingGrant | null> {
+}, viewerMayPin: boolean): Promise<McpPendingGrant | null> {
   const db = getDb();
   const [attempt] = await db
     .select({
       connectionId: managedMcpCredentials.id,
       name: managedMcpCredentials.name,
       isServerDefault: managedMcpCredentials.isServerDefault,
-      createdByUserId: managedMcpCredentials.createdByUserId,
+      ownerKind: managedMcpCredentials.ownerKind,
     })
     .from(managedMcpOAuthAttempts)
     .innerJoin(managedMcpCredentials, and(
@@ -315,7 +506,7 @@ async function findPendingMcpGrant(opts: {
     ))
     .orderBy(desc(managedMcpOAuthAttempts.createdAt))
     .limit(1);
-  if (!attempt || !mcpConnectionUsableByAgent(attempt, agentOwnerUserId)) return null;
+  if (!attempt || !mcpConnectionOffered(attempt, viewerMayPin)) return null;
   const admitted = await admittedMcpConnectionId(db, opts.serverId, opts.agentId, opts.mcpServerId);
   return admitted === attempt.connectionId ? null : { connectionId: attempt.connectionId, name: attempt.name };
 }

@@ -24,12 +24,17 @@
 // `renamed`, so one that knew it by its old title can still find it.
 // - `your_comment_resolved` (#249): someone else resolved a thread this agent
 //   started; it carries `resolved`. Sent whether the agent follows or not (it
-//   is about its own comment, as a mention is about it). A reopen tells no one.
+//   is about its own comment, as a mention is about it). A state change that
+//   asks nothing of it: queued, never pushed, so it wakes no agent
+//   (task #340). A reopen tells no one.
 // A channel's announcement (#proj-chat:#29, channel_announcement_v0): a new
 // version of the Artifact a channel has as its announcement tells that
 // channel's other agents, `subscribed` with `channelAnnouncement` (`following`,
 // `comments` and `version` null; an agent already told `your_file_changed`
 // is not told twice). Queued, never pushed: it wakes no agent.
+// Settled (#334): someone else settling or unsettling an Artifact tells its
+// other following agents and its author (an agent), `subscribed` with
+// `settlement`. A status change only: queued, never pushed.
 // Visibility is checked when a notice is sent, not stored here.
 import { z } from "zod";
 
@@ -116,6 +121,19 @@ export const artifactAgentNoticeSchema = lazySchema("artifactAgentNoticeSchema",
     publisher: agentApiArtifactActorSchema,
     number: z.number().int(),
     note: z.string().nullable(),
+  }).passthrough().nullable().optional(),
+  /**
+   * Settled notices (#334; `subscribed`, `comments` and `version` null): who
+   * settled the Artifact (`settled` true, at its version `version`) or took
+   * it back to Working (`settled` false; `version` the version it had been
+   * settled at). A client from before it writes the notice as "something
+   * changed" with a read of the Artifact's id. Absent (or null) for every
+   * other notice.
+   */
+  settlement: z.object({
+    by: agentApiArtifactActorSchema,
+    settled: z.boolean(),
+    version: z.number().int(),
   }).passthrough().nullable().optional(),
   /** Version notices (`your_file_changed`): the new version, and which of this agent's files it changed. */
   version: z.object({

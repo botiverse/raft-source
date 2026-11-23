@@ -388,6 +388,7 @@ export function MigrationChord({
       onTarget(target, { type: "press", keyboard: true, ...placeOf(target) });
     } else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
       e.preventDefault();
+      // oxlint-disable-next-line react/purity -- runs in the keydown handler, never while rendering: the rule reads this un-memoized handler as render code.
       menuKeyAt.current = Date.now();
       setActive(itemKey(target));
       onTarget(target, { type: "actions", keyboard: true, ...placeOf(target) });

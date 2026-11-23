@@ -1,0 +1,29 @@
+{
+  "formatVersion": 1,
+  "id": "muted_mention_lights_without_moving",
+  "rule": "position",
+  "title": "Past a mute, a mention of the viewer lights the @ of a row with a pre-mute message without moving it; a lagging answer keeps the @, a read past it clears it",
+  "why": "RisingWave keeps the row at its last pre-mute message (rw_inbox_serving_v9: latest_activity_seq is the muted prefix's latest_seq when there is one) and lights has_mention from the mention arm (rw_inbox_mention_v7). So a muted mention (moves: false) lights the @ and leaves the position and unread as they are. An answer at the same position sent before the mention reached the server has no @: the mention is applied above that answer's position, so it is applied again and the @ stays. A read through the mention clears it. A mention-only row moves with its mentions instead (mention_only_stays_on_mention). Decided: Tenny, #triage:#244, 2026-11-16 (follow RisingWave).",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow, applyLive: moves false; activityRowDisplayPosition)",
+      "packages/web/src/store/inboxRowPosition.ts (receiveLiveByPosition, with inbox_row_position_v1 on)"
+    ],
+    "server": [
+      "infra/risingwave/sql/078-task-conversations.sql (rw_inbox_serving_v9: latest_activity_seq, has_mention)",
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (rw_inbox_muted_prefix_v2)"
+    ]
+  },
+  "given": { "row": { "unreadCount": 1, "hasMention": false, "position": "100", "mentionOnly": false } },
+  "steps": [
+    { "act": "liveMessage", "seq": "101", "counts": false, "mentionsViewer": true, "moves": false },
+    { "act": "answer", "row": { "unreadCount": 1, "hasMention": false, "position": "100", "mentionOnly": false } },
+    { "act": "read", "seq": "101" }
+  ],
+  "checkpoints": [
+    { "afterStep": 1, "row": { "unreadCount": 1, "hasMention": true, "position": "100", "mentionOnly": false }, "reread": false },
+    { "afterStep": 2, "row": { "unreadCount": 1, "hasMention": true, "position": "100" }, "reread": false }
+  ],
+  "expect": { "row": { "unreadCount": 0, "hasMention": false, "position": "100", "mentionOnly": false }, "reread": false }
+}

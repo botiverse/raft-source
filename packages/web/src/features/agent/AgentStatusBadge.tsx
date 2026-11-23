@@ -14,6 +14,7 @@ import { showToast } from "../../components/toastBridge";
 import { useAgentStatusCredential } from "./useAgentStatusCredential";
 import { useTimeFormatter } from "../../hooks/useTimeFormatter";
 import { useOpenAgentComputer } from "../../components/agent/useOpenAgentComputer";
+import { useAgentRuntimeSignInNeeded } from "../../components/agent/useAgentRuntimeSignInNeeded";
 import StatusDot from "../../components/ui/StatusDot";
 import type { StatusDotPresence } from "../../components/ui/StatusDot";
 
@@ -106,6 +107,10 @@ export function AgentStatusBadge({ agentId, showDetail, fallbackStatus, external
   const displayState = spawnFailureText
     ? { ...rawDisplayState, activityDetail: spawnFailureText }
     : rawDisplayState;
+  // #triage:#494: a start waiting for the runtime's sign-in names it ("Sign-in
+  // needed for Kimi Code") on the error light, the sentence on hover, as the
+  // sidebar, the member list and the DM's header do.
+  const runtimeSignIn = useAgentRuntimeSignInNeeded(agentId, rawDisplayState);
 
   // External agents: presence = credential seen within the online window
   // (same rule as every other agent dot); managers also see setup state.
@@ -218,8 +223,10 @@ export function AgentStatusBadge({ agentId, showDetail, fallbackStatus, external
   // Held or not, it cannot run until someone acts: the error light. The
   // reason is a detail of the error, for its managers only (DS presence:
   // "Error, or Error and the reason").
-  const chipActivity: AgentActivity = credentialReason ? "error" : displayState.activity;
-  const activityText = credentialReason
+  const chipActivity: AgentActivity = credentialReason || runtimeSignIn ? "error" : displayState.activity;
+  const activityText = runtimeSignIn && !credentialReason
+    ? runtimeSignIn.fullText
+    : credentialReason
     ? (showDetail
       ? formatCredentialInvalidText(formatMessage, credentialReason, credential!)
       : formatActivityText(formatMessage, "error", ""))
@@ -299,7 +306,7 @@ export function AgentStatusBadge({ agentId, showDetail, fallbackStatus, external
     <div className={blocked ? "flex min-w-0 flex-wrap items-center gap-1.5" : "flex min-w-0 items-center gap-1.5"} data-testid="agent-status-row">
       <Badge appearance="soft" variant={PRESENCE_CHIP_VARIANT[chipActivity]} className={blocked ? BLOCKED_STATUS_CHIP_CLASS_NAME : "max-w-full"} data-testid="agent-status-chip" data-credential-reason={credentialReason ?? undefined} render={chipRender}>
         <StatusDot activity={chipActivity} className="shrink-0" />
-        <Tooltip content={activityText}><span className={blocked ? "min-w-0 break-words" : "min-w-0 truncate"}>
+        <Tooltip content={runtimeSignIn && !credentialReason ? runtimeSignIn.detail : activityText}><span className={blocked ? "min-w-0 break-words" : "min-w-0 truncate"}>
           {activityText}
         </span></Tooltip>
       </Badge>

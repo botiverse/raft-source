@@ -29,3 +29,21 @@ export async function logMessageChanged(executor: DatabaseExecutor, input: { mes
     WHERE c.id = ${input.channelId}::uuid
   `);
 }
+
+/**
+ * One `inbox_row` upsert row for conversation `channelId` in its own scope
+ * (`parent_id` = a thread's or task conversation's parent channel), in
+ * `executor`'s transaction: a change to one of its messages that every
+ * member's Activity row for it may show and no other change_log row says (a
+ * retracted message: its preview). Read only by a pull with the inbox_row
+ * capability (services/syncChanges.ts), which rebuilds the viewer's row;
+ * every other pull leaves it out. A person's own row changes (Done
+ * watermarks, mutes) are logged by triggers in their user scope.
+ */
+export async function logInboxRowChanged(executor: DatabaseExecutor, input: { channelId: string }): Promise<void> {
+  await executor.execute(sql`
+    SELECT public.change_log_add(c.server_id, 'channel', c.id, c.parent_channel_id, 'inbox_row', c.id::text, 'upsert')
+    FROM public.channels c
+    WHERE c.id = ${input.channelId}::uuid
+  `);
+}

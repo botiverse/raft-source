@@ -6,6 +6,7 @@ import * as channelService from "./channelService";
 import * as messageService from "./messageService";
 import * as taskService from "./taskService";
 import * as userService from "./userService";
+import { autoFocusOwnTask } from "./agentFocusAuto";
 import { ensureTaskConversationAndBroadcast } from "./taskMutationBroadcast";
 import { insertTaskConversationFollow, resolveFollowerLocalTaskConversation, type CreatedTaskConversation } from "./taskConversationService";
 import { formatRaftChannelTaskRef, TASK_ASSIGNMENT_NOTICE_KIND, type TaskAssignmentNoticeMetadata, type TaskAssignmentNoticeParty } from "@botiverse/raft-shared";
@@ -277,16 +278,16 @@ export async function announceTaskClaim(
 
 /**
  * The new assignee follows the task conversation (reason `assigned`) on their
- * own local conversation; an explicit unfollow is reactivated (assignment and
+ * own local conversation (returned; null when they have none); an explicit unfollow is reactivated (assignment and
  * claim are personal attention, like a direct @mention).
  */
 async function followTaskConversationAsAssignee(
   conversation: CreatedTaskConversation,
   follower: TaskNoticeActor,
   preferredServerId: string | undefined,
-): Promise<void> {
+): Promise<string | null> {
   const local = await resolveFollowerLocalTaskConversation(conversation, follower, { preferredServerId });
-  if (!local) return;
+  if (!local) return null;
   await insertTaskConversationFollow(getDb(), {
     conversationChannelId: local,
     taskId: conversation.taskId,
@@ -294,6 +295,7 @@ async function followTaskConversationAsAssignee(
     reason: "assigned",
     reactivateUnfollowed: true,
   });
+  return local;
 }
 
 /** The local conversation a surface (local channel) sees; canonical as a fallback. */
@@ -339,14 +341,25 @@ export async function postTaskConversationNotice(
     initiatingServerId: input.localChannel.serverId ?? null,
     createdByUserId: input.actor.type === "user" ? input.actor.id : null,
   });
-  if (!conversation) return postLegacyHostThreadNotice(io, agentOrchestrator, input);
-
   const attention = input.attention && input.attention.type !== "external" ? input.attention : null;
   const follower: TaskNoticeActor | null = attention
     ? { type: attention.type as "user" | "agent", id: attention.id }
     : input.follower ?? null;
+  // Focus (auto): an agent that gets no line mentioning it for this task (it took the task itself,
+  // or it was assigned but cannot be mentioned) has no delivery to focus by, so its task's
+  // conversation and source thread are focused from here (agentFocusAuto.ts). The task write has
+  // committed. Not awaited: the line below does not depend on it, and it never throws. An agent
+  // handed the task by someone else is focused by the delivery of the line that mentions it.
+  const focusOwnTask = (conversationChannelId: string | null) => {
+    if (!attention && follower?.type === "agent") void autoFocusOwnTask({ taskId: input.taskId, agentId: follower.id, conversationChannelId });
+  };
+  if (!conversation) {
+    focusOwnTask(null);
+    return postLegacyHostThreadNotice(io, agentOrchestrator, input);
+  }
+
   if (follower) {
-    await followTaskConversationAsAssignee(conversation, follower, input.localChannel.serverId);
+    focusOwnTask(await followTaskConversationAsAssignee(conversation, follower, input.localChannel.serverId));
   }
   if (input.content === null) return null;
   const localConversationId = localConversationFor(conversation, input.localChannel.id);

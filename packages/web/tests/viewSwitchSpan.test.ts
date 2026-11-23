@@ -9,6 +9,7 @@ import {
   beginViewSwitchToPath,
   conversationView,
   reportViewList,
+  taskView,
   threadView,
   viewSwitchForPath,
 } from "../src/observability/viewSwitchSpan";
@@ -18,7 +19,7 @@ import {
   finishWebHttpClientTrace,
 } from "../src/utils/webHttpClientTrace";
 import { apiRouteTemplate } from "../src/observability/apiRouteTemplate";
-import { threadRepliesState } from "../src/features/thread/useThreadViewSwitch";
+import { threadRepliesState, threadSurfaceViewKey } from "../src/features/thread/useThreadViewSwitch";
 import { chatPanelListState } from "../src/features/channel/useChatPanelViewSwitch";
 
 // `web.view.switch` (#triage:8c0d2318): from the input to the frame after the
@@ -84,14 +85,14 @@ function stubPerformance(entries: Array<Partial<PerformanceResourceTiming> & { n
 }
 
 /** One API request through the HTTP client trace, as the Axios interceptors run it. */
-function request(url: string, answer: { status?: number; contentLength?: number } = {}): () => void {
+function request(url: string, answer: { status?: number; contentLength?: number; headers?: Record<string, string> } = {}): () => void {
   const config = { method: "get", url, baseURL: "https://api.example.test/api", headers: {} as Record<string, unknown> };
   attachWebHttpClientTrace(config);
   return () => {
     now += 5;
     finishWebHttpClientTrace(config, {
       statusCode: answer.status ?? 200,
-      responseHeaders: answer.contentLength === undefined ? {} : { "content-length": String(answer.contentLength) },
+      responseHeaders: { ...(answer.contentLength === undefined ? {} : { "content-length": String(answer.contentLength) }), ...answer.headers },
     });
   };
 }
@@ -457,6 +458,24 @@ test("web.http.client carries the route template, the response size and the Reso
   assert.equal(apiRouteTemplate(undefined), ":other");
 });
 
+test("web.http.client splits a new connection into DNS, TCP and TLS, and names the CloudFront edge", () => {
+  const url = `/messages/channel/${CHANNEL}`;
+  const entry = { name: `https://api.example.test/api${url}`, startTime: 50_000, fetchStart: 50_000, requestStart: 50_100, responseStart: 50_150, responseEnd: 50_160 };
+  stubPerformance([{ ...entry, domainLookupStart: 50_002, domainLookupEnd: 50_032, connectStart: 50_032, secureConnectionStart: 50_060, connectEnd: 50_098 }], 50_000);
+  request(url, { headers: { "x-amz-cf-pop": "NRT57-P2" } })();
+  stubPerformance([{ ...entry, domainLookupStart: 50_000, domainLookupEnd: 50_000, connectStart: 50_000, secureConnectionStart: 0, connectEnd: 50_000 }], 50_000);
+  request(url, { headers: { "x-amz-cf-pop": "<script>" } })();
+
+  const [opened, reused] = httpSink.getAllSpans();
+  assert.equal(opened?.attrs?.connect_ms, 98);
+  assert.equal(opened?.attrs?.dns_ms, 30);
+  assert.equal(opened?.attrs?.tcp_ms, 28);
+  assert.equal(opened?.attrs?.tls_ms, 38);
+  assert.equal(opened?.attrs?.edge_pop, "NRT57-P2");
+  assert.equal(reused?.attrs?.connect_ms, 100);
+  for (const key of ["dns_ms", "tcp_ms", "tls_ms", "edge_pop"]) assert.equal(reused?.attrs?.[key], undefined, `${key} on a reused connection / a malformed header`);
+});
+
 test("Resource Timing comes from a PerformanceObserver's bounded map before getEntriesByName", () => {
   const url = `https://api.example.test/api/messages/channel/${CHANNEL}`;
   let callback: ((list: { getEntries: () => PerformanceEntryList }) => void) | null = null;
@@ -520,7 +539,7 @@ test("nothing throws without the performance APIs (SSR, jsdom)", () => {
 });
 
 test("the list hooks' states: skeletons, 'Loading replies…' and live rows only are pending", () => {
-  const shown = { unavailable: false, held: false, loading: false, hasMessages: true, forumMode: false };
+  const shown = { unavailable: false, held: false, loading: false, hasMessages: true };
   assert.equal(chatPanelListState(shown, true), "data");
   assert.equal(chatPanelListState({ ...shown, hasMessages: false }, true), "data", "a loaded empty channel");
   assert.equal(chatPanelListState(shown, false), "pending", "only live rows, no page fetched yet");
@@ -551,4 +570,46 @@ test("message_requests counts the switch's message pages and windows, so a page 
   const span = only();
   assert.equal(span.attrs?.requests, 5);
   assert.equal(span.attrs?.message_requests, 3, "two pages and a window; not the outline or the channel row");
+});
+
+test("task conversation switches time task v2 and pre-v2 task dialogs via target=task and ?task= routes", () => {
+  const TASK_ID = "7a5c0000-1111-4222-8333-444455556666";
+  const TASK_CHANNEL = "7a5c1111-1111-4222-8333-444455556666";
+
+  assert.deepEqual(viewSwitchForPath(`/s/x/channel/${CHANNEL}?task=${CHANNEL}:task:${TASK_ID}`), {
+    target: "task", view: taskView(TASK_ID), matches: [TASK_ID, null],
+  });
+  assert.deepEqual(viewSwitchForPath(`/s/x/channel/${CHANNEL}?msg=${MESSAGE}&task=${CHANNEL}:task:${TASK_ID}`), {
+    target: "message_jump", view: taskView(TASK_ID), matches: [TASK_ID, MESSAGE],
+  });
+  assert.deepEqual(viewSwitchForPath(`/s/x/channel/${CHANNEL}?task=${CHANNEL}:${PARENT_MESSAGE}`), {
+    target: "task", view: taskView(PARENT_MESSAGE), matches: [PARENT_MESSAGE, null],
+  });
+  assert.deepEqual(viewSwitchForPath(`/s/x/channel/${CHANNEL}?thread=${CHANNEL}:${PARENT_MESSAGE}&task=1`), {
+    target: "task", view: taskView(PARENT_MESSAGE), matches: [PARENT_MESSAGE, null],
+  });
+
+  assert.equal(threadSurfaceViewKey({ parentMessageId: null, parentTaskId: TASK_ID, isTaskModalSurface: true }), taskView(TASK_ID));
+  assert.equal(threadSurfaceViewKey({ parentMessageId: null, parentTaskId: TASK_ID, isTaskModalSurface: false }), taskView(TASK_ID));
+  assert.equal(threadSurfaceViewKey({ parentMessageId: PARENT_MESSAGE, parentTaskId: null, isTaskModalSurface: true }), taskView(PARENT_MESSAGE));
+  assert.equal(threadSurfaceViewKey({ parentMessageId: PARENT_MESSAGE, parentTaskId: null, isTaskModalSurface: false }), threadView(PARENT_MESSAGE));
+
+  // Opening a task conversation by click: deduplicates with subsequent ?task= navigation, matches its channel's requests.
+  beginViewSwitch({ target: "task", view: taskView(TASK_ID), matches: [TASK_ID, null], event: input(49_980), requireInput: true });
+  beginViewSwitchToPath(`/s/x/channel/${CHANNEL}?task=${CHANNEL}:task:${TASK_ID}`);
+  addViewSwitchMatch(taskView(TASK_ID), TASK_CHANNEL);
+  const page = request(`/messages/channel/${TASK_CHANNEL}?limit=50`, { contentLength: 600 });
+  page();
+  reportViewList(taskView(TASK_ID), "data");
+  flushFrame();
+
+  const span = only();
+  assert.equal(span.attrs?.target, "task");
+  assert.equal(span.attrs?.cache, "miss");
+  assert.equal(span.attrs?.requests, 1);
+  assert.equal(span.attrs?.message_requests, 1);
+  assert.equal(span.attrs?.bytes, 600);
+  const serialized = JSON.stringify(span.attrs);
+  assert.equal(serialized.includes(TASK_ID), false, "no task id in attrs");
+  assert.equal(serialized.includes(TASK_CHANNEL), false, "no task channel id in attrs");
 });

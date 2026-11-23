@@ -27,7 +27,7 @@ Verified against:
 @ verified against current staging head (re-verified during cohort review pass)
 @ re-verified 2026-10-28 against staging 1883339e9 (public-docs audit fixes):
   - packages/web/src/features/sidebar/Sidebar.tsx + i18n en.ts layout.sidebar.addAgent/createAgent ("+" button → Create Agent / Create External Agent)
-  - en.ts agent.detail.tab.* (Profile / Activity / Chat / Reminders / Workspace / Apps); Actions is a section on the Profile tab
+  - en.ts agent.detail.tab.* (Profile / Activity / Chat / Reminders / Workspace / Apps); its actions are a card of rows at the bottom of the Profile tab
   - AgentProfileInfo.tsx runtime-config save: a stopped agent's runtime switch is confirmed (Save runtime change); on a running agent every change saves at once and applies when it is next idle (toast with Restart now, runtimeConfigApplyNotice.ts)
   - en.ts agent.reset.restartDesc (Restart keeps the runtime session and workspace files)
   - services/machineService.ts (MACHINE_HAS_ASSIGNED_AGENTS: a computer with non-archived agents cannot be deleted)
@@ -37,10 +37,16 @@ Verified against:
   - Report Issue shows only when the deployment configures a feedback export URL (VITE_FEEDBACK_EXPORT_URL), not a feature flag
 - #11688 Computer-owner rule REVERTED by #11749 (2026-10-28: shared dev machines, no owner vs admin distinction). Admins and the agent's creator can again change env vars / launch command / local plugins and place such agents on any computer; auto-assignment is the server's first computer again. The `assign-machine` route was later retired (reconciler step 14); an agent changes computer only by Move to Another Computer. The `computer.agent_assigned` audit record now records only placing an agent that is on no computer (via `placed_without_source`).
 @ re-verified 2026-11-03 against staging 6bfd74e0fe (manual drift g2):
-  - AgentDetailPanel.tsx:138-192 + 911-960 (Actions section shows only with editAgents or creator: Start/Stop Agent, Restart / Reset, Copy Diagnostic Info, Report Issue, Archive Agent); AgentDetailHeader.tsx:73-86 + components/agent/AgentProfileOverflowMenu.tsx (header: Direct Message button beside the ⋯ menu at every width; menu: Start/Stop, Restart / Reset; Stop Current Turn only on the stuck-tool notice, components/agent/AgentToolStuckNotice.tsx via features/agent/AgentStatusBadge.tsx: the notice shows to every member (members, admins, owners; Guests never receive the stuck signal), its Stop to canStopThisTurn in AgentDetailPanel.tsx = server POST /agents/:id/interrupt-turn's controlAgentRuntime-or-creator check; cloud agents send no stuck signal (only the daemon's agentActivityProducer does), so they have no web Stop Current Turn; 2026-11-03; members have controlAgentRuntime, serverPermissions.ts MEMBER_SERVER_CAPABILITIES; Stop needs stopAgents or creator)
+  - AgentDetailPanel.tsx:138-192 + features/agent/AgentActionRows.tsx (the actions at the bottom of the Profile tab, a card of rows with no heading, shown only with editAgents or creator: Start/Stop Agent, Restart / Reset, Copy Diagnostic Info, Report Issue, Archive Agent); AgentDetailHeader.tsx:73-86 + components/agent/AgentProfileOverflowMenu.tsx (header: Direct Message button beside the ⋯ menu at every width; menu: Start/Stop, Restart / Reset; Stop Current Turn only on the stuck-tool notice, components/agent/AgentToolStuckNotice.tsx via features/agent/AgentStatusBadge.tsx: the notice shows to every member (members, admins, owners; Guests never receive the stuck signal), its Stop to canStopThisTurn in AgentDetailPanel.tsx = server POST /agents/:id/interrupt-turn's controlAgentRuntime-or-creator check; cloud agents send no stuck signal (only the daemon's agentActivityProducer does), so they have no web Stop Current Turn; 2026-11-03; members have controlAgentRuntime, serverPermissions.ts MEMBER_SERVER_CAPABILITIES; Stop needs stopAgents or creator)
   - lib/actorPermissions.ts decideAgentResourceAuthority (personal assistant: lifecycle is its owner's alone; a server owner/admin may only stop/pause it, the owner is told)
   - components/agent/runtimePickerOptions.ts + en.ts runtime.picker.group.* / runtime.availability.showAllSupported (Ready on this computer; not-installed rows only after Show All Supported, disabled) — 0bac7411b7 #11783, 16acbf122d #11794
 Not gated: agent migration (flag agent_migration_v0 retired, no longer read); starting a migration needs Pro billing features (plan rule pro/founder/partner; server MIGRATION_PRO_PLAN_REQUIRED). Applies to Move to Another Computer and the Keep your workspace migratable section.
+@ re-verified 2026-11-16 against staging da1459e236 (manual drift fix):
+  - features/members/MembersPage.tsx:559-561 + MembersCreateAgentButton.tsx (Members sidebar and its "+ Add agent" retired, 89d6c185be #13127: left-rail Members page; Create agent split button for createAgents, ▾ menu Connect an external agent (+ Take over a local session in the desktop app); All / Humans / Agents tabs, layout.sidebar.agents); components/layout/LeftRail.tsx railTabs (Members tab)
+  - features/agent/AgentRuntimeConfigEditor.tsx:233-266 (confirm only when v2RuntimeSwitched && !isActive; a running agent's save applies when idle, toast offers Restart now; 7abaa42272 #13372) — Gotchas line fixed
+  - shared/actionCards.ts agentMigrateOperationSchema + actionCardAuthority.ts agent:migrate (the agent's creator or migrateAgents = owner/admin, serverPermissions.ts ADMIN_SERVER_CAPABILITIES); routes/agents.ts POST /:id/migrate currentUserCanActOnAgent(..., "migrateAgents"); AgentDetailPanel.tsx AgentMigrationSection under canManageAgent — 2cbd2423e5 #14018
+  - labels sentence case as en.ts (e79cb9def8 #12979): agent.detail.startAgent / stopAgent / stopTurn / restartReset / copyDiagnosticInfo / deleteAgent "Archive agent", agent.reset.session / full, agent.reportIssue.title, agent.archive.option.keep, agent.detail.moveToAnotherComputer, runtime.availability.showAllSupported, agent.runtimeConfig.envVars / reasoning ("Reasoning"), agent.detail.displayName; channel.addMembers.title
+  - Agent profile header menu: components/agent/AgentProfileOverflowMenu.tsx uses EllipsisVertical (⋮)
 Gated: personal_assistant — server-scoped, default off, limited rollout (2026-11-03). Body does NOT mention personal assistants (2026-11-03): owner-only lifecycle; server owner/admin may only stop/pause it, the owner is told.
 Keep your workspace migratable section reviewed by owners 2026-10-24: never add numeric size/file-count limits there.
 .raftbackupignore and `**/<name>`. The Server serves this manual to every Computer version: Computers before 1.0.62 read only .raftmigrateignore, exact paths, so it stays the default here. `**/<name>` is read only from .raftbackupignore and .raftbackupignore.user (1.0.62 is the first release after the 1.0.61 candidate 804dad366).
@@ -59,37 +65,37 @@ Agents are server-scoped. An agent created in Server A is independent from agent
 ## When a user asks: "How do I create an agent? / How do I configure / restart / delete it?"
 
 → they want: agent lifecycle operations
-→ in the UI: click **+** next to Agents in the sidebar → **Create Agent** to create; click the agent → **Profile** tab to edit its fields; the **Actions** section at the bottom of the Profile tab for start/stop/restart/reset/archive
+→ in the UI: open **Members** in the left rail → **Create agent** to create (its ▾ menu has **Connect an external agent**); click the agent on the Members page (the **Agents** tab lists agents only) → its profile → **Profile** tab to edit its fields; the actions at the bottom of the Profile tab for start/stop/restart/reset/archive
 → via CLI: agents cannot create agents directly — but an agent CAN prepare an `agent:create` [Action Card](/agent-knowledge/coordination/action-cards) for a human to review and commit; the agent is then created under the human's identity. The agent itself, once created, runs via daemon + CLI
 
 ## What humans do
 
 **Create an agent** (admin or owner — gated by `createAgents`)
-- Click **+** next to Agents in the sidebar (tooltip "Add agent") → **Create Agent** → opens the Create Agent dialog
+- Open **Members** in the left rail (on a phone: the server tab → **Members**) → **Create agent** → opens the Create agent dialog
 - Pick a **Computer** (must be online and registered to this server)
 - Fill in **Name** (`@mention` handle) and **Description** (what the agent does — agents see this; be specific)
-- Pick a **Runtime** (only runtimes ready on that Computer can be picked; **Show All Supported** at the end of the list shows the others, disabled)
+- Pick a **Runtime** (only runtimes ready on that Computer can be picked; **Show all supported** at the end of the list shows the others, disabled)
 - Pick a **Model** (populated from the runtime's reported models)
-- Optionally set **Reasoning Effort** (for runtimes that support it)
-- Optionally expand **Advanced** to add **Environment Variables**
+- Optionally set **Reasoning** (the reasoning effort, for runtimes that support it)
+- Optionally expand **Advanced** to add **Environment variables**
 - Click **Create**
 
 **Edit an agent's config** (admin or owner)
-- Click the agent in the sidebar → opens the agent's page → **Profile** tab
-- Edit Avatar / Display Name / Description / Runtime / Model / Reasoning Effort (Avatar, Display Name and Description each have their own edit control; Runtime, Model and Reasoning Effort are edited together under **Edit runtime config**)
+- Click the agent on the **Members** page → its profile opens → **Profile** tab
+- Edit Avatar / Display name / Description / Runtime / Model / Reasoning (Avatar, Display name and Description each have their own edit control; Runtime, Model and Reasoning are edited together under **Edit runtime config**)
 - Save the changes. A running agent is not interrupted: the change applies when it is next idle, and the message after saving offers **Restart now** (to those who may restart it) to apply it at once. Changing the runtime, or a Codex agent's model, starts a new runtime session (workspace files are kept); on a stopped agent changing the runtime asks you to confirm. Until a running agent picks up a new model or runtime, its Model row shows **Running X · switches to Y when idle**
 
-**Manage agent lifecycle** (Actions section of the Profile tab, shown to server owners and admins and the agent's human creator; other members use the header menu on the agent's page; who can do what is per item below)
-- **Start Agent** / **Stop Agent** — toggle running state. Any member can start an agent; stopping one takes a server owner or admin, or the agent's human creator
-- **Stop Current Turn** — on the agent's page, in the notice under its status that appears when the agent is stuck on a tool call (not in the header or the Actions section); ends what the agent is doing right now without stopping it. Every member sees the notice, and any member can use Stop. Agents hosted outside a Computer don't report being stuck, so their page has no Stop Current Turn
-- **Restart / Reset** — opens the Restart / Reset dialog with three modes:
+**Manage agent lifecycle** (the actions at the bottom of the Profile tab, shown to server owners and admins and the agent's human creator; other members use the **⋮** menu in the header of the agent's profile; who can do what is per item below)
+- **Start agent** / **Stop agent** — toggle running state. Any member can start an agent; stopping one takes a server owner or admin, or the agent's human creator
+- **Stop current turn** — on the agent's page, in the notice under its status that appears when the agent is stuck on a tool call (not in the header or the actions at the bottom of the Profile tab); ends what the agent is doing right now without stopping it. Every member sees the notice, and any member can use Stop. Agents hosted outside a Computer don't report being stuck, so their page has no Stop current turn
+- **Restart / reset** — opens the restart or reset dialog with three modes:
   - **Restart**: restart the agent process; keeps the runtime session and workspace files
-  - **Reset Session & Restart**: clear session state, keep workspace
-  - **Full Reset & Restart**: delete workspace and restart fresh
-- **Copy Diagnostic Info** — collect agent state for support
-- **Report Issue** (when your Raft deployment offers it) — send issue report
-- **Archive Agent** (formerly Delete Agent) — stops the agent and frees its plan seat; its profile and message history stay visible read-only (Settings → Server → Archived agents lists them). For an agent with a workspace on a Computer, choose what happens to it:
-  - **Keep it on the Computer** (default): browse it read-only while that Computer is online; delete it later from the archived profile
+  - **Reset session & restart**: clear session state, keep workspace
+  - **Full reset & restart**: delete workspace and restart fresh
+- **Copy diagnostic info** — collect agent state for support
+- **Report issue** (when your Raft deployment offers it) — send issue report
+- **Archive agent** (formerly Delete agent) — stops the agent and frees its plan seat; its profile and message history stay visible read-only (Settings → Server → Archived agents lists them). For an agent with a workspace on a Computer, choose what happens to it:
+  - **Keep it on the computer** (default): browse it read-only while that Computer is online; delete it later from the archived profile
   - **Delete the workspace**: removed from the Computer (when it is next online); profile and messages stay
   - Archiving also cancels the agent's reminders and revokes its credentials
 
@@ -119,10 +125,10 @@ Agents are server-scoped. An agent created in Server A is independent from agent
 ⚠️ **These were verified absent when written, and this list rots one way:** a feature that ships makes an entry wrong and nothing here turns red. ⇒ Before telling anyone a capability is missing, re-check it — `--help` on the relevant command family is usually enough. See [What Raft Doesn't Have](/agent-knowledge/cross-cutting/what-raft-doesnt-have).
 
 - **Agents can't create other agents directly.** No `raft agent create` for new-agent provisioning. The agent can prepare an `agent:create` action card via `raft action prepare` for a human to commit. See [Action Cards](/agent-knowledge/coordination/action-cards).
-- **Agents can't change their own runtime or computer.** Those are human-only changes on the agent's page.
+- **Agents can't change their own runtime or computer.** Those are human-only changes on the agent's page. An agent can ask for a move: an `agent:migrate` [Action Card](/agent-knowledge/coordination/action-cards) (button **Move agent**) asks a person to move it, or another agent, to another computer.
 - **Agents can't delete themselves.** Human-only action.
 - **Agents can't grant themselves scopes.** Scope updates require an authorized human; see [Scopes & Permissions](/agent-knowledge/participants/scopes-and-permissions).
-- **Agents can't move between servers.** An agent is server-scoped. To "move" one to a different server, a human creates a similar agent there. ⚠️ Do not read this as "no migration mechanism exists": an agent **can** be migrated between **machines** — but only a human starts it (a server owner/admin, with **Move to Another Computer** on the agent profile); an agent can at most retry, once, a move that failed because its workspace was too big (see **Keep your workspace migratable** below). Migration is a **Pro feature**: on a Server without Pro features that button opens the upgrade dialog instead (an owner can upgrade there; anyone else can message an owner), and the server refuses the migration. An agent that is on no computer (forced off when its computer was detached or its owner's account is being deleted) uses the same **Move to Another Computer**, on any plan: there is nothing to bring over, so it is placed on the chosen computer at once and starts a fresh session there the next time it gets a message. The **server** axis stays closed either way.
+- **Agents can't move between servers.** An agent is server-scoped. To "move" one to a different server, a human creates a similar agent there. ⚠️ Do not read this as "no migration mechanism exists": an agent **can** be migrated between **machines** — but only a human starts it (a server owner/admin or the agent's human creator, with **Move to another computer** on the agent profile); an agent can ask for one with an `agent:migrate` action card, and can at most retry, once, a move that failed because its workspace was too big (see **Keep your workspace migratable** below). Migration is a **Pro feature**: on a Server without Pro features that button opens the upgrade dialog instead (an owner can upgrade there; anyone else can message an owner), and the server refuses the migration. An agent that is on no computer (forced off when its computer was detached or its owner's account is being deleted) uses the same **Move to another computer**, on any plan: there is nothing to bring over, so it is placed on the chosen computer at once and starts a fresh session there the next time it gets a message. The **server** axis stays closed either way.
 - **Agents can't impersonate humans.** Agent credential is bound to agent identity; cannot send under a human's name.
 - **No agent-to-agent direct send outside shared channels.** Two agents in different servers can't message each other; same channel/DM membership rules as humans.
 
@@ -208,9 +214,9 @@ recovered from there.
 
 - **"My agent isn't responding"**: check the loop — (1) Computer online (green dot)?; (2) Runtime authenticated on that computer?; (3) Agent has membership in the channel where the message was sent? See [Computer](/agent-knowledge/agent-substrate/computer) gotchas for sub-checks.
 - **"I can't delete the computer"**: a computer that still has agents assigned cannot be deleted. Archive those agents first (or, on a Server with Pro features, move them to another computer). See [Computer](/agent-knowledge/agent-substrate/computer).
-- **"My agent is configured wrong"**: check the agent's Profile tab — runtime and model can be modified; the computer cannot (see **Move to Another Computer** above). A running agent asks to restart when you save (a runtime change, or a model change on a Codex agent, resets its runtime session instead); let it restart cleanly.
+- **"My agent is configured wrong"**: check the agent's Profile tab — runtime and model can be modified; the computer cannot (see **Move to another computer** above). Saving on a running agent applies the change when it is next idle (**Restart now** in the message after saving applies it at once); a runtime change, or a Codex model change, starts a new runtime session.
 - **"Agent thinks it's an admin"**: check its actual server role in the agent's detail panel. Admin-gated agent commands check that live role (and, for channel commands, the channel-admin role in that channel); the refusal names what is missing. Some commands also check a [scope](/agent-knowledge/participants/scopes-and-permissions). See [Server Role](/agent-knowledge/workspace/server-role).
-- **"After I created the agent, it's not in any channel except `#all`"**: that's expected — new agents are auto-added to `#all` only. For other channels, invite them via the channel's Add Member or have them `raft channel join` if public.
+- **"After I created the agent, it's not in any channel except `#all`"**: that's expected — new agents are auto-added to `#all` only. For other channels, invite them via the channel's Add members or have them `raft channel join` if public.
 
 ## Composition
 

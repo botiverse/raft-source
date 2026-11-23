@@ -169,6 +169,7 @@ async function main() {
           slug: input.slug,
           ownerId: owner.id,
           onboardingAgentId: null,
+          officialOnboardingAgentId: null,
           agentAllChannelGreetingEnabled: false,
         }).returning();
       } else {
@@ -176,6 +177,7 @@ async function main() {
           name: input.name,
           ownerId: owner.id,
           onboardingAgentId: null,
+          officialOnboardingAgentId: null,
           agentAllChannelGreetingEnabled: false,
           updatedAt: new Date(),
         }).where(eq(servers.id, server.id)).returning();
@@ -198,7 +200,7 @@ async function main() {
         updatedAt: new Date(),
       }).where(and(eq(agents.serverId, serverId), isNull(agents.deletedAt)));
       await db.delete(machines).where(eq(machines.serverId, serverId));
-      await db.update(servers).set({ onboardingAgentId: null, updatedAt: new Date() }).where(eq(servers.id, serverId));
+      await db.update(servers).set({ onboardingAgentId: null, officialOnboardingAgentId: null, updatedAt: new Date() }).where(eq(servers.id, serverId));
     }
 
     async function ensureOfflineMachine(serverId: string) {
@@ -270,7 +272,7 @@ async function main() {
         deletedAt: new Date(),
         updatedAt: new Date(),
       }).where(and(eq(agents.serverId, server.id), isNull(agents.deletedAt)));
-      await db.update(servers).set({ onboardingAgentId: null, updatedAt: new Date() }).where(eq(servers.id, server.id));
+      await db.update(servers).set({ onboardingAgentId: null, officialOnboardingAgentId: null, updatedAt: new Date() }).where(eq(servers.id, server.id));
       prepared.push({
         label: "runtime-ready",
         slug: server.slug,

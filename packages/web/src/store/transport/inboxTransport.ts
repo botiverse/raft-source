@@ -7,6 +7,7 @@
 
 import type { AxiosResponse } from "axios";
 import api from "../../api/client";
+import { noteLocalReadAck } from "../inboxListRowLowered";
 import { clearMarkedUnreadForRead } from "../markedUnreadStore";
 
 const readAllInFlight = new Map<string, Promise<AxiosResponse>>();
@@ -64,9 +65,13 @@ export function postReadAllCoalesced(
   // (e.g. the persisted-read notification that drives Activity reconcile must
   // fire at the same point it always did). Concurrent same-key callers share
   // this exact promise, so one network request serves them all.
+  const ownRead = !identity.receiver || identity.receiver.kind === "human";
   promise.then(
-    () => {
+    (response) => {
       readAllInFlight.delete(key);
+      // #triage:#244: this tab's own read ack settles its held lowered rows (Activity's Read, a thread opened).
+      const data = response?.data as { maxReadSeq?: unknown; seq?: unknown } | undefined;
+      if (ownRead) noteLocalReadAck(channelId, data?.maxReadSeq ?? data?.seq);
     },
     () => {
       readAllInFlight.delete(key);

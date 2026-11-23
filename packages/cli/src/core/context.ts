@@ -14,6 +14,8 @@ export interface CommandContext {
   env: NodeJS.ProcessEnv;
   /** The runtime's continuation options (tests): what a command that can pause runs with. */
   continuations?: CliContinuationOptions;
+  /** The clock of local records that expire (a held artifact push), when a test sets one; else Date.now. */
+  now?: () => number;
   loadAgentContext(): AgentContext;
   createApiClient(agentContext: AgentContext): ApiClient;
 }
@@ -25,6 +27,8 @@ export interface CommandRuntimeOptions {
   createApiClient?: (agentContext: AgentContext) => ApiClient;
   /** Commands that pause for an answer, and `cont` (commands/continuation): the table, store and clock (tests). */
   continuations?: CliContinuationOptions;
+  /** The clock of local records that expire (a held artifact push): tests. */
+  now?: () => number;
 }
 
 function bootstrapSuggestedNextAction(code: string): string | undefined {
@@ -57,6 +61,7 @@ export function createCommandContext(options: CommandRuntimeOptions = {}): Comma
     io,
     env,
     ...(options.continuations ? { continuations: options.continuations } : {}),
+    ...(options.now ? { now: options.now } : {}),
     loadAgentContext() {
       try {
         return loadContext(env);

@@ -85,13 +85,14 @@ test("task update command preserves freshness-hold output", async () => {
     }) as any,
   });
 
-  await taskUpdateCommand.handler(ctx, undefined, { target: "#proj-runtime", number: ["7"], status: "done" });
+  await assert.rejects(async () => { await taskUpdateCommand.handler(ctx, undefined, { target: "#proj-runtime", number: ["7"], status: "done" }); }, (err: unknown) => err instanceof CliError && err.code === "TASK_WRITE_HELD" && err.exitCode === 1);
 
   assert.deepEqual(stderr, []);
   const output = stdout.join("");
   // The context is the task's own conversation, where its status line lands.
   assert.match(output, /Held — 1 unread message in #proj-runtime:#7\./);
   assert.match(output, /Your task status update was not applied\./);
+  assert.equal(output.match(/was not applied/g)?.length, 1, "the hold is printed once");
   assert.match(output, /rerun the task update command/);
 });
 
@@ -107,7 +108,7 @@ test("a held task update is counted for the daemon's turn report while passive A
         }),
       }) as any,
     });
-    await taskUpdateCommand.handler(ctx, undefined, { target: "#proj-runtime", number: ["7"], status: "done" });
+    await assert.rejects(async () => { await taskUpdateCommand.handler(ctx, undefined, { target: "#proj-runtime", number: ["7"], status: "done" }); }, (err: unknown) => err instanceof CliError && err.code === "TASK_WRITE_HELD" && err.exitCode === 1);
     const held = stdout.join("");
     assert.deepEqual(readPassiveRenderCountsForTest(agentContext.agentId), [
       { contextId: "ctx-A", kind: "freshness_hold", renders: 1, chars: Array.from(held).length, bytes: Buffer.byteLength(held, "utf8") },
@@ -162,11 +163,11 @@ test("reviewer-isolation task update sends withheld mode and never renders poiso
     }) as any,
   });
 
-  await taskUpdateCommand.handler(ctx, undefined, {
+  await assert.rejects(async () => { await taskUpdateCommand.handler(ctx, undefined, {
     target: "#proj-runtime",
     number: ["7"],
     status: "done",
-  });
+  }); }, (err: unknown) => err instanceof CliError && err.code === "TASK_WRITE_HELD" && err.exitCode === 1);
 
   assert.deepEqual(requests, [{
     channel: "#proj-runtime",

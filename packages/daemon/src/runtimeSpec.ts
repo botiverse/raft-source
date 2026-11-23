@@ -16,20 +16,18 @@ import { hydrateRuntimeConfig, parseRuntimeConfig, runtimeConfigToLaunchFields, 
  *
  * - `runtime`: the launch runtime.
  * - `model`: the launch model.
- * - `runtime_config`: the launch mode and reasoning effort.
+ * - `runtime_config`: the launch mode, reasoning effort, Built-in `loadLocalPlugins`,
+ *   and custom model limits.
  * - `env`: the agent's own env vars (the provider's generated ones are `provider`).
- * - `provider`: the provider (its kind, connection id or preset, URL and key)
- *   and the Claude command. Of a server-managed connection only its id: the
- *   projection a spawn resolves (`providerConnection`) is not compared.
+ * - `provider`: the provider (its kind, preset, URL and key) and the Claude
+ *   command.
  * - `execution_mode`: absent is `byoc`, as the runtime profile reads it.
  * - `managed_mcp` (reconciler step 11): `managedMcpFingerprint`, the server's
  *   fingerprint of the agent's managed MCP servers.
- * - `provider_connection`: `providerConnectionRevision`, the revision of the
- *   server-managed provider connection the launch resolves.
  *
- * The last two are optional (`OPTIONAL_RUNTIME_SPEC_COMPONENTS`): an older
- * server sends neither, so one absent on either side is no drift; they are
- * compared only when both sides carry them.
+ * The last is optional (`OPTIONAL_RUNTIME_SPEC_COMPONENTS`): an older server
+ * does not send it, so absent on either side is no drift; it is compared only
+ * when both sides carry it.
  *
  * Server features are the sixth kind (`features`), decided as before by
  * `serverFeaturesDrift` (serverFeaturesRefresh.ts).
@@ -46,10 +44,10 @@ import { hydrateRuntimeConfig, parseRuntimeConfig, runtimeConfigToLaunchFields, 
  * non-secret facts a host reports; it lives in memory only (on the process),
  * and only the drift kinds ever leave it (traces), never a key or a value.
  */
-export const RUNTIME_SPEC_COMPONENTS = ["runtime", "model", "runtime_config", "env", "provider", "execution_mode", "managed_mcp", "provider_connection"] as const;
+export const RUNTIME_SPEC_COMPONENTS = ["runtime", "model", "runtime_config", "env", "provider", "execution_mode", "managed_mcp"] as const;
 export type RuntimeSpecComponent = typeof RUNTIME_SPEC_COMPONENTS[number];
 /** Compared only when both sides carry one: absent (an older server) is no drift. */
-const OPTIONAL_RUNTIME_SPEC_COMPONENTS: ReadonlySet<RuntimeSpecComponent> = new Set(["managed_mcp", "provider_connection"]);
+const OPTIONAL_RUNTIME_SPEC_COMPONENTS: ReadonlySet<RuntimeSpecComponent> = new Set(["managed_mcp"]);
 /**
  * A drift kind (`daemon.agent.spec_restart_stop` `drift`, comma-joined): a
  * spec component, the server features, or (reconciler step 15) the provider
@@ -116,11 +114,13 @@ function runtimeSpecComponents(config: AgentConfig): Record<RuntimeSpecComponent
     return {
       runtime: launch.runtime,
       model: launch.model,
-      // A custom model's declared limits (#proj-runtime:#50) are launch inputs
-      // too; absent ones canonicalize away, so existing agents keep their hash.
+      // A custom model's declared limits (#proj-runtime:#50) and Built-in's
+      // loadLocalPlugins (#proj-runtime:#80) are launch inputs too; absent /
+      // default-false values canonicalize away, so existing agents keep their hash.
       runtime_config: {
         mode: launch.mode,
         reasoningEffort: launch.reasoningEffort,
+        loadLocalPlugins: hydrated.runtime === "builtin" && hydrated.loadLocalPlugins === true ? true : undefined,
         modelLimits: hydrated.model.kind === "custom"
           ? { contextWindow: hydrated.model.contextWindow, maxOutputTokens: hydrated.model.maxOutputTokens }
           : undefined,
@@ -133,7 +133,6 @@ function runtimeSpecComponents(config: AgentConfig): Record<RuntimeSpecComponent
       },
       execution_mode: executionMode,
       managed_mcp: config.managedMcpFingerprint,
-      provider_connection: config.providerConnectionRevision,
       // Hydration is lenient (it keeps what it does not know); the strict
       // parse is what says this Computer knows every part of it.
       readable: parseRuntimeConfig(config).ok,
@@ -148,7 +147,6 @@ function runtimeSpecComponents(config: AgentConfig): Record<RuntimeSpecComponent
       provider: config.runtimeConfig ?? undefined,
       execution_mode: executionMode,
       managed_mcp: config.managedMcpFingerprint,
-      provider_connection: config.providerConnectionRevision,
       readable: false,
     };
   }
@@ -206,17 +204,21 @@ export function specChangeNeedsServerStart(
 
 /**
  * Why the next start must open a new session rather than resume the one a
- * process with `startedWith` ran, or null: another runtime cannot read its
- * session, and Codex binds a thread to its model. `runtime_host_changed`
- * (#oar-raft:#10, `runtimeHostSessionDrop`): the agent's runtime now runs on
- * another host whose store cannot read the session.
+ * process with `startedWith` ran, or null:
+ * - `runtime_changed`: another runtime cannot read its session.
+ * - `model_changed` (#proj-runtime:#80): switching models invalidates prompt
+ *   cache on every runtime (and Codex pins the thread's model), so any model
+ *   switch opens a fresh session with constructed initial context. Reasoning
+ *   effort is intentionally excluded (treated as cache-preserving for now).
+ * - `runtime_host_changed` (#oar-raft:#10, `runtimeHostSessionDrop`): the
+ *   agent's runtime now runs on another host whose store cannot read the session.
  */
-export type SessionDropReason = "runtime_changed" | "codex_model_changed" | "runtime_host_changed";
+export type SessionDropReason = "runtime_changed" | "model_changed" | "runtime_host_changed";
 
 /** Words for a log line: what the dropped session started on. */
 export function sessionDropReasonText(reason: SessionDropReason): string {
   if (reason === "runtime_changed") return "another runtime";
-  if (reason === "codex_model_changed") return "another Codex model";
+  if (reason === "model_changed") return "another model";
   return "another runtime host";
 }
 
@@ -258,7 +260,7 @@ export function sessionDropReason(
 ): SessionDropReason | null {
   if (startedWith.readable === false || desired.readable === false) return null;
   if (startedWith.runtime !== desired.runtime) return "runtime_changed";
-  if (startedWith.runtime === "codex" && startedWith.model !== desired.model) return "codex_model_changed";
+  if (startedWith.model !== desired.model) return "model_changed";
   return null;
 }
 
@@ -288,7 +290,7 @@ export type RuntimeSpecReconcileTrigger =
   | "sweep"
   /** Reconciler step 15: an invalid credential was released for a credentials change and now signs in as another account. */
   | "credentials_changed"
-  /** A delivery was queued for a process in a turn (reconciler step 9: its health). */
+  /** A delivery was queued for a process in a turn, or an app notice it refused waits for the turn (reconciler step 9: its health). */
   | "delivery_arrived"
   /** A process with queued work reached the moment it would cross its stall threshold (reconciler step 9). */
   | "stall_deadline";
@@ -296,9 +298,9 @@ export type RuntimeSpecReconcileTrigger =
 /**
  * Reconciler step 7: the runtime and model each agent's last session started
  * on, in memory only (lost with the daemon; the Server then decides: it
- * clears a Codex session on a model change). A start that would resume that
- * session on another runtime, or a Codex session on another model, starts a
- * new one instead (`sessionToDrop`). One per daemon, shared by both hosts.
+ * clears the session on a runtime or model change). A start that would resume
+ * that session on another runtime or model starts a new one instead
+ * (`sessionToDrop`). One per daemon, shared by both hosts.
  */
 export class SessionSpecMemory {
   private readonly sessions = new Map<string, { sessionId: string; runtime: string; model: string }>();
@@ -307,6 +309,16 @@ export class SessionSpecMemory {
   remember(agentId: string, sessionId: string | null | undefined, startedWith: Pick<RuntimeSpecSnapshot, "runtime" | "model">): void {
     if (!sessionId) return;
     this.sessions.set(agentId, { sessionId, runtime: startedWith.runtime, model: startedWith.model });
+  }
+
+  /** The last remembered `(sessionId, runtime, model)` for `agentId`, if any. */
+  sessionOf(agentId: string): { sessionId: string; runtime: string; model: string } | null {
+    return this.sessions.get(agentId) ?? null;
+  }
+
+  /** Forget `agentId` (used on full workspace reset). */
+  forget(agentId: string): void {
+    this.sessions.delete(agentId);
   }
 
   /** Why a start of `agentId` on `config` must not resume `sessionId`, or null. */

@@ -1,0 +1,32 @@
+host: oar
+runtime: cursor
+scenario: server-context-prefix
+promptSource: cold_start_with_memory
+
+## standing prompt
+= standing-prompt.md
+
+## carrier
+launch.options.systemPrompt: (absent)
+launch.options.appendSystemPrompt: (absent)
+launch.options.env.OPENCODE_CONFIG_CONTENT: (absent)
+
+## first input (290 chars, sha256:d16b682699194fbc, the standing prompt written as ⟪STANDING_PROMPT⟫)
+Owner facts: Ada
+
+⟪STANDING_PROMPT⟫
+
+<memory-index file="MEMORY.md" size="0.1 KB" complete="true" note="no need to re-read MEMORY.md unless you change it">
+# Alice
+
+## Role
+Keeps the release notes
+
+## Key Knowledge
+- No notes yet.
+
+## Active Context
+- First startup.
+</memory-index>
+
+Start.

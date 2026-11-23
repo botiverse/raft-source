@@ -82,14 +82,14 @@ test("a v2 task without a source message records its receipt; the follow-up anch
     expiryFollowups: taskResourceExpiryFollowups,
   };
 
-  assert.equal(
+  assert.deepEqual(
     await taskService.recordTaskResourceReceipt({ ...input, receipt: { ...input.receipt, runbook: " " } }),
-    "resource receipt field runbook must be nonblank",
+    { refused: "invalid", code: "task_resource_receipt_invalid", reason: "resource receipt field runbook must be nonblank" },
   );
   assert.equal(await getTaskConversation(task!.id), null, "an invalid receipt writes no line and creates no conversation");
-  assert.equal(
+  assert.deepEqual(
     await taskService.recordTaskResourceReceipt({ ...input, receipt: { ...input.receipt, expiry: "2000-01-01T00:00:00.000Z" } }),
-    "resource receipt expiry must be in the future",
+    { refused: "invalid", code: "task_resource_receipt_invalid", reason: "resource receipt expiry must be in the future" },
   );
   assert.equal(await getTaskConversation(task!.id), null, "a receipt refused inside the transaction (expired) creates no conversation either");
 

@@ -1,12 +1,19 @@
 import { useCallback, useRef } from "react";
 import type { RefObject } from "react";
 import { focusLost } from "../utils/focusGuard";
+import { animationFramesOf, useOwnerDocument } from "../utils/ownerDocument";
 
 type Target = HTMLElement | null | undefined;
 /** Where focus goes back to: an element, or places to try in order (the first that takes it). */
 type Opener = RefObject<Target> | (() => Target | ReadonlyArray<Target>);
 /** How to focus it; a function when that depends on the place found (a row scrolls into view, the list doesn't). */
 type RestoreFocusOptions = FocusOptions | ((target: HTMLElement) => FocusOptions);
+
+/** The places `opener` names now, in order. */
+function openerTargets(opener: Opener): ReadonlyArray<Target> {
+  const resolved = typeof opener === "function" ? opener() : opener.current;
+  return Array.isArray(resolved) ? resolved : [resolved as Target];
+}
 
 /**
  * Focus back to the opener after a non-modal surface closes (a side card, a panel, a selection bar, a notice):
@@ -22,28 +29,30 @@ export function useFocusRestore(opener: Opener, options?: RestoreFocusOptions): 
   const latest = useRef({ opener, options });
   latest.current = { opener, options };
   const pending = useRef<(() => void) | null>(null);
+  // The document this surface is drawn in (an object window's, features/objectWindows): its presses cancel the
+  // restore, its window's frame runs it. The opener itself is read only then (a function opener may act on the page).
+  const doc = useOwnerDocument();
   return useCallback(() => {
     pending.current?.();
+    const view = animationFramesOf(doc);
     let frame = 0;
     const cancel = () => {
-      cancelAnimationFrame(frame);
-      document.removeEventListener("pointerdown", cancel, true);
+      view.cancelAnimationFrame(frame);
+      doc.removeEventListener("pointerdown", cancel, true);
       if (pending.current === cancel) pending.current = null;
     };
     pending.current = cancel;
     // A press before then is the person moving on, wherever it puts focus (the page included).
-    document.addEventListener("pointerdown", cancel, true);
-    frame = requestAnimationFrame(() => {
+    doc.addEventListener("pointerdown", cancel, true);
+    frame = view.requestAnimationFrame(() => {
       cancel();
       const { opener: source, options: focusOptions } = latest.current;
-      const resolved = typeof source === "function" ? source() : source.current;
-      const targets = Array.isArray(resolved) ? resolved : [resolved];
-      for (const target of targets) {
+      for (const target of openerTargets(source)) {
         if (!target?.isConnected || target.closest("[inert]") || !focusLost(target)) continue;
         target.focus(typeof focusOptions === "function" ? focusOptions(target) : focusOptions);
         // One unseen or disabled doesn't take it: the next.
-        if (document.activeElement === target) return;
+        if (target.ownerDocument.activeElement === target) return;
       }
     });
-  }, []);
+  }, [doc]);
 }

@@ -79,6 +79,11 @@ export interface ActivitySnapshot {
   toolStuck?: ToolStuckActivityDiagnostic;
   /** Reconciler step 4b: a re-sent held notice carries its reason too. */
   credentialHold?: CredentialHoldActivityDiagnostic;
+  /**
+   * #proj-runtime:#66: a probe reply re-stating a provider-limit error carries
+   * its typed diagnostic, so the server keeps the error typed.
+   */
+  runtimeError?: RuntimeErrorActivityDiagnostic;
 }
 
 /** Where the process manager hands activity facts. */
@@ -194,6 +199,7 @@ export class LegacyActivitySink implements ActivitySink {
       clientSeq,
       producerFactId,
       isHeartbeat: false,
+      runtimeError: snapshot.runtimeError,
       toolStuck: snapshot.toolStuck,
       credentialHold: snapshot.credentialHold,
     });

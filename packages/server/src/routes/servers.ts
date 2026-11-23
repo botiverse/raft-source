@@ -2,6 +2,9 @@ import { computerAttentionForViewer, computerReadinessForViewer, loadComputerRea
 import { objectActivityUnreadBatch } from "../services/objectActivity";
 import { hideUnfindableAgentsByParam } from "./unfindableAgentGate";
 import { serverSsoRouter } from "./serverSso";
+import { SERVER_NOT_FOUND, serverDataExportsRouter } from "./dataExports";
+import { dataExportEnabledFor } from "../services/dataExport/jobs";
+import { getMemberContextExportEnabled, setMemberContextExportEnabled } from "../services/dataExport/serverSettings";
 import { agentContextViewGrantRouter } from "./agentContextViewGrants";
 import {
   setRequestTraceComputerProbeState,
@@ -85,15 +88,15 @@ import {
   machineLocalReplayFailureCode,
   sendMachineAffinityUnavailable,
 } from "../machineLocalReplay";
-import { AGENT_LOUNGE_FEATURE_FLAG_KEY, asServerId, isRemoteUpgradeSupported, isDaemonInstallKind, evaluateComputerVersionGate, asMachineId, COMPUTER_CAPABILITY_SERVICE_IPC_UNREACHABLE, COMPUTER_CAPABILITY_SUPERVISOR_MUTATIONS, currentDate, FEEDBACK_REPORT_SESSION_RECORD_EVENT, feedbackSessionRecordAnswer, INVALID_EMAIL_MESSAGE, parseChannelSideLayout, PUBLIC_SERVER_FEATURE_FLAG_KEY, RUNTIME_ACCOUNT_USAGE_PROVIDERS, RAFT_CLIENT_CAPABILITIES_HEADER, runtimeAccountUsageReadableWith, runtimeAccountUsageSnapshotForClient, safeParseRuntimeAccountUsageSnapshot, SERVER_NAME_MAX_LENGTH, SERVER_SYSTEM_NOTIFICATIONS_CONTRACT_VERSION, systemAttentionReceiptInputSchema, validateEmailAddress, type ComputerInstallerRepairHint, type FeedbackReportSessionRecordEvent, type RuntimeAccountUsageProvider, type RuntimeModelSourceOutcome, type ServerCapability, type ServerModelLabelCatalog, type MemberRemovalImpact, type ServerPlan, type ServerRole } from "@botiverse/raft-shared";
-import { parseRuntimeFormV2ClientCapabilities, releasedRuntimeFormDefinition, RUNTIME_FORM_V2_CLIENT_CAPABILITIES_QUERY } from "@botiverse/raft-runtime-form";
+import { AGENT_LOUNGE_FEATURE_FLAG_KEY, asServerId, isRemoteUpgradeSupported, isDaemonInstallKind, evaluateComputerVersionGate, asMachineId, COMPUTER_CAPABILITY_SERVICE_IPC_UNREACHABLE, COMPUTER_CAPABILITY_SUPERVISOR_MUTATIONS, currentDate, FEEDBACK_REPORT_SESSION_RECORD_EVENT, feedbackSessionRecordAnswer, INVALID_EMAIL_MESSAGE, parseChannelSideLayout, PUBLIC_SERVER_FEATURE_FLAG_KEY, RUNTIME_ACCOUNT_USAGE_PROVIDERS, RAFT_CLIENT_CAPABILITIES_HEADER, runtimeAccountUsageReadableWith, safeParseRuntimeAccountUsageSnapshot, SERVER_NAME_MAX_LENGTH, SERVER_SYSTEM_NOTIFICATIONS_CONTRACT_VERSION, systemAttentionReceiptInputSchema, validateEmailAddress, type ComputerInstallerRepairHint, type ComputerUpgradeScopeUnavailable, type FeedbackReportSessionRecordEvent, type RuntimeAccountUsageProvider, type RuntimeModelSourceOutcome, type ServerCapability, type ServerDataExportSettings, type ServerModelLabelCatalog, type MemberRemovalImpact, type ServerPlan, type ServerRole } from "@botiverse/raft-shared";
+import { parseRuntimeFormV2ClientCapabilities, RUNTIME_FORM_V2_CLIENT_CAPABILITIES_QUERY } from "@botiverse/raft-runtime-form";
 import { canInspectAgentPrivateSurfaces, myAssistantRouter } from "./agents";
 import { buildChannelMembersView } from "./channels";
 import { assistantWeChatRouter } from "./assistantWeChat";
 import { emitMemberAppearanceUpdated, parseMemberAppearanceInput } from "../lib/memberAppearanceInput";
 import { getAgentUsageRoute } from "./agentUsage";
-import { actorHasServerCapabilityInServer, actorRoleHasServerCapability, getActorServerRoleInServer } from "../lib/actorPermissions";
-import { canManageMachineResource, computerControllerAttachers, computerControllerUserId, controllerUserIdFromAttachers, isManagedComputerMachine } from "../services/computerControlAuthorization";
+import { actorRoleHasServerCapability, getActorServerRoleInServer } from "../lib/actorPermissions";
+import { canManageComputer, canSeeComputerRuntimeAccounts, computerActorAllowed, computerControllerUserId, controllerUserIdFromAttachers, isManagedComputerMachine } from "../services/computerControlAuthorization";
 import { FencedAuthorizationDeniedError, ServerMembershipRevokedError, withActorMembershipFence } from "../lib/actorMembershipFence";
 import { createScopeAttestation } from "../lib/scopeAttestation";
 import { getDb } from "../db/index";
@@ -106,7 +109,9 @@ import { addTraceEvent, createTraceDbQueryTracer, errorClassOf, recordTraceEvent
 import { traceRouteFailure } from "../tracing/routeFailure";
 import { sendJsonServerError } from "./errorResponse";
 import { refuseWithoutRecentSecondFactor } from "./secondFactor";
-import { refuse, RefusalError } from "../lib/refusal";
+import { refuse, RefusalError, sentenceQuoting, type RefusalInput } from "../lib/refusal";
+import { serviceMessageRefusal } from "./agentRouteRefusals";
+import { SERVER_MANAGEMENT_GUEST_REFUSAL } from "../middleware/denyServerGuests";
 import { DeploymentUserLimitError } from "../services/deploymentUserLimit";
 import { readWithStaleOnOverload, resolveSoftTimeoutMs, STALE_RESPONSE_HEADER } from "./rwStaleRead";
 import type { DbQueryTracer } from "../tracing/dbQueryTrace";
@@ -125,12 +130,10 @@ import {
 } from "../services/runtimeAdmissionService";
 import { projectServerRuntimeCatalog } from "../services/serverRuntimeCatalogService";
 import { serverLabsRouter } from "./serverLabs";
-import { builtInPiListOnlyOptionSource, runtimeFormV1Entry } from "../services/runtimeFormDefinitionService";
 import {
-  buildRuntimeFormV2ForServer,
   runtimeFormV2Entry,
   withBuiltInModelLimitVisibility,
-  withoutV2OnlyOptionSourceFields,
+  withCodexSpeedVisibility,
 } from "../services/runtimeFormV2Registry";
 import {
   localizeRuntimeFormV2,
@@ -138,7 +141,7 @@ import {
   runtimeFormCopyLocale,
   setRuntimeFormCopyHeaders,
 } from "../services/runtimeFormV2Copy";
-import { isRuntimeFormV3Request, resolveRuntimeFormV3OptionSource, runtimeFormV3Connections, runtimeFormV3Revision, serveRuntimeFormV3 } from "../services/runtimeFormV3";
+import { isRuntimeFormV3Request, resolveRuntimeFormV3OptionSource, runtimeFormV3Revision, serveRuntimeFormV3 } from "../services/runtimeFormV3";
 import { BuiltInModelCatalogError } from "../services/builtinModelCatalogCompatibility";
 import { evaluateFeatureFlag, evaluateFeatureFlags } from "../services/featureFlagService";
 import {
@@ -152,11 +155,15 @@ import {
 import { RouteFailureError } from "../tracing/routeFailure";
 import { mountRuntimeAuthRoutes } from "./runtimeAuthRoutes";
 import { mountComputerOwnerRoutes } from "./computerOwnerRoutes";
+import { mountComputerProcJobsRoutes } from "./computerProcJobsRoutes";
+import { mountComputerChecksRoutes } from "./computerChecksRoutes";
 import { getComputerOwners } from "../services/computerOwnerService";
 import { computeActivityUnreadCounts } from "../services/activityUnreadSummaryService";
 import { runtimeAccountUsageCacheService } from "../services/runtimeAccountUsageCacheService";
+import { runtimeAccountUsageSnapshotForViewer } from "../services/runtimeAccountUsageViewer";
 import { createBoundedRuntimeFormProbe } from "../services/boundedRuntimeFormProbe";
 import { builtInTypedModelProvidersFor } from "../services/builtInTypedModelProviders";
+import { codexSpeedModelsFor } from "../services/codexSpeedModels";
 import {
   computerProbeCacheFor,
   computerProbeFreshness,
@@ -203,6 +210,39 @@ const ONBOARDING_WIZARD_STEPS = new Set([
 // `defer` is retired (task #172): the endpoint no longer accepts it, so the runtime never
 // writes a new `deferred` row. A POST with action `defer` now returns INVALID_SETUP_ACTION.
 const SERVER_SETUP_ACTIONS = new Set<ServerSetupAction>(["start", "complete"]);
+/**
+ * A member's server read back as gone mid-request (deleted, or the membership
+ * the lockdown saw ended). A non-member never gets here: the lockdown answers
+ * 403 "Not a member of this server" for every server it can't see.
+ */
+const SERVER_NOT_FOUND_REFUSAL: RefusalInput = { code: "server_not_found", error: "Server not found" };
+/**
+ * The caller's own member row, or a role change's target, read back as gone
+ * (the membership ended mid-request, or the target isn't a member here).
+ */
+const MEMBER_NOT_FOUND_REFUSAL: RefusalInput = { code: "member_not_found", error: "Member not found" };
+/**
+ * No profile the viewer may open here: nobody by that id, a person they can't
+ * see, and a `channelId` they can't see all answer this, so none is told apart.
+ */
+const USER_NOT_FOUND_REFUSAL: RefusalInput = { code: "user_not_found", error: "User not found" };
+/**
+ * No machine by that id on this server, said to a member before the route's
+ * capability check and again by its fenced write when the row is gone by then.
+ */
+const MACHINE_NOT_IN_SERVER_REFUSAL: RefusalInput = { code: "machine_not_found", error: "Machine not found in this server" };
+/**
+ * The same case in the runtime routes' own words (runtime options, runtime
+ * account usage, the runtime forms): no machine by that id on this server,
+ * said to a member before the route's capability check.
+ */
+const COMPUTER_NOT_FOUND_REFUSAL: RefusalInput = { code: "machine_not_found", error: "Computer not found" };
+/**
+ * No receipt written for that incident: none by that id that is live on this
+ * server, and a member who isn't an owner or admin, answer this alike
+ * (usageLimitAttentionService writeReceipt), so neither is told apart.
+ */
+const SYSTEM_ATTENTION_INCIDENT_NOT_FOUND_REFUSAL: RefusalInput = { code: "system_attention_incident_not_found", error: "System attention incident not found" };
 
 type ComputerBroadcastPolicyEvaluator = (
   input: Parameters<typeof evaluateBroadcastPolicy>[0],
@@ -235,6 +275,18 @@ async function readInstallerRepairHint(
   machineId: string,
 ): Promise<ComputerInstallerRepairHint | null> {
   return (await orchestrator.getMachineInstallerRepairHint?.(machineId)) ?? null;
+}
+
+/**
+ * The connected Computer's `ready.upgradeScope`: its systemd manager refuses
+ * the scope a web upgrade's installer needs. Null = allowed or unknown
+ * (older Computers, a probe that did not run): nothing changes then.
+ */
+async function readUpgradeScope(
+  orchestrator: Partial<Pick<AgentOrchestrator, "getMachineUpgradeScope">>,
+  machineId: string,
+): Promise<ComputerUpgradeScopeUnavailable | null> {
+  return (await orchestrator.getMachineUpgradeScope?.(machineId)) ?? null;
 }
 
 async function readComputerSourceFact(
@@ -288,18 +340,8 @@ function isRuntimeAccountUsageProvider(value: string): value is RuntimeAccountUs
   return (RUNTIME_ACCOUNT_USAGE_PROVIDERS as readonly string[]).includes(value);
 }
 
-async function canInspectRuntimeAccountUsage(
-  serverId: string,
-  machineId: string,
-  userId: string,
-): Promise<boolean> {
-  const [callerRole, attachers] = await Promise.all([
-    getActorServerRoleInServer(serverId, "user", userId),
-    getComputerLinkedMachineAttachers(serverId),
-  ]);
-  return attachers.get(machineId) === userId
-    || actorRoleHasServerCapability(callerRole, "editMachines");
-}
+/** The attaching human or `editMachines` (canSeeComputerRuntimeAccounts, shared with the Computer's checks). */
+const canInspectRuntimeAccountUsage = canSeeComputerRuntimeAccounts;
 
 function serializeServerNotificationPrefs(prefs: serverService.MemberNotificationPreferences) {
   return {
@@ -901,7 +943,7 @@ serverRouter.patch("/order", async (req, res) => {
     const rawServerOrder = req.body?.serverOrder;
     const normalizedServerOrder = normalizeOrderIds(rawServerOrder);
     if (!normalizedServerOrder) {
-      res.status(400).json({ error: "serverOrder must be an array of string IDs" });
+      refuse(res, 400, { code: "server_order_invalid", error: "serverOrder must be an array of string IDs" });
       return;
     }
 
@@ -1055,7 +1097,7 @@ serverRouter.post("/join-community", async (req, res) => {
     const agreementId = typeof req.body?.agreementId === "string" ? req.body.agreementId : null;
     const rawSlug = req.body?.slug;
     if (rawSlug !== undefined && !inviteService.isCommunityServerSlug(rawSlug)) {
-      res.status(400).json({ error: "Unsupported community server slug" });
+      refuse(res, 400, { code: "community_server_slug_unsupported", error: "Unsupported community server slug" });
       return;
     }
     const result = await inviteService.joinCommunityServer(req.userId!, {
@@ -1093,12 +1135,12 @@ serverRouter.post("/join-community", async (req, res) => {
     }
     const msg = err?.message || "";
     if (msg.includes("not available")) {
-      res.status(404).json({ error: msg });
+      refuse(res, 404, serviceMessageRefusal("community_server_unavailable", msg, "Community server is not available"));
     } else if (msg.includes("already")) {
-      res.status(400).json({ error: msg });
+      refuse(res, 400, serviceMessageRefusal("already_member", msg, "You are already a member of this server"));
     } else if (msg.includes("seat limit") || msg.includes("limit reached")) {
       // The code only: someone joining isn't a member yet, so no numbers.
-      res.status(403).json(err instanceof HumanSeatLimitError ? { error: msg, code: err.code } : { error: msg });
+      refuse(res, 403, serviceMessageRefusal(err instanceof HumanSeatLimitError ? err.code : "community_join_limit_reached", msg, "This server has reached its seat limit, so you can't join it right now."));
     } else {
       sendJsonServerError(req, res, {
         error: "Failed to join community server",
@@ -1119,6 +1161,10 @@ serverRouter.post("/join-community", async (req, res) => {
 // Labs has an exact 403 cross-server contract, so it performs its own scope
 // check before the generic server router's legacy 400 mismatch response.
 serverRouter.use("/:id/labs", serverLabsRouter);
+// Data exports (routes/dataExports.ts): before the lockdown, which refuses
+// closed servers, because an owner may export a closed server's full history
+// until its purge. The router makes the lockdown's checks itself.
+serverRouter.use("/:id/data-exports", serverDataExportsRouter);
 serverRouter.use("/:id", requireServerMatchesParam);
 // SSO settings (rfcs/083-server-sso.md); 404 while server_sso_v1 is off.
 serverRouter.use("/:id/sso", serverSsoRouter);
@@ -1150,7 +1196,7 @@ const guestHiddenServerSurfaces: string[] = [
 serverRouter.use(guestHiddenServerSurfaces, async (req, res, next) => {
   const callerRole = await getActorServerRoleInServer(String(req.params.id), "user", req.userId!);
   if (callerRole === "guest") {
-    res.status(403).json({ error: "Guests can't access server management" });
+    refuse(res, 403, SERVER_MANAGEMENT_GUEST_REFUSAL);
     return;
   }
   next();
@@ -1160,7 +1206,7 @@ serverRouter.get("/:id/agreement", async (req, res) => {
   try {
     const canManageServer = await serverService.userCanEditServerSettings(req.params.id, req.userId!);
     if (!canManageServer) {
-      res.status(403).json({ error: "Only server owners and admins can manage the pre-join agreement" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage the pre-join agreement" });
       return;
     }
     const active = await serverAgreementService.getActiveAgreement(req.params.id);
@@ -1178,7 +1224,7 @@ serverRouter.put("/:id/agreement", async (req, res) => {
   try {
     const canManageServer = await serverService.userCanEditServerSettings(req.params.id, req.userId!);
     if (!canManageServer) {
-      res.status(403).json({ error: "Only server owners and admins can manage the pre-join agreement" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage the pre-join agreement" });
       return;
     }
     const enabled = req.body?.enabled === true;
@@ -1194,7 +1240,7 @@ serverRouter.put("/:id/agreement", async (req, res) => {
   } catch (err: any) {
     const msg = err?.message || "";
     if (msg.includes("required") || msg.includes("characters")) {
-      res.status(400).json({ error: msg });
+      refuse(res, 400, serviceMessageRefusal("server_agreement_invalid", msg, "The pre-join agreement needs a title and a body within the length limit"));
       return;
     }
     sendJsonServerError(req, res, {
@@ -1210,13 +1256,13 @@ serverRouter.delete("/:id", async (req, res) => {
   try {
     const isOwner = await serverService.userIsServerOwnerIncludingDeleted(req.params.id, req.userId!);
     if (!isOwner) {
-      res.status(403).json({ error: "Only the server owner can delete a server" });
+      refuse(res, 403, { code: "server_delete_owner_only", error: "Only the server owner can delete a server" });
       return;
     }
     const memberIds = await serverService.listServerMemberIds(req.params.id);
     const deletion = await serverService.deleteServer(req.params.id, { deletedByUserId: req.userId! });
     if (!deletion) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const io = req.app.get("io") as SocketServer | undefined;
@@ -1243,7 +1289,7 @@ serverRouter.patch("/:id", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!actorRoleHasServerCapability(callerRole, "editServerSettings")) {
-      res.status(403).json({ error: "Only server owners and admins can edit the server profile" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can edit the server profile" });
       return;
     }
 
@@ -1252,16 +1298,16 @@ serverRouter.patch("/:id", async (req, res) => {
 
     if (name !== undefined) {
       if (typeof name !== "string") {
-        res.status(400).json({ error: "Name must be a string" });
+        refuse(res, 400, { code: "server_name_invalid", error: "Name must be a string" });
         return;
       }
       const trimmed = name.trim();
       if (!trimmed) {
-        res.status(400).json({ error: "Name is required" });
+        refuse(res, 400, { code: "server_name_invalid", error: "Name is required" });
         return;
       }
       if (trimmed.length > SERVER_NAME_MAX_LENGTH) {
-        res.status(400).json({ error: `Name must be ${SERVER_NAME_MAX_LENGTH} characters or fewer` });
+        refuse(res, 400, { code: "server_name_invalid", error: `Name must be ${SERVER_NAME_MAX_LENGTH} characters or fewer` });
         return;
       }
       updates.name = trimmed;
@@ -1269,14 +1315,14 @@ serverRouter.patch("/:id", async (req, res) => {
 
     if (hideHumansFromMembers !== undefined) {
       if (typeof hideHumansFromMembers !== "boolean") {
-        res.status(400).json({ error: "hideHumansFromMembers must be a boolean" });
+        refuse(res, 400, { code: "server_hide_humans_invalid", error: "hideHumansFromMembers must be a boolean" });
         return;
       }
       updates.hideHumansFromMembers = hideHumansFromMembers;
     }
 
     if (updates.name === undefined && updates.hideHumansFromMembers === undefined) {
-      res.status(400).json({ error: "At least one field is required" });
+      refuse(res, 400, { code: "server_update_empty", error: "At least one field is required" });
       return;
     }
 
@@ -1284,7 +1330,7 @@ serverRouter.patch("/:id", async (req, res) => {
       audit: { actor: { type: "human", id: req.userId! }, source: "web", actorRole: callerRole },
     });
     if (!updated) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     res.json(updated);
@@ -1298,19 +1344,19 @@ serverRouter.post("/:id/avatar", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!actorRoleHasServerCapability(callerRole, "editServerSettings")) {
-      res.status(403).json({ error: "Only server owners and admins can edit the server profile" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can edit the server profile" });
       return;
     }
 
     const server = await serverService.getServer(req.params.id);
     if (!server) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
 
     const uploaded = await runSingleAvatarUpload(serverAvatarUpload, req);
     if (!uploaded) {
-      res.status(400).json({ error: "No avatar file provided" });
+      refuse(res, 400, { code: "avatar_file_required", error: "No avatar file provided" });
       return;
     }
 
@@ -1319,13 +1365,14 @@ serverRouter.post("/:id/avatar", async (req, res) => {
       audit: { actor: { type: "human", id: req.userId! }, source: "web", actorRole: callerRole },
     });
     if (!updated) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
 
     res.json(updated);
   } catch (err: any) {
     if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
+      // refusal-ok: top-level maxBytes states the limit (as the user and agent avatar uploads in auth.ts and agents.ts answer it); refuse() writes no top-level fields
       res.status(400).json({
         error: PROFILE_AVATAR_TOO_LARGE_MESSAGE,
         errorCode: "PROFILE_AVATAR_TOO_LARGE",
@@ -1334,10 +1381,7 @@ serverRouter.post("/:id/avatar", async (req, res) => {
       return;
     }
     if (err.message?.includes(PROFILE_AVATAR_BAD_FORMAT_MESSAGE)) {
-      res.status(400).json({
-        error: err.message,
-        errorCode: "PROFILE_AVATAR_BAD_FORMAT",
-      });
+      refuse(res, 400, serviceMessageRefusal("PROFILE_AVATAR_BAD_FORMAT", err.message, PROFILE_AVATAR_BAD_FORMAT_MESSAGE));
       return;
     }
     sendJsonServerError(req, res, {
@@ -1362,13 +1406,13 @@ serverRouter.post("/:id/leave", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     if (callerRole === "owner") {
       const ownerCount = await serverService.countOwners(req.params.id);
       if (ownerCount <= 1) {
-        res.status(405).json({ error: "A server must have at least one owner. Add another owner before leaving." });
+        refuse(res, 405, { code: "last_owner", error: "A server must have at least one owner. Add another owner before leaving." });
         return;
       }
     }
@@ -1402,12 +1446,12 @@ serverRouter.get("/:id", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const server = await serverService.getServer(req.params.id);
     if (!server) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     res.json(
@@ -1426,12 +1470,12 @@ serverRouter.get("/:id/settings", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!actorRoleHasServerCapability(callerRole, "viewServerSettings")) {
-      res.status(403).json({ error: "The `viewServerSettings` capability is required to view server settings" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `viewServerSettings` capability is required to view server settings" });
       return;
     }
     const payload = await getServerSettings(req.params.id, req.userId!);
     if (!payload) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     res.json(payload);
@@ -1451,14 +1495,14 @@ serverRouter.get("/:id/audit-events", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!actorRoleHasServerCapability(callerRole, "viewServerSettings")) {
-      res.status(403).json({ error: "The `viewServerSettings` capability is required to view the server audit log" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `viewServerSettings` capability is required to view the server audit log" });
       return;
     }
     let limit = SERVER_AUDIT_EVENTS_DEFAULT_LIMIT;
     if (req.query.limit !== undefined) {
       const parsed = Number(req.query.limit);
       if (typeof req.query.limit !== "string" || !Number.isInteger(parsed) || parsed < 1) {
-        res.status(400).json({ error: "limit must be a positive integer" });
+        refuse(res, 400, { code: "audit_events_limit_invalid", error: "limit must be a positive integer" });
         return;
       }
       limit = Math.min(parsed, SERVER_AUDIT_EVENTS_MAX_LIMIT);
@@ -1467,13 +1511,13 @@ serverRouter.get("/:id/audit-events", async (req, res) => {
     if (req.query.cursor !== undefined) {
       cursor = typeof req.query.cursor === "string" ? decodeServerAuditCursor(req.query.cursor) : null;
       if (!cursor) {
-        res.status(400).json({ error: "cursor must be a nextCursor returned by this endpoint" });
+        refuse(res, 400, { code: "audit_events_cursor_invalid", error: "cursor must be a nextCursor returned by this endpoint" });
         return;
       }
     }
     const parsedFilters = parseServerAuditEventFilters(req.query as Record<string, unknown>);
     if (!parsedFilters.ok) {
-      res.status(400).json({ error: parsedFilters.error });
+      refuse(res, 400, serviceMessageRefusal("audit_events_filter_invalid", parsedFilters.error, "The audit event filters are not valid"));
       return;
     }
     res.setHeader("Cache-Control", "no-store");
@@ -1492,7 +1536,7 @@ serverRouter.get("/:id/onboarding-settings", async (req, res) => {
   try {
     const payload = await getServerSettings(req.params.id, req.userId!);
     if (!payload) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     res.json(payload.settings.onboardSettings);
@@ -1504,10 +1548,17 @@ serverRouter.get("/:id/onboarding-settings", async (req, res) => {
 serverRouter.get("/:id/setup-projection", async (req, res) => {
   const actor = { type: "user" as const, id: req.userId! };
   const orchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
-  // Backstop: a server that committed without its hosted Cindy gets one when its owner
-  // loads setup. Idempotent; a no-op unless antiproton_cindy is on and none exists.
+  // Backstop: a new server that committed without its hosted Cindy gets one when its
+  // owner loads setup. Idempotent; a no-op unless antiproton_cindy is on and none exists.
+  // Only while setup is unfinished: a finished server without an official Cindy (a
+  // greeter-only server, say) never gets one created behind its owner's back.
   const ownerServer = await serverService.getServer(req.params.id);
-  if (ownerServer && ownerServer.ownerId === req.userId && !ownerServer.onboardingAgentId) {
+  if (
+    ownerServer
+    && ownerServer.ownerId === req.userId
+    && !ownerServer.officialOnboardingAgentId
+    && !(await hasServerCompletedSetupForProjection(getDb(), ownerServer.id))
+  ) {
     await ensureHostedCindy({ serverId: ownerServer.id, ownerUserId: ownerServer.ownerId, site: "setup_backstop" });
   }
   const projection = await routeServerSetupStateService(orchestrator).resolveServerSetup({
@@ -1524,7 +1575,7 @@ serverRouter.get("/:id/setup-projection", async (req, res) => {
 // per-server budget and the daily cap still apply. 404 on every other deployment.
 serverRouter.post("/:id/hosted-cindy", async (req, res) => {
   try {
-    const notFound = () => res.status(404).json({ error: "Not found", code: "hosted_cindy_test_entry_unavailable" });
+    const notFound = () => refuse(res, 404, { code: "hosted_cindy_test_entry_unavailable", error: "Not found" });
     if (!isHostedCindyTestEntryDeployment()) {
       notFound();
       return;
@@ -1535,9 +1586,10 @@ serverRouter.post("/:id/hosted-cindy", async (req, res) => {
       return;
     }
     const agentExists = (onboardingAgentId: string | null | undefined) =>
+      // refusal-ok: top-level onboardingAgentId names the agent that is already there (agentRuntimeProviders.api.test.ts pins the body); refuse() writes no top-level fields
       res.status(409).json({ error: "This server already has its onboarding agent.", code: "onboarding_agent_exists", onboardingAgentId: onboardingAgentId ?? null });
-    if (server.onboardingAgentId) {
-      agentExists(server.onboardingAgentId);
+    if (server.officialOnboardingAgentId) {
+      agentExists(server.officialOnboardingAgentId);
       return;
     }
     if (!await isHostedCindyTestEntryAvailable({ serverId: server.id, userId: req.userId! })) {
@@ -1550,13 +1602,13 @@ serverRouter.post("/:id/hosted-cindy", async (req, res) => {
         res.status(201).json({ agentId: result.agentId });
         return;
       case "exists":
-        agentExists((await serverService.getServer(server.id))?.onboardingAgentId);
+        agentExists((await serverService.getServer(server.id))?.officialOnboardingAgentId);
         return;
       case "cap_reached":
-        res.status(429).json({ error: "Today's cloud Cindy limit is reached. Try again tomorrow.", code: "hosted_cindy_cap_reached" });
+        refuse(res, 429, { code: "hosted_cindy_cap_reached", error: "Today's cloud Cindy limit is reached. Try again tomorrow." });
         return;
       case "name_taken":
-        res.status(409).json({ error: "An agent named Cindy already exists on this server.", code: "hosted_cindy_name_taken" });
+        refuse(res, 409, { code: "hosted_cindy_name_taken", error: "An agent named Cindy already exists on this server." });
         return;
       case "disabled":
       case "unavailable":
@@ -1574,6 +1626,7 @@ serverRouter.post("/:id/hosted-cindy", async (req, res) => {
 serverRouter.post("/:id/setup-transition", async (req, res) => {
   const action = req.body?.action;
   if (typeof action !== "string" || !SERVER_SETUP_ACTIONS.has(action as ServerSetupAction)) {
+    // refusal-ok: `error` is a code, not a sentence (servers.api.test.ts pins the body); a sentence and a code move together in their own change
     res.status(400).json({ error: "INVALID_SETUP_ACTION" });
     return;
   }
@@ -1644,12 +1697,13 @@ serverRouter.post("/:id/setup-handoff", async (req, res) => {
   try {
     const server = await serverService.getServer(req.params.id);
     if (!server) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     // The handoff belongs to the owner. An admin can help set a server up; they cannot
     // accept someone else's handoff.
     if (server.ownerId !== req.userId!) {
+      // refusal-ok: `error` is a code, not a sentence (as the setup routes' other refusals); a sentence and a code move together in their own change
       res.status(403).json({ error: "INSUFFICIENT_PERMISSION" });
       return;
     }
@@ -1665,9 +1719,9 @@ serverRouter.post("/:id/setup-handoff", async (req, res) => {
     // booting, the briefing is retried on her next activation (onboardingService owns that).
     const io = req.app.get("io") as SocketServer | undefined;
     const orchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
-    if (io && orchestrator && server.onboardingAgentId) {
+    if (io && orchestrator && server.officialOnboardingAgentId) {
       void onboardingService
-        .triggerOwnerOnboardingOnAgentActivation(io, orchestrator, req.params.id, server.onboardingAgentId)
+        .triggerOwnerOnboardingOnAgentActivation(io, orchestrator, req.params.id, server.officialOnboardingAgentId)
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn(`[Onboarding] Failed to brief onboarding agent on handoff: ${msg}`);
@@ -1688,10 +1742,11 @@ serverRouter.post("/:id/setup-upgrade-prompt", async (req, res) => {
   try {
     const server = await serverService.getServer(req.params.id);
     if (!server) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     if (server.ownerId !== req.userId!) {
+      // refusal-ok: `error` is a code, not a sentence (as the setup routes' other refusals); a sentence and a code move together in their own change
       res.status(403).json({ error: "INSUFFICIENT_PERMISSION" });
       return;
     }
@@ -1713,7 +1768,7 @@ serverRouter.patch("/:id/onboarding-settings", async (req, res) => {
   try {
     const member = await serverService.isMember(req.params.id, req.userId!);
     if (!member) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -1745,39 +1800,39 @@ serverRouter.patch("/:id/onboarding-settings", async (req, res) => {
       );
 
     if (rawOnboardingAgentId !== undefined && !updatesAgent) {
-      res.status(400).json({ error: "onboardingAgentId must be a string or null" });
+      refuse(res, 400, { code: "onboarding_settings_invalid", error: "onboardingAgentId must be a string or null" });
       return;
     }
     if (rawSetupModalReminderOptOut !== undefined && !updatesReminder) {
-      res.status(400).json({ error: "setupModalReminderOptOut must be a boolean" });
+      refuse(res, 400, { code: "onboarding_settings_invalid", error: "setupModalReminderOptOut must be a boolean" });
       return;
     }
     if (rawAgentAllChannelGreetingEnabled !== undefined && !updatesGreeting) {
-      res.status(400).json({ error: "agentAllChannelGreetingEnabled must be a boolean" });
+      refuse(res, 400, { code: "onboarding_settings_invalid", error: "agentAllChannelGreetingEnabled must be a boolean" });
       return;
     }
     if (rawDismissedAddComputerStep !== undefined && !updatesAddComputerStep) {
-      res.status(400).json({ error: "dismissedAddComputerStep must be a boolean" });
+      refuse(res, 400, { code: "onboarding_settings_invalid", error: "dismissedAddComputerStep must be a boolean" });
       return;
     }
     if (rawDismissedCreateAgentStep !== undefined && !updatesCreateAgentStep) {
-      res.status(400).json({ error: "dismissedCreateAgentStep must be a boolean" });
+      refuse(res, 400, { code: "onboarding_settings_invalid", error: "dismissedCreateAgentStep must be a boolean" });
       return;
     }
     if (rawDismissedInviteStep !== undefined && !updatesInviteStep) {
-      res.status(400).json({ error: "dismissedInviteStep must be a boolean" });
+      refuse(res, 400, { code: "onboarding_settings_invalid", error: "dismissedInviteStep must be a boolean" });
       return;
     }
     if (rawDismissedCommunityStep !== undefined && !updatesCommunityStep) {
-      res.status(400).json({ error: "dismissedCommunityStep must be a boolean" });
+      refuse(res, 400, { code: "onboarding_settings_invalid", error: "dismissedCommunityStep must be a boolean" });
       return;
     }
     if (rawDismissedNotificationStep !== undefined && !updatesNotificationStep) {
-      res.status(400).json({ error: "dismissedNotificationStep must be a boolean" });
+      refuse(res, 400, { code: "onboarding_settings_invalid", error: "dismissedNotificationStep must be a boolean" });
       return;
     }
     if (rawOnboardingWizardCurrentStep !== undefined && !updatesWizardCurrentStep) {
-      res.status(400).json({ error: "onboardingWizardCurrentStep must be a valid onboarding wizard step or null" });
+      refuse(res, 400, { code: "onboarding_settings_invalid", error: "onboardingWizardCurrentStep must be a valid onboarding wizard step or null" });
       return;
     }
     if (
@@ -1791,21 +1846,21 @@ serverRouter.patch("/:id/onboarding-settings", async (req, res) => {
       && rawDismissedNotificationStep === undefined
       && rawOnboardingWizardCurrentStep === undefined
     ) {
-      res.status(400).json({ error: "At least one field is required" });
+      refuse(res, 400, { code: "onboarding_settings_empty", error: "At least one field is required" });
       return;
     }
 
     if (rawOnboardingAgentId !== undefined || rawAgentAllChannelGreetingEnabled !== undefined) {
       const canManageServer = await serverService.userCanEditServerSettings(req.params.id, req.userId!);
       if (!canManageServer) {
-        res.status(403).json({ error: "Only server owners and admins can update onboarding settings" });
+        refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can update onboarding settings" });
         return;
       }
 
       if (rawOnboardingAgentId) {
         const agent = await agentService.getAgent(rawOnboardingAgentId);
         if (!agent || agent.serverId !== req.params.id) {
-          res.status(400).json({ error: "Onboarding agent not found in this server" });
+          refuse(res, 400, { code: "onboarding_agent_not_found", error: "Onboarding agent not found in this server" });
           return;
         }
       }
@@ -1842,7 +1897,7 @@ serverRouter.patch("/:id/onboarding-settings", async (req, res) => {
       serverService.getMemberOnboardingPreferences(req.params.id, req.userId!),
     ]);
     if (!settings || !prefs) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -1873,7 +1928,7 @@ serverRouter.get("/:id/product-analytics-settings", async (req, res) => {
     const role = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     const enabled = role ? await serverService.getServerProductAnalyticsEnabled(req.params.id) : null;
     if (!role || enabled === null) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     res.json({
@@ -1889,21 +1944,21 @@ serverRouter.patch("/:id/product-analytics-settings", async (req, res) => {
   try {
     const role = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!role) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     if (!actorRoleHasServerCapability(role, "editServerSettings")) {
-      res.status(403).json({ error: "Only server owners and admins can update product analytics settings" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can update product analytics settings" });
       return;
     }
     const raw = req.body?.productAnalyticsEnabled;
     if (typeof raw !== "boolean") {
-      res.status(400).json({ error: "productAnalyticsEnabled must be a boolean" });
+      refuse(res, 400, { code: "product_analytics_settings_invalid", error: "productAnalyticsEnabled must be a boolean" });
       return;
     }
     const enabled = await serverService.updateServerProductAnalyticsEnabled(req.params.id, raw);
     if (enabled === null) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     res.json({ productAnalyticsEnabled: enabled, canManageProductAnalytics: true });
@@ -1912,18 +1967,70 @@ serverRouter.patch("/:id/product-analytics-settings", async (req, res) => {
   }
 });
 
+// Data export (#triage:#512 design §4 "Owner 的开关", docs/development/data-export.md): the owner's
+// switch "Allow members to export this server's context" (members' personal exports may include other
+// people's messages here). Behind data_export_v0 for the caller and this server (404 while off, as
+// /:id/data-exports); any member, guests included, reads it (on purpose: a boolean that also
+// decides their own personal export), only an owner (exportServerData) changes it, on a web sign-in.
+serverRouter.get("/:id/data-export-settings", async (req, res) => {
+  try {
+    const role = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
+    const enabled = role && await dataExportEnabledFor({ userId: req.userId!, serverId: req.params.id }) ? await getMemberContextExportEnabled(req.params.id) : null;
+    if (!role || enabled === null) {
+      refuse(res, 404, SERVER_NOT_FOUND);
+      return;
+    }
+    res.json({ memberContextExportEnabled: enabled, canManage: actorRoleHasServerCapability(role, "exportServerData") } satisfies ServerDataExportSettings);
+  } catch {
+    res.status(500).json({ error: "Failed to get data export settings" });
+  }
+});
+
+serverRouter.patch("/:id/data-export-settings", async (req, res) => {
+  try {
+    // A person's own web (`full`) sign-in only, as the export routes (routes/dataExports.ts): no agent key,
+    // device login or assistant acting for its owner changes what members may copy out.
+    if (!webSessionFamilyOf(req)) {
+      refuse(res, 403, { code: "session_family_required", error: "Sign in on the web or in the Raft app to change data export settings." });
+      return;
+    }
+    const role = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
+    if (!role || !(await dataExportEnabledFor({ userId: req.userId!, serverId: req.params.id }))) {
+      refuse(res, 404, SERVER_NOT_FOUND);
+      return;
+    }
+    if (!actorRoleHasServerCapability(role, "exportServerData")) {
+      refuse(res, 403, { code: "data_export_owner_only", error: "Only the server's owner can change data export settings." });
+      return;
+    }
+    const raw = req.body?.memberContextExportEnabled;
+    if (typeof raw !== "boolean") {
+      refuse(res, 400, { code: "invalid_request", error: "Send memberContextExportEnabled as true or false." });
+      return;
+    }
+    const enabled = await setMemberContextExportEnabled(req.params.id, raw);
+    if (enabled === null) {
+      refuse(res, 404, SERVER_NOT_FOUND);
+      return;
+    }
+    res.json({ memberContextExportEnabled: enabled, canManage: true } satisfies ServerDataExportSettings);
+  } catch {
+    res.status(500).json({ error: "Failed to update data export settings" });
+  }
+});
+
 // Get translation settings for the current server.
 serverRouter.get("/:id/translation-settings", async (req, res) => {
   try {
     const role = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!role) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
 
     const settings = await serverService.getServerTranslationSettings(req.params.id);
     if (!settings) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -1942,17 +2049,17 @@ serverRouter.patch("/:id/translation-settings", async (req, res) => {
   try {
     const role = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!role) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     if (!actorRoleHasServerCapability(role, "editServerSettings")) {
-      res.status(403).json({ error: "Only server owners and admins can update translation settings" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can update translation settings" });
       return;
     }
 
     const rawTranslationEnabled = req.body?.translationEnabled;
     if (typeof rawTranslationEnabled !== "boolean") {
-      res.status(400).json({ error: "translationEnabled must be a boolean" });
+      refuse(res, 400, { code: "translation_settings_invalid", error: "translationEnabled must be a boolean" });
       return;
     }
 
@@ -1960,7 +2067,7 @@ serverRouter.patch("/:id/translation-settings", async (req, res) => {
       translationEnabled: rawTranslationEnabled,
     });
     if (!settings) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -1979,13 +2086,13 @@ serverRouter.get("/:id/notification-settings", async (req, res) => {
   try {
     const member = await serverService.isMember(req.params.id, req.userId!);
     if (!member) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
 
     const prefs = await serverService.getMemberNotificationPreferences(req.params.id, req.userId!);
     if (!prefs) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -2003,7 +2110,7 @@ serverRouter.patch("/:id/notification-settings", async (req, res) => {
   try {
     const member = await serverService.isMember(req.params.id, req.userId!);
     if (!member) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -2011,11 +2118,11 @@ serverRouter.patch("/:id/notification-settings", async (req, res) => {
     const rawServerPushMuted = req.body?.serverPushMuted;
     const validMode = rawServerPushMode === "all" || rawServerPushMode === "mentions" || rawServerPushMode === "none";
     if (rawServerPushMode !== undefined && !validMode) {
-      res.status(400).json({ error: "serverPushMode must be one of all, mentions, none" });
+      refuse(res, 400, { code: "notification_settings_invalid", error: "serverPushMode must be one of all, mentions, none" });
       return;
     }
     if (rawServerPushMode === undefined && typeof rawServerPushMuted !== "boolean") {
-      res.status(400).json({ error: "serverPushMode or serverPushMuted is required" });
+      refuse(res, 400, { code: "notification_settings_empty", error: "serverPushMode or serverPushMuted is required" });
       return;
     }
 
@@ -2025,7 +2132,7 @@ serverRouter.patch("/:id/notification-settings", async (req, res) => {
         : { serverPushMuted: rawServerPushMuted as boolean }),
     });
     if (!prefs) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -2045,7 +2152,7 @@ serverRouter.get("/:id/appearance-settings", async (req, res) => {
   try {
     const appearance = await serverService.getMemberAppearance(req.params.id, req.userId!);
     if (!appearance) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     res.json(appearance);
@@ -2058,16 +2165,17 @@ serverRouter.patch("/:id/appearance-settings", async (req, res) => {
   try {
     const parsed = parseMemberAppearanceInput(req.body?.theme, req.body?.themeDecor);
     if (!parsed.ok) {
+      // refusal-ok: error is the bare code invalid_theme for an unknown theme (parseMemberAppearanceInput), not a sentence; a sentence and a code are a change of their own
       res.status(400).json({ error: parsed.error });
       return;
     }
     if (Object.keys(parsed.input).length === 0) {
-      res.status(400).json({ error: "theme or themeDecor is required" });
+      refuse(res, 400, { code: "appearance_settings_empty", error: "theme or themeDecor is required" });
       return;
     }
     const appearance = await serverService.updateMemberAppearance(req.params.id, req.userId!, parsed.input);
     if (!appearance) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     emitMemberAppearanceUpdated(req.app.get("io") as SocketServer | undefined, req.userId!, req.params.id, appearance);
@@ -2084,12 +2192,12 @@ serverRouter.post("/:id/scope-attestation", async (req, res) => {
     const allowed = await canCreateScopeAttestation(req.params.id, req.userId!, scope);
 
     if (allowed == null) {
-      res.status(400).json({ error: `Unsupported scope: ${scope}` });
+      refuse(res, 400, { code: "scope_attestation_scope_unsupported", error: sentenceQuoting([scope], `Unsupported scope: ${scope}`, "Unsupported scope") });
       return;
     }
 
     if (!allowed) {
-      res.status(403).json({ error: "You are not authorized for the requested scope" });
+      refuse(res, 403, { code: "insufficient_role", error: "You are not authorized for the requested scope" });
       return;
     }
 
@@ -2100,7 +2208,7 @@ serverRouter.post("/:id/scope-attestation", async (req, res) => {
     ]);
 
     if (!server) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -2135,7 +2243,7 @@ serverRouter.post("/:id/scope-attestation", async (req, res) => {
       return;
     }
     if (message === "Request body must be a JSON object" || message === "scope is required" || message.startsWith("Unsupported scope:")) {
-      res.status(400).json({ error: message });
+      refuse(res, 400, serviceMessageRefusal("scope_attestation_request_invalid", message, "The scope attestation request is not valid"));
       return;
     }
     res.status(500).json({ error: "Failed to create scope attestation" });
@@ -2147,7 +2255,7 @@ serverRouter.get("/:id/usage", async (req, res) => {
   try {
     const member = await serverService.isMember(req.params.id, req.userId!);
     if (!member) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const [agents, machines, channels] = await Promise.all([
@@ -2166,12 +2274,12 @@ serverRouter.get("/:id/members", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (callerRole === "guest") {
-      res.status(403).json({ error: "Guests can't access server management" });
+      refuse(res, 403, SERVER_MANAGEMENT_GUEST_REFUSAL);
       return;
     }
     const member = await serverService.isMember(req.params.id, req.userId!);
     if (!member) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     // Guests are listed to owners/admins only; each carries its bound channel
@@ -2235,12 +2343,12 @@ serverRouter.get("/:id/sidebar-order", async (req, res) => {
       }),
     );
     if (!member) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const responseOrder = await loadSidebarOrderResponse(req.params.id, req.userId!);
     if (!responseOrder) {
-      res.status(404).json({ error: "Member not found" });
+      refuse(res, 404, MEMBER_NOT_FOUND_REFUSAL);
       return;
     }
     addTraceEvent("response.ready", {
@@ -2270,7 +2378,7 @@ serverRouter.patch("/:id/sidebar-order", async (req, res) => {
   try {
     const member = await serverService.isMember(req.params.id, req.userId!);
     if (!member) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -2334,18 +2442,18 @@ serverRouter.patch("/:id/sidebar-order", async (req, res) => {
       || (rawSectionsVersion !== undefined && (!Number.isInteger(rawSectionsVersion) || rawSectionsVersion < 0))
       || (rawChannelSideLayout !== undefined && rawChannelSideLayout !== null && !normalizedChannelSideLayout)
     ) {
-      res.status(400).json({ error: "Invalid sidebar order, pinned, or custom section fields" });
+      refuse(res, 400, { code: "sidebar_order_invalid", error: "Invalid sidebar order, pinned, or custom section fields" });
       return;
     }
 
     const hasLegacyPinnedFields = normalizedPinnedChannelIds !== undefined || normalizedPinnedAgentIds !== undefined || normalizedPinnedOrder !== undefined;
     if (normalizedPinned !== undefined && hasLegacyPinnedFields) {
-      res.status(400).json({ error: "pinned cannot be combined with pinnedChannelIds, pinnedAgentIds, or pinnedOrder" });
+      refuse(res, 400, { code: "sidebar_order_pinned_conflict", error: "pinned cannot be combined with pinnedChannelIds, pinnedAgentIds, or pinnedOrder" });
       return;
     }
 
     if (normalizedChannelOrder === undefined && normalizedAgentOrder === undefined && normalizedDmOrder === undefined && normalizedChannelSortMode === undefined && normalizedJointChannelSortMode === undefined && normalizedDmSortMode === undefined && normalizedPinnedSortMode === undefined && normalizedPinnedChannelIds === undefined && normalizedPinnedAgentIds === undefined && normalizedPinnedOrder === undefined && normalizedPinned === undefined && normalizedHiddenDmIds === undefined && normalizedChannelPanelTabOrder === undefined && normalizedAgentPanelTabOrder === undefined && normalizedCustomSections === undefined && normalizedSectionOrder === undefined && normalizedSectionPlacements === undefined && normalizedChannelSideLayout === undefined) {
-      res.status(400).json({ error: "At least one field is required" });
+      refuse(res, 400, { code: "sidebar_order_empty", error: "At least one field is required" });
       return;
     }
 
@@ -2358,11 +2466,12 @@ serverRouter.patch("/:id/sidebar-order", async (req, res) => {
     if (hasPinnedUpdateFields || hasSectionUpdateFields) {
       currentPinnedOrder = await serverService.getMemberSidebarOrder(req.params.id, req.userId!);
       if (!currentPinnedOrder) {
-        res.status(404).json({ error: "Member not found" });
+        refuse(res, 404, MEMBER_NOT_FOUND_REFUSAL);
         return;
       }
     }
     if (hasSectionUpdateFields && rawSectionsVersion !== currentPinnedOrder!.sectionsVersion) {
+      // refusal-ok: top-level sectionsVersion states the version the member's other client wrote; refuse() writes no top-level fields
       res.status(409).json({
         error: "Sidebar sections changed on another client",
         code: "SIDEBAR_SECTIONS_VERSION_CONFLICT",
@@ -2425,6 +2534,7 @@ serverRouter.patch("/:id/sidebar-order", async (req, res) => {
       if (hasSectionUpdateFields) {
         const latestOrder = await serverService.getMemberSidebarOrder(req.params.id, req.userId!);
         if (latestOrder) {
+          // refusal-ok: top-level sectionsVersion states the version the member's other client wrote; refuse() writes no top-level fields
           res.status(409).json({
             error: "Sidebar sections changed on another client",
             code: "SIDEBAR_SECTIONS_VERSION_CONFLICT",
@@ -2433,7 +2543,7 @@ serverRouter.patch("/:id/sidebar-order", async (req, res) => {
           return;
         }
       }
-      res.status(404).json({ error: "Member not found" });
+      refuse(res, 404, MEMBER_NOT_FOUND_REFUSAL);
       return;
     }
     // PATCH is authoritative to the Web store in the same way GET is. Re-read
@@ -2444,7 +2554,7 @@ serverRouter.patch("/:id/sidebar-order", async (req, res) => {
       req.userId!,
     );
     if (!sanitizedSidebarOrder) {
-      res.status(404).json({ error: "Member not found" });
+      refuse(res, 404, MEMBER_NOT_FOUND_REFUSAL);
       return;
     }
     const responseOrder = hydrateSidebarPinnedResponse(sanitizedSidebarOrder, allowedIds);
@@ -2462,13 +2572,13 @@ serverRouter.patch("/:id/members/:memberId", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!actorRoleHasServerCapability(callerRole, "changeMemberRoles")) {
-      res.status(403).json({ error: "Only server owners and admins can change member roles" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can change member roles" });
       return;
     }
 
     const { role } = req.body as { role?: ServerRole };
     if (!role || !(["owner", "admin", "member", "guest"] as const).includes(role)) {
-      res.status(400).json({ error: "Role must be owner, admin, member, or guest" });
+      refuse(res, 400, { code: "server_member_role_invalid", error: "Role must be owner, admin, member, or guest" });
       return;
     }
     // A Guest leaving the role drops their channel binding (transitionMemberRole).
@@ -2501,18 +2611,20 @@ serverRouter.patch("/:id/members/:memberId", async (req, res) => {
   } catch (err) {
     if (err instanceof serverService.ServerMemberRoleTransitionError) {
       if (err.code === "target_not_member") {
-        res.status(404).json({ error: "Member not found" });
+        refuse(res, 404, MEMBER_NOT_FOUND_REFUSAL);
         return;
       }
       if (err.code === "last_owner") {
-        res.status(400).json({ error: "A server must have at least one owner" });
+        refuse(res, 400, { code: "last_owner", error: "A server must have at least one owner" });
         return;
       }
-      res.status(403).json({ error: "You are not allowed to make that role change" });
+      // The same sentence and code as the agent's role change (agents.ts; docs/contracts/agent-api-refusals.md).
+      refuse(res, 403, { code: "insufficient_role", error: "You are not allowed to make that role change" });
       return;
     }
     if (err instanceof HumanSeatLimitError) {
       notePaywallHit(req, "seat_limit_invite");
+      // refusal-ok: top-level capacityLimit carries the seat numbers HumanDetailPanel opens Add seats with; refuse() writes no top-level fields
       res.status(409).json({ error: err.message, code: err.code, capacityLimit: err.detail });
       return;
     }
@@ -2552,7 +2664,7 @@ async function resolveProfileChannelServers(
   );
   const row = view.humans.find((human) => human.id === memberId);
   if (!row) return [];
-  return "servers" in row && row.servers ? row.servers.map(({ id, name, slug }) => ({ id, name, slug })) : [];
+  return "servers" in row && row.servers ? row.servers.map(({ id, name, slug, avatarUrl }) => ({ id, name, slug, avatarUrl: avatarUrl ?? null })) : [];
 }
 
 // Get a human profile in the context of this server, even if they were removed.
@@ -2569,14 +2681,14 @@ serverRouter.get("/:id/members/:memberId/profile", async (req, res) => {
   try {
     const member = await serverService.isMember(req.params.id, req.userId!);
     if (!member) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const channelServers = req.query.channelId === undefined
       ? undefined
       : await resolveProfileChannelServers(req, req.query.channelId, req.params.memberId);
     if (channelServers === null) {
-      res.status(404).json({ error: "User not found" });
+      refuse(res, 404, USER_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -2619,7 +2731,7 @@ serverRouter.get("/:id/members/:memberId/profile", async (req, res) => {
       }
     }
     if (!profile) {
-      res.status(404).json({ error: "User not found" });
+      refuse(res, 404, USER_NOT_FOUND_REFUSAL);
       return;
     }
     let body: (ServerMemberProfile | ChannelScopedHumanProfile) & { servers?: channelService.ChannelMemberServer[] } = profile;
@@ -2659,11 +2771,15 @@ async function checkMemberRemoval(
     return { ok: false, status: 403, error: "Only server owners and admins can remove members" };
   }
   if (memberId === callerUserId) return { ok: false, status: 400, error: "You cannot remove yourself" };
-  const targetRole = await getActorServerRoleInServer(serverId, "user", memberId);
+  // The row, a deleted account's kept membership included: whether there is
+  // someone to remove, not what authority they hold.
+  const targetRole = await serverService.getMemberRoleIncludingRetired(serverId, memberId);
   if (!targetRole) return { ok: false, status: 404, error: "Member not found" };
   if (targetRole === "owner") {
     if (callerRole !== "owner") return { ok: false, status: 403, error: "Only server owners can remove owners" };
-    if (await serverService.countOwners(serverId) <= 1) return { ok: false, status: 400, error: "A server must have at least one owner" };
+    // The live owners left once this row is gone: a deleted account's kept
+    // owner row counts for none, so removing it never trips this.
+    if (await serverService.countOwners(serverId, { excludingUserId: memberId }) < 1) return { ok: false, status: 400, error: "A server must have at least one owner" };
   } else if (callerRole !== "owner" && targetRole !== "member" && targetRole !== "guest") {
     // An admin removes members and Guests (design D1); only an owner removes admins.
     return { ok: false, status: 403, error: "Only an owner can remove admins" };
@@ -2735,12 +2851,12 @@ serverRouter.post("/:id/invites", async (req, res) => {
   try {
     const rawEmail = typeof req.body.email === "string" ? req.body.email.trim() : "";
     if (!rawEmail) {
-      res.status(400).json({ error: "Email is required" });
+      refuse(res, 400, { code: "invite_email_required", error: "Email is required" });
       return;
     }
     const emailError = validateEmailAddress(rawEmail);
     if (emailError) {
-      res.status(400).json({ error: emailError });
+      refuse(res, 400, { code: "invite_email_invalid", error: emailError });
       return;
     }
 
@@ -2748,20 +2864,20 @@ serverRouter.post("/:id/invites", async (req, res) => {
     // this gate already restricts who may pick a role below — no second check.
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!actorRoleHasServerCapability(callerRole, "inviteMembers")) {
-      res.status(403).json({ error: "Only server owners and admins can send invites" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can send invites" });
       return;
     }
 
     const rawRole = req.body.role;
     if (rawRole !== undefined && rawRole !== "member" && rawRole !== "guest") {
-      res.status(400).json({ error: "role must be one of: member, guest" });
+      refuse(res, 400, { code: "invite_role_invalid", error: "role must be one of: member, guest" });
       return;
     }
     if (rawRole === "guest") {
       // Refused, not silently downgraded (an inviter who picked Guest must not
       // hand out Member access unawares). A Guest belongs to one channel and
       // is invited to that channel, never to the server (#wg-rbac:#15).
-      res.status(400).json({ error: "Guests are invited to one channel, not to the server" });
+      refuse(res, 400, { code: "invite_guest_channel_only", error: "Guests are invited to one channel, not to the server" });
       return;
     }
 
@@ -2774,11 +2890,12 @@ serverRouter.post("/:id/invites", async (req, res) => {
       refuse(res, err.status, err.refusal);
     } else if (err instanceof HumanSeatLimitError) {
       notePaywallHit(req, "seat_limit_invite");
+      // refusal-ok: top-level capacityLimit carries the seat numbers (servers.api.test.ts pins them); refuse() writes no top-level fields
       res.status(400).json({ error: msg, code: err.code, capacityLimit: err.detail });
     } else if (msg === INVALID_EMAIL_MESSAGE || msg.includes("seat limit") || msg.includes("limit reached")) {
-      res.status(400).json({ error: msg });
+      refuse(res, 400, msg === INVALID_EMAIL_MESSAGE ? { code: "invite_email_invalid", error: msg } : serviceMessageRefusal("invite_limit_reached", msg, "This server has reached its seat limit, so you can't invite anyone right now."));
     } else if (msg.includes("already")) {
-      res.status(409).json({ error: msg });
+      refuse(res, 409, serviceMessageRefusal(msg.includes("already a member") ? "already_member" : "invite_already_sent", msg, "This person is already a member of this server or already has an invite"));
     } else {
       sendJsonServerError(req, res, {
         error: "Failed to create invite",
@@ -2794,7 +2911,7 @@ serverRouter.get("/:id/invites", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!actorRoleHasServerCapability(callerRole, "inviteMembers")) {
-      res.status(403).json({ error: "Only server owners and admins can view invites" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can view invites" });
       return;
     }
 
@@ -2810,7 +2927,7 @@ serverRouter.delete("/:id/invites/:inviteId", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!actorRoleHasServerCapability(callerRole, "inviteMembers")) {
-      res.status(403).json({ error: "Only server owners and admins can revoke invites" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can revoke invites" });
       return;
     }
 
@@ -2826,7 +2943,7 @@ serverRouter.post("/:id/join-links", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!actorRoleHasServerCapability(callerRole, "inviteMembers")) {
-      res.status(403).json({ error: "Only server owners and admins can create join links" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can create join links" });
       return;
     }
 
@@ -2835,11 +2952,11 @@ serverRouter.post("/:id/join-links", async (req, res) => {
     const parsedMaxUses = maxUses === undefined || maxUses === null || maxUses === "" ? null : Number(maxUses);
 
     if (parsedExpiresAt && Number.isNaN(parsedExpiresAt.getTime())) {
-      res.status(400).json({ error: "expiresAt must be a valid date" });
+      refuse(res, 400, { code: "join_link_expires_at_invalid", error: "expiresAt must be a valid date" });
       return;
     }
     if (parsedMaxUses != null && (!Number.isInteger(parsedMaxUses) || parsedMaxUses < 1)) {
-      res.status(400).json({ error: "maxUses must be a positive integer" });
+      refuse(res, 400, { code: "join_link_max_uses_invalid", error: "maxUses must be a positive integer" });
       return;
     }
 
@@ -2852,7 +2969,8 @@ serverRouter.post("/:id/join-links", async (req, res) => {
   } catch (err: any) {
     const msg = err?.message || "";
     if (msg.includes("Max uses") || msg.includes("Expires at") || msg.includes("seat limit") || msg.includes("limit reached")) {
-      res.status(400).json({ error: msg });
+      const code = msg.includes("Max uses") ? "join_link_max_uses_invalid" : msg.includes("Expires at") ? "join_link_expires_at_invalid" : err instanceof HumanSeatLimitError ? err.code : "join_link_limit_reached";
+      refuse(res, 400, serviceMessageRefusal(code, msg, "A join link can't be created with these settings right now"));
       return;
     }
     sendJsonServerError(req, res, {
@@ -2868,7 +2986,7 @@ serverRouter.get("/:id/join-links", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!actorRoleHasServerCapability(callerRole, "inviteMembers")) {
-      res.status(403).json({ error: "Only server owners and admins can view join links" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can view join links" });
       return;
     }
 
@@ -2884,7 +3002,7 @@ serverRouter.delete("/:id/join-links/:linkId", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!actorRoleHasServerCapability(callerRole, "inviteMembers")) {
-      res.status(403).json({ error: "Only server owners and admins can revoke join links" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can revoke join links" });
       return;
     }
 
@@ -2907,7 +3025,7 @@ serverRouter.get("/:id/system-notifications", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -2967,7 +3085,7 @@ serverRouter.get("/:id/system-notifications-v2", async (req, res) => {
 serverRouter.post("/:id/system-notifications-v2/:incidentId/seen", async (req, res) => {
   const parsed = systemAttentionReceiptInputSchema.safeParse({ incidentId: req.params.incidentId });
   if (!parsed.success) {
-    res.status(400).json({ error: "Invalid system attention incident" });
+    refuse(res, 400, { code: "system_attention_incident_invalid", error: "Invalid system attention incident" });
     return;
   }
   try {
@@ -2977,7 +3095,7 @@ serverRouter.post("/:id/system-notifications-v2/:incidentId/seen", async (req, r
       parsed.data.incidentId,
     );
     if (!updated) {
-      res.status(404).json({ error: "System attention incident not found" });
+      refuse(res, 404, SYSTEM_ATTENTION_INCIDENT_NOT_FOUND_REFUSAL);
       return;
     }
     res.json({ ok: true });
@@ -2989,7 +3107,7 @@ serverRouter.post("/:id/system-notifications-v2/:incidentId/seen", async (req, r
 serverRouter.post("/:id/system-notifications-v2/:incidentId/dismiss", async (req, res) => {
   const parsed = systemAttentionReceiptInputSchema.safeParse({ incidentId: req.params.incidentId });
   if (!parsed.success) {
-    res.status(400).json({ error: "Invalid system attention incident" });
+    refuse(res, 400, { code: "system_attention_incident_invalid", error: "Invalid system attention incident" });
     return;
   }
   try {
@@ -2999,7 +3117,7 @@ serverRouter.post("/:id/system-notifications-v2/:incidentId/dismiss", async (req
       parsed.data.incidentId,
     );
     if (!updated) {
-      res.status(404).json({ error: "System attention incident not found" });
+      refuse(res, 404, SYSTEM_ATTENTION_INCIDENT_NOT_FOUND_REFUSAL);
       return;
     }
     res.json({ ok: true });
@@ -3051,11 +3169,10 @@ export async function buildMachineList(input: {
   // still follow the whole list's order.
   const onlyIds = machineIds ? new Set(machineIds) : null;
   const machines = onlyIds ? allMachines.filter((m) => onlyIds.has(m.id)) : allMachines;
-  const [computerLinkedMachineAttachers, computerLinkedMachineCreators, computerOwners, controllerAttachers] = await Promise.all([
+  const [computerLinkedMachineAttachers, computerLinkedMachineCreators, computerOwners] = await Promise.all([
     getComputerLinkedMachineAttachers(serverId),
     getComputerLinkedMachineCreators(serverId),
     getComputerOwners(serverId),
-    computerControllerAttachers(getDb(), serverId),
   ]);
   const agentCountsByMachine = await machineService.countActiveAgentsByMachine(serverId, { userId }, {
     traceQuery: createTraceDbQueryTracer("machines.agent_counts.loaded"),
@@ -3077,9 +3194,9 @@ export async function buildMachineList(input: {
           ...readModel,
           creator: computerLinkedMachineCreators.get(m.id) ?? null,
           // Whether the viewer is the machine's controller, as the routes decide it
-          // (computerControllerUserId): after a revoke this stays with the person it
-          // was attached by, while computerAttachedByCurrentUser and creator are empty.
-          controlledByCurrentUser: controllerUserIdFromAttachers(controllerAttachers, m) === userId,
+          // (computerControllerUserId): the person its live Computer is attached by,
+          // else no one (revoked, a raw daemon, or a live record naming no one).
+          controlledByCurrentUser: controllerUserIdFromAttachers(computerLinkedMachineAttachers, m) === userId,
           // Computer owner v1: who Raft records as its owner; null = Public.
           owner: computerOwners.get(m.id) ?? null,
           ...(sameMachineGroups ? { sameMachineGroup: sameMachineGroups.get(m.id) ?? null } : {}),
@@ -3155,6 +3272,8 @@ export async function buildMachineList(input: {
       // Advisory (#proj-raft-computer task #34): the web recommends the
       // install command next to Upgrade; it does not change eligibility.
       installerRepairHint: await readInstallerRepairHint(agentOrchestrator, machine.id),
+      // The web hides Upgrade for an explicit refusal (null: as before).
+      upgradeScope: await readUpgradeScope(agentOrchestrator, machine.id),
       upgradeRequest: upgradeRequestRow ? projectComputerUpgradeRequest(upgradeRequestRow, agentOrchestrator.getComputerUpgradeDrain(machine.id)) : null,
       remoteUpgradeSupported: isRemoteUpgradeSupported(machine.computerVersion),
     };
@@ -3236,11 +3355,11 @@ serverRouter.get("/:id/machines", async (req, res) => {
       }),
     );
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     if (!actorRoleHasServerCapability(callerRole, "viewMachines")) {
-      res.status(403).json({ error: "The `viewMachines` capability is required to list machines" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `viewMachines` capability is required to list machines" });
       return;
     }
     const { body, responseReady } = await buildMachineList({
@@ -3261,16 +3380,16 @@ serverRouter.post("/:id/machines", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     if (!actorRoleHasServerCapability(callerRole, "registerMachines")) {
-      res.status(403).json({ error: "The `registerMachines` capability is required to register machines" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `registerMachines` capability is required to register machines" });
       return;
     }
     const { name } = req.body;
     if (!name) {
-      res.status(400).json({ error: "Name is required" });
+      refuse(res, 400, { code: "machine_name_invalid", error: "Name is required" });
       return;
     }
     // Issues a machine key: with two-step verification on, this web sign-in
@@ -3295,11 +3414,11 @@ serverRouter.post("/:id/machines", async (req, res) => {
     res.json({ machine, apiKey: result.apiKey });
   } catch (err: any) {
     if (err instanceof ServerMembershipRevokedError) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     if (err instanceof FencedAuthorizationDeniedError) {
-      res.status(403).json({ error: "The `registerMachines` capability is required to register machines" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `registerMachines` capability is required to register machines" });
       return;
     }
     if (err instanceof DeviceSessionRevokedError) {
@@ -3308,7 +3427,8 @@ serverRouter.post("/:id/machines", async (req, res) => {
     }
     const msg = err?.message || "";
     if (msg.includes("limit reached")) {
-      res.status(400).json({ error: msg });
+      // The service's own sentence (machineService: "Machine limit reached (n/m on X plan). Upgrade for more.").
+      refuse(res, 400, serviceMessageRefusal("machine_limit_reached", msg, "Machine limit reached for this server's plan: upgrade the plan to add more."));
     } else {
       res.status(500).json({ error: "Failed to register machine" });
     }
@@ -3320,41 +3440,41 @@ serverRouter.patch("/:id/machines/:machineId", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const machine = await machineService.getMachine(asMachineId(req.params.machineId));
     if (!machine || machine.serverId !== req.params.id) {
-      res.status(404).json({ error: "Machine not found in this server" });
+      refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
       return;
     }
-    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "editMachines")) {
-      res.status(403).json({ error: "The `editMachines` capability or machine creator authority is required to edit machines" });
+    if (!await canManageComputer(getDb(), { userId: req.userId!, role: callerRole }, req.params.id, machine, "edit")) {
+      refuse(res, 403, { code: "insufficient_role", error: "The `editMachines` capability or machine creator authority is required to edit machines" });
       return;
     }
     const { name, description } = req.body ?? {};
     const updates: { name?: string; description?: string | null } = {};
     if (name !== undefined) {
       if (typeof name !== "string" || !name.trim()) {
-        res.status(400).json({ error: "Name is required" });
+        refuse(res, 400, { code: "machine_name_invalid", error: "Name is required" });
         return;
       }
       updates.name = name.trim();
     }
     if (description !== undefined) {
       if (description !== null && typeof description !== "string") {
-        res.status(400).json({ error: "Description must be a string" });
+        refuse(res, 400, { code: "machine_description_invalid", error: "Description must be a string" });
         return;
       }
       const nextDescription = typeof description === "string" ? description.trim() : null;
       if (nextDescription && nextDescription.length > 500) {
-        res.status(400).json({ error: "Description must be 500 characters or less" });
+        refuse(res, 400, { code: "machine_description_invalid", error: "Description must be 500 characters or less" });
         return;
       }
       updates.description = nextDescription || null;
     }
     if (updates.name === undefined && updates.description === undefined) {
-      res.status(400).json({ error: "Name or description is required" });
+      refuse(res, 400, { code: "machine_update_empty", error: "Name or description is required" });
       return;
     }
     // Task #91: re-authorize inside the write transaction under a share lock on the caller's membership row,
@@ -3367,7 +3487,7 @@ serverRouter.patch("/:id/machines/:machineId", async (req, res) => {
         .where(eq(machinesTable.id, req.params.machineId))
         .for("update");
       if (!lockedMachine || lockedMachine.serverId !== req.params.id) throw new FencedAuthorizationDeniedError("not_found");
-      if (!await canManageMachineResource(tx, req.params.id, lockedRole, req.userId!, lockedMachine, "editMachines")) {
+      if (!await canManageComputer(tx, { userId: req.userId!, role: lockedRole }, req.params.id, lockedMachine, "edit")) {
         throw new FencedAuthorizationDeniedError("forbidden");
       }
       return machineService.updateMachine(req.params.machineId, updates, { executor: tx });
@@ -3380,14 +3500,14 @@ serverRouter.patch("/:id/machines/:machineId", async (req, res) => {
     res.json(withoutMachineKeySecrets(updated));
   } catch (error) {
     if (error instanceof ServerMembershipRevokedError) {
-      res.status(403).json({ error: error.message });
+      refuse(res, 403, { code: error.code, error: error.message });
       return;
     }
     if (error instanceof FencedAuthorizationDeniedError) {
       if (error.reason === "not_found") {
-        res.status(404).json({ error: "Machine not found in this server" });
+        refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
       } else {
-        res.status(403).json({ error: "The `editMachines` capability or machine creator authority is required to edit machines" });
+        refuse(res, 403, { code: "insufficient_role", error: "The `editMachines` capability or machine creator authority is required to edit machines" });
       }
       return;
     }
@@ -3400,16 +3520,16 @@ serverRouter.delete("/:id/machines/:machineId", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const machine = await machineService.getMachine(asMachineId(req.params.machineId));
     if (!machine || machine.serverId !== req.params.id) {
-      res.status(404).json({ error: "Machine not found in this server" });
+      refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
       return;
     }
-    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "removeMachines")) {
-      res.status(403).json({ error: "The `removeMachines` capability or machine creator authority is required to remove machines" });
+    if (!await canManageComputer(getDb(), { userId: req.userId!, role: callerRole }, req.params.id, machine, "remove")) {
+      refuse(res, 403, { code: "insufficient_role", error: "The `removeMachines` capability or machine creator authority is required to remove machines" });
       return;
     }
     const linkedComputerIds = await getComputerLinkedMachineIds(req.params.id);
@@ -3437,7 +3557,7 @@ serverRouter.delete("/:id/machines/:machineId", async (req, res) => {
       if (!lockedMachine || lockedMachine.serverId !== req.params.id) throw new FencedAuthorizationDeniedError("not_found");
       // Read before the delete takes the attach records with it: after an adoption, the adopter, not the row's owner.
       const controllerUserId = await computerControllerUserId(tx, req.params.id, lockedMachine);
-      if (controllerUserId !== req.userId && !actorRoleHasServerCapability(lockedRole, "removeMachines")) {
+      if (!computerActorAllowed({ userId: req.userId!, role: lockedRole }, controllerUserId, "remove")) {
         throw new FencedAuthorizationDeniedError("forbidden");
       }
       ({ revokedCredentialAgentIds } = await machineService.deleteMachine(req.params.machineId, { executor: tx }));
@@ -3447,8 +3567,9 @@ serverRouter.delete("/:id/machines/:machineId", async (req, res) => {
         outcome: "success",
         source: "web",
         actor: { type: "human", id: req.userId! },
-        // The person it is attached by (computerControllerUserId) authorized its access, as on revoke-computer-key.
-        requester: { type: "human", id: controllerUserId },
+        // The person it is attached by (computerControllerUserId) authorized its access, as on revoke-computer-key;
+        // none once its key is revoked or for a raw daemon.
+        requester: controllerUserId ? { type: "human", id: controllerUserId } : null,
         target: { type: "machine", id: lockedMachine.id },
         metadata: { machineId: lockedMachine.id, machineName: lockedMachine.name, ...serverAuditContextMetadata({ actorRole: lockedRole }) },
       }, tx);
@@ -3465,19 +3586,19 @@ serverRouter.delete("/:id/machines/:machineId", async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     if (err instanceof ServerMembershipRevokedError) {
-      res.status(403).json({ error: err.message });
+      refuse(res, 403, { code: err.code, error: err.message });
       return;
     }
     if (err instanceof FencedAuthorizationDeniedError) {
       if (err.reason === "not_found") {
-        res.status(404).json({ error: "Machine not found in this server" });
+        refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
       } else {
-        res.status(403).json({ error: "The `removeMachines` capability or machine creator authority is required to remove machines" });
+        refuse(res, 403, { code: "insufficient_role", error: "The `removeMachines` capability or machine creator authority is required to remove machines" });
       }
       return;
     }
     if (err instanceof machineService.MachineDeleteConflictError) {
-      res.status(409).json({ error: err.message, code: err.code });
+      refuse(res, 409, { code: err.code, error: err.message });
       return;
     }
     sendJsonServerError(req, res, {
@@ -3518,6 +3639,17 @@ serverRouter.delete("/:id/machines/:machineId", async (req, res) => {
 // detach (`raft-computer detach`, routes/internalComputer.ts, the same gate as
 // computerAgents.ts unbindForcedOthersAgents) are gated: the device-login
 // retire and revoke, the revoke link and the security cascades revoke regardless.
+//
+// `{ delete: true }` also removes the machine, in the same request and the
+// same transaction (Delete Computer on one's own Computer, DeleteComputerDialog):
+// authorized once, while its attach record is still live, so its attacher can
+// finish what a separate DELETE would refuse them once the key is revoked
+// (the controller is the live attacher only). Under the same locks (membership
+// fence, then the machine row FOR UPDATE): the revoke, deleteMachine (409 with
+// its own code, e.g. MACHINE_HAS_ASSIGNED_AGENTS, and nothing changed, while
+// an agent is still on it), `computer.key_revoked`, then `computer.removed`
+// naming the controller read before the revoke. Like DELETE, it runs on the
+// replica holding the machine's socket, and disconnects it after commit.
 class NoLiveComputerKeyError extends Error {
   constructor() {
     super("no_live_computer_key");
@@ -3528,23 +3660,40 @@ serverRouter.post("/:id/machines/:machineId/revoke-computer-key", async (req, re
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const machine = await machineService.getMachine(asMachineId(req.params.machineId));
     if (!machine || machine.serverId !== req.params.id) {
-      res.status(404).json({ error: "Machine not found in this server" });
+      refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
       return;
     }
-    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "removeMachines")) {
-      res.status(403).json({ error: "The `removeMachines` capability or machine creator authority is required to revoke a Computer's key" });
+    if (!await canManageComputer(getDb(), { userId: req.userId!, role: callerRole }, req.params.id, machine, "remove")) {
+      refuse(res, 403, { code: "insufficient_role", error: "The `removeMachines` capability or machine creator authority is required to revoke a Computer's key" });
       return;
     }
-    const rawForce = (req.body && typeof req.body === "object" ? req.body as { forceAgentIds?: unknown } : {}).forceAgentIds;
+    const body = req.body && typeof req.body === "object" ? req.body as { forceAgentIds?: unknown; delete?: unknown } : {};
+    const rawForce = body.forceAgentIds;
     const forceAgentIds = rawForce === undefined ? [] : parseAgentIdList(rawForce);
     if (!forceAgentIds) {
-      res.status(400).json({ error: "forceAgentIds must be a list of at most 200 agent ids.", code: "invalid_force_agent_ids" });
+      refuse(res, 400, { code: "invalid_force_agent_ids", error: "forceAgentIds must be a list of at most 200 agent ids." });
       return;
+    }
+    if (body.delete !== undefined && typeof body.delete !== "boolean") {
+      refuse(res, 400, { code: "invalid_input", error: "The delete field must be true or false." });
+      return;
+    }
+    const alsoDelete = body.delete === true;
+    const agentOrchestratorForDelete = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
+    if (alsoDelete && await isManagedComputerMachine(req.params.id, machine.id)) {
+      // As DELETE: on the replica that holds the machine's socket, so its disconnect below reaches it.
+      const routing = await handleMachineLocalRouting(
+        req,
+        res,
+        req.params.machineId,
+        () => agentOrchestratorForDelete?.hasMachineLocally(req.params.machineId) ?? false,
+      );
+      if (routing === "handled") return;
     }
     const now = currentDate();
     // Re-authorized inside the write under the caller's membership share lock (task #91), then the machine row
@@ -3556,9 +3705,9 @@ serverRouter.post("/:id/machines/:machineId/revoke-computer-key", async (req, re
         .where(eq(machinesTable.id, req.params.machineId))
         .for("update");
       if (!current || current.serverId !== req.params.id) throw new FencedAuthorizationDeniedError("not_found");
-      // The person it is attached by now (after an adoption, the adopter, not the machine row's owner).
+      // The person its live Computer is attached by (after an adoption, the adopter, not the machine row's owner).
       const controllerUserId = await computerControllerUserId(tx, req.params.id, current);
-      if (controllerUserId !== req.userId && !actorRoleHasServerCapability(lockedRole, "removeMachines")) {
+      if (!computerActorAllowed({ userId: req.userId!, role: lockedRole }, controllerUserId, "remove")) {
         throw new FencedAuthorizationDeniedError("forbidden");
       }
       const live = await tx
@@ -3597,7 +3746,24 @@ serverRouter.post("/:id/machines/:machineId/revoke-computer-key", async (req, re
         for (const machineId of result?.reach.machineIds ?? []) reach.machineIds.add(machineId);
         if (result?.detached) detached.push(result.detached);
       }
+      let revokedCredentialAgentIds: string[] = [];
+      if (alsoDelete) {
+        // Authorized above, while the attach record was live; a conflict throws and rolls the revoke back too.
+        ({ revokedCredentialAgentIds } = await machineService.deleteMachine(current.id, { executor: tx }));
+        await recordIntegrationAuditEvent({
+          serverId: req.params.id,
+          eventType: "computer.removed",
+          outcome: "success",
+          source: "web",
+          actor: { type: "human", id: req.userId! },
+          requester: controllerUserId ? { type: "human", id: controllerUserId } : null,
+          target: { type: "machine", id: current.id },
+          metadata: { machineId: current.id, machineName: current.name, ...serverAuditContextMetadata({ actorRole: lockedRole }) },
+        }, tx);
+      }
       return {
+        deleted: alsoDelete,
+        revokedCredentialAgentIds,
         computers: live.length,
         agentIds: [...reach.agentIds],
         machineIds: [...reach.machineIds],
@@ -3625,17 +3791,33 @@ serverRouter.post("/:id/machines/:machineId/revoke-computer-key", async (req, re
         notice: { kind: "computer_detached", computerName: revoked.computerName },
       }).catch((err) => console.warn("[Servers] unbound agent notice failed", { agentId: agent.agentId, err: serializeErrorForLog(err) }));
     }
+    if (revoked.deleted) {
+      // DELETE's effects, in its order.
+      await agentOrchestratorForDelete?.disconnectMachineForUnlink(req.params.machineId);
+      for (const agentId of revoked.revokedCredentialAgentIds) await broadcastAgentCredentialRevocation(agentId);
+    }
     io?.to(`server:${req.params.id}`).emit("machine:updated", {
       serverId: req.params.id,
       machineId: req.params.machineId,
     });
-    res.json({ ok: true, revokedComputers: revoked.computers, unboundAgentIds: revoked.unbound.map((agent) => agent.agentId) });
+    res.json({
+      ok: true,
+      revokedComputers: revoked.computers,
+      unboundAgentIds: revoked.unbound.map((agent) => agent.agentId),
+      ...(revoked.deleted ? { deleted: true } : {}),
+    });
   } catch (err) {
     if (err instanceof NoLiveComputerKeyError) {
-      res.status(409).json({ error: "This machine has no live Computer key to revoke", code: "no_live_computer_key" });
+      refuse(res, 409, { code: "no_live_computer_key", error: "This machine has no live Computer key to revoke" });
+      return;
+    }
+    if (err instanceof machineService.MachineDeleteConflictError) {
+      // `delete: true` only, as DELETE answers it; the revoke was rolled back with it.
+      refuse(res, 409, { code: err.code, error: err.message });
       return;
     }
     if (err instanceof OthersAgentsOnComputerError) {
+      // refusal-ok: top-level agents lists whose agents are in the way (the web's othersAgentsOf in othersAgentsApi.ts reads it, as from the Computer's own detach in internalComputer.ts); refuse() writes no top-level fields
       res.status(409).json({
         error: "Other people's agents run on this computer. Ask their owners to move them first, or remove them from it.",
         code: "others_agents_on_computer",
@@ -3644,14 +3826,14 @@ serverRouter.post("/:id/machines/:machineId/revoke-computer-key", async (req, re
       return;
     }
     if (err instanceof ServerMembershipRevokedError) {
-      res.status(403).json({ error: err.message });
+      refuse(res, 403, { code: err.code, error: err.message });
       return;
     }
     if (err instanceof FencedAuthorizationDeniedError) {
       if (err.reason === "not_found") {
-        res.status(404).json({ error: "Machine not found in this server" });
+        refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
       } else {
-        res.status(403).json({ error: "The `removeMachines` capability or machine creator authority is required to revoke a Computer's key" });
+        refuse(res, 403, { code: "insufficient_role", error: "The `removeMachines` capability or machine creator authority is required to revoke a Computer's key" });
       }
       return;
     }
@@ -3676,21 +3858,21 @@ serverRouter.post("/:id/machines/:machineId/notify-agent-owners", async (req, re
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const machine = await machineService.getMachine(asMachineId(req.params.machineId));
     if (!machine || machine.serverId !== req.params.id) {
-      res.status(404).json({ error: "Machine not found in this server" });
+      refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
       return;
     }
-    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "removeMachines")) {
-      res.status(403).json({ error: "The `removeMachines` capability or machine creator authority is required to ask about this Computer's agents" });
+    if (!await canManageComputer(getDb(), { userId: req.userId!, role: callerRole }, req.params.id, machine, "remove")) {
+      refuse(res, 403, { code: "insufficient_role", error: "The `removeMachines` capability or machine creator authority is required to ask about this Computer's agents" });
       return;
     }
     const agentIds = parseNotifyAgentOwnersBody(req.body);
     if (!agentIds) {
-      res.status(400).json({ error: "agentIds must be a list of 1 to 200 agent ids.", code: "invalid_agent_ids" });
+      refuse(res, 400, { code: "invalid_agent_ids", error: "agentIds must be a list of 1 to 200 agent ids." });
       return;
     }
     const io = req.app.get("io") as SocketServer | undefined;
@@ -3727,16 +3909,16 @@ serverRouter.post("/:id/machines/:machineId/rotate-key", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const machine = await machineService.getMachine(asMachineId(req.params.machineId));
     if (!machine || machine.serverId !== req.params.id) {
-      res.status(404).json({ error: "Machine not found in this server" });
+      refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
       return;
     }
-    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "rotateMachineKeys")) {
-      res.status(403).json({ error: "The `rotateMachineKeys` capability or machine creator authority is required to rotate machine keys" });
+    if (!await canManageComputer(getDb(), { userId: req.userId!, role: callerRole }, req.params.id, machine, "rotateKey")) {
+      refuse(res, 403, { code: "insufficient_role", error: "The `rotateMachineKeys` capability or machine creator authority is required to rotate machine keys" });
       return;
     }
     // Task #91: rotate under the caller's membership share lock (member row first, machine row second). The new key is
@@ -3756,7 +3938,7 @@ serverRouter.post("/:id/machines/:machineId/rotate-key", async (req, res) => {
         .for("update");
       if (!lockedMachine || lockedMachine.serverId !== req.params.id) throw new FencedAuthorizationDeniedError("not_found");
       const controllerUserId = await computerControllerUserId(tx, req.params.id, lockedMachine);
-      if (controllerUserId !== req.userId && !actorRoleHasServerCapability(lockedRole, "rotateMachineKeys")) {
+      if (!computerActorAllowed({ userId: req.userId!, role: lockedRole }, controllerUserId, "rotateKey")) {
         throw new FencedAuthorizationDeniedError("forbidden");
       }
       // B15 (#infra:358ea6d0): this rotates only the legacy sk_machine_* key. A
@@ -3781,9 +3963,9 @@ serverRouter.post("/:id/machines/:machineId/rotate-key", async (req, res) => {
         outcome: "success",
         source: "web",
         actor: { type: "human", id: req.userId! },
-        // The person it is attached by authorized its access, as on DELETE and revoke-computer-key. A machine with
-        // any attach record was refused above, so here that is the machine row's owner.
-        requester: { type: "human", id: controllerUserId },
+        // A machine with any attach record was refused above, so this is a raw daemon: it has no controller
+        // (computerControllerUserId), and the person whose key it is, its registrant, stands as the requester.
+        requester: { type: "human", id: lockedMachine.userId },
         target: { type: "machine", id: lockedMachine.id },
         metadata: { machineId: lockedMachine.id, machineName: lockedMachine.name, ...serverAuditContextMetadata({ actorRole: lockedRole }) },
       }, tx);
@@ -3800,21 +3982,21 @@ serverRouter.post("/:id/machines/:machineId/rotate-key", async (req, res) => {
       return;
     }
     if (error instanceof ComputerKeyRotationUnsupportedError) {
-      res.status(409).json({
-        error: "This is a Computer: rotating the machine key does not affect it. To cut it off, remove the machine.",
+      refuse(res, 409, {
         code: "computer_key_rotation_unsupported",
+        error: "This is a Computer: rotating the machine key does not affect it. To cut it off, remove the machine.",
       });
       return;
     }
     if (error instanceof ServerMembershipRevokedError) {
-      res.status(403).json({ error: error.message });
+      refuse(res, 403, { code: error.code, error: error.message });
       return;
     }
     if (error instanceof FencedAuthorizationDeniedError) {
       if (error.reason === "not_found") {
-        res.status(404).json({ error: "Machine not found in this server" });
+        refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
       } else {
-        res.status(403).json({ error: "The `rotateMachineKeys` capability or machine creator authority is required to rotate machine keys" });
+        refuse(res, 403, { code: "insufficient_role", error: "The `rotateMachineKeys` capability or machine creator authority is required to rotate machine keys" });
       }
       return;
     }
@@ -3846,7 +4028,7 @@ serverRouter.post("/:id/machines/:machineId/computer/:action", async (req, res) 
         server_id: req.params.id,
         machine_id: req.params.machineId,
       });
-      res.status(400).json({ error: "Unknown action", code: "unknown_action" });
+      refuse(res, 400, { code: "unknown_action", error: "Unknown action" });
       return;
     }
     const requestedTargetVersion = req.body?.targetVersion;
@@ -3857,9 +4039,9 @@ serverRouter.post("/:id/machines/:machineId/computer/:action", async (req, res) 
       ))
       || (action === "restart" && requestedTargetVersion !== undefined)
     ) {
-      res.status(400).json({
-        error: "A valid targetVersion is required only for upgrade",
+      refuse(res, 400, {
         code: "invalid_target_version",
+        error: "A valid targetVersion is required only for upgrade",
       });
       return;
     }
@@ -3876,7 +4058,7 @@ serverRouter.post("/:id/machines/:machineId/computer/:action", async (req, res) 
         server_id: req.params.id,
         machine_id: req.params.machineId,
       });
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const machine = await machineService.getMachine(asMachineId(req.params.machineId));
@@ -3887,17 +4069,17 @@ serverRouter.post("/:id/machines/:machineId/computer/:action", async (req, res) 
         server_id: req.params.id,
         machine_id: req.params.machineId,
       });
-      res.status(404).json({ error: "Machine not found in this server" });
+      refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
       return;
     }
-    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "controlComputers")) {
+    if (!await canManageComputer(getDb(), { userId: req.userId!, role: callerRole }, req.params.id, machine, "control")) {
       addTraceEvent("computer.control.rejected", {
         action,
         reason: "forbidden",
         server_id: req.params.id,
         machine_id: req.params.machineId,
       });
-      res.status(403).json({ error: "The `controlComputers` capability, or being the person this Computer is attached by, is required to control Computers" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `controlComputers` capability, or being the person this Computer is attached by, is required to control Computers" });
       return;
     }
     if (!await isManagedComputerMachine(req.params.id, machine.id)) {
@@ -3907,7 +4089,7 @@ serverRouter.post("/:id/machines/:machineId/computer/:action", async (req, res) 
         server_id: req.params.id,
         machine_id: machine.id,
       });
-      res.status(409).json({ error: "Restart/upgrade is only available for managed Computers", code: "not_a_computer" });
+      refuse(res, 409, { code: "not_a_computer", error: "Restart/upgrade is only available for managed Computers" });
       return;
     }
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
@@ -3930,13 +4112,33 @@ serverRouter.post("/:id/machines/:machineId/computer/:action", async (req, res) 
         server_id: req.params.id,
         machine_id: machine.id,
       });
-      res.status(409).json({ error: "Computer is not online", code: "computer_offline" });
+      refuse(res, 409, { code: "computer_offline", error: "Computer is not online" });
       return;
     }
     if (action === "upgrade") {
       // Remote upgrade v2 (task #873): resolve the exact target, record one
       // request row, send the command. The machine's next reconnect is the only
       // readback.
+      // The Computer said on its ready that its systemd manager refuses the
+      // scope the installer needs (a system unit run as a non-root user): it
+      // would refuse this upgrade right before spawning the installer, so
+      // refuse it here, with its code, before anything is recorded or sent.
+      // Unknown (null) refuses nothing.
+      const upgradeScope = await readUpgradeScope(agentOrchestrator, machine.id);
+      if (upgradeScope) {
+        addTraceEvent("computer.control.rejected", {
+          action,
+          reason: "scope_unavailable",
+          server_id: req.params.id,
+          machine_id: machine.id,
+          scope_reason: upgradeScope.reason,
+        });
+        refuse(res, 409, {
+          code: "scope_unavailable",
+          error: "This Computer runs as a systemd service that won't let the upgrade move out of it, so it can't be upgraded from the web. Upgrade it on the machine itself.",
+        });
+        return;
+      }
       const sourceFact = await readComputerSourceFact(agentOrchestrator, machine.id);
       // Older Computers are not driven from the web (the button is greyed and
       // the panel shows the local upgrade hint); refuse here too so the state
@@ -3949,9 +4151,9 @@ serverRouter.post("/:id/machines/:machineId/computer/:action", async (req, res) 
           machine_id: machine.id,
           computer_version: sourceFact?.version ?? "",
         });
-        res.status(409).json({
-          error: "This Computer version cannot be upgraded from the web. Upgrade it once on the machine itself.",
+        refuse(res, 409, {
           code: "computer_remote_upgrade_unsupported",
+          error: "This Computer version cannot be upgraded from the web. Upgrade it once on the machine itself.",
         });
         return;
       }
@@ -3974,6 +4176,7 @@ serverRouter.post("/:id/machines/:machineId/computer/:action", async (req, res) 
           server_id: req.params.id,
           machine_id: machine.id,
         });
+        // refusal-ok: top-level policy carries the upgrade policy's decision (servers.api.test.ts reads policy.reasonCode, as the not-eligible answer below has it); refuse() writes no top-level fields
         res.status(409).json({
           error: "Raft Desktop keeps this Computer up to date; it can't be upgraded from the web.",
           code: "computer_managed_by_desktop",
@@ -4038,7 +4241,7 @@ serverRouter.post("/:id/machines/:machineId/computer/:action", async (req, res) 
             ...(failed ? computerUpgradeRequestTraceAttrs(failed) : { request_id: row.id, server_id: req.params.id, machine_id: machine.id, reason_code: "" }),
             source_version: sourceFact?.version ?? "",
           });
-          res.status(409).json({ error: "Computer is not online", code: "computer_offline" });
+          refuse(res, 409, { code: "computer_offline", error: "Computer is not online" });
           return;
         }
       }
@@ -4066,9 +4269,9 @@ serverRouter.post("/:id/machines/:machineId/computer/:action", async (req, res) 
         server_id: req.params.id,
         machine_id: machine.id,
       });
-      res.status(409).json({
-        error: "Raft couldn't verify the Computer version. Reconnect the Computer, then try again.",
+      refuse(res, 409, {
         code: "computer_control_unsupported",
+        error: "Raft couldn't verify the Computer version. Reconnect the Computer, then try again.",
       });
       return;
     }
@@ -4089,7 +4292,7 @@ serverRouter.post("/:id/machines/:machineId/computer/:action", async (req, res) 
         .where(eq(machinesTable.id, machine.id))
         .for("share");
       if (!lockedMachine || lockedMachine.serverId !== req.params.id) throw new FencedAuthorizationDeniedError("not_found");
-      if (!await canManageMachineResource(tx, req.params.id, lockedRole, req.userId!, lockedMachine, "controlComputers")) {
+      if (!await canManageComputer(tx, { userId: req.userId!, role: lockedRole }, req.params.id, lockedMachine, "control")) {
         throw new FencedAuthorizationDeniedError("forbidden");
       }
       return createUserComputerLifecycleOperation({
@@ -4108,9 +4311,9 @@ serverRouter.post("/:id/machines/:machineId/computer/:action", async (req, res) 
       }, { executor: tx });
     });
     if (!operation?.dispatch) {
-      res.status(409).json({
-        error: "Another Computer lifecycle operation is already in progress for this machine",
+      refuse(res, 409, {
         code: "computer_operation_in_progress",
+        error: "Another Computer lifecycle operation is already in progress for this machine",
       });
       return;
     }
@@ -4161,14 +4364,14 @@ serverRouter.post("/:id/machines/:machineId/computer/:action", async (req, res) 
     res.json({ ok: true, action, requestId, operationId: operation.operationId });
   } catch (error) {
     if (error instanceof ServerMembershipRevokedError) {
-      res.status(403).json({ error: error.message });
+      refuse(res, 403, { code: error.code, error: error.message });
       return;
     }
     if (error instanceof FencedAuthorizationDeniedError) {
       if (error.reason === "not_found") {
-        res.status(404).json({ error: "Machine not found in this server" });
+        refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
       } else {
-        res.status(403).json({ error: "The `controlComputers` capability, or being the person this Computer is attached by, is required to control Computers" });
+        refuse(res, 403, { code: "insufficient_role", error: "The `controlComputers` capability, or being the person this Computer is attached by, is required to control Computers" });
       }
       return;
     }
@@ -4189,39 +4392,39 @@ serverRouter.post("/:id/machines/:machineId/computer-lifecycle-operations", asyn
   let targetVersion = req.body?.targetVersion;
   const completionMode = req.body?.completionMode;
   if (typeof action !== "string" || !LOCAL_COMPUTER_LIFECYCLE_ACTIONS.has(action as "start" | "stop" | "restart" | "upgrade")) {
-    res.status(400).json({ error: "Unknown Computer lifecycle action", code: "unknown_action" });
+    refuse(res, 400, { code: "unknown_action", error: "Unknown Computer lifecycle action" });
     return;
   }
   if (typeof operationId !== "string" || !UUID_RE.test(operationId)) {
-    res.status(400).json({ error: "A valid operationId is required", code: "invalid_operation_id" });
+    refuse(res, 400, { code: "invalid_operation_id", error: "A valid operationId is required" });
     return;
   }
   if (typeof parentOperationId !== "string" || !UUID_RE.test(parentOperationId)) {
-    res.status(400).json({ error: "A valid parentOperationId is required", code: "invalid_parent_operation_id" });
+    refuse(res, 400, { code: "invalid_parent_operation_id", error: "A valid parentOperationId is required" });
     return;
   }
   if ((action === "upgrade" && targetVersion !== undefined && (typeof targetVersion !== "string"
     || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(targetVersion)))
     || (action !== "upgrade" && targetVersion !== undefined)) {
-    res.status(400).json({ error: "A valid targetVersion is required only for upgrade", code: "invalid_target_version" });
+    refuse(res, 400, { code: "invalid_target_version", error: "A valid targetVersion is required only for upgrade" });
     return;
   }
   if (completionMode !== undefined && (action !== "upgrade" || completionMode !== "legacy_k_promoted")) {
-    res.status(400).json({ error: "Unknown Computer lifecycle completion mode", code: "invalid_completion_mode" });
+    refuse(res, 400, { code: "invalid_completion_mode", error: "Unknown Computer lifecycle completion mode" });
     return;
   }
   const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
   if (!callerRole) {
-    res.status(404).json({ error: "Server not found" });
+    refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
     return;
   }
   const machine = await machineService.getMachine(asMachineId(req.params.machineId));
   if (!machine || machine.serverId !== req.params.id) {
-    res.status(404).json({ error: "Machine not found in this server" });
+    refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
     return;
   }
-  if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "controlComputers")) {
-    res.status(403).json({ error: "The `controlComputers` capability, or being the person this Computer is attached by, is required to control Computers" });
+  if (!await canManageComputer(getDb(), { userId: req.userId!, role: callerRole }, req.params.id, machine, "control")) {
+    refuse(res, 403, { code: "insufficient_role", error: "The `controlComputers` capability, or being the person this Computer is attached by, is required to control Computers" });
     return;
   }
   const orchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
@@ -4236,11 +4439,11 @@ serverRouter.post("/:id/machines/:machineId/computer-lifecycle-operations", asyn
     ? orchestrator.getMachineConnectionEpoch?.(machine.id) ?? null
     : null;
   if (action === "start" && connectionEpoch) {
-    res.status(409).json({ error: "Computer is already online", code: "computer_already_online" });
+    refuse(res, 409, { code: "computer_already_online", error: "Computer is already online" });
     return;
   }
   if (action !== "start" && !connectionEpoch) {
-    res.status(409).json({ error: "Computer is not online", code: "computer_offline" });
+    refuse(res, 409, { code: "computer_offline", error: "Computer is not online" });
     return;
   }
   if (action === "upgrade" && targetVersion === undefined) {
@@ -4253,7 +4456,7 @@ serverRouter.post("/:id/machines/:machineId/computer-lifecycle-operations", asyn
       if (existing.serverId !== req.params.id || existing.machineId !== machine.id
         || existing.actorUserId !== req.userId || existing.parentOperationId !== parentOperationId
         || existing.action !== action || existing.dispatchMode !== "local" || !existing.targetVersion) {
-        res.status(409).json({ error: "Operation identity does not match", code: "computer_lifecycle_operation_conflict" });
+        refuse(res, 409, { code: "computer_lifecycle_operation_conflict", error: "Operation identity does not match" });
         return;
       }
       targetVersion = existing.targetVersion;
@@ -4279,7 +4482,7 @@ serverRouter.post("/:id/machines/:machineId/computer-lifecycle-operations", asyn
   }
   // `dispatchMode=local` is the established lifecycle name for an explicit,
   // user-authenticated per-machine operation; it is not a claim about network
-  // locality. Machine creators and roles with `controlComputers` may perform
+  // locality. The machine's controller and roles with `controlComputers` may perform
   // this deliberate manual override. The Computer caller has already resolved
   // its exact target through Hands, or the Server resolved alpha above for
   // an older caller that omitted the target. The legacy completion path still needs a live
@@ -4289,9 +4492,9 @@ serverRouter.post("/:id/machines/:machineId/computer-lifecycle-operations", asyn
     : null;
   if (completionMode === "legacy_k_promoted") {
     if (!source) {
-      res.status(409).json({
-        error: "The live Computer ready attestation is not visible yet.",
+      refuse(res, 409, {
         code: "computer_lifecycle_completion_ready_pending",
+        error: "The live Computer ready attestation is not visible yet.",
       });
       return;
     }
@@ -4299,9 +4502,9 @@ serverRouter.post("/:id/machines/:machineId/computer-lifecycle-operations", asyn
       || source.version !== targetVersion
       || source.provenance !== "owner_connection"
       || typeof source.observedAt !== "string") {
-      res.status(409).json({
-        error: "The live Computer does not attest this completed target.",
+      refuse(res, 409, {
         code: "computer_lifecycle_completion_target_mismatch",
+        error: "The live Computer does not attest this completed target.",
       });
       return;
     }
@@ -4326,7 +4529,7 @@ serverRouter.post("/:id/machines/:machineId/computer-lifecycle-operations", asyn
         .where(eq(machinesTable.id, machine.id))
         .for("share");
       if (!lockedMachine || lockedMachine.serverId !== req.params.id) throw new FencedAuthorizationDeniedError("not_found");
-      if (!await canManageMachineResource(tx, req.params.id, lockedRole, req.userId!, lockedMachine, "controlComputers")) {
+      if (!await canManageComputer(tx, { userId: req.userId!, role: lockedRole }, req.params.id, lockedMachine, "control")) {
         throw new FencedAuthorizationDeniedError("forbidden");
       }
       return createUserComputerLifecycleOperation({
@@ -4350,21 +4553,21 @@ serverRouter.post("/:id/machines/:machineId/computer-lifecycle-operations", asyn
     });
   } catch (error) {
     if (error instanceof ServerMembershipRevokedError) {
-      res.status(403).json({ error: error.message });
+      refuse(res, 403, { code: error.code, error: error.message });
       return;
     }
     if (error instanceof FencedAuthorizationDeniedError) {
       if (error.reason === "not_found") {
-        res.status(404).json({ error: "Machine not found in this server" });
+        refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
       } else {
-        res.status(403).json({ error: "The `controlComputers` capability, or being the person this Computer is attached by, is required to control Computers" });
+        refuse(res, 403, { code: "insufficient_role", error: "The `controlComputers` capability, or being the person this Computer is attached by, is required to control Computers" });
       }
       return;
     }
     throw error;
   }
   if (!operation) {
-    res.status(409).json({ error: "Lifecycle operations are only available for managed Computers", code: "not_a_computer" });
+    refuse(res, 409, { code: "not_a_computer", error: "Lifecycle operations are only available for managed Computers" });
     return;
   }
   addTraceEvent("operation.intent.recorded", {
@@ -4386,16 +4589,16 @@ serverRouter.get("/:id/machines/:machineId/workspaces", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const machine = await machineService.getMachine(asMachineId(req.params.machineId));
     if (!machine || machine.serverId !== req.params.id) {
-      res.status(404).json({ error: "Machine not found in this server" });
+      refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
       return;
     }
-    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "editMachines")) {
-      res.status(403).json({ error: "You do not have permission to view machine workspaces" });
+    if (!await canManageComputer(getDb(), { userId: req.userId!, role: callerRole }, req.params.id, machine, "edit")) {
+      refuse(res, 403, { code: "insufficient_role", error: "You do not have permission to view machine workspaces" });
       return;
     }
 
@@ -4460,7 +4663,7 @@ serverRouter.get("/:id/runtimes", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     res.json(projectServerRuntimeCatalog(
@@ -4480,16 +4683,16 @@ serverRouter.get("/:id/machines/:machineId/runtime-options", async (req, res) =>
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const machine = await machineService.getMachine(asMachineId(req.params.machineId));
     if (!machine || machine.serverId !== req.params.id) {
-      res.status(404).json({ error: "Computer not found" });
+      refuse(res, 404, COMPUTER_NOT_FOUND_REFUSAL);
       return;
     }
-    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "editMachines")) {
-      res.status(403).json({ error: "The `editMachines` capability or machine creator authority is required to inspect runtime options" });
+    if (!await canManageComputer(getDb(), { userId: req.userId!, role: callerRole }, req.params.id, machine, "edit")) {
+      refuse(res, 403, { code: "insufficient_role", error: "The `editMachines` capability or machine creator authority is required to inspect runtime options" });
       return;
     }
     res.json({
@@ -4524,16 +4727,16 @@ async function runtimeAccountUsageUnsupported(app: { get(name: string): unknown 
 serverRouter.get("/:id/machines/:machineId/runtime-account-usage/:provider", async (req, res) => {
   try {
     if (!isRuntimeAccountUsageProvider(req.params.provider)) {
-      res.status(404).json({ error: "Runtime account usage provider not found" });
+      refuse(res, 404, { code: "provider_not_found", error: "Runtime account usage provider not found" });
       return;
     }
     const machine = await machineService.getMachine(asMachineId(req.params.machineId));
     if (!machine || machine.serverId !== req.params.id) {
-      res.status(404).json({ error: "Computer not found" });
+      refuse(res, 404, COMPUTER_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canInspectRuntimeAccountUsage(req.params.id, machine.id, req.userId!)) {
-      res.status(403).json({ error: "The `editMachines` capability or attaching-human authority is required to inspect runtime account usage" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `editMachines` capability or attaching-human authority is required to inspect runtime account usage" });
       return;
     }
 
@@ -4549,8 +4752,9 @@ serverRouter.get("/:id/machines/:machineId/runtime-account-usage/:provider", asy
     }
     // Window scopes only to a client that declares it reads them
     // (RUNTIME_USAGE_WINDOW_SCOPE_CLIENT_CAPABILITY): older web bundles parse
-    // snapshots strictly.
-    res.json({ ...result, snapshot: runtimeAccountUsageSnapshotForClient(result.snapshot, req.header(RAFT_CLIENT_CAPABILITIES_HEADER)) });
+    // snapshots strictly. No agent the viewer may not find (a personal
+    // assistant's own account folder).
+    res.json({ ...result, snapshot: await runtimeAccountUsageSnapshotForViewer(result.snapshot, req.header(RAFT_CLIENT_CAPABILITIES_HEADER), req.userId!) });
   } catch {
     res.status(500).json({ error: "Failed to load runtime account usage" });
   }
@@ -4559,16 +4763,16 @@ serverRouter.get("/:id/machines/:machineId/runtime-account-usage/:provider", asy
 serverRouter.post("/:id/machines/:machineId/runtime-account-usage/:provider/refresh", async (req, res) => {
   try {
     if (!isRuntimeAccountUsageProvider(req.params.provider)) {
-      res.status(404).json({ error: "Runtime account usage provider not found" });
+      refuse(res, 404, { code: "provider_not_found", error: "Runtime account usage provider not found" });
       return;
     }
     const machine = await machineService.getMachine(asMachineId(req.params.machineId));
     if (!machine || machine.serverId !== req.params.id) {
-      res.status(404).json({ error: "Computer not found" });
+      refuse(res, 404, COMPUTER_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canInspectRuntimeAccountUsage(req.params.id, machine.id, req.userId!)) {
-      res.status(403).json({ error: "The `editMachines` capability or attaching-human authority is required to refresh runtime account usage" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `editMachines` capability or attaching-human authority is required to refresh runtime account usage" });
       return;
     }
 
@@ -4613,7 +4817,7 @@ serverRouter.post("/:id/machines/:machineId/runtime-account-usage/:provider/refr
       res.status(200).json({
         accepted: true,
         state: "fresh",
-        snapshot: parsed.success ? runtimeAccountUsageSnapshotForClient(parsed.data, req.header(RAFT_CLIENT_CAPABILITIES_HEADER)) : null,
+        snapshot: parsed.success ? await runtimeAccountUsageSnapshotForViewer(parsed.data, req.header(RAFT_CLIENT_CAPABILITIES_HEADER), req.userId!) : null,
       });
     } catch (error) {
       if (error instanceof RouteFailureError && error.subkind === "daemon_timeout") {
@@ -4635,109 +4839,121 @@ serverRouter.post("/:id/machines/:machineId/runtime-account-usage/:provider/refr
 mountRuntimeAuthRoutes(serverRouter);
 // Computer owner v1 (#wg-rbac:#32): who Raft records as a Computer's owner.
 mountComputerOwnerRoutes(serverRouter, { buildMachineList });
+// `raft proc` jobs on the Computer page and a person's Stop of one (docs/contracts/proc-jobs.md).
+mountComputerProcJobsRoutes(serverRouter);
+// "On this computer" checks: the last report and a refresh (docs/contracts/computer-checks.md).
+mountComputerChecksRoutes(serverRouter);
 
-// Runtime form definitions. v1 is version-pinned and served only for the
-// runtimes with a frozen v1 form (runtimeFormV1Entry); v2 is the current form of
-// any runtime in the v2 registry (runtimeFormV2Registry). Every other runtime
-// continues to use the legacy Web form.
-const handleRuntimeFormDefinition = (protocol: 1 | 2): RequestHandler<{ id: string; machineId: string; runtimeId: string }> => async (req, res) => {
+// Runtime form v1 (`.../runtime-form-definitions/...`) is retired
+// (#wg-runtime-form:#20, 2026-11-18): its routes stay registered so the old
+// app builds that still call them get an update-the-app message instead of a
+// generic 404. Same server-membership check as the v2 routes.
+const handleRetiredRuntimeFormV1: RequestHandler<{ id: string }> = async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
+      return;
+    }
+    refuse(res, 410, {
+      code: "runtime_form_v1_retired",
+      error: "This version of the app no longer supports creating or editing agents. Please update the app.",
+    });
+  } catch {
+    res.status(500).json({ error: "Failed to load runtime form definition" });
+  }
+};
+serverRouter.get("/:id/machines/:machineId/runtime-form-definitions/:runtimeId", handleRetiredRuntimeFormV1);
+serverRouter.get(
+  "/:id/machines/:machineId/runtime-form-definitions/:runtimeId/option-sources/:sourceId",
+  handleRetiredRuntimeFormV1,
+);
+
+// Runtime form definitions (v2): the current form of any runtime in the v2
+// registry (runtimeFormV2Registry). Every other runtime continues to use the
+// legacy Web form.
+const handleRuntimeFormDefinition: RequestHandler<{ id: string; machineId: string; runtimeId: string }> = async (req, res) => {
+  try {
+    const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
+    if (!callerRole) {
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const machine = await machineService.getMachine(asMachineId(req.params.machineId));
     if (!machine || machine.serverId !== req.params.id) {
-      res.status(404).json({ error: "Computer not found" });
+      refuse(res, 404, COMPUTER_NOT_FOUND_REFUSAL);
       return;
     }
-    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "editMachines")) {
-      res.status(403).json({ error: "The `editMachines` capability or machine creator authority is required to inspect runtime form definitions" });
+    if (!await canManageComputer(getDb(), { userId: req.userId!, role: callerRole }, req.params.id, machine, "edit")) {
+      refuse(res, 403, { code: "insufficient_role", error: "The `editMachines` capability or machine creator authority is required to inspect runtime form definitions" });
       return;
     }
-    const v1 = protocol === 1 ? runtimeFormV1Entry(req.params.runtimeId) : null;
-    const v2 = protocol === 2 ? runtimeFormV2Entry(req.params.runtimeId) : null;
-    if (!v1 && !v2) {
+    const v2 = runtimeFormV2Entry(req.params.runtimeId);
+    if (!v2) {
+      // refusal-ok: top-level issues carries the reason (unknown_form_runtime at /runtimeId), the runtime form protocol's issue shape; refuse() writes no top-level fields
       res.status(404).json({
         error: "Runtime form definition not found",
         issues: [{ code: "unknown_form_runtime", pointer: "/runtimeId" }],
       });
       return;
     }
-    // v1 clients pin a schemaVersion; v2 clients take the current form as it is.
-    if (v1 && req.query.schemaVersion !== v1.ref.schemaVersion) {
-      res.status(409).json({
-        error: "Runtime form schema is stale or unknown",
-        issues: [{ code: "stale_form_schema", pointer: "/schemaVersion" }],
-      });
-      return;
-    }
-    // A released version is answered from its frozen sample, never from current
-    // code, so a server change cannot break clients that already shipped it
-    // (packages/runtime-form/README.md).
-    const projectionIssues = (v2 ?? v1!).validateProjection();
+    const projectionIssues = v2.validateProjection();
     if (projectionIssues.length > 0) {
       res.status(500).json({ error: "Runtime form projection drift", issues: projectionIssues });
       return;
     }
-    if (v2) {
-      // v2 copy follows the request language; v1 stays the frozen English sample.
-      // The per-server build adds the saved-connection capability, the
-      // x-connectionOwned markers and the revision token when this server has
-      // provider connections enabled; localization preserves them (it only
-      // rewrites copy strings).
-      const locale = runtimeFormCopyLocale(req.get("accept-language"));
-      setRuntimeFormCopyHeaders(res, locale);
-      // task #10: advertised client capabilities (`?clientCapabilities=`).
-      const clientCapabilities = parseRuntimeFormV2ClientCapabilities(req.query[RUNTIME_FORM_V2_CLIENT_CAPABILITIES_QUERY]);
-      let definition = await buildRuntimeFormV2ForServer(req.params.runtimeId, req.params.id, clientCapabilities) ?? v2.buildForm();
-      let typedConnectionProviderIds: readonly string[] = [];
-      if (req.params.runtimeId === "builtin") {
-        // task #10: the limit fields show for a preset provider only for a
-        // client that renders its typed id AND on a Computer that runs one;
-        // otherwise such a provider is served list-only and limit-free, as before.
-        // Same probe and cache as the model source the client loads next.
-        const typed = await builtInTypedModelProvidersFor({ req, res, serverId: req.params.id, machine, clientCapabilities });
-        if (typed === "handled") return;
-        definition = withBuiltInModelLimitVisibility(definition, typed.presets);
-        typedConnectionProviderIds = typed.connections;
-      }
-      // runtime_form.v3: the same form in v3 shapes (services/runtimeFormV3).
-      if (isRuntimeFormV3Request(clientCapabilities)) {
-        definition = await serveRuntimeFormV3(definition, {
-          runtimeId: req.params.runtimeId,
-          serverId: req.params.id,
-          clientCapabilities,
-          typedConnectionProviderIds,
-          connectionsVisible: await actorHasServerCapabilityInServer(req.params.id, "user", req.userId!, "manageExternalAuth"),
-        });
-      }
-      res.json(localizeRuntimeFormV2(definition, locale));
-      return;
+    // Copy follows the request language.
+    const locale = runtimeFormCopyLocale(req.get("accept-language"));
+    setRuntimeFormCopyHeaders(res, locale);
+    // task #10: advertised client capabilities (`?clientCapabilities=`).
+    const clientCapabilities = parseRuntimeFormV2ClientCapabilities(req.query[RUNTIME_FORM_V2_CLIENT_CAPABILITIES_QUERY]);
+    let definition = v2.buildForm();
+    if (req.params.runtimeId === "builtin") {
+      // task #10: the limit fields show for a preset provider only for a
+      // client that renders its typed id AND on a Computer that runs one;
+      // otherwise such a provider is served list-only and limit-free, as before.
+      // Same probe and cache as the model source the client loads next.
+      const typed = await builtInTypedModelProvidersFor({ req, res, machine, clientCapabilities });
+      if (typed === "handled") return;
+      definition = withBuiltInModelLimitVisibility(definition, typed.presets);
     }
-    res.json(releasedRuntimeFormDefinition(v1!.ref.schemaVersion) ?? v1!.buildDefinition());
+    if (req.params.runtimeId === "codex") {
+      if (isRuntimeFormV3Request(clientCapabilities)) {
+        const models = await codexSpeedModelsFor({ req, res, machine });
+        if (models === "handled") return;
+        definition = withCodexSpeedVisibility(definition, models);
+      } else {
+        definition = withCodexSpeedVisibility(definition, []);
+      }
+    }
+    // runtime_form.v3: the same form in v3 shapes (services/runtimeFormV3).
+    if (isRuntimeFormV3Request(clientCapabilities)) {
+      definition = await serveRuntimeFormV3(definition, {
+        runtimeId: req.params.runtimeId,
+        clientCapabilities,
+      });
+    }
+    res.json(localizeRuntimeFormV2(definition, locale));
   } catch {
     res.status(500).json({ error: "Failed to load runtime form definition" });
   }
 };
-serverRouter.get("/:id/machines/:machineId/runtime-form-definitions/:runtimeId", handleRuntimeFormDefinition(1));
-serverRouter.get("/:id/machines/:machineId/runtime-forms/v2/:runtimeId", handleRuntimeFormDefinition(2));
+serverRouter.get("/:id/machines/:machineId/runtime-forms/v2/:runtimeId", handleRuntimeFormDefinition);
 
-const handleRuntimeFormOptionSource = (protocol: 1 | 2): RequestHandler<{ id: string; machineId: string; runtimeId: string; sourceId: string }> => async (req, res) => {
+const handleRuntimeFormOptionSource: RequestHandler<{ id: string; machineId: string; runtimeId: string; sourceId: string }> = async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const machine = await machineService.getMachine(asMachineId(req.params.machineId));
     if (!machine || machine.serverId !== req.params.id) {
-      res.status(404).json({ error: "Computer not found" });
+      refuse(res, 404, COMPUTER_NOT_FOUND_REFUSAL);
       return;
     }
-    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "editMachines")) {
-      res.status(403).json({ error: "The `editMachines` capability or machine creator authority is required to inspect runtime form option sources" });
+    if (!await canManageComputer(getDb(), { userId: req.userId!, role: callerRole }, req.params.id, machine, "edit")) {
+      refuse(res, 403, { code: "insufficient_role", error: "The `editMachines` capability or machine creator authority is required to inspect runtime form option sources" });
       return;
     }
     setRequestTraceComputerTarget(res, {
@@ -4747,35 +4963,21 @@ const handleRuntimeFormOptionSource = (protocol: 1 | 2): RequestHandler<{ id: st
       runtime: req.params.runtimeId,
       sourceId: req.params.sourceId,
     });
-    // Option values are the same on both protocols; v1 serves them only for the
-    // runtimes that have a v1 form.
-    const v1 = protocol === 1 ? runtimeFormV1Entry(req.params.runtimeId) : null;
-    const entry = protocol === 2 || v1 ? runtimeFormV2Entry(req.params.runtimeId) : null;
+    const entry = runtimeFormV2Entry(req.params.runtimeId);
     if (!entry) {
+      // refusal-ok: top-level issues carries the reason (unknown_form_runtime at /runtimeId, unknown_option_source at /sourceId), the runtime form protocol's issue shape; refuse() writes no top-level fields
       res.status(404).json({
         error: "Runtime form option source not found",
         issues: [{ code: "unknown_form_runtime", pointer: "/runtimeId" }],
       });
       return;
     }
-    if (v1 && req.query.schemaVersion !== v1.ref.schemaVersion) {
-      res.status(409).json({
-        error: "Runtime form schema is stale or unknown",
-        issues: [{ code: "stale_form_schema", pointer: "/schemaVersion" }],
-      });
-      return;
-    }
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
-    // Saved-connection options (v2, capability `provider.saved_connection`):
-    // only a revisioned request from a caller who may list this server's
-    // connections ever sees them; an unrevisioned request keeps the plain
-    // direct-option protocol. Authorization is re-checked here on every
-    // request — the revision guards form consistency only.
-    const formRevision = protocol === 2 && typeof req.query.formRevision === "string" && req.query.formRevision
+    // Definition.revision echoed back (`?formRevision=`): the form-consistency
+    // gate below and in the entry.
+    const formRevision = typeof req.query.formRevision === "string" && req.query.formRevision
       ? req.query.formRevision
       : undefined;
-    const connectionsVisible = formRevision !== undefined
-      && await actorHasServerCapabilityInServer(req.params.id, "user", req.userId!, "manageExternalAuth");
     // Bounded to the replay budget: the Computer's answer, its last good one
     // (stale) or a timeout; a failed replay answers from the shared cache.
     const computerProbe = createBoundedRuntimeFormProbe({
@@ -4789,31 +4991,21 @@ const handleRuntimeFormOptionSource = (protocol: 1 | 2): RequestHandler<{ id: st
         () => agentOrchestrator.hasMachineLocally(req.params.machineId),
       ),
     });
-    // task #10: advertised client capabilities; v1 never has any.
-    const clientCapabilities = protocol === 2
-      ? parseRuntimeFormV2ClientCapabilities(req.query[RUNTIME_FORM_V2_CLIENT_CAPABILITIES_QUERY])
-      : [];
-    // runtime_form.v3: the revision covers every v3 form (and the connection
-    // set its conditions name); a mismatch means the client refetches the form.
-    const v3Form = isRuntimeFormV3Request(clientCapabilities)
-      ? await buildRuntimeFormV2ForServer(req.params.runtimeId, req.params.id, clientCapabilities) ?? entry.buildForm()
-      : null;
-    let v3RevisionStale = false;
-    if (v3Form && formRevision !== undefined) {
-      const connections = await runtimeFormV3Connections(req.params.runtimeId, req.params.id, connectionsVisible);
-      v3RevisionStale = formRevision !== runtimeFormV3Revision(req.params.runtimeId, v3Form, clientCapabilities, connections);
-    }
+    // task #10: advertised client capabilities.
+    const clientCapabilities = parseRuntimeFormV2ClientCapabilities(req.query[RUNTIME_FORM_V2_CLIENT_CAPABILITIES_QUERY]);
+    // runtime_form.v3: the revision covers every v3 form; a mismatch means
+    // the client refetches the form.
+    const v3Form = isRuntimeFormV3Request(clientCapabilities) ? entry.buildForm() : null;
+    const v3RevisionStale = v3Form !== null && formRevision !== undefined
+      && formRevision !== runtimeFormV3Revision(req.params.runtimeId, v3Form, clientCapabilities);
     const sourceContext = {
       sourceId: req.params.sourceId,
       machineId: req.params.machineId,
       machine,
-      serverId: req.params.id,
       formRevision,
-      connectionsVisible,
       clientCapabilities,
-      // A client's retry of a non-live source (`option_source.status`), v2 only.
-      refresh: protocol === 2 && req.query.refresh === "1",
-      sourceStatus: protocol === 2,
+      // A client's retry of a non-live source (`option_source.status`).
+      refresh: req.query.refresh === "1",
       agentOrchestrator: computerProbe.probe,
       routeToComputer: computerProbe.routeToComputer,
     };
@@ -4843,36 +5035,34 @@ const handleRuntimeFormOptionSource = (protocol: 1 | 2): RequestHandler<{ id: st
     }
     const source = resolution.source;
     if (!source) {
+      // refusal-ok: top-level issues carries the reason (unknown_form_runtime at /runtimeId, unknown_option_source at /sourceId), the runtime form protocol's issue shape; refuse() writes no top-level fields
       res.status(404).json({
         error: "Runtime form option source not found",
         issues: [{ code: "unknown_option_source", pointer: "/sourceId" }],
       });
       return;
     }
-    const projectionIssues = (v1 ?? entry).validateProjection();
+    const projectionIssues = entry.validateProjection();
     if (projectionIssues.length > 0) {
       res.status(500).json({ error: "Runtime form projection drift", issues: projectionIssues });
       return;
     }
-    if (protocol === 2) {
-      const locale = runtimeFormCopyLocale(req.get("accept-language"));
-      setRuntimeFormCopyHeaders(res, locale);
-      res.json(localizeRuntimeFormV2OptionSource(
-        optionSourceWithProbeState(source, probeFreshness ?? { state: "ok" }),
-        locale,
-      ));
-      return;
-    }
-    const v1Source = withoutV2OnlyOptionSourceFields(source);
-    res.json(req.params.runtimeId === "builtin" ? builtInPiListOnlyOptionSource(v1Source) : v1Source);
+    const locale = runtimeFormCopyLocale(req.get("accept-language"));
+    setRuntimeFormCopyHeaders(res, locale);
+    res.json(localizeRuntimeFormV2OptionSource(
+      optionSourceWithProbeState(source, probeFreshness ?? { state: "ok" }),
+      locale,
+    ));
   } catch (err) {
     if (err instanceof MachineCatalogStaleError) {
+      // refusal-ok: top-level recovery (retry) names the way out, as sendBuiltInCatalogError (agentMigrationStart.ts) answers the same stale catalog for the agent routes; refuse() writes no top-level fields
       res
         .status(409)
         .json({ error: err.message, code: err.code, recovery: "retry" });
       return;
     }
     if (err instanceof BuiltInModelCatalogError) {
+      // refusal-ok: top-level requestedModel, the three versions and recovery say which catalog refused the model, as sendBuiltInCatalogError (agentMigrationStart.ts) answers the same error for the agent routes; refuse() writes no top-level fields
       res.status(409).json({
         error: err.message,
         code: err.code,
@@ -4888,12 +5078,8 @@ const handleRuntimeFormOptionSource = (protocol: 1 | 2): RequestHandler<{ id: st
   }
 };
 serverRouter.get(
-  "/:id/machines/:machineId/runtime-form-definitions/:runtimeId/option-sources/:sourceId",
-  handleRuntimeFormOptionSource(1),
-);
-serverRouter.get(
   "/:id/machines/:machineId/runtime-forms/v2/:runtimeId/option-sources/:sourceId",
-  handleRuntimeFormOptionSource(2),
+  handleRuntimeFormOptionSource,
 );
 
 // Detect runtime models on a machine on-demand (used by Create/Edit agent picker)
@@ -4904,22 +5090,22 @@ serverRouter.post("/:id/machines/:machineId/runtimes/rescan", async (req, res) =
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const machine = await machineService.getMachine(asMachineId(req.params.machineId));
     if (!machine || machine.serverId !== req.params.id) {
-      res.status(404).json({ error: "Computer not found" });
+      refuse(res, 404, COMPUTER_NOT_FOUND_REFUSAL);
       return;
     }
-    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "editMachines")) {
-      res.status(403).json({ error: "The `editMachines` capability or machine creator authority is required to rescan runtimes" });
+    if (!await canManageComputer(getDb(), { userId: req.userId!, role: callerRole }, req.params.id, machine, "edit")) {
+      refuse(res, 403, { code: "insufficient_role", error: "The `editMachines` capability or machine creator authority is required to rescan runtimes" });
       return;
     }
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
     const requested = await agentOrchestrator?.rescanMachineRuntimes(req.params.machineId);
     if (!requested) {
-      res.status(409).json({ error: "Computer is offline" });
+      refuse(res, 409, { code: "computer_offline", error: "Computer is offline" });
       return;
     }
     res.json({ requested: true });
@@ -4942,7 +5128,7 @@ serverRouter.get("/:id/agent-usage", getAgentUsageRoute);
 serverRouter.get("/:id/model-label-catalog", async (req, res) => {
   const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
   if (!callerRole) {
-    res.status(404).json({ error: "Server not found" });
+    refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
     return;
   }
   // Any member — guests included — renders agent name rows, so any member may
@@ -4972,7 +5158,7 @@ serverRouter.get("/:id/machines/:machineId/runtime-models/:runtime", async (req,
       }),
     );
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const machine = await tracePhase(
@@ -4986,11 +5172,11 @@ serverRouter.get("/:id/machines/:machineId/runtime-models/:runtime", async (req,
       }),
     );
     if (!machine || machine.serverId !== req.params.id) {
-      res.status(404).json({ error: "Machine not found in this server" });
+      refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
       return;
     }
-    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "editMachines")) {
-      res.status(403).json({ error: "The `editMachines` capability or machine creator authority is required to inspect runtime models" });
+    if (!await canManageComputer(getDb(), { userId: req.userId!, role: callerRole }, req.params.id, machine, "edit")) {
+      refuse(res, 403, { code: "insufficient_role", error: "The `editMachines` capability or machine creator authority is required to inspect runtime models" });
       return;
     }
     observedDaemonVersion = machine.daemonVersion;
@@ -5139,10 +5325,12 @@ async function authorizeMentionDeliveryDiagnostic(req: Request) {
 serverRouter.get("/:id/machines/:machineId/agents/:agentId/diagnostic/mention-delivery/:messageId", async (req, res) => {
   try {
     if (!UUID_RE.test(req.params.messageId)) {
+      // refusal-ok: the mention delivery diagnostic's own answer, `{ status }` with no sentence, the shape its 200 answer has
       res.status(404).json({ status: "NOT_JOINABLE" });
       return;
     }
     if (!await authorizeMentionDeliveryDiagnostic(req)) {
+      // refusal-ok: the mention delivery diagnostic's own answer, `{ status }` with no sentence, the shape its 200 answer has
       res.status(404).json({ status: "NOT_ACCESSIBLE" });
       return;
     }
@@ -5164,10 +5352,12 @@ serverRouter.get("/:id/machines/:machineId/agents/:agentId/diagnostic/mention-de
 serverRouter.post("/:id/machines/:machineId/agents/:agentId/diagnostic/mention-delivery/:messageId/redrive", async (req, res) => {
   try {
     if (!UUID_RE.test(req.params.messageId)) {
+      // refusal-ok: the mention delivery diagnostic's own answer, `{ status }` with no sentence, the shape its 200 answer has
       res.status(404).json({ status: "NOT_JOINABLE" });
       return;
     }
     if (!await authorizeMentionDeliveryDiagnostic(req)) {
+      // refusal-ok: the mention delivery diagnostic's own answer, `{ status }` with no sentence, the shape its 200 answer has
       res.status(404).json({ status: "NOT_ACCESSIBLE" });
       return;
     }
@@ -5180,6 +5370,7 @@ serverRouter.post("/:id/machines/:machineId/agents/:agentId/diagnostic/mention-d
       || !Number.isSafeInteger(body.expectedVersion)
       || (body.expectedVersion as number) < 0
     ) {
+      // refusal-ok: the redrive diagnostic's own answer, `{ status }` with no sentence, the shape its 200 and computed-status answers have
       res.status(400).json({ status: "INVALID_REQUEST" });
       return;
     }
@@ -5210,27 +5401,27 @@ serverRouter.get("/:id/machines/:machineId/agents/:agentId/diagnostic/session-tr
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
 
     const machine = await machineService.getMachine(asMachineId(req.params.machineId));
     if (!machine || machine.serverId !== req.params.id) {
-      res.status(404).json({ error: "Machine not found in this server" });
+      refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
       return;
     }
 
     const agent = await agentService.getAgent(req.params.agentId);
     if (!agent || agent.serverId !== req.params.id) {
-      res.status(404).json({ error: "Agent not found in this server" });
+      refuse(res, 404, { code: "agent_not_found", error: "Agent not found in this server" });
       return;
     }
     if (agent.machineId !== req.params.machineId) {
-      res.status(400).json({ error: "Agent is not assigned to this machine" });
+      refuse(res, 400, { code: "invalid_request", error: "Agent is not assigned to this machine" });
       return;
     }
     if (!await canInspectAgentPrivateSurfaces(req.params.id, req.userId!, agent)) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to view agent diagnostics" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `editAgents` capability or human creator authority is required to view agent diagnostics" });
       return;
     }
 
@@ -5272,27 +5463,27 @@ serverRouter.post("/:id/machines/:machineId/agents/:agentId/feedback/:reportId/t
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
 
     const machine = await machineService.getMachine(asMachineId(req.params.machineId));
     if (!machine || machine.serverId !== req.params.id) {
-      res.status(404).json({ error: "Machine not found in this server" });
+      refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
       return;
     }
 
     const agent = await agentService.getAgent(req.params.agentId);
     if (!agent || agent.serverId !== req.params.id) {
-      res.status(404).json({ error: "Agent not found in this server" });
+      refuse(res, 404, { code: "agent_not_found", error: "Agent not found in this server" });
       return;
     }
     if (agent.machineId !== req.params.machineId) {
-      res.status(400).json({ error: "Agent is not assigned to this machine" });
+      refuse(res, 400, { code: "invalid_request", error: "Agent is not assigned to this machine" });
       return;
     }
     if (!await canInspectAgentPrivateSurfaces(req.params.id, req.userId!, agent)) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to request transcript collection" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `editAgents` capability or human creator authority is required to request transcript collection" });
       return;
     }
 
@@ -5320,7 +5511,7 @@ serverRouter.post("/:id/machines/:machineId/agents/:agentId/feedback/:reportId/t
         || !Number.isFinite(Date.parse(requestedReportGeneratedAt))
       )
     ) {
-      res.status(400).json({ error: "reportGeneratedAt must be an ISO timestamp" });
+      refuse(res, 400, { code: "invalid_input", error: "reportGeneratedAt must be an ISO timestamp" });
       return;
     }
     const reportGeneratedAt = typeof requestedReportGeneratedAt === "string"
@@ -5330,20 +5521,22 @@ serverRouter.post("/:id/machines/:machineId/agents/:agentId/feedback/:reportId/t
       ? "web_report_bundle"
       : "server_request_received";
     // Tier 2 (task #272): the machine's runner log tail is free text about
-    // every agent on that machine, so only the machine OWNER may attach it,
-    // and only by explicit opt-in per report. Checked here on the receiving
-    // side against the machine row — hiding the checkbox in the web UI is not
-    // the authorization.
+    // every agent on that machine, so only someone who may read the machine's
+    // other machine-wide private state (its workspaces, runtime sign-in
+    // status, account usage: `edit`) may attach it: its controller (the live
+    // attacher) or an owner/admin (canManageComputer). Only by explicit opt-in
+    // per report. Checked here on the receiving side; hiding the checkbox in
+    // the web UI is not the authorization.
     const requestedMachineLogTail = req.body?.includeMachineLogTail;
     if (requestedMachineLogTail !== undefined && typeof requestedMachineLogTail !== "boolean") {
-      res.status(400).json({ error: "includeMachineLogTail must be a boolean" });
+      refuse(res, 400, { code: "invalid_input", error: "includeMachineLogTail must be a boolean" });
       return;
     }
     const includeMachineLogTail = requestedMachineLogTail === true;
-    if (includeMachineLogTail && await computerControllerUserId(getDb(), req.params.id, machine) !== req.userId) {
-      res.status(403).json({
-        error: "Only the human who attached this machine may include its runner log tail in a report",
+    if (includeMachineLogTail && !await canManageComputer(getDb(), { userId: req.userId!, role: callerRole }, req.params.id, machine, "edit")) {
+      refuse(res, 403, {
         code: "machine_log_tail_owner_required",
+        error: "Only the person this machine's Computer is attached by, or a server owner or admin, may include its runner log tail in a report",
       });
       return;
     }
@@ -5404,16 +5597,16 @@ serverRouter.delete("/:id/machines/:machineId/workspaces/:directoryName", async 
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (!callerRole) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const machine = await machineService.getMachine(asMachineId(req.params.machineId));
     if (!machine || machine.serverId !== req.params.id) {
-      res.status(404).json({ error: "Machine not found in this server" });
+      refuse(res, 404, MACHINE_NOT_IN_SERVER_REFUSAL);
       return;
     }
-    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "controlComputers")) {
-      res.status(403).json({ error: "The `controlComputers` capability or machine creator authority is required to delete machine workspaces" });
+    if (!await canManageComputer(getDb(), { userId: req.userId!, role: callerRole }, req.params.id, machine, "control")) {
+      refuse(res, 403, { code: "insufficient_role", error: "The `controlComputers` capability or machine creator authority is required to delete machine workspaces" });
       return;
     }
 
@@ -5425,7 +5618,7 @@ serverRouter.delete("/:id/machines/:machineId/workspaces/:directoryName", async 
     // confirm what lives on the host.
     const ownAgents = await agentService.listAgents(req.params.id, true);
     if (!ownAgents.some((agent) => agent.id === req.params.directoryName)) {
-      res.status(404).json({ error: "Workspace not found in this server" });
+      refuse(res, 404, { code: "not_found", error: "Workspace not found in this server" });
       return;
     }
 
@@ -5479,7 +5672,7 @@ serverRouter.get("/:id/public-visibility", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (callerRole !== "owner") {
-      res.status(403).json({ error: "Only the server owner can manage public visibility" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only the server owner can manage public visibility" });
       return;
     }
     const gate = await evaluateFeatureFlag({
@@ -5489,7 +5682,7 @@ serverRouter.get("/:id/public-visibility", async (req, res) => {
       platform: "web",
     });
     if (!gate.enabled) {
-      res.status(404).json({ error: "Not found" });
+      refuse(res, 404, { code: "not_found", error: "Not found" });
       return;
     }
     const [server] = await getDb()
@@ -5502,7 +5695,7 @@ serverRouter.get("/:id/public-visibility", async (req, res) => {
       .where(eq(servers.id, req.params.id))
       .limit(1);
     if (!server) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     const exposed = await getDb()
@@ -5531,7 +5724,7 @@ serverRouter.patch("/:id/public-visibility", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (callerRole !== "owner") {
-      res.status(403).json({ error: "Only the server owner can manage public visibility" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only the server owner can manage public visibility" });
       return;
     }
     const gate = await evaluateFeatureFlag({
@@ -5541,12 +5734,12 @@ serverRouter.patch("/:id/public-visibility", async (req, res) => {
       platform: "web",
     });
     if (!gate.enabled) {
-      res.status(404).json({ error: "Not found" });
+      refuse(res, 404, { code: "not_found", error: "Not found" });
       return;
     }
     const { publiclyVisible } = req.body ?? {};
     if (typeof publiclyVisible !== "boolean") {
-      res.status(400).json({ error: "publiclyVisible must be a boolean" });
+      refuse(res, 400, { code: "invalid_input", error: "publiclyVisible must be a boolean" });
       return;
     }
     const [updated] = await getDb().transaction(async (tx) => {
@@ -5566,7 +5759,7 @@ serverRouter.patch("/:id/public-visibility", async (req, res) => {
       return result;
     });
     if (!updated) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     res.json(updated);
@@ -5583,7 +5776,7 @@ serverRouter.patch("/:id/public-search", async (req, res) => {
   try {
     const callerRole = await getActorServerRoleInServer(req.params.id, "user", req.userId!);
     if (callerRole !== "owner") {
-      res.status(403).json({ error: "Only the server owner can manage public search" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only the server owner can manage public search" });
       return;
     }
     const gate = await evaluateFeatureFlag({
@@ -5593,12 +5786,12 @@ serverRouter.patch("/:id/public-search", async (req, res) => {
       platform: "web",
     });
     if (!gate.enabled) {
-      res.status(404).json({ error: "Not found" });
+      refuse(res, 404, { code: "not_found", error: "Not found" });
       return;
     }
     const { publicSearchEnabled } = req.body ?? {};
     if (typeof publicSearchEnabled !== "boolean") {
-      res.status(400).json({ error: "publicSearchEnabled must be a boolean" });
+      refuse(res, 400, { code: "invalid_input", error: "publicSearchEnabled must be a boolean" });
       return;
     }
     // The role read above is only an early answer. The write re-authorizes
@@ -5613,13 +5806,13 @@ serverRouter.patch("/:id/public-search", async (req, res) => {
         .returning({ publicSearchEnabled: servers.publicSearchEnabled });
     });
     if (!updated) {
-      res.status(404).json({ error: "Server not found" });
+      refuse(res, 404, SERVER_NOT_FOUND_REFUSAL);
       return;
     }
     res.json(updated);
   } catch (error) {
     if (error instanceof ServerMembershipRevokedError || error instanceof FencedAuthorizationDeniedError) {
-      res.status(403).json({ error: "Only the server owner can manage public search" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only the server owner can manage public search" });
       return;
     }
     res.status(500).json({ error: "Failed to update public search" });

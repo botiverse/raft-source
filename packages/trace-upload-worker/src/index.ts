@@ -10,6 +10,7 @@ import {
   putFeedbackReportObject,
 } from "./feedback/reports";
 import { ANTIPROTON_TRACE_PATH, ingestAntiprotonTraceBatch } from "./external/antiprotonTrace";
+import { DEV_EVENTS_PATH, ingestDevEvents } from "./external/devEvents";
 import { GITHUB_REFRESH_PATH, ingestGithubRefreshBatch } from "./external/githubRefresh";
 import { HttpError, jsonResponse } from "./shared/http";
 import { createTraceBundleUpload, putTraceBundleObject } from "./traces/bundles";
@@ -35,6 +36,9 @@ export async function handleRequest(request: Request, env: TraceUploadWorkerEnv,
     }
     if (request.method === "POST" && url.pathname === GITHUB_REFRESH_PATH) {
       return await ingestGithubRefreshBatch(request, env);
+    }
+    if (request.method === "POST" && url.pathname === DEV_EVENTS_PATH) {
+      return await ingestDevEvents(request, env);
     }
     if (request.method === "POST" && url.pathname === ANTIPROTON_TRACE_PATH) {
       return await ingestAntiprotonTraceBatch(request, env);

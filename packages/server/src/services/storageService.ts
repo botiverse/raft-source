@@ -2,7 +2,18 @@ import path from "node:path";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { Agent as HttpsAgent } from "node:https";
-import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
+import {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+  DeleteObjectCommand,
+  HeadObjectCommand,
+  CreateMultipartUploadCommand,
+  UploadPartCommand,
+  CompleteMultipartUploadCommand,
+  AbortMultipartUploadCommand,
+  ListMultipartUploadsCommand,
+} from "@aws-sdk/client-s3";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { Readable } from "node:stream";
@@ -131,6 +142,36 @@ function countAgentEntries(entries: Record<string, unknown[] | undefined>): numb
   return Object.values(entries).reduce((total, values) => total + (values?.length ?? 0), 0);
 }
 
+/**
+ * Upload one object in parts (data exports: an archive streamed while it is
+ * written, never whole in memory). The caller keeps `uploadId` so a lost run
+ * can abort it. On R2 every part but the last must have the same size.
+ */
+/** Data export archives (private legacy bucket; never served publicly). */
+export const DATA_EXPORT_STORAGE_KEY_PREFIX = "data-exports/";
+
+export interface MultipartStorage {
+  createMultipartUpload(key: string, contentType: string): Promise<string>;
+  /** Returns the part's ETag, needed to complete. Part numbers start at 1. */
+  uploadPart(key: string, uploadId: string, partNumber: number, body: Buffer): Promise<string>;
+  completeMultipartUpload(key: string, uploadId: string, parts: ReadonlyArray<{ partNumber: number; etag: string }>): Promise<void>;
+  /** Discard the parts uploaded so far. An unknown or finished upload is not an error. */
+  abortMultipartUpload(key: string, uploadId: string): Promise<void>;
+  /**
+   * Every unfinished upload under `prefix`, whether or not anyone recorded its
+   * id: the export maintenance aborts the abandoned ones (a run that died
+   * between creating an upload and recording it). `initiatedAt` is when the
+   * upload began (S3) or last took a part (local disk).
+   */
+  listMultipartUploads(prefix: string): Promise<MultipartUploadListing[]>;
+}
+
+export interface MultipartUploadListing {
+  key: string;
+  uploadId: string;
+  initiatedAt: Date;
+}
+
 export interface StorageBackend {
   /** Store a file. Returns the storage key. */
   put(key: string, data: Buffer, contentType: string): Promise<void>;
@@ -153,6 +194,8 @@ export interface StorageBackend {
   getRange?(key: string, start: number, end: number): Promise<Readable>;
   /** Delete a file. */
   delete(key: string): Promise<void>;
+  /** Multipart upload, where the backend supports it. */
+  multipart?: MultipartStorage;
   /** Read server-trusted object metadata without downloading the body. */
   head?(key: string): Promise<{
     sizeBytes: number;
@@ -301,6 +344,22 @@ export function createAttachmentStorageRouter(
   if (legacy.getPresignedPutUrl && (!directUpload || directUpload.getPresignedPutUrl)) {
     routed.getPresignedPutUrl = (key, options) =>
       requireStorageOperation(backendFor(key), "getPresignedPutUrl")(key, options);
+  }
+  if (legacy.multipart && (!directUpload || directUpload.multipart)) {
+    const multipartFor = (key: string): MultipartStorage => {
+      // Only data exports upload in parts; attachments keep their single-PUT paths.
+      if (!key.startsWith(DATA_EXPORT_STORAGE_KEY_PREFIX)) throw new Error("Multipart is only for data export keys");
+      const backend = backendFor(key).multipart;
+      if (!backend) throw new Error("Storage backend does not support multipart");
+      return backend;
+    };
+    routed.multipart = {
+      createMultipartUpload: async (key, contentType) => multipartFor(key).createMultipartUpload(key, contentType),
+      uploadPart: async (key, uploadId, partNumber, body) => multipartFor(key).uploadPart(key, uploadId, partNumber, body),
+      completeMultipartUpload: async (key, uploadId, parts) => multipartFor(key).completeMultipartUpload(key, uploadId, parts),
+      abortMultipartUpload: async (key, uploadId) => multipartFor(key).abortMultipartUpload(key, uploadId),
+      listMultipartUploads: async (prefix) => multipartFor(prefix).listMultipartUploads(prefix),
+    };
   }
 
   return routed;
@@ -529,6 +588,80 @@ class LocalStorage implements StorageBackend {
   private dir: string;
   private sentinel: string | null;
   private readonly sentinelName = ".raft-storage-presence-v2";
+
+  /** Parts are files beside the target, joined in order on complete. */
+  readonly multipart: MultipartStorage = {
+    createMultipartUpload: async (key) => {
+      const uploadId = randomUUID();
+      fs.mkdirSync(this.partsDir(key, uploadId), { recursive: true });
+      return uploadId;
+    },
+    uploadPart: async (key, uploadId, partNumber, body) => {
+      const dir = this.partsDir(key, uploadId);
+      if (!fs.existsSync(dir)) throw new Error("Multipart upload not found");
+      if (!Number.isSafeInteger(partNumber) || partNumber < 1) throw new Error("Multipart part number is invalid");
+      fs.writeFileSync(path.join(dir, String(partNumber)), body);
+      return `"${partNumber}-${body.length}"`;
+    },
+    completeMultipartUpload: async (key, uploadId, parts) => {
+      const dir = this.partsDir(key, uploadId);
+      if (!fs.existsSync(dir)) throw new Error("Multipart upload not found");
+      const filePath = this.resolveSafe(key);
+      const temporaryPath = `${filePath}.${randomUUID()}.part`;
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      try {
+        await fs.promises.writeFile(temporaryPath, Buffer.alloc(0), { flag: "wx" });
+        for (const [index, part] of parts.entries()) {
+          if (part.partNumber !== index + 1) throw new Error("Multipart parts are not in order");
+          // One part (8 MiB) at a time, off the event loop.
+          await fs.promises.appendFile(temporaryPath, await fs.promises.readFile(path.join(dir, String(part.partNumber))));
+        }
+        fs.renameSync(temporaryPath, filePath);
+      } finally {
+        if (fs.existsSync(temporaryPath)) fs.unlinkSync(temporaryPath);
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+    abortMultipartUpload: async (key, uploadId) => {
+      fs.rmSync(this.partsDir(key, uploadId), { recursive: true, force: true });
+    },
+    listMultipartUploads: async (prefix) => {
+      // The parts directories (`<target>.multipart-<uploadId>`) under the
+      // prefix's directory, at any depth.
+      const root = this.resolveSafe(prefix.endsWith("/") ? prefix : path.dirname(prefix));
+      const found: MultipartUploadListing[] = [];
+      const walk = async (dir: string): Promise<void> => {
+        let entries: fs.Dirent[];
+        try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); }
+        catch (error) {
+          if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+          throw error;
+        }
+        for (const entry of entries) {
+          if (!entry.isDirectory()) continue;
+          const full = path.join(dir, entry.name);
+          const match = /^(.*)\.multipart-([0-9a-f-]{36})$/.exec(entry.name);
+          if (!match) {
+            await walk(full);
+            continue;
+          }
+          const key = path.relative(this.dir, path.join(dir, match[1]!)).split(path.sep).join("/");
+          if (!key.startsWith(prefix)) continue;
+          found.push({ key, uploadId: match[2]!, initiatedAt: (await fs.promises.stat(full)).mtime });
+        }
+      };
+      await walk(root);
+      return found;
+    },
+  };
+
+  private partsDir(key: string, uploadId: string): string {
+    if (!/^[0-9a-f-]{36}$/.test(uploadId)) throw new Error("Multipart upload id is invalid");
+    const target = this.resolveSafe(key);
+    // The root itself is no object: its parts directory would sit beside the root.
+    if (target === this.dir) throw new Error("Multipart key is invalid");
+    return `${target}.multipart-${uploadId}`;
+  }
 
   constructor(dir: string) {
     this.dir = dir;
@@ -877,6 +1010,68 @@ class S3Storage implements StorageBackend {
       Key: key,
     }));
   }
+
+  readonly multipart: MultipartStorage = {
+    createMultipartUpload: async (key, contentType) => {
+      const response = await this.client.send(new CreateMultipartUploadCommand({
+        Bucket: this.bucket,
+        Key: key,
+        ContentType: contentType,
+      }));
+      if (!response.UploadId) throw new Error("Storage did not return a multipart upload id");
+      return response.UploadId;
+    },
+    uploadPart: async (key, uploadId, partNumber, body) => {
+      const response = await this.client.send(new UploadPartCommand({
+        Bucket: this.bucket,
+        Key: key,
+        UploadId: uploadId,
+        PartNumber: partNumber,
+        Body: body,
+        ContentLength: body.length,
+      }));
+      if (!response.ETag) throw new Error("Storage did not return a part ETag");
+      return response.ETag;
+    },
+    completeMultipartUpload: async (key, uploadId, parts) => {
+      await this.client.send(new CompleteMultipartUploadCommand({
+        Bucket: this.bucket,
+        Key: key,
+        UploadId: uploadId,
+        MultipartUpload: { Parts: parts.map((part) => ({ PartNumber: part.partNumber, ETag: part.etag })) },
+      }));
+    },
+    abortMultipartUpload: async (key, uploadId) => {
+      try {
+        await this.client.send(new AbortMultipartUploadCommand({ Bucket: this.bucket, Key: key, UploadId: uploadId }));
+      } catch (error) {
+        // Already completed or aborted: nothing left to discard.
+        if (error instanceof Error && error.name === "NoSuchUpload") return;
+        throw error;
+      }
+    },
+    listMultipartUploads: async (prefix) => {
+      const found: MultipartUploadListing[] = [];
+      let keyMarker: string | undefined;
+      let uploadIdMarker: string | undefined;
+      // One page is at most 1000 uploads; the markers continue after the last one.
+      for (;;) {
+        const page = await this.client.send(new ListMultipartUploadsCommand({
+          Bucket: this.bucket,
+          Prefix: prefix,
+          ...(keyMarker ? { KeyMarker: keyMarker } : {}),
+          ...(uploadIdMarker ? { UploadIdMarker: uploadIdMarker } : {}),
+        }));
+        for (const upload of page.Uploads ?? []) {
+          if (upload.Key && upload.UploadId) found.push({ key: upload.Key, uploadId: upload.UploadId, initiatedAt: upload.Initiated ?? new Date(0) });
+        }
+        if (!page.IsTruncated) return found;
+        if (!page.NextKeyMarker && !page.NextUploadIdMarker) throw new Error("Storage listed a truncated page without a marker");
+        keyMarker = page.NextKeyMarker;
+        uploadIdMarker = page.NextUploadIdMarker;
+      }
+    },
+  };
 
   async head(key: string): Promise<{ sizeBytes: number; contentType: string | null; etag: string | null } | null> {
     try {

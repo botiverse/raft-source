@@ -68,6 +68,7 @@ export function toAgentMessageLike(envelope: AgentApiMessageEnvelope): AgentMess
     sender_type: envelope.sender_type ?? envelope.senderType,
     sender_name: envelope.sender_name ?? envelope.senderName,
     sender_description: envelope.sender_description ?? envelope.senderDescription ?? null,
+    sender_origin: envelope.sender_origin ?? envelope.senderOrigin ?? null,
     sender_timezone: envelope.sender_timezone ?? envelope.senderTimezone ?? null,
     delegated_by: envelope.delegated_by
       ?? ((envelope as { delegatedBy?: { name?: unknown } | null }).delegatedBy?.name

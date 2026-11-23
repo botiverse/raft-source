@@ -1,9 +1,8 @@
-import { useCallback, useMemo } from "react";
+import { useCallback } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
-import { createPortal } from "react-dom";
 import { useIntl } from "react-intl";
 import { FolderOpen } from "lucide-react";
-import { ContextMenuPopup } from "@botiverse/raft-ui";
+import { AnchoredMenuPopover } from "../../components/ui/AnchoredMenuPopover";
 import DismissBackdrop from "../../components/ui/DismissBackdrop";
 import MenuItem from "../../components/ui/MenuItem";
 import { focusFirstMenuButton, stopMouseDownPropagation } from "./searchMenuEvents";
@@ -20,10 +19,6 @@ export function SearchChannelContextMenu({
   onOpen: () => void;
 }) {
   const { formatMessage } = useIntl();
-  const channelContextMenuStyle = useMemo(
-    () => ({ left: menu.x, top: menu.y }),
-    [menu],
-  );
   const handleChannelContextMenuKeyDown = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -31,15 +26,17 @@ export function SearchChannelContextMenu({
       onClose();
     }
   }, [onClose]);
-  return createPortal(
+  return (
     <>
       <DismissBackdrop onDismiss={onClose} trapContextMenu />
-      <ContextMenuPopup
+      <AnchoredMenuPopover
+        open
+        anchor={menu.anchor}
+        onAnchorHidden={onClose}
         ref={focusFirstMenuButton}
         role="menu"
         aria-label={formatMessage({ id: "search.channelMenuAria" }, { title: menu.result.title })}
-        className="fixed z-popup w-48 select-none"
-        style={channelContextMenuStyle}
+        className="min-w-0 w-48"
         onMouseDown={stopMouseDownPropagation}
         onKeyDown={handleChannelContextMenuKeyDown}
       >
@@ -49,8 +46,7 @@ export function SearchChannelContextMenu({
         >
           {formatMessage({ id: "search.open" })}
         </MenuItem>
-      </ContextMenuPopup>
-    </>,
-    document.body,
+      </AnchoredMenuPopover>
+    </>
   );
 }

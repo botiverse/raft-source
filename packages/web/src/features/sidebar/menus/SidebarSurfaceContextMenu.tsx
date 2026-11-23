@@ -1,11 +1,10 @@
-import { ContextMenuPopup } from "@botiverse/raft-ui";
-import { createPortal } from "react-dom";
 import { Plus, GitBranch, FolderPlus } from "lucide-react";
 import { ExternalChannelIcon } from "../../../components/channel/channelKindIcon";
+import { AnchoredMenuPopover } from "../../../components/ui/AnchoredMenuPopover";
 import ContextMenuDivider from "../../../components/ui/ContextMenuDivider";
 import MenuItem from "../../../components/ui/MenuItem";
 import DismissBackdrop from "../../../components/ui/DismissBackdrop";
-import { getSidebarContextMenuStyle, stopSidebarContextMenuPropagation } from "../sidebarContextMenu";
+import { stopSidebarContextMenuPropagation } from "../sidebarContextMenu";
 import type { SidebarData } from "../hooks/useSidebarData";
 import type { SidebarViewState } from "../hooks/useSidebarViewState";
 import type { SidebarSync } from "../hooks/useSidebarSync";
@@ -22,23 +21,24 @@ export function SidebarSurfaceContextMenu({ data, view, sync, menuActions }: {
   menuActions: SidebarMenuActions;
 }) {
   const { formatMessage, externalChannelsEnabled } = data;
-  const { sidebarSurfaceCtxMenu, sidebarSurfaceCtxMenuRef, canManageServer, canCreateJointChannel } = view;
+  const { sidebarSurfaceCtxMenu, canManageServer, canCreateJointChannel } = view;
   const { closeSidebarSurfaceCtx } = sync;
   const {
     createChannelFromSurfaceMenu, createJointChannelFromSurfaceMenu, createSectionFromSurfaceMenu,
   } = menuActions;
   return (
     <>
-      {sidebarSurfaceCtxMenu && createPortal(
+      {sidebarSurfaceCtxMenu && (
         <>
           <DismissBackdrop onDismiss={closeSidebarSurfaceCtx} trapContextMenu />
-          <ContextMenuPopup
-            ref={sidebarSurfaceCtxMenuRef}
+          <AnchoredMenuPopover
+            open
+            anchor={sidebarSurfaceCtxMenu.anchor}
+            onAnchorHidden={closeSidebarSurfaceCtx}
             role="menu"
             aria-label={formatMessage({ id: "layout.sidebar.sidebarOptionsAria" })}
             data-testid="sidebar-surface-context-menu"
-            className="fixed z-popup w-60 select-none"
-            style={getSidebarContextMenuStyle(sidebarSurfaceCtxMenu)}
+            className="w-60"
             onMouseDown={stopSidebarContextMenuPropagation}
           >
             {canManageServer && (
@@ -64,9 +64,8 @@ export function SidebarSurfaceContextMenu({ data, view, sync, menuActions }: {
             >
               {formatMessage({ id: "layout.sidebar.newSectionMenu" })}
             </MenuItem>
-          </ContextMenuPopup>
-        </>,
-        document.body,
+          </AnchoredMenuPopover>
+        </>
       )}
     </>
   );

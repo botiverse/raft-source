@@ -1,12 +1,13 @@
 import { handlerTraceEvents } from "../test/handlerTraceEvents";
-import { PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY, type TrajectoryEntry } from "@botiverse/raft-shared";
+import { type TrajectoryEntry } from "@botiverse/raft-shared";
 import { tokenForHuman, fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 
 import { createHmac, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
-import { and, eq } from "drizzle-orm";
+import { readFile, readdir } from "node:fs/promises";
+import { and, eq, sql } from "drizzle-orm";
 import {
   BasicTracer,
   AGENT_MIGRATION_BUNDLE_CONTENT_TYPE,
@@ -36,8 +37,9 @@ import { createOAuthClient } from "../services/oauthService";
 import {
   AgentOrchestrator,
   KimiReasoningEffortUpgradeRequiredError,
+  BuiltInProviderMissingStartError,
 } from "../services/agentOrchestrator";
-import { addMember, createServer, getAgentMemberRole, getServer, updateServerOnboardingAgent, removeMember } from "../services/serverService";
+import { addMember, createServer, getAgentMemberRole, getServer, linkOfficialOnboardingAgent, removeMember, updateServerOnboardingSettings } from "../services/serverService";
 import {
   createAgent,
   deleteAgent,
@@ -299,13 +301,12 @@ test("agent create persists structured runtimeConfig and strips it from non-admi
     assert.deepEqual(created.envVars, {
       TEAM_FLAG: "enabled",
       ANTHROPIC_BASE_URL: "https://gateway.example.test/v1",
-      ANTHROPIC_API_KEY: "sk-ant-test",
       ANTHROPIC_CUSTOM_MODEL_OPTION: "claude-opus-4-6",
     });
     assert.deepEqual(created.runtimeConfig, {
       version: 1,
       runtime: "claude",
-      provider: { kind: "custom", apiUrl: "https://gateway.example.test/v1", apiKey: "sk-ant-test" },
+      provider: { kind: "custom", apiUrl: "https://gateway.example.test/v1", apiKey: "" },
       model: { kind: "custom", name: "claude-opus-4-6" },
       mode: { kind: "default" },
       reasoningEffort: null,
@@ -335,7 +336,7 @@ test("agent create persists structured runtimeConfig and strips it from non-admi
     assert.deepEqual(patched.runtimeConfig, {
       version: 1,
       runtime: "claude",
-      provider: { kind: "custom", apiUrl: "https://gateway.example.test/v1", apiKey: "sk-ant-test" },
+      provider: { kind: "custom", apiUrl: "https://gateway.example.test/v1", apiKey: "" },
       model: { kind: "custom", name: "claude-opus-4-6" },
       mode: { kind: "default" },
       reasoningEffort: null,
@@ -345,9 +346,12 @@ test("agent create persists structured runtimeConfig and strips it from non-admi
     assert.deepEqual(patched.envVars, {
       TEAM_FLAG: "changed",
       ANTHROPIC_BASE_URL: "https://gateway.example.test/v1",
-      ANTHROPIC_API_KEY: "sk-ant-test",
       ANTHROPIC_CUSTOM_MODEL_OPTION: "claude-opus-4-6",
     });
+    // Stored row keeps the real provider key (decrypted through getAgent; encrypted at rest in DB).
+    const storedAfterPatch = await getAgent(created.id);
+    assert.equal((storedAfterPatch?.runtimeConfig as { provider?: { apiKey?: string } } | null)?.provider?.apiKey, "sk-ant-test");
+    assert.equal(storedAfterPatch?.envVars?.ANTHROPIC_API_KEY, "sk-ant-test");
     // Create recorded the initial configuration; an env-only PATCH (runtime_config
     // changed, runtime/model/effort did not) adds nothing, and no secret is copied.
     const configEvents = await db.select().from(agentConfigChangeEvents).where(eq(agentConfigChangeEvents.agentId, created.id));
@@ -1850,7 +1854,7 @@ const stubCatalogWithoutCustomModels = (app: { app: { get: (k: string) => unknow
   const counter = { calls: 0 };
   Object.assign(app.app.get("agentOrchestrator") as object, {
     hasMachineLocally: () => true,
-    validateBuiltInPresetForMachine: async (machineId: string, config: Parameters<typeof assertBuiltInPresetSupportedByCatalog>[0], connectionProviderId: string | null) => {
+    validateBuiltInPresetForMachine: async (machineId: string, config: Parameters<typeof assertBuiltInPresetSupportedByCatalog>[0]) => {
       counter.calls += 1;
       const validation = assertBuiltInPresetSupportedByCatalog(
         config,
@@ -1862,7 +1866,6 @@ const stubCatalogWithoutCustomModels = (app: { app: { get: (k: string) => unknow
           },
         },
         { machineId, daemonVersion: "1.0.67", computerVersion: "1.0.67" },
-        connectionProviderId,
       );
       return validation ? { ...validation, authority: { connectionEpochId: "e", replicaGeneration: "g" } } : null;
     },
@@ -3063,10 +3066,11 @@ test("PATCH /agents/:id codex model switch forces session reset even when caller
     assert.deepEqual(resetCall, { agentId: agent.id, mode: "session", options: { restartIfStopped: false, terminalControl: "runtime_config_changed" } });
 });
 
-test("PATCH /agents/:id codex model switch without restartMode clears the stored session; other edits and runtimes keep it", async ({ app }) => {
-  // #proj-raft-computer:#48: the session clear used to ride on restartMode, and
-  // the web sends none for a stopped agent, so its next start resumed the old
-  // Codex thread on the old model.
+test("PATCH /agents/:id model switch clears session on Codex always, on other runtimes only when Computer advertises constructed-init:v1; reasoning effort and profile edits keep it", async ({ app, db }) => {
+  // #proj-runtime:#80: Codex always drops its session on model switch
+  // (`thread/resume` pins the model). Other runtimes drop their session on
+  // model switch only when the agent's Computer advertises `constructed-init:v1`
+  // so older Computers keep resuming and never lose working context.
   const owner = await seedUser("codex-model-no-restart@slock.test", "codex-model-no-restart");
   const server = await createServer("Codex Model No Restart", "codex-model-no-restart", owner.id);
   const token = await tokenForHuman(owner.email);
@@ -3074,7 +3078,31 @@ test("PATCH /agents/:id codex model switch without restartMode clears the stored
   const patch = (agentId: string, body: Record<string, unknown>) =>
     fetch(`${app.baseUrl}/api/agents/${agentId}`, { method: "PATCH", headers, body: JSON.stringify(body) });
 
-  const codex = await createAgent(server.id, "codex-no-restart-agent", { runtime: "codex", model: "gpt-5.3-codex" });
+  const [oldMachine] = await db.insert(machines).values({
+    serverId: server.id,
+    userId: owner.id,
+    name: "old-computer",
+    apiKeyHash: "old-computer-hash-constructed-init",
+    runtimes: ["codex", "claude"],
+  }).returning();
+  const [newMachine] = await db.insert(machines).values({
+    serverId: server.id,
+    userId: owner.id,
+    name: "new-computer",
+    apiKeyHash: "new-computer-hash-constructed-init",
+    runtimes: ["codex", "claude"],
+  }).returning();
+  const originalOrchestrator = app.app.get("agentOrchestrator") as Record<string, unknown>;
+  app.app.set("agentOrchestrator", {
+    ...originalOrchestrator,
+    evictCache: () => {},
+    liftWakeBlockForConfigChange: async () => {},
+    applyAgentConfig: async () => "no_daemon",
+    machineAdvertisesCapability: async (machineId: string, capability: string) =>
+      machineId === newMachine!.id && capability === "constructed-init:v1",
+  });
+
+  const codex = await createAgent(server.id, "codex-no-restart-agent", { runtime: "codex", model: "gpt-5.3-codex", machineId: oldMachine!.id });
   await updateAgentStatus(codex.id, "inactive", "codex-session-id");
   const described = await patch(codex.id, { description: "only the description" });
   assert.equal(described.status, 200, await described.clone().text());
@@ -3082,15 +3110,40 @@ test("PATCH /agents/:id codex model switch without restartMode clears the stored
 
   const switched = await patch(codex.id, { model: "gpt-5.6-sol" });
   assert.equal(switched.status, 200, await switched.clone().text());
+  assert.equal((await switched.json() as { configApplyNewSession?: boolean }).configApplyNewSession, true);
   const after = await getAgent(codex.id);
   assert.equal(after?.model, "gpt-5.6-sol");
-  assert.equal(after?.sessionId, null, "a Codex model switch clears the session without restartMode");
+  assert.equal(after?.sessionId, null, "a Codex model switch clears the session even on an older Computer");
 
-  const claude = await createAgent(server.id, "claude-no-restart-agent", { runtime: "claude", model: "sonnet" });
-  await updateAgentStatus(claude.id, "inactive", "claude-session-id");
-  const claudeSwitched = await patch(claude.id, { model: "opus" });
-  assert.equal(claudeSwitched.status, 200, await claudeSwitched.clone().text());
-  assert.equal((await getAgent(claude.id))?.sessionId, "claude-session-id", "other runtimes keep their session");
+  const codexEffortAgent = await createAgent(server.id, "codex-effort-only-agent", { runtime: "codex", model: "gpt-5.3-codex", machineId: newMachine!.id });
+  await updateAgentStatus(codexEffortAgent.id, "inactive", "codex-effort-session-id");
+  const effortOnly = await patch(codexEffortAgent.id, { reasoningEffort: "high" });
+  assert.equal(effortOnly.status, 200, await effortOnly.clone().text());
+  assert.equal((await effortOnly.json() as { configApplyNewSession?: boolean }).configApplyNewSession, false);
+  assert.equal((await getAgent(codexEffortAgent.id))?.sessionId, "codex-effort-session-id", "a reasoning-effort-only edit keeps the session");
+
+  // Older Computer without constructed-init:v1 -> Claude model switch preserves sessionId so context is not lost.
+  const claudeOld = await createAgent(server.id, "claude-old-computer-agent", { runtime: "claude", model: "sonnet", machineId: oldMachine!.id });
+  await updateAgentStatus(claudeOld.id, "inactive", "claude-old-session-id");
+  const claudeOldSwitched = await patch(claudeOld.id, { model: "opus" });
+  assert.equal(claudeOldSwitched.status, 200, await claudeOldSwitched.clone().text());
+  assert.equal((await claudeOldSwitched.json() as { configApplyNewSession?: boolean }).configApplyNewSession, false);
+  assert.equal((await getAgent(claudeOld.id))?.sessionId, "claude-old-session-id", "older Computer without constructed-init:v1 keeps Claude session");
+
+  // Upgraded Computer advertising constructed-init:v1 -> Claude model switch clears sessionId.
+  const claudeNew = await createAgent(server.id, "claude-new-computer-agent", { runtime: "claude", model: "sonnet", machineId: newMachine!.id });
+  await updateAgentStatus(claudeNew.id, "inactive", "claude-new-session-id");
+  const claudeNewSwitched = await patch(claudeNew.id, { model: "opus" });
+  assert.equal(claudeNewSwitched.status, 200, await claudeNewSwitched.clone().text());
+  assert.equal((await claudeNewSwitched.json() as { configApplyNewSession?: boolean }).configApplyNewSession, true);
+  assert.equal((await getAgent(claudeNew.id))?.sessionId, null, "Computer with constructed-init:v1 clears Claude session on model switch");
+
+  const claudeEffortAgent = await createAgent(server.id, "claude-effort-only-agent", { runtime: "claude", model: "sonnet", machineId: newMachine!.id });
+  await updateAgentStatus(claudeEffortAgent.id, "inactive", "claude-effort-session-id");
+  const claudeEffort = await patch(claudeEffortAgent.id, { reasoningEffort: "high" });
+  assert.equal(claudeEffort.status, 200, await claudeEffort.clone().text());
+  assert.equal((await claudeEffort.json() as { configApplyNewSession?: boolean }).configApplyNewSession, false);
+  assert.equal((await getAgent(claudeEffortAgent.id))?.sessionId, "claude-effort-session-id", "Claude reasoning effort keeps its session");
 });
 
 test("PATCH /agents/:id: a Pi agent saved again with its stored off is not a runtime change (#9775)", async ({ app }) => {
@@ -3958,6 +4011,7 @@ for (const subkind of ["daemon_timeout", "daemon_offline"] as const) {
     assert.equal(retry.status, 200, JSON.stringify(created));
     assert.equal(created.runtimeConfig.reasoningEffort, "high", "retry must retain the selected effort");
     assert.equal((await getServer(server.id))?.onboardingAgentId, created.id);
+    assert.equal((await getServer(server.id))?.officialOnboardingAgentId, created.id);
     assert.equal((await getAgent(created.id))?.runtimeConfig?.reasoningEffort, "high");
   });
 }
@@ -4266,6 +4320,7 @@ test("Grok is admitted for new use without a feature flag; computer capability s
   assert.deepEqual(await unavailableCreateRes.json(), {
     error: "Grok Build is not available on this computer",
     code: "runtime_capability_unavailable",
+    errorCode: "runtime_capability_unavailable",
   });
   assert.equal((await listAgents(server.id)).some((agent) => agent.name === "unavailable-grok-agent"), false);
 
@@ -4309,6 +4364,7 @@ test("an OAR-only runtime (Qwen Code) needs only a Computer that reports it, no 
   assert.deepEqual(await unreported.json(), {
     error: "Qwen Code is not available on this computer: install its CLI there, and update the Computer if it does not list Qwen Code yet",
     code: "runtime_capability_unavailable",
+    errorCode: "runtime_capability_unavailable",
   });
 
   await getDb().update(machines).set({ runtimes: ["codex", "qwen"] }).where(eq(machines.id, machine.id));
@@ -4352,7 +4408,8 @@ test("POST /agents onboarding Cindy can recover after other agents already exist
     assert.equal(body.runtimeConfig?.envVars?.SLOCK_ONBOARDING_MEMORY_SEED, "first-cindy");
 
     const updatedServer = await getServer(server.id);
-    assert.equal(updatedServer?.onboardingAgentId, body.id);
+    assert.equal(updatedServer?.onboardingAgentId, body.id, "a fresh Cindy is also the greeter");
+    assert.equal(updatedServer?.officialOnboardingAgentId, body.id);
 
     const regularRes = await fetch(`${app.baseUrl}/api/agents`, {
       method: "POST",
@@ -4399,7 +4456,7 @@ test("POST /agents onboarding Cindy rejects a second active Cindy", async ({ app
     assert.match(body.error ?? "", /Cindy agent already exists/i);
 });
 
-test("POST /agents onboarding rejects when server already has an onboarding agent without overwriting it", async ({ app }) => {
+test("POST /agents onboarding rejects when server already has its official onboarding agent without overwriting it", async ({ app }) => {
     const owner = await seedUser("onboarding-existing-owner@slock.test", "onboarding-existing-owner");
     const server = await createServer("Onboarding Existing", "onboarding-existing", owner.id);
     const customized = await createAgent(server.id, "SetupGuide", {
@@ -4407,7 +4464,7 @@ test("POST /agents onboarding rejects when server already has an onboarding agen
       runtime: "codex",
       avatarUrl: "pixel:finch",
     });
-    await updateServerOnboardingAgent(server.id, customized.id);
+    await linkOfficialOnboardingAgent(server.id, customized.id);
   const ownerToken = await tokenForHuman(owner.email);
 
     const res = await fetch(`${app.baseUrl}/api/agents`, {
@@ -4435,6 +4492,82 @@ test("POST /agents onboarding rejects when server already has an onboarding agen
     assert.equal(unchanged?.avatarUrl, "pixel:finch");
 });
 
+test("a non-Cindy greeter on an owner-unfinished server leaves setup open and Create Cindy still works", async ({ app }) => {
+    const db = getDb();
+    const owner = await seedUser("greeter-not-cindy-owner@slock.test", "greeter-not-cindy-owner");
+    const server = await createServer("Greeter Not Cindy", "greeter-not-cindy", owner.id);
+    // An ordinary agent on a server whose owner has not finished setup (a drifted row: the
+    // agent predates the first-agent stamp).
+    const helper = await createAgent(server.id, "Helper", { runtime: "codex" });
+    await db.update(serverMembers).set({ setupStatus: "not_started", setupCompletionReason: null })
+      .where(eq(serverMembers.serverId, server.id));
+    const ownerToken = await tokenForHuman(owner.email);
+    const headers = { ...authHeaders(ownerToken, server.id), "Content-Type": "application/json" };
+
+    const greeterRes = await fetch(`${app.baseUrl}/api/servers/${server.id}/onboarding-settings`, {
+      method: "PATCH", headers, body: JSON.stringify({ onboardingAgentId: helper.id }),
+    });
+    assert.equal(greeterRes.status, 200, await greeterRes.clone().text());
+
+    const [ownerRow] = await db.select({ status: serverMembers.setupStatus }).from(serverMembers)
+      .where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, owner.id)));
+    assert.equal(ownerRow.status, "not_started", "picking a greeter completes nobody's setup");
+    const projectionRes = await fetch(`${app.baseUrl}/api/servers/${server.id}/setup-projection`, { headers });
+    const projection = await projectionRes.json() as { surface: string; gateReason: string | null };
+    assert.equal(projectionRes.status, 200);
+    assert.notEqual(projection.surface, "complete");
+    assert.notEqual(projection.gateReason, "official_onboarding_agent_unusable", "the greeter is not judged as Cindy");
+
+    const cindyRes = await fetch(`${app.baseUrl}/api/agents`, {
+      method: "POST", headers,
+      body: JSON.stringify({ name: "Cindy", description: "Onboarding Assistant", runtime: "codex", onboarding: true }),
+    });
+    const cindy = await cindyRes.json() as { id: string; name: string };
+    assert.equal(cindyRes.status, 200, JSON.stringify(cindy));
+    assert.equal(cindy.name, "Cindy");
+    const after = await getServer(server.id);
+    assert.equal(after?.officialOnboardingAgentId, cindy.id);
+    assert.equal(after?.onboardingAgentId, helper.id, "the greeter the owner picked is kept");
+});
+
+test("an old Cindy that fails the strict identity test is backfilled as official, still blocks a second Cindy and can adopt the identity", async ({ app }) => {
+    const db = getDb();
+    const owner = await seedUser("old-cindy-owner@slock.test", "old-cindy-owner");
+    const server = await createServer("Old Cindy", "old-cindy", owner.id);
+    // An old Cindy: her name, but her own avatar and description, and an ordinary member role.
+    const oldCindy = await createAgent(server.id, "Cindy", { description: "Helps you start", runtime: "codex", avatarUrl: "pixel:finch" });
+    assert.equal(await getAgentMemberRole(server.id, oldCindy.id), "member");
+    // Before the split she was only the greeter pointer.
+    await db.update(servers).set({ onboardingAgentId: oldCindy.id, officialOnboardingAgentId: null }).where(eq(servers.id, server.id));
+
+    // The shipped backfill statement (third of the migration), run against this database.
+    const drizzleDir = new URL("../../drizzle/", import.meta.url);
+    const file = (await readdir(drizzleDir)).find((name) => name.endsWith("_official_onboarding_agent.sql"));
+    assert.ok(file);
+    const backfill = (await readFile(new URL(file, drizzleDir), "utf8")).split("--> statement-breakpoint")[2]!;
+    await db.execute(sql.raw(backfill));
+    assert.equal((await getServer(server.id))?.officialOnboardingAgentId, oldCindy.id);
+
+    const ownerToken = await tokenForHuman(owner.email);
+    const headers = { ...authHeaders(ownerToken, server.id), "Content-Type": "application/json" };
+    const second = await fetch(`${app.baseUrl}/api/agents`, {
+      method: "POST", headers,
+      body: JSON.stringify({ name: "Cindy", description: "Onboarding Assistant", runtime: "codex", onboarding: true }),
+    });
+    assert.equal(second.status, 409, "she is still this server's Cindy");
+    assert.equal((await second.json() as { onboardingAgentId?: string }).onboardingAgentId, oldCindy.id);
+
+    const preview = await fetch(`${app.baseUrl}/api/agents/${oldCindy.id}/onboarding-identity-adoption`, { headers });
+    assert.equal(preview.status, 200);
+    assert.equal((await preview.json() as { canAdopt: boolean }).canAdopt, true);
+    const adopt = await fetch(`${app.baseUrl}/api/agents/${oldCindy.id}/onboarding-identity-adoption`, { method: "POST", headers });
+    assert.equal(adopt.status, 200);
+    const adopted = await getAgent(oldCindy.id);
+    assert.equal(adopted?.avatarUrl, "pixel:mug");
+    assert.equal(adopted?.description, "Onboarding Assistant");
+    assert.equal(await getAgentMemberRole(server.id, oldCindy.id), "admin");
+});
+
 test("onboarding identity adoption previews then applies official Cindy identity", async ({ app }) => {
     const owner = await seedUser("onboarding-adopt-owner@slock.test", "onboarding-adopt-owner");
     const server = await createServer("Onboarding Adopt", "onboarding-adopt", owner.id);
@@ -4444,7 +4577,7 @@ test("onboarding identity adoption previews then applies official Cindy identity
       avatarUrl: "pixel:finch",
     });
     await updateAgent(customized.id, { displayName: "Setup Guide" });
-    await updateServerOnboardingAgent(server.id, customized.id);
+    await linkOfficialOnboardingAgent(server.id, customized.id);
   const ownerToken = await tokenForHuman(owner.email);
     assert.equal(await getAgentMemberRole(server.id, customized.id), "member");
 
@@ -4552,7 +4685,7 @@ test("onboarding identity adoption returns 409 on exact Cindy handle conflict wi
       avatarUrl: "pixel:astronaut",
     });
     await updateAgent(customized.id, { displayName: "Setup Guide" });
-    await updateServerOnboardingAgent(server.id, customized.id);
+    await linkOfficialOnboardingAgent(server.id, customized.id);
   const ownerToken = await tokenForHuman(owner.email);
     assert.equal(await getAgentMemberRole(server.id, customized.id), "member");
 
@@ -6596,6 +6729,22 @@ test("agent start rejects unassigned machines and classifies daemon-offline fail
     });
     assert.equal(upgradeRequiredRes.status, 409);
     assert.equal((await upgradeRequiredRes.json() as { code?: string }).code, "upgrade_required");
+
+    // A Built-in agent whose stored config lost its provider: before, a TypeError and a 500.
+    Object.assign(app.app.get("agentOrchestrator"), {
+      startAgent: async () => {
+        throw new BuiltInProviderMissingStartError();
+      },
+    });
+    const providerMissingRes = await fetch(`${app.baseUrl}/api/agents/${assignedAgent.id}/start`, {
+      method: "POST",
+      headers: authHeaders(ownerToken, server.id),
+    });
+    assert.equal(providerMissingRes.status, 422);
+    assert.deepEqual(await providerMissingRes.json(), {
+      error: "This agent has no model provider. Open its settings, choose a provider and save, then start it again.",
+      code: "builtin_provider_missing",
+    });
 });
 
 test("agent skills failures return typed statuses and record classified sanitized trace events", async ({ app }) => {
@@ -7007,62 +7156,49 @@ test("user-to-agent DMs keep conversation actions after the peer agent is delete
     assert.deepEqual(order.hiddenDmIds, [dm.id]);
 });
 
-test("Antigravity permits existing-agent edits but rejects new agents and runtime transitions", async ({ app }) => {
-  const owner = await seedUser("antigravity-existing@slock.test", "antigravity-existing");
-  const server = await createServer("Antigravity Existing", "antigravity-existing", owner.id);
-  const ownerToken = await tokenForHuman(owner.email);
-  const existing = await createAgent(server.id, "existing-antigravity", { runtime: "antigravity", model: "default" });
-  const other = await createAgent(server.id, "existing-codex", { runtime: "codex", model: "gpt-5" });
-  const headers = { ...authHeaders(ownerToken, server.id), "Content-Type": "application/json" };
-
-  for (const fields of [
-    { runtime: "antigravity", model: "default" },
-    { runtimeConfig: { version: 1, runtime: "antigravity", model: { kind: "preset", id: "default" } } },
-  ]) {
-    for (const request of [
-      { method: "POST", url: `${app.baseUrl}/api/agents`, body: { name: "new-antigravity", ...fields } },
-      { method: "PATCH", url: `${app.baseUrl}/api/agents/${other.id}`, body: fields },
-    ]) {
-      const response = await fetch(request.url, { method: request.method, headers, body: JSON.stringify(request.body) });
-      assert.equal(response.status, 400);
-      assert.equal((await response.json() as { error: string }).error, "Runtime is deprecated and cannot be selected: antigravity");
+// Antigravity is no longer deprecated (tygg): created, switched to and edited
+// whether agent_runtime_oar_antigravity (which only routes it to the OAR host) is on or off.
+for (const flag of ["on", "off"] as const) {
+  test(`with agent_runtime_oar_antigravity ${flag}, Antigravity agents can be created, switched to and edited`, async ({ app }) => {
+    const owner = await seedUser(`antigravity-flag-${flag}@slock.test`, `antigravity-flag-${flag}`);
+    const server = await createServer(`Antigravity Flag ${flag}`, `antigravity-flag-${flag}`, owner.id);
+    if (flag === "on") {
+      await getDb().insert(featureFlags).values({ key: "agent_runtime_oar_antigravity", randomizationUnit: "server", salt: "test", defaultEnabled: false }).onConflictDoNothing();
+      await getDb().insert(featureFlagRules).values({ id: randomUUID(), flagKey: "agent_runtime_oar_antigravity", stage: "server", priority: 0, decision: "allow", values: [server.id] });
     }
-    const edit = await fetch(`${app.baseUrl}/api/agents/${existing.id}`, {
-      method: "PATCH", headers, body: JSON.stringify({ description: "still editable", ...fields }),
+    const ownerToken = await tokenForHuman(owner.email);
+    const existing = await createAgent(server.id, "existing-antigravity", { runtime: "antigravity", model: "default" });
+    const headers = { ...authHeaders(ownerToken, server.id), "Content-Type": "application/json" };
+
+    for (const [index, fields] of [
+      { runtime: "antigravity", model: "default" },
+      { runtimeConfig: { version: 1, runtime: "antigravity", model: { kind: "preset", id: "default" } } },
+    ].entries()) {
+      const created = await fetch(`${app.baseUrl}/api/agents`, {
+        method: "POST", headers, body: JSON.stringify({ name: `new-antigravity-${index}`, ...fields }),
+      });
+      assert.equal(created.status, 200, await created.clone().text());
+      assert.equal((await created.json() as { runtime: string }).runtime, "antigravity");
+
+      const other = await createAgent(server.id, `codex-${index}`, { runtime: "codex", model: "gpt-5" });
+      const switched = await fetch(`${app.baseUrl}/api/agents/${other.id}`, { method: "PATCH", headers, body: JSON.stringify(fields) });
+      assert.equal(switched.status, 200, await switched.clone().text());
+      assert.equal((await getAgent(other.id))?.runtime, "antigravity");
+
+      const edit = await fetch(`${app.baseUrl}/api/agents/${existing.id}`, {
+        method: "PATCH", headers, body: JSON.stringify({ description: "still editable", ...fields }),
+      });
+      assert.equal(edit.status, 200, await edit.clone().text());
+      assert.equal((await edit.json() as { runtime: string }).runtime, "antigravity");
+    }
+
+    // Other deprecated runtimes are still refused.
+    const gemini = await fetch(`${app.baseUrl}/api/agents`, {
+      method: "POST", headers, body: JSON.stringify({ name: "new-gemini", runtime: "gemini", model: "default" }),
     });
-    assert.equal(edit.status, 200);
-    assert.equal((await edit.json() as { runtime: string }).runtime, "antigravity");
-  }
-  assert.equal((await getAgent(other.id))?.runtime, "codex");
-});
-
-test("with agent_runtime_oar_antigravity on, Antigravity agents can be created and switched to again (tygg, #oar-raft:e9798673)", async ({ app }) => {
-  const owner = await seedUser("antigravity-revived@slock.test", "antigravity-revived");
-  const server = await createServer("Antigravity Revived", "antigravity-revived", owner.id);
-  await getDb().insert(featureFlags).values({ key: "agent_runtime_oar_antigravity", randomizationUnit: "server", salt: "test", defaultEnabled: false }).onConflictDoNothing();
-  await getDb().insert(featureFlagRules).values({ id: randomUUID(), flagKey: "agent_runtime_oar_antigravity", stage: "server", priority: 0, decision: "allow", values: [server.id] });
-  const ownerToken = await tokenForHuman(owner.email);
-  const other = await createAgent(server.id, "revived-codex", { runtime: "codex", model: "gpt-5" });
-  const headers = { ...authHeaders(ownerToken, server.id), "Content-Type": "application/json" };
-
-  const created = await fetch(`${app.baseUrl}/api/agents`, {
-    method: "POST", headers, body: JSON.stringify({ name: "new-antigravity", runtime: "antigravity", model: "default" }),
+    assert.equal(gemini.status, 400);
   });
-  assert.equal(created.status, 200, await created.clone().text());
-  assert.equal((await created.json() as { runtime: string }).runtime, "antigravity");
-
-  const switched = await fetch(`${app.baseUrl}/api/agents/${other.id}`, {
-    method: "PATCH", headers, body: JSON.stringify({ runtime: "antigravity", model: "default" }),
-  });
-  assert.equal(switched.status, 200, await switched.clone().text());
-  assert.equal((await getAgent(other.id))?.runtime, "antigravity");
-
-  // Only Antigravity is revived: other deprecated runtimes are still refused.
-  const gemini = await fetch(`${app.baseUrl}/api/agents`, {
-    method: "POST", headers, body: JSON.stringify({ name: "new-gemini", runtime: "gemini", model: "default" }),
-  });
-  assert.equal(gemini.status, 400);
-});
+}
 
 test("Copilot permits existing-agent model and env edits but rejects new agents and runtime transitions", async ({ app }) => {
   const owner = await seedUser("copilot-existing@slock.test", "copilot-existing");
@@ -7098,7 +7234,7 @@ test("Copilot permits existing-agent model and env edits but rejects new agents 
     body: JSON.stringify({ name: "v2-copilot", machineId: machine.id, formDefinitionRef: { protocolVersion: 2, runtimeId: "copilot" }, formValues: { model: "gpt-5.4" } }),
   });
   assert.equal(v2Create.status, 400);
-  assert.deepEqual(await v2Create.json(), { error: deprecatedError });
+  assert.deepEqual(await v2Create.json(), { error: deprecatedError, code: "runtime_deprecated", errorCode: "runtime_deprecated" });
 
   // The existing Copilot agent keeps its runtime and can change model, effort and env.
   const edit = await fetch(`${app.baseUrl}/api/agents/${existing.id}`, {
@@ -7296,7 +7432,7 @@ test("a v2 submit is checked against the v2 registry, not the v1 refs", async ({
   }
 });
 
-test("batch 2 v2 create: OpenCode stores the legacy runtimeConfig; Kimi CLI, Gemini and Antigravity are refused like legacy deprecated creates", async ({ app }) => {
+test("batch 2 v2 create: OpenCode stores the legacy runtimeConfig; Kimi CLI and Gemini are refused like legacy deprecated creates, Antigravity is created", async ({ app }) => {
   const owner = await seedUser("v2-batch2-create@slock.test", "v2-batch2-create");
   const server = await createServer("V2 Batch2 Create", "v2-batch2-create", owner.id);
   const [machine] = await getDb().insert(machines).values({
@@ -7333,13 +7469,16 @@ test("batch 2 v2 create: OpenCode stores the legacy runtimeConfig; Kimi CLI, Gem
   for (const [runtimeId, formValues] of [
     ["kimi", { model: "default" }],
     ["gemini", { model: "gemini-2.5-pro" }],
-    // Antigravity now has a model field; a server without its OAR flag still refuses the create.
-    ["antigravity", { model: "default" }],
   ] as const) {
     const refused = await create(runtimeId, `v2-${runtimeId}`, formValues);
     assert.equal(refused.status, 400, runtimeId);
-    assert.deepEqual(await refused.json(), { error: `Runtime is deprecated and cannot be selected: ${runtimeId}` }, runtimeId);
+    assert.deepEqual(await refused.json(), { error: `Runtime is deprecated and cannot be selected: ${runtimeId}`, code: "runtime_deprecated", errorCode: "runtime_deprecated" }, runtimeId);
   }
+
+  // Antigravity is no longer deprecated: its v2 create goes through without its OAR flag.
+  const antigravity = await create("antigravity", "v2-antigravity", { model: "gemini-3.8-flash" });
+  assert.equal(antigravity.status, 200, await antigravity.clone().text());
+  assert.equal((await antigravity.json() as { runtime: string }).runtime, "antigravity");
 });
 
 test("runtime_form.v3: a protocolVersion 3 submit stores what a v2 one does, and the edit form answers v3 only to a client that advertises it", async ({ app }) => {
@@ -7541,11 +7680,11 @@ test("Antigravity v2 edit: a saved effort the model no longer lists levels for f
       version: 1, runtime: "antigravity", model: { kind: "preset", id: "gemini-3.8-flash" }, mode: { kind: "default" }, reasoningEffort: null, envVars: { K: "v" },
     });
 
-    // agy's configured default takes no effort: one sent with it is dropped by the static rule.
-    const toDefault = await patch({ model: "default", reasoningEffort: "high", envVars: {} });
-    assert.equal(toDefault.status, 200, await toDefault.clone().text());
-    assert.deepEqual((await storedConfig()).model, { kind: "preset", id: "default" });
-    assert.equal((await storedConfig()).reasoningEffort, null);
+    // #oar-raft:#25: agy's configured default is retired; a form save of it is refused at the field.
+    const toDefault = await patch({ model: "default", reasoningEffort: "", envVars: {} });
+    assert.equal(toDefault.status, 400);
+    assert.deepEqual((await toDefault.json() as { issues: unknown }).issues, [{ code: "model_required", pointer: "/formValues/model" }]);
+    assert.deepEqual((await storedConfig()).model, { kind: "preset", id: "gemini-3.8-flash" }, "nothing saved");
   } finally {
     app.app.set("agentOrchestrator", originalOrchestrator);
   }
@@ -7850,10 +7989,19 @@ test("batch 4 v2 create and edit: Pi stores the legacy runtimeConfig, its built-
     assert.equal(blank.status, 200, await blank.clone().text());
     assert.deepEqual(await storedConfig(agentId), { ...stored, model: { kind: "preset", id: "deepseek/deepseek-flash" } });
 
-    // The v1 agent read still returns the key (legacy web and apps prefill it from here).
+    // The v1 agent read blanks the key (redactOnAgentRead: true), and omits the mirrored DEEPSEEK_API_KEY.
     const read = await fetch(`${app.baseUrl}/api/agents/${agentId}`, { headers });
     assert.equal(read.status, 200);
-    assert.equal(((await read.json() as { runtimeConfig: { provider: { apiKey: string } } }).runtimeConfig.provider.apiKey), SECRET);
+    const readBody = await read.json() as { runtimeConfig: { provider: { apiKey: string } }; envVars?: Record<string, string> | null };
+    assert.equal(readBody.runtimeConfig.provider.apiKey, "");
+    assert.equal(Boolean(readBody.envVars && "DEEPSEEK_API_KEY" in readBody.envVars), false);
+
+    // A legacy (non-v2) save with blank apiKey on the same provider preserves the stored key (<=1.23 mobile compat).
+    const legacyBlankSave = await patch({
+      runtimeConfig: { ...stored, provider: { kind: "pi-builtin", providerId: "deepseek", apiKey: "" }, reasoningEffort: "low" },
+    });
+    assert.equal(legacyBlankSave.status, 200, await legacyBlankSave.clone().text());
+    assert.equal(((await storedConfig(agentId)) as { provider: { apiKey: string } }).provider.apiKey, SECRET);
 
     // A legacy (non-v2) save with the full runtimeConfig is stored exactly as sent.
     const legacyConfig = { ...stored, provider: { kind: "pi-builtin", providerId: "deepseek", apiKey: "sk-legacy-typed" }, reasoningEffort: "medium" };
@@ -7949,16 +8097,18 @@ test("protocol v2 create points issues found after assembly at the submitted fie
   }
 });
 
-// Review follow-up: untrusted form ID must be rejected before UUID DB lookup.
-test("review: v2 malformed connection id returns 400", async ({ app }) => {
+// Saved provider connections are removed: a v2 submit naming one is an
+// unknown provider, refused on its field before any lookup.
+test("a v2 submit with a saved-connection provider value is refused as an unknown provider", async ({ app }) => {
   const owner = await seedUser("review-v2-id@slock.test", "review-v2-id");
   const server = await createServer("Review Connection Id", "review-connection-id", owner.id);
-  await getDb().insert(featureFlagRules).values({ id: randomUUID(), flagKey: PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id] });
   const token = await tokenForHuman(owner.email);
-  const absent = await fetch(`${app.baseUrl}/api/agents`, { method: "POST", headers: { ...authHeaders(token, server.id), "Content-Type": "application/json" }, body: JSON.stringify({ name: "review-absent", formDefinitionRef: { protocolVersion: 2, runtimeId: "builtin" }, formValues: { providerId: "connection:11111111-1111-4111-8111-111111111111", model: "deepseek/deepseek-v4-pro" } }) });
-  assert.equal(absent.status, 409, await absent.clone().text());
-  const res = await fetch(`${app.baseUrl}/api/agents`, { method: "POST", headers: { ...authHeaders(token, server.id), "Content-Type": "application/json" }, body: JSON.stringify({ name: "review-malformed", formDefinitionRef: { protocolVersion: 2, runtimeId: "builtin" }, formValues: { providerId: "connection:not-a-uuid", model: "deepseek/deepseek-v4-pro" } }) });
-  assert.equal(res.status, 400, await res.clone().text());
+  for (const providerId of ["connection:11111111-1111-4111-8111-111111111111", "connection:not-a-uuid"]) {
+    const res = await fetch(`${app.baseUrl}/api/agents`, { method: "POST", headers: { ...authHeaders(token, server.id), "Content-Type": "application/json" }, body: JSON.stringify({ name: "review-connection", formDefinitionRef: { protocolVersion: 2, runtimeId: "builtin" }, formValues: { providerId, model: "deepseek/deepseek-v4-pro" } }) });
+    assert.equal(res.status, 400, await res.clone().text());
+    const body = await res.json() as { issues?: Array<{ code: string; pointer: string }> };
+    assert.deepEqual(body.issues, [{ code: "select_valid_provider", pointer: "/formValues/providerId" }], providerId);
+  }
 });
 
 test("RFC 071 §5: Start and Reset are explicit human controls; PATCH lifts the terminal breaker only on a real runtime value change", async ({ app }) => {
@@ -8010,7 +8160,7 @@ test("RFC 071 §5: Start and Reset are explicit human controls; PATCH lifts the 
   });
   assert.equal(reset.status, 202);
   await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.deepEqual(resets, [{ agentId: agent.id, mode: "session", options: { terminalControl: "human_reset" } }]);
+  assert.deepEqual(resets, [{ agentId: agent.id, mode: "session", options: { terminalControl: "human_reset", revokeRunnerCredentials: { actorUserId: owner.id } } }]);
 
   // Same model value: presence alone is not a change (F3).
   const same = await fetch(`${app.baseUrl}/api/agents/${agent.id}`, {

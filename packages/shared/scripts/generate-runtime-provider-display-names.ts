@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { PI_BUILTIN_PROVIDER_API_KEY_ENV_KEYS_GENERATED } from "../src/piBuiltinModels.generated";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const sourcePath = path.join(root, "runtime-provider-display-names.json");
@@ -26,31 +27,19 @@ const piProviders = (
 ).builtinProviders();
 const piDisplayNames = Object.fromEntries(piProviders.map(({ id, name }) => [id, name]));
 
-const PI_DISPLAY_NAME_PROVIDER_IDS = new Set([
-  "anthropic",
-  "deepseek",
-  "google",
-  "kimi-coding",
-  "minimax",
-  "minimax-cn",
-  "moonshotai",
-  "moonshotai-cn",
-  "openai",
-  "opencode",
-  "opencode-go",
-  "openrouter",
-  "qwen-token-plan",
-  "qwen-token-plan-cn",
-  "xai",
-  "xiaomi",
-  "zai",
-  "zai-coding-cn",
-]);
+// Every provider Built-in surfaces (generated from the Pi SDK by
+// `pnpm --filter @botiverse/raft-daemon generate:pi-builtin-models`; run that
+// first) takes Pi's own provider name.
+const PI_DISPLAY_NAME_PROVIDER_IDS = new Set(Object.keys(PI_BUILTIN_PROVIDER_API_KEY_ENV_KEYS_GENERATED));
+const unnamed = [...PI_DISPLAY_NAME_PROVIDER_IDS].filter((id) => !piDisplayNames[id]);
+if (unnamed.length > 0) {
+  throw new Error(`Pi's provider catalog has no name for Built-in provider(s): ${unnamed.join(", ")}`);
+}
 
 const raw = JSON.parse(readFileSync(sourcePath, "utf8")) as Record<string, string>;
 const displayNames = new Map(Object.entries(raw));
 for (const id of PI_DISPLAY_NAME_PROVIDER_IDS) {
-  displayNames.set(id, piDisplayNames[id] ?? raw[id] ?? id);
+  displayNames.set(id, piDisplayNames[id]!);
 }
 const entries = [...displayNames.entries()].sort(([a], [b]) => a.localeCompare(b));
 
@@ -63,7 +52,7 @@ writeFileSync(
   outputPath,
   [
     "// GENERATED FILE - DO NOT EDIT DIRECTLY.",
-    "// Source: selected Pi builtin provider catalog names + packages/shared/runtime-provider-display-names.json Slock-only entries",
+    "// Source: Pi builtin provider catalog names of every Built-in provider + packages/shared/runtime-provider-display-names.json Slock-only entries",
     "// Regenerate: pnpm --filter @botiverse/raft-shared generate:runtime-provider-display-names",
     "",
     "export const RUNTIME_PROVIDER_DISPLAY_NAMES = {",

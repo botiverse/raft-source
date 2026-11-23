@@ -9,6 +9,8 @@ import type { Message } from "../../store/messageStore";
 import { getSocket } from "../../api/socket";
 import { noteOutlineMessage } from "../../store/messageOutlineStore";
 import { subscribeMessageUpdated } from "../../store/messageUpdatedApply";
+import type { MessageUpdatePatch } from "../../store/messageUpdatedApply";
+import { coerceWireMessageSeq } from "../../store/wireMessageSeq";
 import api from "../../api/client";
 import { clearHiddenTarget, readHistoryLimitedError, recordHiddenHistory, recordHiddenTarget, useHiddenTarget } from "../../store/hiddenHistoryStore";
 import { showToast } from "../../components/toastBridge";
@@ -72,7 +74,7 @@ export function useThreadTimeline({
   const [repliesRetryAt, setRepliesRetryAt] = useState<number | null>(null);
   // The thread channel the replies are loaded for: `web.view.switch` ends once they show (useThreadViewSwitch).
   const [repliesFor, setRepliesFor] = useState<string | null>(null);
-  useThreadViewSwitch(parentMessageId, !isTaskModalSurface, { threadChannelId, repliesFor, loading, failed: repliesLoadFailed });
+  useThreadViewSwitch({ parentMessageId, parentTaskId, isTaskModalSurface }, { threadChannelId, repliesFor, loading, failed: repliesLoadFailed });
   const replyRegionRef = useRef<HTMLDivElement>(null);
   // The reply skeleton's 1-second wait counts from the click that opened the
   // thread (threadStore.openedAt, shared by the resolve shell and the reply
@@ -226,15 +228,11 @@ export function useThreadTimeline({
 
     const socket = getSocket();
 
-    // Merge-only handler for task field updates (no new-message-count bump).
-    const updateHandler = (msg: Message) => {
+    // Merge-only handler for task and action-card field updates (no new-message-count bump).
+    const updateHandler = (msg: MessageUpdatePatch) => {
       if (msg.channelId !== threadChannelId) return;
       try {
-        const updates = onlyThreadMessages(
-          threadChannelId,
-          coerceThreadIngress([msg]),
-        );
-        setMessages((prev) => mergeThreadMessageUpdates(prev, updates));
+        setMessages((prev) => mergeThreadMessageUpdates(prev, [coerceWireMessageSeq(msg)]));
       } catch (error) {
         console.error("[MessageV2] rejected malformed thread message:updated", msg.id, error);
       }

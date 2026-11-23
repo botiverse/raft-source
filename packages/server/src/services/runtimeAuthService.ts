@@ -7,10 +7,13 @@ import {
   RUNTIME_AUTH_RUNTIMES,
   asRuntimeAuthLoginId,
   currentTimeMs,
+  isRuntimeAuthRuntime,
   runtimeAuthStatusReportSchema,
+  runtimeUpdatesSchema,
   type RuntimeAuthLoginId,
   type RuntimeAuthRuntime,
   type RuntimeAuthStatusReport,
+  type RuntimeUpdates,
 } from "@botiverse/raft-shared";
 
 import { z } from "zod";
@@ -31,6 +34,12 @@ const SESSION_PREFIX = "slock:runtime-auth-login:v1";
 const ACTIVE_PREFIX = "slock:runtime-auth-login-active:v1";
 const STARTS_PREFIX = "slock:runtime-auth-login-starts:v1";
 const STATUS_PREFIX = "slock:runtime-auth-status:v1";
+/** Kept apart from the status, whose strict schema an older replica would refuse with the field in it. */
+const UPGRADABLE_PREFIX = "slock:runtime-upgradable:v1";
+/** Install on the web: kept apart from the status for the same reason. */
+const INSTALLABLE_PREFIX = "slock:runtime-installable:v1";
+/** Upgrade on the web: each upgradable runtime's update check, kept apart from the status for the same reason. */
+const UPDATES_PREFIX = "slock:runtime-updates:v1";
 const PROVIDER_REQUESTS_PREFIX = "slock:runtime-auth-provider-requests:v1";
 const CLAUDE_LIMIT_RESET_REQUESTS_PREFIX = "slock:claude-limit-reset-requests:v1";
 /**
@@ -177,6 +186,54 @@ export class RuntimeAuthService {
     await this.backend.set(`${STATUS_PREFIX}:${machineId}`, JSON.stringify(report), STATUS_TTL_SECONDS);
   }
 
+  /** Upgrade on the web: the runtimes whose own updater this Computer runs, from its last report that said. */
+  async recordUpgradable(machineId: string, runtimes: readonly RuntimeAuthRuntime[]): Promise<void> {
+    await this.backend.set(`${UPGRADABLE_PREFIX}:${machineId}`, JSON.stringify(runtimes), STATUS_TTL_SECONDS);
+  }
+
+  /** The runtimes `recordUpgradable` kept (unknown ones dropped); none when the Computer never said. */
+  async getUpgradable(machineId: string): Promise<RuntimeAuthRuntime[]> {
+    return this.readRuntimeList(`${UPGRADABLE_PREFIX}:${machineId}`);
+  }
+
+  /** Install on the web: the runtimes not on this Computer whose own installer it runs, from its last report that said. */
+  async recordInstallable(machineId: string, runtimes: readonly RuntimeAuthRuntime[]): Promise<void> {
+    await this.backend.set(`${INSTALLABLE_PREFIX}:${machineId}`, JSON.stringify(runtimes), STATUS_TTL_SECONDS);
+  }
+
+  /** The runtimes `recordInstallable` kept (unknown ones dropped); none when the Computer never said. */
+  async getInstallable(machineId: string): Promise<RuntimeAuthRuntime[]> {
+    return this.readRuntimeList(`${INSTALLABLE_PREFIX}:${machineId}`);
+  }
+
+  /** Upgrade on the web: each upgradable runtime's update check, from this Computer's last report that said. */
+  async recordUpdates(machineId: string, updates: RuntimeUpdates): Promise<void> {
+    await this.backend.set(`${UPDATES_PREFIX}:${machineId}`, JSON.stringify(updates), STATUS_TTL_SECONDS);
+  }
+
+  /** The checks `recordUpdates` kept (unknown runtimes dropped); none when the Computer never said or they no longer read. */
+  async getUpdates(machineId: string): Promise<RuntimeUpdates> {
+    const raw = await this.backend.get(`${UPDATES_PREFIX}:${machineId}`);
+    if (!raw) return {};
+    try {
+      const parsed = runtimeUpdatesSchema.safeParse(JSON.parse(raw));
+      return parsed.success ? parsed.data : {};
+    } catch {
+      return {};
+    }
+  }
+
+  private async readRuntimeList(key: string): Promise<RuntimeAuthRuntime[]> {
+    const raw = await this.backend.get(key);
+    if (!raw) return [];
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter(isRuntimeAuthRuntime) : [];
+    } catch {
+      return [];
+    }
+  }
+
   async getStatus(machineId: string): Promise<RuntimeAuthStatusReport | null> {
     const raw = await this.backend.get(`${STATUS_PREFIX}:${machineId}`);
     if (!raw) return null;
@@ -223,11 +280,14 @@ export class RuntimeAuthService {
    * the login window. Connects have the login start limit; lists, read each
    * time the dialog opens, a higher one, counted apart. A sign-out (`logout`,
    * Tenny's 1.28.0 review: since it can answer at once and leave the wait
-   * running, nothing else bounds it) has the login start limit too.
+   * running, nothing else bounds it) has the login start limit too, and so
+   * has an upgrade (`upgrade`: it runs the runtime's own updater there) and
+   * an install (`install`: its own installer). An install's plan, read each
+   * time Install is pressed and running nothing, has the list limit, counted apart.
    */
-  async allowProviderRequest(kind: "list" | "connect" | "logout", userId: string, machineId: string): Promise<boolean> {
+  async allowProviderRequest(kind: "list" | "connect" | "logout" | "upgrade" | "install" | "install_plan", userId: string, machineId: string): Promise<boolean> {
     const count = await this.backend.incrementWindow(`${PROVIDER_REQUESTS_PREFIX}:${kind}:${userId}:${machineId}`, STARTS_WINDOW_SECONDS);
-    return count <= (kind === "list" ? RUNTIME_AUTH_PROVIDER_LIST_REQUEST_LIMIT : RUNTIME_AUTH_LOGIN_START_LIMIT);
+    return count <= (kind === "list" || kind === "install_plan" ? RUNTIME_AUTH_PROVIDER_LIST_REQUEST_LIMIT : RUNTIME_AUTH_LOGIN_START_LIMIT);
   }
 
   /** Counts one Claude limit-reset read or redeem; false once the person is over the limit on this Computer. */

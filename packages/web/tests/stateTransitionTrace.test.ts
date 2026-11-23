@@ -382,6 +382,28 @@ test("state violation coalescer reset clears buckets", () => {
   assert.equal(records.length, 2);
 });
 
+// Review of task #441: a mute or a display-prefs change replaces only the list
+// the channel is in, and an Agent Lounge is in `loungeChannels` alone.
+test("a Lounge's mute and display-prefs changes are traced as applied, and the answer it holds as unchanged", () => {
+  resetChannelStore();
+  useChannelStore.setState({
+    loungeChannels: [{ id: "lounge-1", name: "Lounge", description: null, type: "channel", createdAt: "2026-07-07T00:00:00.000Z", joined: true, loungeAgentId: "agent-1" }],
+  } as never);
+  const records = captureStateTransitions();
+
+  useChannelStore.getState().setActivityMuteState("lounge-1", { activityMuted: true, muteFromSeq: "12" });
+  useChannelStore.getState().setActivityMuteState("lounge-1", { activityMuted: true, muteFromSeq: "12" });
+  useChannelStore.getState().setMessageDisplayPrefsState("lounge-1", { collapseLongMessages: true });
+
+  __setStateTransitionEmitterForTest(null);
+  useChannelStore.setState({ loungeChannels: [] });
+  assert.deepEqual(records.map((record) => record.attrs.meta), [
+    { outcomeDetail: "muted", touched: 1 },
+    { outcomeDetail: "unchanged", touched: 0 },
+    { outcomeDetail: "collapse_on", touched: 1 },
+  ]);
+});
+
 test("channel domain store actions emit state transition traces", () => {
   resetChannelStore();
   const records = captureStateTransitions();

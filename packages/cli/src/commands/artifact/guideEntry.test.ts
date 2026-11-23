@@ -36,6 +36,13 @@ const ARTIFACT_SUBCOMMANDS_BY_VERSION: Record<number, readonly string[]> = {
  */
 const NAMED_BY_OTHER_OUTPUT = new Set(["check", "resolve", "reopen"]);
 
+/**
+ * Subcommands behind a server flag, left out of the prompt until the flag is on
+ * everywhere (then they join the entry with a new `commandsVersion`). `settle`
+ * and `unsettle`: artifact_settled_v0 (#334); meanwhile `raft artifact read` and a held push say when one is Settled.
+ */
+const BEHIND_A_FLAG = new Set(["settle", "unsettle"]);
+
 test("the prompt's Artifacts entry names every `raft artifact` subcommand, and only those", () => {
   const entry = FIRST_PARTY_APP_GUIDE_ENTRIES.find((candidate) => candidate.appId === "artifacts");
   assert.ok(entry, "no artifacts entry in FIRST_PARTY_APP_GUIDE_ENTRIES");
@@ -45,7 +52,7 @@ test("the prompt's Artifacts entry names every `raft artifact` subcommand, and o
   assert.ok(artifact, "the CLI has no `raft artifact`");
   assert.deepEqual(
     [...new Set(named)].sort(),
-    artifact.commands.map((command) => command.name()).filter((name) => !NAMED_BY_OTHER_OUTPUT.has(name)).sort(),
+    artifact.commands.map((command) => command.name()).filter((name) => !NAMED_BY_OTHER_OUTPUT.has(name) && !BEHIND_A_FLAG.has(name)).sort(),
   );
   assert.deepEqual(
     [...new Set(named)].sort(),

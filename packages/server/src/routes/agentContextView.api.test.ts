@@ -317,7 +317,7 @@ test("the Guest exception stays narrow: other agent sub-paths and writes on View
   const computers = onlineCapable(app, f);
   await seedBoundGuest({ serverId: f.server.id, userId: f.creator.id });
   const headers = { Authorization: `Bearer ${await tokenForHuman(f.creator.email)}`, "X-Server-Id": f.server.id };
-  const guestRefusal = { error: "Guests can't open the server's agent directory" };
+  const guestRefusal = { error: "Guests can't open the server's agent directory", code: "agent_directory_guest_forbidden", errorCode: "agent_directory_guest_forbidden" };
   const requests: Array<[string, string]> = [
     ["GET", `/api/agents/${f.agent.id}/channels`],
     ["GET", `/api/agents/${f.agent.id}/activity-log`],

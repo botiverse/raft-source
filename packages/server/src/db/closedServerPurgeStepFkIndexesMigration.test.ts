@@ -32,6 +32,9 @@ const INDEXES: Array<[table: string, name: string]> = [
   ["agents", "idx_agents_managed_by_app_install"],
   ["external_oauth_attempts", "idx_external_oauth_attempts_server_grant"],
 ];
+// Tables a later migration dropped (saved provider connections removed): the
+// migration above still builds their index, nothing builds or checks it after.
+const DROPPED_LATER = new Set(["provider_probe_intents"]);
 
 function statements(sqlText: string): string[] {
   return sqlText
@@ -57,6 +60,11 @@ test("builds each index only inside its table's size guard, under bounded timeou
   assert.equal(body.match(/CREATE INDEX/g)?.length, INDEXES.length);
   for (const [table, name] of INDEXES) {
     assert.match(body, new RegExp(`IF pg_relation_size\\('public\\.${table}'::regclass\\) <= 1048576 THEN\\s+CREATE INDEX IF NOT EXISTS "${name}" ON "${table}"`));
+    if (DROPPED_LATER.has(table)) {
+      assert.ok(!DEVICE_SESSION_KEY_INDEXES.some((spec) => spec.name === name), `${name}: its table is dropped, nothing builds it`);
+      assert.ok(!POST_MIGRATION_INDEXES.some((spec) => spec.name === name), `${name}: its table is dropped, nothing checks it`);
+      continue;
+    }
     assert.ok(DEVICE_SESSION_KEY_INDEXES.some((spec) => spec.name === name && spec.table === table), `${name} is built CONCURRENTLY on a large table`);
     assert.ok(POST_MIGRATION_INDEXES.some((spec) => spec.name === name && spec.table === table), `${name} is checked after migrating`);
   }

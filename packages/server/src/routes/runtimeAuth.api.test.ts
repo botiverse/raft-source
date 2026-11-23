@@ -168,13 +168,15 @@ test("task #17: the attacher and server owners/admins may sign a runtime in; oth
   assert.deepEqual(await read.json(), {
     status: null,
     availability: "ok",
-    runtimes: RUNTIME_AUTH_RUNTIMES.filter((runtime) => runtime !== "antigravity"),
+    runtimes: [...RUNTIME_AUTH_RUNTIMES],
     // Pi signs out per provider on a daemon with its capability (this fake's default: every runtime).
-    logoutRuntimes: ["claude", "codex", "kimi", "pi", "grok", "opencode"],
+    logoutRuntimes: ["claude", "codex", "kimi", "antigravity", "pi", "grok", "opencode"],
     canAct: true,
-  }, "Antigravity only where its flag is on");
+  });
   assert.equal((await calls.login(tokens.attacher, "qwen")).status, 404, "Qwen Code has a provider key, not a sign-in");
   assert.equal((await calls.logout(tokens.attacher, "qwen")).status, 404, "nor a sign-out");
+  assert.equal((await calls.login(tokens.attacher, "dsh")).status, 404, "DeepSeek Harness has no sign-in (OAR has none): its card is status and Install only");
+  assert.equal((await calls.logout(tokens.attacher, "dsh")).status, 404, "nor a sign-out");
 
   for (const token of [tokens.attacher, tokens.admin, tokens.owner]) {
     const started = await calls.login(token);
@@ -318,7 +320,7 @@ test("Kimi and Qoder are signed in only on a Computer whose daemon knows them, r
   assert.equal((await calls.logout(tokens.attacher, "qoder")).status, 404, "OAR has no Qoder logout");
 });
 
-test("Antigravity is offered only where agent_runtime_oar_antigravity revives it, its sign-out too", async ({ app }) => {
+test("Antigravity's sign-in and sign-out are offered with agent_runtime_oar_antigravity off and on", async ({ app }) => {
   __clearRuntimeAuthLocalStoreForTests();
   const current = fakeOrchestrator();
   app.app.set("agentOrchestrator", current.orchestrator);
@@ -329,25 +331,21 @@ test("Antigravity is offered only where agent_runtime_oar_antigravity revives it
   const read = async (calls: ReturnType<typeof api>, token: string) =>
     await (await calls.status(token)).json() as { status: { runtimes: Record<string, unknown> } | null; runtimes: string[] };
 
-  // Flag off (the default): the server says nothing about Antigravity, so the web shows nothing new.
+  // Flag off (the default): Antigravity is not deprecated, so its sign-in does not wait for the flag.
   const off = await seedComputer("rtauth-agy-off");
   const offCalls = api(app.baseUrl, off.server.id, off.machine.id);
   await runtimeAuthService.recordStatus(off.machine.id, stored);
   const offView = await read(offCalls, off.tokens.attacher);
-  assert.deepEqual(offView.status?.runtimes, { claude: { kind: "logged_in" } }, "its stored status is left out");
-  assert.ok(!offView.runtimes.includes("antigravity"), "and it is not offered");
-  assert.ok(offView.runtimes.includes("qwen"), "the others are");
-  const refused = await offCalls.login(off.tokens.attacher, "antigravity");
-  assert.equal(refused.status, 404);
-  const refusal = await refused.json() as { code: string; error: string };
-  assert.equal(refusal.code, "runtime_auth_not_offered");
-  assert.equal(refusal.error, "This runtime cannot be signed in from the web on this server.");
-  const refusedLogout = await offCalls.logout(off.tokens.attacher, "antigravity");
-  assert.equal(refusedLogout.status, 404, "its sign-out is refused as its sign-in is");
-  assert.equal((await refusedLogout.json() as { code: string }).code, "runtime_auth_not_offered");
-  assert.ok(!offView.runtimes.includes("antigravity") && !(offView as { logoutRuntimes?: string[] }).logoutRuntimes?.includes("antigravity"));
-  assert.equal(current.commands.length, 0, "nothing reached the Computer");
-  assert.ok(!tracedEvents.some((event) => event.name === "runtime_auth.logout.result" && (event.attrs as { runtime?: string }).runtime === "antigravity"), "no logout was relayed");
+  assert.deepEqual(offView.status?.runtimes, stored.runtimes, "its stored status is read");
+  assert.ok(offView.runtimes.includes("antigravity"), "and it is offered");
+  assert.ok((offView as { logoutRuntimes?: string[] }).logoutRuntimes?.includes("antigravity"), "its sign-out too");
+  const offStarted = await offCalls.login(off.tokens.attacher, "antigravity");
+  assert.equal(offStarted.status, 200);
+  assert.deepEqual(current.commands.at(-1)?.message, { type: "machine:runtime_auth:login:start", loginId: (await offStarted.json() as { loginId: string }).loginId, runtime: "antigravity" });
+  await endLogin(current.commands.at(-1)!.message.loginId!);
+  const offLogout = await offCalls.logout(off.tokens.attacher, "antigravity");
+  assert.equal(offLogout.status, 200);
+  assert.deepEqual(await offLogout.json(), { result: { kind: "logged_out" } });
 
   // Flag on for this server: offered, its status read, its login relayed.
   const on = await seedComputer("rtauth-agy-on");

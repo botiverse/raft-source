@@ -29,6 +29,15 @@ export type ObjectEventHome = ViewHome | { kind: "conversation"; channelId: null
 export interface ObjectEventRecipient {
   actor: { type: "user" | "agent"; id: string };
   reason: ObjectEventRecipientReason;
+  /**
+   * The event is already read for this person (an app's status change that
+   * asks nothing of anyone, such as an Artifact settled): their Activity row
+   * moves to it, but it adds no unread. A row with nothing unread before
+   * stays read (and a Done one stays Done); one unread already stays unread.
+   * Listed more than once, an actor's event is read only if every listing
+   * says so.
+   */
+  read?: true;
 }
 
 export interface ObjectEventInput {
@@ -78,21 +87,24 @@ function checkInput(input: ObjectEventInput): void {
   }
 }
 
-/** One row per recipient, its strongest reason; the actor left out. */
+/** One row per recipient, its strongest reason; the actor left out. `read`: the recipients listed only as read (ObjectEventRecipient.read), by `type:id`. */
 function recipientRows(eventId: string, input: ObjectEventInput) {
   const byActor = new Map<string, ObjectEventRecipient>();
+  const unread = new Set<string>();
   for (const recipient of input.recipients) {
     if (recipient.actor.type === input.actor.type && recipient.actor.id === input.actor.id) continue;
     const key = `${recipient.actor.type}:${recipient.actor.id}`;
+    if (recipient.read !== true) unread.add(key);
     const had = byActor.get(key);
     if (!had || REASON_STRENGTH[recipient.reason] > REASON_STRENGTH[had.reason]) byActor.set(key, recipient);
   }
-  return [...byActor.values()].map((recipient) => ({
+  const rows = [...byActor.values()].map((recipient) => ({
     eventId,
     recipientType: recipient.actor.type,
     recipientId: recipient.actor.id,
     reason: recipient.reason,
   }));
+  return { rows, read: new Set([...byActor.keys()].filter((key) => !unread.has(key))) };
 }
 
 /**
@@ -114,7 +126,7 @@ export async function recordObjectEvent(executor: DatabaseExecutor, input: Objec
     data: input.data,
   }).returning({ id: objectEvents.id, seq: objectEvents.seq, createdAt: objectEvents.createdAt });
   if (!row) throw new Error("object event insert returned no row");
-  const recipients = recipientRows(row.id, input);
+  const { rows: recipients, read } = recipientRows(row.id, input);
   if (recipients.length > 0) await executor.insert(objectEventRecipients).values(recipients);
   // People's Activity rows (and the object's home on all of its rows), in this transaction.
   await recordObjectInboxStates(executor, {
@@ -125,7 +137,7 @@ export async function recordObjectEvent(executor: DatabaseExecutor, input: Objec
     kind: input.kind,
     objectId: input.objectId,
     home: input.home.kind === "conversation" ? { kind: "conversation", channelId: input.home.channelId } : { kind: input.home.kind },
-  }, recipients);
+  }, recipients.map((recipient) => (read.has(`${recipient.recipientType}:${recipient.recipientId}`) ? { ...recipient, read: true as const } : recipient)));
   // Layer 3 (§三 step 3): the change_log rows go here, in this transaction:
   // the object changed in `input.home`, and with `input.previousHome` a
   // removal in the old home, so whoever saw it there drops it from their

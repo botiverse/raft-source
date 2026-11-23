@@ -260,7 +260,7 @@ test("[D6][D8] an app item names its app and related conversation; the app name 
     remaining: 2,
     consumed: false,
   }));
-  assert.deepEqual(fallback.output.split("\n").slice(0, 2), ["Showing 1 of 3 unread on app:stamp; 2 left.", "From Stamp."]);
+  assert.deepEqual(fallback.output.split("\n").slice(0, 2), ["Showing 1 of 3 unread on app:stamp; 2 left.", ""], "the name only repeats the address: no source line");
   assert.match(fallback.output, /\nNext: run the same command for the rest: raft inbox read --target "app:stamp"\n$/);
 });
 

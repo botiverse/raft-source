@@ -477,12 +477,17 @@ test("server-create validation answers as POST /api/servers and creates nothing"
   await convertToJoint(host, room.id);
   const invite = await seedInvite(host, room.id, invitee.email);
   const taken = await createServer("Taken", slug(), (await seedUser(`ns-taken-${randomBytes(4).toString("hex")}`)).id);
+  // A deleted server keeps its slug (servers_slug_unique covers every row):
+  // the same 409, not a 500 from the insert (#triage:#452).
+  const deleted = await createServer("Deleted", slug(), (await seedUser(`ns-deleted-${randomBytes(4).toString("hex")}`)).id);
+  await getDb().update(servers).set({ deletedAt: new Date() }).where(eq(servers.id, deleted.id));
 
   const cases: Array<[string, unknown, number]> = [
     ["empty name", { name: "", slug: slug() }, 400],
     ["no slug", { name: "Newco" }, 400],
     ["bad slug", { name: "Newco", slug: "9-Bad Slug" }, 400],
     ["slug taken", { name: "Newco", slug: taken.slug }, 409],
+    ["slug held by a deleted server", { name: "Newco", slug: deleted.slug }, 409],
   ];
   for (const [label, body, status] of cases) {
     const viaInvite = await connectNew(app.baseUrl, invitee, invite.token, body);

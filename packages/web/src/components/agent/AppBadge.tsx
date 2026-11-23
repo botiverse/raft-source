@@ -1,4 +1,4 @@
-import { Badge } from "raft-ui";
+import { Badge } from "@botiverse/raft-ui";
 import { useIntl } from "react-intl";
 import Tooltip from "../ui/Tooltip";
 

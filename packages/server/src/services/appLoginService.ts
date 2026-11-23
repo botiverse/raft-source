@@ -12,12 +12,13 @@
  * and no provider callback. Only the code is secret; it is stored as a
  * sha256 hash and consumed once by compare-and-set.
  */
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { and, eq, gt, isNull } from "drizzle-orm";
 import { getDb, type DatabaseTransaction } from "../db/index";
 import { appLoginRequests, users } from "../db/schema";
 import { currentDate } from "@botiverse/raft-shared";
 import { isApprovingSessionLive } from "./sessionService";
+import { hashOneTimeCode, isLoopbackReturnUri, isPkceChallenge, loopbackCallbackUrl, pkceVerifierMatches } from "./loopbackRedirect";
 
 export const APP_LOGIN_REQUEST_TTL_MS = 10 * 60_000;
 /** An approved code is exchangeable for this long after approval, and never
@@ -60,28 +61,8 @@ export const GENERIC_APP_LOGIN_CLIENT: AppLoginClient = { id: "custom", name: "R
 
 const DEFAULT_APP_LOGIN_RETURN_URIS = APP_LOGIN_CLIENTS.flatMap((client) => client.returnUris);
 
-/**
- * Strict loopback redirect: exactly `http://127.0.0.1:<port>/callback` or
- * `http://[::1]:<port>/callback`, port explicit, 1–65535, no leading zero.
- * Matched on the raw string (no `localhost`, https, userinfo, query,
- * fragment, other path, uppercase, percent-encoding, or numeric host tricks
- * like `127.1` / `0x7f.0.0.1`), and the WHATWG serialization must equal the
- * input — which also rejects `:80`, since URL drops the default port and the
- * callback could no longer echo the URI as given.
- */
-const LOOPBACK_RETURN_URI = /^http:\/\/(?:127\.0\.0\.1|\[::1\]):([1-9][0-9]{0,4})\/callback$/;
-
-export function isLoopbackAppLoginReturnUri(uri: string): boolean {
-  const match = LOOPBACK_RETURN_URI.exec(uri);
-  if (!match) return false;
-  const port = Number(match[1]);
-  if (port < 1 || port > 65535) return false;
-  try {
-    return new URL(uri).href === uri;
-  } catch {
-    return false;
-  }
-}
+/** Raft Desktop's loopback return URI: the shared RFC 8252 rule (loopbackRedirect.ts). */
+export const isLoopbackAppLoginReturnUri = isLoopbackReturnUri;
 
 /** Exact-URI allowlist. APP_LOGIN_RETURN_URIS replaces the registry's exact
  * URIs (as before); loopback is pattern-matched separately and always on. */
@@ -104,21 +85,13 @@ export function appLoginClientForReturnUri(uri: string, env: NodeJS.ProcessEnv =
 
 /** Display client for a stored request: the registry entry for its return
  * URI, falling back to the generic client if the allowlist changed since. */
-function storedClient(returnUri: string): AppLoginClient {
+export function storedClient(returnUri: string): AppLoginClient {
   return appLoginClientForReturnUri(returnUri) ?? GENERIC_APP_LOGIN_CLIENT;
 }
 
 export type AppLoginStartError = "return_uri_not_allowed" | "code_challenge_invalid" | "client_mismatch";
 export type AppLoginResolveError = "request_not_found" | "request_expired" | "request_already_resolved";
 export type AppLoginExchangeError = "code_not_found" | "code_expired" | "code_consumed" | "pkce_mismatch" | "return_uri_mismatch";
-
-function hashCode(code: string): string {
-  return createHash("sha256").update(code).digest("hex");
-}
-
-function pkceChallenge(verifier: string): string {
-  return createHash("sha256").update(verifier).digest("base64url");
-}
 
 /** `clientId` is optional; when sent it must name the registry client of
  * `returnUri` — it can never pick a client the URI does not belong to. */
@@ -129,7 +102,7 @@ export async function startAppLogin(input: { returnUri: string; codeChallenge: s
   const client = appLoginClientForReturnUri(input.returnUri);
   if (!client) return { ok: false, error: "return_uri_not_allowed" };
   if (input.clientId !== undefined && input.clientId !== client.id) return { ok: false, error: "client_mismatch" };
-  if (!/^[A-Za-z0-9_-]{43,128}$/.test(input.codeChallenge)) return { ok: false, error: "code_challenge_invalid" };
+  if (!isPkceChallenge(input.codeChallenge)) return { ok: false, error: "code_challenge_invalid" };
   const expiresAt = new Date(currentDate().getTime() + APP_LOGIN_REQUEST_TTL_MS);
   const [row] = await getDb().insert(appLoginRequests).values({
     codeChallenge: input.codeChallenge,
@@ -139,9 +112,13 @@ export async function startAppLogin(input: { returnUri: string; codeChallenge: s
   return { ok: true, requestId: row!.id, expiresAt, client };
 }
 
-async function loadPending(requestId: string) {
+export type AppLoginPurpose = "login" | "step_up";
+
+/** A request of `purpose` (the login routes never see a step-up row, nor the reverse: either is "not found"). */
+export async function loadPending(requestId: string, purpose: AppLoginPurpose = "login") {
   if (!/^[0-9a-f-]{36}$/i.test(requestId)) return { ok: false as const, error: "request_not_found" as const };
-  const [row] = await getDb().select().from(appLoginRequests).where(eq(appLoginRequests.id, requestId)).limit(1);
+  const [row] = await getDb().select().from(appLoginRequests)
+    .where(and(eq(appLoginRequests.id, requestId), eq(appLoginRequests.purpose, purpose))).limit(1);
   if (!row) return { ok: false as const, error: "request_not_found" as const };
   if (row.status !== "pending") return { ok: false as const, error: "request_already_resolved" as const, row };
   if (row.expiresAt.getTime() <= currentDate().getTime()) return { ok: false as const, error: "request_expired" as const, row };
@@ -150,11 +127,8 @@ async function loadPending(requestId: string) {
 
 /** Every callback names its request, so an app that retried can ignore a
  * late callback from an earlier attempt before exchanging anything. */
-function callbackUrl(returnUri: string, requestId: string, params: Record<string, string>): string {
-  const url = new URL(returnUri);
-  url.searchParams.set("requestId", requestId);
-  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
-  return url.toString();
+export function callbackUrl(returnUri: string, requestId: string, params: Record<string, string>): string {
+  return loopbackCallbackUrl(returnUri, { requestId, ...params });
 }
 
 /** What the confirmation page needs; the return URI is included so a
@@ -189,9 +163,10 @@ export async function approveAppLogin(requestId: string, userId: string, approve
   }
   const code = randomBytes(32).toString("base64url");
   const [updated] = await getDb().update(appLoginRequests)
-    .set({ status: "approved", userId, codeHash: hashCode(code), approvedAt: currentDate(), approverFamilyId })
+    .set({ status: "approved", userId, codeHash: hashOneTimeCode(code), approvedAt: currentDate(), approverFamilyId })
     .where(and(
       eq(appLoginRequests.id, requestId),
+      eq(appLoginRequests.purpose, "login"),
       eq(appLoginRequests.status, "pending"),
       gt(appLoginRequests.expiresAt, currentDate()),
     ))
@@ -212,7 +187,7 @@ export async function denyAppLogin(requestId: string): Promise<
   }
   const [updated] = await getDb().update(appLoginRequests)
     .set({ status: "denied" })
-    .where(and(eq(appLoginRequests.id, requestId), eq(appLoginRequests.status, "pending")))
+    .where(and(eq(appLoginRequests.id, requestId), eq(appLoginRequests.purpose, "login"), eq(appLoginRequests.status, "pending")))
     .returning({ returnUri: appLoginRequests.returnUri });
   if (!updated) return { ok: false, error: "request_already_resolved" };
   return { ok: true, redirectUrl: callbackUrl(updated.returnUri, requestId, { error: "access_denied" }) };
@@ -239,14 +214,15 @@ export async function exchangeAppLoginCode(tx: DatabaseTransaction, code: string
   | { ok: false; error: AppLoginExchangeError }
 > {
   if (!code || code.length > 256) return { ok: false, error: "code_not_found" };
+  // A step-up's code (appStepUpService.ts) never issues a session: not found here.
   const [row] = await tx.select().from(appLoginRequests)
-    .where(eq(appLoginRequests.codeHash, hashCode(code))).limit(1);
+    .where(and(eq(appLoginRequests.codeHash, hashOneTimeCode(code)), eq(appLoginRequests.purpose, "login"))).limit(1);
   if (!row || !row.userId) return { ok: false, error: "code_not_found" };
   if (row.status === "completed") return { ok: false, error: "code_consumed" };
   const now = currentDate().getTime();
   if (row.expiresAt.getTime() <= now) return { ok: false, error: "code_expired" };
   if (!row.approvedAt || row.approvedAt.getTime() + APP_LOGIN_CODE_TTL_MS < now) return { ok: false, error: "code_expired" };
-  if (!codeVerifier || pkceChallenge(codeVerifier) !== row.codeChallenge) return { ok: false, error: "pkce_mismatch" };
+  if (!pkceVerifierMatches(codeVerifier, row.codeChallenge)) return { ok: false, error: "pkce_mismatch" };
   // A loopback client (Raft Desktop) is new and must send it; others may omit it.
   if (returnUri === undefined ? isLoopbackAppLoginReturnUri(row.returnUri) : returnUri !== row.returnUri) {
     return { ok: false, error: "return_uri_mismatch" };
@@ -261,6 +237,7 @@ export async function exchangeAppLoginCode(tx: DatabaseTransaction, code: string
     .set({ status: "completed", consumedAt: currentDate() })
     .where(and(
       eq(appLoginRequests.id, row.id),
+      eq(appLoginRequests.purpose, "login"),
       eq(appLoginRequests.status, "approved"),
       isNull(appLoginRequests.consumedAt),
     ))

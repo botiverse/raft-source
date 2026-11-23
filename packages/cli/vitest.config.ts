@@ -1,5 +1,13 @@
 import { defineConfig } from "vitest/config";
 
+// Dev trace (scripts/vitest/devTraceReporter.ts). Imported lazily so that plain
+// `node` can still load this config (src/testEnvironment.test.ts does) without
+// resolving the repo's extensionless TypeScript imports. Before the cleanup
+// below: it snapshots the environment (agent id, RAFT_DEV_TRACE*) at import.
+const devTrace = await import("../../scripts/vitest/devTraceReporter")
+  .then((module) => [module.devTracePlugin("@botiverse/raft")])
+  .catch(() => []);
+
 // A managed runner's identity, credentials, and transport/context signal belong
 // to the host, not test fixtures. Clear them before workers fork; tests set
 // their own environment explicitly. Preserve the artifact selector and the
@@ -21,7 +29,9 @@ for (const key of Object.keys(process.env)) {
 // spawns so every worker inherits it.
 process.env.TZ = "Asia/Singapore";
 
+
 export default defineConfig({
+  plugins: devTrace,
   test: {
     globals: true,
     environment: "node",

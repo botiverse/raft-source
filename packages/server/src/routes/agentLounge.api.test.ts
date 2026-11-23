@@ -150,7 +150,8 @@ test("Guests cannot read, post in or be added to a lounge", async ({ app }) => {
   const world = await seedWorld(app.baseUrl);
   const { channel } = await openLounge(world);
   assert.equal((await world.human("guest", "GET", `/channels/${channel.id}`)).status, 404);
-  assert.equal((await world.human("guest", "POST", "/messages", { channelId: channel.id, content: "hi" })).status, 403);
+  // A Guest can't see the lounge, so its post answers like a missing channel, as the read above does.
+  assert.equal((await world.human("guest", "POST", "/messages", { channelId: channel.id, content: "hi" })).status, 404);
   const add = await world.human("owner", "POST", `/channels/${channel.id}/members`, { userId: world.guest.id });
   assert.notEqual(add.status, 200);
   assert.equal((await getDb().select().from(channelHumans).where(and(eq(channelHumans.channelId, channel.id), eq(channelHumans.userId, world.guest.id)))).length, 0);

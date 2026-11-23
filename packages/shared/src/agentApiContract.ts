@@ -2,6 +2,9 @@ import { raftbenchFindingsQuerySchema, raftbenchFindingsResponseSchema, type Raf
 import { raftbenchContextQuerySchema, raftbenchContextResponseSchema, raftbenchReportSchema, raftbenchSubmitResponseSchema, type RaftbenchContextQuery, type RaftbenchContextResponse, type RaftbenchReport, type RaftbenchSubmitResponse } from "./raftbenchContract";
 import { z } from "zod";
 import { lazySchema } from "./lazySchema";
+import { AGENT_TOKEN_SIGNING_ALGS } from "./agentTokenSigningAlg";
+import { AGENT_TOKEN_TYPES } from "./agentTokenType";
+import { DESCRIPTION_LINK_UNREADABLE, DESCRIPTION_LINK_WARNING_CODES } from "./descriptionLinkWarnings";
 import { agentApiAssistantOwnerArtifactPublishAsOwnerBodySchema, agentApiAssistantOwnerArtifactPublishAsOwnerResponseSchema, agentApiAssistantOwnerArtifactPublishBodySchema, agentApiAssistantOwnerArtifactPublishResponseSchema, agentApiAssistantOwnerArtifactQuerySchema, agentApiAssistantOwnerArtifactResponseSchema, type AgentApiAssistantOwnerArtifactPublishAsOwnerBody, type AgentApiAssistantOwnerArtifactPublishAsOwnerResponse, type AgentApiAssistantOwnerArtifactPublishBody, type AgentApiAssistantOwnerArtifactPublishResponse, type AgentApiAssistantOwnerArtifactQuery, type AgentApiAssistantOwnerArtifactResponse } from "./agentApiArtifactsContract";
 import { agentApiMigrationRetryResponseSchema, type AgentApiMigrationRetryResponse } from "./agentMigrationRetry";
 import { AGENT_WRITE_LANDINGS } from "./agentWriteLanding";
@@ -447,6 +450,14 @@ export const agentApiMessageResolveParamsSchema = lazySchema("agentApiMessageRes
   msgId: z.string().trim().min(1).transform(asMessageId),
 }));
 
+/**
+ * `forwarded`: one message of a forward, 1-based as "Forwarded message n" in
+ * the snapshot, returned whole (`forwarded` in the response).
+ */
+export const agentApiMessageResolveQuerySchema = lazySchema("agentApiMessageResolveQuerySchema", () => passthroughObject({
+  forwarded: z.string().trim().regex(/^[1-9][0-9]*$/, "must be a positive integer").optional(),
+}));
+
 export const agentApiMessageReactionParamsSchema = lazySchema("agentApiMessageReactionParamsSchema", () => passthroughObject({
   msgId: z.string().trim().min(1).transform(asMessageId),
 }));
@@ -472,7 +483,7 @@ export const agentApiChannelLifecycleBodySchema = lazySchema("agentApiChannelLif
 
 const agentApiChannelVisibilitySchema = lazySchema("agentApiChannelVisibilitySchema", () => z.enum(["public", "private"]));
 
-/** `POST /channels`: the Server checks the bound agent's createChannels role. */
+/** `POST /channels`: the Server checks the bound agent's createPublicChannels or createPrivateChannels capability, by `visibility`. */
 export const agentApiChannelCreateBodySchema = lazySchema("agentApiChannelCreateBodySchema", () => passthroughObject({
   name: z.string().trim().min(1),
   description: z.string().max(500).optional(),
@@ -523,6 +534,19 @@ export const agentApiChannelMemberRemoveBodySchema = lazySchema("agentApiChannel
   human: z.string().trim().min(1).optional(),
   agent: z.string().trim().min(1).optional(),
   deleteIfLast: agentApiDeleteIfLastSchema,
+}));
+
+/**
+ * `POST /channels/member-role`: set a channel member's channel role, by
+ * handle (`user` for a person, `agent` for an agent; exactly one). The Server
+ * decides from the bound agent's own changeChannelMemberRoles authority in
+ * that channel, the same rule as a person's.
+ */
+export const agentApiChannelMemberRoleBodySchema = lazySchema("agentApiChannelMemberRoleBodySchema", () => passthroughObject({
+  target: z.string().trim().min(1),
+  user: z.string().trim().min(1).optional(),
+  agent: z.string().trim().min(1).optional(),
+  role: z.enum(["admin", "member"]),
 }));
 
 /** The created or updated channel row (with joint-channel metadata when it has any). */
@@ -635,6 +659,63 @@ export const agentApiThreadFollowResponseSchema = lazySchema("agentApiThreadFoll
   following: z.literal(true),
   /** False when the agent already followed the thread. */
   changed: z.boolean(),
+}));
+
+// Focus (flag `agent_focus_v0`): the conversations an agent keeps in focus.
+// Part 1 stores the state only; delivery does not read it yet.
+
+/** The most conversations one agent has in focus; focusing one more unfocuses the least recently active. */
+export const AGENT_FOCUS_LIMIT = 3;
+/** What can be focused. A plain channel cannot (yet). */
+export const AGENT_FOCUS_TARGET_KINDS = ["thread", "dm", "task"] as const;
+export type AgentFocusTargetKind = (typeof AGENT_FOCUS_TARGET_KINDS)[number];
+/** `manual`: the agent focused it itself. `auto`: Raft did (unfocused before any manual one when the limit is reached). */
+export const AGENT_FOCUS_SOURCES = ["auto", "manual"] as const;
+export type AgentFocusSource = (typeof AGENT_FOCUS_SOURCES)[number];
+/** The focus routes' own refusal codes (informative: clients show the sentence). */
+export const AGENT_FOCUS_DISABLED_CODE = "AGENT_FOCUS_DISABLED";
+export const AGENT_FOCUS_CHANNEL_UNAVAILABLE_CODE = "FOCUS_CHANNEL_UNAVAILABLE";
+export const AGENT_FOCUS_TASK_NO_CONVERSATION_CODE = "FOCUS_TASK_NO_CONVERSATION";
+
+export const agentApiFocusBodySchema = lazySchema("agentApiFocusBodySchema", () => passthroughObject({
+  /** A thread (`#chan:abcd1234`, `dm:@peer:abcd1234`), a DM (`dm:@peer`) or a task conversation (`#chan:#7`). */
+  target: z.string().trim().min(1),
+}));
+
+export const agentApiFocusEntrySchema = lazySchema("agentApiFocusEntrySchema", () => passthroughObject({
+  /** The conversation as the agent addresses it: `#chan:abcd1234`, `dm:@peer`, `#chan:#7`. */
+  target: z.string().trim().min(1),
+  kind: z.enum(AGENT_FOCUS_TARGET_KINDS),
+  source: z.enum(AGENT_FOCUS_SOURCES),
+  focusedAt: z.string().datetime(),
+  lastActiveAt: z.string().datetime(),
+}));
+
+export const agentApiFocusResponseSchema = lazySchema("agentApiFocusResponseSchema", () => passthroughObject({
+  ok: z.literal(true),
+  focused: agentApiFocusEntrySchema,
+  /** True when the conversation was already focused (its last-active time is refreshed). */
+  alreadyFocused: z.boolean(),
+  /** What this call unfocused to stay within `limit`, least recently active first. */
+  evicted: z.array(agentApiFocusEntrySchema),
+  /** Everything focused now, most recently active first. */
+  entries: z.array(agentApiFocusEntrySchema),
+  limit: z.number().int().positive(),
+}));
+
+export const agentApiUnfocusResponseSchema = lazySchema("agentApiUnfocusResponseSchema", () => passthroughObject({
+  ok: z.literal(true),
+  target: z.string().trim().min(1),
+  /** False when the conversation was not focused (nothing changed). */
+  wasFocused: z.boolean(),
+  entries: z.array(agentApiFocusEntrySchema),
+  limit: z.number().int().positive(),
+}));
+
+export const agentApiFocusListResponseSchema = lazySchema("agentApiFocusListResponseSchema", () => passthroughObject({
+  /** Most recently active first. */
+  entries: z.array(agentApiFocusEntrySchema),
+  limit: z.number().int().positive(),
 }));
 
 export const agentApiThreadListItemSchema = lazySchema("agentApiThreadListItemSchema", () => passthroughObject({
@@ -1183,6 +1264,16 @@ const agentApiProfileCreatorSchema = lazySchema("agentApiProfileCreatorSchema", 
   }),
 ]));
 
+/** A saved description's link whose object some of its readers can't open (descriptionLinkWarnings.ts; profileUpdate only). */
+export const agentApiDescriptionLinkWarningSchema = lazySchema("agentApiDescriptionLinkWarningSchema", () => passthroughObject({
+  code: z.enum(DESCRIPTION_LINK_WARNING_CODES),
+  url: z.string(),
+  object: passthroughObject({ kind: z.string(), id: z.string() }),
+  server: passthroughObject({ id: z.string(), name: z.string() }).optional(),
+  unreadable: z.array(z.enum(DESCRIPTION_LINK_UNREADABLE)).optional(),
+  fixes: z.array(z.string()),
+}));
+
 export const agentApiProfileViewSchema: z.ZodType<ProfileView> = lazySchema("agentApiProfileViewSchema", () => z.discriminatedUnion("kind", [
   passthroughObject({
     kind: z.literal("human"),
@@ -1220,6 +1311,8 @@ export const agentApiProfileViewSchema: z.ZodType<ProfileView> = lazySchema("age
     createdAgents: z.array(agentApiProfileCreatedAgentSchema),
     createdAt: z.string(),
     deletedAt: nullableStringSchema,
+    // Only on a profileUpdate that saved a new description (the save stands either way).
+    warnings: z.array(agentApiDescriptionLinkWarningSchema).optional(),
   }),
 ]));
 
@@ -1300,6 +1393,13 @@ export const agentApiIntegrationAppUpdateBodySchema = lazySchema("agentApiIntegr
   setupUrl: optionalStringSchema,
   setupDescription: optionalStringSchema,
   scopes: optionalStringArraySchema,
+  /** How Raft signs this App's agent tokens: ES256 (default) or RS256. Never chosen per token request. */
+  agentTokenSigningAlg: z.enum(AGENT_TOKEN_SIGNING_ALGS).optional(),
+  /**
+   * The `typ` header of this App's agent tokens: at+jwt (default) or JWT. JWT
+   * only on an App without a redirect URL; never chosen per token request.
+   */
+  agentTokenType: z.enum(AGENT_TOKEN_TYPES).optional(),
   unsafeDemoUrlOverride: optionalBooleanSchema,
 }));
 
@@ -1493,8 +1593,9 @@ export const agentApiAgentContextResponseSchema = lazySchema("agentApiAgentConte
     taskConversations: z.boolean().optional(),
     /**
      * `continuations_pilot_v0`: a held `raft message send` asks instead of
-     * saving a draft. Present (true) only while on; absent when off and on
-     * older Servers. Not in AgentConfig: the CLI reads it here when a send is
+     * saving a draft. Present (true) only while on and only for a runtime in
+     * CONTINUATIONS_PILOT_RUNTIMES (Claude); absent otherwise and on older
+     * Servers. Not in AgentConfig: the CLI reads it here when a send is
      * held, so it applies without an agent restart.
      */
     continuationsPilot: z.boolean().optional(),
@@ -2242,6 +2343,15 @@ export const agentApiHistoryResponseSchema = lazySchema("agentApiHistoryResponse
   consumption_scope: agentApiHistoryConsumptionScopeSchema.optional(),
   /** Task v2: the read named a task conversation; newer CLIs read it with `raft task read <ref>`. */
   taskCommandHint: optionalStringSchema,
+  /**
+   * `raft task read` of a task from before task v2: its old discussion, the
+   * thread of the message it was posted as (as `raft task view` names it).
+   * Absent otherwise and on older servers.
+   */
+  earlierDiscussion: passthroughObject({
+    target: z.string(),
+    replyCount: z.number().int().nonnegative(),
+  }).nullable().optional(),
   messages: z.array(agentApiMessageEnvelopeSchema),
   has_more: z.boolean(),
   has_older: z.boolean(),
@@ -2352,6 +2462,93 @@ export const agentApiInboxDismissResponseSchema = lazySchema("agentApiInboxDismi
   earliestActivityAt: z.string().datetime().nullable(),
   /** `--before`: items past this call's cap, still listed; run it again. */
   remaining: z.number().int().nonnegative(),
+}));
+
+/** At most this many conversations in one `POST /inbox/rows`. */
+export const AGENT_API_INBOX_ROWS_MAX_TARGETS = 50;
+
+/**
+ * `POST /inbox/rows`: the `inbox check` rows of the named conversations only,
+ * asked by the agent's Computer before it prints a wake-up notice, so the
+ * notice and `inbox check` count from the same source.
+ */
+export const agentApiInboxRowsBodySchema = lazySchema("agentApiInboxRowsBodySchema", () => passthroughObject({
+  targets: z.array(passthroughObject({
+    /** The conversation's channel id as delivery carries it (channel, DM, thread channel or task conversation channel); letter case is ignored. */
+    channelId: z.string().uuid(),
+    /** The seq of the newest message of that conversation the asker holds. */
+    newestSeq: z.number().int().positive().safe(),
+  })).min(1).max(AGENT_API_INBOX_ROWS_MAX_TARGETS),
+  /**
+   * The asker adds what it holds itself: answer every named conversation's
+   * row, also one that does not yet include the asker's newest message, each
+   * with its `activitySeq`. The asker's number for a conversation is then the
+   * row's `unread` plus the messages it holds there with a seq above the
+   * row's `activitySeq`, and what it holds alone where there is no row.
+   */
+  withBehind: z.boolean().optional(),
+}));
+
+export const agentApiInboxRowsResponseSchema = lazySchema("agentApiInboxRowsResponseSchema", () => passthroughObject({
+  /**
+   * One row per named conversation the Server has an unread number for that
+   * already includes the asker's newest message, exactly as `inbox check`
+   * lists it, newest activity first.
+   *
+   * A named conversation with no row means only "no unread number for it
+   * right now": the unread source has not seen the message yet (a new message
+   * in a conversation that was fully read has no row there until it has), or
+   * the agent has nothing unread in it, or can't see it. These are not told
+   * apart. The asker lists such a conversation WITHOUT a number and never
+   * reads a missing row as "nothing unread".
+   *
+   * Seqs are server-wide and two messages of one conversation can commit out
+   * of order, so for a moment a row can pass as including the asker's newest
+   * message with `unread` one short; the next ask has it right.
+   *
+   * Each row carries the `channelId` it answers (lowercase, as the Server
+   * stores it): the asker matches rows to what it asked by id, because it and
+   * the Server build `target` in different code. Rows of `inbox check` have
+   * no such field.
+   */
+  rows: z.array(agentApiInboxItemRowSchema.extend({ channelId: z.string().uuid() })),
+  /**
+   * Set when the request's `withBehind` was honoured (a Server that does not
+   * know the field never sets it). Then `rows` has the row of every named
+   * conversation the unread source has one for, each with `activitySeq`: the
+   * row counts what is unread up to that seq, and may not include the asker's
+   * newest message. A named conversation without a row then means the source
+   * knows of nothing unread there (a conversation with older unread messages
+   * always has a row), so the asker's own held messages are its number.
+   *
+   * The sum is not exact: two messages of one conversation that commit out
+   * of seq order can leave it one short, and a read the source has not seen
+   * yet can leave it high. Both are right again on the next ask.
+   */
+  withBehind: z.literal(true).optional(),
+  /**
+   * A diagnostic. Without `withBehind`: only the named conversations the
+   * unread source already had a row for, older than the asker's `newestSeq`
+   * (one the source has no row for yet is not in it). With `withBehind`:
+   * every named conversation whose `newestSeq` is above its row's
+   * `activitySeq`, or that has no row.
+   */
+  behind: z.number().int().nonnegative(),
+  /**
+   * The agent's unread that was not named, as `inbox check` would add it up
+   * over the rows it lists for those conversations (a DM no target can open is
+   * in none of the four).
+   */
+  otherUnread: passthroughObject({
+    /** Unread conversations that were not named. */
+    conversations: z.number().int().nonnegative(),
+    /** The sum of their rows' `unread`. */
+    messages: z.number().int().nonnegative(),
+    /** How many of them have an unread mention. */
+    mentions: z.number().int().nonnegative(),
+    /** How many of them are DMs. */
+    dms: z.number().int().nonnegative(),
+  }),
 }));
 
 // RFC 074 §2 personal assistant (v0). The assistant calls with its own
@@ -2779,6 +2976,15 @@ export const agentApiAssistantSearchForwardTargetsResponseSchema = lazySchema("a
 
 export const agentApiMessageResolveResponseSchema = lazySchema("agentApiMessageResolveResponseSchema", () => passthroughObject({
   message: agentApiMessageEnvelopeSchema,
+  /**
+   * With `forwarded=<n>`: that forwarded message as the agent's snapshot has
+   * it (the same lines), its content not cut. `total` is how many the forward carries.
+   */
+  forwarded: passthroughObject({
+    number: z.number().int().positive(),
+    total: z.number().int().positive(),
+    content: z.string(),
+  }).optional(),
 }));
 
 export const agentApiChannelAttentionSchema = lazySchema("agentApiChannelAttentionSchema", () => passthroughObject({
@@ -2813,6 +3019,15 @@ export const agentApiChannelMemberRemoveResponseSchema = lazySchema("agentApiCha
   member: agentApiChannelMemberRefSchema,
   attention: agentApiChannelAttentionSchema.optional(),
   channelDeleted: agentApiChannelDeletedSchema,
+}));
+
+/** `changed`: false when the member already had `channelRole` (nothing was written). */
+export const agentApiChannelMemberRoleResponseSchema = lazySchema("agentApiChannelMemberRoleResponseSchema", () => passthroughObject({
+  ok: z.literal(true),
+  changed: z.boolean(),
+  channelId: z.string(),
+  member: agentApiChannelMemberRefSchema,
+  channelRole: z.enum(["admin", "member"]),
 }));
 
 export const agentApiOkResponseSchema = lazySchema("agentApiOkResponseSchema", () => passthroughObject({
@@ -2924,6 +3139,15 @@ export const agentApiMessageSearchResponseSchema = lazySchema("agentApiMessageSe
   relevanceFallback: z.enum(["too_broad"]).optional(),
 }));
 
+/**
+ * A roster member's channel role, only where the channel has channel roles (a
+ * public, private or joint channel other than `#all`). A joint channel's
+ * person is `admin` when they can manage it (the host server's owner or admin,
+ * or a channel admin there); another server's agent carries none, as on the
+ * web member list. Older Servers omit it.
+ */
+const agentApiChannelMemberChannelRoleSchema = lazySchema("agentApiChannelMemberChannelRoleSchema", () => z.enum(["admin", "member"]));
+
 export const agentApiChannelMembersResponseSchema = lazySchema("agentApiChannelMembersResponseSchema", () => passthroughObject({
   channel: passthroughObject({
     ref: z.string(),
@@ -2932,15 +3156,24 @@ export const agentApiChannelMembersResponseSchema = lazySchema("agentApiChannelM
   agents: z.array(passthroughObject({
     name: z.string(),
     status: optionalStringSchema,
+    channelRole: agentApiChannelMemberChannelRoleSchema.optional(),
   })),
   humans: z.array(passthroughObject({
     name: z.string(),
     description: z.string().nullable().optional(),
+    // Present exactly when the person is a member of the agent's own server
+    // (in a joint channel only `member` or `guest`, never their real role);
+    // absent for anyone only on other servers. Programs may rely on this to
+    // tell that a person is also on the agent's server, which `servers` never
+    // lists (Stamp's joint membership match does).
     role: optionalStringSchema,
-    // Joint channels only (RFC 075 phase 1): every server the person
-    // participates through, the agent's own first and marked `yours: true`
-    // when present. Omitted when the person is only on the agent's own server.
+    channelRole: agentApiChannelMemberChannelRoleSchema.optional(),
+    // Joint channels only (RFC 075 phase 1): every other server the person
+    // participates through; the agent's own server is never listed, and the
+    // list is omitted when the person takes part only through it. `id` is the Raft server id, for programs that
+    // match a person by (server id, name); older Servers omit it.
     servers: z.array(passthroughObject({
+      id: z.string().optional(),
       name: z.string(),
       slug: z.string(),
       yours: z.literal(true).optional(),
@@ -3761,7 +3994,7 @@ const coreAgentApiRoutes = {
     client: { resource: "messages", method: "resolve" },
     capability: "read",
     description: "Resolve a message id exactly and return the canonical visible message.",
-    request: { params: agentApiMessageResolveParamsSchema },
+    request: { params: agentApiMessageResolveParamsSchema, query: agentApiMessageResolveQuerySchema },
     response: { body: agentApiMessageResolveResponseSchema },
   }),
   messageSearch: route({
@@ -3904,6 +4137,16 @@ const coreAgentApiRoutes = {
     request: { params: agentApiChannelMembershipParamsSchema, body: agentApiChannelMemberRemoveBodySchema },
     response: { body: agentApiChannelMemberRemoveResponseSchema },
   }),
+  channelMemberRole: route({
+    key: "channelMemberRole",
+    method: "POST",
+    path: "/channels/member-role",
+    client: { resource: "channels", method: "setMemberRole" },
+    capability: "channels",
+    description: "Make a channel member a channel admin, or a channel admin a plain member, under the bound agent's own authority: it must be a channel admin there, or a server owner or admin who can access the channel. Not its own role, nor a server owner's or admin's.",
+    request: { body: agentApiChannelMemberRoleBodySchema },
+    response: { body: agentApiChannelMemberRoleResponseSchema },
+  }),
   channelMembers: route({
     key: "channelMembers",
     method: "GET",
@@ -3954,6 +4197,36 @@ const coreAgentApiRoutes = {
     request: {},
     response: { body: agentApiThreadListResponseSchema },
   }),
+  focus: route({
+    key: "focus",
+    method: "POST",
+    path: "/focus",
+    client: { resource: "focus", method: "add" },
+    capability: "channels",
+    description: "Focus a thread, a DM or a task conversation the bound agent can read (not a plain channel). At most 3 are focused: one more unfocuses the least recently active, those Raft focused by itself before those the agent focused. Focusing a focused one refreshes it. Only on a server with Focus on (flag `agent_focus_v0`); elsewhere 404 `AGENT_FOCUS_DISABLED`.",
+    request: { body: agentApiFocusBodySchema },
+    response: { body: agentApiFocusResponseSchema },
+  }),
+  unfocus: route({
+    key: "unfocus",
+    method: "POST",
+    path: "/unfocus",
+    client: { resource: "focus", method: "remove" },
+    capability: "channels",
+    description: "Stop focusing a conversation. Idempotent: `wasFocused` is false when it was not focused.",
+    request: { body: agentApiFocusBodySchema },
+    response: { body: agentApiUnfocusResponseSchema },
+  }),
+  focusList: route({
+    key: "focusList",
+    method: "GET",
+    path: "/focus",
+    client: { resource: "focus", method: "list" },
+    capability: "channels",
+    description: "List the conversations the bound agent has in focus, most recently active first.",
+    request: {},
+    response: { body: agentApiFocusListResponseSchema },
+  }),
   inboxList: route({
     key: "inboxList",
     method: "GET",
@@ -3987,6 +4260,17 @@ const coreAgentApiRoutes = {
     description: "Dismiss without reading: `target` dismisses one item, `before` every item with no activity since then (at least 24 h ago, or the launch day `inbox check`'s `preLaunch.before` names; at most 500 items a call, `remaining` says how many are left). There is no \"all\". Reminder items are never dismissed: `target` on one answers 409 NEEDS_ACK and `before` skips them (`skippedNeedsAck`). Dismissed items leave `inbox check` and wake-ups and are not redelivered. Every use is traced.",
     request: { body: agentApiInboxDismissBodySchema },
     response: { body: agentApiInboxDismissResponseSchema },
+  }),
+  inboxRows: route({
+    key: "inboxRows",
+    method: "POST",
+    // POST only for its body: it reads, and changes nothing.
+    path: "/inbox/rows",
+    client: { resource: "inbox", method: "rows" },
+    capability: "read",
+    description: "The `inbox check` rows of the named conversations only (asked by the agent's Computer before a wake-up notice; at most 50 conversations, each by its channel id and the seq of the newest message the asker holds). A conversation is listed when the Server has an unread number for it that already includes that newest message. A named conversation with no row means only that there is no number for it right now (the unread source has not seen the message yet, the agent has nothing unread there, or it can't see it; not told apart): list it without a number, never as nothing unread. `behind` is a diagnostic: how many of the conversations without a row already had one in the unread source, older than that newest message. With `withBehind: true` in the body, every named conversation the unread source has a row for is answered, each with its `activitySeq` (the row counts what is unread up to that seq), the response says `withBehind: true`, a conversation without a row has nothing unread in the source, and `behind` counts every named conversation whose newest message the source has not reached. `otherUnread` is the agent's unread that was not named: `conversations`, `messages` (the sum of their rows' `unread`), `mentions` and `dms` (how many of them have an unread mention, or are DMs). Reads only: no read position moves.",
+    request: { body: agentApiInboxRowsBodySchema },
+    response: { body: agentApiInboxRowsResponseSchema },
   }),
   assistantOwnerInbox: route({
     key: "assistantOwnerInbox",
@@ -4034,7 +4318,7 @@ const coreAgentApiRoutes = {
     path: "/assistant/owner-artifact/as-owner",
     client: { resource: "assistant", method: "publishArtifactAsOwner" },
     capability: "send",
-    description: "Personal assistants only, and only while your owner has \"send as me\" on: publish an Artifact AS your owner (they are its author) into a conversation they may post in now, named as they name it (home: #channel, dm:@peer, or an id); or a new version of one you published as them (artifact + base, the version you read; no home). The rules of sending as them apply: not your own DM with them (publish there as yourself with owner-artifact), a DM only while they let you read DMs, never a conversation bridged to an external chat. Any home you can't use answers the one TARGET_NOT_FOUND, whatever the reason; joint (shared) channels are not supported yet: a joint as home, or a new version of one homed in a joint, answers not-found too. Raft posts a receipt in your DM with your owner; you needn't tell them. If the answer is UNSEEN_CHANGES, read it with owner-artifact first and send the same publish with seen = the position it returned: the same publish without seen is held again.",
+    description: "Personal assistants only, and only while your owner has \"send as me\" on: publish an Artifact AS your owner (they are its author) into a conversation they may post in now, named as they name it (home: #channel, dm:@peer, or an id); or a new version of one you published as them (artifact + base, the version you read; no home). The rules of sending as them apply: not your own DM with them (publish there as yourself with owner-artifact), a DM only while they let you read DMs, never a conversation bridged to an external chat. Any home you can't use answers the one TARGET_NOT_FOUND, whatever the reason; a joint (shared) channel as home is not supported yet and answers not-found too; a new version of one homed in a joint goes through your owner's server's copy of it, by these same rules. Raft posts a receipt in your DM with your owner; you needn't tell them. If the answer is UNSEEN_CHANGES, read it with owner-artifact first and send the same publish with seen = the position it returned: the same publish without seen is held again.",
     request: { body: agentApiAssistantOwnerArtifactPublishAsOwnerBodySchema },
     response: { body: agentApiAssistantOwnerArtifactPublishAsOwnerResponseSchema },
   }),
@@ -5013,6 +5297,7 @@ export type AgentApiManagedMcpCallBody = z.infer<typeof agentApiManagedMcpCallBo
 export type AgentApiManagedMcpCallResponse = z.infer<typeof agentApiManagedMcpCallResponseSchema>;
 export type AgentApiMessageSearchQuery = z.infer<typeof agentApiMessageSearchQuerySchema>;
 export type AgentApiMessageResolveParams = z.infer<typeof agentApiMessageResolveParamsSchema>;
+export type AgentApiMessageResolveQuery = z.infer<typeof agentApiMessageResolveQuerySchema>;
 export type AgentApiMessageReactionParams = z.infer<typeof agentApiMessageReactionParamsSchema>;
 export type AgentApiMessageReactionBody = z.infer<typeof agentApiMessageReactionBodySchema>;
 export type AgentApiMessageCardUpdateParams = z.infer<typeof agentApiMessageCardUpdateParamsSchema>;
@@ -5027,11 +5312,18 @@ export type AgentApiChannelLeaveBody = z.infer<typeof agentApiChannelLeaveBodySc
 export type AgentApiChannelRowResponse = z.infer<typeof agentApiChannelRowResponseSchema>;
 export type AgentApiChannelMemberAddResponse = z.infer<typeof agentApiChannelMemberAddResponseSchema>;
 export type AgentApiChannelMemberRemoveResponse = z.infer<typeof agentApiChannelMemberRemoveResponseSchema>;
+export type AgentApiChannelMemberRoleBody = z.infer<typeof agentApiChannelMemberRoleBodySchema>;
+export type AgentApiChannelMemberRoleResponse = z.infer<typeof agentApiChannelMemberRoleResponseSchema>;
 export type AgentApiAttachmentDownloadParams = z.infer<typeof agentApiAttachmentDownloadParamsSchema>;
 export type AgentApiChannelMembersQuery = z.infer<typeof agentApiChannelMembersQuerySchema>;
 export type AgentApiThreadUnfollowBody = z.infer<typeof agentApiThreadUnfollowBodySchema>;
 export type AgentApiThreadFollowBody = z.infer<typeof agentApiThreadFollowBodySchema>;
 export type AgentApiThreadFollowResponse = z.infer<typeof agentApiThreadFollowResponseSchema>;
+export type AgentApiFocusBody = z.infer<typeof agentApiFocusBodySchema>;
+export type AgentApiFocusEntry = z.infer<typeof agentApiFocusEntrySchema>;
+export type AgentApiFocusResponse = z.infer<typeof agentApiFocusResponseSchema>;
+export type AgentApiUnfocusResponse = z.infer<typeof agentApiUnfocusResponseSchema>;
+export type AgentApiFocusListResponse = z.infer<typeof agentApiFocusListResponseSchema>;
 export type AgentApiThreadListItem = z.infer<typeof agentApiThreadListItemSchema>;
 export type AgentApiThreadListResponse = z.infer<typeof agentApiThreadListResponseSchema>;
 export type AgentApiInboxListQuery = z.infer<typeof agentApiInboxListQuerySchema>;
@@ -5086,6 +5378,8 @@ export type AgentApiInboxReadEntry = z.infer<typeof agentApiInboxReadEntrySchema
 export type AgentApiInboxReadResponse = z.infer<typeof agentApiInboxReadResponseSchema>;
 export type AgentApiInboxDismissBody = z.infer<typeof agentApiInboxDismissBodySchema>;
 export type AgentApiInboxDismissResponse = z.infer<typeof agentApiInboxDismissResponseSchema>;
+export type AgentApiInboxRowsBody = z.infer<typeof agentApiInboxRowsBodySchema>;
+export type AgentApiInboxRowsResponse = z.infer<typeof agentApiInboxRowsResponseSchema>;
 export type AgentApiTaskClaimBody = z.infer<typeof agentApiTaskClaimBodySchema>;
 export type AgentApiTaskListQuery = z.infer<typeof agentApiTaskListQuerySchema>;
 export type AgentApiTaskCreateBody = z.infer<typeof agentApiTaskCreateBodySchema>;
@@ -5221,6 +5515,8 @@ export interface AgentApiEventsResponse {
 export interface AgentApiHistoryResponse {
   consumption_scope?: AgentApiHistoryConsumptionScope;
   taskCommandHint?: string;
+  /** `raft task read` of a pre-v2 task: the thread its discussion had before its conversation. */
+  earlierDiscussion?: { target: string; replyCount: number } | null;
   messages: AgentApiMessageEnvelope[];
   has_more: boolean;
   has_older: boolean;
@@ -5461,14 +5757,19 @@ type CoreAgentApiRequestParamsByRoute = {
   channelUpdate: AgentApiChannelMembershipParams;
   channelMemberAdd: AgentApiChannelMembershipParams;
   channelMemberRemove: AgentApiChannelMembershipParams;
+  channelMemberRole: never;
   channelMembers: never;
   resolveChannel: never;
   threadFollow: never;
   threadUnfollow: never;
   threadList: never;
+  focus: never;
+  unfocus: never;
+  focusList: never;
   inboxList: never;
   inboxRead: never;
   inboxDismiss: never;
+  inboxRows: never;
   assistantOwnerInbox: never;
   assistantOwnerMessages: never;
   assistantSendAsOwner: never;
@@ -5579,7 +5880,7 @@ type CoreAgentApiRequestQueryByRoute = {
   managedMcpCall: never;
   messageSend: never;
   messageSendV2: never;
-  messageResolve: never;
+  messageResolve: AgentApiMessageResolveQuery;
   messageSearch: AgentApiMessageSearchQuery;
   messageReactionAdd: never;
   messageReactionRemove: never;
@@ -5597,14 +5898,19 @@ type CoreAgentApiRequestQueryByRoute = {
   channelUpdate: never;
   channelMemberAdd: never;
   channelMemberRemove: never;
+  channelMemberRole: never;
   channelMembers: AgentApiChannelMembersQuery;
   resolveChannel: never;
   threadFollow: never;
   threadUnfollow: never;
   threadList: never;
+  focus: never;
+  unfocus: never;
+  focusList: never;
   inboxList: AgentApiInboxListQuery;
   inboxRead: never;
   inboxDismiss: never;
+  inboxRows: never;
   assistantOwnerInbox: AgentApiAssistantOwnerInboxQuery;
   assistantOwnerMessages: AgentApiAssistantOwnerMessagesQuery;
   assistantSendAsOwner: never;
@@ -5733,14 +6039,19 @@ type CoreAgentApiRequestBodyByRoute = {
   channelUpdate: AgentApiChannelUpdateBody;
   channelMemberAdd: AgentApiChannelMemberBody;
   channelMemberRemove: AgentApiChannelMemberRemoveBody;
+  channelMemberRole: AgentApiChannelMemberRoleBody;
   channelMembers: never;
   resolveChannel: AgentApiResolveChannelBody;
   threadFollow: AgentApiThreadFollowBody;
   threadUnfollow: AgentApiThreadUnfollowBody;
   threadList: never;
+  focus: AgentApiFocusBody;
+  unfocus: AgentApiFocusBody;
+  focusList: never;
   inboxList: never;
   inboxRead: AgentApiInboxReadBody;
   inboxDismiss: AgentApiInboxDismissBody;
+  inboxRows: AgentApiInboxRowsBody;
   assistantOwnerInbox: never;
   assistantOwnerMessages: never;
   assistantSendAsOwner: AgentApiAssistantSendAsOwnerBody;
@@ -5869,14 +6180,19 @@ type CoreAgentApiResponseByRoute = {
   channelUpdate: AgentApiChannelRowResponse;
   channelMemberAdd: AgentApiChannelMemberAddResponse;
   channelMemberRemove: AgentApiChannelMemberRemoveResponse;
+  channelMemberRole: AgentApiChannelMemberRoleResponse;
   channelMembers: AgentApiChannelMembersResponse;
   resolveChannel: AgentApiResolveChannelResponse;
   threadFollow: AgentApiThreadFollowResponse;
   threadUnfollow: AgentApiOkResponse;
   threadList: AgentApiThreadListResponse;
+  focus: AgentApiFocusResponse;
+  unfocus: AgentApiUnfocusResponse;
+  focusList: AgentApiFocusListResponse;
   inboxList: AgentApiInboxListResponse;
   inboxRead: AgentApiInboxReadResponse;
   inboxDismiss: AgentApiInboxDismissResponse;
+  inboxRows: AgentApiInboxRowsResponse;
   assistantOwnerInbox: AgentApiAssistantOwnerInboxResponse;
   assistantOwnerMessages: AgentApiAssistantOwnerMessagesResponse;
   assistantSendAsOwner: AgentApiAssistantSendAsOwnerResponse;

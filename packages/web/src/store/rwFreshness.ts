@@ -3,9 +3,9 @@ import { create } from "zustand";
 // Task #164. The unread and Activity reads come from RisingWave. While it is
 // overloaded the server answers either with a remembered body marked
 // `X-Raft-Stale` (routes/rwStaleRead.ts) or, with nothing remembered, 503
-// `rw_overloaded`. Either way the client keeps what it shows and says, once,
-// that it may be out of date (StaleCountsNotice). This store is that state,
-// per read:
+// `rw_overloaded`. Either way the client keeps what it shows and updates it
+// silently when a clean answer arrives (the "may be out of date" notice was
+// dropped, artin #triage:#517). This store is that state, per read:
 // - `summary`: the cross-server unread summary (rail / switcher dots);
 // - `unread`: this server's channel unread counts;
 // - `inbox`: the Activity list;
@@ -17,7 +17,7 @@ import { create } from "zustand";
 // a 5xx, no network); whatever was shown before stays. An unavailable answer
 // that says RisingWave is not configured (503 `rw_unconfigured`) also keeps its
 // code: that read will not catch up on its own, so the notice says the counts
-// are temporarily unavailable rather than "may be out of date".
+// are temporarily unavailable (StaleCountsNotice, the only notice left).
 
 export type RwSurface = "summary" | "unread" | "inbox" | "followed";
 export type RwFreshness = "fresh" | "stale" | "unavailable";
@@ -83,7 +83,7 @@ export function markRwUnavailable(
   setSurface(surface, { freshness: "unavailable", confirmed: true, retryAfterMs, code });
 }
 
-/** Values seeded from the saved copy, before any answer: stale, but not confirmed (no notice yet). */
+/** Values seeded from the saved copy, before any answer: stale, but not confirmed by the server. */
 export function markRwSeeded(surface: RwSurface): void {
   const current = useRwFreshnessStore.getState().surfaces[surface];
   if (current.confirmed) return;
@@ -97,15 +97,6 @@ export function resetRwFreshness(surfaces: readonly RwSurface[] = RW_SURFACES): 
     for (const surface of surfaces) next[surface] = FRESH;
     return { surfaces: next };
   });
-}
-
-/** True when the server said one of these reads may be out of date or failed: the notice shows. */
-export function isRwOutOfDate(surfaces: Record<RwSurface, RwSurfaceState>, of: readonly RwSurface[]): boolean {
-  return of.some((surface) => surfaces[surface].confirmed && surfaces[surface].freshness !== "fresh");
-}
-
-export function useRwOutOfDate(of: readonly RwSurface[]): boolean {
-  return useRwFreshnessStore((state) => isRwOutOfDate(state.surfaces, of));
 }
 
 /** True when one of these reads failed because RisingWave is not configured (503 `rw_unconfigured`). */

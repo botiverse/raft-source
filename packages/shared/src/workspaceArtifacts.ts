@@ -106,7 +106,7 @@ export type ArtifactShownActor = Omit<ArtifactActor, "id"> & { id?: string };
  * name, and a null `id` once its row is gone too (a hard delete).
  */
 export type ArtifactHome =
-  | { kind: "conversation"; conversation: { id: string | null; name: string; type: "channel" | "private" | "dm" | "joint"; /** A DM's peer by display name, as the reader's sidebar shows it (absent when it has none, and for other types). */ peerDisplayName?: string } }
+  | { kind: "conversation"; conversation: { id: string | null; name: string; type: "channel" | "private" | "dm" | "joint"; /** A DM's peer by display name, as the reader's sidebar shows it (absent when it has none, and for other types). */ peerDisplayName?: string; /** `true`: the conversation is archived (still readable, ranked and shown as archived). Absent when it isn't (and from older servers, and on an orphan or unresolved joint home): read absent as not archived. Part of the search contract (docs/contracts/web-search.md): additive only. */ archived?: true } }
   | { kind: "server" }
   | { kind: "public" };
 
@@ -206,6 +206,40 @@ export interface ArtifactCard {
    * dashboard, search) and from older Servers: draw no marks.
    */
   unseen?: ArtifactCardUnseen | null;
+  /**
+   * Settled (#334): someone who may comment on it marked it done, no longer
+   * a draft under discussion; who, when and at which version. The current
+   * state, whichever version the card shows (as `latestVersion` and
+   * `commentCount`), so an older message's card follows it. Null while it is
+   * Working (never settled, unsettled, or a new version came since). Absent
+   * where the Artifact's server has `artifact_settled_v0` off, for a reader
+   * outside its server (another server's public Artifact), and from older
+   * Servers: then nothing of Settled is shown or offered (no tag, no Settle
+   * in a menu), so a client gates the feature on `settled !== undefined`.
+   */
+  settled?: ArtifactSettled | null;
+  /**
+   * Working again (#334): it was settled and a new version took it back to
+   * Working, for "a new version came since it was settled". Null otherwise;
+   * cleared when it is settled again or unsettled. Absent exactly when
+   * `settled` is.
+   */
+  reopened?: ArtifactReopened | null;
+}
+
+/** ArtifactCard `settled`: who settled it, when, and the version that was current then. */
+export interface ArtifactSettled {
+  /** No `id` outside the Artifact's server (never sent there today: `settled` is absent for such a reader). */
+  by: ArtifactShownActor;
+  /** ISO 8601. */
+  at: string;
+  version: number;
+}
+
+/** ArtifactCard `reopened`: the version that took a settled Artifact back to Working, and the settle it ended. */
+export interface ArtifactReopened {
+  version: number;
+  was: ArtifactSettled;
 }
 
 /**
@@ -344,6 +378,20 @@ export interface ArtifactViewerData {
    */
   originalHome?: { conversationId: ChannelId } | null;
   /**
+   * What was new to the reader as the viewer opened it, read before the open
+   * moved their read position (opening the current version is looking at
+   * everything up to now, so nothing read after says it): ArtifactCard
+   * `unseen`'s counts and first new comment, except that a reader who never
+   * read it is past nothing (every live comment and published version by
+   * someone else is new to them). The reader's own never count. For the
+   * comment list's "new". In the answers that open it (the viewer route,
+   * the standalone page's `open` in the Artifact's own server, the save
+   * from an attachment) and in `details` (which moves nothing: what is new
+   * now); null for a reader who keeps no read position on it (an outsider);
+   * absent from the home routes' ArtifactViewerData and from older Servers.
+   */
+  unseenAtOpen?: ArtifactCardUnseen | null;
+  /**
    * Where the shown version loads on the content origin (S2): the frame
    * route's answer for this version (`artifactWebPaths.frame`), its ticket
    * signed for this reader, so the first screen needs no second request.
@@ -363,7 +411,8 @@ export interface ArtifactViewerData {
 /**
  * How an Artifact entered a conversation: `attachment`, saved from that
  * message's attachment; `share`, the message a share posted when it had no
- * original message yet; `link` (later: a link to it in an ordinary message).
+ * original message yet; `link`, the first message in its home conversation
+ * (or one of its threads) that links it, when it had none yet.
  */
 export type ArtifactOriginVia = "attachment" | "share" | "link";
 
@@ -386,6 +435,25 @@ export interface ArtifactAnnotationAnchor {
     | { type: "TextPositionSelector"; start: number; end: number }
   >;
   label: string;
+  /**
+   * Where it is in the page, as Porthole 0.17.0 reports it on an element or
+   * text anchor (P152): for a reader to know which part it is on, never to
+   * find it again (the selectors do that). Absent on older comments, and where
+   * the page has neither headings nor a named region around it.
+   */
+  context?: ArtifactAnnotationAnchorContext;
+}
+
+/**
+ * An annotation anchor's section (Porthole P152; artifactAnchorContext.ts
+ * holds the limits): `headings`, the page's headings from the top down to
+ * the section, outermost first (at most 6, each at most 80 characters);
+ * `region`, the name of the labelled region around it (an aria-label, a tab
+ * panel's tab; at most 80). The page's text, shown as text.
+ */
+export interface ArtifactAnnotationAnchorContext {
+  headings?: string[];
+  region?: string;
 }
 
 /**

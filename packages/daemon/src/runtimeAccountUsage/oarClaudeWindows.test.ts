@@ -3,7 +3,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { claudeAccountUsage } from "@botiverse/oar/runtimes/claude";
+import { claudeRuntime } from "@botiverse/oar";
 import { CLAUDE_FIVE_HOUR_WINDOW_LABEL, CLAUDE_OAUTH_APPS_WINDOW_LABEL, claudeFiveHourLimitOf, isClaudeOAuthAppsWindow } from "@botiverse/raft-shared";
 
 import { projectOarAccountUsageSnapshot } from "./oarAdapter";
@@ -52,7 +52,7 @@ test("OAR's Claude windows keep the labels the web matches: Current session, and
     const command = path.join(dir, "claude");
     await writeFile(command, FAKE_CLAUDE(process.execPath));
     await chmod(command, 0o755);
-    const snapshot = await claudeAccountUsage({ kind: "available", via: "executable", command, version: "2.1.330" }, { timeoutMs: 20_000 });
+    const snapshot = await claudeRuntime.accountUsage({ kind: "available", via: "executable", command, version: "2.1.330" }, { timeoutMs: 20_000 });
     assert.equal(snapshot.kind, "available");
     if (snapshot.kind !== "available") return;
     // OAR's own key for the window the web leaves out, and its label.

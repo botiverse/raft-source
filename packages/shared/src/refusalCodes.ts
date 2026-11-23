@@ -15,6 +15,8 @@
 // Server does not know the computer_migrate approval (#wg-device-auth:#1, Tenny).
 // IDEMPOTENCY_KEY_REUSED as the Artifacts send it, which the CLI's review reads
 // (#wg-ax:#13 P3); the Artifacts codes shared reads only to pick wording are not listed.
+// computer_pairing_conflict, _ended, _not_found and _unavailable, which Add Computer's
+// pairing acts on (docs/contracts/computer-pairing.md, design §11 B, Tenny 937c6726).
 // Removed since: ACTION_ENDPOINT_REVIEW_STALE, with Raft's card URL review
 // route and its web panel (App Admin decides those reviews, #proj-apps task #19).
 
@@ -77,6 +79,9 @@ export const REFUSAL_CODES = {
   onboarding_agent_exists: { kind: "stale", action: "Reload the server setup projection to pick up the onboarding agent that already exists.", clients: ["web"] }, // web/src/components/onboarding/ServerSetupProjectionGate.tsx:443
   passkey_not_found: { kind: "stale", action: "Reload the passkey list.", clients: ["web"] }, // web/src/components/settings/PasskeysSection.tsx:461; web/src/components/settings/PasskeysSection.tsx:514; web/src/components/settings/PasskeysSection.tsx:547
   PASSWORD_CREDENTIAL_REQUIRED: { kind: "stale", action: "Reload the account's sign-in methods.", clients: ["web"] }, // web/src/features/settings/account/AccountSection.tsx:210
+  computer_pairing_ended: { kind: "stale", action: "Replace Add Computer's pairing with a new one (a new command), quietly.", clients: ["web"] }, // web/src/features/computer/useComputerPairing.ts
+  computer_pairing_not_found: { kind: "stale", action: "Replace Add Computer's pairing with a new one (a new command), quietly.", clients: ["web"] }, // web/src/features/computer/useComputerPairing.ts
+  computer_pairing_unavailable: { kind: "stale", action: "Replace Add Computer's pairing with a new one (a new command), quietly.", clients: ["web"] }, // web/src/features/computer/useComputerPairing.ts
   approval_in_progress: { kind: "stale", action: "Re-read the external invite's state instead of failing.", clients: ["web"] }, // web/src/pages/ExternalInvitePage.tsx:218
   connect_in_progress: { kind: "stale", action: "Re-read the external invite's state instead of failing.", clients: ["web"] }, // web/src/pages/ExternalInvitePage.tsx:218
   request_not_pending: { kind: "stale", action: "Reload the request to show what it is now.", clients: ["web"] }, // web/src/pages/ExternalInvitePage.tsx:342; web/src/pages/ServerConnectRequestPage.tsx:130
@@ -264,6 +269,7 @@ export const REFUSAL_CODES = {
   OAUTH_SCOPE_NOT_APPROVED: { kind: "alternate", action: "Send the Login with Raft flow back to approving the scopes.", clients: ["web"] }, // web/src/features/login-with-raft/loginErrors.ts:12
   runner_credential_already_renewed: { kind: "alternate", action: "Mint a fresh runner credential instead of renewing this one again.", clients: ["daemon"] }, // daemon: runner-credential-renew:v1 (#wg-rbac:#27, lands with the daemon's renew); server: routes/internalComputer.ts renew
   account_link_required: { kind: "alternate", action: "Route the sign-in through linking the account.", clients: ["web"] }, // web/src/utils/pendingAccountLink.ts:70
+  computer_pairing_conflict: { kind: "alternate", action: "Offer neither request for approval, say the command was used more than once, and show a new command (a new pairing).", clients: ["web"] }, // web/src/features/computer/useComputerPairing.ts
   grant_selection_required: { kind: "alternate", action: "Route the device login through choosing a grant.", clients: ["web"] }, // web/src/pages/DeviceLoginPage.tsx:224
   grant_selection_not_allowed: { kind: "alternate", action: "Route the device login without a grant choice.", clients: ["web"] }, // web/src/pages/DeviceLoginPage.tsx:224
   FORM_INVALID: { kind: "alternate", action: "Place the body's issues on the action card's fields.", clients: ["web"] }, // web/src/components/actions/actionCardCommon.tsx:209

@@ -1,4 +1,3 @@
-import { PROVIDER_PROBE_CAPABILITY } from "@botiverse/raft-shared";
 import type {
   AgentAppInboxNoticeOptions,
   AgentAppInboxRegistry,
@@ -16,6 +15,7 @@ import { REMINDER_AGENT_INBOX_REGISTRY } from "./apps/reminder/inboxDefinition";
 import { createReminderRuntime } from "./apps/reminder/runtime";
 import { receiveCleanerConfigMessage } from "./apps/cleaner/configReceiver";
 import { createSystemCleanerAppRegistry } from "./apps/cleaner/definition";
+import { notifyProcMemoryLimit, notifyProcOwnerStop, PROC_AGENT_INBOX_REGISTRY } from "./apps/proc/definition";
 import {
   SystemCleanerRuntime,
   type CleanerClock,
@@ -36,7 +36,6 @@ import type { ScopedAppStorageFactory } from "./scopedAppStorage";
 
 export const BUILT_IN_READY_CAPABILITIES = [
   REMINDER_FIRE_REQUEST_CAPABILITY,
-  PROVIDER_PROBE_CAPABILITY,
 ] as const;
 
 export interface BuiltInLocalAppRuntimeOptions {
@@ -116,6 +115,7 @@ export function createBuiltInLocalScheduleRuntime(options: BuiltInLocalAppRuntim
     : null;
   const inboxRegistry: AgentAppInboxRegistry = {
     ...REMINDER_AGENT_INBOX_REGISTRY,
+    ...PROC_AGENT_INBOX_REGISTRY,
     ...createSystemCleanerAppRegistry((ownerAgentId) => {
       const config = cleaner.getAppliedConfig(ownerAgentId);
       return config
@@ -181,6 +181,14 @@ export function createBuiltInLocalScheduleRuntime(options: BuiltInLocalAppRuntim
     /** machine:workspace:delete succeeded: the Cleaner drops the agent's reminder state. */
     onAgentWorkspaceDeleted(agentId: string) {
       cleaner.onAgentWorkspaceDeleted(agentId);
+    },
+    /** The Computer stopped one of the agent's `raft proc` jobs at its memory cap (procJobs.ts). */
+    notifyProcMemoryLimit(input: { agentId: string; name: string; memoryMaxBytes: number }): Promise<boolean> {
+      return notifyProcMemoryLimit({ getInbox: options.getInbox, notifyInbox: options.notifyInbox }, input);
+    },
+    /** A person stopped one of the agent's `raft proc` jobs from the Computer page (procJobs.ts stopByOwner). */
+    notifyProcOwnerStop(input: { agentId: string; name: string; stoppedBy: string | null }): Promise<boolean> {
+      return notifyProcOwnerStop({ getInbox: options.getInbox, notifyInbox: options.notifyInbox }, input);
     },
     /** The agent's own provider credential hit a usage limit (ProviderLimitLedger). */
     noteProviderLimitHit(agentId: string) {

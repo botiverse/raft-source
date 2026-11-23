@@ -86,9 +86,9 @@ test.each([
   ["server", null],
   ["daemon", 2],
 ])("%s: one worker and the cap locally, RAFT_TEST_MAX_WORKERS raises it, CI sizing untouched", (pkg, ciWorkers) => {
-  expect(loadConfig(pkg, {})).toEqual({ maxWorkers: 1, plugins: ["raft-test-run-record", "raft-test-worker-cap"] });
+  expect(loadConfig(pkg, {})).toEqual({ maxWorkers: 1, plugins: ["raft-dev-trace", "raft-test-run-record", "raft-test-worker-cap"] });
   expect(loadConfig(pkg, { RAFT_TEST_MAX_WORKERS: "3" }).maxWorkers).toBe(3);
-  expect(loadConfig(pkg, { CI: "true" })).toEqual({ maxWorkers: ciWorkers, plugins: [] });
+  expect(loadConfig(pkg, { CI: "true" })).toEqual({ maxWorkers: ciWorkers, plugins: ["raft-dev-trace"] });
 }, 60_000);
 
 test("a real `vitest run --maxWorkers 4` under the plugin runs its files one at a time", () => {

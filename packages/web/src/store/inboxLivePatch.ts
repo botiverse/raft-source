@@ -16,11 +16,13 @@ export function isUnreadInboxFilter(filter: InboxFilter): boolean {
 /**
  * #244: the list's totals after a live message added `added` unread to `row`
  * in place, so a later read (clearReadForChannel, a projection) takes back
- * only what was added. Under an Unread filter a row that was read joins its group.
+ * only what was added. Under an Unread filter a row that was read joins its group;
+ * `revived`: one the list kept read comes back into the store (activityUnreadRevive).
  */
-export function inPlaceUnreadTotals(state: InboxState, row: ActivityPersistedItem, added: number): Partial<InboxState> {
+export function inPlaceUnreadTotals(state: InboxState, row: ActivityPersistedItem, added: number, revived = false): Partial<InboxState> {
   if (added <= 0) return {};
   return {
+    ...(revived ? { totalCount: state.totalCount + 1 } : {}),
     totalUnreadCount: state.totalUnreadCount + added,
     activeUnreadCount: state.activeUnreadCount + added,
     ...(isUnreadInboxFilter(state.filter) && row.unreadCount === added ? { groups: incrementInboxGroupCounts(state.groups, [row]) } : {}),

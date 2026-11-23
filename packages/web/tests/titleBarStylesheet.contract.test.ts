@@ -39,3 +39,11 @@ test("the right corner (caption buttons) comes from the overlay's geometry too, 
   assert.match(rules, /html\[data-title-bar="overlay"\]:not\(\[data-fullscreen\]\) \[data-raft-overlay-titlebar\]\s*\{\s*--raft-titlebar-inset-end: var\(--raft-frame-inset-end\);/);
   assert.equal(/(^|\n)\[data-raft-titlebar\]\s*\{[^}]*padding-right/.test(rules), false, "no platform-blind right inset");
 });
+
+test("desktop macOS: a held traffic-light corner overrides the live geometry, declared after it so it wins (#proj-deskop:#12)", async () => {
+  const rules = await css();
+  const steady = rules.search(/html\[data-title-bar-steady\]\[data-title-bar-start="overlay"\]:not\(\[data-fullscreen\]\)\s*\{\s*--raft-frame-inset-start: var\(--raft-desktop-titlebar-start\);\s*--raft-frame-inset-end: 0px;/);
+  assert.ok(steady > 0, "steady rule present");
+  assert.ok(steady > rules.indexOf('html[data-title-bar="overlay"]:not([data-fullscreen]) {'), "after the end-inset rule");
+  assert.ok(steady > rules.indexOf('html[data-title-bar-start="overlay"]:not([data-fullscreen]) {'), "after the start-inset rule");
+});

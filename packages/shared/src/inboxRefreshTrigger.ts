@@ -79,6 +79,41 @@ export const INBOX_REFRESH_TRIGGER_HEADER = "X-Raft-Fetch-Trigger";
 export const INBOX_REFRESH_COALESCED_HEADER = "X-Raft-Fetch-Coalesced";
 
 /**
+ * #244: why a live message (`message_new`) or thread reply (`thread_reply`)
+ * could not patch its Activity row in place, so the web re-read the list. The
+ * web sends one of these as `X-Raft-Fetch-Refused` with those two triggers
+ * only, decided by the request the trigger is from (the read's first); the
+ * server records exactly these values, anything else as `other`, and nothing
+ * when the header is absent (an older web, any other read). Enum values only.
+ */
+export const INBOX_REFRESH_REFUSALS = [
+  /** The loaded list has no row for the conversation. */
+  "not_listed",
+  /** The list is not settled (not the plain All list, loading, a read in flight), or the row's facet group is not loaded. */
+  "not_settled",
+  /** The patch would not leave the row complete (livePatchComplete), no live unread came with it, or the row has no seq yet. */
+  "patch_incomplete",
+  /** The incoming message has no safe seq (fail-closed). */
+  "no_seq",
+  /** The message is not newer than the row (late or out of order). */
+  "not_newer",
+  /** The row already shows this message, and its first patch did not skip the re-read (or this one counted). */
+  "repeat",
+  /** The patch was complete, but `inbox_message_inplace_v1` is off for this server (`eligible_sent`). */
+  "flag_off",
+  /** The row's set of live messages counted since its last served answer is full. */
+  "counted_cap",
+  /** A channel message past a mute: only the per-row position rule may patch it, and it did not. */
+  "muted",
+  /** `thread:updated` carried no `latestReply` to patch with. */
+  "no_reply",
+] as const;
+
+export type InboxRefreshRefusal = (typeof INBOX_REFRESH_REFUSALS)[number];
+
+export const INBOX_REFRESH_REFUSED_HEADER = "X-Raft-Fetch-Refused";
+
+/**
  * Which read source answered `GET /api/channels/inbox`: `risingwave` (the
  * serving views) or `postgres` (the canonical read: search, guest access,
  * forced). A stale answer from the overload cache says the source of the read

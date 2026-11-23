@@ -66,7 +66,7 @@ async function seed(options: { flag?: boolean } = {}) {
   const foreign = await seedAgent(other.id, { creatorType: "user", creatorId: owner.id });
   if (options.flag !== false) await enableFlag(server.id);
   const { client, clientSecret } = await createOAuthClient({
-    serverId: server.id, createdByUserId: owner.id, clientId: `voice-${randomUUID().slice(0, 8)}`,
+    serverId: server.id, createdByUserId: owner.id, clientId: `voice-${randomUUID().slice(0, 8)}`, vouchAsCreator: true,
     name: "Voice", returnUrl: "https://voice.example.test/callback",
     allowedScopes: ["openid", "profile", "agent:voice"],
   });

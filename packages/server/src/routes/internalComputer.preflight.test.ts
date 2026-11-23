@@ -188,16 +188,3 @@ test("every route internalComputerRouter serves is registered in routeAuthPolicy
   const missing = served.filter((signature) => !registered.has(signature));
   assert.deepEqual(missing, [], "served under /internal/computer/ but unregistered, so they fail closed for every caller");
 });
-
-test("probe materialize reaches its handler under the Computer principal", async ({ app }) => {
-  const { computerApiKey } = await seedFixture();
-  const res = await fetch(`${app.baseUrl}/internal/computer/probes/not-a-probe-id/materialize`, {
-    method: "POST",
-    headers: jsonHeaders(computerApiKey),
-    body: JSON.stringify({ claimRequestId: "claim-1" }),
-  });
-  const body = await res.json() as { code?: string };
-  assert.notEqual(body.code, "auth_policy_unregistered_path");
-  assert.notEqual(res.status, 401);
-  assert.ok(["probe_disabled", "probe_invalid"].includes(body.code ?? ""), `the handler answered: ${res.status} ${JSON.stringify(body)}`);
-});

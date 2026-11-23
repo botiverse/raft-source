@@ -1,4 +1,4 @@
-import type { MarketplaceInstallBadge, OAuthClientCategory } from "@botiverse/raft-shared";
+import type { AppAgentAccess, MarketplaceInstallBadge, OAuthClientCategory } from "@botiverse/raft-shared";
 import type { AppBotOffer } from "../../../components/settings/ConnectedAppBot";
 import type { AppNotificationSelection } from "../../../components/settings/AppNotificationsControls";
 
@@ -29,7 +29,8 @@ export interface OAuthClientRecord {
   promptTextRevisionId?: string | null;
   enableBot: boolean;
   installationId?: string | null;
-  installStatus?: "active" | "paused" | "uninstalled" | null;
+  /** The installation's status, as the server stores it; null without one. */
+  installStatus?: "active" | "suspended" | null;
   botGrant?: "pending" | "granted" | "revoked" | null;
   /** The App's bot on this Server (install-joined rows); absent when it ships none, or on an older server. */
   bot?: AppBotOffer;
@@ -47,6 +48,18 @@ export interface OAuthClientRecord {
   linkPreviewReadOnly?: boolean;
   /** In the official registry: its client ID goes through review (RFC 084 §3). */
   official?: boolean;
+  /**
+   * Which of this Server's agents can use it (GET /integrations/clients, and GET /integrations/marketplace
+   * for an App installed here; null otherwise). Absent from older servers.
+   */
+  agentAccess?: AppAgentAccess | null;
+  /**
+   * A server_local App this Server's owner or admin vouched for: every agent here can use it with
+   * no one's approval (GET /integrations/clients and the editor's write responses; false for other
+   * App types). Absent from older servers: reads as false.
+   */
+  serverVouched?: boolean;
+  serverVouchedAt?: string | null;
   createdByUserId: string;
   createdAt: string;
   updatedAt: string;
@@ -56,7 +69,7 @@ export interface MarketplaceOAuthClientRecord extends OAuthClientRecord {
   official: boolean;
   purpose: string;
   installationId: string | null;
-  installStatus: "active" | "paused" | "uninstalled" | null;
+  installStatus: "active" | "suspended" | null;
   botGrant: "pending" | "granted" | "revoked" | null;
   installedAt: string | null;
   marketplaceInstallBadge: MarketplaceInstallBadge;

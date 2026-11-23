@@ -27,9 +27,9 @@
 import { randomBytes } from "node:crypto";
 import type { ServerRole } from "@botiverse/raft-shared";
 import { currentDate } from "@botiverse/raft-shared";
-import { and, eq, gt, isNull, lte, ne } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, lte, ne, notLike, sql } from "drizzle-orm";
 import { getDb, type DatabaseExecutor } from "../db/index";
-import { agentCredentials, agents, computerRevokeTokens, computers } from "../db/schema";
+import { agentCredentials, agents, computerRevokeTokens, computers, machines } from "../db/schema";
 import { computeTokenLookupHash } from "./agentCredentialService";
 import { closeDeviceSessionKeys, type DeviceSessionKeyReach } from "./deviceSessionKeys";
 import { newAuditOperationId, recordIntegrationAuditEvent, serverAuditContextMetadata } from "./integrationAuditService";
@@ -203,6 +203,102 @@ export async function revokeComputerKeyInTransaction(
     revoked: Boolean(justRevoked),
     reach: { agentIds, machineIds: machineId ? [machineId] : [] },
     detached: justRevoked && machineId ? { machineId, serverId: computer.serverId, computerName: computer.name } : null,
+  };
+}
+
+/**
+ * The legacy machines a person registered on a server whose `sk_machine_*` key
+ * still verifies: never adopted into a Computer (no `computers` row, no
+ * `legacy_key_migrated_at`) and not revoked. The ones ending their membership
+ * revokes (#wg-rbac:#78; serverService getMemberRemovalImpact counts them).
+ */
+export function liveLegacyMachinesRegisteredBy(serverId: string, userId: string) {
+  return and(
+    eq(machines.serverId, serverId),
+    eq(machines.userId, userId),
+    isNull(machines.legacyKeyMigratedAt),
+    notLike(machines.apiKeyHash, "revoked:%"),
+    sql`not exists (select 1 from ${computers} where ${computers.machineId} = ${machines.id})`,
+  );
+}
+
+/** The hash a departed registrant's legacy machine key is replaced with: nothing verifies against it. */
+export const LEGACY_MACHINE_KEY_MEMBER_REMOVED_HASH = "revoked:registrant_left_server";
+
+/**
+ * The end of a person's membership of a server, for the legacy machines they
+ * registered there (#wg-rbac:#78): every live legacy `sk_machine_*` key whose
+ * machine is still legacy (never adopted into a Computer: no `computers` row,
+ * no `legacy_key_migrated_at`) is replaced with a hash nothing verifies
+ * against, and every live runner credential those machines minted is revoked,
+ * each audited under the removal's operation id. The machines and their agents
+ * stay; the connections close after commit (the caller passes the reach to
+ * closeDeviceSessionKeys). Account deletion does the same for every machine of
+ * the account (accountDeletion/cleanup.ts `revoke_daemons`).
+ *
+ * In removeMemberInTransaction, after the person's member row (FOR UPDATE)
+ * and the Computers they attached: a registration takes that member row FOR
+ * SHARE first, so none commits in between, and a rotation of one of these
+ * machines by someone else holds the machine row and waits on nothing here.
+ */
+export async function revokeLegacyMachineKeysOfDepartingRegistrant(
+  tx: DatabaseExecutor,
+  input: { serverId: string; userId: string; by: Extract<ComputerKeyRevoker, { via: "member_removed" }>; now: Date; operationId: string },
+): Promise<{ reach: DeviceSessionKeyReach; detached: DetachedComputer[] }> {
+  const revoked = await tx
+    .update(machines)
+    .set({ apiKeyHash: LEGACY_MACHINE_KEY_MEMBER_REMOVED_HASH })
+    .where(liveLegacyMachinesRegisteredBy(input.serverId, input.userId))
+    .returning({ id: machines.id, name: machines.name });
+  if (revoked.length === 0) return { reach: { agentIds: [], machineIds: [] }, detached: [] };
+
+  const revokedByUserId = input.by.actorUserId;
+  const credentials = await tx
+    .update(agentCredentials)
+    .set({ revokedAt: input.now, revokedReason: COMPUTER_KEY_REVOKED_REASON, revokedByUserId })
+    .where(and(
+      inArray(agentCredentials.issuedByMachineId, revoked.map((machine) => machine.id)),
+      isNull(agentCredentials.revokedAt),
+    ))
+    .returning({ credentialId: agentCredentials.id, agentId: agentCredentials.agentId, machineId: agentCredentials.issuedByMachineId });
+
+  const event = input.by.actorUserId
+    ? { outcome: "success" as const, source: "web" as const, actor: { type: "human" as const, id: input.by.actorUserId } }
+    : { outcome: "success" as const, source: "system" as const, actor: { type: "system" as const } };
+  const context = serverAuditContextMetadata(input.by.actorUserId ? { actorRole: input.by.actorRole, operationId: input.operationId } : { operationId: input.operationId });
+  const requester = { type: "human" as const, id: input.userId };
+  for (const machine of revoked) {
+    await recordIntegrationAuditEvent({
+      ...event,
+      requester,
+      serverId: input.serverId,
+      eventType: "computer.key_revoked",
+      target: { type: "machine", id: machine.id },
+      metadata: {
+        // The target's type (`machine`, not `computer`) says it was a legacy key.
+        machineId: machine.id,
+        computerName: machine.name,
+        reason: COMPUTER_KEY_REVOKED_REASON,
+        via: input.by.via,
+        departureReason: input.by.departureReason,
+        revokedCount: credentials.filter((credential) => credential.machineId === machine.id).length,
+        ...context,
+      },
+    }, tx);
+  }
+  for (const credential of credentials) {
+    await recordIntegrationAuditEvent({
+      ...event,
+      requester,
+      serverId: input.serverId,
+      eventType: "agent_credential.revoked",
+      target: { type: "agent_credential", id: credential.credentialId },
+      metadata: { agentId: credential.agentId, credentialId: credential.credentialId, reason: COMPUTER_KEY_REVOKED_REASON, machineId: credential.machineId, via: input.by.via, departureReason: input.by.departureReason, ...context },
+    }, tx);
+  }
+  return {
+    reach: { agentIds: unique(credentials.map((credential) => credential.agentId)), machineIds: revoked.map((machine) => machine.id) },
+    detached: revoked.map((machine) => ({ machineId: machine.id, serverId: input.serverId, computerName: machine.name })),
   };
 }
 

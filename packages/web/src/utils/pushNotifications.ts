@@ -8,7 +8,7 @@ import {
   clearPushSubscribeFailure,
   rememberPushSubscribeFailure,
 } from "./pushSubscribeFailure";
-import type { PushSubscribeFailureKind } from "./pushSubscribeFailure";
+import type { PushSubscribeFailure, PushSubscribeFailureKind } from "./pushSubscribeFailure";
 
 const SERVICE_WORKER_PATH = "/sw.js";
 // Set by an explicit Disable; only an explicit Enable clears it. While set,
@@ -234,17 +234,18 @@ async function subscribeAndSave(options: {
   respectOptOut: boolean;
   /** Called once `Notification.requestPermission` has resolved (the request ran at all). */
   onPermissionAsked?: () => void;
+  onFailure?: (failure: PushSubscribeFailure) => void;
 }): Promise<EnablePushResult | "opted_out"> {
   const permission = getPushPermissionState();
   if (permission === "unsupported") return permission;
 
   const fail = (kind: PushSubscribeFailureKind, error?: unknown) => {
-    rememberPushSubscribeFailure(buildPushSubscribeFailure({
+    options.onFailure?.(rememberPushSubscribeFailure(buildPushSubscribeFailure({
       kind,
       error,
       permission: getPushPermissionState(),
       endpoint: rememberedPushEndpoint(),
-    }));
+    })));
   };
 
   const vapidKey = await fetchVapidPublicKey();
@@ -296,11 +297,25 @@ async function subscribeAndSave(options: {
   }
 }
 
+/**
+ * Failure callbacks get the failure as stored (with its streak): what to
+ * record, rather than re-reading storage another tab may have cleared or
+ * overwritten meanwhile.
+ */
+export interface PushSubscribeCallbacks {
+  onFailure?: (failure: PushSubscribeFailure) => void;
+}
+
 /** The user pressed Enable: clears the opt-out, asks for permission if needed, subscribes and reports. */
-export async function enablePushNotifications(options: { onPermissionAsked?: () => void } = {}): Promise<EnablePushResult> {
+export async function enablePushNotifications(options: { onPermissionAsked?: () => void } & PushSubscribeCallbacks = {}): Promise<EnablePushResult> {
   if (!supportsPushNotifications()) return "unsupported";
   writeStorage(WEB_PUSH_OPT_OUT_KEY, null);
-  const result = await subscribeAndSave({ requestPermission: true, respectOptOut: false, onPermissionAsked: options.onPermissionAsked });
+  const result = await subscribeAndSave({
+    requestPermission: true,
+    respectOptOut: false,
+    onPermissionAsked: options.onPermissionAsked,
+    onFailure: options.onFailure,
+  });
   return result === "opted_out" ? "error" : result;
 }
 
@@ -308,10 +323,10 @@ export async function enablePushNotifications(options: { onPermissionAsked?: () 
  * The automatic path (permission already granted, no subscription): subscribes
  * unless the user disabled push here. Never asks for permission.
  */
-export async function ensurePushSubscriptionIfAllowed(): Promise<EnablePushResult | "opted_out"> {
+export async function ensurePushSubscriptionIfAllowed(options: PushSubscribeCallbacks = {}): Promise<EnablePushResult | "opted_out"> {
   if (!supportsPushNotifications()) return "unsupported";
   if (isWebPushOptedOut()) return "opted_out";
-  return subscribeAndSave({ requestPermission: false, respectOptOut: true });
+  return subscribeAndSave({ requestPermission: false, respectOptOut: true, onFailure: options.onFailure });
 }
 
 export async function disablePushNotifications(): Promise<boolean> {

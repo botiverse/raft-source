@@ -5,8 +5,8 @@
  * action cards already use. The generic App root (`raft_apps`, via `app_mcp_profiles`) is returned
  * as `rootAppId` when the migration trigger has written one.
  */
-import { mcpAgentGrant, mcpAgentGrantAllows, mcpAutoGrantCoversAgent, mcpAutoGrantCreatorScope } from "./managedMcpAgentGrant";
-import { and, asc, eq, isNull, sql } from "drizzle-orm";
+import { mcpAgentGrantAllows, mcpAutoGrantCoversAgent } from "./managedMcpAgentGrant";
+import { and, asc, eq, isNull, or, sql } from "drizzle-orm";
 import {
   canonicalizeOAuthClientCategory,
   currentDate,
@@ -15,6 +15,7 @@ import {
   type ManagedMcpAuthMode,
   type ManagedMcpOAuthClientMode,
   type ManagedMcpToolCatalogEntry,
+  type AppAgentAccess,
   type McpAppListItem,
 } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
@@ -27,30 +28,36 @@ import {
   managedMcpOAuthAttempts,
   managedMcpServers,
 } from "../db/schema";
-import { mcpAgentOwnerUserId, mcpConnectionUsableByAgent } from "./managedMcpConnectionOwnership";
 import { actorHasServerCapabilityInServer } from "../lib/actorPermissions";
+import { listedServerAgent } from "./agentMemberListPolicy";
 import { ManagedMcpGatewayError, validateManagedMcpEndpoint } from "./managedMcpGateway";
 import { listManagedMcpConnections, type ManagedMcpConnectionView } from "./managedMcpConnectionService";
 import { availableRaftOAuthClientKind } from "./managedMcpRaftOAuthClient";
 import { managedMcpOAuthClientModeForApp } from "./managedMcpOAuthClientMode";
 import {
+  admitFromRows,
   applyMcpAppServerChange,
   assertTemplateFieldsUnchanged,
   deleteManagedMcpServer,
+  insertMcpAppRow,
+  loadPersonalGrants,
   ManagedMcpServiceError,
   mcpAppSourceKind,
   publicManagedMcpEndpoint,
   rethrowIfMcpAppNameTaken,
+  recordMcpServerVouchEvent,
   refreshManagedMcpCatalog,
   validateManagedMcpConfiguredEndpoint,
 } from "./managedMcpService";
 import { probeManagedMcpEndpointWithCatalog, type McpProbeResult } from "./managedMcpProbe";
-import { findActiveMcpAppTemplate, findMcpAppTemplate } from "./mcpAppTemplates";
+import { mcpPersonalAccountsEnabled } from "./managedMcpPersonalAccounts";
+import { findActiveMcpAppTemplate, findMcpAppTemplate, mcpAppTemplatePublisherNames } from "./mcpAppTemplates";
 import { normalizeWhenToUse, storeIntegrationLogo } from "./oauthService";
 import { getCdnStorage, getStorage } from "./storageService";
 import { clientLogoUrl } from "../config/privacyMode";
 
 type AppRow = typeof managedMcpServers.$inferSelect;
+type CredentialAuthStatus = (typeof managedMcpCredentials.$inferSelect)["authStatus"];
 type Prober = typeof probeManagedMcpEndpointWithCatalog;
 
 const LEGACY_PROVIDERS = new Set(["notion", "linear"]);
@@ -69,7 +76,7 @@ export interface McpAppView {
   kind: "mcp";
   sections: Array<"profile" | "mcp_server" | "connections" | "agents" | "distribution" | "danger">;
   profile: { name: string; description: string | null; homepageUrl: string | null; logoUrl: string | null; category: string | null; whenToUse: string | null };
-  source: { kind: "url" | "template"; templateKey: string | null; maintainedByRaft: boolean };
+  source: McpAppListItem["source"];
   server: {
     endpointUrl: string;
     transport: typeof MANAGED_MCP_TRANSPORT;
@@ -83,22 +90,71 @@ export interface McpAppView {
     oauthClientMode: ManagedMcpOAuthClientMode | null;
     health: { status: "reachable" | "unreachable" | "unknown"; checkedAt: string | null; error: string | null; latencyMs: number | null };
     toolCount: number;
-    tools: Array<{ name: string; title?: string; description?: string }>;
+    /** `annotations`: the tool's boolean hints, absent when it declared none. */
+    tools: Array<{ name: string; title?: string; description?: string; annotations?: NonNullable<ManagedMcpToolCatalogEntry["annotations"]> }>;
     enabled: boolean;
   };
-  /** Only for a viewer who manages integrations; empty otherwise. */
+  /**
+   * Every Connection for a viewer who manages integrations (with `ownerKind` and `owner`); for
+   * anyone else only their own personal Connections (RFC 087 §7.2).
+   */
   connections: ManagedMcpConnectionView[];
+  /**
+   * "Members can connect their own account" (D1), for every viewer. False while the Server flag
+   * `mcp_personal_accounts` is off, whatever is stored (the toggle is not offered then).
+   */
+  membersCanConnect: boolean;
+  /** `mcp_personal_accounts` on for this Server: whether the toggle and personal sign-in exist here. */
+  personalAccounts: boolean;
+  /**
+   * The account each of the viewer's own Agents (created by them, or their personal assistant) uses
+   * for this App now (R15: kind and label): null when it is refused. `connectionId` only when the
+   * viewer may see it (a manager, or their own personal Connection).
+   */
+  myAgents: Array<{ agentId: string; account: McpAgentAccountView | null }>;
   defaultConnectionId: string | null;
   /** `noConnection`: pinned to a Connection that was deleted or is no longer usable by that Agent (refused until one is chosen). */
   agentsSummary: { total: number; usingDefault: number; pinned: number; noConnection: number; off: number; actionNeeded: number };
+  /** Which listed agents have the App (the same rule as agentsSummary; "off" ones are excepted). */
+  agentAccess: AppAgentAccess;
+  /**
+   * The Server vouched for the App (`server_vouched_at`): every agent here is granted it
+   * automatically (mcpAutoGrantCoversAgent), whoever created it. Shown to every viewer, like
+   * agentAccess; only an owner or admin changes it (PUT /api/mcp/apps/:appId/server-vouch).
+   */
+  serverVouched: boolean;
+  serverVouchedAt: string | null;
   distribution: { kind: "server_local"; publishStatus: "private" };
   viewer: { canManage: boolean };
 }
 
-function sourceOf(app: AppRow): McpAppView["source"] {
+export interface McpAgentAccountView {
+  kind: "personal" | "shared";
+  connectionId?: string;
+  name: string | null;
+  label: string | null;
+  /** A personal account's owner. */
+  ownerUserId?: string;
+}
+
+/** `publishers`: mcpAppTemplatePublisherNames(), read once per request. */
+function sourceOf(app: AppRow, publishers: ReadonlyMap<string, string | null>): McpAppView["source"] {
   const kind = mcpAppSourceKind(app);
   const templateKey = app.templateKey ?? (kind === "template" ? app.provider : null);
-  return { kind, templateKey, maintainedByRaft: kind === "template" };
+  const publisherName = kind === "template" && templateKey ? publishers.get(templateKey) ?? null : null;
+  return { kind, templateKey, maintainedByRaft: kind === "template", publisherName };
+}
+
+const TOOL_HINTS = ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] as const;
+
+/** The boolean hints a tool declared, or null when it declared none. */
+function toolAnnotations(tool: ManagedMcpToolCatalogEntry): NonNullable<ManagedMcpToolCatalogEntry["annotations"]> | null {
+  const hints: NonNullable<ManagedMcpToolCatalogEntry["annotations"]> = {};
+  for (const hint of TOOL_HINTS) {
+    const value = tool.annotations?.[hint];
+    if (typeof value === "boolean") hints[hint] = value;
+  }
+  return Object.keys(hints).length > 0 ? hints : null;
 }
 
 function healthOf(app: AppRow): McpAppView["server"]["health"] {
@@ -133,43 +189,146 @@ async function openCardCounts(serverId: string): Promise<Map<string, number>> {
   return new Map(rows.map((row) => [row.mcpServerId, row.count]));
 }
 
-async function agentsSummary(serverId: string, app: AppRow, actionNeeded: number): Promise<McpAppView["agentsSummary"]> {
+/**
+ * agentsSummary and agentAccess from one read of the Server's agents (and one of the App's personal
+ * grants). Whether an Agent has the App is the call path's grant (`admitFromRows`): a member's
+ * personal grant counts, an explicit off beats it. The summary's modes describe the admin layer.
+ */
+async function agentsUse(serverId: string, app: AppRow, actionNeeded: number): Promise<Pick<McpAppView, "agentsSummary" | "agentAccess">> {
+  const personalGrantByAgent = new Map((await loadPersonalGrants(getDb(), serverId, { mcpServerId: app.id })).map((grant) => [grant.agentId, grant]));
   const rows = await getDb()
     .select({
+      id: agents.id,
+      // agentAccess names only the agents member lists show: never someone's personal assistant.
+      listed: listedServerAgent(),
       enabled: managedMcpAssignments.enabled,
       connectionMode: managedMcpAssignments.connectionMode,
       boundConnectionId: managedMcpAssignments.boundConnectionId,
       creatorType: agents.creatorType,
       creatorId: agents.creatorId,
-      assistantOwnerUserId: agents.assistantOwnerUserId,
     })
     .from(agents)
     .leftJoin(managedMcpAssignments, and(eq(managedMcpAssignments.agentId, agents.id), eq(managedMcpAssignments.mcpServerId, app.id)))
-    .where(and(eq(agents.serverId, serverId), isNull(agents.deletedAt)));
-  const creatorScope = await mcpAutoGrantCreatorScope(getDb(), serverId, app);
+    .where(and(eq(agents.serverId, serverId), isNull(agents.deletedAt)))
+    .orderBy(asc(agents.createdAt), asc(agents.id));
   const connections = new Map((await getDb()
-    .select({ id: managedMcpCredentials.id, isServerDefault: managedMcpCredentials.isServerDefault, createdByUserId: managedMcpCredentials.createdByUserId })
+    .select({ id: managedMcpCredentials.id, ownerKind: managedMcpCredentials.ownerKind })
     .from(managedMcpCredentials)
     .where(and(eq(managedMcpCredentials.serverId, serverId), eq(managedMcpCredentials.mcpServerId, app.id))))
     .map((connection) => [connection.id, connection]));
   const summary = { total: rows.length, usingDefault: 0, pinned: 0, noConnection: 0, off: 0, actionNeeded };
+  const agentIds: string[] = [];
+  const exceptAgentIds: string[] = [];
   for (const row of rows) {
-    // "Off" is every Agent that does not have the App: revoked, or never granted automatically.
-    const assignment = row.enabled === null ? null : { enabled: row.enabled };
-    if (!mcpAgentGrantAllows(mcpAgentGrant(assignment, mcpAutoGrantCoversAgent(creatorScope, row)))) summary.off += 1;
+    // "Off" is every Agent that does not have the App: revoked, or never granted (automatically, by a
+    // person, or with a member's own account).
+    const assignment = row.enabled === null || row.connectionMode === null
+      ? null
+      : { enabled: row.enabled, connectionMode: row.connectionMode, boundConnectionId: row.boundConnectionId };
+    const { grant } = admitFromRows({
+      server: app,
+      assignment,
+      autoGranted: mcpAutoGrantCoversAgent(app, row),
+      personalGrant: personalGrantByAgent.get(row.id) ?? null,
+      boundCredential: null,
+      defaultCredential: null,
+    });
+    const allowed = mcpAgentGrantAllows(grant);
+    if (row.listed) (allowed ? agentIds : exceptAgentIds).push(row.id);
+    if (!allowed) summary.off += 1;
     else if (row.connectionMode === "pinned") {
-      // The same rule as the Agent's own view and the call path (`mcpConnectionUsableByAgent`).
+      // The same rule as the Agent's own view and the call path: a shared Connection of this App.
       const bound = row.boundConnectionId ? connections.get(row.boundConnectionId) ?? null : null;
-      if (bound && mcpConnectionUsableByAgent(bound, mcpAgentOwnerUserId(row))) summary.pinned += 1;
+      if (bound?.ownerKind === "shared") summary.pinned += 1;
       else summary.noConnection += 1;
     } else summary.usingDefault += 1;
   }
-  return summary;
+  return { agentsSummary: summary, agentAccess: { allAgents: exceptAgentIds.length === 0, agentIds, exceptAgentIds } };
+}
+
+/**
+ * The account each of the viewer's own Agents uses for this App, by the call path's own decision
+ * (`admitFromRows`): the personal grant first, then the shared pin or the default.
+ */
+async function viewerAgentAccounts(serverId: string, app: AppRow, viewerUserId: string, canManage: boolean): Promise<McpAppView["myAgents"]> {
+  const own = await getDb()
+    .select({
+      id: agents.id,
+      creatorType: agents.creatorType,
+      creatorId: agents.creatorId,
+      enabled: managedMcpAssignments.enabled,
+      connectionMode: managedMcpAssignments.connectionMode,
+      boundConnectionId: managedMcpAssignments.boundConnectionId,
+    })
+    .from(agents)
+    .leftJoin(managedMcpAssignments, and(eq(managedMcpAssignments.agentId, agents.id), eq(managedMcpAssignments.mcpServerId, app.id)))
+    .where(and(
+      eq(agents.serverId, serverId),
+      isNull(agents.deletedAt),
+      or(
+        eq(agents.assistantOwnerUserId, viewerUserId),
+        and(isNull(agents.assistantOwnerUserId), eq(agents.creatorType, "user"), eq(agents.creatorId, viewerUserId)),
+      ),
+    ))
+    .orderBy(asc(agents.createdAt), asc(agents.id));
+  if (own.length === 0) return [];
+  const connections = await getDb()
+    .select({
+      id: managedMcpCredentials.id,
+      mcpServerId: managedMcpCredentials.mcpServerId,
+      isServerDefault: managedMcpCredentials.isServerDefault,
+      ownerKind: managedMcpCredentials.ownerKind,
+      ownerUserId: managedMcpCredentials.ownerUserId,
+      authStatus: managedMcpCredentials.authStatus,
+      name: managedMcpCredentials.name,
+      accountLabel: managedMcpCredentials.accountLabel,
+      authorizedEndpointUrl: managedMcpCredentials.authorizedEndpointUrl,
+      headerNames: managedMcpCredentials.headerNames,
+    })
+    .from(managedMcpCredentials)
+    .where(and(eq(managedMcpCredentials.serverId, serverId), eq(managedMcpCredentials.mcpServerId, app.id)));
+  const byId = new Map(connections.map((connection) => [connection.id, connection]));
+  const defaultCredential = connections.find((connection) => connection.isServerDefault) ?? null;
+  const ownIds = new Set(own.map((agent) => agent.id));
+  const grants = new Map((await loadPersonalGrants(getDb(), serverId, { mcpServerId: app.id }))
+    .filter((grant) => ownIds.has(grant.agentId))
+    .map((grant) => [grant.agentId, grant]));
+  return own.map((agent) => {
+    const assignment = agent.enabled === null || agent.connectionMode === null
+      ? null
+      : { enabled: agent.enabled, connectionMode: agent.connectionMode, boundConnectionId: agent.boundConnectionId };
+    const grant = grants.get(agent.id);
+    const grantConnection = grant ? byId.get(grant.connection.id) : undefined;
+    const decision = admitFromRows({
+      server: app,
+      assignment,
+      autoGranted: mcpAutoGrantCoversAgent(app, agent),
+      personalGrant: grant && grantConnection ? { connection: grantConnection, ownerIsMember: grant.ownerIsMember } : null,
+      boundCredential: agent.boundConnectionId ? byId.get(agent.boundConnectionId) ?? null : null,
+      defaultCredential,
+    });
+    const used = decision.block === null && decision.connection.allowed && decision.connection.credentialId
+      ? byId.get(decision.connection.credentialId) ?? null
+      : null;
+    if (!used) return { agentId: agent.id, account: null };
+    const seeId = canManage || (used.ownerKind === "personal" && used.ownerUserId === viewerUserId);
+    return {
+      agentId: agent.id,
+      account: {
+        kind: used.ownerKind,
+        ...(seeId ? { connectionId: used.id } : {}),
+        name: used.name,
+        label: used.accountLabel,
+        ...(used.ownerKind === "personal" && used.ownerUserId ? { ownerUserId: used.ownerUserId } : {}),
+      },
+    };
+  });
 }
 
 export async function getMcpAppView(serverId: string, appId: string, viewerUserId: string): Promise<McpAppView> {
   const app = await loadApp(serverId, appId);
   const canManage = await actorHasServerCapabilityInServer(serverId, "user", viewerUserId, "manageIntegrations");
+  const personalAccounts = await mcpPersonalAccountsEnabled(serverId);
   const [root] = await getDb()
     .select({ appId: appMcpProfiles.appId })
     .from(appMcpProfiles)
@@ -177,6 +336,7 @@ export async function getMcpAppView(serverId: string, appId: string, viewerUserI
     .limit(1);
   const connections = await listManagedMcpConnections(serverId, appId);
   const actionNeeded = (await openCardCounts(serverId)).get(app.id) ?? 0;
+  const publishers = await mcpAppTemplatePublisherNames();
   return {
     id: app.id,
     rootAppId: root?.appId ?? null,
@@ -190,7 +350,7 @@ export async function getMcpAppView(serverId: string, appId: string, viewerUserI
       category: app.category,
       whenToUse: app.whenToUse,
     },
-    source: sourceOf(app),
+    source: sourceOf(app, publishers),
     server: {
       endpointUrl: publicManagedMcpEndpoint(app.endpointUrl),
       transport: MANAGED_MCP_TRANSPORT,
@@ -202,33 +362,60 @@ export async function getMcpAppView(serverId: string, appId: string, viewerUserI
       oauthClientMode: await managedMcpOAuthClientModeForApp(app),
       health: healthOf(app),
       toolCount: app.toolCatalog.length,
-      tools: app.toolCatalog.map((tool) => ({
-        name: tool.name,
-        ...(tool.title ? { title: tool.title } : {}),
-        ...(tool.description ? { description: tool.description } : {}),
-      })),
+      tools: app.toolCatalog.map((tool) => {
+        const annotations = toolAnnotations(tool);
+        return {
+          name: tool.name,
+          ...(tool.title ? { title: tool.title } : {}),
+          ...(tool.description ? { description: tool.description } : {}),
+          ...(annotations ? { annotations } : {}),
+        };
+      }),
       enabled: app.enabled,
     },
-    // Connection ids, names and account labels are for the people who manage them.
-    connections: canManage ? connections : [],
+    // Connection ids, names and account labels are for the people who manage them, and a member's
+    // own Connections for that member.
+    connections: canManage
+      ? connections
+      : connections.filter((connection) => connection.ownerKind === "personal" && connection.owner?.userId === viewerUserId),
+    membersCanConnect: personalAccounts && app.membersCanConnect,
+    personalAccounts,
+    myAgents: await viewerAgentAccounts(serverId, app, viewerUserId, canManage),
     defaultConnectionId: canManage ? connections.find((connection) => connection.isServerDefault)?.id ?? null : null,
-    agentsSummary: await agentsSummary(serverId, app, actionNeeded),
+    ...await agentsUse(serverId, app, actionNeeded),
+    serverVouched: app.serverVouchedAt !== null,
+    serverVouchedAt: app.serverVouchedAt?.toISOString() ?? null,
     distribution: { kind: "server_local", publishStatus: "private" },
     viewer: { canManage },
   };
 }
 
-export async function listMcpApps(serverId: string): Promise<McpAppListItem[]> {
-  const [apps, connectionCounts, cards] = await Promise.all([
+/**
+ * `viewerUserId`: the person viewing the list. The default Connection's status is shown only to
+ * someone who manages integrations, as getMcpAppView shows Connections; null hides it.
+ */
+export async function listMcpApps(serverId: string, viewerUserId: string | null): Promise<McpAppListItem[]> {
+  const [apps, connectionCounts, cards, canManage, publishers] = await Promise.all([
     getDb().select().from(managedMcpServers).where(eq(managedMcpServers.serverId, serverId)).orderBy(asc(managedMcpServers.name)),
     getDb()
-      .select({ mcpServerId: managedMcpCredentials.mcpServerId, count: sql<number>`count(*)::int` })
+      .select({
+        mcpServerId: managedMcpCredentials.mcpServerId,
+        count: sql<number>`count(*)::int`,
+        // RFC 087: what a viewer without manageIntegrations counts: the shared Connections (counted for
+        // everyone before personal ones existed) and their own personal ones, as the App view shows them
+        // their own; never other members' accounts.
+        visibleCount: sql<number>`(count(*) FILTER (WHERE ${managedMcpCredentials.ownerKind} = 'shared'${viewerUserId ? sql` OR ${managedMcpCredentials.ownerUserId} = ${viewerUserId}` : sql``}))::int`,
+        // At most one default per App (idx_managed_mcp_credentials_default).
+        defaultStatus: sql<CredentialAuthStatus | null>`(array_agg(${managedMcpCredentials.authStatus}) FILTER (WHERE ${managedMcpCredentials.isServerDefault}))[1]`,
+      })
       .from(managedMcpCredentials)
       .where(eq(managedMcpCredentials.serverId, serverId))
       .groupBy(managedMcpCredentials.mcpServerId),
     openCardCounts(serverId),
+    viewerUserId ? actorHasServerCapabilityInServer(serverId, "user", viewerUserId, "manageIntegrations") : false,
+    mcpAppTemplatePublisherNames(),
   ]);
-  const counts = new Map(connectionCounts.map((row) => [row.mcpServerId, row.count]));
+  const counts = new Map(connectionCounts.map((row) => [row.mcpServerId, row]));
   return apps.map((app) => ({
     kind: "mcp" as const,
     id: app.id,
@@ -238,12 +425,13 @@ export async function listMcpApps(serverId: string): Promise<McpAppListItem[]> {
     homepageUrl: app.homepageUrl,
     category: app.category,
     distribution: "server_local" as const,
-    source: sourceOf(app),
+    source: sourceOf(app, publishers),
     status: {
       health: healthOf(app).status,
       toolCount: app.toolCatalog.length,
-      connectionCount: counts.get(app.id) ?? 0,
+      connectionCount: (canManage ? counts.get(app.id)?.count : counts.get(app.id)?.visibleCount) ?? 0,
       actionNeeded: cards.get(app.id) ?? 0,
+      defaultConnectionStatus: canManage ? counts.get(app.id)?.defaultStatus ?? null : null,
     },
   }));
 }
@@ -332,6 +520,12 @@ export async function createMcpApp(input: {
   profile: McpAppProfileInput;
   authKind?: ManagedMcpAuthMode;
   requiredHeaderNames?: unknown;
+  /**
+   * The creator is a person in their own session (POST /api/mcp/apps; not their assistant, not a
+   * card dispatch): the App is vouched for (`server_vouched_at`) when they hold manageExternalAuth
+   * on the Server now (`insertMcpAppRow`).
+   */
+  vouchAsCreator?: boolean;
 }, deps: { probe?: Prober } = {}): Promise<McpAppView> {
   const profile = normalizeProfile(input.profile, true);
   let values: Partial<AppRow> & Pick<AppRow, "endpointUrl" | "authMode" | "provider">;
@@ -401,7 +595,7 @@ export async function createMcpApp(input: {
   }
   await assertNameFree(input.serverId, profile.name!);
   const now = currentDate();
-  const [row] = await getDb().insert(managedMcpServers).values({
+  const row = await getDb().transaction((tx) => insertMcpAppRow(tx, {
     serverId: input.serverId,
     ...values,
     ...profile,
@@ -413,7 +607,7 @@ export async function createMcpApp(input: {
     lastCheckedAt: probe?.outcome === "ready" || (probe && values.authMode === "none") ? now : null,
     createdByUserId: input.userId,
     updatedByUserId: input.userId,
-  }).returning().catch(rethrowIfMcpAppNameTaken);
+  }, input.vouchAsCreator)).catch(rethrowIfMcpAppNameTaken);
   return getMcpAppView(input.serverId, row.id, input.userId);
 }
 
@@ -461,7 +655,7 @@ export async function updateMcpApp(input: {
   // were recorded once it has no Connection left to take them from. Existing Connections keep theirs.
   let requiredHeaderNames: string[] | undefined;
   if (input.patch.requiredHeaderNames !== undefined) {
-    if (sourceOf(app).kind === "template") {
+    if (mcpAppSourceKind(app) === "template") {
       throw new ManagedMcpServiceError("A recommended App's sign-in is maintained by Raft", "managed_mcp_template_field_locked");
     }
     if (app.authMode !== "headers") invalid("requiredHeaderNames only applies to an App that uses API-key headers");
@@ -486,6 +680,48 @@ export async function updateMcpApp(input: {
     }).where(eq(managedMcpServers.id, app.id));
   }).catch(rethrowIfMcpAppNameTaken);
   return getMcpAppView(input.serverId, app.id, input.userId);
+}
+
+/* ------------------------------------------------------------------ server vouch */
+
+export type McpAppServerVouchResult = { status: "ok"; changed: boolean } | { status: "not_found" };
+
+/**
+ * Vouch for this Server's MCP App, or end the vouch (PUT /api/mcp/apps/:appId/server-vouch; the
+ * route checks the person's manageExternalAuth and own session). Idempotent: no write and no audit
+ * when nothing changes; the first voucher stays.
+ *
+ * Ending it stops future automatic grants only. Assignment rows already written stay as they are:
+ * an Agent with an enabled row keeps the App (now a person's grant), a revoked one stays revoked.
+ * An Agent that had it only by the automatic rule (no row) no longer has it, as when the App's
+ * creator was demoted under the old rule; a person grants it to that Agent again.
+ */
+export async function setMcpAppServerVouch(input: {
+  serverId: string;
+  appId: string;
+  actorUserId: string;
+  vouched: boolean;
+}): Promise<McpAppServerVouchResult> {
+  return getDb().transaction(async (tx) => {
+    const [app] = await tx.select({
+      id: managedMcpServers.id,
+      serverId: managedMcpServers.serverId,
+      name: managedMcpServers.name,
+      serverVouchedAt: managedMcpServers.serverVouchedAt,
+    }).from(managedMcpServers)
+      .where(and(eq(managedMcpServers.id, input.appId), eq(managedMcpServers.serverId, input.serverId)))
+      .limit(1)
+      .for("update");
+    if (!app) return { status: "not_found" };
+    if ((app.serverVouchedAt !== null) === input.vouched) return { status: "ok", changed: false };
+    await tx.update(managedMcpServers)
+      .set(input.vouched
+        ? { serverVouchedAt: sql`now()`, serverVouchedByUserId: input.actorUserId, updatedAt: currentDate() }
+        : { serverVouchedAt: null, serverVouchedByUserId: null, updatedAt: currentDate() })
+      .where(eq(managedMcpServers.id, app.id));
+    await recordMcpServerVouchEvent(tx, app, input.actorUserId, input.vouched, input.vouched ? "vouched" : "unvouched");
+    return { status: "ok", changed: true };
+  });
 }
 
 export async function refreshMcpApp(serverId: string, appId: string, viewerUserId: string): Promise<McpAppView> {

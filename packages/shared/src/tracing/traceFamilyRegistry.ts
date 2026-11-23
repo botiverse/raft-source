@@ -24,9 +24,15 @@ export type TraceFamilyName =
   | "slock.client_error"
   | "slock.media_preview.error"
   | "slock.web.boot_timing"
+  | "slock.web.vitals"
   | "slock.web.shell_keep_failed"
+  | "slock.web.message_receive"
+  | "slock.web.sync_gap_recovered"
   | "slock.context_view"
   | "slock.open_in_app"
+  | "slock.attachment.upload_finished"
+  | "mobile.thread_open"
+  | "mobile.thread_open.shift"
   | "server.db.query";
 
 export const TRACE_JOIN_KEYS = ["clientEventId"] as const;
@@ -106,6 +112,19 @@ export const TRACE_FAMILY_REGISTRY = [
     ],
   },
   {
+    family: "slock.web.vitals",
+    privacyTier: "fleet-detection",
+    entityFilterableDimensions: [],
+    consumers: [
+      {
+        what: "Real-user Web Vitals and long-task summary in the daily app report: LCP (with lcp_element), session-window CLS, INP (with inp_interaction), long-task count/max/total, and foreground page_visible_ms, joined to boot_timing via tabId and deduplicated per tab via MAX(report_seq) (#proj-frontend:#77)",
+        how: "otel.logs query over events (message = 'slock.web.vitals') taking MAX(report_seq) per tabId, grouped by landing/nav_type/browser_family/form_factor/platform/releaseSha",
+        whoRuns: "AndyLok",
+        runbook: "docs/observability/reading-telemetry.md",
+      },
+    ],
+  },
+  {
     family: "slock.web.shell_keep_failed",
     privacyTier: "fleet-detection",
     entityFilterableDimensions: [],
@@ -113,6 +132,32 @@ export const TRACE_FAMILY_REGISTRY = [
       {
         what: "Browsers whose service worker can't keep a new release's HTML, so they keep opening an older release (#triage:#165, a HarmonyOS browser stuck on web 1.21.42): which step fails, on which browsers",
         how: "otel.logs query over events (message = 'slock.web.shell_keep_failed') grouped by step/browser_family/harmonyos/served_kept/releaseSha",
+        whoRuns: "AndyLok",
+        runbook: "docs/observability/reading-telemetry.md",
+      },
+    ],
+  },
+  {
+    family: "slock.web.message_receive",
+    privacyTier: "fleet-detection",
+    entityFilterableDimensions: [],
+    consumers: [
+      {
+        what: "Client-side live message push receive latency (now - createdAt, 5% sampled) by socket event, sender kind and page visibility, paired with server slock_message_push_lag_seconds to split server lag from network + client lag",
+        how: "otel.logs query over sampled events (message = 'slock.web.message_receive') grouped by event/sender_kind/visibility/clock_skew/releaseSha, percentiles of lag_ms",
+        whoRuns: "AndyLok",
+        runbook: "docs/observability/reading-telemetry.md",
+      },
+    ],
+  },
+  {
+    family: "slock.web.sync_gap_recovered",
+    privacyTier: "fleet-detection",
+    entityFilterableDimensions: [],
+    consumers: [
+      {
+        what: "Missed live messages recovered after the fact by GET /messages/sync (syncGap) or Socket.IO sync:resume:response, plus failed gap reads and horizon resets",
+        how: "otel.logs query over events (message = 'slock.web.sync_gap_recovered') grouped by source/outcome/had_pending_hole/has_more/horizon_reset/visibility, sum and distribution of recovered_count",
         whoRuns: "AndyLok",
         runbook: "docs/observability/reading-telemetry.md",
       },
@@ -140,6 +185,45 @@ export const TRACE_FAMILY_REGISTRY = [
         what: "Whether opening a Raft link in the app works (#proj-mobile:#128, deep_links_v1 on for everyone 11-13): offers shown, Open taken, and the app taking over (handed_over vs not_handed), app_missing and downloads, by surface, platform and kind of link",
         how: "otel.logs query over 'slock.open_in_app' events grouped by step × surface × platform (× link, signed_in); funnel offered → open → handed_over per surface and platform",
         whoRuns: "AndyLok",
+        runbook: "docs/observability/reading-telemetry.md",
+      },
+    ],
+  },
+  {
+    family: "slock.attachment.upload_finished",
+    privacyTier: "fleet-detection",
+    entityFilterableDimensions: [],
+    consumers: [
+      {
+        what: "Whether composer attachment uploads still hang (#triage:#545): how each upload ended (ok/error/timeout/cancelled), which step timed out, by route, size and client",
+        how: "otel.logs query over 'slock.attachment.upload_finished' events grouped by route × outcome × timeout_phase (× size_bucket, client_scheme), with duration_ms percentiles",
+        whoRuns: "AndyLok",
+        runbook: "docs/observability/reading-telemetry.md",
+      },
+    ],
+  },
+  {
+    family: "mobile.thread_open",
+    privacyTier: "fleet-detection",
+    entityFilterableDimensions: [],
+    consumers: [
+      {
+        what: "App open-path stability per sampled thread/channel open: milestones (first frame, cache rows, network applied, positioned, stable), end reason, jitter score (shift_count/sum/max dp, shift_vh, shifts_after_positioned, time_to_stable_ms), reopen_same_view_within_ms (#proj-mobile:#199)",
+        how: "otel.traces query over spans (name = 'mobile.thread_open', service.name = 'slock-web', attrs.clientPlatform in android/ios) grouped by end/cache/surface_kind/open_kind/appVersion, weighted by 1/sample_rate",
+        whoRuns: "Lagoon",
+        runbook: "docs/observability/reading-telemetry.md",
+      },
+    ],
+  },
+  {
+    family: "mobile.thread_open.shift",
+    privacyTier: "fleet-detection",
+    entityFilterableDimensions: [],
+    consumers: [
+      {
+        what: "Which viewport owner or content change moved an opening thread list, and when (cause, phase, delta_dp, rows_resized, max_row_delta_dp, owner_attempt); at most 20 per open",
+        how: "otel.logs query over events (message = 'mobile.thread_open.shift') joined to their mobile.thread_open span on trace_id/span_id, grouped by cause/phase",
+        whoRuns: "Lagoon",
         runbook: "docs/observability/reading-telemetry.md",
       },
     ],

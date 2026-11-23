@@ -24,6 +24,8 @@ export interface ArtifactCardPicture {
   src: string | null;
   screenshot: boolean;
   loading?: boolean;
+  /** The card said it has a picture that couldn't be read: its place stays (an empty box), so nothing moves. */
+  unreadable?: boolean;
   excerpt?: string;
   excerptBlocks?: readonly ArtifactExcerptBlock[] | undefined;
 }
@@ -34,9 +36,10 @@ export interface ArtifactCardPicture {
  * screenshot of the version it shows (the phone shot on a phone when there is
  * one; artifactScreenshot.ts), else a publisher's cover, read only without a
  * screenshot, else a Markdown version's excerpt, which reads nothing. Null
- * without any of them and when it can't be read: no spinner, no error. Until a screenshot is read, `src` is null and `loading` true, so the
- * card can keep the picture's place (a message card growing as it arrives
- * would move the conversation).
+ * without any of them and when it can't be read: no spinner, no error. Until a screenshot or a cover is read, `src` is null and `loading` true;
+ * one that can't be read is `unreadable`. Either way the card keeps the
+ * picture's place (a message card growing or shrinking as it arrives would
+ * move the conversation; #proj-uiux:#1311).
  *
  * With the picture, the ref of the element that stands for the card on screen
  * (the card itself, the tile's cover): its screenshot is read only once that
@@ -53,7 +56,11 @@ export function useArtifactCardPicture(card: ArtifactCard): [picture: ArtifactCa
   ));
   if (screenshot) return [{ src: screenshot, screenshot: true }, setTarget];
   if (loading) return [{ src: null, screenshot: true, loading: true }, setTarget];
+  // A screenshot the card names that couldn't be read keeps its place, as one still loading does (#proj-uiux:#1311).
+  if (artifactScreenshotFile(card, phone) !== null) return [{ src: null, screenshot: true, unreadable: true }, setTarget];
   if (cover) return [{ src: cover, screenshot: false }, setTarget];
+  // A publisher's cover keeps its place while it is read and when it can't be (#proj-uiux:#1311).
+  if (coverPath) return [{ src: null, screenshot: false, ...(cover === null ? { loading: true } : { unreadable: true }) }, setTarget];
   // One kind at a time from the server, so an excerpt never waits for or replaces a picture.
   return [card.preview.kind === "excerpt" && card.preview.text ? { src: null, screenshot: false, excerpt: card.preview.text, excerptBlocks: card.preview.blocks } : null, setTarget];
 }

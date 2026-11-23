@@ -28,7 +28,7 @@ test("a send that answered is partial when a server was refused or the connect f
 });
 
 test("error codes: the ones the dialog has a sentence for, anything else is other", () => {
-  assert.deepEqual([...EXTERNAL_INVITE_SEND_ERROR_CODES].sort(), [...Object.keys(ERROR_MESSAGE_IDS), "other"].sort(), "the registry lists the dialog's codes");
+  assert.deepEqual([...EXTERNAL_INVITE_SEND_ERROR_CODES].sort(), [...Object.keys(ERROR_MESSAGE_IDS), "channel_name_taken", "other"].sort(), "the registry lists the dialog's codes");
   for (const code of Object.keys(ERROR_MESSAGE_IDS)) assert.equal(externalInviteSendErrorCode(code), code);
   assert.equal(externalInviteSendErrorCode("joint_party_limit"), "other");
   assert.equal(externalInviteSendErrorCode("other"), "other");

@@ -21,15 +21,17 @@ import { useTimeFormatter } from "../../hooks/useTimeFormatter";
 import {
   normalizeEnteredCode,
   secondFactorFailureOf,
-  startStepUpPasskeyAssertion,
+  startStepUpPasskeyAssertionIn,
   stepUpThisSignIn,
 } from "../settings/secondFactorApi";
 import type { StepUpAnswer } from "../settings/secondFactorApi";
 import Banner from "../ui/Banner";
 import FormField from "../ui/FormField";
+import { EarlierPasskeyLink } from "./EarlierPasskey";
+import { useEarlierPasskey } from "./useEarlierPasskey";
 import { initialMethod, rememberSecondFactorMethod, usableMethodsOf } from "./secondFactorSignIn";
 import type { CodeMethod, SignInSecondFactorMethod } from "./secondFactorSignIn";
-import { getPasskeyAssertion, isPasskeyCancel } from "./webauthn";
+import { isPasskeyCancel } from "./webauthn";
 
 /** What is typed, for which method, and the error under the field. */
 export function useCodeEntry(methods: readonly SignInSecondFactorMethod[]) {
@@ -94,7 +96,8 @@ export function CodeField({ method, value, onChange, error, disabled }: {
  * and one button that opens the browser's passkey prompt; while it is open
  * the button waits ("Waiting for your passkey…").
  */
-export function PasskeyPrompt({ busy, onUse }: { busy: boolean; onUse: () => void }) {
+/** `onUseEarlier`: "Use an earlier passkey" under the button (EarlierPasskey.tsx), while offered. */
+export function PasskeyPrompt({ busy, onUse, onUseEarlier }: { busy: boolean; onUse: () => void; onUseEarlier?: () => void }) {
   const { formatMessage } = useIntl();
   return (
     <div className="stack-y-3">
@@ -105,6 +108,7 @@ export function PasskeyPrompt({ busy, onUse }: { busy: boolean; onUse: () => voi
         {busy ? null : <KeyRound aria-hidden="true" />}
         {formatMessage({ id: busy ? "auth.secondFactor.passkeyWaiting" : "auth.secondFactor.passkeyButton" })}
       </Button>
+      {onUseEarlier ? <EarlierPasskeyLink className="text-center" onUse={onUseEarlier} disabled={busy} /> : null}
     </div>
   );
 }
@@ -301,10 +305,16 @@ export function StepUpBeforeApproval({ notice, methods: listed, onVerified }: {
     await stepUp(async () => (method === "totp" ? { code: entered } : { backupCode: entered }), method);
   }, [busy, entered, method, stepUp]);
 
+  // After a prompt with nothing to pick, "Use an earlier passkey" asks in the other RP group (useEarlierPasskey.ts).
+  const { earlier, prompt } = useEarlierPasskey();
   const handleUsePasskey = useCallback(() => {
     if (busy) return;
-    void stepUp(async () => ({ webauthn: await getPasskeyAssertion(await startStepUpPasskeyAssertion()) }), "passkey");
-  }, [busy, stepUp]);
+    void stepUp(async () => ({ webauthn: await prompt(startStepUpPasskeyAssertionIn) }), "passkey");
+  }, [busy, prompt, stepUp]);
+  const handleUseEarlierPasskey = useCallback(() => {
+    if (busy || !earlier) return;
+    void stepUp(async () => ({ webauthn: await prompt(startStepUpPasskeyAssertionIn, earlier) }), "passkey");
+  }, [busy, earlier, prompt, stepUp]);
 
   const bannerNode = banner ? <Banner intent={banner.intent}>{banner.message}</Banner> : null;
 
@@ -317,7 +327,7 @@ export function StepUpBeforeApproval({ notice, methods: listed, onVerified }: {
       {method === "passkey" ? (
         <div className="stack-y-4">
           {bannerNode}
-          <PasskeyPrompt busy={busy} onUse={handleUsePasskey} />
+          <PasskeyPrompt busy={busy} onUse={handleUsePasskey} onUseEarlier={earlier ? handleUseEarlierPasskey : undefined} />
         </div>
       ) : method ? (
         <form onSubmit={submit} className="stack-y-4 md:pointer-fine:stack-y-3" noValidate>

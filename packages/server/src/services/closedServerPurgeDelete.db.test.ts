@@ -433,7 +433,7 @@ test("idempotent: a done server is not claimed or scanned again, and every step 
   assert.deepEqual(await serverSnapshot(old.server.id), purged);
 });
 
-test("apps are told the kept channels (joint projection, its thread, receipt channel), every batch, and never a channel the purge clears", async ({ seed }) => {
+test("apps are told the kept channels (joint projection, its thread, receipt channel, the joint's storage channel), every batch, and never a channel the purge clears", async ({ seed }) => {
   const old = await seedPurgeable(seed);
   await close(old.server.id, daysAgo(40));
   await deleteFor(old.server.id);
@@ -449,7 +449,7 @@ test("apps are told the kept channels (joint projection, its thread, receipt cha
   const result = await run({ apps: [app] });
   assert.equal(result.purged.find((entry) => entry.serverId === old.serverId)?.outcome, "done");
   assert.equal(received.length, 2);
-  const kept = [...old.skipped.joint, ...old.skipped.receipt].sort();
+  const kept = [...old.skipped.joint, ...old.skipped.receipt, old.jointStorage.channelId].sort();
   for (const keep of received) {
     assert.deepEqual([...(keep ?? [])].sort(), kept, "the full kept set");
     for (const cleared of [old.channel.id, old.thread.id, old.conversation.id]) assert.ok(!keep!.includes(cleared), "not a channel the purge clears");

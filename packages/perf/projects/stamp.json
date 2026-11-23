@@ -1,5 +1,83 @@
 {
   "project": "stamp",
-  "envs": { "production": { "origin": "https://stamp.build" } },
-  "pages": [{ "name": "sign-in", "path": "/sign-in", "ready": { "selector": "h1" } }]
+  "envs": {
+    "staging": {
+      "origin": "https://staging.stamp.build",
+      "auth": {
+        "kind": "cookie",
+        "cookie": {
+          "name": "__Host-raft_git_gateway_session",
+          "valueEnv": "STAMP_STAGING_SESSION"
+        },
+        "optionalCookies": [
+          {
+            "name": "stamp_app_step_skipped",
+            "valueEnv": "STAMP_SKIP"
+          }
+        ],
+        "storageStateEnv": "STAMP_STAGING_STORAGE_STATE"
+      }
+    },
+    "production": {
+      "origin": "https://stamp.build",
+      "auth": {
+        "kind": "cookie",
+        "cookie": {
+          "name": "__Host-raft_git_gateway_session",
+          "valueEnv": "STAMP_SESSION"
+        },
+        "optionalCookies": [
+          {
+            "name": "stamp_app_step_skipped",
+            "valueEnv": "STAMP_SKIP"
+          }
+        ],
+        "storageStateEnv": "STAMP_STORAGE_STATE"
+      }
+    }
+  },
+  "pages": [
+    {
+      "name": "sign-in",
+      "path": "/sign-in",
+      "auth": false,
+      "ready": { "selector": "h1" }
+    },
+    {
+      "name": "home",
+      "path": "/",
+      "shell": { "selector": "nav.st-topnav" },
+      "ready": { "selector": "main#main h2" }
+    },
+    {
+      "name": "pulls",
+      "path": "/pulls",
+      "shell": { "selector": "nav.st-topnav" },
+      "ready": { "selector": "main#main a[href*='/pull/']" }
+    },
+    {
+      "name": "repositories",
+      "path": "/repositories",
+      "shell": { "selector": "nav.st-topnav" },
+      "ready": { "selector": "main#main a[href^='/github/']" }
+    },
+    {
+      "name": "pr-detail",
+      "envs": ["production"],
+      "paths": {
+        "production": "/github/botiverse/mobile/pull/4682"
+      },
+      "shell": { "selector": "nav.st-topnav" },
+      "ready": { "selector": "main#main h2" }
+    },
+    {
+      "name": "repo",
+      "envs": ["production"],
+      "paths": {
+        "production": "/github/botiverse/mobile"
+      },
+      "shell": { "selector": "nav.st-topnav" },
+      "ready": { "selector": "main#main a[href*='/pull/']" }
+    }
+  ]
 }

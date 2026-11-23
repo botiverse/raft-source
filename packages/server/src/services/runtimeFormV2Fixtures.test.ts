@@ -33,9 +33,10 @@
  *   `pi.option-source.provider-model.json` the built-in providers' model lists
  *   (a dependent_select), and `pi.option-source.fallback.json` the Configured
  *   model list when the Pi probe says missing_config.
- * - Antigravity (revived on the OAR host): `antigravity.edit.json` and
- *   `antigravity.option-source.live.json`, the Computer's agy models after the
- *   configured default, with efforts only for a model agy lists levels for.
+ * - Antigravity: `antigravity.edit.json` and
+ *   `antigravity.option-source.live.json`, the Computer's agy models (the one
+ *   agy starts on preselected; an edit of a stored `default` shows no model),
+ *   with efforts only for a model agy lists levels for.
  *
  * Clients test against these files instead of converting v1 samples themselves,
  * so all of them follow one source. A red here means the server's v2 output
@@ -50,6 +51,7 @@ import { getStaticRuntimeModelSourceSet } from "@botiverse/raft-shared";
 import {
   buildRuntimeFormV2,
   buildRuntimeFormV2EditBody,
+  withCodexSpeedVisibility,
   reasoningModelOptionSource,
   runtimeFormV2Entry,
   type RuntimeFormOptionSourceContext,
@@ -79,8 +81,10 @@ async function nonLiveOptionSource(runtimeId: string, outcome: unknown = { kind:
 }
 
 // The route's own builder (GET /api/agents/:id/runtime-form).
-const editFixture = (runtimeId: string, runtimeConfig: Record<string, unknown>) =>
-  buildRuntimeFormV2EditBody(runtimeId, { runtime: runtimeId, ...runtimeConfig });
+const editFixture = (runtimeId: string, runtimeConfig: Record<string, unknown>) => {
+  const body = buildRuntimeFormV2EditBody(runtimeId, { runtime: runtimeId, ...runtimeConfig });
+  return body && runtimeId === "codex" ? withCodexSpeedVisibility(body, []) : body;
+};
 
 // Batch 2: OpenCode (create and edit) and the deprecated, edit-only Kimi CLI and
 // Gemini CLI; Antigravity's edit fixture (now a live-list model form with an
@@ -101,7 +105,7 @@ const batch2Fixtures = async (): Promise<Record<string, unknown>> => ({
 
 // Batch 3a: Codex (create and edit) and Grok (create).
 const batch3aFixtures = async (): Promise<Record<string, unknown>> => ({
-  "codex.form.json": buildRuntimeFormV2("codex"),
+  "codex.form.json": withCodexSpeedVisibility(buildRuntimeFormV2("codex"), []),
   "codex.edit.json": editFixture("codex", {
     model: { kind: "custom", name: "my-org/codex-custom" },
     mode: { kind: "fast" },

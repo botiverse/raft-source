@@ -249,13 +249,13 @@ test("action cards: plan:upgrade takes the agent's reason and, optionally, one u
     assert.equal(parsed.success, true, gate);
     if (parsed.success) assert.deepEqual(parsed.data, { type: "plan:upgrade", reason, gate });
   }
-  // Dialog-only gates: a Pro theme, a downgrade notice (Tenny), and the Free plan's
-  // one external channel (its limit, and a server frozen over it), which only the
-  // web's own Upgrades open.
+  // Dialog-only gates: a Pro theme and a downgrade notice (Tenny). The Free plan's one
+  // external channel (its limit, and a server frozen over it) is an agent's to name
+  // since the external channel rules apply to every server (#proj-commercial:#28).
   for (const gate of UPGRADE_GATES.filter((g) => !(AGENT_UPGRADE_CARD_GATES as readonly string[]).includes(g))) {
     assert.equal(actionCardActionSchema.safeParse({ type: "plan:upgrade", reason, gate }).success, false, gate);
   }
-  assert.deepEqual(UPGRADE_GATES.filter((g) => !(AGENT_UPGRADE_CARD_GATES as readonly string[]).includes(g)), ["plan_downgraded", "pro_theme", "external_channel_free_limit", "external_channel_frozen"]);
+  assert.deepEqual(UPGRADE_GATES.filter((g) => !(AGENT_UPGRADE_CARD_GATES as readonly string[]).includes(g)), ["plan_downgraded", "pro_theme"]);
   // No gate: an upgrade no specific limit asks for (the card reads it as `general`).
   const noGate = actionCardActionSchema.safeParse({ type: "plan:upgrade", reason });
   assert.deepEqual(noGate.success && noGate.data, { type: "plan:upgrade", reason });

@@ -16,6 +16,7 @@ import antigravityMark from "@botiverse/oar/assets/brands/antigravity.svg";
 import claudeMark from "@botiverse/oar/assets/brands/claude.svg";
 import codexMark from "@botiverse/oar/assets/brands/codex.svg";
 import cursorMark from "@botiverse/oar/assets/brands/cursor.svg";
+import dshMark from "@botiverse/oar/assets/brands/dsh.svg";
 import grokMark from "@botiverse/oar/assets/brands/grok.svg";
 import kimiMark from "@botiverse/oar/assets/brands/kimi.svg";
 import opencodeMark from "@botiverse/oar/assets/brands/opencode.svg";
@@ -26,6 +27,7 @@ import type { Machine } from "../../../store/machineStore";
 import { runtimeAccountUsageClient } from "../../../utils/runtimeAccountUsageClient";
 import Tooltip from "../../ui/Tooltip";
 import { RuntimeUsageHoverCard } from "../RuntimeAccountUsageChip";
+import { formatRuntimePlanName } from "../../../features/computer/accountText";
 import { usageProviderForRuntime } from "../../../utils/runtimeUsageProvider";
 import type { RuntimeUsageTriggerProps } from "../RuntimeAccountUsageChip";
 import { runtimeUsageText } from "../runtimeUsageText";
@@ -49,6 +51,7 @@ const RUNTIME_MARKS: Record<string, string> = {
   pi: piMark,
   qwen: qwenMark,
   qoder: qoderMark,
+  dsh: dshMark,
 };
 
 /** A runtime's mark, 12px, in the text's colour; a terminal for one with none. */
@@ -188,7 +191,7 @@ function cellLabel(cell: Exclude<RackRuntimeCell, { kind: "absent" | "pending" }
       : formatMessage({ id: "machine.rack.usageUnavailable" }, { runtime });
   }
   const value = reset
-    ? [cell.summary.plan ?? formatMessage({ id: "machine.runtimeUsage.accountFallback" }), reset.full].join(" · ")
+    ? [formatRuntimePlanName(cell.summary.plan) ?? formatMessage({ id: "machine.runtimeUsage.accountFallback" }), reset.full].join(" · ")
     : runtimeUsageText(cell.summary, formatMessage, locale);
   const model = cell.model ? modelLabel(cell.model, intlNow({ formatMessage, locale })) : null;
   const usage = [value, model, attention].filter(Boolean).join(" · ");
@@ -262,9 +265,11 @@ function UsageMeter({ cell, label, className = "", children }: {
 
 /**
  * A value's words: "62% used"; once its limit is reached, when it resets
- * ("Back in 3h", "Back in 2d"), or "Used up" when that isn't known.
+ * ("Back in 3h", "Back in 2d"), or "Used up" when that isn't known; "On
+ * credits" while the account runs on credits past it.
  */
 function usedText(cell: Extract<RackRuntimeCell, { kind: "value" }>, reset: ResetText, { formatMessage }: IntlShape): string {
+  if (cell.summary.kind === "credits") return formatMessage({ id: "machine.rack.onCredits" });
   if (!cell.usedUp) return formatMessage({ id: "machine.rack.percentUsed" }, { percent: cell.used });
   return reset?.short ?? formatMessage({ id: "machine.rack.usedUp" });
 }

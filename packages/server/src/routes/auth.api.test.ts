@@ -1709,6 +1709,7 @@ test("POST /api/auth/login returns a stable code for incorrect credentials", asy
   assert.deepEqual(await res.json(), {
     code: "AUTH_INVALID_CREDENTIALS",
     error: "Invalid email or password",
+    errorCode: "AUTH_INVALID_CREDENTIALS",
   });
 });
 
@@ -1868,6 +1869,7 @@ for (const scenario of [
       assert.deepEqual(await res.json(), {
         code: "AUTH_INVALID_CREDENTIALS",
         error: "Invalid email or password",
+        errorCode: "AUTH_INVALID_CREDENTIALS",
       });
 
       const requestSpan = sink.getAllSpans().find((span) =>

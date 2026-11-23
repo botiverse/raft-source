@@ -14,5 +14,6 @@ export * from "./id";
 export * from "./store";
 export * from "./memoryStore";
 export * from "./runtime";
+export * from "./tool";
 export type { CallRef } from "./replay";
 export type { JsonValue } from "../jsonValue";

@@ -144,7 +144,7 @@ test("runtime-host:oar:cursor: only on Linux, outside the SEA build, where the S
   assert.equal(cursorSdkAvailable({ platform: "linux", sea: undefined, resolve: found }), false, "an unanswered SEA probe is not a yes");
   assert.equal(cursorSdkAvailable({ platform: "darwin", sea: false, resolve: found }), false);
   assert.equal(cursorSdkAvailable({ platform: "win32", sea: false, resolve: found }), false);
-  // The SDK's child runs on the daemon's own Node; @cursor/sdk 1.3.1 needs 22.13 or newer.
+  // The SDK's child runs on the daemon's own Node; @cursor/sdk 1.4.1 needs 22.13 or newer.
   assert.equal(cursorSdkAvailable({ platform: "linux", sea: false, nodeVersion: "22.12.0", resolve: found }), false);
   assert.equal(cursorSdkAvailable({ platform: "linux", sea: false, nodeVersion: "20.19.0", resolve: found }), false);
   assert.equal(cursorSdkAvailable({ platform: "linux", sea: false, nodeVersion: "22.13.0", resolve: found }), true);

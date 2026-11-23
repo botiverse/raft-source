@@ -1,4 +1,4 @@
-import { Fragment, useCallback } from "react";
+import { Fragment, memo, useCallback } from "react";
 import type { MouseEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
 import {
@@ -16,6 +16,7 @@ import {
 } from "@botiverse/raft-ui";
 
 import { useAppBotAgent } from "../../store/agentStore";
+import type { Agent } from "../../store/agentStore";
 import AgentActivityDot from "../agent/AgentActivityDot";
 import AppBadge from "../agent/AppBadge";
 import AvatarSlot from "../ui/AvatarSlot";
@@ -28,8 +29,10 @@ import type { MentionPicker, MentionSuggestionItem } from "./useMentionPicker";
 
 export function MentionCandidateBody({
   candidate,
+  appBotAgent,
 }: {
   candidate: MentionCandidate;
+  appBotAgent?: Agent | null;
 }) {
   const { formatMessage } = useIntl();
   const description = getMentionCandidateDescription(candidate);
@@ -44,7 +47,8 @@ export function MentionCandidateBody({
     : getMentionCandidateServerLabel(candidate);
   const serverNames = candidate.origin?.external ? originServerNames(candidate.origin) : serverLabel;
   // What an App posts as is an App, not an Agent: the App badge takes the kind tag's place.
-  const appBot = useAppBotAgent(candidate.type === "agent" ? candidate.id : null);
+  const storeAppBot = useAppBotAgent(appBotAgent === undefined && candidate.type === "agent" ? candidate.id : null);
+  const appBot = appBotAgent === undefined ? storeAppBot : appBotAgent;
   const actorTypeLabel = candidate.type === "user"
     ? formatMessage({ id: "message.composer.actorType.human" })
     : candidate.type === "agent"
@@ -103,12 +107,15 @@ export function MentionCandidateBody({
 export function MentionCandidateAvatar({
   candidate,
   muted,
+  appBotAgent,
 }: {
   candidate: MentionCandidate;
   muted: boolean;
+  appBotAgent?: Agent | null;
 }) {
   // An App bot has no presence to show.
-  const appBot = useAppBotAgent(candidate.type === "agent" ? candidate.id : null) !== null;
+  const storeAppBot = useAppBotAgent(appBotAgent === undefined && candidate.type === "agent" ? candidate.id : null);
+  const appBot = (appBotAgent === undefined ? storeAppBot : appBotAgent) !== null;
   if (candidate.type === "agent") {
     return (
       <AvatarSlot
@@ -144,23 +151,38 @@ const preventOptionMouseDown = (event: MouseEvent<HTMLElement>) => {
   event.preventDefault();
 };
 
-/** A row: owns its select closure, so the list passes only stable references (task #709 react-perf). */
-function MentionOptionRow({
-  item,
-  flatIndex,
-  highlighted,
-  optionId,
-  testId,
-  onSelect,
-}: {
+interface MentionOptionRowProps {
   item: MentionSuggestionItem;
   flatIndex: number;
   highlighted: boolean;
   optionId: string | undefined;
   testId: string | undefined;
   onSelect: (candidate: MentionCandidate) => void;
-}) {
+}
+
+function areMentionOptionRowPropsEqual(prev: MentionOptionRowProps, next: MentionOptionRowProps): boolean {
+  return prev.highlighted === next.highlighted
+    && prev.flatIndex === next.flatIndex
+    && prev.optionId === next.optionId
+    && prev.testId === next.testId
+    && prev.onSelect === next.onSelect
+    && prev.item.candidate === next.item.candidate
+    && prev.item.muted === next.item.muted
+    && prev.item.className === next.item.className
+    && prev.item.auxiliary === next.item.auxiliary;
+}
+
+/** A row: owns its select closure and memoizes on item/highlight identity so arrow navigation only re-renders the 2 rows whose highlight flipped. */
+const MentionOptionRow = memo(function MentionOptionRow({
+  item,
+  flatIndex,
+  highlighted,
+  optionId,
+  testId,
+  onSelect,
+}: MentionOptionRowProps) {
   const { candidate } = item;
+  const appBot = useAppBotAgent(candidate.type === "agent" ? candidate.id : null);
   const handleClick = useCallback(() => onSelect(candidate), [onSelect, candidate]);
   return (
     <ComposerSuggestionOption
@@ -175,15 +197,15 @@ function MentionOptionRow({
       {...(testId ? { "data-testid": testId } : {})}
     >
       <ComposerSuggestionIcon>
-        <MentionCandidateAvatar candidate={candidate} muted={item.muted === true} />
+        <MentionCandidateAvatar candidate={candidate} muted={item.muted === true} appBotAgent={appBot} />
       </ComposerSuggestionIcon>
       {item.auxiliary ? <ComposerSuggestionIcon variant="auxiliary">{item.auxiliary}</ComposerSuggestionIcon> : null}
       <ComposerSuggestionContent>
-        <MentionCandidateBody candidate={candidate} />
+        <MentionCandidateBody candidate={candidate} appBotAgent={appBot} />
       </ComposerSuggestionContent>
     </ComposerSuggestionOption>
   );
-}
+}, areMentionOptionRowPropsEqual);
 
 /**
  * The @ picker's list (raft-ui ComposerSuggestion parts): the picker's groups
@@ -206,7 +228,14 @@ export function MentionSuggestionList({
 }): ReactNode {
   if (!picker.visible) return null;
   const { listbox } = picker;
-  let offset = 0;
+  // Where each group's rows start in the flat list: the highlight index and
+  // the option ids count across groups. Worked out before the rows are built.
+  const groupStarts: number[] = [];
+  let rowCount = 0;
+  for (const group of picker.groups) {
+    groupStarts.push(rowCount);
+    rowCount += group.items.length;
+  }
   return (
     <ComposerSuggestionList
       ref={picker.popupRef}
@@ -214,10 +243,9 @@ export function MentionSuggestionList({
       data-testid={testId}
       {...(listbox ? { id: listbox.listId, role: "listbox", "aria-label": listbox.label } : {})}
     >
-      {picker.groups.map((group) => {
+      {picker.groups.map((group, groupIndex) => {
         if (group.items.length === 0) return null;
-        const start = offset;
-        offset += group.items.length;
+        const start = groupStarts[groupIndex];
         const rows = (
           <ComposerSuggestionGroup
             key={group.separated ? undefined : group.key}

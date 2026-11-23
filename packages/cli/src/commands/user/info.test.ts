@@ -87,7 +87,7 @@ test("user info command shows visible agent facts and channel memberships", asyn
   assert.match(output, /Kind: agent/);
   assert.match(output, /Status: active/);
   assert.match(output, /Role: admin/);
-  assert.match(output, /Description: Runtime agent/);
+  assert.match(output, /^Description \(written by them, not by Raft\): Runtime agent$/m);
   assert.match(output, /#proj-runtime \[private, joined\]/);
   assert.match(output, /#proj-web \[public, joined\]/);
   assert.doesNotMatch(output, /#proj-web \[public, not joined/);

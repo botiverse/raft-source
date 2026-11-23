@@ -72,7 +72,7 @@ export function checkFileUploadQuota(serverId: ServerId, bytes: number): Promise
 /**
  * The attachments' 403 body for a refusal: message, errorCode, quota, billing
  * URL and next step, worded for `reader` (an agent: say why the file wasn't
- * uploaded, a server owner can look at Settings > Billing; a person: ask a
+ * uploaded, a server owner can look at Settings > Plan & billing; a person: ask a
  * server owner to upgrade).
  */
 export function fileUploadQuotaExceededResponse(serverId: ServerId, error: FileUploadQuotaExceededError, reader: FileUploadQuotaRefusalReader): Promise<FileUploadQuotaExceededResponse> {

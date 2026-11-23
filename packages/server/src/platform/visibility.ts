@@ -25,8 +25,10 @@ import { and, asc, eq, isNull, sql, type SQL, type SQLWrapper } from "drizzle-or
 import type { ServerId } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import { agents, serverMembers } from "../db/schema";
+import { managesJointChannel, resolveChannelActorContext } from "../lib/channelActorPermissions";
 import { listedServerAgent } from "../services/agentMemberListPolicy";
-import { appEnabledOn, appEnabledOnLiveServers } from "./flags";
+import { keptChannelsOf } from "../services/closedServerKeptChannels";
+import { appEnabledOn, appEnabledOnLiveServers, liveServers } from "./flags";
 import {
   agentManagerOf as agentManagerOfService,
   agentsManagedBy as agentsManagedByService,
@@ -117,6 +119,117 @@ export function viewersOfHome(
   return canActorsViewHomedObject(actors, object, opts);
 }
 
+/**
+ * What an object is asked for: `read` (seeing it: lists, by id, comments,
+ * Activity, search, cards) or `write` (changing it or taking part in it:
+ * versions, comments, follows, moves, renames, notices, mentions).
+ */
+export type ObjectAccess = "read" | "write";
+
+/**
+ * Which of these objects belong to a closed server (`servers.deleted_at`)
+ * and are homed in a channel the closed-server purge keeps for the apps
+ * (services/closedServerKeptChannels.ts keptChannelsOf `apps`, the purge's
+ * own rule, so the two never drift): the storage channel of a joint the
+ * server is still in (an active projection: closing a server doesn't
+ * disconnect its copies), the server's own copies of such joints, and what
+ * is under them (their threads and task conversations; never under a copy
+ * the server has left, whatever the child's own projection says). Who reads
+ * such an object is still canViewHomes's (a thread or task conversation is
+ * no home, a closed server's own channel no one else's), as on a live
+ * server. One answer per object in input order; a live server's object, or
+ * any other home, is false. One query, and keptChannelsOf's few per closed
+ * server asked about.
+ */
+export async function closedServerJointObjects(objects: readonly HomeRow[], opts?: { executor?: DatabaseExecutor }): Promise<boolean[]> {
+  const live = await liveServers(objects.map((object) => object.serverId), opts?.executor ?? getDb());
+  return keptInJoint(objects, objects.map((_, index) => !live[index]!), opts);
+}
+
+/** closedServerJointObjects, the liveness already read: of the objects `asked` marks, those homed in a channel the purge keeps of their server. */
+async function keptInJoint(objects: readonly HomeRow[], asked: readonly boolean[], opts?: { executor?: DatabaseExecutor }): Promise<boolean[]> {
+  const candidates = objects.filter((object, index) => asked[index] && object.homeKind === "conversation" && object.homeChannelId !== null);
+  if (candidates.length === 0) return objects.map(() => false);
+  const executor = opts?.executor ?? getDb();
+  const servers = [...new Set(candidates.map((object) => object.serverId))];
+  // fanout-ok: one per closed server among the objects (a read names one Artifact, a list a few), each a fixed number of queries
+  const kept = new Map(await Promise.all(servers.map(async (serverId) => [serverId, new Set((await keptChannelsOf(executor, serverId)).apps)] as const)));
+  return objects.map((object, index) => asked[index]! && object.homeKind === "conversation" && object.homeChannelId !== null
+    && kept.get(object.serverId)!.has(object.homeChannelId));
+}
+
+/**
+ * Whether each object's own server answers for it, under the app's flag
+ * (`appFlag`): the app on there, and the server live; or, for `read` only,
+ * the server closed and the object kept in a joint it is still in
+ * (closedServerJointObjects). Such an object is read-only: the joint's
+ * participants on live servers read it as before (canViewHomes still decides
+ * who; nobody acts from a closed server), and nobody writes to it. Who sees
+ * an object is canViewHomes's; this is only whether its server lets it be
+ * read or written at all. A constant number of queries.
+ */
+export async function objectServersAnswer(
+  objects: readonly HomeRow[],
+  appFlag: string,
+  opts: { access: ObjectAccess; executor?: DatabaseExecutor },
+): Promise<boolean[]> {
+  if (objects.length === 0) return [];
+  const executor = opts.executor;
+  const servers = objects.map((object) => object.serverId);
+  const [live, enabled] = await Promise.all([liveServers(servers, executor ?? getDb()), appEnabledOn(servers, appFlag, { executor })]);
+  const kept = opts.access === "read"
+    ? await keptInJoint(objects, objects.map((_, index) => enabled[index]! && !live[index]!), { executor })
+    : objects.map(() => false);
+  return objects.map((_, index) => enabled[index]! && (live[index]! || kept[index]!));
+}
+
+/** The joint channel copy through which an actor manages a closed server's kept object (closedServerJointObjectManagedBy): its own server, the host's. */
+export interface KeptJointManagement {
+  serverId: ServerId;
+  channelId: string;
+}
+
+/**
+ * Whether `actor` manages a closed server's object kept in a joint
+ * (closedServerJointObjects), which nobody of its own server can act on any
+ * more (Tenny, architecture; Warden, RBAC): it is shown in the joint, so it
+ * is moderated by whoever manages the joint channel, from the host's side
+ * (lib/channelActorPermissions managesJointChannel: a host owner/admin or
+ * the host's appointed channel manager, in the channel; the roster's
+ * manager). The actor's own server's active copy of the joint is asked, so
+ * another participant's owner or admin, or a manager appointed on another
+ * server's copy, manages nothing. Which actions that allows, and for whom
+ * (people, agents), is the app's. Answers the copy it manages through (the
+ * caller records it), or null: a live server's object, any other home (a
+ * thread or task conversation under the joint is none), a delegated actor.
+ */
+export async function closedServerJointObjectManagedBy(
+  actor: ViewActor,
+  object: HomeRow,
+  opts?: { executor?: DatabaseExecutor },
+): Promise<KeptJointManagement | null> {
+  let actorType: "user" | "agent";
+  switch (actor.type) {
+    case "user":
+    case "agent":
+      actorType = actor.type;
+      break;
+    case "delegated":
+      return null;
+    default:
+      return assertNeverViewActor(actor);
+  }
+  const executor = opts?.executor ?? getDb();
+  const homeId = object.homeChannelId;
+  if (homeId === null || !(await closedServerJointObjects([object], { executor }))[0]) return null;
+  // The home names the joint's canonical channel, or (stored before that) the closed server's copy of it.
+  const [record] = await jointHomeRecords("any", { localChannelIds: [homeId], executor });
+  const [copy] = await jointHomeProjections([actor.serverId], { canonicalChannelIds: [record?.canonicalChannelId ?? homeId], executor });
+  if (!copy) return null;
+  const context = await resolveChannelActorContext(actor.serverId, copy.localChannelId, actorType, actor.id, executor);
+  return context && managesJointChannel(context) ? { serverId: actor.serverId, channelId: copy.localChannelId } : null;
+}
+
 /** An object of some server, by its standard home columns and its author (seenThroughJoint). */
 export interface JointCandidate extends HomeRow {
   id: string;
@@ -128,23 +241,25 @@ export interface JointCandidate extends HomeRow {
  * channel (#68: an object in a joint is, for the other servers' people, a
  * message there): homed in a joint (its canonical channel, or a server's
  * projection of it) in which the viewer's server has an active projection,
- * the app (`appFlag`) on for both servers, which still exist, and the viewer
- * let in through it (canViewHomes). An object of the viewer's own server, or
- * one it sees any other way (public), is none of them. The one rule an
- * app's writes by another server's person and core's Activity rows of
- * another server's objects both ask, so leaving the joint ends both at once.
+ * the app (`appFlag`) on for the viewer's server, which still exists, the
+ * object's server answering for `access` (objectServersAnswer: live, or for
+ * `read` closed but still in the joint, read-only), and the viewer let in
+ * through it (canViewHomes). An object of the viewer's own server, or one it
+ * sees any other way (public), is none of them. The one rule an app's writes
+ * by another server's person (`write`) and core's Activity rows of another
+ * server's objects (`read`) both ask, so leaving the joint ends both at once.
  * A constant number of queries.
  */
 export async function seenThroughJoint(
   viewer: ViewActor,
   objects: readonly JointCandidate[],
   appFlag: string,
-  opts?: { executor?: DatabaseExecutor },
+  opts: { access: ObjectAccess; executor?: DatabaseExecutor },
 ): Promise<ReadonlySet<string>> {
   const asked = objects.filter((object) => object.serverId !== viewer.serverId && object.homeKind === "conversation" && object.homeChannelId !== null);
   if (asked.length === 0) return new Set();
   const homeIds = [...new Set(asked.map((object) => object.homeChannelId!))];
-  const executor = opts?.executor;
+  const executor = opts.executor;
   // A home naming a server's projection names the joint's canonical channel.
   const canonicalOf = new Map((await jointHomeRecords("any", { localChannelIds: homeIds, executor })).map((record) => [record.localChannelId, record.canonicalChannelId]));
   const canonical = (object: JointCandidate) => canonicalOf.get(object.homeChannelId!) ?? object.homeChannelId!;
@@ -152,20 +267,22 @@ export async function seenThroughJoint(
     .map((projection) => projection.canonicalChannelId));
   const inJoint = asked.filter((object) => viewersJoints.has(canonical(object)));
   if (inJoint.length === 0) return new Set();
-  const servers = [...new Set([viewer.serverId, ...inJoint.map((object) => object.serverId)])];
-  const on = await appEnabledOnLiveServers(servers, appFlag, { executor });
-  const enabled = new Set(servers.filter((_, index) => on[index]));
-  if (!enabled.has(viewer.serverId)) return new Set();
-  const flagged = inJoint.filter((object) => enabled.has(object.serverId));
+  const [[viewerOn], answered] = await Promise.all([
+    appEnabledOnLiveServers([viewer.serverId], appFlag, { executor }),
+    objectServersAnswer(inJoint, appFlag, { access: opts.access, executor }),
+  ]);
+  if (!viewerOn) return new Set();
+  const flagged = inJoint.filter((_, index) => answered[index]);
   const answers = await canViewHomedObjects(viewer, flagged.map((object) => ({ serverId: object.serverId, home: homeOf(object), author: object.author })), { executor });
   return new Set(flagged.filter((_, index) => answers[index]).map((object) => object.id));
 }
 
 /**
  * The other servers in the joint channel an object is homed in (active
- * projections) with the app on, while the object's own server has it on
- * too: those whose people and agents may see it from there. Empty for any
- * other home.
+ * projections) with the app on, which still exist, while the object's own
+ * server has it on too and still exists: those whose people and agents may
+ * be told of it or named on it from there (writes: a closed server's object,
+ * objectServersAnswer's `write`, has none). Empty for any other home.
  */
 export async function jointServersOf(object: HomeRow, appFlag: string, opts?: { executor?: DatabaseExecutor }): Promise<ServerId[]> {
   if (object.homeKind !== "conversation" || object.homeChannelId === null) return [];
@@ -362,7 +479,9 @@ export async function visibleHomes(viewer: ViewActor, opts: { appFlags: readonly
     .map((projection) => projection.canonicalChannelId);
   // Whose objects each joint shows: the servers still in it (an active
   // projection: a server that left takes its objects with it), of those
-  // the ones that have each app on.
+  // the ones that have each app on. A closed server still in it counts:
+  // its objects there are objectServersAnswer's `read` (read-only), the
+  // same answer as by id.
   const inJoints = jointHomeIds.length === 0 ? [] : await jointHomeProjections("any", { canonicalChannelIds: jointHomeIds, executor });
   const participants = [...new Set(inJoints.map((projection) => projection.serverId))];
   // Per flag: the ids a joint object may name (any server's), and, per

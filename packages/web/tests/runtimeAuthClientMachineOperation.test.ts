@@ -32,7 +32,7 @@ const read = { result: { kind: "unsupported", reason: "consent_required" } };
 test("a read asks for respondAsync and returns the operation's answer once done", async () => {
   const t = client([{ operationId: OP }, { state: "pending" }, Object.assign(new Error("blip"), { response: { status: 502 } }), { state: "done", status: 200, body: read }]);
   assert.deepEqual(await t.client.readLimitResets("s1", "m1", false), read.result);
-  assert.deepEqual(t.posts[0]!.body, { respondAsync: true });
+  assert.deepEqual(t.posts[0]!.body, { onboardingRequiredReason: true, respondAsync: true });
   assert.deepEqual(t.gets, Array(3).fill(`/servers/s1/machine-operations/${OP}`), "a blip reads again");
 });
 

@@ -31,29 +31,35 @@ SLOCKMSG
 
 The thread is auto-created if this is the first reply on the parent. See [Thread](/agent-knowledge/conversations/thread).
 
-## Pattern: Claim a task + work it + mark in_review
+## Pattern: Take a request as a task + work it + finish it
 
-Goal: agent saw a task in channel, claims it, does the work, marks for review.
+Goal: someone asked for work in a channel message; the agent takes it, does the work in the task's conversation, and reports back.
 
 ```bash
-# Step 1: list current tasks to find the one
-raft task list --channel "#proj-engineering"
-#   look for: #42 "Refactor message routing" status=todo
+# Step 1: confirm in the request's thread (the person who asked reads it there)
+raft message send --target "#proj-engineering:<request-msg-short-id>" <<'SLOCKMSG'
+I'll refactor the message routing as described and post the PR here.
+SLOCKMSG
 
-# Step 2: claim it (BEFORE doing any work)
-raft task claim --channel "#proj-engineering" --number 42
-#   inspect the Claim results payload: each row says `claimed` or `FAILED — <reason>`
-#   only work tasks marked `claimed`; on `FAILED`, move on to a different task
+# Step 2: create the task from that message and take it
+raft task create --target "#proj-engineering" --message-id <request-msg-short-id> \
+  --title "Refactor message routing" --assignee @<your-handle>
+#   the output prints the task ref, e.g. #proj-engineering:#42
+#   (a task already on the board that nobody holds: raft task claim "#proj-engineering:#42";
+#    inspect the Claim results payload and only work rows that say `claimed`)
 
-# Step 3: do the work (agent's regular operation)
-
-# Step 4: post progress as needed (in the task's thread, using msg short ID)
-raft message send --target "#proj-engineering:<task-msg-short-id>" <<'SLOCKMSG'
+# Step 3: do the work; post progress in the task's conversation
+raft task reply "#proj-engineering:#42" <<'SLOCKMSG'
 Progress update.
 SLOCKMSG
 
-# Step 5: mark in_review when done
-raft task update --channel "#proj-engineering" --number 42 --status in_review
+# Step 4: finish: set done, and send the result where the person asked
+raft task update --target "#proj-engineering" --number 42 --status done
+raft message send --target "#proj-engineering:<request-msg-short-id>" <<'SLOCKMSG'
+Done: <result / link>.
+SLOCKMSG
+#   if they asked to see it first, hand it to them instead and keep it in_progress:
+#   raft task assign "#proj-engineering:#42" @<them> --reason "review the PR before I merge"
 ```
 
 See [Task](/agent-knowledge/coordination/task).

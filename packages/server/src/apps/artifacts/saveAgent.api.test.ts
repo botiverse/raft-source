@@ -319,7 +319,7 @@ test("no room in the quota on Free, for an agent whose Computer can post an upgr
   // Agent B is on no Computer, so its CLI may not post the card: the billing line, no upgradeHint.
   const other = await save(app, world.keys.b, inChannel.id);
   assert.equal(other.status, 403, JSON.stringify(other.body));
-  assert.match(other.body.suggestedNextAction, /^Say in the conversation that the file wasn't uploaded and why\. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: /);
+  assert.match(other.body.suggestedNextAction, /^Say in the conversation that the file wasn't uploaded and why\. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Plan & billing: /);
   assert.equal(other.body.details.upgradeHint, undefined);
   assert.deepEqual(await itemsIn(world.team.id), []);
 });

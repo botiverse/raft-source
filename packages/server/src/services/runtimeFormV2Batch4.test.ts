@@ -53,6 +53,7 @@ import {
   reasoningEffortChoices,
   reconcileRuntimeFormV2SubmissionWithLiveModels,
   redactWriteOnlyRuntimeConfig,
+  retainLegacyBlankWriteOnlySecrets,
   retainOmittedWriteOnlySecrets,
   runtimeFormV2Entry,
   runtimeFormValuesFromRuntimeConfig,
@@ -424,12 +425,15 @@ test("edit with a blank API key keeps the stored key only while the provider is 
   assert.deepEqual(toConfigured.provider, { kind: "default" });
 });
 
-test("legacy (v1) Pi saves are unchanged: the read keeps the key and a full legacy config passes through the PATCH path untouched", () => {
-  // The legacy web edit prefills the key from GET /api/agents/:id
-  // (runtimeConfigPiProviderApiKey) and refuses a blank one; see PI_BUILTIN_PROVIDER_API_KEY.
+test("v1 agent reads blank Pi's key (redactOnAgentRead: true), while legacy v1 blank PATCH keeps stored key on same provider", () => {
   const stored = deepseek("sk-stored");
-  assert.equal(redactWriteOnlyRuntimeConfig(stored), stored);
-  assert.deepEqual(runtimeFormV2Entry("pi")!.writeOnlySecrets?.map((secret) => [secret.path, secret.redactOnAgentRead]), [[["provider", "apiKey"], false]]);
+  const redacted = redactWriteOnlyRuntimeConfig(stored) as { provider: { apiKey: string } };
+  assert.equal(redacted.provider.apiKey, "");
+  assert.deepEqual(runtimeFormV2Entry("pi")!.writeOnlySecrets?.map((secret) => [secret.path, secret.redactOnAgentRead]), [[["provider", "apiKey"], true]]);
+  // Legacy v1 client sending blank apiKey on the same provider preserves the stored key.
+  const blankSameProvider = { ...stored, provider: { ...(stored as { provider: Record<string, unknown> }).provider, apiKey: "" } };
+  const keptBlank = retainLegacyBlankWriteOnlySecrets(blankSameProvider, stored) as { provider: { apiKey: string } };
+  assert.equal(keptBlank.provider.apiKey, "sk-stored");
   const configured = legacy({ model: "my-org/pi-custom", custom: true, effort: "medium" });
   assert.equal(redactWriteOnlyRuntimeConfig(configured), configured);
   // Every config the legacy builder produces carries the key when it has one,

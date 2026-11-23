@@ -220,7 +220,9 @@ test("normalizes empty stream event types to unknown", () => {
 });
 
 test("normalizes compaction finish from compact boundary events", () => {
-  const events = normalizer.normalizeLine(JSON.stringify({
+  const events = // Its own normalizer: the boundary now sets the last request's context,
+  // which must not leak into the tests that share `normalizer`.
+  new ClaudeEventNormalizer().normalizeLine(JSON.stringify({
     type: "system",
     subtype: "compact_boundary",
     session_id: "session-compact-1",
@@ -233,8 +235,26 @@ test("normalizes compaction finish from compact boundary events", () => {
   }));
 
   assert.deepEqual(events, [
-    { kind: "compaction_finished" },
+    { kind: "compaction_finished", contextBeforeTokens: 13127, contextAfterTokens: 570 },
   ]);
+});
+
+test("#67: a compact boundary without metadata still finishes; what it left becomes the last request's context", () => {
+  const local = new ClaudeEventNormalizer();
+  assert.deepEqual(local.normalizeLine(JSON.stringify({ type: "system", subtype: "compact_boundary" })), [{ kind: "compaction_finished" }]);
+  const assistant = (input: number) => JSON.stringify({
+    type: "assistant",
+    message: { content: [{ type: "text", text: "ok" }], usage: { input_tokens: input, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 1 } },
+  });
+  const result = JSON.stringify({ type: "result", subtype: "success", is_error: false, stop_reason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 } });
+  const lastRequest = (events: ReturnType<ClaudeEventNormalizer["normalizeLine"]>) =>
+    events.flatMap((event) => (event.kind === "telemetry" && event.name === "token_usage" ? [event.attrs.lastRequestContextTokens] : []));
+  local.normalizeLine(assistant(600_000));
+  local.normalizeLine(JSON.stringify({ type: "system", subtype: "compact_boundary", compact_metadata: { trigger: "manual", pre_tokens: 600_000, post_tokens: 41_000 } }));
+  assert.deepEqual(lastRequest(local.normalizeLine(result)), [41_000], "the /compact turn's result reports what the compaction left");
+  local.normalizeLine(assistant(600_000));
+  local.normalizeLine(JSON.stringify({ type: "system", subtype: "compact_boundary", compact_metadata: { trigger: "manual", pre_tokens: 600_000 } }));
+  assert.deepEqual(lastRequest(local.normalizeLine(result)), [undefined], "unknown after a compaction that did not say: not the stale size");
 });
 
 test("does not double-count compaction finish from compact result status", () => {
@@ -280,6 +300,117 @@ test("does not treat non-error max_tokens result stops as execution errors", () 
   assert.deepEqual(events, [
     { kind: "turn_end", sessionId: "session-4b" },
   ]);
+});
+
+// Claude Code 2.1.322's refusal, as its bundled bin/claude.exe writes it in
+// stream-json (derived from that build's code, never from a real refusal):
+// V9t() builds the notice with js({ content, error: "invalid_request" })
+// (isApiErrorMessage: true) and sets message.stop_reason "refusal" and
+// message.stop_details; the assistant frame (ZYt/Co) carries `error`,
+// `is_api_error_message` and `refused_message_id`. The result takes is_error
+// from the last assistant message being an API error and stop_reason from its
+// stop_reason; it has no stop_details.
+const REFUSAL_NOTICE = "API Error: Claude Code can't help with this. Start a new session to continue. planted-notice-wording";
+function claudeRefusalAssistantLine(sessionId: string): string {
+  return JSON.stringify({
+    type: "assistant",
+    message: {
+      id: "5b2d5c1e-0000-4000-8000-000000000001",
+      type: "message",
+      role: "assistant",
+      model: "<synthetic>",
+      content: [{ type: "text", text: REFUSAL_NOTICE }],
+      stop_reason: "refusal",
+      stop_details: { type: "refusal", category: null, explanation: "planted-explanation-wording" },
+      usage: { input_tokens: 0, output_tokens: 0 },
+    },
+    parent_tool_use_id: null,
+    session_id: sessionId,
+    uuid: "5b2d5c1e-0000-4000-8000-000000000002",
+    error: "invalid_request",
+    is_api_error_message: true,
+    refused_message_id: "msg_planted",
+  });
+}
+function claudeRefusalResultLine(sessionId: string, isError = true): string {
+  return JSON.stringify({
+    type: "result",
+    subtype: "success",
+    is_error: isError,
+    num_turns: 1,
+    stop_reason: "refusal",
+    api_error_status: null,
+    result: REFUSAL_NOTICE,
+    session_id: sessionId,
+  });
+}
+const FIXED_REFUSAL_ERROR = {
+  kind: "error",
+  message: "The model declined to respond to this request (refusal).",
+  nativeReasonPresent: true,
+  reasonProvenance: "runtime_error_event",
+  modelRefusal: true,
+};
+
+test("Claude 2.1.322's refusal (API-error notice, then an is_error result) is one fixed refusal error, never the notice or a generic error", () => {
+  const n = new ClaudeEventNormalizer();
+  const assistant = n.normalizeLine(claudeRefusalAssistantLine("session-refusal"));
+  const result = n.normalizeLine(claudeRefusalResultLine("session-refusal"));
+  assert.deepEqual(assistant, [FIXED_REFUSAL_ERROR]);
+  assert.deepEqual(result, [{ kind: "turn_end", sessionId: "session-refusal" }]);
+  assert.doesNotMatch(JSON.stringify([...assistant, ...result]), /planted-/, "never the notice or the explanation");
+  // The next turn starts clean: its own refusal is reported again.
+  assert.deepEqual(n.normalizeLine(claudeRefusalAssistantLine("session-refusal")), [FIXED_REFUSAL_ERROR]);
+});
+
+test("a refusal result without its assistant line is the fixed refusal error, whatever is_error says", () => {
+  for (const isError of [true, false]) {
+    const events = new ClaudeEventNormalizer().normalizeLine(claudeRefusalResultLine("session-result-only", isError));
+    assert.deepEqual(events, [FIXED_REFUSAL_ERROR, { kind: "turn_end", sessionId: "session-result-only" }], `is_error ${isError}`);
+    assert.doesNotMatch(JSON.stringify(events), /planted-/);
+  }
+});
+
+test("a model message that stopped on a refusal keeps its own text and adds the fixed refusal error once", () => {
+  const n = new ClaudeEventNormalizer();
+  const assistant = n.normalizeLine(JSON.stringify({
+    type: "assistant",
+    message: { role: "assistant", content: [{ type: "text", text: "Let me look at" }], stop_reason: "refusal" },
+    parent_tool_use_id: null,
+    session_id: "session-partial",
+  }));
+  assert.deepEqual(assistant, [{ kind: "text", text: "Let me look at" }, FIXED_REFUSAL_ERROR]);
+  assert.deepEqual(n.normalizeLine(claudeRefusalResultLine("session-partial", false)), [{ kind: "turn_end", sessionId: "session-partial" }]);
+});
+
+test("a budget or max-turns stop after a refusal keeps its own error, not the refusal", () => {
+  for (const [subtype, message] of [["error_max_turns", "Max turns exceeded"], ["error_max_budget_usd", "Budget limit exceeded"]] as const) {
+    const events = new ClaudeEventNormalizer().normalizeLine(JSON.stringify({
+      type: "result",
+      subtype,
+      is_error: true,
+      stop_reason: "refusal",
+      result: "",
+      session_id: "session-stop-after-refusal",
+    }));
+    const errors = events.filter((event) => event.kind === "error");
+    assert.equal(errors.length, 1, subtype);
+    assert.equal((errors[0] as { message: string }).message.startsWith(message), true, `${subtype}: ${JSON.stringify(errors[0])}`);
+    assert.equal((errors[0] as { modelRefusal?: true }).modelRefusal, undefined, subtype);
+  }
+});
+
+test("a successful result that ended its turn normally reports no error", () => {
+  const events = new ClaudeEventNormalizer().normalizeLine(JSON.stringify({
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    stop_reason: "end_turn",
+    errors: [],
+    result: "Done.",
+    session_id: "session-end-turn",
+  }));
+  assert.deepEqual(events, [{ kind: "turn_end", sessionId: "session-end-turn" }]);
 });
 
 test("normalizes terminal result usage as per-turn token telemetry", () => {
@@ -775,7 +906,174 @@ test("task #379: a rejected rate-limit window marks the limit as used up and car
   assert.deepEqual(event && event.kind === "error" ? event.providerLimit : null, {
     kind: "quota_exhausted",
     resetsAt: new Date(1791900000 * 1000).toISOString(),
+    rateLimitType: "seven_day",
   });
+});
+
+// #proj-runtime:#66 (AndyLok, Claude Code 2.1.325): the weekly limit. The
+// refused request's own limit info rides on the assistant line itself
+// (`api_error: "usage_limit_reached"`, `api_error_params.rate_limit_info`),
+// with or without a `rate_limit_event` before it. Live stream-json is
+// snake_case on the line; inside `rate_limit_info` the fields stay camelCase
+// (the shape `rate_limit_event` carries). Field names confirmed in the 2.1.322
+// bundle (its SDK assistant-message mapper and `rate_limit_info` builder).
+const WEEKLY_LIMIT_TEXT = "You've hit your weekly limit · resets Nov 18, 4am (America/Toronto)";
+const WEEKLY_RESET_SEC = 1794992400; // 2026-11-18T09:00:00Z
+const BEFORE_WEEKLY_RESET_MS = Date.parse("2026-11-16T12:00:00.000Z");
+const WEEKLY_RATE_LIMIT_INFO = {
+  status: "rejected",
+  rateLimitType: "seven_day",
+  resetsAt: WEEKLY_RESET_SEC,
+  overageStatus: "rejected",
+  overageDisabledReason: "org_level_disabled",
+  isUsingOverage: false,
+};
+
+function weeklyLimitLiveLine(rateLimitInfo: Record<string, unknown> = WEEKLY_RATE_LIMIT_INFO): string {
+  return JSON.stringify({
+    type: "assistant",
+    message: {
+      id: "msg_weekly",
+      model: "<synthetic>",
+      role: "assistant",
+      stop_reason: "stop_sequence",
+      type: "message",
+      content: [{ type: "text", text: WEEKLY_LIMIT_TEXT }],
+    },
+    parent_tool_use_id: null,
+    session_id: "session-66",
+    uuid: "uuid-weekly",
+    error: "rate_limit",
+    is_api_error_message: true,
+    api_error_status: 429,
+    api_error: "usage_limit_reached",
+    api_error_params: { rate_limit_info: rateLimitInfo },
+  });
+}
+
+test("#proj-runtime:#66: a live usage_limit_reached line is a used-up quota with its own reset and window", () => {
+  const fresh = new ClaudeEventNormalizer(() => BEFORE_WEEKLY_RESET_MS);
+  assert.deepEqual(fresh.normalizeLine(weeklyLimitLiveLine()), [
+    {
+      kind: "error",
+      message: WEEKLY_LIMIT_TEXT,
+      nativeReasonPresent: true,
+      reasonProvenance: "runtime_error_event",
+      providerLimit: { kind: "quota_exhausted", resetsAt: "2026-11-18T09:00:00.000Z", rateLimitType: "seven_day" },
+      providerError: { codes: ["rate_limit"], httpStatus: 429 },
+    },
+  ]);
+});
+
+test("#proj-runtime:#66: the line's own limit info comes before an earlier rate_limit_event's", () => {
+  const fresh = new ClaudeEventNormalizer(() => BEFORE_WEEKLY_RESET_MS);
+  fresh.normalizeLine(JSON.stringify({
+    type: "rate_limit_event",
+    rate_limit_info: { status: "rejected", resetsAt: WEEKLY_RESET_SEC - 3600, rateLimitType: "five_hour" },
+    session_id: "session-66",
+  }));
+  const [event] = fresh.normalizeLine(weeklyLimitLiveLine());
+  assert.deepEqual(event && event.kind === "error" ? event.providerLimit : null, {
+    kind: "quota_exhausted",
+    resetsAt: "2026-11-18T09:00:00.000Z",
+    rateLimitType: "seven_day",
+  });
+});
+
+test("#proj-runtime:#66: without its own limit info, a usage_limit_reached line takes the reset of a rate_limit_event only if that one is the refusal", () => {
+  const noInfoLine = JSON.stringify({
+    type: "assistant",
+    error: "rate_limit",
+    api_error: "usage_limit_reached",
+    message: { model: "<synthetic>", content: [{ type: "text", text: WEEKLY_LIMIT_TEXT }] },
+    session_id: "session-66",
+  });
+  const after = (info: Record<string, unknown>) => {
+    const fresh = new ClaudeEventNormalizer(() => BEFORE_WEEKLY_RESET_MS);
+    fresh.normalizeLine(JSON.stringify({ type: "rate_limit_event", rate_limit_info: info, session_id: "session-66" }));
+    const [event] = fresh.normalizeLine(noInfoLine);
+    return event && event.kind === "error" ? event.providerLimit : null;
+  };
+  assert.deepEqual(after({ status: "rejected", resetsAt: WEEKLY_RESET_SEC, rateLimitType: "seven_day" }), {
+    kind: "quota_exhausted",
+    resetsAt: "2026-11-18T09:00:00.000Z",
+    rateLimitType: "seven_day",
+  }, "the rejected window is the refusal");
+  assert.deepEqual(after({ status: "allowed_warning", resetsAt: WEEKLY_RESET_SEC - 3600, rateLimitType: "five_hour" }), { kind: "quota_exhausted" }, "a warning about another window says nothing of this one");
+  assert.deepEqual(after({ status: "allowed", resetsAt: WEEKLY_RESET_SEC - 3600, rateLimitType: "five_hour" }), { kind: "quota_exhausted" }, "nor does an allowed reading");
+});
+
+test("#proj-runtime:#66: the session JSONL's camelCase form reads the same", () => {
+  const fresh = new ClaudeEventNormalizer(() => BEFORE_WEEKLY_RESET_MS);
+  const [event] = fresh.normalizeLine(JSON.stringify({
+    type: "assistant",
+    message: { model: "<synthetic>", stop_reason: "stop_sequence", content: [{ type: "text", text: WEEKLY_LIMIT_TEXT }] },
+    sessionId: "session-66",
+    error: "rate_limit",
+    isApiErrorMessage: true,
+    apiErrorStatus: 429,
+    apiErrorType: "rate_limit_error",
+    apiError: "usage_limit_reached",
+    apiErrorParams: { rate_limit_info: WEEKLY_RATE_LIMIT_INFO },
+  }));
+  assert.deepEqual(event && event.kind === "error" ? event.providerLimit : null, {
+    kind: "quota_exhausted",
+    resetsAt: "2026-11-18T09:00:00.000Z",
+    rateLimitType: "seven_day",
+  });
+});
+
+test("#proj-runtime:#66: usage_limit_reached is a used-up quota whatever its wording; an implausible or past reset is dropped, the limit kept", () => {
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["milliseconds read as seconds", { ...WEEKLY_RATE_LIMIT_INFO, resetsAt: WEEKLY_RESET_SEC * 1000 }],
+    ["more than 8 days ahead", { ...WEEKLY_RATE_LIMIT_INFO, resetsAt: Math.floor(BEFORE_WEEKLY_RESET_MS / 1000) + 9 * 24 * 3600 }],
+    ["already past", { ...WEEKLY_RATE_LIMIT_INFO, resetsAt: Math.floor(BEFORE_WEEKLY_RESET_MS / 1000) - 60 }],
+    ["not a number", { ...WEEKLY_RATE_LIMIT_INFO, resetsAt: "Nov 18" }],
+  ];
+  for (const [label, info] of cases) {
+    const [event] = new ClaudeEventNormalizer(() => BEFORE_WEEKLY_RESET_MS).normalizeLine(weeklyLimitLiveLine(info));
+    assert.deepEqual(event && event.kind === "error" ? event.providerLimit : null, { kind: "quota_exhausted", rateLimitType: "seven_day" }, label);
+  }
+  // Wording the quota patterns do not know: the typed kind still decides.
+  const [unknownWording] = new ClaudeEventNormalizer(() => BEFORE_WEEKLY_RESET_MS).normalizeLine(JSON.stringify({
+    type: "assistant",
+    error: "rate_limit",
+    api_error: "usage_limit_reached",
+    message: { model: "<synthetic>", content: [{ type: "text", text: "Try again after Thursday" }] },
+    session_id: "session-66",
+  }));
+  assert.deepEqual(unknownWording && unknownWording.kind === "error" ? unknownWording.providerLimit : null, { kind: "quota_exhausted" });
+  // Limit info on a refusal that is not a usage limit does not make a throttle a used-up quota.
+  const [throttle] = new ClaudeEventNormalizer(() => BEFORE_WEEKLY_RESET_MS).normalizeLine(JSON.stringify({
+    type: "assistant",
+    error: "rate_limit",
+    api_error_params: { rate_limit_info: { status: "allowed_warning", resetsAt: WEEKLY_RESET_SEC } },
+    message: { model: "<synthetic>", content: [{ type: "text", text: "API Error: Request rate limited, retrying shortly" }] },
+    session_id: "session-66",
+  }));
+  assert.deepEqual(throttle && throttle.kind === "error" ? throttle.providerLimit : null, { kind: "transient_rate_limit" });
+});
+
+test("#proj-runtime:#66: a result that ends on usage_limit_reached with no assistant line before it carries the used-up quota", () => {
+  const fresh = new ClaudeEventNormalizer(() => BEFORE_WEEKLY_RESET_MS);
+  assert.deepEqual(fresh.normalizeLine(JSON.stringify({
+    type: "result",
+    subtype: "success",
+    is_error: true,
+    api_error_status: 429,
+    api_error: "usage_limit_reached",
+    result: WEEKLY_LIMIT_TEXT,
+    session_id: "session-66",
+  })), [
+    { kind: "error", message: WEEKLY_LIMIT_TEXT, providerLimit: { kind: "quota_exhausted" }, providerError: { httpStatus: 429 } },
+    { kind: "turn_end", sessionId: "session-66" },
+  ]);
+  // After the assistant line reported it, the result adds nothing.
+  const reported = new ClaudeEventNormalizer(() => BEFORE_WEEKLY_RESET_MS);
+  reported.normalizeLine(weeklyLimitLiveLine());
+  assert.deepEqual(reported.normalizeLine(JSON.stringify({
+    type: "result", subtype: "success", is_error: true, api_error_status: 429, api_error: "usage_limit_reached", result: WEEKLY_LIMIT_TEXT, session_id: "session-66",
+  })), [{ kind: "turn_end", sessionId: "session-66" }]);
 });
 
 test("task #379: a rate limit without used-up evidence stays a transient throttle", () => {

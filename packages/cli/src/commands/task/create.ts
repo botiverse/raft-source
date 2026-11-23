@@ -17,7 +17,7 @@ import { cliError } from "../../core/errors";
 import { writeText, adoptCliReplyText } from "../../core/renderer";
 import { PEER_KIND_OPTION, requireTargetAlias, type TargetAliasOpts } from "../_target";
 import { formatTasksCreated } from "./_format";
-import { writeHeldTaskWrite } from "../freshness/_taskHold";
+import { exitIfHeldTaskWrite } from "../freshness/_taskHold";
 
 interface CreateOpts extends TargetAliasOpts {
   title?: string[];
@@ -131,7 +131,7 @@ export const taskCreateCommand = defineCommand(
     if (!res.data) {
       throw cliError("INVALID_JSON_RESPONSE", "Agent API taskCreate returned an empty response body");
     }
-    if (writeHeldTaskWrite(ctx, agentContext.agentId, "task_create", body, res.data)) return;
+    exitIfHeldTaskWrite(ctx, agentContext.agentId, "task_create", body, res.data);
     writeText(ctx.io, adoptCliReplyText(formatTasksCreated(channel, res.data) + "\n"));
   },
 );

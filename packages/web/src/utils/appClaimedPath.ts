@@ -15,7 +15,7 @@ import { isDesktopDeepLinkPathname } from "@botiverse/raft-shared";
  *   with nothing before or after; an open Artifact on the Artifacts page,
  *   `/s/<slug>/artifacts?artifact=<id>`; an Artifact's share link,
  *   `/artifacts/<id>` and `/artifacts/<id>/v/<n>`; an external invite,
- *   `/external-invite/…`. tests/wellKnownAssociation.test.ts holds this rule
+ *   `/external-invite/…`; a server join link, `/join/<token>`. tests/wellKnownAssociation.test.ts holds this rule
  *   to the file the Worker serves, so the two cannot drift. (That file's other
  *   entries, `/download` and the sign-up verification link, are entry points
  *   of their own, not pages an offer appears on.)
@@ -28,18 +28,30 @@ export type AppPlatform = "desktop" | "android" | "ios";
 
 const IOS_CONVERSATION = /^\/s\/[^/]+\/(?:channel|dm)\/[^/]+$/;
 const IOS_ARTIFACTS_PAGE = /^\/s\/[^/]+\/artifacts$/;
-const IOS_ARTIFACT_LINK = /^\/artifacts\/[^/]+(?:\/v\/[^/]+)?$/;
-const IOS_EXTERNAL_INVITE = /^\/external-invite\//;
+const ARTIFACT_LINK = /^\/artifacts\/[^/]+(?:\/v\/[^/]+)?$/;
+const EXTERNAL_INVITE = /^\/external-invite\/.+$/;
+const SERVER_JOIN = /^\/join\/[^/]+$/;
+
+function normalizePathname(pathname: string): string {
+  // iOS matches the path with a trailing slash added, so `/x` and `/x/` are the same address to it.
+  return pathname.length > 1 && pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
+}
 
 function isIosClaimedPath(pathname: string, search: string): boolean {
-  if (IOS_CONVERSATION.test(pathname) || IOS_ARTIFACT_LINK.test(pathname) || IOS_EXTERNAL_INVITE.test(pathname)) return true;
+  const normalized = normalizePathname(pathname);
+  if (IOS_CONVERSATION.test(normalized) || ARTIFACT_LINK.test(normalized) || EXTERNAL_INVITE.test(normalized) || SERVER_JOIN.test(normalized)) return true;
   // The Artifacts page only with an Artifact open on it.
-  return IOS_ARTIFACTS_PAGE.test(pathname) && (new URLSearchParams(search).get("artifact") ?? "") !== "";
+  return IOS_ARTIFACTS_PAGE.test(normalized) && (new URLSearchParams(search).get("artifact") ?? "") !== "";
+}
+
+function isAndroidClaimedPath(pathname: string): boolean {
+  const normalized = normalizePathname(pathname);
+  // Android's manifest claims every `/s/…` path plus Artifact share links, external invites and server join links.
+  return normalized.startsWith("/s/") || ARTIFACT_LINK.test(normalized) || EXTERNAL_INVITE.test(normalized) || SERVER_JOIN.test(normalized);
 }
 
 export function isAppClaimedPath(pathname: string, platform: AppPlatform, search = ""): boolean {
   if (platform === "desktop") return isDesktopDeepLinkPathname(pathname);
-  // The Android app's claim is in its manifest: every `/s/…` path (its claim of `/artifacts/…` starts with 1.24; no offer is mounted there).
-  if (platform === "android") return pathname.startsWith("/s/");
+  if (platform === "android") return isAndroidClaimedPath(pathname);
   return isIosClaimedPath(pathname, search);
 }

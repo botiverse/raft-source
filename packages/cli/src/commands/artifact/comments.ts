@@ -1,5 +1,10 @@
-// `raft artifact comments <artifact> [--review <review id>] [--path <file>] [--all] [--cursor <c>]`
+// `raft artifact comments <artifact> [--review <review id>] [--held <from..to>] [--path <file>] [--all] [--cursor <c>]`
 // → GET /internal/agent-api/artifacts/:artifact/comments (the SDK's artifacts.comments)
+//
+// `--held` (#proj-workspace:#340): a held comment, resolve or push marks
+// comments seen, so they leave the default (new only) list; its
+// last line names this flag with its range, to list exactly those again
+// when its output was cut.
 
 import type { Command } from "commander";
 import { formatArtifactComments } from "./_format";
@@ -17,6 +22,7 @@ interface CommentsOpts {
   all?: boolean;
   cursor?: string;
   review?: string;
+  held?: string;
 }
 
 export const artifactCommentsCommand = defineCommand(
@@ -30,6 +36,7 @@ export const artifactCommentsCommand = defineCommand(
       { flags: "--path <file>", description: "Only comments on this file" },
       { flags: "--all", description: "Every comment, not only the new ones" },
       { flags: "--cursor <cursor>", description: "Continue from a More line" },
+      { flags: "--held <from..to>", description: "List again the comments a held comment, resolve or push marked seen: the range its last line names" },
     ],
   },
   async (ctx, ...args: unknown[]) => {
@@ -43,9 +50,13 @@ export const artifactCommentsCommand = defineCommand(
       ...(opts.all ? { all: true } : {}),
       ...(opts.cursor === undefined ? {} : { cursor: opts.cursor }),
       ...(opts.review === undefined ? {} : { review: opts.review }),
+      ...(opts.held === undefined ? {} : { held: opts.held }),
     });
     if (!outcome.ok) throw artifactCliError(outcome);
-    writeText(ctx.io, formatArtifactComments(outcome.data, opts.review === undefined ? {} : { review: opts.review }));
+    writeText(ctx.io, formatArtifactComments(outcome.data, {
+      ...(opts.review === undefined ? {} : { review: opts.review }),
+      ...(opts.held === undefined ? {} : { held: opts.held }),
+    }));
   },
 );
 

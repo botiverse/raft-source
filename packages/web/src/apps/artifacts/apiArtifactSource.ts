@@ -6,6 +6,7 @@ import type {
   ArtifactId,
   ArtifactObjectRef,
   ArtifactPublicFrame,
+  ArtifactPublicLinks,
   ArtifactPublicMeta,
   ArtifactPublicView,
   ArtifactPresence,
@@ -22,13 +23,16 @@ import type {
   ArtifactWebFileContent,
   ArtifactWebFrame,
   ArtifactWebHomeChange,
+  ArtifactWebLinks,
   ArtifactWebLocation,
   ArtifactWebOpen,
   ArtifactWebReviewDrafts,
   ArtifactWebReviewDraftSaved,
   ArtifactWebAttachmentSaves,
+  ArtifactWebBacklinks,
   ArtifactWebConversationArtifacts,
   ArtifactWebSaved,
+  ArtifactWebSettlement,
   ArtifactWebShareAudience,
   ArtifactWebShared,
   ArtifactWebTitleInput,
@@ -211,8 +215,17 @@ export const apiArtifactSource: ArtifactSource = {
   frame(id, input) {
     return send<ArtifactWebFrame>("POST", artifactWebPaths.frame(id), input);
   },
+  links(id, version) {
+    return get<ArtifactWebLinks>(artifactWebPaths.links(id, version));
+  },
+  backlinks(id) {
+    return get<ArtifactWebBacklinks>(artifactWebPaths.backlinks(id));
+  },
   setFollowing(id, following) {
     return send<{ following: boolean }>(following ? "PUT" : "DELETE", artifactWebPaths.subscription(id));
+  },
+  setSettled(id, settled) {
+    return send<ArtifactWebSettlement>(settled ? "POST" : "DELETE", artifactWebPaths.settle(id));
   },
   changeHome(id, input) {
     return send<ArtifactViewerData>("POST", artifactWebPaths.home(id), input);
@@ -359,6 +372,15 @@ export function publicArtifactView(id: ArtifactId): Promise<ArtifactPublicView> 
  */
 export function publicArtifactFrame(id: ArtifactId): Promise<ArtifactPublicFrame> {
   return call<ArtifactPublicFrame>({ method: "POST", url: artifactPublicPaths.frame(id), headers: NO_SERVER });
+}
+
+/**
+ * The current version's links to other Artifacts, as a signed-out visitor may see their targets
+ * (`ok` only for a public one, else `unavailable`), for the public page's frame
+ * (useArtifactLinkLabels). NOT_VISIBLE, CONTENT_UNAVAILABLE, RATE_LIMITED.
+ */
+export function publicArtifactLinks(id: ArtifactId): Promise<ArtifactPublicLinks> {
+  return call<ArtifactPublicLinks>({ method: "GET", url: artifactPublicPaths.links(id), headers: NO_SERVER });
 }
 
 /**

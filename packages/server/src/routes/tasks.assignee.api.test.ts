@@ -294,6 +294,24 @@ test("assigning to someone outside the channel is refused and writes nothing", a
   assert.equal(after.revision, before.revision, "a refused assign must not burn a revision");
 });
 
+test("a user of another server answers exactly like a user id that doesn't exist; a server member outside the channel stays 'not a member'", async ({ app }) => {
+  const { member, outsider, server, task } = await setup("assign-foreign");
+  const elsewhere = await seedUser("assign-foreign-elsewhere");
+  await createServer("Assign elsewhere", `assign-elsewhere-${randomUUID()}`, elsewhere.id);
+  const token = await login(app.baseUrl, member.email);
+  const before = await readTask(task.id);
+  const answer = async (id: string) => {
+    const res = await setAssignee(app.baseUrl, token, server.id, task.id, { assignee: { type: "user", id } });
+    return { status: res.status, body: await res.text() };
+  };
+
+  const missing = await answer(randomUUID());
+  assert.match(missing.body, /assignee not found/);
+  assert.deepEqual(await answer(elsewhere.id), missing, "another server's user reads like a missing id");
+  assert.match((await answer(outsider.id)).body, /not a member of this channel/);
+  assert.equal((await readTask(task.id)).revision, before.revision, "nothing was written");
+});
+
 test("a stale expectedRevision loses, changes nothing, and reports the current revision", async ({ app }) => {
   const { member, owner, server, task } = await setup("assign-occ");
   const token = await login(app.baseUrl, member.email);

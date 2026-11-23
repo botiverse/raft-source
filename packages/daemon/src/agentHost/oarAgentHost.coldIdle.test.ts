@@ -6,8 +6,9 @@
 // RED proof: drop `reconcileColdIdle` from `reconcile` (or the sweep's
 // `coldIdleCandidate`) and no cold session is ended; drop its `agentNotIdle`
 // check and a session with a running background task is ended; drop
-// `summaryFactsRuntimesFor` and the next start resumes.
+// `summarySuppliesResumeFacts` (the recorded contextUsage declaration) and the next start resumes.
 import assert from "node:assert/strict";
+import type { SessionCapabilityDeclaration } from "@botiverse/oar";
 import type { ScriptedTask, ScriptedTurn } from "@botiverse/oar/testing";
 import type { AgentConfig } from "@botiverse/raft-shared";
 import { harness, makeConfig, message, request, until, type Harness } from "../testing/oarAgentHostHarness";
@@ -19,11 +20,15 @@ const coldStops = (h: Harness) => h.events.filter((event) => event.name === "dae
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** A host whose clock runs `offset.ms` ahead of real time (OAR's own record times stay real), sweeping every 10 ms. */
-async function coldIdleHarness(options: { turn?: (turn: ScriptedTurn) => void | Promise<void> } = {}) {
+async function coldIdleHarness(options: { turn?: (turn: ScriptedTurn) => void | Promise<void>; capabilities?: SessionCapabilityDeclaration } = {}) {
   const offset = { ms: 0 };
   const h = await harness({
     ...(options.turn ? { turn: options.turn } : {}),
-    deps: { now: () => Date.now() + offset.ms, featuresSweepMs: 10 },
+    deps: {
+      now: () => Date.now() + offset.ms,
+      featuresSweepMs: 10,
+      ...(options.capabilities ? { sessionCapabilities: async () => options.capabilities! } : {}),
+    },
   });
   return { h, offset };
 }
@@ -82,6 +87,21 @@ test("#54: wake_recycle_oar off (absent or false): nothing is ended, and the nex
       offset.ms = 2 * HOUR_MS;
       await sleep(60);
       assert.deepEqual(coldStops(h), [], `flag ${String(flag)}: no cold-idle stop`);
+      assert.equal(h.host.owns("agent-1"), true);
+    } finally {
+      await h.cleanup();
+    }
+  }
+});
+
+test("#54: an installation OAR declares no trustworthy context size for is never stopped cold, whatever the runtime id", async () => {
+  for (const capabilities of [{ contextUsage: { tokens: false, contextWindow: false } }, {}] satisfies SessionCapabilityDeclaration[]) {
+    const { h, offset } = await coldIdleHarness({ capabilities });
+    try {
+      await startIdle(h, { wakeRecycleOar: true });
+      offset.ms = 2 * HOUR_MS;
+      await sleep(60);
+      assert.deepEqual(coldStops(h), [], `${JSON.stringify(capabilities)}: no cold-idle stop`);
       assert.equal(h.host.owns("agent-1"), true);
     } finally {
       await h.cleanup();

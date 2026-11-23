@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useIntl } from "react-intl";
 import { MapPinOff } from "lucide-react";
+import { ScrollArea, cn } from "@botiverse/raft-ui";
 import { CommentCard, CommentCardMeta } from "@botiverse/raft-ui/wip";
 import type { ArtifactComment, ArtifactCommentDraft, ArtifactCommentId, ArtifactCommentPart, ObjectFileId } from "@botiverse/raft-shared";
 import { focusField } from "@botiverse/porthole";
 import type { AnnotationRect } from "@botiverse/porthole";
 
 import ConfirmDialog from "../../components/ConfirmDialog";
-import { useMediaQuery } from "../../hooks/effectPrimitives";
+import { useArtifactPhoneLayout } from "./artifactPhoneLayout";
 import { focusLost } from "../../utils/focusGuard";
+import { timersOf, useOwnerDocument } from "../../utils/ownerDocument";
 import { AnchorMeta } from "./ArtifactActorParts";
 import { useAnchorFound } from "./artifactAnchorStatus";
 import { ArtifactCardHoldContext } from "./artifactCardHold";
@@ -23,13 +25,12 @@ import { useArtifactComments, useTrackedPlace } from "./ArtifactCommentsContext"
 import { useDeleteDraft } from "./artifactDraftDelete";
 import { isInputMethodKey } from "./artifactInputMethodKey";
 import type { ArtifactCommentBubble as Bubble } from "./ArtifactCommentsContext";
-import type { ArtifactBubbleKeyboard } from "./artifactCommentsShapes";
-import { CommentItem } from "./ArtifactCommentsPanel";
+import type { ArtifactBubbleKeyboard, LiveAnchorSpec } from "./artifactCommentsShapes";
+import { CommentItem } from "./ArtifactCommentItem";
 import { ResolveButton, ResolvedBy } from "./ArtifactThreadResolution";
 import { useThreadResolution } from "./useThreadResolution";
 import { focusAfterResolvedCard } from "./artifactResolvedFocus";
 import { PendingReplyDraft, usePendingReplies } from "./ArtifactPendingReplies";
-import { PHONE_QUERY } from "./artifactPhoneHistory";
 import { useArtifactReview } from "./ArtifactReviewContext";
 import { focusArtifactSurface } from "./artifactRestoredFocus";
 import { artifactSource } from "./artifactSource";
@@ -38,11 +39,39 @@ import { useDismissable } from "./useArtifactDismiss";
 import { useDraftOption, useReplyDraftOption } from "./useDraftOption";
 import { canTakeFocus } from "./artifactViewerStore";
 
-/** A virtual anchor for a popover at a box on screen (client px). */
-export function anchorAt(rect: AnnotationRect | null) {
+/** A node of any window (an object window's are another realm's: `instanceof Node` is false for them here). */
+function isNodeOf(value: EventTarget | null): value is Node {
+  return typeof value === "object" && value !== null && typeof (value as { nodeType?: unknown }).nodeType === "number";
+}
+
+function domRectFrom(x: number, y: number, width: number, height: number): DOMRect {
+  const box = { x, y, width, height, top: y, left: x, right: x + width, bottom: y + height };
+  return { ...box, toJSON: () => box } as DOMRect;
+}
+
+/**
+ * A virtual anchor for a popover at a box on screen (client px).
+ *
+ * When `live` is provided (captured atomically at the moment `rect` was
+ * measured via `captureLiveAnchor`), `contextElement` lets Floating UI's
+ * `autoUpdate` track scroll and resize automatically and shifts the box by any
+ * movement of `live.element` since capture — without reading layout during
+ * render or drifting across re-renders / compose -> thread handoffs.
+ */
+export function anchorAt(rect: AnnotationRect | null, live?: LiveAnchorSpec | null) {
   const r = rect ?? { x: 0, y: 0, width: 0, height: 0 };
-  const box = { x: r.x, y: r.y, width: r.width, height: r.height, top: r.y, left: r.x, right: r.x + r.width, bottom: r.y + r.height };
-  return { getBoundingClientRect: () => ({ ...box, toJSON: () => box }) as DOMRect };
+  if (!live) {
+    return { getBoundingClientRect: () => domRectFrom(r.x, r.y, r.width, r.height) };
+  }
+  const { element, dx, dy } = live;
+  return {
+    getBoundingClientRect: () => {
+      if (!element.isConnected) return domRectFrom(r.x, r.y, r.width, r.height);
+      const cur = element.getBoundingClientRect();
+      return domRectFrom(cur.left + dx, cur.top + dy, r.width, r.height);
+    },
+    contextElement: element,
+  };
 }
 
 /** How long `focusMark`'s message has to land (one post to the frame) before the frame is given the focus instead. */
@@ -63,14 +92,16 @@ const MARK_FOCUS_MS = 150;
  * A task even with nothing to ask: this runs in a microtask of the key, and Gecko refuses a move into
  * a frame of another origin during one (`IsHandlingKeyBoardEvent`).
  */
-function backToMark(frame: HTMLIFrameElement | null, focusMark: () => boolean) {
-  if (!focusLost()) return;
+function backToMark(frame: HTMLIFrameElement | null, focusMark: () => boolean, doc: Document) {
+  // The frame's own document and window (an object window's, #337 PR3: its own focus, timers that run while the main
+  // window is hidden).
+  if (!focusLost(null, doc)) return;
   const giveBack = () => {
-    if (!focusLost()) return;
+    if (!focusLost(null, doc)) return;
     frame?.focus({ preventScroll: true });
     focusMark();
   };
-  window.setTimeout(giveBack, focusMark() ? MARK_FOCUS_MS : 0);
+  timersOf(doc).setTimeout(giveBack, focusMark() ? MARK_FOCUS_MS : 0);
 }
 
 /**
@@ -115,7 +146,7 @@ export default function ArtifactCommentBubble({ boundary }: {
   boundary: HTMLElement | null;
 }) {
   const comments = useArtifactComments();
-  const phone = useMediaQuery(PHONE_QUERY);
+  const phone = useArtifactPhoneLayout();
   const bubble = comments?.bubble ?? null;
   if (!bubble) return null;
   // Beside a Markdown Artifact's margin, the open thread's card is the margin's (MarginThreadCard).
@@ -140,8 +171,9 @@ export function MarginThreadCard({ bubble }: { bubble: Extract<Bubble, { kind: "
  * `keyboard`: the Popover takes the focus off that frame, on its own element (Base UI's: `role="dialog"`,
  * `tabIndex={-1}`, labelled by `label`). So that stays out of `inert` while armed: only what's in it is.
  */
-function BubbleShell({ rect, boundary, phone, armed, open, focus, thread = null, inline = false, padded = false, label, testId, onClose, onPress, keyboard = null, onEscaped = null, onKeyedOut = null, onFocusedIn, sheetInitialFocus, children }: {
+function BubbleShell({ rect, liveAnchor = null, boundary, phone, armed, open, focus, thread = null, inline = false, padded = false, label, testId, onClose, onPress, keyboard = null, onEscaped = null, onKeyedOut = null, onFocusedIn, sheetInitialFocus, children }: {
   rect: AnnotationRect | null;
+  liveAnchor?: LiveAnchorSpec | null;
   boundary: HTMLElement | null;
   phone: boolean;
   armed: boolean;
@@ -181,18 +213,20 @@ function BubbleShell({ rect, boundary, phone, armed, open, focus, thread = null,
   sheetInitialFocus?: () => HTMLElement | boolean;
   children: React.ReactNode;
 }) {
-  const anchor = useMemo(() => anchorAt(rect), [rect]);
+  const anchor = useMemo(() => anchorAt(rect, liveAnchor), [rect, liveAnchor]);
   // The frame this card took the focus off as it opened (`useDismissable`, below).
   const leftFrame = useRef<HTMLIFrameElement | null>(null);
   const inlineRef = useRef<HTMLDivElement | null>(null);
   // What Esc left to do once the card is gone (`onEscaped`).
   const afterEscape = useRef<(() => void) | null>(null);
   const [popup, setPopup] = useState<HTMLElement | null>(null);
+  // The document the card is drawn in: an object window's has its own focus (#337 PR3).
+  const doc = useOwnerDocument();
   // Esc, and Tab out past its end (`tabOut`). `from` is the key's own target: only the person, with the
   // focus really in the card, sends a key from there, and this window's `document.activeElement` can
   // still read the frame then (QA, Firefox). A key from elsewhere moves no keyboard into the page.
   const closeByKey = useCallback((from: EventTarget | null) => {
-    const inCard = from instanceof Node && (popup?.contains(from) ?? false);
+    const inCard = isNodeOf(from) && (popup?.contains(from) ?? false);
     const back = keyboard || inCard ? onEscaped : null;
     onClose();
     if (back) {
@@ -203,8 +237,8 @@ function BubbleShell({ rect, boundary, phone, armed, open, focus, thread = null,
     // Esc with the focus still where the opening left it: back in the frame, so the keyboard goes on
     // in the page (on the marker only if its document is still there: `backToMark`). Never off what
     // the person moved it to.
-    if (focusLost()) leftFrame.current?.focus({ preventScroll: true });
-  }, [onClose, onEscaped, onKeyedOut, keyboard, popup]);
+    if (focusLost(null, doc)) leftFrame.current?.focus({ preventScroll: true });
+  }, [onClose, onEscaped, onKeyedOut, keyboard, popup, doc]);
   // The card's own focus falls to the body as it goes; a microtask, after Base UI's cleanup in the commit.
   useEffect(() => () => {
     if (afterEscape.current) queueMicrotask(afterEscape.current);
@@ -240,8 +274,8 @@ function BubbleShell({ rect, boundary, phone, armed, open, focus, thread = null,
     if (!popup || !takeFrom || took.current === takeAt) return;
     took.current = takeAt;
     queueMicrotask(() => {
-      const active = document.activeElement;
-      if (popup.isConnected && (active === takeFrom || active === document.body)) focusField(popup);
+      const active = popup.ownerDocument.activeElement;
+      if (popup.isConnected && (active === takeFrom || active === popup.ownerDocument.body)) focusField(popup);
     });
   }, [popup, takeFrom, takeAt]);
   const tabOut = useCardTabOut(armed, closeByKey);
@@ -251,7 +285,7 @@ function BubbleShell({ rect, boundary, phone, armed, open, focus, thread = null,
   useLayoutEffect(() => {
     if (!inline || !focus) return;
     const card = inlineRef.current;
-    const first = card?.querySelector<HTMLElement>("button:not([disabled]), [href], textarea:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex='-1'])");
+    const first = card?.querySelector<HTMLElement>("button:not([disabled]), [href], textarea:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex='-1']):not([data-slot='scroll-area'])");
     (first ?? card?.querySelector<HTMLElement>("[tabindex='-1']"))?.focus({ preventScroll: true });
   }, [inline, focus]);
   const inlineKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
@@ -318,6 +352,7 @@ function BubbleShell({ rect, boundary, phone, armed, open, focus, thread = null,
 
 function ThreadBubble({ bubble, phone, boundary, inline = false }: { bubble: Extract<Bubble, { kind: "thread" }>; phone: boolean; boundary: HTMLElement | null; inline?: boolean }) {
   const { formatMessage } = useIntl();
+  const ownDoc = useOwnerDocument();
   const comments = useArtifactComments()!;
   const review = useArtifactReview();
   // Where the frame last moved it (`tracked`) since it was opened (a move older than the card's own
@@ -351,7 +386,7 @@ function ThreadBubble({ bubble, phone, boundary, inline = false }: { bubble: Ext
       return;
     }
     focusCard.current = "pending";
-    window.setTimeout(() => {
+    timersOf(ownDoc).setTimeout(() => {
       if (focusCard.current !== "pending") return;
       const card = cardRef.current;
       if (card?.isConnected) {
@@ -361,7 +396,7 @@ function ThreadBubble({ bubble, phone, boundary, inline = false }: { bubble: Ext
         focusCard.current = "afterRestore";
       }
     }, 0);
-  }, [phone]);
+  }, [phone, ownDoc]);
   const [deleteDraft, deleteDraftDialog] = useDeleteDraft({ onAsked: asked });
   // Opened with the focus in the frame (P134): the focus is never a phone's sheet's or the margin's
   // card's, where the frame has no markers. The hold is any card's the bubble came to, in whatever
@@ -398,7 +433,7 @@ function ThreadBubble({ bubble, phone, boundary, inline = false }: { bubble: Ext
   // has its marker there too; a card from Raft's own marker has Base UI give the focus back to it.
   const { marks, box: frameBox } = comments.frame;
   const marked = !phone && !inline && bubble.fromFrame && marks.some((mark) => mark.id === threadId);
-  const escaped = useMemo(() => (frame || marked ? () => backToMark(frame ?? frameBox?.current?.querySelector("iframe") ?? null, () => focusMark(threadId)) : null), [frame, marked, frameBox, focusMark, threadId]);
+  const escaped = useMemo(() => (frame || marked ? () => backToMark(frame ?? frameBox?.current?.querySelector("iframe") ?? null, () => focusMark(threadId), ownDoc) : null), [frame, marked, frameBox, focusMark, threadId, ownDoc]);
   const openInList = useCallback(() => openThreadInList(threadId), [openThreadInList, threadId]);
   // Not gone with the hold: a press on it lifts that, and it must still be there for the click.
   const tookFocus = keyboard !== null;
@@ -437,6 +472,7 @@ function ThreadBubble({ bubble, phone, boundary, inline = false }: { bubble: Ext
     <>
       <BubbleShell
         rect={moved?.rect ?? bubble.rect}
+        liveAnchor={moved ? moved.liveAnchor : bubble.liveAnchor}
         boundary={boundary}
         phone={phone}
         armed={armed}
@@ -501,35 +537,52 @@ function ThreadInBubble({ thread, editing, canReply, onEdit, onStopEditing, onDe
   // Resolved here (#249), its marker goes from the page, and the card beside it with it: the focus
   // goes on (focusAfterResolvedCard), never to the body.
   const comments = useArtifactComments();
+  const ownDoc = useOwnerDocument();
   const closeResolved = useCallback((threadId: ArtifactCommentId, resolved: boolean, wanted: () => boolean) => {
     // Its focus is focusAfterResolvedCard's, which moves it only where it went with the card (focusLost): the answer
     // isn't needed here, asked only so it stops watching.
     wanted();
     if (!resolved || !comments) return;
-    focusAfterResolvedCard(comments, threadId);
+    focusAfterResolvedCard(comments, threadId, ownDoc);
     comments.closeBubble();
-  }, [comments]);
+  }, [comments, ownDoc]);
   const resolution = useThreadResolution(thread, closeResolved);
   return (
     // Focusable (not in the Tab order): where focus goes when a reply draft in it is deleted.
-    <CommentCard ref={cardRef} active tabIndex={-1} className={inMargin ? "outline-none" : "border-0 shadow-none outline-none"} data-testid="artifact-comment-bubble-card" data-thread-id={thread.id}>
+    // Never taller than the room it has (#triage:#531: a long thread ran past the window, its last
+    // replies and reply box cut off): in the margin the margin's room (ArtifactMarkdownMargin), in a
+    // Popover the room Base UI says it has; on a phone neither is set and the sheet scrolls it.
+    <CommentCard
+      ref={cardRef}
+      active
+      tabIndex={-1}
+      className={cn("outline-none", inMargin ? "max-h-(--artifact-margin-card-room)" : "max-h-(--available-height) border-0 shadow-none")}
+      data-testid="artifact-comment-bubble-card"
+      data-thread-id={thread.id}
+    >
       {anchor ? (
         <CommentCardMeta data-found={found ? "true" : "false"}>
           {found ? null : <MapPinOff aria-hidden />}
           <span className="min-w-0 truncate"><AnchorMeta anchor={anchor} found={found} /></span>
         </CommentCardMeta>
       ) : null}
-      {thread.root ? (
-        <CommentItem comment={thread.root} editing={editing === thread.root.id} onEdit={onEdit} onStopEditing={onStopEditing} onDelete={onDelete} listWay={thread.root.id === topId ? listWay : null} inCard />
-      ) : (
-        <p className="text-callout text-foreground-hint italic">{formatMessage({ id: "artifacts.comments.replyToEarlier" })}</p>
-      )}
-      {thread.replies.map((reply) => (
-        <CommentItem key={reply.id} comment={reply} editing={editing === reply.id} onEdit={onEdit} onStopEditing={onStopEditing} onDelete={onDelete} listWay={reply.id === topId ? listWay : null} inCard />
-      ))}
-      {pending.map((draft) => <PendingReplyDraft key={draft.id} draft={draft} thread={thread} onDelete={onDeleteDraft} />)}
-      {resolution.resolved ? <ResolvedBy root={thread.root!} /> : null}
-      {resolution.may ? <div><ResolveButton resolution={resolution} /></div> : null}
+      {/* The thread scrolls between its passage and the reply box, which stay in view; out to the
+          card's edge (its 12px padding) with the content inset by the scrollbar's 16px strip, so the
+          scrollbar is clear of the comments' ⋯ (raft-ui ScrollArea, inline-end controls); pb-2 holds the last control's extended hit
+          area (Resolve's ::after) so a short thread doesn't overflow and scroll by a few pixels. Its height is the card's share. */}
+      <ScrollArea className="-me-3 min-h-0" contentClassName="flex flex-col gap-2 pe-4 pb-2" data-testid="artifact-comment-bubble-thread">
+        {thread.root ? (
+          <CommentItem comment={thread.root} editing={editing === thread.root.id} onEdit={onEdit} onStopEditing={onStopEditing} onDelete={onDelete} listWay={thread.root.id === topId ? listWay : null} inCard />
+        ) : (
+          <p className="text-callout text-foreground-hint italic">{formatMessage({ id: "artifacts.comments.replyToEarlier" })}</p>
+        )}
+        {thread.replies.map((reply) => (
+          <CommentItem key={reply.id} comment={reply} editing={editing === reply.id} onEdit={onEdit} onStopEditing={onStopEditing} onDelete={onDelete} listWay={reply.id === topId ? listWay : null} inCard />
+        ))}
+        {pending.map((draft) => <PendingReplyDraft key={draft.id} draft={draft} thread={thread} onDelete={onDeleteDraft} />)}
+        {resolution.resolved ? <ResolvedBy root={thread.root!} /> : null}
+        {resolution.may ? <div><ResolveButton resolution={resolution} /></div> : null}
+      </ScrollArea>
       {/* Empty, and never focused for the person: they click into it themselves (co-design S2). */}
       {canReply ? <ArtifactCommentBox key={draftOption ? "drafts" : "post"} mode={replyMode} draftOption={draftOption} inCard /> : null}
     </CommentCard>
@@ -555,7 +608,7 @@ function ComposeBubble({ bubble, phone, boundary }: { bubble: Extract<Bubble, { 
   }, [addDraftAt, bubble.target, closeBubble]);
   const draftOption = useDraftOption(addDraftAt ? saveHere : null);
   // Sent, this card gives way to the comment's own (or to the list): `revealSent` closes it, not `onDone`.
-  const sentFrom = useMemo(() => ({ rect: bubble.rect, bubbleKey: bubble.key }), [bubble.rect, bubble.key]);
+  const sentFrom = useMemo(() => ({ rect: bubble.rect, liveAnchor: bubble.liveAnchor ?? null, bubbleKey: bubble.key }), [bubble.rect, bubble.liveAnchor, bubble.key]);
   const place = bubble.target.scope === "file" ? bubble.target.anchor : null;
   const autoFocusKey = fromPage || bubble.restored ? null : bubble.key;
   const boxProps = useMemo(() => ({ mode, draftOption, pageOpen, autoFocusKey, revealSent: sentFrom }), [mode, draftOption, pageOpen, autoFocusKey, sentFrom]);
@@ -564,15 +617,17 @@ function ComposeBubble({ bubble, phone, boundary }: { bubble: Extract<Bubble, { 
   // the card. And a selection's Comment goes as the box takes the focus where the document has one
   // selection (Chromium, Safari). So: that element if it is still there, else the Artifact's surface,
   // never the body. On Firefox a return into the frame during the key is refused: the surface too.
-  const [opener] = useState(() => document.activeElement);
+  const ownDoc = useOwnerDocument();
+  const [opener] = useState(() => ownDoc.activeElement);
   const keyedOut = useCallback(() => {
-    if (!focusLost()) return;
+    if (!focusLost(null, ownDoc)) return;
     if (opener && canTakeFocus(opener)) opener.focus({ preventScroll: true });
-    if (focusLost()) focusArtifactSurface();
-  }, [opener]);
+    if (focusLost(null, ownDoc)) focusArtifactSurface(ownDoc);
+  }, [opener, ownDoc]);
   return (
     <BubbleShell
       rect={bubble.rect}
+      liveAnchor={bubble.liveAnchor}
       boundary={boundary}
       phone={phone}
       armed={armed}

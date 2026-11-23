@@ -13,6 +13,9 @@ import {
   type WorkflowTemplateStep,
 } from "../db/schema";
 import { enrichSingleLegacyTask, reserveTaskNumbers } from "./taskService";
+import { lockAndResolveMessageStorage } from "./channelService";
+import { assertChannelWritableInTransaction } from "./channelConversionFenceService";
+import { recordMessageReferences } from "./messageReferences";
 
 type ActorType = "user" | "agent";
 
@@ -70,14 +73,22 @@ async function createWorkflowTask(
     ))
     .for("update");
   if (!channel) throw new WorkflowConflictError("workflow channel is unavailable");
+  // Where the host message and task are stored, resolved under the row lock
+  // above (lockAndResolveMessageStorage; its KEY SHARE waits on nothing here).
+  const storageChannelId = await lockAndResolveMessageStorage(tx, channelId);
+  if (storageChannelId !== channelId) {
+    // A joint face stores in its canonical channel: number its task there,
+    // under that row's lock, as createTasks does.
+    await tx.select({ id: channels.id }).from(channels).where(eq(channels.id, storageChannelId)).for("no key update");
+  }
 
   // Under the channel row lock above; never reuses a number (RFC 078).
-  const taskNumber = await reserveTaskNumbers(tx, channelId);
+  const taskNumber = await reserveTaskNumbers(tx, storageChannelId);
 
   const [hostMessage] = await tx
     .insert(messages)
     .values({
-      channelId,
+      channelId: storageChannelId,
       senderType: actorType,
       senderId: actorId,
       messageType: "chat",
@@ -88,7 +99,7 @@ async function createWorkflowTask(
   const [task] = await tx
     .insert(tasks)
     .values({
-      channelId,
+      channelId: storageChannelId,
       taskNumber,
       title: step.title,
       description: step.description ?? null,
@@ -118,6 +129,9 @@ async function createWorkflowTask(
 
 async function recordWorkflowTaskInbox(hostMessages: (typeof messages.$inferSelect)[]) {
   if (hostMessages.length === 0) return;
+  // A step title's links to first-party objects (#proj-workspace:#336): after
+  // the commit, never awaited; nothing for text without an address on Raft's hosts.
+  for (const message of hostMessages) recordMessageReferences({ messageId: message.id, content: message.content, previousContent: null });
   const { recordInboxFactsForPersistedMessages } = await import("./messageService");
   await recordInboxFactsForPersistedMessages(hostMessages, {
     inboxFactPolicy: {
@@ -137,6 +151,9 @@ export async function startWorkflowInstance(
 ) {
   const hostMessages: (typeof messages.$inferSelect)[] = [];
   const result = await getDb().transaction(async (tx) => {
+    // The conversion fence first, before any row lock: conversion takes the
+    // exclusive form of the same advisory lock before the channel row.
+    await assertChannelWritableInTransaction(tx, input.channelId);
     const [template] = await tx
       .select()
       .from(workflowTemplates)
@@ -201,6 +218,14 @@ export async function completeCurrentWorkflowStep(
   const hostMessages: (typeof messages.$inferSelect)[] = [];
 
   const result = await getDb().transaction(async (tx) => {
+    // The conversion fence first, before the instance/step/task row locks
+    // below (a fence after them could wait on a conversion that waits on
+    // them). The instance's channel never changes, so it is read unlocked.
+    const [fenceTarget] = await tx
+      .select({ channelId: workflowInstances.channelId })
+      .from(workflowInstances)
+      .where(and(eq(workflowInstances.id, instanceId), eq(workflowInstances.serverId, serverId)));
+    if (fenceTarget) await assertChannelWritableInTransaction(tx, fenceTarget.channelId);
     const [instance] = await tx
       .select()
       .from(workflowInstances)

@@ -91,6 +91,9 @@ test("the fork resumes a copy, reads only inside the workspace and carries the a
   const args = claudeSideQuestionArgs({ sessionId: "sid-1", model: "opus", standingPromptFilePath: "/state/prompt.txt" });
   assert.deepEqual(args.slice(0, 5), ["-p", "--resume", "sid-1", "--fork-session", "--no-session-persistence"]);
   assert.equal(args[args.indexOf("--tools") + 1], "Read,Grep,Glob");
+  assert.equal(args[args.indexOf("--settings") + 1], "{\"disableAllHooks\":true}");
+  assert.ok(args.includes("--strict-mcp-config"));
+  assert.equal(args[args.indexOf("--mcp-config") + 1], "{\"mcpServers\":{}}");
   assert.equal(args[args.indexOf("--permission-mode") + 1], "dontAsk");
   assert.deepEqual(args.slice(args.indexOf("--allowedTools") + 1, args.indexOf("--allowedTools") + 4), [...SIDE_ASK_FORK_ALLOWED_TOOLS]);
   assert.deepEqual([...SIDE_ASK_FORK_ALLOWED_TOOLS], ["Read(./**)", "Grep(./**)", "Glob(./**)"]);
@@ -98,6 +101,24 @@ test("the fork resumes a copy, reads only inside the workspace and carries the a
   // The variadic --allowedTools is followed by another flag, never by a positional prompt (the prompt goes on stdin).
   assert.ok(args[args.indexOf("--allowedTools") + 4]?.startsWith("--"));
   assert.ok(!args.includes("--dangerously-skip-permissions") && !args.includes("bypassPermissions"));
+  assert.ok(!args.includes("--setting-sources"));
+
+  // Custom-provider + default model: excludes user settings and omits --model so provider default applies.
+  const customArgs = claudeSideQuestionArgs({ sessionId: "sid-2", model: null, standingPromptFilePath: "/state/prompt.txt", customProvider: true });
+  assert.ok(!customArgs.includes("--model"));
+  assert.equal(customArgs[customArgs.indexOf("--setting-sources") + 1], "project,local");
+});
+
+test("status text masks secret-shaped tokens in notes and todos", () => {
+  const text = sideAskStatusText({
+    activityKind: "online",
+    detail: "Idle",
+    todos: { at: null, total: 1, open: [{ text: "Rotate sk-ant-api03-secretvalue1234567890", status: "pending" }] },
+    lastNote: { at: null, text: "Checked Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig" },
+    nowMs: 1_000,
+  });
+  assert.doesNotMatch(text, /sk-ant-api03-secretvalue/);
+  assert.doesNotMatch(text, /eyJhbGciOiJIUzI1NiJ9/);
 });
 
 test("the fork's env carries nothing of a Raft launch", () => {

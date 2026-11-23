@@ -1,7 +1,6 @@
-import HowLinksOpenSetting from "../../../components/deeplinks/HowLinksOpenSetting";
 import { HowWebLinksOpenSetting } from "../../webPreview/HowWebLinksOpenSetting";
 import { Card, Switch, ListRowGroup, ListRow, ListRowBody, ListRowTitle } from "@botiverse/raft-ui";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { Type } from "lucide-react";
 import { useServerStore } from "../../../store/serverStore";
 import { useIntl } from "react-intl";
@@ -81,6 +80,8 @@ export function AppearanceSection({ publicSurface = false }: { publicSurface?: b
   const setShowSenderDescription = useAppearanceStore((s) => s.setShowSenderDescription);
   const hideEmptySidebarSections = useAppearanceStore((s) => s.hideEmptySidebarSections);
   const setHideEmptySidebarSections = useAppearanceStore((s) => s.setHideEmptySidebarSections);
+  // The sample message's time: when this section opened, read once.
+  const [previewCreatedAt] = useState(() => new Date().toISOString());
   const previewMessage = useMemo<Message>(() => ({
     id: "appearance-preview-message",
     channelId: APPEARANCE_PREVIEW_CHANNEL.id,
@@ -89,10 +90,10 @@ export function AppearanceSection({ publicSurface = false }: { publicSurface?: b
     senderName: APPEARANCE_PREVIEW_AGENT.displayName ?? APPEARANCE_PREVIEW_AGENT.name,
     messageType: "chat",
     content: formatMessage({ id: "settings.appearance.fontPreviewSample" }),
-    createdAt: new Date().toISOString(),
+    createdAt: previewCreatedAt,
     attachments: [],
     reactions: [],
-  }), [formatMessage]);
+  }), [formatMessage, previewCreatedAt]);
 
   return (
     <div className="mb-6">
@@ -207,7 +208,6 @@ export function AppearanceSection({ publicSurface = false }: { publicSurface?: b
               aria-labelledby="hide-empty-sidebar-sections-setting-label"
             />
           </ListRow>
-          <HowLinksOpenSetting />
           <HowWebLinksOpenSetting />
         </ListRowGroup>
         <p className="px-4 text-footnote text-foreground-hint" data-testid="appearance-saved-on-device">

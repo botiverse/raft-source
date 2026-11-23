@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { ArrowUpRight, Clock, Download, FileX, LogIn, RefreshCw, ShieldOff } from "lucide-react";
-import { Button } from "@botiverse/raft-ui";
+import { Button, useToast } from "@botiverse/raft-ui";
 import { compile, defineDisplays, frameFallback, LIBRARY_CDNS } from "@botiverse/porthole";
 import type { AnnotationReport, CapabilityHandlers, ConfirmRequest, FrameLocation, FrameOutcome, InstanceRef, PortholeConfig, ViewerInfo } from "@botiverse/porthole";
 import { PortholeFrame, PortholeProvider } from "@botiverse/porthole/react";
@@ -13,7 +13,7 @@ import type { ArtifactFile, ArtifactFramedKind, ArtifactId, ArtifactWebErrorCode
 
 import { useMergedRef } from "../../components/layout/appPanelHead";
 import { FRAME_MOVED_ATTRIBUTE, FRAME_MOVED_EVENT } from "../../components/ui/moveNode";
-import { showToast } from "../../components/toastBridge";
+import { docOf, isElementNode, useOwnerWindow } from "../../utils/ownerDocument";
 import { useOptionalAppTheme } from "../../hooks/useAppTheme";
 import { copyTextToClipboard } from "../../utils/selectMarkdown";
 import { trackArtifactFrameLoaded } from "./artifactAnalytics";
@@ -27,6 +27,7 @@ import { useArtifactPageForkAsk } from "./useArtifactPageForkAsk";
 import { ArtifactLoadingSplash } from "./ArtifactLoadingSplash";
 import { useArtifactSplashStart } from "./artifactSplash";
 import { ArtifactPageErrorNotice } from "./ArtifactPageError";
+import { pageErrorsAreTheAgents } from "./artifactPageErrorRules";
 import { useArtifactPageErrors } from "./useArtifactPageErrors";
 import { useArtifactPageTheme } from "./useArtifactPageTheme";
 import { useArtifactReview } from "./ArtifactReviewContext";
@@ -40,6 +41,9 @@ import { ArtifactFrameConfirm } from "./ArtifactFrameConfirm";
 import { FrameState } from "./ArtifactFrameState";
 import { artifactOpenLabelId, openArtifactWindow } from "./artifactWindow";
 import { sameMarkAgain } from "./useArtifactDismiss";
+import { signedInArtifactLinks, useArtifactLinkLabels } from "./useArtifactLinkLabels";
+import type { ArtifactLinksLoader } from "./useArtifactLinkLabels";
+import { POLITE_ERROR } from "./artifactToasts";
 
 /**
  * A framed version (html, markdown, pdf) on the content origin (S2), through
@@ -138,6 +142,9 @@ import { sameMarkAgain } from "./useArtifactDismiss";
  *   and the content error Porthole sends with it never reaches the error strip (the link worked);
  *   anything else stays stopped, unanswered, its error on the strip as before. No `onOpenFile`
  *   (the public page): nothing.
+ * - Links to other Artifacts (`linkLabels`, P151; #proj-workspace:#336): a bare link shows its target's
+ *   live title, or "Deleted" / "No access", as the links route says for this reader (useArtifactLinkLabels).
+ *   Opening one is as before (`openLink`); the Markdown page draws them as chips (content Worker markdown.ts).
  */
 
 /**
@@ -161,7 +168,8 @@ export const RAFT_ARTIFACT_DISPLAYS = defineDisplays({
       // `comments` and `openLink` on Porthole's defaults: no proof of a click since 0.16.0 (its
       // P149; the check refused real presses, #proj-workspace:#271). artifactPageOpenGate holds
       // what it guarded.
-      capabilities: { annotate: {}, comments: {}, copyText: {}, find: {}, openLink: {} },
+      // `linkLabels` (P151): the host's titles for the page's bare links to other Artifacts.
+      capabilities: { annotate: {}, comments: {}, copyText: {}, find: {}, linkLabels: {}, openLink: {} },
       layout: { kind: "fill" },
       errors: "host",
       // The Markdown page's colours; the frame sends live values only to that page.
@@ -321,6 +329,8 @@ interface ArtifactFrameProps {
   files?: readonly ArtifactFile[];
   /** Show that file (the surface's Files panel, at its row); absent, such a link does nothing. */
   onOpenFile?: (path: string) => void;
+  /** The version's links to other Artifacts, for their titles: the signed-in route when absent; the public page's own. */
+  links?: ArtifactLinksLoader;
 }
 
 // The first frame of a version just opened takes the ticket its viewer answer carried; every other load asks the route.
@@ -329,11 +339,14 @@ const signedInFrame = (id: ArtifactId, version: number): Promise<ArtifactWebFram
   return ticket ? Promise.resolve(ticket) : artifactSource().frame(id, { version });
 };
 
-export default function ArtifactFrame({ id, version, kind, title, pageUrl, onDownload, locate = signedInFrame, analytics = true, onOpenInRaft, files, onOpenFile }: ArtifactFrameProps) {
+export default function ArtifactFrame({ id, version, kind, title, pageUrl, onDownload, locate = signedInFrame, analytics = true, onOpenInRaft, files, onOpenFile, links = signedInArtifactLinks }: ArtifactFrameProps) {
   const { formatMessage } = useIntl();
+  const toast = useToast();
+  const ownerWindow = useOwnerWindow();
   const theme = useOptionalAppTheme();
   const scheme = theme?.resolvedMode === "dark" ? "dark" : "light";
   const pageTheme = useArtifactPageTheme(kind === "markdown");
+  const linkLabels = useArtifactLinkLabels(id, version, kind === "pdf" ? null : links);
   // A retry asks the route again and makes a new frame.
   const [attempt, setAttempt] = useState(0);
   // What this attempt came to; locating until it answers.
@@ -450,17 +463,18 @@ export default function ArtifactFrame({ id, version, kind, title, pageUrl, onDow
       const rect = box ? { x: box.left, y: box.top, width: box.width, height: box.height } : null;
       return checked !== null && openFromPage !== undefined && openFromPage(checked, rect);
     },
+    // The frame's own window's clipboard and toasts (an object window's, #337 PR3: the main window's has no focus there).
     copyText: async ({ text }) => {
       try {
-        await copyTextToClipboard(text);
-        showToast({ title: formatMessage({ id: "artifacts.frame.copied" }) });
+        await copyTextToClipboard(text, undefined, { view: ownerWindow });
+        toast.info(formatMessage({ id: "artifacts.frame.copied" }));
         return true;
       } catch {
-        showToast({ title: formatMessage({ id: "artifacts.frame.copyFailed" }), type: "error" });
+        toast.error(formatMessage({ id: "artifacts.frame.copyFailed" }), POLITE_ERROR);
         return false;
       }
     },
-  }), [formatMessage, openFromPage, frameBox, forkOffered, askFork]);
+  }), [formatMessage, openFromPage, frameBox, forkOffered, askFork, ownerWindow, toast]);
 
   // The page's word (artifactBlockedFile): a file of this version, never an address to go to.
   // Opened, the link worked: the content error Porthole sends with the notice, at once after it in
@@ -479,8 +493,9 @@ export default function ArtifactFrame({ id, version, kind, title, pageUrl, onDow
     const answered = answeredBlock.current;
     answeredBlock.current = null;
     if (answered !== null && blockedNoticeNames(message, answered)) return;
+    if (!pageErrorsAreTheAgents(kind)) return;
     pageError(message);
-  }, [pageError]);
+  }, [pageError, kind]);
 
   const onOutcome = useCallback((outcome: FrameOutcome) => {
     const fallback = frameFallback(outcome);
@@ -524,9 +539,9 @@ export default function ArtifactFrame({ id, version, kind, title, pageUrl, onDow
   const layerAnnotation = layer?.onAnnotation;
   const onAnnotation = useCallback((report: AnnotationReport) => {
     const box = frameBox?.getBoundingClientRect();
-    // Read now, as the report arrives, on this page, where the page can't change the answer (P134).
-    const active = document.activeElement;
-    const focused = report.type === "activated" && active instanceof HTMLIFrameElement && frameBox?.contains(active) ? active : null;
+    // Read now, on this page, where the page can't change the answer (P134): the frame's own document's (#337 PR3).
+    const active = docOf(frameBox).activeElement;
+    const focused = report.type === "activated" && isElementNode(active) && active.localName === "iframe" && frameBox?.contains(active) ? active as HTMLIFrameElement : null;
     // The marker of the card this same press just closed (heard first as a press in the page): it stays closed.
     if (report.type === "activated" && sameMarkAgain(report.id)) return;
     layerAnnotation?.(report, box ? { left: box.left, top: box.top, width: box.width, height: box.height, focused } : null);
@@ -629,6 +644,7 @@ export default function ArtifactFrame({ id, version, kind, title, pageUrl, onDow
                 ref={handleRef}
                 onAnnotation={onAnnotation}
                 onContentError={onContentError}
+                linkLabels={linkLabels}
                 {...findProps}
                 className="min-h-0 flex-1"
                 style={FILL}
@@ -660,6 +676,7 @@ export default function ArtifactFrame({ id, version, kind, title, pageUrl, onDow
             // Here too (the public page, a reader with no comments): refused once, the frame would
             // keep a focus Porthole never saw the person move, and refuse every later press.
             ref={handleRef}
+            linkLabels={linkLabels}
             {...findProps}
             className="min-h-0 flex-1"
             style={FILL}

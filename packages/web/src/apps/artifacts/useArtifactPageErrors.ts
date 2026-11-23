@@ -3,11 +3,14 @@ import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
 import type { ArtifactId } from "@botiverse/raft-shared";
 
-import { showToast } from "../../components/toastBridge";
+import { useToast } from "@botiverse/raft-ui";
+import { useOwnerWindow } from "../../utils/ownerDocument";
 import { commentAnchorOf, eventServer, trackArtifactCommentPosted } from "./artifactAnalytics";
 import { useArtifactComments } from "./ArtifactCommentsContext";
 import { useArtifactReview } from "./ArtifactReviewContext";
 import { artifactSource } from "./artifactSource";
+import { isBenignPageError } from "./artifactPageErrorRules";
+import { POLITE_ERROR } from "./artifactToasts";
 
 /**
  * "This page hit an error" (#proj-workspace:#131; xxchan asked, Tenny set the bounds): the framed
@@ -96,6 +99,9 @@ export interface ArtifactPageErrors {
  */
 export function useArtifactPageErrors(id: ArtifactId, version: number, frameWidth: () => number | null): ArtifactPageErrors {
   const { formatMessage } = useIntl();
+  // The window the page is drawn in (an object window's own, #337 PR3): its width and its toasts.
+  const toast = useToast();
+  const ownerWindow = useOwnerWindow();
   const comments = useArtifactComments();
   const review = useArtifactReview();
   const [messages, setMessages] = useState<readonly string[]>([]);
@@ -119,7 +125,7 @@ export function useArtifactPageErrors(id: ArtifactId, version: number, frameWidt
 
   const onContentError = useCallback((raw: string) => {
     const message = raw.trim();
-    if (message === "" || isAnswered(message)) return;
+    if (message === "" || isBenignPageError(message) || isAnswered(message)) return;
     setMessages((current) => (current.includes(message) || current.length >= MAX_MESSAGES ? current : [...current, message]));
   }, [isAnswered]);
 
@@ -133,7 +139,7 @@ export function useArtifactPageErrors(id: ArtifactId, version: number, frameWidt
     if (!comments || sendingRef.current || shown.length === 0) return;
     const sent = [...shown];
     const measured = frameWidth();
-    const width = Math.round(measured && measured > 0 ? measured : window.innerWidth);
+    const width = Math.round(measured && measured > 0 ? measured : ownerWindow.innerWidth);
     const text = pageErrorCommentText(formatMessage, { version, width, messages: sent });
     const target = { scope: "artifact" } as const;
     sendingRef.current = true;
@@ -144,12 +150,12 @@ export function useArtifactPageErrors(id: ArtifactId, version: number, frameWidt
       comments.added(created.comment);
       answer(sent);
     }, () => {
-      showToast({ title: formatMessage({ id: "artifacts.comments.errorFailed" }), type: "error" });
+      toast.error(formatMessage({ id: "artifacts.comments.errorFailed" }), POLITE_ERROR);
     }).finally(() => {
       sendingRef.current = false;
       setSending(false);
     });
-  }, [comments, shown, frameWidth, formatMessage, version, id, answer]);
+  }, [comments, shown, frameWidth, formatMessage, version, id, answer, toast, ownerWindow]);
 
   const dismiss = useCallback(() => answer(shown), [answer, shown]);
 

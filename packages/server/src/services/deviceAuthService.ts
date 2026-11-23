@@ -27,9 +27,9 @@
 import { enforceAgentCredentialMintRate } from "./agentCredentialMintLimits";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import argon2 from "argon2";
-import { and, eq, gt, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
+import { and, eq, gt, isNotNull, isNull, lt, or, sql, type SQL } from "drizzle-orm";
 import { getDb, type DatabaseExecutor } from "../db/index";
-import { deviceAuthorizationRevokeTokens, deviceAuthorizations, deviceLoginGrants, integrationAuditEvents, users, type DeviceLoginGrantKind, type DeviceLoginRevokeReason, type SessionScope, type RequestSessionScope } from "../db/schema";
+import { deviceAuthorizationRevokeTokens, deviceAuthorizations, deviceLoginGrants, integrationAuditEvents, users, type DeviceAuthorizationMode, type DeviceLoginGrantKind, type DeviceLoginRevokeReason, type SessionScope, type RequestSessionScope } from "../db/schema";
 import type { DeviceLoginGrantRequest } from "./deviceLoginGrantService";
 import { attachableServer, keyableAgent } from "./deviceLoginGrantChoices";
 import { addTraceEvent } from "../tracing/semanticTrace";
@@ -41,6 +41,7 @@ import { proofForDeviceLogin } from "./sessionIssueGate";
 import { closeDeviceSessionKeys, deviceSessionKeyReach, revokeKeysOfRevokedDeviceSessions } from "./deviceSessionKeys";
 import { approvedGrantReach } from "./approverSessionGrants";
 import { runSecurityRevokeCascade } from "./securityRevokeCascade";
+import { hashOneTimeCode, isLoopbackReturnUri, isPkceChallenge, loopbackCallbackUrl, pkceVerifierMatches } from "./loopbackRedirect";
 
 // Raw device_code entropy (base64url). user_code is a short human-typed
 // code; device_code is the long secret polled by the client.
@@ -51,6 +52,14 @@ const DEFAULT_POLL_INTERVAL_SECONDS = 5;
 /** How long an approved one-time grant may be used (device-auth design v2 §3.1). */
 export const DEVICE_LOGIN_GRANT_TTL_MS = 10 * 60_000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Loopback: the approval link's request id (32 random bytes, base64url, 43
+// chars) and how long the one-time code approve puts in the redirect stays
+// redeemable (as app login's, appLoginService.ts).
+const LOOPBACK_REQUEST_ID_BYTES = 32;
+const LOOPBACK_REQUEST_ID_RE = /^[A-Za-z0-9_-]{43}$/;
+export const LOOPBACK_CALLBACK_CODE_TTL_MS = 2 * 60_000;
+const LOOPBACK_CALLBACK_CODE_BYTES = 32;
+const LOOPBACK_CALLBACK_CODE_MAX_LENGTH = 256;
 
 // Gate — default-on. Operators flip SLOCK_DEVICE_LOGIN_ENABLED to an
 // explicit false/0/no/off to kill-switch the surface (emergency only).
@@ -133,6 +142,10 @@ function approvalTicketMatches(grantId: string, userId: string, ticket: unknown)
 }
 
 export interface CreateDeviceAuthorizationResult {
+  /** The row's id (never shown to the client): what a computer pairing links. */
+  authorizationId: string;
+  /** The one-time grant it asks for, or null for a device session. */
+  grant: { id: string; kind: DeviceLoginGrantKind } | null;
   deviceCode: string; // raw — returned once, client polls with it
   userCode: string; // human enters this at the approve UI
   expiresInSeconds: number;
@@ -148,42 +161,118 @@ export interface DeviceAuthorizationRequester {
   location: string | null;
 }
 
-/** authorize phase — unauthenticated public (caller must gate-check first). */
-export async function createDeviceAuthorization(
-  input: {
-    clientName?: string | null;
-    ttlMs?: number;
-    requester?: DeviceAuthorizationRequester;
-    /** A one-time grant instead of a session (deviceLoginGrantService); absent → a device session, as before. */
-    grant?: DeviceLoginGrantRequest | null;
-    /** Kept on the grant when there is one, otherwise on the authorization. */
-    requesterUserAgent?: string | null;
-  } = {},
-): Promise<CreateDeviceAuthorizationResult> {
-  const db = getDb();
-  const deviceCode = `dvc_${randomBytes(DEVICE_CODE_BYTES).toString("base64url")}`;
-  const userCode = humanUserCode();
-  const ttlMs = input.ttlMs ?? DEFAULT_DEVICE_CODE_TTL_MS;
-  const expiresAt = new Date(Date.now() + ttlMs);
+/** A loopback request (RFC 8252): where approve sends the browser, and the PKCE S256 challenge. */
+export interface DeviceLoopbackRequest {
+  returnUri: string;
+  codeChallenge: string;
+}
 
-  const deviceCodeHash = await argon2.hash(deviceCode);
+/**
+ * The client's `state`, carried in the return URI's own query and echoed back
+ * untouched: `?state=` with 16–128 base64url characters, nothing else.
+ */
+const LOOPBACK_STATE_QUERY = /^state=[A-Za-z0-9_-]{16,128}$/;
+
+/**
+ * A loopback device login's return URI: app login's loopback rule
+ * (`http://127.0.0.1|[::1]:<port>/callback`, loopbackRedirect.ts) for
+ * everything before the query, and at most a `state` in the query.
+ */
+export function isDeviceLoopbackReturnUri(uri: string): boolean {
+  const queryAt = uri.indexOf("?");
+  if (queryAt === -1) return isLoopbackReturnUri(uri);
+  if (!isLoopbackReturnUri(uri.slice(0, queryAt)) || !LOOPBACK_STATE_QUERY.test(uri.slice(queryAt + 1))) return false;
+  try {
+    return new URL(uri).href === uri;
+  } catch {
+    return false;
+  }
+}
+
+export type ParseDeviceLoopbackResult =
+  | { ok: true; loopback: DeviceLoopbackRequest }
+  | { ok: false; code: "loopback_invalid" | "return_uri_not_allowed" | "code_challenge_invalid" | "code_challenge_method_unsupported"; error: string };
+
+/** authorize's optional `loopback` object: `{returnUri, codeChallenge, codeChallengeMethod: "S256"}`. */
+export function parseDeviceLoopbackRequest(raw: unknown): ParseDeviceLoopbackResult {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return { ok: false, code: "loopback_invalid", error: "The loopback field must be an object with returnUri, codeChallenge and codeChallengeMethod." };
+  }
+  const { returnUri, codeChallenge, codeChallengeMethod } = raw as Record<string, unknown>;
+  if (typeof returnUri !== "string" || returnUri.length > 512 || !isDeviceLoopbackReturnUri(returnUri)) {
+    return { ok: false, code: "return_uri_not_allowed", error: "The loopback returnUri must be http://127.0.0.1:<port>/callback or http://[::1]:<port>/callback, optionally with a state." };
+  }
+  if (codeChallengeMethod !== "S256") {
+    return { ok: false, code: "code_challenge_method_unsupported", error: "The loopback codeChallengeMethod must be S256." };
+  }
+  if (!isPkceChallenge(codeChallenge)) {
+    return { ok: false, code: "code_challenge_invalid", error: "The loopback codeChallenge must be a base64url S256 challenge." };
+  }
+  return { ok: true, loopback: { returnUri, codeChallenge } };
+}
+
+type CreateDeviceAuthorizationInput = {
+  clientName?: string | null;
+  ttlMs?: number;
+  requester?: DeviceAuthorizationRequester;
+  /** A one-time grant instead of a session (deviceLoginGrantService); absent → a device session, as before. */
+  grant?: DeviceLoginGrantRequest | null;
+  /** Kept on the grant when there is one, otherwise on the authorization. */
+  requesterUserAgent?: string | null;
+  /** Why the client fell back from loopback to this device code (parseLoginFallbackReason); audit only. */
+  loginFallbackReason?: string | null;
+};
+
+const LOGIN_FALLBACK_REASON = /^[a-z_]{1,64}$/;
+
+/**
+ * The authorize body's optional `loginFallbackReason` (a Computer's
+ * LoginModeFallbackReason), or null for anything that does not look like one.
+ * Never a reason to refuse the login: an older or newer client must not be
+ * locked out by an audit field.
+ */
+export function parseLoginFallbackReason(raw: unknown): string | null {
+  return typeof raw === "string" && LOGIN_FALLBACK_REASON.test(raw) ? raw : null;
+}
+
+/**
+ * The authorization row and its grant, in one transaction: what device and
+ * loopback mode share (only how the row is found and completed differs).
+ */
+async function insertDeviceAuthorization(
+  input: CreateDeviceAuthorizationInput,
+  completion:
+    | { mode: "device"; deviceCodeLookupHash: Buffer; deviceCodeHash: string; userCode: string }
+    | { mode: "loopback"; requestId: string; returnUri: string; codeChallenge: string },
+  expiresAt: Date,
+): Promise<{ authorizationId: string; grant: { id: string; kind: DeviceLoginGrantKind } | null }> {
   const grant = input.grant ?? null;
   const requesterUserAgent = input.requesterUserAgent ? input.requesterUserAgent.slice(0, 512) : null;
-  const createdGrantId = await db.transaction(async (tx): Promise<string | null> => {
+  const created = await getDb().transaction(async (tx): Promise<{ authorizationId: string; grantId: string | null }> => {
     const [row] = await tx.insert(deviceAuthorizations).values({
-      deviceCodeLookupHash: computeTokenLookupHash(deviceCode),
-      deviceCodeHash,
-      userCode,
+      ...(completion.mode === "device"
+        ? {
+            deviceCodeLookupHash: completion.deviceCodeLookupHash,
+            deviceCodeHash: completion.deviceCodeHash,
+            userCode: completion.userCode,
+          }
+        : {
+            mode: "loopback" as const,
+            requestId: completion.requestId,
+            returnUri: completion.returnUri,
+            codeChallenge: completion.codeChallenge,
+          }),
       status: "pending",
       clientName: sanitizeClientName(input.clientName),
+      loginFallbackReason: input.loginFallbackReason ?? null,
       expiresAt,
       pollIntervalSeconds: DEFAULT_POLL_INTERVAL_SECONDS,
       requestedIp: input.requester?.ip ?? null,
       requestedLocation: input.requester?.location ?? null,
       requestedUserAgent: grant ? null : requesterUserAgent,
     }).returning({ id: deviceAuthorizations.id });
-    if (!grant) return null;
-    const [created] = await tx.insert(deviceLoginGrants).values({
+    if (!grant) return { authorizationId: row!.id, grantId: null };
+    const [inserted] = await tx.insert(deviceLoginGrants).values({
       deviceAuthorizationId: row!.id,
       kind: grant.kind,
       status: "pending",
@@ -193,16 +282,91 @@ export async function createDeviceAuthorization(
       requestedAgentId: grant.agentId,
       requestedUserAgent: requesterUserAgent,
     }).returning({ id: deviceLoginGrants.id });
-    return created!.id;
+    return { authorizationId: row!.id, grantId: inserted!.id };
   });
-  if (createdGrantId && grant) addTraceEvent("auth.device.grant.created", { grant_id: createdGrantId, kind: grant.kind });
+  if (created.grantId && grant) {
+    addTraceEvent("auth.device.grant.created", { grant_id: created.grantId, kind: grant.kind, mode: completion.mode });
+    return { authorizationId: created.authorizationId, grant: { id: created.grantId, kind: grant.kind } };
+  }
+  return { authorizationId: created.authorizationId, grant: null };
+}
+
+/** authorize phase — unauthenticated public (caller must gate-check first). */
+export async function createDeviceAuthorization(
+  input: CreateDeviceAuthorizationInput = {},
+): Promise<CreateDeviceAuthorizationResult> {
+  const deviceCode = `dvc_${randomBytes(DEVICE_CODE_BYTES).toString("base64url")}`;
+  const userCode = humanUserCode();
+  const ttlMs = input.ttlMs ?? DEFAULT_DEVICE_CODE_TTL_MS;
+  const expiresAt = new Date(Date.now() + ttlMs);
+
+  const created = await insertDeviceAuthorization(input, {
+    mode: "device",
+    deviceCodeLookupHash: computeTokenLookupHash(deviceCode),
+    deviceCodeHash: await argon2.hash(deviceCode),
+    userCode,
+  }, expiresAt);
 
   return {
+    ...created,
     deviceCode,
     userCode,
     expiresInSeconds: Math.floor(ttlMs / 1000),
     pollIntervalSeconds: DEFAULT_POLL_INTERVAL_SECONDS,
   };
+}
+
+export interface CreateLoopbackDeviceAuthorizationResult {
+  /** The approval link's id; describe/approve find the request by it. */
+  requestId: string;
+  expiresInSeconds: number;
+}
+
+/**
+ * authorize phase, loopback mode: no device code and no user code (nothing to
+ * poll, nothing to type). The approval page finds the request by its id;
+ * approve sends the browser to the return URI with a one-time code, which the
+ * token phase redeems with the PKCE verifier (consumeLoopbackDeviceAuthorization).
+ */
+export async function createLoopbackDeviceAuthorization(
+  input: CreateDeviceAuthorizationInput & { loopback: DeviceLoopbackRequest },
+): Promise<CreateLoopbackDeviceAuthorizationResult> {
+  const requestId = randomBytes(LOOPBACK_REQUEST_ID_BYTES).toString("base64url");
+  const ttlMs = input.ttlMs ?? DEFAULT_DEVICE_CODE_TTL_MS;
+  await insertDeviceAuthorization(input, {
+    mode: "loopback",
+    requestId,
+    returnUri: input.loopback.returnUri,
+    codeChallenge: input.loopback.codeChallenge,
+  }, new Date(Date.now() + ttlMs));
+  return { requestId, expiresInSeconds: Math.floor(ttlMs / 1000) };
+}
+
+/**
+ * How describe and approve find a request: the code the person typed (device
+ * mode), the request id in the approval link (loopback mode), or the row id a
+ * computer pairing linked itself (computerPairingService.ts; never an id a
+ * client sends). A miss of either kind answers the same way
+ * (user_code_invalid / request_invalid).
+ */
+export type DeviceAuthorizationLocator = { userCode: unknown } | { requestId: unknown } | { linkedAuthorizationId: string };
+
+type LocatorMiss = "user_code_invalid" | "request_invalid";
+
+function locate(locator: DeviceAuthorizationLocator):
+  | { ok: true; where: SQL }
+  | { ok: false; error: LocatorMiss } {
+  if ("linkedAuthorizationId" in locator) {
+    return { ok: true, where: and(eq(deviceAuthorizations.id, locator.linkedAuthorizationId), eq(deviceAuthorizations.mode, "device"))! };
+  }
+  if ("requestId" in locator) {
+    const { requestId } = locator;
+    if (typeof requestId !== "string" || !LOOPBACK_REQUEST_ID_RE.test(requestId)) return { ok: false, error: "request_invalid" };
+    return { ok: true, where: and(eq(deviceAuthorizations.requestId, requestId), eq(deviceAuthorizations.mode, "loopback"))! };
+  }
+  const userCode = normalizeUserCode(locator.userCode);
+  if (!userCode) return { ok: false, error: "user_code_invalid" };
+  return { ok: true, where: and(eq(deviceAuthorizations.userCode, userCode), eq(deviceAuthorizations.mode, "device"))! };
 }
 
 /** A one-time grant request, as describe shows it (choices are listed by the route). */
@@ -218,10 +382,13 @@ export interface DescribedDeviceLoginGrant {
 export type DescribeDeviceAuthorizationResult =
   | {
       ok: true;
+      mode: DeviceAuthorizationMode;
       /** Set when the client asked for a one-time grant instead of a session. */
       grant: DescribedDeviceLoginGrant | null;
-      /** The stored form of the typed code, for the page to show. */
-      userCode: string;
+      /** The stored form of the typed code, for the page to show; null in loopback mode (there is none). */
+      userCode: string | null;
+      /** Loopback mode: the approval link's id (null in device mode). */
+      requestId: string | null;
       /** As the client sent it (sanitized): anyone starting a login can set it to anything. */
       clientName: string | null;
       requestedAt: Date;
@@ -229,7 +396,7 @@ export type DescribeDeviceAuthorizationResult =
       /** What approve needs to approve this code as this person. */
       approvalTicket: string;
     }
-  | { ok: false; error: "user_code_invalid" | "already_resolved" | "expired" };
+  | { ok: false; error: LocatorMiss | "already_resolved" | "expired" };
 
 /**
  * The approval page's look at a code before anyone approves it — USER-
@@ -237,13 +404,16 @@ export type DescribeDeviceAuthorizationResult =
  * approved (same states, same uniform user_code_invalid for a miss). Its
  * approval ticket is what approve requires.
  */
-export async function describeDeviceAuthorization(input: { userCode: unknown; userId: string }): Promise<DescribeDeviceAuthorizationResult> {
-  const userCode = normalizeUserCode(input.userCode);
-  if (!userCode) return { ok: false, error: "user_code_invalid" };
+export async function describeDeviceAuthorization(input: DeviceAuthorizationLocator & { userId: string }): Promise<DescribeDeviceAuthorizationResult> {
+  const located = locate(input);
+  if (!located.ok) return { ok: false, error: located.error };
   const db = getDb();
   const [row] = await db
     .select({
       id: deviceAuthorizations.id,
+      mode: deviceAuthorizations.mode,
+      requestId: deviceAuthorizations.requestId,
+      userCode: deviceAuthorizations.userCode,
       status: deviceAuthorizations.status,
       clientName: deviceAuthorizations.clientName,
       expiresAt: deviceAuthorizations.expiresAt,
@@ -259,12 +429,13 @@ export async function describeDeviceAuthorization(input: { userCode: unknown; us
     })
     .from(deviceAuthorizations)
     .leftJoin(deviceLoginGrants, eq(deviceLoginGrants.deviceAuthorizationId, deviceAuthorizations.id))
-    .where(eq(deviceAuthorizations.userCode, userCode));
-  if (!row) return { ok: false, error: "user_code_invalid" };
+    .where(located.where);
+  if (!row) return { ok: false, error: "userCode" in input ? "user_code_invalid" : "request_invalid" };
   if (row.status !== "pending") return { ok: false, error: "already_resolved" };
   if (row.expiresAt.getTime() <= Date.now()) return { ok: false, error: "expired" };
   return {
     ok: true,
+    mode: row.mode,
     grant: row.grantId && row.grantKind
       ? {
           id: row.grantId,
@@ -275,7 +446,8 @@ export async function describeDeviceAuthorization(input: { userCode: unknown; us
           requestedAgentId: row.requestedAgentId,
         }
       : null,
-    userCode,
+    userCode: row.userCode,
+    requestId: row.requestId,
     clientName: row.clientName,
     requestedAt: row.createdAt,
     requester: { ip: row.requestedIp, location: row.requestedLocation },
@@ -294,14 +466,20 @@ export interface ApprovedDeviceLogin {
 export type ApproveDeviceAuthorizationResult =
   | {
       ok: true;
+      mode: DeviceAuthorizationMode;
       grant: ApprovedDeviceLogin;
       /** Set when it was a one-time grant: what the person picked. */
       oneTime: { id: string; kind: DeviceLoginGrantKind; serverId: string | null; agentId: string | null } | null;
+      /**
+       * Loopback mode: where the page sends the browser next, the return URI
+       * with the one-time `code` (approved) or `error=access_denied` (denied).
+       */
+      redirectUrl: string | null;
     }
   | {
       ok: false;
       error:
-        | "user_code_invalid"
+        | LocatorMiss
         | "already_resolved"
         | "expired"
         | "approval_ticket_required"
@@ -311,7 +489,11 @@ export type ApproveDeviceAuthorizationResult =
         | "grant_selection_not_allowed"
         | "grant_kind_unsupported"
         // The approving session was revoked while it approved.
-        | "approver_session_revoked";
+        | "approver_session_revoked"
+        // Approving through a computer pairing: the pairing stopped being
+        // approvable (a second request, cancelled, signed out, expired) before
+        // the approval committed.
+        | "pairing_unavailable";
     };
 
 /**
@@ -321,8 +503,7 @@ export type ApproveDeviceAuthorizationResult =
  * still-pending, unexpired grant transitions (zero enumeration: any miss →
  * uniform user_code_invalid).
  */
-export async function approveDeviceAuthorization(input: {
-  userCode: unknown;
+export async function approveDeviceAuthorization(input: DeviceAuthorizationLocator & {
   userId: string;
   approve: boolean;
   approvalTicket?: unknown;
@@ -337,13 +518,22 @@ export async function approveDeviceAuthorization(input: {
    * family.
    */
   approverSessionFamilyId?: string | null;
+  /**
+   * Run in the approval's transaction before the authorization's own CAS; false
+   * refuses with `pairing_unavailable` and nothing is written. A computer
+   * pairing claims itself here (computerPairingService.ts), so a second request
+   * voiding it and this approval serialize on its row: one of them wins.
+   */
+  claim?: (tx: DatabaseExecutor) => Promise<boolean>;
 }): Promise<ApproveDeviceAuthorizationResult> {
-  const userCode = normalizeUserCode(input.userCode);
-  if (!userCode) return { ok: false, error: "user_code_invalid" };
+  const located = locate(input);
+  if (!located.ok) return { ok: false, error: located.error };
   const db = getDb();
   const [row] = await db
     .select({
       id: deviceAuthorizations.id,
+      mode: deviceAuthorizations.mode,
+      returnUri: deviceAuthorizations.returnUri,
       status: deviceAuthorizations.status,
       expiresAt: deviceAuthorizations.expiresAt,
       grantId: deviceLoginGrants.id,
@@ -351,8 +541,8 @@ export async function approveDeviceAuthorization(input: {
     })
     .from(deviceAuthorizations)
     .leftJoin(deviceLoginGrants, eq(deviceLoginGrants.deviceAuthorizationId, deviceAuthorizations.id))
-    .where(eq(deviceAuthorizations.userCode, userCode));
-  if (!row) return { ok: false, error: "user_code_invalid" };
+    .where(located.where);
+  if (!row) return { ok: false, error: "userCode" in input ? "user_code_invalid" : "request_invalid" };
   if (input.approve && !approvalTicketMatches(row.id, input.userId, input.approvalTicket)) {
     return { ok: false, error: "approval_ticket_required" };
   }
@@ -389,6 +579,17 @@ export async function approveDeviceAuthorization(input: {
 
   const now = new Date();
   const approverSessionFamilyId = row.grantId && input.approve ? input.approverSessionFamilyId ?? null : null;
+  // Loopback: the one-time code the redirect carries (only its hash is kept),
+  // redeemable for 2 minutes and never past the request's own expiry.
+  const loopbackReturnUri = row.mode === "loopback" ? row.returnUri : null;
+  if (row.mode === "loopback" && !loopbackReturnUri) return { ok: false, error: "request_invalid" };
+  const callbackCode = loopbackReturnUri && input.approve ? randomBytes(LOOPBACK_CALLBACK_CODE_BYTES).toString("base64url") : null;
+  const callbackCodeColumns = callbackCode
+    ? {
+        callbackCodeHash: hashOneTimeCode(callbackCode),
+        callbackCodeExpiresAt: new Date(Math.min(now.getTime() + LOOPBACK_CALLBACK_CODE_TTL_MS, row.expiresAt.getTime())),
+      }
+    : {};
   return db.transaction(async (tx): Promise<ApproveDeviceAuthorizationResult> => {
     // A one-time grant records the approving session's family: fence it live,
     // as a device session's writes do, so a security revoke of that session
@@ -402,6 +603,7 @@ export async function approveDeviceAuthorization(input: {
         throw err;
       }
     }
+    if (input.claim && !await input.claim(tx)) return { ok: false, error: "pairing_unavailable" };
     // CAS — only flip if still pending (loses to a concurrent resolve).
     const claimed = await tx
       .update(deviceAuthorizations)
@@ -414,6 +616,7 @@ export async function approveDeviceAuthorization(input: {
               // Every approval records the approving session's family (two-step
               // verification reads it later); only a grant fences it live above.
               approverFamilyId: input.approverSessionFamilyId ?? null,
+              ...callbackCodeColumns,
             }
           : { status: "denied", deniedAt: now },
       )
@@ -452,7 +655,11 @@ export async function approveDeviceAuthorization(input: {
     }
     return {
       ok: true,
+      mode: row.mode,
       oneTime,
+      redirectUrl: loopbackReturnUri
+        ? loopbackCallbackUrl(loopbackReturnUri, callbackCode ? { code: callbackCode } : { error: "access_denied" })
+        : null,
       grant: {
         id: grant.id,
         clientName: grant.clientName,
@@ -468,7 +675,11 @@ export type ConsumeDeviceAuthorizationError =
   | "authorization_pending"
   | "access_denied"
   | "expired_token"
-  | "device_code_consumed";
+  | "device_code_consumed"
+  // Loopback redeem only: no such request, no code issued, or not its code
+  // (uniform); and the right code with the wrong PKCE verifier (not burned).
+  | "code_invalid"
+  | "pkce_mismatch";
 
 export type ConsumeDeviceAuthorizationResult =
   | {
@@ -533,6 +744,7 @@ export async function consumeDeviceAuthorization(
   const [row] = await db
     .select({
       id: deviceAuthorizations.id,
+      mode: deviceAuthorizations.mode,
       deviceCodeHash: deviceAuthorizations.deviceCodeHash,
       status: deviceAuthorizations.status,
       approvedByUserId: deviceAuthorizations.approvedByUserId,
@@ -544,7 +756,8 @@ export async function consumeDeviceAuthorization(
     .from(deviceAuthorizations)
     .leftJoin(deviceLoginGrants, eq(deviceLoginGrants.deviceAuthorizationId, deviceAuthorizations.id))
     .where(eq(deviceAuthorizations.deviceCodeLookupHash, computeTokenLookupHash(rawDeviceCode)));
-  if (!row) return { ok: false, error: "device_code_invalid" };
+  // A loopback row has no device code: it is never pollable.
+  if (!row || row.mode !== "device" || !row.deviceCodeHash) return { ok: false, error: "device_code_invalid" };
 
   let argonOk = false;
   try {
@@ -553,7 +766,60 @@ export async function consumeDeviceAuthorization(
     argonOk = false;
   }
   if (!argonOk) return { ok: false, error: "device_code_invalid" };
+  return consumeVerifiedDeviceAuthorization(row, observe);
+}
 
+/**
+ * token phase, loopback mode: `{requestId, code, codeVerifier}` instead of a
+ * device code. The code is the one approve put in the redirect (2 minutes,
+ * stored as a sha256 hash), and the verifier must match the S256 challenge
+ * from authorize. A wrong verifier does not burn the code (as in app login:
+ * only the program holding the verifier can use it). Past those checks it is
+ * the device code's consume, unchanged: the same CAS single-consume, the same
+ * grant (or session) and the same answers.
+ */
+export async function consumeLoopbackDeviceAuthorization(
+  input: { requestId: unknown; code: unknown; codeVerifier: unknown },
+  observe: { ip?: string | null; userAgent?: string | null } = {},
+): Promise<ConsumeDeviceAuthorizationResult> {
+  const { requestId, code } = input;
+  if (typeof requestId !== "string" || !LOOPBACK_REQUEST_ID_RE.test(requestId)) return { ok: false, error: "code_invalid" };
+  if (typeof code !== "string" || !code || code.length > LOOPBACK_CALLBACK_CODE_MAX_LENGTH) return { ok: false, error: "code_invalid" };
+  const [row] = await getDb()
+    .select({
+      id: deviceAuthorizations.id,
+      codeChallenge: deviceAuthorizations.codeChallenge,
+      callbackCodeHash: deviceAuthorizations.callbackCodeHash,
+      callbackCodeExpiresAt: deviceAuthorizations.callbackCodeExpiresAt,
+      status: deviceAuthorizations.status,
+      approvedByUserId: deviceAuthorizations.approvedByUserId,
+      expiresAt: deviceAuthorizations.expiresAt,
+      consumedAt: deviceAuthorizations.consumedAt,
+      revokedAt: deviceAuthorizations.revokedAt,
+      oneTimeGrantId: deviceLoginGrants.id,
+    })
+    .from(deviceAuthorizations)
+    .leftJoin(deviceLoginGrants, eq(deviceLoginGrants.deviceAuthorizationId, deviceAuthorizations.id))
+    .where(and(eq(deviceAuthorizations.requestId, requestId), eq(deviceAuthorizations.mode, "loopback")));
+  if (!row || !row.callbackCodeHash || !row.codeChallenge) return { ok: false, error: "code_invalid" };
+  const expected = Buffer.from(row.callbackCodeHash);
+  const actual = Buffer.from(hashOneTimeCode(code));
+  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) return { ok: false, error: "code_invalid" };
+  if (row.consumedAt) return { ok: false, error: "device_code_consumed" };
+  if (!row.callbackCodeExpiresAt || row.callbackCodeExpiresAt.getTime() <= Date.now()) return { ok: false, error: "expired_token" };
+  if (!pkceVerifierMatches(input.codeVerifier, row.codeChallenge)) return { ok: false, error: "pkce_mismatch" };
+  return consumeVerifiedDeviceAuthorization(row, observe);
+}
+
+/**
+ * The consume both modes share once the client has proved it holds the
+ * request (the device code, or the loopback code + PKCE verifier).
+ */
+async function consumeVerifiedDeviceAuthorization(
+  row: DeviceCodeState & { id: string; oneTimeGrantId: string | null },
+  observe: { ip?: string | null; userAgent?: string | null },
+): Promise<ConsumeDeviceAuthorizationResult> {
+  const db = getDb();
   const unconsumable = unconsumableAnswer(row, Date.now());
   if (unconsumable || !row.approvedByUserId) return { ok: false, error: unconsumable ?? "authorization_pending" };
   const userId = row.approvedByUserId;

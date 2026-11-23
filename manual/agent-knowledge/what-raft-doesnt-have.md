@@ -18,20 +18,20 @@ Re-verified against staging 1883339e9 on 2026-10-28 (public-docs audit):
 - packages/server/src/routes/channels.ts (POST /:id/members/batch; DM add refused (a DM has two fixed parties); POST /:id/leave refuses a DM but DELETE /:id/members/user/:self lets a participant remove themself, no Leave button; DELETE /:id lets a DM participant delete the DM, no UI)
 - packages/web/src/components/member/InviteHumanDialog.tsx ("Add another": several emails in one send); no CLI invite command
 - packages/server/src/routes/agentWritableTarget.ts (agent-to-agent DM on the same server; a personal assistant may open a new DM only with its owner)
-- packages/web/src/utils/runtimeConfigForm.ts supportsRuntimeCustomModelName (builtin, claude, codex, cursor, copilot, pi) — the old "only Cursor / Copilot" entry was removed
+- packages/server/src/services/runtimeFormV2Registry.ts custom-model runtimes (codex, claude, cursor, copilot, antigravity, qwen, qoder, pi; builtin per provider via customValueAllowedByValue) — the old "only Cursor / Copilot" entry was removed
 - packages/web/src/components/channel/ChannelPreferencesSection.tsx, InboxContextMenu.tsx, features/sidebar/menus/SidebarRowContextMenu.tsx, components/notifications/NotificationLevelMenu.tsx (a channel's Notifications choice: All new messages / Only what involves me / Mute; Mute Activity on an Activity row); packages/shared/src/activityMute.ts (a DM with an App can be muted; not flagged on staging); docs/contracts/notifications.md §1.1 (a mute silences push entirely, @mentions included), §1.2 (pause and quiet hours)
 - packages/server/src/routes/servers.ts POST /:id/machines/:machineId/computer/restart (machine creator or controlComputers capability, managed online Computer only; POST …/computer/upgrade for web upgrade; useComputerUpgradeCard.ts falls back to a manual upgrade for a Computer too old to support it)
 - remote_computer_upgrade_v2: retired (no longer read); web upgrade is on for every server, stopped per platform by remote_computer_upgrade_hold_<os>
 - packages/web/src/components/machine/AddMachineDialog.tsx (only the user's own machines: this computer, or their own computer, a VPS included)
 
 Gated code that would flip entries here once turned on (default off; re-check each release):
-- guest role: server_guest_v0
 - assistant quiet hours: personal_assistant
 - Raft-run Cloud agents: the cloud agent hosting runtime flag (server-stage, default off)
 apple_web_login_v0 retired 2026-11: Apple sign-in is offered wherever Apple is configured, on the web, in the mobile app and in Raft Desktop (which runs the web app). The channel admin role picker is not gated (channel_manager_role_actions_v0 retired 2026-11), so no gating note.
 Re-verified against staging 6bfd74e0fe on 2026-11-03 (manual drift): auth_second_factor_v1 is generally available (2026-11-03), so two-step verification and passkeys (components/settings/TwoStepVerificationSection.tsx, PasskeysSection.tsx, en.ts settings.twoStep.* / settings.passkeys.*; shown in release v1.21.49 too) are listed as existing; notification-level entries follow the unified notifications work (#12135, #12231): Mute this server is now the server level Nothing, a mute silences @mentions too, pause and quiet hours exist.
 
 Maintainer note (moved out of the body): this page rots one way. Entries become wrong when a feature ships and nothing here goes red. An earlier version said per-channel and per-DM mute both existed while the Notifications topic said neither did; each was half right. Per-DM mute was present in storage but on no reachable surface. Source a capability claim from a surface a user can reach, not from a schema column.
+Re-verified against staging da1459e236 on 2026-11-16 (manual drift g5): the channel's level lives in the Details column under Your preferences (ChannelPreferencesSection.tsx, en.ts channel.details.yourPreferences, #14139: no settings sheet any more); the sidebar item is Close chat (en.ts layout.sidebar.closeChat). No absence entry changed: no commits since 11-03 ship message pinning, custom emoji, a human reminder UI, data export, handle or slug rename, or an audit log.
 */}
 
 # What Raft doesn't have
@@ -101,8 +101,8 @@ Every item on this list was checked as not-present at the time it was added. If 
 
 ## Notification-level
 
-- **Per-channel mute EXISTS.** A person picks a channel's **Notifications** choice (All new messages / Only what involves me / **Mute**) in its settings (under Preferences) or its right-click menu in the sidebar, or uses **Mute Activity** on its Activity row; agents use `raft channel mute`. A muted channel notifies nothing, not even @mentions; personal mentions still show in Activity. A whole server is silenced in **Settings** → the server's **Notifications** → **Nothing**. Don't tell users channel mute doesn't exist.
-- **Per-DM mute only for a DM with an App.** A person can mute their DM with an App (the DM's row menu in the sidebar or Activity, or Mute in its settings); after that nothing in it notifies, @mentions included. A DM with a person or an ordinary agent cannot be muted, and agents can't mute any DM (the CLI takes a regular channel). Close DM hides the conversation; it does not mute it.
+- **Per-channel mute EXISTS.** A person picks a channel's **Notifications** choice (All new messages / Only what involves me / **Mute**) in its **Details** (the header's **Channel details and settings** button) under **Your preferences**, or its right-click menu in the sidebar, or uses **Mute Activity** on its Activity row; agents use `raft channel mute`. A muted channel notifies nothing, not even @mentions; personal mentions still show in Activity. A whole server is silenced in **Settings** → the server's **Notifications** → **Nothing**. Don't tell users channel mute doesn't exist.
+- **Per-DM mute only for a DM with an App.** A person can mute their DM with an App (the DM's row menu in the sidebar or Activity, or Mute in its settings); after that nothing in it notifies, @mentions included. A DM with a person or an ordinary agent cannot be muted, and agents can't mute any DM (the CLI takes a regular channel). **Close chat** hides the conversation; it does not mute it.
 - **No per-thread mute.**
 - **No status-override.** Pause notifications and daily Quiet hours do exist (Settings → Notifications; see [Notifications](/agent-knowledge/coordination/notifications)).
 

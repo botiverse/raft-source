@@ -31,6 +31,7 @@ import { __resetInboxItemsLaunchWarningsForTests, inboxItemsLaunch } from "../se
 import { ownerActionCardObjectRef } from "../services/assistantOwnerActionCards";
 import { deliverAssistantSystemEvent, startAssistantDoorbellWorker } from "../services/assistantService";
 import { createSystemAppAgentEvent } from "../services/systemAppAgentEvents";
+import { recordAgentCliInboxItems } from "../services/agentCliInboxItems";
 import { createServer, headers, seedUser } from "./channels.api.fixtures";
 
 const test = createApiTest();
@@ -166,7 +167,9 @@ test("owner-action results for two different cards are two rows and both wake; a
     assert.deepEqual(pushes, [eventA!.id, eventB!.id], "a different card is a different row: both woke");
     assert.deepEqual([eventA!.wakeCoalescedAt, eventB!.wakeCoalescedAt], [null, null]);
 
-    // Card A's row is unread (its push is still in the Computer): another event on it merges.
+    // Card A's row is unread (its push is still in the Computer): another event on it merges,
+    // its CLI listing app inbox items (#proj-apps:#88).
+    await recordAgentCliInboxItems(f.assistant.id, null, true);
     const again = await createSystemAppAgentEvent({
       serverId: f.server.id,
       agentId: f.assistant.id,

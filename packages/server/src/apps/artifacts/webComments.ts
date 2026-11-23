@@ -40,8 +40,9 @@
 //    (commentImages.ts: each the reader's own unused upload to this
 //    Artifact, else 400 IMAGE_NOT_FOUND and nothing written), then
 //    insertComment;
-// 5. after the commit, the notices are pushed (sendQueued) and people's
-//    Activity is told (announceObjectEvents).
+// 5. after the commit, the notices are pushed (sendQueued), people's
+//    Activity is told (announceObjectEvents) and open pages of the Artifact
+//    are pinged (live.ts announceArtifactChanged; an edit and a delete too).
 //
 // An edit (its author only, 403 FORBIDDEN) replaces the text and checks
 // mentions the same way, except that only the mentions it adds are checked
@@ -59,6 +60,7 @@ import { z } from "zod";
 import {
   AGENT_API_ARTIFACT_COMMENTS_PAGE_LIMIT,
   AGENT_API_ARTIFACT_MAX_ANCHOR_BYTES,
+  artifactAnchorJsonBytes,
   ARTIFACT_COMMENT_MAX_CHARS,
   ARTIFACT_COMMENT_MAX_IMAGES,
   ARTIFACT_COMMENT_MAX_MENTIONS,
@@ -67,6 +69,7 @@ import {
   asObjectFileId,
   createRaftStructuredUserRefRegex,
   currentDate,
+  fitArtifactAnchorContext,
   isWellFormedArtifactFilePath,
   structuredRaftMentionRanges,
   WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY,
@@ -97,6 +100,7 @@ import {
   readableVersion,
   readPositionOf,
   takePartForbiddenError,
+  keepsOwnStateOn,
   takesPartIn,
   versionNumbers,
 } from "./apiCommon";
@@ -104,6 +108,7 @@ import { follow, insertComment, newCommentId, unfollow } from "./comments";
 import { claimCommentImages, commentImagesPart, releasedImagesGone, releaseImages } from "./commentImages";
 import { changeResolution, noteVersionFor, resolvableThread } from "./resolutions";
 import { announceObjectEvents } from "../../platform/activity";
+import { announceArtifactChanged } from "./live";
 import { recordArtifactEvent } from "./events";
 import { commentFollowers, followReasons, noticeComment, sendQueued } from "./notices";
 import {
@@ -163,7 +168,7 @@ const commentInputSchema = z.object({
   version: z.number().int().positive(),
   target: z.union([
     z.object({ scope: z.literal("artifact") }),
-    // The anchor is measured before its shape is checked (FIELD_TOO_LONG first).
+    // The anchor is measured before its shape is refused (FIELD_TOO_LONG first; an annotation's context gives way before that).
     z.object({ scope: z.literal("file"), path: z.string(), anchor: z.json().nullable() }),
   ]),
   replyTo: z.string().min(1).max(200).nullable(),
@@ -326,16 +331,19 @@ export async function checkWebComment(reader: ArtifactWebReader, item: ArtifactI
   if (input.target.scope === "file") {
     let shapedAnchor: ArtifactCommentAnchor | null = null;
     if (input.target.anchor !== null) {
-      if (Buffer.byteLength(JSON.stringify(input.target.anchor), "utf8") > AGENT_API_ARTIFACT_MAX_ANCHOR_BYTES) {
+      const shaped = webCommentAnchorSchema.safeParse(input.target.anchor);
+      // Over the size limit, an annotation's section (its context) gives way first: the region,
+      // then the outermost headings (shared fitArtifactAnchorContext). Only the place is refused.
+      const fitted = shaped.success ? fitArtifactAnchorContext(shaped.data!, AGENT_API_ARTIFACT_MAX_ANCHOR_BYTES) : null;
+      if (artifactAnchorJsonBytes(fitted ?? input.target.anchor) > AGENT_API_ARTIFACT_MAX_ANCHOR_BYTES) {
         refuse(400, {
           code: "FIELD_TOO_LONG",
           error: "The place this comment is anchored to is too large to keep: select a shorter passage or a smaller element, or comment on the whole file.",
           details: { field: "anchor", limit: AGENT_API_ARTIFACT_MAX_ANCHOR_BYTES },
         });
       }
-      const shaped = webCommentAnchorSchema.safeParse(input.target.anchor);
-      if (!shaped.success) throw new ArtifactWebFailure(webBadBody("an ArtifactWebCommentInput whose anchor is an ArtifactCommentAnchor"));
-      shapedAnchor = shaped.data!;
+      if (fitted === null) throw new ArtifactWebFailure(webBadBody("an ArtifactWebCommentInput whose anchor is an ArtifactCommentAnchor"));
+      shapedAnchor = fitted;
       anchor = { type: shapedAnchor.type, data: { ...shapedAnchor.data } };
     }
     path = wellFormedPath(input.target.path);
@@ -554,6 +562,7 @@ export function createWebCommentOperations() {
       // Step 5.
       await sendQueued(outbox, outcome.queued);
       await announceObjectEvents([outcome.eventId]);
+      announceArtifactChanged(item.id, "comments");
       return json(await created(item, outcome.comment, version.number, outcome.told), 201);
     }),
 
@@ -592,6 +601,7 @@ export function createWebCommentOperations() {
       if (outcome === "deleted") return refuse(404, COMMENT_GONE);
       await sendQueued(outbox, outcome.queued);
       await announceObjectEvents([outcome.eventId]);
+      announceArtifactChanged(item.id, "comments");
       const numbers = await versionNumbers([outcome.edited.versionId]);
       return json(await created(item, outcome.edited, numbers.get(outcome.edited.versionId) ?? 0, outcome.told));
     }),
@@ -639,7 +649,8 @@ export function createWebCommentOperations() {
         return images;
       });
       if (!released) return refuse(404, COMMENT_GONE);
-      // Once the delete committed: the images' bytes.
+      // Once the delete committed: open pages read the comments again, and the images' bytes go.
+      announceArtifactChanged(item.id, "comments");
       await releasedImagesGone(released);
       return { kind: "empty" as const };
     }),
@@ -707,10 +718,13 @@ export function createWebCommentOperations() {
       return json({ following: true });
     }),
 
-    /** Stop following (sticky: commenting doesn't follow it again). Someone outside the server and its joint never follows: nothing to stop. */
+    /**
+     * Stop following (sticky: commenting doesn't follow it again). Someone outside the server and its joint never follows: nothing to stop.
+     * The reader's own state, resolved as a read: a closed server's Artifact (read-only) is unfollowed too, never followed.
+     */
     unfollow: (reader: ArtifactWebReader, id: string): Promise<ArtifactApiJson<{ following: boolean }> | ArtifactWebApiError> => answerWeb(async () => {
-      const item = await visibleItemFor(reader, id);
-      if (await takesPartIn(readerViewActor(reader), item)) await unfollow(item.id, readerActor(reader));
+      const item = await readableItemFor(reader, id);
+      if (await keepsOwnStateOn(readerViewActor(reader), item)) await unfollow(item.id, readerActor(reader));
       return json({ following: false });
     }),
   };

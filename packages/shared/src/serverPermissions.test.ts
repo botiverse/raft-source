@@ -6,6 +6,9 @@ import {
   canTransitionServerRole,
   canMutateBilling,
   canReadBillingSummary,
+  canCreateAnyChannel,
+  createChannelCapabilityFor,
+  serverCapabilitiesWireView,
   getServerCapabilities,
   getServerSurfaceCapabilities,
   hasServerCapability,
@@ -35,7 +38,8 @@ test("public server view modes never derive membership powers from authenticatio
 });
 
 const MEMBER_CAPABILITIES = new Set<ServerCapability>([
-  "createChannels",
+  "createPublicChannels",
+  "createPrivateChannels",
   "joinPublicChannels",
   "addChannelMembers",
   "viewMembers",
@@ -46,9 +50,39 @@ const MEMBER_CAPABILITIES = new Set<ServerCapability>([
   "assignTasks",
 ]);
 
-test("server capability registry contains the complete 41-capability contract", () => {
-  assert.equal(SERVER_CAPABILITY_KEYS.length, 41);
-  assert.equal(new Set(SERVER_CAPABILITY_KEYS).size, 41);
+test("server capability registry contains the complete 43-capability contract", () => {
+  assert.equal(SERVER_CAPABILITY_KEYS.length, 43);
+  assert.equal(new Set(SERVER_CAPABILITY_KEYS).size, 43);
+});
+
+// createChannels was split into createPublicChannels and createPrivateChannels
+// with no change in who may create what: every role holds both exactly where
+// it held createChannels (owner, admin, member; never a guest). Giving the two
+// different rules is a deliberate matrix edit that changes this table.
+test("each role holds both create-channel capabilities exactly where it held createChannels", () => {
+  const heldCreateChannels: Record<ServerRole, boolean> = { owner: true, admin: true, member: true, guest: false };
+  for (const role of ["owner", "admin", "member", "guest"] satisfies ServerRole[]) {
+    assert.equal(hasServerCapability(role, "createPublicChannels"), heldCreateChannels[role], `${role}.createPublicChannels`);
+    assert.equal(hasServerCapability(role, "createPrivateChannels"), heldCreateChannels[role], `${role}.createPrivateChannels`);
+    assert.equal(canCreateAnyChannel(getServerCapabilities(role)), heldCreateChannels[role], `${role} sees the create entry`);
+    assert.equal(serverCapabilitiesWireView(role).createChannels, heldCreateChannels[role], `${role} wire createChannels`);
+  }
+  assert.equal(serverCapabilitiesWireView(null).createChannels, false);
+});
+
+test("creating a channel takes the capability of its visibility", () => {
+  assert.equal(createChannelCapabilityFor("private"), "createPrivateChannels");
+  for (const visibility of ["public", "channel", "joint", undefined, null, "", "nonsense"]) {
+    assert.equal(createChannelCapabilityFor(visibility), "createPublicChannels", String(visibility));
+  }
+});
+
+test("the wire view adds the pre-split createChannels as public OR private", () => {
+  assert.equal(canCreateAnyChannel({ createPublicChannels: true, createPrivateChannels: false }), true);
+  assert.equal(canCreateAnyChannel({ createPublicChannels: false, createPrivateChannels: true }), true);
+  assert.equal(canCreateAnyChannel({ createPublicChannels: false, createPrivateChannels: false }), false);
+  const { createChannels: _derived, ...rest } = serverCapabilitiesWireView("member");
+  assert.deepEqual(rest, { ...getServerCapabilities("member") });
 });
 
 test("role bundles match every role x capability cell", () => {
@@ -58,7 +92,7 @@ test("role bundles match every role x capability cell", () => {
 
     for (const capability of SERVER_CAPABILITY_KEYS) {
       const expected = role === "owner"
-        || (role === "admin" && capability !== "manageBilling" && capability !== "manageSso")
+        || (role === "admin" && capability !== "manageBilling" && capability !== "manageSso" && capability !== "exportServerData")
         || (role === "member" && MEMBER_CAPABILITIES.has(capability));
       assert.equal(hasServerCapability(role, capability), expected, `${role}.${capability}`);
     }
@@ -72,7 +106,7 @@ test("guest has an explicit all-false server capability bundle", () => {
   );
 });
 
-test("member has exactly the nine explicitly approved capabilities", () => {
+test("member has exactly the ten explicitly approved capabilities", () => {
   const granted = SERVER_CAPABILITY_KEYS.filter((capability) => hasServerCapability("member", capability));
   assert.deepEqual(granted, [...MEMBER_CAPABILITIES]);
 });

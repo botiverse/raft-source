@@ -1,5 +1,5 @@
 import type { components } from "@botiverse/raft-shared/src/generated/openapi";
-import { setClockTimeout } from "@botiverse/raft-shared";
+import { clearClockTimeout, setClockTimeout } from "@botiverse/raft-shared";
 import axios from "axios";
 import type { AxiosProgressEvent, AxiosRequestConfig } from "axios";
 import { reportUploadCapabilityFallback } from "./attachmentUploadFallbackTrace";
@@ -7,6 +7,8 @@ import type {
   UploadFallbackErrorIdentity,
   UploadFallbackReason,
 } from "./attachmentUploadFallbackTrace";
+import { prepareAttachmentFileForUpload } from "./attachmentImageResize";
+import type { PreparedAttachmentFile } from "./attachmentImageResize";
 import { reportDirectPutFailure } from "./directPutFailureTrace";
 import type { DirectPutFailure } from "./directPutFailureTrace";
 
@@ -52,6 +54,7 @@ export async function listActiveAttachmentUploads(
 }
 
 export type DirectAttachmentUploadSession = Readonly<{ uploadId: string }>;
+export type AttachmentUploadRoute = "legacy" | "direct";
 
 export class AttachmentUploadClientError extends Error {
   constructor(
@@ -65,6 +68,130 @@ export class AttachmentUploadClientError extends Error {
     super(message);
     this.name = "AttachmentUploadClientError";
   }
+}
+
+/**
+ * Which step of an upload ran out of time. Closed set: it is the
+ * `timeout_phase` of `slock.attachment.upload_finished`
+ * (attachmentUploadOutcomeTrace.ts).
+ */
+export type AttachmentUploadPhase =
+  | "channel"     // resolving a not-yet-created thread channel
+  | "capability"  // GET /attachments/upload-capabilities
+  | "create"      // POST /attachments/upload-sessions
+  | "transfer"    // bytes not moving (direct PUT or legacy POST)
+  | "response"    // legacy POST: every byte sent, no answer
+  | "complete"    // POST /attachments/upload-sessions/:id/complete
+  | "status";     // GET /attachments/upload-sessions/:id
+
+/**
+ * #triage:#545: no request in the upload path had a timeout, so a request that
+ * never answered (a mobile network switch, a backgrounded tab) left the
+ * attachment "validating" or "uploading" with a spinner forever. Each step is
+ * now bounded and ends in a retryable error.
+ *
+ * Control calls are small JSON requests; 30s is far beyond a healthy answer.
+ */
+export const ATTACHMENT_UPLOAD_CONTROL_TIMEOUT_MS = 30_000;
+/**
+ * Complete HEADs the object in storage, which the server bounds at its own 30s
+ * S3 request timeout; the client waits past that so it hears the server's
+ * answer rather than cutting it off.
+ */
+export const ATTACHMENT_UPLOAD_COMPLETE_TIMEOUT_MS = 45_000;
+/** A byte transfer with no progress for this long is stalled (direct PUT and legacy POST). */
+export const ATTACHMENT_TRANSFER_IDLE_TIMEOUT_MS = 60_000;
+/**
+ * How long to wait for the answer once the browser reports every byte sent
+ * (direct PUT and legacy POST). Progress reaches 100% while the OS send buffer
+ * may still be draining over a slow link, and the legacy server stores the
+ * file and makes the thumbnail inside the request, so the transfer-idle window
+ * cannot apply. But a response lost to a network switch or a backgrounded tab
+ * used to leave the attachment at ~99% forever. 120s is well above the
+ * server's own work and below the load balancer's 300s idle timeout.
+ */
+export const ATTACHMENT_UPLOAD_RESPONSE_TIMEOUT_MS = 120_000;
+
+const UPLOAD_STALLED_MESSAGE = "The upload stopped making progress. Tap to retry.";
+
+/**
+ * A step of the upload ran out of time. Always retryable; `phase` says which
+ * step. Named `TimeoutError` (the DOM's name for it) so the capability
+ * fallback trace reads it as `capability_timeout`.
+ */
+export class AttachmentUploadTimeoutError extends AttachmentUploadClientError {
+  constructor(
+    public readonly phase: AttachmentUploadPhase,
+    code = "UPLOAD_STALLED",
+    message = UPLOAD_STALLED_MESSAGE,
+  ) {
+    super(code, message, true);
+    this.name = "TimeoutError";
+  }
+}
+
+export type ScheduleUploadDeadline = (onTimeout: () => void, timeoutMs: number) => () => void;
+
+export const scheduleUploadDeadline: ScheduleUploadDeadline = (onTimeout, timeoutMs) => {
+  const handle = setClockTimeout(onTimeout, timeoutMs);
+  return () => clearClockTimeout(handle);
+};
+
+/**
+ * Run one upload request under a deadline. When it expires the request is
+ * aborted and this rejects with an `AttachmentUploadTimeoutError` at once,
+ * whether or not the request honours the abort; a late answer is ignored.
+ * `renew` restarts the window (progress on a transfer), optionally with a new
+ * length; once the request has settled it does nothing. A caller abort is
+ * passed through to the request and stays a cancellation.
+ */
+export function withAttachmentUploadDeadline<T>(options: Readonly<{
+  phase: AttachmentUploadPhase;
+  timeoutMs: number;
+  signal?: AbortSignal;
+  run: (context: Readonly<{ signal: AbortSignal; renew: (nextTimeoutMs?: number) => void }>) => Promise<T>;
+  scheduleDeadline?: ScheduleUploadDeadline;
+}>): Promise<T> {
+  const { phase, timeoutMs, signal, run, scheduleDeadline = scheduleUploadDeadline } = options;
+  if (signal?.aborted) return Promise.reject(signal.reason);
+  const controller = new AbortController();
+  const abortFromCaller = () => controller.abort(signal?.reason);
+  signal?.addEventListener("abort", abortFromCaller, { once: true });
+  let settled = false;
+  let cancelDeadline: () => void = () => undefined;
+  return new Promise<T>((resolve, reject) => {
+    const renew = (nextTimeoutMs = timeoutMs) => {
+      if (settled || controller.signal.aborted) return;
+      cancelDeadline();
+      cancelDeadline = scheduleDeadline(() => {
+        if (settled) return;
+        settled = true;
+        const timeout = new AttachmentUploadTimeoutError(phase);
+        reject(timeout);
+        controller.abort(timeout);
+      }, nextTimeoutMs);
+    };
+    renew();
+    let request: Promise<T>;
+    try {
+      request = run({ signal: controller.signal, renew });
+    } catch (error) {
+      request = Promise.reject(error);
+    }
+    request.then(
+      (value) => {
+        settled = true;
+        resolve(value);
+      },
+      (error: unknown) => {
+        settled = true;
+        reject(error);
+      },
+    );
+  }).finally(() => {
+    cancelDeadline();
+    signal?.removeEventListener("abort", abortFromCaller);
+  });
 }
 
 type AxiosLikeError = Readonly<{
@@ -128,6 +255,7 @@ function capabilityFallbackReason(error: unknown): UploadFallbackReason {
 }
 
 function contractError(error: unknown, fallbackCode: string, fallbackMessage: string): AttachmentUploadClientError {
+  if (error instanceof AttachmentUploadTimeoutError) return error;
   const data = (error as AxiosLikeError | null)?.response?.data;
   const code = typeof data?.code === "string" ? data.code : fallbackCode;
   const message = typeof data?.message === "string" ? data.message : fallbackMessage;
@@ -163,7 +291,16 @@ async function completeUpload(
 ): Promise<Attachment> {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      const response = await api.post<CompleteResponse>(`${sessionEndpoint(uploadId)}/complete`, undefined, { signal });
+      const response = await withAttachmentUploadDeadline({
+        phase: "complete",
+        timeoutMs: ATTACHMENT_UPLOAD_COMPLETE_TIMEOUT_MS,
+        signal,
+        run: ({ signal: requestSignal }) => api.post<CompleteResponse>(
+          `${sessionEndpoint(uploadId)}/complete`,
+          undefined,
+          { signal: requestSignal },
+        ),
+      });
       return response.data.attachment;
     } catch (error) {
       const failure = contractError(error, "UPLOAD_COMPLETE_FAILED", "The upload could not be completed.");
@@ -203,7 +340,12 @@ async function recoverExistingSession(
 ): Promise<Attachment | null> {
   let session: SessionView;
   try {
-    session = (await api.get<SessionView>(sessionEndpoint(uploadId), { signal })).data;
+    session = (await withAttachmentUploadDeadline({
+      phase: "status",
+      timeoutMs: ATTACHMENT_UPLOAD_CONTROL_TIMEOUT_MS,
+      signal,
+      run: ({ signal: requestSignal }) => api.get<SessionView>(sessionEndpoint(uploadId), { signal: requestSignal }),
+    })).data;
   } catch (error) {
     throw contractError(error, "UPLOAD_SESSION_STATUS_FAILED", "The upload session could not be checked.");
   }
@@ -254,8 +396,23 @@ async function putFile(
 ): Promise<PutResult> {
   let reportedProgress = 0;
   let bytesSent: number | null = null;
+  let renewDeadline: (nextTimeoutMs?: number) => void = () => undefined;
+  let transferComplete = false;
   const reportProgress = (event: AxiosProgressEvent) => {
-    if (event.loaded > (bytesSent ?? -1)) bytesSent = event.loaded;
+    if (event.loaded > (bytesSent ?? -1)) {
+      bytesSent = event.loaded;
+      if (!transferComplete) {
+        const total = event.total ?? file.size;
+        if (event.loaded >= total || event.progress === 1) {
+          // Every byte handed to the browser, not necessarily on the wire: the
+          // idle window gives way to the response deadline, as legacy does.
+          transferComplete = true;
+          renewDeadline(ATTACHMENT_UPLOAD_RESPONSE_TIMEOUT_MS);
+        } else {
+          renewDeadline();
+        }
+      }
+    }
     if (!onProgress || file.size <= 0 || event.loaded <= 0) return;
     const progress = Math.max(1, Math.min(99, Math.round((event.loaded / file.size) * 100)));
     if (progress <= reportedProgress) return;
@@ -266,7 +423,9 @@ async function putFile(
   const failure = (status: number | null, error?: unknown): DirectPutFailure => {
     const identity = error === undefined ? { name: null, code: null } : errorIdentity(error);
     return {
-      reason: status === null ? "network_error" : "http_status",
+      reason: error instanceof AttachmentUploadTimeoutError
+        ? "idle_timeout"
+        : status === null ? "network_error" : "http_status",
       httpStatus: status,
       errorName: identity.name,
       errorCode: identity.code,
@@ -277,21 +436,34 @@ async function putFile(
   };
   let response: UploadRequestResponse;
   try {
-    response = await requestImpl({
-      method: "PUT",
-      url: upload.url,
-      headers: {
-        "Content-Type": upload.headers["Content-Type"],
-        "If-None-Match": upload.headers["If-None-Match"],
-      },
-      data: file,
-      adapter: "xhr",
-      withCredentials: false,
-      onUploadProgress: reportProgress,
+    // A 60s no-progress window while bytes move, then the 120s response
+    // deadline once the browser reports the last byte (the send buffer may
+    // still be draining). Expiry is treated as a lost response, which recovery
+    // below resolves against the session.
+    response = await withAttachmentUploadDeadline({
+      phase: "transfer",
+      timeoutMs: ATTACHMENT_TRANSFER_IDLE_TIMEOUT_MS,
       signal,
-      validateStatus: () => true,
+      run: ({ signal: requestSignal, renew }) => {
+        renewDeadline = renew;
+        return requestImpl({
+          method: "PUT",
+          url: upload.url,
+          headers: {
+            "Content-Type": upload.headers["Content-Type"],
+            "If-None-Match": upload.headers["If-None-Match"],
+          },
+          data: file,
+          adapter: "xhr",
+          withCredentials: false,
+          onUploadProgress: reportProgress,
+          signal: requestSignal,
+          validateStatus: () => true,
+        });
+      },
     });
   } catch (error) {
+    // A deadline rejects with its own error, never the request's abort.
     if (isAbort(error, signal)) throw error;
     return { outcome: "object_may_exist", failure: failure(httpStatus(error) ?? null, error) };
   }
@@ -309,7 +481,16 @@ async function createSession(
   signal?: AbortSignal,
 ): Promise<CreateResponse> {
   try {
-    return (await api.post<CreateResponse>("/attachments/upload-sessions", request, { signal })).data;
+    return (await withAttachmentUploadDeadline({
+      phase: "create",
+      timeoutMs: ATTACHMENT_UPLOAD_CONTROL_TIMEOUT_MS,
+      signal,
+      run: ({ signal: requestSignal }) => api.post<CreateResponse>(
+        "/attachments/upload-sessions",
+        request,
+        { signal: requestSignal },
+      ),
+    })).data;
   } catch (error) {
     throw contractError(error, "UPLOAD_SESSION_CREATE_FAILED", "The upload session could not be created.");
   }
@@ -328,30 +509,62 @@ export async function uploadAttachmentFile(options: Readonly<{
   channelId: string;
   clientRequestId: string;
   previousSession?: DirectAttachmentUploadSession;
-  legacyUpload: () => Promise<string>;
+  /** The multipart POST of `file` — the prepared (possibly resized) file, not necessarily options.file. */
+  legacyUpload: (file: File) => Promise<string>;
   signal?: AbortSignal;
+  /**
+   * Turns the picked file into the one to upload (large JPEG/WebP photos are
+   * resized, attachmentImageResize.ts). Runs before the size checks and the
+   * legacy/direct threshold, so a resized photo takes the smaller path.
+   */
+  prepareFile?: (file: File, signal?: AbortSignal) => Promise<PreparedAttachmentFile>;
+  /** The prepared file, before any byte is sent; its `file` is what is uploaded. */
+  onPreparedFile?: (prepared: PreparedAttachmentFile) => void;
   onSession?: (session: DirectAttachmentUploadSession) => void;
   onProgress?: (progress: number) => void;
+  /** Which transport this upload took, once decided (slock.attachment.upload_finished). */
+  onRoute?: (route: AttachmentUploadRoute) => void;
   requestImpl?: UploadRequest;
   sleep?: (ms: number) => Promise<void>;
 }>): Promise<string> {
   const {
     api,
-    file,
     channelId,
     clientRequestId,
     previousSession,
-    legacyUpload,
     signal,
+    prepareFile = (file, prepareSignal) => prepareAttachmentFileForUpload(file, { signal: prepareSignal }),
+    onPreparedFile,
     onSession,
     onProgress,
+    onRoute,
     requestImpl = defaultUploadRequest,
     sleep = defaultSleep,
   } = options;
 
+  // Never blocks the upload: prepareFile resolves to the original on any failure.
+  let prepared: PreparedAttachmentFile;
+  try {
+    prepared = await prepareFile(options.file, signal);
+  } catch {
+    prepared = { file: options.file, outcome: "error", originalBytes: options.file.size };
+  }
+  if (signal?.aborted) throw signal.reason ?? new DOMException("The upload was aborted.", "AbortError");
+  const file = prepared.file;
+  onPreparedFile?.(prepared);
+  const legacyUpload = () => options.legacyUpload(file);
+
   let capability: Capabilities;
   try {
-    capability = (await api.get<Capabilities>("/attachments/upload-capabilities", { signal })).data;
+    capability = (await withAttachmentUploadDeadline({
+      phase: "capability",
+      timeoutMs: ATTACHMENT_UPLOAD_CONTROL_TIMEOUT_MS,
+      signal,
+      run: ({ signal: requestSignal }) => api.get<Capabilities>(
+        "/attachments/upload-capabilities",
+        { signal: requestSignal },
+      ),
+    })).data;
   } catch (error) {
     // Task #187 — fail SAFE, not closed. This used to fall back only on 404 and
     // throw on everything else, so a 500 / timeout / network blip killed the
@@ -369,6 +582,7 @@ export async function uploadAttachmentFile(options: Readonly<{
     // legacy upload instead would be the opposite of what they asked for.
     if (isAbort(error, signal)) throw error;
     reportUploadCapabilityFallback(capabilityFallbackReason(error), httpStatus(error) ?? null, errorIdentity(error));
+    onRoute?.("legacy");
     return legacyUpload();
   }
   if (file.size <= 0) {
@@ -388,8 +602,10 @@ export async function uploadAttachmentFile(options: Readonly<{
       capability.directUploadEnabled ? "below_threshold" : "not_enabled",
       null,
     );
+    onRoute?.("legacy");
     return legacyUpload();
   }
+  onRoute?.("direct");
 
   if (previousSession) {
     const recovered = await recoverExistingSession(api, previousSession.uploadId, sleep, signal);
@@ -433,11 +649,11 @@ export async function uploadAttachmentFile(options: Readonly<{
     }
     reportDirectPutFailure(put.failure, recovered ? "found" : "not_found");
     if (recovered) return recovered.id;
-    throw new AttachmentUploadClientError(
-      "UPLOAD_OBJECT_PUT_UNCERTAIN",
-      "The upload response was lost. Retry to safely resume this upload.",
-      true,
-    );
+    const message = "The upload response was lost. Retry to safely resume this upload.";
+    if (put.failure.reason === "idle_timeout") {
+      throw new AttachmentUploadTimeoutError("transfer", "UPLOAD_OBJECT_PUT_UNCERTAIN", message);
+    }
+    throw new AttachmentUploadClientError("UPLOAD_OBJECT_PUT_UNCERTAIN", message, true);
   }
   const attachment = await completeUpload(api, session.uploadId, sleep, signal);
   return attachment.id;

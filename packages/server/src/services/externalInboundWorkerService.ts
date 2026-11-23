@@ -15,6 +15,7 @@ import {
   setClockInterval,
 } from "@botiverse/raft-shared";
 import { logMessageChanged } from "./messageChangeLog";
+import { recordMessageReferences } from "./messageReferences";
 
 import { withSlackIngressProtocol, readSlackIngressRollout } from "./slackVerifiedIngressRollout";
 import { SlackIngressRolloutUnavailable } from "./slackVerifiedIngressRolloutContracts";
@@ -63,8 +64,10 @@ import {
   getActiveJointThreadProjectionsByCanonicalThread,
   isChannelAgent,
   isChannelHuman,
+  lockAndResolveMessageStorage,
   startReadPositionAtJoin,
 } from "./channelService";
+import { assertChannelWritableInTransaction, ChannelConversionInProgressError } from "./channelConversionFenceService";
 import {
   createInboundExternalAttachmentTransferWithExecutor,
 } from "./externalAttachmentTransferService";
@@ -900,11 +903,17 @@ async function resolveTargetChannel(
   canonicalRootMessageId: string | null;
   jointThreadProjection: JointThreadProjection | null;
 } | null> {
+  // The bound channel's row FOR KEY SHARE and its storage resolved under it
+  // (lockAndResolveMessageStorage), before the route is read below: a read
+  // first could see the route a conversion's start is about to change and
+  // then wait on that start's row lock. The resolver below agrees with it on
+  // every target it returns; a disagreement means the route moved.
+  const lockedStorageChannelId = await lockAndResolveMessageStorage(executor, event.raftChannelId);
   const conversationTarget = await resolveExternalConversationTarget({
     executor,
     authorityChannelId: event.raftChannelId,
   });
-  if (!conversationTarget) return null;
+  if (!conversationTarget || conversationTarget.storageChannelId !== lockedStorageChannelId) return null;
   // Channel rows are only serialized and revalidated here, never re-keyed, so
   // every channel lock in this resolver is FOR NO KEY UPDATE: it still
   // excludes Raft send admission and archive/delete writes, but not the FOR KEY
@@ -1652,8 +1661,17 @@ export async function processExternalInboundEventOnce(input: {
   let commitAt = claimAt;
   let commitBlockReason = "commit_authority_lost_or_root_unavailable";
   let committed: ExternalInboundWorkerResult | null = null;
+  // The committed message's text (and an edit's previous text), for its
+  // object_references after the commit (services/messageReferences.ts).
+  // (Typed by assertion: the transaction's callback sets it, which narrowing doesn't see.)
+  let committedContent = null as { messageId: string; content: string; previousContent: string | null } | null;
   try {
     committed = await inboundTransaction(input.db, durableSlack && claim.provider === "slack", "settle", async (executor): Promise<ExternalInboundWorkerResult | null> => {
+      // The conversion fence of the bound channel (its event row's channel
+      // never changes), first: before the event row, the Slack authority rows
+      // and the channel rows, as conversion takes its exclusive form of the
+      // same advisory lock before the channel, binding and event rows.
+      await assertChannelWritableInTransaction(executor, claim.raftChannelId);
       const [event] = await executor.select().from(externalInboundEvents).where(and(
         eq(externalInboundEvents.id, claim.id),
         eq(externalInboundEvents.status, "processing"),
@@ -1861,6 +1879,7 @@ export async function processExternalInboundEventOnce(input: {
         const updatedAt = new Date(Math.max(commitAt.getTime(), message.updatedAt.getTime() + 1));
         await executor.update(messages).set({ content, searchText: content, updatedAt })
           .where(eq(messages.id, message.id));
+        committedContent = { messageId: message.id, content, previousContent: message.content };
         // RFC 082 §4.4: clients that were away replace it through sync (one
         // `message` change row, in this transaction).
         await logMessageChanged(executor, { messageId: message.id, channelId: message.channelId });
@@ -2390,6 +2409,7 @@ export async function processExternalInboundEventOnce(input: {
       });
       if (inboundCanonicalCommitHookForTests) await inboundCanonicalCommitHookForTests();
       const status = result.kind === "duplicate" ? "duplicate" : "committed";
+      committedContent = status === "committed" ? { messageId: result.message.id, content: result.message.content, previousContent: null } : null;
       await executor.update(externalInboundEvents).set({ ...terminalErase(event, status, result.message.id, commitAt),
         ...(payload.fallbackAuthor ? { outcomeReason: `provider_inbound_fallback_${payload.fallbackAuthor}` }
           : botWakeLimited ? { outcomeReason: "provider_bot_wake_rate_limited" } : {}) })
@@ -2407,6 +2427,11 @@ export async function processExternalInboundEventOnce(input: {
     if (error instanceof ExternalInboundTargetUnavailableError) {
       await releaseClaim(commitBlockReason);
       return { kind: "blocked", eventId: claim.id, reason: commitBlockReason };
+    }
+    // The bound channel is converting: back to the queue, retried after it.
+    if (error instanceof ChannelConversionInProgressError) {
+      await releaseClaim("channel_conversion_in_progress");
+      return { kind: "blocked", eventId: claim.id, reason: "channel_conversion_in_progress" };
     }
     const actorRevoked = error instanceof Error
       && error.message === "External projection actor authority is not current";
@@ -2430,6 +2455,10 @@ export async function processExternalInboundEventOnce(input: {
   }
 
   if (committed) {
+    // Its links to first-party objects (#proj-workspace:#336): a new message's
+    // or an edit's, after the commit, never awaited; nothing for text without
+    // an address on Raft's hosts.
+    if (committed.kind === "committed" && committedContent?.messageId === committed.messageId) recordMessageReferences(committedContent);
     const onCommitted = payload.schema === INBOUND_EDIT_PAYLOAD_SCHEMA
       ? input.dependencies.onMessageEdited
       : input.dependencies.onMessageCommitted;

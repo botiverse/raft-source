@@ -21,6 +21,7 @@ import type { AnnotationRect } from "@botiverse/porthole";
 
 import { formatRelativeTime } from "../../utils/relativeTime";
 import { focusLost } from "../../utils/focusGuard";
+import { intersectionObserverOf, resizeObserverOf } from "../../utils/ownerDocument";
 import { ArtifactActorAvatar, anchorLabel } from "./ArtifactActorParts";
 import { ArtifactCommentText } from "./ArtifactCommentText";
 import { MarginThreadCard } from "./ArtifactCommentBubble";
@@ -31,7 +32,7 @@ import type { ArtifactCommentsState } from "./ArtifactCommentsContext";
 import { artifactActorName } from "./artifactFacts";
 import { useMarginEntries, useMarginTops } from "./artifactMarginEntries";
 import type { MarginEntry } from "./artifactMarginEntries";
-import { marginOffsetOf } from "./artifactMarginPlaces";
+import { MARGIN_CARD_ROOM_VAR, marginOffsetOf, openCardLift, openCardRoom } from "./artifactMarginPlaces";
 import { useArtifactReview } from "./ArtifactReviewContext";
 import { draftDrawn } from "./artifactRestoredFocus";
 
@@ -83,8 +84,9 @@ export function ArtifactMarkdownMargin({ page }: { page: HTMLElement | null }) {
   // page is laid out beside the margin. No ResizeObserver, no margin: the surface draws none
   // (ArtifactSurface), since this observer is what asks first and raft-ui's CommentMargin needs one.
   useLayoutEffect(() => {
-    if (!page || typeof ResizeObserver === "undefined" || !requestRefresh) return;
-    const observer = new ResizeObserver(() => requestRefresh());
+    const PageObserver = resizeObserverOf(page);
+    if (!page || !PageObserver || !requestRefresh) return;
+    const observer = new PageObserver(() => requestRefresh());
     observer.observe(page);
     return () => observer.disconnect();
   }, [page, requestRefresh]);
@@ -126,11 +128,31 @@ export function ArtifactMarkdownMargin({ page }: { page: HTMLElement | null }) {
     trigger?.focus({ preventScroll: true });
   }, [openThread]);
 
+  // The open card is never taller than the margin (#triage:#531: a long thread ran past the foot,
+  // clipped, its last replies and reply box out of reach): the column's height less the room kept at
+  // its top and foot, as a variable the card reads (ThreadInBubble: its comments scroll in a
+  // ScrollArea, the reply box stays under them). Written again as the margin is resized (a window, a
+  // find bar). No ResizeObserver or no height (jsdom): no bound.
+  useLayoutEffect(() => {
+    const host = column.current;
+    const HostObserver = resizeObserverOf(host);
+    if (!host || !HostObserver) return;
+    const write = () => {
+      const room = openCardRoom(host.clientHeight);
+      if (room === null) host.style.removeProperty(MARGIN_CARD_ROOM_VAR);
+      else host.style.setProperty(MARGIN_CARD_ROOM_VAR, `${room}px`);
+    };
+    write();
+    const observer = new HostObserver(write);
+    observer.observe(host);
+    return () => observer.disconnect();
+  }, []);
+
   // An open card past the margin's foot (a passage near the frame's bottom, a long thread): the
   // column moves up until it is whole, never its top above the margin's. Measured as it opens and
   // again as it grows or shrinks (replies loaded, the reply box grown). The whole column moves, so
-  // the collapsed cards move with it while one is open (one column, its order kept). A card taller
-  // than the margin stays clipped at the foot: its top (the thread's start) is what is kept in view.
+  // the collapsed cards move with it while one is open (one column, its order kept). The card is no
+  // taller than the margin's room (above), so lifted it is always whole.
   // Closed (or none open), the lift is 0 and the move is written again at once, not left lifted
   // until the next scroll or report.
   useLayoutEffect(() => {
@@ -152,16 +174,14 @@ export function ArtifactMarkdownMargin({ page }: { page: HTMLElement | null }) {
       const was = lift.current;
       lift.current = 0;
       if (was !== 0) place();
-      const box = card.getBoundingClientRect();
-      const room = host.getBoundingClientRect();
-      const over = box.bottom + MARGIN_FOOT_PX - room.bottom;
-      lift.current = over > 0 ? Math.max(0, Math.min(over, box.top - room.top - MARGIN_FOOT_PX)) : 0;
+      lift.current = openCardLift(card.getBoundingClientRect(), host.getBoundingClientRect());
       if (lift.current !== 0 || was !== 0) place();
     };
     measure();
-    // No ResizeObserver (jsdom): measured as it opens only.
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(measure);
+    // No ResizeObserver (jsdom): measured as it opens only. The card's own window's (an object window's, #337 PR3).
+    const CardObserver = resizeObserverOf(card);
+    if (!CardObserver) return;
+    const observer = new CardObserver(measure);
     observer.observe(card);
     return () => observer.disconnect();
   }, [openThread, tops, floor, store]);
@@ -172,15 +192,16 @@ export function ArtifactMarkdownMargin({ page }: { page: HTMLElement | null }) {
   // scroll, the lift and raft-ui's collisions all count. No IntersectionObserver (jsdom): none is.
   useLayoutEffect(() => {
     const host = column.current;
-    if (!host || typeof IntersectionObserver === "undefined") return;
+    const Intersections = intersectionObserverOf(host);
+    if (!host || !Intersections) return;
     const items = [...host.querySelectorAll<HTMLElement>("[data-slot='comment-margin-item']")];
-    const observer = new IntersectionObserver((records) => {
+    const observer = new Intersections((records) => {
       for (const record of records) {
         const item = record.target as HTMLElement;
         const unseen = !record.isIntersecting && !item.hasAttribute("data-active");
         if (item.inert === unseen) continue;
         // Made inert it would drop focus to the body: what holds it hands it to the surface first.
-        if (unseen && item.contains(document.activeElement)) host.closest<HTMLElement>("[data-artifact-focus]")?.focus({ preventScroll: true });
+        if (unseen && item.contains(host.ownerDocument.activeElement)) host.closest<HTMLElement>("[data-artifact-focus]")?.focus({ preventScroll: true });
         item.inert = unseen;
       }
     }, { root: host });
@@ -235,8 +256,6 @@ const MarginCards = memo(function MarginCards({ entries, tops, floor, comments }
   );
 });
 
-/** The room an open card keeps below it at the margin's foot, px. */
-const MARGIN_FOOT_PX = 8;
 
 /** A box on screen for the card the person chose (its own box, client px). */
 function rectOf(element: Element): AnnotationRect {
@@ -313,7 +332,7 @@ function MarginDraftCard({ draft }: { draft: ArtifactCommentDraft }) {
   const excerpt = draft.body.map((part) => (part.type === "text" ? part.text : "")).join("").trim().slice(0, 60);
   const open = useCallback((event: MouseEvent<HTMLButtonElement>) => {
     const card = event.currentTarget.closest("[data-slot='comment-card']") ?? event.currentTarget;
-    openDraftView?.(draft.id, rectOf(card));
+    openDraftView?.(draft.id, rectOf(card), card);
   }, [openDraftView, draft.id]);
   // Made again by its deletion's toast (its Undo): focus comes as it is drawn (a ref, at once on
   // mount), which is once the frame says where its new mark is.

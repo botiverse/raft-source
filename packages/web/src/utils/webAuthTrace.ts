@@ -117,9 +117,9 @@ export type WebEventName =
   | StateViolationTraceEventName
   | ClientErrorTraceEventName
   | UpdateGateTraceEventName
-  | UploadCapabilityFallbackTraceEventName | DirectPutFailureTraceEventName
+  | UploadCapabilityFallbackTraceEventName | DirectPutFailureTraceEventName | "slock.attachment.upload_finished" // utils/attachmentUploadOutcomeTrace.ts
   | MediaPreviewErrorTraceEventName
-  | BootTimingTraceEventName | "slock.web.shell_keep_failed"
+  | BootTimingTraceEventName | "slock.web.vitals" | "slock.web.shell_keep_failed" | "slock.web.message_receive" | "slock.web.sync_gap_recovered"
   | ContextViewTraceEventName | "slock.open_in_app"; // the latter: utils/openInAppTrace.ts (#proj-mobile:#128)
 
 // Spans with a real duration. `slock.channel.join`: Join clicked to the channel on screen; `web.view.switch`: observability/viewSwitchSpan.ts.

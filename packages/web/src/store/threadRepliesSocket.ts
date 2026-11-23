@@ -50,6 +50,8 @@ export interface ThreadUpdatedPayload {
     content?: unknown;
     senderId?: unknown;
     senderType?: unknown;
+    /** "system" for a system line, which is stored with senderType "user" (#15232 sends them live). */
+    messageType?: unknown;
     senderName?: unknown;
     senderDisplayName?: unknown;
     senderAvatarUrl?: unknown;
@@ -92,9 +94,14 @@ export function projectThreadReplyFrame(
       seq,
       preview: typeof latest.content === "string" ? latest.content : "",
       senderId: typeof latest.senderId === "string" ? latest.senderId : "",
-      senderType: typeof senderType === "string" && SENDER_TYPES.has(senderType)
-        ? (senderType as ThreadReplyPreview["senderType"])
-        : "user",
+      // A system line (stored as senderType "user", messageType "system") is a
+      // system reply, as the page-load read maps it (channelService), so the
+      // previews leave it out (artin, #triage:#528).
+      senderType: latest.messageType === "system"
+        ? "system"
+        : typeof senderType === "string" && SENDER_TYPES.has(senderType)
+          ? (senderType as ThreadReplyPreview["senderType"])
+          : "user",
       senderName: typeof latest.senderName === "string" ? latest.senderName : "",
       senderDisplayName: typeof latest.senderDisplayName === "string"
         ? latest.senderDisplayName

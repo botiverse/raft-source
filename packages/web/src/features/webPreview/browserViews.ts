@@ -40,6 +40,12 @@ import { browserOf, browserTabsListInShell, useBrowserTabsStore } from "./browse
  * plays on and is heard, a page that plays outlives the conversation left
  * (while it plays), and switching away from a playing video puts it in
  * picture-in-picture, as Chrome does (apps/desktop webPreviewPlayback.ts).
+ * Where the shell says what the kept pages of a conversation left do
+ * (`list.onInUse`) it is told this web marks it on the conversation's sidebar
+ * row (`inUseMarks`): a page using the microphone or the camera then
+ * outlives the conversation left too (under the same rules), while that
+ * conversation has a row in the sidebar on screen (`setMarkable`, from
+ * browserTabsStore), where it would otherwise be closed, unseen and unmarked.
  */
 
 let bridge: DesktopWebPreviewTabsBridge | null = null;
@@ -61,6 +67,11 @@ const live = new Map<string, number>();
 let shown: string | null = null;
 /** What a shell that keeps the list was last told (`present`): the owner and whether its panel is on screen. */
 let presented: string | null = null;
+
+/** What this web shows of the pages the shell keeps (`present`'s options): a speaker on a tab, the row's mark. */
+function presentOptions(tabs: DesktopWebPreviewTabsBridge): { backgroundMedia: boolean; inUseMarks: boolean } {
+  return { backgroundMedia: tabs.setMuted !== undefined, inUseMarks: tabs.list?.onInUse !== undefined && tabs.list.setMarkable !== undefined };
+}
 
 /** The attached conversation with a browser; of several (two channel panels), the one in front last. */
 function wantedOwner(): string | null {
@@ -117,8 +128,9 @@ function reconcileViews(): void {
     const next = `${showing === wanted}:${wanted ?? ""}`;
     if (wanted === null ? presented === null : next === presented) return;
     presented = wanted === null ? null : next;
-    // This web shows the speaker on a tab where the shell can mute one: a tab behind plays on, heard (#299).
-    bridge.list.present(wanted, wanted !== null && showing === wanted, { backgroundMedia: bridge.setMuted !== undefined });
+    // This web shows the speaker on a tab where the shell can mute one: a tab behind plays on, heard (#299); and the
+    // row's mark where the shell says what kept pages do.
+    bridge.list.present(wanted, wanted !== null && showing === wanted, presentOptions(bridge));
     return;
   }
   if (wanted !== owner) {
@@ -182,7 +194,7 @@ function connect(next: DesktopWebPreviewTabsBridge): void {
 
 function disconnect(): void {
   if (bridge?.list && (browserTabsListInShell() || presented !== null)) {
-    if (presented !== null) bridge.list.present(null, false, { backgroundMedia: bridge.setMuted !== undefined });
+    if (presented !== null) bridge.list.present(null, false, presentOptions(bridge));
   } else if (bridge && owner !== null) bridge.closeAll();
   presented = null;
   unsubscribeState?.();

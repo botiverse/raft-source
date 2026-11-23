@@ -11,7 +11,7 @@ import { createApiTest } from "../test/integration/apiTest";
 // Computer runs 1.0.53 or later (that CLI declares nothing). Without a card
 // (a shared channel, an older client, a conversation in its upgrade-card
 // cooldown) the quota refusal keeps its billing line, softened:
-// say why, and a server owner can look at Settings > Billing. A person's web
+// say why, and a server owner can look at Settings > Plan & billing. A person's web
 // upload over the quota is told to ask a server owner instead. The route's
 // session refusals carry `error`, the field the CLI prints.
 import assert from "node:assert/strict";
@@ -80,7 +80,7 @@ const UNDECLARED = MANUAL_CONTEXT_CAPABILITY;
 
 /** The quota refusal's own next action, where no card is offered, spelled out. */
 function billingLine(billingUrl: string | undefined): string {
-  return `Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: ${billingUrl}`;
+  return `Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Plan & billing: ${billingUrl}`;
 }
 
 function assertBillingLine(refused: Refusal, serverSlug: string) {
@@ -226,7 +226,7 @@ test("over the quota, a person's web upload is told to ask a server owner; the a
     assert.equal(web.errorCode, "FILE_UPLOAD_QUOTA_EXCEEDED");
     assert.equal(web.error, FILE_UPLOAD_QUOTA_EXCEEDED_MESSAGE);
     assert.match(web.billingUrl ?? "", new RegExp(`/s/${server.slug}/settings/billing$`));
-    assert.equal(web.suggestedNextAction, `Ask a server owner to open Settings > Billing and upgrade to Pro: ${web.billingUrl}`);
+    assert.equal(web.suggestedNextAction, `Ask a server owner to open Settings > Plan & billing and upgrade to Pro: ${web.billingUrl}`);
 
     // The agent's, from a client that can't post a card: the agent's line, same link.
     const agent = await refusal(await upload(app.baseUrl, apiKey, room.id, undefined, UNDECLARED), 403);

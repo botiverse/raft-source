@@ -6,6 +6,77 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `raft.artifacts.settle({ artifact })` / `raft.artifacts.unsettle({ artifact })`
+  and their tools `artifacts_settle` / `artifacts_unsettle` (`POST
+  /artifacts/:artifact/settle | unsettle`, as `raft artifact settle |
+  unsettle`): mark an artifact Settled (done, no longer a draft under
+  discussion) at its current version, or take it back to Working. Outcome
+  states `settled` / `already_settled` and `working` / `already_working`.
+  Artifact summaries carry `settled` and `reopened` where the Artifact's
+  server has Settled on; `artifacts.read` says so in one line, `artifacts.list`
+  ends a settled one's line with `settled`, and a push to a settled artifact is
+  held once (`serverCode: "SETTLED"`; the same push again goes through and its
+  answer carries `wasSettled`). Servers without it answer
+  `SETTLED_NOT_AVAILABLE`.
+
+### Fixed
+
+- No request sends `redirect: "error"`, which the Cloudflare Workers runtime
+  rejects, so on Workers each such call failed before it left (`./app`:
+  `network_error`). That was `./app`'s client, the agent client's inbox and
+  events reads, assistant owner actions and the attachment upload's PUT.
+  They now send `redirect: "manual"` and refuse any 3xx answer, or a
+  browser's opaque redirect, themselves: a redirect is still never followed,
+  so a token never reaches its target, and still reads as a network failure.
+  A Workers app no longer needs its own `fetch` for `./app`. The agent
+  client's reads also send `cache: "no-store"`, which Workers accept from
+  compatibility date 2024-11-11.
+
+## [0.38.0] — 2026-11-19
+
+Additions and one fix; nothing is removed or renamed.
+
+### Added
+
+- App reply text in `raft.integrations.call` (Raft's App reply-text
+  convention, docs/raft-app/README.md "Reply text: what an Agent reads"):
+  when an App's JSON answer carries a top-level string `text`, a `result`
+  outcome has `data.text` (the text cleaned: `\n` line breaks only, control
+  characters made spaces, zero-width and bidi marks dropped, credential shapes
+  redacted, cut at 4000 characters with a note; `data.textCutFrom` is the full
+  length when cut) and its `text` quotes that reply, every line prefixed `  │ `, instead of the JSON.
+  `data.body` still holds the whole answer. On a refusal the reply text is
+  `error.message`, quoted and redacted like the rest; `error.nextAction`
+  stays the SDK's. Answers without `text` are unchanged. Works with any
+  Server; it depends only on the App sending `text`.
+- `raft.channels.setRole({ target, user | agent, role })` and its tool
+  `channels_set_role` (`POST /channels/member-role`, as
+  `raft channel set-role`): make a channel member a channel admin
+  (`role: "admin"`) or a channel admin a plain member (`role: "member"`).
+  The Server decides on every call (a channel admin there, or a server
+  owner or admin; never your own role, nor a server owner's or admin's).
+  Outcome states `changed` / `unchanged`. A refusal keeps the Server's
+  `serverCode` and sentence: `channel_member_required` names the other
+  argument (`agent` for `user`, and back), and
+  `channel_capability_required` points to `channels_members` to see who can
+  change the role. Older Servers answer 404.
+- `channels.members` rows carry `channelRole` (`admin` or `member`) where
+  the channel has channel roles (public, private and joint channels other
+  than `#all`; on a joint channel a person is `admin` when they can manage
+  it, and another server's agent carries none); its text marks
+  `channel role=admin`. Older Servers omit it.
+
+### Fixed
+
+- In `hints: "tool"`, a refusal whose step or sentence quotes something you
+  typed that reads like a command (a title such as "raft docs plan", a path
+  such as "notes/--draft.md") keeps that step and sentence. Before, the SDK
+  took them for CLI text and swapped in the generic default, so e.g. the
+  `artifacts_list({ query: ... })` step after NOT_VISIBLE was lost. Commands
+  and flags outside quoted values are still re-rendered as before.
+
 ## [0.37.0] — 2026-11-16
 
 All changes are additions.

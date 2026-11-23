@@ -1,4 +1,4 @@
-import { refuse } from "../lib/refusal";
+import { refuse, type RefusalInput } from "../lib/refusal";
 import { respondToTaskWriteError } from "../lib/taskWriteErrorResponse";
 import { Router, type Request, type Response, type Router as RouterType } from "express";
 import * as taskService from "../services/taskService";
@@ -8,7 +8,7 @@ import { getServerHistoryWindowForRead, humanHistoryLimitedError, isBehindHistor
 import * as userService from "../services/userService";
 import type { Server as SocketServer } from "socket.io";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
-import { authorizeTaskAction, checkTaskAssignReason, TASK_ASSIGN_REASON_UNCHANGED, checkTaskCreateStatus, checkTaskStatusReason, isSubConversationType, isTaskCreateStatus, isTaskStatus, TASK_DESCRIPTION_MAX_LENGTH, TASK_STATUSES, TASK_TITLE_MAX_LENGTH, type ServerId, type TaskAction, type TaskAssignmentNoticeMetadata, type TaskStatus } from "@botiverse/raft-shared";
+import { authorizeTaskAction, checkTaskAssignReason, TASK_ASSIGN_REASON_UNCHANGED, checkTaskCreateStatus, TASK_CREATE_STATUSES, checkTaskStatusReason, isSubConversationType, isTaskCreateStatus, isTaskStatus, TASK_DESCRIPTION_MAX_LENGTH, TASK_STATUSES, TASK_TITLE_MAX_LENGTH, type ServerId, type TaskAction, type TaskAssignmentNoticeMetadata, type TaskStatus } from "@botiverse/raft-shared";
 import { UUID_RE } from "../lib/messageId";
 import { guardUuidPathParams } from "../lib/uuidPathParams";
 import { emitTaskCreated, emitTaskDeleted, emitTaskMessageNew, emitTaskUpdated } from "../services/taskRealtimeEvents";
@@ -20,6 +20,8 @@ import { creatorSourceMessageContent, postTaskCreatorSourceMessage, TASK_SOURCE_
 import { checkHumanPostAdmission, HUMAN_POST_REFUSALS } from "../services/humanPostAdmission";
 import { channelBillingReadOnlyBody } from "../services/planService";
 import { MAX_MESSAGE_LENGTH } from "./messages";
+import { serviceMessageRefusal, TOO_MANY_TASKS_REFUSAL } from "./agentRouteRefusals";
+import { taskStatusRejectionCode } from "./agentApiErrorTrace";
 import { notePaywallHit } from "./paywallHit";
 import { getUserTaskConversationFollowStates, listTaskConversationsByParentChannel } from "../services/taskConversationService";
 import { actorHasServerCapabilityInServer, getActorServerRoleInServer } from "../lib/actorPermissions";
@@ -37,6 +39,106 @@ export const taskRouter: RouterType = Router();
 // Uniform 404 for non-UUID path params (task #12), before any handler runs.
 // `taskNumber` is deliberately excluded (it is an integer, not a UUID).
 guardUuidPathParams(taskRouter, { channelId: "Channel", taskId: "Task" });
+
+/**
+ * A channel whose tasks this person can't reach: missing, deleted, another
+ * server's or a task's own conversation (task create refuses that one as a
+ * thread), and on the routes that check read access first (the list, a task
+ * by number, the metrics, convert) one they can't read. The agent API's task
+ * routes answer the same code
+ * (TASK_CHANNEL_NOT_FOUND_REFUSAL, in their own words). A non-UUID channelId
+ * still gets the param guard's codeless "Channel not found".
+ */
+const TASK_CHANNEL_NOT_FOUND_HUMAN_REFUSAL: RefusalInput = { code: "task_channel_not_found", error: "Channel not found" };
+/**
+ * A task this person can't see: no task with that id or number, one on another
+ * server, or one in a channel they can't read, one body for every reason. A
+ * non-UUID taskId still gets the param guard's codeless "Task not found".
+ */
+const TASK_NOT_FOUND_HUMAN_REFUSAL: RefusalInput = { code: "task_not_found", error: "Task not found" };
+/** The task metrics reads take the server's owners and admins only. */
+const TASK_METRICS_ADMIN_REQUIRED_REFUSAL: RefusalInput = { code: "server_admin_required", error: "Server administrator required" };
+/** A cursor GET /server can't continue (not one it gave, without a page size, or for another walk). */
+const SERVER_TASKS_CURSOR_INVALID_REFUSAL: RefusalInput = { code: "INVALID_CURSOR", error: "Invalid cursor" };
+const SERVER_TASKS_LIMIT_INVALID_REFUSAL: RefusalInput = { code: "limit_invalid", error: "Invalid limit value" };
+/** A create, claim or convert aimed at a thread or a task's own conversation, which hold no tasks (the agent API's `thread_target`). */
+const TASK_CREATE_IN_THREAD_HUMAN_REFUSAL: RefusalInput = { code: "thread_target", error: "Thread messages cannot become tasks" };
+const TASK_CLAIM_IN_THREAD_HUMAN_REFUSAL: RefusalInput = { code: "thread_target", error: "Thread messages cannot be claimed as tasks" };
+/** A task write by someone who can't post in its channel (the agent API's `channel_membership_required`). */
+const TASK_WRITE_MEMBERSHIP_REQUIRED_REFUSAL: RefusalInput = { code: "channel_membership_required", error: "You must join this channel to modify tasks" };
+/** Opening a task's conversation by someone who can't post in its channel (`channel_membership_required`, as a task write). */
+const TASK_REPLY_MEMBERSHIP_REQUIRED_REFUSAL: RefusalInput = { code: "channel_membership_required", error: "You must join this channel to reply in this task" };
+/**
+ * A convert whose message this person can't reach: no message with that id,
+ * or one whose channel isn't on this server (the agent API's and the people's
+ * message routes' `message_not_found`). A message in a channel of this server
+ * they can't read answers "Channel not found" instead (rejectIfNoTaskReadAccess).
+ */
+const CONVERT_MESSAGE_NOT_FOUND_HUMAN_REFUSAL: RefusalInput = { code: "message_not_found", error: "Message not found" };
+/** An `expectedRevision` (the assign's and the edit's OCC token) that isn't an integer. */
+const EXPECTED_REVISION_INVALID_REFUSAL: RefusalInput = { code: "expected_revision_invalid", error: "expectedRevision must be an integer" };
+
+/** A convert the task service refused (409), in its words, classified as the agent API's convert route does (taskService.convertMessageToTask's reasons). */
+function taskConvertHumanRefusal(reason: string): RefusalInput {
+  const code = reason === "already converted" ? "already_converted"
+    : reason === "message not found" || reason === "message not in this channel" ? "message_not_found"
+    : reason.startsWith("thread messages") ? "thread_target"
+    : reason.startsWith("external projection messages") ? "external_message"
+    : reason.startsWith("system messages") ? "system_message"
+    : "task_convert_rejected";
+  return { code, error: reason };
+}
+
+/** An unclaim the task service refused (409), in its words, classified as the agent API's unclaim route does (taskService.unclaimTask's reasons). */
+function taskUnclaimHumanRefusal(reason: string): RefusalInput {
+  const code = reason === "task not found" ? "task_not_found"
+    : reason === "task is done" ? "task_done"
+    : reason === "task is not assigned" ? "task_not_assigned"
+    : reason === "task state changed concurrently" ? "task_state_conflict"
+    : "task_unclaim_rejected";
+  return { code, error: reason };
+}
+
+/** An assignment the task service refused (409), in its words, classified as the agent API's assign route does (taskService.assignTask's reasons; a lost revision race is answered with its currentRevision before this). */
+function taskAssignHumanRefusal(reason: string): RefusalInput {
+  const code = reason === "task not found" ? "task_not_found"
+    : reason === "task is done" ? "task_done"
+    : reason === "task state changed concurrently" ? "task_state_conflict"
+    : reason === "task channel is unavailable" ? "task_channel_unavailable"
+    : reason === "assignee not found" ? "assignee_not_found"
+    : reason === "assignee is not a member of this channel" ? "assignee_not_member"
+    : reason === taskService.TASK_ASSIGN_REASON_UNCHANGED_ERROR ? TASK_ASSIGN_REASON_UNCHANGED
+    : "task_assign_rejected";
+  return { code, error: reason };
+}
+
+/** An edit the task service refused (409) for a reason the route doesn't answer on its own, in its words (taskService.amendTask's reasons). */
+function taskAmendHumanRefusal(reason: string): RefusalInput {
+  return { code: reason.startsWith("legacy task cards") ? "task_legacy_card" : "task_amend_rejected", error: reason };
+}
+
+/** A status change the task service refused (409), in its words, its code the agent API's (taskStatusRejectionCode). */
+function taskStatusHumanRefusal(reason: string): RefusalInput {
+  return { code: taskStatusRejectionCode(reason), error: reason };
+}
+/** A task from before its channel was shared, written from a participant workspace (as humanPostAdmission's). */
+const HISTORICAL_JOINT_TASK_READ_ONLY_REFUSAL: RefusalInput = { code: "joint_task_read_only", error: "Historical tasks are read-only from a participant workspace" };
+/** The create status check's sentence quotes the requested status; this one stands in when that value breaks the sentence rules. */
+const TASK_CREATE_STATUS_FALLBACK = `A task can't be created in that status: choose ${TASK_CREATE_STATUSES.slice(0, -1).join(", ")} or ${TASK_CREATE_STATUSES[TASK_CREATE_STATUSES.length - 1]}. A task reaches in_review, done or closed through its work.`;
+
+/** A task history read the task service refused (409), its reason classified as the agent API's history route does. */
+function taskHistoryRefusal(reason: string): RefusalInput {
+  const code = reason === "task not found"
+    ? "task_not_found"
+    : reason.startsWith("legacy task cards") ? "task_legacy_card" : "task_history_rejected";
+  return { code, error: reason };
+}
+
+/** A claim the task service refused (409), in its words (taskService.claimTask's reasons). */
+function taskClaimRefusal(reason: string): RefusalInput {
+  const code = reason === "task not found" ? "task_not_found" : reason === "task is done" ? "task_done" : "task_claim_rejected";
+  return { code, error: reason };
+}
 
 /**
  * Task v2: `conversationFollowed` on the web task DTO — whether the requesting
@@ -96,7 +198,7 @@ export async function listChannelTaskRows(
 async function rejectIfNoTaskReadAccess(channelId: string, userId: string, serverId: ServerId, res: Response): Promise<boolean> {
   const canAccess = await channelService.canUserAccessChannel(channelId, userId, serverId);
   if (!canAccess) {
-    res.status(404).json({ error: "Channel not found" });
+    refuse(res, 404, TASK_CHANNEL_NOT_FOUND_HUMAN_REFUSAL);
     return true;
   }
   return false;
@@ -108,7 +210,7 @@ taskRouter.get("/channel/:channelId", async (req, res) => {
     const viewer = { userId: req.userId!, serverId: req.serverId! };
     const surface = await resolveReadableTaskSurface(viewer, req.params.channelId);
     if (!surface) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, TASK_CHANNEL_NOT_FOUND_HUMAN_REFUSAL);
       return;
     }
     // Validate + narrow the optional ?status filter (was an `as TaskStatus` cast).
@@ -118,7 +220,7 @@ taskRouter.get("/channel/:channelId", async (req, res) => {
     let statusFilter: TaskStatus | undefined;
     if (statusParam !== undefined) {
       if (typeof statusParam !== "string" || !isTaskStatus(statusParam)) {
-        res.status(400).json({ error: "Invalid status value" });
+        refuse(res, 400, { code: "invalid_status", error: "Invalid status value" });
         return;
       }
       statusFilter = statusParam;
@@ -134,20 +236,20 @@ taskRouter.get("/channel/:channelId/number/:taskNumber", async (req, res) => {
   try {
     const surface = await resolveTaskChannelSurface(req.serverId!, req.params.channelId);
     if (!surface) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, TASK_CHANNEL_NOT_FOUND_HUMAN_REFUSAL);
       return;
     }
     if (await rejectIfNoTaskReadAccess(surface.localChannel.id, req.userId!, req.serverId!, res)) return;
 
     const taskNumber = Number(req.params.taskNumber);
     if (!Number.isInteger(taskNumber) || taskNumber <= 0) {
-      res.status(400).json({ error: "Invalid task number" });
+      refuse(res, 400, { code: "task_number_invalid", error: "Invalid task number" });
       return;
     }
 
     const owner = await taskService.resolveTaskByNumber(surface.storageChannelId, taskNumber);
     if (!owner) {
-      res.status(404).json({ error: "Task not found" });
+      refuse(res, 404, TASK_NOT_FOUND_HUMAN_REFUSAL);
       return;
     }
     const enriched = await taskService.enrichSingleLegacyTask(owner.row);
@@ -214,10 +316,10 @@ function decodeServerTasksCursor(raw: string): taskService.ServerTasksPageCursor
 taskRouter.get("/server/snapshot-metrics", async (req, res) => {
   try {
     const role = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
-    if (role !== "owner" && role !== "admin") { res.status(403).json({ error: "Server administrator required" }); return; }
+    if (role !== "owner" && role !== "admin") { refuse(res, 403, TASK_METRICS_ADMIN_REQUIRED_REFUSAL); return; }
     const { channelId } = req.query;
     if (channelId !== undefined && (typeof channelId !== "string" || !UUID_RE.test(channelId))) {
-      res.status(400).json({ error: "A valid channel is required" }); return;
+      refuse(res, 400, { code: "task_metrics_channel_invalid", error: "A valid channel is required" }); return;
     }
     if (typeof channelId === "string" && await rejectIfNoTaskReadAccess(channelId, req.userId!, req.serverId!, res)) return;
     res.json(await taskService.getServerTaskSnapshot(req.serverId!, req.userId!, channelId as string | undefined));
@@ -228,14 +330,14 @@ taskRouter.get("/server/snapshot-metrics", async (req, res) => {
 taskRouter.get("/server/period-metrics", async (req, res) => {
   try {
     const role = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
-    if (role !== "owner" && role !== "admin") { res.status(403).json({ error: "Server administrator required" }); return; }
+    if (role !== "owner" && role !== "admin") { refuse(res, 403, TASK_METRICS_ADMIN_REQUIRED_REFUSAL); return; }
     const { from, midpoint, to, channelId } = req.query;
     const validDate = (value: unknown): value is string => typeof value === "string" && Number.isFinite(Date.parse(value));
     if (!validDate(from) || !validDate(midpoint) || !validDate(to) ||
       Date.parse(midpoint) - Date.parse(from) !== Date.parse(to) - Date.parse(midpoint) ||
       Date.parse(from) >= Date.parse(midpoint) || Date.parse(to) - Date.parse(from) > 180 * 86_400_000 ||
       (channelId !== undefined && (typeof channelId !== "string" || !UUID_RE.test(channelId)))) {
-      res.status(400).json({ error: "Two equal positive periods and a valid channel are required" }); return;
+      refuse(res, 400, { code: "task_metrics_periods_invalid", error: "Two equal positive periods and a valid channel are required" }); return;
     }
     if (typeof channelId === "string" && await rejectIfNoTaskReadAccess(channelId, req.userId!, req.serverId!, res)) return;
     const metrics = await taskService.getServerTaskPeriodMetrics(req.serverId!, req.userId!, new Date(from), new Date(midpoint), new Date(to), channelId as string | undefined);
@@ -401,6 +503,7 @@ taskRouter.get("/server", async (req, res) => {
     const legacyStatus = statusParam === undefined || (typeof statusParam === "string" && !statusParam.includes(","));
     if (legacyStatus && statusParam !== undefined) {
       if (typeof statusParam !== "string" || !isTaskStatus(statusParam)) {
+        // refusal-ok: tasks.serverBoardFilters.api.test.ts pins this lone-status 400 without a code (the route's older single-status check)
         res.status(400).json({ error: "Invalid status value" });
         return;
       }
@@ -432,7 +535,7 @@ taskRouter.get("/server", async (req, res) => {
     let detail: "full" | "summary" = "full";
     if (detailParam !== undefined) {
       if (detailParam !== "summary") {
-        res.status(400).json({ error: "Invalid detail value" });
+        refuse(res, 400, { code: "INVALID_TASK_DETAIL", error: "Invalid detail value" });
         return;
       }
       detail = "summary";
@@ -442,12 +545,12 @@ taskRouter.get("/server", async (req, res) => {
     let limit: number | undefined;
     if (limitParam !== undefined) {
       if (typeof limitParam !== "string" || !/^\d+$/.test(limitParam)) {
-        res.status(400).json({ error: "Invalid limit value" });
+        refuse(res, 400, SERVER_TASKS_LIMIT_INVALID_REFUSAL);
         return;
       }
       limit = Number(limitParam);
       if (limit < 1 || limit > SERVER_TASKS_MAX_LIMIT) {
-        res.status(400).json({ error: "Invalid limit value" });
+        refuse(res, 400, SERVER_TASKS_LIMIT_INVALID_REFUSAL);
         return;
       }
     }
@@ -467,12 +570,12 @@ taskRouter.get("/server", async (req, res) => {
     if (cursorParam !== undefined) {
       // A cursor without a page size cannot be walked.
       if (typeof cursorParam !== "string" || limit === undefined) {
-        res.status(400).json({ error: "Invalid cursor" });
+        refuse(res, 400, SERVER_TASKS_CURSOR_INVALID_REFUSAL);
         return;
       }
       cursor = decodeServerTasksCursor(cursorParam);
       if (!cursor) {
-        res.status(400).json({ error: "Invalid cursor" });
+        refuse(res, 400, SERVER_TASKS_CURSOR_INVALID_REFUSAL);
         return;
       }
     }
@@ -499,7 +602,7 @@ taskRouter.get("/server", async (req, res) => {
         // Only failure the service reports: the cursor's channel fell out of
         // the visible set, so its position in the total order is unknowable;
         // or the cursor belongs to another walk (another sort, or none).
-        res.status(400).json({ error: "Invalid cursor" });
+        refuse(res, 400, SERVER_TASKS_CURSOR_INVALID_REFUSAL);
         return;
       }
       payload = paginated
@@ -535,7 +638,7 @@ taskRouter.get("/:taskId/history", async (req, res) => {
     if (!task) return;
     const history = await taskService.listTaskHistory(task.id);
     if (typeof history === "string") {
-      res.status(409).json({ error: history });
+      refuse(res, 409, taskHistoryRefusal(history));
       return;
     }
     res.json({ events: history });
@@ -549,18 +652,28 @@ taskRouter.post("/channel/:channelId", async (req, res) => {
   try {
     const surface = await resolveTaskChannelSurface(req.serverId!, req.params.channelId);
     if (!surface) {
-      // A task's own conversation has no task surface; refuse it as a thread is.
+      // A task's own conversation has no task surface; refuse it as a thread
+      // is, but only to a caller who can read it: to anyone else it is the
+      // missing-channel 404, so a hidden id reads like one that doesn't exist.
       const channel = await channelService.getChannel(req.params.channelId);
-      if (channel?.serverId === req.serverId && channel.type === "task") {
-        res.status(409).json({ error: "Thread messages cannot become tasks" });
+      if (
+        channel?.serverId === req.serverId
+        && channel.type === "task"
+        && await channelService.canUserAccessChannel(channel.id, req.userId!, req.serverId!)
+      ) {
+        refuse(res, 409, TASK_CREATE_IN_THREAD_HUMAN_REFUSAL);
         return;
       }
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, TASK_CHANNEL_NOT_FOUND_HUMAN_REFUSAL);
       return;
     }
+    // Read access before anything that tells what the id is: a channel, DM or
+    // thread the caller can't read answers the missing-channel 404, not the
+    // thread 409 or the write 403 below.
+    if (await rejectIfNoTaskReadAccess(surface.localChannel.id, req.userId!, req.serverId!, res)) return;
     // A sub-conversation (a thread, a task's own conversation) holds no tasks.
     if (isSubConversationType(surface.localChannel.type)) {
-      res.status(409).json({ error: "Thread messages cannot become tasks" });
+      refuse(res, 409, TASK_CREATE_IN_THREAD_HUMAN_REFUSAL);
       return;
     }
     if (await rejectIfNoTaskWriteAccess(surface.localChannel.id, req.userId!, req.serverId!, "create", res)) return;
@@ -571,30 +684,30 @@ taskRouter.post("/channel/:channelId", async (req, res) => {
     // These tasks are unassigned; an in_progress one simply has no claimant.
     const statusRefusal = checkTaskCreateStatus(requestedStatus);
     if (statusRefusal) {
-      res.status(400).json({ error: statusRefusal.message, code: statusRefusal.code });
+      refuse(res, 400, serviceMessageRefusal(statusRefusal.code, statusRefusal.message, TASK_CREATE_STATUS_FALLBACK));
       return;
     }
     const initialStatus = isTaskCreateStatus(requestedStatus) ? requestedStatus : undefined;
     if (!Array.isArray(items) || items.length === 0) {
-      res.status(400).json({ error: "tasks array is required" });
+      refuse(res, 400, { code: "tasks_required", error: "tasks array is required" });
       return;
     }
     if (items.length > 50) {
-      res.status(400).json({ error: "Cannot create more than 50 tasks at once" });
+      refuse(res, 400, { code: TOO_MANY_TASKS_REFUSAL.code, error: "Cannot create more than 50 tasks at once" });
       return;
     }
 
     for (const item of items) {
       if (!item.title || typeof item.title !== "string" || item.title.trim().length === 0) {
-        res.status(400).json({ error: "Each task must have a non-empty title" });
+        refuse(res, 400, { code: "task_title_required", error: "Each task must have a non-empty title" });
         return;
       }
       if (item.description != null && typeof item.description !== "string") {
-        res.status(400).json({ error: "Task description must be a string" });
+        refuse(res, 400, { code: "task_description_invalid", error: "Task description must be a string" });
         return;
       }
       if (item.sourceMessageId != null && typeof item.sourceMessageId !== "string") {
-        res.status(400).json({ error: "sourceMessageId must be a message id", code: "invalid_source_message" });
+        refuse(res, 400, { code: "invalid_source_message", error: "sourceMessageId must be a message id" });
         return;
       }
     }
@@ -674,6 +787,7 @@ taskRouter.post("/channel/:channelId", async (req, res) => {
       createItems,
       {
         initiatingServerId: surface.localChannel.serverId,
+        localChannelId: surface.localChannel.id,
         ...(initialStatus !== undefined && { initialStatus }),
       },
     );
@@ -791,7 +905,7 @@ async function postCreatorSourceMessage(
       return null;
     }
     const refusal = HUMAN_POST_REFUSALS[admission.refusal];
-    refuse(res, refusal.status, { code: admission.refusal, error: refusal.error });
+    refuse(res, refusal.status, { code: refusal.code, error: refusal.error });
     return null;
   }
   const user = await userService.getUser(userId);
@@ -866,7 +980,7 @@ interface ResolvedTask {
 /** Reject mutations on archived channels. Returns true if blocked (response already sent). */
 async function rejectIfArchived(channelId: string, res: Response): Promise<boolean> {
   if (await channelService.isChannelArchived(channelId)) {
-    res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+    refuse(res, 409, { code: "channel_archived", error: "This channel is archived" });
     return true;
   }
   return false;
@@ -895,7 +1009,7 @@ async function rejectIfNoTaskWriteAccess(
     hasDeleteAnyTask,
     ...relationship,
   })) {
-    res.status(403).json({ error: "You must join this channel to modify tasks" });
+    refuse(res, 403, TASK_WRITE_MEMBERSHIP_REQUIRED_REFUSAL);
     return true;
   }
   return false;
@@ -913,9 +1027,9 @@ async function rejectIfNoTaskWriteAccess(
 function rejectIfOrphanNonTerminal(task: ResolvedTask, intent: "terminal" | "non_terminal", res: Response): boolean {
   if (!task.isOrphan) return false;
   if (intent === "terminal") return false;
-  res.status(409).json({
-    error: "This channel was deleted; only mark-done or mark-closed are allowed on the task",
+  refuse(res, 409, {
     code: "channel_deleted_terminal_only",
+    error: "This channel was deleted; only mark-done or mark-closed are allowed on the task",
   });
   return true;
 }
@@ -932,13 +1046,13 @@ async function rejectIfNoChannelWriteAccess(
   if (task.isOrphan) {
     const serverRole = await getActorServerRoleInServer(serverId, "user", userId);
     if (serverRole === "guest") {
-      res.status(403).json({ error: "Guests can't change tasks" });
+      refuse(res, 403, { code: "task_guest_forbidden", error: "Guests can't change tasks" });
       return true;
     }
     return false;
   }
   if (task.jointSurface && isHistoricalJointTaskReadOnly(task.jointSurface, task.raw.createdAt)) {
-    res.status(403).json({ error: "Historical tasks are read-only from a participant workspace", code: "joint_task_read_only" });
+    refuse(res, 403, HISTORICAL_JOINT_TASK_READ_ONLY_REFUSAL);
     return true;
   }
   if (await rejectIfNoTaskWriteAccess(task.channelId, userId, serverId, action, res, relationship)) return true;
@@ -959,13 +1073,13 @@ async function rejectIfNoChannelWriteAccess(
  */
 async function requireTaskInServer(req: Request, res: Response): Promise<ResolvedTask | null> {
   const owner = await taskService.resolveTaskById(String(req.params.taskId));
-  if (!owner) { res.status(404).json({ error: "Task not found" }); return null; }
+  if (!owner) { refuse(res, 404, TASK_NOT_FOUND_HUMAN_REFUSAL); return null; }
 
   const storageChannelId = owner.row.channelId;
   const surface = await resolveTaskChannelSurfaceForStorage(req.serverId!, storageChannelId, { includeDeleted: true });
-  if (!surface) { res.status(404).json({ error: "Task not found" }); return null; }
+  if (!surface) { refuse(res, 404, TASK_NOT_FOUND_HUMAN_REFUSAL); return null; }
   if (!await channelService.canUserAccessChannel(surface.localChannel.id, req.userId!, req.serverId!, { includeDeleted: true })) {
-    res.status(404).json({ error: "Task not found" });
+    refuse(res, 404, TASK_NOT_FOUND_HUMAN_REFUSAL);
     return null;
   }
 
@@ -1091,14 +1205,14 @@ taskRouter.patch("/:taskId/claim", async (req, res) => {
     const task = await requireTaskInServer(req, res);
     if (!task) return;
     if (task.channelType === "thread") {
-      res.status(409).json({ error: "Thread messages cannot be claimed as tasks" });
+      refuse(res, 409, TASK_CLAIM_IN_THREAD_HUMAN_REFUSAL);
       return;
     }
     if (rejectIfOrphanNonTerminal(task, "non_terminal", res)) return;
     if (await rejectIfNoChannelWriteAccess(task, req.userId!, req.serverId!, "claim", res)) return;
 
     const result = await taskService.claimTask(task.id, "user", req.userId!, req.serverId!);
-    if (typeof result === "string") { res.status(409).json({ error: result }); return; }
+    if (typeof result === "string") { refuse(res, 409, taskClaimRefusal(result)); return; }
 
     const enriched = await emitTaskUpdate(req, task, await withTaskConversationEnsured(result, { initiatingServerId: task.localChannel.serverId }));
     // Lifecycle notice goes to the task's own thread, not the parent channel.
@@ -1134,7 +1248,7 @@ taskRouter.post("/convert-message", async (req, res) => {
   try {
     const { messageId } = req.body;
     if (!messageId) {
-      res.status(400).json({ error: "messageId is required" });
+      refuse(res, 400, { code: "message_id_required", error: "messageId is required" });
       return;
     }
 
@@ -1143,31 +1257,45 @@ taskRouter.post("/convert-message", async (req, res) => {
     // channel id.
     const msg = await messageService.getMessage(messageId);
     if (!msg) {
-      res.status(404).json({ error: "Message not found" });
+      refuse(res, 404, CONVERT_MESSAGE_NOT_FOUND_HUMAN_REFUSAL);
+      return;
+    }
+    // A task's own conversation has no task surface: refuse a message in it
+    // as one in a thread, but only to a caller who can read it; to anyone
+    // else it reads like a missing message.
+    const msgChannel = await channelService.getChannel(msg.channelId);
+    if (msgChannel?.type === "task") {
+      if (msgChannel.serverId !== req.serverId || !await channelService.canUserAccessChannel(msgChannel.id, req.userId!, req.serverId!)) {
+        refuse(res, 404, CONVERT_MESSAGE_NOT_FOUND_HUMAN_REFUSAL);
+        return;
+      }
+      refuse(res, 409, TASK_CLAIM_IN_THREAD_HUMAN_REFUSAL);
       return;
     }
     const surface = await resolveTaskChannelSurfaceForStorage(req.serverId!, msg.channelId);
     if (!surface) {
-      res.status(404).json({ error: "Message not found" });
+      refuse(res, 404, CONVERT_MESSAGE_NOT_FOUND_HUMAN_REFUSAL);
       return;
     }
-    if (await rejectIfNoTaskReadAccess(surface.localChannel.id, req.userId!, req.serverId!, res)) return;
+    // A message in a channel the caller can't read answers exactly like a
+    // missing one.
+    if (!await channelService.canUserAccessChannel(surface.localChannel.id, req.userId!, req.serverId!)) {
+      refuse(res, 404, CONVERT_MESSAGE_NOT_FOUND_HUMAN_REFUSAL);
+      return;
+    }
     // After access: a message behind the plan's history window can't become a
     // task (its text would be the title) (services/historyWindow.ts).
     const historyWindow = await getServerHistoryWindowForRead(req.serverId!);
     if (isBehindHistoryWindow(msg.createdAt, historyWindow)) {
-      res.status(404).json(humanHistoryLimitedError(historyWindow));
+      refuse(res, 404, humanHistoryLimitedError(historyWindow));
       return;
     }
     if (surface.localChannel.type === "thread") {
-      res.status(409).json({ error: "Thread messages cannot be claimed as tasks" });
+      refuse(res, 409, TASK_CLAIM_IN_THREAD_HUMAN_REFUSAL);
       return;
     }
     if (isHistoricalJointTaskReadOnly(surface, msg.createdAt)) {
-      res.status(403).json({
-        error: "Historical tasks are read-only from a participant workspace",
-        code: "joint_task_read_only",
-      });
+      refuse(res, 403, HISTORICAL_JOINT_TASK_READ_ONLY_REFUSAL);
       return;
     }
     if (await rejectIfNoTaskWriteAccess(surface.localChannel.id, req.userId!, req.serverId!, "convert", res)) return;
@@ -1183,7 +1311,7 @@ taskRouter.post("/convert-message", async (req, res) => {
 
     const result = await taskService.convertMessageToTask(messageId, "user", req.userId!, surface.storageChannelId);
     if (typeof result === "string") {
-      res.status(409).json({ error: result });
+      refuse(res, 409, taskConvertHumanRefusal(result));
       return;
     }
 
@@ -1235,16 +1363,16 @@ taskRouter.post("/:taskId/conversation", async (req, res) => {
     const task = await requireTaskInServer(req, res);
     if (!task) return;
     if (task.isLegacy) {
-      res.status(409).json({ error: "This task has no conversation", code: "task_without_conversation" });
+      refuse(res, 409, { code: "task_without_conversation", error: "This task has no conversation" });
       return;
     }
     if (rejectIfOrphanNonTerminal(task, "non_terminal", res)) return;
     if (task.jointSurface && isHistoricalJointTaskReadOnly(task.jointSurface, task.raw.createdAt)) {
-      res.status(403).json({ error: "Historical tasks are read-only from a participant workspace", code: "joint_task_read_only" });
+      refuse(res, 403, HISTORICAL_JOINT_TASK_READ_ONLY_REFUSAL);
       return;
     }
     if (!await channelService.canUserPostToChannel(task.channelId, req.userId!)) {
-      res.status(403).json({ error: "You must join this channel to reply in this task" });
+      refuse(res, 403, TASK_REPLY_MEMBERSHIP_REQUIRED_REFUSAL);
       return;
     }
     if (await rejectIfArchived(task.channelId, res)) return;
@@ -1256,9 +1384,9 @@ taskRouter.post("/:taskId/conversation", async (req, res) => {
       createdByUserId: req.userId!,
     });
     if (!conversation) {
-      res.status(409).json({
-        error: "Task conversations are not enabled on this server; the task's discussion is its message thread",
+      refuse(res, 409, {
         code: "task_v2_not_enabled",
+        error: "Task conversations are not enabled on this server; the task's discussion is its message thread",
       });
       return;
     }
@@ -1286,7 +1414,7 @@ taskRouter.patch("/:taskId/unclaim", async (req, res) => {
     })) return;
 
     const result = await taskService.unclaimTask(task.id, "user", req.userId!, req.serverId!);
-    if (typeof result === "string") { res.status(409).json({ error: result }); return; }
+    if (typeof result === "string") { refuse(res, 409, taskUnclaimHumanRefusal(result)); return; }
 
     const enriched = await emitTaskUpdate(req, task, await withTaskConversationEnsured(result, { initiatingServerId: task.localChannel.serverId }));
     // Lifecycle notice goes to the task's own thread, not the parent channel.
@@ -1341,7 +1469,7 @@ taskRouter.patch("/:taskId/assignee", async (req, res) => {
       await getActorServerRoleInServer(req.serverId!, "user", req.userId!) !== "guest"
       && !await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "assignTasks")
     ) {
-      res.status(403).json({ error: "You do not have permission to assign tasks" });
+      refuse(res, 403, { code: "task_assign_forbidden", error: "You do not have permission to assign tasks" });
       return;
     }
 
@@ -1351,7 +1479,7 @@ taskRouter.patch("/:taskId/assignee", async (req, res) => {
       reason?: unknown;
     };
     if (!("assignee" in body)) {
-      res.status(400).json({ error: "assignee is required (use null to unassign)" });
+      refuse(res, 400, { code: "assignee_required", error: "assignee is required (use null to unassign)" });
       return;
     }
 
@@ -1360,7 +1488,7 @@ taskRouter.patch("/:taskId/assignee", async (req, res) => {
       const type = body.assignee?.type;
       const id = body.assignee?.id;
       if ((type !== "user" && type !== "agent") || typeof id !== "string" || !id) {
-        res.status(400).json({ error: "assignee must be { type: 'user'|'agent', id } or null" });
+        refuse(res, 400, { code: "assignee_invalid", error: "assignee must be { type: 'user'|'agent', id } or null" });
         return;
       }
       assignee = { type, id };
@@ -1369,7 +1497,7 @@ taskRouter.patch("/:taskId/assignee", async (req, res) => {
     let expectedRevision: number | undefined;
     if (body.expectedRevision !== undefined) {
       if (typeof body.expectedRevision !== "number" || !Number.isInteger(body.expectedRevision)) {
-        res.status(400).json({ error: "expectedRevision must be an integer" });
+        refuse(res, 400, EXPECTED_REVISION_INVALID_REFUSAL);
         return;
       }
       expectedRevision = body.expectedRevision;
@@ -1398,10 +1526,11 @@ taskRouter.patch("/:taskId/assignee", async (req, res) => {
       // re-read and retry without guessing.
       if (result === "task state changed concurrently") {
         const current = await taskService.resolveTaskById(task.id);
+        // refusal-ok: top-level currentRevision is the task's current OCC token (tasks.assignee.api.test.ts reads it); refuse() writes no top-level fields
         res.status(409).json({ error: result, currentRevision: current?.row.revision ?? null });
         return;
       }
-      res.status(409).json({ error: result });
+      refuse(res, 409, taskAssignHumanRefusal(result));
       return;
     }
 
@@ -1477,32 +1606,32 @@ taskRouter.patch("/:taskId", async (req, res) => {
     const patch: taskService.TaskAmendPatch = {};
     if (body.title !== undefined) {
       if (typeof body.title !== "string" || body.title.trim().length === 0) {
-        res.status(400).json({ error: "title must be a non-empty string" });
+        refuse(res, 400, { code: "task_title_required", error: "title must be a non-empty string" });
         return;
       }
       const title = body.title.trim();
       if (title.length > TASK_TITLE_MAX_LENGTH) {
-        res.status(400).json({ error: `title must be at most ${TASK_TITLE_MAX_LENGTH} characters` });
+        refuse(res, 400, { code: "task_title_too_long", error: `title must be at most ${TASK_TITLE_MAX_LENGTH} characters` });
         return;
       }
       patch.title = title;
     }
     if (body.clearDescription !== undefined && typeof body.clearDescription !== "boolean") {
-      res.status(400).json({ error: "clearDescription must be a boolean" });
+      refuse(res, 400, { code: "clear_description_invalid", error: "clearDescription must be a boolean" });
       return;
     }
     if (body.clearDescription === true && body.description !== undefined) {
-      res.status(400).json({ error: "Send either description or clearDescription, not both" });
+      refuse(res, 400, { code: "task_description_conflict", error: "Send either description or clearDescription, not both" });
       return;
     }
     if (body.description !== undefined) {
       if (typeof body.description !== "string") {
-        res.status(400).json({ error: "description must be a string (use clearDescription to remove it)" });
+        refuse(res, 400, { code: "task_description_invalid", error: "description must be a string (use clearDescription to remove it)" });
         return;
       }
       const description = body.description.trim();
       if (description.length > TASK_DESCRIPTION_MAX_LENGTH) {
-        res.status(400).json({ error: `description must be at most ${TASK_DESCRIPTION_MAX_LENGTH} characters` });
+        refuse(res, 400, { code: "task_description_too_long", error: `description must be at most ${TASK_DESCRIPTION_MAX_LENGTH} characters` });
         return;
       }
       patch.description = description.length > 0 ? description : null;
@@ -1510,14 +1639,14 @@ taskRouter.patch("/:taskId", async (req, res) => {
       patch.description = null;
     }
     if (patch.title === undefined && patch.description === undefined) {
-      res.status(400).json({ error: "title, description or clearDescription is required" });
+      refuse(res, 400, { code: "task_amend_fields_required", error: "title, description or clearDescription is required" });
       return;
     }
 
     let expectedRevision: number | undefined;
     if (body.expectedRevision !== undefined) {
       if (typeof body.expectedRevision !== "number" || !Number.isInteger(body.expectedRevision)) {
-        res.status(400).json({ error: "expectedRevision must be an integer" });
+        refuse(res, 400, EXPECTED_REVISION_INVALID_REFUSAL);
         return;
       }
       expectedRevision = body.expectedRevision;
@@ -1538,18 +1667,19 @@ taskRouter.patch("/:taskId", async (req, res) => {
         // A lost OCC race is reported with the current token so the client can
         // re-read and retry without guessing (as PATCH /:taskId/assignee).
         const current = await taskService.resolveTaskById(task.id);
+        // refusal-ok: top-level currentRevision is the task's current OCC token, which the web's edit reads (TaskHeadEditor.tsx staleRevisionOf); refuse() writes no top-level fields
         res.status(409).json({ error: result, currentRevision: current?.row.revision ?? null });
         return;
       }
       if (result === taskService.TASK_AMEND_MEMBERSHIP_ERROR) {
-        res.status(403).json({ error: "You must join this channel to modify tasks" });
+        refuse(res, 403, TASK_WRITE_MEMBERSHIP_REQUIRED_REFUSAL);
         return;
       }
       if (result === "task not found") {
-        res.status(404).json({ error: "Task not found" });
+        refuse(res, 404, TASK_NOT_FOUND_HUMAN_REFUSAL);
         return;
       }
-      res.status(409).json({ error: result });
+      refuse(res, 409, taskAmendHumanRefusal(result));
       return;
     }
 
@@ -1587,7 +1717,7 @@ taskRouter.patch("/:taskId/status", async (req, res) => {
 
     const { status, reason } = req.body;
     if (typeof status !== "string" || !isTaskStatus(status)) {
-      res.status(400).json({ error: `valid status is required (${TASK_STATUSES.join(", ")})` });
+      refuse(res, 400, { code: "invalid_status", error: `valid status is required (${TASK_STATUSES.join(", ")})` });
       return;
     }
     // A move into backlog may say what would bring the task back; no other status takes a reason.
@@ -1613,7 +1743,7 @@ taskRouter.patch("/:taskId/status", async (req, res) => {
     let result: taskService.TaskMutationResult;
     if (task.isOrphan) {
       if (!await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "deleteAnyTask")) {
-        res.status(403).json({ error: "Only server admins can close tasks in deleted channels" });
+        refuse(res, 403, { code: "task_orphan_close_forbidden", error: "Only server admins can close tasks in deleted channels" });
         return;
       }
       result = await taskService.forceUpdateTaskStatus(task.id, status, "user", req.userId!, req.serverId!, {
@@ -1626,7 +1756,7 @@ taskRouter.patch("/:taskId/status", async (req, res) => {
         ...(backlogReason && { backlogReason }),
       });
     }
-    if (typeof result === "string") { res.status(409).json({ error: result }); return; }
+    if (typeof result === "string") { refuse(res, 409, taskStatusHumanRefusal(result)); return; }
 
     const enriched = await emitTaskUpdate(req, task, await withTaskConversationEnsured(result, { initiatingServerId: task.localChannel.serverId }));
     // Lifecycle notice goes to the task's own thread, not the parent channel.
@@ -1668,7 +1798,7 @@ taskRouter.delete("/:taskId", async (req, res) => {
     const isCreator = task.creatorType === "user" && task.creatorId === req.userId;
     if (!isCreator) {
       if (!await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "deleteAnyTask")) {
-        res.status(403).json({ error: "Only the task creator or server admins can delete" });
+        refuse(res, 403, { code: "task_delete_forbidden", error: "Only the task creator or server admins can delete" });
         return;
       }
     }

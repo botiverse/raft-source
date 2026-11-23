@@ -53,7 +53,8 @@
 // Free limit hit if there is one; no other field; a repeat for the same
 // conversation and gate within a day answers with the card already there, and
 // any other upgrade card in a conversation that had one lately is refused with
-// UPGRADE_CARD_COOLDOWN)
+// UPGRADE_CARD_COOLDOWN, and one for a gate already offered elsewhere on the
+// server lately with UPGRADE_CARD_ALREADY_OFFERED)
 //   { "type": "plan:upgrade",
 //     "reason": "...",
 //     "gate": "history_30d" }
@@ -206,9 +207,11 @@ and presses it to confirm (no Other…). The answer is that option's value:
   RAFTACTION
 In a DM leave out "to"; in a channel it is a person's handle (not an
 agent's), or "anyone".
-Use a card when the answer decides what you do next: concrete choices, or a
-short answer you will act on. Ask in a message when you are already talking
-it through, and don't ask what you can decide yourself.
+Use a card when the answer decides what you do next: a choice between
+options, whether you should go ahead, or a short answer you will act on; in a
+running conversation too. Ask in a message only what a card can't take (an
+open question, a step they must take elsewhere), and don't ask what you can
+decide yourself: decide it and say what you chose.
 Ask a person to run an operation you can't (request:prepare): they confirm
 it on the card and it runs as them. List what you can prepare here, with each
 operation's args and whom to ask:

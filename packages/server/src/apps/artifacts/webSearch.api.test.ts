@@ -180,6 +180,19 @@ test("titles are found by word, grouped under `artifacts`, each with its card an
   assert.ok(artifactIds(await search(app, world.who.owner, { q: "budg" })).includes(world.items.team.id));
 });
 
+test("an Artifact homed in an archived conversation is still found, its home marked `archived: true` (absent while live)", async ({ app, seed }) => {
+  const world = await seedWorld(seed);
+  await getDb().update(channels).set({ archivedAt: new Date() }).where(eq(channels.id, world.channels.team.id));
+  const reply = await search(app, world.who.owner, { q: "budget team" });
+  assert.deepEqual(artifactIds(reply), [world.items.team.id]);
+  assert.deepEqual(reply.body.groups[0].items[0].card.home, {
+    kind: "conversation",
+    conversation: { id: world.channels.team.id, name: world.channels.team.name, type: "private", archived: true },
+  });
+  const live = await search(app, world.who.owner, { q: "guest room" });
+  assert.ok(!("archived" in live.body.groups[0].items[0].card.home.conversation));
+});
+
 test("visibility is the reader's: members only for a private conversation, a guest only its own conversations and public, never an orphan, a deleted or a revoked Artifact", async ({ app, seed }) => {
   const world = await seedWorld(seed);
   const { items } = world;

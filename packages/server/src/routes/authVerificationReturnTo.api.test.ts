@@ -75,3 +75,30 @@ test("sign-up without returnTo is unchanged: /?verify=<token>", async ({ app }) 
   assert.equal(signedUp.returnTo, null);
   assert.deepEqual(await verify(app.baseUrl, signedUp.accessToken, { token: signedUp.token }), { ok: true });
 });
+
+// One answer per token kind, whatever is wrong with the token (unknown,
+// expired, used, malformed): the code must not say what happened to it.
+test("a bad verification, reset or refresh token gets its one answer, with one code", async ({ app }) => {
+  const { accessToken, token } = await signUp(app.baseUrl, "token-codes@example.com", undefined);
+  const post = (path: string, body: Record<string, unknown>, auth = false) => fetch(`${app.baseUrl}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...(auth ? { Authorization: `Bearer ${accessToken}` } : {}) },
+    body: JSON.stringify(body),
+  });
+  const refusal = async (response: Response) => {
+    const body = await response.json() as { error: string; code: string; errorCode: string };
+    return { status: response.status, ...body };
+  };
+
+  const unknown = await refusal(await post("/api/auth/verify-email", { token: "no-such-token" }, true));
+  assert.deepEqual(unknown, { status: 400, error: "Invalid or expired verification token", code: "email_verification_token_invalid", errorCode: "email_verification_token_invalid" });
+  await verify(app.baseUrl, accessToken, { token });
+  const used = await refusal(await post("/api/auth/verify-email", { token }, true));
+  assert.deepEqual(used, unknown, "a used token answers exactly as an unknown one");
+
+  const reset = await refusal(await post("/api/auth/reset-password", { token: "no-such-token", password: "password456" }));
+  assert.deepEqual(reset, { status: 400, error: "Invalid or expired reset token", code: "password_reset_token_invalid", errorCode: "password_reset_token_invalid" });
+
+  const refresh = await refusal(await post("/api/auth/refresh", { refreshToken: "no-such-token" }));
+  assert.deepEqual(refresh, { status: 401, error: "Invalid or expired refresh token", code: "refresh_token_invalid", errorCode: "refresh_token_invalid" });
+});

@@ -1,6 +1,8 @@
 // `raft message resolve <id>` — exact message-id verifier.
 // This command is deliberately stricter than `message read --around`: it never
 // falls back to nearby context and exists to prove whether a cited id resolves.
+// `--forwarded <n>` prints forwarded message n of a forward whole, where the
+// forward's snapshot cut it.
 
 import type { Command } from "commander";
 
@@ -14,7 +16,13 @@ import { writeText, NL } from "../../core/renderer";
 import { formatMessages } from "./_format";
 import { elideSeenSenders } from "./_senderElision";
 
+interface ResolveOpts {
+  forwarded?: string;
+}
+
 interface ResolveMessageData {
+  /** With `--forwarded <n>`: that forwarded message, its content not cut. */
+  forwarded?: { number?: number; total?: number; content?: string };
   message?: {
     message_id?: string;
     channel_type?: string;
@@ -25,6 +33,8 @@ interface ResolveMessageData {
     sender_type?: string;
     sender_name?: string;
     sender_description?: string | null;
+    /** Where an outside sender is from; printed in place of a description (shared formatSenderHandleText). */
+    sender_origin?: unknown;
     content?: string;
     [key: string]: unknown;
   };
@@ -60,7 +70,8 @@ function mapResolveError(res: ApiResponse<unknown>): {
     };
   }
   if (res.errorCode === "INVALID_ARG" || res.status === 400) {
-    return { code: "INVALID_ARG", message };
+    // The Server's step, e.g. the forwarded message numbers this forward has.
+    return { code: "INVALID_ARG", message, ...(res.suggestedNextAction ? { suggestedNextAction: res.suggestedNextAction } : {}) };
   }
   return {
     code: res.status >= 500 ? "SERVER_5XX" : "READ_FAILED",
@@ -73,10 +84,16 @@ export const messageResolveCommand = defineCommand(
     name: "resolve",
     description: "Resolve a message id exactly and print the canonical message",
     arguments: ["<id>"],
+    options: [
+      {
+        flags: "--forwarded <n>",
+        description: "Print forwarded message n of this forward whole (n as in \"Forwarded message n\")",
+      },
+    ],
     helpAfter:
       "\nTo see the messages around it, use: raft message read --target <target> --around <id>\n",
   },
-  async (ctx, rawId: string) => {
+  async (ctx, rawId: string, opts: ResolveOpts = {}) => {
     const id = rawId?.trim();
     if (!id) {
       throw new CliError({
@@ -84,10 +101,20 @@ export const messageResolveCommand = defineCommand(
         message: "<id> is required",
       });
     }
+    const forwarded = opts.forwarded?.trim();
+    if (forwarded !== undefined && !/^[1-9][0-9]*$/.test(forwarded)) {
+      throw new CliError({
+        code: "INVALID_ARG",
+        message: "--forwarded takes a forwarded message number, 1 or more",
+      });
+    }
 
     const agentContext = ctx.loadAgentContext();
     const client = ctx.createApiClient(agentContext);
-    const res = await createAgentApiSurfaceClient(client).messages.resolve({ msgId: asMessageId(id) });
+    const res = await createAgentApiSurfaceClient(client).messages.resolve(
+      { msgId: asMessageId(id) },
+      forwarded === undefined ? undefined : { forwarded },
+    );
     if (!res.ok) {
       const mapped = mapResolveError(res);
       throw new CliError(mapped);
@@ -99,8 +126,17 @@ export const messageResolveCommand = defineCommand(
         message: "Missing message in resolve response",
       });
     }
+    const forwardedItem = res.data?.forwarded;
+    if (forwarded !== undefined && typeof forwardedItem?.content !== "string") {
+      throw new CliError({
+        code: "INVALID_JSON_RESPONSE",
+        message: "The Server returned no forwarded message: it may be older than --forwarded",
+      });
+    }
+    // The forward's own header, with that one forwarded message as its body.
     const senders = elideSeenSenders([{
       ...message,
+      ...(forwarded !== undefined && { content: forwardedItem!.content }),
       parent_channel_type: message.parent_channel_type ?? undefined,
       parent_channel_name: message.parent_channel_name ?? undefined,
     }], agentContext.agentId);

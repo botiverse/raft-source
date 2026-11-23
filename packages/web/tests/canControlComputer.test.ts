@@ -35,13 +35,20 @@ test("no signed-in user and no capability: no restart", () => {
   assert.equal(canControlComputer(machine("me"), null, none), false);
 });
 
-// controlledByCurrentUser: the server's controller (computerControllerUserId), still set after the key is revoked.
-test("the controller manages a revoked Computer (rename, description) but may not restart it: the route refuses a non-Computer", () => {
-  const revoked = { creator: null, computerAttachedByCurrentUser: false, controlledByCurrentUser: true, isComputer: false } as Parameters<typeof canControlComputer>[0];
-  assert.equal(canManageMachine(revoked, "me", none), true);
-  assert.equal(canControlComputer(revoked, "me", none), false);
-  const live = { ...revoked, isComputer: true };
+// controlledByCurrentUser: the server's controller (computerControllerUserId), the live attacher only.
+test("the live attacher, by the server's flag, manages and restarts it", () => {
+  const live = { creator: null, computerAttachedByCurrentUser: false, controlledByCurrentUser: true, isComputer: true } as Parameters<typeof canControlComputer>[0];
+  assert.equal(canManageMachine(live, "me", none), true);
   assert.equal(canControlComputer(live, "me", none), true);
-  const notController = { ...revoked, controlledByCurrentUser: false };
-  assert.equal(canManageMachine(notController, "me", none), false);
+});
+
+test("a revoked Computer or a raw daemon has no controller: a plain member gets nothing, owner/admin capabilities still do", () => {
+  // What the server sends for either now: no live attacher, so no flag, attacher or creator.
+  const uncontrolled = { creator: null, computerAttachedByCurrentUser: false, controlledByCurrentUser: false, isComputer: false } as Parameters<typeof canControlComputer>[0];
+  assert.equal(canManageMachine(uncontrolled, "me", none), false);
+  assert.equal(canControlComputer(uncontrolled, "me", none), false);
+  assert.equal(canManageMachine(uncontrolled, "me", caps({ editMachines: true, removeMachines: true })), true);
+  assert.equal(canControlComputer(uncontrolled, "me", caps({ controlComputers: true })), true);
+  // An older server still flagged the revoked controller: restart stays hidden for a non-Computer.
+  assert.equal(canControlComputer({ ...uncontrolled, controlledByCurrentUser: true }, "me", none), false);
 });

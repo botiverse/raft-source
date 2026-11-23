@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type TraceEvent, workSplit } from "./workSplit";
+import { type TraceEvent, findTraceMark, forcedSpansRange, workSplit, workSplitRange } from "./workSplit";
 
 const MAIN = { pid: 7, tid: 1 };
 /** One complete event on the main thread; times in ms from the trace start. */
@@ -74,5 +74,43 @@ describe("workSplit", () => {
 
   it("is null without a click in the trace", () => {
     expect(workSplit([x("RunTask", 0, 10), x("EventDispatch", 5, 1, { args: { data: { type: "pointerdown" } } })], 1000)).toBeNull();
+  });
+});
+
+describe("workSplitRange, findTraceMark, and forcedSpansRange", () => {
+  it("joins performance.mark timestamps via findTraceMark and extracts forced layout culprit stacks", () => {
+    const events: TraceEvent[] = [
+      { name: "__raft_perf_anchor", ph: "I", ...MAIN, ts: 50_000 },
+      x("RunMicrotasks", 100, 120),
+      style(110, 18, 640, {
+        args: {
+          elementCount: 640,
+          data: { stackTrace: [{ functionName: "measureRow", url: "https://app/assets/index.js", lineNumber: 1, columnNumber: 42 }] },
+        },
+      }),
+      x("Layout", 135, 22, {
+        args: {
+          beginData: { stackTrace: [{ functionName: "measureRow", url: "https://app/assets/index.js", lineNumber: 1, columnNumber: 99 }] },
+        },
+      }),
+      x("Layout", 260, 10), // outside script: not forced
+    ];
+    const mark = findTraceMark(events, "__raft_perf_anchor");
+    expect(mark).toEqual({ pid: 7, tid: 1, ts: 50_000 });
+
+    const range = workSplitRange(events, 7, 1, 100_000, 300_000);
+    expect(range).toMatchObject({
+      windowMs: 200,
+      scriptMs: 80,
+      styleMs: 18,
+      layoutMs: 32,
+      forcedMs: 40,
+    });
+
+    const forced = forcedSpansRange(events, 7, 1, 100_000, 300_000);
+    expect(forced).toHaveLength(2);
+    expect(forced[0]).toMatchObject({ kind: "style", durationMs: 18, elements: 640 });
+    expect(forced[1]).toMatchObject({ kind: "layout", durationMs: 22 });
+    expect(forced[1]!.stackTrace[0]?.functionName).toBe("measureRow");
   });
 });

@@ -44,30 +44,16 @@ export function liveSource(name: string): Json {
  * no provider/model lists, so these follow that form's own pointers and its
  * visibility rule (`baseUrl` shows for the gateway providers) — the same shape
  * packages/web/src/features/agent/tests/schemaCreateAgentDialog.behavior.test.tsx (removed in the 2026-11 web DOM test prune) serves.
- *
- * `saved` adds a saved provider connection the way the server lists one under
- * capability `provider.saved_connection` (runtime-form README): value
- * `connection:<id>`, its underlying provider, and the "saved" group ahead of the
- * "direct" one.
  */
-export function builtinSources(
-  saved?: { connectionId: string; label: string; underlyingProviderId: string },
-  schemaVersion = "builtin-pi.create.v3",
-): Record<string, Json> {
+export function builtinSources(schemaVersion = "builtin-pi.create.v3"): Record<string, Json> {
   const head = { protocolVersion: 1, runtimeId: "builtin", schemaVersion };
-  const savedValue = saved ? `connection:${saved.connectionId}` : null;
-  const direct = (option: Json) => (saved ? { ...option, group: "direct" } : option);
   const deepseekModels = [{ value: "deepseek/deepseek-v4-pro", label: "DeepSeek V4 Pro" }];
   return {
     provider: {
       ...head, sourceId: "provider", kind: "select", pointer: "/providerId",
       options: [
-        ...(saved ? [{
-          value: savedValue, label: saved.label, providerKind: "preset",
-          connectionId: saved.connectionId, underlyingProviderId: saved.underlyingProviderId, group: "saved",
-        }] : []),
-        direct({ value: "deepseek", label: "DeepSeek", providerKind: "preset" }),
-        direct({ value: "openai-compatible", label: "OpenAI Compatible", providerKind: "gateway" }),
+        { value: "deepseek", label: "DeepSeek", providerKind: "preset" },
+        { value: "openai-compatible", label: "OpenAI Compatible", providerKind: "gateway" },
       ],
       defaultValue: "deepseek",
       status: "live",
@@ -75,16 +61,13 @@ export function builtinSources(
     model: {
       ...head, sourceId: "model", kind: "dependent_select", pointer: "/model", dependsOn: "/providerId",
       optionsByValue: {
-        ...(savedValue ? { [savedValue]: deepseekModels } : {}),
         deepseek: deepseekModels,
         "openai-compatible": [],
       },
       defaultValueByValue: {
-        ...(savedValue ? { [savedValue]: "deepseek/deepseek-v4-pro" } : {}),
         deepseek: "deepseek/deepseek-v4-pro",
       },
       customValueAllowedByValue: {
-        ...(savedValue ? { [savedValue]: false } : {}),
         deepseek: false,
         "openai-compatible": true,
       },

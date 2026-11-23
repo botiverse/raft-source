@@ -84,3 +84,43 @@ function microsOrUndefined(secondsMs: number, fraction: string): number | undefi
   const micros = secondsMs * 1000 + Number(fraction.slice(0, 6).padEnd(6, "0"));
   return Number.isSafeInteger(micros) ? micros : undefined;
 }
+
+/** How `linuxPidShowsExited` reads /proc. Each read throws as `fs.readFileSync` does. */
+export interface LinuxProcStatReads {
+  /** The text of /proc/<pid>/stat. */
+  readProcStat: (pid: number) => string;
+  /** The text of /proc/self/stat, to check that /proc is this process's own pid namespace. */
+  readSelfStat: () => string;
+  /** This process's pid (process.pid). */
+  selfPid: number;
+}
+
+/**
+ * Linux: whether a pid that answered signal 0 has in fact exited. An exited
+ * child its parent has not reaped yet (a zombie, state `Z`, or `X`/`x` while it
+ * is torn down) still answers signal 0, so signal 0 alone keeps it "alive"
+ * forever and blocks whatever waits for it to go. /proc/<pid>/stat gone
+ * (ENOENT/ESRCH) means the process is gone too. Anything else unreadable or
+ * unparsable, or a /proc mounted for another pid namespace, is unknown: false,
+ * so the caller keeps its signal-0 answer.
+ */
+export function linuxPidShowsExited(pid: number, reads: LinuxProcStatReads): boolean {
+  try {
+    const self = /^\s*(\d+)\s/.exec(reads.readSelfStat())?.[1];
+    if (Number(self) !== reads.selfPid) return false;
+  } catch {
+    return false;
+  }
+  let text: string;
+  try {
+    text = reads.readProcStat(pid);
+  } catch (err) {
+    const code = typeof err === "object" && err && "code" in err ? (err as { code?: unknown }).code : undefined;
+    return code === "ENOENT" || code === "ESRCH";
+  }
+  // comm (field 2) can hold spaces and parens: the state follows the last ')'.
+  const close = text.lastIndexOf(")");
+  if (close < 0) return false;
+  const state = text.slice(close + 1).trimStart()[0];
+  return state === "Z" || state === "X" || state === "x";
+}

@@ -1,7 +1,7 @@
 import { basename } from "node:path";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import type { Command } from "commander";
-import type { ProfileView } from "@botiverse/raft-shared";
+import type { DescriptionLinkWarning, ProfileView } from "@botiverse/raft-shared";
 import { MAX_PROFILE_AVATAR_BYTES } from "@botiverse/raft-shared/src/agentCliSurface";
 
 import { defineCommand, registerCliCommand } from "../../core/command";
@@ -9,7 +9,7 @@ import type { CommandRuntimeOptions } from "../../core/context";
 import { cliError } from "../../core/errors";
 import { writeJson, writeText, NL } from "../../core/renderer";
 import { createAgentApiSurfaceClient } from "../../agentApiPath";
-import { formatProfile } from "./_format";
+import { formatProfile, formatProfileDescriptionWarnings } from "./_format";
 
 const PROFILE_AVATAR_MIME_TYPES = new Set([
   "image/jpeg",
@@ -33,7 +33,6 @@ interface UpdateOptions {
   json?: boolean;
 }
 
-const MAX_PROFILE_DESCRIPTION_LENGTH = 3000;
 const MAX_PROFILE_DISPLAY_NAME_LENGTH = 80;
 
 function inferImageMimeType(filename: string, buffer: Buffer): string | null {
@@ -111,7 +110,7 @@ export const profileUpdateCommand = defineCommand(
       { flags: "--avatar-file <path>", description: "Path to a local image file to use as your avatar" },
       { flags: "--avatar-url <value>", description: "Set a pixel avatar URL such as pixel:random:<seed>" },
       { flags: "--display-name <name>", description: "Set your display name (non-empty)" },
-      { flags: "--description <text>", description: "Set your profile description (non-empty)" },
+      { flags: "--description <text>", description: "Set your profile description (non-empty; a new or changed one is at most 300 characters)" },
       { flags: "--json", description: "Emit machine-readable JSON" },
     ],
   },
@@ -145,9 +144,9 @@ export const profileUpdateCommand = defineCommand(
         if (opts.description!.length === 0) {
           throw cliError("INVALID_ARG", "--description must not be empty");
         }
-        if (opts.description!.length > MAX_PROFILE_DESCRIPTION_LENGTH) {
-          throw cliError("INVALID_ARG", `--description must be at most ${MAX_PROFILE_DESCRIPTION_LENGTH} characters`);
-        }
+        // No length check here: the Server's limit holds only for a new or changed
+        // description (one saved under the older, longer limit keeps saving), which
+        // only the Server can tell, so its refusal is the answer.
       }
       const avatar = hasAvatar ? readAvatarFile(opts.avatarFile!) : null;
 
@@ -155,6 +154,8 @@ export const profileUpdateCommand = defineCommand(
       const client = ctx.createApiClient(agentContext);
       const agentApi = createAgentApiSurfaceClient(client);
       let latestProfile: ProfileView | null = null;
+      // The Server's warnings about the saved description's links (only on the field update; the save stands).
+      let warnings: DescriptionLinkWarning[] = [];
 
       if (hasAvatarUrl || hasDisplayName || hasDescription) {
         const body: { avatarUrl?: string; displayName?: string; description?: string } = {};
@@ -173,6 +174,7 @@ export const profileUpdateCommand = defineCommand(
           throw cliError(code, res.error ?? `HTTP ${res.status}`);
         }
         latestProfile = res.data;
+        if (res.data.kind === "agent") warnings = res.data.warnings ?? [];
       }
 
       if (hasAvatar) {
@@ -193,11 +195,13 @@ export const profileUpdateCommand = defineCommand(
       }
 
       if (opts.json) {
-        writeJson(ctx.io, { ok: true, data: latestProfile });
+        writeJson(ctx.io, { ok: true, data: warnings.length > 0 ? { ...latestProfile, warnings } : latestProfile });
         return;
       }
 
       writeText(ctx.io, formatProfile(latestProfile!), NL);
+      // Result lines after the profile, on stdout: the save succeeded, so the exit code stays 0.
+      if (warnings.length > 0) writeText(ctx.io, formatProfileDescriptionWarnings(warnings), NL);
   },
 );
 

@@ -36,7 +36,7 @@ import { LoginFaqCard } from "../features/login-with-raft/LoginFaqCard";
 import { LoginLookupLoadingCard } from "../features/login-with-raft/LoginLookupLoadingCard";
 import { LoginScopeConfigurationAlert } from "../features/login-with-raft/LoginScopeConfigurationAlert";
 import {
-  firstServerByRank,
+  initialServerPick,
   isAccountLoginEntry,
   isLoginAvailable,
   marketplaceServerRank,
@@ -132,8 +132,8 @@ export default function HumanLoginSetupPage() {
   // suspended after the lookup (the answer comes after an await: the latest
   // list, not the one the press saw). The page then reads as that lookup
   // would have (the App's Suspended badge, no Login button), and a Server
-  // left suspended isn't kept picked: the next render picks the first by
-  // the lookup's order. The refusal stays first in whichever card shows.
+  // left suspended isn't kept picked: the next render picks again by
+  // initialServerPick (none when several remain). The refusal stays first in whichever card shows.
   const [reselectAfterSuspend, setReselectAfterSuspend] = useState(false);
   const handleAccountSuspended = useCallback(() => {
     setFoundEntries(withAccountInstallationsSuspended);
@@ -142,7 +142,7 @@ export default function HumanLoginSetupPage() {
   if (reselectAfterSuspend) {
     setReselectAfterSuspend(false);
     if (!foundEntries.some((entry) => entry.server.id === selectedServerId && entry.client.availability !== "suspended")) {
-      setSelectedServerId(firstServerByRank(foundEntries));
+      setSelectedServerId(initialServerPick(foundEntries));
     }
   }
   const account = useAccountAuthorization({
@@ -219,7 +219,7 @@ export default function HumanLoginSetupPage() {
       const preferred = found.find((entry) => entry.server.id === preferredServerId
         && (isLoginAvailable(entry.client) || entry.client.availability === "install_required"));
       setSelectedServerId((current) => (
-        found.some((entry) => entry.server.id === current) ? current : preferred?.server.id ?? firstServerByRank(found)
+        found.some((entry) => entry.server.id === current) ? current : preferred?.server.id ?? initialServerPick(found)
       ));
     }).finally(() => {
       if (!cancelled) {
@@ -273,7 +273,9 @@ export default function HumanLoginSetupPage() {
     && !selectedMarketplaceCanInstall;
   const installBot = useLoginInstallBotOffer(selectedMarketplaceEntry, selectedMarketplaceCanInstall);
   const { setConflict: setBotConflict } = installBot;
-  const detailsClient = marketplaceClient ?? client;
+  // The App's details (name, description, what it asks for) are the App's, not a Server's: with
+  // several Servers and none picked yet (initialServerPick), they come from the first lookup answer.
+  const detailsClient = marketplaceClient ?? client ?? availableServerClients[0]?.client ?? null;
   const availableServerOptions = useMemo(() => availableServerClients.map(({ server }) => ({
     value: server.id,
     label: `${server.name} (${server.slug})`,
@@ -284,7 +286,8 @@ export default function HumanLoginSetupPage() {
     ?? selectedServerClient?.server.name
     ?? formatMessage({ id: "pages.humanLogin.thisServerFallback" });
   const hasAgentInboundRequest = hasAgentInboundOAuthScope(scopes);
-  const scopeValidationClient = selectedMarketplaceEntry?.client ?? client;
+  // The App's scope check is the App's, not a Server's: shown before a Server is picked too.
+  const scopeValidationClient = selectedMarketplaceEntry?.client ?? client ?? detailsClient;
   const disallowedScopes = scopeValidationClient?.scopeValidation?.disallowedScopes ?? [];
   const scopeValidationReason = scopeValidationClient?.scopeValidation?.reason ?? null;
   const hasDisallowedScopes = disallowedScopes.length > 0;

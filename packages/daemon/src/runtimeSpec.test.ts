@@ -36,7 +36,6 @@ test("the same spec in another key order, with explicit defaults and its structu
   const structured = config({
     envVars: { BETA: "2", ALPHA: "1" },
     executionMode: "byoc",
-    providerConnection: null,
     runtimeConfig: {
       provider: { kind: "default" },
       envVars: { BETA: "2", ALPHA: "1" },
@@ -67,7 +66,9 @@ test("only whitelisted fields count: prompt inputs, context, credentials, the se
     runtimeProfileControl: { kind: "daemon_release_notice", key: "k", message: "m" },
     constructedWakeContext: true,
     agentContextView: true,
+    // What an older server sent for a saved provider connection (removed).
     providerConnection: { providerId: "openai", endpointUrl: null, supportsImageInput: true },
+    providerConnectionRevision: 4,
     someFieldAddedLater: { anything: true },
   } as Partial<AgentConfig> & Record<string, unknown>);
   assert.deepEqual(drift(base, changed), []);
@@ -99,17 +100,18 @@ test("the snapshot holds hashes, not values", () => {
   assert.equal(text.includes("secret-value"), false);
 });
 
-test("a new session for another runtime or a Codex model; any other model change resumes", () => {
+test("a new session for another runtime or model on any runtime; reasoning effort keeps resuming", () => {
   const claude = runtimeSpecOf(config());
-  assert.equal(sessionDropReason(claude, runtimeSpecOf(config({ model: "opus" }))), null);
+  assert.equal(sessionDropReason(claude, runtimeSpecOf(config({ model: "opus" }))), "model_changed");
+  assert.equal(sessionDropReason(claude, runtimeSpecOf(config({ model: "sonnet", reasoningEffort: "high" }))), null);
   assert.equal(sessionDropReason(claude, runtimeSpecOf(config({ runtime: "codex", model: "gpt-5.5" }))), "runtime_changed");
   const codex = runtimeSpecOf(config({ runtime: "codex", model: "gpt-5.5" }));
-  assert.equal(sessionDropReason(codex, runtimeSpecOf(config({ runtime: "codex", model: "gpt-5.4" }))), "codex_model_changed");
+  assert.equal(sessionDropReason(codex, runtimeSpecOf(config({ runtime: "codex", model: "gpt-5.4" }))), "model_changed");
   assert.equal(sessionDropReason(codex, runtimeSpecOf(config({ runtime: "codex", model: "gpt-5.5", reasoningEffort: "high" }))), null);
 
   const memory = new SessionSpecMemory();
   memory.remember("agent", "thread-1", codex);
-  assert.equal(memory.sessionToDrop("agent", "thread-1", runtimeSpecOf(config({ runtime: "codex", model: "gpt-5.4" }))), "codex_model_changed");
+  assert.equal(memory.sessionToDrop("agent", "thread-1", runtimeSpecOf(config({ runtime: "codex", model: "gpt-5.4" }))), "model_changed");
   assert.equal(memory.sessionToDrop("agent", "thread-2", runtimeSpecOf(config({ runtime: "codex", model: "gpt-5.4" }))), null, "only that session");
   assert.equal(memory.sessionToDrop("other", "thread-1", runtimeSpecOf(config({ runtime: "codex", model: "gpt-5.4" }))), null, "only that agent");
 });
@@ -136,15 +138,14 @@ test("a config this Computer cannot read is never drift and never drops a sessio
   assert.equal(sessionDropReason(runtimeSpecOf(codex), runtimeSpecOf(codexUnreadable)), null);
 });
 
-test("managed MCP and provider connection revisions drift only when both sides carry them", () => {
+test("a managed MCP fingerprint drifts only when both sides carry it", () => {
   const without = config();
-  const withBoth = config({ managedMcpFingerprint: "mcp-1", providerConnectionRevision: 3 });
-  assert.deepEqual(drift(without, withBoth), [], "an older server's session: no drift");
-  assert.deepEqual(drift(withBoth, without), [], "an older server's push: no drift");
-  assert.deepEqual(drift(withBoth, config({ managedMcpFingerprint: "mcp-1", providerConnectionRevision: 3 })), []);
-  assert.deepEqual(drift(withBoth, config({ managedMcpFingerprint: "mcp-2", providerConnectionRevision: 3 })), ["managed_mcp"]);
-  assert.deepEqual(drift(withBoth, config({ managedMcpFingerprint: "mcp-1", providerConnectionRevision: "4" })), ["provider_connection"]);
-  assert.deepEqual(drift(withBoth, config({ managedMcpFingerprint: null, providerConnectionRevision: 4 })), ["provider_connection"], "null is absent");
+  const withIt = config({ managedMcpFingerprint: "mcp-1" });
+  assert.deepEqual(drift(without, withIt), [], "an older server's session: no drift");
+  assert.deepEqual(drift(withIt, without), [], "an older server's push: no drift");
+  assert.deepEqual(drift(withIt, config({ managedMcpFingerprint: "mcp-1" })), []);
+  assert.deepEqual(drift(withIt, config({ managedMcpFingerprint: "mcp-2" })), ["managed_mcp"]);
+  assert.deepEqual(drift(withIt, config({ managedMcpFingerprint: null })), [], "null is absent");
 });
 
 test("a spec stop is left to the server's start for another runtime or host, not for another model", () => {
@@ -175,4 +176,25 @@ test("a Built-in custom model's declared limits are runtime config: a change dri
   assert.deepEqual(drift(builtin({ contextWindow: 128_000 }), builtin({ contextWindow: 128_000 })), []);
   // No limits set: nothing is added to the hashed component (empty objects canonicalize away).
   assert.equal(runtimeSpecOf(plain).hashes.runtime_config, runtimeSpecOf(builtin({ contextWindow: undefined, maxOutputTokens: undefined })).hashes.runtime_config);
+});
+
+test("Built-in loadLocalPlugins is part of runtime_config: toggling drifts, false and absent keep the same hash (#proj-runtime:#80)", () => {
+  const builtin = (loadLocalPlugins?: boolean) => config({
+    runtime: "builtin",
+    model: "my-model",
+    runtimeConfig: {
+      version: RUNTIME_CONFIG_VERSION,
+      runtime: "builtin",
+      provider: { kind: "gateway", providerId: "openai-compatible", baseUrl: "https://gateway.example.test/v1", apiKey: "k" },
+      model: { kind: "custom", name: "my-model" },
+      mode: { kind: "default" },
+      hostUserState: "forbidden",
+      ...(loadLocalPlugins !== undefined ? { loadLocalPlugins } : {}),
+    } as AgentConfig["runtimeConfig"],
+  });
+  assert.deepEqual(drift(builtin(undefined), builtin(false)), []);
+  assert.equal(runtimeSpecOf(builtin(undefined)).hashes.runtime_config, runtimeSpecOf(builtin(false)).hashes.runtime_config);
+  assert.deepEqual(drift(builtin(false), builtin(true)), ["runtime_config"]);
+  assert.deepEqual(drift(builtin(true), builtin(false)), ["runtime_config"]);
+  assert.deepEqual(drift(builtin(true), builtin(true)), []);
 });

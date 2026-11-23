@@ -23,10 +23,14 @@ function sourceFiles(dir: string): string[] {
 
 /**
  * OAR subpaths a daemon module may import statically: synchronous helpers that
- * load no runtime and no SDK (Node built-ins only). The Codex installation
+ * load no runtime and no SDK (Node built-ins only). `@botiverse/oar/capabilities`
+ * (OAR 0.123) resolves installation session capabilities; Codex installation
  * candidates (OAR 0.101) feed the synchronous Codex discovery (drivers/codex.ts).
  */
-const STATIC_OAR_SUBPATHS = new Set(["@botiverse/oar/runtimes/codex/installation-candidates"]);
+const STATIC_OAR_SUBPATHS = new Set([
+  "@botiverse/oar/capabilities",
+  "@botiverse/oar/runtimes/codex/installation-candidates",
+]);
 
 test("source guard: the daemon loads OAR one runtime at a time, never its root entry", () => {
   // OAR's root entry loads every runtime it supports (~49 MB of heap); a
@@ -47,18 +51,28 @@ test("source guard: the daemon loads OAR one runtime at a time, never its root e
 });
 
 test("each account-usage provider and opencode load their own OAR runtime, once", async () => {
-  for (const [id, name] of [["claude", "claude"], ["codex", "codex"], ["kimi", "kimi"], ["grok", "grok"], ["opencode", "opencode"], ["qwen", "qwen"], ["qoder", "qoder"]] as const) {
+  for (const [id, name] of [["claude", "claude"], ["codex", "codex"], ["kimi", "kimi"], ["grok", "grok"], ["opencode", "opencode"], ["qwen", "qwen"], ["qoder", "qoder"], ["dsh", "dsh"]] as const) {
     const [first, second] = await Promise.all([loadOarRuntime(id), loadOarRuntime(id)]);
     assert.equal(first, second);
     assert.equal(first.id, name);
   }
   assert.equal(typeof (await loadOarRuntime("kimi")).accountUsage, "function");
   assert.equal(typeof (await loadOarRuntime("opencode")).listModels, "function");
+  // DSH: an installer, a model list and its version floor; no sign-in, status or updater (OAR has none).
+  const dsh = await loadOarRuntime("dsh");
+  assert.equal(dsh.minVersion, "0.2.1-rc.5");
+  assert.equal(typeof dsh.listModels, "function");
+  assert.equal(typeof dsh.install, "function");
+  assert.equal(typeof dsh.installPlan, "function");
+  assert.equal(dsh.installLines, undefined, "no release lines: Install is offered");
+  assert.equal(dsh.authStatus, undefined);
+  assert.equal(dsh.login, undefined);
+  assert.equal(dsh.upgrade, undefined);
 });
 
 test("agent sessions open one process per session; usage and model reads keep OAR's own runtime", async () => {
   // The runtimes the OAR host opens agent sessions on (OarLaunch.runtimeId).
-  for (const id of ["antigravity", "grok", "qwen", "qoder"] as const) {
+  for (const id of ["antigravity", "grok", "qwen", "qoder", "dsh"] as const) {
     const [first, second] = await Promise.all([loadOarSessionRuntime(id), loadOarSessionRuntime(id)]);
     assert.equal(first, second);
     assert.equal(first.id, id);
@@ -78,7 +92,107 @@ test("Cursor runs in OAR's subprocess mode on the SDK the daemon ships, one chil
   assert.equal(cursor.execution, "process");
   const session = await loadOarSessionRuntime("cursor");
   assert.equal(session.placement, "isolated");
-  assert.equal(cursor.refusedSessionOptions?.env, undefined, "the session's env is taken");
+  const { oarInstalledSessionCapabilities } = await import("./oarLoader");
+  const cursorCaps = oarInstalledSessionCapabilities(cursor, { kind: "available", via: "bundled" });
+  assert.equal(cursorCaps.refusedSessionOptions?.env, undefined, "the session's env is taken");
+});
+
+test("oarInstalledSessionCapabilities uses OAR 0.123.0 @botiverse/oar/capabilities and exposes contextUsage", async () => {
+  const { installedSessionCapabilities } = await import("@botiverse/oar");
+  const { oarInstalledSessionCapabilities } = await import("./oarLoader");
+  assert.equal(oarInstalledSessionCapabilities, installedSessionCapabilities, "re-exports OAR's canonical helper via @botiverse/oar/capabilities");
+  const opencode = await loadOarRuntime("opencode");
+  for (const version of ["1.18.30", "2.0.27", "2.2.7"]) {
+    const inst = { kind: "available" as const, via: "executable" as const, command: "/usr/bin/opencode", version };
+    assert.deepEqual(oarInstalledSessionCapabilities(opencode, inst), installedSessionCapabilities(opencode, inst), `opencode ${version}`);
+    assert.deepEqual(oarInstalledSessionCapabilities(opencode, inst).contextUsage, { tokens: true, contextWindow: true }, `opencode ${version} contextUsage`);
+  }
+  const claude = await loadOarRuntime("claude");
+  const claudeInst = { kind: "available" as const, via: "executable" as const, command: "/usr/bin/claude" };
+  assert.equal(oarInstalledSessionCapabilities(claude, claudeInst).manualCompaction?.kind, "supported", "OAR merges static manualCompaction");
+  assert.deepEqual(oarInstalledSessionCapabilities(claude, claudeInst).contextUsage, { tokens: true, contextWindow: true });
+  const pi = await loadOarRuntime("pi");
+  assert.deepEqual(oarInstalledSessionCapabilities(pi, { kind: "available", via: "bundled" }).contextUsage, { tokens: true, contextWindow: true });
+  const qoder = await loadOarRuntime("qoder");
+  assert.deepEqual(oarInstalledSessionCapabilities(qoder, { kind: "available", via: "executable", command: "/usr/bin/qodercli" }).contextUsage, { tokens: false, contextWindow: false });
+  const dsh = await loadOarRuntime("dsh");
+  assert.ok(Array.isArray(dsh.verifiedPlatforms), "OAR exposes verifiedPlatforms");
+  assert.ok(dsh.credentials?.env && dsh.credentials.env.length > 0, "OAR exposes DSH credentials shape");
+});
+
+test("OAR 0.123.0's per-installation answers decide turn-end compaction and summary resume facts on the OAR host (the table the named lists were replaced by)", async () => {
+  const { oarInstalledSessionCapabilities } = await import("./oarLoader");
+  const { turnEndCompactionAllowed, turnEndCompactionDeclared } = await import("./turnEndCompaction");
+  const { summarySuppliesResumeFacts } = await import("./wakeSessionRecycle");
+  const exe = (command: string, version?: string) => ({ kind: "available" as const, via: "executable" as const, command, ...(version ? { version } : {}) });
+  // [runtime, installation as Raft's launch builds it, turn-end compaction, summary resume facts]
+  const rows: Array<[Parameters<typeof loadOarRuntime>[0], Parameters<typeof oarInstalledSessionCapabilities>[1], boolean, boolean]> = [
+    ["claude", exe("/usr/bin/claude"), true, true],
+    ["codex", exe("/usr/bin/codex", "codex-cli 0.166.0"), true, true],
+    ["codex", exe("/usr/bin/codex", "codex-cli 0.150.0"), false, false],
+    ["pi", { kind: "available", via: "bundled" }, true, true],
+    // No trustworthy window: no turn-end compaction (was on by name); the size still supplies resume facts.
+    ["grok", exe("/usr/bin/grok"), false, true],
+    ["cursor", { kind: "available", via: "bundled" }, false, true],
+    ["antigravity", exe("/usr/bin/agy"), false, true],
+    ["opencode", exe("/usr/bin/opencode", "2.3.0"), true, true],
+    ["opencode", exe("/usr/bin/opencode", "1.18.30"), false, true],
+    ["qwen", exe("/usr/bin/qwen", "0.26.0"), false, true],
+    ["qwen", exe("/usr/bin/qwen", "0.25.0"), false, false],
+    ["qoder", exe("/usr/bin/qodercli"), false, false],
+    // DSH declares both; RFC 070 does not enable it, so no resume facts.
+    ["dsh", exe("/usr/bin/dsh"), true, false],
+  ];
+  for (const [id, installation, compaction, facts] of rows) {
+    const caps = oarInstalledSessionCapabilities(await loadOarRuntime(id), installation);
+    const label = `${id} ${"version" in installation ? installation.version : installation.via}`;
+    assert.equal(turnEndCompactionDeclared(caps), compaction, `${label}: turn-end compaction declared`);
+    // Declared is not enough: only a runtime it has already run on (OpenCode 2 and DSH declare it but are not rolled out).
+    const rolledOut = id === "claude" || id === "codex" || id === "grok" || id === "pi";
+    assert.equal(turnEndCompactionAllowed(id, caps), compaction && rolledOut, `${label}: turn-end compaction allowed`);
+    assert.equal(summarySuppliesResumeFacts({ wakeRecycleOar: true }, id, caps.contextUsage), facts, `${label}: summary resume facts`);
+  }
+});
+
+test("OAR 0.124.0 per-installation declarations expose mcpTransports, stopTask, and nativeMemoryDefault refusals", async () => {
+  const { oarInstalledSessionCapabilities } = await import("./oarLoader");
+  const exe = (command: string, version: string) => ({ kind: "available" as const, via: "executable" as const, command, version });
+  const qoder = oarInstalledSessionCapabilities(await loadOarRuntime("qoder"), exe("/usr/bin/qodercli", "1.1.78"));
+  assert.deepEqual(qoder.mcpTransports, ["stdio", "http"]);
+  assert.equal(qoder.stopTask, true);
+  assert.ok(qoder.refusedSessionOptions?.nativeMemoryDefault);
+
+  const qwenOld = oarInstalledSessionCapabilities(await loadOarRuntime("qwen"), exe("/usr/bin/qwen", "0.25.0"));
+  assert.deepEqual(qwenOld.mcpTransports, ["stdio"]);
+  assert.equal(qwenOld.stopTask, false);
+  assert.ok(qwenOld.refusedSessionOptions?.nativeMemoryDefault);
+
+  const qwenNew = oarInstalledSessionCapabilities(await loadOarRuntime("qwen"), exe("/usr/bin/qwen", "0.26.0"));
+  assert.deepEqual(qwenNew.mcpTransports, ["stdio", "http"]);
+  assert.equal(qwenNew.refusedSessionOptions?.nativeMemoryDefault, undefined);
+
+  const claude = oarInstalledSessionCapabilities(await loadOarRuntime("claude"), exe("/usr/bin/claude", "2.1.220"));
+  assert.deepEqual(claude.mcpTransports, ["stdio", "http"]);
+  assert.equal(claude.stopTask, true);
+  assert.ok(claude.refusedSessionOptions?.nativeMemoryDefault);
+});
+
+test("Pi runs in OAR's subprocess RPC mode on Linux/macOS non-SEA non-Electron builds with one child per session", async () => {
+  const { piRpcAvailable } = await import("./oarLoader");
+  assert.equal(piRpcAvailable({ platform: "linux", sea: false, electron: false, resolve: () => "file:///pi/rpc-entry.js" }), true);
+  assert.equal(piRpcAvailable({ platform: "darwin", sea: false, electron: false, resolve: () => "file:///pi/rpc-entry.js" }), true);
+  assert.equal(piRpcAvailable({ platform: "darwin", sea: false, electron: true, resolve: () => "file:///pi/rpc-entry.js" }), false);
+  assert.equal(piRpcAvailable({ platform: "win32", sea: false, electron: false, resolve: () => "file:///pi/rpc-entry.js" }), false);
+  assert.equal(piRpcAvailable({ platform: "linux", sea: true, electron: false, resolve: () => "file:///pi/rpc-entry.js" }), false);
+  assert.equal(piRpcAvailable({ platform: "linux", sea: undefined, electron: false, resolve: () => "file:///pi/rpc-entry.js" }), false);
+  assert.equal(piRpcAvailable({ platform: "linux", sea: false, electron: false, resolve: () => { throw new Error("missing"); } }), false);
+  const pi = await loadOarRuntime("pi");
+  assert.equal(pi.id, "pi");
+  assert.equal(pi.execution, "process");
+  const session = await loadOarSessionRuntime("pi");
+  assert.equal(session.placement, "isolated");
+  assert.equal(pi.refusedSessionOptions?.env, undefined, "the session's env is taken");
+  assert.ok(pi.refusedSessionOptions?.endTurnProcessesOnAbort, "refuses endTurnProcessesOnAbort");
 });
 
 test("pinIsolated leaves in-process runtimes alone (they reject an explicit placement at open)", async () => {
@@ -94,7 +208,7 @@ test("pinIsolated leaves in-process runtimes alone (they reject an explicit plac
   }
 });
 
-test("the OAR host's modules load as an antigravity, codex, grok, qwen or qoder launch reaches them, and Grok's and OpenCode's sign-in modules too (what the SEA release smoke runs)", async () => {
+test("the OAR host's modules load as an antigravity, codex, grok, qwen, qoder or dsh launch reaches them, and Grok's and OpenCode's sign-in modules too (what the SEA release smoke runs)", async () => {
   const { verifyBundledOarHost } = await import("./oarLoader");
   const started = Date.now();
   await verifyBundledOarHost();

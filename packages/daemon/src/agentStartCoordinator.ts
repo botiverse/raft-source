@@ -1,4 +1,4 @@
-import type { AgentConfig, AgentMessage, TraceContext } from "@botiverse/raft-shared";
+import type { AgentConfig, AgentMessage, AgentStartOpenTasks, TraceContext } from "@botiverse/raft-shared";
 import type { RecoveryGrant } from "./runtimeOutcomeOutbox";
 
 /**
@@ -19,6 +19,8 @@ export type AgentStartQueueItem = {
   wakeMessageTransient?: boolean;
   resumeMessages?: AgentMessage[];
   unreadSummary?: Record<string, number>;
+  /** The open tasks the server's resume start named (`agent:start` `openTasks`). */
+  openTasks?: AgentStartOpenTasks;
   resumePrompt?: string;
   launchId?: string;
   // RFC 071: the recovery grant of the admitted human start this start is

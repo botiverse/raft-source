@@ -1,6 +1,6 @@
 import { handlerTraceEvents } from "../test/handlerTraceEvents";
 import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
-import { parseRuntimeFormV2, releasedRuntimeFormDefinition } from "@botiverse/raft-runtime-form";
+import { parseRuntimeFormV2 } from "@botiverse/raft-runtime-form";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
@@ -19,6 +19,7 @@ import {
   REMOTE_COMPUTER_UPGRADE_PLATFORM_HOLD_FEATURE_FLAG_KEYS,
   RAFT_CLIENT_CAPABILITIES_HEADER,
   RUNTIMES,
+  RUNTIME_USAGE_ACCOUNT_FOLDERS_CLIENT_CAPABILITY,
   RUNTIME_USAGE_WINDOW_SCOPE_CLIENT_CAPABILITY,
   SERVER_RUNTIME_CATALOG_VERSION,
   traceEventRowsForSpan,
@@ -35,7 +36,9 @@ import { createAgent, deleteAgent } from "../services/agentService";
 import { completeAgentMigrationAutoStart } from "../services/agentMigrationService";
 import { beginTestAgentMigration } from "../test/agentMigrationFixture";
 import { registerMachine } from "../services/machineService";
-import { computerControllerAttachers, computerControllerUserId } from "../services/computerControlAuthorization";
+import { canManageComputer, computerActorAllowed, computerControllerUserId, computerRoleAllows, controllerUserIdFromAttachers } from "../services/computerControlAuthorization";
+import { actorRoleHasServerCapability } from "../lib/actorPermissions";
+import { getComputerLinkedMachineAttachers } from "../services/computerCredentialService";
 import * as computerVersionService from "../services/computerVersionService";
 import { getLatestComputerReleaseNotes, getLatestComputerVersion, __resetLatestComputerVersionForTest } from "../services/computerVersionService";
 import { OFFICIAL_ONBOARDING_AGENT_IDENTITY } from "../services/officialOnboardingAgentIdentity";
@@ -562,7 +565,7 @@ test("GET /api/servers/:id/members/:memberId/profile cannot bypass a hidden huma
 
     const hidden = await requestProfile(hiddenPeer.id);
     assert.equal(hidden.status, 404);
-    assert.deepEqual(await hidden.json(), { error: "User not found" });
+    assert.deepEqual(await hidden.json(), { error: "User not found", code: "user_not_found", errorCode: "user_not_found" });
 
     const self = await requestProfile(requester.id);
     assert.equal(self.status, 200, "hidden-directory members keep their own profile");
@@ -2219,7 +2222,40 @@ test("POST /api/servers/:id/invites rejects invalid email addresses", async ({ a
     });
 
     assert.equal(res.status, 400);
-    assert.deepEqual(await res.json(), { error: "Enter a valid email address" });
+    assert.deepEqual(await res.json(), { error: "Enter a valid email address", code: "invite_email_invalid", errorCode: "invite_email_invalid" });
+});
+
+test("POST /api/servers/:id/invites answers 409 with its own code for a pending invite and for an existing member", async ({ app }) => {
+  const owner = await seedPasswordUser("invite-conflict-owner");
+  const member = await seedPasswordUser("invite-conflict-member");
+  const server = await createServer("Invite Conflict", `invite-conflict-${randomUUID()}`, owner.id);
+  await insertActiveProSubscription(server.id, owner.id, 5);
+  await getDb().insert(serverMembers).values({ serverId: server.id, userId: member.id, role: "member" });
+  const ownerToken = await tokenForHuman(owner.email);
+  const invite = (email: string) => fetch(`${app.baseUrl}/api/servers/${server.id}/invites`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${ownerToken}`, "X-Server-Id": server.id, "Content-Type": "application/json" },
+    body: JSON.stringify({ email }),
+  });
+  const email = `invite-conflict-${randomUUID()}@slock.test`;
+  const first = await invite(email);
+  assert.equal(first.status, 200, await first.clone().text());
+
+  // The route picks the code from the service's sentence: each of the two keeps its own.
+  const again = await invite(email);
+  assert.equal(again.status, 409, await again.clone().text());
+  assert.deepEqual(await again.json(), {
+    error: "An invite has already been sent to this email",
+    code: "invite_already_sent",
+    errorCode: "invite_already_sent",
+  });
+  const existing = await invite(member.email);
+  assert.equal(existing.status, 409, await existing.clone().text());
+  assert.deepEqual(await existing.json(), {
+    error: "This user is already a member of this server",
+    code: "already_member",
+    errorCode: "already_member",
+  });
 });
 
 test("two paid seats let an owner invite and accept one more human", async ({ app }) => {
@@ -2314,7 +2350,7 @@ test("email invites are blocked but join links can be created when Pro universal
     });
     // A Guest is invited to a channel, not to the server (#wg-rbac:#15): refused, seats full or not.
     assert.equal(guestInviteRes.status, 400);
-    assert.deepEqual(await guestInviteRes.json(), { error: "Guests are invited to one channel, not to the server" });
+    assert.deepEqual(await guestInviteRes.json(), { error: "Guests are invited to one channel, not to the server", code: "invite_guest_channel_only", errorCode: "invite_guest_channel_only" });
 
     const linkRes = await fetch(`${app.baseUrl}/api/servers/${server.id}/join-links`, {
       method: "POST",
@@ -2549,6 +2585,11 @@ test("PATCH /api/servers/:id/onboarding-settings lets owner/admin set onboarding
 
     const invalidGreetingRes = await patch(ownerToken, { agentAllChannelGreetingEnabled: "nope" });
     assert.equal(invalidGreetingRes.status, 400);
+    assert.deepEqual(await invalidGreetingRes.json(), {
+      error: "agentAllChannelGreetingEnabled must be a boolean",
+      code: "onboarding_settings_invalid",
+      errorCode: "onboarding_settings_invalid",
+    });
 
     const invalidStepRes = await patch(memberToken, { onboardingWizardCurrentStep: "bogus" });
     assert.equal(invalidStepRes.status, 400);
@@ -2723,7 +2764,7 @@ test("server setup projection and transition routes reject retired defer and enf
       role: "admin",
     });
     await getDb().update(serversTable)
-      .set({ onboardingAgentId: officialAgent.id })
+      .set({ officialOnboardingAgentId: officialAgent.id })
       .where(eq(serversTable.id, server.id));
 
     const completed = await transition(ownerToken, "complete");
@@ -2842,11 +2883,11 @@ test("GET/PATCH /api/servers/:id/translation-settings is server-scoped and owner
 
       const memberPatch = await request(memberToken, "PATCH", { translationEnabled: true });
       assert.equal(memberPatch.status, 403);
-      assert.deepEqual(await memberPatch.json(), { error: "Only server owners and admins can update translation settings" });
+      assert.deepEqual(await memberPatch.json(), { error: "Only server owners and admins can update translation settings", code: "insufficient_role", errorCode: "insufficient_role" });
 
       const invalidPatch = await request(ownerToken, "PATCH", { translationEnabled: "yes" });
       assert.equal(invalidPatch.status, 400);
-      assert.deepEqual(await invalidPatch.json(), { error: "translationEnabled must be a boolean" });
+      assert.deepEqual(await invalidPatch.json(), { error: "translationEnabled must be a boolean", code: "translation_settings_invalid", errorCode: "translation_settings_invalid" });
 
       const adminPatch = await request(adminToken, "PATCH", { translationEnabled: true });
       assert.equal(adminPatch.status, 200);
@@ -3627,6 +3668,236 @@ test("PATCH /api/servers/:id/machines/:machineId updates machine description", a
     assert.equal(clearBody.description, null);
 });
 
+test("the machine and join link routes refuse with a code per reason", async ({ app }) => {
+  const { owner, member, server } = await seedRoleFixture("machine-join-link-refusals");
+  const ownerToken = await tokenForHuman(owner.email);
+  const memberToken = await tokenForHuman(member.email);
+  const { machine } = await registerMachine(server.id, owner.id, "refusal-machine");
+  const call = async (token: string, path: string, method: string, body?: unknown) => {
+    const res = await fetch(`${app.baseUrl}/api/servers/${server.id}${path}`, {
+      method,
+      headers: { Authorization: `Bearer ${token}`, "X-Server-Id": server.id, "Content-Type": "application/json" },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+    return [res.status, await res.json()];
+  };
+  const refusal = (status: number, code: string, error: string) => [status, { error, code, errorCode: code }];
+
+  // No machine by that id here: 404 before the capability is looked at, for the owner and a member alike.
+  const missing = refusal(404, "machine_not_found", "Machine not found in this server");
+  assert.deepEqual(await call(ownerToken, `/machines/${randomUUID()}`, "PATCH", { name: "x" }), missing);
+  assert.deepEqual(await call(memberToken, `/machines/${randomUUID()}`, "PATCH", { name: "x" }), missing);
+  assert.deepEqual(await call(ownerToken, `/machines/${randomUUID()}`, "DELETE"), missing);
+  assert.deepEqual(await call(ownerToken, `/machines/${randomUUID()}/rotate-key`, "POST"), missing);
+  // A member who didn't register the machine has no authority over it.
+  assert.deepEqual(
+    await call(memberToken, `/machines/${machine.id}`, "PATCH", { name: "x" }),
+    refusal(403, "insufficient_role", "The `editMachines` capability or machine creator authority is required to edit machines"),
+  );
+  assert.deepEqual(
+    await call(memberToken, "/machines", "POST", { name: "x" }),
+    refusal(403, "insufficient_role", "The `registerMachines` capability is required to register machines"),
+  );
+  assert.deepEqual(await call(ownerToken, "/machines", "POST", {}), refusal(400, "machine_name_invalid", "Name is required"));
+  assert.deepEqual(await call(ownerToken, `/machines/${machine.id}`, "PATCH", { name: " " }), refusal(400, "machine_name_invalid", "Name is required"));
+  assert.deepEqual(await call(ownerToken, `/machines/${machine.id}`, "PATCH", { description: 5 }), refusal(400, "machine_description_invalid", "Description must be a string"));
+  assert.deepEqual(
+    await call(ownerToken, `/machines/${machine.id}`, "PATCH", { description: "d".repeat(501) }),
+    refusal(400, "machine_description_invalid", "Description must be 500 characters or less"),
+  );
+  assert.deepEqual(await call(ownerToken, `/machines/${machine.id}`, "PATCH", {}), refusal(400, "machine_update_empty", "Name or description is required"));
+
+  assert.deepEqual(await call(memberToken, "/join-links", "POST", {}), refusal(403, "insufficient_role", "Only server owners and admins can create join links"));
+  assert.deepEqual(await call(memberToken, "/join-links", "GET"), refusal(403, "insufficient_role", "Only server owners and admins can view join links"));
+  assert.deepEqual(await call(memberToken, `/join-links/${randomUUID()}`, "DELETE"), refusal(403, "insufficient_role", "Only server owners and admins can revoke join links"));
+  assert.deepEqual(await call(ownerToken, "/join-links", "POST", { expiresAt: "not a date" }), refusal(400, "join_link_expires_at_invalid", "expiresAt must be a valid date"));
+  assert.deepEqual(await call(ownerToken, "/join-links", "POST", { maxUses: 0 }), refusal(400, "join_link_max_uses_invalid", "maxUses must be a positive integer"));
+});
+
+test("the Computer control and runtime routes refuse with a code per reason", async ({ app }) => {
+  const { owner, member, server } = await seedRoleFixture("computer-control-runtime-refusals");
+  const ownerToken = await tokenForHuman(owner.email);
+  const memberToken = await tokenForHuman(member.email);
+  // A raw daemon's machine (no Computer linked), connected to no replica.
+  const { machine } = await registerMachine(server.id, owner.id, "control-refusal-machine");
+  app.app.set("agentOrchestrator", { hasMachineLocally: () => false });
+  const call = async (token: string, path: string, method: string, body?: unknown) => {
+    const res = await fetch(`${app.baseUrl}/api/servers/${server.id}${path}`, {
+      method,
+      headers: { Authorization: `Bearer ${token}`, "X-Server-Id": server.id, "Content-Type": "application/json" },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+    return [res.status, await res.json()];
+  };
+  const refusal = (status: number, code: string, error: string) => [status, { error, code, errorCode: code }];
+  const here = `/machines/${machine.id}`;
+  const nowhere = `/machines/${randomUUID()}`;
+  const machineMissing = refusal(404, "machine_not_found", "Machine not found in this server");
+  const computerMissing = refusal(404, "machine_not_found", "Computer not found");
+  const controlForbidden = refusal(403, "insufficient_role", "The `controlComputers` capability, or being the person this Computer is attached by, is required to control Computers");
+
+  // POST .../computer/:action: the action and the target version are checked before the caller's authority.
+  assert.deepEqual(await call(ownerToken, `${here}/computer/frobnicate`, "POST"), refusal(400, "unknown_action", "Unknown action"));
+  const targetVersionInvalid = refusal(400, "invalid_target_version", "A valid targetVersion is required only for upgrade");
+  assert.deepEqual(await call(ownerToken, `${here}/computer/upgrade`, "POST", {}), targetVersionInvalid);
+  assert.deepEqual(await call(ownerToken, `${here}/computer/restart`, "POST", { targetVersion: "1.0.0" }), targetVersionInvalid);
+  assert.deepEqual(await call(ownerToken, `${nowhere}/computer/restart`, "POST"), machineMissing);
+  assert.deepEqual(await call(memberToken, `${nowhere}/computer/restart`, "POST"), machineMissing);
+  assert.deepEqual(await call(memberToken, `${here}/computer/restart`, "POST"), controlForbidden);
+  assert.deepEqual(await call(ownerToken, `${here}/computer/restart`, "POST"), refusal(409, "not_a_computer", "Restart/upgrade is only available for managed Computers"));
+
+  // POST .../computer-lifecycle-operations: the body is checked before the caller's authority.
+  const lifecycle = `${here}/computer-lifecycle-operations`;
+  const stop = { action: "stop", operationId: randomUUID(), parentOperationId: randomUUID() };
+  assert.deepEqual(await call(ownerToken, lifecycle, "POST", { ...stop, action: "frobnicate" }), refusal(400, "unknown_action", "Unknown Computer lifecycle action"));
+  assert.deepEqual(await call(ownerToken, lifecycle, "POST", { ...stop, operationId: "nope" }), refusal(400, "invalid_operation_id", "A valid operationId is required"));
+  assert.deepEqual(await call(ownerToken, lifecycle, "POST", { ...stop, parentOperationId: "nope" }), refusal(400, "invalid_parent_operation_id", "A valid parentOperationId is required"));
+  assert.deepEqual(await call(ownerToken, lifecycle, "POST", { ...stop, targetVersion: "1.0.0" }), targetVersionInvalid);
+  assert.deepEqual(await call(ownerToken, lifecycle, "POST", { ...stop, completionMode: "legacy_k_promoted" }), refusal(400, "invalid_completion_mode", "Unknown Computer lifecycle completion mode"));
+  assert.deepEqual(await call(ownerToken, `${nowhere}/computer-lifecycle-operations`, "POST", stop), machineMissing);
+  assert.deepEqual(await call(memberToken, lifecycle, "POST", stop), controlForbidden);
+  assert.deepEqual(await call(ownerToken, lifecycle, "POST", stop), refusal(409, "computer_offline", "Computer is not online"));
+  assert.deepEqual(
+    await call(ownerToken, lifecycle, "POST", { ...stop, action: "start" }),
+    refusal(409, "not_a_computer", "Lifecycle operations are only available for managed Computers"),
+  );
+
+  // GET .../workspaces
+  assert.deepEqual(await call(ownerToken, `${nowhere}/workspaces`, "GET"), machineMissing);
+  assert.deepEqual(await call(memberToken, `${here}/workspaces`, "GET"), refusal(403, "insufficient_role", "You do not have permission to view machine workspaces"));
+
+  // The runtime routes say "Computer not found" for the same case.
+  assert.deepEqual(await call(ownerToken, `${nowhere}/runtime-options`, "GET"), computerMissing);
+  assert.deepEqual(await call(memberToken, `${nowhere}/runtime-options`, "GET"), computerMissing);
+  assert.deepEqual(
+    await call(memberToken, `${here}/runtime-options`, "GET"),
+    refusal(403, "insufficient_role", "The `editMachines` capability or machine creator authority is required to inspect runtime options"),
+  );
+  const providerMissing = refusal(404, "provider_not_found", "Runtime account usage provider not found");
+  assert.deepEqual(await call(ownerToken, `${here}/runtime-account-usage/frobnicate`, "GET"), providerMissing);
+  assert.deepEqual(await call(ownerToken, `${here}/runtime-account-usage/frobnicate/refresh`, "POST", {}), providerMissing);
+  assert.deepEqual(await call(ownerToken, `${nowhere}/runtime-account-usage/claude`, "GET"), computerMissing);
+  assert.deepEqual(await call(ownerToken, `${nowhere}/runtime-account-usage/claude/refresh`, "POST", {}), computerMissing);
+  assert.deepEqual(
+    await call(memberToken, `${here}/runtime-account-usage/claude`, "GET"),
+    refusal(403, "insufficient_role", "The `editMachines` capability or attaching-human authority is required to inspect runtime account usage"),
+  );
+  assert.deepEqual(
+    await call(memberToken, `${here}/runtime-account-usage/claude/refresh`, "POST", {}),
+    refusal(403, "insufficient_role", "The `editMachines` capability or attaching-human authority is required to refresh runtime account usage"),
+  );
+
+  // The runtime forms (v2).
+  assert.deepEqual(await call(ownerToken, `${nowhere}/runtime-forms/v2/builtin`, "GET"), computerMissing);
+  assert.deepEqual(await call(ownerToken, `${nowhere}/runtime-forms/v2/builtin/option-sources/model`, "GET"), computerMissing);
+  assert.deepEqual(
+    await call(memberToken, `${here}/runtime-forms/v2/builtin`, "GET"),
+    refusal(403, "insufficient_role", "The `editMachines` capability or machine creator authority is required to inspect runtime form definitions"),
+  );
+  assert.deepEqual(
+    await call(memberToken, `${here}/runtime-forms/v2/builtin/option-sources/model`, "GET"),
+    refusal(403, "insufficient_role", "The `editMachines` capability or machine creator authority is required to inspect runtime form option sources"),
+  );
+  // Kept as they were: the runtime form protocol's top-level issues, and no code.
+  assert.deepEqual(await call(ownerToken, `${here}/runtime-forms/v2/frobnicate`, "GET"), [404, {
+    error: "Runtime form definition not found",
+    issues: [{ code: "unknown_form_runtime", pointer: "/runtimeId" }],
+  }]);
+  assert.deepEqual(await call(ownerToken, `${here}/runtime-forms/v2/frobnicate/option-sources/model`, "GET"), [404, {
+    error: "Runtime form option source not found",
+    issues: [{ code: "unknown_form_runtime", pointer: "/runtimeId" }],
+  }]);
+});
+
+test("the runtime detection, agent diagnostic, feedback transcript and workspace delete routes refuse with a code per reason", async ({ app }) => {
+  const { owner, member, server } = await seedRoleFixture("runtime-diagnostic-refusals");
+  const ownerToken = await tokenForHuman(owner.email);
+  const memberToken = await tokenForHuman(member.email);
+  const { machine } = await registerMachine(server.id, owner.id, "diagnostic-refusal-machine");
+  // The machine is on this replica, and the Computer does not take the rescan request.
+  app.app.set("agentOrchestrator", { hasMachineLocally: () => true, rescanMachineRuntimes: async () => false });
+  // The owner's agent on the machine, and one on no machine.
+  const [placed] = await getDb().insert(agents).values({
+    serverId: server.id, name: "diagnostic-placed", runtime: "codex", machineId: machine.id, status: "active",
+    creatorType: "user", creatorId: owner.id,
+  }).returning();
+  const [unplaced] = await getDb().insert(agents).values({
+    serverId: server.id, name: "diagnostic-unplaced", runtime: "codex", status: "active",
+    creatorType: "user", creatorId: owner.id,
+  }).returning();
+  const call = async (token: string, path: string, method: string, body?: unknown) => {
+    const res = await fetch(`${app.baseUrl}/api/servers/${server.id}${path}`, {
+      method,
+      headers: { Authorization: `Bearer ${token}`, "X-Server-Id": server.id, "Content-Type": "application/json" },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+    return [res.status, await res.json()];
+  };
+  const refusal = (status: number, code: string, error: string) => [status, { error, code, errorCode: code }];
+  const here = `/machines/${machine.id}`;
+  const nowhere = `/machines/${randomUUID()}`;
+  const machineMissing = refusal(404, "machine_not_found", "Machine not found in this server");
+  const agentMissing = refusal(404, "agent_not_found", "Agent not found in this server");
+  const agentElsewhere = refusal(400, "invalid_request", "Agent is not assigned to this machine");
+
+  // POST .../runtimes/rescan
+  assert.deepEqual(await call(ownerToken, `${nowhere}/runtimes/rescan`, "POST"), refusal(404, "machine_not_found", "Computer not found"));
+  assert.deepEqual(
+    await call(memberToken, `${here}/runtimes/rescan`, "POST"),
+    refusal(403, "insufficient_role", "The `editMachines` capability or machine creator authority is required to rescan runtimes"),
+  );
+  assert.deepEqual(await call(ownerToken, `${here}/runtimes/rescan`, "POST"), refusal(409, "computer_offline", "Computer is offline"));
+
+  // GET .../runtime-models/:runtime
+  assert.deepEqual(await call(ownerToken, `${nowhere}/runtime-models/codex`, "GET"), machineMissing);
+  assert.deepEqual(
+    await call(memberToken, `${here}/runtime-models/codex`, "GET"),
+    refusal(403, "insufficient_role", "The `editMachines` capability or machine creator authority is required to inspect runtime models"),
+  );
+
+  // GET .../agents/:agentId/diagnostic/session-transcript
+  const transcript = (agentId: string) => `/agents/${agentId}/diagnostic/session-transcript`;
+  assert.deepEqual(await call(ownerToken, `${nowhere}${transcript(placed.id)}`, "GET"), machineMissing);
+  assert.deepEqual(await call(ownerToken, `${here}${transcript(randomUUID())}`, "GET"), agentMissing);
+  assert.deepEqual(await call(ownerToken, `${here}${transcript(unplaced.id)}`, "GET"), agentElsewhere);
+  assert.deepEqual(
+    await call(memberToken, `${here}${transcript(placed.id)}`, "GET"),
+    refusal(403, "insufficient_role", "The `editAgents` capability or human creator authority is required to view agent diagnostics"),
+  );
+
+  // POST .../agents/:agentId/feedback/:reportId/transcript
+  const feedback = (agentId: string) => `/agents/${agentId}/feedback/${randomUUID()}/transcript`;
+  assert.deepEqual(await call(ownerToken, `${nowhere}${feedback(placed.id)}`, "POST", {}), machineMissing);
+  assert.deepEqual(await call(ownerToken, `${here}${feedback(randomUUID())}`, "POST", {}), agentMissing);
+  assert.deepEqual(await call(ownerToken, `${here}${feedback(unplaced.id)}`, "POST", {}), agentElsewhere);
+  assert.deepEqual(
+    await call(memberToken, `${here}${feedback(placed.id)}`, "POST", {}),
+    refusal(403, "insufficient_role", "The `editAgents` capability or human creator authority is required to request transcript collection"),
+  );
+  assert.deepEqual(
+    await call(ownerToken, `${here}${feedback(placed.id)}`, "POST", { reportGeneratedAt: "not-a-timestamp" }),
+    refusal(400, "invalid_input", "reportGeneratedAt must be an ISO timestamp"),
+  );
+  assert.deepEqual(
+    await call(ownerToken, `${here}${feedback(placed.id)}`, "POST", { includeMachineLogTail: "yes" }),
+    refusal(400, "invalid_input", "includeMachineLogTail must be a boolean"),
+  );
+
+  // DELETE .../workspaces/:directoryName
+  assert.deepEqual(await call(ownerToken, `${nowhere}/workspaces/${placed.id}`, "DELETE"), machineMissing);
+  assert.deepEqual(
+    await call(memberToken, `${here}/workspaces/${placed.id}`, "DELETE"),
+    refusal(403, "insufficient_role", "The `controlComputers` capability or machine creator authority is required to delete machine workspaces"),
+  );
+  assert.deepEqual(await call(ownerToken, `${here}/workspaces/${randomUUID()}`, "DELETE"), refusal(404, "not_found", "Workspace not found in this server"));
+
+  // Kept as they were: the mention delivery diagnostic answers `{ status }`, with no sentence and no code.
+  const delivery = `${here}/agents/${placed.id}/diagnostic/mention-delivery/${randomUUID()}`;
+  assert.deepEqual(await call(memberToken, delivery, "GET"), [404, { status: "NOT_ACCESSIBLE" }]);
+  assert.deepEqual(await call(memberToken, `${delivery}/redrive`, "POST", { expectedVersion: 0 }), [404, { status: "NOT_ACCESSIBLE" }]);
+  assert.deepEqual(await call(ownerToken, `${delivery}/redrive`, "POST", {}), [400, { status: "INVALID_REQUEST" }]);
+});
+
 test("DELETE /api/servers/:id/machines/:machineId disconnects live Computer-backed machine immediately", async ({ app }) => {
     const db = getDb();
     const { owner, server } = await seedRoleFixture("machine-delete-disconnects-computer");
@@ -3908,6 +4179,7 @@ test("DELETE /api/servers/:id/machines/:machineId keeps cross-machine runtime pr
     assert.deepEqual(await res.json(), {
       error: "Cannot delete computer while runtime profiles still reference active agents. Remove or migrate related agents first.",
       code: "MACHINE_HAS_ACTIVE_RUNTIME_PROFILE",
+      errorCode: "MACHINE_HAS_ACTIVE_RUNTIME_PROFILE",
     });
 });
 
@@ -3932,6 +4204,7 @@ test("DELETE /api/servers/:id/machines/:machineId keeps stale profiles fail-clos
     assert.deepEqual(await res.json(), {
       error: "Cannot delete computer while runtime profiles still reference active agents. Remove or migrate related agents first.",
       code: "MACHINE_HAS_ACTIVE_RUNTIME_PROFILE",
+      errorCode: "MACHINE_HAS_ACTIVE_RUNTIME_PROFILE",
     });
 });
 
@@ -4016,6 +4289,7 @@ test("DELETE /api/servers/:id/machines/:machineId returns a typed 409 for an act
     assert.deepEqual(await res.json(), {
       error: "Cannot delete computer while an agent migration is in progress. Wait for it to finish or abort it first.",
       code: "MACHINE_HAS_ACTIVE_MIGRATION",
+      errorCode: "MACHINE_HAS_ACTIVE_MIGRATION",
     });
     assert.equal(
       (await db.select({ id: machines.id }).from(machines).where(eq(machines.id, sourceMachine.id))).length,
@@ -4256,6 +4530,41 @@ test("server runtime catalog: any member reads it, a non-member is refused", asy
     assert.equal(outsiderRes.status, 403);
 });
 
+test("runtime form v1 routes are retired: each answers 410 runtime_form_v1_retired with an update-the-app message", async ({ app }) => {
+    const { owner, member, server } = await seedRoleFixture("runtime-form-v1-retired");
+    const { member: outsider } = await seedRoleFixture("runtime-form-v1-retired-other");
+    const [machine] = await getDb().insert(machines).values({
+      serverId: server.id,
+      userId: owner.id,
+      name: "runtime-form-v1-retired-machine",
+      apiKeyHash: "unused-runtime-form-v1-retired-machine-hash",
+      runtimes: ["builtin", "kimi-sdk"],
+    }).returning();
+    const base = `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-form-definitions`;
+    const urls = [
+      `${base}/builtin?schemaVersion=builtin-pi.create.v3`,
+      `${base}/kimi-sdk/option-sources/model?schemaVersion=${KIMI_SDK_FORM_DEFINITION_REF.schemaVersion}`,
+    ];
+    for (const user of [owner, member]) {
+      const headers = { Authorization: `Bearer ${await tokenForHuman(user.email)}`, "X-Server-Id": server.id };
+      for (const url of urls) {
+        const res = await fetch(url, { headers });
+        assert.equal(res.status, 410, url);
+        assert.deepEqual(await res.json(), {
+          error: "This version of the app no longer supports creating or editing agents. Please update the app.",
+          code: "runtime_form_v1_retired",
+          errorCode: "runtime_form_v1_retired",
+        });
+      }
+    }
+    const outsiderHeaders = { Authorization: `Bearer ${await tokenForHuman(outsider.email)}`, "X-Server-Id": server.id };
+    for (const url of urls) {
+      const res = await fetch(url, { headers: outsiderHeaders });
+      assert.equal(res.status, 403, `a non-member is refused before the route runs: ${url}`);
+      await res.text();
+    }
+});
+
 test("schema runtime options serve Built-in Pi and live model-scoped Kimi definitions", async ({ app }) => {
     const { owner, server } = await seedRoleFixture("builtin-pi-schema-form");
     const [machine] = await getDb().insert(machines).values({
@@ -4325,64 +4634,6 @@ test("schema runtime options serve Built-in Pi and live model-scoped Kimi defini
     const kimi = catalog.options.find((option) => option.runtimeId === "kimi-sdk");
     assert.deepEqual(kimi?.formDefinitionRef, KIMI_SDK_FORM_DEFINITION_REF);
 
-    const definitionRes = await fetch(
-      `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-form-definitions/builtin?schemaVersion=${builtIn?.formDefinitionRef?.schemaVersion}`,
-      { headers },
-    );
-    assert.equal(definitionRes.status, 200);
-    const definitionBody = await definitionRes.json() as unknown;
-    // A released version is served verbatim from its frozen sample (packages/runtime-form).
-    assert.deepEqual(definitionBody, releasedRuntimeFormDefinition("builtin-pi.create.v3"));
-    const definition = definitionBody as unknown as {
-      protocolVersion: number;
-      runtimeId: string;
-      schemaVersion: string;
-      dataSchema: {
-        properties: {
-          apiKey: Record<string, unknown>;
-          supportsImageInput: Record<string, unknown>;
-        } & Record<string, Record<string, unknown>>;
-        required: string[];
-      };
-      capabilities: { writeOnlyPointers: string[]; forbiddenPointers: string[] };
-      optionSources: Record<string, { protocolVersion: number; runtimeId: string; schemaVersion: string; sourceId: string }>;
-    };
-    assert.equal(definition.protocolVersion, 1);
-    assert.equal(definition.runtimeId, "builtin");
-    assert.equal(definition.dataSchema.properties.apiKey.writeOnly, true);
-    assert.equal("default" in definition.dataSchema.properties.apiKey, false);
-    assert.equal(definition.dataSchema.properties.supportsImageInput?.type, "boolean");
-    assert.deepEqual(definition.capabilities.writeOnlyPointers, ["/apiKey"]);
-    assert.deepEqual(definition.capabilities.forbiddenPointers, ["/hostUserState"]);
-    for (const source of Object.values(definition.optionSources)) {
-      assert.deepEqual(
-        { protocolVersion: source.protocolVersion, runtimeId: source.runtimeId, schemaVersion: source.schemaVersion },
-        { protocolVersion: 1, runtimeId: "builtin", schemaVersion: definition.schemaVersion },
-      );
-      assert.equal("options" in source, false);
-      assert.equal("optionsByValue" in source, false);
-    }
-
-    const providerSourceRes = await fetch(
-      `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-form-definitions/builtin/option-sources/provider?schemaVersion=${definition.schemaVersion}`,
-      { headers },
-    );
-    const providerSourceBody = await providerSourceRes.json() as {
-      sourceId: string;
-      schemaVersion: string;
-      kind: string;
-      options: Array<{ value: string; providerKind: string }>;
-      error?: string;
-      code?: string;
-    };
-    assert.equal(
-      providerSourceRes.status,
-      200,
-      JSON.stringify(providerSourceBody),
-    );
-    const providerSource = providerSourceBody;
-    assert.equal(providerSource.sourceId, "provider");
-
     // Protocol v2: current form, no schemaVersion pin, rendered by field kind.
     const v2Res = await fetch(
       `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-forms/v2/builtin`,
@@ -4397,9 +4648,13 @@ test("schema runtime options serve Built-in Pi and live model-scoped Kimi defini
       `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-forms/v2/builtin/option-sources/provider`,
       { headers },
     );
-    const v2ProviderBody = await v2ProviderRes.json() as unknown;
-    assert.equal(v2ProviderRes.status, 200, `v2 option sources need no schemaVersion: ${JSON.stringify(v2ProviderBody)}`);
-    assert.deepEqual(v2ProviderBody, providerSourceBody);
+    const providerSource = await v2ProviderRes.json() as {
+      sourceId: string;
+      kind: string;
+      options: Array<{ value: string; providerKind: string }>;
+    };
+    assert.equal(v2ProviderRes.status, 200, `v2 option sources need no schemaVersion: ${JSON.stringify(providerSource)}`);
+    assert.equal(providerSource.sourceId, "provider");
     assert.equal(v2ProviderRes.headers.get("content-language"), "en");
 
     // v2 copy follows Accept-Language; values and structure do not change.
@@ -4427,30 +4682,22 @@ test("schema runtime options serve Built-in Pi and live model-scoped Kimi defini
       zhProvider.options.map((option) => option.value),
       providerSource.options.map((option) => option.value),
     );
-    assert.equal(providerSource.schemaVersion, definition.schemaVersion);
     assert.equal(providerSource.kind, "select");
     assert.ok(providerSource.options.some((option) => option.value === "deepseek" && option.providerKind === "preset"));
 
     const modelSourceRes = await fetch(
-      `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-form-definitions/builtin/option-sources/model?schemaVersion=${definition.schemaVersion}`,
+      `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-forms/v2/builtin/option-sources/model`,
       { headers },
     );
     assert.equal(modelSourceRes.status, 200);
     const modelSource = await modelSourceRes.json() as {
       sourceId: string;
-      schemaVersion: string;
       kind: string;
       optionsByValue: Record<string, unknown[]>;
     };
     assert.equal(modelSource.sourceId, "model");
-    assert.equal(modelSource.schemaVersion, definition.schemaVersion);
     assert.equal(modelSource.kind, "dependent_select");
     assert.ok((modelSource.optionsByValue.deepseek ?? []).length > 0);
-    // task #10: a typed OpenRouter id is v2-only. A v1 client builds its own
-    // config and only ever builds a custom model for a gateway.
-    const v1Custom = (modelSource as unknown as { customValueAllowedByValue: Record<string, boolean> }).customValueAllowedByValue;
-    assert.equal(v1Custom.openrouter, false, "v1 keeps OpenRouter list-only");
-    assert.equal(v1Custom["openai-compatible"], true, "v1 gateways still take a typed id");
     // task #10: typing on OpenRouter and its limit fields need BOTH a client
     // that advertises dependent_select.custom_value_with_options AND a
     // Computer that runs a typed id. Anything else is served as before.
@@ -4485,7 +4732,7 @@ test("schema runtime options serve Built-in Pi and live model-scoped Kimi defini
     catalogMode = "legacy";
     assert.deepEqual((await limitVisibility(CAP)).in, GATEWAYS, "an older Computer hides them for OpenRouter");
     const legacySourceRes = await fetch(
-      `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-form-definitions/builtin/option-sources/model?schemaVersion=${definition.schemaVersion}`,
+      `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-forms/v2/builtin/option-sources/model`,
       { headers },
     );
     assert.equal(legacySourceRes.status, 409);
@@ -4504,7 +4751,7 @@ test("schema runtime options serve Built-in Pi and live model-scoped Kimi defini
 
     catalogMode = "offline";
     const offlineSourceRes = await fetch(
-      `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-form-definitions/builtin/option-sources/model?schemaVersion=${definition.schemaVersion}`,
+      `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-forms/v2/builtin/option-sources/model`,
       { headers },
     );
     // Offline: the bundled catalog keeps the form usable (never an empty one);
@@ -4516,35 +4763,6 @@ test("schema runtime options serve Built-in Pi and live model-scoped Kimi defini
     };
     assert.equal(offlineSource.kind, "dependent_select");
     assert.ok((offlineSource.optionsByValue.deepseek ?? []).length > 0, "offline serves the bundled catalog, not an empty one");
-
-    const staleSourceRes = await fetch(
-      `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-form-definitions/builtin/option-sources/provider?schemaVersion=stale`,
-      { headers },
-    );
-    assert.equal(staleSourceRes.status, 409);
-
-    const staleRes = await fetch(
-      `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-form-definitions/builtin?schemaVersion=stale`,
-      { headers },
-    );
-    assert.equal(staleRes.status, 409);
-    assert.deepEqual((await staleRes.json() as { issues: unknown }).issues, [
-      { code: "stale_form_schema", pointer: "/schemaVersion" },
-    ]);
-
-    const kimiDefinitionRes = await fetch(
-      `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-form-definitions/kimi-sdk?schemaVersion=${kimi?.formDefinitionRef?.schemaVersion}`,
-      { headers },
-    );
-    assert.equal(kimiDefinitionRes.status, 200);
-    const kimiDefinition = await kimiDefinitionRes.json() as {
-      runtimeId: string;
-      dataSchema: { required: string[] };
-      optionSources: Record<string, unknown>;
-    };
-    assert.equal(kimiDefinition.runtimeId, "kimi-sdk");
-    assert.deepEqual(kimiDefinition.dataSchema.required, ["model"]);
-    assert.deepEqual(Object.keys(kimiDefinition.optionSources), ["model"]);
 
     const orchestrator = app.app.get("agentOrchestrator") as {
       detectMachineRuntimeModels: () => Promise<unknown>;
@@ -4565,7 +4783,7 @@ test("schema runtime options serve Built-in Pi and live model-scoped Kimi defini
       },
     });
     const kimiSourceRes = await fetch(
-      `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-form-definitions/kimi-sdk/option-sources/model?schemaVersion=${kimi?.formDefinitionRef?.schemaVersion}`,
+      `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-forms/v2/kimi-sdk/option-sources/model`,
       { headers },
     );
     assert.equal(kimiSourceRes.status, 200);
@@ -4578,73 +4796,7 @@ test("schema runtime options serve Built-in Pi and live model-scoped Kimi defini
     ]);
 });
 
-test("schema kimi option source falls back to the managed default on missing_config, other failures stay typed", async ({ app }) => {
-    const { owner, server } = await seedRoleFixture("kimi-missing-config-fallback");
-    const [machine] = await getDb().insert(machines).values({
-      serverId: server.id,
-      userId: owner.id,
-      name: "kimi-missing-config-machine",
-      apiKeyHash: "unused-kimi-missing-config-machine-hash",
-      runtimes: ["kimi-sdk"],
-    }).returning();
-  const ownerToken = await tokenForHuman(owner.email);
-    const headers = {
-      Authorization: `Bearer ${ownerToken}`,
-      "X-Server-Id": server.id,
-    };
-    let outcome: unknown = { kind: "missing_config", recovery: "kimi_login" };
-    app.app.set("agentOrchestrator", {
-      hasMachineLocally: () => true,
-      detectMachineRuntimeModels: async () => outcome,
-    });
-    const sourceUrl = `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-form-definitions/kimi-sdk/option-sources/model?schemaVersion=${KIMI_SDK_FORM_DEFINITION_REF.schemaVersion}`;
-
-    // First-install shape (no ~/.kimi-code/config.toml yet): the managed
-    // default must be offered, not a hard failure.
-    const fallbackRes = await fetch(sourceUrl, { headers });
-    assert.equal(fallbackRes.status, 200);
-    const fallbackSource = await fallbackRes.json() as {
-      options: Array<{ value: string; label: string }>;
-      defaultValue: string;
-    };
-    assert.deepEqual(fallbackSource.options, [
-      { value: "kimi-code/kimi-for-coding", label: "Kimi for Coding (default)" },
-    ]);
-    assert.equal(fallbackSource.defaultValue, "kimi-code/kimi-for-coding");
-
-    // Offline Computer: the same managed default, not a hard failure.
-    outcome = { kind: "error", retryable: true, code: "computer_offline" };
-    const offlineRes = await fetch(sourceUrl, { headers });
-    assert.equal(offlineRes.status, 200);
-    assert.equal((await offlineRes.json() as { defaultValue: string }).defaultValue, "kimi-code/kimi-for-coding");
-
-    // Genuine detection failures still fail closed.
-    outcome = { kind: "error", retryable: true };
-    const errorRes = await fetch(sourceUrl, { headers });
-    assert.equal(errorRes.status, 409);
-    assert.deepEqual((await errorRes.json() as { issues: unknown }).issues, [
-      { code: "runtime_model_source_error", pointer: "/optionSources/model" },
-    ]);
-
-    // Adjacent non-live outcomes must NOT be disguised as a launchable
-    // default: an empty grant (config exists, no models) and an unsupported
-    // runtime keep their typed 409s.
-    outcome = { kind: "no_models" };
-    const emptyGrantRes = await fetch(sourceUrl, { headers });
-    assert.equal(emptyGrantRes.status, 409);
-    assert.deepEqual((await emptyGrantRes.json() as { issues: unknown }).issues, [
-      { code: "runtime_model_source_no_models", pointer: "/optionSources/model" },
-    ]);
-
-    outcome = { kind: "unsupported" };
-    const unsupportedRes = await fetch(sourceUrl, { headers });
-    assert.equal(unsupportedRes.status, 409);
-    assert.deepEqual((await unsupportedRes.json() as { issues: unknown }).issues, [
-      { code: "runtime_model_source_unsupported", pointer: "/optionSources/model" },
-    ]);
-});
-
-test("v2 Kimi and Built-in Pi model sources report status instead of a 409; v1 bodies are unchanged", async ({ app }) => {
+test("v2 Kimi and Built-in Pi model sources report status instead of a 409", async ({ app }) => {
     const { owner, server } = await seedRoleFixture("kimi-builtin-v2-source-status");
     const [machine] = await getDb().insert(machines).values({
       serverId: server.id,
@@ -4735,21 +4887,9 @@ test("v2 Kimi and Built-in Pi model sources report status instead of a 409; v1 b
     assert.equal(legacy.status, 409);
     assert.equal((await legacy.json() as { code: string }).code, "builtin_catalog_capability_required");
 
-    // v1 keeps its bodies: no status fields, and the old 409s.
-    kimiOutcome = { kind: "missing_config", recovery: "kimi_login" };
-    const v1Kimi = await (await fetch(`${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-form-definitions/kimi-sdk/option-sources/model?schemaVersion=${KIMI_SDK_FORM_DEFINITION_REF.schemaVersion}`, { headers })).json() as Source;
-    assert.equal("status" in v1Kimi, false);
-    kimiOutcome = { kind: "no_models" };
-    const v1Failed = await fetch(`${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-form-definitions/kimi-sdk/option-sources/model?schemaVersion=${KIMI_SDK_FORM_DEFINITION_REF.schemaVersion}`, { headers });
-    assert.equal(v1Failed.status, 409);
-    await v1Failed.text();
-    builtinMode = "timeout";
-    const v1Builtin = await fetch(`${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-form-definitions/builtin/option-sources/model?schemaVersion=builtin-pi.create.v3`, { headers });
-    assert.equal(v1Builtin.status, 409);
-    assert.equal((await v1Builtin.json() as { code: string }).code, "builtin_catalog_unavailable");
 });
 
-test("a runtime with only a v2 form is served on v2 and stays invisible to v1 clients", async ({ app }) => {
+test("a runtime with only a v2 form is served on v2 and carries no v1 ref", async ({ app }) => {
     const { owner, server } = await seedRoleFixture("v2-only-runtime-form");
     const [machine] = await getDb().insert(machines).values({
       serverId: server.id,
@@ -4784,16 +4924,8 @@ test("a runtime with only a v2 form is served on v2 and stays invisible to v1 cl
     assert.equal(sourceRes.status, 200);
     assert.equal((await sourceRes.json() as { defaultValue: string }).defaultValue, "configured");
 
-    // v1 clients: no ref on the row, and both v1 routes answer as for any runtime without a form.
+    // No v1 ref on the row.
     assert.equal(row && "formDefinitionRef" in row, false);
-    for (const url of [
-      `${base}/runtime-form-definitions/pi?schemaVersion=pi.create.v1`,
-      `${base}/runtime-form-definitions/pi/option-sources/provider?schemaVersion=pi.create.v1`,
-    ]) {
-      const res = await fetch(url, { headers });
-      assert.equal(res.status, 404, url);
-      assert.deepEqual((await res.json() as { issues: unknown }).issues, [{ code: "unknown_form_runtime", pointer: "/runtimeId" }]);
-    }
 
     // Without a registry entry (every catalog runtime has one now, so the test
     // takes Pi's out): no marker, and the v2 route 404s as mobile's fallback expects.
@@ -4811,7 +4943,7 @@ test("a runtime with only a v2 form is served on v2 and stays invisible to v1 cl
     assert.deepEqual((await piRow())?.runtimeFormV2, { protocolVersion: 2 });
 });
 
-test("batch 2 v2 forms: OpenCode option source is the live probe or the static fallback (200), Gemini is static, v1 routes stay 404", async ({ app }) => {
+test("batch 2 v2 forms: OpenCode option source is the live probe or the static fallback (200), Gemini is static", async ({ app }) => {
     const { owner, server } = await seedRoleFixture("v2-batch2-runtime-forms");
     const [machine] = await getDb().insert(machines).values({
       serverId: server.id,
@@ -4838,14 +4970,15 @@ test("batch 2 v2 forms: OpenCode option source is the live probe or the static f
     const base = `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}`;
     const fixture = (name: string) => JSON.parse(readFileSync(new URL(`../../../runtime-form/fixtures/${name}`, import.meta.url), "utf8")) as unknown;
 
-    // The OpenCode row carries the v2 marker and no v1 ref; the deprecated runtimes are not offered for new agents.
+    // The OpenCode row carries the v2 marker and no v1 ref; the deprecated runtimes are not offered for new agents, Antigravity is.
     const rowsRes = await fetch(`${base}/runtime-options`, { headers: { ...headers, "X-Raft-Runtime-Form-V2": "1" } });
     assert.equal(rowsRes.status, 200);
     const rows = (await rowsRes.json() as { options: Array<Record<string, unknown> & { runtimeId: string }> }).options;
     const opencodeRow = rows.find((row) => row.runtimeId === "opencode");
     assert.deepEqual(opencodeRow?.runtimeFormV2, { protocolVersion: 2 });
     assert.equal(opencodeRow && "formDefinitionRef" in opencodeRow, false);
-    assert.deepEqual(rows.filter((row) => ["kimi", "gemini", "antigravity"].includes(row.runtimeId)), []);
+    assert.deepEqual(rows.filter((row) => ["kimi", "gemini"].includes(row.runtimeId)), []);
+    assert.deepEqual(rows.find((row) => row.runtimeId === "antigravity")?.runtimeFormV2, { protocolVersion: 2 });
 
     const formRes = await fetch(`${base}/runtime-forms/v2/opencode`, { headers });
     assert.equal(formRes.status, 200);
@@ -4898,25 +5031,16 @@ test("batch 2 v2 forms: OpenCode option source is the live probe or the static f
     assert.equal(geminiRes.status, 200);
     assert.deepEqual(await geminiRes.json(), fixture("gemini.option-source.json"));
     assert.deepEqual(probed, []);
-    // Antigravity: the Computer's agy list; not live here, so agy's configured default alone.
+    // Antigravity: the Computer's agy list; not live here, so no list (a typed model id is still allowed).
     const antigravityRes = await fetch(`${base}/runtime-forms/v2/antigravity/option-sources/model`, { headers });
     assert.equal(antigravityRes.status, 200);
-    const antigravity = await antigravityRes.json() as { options: unknown; defaultValue: unknown; status: unknown };
-    assert.deepEqual(antigravity.options, [{ value: "default", label: "AGY configured default", supportedReasoningEfforts: [] }]);
-    assert.equal(antigravity.defaultValue, "default");
+    const antigravity = await antigravityRes.json() as { options: unknown; defaultValue: unknown; status: unknown; customValueAllowed: unknown };
+    assert.deepEqual(antigravity.options, []);
+    assert.equal(antigravity.defaultValue, "");
+    // A fallback, not unavailable: a required field with an unavailable source blocks even a typed value.
     assert.equal(antigravity.status, "fallback");
+    assert.equal(antigravity.customValueAllowed, true);
 
-    // v1 clients never see these forms.
-    for (const runtimeId of ["opencode", "kimi", "gemini", "antigravity"]) {
-      for (const url of [
-        `${base}/runtime-form-definitions/${runtimeId}?schemaVersion=${runtimeId}.create.v1`,
-        `${base}/runtime-form-definitions/${runtimeId}/option-sources/model?schemaVersion=${runtimeId}.create.v1`,
-      ]) {
-        const res = await fetch(url, { headers });
-        assert.equal(res.status, 404, url);
-        assert.deepEqual((await res.json() as { issues: unknown }).issues, [{ code: "unknown_form_runtime", pointer: "/runtimeId" }]);
-      }
-    }
 });
 test("runtime_form.v3 over HTTP: the advertised capability gets the v3 form and effort source, a stale revision is a 409, others keep v2 byte for byte", async ({ app }) => {
     const { owner, server } = await seedRoleFixture("v3-runtime-forms");
@@ -4927,33 +5051,69 @@ test("runtime_form.v3 over HTTP: the advertised capability gets the v3 form and 
       apiKeyHash: "unused-v3-machine-hash",
       runtimes: ["codex"],
     }).returning();
+    const [tieredMachine] = await getDb().insert(machines).values({
+      serverId: server.id,
+      userId: owner.id,
+      name: "v3-tiered-machine",
+      apiKeyHash: "unused-v3-tiered-machine-hash",
+      runtimes: ["codex"],
+    }).returning();
     const headers = { Authorization: `Bearer ${await tokenForHuman(owner.email)}`, "X-Server-Id": server.id };
     app.app.set("agentOrchestrator", {
       hasMachineLocally: () => true,
-      detectMachineRuntimeModels: async () => ({
+      detectMachineRuntimeModels: async (machineId: string) => ({
         kind: "live",
-        value: {
-          models: [
-            { id: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
-            { id: "gpt-7-preview", label: "GPT-7 Preview", supportedReasoningEfforts: ["low", "medium", "high", "max"], defaultReasoningEffort: "high" },
-          ],
-          default: "gpt-5.6-sol",
-        },
+        value: machineId === tieredMachine.id
+          ? {
+              models: [
+                { id: "gpt-6.2-sol", label: "GPT-6.2-Sol", serviceTierChoices: [{ id: "priority", name: "Fast", description: "2x speed, increased usage" }] },
+                {
+                  id: "gpt-6.2-astra",
+                  label: "GPT-6.2-Astra",
+                  serviceTierChoices: [
+                    { id: "priority", name: "Fast", description: "2x speed, increased usage" },
+                    { id: "ultrafast", name: "Ultrafast", description: "Up to 4.5x speed, uses more of your plan" },
+                  ],
+                },
+                { id: "gpt-5-mini", label: "GPT-5 Mini", serviceTierChoices: [] },
+              ],
+              default: "gpt-6.2-sol",
+            }
+          : {
+              models: [
+                { id: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
+                { id: "gpt-7-preview", label: "GPT-7 Preview", supportedReasoningEfforts: ["low", "medium", "high", "max"], defaultReasoningEffort: "high" },
+              ],
+              default: "gpt-5.6-sol",
+            },
       }),
     });
     const base = `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-forms/v2/codex`;
+    const tieredBase = `${app.baseUrl}/api/servers/${server.id}/machines/${tieredMachine.id}/runtime-forms/v2/codex`;
     const v3 = "clientCapabilities=dependent_select.custom_value_with_options,runtime_form.v3";
     const fixtureText = (name: string) => readFileSync(new URL(`../../../runtime-form/fixtures/${name}`, import.meta.url), "utf8");
     const asSent = async (res: Response) => `${JSON.stringify(await res.json(), null, 2)}\n`;
 
-    const v2Form = await fetch(base, { headers });
-    assert.equal(await asSent(v2Form), fixtureText("codex.form.json"), "no capability: today's v2 form");
-    const v3FormRes = await fetch(`${base}?${v3}`, { headers });
-    assert.equal(v3FormRes.status, 200);
-    const v3Text = await asSent(v3FormRes);
-    assert.equal(v3Text, fixtureText("codex.form.v3.json"));
-    const revision = (JSON.parse(v3Text) as { revision: string }).revision;
+    // V2 clients (no runtime_form.v3) keep codex.form.json byte-for-byte on both single-tier and tiered Computers.
+    assert.equal(await asSent(await fetch(base, { headers })), fixtureText("codex.form.json"), "no capability: v2 form");
+    assert.equal(await asSent(await fetch(tieredBase, { headers })), fixtureText("codex.form.json"), "no capability on tiered Computer: v2 form");
 
+    // V3 on a tiered Computer matches codex.form.v3.json and codex.option-source.speed.v3.json.
+    const tieredV3Res = await fetch(`${tieredBase}?${v3}`, { headers });
+    assert.equal(tieredV3Res.status, 200);
+    const tieredV3Text = await asSent(tieredV3Res);
+    assert.equal(tieredV3Text, fixtureText("codex.form.v3.json"));
+    const revision = (JSON.parse(tieredV3Text) as { revision: string }).revision;
+
+    const speed = await fetch(`${tieredBase}/option-sources/speed?formRevision=${revision}&${v3}`, { headers });
+    assert.equal(speed.status, 200);
+    assert.equal(await asSent(speed), fixtureText("codex.option-source.speed.v3.json"));
+
+    // V3 on a non-tiered Computer omits speed and serves codex.option-source.reasoning-effort.v3.json.
+    const plainV3Res = await fetch(`${base}?${v3}`, { headers });
+    assert.equal(plainV3Res.status, 200);
+    const plainV3Body = await plainV3Res.json() as { dataSchema: { properties: Record<string, unknown> } };
+    assert.equal("speed" in plainV3Body.dataSchema.properties, false);
     const effort = await fetch(`${base}/option-sources/reasoningEffort?formRevision=${revision}&${v3}`, { headers });
     assert.equal(effort.status, 200);
     assert.equal(await asSent(effort), fixtureText("codex.option-source.reasoning-effort.v3.json"));
@@ -4972,7 +5132,7 @@ test("runtime_form.v3 over HTTP: the advertised capability gets the v3 form and 
     const v2Effort = await fetch(`${base}/option-sources/reasoningEffort`, { headers });
     assert.equal(v2Effort.status, 404);
 });
-test("batch 3a v2 forms: Codex/Grok option sources carry option_source.status over HTTP, retry with refresh=1 probes again, v1 routes stay 404", async ({ app }) => {
+test("batch 3a v2 forms: Codex/Grok option sources carry option_source.status over HTTP, retry with refresh=1 probes again", async ({ app }) => {
     const { owner, server } = await seedRoleFixture("v2-batch3a-runtime-forms");
     const [machine] = await getDb().insert(machines).values({
       serverId: server.id,
@@ -5052,17 +5212,6 @@ test("batch 3a v2 forms: Codex/Grok option sources carry option_source.status ov
     assert.equal(opencode.status, 200);
     assert.equal(await asSent(opencode), fixtureText("opencode.option-source.fallback.json"));
 
-    // v1 clients never see these forms or their status.
-    for (const runtimeId of ["codex", "grok"]) {
-      for (const url of [
-        `${base}/runtime-form-definitions/${runtimeId}?schemaVersion=${runtimeId}.create.v1`,
-        `${base}/runtime-form-definitions/${runtimeId}/option-sources/model?schemaVersion=${runtimeId}.create.v1`,
-      ]) {
-        const res = await fetch(url, { headers });
-        assert.equal(res.status, 404, url);
-        assert.deepEqual((await res.json() as { issues: unknown }).issues, [{ code: "unknown_form_runtime", pointer: "/runtimeId" }]);
-      }
-    }
 });
 
 test("GET /api/servers/:id/machines projects the Computer creator profile without exposing the raw attacher field", async ({ app }) => {
@@ -5332,6 +5481,81 @@ test("runtime-account usage needs no rollout rule and remains server-admin-or-at
   } finally {
     __clearRuntimeAccountUsageLocalCacheForTests();
     await app.close();
+  }
+});
+
+// A personal assistant is found only by its owner (agentFindableBy): an
+// account read from its own account folder (`agentIds`) reaches nobody else,
+// not even the Computer's attaching human or a server admin.
+test("runtime-account usage never shows another person's personal assistant or its own folder's account", async ({ app }) => {
+  __clearRuntimeAccountUsageLocalCacheForTests();
+  try {
+    const { owner, admin, member, server } = await seedRoleFixture("runtime-usage-assistant-folder");
+    const db = getDb();
+    const [machine] = await db.insert(machines).values({
+      serverId: server.id,
+      userId: member.id,
+      name: "runtime-usage-folder-computer",
+      apiKeyHash: "unused-runtime-usage-folder-machine-hash",
+      runtimes: ["codex"],
+    }).returning();
+    await db.insert(computers).values({
+      serverId: server.id,
+      machineId: machine.id,
+      name: "runtime-usage-folder-computer",
+      apiKeyHash: "unused-runtime-usage-folder-computer-hash",
+      apiKeyPrefix: "sk_computer_usage_folder",
+      attachedByUserId: member.id,
+    });
+    // The owner's assistant (its own CODEX_HOME) and an ordinary agent with its own folder.
+    const [assistant, ordinary] = await db.insert(agents).values([
+      { serverId: server.id, name: "owner-assistant-folder", runtime: "codex", status: "active", assistantOwnerUserId: owner.id, envVars: { CODEX_HOME: "/srv/assistant" } },
+      { serverId: server.id, name: "ordinary-folder", machineId: machine.id, runtime: "codex", status: "active", envVars: { CODEX_HOME: "/srv/ordinary" } },
+    ]).returning();
+    const window = { id: "primary", label: "5 hours", status: "ok" as const, usedRatio: 0.2 };
+    await runtimeAccountUsageCacheService.write(machine.id, {
+      protocolVersion: 2,
+      provider: "codex",
+      collectedAt: new Date(Date.now() - 60_000).toISOString(),
+      staleAfter: new Date(Date.now() + 29 * 60_000).toISOString(),
+      collectorVersion: "test",
+      accounts: [
+        { accountKey: "a".repeat(64), maskedLabel: "def****ault@company.com", health: "ok", windows: [window] },
+        { accountKey: "b".repeat(64), maskedLabel: "ass****tant@company.com", health: "ok", windows: [window], agentIds: [assistant!.id] },
+        { accountKey: "c".repeat(64), maskedLabel: "shar****ed@company.com", health: "ok", windows: [window], agentIds: [assistant!.id, ordinary!.id] },
+      ],
+    });
+    const url = `${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-account-usage/codex`;
+    const read = async (email: string, capabilities?: string) => {
+      const response = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${await tokenForHuman(email)}`,
+          "X-Server-Id": server.id,
+          ...(capabilities ? { [RAFT_CLIENT_CAPABILITIES_HEADER]: capabilities } : {}),
+        },
+      });
+      assert.equal(response.status, 200, email);
+      return ((await response.json()) as { snapshot: { accounts: Array<{ maskedLabel?: string; agentIds?: string[] }> } }).snapshot.accounts
+        .map((account) => [account.maskedLabel, account.agentIds ?? null]);
+    };
+    const folders = `${RUNTIME_USAGE_WINDOW_SCOPE_CLIENT_CAPABILITY},${RUNTIME_USAGE_ACCOUNT_FOLDERS_CLIENT_CAPABILITY}`;
+    for (const viewer of [member, admin]) {
+      assert.deepEqual(await read(viewer.email, folders), [
+        ["def****ault@company.com", null],
+        ["shar****ed@company.com", [ordinary!.id]],
+      ], `${viewer.email}: no assistant id, and no account only the assistant reads`);
+      assert.deepEqual(await read(viewer.email), [
+        ["def****ault@company.com", null],
+        ["shar****ed@company.com", null],
+      ], `${viewer.email}: an older bundle gets no agentIds and still not the assistant's account`);
+    }
+    assert.deepEqual(await read(owner.email, folders), [
+      ["def****ault@company.com", null],
+      ["ass****tant@company.com", [assistant!.id]],
+      ["shar****ed@company.com", [assistant!.id, ordinary!.id]],
+    ], "the assistant's owner sees it");
+  } finally {
+    __clearRuntimeAccountUsageLocalCacheForTests();
   }
 });
 
@@ -5732,7 +5956,7 @@ test("GET /api/servers/:id/machines projects one source-aware policy decision pe
       },
     );
     assert.equal(legacyDispatch.status, 409);
-    assert.equal(((await legacyDispatch.json()) as { code: string }).code, "computer_remote_upgrade_unsupported");
+    assert.deepEqual(await legacyDispatch.json(), { error: "This Computer version cannot be upgraded from the web. Upgrade it once on the machine itself.", code: "computer_remote_upgrade_unsupported", errorCode: "computer_remote_upgrade_unsupported" });
     assert.equal(sent.length, 1, "no command for an unsupported Computer");
     const listedAfter = await fetch(`${app.baseUrl}/api/servers/${server.id}/machines`, {
       headers: { Authorization: `Bearer ${ownerToken}`, "X-Server-Id": server.id },
@@ -6335,16 +6559,20 @@ test("POST /computer/:action — after an adoption the adopter controls the Comp
   assert.equal(asPreviousOwner.status, 403, "the previous machine-row owner keeps no control without controlComputers");
 });
 
-test("POST /computer/:action — with no attacher on record the machine-row owner still controls it", async ({ app }) => {
-  const { member, previousOwner, server, machine } = await seedAdoptedComputer("computer-control-no-attacher", "none");
+test("POST /computer/:action — a live attach record naming no one has no personal controller: only owner/admin", async ({ app }) => {
+  const { owner, admin, member, previousOwner, server, machine } = await seedAdoptedComputer("computer-control-no-attacher", "none");
   app.app.set("agentOrchestrator", offlineOrchestrator());
 
   const asRowOwner = await restartAs(app, server.id, machine.id, previousOwner.email);
-  assert.equal(asRowOwner.status, 409, await asRowOwner.clone().text());
-  assert.equal((await asRowOwner.json()).code, "computer_offline");
-
+  assert.equal(asRowOwner.status, 403, "the machine row's registrant is no fallback controller");
   const asOtherMember = await restartAs(app, server.id, machine.id, member.email);
   assert.equal(asOtherMember.status, 403);
+
+  for (const manager of [owner, admin]) {
+    const res = await restartAs(app, server.id, machine.id, manager.email);
+    assert.equal(res.status, 409, await res.clone().text());
+    assert.equal((await res.json()).code, "computer_offline", "owner/admin pass the authority check");
+  }
 });
 
 async function machineRequestAs(
@@ -6411,9 +6639,7 @@ test("machine edit and runtime routes — after an adoption the adopter passes t
   const routes: Array<[string, { method?: string; body?: unknown }, number]> = [
     ["", { method: "PATCH", body: { description: "adopted" } }, 200],
     ["/runtime-options", {}, 200],
-    [`/runtime-form-definitions/${unknownRuntime}`, {}, 404],
     [`/runtime-forms/v2/${unknownRuntime}`, {}, 404],
-    [`/runtime-form-definitions/${unknownRuntime}/option-sources/model`, {}, 404],
     [`/runtime-forms/v2/${unknownRuntime}/option-sources/model`, {}, 404],
     ["/runtime-models/codex", {}, 200],
     ["/runtimes/rescan", { method: "POST" }, 200],
@@ -6430,7 +6656,7 @@ test("machine edit and runtime routes — after an adoption the adopter passes t
 });
 
 test("revoke-computer-key, notify-agent-owners and DELETE machine — after an adoption the adopter may and the previous machine-row owner may not", async ({ app }) => {
-  const { member: adopter, previousOwner, server, machine } = await seedAdoptedComputer("machine-remove-adopted", "adopter");
+  const { owner, member: adopter, previousOwner, server, machine } = await seedAdoptedComputer("machine-remove-adopted", "adopter");
   app.app.set("agentOrchestrator", { hasMachineLocally: () => true, evictCache: () => {}, deliverMessagesOnChannel: async () => {} });
   const [previousOwnersAgent] = await getDb().insert(agents).values({
     serverId: server.id, name: "previous-owners-agent", runtime: "codex", machineId: machine.id, status: "active",
@@ -6458,8 +6684,8 @@ test("revoke-computer-key, notify-agent-owners and DELETE machine — after an a
   assert.equal(forcedAsAdopter.status, 200, await forcedAsAdopter.clone().text());
   assert.deepEqual((await forcedAsAdopter.json()).unboundAgentIds, [previousOwnersAgent.id]);
 
-  // The dialog's path (DeleteComputerDialog): revoke, then DELETE. The revoked attach record still names the adopter,
-  // so the previous machine-row owner gets nothing back and the adopter finishes the removal.
+  // After the revoke there is no live attach record, so no personal controller: neither the previous machine-row
+  // owner nor the adopter whose record was revoked may act on it; only an owner or admin removes it.
   app.app.set("agentOrchestrator", { hasMachineLocally: () => true, scanMachineWorkspaces: async () => [], disconnectMachineForUnlink: async () => {} });
   const afterRevoke: Array<[string, { method?: string; body?: unknown }]> = [
     ["", { method: "PATCH", body: { description: "previous owner" } }],
@@ -6472,24 +6698,29 @@ test("revoke-computer-key, notify-agent-owners and DELETE machine — after an a
     assert.equal(res.status, 403, `${init.method ?? "GET"} ${path || "/"} after the revoke: the previous machine-row owner is refused`);
   }
   const deleteAsAdopterAfterRevoke = await machineRequestAs(app, server.id, machine.id, adopter.email, "", { method: "DELETE" });
-  assert.equal(deleteAsAdopterAfterRevoke.status, 200, await deleteAsAdopterAfterRevoke.clone().text());
+  assert.equal(deleteAsAdopterAfterRevoke.status, 403, "the revoked record's attacher is no fallback controller");
+  const deleteAsOwnerAfterRevoke = await machineRequestAs(app, server.id, machine.id, owner.email, "", { method: "DELETE" });
+  assert.equal(deleteAsOwnerAfterRevoke.status, 200, await deleteAsOwnerAfterRevoke.clone().text());
   assert.equal((await getDb().select({ id: machines.id }).from(machines).where(eq(machines.id, machine.id))).length, 0);
 });
 
-test("DeleteComputerDialog path — a member who adopted revokes, then deletes the Computer", async ({ app }) => {
-  const { member: adopter, previousOwner, server, machine } = await seedAdoptedComputer("machine-dialog-adopted", "adopter");
+test("DeleteComputerDialog path — a member who adopted revokes; once revoked only an owner or admin deletes it", async ({ app }) => {
+  const { admin, member: adopter, previousOwner, server, machine } = await seedAdoptedComputer("machine-dialog-adopted", "adopter");
   app.app.set("agentOrchestrator", { hasMachineLocally: () => true, evictCache: () => {}, disconnectMachineForUnlink: async () => {} });
   const revoke = await machineRequestAs(app, server.id, machine.id, adopter.email, "/revoke-computer-key", { method: "POST", body: {} });
   assert.equal(revoke.status, 200, await revoke.clone().text());
   const asPreviousOwner = await machineRequestAs(app, server.id, machine.id, previousOwner.email, "", { method: "DELETE" });
   assert.equal(asPreviousOwner.status, 403, "the previous machine-row owner regains nothing once the key is revoked");
   const asAdopter = await machineRequestAs(app, server.id, machine.id, adopter.email, "", { method: "DELETE" });
-  assert.equal(asAdopter.status, 200, await asAdopter.clone().text());
+  assert.equal(asAdopter.status, 403, "nor does the adopter: a revoked attach record names no controller");
+  assert.equal((await asAdopter.json()).error, "The `removeMachines` capability or machine creator authority is required to remove machines");
+  const asAdmin = await machineRequestAs(app, server.id, machine.id, admin.email, "", { method: "DELETE" });
+  assert.equal(asAdmin.status, 200, await asAdmin.clone().text());
   assert.equal((await getDb().select({ id: machines.id }).from(machines).where(eq(machines.id, machine.id))).length, 0);
 });
 
-test("feedback transcript includeMachineLogTail — after an adoption only the adopter may attach the machine's log tail", async ({ app }) => {
-  const { member: adopter, previousOwner, server, machine } = await seedAdoptedComputer("log-tail-adopted", "adopter");
+test("feedback transcript includeMachineLogTail — the live attacher or an owner/admin may attach the machine's log tail; the previous machine-row owner may not", async ({ app }) => {
+  const { owner, admin, member: adopter, previousOwner, server, machine } = await seedAdoptedComputer("log-tail-adopted", "adopter");
   const collected: Array<{ agentId: string; includeMachineLogTail: boolean }> = [];
   app.app.set("agentOrchestrator", {
     hasMachineLocally: () => true,
@@ -6514,10 +6745,47 @@ test("feedback transcript includeMachineLogTail — after an adoption only the a
 
   const asPreviousOwner = await feedback(previousOwner.email, previousOwnersAgent.id);
   assert.equal(asPreviousOwner.status, 403, await asPreviousOwner.clone().text());
-  assert.equal((await asPreviousOwner.json()).code, "machine_log_tail_owner_required");
+  assert.deepEqual(await asPreviousOwner.json(), {
+    error: "Only the person this machine's Computer is attached by, or a server owner or admin, may include its runner log tail in a report",
+    code: "machine_log_tail_owner_required",
+    errorCode: "machine_log_tail_owner_required",
+  });
   const asAdopter = await feedback(adopter.email, adoptersAgent.id);
   assert.equal(asAdopter.status, 202, await asAdopter.clone().text());
-  assert.deepEqual(collected, [{ agentId: adoptersAgent.id, includeMachineLogTail: true }]);
+  // canManageComputer `edit`: owners and admins may attach it too (it was the attacher only before).
+  for (const manager of [owner, admin]) {
+    const asManager = await feedback(manager.email, adoptersAgent.id);
+    assert.equal(asManager.status, 202, await asManager.clone().text());
+  }
+  assert.deepEqual(collected, [adoptersAgent.id, adoptersAgent.id, adoptersAgent.id].map((agentId) => ({ agentId, includeMachineLogTail: true })));
+
+  // Once its key is revoked the former attacher has no controller authority left; an admin still may.
+  await getDb().update(computers).set({ revokedAt: new Date() }).where(eq(computers.machineId, machine.id));
+  const asFormerAttacher = await feedback(adopter.email, adoptersAgent.id);
+  assert.equal(asFormerAttacher.status, 403);
+  assert.equal((await asFormerAttacher.json()).code, "machine_log_tail_owner_required");
+  const asAdminAfterRevoke = await feedback(admin.email, adoptersAgent.id);
+  assert.equal(asAdminAfterRevoke.status, 202, await asAdminAfterRevoke.clone().text());
+});
+
+test("canManageComputer — each action maps to its own capability; the live attacher passes every action, nobody else without the role", async ({ db: _db }) => {
+  const { owner, admin, member: attacher, previousOwner, server, machine } = await seedAdoptedComputer("can-manage-computer", "adopter");
+  const actions = [["edit", "editMachines"], ["control", "controlComputers"], ["remove", "removeMachines"], ["rotateKey", "rotateMachineKeys"]] as const;
+  for (const [action, capability] of actions) {
+    for (const role of ["owner", "admin", "member", "guest", null] as const) {
+      assert.equal(computerRoleAllows(role, action), actorRoleHasServerCapability(role, capability), `${role} ${action}`);
+    }
+    assert.equal(await canManageComputer(getDb(), { userId: owner.id, role: "owner" }, server.id, machine, action), true, `owner ${action}`);
+    assert.equal(await canManageComputer(getDb(), { userId: admin.id, role: "admin" }, server.id, machine, action), true, `admin ${action}`);
+    assert.equal(await canManageComputer(getDb(), { userId: attacher.id, role: "member" }, server.id, machine, action), true, `live attacher ${action}`);
+    assert.equal(await canManageComputer(getDb(), { userId: previousOwner.id, role: "member" }, server.id, machine, action), false, `registrant ${action}`);
+    assert.equal(computerActorAllowed({ userId: attacher.id, role: "member" }, null, action), false, `no controller ${action}`);
+  }
+  await getDb().update(computers).set({ revokedAt: new Date() }).where(eq(computers.machineId, machine.id));
+  for (const [action] of actions) {
+    assert.equal(await canManageComputer(getDb(), { userId: attacher.id, role: "member" }, server.id, machine, action), false, `revoked attacher ${action}`);
+    assert.equal(await canManageComputer(getDb(), { userId: admin.id, role: "admin" }, server.id, machine, action), true, `admin after revoke ${action}`);
+  }
 });
 
 async function controlledByCurrentUserAs(app: { baseUrl: string }, serverId: string, email: string) {
@@ -6529,26 +6797,38 @@ async function controlledByCurrentUserAs(app: { baseUrl: string }, serverId: str
   return new Map(body.machines.map((machine) => [machine.id, machine.controlledByCurrentUser]));
 }
 
-test("GET /machines controlledByCurrentUser — follows the controller the routes use, through an adoption and a revoke", async ({ app }) => {
+test("GET /machines controlledByCurrentUser — the live attacher only, through an adoption and a revoke", async ({ app }) => {
   const { member: adopter, previousOwner, server, machine } = await seedAdoptedComputer("machine-list-controller", "adopter");
   const [rawDaemon] = await getDb().insert(machines).values({
     serverId: server.id, userId: previousOwner.id, name: "raw-daemon", apiKeyHash: "unused-machine-list-controller-raw",
   }).returning();
+  const [unattributed] = await getDb().insert(machines).values({
+    serverId: server.id, userId: previousOwner.id, name: "unattributed", apiKeyHash: "unused-machine-list-controller-unattributed",
+  }).returning();
+  await getDb().insert(computers).values({
+    serverId: server.id, machineId: unattributed.id, name: "unattributed", apiKeyHash: "unused-machine-list-controller-unattributed-computer",
+    apiKeyPrefix: "sk_computer_test", attachedByUserId: null,
+  });
 
-  const expectFlags = async (when: string) => {
-    const asAdopter = await controlledByCurrentUserAs(app, server.id, adopter.email);
-    const asPreviousOwner = await controlledByCurrentUserAs(app, server.id, previousOwner.email);
-    assert.equal(asAdopter.get(machine.id), true, `${when}: the adopter controls the adopted machine`);
-    assert.equal(asPreviousOwner.get(machine.id), false, `${when}: the previous machine-row owner does not`);
-    assert.equal(asPreviousOwner.get(rawDaemon.id), true, `${when}: a never-attached machine follows machines.userId`);
-    assert.equal(asAdopter.get(rawDaemon.id), false, `${when}: nobody else controls the never-attached machine`);
-  };
-  await expectFlags("attached");
+  const flags = async () => ({
+    asAdopter: await controlledByCurrentUserAs(app, server.id, adopter.email),
+    asPreviousOwner: await controlledByCurrentUserAs(app, server.id, previousOwner.email),
+  });
+  const attached = await flags();
+  assert.equal(attached.asAdopter.get(machine.id), true, "the live attacher controls the adopted machine");
+  assert.equal(attached.asPreviousOwner.get(machine.id), false, "the previous machine-row owner does not");
+  for (const viewer of [attached.asAdopter, attached.asPreviousOwner]) {
+    assert.equal(viewer.get(rawDaemon.id), false, "a never-attached raw daemon has no controller, not even its registrant");
+    assert.equal(viewer.get(unattributed.id), false, "a live record naming no one has no controller");
+  }
+
   await getDb().update(computers).set({ revokedAt: new Date() }).where(eq(computers.machineId, machine.id));
-  await expectFlags("after the revoke");
+  const revoked = await flags();
+  assert.equal(revoked.asAdopter.get(machine.id), false, "after the revoke the former attacher no longer controls it");
+  assert.equal(revoked.asPreviousOwner.get(machine.id), false, "nor does the machine row's owner");
 });
 
-test("computerControllerAttachers — one query for the whole server, the same controller computerControllerUserId names", async ({ db: _db }) => {
+test("computerControllerUserId — the live attach record's attacher only, and the list map names the same", async ({ db: _db }) => {
   const { member: adopter, previousOwner, server, machine: adopted } = await seedAdoptedComputer("controller-attachers", "adopter");
   const insertMachine = async (name: string) => (await getDb().insert(machines).values({
     serverId: server.id, userId: previousOwner.id, name, apiKeyHash: `unused-controller-attachers-${name}`,
@@ -6557,10 +6837,11 @@ test("computerControllerAttachers — one query for the whole server, the same c
     serverId: server.id, machineId, name, apiKeyHash: `unused-controller-attachers-${name}`, apiKeyPrefix: "sk_computer_test",
     attachedByUserId, revokedAt, createdAt,
   });
-  // Revoked by the adopter, then reattached live by no one: the live record wins, and naming no one falls back to the row owner.
+  // Revoked by the adopter, then reattached live by no one: no controller (no fallback to the revoked one or the row owner).
   const liveUnattributed = await insertMachine("live-unattributed");
-  // Two revoked records: the most recent one wins.
+  // Only revoked records: no controller (no fallback to the most recent revoked one).
   const revokedTwice = await insertMachine("revoked-twice");
+  // A raw daemon: no controller (no fallback to machines.userId).
   const rawDaemon = await insertMachine("raw-daemon");
   await getDb().insert(computers).values([
     computerRow(liveUnattributed.id, "live-unattributed-old", adopter.id, new Date(2_000), new Date(1_000)),
@@ -6569,29 +6850,95 @@ test("computerControllerAttachers — one query for the whole server, the same c
     computerRow(revokedTwice.id, "revoked-twice-new", adopter.id, new Date(4_000), new Date(3_000)),
   ]);
 
-  const pg = (getDb() as unknown as { $client: { query: (...args: unknown[]) => Promise<unknown> } }).$client;
-  const originalQuery = pg.query.bind(pg);
-  let queries = 0;
-  pg.query = (...args: unknown[]) => {
-    queries += 1;
-    return originalQuery(...args);
-  };
-  let attachers: Map<string, string | null>;
-  try {
-    attachers = await computerControllerAttachers(getDb(), server.id);
-  } finally {
-    pg.query = originalQuery;
-  }
-  assert.equal(queries, 1);
-
+  const attachers = await getComputerLinkedMachineAttachers(server.id);
+  const expected = new Map<string, string | null>([
+    [adopted.id, adopter.id],
+    [liveUnattributed.id, null],
+    [revokedTwice.id, null],
+    [rawDaemon.id, null],
+  ]);
   for (const machine of [adopted, liveUnattributed, revokedTwice, rawDaemon]) {
-    const expected = await computerControllerUserId(getDb(), server.id, machine);
-    assert.equal(attachers.get(machine.id) ?? machine.userId, expected, machine.name);
+    assert.equal(await computerControllerUserId(getDb(), server.id, machine), expected.get(machine.id), machine.name);
+    assert.equal(controllerUserIdFromAttachers(attachers, machine), expected.get(machine.id), `${machine.name} (list map)`);
   }
-  assert.equal(attachers.get(adopted.id), adopter.id);
-  assert.equal(attachers.get(liveUnattributed.id), null);
-  assert.equal(attachers.get(revokedTwice.id), adopter.id);
-  assert.equal(attachers.has(rawDaemon.id), false);
+});
+
+// Controller = the live attach record's attacher only (no fallback to a revoked record or machines.userId);
+// otherwise only a role holding the route's capability (owner/admin) acts. Refusals keep the routes' existing bodies.
+test("controller rule — a revoked attach record leaves its former attacher no restart, rename or delete; owner/admin keep them", async ({ app }) => {
+  const { owner, admin, member: formerAttacher, server, machine } = await seedAdoptedComputer("controller-rule-revoked", "adopter");
+  await getDb().update(computers).set({ revokedAt: new Date() }).where(eq(computers.machineId, machine.id));
+  assert.equal((await controlledByCurrentUserAs(app, server.id, formerAttacher.email)).get(machine.id), false);
+  app.app.set("agentOrchestrator", { ...offlineOrchestrator(), disconnectMachineForUnlink: async () => {} });
+
+  const restart = await restartAs(app, server.id, machine.id, formerAttacher.email);
+  assert.equal(restart.status, 403, "restart refused before the not_a_computer check");
+  assert.equal((await restart.json()).error, "The `controlComputers` capability, or being the person this Computer is attached by, is required to control Computers");
+  const rename = await machineRequestAs(app, server.id, machine.id, formerAttacher.email, "", { method: "PATCH", body: { name: "taken-back" } });
+  assert.equal(rename.status, 403);
+  const remove = await machineRequestAs(app, server.id, machine.id, formerAttacher.email, "", { method: "DELETE" });
+  assert.equal(remove.status, 403);
+  assert.equal((await remove.json()).error, "The `removeMachines` capability or machine creator authority is required to remove machines");
+
+  // Owner/admin pass the authority check (the restart then answers that it is no longer a Computer).
+  const restartAsOwner = await restartAs(app, server.id, machine.id, owner.email);
+  assert.equal(restartAsOwner.status, 409);
+  assert.equal((await restartAsOwner.json()).code, "not_a_computer");
+  const renameAsAdmin = await machineRequestAs(app, server.id, machine.id, admin.email, "", { method: "PATCH", body: { name: "renamed-by-admin" } });
+  assert.equal(renameAsAdmin.status, 200, await renameAsAdmin.clone().text());
+  const removeAsOwner = await machineRequestAs(app, server.id, machine.id, owner.email, "", { method: "DELETE" });
+  assert.equal(removeAsOwner.status, 200, await removeAsOwner.clone().text());
+});
+
+test("controller rule — a never-attached raw daemon gives its registrant (a member) no rename, delete, restart or key rotation; owner/admin keep them", async ({ app }) => {
+  const { owner, admin, member: registrant, server } = await seedRoleFixture("controller-rule-raw-daemon");
+  const { machine } = await registerMachine(server.id, registrant.id, "members-raw-daemon");
+  assert.equal((await controlledByCurrentUserAs(app, server.id, registrant.email)).get(machine.id), false);
+  app.app.set("agentOrchestrator", { ...offlineOrchestrator(), disconnectMachineForUnlink: async () => {} });
+
+  const restart = await restartAs(app, server.id, machine.id, registrant.email);
+  assert.equal(restart.status, 403);
+  const rename = await machineRequestAs(app, server.id, machine.id, registrant.email, "", { method: "PATCH", body: { name: "mine" } });
+  assert.equal(rename.status, 403);
+  const rotate = await machineRequestAs(app, server.id, machine.id, registrant.email, "/rotate-key", { method: "POST", body: {} });
+  assert.equal(rotate.status, 403);
+  const remove = await machineRequestAs(app, server.id, machine.id, registrant.email, "", { method: "DELETE" });
+  assert.equal(remove.status, 403);
+
+  const renameAsAdmin = await machineRequestAs(app, server.id, machine.id, admin.email, "", { method: "PATCH", body: { name: "renamed-by-admin" } });
+  assert.equal(renameAsAdmin.status, 200, await renameAsAdmin.clone().text());
+  const restartAsAdmin = await restartAs(app, server.id, machine.id, admin.email);
+  assert.equal((await restartAsAdmin.json()).code, "not_a_computer", "admin passes the authority check");
+  const removeAsOwner = await machineRequestAs(app, server.id, machine.id, owner.email, "", { method: "DELETE" });
+  assert.equal(removeAsOwner.status, 200, await removeAsOwner.clone().text());
+});
+
+test("controller rule — a live attach record naming no one: no rename or delete for the registrant or any member; owner/admin keep them", async ({ app }) => {
+  const { owner, admin, member, previousOwner: registrant, server, machine } = await seedAdoptedComputer("controller-rule-unattributed", "none");
+  for (const person of [registrant, member]) {
+    assert.equal((await controlledByCurrentUserAs(app, server.id, person.email)).get(machine.id), false);
+  }
+  app.app.set("agentOrchestrator", { hasMachineLocally: () => false, disconnectMachineForUnlink: async () => {} });
+  for (const person of [registrant, member]) {
+    const rename = await machineRequestAs(app, server.id, machine.id, person.email, "", { method: "PATCH", body: { name: "mine" } });
+    assert.equal(rename.status, 403);
+    const remove = await machineRequestAs(app, server.id, machine.id, person.email, "", { method: "DELETE" });
+    assert.equal(remove.status, 403);
+  }
+  const renameAsAdmin = await machineRequestAs(app, server.id, machine.id, admin.email, "", { method: "PATCH", body: { name: "renamed-by-admin" } });
+  assert.equal(renameAsAdmin.status, 200, await renameAsAdmin.clone().text());
+  const removeAsOwner = await machineRequestAs(app, server.id, machine.id, owner.email, "", { method: "DELETE" });
+  assert.equal(removeAsOwner.status, 200, await removeAsOwner.clone().text());
+});
+
+test("controller rule — the live attacher, a plain member, renames and restarts it and the list says so", async ({ app }) => {
+  const { member: attacher, server, machine } = await seedAdoptedComputer("controller-rule-live", "adopter");
+  assert.equal((await controlledByCurrentUserAs(app, server.id, attacher.email)).get(machine.id), true);
+  app.app.set("agentOrchestrator", offlineOrchestrator());
+  const restart = await restartAs(app, server.id, machine.id, attacher.email);
+  assert.equal((await restart.json()).code, "computer_offline", "past the authority check");
+  const rename = await machineRequestAs(app, server.id, machine.id, attacher.email, "", { method: "PATCH", body: { name: "attachers" } });
+  assert.equal(rename.status, 200, await rename.clone().text());
 });
 
 test("DELETE machine — after an adoption the adopter removes the Computer", async ({ app }) => {
@@ -6611,8 +6958,8 @@ async function machineAuditEvents(serverId: string, eventType: string) {
     .where(and(eq(integrationAuditEvents.serverId, serverId), eq(integrationAuditEvents.eventType, eventType)));
 }
 
-test("machine removal audit — after an adoption the adopter revokes and deletes: both events name the adopter, not the previous machine-row owner", async ({ app }) => {
-  const { member: adopter, server, machine } = await seedAdoptedComputer("machine-audit-adopted", "adopter");
+test("machine removal audit — after an adoption the adopter revokes, an admin then deletes: the revoke names the adopter, the removal no requester", async ({ app }) => {
+  const { admin, member: adopter, server, machine } = await seedAdoptedComputer("machine-audit-adopted", "adopter");
   app.app.set("agentOrchestrator", { hasMachineLocally: () => true, evictCache: () => {}, disconnectMachineForUnlink: async () => {} });
   // A Computer's machine key is never rotated (409, nothing audited): the adopter's only key action is the revoke.
   const rotate = await machineRequestAs(app, server.id, machine.id, adopter.email, "/rotate-key", { method: "POST" });
@@ -6622,11 +6969,14 @@ test("machine removal audit — after an adoption the adopter revokes and delete
 
   const revoke = await machineRequestAs(app, server.id, machine.id, adopter.email, "/revoke-computer-key", { method: "POST", body: {} });
   assert.equal(revoke.status, 200, await revoke.clone().text());
-  const remove = await machineRequestAs(app, server.id, machine.id, adopter.email, "", { method: "DELETE" });
+  // Revoked: no controller any more, so the adopter's DELETE is refused and an admin's goes through.
+  const refused = await machineRequestAs(app, server.id, machine.id, adopter.email, "", { method: "DELETE" });
+  assert.equal(refused.status, 403);
+  const remove = await machineRequestAs(app, server.id, machine.id, admin.email, "", { method: "DELETE" });
   assert.equal(remove.status, 200, await remove.clone().text());
 
   assert.deepEqual(await machineAuditEvents(server.id, "computer.key_revoked"), [{ actorId: adopter.id, requesterId: adopter.id }]);
-  assert.deepEqual(await machineAuditEvents(server.id, "computer.removed"), [{ actorId: adopter.id, requesterId: adopter.id }]);
+  assert.deepEqual(await machineAuditEvents(server.id, "computer.removed"), [{ actorId: admin.id, requesterId: null }]);
 });
 
 test("machine removal audit — an admin deletes an adopted Computer: the admin is the actor, the adopter the requester", async ({ app }) => {
@@ -6713,7 +7063,7 @@ test("POST /computer/:action — offline Computer is refused (409 computer_offli
       headers: { Authorization: `Bearer ${ownerToken}`, "X-Server-Id": server.id },
     });
     assert.equal(res.status, 409);
-    assert.equal((await res.json()).code, "computer_offline");
+    assert.deepEqual(await res.json(), { error: "Computer is not online", code: "computer_offline", errorCode: "computer_offline" });
     assert.equal(relayCalls, 0, "offline Computer must not receive a relay");
 });
 
@@ -6753,9 +7103,7 @@ test("POST /computer/:action — online Computer without a supported reported ve
       headers: { Authorization: `Bearer ${ownerToken}`, "X-Server-Id": server.id },
     });
     assert.equal(res.status, 409);
-    const body = await res.json() as { code: string; error: string };
-    assert.equal(body.code, "computer_control_unsupported");
-    assert.equal(body.error, "Raft couldn't verify the Computer version. Reconnect the Computer, then try again.");
+    assert.deepEqual(await res.json(), { error: "Raft couldn't verify the Computer version. Reconnect the Computer, then try again.", code: "computer_control_unsupported", errorCode: "computer_control_unsupported" });
     assert.equal(relayCalls, 0, "must NOT relay to a Computer that would silently ignore the command");
 });
 
@@ -6886,7 +7234,9 @@ test("legacy manual upgrade resolves Hands stable (main) without a target and re
   const changedAlphaReplay = await send(ownerToken);
   assert.equal(changedAlphaReplay.status, 201, "new alpha must not change an existing operation");
   assert.equal((await changedAlphaReplay.json() as { targetVersion: string }).targetVersion, "1.0.31");
-  assert.equal((await send(ownerToken, { parentOperationId: randomUUID() })).status, 409, "different parent is not a replay");
+  const differentParent = await send(ownerToken, { parentOperationId: randomUUID() });
+  assert.equal(differentParent.status, 409, "different parent is not a replay");
+  assert.deepEqual(await differentParent.json(), { error: "Operation identity does not match", code: "computer_lifecycle_operation_conflict", errorCode: "computer_lifecycle_operation_conflict" });
   assert.equal((await send(adminToken)).status, 409, "another authorized actor cannot adopt the operation");
   assert.equal((await send(ownerToken, { action: "restart" })).status, 409, "different action is not a replay");
   assert.equal((await send(ownerToken, { operationId: randomUUID(), targetVersion: "1.0.31" })).status, 409,
@@ -7059,6 +7409,9 @@ test("POST /computer-lifecycle-operations derives local start/stop authority fro
 
     machineLocal = true;
     epoch = "epoch-before-stop";
+    response = await send({ action: "start", operationId: randomUUID(), parentOperationId });
+    assert.equal(response.status, 409, "a connected Computer is not started again");
+    assert.deepEqual(await response.json(), { error: "Computer is already online", code: "computer_already_online", errorCode: "computer_already_online" });
     const stopOperationId = randomUUID();
     response = await send({ action: "stop", operationId: stopOperationId, parentOperationId });
     assert.equal(response.status, 201);
@@ -7100,10 +7453,7 @@ test("POST /computer-lifecycle-operations derives local start/stop authority fro
     liveSourceVisible = false;
     response = await send(completionBody);
     assert.equal(response.status, 409, "a connected socket may race ahead of its ready attestation");
-    assert.equal(
-      (await response.json() as { code?: string }).code,
-      "computer_lifecycle_completion_ready_pending",
-    );
+    assert.deepEqual(await response.json(), { error: "The live Computer ready attestation is not visible yet.", code: "computer_lifecycle_completion_ready_pending", errorCode: "computer_lifecycle_completion_ready_pending" });
     liveSourceVisible = true;
     response = await send(completionBody);
     assert.equal(response.status, 201);
@@ -7120,7 +7470,7 @@ test("POST /computer-lifecycle-operations derives local start/stop authority fro
       targetVersion: "0.72.4",
     });
     assert.equal(response.status, 409);
-    assert.equal((await response.json() as { code?: string }).code, "computer_lifecycle_completion_target_mismatch");
+    assert.deepEqual(await response.json(), { error: "The live Computer does not attest this completed target.", code: "computer_lifecycle_completion_target_mismatch", errorCode: "computer_lifecycle_completion_target_mismatch" });
     liveProvenance = "replica_meta";
     response = await send({
       ...completionBody,
@@ -7189,7 +7539,7 @@ test("an email invite carries the member role, and Guest is refused rather than 
   // A bad role is rejected outright rather than coerced.
   const bogus = await invite(`invite-bogus-${randomUUID()}@slock.test`, { role: "owner" });
   assert.equal(bogus.status, 400, "admin/owner must not be reachable by email invite");
-  assert.deepEqual(await bogus.json(), { error: "role must be one of: member, guest" });
+  assert.deepEqual(await bogus.json(), { error: "role must be one of: member, guest", code: "invite_role_invalid", errorCode: "invite_role_invalid" });
 
   // A Guest is invited to a channel, not to the server (#wg-rbac:#15). The
   // inviter must not receive a member invite after asking for a Guest one: that
@@ -7198,7 +7548,7 @@ test("an email invite carries the member role, and Guest is refused rather than 
   const guestEmail = `invite-guest-${randomUUID()}@slock.test`;
   const refused = await invite(guestEmail, { role: "guest" });
   assert.equal(refused.status, 400);
-  assert.deepEqual(await refused.json(), { error: "Guests are invited to one channel, not to the server" });
+  assert.deepEqual(await refused.json(), { error: "Guests are invited to one channel, not to the server", code: "invite_guest_channel_only", errorCode: "invite_guest_channel_only" });
   const leaked = await db.select({ id: serverInvites.id }).from(serverInvites)
     .where(eq(serverInvites.invitedEmail, guestEmail));
   assert.equal(leaked.length, 0, "a refused Guest invite must not leave an invite row behind");
@@ -7328,7 +7678,7 @@ test("with no upgrade flag set the machine-list projection is eligible and the v
     deliver = false;
     const undelivered = await upgrade();
     assert.equal(undelivered.status, 409, await undelivered.clone().text());
-    assert.equal(((await undelivered.json()) as { code: string }).code, "computer_offline");
+    assert.deepEqual(await undelivered.json(), { error: "Computer is not online", code: "computer_offline", errorCode: "computer_offline" });
     assert.equal(await getOpenComputerUpgradeRequest(machine.id), null, "no open request is left behind");
     const [undeliveredRow] = await getDb().select().from(computerUpgradeRequests).where(eq(computerUpgradeRequests.machineId, machine.id));
     assert.equal(undeliveredRow?.outcome, "failed");
@@ -7657,6 +8007,91 @@ test("a Computer reporting an installer repair hint gets it on the machine list 
     const accepted = await upgrade(hinted.id);
     assert.equal(accepted.status, 201, await accepted.clone().text());
     assert.deepEqual(sent, [hinted.id], "the hint never stops the upgrade");
+  } finally {
+    globalThis.fetch = originalFetch;
+    __resetLatestComputerVersionForTest();
+  }
+});
+
+test("a Computer whose systemd manager refuses the upgrade scope: the list carries it and the web upgrade is refused up front; unknown changes nothing", async ({ app }) => {
+  const originalFetch = globalThis.fetch;
+  __resetLatestComputerVersionForTest();
+  try {
+    const { owner, server } = await seedRoleFixture("upgrade-scope-computer");
+    const inserted = await getDb().insert(machines).values((["refused", "unknown"] as const).map((name) => ({
+      serverId: server.id, userId: owner.id, name: `${name}-computer`,
+      apiKeyHash: `${name}-scope-computer-hash`, os: "linux x64", installKind: "sea",
+    }))).returning();
+    const [refused, unknown] = inserted as [typeof inserted[number], typeof inserted[number]];
+    for (const machine of inserted) await linkComputer(server.id, machine.id);
+    const ownerToken = await tokenForHuman(owner.email);
+    const REFUSAL = { ok: false as const, reason: "Failed to start transient scope unit: Access denied" };
+    const sent: string[] = [];
+    app.app.set("agentOrchestrator", {
+      computerUpgradeDrainMs: async () => null,
+      getComputerUpgradeDrain: () => null,
+      getCurrentTimeMs: () => Date.parse("2026-11-03T00:00:00Z"),
+      getMachineStatus: async () => "online",
+      getMachineStatusVersion: async () => 1,
+      getMachineDaemonVersion: () => null,
+      hasMachineLocally: () => true,
+      hasMachineCapability: (_machineId: string, capability: string) => capability !== COMPUTER_CAPABILITY_SERVICE_IPC_UNREACHABLE,
+      getMachineConnectionEpoch: () => "upgrade-scope-epoch",
+      getMachineComputerVersionFact: async () => ({
+        version: "1.0.57", observedAt: new Date().toISOString(), provenance: "owner_connection",
+      }),
+      getMachineUpgradeScope: async (machineId: string) => machineId === refused.id ? REFUSAL : null,
+      sendComputerControl: async () => {
+        throw new Error("the v2 upgrade route must not use the legacy control relay");
+      },
+      sendComputerUpgrade: async (machineId: string) => {
+        sent.push(machineId);
+        return { sent: true };
+      },
+    });
+    app.app.set("computerBroadcastPolicyEvaluator", (input: EvaluateComputerBroadcastPolicyInput) =>
+      evaluateBroadcastPolicy(input, { fetchFn: async () => Response.json({
+        app: { slug: "raft-computer-cli", platform: "node" }, channel: "main",
+        build: { id: "build-59", version: "1.0.59" }, scoped: { release_id: "release-59" },
+        assets: [{ platform: "linux", arch: "x64", variant: null, filetype: "binary",
+          sha256: "a".repeat(64), size_bytes: 100, download_url: "https://hands.build/artifact" }],
+      }) }));
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.startsWith("https://hands.build/")) return new Response("unavailable", { status: 503 });
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    const res = await fetch(`${app.baseUrl}/api/servers/${server.id}/machines`, {
+      headers: { Authorization: `Bearer ${ownerToken}`, "X-Server-Id": server.id },
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as {
+      machines: Array<{ id: string; computerUpgradeAvailable: boolean | null; upgradeScope?: unknown }>;
+    };
+    const row = (id: string) => body.machines.find((machine) => machine.id === id)!;
+    assert.deepEqual(row(refused.id).upgradeScope, REFUSAL);
+    assert.equal(row(unknown.id).upgradeScope, null);
+    assert.equal(row(unknown.id).computerUpgradeAvailable, true);
+
+    const upgrade = (machineId: string) => fetch(`${app.baseUrl}/api/servers/${server.id}/machines/${machineId}/computer/upgrade`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${ownerToken}`, "X-Server-Id": server.id, "Content-Type": "application/json" },
+      body: JSON.stringify({ targetVersion: "1.0.59" }),
+    });
+    const rejected = await upgrade(refused.id);
+    assert.equal(rejected.status, 409);
+    const rejectedBody = await rejected.json() as { code?: string; error?: string };
+    assert.equal(rejectedBody.code, "scope_unavailable");
+    assert.match(rejectedBody.error ?? "", /can't be upgraded from the web/);
+    assert.deepEqual(sent, [], "nothing is sent to a Computer that would refuse it");
+    const [recorded] = await getDb().select({ count: sql<number>`count(*)::int` }).from(computerUpgradeRequests)
+      .where(eq(computerUpgradeRequests.machineId, refused.id));
+    assert.equal(recorded?.count, 0, "no request row is recorded");
+
+    const accepted = await upgrade(unknown.id);
+    assert.equal(accepted.status, 201, await accepted.clone().text());
+    assert.deepEqual(sent, [unknown.id], "unknown upgrades as before");
   } finally {
     globalThis.fetch = originalFetch;
     __resetLatestComputerVersionForTest();

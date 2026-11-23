@@ -70,7 +70,8 @@ async function visibleRecipients(item: ArtifactVisibilitySubject & Pick<Artifact
  * Record one event on the Artifact in `tx`, the transaction of the change,
  * for those of `recipients` who can see it now (visibleRecipients). Every
  * event this module records goes through here: comments, reviews, edits,
- * versions, moves.
+ * versions, moves. Returns the event and the recipients it was written for
+ * (a resolve says whether the thread's author was told, #proj-workspace:#340).
  */
 export async function recordArtifactEvent(tx: DatabaseExecutor, input: {
   item: Pick<ArtifactItemRow, "id" | "serverId" | "homeKind" | "homeChannelId"> & ArtifactVisibilitySubject;
@@ -80,8 +81,9 @@ export async function recordArtifactEvent(tx: DatabaseExecutor, input: {
   recipients: readonly ArtifactEventRecipient[];
   /** The home before the change, when it moved the Artifact. */
   previousHome?: ObjectEventInput["home"];
-}): Promise<{ id: string; seq: number }> {
-  return recordObjectEvent(tx, {
+}): Promise<{ id: string; seq: number; recipients: ArtifactEventRecipient[] }> {
+  const recipients = input.recipients.length === 0 ? [] : await visibleRecipients(input.item, input.recipients);
+  const event = await recordObjectEvent(tx, {
     serverId: input.item.serverId,
     kind: ARTIFACT_OBJECT_KIND,
     objectId: input.item.id,
@@ -90,6 +92,7 @@ export async function recordArtifactEvent(tx: DatabaseExecutor, input: {
     ...(input.previousHome ? { previousHome: input.previousHome } : {}),
     actor: input.actor,
     data: input.data,
-    recipients: input.recipients.length === 0 ? [] : await visibleRecipients(input.item, input.recipients),
+    recipients,
   });
+  return { ...event, recipients };
 }

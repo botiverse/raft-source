@@ -1269,3 +1269,33 @@ test.skipIf(!configured)("Done frontier parity: canonical Postgres doneFrontierS
     assert.equal(seqOf(done.doneFrontierSeq), seqOf(pg.get(c.id)!.doneFrontierSeq), `${c.what}: = PG doneFrontierSeq`);
   }
 });
+
+// Sync inbox rows (services/syncInboxRows.ts): the rows-only RisingWave read
+// (buildRisingWaveInboxItemsServingQuery `rowsOnly`) answers the same rows as
+// the full ids read, and its target latest seqs (rw_target_latest_v4, same
+// statement) are each conversation's latest message seq once CDC caught up.
+test.skipIf(!configured)("rows-only Activity read: the ids read's rows, with each target's rw_target_latest_v4 seq", async () => {
+  const ids = [f.general.id, f.receiverLocal.id, f.thread.id];
+  const full = await getInboxItems(f.receiverServer.id, f.receiver.id, { filter: "all", limit: ids.length, rowIds: ids, includeUnfollowedThreads: true });
+  const rowsOnly = await getInboxItems(f.receiverServer.id, f.receiver.id, { filter: "all", limit: ids.length, rowIds: ids, includeUnfollowedThreads: true, rowsOnly: true });
+  const withStates = await getInboxItems(f.receiverServer.id, f.receiver.id, { filter: "all", limit: ids.length, rowIds: ids, includeUnfollowedThreads: true, rowsOnly: true, sourceStateIds: ids });
+  assert.equal(rowsOnly.backend, "risingwave");
+  assert.deepEqual(rowsOnly.items, full.items, "the same rows, in the same order");
+  assert.deepEqual(rowsOnly.groups, [], "rows only: no groups");
+  assert.equal(full.targetLatestSeqs, undefined, "only a rows-only read carries target latest seqs");
+  const latest = rowsOnly.targetLatestSeqs;
+  assert.ok(latest, "a rows-only RisingWave read carries the target latest seqs");
+  for (const item of rowsOnly.items) {
+    const target = targetOf(item).toLowerCase();
+    assert.equal(latest.get(target), item.latestActivitySeq ?? undefined, `${item.kind} ${target}: tl.latest_seq is the row's latest activity`);
+  }
+  // The Done watermarks and mutes of the same statement (the CDC tables the serving chain reads).
+  assert.equal(full.sourceStates, undefined, "only a rows-only read asked for them carries source states");
+  assert.equal(rowsOnly.sourceStates, undefined, "not asked: none");
+  assert.deepEqual(withStates.items, rowsOnly.items, "asking for them changes no row");
+  assert.deepEqual(withStates.targetLatestSeqs, rowsOnly.targetLatestSeqs);
+  const states = withStates.sourceStates;
+  assert.ok(states, "a rows-only RisingWave read carries the asked rows' Done watermarks and mutes");
+  const asked = new Set(ids.map((id) => id.toLowerCase()));
+  for (const id of [...states.suppression.keys(), ...states.mute.keys()]) assert.ok(asked.has(id), `${id} is an asked row`);
+});

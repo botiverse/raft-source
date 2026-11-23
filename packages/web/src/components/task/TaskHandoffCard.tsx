@@ -12,18 +12,32 @@ import type { TaskAssignmentNoticeParty } from "@botiverse/raft-shared";
 import { useTimeFormatter } from "../../hooks/useTimeFormatter";
 import { useAgentStore } from "../../store/agentStore";
 import { useAuthStore } from "../../store/authStore";
+import { useActorFallback } from "../../store/localTables/useActorFallback";
 import type { Message } from "../../store/messageStore";
 import { useServerStore } from "../../store/serverStore";
+import { MessageMarkdownBody } from "../message/MessageMarkdownBody";
+import type { MessageMarkdownRefProps } from "../message/MessageMarkdownBody";
 import AvatarSlot from "../ui/AvatarSlot";
 import { sameParty } from "./taskHandoffNotice";
 import type { TaskHandoffNotice, TaskHandoffReturn } from "./taskHandoffNotice";
 
-/** A party's avatar and the name people read, from the server's people and agents; the line's own names as a fallback. */
-function usePartyIdentity(party: TaskAssignmentNoticeParty): { name: string; avatarUrl: string | null } {
+/**
+ * A party's avatar and the name people read, from the server's people and
+ * agents; the line's own names as a fallback. On a joint surface a party from
+ * the other server is on neither list, so, as a message sender's face does,
+ * it falls back to the actors table (`/actors/resolve`).
+ */
+function usePartyIdentity(party: TaskAssignmentNoticeParty, jointSurface: boolean): { name: string; avatarUrl: string | null } {
   const agent = useAgentStore((s) => (party.type === "agent" ? s.agents.find((a) => a.id === party.id) ?? null : null));
   const member = useServerStore((s) => (party.type === "user" ? s.members.find((m) => m.userId === party.id) ?? null : null));
   const me = useAuthStore((s) => (party.type === "user" && s.user?.id === party.id ? s.user : null));
-  const known = agent ?? member ?? me;
+  const local = agent ?? member ?? me;
+  const actor = useActorFallback(
+    jointSurface && !local && party.id
+      ? { kind: party.type === "agent" ? "agent" : "human", id: party.id }
+      : null,
+  );
+  const known = local ?? actor;
   return {
     name: known?.displayName || known?.name || party.displayName || party.name || "",
     avatarUrl: known?.avatarUrl ?? null,
@@ -54,21 +68,28 @@ function partyHandle(party: TaskAssignmentNoticeParty, identity: { name: string 
  * back to whoever handed it off, the card says so and fades: "Otter took it
  * back · 10:51" when they took it, "xxchan handed it back to Otter · 10:51"
  * when someone else gave it back. The wait it describes is over.
+ * With `reasonMarkdown`, the reason is drawn as a message body is (its refs,
+ * mentions and links open as they do there; no read receipts); without it,
+ * as its plain text.
  */
-export function TaskHandoffCard({ message, notice, returned, time }: {
-  message: Pick<Message, "id">;
+export function TaskHandoffCard({ message, notice, returned, time, reasonMarkdown, jointSurface = false }: {
+  message: Pick<Message, "id" | "channelId">;
   notice: TaskHandoffNotice;
   returned: TaskHandoffReturn | null | undefined;
   /** The line's time, as the timeline formats it. */
   time: string;
+  /** How the conversation's messages resolve and open refs, mentions and links. */
+  reasonMarkdown?: MessageMarkdownRefProps;
+  /** In a joint channel (or its thread): a party from the other server resolves through the actors table. */
+  jointSurface?: boolean;
 }) {
   const { formatMessage } = useIntl();
   const { formatMessageTime } = useTimeFormatter();
-  const from = usePartyIdentity(notice.actor);
-  const to = usePartyIdentity(notice.assignee);
+  const from = usePartyIdentity(notice.actor, jointSurface);
+  const to = usePartyIdentity(notice.assignee, jointSurface);
   const toHandle = partyHandle(notice.assignee, to);
   // Who gave it back: the actor themselves (took it back) or someone else (handed it back).
-  const returner = usePartyIdentity(returned?.by ?? notice.actor);
+  const returner = usePartyIdentity(returned?.by ?? notice.actor, jointSurface);
   const returnedBySomeoneElse = returned ? !sameParty(returned.by, notice.actor) : false;
   return (
     <div
@@ -95,9 +116,21 @@ export function TaskHandoffCard({ message, notice, returned, time }: {
           </MessageActionCardHeaderTitle>
         </MessageActionCardHeader>
         <MessageActionCardContent>
-          <p className="m-0 whitespace-pre-wrap break-words text-callout text-foreground" data-testid="task-handoff-reason">
-            {notice.reason}
-          </p>
+          {reasonMarkdown ? (
+            <div className="break-words text-callout text-foreground" data-testid="task-handoff-reason">
+              <MessageMarkdownBody
+                {...reasonMarkdown}
+                content={notice.reason}
+                readReceiptChannelId={message.channelId}
+                readReceiptMessageSeq={undefined}
+                readReceiptEnabled={false}
+              />
+            </div>
+          ) : (
+            <p className="m-0 whitespace-pre-wrap break-words text-callout text-foreground" data-testid="task-handoff-reason">
+              {notice.reason}
+            </p>
+          )}
         </MessageActionCardContent>
       </MessageActionCard>
     </div>

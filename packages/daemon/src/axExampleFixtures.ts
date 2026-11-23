@@ -1,7 +1,7 @@
 // Shared example fixtures for daemon axSurface definitions (@xxchan: reuse
 // samples per data type). PURE DATA with placeholder identifiers; the driver
 // stubs carry only the fields the runtime-input formatters read.
-import type { AgentConfig, AgentMessage } from "@botiverse/raft-shared";
+import type { AgentConfig, AgentMessage, AgentStartOpenTasks } from "@botiverse/raft-shared";
 
 import type { RuntimeDriver } from "./drivers/types";
 import type { SystemPromptOptions } from "./drivers/systemPrompt";
@@ -65,6 +65,14 @@ export function exampleThirdPartyEvent(seq: number, inboxItemTarget?: string): A
 export const exampleUnreadSummary: Record<string, number> = {
   "#channel-a": 12,
   "dm:@peer": 1,
+};
+
+export const exampleOpenTask: AgentStartOpenTasks["tasks"][number] = { ref: "#channel-a:#7", title: "Roll out the new billing page", status: "in_progress" };
+
+/** The open tasks an `agent:start` of a resumed session names (a few, then a count). */
+export const exampleOpenTasks: AgentStartOpenTasks = {
+  tasks: [exampleOpenTask, { ref: "dm:@peer:#3", title: "Draft the release note", status: "todo" }],
+  more: 2,
 };
 
 export const exampleAgentConfig = {

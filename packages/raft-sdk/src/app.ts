@@ -10,6 +10,7 @@
 //
 // Experimental: RFC 079 is still settling, so the shape may change in a minor
 // release until account mode ships.
+import { fetchWithoutRedirect } from "@botiverse/raft-shared/src/fetchWithoutRedirect";
 import { asServerId, type ServerId } from "@botiverse/raft-shared/src/brandedIds";
 
 export type { ServerId };
@@ -214,11 +215,10 @@ export function createRaftAppClient(options: CreateRaftAppClientOptions): RaftAp
     const where = `/api/oauth/${endpoint}`;
     let response: Response;
     try {
-      response = await doFetch(url.toString(), {
+      // These endpoints never redirect; following one would carry the token elsewhere.
+      response = await fetchWithoutRedirect(doFetch, url.toString(), {
         method: "GET",
         headers: { authorization: `Bearer ${accessToken}`, accept: "application/json" },
-        // These endpoints never redirect; following one would carry the token elsewhere.
-        redirect: "error",
       });
     } catch (cause) {
       throw new RaftAppError("network_error", `Could not reach Raft for ${where}`, null, { cause });

@@ -1,4 +1,5 @@
 import { useIntl } from "react-intl";
+import { FileText } from "lucide-react";
 import { PreviewCardTitle, Text } from "@botiverse/raft-ui";
 import { PreviewCardBody, PreviewCardMeta } from "@botiverse/raft-ui/wip";
 import type { ArtifactCard } from "@botiverse/raft-shared";
@@ -72,6 +73,28 @@ export function ArtifactLinkPreview({ card }: { card: ArtifactCard }) {
           {description}
         </Text.Sans>
       ) : null}
+    </PreviewCardBody>
+  );
+}
+
+/**
+ * The hover card's body for an Artifact link this viewer can't read (a
+ * profile description's chip: unavailable, or its read failed): the card's
+ * place and the Artifact's mark, and what to do. Never its title, or anything
+ * else of the Artifact the viewer may not read; the address is the
+ * description's own public text, left out only to keep the card to the hint.
+ * Opening it shows the viewer's own "can't open" state, which says why.
+ */
+export function ArtifactUnavailableLinkPreview() {
+  const { formatMessage } = useIntl();
+  return (
+    <PreviewCardBody>
+      <div className="flex min-w-0 items-start gap-2" data-artifact-link-unavailable="">
+        <FileText aria-hidden className="mt-0.5 size-4 shrink-0 text-foreground-muted" />
+        <Text.Sans size="small" variant="default" className={WRAP}>
+          {formatMessage({ id: "artifacts.chip.descriptionUnavailableHint" })}
+        </Text.Sans>
+      </div>
     </PreviewCardBody>
   );
 }

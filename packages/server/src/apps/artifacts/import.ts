@@ -206,6 +206,7 @@ import {
 import { ARTIFACT_NAME, isReservedArtifactName, liveInHome, type ArtifactHomeRef } from "./names";
 import { autoSubscribe } from "./notices";
 import { fillCurrentExcerpt } from "./excerpt";
+import { fillArtifactReferences } from "./references";
 import { fillCurrentPublicText } from "./publicText";
 import { artifactAudit, artifactItems, artifactSubscriptions, artifactVersionFiles, artifactVersions, type ArtifactItemRow } from "./schema";
 import { indexArtifactSearch } from "./search";
@@ -963,6 +964,8 @@ async function importFromStandaloneApp(importer: Importer, input: { link: { serv
     if (created) fillCurrentPublicText(committed.item);
     // A Markdown entry's excerpt, what its card shows (excerpt.ts): bounded, never failing the import.
     if (created) await fillCurrentExcerpt(committed.item);
+    // Its links to other Artifacts: bounded, never failing the import (references.ts).
+    if (created) await fillArtifactReferences(committed.item);
     await tellStandaloneApp(config, importer, committed.item, manifest);
     return { ...committed, from: parsed.link };
   } catch (error) {

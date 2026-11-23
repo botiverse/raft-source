@@ -43,7 +43,6 @@ export function limitResetFailureMessageId(result: RuntimeLimitResetResult): Mes
 /** Why a limit-reset request itself failed (Codex and Claude). */
 export function limitResetRequestErrorMessageId(error: unknown): MessageId {
   const { status, code } = runtimeAuthRequestError(error);
-  if (code === "claude_limit_reset_owner_only") return "machine.runtimeUsage.claudeReset.ownerOnly";
   if (status === 403) return "machine.runtimeUsage.limitReset.forbidden";
   if (code === "computer_offline") return "machine.runtimeAuth.error.computerOffline";
   if (code === "computer_upgrade_required") return "machine.runtimeUsage.limitReset.upgradeRequired";

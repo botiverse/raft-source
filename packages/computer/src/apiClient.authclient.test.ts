@@ -308,18 +308,31 @@ test("ServersClient.list: unknown string role remains visible for forward compat
   );
 });
 
-test("device authorize names the Computer and its version in the User-Agent", async () => {
-  let userAgent: string | undefined;
+test("device authorize, poll and loopback redeem name the Computer, its version, OS and arch in the User-Agent", async () => {
+  const seen: Array<{ path: string | undefined; userAgent: string | undefined }> = [];
   const server = createServer((req, res) => {
-    userAgent = req.headers["user-agent"];
-    res.writeHead(201, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ deviceCode: "d", userCode: "U", verificationUri: "https://example.test/device", expiresIn: 600, interval: 5 }));
+    seen.push({ path: req.url, userAgent: req.headers["user-agent"] });
+    if (req.url === "/api/auth/device/authorize") {
+      res.writeHead(201, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ deviceCode: "d", userCode: "U", verificationUri: "https://example.test/device", expiresIn: 600, interval: 5 }));
+      return;
+    }
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ code: "authorization_pending" }));
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address() as AddressInfo;
   try {
-    await new DeviceAuthClient(`http://127.0.0.1:${address.port}`).authorize("raft-computer");
-    assert.equal(userAgent, `raft-computer/${COMPUTER_VERSION}`);
+    const client = new DeviceAuthClient(`http://127.0.0.1:${address.port}`);
+    await client.authorize("raft-computer");
+    await client.token("d");
+    await client.redeemLoopback({ requestId: "r", code: "c", codeVerifier: "v" });
+    const expected = `raft-computer/${COMPUTER_VERSION} (${process.platform}; ${process.arch})`;
+    assert.deepEqual(seen, [
+      { path: "/api/auth/device/authorize", userAgent: expected },
+      { path: "/api/auth/device/token", userAgent: expected },
+      { path: "/api/auth/device/token", userAgent: expected },
+    ]);
   } finally {
     await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); });
   }

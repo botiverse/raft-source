@@ -81,7 +81,8 @@ export function createRuntimeAccountUsageRoutingBackend({
   };
 }
 
-function defaultBackend(): RuntimeAccountUsageCacheBackend {
+/** Redis when it is up, else this process's map: the usage cache's storage, shared with records keyed beside it. */
+export function defaultRuntimeAccountUsageCacheBackend(): RuntimeAccountUsageCacheBackend {
   return createRuntimeAccountUsageRoutingBackend({
     isSharedAvailable: isRedisAvailable,
     shared: redisBackend,
@@ -103,7 +104,7 @@ function refreshKey(machineId: string, provider: RuntimeAccountUsageProvider): s
 
 export class RuntimeAccountUsageCacheService {
   constructor(
-    private readonly backend: RuntimeAccountUsageCacheBackend = defaultBackend(),
+    private readonly backend: RuntimeAccountUsageCacheBackend = defaultRuntimeAccountUsageCacheBackend(),
     private readonly now: () => number = currentTimeMs,
   ) {}
 

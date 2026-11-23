@@ -17,6 +17,7 @@ import {
 } from "@botiverse/raft-shared";
 
 import { createApiTest } from "../test/integration/apiTest";
+import { seedJointChannel } from "../test/integration/jointFixture";
 import { fixturePasswordHash } from "../test/integration/credentials";
 import { getDb } from "../db/index";
 import { agents, messages, reminderEvents, reminders, thirdPartyAgentEvents, users } from "../db/schema";
@@ -365,6 +366,41 @@ test("D6 D7 D8 D12 D13: items=true lists reminders first, one app row per object
   assert.ok(page2.body.rows.every((row: any) => row.kind === "conversation"), page2.text);
 });
 
+test("D8 #460: a notice about a joint-homed object names the agent's own server's copy of the joint, only when the agent can open it", async ({ app }) => {
+  const f = await seed("joint-related");
+  const suffix = randomUUID().slice(0, 8);
+  const otherServer = await createServer("Inbox Items Other", `inbox-items-other-${suffix}`, f.owner.id);
+  const outsideServer = await createServer("Inbox Items Outside", `inbox-items-outside-${suffix}`, f.owner.id);
+  // A joint the agent is in through its own server's copy; one its server is in but the agent isn't; one its server isn't in.
+  const joined = await seedJointChannel({ name: `joined-${suffix}`, serverIds: [otherServer.id, f.server.id], createdByUserId: f.owner.id });
+  const [theirCopy, ourCopy] = joined.projections as [typeof joined.projections[number], typeof joined.projections[number]];
+  await addAgent(ourCopy.id, f.agent.id);
+  const notJoined = await seedJointChannel({ name: `not-joined-${suffix}`, serverIds: [otherServer.id, f.server.id], createdByUserId: f.owner.id });
+  const elsewhere = await seedJointChannel({ name: `elsewhere-${suffix}`, serverIds: [otherServer.id, outsideServer.id], createdByUserId: f.owner.id });
+  // Even on another server's copy's roster (if core lets the row in at all), the agent opens nothing of a joint its server isn't in.
+  await addAgent(elsewhere.projections[0]!.id, f.agent.id).catch(() => undefined);
+  stubChain([]);
+  // Joint-homed objects name the joint's storage channel (an Artifact's home), or, named before that, another server's copy.
+  await insertEvent(f, { objectRef: "canonical", relatedChannelId: joined.canonical.id });
+  await insertEvent(f, { objectRef: "their-copy", relatedChannelId: theirCopy.id });
+  await insertEvent(f, { objectRef: "not-joined", relatedChannelId: notJoined.canonical.id });
+  await insertEvent(f, { objectRef: "elsewhere", relatedChannelId: elsewhere.canonical.id });
+  await insertEvent(f, { objectRef: "local", relatedChannelId: f.general.id });
+  await insertEvent(f, { objectRef: "hidden", relatedChannelId: f.hidden.id });
+
+  const res = await check(app.baseUrl, f.apiKey, "?items=true", RUNNER);
+  assert.equal(res.status, 200, res.text);
+  const related = new Map((res.body.rows as any[]).map((row) => [row.objectRef, row.related]));
+  assert.deepEqual(related.get("canonical"), { target: `#${ourCopy.name}` }, "the agent's own copy, never the storage channel");
+  assert.deepEqual(related.get("their-copy"), { target: `#${ourCopy.name}` });
+  assert.equal(related.get("not-joined"), null, "a copy the agent can't open is not named");
+  assert.equal(related.get("elsewhere"), null, "a joint its server isn't in is not named");
+  // Its own server's conversations, as before.
+  assert.deepEqual(related.get("local"), { target: `#${f.general.name}` });
+  assert.equal(related.get("hidden"), null);
+  assert.equal(res.text.includes("joint-storage"), false);
+});
+
 // ---------------------------------------------------------------------------
 // inbox read
 
@@ -685,6 +721,21 @@ test("D22: a recurring reminder lists only its latest fire: earlier un-acked fir
     occurredAt: new Date(), metadata: { fired: true, sourceVersion: 4 },
   });
   assert.deepEqual((await rowsOf()).get(target)?.ack, [{ app: "system.reminder", id: recurring.id, revision: "4" }]);
+});
+
+test("D22 at scale: a recurring reminder with many fires still reads its latest fire only (#triage:#388: the per-fire newer-fire scan was quadratic)", async ({ app }) => {
+  const f = await seed("reminder-d22-many");
+  stubChain([]);
+  const fires = Array.from({ length: 400 }, (_, index) => index + 1);
+  const recurring = await seedReminder(f, "Every minute", fires);
+  await getDb().update(reminders).set({ status: "scheduled", recurrence: { kind: "interval", everyMs: 60_000 } }).where(eq(reminders.id, recurring.id));
+  const target = `reminder:${recurring.id.slice(0, 8)}`;
+  const started = Date.now();
+  const shown = await read(app.baseUrl, f.apiKey, { target }, RUNNER);
+  const elapsedMs = Date.now() - started;
+  assert.equal(shown.status, 200, shown.text);
+  assert.deepEqual(shown.body.entries.map((entry: any) => entry.ack.revision), ["400"], "only the latest of 400 fires");
+  assert.ok(elapsedMs < 10_000, `read took ${elapsedMs} ms`);
 });
 
 test("D1 D5 D6: message read of agent-event:<id> consumes that event on the server, so its item counts one fewer; message read still re-reads it", async ({ app }) => {
@@ -1056,9 +1107,13 @@ test("RAFT_INBOX_ITEMS_APP_EVENTS_FROM before the launch: app events from then o
   assert.equal(targets.get(early.id), `app:${f.appKey}/pr-early`);
   assert.equal(targets.get(tooOld.id), undefined);
 
-  // A new event on it while unread merges, as on any item.
-  const later = await insertEvent(f, { objectRef: "pr-early", summary: "after the launch" });
+  // A new event on it while unread, inside the wake window, merges, as on any item.
+  const later = await insertEvent(f, { objectRef: "pr-early", summary: "after the launch", createdAt: new Date(early.createdAt.getTime() + 60_000) });
   const { coalesceWakeIntoUnreadItem } = await import("../services/appItemWakeCoalescing");
+  // Merging needs its CLI to list app items (#proj-apps:#88); the check above recorded that in
+  // the background, so wait for it rather than race it.
+  const { agentCliInboxItemsState } = await import("../services/agentCliInboxItems");
+  await vi.waitFor(async () => assert.equal(await agentCliInboxItemsState(f.agent.id), "lists"), { timeout: 5_000 });
   assert.equal(await coalesceWakeIntoUnreadItem(later, f.appKey), true);
 
   const read1 = await read(app.baseUrl, f.apiKey, { target: `app:${f.appKey}/pr-early` });

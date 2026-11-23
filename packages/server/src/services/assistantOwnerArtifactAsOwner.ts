@@ -7,7 +7,7 @@ import type {
 import type { Server as SocketServer } from "socket.io";
 import { firstPartyApps } from "../apps/firstPartyApps";
 import type { AppNoticeOutbox, AppPublishAsAnswer } from "../platform/apps";
-import { postableConversation } from "../platform/conversations";
+import { localConversationIds, postableConversation } from "../platform/conversations";
 import { getActorServerRoleInServer } from "../lib/actorPermissions";
 import type { AgentOrchestrator } from "./agentOrchestrator";
 import * as channelService from "./channelService";
@@ -45,13 +45,12 @@ import { recordTraceEvent } from "../tracing/semanticTrace";
  * carrying `seen` gets past it, so a plain retry can't publish over comments
  * never shown (Tenny, #33).
  *
- * v1: joint (shared) channels are not supported. A new Artifact whose home is
- * a joint channel, and a new version of one homed in a joint's canonical
- * channel, both answer the one not-found: the canonical channel belongs to
- * the joint's storage namespace, not to a server, so postableConversation
- * refuses it even on the host. A later relaxation should ask whether the
- * owner may post in their own server's projection of that joint, never relax
- * the server check (Warden, #14681).
+ * Joint (shared) channels: a new version of an Artifact homed in a joint's
+ * canonical channel is checked on the owner's own server's projection of it
+ * (platform/conversations localConversationIds), by the same rules; with no
+ * active projection there it answers the one not-found, never relaxing the
+ * server check (Warden, #14681, #460). A new Artifact's home is resolved as
+ * before (homeIdOf, then usableHome).
  *
  * After a publish that made a version, Raft records it (integration audit
  * `assistant.publish_artifact_as_owner`, trace
@@ -82,6 +81,8 @@ export type OwnerArtifactPublishAsOwnerResult =
   | Refusal;
 
 interface UsableHome {
+  /** The conversation, as the owner's server has it (a joint by the server's projection): the id the assistant is given. */
+  conversationId: string;
   /** The home an Artifact put there names (a joint's canonical channel). */
   homeChannelId: string;
   /** As the owner names it. */
@@ -105,7 +106,7 @@ async function usableHome(input: { agentId: string; serverId: ServerId; ownerUse
   const ref = scope.dm
     ? `dm:@${await channelService.resolveUserFacingDmPeerRef(input.serverId, input.ownerUserId, channel.id) ?? "someone"}`
     : `#${channel.name}`;
-  return { homeChannelId: postable.homeChannelId, ref };
+  return { conversationId: postable.conversationId, homeChannelId: postable.homeChannelId, ref };
 }
 
 /** `home` as the owner names it, to a conversation id; null when it names none they can see. */
@@ -226,7 +227,12 @@ export async function publishOwnerArtifactAsOwner(input: {
       comments: false,
       homeAllowed: async (found) => {
         if (found.kind !== "conversation" || found.channelId === null) return false;
-        home = await usableHome({ agentId: input.agentId, serverId: input.serverId, ownerUserId: input.ownerUserId, conversationId: found.channelId });
+        // A joint's Artifact names the joint's canonical channel: the checks run on the owner's own server's copy of
+        // it, and with none (the server is not, or no longer, in the joint) it is the one not-found, never the
+        // canonical channel itself (Warden, #460).
+        const local = (await localConversationIds(input.serverId, [found.channelId])).get(found.channelId);
+        if (local === undefined) return false;
+        home = await usableHome({ agentId: input.agentId, serverId: input.serverId, ownerUserId: input.ownerUserId, conversationId: local });
         return home !== null;
       },
     });
@@ -277,6 +283,8 @@ export async function publishOwnerArtifactAsOwner(input: {
   return {
     ok: true,
     status: answer.status,
-    body: { artifact: { id: itemId, url, version, unchanged }, home: { id: usable.homeChannelId, ref: usable.ref } },
+    // The conversation as the owner's server has it, as `ref` names it: for a joint its projection, an id the
+    // assistant can name as home again, never the joint's storage channel (#460).
+    body: { artifact: { id: itemId, url, version, unchanged }, home: { id: usable.conversationId, ref: usable.ref } },
   };
 }

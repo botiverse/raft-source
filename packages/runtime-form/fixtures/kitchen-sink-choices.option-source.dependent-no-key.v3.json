@@ -1,0 +1,18 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "kitchen-sink-choices",
+  "schemaVersion": "kitchen-sink-choices.create.v1",
+  "sourceId": "dependentNoKey",
+  "kind": "dependent_select",
+  "pointer": "/dependentNoKey",
+  "dependsOn": "/selectFilled",
+  "optionsByValue": {
+    "alpha": [
+      {
+        "value": "a1",
+        "label": "Alpha one"
+      }
+    ]
+  },
+  "status": "live"
+}

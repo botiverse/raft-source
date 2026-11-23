@@ -12,6 +12,7 @@ import { formatCopyLinksToast, formatForwardSelectionBlockedMessage, getForwarda
 import { isRangeSelectableMessage } from "../../components/message/messageRangeSelection";
 import { forwardToast } from "../../components/message/forwardToast";
 import { buildMessagePermalink } from "../../hooks/useAppNavigate";
+import { useCurrentDay } from "../../hooks/useCurrentDay";
 import { useShortcutLayer } from "../../features/shortcuts/useShortcutLayer";
 import { copyTextToClipboard } from "../../utils/selectMarkdown";
 
@@ -82,6 +83,8 @@ export function useThreadSelectionActions({
   // Stryker restore all
   const panelRef = useRef<HTMLDivElement>(null);
   const exitSelectionReturningFocus = useExitSelectionReturningFocus(panelRef);
+  // An exported picture's filename carries today's date (UTC), kept current while the thread stays open.
+  const picFilename = `raft-thread-${useCurrentDay("UTC")}.png`;
   const {
     picCapturing,
     picCaptureProgress,
@@ -265,6 +268,7 @@ export function useThreadSelectionActions({
     picCaptureProgress,
     cancelPicCapture,
     picPreview,
+    picFilename,
     picError,
     setPicError,
     copiedMd,

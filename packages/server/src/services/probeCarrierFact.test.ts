@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import {
   isProbeCarrierFactLive,
   parseProbeCarrierMeta,
-  probeCarrierFactHasProbeCapability,
   PROBE_CARRIER_FACT_MAX_AGE_MS,
 } from "./probeCarrierFact";
 
@@ -27,7 +26,6 @@ test("parseProbeCarrierMeta projects capabilities and runtime versions", () => {
   assert.deepEqual(snapshot?.capabilities, ["provider-probe:v1"]);
   assert.deepEqual(snapshot?.runtimeVersions, { builtin: "pi-1" });
   assert.equal(snapshot?.connectionEpochId, "epoch-1");
-  assert.equal(probeCarrierFactHasProbeCapability(snapshot!), true);
   // fallback to the legacy runtimeVersions field when the probe field is absent
   const legacy = parseProbeCarrierMeta(meta({ probeRuntimeVersions: null, runtimeVersions: JSON.stringify({ claude: "c-1" }) }));
   assert.deepEqual(legacy?.runtimeVersions, { claude: "c-1" });
@@ -35,8 +33,7 @@ test("parseProbeCarrierMeta projects capabilities and runtime versions", () => {
   assert.equal(parseProbeCarrierMeta(meta({ probeConnectionEpochId: null })), null);
   assert.equal(parseProbeCarrierMeta(meta({ probeObservedAt: "not-a-date" })), null);
   const noCap = parseProbeCarrierMeta(meta({ probeCapabilities: "[]" }));
-  assert.ok(noCap);
-  assert.equal(probeCarrierFactHasProbeCapability(noCap), false);
+  assert.deepEqual(noCap?.capabilities, []);
 });
 
 test("fact freshness rejects future and stale observations", () => {

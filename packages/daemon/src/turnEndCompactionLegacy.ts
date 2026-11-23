@@ -6,6 +6,7 @@
 // ordinary result.
 import { existsSync } from "node:fs";
 import path from "node:path";
+import type { AgentNotIdleReason } from "./agentIdle";
 import type { ParsedEvent } from "./drivers/index";
 import { TurnEndCompactionArming, type TurnEndContextFacts } from "./turnEndCompaction";
 
@@ -22,7 +23,14 @@ export interface LegacyTurnEndCompactionState {
    * the call settles the daemon holds every delivery itself
    * (`driverCompactionHolds`), whatever events the runtime reports.
    */
-  inFlight: { startedAtMs: number; finishedAtMs: number | null; contextTokens: number | null; viaDriver?: true } | null;
+  inFlight: {
+    startedAtMs: number;
+    finishedAtMs: number | null;
+    contextTokens: number | null;
+    viaDriver?: true;
+    /** What Claude's compaction left (`compact_metadata.post_tokens`), when it said. */
+    contextAfterTokens?: number;
+  } | null;
   /** The last skip reported for this session (one event per session and reason). */
   lastSkipKey: string | null;
   /** True while `/compact` is being written (a failed write's give-back is an idle edge of its own). */
@@ -58,7 +66,7 @@ export function noteLegacyTurnEndContext(state: LegacyTurnEndCompactionState, ev
 }
 
 export type LegacyTurnEndCompactionBlock =
-  | "agent_busy"
+  | AgentNotIdleReason
   | "compacting"
   | "stopping"
   | "deliveries_waiting"
@@ -73,7 +81,7 @@ export type LegacyTurnEndCompactionBlock =
  * ordinary text, so it waits for the next turn end like everything else here.
  */
 export function legacyTurnEndCompactionPreconditionFailure(input: {
-  notIdleReason: unknown;
+  notIdleReason: AgentNotIdleReason | null;
   compacting: boolean;
   stopping: boolean;
   untoldInbox: boolean;
@@ -84,7 +92,7 @@ export function legacyTurnEndCompactionPreconditionFailure(input: {
 }): LegacyTurnEndCompactionBlock | null {
   if (input.stopping) return "stopping";
   if (input.compacting) return "compacting";
-  if (input.notIdleReason !== null) return "agent_busy";
+  if (input.notIdleReason !== null) return input.notIdleReason;
   if (input.untoldInbox) return "deliveries_waiting";
   if (input.failureState) return "runtime_failure_state";
   if (!input.deliverable) return "not_deliverable";

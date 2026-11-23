@@ -48,7 +48,10 @@ function HistoryMenuRow({ entity, onOpen }: { entity: SearchEntityResult; onOpen
   );
 }
 
-export function HistoryMenu() {
+// The rows, resolved only while the menu is open: the popup (and so this
+// component) is not mounted while closed, so a closed menu neither builds the
+// destination catalog nor re-renders on channel / activity changes (#532).
+function HistoryMenuItems() {
   const { formatMessage } = useIntl();
   const location = useLocation();
   const nav = useAppNavigate();
@@ -56,13 +59,25 @@ export function HistoryMenu() {
     excludeChannelId: conversationChannelIdFromPath(location.pathname),
     fillFromActivity: false,
   });
-  const label = formatMessage({ id: "desktop.history.menu", defaultMessage: "History" });
 
   const open = useCallback((entity: SearchEntityResult) => {
     if (!entity.channelId) return;
     if (entity.type === "channel") nav.toChannel(entity.channelId, { sidebarFocus: "center" });
     else nav.toDm(entity.channelId);
   }, [nav]);
+
+  return recent.length === 0 ? (
+    <DropdownMenuItem disabled data-testid="desktop-history-empty">
+      <DropdownMenuItemLabel>{formatMessage({ id: "desktop.history.empty", defaultMessage: "No recent conversations yet" })}</DropdownMenuItemLabel>
+    </DropdownMenuItem>
+  ) : (
+    recent.map((entity) => <HistoryMenuRow key={entity.key} entity={entity} onOpen={open} />)
+  );
+}
+
+export function HistoryMenu() {
+  const { formatMessage } = useIntl();
+  const label = formatMessage({ id: "desktop.history.menu", defaultMessage: "History" });
 
   return (
     <DropdownMenu>
@@ -79,13 +94,7 @@ export function HistoryMenu() {
           truncates instead of widening the menu). */}
       <DropdownMenuContent side="bottom" align="start" sideOffset={4} aria-label={label} data-testid={HISTORY_MENU_TESTID} className="w-60">
         <DropdownMenuLabel>{formatMessage({ id: "search.overlay.recentConversations", defaultMessage: "Recent conversations" })}</DropdownMenuLabel>
-        {recent.length === 0 ? (
-          <DropdownMenuItem disabled data-testid="desktop-history-empty">
-            <DropdownMenuItemLabel>{formatMessage({ id: "desktop.history.empty", defaultMessage: "No recent conversations yet" })}</DropdownMenuItemLabel>
-          </DropdownMenuItem>
-        ) : (
-          recent.map((entity) => <HistoryMenuRow key={entity.key} entity={entity} onOpen={open} />)
-        )}
+        <HistoryMenuItems />
       </DropdownMenuContent>
     </DropdownMenu>
   );

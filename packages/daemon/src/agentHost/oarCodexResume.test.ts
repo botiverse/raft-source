@@ -1,29 +1,29 @@
-// RFC 060 host switch, codex (#wg-ax:#3): a thread the legacy driver started
-// is the thread OAR resumes (same thread id, same cwd, same CODEX_HOME), and
-// the other way round; a thread codex cannot find is handed back, never
-// replaced by a fresh one; what each host sends codex for the thread is
-// the same: the standing prompt as developer instructions (never base
-// instructions), the model, an explicit service tier; and the activity each
-// host reports for one turn is the same.
+// OAR host, codex (#wg-ax:#3): a thread OAR started is resumed across restarts
+// (same thread id, same cwd, same CODEX_HOME); a thread codex cannot find is
+// handed back, never replaced by a fresh one; OAR sends the standing prompt as
+// developer instructions (never base instructions), the model, and an explicit
+// service tier; and the activity reported for a turn matches Raft's contract.
+// And a delivery after a background command reported its end past its turn's
+// starts a turn (#oar-raft:79368d4d).
 //
 // One fake `codex app-server` stands in for codex: it keeps its threads in a
 // store in CODEX_HOME (where codex keeps its rollouts), reports
 // the tier the way codex does (`fast` reads back as `priority`), and answers
-// an unknown `thread/resume` with codex's own -32600 "no rollout found". The
-// legacy CodexDriver and OAR's real codex runtime both run against it.
+// an unknown `thread/resume` with codex's own -32600 "no rollout found".
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { RawEvent, Session } from "@botiverse/oar";
 import { normalizeToolDisplayInvocation, type AgentConfig, type MachineToServerMessage } from "@botiverse/raft-shared";
 import { clearCodexProbeCacheForTests, CodexDriver } from "../drivers/codex";
-import { CodexEventNormalizer } from "../drivers/codexEventNormalizer";
-import type { ParsedEvent, SpawnContext } from "../drivers/types";
 import { exampleMessage } from "../axExampleFixtures";
+import { loadOarSessionRuntime } from "../oarLoader";
 import type { AgentStartRequest } from "./agentLifecycleHost";
-import { OarAgentHost } from "./oarAgentHost";
+import { OarAgentHost, type OarAgentHostDeps } from "./oarAgentHost";
+import { prepareCodexOarLaunch } from "./oarCodexLaunch";
 
 const FAKE_CODEX = String.raw`
 const fs = require("node:fs");
@@ -89,8 +89,15 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       send({ method: "turn/started", params: { threadId, turn: { id: turnId, status: "inProgress", items: [] } } });
       // A scripted turn (FAKE_CODEX_TURN: notifications), each sent for this thread and turn.
       if (process.env.FAKE_CODEX_TURN) for (const note of JSON.parse(fs.readFileSync(process.env.FAKE_CODEX_TURN, "utf8"))) send({ method: note.method, params: { threadId, turnId, ...note.params } });
-      return send({ method: "turn/completed", params: { threadId, turn: { id: turnId, status: "completed", items: [] } } });
+      send({ method: "turn/completed", params: { threadId, turn: { id: turnId, status: "completed", items: [] } } });
+      // FAKE_CODEX_LATE_COMMAND: a background command the turn started reports
+      // its end after the turn's (#oar-raft:79368d4d), outside any turn.
+      if (process.env.FAKE_CODEX_LATE_COMMAND) send({ method: "item/completed", params: { threadId, turnId, item: { type: "commandExecution", id: "late-" + turnId, command: "/bin/bash -lc 'sleep 5 &'", status: "completed", exitCode: 0, aggregatedOutput: "" } } });
+      return;
     }
+    case "thread/queue/add":
+      // Codex's own in-memory queue: the input runs after the turn that is running, if any.
+      return send({ id: message.id, result: {} });
     default:
       return send({ id: message.id, error: { code: -32601, message: "method not found: " + message.method } });
   }
@@ -126,6 +133,7 @@ function installFakeCodex(): FakeCodex {
     CODEX_HOME: process.env.CODEX_HOME,
     FAKE_CODEX_LOG: process.env.FAKE_CODEX_LOG,
     FAKE_CODEX_TURN: process.env.FAKE_CODEX_TURN,
+    FAKE_CODEX_LATE_COMMAND: process.env.FAKE_CODEX_LATE_COMMAND,
     OAR_CODEX_SANDBOX: process.env.OAR_CODEX_SANDBOX,
   };
   process.env.PATH = `${binDir}${path.delimiter}${previous.PATH ?? ""}`;
@@ -166,52 +174,10 @@ const config: AgentConfig = {
   authToken: "",
 };
 
-/** The standing prompt the driver builds for this agent, which both hosts send. */
+/** The standing prompt the driver builds for this agent. */
 function standingPrompt(fake: FakeCodex, agentConfig: AgentConfig = config): string {
   const runtimeConfig = { ...agentConfig, runtimeContext: { agentId: "agent-1", workspacePath: fake.workDir } };
   return String(new CodexDriver().buildSystemPrompt(runtimeConfig, "agent-1"));
-}
-
-/** The legacy driver's own launch, up to the thread it announces. */
-async function legacyThread(fake: FakeCodex, agentConfig: AgentConfig = config): Promise<string> {
-  const driver = new CodexDriver();
-  const ctx: SpawnContext = {
-    agentId: "agent-1",
-    config: agentConfig,
-    standingPrompt: standingPrompt(fake, agentConfig),
-    prompt: "first input",
-    workingDirectory: fake.workDir,
-    slockCliPath: process.execPath,
-    daemonApiKey: "sk_machine_test",
-    slockHome: fake.slockHome,
-    launchId: "launch-legacy",
-  };
-  const { process: child } = await driver.spawn(ctx);
-  try {
-    return await new Promise<string>((resolve, reject) => {
-      let buffer = "";
-      const timer = setTimeout(() => reject(new Error("legacy codex thread never started")), 10_000);
-      child.stdout!.on("data", (chunk: Buffer) => {
-        buffer += chunk.toString("utf8");
-        for (let newline = buffer.indexOf("\n"); newline >= 0; newline = buffer.indexOf("\n")) {
-          const line = buffer.slice(0, newline);
-          buffer = buffer.slice(newline + 1);
-          for (const event of driver.parseLine(line) as ParsedEvent[]) {
-            if (event.kind === "session_init") {
-              clearTimeout(timer);
-              resolve(event.sessionId);
-            }
-          }
-        }
-      });
-    });
-  } finally {
-    const exited = child.exitCode !== null || child.signalCode !== null
-      ? Promise.resolve()
-      : new Promise<void>((resolve) => child.once("exit", () => resolve()));
-    child.kill("SIGKILL");
-    await exited;
-  }
 }
 
 /** The fake's log entries for `method` past the first `from` entries, once there is at least one. */
@@ -225,7 +191,7 @@ async function waitForLogged(fake: FakeCodex, method: string, from: number, time
   }
 }
 
-function hostFor(fake: FakeCodex, frames: MachineToServerMessage[]): OarAgentHost {
+function hostFor(fake: FakeCodex, frames: MachineToServerMessage[], overrides: Partial<OarAgentHostDeps> = {}): OarAgentHost {
   return new OarAgentHost({
     dataDir: path.dirname(fake.workDir),
     serverUrl: "http://localhost:3001",
@@ -242,6 +208,7 @@ function hostFor(fake: FakeCodex, frames: MachineToServerMessage[]): OarAgentHos
     recordEvent: () => {},
     fetchImpl: async () => new Response(null, { status: 204 }),
     platform: "linux",
+    ...overrides,
   });
 }
 
@@ -267,44 +234,7 @@ function threadFacts(params: Record<string, unknown>) {
   };
 }
 
-test("the OAR host resumes the thread the legacy codex driver started, and says the same about it", async () => {
-  const fake = installFakeCodex();
-  const frames: MachineToServerMessage[] = [];
-  const host = hostFor(fake, frames);
-  try {
-    const threadId = await legacyThread(fake);
-    assert.match(threadId, /^thread-0-/);
-    const legacyStart = fake.log().find((entry) => entry.method === "thread/start")!;
-    const legacyEntries = fake.log().length;
-
-    assert.deepEqual(await host.start(startRequest(threadId)), { kind: "started" });
-    assert.equal(host.getAgentSessionId("agent-1"), threadId);
-    const turns = await waitForLogged(fake, "turn/start", legacyEntries);
-    const oar = fake.log().slice(legacyEntries);
-    assert.deepEqual(oar.filter((entry) => entry.method === "thread/start"), [], "no fresh thread");
-    const resume = oar.find((entry) => entry.method === "thread/resume")!;
-    assert.equal(resume.params.threadId, threadId);
-    assert.equal(turns.at(-1)!.params.threadId, threadId);
-
-    // The same thread facts as the legacy driver's start: cwd, model, approvals,
-    // the standing prompt as developer instructions and never base instructions.
-    assert.deepEqual(threadFacts(resume.params), threadFacts(legacyStart.params));
-    assert.equal(resume.params.developerInstructions, standingPrompt(fake));
-    assert.equal(resume.params.baseInstructions, undefined);
-    // An explicit tier: OAR's "default" where the driver sends null (#11175).
-    assert.equal(legacyStart.params.serviceTier, null);
-    assert.equal(resume.params.serviceTier, "default");
-    // The sandbox: the driver's thread params, OAR's launch override.
-    assert.equal(legacyStart.params.sandbox, "danger-full-access");
-    assert.ok(resume.argv.join(" ").includes('sandbox_mode="danger-full-access"'), resume.argv.join(" "));
-    assert.ok(frames.some((frame) => frame.type === "agent:process_spawned"), frames.map((frame) => frame.type).join(","));
-  } finally {
-    await host.stopAll();
-    fake.restore();
-  }
-});
-
-test("the legacy codex driver resumes a thread the OAR host started", async () => {
+test("the OAR host resumes a thread it started across restarts with the same thread facts", async () => {
   const fake = installFakeCodex();
   const frames: MachineToServerMessage[] = [];
   const host = hostFor(fake, frames);
@@ -313,17 +243,28 @@ test("the legacy codex driver resumes a thread the OAR host started", async () =
     const oarStart = (await waitForLogged(fake, "thread/start", 0))[0]!;
     const threadId = host.getAgentSessionId("agent-1");
     assert.ok(threadId, "the OAR host reports the new thread");
+    assert.match(threadId, /^thread-0-/);
     assert.equal(oarStart.params.developerInstructions, standingPrompt(fake));
     assert.equal(oarStart.params.baseInstructions, undefined);
+    assert.equal(oarStart.params.approvalPolicy, "never");
+    assert.equal(oarStart.params.serviceTier, "default");
+    assert.ok(oarStart.argv.join(" ").includes('sandbox_mode="danger-full-access"'), oarStart.argv.join(" "));
     await host.stopAll();
 
-    const oarEntries = fake.log().length;
-    assert.equal(await legacyThread(fake, { ...config, sessionId: threadId }), threadId);
-    const legacy = fake.log().slice(oarEntries);
-    assert.deepEqual(legacy.filter((entry) => entry.method === "thread/start"), [], "no fresh thread");
-    const resume = legacy.find((entry) => entry.method === "thread/resume")!;
+    const firstRunEntries = fake.log().length;
+    assert.deepEqual(await host.start(startRequest(threadId)), { kind: "started" });
+    assert.equal(host.getAgentSessionId("agent-1"), threadId);
+    const turns = await waitForLogged(fake, "turn/start", firstRunEntries);
+    const resumed = fake.log().slice(firstRunEntries);
+    assert.deepEqual(resumed.filter((entry) => entry.method === "thread/start"), [], "no fresh thread");
+    const resume = resumed.find((entry) => entry.method === "thread/resume")!;
     assert.equal(resume.params.threadId, threadId);
+    assert.equal(turns.at(-1)!.params.threadId, threadId);
+
     assert.deepEqual(threadFacts(resume.params), threadFacts(oarStart.params));
+    assert.equal(resume.params.serviceTier, "default");
+    assert.ok(resume.argv.join(" ").includes('sandbox_mode="danger-full-access"'), resume.argv.join(" "));
+    assert.ok(frames.some((frame) => frame.type === "agent:process_spawned"), frames.map((frame) => frame.type).join(","));
   } finally {
     await host.stopAll();
     fake.restore();
@@ -336,12 +277,16 @@ test("fast mode opens on OAR: it asks for codex's own tier id, which codex repor
   const host = hostFor(fake, frames);
   const fast: AgentConfig = { ...config, runtimeConfig: { version: 1, runtime: "codex", model: { kind: "preset", id: "gpt-5.5" }, mode: { kind: "fast" } } } as AgentConfig;
   try {
-    const threadId = await legacyThread(fake, fast);
-    const legacyStart = fake.log().find((entry) => entry.method === "thread/start")!;
-    assert.equal(legacyStart.params.serviceTier, "fast");
-    const legacyEntries = fake.log().length;
+    assert.deepEqual(await host.start(startRequest(null, fast)), { kind: "started" });
+    const start = (await waitForLogged(fake, "thread/start", 0))[0]!;
+    assert.equal(start.params.serviceTier, "priority");
+    const threadId = host.getAgentSessionId("agent-1");
+    assert.ok(threadId);
+    await host.stopAll();
+
+    const firstEntries = fake.log().length;
     assert.deepEqual(await host.start(startRequest(threadId, fast)), { kind: "started" });
-    const resume = (await waitForLogged(fake, "thread/resume", legacyEntries))[0]!;
+    const resume = (await waitForLogged(fake, "thread/resume", firstEntries))[0]!;
     assert.equal(resume.params.serviceTier, "priority");
   } finally {
     await host.stopAll();
@@ -386,7 +331,7 @@ const SCRIPTED_TURN = [
   { method: "item/completed", params: { item: { type: "agentMessage", id: "msg-f", phase: "final_answer", text: "All done." } } },
 ];
 
-test("a Codex turn shows the same tool rows, text and warnings on the OAR host as the legacy driver reports", async () => {
+test("a Codex turn shows the expected tool rows, text and warnings on the OAR host", async () => {
   const fake = installFakeCodex();
   const turnPath = path.join(fake.root, "turn.json");
   writeFileSync(turnPath, JSON.stringify(SCRIPTED_TURN));
@@ -394,17 +339,14 @@ test("a Codex turn shows the same tool rows, text and warnings on the OAR host a
   const frames: MachineToServerMessage[] = [];
   const host = hostFor(fake, frames);
   try {
-    // The legacy driver's reading of the same notifications.
-    const normalizer = new CodexEventNormalizer();
-    normalizer.reset({ threadId: "thread-x" });
-    const legacy = [
-      { method: "turn/started", params: { threadId: "thread-x", turn: { id: "turn-1" } } },
-      ...SCRIPTED_TURN.map((note) => ({ method: note.method, params: { threadId: "thread-x", turnId: "turn-1", ...note.params } })),
-    ].flatMap((note) => normalizer.normalizeMessage(note).events);
-    const legacyTools = legacy.flatMap((event) => event.kind === "tool_call" ? [[normalizeToolDisplayInvocation(event.name, event.input).toolName, event.callId]] : []);
-    const legacyEnds = legacy.flatMap((event) => event.kind === "tool_output" ? [event.callId] : []);
-    const legacyText = legacy.flatMap((event) => event.kind === "text" ? [event.text] : []);
-    assert.deepEqual(legacyTools.map(([name]) => name).slice(1), ["mcp_github_create_issue", "file_change", "file_change"]);
+    const expectedShellTool = normalizeToolDisplayInvocation("shell", { command: "/bin/bash -lc 'ls -la'" }).toolName;
+    const expectedTools: [string, string][] = [
+      [expectedShellTool, "cmd-1"],
+      ["mcp_github_create_issue", "mcp-1"],
+      ["file_change", "fc-1:0"],
+      ["file_change", "fc-1:1"],
+    ];
+    const expectedEnds = ["cmd-1", "mcp-1", "fc-1:0", "fc-1:1"];
 
     assert.deepEqual(await host.start(startRequest(null)), { kind: "started" });
     const entries = () => frames.flatMap((frame) => frame.type === "agent:activity" ? frame.entries ?? [] : []);
@@ -416,13 +358,12 @@ test("a Codex turn shows the same tool rows, text and warnings on the OAR host a
     const oarTools = entries().flatMap((entry) => entry.kind === "tool_start" ? [[entry.toolName, entry.callId]] : []);
     const oarEnds = entries().flatMap((entry) => entry.kind === "status" && entry.detailKind === "tool_end" ? [entry.tool] : []);
     const oarText = entries().flatMap((entry) => entry.kind === "text" ? [entry.text] : []);
-    assert.deepEqual(oarTools, legacyTools);
-    assert.deepEqual(oarEnds.map((tool) => tool?.callId), legacyEnds);
-    // What the legacy driver does not say: the command ran (ok) and exited 2.
+    assert.deepEqual(oarTools, expectedTools);
+    assert.deepEqual(oarEnds.map((tool) => tool?.callId), expectedEnds);
+    // The command ran (ok) and exited 2.
     assert.equal(oarEnds[0]?.exitCode, 2);
     assert.equal(oarEnds[0]?.ok, true);
-    // Commentary stays out on both.
-    assert.deepEqual(oarText, legacyText);
+    // Commentary stays out; only final_answer is shown.
     assert.deepEqual(oarText, ["All done."]);
     assert.ok(entries().some((entry) => entry.kind === "system" && entry.title === "Codex config warning" && entry.text.includes("Path: /c/config.toml")), JSON.stringify(entries()));
 
@@ -435,7 +376,7 @@ test("a Codex turn shows the same tool rows, text and warnings on the OAR host a
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     const second = entries().slice(firstTurn);
-    assert.deepEqual(second.flatMap((entry) => entry.kind === "tool_start" ? [[entry.toolName, entry.callId]] : []), legacyTools);
+    assert.deepEqual(second.flatMap((entry) => entry.kind === "tool_start" ? [[entry.toolName, entry.callId]] : []), expectedTools);
     assert.deepEqual(second.flatMap((entry) => entry.kind === "text" ? [entry.text] : []), ["All done."]);
   } finally {
     await host.stopAll();
@@ -464,6 +405,77 @@ test("a Codex turn whose final answer is blank says so on the OAR host", async (
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     assert.deepEqual(entries().filter((entry) => entry.kind === "text"), []);
+  } finally {
+    await host.stopAll();
+    fake.restore();
+  }
+});
+
+/** Polls `read` until it yields a value. */
+async function until<T>(what: string, read: () => T | undefined, timeoutMs = 10_000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = read();
+    if (value !== undefined) return value;
+    if (Date.now() > deadline) assert.fail(`never: ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+/** The frame of a background command's end that codex reported after its turn's (`late-<turn>`). */
+function isLateCommandEnd(record: RawEvent, turnId: string): boolean {
+  if (record.kind !== "frame" || record.body.type !== "item/completed") return false;
+  const native = record.body.native as { item?: { id?: unknown } } | undefined;
+  return native?.item?.id === `late-${turnId}`;
+}
+
+/**
+ * #oar-raft:79368d4d, on OAR's real codex runtime: the first turn ends, then
+ * a background command it started reports its end (`item/completed` past
+ * `turn/completed`), which OAR sees as a root `tool_call_ended`. Before OAR
+ * 0.111 its status then read running with no turn, and a status-led delivery
+ * steered into nothing and landed in codex's in-memory queue (the daemon
+ * prompted first to get around it). From 0.111 the status stays idle (OAR
+ * #838), so the ordinary status-led delivery starts a turn.
+ */
+test("a Codex delivery after a background command ended past its turn starts a turn: OAR's status stays idle (#oar-raft:79368d4d)", async () => {
+  const fake = installFakeCodex();
+  process.env.FAKE_CODEX_LATE_COMMAND = "1";
+  const frames: MachineToServerMessage[] = [];
+  const events: Array<{ name: string; attrs: Record<string, unknown> }> = [];
+  const sessions: Session[] = [];
+  const host = hostFor(fake, frames, {
+    recordEvent: (name, attrs) => { events.push({ name, attrs }); },
+    prepareLaunch: async (ctx) => {
+      const launch = await prepareCodexOarLaunch(ctx);
+      assert.equal(launch.promptFirst, undefined, "the codex launch delivers by OAR's status");
+      return launch;
+    },
+    openSession: async (launch) => {
+      const session = await (await loadOarSessionRuntime(launch.runtimeId)).session(launch.installation, launch.options);
+      sessions.push(session);
+      return session;
+    },
+  });
+  try {
+    assert.deepEqual(await host.start(startRequest(null)), { kind: "started" });
+    const session = await until("the first turn's late command end", () => sessions[0]?.records().some((record) => isLateCommandEnd(record, "turn-1")) ? sessions[0] : undefined);
+    assert.equal(session.status().value.kind, "idle", "OAR's status adopts no turn from the late tool_call_ended");
+    assert.equal(fake.log().filter((entry) => entry.method === "turn/start").length, 1);
+
+    const codexFrom = fake.log().length;
+    const eventsFrom = events.length;
+    assert.equal(await host.deliverMessage("agent-1", { ...exampleMessage, message_id: "m-after-late-command" }, { deliveryId: "d-after-late-command" }), true);
+    // Traced once the runtime answered: whatever codex was asked is in its log by then.
+    const delivery = await until("a delivery outcome", () => events.slice(eventsFrom).find((event) => event.name === "daemon.agent.oar.delivery" && event.attrs.outcome !== undefined));
+    assert.equal(delivery.attrs.outcome, "prompted");
+    const codex = fake.log().slice(codexFrom);
+    const methods = codex.map((entry) => entry.method);
+    assert.ok(!methods.includes("turn/steer"), methods.join(","));
+    assert.ok(!methods.includes("thread/queue/add"), methods.join(","));
+    const turns = codex.filter((entry) => entry.method === "turn/start");
+    assert.equal(turns.length, 1, methods.join(","));
+    assert.ok(JSON.stringify(turns[0]!.params.input).includes(exampleMessage.content), JSON.stringify(turns[0]!.params.input));
   } finally {
     await host.stopAll();
     fake.restore();

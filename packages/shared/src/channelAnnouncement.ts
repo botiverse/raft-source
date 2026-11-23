@@ -146,6 +146,34 @@ export function channelAnnouncementPushForbiddenText(channel: string, style: "cl
 }
 
 /**
+ * A push refused because the Artifact is the announcement of a joint (shared)
+ * channel the pusher's server has no copy of
+ * (CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN_ELSEWHERE): no channel the pusher can
+ * name, and no admin the pusher can reach: the step is a copy pushed into a
+ * conversation of the pusher's own server (by its title when it has one a
+ * command can quote), and who can push this one.
+ */
+export function channelAnnouncementElsewherePushForbiddenText(title?: string, style: "cli" | "tool" = "cli"): { message: string; nextAction: string } {
+  const quotedTitle = title && !/["\\`$\r\n]/.test(title) ? title : "<title>";
+  const who = "Only an admin of that shared channel on a server that still has a copy can push this one; tell whoever asked for the change.";
+  return {
+    message: "This artifact is the announcement of a shared channel your server has no copy of, so you can't push a new version. Nothing was pushed.",
+    nextAction: style === "cli"
+      ? `Copy this folder to a new directory and push that: raft artifact push <new dir> --target "#channel-name" --title "${quotedTitle}". ${who}`
+      : `Push your change as a new artifact homed in a conversation on your server. ${who}`,
+  };
+}
+
+/**
+ * A person's change refused because the Artifact is the announcement of a
+ * shared channel their server has no copy of: nobody on their server can
+ * change it, so there is no step.
+ */
+export function channelAnnouncementElsewhereChangeForbiddenText(): { message: string } {
+  return { message: "This artifact is the announcement of a shared channel your server has no copy of, so it can't be changed from your server. Nothing was changed." };
+}
+
+/**
  * A person's change refused for the same reason (the web's rename of the
  * announcement Artifact; CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN).
  */

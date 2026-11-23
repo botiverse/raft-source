@@ -1,6 +1,7 @@
 import { composerGeneratedPinyin } from "../generated/composerPinyinData";
 
-const COMPOSER_SUGGESTION_MAX_RESULTS = 30;
+export const COMPOSER_SUGGESTION_MAX_RESULTS = 30;
+const MAX_PREPARED_FIELD_CACHE_SIZE = 4096;
 
 export interface ComposerSuggestionSearchField {
   raw: string;
@@ -14,8 +15,8 @@ export interface ComposerSuggestionSearchEntry<T> {
   /**
    * Ranked within a match band, lowest first (absent is 0; see `matchBand`): among the strong
    * matches a lower tier comes first, but an exact name always leads and a loose fuzzy match
-   * always trails. Search uses it so an archived channel never goes above a live one on a
-   * comparable match (searchEntities `SEARCH_ENTITY_TIER`).
+   * always trails. (Global search no longer sets it: the server ranks channels and people by
+   * their status, docs/contracts/web-search.md.)
    */
   tier?: number;
 }
@@ -162,16 +163,48 @@ function buildComposerSuggestionQueryKey(query: string): ComposerSuggestionQuery
   };
 }
 
+interface PreparedComposerSearchField {
+  rawLowercase: string;
+  normalized: ComposerNormalizedSearchText;
+  pinyinFull: string;
+  pinyinInitials: string;
+  isEmpty: boolean;
+}
+
+const preparedFieldCache = new Map<string, PreparedComposerSearchField>();
+
+function prepareComposerSearchField(raw: string): PreparedComposerSearchField {
+  const cached = preparedFieldCache.get(raw);
+  if (cached) return cached;
+
+  const rawLowercase = raw.toLowerCase();
+  const normalized = normalizeComposerSearchText(raw);
+  const pinyinFull = toComposerPinyinFull(raw);
+  const pinyinInitials = toComposerPinyinInitials(raw);
+  const prepared: PreparedComposerSearchField = {
+    rawLowercase,
+    normalized,
+    pinyinFull,
+    pinyinInitials,
+    isEmpty: !normalized.compact && !pinyinFull && !pinyinInitials,
+  };
+
+  if (preparedFieldCache.size >= MAX_PREPARED_FIELD_CACHE_SIZE) {
+    const oldestKey = preparedFieldCache.keys().next().value;
+    if (oldestKey !== undefined) preparedFieldCache.delete(oldestKey);
+  }
+  preparedFieldCache.set(raw, prepared);
+  return prepared;
+}
+
 function scoreComposerSuggestionField(
   field: ComposerSuggestionSearchField,
   query: ComposerSuggestionQueryKey,
 ): ComposerSuggestionScore | null {
-  const rawLowercase = field.raw.toLowerCase();
-  const normalized = normalizeComposerSearchText(field.raw);
-  const pinyinFull = toComposerPinyinFull(field.raw);
-  const pinyinInitials = toComposerPinyinInitials(field.raw);
+  if (!field.raw) return null;
+  const { rawLowercase, normalized, pinyinFull, pinyinInitials, isEmpty } = prepareComposerSearchField(field.raw);
 
-  if (!normalized.compact && !pinyinFull && !pinyinInitials) return null;
+  if (isEmpty) return null;
 
   return exactScore(field, query, normalized, pinyinFull)
     ?? prefixScore(field, query, normalized)
@@ -348,7 +381,7 @@ function isComposerSearchTokenChar(char: string): boolean {
 }
 
 function isLetterOrDigit(char: string): boolean {
-  return /^\p{L}$|^\p{N}$/u.test(char);
+  return isAsciiLetterOrDigit(char) || /^\p{L}$|^\p{N}$/u.test(char);
 }
 
 function isAsciiLetterOrDigit(char: string): boolean {

@@ -44,7 +44,7 @@ const WRITERS: Record<string, string> = {
   "services/externalInviteConnectService.ts#connectJointChannel#channelExternalInvites": "covered:yourServersJoint",
   "services/externalInviteConnectService.ts#reserveConnection#channelExternalInvites": "covered:yourServersPrivate",
   // Also run by yourServersPrivate (reserveConnection), users-first too.
-  "services/channelConversionService.ts#startChannelToJointConversion#channelConversionJobs": "covered:convertToJoint",
+  "services/channelConversionService.ts#startConversionInTransaction#channelConversionJobs": "covered:convertToJoint",
   "services/externalInviteConnectService.ts#selfConnectInTransaction#channelExternalInvites": "covered:selfConnect",
   "services/externalInviteConnectService.ts#reopenEndedOwnSource#jointChannelAdmissions": "covered:yourServersJoint",
   "services/externalInviteConnectService.ts#createApprovalRequests#channelServerConnectRequests": "covered:requestApproval",
@@ -120,7 +120,7 @@ const WRITERS: Record<string, string> = {
   "services/externalInboundWorkerService.ts#resolveTargetChannel#jointChannelServers": "exempt: an external thread's structural copy (inbound worker); names no user",
   "services/channelConversionPhaseContext.ts#advance#channelConversionJobs": "exempt: the conversion worker's progress; names no user",
   "services/channelConversionPreparation.ts#prepare#jointChannelServers": "exempt: the conversion worker's structural copies; names no user",
-  "services/channelConversionPreparation.ts#prepareThreads#jointChannelServers": "exempt: the conversion worker's structural copies; names no user",
+  "services/channelConversionPreparation.ts#prepareCanonicalThreads#jointChannelServers": "exempt: the conversion's structural copies (worker phase or online-move start); names no user",
   "services/channelConversionPreparation.ts#prepareTaskConversationProjections#jointChannelServers": "exempt: the conversion worker's structural copies; names no user",
   "services/channelConversionService.ts#rollbackConversionToSource#jointChannelServers": "exempt: the conversion worker's rollback; names no user",
   "services/channelConversionService.ts#markJobFailed#channelConversionJobs": "exempt: the conversion worker's job state; names no user",

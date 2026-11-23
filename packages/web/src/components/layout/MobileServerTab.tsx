@@ -5,7 +5,7 @@ import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-
 import { CSS } from "@dnd-kit/utilities";
 import { useIntl } from "react-intl";
 import { useLocation } from "react-router-dom";
-import { Blocks, Monitor, Plus, Settings, UserPlus, Users } from "lucide-react";
+import { Blocks, Bookmark, Monitor, Plus, Settings, UserPlus, Users } from "lucide-react";
 import { AvatarBadge, MobileNavLabel, PopoverSeparator, Status } from "@botiverse/raft-ui";
 import { ArtifactIcon } from "@botiverse/ricons";
 import type { AvatarBadgeOffset } from "@botiverse/raft-ui";
@@ -26,7 +26,8 @@ import { trackNavEntrySelected } from "../../analytics/navigation";
 import { markComputerAttentionSeenNow } from "../../hooks/useComputerAttentionDot";
 import { useAppNavigate } from "../../hooks/useAppNavigate";
 import { NonTouchPointerSensor, SORTABLE_KEYBOARD_SENSOR_OPTIONS } from "../../lib/dndSensors";
-import { tabHomeFor, useMobileNavStore } from "../../store/mobileNavStore";
+import { useMobileNavStore } from "../../store/mobileNavStore";
+import { placeFor } from "../../hooks/placeMemory";
 import type { MobileTabId } from "../../store/mobileNavStore";
 import { useServerStore } from "../../store/serverStore";
 import type { Server } from "../../store/serverStore";
@@ -56,7 +57,8 @@ import { useShellPending } from "./shellPending";
 //  3. the server's own pages, Artifacts (where the rail has it, guests
 //     included: #proj-workspace:#203), Members, Computers, Apps and Settings,
 //     in one row of equal buttons, each a pushed page with Back (guests have
-//     no Members, Computers or Apps).
+//     no Members, Computers or Apps, and get Saved in their place, since
+//     they have no Home list to hold it: #triage:#551).
 // Switching keeps the current tab, and coming back from one of the server's
 // pages gives focus back to this tab.
 
@@ -182,17 +184,18 @@ export function MobileServerTab({ mobileTab }: { mobileTab: MobileTabId | null }
   }, []);
 
   // Switching keeps the tab: Activity in one server goes to Activity in the
-  // next, so people go on with the same thing there.
+  // next, so people go on with the same thing there, as that tab left it there.
   const tab = mobileTab ?? "chat";
   const handleSelectServer = useCallback((selected: Server) => {
-    selectServer(selected, tabHomeFor(tab, `/s/${selected.slug}`));
+    selectServer(selected, placeFor(selected.slug, tab, { phone: true }));
   }, [selectServer, tab]);
 
-  const openServerPage = useCallback((page: "artifacts" | "members" | "computers" | "apps" | "settings") => {
+  const openServerPage = useCallback((page: "artifacts" | "saved" | "members" | "computers" | "apps" | "settings") => {
     trackNavEntrySelected(page, "mobile_more", false);
     useMobileNavStore.getState().requestServerTabFocus(locationKey);
     setOpen(false);
     if (page === "artifacts") nav.toArtifacts();
+    else if (page === "saved") nav.toSaved();
     else if (page === "members") nav.toMembers();
     else if (page === "computers") {
       // Opening Computers sees every computer's current attention state.
@@ -202,6 +205,7 @@ export function MobileServerTab({ mobileTab }: { mobileTab: MobileTabId | null }
     else nav.toSettings();
   }, [locationKey, nav]);
   const openArtifacts = useCallback(() => openServerPage("artifacts"), [openServerPage]);
+  const openSaved = useCallback(() => openServerPage("saved"), [openServerPage]);
   const openMembers = useCallback(() => openServerPage("members"), [openServerPage]);
   const openComputers = useCallback(() => openServerPage("computers"), [openServerPage]);
   const openApps = useCallback(() => openServerPage("apps"), [openServerPage]);
@@ -304,7 +308,14 @@ export function MobileServerTab({ mobileTab }: { mobileTab: MobileTabId | null }
                 <span>{formatMessage({ id: "layout.leftRail.tabArtifacts" })}</span>
               </MobileNavServerPopoverDestination>
             ) : null}
-            {isGuest ? null : (
+            {/* A Guest has no Home list, where a member's Saved row is: its
+                Saved list opens from here (#triage:#551), a pushed page with Back. */}
+            {isGuest ? (
+              <MobileNavServerPopoverDestination data-testid="mobile-server-tab-saved" onClick={openSaved}>
+                <Bookmark />
+                <span>{formatMessage({ id: "layout.sidebar.saved" })}</span>
+              </MobileNavServerPopoverDestination>
+            ) : (
               <>
                 <MobileNavServerPopoverDestination data-testid="mobile-server-tab-members" onClick={openMembers}>
                   <Users />

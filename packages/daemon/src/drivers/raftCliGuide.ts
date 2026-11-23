@@ -17,6 +17,7 @@ export {
   enabledFirstPartyAppGuideEntries,
   renderFirstPartyAppCommandEntries,
   CONTEXT_COMMANDS_ENTRY,
+  PROC_COMMANDS_ENTRY,
   type FirstPartyAppGuideEntry,
   type BuildRaftCliGuideSectionsOptions,
   type MentionsIdentity,

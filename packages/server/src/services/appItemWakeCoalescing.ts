@@ -11,23 +11,72 @@
 // the push already share, so the wake and `inbox check` can't disagree on
 // what one item is (Remy). Only on servers with inbox items on: elsewhere
 // every event is its own notice, as before.
+//
+// Only a recent wake holds the item (#wg-ax:#35, Tenny): an event merges
+// only while the item's last wake (an unread event that was not itself
+// merged) is less than APP_ITEM_WAKE_COALESCE_WINDOW_MS old. Agents that deal
+// with a notice in the app itself (reply in the doc) never read the item, so
+// it stayed unread and every later ask on it was silenced. Merged events
+// left unread never hold it either: they woke no one.
+//
+// Only for an agent whose `raft` CLI lists app items in its inbox
+// (agentCliInboxItems, #proj-apps:#88): a merged event is never pushed, so
+// an agent whose CLI can't show it would never see it. Any other agent gets
+// a wake for every event, as before inbox items.
 
 import { and, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import { thirdPartyAgentEvents } from "../db/schema";
+import { agentCliInboxItemsState } from "./agentCliInboxItems";
 import { appEventInboxItemTarget, inboxItemsEnabled, inboxItemsLaunch } from "./inboxItemsLaunch";
 import { claimQueuedThirdPartyAgentEventForDelivery, listPendingThirdPartyAgentEventMessages, releaseThirdPartyAgentEventDeliveryClaim } from "./oauthService";
 import type { AgentOrchestrator } from "./agentOrchestrator";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
 
+/** How long after an item's last wake later events on it are merged into that wake. */
+export const APP_ITEM_WAKE_COALESCE_WINDOW_MS = 2 * 60_000;
+
 type CoalescibleEvent = Pick<typeof thirdPartyAgentEvents.$inferSelect,
   "id" | "serverId" | "agentId" | "clientId" | "systemApp" | "objectRef" | "createdAt">;
 
+/** Why an App's `delivery: "inbox"` event can't be held without a wake. */
+export type InboxOnlyDeliveryUnavailable =
+  /** The server has no app inbox items (flag off, or before the launch). */
+  | "server"
+  /** The agent's CLI said it can't list app inbox items (#proj-apps:#88). */
+  | "agent_cli_old"
+  /** No recent answer from the agent's CLI where it runs now: its Computer and daemon version, or within 24 h for an agent on no Computer (#proj-apps:#88). */
+  | "agent_cli_unknown";
+
 /**
- * Whether `event` joins an item that already has unread events and so wakes
- * no one. When it does, marks it (`wake_coalesced_at`) so no re-delivery
- * wakes for it either. Only an earlier unread event of the item counts: of
- * two events arriving together, the first still wakes. `appKey` is the
+ * Whether an App's `delivery: "inbox"` event (dm:@Remy:#1) can be held in the
+ * agent's inbox without a wake: only where it becomes an inbox item the agent
+ * lists with `raft inbox check` (inbox items on for the server, an event from
+ * the launch's app-events start on) and the agent's CLI shows such items
+ * (agentCliListsAppInboxItems). Elsewhere one never pushed would never be
+ * seen: the caller wakes as usual and says why. Null: it can.
+ */
+export async function inboxOnlyDeliveryUnavailable(
+  serverId: string,
+  agentId: string,
+  appKey: string,
+  objectRef: string | null,
+  now: Date = new Date(),
+): Promise<InboxOnlyDeliveryUnavailable | null> {
+  if (!await inboxItemsEnabled(serverId)) return "server";
+  const launch = inboxItemsLaunch();
+  if (!launch || appEventInboxItemTarget({ createdAt: now, systemApp: null, objectRef }, appKey, launch) === null) return "server";
+  const cli = await agentCliInboxItemsState(agentId);
+  return cli === "lists" ? null : cli === "old_cli" ? "agent_cli_old" : "agent_cli_unknown";
+}
+
+/**
+ * Whether `event` joins an item whose last wake is unread and recent, and so
+ * wakes no one; never for an agent whose CLI doesn't list app inbox items
+ * (agentCliInboxItemsState is not `lists`). When it does, marks it (`wake_coalesced_at`) so no re-delivery
+ * wakes for it either. Only an earlier unread event of the item that was not
+ * merged itself, created at most APP_ITEM_WAKE_COALESCE_WINDOW_MS before
+ * `event`, counts: of two events arriving together, the first still wakes. `appKey` is the
  * event's app key (the OAuth client key, or its `system.<id>`).
  */
 export async function coalesceWakeIntoUnreadItem(
@@ -49,8 +98,11 @@ export async function coalesceWakeIntoUnreadItem(
       event.objectRef === null ? isNull(thirdPartyAgentEvents.objectRef) : eq(thirdPartyAgentEvents.objectRef, event.objectRef),
       ne(thirdPartyAgentEvents.id, event.id),
       or(eq(thirdPartyAgentEvents.status, "queued"), eq(thirdPartyAgentEvents.status, "delivering")),
+      // A wake, not an event merged into one.
+      isNull(thirdPartyAgentEvents.wakeCoalescedAt),
       gt(thirdPartyAgentEvents.expiresAt, now),
       gte(thirdPartyAgentEvents.createdAt, launch.appEventsFrom),
+      gte(thirdPartyAgentEvents.createdAt, new Date(event.createdAt.getTime() - APP_ITEM_WAKE_COALESCE_WINDOW_MS)),
       or(
         lt(thirdPartyAgentEvents.createdAt, event.createdAt),
         and(eq(thirdPartyAgentEvents.createdAt, event.createdAt), sql`${thirdPartyAgentEvents.id} < ${event.id}`),
@@ -58,6 +110,8 @@ export async function coalesceWakeIntoUnreadItem(
     ))
     .limit(1);
   if (!earlier) return false;
+  // Checked last: one agents read, only when the event would merge.
+  if (await agentCliInboxItemsState(event.agentId, { now }) !== "lists") return false;
   await db.update(thirdPartyAgentEvents)
     .set({ wakeCoalescedAt: now, updatedAt: now })
     .where(and(eq(thirdPartyAgentEvents.id, event.id), isNull(thirdPartyAgentEvents.wakeCoalescedAt)));
@@ -126,6 +180,8 @@ export async function wakeForEventsMergedSinceHandover(
       .where(and(
         sameItem,
         isNotNull(thirdPartyAgentEvents.wakeCoalescedAt),
+        // Merged into a wake, not sent to wake no one (`delivery: "inbox"`).
+        eq(thirdPartyAgentEvents.delivery, "wake"),
         eq(thirdPartyAgentEvents.status, "queued"),
         gt(thirdPartyAgentEvents.expiresAt, now),
         gt(thirdPartyAgentEvents.createdAt, since),

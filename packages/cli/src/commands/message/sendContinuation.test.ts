@@ -496,15 +496,17 @@ test("JSON, reviewer isolation and --send-draft keep the draft flow with the pil
   assert.equal(spansNamed("cli.continuation.created").length, 0);
 });
 
-test("a codex agent keeps the draft flow with the pilot on: it reads exit 10 as a failure (#wg-ax:#5)", async () => {
-  const server = fakeServer(["held"]);
-  const run = await runRaft(["message", "send", "--target", TARGET], server, { stdin: `${PRIVATE.body}\n`, runtime: "codex" });
-  assert.equal(run.exitCode, 1);
-  assert.equal(server.contextReads, 0, "the runtime decides before the flag is read");
-  assert.match(run.stderr, /SEND_HELD_AS_DRAFT/);
-  assert.equal(getSavedDraft(agentId, TARGET)?.content, `${PRIVATE.body}\n`, "the message survives as a draft");
-  assert.equal(spansNamed("cli.continuation.created").length, 0);
-});
+for (const runtime of ["codex", "builtin"]) {
+  test(`a ${runtime} agent keeps the draft flow with the pilot on: only Claude answers the pause reliably (#wg-ax:#5)`, async () => {
+    const server = fakeServer(["held"]);
+    const run = await runRaft(["message", "send", "--target", TARGET], server, { stdin: `${PRIVATE.body}\n`, runtime });
+    assert.equal(run.exitCode, 1);
+    assert.equal(server.contextReads, 0, "the runtime decides before the flag is read");
+    assert.match(run.stderr, /SEND_HELD_AS_DRAFT/);
+    assert.equal(getSavedDraft(agentId, TARGET)?.content, `${PRIVATE.body}\n`, "the message survives as a draft");
+    assert.equal(spansNamed("cli.continuation.created").length, 0);
+  });
+}
 
 test("held for a channel description alone: the question says so, the description is the preview, and anyway is never offered", async () => {
   const card = { id: "c-ops", name: "ops", type: "channel", description: "Release coordination. Post go/no-go here." };

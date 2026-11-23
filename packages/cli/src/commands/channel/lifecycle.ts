@@ -64,7 +64,7 @@ async function runChannelLifecycle(
 export const channelArchiveCommand = defineCommand(
   {
     name: "archive",
-    description: "Archive a public, private, or joint channel when this agent has server admin authority (a joint channel is archived for every connected server)",
+    description: "Archive a public, private, or joint channel, as a channel admin there or with the admin role on this server (a joint channel only from its host server, and it is archived for every connected server)",
     options: [{
       flags: "--target <target>",
       description: "Channel to archive, e.g. '#engineering'",
@@ -76,7 +76,7 @@ export const channelArchiveCommand = defineCommand(
 export const channelUnarchiveCommand = defineCommand(
   {
     name: "unarchive",
-    description: "Unarchive a public, private, or joint channel when this agent has server admin authority",
+    description: "Unarchive a public, private, or joint channel, as a channel admin there or with the admin role on this server (a joint channel only from its host server)",
     options: [{
       flags: "--target <target>",
       description: "Archived channel to restore, e.g. '#engineering'",

@@ -9,7 +9,8 @@
 // revoked items are never visible. For core's
 // own filter (the summaries route) it
 // reports the live items' homes instead (artifactHomes), and the deleted
-// ones' for their deleted cards (deletedArtifactHomes: never a revoked one).
+// ones' for their deleted cards (deletedArtifactHomes: never a revoked one);
+// the links route asks both at once (artifactSight).
 import { and, inArray, isNotNull, isNull, sql, type SQL } from "drizzle-orm";
 import { WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import type { AppObjectHome } from "../../platform/apps";
@@ -24,6 +25,7 @@ import {
   visibleHomesSql,
   type HomeColumns,
   type HomeNarrowing,
+  type HomeRow,
   type ServerViewActor,
   type ViewActor,
 } from "../../platform/visibility";
@@ -178,9 +180,47 @@ export async function artifactHomes(ids: readonly string[]): Promise<ReadonlyMap
  */
 export async function deletedArtifactHomes(ids: readonly string[]): Promise<ReadonlyMap<string, AppObjectHome>> {
   const homes = await homesWhere(ids, and(isNotNull(artifactItems.deletedAt), isNull(artifactItems.revokedAt))!);
-  // A public item is open to outsiders only while its author keeps it public; deleting takes that
-  // back, so its card is for its own server's people: a public home is read as the whole server (Tenny, #11590).
-  return new Map([...homes].map(([id, home]) => [id, home.homeKind === "public" ? { ...home, homeKind: "server" as const, homeChannelId: null } : home]));
+  return new Map([...homes].map(([id, home]) => [id, homeWhenDeleted(home)]));
+}
+
+/**
+ * The home a deleted item is judged by, for who may be told it was deleted
+ * (deletedArtifactHomes, and the links route's `deleted`: artifactSight): the
+ * one it had, but a public item is open to outsiders only while its author
+ * keeps it public; deleting takes that back, so its card is for its own
+ * server's people: a public home is read as the whole server (Tenny, #11590).
+ */
+export function homeWhenDeleted<T extends Pick<HomeRow, "homeKind" | "homeChannelId">>(row: T): T {
+  return row.homeKind === "public" ? { ...row, homeKind: "server", homeChannelId: null } as T : row;
+}
+
+/** What an actor may know of an Artifact (artifactSight): see it now, be told it was deleted, or nothing. */
+export type ArtifactSight = "visible" | "deleted" | null;
+
+/**
+ * canViewArtifacts, and for a deleted item whether the actor could see it
+ * before (core's rule for a deleted card, services/objectSummaries.ts
+ * deletedSummaries over deletedArtifactHomes: canViewHomes on homeWhenDeleted),
+ * in one canViewHomes call: one answer per item, in input order. `visible`:
+ * live and seen (canViewArtifacts' answer); `deleted`: deleted, not revoked,
+ * and seen on that home; null otherwise (a revoked item for everyone). Who
+ * may be told it was deleted is decided here only by sight: whether its
+ * server answers for it (apiCommon itemsReadable, on the same home) and its
+ * delete is on record are the caller's, as for the card
+ * (webCards.ts summarizeDeletedArtifacts).
+ */
+export async function artifactSight(actor: ViewActor, items: readonly ArtifactVisibilitySubject[]): Promise<ArtifactSight[]> {
+  const asked = items.flatMap((item, index) => {
+    if (item.revokedAt !== null) return [];
+    const deleted = item.deletedAt !== null;
+    return [{ index, deleted, object: homedObject(deleted ? homeWhenDeleted(item) : item) }];
+  });
+  const answers = await canViewHomes(actor, asked.map((entry) => entry.object));
+  const sight: ArtifactSight[] = items.map(() => null);
+  asked.forEach((entry, position) => {
+    if (answers[position]) sight[entry.index] = entry.deleted ? "deleted" : "visible";
+  });
+  return sight;
 }
 
 async function homesWhere(ids: readonly string[], state: SQL): Promise<ReadonlyMap<string, AppObjectHome>> {

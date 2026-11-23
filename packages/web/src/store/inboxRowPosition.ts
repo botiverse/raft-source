@@ -20,7 +20,8 @@
  * position its last answer delivered, the seqs applied above it since, and
  * whether a commit-order inversion was seen. It is valid only while the row
  * still shows the position it implies (another path moved the row: start
- * again from the row as shown).
+ * again from the row as shown). Its read seq and Mark as Unread ceiling are about
+ * reads, not the position: kept either way (foldLedgerReadByPosition, markUnreadByPosition).
  *
  * Row re-reads (`GET /api/channels/inbox?ids=`, `X-Raft-Fetch-Reason:
  * position_reread`, the trigger in `X-Raft-Fetch-Trigger`): at most one in
@@ -36,10 +37,20 @@
  * in exactly one check: judged (noop / conflict), or `result=not_judged` with
  * its cause (AuditNotJudgedCause), so the audits' denominator is known.
  *
- * Not handled here (the list re-read stays): a row not listed, a joint
- * conversation (its frontiers are in another server's seq space), a message
- * in a muted conversation's range, my own message with mentions (it may add a
- * mention_action row), and the thread-replies rebaseline. Flag off: nothing
+ * A mention of me in a muted conversation's range is judged here too (#244
+ * contract case muted_mention_lights_without_moving): RisingWave keeps the row
+ * at its last message before the mute (the verdict's `moves: false`), so the
+ * mention lights the @ without counting or moving the row; a mention-only row
+ * moves with it. Any other message there does not reach Activity at all
+ * (socketBridge isMessageActivitySuppressedByMute; muted_message_leaves_row).
+ *
+ * A thread not listed whose `thread:updated` carries its whole row is
+ * inserted by inboxThreadInsert.ts, with its state here (keepRowState).
+ *
+ * Not handled here (the list re-read stays): any other row not listed, a joint
+ * conversation (its frontiers are in another server's seq space), my own
+ * message with mentions (it may add a mention_action row), and the
+ * thread-replies rebaseline. Flag off: nothing
  * here runs, every path is as before.
  */
 import {
@@ -59,6 +70,7 @@ import type {
   ActivityRowState,
   ActivityUnreadMessage,
   ActivityUnreadScope,
+  ActivityUnreadVerdict,
   InboxRefreshTrigger,
   InboxScopeReadFrontier,
 } from "@botiverse/raft-shared";
@@ -73,9 +85,12 @@ import { CHANNEL_DETAIL_REASON_HEADER } from "./channelDetailReason";
 import { isMessageInMutedActivityRange } from "./channelRealtimeSync";
 import { safeSeqToDecimalString } from "./activitySeq";
 import { touchInboxGroupActivity } from "./inboxGroups";
-import { checkRowAnswerDrift, noteInPlaceRow, readPersistedSkipsReread, recordAuditNotJudged, skippedRereadFrontiers } from "./inboxInPlaceUnread";
+import { inboxRowPlaceAt } from "./inboxInsertedThreadRow";
+import { checkRowAnswerDrift, noteInPlaceRow, readPersistedSkipsReread, recordAuditNotJudged, skippedRereadFrontiers, takeInsertedRowKeep } from "./inboxInPlaceUnread";
 import type { AuditNotJudgedCause, InboxLiveUnread } from "./inboxInPlaceUnread";
 import { getInboxItemKey } from "./inboxItem";
+import { clearLedgerReadFolds, rowReadFields, takeLedgerReadEvents } from "./inboxRowReadSeq";
+import type { RowReadEvent } from "./inboxRowReadSeq";
 import { inPlaceUnreadTotals } from "./inboxLivePatch";
 import type { ChannelInboxItem, InboxItem, InboxState, ThreadInboxItem } from "./inboxStore";
 import { getPendingReadSeq, useMessageStore } from "./messageStore";
@@ -114,7 +129,7 @@ export function rowPositionOn(serverId: string | null = useServerStore.getState(
 
 // ---- Per-row client state -----------------------------------------------------
 
-type RowClientState = Pick<ActivityRowState, "position" | "applied" | "inversionObserved">;
+type RowClientState = Pick<ActivityRowState, "position" | "applied" | "inversionObserved" | "readSeq" | "readSeqCeiling">;
 
 // Rows with a state; a page whose Activity is never re-read still notes rows, so past this the oldest go.
 const ROW_STATE_CAP = 500;
@@ -140,12 +155,15 @@ export function rowPositionStateOf(row: ConversationRow): ActivityRowState {
     position: valid ? kept.position : canonicalOrNull(shown),
     applied: valid ? kept.applied : [],
     inversionObserved: valid ? kept.inversionObserved : false,
+    ...rowReadFields(kept),
   };
 }
 
-function keepRowState(scopeId: string, row: ActivityRowState): void {
+/** Keep `row` as the reducer's state for the scope (also a row inserted from a `thread:updated`, inboxThreadInsert.ts); one built afresh (no read seq or ceiling) keeps the scope's. */
+export function keepRowState(scopeId: string, row: ActivityRowState): void {
+  const read = rowReadFields(row.readSeq === undefined && row.readSeqCeiling === undefined ? rowStates.get(scopeId) : row);
   rowStates.delete(scopeId);
-  rowStates.set(scopeId, { position: row.position, applied: row.applied, inversionObserved: row.inversionObserved });
+  rowStates.set(scopeId, { position: row.position, applied: row.applied, inversionObserved: row.inversionObserved, ...read });
   while (rowStates.size > ROW_STATE_CAP) rowStates.delete(rowStates.keys().next().value!);
 }
 
@@ -202,10 +220,10 @@ function isOwn(message: Message): boolean {
  * (receiveLiveByPosition asks with `loaded: false` and keeps the projected
  * count instead, so the record still says whether the message counts).
  */
-export function rowPositionVerdict(row: ConversationRow, message: Message, live: Pick<InboxLiveUnread, "counts" | "loaded">): { counts: boolean | null; mention: boolean } {
-  if (live.loaded) return { counts: false, mention: false };
+export function rowPositionVerdict(row: ConversationRow, message: Message, live: Pick<InboxLiveUnread, "counts" | "loaded">): ActivityUnreadVerdict {
+  if (live.loaded) return { counts: false, mention: false, moves: true };
   const viewer = useMessageStore.getState().currentUserId;
-  if (!viewer) return { counts: null, mention: false };
+  if (!viewer) return { counts: null, mention: false, moves: true };
   const scope: ActivityUnreadScope = row.kind === "thread"
     ? { rowKind: isTaskConversationItem(row) ? "task" : "thread", threadFollowed: row.isFollowing !== false, readOnArrival: !live.counts }
     : { rowKind: row.kind, activityMuted: isMessageInMutedActivityRange(message), readOnArrival: !live.counts };
@@ -283,7 +301,6 @@ export function receiveLiveByPosition(message: Message, live: InboxLiveUnread | 
     : (item.kind === "channel" || item.kind === "dm") && item.channelId === message.channelId);
   if (!existing || isJoint(existing)) return false;
   if (isOwn(message) && (message.mentions ?? []).length > 0) return false;
-  if (existing.kind !== "thread" && isMessageInMutedActivityRange(message)) return false;
   const scopeId = scopeOf(existing);
   const seq = canonicalOrNull(safeSeqToDecimalString(message.seq));
   // A message the loaded messages' read-state projection already counted
@@ -294,7 +311,7 @@ export function receiveLiveByPosition(message: Message, live: InboxLiveUnread | 
   const preCounted = live.loaded;
   const verdict = rowPositionVerdict(existing, message, { counts: live.counts, loaded: false });
   const before = rowPositionStateOf(existing);
-  const applied = reduceActivityRow(before, { type: "live", seq: seq ?? "", counts: verdict.counts, mentionsViewer: verdict.mention });
+  const applied = reduceActivityRow(before, { type: "live", seq: seq ?? "", counts: verdict.counts, mentionsViewer: verdict.mention, moves: verdict.moves });
   if (applied.reread) {
     requestRowReread(scopeId, REREAD_TRIGGER[applied.rereadReason ?? "ambiguous_seq"]);
     return true;
@@ -311,7 +328,8 @@ export function receiveLiveByPosition(message: Message, live: InboxLiveUnread | 
   if (after === before) return true;
   keepRowState(scopeId, after);
   const shown = existing.latestActivitySeq;
-  const advances = seq !== null && (shown == null || !isCanonicalActivitySeq(shown) || compareActivityRowSeq(seq, shown) > 0);
+  // Not past a mute, or a mention-only row: the row's shown position is now this message.
+  const advances = seq !== null && activityRowDisplayPosition(applied.row) === seq && (shown == null || !isCanonicalActivitySeq(shown) || compareActivityRowSeq(seq, shown) > 0);
   const next = {
     ...(advances ? { ...advancedRow(existing, message, seq), ...movedFrontiers(existing, seq) } : existing),
     ...unreadFields(existing, after, message.id),
@@ -343,6 +361,7 @@ export function receiveLiveByPosition(message: Message, live: InboxLiveUnread | 
  */
 export function readPersistedByPosition(row: ConversationRow): void {
   const scopeId = scopeOf(row);
+  foldLedgerReadByPosition(scopeId);
   const before = withReadApplied(scopeId, rowPositionStateOf(row));
   // A Number (readStateSync): see readThrough on the one non-exact place.
   const accepted = getAcceptedReadState(useServerStore.getState().current?.id ?? null, scopeId)?.maxReadSeq;
@@ -362,6 +381,27 @@ export function readPersistedByPosition(row: ConversationRow): void {
   port?.store.setState((current) => ({
     items: current.items.map((item) => (item === row ? { ...row, ...unreadFields(row, result.row, "") } as ConversationRow : item)),
   }));
+}
+
+/** A read or Mark as Unread event for the scope's kept state (the listed row's, else the state kept for it). */
+function reduceRowRead(scopeId: string, event: RowReadEvent): void {
+  const listed = port?.store.getState().items.find((item): item is ConversationRow => isConversation(item) && scopeOf(item) === scopeId && !isJoint(item));
+  const kept = rowStates.get(scopeId);
+  const state = listed ? rowPositionStateOf(listed) : kept && { ...kept, unreadCount: 0, hasMention: false, mentionOnly: false };
+  if (state) keepRowState(scopeId, reduceActivityRow(state, event).row);
+}
+
+/** Flag on: the read state the ledger accepted since the last fold, by any path (inboxRowReadSeq.ts), into the read seq; before every answer merge too. */
+export function foldLedgerReadByPosition(scopeId: string): void {
+  const kept = rowStates.get(scopeId);
+  const events = rowPositionOn() ? takeLedgerReadEvents(useServerStore.getState().current?.id ?? null, scopeId, kept?.readSeq) : [];
+  if (events !== "forget") for (const event of events) reduceRowRead(scopeId, event);
+  else if (kept) rowStates.set(scopeId, { position: kept.position, applied: kept.applied, inversionObserved: kept.inversionObserved });
+}
+
+/** Flag on: Mark as Unread here (inboxStore markScopeUnread): a late ack of a read before it (folded first if accepted unfolded) does not raise the read seq again. */
+export function markUnreadByPosition(scopeId: string): void {
+  if (rowPositionOn()) { foldLedgerReadByPosition(scopeId); reduceRowRead(scopeId, { type: "markUnread" }); }
 }
 
 /**
@@ -388,6 +428,7 @@ export function readPersistedSkipsListReread(items: readonly InboxItem[], scopeI
  */
 function mergeServedRow(current: ConversationRow, served: ConversationRow, pa: string | null): { row: ConversationRow; kept: boolean; note: string } {
   const scopeId = scopeOf(current);
+  foldLedgerReadByPosition(scopeId);
   const state = rowPositionStateOf(current);
   const before = withReadApplied(scopeId, state);
   // #triage:#244 (a lagging answer merged one short, 2 of 2 on staging): what the merge started from, for the audit detail.
@@ -417,11 +458,7 @@ function mergeServedRow(current: ConversationRow, served: ConversationRow, pa: s
   };
 }
 
-function activityAt(item: InboxItem): number {
-  if (item.kind === "mention_action" || item.kind === "object") return Number.NEGATIVE_INFINITY;
-  const at = Date.parse(item.kind === "thread" ? item.lastActivityAt : item.lastMessageAt);
-  return Number.isFinite(at) ? at : Number.NEGATIVE_INFINITY;
-}
+const activityAt = inboxRowPlaceAt;
 
 /** Newest first: rows kept at a newer message than the answer go back to their place by time. */
 function placeKeptRows(items: InboxItem[], kept: ReadonlySet<InboxItem>, newestFirst: boolean): InboxItem[] {
@@ -441,13 +478,17 @@ function placeKeptRows(items: InboxItem[], kept: ReadonlySet<InboxItem>, newestF
  * Each answered row that is listed merges by the reducer; one first listed
  * by this answer starts its client state. `readBehind`: rows whose answer is
  * from an older read than the one accepted here (inboxServedReadBehind),
- * left as the store kept them. Flag off: `merged` as it is.
+ * left as the store kept them. A row inserted from `thread:updated` that the
+ * first-window answer (`firstWindow`) does not have yet is kept once and
+ * re-read (takeInsertedRowKeep); a later page never has it, so it keeps
+ * nothing. Flag off: `merged` as it is.
  */
 export function mergeAnswerByPosition<T extends { items: InboxItem[]; totalUnreadDelta: number }>(
   merged: T,
   current: readonly InboxItem[],
   served: readonly InboxItem[],
   newestFirst: boolean,
+  firstWindow: boolean,
   readBehind: ReadonlySet<string> = new Set(),
 ): T {
   if (!rowPositionOn()) return merged;
@@ -464,6 +505,7 @@ export function mergeAnswerByPosition<T extends { items: InboxItem[]; totalUnrea
     const scopeId = scopeOf(item);
     if (!before) {
       keepRowState(scopeId, { position: pa, applied: [], inversionObserved: false, unreadCount: 0, hasMention: false, mentionOnly: false });
+      foldLedgerReadByPosition(scopeId);
       return item;
     }
     if (readBehind.has(scopeId)) return item;
@@ -472,6 +514,21 @@ export function mergeAnswerByPosition<T extends { items: InboxItem[]; totalUnrea
     if (next.kept) kept.add(next.row);
     return next.row;
   });
+  // A row inserted from `thread:updated` that the answer does not have yet (the read model lags the reply):
+  // kept once, by time, and re-read (a row read that leaves it out re-reads the list: row_missing). With more
+  // rows to follow, the store's loaded tail already carries it in its old order: it is taken out of the tail.
+  // Only a first window answers for the top of the list: a later page (load more) leaves out every shown row.
+  for (const row of firstWindow ? current : []) {
+    if (!isConversation(row) || servedSeq.has(getInboxItemKey(row))) continue;
+    const baseline = takeInsertedRowKeep(scopeOf(row), row.latestActivitySeq ?? null);
+    if (baseline === null) continue;
+    const inTail = items.findIndex((item) => getInboxItemKey(item) === getInboxItemKey(row));
+    if (inTail >= 0) items.splice(inTail, 1);
+    items.push(row);
+    kept.add(row);
+    delta += row.unreadCount - baseline;
+    requestRowReread(scopeOf(row), "catch_up_retry");
+  }
   return { ...merged, items: placeKeptRows(items, kept, newestFirst), totalUnreadDelta: merged.totalUnreadDelta + delta };
 }
 
@@ -530,7 +587,7 @@ export function requestRowReread(scopeId: string, trigger: InboxRefreshTrigger):
  * it): scope=row. One that cannot be judged is recorded `not_judged` with its
  * cause (notJudged). Not when the row already waits for a read.
  */
-function auditLiveApplied(scopeId: string, row: ConversationRow): void {
+export function auditLiveApplied(scopeId: string, row: ConversationRow): void {
   if (++liveAppliedCount % POSITION_AUDIT_EVERY !== 0 || pendingRows.has(scopeId)) return;
   pendingRows.set(scopeId, { trigger: "position_audit", asks: 1, audit: row });
   scheduleFlush();
@@ -720,6 +777,7 @@ function resetRowPosition(): void {
 function clearRowPosition(): void {
   generation += 1;
   rowStates.clear();
+  clearLedgerReadFolds();
   pendingRows.clear();
   inFlightRows.clear();
   liveAppliedCount = 0;

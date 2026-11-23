@@ -5,14 +5,16 @@
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { type ClaimEvent, type ClaimRow, claimStates, isCommitSha, judgeClaim, median, metricRuns, parseClaims, predictionFloor, sameCommit, transitionError } from "./claims";
+import { cohortFromRows, compareCohorts } from "./cohort";
 
 const HELP = `raft-perf claim <open|ship|verify|withdraw|status> --claims <claims.jsonl> [options]
 
   open      --id --project --env --title --ref --author --scenario --metric --predicted-delta <n, negative = saves>
             --before <rows.jsonl> --runner <machine> --verify-command <command>
   ship      --id --commit <sha>          the change is deployed at this commit
-  verify    --id --before <rows.jsonl> --after <rows.jsonl>
+  verify    --id --before <rows.jsonl> --after <rows.jsonl> [--allow-cohort-change]
             the before rows must give the baseline the claim was opened with; the after rows must name the shipped commit
+            and belong to the same cohort (machine, browser, throttling, network path and fixture)
   withdraw  --id --note <why>
   status                                 the current state of every claim
 
@@ -106,6 +108,7 @@ function main(argv: readonly string[], io: ClaimIo): number {
           "verify-command": { type: "string" },
           commit: { type: "string" },
           note: { type: "string" },
+          "allow-cohort-change": { type: "boolean", default: false },
           help: { type: "boolean", short: "h", default: false },
         },
       });
@@ -242,6 +245,16 @@ function main(argv: readonly string[], io: ClaimIo): number {
   if (!afterCommits.every((c) => sameCommit(c, shipped.commit_sha!))) fail(`--after was not measured on the shipped commit ${shipped.commit_sha} (its rows name ${afterCommits.join(", ")})`);
   if (commitsOf(beforeRows, "--before").some((c) => sameCommit(c, shipped.commit_sha!))) fail(`--before was measured on the shipped commit ${shipped.commit_sha} itself: it must be from before the change`);
   if (before.length !== shipped.runs_before) fail(`--before has ${before.length} run(s) of ${shipped.metric}, the claim was opened with ${shipped.runs_before}: pass the rows it was opened with`);
+  if (!args["allow-cohort-change"]) {
+    const beforeCohort = cohortFromRows(beforeRows);
+    const afterCohort = cohortFromRows(afterRows);
+    if (beforeCohort.hasCohort && afterCohort.hasCohort) {
+      const cmp = compareCohorts(beforeCohort.expectation, afterCohort.actual);
+      if (!cmp.comparable) {
+        fail(`--after was not measured in the same cohort as --before (${cmp.differences.map((d) => d.reason).join("; ")}): re-measure in the same cohort, or pass --allow-cohort-change`);
+      }
+    }
+  }
   let judgement;
   try {
     judgement = judgeClaim(shipped.metric, shipped.predicted_delta, before, after);

@@ -23,9 +23,57 @@ import { THREAD_HEADER_CONTAINER_CLASS_NAME, THREAD_HEADER_SUBTITLE_CLASS_NAME, 
 import { ColumnMoveMenuItems } from "../../components/layout/ColumnMoveMenu";
 import { useMessageOutlineStore } from "../../store/messageOutlineStore";
 import { hasOutline, openOutlineList } from "../conversation-outline/outlineListStore";
+import { useMediaQuery } from "../../hooks/effectPrimitives";
+import type { ThreadHeaderOriginal } from "./threadHeaderTitle";
 
 /** The subtitle's channel name: its own width, at most the subtitle's, ellipsized there. */
 const THREAD_SUBTITLE_LEAD_CLASS_NAME = "max-w-full shrink-0 truncate";
+/** The title's face not shown now: laid over the shown one, out of the layout, so the head keeps its height. */
+const TITLE_FACE_HIDDEN_CLASS_NAME = "pointer-events-none absolute inset-x-0 top-0 opacity-0";
+/** The title's two faces cross-fade (#proj-chat:#31 v3, 140ms, no movement); reduced motion swaps them at once. */
+const TITLE_FACE_FADE_CLASS_NAME = "transition-opacity duration-140 ease-out motion-reduce:transition-none";
+const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
+
+/**
+ * The thread head's title: Thread, or, once the message the thread started from has scrolled out of view, its sender
+ * and first line on one line (raft-design conversation.md, Threads). Only the words change; the face not shown is
+ * aria-hidden. The button's accessible name is the words shown (threadTitleLabel).
+ */
+/**
+ * The title button's accessible name. Naming the original, it is the words shown with Thread before them ("Thread:
+ * Juno: Can we ship…"), so a person using voice control can say what they see (WCAG 2.5.3); spelled out rather than
+ * read from the faces, whose separate pieces a browser may join without their spaces. The head is no live region:
+ * the changed name isn't announced (focus is in the replies while they scroll). Deleted or out of reach, the title
+ * stays Thread and the name says why; otherwise it is Thread, the word shown.
+ */
+function threadTitleLabel(original: ThreadHeaderOriginal | null, swapped: boolean, formatMessage: ReturnType<typeof useIntl>["formatMessage"]): string | undefined {
+  if (original?.state === "deleted") return formatMessage({ id: "message.threadPanel.titleOriginalDeleted" });
+  if (original?.state === "unavailable") return formatMessage({ id: "message.threadPanel.titleOriginalUnavailable" });
+  if (original?.state !== "shown" || !swapped) return undefined;
+  return `${formatMessage({ id: "message.threadPanel.titleOriginalPrefix" })} ${original.sender}${formatMessage({ id: "message.threadPanel.titleOriginalSeparator" })}${original.text}`;
+}
+
+function ThreadHeaderTitleText({ original, swapped }: { original: ThreadHeaderOriginal | null; swapped: boolean }) {
+  const { formatMessage } = useIntl();
+  const reducedMotion = useMediaQuery(REDUCED_MOTION_QUERY);
+  const fade = reducedMotion ? "" : TITLE_FACE_FADE_CLASS_NAME;
+  const shown = original?.state === "shown" ? original : null;
+  const showOriginal = !!shown && swapped;
+  return (
+    <span className="relative block min-w-0" data-title-swapped={showOriginal ? "true" : "false"} data-title-motion={reducedMotion ? "reduce" : "fade"}>
+      <span aria-hidden={showOriginal || undefined} className={`block truncate ${fade} ${showOriginal ? TITLE_FACE_HIDDEN_CLASS_NAME : ""}`} data-testid="thread-title-default">
+        {formatMessage({ id: "message.threadPanel.thread" })}
+      </span>
+      {shown ? (
+        <span aria-hidden={!showOriginal || undefined} className={`flex min-w-0 items-baseline ${fade} ${showOriginal ? "" : TITLE_FACE_HIDDEN_CLASS_NAME}`} data-testid="thread-title-original">
+          <span className="max-w-full shrink-0 truncate">{shown.sender}</span>
+          <span className="shrink-0 whitespace-pre">{formatMessage({ id: "message.threadPanel.titleOriginalSeparator" })}</span>
+          <span className="min-w-0 truncate font-medium">{shown.text}</span>
+        </span>
+      ) : null}
+    </span>
+  );
+}
 
 /**
  * The thread panel's head: its title (a jump to the first reply), the parent
@@ -54,6 +102,8 @@ export function ThreadPanelHeader({
   handleOpenParentChannelAction,
   handleOpenThreadSearch,
   allowExpand,
+  original = null,
+  originalOutOfView = false,
 }: {
   headerLeading: ReactNode;
   headerDrag: SideSectionHead | undefined;
@@ -78,6 +128,10 @@ export function ThreadPanelHeader({
   handleOpenParentChannelAction: () => void;
   handleOpenThreadSearch: () => void;
   allowExpand: boolean;
+  /** What the title can say about the message the thread started from (resolveThreadHeaderOriginal). */
+  original?: ThreadHeaderOriginal | null;
+  /** That message has scrolled fully out of view (useThreadParentOutOfView): the title names it. */
+  originalOutOfView?: boolean;
 }) {
   const { formatMessage } = useIntl();
   // Its column holds the columns the row couldn't give 160 (#189 rule 4): their tabs in place of its title.
@@ -119,6 +173,10 @@ export function ThreadPanelHeader({
   // Stryker disable all: header action wiring is browser-smoke verified.
   // Thread commands live in the menu; structural Back and Close stay in the header.
   const openParentChannelLabel = formatMessage({ id: "message.threadPanel.viewInChannel" });
+  // A place the person can't see offers no way in: no View in channel, a place name that is plain text.
+  const parentReachable = !!parentMessageId && original?.state !== "unavailable";
+  const titleSwapped = original?.state === "shown" && originalOutOfView;
+  const titleLabel = threadTitleLabel(original, titleSwapped, formatMessage);
 
   const threadContextActions = (
     <>
@@ -126,7 +184,7 @@ export function ThreadPanelHeader({
       threadChannelId={threadChannelId}
       parentMessageId={parentMessageId}
       viewInChannelLabel={openParentChannelLabel}
-      onViewInChannel={handleOpenParentChannelAction}
+      onViewInChannel={parentReachable ? handleOpenParentChannelAction : undefined}
       onSearch={handleOpenThreadSearch}
       onTimeline={timelineShown ? openTimeline : undefined}
       leadingItems={hasFollowers && !followersShown ? (
@@ -170,7 +228,7 @@ export function ThreadPanelHeader({
               <button
                 type="button"
                 onClick={() => { void jumpToThreadStart(); }}
-                aria-label={formatMessage({ id: "message.threadPanel.scrollThreadToFirst" })}
+                aria-label={titleLabel}
                 data-testid="thread-scroll-to-top"
               />
             )}
@@ -178,9 +236,10 @@ export function ThreadPanelHeader({
             // underline on hover (clickable-affordance contract). It hugs its
             // word, so the head's empty room isn't hovering it (Expand moves
             // the head's buttons out from under the pointer; #189 rule 5).
-            className="block min-w-0 max-w-full self-start md:pointer-fine:shrink-0 md:pointer-fine:self-auto truncate rounded-sticker text-left decoration-[1.5px] underline-offset-[3px] outline-none hover:underline focus-visible:shadow-focus"
+            // Naming the message, it gives up its room before the place and count do (they stay as they were).
+            className={`block min-w-0 max-w-full self-start ${titleSwapped ? "md:pointer-fine:shrink" : "md:pointer-fine:shrink-0"} md:pointer-fine:self-auto truncate rounded-sticker text-left decoration-[1.5px] underline-offset-[3px] outline-none hover:underline focus-visible:shadow-focus`}
           >
-            {formatMessage({ id: "message.threadPanel.thread" })}
+            <ThreadHeaderTitleText original={original} swapped={titleSwapped} />
           </PanelTitle>
           </Tooltip>
           {parentChannelId && (() => {
@@ -200,7 +259,7 @@ export function ThreadPanelHeader({
               // A row whose end ellipsizes, as a title does (#189 rule 6): the channel name first, a link (a
               // button, which a line's ellipsis can't cut into), ellipsizing itself where it is all there is room for;
               // the count after it in what is left.
-              <PanelMeta render={<p />} className={`${THREAD_HEADER_SUBTITLE_CLASS_NAME} flex`} data-testid="thread-header-subtitle">
+              <PanelMeta render={<p />} className={`${THREAD_HEADER_SUBTITLE_CLASS_NAME} flex ${titleSwapped ? "md:pointer-fine:max-w-[50%] md:pointer-fine:flex-none" : ""}`} data-testid="thread-header-subtitle">
                 {/* A Lounge's thread names its place with the Lounge's face too (LoungeAvatar). */}
                 {/* Decorative: the name after it says which Lounge (an agent's image carries alt text). */}
                 {ch.loungeAgentId ? (
@@ -211,7 +270,7 @@ export function ThreadPanelHeader({
                 {/* The channel name does what View in Channel does. */}
                 {/* Not in a sentence: the channel name underlines on hover only,
                     like the forwarded "from #channel" source and the sender name. */}
-                {parentMessageId ? (
+                {parentReachable ? (
                   <Tooltip content={openParentChannelLabel}>
                     <TextLink onClick={handleOpenParentChannelAction} className={THREAD_SUBTITLE_LEAD_CLASS_NAME} data-testid="thread-header-channel-link">
                       {label}

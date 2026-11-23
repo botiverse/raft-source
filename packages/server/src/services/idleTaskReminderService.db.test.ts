@@ -119,6 +119,54 @@ test("flag off: send false, reason disabled, nothing recorded", async ({ seed })
   assert.deepEqual(await nudgeRows(fx.agent.id), []);
 });
 
+test("flag off, new session or compaction: the agent's todo / in_progress tasks listed as new session, rules point at the thread, nothing recorded", async ({ seed }) => {
+  const fx = await fixture(seed, { flag: false, onSince: null });
+  const todo = await openTask(fx, { title: "Rollout checklist", assignedBy: fx.ownerActor, assignedAt: ago(3 * HOUR) });
+  const doing = await openTask(fx, { title: "Fix the probe", status: "in_progress", assignedBy: fx.agentActor, assignedAt: ago(HOUR) });
+  await openTask(fx, { status: "in_review", assignedBy: fx.agentActor, assignedAt: ago(HOUR) });
+  await openTask(fx, { status: "done", assignedBy: fx.agentActor, assignedAt: ago(HOUR) });
+  await openTask(fx, { assignedBy: fx.ownerActor, assignedAt: ago(HOUR), assignee: fx.peerActor });
+
+  const fresh = await remind(fx, { freshSession: true });
+  assert.equal(fresh.send, true);
+  // Most recently updated first, as a resumed start lists them.
+  assert.deepEqual(fresh.items.map((item) => [item.taskNumber, item.status, item.reason, item.why]), [
+    [doing.taskNumber, "in_progress", "new_session", "new session"],
+    [todo.taskNumber, "todo", "new_session", "new session"],
+  ]);
+  assert.deepEqual(fresh.backlog, []);
+  assert.equal(fresh.rules, true);
+  const ref = `#${fx.channel.name}:#${doing.taskNumber}`;
+  assert.ok(fresh.text.startsWith(`[Raft task notice: 2 tasks are waiting on you.\n${ref} [in_progress] Fix the probe — new session\n`), fresh.text);
+  assert.ok(fresh.text.includes("- Won't be done: set it closed and say why in its thread."), fresh.text);
+  assert.ok(!fresh.text.includes("its conversation"), fresh.text);
+  assert.ok(!fresh.text.includes("backlog"), fresh.text);
+  assert.ok(!fresh.text.includes("more assigned to you"), fresh.text);
+
+  // Nothing recorded and no on-since set: the next new session lists them again; any other idle stays off.
+  assert.deepEqual(await nudgeRows(fx.agent.id), []);
+  assert.equal((await getDb().select({ n: sql<number>`count(*)::int` }).from(agentTaskNudgeSends).where(eq(agentTaskNudgeSends.agentId, fx.agent.id)))[0]?.n, 0);
+  const [server] = await getDb().select({ onSince: servers.taskV2OnSince }).from(servers).where(eq(servers.id, fx.server.id));
+  assert.equal(server?.onSince ?? null, null);
+  assert.equal((await remind(fx, { freshSession: true })).items.length, 2);
+  assert.equal((await remind(fx)).reason, "disabled");
+
+  // The Computer says the context already has the rules: the listing leaves them out.
+  const again = await computeIdleTaskReminder({ serverId: fx.server.id, agentId: fx.agent.id, now: NOW, freshSession: true, rulesShown: true });
+  assert.equal(again.rules, false);
+  assert.ok(!again.text.includes("For each task:"), again.text);
+});
+
+test("flag off, new session: five named, the rest counted with where to see them; none open is no_open_tasks", async ({ seed }) => {
+  const fx = await fixture(seed, { flag: false });
+  assert.deepEqual(await remind(fx, { freshSession: true }), { send: false, reason: "no_open_tasks", items: [], backlog: [], text: "" });
+  for (let i = 0; i < 7; i++) await openTask(fx, { assignedBy: fx.ownerActor, assignedAt: ago((i + 1) * HOUR) });
+  const fresh = await remind(fx, { freshSession: true });
+  assert.equal(fresh.items.length, 5);
+  assert.ok(fresh.text.startsWith("[Raft task notice: 5 tasks are waiting on you.\n"), fresh.text);
+  assert.ok(fresh.text.includes("\n…and 2 more assigned to you. To see them: raft task list --mine.\n"), fresh.text);
+});
+
 test("no open task assigned to the agent: no_open_tasks (others' and finished tasks are not listed)", async ({ seed }) => {
   const fx = await fixture(seed);
   await openTask(fx, { assignedBy: fx.ownerActor, assignedAt: ago(HOUR), assignee: fx.peerActor });

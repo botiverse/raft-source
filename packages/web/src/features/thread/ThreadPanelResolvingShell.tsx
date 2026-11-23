@@ -11,7 +11,8 @@ import { THREAD_CHROME_CONTAINER_PROPS, THREAD_MOBILE_BACK_PROPS } from "./threa
 
 /**
  * The panel while its thread channel is being found (first open): the
- * reply skeleton under the head, or the failure with Retry.
+ * reply skeleton under the head, or the failure with Retry (none for an
+ * anchor whose ids nothing resolves: threadLinkIds.ts).
  */
 export function ThreadPanelResolvingShell({
   panelClassName,
@@ -34,7 +35,7 @@ export function ThreadPanelResolvingShell({
   resolveRegionRef: RefObject<HTMLDivElement | null>;
   resolveFailed: boolean;
   handleRetryOpenThreadFocused: () => void;
-  openThreadError: { unavailable?: boolean } | null;
+  openThreadError: { unavailable?: boolean; unresolved?: boolean } | null;
   currentServer: Server | null;
   repliesLoadingSince: number;
 }) {
@@ -67,7 +68,7 @@ export function ThreadPanelResolvingShell({
       <div ref={resolveRegionRef} tabIndex={-1} aria-busy={!resolveFailed || undefined} className="relative flex-1 outline-none">
         {resolveFailed ? (
           <ThreadRepliesLoadFailed
-            onRetry={handleRetryOpenThreadFocused}
+            onRetry={openThreadError?.unresolved ? undefined : handleRetryOpenThreadFocused}
             retryTestId="thread-retry"
             unavailableFrom={openThreadError?.unavailable ? currentServer?.name ?? null : null}
           />

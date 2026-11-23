@@ -13,6 +13,7 @@ import { createApiTest } from "../../test/integration/apiTest";
 import { getDb } from "../../db/index";
 import {
   agents,
+  channels,
   externalAppInstalls,
   externalAppRegistrations,
   externalAppServerGrants,
@@ -20,6 +21,7 @@ import {
   featureFlagRules,
   featureFlags,
   integrationAuditEvents,
+  jointChannelServers,
   messages,
   oauthClients,
 } from "../../db/schema";
@@ -35,6 +37,7 @@ import { addHuman, createChannel, findOrCreateDM, findOrCreateUserDM } from "../
 import { __setArtifactR2StoreForTests, type ArtifactR2Store } from "./blobStore";
 import { artifactComments, artifactItems, artifactVersions } from "./schema";
 import { createServer, seedUser } from "../../routes/channels.api.fixtures";
+import { seedJointChannel } from "../../test/integration/jointFixture";
 
 const test = createApiTest();
 
@@ -275,4 +278,67 @@ test("a held push says no comment text: counts and the position only (Warden, #1
   const through = await publish(app.baseUrl, s.apiKey, { artifact: id, base: 1, seen, files: files("2") });
   assert.ok(through.status === 200 || through.status === 201, JSON.stringify(through.body));
   assert.equal(through.body.artifact.version, 2);
+});
+
+// #460 (Warden): an Artifact homed in a joint names the joint's canonical channel. A new version as the owner is
+// checked on the owner's own server's copy of the joint, by the same rules as any home; with no active copy there
+// it is the one not-found, never the canonical channel.
+async function seedJointHomed(s: Seeded & { apiBaseUrl: string }) {
+  const other = await createServer("As Owner Other", `ao-other-${s.suffix}`, s.bob.id);
+  const third = await createServer("As Owner Third", `ao-third-${s.suffix}`, s.bob.id);
+  const joint = await seedJointChannel({ name: `shared-${s.suffix}`, serverIds: [s.server.id, other.id], createdByUserId: s.bob.id });
+  const ourCopy = joint.projections[0]!;
+  await addHuman(ourCopy.id, s.owner.id);
+  const elsewhere = await seedJointChannel({ name: `elsewhere-${s.suffix}`, serverIds: [other.id, third.id], createdByUserId: s.bob.id });
+  // Published as the owner, then homed in the joint as a joint's Artifact is stored: by its canonical channel.
+  const made = await publish(s.apiBaseUrl, s.apiKey, { home: `#design-${s.suffix}`, title: "Shared", files: files("1") });
+  assert.ok(made.status === 200 || made.status === 201, JSON.stringify(made.body));
+  const id = made.body.artifact.id as string;
+  await getDb().update(artifactItems).set({ homeChannelId: joint.canonical.id }).where(eq(artifactItems.id, id));
+  return { id, joint, ourCopy, elsewhere };
+}
+
+test("#460: a new version of a joint-homed Artifact as the owner, while the owner may post in their server's copy of the joint", async ({ app }) => {
+  const s = { ...await seed(), apiBaseUrl: app.baseUrl };
+  const { id, joint, ourCopy } = await seedJointHomed(s);
+  const next = await publish(app.baseUrl, s.apiKey, { artifact: id, base: 1, files: files("2") });
+  assert.ok(next.status === 200 || next.status === 201, JSON.stringify(next.body));
+  assert.equal(next.body.artifact.version, 2);
+  assert.deepEqual(next.body.home, { id: ourCopy.id, ref: `#${ourCopy.name}` }, "named by the owner's own copy, its id one the assistant can name as home");
+  assert.ok((await receipts(s)).includes(`Published v2 of Shared in #${ourCopy.name} as you: ${next.body.artifact.url}`));
+  // The owner's copy only names and checks the home: the stored home stays the joint's canonical channel.
+  const [row] = await getDb().select({ homeChannelId: artifactItems.homeChannelId }).from(artifactItems).where(eq(artifactItems.id, id));
+  assert.equal(row!.homeChannelId, joint.canonical.id, "home_channel_id is not rewritten to the owner's copy");
+});
+
+test("#460: a joint-homed Artifact is the one not-found when the owner may not post in their server's copy (archived), as any home", async ({ app }) => {
+  const s = { ...await seed(), apiBaseUrl: app.baseUrl };
+  const { id, ourCopy } = await seedJointHomed(s);
+  await getDb().update(channels).set({ archivedAt: new Date() }).where(eq(channels.id, ourCopy.id));
+  const refused = await publish(app.baseUrl, s.apiKey, { artifact: id, base: 1, files: files("2") });
+  assert.equal(refused.status, 404, JSON.stringify(refused.body));
+  assert.equal(refused.body.code, "artifact_not_found");
+});
+
+test("#460: a joint-homed Artifact is the one not-found once the owner's server is disconnected from the joint", async ({ app }) => {
+  const s = { ...await seed(), apiBaseUrl: app.baseUrl };
+  const { id, ourCopy } = await seedJointHomed(s);
+  await getDb().update(jointChannelServers).set({ status: "disconnected" }).where(eq(jointChannelServers.localChannelId, ourCopy.id));
+  const refused = await publish(app.baseUrl, s.apiKey, { artifact: id, base: 1, files: files("2") });
+  assert.equal(refused.status, 404, JSON.stringify(refused.body));
+  assert.equal(refused.body.code, "artifact_not_found");
+});
+
+test("#460: an Artifact in a joint the owner's server is not in (another server's copy) is the one not-found", async ({ app }) => {
+  const s = { ...await seed(), apiBaseUrl: app.baseUrl };
+  const { id, elsewhere } = await seedJointHomed(s);
+  await getDb().update(artifactItems).set({ homeChannelId: elsewhere.canonical.id }).where(eq(artifactItems.id, id));
+  const refused = await publish(app.baseUrl, s.apiKey, { artifact: id, base: 1, files: files("2") });
+  assert.equal(refused.status, 404, JSON.stringify(refused.body));
+  assert.equal(refused.body.code, "artifact_not_found");
+  // Named by another server's copy (a home stored before canonical homes), likewise.
+  await getDb().update(artifactItems).set({ homeChannelId: elsewhere.projections[0]!.id }).where(eq(artifactItems.id, id));
+  const byCopy = await publish(app.baseUrl, s.apiKey, { artifact: id, base: 1, files: files("2") });
+  assert.equal(byCopy.status, 404, JSON.stringify(byCopy.body));
+  assert.equal(byCopy.body.code, "artifact_not_found");
 });

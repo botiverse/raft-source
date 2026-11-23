@@ -70,7 +70,7 @@ test("unsupported runtimes say '(coming soon)' regardless of binary/report", () 
 });
 
 test("deprecated runtimes stay known but are hidden from new/setup/display option helpers", () => {
-  assert.deepEqual(RUNTIMES.filter((runtime) => runtime.deprecated).map((runtime) => runtime.id), ["antigravity", "kimi", "copilot", "gemini"]);
+  assert.deepEqual(RUNTIMES.filter((runtime) => runtime.deprecated).map((runtime) => runtime.id), ["kimi", "copilot", "gemini"]);
   assert.deepEqual(getCreatableRuntimeOptions().filter((runtime) => runtime.deprecated).map((runtime) => runtime.id), []);
   assert.deepEqual(getSetupRuntimeOptions().filter((runtime) => runtime.deprecated).map((runtime) => runtime.id), []);
   assert.deepEqual(getMachineRuntimeDisplayOptions().filter((runtime) => runtime.deprecated).map((runtime) => runtime.id), []);
@@ -79,7 +79,15 @@ test("deprecated runtimes stay known but are hidden from new/setup/display optio
   assert.equal(getExistingAgentRuntimeOptions("gemini").some((runtime) => runtime.id === "gemini"), true);
 });
 
-for (const runtimeId of ["antigravity", "copilot"]) {
+test("Antigravity is not deprecated: offered for new agents, switches, setup and display", () => {
+  assert.equal(isRuntimeDeprecated("antigravity"), false);
+  assert.equal(getCreatableRuntimeOptions().some((runtime) => runtime.id === "antigravity"), true);
+  assert.equal(getSetupRuntimeOptions().some((runtime) => runtime.id === "antigravity"), true);
+  assert.equal(getMachineRuntimeDisplayOptions().some((runtime) => runtime.id === "antigravity"), true);
+  assert.equal(getExistingAgentRuntimeOptions("claude").some((runtime) => runtime.id === "antigravity"), true);
+});
+
+for (const runtimeId of ["copilot"]) {
   test(`${runtimeId} remains available only to agents already using it`, () => {
     assert.equal(isRuntimeDeprecated(runtimeId), true);
     assert.equal(getCreatableRuntimeOptions().some((runtime) => runtime.id === runtimeId), false);
@@ -90,6 +98,6 @@ for (const runtimeId of ["antigravity", "copilot"]) {
   });
 }
 
-test("Qwen Code and Qoder are experimental; no other runtime is", () => {
-  assert.deepEqual(RUNTIMES.filter((runtime) => isRuntimeExperimental(runtime.id)).map((runtime) => runtime.id).sort(), ["qoder", "qwen"]);
+test("Antigravity CLI, Qwen Code, Qoder and DeepSeek Harness are experimental; no other runtime is", () => {
+  assert.deepEqual(RUNTIMES.filter((runtime) => isRuntimeExperimental(runtime.id)).map((runtime) => runtime.id).sort(), ["antigravity", "dsh", "qoder", "qwen"]);
 });

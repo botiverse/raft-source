@@ -17,18 +17,25 @@ import { useIntl } from "react-intl";
 import AvatarSlot from "../ui/AvatarSlot";
 import Tooltip from "../ui/Tooltip";
 import { useServerStore } from "../../store/serverStore";
-import { originServerNames } from "../../utils/memberOrigin";
+import { originServerLogo, originServerNames } from "../../utils/memberOrigin";
 import type { MemberOrigin, OriginServer } from "../../utils/memberOrigin";
 
 /**
+ * A server's logo for its origin mark (originServerLogo): the one the server
+ * sent with the person, else the viewer's own copy of a server they belong
+ * to, else null.
+ */
+function useOriginServerLogo(server: OriginServer | undefined): string | null {
+  return useServerStore((state) => originServerLogo(server, state.servers));
+}
+
+/**
  * A server's own tile at the pickers' 14px: its logo when this client has it
- * (the servers the viewer belongs to), else its initial. Decoration: the name
- * is always written or spoken beside it. `className` resizes it.
+ * (useOriginServerLogo), else its initial. Decoration: the name is always
+ * written or spoken beside it. `className` resizes it.
  */
 function ServerOriginTile({ server, className }: { server: OriginServer; className?: string }) {
-  // The API names another server but sends no logo for it; only a server the
-  // viewer is also a member of has one here.
-  const logoUrl = useServerStore((state) => state.servers.find((candidate) => candidate.id === server.id)?.avatarUrl ?? null);
+  const logoUrl = useOriginServerLogo(server);
   return (
     <span aria-hidden="true" data-origin-tile={logoUrl ? "logo" : "initial"} className="inline-flex size-full shrink-0">
       <AvatarSlot context="picker-trigger" type="server" serverAvatarUrl={logoUrl} serverInitial={server.name} className={className} />
@@ -47,30 +54,50 @@ function ServerOriginTile({ server, className }: { server: OriginServer; classNa
  * It sizes itself from the avatar as drawn, not from its size name: the
  * message row shrinks an `md` avatar with `--mi-avatar`. A query container
  * over the avatar gives the tile a share of the face, with a floor and a cap;
- * on a small face (a narrow row) the tile is a plain dot, as it always is
- * with `dot` (the @ list's xs faces), where an initial cannot be read.
+ * on a small face (under 26px: a narrow row, and always with `dot`, the @
+ * list's xs faces) an initial cannot be read, so the tile is the server's logo
+ * in a circle, at least 10px so the logo can be recognised, and a plain dot
+ * only where no logo is known for the server (artin, #proj-mobile
+ * msg=608719a9; Lagoon and Kirby, #proj-raft-ui:a30f10a9).
  */
 export function AvatarOriginCorner({ origin, dot = false }: { origin: MemberOrigin; dot?: boolean }) {
   const first = origin.servers[0];
+  const logoUrl = useOriginServerLogo(first);
   if (!origin.external || !first) return null;
+  const mark = dot ? (logoUrl ? "logo" : "dot") : "tile";
   return (
     <span
       aria-hidden="true"
       data-testid="avatar-origin-corner"
-      data-origin-mark={dot ? "dot" : "tile"}
+      data-origin-mark={mark}
       className="pointer-events-none absolute inset-0 z-raised @container/origin"
     >
       <Tooltip content={originServerNames(origin)}>
-        <span className="pointer-events-auto absolute -top-[clamp(3px,9cqw,5px)] -left-[clamp(3px,9cqw,5px)] flex size-[clamp(7px,42cqw,19px)]">
-          {dot ? (
+        <span
+          className={
+            logoUrl
+              ? "pointer-events-auto absolute -top-[clamp(3px,9cqw,5px)] -left-[clamp(3px,9cqw,5px)] flex size-[clamp(10px,42cqw,19px)]"
+              : "pointer-events-auto absolute -top-[clamp(3px,9cqw,5px)] -left-[clamp(3px,9cqw,5px)] flex size-[clamp(7px,42cqw,19px)]"
+          }
+        >
+          {mark === "dot" ? (
             <span
               data-origin-tile="dot"
               className="size-full rounded-full border border-sticker-ink bg-sticker-ink shadow-[0_0_0_1.5px_var(--sticker-edge)]"
             />
+          ) : mark === "logo" ? (
+            <ServerOriginTile
+              server={first}
+              className="size-full! rounded-full! shadow-[0_0_0_1.5px_var(--sticker-edge)]"
+            />
           ) : (
             <ServerOriginTile
               server={first}
-              className="size-full! text-[length:clamp(8px,23cqw,11px)]! [&_*]:text-[length:inherit]! @max-[26px]/origin:rounded-full! @max-[26px]/origin:[&>*]:invisible"
+              className={
+                logoUrl
+                  ? "size-full! text-[length:clamp(8px,23cqw,11px)]! [&_*]:text-[length:inherit]! @max-[26px]/origin:rounded-full! @max-[26px]/origin:shadow-[0_0_0_1.5px_var(--sticker-edge)]"
+                  : "size-full! text-[length:clamp(8px,23cqw,11px)]! [&_*]:text-[length:inherit]! @max-[26px]/origin:rounded-full! @max-[26px]/origin:[&>*]:invisible"
+              }
             />
           )}
         </span>

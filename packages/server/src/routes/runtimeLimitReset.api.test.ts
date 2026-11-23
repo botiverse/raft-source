@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { RAFT_CLIENT_CAPABILITIES_HEADER, RUNTIME_USAGE_WINDOW_SCOPE_CLIENT_CAPABILITY } from "@botiverse/raft-shared";
 import type { RuntimeAccountUsageProvider, RuntimeAccountUsageSnapshot } from "@botiverse/raft-shared";
 
 import { getDb } from "../db/index";
-import { computers, machines, serverMembers, servers as serversTable, users } from "../db/schema";
+import { computers, integrationAuditEvents, machines, serverMembers, servers as serversTable, users } from "../db/schema";
+import { __setEmailDeliveryObserverForTests, type EmailDelivery } from "../services/emailService";
+import { CLAUDE_LIMIT_RESET_REQUEST_LIMIT } from "../services/runtimeAuthService";
 import { createServer } from "../services/serverService";
 import { RouteFailureError } from "../tracing/routeFailure";
 import { createApiTest } from "../test/integration/apiTest";
@@ -73,7 +75,7 @@ async function seedComputer(slug: string, options: { attached?: boolean } = {}) 
     attacher: await tokenForHuman(attacher.email),
     bystander: await tokenForHuman(bystander.email),
   };
-  return { server, machine: machine!, tokens, attacher };
+  return { server, machine: machine!, tokens, attacher, owner, admin };
 }
 
 function snapshot(resets: number): RuntimeAccountUsageSnapshot {
@@ -150,6 +152,7 @@ test("limit reset: only the attacher and server owners/admins may use one; the k
 });
 
 test("limit reset: offline, old or unattached Computers are refused; outcomes and timeouts are relayed", async ({ app }) => {
+  tracedEvents.length = 0;
   const { server, machine, tokens } = await seedComputer("limreset-avail");
   const redeem = api(app.baseUrl, server.id, machine.id);
 
@@ -192,6 +195,10 @@ test("limit reset: offline, old or unattached Computers are refused; outcomes an
   assert.equal(noOwner.status, 409);
   assert.equal((await noOwner.json() as { code: string }).code, "computer_not_attached");
   assert.equal(fake.redeems.length, 0);
+
+  // Every attempt, refused before the Computer or answered by it, leaves one result event for the daily count.
+  const outcomes = tracedEvents.filter((event) => event.name === "runtime_account_usage.limit_reset.result").map((event) => (event.attrs as { outcome?: string }).outcome);
+  assert.deepEqual(outcomes, ["computer_offline", "upgrade_required", "nothing_to_reset", "unknown", "timeout", "computer_offline", "not_attached"]);
 });
 
 test("limit reset: the usage read after it carries window scopes only to a client that declares it reads them", async ({ app }) => {
@@ -219,4 +226,109 @@ test("limit reset: the usage read after it carries window scopes only to a clien
     body: JSON.stringify({ idempotencyKey: KEY }),
   })).json() as { snapshot: RuntimeAccountUsageSnapshot };
   assert.deepEqual(capable.snapshot.accounts[0]!.windows[0]!.scope, { kind: "model", name: "GPT-5.3-Codex-Spark" });
+});
+
+/** Emails sent while a test runs (fake delivery); stop() before the test ends. */
+function watchEmails() {
+  const deliveries: EmailDelivery[] = [];
+  __setEmailDeliveryObserverForTests((delivery) => deliveries.push(delivery));
+  return { deliveries, stop: () => __setEmailDeliveryObserverForTests(null) };
+}
+
+/** The notice email is sent after the answer, unawaited: wait for it, briefly. */
+async function settle(done: () => boolean = () => false): Promise<void> {
+  for (let i = 0; i < 25 && !done(); i += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+}
+
+async function usedByOtherEvents(serverId: string) {
+  return getDb().select().from(integrationAuditEvents)
+    .where(and(eq(integrationAuditEvents.serverId, serverId), eq(integrationAuditEvents.eventType, "computer.limit_reset_used_by_other")));
+}
+
+test("limit reset: a Codex reset an owner or admin uses on a Computer someone else connected is audited and emailed to that person; their own is not", async ({ app }) => {
+  const { server, machine, tokens, attacher, owner, admin } = await seedComputer("limreset-other");
+  const fake = fakeOrchestrator();
+  app.app.set("agentOrchestrator", fake.orchestrator);
+  const redeem = api(app.baseUrl, server.id, machine.id);
+  const emails = watchEmails();
+  try {
+    assert.equal((await redeem(tokens.attacher)).status, 200);
+    await settle();
+    assert.deepEqual(await usedByOtherEvents(server.id), [], "the attacher's own use");
+    assert.equal(emails.deliveries.length, 0);
+
+    assert.equal((await redeem(tokens.admin)).status, 200);
+    assert.equal((await redeem(tokens.owner)).status, 200);
+    const events = await usedByOtherEvents(server.id);
+    assert.equal(events.length, 2);
+    for (const [user, role] of [[admin, "admin"], [owner, "owner"]] as const) {
+      const event = events.find((row) => row.actorId === user.id);
+      assert.ok(event, `${role}'s use is audited`);
+      assert.equal(event.outcome, "success");
+      assert.equal(event.eventCategory, "computer");
+      assert.equal(event.subjectId, attacher.id);
+      assert.equal(event.targetType, "machine");
+      assert.equal(event.targetId, machine.id);
+      assert.deepEqual(event.metadata, { machineId: machine.id, machineName: machine.name, provider: "codex", via: "redeem", answer: "reset", actorRole: role }, "no reset kind for Codex");
+    }
+
+    await settle(() => emails.deliveries.length >= 2);
+    assert.deepEqual(emails.deliveries.map((delivery) => [delivery.to, delivery.subject]).sort(), [
+      [attacher.email, `${admin.displayName} used a Codex limit reset on your Computer ${machine.name}`],
+      [attacher.email, `${owner.displayName} used a Codex limit reset on your Computer ${machine.name}`],
+    ]);
+
+    // A retry, with the same key, of a redeem that went through (its `reset` answer lost): a spend too.
+    app.app.set("agentOrchestrator", fakeOrchestrator({
+      redeem: async () => ({ type: "machine:runtime_account_usage:limit_reset:result", requestId: "r", result: { kind: "already_redeemed" } }),
+    }).orchestrator);
+    assert.equal((await redeem(tokens.admin)).status, 200);
+    const retried = (await usedByOtherEvents(server.id)).filter((row) => (row.metadata as { answer?: string }).answer === "already_redeemed");
+    assert.equal(retried.length, 1);
+    assert.equal(retried[0]!.actorId, admin.id);
+    await settle(() => emails.deliveries.length >= 3);
+    assert.equal(emails.deliveries.length, 3);
+  } finally {
+    emails.stop();
+  }
+});
+
+test("limit reset: an owner's or admin's Codex reset that was refused, limited, timed out or spent nothing is neither audited nor told", async ({ app }) => {
+  const { server, machine, tokens } = await seedComputer("limreset-other-refused");
+  const redeem = api(app.baseUrl, server.id, machine.id);
+  const emails = watchEmails();
+  try {
+    app.app.set("agentOrchestrator", fakeOrchestrator().orchestrator);
+    assert.equal((await redeem(tokens.bystander)).status, 403);
+    app.app.set("agentOrchestrator", fakeOrchestrator({ availability: "computer_upgrade_required" }).orchestrator);
+    assert.equal((await redeem(tokens.admin)).status, 409);
+
+    const spentNothing = [{ kind: "nothing_to_reset" }, { kind: "no_reset" }, { kind: "unknown" }, { kind: "something_new" }];
+    for (const result of spentNothing) {
+      app.app.set("agentOrchestrator", fakeOrchestrator({
+        redeem: async () => ({ type: "machine:runtime_account_usage:limit_reset:result", requestId: "r", result }),
+      }).orchestrator);
+      assert.equal((await redeem(tokens.admin)).status, 200, JSON.stringify(result));
+    }
+    app.app.set("agentOrchestrator", fakeOrchestrator({ redeem: async () => { throw new RouteFailureError("daemon_timeout", "timed out"); } }).orchestrator);
+    assert.equal((await redeem(tokens.owner)).status, 504);
+
+    // The admin has one counted per answer above; the rest fill the limit, then one that would have answered `reset` is refused.
+    app.app.set("agentOrchestrator", fakeOrchestrator({
+      redeem: async () => ({ type: "machine:runtime_account_usage:limit_reset:result", requestId: "r", result: { kind: "nothing_to_reset" } }),
+    }).orchestrator);
+    for (let i = spentNothing.length; i < CLAUDE_LIMIT_RESET_REQUEST_LIMIT; i += 1) assert.equal((await redeem(tokens.admin)).status, 200);
+    const resetting = fakeOrchestrator();
+    app.app.set("agentOrchestrator", resetting.orchestrator);
+    tracedEvents.length = 0;
+    assert.equal((await redeem(tokens.admin)).status, 429);
+    assert.equal(resetting.redeems.length, 0);
+    assert.deepEqual(tracedEvents.filter((event) => event.name === "runtime_account_usage.limit_reset.result").map((event) => (event.attrs as { outcome?: string }).outcome), ["rate_limited"], "a refused attempt is still counted");
+
+    await settle();
+    assert.deepEqual(await usedByOtherEvents(server.id), []);
+    assert.equal(emails.deliveries.length, 0);
+  } finally {
+    emails.stop();
+  }
 });

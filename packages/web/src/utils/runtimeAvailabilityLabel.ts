@@ -1,4 +1,4 @@
-import { getRuntimeDisplayName, isRuntimeExperimental } from "@botiverse/raft-shared";
+import { getRuntimeDisplayName } from "@botiverse/raft-shared";
 import type { RuntimeAvailabilitySuffix } from "@botiverse/raft-shared";
 import type { MessageId } from "../i18n/messages/en";
 
@@ -44,6 +44,9 @@ export function formatRuntimeAvailabilitySuffix(
  * runtime-options rows or its catalog): a runtime it offers again (Antigravity
  * on OAR) is not deprecated there. Required, so no surface labels from the
  * bundled flag by default; the hooks fall back to it for an old server.
+ *
+ * The catalog's `experimental` flag is not shown (cindyz, #triage:#524): the
+ * runtime pickers say what a runtime lacks in Raft instead.
  */
 export function formatRuntimeLabelWithStatus(
   runtimeId: string,
@@ -51,30 +54,5 @@ export function formatRuntimeLabelWithStatus(
   deprecated: boolean,
 ): string {
   const name = getRuntimeDisplayName(runtimeId);
-  if (deprecated) return `${name}${formatMessage({ id: "runtime.availability.deprecated" })}`;
-  if (isRuntimeExperimental(runtimeId)) return `${name}${formatMessage({ id: "runtime.availability.experimental" })}`;
-  return name;
-}
-
-/**
- * Runtime label for a place that draws raft-ui's `Badge.Experimental` beside
- * the name (the runtime pickers; the Computer page chips keep the text): the
- * product name plus a deprecated suffix, without the "(experimental)" text the
- * badge says instead. Pair with `runtimeShowsExperimentalBadge`.
- *
- * `deprecated` is the server's answer, as in `formatRuntimeLabelWithStatus`.
- */
-export function formatRuntimeLabelBesideBadge(
-  runtimeId: string,
-  formatMessage: (m: { id: MessageId }) => string,
-  deprecated: boolean,
-): string {
-  const name = getRuntimeDisplayName(runtimeId);
   return deprecated ? `${name}${formatMessage({ id: "runtime.availability.deprecated" })}` : name;
-}
-
-/** Whether `formatRuntimeLabelBesideBadge`'s name gets an Experimental badge
- *  (deprecated wins, as in `formatRuntimeLabelWithStatus`). */
-export function runtimeShowsExperimentalBadge(runtimeId: string, deprecated: boolean): boolean {
-  return !deprecated && isRuntimeExperimental(runtimeId);
 }

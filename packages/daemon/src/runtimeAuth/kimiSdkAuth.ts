@@ -102,6 +102,55 @@ export async function readKimiCodeSignInStatus(homeDir: string): Promise<Runtime
   return unreadable ? { kind: "unknown" } : { kind: "logged_out" };
 }
 
+/** The SDK's managed Kimi Code provider (`KIMI_CODE_PROVIDER_NAME`, not exported by the SDK). */
+const KIMI_CODE_MANAGED_PROVIDER = "managed:kimi-code";
+/** The SDK's env-configured model (`applyEnvModelConfig`): with it, no sign-in is needed. */
+const KIMI_ENV_MODEL_NAME = "KIMI_MODEL_NAME";
+/** Any API-key credential a provider in `config.toml` may carry instead of the sign-in (inline, env-named, `KIMI_API_KEY`). */
+const KIMI_CONFIG_API_KEY = /api[_-]?key/iu;
+const KIMI_CONFIG_PROVIDER_HEADER = /^\s*\[\s*providers\s*\.\s*(?:"([^"]*)"|'([^']*)'|([^\]\s]+))\s*\]/gmu;
+const KIMI_CONFIG_PROVIDER_REF = /^\s*provider\s*=\s*(?:"([^"]*)"|'([^']*)')/gmu;
+
+/**
+ * Whether a Kimi Code SDK start in `homeDir` clearly cannot run for want of
+ * the sign-in, read without the SDK and without network: no stored token
+ * (`readKimiCodeSignInStatus` says `logged_out`), and nothing else it could
+ * run on: no model from the environment (the SDK's `applyEnvModelConfig`
+ * takes one from `KIMI_MODEL_NAME` with its key; `env` is every environment
+ * the SDK may read), and no `config.toml` at all or one whose providers are
+ * all the managed Kimi Code one (the sign-in's) and that names no API key.
+ * Anything else, including a status or config that cannot be read, is no
+ * claim: false, and the start goes on (the SDK decides, as before).
+ */
+export async function kimiCodeStartNeedsSignIn(
+  homeDir: string,
+  options: {
+    env?: ReadonlyArray<Record<string, string | undefined>>;
+    readStatus?: (homeDir: string) => Promise<RuntimeAuthStatus>;
+  } = {},
+): Promise<boolean> {
+  if ((options.env ?? []).some((env) => (env[KIMI_ENV_MODEL_NAME] ?? "").trim() !== "")) return false;
+  const readStatus = options.readStatus ?? readKimiCodeSignInStatus;
+  let status: RuntimeAuthStatus;
+  try {
+    status = await readStatus(homeDir);
+  } catch {
+    return false;
+  }
+  if (status.kind !== "logged_out") return false;
+  let config: string;
+  try {
+    config = await readFile(path.join(homeDir, "config.toml"), "utf8");
+  } catch (error) {
+    return (error as NodeJS.ErrnoException | null)?.code === "ENOENT";
+  }
+  if (KIMI_CONFIG_API_KEY.test(config)) return false;
+  const providers = [...config.matchAll(KIMI_CONFIG_PROVIDER_HEADER)].map((match) => match[1] ?? match[2] ?? match[3]);
+  const references = [...config.matchAll(KIMI_CONFIG_PROVIDER_REF)].map((match) => match[1] ?? match[2]);
+  if (providers.length === 0) return false;
+  return [...providers, ...references].every((name) => name === KIMI_CODE_MANAGED_PROVIDER);
+}
+
 /**
  * One token slot as the SDK's `FileTokenStorage.load` and `classifyToken`
  * see it: a file that is missing, not JSON or not an object holds no token;

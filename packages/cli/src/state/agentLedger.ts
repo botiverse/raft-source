@@ -1161,6 +1161,48 @@ export function deleteExpiredContinuationRows(agentId: string, now: number, env:
   });
 }
 
+// ---- held artifact pushes (#345) ----
+
+// Additive (still version 1): a new artifact pushed with no page is held once
+// (shared agentOps/artifacts.ts); its push's key and when it was held, so the
+// same push again goes through. Created on first use, like the continuations.
+const ARTIFACT_PUSH_HOLDS_DDL = `CREATE TABLE IF NOT EXISTS artifact_push_holds (
+    key TEXT PRIMARY KEY,
+    held_at INTEGER NOT NULL
+  );`;
+
+/** Not best-effort: a failed read or write throws, and the push goes through instead of being held with nothing kept to let it pass. */
+function withArtifactPushHolds<T>(agentId: string, env: NodeJS.ProcessEnv, fn: (db: DatabaseSync) => T): T {
+  return withDb(agentId, env, (db) => {
+    const present = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'artifact_push_holds'").get();
+    if (!present) db.exec(ARTIFACT_PUSH_HOLDS_DDL);
+    return fn(db);
+  });
+}
+
+/** When the push with this key was held (ms since the epoch), if it was. */
+export function readArtifactPushHold(agentId: string, key: string, env: NodeJS.ProcessEnv = process.env): number | undefined {
+  return withArtifactPushHolds(agentId, env, (db) => {
+    const row = db.prepare("SELECT held_at FROM artifact_push_holds WHERE key = ?").get(key) as { held_at: number | bigint } | undefined;
+    return row === undefined ? undefined : Number(row.held_at);
+  });
+}
+
+/** Record that the push with this key was held at `heldAt`, dropping records held before `forgetBefore`. */
+export function writeArtifactPushHold(agentId: string, key: string, heldAt: number, forgetBefore: number, env: NodeJS.ProcessEnv = process.env): void {
+  withArtifactPushHolds(agentId, env, (db) => {
+    db.prepare("DELETE FROM artifact_push_holds WHERE held_at < ?").run(forgetBefore);
+    db.prepare("INSERT OR REPLACE INTO artifact_push_holds (key, held_at) VALUES (?, ?)").run(key, heldAt);
+  });
+}
+
+/** Forget the hold of the push with this key: it went through. */
+export function deleteArtifactPushHold(agentId: string, key: string, env: NodeJS.ProcessEnv = process.env): void {
+  withArtifactPushHolds(agentId, env, (db) => {
+    db.prepare("DELETE FROM artifact_push_holds WHERE key = ?").run(key);
+  });
+}
+
 // ---- counters ----
 
 /** Best-effort meta counter (observability only; never read back by behaviour). */

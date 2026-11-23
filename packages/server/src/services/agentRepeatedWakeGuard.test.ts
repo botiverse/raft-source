@@ -194,6 +194,21 @@ test("only an idle frame ends a turn cleanly; a start or a reconnect opens none"
   assert.ok(h.guard.noteActivity(AGENT, "online", "other", 8_000), "a legacy daemon's detail-less idle is a clean end");
 });
 
+test("#67: a compaction alone (the daemon's turn-end /compact) opens no turn; one inside a real turn leaves that turn counted", async () => {
+  const h = harness(1);
+  h.offer("m1");
+  h.guard.noteActivity(AGENT, "working", "compacting_context", 1_000);
+  h.guard.noteActivity(AGENT, "working", "compaction_finished", 2_000);
+  assert.equal(h.guard.noteActivity(AGENT, "online", "idle", 3_000), null, "compacting, then idle: no turn, nothing counted");
+  h.guard.noteActivity(AGENT, "working", "model_request_started", 4_000);
+  h.guard.noteActivity(AGENT, "working", "compacting_context", 5_000);
+  h.guard.noteActivity(AGENT, "working", "compaction_finished", 6_000);
+  const turn = h.guard.noteActivity(AGENT, "online", "idle", 7_000);
+  assert.ok(turn, "a real turn that compacted is still a turn");
+  assert.equal(turn.startedAtMs, 4_000);
+  assert.ok(await h.guard.completeTurn(AGENT, turn), "and counts as one (threshold 1)");
+});
+
 test("a turn long after the previous one starts a new streak (wakes the server does not see, like an hourly reminder)", async () => {
   const h = harness(3);
   h.offer("m1");

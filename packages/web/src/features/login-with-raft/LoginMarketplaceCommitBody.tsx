@@ -102,6 +102,11 @@ export function LoginMarketplaceCommitBody({ server, entry, installed, canInstal
             },
           )}
         </p>
+      ) : !server ? (
+        // Several Servers and none picked yet (initialServerPick): ask for one.
+        <p className="text-callout text-foreground">
+          {formatMessage({ id: "pages.humanLogin.chooseServer" })}
+        </p>
       ) : (
         <p className="text-callout text-foreground">
           {formatMessage({ id: "pages.humanLogin.serverStatusUnavailable" })}

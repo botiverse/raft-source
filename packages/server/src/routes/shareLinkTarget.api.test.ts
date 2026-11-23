@@ -24,7 +24,7 @@ type ShareCreated = {
   token: string;
 };
 
-const INVALID_INVITE = { error: "This private app invite is invalid or has expired", code: "private_app_invite_invalid" };
+const INVALID_INVITE = { error: "This private app invite is invalid or has expired", code: "private_app_invite_invalid", errorCode: "private_app_invite_invalid" };
 
 async function seedSharedApp(seed: Seed) {
   const owner = await seed.human();

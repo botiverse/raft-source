@@ -133,11 +133,54 @@ export interface ReadStateProjection {
    * newer than this is not covered: see projectionCoversActivity.
    */
   throughSeq?: number | null;
+  /**
+   * #triage:#244: the seqs of the loaded messages above the read cursor, set
+   * only on a complete projection (loadedReadStateProjection: the loaded
+   * window reaches back to the read, has no gap and no newer page). Seqs are
+   * server-wide, so a conversation's are not contiguous: a lowering is proven
+   * by the window being complete AND the row's activity message being one of
+   * these (a frozen tab that missed the newest reply does not have it).
+   * Absent: nothing proven above the read.
+   */
+  loadedSeqsAboveRead?: readonly number[];
+  /** The read cursor the projection counted from (diagnostics, #244). */
+  readSeq?: number;
+  /** How many loaded messages, and the lowest loaded seq, it looked at (diagnostics, #244). */
+  loadedCount?: number;
+  loadedMinSeq?: number | null;
 }
 
 /** What a projection covers: its read cursor (all read, loaded or not) and the newest loaded message it counted. */
 export function projectionThroughSeq(messages: readonly { seq?: number | null }[], maxReadSeq: number): number {
   return messages.reduce((max, message) => (message.seq != null && message.seq > max ? message.seq : max), maxReadSeq);
+}
+
+/**
+ * #triage:#244: may a projection LOWER a row served with activity through
+ * `activitySeq`? A read at or past it proves it (nothing after the read is
+ * left). Otherwise only a complete projection (its window reaches from the
+ * read to the latest with no gap) that has the row's activity message loaded
+ * proves it. Seqs are server-wide (not contiguous within a conversation), so
+ * this is decided by the window's own ordering, never by integer adjacency.
+ * An unknown side proves nothing, so the served (higher) count stays.
+ */
+export function projectionProvesLowering(projection: ReadStateProjection, activitySeq: string | null | undefined): boolean {
+  if (activitySeq == null || compareActivitySeq(activitySeq, "0") < 0) return false; // unknown, or not a canonical seq
+  if (projection.readSeq != null && compareActivitySeq(activitySeq, String(projection.readSeq)) <= 0) return true;
+  if (!projection.complete || !projection.loadedSeqsAboveRead) return false;
+  return projection.loadedSeqsAboveRead.some((seq) => compareActivitySeq(activitySeq, String(seq)) === 0);
+}
+
+/** What a projection made from `messages` read through `maxReadSeq` covers, and its inputs (#244 diagnostics). */
+export function projectionCoverage(messages: readonly { seq?: number | null }[], maxReadSeq: number): Pick<ReadStateProjection, "throughSeq" | "loadedSeqsAboveRead" | "readSeq" | "loadedCount" | "loadedMinSeq"> {
+  const seqs = messages.flatMap((message) => (message.seq != null ? [message.seq] : []));
+  return {
+    throughSeq: projectionThroughSeq(messages, maxReadSeq),
+    loadedSeqsAboveRead: seqs.filter((seq) => seq > maxReadSeq),
+    readSeq: maxReadSeq,
+    loadedCount: messages.length,
+    loadedMinSeq: seqs.length > 0 ? Math.min(...seqs) : null,
+  };
 }
 
 /** Does a projection cover a row served with activity through `activitySeq`? (An unknown side is covered, as before.) */

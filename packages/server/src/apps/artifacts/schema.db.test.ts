@@ -161,7 +161,10 @@ test("the original message: set with how it came, a message's delete goes throug
 
   // A message is an origin only with how it became one, and only as one of those.
   await assert.rejects(db.insert(artifactItems).values(item({ originMessageId: await message() })), violates("items_origin_message_via"));
-  await assert.rejects(db.insert(artifactItems).values(item({ originMessageId: await message(), originVia: "link" as never })), violates("items_origin_via"));
+  await assert.rejects(db.insert(artifactItems).values(item({ originMessageId: await message(), originVia: "forward" as never })), violates("items_origin_via"));
+  // `link` (linkOrigin.ts) is one of them.
+  const [linked] = await db.insert(artifactItems).values(item({ originMessageId: await message(), originVia: "link" })).returning();
+  assert.equal(linked!.originVia, "link");
 
   // No foreign key (Tenny): core deletes the message without the app in the
   // way, and the Artifact keeps the id as it was (readers show none: the

@@ -2,6 +2,7 @@
 // Server: files land in the directory with the base recorded; push sends
 // only changed files, uploads what the Server lacks, takes in merged files
 // and moves the base; refusals happen before any request where they can.
+import { __setCliTraceSinkForTest } from "../../transportTrace";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +14,7 @@ import type { AgentContext } from "../../auth/env";
 import type { CliIo } from "../../core/io";
 import { buildRaftProgram } from "../../program";
 import { opError } from "@botiverse/raft-shared/src/agentCliSurface";
+import { CliExit } from "../../core/errors";
 import { PULL_DIR_NAME_MAX, pullDirName } from "./_dir";
 import { artifactCliError } from "./_shared";
 import { mapConcurrently } from "./pull";
@@ -34,7 +36,11 @@ const FILES: Record<string, string> = { "index.html": "<h1>v12</h1>", "assets/ap
 
 type Handler = (method: string, path: string, body?: unknown) => { status?: number; data?: unknown; bytes?: Uint8Array; errorBody?: unknown };
 
-async function run(argv: string[], handler: Handler) {
+// The agent ledger these runs keep held pushes in (#345): a temporary one, never the real Raft home.
+const LEDGER_DIR = mkdtempSync(join(tmpdir(), "raft-artifact-ledger-"));
+afterAll(() => rmSync(LEDGER_DIR, { recursive: true, force: true }));
+
+async function run(argv: string[], handler: Handler, options: { now?: () => number } = {}) {
   const stdout: string[] = [];
   const stderr: string[] = [];
   const requests: Array<{ method: string; path: string; body?: unknown; size?: number }> = [];
@@ -51,7 +57,8 @@ async function run(argv: string[], handler: Handler) {
   };
   const program = buildRaftProgram({
     io,
-    env: {},
+    env: { SLOCK_CLI_STATE_DIR: LEDGER_DIR },
+    ...(options.now ? { now: options.now } : {}),
     loadAgentContext: () => agentContext,
     createApiClient: () => ({
       request: async <T>(method: string, path: string, body?: unknown) => { requests.push({ method, path, body }); return reply<T>(method, path, body); },
@@ -319,7 +326,7 @@ test("push: a refusal code this CLI doesn't know (a newer Server) shows the Serv
     writeFileSync(join(dir, "tech.html"), "tech mine");
     const r = await run(["artifact", "push", dir], () => ({ status: 400, errorBody: { error: "A newer rule refused this push: give it what the rule asks for, then push again.", code: "SOMETHING_NEWER" } }));
     assert.ok(r.error !== null, "exits nonzero");
-    const latest = "Next action: Change what the error says, then run the same command again. If it doesn't say what to change, this Raft CLI may be older than the Raft Server: ask the owner of this computer to update its Raft Computer to the latest version.";
+    const latest = "Next action: Change what the error says, then run the same command again. If it doesn't say what to change, this Raft CLI may be older than the Raft Server: ask the person who connected this computer, or a server owner or admin, to update its Raft Computer to the latest version.";
     assert.equal(r.stderr, [
       "Error: A newer rule refused this push: give it what the rule asks for, then push again.",
       "Code: SOMETHING_NEWER",
@@ -360,20 +367,20 @@ test("push: FILE_UPLOAD_QUOTA_EXCEEDED (the attachments' monthly quota) names th
     const r = await run(["artifact", "push", dir], () => ({
       status: 403,
       errorBody: {
-        error: "Monthly file upload quota exceeded. Free includes 100 MB of file uploads per month; upgrade to Pro for higher file upload limits.",
+        error: "Monthly file upload quota exceeded. Free includes 100 MB of file uploads per month; Pro has no monthly upload limit.",
         errorCode: "FILE_UPLOAD_QUOTA_EXCEEDED",
         code: "FILE_UPLOAD_QUOTA_EXCEEDED",
         requestedBytes: 9,
         quota,
         billingUrl,
-        suggestedNextAction: `Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: ${billingUrl}`,
+        suggestedNextAction: `Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Plan & billing: ${billingUrl}`,
         details: { requestedBytes: 9, quota, billingUrl },
       },
     }));
     assert.ok(r.error !== null, "exits nonzero");
     assert.ok(r.stderr.includes("Code: FILE_UPLOAD_QUOTA_EXCEEDED"), r.stderr);
     assert.ok(r.stderr.includes("Not stored: this server's monthly file upload quota is used up (100 MiB of 100 MiB used this month). The Free plan includes 100 MB of uploads a month, and artifact files count against it as attachments do."), r.stderr);
-    assert.ok(r.stderr.includes(`Next action: Say in the conversation that the files weren't stored and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: ${billingUrl}. Until then, only files the server already has (unchanged ones) can be pushed.\n`), r.stderr);
+    assert.ok(r.stderr.includes(`Next action: Say in the conversation that the files weren't stored and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Plan & billing: ${billingUrl}. Until then, only files the server already has (unchanged ones) can be pushed.\n`), r.stderr);
     assert.equal(JSON.parse(readFileSync(join(dir, ".raft-artifact.json"), "utf8")).version, 12, "the base stays");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -396,7 +403,7 @@ test("push: FILE_UPLOAD_QUOTA_EXCEEDED with the Server's upgrade card (details.u
     const r = await run(["artifact", "push", dir], () => ({
       status: 403,
       errorBody: {
-        error: "Monthly file upload quota exceeded. Free includes 100 MB of file uploads per month; upgrade to Pro for higher file upload limits.",
+        error: "Monthly file upload quota exceeded. Free includes 100 MB of file uploads per month; Pro has no monthly upload limit.",
         errorCode: "FILE_UPLOAD_QUOTA_EXCEEDED",
         code: "FILE_UPLOAD_QUOTA_EXCEEDED",
         requestedBytes: 9,
@@ -534,6 +541,9 @@ test("push --target a thread: the thread target is sent as given; the reply says
         ? { kind: "conversation", conversation: { id: "c-dm", type: "dm", target: "dm:@tenny" } }
         : { kind: "conversation", conversation: { id: "c-1", type: "channel", target: "#proj-workspace" } };
       const created = { ...summary, id: "pt_new", title: "Demo", kind: "pdf", home, currentVersion: 1 };
+      // No page in it: held once (#345), then the same command goes through.
+      const held = await run(["artifact", "push", dir, "--target", target, "--title", "Demo", "--entry", "x.pdf"], () => { throw new Error("no request expected"); });
+      assert.ok(held.stderr.startsWith("Error: Held — not pushed.") && !held.stderr.includes("Code:"), held.stderr);
       const r = await run(["artifact", "push", dir, "--target", target, "--title", "Demo", "--entry", "x.pdf"], (_m, path, body) => {
         if (path === `${BASE}/push`) {
           assert.equal((body as { target?: string }).target, target, "the thread suffix is sent, not dropped");
@@ -590,6 +600,143 @@ test("push a new directory needs a title: --title, else its page's <title>; neit
     });
     assert.equal(r.error, null, r.stderr);
     assert.ok(r.stdout.startsWith(`Pushed "Q3 & Q4 report" (pt_new) as v1`), r.stdout);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// A new artifact with no page (#345): held once before any request, with the attachment to send instead.
+const createdNoPage = (files: string[]) => ({ status: 201, data: { artifact: { ...summary, id: "pt_new", title: "Report", kind: "pdf", currentVersion: 1 }, version: { number: 1, filesFromYou: files, deleted: [], base: null, previous: null, merged: [] }, unseen: { otherComments: 0 }, notified: [], replayed: false, unchanged: false } });
+const noRequest = () => { throw new Error("no request expected"); };
+
+test("push a new directory with no page: held once before any request (exit 1, no code line), with the attachment to send instead; the same command again pushes it", async () => {
+  const root = mkdtempSync(join(tmpdir(), "raft-artifact-nopage-"));
+  const dir = join(root, "report");
+  try {
+    mkdirSync(dir);
+    writeFileSync(join(dir, "report.pdf"), "%PDF-1.4");
+    const argv = ["artifact", "push", dir, "--target", "#proj-workspace", "--title", "Report"];
+    // The agent is shown no code for the hold; how often it fires and is run again is counted by trace spans.
+    const spans: Array<Record<string, unknown>> = [];
+    __setCliTraceSinkForTest((record) => { if (record.name === "cli.held_once") spans.push(record.attrs); });
+    const held = await run(argv, noRequest);
+    assert.ok(held.error instanceof CliExit && held.error.exitCode === 1, "exits 1");
+    assert.deepEqual(held.requests, [], "nothing sent, nothing uploaded");
+    assert.equal(held.stdout, "");
+    assert.equal(held.stderr, [
+      "Error: Held — not pushed. Send report.pdf as an attachment instead. An artifact keeps versions, takes comments and holds several files together, and it costs more to make and to keep up; a finished file that won't be revised needs none of that.",
+      "Next action: Upload it:",
+      `  raft attachment upload --path ${dir}/report.pdf --target "#proj-workspace"`,
+      `then send your message with the id it prints: raft message send --target "#proj-workspace" --attachment-id <id>`,
+      "Only if you will revise it in Raft or people must comment on it there, run the same command again.",
+      "",
+    ].join("\n"));
+    assert.ok(!existsSync(join(dir, ".raft-artifact.json")), "nothing recorded in the directory");
+    assert.deepEqual(readdirSync(dir), ["report.pdf"], "the hold is not kept in the pushed directory");
+
+    const again = await run(argv, (_m, path, body) => {
+      if (path === `${BASE}/push`) {
+        assert.deepEqual((body as { files: Array<{ path: string }> }).files.map((f) => f.path), ["report.pdf"]);
+        return createdNoPage(["report.pdf"]);
+      }
+      return {};
+    });
+    assert.equal(again.error, null, again.stderr);
+    assert.ok(again.stdout.startsWith(`Pushed "Report" (pt_new) as v1`), again.stdout);
+    assert.ok(existsSync(join(dir, ".raft-artifact.json")), "pushed: the directory now holds the new artifact");
+    assert.deepEqual(spans, [
+      { hold_kind: "artifact_push_no_page", outcome: "held" },
+      { hold_kind: "artifact_push_no_page", outcome: "went_through" },
+    ]);
+  } finally {
+    __setCliTraceSinkForTest(null);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("push a new directory with no page: held again once its files change, or when run again more than 10 minutes later", async () => {
+  const root = mkdtempSync(join(tmpdir(), "raft-artifact-nopage-"));
+  const dir = join(root, "report");
+  let now = Date.parse("2026-11-20T10:00:00.000Z");
+  const clock = { now: () => now };
+  try {
+    mkdirSync(dir);
+    writeFileSync(join(dir, "report.pdf"), "%PDF-1.4");
+    const argv = ["artifact", "push", dir, "--target", "#ops", "--title", "Report", "--entry", "report.pdf"];
+    const isHeld = (r: { stderr: string; requests: unknown[] }) => r.stderr.startsWith("Error: Held — not pushed.") && !r.stderr.includes("Code:") && r.requests.length === 0;
+    assert.ok(isHeld(await run(argv, noRequest, clock)));
+    now += 60_000;
+    writeFileSync(join(dir, "data.csv"), "a,b");
+    const changed = await run(argv, noRequest, clock);
+    assert.ok(isHeld(changed), "a file added: held again");
+    assert.ok(changed.stderr.includes("Send these 2 files as attachments instead (data.csv and report.pdf). An artifact keeps versions, takes comments and holds several files together, and it costs more to make and to keep up; finished files that won't be revised need none of that."), changed.stderr);
+    now += 60_000;
+    writeFileSync(join(dir, "data.csv"), "a,b,c");
+    assert.ok(isHeld(await run(argv, noRequest, clock)), "a file's size changed: held again");
+    now += 10 * 60_000 + 1;
+    assert.ok(isHeld(await run(argv, noRequest, clock)), "more than 10 minutes later: held again");
+    now += 5 * 60_000;
+    const r = await run(argv, (_m, path) => (path === `${BASE}/push` ? createdNoPage(["data.csv", "report.pdf"]) : {}), clock);
+    assert.equal(r.error, null, r.stderr);
+    assert.ok(r.requests.some((q) => q.path === `${BASE}/push`), "the same command within 10 minutes pushes");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("push with no page is never held for a pulled directory's new version, nor for a new directory with an HTML or Markdown page", async () => {
+  const root = mkdtempSync(join(tmpdir(), "raft-artifact-nopage-"));
+  try {
+    const pulled = join(root, "pulled");
+    mkdirSync(pulled);
+    writeFileSync(join(pulled, "x.pdf"), "%PDF-1.5");
+    writeFileSync(join(pulled, ".raft-artifact.json"), JSON.stringify({ artifact: "pt_abc", title: "Proto", version: 12, files: { "x.pdf": sha("%PDF-1.4") } }));
+    const v13 = await run(["artifact", "push", pulled], (_m, path) => (path === `${BASE}/push`
+      ? { status: 201, data: { artifact: { ...summary, kind: "pdf", currentVersion: 13 }, version: { number: 13, filesFromYou: ["x.pdf"], deleted: [], base: 12, previous: 12, merged: [] }, unseen: { otherComments: 0 }, notified: [], replayed: false, unchanged: false } }
+      : {}));
+    assert.equal(v13.error, null, v13.stderr);
+    assert.ok(v13.stdout.startsWith(`Pushed v13 of "Proto" (pt_abc)`), v13.stdout);
+
+    for (const page of ["summary.md", "summary.html"]) {
+      const dir = join(root, page.replace(".", "_"));
+      mkdirSync(dir);
+      writeFileSync(join(dir, "report.pdf"), "%PDF-1.4");
+      writeFileSync(join(dir, page), "# Summary");
+      const r = await run(["artifact", "push", dir, "--target", "#ops", "--title", "Report"], (_m, path) => (path === `${BASE}/push` ? createdNoPage(["report.pdf", page]) : {}));
+      assert.equal(r.error, null, `${page}: ${r.stderr}`);
+      assert.ok(r.requests.some((q) => q.path === `${BASE}/push`), `${page}: pushed at once`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("push with no page counts the files the push sends: a hidden page is left out (held) unless --include-hidden sends it", async () => {
+  const root = mkdtempSync(join(tmpdir(), "raft-artifact-nopage-"));
+  const dir = join(root, "report");
+  try {
+    mkdirSync(dir);
+    writeFileSync(join(dir, "report.pdf"), "%PDF-1.4");
+    writeFileSync(join(dir, ".notes.md"), "# notes");
+    const held = await run(["artifact", "push", dir, "--target", "#ops", "--title", "Report", "--entry", "report.pdf"], noRequest);
+    assert.ok(held.stderr.includes("Error: Held — not pushed. Send report.pdf as an attachment instead. An artifact keeps versions, takes comments and holds several files together, and it costs more to make and to keep up; a finished file that won't be revised needs none of that.\n"), held.stderr);
+    const hidden = await run(["artifact", "push", dir, "--target", "#ops", "--title", "Report", "--entry", "report.pdf", "--include-hidden"], (_m, path) => (path === `${BASE}/push` ? createdNoPage([".notes.md", "report.pdf"]) : {}));
+    assert.equal(hidden.error, null, hidden.stderr);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("push with no page, several files in a directory with a space: three named and how many more; the first file's path quoted as one argument", async () => {
+  const root = mkdtempSync(join(tmpdir(), "raft-artifact-nopage-"));
+  const dir = join(root, "Q3 report");
+  try {
+    mkdirSync(dir);
+    for (const name of ["e.zip", "c.csv", "a.pdf", "d.zip", "b.png"]) writeFileSync(join(dir, name), name);
+    const held = await run(["artifact", "push", dir, "--target", "#ops", "--title", "Data", "--entry", "a.pdf"], noRequest);
+    assert.ok(held.error instanceof CliExit && held.error.exitCode === 1, "exits 1");
+    assert.ok(held.stderr.startsWith("Error: Held — not pushed. Send these 5 files as attachments instead (a.pdf, b.png, c.csv and 2 more). An artifact keeps versions, takes comments and holds several files together, and it costs more to make and to keep up; finished files that won't be revised need none of that.\n"), held.stderr);
+    assert.ok(held.stderr.includes(`\n  raft attachment upload --path '${dir}/a.pdf' --target "#ops" (one command per file)\n`), held.stderr);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -825,7 +972,7 @@ test("push --announcement is refused before any push: announcements off, no righ
 
     const forbidden = await run(["artifact", "push", dir, "--target", "#ops", "--title", "Rules", "--announcement"], (method, path) => (method === "GET" && path === "/internal/agent-api/server" ? opsEntry({ announcement: null, channelCapabilities: { editChannelMetadata: false } }) : {}));
     assert.ok(forbidden.stderr.includes("Code: CHANNEL_ANNOUNCEMENT_FORBIDDEN"), forbidden.stderr);
-    assert.ok(forbidden.stderr.includes("Only the owner of #ops (one of its channel admins) or a server owner or admin can set its announcement."), forbidden.stderr);
+    assert.ok(forbidden.stderr.includes("Only a channel admin of #ops or a server owner or admin can set its announcement."), forbidden.stderr);
     assert.ok(forbidden.stderr.includes(`raft channel update --target "#ops" --announcement <artifact>`), forbidden.stderr);
     assert.ok(!forbidden.requests.some((req) => req.path === `${BASE}/push`));
 

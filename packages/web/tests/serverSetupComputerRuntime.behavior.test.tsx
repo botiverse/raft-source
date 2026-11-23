@@ -161,6 +161,8 @@ test("runtime catalog is derived from the shared registry with Screen B filterin
   const catalog = getServerSetupRuntimeCatalog(setupRuntimeOptions([]));
   assert.deepEqual(catalog.recommended.map((runtime) => runtime.displayName), ["Claude Code", "Codex CLI"]);
   assert.deepEqual(catalog.supported.map((runtime) => runtime.displayName), [
+    // No longer deprecated: setup offers it like the other supported runtimes.
+    "Antigravity CLI",
     "Cursor CLI",
     "Grok Build",
     "Kimi Code",
@@ -323,6 +325,29 @@ test("no usable runtime keeps the education box, without turning it into a choos
   fireEvent.click(screen.getByRole("button", { name: /Own API key/i }));
   assert.ok(screen.getByText("Use your own API key instead of installing a runtime."));
   assert.ok(screen.queryByText(/same tier|not a fallback/i) === null);
+});
+
+test("the runtime list marks Claude Code and Codex Recommended, and says under the others what they lack in Raft (#triage:#524)", () => {
+  renderStep({ runtimeIds: ["builtin"], runtimeStatus: "not_ready" });
+  const recommendedHeading = screen.getByText("Recommended");
+  const claudeRow = screen.getByTestId("onboarding-runtime-row-claude");
+  // Under the Recommended heading, before the first row; and no hint of their own.
+  assert.ok(recommendedHeading.compareDocumentPosition(claudeRow) & Node.DOCUMENT_POSITION_FOLLOWING);
+  assert.ok(screen.queryByTestId("onboarding-runtime-hint-claude") === null);
+  assert.ok(screen.queryByTestId("onboarding-runtime-hint-codex") === null);
+  assert.equal(
+    screen.getByTestId("onboarding-runtime-hint-cursor").textContent,
+    "May be harder to correct in Raft: it can't take new instructions mid-task or split work into parallel tasks.",
+  );
+  assert.ok(screen.getByTestId("onboarding-runtime-row-cursor").contains(screen.getByTestId("onboarding-runtime-hint-cursor")));
+  // Kimi Code lacks nothing: no hint.
+  assert.ok(screen.queryByTestId("onboarding-runtime-hint-kimi-sdk") === null);
+  // Limited after the name of a runtime without mid-turn steering, never a recommended one.
+  assert.equal(screen.getByTestId("onboarding-runtime-limited-cursor").textContent, "Limited");
+  assert.ok(screen.getByTestId("onboarding-runtime-row-cursor").contains(screen.getByTestId("onboarding-runtime-limited-cursor")));
+  assert.ok(screen.queryByTestId("onboarding-runtime-limited-claude") === null);
+  assert.ok(screen.queryByTestId("onboarding-runtime-limited-codex") === null);
+  assert.ok(screen.queryByTestId("onboarding-runtime-limited-kimi-sdk") === null);
 });
 
 // task #159 — the whole point of the SSOT change. The machine store can shout

@@ -15,7 +15,11 @@
  * attachmentUploadFallbackTrace.ts — no fallback after a session exists).
  *
  * Fields:
- *   reason            network_error (no HTTP status) / http_status
+ *   reason            network_error (no HTTP status) / http_status /
+ *                     idle_timeout (no progress for
+ *                     ATTACHMENT_TRANSFER_IDLE_TIMEOUT_MS, or no answer for
+ *                     ATTACHMENT_UPLOAD_RESPONSE_TIMEOUT_MS after the last
+ *                     byte, #triage:#545)
  *   http_status       the PUT's status, null for network_error
  *   error_name        the error's own `name`, when the PUT threw
  *   error_code        the error's own `code`, when the PUT threw
@@ -49,7 +53,7 @@ export function __setDirectPutFailureEmitterForTest(next: DirectPutFailureEmitte
   emitter = next ?? emitWebEvent;
 }
 
-export type DirectPutFailureReason = "network_error" | "http_status";
+export type DirectPutFailureReason = "network_error" | "http_status" | "idle_timeout";
 export type DirectPutSizeBucket = "<10MB" | "10-50MB" | "50-200MB" | ">200MB";
 export type DirectPutElapsedBucket = "<1s" | "1-10s" | "10-60s" | "1-5m" | ">5m";
 export type DirectPutSentBucket = "<10%" | "10-50%" | "50-90%" | "90-99%" | "100%";

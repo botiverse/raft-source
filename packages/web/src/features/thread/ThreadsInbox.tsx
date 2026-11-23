@@ -1,6 +1,5 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode, UIEvent } from "react";
-import { createPortal } from "react-dom";
 import { useIntl } from "react-intl";
 import Tooltip from "../../components/ui/Tooltip";
 import { ArrowUp, CheckCheck, ChevronDown, ListFilter, TriangleAlert } from "lucide-react";
@@ -27,9 +26,10 @@ import { activityInboxTraceScope, currentActivityInboxTraceCycle, traceActivityI
 import { TabRootBar } from "../../components/layout/TabRootBar";
 import { isHostShell } from "../../embed";
 import EmptyState from "../../components/ui/EmptyState";
-import { placeInboxContextMenu } from "../../components/thread/inboxContextMenuPosition";
+import { capturePointAnchor } from "../../components/ui/popupAnchor";
 import DismissBackdrop from "../../components/ui/DismissBackdrop";
 import { InboxContextMenu } from "../../components/thread/InboxContextMenu";
+import type { LongPressCoords } from "../../hooks/useLongPress";
 import { useRetireJump } from "../../hooks/useRetireJump";
 import { swallowClickAfterPress } from "../../hooks/useRowSwipe";
 import { useActivitySwipeActions } from "../../components/thread/activitySwipeActions";
@@ -343,14 +343,15 @@ export function ThreadsInbox() {
 
   const openCtxMenu = useCallback((e: React.MouseEvent, item: InboxItem) => {
     e.preventDefault();
-    setCtxMenu(placeInboxContextMenu({ x: e.clientX, y: e.clientY, item }));
+    const target = e.currentTarget instanceof Element ? e.currentTarget : null;
+    setCtxMenu({ anchor: capturePointAnchor(e.clientX, e.clientY, target), item });
   }, []);
   // iOS can land a synthetic click after the long-press touchend; it must
   // not dismiss the menu that press just opened.
   const ctxMenuTouchOpenedAtRef = useRef(0);
-  const openCtxMenuFromLongPress = useCallback((coords: { x: number; y: number }, item: InboxItem) => {
+  const openCtxMenuFromLongPress = useCallback((coords: LongPressCoords, item: InboxItem) => {
     ctxMenuTouchOpenedAtRef.current = Date.now();
-    setCtxMenu(placeInboxContextMenu({ x: coords.x, y: coords.y, item }));
+    setCtxMenu({ anchor: capturePointAnchor(coords.x, coords.y, coords.target), item });
   }, []);
   const closeCtxMenu = useCallback(() => setCtxMenu(null), []);
   const dismissCtxMenu = useCallback(() => {
@@ -485,9 +486,8 @@ export function ThreadsInbox() {
     <DismissBackdrop onDismiss={dismissCtxMenu} trapContextMenu />
   ) : null;
 
-  const contextMenuPortal = ctxMenu ? createPortal(
-    <InboxContextMenu ctxMenu={ctxMenu} onClose={closeCtxMenu} onDone={rowDone} onUnfollow={rowUnfollow} />,
-    document.body,
+  const contextMenuPortal = ctxMenu ? (
+    <InboxContextMenu ctxMenu={ctxMenu} onClose={closeCtxMenu} onDone={rowDone} onUnfollow={rowUnfollow} />
   ) : null;
 
   // Counts are numbers, so Space Mono, like Tasks' count. Both numbers use
@@ -637,13 +637,13 @@ export function ThreadsInbox() {
         />
       )}
 
-      {/* Task #164: the rows and counts may be the last known ones; say so
-          once, under the head. Not with the failed state: that already says
-          the list did not load. */}
+      {/* Task #164: the rows and counts may be the last known ones; they
+          update silently. Only reads that cannot catch up on their own
+          (RisingWave not configured) say so, once, under the head. Not with
+          the failed state: that already says the list did not load. */}
       {!showLoadFailed && (
         <StaleCountsNotice
           surfaces={ACTIVITY_SURFACES}
-          messageId="thread.staleNotice"
           unavailableMessageId="thread.unavailableNotice"
           data-testid="activity-stale-notice"
         />
@@ -776,7 +776,7 @@ export function ThreadsInbox() {
                         focusRef: isFocused ? focusedRowRef : undefined,
                       };
                       return item.kind === "object" ? (
-                        <ObjectInboxRow key={key} item={item} swipe={phoneTouch ? rowSwipeFor(rowSwipe, key === liveOpenSwipeKey) : undefined} {...rowProps} />
+                        <ObjectInboxRow key={key} item={item} swipe={phoneTouch ? (key === liveOpenSwipeKey ? openRowSwipe : closedRowSwipe) : undefined} {...rowProps} />
                       ) : (
                         <InboxRow key={key} item={item} searchQuery={inboxSearchQuery} taskV2={taskV2} swipe={phoneTouch ? (key === liveOpenSwipeKey ? openRowSwipe : closedRowSwipe) : undefined} {...rowProps} />
                       );

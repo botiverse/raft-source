@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import {
+  buildSearchEntityEntries,
   buildSearchEntityEntriesWhenQueryPresent,
   buildSearchEntityResults,
 } from "../searchEntities";
+import type { SearchEntityCatalogParams } from "../searchEntities";
 
 test("skips entity entry construction until the query has non-whitespace text", () => {
   let channelScans = 0;
@@ -374,17 +376,14 @@ test("a channel matched by its description gets the description, cut like a mess
   );
 });
 
-test("archived channels rank below live ones, and channels you haven't joined below ones you're in, whatever the match", () => {
-  // xxchan, #triage:666d1506: "onboarding" put three archived onboarding-<name> channels above wg-onboarding-v3.
+test("the local first paint has no status tiers: archived and not-joined channels rank by the match alone (the server ranks them)", () => {
   const archivedAt = "2026-11-01T00:00:00.000Z";
   const results = buildSearchEntityResults({
     query: "onboarding",
     channels: [
-      { id: "a1", name: "onboarding-xxchan02", description: null, type: "private", createdAt: "", archivedAt, joined: true },
-      { id: "a2", name: "onboarding-qizhi-wang", description: null, type: "private", createdAt: "", archivedAt, joined: false },
-      { id: "p1", name: "onboarding-zhiqiang-zhou", description: null, type: "private", createdAt: "", joined: false },
+      { id: "a1", name: "onboarding", description: null, type: "channel", createdAt: "", archivedAt, joined: true },
+      { id: "p1", name: "onboarding-zhou", description: null, type: "channel", createdAt: "", joined: false },
       { id: "w1", name: "wg-onboarding-v3", description: null, type: "channel", createdAt: "", joined: true },
-      { id: "t1", name: "team-management", description: "Team organization and onboarding.", type: "channel", createdAt: "", joined: true },
     ],
     members: [],
     agents: [],
@@ -392,45 +391,58 @@ test("archived channels rank below live ones, and channels you haven't joined be
     currentUser: null,
     dmChannels: [],
   } as never);
-
-  assert.deepEqual(
-    results.map((result) => result.key),
-    // Joined and live (name match before description match), then live but not joined, then archived.
-    ["channel:w1", "channel:t1", "channel:p1", "channel:a1", "channel:a2"],
-  );
+  // Exact, then prefix, then word start: archived or not joined changes nothing here.
+  assert.deepEqual(results.map((result) => result.key), ["channel:a1", "channel:p1", "channel:w1"]);
+  assert.ok(results.every((result) => result.status === undefined), "local rows carry no server status");
 });
 
-test("archived matches never push live ones off the capped list", () => {
-  const archivedAt = "2026-11-01T00:00:00.000Z";
-  const archived = Array.from({ length: 40 }, (_, index) => ({
-    id: `a${index}`, name: `onboarding-${index}`, description: null, type: "channel", createdAt: "", archivedAt, joined: true,
+// #532: the catalog sorts with cached Intl.Collators instead of a
+// localeCompare(…, { sensitivity: "base" }) per comparison; the order must be
+// the one the per-call localeCompare gave (case and accents ignored, then key).
+test("catalog order equals the per-call localeCompare order for mixed case and accents", () => {
+  const names = ["zeta", "Émile", "emile", "Alpha", "alpha", "ÄLPHA", "beta", "Beta", "éclair", "Eclair", "ñu", "nu", "Zeta", "_x", "10", "9", "研究", "été"];
+  const channels = names.map((name, index) => ({
+    id: `c${String(names.length - index).padStart(2, "0")}`,
+    name,
+    description: null,
+    type: "channel" as const,
+    archivedAt: null,
   }));
-  const results = buildSearchEntityResults({
-    query: "onboarding",
-    channels: [...archived, { id: "w1", name: "wg-onboarding-v3", description: null, type: "channel", createdAt: "", joined: true }],
-    members: [],
-    agents: [],
-    machines: [],
-    currentUser: null,
-    dmChannels: [],
-  } as never);
-
-  assert.equal(results[0]?.key, "channel:w1");
-  assert.equal(results.length, 30);
-});
-
-test("an exact name you haven't joined still comes first, so Enter goes to it", () => {
-  const results = buildSearchEntityResults({
-    query: "design",
-    channels: [
-      { id: "j1", name: "dev-sign-off", description: null, type: "channel", createdAt: "", joined: true },
-      { id: "u1", name: "design", description: null, type: "channel", createdAt: "", joined: false },
+  const dmChannels = [
+    { id: "dm-1", peerType: "agent" as const, peerId: "a1" },
+    { id: "dm-2", peerType: "user" as const, peerId: "u1" },
+    { id: "dm-3", peerType: "agent" as const, peerId: "a1" },
+  ];
+  const params = {
+    channels,
+    members: [
+      { userId: "u1", name: "Öscar", displayName: null, role: "member" },
+      { userId: "u2", name: "oscar", displayName: null, role: "member" },
     ],
-    members: [],
-    agents: [],
+    agents: [
+      { id: "a1", name: "émile", displayName: null, status: "active", createdAt: "" },
+      { id: "a2", name: "Emile", displayName: null, status: "active", createdAt: "" },
+    ],
     machines: [],
     currentUser: null,
-    dmChannels: [],
-  } as never);
-  assert.equal(results[0]?.key, "channel:u1");
+    dmChannels,
+  } as unknown as SearchEntityCatalogParams;
+
+  const entries = buildSearchEntityEntries(params);
+  const typeOrder = { channel: 0, computer: 1, agentDm: 2, humanDm: 3 } as const;
+  const expected = entries
+    .map((entry) => entry.suggestion)
+    .slice()
+    .sort((left, right) => typeOrder[left.type] - typeOrder[right.type]
+      || left.title.localeCompare(right.title, undefined, { sensitivity: "base" })
+      || left.key.localeCompare(right.key));
+  assert.deepEqual(entries.map((entry) => entry.suggestion.key), expected.map((result) => result.key));
+  assert.deepEqual(entries.map((entry) => entry.index), entries.map((_, index) => index));
+
+  // Each peer's DM is its first row, as `dmChannels.find` gave.
+  const byKey = new Map(entries.map((entry) => [entry.suggestion.key, entry.suggestion]));
+  assert.equal(byKey.get("agent:a1")?.channelId, "dm-1");
+  assert.equal(byKey.get("agent:a2")?.channelId, null);
+  assert.equal(byKey.get("human:u1")?.channelId, "dm-2");
+  assert.equal(byKey.get("human:u2")?.channelId, null);
 });

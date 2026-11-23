@@ -10,10 +10,8 @@ import {
   ListRowTitle,
   ListRowTop,
   Textarea,
-  toast,
 } from "@botiverse/raft-ui";
-import { reportConversionFailure } from "../../utils/conversionDiagnostics";
-import { formatJointInviteRateLimited, jointConversionGuestRefusalMessage, jointDisconnectGuestRefusalMessage, jointFreeHostLimitMessage } from "../../utils/jointChannelLimit";
+import { formatJointInviteRateLimited, jointDisconnectGuestRefusalMessage } from "../../utils/jointChannelLimit";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
@@ -24,12 +22,10 @@ import { useServerStore } from "../../store/serverStore";
 import { showToast } from "../../components/toastBridge";
 import { useAuthStore } from "../../store/authStore";
 import { ChannelPreferencesSection } from "../../components/channel/ChannelPreferencesSection";
-import { ChannelThreadSortField } from "../../components/channel/ChannelThreadSortField";
 import { ChannelAnnouncementField } from "../../components/channel/ChannelAnnouncementField";
 import { ChannelVisitorVisibleField } from "../../components/channel/ChannelVisitorVisibleField";
 import {
   EXTERNAL_CHANNELS_FEATURE_FLAG_KEY,
-  CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY,
   MAX_JOINT_CHANNEL_SERVERS,
   clearClockTimeout,
   setClockTimeout,
@@ -40,6 +36,8 @@ import Banner from "../../components/ui/Banner";
 import SectionEyebrow from "../../components/ui/SectionEyebrow";
 import SectionHeader from "../../components/ui/SectionHeader";
 import Tooltip from "../../components/ui/Tooltip";
+import { PHONE_MEDIA_QUERY } from "../../components/ui/NarrowDialog";
+import { useMediaQuery } from "../../hooks/effectPrimitives";
 import ConfirmDialog from "../../components/ConfirmDialog";
 import LeaveChannelConfirmDialog from "../../components/channel/LeaveChannelConfirmDialog";
 import { useAppNavigate } from "../../hooks/useAppNavigate";
@@ -49,13 +47,7 @@ import FormField from "../../components/ui/FormField";
 import { ChannelSlackBridgeRow, useChannelSlackBridgeEditor } from "../../components/channel/ChannelSlackBridgeField";
 import SlugInput from "../../components/ui/SlugInput";
 import { useSidePanelEscapeStep } from "../../components/task/sidePanelEscape";
-import JointConversionSection, { JointConversionConfirmDialog } from "../../components/channel/JointConversionSection";
-import { useConversionObservationNotice } from "../../components/channel/useConversionObservationNotice";
-import { beginConversionObservation } from "../../store/conversionObservationStore";
-import { channelConversionState, conversionResponseState, conversionObservationResult } from "../../store/channelConversionState";
 import { useChannelConversionState } from "../../hooks/useChannelConversionState";
-import type { ChannelConversionJobView as ConversionJobState } from "@botiverse/raft-shared";
-import type { ConversionObservationToken, ConversionAttemptBaseline } from "../../store/conversionObservationStore";
 import JointAttachmentUploadSection, { useActiveAttachmentUploads } from "../../components/channel/JointAttachmentUploadSection";
 import { SameAdminJointNotice } from "../../components/channel/SameAdminJointNotice";
 import { JointServerDisconnectAction } from "../../components/channel/JointServerDisconnectAction";
@@ -114,8 +106,8 @@ export function EditChannelDialog({
   membersSlot,
 }: EditChannelDialogProps) {
   const { formatMessage } = useIntl();
-  const { state: serverConversion, observationScope, pendingCommand, finishObservation } = useChannelConversionState(channelId, true);
-  const serverCommand = serverConversion.command;
+  const phone = useMediaQuery(PHONE_MEDIA_QUERY);
+  const { state: serverConversion, pendingCommand } = useChannelConversionState(channelId);
   const [name, setName] = useState(initialName);
   const [description, setDescription] = useState(initialDescription);
   // Read first (raft-design channel.md): the name and description turn into fields only after Edit.
@@ -143,31 +135,11 @@ export function EditChannelDialog({
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showArchiveConfirm, setShowArchiveConfirm] = useState(false);
   const [showVisibilityConfirm, setShowVisibilityConfirm] = useState(false);
-  const [showConvertConfirm, setShowConvertConfirm] = useState(false);
-  const [convertError, setConvertError] = useState("");
-  const { warning: conversionConnectionWarning, pending: conversionRequestPending, settled: conversionObservationSettled, setWarning: setConversionConnectionWarning, setPending: setConversionRequestPending } = useConversionObservationNotice(pendingCommand?.startedAt, serverCommand?.status === "pending");
-  const [conversionObservationRefresh, setConversionObservationRefresh] = useState(0);
-  const conversionAwaitingReceipt = !!pendingCommand && pendingCommand.kind !== "cancel";
-  const conversionCancelObservationId = pendingCommand?.kind === "cancel" ? pendingCommand.jobId : null;
   const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
   const [visibilityBusy, setVisibilityBusy] = useState(false);
-  const [convertBusy, setConvertBusy] = useState(false);
-  const [conversionCancelBusy, setConversionCancelBusy] = useState(false);
-  const [conversionJob, setConversionJob] = useState<ConversionJobState | null>(null);
-  const [convertSucceeded, setConvertSucceeded] = useState(false);
-  const [conversionProgressDismissed, setConversionProgressDismissed] = useState(false);
-  const conversionRunRef = useRef(0);
-  const conversionCanceledJobRef = useRef<string | null>(null);
-  // Before a Retry is acknowledged, its old failed receipt is only evidence
-  // of the preceding attempt, never a terminal answer for this command.
-  const conversionAttemptBaselineRef = useRef<ConversionJobState | null>(null);
   const updateChannel = useChannelStore((s) => s.updateChannel);
   const hideAllChannel = useChannelStore((s) => s.hideAllChannel);
   const restoreAllChannel = useChannelStore((s) => s.restoreAllChannel);
-  const convertChannelToJoint = useChannelStore((s) => s.convertChannelToJoint);
-  const getChannelConversionJob = useChannelStore((s) => s.getChannelConversionJob);
-  const retryChannelConversionJob = useChannelStore((s) => s.retryChannelConversionJob);
-  const cancelChannelConversionJob = useChannelStore((s) => s.cancelChannelConversionJob);
   const deleteChannel = useChannelStore((s) => s.deleteChannel);
   const disconnectJointChannel = useChannelStore((s) => s.disconnectJointChannel);
   const resendJointChannelInvite = useChannelStore((s) => s.resendJointChannelInvite);
@@ -190,7 +162,6 @@ export function EditChannelDialog({
   // (#wg-rbac:45b37df9): pending ones stay listed until accepted or expired.
   // Until the flag is read they wait too, so they never flash on a Server that has External.
   const serverInviteOfferAllowed = externalChannels.resolved && !externalChannels.enabled;
-  const channelThreadSortEnabled = useServerFeatureFlag(CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY).enabled;
   const isJointChannel = channel?.type === "joint";
   const currentVisibility = channel?.type === "private" ? "private" : "public";
   const nextVisibility = currentVisibility === "private" ? "public" : "private";
@@ -198,176 +169,20 @@ export function EditChannelDialog({
   const { capabilities } = useServerPermissions();
   const effectiveCapabilities = channel?.channelCapabilities ?? capabilities;
   const nav = useAppNavigate();
-  const persistedConversionJob = serverConversion.job;
-  // The channel response is the durable source of truth across Settings
-  // mounts. Local state only owns the conversion started by this mount. This
-  // render-time fallback also covers a late async channel hydrate without a
-  // prop-to-state effect or a one-shot channel-id guard.
-  // A restored failure no longer blocks sending, but its error and Retry
-  // remain visible until cancellation or a successful retry.
-  const persistedConversionReceipt = persistedConversionJob
-    && ["pending", "running", "failed"].includes(persistedConversionJob.status)
-    && conversionCanceledJobRef.current !== persistedConversionJob.id
-      ? persistedConversionJob
-      : null;
-  // A local retry/start response is newer than the stale channel snapshot that
-  // caused this mount. Prefer it until the next poll patches the store.
-  const conversionReceipt = conversionJob ?? persistedConversionReceipt;
-  const conversionReceiptRef = useRef<ConversionJobState | null>(null);
-  conversionReceiptRef.current = conversionReceipt;
-  const conversionReceiptId = conversionReceipt?.id;
-  const conversionReceiptStatus = conversionReceipt?.status;
-  const conversionInProgress = convertBusy || conversionAwaitingReceipt || Boolean(conversionCancelObservationId) || Boolean(
-    conversionReceipt && ["pending", "running", "failed"].includes(conversionReceipt.status),
+  // A conversion to an external channel under way (the conversation's
+  // ChannelConversionStrip follows it and owns Retry and Cancel). The durable
+  // receipt, or a command this browser sent that has no receipt yet, keeps
+  // the completed external-channel settings and the private connect offer
+  // away until it settles; channel.type alone is not the authority.
+  const conversionInProgress = Boolean(pendingCommand) || serverConversion.command?.status === "pending" || Boolean(
+    serverConversion.job && ["pending", "running", "failed"].includes(serverConversion.job.status),
   );
-  // A stale/early channel projection must not expose completed Joint controls
-  // while the durable conversion receipt is still actionable. The receipt is
-  // the authority for the Settings state machine; channel.type alone is not.
   const showCompletedJointSettings = isJointChannel && !conversionInProgress;
   const {
     uploads: activeAttachmentUploads,
     cancelBusyId: activeAttachmentUploadCancelBusyId,
     cancelUpload: cancelActiveAttachmentUpload,
   } = useActiveAttachmentUploads(channelId, showCompletedJointSettings || conversionInProgress);
-  /*
-   * A channel poll replaces the receipt object on every read. Keep the polling
-   * effect keyed only by the job identity/status so phase/progress updates do
-   * not spawn a second loop or reset its timer.
-   */
-  // If the drawer is opened while a conversion is already running, resume the
-  // same durable polling loop. A first mount that just started the job is
-  // already polled by handleConvertToJoint while convertBusy is true.
-  const finishCanceledConversion = useCallback((jobId: string, token?: ConversionObservationToken) => {
-    conversionCanceledJobRef.current = jobId;
-    conversionAttemptBaselineRef.current = null;
-    finishObservation(token);
-    setConversionConnectionWarning(false);
-    setConversionJob(null);
-    setConvertSucceeded(false);
-    setConversionProgressDismissed(false);
-    setShowConvertConfirm(false);
-    setConvertError("");
-  }, [setConversionConnectionWarning, finishObservation]);
-
-  useEffect(() => {
-    const receipt = conversionAwaitingReceipt ? null : conversionReceiptRef.current;
-    if (convertBusy || conversionCancelBusy) return;
-    if (!conversionCancelObservationId && !conversionAwaitingReceipt && (!receipt || !["pending", "running"].includes(receipt.status))) return;
-    let cancelled = false;
-    let timeoutId: ReturnType<typeof setTimeout> | null = null;
-    const runId = ++conversionRunRef.current;
-    const isCurrent = () => !cancelled && conversionRunRef.current === runId;
-    const poll = async () => {
-      let current = receipt;
-      let retryDelay = 120;
-      while (isCurrent() && (conversionCancelObservationId || !current || ["pending", "running"].includes(current.status))) {
-        await new Promise<void>((resolve) => {
-          timeoutId = setClockTimeout(() => { timeoutId = null; resolve(); }, retryDelay) as ReturnType<typeof setTimeout>;
-        });
-        if (!isCurrent() || (current && conversionCanceledJobRef.current === current.id)) return;
-        try {
-          if (current || conversionCancelObservationId) {
-            // Own this read's last confirmed receipt before its store hydrate
-            // can replace the active fallback and invalidate the observer.
-            if (current) setConversionJob(current);
-            current = conversionResponseState(await getChannelConversionJob(conversionCancelObservationId ?? current!.id)).job;
-          } else {
-            // A lost start response gives us no job ID. Read the source channel
-            // afresh, rather than assuming the command failed or replaying it.
-            const refreshed = await useChannelStore.getState().ensureChannel(channelId, { refresh: true });
-            if (!isCurrent()) return;
-            if (!refreshed) throw new Error("Conversion status unavailable");
-            const refreshedConversion = channelConversionState(refreshed);
-            current = refreshedConversion.job;
-            const observed = refreshedConversion.command;
-            const observation = conversionObservationResult(refreshed, pendingCommand, pendingCommand?.baseline ?? conversionAttemptBaselineRef.current);
-            if (observation === "pending") {
-              current = null;
-              setConversionRequestPending();
-              retryDelay = conversionObservationSettled ? 5000 : 1000;
-              continue;
-            }
-            if (observation === "canceled") {
-              finishCanceledConversion(current?.id ?? observed?.jobId ?? observed!.id, pendingCommand?.token);
-              return;
-            }
-            if (observation === "done") {
-              finishObservation(pendingCommand?.token);
-              setConversionConnectionWarning(false);
-              setConversionJob(null);
-              setConvertSucceeded(true);
-              setShowConvertConfirm(false);
-              toast.success(formatMessage({ id: "channel.edit.convertSuccess" }));
-              return;
-            }
-            if (observation === "commandFailed") {
-              finishObservation();
-              setConversionConnectionWarning(false);
-              setConversionJob(current);
-              setConvertError(observed?.error || formatMessage({ id: "channel.edit.failedConvertJoint" }));
-              return;
-            }
-            if (observation === "unconfirmed") {
-              // The original command may still be waiting for admission/lock.
-              // An absent job or the pre-Retry failure cannot end observation.
-              current = null;
-              setConversionConnectionWarning(true);
-              retryDelay = conversionObservationSettled ? 5000 : 1000;
-              continue;
-            }
-            conversionAttemptBaselineRef.current = null;
-
-          }
-          if (!isCurrent()) return;
-          if (current?.status === "canceled") {
-            finishCanceledConversion(current.id);
-            return;
-          }
-          if (conversionCancelObservationId && current?.status !== "done" && current?.canCancel !== false) {
-            // Cancel has a known job identity. Continue reading even a failed
-            // snapshot until cancellation commits or becomes impossible.
-            setConversionJob(current);
-            setConversionConnectionWarning(true);
-            retryDelay = conversionObservationSettled ? 5000 : 1000;
-            continue;
-          }
-
-          setConversionConnectionWarning(false);
-          setConvertError(conversionCancelObservationId
-            ? formatMessage({ id: "channel.edit.cancelConversionUnavailable" })
-            : current?.status === "failed" ? current.error || "" : "");
-          setConversionJob(current);
-          finishObservation();
-          if (!current || current.status === "done") {
-            setConvertSucceeded(true);
-            setShowConvertConfirm(false);
-            toast.success(formatMessage({ id: "channel.edit.convertSuccess" }));
-            return;
-          }
-          retryDelay = 120;
-        } catch (error) {
-          if (!isCurrent()) return;
-          reportConversionFailure("observe", channelId, pendingCommand?.token, error);
-          // Connectivity is an observation failure, not a new job state.
-          setConversionConnectionWarning(true);
-          retryDelay = conversionObservationSettled ? 5000 : 1000;
-        }
-      }
-    };
-    void poll();
-    return () => {
-      cancelled = true;
-      if (timeoutId !== null) clearClockTimeout(timeoutId);
-    };
-  }, [channelId, conversionReceiptId, conversionReceiptStatus, conversionAwaitingReceipt, conversionCancelObservationId, conversionObservationSettled, conversionObservationRefresh, convertBusy, conversionCancelBusy, getChannelConversionJob, formatMessage, setConversionConnectionWarning, setConversionRequestPending, finishCanceledConversion, finishObservation, pendingCommand]);
-
-  // Invalidate the mounted conversion runner when Settings unmounts. Without
-  // this, a drawer closed during an in-flight poll can keep issuing reads and
-  // later overwrite the next Settings mount's receipt.
-  useEffect(() => () => {
-    conversionRunRef.current += 1;
-  }, []);
-
   const isAllChannel = initialName === "all";
   const canEditChannel = Boolean(effectiveCapabilities.editChannelMetadata
     || effectiveCapabilities.changeChannelVisibility
@@ -386,32 +201,9 @@ export function EditChannelDialog({
   // server's admin there may only disconnect it (deleteChannels), not rename.
   const canEditInfo = isJointChannel ? Boolean(effectiveCapabilities.editChannelMetadata) : canEditChannel;
   const showVisibilityAction = showManageActions && Boolean(effectiveCapabilities.changeChannelVisibility);
-  const showConvertAction = canEditChannel &&
-    capabilities.federateChannels &&
-    externalChannels.enabled &&
-    !isAllChannel &&
-    !isJointChannel &&
-    Boolean(effectiveCapabilities.federateChannels) &&
-    (channel?.type === "channel" || channel?.type === "private");
-  // Conversion uses a durable source fence without changing the channel's
-  // archive lifecycle. Keep the in-session job receipt mounted through
-  // running/failed/canceled states so the user always has an actionable
-  // progress, retry, or cancel surface.
-  const conversionRetryable = conversionReceipt?.status === "failed";
-  const showJointConversionSection = capabilities.federateChannels &&
-    externalChannels.enabled &&
-    conversionInProgress &&
-    !isAllChannel &&
-    ((channel?.type === "channel" || channel?.type === "private") ||
-      conversionInProgress ||
-      ((!conversionProgressDismissed) && (conversionReceipt !== null || convertSucceeded)));
   const showChannelInfoSettings = !isJointChannel || showCompletedJointSettings;
   // Edit opens the name and description in place (read first, raft-design channel.md).
   const canStartEditing = showManageActions && canEditInfo && showChannelInfoSettings;
-  // Contract v0.3: any plan may convert; limits apply when servers are invited.
-  const jointConversionUnavailableMessage = !canEditChannel
-    ? formatMessage({ id: "channel.edit.convertPermissionRequired" })
-    : undefined;
   const jointServers = channel?.jointServers?.length
     ? channel.jointServers
     : channel?.jointPeerServerId || channel?.jointPeerServerSlug
@@ -596,19 +388,6 @@ export function EditChannelDialog({
     return true;
   });
 
-  // Expose the save to the host's unsaved-changes prompt. The ref is
-  // re-published after every commit so it always closes over the latest
-  // draft; ref writes drive no renders (same react-doctor blind spot as
-  // the dirtyRef sync above).
-  useEffect(() => {
-    // oxlint-disable-next-line react-doctor/no-event-handler
-    if (saveRef) saveRef.current = saveChanges;
-    return () => {
-      // oxlint-disable-next-line react-doctor/no-event-handler
-      if (saveRef) saveRef.current = null;
-    };
-  });
-
   const getFallbackChannel = useCallback(() =>
     channels.find((candidate) => candidate.id !== channelId && candidate.name === "all") ||
     channels.find((candidate) => candidate.id !== channelId), [channels, channelId]);
@@ -670,6 +449,19 @@ export function EditChannelDialog({
     }
   }, [clearSaveStatus, canEditInfo, editing, isAllChannel, name, description, initialName, initialDescription,
     formatMessage, updateChannel, channelId, showSaveSuccess]);
+  // Expose the save to the host's unsaved-changes prompt. The ref is
+  // re-published after every commit so it always closes over the latest
+  // draft; ref writes drive no renders (same react-doctor blind spot as
+  // the dirtyRef sync above).
+  useEffect(() => {
+    // oxlint-disable-next-line react-doctor/no-event-handler
+    if (saveRef) saveRef.current = saveChanges;
+    return () => {
+      // oxlint-disable-next-line react-doctor/no-event-handler
+      if (saveRef) saveRef.current = null;
+    };
+  });
+
   const handleSubmit = useCallback((e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     void saveChanges();
@@ -724,161 +516,6 @@ export function EditChannelDialog({
     getFallbackChannel,
     nav,
     formatMessage,
-  ]);
-
-  const handleConvertToJoint = useCallback(async () => {
-    const runId = ++conversionRunRef.current;
-    conversionAttemptBaselineRef.current = conversionReceiptRef.current;
-    if (!observationScope || pendingCommand) return;
-    const previous = conversionReceiptRef.current;
-    const baseline: ConversionAttemptBaseline | null = previous ? {
-      id: previous.id, status: previous.status,
-      progress: { failedAt: typeof previous.progress?.failedAt === "string" ? previous.progress.failedAt : undefined,
-        relockedAt: typeof previous.progress?.relockedAt === "string" ? previous.progress.relockedAt : undefined },
-    } : null;
-    const command = beginConversionObservation(observationScope, previous?.status === "failed" ? "retry" : "start", baseline, serverCommand?.id ?? null);
-    if (!command) return;
-    setError("");
-    setConvertError("");
-    setConversionConnectionWarning(false);
-    conversionCanceledJobRef.current = null;
-    setConvertBusy(true);
-    setShowConvertConfirm(false);
-    setConversionRequestPending();
-    try {
-      const started = conversionReceiptRef.current?.status === "failed"
-        ? await retryChannelConversionJob(conversionReceiptRef.current.id, command.token)
-        : await convertChannelToJoint(channelId, { observeProgress: true, commandId: command.token });
-      if (conversionRunRef.current !== runId) return;
-      conversionAttemptBaselineRef.current = null;
-      const startedConversion = conversionResponseState(started);
-      const commandPending = startedConversion.status === "pending";
-      if (commandPending) {
-        // Admission is durable on the server, but the source lock may still
-        // be waiting. Keep the scoped observation record for remount/reload.
-        setShowConvertConfirm(false);
-        setConversionRequestPending();
-        setConversionJob(null);
-        return;
-      }
-      finishObservation(command.token);
-      setConversionConnectionWarning(false);
-      setShowConvertConfirm(false);
-      const currentJob = startedConversion.job;
-      setConversionJob(currentJob);
-      if (currentJob?.status === "failed") {
-        setConvertError(currentJob.error || formatMessage({ id: "channel.edit.failedConvertJoint" }));
-      } else if (!currentJob || currentJob.status === "done") {
-        setConvertSucceeded(true);
-        toast.success(formatMessage({ id: "channel.edit.convertSuccess" }));
-      }
-      // Running jobs are observed by the mounted polling effect above.
-    } catch (err: unknown) {
-      reportConversionFailure(command.kind === "retry" ? "retry" : "start", channelId, command.token, err);
-      if (conversionRunRef.current !== runId) return;
-      const axiosErr = err as { response?: { status?: number; data?: { error?: string; code?: string; conversionJob?: ConversionJobState } } };
-      const responseData = axiosErr.response?.data;
-      if (responseData?.conversionJob) {
-        finishObservation(command.token);
-        setConversionJob(responseData.conversionJob);
-        setShowConvertConfirm(false);
-        setConvertError(responseData.conversionJob.status === "failed" ? responseData.conversionJob.error || responseData.error || "" : "");
-      } else if (!axiosErr.response || (axiosErr.response.status !== undefined && axiosErr.response.status >= 500)) {
-        setShowConvertConfirm(false);
-        setConversionConnectionWarning(true);
-        // Retry may have succeeded even when its response was lost. Discard
-        // the old failed snapshot and rediscover the authoritative receipt.
-        setConversionJob(null);
-        // Keep the pending command record for reopen, refresh and read-only recovery.
-      } else {
-        finishObservation(command.token);
-        setConversionConnectionWarning(false);
-        setConvertError(jointConversionGuestRefusalMessage(err, initialName, formatMessage)
-          ?? jointFreeHostLimitMessage(err, formatMessage)
-          ?? (responseData?.error || formatMessage({ id: "channel.edit.failedConvertJoint" })));
-        setShowConvertConfirm(true);
-        throw err;
-      }
-    } finally {
-      setConvertBusy(false);
-    }
-  }, [
-    observationScope,
-    pendingCommand,
-    serverCommand?.id,
-    setConversionConnectionWarning,
-    setConversionRequestPending,
-    retryChannelConversionJob,
-    convertChannelToJoint,
-    channelId,
-    initialName,
-    finishObservation,
-    formatMessage,
-  ]);
-
-  const handleCancelConversion = useCallback(async () => {
-    if (!conversionReceipt) return;
-    const cancelingJobId = conversionReceipt.id;
-    if (!observationScope || conversionCancelObservationId) return;
-    const runId = ++conversionRunRef.current;
-    const command = beginConversionObservation(observationScope, "cancel", { id: cancelingJobId, status: conversionReceipt.status }, serverCommand?.id ?? null);
-    if (!command) return;
-    setConvertError("");
-    setConversionConnectionWarning(false);
-    setConversionCancelBusy(true);
-    try {
-      await cancelChannelConversionJob(cancelingJobId, command.token);
-      if (conversionRunRef.current !== runId) return;
-      finishCanceledConversion(cancelingJobId, command.token);
-      toast.success(formatMessage({ id: "channel.edit.conversionCanceled" }));
-    } catch (err: unknown) {
-      reportConversionFailure("cancel", channelId, command.token, err);
-      if (conversionRunRef.current !== runId) return;
-      const axiosErr = err as { response?: { status?: number; data?: { error?: string; code?: string } } };
-      const uncertain = !axiosErr.response || (axiosErr.response.status !== undefined && axiosErr.response.status >= 500);
-      conversionCanceledJobRef.current = null;
-      setConversionJob(conversionReceipt);
-      let latest: ConversionJobState | null = null;
-      try { latest = conversionResponseState(await getChannelConversionJob(cancelingJobId)).job; }
-      catch (error) { reportConversionFailure("cancel-observe", channelId, command.token, error); }
-      if (conversionRunRef.current !== runId) return;
-      if (latest?.status === "canceled") {
-        finishCanceledConversion(latest.id, command.token);
-        toast.success(formatMessage({ id: "channel.edit.conversionCanceled" }));
-        return;
-      }
-      if (latest) setConversionJob(latest);
-      if (uncertain && latest?.status !== "done" && latest?.canCancel !== false) {
-        conversionAttemptBaselineRef.current = null;
-        // Keep the known-job cancellation record until a conclusive read.
-        setConversionConnectionWarning(true);
-        setShowConvertConfirm(false);
-        return;
-      }
-      finishObservation(command.token);
-      setConversionConnectionWarning(false);
-      if (latest?.status === "done") {
-        setConvertSucceeded(true);
-        setShowConvertConfirm(false);
-      }
-      setConvertError(uncertain
-        ? formatMessage({ id: "channel.edit.cancelConversionUnavailable" })
-        : axiosErr.response?.data?.error || formatMessage({ id: "channel.edit.failedCancelConversion" }));
-    } finally {
-      if (conversionRunRef.current === runId) setConversionCancelBusy(false);
-    }
-  }, [
-    conversionReceipt,
-    observationScope,
-    conversionCancelObservationId,
-    serverCommand?.id,
-    setConversionConnectionWarning,
-    cancelChannelConversionJob,
-    finishCanceledConversion,
-    formatMessage,
-    channelId,
-    getChannelConversionJob,
-    finishObservation,
   ]);
 
   const handleUnarchive = useCallback(async () => {
@@ -1044,50 +681,10 @@ export function EditChannelDialog({
   const closeArchiveConfirm = useCallback(() => setShowArchiveConfirm(false), []);
   const openDeleteConfirm = useCallback(() => setShowDeleteConfirm(true), []);
   const closeDeleteConfirm = useCallback(() => setShowDeleteConfirm(false), []);
-  const closeConvertConfirm = useCallback(() => setShowConvertConfirm(false), []);
 
-  const requestConversionStatusCheck = useCallback(() => setConversionObservationRefresh((n) => n + 1), []);
-  const dismissConversionProgress = useCallback(() => setConversionProgressDismissed(true), []);
-  const retryConversion = useCallback(() => {
-    void handleConvertToJoint().catch(() => undefined);
-  }, [handleConvertToJoint]);
-  const cancelConversion = useCallback(() => {
-    void handleCancelConversion();
-  }, [handleCancelConversion]);
-  const conversionReceiptFailed = conversionReceipt?.status === "failed";
-  const startConversion = useCallback(() => {
-    setConvertError("");
-    setConvertSucceeded(false);
-    // Keep a failed job mounted while its archived source is being
-    // retried; clearing it here would re-trigger the archive hide gate
-    // before the retry request returns its replacement job.
-    if (!conversionReceiptFailed) setConversionJob(null);
-    setConversionProgressDismissed(false);
-    setShowConvertConfirm(true);
-  }, [conversionReceiptFailed]);
   const cancelAttachmentUpload = useCallback((uploadId: string) => {
-    void cancelActiveAttachmentUpload(uploadId)
-      .then((remaining) => {
-        setConversionJob((current) => {
-          const base = current ?? conversionReceipt;
-          return base
-            ? {
-                ...base,
-                error: remaining.length === 0 ? null : base.error,
-                progress: remaining.length === 0
-                  ? Object.fromEntries(
-                      Object.entries(base.progress ?? {}).filter(([key]) => (
-                        key !== "errorCode" && key !== "uploadCount" && key !== "uploadScope"
-                      )),
-                    )
-                  : { ...(base.progress ?? {}), uploadCount: remaining.length },
-              }
-            : current;
-        });
-        if (remaining.length === 0) setConvertError("");
-      })
-      .catch(() => undefined);
-  }, [cancelActiveAttachmentUpload, conversionReceipt]);
+    void cancelActiveAttachmentUpload(uploadId).catch(() => undefined);
+  }, [cancelActiveAttachmentUpload]);
 
   const handleInviteServerSlugChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {
     setInviteServerSlug(e.target.value);
@@ -1152,31 +749,8 @@ export function EditChannelDialog({
     && !isArchived
     && (channel.type === "channel" || channel.type === "private");
   const regularChannel = channel?.type === "channel" || channel?.type === "private";
-  // Forum-style order (#proj-chat:#24): the channel's own setting, the same
-  // for everyone, so only for those who may edit its info.
-  const showThreadSort = channelThreadSortEnabled && Boolean(effectiveCapabilities.editChannelMetadata) && !isArchived && regularChannel;
   const showSlack = canEditChannel && !isArchived && regularChannel && bridgeEditor.available;
 
-  const jointConversionSection = showJointConversionSection && (
-    <JointConversionSection
-      busy={convertBusy}
-      disabled={conversionAwaitingReceipt || Boolean(conversionCancelObservationId) || (!showConvertAction && !conversionRetryable)}
-      unavailableMessage={jointConversionUnavailableMessage}
-      error={conversionConnectionWarning || conversionRequestPending ? undefined : convertError || conversionReceipt?.error || undefined}
-      admissionPending={conversionRequestPending}
-      connectionWarning={conversionConnectionWarning ? formatMessage({ id: conversionObservationSettled ? "channel.edit.conversionOutcomeUnknown" : "channel.edit.conversionStatusUnavailable" }) : undefined}
-      onCheckStatus={conversionConnectionWarning ? requestConversionStatusCheck : undefined}
-      conversionJob={conversionReceipt}
-      succeeded={convertSucceeded}
-      progressDismissed={conversionProgressDismissed}
-      onDismissProgress={dismissConversionProgress}
-      onRetry={conversionCancelObservationId || (conversionAwaitingReceipt && !convertBusy) ? undefined : retryConversion}
-      onCancel={conversionCancelObservationId ? undefined : cancelConversion}
-      onOpenChannel={onClose}
-      cancelBusy={conversionCancelBusy}
-      onStart={startConversion}
-    />
-  );
   const jointAttachmentUploadSection = (showCompletedJointSettings || conversionInProgress) && (
     <JointAttachmentUploadSection
       uploads={activeAttachmentUploads}
@@ -1282,7 +856,7 @@ export function EditChannelDialog({
   );
 
   // Connected servers (#wg-rbac:2ee0381d): a group of its own after the announcement, one row per server.
-  const showServers = (isJointChannel && showCompletedJointSettings && ((!conversionReceipt && !convertSucceeded) || conversionProgressDismissed)) || showPrivateConnectSection;
+  const showServers = (isJointChannel && showCompletedJointSettings) || showPrivateConnectSection;
   const serversSection = showServers && (
     <section className="stack-y-3" data-testid="channel-settings-joint-section">
       <SectionHeader
@@ -1450,7 +1024,6 @@ export function EditChannelDialog({
   );
   const channelSettingsRows = [
     visibilityRow,
-    showThreadSort && <ChannelThreadSortField key="sort" channelId={channelId} threadSort={channel?.threadSort} disabled={saving} />,
     showVisitorVisible && (
       <ChannelVisitorVisibleField key={`visitors-${channelId}`} channelId={channelId} visitorVisible={visitorVisible} canTurnOn={visitorVisibleCanTurnOn} disabled={saving} />
     ),
@@ -1466,13 +1039,13 @@ export function EditChannelDialog({
     </section>
   );
 
-  // The actions, last, in a card of rows with no heading, colored by risk (DS Forms, "Danger zone"; Jasper's ruling,
-  // raft-design #1165): Archive, Leave and Stop all agents orange (they interrupt but can be undone), Delete or
-  // Disconnect red (can't be undone). Unarchive takes nothing back, so it stays neutral.
+  // The actions, last, in a card of rows with no heading (DS Forms, "Danger zone"; ListRow "An action's risk"):
+  // only Delete or Disconnect, which can't be undone, is red. Archive, Leave and Stop all agents are ink: they
+  // interrupt but can be undone, and their confirmations' buttons are orange (cindyz, #triage:f2e107f7).
   // Each keeps its confirmation. raft-ui's ListRow risk tones (0.87, list-row.md "An action's risk") color the icon
   // and the title.
   const actionRow = ({ icon, label, onClick, disabled, tone, testId, ariaLabel }: {
-    icon: ReactNode; label: string; onClick: () => void; disabled?: boolean; tone?: "warning" | "danger"; testId: string; ariaLabel?: string;
+    icon: ReactNode; label: string; onClick: () => void; disabled?: boolean; tone?: "danger"; testId: string; ariaLabel?: string;
   }) => (
     <ListRow
       key={testId}
@@ -1492,9 +1065,9 @@ export function EditChannelDialog({
   const actionRows = showChannelInfoSettings ? [
     showArchiveRow && (isArchived
       ? actionRow({ icon: <ArchiveRestore />, label: archiveBusy ? formatMessage({ id: "channel.edit.unarchiving" }) : formatMessage({ id: "channel.edit.unarchiveChannel" }), onClick: handleUnarchive, disabled: archiveBusy, testId: "channel-settings-archive-action" })
-      : actionRow({ icon: <Archive />, label: formatMessage({ id: "channel.edit.archiveChannel" }), onClick: openArchiveConfirm, tone: "warning", testId: "channel-settings-archive-action" })),
-    showLeaveAction && actionRow({ icon: <LeaveChannelKindIcon type={channel?.type} size={20} />, label: formatMessage({ id: "channel.edit.leaveChannel" }), onClick: openLeaveConfirm, tone: "warning", testId: "channel-overflow-leave" }),
-    showStopAgentsRow && actionRow({ icon: <Square />, label: formatMessage({ id: "message.chatPanel.overflow.stopAgents" }), ariaLabel: formatMessage({ id: "message.chatPanel.stopAllAgents" }), onClick: onStopAllAgents!, tone: "warning", testId: "channel-overflow-stop-agents" }),
+      : actionRow({ icon: <Archive />, label: formatMessage({ id: "channel.edit.archiveChannel" }), onClick: openArchiveConfirm, testId: "channel-settings-archive-action" })),
+    showLeaveAction && actionRow({ icon: <LeaveChannelKindIcon type={channel?.type} size={20} />, label: formatMessage({ id: "channel.edit.leaveChannel" }), onClick: openLeaveConfirm, testId: "channel-overflow-leave" }),
+    showStopAgentsRow && actionRow({ icon: <Square />, label: formatMessage({ id: "message.chatPanel.overflow.stopAgents" }), ariaLabel: formatMessage({ id: "message.chatPanel.stopAllAgents" }), onClick: onStopAllAgents!, testId: "channel-overflow-stop-agents" }),
     showDeleteRow && (showCompletedJointSettings
       ? actionRow({ icon: <Unplug />, label: formatMessage({ id: "channel.edit.disconnectChannel" }), onClick: openDeleteConfirm, tone: "danger", testId: "channel-settings-delete-action" })
       : actionRow({ icon: <Trash2 />, label: formatMessage({ id: "channel.edit.deleteChannel" }), onClick: openDeleteConfirm, tone: "danger", testId: "channel-settings-delete-action" })),
@@ -1569,15 +1142,6 @@ export function EditChannelDialog({
         />
       )}
 
-      <JointConversionConfirmDialog
-        open={showConvertConfirm}
-        busy={convertBusy}
-        error={convertError}
-        channelName={initialName}
-        onConfirm={handleConvertToJoint}
-        onClose={closeConvertConfirm}
-      />
-
       {showDeleteConfirm && (
         <ConfirmDialog
           chromeLocale="active"
@@ -1597,22 +1161,24 @@ export function EditChannelDialog({
 
   return (
     /* The channel details' body (ChannelOverflowMenu: a column of the conversation's row, or a pushed page on a
-       phone). From the top: a conversion or an upload under way, the channel's name and description, its members,
-       its announcement, its servers, Channel settings, Your preferences, then the actions (raft-design channel.md,
+       phone). From the top: an upload under way, the channel's name and description, its members,
+       its pinned content, its servers, Channel settings, Your preferences, then the actions (raft-design channel.md,
        stdrc 2026-11-10, #proj-raft-ui:dae8db07). Closing is the host's, guarded by the unsaved-changes prompt. */
     <>
       <div className="stack-y-6" data-testid="channel-settings-panel">
-        {jointConversionSection}
         {jointAttachmentUploadSection}
         {identity}
         {membersSlot}
-        {/* Channel announcements (#proj-chat:#29): its own row, only while the flag is on, and to who can't change
-            it only while there is one. */}
+        {/* Pinned content (the channel announcement, #proj-chat:#29 and #35): its own section, only while the flag is
+            on, and to who can't change it only while there is one. On a phone the details are a page over the
+            channel, so opening the pinned Artifact closes them to show it (as the upload section's channel link does);
+            on a desktop it opens in the row beside the details, which stay. */}
         <ChannelAnnouncementField
           channelId={channelId}
           channelName={initialName}
           channelType={channel?.type}
           canEdit={Boolean(effectiveCapabilities.editChannelMetadata) && !isArchived}
+          onOpened={phone ? onClose : undefined}
         />
         {serversSection}
         {channelSettingsSection}

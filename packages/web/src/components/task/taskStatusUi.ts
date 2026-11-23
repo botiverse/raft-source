@@ -1,6 +1,6 @@
 import type { TaskStatusId } from "@botiverse/raft-ui";
 import type { MessageId } from "../../i18n/messages";
-import { TASK_STATUSES } from "@botiverse/raft-shared";
+import { TASK_STATUSES, authorizeTaskAction } from "@botiverse/raft-shared";
 import type { Task, TaskStatus } from "../../store/taskStore";
 import { opensAsTaskConversation } from "../../utils/taskConversation";
 
@@ -63,14 +63,21 @@ export function toRuiTaskStatus(status: TaskStatus): TaskStatusId {
  *
  * There are no transition limits either (stdrc 2026-10-31, #wg-task-v2
  * msg=ad820421): any status can be set from any status.
+ *
+ * "Member" is the limit: a public channel's tasks show to someone who has not
+ * joined it, and the server refuses their writes (403, "You must join this
+ * channel to modify tasks"). `canWriteChannel` is that answer for the task's
+ * channel (taskChannelWrite); it defaults to yes for a caller that only holds
+ * tasks of the viewer's own channels.
  */
 export function canEditTaskStatus(
   task: Task,
   _currentUserId: string | undefined,
   _canManageServer: boolean,
+  canWriteChannel = true,
 ): boolean {
   // A Guest sees only its own channel's tasks and moves them like a member (matrix §1).
-  return !task.readOnlyReason;
+  return authorizeTaskAction({ action: "change_status", canReadChannel: true, canWriteChannel, readOnlyReason: task.readOnlyReason });
 }
 
 export function getTaskStatusOptions(task: Task, _currentUserId: string | undefined, _canManageServer: boolean, taskV2: boolean) {

@@ -1,4 +1,4 @@
-import { useId } from "react";
+import { useId, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import {
   cn,
@@ -13,6 +13,7 @@ import {
 import type { DrawerContentProps, PopoverContentProps } from "@botiverse/raft-ui";
 
 import { SHEET_NOTIFY_CLASS, SheetNotifyContext, useSheetNotify } from "./artifactSheetNotify";
+import { keyboardSheetStyle, useFieldInSheetView, useSoftKeyboardBox } from "./artifactSoftKeyboard";
 
 /**
  * What a floating Artifact comment card is drawn on, written once (xxchan, #proj-workspace:
@@ -25,7 +26,8 @@ import { SHEET_NOTIFY_CLASS, SheetNotifyContext, useSheetNotify } from "./artifa
  *   comment's card becomes its thread's card in place once sent, so the two are the same width).
  * - On a phone, a bottom sheet: its title, under it who its box's Send notifies (a touch screen
  *   has no tooltip; names are data, so a line in ink, the sheet's description for assistive tech),
- *   then the card.
+ *   then the card. With the on-screen keyboard up it sits on the keyboard and fits what is left of
+ *   the screen (`keyboardSheetStyle`), and the field being typed in is scrolled into its view.
  *
  * It draws and nothing else. When it closes is the dismissal layer's (`onOpenChange` is
  * `useDismissable`'s `change`), where it sits and where the focus goes are its caller's, which
@@ -63,10 +65,20 @@ export function ArtifactCardShell({ phone, open, onOpenChange, label, testId, ar
 }) {
   const [notify, setNotify] = useSheetNotify();
   const notifyId = useId();
+  // Held where it was through the sheet's way out (`shown` is true from its entry's end to its exit's
+  // end), so a sheet closed with the keyboard up slides out from there instead of dropping behind it.
+  const [shown, setShown] = useState(false);
+  const keyboard = useSoftKeyboardBox(phone && (open || shown), !open);
+  const keyboardStyle = useMemo(() => keyboardSheetStyle(keyboard), [keyboard]);
+  const up = keyboard !== null;
+  // The sheet itself, found from its head (this shell's own element; `sheet.ref` is the caller's).
+  const [head, setHead] = useState<HTMLDivElement | null>(null);
+  const popup = head?.closest<HTMLElement>("[data-slot='drawer-popup']") ?? null;
+  useFieldInSheetView(popup, up);
   if (phone) {
     const said = surface === "none" ? null : notify;
     return (
-      <Drawer open={open} onOpenChange={onOpenChange}>
+      <Drawer open={open} onOpenChange={onOpenChange} onOpenChangeComplete={setShown}>
         {/* No focus, so no keyboard, until the person taps into the box (co-design S2), unless `sheet` says where. */}
         <DrawerContent
           initialFocus={false}
@@ -76,8 +88,10 @@ export function ArtifactCardShell({ phone, open, onOpenChange, label, testId, ar
           inert={armed || undefined}
           data-testid={testId}
           data-armed={armed || undefined}
+          data-above-keyboard={up || undefined}
+          style={keyboardStyle}
         >
-          <DrawerHeader>
+          <DrawerHeader ref={setHead}>
             <DrawerTitle>{label}</DrawerTitle>
             {said ? <p id={notifyId} className={SHEET_NOTIFY_CLASS} data-testid="artifact-sheet-notify">{said}</p> : null}
           </DrawerHeader>

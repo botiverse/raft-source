@@ -13,7 +13,7 @@ import {
 } from "./runtimeFormV2Registry";
 
 test("the v2 registry holds exactly the runtimes that have a v2 form today", () => {
-  assert.deepEqual(runtimeFormV2RuntimeIds().sort(), ["antigravity", "builtin", "claude", "codex", "copilot", "cursor", "gemini", "grok", "kimi", "kimi-sdk", "opencode", "pi", "qoder", "qwen"]);
+  assert.deepEqual(runtimeFormV2RuntimeIds().sort(), ["antigravity", "builtin", "claude", "codex", "copilot", "cursor", "dsh", "gemini", "grok", "kimi", "kimi-sdk", "opencode", "pi", "qoder", "qwen"]);
 });
 
 test("since batch 4 every runtime in the catalog has a v2 form", () => {
@@ -22,12 +22,12 @@ test("since batch 4 every runtime in the catalog has a v2 form", () => {
 
 test("deprecated runtimes keep a v2 form, labelled edit-only; the rest are create forms", () => {
   const deprecated = RUNTIMES.filter((runtime) => runtime.deprecated).map((runtime) => runtime.id);
-  assert.deepEqual(deprecated, ["antigravity", "kimi", "copilot", "gemini"]);
-  for (const runtimeId of ["antigravity", "kimi", "copilot", "gemini"]) {
+  assert.deepEqual(deprecated, ["kimi", "copilot", "gemini"]);
+  for (const runtimeId of ["kimi", "copilot", "gemini"]) {
     assert.equal(isRuntimeDeprecated(runtimeId), true, runtimeId);
     assert.equal(buildRuntimeFormV2(runtimeId).schemaVersion, `${runtimeId}.edit.v1`, runtimeId);
   }
-  for (const runtimeId of ["opencode", "codex", "grok", "claude", "cursor", "pi"]) {
+  for (const runtimeId of ["opencode", "codex", "grok", "claude", "cursor", "pi", "antigravity"]) {
     assert.equal(buildRuntimeFormV2(runtimeId).schemaVersion, `${runtimeId}.create.v1`, runtimeId);
   }
 });
@@ -104,9 +104,6 @@ test("Built-in's provider secret is write-only through the generic mechanism: bl
     "apiKey" in (retainOmittedWriteOnlySecrets(withoutApiKey(builtinGateway("https://b.example.test/v1", "")), gateway) as { provider: object }).provider,
     false,
   );
-  // Managed connections carry no secret and are left alone.
-  const connection = { ...stored, provider: { kind: "connection", connectionId: "c1" } } as RuntimeConfig;
-  assert.equal(redactWriteOnlyRuntimeConfig(connection), connection);
   // Pre-registry output for released clients: a Built-in preset/gateway read
   // always carries apiKey "", even when nothing was stored (Argus, #8600).
   const keyless = { ...stored, provider: { ...(stored as unknown as { provider: Record<string, unknown> }).provider } } as unknown as { provider: Record<string, unknown> };

@@ -109,7 +109,7 @@ test("OAR: a delivery right after the idle stop is refused to the server, whose 
     await sleep(20);
     assert.equal(h.inputs.length, 2);
     assert.equal(h.inputs[1]!.split("race-unique-body").length - 1, 1, "delivered once");
-    assert.equal(h.opened[1]!.options.resume, h.sessions[0]!.id, "another grok model resumes the session");
+    assert.equal(h.opened[1]!.options.resume, undefined, "switching models opens a fresh session on every runtime");
   } finally {
     await h.cleanup();
   }
@@ -184,7 +184,7 @@ test("OAR: a start older than the applied push rebinds the launch and delivers i
     const sessionId = h.sessions[0]!.id;
 
     assert.equal(revisions.acceptPush("agent-1", 6), true);
-    h.host.applyConfig("agent-1", makeConfig({ model: "grok-other" }), 6);
+    h.host.applyConfig("agent-1", makeConfig({ envVars: { PUSHED: "1" } }), 6);
     const r5 = makeConfig({ model: "default", sessionId });
     revisions.noteStart("agent-1", 5, r5);
     h.waiting.set("agent-1", ["launch-5"]);
@@ -192,7 +192,7 @@ test("OAR: a start older than the applied push rebinds the launch and delivers i
     assert.deepEqual(await h.host.start(request({ launchId: "launch-5", config: r5, wakeMessage: wake })), { kind: "rebound" });
 
     const agent = (h.host as any).agents.get("agent-1");
-    assert.equal(agent.request.config.model, "grok-other", "the newer config stays");
+    assert.deepEqual(agent.request.config.envVars, { PUSHED: "1" }, "the newer config stays");
     assert.equal(h.host.getAgentLaunchId("agent-1"), "launch-5", "the launch rebinds");
     assert.deepEqual(h.rebound.map((each) => each.launchId), ["launch-5"]);
     assert.equal(h.framesOf("agent:session").at(-1)?.launchId, "launch-5");
@@ -223,6 +223,42 @@ test("OAR: a delivery held for a provider limit does not hold a session-keeping 
     await until(() => specStops(h).length > 0, "the spec stop");
     assert.equal(specStops(h).at(-1)!.drift, "env");
   } finally {
+    await h.cleanup();
+  }
+});
+
+test("OAR (#proj-runtime:#80): interrupting push stops busy turn immediately, records interrupted-turn note, and deletes only on commit", async () => {
+  const release = deferred();
+  const h = await harness({ turn: async (t) => { await release.promise; t.say("done"); } });
+  try {
+    assert.deepEqual(await h.host.start(request()), { kind: "started" });
+    await until(() => h.sessions[0]?.status().value.kind === "running", "first turn running");
+    const sessionId = h.sessions[0]!.id;
+
+    h.host.applyConfig("agent-1", makeConfig({ model: "grok-other", sessionId: "server-session" }), 4, { interrupt: true });
+    assert.equal(h.host.owns("agent-1"), false, "interrupts immediately");
+    assert.deepEqual(specStops(h).map((stop) => [stop.drift, stop.trigger, stop.session_id, stop.interrupted_turn]), [["model", "signal", sessionId, true]]);
+    assert.equal(pushEvents(h).at(-1)!.interrupt, true);
+
+    release.resolve();
+    await h.host.unwound("agent-1");
+
+    // Replacement start injects <interrupted-turn> and consumes it on commit.
+    assert.deepEqual(await h.host.start(request({ launchId: "launch-2", config: makeConfig({ model: "grok-other", sessionId: null }) })), { kind: "started" });
+    await until(() => h.inputs.length === 2, "replacement first input");
+    assert.match(
+      h.inputs[1]!,
+      /<interrupted-turn>\nYour previous turn was stopped partway to apply a settings change someone made \(model\)\./,
+    );
+
+    // Subsequent start does not receive the note again.
+    await h.host.stopAgent("agent-1");
+    await h.host.unwound("agent-1");
+    assert.deepEqual(await h.host.start(request({ launchId: "launch-3", config: makeConfig({ model: "grok-other", sessionId: null }) })), { kind: "started" });
+    await until(() => h.inputs.length === 3, "third start first input");
+    assert.doesNotMatch(h.inputs[2]!, /<interrupted-turn>/);
+  } finally {
+    release.resolve();
     await h.cleanup();
   }
 });

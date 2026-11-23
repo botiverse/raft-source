@@ -2,7 +2,6 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import type { Ref, RefObject } from "react";
 import { useIntl } from "react-intl";
 import {
-  ArrowUpRight,
   Code,
   Download,
   EllipsisVertical,
@@ -14,6 +13,7 @@ import {
   MonitorSmartphone,
   Pencil,
   Search,
+  SquareDashedMousePointer,
   Trash2,
   Users,
 } from "lucide-react";
@@ -27,9 +27,9 @@ import {
   DropdownMenuSubmenuTrigger,
   DropdownMenuTrigger,
   PanelAction,
+  useToast,
 } from "@botiverse/raft-ui";
 import {
-  AddCommentIcon,
   CommentIcon,
   FollowArtifactIcon,
   UnfollowArtifactIcon,
@@ -38,18 +38,19 @@ import type { ArtifactHome, ArtifactViewerData } from "@botiverse/raft-shared";
 
 import ConfirmDialog from "../../components/ConfirmDialog";
 import Tooltip from "../../components/ui/Tooltip";
-import { showToast } from "../../components/toastBridge";
-import { useMediaQuery } from "../../hooks/effectPrimitives";
+import { useArtifactPhoneLayout } from "./artifactPhoneLayout";
 import { useArtifactsEmbedOrigin } from "../../store/artifactsEmbedOrigin";
 import { copyTextToClipboard } from "../../utils/selectMarkdown";
+import { useOwnerWindow } from "../../utils/ownerDocument";
 import { trackArtifactViewerAction } from "./artifactAnalytics";
 import { artifactErrorCode } from "./artifactApi";
 import { artifactEmbedCode, copyTextLater, offersEmbed } from "./artifactEmbed";
 import type { LaterCopy } from "./artifactEmbed";
 import { artifactUrl } from "./artifactLinks";
-import { PHONE_QUERY } from "./artifactPhoneHistory";
 import { artifactSource, deleteArtifactHere, renameArtifactHere } from "./artifactSource";
+import { useCommentWritesOnArtifact } from "./artifactCommentWrites";
 import { useArtifactDownload } from "./artifactDownloads";
+import { ArtifactShareFileItem } from "./ArtifactShareFileItem";
 import { ArtifactScopeMenuItem, ArtifactVisibilityOptions, artifactVisibility } from "./ArtifactScopeLabel";
 import type { ArtifactVisibility } from "./ArtifactScopeLabel";
 import { artifactShareHost, artifactShareNoteKey } from "./artifactShareHost";
@@ -59,12 +60,16 @@ import type { ArtifactHomeConfirmation } from "./ArtifactNarrowHome";
 import { currentArtifactServerName } from "./artifactServerName";
 import { ArtifactRenameDialog } from "./ArtifactRenameDialog";
 import { ArtifactVersionHistoryMenuItem } from "./ArtifactVersionHistory";
-import { artifactOpenLabelId, openArtifactWindow } from "./artifactWindow";
+import { ArtifactOpenElsewhereItem } from "./ArtifactOpenElsewhereItem";
 import type { PickVersion } from "./ArtifactVersionHistory";
 import { ColumnMoveMenuItems } from "../../components/layout/appPanelHead";
 import { readsAsOutsider, readsInOwnServer } from "./artifactOwnServer";
 import { artifactAbuseHref } from "./artifactAbuseReport";
 import { ArtifactHostMenuItems } from "./artifactHostMenu";
+import { useArtifactSettle } from "./useArtifactSettle";
+import type { ArtifactSettle } from "./useArtifactSettle";
+import { ArtifactSettleMenuItem } from "./ArtifactSettledParts";
+import { POLITE_ERROR } from "./artifactToasts";
 
 // The ⋯ menu's actions and the dialogs they open, one copy for both places an
 // Artifact is read signed in: the in-app viewer (ArtifactViewer: the side
@@ -142,6 +147,8 @@ export interface ArtifactViewerActions {
   readHomeAgain: () => void;
   /** Renaming it (⋯'s Rename and its Rename Artifact dialog); null where the reader may not (`capabilities.publish`). */
   rename: ArtifactRename | null;
+  /** Settle or Unsettle (#334); null where the card says nothing of it (the flag off) or the reader may not comment. */
+  settle: ArtifactSettle | null;
   /**
    * ⋯'s Embed (#proj-workspace:#260, artifactEmbed.ts): a public Artifact's embed code copied; on one this reader
    * may make public, the turn-on-link-sharing confirmation first, then the code copied. Null where it isn't offered
@@ -176,6 +183,9 @@ export interface ArtifactViewerActions {
  */
 export function useArtifactViewerActions(data: ArtifactViewerData | null, shownKey: string, onDeleted: () => void): ArtifactViewerActions {
   const { formatMessage } = useIntl();
+  // The window the viewer is drawn in (an object window's own, #337 PR3): its toasts and its clipboard.
+  const toast = useToast();
+  const ownerWindow = useOwnerWindow();
   const [written, setWritten] = useState<WriteAnswer | null>(null);
   const [followChange, setFollowChange] = useState<boolean | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -187,7 +197,7 @@ export function useArtifactViewerActions(data: ArtifactViewerData | null, shownK
   const [renaming, setRenaming] = useState(false);
   /** The title this reader gave it, on the data it was given on, as `written`. */
   const [retitled, setRetitled] = useState<{ on: ArtifactViewerData; shownKey: string; title: string } | null>(null);
-  const view = useMemo(() => {
+  const edited = useMemo(() => {
     const moved = data && written && written.on === data && written.shownKey === shownKey
       ? {
         ...data,
@@ -198,6 +208,8 @@ export function useArtifactViewerActions(data: ArtifactViewerData | null, shownK
       : data;
     return moved && retitled && retitled.on === data && retitled.shownKey === shownKey ? { ...moved, card: { ...moved.card, title: retitled.title } } : moved;
   }, [data, written, retitled, shownKey]);
+  // Settle or Unsettle (#334): its answer on the data shown too; settling follows it, so ⋯ says Unfollow then.
+  const { view, settle } = useArtifactSettle(data, edited, setFollowChange);
   const writeOn = useCallback((on: ArtifactViewerData | null, requestKey: string) => (change: Pick<WriteAnswer, "home" | "capabilities" | "originalHome">) => {
     if (on) setWritten({ on, shownKey: requestKey, ...change });
   }, []);
@@ -230,11 +242,11 @@ export function useArtifactViewerActions(data: ArtifactViewerData | null, shownK
       write(viewerWrite(next));
       return next.card.home.kind === to;
     }, (error: unknown) => {
-      showToast({ title: homeRefusalMessage(formatMessage, error), type: "error" });
+      toast.error(homeRefusalMessage(formatMessage, error), POLITE_ERROR);
       if (isStaleHomeRefusal(error)) readHomeAgain();
       return false;
     });
-  }, [id, data, shownKey, writeOn, formatMessage, readHomeAgain]);
+  }, [id, data, shownKey, writeOn, formatMessage, readHomeAgain, toast]);
   const narrowed = useCallback((next: ArtifactViewerData) => {
     writeOn(data, shownKey)(viewerWrite(next));
     setNarrowing(null);
@@ -249,7 +261,7 @@ export function useArtifactViewerActions(data: ArtifactViewerData | null, shownK
     const write = writeOn(data, shownKey);
     return artifactSource().unpublish(id).then((next) => write(viewerWrite(next)), (error: unknown) => {
       const code = artifactErrorCode(error);
-      showToast({ title: formatMessage({ id: unpublishRefusal(code) }, currentArtifactServerName()), type: "error" });
+      toast.error(formatMessage({ id: unpublishRefusal(code) }, currentArtifactServerName()), POLITE_ERROR);
       // Link sharing off already (moved meanwhile): show where it lives now.
       if (code === "NOT_PUBLIC") {
         void artifactSource().viewer({ id, version: null }).then((result) => {
@@ -257,7 +269,7 @@ export function useArtifactViewerActions(data: ArtifactViewerData | null, shownK
         }, () => {});
       }
     });
-  }, [id, formatMessage, data, shownKey, writeOn]);
+  }, [id, formatMessage, data, shownKey, writeOn, toast]);
   const shownTitle = view?.card.title ?? null;
   const startRename = useCallback(() => setRenaming(true), []);
   const cancelRename = useCallback(() => setRenaming(false), []);
@@ -323,22 +335,22 @@ export function useArtifactViewerActions(data: ArtifactViewerData | null, shownK
   const copiedEmbed = useCallback((result: LaterCopy) => {
     if (result === "copied") {
       trackArtifactViewerAction("embed_copy");
-      showToast({ title: formatMessage({ id: "artifacts.menu.embedCopied" }), type: "success" });
-    } else if (result === "failed") showToast({ title: formatMessage({ id: "artifacts.frame.copyFailed" }), type: "warning" });
-  }, [formatMessage]);
+      toast.success(formatMessage({ id: "artifacts.menu.embedCopied" }));
+    } else if (result === "failed") toast.warning(formatMessage({ id: "artifacts.frame.copyFailed" }));
+  }, [formatMessage, toast]);
   const embed = useMemo(() => {
     if (embedOffer === null || embedCode === null) return null;
     return () => {
       if (embedOffer === "copy") {
         // In the click: the code is known now.
-        void copyTextToClipboard(embedCode).then(() => "copied" as const, () => "failed" as const).then(copiedEmbed);
+        void copyTextToClipboard(embedCode, undefined, { view: ownerWindow }).then(() => "copied" as const, () => "failed" as const).then(copiedEmbed);
       } else {
         // Not public yet: the turn-on-link-sharing confirmation, as Who can see's, Embed's words in it.
         setEmbedding(true);
         setNarrowing("public");
       }
     };
-  }, [embedOffer, embedCode, copiedEmbed]);
+  }, [embedOffer, embedCode, copiedEmbed, ownerWindow]);
   const widenPublicNow = useCallback(async () => {
     if (!embedding || embedCode === null) {
       await widen("public");
@@ -348,10 +360,10 @@ export function useArtifactViewerActions(data: ArtifactViewerData | null, shownK
     // text the code once anyone with the link can open it; a refusal said why, and nothing is copied.
     const code = embedCode;
     const shared = widen("public");
-    const copied = copyTextLater(shared.then((ok) => (ok ? code : null)));
+    const copied = copyTextLater(shared.then((ok) => (ok ? code : null)), ownerWindow);
     await shared;
     copiedEmbed(await copied);
-  }, [widen, embedding, embedCode, copiedEmbed]);
+  }, [widen, embedding, embedCode, copiedEmbed, ownerWindow]);
   // One set of visibility rules for the chip a manager clicks and the ⋯ menu.
   const visibility = useMemo(
     () => (view ? artifactVisibility(view, { onWiden: askWiden, onUnpublish: askUnpublish, onNarrow: setNarrowing }) : null),
@@ -368,9 +380,10 @@ export function useArtifactViewerActions(data: ArtifactViewerData | null, shownK
     askDelete,
     readHomeAgain,
     rename,
+    settle,
     embed,
     dialogs: { sharing, closeSharing, handleShared, narrowing, closeNarrowing, narrowed, unpublishNow: unpublish, widenPublicNow, embedding, confirmDelete, cancelDelete, confirmDeleteNow },
-  }), [view, visibility, following, toggleFollow, openShare, openFork, askDelete, readHomeAgain, rename, embed, sharing, closeSharing, handleShared, narrowing, closeNarrowing, narrowed, unpublish, widenPublicNow, embedding, confirmDelete, cancelDelete, confirmDeleteNow]);
+  }), [view, visibility, following, toggleFollow, openShare, openFork, askDelete, readHomeAgain, rename, settle, embed, sharing, closeSharing, handleShared, narrowing, closeNarrowing, narrowed, unpublish, widenPublicNow, embedding, confirmDelete, cancelDelete, confirmDeleteNow]);
 }
 
 /** What ⋯'s items open: Send to conversation, a smaller home's confirmation, Rename Artifact, Delete's. */
@@ -417,20 +430,6 @@ export function ArtifactViewerDialogs({ data, actions, finalFocus, menuFocus }: 
   );
 }
 
-/** Copies the Artifact's address (this deployment's origin; `/v/<n>` only when pinned) and says so in a toast, in every shell. */
-export function useCopyArtifactLink(card: ArtifactViewerData["card"]): () => void {
-  const { formatMessage } = useIntl();
-  // Built from the id, never taken from the payload.
-  const url = artifactUrl(card.id, card.pinned ? card.version : null);
-  return useCallback(() => {
-    trackArtifactViewerAction("copy_link");
-    void navigator.clipboard?.writeText(url).then(
-      () => showToast({ title: formatMessage({ id: "artifacts.menu.linkCopied" }), type: "success" }),
-      () => {},
-    );
-  }, [url, formatMessage]);
-}
-
 /** The side card's header pieces folded into ⋯ where it is narrow (the in-app viewer only). */
 export interface ArtifactMenuFold {
   comments: { open: boolean; label: string; onOpenChange: (open: boolean) => void } | null;
@@ -448,8 +447,6 @@ export interface ArtifactMenuFold {
     retry: { label: string; onSelect: () => void } | null;
     reportDisplay: { label: string; onSelect: () => void } | null;
   } | null;
-  /** Open in New Page, folded from the head (#189 rule 6: it folds like the head's other own actions). */
-  openInNewPage?: boolean;
   /** The head's visibility chip, folded with them: ⋯'s Visibility where the reader can change it, else where it lives. */
   scope?: boolean;
   /** Fork in Raft (#proj-workspace:#140), where the header is compact: the menu's first item, not a labelled button. */
@@ -472,10 +469,11 @@ export interface ArtifactMenuFold {
  * After what the head folded in, four groups, each two apart by a separator,
  * an empty one left out with its separator (#proj-workspace:#169, xxchan's
  * mockup): taking it elsewhere (Copy link, Embed, Send to conversation, Who
- * can see ›), the Artifact itself (Rename, Version history › but for another
+ * can see ›), the Artifact itself (Settle or Unsettle first, #334; Rename, Version history › but for another
  * server's reader, who reads the current version only, Files,
  * then Download, or Download all (one zip) for more than one file:
- * useArtifactDownload: none for another server's reader), this reader's own
+ * useArtifactDownload: none for another server's reader; then Share, the
+ * file itself to the system share sheet, where the browser can), this reader's own
  * (Follow or Unfollow, a member of the Artifact's own server's only: another
  * server's reader gets nothing from following it; Doesn't display well here
  * where the reader may comment but there is no comment mode, so no Comment
@@ -501,6 +499,7 @@ export function ArtifactViewerMenu({
   onCopyLink,
   onEmbed = null,
   onRename,
+  settle = null,
   onPickVersion,
   onOpenVersions,
   onOpenFiles = null,
@@ -524,6 +523,8 @@ export function ArtifactViewerMenu({
   onEmbed?: (() => void) | null;
   /** Rename: opens Rename Artifact; null where the reader may not (no `capabilities.publish`). */
   onRename: (() => void) | null;
+  /** Settle or Unsettle (#334), leading the Artifact-itself group; null or absent: not offered. */
+  settle?: ArtifactSettle | null;
   onPickVersion: PickVersion;
   /** On a phone, Version history opens its sheet. */
   onOpenVersions: () => void;
@@ -533,7 +534,8 @@ export function ArtifactViewerMenu({
    * Doesn't display well here (#proj-workspace:#243): opens the comment list's box with what it measured
    * (useArtifactDisplayReport); null or
    * absent where the reader may not comment (`capabilities.comment`), or where it is the Comment button's ▾'s
-   * (comment mode offered; folded in, it is `fold.review.reportDisplay`).
+   * (an HTML page's split button; folded in, it is `fold.review.reportDisplay`). A page with no block to pick has
+   * one Comments button and no ▾, so it is here.
    */
   onReportDisplay?: (() => void) | null;
   fold?: ArtifactMenuFold | null;
@@ -564,6 +566,12 @@ export function ArtifactViewerMenu({
     handsFocus.current = true;
     foldedReport?.();
   }, [foldedReport]);
+  // Where the page shown has no block to pick, Comment writes on the whole Artifact, as the head's (#proj-workspace:#323).
+  const foldedWrite = useCommentWritesOnArtifact();
+  const writeFolded = useCallback(() => {
+    handsFocus.current = true;
+    foldedWrite?.();
+  }, [foldedWrite]);
   const foldedFind = fold?.find?.onSelect;
   const openFind = useCallback(() => {
     handsFocus.current = true;
@@ -574,24 +582,21 @@ export function ArtifactViewerMenu({
     handsFocus.current = false;
     return toTrigger;
   }, []);
-  const phoneWidth = useMediaQuery(PHONE_QUERY);
+  const phoneWidth = useArtifactPhoneLayout();
   const phone = phoneLayout ?? phoneWidth;
   const moreLabel = formatMessage({ id: "artifacts.viewer.more" });
   const testId = surface === "page" ? "artifact-page-menu" : "artifact-viewer-menu";
   const download = useArtifactDownload(data);
-  const openInNewPage = useCallback(() => {
-    // Addresses are built from the id, never taken from the payload.
-    openArtifactWindow(artifactUrl(card.id, card.pinned ? card.version : null), card.id);
-  }, [card.id, card.pinned, card.version]);
   const review = fold?.review ?? null;
-  const openHere = surface === "viewer" && (phone || !!fold?.openInNewPage);
+  // The viewer's Open in New Page is always here, first (a desktop head and a phone's have no button for it).
+  const openHere = surface === "viewer";
   const scopeFolded = !!fold?.scope && !visibility;
   const folded = openHere || scopeFolded || review !== null || fold?.comments != null || fold?.find != null || fold?.fork != null;
   const shares = onCopyLink !== null || onEmbed !== null || onSend !== null || visibility !== null;
   // Another server's reader reads the current version only (the server's accessOf historyLimited: its versions
   // list just that one, any other is not found), so no Version history for them.
   const versionHistory = readsInOwnServer(card);
-  const itself = !!onRename || versionHistory || (!!onOpenFiles && data.files.length > 0) || download !== null;
+  const itself = settle !== null || !!onRename || versionHistory || (!!onOpenFiles && data.files.length > 0) || download !== null;
   // Follow is the Artifact's own server's (readsInOwnServer): another server's reader would follow nothing.
   const follow = readsInOwnServer(card);
   // What of the reader's own group this menu knows it draws; Move Left / Move Right are ColumnMoveMenuItems' to know.
@@ -614,22 +619,16 @@ export function ArtifactViewerMenu({
       <DropdownMenuContent side="bottom" align="end" sideOffset={4} finalFocus={finalFocus} aria-label={moreLabel} data-testid={testId}>
         {/* In the App, where it declared its own items, they come first: the page's bar is the only one (artifactHostMenu). */}
         {surface === "page" ? <ArtifactHostMenuItems /> : null}
-        {/* Where the header is compact, its Fork in Raft is the first item: the one primary action, folded in
-            (#proj-workspace:#140), so a long label never squeezes the title. */}
+        {/* The viewer's first item, for every kind (the head has Expand beside ⋯; leaving the conversation is here).
+            Open in new page is the page itself on the Artifact's own page. */}
+        {openHere ? <ArtifactOpenElsewhereItem card={card} /> : null}
+        {/* Where the header is compact, its Fork in Raft comes next: the one primary action, folded in
+            (#proj-workspace:#140), so a long label never squeezes the title. Then a phone's head's own actions,
+            folded in, in the head's order (Expand never folds in). */}
         {fold?.fork ? (
           <DropdownMenuItem onClick={fold.fork.onSelect} data-testid="artifact-viewer-menu-fork">
             <Forward />
             {fold.fork.label}
-          </DropdownMenuItem>
-        ) : null}
-        {/* Where the head is narrow, its own actions come first here: the viewer's own toolbar, folded in, in the
-            head's order (Expand never folds in). Open in new page is the page itself on the Artifact's own page; off
-            a phone the viewer's is a header button beside Expand (ArtifactViewer) until the head folds it, and a
-            phone's header has no room for it, so it is here. */}
-        {openHere ? (
-          <DropdownMenuItem onClick={openInNewPage} data-testid="artifact-viewer-menu-open-in-new-page">
-            <ArrowUpRight />
-            {formatMessage({ id: artifactOpenLabelId("artifacts.card.openInNewPage") })}
           </DropdownMenuItem>
         ) : null}
         {scopeFolded ? <ArtifactScopeMenuItem home={card.home} fromAnotherServer={card.fromAnotherServer} /> : null}
@@ -640,10 +639,17 @@ export function ArtifactViewerMenu({
         ) : null}
         {review ? (
           <>
-            <DropdownMenuCheckboxItem checked={review.commenting} onCheckedChange={review.onToggle} closeOnClick data-testid="artifact-viewer-menu-comment">
-              <AddCommentIcon />
-              {review.label}
-            </DropdownMenuCheckboxItem>
+            {foldedWrite ? (
+              <DropdownMenuItem onClick={writeFolded} data-testid="artifact-viewer-menu-write">
+                <CommentIcon />
+                {review.label}
+              </DropdownMenuItem>
+            ) : (
+              <DropdownMenuCheckboxItem checked={review.commenting} onCheckedChange={review.onToggle} closeOnClick data-testid="artifact-viewer-menu-comment">
+                <SquareDashedMousePointer />
+                {review.label}
+              </DropdownMenuCheckboxItem>
+            )}
             <DropdownMenuItem onClick={review.onShowAll} data-testid="artifact-viewer-menu-show-all-comments">
               <CommentIcon />
               {review.showAllLabel}
@@ -709,6 +715,7 @@ export function ArtifactViewerMenu({
           </DropdownMenuSubmenu>
         ) : null}
         {shares && itself ? <DropdownMenuSeparator /> : null}
+        {settle ? <ArtifactSettleMenuItem settle={settle} testId={`${testId}-settle`} /> : null}
         {onRename ? (
           <DropdownMenuItem onClick={rename} data-testid={`${testId}-rename`}>
             <Pencil />
@@ -729,6 +736,8 @@ export function ArtifactViewerMenu({
             {formatMessage({ id: download.all ? "artifacts.menu.downloadAll" : "artifacts.menu.download" })}
           </DropdownMenuItem>
         ) : null}
+        {/* Download's reader only; drawn only where this browser shares the file (ArtifactShareFileItem). */}
+        {download ? <ArtifactShareFileItem data={data} testId={testId} /> : null}
         {/* The group's separator: before Follow or the display report; with neither, before the moves if there are any. */}
         {(shares || itself) && own ? <DropdownMenuSeparator /> : null}
         {follow ? (
@@ -737,8 +746,8 @@ export function ArtifactViewerMenu({
             {formatMessage({ id: following ? "artifacts.menu.unfollow" : "artifacts.menu.follow" })}
           </DropdownMenuItem>
         ) : null}
-        {/* With the reader's own, after Follow, where there is no comment mode (no Comment button's ▾, which has it
-            otherwise): the page doesn't show well on their screen; it opens the comment list's box with what the
+        {/* With the reader's own, after Follow, where there is no Comment button's ▾ to hold it (no comment mode, or a
+            page with no block to pick: Markdown, a PDF): the page doesn't show well on their screen; it opens the comment list's box with what the
             viewer measured (#proj-workspace:#243). No hint anywhere else. */}
         {onReportDisplay ? (
           <DropdownMenuItem onClick={reportDisplay} data-testid="artifact-viewer-menu-display-report">

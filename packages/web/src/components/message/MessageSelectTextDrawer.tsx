@@ -17,6 +17,7 @@ import {
 } from "@botiverse/raft-ui";
 import CopyButton from "../ui/CopyButton";
 import { emitSelectedTextQuote } from "./selectedTextQuote";
+import type { QuoteReplyAuthorType } from "./selectedTextQuote";
 import { hasTouchToSearch } from "./touchToSearch";
 
 /**
@@ -60,6 +61,10 @@ export interface MessageSelectTextDrawerProps {
   markdown: string;
   /** The composer a quote lands in (MessageItem's quoteComposerChannelId). */
   quoteChannelId: string;
+  /** Source message metadata for structured Quote Reply v0. */
+  messageId?: string;
+  senderType?: QuoteReplyAuthorType;
+  createdAt?: string;
 }
 
 /**
@@ -79,6 +84,9 @@ export function MessageSelectTextDrawer({
   time,
   markdown,
   quoteChannelId,
+  messageId,
+  senderType,
+  createdAt,
 }: MessageSelectTextDrawerProps) {
   const { formatMessage } = useIntl();
   const hintId = useId();
@@ -135,9 +143,23 @@ export function MessageSelectTextDrawer({
   const handleQuote = useCallback(() => {
     // A second tap while the sheet slides out mustn't quote again.
     if (quotedRef.current) return;
-    quotedRef.current = emitSelectedTextQuote(quoteChannelId, takeSelection() || markdown);
+    const selection = takeSelection();
+    const quotedText = selection || markdown;
+    quotedRef.current = emitSelectedTextQuote(
+      quoteChannelId,
+      quotedText,
+      messageId
+        ? {
+            messageId,
+            authorName: senderName,
+            authorType: senderType,
+            createdAt,
+            isPartial: Boolean(selection),
+          }
+        : undefined,
+    );
     onClose();
-  }, [markdown, onClose, quoteChannelId, takeSelection]);
+  }, [createdAt, markdown, messageId, onClose, quoteChannelId, senderName, senderType, takeSelection]);
 
   const handleOpenChange = useCallback((nextOpen: boolean) => {
     if (!nextOpen) onClose();

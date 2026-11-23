@@ -20,6 +20,7 @@ import type { AxSurfaceText } from "@botiverse/raft-shared";
 import { migrateLegacyBridgeArtifacts } from "../legacyBridgeArtifacts";
 import { SLOCK_HOME_ENV, resolveRaftHome } from "../raftHome";
 import { registerAgentCredentialProxy } from "../agentCredentialProxy";
+import { daemonRunsProcJobs } from "../procJobs";
 import { configPassiveAx, publishSpawnContextGeneration } from "../contextGeneration";
 import { LOOPBACK_NO_PROXY, applyLoopbackNoProxyEnv } from "../loopbackNoProxy";
 import { detectNodeHostKind, resolveNodeHostLaunch, type NodeHostKind } from "./nodeHostLaunch";
@@ -93,6 +94,58 @@ const AGENT_CLI_TRANSPORT_WRAPPER_NAMES = [
   "raft.ps1",
 ] as const;
 const LAUNCH_CREATED_AT_FILENAME = ".slock-launch-created-at";
+
+// A generated wrapper runs the CLI as the agent it was written for. A process
+// that already says it is another agent (its launch set SLOCK_AGENT_ID) and
+// runs this wrapper anyway (a leftover shell, a hardcoded path) would post as
+// this agent, so the wrapper refuses it before anything else runs. Agents on a
+// Computer share an OS user, so this guards against misattribution, not an
+// attacker. An unset or empty SLOCK_AGENT_ID (cron, nohup, a person debugging)
+// is allowed. Same-agent launch forwarding is unaffected: the forwarded-to
+// wrapper belongs to the same agent. The caller's value is only compared and
+// printed, never evaluated.
+const FOREIGN_CALLER_EXIT_CODE = 1;
+const foreignCallerMessage = (bakedAgentId: string, callerRef: string) =>
+  `raft: this CLI belongs to agent ${bakedAgentId}; the calling process is agent ${callerRef}. Use your own raft command.`;
+
+function buildPosixForeignCallerGuard(agentId: string): string {
+  return [
+    `SLOCK_WRAPPER_AGENT_ID=${shellSingleQuote(agentId)}`,
+    'if [ -n "${SLOCK_AGENT_ID:-}" ] && [ "$SLOCK_AGENT_ID" != "$SLOCK_WRAPPER_AGENT_ID" ]; then',
+    `  printf '%s\\n' "raft: this CLI belongs to agent $SLOCK_WRAPPER_AGENT_ID; the calling process is agent $SLOCK_AGENT_ID. Use your own raft command." >&2`,
+    `  exit ${FOREIGN_CALLER_EXIT_CODE}`,
+    "fi",
+  ].join("\n");
+}
+
+function buildCmdForeignCallerGuard(agentId: string): string {
+  // The baked id is set with delayed expansion off (as the identity line
+  // below is), then both values are compared and printed only through
+  // !delayed! expansion, which happens after cmd parses the line, so quotes,
+  // &, |, parentheses or % in the caller's value are not interpreted. The
+  // comparison is case-insensitive (/I); agent ids are UUIDs.
+  return [
+    "setlocal DisableDelayedExpansion",
+    `set "SLOCK_WRAPPER_AGENT_ID=${agentId}"`,
+    "setlocal EnableDelayedExpansion",
+    'if defined SLOCK_AGENT_ID if /I not "!SLOCK_AGENT_ID!"=="!SLOCK_WRAPPER_AGENT_ID!" (',
+    `  >&2 echo ${foreignCallerMessage("!SLOCK_WRAPPER_AGENT_ID!", "!SLOCK_AGENT_ID!")}`,
+    `  exit /b ${FOREIGN_CALLER_EXIT_CODE}`,
+    ")",
+    "endlocal",
+    "endlocal",
+  ].join("\r\n");
+}
+
+function buildPs1ForeignCallerGuard(agentId: string): string {
+  return [
+    `$SlockWrapperAgentId = ${powershellSingleQuote(agentId)}`,
+    "if ($env:SLOCK_AGENT_ID -and ($env:SLOCK_AGENT_ID -cne $SlockWrapperAgentId)) {",
+    `  [Console]::Error.WriteLine(${'"' + foreignCallerMessage("$SlockWrapperAgentId", "$($env:SLOCK_AGENT_ID)") + '"'})`,
+    `  exit ${FOREIGN_CALLER_EXIT_CODE}`,
+    "}",
+  ].join("\r\n");
+}
 
 function buildPosixLaunchForwardingGuard(ownSlockDir: string): string {
   // The selector passed via SLOCK_AGENT_LAUNCH_DIR is a single launch-directory
@@ -888,7 +941,9 @@ export function buildCliTransportSystemPrompt(
   config: AgentConfig,
   opts: SystemPromptOptions,
 ): AxSurfaceText {
-  return buildCliSystemPrompt(config, opts);
+  // `raft proc`: the Background jobs entry only where this daemon runs jobs
+  // (the same answer that starts its job manager and declares `proc@1`).
+  return buildCliSystemPrompt(config, { procJobs: daemonRunsProcJobs(), ...opts });
 }
 
 /** PATH from an env object; on Windows the name matches in any case. */
@@ -1034,6 +1089,8 @@ export async function prepareCliTransport(
       inboxCoordinator: ctx.agentCredentialProxyInboxCoordinator,
       recordMessageCommitted: ctx.agentCredentialProxyMessageCommitted,
       recordSendOutcome: ctx.agentCredentialProxySendOutcome,
+      recordInboxRead: ctx.agentCredentialProxyInboxRead,
+      getExactSeenSeqs: ctx.agentCredentialProxyExactSeenSeqs,
       inboxItems: ctx.agentCredentialProxyInboxItems,
       appInbox: ctx.agentAppInbox,
       tracer: ctx.tracer,
@@ -1091,7 +1148,7 @@ export async function prepareCliTransport(
     : "";
   const posixHostRef = hostPromotedPath ? '"$RAFT_HOST"' : shellSingleQuote(nodeHost.command);
   const posixWrapperBody = (head: string, entryPrefix: string) =>
-    `#!/usr/bin/env bash\n${head}\nunset RAFT_PROFILE SLOCK_PROFILE RAFT_PROFILE_DIR SLOCK_PROFILE_DIR\n${posixLoopbackNoProxyPrelude()}\nSLOCK_CLI=${shellSingleQuote(cliPath)}\n${posixCliFallbackBlock}${electronNodeMode ? "export ELECTRON_RUN_AS_NODE=1\n" : ""}${posixHostPrelude}${posixCredentialPrefix}${entryPrefix}exec ${posixHostRef} "$SLOCK_CLI" "$@"\n`;
+    `#!/usr/bin/env bash\n${buildPosixForeignCallerGuard(ctx.agentId)}\n${head}\nunset RAFT_PROFILE SLOCK_PROFILE RAFT_PROFILE_DIR SLOCK_PROFILE_DIR\n${posixLoopbackNoProxyPrelude()}\nSLOCK_CLI=${shellSingleQuote(cliPath)}\n${posixCliFallbackBlock}${electronNodeMode ? "export ELECTRON_RUN_AS_NODE=1\n" : ""}${posixHostPrelude}${posixCredentialPrefix}${entryPrefix}exec ${posixHostRef} "$SLOCK_CLI" "$@"\n`;
   const posixBody = posixWrapperBody(buildPosixLaunchForwardingGuard(slockDir), "");
   writeFileSync(posixWrapper, posixBody, { mode: 0o755 });
   writeFileSync(posixRaftWrapper, posixBody, { mode: 0o755 });
@@ -1129,6 +1186,7 @@ export async function prepareCliTransport(
         `if not exist "%SLOCK_CLI%" set "SLOCK_CLI=${candidate}"`);
     const cmdWrapperBody = (head: string, entryLines: string[]) => [
       "@echo off",
+      buildCmdForeignCallerGuard(ctx.agentId),
       head,
       "set PYTHONIOENCODING=utf-8",
       "set PYTHONUTF8=1",
@@ -1178,6 +1236,7 @@ export async function prepareCliTransport(
         : []),
     ];
     const psWrapperBody = (head: string, entryLines: string[]) => [
+      buildPs1ForeignCallerGuard(ctx.agentId),
       head,
       "$ErrorActionPreference = 'Stop'",
       "$utf8NoBom = [System.Text.UTF8Encoding]::new($false)",

@@ -44,8 +44,8 @@ export function artifactHashForPanel(panel: ArtifactPagePanel): string {
 /**
  * `#host=<action>`: the page asks the App for something of its own: `close` (Back in the App's toolbar, `back=host`,
  * embed.ts; Lagoon, #proj-workspace:#264), or an item of the App's menu it declared (`hostMenu`, embed.ts:
- * `desktop-mode`, `open-in-browser`; mobile #4635, which ignores any other name). Like `#panel=`, a hashchange the
- * App watches, no bridge. Not a panel: artifactPanelFromHash ignores it, and the page's `#panel=` write-back may
+ * `desktop-mode`, `open-in-browser`; mobile #4635, which ignores any other name), or `copy-link` (Copy link, done with
+ * the system clipboard; mobile #4870). Like `#panel=`, a hashchange the App watches, no bridge. Not a panel: artifactPanelFromHash ignores it, and the page's `#panel=` write-back may
  * replace it.
  */
 export type ArtifactHostAction = "close" | HostMenuItem;

@@ -20,7 +20,7 @@ import {
 } from "../reviewerIsolation";
 import { formatTaskStatusUpdated } from "./_format";
 import { NO_TASK_NAMED_MESSAGE, resolveTaskAddress, TASK_REF_ARGUMENT } from "./_taskAddress";
-import { writeAttachedUnseen, writeHeldTaskWrite } from "../freshness/_taskHold";
+import { writeAttachedUnseen, exitIfHeldTaskWrite } from "../freshness/_taskHold";
 
 const STATUSES = ["backlog", "todo", "in_progress", "in_review", "done", "closed"] as const;
 type Status = (typeof STATUSES)[number];
@@ -159,7 +159,7 @@ export const taskUpdateCommand = defineCommand(
         message: "Agent API taskUpdateStatus returned an empty response body",
       });
     }
-    if (writeHeldTaskWrite(ctx, agentContext.agentId, "task_update", body, res.data, { reviewerIsolation })) return;
+    exitIfHeldTaskWrite(ctx, agentContext.agentId, "task_update", body, res.data, { reviewerIsolation });
     // What the server stored (older servers omit it: the request). A task v2
     // task asked for in_review stores in_progress.
     writeText(ctx.io, formatTaskStatusUpdated(taskNumber, res.data.status ?? status, res.data.taskRef, status), NL);

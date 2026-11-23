@@ -666,7 +666,7 @@ export function createDashboardOperations() {
       const names = await conversationNames(reader, groups.flatMap((group) => (group.home ? [group.home] : [])));
       // The filter's own rule, as one batch: what it would refuse is no row, and `q` below reads only what is left.
       const readable = await readableConversations(reader, [...names.values()].map(({ id }) => id));
-      const merged = new Map<string, { id: string; name: string; type: ArtifactDashboardConversation["type"]; peerDisplayName?: string; peer?: { type: "user" | "agent"; id: string }; count: number; at: Date }>();
+      const merged = new Map<string, { id: string; name: string; type: ArtifactDashboardConversation["type"]; peerDisplayName?: string; peer?: { type: "user" | "agent"; id: string }; archived: boolean; count: number; at: Date }>();
       for (const group of groups) {
         const conversation = group.home ? names.get(group.home) : undefined;
         if (!conversation || !readable.has(conversation.id)) continue;
@@ -682,7 +682,7 @@ export function createDashboardOperations() {
       // One lookup for the DM peers shown (their avatars).
       const actorOf = await profiler(shown.flatMap(({ peer }) => (peer ? [peer] : [])));
       return json<ArtifactWebDashboardConversations>({
-        conversations: shown.map(({ peer, at, ...conversation }) => ({ ...conversation, updatedAt: at.toISOString(), ...(peer ? { peer: actorOf(peer) } : {}) })),
+        conversations: shown.map(({ peer, at, archived: _archived, ...conversation }) => ({ ...conversation, updatedAt: at.toISOString(), ...(peer ? { peer: actorOf(peer) } : {}) })),
       });
     }),
   };

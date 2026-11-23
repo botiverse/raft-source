@@ -4,14 +4,14 @@ import type { DesktopWebPreviewTabList, DesktopWebPreviewTabsBridge } from "@bot
 import { PanelHeadChromeContext } from "../../src/components/layout/panelHeadChrome";
 import type { PanelHeadChrome } from "../../src/components/layout/panelHeadChrome";
 import { BrowserPanel } from "../../src/features/webPreview/BrowserPanel";
-import { mirrorBrowserTabsList } from "../../src/features/webPreview/browserTabsStore";
+import { mirrorBrowserTabsList, useBrowserTabsStore } from "../../src/features/webPreview/browserTabsStore";
 import { preloadInitialLocaleMessages } from "../../src/i18n/preloadLocaleMessages";
 import { VisualTestingRoot } from "../VisualTestingRoot";
 import "../../src/index.css";
 
 // Raft Desktop's built-in browser panel head with pinned tabs (#proj-workspace:#297), drawn with the real
 // BrowserPanel over a shell that only answers with a fixed tab list, for local screenshots
-// (desktop-browser-tabs.shot.mjs): ?mode=light|dark&width=<panel px>&pinned=<n>&own=<n>&front=<tab id>&grip=0|1.
+// (desktop-browser-tabs.shot.mjs): ?mode=light|dark&width=<panel px>&pinned=<n>&own=<n>&front=<tab id>&grip=0|1&site=0|1.
 // Tabs are p1… (pinned) and t1… (the conversation's own). `own=0` is a conversation with no tabs of its own.
 const params = new URLSearchParams(window.location.search);
 const mode = params.get("mode") === "dark" ? "dark" : "light";
@@ -20,6 +20,8 @@ const pinnedCount = Number(params.get("pinned") ?? 2);
 const ownCount = Number(params.get("own") ?? 3);
 const front = params.get("front") ?? "t1";
 const withGrip = params.get("grip") !== "0";
+// site=1: every tab reports its site, so the address row shows the site settings button before the address.
+const withSite = params.get("site") === "1";
 
 const PAGES = [
   ["https://mail.example.com/inbox", "Inbox (3) - Mail"],
@@ -46,9 +48,18 @@ const bridge: DesktopWebPreviewTabsBridge = {
   open: nothing, activate: nothing, close: nothing, closeAll: nothing, back: nothing, forward: nothing, reload: nothing, setBounds: nothing,
   setVisible: async () => null,
   onState: () => nothing,
+  setSitePermission: nothing,
   list: { get: async () => list, dispatch: async () => list, present: nothing, onChange: () => nothing, pins: true },
 };
 mirrorBrowserTabsList(bridge.list!, "fixture-user");
+// What the shell reports of each tab's site (its views are not attached here, so the report is applied directly).
+if (withSite) {
+  const timer = setInterval(() => {
+    if (!useBrowserTabsStore.getState().browsers.c1) return;
+    for (const each of own) useBrowserTabsStore.getState().applyState("c1", { tabId: each.id, url: each.url, title: each.title, loading: false, canGoBack: false, canGoForward: false, site: { origin: new URL(each.url).origin, microphone: "ask", camera: "ask" } });
+    clearInterval(timer);
+  }, 100);
+}
 
 // The head as a side section's: the grip that moves the panel, its bar drawn as under the pointer.
 const chrome: PanelHeadChrome = {

@@ -10,6 +10,7 @@ import { parseDurationSeconds } from "./_duration";
 import { formatReminderSnoozed } from "./_format";
 import { resolveReminderId } from "./_resolve";
 import { assertReminderNotSealed } from "../../apps/reminder/sealGuard";
+import { legacyThenApp, reminderAppGate, reminderAppId, runReminderAppAction, wasMovedToApp } from "./_app";
 
 interface SnoozeOpts {
   id: string;
@@ -38,22 +39,31 @@ export const reminderSnoozeCommand = defineCommand(
       }
 
       const agentContext = ctx.loadAgentContext();
-      const client = ctx.createApiClient(agentContext);
-      await assertReminderNotSealed(ctx, opts.id.trim(), "snooze");
-      const fullId = await resolveReminderId(client, opts.id, {
-        statuses: ["scheduled", "fired"],
-        failureCode: "SNOOZE_FAILED",
-      });
+      const appId = reminderAppId(opts.id);
+      const viaApp = () => runReminderAppAction(ctx, "snooze-reminder", { id: appId, by: opts.by.trim() }, { write: true });
+      const gate = await reminderAppGate(ctx, agentContext);
+      if (gate === "on") return viaApp();
 
-      const res = await createAgentApiSurfaceClient(client).reminders.snooze(
-        { reminderId: fullId },
-        { delaySeconds },
-      );
-      if (!res.ok || !res.data?.reminder) {
-        // Carries the server's code, e.g. reminders_unsupported_for_external_agents.
-        throw apiFailureError(res, "SNOOZE_FAILED");
-      }
-      writeText(ctx.io, adoptCliReplyText(formatReminderSnoozed(res.data.reminder) + "\n"));
+      const legacy = async () => {
+        const client = ctx.createApiClient(agentContext);
+        await assertReminderNotSealed(ctx, opts.id.trim(), "snooze");
+        const fullId = await resolveReminderId(client, opts.id, {
+          statuses: ["scheduled", "fired"],
+          failureCode: "SNOOZE_FAILED",
+        });
+
+        const res = await createAgentApiSurfaceClient(client).reminders.snooze(
+          { reminderId: fullId },
+          { delaySeconds },
+        );
+        if (wasMovedToApp(res)) return viaApp();
+        if (!res.ok || !res.data?.reminder) {
+          // Carries the server's code, e.g. reminders_unsupported_for_external_agents.
+          throw apiFailureError(res, "SNOOZE_FAILED");
+        }
+        writeText(ctx.io, adoptCliReplyText(formatReminderSnoozed(res.data.reminder) + "\n"));
+      };
+      await legacyThenApp(gate, appId, legacy, viaApp);
   },
 );
 

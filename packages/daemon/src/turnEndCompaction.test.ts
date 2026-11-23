@@ -1,6 +1,7 @@
 // #proj-runtime:#54 phase 3: the turn-end compaction rule both hosts share.
 import assert from "node:assert/strict";
 import { TurnEndCompactionArming, decideTurnEndCompaction, resolveTurnEndCompactionConfig, turnEndCompactionLogLine, turnEndCompactionTraceAttrs } from "./turnEndCompaction";
+import { legacyTurnEndCompactionPreconditionFailure } from "./turnEndCompactionLegacy";
 
 const on = resolveTurnEndCompactionConfig({ turnEndCompaction: true }, {});
 
@@ -63,4 +64,21 @@ test("#54 phase 3: a settled compaction's one log line names the outcome and the
     turnEndCompactionLogLine({ agentId: "agent-1", host: "legacy", outcome: "failed:not_compacted", contextTokens: null, durationMs: 5 }),
     "[TurnEndCompaction] agent agent-1: failed:not_compacted, unknown context tokens before, took 5ms (legacy)",
   );
+});
+
+test("#67: legacyTurnEndCompactionPreconditionFailure preserves granular AgentNotIdleReason values instead of collapsing to agent_busy", () => {
+  const base = {
+    compacting: false,
+    stopping: false,
+    untoldInbox: false,
+    failureState: false,
+    serverContextPending: false,
+    deliverable: true,
+    commandOverridden: false,
+  };
+  assert.equal(legacyTurnEndCompactionPreconditionFailure({ ...base, notIdleReason: null }), null);
+  assert.equal(legacyTurnEndCompactionPreconditionFailure({ ...base, notIdleReason: "agent_busy" }), "agent_busy");
+  assert.equal(legacyTurnEndCompactionPreconditionFailure({ ...base, notIdleReason: "background_tasks" }), "background_tasks");
+  assert.equal(legacyTurnEndCompactionPreconditionFailure({ ...base, notIdleReason: "delivery_in_flight" }), "delivery_in_flight");
+  assert.equal(legacyTurnEndCompactionPreconditionFailure({ ...base, notIdleReason: "mention_in_flight" }), "mention_in_flight");
 });

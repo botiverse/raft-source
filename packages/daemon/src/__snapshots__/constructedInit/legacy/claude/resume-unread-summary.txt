@@ -1,0 +1,31 @@
+host: legacy
+runtime: claude
+scenario: resume-unread-summary
+promptSource: resume_unread_summary
+note: driver: supportsNativeStandingPrompt=true standingPromptRefreshesOnResume=false deferSpawnUntilMessage=false
+
+## standing prompt
+= standing-prompt.md with:
+===================================================================
+--- standing-prompt.md
++++ this-case
+@@ -25,1 +25,1 @@
+-1. **Messages** — `raft message send`, `raft message read`, `raft message search`, `raft message resolve`, `raft message react`. To catch up, `raft inbox check` lists what is unread, then `raft message read --target <target> --unread` reads one conversation; read the ones you need, one at a time.
++1. **Messages** — `raft message send`, `raft message read`, `raft message search`, `raft message resolve`, `raft message react`. To catch up, `raft inbox check` lists what is unread, then `raft inbox read --target <item>` reads one item a page at a time; read the ones you need, one at a time. `raft message read` re-reads any conversation, read or not.
+@@ -37,1 +37,1 @@
+-13. **Inbox** — `raft inbox check` is your Activity panel: it lists your unread conversations (DMs, channels, threads), newest activity first. Each row prints the `raft message read` command that opens it, and the output ends with one `Next:` step when there is one. No flags needed; `--view mentions` narrows to conversations that mention you, and `--before <seq>` from the `More:` line pages.
++13. **Inbox** — `raft inbox check` is your Activity panel: it lists what is unread, newest activity first: conversations (DMs, channels, threads), app notices grouped by what they are about (`app:<app>/<ref>`), and reminders that fired (`reminder:<id>`). Each row prints the `raft inbox read --target <item>` command that reads it; a reminder also prints the `raft reminder ack` command that clears it, since reading doesn't. `raft inbox read` prints one page, says how many are left when some are, and marks what it printed read. The list ends with one `Next:` step when there is one. No flags needed; `--view mentions` narrows to conversations that mention you, and `--before <seq>` from the `More:` line pages.
+@@ -169,1 +169,1 @@
+-What `raft message read` prints counts as seen by you, so a later send is not held for it. Never discard or filter its output (`>/dev/null`, `| head`, `| grep`): anything you cut out still counts as seen, and you may reply without knowing what was just said.
++What `raft inbox read` and `raft message read` print counts as seen by you, so a later send is not held for it. Never discard or filter their output (`>/dev/null`, `| head`, `| grep`): anything you cut out still counts as seen, and you may reply without knowing what was just said.
+
+
+## carrier
+SpawnContext.standingPrompt: = standing prompt
+
+## first input (521 chars, sha256:56ca8430e75e3c16, does not contain the standing prompt)
+You have unread messages:
+- #general: 3 unread
+- dm:@bob: 1 unread
+
+Run `raft inbox check` once, then read each item it lists once with `raft inbox read --target <item>`, then stop. If the history reveals a direct request, assignment, @mention, review request, or task clearly addressed to you, switch into active handling instead of stopping: reply using `raft message send --target <exact target>` and claim the relevant task with `raft task claim` before starting work. Otherwise, do NOT send any message in this mode.

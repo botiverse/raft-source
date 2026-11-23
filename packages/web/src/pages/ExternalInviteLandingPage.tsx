@@ -3,6 +3,7 @@ import { useIntl } from "react-intl";
 import { Button } from "@botiverse/raft-ui";
 import { LogIn, UserPlus } from "lucide-react";
 import CenteredCardFrame from "../components/auth/CenteredCardFrame";
+import { OpenInAppOffers } from "../components/deeplinks/OpenInAppOffers";
 import { AuthPageIntro } from "../components/auth/AuthPageFrame";
 import { apiErrorStatus, getExternalInvitePreview } from "../components/externalInvite/externalInviteAccept";
 import type { ExternalInviteLinkPreview } from "../components/externalInvite/externalInviteAccept";
@@ -55,7 +56,7 @@ export function ExternalInviteLandingPage({ token, onChoose }: ExternalInviteLan
 
   if (state.kind === "loading") {
     return (
-      <CenteredCardFrame>
+      <CenteredCardFrame topStrip={<OpenInAppOffers slot="top" />} bottomStrip={<OpenInAppOffers slot="bottom" />}>
         <div className="w-full" data-testid="external-invite-landing-loading">
           <AuthPageIntro title={formatMessage({ id: "pages.invite.loadingTitle" })} />
         </div>
@@ -66,7 +67,7 @@ export function ExternalInviteLandingPage({ token, onChoose }: ExternalInviteLan
   if (state.kind === "invalid" || state.kind === "loadFailed") {
     const invalid = state.kind === "invalid";
     return (
-      <CenteredCardFrame>
+      <CenteredCardFrame topStrip={<OpenInAppOffers slot="top" />} bottomStrip={<OpenInAppOffers slot="bottom" />}>
         <div className="w-full" data-testid={invalid ? "external-invite-landing-invalid" : "external-invite-landing-load-failed"}>
           <AuthPageIntro
             title={formatMessage({ id: invalid ? "externalInvite.invalid.title" : "externalInvite.loadFailed.title" })}
@@ -82,7 +83,7 @@ export function ExternalInviteLandingPage({ token, onChoose }: ExternalInviteLan
 
   const { preview } = state;
   return (
-    <CenteredCardFrame>
+    <CenteredCardFrame topStrip={<OpenInAppOffers slot="top" />} bottomStrip={<OpenInAppOffers slot="bottom" />}>
       <div className="w-full" data-testid="external-invite-landing">
         <AuthPageIntro title={formatMessage({ id: "externalInvite.landing.title" })}>
           <p className="mt-2 text-callout text-foreground-muted" data-testid="external-invite-landing-sent-to">

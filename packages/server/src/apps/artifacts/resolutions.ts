@@ -21,9 +21,16 @@
 //   object event (`comment_resolved` for the thread's author when a person
 //   and someone else; `comment_reopened` for no one), and, resolving, the
 //   notice to the thread's author when an agent and someone else
-//   (noticeResolved, whether it follows or not). After the commit the
-//   notices are pushed and people's Activity is told (`activity:changed`,
-//   the ping every comment write sends).
+//   (noticeResolved, whether it follows or not). Only the thread's author
+//   hears of a resolve, never the Artifact's other followers, and only in
+//   their inbox (Sage, #proj-workspace:#340: what needs the recipient to act
+//   or answer wakes, a state change only goes to the inbox): an agent's
+//   notice is queued, never pushed; a person's Activity row moves to the
+//   event without an unread (ObjectEventRecipient.read, as a settle's). The
+//   resolver is told who heard (`toldAuthor`). After the commit the note's
+//   notices are pushed, people's Activity is told (`activity:changed`, the
+//   ping every comment write sends) and open pages of the Artifact are
+//   pinged (live.ts, `comments`).
 // - A reply in a resolved thread reopens it in the reply's transaction
 //   (reopenThreadsOf, from insertComment and a review's writer).
 import { and, eq, sql } from "drizzle-orm";
@@ -34,6 +41,7 @@ import { canManageObjectActions, type ServerViewActor } from "../../platform/vis
 import { currentVersionOf, readableVersion, type ArtifactActorRef, type ArtifactNoticeOutbox } from "./apiCommon";
 import type { CommentHold, WrittenComment } from "./comments";
 import { recordArtifactEvent } from "./events";
+import { announceArtifactChanged } from "./live";
 import { noticeResolved, sendQueued, type QueuedNotice } from "./notices";
 import { artifactComments, artifactItems, artifactVersionFiles, artifactVersions, type ArtifactCommentRow, type ArtifactItemRow, type ArtifactVersionRow } from "./schema";
 
@@ -133,8 +141,13 @@ export type ResolutionOutcome =
     root: ArtifactCommentRow;
     changed: boolean;
     note: WrittenComment | null;
-    /** The thread's author, told of the resolve (an agent), by id; null when no one was. */
-    toldAgent: string | null;
+    /**
+     * The thread's author, told of the resolve (an agent in its inbox, a
+     * person in their Activity, neither woken nor marked unread); null when
+     * no one was: a reopen, the resolver's own thread, or an author who can't
+     * see the Artifact.
+     */
+    toldAuthor: ArtifactActorRef | null;
   };
 
 /**
@@ -160,7 +173,7 @@ export async function changeResolution(input: {
     if (!locked || locked.deletedAt || locked.revokedAt) return { kind: "gone" };
     const [root] = await tx.select().from(artifactComments).where(and(eq(artifactComments.itemId, locked.id), eq(artifactComments.id, input.rootId))).limit(1);
     if (!root) return { kind: "not_found" };
-    if ((root.resolvedAt !== null) === resolve) return { kind: "done", root, changed: false, note: null, toldAgent: null };
+    if ((root.resolvedAt !== null) === resolve) return { kind: "done", root, changed: false, note: null, toldAuthor: null };
     if (resolve && input.hold) {
       const hold = await input.hold(tx, locked, root);
       if (hold) return { kind: "held", hold };
@@ -179,19 +192,23 @@ export async function changeResolution(input: {
       eventKind: resolve ? "comment_resolved" : "comment_reopened",
       actor: by,
       data: { comment: root.id, position: root.position, ...(note ? { note: note.comment.id } : {}) },
-      // A person whose thread someone else resolved hears through their Activity; a reopen tells no one.
-      recipients: tellsAuthor && threadAuthor.type === "user" ? [{ actor: threadAuthor, reason: "following" as const }] : [],
+      // A person whose thread someone else resolved hears through their
+      // Activity, already read (#proj-workspace:#340: a state change adds no
+      // unread); a reopen tells no one.
+      recipients: tellsAuthor && threadAuthor.type === "user" ? [{ actor: threadAuthor, reason: "following" as const, read: true as const }] : [],
     });
-    const told = tellsAuthor && threadAuthor.type === "agent"
+    // An agent author's notice is queued only (noticeResolved): not among what is pushed below.
+    const toldAgent = tellsAuthor && threadAuthor.type === "agent"
       ? await noticeResolved({ executor: tx, outbox: input.outbox, item: item!, root: row!, by, note: note?.comment ?? null, now })
-      : { queued: [], told: null };
+      : null;
+    const toldPerson = tellsAuthor && threadAuthor.type === "user" && event.recipients.some(({ actor }) => sameActor(actor, threadAuthor));
     return {
       kind: "done",
       root: row!,
       changed: true,
       note,
-      toldAgent: told.told,
-      queued: [...(note?.queued ?? []), ...told.queued],
+      toldAuthor: toldAgent !== null || toldPerson ? threadAuthor : null,
+      queued: note?.queued ?? [],
       eventIds: [...(note ? [note.eventId] : []), event.id],
     };
   });
@@ -199,5 +216,7 @@ export async function changeResolution(input: {
   const { queued = [], eventIds = [], ...done } = outcome;
   await sendQueued(input.outbox, queued);
   await announceObjectEvents(eventIds);
+  // Open pages of the Artifact read the thread again (nothing changed: nothing to read).
+  if (done.changed) announceArtifactChanged(input.item.id, "comments");
   return done;
 }

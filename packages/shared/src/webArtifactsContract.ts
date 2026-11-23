@@ -33,9 +33,11 @@ import type {
   ArtifactCommentPart,
   ArtifactHome,
   ArtifactId,
+  ArtifactKind,
   ArtifactPresence,
   ArtifactReference,
   ArtifactReviewId,
+  ArtifactSettled,
   ArtifactViewerData,
   ArtifactWebConversationArtifacts,
   ArtifactWillNotify,
@@ -99,6 +101,33 @@ export const artifactWebPaths = {
   downloadZip: (id: ArtifactId, version?: number) => `/api/artifacts/${enc(id)}/download.zip${versionQuery(version)}`,
   /** GET → ArtifactWebFileContent. */
   fileContent: (id: ArtifactId, path: string, version?: number) => `/api/artifacts/${enc(id)}/files/${enc(path)}/content${versionQuery(version)}`,
+  /**
+   * GET → ArtifactWebLinks (#proj-workspace:#336): the version's links to
+   * other Artifacts (the current one, or `version`), each with what it names
+   * for this reader: `ok` with the target's live title, `deleted`, or
+   * `unavailable`; and `authorSees`, whether the version's publisher sees the
+   * target now (the viewer labels no other link). The Artifact and `version` are read as the viewer reads
+   * them (the flag, the one 404, 400 INVALID_REQUEST, 404 VERSION_NOT_FOUND);
+   * its links not readable now (storage failing or slow) 503
+   * CONTENT_UNAVAILABLE, ask again later. Reads only, moves no read position.
+   * At most ARTIFACT_CONTENT_LINKS_MAX links. 120 a minute per user, then 429
+   * RATE_LIMITED.
+   */
+  links: (id: ArtifactId, version?: number) => `/api/artifacts/${enc(id)}/links${versionQuery(version)}`,
+  /**
+   * GET → ArtifactWebBacklinks (#proj-workspace:#336 step 2, "Linked from"):
+   * what links to this Artifact, for this reader. `documents`: other
+   * Artifacts whose current version links it, as cards (their live titles),
+   * only those the reader can see. `discussions`: chat messages whose text
+   * links it, only those the reader can read now, and only for a reader
+   * inside the Artifact's server (empty otherwise). Each group newest first,
+   * at most ARTIFACT_BACKLINKS_PAGE_LIMIT, with how many there are
+   * (`total`, counted up to ARTIFACT_BACKLINKS_COUNT_CAP; `capped` past it).
+   * The Artifact is read as the viewer reads it (the flag, the one 404).
+   * Reads only, moves no read position. Signed in only (no signed-out
+   * route). 120 a minute per user, then 429 RATE_LIMITED.
+   */
+  backlinks: (id: ArtifactId) => `/api/artifacts/${enc(id)}/backlinks`,
   /**
    * GET → ArtifactWebCommentsPage: the newest page first, one file's with
    * `path`, one review's (S8) with `review` (a comment's `reviewId`: its
@@ -177,6 +206,18 @@ export const artifactWebPaths = {
   presence: (id: ArtifactId) => `/api/artifacts/${enc(id)}/presence`,
   /** PUT → `{ following: true }`; DELETE → `{ following: false }`. */
   subscription: (id: ArtifactId) => `/api/artifacts/${enc(id)}/subscription`,
+  /**
+   * Settled (#334). POST (no body) → ArtifactWebSettlement: settle it at
+   * its current version; DELETE → ArtifactWebSettlement: take it back to
+   * Working. Who may: whoever may comment on it (else 403 FORBIDDEN);
+   * nothing is locked and no permission changes. Settling follows it (as
+   * commenting does), so its next version reaches the settler. Written to
+   * its Activity row as read (no unread, no push for anyone); its following
+   * agents get a notice that is queued, never pushed. Already so: `changed:
+   * false`, nothing written. 404 SETTLED_NOT_AVAILABLE while the Artifact's
+   * server has `artifact_settled_v0` off. In the writes' budget.
+   */
+  settle: (id: ArtifactId) => `/api/artifacts/${enc(id)}/settle`,
   /**
    * Batch comments (S8): the reader's own review drafts on this Artifact,
    * seen by no one else, oldest first, expired ones left out. GET →
@@ -301,8 +342,10 @@ export const artifactWebPaths = {
    * POST ArtifactWebTakedownInput → ArtifactWebTakedown: take the Artifact
    * down (moderation, not a delete: docs/operations/artifact-takedown.md).
    * Only the owners and admins of the Artifact's own server may, without
-   * having to see it; anyone else 403 FORBIDDEN if they see it, else the
-   * one 404. Afterwards it is NOT_VISIBLE everywhere, its author included,
+   * having to see it; for a closed server's Artifact kept in a shared
+   * channel, the people who manage that channel on its host server; anyone
+   * else 403 FORBIDDEN if they see it, else the one 404. Afterwards it is
+   * NOT_VISIBLE everywhere, its author included,
    * as a deleted one (the content Worker within its 30 s authorize cache).
    * Already down: 200 `changed: false`, nothing written. Audited
    * (`taken_down`, with the reason). A body other than
@@ -959,6 +1002,119 @@ export function asArtifactInstanceVersion(raw: unknown): ArtifactInstanceVersion
  */
 export const ARTIFACT_FRAME_SANDBOX = "allow-scripts allow-same-origin";
 
+/** The most links `links` answers for a version: the ones its files name first (the server's extractor keeps no more). */
+export const ARTIFACT_CONTENT_LINKS_MAX = 200;
+
+/**
+ * What a link to another Artifact names for the reader who asks (`links`),
+ * decided for each reader at each ask, so a title is always the live one:
+ * - `ok`: an Artifact the reader can open (as the viewer would let them,
+ *   with a published current version): its title now and its `kind` (of the
+ *   version the link opens: the pinned one where it exists, else the
+ *   current one); for a pinned link, `versionExists`: whether the reader
+ *   can open that version (a reader outside a public Artifact's server
+ *   opens its current version only).
+ * - `deleted`: deleted, and the reader could see it before (the rule of a
+ *   message's card for it: the home it had, a public one read as its own
+ *   server's; a delete on record; never a taken-down one). Nothing else of
+ *   it.
+ * - `unavailable`: anything else, the same for every reason: no such
+ *   Artifact, not the reader's to see, taken down, deleted out of their
+ *   sight, never published, its server's Artifacts off.
+ */
+export type ArtifactLinkTarget =
+  | { state: "ok"; title: string; kind: ArtifactKind; versionExists?: boolean }
+  | { state: "deleted" }
+  | { state: "unavailable" };
+
+/**
+ * One link of a version to another Artifact (`links`), as the server read it
+ * from the version's Markdown and HTML files: absolute links on this
+ * deployment's addresses that name an Artifact by id, never one to the
+ * Artifact itself; once per file and address.
+ */
+export interface ArtifactContentLink {
+  /** The link's address, WHATWG-normalised as a browser reads `a.href`: what the viewer matches the page's links by. */
+  href: string;
+  /** The file of the version it is in. */
+  path: string;
+  /** Its text is its own address: the only links the viewer may relabel with the target's title. */
+  bare: boolean;
+  /** The Artifact it names. */
+  id: ArtifactId;
+  /** The version it pins (`/v/<n>`), or null for the current one. */
+  version: number | null;
+  target: ArtifactLinkTarget;
+  /**
+   * Whether the author of the version these links are read from (its publisher) can see the target
+   * now: live and in sight, or deleted and seen on the home it had (the reader's notion of sight),
+   * and the author's account still there. The page's scripts are its author's and read every label
+   * the viewer gives it (Porthole's THREAT_MODEL: only what the reader may see AND the page may
+   * learn), so the viewer labels a link only where this is true, whatever `target` says; false, the
+   * link stays as the page wrote it. The signed-out route's targets are public ones: always true.
+   */
+  authorSees: boolean;
+}
+
+/** A version's links to other Artifacts (`links`), in the order its files name them (the entry first, then by path). */
+export interface ArtifactWebLinks {
+  /** The version whose links these are. */
+  version: number;
+  links: ArtifactContentLink[];
+}
+
+/** The most items `backlinks` lists in each group (`documents`, `discussions`): the newest. */
+export const ARTIFACT_BACKLINKS_PAGE_LIMIT = 50;
+
+/** How far `backlinks` counts each group: past this, `total` is this and `capped` is true. */
+export const ARTIFACT_BACKLINKS_COUNT_CAP = 1000;
+
+/**
+ * One group of `backlinks`: the newest `items` (at most
+ * ARTIFACT_BACKLINKS_PAGE_LIMIT) and how many there are for this reader
+ * (`total`, at most ARTIFACT_BACKLINKS_COUNT_CAP; `capped`: there are more).
+ * `items` may be fewer than `total` says even under the limit: an item that
+ * stopped linking the Artifact since it was counted is left out of the page.
+ */
+export interface ArtifactBacklinkGroup<T> {
+  items: T[];
+  total: number;
+  capped: boolean;
+}
+
+/**
+ * A chat message that links the Artifact (`backlinks`' `discussions`), where
+ * the reader reads it: its top-level conversation (a joint by the reader's
+ * own server's projection) and, for a reply in a thread, the message the
+ * thread hangs off. `excerpt`: the message's text now, as plain text (no
+ * Markdown, a link by its text), on one line, at most about 120 characters;
+ * never stored.
+ */
+export interface ArtifactBacklinkMessage {
+  messageId: MessageId;
+  conversationId: ChannelId;
+  /** For a reply in a thread: the message the thread hangs off. Absent otherwise (a task conversation's message reads as its parent's). */
+  threadRootId?: MessageId;
+  /**
+   * Who sent it, as a card names an author; null for a sender Raft names no
+   * one here (a person of a connected external workspace).
+   */
+  author: ArtifactActor | null;
+  createdAt: string;
+  excerpt: string;
+}
+
+/**
+ * What links to an Artifact, for the reader who asks (`backlinks`; #336 step
+ * 2, "Linked from"): decided at each ask, never stored per reader.
+ */
+export interface ArtifactWebBacklinks {
+  /** Other Artifacts whose current version links this one, newest version first, as the reader's cards. */
+  documents: ArtifactBacklinkGroup<ArtifactCard>;
+  /** Chat messages that link this one, newest first; always empty for a reader outside the Artifact's server. */
+  discussions: ArtifactBacklinkGroup<ArtifactBacklinkMessage>;
+}
+
 /** A file of a version as JSON: text inline (cut at 256 KiB), or only its size and type. */
 export type ArtifactWebFileContent =
   | { kind: "text"; path: string; version: number; size: number; contentType: string; content: string; truncated: boolean }
@@ -1041,6 +1197,14 @@ export interface ArtifactWebCommentCreated {
 export interface ArtifactWebResolveInput {
   /** The note's text and mentions, as a comment's body; null or absent: none. */
   note?: ArtifactWebCommentInput["body"] | null;
+}
+
+/** A settle's or unsettle's answer (`settle`): the Artifact's state as it stands now. */
+export interface ArtifactWebSettlement {
+  /** Null: Working. */
+  settled: ArtifactSettled | null;
+  /** False when it already stood so: nothing written. */
+  changed: boolean;
 }
 
 /** A resolve's or reopen's answer: the thread's root as it stands now. */
@@ -1367,6 +1531,8 @@ export const ARTIFACT_WEB_ERROR_CODES = [
   "COMMENT_NOT_FOUND",
   // `commentResolve` / `commentReopen` (#249) of a reply: only a thread (its root) is resolved.
   "COMMENT_IS_REPLY",
+  // `settle` (POST or DELETE) while the Artifact's server has artifact_settled_v0 off (404, #334).
+  "SETTLED_NOT_AVAILABLE",
   "MENTION_NOT_VISIBLE",
   "FIELD_TOO_LONG",
   "ATTACHMENT_NOT_FOUND",
@@ -1412,14 +1578,15 @@ export const ARTIFACT_WEB_ERROR_CODES = [
   "BUSY",
   // 429, per user: the frame route, the viewer and open (each signs a
   // ticket) 120 a minute together; the writes (comment
-  // POST, PATCH and DELETE, a thread's resolve and reopen, review drafts POST, PATCH and DELETE, review
+  // POST, PATCH and DELETE, a thread's resolve and reopen, settle POST and DELETE, review drafts POST, PATCH and DELETE, review
   // submit, subscription PUT and DELETE, home and unpublish POST, title PATCH, the
   // Artifact's DELETE, import, save-attachment, share) 60 a minute together;
   // comment image uploads 30 a minute;
   // mention candidates 300 a minute; the dashboard (its All tab and its authors included)
   // and a conversation's Artifacts 120 a minute together; attachment saves, share audiences and
   // home-change previews 300 a minute each; locate 120 a minute; open in
-  // the frame route's and the viewer's 120; a version's zip 20 a minute.
+  // the frame route's and the viewer's 120; a version's zip 20 a minute;
+  // a version's links 120 a minute; what links to an Artifact (backlinks) 120 a minute.
   "RATE_LIMITED",
 ] as const;
 export type ArtifactWebErrorCode = (typeof ARTIFACT_WEB_ERROR_CODES)[number];
@@ -1523,6 +1690,8 @@ export interface ArtifactWebResponses {
   dashboardConversations: ArtifactWebDashboardConversations;
   location: ArtifactWebLocation;
   open: ArtifactWebOpen;
+  links: ArtifactWebLinks;
+  backlinks: ArtifactWebBacklinks;
   conversationArtifacts: ArtifactWebConversationArtifacts;
   reviewDrafts: ArtifactWebReviewDrafts;
   reviewDraftSaved: ArtifactWebReviewDraftSaved;

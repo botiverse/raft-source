@@ -501,15 +501,16 @@ test("index.md is at most 200 KB, cut at a character with a note", async ({ app,
 });
 
 /** A public Artifact of several files (an HTML entry, a stylesheet, an image, a nested path with a space), current. */
-async function publicSite(world: Awaited<ReturnType<typeof seedWorld>>) {
+const SITE_FILES = [
+  { path: "index.html", bytes: Buffer.from("<h1>Site</h1><script>alert(1)</script>") },
+  { path: "style.css", bytes: Buffer.from("body { color: red }") },
+  { path: "img/logo (1).png", bytes: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 255, 7]) },
+];
+
+async function publicSite(world: Awaited<ReturnType<typeof seedWorld>>, files = SITE_FILES) {
   const serverId = asServerId(world.server.id);
   const author: Actor = { type: "user", id: world.owner.id };
   const item = await insertItem({ serverId, author, home: "public" });
-  const files = [
-    { path: "index.html", bytes: Buffer.from("<h1>Site</h1><script>alert(1)</script>") },
-    { path: "style.css", bytes: Buffer.from("body { color: red }") },
-    { path: "img/logo (1).png", bytes: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 255, 7]) },
-  ];
   const db = getDb();
   const versionId = `v_${randomUUID()}`;
   const [version] = await db.insert(artifactVersions).values({
@@ -574,6 +575,20 @@ test("files: a text file and a binary download as published, as attachments that
   // The contract's path builder reaches the same file.
   const built = await fetch(`${app.baseUrl}${artifactPublicPaths.file(asArtifactId(site.item.id), "img/logo (1).png")}`);
   assert.deepEqual([built.status, Buffer.from(await built.arrayBuffer())], [200, site.files[2]!.bytes]);
+});
+
+test("files: a version of one file is saved by the title with the file's extension, a Chinese title's letters kept", async ({ app, seed }) => {
+  __setArtifactR2StoreForTests(memoryR2);
+  const world = await seedWorld(seed);
+  const single = await publicSite(world, [SITE_FILES[0]!]);
+  const named = await download(app.baseUrl, single.item.id, "index.html");
+  assert.equal(named.status, 200);
+  const name = `${single.item.title}.html`;
+  assert.equal(named.headers.get("content-disposition"), `attachment; filename="${name}"; filename*=UTF-8''${encodeURIComponent(name)}`);
+  await getDb().update(artifactItems).set({ title: "周计划.HTML" }).where(eq(artifactItems.id, single.item.id));
+  const chinese = await download(app.baseUrl, single.item.id, "index.html");
+  // The title already ends in the extension: not added again.
+  assert.equal(chinese.headers.get("content-disposition"), `attachment; filename="___.HTML"; filename*=UTF-8''${encodeURIComponent("周计划.HTML")}`);
 });
 
 test("files: traversal, a malformed path, a path not in the version and a non-public Artifact are all the one 404", async ({ app, seed }) => {
@@ -1346,5 +1361,26 @@ test("no frame route signs an embed subject: the server never mints an embed ses
     assert.ok(await signContentFrame({ artifact, version, viewer: "anonymous", subject: anonymousSubject(artifact, version) }, { kind: "html" }));
   } finally {
     warn.mockRestore();
+  }
+});
+
+test("og-image.png: returns an inline 1200x630 PNG with no-store/noindex for public Artifacts and the one 404 for every hidden or missing one", async ({ app, seed }) => {
+  const world = await seedWorld(seed);
+  const short = artifactLinkId(asArtifactId(world.open.item.id));
+  const res = await fetch(`${app.baseUrl}/api/public/artifacts/${short}/og-image.png`);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("content-type"), "image/png");
+  assert.equal(res.headers.get("content-disposition"), 'inline; filename="og-image.png"');
+  assert.equal(res.headers.get("cache-control"), "private, no-store");
+  assert.equal(res.headers.get("x-robots-tag"), "noindex, nofollow");
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  assert.deepEqual([...bytes.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+  // Every non-public or unknown Artifact answers the exact same 404 NOT_VISIBLE.
+  const first404 = await (await fetch(`${app.baseUrl}/api/public/artifacts/pt_${randomUUID()}/og-image.png`)).text();
+  for (const hidden of [world.whole.item.id, world.inRoom.item.id, world.deleted.item.id, world.revoked.item.id]) {
+    const hiddenRes = await fetch(`${app.baseUrl}/api/public/artifacts/${hidden}/og-image.png`);
+    assert.equal(hiddenRes.status, 404);
+    assert.equal(await hiddenRes.text(), first404);
   }
 });

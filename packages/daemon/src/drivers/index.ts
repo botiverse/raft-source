@@ -2,7 +2,7 @@ import type { RuntimeDriver } from "./types";
 import { ClaudeDriver } from "./claude";
 import { CodexDriver } from "./codex";
 import { GrokDriver } from "./grok";
-import { AntigravityDriver } from "./antigravity.deprecated";
+import { AntigravityDriver } from "./antigravity";
 import { CopilotDriver } from "./copilot";
 import { CursorDriver } from "./cursor";
 import { GeminiDriver } from "./gemini";
@@ -50,31 +50,44 @@ export {
   formatCompactionInterruption,
   projectStructuredRuntimeTerminalFailure,
 } from "../runtimeCompactionProjection";
-export { claudeSideQuestionProviderEnv, readClaudeInstallationAsync, resolveClaudeCommand, startClaudeSideQuestion } from "./claude";
+export {
+  assertClaudeStartupPayloadWithinBudget,
+  CLAUDE_CODE_ENTRYPOINT,
+  CLAUDE_CUSTOM_PROVIDER_HOST_ENV_KEYS,
+  CLAUDE_DISALLOWED_TOOLS,
+  claudeSideQuestionProviderEnv,
+  isClaudeCustomProviderConfig,
+  LEGACY_CLAUDE_PROVIDER_CONFIG_DIR,
+  prepareClaudeCliTransport,
+  readClaudeInstallationAsync,
+  resolveClaudeCommand,
+  resolveClaudeLaunchCommandAsync,
+  shouldWarnLegacyClaudeProviderConfigDir,
+  startClaudeSideQuestion,
+} from "./claude";
 export { buildCodexAppServerArgs, buildCodexInstructionShapeAttrs, buildCodexInstructionShapeStaticAttrs, type CodexInstructionObservationPhase, type CodexThreadRequestMethod, codexBlankFinalAnswerDiagnostic, codexCandidateTraceAttrs, codexMcpToolName, codexNotificationDiagnostics, parseCodexTelemetryEvent, CODEX_MANAGED_MCP_TOKEN_ENV, codexThreadFields, parseCodexJsonRpcLine, prepareCodexLaunch, resolveCodexSpawn, type CodexLaunchPreparation, type CodexThreadFields } from "./codex";
-export { ANTIGRAVITY_ENV_OVERRIDES, excludeFromWorkspaceGit, prepareAntigravityEnvironment, resolveAntigravitySpawn } from "./antigravity.deprecated";
+export { ANTIGRAVITY_ENV_OVERRIDES, excludeFromWorkspaceGit, prepareAntigravityEnvironment, resolveAntigravitySpawn } from "./antigravity";
 export { prepareGrokLaunch, type GrokLaunchPlan } from "./grok";
+export { buildPiSessionDir, buildPiSpawnEnv } from "./pi";
 export {
   decideOpenCodeSessionResume,
   ensureOpenCodeSessionRecordWritable,
+  openCodeMajor,
+  openCodeWorkspaceProcessEnv,
   openCodeSessionRecordPath,
   prepareOpenCodeOarEnvironment,
+  readOpenCodeInstallation,
   readOpenCodeSessionRecord,
-  readOpenCodeVersionDetailedAsync,
-  resolveOpenCodeSpawnAsync,
   writeOpenCodeSessionRecord,
   type OpenCodeSessionResumeDecision,
-  type OpenCodeVersionRead,
 } from "./opencode";
-export { isOarOnlyRuntimeId, OAR_ONLY_RUNTIMES, oarOnlyInstallation, prepareOarOnlyLaunchEnv, readOarOnlyCliVersion, type OarOnlyRuntimeId } from "./oarOnly";
+export { isOarOnlyRuntimeId, OAR_ONLY_RUNTIMES, oarOnlyInstallation, prepareOarOnlyLaunchEnv, type OarOnlyRuntimeId } from "./oarOnly";
 
 const driverFactories: Record<string, () => RuntimeDriver> = {
   builtin: () => new BuiltInDriver(),
   claude: () => new ClaudeDriver(),
   codex: () => new CodexDriver(),
   grok: () => new GrokDriver(),
-  // Deprecated: retain for existing agents to run/resume. Shared availability
-  // and server admission prohibit creating agents or switching into this runtime.
   antigravity: () => new AntigravityDriver(),
   // Deprecated: retain for existing agents to run/resume. Shared availability
   // and server admission prohibit creating agents or switching into this runtime.
@@ -93,6 +106,7 @@ const driverFactories: Record<string, () => RuntimeDriver> = {
   // Run only on the OAR host (drivers/oarOnly.ts): no legacy driver exists.
   qwen: () => new OarOnlyDriver("qwen"),
   qoder: () => new OarOnlyDriver("qoder"),
+  dsh: () => new OarOnlyDriver("dsh"),
 };
 
 /** Every runtime id `getDriver` accepts. */

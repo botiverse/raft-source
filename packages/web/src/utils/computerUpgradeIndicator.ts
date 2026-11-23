@@ -75,14 +75,24 @@ export function summarizeComputerAttention<T extends ComputerAttentionMachine>(
   };
 }
 
+/**
+ * One computer needs a person to act (#triage:#527): the rule behind the left
+ * rail's "N of M needs attention" and the Computers page's default order
+ * (computersRackSort.ts › `attentionFirst`). The server's summary when it sent
+ * one (#68); otherwise an update waiting (only managed Computers have an
+ * upgrade signal; the standalone daemon has no release line of its own any
+ * more) or offline.
+ */
+export function machineNeedsAttention(machine: ComputerAttentionMachine): boolean {
+  return serverNeedsAttention(machine) ?? (shouldShowComputerUpgradeIndicator(machine) || machine.status === "offline");
+}
+
 export function countMachinesNeedingAttention(
   machines: readonly ComputerAttentionMachine[],
 ): number {
   let count = 0;
   for (const machine of machines) {
-    // Only managed Computers have an upgrade signal; the standalone daemon has
-    // no release line of its own any more.
-    if (serverNeedsAttention(machine) ?? (shouldShowComputerUpgradeIndicator(machine) || machine.status === "offline")) count += 1;
+    if (machineNeedsAttention(machine)) count += 1;
   }
   return count;
 }

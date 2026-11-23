@@ -15,7 +15,8 @@ Verified against:
 - packages/server/src/services/inboxPolicyModel.ts (followed-thread delivery is independent from parent channel mute)
 - Re-verified on staging 1883339e9, 2026-10-28 (public-docs audit): heredoc delimiter RAFTMSG (packages/cli/src/commands/continuation/*); `--channel` is a legacy alias of `--target` (packages/cli/src/commands/message/read.ts)
 - Re-verified on staging 6bfd74e0fe, 2026-11-03 (drift fix g4): packages/server/src/services/notifications/policy.ts (a person's mute of the parent drops every push, followed threads and @mentions included; Activity keeps them; #12231); packages/server/src/services/savedService.ts saveMessage (saving follows the thread; #12330). Agent delivery (inboxPolicyModel.ts) unchanged, so the agent sections stay.
-@ verified against staging 6bfd74e0fe (2026-11-03)
+- Re-verified on staging da1459e236, 2026-11-16 (drift fix g4): labels sentence case (#12979): en.ts message.messageItem.followThread / unfollowThread / markThreadAsUnread, thread.contextMenu.markAsUnread ("Mark as unread"); packages/web/src/components/message/ThreadOverflowMenu.tsx (thread header overflow is EllipsisVertical ⋮); MessageHoverToolbar.tsx (message menu is Ellipsis ⋯)
+@ verified against staging da1459e236 (2026-11-16)
 */}
 
 # Thread
@@ -55,11 +56,11 @@ For a thread in a regular channel, muting the parent channel suppresses ordinary
 **Follow / unfollow a thread**
 - Once you've replied, been @mentioned, or saved a message in a thread, you "follow" it by default
 - Muting the parent channel silences its notifications entirely, followed threads and @mentions included; followed threads still show in Activity. To stop one thread, Unfollow it
-- Unfollow via the thread panel header ⋯ (or any message's menu inside the thread panel: Follow / Unfollow Thread, next to Mark Thread as Unread) to remove this thread's follow record and stop its ordinary thread-reply notifications; the thread's unread count clears at once (an unfollowed thread counts no unread)
+- Unfollow via the thread panel header ⋮ (or any message's menu inside the thread panel: **Follow thread** / **Unfollow thread**, next to **Mark thread as unread**) to remove this thread's follow record and stop its ordinary thread-reply notifications; the thread's unread count clears at once (an unfollowed thread counts no unread)
 - You can still navigate to the thread from the parent message
 
 **Mark a thread unread**
-- A followed thread's header ⋯ → Mark as Unread, or any message's menu inside the thread panel (right-click / long-press / ⋯) → Mark Thread as Unread. Both mark the whole thread unread (there is no "unread from this message"), in its channel entry and in Activity
+- A followed thread's header ⋮ → **Mark as unread**, or any message's menu inside the thread panel (right-click / long-press / ⋯) → **Mark thread as unread**. Both mark the whole thread unread (there is no "unread from this message"), in its channel entry and in Activity
 - The thread stays open and unread while you are in it; it is read again the next time you open it
 
 **View thread participants**
@@ -116,7 +117,7 @@ Agents work with threads via the `raft message send`/`read` commands using the t
 - **Threads can't be nested.** You can't start a thread inside a thread. The parent message must be a top-level channel or DM message.
 - **Threads can't be moved.** Once anchored to a parent message, the thread stays there. You can't migrate replies to a different parent or to root-channel-level.
 - **Threads can't change parent surface.** A thread in `#engineering` can't be moved to `#design`; you'd have to manually re-post.
-- **Tasks can't be created in threads.** Only top-level channel/DM messages can become tasks; thread replies cannot. If a user wants to track a thread reply as a task, they need to file a new top-level message + convert that.
+- **A thread reply can't be a task's source.** A task created from a thread reply hangs under the thread's root message. To track a thread reply's work as its own task, post a new top-level message and create the task from it.
 - **Threads have no separate visibility setting.** They inherit the parent channel's visibility — there's no "private thread inside a public channel."
 
 ## Gotchas

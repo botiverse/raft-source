@@ -13,8 +13,12 @@ export const REFUSAL_ERROR_MAX_CHARS = 500;
 /** A code: a stable identifier for logs and metrics, and the contract for the listed ones. */
 export const REFUSAL_CODE_PATTERN = /^[A-Za-z0-9_.:-]{1,64}$/;
 
-/** Text that names a command or a flag (`raft …`, `--title`): it belongs in `next`, not in `error`. */
-export const REFUSAL_COMMAND_PATTERN = /\braft [a-z]|(^|[\s`'"(])--[a-z]/;
+/**
+ * Text that names a command or a flag (`raft …`, `--title`): it belongs in
+ * `next`, not in `error`. A handle that ends in "raft" (`@raft`, `@ops-raft`,
+ * `@team.raft`, `@团队raft`) is a name, not the command.
+ */
+export const REFUSAL_COMMAND_PATTERN = /(^|[^\p{L}\p{N}_@.-])raft [a-z]|(^|[\s`'"(])--[a-z]/u;
 
 export interface Refusal {
   /**

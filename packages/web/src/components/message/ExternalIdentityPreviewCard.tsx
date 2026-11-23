@@ -139,7 +139,6 @@ export default function ExternalIdentityPreviewCard({
       />
       <PreviewCardContent
         sideOffset={6}
-        collisionPadding={6}
       >
         <ExternalIdentityPreviewBody
           displayName={actorKind === "bot" ? profileDisplayName || displayName : displayName}

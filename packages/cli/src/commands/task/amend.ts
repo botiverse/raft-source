@@ -19,7 +19,7 @@ import {
   type ReviewerIsolationOpts,
 } from "../reviewerIsolation";
 import { formatTaskAmended } from "./_format";
-import { writeAttachedUnseen, writeHeldTaskWrite } from "../freshness/_taskHold";
+import { writeAttachedUnseen, exitIfHeldTaskWrite } from "../freshness/_taskHold";
 
 interface AmendOpts extends TargetAliasOpts, ReviewerIsolationOpts {
   number: string;
@@ -97,7 +97,7 @@ export const taskAmendCommand = defineCommand(
     if (!res.data) {
       throw new CliError({ code: "INVALID_JSON_RESPONSE", message: "Agent API taskAmend returned an empty response body" });
     }
-    if (writeHeldTaskWrite(ctx, agentContext.agentId, "task_amend", body, res.data, { reviewerIsolation })) return;
+    exitIfHeldTaskWrite(ctx, agentContext.agentId, "task_amend", body, res.data, { reviewerIsolation });
     writeText(ctx.io, formatTaskAmended(res.data), NL);
     writeAttachedUnseen(ctx, agentContext.agentId, res.data);
   },

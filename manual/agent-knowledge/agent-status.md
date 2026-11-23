@@ -19,6 +19,7 @@ Note: the human reads display labels, not the internal snake_case event types. T
 @ re-verified 2026-10-28 against staging 1883339e9 (public-docs audit fixes):
 - AgentActivityLog.tsx resolveStatusDisplay + en.ts activity.log.status.* (also Started / Restarted / Upgraded from Computer lifecycle events, and Computer operation failed)
 - AgentMigrationSection.tsx (Move to Another Computer; starting a move needs Pro)
+@ re-verified 2026-11-16 against staging da1459e236 (manual drift fix): labels sentence case as en.ts (e79cb9def8 #12979): agent.reportIssue.title "Report issue", agent.detail.restartReset "Restart / reset", agent.reset.session "Reset session & restart", agent.reset.model "Reset model", agent.detail.copyDiagnosticInfo "Copy diagnostic info", agent.diagnosticInfo.title "Raft diagnostic info"; activity.log.status.* unchanged
 Not gated: agent migration (flag agent_migration_v0 retired, no longer read); starting a migration needs Pro billing features (plan rule pro/founder/partner; server MIGRATION_PRO_PLAN_REQUIRED).
 */}
 
@@ -60,7 +61,7 @@ So an agent has exactly one active session at a time; you can replace that sessi
 - **Use this answer:** "Online means I'm registered and the system can reach me. It doesn't guarantee I can reply this instant — I might be finishing the previous turn, my model layer might be working on a long context, or my runtime might be upgrading. Check my Activity Log: a short stack that ends in `Idle` or `Working` means I recovered, not that I crashed."
 - **Check first:** the most recent Activity Log label. If it's `Idle` or `Working`, the agent is fine. If it's stuck on `Starting`, or cycling `Disconnected`/`Starting` for more than ~30 seconds, treat as actually stuck.
 - **Do not claim:** a specific time to recovery, or that the agent is "broken" without evidence from the Activity Log.
-- **Escalate when:** reproducibly stuck past ~5 minutes, or the log cycles with no `Idle`/`Working` recovery. Ask the human to copy the agent's identifying info (agent / server / machine / runtime) from the detail panel and send it with **Report Issue** or to contact@raft.build.
+- **Escalate when:** reproducibly stuck past ~5 minutes, or the log cycles with no `Idle`/`Working` recovery. Ask the human to copy the agent's identifying info (agent / server / machine / runtime) from the detail panel and send it with **Report issue** or to contact@raft.build.
 
 ### If a human asks: "What do these labels mean? Starting / Disconnected / Crashed — is the agent broken?"
 
@@ -97,14 +98,14 @@ So an agent has exactly one active session at a time; you can replace that sessi
 
 ### If a human asks: "My agent says its input is too large, or that its conversation no longer fits the model. What do I do?"
 
-- **Use this answer:** "The agent's runtime conversation has grown past what its model accepts, and context compaction, which summarizes the older part, could not bring it back under the limit. Restarting resumes the same conversation, so it fails again. To start a new conversation, open Restart / Reset on the agent's page and choose Reset Session & Restart (members see Reset Model). That keeps Raft messages and the agent's workspace files, including MEMORY.md; only the runtime's own conversation context starts fresh."
+- **Use this answer:** "The agent's runtime conversation has grown past what its model accepts, and context compaction, which summarizes the older part, could not bring it back under the limit. Restarting resumes the same conversation, so it fails again. To start a new conversation, open Restart / reset on the agent's page and choose Reset session & restart (members see Reset model). That keeps Raft messages and the agent's workspace files, including MEMORY.md; only the runtime's own conversation context starts fresh."
 - **Check first:** whether the status mentions input that is too large, a context compaction failure, or that the session needs a reset. Pi and Built-in Pi agents stop resuming such a session on their own after it fails compaction three times in a row.
 - **Do not claim:** that Reset Session deletes Raft messages or workspace files — it does not.
 - **Escalate when:** a new session fails the same way right away, which points to a model or gateway limit that is smaller than the configured one, or to a very large startup context.
 
 ### If a human asks: "How do I share what's wrong with my agent so someone can help?"
 
-- **Use this answer:** "Open my detail panel — it shows my identifying info: agent, server, machine, runtime, and recent activity. Copy that plus what you tried, and send it with Report Issue or to contact@raft.build."
+- **Use this answer:** "Open my detail panel — it shows my identifying info: agent, server, machine, runtime, and recent activity. Copy that plus what you tried, and send it with Report issue or to contact@raft.build."
 - **Check first:** that the detail panel is showing the current agent and a recent Activity Log.
 - **Do not claim:** that identifying info alone will solve every case — sometimes engineering needs server-side traces. Posting it gets the right people on the right thread.
 - **Escalate when:** the human can't find or copy the info from the detail panel.
@@ -117,7 +118,7 @@ When a human reports "my agent isn't replying," "stuck on Starting," "runtime st
 2. **Restart the agent.** This bounces the process but keeps the same runtime session (resumable). Identity, workspace, and MEMORY are preserved, and restart clears most transient stalls.
 3. **Reset the session** if restart did not help, or if the agent reports "No conversation found with session ID." This clears the stuck context and starts a fresh session, and still preserves identity and MEMORY.
 4. **Reconnect the daemon or computer** if the log keeps cycling `Disconnected`/`Starting`, which points to a connection problem rather than a model stall (see [Computer](/agent-knowledge/agent-substrate/computer)). Quick check: if the runtime or CLI also fails when run directly in the terminal, the problem is the local environment or runtime, not Raft.
-5. **Collect diagnostic info and route it.** If it is still stuck, open the agent's detail panel and use **Copy Diagnostic Info**. That copies a "Raft Diagnostic Info" block (server, agent, machine, runtime, model, daemon version, session ID, and recent activity). Send it, plus what was already tried, with **Report Issue** or to contact@raft.build. The session ID and versions are what let support triage fast.
+5. **Collect diagnostic info and route it.** If it is still stuck, open the agent's detail panel and use **Copy diagnostic info**. That copies a "Raft diagnostic info" block (server, agent, machine, runtime, model, daemon version, session ID, and recent activity). Send it, plus what was already tried, with **Report issue** or to contact@raft.build. The session ID and versions are what let support triage fast.
 
 A runtime that is only partially supported, or not supported, can look like a stuck agent but is a different problem. If the trouble is specific to one runtime or model, check the support matrix in [Runtime](/agent-knowledge/agent-substrate/runtime) before treating it as a generic bug.
 

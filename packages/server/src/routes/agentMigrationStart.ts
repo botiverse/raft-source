@@ -11,6 +11,7 @@ import {
   AGENT_MIGRATION_CAPABILITY,
   AGENT_MIGRATION_SOURCE_DRAIN_CAPABILITY,
   hydrateRuntimeConfig,
+  isBuiltInRuntimeConfigMissingProvider,
   isExternalAgentRuntime,
   type AgentMigrationUserErrorCode,
   type RuntimeConfig,
@@ -21,11 +22,11 @@ import * as agentMigrationService from "../services/agentMigrationService";
 import type { AgentOrchestrator, MachineMigrationTransportState } from "../services/agentOrchestrator";
 import { emitAgentMigrationUpdated } from "../services/agentMigrationRealtime";
 import { findAccessRevokedMachineIds } from "../services/computerAgents";
-import { providerConnectionProviderId } from "../services/providerConnectionService";
 import { BuiltInModelCatalogError, isBuiltInCatalogCheckedSelection } from "../services/builtinModelCatalogCompatibility";
 import { MachineCatalogStaleError } from "../services/machineCatalogAuthority";
 import { requireTeamBillingFeature } from "../services/planService";
 import { handleMachineLocalRouting } from "../machineLocalReplay";
+import { openAgentRowSecrets } from "../services/agentSecretCrypto";
 
 export const MIGRATION_MACHINE_ONLINE_MAX_AGE_MS = 2 * 60 * 1000;
 
@@ -91,8 +92,6 @@ export async function validateBuiltInPresetForWrite(
   agentOrchestrator: AgentOrchestrator,
   machineId: string,
   runtimeConfig: RuntimeConfig,
-  /** A saved connection's provider (builtInCatalogSelection). */
-  connectionProviderId: string | null,
 ): Promise<
   Awaited<ReturnType<AgentOrchestrator["validateBuiltInPresetForMachine"]>>
 > {
@@ -100,7 +99,6 @@ export async function validateBuiltInPresetForWrite(
     return await agentOrchestrator.validateBuiltInPresetForMachine(
       machineId,
       runtimeConfig,
-      connectionProviderId,
     );
   } catch (error) {
     if (
@@ -444,7 +442,7 @@ export async function validateComputerMigrationStart(input: {
         agentId: agent.id,
         targetMachineId: targetMachine.id,
         targetMachineName: targetMachine.name,
-        runtimeConfig: hydrateRuntimeConfig(agent),
+        runtimeConfig: hydrateRuntimeConfig(openAgentRowSecrets(agent)),
         placeWithoutSource,
         revokedSourceMachineId: sourceAccessRevoked ? boundMachine!.id : null,
         sourceMachineId: sourceMachine?.id ?? null,
@@ -459,8 +457,7 @@ export async function validateComputerMigrationStart(input: {
 
 /**
  * The target Computer's Built-in model catalog check, for an agent on a
- * Built-in preset, or on a typed model through a saved preset connection
- * (builtInCatalogSelection): answered by the replica holding the target's connection
+ * Built-in preset (builtInCatalogSelection): answered by the replica holding the target's connection
  * (the request is replayed there when it is another one). "handled": the
  * response was sent (a refusal, or the owner replica's answer). Otherwise
  * the catalog authority to release once the start is done.
@@ -472,10 +469,11 @@ export async function acquireMigrationTargetCatalogAuthority(
   validated: Pick<ValidatedComputerMigration, "targetMachineId" | "runtimeConfig">,
 ): Promise<"handled" | (() => void)> {
   const config = validated.runtimeConfig;
-  const connectionProviderId = config.runtime === "builtin" && config.provider.kind === "connection" && config.model.kind === "custom"
-    ? await providerConnectionProviderId(req.serverId!, config.provider.connectionId)
-    : null;
-  if (!isBuiltInCatalogCheckedSelection(config, connectionProviderId)) return () => undefined;
+  // A Built-in agent with no provider moves without a catalog check: there is
+  // no provider to check its model against on the target. The move itself
+  // needs none; the agent then answers "has no model provider" when started.
+  if (isBuiltInRuntimeConfigMissingProvider(config)) return () => undefined;
+  if (!isBuiltInCatalogCheckedSelection(config)) return () => undefined;
   if (!agentOrchestrator) {
     sendBuiltInCatalogUnavailable(res);
     return "handled";
@@ -495,7 +493,6 @@ export async function acquireMigrationTargetCatalogAuthority(
     agentOrchestrator,
     validated.targetMachineId,
     config,
-    connectionProviderId,
   );
   if (!catalogValidation) return () => undefined;
   return agentOrchestrator.acquireBuiltInCatalogAuthority(validated.targetMachineId, catalogValidation.authority);

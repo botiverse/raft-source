@@ -18,12 +18,17 @@ export interface ColumnMenuItem {
  * A column's ⋯ where the column has no menu of its own (Tasks, Files): after its shown actions, before Expand and
  * Close (raft-design panel.md, Rules). Only with something in it (#189 rule 6): none, no ⋯.
  */
-export function ColumnOverflowMenu({ items, testId }: { items: readonly ColumnMenuItem[]; testId: string }) {
+export function ColumnOverflowMenu({ items, testId, onOpenChange }: {
+  items: readonly ColumnMenuItem[];
+  testId: string;
+  /** The ⋯ opened or closed (the conversation header records its opening). */
+  onOpenChange?: (open: boolean) => void;
+}) {
   const { formatMessage } = useIntl();
   if (items.length === 0) return null;
   const label = formatMessage({ id: "layout.row.more" });
   return (
-    <DropdownMenu>
+    <DropdownMenu onOpenChange={onOpenChange}>
       <Tooltip content={label}>
         <DropdownMenuTrigger render={<PanelAction aria-label={label} data-testid={`${testId}-trigger`}><EllipsisVertical /></PanelAction>} />
       </Tooltip>

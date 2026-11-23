@@ -7,7 +7,7 @@
 // Artifact is deleted or moved out is manage.ts, through
 // platform/channelAnnouncements.
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
-import { channelAnnouncementPushForbiddenText, type ServerId } from "@botiverse/raft-shared";
+import { channelAnnouncementElsewherePushForbiddenText, channelAnnouncementPushForbiddenText, type ServerId } from "@botiverse/raft-shared";
 import type { AppActor, AppObjectHeadline } from "../../platform/apps";
 import { channelAnnouncementPushRefusal } from "../../platform/channelAnnouncements";
 import { getDb, type DatabaseExecutor } from "../../platform/db";
@@ -26,6 +26,10 @@ export async function channelAnnouncementPushRefused(publisher: ArtifactActorRef
   if (item.homeKind !== "conversation") return null;
   const refused = await channelAnnouncementPushRefusal(item.id, item.homeChannelId, { type: publisher.type, id: publisher.id, serverId: publisher.serverId }, executor);
   if (!refused) return null;
+  if ("elsewhere" in refused) {
+    const text = channelAnnouncementElsewherePushForbiddenText(item.title);
+    return { code: "CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN_ELSEWHERE", error: text.message, suggestedNextAction: text.nextAction, details: { title: item.title } };
+  }
   const text = channelAnnouncementPushForbiddenText(refused.channel);
   return { code: "CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN", error: text.message, suggestedNextAction: text.nextAction, details: { channel: refused.channel, title: item.title } };
 }

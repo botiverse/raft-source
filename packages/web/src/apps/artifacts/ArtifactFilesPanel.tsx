@@ -12,6 +12,7 @@ import {
   PanelMeta,
   PanelTitle,
   ScrollArea,
+  useToast,
 } from "@botiverse/raft-ui";
 import { focusField } from "@botiverse/porthole";
 import type { ArtifactFile, ArtifactViewerData } from "@botiverse/raft-shared";
@@ -105,8 +106,10 @@ export function ArtifactFilesPanel({ data, onClose, onDownloadAll, jump = null, 
   const focusJumped = useCallback(() => {
     const node = regionRef.current;
     if (!node || jumpPath === null) return;
-    const active = document.activeElement;
-    const stayed = active === null || active === document.body || active instanceof HTMLIFrameElement || node.contains(active) || active.contains(node);
+    // The panel's own document (an object window's has its own focus, #337 PR3).
+    const doc = node.ownerDocument;
+    const active = doc.activeElement;
+    const stayed = active === null || active === doc.body || active.localName === "iframe" || node.contains(active) || active.contains(node);
     const row = [...node.querySelectorAll<HTMLElement>("[data-testid='artifact-files-row']")].find((r) => r.dataset.path === jumpPath);
     if (stayed && row) focusField(row);
   }, [jumpPath]);
@@ -168,10 +171,11 @@ function FileRowItem({ data, file, jump, jumping, onOpened }: { data: ArtifactVi
   const downloadLabel = formatMessage({ id: "artifacts.files.download" }, { name });
   // Downloads are the Artifact's own server's: another server's reader sees the row without one.
   const downloads = readsInOwnServer(data.card);
+  const toast = useToast();
   const download = useCallback(() => {
     trackArtifactViewerAction("download");
-    void downloadArtifactFile({ id, version, path: file.path }).catch(() => fileDownloadFailed(formatMessage));
-  }, [id, version, file.path, formatMessage]);
+    void downloadArtifactFile(data, file.path).catch(() => fileDownloadFailed(formatMessage, toast));
+  }, [data, file.path, formatMessage, toast]);
   // The row opens its file (the entry: back to it). A plain click shows it here; anything else
   // (a new tab, Copy Link) is the link's own, to the file's address on the Artifact's page.
   const shown = useShownFile(data);

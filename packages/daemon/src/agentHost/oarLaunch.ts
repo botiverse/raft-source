@@ -8,7 +8,7 @@ import type { SpawnContext } from "../drivers/types";
 
 export interface OarLaunch {
   /** OAR runtime id (`@botiverse/oar/runtimes/<id>`, loaded through oarLoader). */
-  runtimeId: "antigravity" | "codex" | "cursor" | "grok" | "opencode" | OarOnlyRuntimeId;
+  runtimeId: "antigravity" | "claude" | "codex" | "cursor" | "grok" | "opencode" | "pi" | OarOnlyRuntimeId;
   installation: AvailableInstallation;
   /** `resume` is the native session this launch resumes, as the legacy driver would. */
   options: SessionOptions;
@@ -57,6 +57,14 @@ export interface OarLaunch {
    * resumes an OpenCode session only in its own directory.
    */
   newSessionOnResumeElsewhere?: true;
+  /**
+   * The same, but only when OAR could not find the session at all
+   * (`ResumeCwdError` reason `not_listed`, OAR 0.108+). Antigravity: the
+   * legacy driver's session id is its own (it resumes with `--continue`), so
+   * `agy` never lists it, and handing back kept the agent on the driver for
+   * good. Any other cwd refusal is handed back as before.
+   */
+  newSessionOnResumeNotListed?: true;
 }
 
 /**

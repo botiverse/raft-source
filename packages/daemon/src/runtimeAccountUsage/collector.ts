@@ -2,7 +2,18 @@ import type { Runtime } from "@botiverse/oar";
 
 import { loadOarRuntime } from "../oarLoader";
 
-import type { RuntimeAccountUsageProvider, RuntimeAccountUsageSnapshot } from "@botiverse/raft-shared";
+import os from "node:os";
+
+import {
+  isRuntimeAccountUsageFolderProvider,
+  type RuntimeAccountUsageAccountHome,
+  type RuntimeAccountUsageProvider,
+  type RuntimeAccountUsageSnapshot,
+} from "@botiverse/raft-shared";
+
+import type { CredentialLocationContext } from "../credentialSource";
+import { ambientProcessEnv } from "../processEnvPatch";
+import { mergeRuntimeAccountUsageFolders, planRuntimeAccountUsageFolders } from "./accountFolders";
 
 import {
   projectOarAccountUsageFailure,
@@ -60,11 +71,22 @@ export type OarUsageReadDeps = {
  * damaged or foreign write) are different facts that OAR reads alike as
  * `credentials_missing`
  * (`reauth_required` on the wire); an expired token the pre-step could not
- * or did not refresh (win32, lock disabled, no refresh token) still reaches
- * the usage endpoint and reads as `credentials_rejected`; non-file storage
+ * or did not refresh is OAR's read-only answer (KIMI_READ_ONLY_USAGE_ENV): a
+ * refreshable one is `unavailable` (the card's "not read yet"), an
+ * unrefreshable one `credentials_missing`; non-file storage
  * is OAR's `unsupported` before any token read — today's behavior, listed
  * as unresolved in KIMI_REFRESH_EVIDENCE.md.
  */
+/**
+ * task #1282 (Tenny, #oar-raft:e385094a): reading usage never writes Kimi's
+ * shared credentials, whoever would write them. OAR 0.113 reads Kimi's usage
+ * through `kimi web` when Kimi's lock is on, which lets Kimi refresh and write
+ * its credentials; with the lock off for the read, OAR reads only, and a
+ * refreshable expired token is `unavailable` ("not read yet", read again at
+ * the next poll). Turning the write on is artin's decision.
+ */
+export const KIMI_READ_ONLY_USAGE_ENV: Readonly<Record<string, string>> = { KIMI_DISABLE_OAUTH_LOCK: "1" };
+
 export function kimiProbeDecision(freshness: KimiFreshness): { kind: "probe" } | { kind: "reauth_required" } | { kind: "error" } {
   switch (freshness.kind) {
     case "rejected":
@@ -102,6 +124,8 @@ export async function readOarAccountUsage(input: {
   collectorVersion: string;
   observedAtMs: number;
   deps?: OarUsageReadDeps;
+  /** An agent account folder's env (HOME, CODEX_HOME / CLAUDE_CONFIG_DIR), over the provider's own read env. Absent: the default account. */
+  env?: Readonly<Record<string, string>>;
 }): Promise<RuntimeAccountUsageSnapshot> {
   const failure = (): RuntimeAccountUsageSnapshot =>
     projectOarAccountUsageFailure({
@@ -172,7 +196,12 @@ export async function readOarAccountUsage(input: {
     // Antigravity (OAR 0.103 runs `agy models`, then `agy -p /usage`): in the
     // environment its agents and its sign-in run in, so it reads the sign-in
     // they use (agy keeps another one under SSH).
-    const env = input.provider === "antigravity" ? RUNTIME_AUTH_OAR_ENV.antigravity : undefined;
+    const providerEnv = input.provider === "antigravity"
+      ? RUNTIME_AUTH_OAR_ENV.antigravity
+      : input.provider === "kimi"
+        ? KIMI_READ_ONLY_USAGE_ENV
+        : undefined;
+    const env = input.env ? { ...providerEnv, ...input.env } : providerEnv;
     const snapshot = await readUsage(installation, {
       ...(env ? { env } : {}),
       timeoutMs: input.deps?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
@@ -188,24 +217,62 @@ export async function readOarAccountUsage(input: {
   }
 }
 
+/** What a refresh asks of a read beyond its provider. */
+export type RuntimeAccountUsageReadRequest = {
+  /** The server's `accountHomes` (parsed): agents' own folders to read beside the default account (Codex, Claude). */
+  accountHomes?: readonly RuntimeAccountUsageAccountHome[];
+  /** How many extra folders were read and dropped past the cap, for the refresh's trace and log. Counts only. */
+  onFolders?: (counts: { folders: number; dropped: number }) => void;
+};
+
 export type RuntimeAccountUsageCollector = (
   provider: RuntimeAccountUsageProvider,
+  request?: RuntimeAccountUsageReadRequest,
 ) => Promise<RuntimeAccountUsageSnapshot>;
 
-/** Read every provider through OAR and project its published usage contract. */
+/** Where the daemon itself would read the default account from: its own env, home and cwd. */
+export function daemonAccountFolderContext(): CredentialLocationContext {
+  return { env: ambientProcessEnv(), homeDir: os.homedir(), platform: process.platform, cwd: process.cwd() };
+}
+
+/**
+ * Read every provider through OAR and project its published usage contract.
+ * With `accountHomes` (Codex, Claude), each agent account folder other than
+ * the default one is read too, in parallel with the default read and under
+ * the same per-read timeout, its account keyed by the folder and tagged with
+ * its agents; one folder failing is that folder's error account only.
+ * Without it, the read is exactly the default account's, as before.
+ */
 export function createRuntimeAccountUsageCollector(input: {
   localAccountSlot: string;
   collectorVersion: string;
   now?: () => number;
   /** Test seam for the OAR read; production uses the real runtimes. */
   oar?: OarUsageReadDeps;
+  /** Test seam: where the default folder is; production reads the daemon's own environment. */
+  folderContext?: () => CredentialLocationContext;
 }): RuntimeAccountUsageCollector {
   const now = input.now ?? Date.now;
-  return (provider) => readOarAccountUsage({
+  const read = (provider: RuntimeAccountUsageProvider, observedAtMs: number, folder?: { slot: string; env: Record<string, string> }) => readOarAccountUsage({
     provider,
-    localAccountSlot: input.localAccountSlot,
+    localAccountSlot: folder?.slot ?? input.localAccountSlot,
     collectorVersion: input.collectorVersion,
-    observedAtMs: now(),
+    observedAtMs,
     ...(input.oar ? { deps: input.oar } : {}),
+    ...(folder ? { env: folder.env } : {}),
   });
+  return async (provider, request) => {
+    const observedAtMs = now();
+    if (!request?.accountHomes || !isRuntimeAccountUsageFolderProvider(provider)) return read(provider, observedAtMs);
+    const plan = planRuntimeAccountUsageFolders(provider, request.accountHomes, (input.folderContext ?? daemonAccountFolderContext)());
+    request.onFolders?.({ folders: plan.folders.length, dropped: plan.dropped });
+    const [base, folders] = await Promise.all([
+      read(provider, observedAtMs),
+      Promise.all(plan.folders.map(async (folder) => ({
+        snapshot: await read(provider, observedAtMs, { slot: folder.folder, env: folder.env }),
+        agentIds: folder.agentIds,
+      }))),
+    ]);
+    return mergeRuntimeAccountUsageFolders(base, folders);
+  };
 }

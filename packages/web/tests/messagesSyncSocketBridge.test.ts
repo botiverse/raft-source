@@ -57,6 +57,7 @@ const {
 const { reactionReadModelStore } = await import("../src/store/reactionReadModels");
 const { useChannelStore } = await import("../src/store/channelStore");
 const { __resetMessageHistoryRequestsForTests, useMessageStore } = await import("../src/store/messageStore");
+const { liveHeldIdsForResume } = await import("../src/store/syncResumeHeldIds");
 const { useServerStore } = await import("../src/store/serverStore");
 const { triggerServerReset } = await import("../src/store/serverResetRegistry");
 const { buildMainLayoutSocketBindings } = await import("../src/store/socketBridge");
@@ -1292,6 +1293,114 @@ test("sync:resume without a horizon yet is sent exactly as before", async () => 
 
   handler("rooms:joined")();
   assert.deepEqual(emitted.find((entry) => entry.event === "sync:resume")?.args[0], { lastSeq: 40 });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+});
+
+function startHorizon(horizon: string) {
+  resetMessageStore();
+  // Through null, so the held set of an earlier test is never kept by an equal horizon.
+  useMessageStore.setState({ syncHorizon: null });
+  useMessageStore.setState({ lastSeq: 40, syncHorizon: horizon });
+}
+
+/** A message id of UUID shape (what the server accepts in heldIds). */
+function heldId(n: number) {
+  return `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+}
+
+function liveMessage(seq: number, id: string) {
+  return { ...message(seq, `live ${id}`), id };
+}
+
+test("sync:resume sends the ids message:new brought since the horizon as heldIds", async () => {
+  api.get = (async () => ({ data: [] })) as typeof api.get;
+  stubMessageFlagEvaluation(false);
+  startHorizon("1200");
+  const { emitted, handler } = recordingBindings();
+
+  handler("message:new")(liveMessage(41, heldId(1)));
+  handler("message:new")(liveMessage(42, heldId(2)));
+  handler("message:new")(liveMessage(42, heldId(2))); // a repeat delivery counts once
+  // An id that is not a UUID is not held (it would void the whole list on the server).
+  handler("message:new")(liveMessage(43, "not-a-uuid"));
+  // My own send's HTTP answer is not live ingress: not held.
+  useMessageStore.getState().addMessage(liveMessage(44, heldId(3)));
+
+  handler("rooms:joined")();
+  const resume = emitted.find((entry) => entry.event === "sync:resume");
+  assert.deepEqual(resume?.args[0], { lastSeq: 44, sinceHorizon: "1200", heldIds: [heldId(1), heldId(2)] });
+
+  // The response's horizon replaces this one: a new, empty set.
+  handler("sync:resume:response")({ messages: [], currentSeq: 44, hasMore: false, horizon: "1350" });
+  handler("rooms:joined")();
+  assert.deepEqual(emitted.filter((entry) => entry.event === "sync:resume")[1]?.args[0], { lastSeq: 44, sinceHorizon: "1350" });
+
+  // Held since the new horizon, and kept by a response that returns the same horizon.
+  handler("message:new")(liveMessage(45, heldId(4)));
+  handler("sync:resume:response")({ messages: [], currentSeq: 45, hasMore: false, horizon: "1350" });
+  handler("rooms:joined")();
+  assert.deepEqual(emitted.filter((entry) => entry.event === "sync:resume")[2]?.args[0], { lastSeq: 45, sinceHorizon: "1350", heldIds: [heldId(4)] });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+});
+
+test("heldIds: a live message the window does not keep (newer history unloaded) is not held", async () => {
+  api.get = (async () => ({ data: [] })) as typeof api.get;
+  stubMessageFlagEvaluation(false);
+  startHorizon("1200");
+  const kept = liveMessage(41, heldId(10));
+  useMessageStore.setState({ channelMessages: { [channelId]: [kept] }, messages: [kept], hasNewer: true });
+  const { emitted, handler } = recordingBindings();
+
+  handler("message:new")(liveMessage(90, heldId(11))); // past a seq jump with hasNewer: loadNewer's to fetch
+  assert.equal(useMessageStore.getState().channelMessages[channelId]?.some((m) => m.id === heldId(11)), false);
+  handler("rooms:joined")();
+  assert.deepEqual(emitted.find((entry) => entry.event === "sync:resume")?.args[0], { lastSeq: 90, sinceHorizon: "1200" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+});
+
+test("heldIds: none without a horizon, none over 200 until the horizon is replaced, no follow-up resume after hasMore", async () => {
+  api.get = (async () => ({ data: [] })) as typeof api.get;
+  stubMessageFlagEvaluation(false);
+  resetMessageStore();
+  useMessageStore.setState({ lastSeq: 40, syncHorizon: null });
+  let visibleScopeSyncs = 0;
+  const { emitted, handler } = recordingBindings(async () => { visibleScopeSyncs += 1; });
+  const resumes = () => emitted.filter((entry) => entry.event === "sync:resume").map((entry) => entry.args[0]);
+
+  // No horizon: the resume is today's, whatever came live.
+  handler("message:new")(liveMessage(41, heldId(1)));
+  handler("rooms:joined")();
+  assert.deepEqual(resumes()[0], { lastSeq: 41 });
+
+  // The starting horizon replaces null: what came before it is not held.
+  handler("sync:resume:response")({ messages: [], currentSeq: 41, hasMore: false, horizon: "1200" });
+  handler("rooms:joined")();
+  assert.deepEqual(resumes()[1], { lastSeq: 41, sinceHorizon: "1200" });
+
+  // Exactly 200: all sent.
+  for (let i = 0; i < 200; i += 1) handler("message:new")(liveMessage(100 + i, heldId(100 + i)));
+  handler("rooms:joined")();
+  assert.equal((resumes()[2] as { heldIds?: string[] }).heldIds?.length, 200);
+  // The 201st: none, and none after more arrive.
+  handler("message:new")(liveMessage(400, heldId(400)));
+  handler("message:new")(liveMessage(401, heldId(401)));
+  handler("rooms:joined")();
+  assert.deepEqual(resumes()[3], { lastSeq: 401, sinceHorizon: "1200" });
+
+  // hasMore: the visible scopes are re-read; no follow-up resume goes out. The new horizon clears the overflow.
+  const scopeSyncsBefore = visibleScopeSyncs;
+  handler("sync:resume:response")({ messages: [], currentSeq: 401, hasMore: true, horizon: "1500" });
+  assert.equal(visibleScopeSyncs, scopeSyncsBefore + 1);
+  assert.equal(resumes().length, 4, "a hasMore round sends no follow-up sync:resume");
+  handler("message:new")(liveMessage(402, heldId(402)));
+  handler("rooms:joined")();
+  assert.deepEqual(resumes()[4], { lastSeq: 402, sinceHorizon: "1500", heldIds: [heldId(402)] });
+
+  // A server reset (registerServerReset) drops the horizon and the set with it.
+  assert.deepEqual(liveHeldIdsForResume(), [heldId(402)]);
+  triggerServerReset();
+  assert.equal(useMessageStore.getState().syncHorizon, null);
+  assert.equal(liveHeldIdsForResume(), null);
   await new Promise((resolve) => setTimeout(resolve, 0));
 });
 

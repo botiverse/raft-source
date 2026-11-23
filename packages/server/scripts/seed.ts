@@ -15,7 +15,7 @@ import { eq, and, isNull, desc } from "drizzle-orm";
 import { createHash, randomBytes } from "node:crypto";
 import argon2 from "argon2";
 import * as schema from "../src/db/schema";
-import { CONTINUATIONS_PILOT_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
+import { AGENT_FOCUS_FEATURE_FLAG_KEY, ARTIFACT_SETTLED_FEATURE_FLAG_KEY, CONTINUATION_TOOL_FEATURE_FLAG_KEY, CONTINUATIONS_PILOT_FEATURE_FLAG_KEY, INBOX_NOTICE_SERVER_ROWS_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import { buildSearchText } from "../src/services/searchTokenizer";
 import { getStorage } from "../src/services/storageService";
 import { applyDevSeedOnboardingFixture } from "./devSeedOnboarding";
@@ -2410,6 +2410,14 @@ async function main() {
       { key: "onboarding_owner_wizard_v0", description: "Enable owner onboarding wizard", randomizationUnit: "server" as const, defaultEnabled: true },
       // As migration continuations_pilot_flag inserts it: off until a server rule turns it on.
       { key: CONTINUATIONS_PILOT_FEATURE_FLAG_KEY, description: "Continuation pilot: a held raft message send asks the agent what to do instead of saving a draft", randomizationUnit: "server" as const, defaultEnabled: false },
+      // As migration continuation_tool_flag inserts it: off until a server rule turns it on.
+      { key: CONTINUATION_TOOL_FEATURE_FLAG_KEY, description: "Continuation answer tool: Claude agents can answer a paused raft command with the answer_continuation MCP tool", randomizationUnit: "server" as const, defaultEnabled: false },
+      // As migration inbox_notice_server_rows_flag inserts it: off until a server rule turns it on.
+      { key: INBOX_NOTICE_SERVER_ROWS_FEATURE_FLAG_KEY, description: "Wake-up notice with the Server's unread numbers: the Computer asks the Server for the rows it is about to list", randomizationUnit: "server" as const, defaultEnabled: false },
+      // As migration artifact_settled inserts it: off until a server rule turns it on.
+      { key: ARTIFACT_SETTLED_FEATURE_FLAG_KEY, description: "Settled Artifacts: mark an Artifact done (Settled); a new version takes it back to Working", randomizationUnit: "server" as const, defaultEnabled: false },
+      // As migration agent_focus_flag inserts it: off until a server rule turns it on.
+      { key: AGENT_FOCUS_FEATURE_FLAG_KEY, description: "Focus: an agent keeps up to three threads, DMs or task conversations in focus with raft focus and raft unfocus", randomizationUnit: "server" as const, defaultEnabled: false },
       // On here: the seeded owner has a personal assistant (step 12), so a preview shows its otter.
       { key: "personal_assistant", description: "Personal assistant (Ottie) for each person", randomizationUnit: "server" as const, defaultEnabled: true },
     ];

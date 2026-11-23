@@ -5,13 +5,17 @@ import { inboxRefreshWaitsForShow } from "./hiddenOwedReads";
 import { decrementInboxGroupCounts, hasInboxGroup, incrementInboxGroupCounts, preserveSelectedInboxGroup, sortInboxGroupsByRecentActivity, touchInboxGroupActivity } from "./inboxGroups";
 import type { InboxGroupCount } from "./inboxGroups";
 import { keepUnreadOverReadBehind, servedReadBehindScopes } from "./inboxServedReadBehind";
-import { checkInPlaceDrift, inPlaceUnreadOf, liveMessageRepeatSkipsReread, liveMessageRereadOutcome, liveUnreadFields, noteInPlaceRow, noteInPlaceRowAbsent, noteLiveApplied, skippedRereadFrontiers } from "./inboxInPlaceUnread";
-import { mergeAnswerByPosition, readPersistedSkipsListReread, receiveLiveByPosition, registerInboxRowPositionStore, rowPositionOn } from "./inboxRowPosition";
+import { checkInPlaceDrift, inPlaceUnreadOf, LIVE_ROW_SKIPPED, liveMessageRepeatSkipsReread, liveMessageRereadOutcome, liveRereadRefusal, liveRowReceipt, liveRowRefused, liveUnreadFields, noteInPlaceRow, noteInPlaceRowAbsent, noteLiveApplied, skippedRereadFrontiers } from "./inboxInPlaceUnread";
+import { catchUpVerdict, keptChannelRowToRevive, keptThreadRowToRevive, NOT_BEHIND, reviveLive } from "./activityUnreadRevive";
+import type { InboxCatchUpTarget } from "./activityUnreadRevive";
+import { markUnreadByPosition, mergeAnswerByPosition, readPersistedSkipsListReread, receiveLiveByPosition, registerInboxRowPositionStore, rowPositionOn } from "./inboxRowPosition";
 import { reportListRowsLowered } from "./inboxListRowLowered";
 import { noteServedInboxRows } from "./inboxCountedIds";
 import { inPlaceUnreadTotals, isUnreadInboxFilter, lateLivePatch } from "./inboxLivePatch";
+import { adjudicateServedUnreadAgainstLedger } from "./inboxLedgerAdjudication";
+import { projectInboxItem } from "./inboxReadProjection";
 export { isUnreadInboxFilter };
-import type { InboxLiveUnread, RereadOutcome } from "./inboxInPlaceUnread";
+import type { InboxLiveUnread, LiveRowReceipt, RereadOutcome } from "./inboxInPlaceUnread";
 import type { InboxRefreshTriggerCount, ListFetchReason } from "./listFetchReason";
 import { create } from "zustand";
 import type { StoreApi } from "zustand";
@@ -57,7 +61,6 @@ import {
   consumeReadStateSnapshotRows,
   getAcceptedReadState,
   getAcceptedReadStateProjection,
-  projectionCoversActivity,
   getReadStateLedgerGeneration,
   registerChannelReadListener,
   registerPersistedChannelReadListener,
@@ -68,7 +71,7 @@ import type {
   ReadStateProjection,
 } from "./readStateSync";
 import { clearAllMarkedUnreadForRead, isScopeMarkedUnread } from "./markedUnreadStore";
-import type { InboxRefreshTrigger, InboxScopeReadFrontier, ObjectActivityDoneInput, ObjectActivityInput, ObjectActivityReadInput, ObjectInboxFields, ObjectInboxItem, SummarizedObjectKind } from "@botiverse/raft-shared";
+import type { InboxRefreshRefusal, InboxRefreshTrigger, InboxScopeReadFrontier, ObjectActivityDoneInput, ObjectActivityInput, ObjectActivityReadInput, ObjectInboxFields, ObjectInboxItem, SummarizedObjectKind } from "@botiverse/raft-shared";
 import { normalizeTaskConversationRow } from "../utils/taskConversation";
 import type { TaskConversationRowFields } from "../utils/taskConversation";
 import { useServerStore } from "./serverStore";
@@ -119,7 +122,7 @@ export { compareActivitySeq, safeSeqToDecimalString };
 
 // #244 steps 3a/3b: a list an in-place update stands for without a re-read (a first window accepted,
 // not the saved page, no Activity read in flight); 3b also needs the plain All list, newest first.
-function inboxListSettled(state: InboxState, plain = false): boolean {
+export function inboxListSettled(state: InboxState, plain = false): boolean {
   return state.hasAcceptedWindow && !state.savedWindow && !state.loading && activeInboxRequestInFlightId === null
     && (!plain || (state.filter === "all" && !state.channelFilterId && !state.scope && !state.searchQuery && state.sortDirection === "desc"));
 }
@@ -397,10 +400,10 @@ export interface InboxState {
   conversationLatestReadableSeq: (channelId: string) => string | null;
   clearReadForChannel: (channelId: string) => void;
   applyReadStateProjection: (channelId: string, projection: ReadStateProjection) => void;
-  /** `live`: a live message's unread, patched in place on its existing row (#244). True: its re-read can be skipped (step 3b). */
-  receiveThreadReply: (message: Message, live?: InboxLiveUnread) => boolean;
-  /** A live channel or DM message: patch its existing row's preview, sender and time, and with `live` its unread (#244); never a new row. True: as receiveThreadReply. */
-  receiveChannelMessage: (message: Message, live?: InboxLiveUnread) => boolean;
+  /** `live`: a live message's unread, patched in place on its existing row (#244). `skipped`: its re-read can be skipped (step 3b); else `refused` says why not. */
+  receiveThreadReply: (message: Message, live?: InboxLiveUnread) => LiveRowReceipt;
+  /** A live channel or DM message: patch its existing row's preview, sender and time, and with `live` its unread (#244); never a new row. As receiveThreadReply. */
+  receiveChannelMessage: (message: Message, live?: InboxLiveUnread) => LiveRowReceipt;
   /** RFC 077: a retracted message's rows show its placeholder from now on, never its old text. */
   retractPreview: (messageId: string, placeholder: string) => void;
   updateThreadActivityMeta: (threadChannelId: string, replyCount: number, lastReplyAt: string | null) => void;
@@ -483,13 +486,13 @@ let pendingInboxBackgroundRefreshTrigger: InboxRefreshTriggerCount | undefined;
  * The single entry point for realtime-triggered Activity reloads. The first
  * request after a quiet window fetches immediately; requests inside the window
  * collapse into one trailing fetch at the window's end, so the latest state
- * still arrives. It carries the window's first trigger and count (#triage:#229).
+ * still arrives. It carries the window's first trigger, count and refusal (#triage:#229, #244).
  * While the page is hidden nothing is read (#243): the read is owed, and showing
  * the page pays it with one `visibility` read (hiddenOwedReads).
  */
-export function requestInboxBackgroundRefresh(trigger: InboxRefreshTrigger): void {
+export function requestInboxBackgroundRefresh(trigger: InboxRefreshTrigger, refused?: InboxRefreshRefusal): void {
   if (inboxRefreshWaitsForShow(loadInboxOnShow)) return;
-  pendingInboxBackgroundRefreshTrigger = foldInboxRefreshTrigger(pendingInboxBackgroundRefreshTrigger, { trigger, coalesced: 1 });
+  pendingInboxBackgroundRefreshTrigger = foldInboxRefreshTrigger(pendingInboxBackgroundRefreshTrigger, { trigger, coalesced: 1, ...(refused ? { refused } : {}) });
   if (inboxBackgroundRefreshTimer !== null) return;
   const waitMs = lastInboxResetStartedAt + INBOX_BACKGROUND_REFRESH_INTERVAL_MS - currentTimeMs();
   const run = () => {
@@ -506,12 +509,34 @@ export function requestInboxBackgroundRefresh(trigger: InboxRefreshTrigger): voi
   }, waitMs);
 }
 
+/** A realtime list read is asked for and not sent yet (#244: a thread row is not inserted under it). */
+export const inboxBackgroundRefreshPending = (): boolean => pendingInboxBackgroundRefreshTrigger !== undefined;
+
+/** A local Done or read still holds the row of `key` out of, or read in, the next answers. */
+export function hasInboxLocalRowHold(key: string, nowMs = currentTimeMs()): boolean {
+  return nowMs <= (inboxLocalDoneSuppressedUntil.get(key) ?? 0) || nowMs <= (inboxLocalReadSuppressedUntil.get(key) ?? 0);
+}
+
 function loadInboxOnShow(): void {
   // It stands for every realtime read asked for before it, a trailing one set while visible too.
   if (inboxBackgroundRefreshTimer !== null) clearTimeout(inboxBackgroundRefreshTimer);
   inboxBackgroundRefreshTimer = null;
   pendingInboxBackgroundRefreshTrigger = undefined;
   void useInboxStore.getState().loadInbox({ reset: true, background: true, reason: "visibility" });
+}
+
+/**
+ * #triage:#244: the page is back from hidden or frozen (resumeActivityReread):
+ * one `visibility` read of a loaded Activity list, unless a reset read started
+ * inside the background throttle window (an owed read this show already paid
+ * stands for it). True when it reads.
+ */
+export function requestInboxResumeRefresh(): boolean {
+  const { loaded, loading } = useInboxStore.getState();
+  if (!loaded && !loading) return false;
+  if (currentTimeMs() - lastInboxResetStartedAt < INBOX_BACKGROUND_REFRESH_INTERVAL_MS) return false;
+  loadInboxOnShow();
+  return true;
 }
 
 /** Drop a scheduled trailing background reload (bridge teardown, server reset, tests). */
@@ -536,14 +561,14 @@ export const INBOX_CATCH_UP_RETRY_DELAYS_MS = [1_500, 3_000] as const;
 // and under RW overload the lag outlasts 3 s, so it gets one later read.
 export const INBOX_REOPEN_CATCH_UP_RETRY_DELAYS_MS = [1_500, 3_000, 10_000] as const;
 // Task #92: `reopen` marks a target whose row Done hid. The view drops that
-// row until it has the new message, so there a missing row is the lag itself.
-let inboxCatchUpTarget: { channelId: string; seq: string; reopen: boolean } | null = null;
+// row until it has the new message, so there a missing row is the lag itself. `revived`: activityUnreadRevive.
+let inboxCatchUpTarget: InboxCatchUpTarget | null = null;
 let inboxCatchUpAttempt = 0;
 let inboxCatchUpTimer: ReturnType<typeof setTimeout> | null = null;
 
-function noteInboxCatchUpTarget(channelId: string, seq: string, reopen = false): void {
+function noteInboxCatchUpTarget(channelId: string, seq: string, reopen = false, revived: string | null = null): void {
   if (inboxCatchUpTarget && compareActivitySeq(seq, inboxCatchUpTarget.seq) <= 0) return;
-  inboxCatchUpTarget = { channelId, seq, reopen };
+  inboxCatchUpTarget = { channelId, seq, reopen: reopen || revived !== null, revived };
   inboxCatchUpAttempt = 0;
 }
 
@@ -569,21 +594,6 @@ function clearInboxCatchUp(): void {
   inboxCatchUpTimer = null;
   inboxCatchUpTarget = null;
   inboxCatchUpAttempt = 0;
-}
-
-/**
- * Does this served first window still serve the newest live message's channel
- * row older than that message? A missing row is not behind: the filter may
- * leave it out, and no answer can tell. Except for a row Done hid (task #92):
- * the view leaves it out until it has the message, so missing is behind.
- */
-function inboxAnswerIsBehindCatchUp(served: InboxItem[]): boolean {
-  const target = inboxCatchUpTarget;
-  if (!target) return false;
-  const row = served.find((item): item is ChannelInboxItem =>
-    (item.kind === "channel" || item.kind === "dm") && item.channelId === target.channelId);
-  if (row === undefined) return target.reopen;
-  return compareActivitySeq(row.latestActivitySeq, target.seq) < 0;
 }
 
 function settleInboxCatchUp(behind: boolean, stale: boolean): void {
@@ -699,28 +709,10 @@ function isInboxLoadIdentityCurrent(identity: InboxLoadIdentity): boolean {
     && getCurrentPrincipalId() === identity.principalId;
 }
 
-// Stryker disable all: pure Activity-row projection glue is covered by read-state behavior tests; surviving mutants here are identity/no-op variants or mention_action type narrowing.
-function projectInboxItem(item: InboxItem, projection: ReadStateProjection): InboxItem {
-  // #triage:#244: a row with a message the loaded messages lack (never received here) keeps its count.
-  if (item.kind === "mention_action" || item.kind === "object" || !projectionCoversActivity(projection, item.readStateLatestActivitySeq)) return item;
-  const nextFirstMentionMessageId = projection.hasMention ? projection.firstMentionMessageId : null;
-  if (
-    item.unreadCount === projection.unreadCount
-    && item.firstUnreadMessageId === projection.firstUnreadMessageId
-    && item.firstMentionMessageId === nextFirstMentionMessageId
-    && item.hasMention === projection.hasMention
-  ) {
-    return item;
-  }
-  return {
-    ...item,
-    unreadCount: projection.unreadCount,
-    firstUnreadMessageId: projection.firstUnreadMessageId,
-    firstMentionMessageId: nextFirstMentionMessageId,
-    hasMention: projection.hasMention,
-  } as InboxItem;
+/** A loaded message's seq in the scope, by id (projectInboxItem's proof for a row served without activity seqs). */
+function loadedMessageSeqIn(scopeId: string): (messageId: string) => number | null {
+  return (messageId) => useMessageStore.getState().channelMessages[scopeId]?.find((message) => message.id === messageId)?.seq ?? null;
 }
-// Stryker restore all
 
 // Stryker disable all: applying already-known projections during Activity hydration is pinned by focused hydrate tests; mutations here only alter no-op/reference behavior.
 function applyKnownReadStateProjectionsToItems(items: InboxItem[]): InboxItem[] {
@@ -735,7 +727,7 @@ function applyKnownReadStateProjectionsToItems(items: InboxItem[]): InboxItem[] 
     // A Mark as Unread here outranks a read projection of an earlier Read
     // (one newer than the Unread has retired it: localUnreadOf).
     if (projection.unreadCount === 0 && localUnreadOf(channelId)) return item;
-    const next = projectInboxItem(item, projection);
+    const next = projectInboxItem(item, projection, loadedMessageSeqIn(channelId));
     if (next !== item) changed = true;
     return next;
   });
@@ -988,57 +980,6 @@ function releaseInboxDoneGeneration(item: ActivityPersistedItem, generation: num
 function forgetInboxLocalReadSuppression(item: ActivityPersistedItem) {
   inboxLocalReadSuppressedMarkers.delete(getInboxItemKey(item));
   inboxLocalReadSuppressedUntil.delete(getInboxItemKey(item));
-}
-
-/**
- * A served Activity row is one consistent generation (RisingWave reads are
- * checkpoint-consistent), but it can be OLDER than what this client already
- * knows: the client's own read reaches the ledger through its ack before
- * RisingWave has ingested the cursor. An older generation must not override a
- * newer one, so the ledger adjudicates such rows: when its cursor already
- * covers the row's latest activity, the row is read. A row the ledger knows
- * nothing newer about, or whose latest activity is beyond the ledger's cursor,
- * is served as-is (there is genuinely unread content).
- */
-function adjudicateServedUnreadAgainstLedger(
-  serverId: string | null,
-  items: InboxItem[],
-  servedFrontiers: readonly (InboxScopeReadFrontier | undefined)[],
-  filter: InboxFilter,
-): { items: InboxItem[]; suppressedCount: number; suppressedUnreadCount: number } {
-  let suppressedCount = 0;
-  let suppressedUnreadCount = 0;
-  const nextItems: InboxItem[] = [];
-  items.forEach((item, index) => {
-    const served = servedFrontiers[index];
-    const scopeId = inboxItemChannelId(item);
-    const ledger = scopeId ? getAcceptedReadState(serverId, scopeId) : null;
-    const latestSeq = served?.kind === "present" ? served.latestActivity?.seq ?? null : null;
-    if (
-      !ledger
-      || served?.kind !== "present"
-      || ledger.readStateVersion <= served.readStateVersion
-      || latestSeq === null
-      || BigInt(ledger.maxReadSeq) < BigInt(latestSeq)
-      || item.unreadCount === 0
-    ) {
-      nextItems.push(item);
-      return;
-    }
-    suppressedUnreadCount += item.unreadCount;
-    if (isUnreadInboxFilter(filter)) {
-      suppressedCount += 1;
-      return;
-    }
-    nextItems.push({
-      ...item,
-      unreadCount: 0,
-      firstUnreadMessageId: null,
-      firstMentionMessageId: null,
-      hasMention: false,
-    } as InboxItem);
-  });
-  return { items: nextItems, suppressedCount, suppressedUnreadCount };
 }
 
 function applyInboxLocalReadSuppressions(
@@ -1490,6 +1431,7 @@ async function markScopeUnread(
   for (const row of get().items) if (ofScope(row)) forgetInboxLocalReadSuppression(row);
   if (item && isConversationRow(item)) forgetInboxLocalReadSuppression(item);
   releaseActivityReadHold(identity, scopeId);
+  markUnreadByPosition(scopeId); // #244 flag on: and the row's read seq (a late ack of an earlier read does not raise it)
   // Unread at once, as the server will mark it: its latest message.
   const local: InboxLocalUnread = { readStateVersion: null, until: currentTimeMs() + LOCAL_READ_SUPPRESSION_MS };
   inboxLocalUnreads.set(scopeId, local);
@@ -1536,6 +1478,7 @@ async function markScopeUnread(
     // The Read before this one may have set its hold since (its ack came
     // back while this waited): this Unread is the later word.
     releaseActivityReadHold(identity, scopeId);
+    markUnreadByPosition(scopeId);
   }
   let answer: { unreadCount?: unknown; readStateVersion?: unknown; maxReadSeq?: unknown; markedUnread?: unknown } | null = null;
   let failed = false;
@@ -1913,7 +1856,7 @@ export const useInboxStore = create<InboxState>((set, get) => ({
       );
       const objectHold = applyObjectActivityHolds(localUnread.items, requestFilter);
       const nextItems = objectHold.items;
-      const catchUpBehind = reset && inboxAnswerIsBehindCatchUp(incomingItems);
+      const catchUp = reset ? catchUpVerdict(incomingItems, inboxCatchUpTarget) : NOT_BEHIND;
       const acceptedKeys = new Set(nextItems.map(getInboxItemKey));
       const suppressedItems = incomingItems.filter((item) => !acceptedKeys.has(getInboxItemKey(item)));
       const suppressedCount = ledgerAdjudicated.suppressedCount
@@ -1943,6 +1886,8 @@ export const useInboxStore = create<InboxState>((set, get) => ({
           return { loading: false, loadingMore: false };
         }
         accepted = true;
+        // A revived row this current answer leaves out (catchUpVerdict): the list shows its copy, read, meanwhile.
+        if (catchUp.keepShown) noteActivityUnreadRowsRead([catchUp.keepShown]);
         noteServedInboxRows(incomingItems, reset);
         if (reset && allScope && requestSortDirection === "desc") checkInPlaceDrift(current.items, nextItems, readBehind, backend);
         // #244 step 2 (inbox_row_position_v1): then each answered row merges by the per-row position rule.
@@ -1966,7 +1911,7 @@ export const useInboxStore = create<InboxState>((set, get) => ({
               ),
             };
           })(), current.items, readBehind)
-          : { items: [...current.items, ...nextItems], totalUnreadDelta: 0 }, current.items, incomingItems, requestSortDirection === "desc", readBehind);
+          : { items: [...current.items, ...nextItems], totalUnreadDelta: 0 }, current.items, incomingItems, requestSortDirection === "desc", reset, readBehind);
         // A row marked unread here that a lagging Unread list leaves out stays.
         // The page covers it when it is the whole list, or the row sorts
         // before its last row; past the page, the server's totals count it.
@@ -1982,7 +1927,8 @@ export const useInboxStore = create<InboxState>((set, get) => ({
         const keptUnreadCount = keptUnread.fellOut.reduce((sum, row) => sum + row.unreadCount, 0);
         // Stryker disable all: total-count arithmetic combines pre-existing local suppressions with projection deltas; the focused read-state tests assert row/total outcomes, not each arithmetic mutant.
         const merged = applyKnownReadStateProjectionsToItems(keptUnread.items);
-        if (reset) reportListRowsLowered({ served: incomingItems, before: current.items, reason: opts.reason, trigger: opts.trigger?.trigger, rowPosition: rowPositionOn(requestServerId),
+        if (reset) reportListRowsLowered({ served: incomingItems, servedFrontiers, ledgerOf: (scopeId) => getAcceptedReadState(requestServerId, scopeId), before: current.items, reason: opts.reason, trigger: opts.trigger?.trigger, rowPosition: rowPositionOn(requestServerId),
+          projectionOf: (scopeId) => getAcceptedReadStateProjection(requestServerId, scopeId), loadedSeqOf: loadedMessageSeqIn,
           stages: [["ledger", ledgerAdjudicated.items], ["local_read", readSuppression.items], ["done", doneSuppression.items], ["read_hold", acceptedReadHold.items], ["merge", preserved.items], ["projection", merged]] });
         const projectionUnreadDelta = merged.reduce((sum, item) => sum + item.unreadCount, 0)
           - keptUnread.items.reduce((sum, item) => sum + item.unreadCount, 0);
@@ -2074,7 +2020,7 @@ export const useInboxStore = create<InboxState>((set, get) => ({
           loadingMore: false,
         };
       });
-      if (accepted && reset) settleInboxCatchUp(catchUpBehind, stale);
+      if (accepted && reset) settleInboxCatchUp(catchUp.behind, stale);
       // Task #164: a clean first page of the plain All list is what a later
       // boot shows while RW is unavailable.
       if (accepted && reset && !stale && allScope && requestSortDirection === "desc") {
@@ -2212,6 +2158,7 @@ export const useInboxStore = create<InboxState>((set, get) => ({
       try {
         const { data } = await postReadAllCoalesced(channelId, ingressContext);
         if (isReceiverPrivateIngressContextCurrent(ingressContext)) {
+          // Its read ack reaches the lowered-row report in postReadAllCoalesced (noteLocalReadAck).
           acceptActivityReadAllAck(ingressContext, channelId, data);
           traceActivityInboxTransition({
             source: "read_ack",
@@ -2679,7 +2626,7 @@ export const useInboxStore = create<InboxState>((set, get) => ({
       const projectItem = (item: InboxItem): InboxItem => {
         if (item.kind === "mention_action" || item.kind === "object") return item;
         if (inboxItemChannelId(item) !== channelId) return item;
-        const next = projectInboxItem(item, projection);
+        const next = projectInboxItem(item, projection, loadedMessageSeqIn(channelId));
         if (next === item) return item;
         totalUnreadDelta += projection.unreadCount - item.unreadCount;
         changed = true;
@@ -2727,16 +2674,18 @@ export const useInboxStore = create<InboxState>((set, get) => ({
   // behavior tests; the version ledger branches above are
   // exercised through refreshInbox rather than mutation-testing store wiring.
   receiveThreadReply: (message, live) => {
-    if (receiveLiveByPosition(message, live, "thread")) return true;
+    if (receiveLiveByPosition(message, live, "thread")) return LIVE_ROW_SKIPPED;
     let traceInput: Parameters<typeof traceActivityInboxTransition>[0] | null = null;
     let kept = true;
     let skipsReread = false;
+    let refused: InboxRefreshRefusal | undefined; // #244: why its re-read is not skipped (X-Raft-Fetch-Refused)
     set((state) => {
-      const existing = state.items.find(
-        (item): item is ThreadInboxItem => item.kind === "thread" && item.threadChannelId === message.channelId,
-      );
+      const refuse = (why: InboxRefreshRefusal, patch: Partial<InboxState> = state) => { refused = why; return patch; };
+      const listed = state.items.find((item): item is ThreadInboxItem => item.kind === "thread" && item.threadChannelId === message.channelId);
+      const revived = listed ? undefined : keptThreadRowToRevive(state, message, live); // Unread: a row kept read
+      const existing = listed ?? revived;
       if (!existing && live) noteInPlaceRowAbsent(message, live, "thread");
-      if (!existing) return state;
+      if (!existing) return refuse("not_listed");
       // #244: a reply the row is already past (late, or applied uncounted) counts once (lateLivePatch).
       const late = (): Partial<InboxState> => {
         const counted = lateLivePatch(state, existing, message, live);
@@ -2748,7 +2697,7 @@ export const useInboxStore = create<InboxState>((set, get) => ({
         const repeatSkips = !!live && liveMessageRepeatSkipsReread(existing, inboxListSettled(state, true));
         const patch = existing.latestActivitySeq == null ? state : late();
         skipsReread = repeatSkips && patch === state;
-        return patch;
+        return skipsReread ? patch : refuse("repeat", patch);
       }
       // task #361 legacy socket recency guard: only advance the thread row when this
       // reply is strictly newer than the current content frontier. An old/duplicate
@@ -2766,14 +2715,15 @@ export const useInboxStore = create<InboxState>((set, get) => ({
         // is fail-closed — no apply; the socket is only a wake signal and the canonical
         // refetch supplies the row (no fabricated seq, no createdAt/messageId fallback).
         // Pre-activation (currentSeq null) keeps the legacy same-id behavior above.
-        if (incomingSeq == null) return state;
-        if (compareActivitySeq(incomingSeq, currentSeq) <= 0) return late();
+        if (incomingSeq == null) return refuse("no_seq");
+        if (compareActivitySeq(incomingSeq, currentSeq) <= 0) return refuse("not_newer", late());
       }
       const fromIndex = state.items.indexOf(existing);
       // #244 step 3b: decided on the row as listed before the patch.
-      const reread: RereadOutcome | null = liveMessageRereadOutcome(existing, message, live, inboxListSettled(state, true) && hasInboxGroup(state.groups, existing));
+      const listSettled = inboxListSettled(state, true) && hasInboxGroup(state.groups, existing);
+      const reread: RereadOutcome | null = liveMessageRereadOutcome(existing, message, live, listSettled);
       skipsReread = reread === "skipped";
-
+      refused = liveRereadRefusal(reread, live, listSettled);
       const next: ThreadInboxItem = {
         ...existing,
         latestActivityPreview: message.content,
@@ -2791,9 +2741,10 @@ export const useInboxStore = create<InboxState>((set, get) => ({
         replyCount: existing.replyCount + 1,
         lastActivityAt: message.createdAt,
         lastReplyAt: message.createdAt,
-        ...liveUnreadFields(existing, message, live),
+        ...liveUnreadFields(existing, message, revived ? reviveLive(live) : live),
         ...(skipsReread && incomingSeq != null ? skippedRereadFrontiers(existing, incomingSeq) : {}),
       };
+      if (revived && incomingSeq != null) noteInboxCatchUpTarget(message.channelId, incomingSeq, true, getInboxItemKey(next));
       rememberLocalThreadActivity(next);
       if (live) noteInPlaceRow(next, live, message, reread);
       kept = noteLiveApplied(next, message, live);
@@ -2813,7 +2764,7 @@ export const useInboxStore = create<InboxState>((set, get) => ({
       };
       return {
         items: nextItems,
-        ...inPlaceUnreadTotals(state, next, next.unreadCount - existing.unreadCount),
+        ...inPlaceUnreadTotals(state, next, next.unreadCount - existing.unreadCount, !!revived),
         ...(skipsReread ? { groups: touchInboxGroupActivity(state.groups, next, message.createdAt) } : {}),
       };
     });
@@ -2826,16 +2777,16 @@ export const useInboxStore = create<InboxState>((set, get) => ({
       traceActivityInboxTransition(traceInput, traceCycleId);
     }
     if (!kept) requestInboxBackgroundRefresh("counted_cap");
-    return skipsReread && kept;
+    return liveRowReceipt(skipsReread, kept, refused);
   },
 
   receiveChannelMessage: (message, live) => {
     // Thread and task-conversation replies have their own rows (receiveThreadReply).
     const conversationType = message.conversationContext?.channelType;
-    if (conversationType === "thread" || conversationType === "task") return false;
-    if (receiveLiveByPosition(message, live, "channel")) return true;
+    if (conversationType === "thread" || conversationType === "task") return liveRowRefused("not_listed");
+    if (receiveLiveByPosition(message, live, "channel")) return LIVE_ROW_SKIPPED;
     const incomingSeq = safeSeqToDecimalString(message.seq);
-    if (incomingSeq == null) return false;
+    if (incomingSeq == null) return liveRowRefused("no_seq");
     // Only a message on a row the list shows (or one Done hid, task #92)
     // chases the view: a message
     // elsewhere would replace the target with a row no answer has, and end
@@ -2844,21 +2795,25 @@ export const useInboxStore = create<InboxState>((set, get) => ({
     let reopened = false;
     let kept = true;
     let skipsReread = false;
+    let refused: InboxRefreshRefusal | undefined;
     set((state) => {
-      const existing = state.items.find((item): item is ChannelInboxItem =>
-        (item.kind === "channel" || item.kind === "dm") && item.channelId === message.channelId);
+      const refuse = (why: InboxRefreshRefusal) => { refused = why; return state; };
+      const listed = state.items.find((item): item is ChannelInboxItem => (item.kind === "channel" || item.kind === "dm") && item.channelId === message.channelId);
+      const revived = listed ? undefined : keptChannelRowToRevive(state, message, live); // Unread: a row kept read
+      const existing = listed ?? revived;
       // Task #92: a row Done hid is not listed, so nothing patches it; still
       // chase it, or the first read (before the view has the message) is the last.
       if (!existing) {
         reopened = isReopenedByLiveMessage(message.channelId, incomingSeq);
         if (live) noteInPlaceRowAbsent(message, live, "channel");
-        return state;
+        return refuse("not_listed");
       }
       // Same guard as thread rows: only a strictly newer seq moves a row that has one.
-      if (!existing.latestActivitySeq) return state;
+      if (!existing.latestActivitySeq) return refuse("patch_incomplete");
       if (compareActivitySeq(incomingSeq, existing.latestActivitySeq) <= 0) {
         // #244 step 3b: the same message again skips its re-read only if the first did and it counts nothing new.
-        const repeatSkips = existing.lastMessageId === message.id && !!live && liveMessageRepeatSkipsReread(existing, inboxListSettled(state, true));
+        refused = existing.lastMessageId === message.id ? "repeat" : "not_newer";
+        const repeatSkips = refused === "repeat" && !!live && liveMessageRepeatSkipsReread(existing, inboxListSettled(state, true));
         const counted = lateLivePatch(state, existing, message, live);
         if (!counted) {
           skipsReread = repeatSkips;
@@ -2871,8 +2826,10 @@ export const useInboxStore = create<InboxState>((set, get) => ({
         return counted.patch;
       }
       // #244 step 3b: decided on the row as listed before the patch.
-      const reread: RereadOutcome | null = liveMessageRereadOutcome(existing, message, live, inboxListSettled(state, true) && hasInboxGroup(state.groups, existing));
+      const listSettled = inboxListSettled(state, true) && hasInboxGroup(state.groups, existing);
+      const reread: RereadOutcome | null = liveMessageRereadOutcome(existing, message, live, listSettled);
       skipsReread = reread === "skipped";
+      refused = liveRereadRefusal(reread, live, listSettled);
       const next: ChannelInboxItem & { latestActivitySeq: string } = {
         ...existing,
         lastMessageId: message.id,
@@ -2887,9 +2844,11 @@ export const useInboxStore = create<InboxState>((set, get) => ({
         // The avatar is the previous message's sender's; a new sender has none
         // until the next load (the client rosters still apply).
         senderAvatarUrl: message.senderId === existing.lastMessageSenderId ? existing.senderAvatarUrl : null,
-        ...liveUnreadFields(existing, message, live),
+        ...liveUnreadFields(existing, message, revived ? reviveLive(live) : live),
         ...(skipsReread ? skippedRereadFrontiers(existing, incomingSeq) : {}),
       };
+      // Before the catch-up below, which then keeps this target (same seq).
+      if (revived) noteInboxCatchUpTarget(message.channelId, incomingSeq, true, getInboxItemKey(next));
       rememberLocalChannelActivity(next, !!live?.counts || inboxChannelActivityHighWater.get(next.channelId)?.counts === true);
       if (live) noteInPlaceRow(next, live, message, reread);
       kept = noteLiveApplied(next, message, live);
@@ -2898,7 +2857,7 @@ export const useInboxStore = create<InboxState>((set, get) => ({
         items: state.sortDirection === "desc"
           ? [next, ...state.items.filter((item) => item !== existing)]
           : state.items.map((item) => item === existing ? next : item),
-        ...inPlaceUnreadTotals(state, next, next.unreadCount - existing.unreadCount),
+        ...inPlaceUnreadTotals(state, next, next.unreadCount - existing.unreadCount, !!revived),
         ...(skipsReread ? { groups: touchInboxGroupActivity(state.groups, next, message.createdAt) } : {}),
       };
     });
@@ -2906,7 +2865,7 @@ export const useInboxStore = create<InboxState>((set, get) => ({
     if (patched && !skipsReread) noteInboxCatchUpTarget(message.channelId, incomingSeq);
     else if (reopened) noteInboxCatchUpTarget(message.channelId, incomingSeq, true);
     if (!kept) requestInboxBackgroundRefresh("counted_cap");
-    return skipsReread && kept;
+    return liveRowReceipt(skipsReread, kept, refused);
   },
 
   updateThreadActivityMeta: (threadChannelId, replyCount, lastReplyAt) => set((state) => {

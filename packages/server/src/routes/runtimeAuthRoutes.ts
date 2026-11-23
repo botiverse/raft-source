@@ -5,16 +5,23 @@ import {
   asMachineOperationId,
   asServerId,
   type MachineOperationStarted,
-  isAdminOrOwner,
-  RUNTIME_AUTH_SERVER_GATED_RUNTIMES,
   isRuntimeAccountUsageProvider,
   isRuntimeAuthPastedCode,
   isRuntimeAuthRuntime,
-  isRuntimeAuthServerGated,
   isRuntimeLimitResetIdempotencyKey,
   isRuntimeLimitResetKind,
   claudeFiveHourLimitOf,
   CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY,
+  RUNTIME_UPGRADE_FEATURE_FLAG_KEY,
+  RUNTIME_UPGRADE_RELAY_BUDGET_MS,
+  runtimeUpgradeResultSchema,
+  type RuntimeUpgradeResult,
+  RUNTIME_INSTALL_FEATURE_FLAG_KEY,
+  RUNTIME_INSTALL_RELAY_BUDGET_MS,
+  runtimeInstallPlanSchema,
+  runtimeInstallResultSchema,
+  type RuntimeInstallPlan,
+  type RuntimeInstallResult,
   parseRuntimeAuthProviderConnectInput,
   runtimeAuthLoginRegionFits,
   runtimeAuthOAuthMethodFits,
@@ -24,7 +31,6 @@ import {
   runtimeLimitResetResultSchema,
   runtimeLimitResetsReadResultSchema,
   RAFT_CLIENT_CAPABILITIES_HEADER,
-  runtimeAccountUsageSnapshotForClient,
   safeParseRuntimeAccountUsageSnapshot,
   type RuntimeAccountUsageProvider,
   type RuntimeLimitResetResult,
@@ -32,17 +38,22 @@ import {
   type RuntimeAuthAction,
   type RuntimeAuthProviderConnectField,
   type RuntimeAuthRuntime,
-  type RuntimeAuthStatusReport,
+  type RuntimeUpdates,
+  type ServerRole,
 } from "@botiverse/raft-shared";
 
-import { getActorServerRoleInServer, actorRoleHasServerCapability } from "../lib/actorPermissions";
+import { getActorServerRoleInServer } from "../lib/actorPermissions";
+import { computerActorAllowed, controllerUserIdFromAttachers } from "../services/computerControlAuthorization";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
 import { getComputerLinkedMachineAttachers } from "../services/computerCredentialService";
 import { evaluateFeatureFlag } from "../services/featureFlagService";
+import { recordIntegrationAuditEventBestEffort, serverAuditContextMetadata } from "../services/integrationAuditService";
+import { claudeLimitResetReadSpentGuard } from "../services/claudeLimitResetReadSpentGuard";
 import { runtimeAccountUsageCacheService } from "../services/runtimeAccountUsageCacheService";
+import { runtimeAccountUsageSnapshotForViewer } from "../services/runtimeAccountUsageViewer";
 import * as machineService from "../services/machineService";
-import { isRuntimeRevived, resolveRuntimeAdmissionPolicy } from "../services/runtimeAdmissionService";
 import { runtimeAuthService } from "../services/runtimeAuthService";
+import { recordLimitResetUsedByOther, spentLimitReset } from "../services/runtimeLimitResetUsedByOther";
 import { addTraceEvent } from "../tracing/semanticTrace";
 import { RouteFailureError } from "../tracing/routeFailure";
 import { refuse } from "../lib/refusal";
@@ -55,10 +66,22 @@ import { readMachineOperation, startMachineOperation, type MachineOperationAnswe
  * (docs/contracts/runtime-auth.md). People only: `/api/servers` takes a user
  * session, never an agent credential.
  *
- * - See status: the human who attached the Computer, or `editMachines`.
+ * Both through computerActorAllowed (services/computerControlAuthorization.ts),
+ * the one Computer check: its live attacher, or a role holding the action's
+ * capability (today owner and admin).
+ * - See status: the human who attached the Computer, or `edit` (`editMachines`).
  * - Log in, log out, cancel, list providers, connect one, use a limit reset,
  *   read which Claude limit resets the account holds: the human who attached
- *   it, or a server owner or admin.
+ *   it, or `control` (`controlComputers`: these send commands to the Computer). A limit reset an owner or admin uses on a
+ *   Computer someone else attached is audited and that person is emailed
+ *   (recordLimitResetUsedByOther).
+ * - Upgrade a runtime's command-line tool (behind runtime_upgrade_button):
+ *   the same people as a sign-in. Only when a person presses Upgrade; Raft
+ *   never upgrades a runtime on its own.
+ * - Read what installing a runtime would run, and install it (behind
+ *   runtime_install_button): the same people as Upgrade (`canAct`). Only the
+ *   runtime is taken from the request; what runs is OAR's on the Computer.
+ *   Each install is recorded in the server audit (`computer.runtime_install`).
  * - A login's code and cancel answer 404 to anyone but the person who started
  *   it, so another person's login is never revealed.
  * - The pasted code and a provider's API key are never logged, traced,
@@ -71,11 +94,14 @@ interface Actors {
   canView: boolean;
   canAct: boolean;
   /**
-   * The caller is the person who connected this Computer. Its Claude account is
-   * usually their own subscription, so only they may spend its Claude limit
-   * resets (redeem, or a read with consent at the 5-hour limit).
+   * The caller is the person who connected this Computer. A limit reset anyone
+   * else (an owner or admin) uses on it is audited and told to that person.
    */
   attachedByCaller: boolean;
+  /** The person who connected this Computer, if anyone. */
+  attachedBy: string | null;
+  /** The caller's role on the server, as the permission check read it (for the audit). */
+  callerRole: ServerRole | null;
   /** A Computer with no attaching human cannot relay a login (its events would be dropped). */
   attached: boolean;
 }
@@ -114,13 +140,18 @@ async function resolveActors(serverId: string, machineIdParam: string, userId: s
     getActorServerRoleInServer(serverId, "user", userId),
     getComputerLinkedMachineAttachers(serverId),
   ]);
-  const attachedByCaller = attachers.get(machine.id) === userId;
+  // The machine's controller: its live attacher (controllerUserIdFromAttachers), as on every Computer route.
+  const attachedBy = controllerUserIdFromAttachers(attachers, machine);
+  const attachedByCaller = attachedBy === userId;
+  const actor = { userId, role: callerRole };
   return {
     machine,
-    canView: attachedByCaller || actorRoleHasServerCapability(callerRole, "editMachines"),
-    canAct: attachedByCaller || isAdminOrOwner(callerRole),
+    canView: computerActorAllowed(actor, attachedBy, "edit"),
+    canAct: computerActorAllowed(actor, attachedBy, "control"),
     attachedByCaller,
-    attached: Boolean(attachers.get(machine.id)),
+    attachedBy,
+    callerRole,
+    attached: Boolean(attachedBy),
   };
 }
 
@@ -153,10 +184,12 @@ async function answerMachineWait(
   res: express.Response,
   wait: () => Promise<MachineOperationAnswer>,
   failure: MachineOperationAnswer,
+  /** How long the operation is kept; past the wait's own budget (MACHINE_OPERATION_TTL_SECONDS by default). */
+  ttlSeconds?: number,
 ): Promise<void> {
   res.setHeader("Cache-Control", "private, no-store");
   if (req.body?.respondAsync === true) {
-    const operationId = await startMachineOperation({ userId: req.userId!, serverId: asServerId(req.serverId!), surface: "web" }, wait, failure);
+    const operationId = await startMachineOperation({ userId: req.userId!, serverId: asServerId(req.serverId!), surface: "web" }, wait, failure, ttlSeconds);
     res.status(202).json({ operationId } satisfies MachineOperationStarted);
     return;
   }
@@ -164,31 +197,12 @@ async function answerMachineWait(
   res.status(answer.status).json(answer.body);
 }
 
-/**
- * The server-gated runtimes (Antigravity) this server does not offer: those
- * whose deprecated runtime its flag does not revive
- * (`agent_runtime_oar_antigravity`). Empty when none is gated off. A server
- * gated runtime's auth id is its Raft runtime id.
- */
-async function runtimesNotOffered(serverId: string, userId: string): Promise<ReadonlySet<RuntimeAuthRuntime>> {
-  const policy = await resolveRuntimeAdmissionPolicy({ serverId, userId });
-  return new Set<RuntimeAuthRuntime>(RUNTIME_AUTH_SERVER_GATED_RUNTIMES.filter((runtime) => !isRuntimeRevived(runtime, policy)));
-}
-
-/** The stored report without the runtimes this server does not offer. */
-function offeredStatus(status: RuntimeAuthStatusReport | null, hidden: ReadonlySet<RuntimeAuthRuntime>): RuntimeAuthStatusReport | null {
-  if (!status || hidden.size === 0) return status;
-  const runtimes = { ...status.runtimes };
-  for (const runtime of hidden) delete runtimes[runtime];
-  return { ...status, runtimes };
-}
-
 /** The runtime named in the path, when OAR can take this action for it. */
 function actionableRuntime(value: string | undefined, action: RuntimeAuthAction): RuntimeAuthRuntime | null {
   return isRuntimeAuthRuntime(value) && runtimeAuthSupports(value, action) ? value : null;
 }
 
-/** `claude_limit_reset` for this server; an evaluation failure reads as off. */
+/** `claude_limit_reset_v2` for this server; an evaluation failure reads as off. */
 async function claudeLimitResetOn(serverId: string, userId: string): Promise<boolean> {
   try {
     return (await evaluateFeatureFlag({ key: CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY, serverId, userId })).enabled;
@@ -200,14 +214,6 @@ async function claudeLimitResetOn(serverId: string, userId: string): Promise<boo
 /** Claude limit resets are not offered on this server: as if the route did not exist for Claude. */
 function refuseClaudeLimitResetOff(res: Parameters<typeof refuse>[0]): void {
   refuse(res, 404, { code: "claude_limit_reset_disabled", error: "Claude limit resets cannot be used from here on this server." });
-}
-
-/**
- * A Claude limit reset spent by someone other than the person who connected
- * this Computer: an owner or admin may view the resets but not spend them.
- */
-function refuseClaudeLimitResetOwnerOnly(res: Parameters<typeof refuse>[0]): void {
-  refuse(res, 403, { code: "claude_limit_reset_owner_only", error: "Only the person who connected this Computer can use its Claude limit resets." });
 }
 
 /**
@@ -225,6 +231,138 @@ async function claudeLimitResetsView(req: { params: { id: string }; userId?: str
   return availability === "computer_offline" ? undefined : availability;
 }
 
+/** An upgrade's wait (RUNTIME_UPGRADE_RELAY_BUDGET_MS) runs past the default operation TTL: kept two minutes longer than it. */
+const RUNTIME_UPGRADE_OPERATION_TTL_SECONDS = Math.ceil(RUNTIME_UPGRADE_RELAY_BUDGET_MS / 1000) + 120;
+
+/** `runtime_upgrade_button` for this server; an evaluation failure reads as off. */
+async function runtimeUpgradeOn(serverId: string, userId: string): Promise<boolean> {
+  try {
+    return (await evaluateFeatureFlag({ key: RUNTIME_UPGRADE_FEATURE_FLAG_KEY, serverId, userId })).enabled;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether the web offers Upgrade for this Computer's runtimes: the flag is on,
+ * the viewer may sign its runtimes in, and the Computer is online and runs a
+ * runtime's updater (DAEMON_CAPABILITY_RUNTIME_UPGRADE). Offered: the runtimes
+ * its last status report named upgradable (possibly none), with the update
+ * checks it reported for them (`updates`, possibly none); null otherwise.
+ */
+async function runtimeUpgradeOffered(req: { params: { id: string }; userId?: string; app: { get(name: string): unknown } }, actors: Actors): Promise<{ runtimes: RuntimeAuthRuntime[]; updates: RuntimeUpdates } | null> {
+  if (!actors.canAct) return null;
+  if (!await runtimeUpgradeOn(req.params.id, req.userId!)) return null;
+  if ((await orchestratorOf(req).runtimeUpgradeAvailability(actors.machine.id)) !== "ok") return null;
+  const [runtimes, updates] = await Promise.all([
+    runtimeAuthService.getUpgradable(actors.machine.id),
+    runtimeAuthService.getUpdates(actors.machine.id),
+  ]);
+  return { runtimes, updates };
+}
+
+/** The update checks of the runtimes Upgrade is offered for, and only theirs. */
+function offeredRuntimeUpdates(updates: RuntimeUpdates, offered: readonly RuntimeAuthRuntime[]): RuntimeUpdates {
+  return Object.fromEntries(offered.flatMap((runtime) => (updates[runtime] ? [[runtime, updates[runtime]]] : [])));
+}
+
+/** An install's wait (RUNTIME_INSTALL_RELAY_BUDGET_MS) runs past the default operation TTL: kept two minutes longer than it. */
+const RUNTIME_INSTALL_OPERATION_TTL_SECONDS = Math.ceil(RUNTIME_INSTALL_RELAY_BUDGET_MS / 1000) + 120;
+
+/** `runtime_install_button` for this server; an evaluation failure reads as off. */
+async function runtimeInstallOn(serverId: string, userId: string): Promise<boolean> {
+  try {
+    return (await evaluateFeatureFlag({ key: RUNTIME_INSTALL_FEATURE_FLAG_KEY, serverId, userId })).enabled;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether the web offers Install for this Computer's runtimes: as Upgrade
+ * (`runtimeUpgradeOffered`), the flag is on, the viewer may act (`canAct`),
+ * and the Computer is online and runs a runtime's installer
+ * (DAEMON_CAPABILITY_RUNTIME_INSTALL). Offered: the runtimes its last status
+ * report named installable (possibly none); null otherwise.
+ */
+async function runtimeInstallOffered(req: { params: { id: string }; userId?: string; app: { get(name: string): unknown } }, actors: Actors): Promise<RuntimeAuthRuntime[] | null> {
+  if (!actors.canAct) return null;
+  if (!await runtimeInstallOn(req.params.id, req.userId!)) return null;
+  if ((await orchestratorOf(req).runtimeInstallAvailability(actors.machine.id)) !== "ok") return null;
+  return runtimeAuthService.getInstallable(actors.machine.id);
+}
+
+/**
+ * The checks both Install routes make before anything reaches the Computer,
+ * in Upgrade's order: the flag (404), a runtime id (404), the Computer on
+ * this server (404), the same people as Upgrade (`resolveActors(...).canAct`,
+ * 403), a server-gated runtime not offered here (404), and a Computer online
+ * that runs installers (409). Answers and returns null on a refusal.
+ */
+async function installRouteTarget(
+  req: { params: { id: string; machineId: string; runtime: string }; userId?: string; app: { get(name: string): unknown } },
+  res: express.Response,
+): Promise<{ actors: Actors; runtime: RuntimeAuthRuntime; orchestrator: AgentOrchestrator } | null> {
+  if (!await runtimeInstallOn(req.params.id, req.userId!)) {
+    refuse(res, 404, { code: "runtime_install_disabled", error: "Runtimes cannot be installed from here on this server." });
+    return null;
+  }
+  const runtime = isRuntimeAuthRuntime(req.params.runtime) ? req.params.runtime : null;
+  if (!runtime) {
+    refuse(res, 404, { code: "runtime_not_installable", error: "This runtime cannot be installed from the web." });
+    return null;
+  }
+  const actors = await resolveActors(req.params.id, req.params.machineId, req.userId!);
+  if (!actors) {
+    refuse(res, 404, { code: "computer_not_found", error: "This Computer was not found on this server." });
+    return null;
+  }
+  if (!actors.canAct) {
+    refuse(res, 403, { code: "forbidden", error: "Only the person who connected this Computer, or an owner or admin, can install its runtimes." });
+    return null;
+  }
+  const orchestrator = orchestratorOf(req);
+  // An older daemon drops the request: say so rather than wait.
+  const availability = await orchestrator.runtimeInstallAvailability(actors.machine.id);
+  if (availability !== "ok") {
+    refuse(res, 409, availability === "computer_offline"
+      ? availabilityErrorBody("computer_offline")
+      : { code: "computer_upgrade_required", error: "Update this Computer to install runtimes from here." });
+    return null;
+  }
+  return { actors, runtime, orchestrator };
+}
+
+/** How an install attempt ended, for its audit record: the Computer's outcome, or the request's end without one. */
+type RuntimeInstallEnd = RuntimeInstallResult | { kind: "computer_timeout" | "computer_offline" | "request_failed" };
+
+/**
+ * The Computer's record of an install attempt (`computer.runtime_install`):
+ * who pressed it, the runtime, how it ended. Best effort: the install has
+ * already happened (or not) on the Computer.
+ */
+async function recordRuntimeInstall(serverId: string, actors: Actors, userId: string, runtime: RuntimeAuthRuntime, end: RuntimeInstallEnd): Promise<void> {
+  await recordIntegrationAuditEventBestEffort({
+    serverId,
+    eventType: "computer.runtime_install",
+    outcome: end.kind === "installed" || end.kind === "already_installed" ? "success" : "failure",
+    source: "web",
+    actor: { type: "human", id: userId },
+    target: { type: "machine", id: actors.machine.id },
+    metadata: {
+      machineId: actors.machine.id,
+      machineName: actors.machine.name,
+      runtime,
+      result: end.kind,
+      ...((end.kind === "installed" || end.kind === "already_installed") && end.version ? { version: end.version } : {}),
+      ...(end.kind === "failed" ? { exitCode: end.exitCode } : {}),
+      ...(end.kind === "unsupported" ? { reason: end.reason } : {}),
+      ...(end.kind === "error" ? { errorCode: end.code } : {}),
+      ...serverAuditContextMetadata({ actorRole: actors.callerRole }),
+    },
+  });
+}
+
 /**
  * Whether the cached usage leaves any doubt that the Claude account is NOT at
  * its 5-hour limit. The Computer refuses a read there without the person's
@@ -240,6 +378,15 @@ async function claudeAtFiveHourLimit(machineId: string): Promise<boolean> {
   }
 }
 
+/** Whether a read on this Computer already spent its Claude account's 5-hour reset; a failed lookup forwards the use as before. */
+async function claudeFiveHourSpentByRead(machineId: string): Promise<boolean> {
+  try {
+    return await claudeLimitResetReadSpentGuard.readSpent(machineId);
+  } catch {
+    return false;
+  }
+}
+
 export function mountRuntimeAuthRoutes(serverRouter: Router): void {
   serverRouter.get("/:id/machines/:machineId/runtime-auth", async (req, res) => {
     try {
@@ -252,29 +399,38 @@ export function mountRuntimeAuthRoutes(serverRouter: Router): void {
         res.status(403).json({ error: "Only the person who connected this Computer, or an owner or admin, can see its runtime accounts" });
         return;
       }
-      const [status, availability, hidden, claudeLimitResets] = await Promise.all([
+      const [status, availability, claudeLimitResets, runtimeUpgrade, runtimeInstall] = await Promise.all([
         runtimeAuthService.getStatus(actors.machine.id),
         orchestratorOf(req).runtimeAuthAvailability(actors.machine.id),
-        runtimesNotOffered(req.params.id, req.userId!),
         claudeLimitResetsView(req, actors),
+        runtimeUpgradeOffered(req, actors),
+        runtimeInstallOffered(req, actors),
       ]);
       res.setHeader("Cache-Control", "private, no-store");
       res.json({
-        // A runtime this server does not offer (Antigravity without its flag) is left out of both,
-        // so the web shows it as before: no card, no orange badge, no sign-in notice.
-        status: offeredStatus(status, hidden),
+        status,
         availability: actors.attached || availability.state !== "ok" ? availability.state : "computer_not_attached",
         // The runtimes this Computer signs in from here: the web offers an upgrade instead for the others.
-        runtimes: availability.state === "ok" ? availability.runtimes.filter((runtime) => !hidden.has(runtime)) : [],
+        runtimes: availability.state === "ok" ? availability.runtimes : [],
         // The ones it also signs out from here (Antigravity only from a daemon that runs its logout).
-        logoutRuntimes: availability.state === "ok" ? availability.logoutRuntimes.filter((runtime) => !hidden.has(runtime)) : [],
+        logoutRuntimes: availability.state === "ok" ? availability.logoutRuntimes : [],
         canAct: actors.canAct,
-        // Behind claude_limit_reset: the card's "View available resets" for Claude Code, or why there is none.
+        // Behind claude_limit_reset_v2: the card's "View available resets" for Claude Code, or why there is none.
         ...(claudeLimitResets ? { claudeLimitResets } : {}),
-        // What this viewer may do with them: only the person who connected the Computer spends its
-        // Claude resets (a use, or a read with consent at the 5-hour limit). Advisory for the web;
-        // the limit-reset routes enforce it either way.
-        ...(claudeLimitResets ? { claudeLimitResetAccess: { canUse: actors.attachedByCaller, canConsent: actors.attachedByCaller } } : {}),
+        // What this viewer may do with them: the same people who see them (the person who connected
+        // the Computer, or an owner or admin) use them and consent to a read at the 5-hour limit, so
+        // both are true whenever it is sent. Kept for older web bundles, which read `canUse` (false
+        // there meant a view-only list); the limit-reset routes enforce the rule either way.
+        ...(claudeLimitResets ? { claudeLimitResetAccess: { canUse: actors.canAct, canConsent: actors.canAct } } : {}),
+        // Behind runtime_upgrade_button, for a viewer who may act on a Computer that runs a runtime's updater:
+        // Upgrade is offered, on the card for each runtime the Computer reports it can upgrade.
+        // `runtimeUpdates`: the Computer's update check for those it checked, so Upgrade is offered only where there is a newer version.
+        ...(runtimeUpgrade
+          ? { runtimeUpgrade: true, upgradableRuntimes: runtimeUpgrade.runtimes, runtimeUpdates: offeredRuntimeUpdates(runtimeUpgrade.updates, runtimeUpgrade.runtimes) }
+          : {}),
+        // Behind runtime_install_button, for the same viewers as Upgrade on a Computer that runs a runtime's installer:
+        // Install is offered on the "not installed" chip of each runtime the Computer reports it can install.
+        ...(runtimeInstall ? { runtimeInstall: true, installableRuntimes: runtimeInstall } : {}),
       });
     } catch {
       res.status(500).json({ error: "Failed to read runtime accounts" });
@@ -313,11 +469,6 @@ export function mountRuntimeAuthRoutes(serverRouter: Router): void {
       }
       if (!actors.canAct) {
         res.status(403).json({ error: "Only the person who connected this Computer, or an owner or admin, can sign its runtimes in or out" });
-        return;
-      }
-      // Antigravity without its flag on this server: as if it could not be signed in at all.
-      if (isRuntimeAuthServerGated(runtime) && (await runtimesNotOffered(req.params.id, req.userId!)).has(runtime)) {
-        refuse(res, 404, { code: "runtime_auth_not_offered", error: "This runtime cannot be signed in from the web on this server." });
         return;
       }
       const orchestrator = orchestratorOf(req);
@@ -458,11 +609,6 @@ export function mountRuntimeAuthRoutes(serverRouter: Router): void {
         res.status(403).json({ error: "Only the person who connected this Computer, or an owner or admin, can sign its runtimes in or out" });
         return;
       }
-      // Antigravity without its flag on this server: answered as its login is there.
-      if (isRuntimeAuthServerGated(runtime) && (await runtimesNotOffered(req.params.id, req.userId!)).has(runtime)) {
-        refuse(res, 404, { code: "runtime_auth_not_offered", error: "This runtime cannot be signed out from the web on this server." });
-        return;
-      }
       const orchestrator = orchestratorOf(req);
       const availability = await orchestrator.runtimeAuthAvailability(actors.machine.id);
       if (availability.state !== "ok") {
@@ -508,12 +654,204 @@ export function mountRuntimeAuthRoutes(serverRouter: Router): void {
   });
 
   /**
+   * Upgrade a runtime's command-line tool on this Computer (behind
+   * runtime_upgrade_button): the Computer runs the runtime's own updater
+   * through OAR, then re-detects its runtimes. Same people as a sign-in.
+   * Answers the outcome's kind and versions (never the updater's output);
+   * waits on the Computer like a logout, for up to
+   * RUNTIME_UPGRADE_RELAY_BUDGET_MS (`respondAsync` for the web).
+   */
+  serverRouter.post("/:id/machines/:machineId/runtimes/:runtime/upgrade", async (req, res) => {
+    try {
+      if (!await runtimeUpgradeOn(req.params.id, req.userId!)) {
+        refuse(res, 404, { code: "runtime_upgrade_disabled", error: "Runtimes cannot be upgraded from here on this server." });
+        return;
+      }
+      const runtime = isRuntimeAuthRuntime(req.params.runtime) ? req.params.runtime : null;
+      if (!runtime) {
+        refuse(res, 404, { code: "runtime_not_upgradable", error: "This runtime cannot be upgraded from the web." });
+        return;
+      }
+      const actors = await resolveActors(req.params.id, req.params.machineId, req.userId!);
+      if (!actors) {
+        refuse(res, 404, { code: "computer_not_found", error: "This Computer was not found on this server." });
+        return;
+      }
+      if (!actors.canAct) {
+        refuse(res, 403, { code: "forbidden", error: "Only the person who connected this Computer, or an owner or admin, can upgrade its runtimes." });
+        return;
+      }
+      const orchestrator = orchestratorOf(req);
+      // An older daemon drops the request: say so rather than wait.
+      const availability = await orchestrator.runtimeUpgradeAvailability(actors.machine.id);
+      if (availability !== "ok") {
+        refuse(res, 409, availability === "computer_offline"
+          ? availabilityErrorBody("computer_offline")
+          : { code: "computer_upgrade_required", error: "Update this Computer to upgrade its runtimes from here." });
+        return;
+      }
+      // Each upgrade runs the runtime's own updater there: bounded per person and Computer, like a sign-out.
+      if (!await runtimeAuthService.allowProviderRequest("upgrade", req.userId!, actors.machine.id)) {
+        addTraceEvent("runtime.upgrade.rate_limited", { machine_id: actors.machine.id, runtime, user_id: req.userId });
+        sendRateLimited(res);
+        return;
+      }
+      await answerMachineWait(req, res, async (): Promise<MachineOperationAnswer> => {
+        const startedAt = Date.now();
+        try {
+          const reply = await orchestrator.upgradeRuntime(actors.machine.id, runtime);
+          const parsed = runtimeUpgradeResultSchema.safeParse(reply);
+          // An answer this server cannot read: an internal error, and nothing of it is traced or passed on.
+          const result: RuntimeUpgradeResult = parsed.success ? parsed.data : { kind: "error", code: "internal" };
+          if (!parsed.success) addTraceEvent("runtime.upgrade.result_rejected", { machine_id: actors.machine.id, runtime });
+          addTraceEvent("runtime.upgrade.result", {
+            machine_id: actors.machine.id,
+            runtime,
+            user_id: req.userId,
+            outcome: result.kind,
+            ...(result.kind === "upgraded" ? { from_version: result.from, to_version: result.to } : {}),
+            ...("reason" in result ? { reason: result.reason } : {}),
+            ...("code" in result ? { code: result.code } : {}),
+            duration_ms: Date.now() - startedAt,
+          });
+          return { status: 200, body: { result } };
+        } catch (error) {
+          if (error instanceof RouteFailureError && error.subkind === "daemon_timeout") {
+            return { status: 504, body: { error: "The Computer did not answer in time. Check the runtime's version on the Computer page.", code: "computer_timeout" } };
+          }
+          if (error instanceof RouteFailureError && error.subkind === "daemon_offline") {
+            return { status: 409, body: availabilityErrorBody("computer_offline") };
+          }
+          throw error;
+        }
+      }, { status: 500, body: { error: "Failed to upgrade the runtime" } }, RUNTIME_UPGRADE_OPERATION_TTL_SECONDS);
+    } catch {
+      res.status(500).json({ error: "Failed to upgrade the runtime" });
+    }
+  });
+
+  /**
+   * What installing a runtime on this Computer would run (behind
+   * runtime_install_button), read there without running anything: OAR's
+   * plan, its steps as the person reads them and the vendor's page, or why
+   * it will not run one (with the steps to run by hand where OAR gives them).
+   * Same people as Upgrade. Only the runtime goes to the Computer. The steps
+   * can name a home path: answered to this person only, never traced.
+   */
+  serverRouter.post("/:id/machines/:machineId/runtimes/:runtime/install-plan", async (req, res) => {
+    try {
+      const target = await installRouteTarget(req, res);
+      if (!target) return;
+      const { actors, runtime, orchestrator } = target;
+      // Read each time Install is pressed, running nothing there: the provider list's bound, counted apart.
+      if (!await runtimeAuthService.allowProviderRequest("install_plan", req.userId!, actors.machine.id)) {
+        addTraceEvent("runtime.install.plan.rate_limited", { machine_id: actors.machine.id, runtime, user_id: req.userId });
+        sendRateLimited(res);
+        return;
+      }
+      await answerMachineWait(req, res, async (): Promise<MachineOperationAnswer> => {
+        try {
+          const reply = await orchestrator.runtimeInstallPlan(actors.machine.id, runtime);
+          const parsed = runtimeInstallPlanSchema.safeParse(reply);
+          // An answer this server cannot read: an internal error, and nothing of it is traced or passed on.
+          const plan: RuntimeInstallPlan = parsed.success ? parsed.data : { kind: "error", code: "internal" };
+          addTraceEvent("runtime.install.plan.result", {
+            machine_id: actors.machine.id,
+            runtime,
+            user_id: req.userId,
+            outcome: plan.kind,
+            ...(plan.kind === "unsupported" ? { reason: plan.reason } : {}),
+            rejected: !parsed.success,
+          });
+          return { status: 200, body: { plan } };
+        } catch (error) {
+          if (error instanceof RouteFailureError && error.subkind === "daemon_timeout") {
+            return { status: 504, body: { error: "The Computer did not answer in time. Try again.", code: "computer_timeout" } };
+          }
+          if (error instanceof RouteFailureError && error.subkind === "daemon_offline") {
+            return { status: 409, body: availabilityErrorBody("computer_offline") };
+          }
+          throw error;
+        }
+      }, { status: 500, body: { error: "Failed to read the install plan" } });
+    } catch {
+      res.status(500).json({ error: "Failed to read the install plan" });
+    }
+  });
+
+  /**
+   * Install a runtime that is not on this Computer (behind
+   * runtime_install_button): the Computer runs the runtime's own official
+   * installer through OAR (the plan the person was shown), then re-detects
+   * its runtimes. Same people as Upgrade. The body names nothing: the
+   * runtime is the path's, and what runs is OAR's there. Answers the
+   * outcome's kind and version (never the installer's output); waits on the
+   * Computer for up to RUNTIME_INSTALL_RELAY_BUDGET_MS (`respondAsync` for
+   * the web). Every attempt that reaches the Computer is recorded
+   * (`computer.runtime_install`) once it ends.
+   */
+  serverRouter.post("/:id/machines/:machineId/runtimes/:runtime/install", async (req, res) => {
+    try {
+      const target = await installRouteTarget(req, res);
+      if (!target) return;
+      const { actors, runtime, orchestrator } = target;
+      // Each install runs the runtime's own installer there: bounded per person and Computer, like an upgrade.
+      if (!await runtimeAuthService.allowProviderRequest("install", req.userId!, actors.machine.id)) {
+        addTraceEvent("runtime.install.rate_limited", { machine_id: actors.machine.id, runtime, user_id: req.userId });
+        sendRateLimited(res);
+        return;
+      }
+      const serverId = req.params.id;
+      const userId = req.userId!;
+      await answerMachineWait(req, res, async (): Promise<MachineOperationAnswer> => {
+        const startedAt = Date.now();
+        let end: RuntimeInstallEnd = { kind: "request_failed" };
+        try {
+          const reply = await orchestrator.installRuntime(actors.machine.id, runtime);
+          const parsed = runtimeInstallResultSchema.safeParse(reply);
+          // An answer this server cannot read: an internal error, and nothing of it is traced or passed on.
+          const result: RuntimeInstallResult = parsed.success ? parsed.data : { kind: "error", code: "internal" };
+          if (!parsed.success) addTraceEvent("runtime.install.result_rejected", { machine_id: actors.machine.id, runtime });
+          end = result;
+          addTraceEvent("runtime.install.result", {
+            machine_id: actors.machine.id,
+            runtime,
+            user_id: userId,
+            outcome: result.kind,
+            ...(result.kind === "installed" || result.kind === "already_installed" ? { version: result.version } : {}),
+            ...("reason" in result ? { reason: result.reason } : {}),
+            ...("code" in result ? { code: result.code } : {}),
+            duration_ms: Date.now() - startedAt,
+          });
+          return { status: 200, body: { result } };
+        } catch (error) {
+          if (error instanceof RouteFailureError && error.subkind === "daemon_timeout") {
+            end = { kind: "computer_timeout" };
+            return { status: 504, body: { error: "The Computer did not answer in time. Check the Computer page for the runtime.", code: "computer_timeout" } };
+          }
+          if (error instanceof RouteFailureError && error.subkind === "daemon_offline") {
+            end = { kind: "computer_offline" };
+            return { status: 409, body: availabilityErrorBody("computer_offline") };
+          }
+          throw error;
+        } finally {
+          await recordRuntimeInstall(serverId, actors, userId, runtime, end);
+        }
+      }, { status: 500, body: { error: "Failed to install the runtime" } }, RUNTIME_INSTALL_OPERATION_TTL_SECONDS);
+    } catch {
+      res.status(500).json({ error: "Failed to install the runtime" });
+    }
+  });
+
+  /**
    * Spend one of a runtime account's limit resets on this Computer (Codex,
-   * OAR `redeemLimitReset`; Claude, by `kind`, behind claude_limit_reset).
-   * Codex: same people as a sign-out, the human who attached it or a server
-   * owner or admin. Claude: only the human who attached it (its Claude
-   * account is usually their own subscription; an owner or admin is refused
-   * `claude_limit_reset_owner_only`). Never an agent (`/api/servers`
+   * OAR `redeemLimitReset`; Claude, by `kind`, behind claude_limit_reset_v2).
+   * Same people as a sign-out, for Claude as for Codex: the human who
+   * attached it or a server owner or admin. When the Computer answers that a
+   * reset was spent (`reset`, `already_redeemed`, or `unknown` with
+   * `fiveHourSpent`: spentLimitReset) to anyone but the human who attached
+   * it, the use is audited (`computer.limit_reset_used_by_other`) and that
+   * human is emailed; no other answer, refusal or timeout is. Never an agent (`/api/servers`
    * takes a user session only, and no agent route or CLI command reaches it).
    * The web mints `idempotencyKey` once per confirmed click and sends it again
    * to retry an attempt whose outcome it never learned; it is passed through
@@ -525,7 +863,9 @@ export function mountRuntimeAuthRoutes(serverRouter: Router): void {
    * older web bundle cannot read (`fiveHourSpent`, the Claude driver's
    * unsupported reasons) answer only a request that named a kind, which only
    * the current bundle sends: a Claude redeem without one is refused here,
-   * and a Codex redeem never yields them.
+   * and a Codex redeem never yields them. `onboarding_required` (OAR 0.114)
+   * is newer than some of those bundles, so it answers only a request whose
+   * body says `onboardingRequiredReason: true`.
    */
   /**
    * A Computer wait started with `respondAsync` (answerMachineWait): pending,
@@ -576,11 +916,8 @@ export function mountRuntimeAuthRoutes(serverRouter: Router): void {
       const kind = isRuntimeLimitResetKind(kindValue) ? kindValue : undefined;
       if (provider === "claude") {
         if (!await claudeLimitResetOn(req.params.id, req.userId!)) {
+          addTraceEvent("runtime_account_usage.limit_reset.result", { machine_id: actors.machine.id, provider, user_id: req.userId, outcome: "disabled" });
           refuseClaudeLimitResetOff(res);
-          return;
-        }
-        if (!actors.attachedByCaller) {
-          refuseClaudeLimitResetOwnerOnly(res);
           return;
         }
         if (!kind) {
@@ -593,6 +930,8 @@ export function mountRuntimeAuthRoutes(serverRouter: Router): void {
         ? await orchestrator.claudeLimitResetAvailability(actors.machine.id)
         : await orchestrator.runtimeLimitResetAvailability(actors.machine.id);
       if (availability !== "ok") {
+        // Refused before the Computer is asked: still one result event, so a daily count sees every attempt.
+        addTraceEvent("runtime_account_usage.limit_reset.result", { machine_id: actors.machine.id, provider, user_id: req.userId, outcome: availability === "computer_offline" ? "computer_offline" : "upgrade_required" });
         refuse(res, 409, availability === "computer_offline"
           ? { code: "computer_offline", error: "This Computer is offline." }
           : { code: "computer_upgrade_required", error: "Upgrade this Computer to use a limit reset from here." });
@@ -600,19 +939,33 @@ export function mountRuntimeAuthRoutes(serverRouter: Router): void {
       }
       if (!actors.attached) {
         // Its usage cannot be cached without an attaching human, so the reset's effect could not be shown.
+        addTraceEvent("runtime_account_usage.limit_reset.result", { machine_id: actors.machine.id, provider, user_id: req.userId, outcome: "not_attached" });
         sendAvailabilityError(res, "computer_not_attached");
+        return;
+      }
+      // A read already spent this account's 5-hour reset (Claude's older program): a later 5-hour use,
+      // whatever its key, is answered here and never reaches the Computer (a card still showing the limit).
+      if (provider === "claude" && kind === "five_hour" && await claudeFiveHourSpentByRead(actors.machine.id)) {
+        addTraceEvent("runtime_account_usage.limit_reset.read_spent_guard", { machine_id: actors.machine.id, provider, user_id: req.userId, reset_kind: kind });
+        addTraceEvent("runtime_account_usage.limit_reset.result", { machine_id: actors.machine.id, provider, user_id: req.userId, outcome: "nothing_to_reset", reset_kind: kind, guard: "read_spent_five_hour", snapshot: "none" });
+        await answerMachineWait(req, res, async (): Promise<MachineOperationAnswer> => ({
+          status: 200,
+          body: { result: { kind: "nothing_to_reset" } satisfies RuntimeLimitResetResult, snapshot: null },
+        }), { status: 500, body: { error: "Failed to use a limit reset" } });
         return;
       }
       // Each redeem runs on the Computer (Claude's starts Claude Code): bounded per person and Computer.
       if (!await runtimeAuthService.allowClaudeLimitResetRequest(provider === "claude" ? "redeem" : "codex_redeem", req.userId!, actors.machine.id)) {
         addTraceEvent("runtime_account_usage.limit_reset.rate_limited", { machine_id: actors.machine.id, provider, user_id: req.userId });
+        addTraceEvent("runtime_account_usage.limit_reset.result", { machine_id: actors.machine.id, provider, user_id: req.userId, outcome: "rate_limited" });
         sendRateLimited(res);
         return;
       }
       const clientCapabilities = req.header(RAFT_CLIENT_CAPABILITIES_HEADER);
       await answerMachineWait(req, res, async (): Promise<MachineOperationAnswer> => {
         try {
-          const reply = await orchestrator.redeemRuntimeLimitReset(actors.machine.id, provider, idempotencyKey, kind);
+          // The page reads `unsupported: onboarding_required` only when it says so (an older bundle's strict parse refuses it).
+          const reply = await orchestrator.redeemRuntimeLimitReset(actors.machine.id, provider, idempotencyKey, kind, req.body?.onboardingRequiredReason === true);
           const parsedResult = runtimeLimitResetResultSchema.safeParse(reply.result);
           // An answer this server cannot read says nothing about whether a reset was spent.
           const result: RuntimeLimitResetResult = parsedResult.success ? parsedResult.data : { kind: "unknown" };
@@ -627,8 +980,22 @@ export function mountRuntimeAuthRoutes(serverRouter: Router): void {
             ...(result.kind === "unknown" && result.fiveHourSpent ? { five_hour_spent: true } : {}),
             snapshot: parsedSnapshot?.success ? "fresh" : "none",
           });
-          // Window scopes only to a client that reads them (an older web bundle's strict parse would drop the snapshot).
-          const snapshot = parsedSnapshot?.success ? runtimeAccountUsageSnapshotForClient(parsedSnapshot.data, clientCapabilities) : null;
+          // An owner or admin spent a reset of a Computer someone else connected: audited, and that person is told.
+          const spent = spentLimitReset(result, kind);
+          if (spent && !actors.attachedByCaller && actors.attachedBy) {
+            await recordLimitResetUsedByOther({
+              serverId: req.params.id,
+              machine: { id: actors.machine.id, name: actors.machine.name },
+              provider,
+              ...spent,
+              usedByUserId: req.userId!,
+              usedByRole: actors.callerRole,
+              connectorUserId: actors.attachedBy,
+            });
+          }
+          // Window scopes only to a client that reads them (an older web bundle's strict parse would drop the snapshot),
+          // and no agent the person may not find (a personal assistant's own account folder).
+          const snapshot = parsedSnapshot?.success ? await runtimeAccountUsageSnapshotForViewer(parsedSnapshot.data, clientCapabilities, req.userId!) : null;
           return { status: 200, body: { result, snapshot } };
         } catch (error) {
           if (error instanceof RouteFailureError && error.subkind === "daemon_timeout") {
@@ -649,14 +1016,15 @@ export function mountRuntimeAuthRoutes(serverRouter: Router): void {
 
   /**
    * Read which limit resets a Claude account holds on this Computer, behind
-   * claude_limit_reset: its daemon opens Claude Code's own command for each
+   * claude_limit_reset_v2: its daemon opens Claude Code's own command for each
    * kind and cancels it. Only on a person's click (POST: on Claude's older
    * program, opening the command at the 5-hour limit spends that reset), by
    * the person who connected the Computer or an owner or admin.
    * `consent: true` says the person accepted that; without it the Computer
-   * refuses a read at the limit (`unsupported: consent_required`). A read
-   * with consent can spend the 5-hour reset, so only the person who
-   * connected the Computer may send one (`claude_limit_reset_owner_only`).
+   * refuses a read at the limit (`unsupported: consent_required`). The same
+   * people may send a read with consent, as they may use a reset; a read on
+   * which the older program spent the 5-hour reset (`fiveHourSpent`) by
+   * anyone but the human who attached it is audited and emailed like a use.
    * Answers the Computer's read, or `unknown` when it cannot be read. A new route: only a web bundle that
    * reads these shapes calls it.
    */
@@ -685,10 +1053,6 @@ export function mountRuntimeAuthRoutes(serverRouter: Router): void {
         refuse(res, 400, { code: "invalid_consent", error: "consent is true or false." });
         return;
       }
-      if (consent === true && !actors.attachedByCaller) {
-        refuseClaudeLimitResetOwnerOnly(res);
-        return;
-      }
       const orchestrator = orchestratorOf(req);
       const availability = await orchestrator.claudeLimitResetAvailability(actors.machine.id);
       if (availability !== "ok") {
@@ -715,6 +1079,8 @@ export function mountRuntimeAuthRoutes(serverRouter: Router): void {
             atFiveHourLimit,
             atFiveHourLimitConsent: consent === true,
             includeFiveHour: true,
+            // As the redeem: only a page that says it reads `onboarding_required` may get it.
+            onboardingRequiredReason: req.body?.onboardingRequiredReason === true,
           });
           const parsed = runtimeLimitResetsReadResultSchema.safeParse(reply.result);
           // An answer this server cannot read: nothing is known, not even whether the older program spent its reset.
@@ -732,6 +1098,26 @@ export function mountRuntimeAuthRoutes(serverRouter: Router): void {
               available_kinds: result.resets.filter((reset) => reset.state === "available").length,
             } : {}),
           });
+          if (result.kind === "read" && result.fiveHourSpent) {
+            // A later 5-hour use of this account is answered by the server (claudeLimitResetReadSpentGuard).
+            await claudeLimitResetReadSpentGuard.recordReadSpent(actors.machine.id).catch((error: unknown) => {
+              addTraceEvent("runtime_account_usage.limit_resets.read.spent_record_failed", { machine_id: actors.machine.id, error_class: error instanceof Error ? error.name : typeof error });
+            });
+          }
+          // Opening the list spent the account's 5-hour reset (Claude's older program): a use, as a redeem's.
+          if (result.kind === "read" && result.fiveHourSpent && !actors.attachedByCaller && actors.attachedBy) {
+            await recordLimitResetUsedByOther({
+              serverId: req.params.id,
+              machine: { id: actors.machine.id, name: actors.machine.name },
+              provider: usageProvider,
+              resetKind: "five_hour",
+              via: "read",
+              answer: "five_hour_spent",
+              usedByUserId: req.userId!,
+              usedByRole: actors.callerRole,
+              connectorUserId: actors.attachedBy,
+            });
+          }
           return { status: 200, body: { result } };
         } catch (error) {
           if (error instanceof RouteFailureError && error.subkind === "daemon_timeout") {

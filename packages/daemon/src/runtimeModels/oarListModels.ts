@@ -3,11 +3,14 @@ import type { AvailableInstallation, ListModelsResult, ModelEntry, ModelLister }
 import {
   clearClockTimeout,
   setClockTimeout,
+  sanitizeRuntimeEffortUnavailableReason,
   sanitizeRuntimeModelUnavailable,
   type RuntimeModelInfo,
   type RuntimeModelSourceOutcome,
   type RuntimeModelUnavailable,
 } from "@botiverse/raft-shared";
+
+import { scrubRuntimeErrorDiagnosticText } from "../runtimeErrorDiagnostics";
 
 /**
  * Reads a runtime's usable-now model list through OAR's `listModels` and
@@ -20,7 +23,10 @@ import {
  *                                   `unavailable`, never in `models`)
  *  - `ok` with no models         → `no_models`
  *  - `unauthenticated`           → retryable `runtime_not_authenticated`
- *  - `unsupported`               → `onUnsupported` (the caller decides: for
+ *  - `unsupported` with code
+ *    `version_unsupported`       → retryable `protocol_unsupported` (the CLI
+ *                                   is too old; the form says to update it)
+ *  - other `unsupported`         → `onUnsupported` (the caller decides: for
  *                                   some runtimes OAR uses it for a transient
  *                                   state, not a structural absence)
  *  - our deadline fires first    → retryable `detect_timeout`
@@ -41,6 +47,14 @@ export interface OarModelSourceInput {
   readonly label: (entry: ModelEntry) => string;
   /** Keep OAR's effort menu only when the runtime's launch path applies the chosen effort. */
   readonly keepReasoningEfforts: boolean;
+  /**
+   * With `keepReasoningEfforts`: report an entry's explicit empty
+   * `effortLevels` as `supportedReasoningEfforts: []` (the model takes no
+   * effort) instead of omitting it (not reported). Only for a lister that
+   * marks "no effort" that way itself (Antigravity); OAR's own `[]` is not
+   * read as "none" for the others.
+   */
+  readonly keepEmptyEffortLevels?: boolean;
   /**
    * Report the entry OAR marks `default` (the model a session uses with no
    * `model` set) as the set's `default`, so the form preselects it. Opt-in:
@@ -109,13 +123,15 @@ export async function detectModelSourceViaOar(input: OarModelSourceInput): Promi
     case "unauthenticated":
       return { kind: "error", retryable: true, code: "runtime_not_authenticated" };
     case "unsupported":
-      return input.onUnsupported(result.reason);
+      return result.code === "version_unsupported"
+        ? { kind: "error", retryable: true, code: "protocol_unsupported" }
+        : input.onUnsupported(result.reason);
   }
 }
 
 export function projectOarModelEntries(
   entries: readonly ModelEntry[],
-  options: Pick<OarModelSourceInput, "label" | "keepReasoningEfforts">,
+  options: Pick<OarModelSourceInput, "label" | "keepReasoningEfforts" | "keepEmptyEffortLevels">,
 ): RuntimeModelInfo[] {
   const models: RuntimeModelInfo[] = [];
   const seen = new Set<string>();
@@ -123,11 +139,19 @@ export function projectOarModelEntries(
     // A listed-but-refused model is not launchable; offering it would fail at start.
     if (entry.disabled || seen.has(entry.id)) continue;
     seen.add(entry.id);
-    const efforts = options.keepReasoningEfforts && entry.effortLevels?.length ? [...entry.effortLevels] : undefined;
+    const listed = options.keepReasoningEfforts ? entry.effortLevels : undefined;
+    const efforts = listed?.length ? [...listed] : listed && options.keepEmptyEffortLevels ? [] : undefined;
+    // OAR >= 0.111: the listing could not read this model's menu (not "none").
+    // Runtime-supplied text that everyone who opens the form sees: scrubbed
+    // (paths, tokens, emails) like a start failure, then bounded.
+    const effortUnavailableReason = options.keepReasoningEfforts && !efforts && typeof entry.effortUnavailableReason === "string"
+      ? sanitizeRuntimeEffortUnavailableReason(scrubRuntimeErrorDiagnosticText(entry.effortUnavailableReason))
+      : undefined;
     models.push({
       id: entry.id,
       label: options.label(entry),
       ...(efforts ? { supportedReasoningEfforts: efforts } : {}),
+      ...(effortUnavailableReason ? { reasoningEffortUnavailableReason: effortUnavailableReason } : {}),
       ...(efforts && entry.defaultEffort && efforts.includes(entry.defaultEffort)
         ? { defaultReasoningEffort: entry.defaultEffort }
         : {}),

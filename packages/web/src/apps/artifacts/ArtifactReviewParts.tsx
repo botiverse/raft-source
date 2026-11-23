@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { RefObject } from "react";
 // oxlint-disable-next-line react-doctor/no-flush-sync -- Edit draws and focuses its box within the tap: iOS Safari opens the keyboard only for a focus made during the tap event itself (focus plan rule 5 decision).
 import { flushSync } from "react-dom";
 import { useIntl } from "react-intl";
@@ -22,12 +23,13 @@ import {
   Separator,
   Text,
 } from "@botiverse/raft-ui";
-import { AddCommentIcon, CommentIcon } from "@botiverse/ricons";
+import { CommentIcon } from "@botiverse/ricons";
 import { CommentCard, CommentCardMeta, PopoverBody, PanelSplitAction, PanelSplitActionMenu, PanelSplitActionToggle } from "@botiverse/raft-ui/wip";
 
 import Tooltip from "../../components/ui/Tooltip";
-import { useMediaQuery } from "../../hooks/effectPrimitives";
+import { useArtifactPhoneLayout } from "./artifactPhoneLayout";
 import { requestFocus } from "../../utils/focusRequest";
+import { animationFramesOf, isElementNode, useOwnerDocument } from "../../utils/ownerDocument";
 import { DraftPlace } from "./ArtifactActorParts";
 import { ArtifactCardShell } from "./ArtifactCardShell";
 import { ArtifactCommentText } from "./ArtifactCommentText";
@@ -38,7 +40,7 @@ import { trackArtifactViewerAction } from "./artifactAnalytics";
 import ArtifactCommentBox from "./ArtifactCommentBox";
 import { ArtifactDismissableBox } from "./ArtifactDismissableBox";
 import type { ArtifactCommentBoxBatch } from "./ArtifactCommentBox";
-import { PHONE_QUERY } from "./artifactPhoneHistory";
+import { useCommentWritesOnArtifact } from "./artifactCommentWrites";
 import { useArtifactReview } from "./ArtifactReviewContext";
 import type { ArtifactDraftView } from "./ArtifactReviewContext";
 import { ArtifactReviewSheet } from "./ArtifactReviewPanel";
@@ -55,15 +57,24 @@ const DRAFT_BODY_ELEMENT = <div />;
 const FIELD_SELECTOR = "input, textarea, select, [contenteditable]:not([contenteditable='false'])";
 
 /**
- * The header's comment-mode controls: the Comment button (its left half enters and leaves comment
- * mode, pressed there and in C) and its ▾, which carries the comment count and whose Show All
- * Comments (N) opens the comment list in any state (co-design S8), then, where `onReportDisplay`
- * (the reader may comment), Doesn't display well here (#proj-workspace:#243). No drafts count and no Submit
- * here (#proj-workspace:#148): the bar at the content's foot says how many drafts wait and sends
- * them (ArtifactReviewBar). Shown at every width: on a phone they are how comment mode is reached.
- * Drafts that didn't load say so here, with Retry (no count is better than a wrong one). A review
- * posted brings focus back to the Comment button (the panel that had it is gone). No how-to hint on
- * touch (#proj-workspace:#250).
+ * The header's comment-mode controls, by what the page shown can do (#proj-workspace:#323; the fixed sets of the
+ * one-line head, M3):
+ *
+ * - A page with blocks to pick (an HTML page): the Comment split button. Its left half enters and leaves comment
+ *   mode, pressed there and in C, drawn with the drafts bar's Pick Element icon (it says what it does: point at a
+ *   thing on the page); its ▾ carries the comment count and holds Show All Comments (N), which opens the comment list
+ *   in any state (co-design S8), then, where `onReportDisplay` (the reader may comment), Doesn't display well here
+ *   (#proj-workspace:#243).
+ * - A page with none (Markdown, a PDF, a file Raft draws: its text is selected to comment either way): one Comments
+ *   button, the comment icon and the count, pressed while the list is open; it opens the list with its box focused,
+ *   for a comment on the whole Artifact (useCommentWritesOnArtifact). Its Show All would be the same press, so there
+ *   is no ▾; Doesn't display well here is ⋯'s (ArtifactSurfaceActions). While comment mode or C is on (from an HTML
+ *   page of the same set) it is the split, so it can be left.
+ *
+ * No drafts count and no Submit here (#proj-workspace:#148): the bar at the content's foot says how many drafts wait
+ * and sends them (ArtifactReviewBar). Shown at every width: on a phone they are how comment mode is reached.
+ * Drafts that didn't load say so here, with Retry (no count is better than a wrong one). A review posted brings focus
+ * back to the Comment button (the panel that had it is gone). No how-to hint on touch (#proj-workspace:#250).
  */
 export function ArtifactReviewHeaderActions({ onReportDisplay = null }: {
   /** Doesn't display well here: opens the comment list's box with what it measured (useArtifactDisplayReport); null: not offered. */
@@ -73,16 +84,20 @@ export function ArtifactReviewHeaderActions({ onReportDisplay = null }: {
   const review = useArtifactReview();
   const toggleRef = useRef<HTMLButtonElement | null>(null);
   const toggleFocus = review?.toggleFocus ?? 0;
+  // The frames of the window the head is drawn in: an object window's draw while the main window is hidden (#337 PR3).
+  const ownDoc = useOwnerDocument();
   useEffect(() => {
     if (toggleFocus === 0) return;
     // After the frame: the comment list the review opens focuses its region when it mounts, in the same commit. The
     // send's answer: not from a text field or dialog the person went to while it was out (focus plan rule 2).
-    const frame = requestAnimationFrame(() => requestFocus(() => toggleRef.current, { reason: "async" }));
-    return () => cancelAnimationFrame(frame);
-  }, [toggleFocus]);
+    const frames = animationFramesOf(ownDoc);
+    const frame = frames.requestAnimationFrame(() => requestFocus(() => toggleRef.current, { reason: "async" }));
+    return () => frames.cancelAnimationFrame(frame);
+  }, [toggleFocus, ownDoc]);
   const enterCommenting = review?.enterCommenting;
   const done = review?.done;
   const toggle = useCallback((pressed: boolean) => (pressed ? enterCommenting?.() : done?.()), [enterCommenting, done]);
+  const write = useCommentWritesOnArtifact();
   if (!review?.canComment) return null;
   const { status } = review;
   const label = formatMessage({ id: "artifacts.review.comment" });
@@ -93,21 +108,49 @@ export function ArtifactReviewHeaderActions({ onReportDisplay = null }: {
           {formatMessage({ id: "artifacts.review.draftsLoadFailedRetry" })}
         </Button>
       ) : null}
-      <PanelSplitAction aria-label={formatMessage({ id: "artifacts.comments.title" })}>
-        <Tooltip content={label}>
-          <PanelSplitActionToggle
-            ref={toggleRef}
-            aria-label={label}
-            pressed={status !== "browsing"}
-            onPressedChange={toggle}
-            data-testid="artifact-review-toggle"
-          >
-            <AddCommentIcon />
-          </PanelSplitActionToggle>
-        </Tooltip>
-        <CommentMenu onReportDisplay={onReportDisplay} />
-      </PanelSplitAction>
+      {write ? <CommentsWriteButton write={write} buttonRef={toggleRef} /> : (
+        <PanelSplitAction aria-label={formatMessage({ id: "artifacts.comments.title" })}>
+          <Tooltip content={label}>
+            <PanelSplitActionToggle
+              ref={toggleRef}
+              aria-label={label}
+              pressed={status !== "browsing"}
+              onPressedChange={toggle}
+              data-testid="artifact-review-toggle"
+            >
+              <SquareDashedMousePointer />
+            </PanelSplitActionToggle>
+          </Tooltip>
+          <CommentMenu onReportDisplay={onReportDisplay} />
+        </PanelSplitAction>
+      )}
     </>
+  );
+}
+
+/**
+ * The one Comments button of a page with no block to pick (above): the comment icon and the count (none at 0), named
+ * as the Comments toggle is ("Comments (3)"), pressed while the list is open. Pressed, it opens the list with its foot
+ * box focused (`write`); pressed again, it closes the list.
+ */
+function CommentsWriteButton({ write, buttonRef }: { write: () => void; buttonRef: RefObject<HTMLButtonElement | null> }) {
+  const { formatMessage } = useIntl();
+  const comments = useArtifactComments();
+  const setPanelOpen = comments?.setPanelOpen;
+  const open = comments?.panelOpen ?? false;
+  const count = comments ? commentCount(comments) : 0;
+  const press = useCallback((pressed: boolean) => {
+    if (pressed) write();
+    else setPanelOpen?.(false);
+  }, [write, setPanelOpen]);
+  const label = count > 0 ? formatMessage({ id: "artifacts.comments.toggle" }, { count }) : formatMessage({ id: "artifacts.comments.title" });
+  return (
+    <Tooltip content={label}>
+      <PanelToggleAction ref={buttonRef} aria-label={label} pressed={open} onPressedChange={press} data-testid="artifact-review-write">
+        <CommentIcon />
+        {count > 0 ? <CommentCountNumber count={count} /> : null}
+      </PanelToggleAction>
+    </Tooltip>
   );
 }
 
@@ -231,7 +274,8 @@ export function ArtifactReviewBar({ kind }: { kind: string }) {
   const keys = offered && (canUndo || canRedo) && !stepping;
   // Through the registry (fixed keys: the standard editing ones), heard wherever the focus is on the surface but
   // never in a field (registry textField "never"; a select or contenteditable too), whose own undo it is.
-  const notInField = (event: KeyboardEvent) => !(event.target instanceof Element && event.target.closest(FIELD_SELECTOR));
+  // An element of any window (an object window's are another realm's).
+  const notInField = (event: KeyboardEvent) => !(isElementNode(event.target) && event.target.closest(FIELD_SELECTOR));
   useShortcut("undo-draft", (event) => {
     if (!canUndo || !notInField(event)) return false;
     void undo?.();
@@ -373,7 +417,7 @@ function DiscardAllInPlace({ count, disabled }: { count: number; disabled: boole
  */
 export function ArtifactReviewLayer({ viewer }: { viewer: () => HTMLElement | null }) {
   const review = useArtifactReview();
-  const phone = useMediaQuery(PHONE_QUERY);
+  const phone = useArtifactPhoneLayout();
   if (!review) return null;
   const { selection, status, draftView } = review;
   return (
@@ -401,7 +445,7 @@ function DraftView({ view, phone }: { view: ArtifactDraftView; phone: boolean })
   const review = useArtifactReview()!;
   const comments = useArtifactComments();
   const armed = useArmed(view.fromPage ? view.key : null);
-  const anchor = useMemo(() => anchorAt(view.rect), [view.rect]);
+  const anchor = useMemo(() => anchorAt(view.rect, view.liveAnchor), [view.rect, view.liveAnchor]);
   const [editing, setEditing] = useState(false);
   const moreButton = useRef<HTMLButtonElement>(null);
   // The view closes while its delete is being confirmed; asked (and so cancelled, the draft still
@@ -431,7 +475,8 @@ function DraftView({ view, phone }: { view: ArtifactDraftView; phone: boolean })
     element: () => popup.current,
     close: (by) => {
       closeDraftView();
-      if (by === "escape" && document.activeElement === document.body) leftFrame.current?.focus({ preventScroll: true });
+      const doc = popup.current?.ownerDocument ?? leftFrame.current?.ownerDocument ?? document;
+      if (by === "escape" && doc.activeElement === doc.body) leftFrame.current?.focus({ preventScroll: true });
     },
   });
   const close = useCallback((open: boolean, details?: { reason?: string; event?: Event }) => {

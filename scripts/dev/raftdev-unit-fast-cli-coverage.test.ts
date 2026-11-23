@@ -31,19 +31,31 @@ type CliExecutionManifest = {
 const expectedCliCaseCounts = new Map([
   ["src/client.test.ts", 29],
   ["src/commands/action/prepare.test.ts", 35],
-  ["src/commands/message/_format.test.ts", 79],
+  ["src/commands/message/_format.test.ts", 81],
   ["src/commands/task/_format.test.ts", 37],
   ["src/parserOutput.test.ts", 3],
 ]);
 
-function unitFastBody(workflow: string): string {
-  const header = /^  unit-fast:\s*$/m.exec(workflow);
-  assert.ok(header, "test.yml must define the required unit-fast job");
+function jobBody(workflow: string, name: string): string {
+  const header = new RegExp(`^  ${name}:\\s*$`, "m").exec(workflow);
+  assert.ok(header, `test.yml must define the ${name} job`);
 
   const bodyStart = header.index + header[0].length;
   const following = workflow.slice(bodyStart);
   const nextJob = /^  [A-Za-z0-9_-]+:\s*$/m.exec(following);
   return following.slice(0, nextJob?.index ?? following.length);
+}
+
+// The required `unit-fast` check is a fan-in over parallel lanes; the package
+// loop lives in its `unit-fast-packages` lane, which the gate must require.
+function unitFastBody(workflow: string): string {
+  const gate = jobBody(workflow, "unit-fast");
+  assert.match(
+    gate,
+    /^    needs: \[[^\]]*\bunit-fast-packages\b[^\]]*\]$/m,
+    "the required unit-fast gate must need the unit-fast-packages lane",
+  );
+  return jobBody(workflow, "unit-fast-packages");
 }
 
 function assertPackageInUnitFastLoop(workflow: string, pkg: string): void {
@@ -170,7 +182,7 @@ test("required unit-fast runs the package-owned trace-client suite", { skip: inS
 
 test("removing the trace-client package from unit-fast makes the contract fail", { skip: inSourceSnapshot }, () => {
   const workflow = readFileSync(workflowPath, "utf8");
-  const mutated = workflow.replace(" @botiverse/raft-trace-client @botiverse/raft-web", " @botiverse/raft-web");
+  const mutated = workflow.replace(" @botiverse/raft-trace-client @botiverse/raft-runtime-form", " @botiverse/raft-runtime-form");
   if (mutated === workflow) {
     throw new Error("directed mutation could not remove the trace-client package token");
   }

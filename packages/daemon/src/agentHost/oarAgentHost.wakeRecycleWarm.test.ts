@@ -15,7 +15,7 @@
 // `release` / `stopAgent` and the quiet timer fires a `not_idle` cancel for a
 // session already gone.
 import assert from "node:assert/strict";
-import type { Session } from "@botiverse/oar";
+import type { Session, SessionCapabilityDeclaration } from "@botiverse/oar";
 import type { ScriptedTask, ScriptedTurn } from "@botiverse/oar/testing";
 import type { AgentConfig } from "@botiverse/raft-shared";
 import { createAgentAppInboxStore } from "../agentAppInbox";
@@ -23,6 +23,9 @@ import { REMINDER_AGENT_INBOX_REGISTRY } from "../apps/reminder/inboxDefinition"
 import { harness, makeConfig, message, request, until, type Harness } from "../testing/oarAgentHostHarness";
 import type { WarmRecycleTimers } from "../wakeRecycleWarm";
 import { buildWarmRecycleNotice } from "../wakeSessionRecycle";
+
+/** An installation OAR declares turn-end compaction's inputs for (the harness's Grok declares no trustworthy window). */
+const COMPACTING: SessionCapabilityDeclaration = { manualCompaction: { kind: "supported", activeTurn: "reject" }, contextUsage: { tokens: true, contextWindow: true } };
 
 const SESSION_ID = "sess-warm";
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -248,7 +251,7 @@ const bothFlags = (quietMs: string): Partial<AgentConfig> => ({
 test("§6.5: with both flags on, a mark a delivery cancelled leaves the next turn end to compaction (no starvation)", async () => {
   const compactCalls: number[] = [];
   const quiet = manualTimers();
-  const h = await harness({ wrapSession: countingCompact(compactCalls), deps: { warmRecycleTimers: quiet.timers } });
+  const h = await harness({ wrapSession: countingCompact(compactCalls), deps: { warmRecycleTimers: quiet.timers, sessionCapabilities: async () => COMPACTING } });
   try {
     await firstTurn(h, bothFlags("400"));
     await until(() => marks(h).length === 1, "the mark");
@@ -270,7 +273,7 @@ test("§6.5: the warm flag off leaves turn-end compaction as it was: compacted a
   for (const overrides of [{ wakeRecycleWarm: undefined }, { wakeRecycleWarm: false }] as Partial<AgentConfig>[]) {
     const compactCalls: number[] = [];
     const quiet = manualTimers();
-    const h = await harness({ wrapSession: countingCompact(compactCalls), deps: { warmRecycleTimers: quiet.timers } });
+    const h = await harness({ wrapSession: countingCompact(compactCalls), deps: { warmRecycleTimers: quiet.timers, sessionCapabilities: async () => COMPACTING } });
     try {
       await firstTurn(h, { ...bothFlags("150"), ...overrides });
       await until(() => compactCalls.length === 1, "compacted at the turn end");

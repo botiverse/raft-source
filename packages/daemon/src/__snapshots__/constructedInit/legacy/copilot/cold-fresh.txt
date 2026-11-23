@@ -1,0 +1,29 @@
+host: legacy
+runtime: copilot
+scenario: cold-fresh
+promptSource: cold_start_with_memory
+note: driver: supportsNativeStandingPrompt=false standingPromptRefreshesOnResume=false deferSpawnUntilMessage=false
+
+## standing prompt
+= standing-prompt.md
+
+## carrier
+SpawnContext.standingPrompt: = standing prompt
+
+## first input (272 chars, sha256:9327173a0ef2f592, the standing prompt written as ⟪STANDING_PROMPT⟫)
+⟪STANDING_PROMPT⟫
+
+<memory-index file="MEMORY.md" size="0.1 KB" complete="true" note="no need to re-read MEMORY.md unless you change it">
+# Alice
+
+## Role
+Keeps the release notes
+
+## Key Knowledge
+- No notes yet.
+
+## Active Context
+- First startup.
+</memory-index>
+
+Start.

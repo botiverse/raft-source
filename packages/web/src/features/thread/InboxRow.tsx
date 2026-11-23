@@ -32,6 +32,7 @@ import AppBadge from "../../components/agent/AppBadge";
 import { itemFilterChannelLabel } from "../../components/thread/inboxChannelFilter";
 import { dismissLayerProps } from "../../components/ui/dismissLayer";
 import { useLongPress } from "../../hooks/useLongPress";
+import type { LongPressCoords } from "../../hooks/useLongPress";
 import { ROW_SWIPE_ACTION_ATTR, ROW_SWIPE_BUTTON_WIDTH, useRowSwipe } from "../../hooks/useRowSwipe";
 import { canMuteActivityRow, canSwipeActivityRowRead, canUnfollowActivityRow, toggleActivityRowRead } from "../../components/thread/inboxRowActions";
 import { delegatedByOf, formatDelegatedSender, isRetractedPreviewOf } from "../../components/message/delegatedMessage";
@@ -87,6 +88,12 @@ function renderActivityPreview(markdown: string, query: string, retractedLine?: 
     : <InlineMarkdownPreview markdown={markdown} />;
 }
 
+const NO_CHANNELS: Channel[] = [];
+
+function findRow(list: Channel[] | undefined, id: string | null | undefined): Channel | undefined {
+  return id ? list?.find((c) => c.id === id) : undefined;
+}
+
 function InboxRowImpl({ item, filter, searchQuery, taskV2, onOpen, onDone, swipe: rowSwipe, onContextMenu, onLongPress, focused, active, located, focusRef }: {
   item: ConversationInboxItem;
   filter: InboxFilter;
@@ -99,7 +106,7 @@ function InboxRowImpl({ item, filter, searchQuery, taskV2, onOpen, onDone, swipe
   swipe?: RowSwipeProps;
   onContextMenu: (e: React.MouseEvent, item: InboxItem) => void;
   /** Press-and-hold on a touch screen opens the same menu right-click opens. */
-  onLongPress: (coords: { x: number; y: number }, item: InboxItem) => void;
+  onLongPress: (coords: LongPressCoords, item: InboxItem) => void;
   /** The row a focus request (double-click, permalink) is for: scrolled to. */
   focused?: boolean;
   /** Open in col 3: raft-ui's active look, for as long as it is open. */
@@ -110,10 +117,19 @@ function InboxRowImpl({ item, filter, searchQuery, taskV2, onOpen, onDone, swipe
   focusRef?: React.Ref<HTMLDivElement>;
 }) {
   const { formatMessage } = useIntl();
-  const channels = useChannelStore((s) => s.channels);
-  const dmChannels = useChannelStore((s) => s.dmChannels);
-  const loungeChannels = useChannelStore((s) => s.loungeChannels);
-  const agents = useAgentStore((s) => s.agents);
+  // Every store lookup below is of this row's own conversation (the channel,
+  // the DM, or a thread's parent). Each list is narrowed to that one row, so a
+  // patch to another conversation (a `channel:updated` flood, #532) does not
+  // re-render every row: a selector answering the same record bails out.
+  const rowConversationId = item.kind === "thread" ? item.parentChannelId : item.channelId;
+  const rowListChannel = useChannelStore((s) => findRow(s.channels, rowConversationId));
+  const rowDmChannel = useChannelStore((s) => findRow(s.dmChannels, rowConversationId));
+  const rowLoungeChannel = useChannelStore((s) => findRow(s.loungeChannels, rowConversationId));
+  const { channels, dmChannels, loungeChannels } = useMemo(() => ({
+    channels: rowListChannel ? [rowListChannel] : NO_CHANNELS,
+    dmChannels: rowDmChannel ? [rowDmChannel] : NO_CHANNELS,
+    loungeChannels: rowLoungeChannel ? [rowLoungeChannel] : NO_CHANNELS,
+  }), [rowDmChannel, rowListChannel, rowLoungeChannel]);
   const members = useServerStore((s) => s.members);
   const serverPublicPageLive = useServerStore((s) => s.current?.publicPageLive === true);
   const currentUser = useAuthStore((s) => s.user);
@@ -138,7 +154,6 @@ function InboxRowImpl({ item, filter, searchQuery, taskV2, onOpen, onDone, swipe
   // Agent Lounge: a Lounge row (or a thread in one) is named and drawn as
   // its agent's Lounge. The Lounge is in neither list above: the store's
   // Lounge slice, or the agent DM row that carries it, says whose it is.
-  const rowConversationId = item.kind === "thread" ? item.parentChannelId : item.channelId;
   const rowLoungeAgentId = useLoungeAgentId(item.kind === "dm" ? null : rowConversationId);
   const rowLoungeTitle = useLoungeTitle(
     rowLoungeAgentId,
@@ -158,7 +173,8 @@ function InboxRowImpl({ item, filter, searchQuery, taskV2, onOpen, onDone, swipe
 
   const senderType = item.kind === "thread" ? item.latestActivitySenderType : item.kind === "mention_action" ? "system" : item.lastMessageSenderType;
   const senderId = item.kind === "thread" ? item.latestActivitySenderId : item.kind === "mention_action" ? "" : item.lastMessageSenderId;
-  const senderAgent = senderType === "agent" ? agents.find((a) => a.id === senderId) : null;
+  // The sender alone, not the agent list: another agent's change keeps this row.
+  const senderAgent = useAgentStore((s) => (senderType === "agent" ? s.agents.find((a) => a.id === senderId) : null));
   const senderMember = senderType === "user"
     ? resolveMessageSenderMemberFromList({ senderType, senderId }, members, currentUser) ?? null
     : null;
@@ -359,7 +375,7 @@ function InboxRowImpl({ item, filter, searchQuery, taskV2, onOpen, onDone, swipe
   const bodyId = useId();
   const statusId = useId();
   const timeId = useId();
-  const handleLongPress = useCallback((coords: { x: number; y: number }) => onLongPress(coords, item), [item, onLongPress]);
+  const handleLongPress = useCallback((coords: LongPressCoords) => onLongPress(coords, item), [item, onLongPress]);
   const longPress = useLongPress(handleLongPress);
   const longPressSuppressClickRef = longPress.suppressClickRef;
   const { onTouchStart: handleTouchStart, onTouchMove: handleTouchMove, onTouchEnd: handleTouchEnd, onTouchCancel: handleTouchCancel } = longPress;

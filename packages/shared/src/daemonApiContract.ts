@@ -223,6 +223,17 @@ export const daemonApiProcJobSchema = lazySchema("daemonApiProcJobSchema", () =>
   logPath: z.string(),
   scope: z.enum(["none", "agent", "created"]),
   adopted: z.boolean(),
+  /** The job's memory cap in bytes; absent from an older daemon, null: none. */
+  memoryMaxBytes: z.number().int().positive().nullable().optional(),
+  /**
+   * `memory_limit`: the Computer stopped the job at its cap; `owner_stop`: a
+   * person stopped it from the Computer page. Absent from an
+   * older daemon; a string, so a reason a newer daemon adds never fails a
+   * listing (the CLI shows only the ones it knows).
+   */
+  exitReason: z.string().nullable().optional(),
+  /** With `owner_stop`: the handle of the person who stopped it; absent from an older daemon, null: not known. */
+  stoppedBy: z.string().nullable().optional(),
 }));
 
 export const daemonApiProcListResponseSchema = lazySchema("daemonApiProcListResponseSchema", () => passthroughObject({

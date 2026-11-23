@@ -36,6 +36,12 @@ export const AGENT_MIGRATION_TERMINAL_FAILURE_CODES = [
    * ./agentMigrationUserIgnore); the detail code carries the reason.
    */
   "MIGRATION_USER_IGNORE_WRITE_FAILED",
+  /**
+   * The source had no permission to read MEMORY.md, notes/ or the workspace
+   * itself, which a move never leaves behind; the raw message names the path
+   * (`:path=<URI-encoded>`). Other unreadable paths are skipped, not failed.
+   */
+  "MIGRATION_WORKSPACE_KEY_PATH_UNREADABLE",
 ] as const;
 
 export type AgentMigrationTerminalFailureCode =

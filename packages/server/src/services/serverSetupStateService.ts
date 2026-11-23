@@ -754,15 +754,17 @@ export class DrizzleServerSetupStateRepository implements ServerSetupStateReposi
 }
 
 async function resolveOnboardingAgentFacts(serverId: string): Promise<Pick<ServerSetupLiveFacts, "officialOnboardingAgent" | "hostedOnboardingAgent">> {
+  // The official Cindy only. The joiner greeter (`onboardingAgentId`) is never read here: an
+  // ordinary agent picked as greeter must not make Cindy "unusable".
   const [server] = await getDb()
-    .select({ onboardingAgentId: servers.onboardingAgentId })
+    .select({ officialOnboardingAgentId: servers.officialOnboardingAgentId })
     .from(servers)
     .where(and(eq(servers.id, serverId), isNull(servers.deletedAt)));
 
   let officialOnboardingAgent: OfficialOnboardingAgentState = "unknown";
   let hostedOnboardingAgent: HostedCindySetupState | null = null;
   if (server) {
-    if (!server.onboardingAgentId) {
+    if (!server.officialOnboardingAgentId) {
       officialOnboardingAgent = "missing";
     } else {
       const [agent] = await getDb()
@@ -784,14 +786,14 @@ async function resolveOnboardingAgentFacts(serverId: string): Promise<Pick<Serve
           ),
         )
         .where(and(
-          eq(agents.id, server.onboardingAgentId),
+          eq(agents.id, server.officialOnboardingAgentId),
           eq(agents.serverId, serverId),
           isNull(agents.deletedAt),
         ));
 
       // A hosted Cindy has no machine; she is usable by her hosted state instead.
       hostedOnboardingAgent = agent && !agent.machineId && isExternalAgentRuntime(agent.runtime)
-        ? await resolveHostedCindySetupState({ serverId, agentId: server.onboardingAgentId })
+        ? await resolveHostedCindySetupState({ serverId, agentId: server.officialOnboardingAgentId })
         : null;
       officialOnboardingAgent = agent
         && (agent.machineId || hostedOnboardingAgent === "usable")
@@ -1006,12 +1008,14 @@ export async function resolveServerSetupLiveFacts(
           : "not_ready";
   }
 
-  // The commit point. Deleted Cindy counts because `servers.onboarding_agent_id` remains
-  // populated; non-onboarding agents do not. This mirrors the top-level invariant:
+  // The commit point. Deleted Cindy counts because `servers.official_onboarding_agent_id`
+  // remains populated; non-onboarding agents do not. This mirrors the top-level invariant:
   // onboarding crosses the checkpoint when the official onboarding agent is created, not
-  // when a dev/bootstrap server happens to contain some other agent row.
+  // when a dev/bootstrap server happens to contain some other agent row. A greeter pointer
+  // counts too, only because `resetServerSetup`'s own guard still refuses on it: never offer
+  // a reset that guard would refuse.
   const [server] = await getDb()
-    .select({ onboardingAgentId: servers.onboardingAgentId })
+    .select({ onboardingAgentId: servers.onboardingAgentId, officialOnboardingAgentId: servers.officialOnboardingAgentId })
     .from(servers)
     .where(and(eq(servers.id, serverId), isNull(servers.deletedAt)));
 
@@ -1020,7 +1024,7 @@ export async function resolveServerSetupLiveFacts(
     computer,
     hasConnectedComputer,
     offlineComputers,
-    everHadAgent: !!server?.onboardingAgentId,
+    everHadAgent: !!(server?.officialOnboardingAgentId || server?.onboardingAgentId),
     runtime,
     runtimeOptions,
     ...(await resolveOnboardingAgentFacts(serverId)),

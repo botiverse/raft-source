@@ -1,0 +1,20 @@
+host: legacy
+runtime: gemini
+scenario: resume-standing-prompt-changed
+promptSource: resume_empty_with_standing_prompt_update
+note: driver: supportsNativeStandingPrompt=false standingPromptRefreshesOnResume=false deferSpawnUntilMessage=false
+
+## standing prompt
+= standing-prompt.md
+
+## carrier
+SpawnContext.standingPrompt: = standing prompt
+
+## first input (426 chars, sha256:20bf79ee8dc06298, the standing prompt written as ⟪STANDING_PROMPT⟫)
+<raft-standing-prompt-update>
+Raft updated your standing instructions since this session started. The instructions below replace the earlier standing instructions (system or developer prompt) for the rest of this session; where they differ, follow these.
+
+⟪STANDING_PROMPT⟫
+</raft-standing-prompt-update>
+
+No new messages while you were away. If you were in the middle of a task, continue it; otherwise stop (no reply needed).

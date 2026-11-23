@@ -161,3 +161,15 @@ test("task #266: the time zone drops with the description on a sender's second a
   assert.deepEqual(second.messages.map((m) => m.sender_timezone), ["Europe/Berlin", null]);
   ledger.close();
 });
+
+test("an outside sender's origin is printed every time; a description beside it still elides", () => {
+  createCliLedger();
+  const ledger = openSenderLedger(dbPath, "ctx-A")!;
+  const outside = (id: string) => message({ message_id: id, sender_name: "Ada", sender_description: null, sender_origin: { kind: "other_server", server_slug: "acme" } });
+  const { messages } = elideSeenSendersInMessages([outside("a"), message(), outside("b"), message()], ledger.claim);
+  assert.deepEqual(messages.map((m) => m.sender_origin ?? null), [
+    { kind: "other_server", server_slug: "acme" }, null, { kind: "other_server", server_slug: "acme" }, null,
+  ]);
+  assert.deepEqual(messages.map((m) => m.sender_description ?? null), [null, "Writer. Long profile description.", null, null]);
+  ledger.close();
+});

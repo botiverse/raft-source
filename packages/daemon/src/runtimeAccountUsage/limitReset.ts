@@ -29,9 +29,11 @@ import { loadOarRuntime } from "../oarLoader";
  * Limit resets through OAR (docs/contracts/runtime-account-usage.md): Codex's
  * `redeemLimitReset`, and Claude's `inspectLimitResets` / `redeemLimitReset`
  * (OAR 0.102 drives Claude Code's own `/limit-reset`; the daemon no longer
- * has a driver of its own). This file only chooses the call and maps OAR's
- * answer onto the wire Raft already speaks, so older servers and web bundles
- * keep reading it.
+ * has a driver of its own; OAR 0.114 also completes Claude Code's first-run
+ * onboarding on a Computer where it was never opened). This file only
+ * chooses the call and maps OAR's answer onto the wire Raft already speaks,
+ * so older servers and web bundles keep reading it; the one newer reason,
+ * `onboarding_required`, goes only to a server that asked for it.
  */
 
 /**
@@ -65,20 +67,32 @@ export type RuntimeLimitResetReport = {
   claudeVersion?: string;
   /** On `not_attempted:startup_failed`, OAR's word for the last screen (OAR 0.104); never screen text. */
   startupScreen?: LimitResetStartupScreen;
+  /** OAR completed Claude Code's first-run onboarding during this call (OAR 0.114), whatever the answer. */
+  onboardingCompleted?: true;
 };
 
 /**
- * `kind` is the Claude reset kind the person clicked, absent for every other
- * provider. `observe` hears what OAR answered before the mapping, for telemetry.
+ * Whether the server reads `unsupported: onboarding_required` (the request's
+ * `onboardingRequiredReason`). Absent or false: that answer is the wire's
+ * `not_attempted`, as an older server reads it.
  */
+type OnboardingRequiredReason = { onboardingRequiredReason?: boolean };
+
+/** What the redeem message asked for beside the key. */
+export type RuntimeLimitResetRedeemInput = OnboardingRequiredReason & {
+  /** The Claude reset kind the person clicked, absent for every other provider. */
+  kind?: RuntimeLimitResetKind;
+};
+
+/** `observe` hears what OAR answered before the mapping, for telemetry. */
 export type RuntimeLimitResetRedeemer = (
   provider: RuntimeAccountUsageProvider,
   idempotencyKey: RuntimeLimitResetIdempotencyKey,
-  kind?: RuntimeLimitResetKind,
+  input: RuntimeLimitResetRedeemInput,
   observe?: (report: RuntimeLimitResetReport) => void,
 ) => Promise<RuntimeLimitResetResult>;
 
-export type RuntimeLimitResetsReadInput = {
+export type RuntimeLimitResetsReadInput = OnboardingRequiredReason & {
   /** What the server's cached usage says; anything but `false` counts as at the 5-hour limit. */
   atFiveHourLimit: boolean;
   atFiveHourLimitConsent: boolean;
@@ -131,6 +145,11 @@ function unsupportedReasonOf(reason: LimitResetUnsupportedReason): WireUnsupport
       return reason;
     case "reset_id_required":
       return "capability_unavailable";
+    // OAR 0.110: the installed CLI is older than the one with this
+    // capability. On the wire (and to older servers) that is the same
+    // "this version can't do it" as the screen-based `unsupported_version`.
+    case "version_unsupported":
+      return "unsupported_version";
     default: {
       const _newer: never = reason;
       return "capability_unavailable";
@@ -143,23 +162,38 @@ function oarOutcomeOf(result: { kind: string; reason?: string }): string {
 }
 
 const STARTUP_SCREENS: ReadonlySet<string> = new Set<LimitResetStartupScreen>([
-  "blank", "exited", "trust_unrecognised", "dialog", "prompt_with_text", "no_banner", "unsettled", "unknown",
+  "blank", "exited", "onboarding", "trust_unrecognised", "dialog", "prompt_with_text", "no_banner", "unsettled", "unknown",
 ]);
 
 /**
- * What OAR saw when Claude Code failed to start (`startup`, OAR 0.104): the
- * screen's word (one Raft does not know yet reads as `unknown`) and the
- * banner's version, so a `startup_failed` on a real machine says which
- * screen stopped it.
+ * What OAR saw while starting Claude Code: whether it completed the
+ * first-run onboarding (OAR 0.114), and, when the start failed (`startup`,
+ * OAR 0.104), the screen's word (one Raft does not know yet reads as
+ * `unknown`) and the banner's version, so a `startup_failed` on a real
+ * machine says which screen stopped it.
  */
 function startupReportOf(result: LimitResetResult | LimitResetInspection): RuntimeLimitResetReport {
-  if (result.kind !== "not_attempted" || result.reason !== "startup_failed" || !result.startup) return {};
+  const onboarding = result.onboardingCompleted ? { onboardingCompleted: true as const } : {};
+  if (result.kind !== "not_attempted" || result.reason !== "startup_failed" || !result.startup) return onboarding;
   const { screen, version } = result.startup;
   const label = wireLabel(version);
   return {
+    ...onboarding,
     startupScreen: STARTUP_SCREENS.has(screen) ? screen : "unknown",
     ...(label ? { claudeVersion: label } : {}),
   };
+}
+
+/**
+ * OAR's `not_attempted` on the wire: nothing was sent that could spend. A
+ * start that stopped at a first-run page OAR does not complete
+ * (`startup.screen: "onboarding"`, OAR 0.114) is `onboarding_required` (open
+ * Claude Code once on the Computer) for a server that reads it; everything
+ * else, and that for an older server, `not_attempted`.
+ */
+function notAttemptedOf(result: LimitResetResult | LimitResetInspection, answers: OnboardingRequiredReason) {
+  const atOnboarding = result.kind === "not_attempted" && result.reason === "startup_failed" && result.startup?.screen === "onboarding";
+  return atOnboarding && answers.onboardingRequiredReason ? { kind: "unsupported", reason: "onboarding_required" } as const : NOT_ATTEMPTED;
 }
 
 /**
@@ -168,7 +202,9 @@ function startupReportOf(result: LimitResetResult | LimitResetInspection): Runti
  * - `not_attempted` (busy, deadline, usage_unread, startup_failed): nothing
  *   was sent that could spend; the wire's `unsupported: not_attempted`, which
  *   the web already words as "nothing was used, try again". OAR's reason
- *   reaches telemetry only (`oar_outcome`).
+ *   reaches telemetry only (`oar_outcome`), except a start stopped at a
+ *   first-run page (`notAttemptedOf`): `onboarding_required` when
+ *   `onboardingRequiredReason`.
  * - `unsupported: consent_required`: Claude without consent refused to type
  *   a kind other than `five_hour`, for one of two reasons OAR does not tell
  *   apart: usage shows (or cannot rule out) the 5-hour limit, or Claude
@@ -181,7 +217,10 @@ function startupReportOf(result: LimitResetResult | LimitResetInspection): Runti
  *   consent (the web offers only the 5-hour reset at the limit).
  * - `unknown`: may or may not have been spent, `fiveHourSpent` kept.
  */
-export function projectOarLimitResetResult(result: LimitResetResult, fiveHourLimit: ClaudeFiveHourLimit = "unknown"): RuntimeLimitResetResult {
+export function projectOarLimitResetResult(
+  result: LimitResetResult,
+  options: OnboardingRequiredReason & { fiveHourLimit?: ClaudeFiveHourLimit } = {},
+): RuntimeLimitResetResult {
   switch (result.kind) {
     case "reset":
     case "nothing_to_reset":
@@ -193,10 +232,10 @@ export function projectOarLimitResetResult(result: LimitResetResult, fiveHourLim
     case "unsupported": {
       const reason = unsupportedReasonOf(result.reason);
       if (reason !== "consent_required") return { kind: "unsupported", reason };
-      return fiveHourLimit === "not_at_limit" ? { kind: "unsupported", reason: "capability_unavailable" } : NOT_ATTEMPTED;
+      return options.fiveHourLimit === "not_at_limit" ? { kind: "unsupported", reason: "capability_unavailable" } : NOT_ATTEMPTED;
     }
     case "not_attempted":
-      return NOT_ATTEMPTED;
+      return notAttemptedOf(result, options);
     case "unknown":
       return result.fiveHourSpent ? { kind: "unknown", fiveHourSpent: true } : { kind: "unknown" };
     default: {
@@ -244,10 +283,10 @@ function kindStatusOf(kind: RuntimeLimitResetKind, status: LimitResetKindStatus 
  * OAR's inspection on the wire (`RuntimeLimitResetsReadResult`): one entry
  * per kind in RUNTIME_LIMIT_RESET_KINDS order (a kind OAR did not list is
  * `not_checked`, an id Raft does not know is left out), `not_attempted` as
- * the wire's `unsupported: not_attempted`. An answer the wire schema still
- * refuses is `unknown`.
+ * the redeem's (`notAttemptedOf`). An answer the wire schema still refuses is
+ * `unknown`.
  */
-export function projectOarLimitResetInspection(inspection: LimitResetInspection): RuntimeLimitResetsReadResult {
+export function projectOarLimitResetInspection(inspection: LimitResetInspection, options: OnboardingRequiredReason = {}): RuntimeLimitResetsReadResult {
   switch (inspection.kind) {
     case "inspected": {
       const byKind = new Map(inspection.resets.map((reset) => [reset.id, reset]));
@@ -265,7 +304,7 @@ export function projectOarLimitResetInspection(inspection: LimitResetInspection)
     case "unsupported":
       return { kind: "unsupported", reason: unsupportedReasonOf(inspection.reason) };
     case "not_attempted":
-      return NOT_ATTEMPTED;
+      return notAttemptedOf(inspection, options);
     case "unknown":
       return { kind: "unknown" };
     default: {
@@ -289,10 +328,9 @@ export function projectOarLimitResetInspection(inspection: LimitResetInspection)
  * - Any exception is `unknown`: whether a reset was spent is not known, so
  *   the person checks usage (Claude) or retries with the same key (Codex).
  */
-export async function redeemOarLimitReset(input: {
+export async function redeemOarLimitReset(input: RuntimeLimitResetRedeemInput & {
   provider: RuntimeAccountUsageProvider;
   idempotencyKey: RuntimeLimitResetIdempotencyKey;
-  kind?: RuntimeLimitResetKind;
   deps?: OarLimitResetDeps;
   observe?: (report: RuntimeLimitResetReport) => void;
 }): Promise<RuntimeLimitResetResult> {
@@ -314,7 +352,7 @@ export async function redeemOarLimitReset(input: {
     const fiveHourLimit = result.kind === "unsupported" && result.reason === "consent_required" && input.deps?.fiveHourLimit
       ? await input.deps.fiveHourLimit().catch((): ClaudeFiveHourLimit => "unknown")
       : "unknown";
-    return projectOarLimitResetResult(result, fiveHourLimit);
+    return projectOarLimitResetResult(result, { fiveHourLimit, onboardingRequiredReason: input.onboardingRequiredReason === true });
   } catch {
     input.observe?.({ oarOutcome: "rejected" });
     return { kind: "unknown" };
@@ -357,7 +395,7 @@ export async function readOarLimitResets(input: {
       ...(inspection.kind === "inspected" && inspection.version ? { claudeVersion: inspection.version } : {}),
       ...startupReportOf(inspection),
     });
-    return projectOarLimitResetInspection(inspection);
+    return projectOarLimitResetInspection(inspection, { onboardingRequiredReason: input.read.onboardingRequiredReason === true });
   } catch {
     input.observe?.({ oarOutcome: "rejected" });
     return { kind: "unknown" };
@@ -365,10 +403,10 @@ export async function readOarLimitResets(input: {
 }
 
 export function createRuntimeLimitResetRedeemer(deps?: OarLimitResetDeps): RuntimeLimitResetRedeemer {
-  return (provider, idempotencyKey, kind, observe) => redeemOarLimitReset({
+  return (provider, idempotencyKey, input, observe) => redeemOarLimitReset({
+    ...input,
     provider,
     idempotencyKey,
-    ...(kind ? { kind } : {}),
     ...(deps ? { deps } : {}),
     ...(observe ? { observe } : {}),
   });

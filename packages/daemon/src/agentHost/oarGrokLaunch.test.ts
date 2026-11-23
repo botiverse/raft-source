@@ -46,7 +46,9 @@ test("a grok launch: the driver's executable, standing prompt, model, effort and
 
 test("OAR upgrade check: OAR's grok no longer refuses endTurnProcessesOnAbort (OAR 0.99, #733)", async () => {
   const { grokRuntime } = await import("@botiverse/oar/runtimes/grok");
-  assert.equal(grokRuntime.refusedSessionOptions?.endTurnProcessesOnAbort, undefined);
+  const { oarInstalledSessionCapabilities } = await import("../oarLoader");
+  const caps = oarInstalledSessionCapabilities(grokRuntime, { kind: "available", via: "executable", command: "/opt/grok" });
+  assert.equal(caps.refusedSessionOptions?.endTurnProcessesOnAbort, undefined);
 });
 
 test("a grok launch attaches managed MCP as a session MCP server, given again on resume; none without it (#oar-raft:#8)", () => {

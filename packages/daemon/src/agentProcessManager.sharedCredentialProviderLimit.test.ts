@@ -14,6 +14,8 @@ import path from "node:path";
 import { asAxSurfaceText, type AgentConfig, type AgentMessage, type CredentialHoldReason, type MachineToServerMessage } from "@botiverse/raft-shared";
 import { AgentProcessManager } from "./agentProcessManager";
 import { setDaemonFetchImplForTests } from "./daemonFetch";
+import { ClaudeEventNormalizer } from "./drivers/claudeEventNormalizer";
+import { formatProviderLimitHeldDetail } from "./runtimeErrorDeliveryPolicy";
 import type { ParsedEvent, RuntimeDriver } from "./drivers/index";
 import { promptConfig } from "./testing/promptFixture";
 import { drainAgentManagerForTests } from "./testing/agentManagerTeardown";
@@ -431,23 +433,29 @@ test("C5: every usage-limit wording the classifier knows records the limit on th
   });
 }, 20_000);
 
-test("Q3: a reported reset 5 hours away holds the sign-in's agents for at most 1 hour", async () => {
+// #proj-runtime:#66: Q3 capped every wait at 1 hour, so a weekly limit was
+// retried every hour into the same refusal. A usable reported reset is now
+// waited for; only a wait without one keeps the cap.
+test("a reported reset 2 hours away holds the sign-in's agents until that reset, past the 1-hour cap of a wait without one", async () => {
   await withManager(async (h) => {
     await startIdle(h, A);
     await startIdle(h, B);
-    const resetsAt = new Date(Date.now() + 5 * 60 * MINUTE_MS).toISOString();
+    const resetsAtMs = Date.now() + 2 * 60 * MINUTE_MS;
+    const resetsAt = new Date(resetsAtMs).toISOString();
     await h.emit(A, [
       { kind: "error", message: QUOTA_TEXT, providerLimit: { kind: "quota_exhausted", resetsAt } },
       { kind: "turn_end", sessionId: `session-${A}` },
     ]);
-    const capMs = 60 * MINUTE_MS;
-    expect(h.m.lifecycleRecords.getProviderLimit(SHARED)).toMatchObject({ resetsAt, untilMs: Date.now() + capMs });
-    expect(h.m.agents.get(B)?.runtimeErrorDeliveryBackoff.untilMs).toBe(Date.now() + capMs);
+    expect(h.m.lifecycleRecords.getProviderLimit(SHARED)).toMatchObject({ resetsAt, untilMs: resetsAtMs });
+    expect(h.m.agents.get(B)?.runtimeErrorDeliveryBackoff.untilMs).toBe(resetsAtMs);
     expect(await deliveryReachesRuntime(h, B, "for B")).toBe(false);
     const bWrites = writes(h, B);
-    await vi.advanceTimersByTimeAsync(capMs);
+    await vi.advanceTimersByTimeAsync(61 * MINUTE_MS);
+    await settle();
+    expect(writes(h, B), "still held past 1 hour").toBe(bWrites);
+    await vi.advanceTimersByTimeAsync(resetsAtMs - Date.now());
     await settle(() => writes(h, B) > bWrites);
-    expect(writes(h, B), "B's held delivery goes out after 1 hour, not 5").toBeGreaterThan(bWrites);
+    expect(writes(h, B), "B's held delivery goes out at the reset").toBeGreaterThan(bWrites);
   });
 }, 20_000);
 
@@ -948,3 +956,203 @@ test("4b: the Retry (an explicit stop) of the agent that showed the error report
     ]);
   });
 }, 20_000);
+
+// #proj-runtime:#66 (AndyLok, Claude Code 2.1.325): an agent at its weekly
+// limit showed "working: Message received" for days. The server no longer
+// writes "Message received" on the ack of a delivery while the agent shows a
+// provider-limit error (agentOrchestrator `shouldRecordDeliveryAckTurnActive`);
+// the daemon keeps the error the status: at the turn end, in probe replies
+// (with its typed diagnostic), and for agents its credential's limit holds
+// without an error of their own. A reported reset is waited for; anything a
+// person does that could lift the limit ends the wait at once.
+describe("#proj-runtime:#66: a used-up quota's error stays the status while it holds deliveries", () => {
+  const RESET_ISO = "2026-11-18T09:00:00.000Z";
+  const NOW_MS = Date.parse(RESET_ISO) - 3 * 60 * MINUTE_MS;
+  const WEEKLY_TEXT = "You've hit your weekly limit · resets Nov 18, 4am (America/Toronto)";
+  // The assistant line as live stream-json carries it (snake_case on the line,
+  // `rate_limit_info` in the shape `rate_limit_event` carries).
+  const weeklyLimitLine = JSON.stringify({
+    type: "assistant",
+    message: { model: "<synthetic>", role: "assistant", stop_reason: "stop_sequence", type: "message", content: [{ type: "text", text: WEEKLY_TEXT }] },
+    parent_tool_use_id: null,
+    session_id: "session-weekly",
+    error: "rate_limit",
+    is_api_error_message: true,
+    api_error_status: 429,
+    api_error: "usage_limit_reached",
+    api_error_params: {
+      rate_limit_info: {
+        status: "rejected",
+        rateLimitType: "seven_day",
+        resetsAt: Date.parse(RESET_ISO) / 1000,
+        overageStatus: "rejected",
+        overageDisabledReason: "org_level_disabled",
+        isUsingOverage: false,
+      },
+    },
+  });
+  const weeklyLimitEvents = (): ParsedEvent[] => new ClaudeEventNormalizer(() => NOW_MS).normalizeLine(weeklyLimitLine);
+  const errorFrames = (h: Harness, agentId: string) => activities(h, agentId).filter((frame) => frame.detailKind === "runtime_error");
+  const ownActivity = (h: Harness, agentId: string, from: number) => h.frames.slice(from)
+    .filter((frame): frame is ActivityFrame => frame.type === "agent:activity" && frame.agentId === agentId);
+  const hitWeeklyLimit = async (h: Harness, agentId: string) => {
+    await h.emit(agentId, [...weeklyLimitEvents(), { kind: "turn_end", sessionId: `session-${agentId}` }]);
+  };
+
+  test("the error shows the reported reset; a held delivery adds no frame; a probe answers the error with its diagnostic; the wait runs to the reset", async () => {
+    await withManager(async (h) => {
+      vi.setSystemTime(NOW_MS);
+      await startIdle(h, A);
+      await hitWeeklyLimit(h, A);
+
+      const shown = errorFrames(h, A)[0];
+      expect(shown?.detail).toBe(`${WEEKLY_TEXT} (limit resets at ${RESET_ISO})`);
+      expect(shown?.runtimeError).toMatchObject({ errorClass: "RateLimitError" });
+      // The turn end re-states it as shown: the reset and diagnostic stay.
+      expect(activities(h, A).at(-1)).toMatchObject({ detailKind: "runtime_error", detail: shown!.detail, runtimeError: shown!.runtimeError });
+      expect(h.m.agents.get(A)?.runtimeErrorDeliveryBackoff).toMatchObject({ kind: "backing_off", reason: "rate_limited", untilMs: Date.parse(RESET_ISO) });
+      expect(h.events.filter((event) => event.name === "daemon.agent.runtime_error_delivery_backoff" && event.attrs.agentId === A).at(-1)?.attrs)
+        .toMatchObject({ provider_limit_kind: "quota_exhausted", waits_for_reported_reset: true, provider_limit_rate_limit_type: "seven_day", delay_ms: 3 * 60 * MINUTE_MS });
+
+      const aWrites = writes(h, A);
+      const framesBefore = h.frames.length;
+      expect(await h.manager.deliverMessage(A, message("while the weekly limit holds"))).toBe(true);
+      await settle();
+      expect(writes(h, A), "held: nothing reaches the runtime").toBe(aWrites);
+      // The server's ack no longer writes "Message received" over the error; the daemon sends nothing for it.
+      expect(ownActivity(h, A, framesBefore), "no frame for a held delivery").toHaveLength(0);
+
+      // A probe while held answers the error, typed, not "Message received".
+      h.manager.respondToActivityProbe(A, "probe-weekly");
+      expect(activities(h, A).at(-1)).toMatchObject({ probeId: "probe-weekly", detailKind: "runtime_error", detail: shown!.detail, runtimeError: shown!.runtimeError });
+
+      // Past the old 1-hour cap: still held, and no turn was started (no "Message received").
+      const framesBeforeWait = h.frames.length;
+      await vi.advanceTimersByTimeAsync(61 * MINUTE_MS);
+      await settle();
+      expect(writes(h, A)).toBe(aWrites);
+      // broadcastMessageReceivedActivity sends "Message received" with detailKind "model_request_started".
+      expect(ownActivity(h, A, framesBeforeWait).some((frame) => frame.detail === "Message received")).toBe(false);
+
+      // At the reset the held message starts a turn, which says "Message received".
+      await vi.advanceTimersByTimeAsync(Date.parse(RESET_ISO) - Date.now());
+      await settle(() => writes(h, A) > aWrites);
+      expect(writes(h, A)).toBeGreaterThan(aWrites);
+      expect(ownActivity(h, A, framesBeforeWait).some((frame) => frame.detail === "Message received")).toBe(true);
+      h.manager.respondToActivityProbe(A, "probe-after-reset");
+      expect(activities(h, A).at(-1)).toMatchObject({ probeId: "probe-after-reset" });
+      expect(activities(h, A).at(-1)?.detailKind).not.toBe("runtime_error");
+    });
+  }, 20_000);
+
+  test("an agent the shared sign-in's limit holds, with a message waiting, answers a probe with the fixed held text, typed; with nothing waiting it keeps its idle status", async () => {
+    await withManager(async (h) => {
+      vi.setSystemTime(NOW_MS);
+      await startIdle(h, A);
+      await startIdle(h, B);
+      await hitWeeklyLimit(h, A);
+      expect(h.m.agents.get(B)?.runtimeErrorDeliveryBackoff).toMatchObject({ kind: "backing_off", untilMs: Date.parse(RESET_ISO) });
+
+      h.manager.respondToActivityProbe(B, "probe-b-nothing-waiting");
+      expect(activities(h, B).at(-1)).toMatchObject({ probeId: "probe-b-nothing-waiting" });
+      expect(activities(h, B).at(-1)?.detailKind, "nothing waits: no error the server would keep").not.toBe("runtime_error");
+
+      expect(await deliveryReachesRuntime(h, B, "for B")).toBe(false);
+      h.manager.respondToActivityProbe(B, "probe-b-held");
+      const reply = activities(h, B).at(-1);
+      expect(reply).toMatchObject({
+        probeId: "probe-b-held",
+        detailKind: "runtime_error",
+        detail: formatProviderLimitHeldDetail({ resetsAt: RESET_ISO, rateLimitType: "seven_day" }),
+      });
+      expect(reply?.detail).toContain(`(limit resets at ${RESET_ISO})`);
+      expect(reply?.runtimeError).toMatchObject({ errorClass: "RateLimitError", reasonProvenance: "daemon_fallback" });
+      expect(reply?.runtimeError?.requiredAction, "nothing for a person to do but wait or switch").toBeUndefined();
+    });
+  }, 20_000);
+
+  test("model output ends it: a probe no longer answers the error", async () => {
+    await withManager(async (h) => {
+      vi.setSystemTime(NOW_MS);
+      await startIdle(h, A, ownHome);
+      await hitWeeklyLimit(h, A);
+      expect(h.m.agents.get(A)?.runtimeErrorDeliveryBackoff.kind).toBe("backing_off");
+      await h.emit(A, [{ kind: "text", text: "Back to work." }]);
+      expect(h.m.agents.get(A)?.runtimeErrorDeliveryBackoff.kind, "model output releases the limit").toBe("idle");
+      h.manager.respondToActivityProbe(A, "probe-released");
+      expect(activities(h, A).at(-1)).toMatchObject({ probeId: "probe-released" });
+      expect(activities(h, A).at(-1)?.detailKind).not.toBe("runtime_error");
+    });
+  }, 20_000);
+
+  test("no used-up quota, no change: a throttle's held delivery adds no frame, and a probe still reports the pending message", async () => {
+    await withManager(async (h) => {
+      await startIdle(h, A);
+      await h.emit(A, [
+        { kind: "error", message: "Slow down a little, then send again.", providerLimit: { kind: "transient_rate_limit" } },
+        { kind: "turn_end", sessionId: `session-${A}` },
+      ]);
+      expect(h.m.agents.get(A)?.runtimeErrorDeliveryBackoff).toMatchObject({ kind: "backing_off", reason: "rate_limited" });
+      const before = activities(h, A).length;
+      expect(await deliveryReachesRuntime(h, A, "held by a throttle")).toBe(false);
+      expect(activities(h, A).length, "nothing re-stated").toBe(before);
+      h.manager.respondToActivityProbe(A, "probe-throttle");
+      expect(activities(h, A).at(-1)).toMatchObject({ probeId: "probe-throttle", detailKind: "message_received", detail: "Message received" });
+      expect(activities(h, A).at(-1)?.runtimeError).toBeUndefined();
+    });
+  }, 20_000);
+
+  // Tenny's condition for waiting until the reset: a person's Start or
+  // Restart (a stop, then a start), a runtime or model change, and a sign-in
+  // (agentProcessManager.runtimeCredentialsChanged.test.ts,
+  // agentProcessManager.credentialAccount.test.ts) end the wait at once.
+  test("a person's stop and start ends a wait days long, for the agent and the others on the sign-in", async () => {
+    await withManager(async (h) => {
+      vi.setSystemTime(NOW_MS);
+      await startIdle(h, A);
+      await startIdle(h, B);
+      await hitWeeklyLimit(h, A);
+      expect(await deliveryReachesRuntime(h, B, "held for B")).toBe(false);
+      const bWrites = writes(h, B);
+
+      await h.manager.stopAgent(A);
+      await settle(() => writes(h, B) > bWrites);
+      expect(writes(h, B), "B's held message goes at once").toBeGreaterThan(bWrites);
+      expect(h.m.lifecycleRecords.getProviderLimit(SHARED)).toBeUndefined();
+      await startIdle(h, A);
+      expect(h.m.agents.get(A)?.runtimeErrorDeliveryBackoff.kind, "the started agent has no wait").toBe("idle");
+      expect(await deliveryReachesRuntime(h, A, "after the restart")).toBe(true);
+    });
+  }, 20_000);
+
+  test("a model change ends the wait: the agent's held message goes, and the others on the sign-in are released", async () => {
+    await withManager(async (h) => {
+      vi.setSystemTime(NOW_MS);
+      await startIdle(h, A);
+      await startIdle(h, B);
+      await hitWeeklyLimit(h, A);
+      expect(await deliveryReachesRuntime(h, A, "held for A")).toBe(false);
+      expect(await deliveryReachesRuntime(h, B, "held for B")).toBe(false);
+      const bWrites = writes(h, B);
+
+      h.manager.applyConfig(A, config(A, { model: "another-model" }), 2);
+      await settle(() => writes(h, B) > bWrites);
+      expect(h.m.lifecycleRecords.getProviderLimit(SHARED)).toBeUndefined();
+      expect(h.m.agents.get(A)?.runtimeErrorDeliveryBackoff.kind ?? "idle", "A's own wait ends").toBe("idle");
+      expect(writes(h, B), "B's held message goes at once").toBeGreaterThan(bWrites);
+      expect(h.events.some((event) => event.name === "daemon.agent.runtime_error_delivery_backoff.reset" && event.attrs.reset_source === "config_changed")).toBe(true);
+    });
+  }, 20_000);
+
+  test("a config change that keeps the runtime and model does not end the wait", async () => {
+    await withManager(async (h) => {
+      vi.setSystemTime(NOW_MS);
+      await startIdle(h, A);
+      await hitWeeklyLimit(h, A);
+      h.manager.applyConfig(A, config(A, { description: "another role" }), 2);
+      await settle();
+      expect(h.m.lifecycleRecords.getProviderLimit(SHARED)).toBeDefined();
+      expect(h.m.agents.get(A)?.runtimeErrorDeliveryBackoff.kind).toBe("backing_off");
+    });
+  }, 20_000);
+});

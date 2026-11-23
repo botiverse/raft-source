@@ -5,16 +5,17 @@ import { APP_PERMISSIONS_CHANGED, AppPermissionsChangedError, currentAppPermissi
 import { ensureCurrentTextRevision } from "./appPromptTextService";
 import { normalizeAppSetupUrl, normalizeAppSetupDescription, AppSetupValidationError } from "@botiverse/raft-shared";
 import { APP_NAME_RESERVED_CODE } from "@botiverse/raft-shared";
+import { PROFILE_DESCRIPTION_MAX_LENGTH } from "@botiverse/raft-shared";
 import { RefusalError } from "../lib/refusal";
 import type { DatabaseExecutor } from "../db/index";
 import { AgentRuntimeProviderError } from "./agentRuntimeProviderService";
 import { approvalEndedSentence } from "./agentRuntimeApprovalItem";
 import { assertProviderProvisioningAvailable } from "./agentRuntimeProvisionService";
 import { getHostedRuntimeModels, isHostedModelPickerEnabled } from "./hostedAgentModelService";
-import { isRuntimeAdmittedForNewUse, isRuntimeDeprecatedForServer, newAgentAdmittedRuntimeIds, resolveRuntimeAdmissionPolicy } from "./runtimeAdmissionService";
+import { isRuntimeAdmittedForNewUse, newAgentAdmittedRuntimeIds, resolveRuntimeAdmissionPolicy } from "./runtimeAdmissionService";
 import { jointChannels, jointChannelServers } from "../db/schema";
 import { recordTraceEvent } from "../tracing/semanticTrace";
-import { getRuntimeInfo, HOSTED_DEFAULT_MODEL, isActionCardReadOnlyInServer } from "@botiverse/raft-shared";
+import { getRuntimeInfo, HOSTED_DEFAULT_MODEL, isActionCardReadOnlyInServer, isRuntimeDeprecated } from "@botiverse/raft-shared";
 import { isMcpConnectionAuthorized } from "./managedMcpService";
 import { publishChannelUpdate } from "./channelRealtimeEvents";
 import { socketUserServerRoom } from "../socket/platformScope";
@@ -106,9 +107,13 @@ import type { OwnerConfirmRequest } from "./assistantOwnerActionCards";
 import type { RequestClient } from "./productEventContext";
 import { canonicalJson } from "../lib/canonicalJson";
 import {
+  agentUpgradeCardAlreadyOfferedRefusal,
   agentUpgradeCardCooldownRefusal,
   findAgentUpgradeCardCooldown,
   findRecentAgentUpgradeCard,
+  findServerAgentUpgradeCard,
+  lockServerAgentUpgradeCardGate,
+  type ServerAgentUpgradeCard,
   isJointConversation,
   isServerOnFreePlan,
 } from "./agentUpgradeCardService";
@@ -446,6 +451,9 @@ async function emitActionCardCarrierMessage(
     const payload = projectRichMessageSocketPayload(messageService.stripViewerScopedAttachmentCommentMetadata(projected));
     if (channel.type !== "thread") {
       if (event === "message:new") {
+        // As for an ordinary DM send: a just-created DM's room may not hold
+        // its members' sockets yet.
+        if (channel.type === "dm") await messageService.joinDmHumanSocketsToRoom(io, { id: target.channelId, serverId: target.serverId });
         // message-realtime-producer: action-card.new.channel
         io.to(`channel:${target.channelId}`).emit("message:new", payload);
       } else {
@@ -1038,10 +1046,22 @@ async function assertSuggestedRuntimePreparable(serverId: string, action: Action
   const offered = newAgentAdmittedRuntimeIds(policy);
   if (offered.includes(runtime)) return;
   const why = !getRuntimeInfo(runtime) ? "is not a runtime Raft knows"
-    : isRuntimeDeprecatedForServer(runtime, policy) ? "is deprecated for new agents"
+    : isRuntimeDeprecated(runtime) ? "is deprecated for new agents"
       : !isRuntimeAdmittedForNewUse(runtime, policy) ? "is not enabled on this server"
         : "is not offered for new agents";
   throw new ActionCardError(422, "RUNTIME_NOT_OFFERED", suggestedRuntimeNotOfferedMessage(runtime, why, offered));
+}
+
+/**
+ * `agent:create`'s description: refused at prepare when it is longer than a
+ * new agent's description may be (#triage:#541), so the agent shortens it, not
+ * the person in the dialog. The card schema keeps its older 500 so cards
+ * already stored still read.
+ */
+function assertAgentCardDescriptionFits(action: ActionCardAction): void {
+  if (action.type !== "agent:create" || action.description === undefined) return;
+  if (action.description.length <= PROFILE_DESCRIPTION_MAX_LENGTH) return;
+  throw new ActionCardError(422, "DESCRIPTION_TOO_LONG", `description is ${action.description.length} characters; a new agent's description is at most ${PROFILE_DESCRIPTION_MAX_LENGTH}. Keep it to who the agent is and what it does, and tell it longer instructions in a message after it is created.`);
 }
 
 /** RUNTIME_NOT_OFFERED's sentence: the offered ids with their names, or, with none, to leave the field out. */
@@ -1331,6 +1351,7 @@ async function resolveAgentActionForPost(args: PrepareActionCardArgs): Promise<A
   }
   await assertHostedAgentCardPreparable(args.serverId, parsed.data as ActionCardAction);
   await assertSuggestedRuntimePreparable(args.serverId, parsed.data as ActionCardAction);
+  assertAgentCardDescriptionFits(parsed.data as ActionCardAction);
   assertFeedbackCardPreparable(parsed.data as ActionCardAction);
   const cardNames: ActionCardSpecNames = {};
   const resolvedAction = await resolveActionHandles(
@@ -1394,6 +1415,26 @@ async function resolveAgentActionForPost(args: PrepareActionCardArgs): Promise<A
     cardPayload = storedAction;
   }
   return { action, storedAction, cardPayload, cardNames, agent, target, currentComputerId };
+}
+
+/**
+ * An upgrade card as this agent addresses it (`#general msg=7c41e2a0`, a
+ * thread's `#general:1a2b3c4d msg=…`), named only where whoever the agent tells
+ * can open it too: a public channel of this server, or a thread or task of
+ * one (Sage, #proj-apps:#84: the agent is told to point people to it, so a
+ * private channel's name or someone's DM must not reach another
+ * conversation). Null otherwise, or when the agent itself cannot open it.
+ */
+async function agentUpgradeCardAddress(serverId: string, agentId: string, card: ServerAgentUpgradeCard): Promise<string | null> {
+  const conversation = await channelService.getChannel(card.channelId);
+  if (!conversation || conversation.serverId !== serverId) return null;
+  const channel = isSubConversationType(conversation.type) && conversation.parentChannelId
+    ? await channelService.getChannel(conversation.parentChannelId)
+    : conversation;
+  if (!channel || channel.serverId !== serverId || channel.type !== "channel") return null;
+  const { renderRelatedTargets } = await import("./agentInboxItems");
+  const target = (await renderRelatedTargets(serverId, agentId, [card.channelId])).get(card.channelId);
+  return target ? `${target} msg=${card.messageId.slice(0, 8)}` : null;
 }
 
 async function postActionCard(args: PrepareActionCardArgs, toPost: ActionCardToPost): Promise<PreparedActionCard> {
@@ -1467,19 +1508,29 @@ async function postActionCard(args: PrepareActionCardArgs, toPost: ActionCardToP
     // projection would hide it from peers and from canonical-backed history.
     const storageChannelId = await channelService.getMessageStorageChannelIdWithExecutor(tx, args.targetChannelId);
     if (action.type === "plan:upgrade") {
-      // A repeat for the same conversation and gate (none: `general`) within
-      // a day answers with the posted card. Otherwise, after an agent's
-      // upgrade card of any gate there (deleted since or not), the
-      // conversation gets no other one for the cooldown: 409
-      // UPGRADE_CARD_COOLDOWN, saying when it was offered and until when not
-      // to offer another (cindyz: don't disturb people). The source lock
-      // above serializes prepares in this conversation, so two cannot both
-      // miss a card. Joint conversations were refused above, so this never
-      // spans servers.
+      // In this order:
+      // 1. A repeat for the same conversation and gate (none: `general`)
+      //    within a day answers with the posted card (200, `existing`).
+      // 2. After an agent's upgrade card of any gate there (deleted since or
+      //    not), the conversation gets no other one for the cooldown: 409
+      //    UPGRADE_CARD_COOLDOWN, saying when it was offered and until when
+      //    not to offer another (cindyz: don't disturb people).
+      // 3. After an agent's upgrade card for this gate in another
+      //    conversation of the server in the last 7 days: 409
+      //    UPGRADE_CARD_ALREADY_OFFERED, naming where it is. After the
+      //    cooldown, so the cooldown keeps every answer it gave, and this
+      //    refusal is counted only for a card that would otherwise have been
+      //    posted (an agent's card here inside 7 days is in the cooldown).
+      // The source lock above serializes prepares in this conversation, and
+      // the server's gate lock serializes those for this gate across its
+      // conversations, so two cannot both miss a card. Joint conversations
+      // were refused above, so this never spans servers.
+      const gate = action.gate ?? GENERAL_UPGRADE_GATE;
+      await lockServerAgentUpgradeCardGate(tx, { serverId: args.serverId, gate });
       const recent = await findRecentAgentUpgradeCard(tx, {
         serverId: args.serverId,
         storageChannelId,
-        gate: action.gate ?? GENERAL_UPGRADE_GATE,
+        gate,
       });
       if (recent) {
         const existing: PreparedActionCard = { ...recent, existing: true };
@@ -1494,6 +1545,9 @@ async function postActionCard(args: PrepareActionCardArgs, toPost: ActionCardToP
         const refusal = agentUpgradeCardCooldownRefusal(cooldown);
         throw new ActionCardError(409, "UPGRADE_CARD_COOLDOWN", refusal.error, { suggestedNextAction: refusal.suggestedNextAction });
       }
+      const offered = await findServerAgentUpgradeCard(tx, { serverId: args.serverId, gate });
+      // Refused after the transaction, which posted nothing: naming the card reads outside it.
+      if (offered) return { alreadyOffered: offered };
     }
     if (storedAction.type === "question:ask") {
       await assertQuestionCardBudget(tx, { requesterAgentId: args.requesterAgentId, storageChannelId });
@@ -1537,6 +1591,10 @@ async function postActionCard(args: PrepareActionCardArgs, toPost: ActionCardToP
     return { posted: msg };
   });
   if (out.existing) return out.existing;
+  if (out.alreadyOffered) {
+    const refusal = agentUpgradeCardAlreadyOfferedRefusal(await agentUpgradeCardAddress(args.serverId, args.requesterAgentId, out.alreadyOffered));
+    throw new ActionCardError(409, "UPGRADE_CARD_ALREADY_OFFERED", refusal.error, { suggestedNextAction: refusal.suggestedNextAction });
+  }
   const posted = out.posted;
 
   // The person a question card asks gets a mention, not just channel activity (spec §2.3); so
@@ -1768,7 +1826,7 @@ async function assertActionCardTypeAuthority(
     throw new ActionCardError(409, "UNKNOWN_ACTION_TYPE", "This card's action is not one this server runs");
   }
   const type = actionType as StoredActionCardActionType;
-  const authority = actionCardTypeAuthority(type);
+  const authority = actionCardTypeAuthority(type, payload);
   switch (authority.kind) {
     case "none":
       break;
@@ -2865,7 +2923,7 @@ async function commitActionCardResult(args: MarkExecutedArgs, resultSource: "cli
     assertActionResultKindMatches(action, args.result);
     // What the card records: the client's result, but for what only the server may say.
     let committedResult: ActionCardResult = args.result;
-    // The type's own permission (createChannels, createAgents, ...) was checked
+    // The type's own permission (createPublicChannels / createPrivateChannels, createAgents, ...) was checked
     // by assertActionCardWritableByUser above (assertActionCardTypeAuthority).
     if (action.type === "integration:connect_mcp" && args.result.kind === "mcp-connection") {
       // The card names the subject; the client only gets to say "I resolved THIS one". Mismatched
@@ -3194,7 +3252,8 @@ export type ActionCardResultReplyOutcome =
  * or the person who asked (`requester_user_id`: a seat request, a person's
  * Pro request, the agent:create card an owner sends back; task #10, the same
  * for both). The receipt is a durable system reply in the card's own thread
- * (the canonical Joint thread when the card lives in a Joint channel) that
+ * (the canonical Joint thread when the card lives in a Joint channel; the
+ * conversation itself when the card was asked in a thread or a task conversation) that
  * @mentions the requester, so it rides the ordinary mention path: an unread
  * inbox fact + wake/notice push for managed and external agents alike, a
  * personal mention for a person, replayable after a missed delivery. Others
@@ -3250,11 +3309,22 @@ export async function postActionCardResultReply(input: {
           : input.outcome.kind === "prepared_request" ? input.outcome.causalUserId : null);
     if (!causalUserId) return skip("no_causal_user");
     let threadChannelId: string;
-    let threadParentMessageId: string;
+    // A thread's parent message, or null for a task conversation (its follow names the task).
+    let threadParentMessageId: string | null;
+    let threadParentTaskId: string | null = null;
     if (carrierChannel.type === "thread") {
       if (!carrierChannel.parentMessageId) return skip("thread_without_parent");
       threadChannelId = localCarrierChannelId;
       threadParentMessageId = carrierChannel.parentMessageId;
+    } else if (carrierChannel.type === "task") {
+      // A card asked in a task conversation is answered there, where the work
+      // is: a thread on the card message would nest under the conversation,
+      // which threads never do, and nobody would follow it (#wg-rbac:#105).
+      // A Joint task conversation's local projection names the same task.
+      if (!carrierChannel.taskId) return skip("task_conversation_without_task");
+      threadChannelId = localCarrierChannelId;
+      threadParentMessageId = null;
+      threadParentTaskId = carrierChannel.taskId;
     } else {
       const thread = await channelService.getOrCreateThreadForChannel(
         localCarrierChannelId,
@@ -3286,7 +3356,7 @@ export async function postActionCardResultReply(input: {
     // By design for some outcomes (an approval card's, which antiproton tells the agent).
     if (content === null) return skip("no_reply_for_outcome");
 
-    // Delivery in a thread follows thread attention; start (or revive) the
+    // Delivery in a thread or task conversation follows its attention; start (or revive) the
     // requester's follow at the current tail so this reply is the unread item
     // that wakes an agent and reaches a person.
     await channelService.recordThreadFollow(
@@ -3295,7 +3365,7 @@ export async function postActionCardResultReply(input: {
       threadChannelId,
       threadParentMessageId,
       "mentioned",
-      { reactivateUnfollowed: true, preserveExistingReason: true, joinedThroughSeq: "latest" },
+      { parentTaskId: threadParentTaskId, reactivateUnfollowed: true, preserveExistingReason: true, joinedThroughSeq: "latest" },
     );
     await messageService.broadcastSystemMessageToLocalSurfaces(input.io, input.orchestrator, threadChannelId, content, {
       inboxFactPolicy: {
@@ -4087,9 +4157,7 @@ async function performAction(
     const homepageUrl = validateIntegrationUrl(action.homepageUrl, "homepageUrl", action.unsafeDemoUrlOverride);
     const returnUrl = validateIntegrationUrl(action.returnUrl, "returnUrl", action.unsafeDemoUrlOverride);
     const agentManifestUrl = validateIntegrationUrl(action.agentManifestUrl, "agentManifestUrl", action.unsafeDemoUrlOverride);
-    if (!returnUrl) {
-      throw new ActionCardError(400, "INVALID_URL", "returnUrl is required");
-    }
+    // No return URL registers a token-only App: nobody can sign in to it.
     const { setupUrl, setupDescription } = validateActionAppSetup(action);
     const created = await oauthService.createOAuthClient({
       serverId,
@@ -4267,7 +4335,11 @@ async function performAction(
       const channelType = action.visibility === "private" ? "private" : "channel";
       const initialUserIds: string[] = [];
       for (const uid of [...new Set(action.initialHumans ?? [])]) {
-        if (uid !== userId && (await resolveActorContext(serverId, "user", uid, dbOrTx)).serverRole) initialUserIds.push(uid);
+        if (uid === userId) continue;
+        const role = (await resolveActorContext(serverId, "user", uid, dbOrTx)).serverRole;
+        // Like a non-member, a Guest is left out: it is only ever in its one
+        // bound channel (addHuman), and createChannel refuses it.
+        if (role && role !== "guest") initialUserIds.push(uid);
       }
       const initialAgentIds: string[] = [];
       for (const aid of [...new Set(action.initialAgents ?? [])]) {

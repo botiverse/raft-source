@@ -1,6 +1,6 @@
 {
   "name": "@botiverse/raft-computer",
-  "version": "1.25.4",
+  "version": "1.25.9",
   "license": "LicenseRef-Raft-License",
   "description": "Canonical Raft Computer — standalone human/local-machine control-plane CLI (login + attach); distinct from the agent-facing @botiverse/raft CLI.",
   "type": "module",

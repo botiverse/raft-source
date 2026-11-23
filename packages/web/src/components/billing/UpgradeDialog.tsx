@@ -48,12 +48,13 @@ import { FramedDialogContent } from "../ui/NarrowDialog";
 import SetupStepFrame from "../onboarding/SetupStepFrame";
 import Banner from "../ui/Banner";
 import { ProCheckoutChoices, ProOfferPanel, useProCheckoutDraft } from "./ProOffer";
-import type { CheckoutPayment, ProHighlightKey } from "./ProOffer";
+import type { CheckoutPayment } from "./ProOffer";
+import type { ProHighlightKey } from "./proHighlights";
 import { showToast } from "../toastBridge";
 import { emitActionCardEvent } from "../actions/actionCardCommon";
 import { billingServerError } from "./billingServerError";
 import { useTimeFormatter } from "../../hooks/useTimeFormatter";
-import { askOwnerPrefill, externalLimitCopy, GATE_COPY, gateValues, historyLimitHint, UPGRADE_CANCELED_PARAM as CANCELED_PARAM, UPGRADE_ENTRY_PARAM as ENTRY_PARAM, UPGRADE_RENEW_FROM_PARAM as RENEW_FROM_PARAM, UPGRADE_RETURN_PARAM, UPGRADE_SERVER_PARAM as SERVER_PARAM, UPGRADE_SOURCE_PARAM as SOURCE_PARAM, UPGRADE_SURFACE_PARAM as SURFACE_PARAM, upgradeGateCopy } from "./upgradeGateCopy";
+import { askOwnerPrefill, externalContextForGate, upgradeDoneMessageId, externalLimitCopy, gateValues, historyLimitHint, UPGRADE_CANCELED_PARAM as CANCELED_PARAM, UPGRADE_ENTRY_PARAM as ENTRY_PARAM, UPGRADE_RENEW_FROM_PARAM as RENEW_FROM_PARAM, UPGRADE_RETURN_PARAM, UPGRADE_SERVER_PARAM as SERVER_PARAM, UPGRADE_SOURCE_PARAM as SOURCE_PARAM, UPGRADE_SURFACE_PARAM as SURFACE_PARAM, UPGRADE_FREEZE_AT_PARAM as FREEZE_AT_PARAM, upgradeGateCopy } from "./upgradeGateCopy";
 
 /**
  * The upgrade dialog every Free paywall's Upgrade opens, in place (cindyz, task #7;
@@ -126,13 +127,14 @@ export { serverOwners as upgradeOwners } from "./OwnerPicker";
 /**
  * This page with the paywall Stripe should report back, paid or (`canceled`)
  * not, and what the dialog was opened with; `server`, the server paid for when
- * it isn't the current one (a page outside the app).
+ * it isn't the current one (a page outside the app); `freezeAt`, the external
+ * channel freeze's start when its notice opened it before then (`freeze_upcoming`).
  */
 export function upgradeReturnUrl(
   pageUrl: string,
   gate: UpgradeGate,
   canceled: boolean,
-  { source, settingsEntry, renewFrom, surface, server }: { source?: UpgradeDialogSource; settingsEntry?: BillingEntry; renewFrom?: string; surface?: PaywallSurface; server?: string } = {},
+  { source, settingsEntry, renewFrom, surface, server, freezeAt }: { source?: UpgradeDialogSource; settingsEntry?: BillingEntry; renewFrom?: string; surface?: PaywallSurface; server?: string; freezeAt?: string } = {},
 ): string {
   const url = new URL(pageUrl);
   if (renewFrom) url.searchParams.set(RENEW_FROM_PARAM, renewFrom);
@@ -148,6 +150,8 @@ export function upgradeReturnUrl(
   else url.searchParams.delete(SURFACE_PARAM);
   if (server) url.searchParams.set(SERVER_PARAM, server);
   else url.searchParams.delete(SERVER_PARAM);
+  if (freezeAt) url.searchParams.set(FREEZE_AT_PARAM, freezeAt);
+  else url.searchParams.delete(FREEZE_AT_PARAM);
   return url.toString();
 }
 
@@ -175,6 +179,7 @@ function OwnerPart({
   surface,
   settingsEntry,
   target,
+  externalContext,
 }: {
   gate: UpgradeGate;
   stage: UpgradeDialogStage;
@@ -189,8 +194,12 @@ function OwnerPart({
    * return names it. Absent: the current server.
    */
   target?: { id: string; billing: BillingInfo | null };
+  /** What the paywall's Upgrade said about where it was met; Stripe's return carries the freeze's start. */
+  externalContext?: ExternalLimitContext;
 }) {
   const { formatMessage, locale } = useIntl();
+  const paired = externalContextForGate(gate, externalContext);
+  const freezeAt = paired?.kind === "freeze_upcoming" ? paired.deadline : undefined;
   const current = useServerStore((state) => state.current);
   const currentBilling = useServerStore((state) => state.billing);
   const serverId = target ? target.id : current?.id;
@@ -251,8 +260,8 @@ function OwnerPart({
         months: draft.months,
         seatQuantity: draft.seats,
         defaultSeatQuantity: draft.defaultSeats,
-        returnUrl: upgradeReturnUrl(page, gate, false, { source, settingsEntry, renewFrom, surface, server: returnServer }),
-        cancelUrl: upgradeReturnUrl(page, gate, true, { source, settingsEntry, renewFrom, surface, server: returnServer }),
+        returnUrl: upgradeReturnUrl(page, gate, false, { source, settingsEntry, renewFrom, surface, server: returnServer, freezeAt }),
+        cancelUrl: upgradeReturnUrl(page, gate, true, { source, settingsEntry, renewFrom, surface, server: returnServer, freezeAt }),
         serverId: prepaidServerId,
         billingEntry: settingsEntry ?? gate,
         openedFrom: source,
@@ -264,8 +273,8 @@ function OwnerPart({
         billingInterval: draft.billingInterval,
         seatQuantity: draft.seats,
         defaultSeatQuantity: draft.minimumSeats,
-        returnUrl: upgradeReturnUrl(page, gate, false, { source, settingsEntry, surface, server: returnServer }),
-        cancelUrl: upgradeReturnUrl(page, gate, true, { source, settingsEntry, surface, server: returnServer }),
+        returnUrl: upgradeReturnUrl(page, gate, false, { source, settingsEntry, surface, server: returnServer, freezeAt }),
+        cancelUrl: upgradeReturnUrl(page, gate, true, { source, settingsEntry, surface, server: returnServer, freezeAt }),
         serverId,
         openedFrom: source,
         surface,
@@ -288,7 +297,7 @@ function OwnerPart({
     // The server is Pro already: the renewal is paid when its end moves past this.
     if (renewFrom) markRenewal(renewFrom);
     setStage("paying");
-  }, [draft.billingInterval, draft.defaultSeats, draft.minimumSeats, draft.months, draft.payment, draft.ready, draft.seats, formatMessage, gate, markRenewal, noteStripeOpened, renewFrom, serverId, setStage, settingsEntry, source, surface, target?.id]);
+  }, [draft.billingInterval, draft.defaultSeats, draft.minimumSeats, draft.months, draft.payment, draft.ready, draft.seats, formatMessage, freezeAt, gate, markRenewal, noteStripeOpened, renewFrom, serverId, setStage, settingsEntry, source, surface, target?.id]);
   const handleCheckout = useCallback(() => {
     void checkout();
   }, [checkout]);
@@ -362,7 +371,7 @@ function isAgentUpgradeCardGate(gate: UpgradeGate): gate is AgentUpgradeCardGate
 }
 
 function AskOwnerPart({ gate, serverName, source, surface, settingsEntry, externalContext }: { gate: UpgradeGate; serverName: string; source?: UpgradeDialogSource; surface?: PaywallSurface; settingsEntry?: BillingEntry; externalContext?: ExternalLimitContext }) {
-  const { formatMessage } = useIntl();
+  const { formatMessage, formatDate } = useIntl();
   const nav = useAppNavigate();
   const openUserDM = useChannelStore((state) => state.openUserDM);
   const sendMessage = useMessageStore((state) => state.sendMessage);
@@ -376,7 +385,7 @@ function AskOwnerPart({ gate, serverName, source, surface, settingsEntry, extern
   const recipient = asCard ? requestCardOwner(ownerState) : ownerState.recipient;
   // Within a request card's limit, so it can be sent as written (a long server
   // name is cut short). Also for a plain message: the flag may resolve after this runs.
-  const [text, setText] = useState(() => askOwnerPrefill(formatMessage, gate, serverName, PLAN_UPGRADE_REASON_MAX_LENGTH, externalContext));
+  const [text, setText] = useState(() => askOwnerPrefill(formatMessage, gate, serverName, PLAN_UPGRADE_REASON_MAX_LENGTH, externalContext, formatDate));
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
   // One id per message, so a retry after an unclear failure cannot post it twice.
@@ -519,8 +528,8 @@ function DialogFrame({
   const { options: timeOptions } = useTimeFormatter();
   const uploadContext = useUpgradeDialogStore((state) => state.request?.uploadContext);
   const historyContext = useUpgradeDialogStore((state) => (state.request?.gate === "history_30d" ? state.request.historyContext : undefined));
-  const externalContext = useUpgradeDialogStore((state) => (state.request?.gate === "external_channel_free_limit" ? state.request.externalContext : undefined));
-  const copy = { ...upgradeGateCopy(formatMessage, gate, serverName), ...externalLimitCopy(formatMessage, externalContext, serverName) };
+  const externalContext = useUpgradeDialogStore((state) => (state.request ? externalContextForGate(state.request.gate, state.request.externalContext) : undefined));
+  const copy = { ...upgradeGateCopy(formatMessage, gate, serverName), ...externalLimitCopy(formatMessage, externalContext, serverName, formatDate) };
   const agentTries = useServerStore((state) => state.billing?.agentHistoryBlocks7d ?? 0);
   const hint = renewUntil
     ? formatMessage({ id: renewInGrace ? "upgradeDialog.renew.hintGrace" : "upgradeDialog.renew.hint" }, { date: formatDate(renewUntil, { dateStyle: "medium" }) })
@@ -676,18 +685,23 @@ export default function UpgradeDialogHost() {
     const surface = readSurface(params.get(SURFACE_PARAM));
     const renewFromParam = params.get(RENEW_FROM_PARAM);
     const renewFrom = renewFromParam && Number.isFinite(Date.parse(renewFromParam)) ? renewFromParam : undefined;
+    const freezeAtParam = params.get(FREEZE_AT_PARAM);
+    const externalContext: ExternalLimitContext | undefined = gate === "external_channel_frozen" && freezeAtParam && Number.isFinite(Date.parse(freezeAtParam))
+      ? { kind: "freeze_upcoming", deadline: freezeAtParam }
+      : undefined;
     params.delete(UPGRADE_RETURN_PARAM);
     params.delete(CANCELED_PARAM);
     params.delete(SOURCE_PARAM);
     params.delete(ENTRY_PARAM);
     params.delete(RENEW_FROM_PARAM);
     params.delete(SURFACE_PARAM);
+    params.delete(FREEZE_AT_PARAM);
     const search = params.toString();
     navigate(
       { pathname: location.pathname, search: search ? `?${search}` : "", hash: location.hash },
       { replace: true, state: location.state },
     );
-    open(gate, serverId, { stage: canceled ? "choose" : "confirming", source, surface, settingsEntry, renewFrom });
+    open(gate, serverId, { stage: canceled ? "choose" : "confirming", source, surface, settingsEntry, renewFrom, externalContext });
   }, [location.hash, location.pathname, location.search, location.state, navigate, open, serverId]);
 
   // A dialog opened for another server never shows here.
@@ -701,8 +715,9 @@ export default function UpgradeDialogHost() {
   const renewFrom = request?.renewFrom;
   const renewedUntil = renewFrom && billing?.prepaid?.endsAt && Date.parse(billing.prepaid.endsAt) > Date.parse(renewFrom) ? billing.prepaid.endsAt : null;
   const paidGate = request && forThisServer && request.stage !== "choose" && (renewFrom ? Boolean(renewedUntil) : !free) ? request.gate : null;
+  const paidDoneId = paidGate ? upgradeDoneMessageId(paidGate, request?.externalContext) : null;
   useEffect(() => {
-    if (!paidGate) return;
+    if (!paidGate || !paidDoneId) return;
     close();
     showToast(renewedUntil ? {
       title: formatMessage({ id: "upgradeDialog.renewedToast" }, { server: serverName }),
@@ -711,11 +726,11 @@ export default function UpgradeDialogHost() {
       data: { intent: "success" },
     } : {
       title: formatMessage({ id: "upgradeDialog.paidToast" }, { server: serverName }),
-      description: formatMessage({ id: GATE_COPY[paidGate].done }, gateValues(serverName)),
+      description: formatMessage({ id: paidDoneId }, gateValues(serverName)),
       type: "success",
       data: { intent: "success" },
     });
-  }, [close, formatDate, formatMessage, paidGate, renewedUntil, serverName]);
+  }, [close, formatDate, formatMessage, paidDoneId, paidGate, renewedUntil, serverName]);
 
   if (!request || !forThisServer || paidGate) return null;
   // raft-ui Dialog: the dialog role and name, the focus trap, Esc, and focus back to the
@@ -740,7 +755,7 @@ export default function UpgradeDialogHost() {
         ) : managedUpload ? (
           <AppSumoUploadLimit quota={uploadQuota} canManage={capabilities.manageBilling} onClose={close} />
         ) : capabilities.manageBilling ? (
-          <OwnerPart gate={request.gate} stage={request.stage} serverName={serverName} source={request.source} surface={request.surface} settingsEntry={request.settingsEntry} />
+          <OwnerPart gate={request.gate} stage={request.stage} serverName={serverName} source={request.source} surface={request.surface} settingsEntry={request.settingsEntry} externalContext={request.externalContext} />
         ) : (
           <AskOwnerPart gate={request.gate} serverName={serverName} source={request.source} surface={request.surface} settingsEntry={request.settingsEntry} externalContext={request.externalContext} />
         )}

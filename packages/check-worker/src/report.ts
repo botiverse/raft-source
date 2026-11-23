@@ -24,7 +24,7 @@ export type ConsoleError = ArtifactCheckReport["consoleErrors"][number];
 export interface Findings {
   consoleError(message: string, source: string | null, line: number | null): void;
   blocked(url: string): void;
-  report(fields: { checkId: string; lease: string; load: ArtifactCheckLoad; blank?: boolean; phoneOverflow?: ArtifactCheckReport["phoneOverflow"]; timing?: ArtifactCheckTiming }): ArtifactCheckReport;
+  report(fields: { checkId: string; lease: string; load: ArtifactCheckLoad; blank?: boolean; phoneOverflow?: ArtifactCheckReport["phoneOverflow"]; pageCantScroll?: ArtifactCheckReport["pageCantScroll"]; timing?: ArtifactCheckTiming }): ArtifactCheckReport;
 }
 
 /** Chromium's console warning for a CSP directive it doesn't know (Raft's `webrtc`). */
@@ -88,10 +88,12 @@ export function createFindings(ticketUrl: string): Findings {
       if (blocked.size >= ARTIFACT_CHECK_MAX_BLOCKED_RESOURCES) return;
       blocked.add(reportUrl(url, ticketUrl));
     },
-    report({ checkId, lease, load, blank, phoneOverflow, timing }) {
+    report({ checkId, lease, load, blank, phoneOverflow, pageCantScroll, timing }) {
       const report: ArtifactCheckReport = { checkId, lease, load, consoleErrors: [...consoleErrors], blockedResources: [...blocked] };
       if (blank !== undefined) report.blank = blank;
       if (phoneOverflow !== undefined) report.phoneOverflow = phoneOverflow;
+      // An element's name in it is the page's, but never the ticket's: no URL fits its characters (pageChecks.ts elementLabel).
+      if (pageCantScroll !== undefined) report.pageCantScroll = pageCantScroll;
       if (timing !== undefined) report.timing = timing;
       return fitReport(report);
     },

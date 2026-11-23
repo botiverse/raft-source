@@ -661,6 +661,10 @@ export default function AgentActivityOverview({
   // that no longer joins up with them.
   const generation = useRef(0);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+  // Follow the bottom when a turn finishes only if the person is already at
+  // the bottom (and on first load); someone reading earlier turns stays put
+  // and gets a "new turn" hint instead (Tenny).
+  const [newTurnBelow, setNewTurnBelow] = useState(false);
 
   const loadLatest = useCallback(async (id: string) => {
     try {
@@ -756,10 +760,6 @@ export default function AgentActivityOverview({
   }, [finished, operatorEvents, runningStart]);
   const runningKey = running ? `running:${running.id ?? running.startedAt}` : null;
   const latestTurnKey = runningKey ?? (finished[0] ? turnKey(finished[0]) : null);
-  // Follow the bottom when a turn finishes only if the person is already at
-  // the bottom (and on first load); someone reading earlier turns stays put
-  // and gets a "new turn" hint instead (Tenny).
-  const [newTurnBelow, setNewTurnBelow] = useState(false);
   const measureNearBottom = useCallback(() => {
     const container = scrollRef.current;
     if (!container) return;

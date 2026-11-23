@@ -1,0 +1,18 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "kitchen-sink-choices",
+  "schemaVersion": "kitchen-sink-choices.create.v1",
+  "sourceId": "dependentEmpty",
+  "kind": "dependent_select",
+  "pointer": "/dependentEmpty",
+  "dependsOn": "/selectFilled",
+  "optionsByValue": {
+    "beta": [
+      {
+        "value": "b1",
+        "label": "Beta one"
+      }
+    ]
+  },
+  "status": "live"
+}

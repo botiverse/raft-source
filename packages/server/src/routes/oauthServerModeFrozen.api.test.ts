@@ -20,9 +20,15 @@
 // server-mode answer.
 //
 // Fixture: __fixtures__/oauthServerModeFrozen.json
-// sha256:  2bfe0d1f3aba4244b846280dfeed7e08b2a95a187610a384946b30ebbe657b87
+// sha256:  7b6e85944a023ac3c001d18b5ae1f50a55b7a3fb016600f94731b8ff2cb21dbd
 // From phase 3a PR 1 on, a PR that changes the fixture is blocked (review
 // rule; the last test pins the sha256 above, so the change shows here too).
+// Reviewed changes: per-App RS256 agent tokens (Tenny's design) add the RS256
+// key to JWKS (derived from the pinned JWT_SECRET, so fixed) and "RS256" to
+// discovery's id_token_signing_alg_values_supported; nothing else moved.
+// The Agent `owner_sub` claim (#proj-apps:#75, #15431, approved by Tenny) adds
+// "owner_sub" to discovery's claims_supported; a person's login never carries
+// it, so nothing else moved.
 //
 // Normalisation (Normaliser below), applied to request lines, header values,
 // bodies and the decoded ID token; everything else is kept byte for byte,

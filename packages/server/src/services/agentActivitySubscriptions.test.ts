@@ -215,6 +215,216 @@ test("a Computer disconnecting from this replica resets its agents' sent coarse 
   assert.deepEqual(states.map((e) => e.payload.state), ["busy", "busy"], "the state after the disconnect is sent, not deduped");
 });
 
+/**
+ * Two replicas sharing what Redis holds in production: the agent's mirrored
+ * activity and which replica holds each Computer.
+ */
+function sharedReplicaState(computerOwners: Record<string, string>, available = true) {
+  const activities = new Map<string, any>();
+  return {
+    activities,
+    store: {
+      isAvailable: () => available,
+      setAgentActivity: async (agentId: string, activity: string, detail: string, detailKind: string, observedAtMs?: number) => {
+        activities.set(agentId, { activity, detail, detailKind, ...(observedAtMs !== undefined ? { observedAtMs } : {}), updatedAt: Date.now() });
+      },
+      getAgentActivity: async (agentId: string) => activities.get(agentId) ?? null,
+      getMachineReplicaOwner: async (machineId: string) => computerOwners[machineId] ?? null,
+    } as any,
+  };
+}
+
+/** Let the emits in flight (their getCachedAgent / owner reads) finish. */
+const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+class ReplicaOrchestrator extends EmitOnlyOrchestrator {
+  readonly persistedRows: Array<{ activity: string; detail: string; entries: unknown[] }> = [];
+  latestRow: { activity: string; detail: string; detailKind: string; updatedAt: number } | null = null;
+  protected override async persistActivityEvent(_agentId: string, activity: any, detail: string, entries: any[]): Promise<boolean> {
+    this.persistedRows.push({ activity, detail, entries });
+    return true;
+  }
+  protected override async loadLatestPersistedActivityHint(): Promise<any> {
+    return this.latestRow;
+  }
+}
+
+/**
+ * Replicas "replica-A" and "replica-B" in one process. By default A holds the
+ * agent's Computer m1 (`machineId: null`: an agent without a Computer).
+ */
+function twoReplicas(options: { computerOwners?: Record<string, string>; machineId?: string | null; redisAvailable?: boolean } = {}) {
+  const clock = fakeClock(Date.now());
+  const testClock = { ...clock, scheduleRepeated: () => null, cancelRepeated: () => undefined };
+  const machineId = options.machineId === undefined ? "m1" : options.machineId;
+  const shared = sharedReplicaState(options.computerOwners ?? { m1: "replica-A" }, options.redisAvailable ?? true);
+  const emittedA: Emitted[] = [];
+  const emittedB: Emitted[] = [];
+  const replicaA = new ReplicaOrchestrator(shared.store, testClock);
+  const replicaB = new ReplicaOrchestrator(shared.store, testClock);
+  replicaA.setIO(recordingIo(emittedA));
+  replicaB.setIO(recordingIo(emittedB));
+  for (const [replica, id] of [[replicaA, "replica-A"], [replicaB, "replica-B"]] as const) {
+    (replica as any).getCachedAgent = async (agentId: string) => ({ id: agentId, serverId: "s1", machineId });
+    Object.defineProperty(replica, "coarseStateReplicaId", { value: id });
+  }
+  (replicaA as any).hasMachineLocally = (id: string) => id === "m1" && machineId === "m1";
+  (replicaB as any).hasMachineLocally = () => false;
+  const coarse = (emitted: Emitted[]) => emitted.filter((e) => e.event === AGENT_ACTIVITY_STATE_EVENT).map((e) => e.payload.state);
+  const detailed = (emitted: Emitted[]) => emitted.filter((e) => e.event === "agent:activity").map((e) => e.payload.activity);
+  const daemonReports = (activity: string, detail: string) => (replicaA as any).broadcastActivity("a", activity, detail, "action", [{ kind: "text", text: detail }]);
+  const shutdown = () => { replicaA.shutdown(); replicaB.shutdown(); };
+  return { clock, shared, emittedA, emittedB, replicaA, replicaB, coarse, detailed, daemonReports, shutdown };
+}
+
+test("two replicas: a Raft action recorded on the replica without the agent's Computer writes no status and pushes nothing; the row carries the owner's status", async () => {
+  const r = twoReplicas();
+  r.daemonReports("working", "Editing file");
+  await Promise.resolve();
+  assert.deepEqual(r.coarse(r.emittedA), ["busy"], "mid-turn on A: busy sent");
+  assert.equal(r.shared.activities.get("a")?.activity, "working");
+
+  // The agent creates a task; the request lands on B.
+  r.clock.advance(1_000);
+  await r.replicaB.recordAgentRaftAction("a", { title: "Created 1 task", text: "target: #general" });
+  assert.deepEqual(r.emittedB, [], "B pushes nothing: no online, and no status read from the shared record that could outrank the owner's next push");
+  assert.equal((r.replicaB as any).agentActivity.get("a"), undefined, "B writes no status of its own");
+  assert.equal(r.shared.activities.get("a")?.activity, "working", "nor over the shared one");
+  assert.deepEqual(r.replicaB.persistedRows.map((row) => [row.activity, (row.entries[0] as any).title]), [["working", "Created 1 task"]], "the row is stored, with the owner's status");
+
+  r.shutdown();
+});
+
+test("two replicas: only the replica holding the agent's Computer feeds the coarse state, so its dedupe cannot swallow a change", async () => {
+  const r = twoReplicas();
+  r.daemonReports("working", "Editing file");
+  await Promise.resolve();
+
+  // A status B pushes (here a direct emit) reaches the detailed rooms only.
+  r.clock.advance(1_000);
+  await (r.replicaB as any).emitActivity("a", "online", "", "none", r.clock.now());
+  assert.deepEqual([...new Set(r.detailed(r.emittedB))], ["online"], "the detailed push still goes out");
+  assert.deepEqual(r.coarse(r.emittedB), [], "B sends no coarse state for an agent whose Computer is on A");
+
+  // The daemon reports working again on A: clients' coarse state never left busy.
+  r.clock.advance(213);
+  r.daemonReports("working", "Running command");
+  r.clock.advance(AGENT_ACTIVITY_STATE_MIN_INTERVAL_MS);
+  assert.deepEqual(r.coarse(r.emittedA), ["busy"], "A's dedupe is right: it sent busy, and clients still show busy");
+
+  r.shutdown();
+});
+
+test("a status written on a replica without the agent's Computer is traced as skipped from the coarse state", async () => {
+  const r = twoReplicas();
+  const events: Array<{ name: string; attrs: any }> = [];
+  (r.replicaA as any).recordEvent = (name: string, attrs: any) => events.push({ name: `A:${name}`, attrs });
+  (r.replicaB as any).recordEvent = (name: string, attrs: any) => events.push({ name: `B:${name}`, attrs });
+  r.daemonReports("working", "Editing file");
+  await settle();
+
+  // The real path: B writes the status (and mirrors it to the shared record) before it emits.
+  r.clock.advance(1_000);
+  // With an entry it emits now (a status-only write is debounced first).
+  (r.replicaB as any).broadcastActivity("a", "online", "", "none", [{ kind: "text", text: "Stopped" }]);
+  await settle();
+  const skips = events.filter((e) => e.name.endsWith("activity.coarse_state.other_replica_skip"));
+  assert.deepEqual(skips, [{ name: "B:activity.coarse_state.other_replica_skip", attrs: { agent_id: "a", activity_kind: "online", detail_kind: "none" } }], "B's skip is counted; A, the owner, feeds the coarse state");
+  assert.deepEqual(r.coarse(r.emittedB), [], "and B sent no coarse state");
+
+  r.shutdown();
+});
+
+test("a replica feeds the coarse state while no replica holds the agent's Computer", async () => {
+  const r = twoReplicas({ computerOwners: {} });
+  await (r.replicaB as any).emitActivity("a", "offline", "", "none", r.clock.now());
+  assert.deepEqual(r.coarse(r.emittedB), ["offline"]);
+  r.shutdown();
+});
+
+test("a Raft action on another replica without the shared record: the row takes the latest row's status as readers serve it, and nothing is pushed", async () => {
+  const cases: Array<[string, { activity: string; detail: string; detailKind: string; ageMs: number } | null, [string, string]]> = [
+    ["fresh busy latest row", { activity: "working", detail: "Editing file", detailKind: "action", ageMs: 5_000 }, ["working", "Editing file"]],
+    ["stale busy latest row: served as online, not made fresh again", { activity: "working", detail: "Editing file", detailKind: "action", ageMs: 30 * 60_000 }, ["online", ""]],
+    ["idle latest row", { activity: "offline", detail: "Stopped", detailKind: "none", ageMs: 30 * 60_000 }, ["offline", "Stopped"]],
+    ["no row at all", null, ["online", ""]],
+  ];
+  for (const [name, row, expected] of cases) {
+    const r = twoReplicas();
+    r.replicaB.latestRow = row ? { activity: row.activity, detail: row.detail, detailKind: row.detailKind, updatedAt: r.clock.now() - row.ageMs } : null;
+    await r.replicaB.recordAgentRaftAction("a", { title: "Created 1 task", text: "target: #general" });
+    assert.deepEqual(r.replicaB.persistedRows.map((stored) => [stored.activity, stored.detail]), [expected], name);
+    assert.deepEqual(r.emittedB, [], `${name}: nothing pushed`);
+    assert.equal((r.replicaB as any).agentActivity.get("a"), undefined, `${name}: no status written`);
+    r.shutdown();
+  }
+});
+
+test("an agent without a Computer across two replicas: a Raft action pushes nothing, and a replica's memory of what it sent does not swallow a change", async () => {
+  const r = twoReplicas({ machineId: null });
+  // Its status comes in over HTTP on A.
+  r.daemonReports("working", "Editing file");
+  await settle();
+  assert.deepEqual(r.coarse(r.emittedA), ["busy"]);
+
+  r.clock.advance(1_000);
+  await r.replicaB.recordAgentRaftAction("a", { title: "Created 1 task", text: "target: #general" });
+  assert.deepEqual(r.emittedB, [], "no online from B's empty memory, nothing pushed");
+  assert.equal((r.replicaB as any).agentActivity.get("a"), undefined);
+  assert.equal(r.shared.activities.get("a")?.activity, "working", "the shared record keeps working");
+  assert.deepEqual(r.replicaB.persistedRows.map((row) => row.activity), ["working"], "the row takes the shared status");
+
+  // Another replica pushes a different state in between (no owner: any may).
+  await (r.replicaB as any).emitActivity("a", "online", "", "none", r.clock.now());
+  assert.deepEqual(r.coarse(r.emittedB), ["online"]);
+  r.clock.advance(213);
+  r.daemonReports("working", "Running command");
+  await settle();
+  r.clock.advance(AGENT_ACTIVITY_STATE_MIN_INTERVAL_MS);
+  assert.deepEqual(r.coarse(r.emittedA), ["busy", "busy"], "A sends busy again: it does not dedupe without owning a Computer");
+
+  r.shutdown();
+});
+
+test("with the Computer's owner unreadable (Redis down), a replica not holding it feeds the coarse state without the last-sent skip; the owner keeps it", async () => {
+  const r = twoReplicas({ redisAvailable: false });
+  await (r.replicaB as any).emitActivity("a", "working", "Editing file", "action", r.clock.now());
+  r.clock.advance(AGENT_ACTIVITY_STATE_MIN_INTERVAL_MS);
+  await (r.replicaB as any).emitActivity("a", "working", "Running command", "action", r.clock.now());
+  assert.deepEqual(r.coarse(r.emittedB), ["busy", "busy"], "B: sent again");
+
+  await (r.replicaA as any).emitActivity("a", "working", "Editing file", "action", r.clock.now());
+  r.clock.advance(AGENT_ACTIVITY_STATE_MIN_INTERVAL_MS);
+  await (r.replicaA as any).emitActivity("a", "working", "Running command", "action", r.clock.now());
+  assert.deepEqual(r.coarse(r.emittedA), ["busy"], "A holds the Computer: deduped");
+  r.shutdown();
+});
+
+test("a replica the Computer's owner record names, without the connection, feeds the coarse state (no other replica holds it)", async () => {
+  const r = twoReplicas({ computerOwners: { m1: "replica-B" } });
+  await (r.replicaB as any).emitActivity("a", "offline", "", "none", r.clock.now());
+  assert.deepEqual(r.coarse(r.emittedB), ["offline"]);
+  await (r.replicaA as any).emitActivity("a", "offline", "", "none", r.clock.now());
+  assert.deepEqual(r.coarse(r.emittedA), ["offline"], "A holds it locally: feeds");
+  r.shutdown();
+});
+
+test("a Raft action on another replica: a busy shared status older than ACTIVITY_STALE_SEC is stored as online; a fresh one, starting included, as it is", async () => {
+  const cases: Array<[string, { activity: string; detail: string; detailKind: string; ageMs: number }, [string, string]]> = [
+    ["stale busy shared record", { activity: "working", detail: "Editing file", detailKind: "action", ageMs: 30 * 60_000 }, ["online", ""]],
+    ["fresh busy shared record", { activity: "thinking", detail: "", detailKind: "other", ageMs: 5_000 }, ["thinking", ""]],
+    ["fresh starting shared record", { activity: "working", detail: "Starting", detailKind: "starting", ageMs: 5_000 }, ["working", "Starting"]],
+  ];
+  for (const [name, record, expected] of cases) {
+    const r = twoReplicas();
+    r.shared.activities.set("a", { activity: record.activity, detail: record.detail, detailKind: record.detailKind, observedAtMs: r.clock.now() - record.ageMs, updatedAt: r.clock.now() - record.ageMs });
+    await r.replicaB.recordAgentRaftAction("a", { title: "Created 1 task", text: "target: #general" });
+    assert.deepEqual(r.replicaB.persistedRows.map((stored) => [stored.activity, stored.detail]), [expected], name);
+    assert.deepEqual(r.emittedB, [], `${name}: nothing pushed`);
+    r.shutdown();
+  }
+});
+
 function fakeSocket() {
   const joined: string[] = [];
   const emits: Array<[string, unknown]> = [];

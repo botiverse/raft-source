@@ -23,9 +23,11 @@ test("the agreed bounds table (design lead, 2026-10-21; right-hand maxima task #
     workspaceTree: [256, 180, 480, "slock:workspaceTreeWidth", null],
     // Task v2 side sections: flat against the panel's edge, no gutter (task #165).
     sideCards: [360, 160, toMainMin, "slock:channelSideCardsWidth", 280],
+    // The Artifact viewer's comment list, inside the Artifact's column: its old fixed 340 by default, 280 at least.
+    artifactComments: [340, 280, toMainMin, "slock:artifactCommentsWidth", null],
   });
   const growing = Object.entries(COLUMN_BOUNDS).filter(([, b]) => "growsToMainMin" in b && b.growsToMainMin).map(([id]) => id);
-  assert.deepEqual(growing, ["thread", "detail", "sideCards"]);
+  assert.deepEqual(growing, ["thread", "detail", "sideCards", "artifactComments"]);
   assert.equal(MAIN_COLUMN_MIN_WIDTH, 360);
 });
 
@@ -40,6 +42,9 @@ test("a right-hand column grows until the conversation beside it is down to 360 
   assert.equal(growToMainMinMax("detail", 500, 300), 500);
   assert.equal(growToMainMinMax("sideCards", 200, 300), 200);
   assert.equal(growToMainMinMax("sideCards", 120, 300), 160, "never under the column's 160");
+  // The Artifact's comment list beside its content: up to what leaves the content 360, never under its own 280.
+  assert.equal(growToMainMinMax("artifactComments", 340, 640), 620);
+  assert.equal(growToMainMinMax("artifactComments", 280, 360), 280);
   // Never past the safety bound, and fractions of a pixel round down so the conversation keeps its full 360.
   assert.equal(growToMainMinMax("thread", 8000, 9000), GROWS_TO_MAIN_MIN_SAFETY_MAX);
   assert.equal(growToMainMinMax("thread", 400.6, 760.2), 800);

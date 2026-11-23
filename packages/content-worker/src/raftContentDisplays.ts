@@ -9,7 +9,7 @@
  * the same `sandbox` (P099). No popups, no top navigation: links go to the
  * host through `openLink`, which Raft opens in a new tab with `noopener`.
  *
- * Porthole 0.16.0 (0.12 from Tenny, 2026-10-26), for `comments` (P090, P108,
+ * Porthole 0.17.2 (0.12 from Tenny, 2026-10-26), for `comments` (P090, P108,
  * P109: `comments.open(anchor, { draft })` opens Raft's composer at the page's
  * anchor; the page never reads or posts a comment) and the comment mode's
  * annotations (P112, P115-P117; P118 is the web's React binding only; 0.14.3's
@@ -71,7 +71,10 @@ export const raftDisplays = defineDisplays({
       // no proof of a click: the shell stops no call of the page's for want of one, and the
       // web's bridge refuses none. What that check guarded is Raft's own to hold (the web's
       // artifactPageOpenGate says how). `copyText` still needs a click.
-      capabilities: { annotate: {}, comments: {}, copyText: {}, find: {}, openLink: {} },
+      // `linkLabels` (P151, #proj-workspace:#336): the web's titles for the page's bare links to
+      // other Artifacts, from the links route (host to frame only; the page reports nothing). The
+      // Markdown page draws them as chips (src/markdown.ts, `data-porthole-label`).
+      capabilities: { annotate: {}, comments: {}, copyText: {}, find: {}, linkLabels: {}, openLink: {} },
       layout: { kind: "fill" },
       errors: "host",
       // Added to Porthole's names, for the Markdown page (src/markdown.ts): colours Raft's theme

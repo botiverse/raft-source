@@ -27,7 +27,7 @@ test("the Worker's display capabilities are the web's, and the fake content serv
   const worker = Object.keys(raftDisplays.guideConfig("artifact", "served").capabilities ?? {})
     .filter((name) => !["reportError", "resize"].includes(name))
     .sort();
-  assert.deepEqual(worker, ["annotate", "comments", "copyText", "find", "openLink"]);
+  assert.deepEqual(worker, ["annotate", "comments", "copyText", "find", "linkLabels", "openLink"]);
   assert.deepEqual(declaredIn("web/src/apps/artifacts/ArtifactFrame.tsx", "export const RAFT_ARTIFACT_DISPLAYS"), worker);
   assert.deepEqual(declaredIn("web/scripts/fake-artifact-content.ts", "const displays = defineDisplays"), worker);
   assert.deepEqual(declaredIn("content-worker/src/raftContentDisplays.ts", "export const raftDisplays"), worker);

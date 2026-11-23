@@ -187,8 +187,13 @@ export function filtersFromSearch(params: URLSearchParams): LogFilters {
   return { agents: list("agent"), computers: list("computer"), from: list("from"), to: list("to"), outcomes, days: Number.isFinite(days) && days > 0 ? days : null };
 }
 
-export function searchFromFilters(f: LogFilters): URLSearchParams {
+/** How the log is shown: the chord chart, or a table with one row per move. Kept in the URL with the filters. */
+export type LogView = "chart" | "table";
+export const viewFromSearch = (params: URLSearchParams): LogView => (params.get("view") === "table" ? "table" : "chart");
+
+export function searchFromFilters(f: LogFilters, view: LogView = "chart"): URLSearchParams {
   const p = new URLSearchParams();
+  if (view === "table") p.set("view", "table");
   if (f.agents.length) p.set("agent", f.agents.join(","));
   if (f.computers.length) p.set("computer", f.computers.join(","));
   if (f.from.length) p.set("from", f.from.join(","));
@@ -234,3 +239,17 @@ export const OUTCOME_LABEL = {
   failed: "agent.migrationLog.outcome.failed",
   canceled: "agent.migrationLog.outcome.canceled",
 } as const;
+
+/** A move's duration in seconds, once it has ended. */
+export const durationSec = (e: AgentMigrationLogEntry) => (e.endedAt ? Math.max(0, Math.round((Date.parse(e.endedAt) - Date.parse(e.startedAt)) / 1000)) : null);
+
+/**
+ * The moves whose texts (`textsOf`: the agent's name, both computers' names and
+ * codes, the names they had then) contain the query, case-insensitively; all of
+ * them for an empty query.
+ */
+export function searchEntries(entries: AgentMigrationLogEntry[], query: string, textsOf: (e: AgentMigrationLogEntry) => Array<string | null | undefined>): AgentMigrationLogEntry[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return entries;
+  return entries.filter((e) => textsOf(e).some((text) => text?.toLowerCase().includes(q)));
+}

@@ -2061,3 +2061,44 @@ export function classifyDaemonActivityObservation(input: {
   if (!input.lastAccepted) return "observed";
   return contentUnchanged ? "replayed" : "observed";
 }
+
+// #oar-raft:#22: liveness refresh, the one write a replayed heartbeat may make.
+// A daemon re-sends its unchanged activity every 60 s while it is busy (legacy
+// ACTIVITY_HEARTBEAT_MS, OAR HEARTBEAT_INTERVAL_MS), and stops when the runtime
+// stops or stalls. Such a heartbeat is no new observation (prop5: a replay never
+// advances the kernel's observed clock, and a server receive time must never
+// order daemon-clocked facts), but it does prove the stored state is still
+// current. So it may refresh ONLY a separate liveness stamp beside the snapshot,
+// at the server's receive time: no projection change, no activity log row, no
+// broadcast of its own, under either arbitration mode. The read path and the
+// stale sweep age a snapshot by the later of its observed time and this stamp.
+// Only the declared bit qualifies (never content guessing), only a replay of
+// exactly the stored activity, and only from the agent's current launch: a
+// heartbeat with changed content keeps the ordinary path, and a stale launch's
+// heartbeat proves nothing about the current one.
+export type ActivityLivenessRefreshDecision =
+  | { action: "liveness_refresh"; reason: "replayed_heartbeat_same_content" }
+  | {
+      action: "none";
+      reason: "not_declared_heartbeat" | "not_replayed" | "stale_launch" | "no_current_snapshot" | "content_changed";
+    };
+
+export function planActivityLivenessRefresh(input: {
+  /** Producer-declared heartbeat bit (`isHeartbeat === true`). */
+  declaredHeartbeat: boolean;
+  observationClass: LifecycleObservationClass;
+  /** The frame's launch is known to differ from the agent's current launch. */
+  staleLaunch: boolean;
+  incoming: Pick<LifecycleObservationIdentity, "activity" | "detail" | "detailKind">;
+  current?: Pick<LifecycleObservationIdentity, "activity" | "detail" | "detailKind">;
+}): ActivityLivenessRefreshDecision {
+  if (!input.declaredHeartbeat) return { action: "none", reason: "not_declared_heartbeat" };
+  if (input.observationClass !== "replayed") return { action: "none", reason: "not_replayed" };
+  if (input.staleLaunch) return { action: "none", reason: "stale_launch" };
+  if (!input.current) return { action: "none", reason: "no_current_snapshot" };
+  const sameContent = input.incoming.activity === input.current.activity
+    && input.incoming.detail === input.current.detail
+    && input.incoming.detailKind === input.current.detailKind;
+  if (!sameContent) return { action: "none", reason: "content_changed" };
+  return { action: "liveness_refresh", reason: "replayed_heartbeat_same_content" };
+}

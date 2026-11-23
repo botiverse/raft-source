@@ -5,8 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "vitest";
 import { SERVER_CAPABILITY_MIGRATION_BACKUP_IGNORE_SOURCES_V1, SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1, type MachineToServerMessage, type ServerToMachineMessage } from "@botiverse/raft-shared";
-import { DaemonCore, migrationSummaryMayReportIgnoreSources,
-  migrationSummaryMayReportIgnoredPartial, type RuntimeDetection } from "./core";
+import { changedRuntimeVersions, DaemonCore, migrationSummaryMayReportIgnoreSources,
+  migrationSummaryMayReportIgnoredPartial, migrationSummaryMayReportSkippedUnreadable, type RuntimeDetection } from "./core";
 import type { WebSocketLike } from "./connection";
 import type { RuntimeDetectionRoundOptions, RuntimeDetectionRoundResult } from "./runtimeDetectionRound";
 
@@ -445,4 +445,126 @@ test("a partial mark on the ignored totals needs both the Server and the target 
   assert.equal(migrationSummaryMayReportIgnoredPartial(true, {}), false);
   assert.equal(migrationSummaryMayReportIgnoredPartial(true, { targetAcceptsIgnoredPartial: false }), false);
   assert.equal(migrationSummaryMayReportIgnoredPartial(false, { targetAcceptsIgnoredPartial: true }), false);
+});
+
+test("naming unreadable paths needs both the Server and the target Computer to accept it", () => {
+  assert.equal(migrationSummaryMayReportSkippedUnreadable(true, { targetAcceptsSkippedUnreadable: true }), true);
+  assert.equal(migrationSummaryMayReportSkippedUnreadable(true, {}), false);
+  assert.equal(migrationSummaryMayReportSkippedUnreadable(true, { targetAcceptsSkippedUnreadable: false }), false);
+  assert.equal(migrationSummaryMayReportSkippedUnreadable(false, { targetAcceptsSkippedUnreadable: true }), false);
+});
+
+test("#proj-raft-computer:#120: the quiet version check re-announces only when a runtime CLI changed while connected", async () => {
+  await withCore(async ({ sockets, rounds }) => {
+    const socket = sockets[0]!;
+    socket.emitUpgrade([SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1]);
+    socket.emitOpen();
+    socket.emitContext([SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1]);
+    await tick();
+    rounds.started[0]!.settle({ status: "complete", detection: ROUND_DETECTION, durationMs: 10 });
+    await waitFor(() => socket.readyFrames().length === 2, "the inventory ready");
+
+    // Same versions: the check runs in its own child and tells the server nothing.
+    await waitFor(() => rounds.started.length === 2, "the first quiet check");
+    rounds.started[1]!.settle({ status: "complete", detection: ROUND_DETECTION, durationMs: 10 });
+    await waitFor(() => rounds.started.length === 3, "the next quiet check");
+    assert.equal(socket.readyFrames().length, 2, "an unchanged check sends no ready");
+
+    // An incomplete check decides nothing.
+    rounds.started[2]!.settle({ status: "incomplete", reason: "deadline", detection: { ids: [], versions: {} }, unfinishedRuntimes: ["round-alpha"], durationMs: 10 });
+    await waitFor(() => rounds.started.length === 4, "the check after an incomplete one");
+    assert.equal(socket.readyFrames().length, 2, "an incomplete check sends no ready");
+
+    // round-alpha was upgraded outside Raft: the same re-emit a web rescan does.
+    rounds.started[3]!.settle({ status: "complete", detection: { ids: ["round-alpha", "round-beta"], versions: { "round-alpha": "2.1.0" } }, durationMs: 10 });
+    await waitFor(() => socket.readyFrames().length === 3 && rounds.started.length === 5, "the rescan's pending ready and its detection round");
+    assert.deepEqual(socket.readyFrames()[2]!.runtimeDetection, { status: "pending" });
+    rounds.started[4]!.settle({ status: "complete", detection: { ids: ["round-alpha", "round-beta"], versions: { "round-alpha": "2.1.0" } }, durationMs: 10 });
+    await waitFor(() => socket.readyFrames().length === 4, "the rescan's inventory ready");
+    assert.deepEqual(socket.readyFrames()[3]!.runtimeVersions, { "round-alpha": "2.1.0" });
+  }, { runtimeVersionRecheckIntervalMs: 30 });
+});
+
+test("#proj-raft-computer:#120: a disconnect cancels a quiet check in flight", async () => {
+  await withCore(async ({ sockets, rounds }) => {
+    const socket = sockets[0]!;
+    socket.emitUpgrade([SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1]);
+    socket.emitOpen();
+    socket.emitContext([SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1]);
+    await tick();
+    rounds.started[0]!.settle({ status: "complete", detection: ROUND_DETECTION, durationMs: 10 });
+    await waitFor(() => rounds.started.length === 2, "a quiet check");
+    socket.close();
+    await tick();
+    assert.equal(rounds.started[1]!.cancelled, true);
+  }, { runtimeVersionRecheckIntervalMs: 30 });
+});
+
+test("#proj-raft-computer:#120: changedRuntimeVersions names installs, removals and version changes", () => {
+  const announced = { ids: ["claude", "codex", "grok"], versions: { claude: "2.1.200", codex: "0.163.0" } };
+  assert.deepEqual(changedRuntimeVersions(announced, { ids: ["grok", "codex", "claude"], versions: { claude: "2.1.200", codex: "0.163.0" } }), []);
+  assert.deepEqual(changedRuntimeVersions(announced, { ids: ["claude", "codex", "qwen"], versions: { claude: "2.1.220", codex: "0.163.0", qwen: "0.26.9" } }), ["claude", "grok", "qwen"]);
+  assert.deepEqual(changedRuntimeVersions(announced, { ids: ["claude", "codex", "grok"], versions: { claude: "2.1.200", codex: "0.163.0", grok: "1.0.70" } }), ["grok"]);
+});
+
+test("#proj-raft-computer:#120: a detection the quiet check already rescanned for does not rescan again", async () => {
+  await withCore(async ({ sockets, rounds }) => {
+    const socket = sockets[0]!;
+    socket.emitUpgrade([SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1]);
+    socket.emitOpen();
+    socket.emitContext([SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1]);
+    await tick();
+    rounds.started[0]!.settle({ status: "complete", detection: ROUND_DETECTION, durationMs: 10 });
+    await waitFor(() => rounds.started.length === 2, "the first quiet check");
+    const flapping = { ids: ["round-alpha", "round-beta"], versions: { "round-alpha": "2.1.0" } };
+    rounds.started[1]!.settle({ status: "complete", detection: flapping, durationMs: 10 });
+    await waitFor(() => rounds.started.length === 3, "the rescan's round");
+    // The rescan's own detection still sees the old version (the probes disagree).
+    rounds.started[2]!.settle({ status: "complete", detection: ROUND_DETECTION, durationMs: 10 });
+    await waitFor(() => socket.readyFrames().length === 4 && rounds.started.length === 4, "the rescan's ready, then the next check");
+    rounds.started[3]!.settle({ status: "complete", detection: flapping, durationMs: 10 });
+    await waitFor(() => rounds.started.length === 5, "the check after that");
+    assert.equal(socket.readyFrames().length, 4, "the same difference again sends no ready");
+  }, { runtimeVersionRecheckIntervalMs: 30 });
+});
+
+test("#proj-raft-computer:#120: no quiet check against a server without async detection", async () => {
+  await withCore(async ({ sockets, rounds }) => {
+    const socket = sockets[0]!;
+    socket.emitUpgrade(null);
+    socket.emitOpen();
+    socket.emitContext();
+    await waitFor(() => socket.readyFrames().length === 1, "the synchronous ready");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(rounds.started.length, 0, "the in-process probes and the child's would not compare");
+    assert.equal(socket.readyFrames().length, 1);
+  }, { runtimeVersionRecheckIntervalMs: 30 });
+});
+
+test("#proj-raft-computer:#120: after a converged check, a return to an earlier changed version rescans again", async () => {
+  await withCore(async ({ sockets, rounds }) => {
+    const socket = sockets[0]!;
+    socket.emitUpgrade([SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1]);
+    socket.emitOpen();
+    socket.emitContext([SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1]);
+    await tick();
+    const v1 = { ids: ["round-alpha", "round-beta"], versions: { "round-alpha": "2.1.0" } };
+    rounds.started[0]!.settle({ status: "complete", detection: ROUND_DETECTION, durationMs: 10 });
+    await waitFor(() => rounds.started.length === 2, "check 1");
+    rounds.started[1]!.settle({ status: "complete", detection: v1, durationMs: 10 });
+    await waitFor(() => rounds.started.length === 3, "rescan to v1");
+    rounds.started[2]!.settle({ status: "complete", detection: v1, durationMs: 10 });
+    await waitFor(() => socket.readyFrames().length === 4 && rounds.started.length === 4, "v1 announced, check 2");
+    // Rolled back and announced (here: a web rescan).
+    rounds.started[3]!.settle({ status: "complete", detection: v1, durationMs: 10 });
+    await waitFor(() => rounds.started.length === 5, "check 3 (converged)");
+    socket.emitServerMessage({ type: "machine:runtimes:rescan" });
+    await waitFor(() => rounds.started.length === 6 && rounds.started[4]!.cancelled, "the web rescan's round replaces the check in flight");
+    rounds.started[5]!.settle({ status: "complete", detection: ROUND_DETECTION, durationMs: 10 });
+    await waitFor(() => rounds.started.length === 7, "the next check after the rescan's ready");
+    // Upgraded to v1 again: rescans, though v1 triggered a rescan before.
+    const readiesBefore = socket.readyFrames().length;
+    rounds.started[6]!.settle({ status: "complete", detection: v1, durationMs: 10 });
+    await waitFor(() => socket.readyFrames().length > readiesBefore, "the re-upgrade is announced");
+  }, { runtimeVersionRecheckIntervalMs: 30 });
 });

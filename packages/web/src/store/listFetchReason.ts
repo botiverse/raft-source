@@ -1,5 +1,5 @@
-import { INBOX_REFRESH_COALESCED_HEADER, INBOX_REFRESH_TRIGGER_HEADER } from "@botiverse/raft-shared";
-import type { InboxRefreshTrigger } from "@botiverse/raft-shared";
+import { INBOX_REFRESH_COALESCED_HEADER, INBOX_REFRESH_REFUSED_HEADER, INBOX_REFRESH_TRIGGER_HEADER } from "@botiverse/raft-shared";
+import type { InboxRefreshRefusal, InboxRefreshTrigger } from "@botiverse/raft-shared";
 import { CHANNEL_DETAIL_REASON_HEADER } from "./channelDetailReason";
 
 /**
@@ -30,16 +30,25 @@ export type ListFetchReason =
 /**
  * The realtime event behind a throttled background re-read (#triage:#229): the
  * FIRST trigger folded into it and how many requests it stands for (>= 1).
+ * `refused` (#244): why that first request's live message could not patch its
+ * row in place (message_new, thread_reply only).
  */
-export type InboxRefreshTriggerCount = { trigger: InboxRefreshTrigger; coalesced: number };
+export type InboxRefreshTriggerCount = { trigger: InboxRefreshTrigger; coalesced: number; refused?: InboxRefreshRefusal };
 
-/** Fold `next` into `first`: the first trigger stays, the counts add up. Never mutates either. */
+/** Triggers whose read says why the in-place patch was refused (`X-Raft-Fetch-Refused`). */
+const REFUSAL_TRIGGERS: ReadonlySet<InboxRefreshTrigger> = new Set(["message_new", "thread_reply"]);
+
+/**
+ * Fold `next` into `first`: the first trigger and its refusal stay (the refusal
+ * is the first request's, even when it had none), the counts add up. Never
+ * mutates either.
+ */
 export function foldInboxRefreshTrigger(
   first: InboxRefreshTriggerCount | undefined,
   next: InboxRefreshTriggerCount | undefined,
 ): InboxRefreshTriggerCount | undefined {
   if (!first || !next) return first ?? next;
-  return { trigger: first.trigger, coalesced: first.coalesced + next.coalesced };
+  return { trigger: first.trigger, coalesced: first.coalesced + next.coalesced, ...(first.refused ? { refused: first.refused } : {}) };
 }
 
 export function listFetchReasonHeaders(
@@ -53,6 +62,7 @@ export function listFetchReasonHeaders(
   if (trigger && reason === "realtime_fallback") {
     headers[INBOX_REFRESH_TRIGGER_HEADER] = trigger.trigger;
     headers[INBOX_REFRESH_COALESCED_HEADER] = String(trigger.coalesced);
+    if (trigger.refused && REFUSAL_TRIGGERS.has(trigger.trigger)) headers[INBOX_REFRESH_REFUSED_HEADER] = trigger.refused;
   }
   return Object.keys(headers).length > 0 ? headers : undefined;
 }

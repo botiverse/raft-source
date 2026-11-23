@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT,
+  MAX_AGENT_MIGRATION_SKIPPED_UNREADABLE_PATHS,
   MAX_AGENT_MIGRATION_TRANSPORT_BYTES,
   MAX_AGENT_MIGRATION_TRANSFER_BYTES,
   MAX_AGENT_MIGRATION_TRANSFER_FILE_COUNT,
@@ -114,4 +115,18 @@ test("migration transfer summary: excludedIgnoredPartial is only `true`, and onl
   assert.deepEqual(agentMigrationTransferSummarySchema.parse(withIgnored), withIgnored);
   assert.equal(agentMigrationTransferSummarySchema.safeParse({ ...withIgnored, excludedIgnoredPartial: false }).success, false);
   assert.equal(agentMigrationTransferSummarySchema.safeParse({ ...VALID_SUMMARY, excludedIgnoredPartial: true }).success, false);
+});
+
+test("migration transfer summary: skippedUnreadable is bounded and names no more paths than it counts", () => {
+  const withSkipped = { ...VALID_SUMMARY, skippedUnreadable: { count: 3, paths: ["a.log", "cache/"] } };
+  assert.deepEqual(agentMigrationTransferSummarySchema.parse(withSkipped), withSkipped);
+  for (const skippedUnreadable of [
+    { count: 0, paths: [] },
+    { count: 1, paths: [] },
+    { count: 1, paths: ["a", "b"] },
+    { count: 30, paths: Array.from({ length: MAX_AGENT_MIGRATION_SKIPPED_UNREADABLE_PATHS + 1 }, (_, i) => `f${i}`) },
+    { count: 1, paths: ["a"], extra: true },
+  ]) {
+    assert.equal(agentMigrationTransferSummarySchema.safeParse({ ...VALID_SUMMARY, skippedUnreadable }).success, false, JSON.stringify(skippedUnreadable));
+  }
 });

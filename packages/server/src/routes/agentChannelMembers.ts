@@ -11,7 +11,7 @@ import { getActorServerRoleInServer } from "../lib/actorPermissions";
 import { actorHasChannelCapability, resolveChannelActorContext, channelActorHasCapability, withLockedChannelActorCapability } from "../lib/channelActorPermissions";
 import { addTraceEvent, errorClassOf } from "../tracing/semanticTrace";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
-import { agentRefusalBody, agentServerRoleRequiredBody, asSentence } from "../lib/agentServerRoleRequired";
+import { AGENT_CHANNEL_ID_NOT_FOUND_REFUSAL, AGENT_NO_LONGER_EXISTS_REFUSAL, agentRefusalBody, agentServerRoleRequiredBody, asSentence, type AgentRouteResult } from "../lib/agentServerRoleRequired";
 
 export interface AgentChannelMemberActor {
   id: string;
@@ -19,15 +19,13 @@ export interface AgentChannelMemberActor {
   serverId: string;
 }
 
-export interface AgentChannelMemberAddResult {
-  status: number;
-  body: Record<string, unknown>;
-}
+export type AgentChannelMemberAddResult = AgentRouteResult;
 
-export interface AgentChannelMemberRemoveResult {
-  status: number;
-  body: Record<string, unknown>;
-}
+export type AgentChannelMemberRemoveResult = AgentRouteResult;
+
+const THREAD_MEMBERSHIP_REFUSAL: RefusalInput = { code: "thread_membership", error: "Thread membership is managed via follow/unfollow" };
+const UNSUPPORTED_CHANNEL_TYPE_REFUSAL: RefusalInput = { code: "unsupported_channel_type", error: "Only public, private, or joint channels are supported" };
+const CHANNEL_ARCHIVED_REFUSAL: RefusalInput = { code: "channel_archived", error: "This channel is archived" };
 
 type Target =
   | { type: "human"; id: string; name: string }
@@ -63,12 +61,6 @@ export async function removeUnlessLastMember(remove: () => Promise<channelServic
 }
 
 /** 409 `last_member_deletes_channel`: what it would have deleted, and the call that does it (CLI form; the SDK writes its own). */
-export function lastMemberRefusalBody(input: { target: string; member?: { user: string } | { agent: string } }) {
-  const { message, nextAction } = formatLastMemberRefusal(input);
-  return agentRefusalBody(message, LAST_MEMBER_DELETES_CHANNEL, nextAction);
-}
-
-/** The same refusal for refuse(). */
 export function lastMemberRefusal(input: { target: string; member?: { user: string } | { agent: string } }): RefusalInput {
   const { message, nextAction } = formatLastMemberRefusal(input);
   return { code: LAST_MEMBER_DELETES_CHANNEL, error: message, suggestedNextAction: nextAction };
@@ -80,7 +72,7 @@ function normalizeHandle(raw: unknown): string | null {
   return value || null;
 }
 
-function pickTarget(payload: Record<string, unknown>): { target?: TargetRequest; error?: string } {
+function pickTarget(payload: Record<string, unknown>): { target?: TargetRequest; refusal?: RefusalInput } {
   const requests: TargetRequest[] = [];
   if (typeof payload.userId === "string" && payload.userId.trim()) {
     requests.push({ type: "human", id: payload.userId.trim() });
@@ -96,10 +88,10 @@ function pickTarget(payload: Record<string, unknown>): { target?: TargetRequest;
   if (agentHandle) requests.push({ type: "agent", name: agentHandle });
 
   if (requests.length === 0) {
-    return { error: "One of userId, agentId, user, human, or agent is required" };
+    return { refusal: { code: "invalid_member_target", error: "One of userId, agentId, user, human, or agent is required" } };
   }
   if (requests.length > 1) {
-    return { error: "Provide exactly one member target" };
+    return { refusal: { code: "invalid_member_target", error: "Provide exactly one member target" } };
   }
   return { target: requests[0] };
 }
@@ -110,24 +102,34 @@ type TargetRequest =
   | { type: "human"; name: string; id?: never }
   | { type: "agent"; name: string; id?: never };
 
-async function resolveTarget(serverId: string, request: TargetRequest, jointRemovalChannelId?: string): Promise<{ target?: Target; error?: string }> {
+const USER_NOT_IN_SERVER_REFUSAL: RefusalInput = { code: "user_not_in_server", error: "User is not a member of this server" };
+const AGENT_NOT_IN_SERVER_REFUSAL: RefusalInput = { code: "agent_not_in_server", error: "Agent not found in this server" };
+
+async function resolveTarget(serverId: string, request: TargetRequest, jointRemovalChannelId?: string): Promise<{ target?: Target; refusal?: RefusalInput }> {
   if (jointRemovalChannelId) {
     // Resolve only visible current J members, never a global agent directory.
     const members = await channelService.getChannelMembers(jointRemovalChannelId);
     const candidates = request.type === "human" ? members.humans : members.agents;
     const matches = candidates.filter(candidate => request.id ? candidate.id === request.id : candidate.name === request.name);
-    if (matches.length !== 1) return { error: matches.length ? "Member handle is ambiguous; use its ID" : "Member not found in this channel" };
+    if (matches.length !== 1) {
+      return {
+        refusal: matches.length
+          ? { code: "member_ambiguous", error: "Member handle is ambiguous; use its ID" }
+          : { code: "channel_member_not_found", error: "Member not found in this channel" },
+      };
+    }
     return { target: { type: request.type, id: matches[0]!.id, name: matches[0]!.name } };
   }
   if (request.type === "human") {
     if (request.id) {
-      const role = await getActorServerRoleInServer(serverId, "user", request.id);
-      if (!role) return { error: "User is not a member of this server" };
+      // Whether there is a membership to address (a deleted account's kept row included), not authority.
+      const role = await serverService.getMemberRoleIncludingRetired(serverId, request.id);
+      if (!role) return { refusal: USER_NOT_IN_SERVER_REFUSAL };
       const human = (await serverService.getServerMembers(serverId, null)).find((candidate) => candidate.userId === request.id);
       return { target: { type: "human", id: request.id, name: human?.name ?? request.id } };
     }
     const human = (await serverService.getServerMembers(serverId, null)).find((candidate) => candidate.name === request.name);
-    if (!human) return { error: "User is not a member of this server" };
+    if (!human) return { refusal: USER_NOT_IN_SERVER_REFUSAL };
     return { target: { type: "human", id: human.userId, name: human.name } };
   }
 
@@ -136,11 +138,11 @@ async function resolveTarget(serverId: string, request: TargetRequest, jointRemo
   // by handle, rather than refused later by addAgent.
   if (request.id) {
     const agent = await agentService.getAgent(request.id);
-    if (!agent || agent.serverId !== serverId || agent.assistantOwnerUserId) return { error: "Agent not found in this server" };
+    if (!agent || agent.serverId !== serverId || agent.assistantOwnerUserId) return { refusal: AGENT_NOT_IN_SERVER_REFUSAL };
     return { target: { type: "agent", id: agent.id, name: agent.name } };
   }
   const agent = (await agentService.listAgents(serverId)).find((candidate) => candidate.name === request.name && !candidate.assistantOwnerUserId);
-  if (!agent) return { error: "Agent not found in this server" };
+  if (!agent) return { refusal: AGENT_NOT_IN_SERVER_REFUSAL };
   return { target: { type: "agent", id: agent.id, name: agent.name } };
 }
 
@@ -177,7 +179,11 @@ async function broadcastMembershipSystemMessage(
       .filter((candidate) => candidate.id !== target.id)
       .map((candidate) => candidate.id);
   }
-  const broadcast = persistedMessage
+  // A joint channel's notice is stored in canonical storage and fanned out to
+  // every server's copy (broadcastSystemMessageToLocalSurfaces); the plain
+  // writer would store it in this server's copy, which owns no storage
+  // (slock issue 15637 step 2: those rows reached no other server).
+  const broadcast = persistedMessage || channel.type === "joint"
     ? messageService.broadcastSystemMessageToLocalSurfaces
     : messageService.broadcastSystemMessage;
   await broadcast(
@@ -220,7 +226,7 @@ export async function addChannelMemberForAgent(input: {
       reason: "agent_server_mismatch",
       status_code: 401,
     });
-    return { status: 401, body: { error: "Agent no longer exists" } };
+    return { ok: false, status: 401, refusal: AGENT_NO_LONGER_EXISTS_REFUSAL };
   }
 
   const channel = await channelService.getChannel(channelId);
@@ -229,7 +235,7 @@ export async function addChannelMemberForAgent(input: {
       reason: "channel_not_found",
       status_code: 404,
     });
-    return { status: 404, body: { error: "Channel not found" } };
+    return { ok: false, status: 404, refusal: AGENT_CHANNEL_ID_NOT_FOUND_REFUSAL };
   }
   const canAccessChannel = await channelService.canAgentAccessChannel(channel.id, actor.id);
   const actorRole = await getActorServerRoleInServer(serverId, "agent", actor.id);
@@ -244,7 +250,7 @@ export async function addChannelMemberForAgent(input: {
       reason: "channel_not_visible",
       status_code: 404,
     });
-    return { status: 404, body: { error: "Channel not found" } };
+    return { ok: false, status: 404, refusal: AGENT_CHANNEL_ID_NOT_FOUND_REFUSAL };
   }
   if (isSubConversationType(channel.type)) {
     addTraceEvent("agent_channel_member_add.validation.failed", { reason: "thread_channel" });
@@ -252,7 +258,7 @@ export async function addChannelMemberForAgent(input: {
       reason: "thread_channel",
       status_code: 400,
     });
-    return { status: 400, body: { error: "Thread membership is managed via follow/unfollow" } };
+    return { ok: false, status: 400, refusal: THREAD_MEMBERSHIP_REFUSAL };
   }
   // Joint channels carry ordinary membership under the same admission rules
   // (canAddChannelMembers): candidates resolve from this server only, and the
@@ -263,21 +269,22 @@ export async function addChannelMemberForAgent(input: {
       reason: "unsupported_channel_type",
       status_code: 400,
     });
-    return { status: 400, body: { error: "Only public, private, or joint channels are supported" } };
+    return { ok: false, status: 400, refusal: UNSUPPORTED_CHANNEL_TYPE_REFUSAL };
   }
   if (channel.archivedAt) {
     addTraceEvent("agent_channel_member_add.request.failed", {
       reason: "channel_archived",
       status_code: 409,
     });
-    return { status: 409, body: { error: "This channel is archived", code: "channel_archived" } };
+    return { ok: false, status: 409, refusal: CHANNEL_ARCHIVED_REFUSAL };
   }
   // Two refusals the role check would misreport as "ask an admin".
   if (channelService.isAllSystemChannel(channel)) {
     addTraceEvent("agent_channel_member_add.request.failed", { reason: "all_channel", status_code: 403 });
     return {
+      ok: false,
       status: 403,
-      body: agentRefusalBody(
+      refusal: agentRefusalBody(
         "Cannot add members to the #all channel",
         "all_channel_membership_fixed",
         "Everyone on the server is already in #all; there is nobody to add. Do not retry.",
@@ -288,8 +295,9 @@ export async function addChannelMemberForAgent(input: {
   if (!canManageUnjoined && !await channelService.isChannelAgent(channel.id, actor.id)) {
     addTraceEvent("agent_channel_member_add.request.failed", { reason: "channel_membership_required", status_code: 403 });
     return {
+      ok: false,
       status: 403,
-      body: agentRefusalBody(
+      refusal: agentRefusalBody(
         "Agent must be a member of this channel to add members",
         "channel_membership_required",
         `Join #${channel.name} first (for a private channel, ask a member to add you), then retry.`,
@@ -306,7 +314,7 @@ export async function addChannelMemberForAgent(input: {
       reason: "capability_required",
       status_code: 403,
     });
-    return { status: 403, body: await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["addChannelMembers"], action: "add channel members" }) };
+    return { ok: false, status: 403, refusal: await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["addChannelMembers"], action: "add channel members" }) };
   }
 
   const payload = typeof body === "object" && body !== null ? body as Record<string, unknown> : {};
@@ -317,7 +325,7 @@ export async function addChannelMemberForAgent(input: {
       reason: "invalid_target",
       status_code: 400,
     });
-    return { status: 400, body: { error: requested.error ?? "Invalid member target" } };
+    return { ok: false, status: 400, refusal: requested.refusal ?? { code: "invalid_member_target", error: "Invalid member target" } };
   }
 
   const resolved = await resolveTarget(serverId, requested.target);
@@ -329,13 +337,13 @@ export async function addChannelMemberForAgent(input: {
       reason: requested.target.type === "agent" ? "agent_not_found" : "user_not_server_member",
       status_code: 400,
     });
-    return { status: 400, body: { error: resolved.error ?? "Member not found" } };
+    return { ok: false, status: 400, refusal: resolved.refusal ?? { code: "member_not_found", error: "Member not found" } };
   }
 
   const target = resolved.target;
   if (target.type === "agent" && await isLoungeOutsiderAgent(channel.id, target.id)) {
     addTraceEvent("agent_channel_member_add.request.failed", { reason: "agent_lounge_outsider", status_code: 403 });
-    return { status: 403, body: { error: AGENT_LOUNGE_OUTSIDER_ADD_REFUSAL, code: "agent_lounge_outsider" } };
+    return { ok: false, status: 403, refusal: { code: "agent_lounge_outsider", error: AGENT_LOUNGE_OUTSIDER_ADD_REFUSAL } };
   }
   let alreadyMember = false;
 
@@ -391,6 +399,7 @@ export async function addChannelMemberForAgent(input: {
       channel_visibility: channel.type === "private" ? "private" : "public",
     });
     return {
+      ok: true,
       status: 200,
       body: {
         ok: true,
@@ -402,11 +411,24 @@ export async function addChannelMemberForAgent(input: {
   } catch (err) {
     if (err instanceof Error && err.message === channelService.ASSISTANT_CHANNEL_FORBIDDEN_MESSAGE) {
       return {
+        ok: false,
         status: 403,
-        body: agentRefusalBody(
+        refusal: agentRefusalBody(
           err.message,
           channelService.ASSISTANT_CHANNEL_FORBIDDEN_CODE,
           "A personal assistant stays in its DM with its owner and cannot be added to channels. Do not retry.",
+        ),
+      };
+    }
+    if (err instanceof Error && err.message === channelService.GUEST_OTHER_CHANNEL_MESSAGE) {
+      addTraceEvent("agent_channel_member_add.request.failed", { reason: "guest_other_channel", status_code: 403 });
+      return {
+        ok: false,
+        status: 403,
+        refusal: agentRefusalBody(
+          err.message,
+          channelService.GUEST_OTHER_CHANNEL_CODE,
+          "A Guest stays in the one channel it was invited to. Do not retry; ask a server owner or admin to make them a member if they belong here.",
         ),
       };
     }
@@ -415,14 +437,14 @@ export async function addChannelMemberForAgent(input: {
         reason: "capability_required_under_lock",
         status_code: 403,
       });
-      return { status: 403, body: await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["addChannelMembers"], action: "add channel members" }) };
+      return { ok: false, status: 403, refusal: await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["addChannelMembers"], action: "add channel members" }) };
     }
     addTraceEvent("agent_channel_member_add.request.failed", {
       reason: "unexpected_error",
       status_code: 500,
       error_class: errorClassOf(err),
     });
-    return { status: 500, body: { error: "Failed to add member" } };
+    return { ok: false, status: 500, body: { error: "Failed to add member" } };
   }
 }
 
@@ -432,7 +454,7 @@ function lastMemberRefused(channel: { name: string }, target: Target): AgentChan
     status_code: 409,
   });
   const member = target.type === "agent" ? { agent: `@${target.name}` } : { user: `@${target.name}` };
-  return { status: 409, body: lastMemberRefusalBody({ target: `#${channel.name}`, member }) };
+  return { ok: false, status: 409, refusal: lastMemberRefusal({ target: `#${channel.name}`, member }) };
 }
 
 export async function removeChannelMemberForAgent(input: {
@@ -453,7 +475,7 @@ export async function removeChannelMemberForAgent(input: {
       reason: "agent_server_mismatch",
       status_code: 401,
     });
-    return { status: 401, body: { error: "Agent no longer exists" } };
+    return { ok: false, status: 401, refusal: AGENT_NO_LONGER_EXISTS_REFUSAL };
   }
 
   const channel = await channelService.getChannel(channelId);
@@ -462,7 +484,7 @@ export async function removeChannelMemberForAgent(input: {
       reason: "channel_not_found",
       status_code: 404,
     });
-    return { status: 404, body: { error: "Channel not found" } };
+    return { ok: false, status: 404, refusal: AGENT_CHANNEL_ID_NOT_FOUND_REFUSAL };
   }
   // Visibility before the channel-type refusals: an id the agent cannot see
   // answers 404 whatever its type, exactly like an id that does not exist
@@ -473,7 +495,7 @@ export async function removeChannelMemberForAgent(input: {
       reason: "channel_not_visible",
       status_code: 404,
     });
-    return { status: 404, body: { error: "Channel not found" } };
+    return { ok: false, status: 404, refusal: AGENT_CHANNEL_ID_NOT_FOUND_REFUSAL };
   }
   if (isSubConversationType(channel.type)) {
     addTraceEvent("agent_channel_member_remove.validation.failed", { reason: "thread_channel" });
@@ -481,7 +503,7 @@ export async function removeChannelMemberForAgent(input: {
       reason: "thread_channel",
       status_code: 400,
     });
-    return { status: 400, body: { error: "Thread membership is managed via follow/unfollow" } };
+    return { ok: false, status: 400, refusal: THREAD_MEMBERSHIP_REFUSAL };
   }
   // Joint channels carry ordinary membership under the same admission rules
   // (canAddChannelMembers): candidates resolve from this server only, and the
@@ -492,7 +514,7 @@ export async function removeChannelMemberForAgent(input: {
       reason: "unsupported_channel_type",
       status_code: 400,
     });
-    return { status: 400, body: { error: "Only public, private, or joint channels are supported" } };
+    return { ok: false, status: 400, refusal: UNSUPPORTED_CHANNEL_TYPE_REFUSAL };
   }
   if (channelService.isAllSystemChannel(channel)) {
     addTraceEvent("agent_channel_member_remove.validation.failed", { reason: "all_channel" });
@@ -501,8 +523,9 @@ export async function removeChannelMemberForAgent(input: {
       status_code: 403,
     });
     return {
+      ok: false,
       status: 403,
-      body: agentRefusalBody(
+      refusal: agentRefusalBody(
         "Cannot remove members from the #all channel",
         "all_channel_membership_fixed",
         "Everyone on the server is in #all, so nobody can be removed from it. Do not retry.",
@@ -517,7 +540,7 @@ export async function removeChannelMemberForAgent(input: {
       reason: "invalid_target",
       status_code: 400,
     });
-    return { status: 400, body: { error: requested.error ?? "Invalid member target" } };
+    return { ok: false, status: 400, refusal: requested.refusal ?? { code: "invalid_member_target", error: "Invalid member target" } };
   }
 
   const actorContext = await resolveChannelActorContext(serverId, channel.id, "agent", actor.id);
@@ -532,14 +555,14 @@ export async function removeChannelMemberForAgent(input: {
       reason: "capability_required",
       status_code: 403,
     });
-    return { status: 403, body: await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["removeChannelMembers"], action: "remove channel members", channelAdminIn: channel.type === "joint" ? undefined : channel.name }) };
+    return { ok: false, status: 403, refusal: await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["removeChannelMembers"], action: "remove channel members", ...(channel.type === "joint" ? { jointChannel: channel.name } : { channelAdminIn: channel.name }) }) };
   }
   if (channel.archivedAt) {
     addTraceEvent("agent_channel_member_remove.request.failed", {
       reason: "channel_archived",
       status_code: 409,
     });
-    return { status: 409, body: { error: "This channel is archived", code: "channel_archived" } };
+    return { ok: false, status: 409, refusal: CHANNEL_ARCHIVED_REFUSAL };
   }
 
   const resolved = await resolveTarget(serverId, requested.target, actorContext?.jointAuthority ? channel.id : undefined);
@@ -551,7 +574,7 @@ export async function removeChannelMemberForAgent(input: {
       reason: requested.target.type === "agent" ? "agent_not_found" : "user_not_server_member",
       status_code: 400,
     });
-    return { status: 400, body: { error: resolved.error ?? "Member not found" } };
+    return { ok: false, status: 400, refusal: resolved.refusal ?? { code: "member_not_found", error: "Member not found" } };
   }
 
   const target = resolved.target;
@@ -607,6 +630,7 @@ export async function removeChannelMemberForAgent(input: {
       channel_visibility: channel.type === "private" ? "private" : "public",
     });
     return {
+      ok: true,
       status: 200,
       body: {
         ok: true,
@@ -624,20 +648,20 @@ export async function removeChannelMemberForAgent(input: {
         reason: "capability_required_under_lock",
         status_code: 403,
       });
-      return { status: 403, body: await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["removeChannelMembers"], action: "remove channel members", channelAdminIn: channel.type === "joint" ? undefined : channel.name }) };
+      return { ok: false, status: 403, refusal: await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["removeChannelMembers"], action: "remove channel members", ...(channel.type === "joint" ? { jointChannel: channel.name } : { channelAdminIn: channel.name }) }) };
     }
     if (msg.includes("Cannot remove")) {
       addTraceEvent("agent_channel_member_remove.request.failed", {
         reason: "forbidden_remove",
         status_code: 403,
       });
-      return { status: 403, body: agentRefusalBody(msg, "channel_member_remove_forbidden", `${asSentence(msg)} Nobody can do this; do not retry.`) };
+      return { ok: false, status: 403, refusal: agentRefusalBody(msg, "channel_member_remove_forbidden", `${asSentence(msg)} Nobody can do this; do not retry.`) };
     }
     addTraceEvent("agent_channel_member_remove.request.failed", {
       reason: "unexpected_error",
       status_code: 500,
       error_class: errorClassOf(err),
     });
-    return { status: 500, body: { error: "Failed to remove member" } };
+    return { ok: false, status: 500, body: { error: "Failed to remove member" } };
   }
 }

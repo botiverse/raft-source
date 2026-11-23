@@ -40,6 +40,23 @@ export default defineConfig({
     // the same scale on the browser makes borders snap to device pixels, as on a device.
     launchOptions: { args: ["--font-render-hinting=none", "--force-device-scale-factor=3"] },
   },
+  // Two projects, so a case's pixels can match its Android lane: `visual` at 3x (the phone
+  // emulator, 480dpi) for every case, and `visual-2x` for the cases that declare their pointer
+  // at density 2 (the Android wide lane, 320dpi: 1280x800 is 2560x1600). The scale is forced on
+  // the browser (above), so it takes a browser of its own. The spec skips, in each project, the
+  // other project's cases.
+  projects: [
+    { name: "visual", use: {} },
+    {
+      name: "visual-2x",
+      // Only the provider spec has 2x cases; the other specs run once, in `visual`.
+      testMatch: /react-provider\.spec\.ts$/,
+      use: {
+        deviceScaleFactor: 2,
+        launchOptions: { args: ["--font-render-hinting=none", "--force-device-scale-factor=2"] },
+      },
+    },
+  ],
   webServer: {
     command: `pnpm exec vite --host 127.0.0.1 --port ${port}`,
     url: `http://127.0.0.1:${port}`,

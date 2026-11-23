@@ -37,6 +37,13 @@ test("task #1268: child main streams one checked line per runtime then done, exi
   const failCode = await runRuntimeDetectionChildMain({ write: (line) => failing.push(line), detect: () => { throw new Error("probe exploded"); } });
   assert.equal(failCode, 1);
   assert.deepEqual(parseRuntimeDetectionChildLine(failing[0] ?? ""), { event: "error", message: "probe exploded" });
+  // The round is asynchronous (detectRuntimesAsync): its result is awaited, and so is its failure.
+  const asyncLines: string[] = [];
+  assert.equal(await runRuntimeDetectionChildMain({ write: (line) => asyncLines.push(line), detect: async () => ({ ids: ["opencode"], versions: { opencode: "opencode v2.3.0" } }) }), 0);
+  assert.deepEqual(parseRuntimeDetectionChildLine(asyncLines[0] ?? ""), { event: "done", detection: { ids: ["opencode"], versions: { opencode: "opencode v2.3.0" } } });
+  const asyncFailing: string[] = [];
+  assert.equal(await runRuntimeDetectionChildMain({ write: (line) => asyncFailing.push(line), detect: async () => { throw new Error("async probe exploded"); } }), 1);
+  assert.deepEqual(parseRuntimeDetectionChildLine(asyncFailing[0] ?? ""), { event: "error", message: "async probe exploded" });
 });
 
 test("task #1268: a complete round returns the child's final detection", async () => {

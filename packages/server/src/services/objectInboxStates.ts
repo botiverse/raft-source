@@ -46,11 +46,17 @@ function homeColumns(home: RecordedObjectEvent["home"]): { homeKind: "conversati
  * this event, unless a newer one is already there (events of one object can
  * commit out of seq order). Rows are written in user order, so concurrent
  * events of one object take their row locks in the same order.
+ *
+ * A recipient marked `read` (ObjectEventRecipient.read: a status change that
+ * asks nothing of anyone) gets the event without an unread: a new row starts
+ * read through it; a row with nothing unread (its newest event at or before
+ * how far the person has read, or Done) moves its read (and its Done) to it,
+ * so it stays read (and stays Done); a row already unread stays unread.
  */
 export async function recordObjectInboxStates(
   executor: DatabaseExecutor,
   event: RecordedObjectEvent,
-  recipients: ReadonlyArray<{ recipientType: "user" | "agent"; recipientId: string; reason: ObjectEventRecipientReason }>,
+  recipients: ReadonlyArray<{ recipientType: "user" | "agent"; recipientId: string; reason: ObjectEventRecipientReason; read?: true }>,
 ): Promise<void> {
   const home = homeColumns(event.home);
   await executor.update(objectInboxStates)
@@ -75,9 +81,17 @@ export async function recordObjectInboxStates(
     lastEventSeq: event.seq,
     lastEventAt: event.createdAt,
     lastMentionSeq: person.reason === "mentioned" ? event.seq : null,
+    // Read through this event from the start; on a conflict, the CASEs below decide.
+    readThroughSeq: person.read === true ? event.seq : null,
   }))).onConflictDoUpdate({
     target: [objectInboxStates.userId, objectInboxStates.objectKind, objectInboxStates.objectId],
     set: {
+      // `excluded.read_through_seq` is set only for a read recipient. Every
+      // right-hand side reads the row as it was, so "nothing unread" is
+      // judged before this event: its newest event at or before the read
+      // frontier (how far read, or Done).
+      readThroughSeq: sql`CASE WHEN excluded.read_through_seq IS NOT NULL AND ${objectInboxStates.lastEventSeq} <= GREATEST(COALESCE(${objectInboxStates.doneThroughSeq}, 0), COALESCE(${objectInboxStates.readThroughSeq}, 0)) THEN GREATEST(COALESCE(${objectInboxStates.readThroughSeq}, 0), excluded.read_through_seq) ELSE ${objectInboxStates.readThroughSeq} END`,
+      doneThroughSeq: sql`CASE WHEN excluded.read_through_seq IS NOT NULL AND ${objectInboxStates.doneThroughSeq} IS NOT NULL AND ${objectInboxStates.lastEventSeq} <= ${objectInboxStates.doneThroughSeq} THEN GREATEST(${objectInboxStates.doneThroughSeq}, excluded.read_through_seq) ELSE ${objectInboxStates.doneThroughSeq} END`,
       lastEventId: sql`CASE WHEN excluded.last_event_seq > ${objectInboxStates.lastEventSeq} THEN excluded.last_event_id ELSE ${objectInboxStates.lastEventId} END`,
       lastEventAt: sql`CASE WHEN excluded.last_event_seq > ${objectInboxStates.lastEventSeq} THEN excluded.last_event_at ELSE ${objectInboxStates.lastEventAt} END`,
       lastEventSeq: sql`GREATEST(${objectInboxStates.lastEventSeq}, excluded.last_event_seq)`,

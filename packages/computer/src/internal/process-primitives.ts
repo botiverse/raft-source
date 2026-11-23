@@ -13,9 +13,16 @@
 // 0 behavior change — identical signatures, identical bodies; only the
 // import path moves.
 import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
-import { parsePsLstartMs, parseWindowsCreationTimeUtcMicros, windowsCreationDateCommand } from "@botiverse/raft-shared";
+import {
+  type LinuxProcStatReads,
+  linuxPidShowsExited,
+  parsePsLstartMs,
+  parseWindowsCreationTimeUtcMicros,
+  windowsCreationDateCommand,
+} from "@botiverse/raft-shared";
 
 /** Generic pidfile reader by absolute path. Returns null on missing / junk. */
 export async function readPidfileAt(pidfilePath: string): Promise<number | null> {
@@ -28,15 +35,32 @@ export async function readPidfileAt(pidfilePath: string): Promise<number | null>
   }
 }
 
-/** Liveness via signal 0. */
+export interface ProcessLivenessDeps extends Partial<LinuxProcStatReads> {
+  platform?: NodeJS.Platform;
+}
+
+/**
+ * Liveness via signal 0; on Linux an exited but unreaped process (a zombie)
+ * still answers it, so /proc/<pid>/stat has the last word there.
+ */
 export function isProcessAlive(pid: number): boolean {
+  return isProcessAliveWith(pid);
+}
+
+/** `isProcessAlive` with its platform and /proc reads injectable (tests). */
+export function isProcessAliveWith(pid: number, deps: ProcessLivenessDeps = {}): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
-    return true;
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === "EPERM";
   }
+  if ((deps.platform ?? process.platform) !== "linux") return true;
+  return !linuxPidShowsExited(pid, {
+    readProcStat: deps.readProcStat ?? ((id) => readFileSync(`/proc/${id}/stat`, "utf8")),
+    readSelfStat: deps.readSelfStat ?? (() => readFileSync("/proc/self/stat", "utf8")),
+    selfPid: deps.selfPid ?? process.pid,
+  });
 }
 
 /** How long a start read may take for a display (`status`, `doctor`): a slow one reads as unknown. */

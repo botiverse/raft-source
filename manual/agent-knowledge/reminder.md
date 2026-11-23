@@ -5,11 +5,12 @@ description: Scheduled wake-up signal — agent-authored, persistent, observable
 ---
 
 {/*
+2026-11-19: "On a Server whose reminders are in the Reminder app" section against packages/cli/src/commands/reminder/_app.ts (gate = agent context features.reminderApp; a legacy write refused with reminders_moved_to_app is redone through the app; cancel falls back to the legacy reminder when the app answers reminder_not_found; list appends legacy scheduled reminders), show.ts, and the Reminder App's actions (botiverse/reminder-app ax-text-replies 1d195ec: create/list/show/update/snooze/cancel-reminder, flat params, top-level text on every answer, id = full or >= 8-char prefix, list status active|paused|finished|cancelled|all).
 Triggers section added 2026-11-10 (body doesn't name the Reminder App, 2026-10-28) against packages/cli/src/commands/reminder/trigger.ts and apps/reminder/log.ts (--key), and the Reminder App's docs/api.md "Triggers" (botiverse/reminder-app#20: outcomes woke/merged/recorded/throttled, mergeWindowSeconds 60-86400 default 600, TRIGGER_WAKE_CAP_PER_HOUR default 30, log keeps 200 entries and 7 days per key, events carry object.ref trigger/<key> so Raft merges unread events of a key into one row).
 Re-verified 2026-10-28 against staging 1883339e9 (public-docs audit fixes):
 - packages/cli/src/commands/reminder/schedule.ts (--message-id required for agent-created; --msg-id is a deprecated alias; no unanchored reminder: fails closed; --tz <iana> overrides host tz for --repeat, rejected without --repeat)
-- packages/server/src/routes/reminderAppRollout.ts + services/reminderAppGate.ts (409 reminders_moved_to_app for schedule/update/snooze; reminder_migrated for a moved reminder on cancel/snooze/update; list/log/cancel keep working)
-- Reminder App: not documented publicly yet, 2026-10-28 (body mentions removed); gate = reminder_app flag (server-scoped, default off) OR app installed+migrated; refusal reminders_moved_to_app on schedule/update/snooze (external agents get reminders_unsupported_for_external_agents first); a moved reminder answers reminder_migrated and has status/event migrated. Event and status lists in the body omit `migrated` on purpose.
+- packages/server/src/routes/reminderAppRollout.ts + services/reminderAppGate.ts (409 reminders_moved_to_app for schedule/update/snooze; reminder_migrated for a moved reminder on cancel/snooze/update; list/log/cancel keep working). Since 2026-11-19 the CLI calls the app on such a Server, so agents no longer see the refusal.
+- Reminder App: not documented publicly yet, 2026-10-28 (body mentions removed; since 2026-11-19 the body names it only where `raft reminder` works with it); gate = reminder_app flag (server-scoped, default off) OR app installed+migrated; refusal reminders_moved_to_app on schedule/update/snooze (external agents get reminders_unsupported_for_external_agents first); a moved reminder answers reminder_migrated and has status/event migrated. Event and status lists in the body omit `migrated` on purpose.
 - packages/web/src/features/agent/AgentDetailPanel.tsx (Reminders tab requests status=scheduled only, label "Pending Reminders"; private tab visible to creator or admin)
 - packages/server/src/apps/reminder/sourceAck.ts + service.ts ackAuthorizedReminderFire (an older fired revision acks fine; the "Source revision is stale" error no longer exists, so the stuck-item paragraph was dropped)
 - packages/shared/src/index.ts ReminderEventType (scheduled/fired/snoozed/updated/canceled/migrated; there is no "dismissed" event); ReminderStatus includes migrated
@@ -41,7 +42,7 @@ The **human-side UI is read-only**. Humans can see pending reminders on an agent
 
 → they want: schedule, check on, or cancel a reminder
 → in the UI: humans view (read-only) on the agent's profile → **Reminders** tab
-→ via CLI: `raft reminder schedule / list / snooze / update / cancel / log` — agent-authoring primitive
+→ via CLI: `raft reminder schedule / list / show / snooze / update / cancel / log` — agent-authoring primitive
 
 ## What humans do
 
@@ -104,7 +105,16 @@ never take a criterion from the notice; read the full title with `raft reminder 
 - `raft reminder log --id <reminder-id>` — shows the reminder's lifecycle events (scheduled / fired / snoozed / updated / canceled)
   - Rows are **newest-first**: the first line is the latest event, and `| tail` shows the oldest rows. Neither the command help nor the row format says so.
   - The log has **no ack event**, so it cannot tell you whether a revision has been acked.
-  - A fired reminder's Inbox item is cleared by `raft reminder ack --id <id> --revision <n>` with the exact revision printed in the item (`retention=until_explicit_ack`); reading the item does not clear it, and a successful ack removes only that one item. Read the CLI's exit and wording as the CLI's claim, not as proof of a server-side ack: the log records no ack event (previous bullet), and a success reply can be a replay of an earlier ack attempt (`replayed: true`).
+  - A fired reminder's Inbox item is cleared by `raft reminder ack --id <id> --revision <n>` with the exact revision printed in the item (its `ack:` line, or `do:` line for a reminder fired before inbox items); reading the item does not clear it, and a successful ack removes only that one item. Read the CLI's exit and wording as the CLI's claim, not as proof of a server-side ack: the log records no ack event (previous bullet), and a success reply can be a replay of an earlier ack attempt (`replayed: true`).
+
+**On a Server whose reminders are in the Reminder app**
+- The same commands work with the app: `schedule`, `list`, `snooze`, `update`, `cancel`, and `raft reminder show --id <id>`, which shows one reminder in full (only there). Each prints the app's answer: what was done, the next fire time, and the next command.
+- Ids are the app's: the full id or its first 8 or more characters.
+- `schedule` anchors the reminder to where the `--message-id` message is (a reply in a thread: that thread); a `--channel` naming another conversation is refused with where the message is. `--tz` also sets a one-time reminder's zone.
+- External agents use the app the same way, with a CLI that has these commands (it tells the Server so; an older one is refused as before).
+- A write that fails on the app's side may or may not have been applied: check with `raft reminder list` or `show` before running it again.
+- `update` can change several fields at once, and also takes `--tz` and `--notes`; `--cadence none` makes it one-time.
+- `list --status` takes one status (`active`, `paused`, `finished`, `cancelled`, `all`; `scheduled`, `fired` and `canceled` mean the same; several read as `all`, and the list then says it listed every status). Reminders made before the move that still fire are listed last; `cancel` cancels them too, given at least the first 8 characters of the id.
 
 **Use reminders instead of long sleep / cron**
 - When an agent needs to wait for future state to resolve, prefer `raft reminder schedule` over `sleep`, `cron`, or runtime-native scheduling. Reminders are author-owned, persistent, observable, snoozable, updatable, cancelable.

@@ -1,12 +1,12 @@
-import { ContextMenuLabel, ContextMenuPopup } from "@botiverse/raft-ui";
-import { createPortal } from "react-dom";
+import { ContextMenuLabel } from "@botiverse/raft-ui";
 import { Plus, Trash2, Pencil, GitBranch, Check, FolderPlus } from "lucide-react";
 import { ExternalChannelIcon } from "../../../components/channel/channelKindIcon";
+import { AnchoredMenuPopover } from "../../../components/ui/AnchoredMenuPopover";
 import ContextMenuDivider from "../../../components/ui/ContextMenuDivider";
 import MenuItem from "../../../components/ui/MenuItem";
 import DismissBackdrop from "../../../components/ui/DismissBackdrop";
 import { SectionSortModeMenuItem } from "../../../components/layout/SectionSortModeMenuItem";
-import { getSidebarContextMenuStyle, stopSidebarContextMenuPropagation } from "../sidebarContextMenu";
+import { stopSidebarContextMenuPropagation } from "../sidebarContextMenu";
 import { SIDEBAR_SORT_MODES, SIDEBAR_SORT_SECTION_LABEL_ID } from "../sections/sidebarSortSections";
 import type { SidebarSortSection } from "../sections/sidebarSortSections";
 import type { SidebarData } from "../hooks/useSidebarData";
@@ -30,7 +30,7 @@ export function SidebarSectionContextMenu({ data, view, sync, createActions, ite
 }) {
   const { formatMessage, externalChannelsEnabled } = data;
   const {
-    sectionCtxMenu, sectionCtxMenuRef, canCreateChannel, canCreateJointChannel, channelSortMode,
+    sectionCtxMenu, canCreateChannel, canCreateJointChannel, channelSortMode,
     jointChannelSortMode, dmSortMode, pinnedSortMode, joinedChannelsOnly, hideEmptySections,
   } = view;
   const { closeSectionCtx } = sync;
@@ -50,19 +50,20 @@ export function SidebarSectionContextMenu({ data, view, sync, createActions, ite
     );
   return (
     <>
-      {sectionCtxMenu && createPortal(
+      {sectionCtxMenu && (
         <>
           <DismissBackdrop onDismiss={closeSectionCtx} trapContextMenu />
-          <ContextMenuPopup
-            ref={sectionCtxMenuRef}
+          <AnchoredMenuPopover
+            open
+            anchor={sectionCtxMenu.anchor}
+            onAnchorHidden={closeSectionCtx}
             role="menu"
             aria-label={formatMessage(
               { id: "layout.sidebar.sectionOptionsAria" },
               { section: sectionContextLabel },
             )}
             data-testid={`sidebar-section-context-menu-${sectionCtxMenu.section}`}
-            className="fixed z-popup w-60 select-none"
-            style={getSidebarContextMenuStyle(sectionCtxMenu)}
+            className="w-60"
             onMouseDown={stopSidebarContextMenuPropagation}
           >
             {sectionCtxMenu.section === "channels" && canCreateChannel && (
@@ -157,9 +158,8 @@ export function SidebarSectionContextMenu({ data, view, sync, createActions, ite
                 </MenuItem>
               </>
             )}
-          </ContextMenuPopup>
-        </>,
-        document.body,
+          </AnchoredMenuPopover>
+        </>
       )}
     </>
   );

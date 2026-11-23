@@ -59,6 +59,7 @@ export const FEATURE_FLAG_DEFAULT_ON_EXCEPTIONS: Record<string, string> = {
   remote_computer_upgrade_hold_windows: "inverted: on holds Windows Computer upgrades",
   computer_version_enforcement: "emergency: on holds agents on Computers below the version floor",
   runner_credential_reconcile_count_only: "emergency: evidence mode for runner credential reconcile, toggled by hand",
+  sync_inbox_staging_held_v0: "restrict, staging testing aid: on holds every inbox_row of a capable sync pull, then resets held_too_long",
   // Destructive, or can lock people out.
   closed_server_purge: "destructive: purges closed servers' data",
   runner_credential_reconcile: "destructive: revokes runner credentials on every daemon reconnect",
@@ -84,20 +85,30 @@ export const FEATURE_FLAG_DEFAULT_ON_EXCEPTIONS: Record<string, string> = {
   public_server_search_index_v0: "indexing: exposes servers to search engines; publicSearch also reads default_enabled in raw SQL",
   public_server_v0: "external: makes servers publicly reachable",
   // Data or legal prerequisites that a deploy does not satisfy.
+  search_joint_conversation_walk_v0: "data: only after the 0764 conversation_id backfill verified 0/0 and its index is valid",
   reminder_app: "data: staging has no Reminder app, so on makes the built-in reminder commands refuse; lift once staging registers its own Reminder app",
-  search_server_gin_v0: "data: only after the 0658 vector backfill verified 0 and its index is valid",
   public_visitor_id_v0: "legal: cookie banner and visitor id only once the privacy policy and banner copy are published",
   // Under staged acceptance: stays off until its acceptance is read.
   inbox_row_position_v1: "acceptance: Activity list path; on only after its staging drift audit is accepted (#triage:#244)",
+  // Both halves exist (Computers advertise agent:focus-v1) and the focused-body size limits are in the code
+  // (16 KB a message, 32 KB a write, set from production message sizes; docs/contracts/agent-focus.md, "Size limits").
+  // Stays off for every production server, our own included, until the scripted staging test passes on both agent
+  // hosts and the limits' telemetry is confirmed arriving from staging ("Not done"). On staging it is turned on per
+  // server through the flag admin for that test; lift this once both hold.
+  agent_focus_v0: "acceptance: off for every production server, our own included, until the scripted staging test passes on both agent hosts and the size-limit telemetry is confirmed arriving from staging (docs/contracts/agent-focus.md, Not done)",
+  // Half built: the start and the route exist; the mover and the switch do not, so an on job never finishes.
+  channel_conversion_online_move_v1: "peer not ready: an online move's job waits in online_move until the mover and switch land",
   // Under security review: stays off until the review closes.
   prepared_request_card_v0: "security: runs a request with the presser's authority; staged review (RFC 085)",
-  desktop_browser_raft_sign_in_v0: "security: consent flow, before-flag-on list open (#proj-workspace:#285)",
+  data_export_v0: "security: copies personal and server data out of Raft; under Tenny/Warden review; on only through allow rules",
   // Protocol or worker-version gates: on before the other side is ready breaks old peers.
   interactive_link_cards: "protocol: on sends link-preview v2 with no v1 fallback; only for servers whose Apps answer v2",
   sidebar_mark_all_read_v0: "protocol: only after every read worker supports the mark-all-read mutation",
   agent_activity_kernel_arbitration_v0: "protocol: default-dark gate for kernel-arbitrated agent activity serving-map writes",
   apple_web_login_v0: "protocol: gated by a required platform rule that a default-on would bypass",
   social_completion_binding: "protocol: refuses social sign-in completions from web bundles that do not post the binding cookie",
+  agent_secret_encryption_write_v1: "protocol: seals agent secrets on DB write; stays off during rolling deploy and rollback window until all replicas can decrypt (#proj-runtime:#79)",
+  replica_seal_agent_config_v1: "protocol: seals agent:start and agent:config across Redis; stays off during rolling deploy until all replicas can open sealed frames (#proj-runtime:#79)",
   // Retired: kept only for rolling upgrades.
   wiki_v0: "retired",
   slack_reaction_sync: "retired",

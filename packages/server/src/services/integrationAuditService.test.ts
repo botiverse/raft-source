@@ -191,11 +191,13 @@ test("every server-wide audit type keeps actorRole and operationId; integration 
     "channel.member_left", "channel.member_removed", "channel.server_disconnected", "channel.server_connected", "channel.source_readmitted",
     "agent.context_view_granted", "agent.context_view_grant_revoked",
     "agent_credential.issued", "agent_credential.revoked", "agent_credential.bootstrap_token_issued",
-    "computer.removed", "computer.agent_assigned", "computer.key_rotated", "computer.key_revoked", "computer.revoke_unbound_others_agents", "computer.owner_changed", "computer.legacy_adopted_by_other",
+    "computer.removed", "computer.agent_assigned", "computer.key_rotated", "computer.key_revoked", "computer.revoke_unbound_others_agents", "computer.owner_changed", "computer.legacy_adopted_by_other", "computer.limit_reset_used_by_other", "computer.runtime_install", "computer.proc_job_stopped",
     "sso.connection_saved", "sso.connection_deleted", "sso.rules_updated",
     "sso.domain_added", "sso.domain_verified", "sso.domain_unverified", "sso.domain_removed",
     "sso.identity_linked", "sso.signed_in", "sso.sign_in_refused", "sso.connection_tested",
-    "sso.domain_lookup_failing_notice", "sso.domain_unverified_notice"]);
+    "sso.domain_lookup_failing_notice", "sso.domain_unverified_notice",
+    "mcp_connection.created", "mcp_connection.signed_in", "mcp_connection.deleted", "mcp_connection.signed_out", "mcp_connection.agents_changed",
+    "mcp_connection.members_can_connect_changed"]);
   const operationId = "11111111-1111-4111-8111-111111111111";
   for (const eventType of INTEGRATION_AUDIT_EVENT_TYPES) {
     const sanitized = sanitizeIntegrationAuditMetadata(eventType, { actorRole: "admin", operationId });

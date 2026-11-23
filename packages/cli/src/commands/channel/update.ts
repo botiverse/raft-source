@@ -47,7 +47,7 @@ export function formatUpdateChannelResult(channel: UpdatedChannel): string {
 export const channelUpdateCommand = defineCommand(
   {
     name: "update",
-    description: "Edit a public, private, or joint channel when this agent has server admin or channel admin authority (a joint channel's name and description change for every connected server; its visibility cannot change)",
+    description: "Edit a public, private, or joint channel, as a channel admin there or with the admin role on this server (a joint channel only from its host server: its name and description change for every connected server; its visibility cannot change)",
     options: [
       {
         flags: "--target <target>",
@@ -63,15 +63,15 @@ export const channelUpdateCommand = defineCommand(
       },
       {
         flags: "--public",
-        description: "Make the channel public (you must be a member; not usable on #all)",
+        description: "Make the channel public (needs the admin role on this server, not only channel admin; you must be a member; not on #all or a joint channel)",
       },
       {
         flags: "--private",
-        description: "Make the channel private (you must be a member; not usable on #all)",
+        description: "Make the channel private (needs the admin role on this server, not only channel admin; you must be a member; not on #all or a joint channel)",
       },
       {
         flags: "--announcement <artifact>",
-        description: "Make an Artifact homed in this channel (its id pt_… or link) the channel's announcement, replacing any other: for standing rules and link round-ups members should read before working there (the channel's owner or a server owner/admin only)",
+        description: "Make an Artifact homed in this channel (its id pt_… or link) the channel's announcement, replacing any other: for standing rules and link round-ups members should read before working there (a channel admin of it or a server owner/admin only; on a joint channel, the host server's)",
       },
       {
         flags: "--no-announcement",

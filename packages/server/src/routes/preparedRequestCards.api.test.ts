@@ -187,7 +187,7 @@ test("commit: the route's own permission check refuses a person without it; the 
     assert.equal(refused.status, 409, refused.text);
     assert.equal(refused.body.errorCode, "request_refused");
     assert.equal(refused.body.error, "Only admins can archive channels");
-    assert.deepEqual([(refused.body as Body).routeStatus, (refused.body as Body).routeCode], [403, "http_403"]);
+    assert.deepEqual([(refused.body as Body).routeStatus, (refused.body as Body).routeCode], [403, "channel_archive_forbidden"]);
     assert.equal(((refused.body as Body).metadata as Body).action.attempt, 2, "the card as it is now");
     assert.equal((await channelService.getChannel(w.target.id))?.archivedAt ?? null, null);
     const row = await cardRow(card.messageId);
@@ -195,10 +195,10 @@ test("commit: the route's own permission check refuses a person without it; the 
     assert.equal(row.result, null, "no claim left");
     const action = (await stored(card.messageId)).action;
     assert.equal(action.attempt, 2);
-    assert.deepEqual({ status: action.refusal?.status, code: action.refusal?.code, attempt: action.refusal?.attempt }, { status: 403, code: "http_403", attempt: 1 });
+    assert.deepEqual({ status: action.refusal?.status, code: action.refusal?.code, attempt: action.refusal?.attempt }, { status: 403, code: "channel_archive_forbidden", attempt: 1 });
     assert.ok(!JSON.stringify(action).includes("Only admins"), "the route's sentence is not on the card the agent reads");
     const told = await waitFor(() => replies(w, card.messageId), (lines) => lines.length > 0);
-    assert.match(told[0]!, /ended refused \(http_403\)\./);
+    assert.match(told[0]!, /ended refused \(channel_archive_forbidden\)\./);
   } finally {
     reset();
   }

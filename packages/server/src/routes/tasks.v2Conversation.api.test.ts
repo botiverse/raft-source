@@ -575,10 +575,15 @@ test("a task from before task v2: raft task reply creates its conversation; view
   await addHuman(channel.id, owner.id);
   const agentA = await createAgent(server.id, `lazy-a-${randomUUID().slice(0, 6)}`, { runtime: "claude" });
   const agentB = await createAgent(server.id, `lazy-b-${randomUUID().slice(0, 6)}`, { runtime: "claude" });
-  for (const agent of [agentA, agentB]) await addAgent(channel.id, agent.id);
+  // C talked in the host thread and still follows it; D talked there and unfollowed it.
+  const agentC = await createAgent(server.id, `lazy-c-${randomUUID().slice(0, 6)}`, { runtime: "claude" });
+  const agentD = await createAgent(server.id, `lazy-d-${randomUUID().slice(0, 6)}`, { runtime: "claude" });
+  for (const agent of [agentA, agentB, agentC, agentD]) await addAgent(channel.id, agent.id);
   const deliveries = installRecordingOrchestrator(app.app);
   const keyA = await agentKey(agentA.id);
   const keyB = await agentKey(agentB.id);
+  const keyC = await agentKey(agentC.id);
+  const keyD = await agentKey(agentD.id);
 
   // Flag off: the task is posted as a message whose thread is its discussion.
   const created = await agentPost(app.baseUrl, keyA, "tasks", { channel: `#${channel.name}`, tasks: [{ title: "old style" }] });
@@ -586,8 +591,18 @@ test("a task from before task v2: raft task reply creates its conversation; view
   const taskNumber = created.body.tasks[0].taskNumber as number;
   const [task] = await db.select().from(tasks).where(and(eq(tasks.channelId, channel.id), eq(tasks.taskNumber, taskNumber)));
   assert.ok(task!.messageId);
-  await agentSend(app.baseUrl, keyB, `#${channel.name}:${task!.messageId!.slice(0, 8)}`, "earlier discussion in the host thread");
+  const hostThread = `#${channel.name}:${task!.messageId!.slice(0, 8)}`;
+  await agentSend(app.baseUrl, keyB, hostThread, "earlier discussion in the host thread");
+  await agentSend(app.baseUrl, keyC, hostThread, "C asked for this");
+  await agentSend(app.baseUrl, keyD, hostThread, "D chimed in");
   await settle();
+  const [hostThreadRow] = await db.select({ id: channels.id }).from(channels)
+    .where(and(eq(channels.parentMessageId, task!.messageId!), eq(channels.type, "thread")));
+  await db.update(threadFollows).set({ unfollowedAt: new Date() }).where(and(
+    eq(threadFollows.threadChannelId, hostThreadRow!.id),
+    eq(threadFollows.followerType, "agent"),
+    eq(threadFollows.followerId, agentD.id),
+  ));
 
   const contextOff = await agentGet(app.baseUrl, keyA, "context");
   assert.equal(contextOff.body.features?.taskConversations, undefined, "flag off: the features object keeps its shape");
@@ -600,10 +615,12 @@ test("a task from before task v2: raft task reply creates its conversation; view
   assert.equal(before.body.taskRef, ref);
   assert.equal(before.body.conversation.exists, false, "no conversation until the first write");
   assert.equal(before.body.task.conversationPending, true);
-  assert.deepEqual(before.body.earlierDiscussion, { target: `#${channel.name}:${task!.messageId!.slice(0, 8)}`, replyCount: 1 });
+  assert.deepEqual(before.body.earlierDiscussion, { target: hostThread, replyCount: 3 });
   const emptyRead = await agentGet(app.baseUrl, keyA, `tasks/read?channel=${encodeURIComponent(`#${channel.name}`)}&task_number=${taskNumber}`);
   assert.equal(emptyRead.status, 200, JSON.stringify(emptyRead.body));
   assert.deepEqual([emptyRead.body.target, emptyRead.body.messages], [ref, []]);
+  // No conversation yet, but the read still points at where the task was discussed.
+  assert.deepEqual(emptyRead.body.earlierDiscussion, { target: hostThread, replyCount: 3 });
   const [stillNone] = await db.select().from(tasks).where(eq(tasks.id, task!.id));
   assert.equal(stillNone!.conversationChannelId, null, "reads never create the conversation");
 
@@ -625,6 +642,13 @@ test("a task from before task v2: raft task reply creates its conversation; view
   assert.equal((await followRow(after!.conversationChannelId!, "agent", agentB.id))?.reason, "replied");
   // Creating it (lazily, for a pre-v2 task too) makes the task's creator follow.
   assert.equal((await followRow(after!.conversationChannelId!, "agent", agentA.id))?.reason, "authored", "the creator follows from the conversation's creation");
+  // The host thread's followers move with the discussion; an explicit unfollow does not.
+  assert.equal((await followRow(after!.conversationChannelId!, "agent", agentC.id))?.reason, "replied", "C still followed the host thread, so C follows the conversation");
+  assert.equal(await followRow(after!.conversationChannelId!, "agent", agentD.id), null, "D had unfollowed the host thread");
+  const readAfter = await agentGet(app.baseUrl, keyA, `tasks/read?channel=${encodeURIComponent(`#${channel.name}`)}&task_number=${taskNumber}`);
+  assert.equal(readAfter.status, 200, JSON.stringify(readAfter.body));
+  assert.equal(readAfter.body.messages.length, 1);
+  assert.deepEqual(readAfter.body.earlierDiscussion, { target: hostThread, replyCount: 3 }, "the read keeps naming the earlier thread once the conversation exists");
   await settle();
   const viewB = await agentGet(app.baseUrl, keyB, `tasks/view?channel=${encodeURIComponent(`#${channel.name}`)}&task_number=${taskNumber}`);
   assert.equal(viewB.body.conversation.exists, true);

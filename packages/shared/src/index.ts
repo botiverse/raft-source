@@ -3,9 +3,10 @@ export { AI_TRAINING_CRAWLERS, aiTrainingCrawlerRobotsLines } from "./aiTraining
 export { APPSUMO_PLAN_LIMITS, isAppSumoTier } from "./appsumoPlans";
 export type { AppSumoTier, AppSumoEntitlement, AppSumoPlanLimits } from "./appsumoPlans";
 export { normalizeAppSetupUrl, normalizeAppSetupDescription, projectAppSetup, asAppSetupInstallationId, AppSetupValidationError } from "./appSetup";
-export type { AppSetupState, AppSetupInstallationId } from "./appSetup";
+export type { AppAgentAccess, AppSetupState, AppSetupInstallationId } from "./appSetup";
 export { validateAnnouncementAudience, matchesAnnouncementAudience, matchesAnnouncementClient, asAnnouncementRecipientUserId, ANNOUNCEMENT_AUDIENCE_MAX_IDS, ANNOUNCEMENT_AUDIENCE_MAX_CLIENTS, ANNOUNCEMENT_CLIENT_PLATFORMS, validateAnnouncementAudienceRules, matchesAnnouncementRules, matchesAnnouncementDevices, announcementDeviceOf, ANNOUNCEMENT_DEVICES, announcementRuleFlagKeys, announcementRulesNeedComputers, computerVersionBelow, ANNOUNCEMENT_COMPUTER_ACTIVE_DAYS, ANNOUNCEMENT_RULE_MAX_GROUPS, ANNOUNCEMENT_RULE_MAX_CONDITIONS, ANNOUNCEMENT_RULE_ROLES, ANNOUNCEMENT_RULE_PLANS, ANNOUNCEMENT_RULE_PLATFORMS, ANNOUNCEMENT_RULE_TIME_OPS, ANNOUNCEMENT_RULE_MAX_DAYS } from "../announcement-audience";
 export type { AnnouncementAudience, AnnouncementClient, AnnouncementClientPlatform, AnnouncementClientTarget, AnnouncementDeliveryScope, AnnouncementAudienceSnapshot, AnnouncementRecipientUserId, AnnouncementAudienceRules, AnnouncementConditionGroup, AnnouncementCondition, AnnouncementRuleContext, AnnouncementRulePlatform, AnnouncementRuleMatch, AnnouncementDevice } from "../announcement-audience";
+import type { DescriptionLinkWarning } from "./descriptionLinkWarnings";
 import type { ActivityTurnSummary, ActivityTurnTrigger } from "./activityTurnSummary";
 import type { AnnouncementContent, AnnouncementPresentation } from "../announcement-presentation";
 export { validateAnnouncementPresentation } from "../announcement-presentation";
@@ -24,9 +25,11 @@ import {
   PI_BUILTIN_ALL_REASONING_PROVIDER_IDS_GENERATED,
   PI_BUILTIN_UNIFORM_TRANSPORT_PROVIDER_IDS_GENERATED,
 } from "./piBuiltinModels.generated";
+export { builtInModelSuccessor } from "./piBuiltinModelSuccessors";
 import { formatRuntimeProviderModelLabel } from "./runtimeProviderDisplay";
 import { hydrateLegacyRuntimeConfigWithTrace } from "./runtimeConfigLegacy";
 import type { AttentionHint } from "./attentionDependencyOracle";
+import type { AgentSenderOriginWire } from "./agentMessageText";
 import type { ReadinessCode, RuntimeReadinessReport } from "./readiness";
 import type { EXTERNAL_AGENT_ACTIVITY_LEGACY_STATUS_VALUES, RaftAgentStatus } from "./agentStatusStandard";
 import type { EXTERNAL_AGENT_ACTIVITY_DRAIN_SCHEMA, EXTERNAL_AGENT_ACTIVITY_EVENT_SCHEMA, EXTERNAL_AGENT_ACTIVITY_INGEST_SCHEMA } from "./externalAgentActivity";
@@ -66,6 +69,7 @@ export {
   MAX_AGENT_MIGRATION_TRANSFER_FILE_COUNT,
   MAX_AGENT_MIGRATION_TRANSFER_BYTES,
   MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT,
+  MAX_AGENT_MIGRATION_SKIPPED_UNREADABLE_PATHS,
   AGENT_MIGRATION_SOURCE_BUILD_PHASES,
   agentMigrationSourceBuildProgressReportSchema,
   AGENT_MIGRATION_SOURCE_DRAIN_WAITING_FOR,
@@ -113,6 +117,7 @@ export {
   FEATURE_FLAG_ADMIN_OPERATOR_ROLE,
   FEATURE_FLAG_ADMIN_ANNOUNCEMENT_RULES_REACH_FUNCTION,
   FEATURE_FLAG_ADMIN_SERVER_PLAN_ENTITLEMENT_INPUTS_FUNCTION,
+  FEATURE_FLAG_ADMIN_CHANGE_SERVER_PLAN_FUNCTION,
   FORBIDDEN_FEATURE_FLAG_ADMIN_PRIVILEGES,
   REQUIRED_FEATURE_FLAG_ADMIN_PRIVILEGES,
   FeatureFlagAdminPrivilegeError,
@@ -123,9 +128,10 @@ export {
   type FeatureFlagAdminPrivilegeQuery,
 } from "./featureFlagAdminPrivileges";
 import type { DisplayLocale } from "./displayLocales";
-import type { ProviderConnectionLaunchProjection } from "./providerConnections";
-import type { ProviderProbeCategory, ProviderProbeDaemonCategory, ProviderProbeId } from "./providerProbes";
-import type { RuntimeAccountUsageProvider, RuntimeAccountUsageSnapshot, RuntimeLimitResetIdempotencyKey, RuntimeLimitResetKind, RuntimeLimitResetResult, RuntimeLimitResetsReadResult } from "./runtimeAccountUsage";
+import type { ProcJobStopOutcome, ProcJobsSnapshot } from "./procJobsSnapshot";
+import type { ComputerChecksEnabled, ComputerChecksReport } from "./computerChecks";
+import type { RuntimeAccountUsageAccountHome, RuntimeAccountUsageProvider, RuntimeAccountUsageSnapshot, RuntimeLimitResetIdempotencyKey, RuntimeLimitResetKind, RuntimeLimitResetResult, RuntimeLimitResetsReadResult } from "./runtimeAccountUsage";
+import { RUNTIME_ACCOUNT_USAGE_AGENT_IDS_MAX, RUNTIME_ACCOUNT_USAGE_ACCOUNT_HOMES_MAX, RUNTIME_ACCOUNT_USAGE_API_KEY_ENV, runtimeAccountUsageFolderEnvNames, type RuntimeAccountUsageFolderProvider } from "./runtimeAccountUsage";
 import { RUNTIME_AUTH_RUNTIMES, RUNTIME_AUTH_V1_RUNTIMES, RUNTIME_AUTH_V2_RUNTIMES, runtimeAuthRuntimeFor, runtimeAuthSupports } from "./runtimeAuth";
 import type {
   RuntimeAuthLoginEvent,
@@ -138,6 +144,8 @@ import type {
   RuntimeAuthRuntime,
   RuntimeAuthStatusReport,
 } from "./runtimeAuth";
+import type { RuntimeUpgradeResult } from "./runtimeUpgrade";
+import type { RuntimeInstallPlan, RuntimeInstallResult } from "./runtimeInstall";
 import type { RuntimeModelCatalogEntry } from "./runtimeModelCatalog";
 import type { AgentVisibleExternalMessageProvenance } from "./externalProjection";
 import type { AgentMessageCardMarker } from "./messageCard";
@@ -160,6 +168,8 @@ export interface AgentThreadContextMessage {
   message_id: string;
   sender_name: string;
   sender_description?: string | null;
+  /** Where an outside sender is from, set in place of the withheld description (AgentSenderOrigin); absent otherwise. */
+  sender_origin?: AgentSenderOriginWire;
   /** IANA zone the human sender's browser reported (web sends); null otherwise. */
   sender_timezone?: string | null;
   /** RFC 077: the personal assistant that sent this as its owner (the sender). */
@@ -206,6 +216,24 @@ export type AgentMessageSourceTask = {
  */
 export type AgentAppEvent = { app: string; kind: string } & Record<string, unknown>;
 
+/** Why Raft focused a conversation by itself. */
+export type AgentFocusChangeReason = "mentioned" | "dm" | "task_assigned";
+
+/**
+ * An auto-focus, as the delivery that caused it tells the agent
+ * (`AgentMessage.focus_change`). `focused` and `unfocused` are conversations
+ * as the agent addresses them (`#chan:abcd1234`, `dm:@peer`, `#chan:#7`), the
+ * form `raft focus` takes. Advisory and best effort: it is never stored, so
+ * it can be lost with its delivery. `raft focus` (the list) is what holds.
+ */
+export interface AgentFocusChange {
+  reason: AgentFocusChangeReason;
+  /** What Raft focused: this message's conversation, and for a task assignment also the thread of the task's source message. */
+  focused: string[];
+  /** What was let go to stay within the limit; empty when nothing was. */
+  unfocused: string[];
+}
+
 export interface AgentMessage {
   channel_id: string;
   channel_name: string;
@@ -213,6 +241,8 @@ export interface AgentMessage {
   sender_id: string;
   sender_name: string;
   sender_description?: string | null;
+  /** Where an outside sender is from, set in place of the withheld description (AgentSenderOrigin); absent otherwise. */
+  sender_origin?: AgentSenderOriginWire;
   /** IANA zone the human sender's browser reported (web sends); null otherwise. */
   sender_timezone?: string | null;
   /** RFC 077: the personal assistant that sent this as its owner (the sender). */
@@ -294,6 +324,22 @@ export interface AgentMessage {
    * `schema` discriminator before interpreting the payload.
    */
   attention_hint?: AttentionHint;
+  /**
+   * Focus (`agent_focus_v0`): this conversation is in the receiving agent's
+   * focus set. A Computer that handles it writes such a message into the
+   * model in full (docs/contracts/agent-focus.md, "What the Computer does").
+   * Set per recipient at delivery, only for a Computer that advertised
+   * DAEMON_CAPABILITY_AGENT_FOCUS_V1. The Computer acts on it only while its
+   * current `AgentConfig.agentFocus` is true. Absent everywhere else; older
+   * daemons ignore it.
+   */
+  focused?: true;
+  /**
+   * Focus: this delivery made Raft focus its conversation by itself. Only on
+   * a message that is also `focused`. Advisory (see AgentFocusChange). Older
+   * daemons ignore it.
+   */
+  focus_change?: AgentFocusChange;
   /** Internal trace context for daemon-injected synthetic control messages. Not rendered to the agent. */
   traceparent?: string;
   /**
@@ -370,7 +416,7 @@ export * from "./appNameReservation";
 export * from "./agentModelLimits";
 export * from "./runtimeErrorVisibility";
 export * from "./agentActivitySubscriptions";
-export * from "./agentReadProgress";
+export * from "./objectWatch";
 export * from "./diagnosticRedaction";
 export * from "./feedbackMachineEvidence";
 export * from "./machineDuplicateConnection";
@@ -385,7 +431,6 @@ export * from "./assistantOtterShortcut";
 export * from "./composerSendKey";
 export * from "./shortcutOverrides";
 export * from "./channelPermissions";
-export * from "./channelThreadSort";
 export * from "./channelAnnouncement";
 export * from "./raftPermalinks";
 export * from "./notificationDisplay";
@@ -406,6 +451,7 @@ export * from "./agentWriteLanding";
 export * from "./emailValidation";
 export * from "./serverSlugValidation";
 export { MAX_PROFILE_AVATAR_BYTES } from "./profileAvatar";
+export { PROFILE_DESCRIPTION_MAX_LENGTH, profileDescriptionTooLong } from "./profileDescription";
 export * from "./tracing/index";
 export * from "./raftCliGuide";
 export * from "./tracing/eventRows";
@@ -432,6 +478,8 @@ export * from "./messageCard";
 export * from "./messageCardActions";
 export * from "./messageCardMarkdown";
 export * from "./featureFlags";
+export * from "./quoteReply";
+export * from "./traceSampling";
 export * from "./featuresChanged";
 export * from "./agentContextView";
 export * from "./agentSideAsk";
@@ -494,6 +542,8 @@ export * from "./runtimeAccountUsage";
 export * from "./machineOperation";
 export * from "./agentVoiceCall";
 export * from "./runtimeAuth";
+export * from "./runtimeUpgrade";
+export * from "./runtimeInstall";
 export * from "./readiness";
 export * from "./systemAttention";
 export * from "./runtimeModelCatalog";
@@ -509,6 +559,8 @@ export * from "./agentScopes";
 export * from "./oauthScopes";
 export * from "./oauthRedirect";
 export * from "./oauthClientCategories";
+export * from "./agentTokenSigningAlg";
+export * from "./agentTokenType";
 export * from "./appNotifications";
 export * from "./desktopNotifications";
 export * from "./notifications";
@@ -525,6 +577,8 @@ export * from "./knowledgeContext";
 export * from "./requestOriginHeaders";
 export * from "./cliStableEntry";
 export * from "./procJobs";
+export * from "./procJobsSnapshot";
+export * from "./computerChecks";
 export * from "./processStartTime";
 export * from "./capabilityInventories";
 
@@ -786,6 +840,15 @@ export const SERVER_CAPABILITY_TASK_WRITE_LANDING_V1 = "agent:task-write-landing
  */
 export const SERVER_CAPABILITY_IDLE_TASK_REMINDER_V1 = "agent:idle-task-reminder-v1";
 /**
+ * The Server answers `POST /internal/agent-api/inbox/rows` (agent API
+ * `inboxRows`): the `inbox check` rows of the conversations a daemon names. A
+ * daemon asks it before a wake-up notice only when the Server says so; an
+ * older Server is never called. Always advertised: the per-server inbox items
+ * switch decides, server-side, whether it answers (404 `INBOX_ITEMS_DISABLED`
+ * while it is off).
+ */
+export const SERVER_CAPABILITY_INBOX_ROWS_V1 = "agent:inbox-rows-v1";
+/**
  * RFC 069 §8: the daemon reports agent state only through sequenced, replayed
  * `agent:status` frames (`daemonInstanceId` + `clientSeq`, same counter as
  * activity). A server that sees this capability lets activity frames change
@@ -876,6 +939,26 @@ export const DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE = "machine:runtime-auth:ope
 export const DAEMON_CAPABILITY_RUNTIME_AUTH_ANTIGRAVITY_LOGOUT = "machine:runtime-auth:antigravity-logout";
 
 /**
+ * The daemon upgrades a runtime's command-line tool when a person asks
+ * (`machine:runtime:upgrade`, OAR's `Runtime.upgrade`), answers
+ * `machine:runtime:upgrade:result`, and re-detects its runtimes after an
+ * updater ran. A daemon without it drops the request: the server answers 409
+ * `computer_upgrade_required` instead of waiting.
+ */
+export const DAEMON_CAPABILITY_RUNTIME_UPGRADE = "machine:runtime-upgrade";
+
+/**
+ * The daemon installs a runtime that is not on it when a person asks: it
+ * answers `machine:runtime:install_plan` with what OAR's `Runtime.installPlan`
+ * would run (display strings), runs the runtime's own installer on
+ * `machine:runtime:install` (OAR's `Runtime.install`), answers
+ * `machine:runtime:install:result`, and re-detects its runtimes after one was
+ * installed. A daemon without it drops both requests: the server answers 409
+ * `computer_upgrade_required` instead of waiting.
+ */
+export const DAEMON_CAPABILITY_RUNTIME_INSTALL = "machine:runtime-install";
+
+/**
  * Runtimes whose logout came after their login: a Computer signs them out from
  * the web only when its daemon advertises the capability named here.
  */
@@ -949,12 +1032,53 @@ export const SERVER_CAPABILITY_RUNTIME_AUTH_V2 = "machine:runtime-auth-v2";
  */
 export const SERVER_CAPABILITY_RUNTIME_CREDENTIALS_CHANGED_V1 = "machine:runtime-credentials-changed-v1";
 /**
+ * Upgrade on the web (server capability, on `machine:context.capabilities`):
+ * the server's status report schema reads `upgradable` (the runtimes whose
+ * own updater this Computer can run). A Computer includes that field only
+ * when the server advertises this; an older server's strict schema would
+ * refuse the whole report.
+ */
+export const SERVER_CAPABILITY_RUNTIME_UPGRADE_V1 = "machine:runtime-upgrade-v1";
+/**
+ * Install on the web (server capability, on `machine:context.capabilities`):
+ * the server's status report schema reads `installable` (the runtimes not on
+ * this Computer whose own installer it can run). A Computer includes that
+ * field only when the server advertises this; an older server's strict
+ * schema would refuse the whole report.
+ */
+export const SERVER_CAPABILITY_RUNTIME_INSTALL_V1 = "machine:runtime-install-v1";
+/**
+ * Upgrade on the web (server capability, on `machine:context.capabilities`):
+ * the server's status report schema reads `updates` (OAR's read-only update
+ * check for each runtime in `upgradable`), so the web offers Upgrade only
+ * where a newer version exists. A Computer includes that field, and runs the
+ * checks at all, only when the server advertises this; an older server's
+ * strict schema would refuse the whole report.
+ */
+export const SERVER_CAPABILITY_RUNTIME_UPDATE_CHECK_V1 = "machine:runtime-update-check-v1";
+/**
  * Server capability (on `machine:context.capabilities`): the server's
  * runtime-usage snapshot schema reads `accounts[].limitResetsAvailable`. A
  * Computer includes that field only when the server advertises this; an older
  * server's strict schema would refuse the whole snapshot.
  */
 export const SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_LIMIT_RESETS_V1 = "machine:runtime-account-usage:limit-resets-v1";
+/**
+ * Server capability (on `machine:context.capabilities`): the server's
+ * runtime-usage snapshot schema reads `accounts[].credits` (OAR's Codex
+ * credits). A Computer includes that field only when the server advertises
+ * this (`withoutCredits` otherwise); an older server's strict schema would
+ * refuse the whole snapshot.
+ */
+export const SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_CREDITS_V1 = "machine:runtime-account-usage:credits-v1";
+/**
+ * Server capability (on `machine:context.capabilities`): the server's
+ * runtime-usage snapshot schema reads `accounts[].unsupportedReason` (why an
+ * `unsupported` account has no reading, from OAR). A Computer includes that
+ * field only when the server advertises this (`withoutUnsupportedReasons`
+ * otherwise); an older server's strict schema would refuse the whole snapshot.
+ */
+export const SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_UNSUPPORTED_REASON_V1 = "machine:runtime-account-usage:unsupported-reason-v1";
 /**
  * Server capability (on `machine:context.capabilities`): the server's
  * runtime-usage snapshot schema reads `accounts[].windows[].scope` (OAR's
@@ -1057,9 +1181,48 @@ export const DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR = "runtime-host:oar:curso
  * OpenCode (`opencode acp`: 1.x from 1.18.30, 2.x from 2.0.27, below 3).
  * Advertised on Linux and macOS (the OAR host runs only Codex on Windows).
  * The server asks for the OAR host for OpenCode only with this and its
- * `agent_runtime_oar_opencode` flag on, so older Computers keep the driver.
+ * `runtime-host:oar:opencode` capability (code-side flag retired, #oar-raft:#46),
+ * so older Computers and Windows keep the legacy driver.
  */
 export const DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE = "runtime-host:oar:opencode";
+/**
+ * #oar-raft:#48 (daemon capability, on `ready.capabilities`): this daemon's
+ * OAR host can run Pi through OAR's subprocess RPC runtime (`projectTrusted: false`).
+ * Advertised on Linux and macOS outside SEA builds where Pi's `rpc-entry` resolves.
+ * The server asks for the OAR host for Pi only with this and its
+ * `agent_runtime_oar_pi` flag on, so older Computers keep the legacy driver.
+ */
+export const DAEMON_CAPABILITY_RUNTIME_HOST_OAR_PI = "runtime-host:oar:pi";
+/**
+ * #oar-raft:#48 (daemon capability, on `ready.capabilities`): this daemon's
+ * OAR host can run Claude Code through OAR's generic launch path. Advertised on
+ * Linux and macOS (never Windows until verified on a real machine). The server
+ * asks for the OAR host for Claude only with this and its
+ * `agent_runtime_oar_claude` flag on (default off), so older Computers keep the
+ * legacy driver.
+ */
+export const DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CLAUDE = "runtime-host:oar:claude";
+/**
+ * #proj-runtime:#67 (daemon capability, on `ready.capabilities`): this
+ * daemon's turn-end compaction (`AgentConfig.turnEndCompaction`) resets its
+ * context facts after a compaction boundary and waits for a deferred or held
+ * app-inbox drain before it compacts. Computers 1.0.69 onward obey the flag
+ * without those fixes, so the server sends `turnEndCompaction` (at
+ * `agent:start`, `agent:config` and in `server:features`) only to a
+ * connection that advertised this; every other daemon stays off whatever the
+ * `turn_end_compaction` flag says.
+ */
+export const DAEMON_CAPABILITY_TURN_END_COMPACTION_V2 = "turn-end-compaction:v2";
+/**
+ * #proj-runtime:#80 (daemon capability, on `ready.capabilities`): the daemon
+ * builds unified constructed initial context (warm panel from prior OAR session
+ * summary or readable transcript + `<memory-index>`) on every non-resume fresh
+ * start. The server clears `sessionId` and upgrades to `mode: "session"` on
+ * non-Codex model switches only when the agent's Computer advertises this
+ * capability; older Computers keep resuming their session so switching models
+ * does not drop working context.
+ */
+export const DAEMON_CAPABILITY_CONSTRUCTED_INIT_V1 = "constructed-init:v1";
 /**
  * #wg-rbac:#27 (daemon capability, on `ready.capabilities`): every `ready`
  * carries `runnerCredentialIds`, the runner credentials
@@ -1093,6 +1256,33 @@ export const DAEMON_CAPABILITY_RUNNER_CREDENTIAL_RENEW_V1 = "runner-credential-r
  * config change.
  */
 export const DAEMON_CAPABILITY_AGENT_CONFIG_PUSH = "agent:config-push-v1";
+/**
+ * #proj-runtime:#80 (daemon capability, on `ready.capabilities`): the daemon
+ * honours `agent:config` `{ interrupt: true }` by persisting a one-shot
+ * interrupted-turn handoff note outside the workspace and injecting
+ * `<interrupted-turn>` on the immediate replacement launch so interrupted work
+ * continues without waiting for a human poke. The server interrupts busy turns
+ * immediately only on Computers advertising this capability; older Computers
+ * keep waiting for idle.
+ */
+export const DAEMON_CAPABILITY_AGENT_CONFIG_INTERRUPT = "agent:config-interrupt-v1";
+/**
+ * #wg-runtime-form:#27 (daemon capability, on `ready.capabilities`): the
+ * daemon reads `runtimeConfig.mode.serviceTier` (a Codex speed tier such as
+ * `ultrafast`) and launches it. The server sends that field only to a daemon
+ * that advertises this (`runtimeConfigWithoutServiceTier` otherwise): an older
+ * daemon's strict `parseRuntimeConfig` refuses an unknown mode field, which
+ * marks the spec unreadable and turns its drift detection off.
+ */
+export const DAEMON_CAPABILITY_CODEX_SERVICE_TIER_V1 = "agent:runtime-config-service-tier-v1";
+
+/**
+ * Focus (daemon capability, on `ready.capabilities`): the daemon reads
+ * `AgentConfig.agentFocus` and `AgentMessage.focused`. The server sends
+ * either only to a Computer that advertised this, so the `agent_focus_v0`
+ * flag changes nothing on any other daemon.
+ */
+export const DAEMON_CAPABILITY_AGENT_FOCUS_V1 = "agent:focus-v1";
 
 /**
  * RFC 071 F9: an `agent:start` that carries both `config.runtimeProfileControl`
@@ -1182,6 +1372,14 @@ export const SERVER_CAPABILITY_MIGRATION_BACKUP_IGNORE_SOURCES_V1 = "migration:b
  * older Server's strict summary schema would reject the manifest.
  */
 export const SERVER_CAPABILITY_MIGRATION_IGNORED_PARTIAL_V1 = "migration:ignored-partial-v1";
+/**
+ * Server capability (on `machine:context.capabilities`): the server accepts
+ * `transferSummary.skippedUnreadable` (shared agentMigration.ts) in a
+ * migration control manifest and names those paths in the receipt. A Computer
+ * includes that field only when the Server advertises this; it skips
+ * unreadable files either way.
+ */
+export const SERVER_CAPABILITY_MIGRATION_SKIPPED_UNREADABLE_V1 = "migration:skipped-unreadable-v1";
 /**
  * Server capability (on `machine:context.capabilities`): the server accepts
  * `userIgnoreAdditions` (the receipt, ./agentMigrationUserIgnore) in a migration
@@ -1552,6 +1750,21 @@ export type AgentWakeRefusedReason =
 /** Why the server sent an `agent:stop` (its `reason`); absent reads as `lifecycle`. */
 export type AgentStopReason = "owner_stop" | "deleted" | "migrated" | "lifecycle";
 
+/** The statuses of a task the agent itself still has to act on (`in_review` waits on someone else). */
+export type AgentStartOpenTaskStatus = "todo" | "in_progress";
+
+/**
+ * The open tasks assigned to an agent, as an `agent:start` of a resumed
+ * session names them (`openTasks`): at most a few, most recently updated
+ * first, each by its agent-facing ref (`#channel:#7`, `dm:@peer:#7`), and how
+ * many more there are. The title is the task's own text, unsanitized: the
+ * daemon folds and caps it where it renders it.
+ */
+export interface AgentStartOpenTasks {
+  tasks: Array<{ ref: string; title: string; status: AgentStartOpenTaskStatus }>;
+  more: number;
+}
+
 export type ServerToMachineMessage =
   /**
    * Authenticated websocket ownership context. The Server sends this as the
@@ -1587,16 +1800,19 @@ export type ServerToMachineMessage =
    *  - `humanStart`: an explicit human start (RFC 071 §5 E3). The daemon's
    *    local refusal of automatic starts does not apply to it.
    */
-  | { type: "agent:start"; agentId: string; config: AgentConfig; wakeMessage?: AgentMessage; wakeMessageTransient?: boolean; resumeMessages?: AgentMessage[]; unreadSummary?: Record<string, number>; resumePrompt?: string; launchId?: string; startDispatchId?: string; traceparent?: string; catchupBatchId?: string; breakerGeneration?: number; takeoverEpoch?: number; humanStart?: boolean; /** Additive (task #365): the connection the server claimed this automatic start against; the daemon refuses it on any other connection. */ connectionEpochId?: string; /** Additive (reconciler step 11): the server's revision of `config`; an `agent:config` at or below it is stale. Absent on older servers. */ configRevision?: number }
+  | { type: "agent:start"; agentId: string; config: AgentConfig; wakeMessage?: AgentMessage; wakeMessageTransient?: boolean; resumeMessages?: AgentMessage[]; unreadSummary?: Record<string, number>; resumePrompt?: string; launchId?: string; startDispatchId?: string; traceparent?: string; catchupBatchId?: string; breakerGeneration?: number; takeoverEpoch?: number; humanStart?: boolean; /** Additive (task #365): the connection the server claimed this automatic start against; the daemon refuses it on any other connection. */ connectionEpochId?: string; /** Additive (reconciler step 11): the server's revision of `config`; an `agent:config` at or below it is stale. Absent on older servers. */ configRevision?: number; /** Additive: the open tasks the agent holds, sent only on a start that resumes its session with no wake message and no resume prompt, so the daemon's resume input does not tell an agent with unfinished work to stop. Older daemons ignore it; absent = today's behaviour. */ openTasks?: AgentStartOpenTasks }
   /**
    * Reconciler step 11 (`DAEMON_CAPABILITY_AGENT_CONFIG_PUSH`): the agent's
    * current config, for a daemon that runs or starts it. `revision` grows
    * with every config the server sends for the agent (pushes and starts); the
    * daemon drops one at or below the last it applied. Never wakes the agent:
-   * a running session whose runtime spec drifted is stopped once idle, and
-   * the next start runs on the new config. Older daemons ignore it.
+   * a running session whose runtime spec drifted is stopped once idle, or
+   * immediately when `interrupt` is true (paired with a server `resetAgent`
+   * so an interrupted foreground turn resumes on the new config without
+   * waiting for a human poke). Older daemons ignore `agent:config` or the
+   * additive `interrupt` flag.
    */
-  | { type: "agent:config"; agentId: string; config: AgentConfig; revision: number }
+  | { type: "agent:config"; agentId: string; config: AgentConfig; revision: number; interrupt?: boolean }
   /**
    * `reason` (additive; older daemons ignore it) says why the server stops
    * the agent, so the daemon can decide what else goes with it (e.g. the
@@ -1614,6 +1830,14 @@ export type ServerToMachineMessage =
   | import("./agentSideAsk").AgentSideAskRequest
   /** #proj-runtime:#41: stop one running sub-agent, by its `SubagentLineage.taskId` (DAEMON_CAPABILITY_INTERRUPT_SUBAGENT). */
   | { type: "agent:interrupt-subagent"; agentId: string; requestId: string; subagentTaskId: string }
+  /**
+   * A person stops one `raft proc` job from the Computer page
+   * (DAEMON_CAPABILITY_PROC_STOP; docs/contracts/proc-jobs.md). The job is
+   * named by its agent and name only, never a pid. `stoppedBy`: that
+   * person's handle, filled in by the server from the signed-in person;
+   * null when it is not a valid handle.
+   */
+  | { type: "machine:proc_job:stop"; requestId: string; agentId: string; name: string; stoppedBy: string | null }
   /**
    * Answer to a daemon `agent:wake:request` (task #1103). `dispatched` means
    * the Server issued its ordinary `agent:start` for this agent; `refused` is
@@ -1634,6 +1858,16 @@ export type ServerToMachineMessage =
   // finish their current work before the installer runs; see ./computerUpgradeDrain.
   | { type: "computer:upgrade"; operationId?: string; requestId?: string; targetVersion?: string; drain?: import("./computerUpgradeDrain").ComputerUpgradeDrainRequest }
   | { type: "computer:lifecycle:receipt"; operationId: string; phase: "shutdown" | "ready" }
+  /**
+   * "On this computer" checks (DAEMON_CAPABILITY_COMPUTER_CHECKS only;
+   * docs/contracts/computer-checks.md): this server's switch per check. Sent
+   * on `ready` and before every `computer:checks:refresh`; the Computer
+   * answers a refresh only after a config. Unknown ids are ignored; a check
+   * not `true` here is not run for (nor reported to) this server.
+   */
+  | { type: "computer:checks:config"; enabled: ComputerChecksEnabled }
+  /** Run one round of checks (no parameters); answered by `computer:checks:report`. */
+  | { type: "computer:checks:refresh" }
   | { type: "agent:reset-workspace"; agentId: string }
   | { type: "agent:deliver"; agentId: string; message: AgentMessage; seq: number; traceparent?: string; deliveryId?: string; transient?: boolean; mentionDelivery?: MentionDeliveryIdentitySnapshot }
   | { type: "agent:inbox:purge"; agentId: string; channelIds: string[]; reason?: string }
@@ -1675,20 +1909,6 @@ export type ServerToMachineMessage =
    */
   | { type: "machine:runtime_models:detect"; requestId: string; runtime: string; force?: boolean }
   /**
-   * Ask the owning Computer to run one bounded provider probe for an opaque
-   * probe intent. Carries no credential, endpoint or connection id: the daemon
-   * resolves the one-time materialization itself with machine auth. Older
-   * daemons ignore the additive message, which the Server detects through the
-   * missing `provider-probe:v1` capability before dispatch.
-   */
-  | {
-      type: "machine:provider_probe:request";
-      requestId: string;
-      probeId: string;
-      runtime: string;
-      model: string;
-    }
-  /**
    * Ask the owning Computer to refresh one provider's sanitized account-usage
    * snapshot. This is never sent by a cache-read endpoint without the
    * owner/gate/cooldown checks. Older daemons ignore the additive message.
@@ -1698,6 +1918,16 @@ export type ServerToMachineMessage =
       requestId: string;
       provider: RuntimeAccountUsageProvider;
       reason: "manual" | "stale_or_missing" | "scheduled";
+      /**
+       * Codex and Claude only: the account folders of the Computer's agents
+       * that set their own (`HOME`, `CODEX_HOME` / `CLAUDE_CONFIG_DIR`), so the
+       * Computer reads each beside its default account and tags each with its
+       * agents (`agentIds`). Additive: an older daemon ignores it (its inbound
+       * messages are plain JSON, read by field) and answers with its default
+       * account only; a daemon answers with `agentIds` only to a refresh that
+       * carried it (docs/contracts/runtime-account-usage.md).
+       */
+      accountHomes?: RuntimeAccountUsageAccountHome[];
     }
   /**
    * DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET: spend one of the provider
@@ -1717,6 +1947,16 @@ export type ServerToMachineMessage =
        * answered `unsupported`: the Computer never picks a kind.
        */
       kind?: RuntimeLimitResetKind;
+      /**
+       * The server (and the web page that asked: the server sets this only
+       * when the page's request says so) reads `unsupported:
+       * onboarding_required`. A Computer answers it (Claude Code stopped at a
+       * first-run page OAR does not complete) only when this is set;
+       * otherwise `not_attempted`, as before: an older server's or page's
+       * strict parse would turn the unknown reason into `unknown` ("a reset
+       * may have been used") or a failed request.
+       */
+      onboardingRequiredReason?: true;
     }
   /**
    * DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET_CLAUDE_KINDS: read which limit
@@ -1728,6 +1968,7 @@ export type ServerToMachineMessage =
    * what usage shows (anything but `false` counts as at the limit), and the
    * Computer refuses unless `atFiveHourLimitConsent` says the person accepted
    * that. `includeFiveHour` (default false) also opens the 5-hour kind.
+   * `onboardingRequiredReason`: as on the redeem message.
    */
   | {
       type: "machine:runtime_account_usage:limit_resets:read";
@@ -1736,6 +1977,7 @@ export type ServerToMachineMessage =
       atFiveHourLimit: boolean;
       atFiveHourLimitConsent?: boolean;
       includeFiveHour?: boolean;
+      onboardingRequiredReason?: true;
     }
   /**
    * task #17 (DAEMON_CAPABILITY_RUNTIME_AUTH): start a web login for a runtime
@@ -1762,6 +2004,25 @@ export type ServerToMachineMessage =
   | { type: "machine:runtime_auth:login:cancel"; loginId: RuntimeAuthLoginId }
   /** `providerId`: the provider to sign out, for a per-provider runtime (Pi) only. */
   | { type: "machine:runtime_auth:logout"; requestId: string; runtime: RuntimeAuthRuntime; providerId?: string }
+  /**
+   * DAEMON_CAPABILITY_RUNTIME_UPGRADE: run the runtime's own updater on this
+   * Computer (a person pressed Upgrade; never sent on its own). Answered by
+   * `:upgrade:result`; after an updater ran the daemon re-detects its runtimes.
+   */
+  | { type: "machine:runtime:upgrade"; requestId: string; runtime: RuntimeAuthRuntime }
+  /**
+   * DAEMON_CAPABILITY_RUNTIME_INSTALL: what the runtime's own installer would
+   * run on this Computer, read without running it (a person pressed Install).
+   * Answered by `:install_plan:result`. Only the runtime: what runs is OAR's.
+   */
+  | { type: "machine:runtime:install_plan"; requestId: string; runtime: RuntimeAuthRuntime }
+  /**
+   * DAEMON_CAPABILITY_RUNTIME_INSTALL: run the runtime's own installer on this
+   * Computer (a person confirmed the plan; never sent on its own). Only the
+   * runtime: what runs is OAR's. Answered by `:install:result`; after an
+   * install the daemon re-detects its runtimes.
+   */
+  | { type: "machine:runtime:install"; requestId: string; runtime: RuntimeAuthRuntime }
   /**
    * DAEMON_CAPABILITY_RUNTIME_AUTH_QWEN_PROVIDER: the model providers a
    * runtime with `connect_provider` (Qwen Code) offers on this Computer, for
@@ -1833,6 +2094,12 @@ export type ServerToMachineMessage =
        * Absent or false: the source sends the summary without it.
        */
       targetAcceptsIgnoredPartial?: boolean;
+      /**
+       * Source lease only: the target Computer accepts `skippedUnreadable` in the
+       * transfer summary (AGENT_MIGRATION_TARGET_SKIPPED_UNREADABLE_CAPABILITY).
+       * Absent or false: the source sends the summary without it.
+       */
+      targetAcceptsSkippedUnreadable?: boolean;
       /**
        * Source lease only (Computer 1.0.63+, AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY):
        * paths the user picked to leave behind. Read it with
@@ -2285,6 +2552,17 @@ export interface SpawnFailureActivityDiagnostic {
    * Absent: no time known (an older server, or a pause only a person lifts).
    */
   pauseRetryAtMs?: number;
+  /**
+   * The failed start's own error text (the thrown error's message), so the
+   * agent's managers can read what went wrong beside the fixed copy `reason`
+   * picks. Scrubbed (scrubRuntimeErrorText) and then capped at
+   * MAX_START_FAILURE_MESSAGE_CHARS (boundedStartFailureMessage) by the
+   * daemon, and again by the server. The server stores it as the agent's
+   * `lastRuntimeError` (read per viewer: managers only) and never passes it
+   * on in the activity carrier, which every viewer receives. Absent from
+   * older daemons and when the start had no text of its own.
+   */
+  message?: string;
 }
 
 /**
@@ -2475,6 +2753,43 @@ export function parseComputerInstallerRepairHint(value: unknown): ComputerInstal
 }
 
 /**
+ * The Computer's service runs in a systemd unit whose manager refuses this
+ * user a transient scope (`systemd-run --scope`), so a web upgrade's installer
+ * could not move out of the unit and the Computer refuses it right before
+ * spawning (`scope_unavailable`). Typical case: a systemd SYSTEM unit run as a
+ * non-root user (polkit refuses). Probed by the Computer's runner when it
+ * starts (so again after every upgrade), with the same probe the upgrade uses;
+ * sent as `ready.upgradeScope`. Only an explicit refusal produces it: absent
+ * means allowed OR unknown (not under systemd, root, the probe could not run,
+ * an older Computer), and the server and web then behave as before. A later
+ * ready without it clears it. `reason`: systemd-run's first line, bounded
+ * (COMPUTER_UPGRADE_SCOPE_REASON_MAX_CHARS), for traces and refusals.
+ */
+export interface ComputerUpgradeScopeUnavailable {
+  ok: false;
+  reason: string;
+}
+export const COMPUTER_UPGRADE_SCOPE_REASON_MAX_CHARS = 200;
+/** One line of printable text, at most COMPUTER_UPGRADE_SCOPE_REASON_MAX_CHARS. */
+export function boundComputerUpgradeScopeReason(value: string): string {
+  const printable = Array.from(value, (char) => {
+    const code = char.charCodeAt(0);
+    return code < 0x20 || code === 0x7f ? " " : char;
+  }).join("");
+  const line = printable.replace(/\s+/g, " ").trim();
+  return line.length > COMPUTER_UPGRADE_SCOPE_REASON_MAX_CHARS
+    ? `${line.slice(0, COMPUTER_UPGRADE_SCOPE_REASON_MAX_CHARS - 1)}…`
+    : line;
+}
+/** The report when it is an explicit refusal, else null (absent, malformed, or anything but `ok: false`). */
+export function parseComputerUpgradeScope(value: unknown): ComputerUpgradeScopeUnavailable | null {
+  if (typeof value !== "object" || value === null) return null;
+  const { ok, reason } = value as { ok?: unknown; reason?: unknown };
+  if (ok !== false) return null;
+  return { ok: false, reason: typeof reason === "string" ? boundComputerUpgradeScopeReason(reason) : "" };
+}
+
+/**
  * os-release `ID` / `ID_LIKE` entries, for picking a distribution icon: the
  * spec allows only lowercase letters, digits and `._-` ("ubuntu", "rhel",
  * "opensuse-tumbleweed"). `ready.osIdLike` holds at most OS_ID_LIKE_MAX ids.
@@ -2613,6 +2928,8 @@ export type MachineToServerMessage =
   | import("./agentSideAsk").AgentSideAskResult
   /** #proj-runtime:#41: the answer to `agent:interrupt-subagent`. */
   | { type: "agent:interrupt-subagent:result"; agentId: string; requestId: string; outcome: AgentSubagentInterruptOutcome }
+  /** The answer to `machine:proc_job:stop`. */
+  | { type: "machine:proc_job:stop:result"; requestId: string; agentId: string; name: string; outcome: ProcJobStopOutcome }
   | { type: "agent:activity"; agentId: string; activity?: string; activityKind?: AgentActivityKind; detail: string; detailKind?: AgentActivityDetailKind; entries?: DaemonTrajectoryEntry[]; launchId?: string; daemonInstanceId?: string; probeId?: string; clientSeq?: number; producerFactId?: string; observedAtMs?: number; isHeartbeat?: boolean; runtimeError?: RuntimeErrorActivityDiagnostic; deliveryConsumption?: DeliveryConsumptionActivityDiagnostic; spawnFailure?: SpawnFailureActivityDiagnostic; providerRequest?: import("./providerRequestActivity").ProviderRequestActivity; toolStuck?: ToolStuckActivityDiagnostic; credentialHold?: CredentialHoldActivityDiagnostic }
   /** Agent typing line: see `./agentTyping` (`AgentSendIntentFrame`). */
   | import("./agentTyping").AgentSendIntentFrame
@@ -2821,7 +3138,21 @@ export type MachineToServerMessage =
   | { type: "agent:delivery:rejected"; agentId: string; seq: number; deliveryId?: string; reason: "no_process"; mentionDelivery?: MentionDeliveryIdentitySnapshot; traceparent?: string }
   | { type: "agent:workspace:file_tree"; agentId: string; files: FileNode[]; dirPath?: string; includeHidden?: boolean }
   | { type: "agent:workspace:file_content"; agentId: string; requestId: string; content: string | null; binary: boolean; size?: number; mimeType?: string; encoding?: "utf-8" | "base64" }
-  | { type: "agent:skills:list_result"; agentId: string; requestId?: string; global: SkillInfo[]; workspace: SkillInfo[] }
+  /**
+   * `builtin` (additive): skills the runtime itself ships (Claude's bundled,
+   * Codex's system scope), read through OAR's skills inventory. Absent from
+   * older daemons and when the daemon fell back to its folder scan.
+   */
+  | {
+      type: "agent:skills:list_result"; agentId: string; requestId?: string; global: SkillInfo[]; workspace: SkillInfo[]; builtin?: SkillInfo[];
+      /**
+       * OAR could not read the runtime's skills (the lists are empty): a short
+       * code saying why (`deadline`, `unsupported:<code>`, ...). The server
+       * answers it as unavailable, so the web offers Retry. An older server
+       * ignores it and shows the empty lists.
+       */
+      unavailable?: { reason: string };
+    }
   | { type: "agent:diagnostic:session_transcript_result"; agentId: string; requestId: string; runtime: string; sessionId: string; reachable: boolean; path: string | null; fallbackReason?: string; transcript: string | null; sizeBytes: number; truncated: boolean; redacted: boolean; tier: string; error?: string }
   | {
       type: "agent:diagnostic:feedback_transcript_result"; agentId: string; feedbackReportId: string; requestId: string; traceBundleId?: string; reachable: boolean; fallbackReason?: string; error?: string; transcriptWindow?: FeedbackTranscriptWindow; machineLogTail?: FeedbackMachineLogTailOutcome; machineEvidence?: FeedbackMachineEvidenceOutcome;
@@ -2884,27 +3215,17 @@ export type MachineToServerMessage =
        */
       authoritative?: true;
     }
-  | {
-      type: "machine:provider_probe:result";
-      requestId: string;
-      probeId: ProviderProbeId;
-      outcome: "success" | "failure";
-      category: ProviderProbeDaemonCategory | null;
-      latencyMs: number | null;
-      responseSha256: string | null;
-      responseBytes: number | null;
-      resultDigest: string;
-      authorityEcho: { connectionEpochId: string; replicaGeneration: string };
-      daemonVersion: string | null;
-      computerVersion: string | null;
-      runtimeVersion: string | null;
-      reply: string | null;
-    }
   /** task #17: each web-loginable runtime's auth status, sent unprompted after detection and after a login or logout. */
   | { type: "machine:runtime_auth:status"; report: RuntimeAuthStatusReport }
   | { type: "machine:runtime_auth:login:event"; loginId: RuntimeAuthLoginId; event: RuntimeAuthLoginEvent }
   | { type: "machine:runtime_auth:login:result"; loginId: RuntimeAuthLoginId; result: RuntimeAuthLoginResult }
   | { type: "machine:runtime_auth:logout:result"; requestId: string; result: RuntimeAuthLogoutResult }
+  /** The outcome's kind and versions only: never the updater's output. */
+  | { type: "machine:runtime:upgrade:result"; requestId: string; result: RuntimeUpgradeResult }
+  /** The plan's display strings and source, for the person who asked only: never logged or traced. */
+  | { type: "machine:runtime:install_plan:result"; requestId: string; result: RuntimeInstallPlan }
+  /** The outcome's kind and version only: never the installer's output. */
+  | { type: "machine:runtime:install:result"; requestId: string; result: RuntimeInstallResult }
   | { type: "machine:runtime_auth:providers:result"; requestId: string; result: RuntimeAuthProvidersResult }
   | { type: "machine:runtime_auth:connect_provider:result"; requestId: string; result: RuntimeAuthProviderConnectResult }
   /**
@@ -2951,6 +3272,22 @@ export type MachineToServerMessage =
    */
   | { type: "machine:disk_status"; availableBytes: number; totalBytes: number }
   /**
+   * Every `raft proc` job the daemon knows, of every agent it runs (never a
+   * command line, argument, directory, environment or log path; strict
+   * schema `procJobsSnapshotSchema`). Sent on connect, ~2 s after a job
+   * starts, exits or is stopped, and every 5 minutes. Servers that predate
+   * it ignore the unknown type.
+   */
+  | { type: "machine:proc_jobs:snapshot"; snapshot: ProcJobsSnapshot }
+  /**
+   * "On this computer" checks (docs/contracts/computer-checks.md): one
+   * round, only the checks this server enabled (`computer:checks:config`),
+   * the owner's local switch applied. Sent only after a refresh from a
+   * server that sent a config. Untrusted on the server: re-read with
+   * `parseComputerChecksReport` and scrubbed before it is kept.
+   */
+  | { type: "computer:checks:report"; report: ComputerChecksReport }
+  /**
    * The machine's memory (Linux: MemAvailable), sent on connect and every
    * 5 minutes. Servers that predate it ignore the unknown type.
    */
@@ -2995,7 +3332,7 @@ export type MachineToServerMessage =
   | { type: "computer:upgrade:done"; requestId: string; ok: boolean; reason?: string; code?: string; /** ComputerUpgradeInstallerReport: the installer receipt's outcome and fixed codes, when the failure is an installer receipt; absent on older Computers. Read through parseComputerUpgradeInstallerReport. */ installerOutcome?: ComputerUpgradeInstallerOutcome; installerCode?: string; installerDiagnosticCode?: string }
   /** Reconciler step 13: a drained web upgrade's progress (./computerUpgradeDrain). Sent only for a request that carried `drain`. */
   | import("./computerUpgradeDrain").ComputerUpgradeDrainingMessage
-  | { type: "ready"; capabilities?: string[]; /** RFC 069 §8: this daemon process's generation. */ daemonInstanceId?: string; /** RFC 071 outbox: agents whose outcome storage is unreliable; `agent:runtime-outcome-v1` does not apply to them. */ runtimeOutcomeUnreliableAgents?: string[]; /** task #1268: omitted entirely while `runtimeDetection.status` is "pending" (a pending ready carries no inventory); otherwise this round's detected runtime ids. */ runtimes?: string[]; runtimeVersions?: Record<string, string>; /** task #1268: absent on daemons that detect synchronously before ready (= complete). */ runtimeDetection?: RuntimeDetectionReport; runningAgents: string[]; hostname?: string; os?: string; /** Set only on WSL (`os` still says `linux`); absent on older daemons and other hosts. */ osVariant?: "wsl1" | "wsl2"; /** Coarse kind of machine for the Computer icon, classified on the machine (the model it comes from is not sent); absent when unknown and on older daemons. */ deviceClass?: DeviceClass; /** Cloud / VM platform recognized on the machine; absent when not recognized and on older daemons. */ hostProvider?: HostProvider; /** OS name and version, e.g. "Ubuntu 26.04" (Linux `/etc/os-release`); absent when unknown and on older daemons. */ osRelease?: string; /** os-release `ID` ("ubuntu"), for a distribution icon; absent when unknown and on older daemons. */ osId?: string; /** os-release `ID_LIKE` ("rhel", "fedora"), fallback for the icon; absent when empty. */ osIdLike?: string[]; /** How the daemon itself runs (DAEMON_INSTALL_KINDS); absent when unknown and on older daemons. */ installKind?: DaemonInstallKind; /** COMPUTER_MIGRATED_FROM: on the first ready to each server after Raft Desktop moved this Computer from its embedded one; absent otherwise and on older daemons. */ migratedFrom?: ComputerMigratedFrom; /** Whether an executable `node` is on the daemon's PATH (no path is sent); absent on older daemons. */ nodeOnPath?: boolean; daemonVersion?: string; computerVersion?: string; migrationTransport?: AgentMigrationTransportReady; lifecycleAcks?: ComputerLifecycleExecutionAck[]; lastUpgradeReceipt?: ComputerLastUpgradeReceipt; /** #proj-raft-computer task #38: this machine's CURRENT `sk_machine_*` key was found in a legacy file inside an agent workspace (removed since), so an agent may have read it. Fingerprint = first 16 hex of sha256(key), never the key; the server keeps it only while it is still the stored key. Absent on older daemons and when nothing was found. */ legacyCredentialExposure?: LegacyCredentialExposureReport; /** #proj-raft-computer task #34: advisory, the installer state looks like it needs a repair run on the machine (COMPUTER_INSTALLER_REPAIR_HINT_REASONS); never blocks a web upgrade. Absent when there is nothing to hint and on older Computers. */ installerRepairHint?: ComputerInstallerRepairHint ; /** #wg-rbac:#27: with DAEMON_CAPABILITY_RUNNER_CREDENTIAL_RECONCILE_V1 (always then, possibly empty), the runner credential ids (`AgentConfig.agentCredentialId`) the daemon holds as it builds this frame; read it through `readyRunnerCredentialIds`. Absent on older daemons. */ runnerCredentialIds?: string[]; /** Reconciler step 11d: with DAEMON_CAPABILITY_AGENT_CONFIG_PUSH, the highest config revision the daemon applied (`agent:config` `revision` or `agent:start` `configRevision`) for each agent in `runningAgents` whose revision it knows; the server re-sends the agent's config when its own revision is newer (a push lost on the way). An agent without an entry is not compared. Absent on older daemons. */ runningAgentConfigRevisions?: Record<string, number> };
+  | { type: "ready"; capabilities?: string[]; /** RFC 069 §8: this daemon process's generation. */ daemonInstanceId?: string; /** RFC 071 outbox: agents whose outcome storage is unreliable; `agent:runtime-outcome-v1` does not apply to them. */ runtimeOutcomeUnreliableAgents?: string[]; /** task #1268: omitted entirely while `runtimeDetection.status` is "pending" (a pending ready carries no inventory); otherwise this round's detected runtime ids. */ runtimes?: string[]; runtimeVersions?: Record<string, string>; /** task #1268: absent on daemons that detect synchronously before ready (= complete). */ runtimeDetection?: RuntimeDetectionReport; runningAgents: string[]; hostname?: string; os?: string; /** Set only on WSL (`os` still says `linux`); absent on older daemons and other hosts. */ osVariant?: "wsl1" | "wsl2"; /** Coarse kind of machine for the Computer icon, classified on the machine (the model it comes from is not sent); absent when unknown and on older daemons. */ deviceClass?: DeviceClass; /** Cloud / VM platform recognized on the machine; absent when not recognized and on older daemons. */ hostProvider?: HostProvider; /** OS name and version, e.g. "Ubuntu 26.04" (Linux `/etc/os-release`); absent when unknown and on older daemons. */ osRelease?: string; /** os-release `ID` ("ubuntu"), for a distribution icon; absent when unknown and on older daemons. */ osId?: string; /** os-release `ID_LIKE` ("rhel", "fedora"), fallback for the icon; absent when empty. */ osIdLike?: string[]; /** How the daemon itself runs (DAEMON_INSTALL_KINDS); absent when unknown and on older daemons. */ installKind?: DaemonInstallKind; /** COMPUTER_MIGRATED_FROM: on the first ready to each server after Raft Desktop moved this Computer from its embedded one; absent otherwise and on older daemons. */ migratedFrom?: ComputerMigratedFrom; /** Whether an executable `node` is on the daemon's PATH (no path is sent); absent on older daemons. */ nodeOnPath?: boolean; daemonVersion?: string; computerVersion?: string; migrationTransport?: AgentMigrationTransportReady; lifecycleAcks?: ComputerLifecycleExecutionAck[]; lastUpgradeReceipt?: ComputerLastUpgradeReceipt; /** #proj-raft-computer task #38: this machine's CURRENT `sk_machine_*` key was found in a legacy file inside an agent workspace (removed since), so an agent may have read it. Fingerprint = first 16 hex of sha256(key), never the key; the server keeps it only while it is still the stored key. Absent on older daemons and when nothing was found. */ legacyCredentialExposure?: LegacyCredentialExposureReport; /** #proj-raft-computer task #34: advisory, the installer state looks like it needs a repair run on the machine (COMPUTER_INSTALLER_REPAIR_HINT_REASONS); never blocks a web upgrade. Absent when there is nothing to hint and on older Computers. */ installerRepairHint?: ComputerInstallerRepairHint ; /** Explicit refusal of the transient scope a web upgrade's installer needs (ComputerUpgradeScopeUnavailable): the server refuses the web upgrade with `scope_unavailable` and the web hides Upgrade. Absent = allowed or unknown (and on older Computers); a later ready without it clears it. */ upgradeScope?: ComputerUpgradeScopeUnavailable; /** #wg-rbac:#27: with DAEMON_CAPABILITY_RUNNER_CREDENTIAL_RECONCILE_V1 (always then, possibly empty), the runner credential ids (`AgentConfig.agentCredentialId`) the daemon holds as it builds this frame; read it through `readyRunnerCredentialIds`. Absent on older daemons. */ runnerCredentialIds?: string[]; /** Reconciler step 11d: with DAEMON_CAPABILITY_AGENT_CONFIG_PUSH, the highest config revision the daemon applied (`agent:config` `revision` or `agent:start` `configRevision`) for each agent in `runningAgents` whose revision it knows; the server re-sends the agent's config when its own revision is newer (a push lost on the way). An agent without an entry is not compared. Absent on older daemons. */ runningAgentConfigRevisions?: Record<string, number> };
 
 export type MachineShutdownReason =
   | "computer_stop"
@@ -3040,6 +3377,7 @@ export type RuntimeId =
   | "pi"
   | "qwen"
   | "qoder"
+  | "dsh"
   | "external";
 
 /**
@@ -3190,7 +3528,16 @@ export const CUSTOM_MODEL_MAX_OUTPUT_TOKENS_MAX = 1_000_000;
 
 export type RuntimeModeConfig =
   | { kind: "default" }
-  | { kind: "fast" };
+  | {
+      kind: "fast";
+      /**
+       * #wg-runtime-form:#27: the fast tier when the model lists more than one
+       * (Codex `ultrafast`), as the runtime names it. Absent: the runtime's
+       * primary fast tier (Codex `priority`). Codex only. An older Computer's
+       * lenient hydration drops it and launches the primary tier.
+       */
+      serviceTier?: string;
+    };
 
 interface RuntimeConfigBase { // Persisted source fields; launch/env mirrors are derived, not parsed back.
   version: typeof RUNTIME_CONFIG_VERSION;
@@ -3242,15 +3589,6 @@ export interface AgentConfig {
   model: string;
   runtime: string;
   runtimeConfig?: RuntimeConfig | null;
-  /** Ephemeral, credential-free metadata for a server-managed provider launch. */
-  providerConnection?: ProviderConnectionLaunchProjection | null;
-  /**
-   * Reconciler step 11: the revision of the server-managed provider
-   * connection the launch resolves (its endpoint or key changed). A running
-   * session whose revision differs is restarted once idle; absent on either
-   * side (an older server) compares as no change.
-   */
-  providerConnectionRevision?: string | number | null;
   /**
    * task #1357 item 1: the server's revision of this config (`agent:start`
    * `configRevision`, `agent:config` `revision`), stamped by the daemon when
@@ -3319,6 +3657,14 @@ export interface AgentConfig {
    * server session worker can revoke the row when the launch ends.
    */
   agentCredentialId?: string | null;
+  /**
+   * #wg-rbac:#27: ISO time `agentCredentialKey` stops authenticating, from the
+   * mint response (null: never, a daemon that does not renew). Daemon-local:
+   * servers do not send it. The daemon renews the key at its half-life
+   * (runnerCredentialRenewal.ts); the config keeps the launch's first key and
+   * id, and every use resolves the current one through the renewal lineage.
+   */
+  agentCredentialExpiresAt?: string | null;
   runtimeContext?: AgentRuntimeContext | null;
   /**
    * Spawn-time runtime-profile control. Server attaches this on
@@ -3423,8 +3769,8 @@ export interface AgentConfig {
   /**
    * Server-evaluated `wake_recycle_oar` feature flag (#proj-runtime:#54,
    * RFC 070 for the OAR host). When true, the daemon's OAR host gives wake
-   * recycle the context size and last activity of Codex and Grok sessions
-   * from its session summary, and stops such a session once it is cold idle
+   * recycle the context size and last activity of Codex, Grok, OpenCode,
+   * Cursor, Qwen and Antigravity sessions from its session summary, and stops such a session once it is cold idle
    * (idle past the gap, context past the threshold, nothing open), so the
    * next wake starts a fresh session with a briefing instead of resuming the
    * whole context. Absent or false means off (today's behaviour); older
@@ -3450,9 +3796,20 @@ export interface AgentConfig {
    * runtime compact natively at a turn end with nothing running, held or
    * queued (Claude on the legacy host: `/compact`; Codex and Grok on the OAR
    * host: OAR `Session.compact()`). Absent or false means off; older servers
-   * never send it and older daemons ignore it.
+   * never send it and older daemons ignore it. Sent (here and in
+   * `server:features`) only to a daemon that advertised
+   * DAEMON_CAPABILITY_TURN_END_COMPACTION_V2 on its connection.
    */
   turnEndCompaction?: boolean;
+  /**
+   * Server-evaluated `silent_turn_end` feature flag (task #triage:#496). When
+   * true, the OAR host ends a running turn that has produced no record for
+   * 60 minutes with no tool open, no sub-agent or background task running,
+   * nothing held and no delivery waiting, and shows the person why. Off, the
+   * host only records that it would have ended it. Absent or false means off;
+   * older servers never send it and older daemons ignore it.
+   */
+  silentTurnEnd?: boolean;
   /**
    * Server-evaluated `wake_recycle_warm` feature flag (#proj-runtime:#54,
    * RFC 070 §6.5). When true, a session whose last model request carried more
@@ -3460,8 +3817,8 @@ export interface AgentConfig {
    * stopped at a clean turn end with nothing running, held or queued (after
    * two quiet minutes; at once past 500k), and the next start gives it a
    * fresh session with a briefing whatever the gap. Only for runtimes whose
-   * resume facts the daemon reads (Claude; Codex and Grok on the OAR host
-   * while `wakeRecycleOar` is on). Absent or false means off; older servers
+   * resume facts the daemon reads (Claude; Codex, Grok, OpenCode, Cursor, Qwen
+   * and Antigravity on the OAR host while `wakeRecycleOar` is on). Absent or false means off; older servers
    * never send it and older daemons ignore it. The daemon's local
    * `RAFT_WAKE_RECYCLE=0` stays an off switch and cannot turn it on.
    */
@@ -3491,11 +3848,12 @@ export interface AgentConfig {
   installedApps?: AgentInstalledAppCatalogEntry[] | null;
   /**
    * Server-evaluated `reminder_app` rollout flag. When true, the prompt's
-   * Reminders section and command-list entry point at the Reminder app (found
-   * in the installed-app list) instead of `raft reminder schedule`, which the
-   * Server then refuses with `reminders_moved_to_app`. Absent or false means
-   * off; older servers never send it, and older daemons ignore it and learn of
-   * the move from that refusal.
+   * Reminders section says reminders live in the Reminder app and teaches the
+   * `raft reminder` commands, which call the app on such a server (the CLI
+   * reads `features.reminderApp` from the agent context, and redoes a legacy
+   * write the Server refuses with `reminders_moved_to_app` there). Absent or
+   * false means off; older servers never send it, and older daemons ignore it
+   * and learn of the move from that refusal.
    */
   reminderApp?: boolean;
   /**
@@ -3510,6 +3868,45 @@ export interface AgentConfig {
    * refs `#channel:#7`). Absent or false keeps the historical text.
    */
   taskConversations?: boolean;
+  /**
+   * Server-evaluated `dm_reply_placement_prompt` feature flag. When true, the
+   * task-conversations Tasks section of the standing prompt adds the DM rule:
+   * in a DM with one person, confirm and report on the DM's own timeline
+   * rather than in a thread or the task's conversation. Prompt text only, and
+   * only beside `taskConversations`. Absent or false means off; older servers
+   * never send it and older daemons ignore it, so the prompt stays
+   * byte-identical to the ungated one.
+   */
+  dmReplyPlacement?: boolean;
+  /**
+   * Server-evaluated `continuation_tool_v0` flag. When true and the runtime is
+   * in CONTINUATIONS_PILOT_RUNTIMES, the daemon adds its local
+   * `answer_continuation` tool to the launch's managed MCP server and sets
+   * RAFT_CONTINUATION_TOOL in the runtime's environment, so a paused command
+   * names the tool. Read at each launch. Absent or false means off; older
+   * servers never send it and older daemons ignore it.
+   */
+  continuationTool?: boolean;
+  /**
+   * Server-evaluated `agent_focus_v0` flag (Focus). When true, messages of a
+   * conversation the agent keeps in focus arrive tagged
+   * (`AgentMessage.focused`). Changes no running session, so a change needs
+   * no restart. Absent or false means off; older servers never send it. Sent
+   * (here and in `server:features`) only to a daemon that advertised
+   * DAEMON_CAPABILITY_AGENT_FOCUS_V1 on its connection.
+   */
+  agentFocus?: boolean;
+  /**
+   * Server-evaluated `inbox_notice_server_rows_v0` flag. When true, beside
+   * `inboxItems` and on a Server that advertises
+   * SERVER_CAPABILITY_INBOX_ROWS_V1, the daemon asks the Server for the
+   * unread rows of the conversations a wake-up notice is about to list
+   * (`POST /inbox/rows`) and prints the Server's numbers. Read at each
+   * notice, so a change never restarts a session. Absent or false means off:
+   * no request and today's notice; older servers never send it and older
+   * daemons ignore it.
+   */
+  inboxNoticeServerRows?: boolean;
   /**
    * The ids of the first-party apps (the Server's app registry, such as
    * `artifacts`) whose feature flag is on for this Server, in registry order.
@@ -3613,6 +4010,8 @@ export interface AgentProfileView {
   createdAgents: ProfileCreatedAgentSummary[];
   createdAt: string;
   deletedAt: string | null;
+  /** profileUpdate only, after a new description: its links some of its readers can't open (the save stands). */
+  warnings?: DescriptionLinkWarning[];
 }
 
 export type ProfileView = HumanProfileView | AgentProfileView;
@@ -3660,7 +4059,7 @@ export interface SkillInfo {
   displayName: string;
   /** Description from SKILL.md frontmatter */
   description: string;
-  /** Whether the skill is user-invocable */
+  /** True only when the runtime confirms the skill runs as a `/name` command; false is "no" or "unknown" (display only: the /name badge). */
   userInvocable: boolean;
   /** Source directory path where this skill was found */
   sourcePath?: string;
@@ -3802,6 +4201,15 @@ export interface AgentRuntimeErrorState {
    * record without it.
    */
   recoveryLaunchId?: string;
+  /**
+   * Set when this record is a failed start (a `runtime_unavailable` frame
+   * with its typed spawn-failure carrier), not an error of a running
+   * runtime: the carrier's reason. `message` is then the start's own error
+   * text (SpawnFailureActivityDiagnostic.message) or, from an older daemon,
+   * the frame's fixed copy. Cleared by the agent's next successful start and
+   * by a runtime or model change. Absent on every other record.
+   */
+  spawnFailureReason?: SpawnFailureReason;
 }
 
 export const VALID_ACTIVITIES = new Set<AgentActivityKind>(AGENT_ACTIVITIES);
@@ -4175,7 +4583,10 @@ export interface ServerRuntimeCatalogEntry {
 export type ServerRuntimeCatalogForm =
   /** The generic create payload (runtime, model, env vars): every runtime without a v1 form. */
   | { kind: "generic" }
-  /** The frozen v1 form: `.../runtime-form-definitions/:runtimeId?schemaVersion=<schemaVersion>`. */
+  /**
+   * The frozen v1 form: `.../runtime-form-definitions/:runtimeId?schemaVersion=<schemaVersion>`.
+   * Retired 2026-11-18: those routes answer 410 `runtime_form_v1_retired`.
+   */
   | { kind: "v1"; schemaVersion: string }
   /** The current v2 form: `.../runtime-forms/v2/:runtimeId`. */
   | { kind: "v2" };
@@ -4247,6 +4658,10 @@ export interface AgentCreateFormOption {
   supportedReasoningEfforts?: string[];
   /** Must be one of supportedReasoningEfforts when present. */
   defaultReasoningEffort?: string;
+  /** Additive, with an empty supportedReasoningEfforts: the Computer could not read this model's levels; plain text. */
+  reasoningEffortUnavailableReason?: string;
+  /** Additive, with an empty supportedReasoningEfforts: the runtime declared that this model takes no effort. */
+  reasoningEffortNone?: true;
 }
 
 interface AgentCreateFormOptionSourceBase {
@@ -4332,19 +4747,48 @@ export type {
 
 // ── Runtime Models ──
 
+/** #wg-runtime-form:#27: one fast tier a model offers, as its runtime names it. */
+export interface RuntimeServiceTierChoice {
+  /** The runtime-native id (RUNTIME_SERVICE_TIER_ID_PATTERN), e.g. Codex `priority`, `ultrafast`. */
+  id: string;
+  /** The runtime's short name, e.g. "Fast", "Ultrafast". */
+  name?: string;
+  /** The runtime's one-line description, e.g. "2x speed, increased usage". */
+  description?: string;
+}
+
 export interface RuntimeModelInfo {
   /** Model ID passed to CLI (e.g. "sonnet", "gpt-5.3-codex") */
   id: string;
   /** Human-readable label (e.g. "Sonnet", "GPT-5.3 Codex") */
   label: string;
-  /** Runtime-reported reasoning effort IDs accepted by this model, when known. */
+  /**
+   * Runtime-reported reasoning effort IDs accepted by this model. Omit when
+   * unknown; `[]` means the model takes no reasoning effort (readers must not
+   * fall back to a catalog or base set for it).
+   */
   supportedReasoningEfforts?: string[];
-  /** Runtime-reported default reasoning effort for this model, when known. */
+  /** Runtime-reported default reasoning effort for this model, when known; one of supportedReasoningEfforts when that is present. */
   defaultReasoningEffort?: string;
+  /**
+   * Additive: why the runtime could not read this model's effort levels on
+   * this listing (OAR's `effortUnavailableReason`, a short provider-written
+   * line; plain text, bounded). Sent only with `supportedReasoningEfforts`
+   * omitted. Absent from older Computers: treat absent as not reported.
+   */
+  reasoningEffortUnavailableReason?: string;
   /** Runtime-reported service tier IDs accepted by this model, when known. */
   serviceTiers?: string[];
   /** Runtime-reported default service tier for this model, when known. */
   defaultServiceTier?: string;
+  /**
+   * #wg-runtime-form:#27, additive: the fast tiers this Computer can launch for
+   * the model by name (`mode.serviceTier`), primary first, with the runtime's
+   * name and description. Sent only by a Computer that passes the chosen tier
+   * through; absent from older ones, which launch the primary tier whatever is
+   * stored. The form offers a tier choice only for a model with two or more.
+   */
+  serviceTierChoices?: RuntimeServiceTierChoice[];
   /**
    * Whether this model is expected to launch with the current runtime config.
    * Official CLI model catalogs can be marked launchable when launch is a
@@ -4401,6 +4845,13 @@ function boundedRuntimeText(value: string): string {
  * length-capped, ids de-duplicated, entry count capped. Undefined when nothing
  * is left.
  */
+/** A runtime's "could not read this model's effort levels" line, bounded; undefined when blank or not a string. */
+export function sanitizeRuntimeEffortUnavailableReason(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = boundedRuntimeText(value);
+  return text ? text : undefined;
+}
+
 export function sanitizeRuntimeModelUnavailable(value: unknown): RuntimeModelUnavailable[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const entries: RuntimeModelUnavailable[] = [];
@@ -4435,7 +4886,8 @@ export interface RuntimeModelCatalogCapability {
    * typed id through a saved provider connection (the connection supplies
    * only the key; the transport stays the provider's). Absent on older
    * Computers, which run a typed id only on a direct preset: treat absent as
-   * none.
+   * none. Saved provider connections are removed: the Server no longer reads
+   * it and current Computers no longer send it; older ones still do.
    */
   customModelConnectionProviderIds?: string[];
 }
@@ -4583,8 +5035,22 @@ export const RUNTIME_MODELS: Record<string, RuntimeModelInfo[]> = {
   ],
   codex: [
     // Order and per-model reasoning metadata follow upstream Codex's bundled
-    // catalog (codex-rs/models-manager/models.json, rust-v0.162.0): picker
+    // catalog (codex-rs/models-manager/models.json, rust-v0.169.1): picker
     // priority, `default_reasoning_level`, `supported_reasoning_levels`.
+    {
+      id: "gpt-6.2-sol",
+      label: "GPT-6.2 Sol",
+      supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      defaultReasoningEffort: "low",
+      verified: "launchable",
+    },
+    {
+      id: "gpt-6.2-astra",
+      label: "GPT-6.2 Astra",
+      supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      defaultReasoningEffort: "low",
+      verified: "launchable",
+    },
     {
       id: "gpt-6.1-sol",
       label: "GPT-6.1 Sol",
@@ -4661,9 +5127,11 @@ export const RUNTIME_MODELS: Record<string, RuntimeModelInfo[]> = {
       verified: "launchable",
     },
   ],
-  antigravity: [
-    { id: "default", label: "AGY configured default", verified: "suggestion_only" },
-  ],
+  // No bundled list: the models are the Computer's `agy` login's (OAR
+  // listModels), and one must be chosen (#oar-raft:#25). The old "AGY
+  // configured default" (`default`, no model passed) is gone from pickers;
+  // agents that stored it keep running (getDefaultModel, the daemon's launch).
+  antigravity: [],
   copilot: [
     { id: "gpt-5.4", label: "GPT-5.4" },
     { id: "gpt-5.2", label: "GPT-5.2" },
@@ -4731,8 +5199,18 @@ export function getStaticRuntimeModelSourceSet(
   };
 }
 
+/**
+ * The model id an Antigravity agent stored before a model was required
+ * (#oar-raft:#25): agy chooses (the daemon passes no model). Never offered;
+ * a form that loads it asks for a model, and a save refuses it.
+ */
+export const ANTIGRAVITY_AGY_CHOOSES_MODEL = "default";
+
 /** Get the default model ID for a runtime. */
 export function getDefaultModel(runtimeId: string): string {
+  // An Antigravity agent stored before a model was required ran on agy's own
+  // choice (`default`, no model passed); it keeps doing so, never "sonnet".
+  if (runtimeId === "antigravity") return ANTIGRAVITY_AGY_CHOOSES_MODEL;
   const models = RUNTIME_MODELS[runtimeId];
   return models?.[0]?.id ?? "sonnet";
 }
@@ -4906,7 +5384,7 @@ const RUNTIME_CONFIG_FIELDS = [
   "loadLocalPlugins",
 ] as const;
 const MODEL_CONFIG_FIELDS = ["kind", "id", "name", "contextWindow", "maxOutputTokens"] as const;
-const MODE_CONFIG_FIELDS = ["kind"] as const;
+const MODE_CONFIG_FIELDS = ["kind", "serviceTier"] as const;
 const CLAUDE_DEFAULT_PROVIDER_FIELDS = ["kind"] as const;
 const CLAUDE_CUSTOM_PROVIDER_FIELDS = ["kind", "apiUrl", "apiKey", "authType"] as const;
 const PI_DEFAULT_PROVIDER_FIELDS = ["kind"] as const;
@@ -5295,9 +5773,15 @@ function parseStrictModeConfig(value: unknown): RuntimeModeConfig | string {
   if (value === undefined || value === null) return { kind: "default" };
   if (!isPlainRecord(value)) return "runtimeConfig.mode must be an object";
   if (hasUnknownFields(value, MODE_CONFIG_FIELDS)) return "runtimeConfig.mode contains unknown fields";
-  if (value.kind === "default" || value.kind === "fast") return { kind: value.kind };
-  return "runtimeConfig.mode.kind is invalid";
+  if (value.kind !== "default" && value.kind !== "fast") return "runtimeConfig.mode.kind is invalid";
+  if (value.serviceTier === undefined) return { kind: value.kind };
+  if (value.kind !== "fast") return "runtimeConfig.mode.serviceTier is only valid with fast mode";
+  if (!isRuntimeServiceTierId(value.serviceTier)) return "runtimeConfig.mode.serviceTier is invalid";
+  return { kind: "fast", serviceTier: value.serviceTier };
 }
+
+/** The reason a start refuses a Built-in config with no provider (the strict parser's words). */
+const BUILTIN_RUNTIME_PROVIDER_REQUIRED_REASON = "runtimeConfig.provider is required for runtime: builtin";
 
 function parseStrictProviderConfig(
   runtime: string,
@@ -5305,19 +5789,16 @@ function parseStrictProviderConfig(
 ): BuiltInRuntimeProviderConfig | ClaudeRuntimeProviderConfig | PiRuntimeProviderConfig | string | undefined {
   if (value === undefined || value === null) {
     if (runtime === "claude" || runtime === "pi") return { kind: "default" };
-    if (runtime === "builtin") return "runtimeConfig.provider is required for runtime: builtin";
+    if (runtime === "builtin") return BUILTIN_RUNTIME_PROVIDER_REQUIRED_REASON;
     return undefined;
   }
   if (!isPlainRecord(value)) return "runtimeConfig.provider must be an object";
   const rawKind = typeof value.kind === "string" ? value.kind : undefined;
   if (runtime === "builtin") {
-    if (rawKind === "connection") {
-      if (hasUnknownFields(value, providerKnownFieldsFor(runtime, value))) return "runtimeConfig.provider contains unknown fields";
-      if (typeof value.connectionId !== "string" || !value.connectionId.trim()) {
-        return "runtimeConfig.provider.connectionId is required";
-      }
-      return { kind: "connection", connectionId: value.connectionId.trim() };
-    }
+    // Saved provider connections are removed: a write can no longer bind one.
+    // (Hydration still reads a stored one, so a Computer on an older config
+    // keeps parsing it.)
+    if (rawKind === "connection") return "runtimeConfig.provider.kind connection was removed; choose a provider and its API key";
     if (rawKind === "preset") {
       if (hasUnknownFields(value, providerKnownFieldsFor(runtime, value))) return "runtimeConfig.provider contains unknown fields";
       if (typeof value.providerId !== "string" || !value.providerId.trim()) return "runtimeConfig.provider.providerId is required";
@@ -5508,7 +5989,7 @@ export function parseRuntimeConfig(input: RuntimeConfigHydrationInput): RuntimeC
   if (raw === undefined || raw === null) {
     const config = hydrateRuntimeConfig(input);
     if (config.runtime === "builtin") {
-      return runtimeConfigError("invalid_provider", "runtimeConfig.provider is required for runtime: builtin", config.runtime, providerKind(config));
+      return runtimeConfigError("invalid_provider", BUILTIN_RUNTIME_PROVIDER_REQUIRED_REASON, config.runtime, providerKind(config));
     }
     const providerError = config.runtime === "claude" && config.provider?.kind === "custom"
       ? customProviderConfigError(config.provider)
@@ -5561,6 +6042,9 @@ export function parseRuntimeConfig(input: RuntimeConfigHydrationInput): RuntimeC
   if (typeof mode === "string") return runtimeConfigError("invalid_mode", mode, runtime);
   if (mode.kind === "fast" && !RUNTIME_FAST_MODE_RUNTIMES.has(runtime)) {
     return runtimeConfigError("unsupported_fast_mode", `runtimeConfig.mode is not supported for runtime: ${runtime}`, runtime);
+  }
+  if (mode.kind === "fast" && mode.serviceTier !== undefined && !RUNTIME_SERVICE_TIER_RUNTIMES.has(runtime)) {
+    return runtimeConfigError("unsupported_fast_mode", `runtimeConfig.mode.serviceTier is not supported for runtime: ${runtime}`, runtime);
   }
 
   const rawProviderKind = isPlainRecord(raw.provider) && typeof raw.provider.kind === "string" ? raw.provider.kind : undefined;
@@ -5667,6 +6151,17 @@ export function runtimeConfigForLaunch(config: RuntimeConfig): RuntimeConfig {
   return { ...config, mode: { kind: "default" } };
 }
 
+/**
+ * The config without a named fast tier, for a daemon that predates
+ * DAEMON_CAPABILITY_CODEX_SERVICE_TIER_V1: it launches the primary fast tier
+ * either way, and its strict parse stays readable. Same object when there is
+ * none.
+ */
+export function runtimeConfigWithoutServiceTier(config: RuntimeConfig): RuntimeConfig {
+  if (config.mode.kind !== "fast" || config.mode.serviceTier === undefined) return config;
+  return { ...config, mode: { kind: "fast" } };
+}
+
 function reasonForValidationError(error: string): RuntimeConfigParseReason {
   if (error.includes("provider is not supported") || error.includes("provider.kind")) return "cross_runtime_provider";
   if (error.includes("mode is not supported")) return "unsupported_fast_mode";
@@ -5690,6 +6185,16 @@ export function runtimeConfigSource(config: RuntimeConfig): RuntimeConfigSource 
   return config.provider ? "agent_config" : "host_runtime_config";
 }
 
+/**
+ * A Built-in config whose stored row lost its provider. The strict parser
+ * refuses it ("runtimeConfig.provider is required for runtime: builtin"), but
+ * hydration is lenient and the type's `provider` promise is not kept on the
+ * wire (runtimeConfigLegacy.ts), so readers of a hydrated config check here.
+ */
+export function isBuiltInRuntimeConfigMissingProvider(config: RuntimeConfig): boolean {
+  return config.runtime === "builtin" && (config as { provider?: unknown }).provider == null;
+}
+
 export function buildLaunchPlan(config: RuntimeConfig): LaunchPlan {
   // Compatibility bridge for existing runtime drivers: RuntimeConfig is the
   // persisted source of truth, while drivers still consume flat launch fields
@@ -5697,7 +6202,9 @@ export function buildLaunchPlan(config: RuntimeConfig): LaunchPlan {
   // LaunchPlan; re-parse or hydrate RuntimeConfig instead.
   const normalized = config;
   const generatedEnvVars: Record<string, string> = {};
-  if (normalized.runtime === "builtin") {
+  // A provider-less Built-in row emits no provider env; the start refuses it
+  // (agentOrchestrator), and cache/config reads must not throw on it.
+  if (normalized.runtime === "builtin" && !isBuiltInRuntimeConfigMissingProvider(normalized)) {
     if (normalized.provider.kind === "preset") {
       const envKey = BUILTIN_RUNTIME_PROVIDER_ENV_KEYS[normalized.provider.providerId];
       if (envKey) generatedEnvVars[envKey] = normalized.provider.apiKey;
@@ -5785,6 +6292,12 @@ const RUNTIME_CREDENTIAL_HOME_ENV: Readonly<Record<RuntimeAuthRuntime, readonly 
   // OpenCode keeps its sign-ins under $XDG_DATA_HOME/opencode (~/.local/share
   // by default); an agent with its own data dir reads its own.
   opencode: ["XDG_DATA_HOME"],
+  // DeepSeek Harness resolves its key (the `DEEPSEEK_API_KEY` reference) from
+  // $DSH_HOME/.credentials.yaml (~/.dsh by default) first, then the
+  // environment. An agent with its own DSH_HOME reads its own store; one with
+  // its own DEEPSEEK_API_KEY runs on it unless the Computer's dsh has a key
+  // saved, which Raft cannot tell, so it is treated as on its own credential.
+  dsh: ["DSH_HOME", "DEEPSEEK_API_KEY"],
 };
 
 /**
@@ -5807,6 +6320,58 @@ export function sharedCredentialsAuthRuntime(input: RuntimeConfigHydrationInput)
     if (typeof value === "string" && value.trim().length > 0) return null;
   }
   return authRuntime;
+}
+
+/**
+ * The env that points an agent's runtime at its own account folder for
+ * `provider` (Codex, Claude), for the Computer's per-folder usage read: only
+ * `HOME` and the folder key (CODEX_HOME / CLAUDE_CONFIG_DIR), as the agent
+ * sets them. Null for an agent on another runtime, on its own (non-default)
+ * provider, with an API key (OPENAI_API_KEY / ANTHROPIC_AUTH_TOKEN; no
+ * signed-in account), or setting neither: it reads the default account.
+ */
+export function runtimeAccountUsageAccountHomeEnv(provider: RuntimeAccountUsageFolderProvider, input: RuntimeConfigHydrationInput): Record<string, string> | null {
+  if (runtimeAuthRuntimeFor(input.runtime || "claude") !== provider) return null;
+  const config = hydrateRuntimeConfig(input);
+  if (config.provider && config.provider.kind !== "default") return null;
+  const agentEnv = runtimeConfigToLaunchFields(config).envVars ?? {};
+  const set = (name: string): string | null => {
+    const value = agentEnv[name];
+    return typeof value === "string" && value.trim().length > 0 ? value : null;
+  };
+  if (set(RUNTIME_ACCOUNT_USAGE_API_KEY_ENV[provider])) return null;
+  const env: Record<string, string> = {};
+  for (const name of runtimeAccountUsageFolderEnvNames(provider)) {
+    const value = set(name);
+    if (value !== null) env[name] = value;
+  }
+  return Object.keys(env).length > 0 ? env : null;
+}
+
+/**
+ * A refresh's `accountHomes` for `provider` from the agents on a Computer:
+ * every agent with an account folder env (`runtimeAccountUsageAccountHomeEnv`),
+ * agents with the same env in one entry. Deterministic (entries by env, ids
+ * sorted) and bounded (RUNTIME_ACCOUNT_USAGE_ACCOUNT_HOMES_MAX entries,
+ * RUNTIME_ACCOUNT_USAGE_AGENT_IDS_MAX ids each). Empty when none has one.
+ */
+export function runtimeAccountUsageAccountHomes(
+  provider: RuntimeAccountUsageFolderProvider,
+  agents: Iterable<RuntimeConfigHydrationInput & { id: string }>,
+): RuntimeAccountUsageAccountHome[] {
+  const byEnv = new Map<string, RuntimeAccountUsageAccountHome>();
+  for (const agent of agents) {
+    const env = runtimeAccountUsageAccountHomeEnv(provider, agent);
+    if (!env) continue;
+    const key = JSON.stringify(Object.entries(env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+    const entry = byEnv.get(key) ?? { agentIds: [], env };
+    entry.agentIds.push(agent.id);
+    byEnv.set(key, entry);
+  }
+  return [...byEnv.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .slice(0, RUNTIME_ACCOUNT_USAGE_ACCOUNT_HOMES_MAX)
+    .map(([, entry]) => ({ agentIds: [...new Set(entry.agentIds)].sort().slice(0, RUNTIME_ACCOUNT_USAGE_AGENT_IDS_MAX), env: entry.env }));
 }
 
 // ── Reasoning Effort ──
@@ -5866,9 +6431,11 @@ export function defaultReasoningEffortsForRuntime(runtime: string): readonly Rea
  * in the pickers (the v2 form, the bulk change). Antigravity does not: agy's
  * thought levels are per model and it can only apply a level the Computer
  * listed for that model (OAR `listModels` reads them for the current model only).
+ * Nor does DeepSeek Harness: OAR lists each model's own efforts (none for a
+ * model without reasoning), and dsh refuses one it does not support.
  */
 export function runtimeOffersUndeclaredReasoningEfforts(runtime: string): boolean {
-  return runtime !== "antigravity";
+  return runtime !== "antigravity" && runtime !== "dsh";
 }
 
 /**
@@ -5891,22 +6458,13 @@ export function allowedReasoningEffortsForModel(runtime: string, modelId: string
   if (runtime === "kimi-sdk") return supported ?? [];
   if (supported && supported.length > 0) return supported;
   // A catalog model that declares none, on a runtime that applies only listed
-  // levels (Antigravity's `default`: agy's own choice), allows none. A model
+  // levels, allows none. A model
   // only the Computer lists is not in this static catalog: the v2 submit checks
   // it against the live list (reconcileWithLiveModels).
   if (known && !runtimeOffersUndeclaredReasoningEfforts(runtime)) return [];
   return defaultReasoningEffortsForRuntime(runtime);
 }
 
-/**
- * A runtime's model entry meaning "the runtime chooses" (no model is passed):
- * Antigravity's `default`. Model pickers keep it first and preselect it, so a
- * new agent or a bulk change leaves the choice to the runtime unless the user
- * picks a model.
- */
-export function runtimeChoiceModel(runtime: string): RuntimeModelInfo | undefined {
-  return runtime === "antigravity" ? RUNTIME_MODELS.antigravity?.find((model) => model.id === "default") : undefined;
-}
 
 /** Whether `effort` is allowed for the model — used to gate/normalize backend input. */
 export function isReasoningEffortAllowedForModel(runtime: string, modelId: string, effort: ReasoningEffort): boolean {
@@ -5915,13 +6473,49 @@ export function isReasoningEffortAllowedForModel(runtime: string, modelId: strin
 
 /**
  * Runtimes that support configurable reasoning effort. Antigravity's is agy's
- * thought level, offered only for a model whose levels the Computer lists
- * (OAR `listModels`) and passed as the OAR session's `effort`.
+ * thought level, and DeepSeek Harness's its model's reasoning effort, each
+ * offered only for a model whose levels the Computer lists (OAR `listModels`)
+ * and passed as the OAR session's `effort`.
  */
-export const REASONING_EFFORT_RUNTIMES = new Set(["builtin", "claude", "codex", "grok", "antigravity", "copilot", "pi", "kimi-sdk"]);
+export const REASONING_EFFORT_RUNTIMES = new Set(["builtin", "claude", "codex", "grok", "antigravity", "copilot", "pi", "kimi-sdk", "dsh"]);
 
 /** Runtimes that support the shared fast-mode launch variant. */
 export const RUNTIME_FAST_MODE_RUNTIMES = new Set(["claude", "codex"]);
+
+/**
+ * #wg-runtime-form:#27: fast-mode runtimes whose fast mode can name a tier
+ * (`mode.serviceTier`), chosen from the model's `serviceTierChoices`.
+ */
+export const RUNTIME_SERVICE_TIER_RUNTIMES = new Set(["codex"]);
+
+/** Codex's primary fast tier: what fast mode launches when no tier is named. */
+export const CODEX_PRIMARY_FAST_SERVICE_TIER = "priority";
+
+/** A runtime-native service tier id as Raft stores and forwards it (Codex: `priority`, `ultrafast`). */
+export const RUNTIME_SERVICE_TIER_ID_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+
+export function isRuntimeServiceTierId(value: unknown): value is string {
+  return typeof value === "string" && RUNTIME_SERVICE_TIER_ID_PATTERN.test(value);
+}
+
+/**
+ * Codex tiers that are not a faster speed: the explicit `default` opt-out and
+ * the slower, cheaper `flex`. Never offered as a fast-mode choice.
+ */
+export const CODEX_NON_FAST_SERVICE_TIERS: ReadonlySet<string> = new Set(["default", "flex"]);
+
+/**
+ * A runtime-written tier name or description as every form viewer reads it:
+ * one line, no control, bidi or zero-width characters, at most `max` chars.
+ */
+export function runtimeServiceTierText(value: unknown, max: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text ? (text.length > max ? `${text.slice(0, max - 1)}…` : text) : undefined;
+}
 
 /**
  * Models a fast-mode runtime does not run fast. Claude Code 2.1.316: fast mode
@@ -6038,6 +6632,7 @@ export interface TaskInfo {
 }
 
 export * from "./serverPermissions";
+export * from "./dataExport";
 export * from "./taskPermissions";
 
 // ── Server Plans ──
@@ -6061,9 +6656,6 @@ export {
   type ServerPlan,
 };
 
-/** Plans shown in the pricing comparison UI (includes coming-soon tiers). */
-export type DisplayPlan = "free" | "pro" | "enterprise";
-
 export interface PlanLimits {
   maxMachines: number;       // -1 = unlimited
   maxAgents: number;         // -1 = unlimited
@@ -6077,12 +6669,7 @@ export interface PlanConfig {
   limits: PlanLimits;
   comingSoon: boolean;
   price: number;             // monthly price in dollars (0 = free)
-  priceLabel?: string;       // display-only override for non-numeric pricing copy
-  priceCadence?: string | null;
   extraAgentPrice: number;   // [UNUSED] extra-agent billing disabled — always 0 for now
-  displayFeatures?: string[];
-  displayDescription?: string;
-  displayNote?: string;
 }
 
 export interface BillingCapacity {
@@ -6292,15 +6879,6 @@ export const PLAN_CONFIG: Record<ServerPlan, PlanConfig> = {
     comingSoon: false,
     price: 0,
     extraAgentPrice: 0,
-    displayFeatures: [
-      "Channels",
-      "Tasks",
-      "Agents on your own computers",
-      "Agent reminders",
-      "Basic observability",
-      "30 days of message history",
-      "100 MB file uploads/month",
-    ],
   },
   founder: {
     displayName: "Founder",
@@ -6325,46 +6903,6 @@ export const PLAN_CONFIG: Record<ServerPlan, PlanConfig> = {
   },
 };
 
-/** Display-only plan configs for the pricing comparison UI. */
-export const DISPLAY_PLAN_CONFIG: Record<DisplayPlan, PlanConfig> = {
-  free: PLAN_CONFIG.free,
-  pro: {
-    displayName: "Pro",
-    limits: { maxMachines: -1, maxAgents: -1, maxChannels: -1, messageHistoryDays: -1, includedAgents: -1 },
-    comingSoon: false,
-    price: PRO_SEAT_MONTHLY_USD,
-    priceCadence: "/ seat / month",
-    extraAgentPrice: 0,
-    displayFeatures: [
-      "Everything in Free",
-      "Unlimited message history",
-      "Higher file upload limits",
-      "Joint channels",
-      "More professional features coming soon",
-    ],
-    displayDescription: "For builders and teams scaling agent collaboration.",
-    displayNote: `$${PRO_SEAT_ANNUAL_MONTHLY_USD.toFixed(2)} / seat / month when billed yearly. Each human uses 1 seat; each agent uses ${PRO_AGENT_SEAT_FRACTION} seat.`,
-  },
-  enterprise: {
-    displayName: "Enterprise",
-    limits: { maxMachines: -1, maxAgents: -1, maxChannels: -1, messageHistoryDays: -1, includedAgents: -1 },
-    comingSoon: false,
-    price: 0,
-    priceLabel: "Coming soon",
-    priceCadence: null,
-    extraAgentPrice: 0,
-    displayFeatures: [
-      "Everything in Pro",
-      "Private deployment options",
-      "SSO and advanced access control",
-      "Dedicated onboarding and rollout support",
-    ],
-    displayDescription: "For advanced deployment and governance needs.",
-  },
-};
-
-/** Plans shown in the pricing comparison UI. */
-export const DISPLAY_PLANS: DisplayPlan[] = ["free", "pro", "enterprise"];
 export type BillingInterval = "monthly" | "annual";
 export const DEFAULT_BILLING_INTERVAL: BillingInterval = "annual";
 export const FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES = 100 * 1024 * 1024;
@@ -7234,8 +7772,7 @@ export * from "./agentMigrationUserIgnore";
 export * from "./agentArchive";
 export * from "./discussionGraph";
 export * from "./managedMcp";
-export * from "./providerConnections";
-export * from "./providerProbes";
+export * from "./canonicalDigest";
 
 
 // ── Identity setup: who still owes us a handle ──
@@ -7302,9 +7839,10 @@ export {
 } from "./artifactExcerptBlocks";
 export type { ArtifactExcerptBlock, ArtifactExcerptListItem, ArtifactExcerptSpan } from "./artifactExcerptBlocks";
 export { ARTIFACT_CHECKED_KINDS, ARTIFACT_DRAFT_MAX_PER_ARTIFACT, ARTIFACT_DRAFT_TTL_DAYS, ARTIFACT_DRAFT_WARN_AFTER_DAYS, ARTIFACT_EXCERPT_MAX_CHARS, ARTIFACT_FRAMED_KINDS, ARTIFACT_INLINE_IMAGE_TYPES, ARTIFACT_PAGE_ANCHOR_MAX_LABEL, ARTIFACT_PAGE_ANCHOR_MAX_QUOTE, ARTIFACT_PAGE_ANCHOR_NAME, ARTIFACT_PAGE_DRAFT_MAX, ARTIFACT_PAGE_TEXT_UNSEEN, asArtifactCommentDraftId, asArtifactCommentId, asArtifactId, asArtifactReviewId, isArtifactCheckedKind, isArtifactFramedKind, isArtifactPageText } from "./workspaceArtifacts";
+export { ARTIFACT_ANCHOR_CONTEXT_LIMITS, artifactAnchorContextSchema, artifactAnchorJsonBytes, cleanArtifactAnchorContextText, fitArtifactAnchorContext, keepArtifactAnchorContext } from "./artifactAnchorContext";
 export { ARTIFACT_LEGACY_HOSTS, ARTIFACT_LINK_FIXED_HOSTS, artifactLinkId, artifactPagePath, isArtifactName, parseArtifactId, parseArtifactRef, parseLegacyArtifactLink, type ParseArtifactRefOptions, type ParsedArtifactRef, type ParsedLegacyArtifactLink } from "./artifactRef";
 export { ARTIFACT_SHORT_ID_LENGTH, decodeArtifactShortId, encodeArtifactShortId } from "./artifactShortId";
-export { artifactFileType, artifactFramedPagePath, artifactTitleFromFileName, artifactTitleFromHtml, type ArtifactFileType } from "./artifactFiles";
+export { ARTIFACT_FILE_NAME_MAX_CHARS, artifactDefaultEntry, artifactDownloadFileName, artifactFileType, artifactFramedPagePath, artifactSafeFileName, artifactTitleFromFileName, artifactTitleFromHtml, type ArtifactFileType } from "./artifactFiles";
 export { isGitPathSegment, isWellFormedArtifactFilePath } from "./artifactFilePath";
 export { appEnabledPerEnv, enabledAppsEnvValue, RAFT_ENABLED_APPS_ENV } from "./enabledAppsEnv";
 export * from "./agentApiArtifactsContract";
@@ -7335,6 +7873,7 @@ export type {
   ArtifactActor,
   ArtifactShownActor,
   ArtifactAnnotationAnchor,
+  ArtifactAnnotationAnchorContext,
   ArtifactPageAnchor,
   ArtifactCapabilities,
   ArtifactCard,
@@ -7361,7 +7900,9 @@ export type {
   ArtifactPresence,
   ArtifactPreview,
   ArtifactReference,
+  ArtifactReopened,
   ArtifactReviewId,
+  ArtifactSettled,
   ArtifactVersionSummary,
   ArtifactViewerData,
   ArtifactReadAsUser,
@@ -7370,10 +7911,13 @@ export type {
   ArtifactWebConversationArtifacts,
   ArtifactWillNotify,
 } from "./workspaceArtifacts";
-export { ARTIFACT_CHECK_SHOTS, ARTIFACT_COMMENT_IMAGE_MAX_BYTES, ARTIFACT_COMMENT_IMAGE_TYPES, ARTIFACT_COMMENT_MAX_CHARS, ARTIFACT_COMMENT_MAX_IMAGES, ARTIFACT_COMMENT_MAX_MENTIONS, ARTIFACT_CONVERSATION_PAGE_LIMIT, ARTIFACT_DASHBOARD_ALL_DEFAULT_DIRS, ARTIFACT_DASHBOARD_ALL_DIRS, ARTIFACT_DASHBOARD_ALL_PAGE_LIMIT, ARTIFACT_DASHBOARD_ALL_SORTS, ARTIFACT_DASHBOARD_AUTHORS_LIMIT, ARTIFACT_DASHBOARD_AUTHORS_MAX, ARTIFACT_DASHBOARD_CONVERSATIONS_LIMIT, ARTIFACT_DASHBOARD_HOMES, ARTIFACT_DASHBOARD_PAGE_LIMIT, ARTIFACT_DASHBOARD_SECTIONS, ARTIFACT_FRAME_SANDBOX, ARTIFACT_ATTACHMENT_SAVES_MAX_IDS, ARTIFACT_HOME_CHANGE_MAX_COUNTED, ARTIFACT_SAVE_MAX_BINARY_BYTES, ARTIFACT_SAVE_MAX_TEXT_BYTES, ARTIFACT_SHARE_AUDIENCE_MAX_COUNTED, ARTIFACT_SHARE_NOTE_MAX_CHARS, ARTIFACT_TAKEDOWN_REASON_MAX_CHARS, ARTIFACT_WEB_ERROR_CODES, artifactWebPaths, asArtifactInstanceVersion } from "./webArtifactsContract";
+export { ARTIFACT_BACKLINKS_COUNT_CAP, ARTIFACT_BACKLINKS_PAGE_LIMIT, ARTIFACT_CHECK_SHOTS, ARTIFACT_COMMENT_IMAGE_MAX_BYTES, ARTIFACT_COMMENT_IMAGE_TYPES, ARTIFACT_COMMENT_MAX_CHARS, ARTIFACT_COMMENT_MAX_IMAGES, ARTIFACT_COMMENT_MAX_MENTIONS, ARTIFACT_CONTENT_LINKS_MAX, ARTIFACT_CONVERSATION_PAGE_LIMIT, ARTIFACT_DASHBOARD_ALL_DEFAULT_DIRS, ARTIFACT_DASHBOARD_ALL_DIRS, ARTIFACT_DASHBOARD_ALL_PAGE_LIMIT, ARTIFACT_DASHBOARD_ALL_SORTS, ARTIFACT_DASHBOARD_AUTHORS_LIMIT, ARTIFACT_DASHBOARD_AUTHORS_MAX, ARTIFACT_DASHBOARD_CONVERSATIONS_LIMIT, ARTIFACT_DASHBOARD_HOMES, ARTIFACT_DASHBOARD_PAGE_LIMIT, ARTIFACT_DASHBOARD_SECTIONS, ARTIFACT_FRAME_SANDBOX, ARTIFACT_ATTACHMENT_SAVES_MAX_IDS, ARTIFACT_HOME_CHANGE_MAX_COUNTED, ARTIFACT_SAVE_MAX_BINARY_BYTES, ARTIFACT_SAVE_MAX_TEXT_BYTES, ARTIFACT_SHARE_AUDIENCE_MAX_COUNTED, ARTIFACT_SHARE_NOTE_MAX_CHARS, ARTIFACT_TAKEDOWN_REASON_MAX_CHARS, ARTIFACT_WEB_ERROR_CODES, artifactWebPaths, asArtifactInstanceVersion } from "./webArtifactsContract";
 export type {
+  ArtifactBacklinkGroup,
+  ArtifactBacklinkMessage,
   ArtifactCheckShot,
   ArtifactCommentImageType,
+  ArtifactContentLink,
   ArtifactDashboardAllCounts,
   ArtifactDashboardAllDir,
   ArtifactDashboardAllNews,
@@ -7388,10 +7932,12 @@ export type {
   ArtifactDashboardRecent,
   ArtifactDashboardSection,
   ArtifactDashboardWaiting,
+  ArtifactLinkTarget,
   ArtifactReviewRejected,
   ArtifactReviewSubmitted,
   ArtifactSearchHit,
   ArtifactWebAttachmentSaves,
+  ArtifactWebBacklinks,
   ArtifactWebCommentCreated,
   ArtifactWebCommentInput,
   ArtifactWebCommentsPage,
@@ -7406,12 +7952,14 @@ export type {
   ArtifactWebFrameInput,
   ArtifactWebHomeChange,
   ArtifactWebHomeInput,
+  ArtifactWebLinks,
   ArtifactWebMentionCandidates,
   ArtifactWebResponses,
   ArtifactWebReview,
   ArtifactWebReviewDrafts,
   ArtifactWebReviewDraftSaved,
   ArtifactWebResolveInput,
+  ArtifactWebSettlement,
   ArtifactWebThreadResolution,
   ArtifactWebImported,
   ArtifactWebImportInput,
@@ -7430,8 +7978,11 @@ export type {
 } from "./webArtifactsContract";
 export { ARTIFACT_PUBLIC_DESCRIPTION_MAX_CHARS, ARTIFACT_PUBLIC_MARKDOWN_MAX_BYTES, artifactPublicPaths } from "./publicArtifactsContract";
 export {
+  ARTIFACT_CHECK_ELEMENT_MAX_CHARS,
+  ARTIFACT_CHECK_HOLD_STYLES,
   ARTIFACT_CHECK_MAX_BLOCKED_RESOURCES,
   ARTIFACT_CHECK_MAX_CONSOLE_ERRORS,
+  ARTIFACT_CHECK_MAX_HELD_BY,
   ARTIFACT_CHECK_REPORT_MAX_BYTES,
   ARTIFACT_CHECK_SHOT_MAX_BYTES,
   ARTIFACT_CHECK_TEXT_MAX_CHARS,
@@ -7440,8 +7991,8 @@ export {
   ARTIFACT_CHECK_VIEWPORTS,
   artifactCheckWorkerPaths,
 } from "./artifactCheckContract";
-export type { ArtifactCheckLease, ArtifactCheckLoad, ArtifactCheckReport, ArtifactCheckReportForm, ArtifactCheckResultAnswer, ArtifactCheckTiming, ArtifactCheckViewport } from "./artifactCheckContract";
-export type { ArtifactPublicAttribution, ArtifactPublicFile, ArtifactPublicFrame, ArtifactPublicMeta, ArtifactPublicView } from "./publicArtifactsContract";
+export type { ArtifactCheckCantScroll, ArtifactCheckHoldStyle, ArtifactCheckLease, ArtifactCheckLoad, ArtifactCheckReport, ArtifactCheckReportForm, ArtifactCheckResultAnswer, ArtifactCheckTiming, ArtifactCheckViewport } from "./artifactCheckContract";
+export type { ArtifactPublicAttribution, ArtifactPublicFile, ArtifactPublicFrame, ArtifactPublicLinks, ArtifactPublicMeta, ArtifactPublicView } from "./publicArtifactsContract";
 export { AGENT_API_META, appAgentApiRoutesOf, defineAppAgentApi, mergeAppAgentApis } from "./agentApiRoute";
 export type { AgentApiRouteAuthority, AgentApiRouteVisibility, AppAgentApi, AppAgentApiRoute } from "./agentApiRoute";
 export { firstPartyAppAgentApis } from "./apps";
@@ -7520,8 +8071,8 @@ export type {
   ObjectInboxReason,
   ObjectUnreadSummaryFields,
 } from "./activityObjectsContract";
-export { asSearchCursor, WEB_SEARCH_DEFAULT_LIMIT, WEB_SEARCH_ERROR_CODES, WEB_SEARCH_MAX_LIMIT, WEB_SEARCH_QUERY_MAX_CHARS, webSearchPath } from "./webSearchContract";
-export type { SearchCursor, WebSearchApp, WebSearchErrorCode, WebSearchGroup, WebSearchGroupError, WebSearchItemsByApp, WebSearchQuery, WebSearchResponse } from "./webSearchContract";
+export { asSearchCursor, isWebSearchCoreGroupId, WEB_SEARCH_CORE_DEFAULT_LIMIT, WEB_SEARCH_CORE_GROUPS, WEB_SEARCH_DEFAULT_LIMIT, WEB_SEARCH_ERROR_CODES, WEB_SEARCH_MAX_LIMIT, WEB_SEARCH_QUERY_MAX_CHARS, webSearchPath } from "./webSearchContract";
+export type { ChannelSearchHit, PersonSearchHit, SearchCursor, WebSearchApp, WebSearchCoreGroup, WebSearchCoreGroupId, WebSearchErrorCode, WebSearchGroup, WebSearchGroupError, WebSearchItemsByApp, WebSearchItemsByCoreGroup, WebSearchQuery, WebSearchRequiredAction, WebSearchResponse } from "./webSearchContract";
 export { MARKETPLACE_INSTALL_BUCKET_LABELS, MARKETPLACE_INSTALL_BUCKETS, marketplaceInstallBucket } from "./marketplaceInstalls";
 export type { MarketplaceInstallBadge, MarketplaceInstallBucket } from "./marketplaceInstalls";
 export { MARKETPLACE_LISTING_SORTS, MARKETPLACE_LISTING_TYPES, MARKETPLACE_LISTINGS_DEFAULT_LIMIT, MARKETPLACE_LISTINGS_ERROR_CODES, MARKETPLACE_LISTINGS_MAX_LIMIT, MARKETPLACE_LISTINGS_QUERY_MAX_CHARS } from "./marketplaceListingsContract";
@@ -7532,3 +8083,23 @@ export * from "./syncChanges";
 export { PI_RESPONSE_NOTICE_TITLE, PI_RESPONSE_NOTICE_TEXT, piResponseNoticeKind, type PiResponseNoticeKind } from "./piResponseNotice";
 export { MEMBER_REMOVAL_IMPACT_MAX_COMPUTER_NAMES } from "./memberRemovalImpact";
 export type { MemberRemovalImpact } from "./memberRemovalImpact";
+export { descriptionPieces, descriptionUrls, type DescriptionPiece } from "./descriptionLinks";
+export { bareLinkBeforeFullWidthPunctuation, FULL_WIDTH_PUNCTUATION } from "./bareLinkEnd";
+export {
+  DESCRIPTION_AUDIENCE_REMINDER,
+  DESCRIPTION_LINK_UNREADABLE,
+  DESCRIPTION_LINK_WARNING_CODES,
+  descriptionLinkFixes,
+  descriptionLinkFixesOf,
+  descriptionLinkFixText,
+  descriptionLinkFixTexts,
+  descriptionLinkProblem,
+  formatDescriptionLinkWarnings,
+  type DescriptionLinkFix,
+  type DescriptionLinkFixContext,
+  type DescriptionLinkUnreadable,
+  type DescriptionLinkWarning,
+  type DescriptionLinkWarningCode,
+  type DescriptionLinkSubject,
+  type DescriptionLinkWriter,
+} from "./descriptionLinkWarnings";

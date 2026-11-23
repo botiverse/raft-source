@@ -54,8 +54,12 @@ import { artifactR2Store, type ArtifactBlobReader } from "./blobStore";
 import { bundledLibraryWarnings } from "./bundledLibraries";
 import { artifactBlobs, type ArtifactBlobRow } from "./schema";
 
-/** The lintFiles rules a push warns about: pages held to one screen, and pages with nested frames or plugins. */
-const KEPT_RULES: ReadonlySet<string> = new Set(["scroll-lock", "nested-frame"]);
+/**
+ * The lintFiles rules a push warns about: pages held to one screen, pages with nested frames or plugins, and
+ * pages with a `<form>` (Raft's frame has no `allow-forms`, ARTIFACT_FRAME_SANDBOX: a form never submits and some
+ * browsers fire no submit event, so a submit button does nothing; Porthole's message says to use a click handler).
+ */
+const KEPT_RULES: ReadonlySet<string> = new Set(["scroll-lock", "nested-frame", "form"]);
 /** A comment, or a raw-text element whose `<!--` is no comment (a script's, a style's). */
 const COMMENT_OR_RAW = /<!--|<(script|style|textarea|title)\b/giu;
 /** A `<script>` element's start tag. */

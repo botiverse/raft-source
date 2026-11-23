@@ -82,7 +82,11 @@ test("on a migrated (small) database the migration built them, and the revoke ca
             ? `EXPLAIN SELECT id FROM "tasks" WHERE channel_id = '${familyId}' ORDER BY COALESCE(last_activity_at, updated_at) DESC, id DESC LIMIT 51`
             : spec.name === "idx_tasks_channel_created"
               ? `EXPLAIN SELECT id FROM "tasks" WHERE channel_id = '${familyId}' ORDER BY created_at DESC, id DESC LIMIT 51`
-              : `EXPLAIN SELECT 1 FROM "${spec.table}" WHERE "${spec.columns[0]}" = '${familyId}'${partial}`;
+              // resolveThreadByShortId: a live thread by server and name
+              // (idx_channels_server also leads with server_id).
+              : spec.name === "idx_channels_thread_server_name"
+                ? `EXPLAIN SELECT id FROM "channels" WHERE server_id = '${familyId}' AND type = 'thread' AND name = 'thread-0a1b2c3d' AND deleted_at IS NULL`
+                : `EXPLAIN SELECT 1 FROM "${spec.table}" WHERE "${spec.columns[0]}" = '${familyId}'${partial}`;
       const plan = await tx.execute(sql.raw(probe));
       text = plan.rows.map((row) => Object.values(row as Record<string, unknown>)[0]).join("\n");
       tx.rollback();

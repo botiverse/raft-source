@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { and, eq } from "drizzle-orm";
 import { apiTest } from "../test/integration/apiTest";
 import type { createHttpClient } from "../test/integration/http";
+import type { createSeed } from "../test/integration/seed";
 import type { Database } from "../db/index";
 import { channelHumans, servers, threadFollows } from "../db/schema";
 import { createAgent } from "../services/agentService";
 import { addMember } from "../services/serverService";
 import {
   acceptJointChannelInvite,
+  addAgent,
   addHuman,
   createJointChannel,
   getActiveJointThreadProjectionsByCanonicalThread,
@@ -27,6 +29,8 @@ import { createMessage } from "../services/messageService";
  */
 
 type Http = ReturnType<typeof createHttpClient>;
+type Seed = ReturnType<typeof createSeed>;
+type Human = Awaited<ReturnType<Seed["human"]>>;
 type Actor = { id: string };
 type Roster = { threads: Array<{ canManage: boolean; agents: Array<{ id: string; canRemove: boolean }> }> };
 
@@ -86,6 +90,47 @@ async function removeAndRestore(
   assert.equal(await isFollowing(db, followerThreadId, "agent", agentId), true, `${label}: the follower row is back`);
 }
 
+/**
+ * A joint channel (host and one peer server, each owner in it) with a thread
+ * on it: its host projection, and the peer server's own projection.
+ */
+async function seedJointThread(
+  { db, seed, http }: { db: Database; seed: Seed; http: Http },
+  { hostMembers = [], peerMembers = [] }: { hostMembers?: Human[]; peerMembers?: Human[] } = {},
+) {
+  const hostOwner = await seed.human(), peerOwner = await seed.human();
+  const host = await seed.server({ owner: hostOwner, name: "Host", members: hostMembers });
+  const peer = await seed.server({ owner: peerOwner, name: "Peer", members: peerMembers });
+  await db.update(servers).set({ plan: "founder" }).where(eq(servers.id, host.id));
+  const made = await createJointChannel({
+    hostServerId: host.id,
+    createdByUserId: hostOwner.id,
+    name: "joint-followers",
+    jointInvites: [{ targetServerSlug: peer.slug, invitedPeople: [`@${peerOwner.name}`] }],
+  });
+  const peerEntry = await acceptJointChannelInvite({ inviteId: made.invites[0]!.id, targetServerId: peer.id, acceptedByUserId: peerOwner.id });
+  const root = await http.as(hostOwner, host).request("/api/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ channelId: made.channel.id, content: "joint thread root" }),
+  });
+  assert.equal(root.status, 200, await root.clone().text());
+  const { id: rootId } = await root.json() as { id: string };
+  const created = await http.as(hostOwner, host).request(`/api/channels/${made.channel.id}/threads`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ parentMessageId: rootId, content: "first reply" }),
+  });
+  assert.equal(created.status, 200, await created.clone().text());
+  const { threadChannelId: hostThreadId } = await created.json() as { threadChannelId: string };
+  const projection = await getJointThreadProjectionByLocalThread(hostThreadId, host.id);
+  assert.ok(projection);
+  const peerThreadId = (await getActiveJointThreadProjectionsByCanonicalThread(projection.canonicalThreadChannelId))
+    .find((row) => row.localServerId === peer.id)?.localThreadChannelId;
+  assert.ok(peerThreadId, "the peer server has its own projection of the thread");
+  return { hostOwner, peerOwner, host, peer, made, peerEntry, rootId, hostThreadId, peerThreadId };
+}
+
 apiTest("ordinary channel: a channel admin manages Agent followers; a plain member cannot", async ({ db, seed, http }) => {
   const owner = await seed.human();
   const author = await seed.human();
@@ -118,7 +163,7 @@ apiTest("ordinary channel: a channel admin manages Agent followers; a plain memb
   assert.equal((await member.roster()).canManage, false);
   const denied = await member.remove(agent.id);
   assert.equal(denied.status, 403);
-  assert.deepEqual(await denied.json(), { error: "Only the thread author or a channel manager can remove followers" });
+  assert.deepEqual(await denied.json(), { error: "Only the thread author or a channel manager can remove followers", code: "thread_follower_manage_forbidden", errorCode: "thread_follower_manage_forbidden" });
   assert.equal(await isFollowing(db, thread.id, "agent", agent.id), true, "a refused removal leaves the follow");
 
   // Self-unfollow is unchanged: any reader leaves their own follow.
@@ -135,20 +180,11 @@ apiTest("ordinary channel: a channel admin manages Agent followers; a plain memb
 });
 
 apiTest("joint channel: host managers manage any server's Agent followers, another server's admin only its own", async ({ db, seed, http }) => {
-  const hostOwner = await seed.human(), peerOwner = await seed.human();
   const hostAdmin = await seed.human(), hostManager = await seed.human(), hostPlain = await seed.human();
   const peerPlain = await seed.human();
-  const host = await seed.server({ owner: hostOwner, name: "Host", members: [hostManager, hostPlain] });
-  const peer = await seed.server({ owner: peerOwner, name: "Peer", members: [peerPlain] });
+  const { hostOwner, peerOwner, host, peer, made, peerEntry, rootId, hostThreadId, peerThreadId } =
+    await seedJointThread({ db, seed, http }, { hostMembers: [hostManager, hostPlain], peerMembers: [peerPlain] });
   await addMember(host.id, hostAdmin.id, "admin");
-  await db.update(servers).set({ plan: "founder" }).where(eq(servers.id, host.id));
-  const made = await createJointChannel({
-    hostServerId: host.id,
-    createdByUserId: hostOwner.id,
-    name: "joint-followers",
-    jointInvites: [{ targetServerSlug: peer.slug, invitedPeople: [`@${peerOwner.name}`] }],
-  });
-  const peerEntry = await acceptJointChannelInvite({ inviteId: made.invites[0]!.id, targetServerId: peer.id, acceptedByUserId: peerOwner.id });
   await addHuman(made.channel.id, hostAdmin.id);
   await addHuman(made.channel.id, hostPlain.id);
   await addHuman(made.channel.id, hostManager.id);
@@ -158,26 +194,6 @@ apiTest("joint channel: host managers manage any server's Agent followers, anoth
   await addHuman(peerEntry.id, peerPlain.id);
   const hostAgent = await createAgent(host.id, "host-follower", { runtime: "codex" });
   const peerAgent = await createAgent(peer.id, "peer-follower", { runtime: "codex" });
-
-  const root = await http.as(hostOwner, host).request("/api/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ channelId: made.channel.id, content: "joint thread root" }),
-  });
-  assert.equal(root.status, 200, await root.clone().text());
-  const { id: rootId } = await root.json() as { id: string };
-  const created = await http.as(hostOwner, host).request(`/api/channels/${made.channel.id}/threads`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ parentMessageId: rootId, content: "first reply" }),
-  });
-  assert.equal(created.status, 200, await created.clone().text());
-  const { threadChannelId: hostThreadId } = await created.json() as { threadChannelId: string };
-  const projection = await getJointThreadProjectionByLocalThread(hostThreadId, host.id);
-  assert.ok(projection);
-  const peerThreadId = (await getActiveJointThreadProjectionsByCanonicalThread(projection.canonicalThreadChannelId))
-    .find((row) => row.localServerId === peer.id)?.localThreadChannelId;
-  assert.ok(peerThreadId, "the peer server has its own projection of the thread");
   // Each Agent follows through its own server's projection.
   await recordThreadFollow("agent", hostAgent.id, hostThreadId, rootId, "manual");
   await recordThreadFollow("agent", peerAgent.id, peerThreadId, rootId, "manual");
@@ -203,7 +219,7 @@ apiTest("joint channel: host managers manage any server's Agent followers, anoth
   await removeAndRestore(db, peerAdminApi, peerAgent.id, peerThreadId, "peer owner (own Agent)");
   const crossServer = await peerAdminApi.remove(hostAgent.id);
   assert.equal(crossServer.status, 403);
-  assert.deepEqual(await crossServer.json(), { error: "Only a channel manager of the host server can remove another server's Agent followers" });
+  assert.deepEqual(await crossServer.json(), { error: "Only a channel manager of the host server can remove another server's Agent followers", code: "thread_follower_other_server_forbidden", errorCode: "thread_follower_other_server_forbidden" });
   assert.equal(await isFollowing(db, hostThreadId, "agent", hostAgent.id), true, "the host Agent still follows");
   // Restore follows the removal rule: the peer cannot undo the host's removal.
   const hostApi = followerApi(http, hostOwner, host, hostThreadId);
@@ -211,7 +227,7 @@ apiTest("joint channel: host managers manage any server's Agent followers, anoth
   const { undoToken } = await hostRemoval.json() as { undoToken: string };
   const crossRestore = await peerAdminApi.restore(hostAgent.id, undoToken);
   assert.equal(crossRestore.status, 403);
-  assert.deepEqual(await crossRestore.json(), { error: "Only a channel manager of the host server can restore another server's Agent followers" });
+  assert.deepEqual(await crossRestore.json(), { error: "Only a channel manager of the host server can restore another server's Agent followers", code: "thread_follower_other_server_forbidden", errorCode: "thread_follower_other_server_forbidden" });
   assert.equal(await isFollowing(db, hostThreadId, "agent", hostAgent.id), false);
   assert.equal((await hostApi.restore(hostAgent.id, undoToken)).status, 200);
 
@@ -225,8 +241,52 @@ apiTest("joint channel: host managers manage any server's Agent followers, anoth
     for (const agentId of [hostAgent.id, peerAgent.id]) {
       const denied = await api.remove(agentId);
       assert.equal(denied.status, 403, label);
-      assert.deepEqual(await denied.json(), { error: "Only the thread author or a channel manager can remove followers" });
+      assert.deepEqual(await denied.json(), { error: "Only the thread author or a channel manager can remove followers", code: "thread_follower_manage_forbidden", errorCode: "thread_follower_manage_forbidden" });
     }
   }
   assert.equal(await isFollowing(db, peerThreadId, "agent", peerAgent.id), true);
+});
+
+apiTest("joint channel: a non-host manager can't tell another server's Agent that doesn't follow the thread from no Agent", async ({ db, seed, http }) => {
+  const { hostOwner, peerOwner, host, peer, made, rootId, hostThreadId, peerThreadId } = await seedJointThread({ db, seed, http });
+  const follower = await createAgent(host.id, "host-follower", { runtime: "codex" });
+  // In the joint channel, but not following the thread.
+  const bystander = await createAgent(host.id, "host-bystander", { runtime: "codex" });
+  await addAgent(made.channel.id, follower.id);
+  await addAgent(made.channel.id, bystander.id);
+  await recordThreadFollow("agent", follower.id, hostThreadId, rootId, "manual");
+  const madeUpId = "00000000-0000-4000-8000-000000000000";
+
+  // Regression guard: before, the bystander answered the other-server 403 and
+  // the made-up id the 404, so a peer manager could probe for the host's Agents.
+  const peerManager = followerApi(http, peerOwner, peer, peerThreadId);
+  const notFound = { error: "Agent follower not found", code: "agent_follower_not_found", errorCode: "agent_follower_not_found" };
+  for (const [label, send] of [
+    ["remove", (agentId: string) => peerManager.remove(agentId)],
+    ["restore", (agentId: string) => peerManager.restore(agentId, new Date().toISOString())],
+  ] as const) {
+    const [bystanderAnswer, madeUpAnswer] = await Promise.all([send(bystander.id), send(madeUpId)]);
+    const [bystanderBody, madeUpBody] = await Promise.all([bystanderAnswer.text(), madeUpAnswer.text()]);
+    assert.equal(bystanderAnswer.status, 404, `${label}: ${bystanderBody}`);
+    assert.equal(madeUpAnswer.status, 404, `${label}: ${madeUpBody}`);
+    assert.equal(bystanderBody, madeUpBody, `${label}: the bystander reads the same as no Agent`);
+    assert.deepEqual(JSON.parse(bystanderBody), notFound, label);
+  }
+
+  // An actual follower from another server is still refused as such.
+  const crossServer = await peerManager.remove(follower.id);
+  assert.equal(crossServer.status, 403);
+  assert.deepEqual(await crossServer.json(), { error: "Only a channel manager of the host server can remove another server's Agent followers", code: "thread_follower_other_server_forbidden", errorCode: "thread_follower_other_server_forbidden" });
+  assert.equal(await isFollowing(db, hostThreadId, "agent", follower.id), true);
+  // The host's manager still removes it, and the peer can't undo that removal.
+  const hostManager = followerApi(http, hostOwner, host, hostThreadId);
+  const removed = await hostManager.remove(follower.id);
+  assert.equal(removed.status, 200, await removed.clone().text());
+  const { undoToken } = await removed.json() as { undoToken: string };
+  assert.equal(await isFollowing(db, hostThreadId, "agent", follower.id), false);
+  const crossRestore = await peerManager.restore(follower.id, undoToken);
+  assert.equal(crossRestore.status, 403);
+  assert.equal((await crossRestore.json() as { code: string }).code, "thread_follower_other_server_forbidden");
+  assert.equal((await hostManager.restore(follower.id, undoToken)).status, 200);
+  assert.equal(await isFollowing(db, hostThreadId, "agent", follower.id), true);
 });

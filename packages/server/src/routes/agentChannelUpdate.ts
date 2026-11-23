@@ -8,8 +8,7 @@ import type { AgentOrchestrator } from "../services/agentOrchestrator";
 import { actorHasServerCapabilityInServer } from "../lib/actorPermissions";
 import { actorHasChannelCapability, withLockedChannelActorCapability } from "../lib/channelActorPermissions";
 import { addTraceEvent, errorClassOf } from "../tracing/semanticTrace";
-import { agentRefusalBody, agentServerRoleRequiredBody, asSentence } from "../lib/agentServerRoleRequired";
-import { refusalBody } from "../lib/refusal";
+import { AGENT_CHANNEL_ID_NOT_FOUND_REFUSAL, AGENT_NO_LONGER_EXISTS_REFUSAL, agentRefusalBody, agentServerRoleRequiredBody, asSentence, type AgentRouteResult } from "../lib/agentServerRoleRequired";
 import { attachChannelAnnouncement, channelAnnouncementChange } from "../services/channelAnnouncements";
 import { postChannelAnnouncementChange } from "../services/channelAnnouncementMessages";
 
@@ -19,10 +18,7 @@ export interface AgentChannelUpdateActor {
   serverId: string;
 }
 
-export interface AgentChannelUpdateResult {
-  status: number;
-  body: Record<string, unknown>;
-}
+export type AgentChannelUpdateResult = AgentRouteResult;
 
 function parseVisibility(raw: unknown): channelService.RegularChannelType | undefined | null {
   if (raw === undefined) return undefined;
@@ -49,7 +45,7 @@ export async function updateChannelForAgent(input: {
       reason: "agent_server_mismatch",
       status_code: 401,
     });
-    return { status: 401, body: { error: "Agent no longer exists" } };
+    return { ok: false, status: 401, refusal: AGENT_NO_LONGER_EXISTS_REFUSAL };
   }
 
   const channel = await channelService.getChannel(channelId);
@@ -58,7 +54,7 @@ export async function updateChannelForAgent(input: {
       reason: "channel_not_found",
       status_code: 404,
     });
-    return { status: 404, body: { error: "Channel not found" } };
+    return { ok: false, status: 404, refusal: AGENT_CHANNEL_ID_NOT_FOUND_REFUSAL };
   }
   const payload = typeof body === "object" && body !== null ? body as Record<string, unknown> : {};
   const viewer = { type: "agent" as const, id: actor.id, serverId: asServerId(serverId) };
@@ -70,7 +66,7 @@ export async function updateChannelForAgent(input: {
       const change = await channelAnnouncementChange({ actor: viewer, channel, raw: payload.announcement, canEditChannelMetadata: false });
       if (!change.ok) {
         addTraceEvent("agent_channel_update.request.failed", { reason: change.refusal.code, status_code: change.status });
-        return { status: change.status, body: { ...refusalBody(change.refusal) } };
+        return { ok: false, status: change.status, refusal: change.refusal };
       }
     }
     addTraceEvent("agent_channel_update.validation.failed", { reason: "unsupported_channel_type" });
@@ -78,21 +74,21 @@ export async function updateChannelForAgent(input: {
       reason: "unsupported_channel_type",
       status_code: 400,
     });
-    return { status: 400, body: { error: "Only public, private, or joint channels are supported" } };
+    return { ok: false, status: 400, refusal: { code: "unsupported_channel_type", error: "Only public, private, or joint channels are supported" } };
   }
   if (!await channelService.canAgentAccessChannel(channel.id, actor.id)) {
     addTraceEvent("agent_channel_update.request.failed", {
       reason: "channel_not_visible",
       status_code: 404,
     });
-    return { status: 404, body: { error: "Channel not found" } };
+    return { ok: false, status: 404, refusal: AGENT_CHANNEL_ID_NOT_FOUND_REFUSAL };
   }
   if (channel.archivedAt) {
     addTraceEvent("agent_channel_update.request.failed", {
       reason: "channel_archived",
       status_code: 409,
     });
-    return { status: 409, body: { error: "This channel is archived", code: "channel_archived" } };
+    return { ok: false, status: 409, refusal: { code: "channel_archived", error: "This channel is archived" } };
   }
 
   const [canEditChannelMetadata, canChangeChannelVisibility] = await Promise.all([
@@ -107,7 +103,7 @@ export async function updateChannelForAgent(input: {
     const change = await channelAnnouncementChange({ actor: viewer, channel, raw: payload.announcement, canEditChannelMetadata });
     if (!change.ok) {
       addTraceEvent("agent_channel_update.request.failed", { reason: change.refusal.code, status_code: change.status });
-      return { status: change.status, body: { ...refusalBody(change.refusal) } };
+      return { ok: false, status: change.status, refusal: change.refusal };
     }
     announcementArtifactId = change.artifactId;
   }
@@ -122,13 +118,14 @@ export async function updateChannelForAgent(input: {
       status_code: 403,
     });
     return {
+      ok: false,
       status: 403,
-      body: await agentServerRoleRequiredBody({
+      refusal: await agentServerRoleRequiredBody({
         serverId,
         agentId: actor.id,
         capabilities: ["editChannelMetadata", "changeChannelVisibility"],
         action: "update channels",
-        channelAdminIn: channel.name,
+        ...(channel.type === "joint" ? { jointChannel: channel.name } : { channelAdminIn: channel.name }),
       }),
     };
   }
@@ -138,17 +135,19 @@ export async function updateChannelForAgent(input: {
 
   if ((payload.name !== undefined || payload.description !== undefined) && !canEditChannelMetadata) {
     return {
+      ok: false,
       status: 403,
-      body: {
-        ...await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["editChannelMetadata"], action: "rename this channel or edit its description", channelAdminIn: channel.name }),
+      refusal: {
+        ...await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["editChannelMetadata"], action: "rename this channel or edit its description", ...(channel.type === "joint" ? { jointChannel: channel.name } : { channelAdminIn: channel.name }) }),
         error: "Agent lacks permission to edit channel metadata",
       },
     };
   }
   if (payload.visibility !== undefined && !canChangeChannelVisibility) {
     return {
+      ok: false,
       status: 403,
-      body: {
+      refusal: {
         ...await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["changeChannelVisibility"], action: "change channel visibility" }),
         error: "Agent lacks permission to change channel visibility",
       },
@@ -166,8 +165,9 @@ export async function updateChannelForAgent(input: {
       status_code: 403,
     });
     return {
+      ok: false,
       status: 403,
-      body: agentRefusalBody(
+      refusal: agentRefusalBody(
         channelService.ALL_CHANNEL_VISIBILITY_REFUSAL,
         "all_channel_visibility_managed_separately",
         "Only a human can hide or restore #all, from channel settings or server settings. Ask a server owner or admin; do not retry this call.",
@@ -184,8 +184,9 @@ export async function updateChannelForAgent(input: {
       status_code: 403,
     });
     return {
+      ok: false,
       status: 403,
-      body: agentRefusalBody(
+      refusal: agentRefusalBody(
         "Agent must be a member of this channel to change its visibility",
         "channel_membership_required",
         "Join this channel first (for a private channel, ask a member to add you), then retry.",
@@ -200,7 +201,7 @@ export async function updateChannelForAgent(input: {
         reason: "invalid_name_type",
         status_code: 400,
       });
-      return { status: 400, body: { error: "Channel name must be a string" } };
+      return { ok: false, status: 400, refusal: { code: "channel_name_invalid", error: "Channel name must be a string" } };
     }
     const rawName = payload.name.trim().replace(/^#/, "");
     const nameError = validateName(rawName, "Channel name");
@@ -210,7 +211,7 @@ export async function updateChannelForAgent(input: {
         reason: "invalid_name",
         status_code: 400,
       });
-      return { status: 400, body: { error: nameError } };
+      return { ok: false, status: 400, refusal: { code: "channel_name_invalid", error: nameError } };
     }
     updates.name = rawName;
   }
@@ -222,7 +223,7 @@ export async function updateChannelForAgent(input: {
         reason: "invalid_description",
         status_code: 400,
       });
-      return { status: 400, body: { error: "Description must be a string of at most 500 characters" } };
+      return { ok: false, status: 400, refusal: { code: "channel_description_invalid", error: "Description must be a string of at most 500 characters" } };
     }
     updates.description = payload.description;
   }
@@ -234,7 +235,7 @@ export async function updateChannelForAgent(input: {
       reason: "invalid_visibility",
       status_code: 400,
     });
-    return { status: 400, body: { error: "visibility must be one of: public, private" } };
+    return { ok: false, status: 400, refusal: { code: "channel_visibility_invalid", error: "visibility must be one of: public, private" } };
   }
   if (visibility !== undefined) updates.type = visibility;
 
@@ -244,7 +245,7 @@ export async function updateChannelForAgent(input: {
       reason: "empty_update",
       status_code: 400,
     });
-    return { status: 400, body: { error: "At least one field is required" } };
+    return { ok: false, status: 400, refusal: { code: "channel_update_empty", error: "At least one field is required" } };
   }
 
   try {
@@ -272,7 +273,8 @@ export async function updateChannelForAgent(input: {
       await publishChannelUpdate(io, updated);
     }
     if (renamed && io && agentOrchestrator) {
-      await messageService.broadcastSystemMessage(
+      // Joint-aware: a joint's notice goes to canonical storage, fanned out to every server (slock issue 15637).
+      await messageService.broadcastSystemMessageToLocalSurfaces(
         io,
         agentOrchestrator,
         channel.id,
@@ -307,7 +309,7 @@ export async function updateChannelForAgent(input: {
       announcement_changed: updates.announcementArtifactId !== undefined,
       channel_visibility: updated.type === "private" ? "private" : "public",
     });
-    return { status: 200, body: await attachChannelAnnouncement(viewer, updated) };
+    return { ok: true, status: 200, body: await attachChannelAnnouncement(viewer, updated) };
   } catch (err) {
     const msg = err instanceof Error ? err.message : "";
     // A channel with external members or open external invites stays private
@@ -318,8 +320,9 @@ export async function updateChannelForAgent(input: {
         status_code: 409,
       });
       return {
+        ok: false,
         status: 409,
-        body: agentRefusalBody(err.message, err.code, `${err.message} Remove its external members and revoke its external invites first; do not retry until then.`),
+        refusal: agentRefusalBody(err.message, err.code, `${err.message} Remove its external members and revoke its external invites first; do not retry until then.`),
       };
     }
     if (err instanceof channelService.ArchivedNameCollisionError) {
@@ -327,7 +330,9 @@ export async function updateChannelForAgent(input: {
         reason: "archived_name_collision",
         status_code: 409,
       });
+      // refusal-ok: the archived-name body, the hidden case byte-identical to the live "already taken" below (archivedNameCollision.ts, #proj-chat:#19)
       return {
+        ok: false,
         status: 409,
         body: await archivedNameCollisionBody(err, { type: "agent", id: actor.id, serverId: serverId as ServerId }),
       };
@@ -337,7 +342,8 @@ export async function updateChannelForAgent(input: {
         reason: "name_taken",
         status_code: 409,
       });
-      return { status: 409, body: { error: msg } };
+      // refusal-ok: must stay byte-identical to the hidden archived-name body (archivedNameCollision.ts), no existence oracle (#proj-chat:#19)
+      return { ok: false, status: 409, body: { error: msg } };
     }
     if (msg === "Channel capability required") {
       addTraceEvent("agent_channel_update.request.failed", {
@@ -345,9 +351,10 @@ export async function updateChannelForAgent(input: {
         status_code: 403,
       });
       return {
+        ok: false,
         status: 403,
-        body: {
-          ...await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["editChannelMetadata"], action: "rename this channel or edit its description", channelAdminIn: channel.name }),
+        refusal: {
+          ...await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["editChannelMetadata"], action: "rename this channel or edit its description", ...(channel.type === "joint" ? { jointChannel: channel.name } : { channelAdminIn: channel.name }) }),
           error: "Agent lacks permission to edit channel metadata",
         },
       };
@@ -358,8 +365,9 @@ export async function updateChannelForAgent(input: {
         status_code: 403,
       });
       return {
+        ok: false,
         status: 403,
-        body: agentRefusalBody(msg, "channel_update_forbidden", `${asSentence(msg)} This channel cannot be changed this way by anyone; do not retry.`),
+        refusal: agentRefusalBody(msg, "channel_update_forbidden", `${asSentence(msg)} This channel cannot be changed this way by anyone; do not retry.`),
       };
     }
     addTraceEvent("agent_channel_update.request.failed", {
@@ -367,6 +375,6 @@ export async function updateChannelForAgent(input: {
       status_code: 500,
       error_class: errorClassOf(err),
     });
-    return { status: 500, body: { error: "Failed to update channel" } };
+    return { ok: false, status: 500, body: { error: "Failed to update channel" } };
   }
 }

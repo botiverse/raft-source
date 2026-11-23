@@ -1,5 +1,6 @@
 import type { KeyboardPlatform } from "@botiverse/raft-ui/wip";
 import { isTextEditableElement, keyboardPlatform } from "../../utils/keyboardShortcuts";
+import { isElementNode } from "../../utils/ownerDocument";
 import type { KeyboardShortcutEvent, ShortcutCombo } from "../../utils/keyboardShortcuts";
 import { isImeComposing, matchCombo, matchComboEitherMod, matchComboPhysical } from "./match";
 import { getShortcutCommand } from "./registry";
@@ -22,6 +23,11 @@ export interface RegistrationOptions {
    * element of its own to focus (Settings), a text selection, which never holds the focus.
    */
   ambient?: boolean;
+  /**
+   * The document this registration belongs to (the one its surface is drawn in: an object window's, useOwnerDocument):
+   * outside `global`, only keys typed in it are offered to it. Default: the main document.
+   */
+  doc?: Document;
 }
 
 interface Registration {
@@ -30,6 +36,7 @@ interface Registration {
   enabled: () => boolean;
   node?: () => Element | null;
   ambient: boolean;
+  doc?: Document;
 }
 
 export interface LayerOptions {
@@ -49,6 +56,11 @@ export interface LayerOptions {
   ignoreDefaultPrevented?: boolean;
   /** Also stops the Esc it takes from reaching listeners outside the registry (stopPropagation). */
   stopPropagation?: boolean;
+  /**
+   * The document the layer is open in (an object window's, useOwnerDocument): only keys typed in it reach the layer,
+   * and a modal layer hides only that document's scopes. Default: the main document.
+   */
+  doc?: Document;
 }
 
 interface Layer extends LayerOptions {
@@ -64,17 +76,27 @@ const layers: Layer[] = [];
 const takenByLayer = new WeakSet<Event>();
 let installed = false;
 let recording = false;
-/** The element last pressed or focused: where a key on <body> (the focus fell there) is offered. */
-let lastInteraction: Element | null = null;
+/**
+ * The element last pressed or focused in each document (the main one, an attached object window's): where a key on
+ * that document's <body> (the focus fell there) is offered.
+ */
+const lastInteraction = new WeakMap<Document, Element>();
 /** The last first press (not a repeat) a command matched, and who took it (null: a handler said "not mine"). */
 let lastPress: { key: string; taken: Registration | null } | null = null;
 
+function trackInteraction(event: Event): void {
+  if (isElementNode(event.target)) lastInteraction.set(event.target.ownerDocument, event.target);
+}
+
 if (typeof window !== "undefined") {
-  const track = (event: Event) => {
-    if (event.target instanceof Element) lastInteraction = event.target;
-  };
-  window.addEventListener("pointerdown", track, { capture: true, passive: true });
-  window.addEventListener("focusin", track, true);
+  window.addEventListener("pointerdown", trackInteraction, { capture: true, passive: true });
+  window.addEventListener("focusin", trackInteraction, true);
+}
+
+/** Where a key came from, for a document attached with attachShortcutDocument. */
+export interface ShortcutSource {
+  /** A global-scope command (search, the sidebar, help, the assistant) took a key from this document. */
+  onGlobalCommand?: (command: ShortcutCommand) => void;
 }
 
 /** While the panel records a new shortcut every key is the recorder's: nothing dispatches. */
@@ -88,32 +110,69 @@ interface ChainEntry {
   element: Element | null;
 }
 
+/** The target's own document (a node's, a document itself); null for anything else (a window). */
+function targetDocument(target: EventTarget | null): Document | null {
+  const node = target as { nodeType?: unknown; ownerDocument?: Document | null } | null;
+  if (!node || typeof node.nodeType !== "number") return null;
+  return node.nodeType === 9 ? (target as Document) : node.ownerDocument ?? null;
+}
+
+/** The document a key was typed in: its target's, or a window target's own document; else the main document. */
+function eventDocument(event: Event): Document | null {
+  const doc = targetDocument(event.target);
+  if (doc) return doc;
+  const viewDocument = (event.target as { document?: unknown } | null)?.document;
+  return targetDocument(viewDocument as EventTarget | null) ?? globalThis.document ?? null;
+}
+
+/** Whether a registration or layer of `owner` (none: the main document) hears keys typed in `doc`. */
+function ownedBy(owner: Document | undefined, doc: Document | null): boolean {
+  if (!owner) return !doc || doc === globalThis.document;
+  return owner === doc;
+}
+
+/** A key on <body>, <html> or the document itself: the focus fell there (in whichever document the key is in). */
 function isBodyTarget(target: EventTarget | null): boolean {
-  return typeof document !== "undefined" && (target === document.body || target === document.documentElement || target === document);
+  const doc = targetDocument(target);
+  return !!doc && (target === doc.body || target === doc.documentElement || target === doc);
 }
 
 /** The scopes this key is offered to, most specific first: open layers (to the first modal one), the focus path, ambient registrations, then global. */
-function activeChain(target: EventTarget | null): ChainEntry[] {
+function activeChain(target: EventTarget | null, doc: Document | null): ChainEntry[] {
   const chain: ChainEntry[] = [];
   for (let index = layers.length - 1; index >= 0; index--) {
     const layer = layers[index]!;
+    // Another window's layer (the main window's dialog, an object window's menu) neither takes nor hides this key.
+    if (!ownedBy(layer.doc, doc)) continue;
     chain.push({ scope: layer.scope, element: null });
     if (layer.modal) return chain;
   }
-  let node = target instanceof Element && !isBodyTarget(target) ? target : null;
-  // The focus fell to the body: the element last clicked or focused stands in for it (ChatPanel's and the thread's
-  // ⌘F before the registry).
-  if (!node && isBodyTarget(target) && lastInteraction?.isConnected) node = lastInteraction;
+  let node = isElementNode(target) && !isBodyTarget(target) ? target : null;
+  // The focus fell to the body: the element last clicked or focused in that document stands in for it (ChatPanel's
+  // and the thread's ⌘F before the registry).
+  if (!node && isBodyTarget(target)) {
+    const doc = targetDocument(target);
+    const last = doc ? lastInteraction.get(doc) : undefined;
+    if (last?.isConnected) node = last;
+  }
   for (; node; node = node.parentElement) {
     const scope = node.getAttribute(SHORTCUT_SCOPE_ATTRIBUTE) as ShortcutScope | null;
     if (scope && !chain.some((entry) => entry.scope === scope)) chain.push({ scope, element: node });
   }
   chain.push({ scope: "ambient", element: null });
-  chain.push({ scope: "global", element: null });
+  // Global commands act on the main window, so a modal open there hides them wherever the key was typed: an object
+  // window's ⌘K doesn't open search behind the main window's dialog (it wouldn't from the main window either).
+  const fromOtherWindow = !!doc && doc !== globalThis.document;
+  if (!(fromOtherWindow && layers.some((layer) => layer.modal && ownedBy(layer.doc, globalThis.document)))) {
+    chain.push({ scope: "global", element: null });
+  }
   return chain;
 }
 
-function offeredTo(entry: ChainEntry, registration: Registration): boolean {
+function offeredTo(entry: ChainEntry, registration: Registration, doc: Document | null): boolean {
+  // Outside global, a registration hears only keys typed in its own document (the main window's Settings ⌘F is not
+  // an object window's, nor the other way round).
+  if (entry.scope !== "global" && !ownedBy(registration.doc, doc)) return false;
   if (entry.scope === "ambient") return registration.ambient;
   if (registration.command.scope !== entry.scope) return false;
   if (!entry.element || !registration.node) return true;
@@ -160,8 +219,10 @@ function allowedInField(command: ShortcutCommand, combo: ShortcutCombo): boolean
 function dispatchToLayers(event: KeyboardEvent, phase: "capture" | "bubble"): boolean {
   if (takenByLayer.has(event)) return true;
   const escape = event.key === "Escape";
+  const doc = eventDocument(event);
   for (let index = layers.length - 1; index >= 0; index--) {
     const layer = layers[index]!;
+    if (!ownedBy(layer.doc, doc)) continue;
     if ((layer.phase ?? "bubble") === phase) {
       if (!escape) {
         if (layer.onKey?.()(event) === true) {
@@ -196,12 +257,12 @@ function dispatchShortcutCapture(event: KeyboardEvent): void {
  * key itself (a menu, a field's own Escape) marks it defaultPrevented first. The IME guard runs before anything
  * else.
  */
-export function dispatchShortcutEvent(event: KeyboardEvent): void {
+export function dispatchShortcutEvent(event: KeyboardEvent, source?: ShortcutSource): void {
   if (recording || isImeComposing(event)) return;
   if (dispatchToLayers(event, "bubble") || registrations.size === 0) return;
   const platform = keyboardPlatform();
   const overrides = currentShortcutOverrides();
-  const target = event.target instanceof Element ? event.target : null;
+  const target = isElementNode(event.target) ? event.target : null;
   const inField = !!target && isTextEditableElement(target);
   const pressKey = event.code || event.key;
   const heldFromBefore = event.repeat && lastPress?.key !== pressKey;
@@ -209,10 +270,11 @@ export function dispatchShortcutEvent(event: KeyboardEvent): void {
   let matched = false;
   // Latest registration first, so the surface mounted last wins within one scope.
   const mounted = Array.from(registrations).reverse();
-  outer: for (const entry of activeChain(event.target)) {
+  const doc = eventDocument(event);
+  outer: for (const entry of activeChain(event.target, doc)) {
     for (const registration of mounted) {
       const { command } = registration;
-      if (!offeredTo(entry, registration) || !registration.enabled()) continue;
+      if (!offeredTo(entry, registration, doc) || !registration.enabled()) continue;
       const combo = matchedCombo(command, event, platform, overrides);
       if (!combo || (inField && !allowedInField(command, combo))) continue;
       matched = true;
@@ -229,6 +291,9 @@ export function dispatchShortcutEvent(event: KeyboardEvent): void {
       if (registration.handler()(event) === false) continue;
       event.preventDefault();
       taken = registration;
+      // A global command typed in an attached document (an object window) acts on the main window: the source
+      // brings that forward.
+      if (entry.scope === "global") source?.onGlobalCommand?.(command);
       break outer;
     }
   }
@@ -249,6 +314,35 @@ function install() {
   window.addEventListener("keydown", dispatchShortcutCapture, true);
   // keydown-global-exempt: the registry's bubble pass for a key sent to the window itself, which the document never sees
   window.addEventListener("keydown", dispatchWindowTargeted);
+}
+
+/**
+ * Offer the keys typed in another document (an object window's, features/objectWindows) to the registry, as the main
+ * document's are: the same three keydown passes on it and its window, and its own last press / focus for a key on its
+ * <body>. A global command taken there calls `source.onGlobalCommand` after it runs. Returns the detach.
+ */
+export function attachShortcutDocument(doc: Document, source: ShortcutSource = {}): () => void {
+  const view = doc.defaultView;
+  const onKeyDown = (event: KeyboardEvent) => dispatchShortcutEvent(event, source);
+  const onWindowKeyDown = (event: KeyboardEvent) => {
+    if (event.target === view) dispatchShortcutEvent(event, source);
+  };
+  // keydown-global-exempt: the shortcut registry's single dispatcher, for an object window's document; each command's handler moves focus itself
+  doc.addEventListener("keydown", onKeyDown);
+  // keydown-global-exempt: the registry's capture pass in an object window, for layers whose Esc must come before the page's own handlers
+  view?.addEventListener("keydown", dispatchShortcutCapture, true);
+  // keydown-global-exempt: the registry's bubble pass for a key sent to the object window itself, which its document never sees
+  view?.addEventListener("keydown", onWindowKeyDown);
+  view?.addEventListener("pointerdown", trackInteraction, { capture: true, passive: true });
+  view?.addEventListener("focusin", trackInteraction, true);
+  return () => {
+    doc.removeEventListener("keydown", onKeyDown);
+    view?.removeEventListener("keydown", dispatchShortcutCapture, true);
+    view?.removeEventListener("keydown", onWindowKeyDown);
+    view?.removeEventListener("pointerdown", trackInteraction, { capture: true });
+    view?.removeEventListener("focusin", trackInteraction, true);
+    lastInteraction.delete(doc);
+  };
 }
 
 function uninstallIfIdle() {
@@ -273,6 +367,7 @@ export function registerShortcutHandler(
     enabled: options.enabled ?? (() => true),
     node: options.node,
     ambient: !!options.ambient,
+    doc: options.doc,
   };
   registrations.add(registration);
   install();
@@ -287,8 +382,8 @@ export function registerShortcutHandler(
  * Whether a modal layer is open (a raft-ui Dialog or Drawer, useOverlayLayer): for an Esc handler outside the registry
  * (a surface's own onKeyDown) that would otherwise act on the key a modal over it closes on.
  */
-export function isModalLayerOpen(): boolean {
-  return layers.some((layer) => layer.modal);
+export function isModalLayerOpen(doc?: Document): boolean {
+  return layers.some((layer) => layer.modal && (!doc || ownedBy(layer.doc, doc)));
 }
 
 /**

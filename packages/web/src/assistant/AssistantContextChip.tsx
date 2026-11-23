@@ -142,7 +142,9 @@ export function AssistantContextChip({ context, onRemove }: { context: Assistant
                 type="button"
                 aria-label={remove}
                 onClick={onRemove}
-                className="shrink-0 rounded-chip text-foreground-muted outline-none hover:text-foreground focus-visible:shadow-focus"
+                // self-center: the chip lines up its items on the text baseline, where a button with no text sits
+                // on its bottom edge, 2px high; centred like the chip's icon (alignment.md, Artea #proj-assistant:0bd2ebe9).
+                className="inline-flex shrink-0 items-center self-center rounded-chip text-foreground-muted outline-none hover:text-foreground focus-visible:shadow-focus"
                 data-testid="assistant-context-chip-remove"
               >
                 <X size={12} aria-hidden="true" />

@@ -148,7 +148,7 @@ test("notice: several changes in one sentence, apps first", () => {
     { taskConversations: true, vaultApp: true, enabledApps: [] },
     { reminderApp: true, enabledApps: ["artifacts"] },
   )).toMatchInlineSnapshot(`
-    "Raft notice: this server's features changed: Artifacts turned on (\`raft artifact\`); Task conversations turned off for new tasks (a task that already has a conversation keeps it); reminders moved to the Reminder app (\`raft reminder schedule\`, \`update\` and \`snooze\` are refused here now); your instructions no longer cover the Vault app. Your standing instructions now describe what is available here; where your notes (MEMORY.md and the rest) say otherwise, follow the instructions and update the notes. No reply is needed.
+    "Raft notice: this server's features changed: Artifacts turned on (\`raft artifact\`); Task conversations turned off for new tasks (a task that already has a conversation keeps it); reminders moved to the Reminder app (\`raft reminder\` commands now work with it); your instructions no longer cover the Vault app. Your standing instructions now describe what is available here; where your notes (MEMORY.md and the rest) say otherwise, follow the instructions and update the notes. No reply is needed.
 
     "
   `);
@@ -177,6 +177,17 @@ test("notice: instruction-only changes are named as such; sub-agents only where 
   ]);
 });
 
+// `dm_reply_placement_prompt` (#triage:#540): instructions only, for every runtime.
+test("notice: the DM reply placement rule is named as an instruction-only change, both ways", () => {
+  expect(describeAgentServerFeatureChanges({ taskConversations: true }, { taskConversations: true, dmReplyPlacement: true })).toEqual([
+    "your instructions now cover where to confirm and report work asked for in a DM with one person",
+  ]);
+  expect(describeAgentServerFeatureChanges({ taskConversations: true, dmReplyPlacement: true }, { taskConversations: true }, { runtime: { supportsSubagents: true } })).toEqual([
+    "your instructions no longer cover where to confirm and report work asked for in a DM with one person",
+  ]);
+  assert.equal(formatServerFeaturesNotice({ dmReplyPlacement: true, enabledApps: [] }, { dmReplyPlacement: true, enabledApps: [] }), null);
+});
+
 test("notice: nothing an agent would notice gives none", () => {
   assert.equal(formatServerFeaturesNotice({ subagentDelegation: true, passiveAx: true, piSessionRotation: true }, {}), null);
   assert.equal(formatServerFeaturesNotice({ subagentDelegation: true }, {}, { supportsSubagents: false }), null, "a runtime without sub-agents never had that section");
@@ -200,7 +211,7 @@ test("restart: a key restarts only a runtime it changes something for", () => {
   const plain = { supportsSubagents: false, rotatesSessions: false };
   const claude = { supportsSubagents: true, rotatesSessions: false };
   const pi = { supportsSubagents: false, rotatesSessions: true };
-  for (const key of ["enabledApps", "taskConversations", "reminderApp", "vaultApp", "passiveAx"] as const) {
+  for (const key of ["enabledApps", "taskConversations", "dmReplyPlacement", "reminderApp", "vaultApp", "passiveAx"] as const) {
     assert.equal(serverFeatureChangeNeedsRestart([key], plain), true, key);
   }
   assert.equal(serverFeatureChangeNeedsRestart(["subagentDelegation"], plain), false);
@@ -215,6 +226,16 @@ test("restart: a key restarts only a runtime it changes something for", () => {
     assert.equal(serverFeatureChangeNeedsRestart([key], pi), false, key);
   }
   assert.equal(serverFeatureChangeNeedsRestart([], claude), false);
+  // The answer tool is fixed for a launch when it registers its managed MCP endpoint: a change waits for the next start.
+  assert.equal(serverFeatureChangeNeedsRestart(["continuationTool"], claude), false);
+  assert.equal(describeAgentServerFeatureChanges({}, { continuationTool: true }, { runtime: claude }).length, 0);
+  // Focus is read when a delivery is shown: turning it on or off restarts no agent.
+  assert.equal(serverFeatureChangeNeedsRestart(["agentFocus"], claude), false);
+  assert.equal(serverFeatureChangeNeedsRestart(["agentFocus"], pi), false);
+  // The wake-up notice's rows ask is decided by the daemon at each notice: a flip never restarts a session.
+  for (const runtime of [plain, claude, pi]) assert.equal(serverFeatureChangeNeedsRestart(["inboxNoticeServerRows"], runtime), false);
+  assert.equal(describeAgentServerFeatureChanges({}, { inboxNoticeServerRows: true }, { runtime: claude }).length, 0);
+  assert.deepEqual(readAgentServerFeatures({ inboxNoticeServerRows: true, inboxItems: true }), { inboxNoticeServerRows: true, inboxItems: true });
 });
 
 

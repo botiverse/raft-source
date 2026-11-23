@@ -57,7 +57,6 @@ test("the product event registry changes only on purpose", () => {
     "activity_mark",
     "activity_open",
     "agent_create_opened",
-    "agent_read_progress_shown",
     "announcement_interacted",
     "announcement_shown",
     "app_download_clicked",
@@ -94,6 +93,7 @@ test("the product event registry changes only on purpose", () => {
     "computers_list_control_changed",
     "computers_list_viewed",
     "confirm_dialog_closed",
+    "conversation_header_action_selected",
     "conversation_mute_changed",
     "desktop_computer_migration_finished",
     "desktop_download_requested",
@@ -249,7 +249,7 @@ test("the host's external invite flow: web events with fixed values, buckets for
 // cindyz via Warden, 2026-11-12 (#wg-rbac:db8d6e83): each finished join or connect attempt.
 test("external_channel_connect_finished is a server fact of enums and booleans: the way, the result, the refusal, nothing identifying", () => {
   assert.deepEqual([...EXTERNAL_CONNECT_PATHS], ["guest", "connect", "new_server", "request_approval", "approve", "decline", "host_direct", "self_connect"]);
-  assert.deepEqual([...EXTERNAL_CONNECT_RESULTS], ["connected", "connecting", "awaiting_approval", "declined", "refused", "expired", "error"]);
+  assert.deepEqual([...EXTERNAL_CONNECT_RESULTS], ["connected", "connecting", "awaiting_approval", "declined", "refused", "expired", "error", "already_connected"]);
   assert.equal(EXTERNAL_CONNECT_REFUSAL_CODES.at(-1), "other", "a code not listed is other");
   assert.ok(EXTERNAL_CONNECT_REFUSAL_CODES.includes("invite_unusable"));
   const connected = { path: "connect", result: "connected", async: false, multi: false, host_plan: "paid" };
@@ -415,22 +415,20 @@ test("the onboarding tour: web events with a step from 1 to 6 and a closed list 
   assert.deepEqual(validateProductEvent("onboarding_tour_step_shown", { tour_step: 1, title: "Meet your agent" }, "web"), { ok: false, reason: "unknown_property", property: "title" });
 });
 
-// Gated features with no server record (tygg, #proj-o11y:a5f3094f): Drafts and agent read progress,
+// Gated features with no server record (tygg, #proj-o11y:a5f3094f): Drafts,
 // from every client that has them, with fixed values only.
-test("gated feature events: Drafts and agent read progress carry fixed values only", () => {
+test("gated feature events: Drafts carry fixed values only", () => {
   for (const source of ["web", "desktop", "ios", "android"] as const) {
     assert.equal(validateProductEvent("drafts_page_viewed", { drafts: "2-5" }, source).ok, true, source);
     assert.equal(validateProductEvent("drafts_item_opened", { place: "task" }, source).ok, true, source);
-    assert.equal(validateProductEvent("agent_read_progress_shown", { part: "faces", conversation: "thread" }, source).ok, true, source);
   }
   assert.equal(validateProductEvent("drafts_page_viewed", { drafts: "2-5" }, "server").ok, false, "a client event");
   assert.equal(validateProductEvent("drafts_page_viewed", {}, "web").ok, false, "the count bucket is required");
   assert.equal(validateProductEvent("drafts_page_viewed", { drafts: "3" }, "web").ok, false, "a bucket, never a count");
   assert.equal(validateProductEvent("drafts_item_opened", { place: "channel", channel_id: "c-1" }, "web").ok, false, "no ids");
   assert.equal(validateProductEvent("drafts_item_opened", { place: "channel", length: 12 }, "web").ok, false, "nothing about the text");
-  assert.equal(validateProductEvent("agent_read_progress_shown", { part: "not_reaching_line", conversation: "channel" }, "web").ok, true);
-  assert.equal(validateProductEvent("agent_read_progress_shown", { part: "faces", conversation: "dm" }, "web").ok, false, "DMs show no faces");
-  assert.equal(validateProductEvent("agent_read_progress_shown", { part: "faces", conversation: "channel", agents: 3 }, "web").ok, false, "no counts of agents");
+  // Agent read progress was removed (#raft-feature-flag:#9): its event is no longer registered.
+  assert.deepEqual(validateProductEvent("agent_read_progress_shown", { part: "faces", conversation: "thread" }, "web"), { ok: false, reason: "unregistered_event" });
 });
 
 // #proj-analytics:#17 (AndyLok, #proj-o11y:#16): notification levels and mutes are server facts
@@ -673,6 +671,34 @@ test("channel_tab_selected and message_action_selected come from every client, w
   // Values no client sends are not kept (the apps have no such long-press items).
   assert.deepEqual(validateProductEvent("message_action_selected", { action: "pin", surface: "long_press" }, "android"), { ok: false, reason: "invalid_property_value", property: "action" });
   assert.equal(validateProductEvent("page_viewed", { route: "assistant" }, "web").ok, true);
+});
+
+// Nova, 2026-11-17: the conversation header's Search, details (Settings or the name) and ⋯, and whether the header was folded.
+test("conversation_header_action_selected: every client, fixed values, a required compact; channel_tab_selected's more_menu and optional compact", () => {
+  const search = { action: "search", surface: "header", conversation: "channel", compact: false };
+  for (const source of ["web", "desktop", "ios", "android", "harmonyos"] as const) {
+    assert.equal(validateProductEvent("conversation_header_action_selected", search, source).ok, true, source);
+  }
+  assert.deepEqual(validateProductEvent("conversation_header_action_selected", search, "server"), { ok: false, reason: "source_not_allowed" });
+  for (const [action, surface] of [["open_details", "header"], ["open_details", "title"], ["open_details", "more_menu"], ["open_menu", "header"], ["search", "more_menu"], ["open_lounge", "header"], ["open_lounge", "more_menu"], ["start_call", "header"], ["start_call", "more_menu"]]) {
+    assert.equal(validateProductEvent("conversation_header_action_selected", { action, surface, conversation: "dm", compact: true }, "web").ok, true, `${action} ${surface}`);
+  }
+  for (const property of ["action", "surface", "conversation", "compact"]) {
+    const props: Record<string, unknown> = { ...search };
+    delete props[property];
+    assert.deepEqual(validateProductEvent("conversation_header_action_selected", props, "web"), { ok: false, reason: "missing_property", property });
+  }
+  assert.deepEqual(validateProductEvent("conversation_header_action_selected", { ...search, action: "pin" }, "web"), { ok: false, reason: "invalid_property_value", property: "action" });
+  assert.deepEqual(validateProductEvent("conversation_header_action_selected", { ...search, action: "settings" }, "web"), { ok: false, reason: "invalid_property_value", property: "action" }, "Settings opening the details is open_details");
+  assert.deepEqual(validateProductEvent("conversation_header_action_selected", { ...search, surface: "context_menu" }, "web"), { ok: false, reason: "invalid_property_value", property: "surface" });
+  assert.deepEqual(validateProductEvent("conversation_header_action_selected", { ...search, conversation: "thread" }, "web"), { ok: false, reason: "invalid_property_value", property: "conversation" });
+  assert.deepEqual(validateProductEvent("conversation_header_action_selected", { ...search, compact: "yes" }, "web"), { ok: false, reason: "invalid_property_value", property: "compact" });
+  assert.deepEqual(validateProductEvent("conversation_header_action_selected", { ...search, channel_id: "c-1" }, "web"), { ok: false, reason: "unknown_property", property: "channel_id" });
+
+  assert.equal(validateProductEvent("channel_tab_selected", { tab: "tasks", surface: "more_menu", was_active: false, compact: true }, "web").ok, true, "Tasks inside the ⋯");
+  assert.equal(validateProductEvent("channel_tab_selected", { tab: "files", surface: "side_card_toggle", was_active: true, compact: false }, "web").ok, true, "the header's toggle, not folded");
+  assert.equal(validateProductEvent("channel_tab_selected", { tab: "files", surface: "side_card_toggle", was_active: true }, "ios").ok, true, "an older client without compact");
+  assert.deepEqual(validateProductEvent("channel_tab_selected", { tab: "files", surface: "side_card_toggle", was_active: true, compact: 1 }, "web"), { ok: false, reason: "invalid_property_value", property: "compact" });
 });
 
 // Ginny/huxijin via Lagoon, 2026-11-12 (#proj-mobile:66f15a50): the store rating prompt request.
@@ -1029,6 +1055,8 @@ test("Artifact events come from the web with fixed values only, every property r
   assert.deepEqual(web("artifact_opened", { ...opened, source: "message_chip" }), { ok: true, event: "artifact_opened" });
 
   assert.equal(web("artifact_viewer_action", { action: "comments_open" }).ok, true);
+  // ⋯'s Share (#proj-workspace:#346): the file itself to the system share sheet.
+  assert.equal(web("artifact_viewer_action", { action: "share" }).ok, true);
   assert.deepEqual(web("artifact_viewer_action", { action: "rename" }), { ok: false, reason: "invalid_property_value", property: "action" });
   assert.equal(web("artifact_comment_posted", { anchor: "page_anchor", is_reply: true, mention_count_bucket: "2-3" }).ok, true);
   assert.deepEqual(web("artifact_comment_posted", { anchor: "none", is_reply: false, mention_count_bucket: 2 }), { ok: false, reason: "invalid_property_value", property: "mention_count_bucket" });

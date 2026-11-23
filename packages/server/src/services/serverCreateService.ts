@@ -36,10 +36,25 @@ export async function createServerAsOwner(body: unknown, ownerUserId: string): P
   } catch (err) {
     const message = err instanceof Error ? err.message : "";
     if (message.includes("already taken")) throw new ServerCreateInputError(409, message);
+    // Two creates with one slug at once: the second passes the pre-check and
+    // meets servers_slug_unique on insert. Same answer as the pre-check.
+    if (isServerSlugUniqueViolation(err)) throw new ServerCreateInputError(409, `Server slug "${slug as string}" is already taken`);
     throw err;
   }
   // antiproton_cindy: the onboarding agent is a hosted Cindy, created right after the
   // server commits (no computer needed). Best effort; the setup projection backstops it.
   await ensureHostedCindy({ serverId: server.id, ownerUserId, site: "server_create" });
   return server;
+}
+
+function isServerSlugUniqueViolation(err: unknown): boolean {
+  let current: unknown = err;
+  for (let depth = 0; depth < 4 && current && typeof current === "object"; depth += 1) {
+    const candidate = current as { code?: unknown; constraint?: unknown; constraint_name?: unknown; cause?: unknown };
+    if (candidate.code === "23505" && (candidate.constraint === "servers_slug_unique" || candidate.constraint_name === "servers_slug_unique")) {
+      return true;
+    }
+    current = candidate.cause;
+  }
+  return false;
 }

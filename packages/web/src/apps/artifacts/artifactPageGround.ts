@@ -1,4 +1,5 @@
 import { useLayoutEffect, useState } from "react";
+import { resizeObserverOf } from "../../utils/ownerDocument";
 import { ARTIFACT_PAGE_CARD_MIN_WIDTH_PX } from "@botiverse/raft-shared/src/artifactPageTheme";
 
 /**
@@ -45,8 +46,10 @@ export function useMarkdownPageGround(page: HTMLElement | null, watching: boolea
       setGround(markdownPageGround(width > 0 ? width : null));
     };
     read();
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(read);
+    // The page's own window's observer (an object window's, #337 PR3).
+    const Observer = resizeObserverOf(page);
+    if (!Observer) return;
+    const observer = new Observer(read);
     observer.observe(page);
     return () => observer.disconnect();
   }, [page, watching]);

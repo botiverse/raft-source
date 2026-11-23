@@ -41,7 +41,11 @@ export function ThisDevicePanel() {
   }
   return (
     <div className="flex min-h-0 flex-1 flex-col font-sans" data-testid="this-device-panel">
-      <MachinePanelHeader machine={headMachine} />
+      {/* No side panel hosts this page (a computer's opens beside the card wall from 768px), so on desktop
+          too it is a page of its own: Back to Computers at every width, as a full page has (Raft DS ›
+          Navigation, "Closing"). It goes back one step (the page it was opened from, e.g. via the tray), or to
+          Computers when opened directly. The page exists only in Raft Desktop (no host: it redirects above). */}
+      <MachinePanelHeader machine={headMachine} backAlways />
       {/* Scrolls in a raft-ui ScrollArea, as the computer's own page does; a region named like the page. */}
       <ScrollArea role="region" aria-label={title} className="min-h-0 flex-1 bg-layer-canvas">
         <MachineProfileHead

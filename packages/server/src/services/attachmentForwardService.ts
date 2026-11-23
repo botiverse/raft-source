@@ -1,9 +1,9 @@
 import { lockAssistantDelegatedMessageAuthority } from "./assistantDelegatedMessageAuthority";
 import { assertDmHumanPeersAreMembers } from "./dmSendPolicy";
 import { randomUUID, createHash } from "node:crypto";
-import { and, asc, eq, inArray, isNotNull } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, notInArray } from "drizzle-orm";
 import { currentDate, isSubConversationType, type ForwardedBundleAttachmentSnapshot } from "@botiverse/raft-shared";
-import { getDb } from "../db/index";
+import { getDb, type DatabaseExecutor } from "../db/index";
 import {
   attachmentObjects,
   attachments,
@@ -19,6 +19,7 @@ import { buildSearchText } from "./searchTokenizer";
 import { withChannelWriterFence } from "./channelConversionFenceService";
 import { addAttachmentObjectHoldsWithExecutor } from "./attachmentObjectHoldService";
 import { lockJointPostingAuthority } from "../lib/channelActorPermissions";
+import { lockAndResolveMessageStorage } from "./channelService";
 import { lockOrdinaryMessageExternalDeliveryAdmission } from "./externalDeliveryOutboxService";
 import { classifyOrdinaryMessageExternalProjection } from "./ordinaryMessageExternalProjection";
 import { mayAssistantReadOwnerConversation, readableOwnerDmPolicy } from "./assistantDmScope";
@@ -81,6 +82,31 @@ function metadataFingerprint(value: unknown): string | null {
  * nothing while the shared classifier keeps action-metadata messages (a
  * bundle) out of the external outbox.
  */
+const SUBCONVERSATION_TYPES: Array<"thread" | "task"> = ["thread", "task"];
+
+/**
+ * A forward's channel rows FOR UPDATE (sources, destination, destination
+ * parent), in two ordered statements: root channels in id order, then threads
+ * and task conversations in id order. A send into a Joint thread locks the
+ * parent before the thread (lockSendRouteAndResolveStorage); one
+ * `WHERE id IN (...)` locked them in scan order, so a forward could hold the
+ * parent and wait for the thread a send held while the send waited for the
+ * parent (40P01). Pinned by jointThreadSendForwardLockOrder.realPg.test.ts.
+ */
+export async function lockForwardAuthorityChannels(tx: DatabaseExecutor, channelIds: readonly string[]) {
+  if (channelIds.length === 0) return [];
+  const ids = [...channelIds];
+  const roots = await tx.select().from(channels)
+    .where(and(inArray(channels.id, ids), notInArray(channels.type, SUBCONVERSATION_TYPES)))
+    .orderBy(asc(channels.id))
+    .for("update");
+  const subconversations = await tx.select().from(channels)
+    .where(and(inArray(channels.id, ids), inArray(channels.type, SUBCONVERSATION_TYPES)))
+    .orderBy(asc(channels.id))
+    .for("update");
+  return [...roots, ...subconversations];
+}
+
 export async function persistForwardBundle(input: {
   destinationStorageChannelId: string;
   destinationRequestChannelId: string;
@@ -128,9 +154,12 @@ export async function persistForwardBundle(input: {
       input.destinationRequestChannelId,
       ...(destinationParentChannelId ? [destinationParentChannelId] : []),
     ])];
-    const authorityChannels = await tx.select().from(channels)
-      .where(inArray(channels.id, authorityChannelIds))
-      .for("update");
+    const authorityChannels = await lockForwardAuthorityChannels(tx, authorityChannelIds);
+    // The storage id this forward inserts into, resolved now under the
+    // destination row's lock (held FOR UPDATE just above, so the KEY SHARE
+    // re-lock waits on nothing): lockAndResolveMessageStorage. The id the
+    // caller resolved before the transaction is only compared below.
+    const destinationStorageChannelId = await lockAndResolveMessageStorage(tx, input.destinationRequestChannelId);
     const channelById = new Map(authorityChannels.map((channel) => [channel.id, channel]));
     const destination = channelById.get(input.destinationRequestChannelId);
     // The channel whose membership admits the post: the destination itself,
@@ -305,11 +334,11 @@ export async function persistForwardBundle(input: {
           id: projectionId,
           objectId: object.id,
           messageId: null,
-          pendingChannelId: input.destinationStorageChannelId,
+          pendingChannelId: destinationStorageChannelId,
           createdById: input.senderId,
           createdByType: "user",
           messagePosition: messagePosition++,
-          channelId: input.destinationStorageChannelId,
+          channelId: destinationStorageChannelId,
           uploaderId: object.uploaderId,
           uploaderType: object.uploaderType,
           filename: snapshot.filename,
@@ -342,18 +371,18 @@ export async function persistForwardBundle(input: {
     // the requested conversation (messageService.broadcastAndDeliver).
     await lockOrdinaryMessageExternalDeliveryAdmission({
       executor: tx,
-      authorityChannelId: destinationParentChannelId && input.destinationStorageChannelId !== input.destinationRequestChannelId
+      authorityChannelId: destinationParentChannelId && destinationStorageChannelId !== input.destinationRequestChannelId
         ? destinationParentChannelId
         : input.destinationRequestChannelId,
       requestedChannelId: input.destinationRequestChannelId,
-      canonicalConversationId: input.destinationStorageChannelId,
+      canonicalConversationId: destinationStorageChannelId,
       decision: classifyOrdinaryMessageExternalProjection({ senderType: "user", messageType: "chat", actionMetadata: publicMetadata }),
     });
     if (postingScope.type === "dm") {
-      await assertDmHumanPeersAreMembers(tx, input.destinationStorageChannelId, "user", input.senderId);
+      await assertDmHumanPeersAreMembers(tx, destinationStorageChannelId, "user", input.senderId);
     }
     const insertRows = await tx.insert(messages).values({
-      channelId: input.destinationStorageChannelId,
+      channelId: destinationStorageChannelId,
       senderType: "user",
       senderId: input.senderId,
       randomId: input.randomId,
@@ -385,7 +414,7 @@ export async function persistForwardBundle(input: {
     await tx.update(userChannelInboxStates)
       .set({ doneAt: null, updatedAt: currentDate() })
       .where(and(
-        eq(userChannelInboxStates.channelId, input.destinationStorageChannelId),
+        eq(userChannelInboxStates.channelId, destinationStorageChannelId),
         isNotNull(userChannelInboxStates.doneAt),
       ));
     return { message, replayed: false };

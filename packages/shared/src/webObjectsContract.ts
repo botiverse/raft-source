@@ -43,11 +43,18 @@ export interface ArtifactObjectRef {
  * (S8, eventKind `review`) also names it: its id (a comment's `reviewId`,
  * for `artifactWebPaths.comments(id, { review })`) and how many comments it
  * posted, its summary included.
+ *
+ * Settled (#334): a row whose newest event is `settled` or `unsettled`
+ * (recorded read: it adds no unread) opens at the version it was settled at.
+ * One whose newest event is a `version` that took a settled Artifact back to
+ * Working carries `wasSettled`, the version it had been settled at ("a new
+ * version since it was settled"); absent otherwise and from older Servers.
  */
 export interface ArtifactActivityTarget {
   version: number;
   comment?: ArtifactCommentId;
   review?: { id: ArtifactReviewId; comments: number };
+  wasSettled?: number;
 }
 
 /**

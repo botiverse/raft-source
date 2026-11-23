@@ -3,7 +3,6 @@
 // without constructing the orchestrator: freshness, capability presence and
 // runtime-version projection are exactly the axes previous review rounds
 // found unguarded.
-import { PROVIDER_PROBE_CAPABILITY } from "@botiverse/raft-shared";
 
 export interface ProbeCarrierMetaInput {
   probeCapabilities?: string | null;
@@ -74,8 +73,4 @@ export function isProbeCarrierFactLive(
 ): boolean {
   const age = nowMs - snapshot.observedAtMs;
   return age >= 0 && age <= maxAgeMs;
-}
-
-export function probeCarrierFactHasProbeCapability(snapshot: ProbeCarrierMetaSnapshot): boolean {
-  return snapshot.capabilities.includes(PROVIDER_PROBE_CAPABILITY);
 }

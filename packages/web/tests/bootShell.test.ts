@@ -494,6 +494,9 @@ test("the build gives the boot prefetch the API client's base and version, and p
     preconnect: "https://api.raft.build",
   });
   assert.deepEqual(bootPrefetchConfig({}), { api: "/api", version: resolveWebAppVersion({}), preconnect: null }, "same origin: no preconnect");
+  const staging = { VITE_DEPLOYMENT_ENV: "staging", VITE_COMMIT_SHA: "2d5f9c0cb89af6250974d29aa598cae5e18607d3" };
+  assert.equal(bootPrefetchConfig(staging).version, resolveWebAppVersion(staging), "a staging build's prefetch sends the version its API client does");
+  assert.match(bootPrefetchConfig(staging).version, /-staging\+2d5f9c0$/);
   const html = '<html><head><meta charset="UTF-8" />\n    <script src="/app-theme-bootstrap.js"></script></head></html>';
   const out = injectBootPrefetchConfig(html, { api: "https://api.raft.build/api", version: "1</script>", preconnect: "https://api.raft.build" });
   assert.ok(out.indexOf('<link rel="preconnect" href="https://api.raft.build" crossorigin>') < out.indexOf(`id="${BOOT_PREFETCH_CONFIG_ID}"`));

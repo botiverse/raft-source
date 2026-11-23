@@ -10,4 +10,6 @@ export const RUNTIME_INSTALL_COMMANDS: Readonly<Record<string, string>> = {
   claude: "npm install -g @anthropic-ai/claude-code",
   codex: "npm install -g @openai/codex",
   "kimi-sdk": "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
+  // OAR's documented method for DeepSeek Harness (runtimes/dsh/install.js): its official npm package.
+  dsh: "npm install -g @deepseek-ai/dsh",
 };

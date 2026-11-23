@@ -94,7 +94,7 @@ export function bootPrefetchConfig(env: Record<string, string | undefined>): { a
   const { apiBase } = deriveRuntimeEndpoints(compiledOrigin, "");
   return {
     api: apiBase,
-    version: resolveWebAppVersion({ VITE_APP_VERSION: env.VITE_APP_VERSION }),
+    version: resolveWebAppVersion({ VITE_APP_VERSION: env.VITE_APP_VERSION, VITE_DEPLOYMENT_ENV: env.VITE_DEPLOYMENT_ENV, VITE_COMMIT_SHA: env.VITE_COMMIT_SHA }),
     preconnect: compiledOrigin ? new URL(compiledOrigin).origin : null,
   };
 }

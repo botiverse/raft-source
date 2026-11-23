@@ -12,7 +12,7 @@ import { registerMachine } from "../services/machineService";
 import { addMember, createServer, grantOnboardingAgentRole, removeMember, updateAgentMemberRole } from "../services/serverService";
 import { consumeAgentBootstrapToken, issueAgentBootstrapToken, mintAgentCredential } from "../services/agentCredentialService";
 import { recordAgentProvisioning } from "../services/agentRuntimeProvisionService";
-import { SERVER_AUDIT_HIDDEN_EVENT_TYPES } from "../services/integrationAuditService";
+import { listIntegrationAuditEventsForAppAdmin, SERVER_AUDIT_HIDDEN_EVENT_TYPES } from "../services/integrationAuditService";
 import { updateServerProfileForAgent } from "./agentServerManage";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
@@ -314,10 +314,13 @@ test("machine key rotation and removal are audited without the key", async ({ ap
     assert.equal(event.actorId, owner.id);
     assert.equal(event.targetType, "machine");
     assert.equal(event.targetId, machine.id);
-    assert.equal(event.requesterType, "human");
-    assert.equal(event.requesterId, owner.id, "the person who connected the machine");
     assert.deepEqual(event.metadata, { machineId: machine.id, machineName: "audit-machine", actorRole: "owner" });
   }
+  // The rotated key is the registrant's; a raw daemon has no controller (no live attach record), so its removal names no requester.
+  assert.equal(rotated!.requesterType, "human");
+  assert.equal(rotated!.requesterId, owner.id, "the person whose machine key it is");
+  assert.equal(removed!.requesterType, null);
+  assert.equal(removed!.requesterId, null);
   assert.ok(!JSON.stringify([rotated, removed]).includes(apiKey));
 });
 
@@ -380,6 +383,13 @@ test("GET /api/servers/:id/audit-events: owners read newest-first events; member
   const limitedBody = await limited.json() as { events: unknown[]; nextCursor: string | null };
   assert.equal(limitedBody.events.length, 1);
   assert.equal(typeof limitedBody.nextCursor, "string");
+  const badLimit = await fetch(`${app.baseUrl}/api/servers/${server.id}/audit-events?limit=0`, { headers: headers(ownerToken, server.id) });
+  assert.equal(badLimit.status, 400);
+  assert.deepEqual(await badLimit.json(), {
+    error: "limit must be a positive integer",
+    code: "audit_events_limit_invalid",
+    errorCode: "audit_events_limit_invalid",
+  });
   for (const garbage of ["not-a-cursor!", Buffer.from("2026-01-01T00:00:00Z|nope").toString("base64url"), "x"]) {
     const invalid = await fetch(`${app.baseUrl}/api/servers/${server.id}/audit-events?cursor=${encodeURIComponent(garbage)}`, { headers: headers(ownerToken, server.id) });
     assert.equal(invalid.status, 400, garbage);
@@ -662,4 +672,71 @@ test("one member removal shares an operationId across its events; each removal a
   const [systemEvent] = (await eventsOf(server.id, "membership.removed")).filter((row) => row.targetId === admin.id);
   assert.equal(systemEvent!.actorType, "system");
   assert.equal((systemEvent!.metadata as Record<string, unknown>).actorRole, undefined);
+});
+
+test("GET audit-events shows owners a platform admin's plan change without the reason, the approval or the operator", async ({ app }) => {
+  const owner = await seedUser("audit-plan-owner");
+  const operator = await seedUser("audit-plan-operator");
+  const server = await createServer("Plan", `audit-plan-${randomUUID()}`, owner.id);
+  const ownerToken = await login(app.baseUrl, owner.email);
+  // The row public.ffa_change_server_plan (migration 0724) writes.
+  const metadata = {
+    serverSlug: server.slug, fromPlan: "free", toPlan: "founder", planDowngradedAt: null, reason: "Founder deal",
+    actorId: operator.id, actorName: "Platform Operator", approvedBy: "cindyz: yes, set it to founder",
+    approvalMessageId: "c0ffee12", via: "feature-flag-admin",
+  };
+  await getDb().insert(integrationAuditEvents).values({
+    serverId: server.id,
+    eventType: "server.plan_changed",
+    eventCategory: "server_profile",
+    outcome: "success",
+    source: "web",
+    actorType: "human",
+    actorId: operator.id,
+    targetType: "server",
+    targetId: server.id,
+    correlationId: "ffa-audit-1",
+    requestId: "ffa-request-1",
+    metadata,
+    diff: { plan: { before: "free", after: "founder" } },
+  });
+
+  const response = await fetch(`${app.baseUrl}/api/servers/${server.id}/audit-events`, { headers: headers(ownerToken, server.id) });
+  assert.equal(response.status, 200);
+  const body = await response.json() as {
+    events: Array<{ eventType: string; actorType: string; actorId: string | null; createdAt: string; diff: unknown; metadata: Record<string, unknown>; summary?: { zh: string; en: string } }>;
+    people: Record<string, unknown>;
+  };
+  const event = body.events.find((entry) => entry.eventType === "server.plan_changed");
+  assert.ok(event, "owners see the plan change");
+  assert.deepEqual(event.summary, {
+    zh: "平台管理员把 plan 从 free 改成 founder",
+    en: "A platform admin changed the plan from free to founder",
+  });
+  assert.ok(typeof event.createdAt === "string" && event.createdAt.length > 0, "with its time");
+  assert.deepEqual(event.metadata, { actorRole: "platform_admin", fromPlan: "free", toPlan: "founder" });
+  assert.deepEqual(event.diff, { plan: { before: "free", after: "founder" } });
+  assert.equal(event.actorId, null);
+  const text = JSON.stringify(body);
+  for (const secret of ["Founder deal", "cindyz: yes, set it to founder", "c0ffee12", "Platform Operator", operator.id, "ffa-request-1", "ffa-audit-1"]) {
+    assert.ok(!text.includes(secret), `owners do not see ${secret}`);
+  }
+  assert.equal(body.people[`human:${operator.id}`], undefined);
+
+  // Filtering by the operator's id does not reveal that they made the change.
+  const byOperator = await fetch(
+    `${app.baseUrl}/api/servers/${server.id}/audit-events?actorType=human&actorId=${operator.id}`,
+    { headers: headers(ownerToken, server.id) },
+  );
+  assert.equal(byOperator.status, 200);
+  const byOperatorBody = await byOperator.json() as { events: Array<{ eventType: string }> };
+  assert.ok(!byOperatorBody.events.some((entry) => entry.eventType === "server.plan_changed"));
+
+  // Platform admins still read the full row.
+  const adminView = (await listIntegrationAuditEventsForAppAdmin(250))
+    .find((entry) => entry.serverId === server.id && entry.eventType === "server.plan_changed");
+  assert.ok(adminView);
+  assert.equal(adminView.actorId, operator.id);
+  assert.equal(adminView.requestId, "ffa-request-1");
+  assert.deepEqual(adminView.metadata, metadata);
 });

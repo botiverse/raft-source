@@ -36,6 +36,7 @@ import { watchFocusIntent } from "../../utils/focusRequest";
 import { artifactErrorCode } from "./artifactApi";
 import { PHONE_QUERY } from "./artifactPhoneHistory";
 import ArtifactViewer from "./ArtifactViewer";
+import { openArtifactInWindow, useArtifactMiniWindows } from "./artifactWindowOpening";
 import { artifactSource } from "./artifactSource";
 import { useArtifactActivityChanged } from "./useArtifactActivityRefresh";
 import { setArtifactReturnFocus } from "./artifactViewerStore";
@@ -256,7 +257,7 @@ export default function ArtifactsDashboard({ serverId, onMobileBack, address: ho
   const flag = useServerFeatureFlag(WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY);
   const phone = useMediaQuery(PHONE_QUERY);
   const readerId = useArtifactReaderId();
-  const { prefs, setView, setWidth, setSort } = useArtifactDashboardPrefs();
+  const { prefs, setView, setWidth, setSort, setOtherOpen } = useArtifactDashboardPrefs();
   // The list view is the table on a wider screen and one row per Artifact on a phone (design D20, p3).
   const layout: DashboardLayout = prefs.view === "grid" ? "grid" : phone ? "rows" : "table";
   const localAddress = useLocalOpenAddress();
@@ -291,11 +292,16 @@ export default function ArtifactsDashboard({ serverId, onMobileBack, address: ho
   useArtifactActivityChanged(enabled && serverId && open === null ? serverId : null, null, () => (extended ? Promise.resolve() : read(true)));
 
   const { open: openAddress, close: closeViewer } = address;
+  const miniWindows = useArtifactMiniWindows();
   const openArtifact = useCallback((card: ArtifactCard, from: HTMLElement, index: number) => {
+    // Raft Desktop with the Artifact mini window (artifactWindowOpening.ts): a row's plain click (and its menu's Open)
+    // opens it in the reused Artifact window, which gives focus back to the row when it closes; where it can't, over
+    // the page as before.
+    if (openArtifactInWindow({ id: card.id, version: null }, { enabled: miniWindows, source: "all", from, title: card.title })) return;
     setArtifactReturnFocus(from);
     openedFrom.current = index;
     openAddress({ id: card.id, version: null }, "all");
-  }, [openAddress]);
+  }, [openAddress, miniWindows]);
 
   // However it closed (its close, Escape, Back, the address changed by hand): the list as it was, read again.
   // Opening it read the current version: what waited or was new may be gone, and the Artifact may have moved in the
@@ -374,6 +380,7 @@ export default function ArtifactsDashboard({ serverId, onMobileBack, address: ho
         {header}
         <DashboardList
           all={all}
+          serverId={serverId}
           place={place}
           onPlace={setPlace}
           author={author}
@@ -392,6 +399,8 @@ export default function ArtifactsDashboard({ serverId, onMobileBack, address: ho
           view={<ViewToggle view={prefs.view} onChange={setView} />}
           readerId={readerId}
           table={table}
+          otherOpen={prefs.otherOpen}
+          onOtherOpen={setOtherOpen}
         />
       </div>
       {open ? (

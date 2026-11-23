@@ -40,7 +40,8 @@ const DAEMON_SECTION_NOTICE = [
   "",
   "App items: 1",
   "",
-  `app=system.reminder · class=due · item=reminder · retention=until_explicit_ack · sourceRef=reminder:${REMINDER_ID}:1 · action=raft reminder ack --id 1598ee1a --revision 1 · title=查看「今日待办」页面有没有新评论`,
+  "app:system.reminder/1598ee1a · \"查看「今日待办」页面有没有新评论\"",
+  "  do: raft reminder ack --id 1598ee1a --revision 1",
   "]",
 ].join("\n");
 

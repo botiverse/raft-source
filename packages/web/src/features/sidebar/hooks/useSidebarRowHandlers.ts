@@ -1,11 +1,11 @@
-import { useCallback, useLayoutEffect } from "react";
+import { useCallback } from "react";
 import type { Channel } from "../../../store/channelStore";
 import type { Agent } from "../../../store/agentStore";
 import { useThreadStore } from "../../../store/threadStore";
 import { useProfileStore } from "../../../store/profileStore";
 import { opensProfileInPanel } from "../../members/useMembersProfileRedirect";
 import { useLongPress } from "../../../hooks/useLongPress";
-import { placeSidebarContextMenu } from "../../../components/layout/sidebarContextMenuPosition";
+import { capturePointAnchor } from "../../../components/ui/popupAnchor";
 import type { CtxMenu } from "../sidebarContextMenu";
 import type { SidebarSortSection } from "../sections/sidebarSortSections";
 import type { SidebarData } from "./useSidebarData";
@@ -17,16 +17,15 @@ import type { SidebarSync } from "./useSidebarSync";
  * of earlier Sidebar hooks, which are stable across renders. */
 /**
  * Row selection, DM opening and context-menu opening handlers, stable so the
- * memo'd rows skip re-renders, and the menus' on-screen placement.
+ * memo'd rows skip re-renders.
  */
 export function useSidebarRowHandlers(data: SidebarData, view: SidebarViewState, sync: SidebarSync) {
   const {
-    channelRowsDisplayOnlyRef, setSidebarOpen, nav, ctxMenu, setCtxMenu, ctxMenuRef,
-    setMoveToSectionMenuOpen, setMoveToSectionMenuPosition,
+    channelRowsDisplayOnlyRef, setSidebarOpen, nav, setCtxMenu,
+    setMoveToSectionMenuOpen,
   } = data;
   const {
-    setSectionCtxMenu, sectionCtxMenu, sectionCtxMenuRef, setSidebarSurfaceCtxMenu, sidebarSurfaceCtxMenu,
-    sidebarSurfaceCtxMenuRef, setOpenSortMenu,
+    setSectionCtxMenu, setSidebarSurfaceCtxMenu, setOpenSortMenu,
   } = view;
   const { markUnreadSidebarItemRead, longPressTargetRef, onLongPress } = sync;
 
@@ -140,21 +139,21 @@ export function useSidebarRowHandlers(data: SidebarData, view: SidebarViewState,
     setSectionCtxMenu(null);
     setSidebarSurfaceCtxMenu(null);
     setMoveToSectionMenuOpen(false);
-    setMoveToSectionMenuPosition(null);
-    setCtxMenu({ x: e.clientX, y: e.clientY, type, id });
+    const target = e.currentTarget instanceof Element ? e.currentTarget : null;
+    setCtxMenu({ anchor: capturePointAnchor(e.clientX, e.clientY, target), type, id });
   }, [longPressSuppressRef]);
   // Stryker restore all
 
-  // Stryker disable all: pointer coordinates and portal placement are browser-smoke verified; clamping semantics live in placeSidebarContextMenu.
+  // Stryker disable all: pointer coordinates and portal placement are browser-smoke verified.
   const openSectionCtxMenu = useCallback((event: React.MouseEvent, section: SidebarSortSection | `custom:${string}`) => {
     event.preventDefault();
     event.stopPropagation();
     setCtxMenu(null);
     setSidebarSurfaceCtxMenu(null);
     setMoveToSectionMenuOpen(false);
-    setMoveToSectionMenuPosition(null);
     setOpenSortMenu(null);
-    setSectionCtxMenu({ x: event.clientX, y: event.clientY, section });
+    const target = event.currentTarget instanceof Element ? event.currentTarget : null;
+    setSectionCtxMenu({ anchor: capturePointAnchor(event.clientX, event.clientY, target), section });
   }, []);
   // Stryker restore all
 
@@ -165,77 +164,10 @@ export function useSidebarRowHandlers(data: SidebarData, view: SidebarViewState,
     setCtxMenu(null);
     setSectionCtxMenu(null);
     setMoveToSectionMenuOpen(false);
-    setMoveToSectionMenuPosition(null);
     setOpenSortMenu(null);
-    setSidebarSurfaceCtxMenu({ x: event.clientX, y: event.clientY });
+    const surface = event.currentTarget instanceof Element ? event.currentTarget : null;
+    setSidebarSurfaceCtxMenu({ anchor: capturePointAnchor(event.clientX, event.clientY, surface) });
   }, []);
-
-  // Stryker disable all: pre-existing context-menu placement is outside the workspace mutation corpus.
-  useLayoutEffect(() => {
-    if (!ctxMenu) return;
-    const menuEl = ctxMenuRef.current;
-    if (!menuEl) return;
-    const rect = menuEl.getBoundingClientRect();
-    const next = placeSidebarContextMenu({
-      x: ctxMenu.x,
-      y: ctxMenu.y,
-      menuWidth: rect.width,
-      menuHeight: rect.height,
-      viewportWidth: window.innerWidth,
-      viewportHeight: window.innerHeight,
-    });
-    if (next.x === ctxMenu.x && next.y === ctxMenu.y) return;
-    setCtxMenu((current) => {
-      if (!current || current.type !== ctxMenu.type || current.id !== ctxMenu.id) return current;
-      if (current.x !== ctxMenu.x || current.y !== ctxMenu.y) return current;
-      return { ...current, ...next };
-    });
-  }, [ctxMenu]);
-  // Stryker restore all
-
-  // Stryker disable all: section-menu placement reuses the pure, separately tested context-menu geometry and is verified in the browser proof.
-  useLayoutEffect(() => {
-    if (!sectionCtxMenu) return;
-    const menuEl = sectionCtxMenuRef.current;
-    if (!menuEl) return;
-    const rect = menuEl.getBoundingClientRect();
-    const next = placeSidebarContextMenu({
-      x: sectionCtxMenu.x,
-      y: sectionCtxMenu.y,
-      menuWidth: rect.width,
-      menuHeight: rect.height,
-      viewportWidth: window.innerWidth,
-      viewportHeight: window.innerHeight,
-    });
-    if (next.x === sectionCtxMenu.x && next.y === sectionCtxMenu.y) return;
-    setSectionCtxMenu((current) => {
-      if (!current || current.section !== sectionCtxMenu.section) return current;
-      if (current.x !== sectionCtxMenu.x || current.y !== sectionCtxMenu.y) return current;
-      return { ...current, ...next };
-    });
-  }, [sectionCtxMenu]);
-  // Stryker restore all
-
-  useLayoutEffect(() => {
-    if (!sidebarSurfaceCtxMenu) return;
-    const menuEl = sidebarSurfaceCtxMenuRef.current;
-    if (!menuEl) return;
-    const rect = menuEl.getBoundingClientRect();
-    const next = placeSidebarContextMenu({
-      x: sidebarSurfaceCtxMenu.x,
-      y: sidebarSurfaceCtxMenu.y,
-      menuWidth: rect.width,
-      menuHeight: rect.height,
-      viewportWidth: window.innerWidth,
-      viewportHeight: window.innerHeight,
-    });
-    if (next.x === sidebarSurfaceCtxMenu.x && next.y === sidebarSurfaceCtxMenu.y) return;
-    setSidebarSurfaceCtxMenu((current) => {
-      if (!current) return current;
-      if (current.x !== sidebarSurfaceCtxMenu.x || current.y !== sidebarSurfaceCtxMenu.y) return current;
-      return { ...current, ...next };
-    });
-  }, [sidebarSurfaceCtxMenu]);
 
   return {
     makeLongPressHandlers, handleSelectChannel, handleSelectDm, openComputerId, handleSelectAgentDm,

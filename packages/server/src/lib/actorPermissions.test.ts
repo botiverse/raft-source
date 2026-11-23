@@ -7,7 +7,7 @@ import { eq } from "drizzle-orm";
 import { serverAgentMembers, serverMembers, users } from "../db/schema";
 import { getDb } from "../db/index";
 import { createAgent } from "../services/agentService";
-import { createServer } from "../services/serverService";
+import { createServer, getMemberRoleIncludingRetired } from "../services/serverService";
 import { actorHasServerCapabilityInServer, decideAgentConnectorAuthority, resolveActorContext, serverRolesWithCapability } from "./actorPermissions";
 import { assertActorServerCapabilityMatrix } from "../test/actorCapabilityMatrix";
 
@@ -84,6 +84,33 @@ test("actor permissions resolve human and agent server roles through the shared 
     serverRole: null,
   });
   assert.equal(await actorHasServerCapabilityInServer(server.id, "agent", agent.id, "joinPublicChannels"), false);
+});
+
+test("a deleted account's kept membership holds no server role; a live admin keeps theirs", async ({ app: _app }) => {
+  const db = getDb();
+  const owner = await seedUser("retired-role-owner");
+  const liveAdmin = await seedUser("retired-role-live-admin");
+  const retiredAdmin = await seedUser("retired-role-retired-admin");
+  const server = await createServer("Retired Role", "retired-role", owner.id);
+  await db.insert(serverMembers).values([
+    { serverId: server.id, userId: liveAdmin.id, role: "admin" },
+    { serverId: server.id, userId: retiredAdmin.id, role: "admin" },
+  ]);
+  // Account deletion keeps the server_members row and its role (tableClassification).
+  await db.update(users).set({ retiredAt: new Date() }).where(eq(users.id, retiredAdmin.id));
+
+  assert.equal((await resolveActorContext(server.id, "user", retiredAdmin.id)).serverRole, null);
+  assert.equal(await actorHasServerCapabilityInServer(server.id, "user", retiredAdmin.id, "manageExternalAuth"), false);
+  assert.equal(await actorHasServerCapabilityInServer(server.id, "user", retiredAdmin.id, "editAgents"), false);
+  // Inside a transaction (the executor path) too.
+  await db.transaction(async (tx) => {
+    assert.equal((await resolveActorContext(server.id, "user", retiredAdmin.id, tx)).serverRole, null);
+  });
+  // The row itself is kept, for what reads it as a record.
+  assert.equal(await getMemberRoleIncludingRetired(server.id, retiredAdmin.id), "admin");
+
+  assert.equal((await resolveActorContext(server.id, "user", liveAdmin.id)).serverRole, "admin");
+  assert.equal(await actorHasServerCapabilityInServer(server.id, "user", liveAdmin.id, "manageExternalAuth"), true);
 });
 
 test("connector authority: creator first, then owner/admin; members and guests only as non-guest creator", () => {

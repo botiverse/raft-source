@@ -94,6 +94,13 @@ export const AGENT_API_ARTIFACT_ERROR_CODES = [
    * before it show `error` and `suggestedNextAction` as sent.
    */
   "CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN",
+  /**
+   * 403: the same refusal when the channel is a joint (shared) channel the
+   * agent's server has no copy of: no channel to name. Nothing was pushed.
+   * details: { title }. Clients from before it show `error` and
+   * `suggestedNextAction` as sent.
+   */
+  "CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN_ELSEWHERE",
   /** 400: a new Artifact without `target` (its home). */
   "TARGET_REQUIRED",
   /**
@@ -132,8 +139,10 @@ export const AGENT_API_ARTIFACT_ERROR_CODES = [
    * changes or on the whole Artifact. Nothing was published. details:
    * { unseen: { comments (the newest few, oldest first, shaped as
    * artifactRead's unseen.comments), commentCount, commentsCursor, unread },
-   * seen, skipped: { versions, otherComments } } (`seen`: what a caller
-   * passing `seen` passes next).
+   * seenFrom, seen, skipped: { versions, otherComments } } (`seen`: what a
+   * caller passing `seen` passes next; `seenFrom`, newer servers: where the
+   * read position stood before, so `held` = `<seenFrom>..<seen>` lists the
+   * comments this hold marked seen again, artifactComments, task #340).
    *
    * The caller's read position now covers the held comments shown in full
    * (an excerpt cut short doesn't count), and stops before the first comment
@@ -156,6 +165,19 @@ export const AGENT_API_ARTIFACT_ERROR_CODES = [
    * passed over that didn't hold it.
    */
   "UNSEEN_CHANGES",
+  /**
+   * 409 (#334): a push that makes a new version of a Settled Artifact, the
+   * first time this agent is told of this settle. Nothing was published; the
+   * Server records that the agent was told, so the same request again goes
+   * through (and takes it back to Working). details: { title, settled: {
+   * by, at, version }, next } (`next`: the version number the push would make).
+   */
+  "SETTLED",
+  /**
+   * 404 (#334): settling isn't on for the Artifact's server (artifact_settled_v0),
+   * or this Server has no settle route. Nothing was written.
+   */
+  "SETTLED_NOT_AVAILABLE",
   /** 400: a path listed twice, or both listed and deleted. details: { path }. */
   "DUPLICATE_PATH",
   /** 400: the entry file isn't in the resulting version. details: { entry }. */
@@ -356,9 +378,24 @@ export const AGENT_API_ARTIFACT_SEARCH_MATCHES_MAX = 3;
 export const AGENT_API_ARTIFACT_SEARCH_SNIPPET_CHARS = 160;
 /** Comments per `artifactComments` page. */
 export const AGENT_API_ARTIFACT_COMMENTS_PAGE_LIMIT = 50;
+/**
+ * A hold's range of item positions, `<from>..<through>` (artifactComments'
+ * `held`, task #340): what the hold moved the read position over.
+ */
+export const AGENT_API_ARTIFACT_HELD_RANGE = /^\d{1,15}\.\.\d{1,15}$/;
+/** `<from>..<through>` as artifactComments' `held` takes it. */
+export const artifactHeldRange = (from: number, through: number): string => `${from}..${through}`;
+/** A `held` range's two positions, or null when it isn't one. */
+export function parseArtifactHeldRange(range: string): { from: number; through: number } | null {
+  if (!AGENT_API_ARTIFACT_HELD_RANGE.test(range)) return null;
+  const [from, through] = range.split("..").map(Number);
+  return { from: from!, through: through! };
+}
 /** `artifactRead`: the newest versions listed, and the newest unseen versions and comments shown. */
 export const AGENT_API_ARTIFACT_READ_VERSIONS_SHOWN = 3;
 export const AGENT_API_ARTIFACT_READ_UNSEEN_SHOWN = 5;
+/** `artifactRead`: the newest of each "Linked from" group listed (`linkedFrom`, task #336 step 2). */
+export const AGENT_API_ARTIFACT_READ_LINKED_FROM_SHOWN = 10;
 /** `artifactRead`: an unseen comment's excerpt, in characters. */
 export const AGENT_API_ARTIFACT_COMMENT_EXCERPT_CHARS = 300;
 /** `artifactFileContent`: a text file's content is cut at this many UTF-8 bytes (`truncated: true`). */
@@ -448,6 +485,13 @@ export const agentApiArtifactHomeSchema = lazySchema("agentApiArtifactHomeSchema
   passthroughObject({ kind: z.literal("public") }),
 ]));
 
+/** Who settled an Artifact, when, and the version that was current then (#334). */
+export const agentApiArtifactSettledSchema = lazySchema("agentApiArtifactSettledSchema", () => passthroughObject({
+  by: agentApiArtifactActorSchema,
+  at: isoSchema,
+  version: z.number().int(),
+}));
+
 export const agentApiArtifactSummarySchema = lazySchema("agentApiArtifactSummarySchema", () => passthroughObject({
   id: z.string(),
   /** https://app.raft.build/artifacts/<id> (the app's origin on other deployments). */
@@ -470,6 +514,18 @@ export const agentApiArtifactSummarySchema = lazySchema("agentApiArtifactSummary
   author: agentApiArtifactActorSchema,
   createdAt: isoSchema,
   updatedAt: isoSchema,
+  /**
+   * Settled (#334): marked done by someone who may comment on it; null while
+   * it is Working. Absent where its server has artifact_settled_v0 off, for
+   * an Artifact of another server, and from older Servers.
+   */
+  settled: agentApiArtifactSettledSchema.nullable().optional(),
+  /**
+   * Working again (#334): it was settled (`was`) and `version` took it back
+   * to Working. Null otherwise (cleared by the next settle or an unsettle);
+   * absent exactly when `settled` is.
+   */
+  reopened: passthroughObject({ version: z.number().int(), was: agentApiArtifactSettledSchema }).nullable().optional(),
 }));
 
 export const agentApiArtifactVersionSummarySchema = lazySchema("agentApiArtifactVersionSummarySchema", () => passthroughObject({
@@ -490,8 +546,14 @@ export const agentApiArtifactFileSchema = lazySchema("agentApiArtifactFileSchema
 
 /**
  * A place in one file, in the attachment-comment anchor format (RFC 036, e.g.
- * `html-region`). Stored and returned as given; the Server checks only its
- * shape and size.
+ * `html-region`), or the web's (`annotation`, `page`, `lines`, `csv-rows`).
+ * Stored and returned as given, but for an `annotation` anchor's
+ * `data.context` (Porthole P152: `{ headings?, region? }`, the section it is
+ * in): kept cleaned and within Porthole's limits (at most 6 headings, each and
+ * the region at most 80 characters) when well formed, else left out, never
+ * refused. The Server checks the anchor's shape and size (4 KiB as JSON,
+ * AGENT_API_ARTIFACT_MAX_ANCHOR_BYTES); over it, the context gives way first
+ * (the region, then the outermost headings) before the anchor is refused.
  */
 export const agentApiArtifactCommentAnchorSchema = lazySchema("agentApiArtifactCommentAnchorSchema", () => passthroughObject({
   type: z.string().min(1),
@@ -644,7 +706,8 @@ export const agentApiArtifactReadResponseSchema = lazySchema("agentApiArtifactRe
    * The Artifact's original message: the one through which it entered a
    * conversation, set once and never moved (`attachment`: saved from that
    * message's attachment; `share`: the message its first share posted;
-   * `link`: later). `target` is the conversation as `raft` takes it, from
+   * `link`: the first message in its home conversation, or one of its
+   * threads, that links it). `target` is the conversation as `raft` takes it, from
    * the caller's side: `#channel`, `dm:@peer`, and for a reply in a thread
    * the thread's (`#channel:<root short id>`); `messageId` the full id. Null
    * when it has none, the message is deleted, or the caller can't read that
@@ -656,6 +719,33 @@ export const agentApiArtifactReadResponseSchema = lazySchema("agentApiArtifactRe
     messageId: z.string(),
     via: z.enum(["attachment", "share", "link"]),
   }).nullable().optional(),
+  /**
+   * "Linked from" (task #336 step 2): what links to it, as the
+   * caller sees it, each group newest first, at most
+   * AGENT_API_ARTIFACT_READ_LINKED_FROM_SHOWN, with how many there are
+   * (`total`, counted up to ARTIFACT_BACKLINKS_COUNT_CAP; `capped`: there
+   * are more). `documents`: other Artifacts whose current version links it,
+   * only those the caller can see (`id` as `artifact.id`, the live `title`).
+   * `discussions`: chat messages whose text links it, only those the caller
+   * can read now, and only when it is inside the Artifact's server (empty
+   * otherwise); `target` is the conversation as `origin.target` names it
+   * (a reply in a thread by the thread's), `messageId` the full id, `author`
+   * who sent it (null: someone Raft has no name for here). A message whose
+   * conversation the caller has no name for is counted, not listed. Absent
+   * from Servers before it.
+   */
+  linkedFrom: passthroughObject({
+    documents: passthroughObject({
+      items: z.array(passthroughObject({ id: z.string(), title: z.string() })),
+      total: z.number().int(),
+      capped: z.boolean(),
+    }),
+    discussions: passthroughObject({
+      items: z.array(passthroughObject({ target: z.string(), messageId: z.string(), author: agentApiArtifactActorSchema.nullable() })),
+      total: z.number().int(),
+      capped: z.boolean(),
+    }),
+  }).optional(),
   /**
    * Whether the caller may push a new version of it (an agent of its own
    * server). False for another server's Artifact it reads (a public one, a
@@ -726,6 +816,15 @@ export const agentApiArtifactCommentsQuerySchema = lazySchema("agentApiArtifactC
    * lists nothing.
    */
   review: z.string().trim().min(1).optional(),
+  /**
+   * `<from>..<through>` (item positions, as a hold's `seenFrom` and `seen`
+   * give them): the comments by others a hold marked seen for the caller
+   * (shown, or passed over), those after `from` up to `through`, oldest
+   * first, paged as `all`
+   * (task #340: a held output that was cut can be listed again).
+   * Moves no read position; with `path` or `review`, only those of them.
+   */
+  held: z.string().regex(AGENT_API_ARTIFACT_HELD_RANGE).optional(),
 }));
 
 /**
@@ -815,6 +914,8 @@ export const agentApiArtifactCommentsResponseSchema = lazySchema("agentApiArtifa
    * stopped before the first of them.
    */
   unseenVersionCount: z.number().int(),
+  /** The query's `held` range the list is limited to, else null. Absent from Servers before it (task #340). */
+  held: z.string().nullable().optional(),
 }));
 
 // ---- POST /artifacts/push ----------------------------------------------------
@@ -853,7 +954,7 @@ export const agentApiArtifactPublishBodySchema = lazySchema("agentApiArtifactPub
    */
   title: z.string().optional(),
   description: z.string().optional(),
-  /** The file the Artifact opens at. Default: the base's; for a new one `index.html`, or the only file. */
+  /** The file the Artifact opens at. Default: the base's; for a new one `index.html`, else the only file, else its only HTML page (with none, its only Markdown file): artifactDefaultEntry. */
   entry: z.string().optional(),
   note: z.string().optional(),
   label: z.string().optional(),
@@ -893,7 +994,9 @@ export const agentApiArtifactMergedChangeSchema = lazySchema("agentApiArtifactMe
  * `scroll-lock`, a page whose own styles hold it to one screen, so the frame
  * shows its first screen and the reader can't scroll to the rest (Porthole's
  * `lintFiles` rule, P106/P110); `nested-frame`, a page with frames of its own,
- * which never load in Raft's frame; `bundled-library`, a pushed copy of a
+ * which never load in Raft's frame; `form`, a page with a `<form>`, which never
+ * submits in Raft's frame (no `allow-forms`; some browsers fire no submit event
+ * either), so its submit buttons do nothing; `bundled-library`, a pushed copy of a
  * common library a page may load from a library CDN instead (no `line`).
  * `path` is the file it is about (for scroll-lock the page, or a stylesheet it
  * links), `line` its line; `message` says what it found and what to do.
@@ -986,6 +1089,12 @@ export const agentApiArtifactPublishedSchema = lazySchema("agentApiArtifactPubli
    * older Servers.
    */
   check: agentApiArtifactPushCheckSchema.optional(),
+  /**
+   * The new version took a Settled Artifact back to Working (#334): the
+   * settle it ended. Absent otherwise (and from replayed or unchanged
+   * answers, and older Servers).
+   */
+  wasSettled: agentApiArtifactSettledSchema.optional(),
 }));
 
 /** 200 `missing`, or 201 published (200 with `replayed`). */
@@ -1056,6 +1165,15 @@ export const agentApiArtifactCommentBodySchema = lazySchema("agentApiArtifactCom
 }));
 
 export const AGENT_API_ARTIFACT_COMMENT_NOTICE_REASONS = ["mentioned", "subscribed"] as const;
+/**
+ * How someone told of a resolve was told (task #340): `wake`, a
+ * notice pushed at once (it wakes the agent: a note's mentions and
+ * followers); `inbox`, a notice queued without a push (the thread's author,
+ * an agent: handed over with its next wake-up, dropped after
+ * ARTIFACT_NOTICE_TTL_MS if nothing wakes it); `activity`, a person's
+ * Activity row moved without an unread (the thread's author, a person).
+ */
+export const AGENT_API_ARTIFACT_NOTICE_DELIVERIES = ["wake", "inbox", "activity"] as const;
 /**
  * A `@name` no notice went to: no person or agent of the Artifact's server
  * has that handle (`unknown_name`), the agent or person can't see the
@@ -1198,8 +1316,10 @@ export const agentApiArtifactResolveBodySchema = lazySchema("agentApiArtifactRes
 /**
  * 200: the thread as it stands. `changed` false: it already stood so, and
  * nothing was written (a resolve's note neither). Resolving tells the
- * thread's author when someone else (`notified`: an agent among them); a
- * reopen tells no one.
+ * thread's author when someone else, and only them, in their inbox without
+ * waking them (task #340: an agent's notice is queued, never
+ * pushed; a person's Activity shows it without an unread); a reopen tells no
+ * one.
  */
 export const agentApiArtifactThreadResolutionSchema = lazySchema("agentApiArtifactThreadResolutionSchema", () => passthroughObject({
   artifact: agentApiArtifactRefSchema,
@@ -1208,10 +1328,36 @@ export const agentApiArtifactThreadResolutionSchema = lazySchema("agentApiArtifa
   /** The note posted as a reply, null without one (always null for a reopen). */
   note: agentApiArtifactCommentSchema.nullable(),
   changed: z.boolean(),
-  /** Agents told: the thread's author (`resolved`) and, for a note, its mentions and the Artifact's other followers, as a reply's. */
-  notified: z.array(passthroughObject({ actor: agentApiArtifactActorSchema, reason: z.enum(["resolved", ...AGENT_API_ARTIFACT_COMMENT_NOTICE_REASONS]) })),
+  /**
+   * Who was told: the thread's author (`resolved`; an agent, or a person
+   * from Servers since task #340), and, for a note, its mentions
+   * and the Artifact's other followers (agents), as a reply's. `delivery`
+   * (AGENT_API_ARTIFACT_NOTICE_DELIVERIES): how each was told; absent from
+   * Servers before #340, which pushed the author's notice at once.
+   */
+  notified: z.array(passthroughObject({
+    actor: agentApiArtifactActorSchema,
+    reason: z.enum(["resolved", ...AGENT_API_ARTIFACT_COMMENT_NOTICE_REASONS]),
+    delivery: z.enum(AGENT_API_ARTIFACT_NOTICE_DELIVERIES).optional(),
+  })),
   /** A note's `@name`s that reached no one, as a reply's. */
   notNotified: z.array(passthroughObject({ name: z.string(), reason: z.enum(AGENT_API_ARTIFACT_NOT_NOTIFIED_REASONS) })),
+}));
+
+// ---- POST /artifacts/:artifact/settle | unsettle (#334) -----------------------
+
+/**
+ * 200: the Artifact as it stands (`artifact.settled`). `changed` false: it
+ * already stood so, and nothing was written. Settling follows the Artifact
+ * (`newlySubscribed`, as commenting does). Its other following agents (and
+ * its author, an agent) are told in a notice that is queued, never pushed
+ * (`notified`).
+ */
+export const agentApiArtifactSettlementSchema = lazySchema("agentApiArtifactSettlementSchema", () => passthroughObject({
+  artifact: agentApiArtifactSummarySchema,
+  changed: z.boolean(),
+  newlySubscribed: z.boolean(),
+  notified: z.array(passthroughObject({ actor: agentApiArtifactActorSchema, reason: z.string() })),
 }));
 
 // ---- POST /artifacts/:artifact/home, DELETE /artifacts/:artifact ---------------
@@ -1324,6 +1470,7 @@ export type AgentApiArtifactListItem = z.infer<typeof agentApiArtifactListItemSc
 export type AgentApiArtifactParams = z.infer<typeof agentApiArtifactParamsSchema>;
 export type AgentApiArtifactReadQuery = z.infer<typeof agentApiArtifactReadQuerySchema>;
 export type AgentApiArtifactReadResponse = z.infer<typeof agentApiArtifactReadResponseSchema>;
+export type AgentApiArtifactLinkedFrom = NonNullable<AgentApiArtifactReadResponse["linkedFrom"]>;
 export type AgentApiArtifactFileParams = z.infer<typeof agentApiArtifactFileParamsSchema>;
 export type AgentApiArtifactFileQuery = z.infer<typeof agentApiArtifactFileQuerySchema>;
 export type AgentApiArtifactFileContentResponse = z.infer<typeof agentApiArtifactFileContentResponseSchema>;
@@ -1353,6 +1500,8 @@ export type AgentApiArtifactSubscriptionResponse = z.infer<typeof agentApiArtifa
 export type AgentApiArtifactCommentParams = z.infer<typeof agentApiArtifactCommentParamsSchema>;
 export type AgentApiArtifactResolveBody = z.infer<typeof agentApiArtifactResolveBodySchema>;
 export type AgentApiArtifactThreadResolution = z.infer<typeof agentApiArtifactThreadResolutionSchema>;
+export type AgentApiArtifactSettled = z.infer<typeof agentApiArtifactSettledSchema>;
+export type AgentApiArtifactSettlement = z.infer<typeof agentApiArtifactSettlementSchema>;
 export type AgentApiArtifactMoveBody = z.infer<typeof agentApiArtifactMoveBodySchema>;
 export type AgentApiArtifactMoved = z.infer<typeof agentApiArtifactMovedSchema>;
 export type AgentApiArtifactDeleted = z.infer<typeof agentApiArtifactDeletedSchema>;
@@ -1449,7 +1598,7 @@ export const agentApiAssistantOwnerArtifactPublishBodySchema = lazySchema("agent
   /** Required for a new Artifact; for a new version, a new title with nothing else changed renames it. */
   title: z.string().optional(),
   description: z.string().optional(),
-  /** The file it opens at. Default: the base's; for a new one index.html, or the only file. */
+  /** The file it opens at. Default: the base's; for a new one index.html, else the only file, else its only HTML page (with none, its only Markdown file). */
   entry: z.string().optional(),
   /** What changed in this version. */
   note: z.string().optional(),
@@ -1500,7 +1649,7 @@ export const agentApiAssistantOwnerArtifactPublishAsOwnerBodySchema = lazySchema
   /** Required for a new Artifact; for a new version, a new title with nothing else changed renames it. */
   title: z.string().optional(),
   description: z.string().optional(),
-  /** The file it opens at. Default: the base's; for a new one index.html, or the only file. */
+  /** The file it opens at. Default: the base's; for a new one index.html, else the only file, else its only HTML page (with none, its only Markdown file). */
   entry: z.string().optional(),
   /** What changed in this version. */
   note: z.string().optional(),

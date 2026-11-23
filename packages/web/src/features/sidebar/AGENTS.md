@@ -20,7 +20,9 @@ drop. One component per file, named exports, no index files.
   each section lists), `useSidebarProjection` (reveal on navigation, unread
   flags, DM list, drag projection, row counts), `useSidebarDnd` (pin / section
   / drag mutations and handlers), `useSidebarHomeEntries`,
-  `useSidebarMenuActions` (context-menu targets and actions, dialog handlers).
+  `useSidebarMenuActions` (context-menu targets and actions, dialog handlers),
+  `useSidebarBrowserInUse` (the built-in browser's marks, rows and folded
+  heads).
 - Parts: `SidebarTopBar.tsx`, `SidebarDialogs.tsx`,
   `sections/SidebarChatSections.tsx` (the Chat sections in their drag
   context), `rows/SidebarHomeEntries.tsx`,
@@ -30,7 +32,15 @@ drop. One component per file, named exports, no index files.
   slice so a message or status push re-renders one row, not the Sidebar
   (`ChannelRow`, `DmRow`, `AgentDmRow`, `SidebarPeerRowBody`,
   `ChannelUnreadSegments`, `SidebarActivityMutedMark`, `SidebarAgentMeta`,
-  `SidebarAgentActivityBadge`, `SavedNavCount`, `DraftsNavCount`);
+  `SidebarAgentActivityBadge`, `SavedNavCount`, `DraftsNavCount`,
+  `SidebarBrowserInUseMark`: the built-in browser's kept pages of a conversation
+  off screen play sound or use the mic / camera, a row's and a folded section
+  head's optional `browserInUse` prop, from `hooks/useSidebarBrowserInUse`
+  over `webPreview/browserInUseStore` (Raft Desktop's `tabs.list.onInUse`;
+  rules in `sidebarBrowserInUse.ts`: never the route's conversation, a folded
+  head's is its rows' together; also on `AgentLoungeRow`; it also publishes
+  which conversations have a row, `setBrowserMarkable`, as the shell keeps
+  a page using a device only for those);
   `SidebarCellList` and `SidebarRowsSkeleton` (raft-ui SidebarItems with an
   avatar or a glyph-box lead; also the boot frame's); `sidebarRowClasses.ts`
   (`sidebarItemClass`, `SIDEBAR_ROW_TRAILING_CLASS`, and
@@ -74,7 +84,7 @@ drop. One component per file, named exports, no index files.
   visibility, focus, collapsed-state and row-count helpers
   (`sidebarChannelVisibility`, `sidebarChannelFocus`,
   `sidebarCollapsedSections`, `sidebarSectionRowCounts`,
-  `sidebarEmptySectionVisibility`, `sidebarContextMenuPosition`,
+  `sidebarEmptySectionVisibility`,
   `sidebarDmContext`, `sidebarMachineOrder`, `agentDmProfileSource`), the
   custom-section dialogs (`SidebarSectionDialog`,
   `SidebarSectionAddConversationsDialog`, `SidebarSectionEmojiPicker`), the

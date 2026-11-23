@@ -11,7 +11,12 @@ export const MESSAGE_FONT_SIZE_LABEL_ID: Record<MessageBodyFontSize, MessageId> 
   lg: "settings.appearance.fontSizeLarge",
 };
 
-export type ConnectedAppsTab = "marketplace" | "installed" | "myapps";
+/**
+ * The Apps list's scope: Yours (every App this Server has) and Discover (the
+ * Marketplace's listings). The old tab names map onto them in
+ * `features/apps/appsScope.ts`.
+ */
+export type ConnectedAppsTab = "yours" | "discover";
 
 export function MessageBodyFontSizeSegmentedControl({
   value,

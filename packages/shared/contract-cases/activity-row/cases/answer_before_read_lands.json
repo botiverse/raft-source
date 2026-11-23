@@ -1,0 +1,28 @@
+{
+  "formatVersion": 1,
+  "id": "answer_before_read_lands",
+  "rule": "position",
+  "title": "An answer the server computed before the viewer's read, arriving after it, does not bring the read unread back",
+  "why": "The row keeps the highest seq the viewer read (readSeq). Live 101 is read through 101; an answer at 101 still counting 101 as unread (and its @) was computed before the read reached the server. Every message it counted is at or below the read, so none of it is unread. Without the read seq a client with no store-level correction (the app) shows the unread again until the next answer (Lagoon, Scout, #triage:#244).",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow, applyRead, mergeAnswer: readSeq)",
+      "packages/web/src/store/inboxReadProjection.ts (projectionCoversActivity: web's store meets it today outside the shared rule)"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/data/ActivityRowPosition.kt (reduceActivityRow: readSeq)"
+    ]
+  },
+  "given": { "row": { "unreadCount": 0, "hasMention": false, "position": "100", "mentionOnly": false } },
+  "steps": [
+    { "act": "liveMessage", "seq": "101", "counts": true, "mentionsViewer": true },
+    { "act": "read", "seq": "101" },
+    { "act": "answer", "row": { "unreadCount": 1, "hasMention": true, "position": "101", "mentionOnly": false } }
+  ],
+  "checkpoints": [
+    { "afterStep": 1, "row": { "unreadCount": 1, "hasMention": true, "position": "101" }, "reread": false },
+    { "afterStep": 2, "row": { "unreadCount": 0, "hasMention": false, "position": "101" }, "reread": false }
+  ],
+  "expect": { "row": { "unreadCount": 0, "hasMention": false, "position": "101", "mentionOnly": false }, "reread": false }
+}

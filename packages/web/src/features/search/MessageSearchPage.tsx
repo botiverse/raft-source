@@ -26,7 +26,7 @@ import { usePagePullToRefresh } from "../../hooks/usePagePullToRefresh";
 import { PagePullToRefreshIndicator } from "../../components/ui/PagePullToRefreshIndicator";
 import { useShortcutBinding } from "../shortcuts/useShortcutBinding";
 import type { SearchEntityResult as SearchEntityRecord } from "./searchEntities";
-import { captureSearchState, getSearchStateStorageKey } from "./searchHome";
+import { captureSearchState, getSearchStateStorageKey, searchFilterBarShown, searchHomeFilterConversationId } from "./searchHome";
 import { AppSearchFailed, AppSearchGroupSection } from "./AppSearchGroupSection";
 import { OVERLAY_ALL_RESULTS_KEY, OVERLAY_MESSAGE_PREVIEW_LIMIT } from "./searchConstants";
 import { lastOpenedResultKeys } from "./searchSnapshot";
@@ -51,7 +51,7 @@ import { SearchEverywhereRow } from "./SearchEverywhereRow";
 import { SearchHomeContent } from "./SearchHomeContent";
 import { SearchOverlayHead } from "./SearchOverlayHead";
 import { SearchNoResultsState } from "./SearchNoResultsState";
-import { SearchEntityResultsSection } from "./SearchEntityResultsSection";
+import { SearchEntityResultsIncompleteNote, SearchEntityResultsSection } from "./SearchEntityResultsSection";
 import { SearchMessageResultsSection } from "./SearchMessageResultsSection";
 import { SearchLoadMoreFooter } from "./SearchLoadMoreFooter";
 import { SearchChannelContextMenu } from "./SearchChannelContextMenu";
@@ -146,7 +146,6 @@ export function MessageSearchPage({ activateResultsInChat = false, overlayChrome
   const inputRef = useRef<HTMLInputElement>(null);
   const searchScrollKey = `${serverId ?? ""}|${JSON.stringify(captureSearchState(visibleSearchParams))}`;
   const { viewportRef, rememberViewportScroll, searchSurfaceRef } = useSearchViewportScroll(searchSurface, searchScrollKey);
-  const filtersPortalRef = useRef<HTMLDivElement>(null);
   const resultClickTimerRef = useRef<number | null>(null);
   const entityResultClickTimerRef = useRef<number | null>(null);
   const pendingEntityResultRef = useRef<SearchEntityRecord | null>(null);
@@ -165,6 +164,10 @@ export function MessageSearchPage({ activateResultsInChat = false, overlayChrome
   // history + frequent sections; filters wait until there is a query.
   // oxlint-disable-next-line react-doctor/no-event-handler -- same YMNNE-family taint as hasSearchIntent above (it is derived from it); a render-time boolean, no Effect, no setState.
   const overlayHome = overlayChrome && !hasSearchIntent;
+  const showFilterBar = searchFilterBarShown({ overlayHome, deferUntilQuery, hasActiveFilters });
+  // ⌘F in a channel opens the overlay home filtered to it (#triage:#542): its home is then that conversation's
+  // (search it), not recent conversations, until the person clears the filter.
+  const homeFilterConversationId = searchHomeFilterConversationId({ scoped: !!scope, overlayHome, deferUntilQuery, channelFilterParam });
   const { skipNextSearchStateRestoreRef, selectRestoredQueryRef } = useSearchStatePersistence({
     scope,
     location,
@@ -285,19 +288,25 @@ export function MessageSearchPage({ activateResultsInChat = false, overlayChrome
     senderIdParam,
     scopes,
     formatMessage,
-    filtersPortalRef,
   });
 
   const {
     frequentSearchEntities,
     recentConversationEntities,
     recentConversationRows,
-    rankedEntityResults,
+    entityGroups,
     entityResults,
+    entityResultsIncomplete,
+    entityResultsPending,
+    entityResultsRetrying,
+    loadMoreEntityGroup,
+    retryEntityGroups,
   } = useSearchEntityResults({
     query,
+    isComposing,
+    serverId,
     scope,
-    overlayHome,
+    overlayHome: overlayHome && !homeFilterConversationId,
     location,
     searchEntityUsage,
     channels,
@@ -435,10 +444,9 @@ export function MessageSearchPage({ activateResultsInChat = false, overlayChrome
   const {
     showAllResultsAction,
     exactDestination,
-    remainingEntityResults,
-    entityListExpanded,
-    visibleEntityResults,
-    toggleEntityResults,
+    remainingEntityCount,
+    visibleEntityGroups,
+    toggleEntityGroup,
     selectableResults,
     selectedResultKey,
     entityResultsListRef,
@@ -449,7 +457,7 @@ export function MessageSearchPage({ activateResultsInChat = false, overlayChrome
     query,
     serverId,
     searchSurface,
-    rankedEntityResults,
+    entityGroups,
     entityResults,
     recentConversationRows,
     appHits,
@@ -471,10 +479,14 @@ export function MessageSearchPage({ activateResultsInChat = false, overlayChrome
     openResultInChat,
   });
 
-  const totalResults = entityResults.length + appHits.length + results.length;
+  const entityTotal = remainingEntityCount + (exactDestination ? 1 : 0);
+  const totalResults = entityTotal + appHits.length + results.length;
   // "No results" only once every part has answered and none has anything or
-  // failed: an app group still searching may yet have hits, a failed one says so itself.
-  const showNoResults = !loading && totalResults === 0 && !searchError && !appSearchPending && !appSearchFailed;
+  // failed: an app or core group still searching may yet have hits, a failed one says so itself.
+  // Core groups that failed with nothing loaded matching: the incomplete line
+  // says why, and the empty state says only the loaded ones were searched.
+  const showNoResults = !loading && totalResults === 0 && !searchError && !appSearchPending && !appSearchFailed
+    && !entityResultsPending;
   const boundaryKey = `${queryParam}|${senderIdParam}|${scopes.join(",")}|${timeRange}|${sort}|${searchNonce}|${channelIdParam}`;
   const showInitialSkeleton = loading && entityResults.length === 0 && results.length === 0 && !searchError;
   // A plan with a history window says so on every search, before anything is
@@ -552,25 +564,27 @@ export function MessageSearchPage({ activateResultsInChat = false, overlayChrome
   // dropped there (it was clipped to "Ctrl+" in the narrow field anyway).
   // The conversation a scoped search is in, as the hits name theirs: #channel
   // or @person.
+  // The conversation search is limited to: a conversation's own search's scope, or the channel ⌘F filtered to.
+  const homeConversationId = scope?.id ?? homeFilterConversationId;
   const scopeConversation = useMemo(() => {
-    if (!scope) return null;
-    if (scope.kind === "dm") {
-      const dm = dmChannels.find((channel) => channel.id === scope.id);
+    if (!homeConversationId) return null;
+    const dm = dmChannels.find((channel) => channel.id === homeConversationId);
+    if (scope?.kind === "dm" || dm) {
       return `@${dm?.peerDisplayName || dm?.peerName || dm?.name || formatMessage({ id: "search.channel" })}`;
     }
     const lists = { channels, dmChannels, loungeChannels };
-    const channel = findStoredChannel(lists, scope.id);
+    const channel = findStoredChannel(lists, homeConversationId);
     // A scope in an agent's Lounge names the Lounge, as its header does.
-    const loungeAgentId = findLoungeAgentId(lists, scope.id);
+    const loungeAgentId = findLoungeAgentId(lists, homeConversationId);
     if (loungeAgentId) {
       const name = loungeAgentDisplayName(agents.find((agent) => agent.id === loungeAgentId), channel?.name ?? "");
       return formatMessage({ id: "agent.lounge.title" }, { name });
     }
     return `#${channel?.name ?? formatMessage({ id: "search.channel" })}`;
-  }, [agents, channels, dmChannels, formatMessage, loungeChannels, scope]);
+  }, [agents, channels, dmChannels, formatMessage, homeConversationId, loungeChannels, scope?.kind]);
   const searchPlaceholder = overlayChrome
     ? formatMessage({ id: "search.overlay.placeholder" })
-    : scopeConversation
+    : scope && scopeConversation
       ? formatMessage({ id: "search.scoped.placeholder" }, { conversation: scopeConversation })
       : formatMessage({ id: "search.placeholder" }, { shortcutHint: isTouchSearchHome ? "" : shortcutHint }).trim();
   // Searching everywhere is the Search tab's job: switch to it with the same
@@ -609,14 +623,13 @@ export function MessageSearchPage({ activateResultsInChat = false, overlayChrome
         field={searchFieldInner}
       />
 
-      {overlayHome ? null : (
+      {showFilterBar ? (
         <SearchFilterBar
-          filtersPortalRef={filtersPortalRef}
           overlayChrome={overlayChrome}
           filters={filters}
           senderIdParam={senderIdParam}
           scopes={scopes}
-          scopeConversation={scopeConversation}
+          scopeConversation={scope ? scopeConversation : null}
           channelIdParam={channelIdParam}
           channels={channels}
           dmChannels={dmChannels}
@@ -626,7 +639,7 @@ export function MessageSearchPage({ activateResultsInChat = false, overlayChrome
           query={query}
           hasActiveFilters={hasActiveFilters}
         />
-      )}
+      ) : null}
 
       {/* raft-ui ScrollArea: the element the scroll memory, the tab-root
           re-tap and pull to refresh read and scroll. raft-ui
@@ -648,7 +661,7 @@ export function MessageSearchPage({ activateResultsInChat = false, overlayChrome
         {!hasSearchIntent ? (
           <SearchHomeContent
             historyNotice={historyNotice}
-            scoped={!!scope}
+            scoped={!!homeConversationId}
             scopeConversation={scopeConversation}
             overlayHome={overlayHome}
             hasRecentConversations={recentConversationEntities.length > 0}
@@ -679,9 +692,16 @@ export function MessageSearchPage({ activateResultsInChat = false, overlayChrome
               </SearchOverlayHead>
             ) : (
               <SearchResultsSummary>
-                {loading ? formatMessage({ id: "search.searching" }) : formatMessage({ id: "search.resultsCount" }, { count: totalResults })}
+                {/* Searching… until messages and every core group have answered: the count changes once. */}
+                {loading || entityResultsPending ? formatMessage({ id: "search.searching" }) : formatMessage({ id: "search.resultsCount" }, { count: totalResults })}
               </SearchResultsSummary>
             )}
+            {/* The summary's second line (the overlay's too): only the loaded channels and people are shown. */}
+            <SearchEntityResultsIncompleteNote
+              state={entityResultsIncomplete ? "failed" : entityResultsRetrying ? "retrying" : "complete"}
+              onRetry={retryEntityGroups}
+              onRetryFocusLost={focusSearchField}
+            />
 
             {historyNotice}
 
@@ -690,22 +710,33 @@ export function MessageSearchPage({ activateResultsInChat = false, overlayChrome
                 query={query}
                 searchIncomplete={searchIncomplete}
                 tooBroad={continuation.tooBroad}
+                onlyLoadedEntities={entityResultsIncomplete}
                 incompleteSearchNote={incompleteSearchNote}
                 loadingMore={loadingMore}
                 onContinueSearching={loadMoreResults}
               />
             ) : (
               <>
-                {remainingEntityResults.length > 0 && (
-                  <SearchEntityResultsSection
-                    count={remainingEntityResults.length}
-                    listRef={entityResultsListRef}
-                    expanded={entityListExpanded}
-                    onToggleExpanded={toggleEntityResults}
-                  >
-                    {visibleEntityResults.map((result) => renderEntityResultRow(result))}
-                  </SearchEntityResultsSection>
-                )}
+                {/* Channels, people, computers: the local rows first, each core
+                    group's server answer in their place when it arrives. */}
+                <div ref={entityResultsListRef}>
+                  {visibleEntityGroups.map((view) => (view.rows.length > 0 ? (
+                    <SearchEntityResultsSection
+                      key={view.group.id}
+                      group={view.group.id}
+                      count={view.count}
+                      pending={view.group.pending}
+                      expanded={view.expanded}
+                      hasMore={view.group.hasMore}
+                      paging={view.group.paging}
+                      pageFailed={view.group.pageFailed}
+                      onToggleExpanded={toggleEntityGroup}
+                      onLoadMore={loadMoreEntityGroup}
+                    >
+                      {view.rows.map((result) => renderEntityResultRow(result))}
+                    </SearchEntityResultsSection>
+                  ) : null))}
+                </div>
 
                 {/* One section per group of core's search, as the answer has them. */}
                 {appSearch.state.groups.map((group) => (

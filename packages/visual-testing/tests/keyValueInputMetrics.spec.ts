@@ -17,7 +17,7 @@ const RAFT_FIELD: Metrics = { fontSize: "16px", fontWeight: "400", lineHeight: "
 // The visual host reads its mode from `?theme=dark` and renders light
 // otherwise (requestedMode in packages/web/visual-testing/VisualTestingCases.tsx).
 const CASE = (mode: Mode) =>
-  `/visual-testing.html?case=screens.members.agent-detail.runtime-connection` +
+  `/visual-testing.html?case=screens.members.agent-detail.runtime-builtin` +
   (mode === "dark" ? "&theme=dark" : "");
 
 /**
@@ -38,8 +38,7 @@ async function openRows(page: import("@playwright/test").Page, mode: Mode) {
   await page.goto(CASE(mode));
   await page.getByRole("button", { name: "Edit runtime config" }).click({ timeout: 10_000 });
   // Agent Details uses an inline editor surface (not an ARIA dialog).  Readiness
-  // is the editor's real combobox, matching the existing provider-connection
-  // metrics spec; waiting for role=dialog makes the tooth fail before measuring.
+  // is the editor's real combobox; waiting for role=dialog makes the tooth fail before measuring.
   await page.waitForSelector('[role="combobox"]', { timeout: 10_000 });
   const more = page.getByRole("button", { name: /^More$/i }).last();
   if (await more.count()) await more.click();

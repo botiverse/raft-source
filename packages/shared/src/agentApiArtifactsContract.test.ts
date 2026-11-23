@@ -77,6 +77,17 @@ test("comment images on the request: up to four ids, a comment of images alone h
   assert.deepEqual(agentApiArtifactReviewCommentSchema.parse({ path: "a.html", images: [image.fileId] }), { path: "a.html", images: [image.fileId] });
 });
 
+test("an annotation anchor's context (Porthole P152) on the request: free-form as any anchor's data (the Server keeps it cleaned or leaves it out, never refuses it)", () => {
+  const anchor = (context: unknown) => ({ type: "annotation", data: { kind: "element", label: "h2 Plans", selectors: [{ type: "CssSelector", value: "#plans" }], context } });
+  for (const context of [{ headings: ["Pricing", "Plans"], region: "Design" }, { headings: Array.from({ length: 7 }, () => "h") }, { headings: ["h".repeat(81)] }, { headings: "Pricing" }, "Pricing", null]) {
+    const sent = { body: "x", path: "a.html", anchor: anchor(context) };
+    assert.deepEqual(agentApiArtifactCommentBodySchema.parse(sent), sent, JSON.stringify(context));
+    assert.deepEqual(agentApiArtifactReviewCommentSchema.parse(sent).anchor, sent.anchor, JSON.stringify(context));
+  }
+  // And as a Server answers it, whatever an older comment holds.
+  assert.equal(agentApiArtifactCommentExcerptSchema.safeParse({ id: "c_1", author: { type: "user", name: "xxchan" }, version: 1, path: "a.html", createdAt: "2026-10-22T14:05:00.000Z", excerpt: "x", truncated: false, bodyChars: 1, anchor: anchor({ headings: "Pricing" }) }).success, true);
+});
+
 test("comment images on the answer: what the Server kept, optional on a comment and as a count on an excerpt; never SVG", () => {
   const comment = { id: "c_1", author: { type: "agent", name: "remy" }, version: 1, path: null, anchor: null, replyTo: null, body: "", createdAt: "2026-10-22T11:00:00.000Z", editedAt: null };
   assert.deepEqual(agentApiArtifactCommentSchema.parse(comment), comment, "an older Server's comment");

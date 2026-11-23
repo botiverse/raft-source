@@ -2,15 +2,15 @@ import { Button } from "@botiverse/raft-ui";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useIntl } from "react-intl";
 import { getRuntimeDisplayName, getRuntimeInfo, runtimeAvailabilitySuffix } from "@botiverse/raft-shared";
-import type { ProviderConnectionSummary, RuntimeSelectionOption } from "@botiverse/raft-shared";
+import type { RuntimeSelectionOption } from "@botiverse/raft-shared";
 import { applyRuntimeFormV2Change, initialRuntimeFormV2Values, runtimeFormV2Submission, validateRuntimeFormV2 } from "@botiverse/raft-runtime-form";
 import type { RuntimeFormV2Value, RuntimeFormV2Values } from "@botiverse/raft-runtime-form";
-import EditProviderConnectionModal from "../../components/settings/EditProviderConnectionModal";
 import ConfirmDialog from "../../components/ConfirmDialog";
 import Banner from "../../components/ui/Banner";
 import RuntimeConfigFields from "../../components/agent/RuntimeConfigFields";
 import { useRuntimeShowAllAction } from "../../components/agent/useRuntimeShowAllAction";
 import { groupRuntimePickerRows } from "../../components/agent/runtimePickerOptions";
+import { runtimePickerGuidance } from "../../utils/runtimeCapabilityHint";
 import type { RuntimePickerRow } from "../../components/agent/runtimePickerOptions";
 import RuntimeSignInNotice from "../../components/machine/RuntimeSignInNotice";
 import { DialogCardFooter, DialogCommit } from "../../components/ui/NarrowDialog";
@@ -18,7 +18,6 @@ import { useExistingAgentRuntimeOptions as useExistingAgentRuntimeSelectionOptio
 import { RUNTIME_FORM_V2_UNAVAILABLE, useRuntimeFormV2 } from "../../hooks/useRuntimeFormV2";
 import type { RuntimeFormV2State } from "../../hooks/useRuntimeFormV2";
 import { useServerPermissions } from "../../hooks/useServerPermissions";
-import { useProviderConnections } from "../../hooks/useProviderConnections";
 import { useAgentStore, useAgentDisplayState } from "../../store/agentStore";
 import type { Agent } from "../../store/agentStore";
 import { useMachineStore } from "../../store/machineStore";
@@ -27,7 +26,7 @@ import { useAuthStore } from "../../store/authStore";
 import { resolveAgentMachineRow } from "../../utils/agentMachineRow";
 import { hydrateRuntimeConfigForm } from "../../utils/runtimeConfigForm";
 import { canViewMachineRuntimeAccountUsage } from "../../utils/machineRuntimeUsageVisibility";
-import { formatRuntimeAvailabilitySuffix, formatRuntimeLabelBesideBadge, runtimeShowsExperimentalBadge } from "../../utils/runtimeAvailabilityLabel";
+import { formatRuntimeAvailabilitySuffix, formatRuntimeLabelWithStatus } from "../../utils/runtimeAvailabilityLabel";
 import { AgentModelLimitsWarning } from "./AgentModelLimitsWarning";
 import { RuntimeConfigEditorFrame } from "./RuntimeConfigEditorFrame";
 import { announceRuntimeConfigApply } from "./runtimeConfigApplyNotice";
@@ -47,20 +46,18 @@ type SwitchConfirm = { from: string; to: string; onConfirm: () => Promise<void> 
  *
  * The caller decides who may open it: the profile's rule (owner/admin's
  * editAgents or the agent's creator, never an external agent).
- * `canRestartAgent` offers Restart now in the saved toast. `runtimeOptions`:
+ * `runtimeOptions`:
  * the agent's runtime rows (`/agents/:id/runtime-options`) when the caller
  * already holds them (the profile), so the editor opens on them instead of
  * asking again; without it (Members) it reads them itself.
  */
-export function AgentRuntimeConfigEditor({ agent, canRestartAgent = false, runtimeOptions, onClose }: {
+export function AgentRuntimeConfigEditor({ agent, runtimeOptions, onClose }: {
   agent: Agent;
-  canRestartAgent?: boolean;
   runtimeOptions?: { options: RuntimeSelectionOption[]; loading: boolean };
   onClose: () => void;
 }) {
   const { formatMessage } = useIntl();
   const updateAgent = useAgentStore((s) => s.updateAgent);
-  const resetAgent = useAgentStore((s) => s.resetAgent);
   const currentServerId = useServerStore((s) => s.current?.id);
   const displayState = useAgentDisplayState(agent.id, agent);
   const isActive = displayState.isOnline || agent.status === "active";
@@ -83,7 +80,6 @@ export function AgentRuntimeConfigEditor({ agent, canRestartAgent = false, runti
   }).runtime, [agentEnvVars, agentModel, agentReasoningEffort, agentRuntime, agentRuntimeConfig]);
   // The one thing drafted here besides the v2 form's values: which runtime it edits.
   const [draftRuntime, setDraftRuntime] = useState<string>(currentRuntime);
-  const [editingProviderConnection, setEditingProviderConnection] = useState<ProviderConnectionSummary | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [switchConfirm, setSwitchConfirm] = useState<SwitchConfirm | null>(null);
@@ -96,8 +92,9 @@ export function AgentRuntimeConfigEditor({ agent, canRestartAgent = false, runti
   // as create, pre-filled by the server with this agent's values (writeOnly
   // fields blank = keep). Switching to another runtime loads that runtime's
   // create form instead (nothing to prefill, no secret to keep) and saves it as
-  // a runtime switch (task #8). A saved provider connection is edited natively
-  // (capability provider.saved_connection).
+  // a runtime switch (task #8). A leftover saved provider connection binding
+  // opens with nothing selected and the agent-local provider fields shown
+  // (useRuntimeFormV2 drops connection options and values).
   // A runtime whose admission row has no v2 marker, or a form needing client
   // capabilities this build lacks, shows the form-unavailable notice and
   // cannot be saved; a failed load shows it with a retry.
@@ -123,10 +120,11 @@ export function AgentRuntimeConfigEditor({ agent, canRestartAgent = false, runti
   const v2EditChanged = v2RuntimeSwitched
     || Boolean(v2EditDraft && v2EditInitial && JSON.stringify(v2EditDraft) !== JSON.stringify(v2EditInitial));
   // A required field whose option source is unavailable cannot be saved (option_source.status),
-  // nor a blank secret whose bound fields changed (writeOnlyKeepRequiresUnchanged).
+  // nor a blank secret whose bound fields changed (writeOnlyKeepRequiresUnchanged),
+  // nor a required field this build cannot render (it says to update Raft).
   const v2EditBlocked = runtimeFormV2Edit.status === "ready" && v2EditValues !== null
     && Object.values(validateRuntimeFormV2(runtimeFormV2Edit.form, runtimeFormV2Edit.sources, v2EditValues, { editing: !v2RuntimeSwitched }))
-      .some((code) => code === "source_unavailable" || code === "secret_reentry_required");
+      .some((code) => code === "source_unavailable" || code === "secret_reentry_required" || code === "unsupported_required");
   // The runtime must still be selectable here: its Computer capability can go away mid-edit.
   const draftRuntimeCanSelect = draftRuntimeAdmission?.canSelectInThisContext === true;
   const saveDisabled = saving || !draftRuntimeCanSelect || runtimeFormV2Edit.status !== "ready" || !v2EditChanged || v2EditBlocked;
@@ -137,19 +135,18 @@ export function AgentRuntimeConfigEditor({ agent, canRestartAgent = false, runti
   }, [runtimeFormV2Edit, v2EditValues]);
 
   const canViewRuntimeAccountUsage = canViewMachineRuntimeAccountUsage(agentMachine, currentUserId, capabilities);
-  // Saved Provider connections, for the v2 form's pencil (edit) action.
-  const providerConnectionCatalog = useProviderConnections(true);
   // Which runtimes the agent may switch to is the server's rows (a deprecated
-  // runtime it offers again is one); the bundled catalog only names them.
+  // runtime it offers again is one); Experimental is the server's catalog; the
+  // bundled catalog only names them.
   const runtimePickerRows = runtimeAdmissionOptions.flatMap((option): RuntimePickerRow[] => {
     const runtimeInfo = getRuntimeInfo(option.runtimeId);
     const deprecatedHere = option.admissionReason === "deprecated";
     return runtimeInfo?.supported
       ? [{
           value: runtimeInfo.id,
-          label: formatRuntimeLabelBesideBadge(runtimeInfo.id, formatMessage, deprecatedHere),
+          label: formatRuntimeLabelWithStatus(runtimeInfo.id, formatMessage, deprecatedHere),
           availabilitySuffix: formatRuntimeAvailabilitySuffix(runtimeAvailabilitySuffix(runtimeInfo, availableRuntimes), formatMessage),
-          experimental: runtimeShowsExperimentalBadge(runtimeInfo.id, deprecatedHere),
+          ...runtimePickerGuidance(runtimeInfo.id, deprecatedHere, formatMessage),
           disabled: !option.canSelectInThisContext,
           capabilityStatus: option.capabilityStatus,
           selectable: option.canSelectInThisContext,
@@ -191,13 +188,6 @@ export function AgentRuntimeConfigEditor({ agent, canRestartAgent = false, runti
     editing: !v2RuntimeSwitched,
   }), [changeV2EditValue, runtimeFormV2Edit, v2EditServerErrors, v2EditValues, v2RuntimeSwitched]);
 
-  const closeEditingProviderConnection = useCallback(() => setEditingProviderConnection(null), []);
-  const refreshProviderConnections = providerConnectionCatalog.refresh;
-  const completeEditingProviderConnection = useCallback(async () => {
-    setEditingProviderConnection(null);
-    await refreshProviderConnections();
-  }, [refreshProviderConnections]);
-
   const save = async () => {
     setSaveError("");
     if (runtimeFormV2Edit.status !== "ready" || !v2EditValues) return;
@@ -217,7 +207,7 @@ export function AgentRuntimeConfigEditor({ agent, canRestartAgent = false, runti
       try {
         const saved = await updateAgent(agent.id, fields, restartMode ? { restartMode } : undefined);
         setV2EditDraft(null);
-        return saved.configApply;
+        return { configApply: saved.configApply, configApplyNewSession: saved.configApplyNewSession };
       } catch (err: unknown) {
         const data = (err as { response?: { data?: { error?: string; issues?: Array<{ pointer?: string }> } } }).response?.data;
         const fieldErrors: Record<string, string> = {};
@@ -242,15 +232,13 @@ export function AgentRuntimeConfigEditor({ agent, canRestartAgent = false, runti
       });
       return;
     }
-    // Reconciler step 11c (Tenny decision 1): a running agent is not
-    // interrupted. Saved without restartMode, the change applies at its next
-    // idle point (a runtime switch, or a Codex model change since `thread/resume`
-    // pins the model, on a new session: the server clears it); the toast says
-    // so and offers Restart now.
-    const newSession = v2RuntimeSwitched || (draftRuntime === "codex" && v2EditValues.model !== v2EditInitial?.model);
+    // Reconciler step 11c + #proj-runtime:#80: saved runtime config changes
+    // apply immediately (interrupting & restarting with preserved context if
+    // mid-turn) — show plain confirmation only.
     setSaving(true);
     try {
-      const configApply = await submit();
+      const { configApply, configApplyNewSession } = await submit();
+      const newSession = configApplyNewSession ?? (v2RuntimeSwitched || (draftRuntime === "codex" && v2EditValues.model !== v2EditInitial?.model));
       onClose();
       announceRuntimeConfigApply({
         configApply,
@@ -258,7 +246,6 @@ export function AgentRuntimeConfigEditor({ agent, canRestartAgent = false, runti
         agentName: agent.displayName || agent.name,
         newSession,
         formatMessage,
-        ...(canRestartAgent && !agent.deletedAt ? { restartNow: (mode: "restart" | "session") => resetAgent(agent.id, mode) } : {}),
       });
     } catch {
       // Shown beside the fields and in the banner.
@@ -288,18 +275,6 @@ export function AgentRuntimeConfigEditor({ agent, canRestartAgent = false, runti
       title={formatMessage({ id: "agent.detail.editRuntimeConfig" })}
       onClose={onClose}
       surfaceRef={surfaceRef}
-      // Opened from the editor's provider picker: inside the editor's tree, so it stacks over it (layer 1, as the
-      // editor), and Esc closes only it.
-      nested={editingProviderConnection ? (
-        <EditProviderConnectionModal
-          key={editingProviderConnection.id}
-          connection={editingProviderConnection}
-          providerOptions={providerConnectionCatalog.providerOptions}
-          onClose={closeEditingProviderConnection}
-          onCompleted={completeEditingProviderConnection}
-          layer={1}
-        />
-      ) : null}
     >
       <form
         className="stack-y-4"
@@ -314,8 +289,8 @@ export function AgentRuntimeConfigEditor({ agent, canRestartAgent = false, runti
           runtimeOptions={runtimePicker.options}
           runtimeBelowDescription={runtimeBelowDescription}
           runtimeListAction={runtimeListAction}
-          providerConnections={providerConnectionCatalog.connections}
-          onEditProviderConnection={capabilities.manageExternalAuth ? setEditingProviderConnection : undefined}
+          upgradeServerId={currentServerId}
+          upgradeMachineId={agentMachine?.id}
           runtimeFormV2={runtimeFormV2EditProps}
         />
         {agent.modelLimits?.defaultsReported && draftRuntime === "builtin" && !v2EditChanged && <AgentModelLimitsWarning />}

@@ -141,6 +141,7 @@ test("identity unlink keeps at least one established login method and is owner-b
   assert.equal(blockedLastIdentity.status, 409);
   assert.deepEqual(await blockedLastIdentity.json(), {
     code: "PASSWORD_CREDENTIAL_REQUIRED",
+    errorCode: "PASSWORD_CREDENTIAL_REQUIRED",
     error: "Set a password before disconnecting your final sign-in account.",
   });
   assert.equal((await getDb().select({ id: userAuthIdentities.id }).from(userAuthIdentities).where(and(

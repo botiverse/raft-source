@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { getDb } from "../db/index";
 import { users } from "../db/schema";
-import { createServer, updateServerOnboardingAgent } from "./serverService";
+import { createServer, linkOfficialOnboardingAgent } from "./serverService";
 import { createAgent } from "./agentService";
 import { startOnboardingBriefingOnActivation } from "./onboardingBriefingOnActivation";
 import type { AgentOrchestrator } from "./agentOrchestrator";
@@ -48,7 +48,7 @@ test("a computer coming back briefs the onboarding agent — no HTTP route, no w
     const owner = await seedUser("brief-owner");
     const server = await createServer("Brief", `brief-${randomUUID()}`, owner.id);
     const cindy = await createAgent(server.id, "cindy", { runtime: "claude" });
-    await updateServerOnboardingAgent(server.id, cindy.id);
+    await linkOfficialOnboardingAgent(server.id, cindy.id);
 
     const trigger = vi.fn(async () => true);
     const stop = startOnboardingBriefingOnActivation({
@@ -108,7 +108,7 @@ test("a failing briefing does not take the reconnect down with it", async ({ app
     const owner = await seedUser("brief-throw");
     const server = await createServer("Throw", `throw-${randomUUID()}`, owner.id);
     const cindy = await createAgent(server.id, "cindy", { runtime: "claude" });
-    await updateServerOnboardingAgent(server.id, cindy.id);
+    await linkOfficialOnboardingAgent(server.id, cindy.id);
 
     const errors: string[] = [];
     const stop = startOnboardingBriefingOnActivation({
@@ -140,7 +140,7 @@ test("the owner facts go over on EVERY wake — even long after onboarding finis
     const owner = await seedUser("brief-facts");
     const server = await createServer("Facts", `facts-${randomUUID()}`, owner.id);
     const cindy = await createAgent(server.id, "cindy", { runtime: "claude" });
-    await updateServerOnboardingAgent(server.id, cindy.id);
+    await linkOfficialOnboardingAgent(server.id, cindy.id);
 
     const facts = vi.fn(async () => true);
     const stop = startOnboardingBriefingOnActivation({

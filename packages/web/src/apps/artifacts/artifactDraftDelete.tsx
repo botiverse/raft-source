@@ -5,12 +5,14 @@ import { useIntl } from "react-intl";
 import type { ArtifactCommentDraft } from "@botiverse/raft-shared";
 
 import ConfirmDialog from "../../components/ConfirmDialog";
-import { closeToast, showToast } from "../../components/toastBridge";
+import { useToast } from "@botiverse/raft-ui";
+import { useOwnerDocument } from "../../utils/ownerDocument";
 import { anchorLabel } from "./ArtifactActorParts";
 import type { DraftHistoryStep } from "./artifactDraftHistory";
 import { focusArtifactSurface, focusDraftWhenDrawn } from "./artifactRestoredFocus";
 import { draftFromBody, shortQuote } from "./artifactComments";
 import { useArtifactReview } from "./ArtifactReviewContext";
+import { POLITE_ERROR } from "./artifactToasts";
 
 /** How much of a draft's words name it (its Edit and Delete buttons, #148 follow-up). */
 const EXCERPT_CHARS = 40;
@@ -54,6 +56,9 @@ export function useDeleteDraft({ onAsked, askFirst = false }: {
   askFirst?: boolean;
 } = {}): [(draft: ArtifactCommentDraft) => Promise<boolean>, ReactNode] {
   const { formatMessage } = useIntl();
+  // The window the draft is drawn in (an object window's own, #337 PR3): its toasts and its focus.
+  const toast = useToast();
+  const doc = useOwnerDocument();
   const review = useArtifactReview();
   const removeDraft = review?.removeDraft;
   const undoStep = review?.history.undoStep;
@@ -63,27 +68,25 @@ export function useDeleteDraft({ onAsked, askFirst = false }: {
   const said = useCallback((step: DraftHistoryStep | null) => {
     const title = formatMessage({ id: "artifacts.review.draftDeleted" });
     if (!step || !undoStep || !watch) {
-      showToast({ title, type: "success" });
+      toast.success(title);
       return;
     }
-    const toastId = showToast({
-      title,
-      type: "success",
-      actionProps: {
-        children: formatMessage({ id: "artifacts.review.undo" }),
+    const toastId = toast.success(title, {
+      action: {
+        label: formatMessage({ id: "artifacts.review.undo" }),
         // This deletion, wherever it is in the history now (a failure toasts as any undo's); the
         // toast goes with it, so focus moves to the draft made again, or to the Artifact surface
         // where nothing here draws it (pressed by keyboard, it would be left on nothing):
         // artifactRestoredFocus.
         onClick: () => {
           void undoStep(step).then((madeAgain) => {
-            if (madeAgain) focusDraftWhenDrawn(madeAgain, step.draft.replyTo !== null);
+            if (madeAgain) focusDraftWhenDrawn(madeAgain, step.draft.replyTo !== null, doc);
           });
         },
       },
     });
-    watch(step, () => closeToast(toastId));
-  }, [formatMessage, undoStep, watch]);
+    watch(step, () => toast.dismiss(toastId));
+  }, [formatMessage, undoStep, watch, toast, doc]);
   const remove = useCallback(async (draft: ArtifactCommentDraft) => {
     if (!removeDraft) return false;
     if (askFirst || hasImages(draft)) return new Promise<boolean>((resolve) => setConfirming({ draft, resolve }));
@@ -91,12 +94,12 @@ export function useDeleteDraft({ onAsked, askFirst = false }: {
     try {
       step = await removeDraft(draft.id);
     } catch {
-      showToast({ title: formatMessage({ id: "artifacts.review.deleteFailed" }), type: "error" });
+      toast.error(formatMessage({ id: "artifacts.review.deleteFailed" }), POLITE_ERROR);
       return false;
     }
     said(step);
     return true;
-  }, [removeDraft, formatMessage, said, askFirst]);
+  }, [removeDraft, formatMessage, said, askFirst, toast]);
   // A failure throws to the dialog, which keeps itself open with its error; done, it closes.
   const confirm = useCallback(async () => {
     if (!confirming || !removeDraft) return;
@@ -116,10 +119,10 @@ export function useDeleteDraft({ onAsked, askFirst = false }: {
       // focusing again whatever had focus as it began, if still there (a header button, when the
       // dialog's own focus hadn't arrived yet): so the surface takes it after the commit, as Base
       // UI's own return focus does (a microtask).
-      queueMicrotask(focusArtifactSurface);
+      queueMicrotask(() => focusArtifactSurface(doc));
     }
     return false;
-  }, []);
+  }, [doc]);
   const close = useCallback(() => {
     confirming?.resolve(false);
     setConfirming(null);

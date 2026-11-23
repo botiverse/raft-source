@@ -1,16 +1,11 @@
 {
   "protocolVersion": 1,
   "runtimeId": "antigravity",
-  "schemaVersion": "antigravity.edit.v1",
+  "schemaVersion": "antigravity.create.v1",
   "sourceId": "model",
   "kind": "select",
   "pointer": "/model",
   "options": [
-    {
-      "value": "default",
-      "label": "AGY configured default",
-      "supportedReasoningEfforts": []
-    },
     {
       "value": "gemini-3.8-flash",
       "label": "Gemini 3.8 Flash",
@@ -27,7 +22,7 @@
       "supportedReasoningEfforts": []
     }
   ],
-  "defaultValue": "default",
+  "defaultValue": "gemini-3.8-flash",
   "customValueAllowed": true,
   "status": "live"
 }

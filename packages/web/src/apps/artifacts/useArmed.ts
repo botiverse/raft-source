@@ -3,6 +3,7 @@ import { useEffect, useEffectEvent, useState } from "react";
 import { flushSync } from "react-dom";
 
 import { PAGE_COMMENT_ARM_MS } from "./artifactPageComments";
+import { useOwnerTimers } from "../../utils/ownerDocument";
 
 /**
  * True for PAGE_COMMENT_ARM_MS after `key` changes (a view the page's report brought), from its
@@ -21,11 +22,13 @@ export function useArmed(key: number | string | null, onDisarmed?: () => void): 
     flushSync(() => setDisarmed(done));
     onDisarmed();
   });
+  // The view's own window's timer: an object window's runs while the main window is hidden (#337 PR3).
+  const timers = useOwnerTimers();
   useEffect(() => {
     if (key === null) return;
     // A timer, not an event: the guard is a fixed time from when the view appeared.
-    const timer = window.setTimeout(() => disarm(key), PAGE_COMMENT_ARM_MS);
-    return () => window.clearTimeout(timer);
-  }, [key]);
+    const timer = timers.setTimeout(() => disarm(key), PAGE_COMMENT_ARM_MS);
+    return () => timers.clearTimeout(timer);
+  }, [key, timers]);
   return key !== null && disarmed !== key;
 }

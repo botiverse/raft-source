@@ -121,6 +121,7 @@ test("GET /messages/sync rejects a since_horizon that is not a decimal xid8", as
     assert.deepEqual(await res.json(), {
       error: "since_horizon must be the decimal string of a non-negative 64-bit transaction id",
       code: "invalid_since_horizon",
+      errorCode: "invalid_since_horizon",
     });
   }
   // A repeated parameter arrives as an array: refused too.
@@ -268,6 +269,89 @@ test("socket sync:resume carries horizon / late messages / horizonReset; sync:ho
       assert.deepEqual(reset.messages, []);
       assert.equal(reset.horizonReset, true);
       assert.equal(reset.currentSeq, b.seq);
+    } finally {
+      __setSyncLateCapForTests(null);
+    }
+  } finally {
+    await closeSocket(ws);
+  }
+});
+
+test("socket sync:resume heldIds: the late arm leaves out the messages the client already got live; nothing else changes", async ({ app, seed, db }) => {
+  const owner = await seed.human();
+  const server = await seed.server({ owner });
+  const channel = await seed.channel({ server, members: [owner] });
+  const m0 = await seed.message({ channel, author: owner, content: "m0" });
+  const heldSeq = await reserveSeq(db);
+  const otherSeq = await reserveSeq(db);
+  const thirdSeq = await reserveSeq(db);
+  const b = await seed.message({ channel, author: owner, content: "b" });
+
+  const { ws, packets } = rawSocket(app.baseUrl, { token: await accessTokenForTest(owner.id), serverId: server.id });
+  let resumes = 0;
+  const resume = async (payload: Record<string, unknown>) => {
+    const before = packets.filter((p) => p.includes('"sync:resume:response"')).length;
+    ws.send(`42${JSON.stringify(["sync:resume", payload])}`);
+    resumes += 1;
+    await waitPacket(ws, packets, () => packets.filter((p) => p.includes('"sync:resume:response"')).length > before, `resume ${resumes}`);
+    return JSON.parse(packets.filter((p) => p.includes('"sync:resume:response"'))[before]!.slice(2))[1] as ResumeResponse;
+  };
+
+  try {
+    await waitPacket(ws, packets, (p) => p.includes('"rooms:joined"'), "rooms:joined");
+    const first = await resume({ lastSeq: m0.seq });
+    assert.deepEqual(first.messages.map((m) => m.id), [b.id]);
+
+    // Two messages commit late, below the cursor; the client got `held` live.
+    const held = await insertLate(db, { seq: heldSeq, channelId: channel.id, senderId: owner.id, content: "held (late)" });
+    const other = await insertLate(db, { seq: otherSeq, channelId: channel.id, senderId: owner.id, content: "other (late)" });
+    // A page row (above the cursor) the client also lists.
+    const c = await seed.message({ channel, author: owner, content: "c" });
+    const sinceHorizon = first.horizon;
+
+    // The held late row is left out; the other late row and the page row (held or not) still come.
+    const withHeld = await resume({ lastSeq: b.seq, sinceHorizon, heldIds: [held.id, c.id, randomUUID()] });
+    assert.deepEqual(withHeld.messages.map((m) => m.id), [other.id, c.id]);
+    assert.equal(withHeld.currentSeq, c.seq);
+    assert.equal(withHeld.horizonReset, false);
+    // Upper-case ids name the same messages.
+    const upper = await resume({ lastSeq: b.seq, sinceHorizon, heldIds: [held.id.toUpperCase()] });
+    assert.deepEqual(upper.messages.map((m) => m.id), [other.id, c.id]);
+
+    // Without heldIds (an old client) or with an empty list: the full late arm.
+    const full = [held.id, other.id, c.id];
+    assert.deepEqual((await resume({ lastSeq: b.seq, sinceHorizon })).messages.map((m) => m.id), full);
+    assert.deepEqual((await resume({ lastSeq: b.seq, sinceHorizon, heldIds: [] })).messages.map((m) => m.id), full);
+
+    // An invalid list is ignored as a whole: the full late arm.
+    const tooMany = [held.id, ...Array.from({ length: 200 }, () => randomUUID())];
+    for (const bad of [held.id, { 0: held.id }, [held.id, "not-a-uuid"], [held.id, 42], tooMany]) {
+      const ignored = await resume({ lastSeq: b.seq, sinceHorizon, heldIds: bad });
+      assert.deepEqual(ignored.messages.map((m) => m.id), full, JSON.stringify(bad).slice(0, 80));
+    }
+    // Exactly at the cap is valid.
+    const atCap = [held.id, ...Array.from({ length: 199 }, () => randomUUID())];
+    assert.deepEqual((await resume({ lastSeq: b.seq, sinceHorizon, heldIds: atCap })).messages.map((m) => m.id), [other.id, c.id]);
+
+    // heldIds without sinceHorizon (or with an invalid one) means nothing: an old resume.
+    assert.deepEqual((await resume({ lastSeq: b.seq, heldIds: [c.id] })).messages.map((m) => m.id), [c.id]);
+    assert.deepEqual((await resume({ lastSeq: b.seq, sinceHorizon: "x", heldIds: [c.id] })).messages.map((m) => m.id), [c.id]);
+
+    // Held rows do not count toward the late cap: one other late row fits a cap of 1.
+    __setSyncLateCapForTests(1);
+    try {
+      const capped = await resume({ lastSeq: b.seq, sinceHorizon, heldIds: [held.id] });
+      assert.equal(capped.horizonReset, false);
+      assert.deepEqual(capped.messages.map((m) => m.id), [other.id, c.id]);
+      const reset = await resume({ lastSeq: b.seq, sinceHorizon });
+      assert.equal(reset.horizonReset, true, "without the held id two late rows exceed the cap");
+
+      // A third late row: [held, other, third] with held listed leaves two unheld rows over a cap of 1.
+      // The late read must still see past the held row (its LIMIT grows by the held ids) to tell.
+      await insertLate(db, { seq: thirdSeq, channelId: channel.id, senderId: owner.id, content: "third (late)" });
+      const overCap = await resume({ lastSeq: b.seq, sinceHorizon, heldIds: [held.id] });
+      assert.equal(overCap.horizonReset, true, "two unheld late rows exceed a cap of 1");
+      assert.deepEqual(overCap.messages.map((m) => m.id), [c.id]);
     } finally {
       __setSyncLateCapForTests(null);
     }

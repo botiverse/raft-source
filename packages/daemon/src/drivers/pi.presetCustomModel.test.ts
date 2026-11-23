@@ -47,7 +47,7 @@ test("an OpenRouter id outside the catalog registers exactly as before the share
   assert.equal(template.baseUrl, "https://openrouter.ai/api");
   const name = "raft-test-vendor/unlisted-model-2099";
   const config = presetConfig("openrouter", name);
-  assert.equal(resolvePiModelFromRegistry(name, registry, config, null), undefined, "not resolvable before registration");
+  assert.equal(resolvePiModelFromRegistry(name, registry, config), undefined, "not resolvable before registration");
 
   const { modelLimits } = configureBuiltInPresetCustomModel(registry, config);
   assert.deepEqual(modelLimits, {
@@ -75,7 +75,7 @@ test("an OpenRouter id outside the catalog registers exactly as before the share
       ...(template.compat ? { compat: template.compat } : {}),
     }],
   });
-  const model = resolvePiModelFromRegistry(name, registry, config, null);
+  const model = resolvePiModelFromRegistry(name, registry, config);
   assert.ok(model);
   assert.deepEqual(model, before.find("openrouter", name));
   assert.equal(model.reasoning, true);
@@ -89,7 +89,7 @@ test("declared limits win, and an id the catalog lists keeps its catalog metadat
   const declared = configureBuiltInPresetCustomModel(registry, presetConfig("openrouter", listed.id, { contextWindow: 64_000 }));
   assert.deepEqual(declared.modelLimits?.contextWindow, { value: 64_000, source: "agent_config" });
   assert.deepEqual(declared.modelLimits?.maxTokens, { value: listed.maxTokens, source: "catalog" });
-  const model = resolvePiModelFromRegistry(listed.id, registry, presetConfig("openrouter", listed.id), null);
+  const model = resolvePiModelFromRegistry(listed.id, registry, presetConfig("openrouter", listed.id));
   assert.equal(model?.name, listed.name);
   assert.equal(model?.reasoning, listed.reasoning);
 });
@@ -102,18 +102,14 @@ test("a typed name never resolves to another provider's model of the same name",
   assert.ok(other);
   const name = `${other.provider}/${other.id}`;
   const config = presetConfig("openrouter", name);
-  assert.equal(resolvePiModelFromRegistry(name, registry, config, null), undefined);
+  assert.equal(resolvePiModelFromRegistry(name, registry, config), undefined);
 });
 
-test("a preset provider takes a typed model; a saved connection only with its launch projection", () => {
+test("a preset provider takes a typed model", () => {
   const resolved = resolveBuiltInPresetCustomModel(presetConfig("openrouter", "a/b"));
   assert.equal(resolved?.providerId, "openrouter");
   assert.equal(resolved?.modelId, "a/b");
   assert.equal(resolveBuiltInPresetCustomModel(presetConfig("qwen-token-plan", "qwen4-preview"))?.modelId, "qwen4-preview");
-  assert.equal(resolveBuiltInPresetCustomModel({
-    ...presetConfig("openrouter", "a/b"),
-    provider: { kind: "connection", connectionId: "c1" },
-  } as RuntimeConfig), null, "without the connection's launch projection");
 });
 
 test("the Built-in catalog advertises the preset providers that accept a typed model", async () => {
@@ -124,8 +120,6 @@ test("the Built-in catalog advertises the preset providers that accept a typed m
     assert.ok(reported?.includes(providerId), providerId);
   }
   assert.deepEqual(reported, [...BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS]);
-  // ...and runs them through a saved connection to those providers too.
-  assert.deepEqual(outcome.kind === "live" ? outcome.value.catalog?.customModelConnectionProviderIds : undefined, reported);
 });
 
 function qwenConfig(providerId: "qwen-token-plan" | "qwen-token-plan-cn", name: string, limits: { contextWindow?: number; maxOutputTokens?: number } = {}): RuntimeConfig {
@@ -154,7 +148,7 @@ test("a typed Qwen Token Plan id (bare or Raft's form) runs as the bare id on th
       const siblings = registry.getAll().filter((model) => model.provider === providerId);
       assert.ok(siblings.length > 1);
       assert.ok(siblings.every((model) => model.api === "openai-completions" && model.baseUrl === baseUrl), "one transport for the whole catalog");
-      assert.equal(resolvePiModelFromRegistry("qwen4-preview", registry, config, null), undefined, "not resolvable before registration");
+      assert.equal(resolvePiModelFromRegistry("qwen4-preview", registry, config), undefined, "not resolvable before registration");
 
       const { modelLimits } = configureBuiltInPresetCustomModel(registry, config);
       // Raft's defaults (which the default-limits note names), never a sibling's 1M context.
@@ -162,7 +156,7 @@ test("a typed Qwen Token Plan id (bare or Raft's form) runs as the bare id on th
         contextWindow: { value: 200_000, source: "raft_default" },
         maxTokens: { value: 8192, source: "raft_default" },
       });
-      const model = resolvePiModelFromRegistry("qwen4-preview", registry, config, null);
+      const model = resolvePiModelFromRegistry("qwen4-preview", registry, config);
       assert.ok(model, `${providerId}: ${typed}`);
       assert.equal(model.provider, providerId);
       assert.equal(model.id, "qwen4-preview", "the provider gets its own id, never Raft's namespace");
@@ -189,7 +183,7 @@ test("reasoning for a typed id: on where every catalog model reasons (with their
   assert.ok(deepseekRegistry.getAll().filter((model) => model.provider === "deepseek").every((model) => model.reasoning));
   const deepseek = presetConfig("deepseek", "deepseek-v9");
   configureBuiltInPresetCustomModel(deepseekRegistry, deepseek);
-  const deepseekModel = resolvePiModelFromRegistry("deepseek-v9", deepseekRegistry, deepseek, null);
+  const deepseekModel = resolvePiModelFromRegistry("deepseek-v9", deepseekRegistry, deepseek);
   assert.equal(deepseekModel?.reasoning, true);
   const deepseekCompat = deepseekModel?.compat as Record<string, unknown> | undefined;
   assert.equal(deepseekCompat?.requiresReasoningContentOnAssistantMessages, true);
@@ -202,7 +196,7 @@ test("reasoning for a typed id: on where every catalog model reasons (with their
   assert.equal(builtInPresetTypedModelReasons("openai"), false);
   const openai = presetConfig("openai", "gpt-raft-test-2099");
   const { modelLimits } = configureBuiltInPresetCustomModel(openaiRegistry, openai);
-  const openaiModel = resolvePiModelFromRegistry("gpt-raft-test-2099", openaiRegistry, openai, null);
+  const openaiModel = resolvePiModelFromRegistry("gpt-raft-test-2099", openaiRegistry, openai);
   assert.equal(openaiModel?.reasoning, false);
   assert.deepEqual(openaiModel?.input, ["text"]);
   assert.equal(openaiModel?.thinkingLevelMap, undefined);
@@ -243,7 +237,7 @@ test("a typed Qwen Token Plan id takes the agent's declared limits; a listed one
     contextWindow: { value: listed.contextWindow, source: "catalog" },
     maxTokens: { value: 4096, source: "agent_config" },
   });
-  const model = resolvePiModelFromRegistry("qwen3.8-max", listedRegistry, config, null);
+  const model = resolvePiModelFromRegistry("qwen3.8-max", listedRegistry, config);
   assert.equal(model?.reasoning, listed.reasoning);
   assert.deepEqual(model?.thinkingLevelMap, listed.thinkingLevelMap);
   assert.deepEqual(model?.input, listed.input);
@@ -278,7 +272,7 @@ test("a listed OpenRouter model saved with a limit: parse -> store -> parse -> r
     const { modelLimits } = configureBuiltInPresetCustomModel(registry, stored);
     assert.deepEqual(modelLimits?.contextWindow, { value: 131_072, source: "agent_config" }, "the agent's limit wins");
     assert.deepEqual(modelLimits?.maxTokens, { value: maxTokens, source: "catalog" });
-    const model = resolvePiModelFromRegistry(piId, registry, stored, null);
+    const model = resolvePiModelFromRegistry(piId, registry, stored);
     assert.ok(model);
     assert.equal(model.id, piId, "the request model id is OpenRouter's own id, without Raft's namespace");
     assert.equal(model.provider, "openrouter");
@@ -316,7 +310,7 @@ test("the request model id is the same OpenRouter API id with and without limits
       const registry = await freshRegistry();
       configureBuiltInPresetCustomModel(registry, config);
       const modelId = config.model.kind === "custom" ? config.model.name : config.model.id;
-      const model = resolvePiModelFromRegistry(modelId, registry, config, null);
+      const model = resolvePiModelFromRegistry(modelId, registry, config);
       assert.ok(model, `${name} ${JSON.stringify(limits)}`);
       assert.equal(model.provider, "openrouter");
       assert.equal(model.id, apiId, `${name} ${JSON.stringify(limits)}: the provider gets ${apiId}`);
@@ -340,22 +334,8 @@ test("a modelOverrides entry in models.json sets a typed OpenRouter model's limi
       contextWindow: { value: 1_000_000, source: "catalog" },
       maxTokens: { value: 8192, source: "raft_default" },
     });
-    assert.equal(resolvePiModelFromRegistry(name, registry, config, null)?.contextWindow, 1_000_000, "the report is what the session runs with");
+    assert.equal(resolvePiModelFromRegistry(name, registry, config)?.contextWindow, 1_000_000, "the report is what the session runs with");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-});
-
-test("a typed id through a saved connection resolves to the connection's preset provider only", () => {
-  const throughConnection = { ...presetConfig("deepseek", "deepseek-v9"), provider: { kind: "connection", connectionId: "conn-1" } } as RuntimeConfig;
-  const projection = (providerId: string, endpointUrl: string | null = null) => ({ providerId, endpointUrl, supportsImageInput: false }) as Parameters<typeof resolveBuiltInPresetCustomModel>[1];
-  assert.equal(resolveBuiltInPresetCustomModel(throughConnection), null, "no launch projection: nothing to run it on");
-  assert.equal(resolveBuiltInPresetCustomModel(throughConnection, projection("openai-compatible", "https://gw.example.test/v1")), null, "a gateway connection registers as a gateway");
-  assert.deepEqual(resolveBuiltInPresetCustomModel(throughConnection, projection("deepseek")), {
-    providerId: "deepseek",
-    modelId: "deepseek-v9",
-    model: { kind: "custom", name: "deepseek-v9" },
-  });
-  const listed = { ...throughConnection, model: { kind: "preset", id: "deepseek/deepseek-v4-pro" } } as RuntimeConfig;
-  assert.equal(resolveBuiltInPresetCustomModel(listed, projection("deepseek")), null, "a listed model resolves from the catalog as before");
 });

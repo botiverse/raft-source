@@ -64,7 +64,7 @@ import {
 import { ALREADY_SAVED_ERROR, ATTACHMENT_NOT_FOUND_ERROR } from "./save";
 import { webNotVisible } from "./webCommon";
 import { shareAudienceLimits } from "./webShare";
-import { seedBoundGuest } from "../../test/guestFixture";
+import { seedBoundGuest, seedStrayGuestChannelRow } from "../../test/guestFixture";
 import { __answerFlagForTests } from "../../services/deploymentAnsweredFlags";
 
 const test = createApiTest();
@@ -554,7 +554,8 @@ test("share-audience: counts the members of a conversation who couldn't see the 
   const world = await seedWorld(seed);
   // #wide: owner, reader, outsider, guest, agentIn, agentOut. The page (#team) is seen by owner, reader, guest and agentIn.
   const wide = await createChannel(world.server.id, `share-wide-${label()}`, undefined, "private");
-  for (const human of [world.owner, world.reader, world.outsider, world.guest]) await addHuman(wide.id, human.id);
+  for (const human of [world.owner, world.reader, world.outsider]) await addHuman(wide.id, human.id);
+  await seedStrayGuestChannelRow({ channelId: wide.id, userId: world.guest.id });
   for (const agent of [world.agentIn, world.agentOut]) await addAgent(wide.id, agent.id);
   const res = await call(app, "GET", artifactWebPaths.shareAudience(id(world.page), { conversationId: asChannelId(wide.id) }), world.who.reader);
   assert.equal(res.status, 200, JSON.stringify(res.body));
@@ -590,7 +591,8 @@ test("share-audience: a conversation the reader can't see is 404 TARGET_NOT_FOUN
 test("share-audience: past the counting budget, `capped` with counts that are a lower bound and the exact member count", async ({ app, seed }) => {
   const world = await seedWorld(seed);
   const wide = await createChannel(world.server.id, `share-cap-${label()}`, undefined, "private");
-  for (const human of [world.owner, world.reader, world.outsider, world.guest]) await addHuman(wide.id, human.id);
+  for (const human of [world.owner, world.reader, world.outsider]) await addHuman(wide.id, human.id);
+  await seedStrayGuestChannelRow({ channelId: wide.id, userId: world.guest.id });
   for (const agent of [world.agentIn, world.agentOut]) await addAgent(wide.id, agent.id);
   shareAudienceLimits.maxCounted = 3;
   const res = await call(app, "GET", artifactWebPaths.shareAudience(id(world.page), { conversationId: asChannelId(wide.id) }), world.who.reader);

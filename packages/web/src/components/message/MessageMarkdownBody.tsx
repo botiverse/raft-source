@@ -709,6 +709,14 @@ export interface MessageMarkdownBodyProps {
   slots?: MessageMarkdownSlots;
 }
 
+/** Everything a message body is drawn with but its text and read receipts: how its
+ *  refs, mentions and links resolve and navigate. MessageItem builds it once and
+ *  draws the body, the bilingual original and a task hand-off's reason with it. */
+export type MessageMarkdownRefProps = Omit<
+  MessageMarkdownBodyProps,
+  "content" | "readReceiptChannelId" | "readReceiptMessageSeq" | "readReceiptEnabled"
+>;
+
 // Memoized markdown body. `renderContent` runs the full markdown preprocessing
 // + react-markdown parse, which the 2026-06-06 prod CPU trace showed to be ~33%
 // of main-thread JS in the message list. Wrapping it in a memo'd component lets

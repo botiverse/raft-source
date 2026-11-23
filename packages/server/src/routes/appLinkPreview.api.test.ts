@@ -344,11 +344,11 @@ test("a refused preview read records why on its trace, with the message hashed, 
   const outsiderHeaders = { Authorization: `Bearer ${await tokenForHuman(outsider.email)}`, 'X-Server-Id': server.id };
   const unknown = randomUUID();
   const missing = await fetch(`${app.baseUrl}/api/messages/${unknown}/app-link-previews`, { headers: outsiderHeaders });
-  assert.equal(missing.status, 404); assert.deepEqual(await missing.json(), { error: 'Message not found' });
+  assert.equal(missing.status, 404); assert.deepEqual(await missing.json(), { error: 'Message not found', code: 'message_not_found', errorCode: 'message_not_found' });
   const hidden = await fetch(`${app.baseUrl}/api/messages/${message.id}/link-cards/read`, {
     method: 'POST', headers: { ...outsiderHeaders, 'Content-Type': 'application/json' }, body: JSON.stringify({ view_instance_id: randomUUID(), capabilities: [], locale: 'en' }),
   });
-  assert.equal(hidden.status, 404); assert.deepEqual(await hidden.json(), { error: 'Message not found' });
+  assert.equal(hidden.status, 404); assert.deepEqual(await hidden.json(), { error: 'Message not found', code: 'message_not_found', errorCode: 'message_not_found' });
   const recorded = refusals();
   assert.equal(recorded[0]?.route_action, 'app_link_previews'); assert.equal(recorded[0]?.preview_refusal, 'not_found');
   assert.equal(recorded[1]?.route_action, 'link_cards_read'); assert.equal(recorded[1]?.preview_refusal, 'not_visible');

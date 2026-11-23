@@ -10,6 +10,10 @@ import type { ChannelMemberServer } from "./channelLocalMembership";
 export interface OriginServer {
   id: string;
   name: string;
+  /** The server's logo as the server sent it with this person (a joint
+   *  roster's `servers[].avatarUrl`, a joint channel's
+   *  `jointServers[].serverAvatarUrl`). Absent when it sent none. */
+  avatarUrl?: string;
 }
 
 /** Whether someone is from another server than the viewed one, and which servers to name. */
@@ -44,6 +48,8 @@ export interface KnownServer {
   serverId: string;
   serverName?: string | null;
   serverSlug?: string | null;
+  /** The server's logo (null for a pending server or one with no logo). */
+  serverAvatarUrl?: string | null;
 }
 
 const NO_SERVERS: readonly OriginServer[] = Object.freeze([]);
@@ -55,7 +61,8 @@ export const LOCAL_MEMBER_ORIGIN: MemberOrigin = Object.freeze({ external: false
  * Where a member is from, as seen from `viewerServerId`. External only when
  * the server said so: `inViewerServer: false`, or a `serverId` that is not
  * the viewed server's. A member with neither is the viewed server's own.
- * `knownServers` names a server the member's own fields only gave the id of.
+ * `knownServers` names a server the member's own fields only gave the id of,
+ * and gives a server's logo where the member's own fields carry none.
  */
 export function memberOrigin(
   source: MemberOriginSource | null | undefined,
@@ -74,7 +81,7 @@ export function memberOrigin(
     ? !inViewerServer
     : Boolean(home && home.id !== viewerServerId);
   if (!external) return LOCAL_MEMBER_ORIGIN;
-  const listed: Array<{ id: string; name?: string | null; slug?: string | null }> = sourceServers
+  const listed: Array<{ id: string; name?: string | null; slug?: string | null; avatarUrl?: string | null }> = sourceServers
     ? [...sourceServers]
     : home
       ? [home]
@@ -84,9 +91,26 @@ export function memberOrigin(
     if (server.id === viewerServerId || servers.some((seen) => seen.id === server.id)) continue;
     const known = knownServers?.find((candidate) => candidate.serverId === server.id);
     const name = server.name || server.slug || known?.serverName || known?.serverSlug || "";
-    if (name) servers.push({ id: server.id, name });
+    if (!name) continue;
+    const avatarUrl = server.avatarUrl || known?.serverAvatarUrl;
+    servers.push(avatarUrl ? { id: server.id, name, avatarUrl } : { id: server.id, name });
   }
   return { external: true, servers };
+}
+
+/**
+ * The logo to draw on a server's origin mark: the one the server sent with
+ * the person (OriginServer.avatarUrl), else the viewer's own copy when the
+ * viewer belongs to that server too (`joinedServers`), else null (an initial
+ * tile, or a plain dot on a small face).
+ */
+export function originServerLogo(
+  server: OriginServer | null | undefined,
+  joinedServers: readonly { id: string; avatarUrl?: string | null }[],
+): string | null {
+  if (!server) return null;
+  if (server.avatarUrl) return server.avatarUrl;
+  return joinedServers.find((candidate) => candidate.id === server.id)?.avatarUrl || null;
 }
 
 /** "Acme Corp, Lumen Labs": every server, where there is room for all of them. */

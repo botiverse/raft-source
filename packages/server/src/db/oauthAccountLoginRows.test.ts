@@ -258,6 +258,33 @@ dbTest("T13: one account consent per person and App, upserted on the partial ind
   ].sort());
 });
 
+function insertDecline(row: { userId: string; serverId: string | null; clientId: string }) {
+  return getDb().execute<{ id: string }>(sql`
+    INSERT INTO "oauth_link_preview_declines" ("id", "user_id", "server_id", "client_id")
+    VALUES (${randomUUID()}, ${row.userId}, ${row.serverId}, ${row.clientId})
+    RETURNING "id"
+  `);
+}
+
+dbTest("RFC 079 D17: a link-preview decline with no Server needs an account-mode App, one per person and App; per-Server declines of either mode coexist", async ({ seed }) => {
+  const f = await setup(seed);
+  await assert.rejects(insertDecline({ userId: f.person.id, serverId: null, clientId: f.serverApp.id }),
+    violates(CHECK_VIOLATION, "oauth_link_preview_declines_server_id_null_account_only"));
+  await idOf(insertDecline({ userId: f.person.id, serverId: null, clientId: f.accountApp.id }));
+  await assert.rejects(insertDecline({ userId: f.person.id, serverId: null, clientId: f.accountApp.id }),
+    violates(UNIQUE_VIOLATION, "idx_oauth_link_preview_declines_user_client_account"));
+  await idOf(insertDecline({ userId: f.owner.id, serverId: null, clientId: f.accountApp.id }));
+  // Declines given on a Server (before an App switched, or of a server-mode App) stay writable.
+  for (const clientId of [f.accountApp.id, f.serverApp.id]) {
+    for (const serverId of [f.server.id, f.otherServer.id]) await idOf(insertDecline({ userId: f.person.id, serverId, clientId }));
+  }
+  // A server-mode App's decline cannot become one for every Server.
+  await assert.rejects(getDb().execute(sql`
+    UPDATE "oauth_link_preview_declines" SET "server_id" = NULL
+    WHERE "user_id" = ${f.person.id} AND "client_id" = ${f.serverApp.id} AND "server_id" = ${f.server.id}
+  `), violates(CHECK_VIOLATION, "oauth_link_preview_declines_server_id_null_account_only"));
+});
+
 dbTest("rows written before an App switches to account mode survive the switch and stay writable", async ({ seed }) => {
   const f = await setup(seed);
   const app = await f.app("switched", "server");

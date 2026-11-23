@@ -10,6 +10,7 @@ import {
   loadAccountIdentitySetupPage,
   loadAgentConnectionCallbackPage,
   loadAppLoginPage,
+  loadAppStepUpPage,
   loadAppSumoRedemptionPage,
   loadAppSumoServerCreationPage,
   loadChineseCommunityPage,
@@ -40,6 +41,7 @@ export const DeviceLoginPage = lazyPanel(loadDeviceLoginPage);
 export const DeviceLoginRevokePage = lazyPanel(loadDeviceLoginRevokePage);
 export const SecondFactorRecoveryLinkPage = lazyPanel(loadSecondFactorRecoveryLinkPage);
 export const AppLoginPage = lazyPanel(loadAppLoginPage);
+export const AppStepUpPage = lazyPanel(loadAppStepUpPage);
 export const HumanLoginSetupPage = lazyPanel(loadHumanLoginSetupPage);
 export const IntegrationInvitePage = lazyPanel(loadIntegrationInvitePage);
 export const ExternalInvitePage = lazyPanel(loadExternalInvitePage);

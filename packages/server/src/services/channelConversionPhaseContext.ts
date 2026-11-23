@@ -14,7 +14,15 @@ export type ChannelConversionPhase =
   | "audience_cutover"
   | "residual_cleanup"
   | "finalize"
-  | "done";
+  | "done"
+  /**
+   * channel_conversion_online_move_v1: the start prepared everything (the
+   * canonical channel, task identity, every thread and task conversation) in
+   * its own transaction; no fence, writers are admitted, new root messages
+   * are stored in the canonical channel (onlineMoveCanonicalForRoot). The
+   * worker leaves it alone; the mover and the switch come later.
+   */
+  | "online_move";
 
 export type ChannelConversionJob = typeof channelConversionJobs.$inferSelect;
 export class ChannelConversionError extends Error {

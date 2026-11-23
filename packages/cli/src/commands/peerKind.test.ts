@@ -39,6 +39,7 @@ import { taskUnassignCommand } from "./task/unassign";
 import { taskUnclaimCommand } from "./task/unclaim";
 import { taskUpdateCommand } from "./task/update";
 import { threadFollowCommand } from "./thread/follow";
+import { focusCommand, unfocusCommand } from "./focus/focus";
 import { threadUnfollowCommand } from "./thread/unfollow";
 
 function invalidArg(pattern: RegExp) {
@@ -75,6 +76,8 @@ test("every command that takes a DM target declares --peer-kind", () => {
     "attachment upload": attachmentUploadCommand,
     "thread follow": threadFollowCommand,
     "thread unfollow": threadUnfollowCommand,
+    "focus": focusCommand,
+    "unfocus": unfocusCommand,
     "reminder schedule": reminderScheduleCommand,
     "action prepare": actionPrepareCommand,
     "task amend": taskAmendCommand,

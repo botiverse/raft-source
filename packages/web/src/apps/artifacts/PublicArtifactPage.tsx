@@ -22,7 +22,7 @@ import Tooltip from "../../components/ui/Tooltip";
 import { useMediaQuery } from "../../hooks/effectPrimitives";
 import { formatRelativeTime } from "../../utils/relativeTime";
 import { useArtifactPageDocumentTitle } from "../../utils/browserDocumentTitle";
-import { publicArtifactFrame, publicArtifactView } from "./apiArtifactSource";
+import { publicArtifactFrame, publicArtifactLinks, publicArtifactView } from "./apiArtifactSource";
 import { isArtifactDrawnKind } from "./artifactDrawnKind";
 import { PublicArtifactDrawn } from "./PublicArtifactDrawn";
 import ArtifactFrame from "./ArtifactFrame";
@@ -79,6 +79,9 @@ const publicFrame = (id: ArtifactId, version: number) => {
   const ticket = takeViewerFrame(id, version, artifactReaderScopeIn(null));
   return ticket ? Promise.resolve(ticket) : publicArtifactFrame(id);
 };
+
+/** The public links route, for the frame's link titles (the current version's; one stable function). */
+const publicLinks = (id: ArtifactId) => publicArtifactLinks(id);
 
 /**
  * Who reads the page. A visitor, not signed in: the sign-up prompt, and
@@ -440,6 +443,7 @@ export default function PublicArtifactPage({ id, version, reader, onUnavailable,
                   title={view.title}
                   pageUrl={url}
                   locate={publicFrame}
+                  links={publicLinks}
                   // No sign-in, no analytics identity: nothing is reported.
                   analytics={false}
                   onOpenInRaft={onSignIn ?? undefined}

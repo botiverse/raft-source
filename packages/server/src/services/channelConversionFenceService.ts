@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { RefusalError } from "../lib/refusal";
 import { and, eq, sql } from "drizzle-orm";
 import { getDb, isDatabaseInitialized, type DatabaseExecutor, type DatabaseTransaction } from "../db/index";
 import {
@@ -105,15 +106,21 @@ export const CHANNEL_CONVERSION_LOCK_NAMESPACE = 136;
  */
 export const ACTION_CARD_SOURCE_LOCK_NAMESPACE = 138;
 
-export class ChannelConversionInProgressError extends Error {
+/**
+ * A write to a channel under a conversion fence. A RefusalError, so a route
+ * that only ends in sendJsonServerError still answers this 409 rather than a
+ * 500 (slock issue 15637 item 4: agent sends during the freeze were 500s).
+ * Routes that catch it by name keep adding `conversionEpoch`.
+ */
+export class ChannelConversionInProgressError extends RefusalError {
   readonly code = "channel_conversion_in_progress" as const;
-  readonly status = 409 as const;
+  declare readonly status: 409;
 
   constructor(
     public readonly sourceChannelId: string,
     public readonly conversionEpoch: string,
   ) {
-    super("Channel conversion is in progress; this write must be retried after conversion completes.");
+    super(409, { code: "channel_conversion_in_progress", error: "This channel is being converted. Try again when the conversion has finished." });
     this.name = "ChannelConversionInProgressError";
   }
 }
@@ -251,7 +258,15 @@ export async function getActiveChannelConversionFence(
   return fence ?? null;
 }
 
-/** Throws the typed writer-fence error when a source is actively converting. */
+/**
+ * Throws the typed writer-fence error when a source is actively converting.
+ * Every writer fence (withChannelWriterFence, assertChannelWritableInTransaction,
+ * the upload drain, assertChannelConversionSourceFence) asks this. One active
+ * job admits writers: an online move (phase `online_move`,
+ * channel_conversion_online_move_v1), which holds no fence row by design.
+ * Writers still take the shared conversion lock, so they wait for the
+ * start, a cancel or the switch, which take it exclusively.
+ */
 export async function assertChannelConversionWritable(
   sourceChannelId: string,
   executor: DatabaseExecutor = getDb(),
@@ -259,7 +274,7 @@ export async function assertChannelConversionWritable(
   const fence = await getActiveChannelConversionFence(executor, sourceChannelId);
   if (fence) throw new ChannelConversionInProgressError(sourceChannelId, fence.conversionEpoch);
   const [activeJob] = await executor
-    .select({ conversionEpoch: channelConversionJobs.conversionEpoch, progress: channelConversionJobs.progress })
+    .select({ conversionEpoch: channelConversionJobs.conversionEpoch, progress: channelConversionJobs.progress, status: channelConversionJobs.status, phase: channelConversionJobs.phase })
     .from(channelConversionJobs)
     .where(and(
       eq(channelConversionJobs.sourceChannelId, sourceChannelId),
@@ -269,6 +284,7 @@ export async function assertChannelConversionWritable(
   const progress = activeJob?.progress;
   const rolledBack = progress && typeof progress === "object" && !Array.isArray(progress)
     && (progress as Record<string, unknown>).rollbackState === "restored";
+  if (activeJob && activeJob.phase === "online_move" && activeJob.status !== "failed") return;
   if (activeJob && !rolledBack) throw new ChannelConversionInProgressError(sourceChannelId, activeJob.conversionEpoch);
 }
 

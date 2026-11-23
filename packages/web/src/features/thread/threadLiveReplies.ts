@@ -1,4 +1,5 @@
 import type { Message } from "../../store/messageStore";
+import { hydrateLiveMessageResolvedQuotes } from "../../store/resolvedQuotesHydrationStore";
 import { mergeThreadMessages } from "./threadMessages";
 
 /** Batches the read write for a burst of live replies landing in view. */
@@ -112,6 +113,7 @@ export function subscribeThreadLiveReplies(params: {
 }): () => void {
   const seenReplyIds = new Set<string>();
   const ingest = (reply: Message) => {
+    hydrateLiveMessageResolvedQuotes(reply);
     params.onReply?.(reply);
     params.setMessages((prev) => {
       const { messages, countedNew, landedInView } = ingestThreadLiveReply({ messages: prev, seenReplyIds }, reply, params.getScroll());

@@ -16,9 +16,12 @@ import { requestSecondFactorRecovery } from "../auth/secondFactorRecovery";
 import type { LostDeviceStepUp } from "./secondFactorStepUp";
 import { useAuthStore } from "../../store/authStore";
 import { isPasskeyCancel } from "../auth/webauthn";
+import { EarlierPasskeyLink } from "../auth/EarlierPasskey";
+import { useEarlierPasskey } from "../auth/useEarlierPasskey";
+import type { PasskeyRpGroup } from "../auth/passkeyRpGroups";
 import { getApiErrorResponse } from "../../utils/apiErrorResponse";
 import Banner from "../ui/Banner";
-import { normalizeEnteredCode, secondFactorFailureOf } from "./secondFactorApi";
+import { normalizeEnteredCode, secondFactorFailureOf, startStepUpPasskeyAssertionIn } from "./secondFactorApi";
 import type { StepUpAnswer } from "./secondFactorApi";
 import { AnswerField, CancelButton, CommitButton, DoneButton, MethodLink, StepDialog, stepUpAnswerFor } from "./TwoStepVerificationSection";
 import { useAnswer, useFailureCopy } from "./secondFactorAnswer";
@@ -127,7 +130,11 @@ export default function VerifyItsYouDialog({ description, methods: listed, onAns
     </TextLink>
   ), [answer.busy, handleRequestReset]);
 
-  const submit = useCallback(async () => {
+  // After a prompt with nothing to pick, "Use an earlier passkey" asks in the other RP group (auth/useEarlierPasskey.ts).
+  const { earlier, prompt } = useEarlierPasskey();
+
+  /** `rp`: the earlier passkey's group, from its line. */
+  const submit = useCallback(async (rp?: PasskeyRpGroup) => {
     if (!method) return;
     const entered = normalizeEnteredCode(value);
     if (method !== "passkey" && !entered) return;
@@ -136,7 +143,7 @@ export default function VerifyItsYouDialog({ description, methods: listed, onAns
     setInfoBanner("");
     setSignInAgain(false);
     try {
-      await onAnswer(await stepUpAnswerFor(method, entered));
+      await onAnswer(method === "passkey" ? { webauthn: await prompt(startStepUpPasskeyAssertionIn, rp) } : await stepUpAnswerFor(method, entered));
       rememberSecondFactorMethod(method);
     } catch (err) {
       setBusy(false);
@@ -159,11 +166,14 @@ export default function VerifyItsYouDialog({ description, methods: listed, onAns
       }
       setFailure(failure);
     }
-  }, [describeFailure, formatMessage, method, onAnswer, onSignInAgain, setBusy, setFailure, value]);
+  }, [describeFailure, formatMessage, method, onAnswer, onSignInAgain, prompt, setBusy, setFailure, value]);
 
   const handleSubmit = useCallback(() => {
     void submit();
   }, [submit]);
+  const handleUseEarlierPasskey = useCallback(() => {
+    if (earlier && !answer.busy) void submit(earlier);
+  }, [answer.busy, earlier, submit]);
 
   const others = methods.filter((other) => other !== method);
 
@@ -333,7 +343,9 @@ export default function VerifyItsYouDialog({ description, methods: listed, onAns
     >
       <DialogDescription>{description}</DialogDescription>
       {/* A passkey is its Use passkey button; a code its field (no instruction or format line: HelperText step 1). */}
-      {method === "passkey" ? null : method ? (
+      {method === "passkey" ? (
+        earlier ? <EarlierPasskeyLink onUse={handleUseEarlierPasskey} disabled={answer.busy} /> : null
+      ) : method ? (
         <AnswerField
           key={method}
           kind={method}

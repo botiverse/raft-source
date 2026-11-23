@@ -1,4 +1,5 @@
 import { channelTypeSupportsActivityMute } from "@botiverse/raft-shared";
+import { sameJsonData } from "../utils/sameJsonData";
 import type { ApiChannel, Channel } from "./channelStore";
 
 export interface ChannelDomainState {
@@ -109,30 +110,37 @@ export function isLoungeChannel(channel: { loungeAgentId?: string | null } | nul
 function upsertLounge(loungeChannels: Channel[], channel: Channel): Channel[] {
   const exists = loungeChannels.some((c) => c.id === channel.id);
   return exists
-    ? loungeChannels.map((c) => (c.id === channel.id ? { ...c, ...channel } : c))
+    ? replaceRow(loungeChannels, channel.id, (c) => ({ ...c, ...channel }))
     : [...loungeChannels, channel];
+}
+
+/**
+ * The list with row `id` replaced by `next(row)`, keeping the previous record
+ * when its content is unchanged and the previous array when no row changed: a
+ * socket flood re-sends rows that did not change (#532), and a new record or
+ * array for them re-renders every subscriber.
+ */
+function replaceRow(list: Channel[], id: string, next: (row: Channel) => Channel): Channel[] {
+  let changed = false;
+  const result = list.map((row) => {
+    if (row.id !== id) return row;
+    const replaced = next(row);
+    if (sameJsonData(row, replaced)) return row;
+    changed = true;
+    return replaced;
+  });
+  return changed ? result : list;
+}
+
+/** The activity map with `id` set, or the same map when it already holds that value. */
+function withActivity(activity: Record<string, string | null>, id: string, value: string | null): Record<string, string | null> {
+  return Object.hasOwn(activity, id) && activity[id] === value ? activity : { ...activity, [id]: value };
 }
 
 export function sortChannels(channels: Channel[]): Channel[] {
   const allCh = channels.filter((c) => c.name === "all");
   const rest = channels.filter((c) => c.name !== "all");
   return [...allCh, ...rest];
-}
-
-/** Plain JSON values (what the API returns) compared by content. */
-function sameJsonValue(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
-  if (Array.isArray(a) !== Array.isArray(b)) return false;
-  if (Array.isArray(a)) {
-    const other = b as unknown[];
-    return a.length === other.length && a.every((value, index) => sameJsonValue(value, other[index]));
-  }
-  const aKeys = Object.keys(a);
-  const bRecord = b as Record<string, unknown>;
-  if (aKeys.length !== Object.keys(bRecord).length) return false;
-  return aKeys.every((key) => Object.prototype.hasOwnProperty.call(bRecord, key)
-    && sameJsonValue((a as Record<string, unknown>)[key], bRecord[key]));
 }
 
 /**
@@ -146,7 +154,7 @@ export function reconcileChannelList(prev: Channel[], next: Channel[]): Channel[
   const prevById = new Map(prev.map((channel) => [channel.id, channel]));
   const reconciled = next.map((incoming) => {
     const previous = prevById.get(incoming.id);
-    return previous && sameJsonValue(previous, incoming) ? previous : incoming;
+    return previous && sameJsonData(previous, incoming) ? previous : incoming;
   });
   return reconciled.length === prev.length && reconciled.every((channel, index) => channel === prev[index])
     ? prev
@@ -262,7 +270,7 @@ function patchRow(
         ? state.channels.filter((c) => c.id !== channelWithMembership.id)
         : state.channels,
       loungeChannels: upsertLounge(state.loungeChannels ?? [], channelWithMembership),
-      channelActivity: { ...state.channelActivity, [channelWithMembership.id]: nextActivity },
+      channelActivity: withActivity(state.channelActivity, channelWithMembership.id, nextActivity),
     };
   }
   if (channelWithMembership.type === "dm") {
@@ -270,9 +278,9 @@ function patchRow(
     return {
       ...state,
       dmChannels: exists
-        ? state.dmChannels.map((c) => (c.id === channelWithMembership.id ? channelWithMembership : c))
+        ? replaceRow(state.dmChannels, channelWithMembership.id, () => channelWithMembership)
         : [...state.dmChannels, channelWithMembership],
-      channelActivity: { ...state.channelActivity, [channelWithMembership.id]: nextActivity },
+      channelActivity: withActivity(state.channelActivity, channelWithMembership.id, nextActivity),
     };
   }
 
@@ -288,14 +296,14 @@ function patchRow(
   }
 
   const exists = state.channels.some((c) => c.id === channelWithMembership.id);
+  const channels = exists
+    ? replaceRow(state.channels, channelWithMembership.id, (c) => ({ ...c, ...channelWithMembership }))
+    : [...state.channels, channelWithMembership];
   return {
     ...state,
-    channels: sortChannels(
-      exists
-        ? state.channels.map((c) => (c.id === channelWithMembership.id ? { ...c, ...channelWithMembership } : c))
-        : [...state.channels, channelWithMembership],
-    ),
-    channelActivity: { ...state.channelActivity, [channelWithMembership.id]: nextActivity },
+    // An unchanged row keeps the list as it was (already sorted).
+    channels: channels === state.channels ? channels : sortChannels(channels),
+    channelActivity: withActivity(state.channelActivity, channelWithMembership.id, nextActivity),
   };
 }
 
@@ -348,20 +356,23 @@ export function applyActivityMuteState(
   const apply = (channel: Channel) => {
     if (channel.id !== channelId) return channel;
     if (isStaleActivityMutePatch(channel, muteState)) return channel;
+    const activityMuteSupported = muteState.activityMuteSupported ?? channel.activityMuteSupported;
+    // The answer a channel already holds (every open re-reads it) changes nothing.
+    if (
+      channel.activityMuted === muteState.activityMuted
+      && channel.muteFromSeq === muteState.muteFromSeq
+      && channel.activityMuteSupported === activityMuteSupported
+      && (muteState.prefsVersion === undefined || channel.prefsVersion === muteState.prefsVersion)
+    ) return channel;
     return {
       ...channel,
       activityMuted: muteState.activityMuted,
       muteFromSeq: muteState.muteFromSeq,
-      activityMuteSupported: muteState.activityMuteSupported ?? channel.activityMuteSupported,
+      activityMuteSupported,
       ...(muteState.prefsVersion === undefined ? {} : { prefsVersion: muteState.prefsVersion }),
     };
   };
-  return {
-    ...state,
-    channels: state.channels.map(apply),
-    dmChannels: state.dmChannels.map(apply),
-    ...(state.loungeChannels ? { loungeChannels: state.loungeChannels.map(apply) } : {}),
-  };
+  return applyToChannelCollections(state, apply);
 }
 
 export function matchesActivityMuteState(
@@ -381,18 +392,17 @@ export function applyMessageDisplayPrefsState(
   const apply = (channel: Channel) => {
     if (channel.id !== channelId) return channel;
     if (isStaleMessageDisplayPrefsPatch(channel, prefs)) return channel;
+    if (
+      channel.collapseLongMessages === prefs.collapseLongMessages
+      && (prefs.prefsVersion === undefined || channel.displayPrefsVersion === prefs.prefsVersion)
+    ) return channel;
     return {
       ...channel,
       collapseLongMessages: prefs.collapseLongMessages,
       ...(prefs.prefsVersion === undefined ? {} : { displayPrefsVersion: prefs.prefsVersion }),
     };
   };
-  return {
-    ...state,
-    channels: state.channels.map(apply),
-    dmChannels: state.dmChannels.map(apply),
-    ...(state.loungeChannels ? { loungeChannels: state.loungeChannels.map(apply) } : {}),
-  };
+  return applyToChannelCollections(state, apply);
 }
 
 export function matchesMessageDisplayPrefsState(
@@ -439,6 +449,38 @@ export function setLocalChannelMembership(
       }
       : {}),
     channelLocalMembership,
+  };
+}
+
+/**
+ * One channel's change applied to every collection it can be in. A collection
+ * none of whose rows changed keeps its array, and a patch that changed no row
+ * returns the state it was given: every mounted message row reads these arrays
+ * (MessageItem), so a new array for the same rows rendered all of them again
+ * on each channel open (task #441).
+ */
+function applyToChannelCollections(
+  state: ChannelDomainState,
+  apply: (channel: Channel) => Channel,
+): ChannelDomainState {
+  const applyTo = (list: Channel[]) => {
+    let changed = false;
+    const next = list.map((channel) => {
+      const applied = apply(channel);
+      if (applied !== channel) changed = true;
+      return applied;
+    });
+    return changed ? next : list;
+  };
+  const channels = applyTo(state.channels);
+  const dmChannels = applyTo(state.dmChannels);
+  const loungeChannels = state.loungeChannels ? applyTo(state.loungeChannels) : state.loungeChannels;
+  if (channels === state.channels && dmChannels === state.dmChannels && loungeChannels === state.loungeChannels) return state;
+  return {
+    ...state,
+    channels,
+    dmChannels,
+    ...(state.loungeChannels ? { loungeChannels } : {}),
   };
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "@botiverse/raft",
-  "version": "1.25.4",
+  "version": "1.25.9",
   "license": "LicenseRef-Raft-License",
   "description": "Canonical Raft agent-facing CLI. Provides raft plus the legacy slock alias over the same CLI core. Invoked by daemon-spawned agent processes via injected env vars.",
   "type": "module",

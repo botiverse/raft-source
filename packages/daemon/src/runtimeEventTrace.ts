@@ -38,6 +38,12 @@ export function runtimeDiagnosticTraceAttrs(
     session_id_present: Boolean(event.sessionId),
     input_evidence: event.inputEvidence,
     reason_present: event.reasonPresent,
+    // Count and kinds only: job titles are command lines and may carry secrets.
+    ...("backgroundJobs" in event ? {
+      background_job_count: event.backgroundJobs.count,
+      background_job_kinds: event.backgroundJobs.kinds.join(","),
+      ...(event.backgroundJobs.capMinutes !== undefined ? { background_wait_cap_minutes: event.backgroundJobs.capMinutes } : {}),
+    } : {}),
   };
 }
 

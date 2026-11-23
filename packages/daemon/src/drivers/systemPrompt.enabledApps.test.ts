@@ -40,7 +40,7 @@ test("enabledApps absent (older Server): no apps, and the booleans still drive t
   expect(options.vaultApp).toBe(true);
 
   const older = buildCliSystemPrompt(promptConfig({ reminderApp: true, vaultApp: true }), { extraCriticalRules: [] });
-  expect(older).toContain("Reminders on this Server live in the Reminder app.");
+  expect(older).toContain("Reminders on this Server live in the Reminder app;");
   expect(older).toContain("ask for access through the Vault app");
   expect(buildCliSystemPrompt(promptConfig({ reminderApp: true, vaultApp: true, enabledApps: [] }), { extraCriticalRules: [] })).toBe(older);
 });

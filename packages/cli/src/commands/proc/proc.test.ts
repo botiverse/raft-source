@@ -180,6 +180,25 @@ test("list: one row per job and the next commands; an empty list says how to sta
   assert.equal(empty.stdout, "No jobs. Start one: raft proc start --name <name> -- <command> [args...]\n");
 });
 
+test("list: a job the Computer stopped at its memory cap reads exited: memory_limit (<cap>), the words of the Inbox notice and the Manual", async () => {
+  const exitedAt = new Date(NOW - 5 * 60_000 - 1_000).toISOString();
+  const result = await run(["proc", "list"], () => listing([
+    job({ state: "exited", exitSignal: "SIGKILL", exitedAt, memoryMaxBytes: 4 * 1024 ** 3, exitReason: "memory_limit" }),
+    // An older daemon sends neither field: as before.
+    job({ name: "bot", state: "exited", exitSignal: "SIGKILL", exitedAt }),
+  ]));
+  assert.equal(result.stdout, "web · exited: memory_limit (4 GB) 5m ago\nbot · exited (SIGKILL) 5m ago\nLogs: raft proc logs bot\n");
+});
+
+test("list: a job a person stopped from the Computer page reads exited: stopped by @<handle>, or by a person when the handle is unknown", async () => {
+  const exitedAt = new Date(NOW - 5 * 60_000 - 1_000).toISOString();
+  const result = await run(["proc", "list"], () => listing([
+    job({ state: "exited", exitSignal: "SIGTERM", exitedAt, exitReason: "owner_stop", stoppedBy: "tygg" }),
+    job({ name: "bot", state: "exited", exitSignal: "SIGTERM", exitedAt, exitReason: "owner_stop", stoppedBy: null }),
+  ]));
+  assert.equal(result.stdout, "web · exited: stopped by @tygg 5m ago\nbot · exited: stopped by a person 5m ago\nLogs: raft proc logs bot\n");
+});
+
 test("stop: SIGTERM exit, a kill after the grace, --force, an exited job, an unknown name", async () => {
   const stop = (outcome: string, graceMs: number, stopped = job()) => (method: string) => method === "GET"
     ? listing([job()])

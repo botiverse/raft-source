@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useIntl } from "react-intl";
 import { useLocation, useNavigate } from "react-router-dom";
-import { Card, ScrollArea } from "@botiverse/raft-ui";
+import { ScrollArea } from "@botiverse/raft-ui";
 import { trackEvent } from "../analytics/track";
 import CloseButton from "../components/ui/CloseButton";
 import { useHistoryStep } from "../components/topbar/historyNavigation";
 import {
   CHINESE_COMMUNITY_QR_FALLBACK_CONFIG_PATH,
+  chineseCommunityQrCropStyle,
   getChineseCommunityQrConfigUrl,
   isChineseCommunityQrExpired,
   resolveChineseCommunityQrConfig,
@@ -41,11 +42,12 @@ async function fetchConfig(url: string) {
 }
 
 export default function ChineseCommunityPage() {
-  const { formatMessage } = useIntl();
+  const { formatMessage, formatDate } = useIntl();
   const location = useLocation();
   const navigate = useNavigate();
   const stepHistory = useHistoryStep();
   const [state, setState] = useState<QrState>({ status: "loading" });
+  const [uncroppedImageUrl, setUncroppedImageUrl] = useState<string | null>(null);
   const [failedImageUrl, setFailedImageUrl] = useState<string | null>(null);
   const configUrl = useMemo(() => getChineseCommunityQrConfigUrl(), []);
   const from = useMemo(() => new URLSearchParams(location.search).get("from") || "direct", [location.search]);
@@ -102,12 +104,11 @@ export default function ChineseCommunityPage() {
           {formatMessage({ id: "pages.chineseCommunity.title" })}
         </h1>
 
-        <Card
+        <section
           aria-label={formatMessage({ id: "pages.chineseCommunity.qrLabel" })}
-          render={<section />}
-          className="w-full max-w-[20rem] shrink-0 p-3 sm:p-4"
+          className="w-full max-w-[20rem] shrink-0"
         >
-          <div className="relative mx-auto grid aspect-square w-full place-items-center overflow-hidden rounded-control border border-line-hairline bg-layer-canvas">
+          <div className="relative mx-auto grid aspect-square w-full place-items-center overflow-hidden rounded-control bg-layer-canvas">
             {state.status === "loading" ? (
               <div
                 data-testid="chinese-community-qr-loading"
@@ -127,6 +128,13 @@ export default function ChineseCommunityPage() {
                   }
                   setFailedImageUrl(config.imageUrl);
                 }}
+                onLoad={(event) => {
+                  const image = event.currentTarget;
+                  if (config.crop && (image.naturalWidth !== config.crop.sourceWidth || image.naturalHeight !== config.crop.sourceHeight)) {
+                    setUncroppedImageUrl(config.imageUrl);
+                  }
+                }}
+                style={chineseCommunityQrCropStyle(config.imageUrl === uncroppedImageUrl ? undefined : config.crop)}
                 data-testid="chinese-community-qr-image"
                 className="absolute inset-0 size-full object-contain [image-rendering:pixelated]"
               />
@@ -140,7 +148,14 @@ export default function ChineseCommunityPage() {
               </div>
             )}
           </div>
-        </Card>
+        </section>
+        {showQrImage && config?.expiresAt && Number.isFinite(Date.parse(config.expiresAt)) ? (
+          <p className="text-callout text-foreground-muted">
+            {formatMessage({ id: "pages.chineseCommunity.expiresAt" }, {
+              date: formatDate(config.expiresAt, { month: "long", day: "numeric", timeZone: "Asia/Shanghai" }),
+            })}
+          </p>
+        ) : null}
       </div>
     </ScrollArea>
   );

@@ -22,10 +22,12 @@
 
 import type { Dispatcher } from "undici";
 import {
+  FORWARDED_RESOLVE_CAPABILITY,
   guideAppCapabilities,
   MANUAL_CONTEXT_CAPABILITY,
   PLAN_UPGRADE_CARD_CAPABILITY,
   INBOX_ITEMS_CAPABILITY,
+  REMINDER_APP_CLI_CAPABILITY,
   RAFT_CLI_ENTRY_HEADER,
   RAFT_CLI_STABLE_ENTRY,
   RAFT_CLIENT_CAPABILITIES_HEADER,
@@ -48,9 +50,19 @@ import { normalizeVersion, readCliVersion } from "./version";
 /**
  * `X-Raft-Client-Capabilities` on every JSON and multipart request: the Manual
  * context contract, that `raft action prepare` posts `plan:upgrade` cards (so
- * the Server may hint one), and the guide-app tokens.
+ * the Server may hint one), that `raft message resolve` takes `--forwarded`
+ * (so a cut forwarded message may name it), that `raft reminder` calls the
+ * Reminder app where reminders moved (so an external agent's guide may teach
+ * it), and the guide-app tokens.
  */
-const CLI_CLIENT_CAPABILITIES = [MANUAL_CONTEXT_CAPABILITY, PLAN_UPGRADE_CARD_CAPABILITY, INBOX_ITEMS_CAPABILITY, ...guideAppCapabilities()].join(",");
+const CLI_CLIENT_CAPABILITIES = [
+  MANUAL_CONTEXT_CAPABILITY,
+  PLAN_UPGRADE_CARD_CAPABILITY,
+  INBOX_ITEMS_CAPABILITY,
+  FORWARDED_RESOLVE_CAPABILITY,
+  REMINDER_APP_CLI_CAPABILITY,
+  ...guideAppCapabilities(),
+].join(",");
 
 let cliVersionHeaderValue: string | null | undefined;
 

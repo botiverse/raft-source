@@ -1,7 +1,7 @@
 import { useCallback, useId, useState } from "react";
 import type { ComponentProps, FocusEvent, MouseEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
-import { Check, CircleArrowUp, History, TriangleAlert } from "lucide-react";
+import { Check, ChevronRight, CircleArrowUp, History, TriangleAlert } from "lucide-react";
 import {
   Badge,
   Button,
@@ -27,6 +27,7 @@ import {
   PanelNoticeActions,
   PanelNoticeContent,
   ScrollArea,
+  TextLink,
 } from "@botiverse/raft-ui";
 import type { ArtifactCard, ArtifactId, ArtifactVersionSummary, ArtifactViewerData } from "@botiverse/raft-shared";
 
@@ -301,6 +302,34 @@ export function ArtifactVersionTag({ data, phone, onPick, onOpenSheet }: {
         <VersionMenuScroll><VersionRadioItems data={data} onPick={onPick} /></VersionMenuScroll>
       </DropdownMenuContent>
     </DropdownMenu>
+  );
+}
+
+/**
+ * The version line in the details behind a desktop head's title (ArtifactDetailsTitle): the version shown (the
+ * latest marked), then, where the tag above would switch versions (more than one, a reader of its own server),
+ * "Version history ›", opening the same versions as a menu (the ⋯ submenu's items).
+ */
+export function ArtifactVersionLine({ data, onPick }: { data: ArtifactViewerData; onPick: PickVersion }) {
+  const { formatMessage } = useIntl();
+  const { card, versions } = data;
+  const label = formatMessage({ id: "artifacts.menu.versionHistory" });
+  return (
+    <div className="flex min-w-0 items-center gap-2" data-testid="artifact-details-version">
+      <span className="font-mono text-mono-meta text-foreground">{formatMessage({ id: "artifacts.card.version" }, { version: card.version })}</span>
+      {card.version === card.latestVersion ? <LatestBadge /> : null}
+      {versions.length > 1 && readsInOwnServer(card) ? (
+        <DropdownMenu>
+          <DropdownMenuTrigger render={<TextLink className="ms-auto inline-flex shrink-0 items-center gap-0.5 text-caption" />} data-testid="artifact-details-versions">
+            {label}
+            <ChevronRight aria-hidden className="size-3.5" />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" aria-label={label} className="p-0" data-testid="artifact-version-list">
+            <VersionMenuScroll><VersionRadioItems data={data} onPick={onPick} /></VersionMenuScroll>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      ) : null}
+    </div>
   );
 }
 

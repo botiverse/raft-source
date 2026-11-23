@@ -825,7 +825,7 @@ async function seedJointWorld(seed: ReturnType<typeof createSeed>, app: { baseUr
     });
   };
   const who: Who = { token: await accessTokenForTest(peer.id), serverId: peerServer.id };
-  return { world, peer, peerServer, id, tell, who, hostProjection, peerProjection };
+  return { world, peer, peerServer, id, tell, who, hostProjection, peerProjection, canonical: joint.canonical };
 }
 
 // A joint channel is one conversation of each server in it, so an Artifact
@@ -844,6 +844,24 @@ test("a joint channel: the other server's person who is mentioned or follows get
     assert.deepEqual(rows[0]!.home, { kind: "channel", label: joint.peerProjection.name, channelId: joint.peerProjection.id }, "its home as the reader's server has it");
     assert.equal(await assertAgree(app, joint.who), 1);
   }
+});
+
+// The Artifact's own server names the joint's canonical channel as its home
+// too: its people's rows say the projection's name, never the canonical
+// channel's internal `joint-storage-<uuid>` (#triage:#455).
+test("a joint channel: a person of the Artifact's own server sees its home as that server's projection, not the canonical channel", async ({ app, seed }) => {
+  const joint = await seedJointWorld(seed, app);
+  const [item] = await getDb().select().from(artifactItems).where(eq(artifactItems.id, joint.id));
+  const reader = joint.world.reader;
+  await addHuman(joint.hostProjection.id, reader.id);
+  await getDb().transaction(async (tx) => {
+    const [locked] = await tx.select().from(artifactItems).where(eq(artifactItems.id, joint.id)).for("update");
+    await recordArtifactEvent(tx, { item: locked!, eventKind: "comment", actor: { type: "user", id: joint.world.owner.id }, data: { position: locked!.lastPosition }, recipients: [{ actor: { type: "user", id: reader.id }, reason: "mentioned" }] });
+  });
+  const rows = objectRows((await inbox(app, joint.world.who.reader)).body);
+  assert.deepEqual(rows.map((row) => row.objectId), [joint.id]);
+  assert.deepEqual(rows[0]!.home, { kind: "channel", label: joint.hostProjection.name, channelId: joint.hostProjection.id });
+  assert.equal(item!.homeChannelId, joint.canonical.id, "witness: the Artifact names the joint's canonical channel");
 });
 
 // The rule a joint's member of another server writes by (apiCommon

@@ -28,6 +28,7 @@ const DESCRIPTION_IDS = {
   actionCard: "settings.twoStep.stepUpActionCardDescription",
   // Only a lost device's revoke asks (#triage:#386): a plain sign-out needs the password alone.
   signOutDevice: "settings.twoStep.stepUpLostDeviceDescription",
+  dataExport: "settings.twoStep.stepUpDataExportDescription",
   other: "settings.twoStep.stepUpGenericDescription",
 } as const satisfies Record<StepUpReason, MessageId>;
 

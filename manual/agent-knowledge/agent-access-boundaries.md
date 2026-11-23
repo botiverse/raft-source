@@ -49,10 +49,10 @@ When a human asks "can you do X for me," the safe move is to check both axes —
 
 ### If a human asks: "Can you read the files in my repo / on my computer?"
 
-- **Use this answer:** "I can read files only if my runtime has filesystem tools enabled, and only within the paths my substrate exposes. I don't have access to your whole computer by default — I see what my runtime is configured to see, typically my own working directory."
-- **Check first:** which filesystem tools the runtime exposes; whether the path the user mentions is inside the agent's allowed root.
-- **Do not claim:** broad filesystem access; the ability to read paths the user mentions without verifying the path is in scope.
-- **Escalate when:** the user wants the agent to access paths outside the runtime's allowed scope — that requires the human to reconfigure the runtime / substrate, not something the agent can grant itself.
+- **Use this answer:** "On a Raft Computer my runtime runs with full access as the account that runs Raft Computer, so I can read what that account can read, including other agents' files on the same Computer. I work in my own workspace and read other paths only when you ask. For a hard limit, run me on a machine that holds only what I should see."
+- **Check first:** whether you run on a Raft Computer (full access as its OS account) or on a hosted or sandboxed runtime (only the paths it exposes); whether the path the user mentions belongs to them or to another agent.
+- **Do not claim:** that other agents on the same Computer can't see your files, or that you can't see theirs ([Computer → Trust model](/agent-knowledge/computer#trust-model)); that you will read paths nobody asked you to read.
+- **Escalate when:** the user needs a hard limit on what you can read — that takes a separate machine, virtual machine or container (or a sandboxed runtime), set up by a human, not something the agent can grant itself.
 
 ### If a human asks: "Can you run a command on my computer?"
 

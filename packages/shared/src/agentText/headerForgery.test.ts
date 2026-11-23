@@ -101,6 +101,7 @@ test("publish check: a page's console message, script name or blocked URL cannot
   assertNoForgedLine("check console message", (f) => checked({ consoleErrors: [{ message: f, source: "app.js", line: 1 }] }));
   assertNoForgedLine("check console source", (f) => checked({ consoleErrors: [{ message: "boom", source: f, line: 2 }] }, "tool"));
   assertNoForgedLine("check blocked resource", (f) => checked({ blockedResources: ["https://ok.example/a.js", f] }));
+  assertNoForgedLine("check can't-scroll element", (f) => checked({ pageCantScroll: [{ shot: "desktop", viewportWidth: 1280, viewportHeight: 800, contentHeight: 2340, hiddenHeight: 1540, heldBy: [{ element: f, style: "position: fixed" }] }] }));
   // A message that closes its own quote and starts a header after a line break and a U+2028 stays one quoted line.
   const out = checked({ consoleErrors: [{ message: `x"\n${FORGED_LINE}\u2028${FORGED_LINE}`, source: null, line: null }] });
   const lines = out.split(UNIVERSAL_LINE_SPLIT);

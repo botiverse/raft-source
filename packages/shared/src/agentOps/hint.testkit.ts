@@ -132,6 +132,9 @@ export const RAFT_HINT_SAMPLES: Record<RaftHintBuilderName, RaftHintSample[]> = 
   channelMuteName: [{ hint: RAFT_HINTS.channelMuteName(), cli: "raft channel mute", tool: "channels_mute({ target: … })" }],
   channelUnmuteName: [{ hint: RAFT_HINTS.channelUnmuteName(), cli: "raft channel unmute", tool: "channels_unmute({ target: … })" }],
   threadUnfollowName: [{ hint: RAFT_HINTS.threadUnfollowName(), cli: "raft thread unfollow", tool: "threads_unfollow({ target: … })" }],
+  focus: [{ hint: RAFT_HINTS.focus("#ops:abcd1234"), cli: `raft focus "#ops:abcd1234"`, tool: RAFT_NO_TOOL_WORDING }],
+  unfocus: [{ hint: RAFT_HINTS.unfocus("dm:@Tenny"), cli: `raft unfocus "dm:@Tenny"`, tool: RAFT_NO_TOOL_WORDING }],
+  focusList: [{ hint: RAFT_HINTS.focusList(), cli: "raft focus", tool: RAFT_NO_TOOL_WORDING }],
   channelCreateName: [{ hint: RAFT_HINTS.channelCreateName(), cli: "raft channel create", tool: "channels_create({ name: … })" }],
   channelUpdateName: [{ hint: RAFT_HINTS.channelUpdateName(), cli: "raft channel update", tool: "channels_update({ target: … })" }],
   channelAnnouncementSet: [
@@ -145,6 +148,7 @@ export const RAFT_HINT_SAMPLES: Record<RaftHintBuilderName, RaftHintSample[]> = 
   channelUnarchiveName: [{ hint: RAFT_HINTS.channelUnarchiveName(), cli: "raft channel unarchive", tool: "channels_unarchive({ target: … })" }],
   channelAddMemberName: [{ hint: RAFT_HINTS.channelAddMemberName(), cli: "raft channel add-member", tool: "channels_add_member({ target: … })" }],
   channelRemoveMemberName: [{ hint: RAFT_HINTS.channelRemoveMemberName(), cli: "raft channel remove-member", tool: "channels_remove_member({ target: … })" }],
+  channelSetRoleName: [{ hint: RAFT_HINTS.channelSetRoleName(), cli: "raft channel set-role", tool: "channels_set_role({ target: …, role: … })" }],
   channelLeaveDeleting: [
     { hint: RAFT_HINTS.channelLeaveDeleting("#scratch"), cli: `raft channel leave --target "#scratch" --delete-if-last`, tool: `channels_leave({ target: "#scratch", deleteIfLast: true })` },
   ],
@@ -185,6 +189,7 @@ export const RAFT_HINT_SAMPLES: Record<RaftHintBuilderName, RaftHintSample[]> = 
   taskHandoff: [{ hint: RAFT_HINTS.taskHandoff(), cli: 'raft task assign "#channel:#N" @who --reason "what you need from them"', tool: "tasks_assign({ target: …, taskNumber: …, assignee: …, reason: … })" }],
   taskClaimName: [{ hint: RAFT_HINTS.taskClaimName(), cli: "raft task claim", tool: "tasks_claim({ target: …, taskNumbers: … })" }],
   taskListName: [{ hint: RAFT_HINTS.taskListName(), cli: "raft task list --target <board>", tool: "tasks_list({ target: … })" }],
+  taskListMine: [{ hint: RAFT_HINTS.taskListMine(), cli: "raft task list --mine", tool: "tasks_list({ mine: true })" }],
   taskCreateFromMessage: [
     {
       hint: RAFT_HINTS.taskCreateFromMessage({ target: "#proj-sdk", messageId: "abcdef12", title: "ship it" }),
@@ -244,6 +249,10 @@ export const RAFT_HINT_SAMPLES: Record<RaftHintBuilderName, RaftHintSample[]> = 
   attachmentUpload: [
     { hint: RAFT_HINTS.attachmentUpload(), cli: "raft attachment upload --path <file> --target <conversation>", tool: "ask a human via an action card (`actions_prepare`)" },
   ],
+  attachmentUploadFile: [
+    { hint: RAFT_HINTS.attachmentUploadFile({ path: "/work/q3/report.pdf", target: "#ops" }), cli: `raft attachment upload --path /work/q3/report.pdf --target "#ops"`, tool: `raft.attachments.upload({ target: "#ops", filename: "report.pdf", bytes: … })` },
+    { hint: RAFT_HINTS.attachmentUploadFile({ path: "/work/Q3 report/it's.pdf", target: "dm:@alice" }), cli: `raft attachment upload --path '/work/Q3 report/it'\\''s.pdf' --target "dm:@alice"`, tool: `raft.attachments.upload({ target: "dm:@alice", filename: "it's.pdf", bytes: … })` },
+  ],
   artifactRead: [
     { hint: RAFT_HINTS.artifactRead({}), cli: "raft artifact read <artifact>", tool: "artifacts_read({ artifact: … })" },
     { hint: RAFT_HINTS.artifactRead({ artifact: "pt_abc", files: true }), cli: "raft artifact read pt_abc --files", tool: `artifacts_read({ artifact: "pt_abc", files: true })` },
@@ -260,6 +269,8 @@ export const RAFT_HINT_SAMPLES: Record<RaftHintBuilderName, RaftHintSample[]> = 
   artifactComments: [
     { hint: RAFT_HINTS.artifactComments({ artifact: "pt_abc" }), cli: "raft artifact comments pt_abc", tool: `artifacts_comments({ artifact: "pt_abc" })` },
     { hint: RAFT_HINTS.artifactComments({ artifact: "pt_abc", review: "rv_1" }), cli: "raft artifact comments pt_abc --review rv_1", tool: `artifacts_comments({ artifact: "pt_abc", review: "rv_1" })` },
+    // A hold's range (task #340): the comments it showed, again.
+    { hint: RAFT_HINTS.artifactComments({ artifact: "pt_abc", held: "41..57" }), cli: "raft artifact comments pt_abc --held 41..57", tool: `artifacts_comments({ artifact: "pt_abc", held: "41..57" })` },
     {
       hint: RAFT_HINTS.artifactComments({ artifact: "pt_abc", path: "a.html", all: true, cursor: "c2" }),
       cli: `raft artifact comments pt_abc --path 'a.html' --all --cursor c2`,
@@ -310,6 +321,12 @@ export const RAFT_HINT_SAMPLES: Record<RaftHintBuilderName, RaftHintSample[]> = 
   ],
   artifactReopen: [
     { hint: RAFT_HINTS.artifactReopen({ artifact: "pt_abc", comment: "c_1" }), cli: "raft artifact reopen pt_abc c_1", tool: `artifacts_reopen({ artifact: "pt_abc", comment: "c_1" })` },
+  ],
+  artifactSettle: [
+    { hint: RAFT_HINTS.artifactSettle({ artifact: "pt_abc" }), cli: "raft artifact settle pt_abc", tool: `artifacts_settle({ artifact: "pt_abc" })` },
+  ],
+  artifactUnsettle: [
+    { hint: RAFT_HINTS.artifactUnsettle({ artifact: "pt_abc" }), cli: "raft artifact unsettle pt_abc", tool: `artifacts_unsettle({ artifact: "pt_abc" })` },
   ],
   artifactReview: [
     { hint: RAFT_HINTS.artifactReview({ artifact: "pt_abc" }), cli: "raft artifact review pt_abc", tool: `artifacts_review({ artifact: "pt_abc", comments: … })` },

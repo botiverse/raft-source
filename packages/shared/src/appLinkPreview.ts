@@ -42,18 +42,30 @@ export type AppLinkPreview = AppLinkPreviewContent & { url: string; appName: str
  */
 export type AppLinkPreviewPrompt = { url: string; app: { id: string; name: string; icon: string | null } };
 /**
+ * Raft's digest of an App's object (the server's linkCardObjectKeySha256: the
+ * App's id and its `object_ref`), 64 lowercase hex characters. A read item
+ * carries it as `object_key_sha256` and a `link_card.changed` nudge names it;
+ * a client only compares the two, never hashes anything itself.
+ */
+export const linkCardObjectKeySha256Schema = lazySchema("linkCardObjectKeySha256Schema", () => z.string().regex(/^[0-9a-f]{64}$/).brand<"LinkCardObjectKeySha256">());
+export type LinkCardObjectKeySha256 = z.infer<typeof linkCardObjectKeySha256Schema>;
+
+/**
  * What a client reads from `GET /api/messages/:id/app-link-previews`. Not
  * strict at the top level, on purpose: a field the server adds (`prompts`,
  * `appIcons`) is dropped by clients that do not know it, instead of hiding
  * every preview. Each preview is strict, so new per-link data goes at the top.
  *
  * `appIcons`: preview `url` -> the icon Raft stores for the App that rendered
- * it, or null. Older servers leave it out. Up to 10 previews: the per-message
+ * it, or null. Older servers leave it out. `objectKeys`: preview `url` -> its
+ * `object_key_sha256` (as on a batched read item), only for a preview whose
+ * App named its object; older servers leave it out. Up to 10 previews: the per-message
  * link limit (protocol v3.2.3 addendum 2 §5), though v1 reads at most three.
  */
 export const appLinkPreviewListResponseSchema = lazySchema("appLinkPreviewListResponseSchema", () => z.object({ previews: z.array(appLinkPreviewResponseSchema.extend({
   url: z.string().refine((value) => !!publicPreviewUrl(value)), appName: z.string().max(300),
-})).max(10), appIcons: z.record(z.string(), z.string().max(2000).nullable()).optional() }));
+})).max(10), appIcons: z.record(z.string(), z.string().max(2000).nullable()).optional(),
+  objectKeys: z.record(z.string(), linkCardObjectKeySha256Schema).optional() }));
 
 // ---------------------------------------------------------------------------
 // Version 2: interactive link cards (RFC 076; protocol v3.2.3 §4.3, §4.4).
@@ -80,11 +92,15 @@ export const appLinkPreviewListResponseSchema = lazySchema("appLinkPreviewListRe
  * `execute.toast.v1` (RFC 076 §6.3): the client reads `app_result` on
  * execute's answer, the App's toast for an operation that finished at once
  * (linkCardExecuteToastForCapabilities).
+ * `card.changed.v1` (link_card.changed): the client reads `object_key_sha256`
+ * on a read item and re-reads that card when a `link_card.changed` nudge
+ * carries the same digest (LINK_CARD_CHANGED_EVENT).
  */
-export const LINK_CARD_CAPABILITIES = ["card.v2", "button.v1", "confirm.v1", "undo.v1", "inline.v1", "inline.tone.v2", "block.v1", "preview.v3", "badge.color.v1", "unreviewed_app.v1", "execute.toast.v1"] as const;
+export const LINK_CARD_CAPABILITIES = ["card.v2", "button.v1", "confirm.v1", "undo.v1", "inline.v1", "inline.tone.v2", "block.v1", "preview.v3", "badge.color.v1", "unreviewed_app.v1", "execute.toast.v1", "card.changed.v1"] as const;
 export type LinkCardCapability = typeof LINK_CARD_CAPABILITIES[number];
 export const UNREVIEWED_APP_CAPABILITY = "unreviewed_app.v1" satisfies LinkCardCapability;
 export const EXECUTE_TOAST_CAPABILITY = "execute.toast.v1" satisfies LinkCardCapability;
+export const LINK_CARD_CHANGED_CAPABILITY = "card.changed.v1" satisfies LinkCardCapability;
 export const LINK_CARD_ACTION_ID = /^[a-z][a-z0-9_]{0,31}$/;
 const MAX_BUTTONS = 4;
 
@@ -428,6 +444,57 @@ export function linkCardBadgeColorsForCapabilities(items: readonly AppLinkPrevie
   return { items: items.map((item) => item.type === "card" ? { ...item, card: card(item.card) } : item), stripped };
 }
 
+// ---------------------------------------------------------------------------
+// Link cards that update themselves (docs/development/app-link-previews.md,
+// "Telling Raft a card changed"). An App names the object a card shows with
+// `object_ref`; Raft keys a list of recent readers on (App, object_ref) and,
+// when the App says the object changed, nudges them to read the card again.
+
+/**
+ * An App's own label for the object a card shows (`pr:botiverse/slock#15813`):
+ * 1-200 printable ASCII characters (0x20-0x7E), opaque to Raft, which never
+ * parses, shows or forwards it. Only asLinkCardObjectRef makes one.
+ */
+export type LinkCardObjectRef = string & { readonly __linkCardObjectRef: unique symbol };
+export const LINK_CARD_OBJECT_REF = /^[\x20-\x7E]{1,200}$/;
+export function asLinkCardObjectRef(value: unknown): LinkCardObjectRef | null {
+  return typeof value === "string" && LINK_CARD_OBJECT_REF.test(value) ? value as LinkCardObjectRef : null;
+}
+/**
+ * An App's answer as parsed from JSON, before the schema reads it, with its
+ * `object_ref` taken out: on a version 1 or 2 answer at the top level, on a
+ * version 3 answer on its `card` item (anywhere else in version 3 it is an
+ * unknown field like any other, and the strict schema refuses the answer).
+ * `objectRef` is the valid label, or null: absent, or invalid (not a string,
+ * empty, longer than 200, or outside printable ASCII), which only drops the
+ * label and never the card. The schemas never see the field, so the answers
+ * Raft hands clients never carry it. Never mutates `raw`.
+ */
+export function takeLinkCardObjectRef(raw: unknown): { answer: unknown; objectRef: LinkCardObjectRef | null } {
+  if (!isJsonObject(raw)) return { answer: raw, objectRef: null };
+  const take = (value: JsonObject): [JsonObject, LinkCardObjectRef | null] => {
+    const { object_ref: label, ...rest } = value;
+    return [rest, asLinkCardObjectRef(label)];
+  };
+  if (raw.version === 1 || raw.version === 2) {
+    if (!Object.hasOwn(raw, "object_ref")) return { answer: raw, objectRef: null };
+    const [answer, objectRef] = take(raw);
+    return { answer, objectRef };
+  }
+  if (raw.version !== 3 || !Array.isArray(raw.items)) return { answer: raw, objectRef: null };
+  let objectRef: LinkCardObjectRef | null = null;
+  let taken = false;
+  const items = raw.items.map((item: unknown) => {
+    if (!isJsonObject(item) || item.type !== "card" || !Object.hasOwn(item, "object_ref")) return item;
+    const [rest, label] = take(item);
+    taken = true;
+    // At most one card item is valid; a second one refuses the answer anyway.
+    objectRef ??= label;
+    return rest;
+  });
+  return taken ? { answer: { ...raw, items }, objectRef } : { answer: raw, objectRef: null };
+}
+
 /**
  * One link of a batched read answer (`POST /api/messages/:messageId/link-cards/read`,
  * RFC 076 §6.1), as a client reads it: `v1` (the version 1 preview), `v2` (a
@@ -437,17 +504,21 @@ export function linkCardBadgeColorsForCapabilities(items: readonly AppLinkPrevie
  * `retry_after` seconds). `app` is Raft's record of the App, its icon the one
  * Raft stores, and `reviewed: false` on an item of an App acting under its
  * own Server's confirmation, sent only to a client that declared
- * `unreviewed_app.v1` (RFC 076 §17). Strict, like each GET preview.
+ * `unreviewed_app.v1` (RFC 076 §17). `object_key_sha256` on a card whose App
+ * named its object (`object_ref`), sent only to a client that declared
+ * `card.changed.v1`: a `link_card.changed` nudge with the same digest means
+ * "read this card again". Strict, like each GET preview.
  */
 export const linkCardReadItemSchema = lazySchema("linkCardReadItemSchema", () => {
   const url = z.string().refine((value) => !!publicPreviewUrl(value));
   const app = z.object({ id: z.string().min(1).max(200), name: z.string().max(300), icon: z.string().max(2000).nullable(), reviewed: z.literal(false).optional() }).strict();
   const ticket = z.string().min(1).max(4096).brand<"LinkCardReadTicket">().nullable();
   const actions = z.array(z.object({ action_id: z.string().regex(LINK_CARD_ACTION_ID), handle: z.string().min(1).max(4096).brand<"LinkCardHandle">() }).strict()).max(MAX_BUTTONS);
+  const object_key_sha256 = linkCardObjectKeySha256Schema.optional();
   return z.discriminatedUnion("kind", [
-    z.object({ kind: z.literal("v1"), url, app, preview: appLinkPreviewResponseSchema }).strict(),
-    z.object({ kind: z.literal("v2"), url, app, preview: appLinkPreviewV2ResponseSchema, ticket, actions }).strict(),
-    z.object({ kind: z.literal("v3"), url, app, preview: appLinkPreviewV3ResponseSchema, ticket, actions }).strict(),
+    z.object({ kind: z.literal("v1"), url, app, preview: appLinkPreviewResponseSchema, object_key_sha256 }).strict(),
+    z.object({ kind: z.literal("v2"), url, app, preview: appLinkPreviewV2ResponseSchema, ticket, actions, object_key_sha256 }).strict(),
+    z.object({ kind: z.literal("v3"), url, app, preview: appLinkPreviewV3ResponseSchema, ticket, actions, object_key_sha256 }).strict(),
     z.object({ kind: z.literal("rate_limited"), url, retry_after: z.number().int().min(0).max(3600) }).strict(),
   ]);
 });
@@ -508,6 +579,20 @@ export function linkCardExecuteToastForCapabilities<T>(toast: T | null, capabili
  */
 export const LINK_CARD_OPERATION_CHANGED_EVENT = "link_card.operation_changed";
 export type LinkCardOperationChangedEvent = { operation_id: string; receipt_revision: number };
+
+/**
+ * Server -> clients, socket event name `link_card.changed`, emitted to
+ * `socketUserServerRoom(viewer, server)` when an App says an object changed
+ * (`POST /api/oauth/link-preview/changed`), only to people who read a card of
+ * that object on that Server in the last 24 hours and are still its members.
+ * No content: `app` is the App's id as read items carry it (`app.id`), and
+ * `object_key_sha256` the digest those items carry. A client re-reads its
+ * mounted, on-screen cards of that App with that digest through its usual read
+ * path; one that doesn't know the event ignores it, and the card updates on its
+ * next display as before.
+ */
+export const LINK_CARD_CHANGED_EVENT = "link_card.changed";
+export type LinkCardChangedEvent = { app: string; object_key_sha256: LinkCardObjectKeySha256 };
 
 /**
  * The most a provider's buttons may do on this read (addendum 4 §2):

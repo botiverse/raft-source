@@ -10,7 +10,7 @@ import { startRaftContent } from "./raftContentHarness";
 
 /**
  * The workspace's displays (src/raftContentDisplays.ts) and its content Worker
- * (src/raftContent.ts) are Porthole 0.16.0's, for `comments` (P090, P108,
+ * (src/raftContent.ts) are Porthole 0.17.2's, for `comments` (P090, P108,
  * P109) and the comment mode's annotations (P112, P115-P117; P118 the React
  * binding's `trackedAnnotation` and ref; 0.14.3's P119 the shell's 44×44 tap
  * area for markers on touch; 0.14.4's P120-P122 nested pages' keyboard and
@@ -75,13 +75,13 @@ const notNewer = (a: string, b: string) => {
   return at === -1 || x![at]! < y![at]!;
 };
 
-test("Porthole is 0.16.0, and the web that mounts the frames is not ahead of what it bundles", () => {
+test("Porthole is 0.17.2, and the web that mounts the frames is not ahead of what it bundles", () => {
   const manifest = json("package.json");
   const pinned: string = manifest.dependencies["@botiverse/porthole"];
-  assert.equal(pinned, "0.16.0");
+  assert.equal(pinned, "0.17.2");
   const installed = json("node_modules/@botiverse/porthole/package.json");
   assert.equal(installed.name, "@botiverse/porthole");
-  assert.equal(installed.version, "0.16.0");
+  assert.equal(installed.version, "0.17.2");
   const web: string = json("../web/package.json").dependencies["@botiverse/porthole"];
   assert.match(web, /^\d+\.\d+\.\d+$/, "the web pins an exact version");
   if (notNewer(web, pinned)) return;
@@ -111,7 +111,7 @@ test("Raft's door is under Porthole's DOOR_PATH, where the host takes a door fro
   assert.doesNotMatch(ARTIFACT_CONTENT_DOOR_PATH.slice(DOOR_PATH.length), /^[a-z2-7]{16}$/);
 });
 
-test("a workspace frame runs Porthole 0.16.0's runtime, comments in its plan; the Worker bundles 0.16.0 only", async (t) => {
+test("a workspace frame runs Porthole 0.17.2's runtime, comments in its plan; the Worker bundles 0.17.2 only", async (t) => {
   const app = await startRaftContent();
   t.after(() => app.close());
   const published = await app.publish({ "index.html": `<!doctype html><title>t</title><h1>Decision sheet</h1>` });
@@ -141,11 +141,11 @@ test("a workspace frame runs Porthole 0.16.0's runtime, comments in its plan; th
   const workspace = await runtimeOf();
   const parts = workspace.composedRuntime(shellPlan(raftDisplays.guideConfig("artifact", "served"))).split("__PLAN__");
   assert.equal(parts.length, 2);
-  for (const part of parts) assert.ok(body.includes(part), "0.16.0's composed runtime, around the plan");
-  assert.ok(body.includes(workspace.USE_RUNTIME), "0.16.0's capability runtime");
+  for (const part of parts) assert.ok(body.includes(part), "0.17.2's composed runtime, around the plan");
+  assert.ok(body.includes(workspace.USE_RUNTIME), "0.17.2's capability runtime");
 
-  // The Worker as wrangler bundled it: Porthole's modules, every one 0.16.0's.
+  // The Worker as wrangler bundled it: Porthole's modules, every one 0.17.2's.
   const bundled = bundledPortholeModules();
   assert.ok(bundled.some((path) => path.endsWith("@botiverse/porthole/dist/shell/runtime.js")), "Porthole's shell runtime in the bundle");
-  assert.ok(bundled.every((path) => path.includes("/@botiverse+porthole@0.16.0")), `only 0.16.0's modules: ${bundled.filter((path) => !path.includes("/@botiverse+porthole@0.16.0"))}`);
+  assert.ok(bundled.every((path) => path.includes("/@botiverse+porthole@0.17.2")), `only 0.17.2's modules: ${bundled.filter((path) => !path.includes("/@botiverse+porthole@0.17.2"))}`);
 });

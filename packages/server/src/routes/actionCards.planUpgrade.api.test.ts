@@ -7,7 +7,11 @@ import { createApiTest } from "../test/integration/apiTest";
 // (none: `general`) within a day answers with the card already there;
 // otherwise, after an agent's upgrade card there of any gate, deleted since or
 // not, the conversation gets no other one for a cooldown (14 days, cindyz
-// #proj-apps:5eafd481): 409 UPGRADE_CARD_COOLDOWN. No server action at all. No
+// #proj-apps:5eafd481): 409 UPGRADE_CARD_COOLDOWN; and otherwise, after an
+// agent's card for the same gate in any other conversation of the server in the
+// last 7 days (not deleted), no new one either: 409
+// UPGRADE_CARD_ALREADY_OFFERED, naming where that card is (cindyz, on Nova's
+// data). Checked in that order. No server action at all. No
 // flag: `agent_upgrade_card` is retired (#raft-architecture:#32), and a
 // leftover row, even off or with a variant, changes nothing.
 // `agentUpgradeCardHint` is the line Till's read-limit messages offer agents,
@@ -325,7 +329,7 @@ test("the prepare request's span names the card type, refused or not", async ({ 
   assert.deepEqual(await traced(await prepare(app.baseUrl, noTasks, `#${room.name}`), 403), ["plan:upgrade", "capability_not_authorized"]);
 });
 
-test("after an agent's upgrade card, the conversation gets no other one for 14 days, of any gate; another conversation is unaffected", async ({ app }) => {
+test("after an agent's upgrade card, the conversation gets no other one for 14 days, of any gate; another conversation is outside that cooldown", async ({ app }) => {
   const { owner, server, agent, room, other, apiKey } = await seedWorld();
   // A leftover agent_upgrade_card row, off: the card is offered all the same.
   await seedRetiredFlagRowOff();
@@ -345,13 +349,15 @@ test("after an agent's upgrade card, the conversation gets no other one for 14 d
   assert.equal(repeat.existing, true);
   assert.equal(await upgradeCardCount(server.id), 1);
 
-  // (e) Another channel, a thread of this one, a DM: each its own conversation.
+  // (e) Another channel, a thread of this one, a DM: each its own conversation
+  // (each with a gate not offered on the server yet: the server-wide rule is
+  // the next test's).
   await prepared(await prepare(app.baseUrl, apiKey, `#${other.name}`, { ...UPGRADE, gate: "upload_file_size" }), 201);
   const root = await createMessage(room.id, "user", owner.id, "Can we see last quarter's notes?");
-  await prepared(await prepare(app.baseUrl, apiKey, `#${room.name}:${root.id.slice(0, 8)}`), 201);
+  await prepared(await prepare(app.baseUrl, apiKey, `#${room.name}:${root.id.slice(0, 8)}`, { ...UPGRADE, gate: "agent_migration" }), 201);
   const dm = await channelService.findOrCreateDM(server.id, owner.id, agent.id);
   assert.ok(dm);
-  await prepared(await prepare(app.baseUrl, apiKey, `dm:@${owner.name}`), 201);
+  await prepared(await prepare(app.baseUrl, apiKey, `dm:@${owner.name}`, { type: "plan:upgrade", reason: REASON }), 201);
   assert.equal(await upgradeCardCount(server.id), 4);
 });
 
@@ -381,6 +387,159 @@ test("the same gate after a day but inside the cooldown is refused; after the co
     assert.match(body.suggestedNextAction ?? "", new RegExp(`offered here on ${isoDay(later.getTime())}\\.`));
   });
   assert.equal(await upgradeCardCount(server.id), 2);
+});
+
+/** Another agent of the world's server, in `channels` (the world's agent is in both of its channels). */
+async function seedSecondAgent(serverId: string, name: string, channelIds: readonly string[]) {
+  const agent = await createAgent(serverId, name, { runtime: "claude" });
+  for (const channelId of channelIds) await channelService.addAgent(channelId, agent.id);
+  const { apiKey } = await mintAgentCredential({ agentId: agent.id, scopes: ["send", "read", "tasks"], name: `${name}-key`, issuedVia: "computer", createdByUserId: null });
+  return { agent, apiKey };
+}
+
+/** The 409 UPGRADE_CARD_ALREADY_OFFERED body for a card the agent addresses as `address` (null: one not in a public channel, or one it can't open). */
+function alreadyOffered(address: string | null): Refusal {
+  const sentence = address
+    ? `An upgrade card for this limit was already offered on this server in the last 7 days (${address}): don't offer another; tell the person the limit and point them to that card.`
+    : "An upgrade card for this limit was already offered on this server in the last 7 days, in a conversation not everyone here can open: don't offer another; tell the person the limit and why, without a card, and that a server owner can upgrade in Settings → Plan & Billing.";
+  return { error: sentence, errorCode: "UPGRADE_CARD_ALREADY_OFFERED", suggestedNextAction: sentence };
+}
+
+// Per server and gate (cindyz, on Nova's data: duplicates came from other
+// agents in other conversations of the same server, never the conversation's
+// cooldown): after an agent's upgrade card for a gate, no other conversation
+// of the server gets one for that gate for 7 days; the agent is told where the
+// card is instead.
+test("an agent's upgrade card for a gate keeps the server's other conversations from another for that gate for 7 days, pointing to it", async ({ app }) => {
+  const { owner, server, room, other, apiKey } = await seedWorld();
+  const second = await seedSecondAgent(server.id, "upgrade-second", [room.id, other.id]);
+  const first = await prepared(await prepare(app.baseUrl, apiKey, `#${room.name}`), 201);
+  const offeredAt = await pinCardTime(first.messageId);
+  const address = `#${room.name} msg=${first.messageId.slice(0, 8)}`;
+
+  // Another agent in another conversation, the same gate: nothing posted, told where the card is.
+  assert.deepEqual(await refused(await prepare(app.baseUrl, second.apiKey, `#${other.name}`), 409), alreadyOffered(address));
+  // The same agent in another conversation, a DM, a thread: the same.
+  assert.deepEqual(await refused(await prepare(app.baseUrl, apiKey, `#${other.name}`), 409), alreadyOffered(address));
+  const dm = await channelService.findOrCreateDM(server.id, owner.id, second.agent.id);
+  assert.ok(dm);
+  assert.deepEqual(await refused(await prepare(app.baseUrl, second.apiKey, `dm:@${owner.name}`), 409), alreadyOffered(address));
+  // An agent not in the card's (public) channel, which it can open, is told where too.
+  const third = await channelService.createChannel(server.id, `upgrade-third-${randomUUID().slice(0, 6)}`);
+  const outsider = await seedSecondAgent(server.id, "upgrade-outsider", [third.id]);
+  assert.deepEqual(await refused(await prepare(app.baseUrl, outsider.apiKey, `#${third.name}`), 409), alreadyOffered(address));
+  assert.equal(await upgradeCardCount(server.id), 1);
+
+  // Another gate, or none (`general`), is another limit: posted.
+  await prepared(await prepare(app.baseUrl, second.apiKey, `#${other.name}`, { ...UPGRADE, gate: "upload_monthly_quota" }), 201);
+  await prepared(await prepare(app.baseUrl, outsider.apiKey, `#${third.name}`, { type: "plan:upgrade", reason: REASON }), 201);
+  assert.equal(await upgradeCardCount(server.id), 3);
+
+  // Another server is unaffected.
+  const elsewhere = await seedWorld();
+  await prepared(await prepare(app.baseUrl, elsewhere.apiKey, `#${elsewhere.room.name}`), 201);
+
+  // A minute before the 7 days end: still refused; a minute after: a new card.
+  await at(new Date(offeredAt.getTime() + 7 * DAY_MS - 60_000), async () => {
+    assert.deepEqual(await refused(await prepare(app.baseUrl, second.apiKey, `dm:@${owner.name}`), 409), alreadyOffered(address));
+  });
+  await at(new Date(offeredAt.getTime() + 7 * DAY_MS + 60_000), async () => {
+    const dm2 = await prepared(await prepare(app.baseUrl, second.apiKey, `dm:@${owner.name}`), 201);
+    assert.notEqual(dm2.messageId, first.messageId);
+  });
+  assert.equal(await upgradeCardCount(server.id), 4);
+
+  // A card in a conversation the agent can't open (another agent's DM): told it exists, not where.
+  const dmWorld = await seedWorld();
+  const dmPeer = await seedSecondAgent(dmWorld.server.id, "upgrade-dm-peer", [dmWorld.room.id]);
+  assert.ok(await channelService.findOrCreateDM(dmWorld.server.id, dmWorld.owner.id, dmWorld.agent.id));
+  await prepared(await prepare(app.baseUrl, dmWorld.apiKey, `dm:@${dmWorld.owner.name}`), 201);
+  assert.deepEqual(await refused(await prepare(app.baseUrl, dmPeer.apiKey, `#${dmWorld.room.name}`), 409), alreadyOffered(null));
+  assert.equal(await upgradeCardCount(dmWorld.server.id), 1);
+
+  // A card in someone's DM, even one the asking agent is in: not named (Bob must not be pointed to Alice's DM).
+  const dmAgain = await seedWorld();
+  assert.ok(await channelService.findOrCreateDM(dmAgain.server.id, dmAgain.owner.id, dmAgain.agent.id));
+  await prepared(await prepare(app.baseUrl, dmAgain.apiKey, `dm:@${dmAgain.owner.name}`), 201);
+  assert.deepEqual(await refused(await prepare(app.baseUrl, dmAgain.apiKey, `#${dmAgain.room.name}`), 409), alreadyOffered(null));
+});
+
+// Sage (#proj-apps:#84): the agent is told to point people to the card, so it
+// is named only where everyone on the server can open it. A card in a private
+// channel the agent belongs to is not named in a public one.
+test("a card in a private channel, or a thread of one, is not named even to an agent that is a member", async ({ app }) => {
+  const { server, room, agent, apiKey } = await seedWorld();
+  const secret = await channelService.createChannel(server.id, `upgrade-secret-${randomUUID().slice(0, 6)}`, undefined, "private");
+  await channelService.addAgent(secret.id, agent.id);
+  await prepared(await prepare(app.baseUrl, apiKey, `#${secret.name}`), 201);
+  // The agent can open the private channel, and the refusal still doesn't name it.
+  assert.deepEqual(await refused(await prepare(app.baseUrl, apiKey, `#${room.name}`), 409), alreadyOffered(null));
+
+  const elsewhere = await seedWorld();
+  const hidden = await channelService.createChannel(elsewhere.server.id, `upgrade-hidden-${randomUUID().slice(0, 6)}`, undefined, "private");
+  await channelService.addAgent(hidden.id, elsewhere.agent.id);
+  const root = await createMessage(hidden.id, "user", elsewhere.owner.id, "Can we see last quarter's notes?");
+  await prepared(await prepare(app.baseUrl, elsewhere.apiKey, `#${hidden.name}:${root.id.slice(0, 8)}`), 201);
+  assert.deepEqual(await refused(await prepare(app.baseUrl, elsewhere.apiKey, `#${elsewhere.room.name}`), 409), alreadyOffered(null));
+});
+
+test("the server-wide answer names a thread's card in thread form, skips a deleted card, and leaves the conversation's own answers first", async ({ app }) => {
+  const db = getDb();
+  const { owner, server, room, other, apiKey } = await seedWorld();
+  const second = await seedSecondAgent(server.id, "upgrade-thread", [room.id, other.id]);
+  const root = await createMessage(room.id, "user", owner.id, "Can we see last quarter's notes?");
+  const thread = `#${room.name}:${root.id.slice(0, 8)}`;
+  const first = await prepared(await prepare(app.baseUrl, apiKey, thread), 201);
+  assert.deepEqual(await refused(await prepare(app.baseUrl, second.apiKey, `#${other.name}`), 409), alreadyOffered(`${thread} msg=${first.messageId.slice(0, 8)}`));
+
+  // In the card's own conversation: the same gate within the day is the card already there; another gate is the cooldown.
+  const repeat = await prepared(await prepare(app.baseUrl, second.apiKey, thread), 200);
+  assert.equal(repeat.messageId, first.messageId);
+  assert.equal(repeat.existing, true);
+  assert.equal((await refused(await prepare(app.baseUrl, second.apiKey, thread, { ...UPGRADE, gate: "upload_file_size" }), 409)).errorCode, "UPGRADE_CARD_COOLDOWN");
+  // A conversation in its cooldown with the gate offered elsewhere: the cooldown answers (its own rule first).
+  await prepared(await prepare(app.baseUrl, apiKey, `#${other.name}`, { ...UPGRADE, gate: "agent_migration" }), 201);
+  assert.equal((await refused(await prepare(app.baseUrl, apiKey, `#${other.name}`), 409)).errorCode, "UPGRADE_CARD_COOLDOWN");
+
+  // A deleted card can't be pointed to: it holds its own conversation's cooldown only.
+  await db.update(messages).set({ deletedAt: new Date() }).where(eq(messages.id, first.messageId));
+  const room2 = await channelService.createChannel(server.id, `upgrade-fresh-${randomUUID().slice(0, 6)}`);
+  await channelService.addAgent(room2.id, second.agent.id);
+  await prepared(await prepare(app.baseUrl, second.apiKey, `#${room2.name}`), 201);
+});
+
+test("two agents preparing the same gate at once in two conversations of a server post one card", async ({ app }) => {
+  const { server, room, other, apiKey } = await seedWorld();
+  const second = await seedSecondAgent(server.id, "upgrade-race", [other.id]);
+  const responses = await Promise.all([prepare(app.baseUrl, apiKey, `#${room.name}`), prepare(app.baseUrl, second.apiKey, `#${other.name}`)]);
+  assert.deepEqual(responses.map((response) => response.status).sort(), [201, 409]);
+  const refusal = await refused(responses.find((response) => response.status === 409)!, 409);
+  assert.equal(refusal.errorCode, "UPGRADE_CARD_ALREADY_OFFERED");
+  assert.equal(await upgradeCardCount(server.id), 1);
+});
+
+// Nova counts the outcomes on the prepare request's span: 201 posted, 200 the
+// conversation's card already there, error_code upgrade_card_cooldown and
+// upgrade_card_already_offered (the server-wide answer) for the refusals.
+test("the prepare span records a server-wide answer as its own error_code", async ({ app }) => {
+  const sink = new MemoryTraceSink();
+  app.app.set("serverTracer", new BasicTracer({ sink }));
+  const prepareSpans = () => sink.getAllSpans().filter((span) =>
+    span.name === "server.http.request" && span.attrs?.route_pattern === "/internal/agent-api/prepare-action");
+  let seen = 0;
+  const traced = async (response: Response, status: number) => {
+    assert.equal(response.status, status, await response.clone().text());
+    seen += 1;
+    await vi.waitFor(() => assert.equal(prepareSpans().length, seen));
+    const attrs = prepareSpans()[seen - 1]!.attrs ?? {};
+    return [attrs.action_type, attrs.error_code, attrs.reason_class];
+  };
+  const { server, room, other, apiKey } = await seedWorld();
+  const second = await seedSecondAgent(server.id, "upgrade-traced", [other.id]);
+  assert.deepEqual(await traced(await prepare(app.baseUrl, apiKey, `#${room.name}`), 201), ["plan:upgrade", undefined, undefined]);
+  assert.deepEqual(await traced(await prepare(app.baseUrl, apiKey, `#${room.name}`), 200), ["plan:upgrade", undefined, undefined]);
+  assert.deepEqual(await traced(await prepare(app.baseUrl, apiKey, `#${room.name}`, { ...UPGRADE, gate: "upload_file_size" }), 409), ["plan:upgrade", "upgrade_card_cooldown", "conflict"]);
+  assert.deepEqual(await traced(await prepare(app.baseUrl, second.apiKey, `#${other.name}`), 409), ["plan:upgrade", "upgrade_card_already_offered", "conflict"]);
 });
 
 test("a deleted upgrade card still holds its conversation's cooldown", async ({ app }) => {

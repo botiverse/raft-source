@@ -13,10 +13,9 @@ export function MoveToSectionMenuItem({ section, current, onMove }: {
     <MenuItem
       icon={<FolderInput size={14} />}
       trailing={current ? <Check size={16} /> : null}
-      className={current ? "font-bold" : ""}
       onClick={move}
     >
-      <span className="flex min-w-0 items-center gap-1">
+      <span className={current ? "flex min-w-0 items-center gap-1 font-bold" : "flex min-w-0 items-center gap-1"}>
         {section.emoji && <span aria-hidden>{section.emoji}</span>}
         <span className="truncate">{section.name}</span>
       </span>

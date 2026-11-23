@@ -394,11 +394,13 @@ export function buildRedeliveredThirdPartyAgentMessage(input: {
 
 const t = thirdPartyAgentEvents;
 
-/** Pending, not past expires_at, not a hosted assistant's row. */
+/** Pending, not past expires_at, not a hosted assistant's row, not one sent to wake no one. */
 function pendingPredicates(now: Date): SQL[] {
   return [
     or(eq(t.status, "queued"), eq(t.status, "delivering"))!,
     isNull(t.deliveredAt),
+    // `delivery: "inbox"` (dm:@Remy:#1): never pushed, so never re-sent either.
+    eq(t.delivery, "wake"),
     sql`${t.expiresAt} > ${now}`,
     or(isNull(t.systemApp), ne(t.systemApp, EXCLUDED_SYSTEM_APP))!,
   ];

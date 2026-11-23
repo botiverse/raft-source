@@ -10,7 +10,7 @@ import { withTraceChildSpan, recordTraceEvent } from "../tracing/semanticTrace";
 import { includeThreadSources, type AnalysisSource } from "./sources";
 import * as channelService from "../services/channelService";
 import { agentHasScope } from "../services/agentScopesService";
-import { evaluateFeatureFlag } from "../services/featureFlagService";
+import { evaluateFeatureFlag, RAFTBENCH_OVERVIEW_FEATURE_FLAG_KEY } from "../services/featureFlagService";
 import { getActorServerRoleInServer } from "../lib/actorPermissions";
 import { isPilotServer, READ_GRANTS, validateFetchedEvidence, type ValidationProblem } from "./contract";
 import { hasExactRaftbenchServiceScopes } from "./credentialScopes";
@@ -99,7 +99,7 @@ async function ownedRun(tx: DatabaseTransaction, serverId: string, agentId: stri
     .where(and(eq(agentCredentials.agentId, agentId), isNull(agentCredentials.revokedAt)));
   if (!dedicated || !credentials.some(credential => hasExactRaftbenchServiceScopes(credential.scopes)))
     fail(403, "raftbench_service_credential_required", "This run requires its assigned RaftBench service agent and read-only credential.", "Ask an administrator to create and assign a RaftBench service agent with read and raftbench access. Retrying or using another credential will not help.");
-  const flag = await evaluateFeatureFlag({ key: "raftbench_overview_v0", serverId, userId: config.configuredByUserId }, tx);
+  const flag = await evaluateFeatureFlag({ key: RAFTBENCH_OVERVIEW_FEATURE_FLAG_KEY, serverId, userId: config.configuredByUserId }, tx);
   if (!flag.enabled) fail(409, "raftbench_disabled", "RaftBench was disabled for this server.", "Stop this run. Ask the administrator to review enrollment before reading context again.");
   if (config.revision !== run.revision) fail(409, "raftbench_revision_conflict", "The configuration revision changed.", "Read context again and use its current run ID and revision.");
   const sources = await withTraceChildSpan("server.raftbench.authorize_sources", { surface: "server", kind: "internal" }, () => assertLiveSources(config, agentId));

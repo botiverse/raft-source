@@ -60,12 +60,13 @@ import { runAttach, runAttachWithTokenFromStdin } from "./attach";
 import { readMachineTurnActivity } from "./turnActivity";
 import { parseForceUnbindIds, runDetach } from "./detach";
 import { runSetup } from "./setup";
-import { formatStatusReport, printProcJobsStatus } from "./status";
+import { formatStatusReport, printProcJobsStatus, readServerComputerNames } from "./status";
 import { runRunnersList, runRunnersStop } from "./runners";
 import { noteStartNeverRan, runStart, runStop, startAcceptsPartialReady, startNotesUpgradeStep, startWaitForCaller } from "./startStop";
 import { runResident, runService, isSeaBinary, RESIDENT_CLI_PATH_ENV_VAR } from "./service";
 import { runDoctor, runDoctorJson, runDoctorMigrationDetails } from "./doctorCli";
 import { runLogs } from "./logs";
+import { formatLeftovers, readLeftovers } from "./leftovers";
 import { CliExit, info, fail, present } from "./output";
 import { createComputerApi } from "./lib/api";
 import { createComputerTracer } from "./lib/computerTracer";
@@ -96,6 +97,7 @@ import { isServiceConnectionLoss, requestServiceRestartViaIpc } from "./serviceC
 import { callerIsRunnerHosted } from "./restartReadiness";
 import { connectService } from "./lib/ipc-client";
 import { removeServiceAddedMallocEnv } from "./runnerChildEnv";
+import { PAIR_FLAG_DESC, resolvePairFlag } from "./pairFlag";
 
 function withCliExit<A extends unknown[]>(fn: (...args: A) => Promise<void>) {
   return async (...args: A) => {
@@ -146,6 +148,8 @@ function resolveCliTracer(slockHome: string): Tracer {
 // differently. Command-specific behavior notes are appended at the
 // callsite, but the boilerplate (slug format / foreground) comes from here.
 const FOREGROUND_DESC = "run the service in this terminal instead of the background";
+const DEVICE_CODE_DESC =
+  "approve with a code you enter on any device, instead of in a browser on this machine";
 const SERVER_SLUG_TARGET_DESC =
   "target Raft server slug (canonical form `/myserver`; bare `myserver` accepted)";
 const SERVER_SLUG_OPTIONAL_DESC =
@@ -400,8 +404,9 @@ program
   .command("login")
   .description("No longer needed: use `raft-computer attach <server>`. Runs the same approval.")
   .option("--server-url <url>", `Raft API base URL; defaults to ${SERVER_URL_ENV_DESC}`)
-  .action(withCliExit(async (opts: { serverUrl?: string }) => {
-    await runLogin({ serverUrl: opts.serverUrl });
+  .option("--device-code", DEVICE_CODE_DESC)
+  .action(withCliExit(async (opts: { serverUrl?: string; deviceCode?: boolean }) => {
+    await runLogin({ serverUrl: opts.serverUrl, deviceCode: opts.deviceCode === true });
   }));
 
 // --- logout (kept for old docs/scripts: there is no session to end) ---
@@ -421,20 +426,31 @@ program
   .option("--name <name>", "Computer display name shown on the approval page; defaults to a sanitized hostname")
   .option("--no-start", "connect without starting Raft Computer")
   .option("--foreground", FOREGROUND_DESC)
+  .option("--device-code", DEVICE_CODE_DESC)
+  .option("--pair <id>", PAIR_FLAG_DESC)
   // Raft Desktop: it ran the approval itself (a one-time attach grant) and
   // hands over the single-use `dvat_*` token on stdin, never on argv.
   .option("--server-id <id>", "the server id the attach token was approved for (with --attach-token-stdin)")
   .option(COMPUTER_CLI_ATTACH_TOKEN_STDIN_FLAG, "read a one-time attach token from stdin instead of asking for approval")
   .option("--json", "print the result as one JSON line (with --attach-token-stdin)")
-  .action(withCliExit(async (serverSlug: string, opts: { serverUrl?: string; name?: string; start?: boolean; foreground?: boolean; serverId?: string; attachTokenStdin?: boolean; json?: boolean }) => {
+  .action(withCliExit(async (serverSlug: string, opts: { serverUrl?: string; name?: string; start?: boolean; foreground?: boolean; serverId?: string; attachTokenStdin?: boolean; json?: boolean; deviceCode?: boolean; pair?: string }) => {
     if (opts.attachTokenStdin) {
       await withMutationLock(() =>
         runAttachWithTokenFromStdin({ serverSlug, serverId: opts.serverId, serverUrl: opts.serverUrl, name: opts.name, json: opts.json === true }),
       );
       return;
     }
+    const pairingId = resolvePairFlag(opts.pair);
     await withMutationLock(() =>
-      runAttach({ serverSlug, serverUrl: opts.serverUrl, name: opts.name, start: opts.start, foreground: opts.foreground }),
+      runAttach({
+        serverSlug,
+        serverUrl: opts.serverUrl,
+        name: opts.name,
+        start: opts.start,
+        foreground: opts.foreground,
+        deviceCode: opts.deviceCode === true,
+        ...(pairingId ? { pairingId } : {}),
+      }),
     );
   }));
 
@@ -478,6 +494,8 @@ program
   .option("--no-start", "finish setup without starting Raft Computer")
   .option("--foreground", FOREGROUND_DESC)
   .option("-y, --yes", "allow non-interactive setup after confirming the planned actions")
+  .option("--device-code", DEVICE_CODE_DESC)
+  .option("--pair <id>", PAIR_FLAG_DESC)
   .action(
     withCliExit(async (
       serverSlug: string,
@@ -490,8 +508,11 @@ program
         start?: boolean;
         foreground?: boolean;
         yes?: boolean;
+        deviceCode?: boolean;
+        pair?: string;
       },
     ) => {
+      const pairingId = resolvePairFlag(opts.pair);
       await withMutationLock(() =>
         runSetup({
           serverSlug,
@@ -503,6 +524,8 @@ program
           start: opts.start,
           foreground: opts.foreground,
           yes: opts.yes,
+          deviceCode: opts.deviceCode === true,
+          ...(pairingId ? { pairingId } : {}),
         }),
       );
     }),
@@ -607,9 +630,26 @@ program
       return;
     }
     await present(async () => {
-      formatStatusReport(await api.getStatus());
+      const [report, names] = await Promise.all([api.getStatus(), readServerComputerNames(slockHome)]);
+      formatStatusReport(report, names);
       await printProcJobsStatus(slockHome);
     });
+  }));
+
+// --- leftovers (read-only, #raft-architecture:#34) ---
+// What agents have running on this Computer outside Raft's bookkeeping, which
+// the daemon leaves running when an agent is deleted or moves away. Lists only.
+program
+  .command("leftovers")
+  .description("List what agents have running on this Computer: processes, raftdev previews and containers. Stops nothing.")
+  .option("--json", "print the listing as JSON")
+  .action(withCliExit(async (opts: { json?: boolean }) => {
+    const report = await readLeftovers(resolveRaftHome());
+    if (opts.json) {
+      process.stdout.write(`${JSON.stringify(report)}\n`);
+      return;
+    }
+    for (const line of formatLeftovers(report, currentTimeMs())) info(line);
   }));
 
 // --- doctor (aggregate per-server health) ---
@@ -794,13 +834,23 @@ async function runCli(): Promise<void> {
   // Execute on the injected release artifact, without reading account files or
   // contacting an OAuth service. A successful --version cannot detect missing
   // modules behind the SDK's lazy credential-derivation path.
-  if (process.argv[2] === "__verify-bundled-oauth" || process.argv[2] === "__verify-bundled-kimi" || process.argv[2] === "__verify-bundled-oar") {
+  if (
+    process.argv[2] === "__verify-bundled-oauth"
+    || process.argv[2] === "__verify-bundled-kimi"
+    || process.argv[2] === "__verify-bundled-bedrock"
+    || process.argv[2] === "__verify-bundled-oar"
+  ) {
     const core = await import("@botiverse/raft-daemon/core");
     if (process.argv[2] === "__verify-bundled-oauth") {
       await core.verifyBundledPiOAuth();
       process.stdout.write("oauth-bundle-ok\n");
+    } else if (process.argv[2] === "__verify-bundled-bedrock") {
+      // The AWS SDK behind pi's Bedrock provider is its own SEA asset, loaded
+      // on the first Bedrock request; send one to a loopback server.
+      await core.verifyBundledPiBedrock();
+      process.stdout.write("bedrock-bundle-ok\n");
     } else if (process.argv[2] === "__verify-bundled-oar") {
-      // RFC 060: the OAR host's runtimes (grok, qwen, qoder), their session paths and the observe entry, from the bundle.
+      // RFC 060: the OAR host's runtimes (grok, qwen, qoder, dsh), their session paths and the observe entry, from the bundle.
       await core.verifyBundledOarHost();
       process.stdout.write("oar-bundle-ok\n");
     } else {

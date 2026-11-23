@@ -5,6 +5,7 @@ import type {
   RuntimeAccountUsageSnapshot,
   RuntimeLimitResetIdempotencyKey,
   RuntimeLimitResetKind,
+  RuntimeLimitResetKindStatus,
   RuntimeLimitResetResult,
   RuntimeLimitResetsReadResult,
 } from "@botiverse/raft-shared";
@@ -14,48 +15,66 @@ import ConfirmDialog from "../../components/ConfirmDialog";
 import Banner from "../../components/ui/Banner";
 import type { RuntimeAuthClient } from "../../utils/runtimeAuthClient";
 import { limitResetRequestErrorMessageId, limitResetRequestOutcomeUnknown } from "./limitResetOutcome";
-import { claudeKindMeta, claudeKindName, claudeLimitResetNote, claudeLimitResetRefusal, claudeLimitResetsNotSupportedHere, claudeLimitResetsNotSupportedMessageId } from "./claudeLimitResetCopy";
+import {
+  claudeKindMeta,
+  claudeKindName,
+  claudeLimitResetNote,
+  claudeLimitResetReadStep,
+  claudeLimitResetRefusal,
+  claudeLimitResetsNotSupportedHere,
+  claudeLimitResetsNotSupportedMessageId,
+} from "./claudeLimitResetCopy";
+import type { ClaudeLimitResetAvailable } from "./claudeLimitResetCopy";
 import type { RuntimeLimitResetOutcome } from "./limitResetOutcome";
 
 /**
- * Claude limit resets on the usage card (claude_limit_reset): the list of
- * kinds the account holds, read on the Computer through Claude Code's own
- * `/limit-reset` only when the person asks, and the confirm that uses one.
+ * Claude limit resets on the usage card (claude_limit_reset_v2), as Claude
+ * Code's own `/limit-reset` goes: "Use a limit reset" reads the kinds the
+ * account holds on the Computer (the read is a bare `/limit-reset` there),
+ * then one usable kind goes straight to its confirm, several to "Which reset
+ * do you want to use?", and anything else ends with a line on the card.
  * docs/contracts/runtime-account-usage.md, "Limit resets (Claude)".
  */
 
 /**
- * Confirms using one kind of reset, naming the kind and the account, and that
- * it cannot be undone. Its key comes from the card: one per attempt on that
- * kind, the same one again after a request whose answer never arrived.
+ * Confirms using one kind of reset in Claude Code's words ("Use a weekly
+ * reset?", "Yes, use my weekly reset" / "No, keep it"), naming the account
+ * (Raft acts on another machine's account) and what the read said of the
+ * kind. Its key comes from the card: one per attempt on that kind, the same
+ * one again after a request whose answer never arrived. Closed before
+ * anything was sent, `onClose(true)`: the reset was kept.
  */
 export function ClaudeLimitResetConfirmDialog({
   serverId,
   machineId,
   kind,
+  status = null,
   account,
   atFiveHourLimit,
   idempotencyKey,
   client,
-  layer = 0,
   onOutcome,
   onClose,
 }: {
   serverId: string;
   machineId: string;
   kind: RuntimeLimitResetKind;
+  /** What the read said of this kind: its "2 left · use by …" line. */
+  status?: RuntimeLimitResetKindStatus | null;
   account: string | null;
   atFiveHourLimit: boolean;
   idempotencyKey: RuntimeLimitResetIdempotencyKey;
   client: RuntimeAuthClient;
-  layer?: number;
   /** An answer the dialog closes on: the card shows `note` and the usage read after it. */
   onOutcome: (outcome: RuntimeLimitResetOutcome & { kind: RuntimeLimitResetKind; note: string | null }) => void;
-  onClose: () => void;
+  /** `kept`: closed before any request was sent ("No, keep it"). */
+  onClose: (kept: boolean) => void;
 }) {
   const { formatMessage } = useIntl();
   const name = claudeKindName(formatMessage, kind);
+  const sentRef = useRef(false);
   const handleConfirm = useCallback(async () => {
+    sentRef.current = true;
     let reply: { result: RuntimeLimitResetResult; snapshot: RuntimeAccountUsageSnapshot | null };
     try {
       reply = await client.redeemLimitReset(serverId, machineId, "claude", idempotencyKey, kind);
@@ -72,49 +91,63 @@ export function ClaudeLimitResetConfirmDialog({
     onOutcome({ kind, result: reply.result, snapshot: reply.snapshot, note });
     if (note === null) throw new Error(claudeLimitResetRefusal(formatMessage, kind, reply.result, atFiveHourLimit));
   }, [atFiveHourLimit, client, formatMessage, idempotencyKey, kind, machineId, onOutcome, serverId]);
+  const close = useCallback(() => onClose(!sentRef.current), [onClose]);
   const accountLabel = account ?? formatMessage({ id: "machine.runtimeUsage.limitReset.accountFallback" });
+  const detail = status?.state === "available" ? claudeKindMeta(formatMessage, status, "useBy") : null;
   return (
     <ConfirmDialog
       title={formatMessage({ id: "machine.runtimeUsage.claudeReset.confirmTitle" }, { kind: name })}
       plainMessage
       message={(
-        <p className="text-subhead text-foreground-muted" data-testid="claude-limit-reset-confirm">
-          {formatMessage(
-            { id: "machine.runtimeUsage.claudeReset.confirmBody" },
-            { kind: name, account: <span key="account" className="font-semibold text-foreground">{accountLabel}</span> },
-          )}
-        </p>
+        <div className="stack-y-1" data-testid="claude-limit-reset-confirm">
+          <p className="text-subhead text-foreground-muted">
+            {formatMessage(
+              { id: "machine.runtimeUsage.claudeReset.confirmBody" },
+              { account: <span key="account" className="font-semibold text-foreground">{accountLabel}</span> },
+            )}
+          </p>
+          {detail && <p className="text-footnote text-foreground-muted" data-testid="claude-limit-reset-confirm-detail">{detail}</p>}
+        </div>
       )}
       confirmLabel={formatMessage({ id: "machine.runtimeUsage.claudeReset.confirm" }, { kind: name })}
+      cancelLabel={formatMessage({ id: "machine.runtimeUsage.claudeReset.keep" })}
       confirmVariant="primary"
-      layer={layer}
       maxWidthClass="max-w-md"
       onConfirm={handleConfirm}
-      onClose={onClose}
+      onClose={close}
     />
   );
 }
 
 type ReadState =
-  | { phase: "consent" }
   | { phase: "reading"; consent: boolean }
   | { phase: "read"; result: Extract<RuntimeLimitResetsReadResult, { kind: "read" }> }
+  | { phase: "choose"; usable: ClaudeLimitResetAvailable[]; atLimit: boolean }
   | { phase: "failed"; message: string };
 
 /**
- * "View available resets": at the 5-hour limit it first asks the person to
- * accept that, on Claude's older program, opening the list there uses the
- * 5-hour reset. Then it reads, lists each kind with what Claude Code showed,
- * and hands the chosen one to `onUse` (the confirm). Nothing is retried for
- * the person.
+ * "Use a limit reset": it reads at once ("This takes a moment"), then goes on
+ * as Claude Code's `/limit-reset` does (`claudeLimitResetReadStep`): one
+ * usable kind is handed to `onUse` (the confirm) without a list; several are
+ * offered under "Which reset do you want to use?" ("Use a weekly reset",
+ * "2 left · until …"), the chosen one handed to `onUse`; otherwise the read
+ * ends with a line for the card (`onNote`), such as "5-hour limit reset ·
+ * your weekly limit still applies" when on Claude's older program the read
+ * itself used the 5-hour reset. Nothing is retried for the person.
  *
- * A viewer who did not connect the Computer (`canUse` false) gets the same
- * read as a plain list: display-only rows, nothing to choose, Close as the
- * one action, and copy that speaks of the Computer's resets, not "yours".
- * The card opens it for them only where the read needs no consent
- * (`claudeLimitResetOffer`). The consent is the connecting person's alone:
- * if the Computer asks for one anyway, no read with consent is sent and the
- * dialog says who can, as the server would.
+ * A viewer the server says may not use them (`canUse` false: only an older
+ * server, which kept Claude resets to the person who connected the Computer;
+ * the current one lets owners and admins use them too) gets "View available
+ * resets": the same read as a plain list of every kind, display-only rows,
+ * Close as the one action, and copy that speaks of the Computer's resets, not
+ * "yours". The card opens it for them only where the read needs no consent
+ * (`claudeLimitResetOffer`). If the Computer asks for one anyway, no read with
+ * consent is sent and the dialog says who can use the resets.
+ *
+ * Someone who may use a reset is never asked first (artin,
+ * #proj-raft-computer:4e327d5c): at the 5-hour limit the read carries consent
+ * at once, and below it a Computer that still answers `consent_required` (the
+ * card's usage was stale) gets one more read with consent.
  */
 export function ClaudeLimitResetsDialog({
   serverId,
@@ -123,33 +156,33 @@ export function ClaudeLimitResetsDialog({
   canUse = true,
   client,
   onUse,
-  onLegacy,
+  onNote,
   onNotSupported,
   onClose,
 }: {
   serverId: string;
   machineId: string;
-  /** The card's usage shows the account at its 5-hour limit: ask before reading. */
+  /** The card's usage shows the account at its 5-hour limit: the read carries consent (or, for a viewer who cannot give it, none is sent). */
   atFiveHourLimit: boolean;
   /**
-   * The viewer connected this Computer: they can use a reset and consent to
-   * the read that may spend the 5-hour one. False: the list is read-only.
+   * The viewer may use a reset and consent to the read that may spend the
+   * 5-hour one (`claudeLimitResetAccess.canUse`). False: the list is read-only.
    */
   canUse?: boolean;
   client: RuntimeAuthClient;
-  onUse: (kind: RuntimeLimitResetKind) => void;
-  /** The read showed the older program; `spent`: opening the list used its 5-hour reset. */
-  onLegacy: (spent: boolean) => void;
+  /** Confirm this kind (the one usable kind, or the one chosen). */
+  /** `atLimit`: the card's usage, or a read the Computer would only run with consent, put the account at its 5-hour limit. */
+  onUse: (status: ClaudeLimitResetAvailable, atLimit: boolean) => void;
+  /** The read ended with a line for the card; `usageChanged`: it used the older program's 5-hour reset. */
+  onNote: (note: string, usageChanged: boolean) => void;
   /** The Computer cannot run Claude limit resets at all (macOS): the card stops offering them. */
   onNotSupported?: () => void;
   onClose: () => void;
 }) {
   const { formatMessage } = useIntl();
-  const [state, setState] = useState<ReadState>(() => (!atFiveHourLimit
-    ? { phase: "reading", consent: false }
-    : canUse
-      ? { phase: "consent" }
-      : { phase: "failed", message: formatMessage({ id: "machine.runtimeUsage.claudeReset.ownerOnly" }) }));
+  const [state, setState] = useState<ReadState>(() => (!atFiveHourLimit || canUse
+    ? { phase: "reading", consent: atFiveHourLimit }
+    : { phase: "failed", message: formatMessage({ id: "machine.runtimeUsage.limitReset.forbidden" }) }));
   const [selected, setSelected] = useState<RuntimeLimitResetKind | null>(null);
   const liveRef = useRef(true);
   useEffect(() => {
@@ -157,10 +190,16 @@ export function ClaudeLimitResetsDialog({
     return () => { liveRef.current = false; };
   }, []);
 
-  const read = useCallback(async (consent: boolean) => {
+  const read = useCallback(async (firstConsent: boolean) => {
+    let consent = firstConsent;
     let result: RuntimeLimitResetsReadResult;
     try {
       result = await client.readLimitResets(serverId, machineId, consent);
+      if (result.kind === "unsupported" && result.reason === "consent_required" && !consent && canUse && liveRef.current) {
+        // The account reached the limit after the card's usage was read: read again, with consent, unasked.
+        consent = true;
+        result = await client.readLimitResets(serverId, machineId, consent);
+      }
     } catch (error) {
       if (!liveRef.current) return;
       setState({
@@ -173,18 +212,28 @@ export function ClaudeLimitResetsDialog({
     }
     if (!liveRef.current) return;
     switch (result.kind) {
-      case "read":
-        if (result.program === "legacy") onLegacy(result.fiveHourSpent === true);
-        // Nothing chosen for the person: Use stays off until they pick a kind.
-        setSelected(null);
-        setState({ phase: "read", result });
+      case "read": {
+        // A read that used the 5-hour reset is said the same to anyone; otherwise a viewer who cannot use them gets the plain list.
+        if (!canUse && !result.fiveHourSpent) {
+          setState({ phase: "read", result });
+          return;
+        }
+        // A read that needed consent (the card's usage was stale) found the account at the limit.
+        const atLimit = atFiveHourLimit || consent;
+        const next = claudeLimitResetReadStep(result, atLimit);
+        if (next.step === "note") onNote(formatMessage({ id: next.messageId }), next.usageChanged);
+        else if (next.step === "confirm") onUse(next.status, atLimit);
+        else {
+          // Nothing chosen for the person: Use stays off until they pick a kind.
+          setSelected(null);
+          setState({ phase: "choose", usable: next.usable, atLimit });
+        }
         return;
+      }
       case "unsupported":
         if (result.reason === "consent_required" && !consent) {
           // Someone who cannot give it is not asked: nothing more is sent.
-          setState(canUse
-            ? { phase: "consent" }
-            : { phase: "failed", message: formatMessage({ id: "machine.runtimeUsage.claudeReset.ownerOnly" }) });
+          setState({ phase: "failed", message: formatMessage({ id: "machine.runtimeUsage.limitReset.forbidden" }) });
           return;
         }
         if (claudeLimitResetsNotSupportedHere(result)) {
@@ -194,11 +243,14 @@ export function ClaudeLimitResetsDialog({
         }
         setState({
           phase: "failed",
-          message: result.reason === "not_attempted"
-            ? formatMessage({ id: canUse ? "machine.runtimeUsage.claudeReset.notAttempted" : "machine.runtimeUsage.claudeReset.readFailedViewOnly" })
-            : result.reason === "not_installed"
-              ? formatMessage({ id: "machine.runtimeAuth.error.notInstalled" }, { runtime: "Claude Code" })
-              : formatMessage({ id: "machine.runtimeUsage.limitReset.unsupported" }, { runtime: "Claude Code" }),
+          // Claude Code's first-run setup is unfinished on the Computer: said the same to anyone who can read.
+          message: result.reason === "onboarding_required"
+            ? formatMessage({ id: "machine.runtimeUsage.claudeReset.onboardingRequired" })
+            : result.reason === "not_attempted"
+              ? formatMessage({ id: canUse ? "machine.runtimeUsage.claudeReset.readNotAttempted" : "machine.runtimeUsage.claudeReset.readFailedViewOnly" })
+              : result.reason === "not_installed"
+                ? formatMessage({ id: "machine.runtimeAuth.error.notInstalled" }, { runtime: "Claude Code" })
+                : formatMessage({ id: "machine.runtimeUsage.limitReset.unsupported" }, { runtime: "Claude Code" }),
         });
         return;
       case "reauth_required":
@@ -207,9 +259,9 @@ export function ClaudeLimitResetsDialog({
       default:
         setState({ phase: "failed", message: formatMessage({ id: canUse ? "machine.runtimeUsage.claudeReset.readFailed" : "machine.runtimeUsage.claudeReset.readFailedViewOnly" }) });
     }
-  }, [canUse, client, formatMessage, machineId, onLegacy, onNotSupported, serverId]);
+  }, [atFiveHourLimit, canUse, client, formatMessage, machineId, onNote, onNotSupported, onUse, serverId]);
 
-  // The first read starts on open when no consent is needed; a later one only from Continue.
+  // One read, on open.
   const startedRef = useRef(false);
   useEffect(() => {
     if (startedRef.current || state.phase !== "reading") return;
@@ -217,51 +269,28 @@ export function ClaudeLimitResetsDialog({
     void read(state.consent);
   }, [read, state]);
 
-  // One read with consent per dialog, however often Continue is pressed.
-  const consentedRef = useRef(false);
-  const confirmConsent = useCallback(() => {
-    if (!canUse || consentedRef.current) return;
-    consentedRef.current = true;
-    startedRef.current = true;
-    setState({ phase: "reading", consent: true });
-    void read(true);
-  }, [canUse, read]);
-  const listed = state.phase === "read" ? state.result : null;
-  const legacy = listed?.program === "legacy";
-  const items = useMemo<ChoiceListItem[]>(() => (listed && !legacy
-    ? listed.resets.map((reset) => ({
-        value: reset.kind,
-        label: claudeKindName(formatMessage, reset.kind),
-        meta: claudeKindMeta(formatMessage, reset),
-        // At the 5-hour limit only a 5-hour reset is used from here (the hint below says where the others are).
-        disabled: reset.state !== "available" || (atFiveHourLimit && reset.kind !== "five_hour"),
-      }))
-    : []), [atFiveHourLimit, formatMessage, legacy, listed]);
-  const usable = canUse && selected !== null && items.some((item) => item.value === selected && !item.disabled);
+  const usable = state.phase === "choose" ? state.usable : null;
+  const choices = useMemo<ChoiceListItem[]>(() => (usable ?? []).map((reset) => ({
+    value: reset.kind,
+    label: formatMessage({ id: "machine.runtimeUsage.claudeReset.useKind" }, { kind: claudeKindName(formatMessage, reset.kind) }),
+    meta: claudeKindMeta(formatMessage, reset, "until"),
+  })), [formatMessage, usable]);
   const useSelected = useCallback(() => {
-    if (usable && selected) onUse(selected);
-  }, [onUse, selected, usable]);
+    const chosen = usable?.find((reset) => reset.kind === selected);
+    if (chosen && state.phase === "choose") onUse(chosen, state.atLimit);
+  }, [onUse, selected, state, usable]);
   const choose = useCallback((value: string) => setSelected(value as RuntimeLimitResetKind), []);
 
-  if (state.phase === "consent") {
-    return (
-      <ConfirmDialog
-        title={formatMessage({ id: "machine.runtimeUsage.claudeReset.consentTitle" })}
-        message={formatMessage({ id: "machine.runtimeUsage.claudeReset.consentBody" })}
-        confirmLabel={formatMessage({ id: "machine.runtimeUsage.claudeReset.consentConfirm" })}
-        // Disruptive but chosen with eyes open: orange, not the red of a sure loss.
-        confirmVariant="warning"
-        initialFocus="cancel"
-        closeOnConfirm={false}
-        maxWidthClass="max-w-md"
-        onConfirm={confirmConsent}
-        onClose={onClose}
-      />
-    );
-  }
+  // Read-only: every kind as Claude Code showed it.
+  const listed = state.phase === "read" ? state.result : null;
+  const legacy = listed?.program === "legacy";
+  const rows = listed && !legacy
+    ? listed.resets.map((reset) => ({ kind: reset.kind, label: claudeKindName(formatMessage, reset.kind), meta: claudeKindMeta(formatMessage, reset) }))
+    : [];
 
-  const title = formatMessage({ id: "machine.runtimeUsage.claudeReset.dialogTitle" });
   const reading = state.phase === "reading";
+  const title = formatMessage({ id: usable ? "machine.runtimeUsage.claudeReset.chooseTitle" : "machine.runtimeUsage.claudeReset.dialogTitle" });
+  const listLabel = formatMessage({ id: "machine.runtimeUsage.claudeReset.listLabel" });
   return (
     <ConfirmDialog
       title={title}
@@ -270,7 +299,7 @@ export function ClaudeLimitResetsDialog({
       // Read-only: nothing to use, so Close is the one action.
       closeOnConfirm={!canUse}
       confirmVariant={canUse ? "primary" : "outline"}
-      confirmDisabled={canUse && !usable}
+      confirmDisabled={canUse && !usable?.some((reset) => reset.kind === selected)}
       hideCancel={!canUse}
       confirmLabel={formatMessage({ id: canUse ? "machine.runtimeUsage.claudeReset.useSelectedAction" : "common.close" })}
       onConfirm={useSelected}
@@ -280,49 +309,39 @@ export function ClaudeLimitResetsDialog({
           {reading && (
             <div className="flex items-center gap-2 text-subhead text-foreground-muted" role="status" data-testid="claude-limit-resets-reading">
               <Spinner size="xs" aria-hidden="true" />
-              {formatMessage({ id: canUse ? "machine.runtimeUsage.claudeReset.reading" : "machine.runtimeUsage.claudeReset.readingViewOnly" })}
+              {formatMessage({ id: "machine.runtimeUsage.claudeReset.reading" })}
             </div>
           )}
           {state.phase === "failed" && (
             <Banner intent="warning" data-testid="claude-limit-resets-failed">{state.message}</Banner>
           )}
-          {listed?.fiveHourSpent && (
-            <Banner intent="warning" data-testid="claude-limit-resets-five-hour-spent">
-              {formatMessage({ id: "machine.runtimeUsage.claudeReset.readFiveHourSpent" })}
-            </Banner>
-          )}
           {legacy && (
             <p className="text-subhead text-foreground-muted" data-testid="claude-limit-resets-legacy">
-              {formatMessage({ id: canUse ? "machine.runtimeUsage.claudeReset.legacy" : "machine.runtimeUsage.claudeReset.legacyViewOnly" })}
+              {formatMessage({ id: "machine.runtimeUsage.claudeReset.legacyViewOnly" })}
             </p>
           )}
-          {items.length > 0 && !canUse && (
+          {rows.length > 0 && (
             // Display-only rows: a radio list with nothing to do with the choice would be a dead end.
-            <ListRowGroup role="list" aria-label={formatMessage({ id: "machine.runtimeUsage.claudeReset.listLabel" })} data-testid="claude-limit-resets-read-only">
-              {items.map((item) => (
-                <ListRow key={item.value} variant="plain" interactive={false} role="listitem">
+            <ListRowGroup role="list" aria-label={listLabel} data-testid="claude-limit-resets-read-only">
+              {rows.map((row) => (
+                <ListRow key={row.kind} variant="plain" interactive={false} role="listitem">
                   <ListRowBody>
-                    <ListRowTitle>{item.label}</ListRowTitle>
-                    <ListRowDescription>{item.meta}</ListRowDescription>
+                    <ListRowTitle>{row.label}</ListRowTitle>
+                    <ListRowDescription>{row.meta}</ListRowDescription>
                   </ListRowBody>
                 </ListRow>
               ))}
             </ListRowGroup>
           )}
-          {items.length > 0 && canUse && (
+          {choices.length > 0 && (
             <ChoiceList
-              items={items}
+              items={choices}
               value={selected}
               onValueChange={choose}
-              aria-label={formatMessage({ id: "machine.runtimeUsage.claudeReset.listLabel" })}
-              searchLabel={formatMessage({ id: "machine.runtimeUsage.claudeReset.listLabel" })}
+              aria-label={listLabel}
+              searchLabel={listLabel}
               clearSearchLabel={formatMessage({ id: "search.clearSearch" })}
             />
-          )}
-          {items.length > 0 && canUse && atFiveHourLimit && (
-            <p className="text-footnote text-foreground-muted" data-testid="claude-limit-resets-at-limit-hint">
-              {formatMessage({ id: "machine.runtimeUsage.claudeReset.atLimitHint" })}
-            </p>
           )}
         </div>
       )}

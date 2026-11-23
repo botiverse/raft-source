@@ -132,17 +132,24 @@ async function callableAgent(serverId: string, userId: string, agentId: string) 
  * What the agent is doing now, for the call's opening instructions: read as
  * a status ask (prepareVoiceAsk), so the editors' `voice_askable` switch and
  * the status budget hold. Asking turned off or over budget: no status, and
- * the Computer is not asked. `offline`: the Computer answered that the agent
- * isn't running, or did not answer.
+ * the Computer is not asked. `offline`: the Computer did not answer. An idle
+ * agent's runtime is often asleep (`agent_not_running`): a call doesn't need
+ * it running, so it opens saying the agent isn't busy (#wg-runtime-form:#22,
+ * artin's first staging call). A Computer too old to answer opens without a
+ * status.
  */
 async function openingStatus(deps: Deps, serverId: string, userId: string, agentId: string): Promise<{ text: string | null } | "offline"> {
   const prepared = await prepareVoiceAsk({ orchestrator: deps.orchestrator, serverId, userId, agentId, ask: { kind: "status" } });
   if (!prepared.ok) return { text: null };
   const result = await prepared.ask();
   if (result.outcome === "answered") return { text: result.text ?? null };
-  if (result.outcome === "agent_not_running" || result.outcome === "computer_offline" || result.outcome === "computer_upgrade_required") return "offline";
+  if (result.outcome === "computer_offline") return "offline";
+  if (result.outcome === "agent_not_running") return { text: IDLE_STATUS };
   return { text: null };
 }
+
+/** The opening status of an agent whose runtime is asleep: nothing in progress. */
+const IDLE_STATUS = "Not working on anything right now.";
 
 export async function startAgentVoiceCall(input: Deps & { serverId: string; userId: string; agentId: string }): Promise<AgentVoiceCallStartResult> {
   const { serverId, userId, agentId } = input;
@@ -163,6 +170,12 @@ export async function startAgentVoiceCall(input: Deps & { serverId: string; user
   if (isExternalAgentRuntime(agent.runtime)) {
     trace("unsupported_runtime");
     return { ok: false, code: "unsupported_runtime" };
+  }
+  // Stopped by a person: nothing wakes it until it is started again, so it is
+  // not reachable. The web shows no Call button for it.
+  if (agent.status === "stopped") {
+    trace("agent_stopped");
+    return { ok: false, code: "agent_offline" };
   }
   await expireStaleCalls(input, agent.id);
   const admission = await admitVoiceCall(userId, agent.id);
@@ -209,6 +222,7 @@ export async function startAgentVoiceCall(input: Deps & { serverId: string; user
       instructions: instructionsFor({ agentName, description: agent.description, callerName, status: status.text }),
       tools: TOOLS,
       callback: { url: `${origin}/api/webhooks/holt-live/calls/${callId}`, secret },
+      captions: true,
     }));
   } catch (error) {
     if (!(error instanceof HoltLiveError)) throw error;

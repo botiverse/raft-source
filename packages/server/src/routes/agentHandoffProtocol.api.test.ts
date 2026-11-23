@@ -34,7 +34,10 @@ test("registered protocol is legacy by default and login reads the server-owned 
     method: "PATCH", headers: { Authorization: `Bearer ${humanToken}`, "X-Server-Id": server.id, "Content-Type": "application/json" },
     body: JSON.stringify({ name: "Updated fixture", agentHandoffProtocol: "v1" }),
   });
-  assert.equal(patch.status, 200);
+  // The edit API refuses fields it does not read (#15404), so the opt-in is refused outright, not ignored.
+  assert.equal(patch.status, 400);
+  const patchBody = await patch.json() as { code?: string };
+  assert.equal(patchBody.code, "APP_UPDATE_UNKNOWN_FIELD");
   assert.equal((await login(client.clientId)).agentHandoffProtocol, "legacy", "an App owner cannot opt in via the ordinary edit API");
   await getDb().update(oauthClients).set({ agentHandoffProtocol: "v1" }).where(eq(oauthClients.id, client.id));
   assert.equal((await login(client.clientId)).agentHandoffProtocol, "v1");

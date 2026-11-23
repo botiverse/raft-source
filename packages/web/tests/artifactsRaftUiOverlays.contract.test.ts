@@ -56,6 +56,9 @@ const KNOWN = new Map<string, string>([
   // Not a control raft-ui has: the table's column-resize grip (#proj-workspace:#133, design D21), a focusable separator
   // with its own ring until raft-ui's Table takes it (TODO(raft-ui) in ArtifactsTable.tsx; Kirby upstreams it).
   ["ArtifactsTable.tsx own focus ring", "the table's column-resize grip, a raft-ui gap (#133)"],
+  // Not a control raft-ui has: a compact clickable person row inside a popover (the viewers list, #triage:#469).
+  // raft-ui's ListRow is 64px; the row copies ComputerOwnerField's person chip until raft-ui has one (Kirby upstreams it).
+  ["ArtifactPresence.tsx own focus ring", "a compact person row in a popover, a raft-ui gap (#triage:#469)"],
 ]);
 
 function walk(dir: string, out: string[] = []): string[] {

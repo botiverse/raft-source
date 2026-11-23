@@ -122,10 +122,13 @@ describe("the public Artifact page's head", () => {
       `<meta property="og:description" content="Revenue grew 12% on the quarter.">`,
       `<meta property="og:type" content="article">`,
       `<meta property="og:url" content="${APP}/artifacts/${ID}">`,
-      `<meta property="og:image" content="${APP}/android-chrome-512x512.png">`,
-      `<meta name="twitter:card" content="summary">`,
+      `<meta property="og:image" content="${API}/api/public/artifacts/${ID}/og-image.png?v=${encodeURIComponent(META.updatedAt)}">`,
+      `<meta property="og:image:width" content="1200">`,
+      `<meta property="og:image:height" content="630">`,
+      `<meta name="twitter:card" content="summary_large_image">`,
       `<meta name="twitter:title" content="Q3 report">`,
       `<meta name="twitter:description" content="Revenue grew 12% on the quarter.">`,
+      `<meta name="twitter:image" content="${API}/api/public/artifacts/${ID}/og-image.png?v=${encodeURIComponent(META.updatedAt)}">`,
       `<link rel="canonical" href="${APP}/artifacts/${ID}">`,
       `<link rel="alternate" type="text/markdown" href="${API}/api/public/artifacts/${ID}/index.md">`,
       `<link rel="alternate" type="text/html" title="Source" href="${API}/api/public/artifacts/${ID}/files/index.html">`,
@@ -140,6 +143,19 @@ describe("the public Artifact page's head", () => {
   test("a pinned version's page (/v/<n>) gets the same head, its canonical the Artifact's address", async () => {
     const { body } = await page(`/artifacts/${ID}/v/3`);
     assert.ok(body.includes(`<link rel="canonical" href="${APP}/artifacts/${ID}">`));
+  });
+
+  test("injectPreview strips default fallback OG tags so rewritten pages never emit duplicate og:title or og:image tags", () => {
+    const shellWithDefault = `<!doctype html><html><head><meta charset="UTF-8" /><title>Raft</title><meta data-raft-default-og property="og:title" content="Raft" /><meta data-raft-default-og property="og:image" content="${APP}/brand/og-raft.png" /></head><body><div id="root"></div></body></html>`;
+    const out = injectPreview(shellWithDefault, {
+      title: "Q3 report | Raft",
+      head: `<meta property="og:title" content="Q3 report">\n<meta property="og:image" content="${API}/api/public/artifacts/${ID}/og-image.png">`,
+      article: "<article>x</article>",
+    });
+    assert.ok(out);
+    assert.ok(!out.includes("data-raft-default-og"));
+    assert.equal((out.match(/property="og:title"/g) ?? []).length, 1);
+    assert.equal((out.match(/property="og:image"/g) ?? []).length, 1);
   });
 
   test("the canonical is the configured web origin, never the request's Host", async () => {

@@ -59,6 +59,8 @@ export function computerProbeFreshness<T>(answer: ComputerProbeAnswer<T>): Compu
 export interface AgentSkillsList {
   global: SkillInfo[];
   workspace: SkillInfo[];
+  /** Additive: absent from older daemons and from a daemon's folder-scan fallback. */
+  builtin?: SkillInfo[];
 }
 
 /**
@@ -166,8 +168,15 @@ const runtimeModelInfoSchema = z.object({
   label: z.string(),
   supportedReasoningEfforts: z.array(z.string()).optional(),
   defaultReasoningEffort: z.string().optional(),
+  reasoningEffortUnavailableReason: z.string().optional(),
   serviceTiers: z.array(z.string()).optional(),
   defaultServiceTier: z.string().optional(),
+  // #wg-runtime-form:#27: what the Computer can launch by name; the form reads it.
+  serviceTierChoices: z.array(z.object({
+    id: z.string(),
+    name: z.string().optional(),
+    description: z.string().optional(),
+  })).optional(),
   verified: z.enum(["launchable", "suggestion_only"]).optional(),
 });
 
@@ -202,6 +211,7 @@ const skillInfoSchema = z.object({
 const cachedSkillsSchema = z.object({
   global: z.array(skillInfoSchema),
   workspace: z.array(skillInfoSchema),
+  builtin: z.array(skillInfoSchema).optional(),
 });
 
 // The record schemas are the shared types exactly: a field added to one side
@@ -242,8 +252,20 @@ function skillsSlot({ machineId, runtime, agentId }: AgentSkillsProbeTarget): Pr
   };
 }
 
+/**
+ * The Computer answered that it could not read this (OAR's skills read
+ * failed, with `reason`): served like a wait that ran out, the last answer
+ * (stale) or unavailable, never as a server error.
+ */
+export class ComputerReadUnavailableError extends Error {
+  constructor(readonly reason: string) {
+    super(`The Computer could not read this (${reason})`);
+    this.name = "ComputerReadUnavailableError";
+  }
+}
+
 function isComputerWaitTimeout(error: unknown): boolean {
-  return error instanceof RouteFailureError && error.subkind === "daemon_timeout";
+  return (error instanceof RouteFailureError && error.subkind === "daemon_timeout") || error instanceof ComputerReadUnavailableError;
 }
 
 export class ComputerProbeCacheService {

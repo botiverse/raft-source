@@ -20,12 +20,16 @@ import { findOrCreateDM } from "../services/channelService";
 import { addMember } from "../services/serverService";
 import {
   dispatchOwnerRoute,
+  OWNER_DISPATCH_REFUSED_CODE,
   setOwnerDispatchBoundsForTest,
   setOwnerRouteDispatcherForTest,
   sweepExpiredAssistantOwnerActionCards,
   type OwnerRouteDispatcher,
 } from "../services/assistantOwnerActionCards";
 import { createServer, headers, seedUser } from "./channels.api.fixtures";
+import { ASSISTANT_OWNER_ACTIONS } from "../services/assistantOwnerActions";
+import { DELEGABLE_CARD_ROUTES } from "../services/delegableCardRoutes";
+import { requestNotAvailable } from "../services/preparedRequestCards";
 
 const test = createApiTest();
 
@@ -338,15 +342,17 @@ test("no dispatch from inside a dispatch: a dispatched request can't confirm a c
   setOwnerRouteDispatcherForTest(null);
   const messageId = asked.body.assistant.cardMessageId as string;
   const expressApp = app.app as unknown as Parameters<typeof dispatchOwnerRoute>[0]["ownerRequest"]["app"];
-  // The owner's own session, but from inside a dispatch: the confirm endpoint refuses it.
+  // The owner's own session, but from inside a dispatch: a card never runs another card. The dispatcher's
+  // delegable backstop refuses /actions/ before any request is made (the confirm endpoint's own
+  // OWNER_ACTION_NESTED_DISPATCH guard stays behind it).
   const nestedConfirm = await dispatchOwnerRoute({
     ownerRequest: { app: expressApp, headers: { authorization: `Bearer ${f.ownerToken}`}, clientIp: "203.0.113.7" },
     serverId: f.server.id,
     request: { method: "POST", path: `/api/actions/${messageId}/execute`, body: { form: { id: "decision", values: { decision: "confirm" } } } },
     cardMessageId: messageId,
   });
-  assert.equal(nestedConfirm.status, 403, JSON.stringify(nestedConfirm.body));
-  assert.equal(nestedConfirm.body.errorCode, "OWNER_ACTION_NESTED_DISPATCH");
+  assert.equal(nestedConfirm.status, 409, JSON.stringify(nestedConfirm.body));
+  assert.equal(nestedConfirm.body.code, OWNER_DISPATCH_REFUSED_CODE);
   assert.equal((await cardState(messageId)).state, "prepared");
   // The assistant's own key, from inside a dispatch: assistantAsOwner refuses it.
   const nestedAssistant = await dispatchOwnerRoute({
@@ -545,4 +551,48 @@ test("no answer in time is 'unknown', not 'failed': the assistant is told it may
   } finally {
     setOwnerRouteDispatcherForTest(null);
   }
+});
+
+test("the dispatcher applies the delegable backstop itself: MCP, connections and OAuth paths are refused before any request; owner-action and card routes still dispatch", async () => {
+  let reached = 0;
+  const app = ((_req: unknown, res: { statusCode: number; end: (body: string) => void }) => {
+    reached += 1;
+    res.statusCode = 200;
+    res.end(JSON.stringify({ ok: true }));
+  }) as unknown as Parameters<typeof dispatchOwnerRoute>[0]["ownerRequest"]["app"];
+  const dispatch = (method: "POST" | "PUT" | "PATCH" | "DELETE", path: string) => dispatchOwnerRoute({
+    ownerRequest: { app, headers: { authorization: "Bearer owner-token" }, clientIp: "203.0.113.7" },
+    serverId: randomUUID(),
+    request: { method, path, body: {} },
+    cardMessageId: randomUUID(),
+  });
+  const id = randomUUID();
+  for (const [method, path] of [
+    ["POST", `/api/mcp/apps/${id}/connections/oauth/start`],
+    ["PUT", `/api/mcp/agents/${id}/assignments`],
+    ["PUT", `/api/MCP/connections/${id}/agents`],
+    ["POST", `/api/agents/${id}/connections/github`],
+    ["POST", "/api/oauth/authorize/human"],
+    ["POST", `/api/mcp/apps/${id}/connections/oauth/start?x=1`],
+  ] as const) {
+    const refused = await dispatch(method, path);
+    assert.equal(refused.status, 409, `${method} ${path}`);
+    assert.equal(refused.body.code, OWNER_DISPATCH_REFUSED_CODE, path);
+    assert.equal(refused.body.code, requestNotAvailable().code, "the request card backstop's own code");
+    assert.equal(refused.body.error, requestNotAvailable().message);
+  }
+  assert.equal(reached, 0, "no refused path reached the app");
+
+  // Every route a dispatch legitimately runs: the owner-action table's confirm tier and the delegable card routes.
+  const legitimate = [
+    ...ASSISTANT_OWNER_ACTIONS.filter((action) => action.tier === "confirm").map((action) => `${action.method} ${action.path}`),
+    ...Object.keys(DELEGABLE_CARD_ROUTES),
+  ];
+  assert.ok(legitimate.length > 0);
+  for (const route of legitimate) {
+    const [method, path] = route.split(" ") as ["POST" | "PUT" | "PATCH" | "DELETE", string];
+    const answer = await dispatch(method, path.replace(/:[A-Za-z_]+/g, randomUUID()));
+    assert.equal(answer.status, 200, `${route} still dispatches`);
+  }
+  assert.equal(reached, legitimate.length);
 });

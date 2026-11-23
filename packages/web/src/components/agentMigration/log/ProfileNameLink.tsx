@@ -47,7 +47,7 @@ export function ProfileNameLink({ kind, id, fallbackAgent, fallbackLabel, childr
       >
         {children}
       </PreviewCardTrigger>
-      <PreviewCardContent sideOffset={6} collisionPadding={6}>
+      <PreviewCardContent sideOffset={6}>
         <ProfilePreviewCardContent mentionType={kind} mentionId={id} fallbackAgent={fallbackAgent} fallbackLabel={fallbackLabel} />
       </PreviewCardContent>
     </PreviewCard>

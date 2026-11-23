@@ -1,8 +1,8 @@
-import { Badge, Button, ConversationPanelTabs, ScrollArea, SortableTabsList, SortableTabsTab, Tabs, TabsLabel, ProfilePanelBody, useOrderedTabs, Separator, PanelNotice, PanelNoticeActions, PanelNoticeContent } from "@botiverse/raft-ui";
+import { Badge, ConversationPanelTabs, ScrollArea, SortableTabsList, SortableTabsTab, Tabs, TabsLabel, ProfilePanelBody, useOrderedTabs, Separator, PanelNotice, PanelNoticeActions, PanelNoticeContent } from "@botiverse/raft-ui";
 import Tooltip from "../../components/ui/Tooltip";
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { useIntl } from "react-intl";
-import { Archive, Bug, Pencil, Check, X, RotateCcw, Lock, Copy, SquareTerminal } from "lucide-react";
+import { Pencil, X, Lock, SquareTerminal } from "lucide-react";
 import { useLocation } from "react-router-dom";
 import { SIDEBAR_TAB_QUERY_PARAM, useAppNavigate } from "../../hooks/useAppNavigate";
 import { AGENT_USAGE_FEATURE_FLAG_KEY, getRuntimeDisplayName, isExternalAgentRuntime, runtimeHasSubagents, parseRaftPermalink, isAdminOrOwner } from "@botiverse/raft-shared";
@@ -29,10 +29,9 @@ import { canStopSubagentsOf } from "../../components/agent/stopSubagent";
 import { AssistantPausedChip, AssistantPausedNotice, isPersonalAssistant, useAssistantPause } from "../../assistant/AssistantPaused";
 import { AssistantOwnerSection } from "../../assistant/AssistantOwnerSection";
 import { showToast } from "../../components/toastBridge";
-import { formatActivityText, getActivityErrorDisplayDetail } from "../../utils/activity";
+import { formatActivityText, getActivityErrorDisplayDetail, storedRuntimeErrorBannerShown } from "../../utils/activity";
 import { buildAgentDiagnosticInfo } from "../../utils/agentDiagnosticInfo";
 import { useCopyText } from "../../hooks/useCopyText";
-import CopyButton from "../../components/ui/CopyButton";
 import { isCustomAvatar } from "../../components/agent/PixelAvatar";
 import { useImageLightboxStore } from "../../store/imageLightboxStore";
 import { PROFILE_HANDLE_FONT_CLASS } from "../../components/ui/PanelHeader";
@@ -68,7 +67,7 @@ import { AgentProfileInfo } from "./AgentProfileInfo";
 import { AppBotFromApp } from "./ManagedAppIdentity";
 import type { RuntimeConfigEditorHandle } from "./AgentProfileInfo";
 import { AgentRecentActivity } from "./AgentRecentActivity";
-import { AgentStartStopButton } from "./AgentStartStopButton";
+import { AgentActionRows } from "./AgentActionRows";
 import { AgentStatusBadge } from "./AgentStatusBadge";
 import { AgentDetailHeader } from "./AgentDetailHeader";
 import { AgentComputerOfflineCard } from "./AgentComputerOfflineCard";
@@ -78,7 +77,9 @@ import { restartResetOffered } from "../../utils/agentBlockedState";
 import { AGENT_PANEL_TABS, AGENT_TABS, PUBLIC_AGENT_TABS } from "./agentDetailTabs";
 import { AgentUsageTab } from "./AgentUsageTab";
 import { useServerFeatureFlag } from "../../store/serverFeatureFlags";
+import { usePrivacyModeState } from "../../store/usePrivacyModeState";
 import { AgentVoiceSection } from "./AgentVoiceSection";
+import { useAgentVoiceCallAction } from "./agentVoiceCallEntry";
 import type { AgentTab } from "./agentDetailTabs";
 
 recordProfileOpenE2eEvent({ kind: "module-evaluated", module: "agent-detail" });
@@ -125,6 +126,10 @@ export function AgentDetailPanel({ agent, onClose, onBack, onOpenProfile, activi
   const computerOffline = isMachineOffline(machines, agent.machineId);
   const [showResetDialog, setShowResetDialog] = useState(false);
   const [showReportDialog, setShowReportDialog] = useState(false);
+  // Report a problem uploads a bundle to Raft's receiver, so it is offered only
+  // once the server has said privacy mode is off (RAFT_PRIVACY_MODE).
+  const privacyMode = usePrivacyModeState();
+  const reportIssueAvailable = FEEDBACK_EXPORT_ENABLED && privacyMode === "off";
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showStopConfirm, setShowStopConfirm] = useState(false);
   const fetchExternalAgentStatus = useAgentStore((s) => s.fetchExternalAgentStatus);
@@ -217,7 +222,15 @@ export function AgentDetailPanel({ agent, onClose, onBack, onOpenProfile, activi
       .catch(() => undefined);
     return () => { canceled = true; };
   }, [agent.id, canViewPrivateAgentSurfaces, fetchExternalAgentDiagnostics, isBoundedPublicProjection, isExternalAgent]);
-  const hasRuntimeError = activityState?.activity === "error" || Boolean(agent.lastRuntimeError);
+  const activityIsError = activityState?.activity === "error";
+  // A stored failed start shows here only as its own text, for its managers
+  // (storedRuntimeErrorBannerShown); the status badge carries its typed copy.
+  const storedStartFailure = !activityIsError && Boolean(agent.lastRuntimeError?.spawnFailureReason);
+  const hasRuntimeError = activityIsError || storedRuntimeErrorBannerShown({
+    lastRuntimeError: agent.lastRuntimeError,
+    activityDetail: activityState?.activityDetail,
+    canViewDetails: canViewPrivateAgentSurfaces,
+  });
   const rawRuntimeError = hasRuntimeError
     ? (activityState?.activity === "error" ? activityState.activityDetail : agent.lastRuntimeError?.message) ?? ""
     : "";
@@ -240,8 +253,9 @@ export function AgentDetailPanel({ agent, onClose, onBack, onOpenProfile, activi
   // unknown errors keep the raw text / generic fallback (never mistranslated).
   // Text patterns only for a viewer the server sends the text to, and only
   // when there is no code.
+  // A failed start's text is shown as written (the badge has its catalog copy).
   const runtimeErrorKind = typedRuntimeErrorErrKind
-    ?? (rawRuntimeError && !runtimeErrorCode && canViewPrivateAgentSurfaces ? classifyRuntimeError(rawRuntimeError) : null);
+    ?? (rawRuntimeError && !runtimeErrorCode && canViewPrivateAgentSurfaces && !storedStartFailure ? classifyRuntimeError(rawRuntimeError) : null);
   // task #735: a "not installed" classification only keeps the install copy
   // when the start failure's typed carrier confirms the miss (lookupReason
   // "not_on_path"). A timed-out/denied/failed lookup — and an old daemon that
@@ -573,6 +587,8 @@ export function AgentDetailPanel({ agent, onClose, onBack, onOpenProfile, activi
   const handleOpenLounge = useCallback(() => {
     void openAgentLounge(agent.id);
   }, [agent.id, openAgentLounge]);
+  // Raft voice calls: Call, for an agent the viewer can message (flag on, not a Guest).
+  const handleCall = useAgentVoiceCallAction(isBoundedPublicProjection ? null : agent);
   const openResetDialog = useCallback(() => setShowResetDialog(true), []);
   const closeResetDialog = useCallback(() => setShowResetDialog(false), []);
   const openStopConfirm = useCallback(() => setShowStopConfirm(true), []);
@@ -659,6 +675,7 @@ export function AgentDetailPanel({ agent, onClose, onBack, onOpenProfile, activi
         onBack={onBack}
         onMessage={handleMessage}
         onOpenLounge={loungeEnabled && !isBoundedPublicProjection && agentOffersLounge(agent) ? handleOpenLounge : undefined}
+        onCall={handleCall}
         onShowResetDialog={openResetDialog}
         onShowStopConfirm={openStopConfirm}
         onPauseAssistant={canPauseAssistant ? openPauseConfirm : undefined}
@@ -851,7 +868,6 @@ export function AgentDetailPanel({ agent, onClose, onBack, onOpenProfile, activi
             onEdit={canManageAgent && !agent.deletedAt ? setEditField : undefined}
             canManageAgent={canManageAgent && !agent.deletedAt}
             canChangeAgentRole={canChangeAgentRole && !agent.deletedAt}
-            canRestartAgent={canControlAgentRuntime && !agent.deletedAt}
             onOpenProfile={onOpenProfile}
             showOperationalInfo={!isBoundedPublicProjection}
             runtimeConfigEditorRef={runtimeConfigEditorRef}
@@ -884,69 +900,27 @@ export function AgentDetailPanel({ agent, onClose, onBack, onOpenProfile, activi
 
           {/* Actions: runtime operations (diagnostics copy, issue report,
               archive) belong to agents with a runtime; a managed bot's
-              lifecycle is the grant revoke on the owning app. */}
+              lifecycle is the grant revoke on the owning app. A card of action
+              rows with no heading, as at the end of a channel's details. */}
           {canManageAgent && !agent.deletedAt && !agent.managedByAppInstallId && (
             <>
-            <Separator />
-            <div className="px-(--surface-inset) py-4">
-              <SectionEyebrow as="div" className="mb-3">
-                {formatMessage({ id: "agent.detail.actions" })}
-              </SectionEyebrow>
-              <div className="stack-y-2">
-                {!isExternalAgent && (
-                  <>
-                    <AgentStartStopButton agentId={agent.id} canStopAgent={canStopAgent} onShowStopConfirm={openStopConfirm} computerOffline={computerOffline} onStartSettled={handleStartSettled} />
-                    {restartResetOffered(true, computerOffline) && (
-                    <Button variant="outline" size="lg"
-                      onClick={openResetDialog}
-                      className="flex w-full items-center justify-center gap-2"
-                    >
-                      <RotateCcw size={14} />
-                      {formatMessage({ id: "agent.detail.restartReset" })}
-                    </Button>
-                    )}
-                  </>
-                )}
-                <CopyButton
-                  controller={diagnosticCopyController}
-                  text={getDiagnosticInfo}
-                  onCopyError={handleDiagnosticCopyError}
-                >
-                  {({ copied, disabled, onClick, onMouseDown }) => (
-                    <Button variant="outline" size="lg"
-                      onClick={onClick}
-                      onMouseDown={onMouseDown}
-                      disabled={disabled}
-                      className="flex w-full items-center justify-center gap-2"
-                    >
-                      {copied ? <Check size={14} /> : <Copy size={14} />}
-                      {copied
-                        ? formatMessage({ id: "agent.detail.diagnosticInfoCopied" })
-                        : formatMessage({ id: "agent.detail.copyDiagnosticInfo" })}
-                    </Button>
-                  )}
-                </CopyButton>
-                {FEEDBACK_EXPORT_ENABLED && (
-                  <Button variant="outline" size="lg"
-                    onClick={openReportDialog}
-                    className="flex w-full items-center justify-center gap-2"
-                  >
-                    <Bug size={14} />
-                    {formatMessage({ id: "agent.reportIssue.title" })}
-                  </Button>
-                )}
-                {canArchiveAgent && (
-                  <Button variant="danger" size="lg"
-                    onClick={openDeleteConfirm}
-                    className="flex w-full items-center justify-center gap-2"
-                    data-testid="agent-archive-button"
-                  >
-                    <Archive size={14} />
-                    {formatMessage({ id: "agent.detail.deleteAgent" })}
-                  </Button>
-                )}
+              <Separator />
+              <div className="px-(--surface-inset) py-4">
+                <AgentActionRows
+                  agentId={agent.id}
+                  isExternalAgent={isExternalAgent}
+                  canStopAgent={canStopAgent}
+                  computerOffline={computerOffline}
+                  diagnosticCopyController={diagnosticCopyController}
+                  getDiagnosticInfo={getDiagnosticInfo}
+                  onDiagnosticCopyError={handleDiagnosticCopyError}
+                  onShowStopConfirm={openStopConfirm}
+                  onStartSettled={handleStartSettled}
+                  onShowResetDialog={openResetDialog}
+                  onShowReportDialog={reportIssueAvailable ? openReportDialog : undefined}
+                  onShowArchiveConfirm={canArchiveAgent ? openDeleteConfirm : undefined}
+                />
               </div>
-            </div>
             </>
           )}
         </ScrollArea>

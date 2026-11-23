@@ -1,32 +1,22 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 
-import { projectAntigravityModels, type ListModelsOptions, type ListModelsResult, type ModelLister } from "@botiverse/oar";
+import type { ListModelsOptions, ListModelsResult, ModelEntry, ModelLister } from "@botiverse/oar";
 
-import { AntigravityDriver } from "./antigravity.deprecated";
-import { detectAntigravityModelSource, withoutEmbeddedEffortLevels } from "./antigravityModels";
+import { AntigravityDriver } from "./antigravity";
+import { detectAntigravityModelSource, withAntigravityEffortLevels, withoutEmbeddedEffortLevels } from "./antigravityModels";
 
-/** A `session/new` answer in the shape agy's ACP server gives (trimmed): the model picker and the current model's thought level. */
-const SESSION_NEW = {
-  sessionId: "s-1",
-  configOptions: [
-    {
-      id: "model",
-      currentValue: "gemini-3.8-flash",
-      options: [
-        { value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
-        { value: "gemini-3.8-pro", name: "Gemini 3.8 Pro" },
-        { value: "claude-sonnet-5", name: "claude-sonnet-5" },
-      ],
-    },
-    {
-      id: "thinking_level",
-      category: "thought_level",
-      currentValue: "medium",
-      options: [{ value: "low" }, { value: "medium" }, { value: "high" }],
-    },
-  ],
-};
+/**
+ * What OAR's (>= 0.111) agy lister returns for agy's `session/new` model
+ * picker: the current model is the default and carries the thought levels; a
+ * model whose menu it could not read says why; one agy lists bare has none.
+ * (Turning agy's raw answer into these entries is OAR's to test, not Raft's.)
+ */
+const MODELS: ModelEntry[] = [
+  { id: "gemini-3.8-flash", displayName: "Gemini 3.8 Flash", default: true, effortLevels: ["low", "medium", "high"], defaultEffort: "medium" },
+  { id: "gemini-3.8-pro", displayName: "Gemini 3.8 Pro", effortUnavailableReason: "Native catalog did not expose this model's effort menu." },
+  { id: "claude-sonnet-5" },
+];
 
 function recordingLister(result: ListModelsResult): ModelLister & { options: ListModelsOptions[] } {
   const options: ListModelsOptions[] = [];
@@ -42,15 +32,17 @@ function recordingLister(result: ListModelsResult): ModelLister & { options: Lis
 const withCommand = { resolveCommand: async () => "/usr/local/bin/agy" };
 
 test("agy's model picker becomes the live list; the current model carries its thought levels and is the default", async () => {
-  const listModels = recordingLister({ kind: "ok", models: projectAntigravityModels(SESSION_NEW)! });
+  const listModels = recordingLister({ kind: "ok", models: MODELS });
   const outcome = await detectAntigravityModelSource({ ...withCommand, listModels });
   assert.deepEqual(outcome, {
     kind: "live",
     value: {
       models: [
         { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", supportedReasoningEfforts: ["low", "medium", "high"], defaultReasoningEffort: "medium", verified: "launchable" },
-        { id: "gemini-3.8-pro", label: "Gemini 3.8 Pro", verified: "launchable" },
-        { id: "claude-sonnet-5", label: "claude-sonnet-5", verified: "launchable" },
+        // Could not read: the reason, and no effort list (not reported).
+        { id: "gemini-3.8-pro", label: "Gemini 3.8 Pro", reasoningEffortUnavailableReason: "Native catalog did not expose this model's effort menu.", verified: "launchable" },
+        // No menu and no reason: the model takes no effort, an explicit [].
+        { id: "claude-sonnet-5", label: "claude-sonnet-5", supportedReasoningEfforts: [], verified: "launchable" },
       ],
       default: "gemini-3.8-flash",
     },
@@ -71,6 +63,18 @@ test("a model id that already names its thought level offers no separate effort"
     { id: "gemini-4-carbon-medium", default: true },
     { id: "gemini-4-carbon-high" },
     { id: "gemini-3.8-flash", effortLevels: ["low", "high"], defaultEffort: "low" },
+  ]);
+});
+
+test("an id that names its level stays without a menu; only an unexplained missing menu becomes none", () => {
+  assert.deepEqual(withAntigravityEffortLevels([
+    { id: "gemini-4-carbon-medium", effortLevels: ["low", "medium", "high"], defaultEffort: "medium" },
+    { id: "gemini-3.8-pro", effortUnavailableReason: "Could not read." },
+    { id: "claude-sonnet-5" },
+  ]), [
+    { id: "gemini-4-carbon-medium" },
+    { id: "gemini-3.8-pro", effortUnavailableReason: "Could not read." },
+    { id: "claude-sonnet-5", effortLevels: [] },
   ]);
 });
 

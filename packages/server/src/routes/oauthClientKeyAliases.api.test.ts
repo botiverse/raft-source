@@ -149,7 +149,7 @@ test("integration login: a deleted App's reserved key never names another OAuth 
   assert.equal(legitimate.body.service?.id, other.id, "the other App remains usable by its own key");
   for (const service of keyInputs(oldKey)) {
     const refused = await login(service);
-    assert.deepEqual(refused, { status: 404, body: { error: "Registered service not found" } });
+    assert.deepEqual(refused, { status: 404, body: { error: "Registered service not found", code: "service_not_found", errorCode: "service_not_found" } });
     const inventory = await fetch(`${app.baseUrl}/internal/agent-api/integrations?service=${encodeURIComponent(service)}`, {
       headers: { Authorization: `Bearer ${apiKey}` },
     });
@@ -183,7 +183,7 @@ test("integration login: an unavailable current key never falls through to a can
       method: "POST", headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" }, body: JSON.stringify({ service }),
     });
     assert.equal(res.status, 404);
-    assert.deepEqual(await res.json(), { error: "Registered service not found" });
+    assert.deepEqual(await res.json(), { error: "Registered service not found", code: "service_not_found", errorCode: "service_not_found" });
   }
 });
 

@@ -13,7 +13,7 @@ import { openUpgradeDialog } from "../../store/upgradeDialogStore";
 import { validateNameReason, PLAN_CONFIG, getEffectiveLimits, EXTERNAL_CHANNELS_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import type { ServerPlan } from "@botiverse/raft-shared";
 import { useAppNavigate } from "../../hooks/useAppNavigate";
-import { useExternalInviteTracker } from "../../analytics/externalInvites";
+import { noteChannelNameTaken, useExternalInviteTracker } from "../../analytics/externalInvites";
 import type { ExternalInviteEntry } from "../../analytics/externalInvites";
 import DialogCard from "../ui/DialogCard";
 import { DialogCardFooter, DialogCommit } from "../ui/NarrowDialog";
@@ -24,6 +24,7 @@ import FormField from "../ui/FormField";
 import { useServerPermissions } from "../../hooks/useServerPermissions";
 import { ChannelSlackBridgeField, useChannelSlackBridgeEditor } from "./ChannelSlackBridgeField";
 import { ExternalChannelIcon } from "./channelKindIcon";
+import { isAddableToNewChannel } from "../../utils/channelLocalMembership";
 import { currentExternalSlotContext } from "./externalChannelSlot";
 import {
   EXTERNAL_INVITE_MAX_EMAILS,
@@ -126,6 +127,8 @@ export default function CreateChannelDialog({
   const [externalReview, setExternalReview] = useState<ExternalInvitePreview | null>(null);
   const [createdExternal, setCreatedExternal] = useState<{ id: string; name: string } | null>(null);
   const createdExternalRef = useRef<{ id: string; name: string } | null>(null);
+  // Create and Invite running: the channel may exist while its invites are still being sent.
+  const [externalCommitting, setExternalCommitting] = useState(false);
   // The review's Create and Invite while it runs (the dialog can't be closed
   // then), and whether the dialog has closed (nothing after that navigates).
   const externalCommitInFlightRef = useRef(false);
@@ -164,7 +167,12 @@ export default function CreateChannelDialog({
   // Create on the first screen (plan §2a: a flag-off Server sees no change).
   // On: two steps for every visibility, External for owners and admins.
   const twoStep = useServerFeatureFlag(EXTERNAL_CHANNELS_FEATURE_FLAG_KEY).enabled;
-  const externalAvailable = useExternalChannelCreateAccess();
+  // Each visibility is offered only to whoever may create it
+  // (createPublicChannels / createPrivateChannels); External creates a private channel.
+  const canCreatePublic = capabilities.createPublicChannels;
+  const canCreatePrivate = capabilities.createPrivateChannels;
+  const externalAccess = useExternalChannelCreateAccess();
+  const externalAvailable = externalAccess && canCreatePrivate;
   // A Free server whose one external channel is taken: External can still
   // be selected, and then says so in place of its hint, with the upgrade,
   // and Next waits (c_a668d39c). Until the server answers, External can't
@@ -187,7 +195,11 @@ export default function CreateChannelDialog({
   const external = visibility === "external" && externalChoosable;
   // External chosen at the free limit: shown selected, with the limit line, and nothing goes on.
   const externalAtLimit = visibility === "external" && externalFreeLimit;
-  const chosenVisibility: Visibility = visibility === "external" && !externalChoosable && !externalAtLimit ? "private" : visibility;
+  const requestedVisibility: Visibility = visibility === "external" && !externalChoosable && !externalAtLimit ? "private" : visibility;
+  // A visibility this person may not create (a prefill, or the default Public) falls back to the other one.
+  const chosenVisibility: Visibility = requestedVisibility === "public" && !canCreatePublic && canCreatePrivate
+    ? "private"
+    : requestedVisibility === "private" && !canCreatePrivate && canCreatePublic ? "public" : requestedVisibility;
   const { entries: emailEntries, overBy: emailsOverBy } = useExternalInviteEntries(emailText);
   const ownServers = useOwnConnectableServers(external);
   // Checked and still offered: what step 2's Create and Invite takes.
@@ -197,8 +209,8 @@ export default function CreateChannelDialog({
   );
   const externalNothingChosen = emailEntries.length === 0 && chosenServerIds.length === 0;
   const bridgeEditor = useChannelSlackBridgeEditor({
-    visibility: external ? "private" : visibility === "public" ? "public" : "private",
-    canManage: capabilities.createChannels,
+    visibility: external ? "private" : chosenVisibility === "public" ? "public" : "private",
+    canManage: external || chosenVisibility !== "public" ? canCreatePrivate : canCreatePublic,
   });
 
   const plan = (useServerStore((s) => s.current?.plan) || "free") as ServerPlan;
@@ -219,7 +231,8 @@ export default function CreateChannelDialog({
           ? <AppBadge className="shrink-0" appName={agent.managedByApp?.name} botName={agent.displayName || agent.name} />
           : undefined,
       })),
-      ...members.filter((member) => member.userId !== currentUser?.id).map((member) => ({
+      // No Guest: a new channel is never its bound one (403 guest_other_channel).
+      ...members.filter((member) => member.userId !== currentUser?.id && isAddableToNewChannel(member)).map((member) => ({
         kind: "human" as const,
         id: member.userId,
         value: member,
@@ -231,10 +244,19 @@ export default function CreateChannelDialog({
       })),
     ], [allAgents, currentUser?.id, members]);
   const memberMatches = useMemberChoiceSearch(memberSearch, memberChoices);
+  // The people this create takes: only selected ids that resolve to a loaded
+  // member the picker offers, as AddMembersDialog does. A prefilled Guest (an
+  // action card's initialHumans) or an id outside the loaded, possibly partial
+  // directory is not sent, so no chip-less pick can make every submit fail.
+  // The prefill stays in selectedHumanIds, so ids are taken up once members load.
+  const chosenHumanIds = useMemo(() => {
+    const offeredIds = new Set(members.filter(isAddableToNewChannel).map((member) => member.userId));
+    return [...selectedHumanIds].filter((id) => offeredIds.has(id));
+  }, [members, selectedHumanIds]);
   const selectedMemberKeys = useMemo(() => [
     ...[...selectedAgentIds].map((id) => memberChoiceKey("agent", id)),
-    ...[...selectedHumanIds].map((id) => memberChoiceKey("human", id)),
-  ], [selectedAgentIds, selectedHumanIds]);
+    ...chosenHumanIds.map((id) => memberChoiceKey("human", id)),
+  ], [selectedAgentIds, chosenHumanIds]);
   const handleMembersChange = useCallback((keys: string[]) => {
     const pick = (kind: "agent" | "human") => new Set(keys.filter((key) => key.startsWith(`${kind}:`)).map((key) => key.slice(kind.length + 1)));
     setSelectedAgentIds(pick("agent"));
@@ -322,7 +344,7 @@ export default function CreateChannelDialog({
           {
             visibility: chosenVisibility === "public" ? "public" : "private",
             agentIds: [...selectedAgentIds],
-            userIds: [...selectedHumanIds],
+            userIds: chosenHumanIds,
             actionCardMessageId,
             actionCardConfirmationVersion,
           }
@@ -367,8 +389,9 @@ export default function CreateChannelDialog({
   // plan §5) only now, then the reviewed addresses are sent to it. A send
   // that fails after the create leaves the channel, and a retry sends again
   // to it rather than creating another.
-  const commitExternal = useCallback(async (addresses: string[], serverIds: string[]): Promise<SendExternalInvitesResult> => {
+  const commitExternal = useCallback(async (addresses: string[], serverIds: string[], connectMemberEmails: string[]): Promise<SendExternalInvitesResult> => {
     externalCommitInFlightRef.current = true;
+    setExternalCommitting(true);
     try {
       let channel = createdExternalRef.current;
       if (!channel) {
@@ -377,12 +400,15 @@ export default function CreateChannelDialog({
           const created = await createChannel(name.trim(), description.trim() || undefined, {
             visibility: "private",
             agentIds: [...selectedAgentIds],
-            userIds: [...selectedHumanIds],
+            userIds: chosenHumanIds,
             actionCardMessageId,
             actionCardConfirmationVersion,
           });
           channel = { id: created.id, name: created.name };
         } catch (err) {
+          // A taken name (the 409 carries no code, by design; an archived holder's, of any kind, says archived_name_collision): the send's failure says so.
+          const refused = (err as { response?: { status?: number; data?: { code?: unknown } } } | null)?.response;
+          if (refused?.status === 409 && (refused.data?.code === undefined || refused.data.code === "archived_name_collision")) noteChannelNameTaken(err);
           setError("");
           setArchivedCollision(null);
           handleCreateError(err);
@@ -392,13 +418,14 @@ export default function CreateChannelDialog({
         setCreatedExternal(channel);
         onCreated?.(channel);
       }
-      return await sendInvitesAndConnectServers(channel.id, addresses, serverIds, false);
+      return await sendInvitesAndConnectServers(channel.id, addresses, serverIds, false, connectMemberEmails);
     } finally {
       externalCommitInFlightRef.current = false;
+      setExternalCommitting(false);
     }
   }, [
     actionCardConfirmationVersion, actionCardMessageId, createChannel, description, handleCreateError, name,
-    onCreated, onSubmitStart, selectedAgentIds, selectedHumanIds,
+    onCreated, onSubmitStart, selectedAgentIds, chosenHumanIds,
   ]);
 
   const handleChangeCollidingName = useCallback(() => {
@@ -455,8 +482,9 @@ export default function CreateChannelDialog({
           onBackFromReview={createdExternal ? undefined : backToPeople}
           upgradeSurface="create_channel"
           tracker={tracker}
-          notice={createdExternal ? (
-            <Banner intent="success" data-testid="create-channel-external-created">
+          notice={createdExternal && !externalCommitting ? (
+            // Only once a send has come back unsent: while it runs, the channel exists but nothing failed yet.
+            <Banner intent="warning" data-testid="create-channel-external-created">
               {formatMessage({ id: "channel.create.externalCreated" }, { name: createdExternal.name })}
             </Banner>
           ) : undefined}
@@ -591,7 +619,7 @@ export default function CreateChannelDialog({
           </FormField>
           <FormField
             label={formatMessage({ id: "channel.create.visibilityLabel" })}
-            hint={external ? formatMessage({ id: "channel.create.externalHint" }, { server: serverName }) : externalAtLimit ? (
+            hint={external ? formatMessage({ id: "channel.create.externalHint" }) : externalAtLimit ? (
               <span id={externalHintId} data-testid="create-channel-external-free-limit">
                 {formatMessage({ id: "channel.create.externalFreeLimit" }, { server: serverName })}{" "}
                 <TextLink variant="strong" onClick={openExternalUpgrade}>
@@ -605,14 +633,18 @@ export default function CreateChannelDialog({
               onValueChange={handleVisibilityChange}
               aria-label={formatMessage({ id: "channel.create.visibilityAriaLabel" })}
             >
-              <SegmentedControlItem value="public">
-                <Hash size={16} aria-hidden="true" />
-                <SegmentedControlLabel>{formatMessage({ id: "channel.create.public" })}</SegmentedControlLabel>
-              </SegmentedControlItem>
-              <SegmentedControlItem value="private">
-                <Lock size={16} aria-hidden="true" />
-                <SegmentedControlLabel>{formatMessage({ id: "channel.create.private" })}</SegmentedControlLabel>
-              </SegmentedControlItem>
+              {canCreatePublic && (
+                <SegmentedControlItem value="public">
+                  <Hash size={16} aria-hidden="true" />
+                  <SegmentedControlLabel>{formatMessage({ id: "channel.create.public" })}</SegmentedControlLabel>
+                </SegmentedControlItem>
+              )}
+              {canCreatePrivate && (
+                <SegmentedControlItem value="private">
+                  <Lock size={16} aria-hidden="true" />
+                  <SegmentedControlLabel>{formatMessage({ id: "channel.create.private" })}</SegmentedControlLabel>
+                </SegmentedControlItem>
+              )}
               {externalAvailable && (
                 // Not known yet: focusable and announced as unavailable, never
                 // selected (raft-ui's item passes Base UI's readOnly through;

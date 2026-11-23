@@ -120,6 +120,7 @@ export function useMergedRowRef(focusRef: React.Ref<HTMLDivElement> | undefined,
     if (element && !element.hasAttribute("data-laid-out")) markLaidOut(element);
     swipeRef(element);
     if (typeof focusRef === "function") focusRef(element);
+    // oxlint-disable-next-line react/immutability -- `focusRef` is the caller's ref object; a merged ref callback has to write its `.current`.
     else if (focusRef) (focusRef as React.MutableRefObject<HTMLDivElement | null>).current = element;
   }, [focusRef, swipeRef]);
 }

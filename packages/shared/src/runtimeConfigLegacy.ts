@@ -259,9 +259,16 @@ function storedCustomModelLimits(value: Record<string, unknown>): { contextWindo
   };
 }
 
+// index.ts RUNTIME_SERVICE_TIER_ID_PATTERN (this module takes only types from index).
+const SERVICE_TIER_ID_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+
 function parseModeConfig(value: unknown): RuntimeModeConfig {
   if (!isPlainRecord(value)) return { kind: "default" };
-  if (value.kind === "fast") return { kind: "fast" };
+  if (value.kind === "fast") {
+    return typeof value.serviceTier === "string" && SERVICE_TIER_ID_PATTERN.test(value.serviceTier)
+      ? { kind: "fast", serviceTier: value.serviceTier }
+      : { kind: "fast" };
+  }
   return { kind: "default" };
 }
 

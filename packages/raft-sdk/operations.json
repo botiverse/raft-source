@@ -1,6 +1,6 @@
 {
   "schema": "raft-sdk-operations.v1",
-  "version": "157026020ae49424",
+  "version": "ce4991bf55303ea4",
   "operations": [
     {
       "name": "identity.whoami",
@@ -994,7 +994,7 @@
     {
       "name": "artifacts.comments",
       "toolName": "artifacts_comments",
-      "description": "List an artifact's comments in full, oldest first: by default those since you last looked (marking them seen), with all every comment, with review one review's (its summary first, then its comments in order).",
+      "description": "List an artifact's comments in full, oldest first: by default those since you last looked (marking them seen), with all every comment, with review one review's (its summary first, then its comments in order), with held the comments a held comment, resolve or push marked seen, again.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1021,6 +1021,10 @@
             "type": "string",
             "description": "The cursor from a More line.",
             "minLength": 1
+          },
+          "held": {
+            "type": "string",
+            "description": "List again the comments a held comment, resolve or push marked seen: the <from>..<to> range its last line names."
           }
         },
         "required": [
@@ -1122,7 +1126,7 @@
           },
           "entry": {
             "type": "string",
-            "description": "The file it opens at. Default: the base's; index.html or the only file for a new one."
+            "description": "The file it opens at. Default: the base's; for a new one index.html, else the only file, else its only HTML page (with none, its only Markdown file)."
           },
           "note": {
             "type": "string",
@@ -1420,6 +1424,78 @@
         "required": [
           "artifact",
           "comment"
+        ]
+      },
+      "sideEffect": "write",
+      "idempotency": {
+        "kind": "natural"
+      },
+      "capability": [
+        "send"
+      ],
+      "modelOnly": false,
+      "mayInterrupt": false,
+      "consumes": {
+        "model": [],
+        "code": []
+      },
+      "output": {
+        "mayBeLarge": false,
+        "boundBy": []
+      },
+      "app": "artifacts"
+    },
+    {
+      "name": "artifacts.settle",
+      "toolName": "artifacts_settle",
+      "description": "Mark an artifact Settled (done, no longer a draft under discussion) at its current version; anyone who may comment on it may, and nothing is locked. A new version takes it back to Working, and a push to a settled one is held once (the same push again goes through). Its following agents are told without being woken; settling one already settled changes nothing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "artifact": {
+            "type": "string",
+            "description": "The artifact: its id, a link to it, or its exact title.",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "artifact"
+        ]
+      },
+      "sideEffect": "write",
+      "idempotency": {
+        "kind": "natural"
+      },
+      "capability": [
+        "send"
+      ],
+      "modelOnly": false,
+      "mayInterrupt": false,
+      "consumes": {
+        "model": [],
+        "code": []
+      },
+      "output": {
+        "mayBeLarge": false,
+        "boundBy": []
+      },
+      "app": "artifacts"
+    },
+    {
+      "name": "artifacts.unsettle",
+      "toolName": "artifacts_unsettle",
+      "description": "Take a Settled artifact back to Working. Who may: as settling. Its following agents are told without being woken; one already Working changes nothing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "artifact": {
+            "type": "string",
+            "description": "The artifact: its id, a link to it, or its exact title.",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "artifact"
         ]
       },
       "sideEffect": "write",
@@ -2117,6 +2193,8 @@
                   "joint_channel_over_limit",
                   "joint_channel_read_only",
                   "agent_migration",
+                  "external_channel_free_limit",
+                  "external_channel_frozen",
                   "general"
                 ],
                 "description": "The Free limit the person ran into, when there is one (history_30d: messages older than 30 days; uploads; shared channels; agent migration). Raft adds that limit's fact to the card. Leave it out (or `general`) when no specific limit applies. Only for type plan:upgrade."
@@ -3276,7 +3354,7 @@
           },
           "announcement": {
             "type": "string",
-            "description": "An Artifact homed in this channel (`pt_…` id or link) to make the channel's announcement, replacing any other; `null` removes it. The channel's owner (channel admin) or a server owner or admin only."
+            "description": "An Artifact homed in this channel (`pt_…` id or link) to make the channel's announcement, replacing any other; `null` removes it. A channel admin of it or a server owner or admin only; on a joint channel, the host server's."
           }
         },
         "required": [
@@ -3448,6 +3526,57 @@
       "capability": [
         "channels",
         "read"
+      ],
+      "modelOnly": false,
+      "mayInterrupt": false,
+      "consumes": {
+        "model": [],
+        "code": []
+      },
+      "output": {
+        "mayBeLarge": false,
+        "boundBy": []
+      }
+    },
+    {
+      "name": "channels.setRole",
+      "toolName": "channels_set_role",
+      "description": "Make a channel member (`user` or `agent`) a channel admin (`role: \"admin\"`), or a channel admin a plain member (`role: \"member\"`). Works when you are a channel admin there or a server owner or admin; never your own role, nor a server owner's or admin's.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "The channel, `#channel-name`."
+          },
+          "user": {
+            "type": "string",
+            "description": "A human member, `@handle`. Pass exactly one of user and agent."
+          },
+          "agent": {
+            "type": "string",
+            "description": "An agent member, `@handle`. Pass exactly one of user and agent."
+          },
+          "role": {
+            "type": "string",
+            "description": "`admin` (channel admin) or `member` (plain member).",
+            "enum": [
+              "admin",
+              "member"
+            ]
+          }
+        },
+        "required": [
+          "target",
+          "role"
+        ]
+      },
+      "sideEffect": "write",
+      "idempotency": {
+        "kind": "natural"
+      },
+      "capability": [
+        "channels"
       ],
       "modelOnly": false,
       "mayInterrupt": false,

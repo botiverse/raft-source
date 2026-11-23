@@ -9,6 +9,7 @@ import { UUID_RE } from "../lib/messageId";
 import { users, serverMembers, servers, sessionFamilies, agents, appBotBindings, oauthClientInstalls, raftbenchServiceAgents, agentRuntimeProvisions, accountDeletionRequests, type SessionScope, type RequestSessionScope } from "../db/schema";
 import { ASSISTANT_ROUTE_NOT_ALLOWED_BODY, isAssistantAgentApiRequestAllowed } from "../services/assistantRouteAllowlist";
 import { findMachineByApiKey, getMachine } from "../services/machineService";
+import { legacyMachineKeyStanding } from "../lib/legacyMachineKeyStanding";
 import {
   AGENT_CREDENTIAL_EXPIRED_CODE,
   authenticateAgentApiKey,
@@ -23,7 +24,8 @@ import {
   isComputerApiKey,
   recordComputerUse,
 } from "../services/computerCredentialService";
-import { accountNeedsIdentitySetup, asServerId, isExternalAgentRuntime, asMachineId, isOwnerRole, type ServerId, type MachineId } from "@botiverse/raft-shared";
+import { accountNeedsIdentitySetup, asServerId, isExternalAgentRuntime, asMachineId, isOwnerRole, RAFT_CLIENT_CAPABILITIES_HEADER, RAFT_DAEMON_VERSION_HEADER, type ServerId, type MachineId } from "@botiverse/raft-shared";
+import { noteAgentCliInboxItems } from "../services/agentCliInboxItems";
 import { rememberTraceUserId } from "../tracing/traceUserId";
 import { setRequestTraceMachineKeyKind } from "./requestObservability";
 
@@ -818,21 +820,22 @@ export async function requireMachineAuth(req: Request, res: Response, next: Next
         });
         return;
       }
-      // Reject if the machine's server has been deleted
-      const db = getDb();
-      const [srv] = await db
-        .select({ id: servers.id })
-        .from(servers)
-        .where(and(eq(servers.id, machine.serverId), isNull(servers.deletedAt)));
-      if (!srv) {
+      // Reject if the machine's server has been deleted, or the person who
+      // registered it is no longer a member there (#wg-rbac:#78): the key acts
+      // for them, so it ends with their membership, answered as an invalid key
+      // below.
+      const standing = await legacyMachineKeyStanding(machine);
+      if (standing === "server_gone") {
         res.status(401).json({ error: "Server no longer exists" });
         return;
       }
-      req.machineId = asMachineId(machine.id);
-      req.serverId = asServerId(machine.serverId);
-      req.daemonVersion = "daemonVersion" in machine ? machine.daemonVersion ?? null : null;
-      next();
-      return;
+      if (standing === "live") {
+        req.machineId = asMachineId(machine.id);
+        req.serverId = asServerId(machine.serverId);
+        req.daemonVersion = "daemonVersion" in machine ? machine.daemonVersion ?? null : null;
+        next();
+        return;
+      }
     }
     res.status(401).json({ error: "Invalid machine API key" });
     return;
@@ -971,7 +974,7 @@ async function authenticateAgentCredential(
   // but verify again so semantics stay correct if the JOIN is removed.
   const agentLivenessStart = Date.now();
   const [agentRow] = await db
-    .select({ id: agents.id, runtime: agents.runtime, managedByAppInstallId: agents.managedByAppInstallId, assistantOwnerUserId: agents.assistantOwnerUserId })
+    .select({ id: agents.id, runtime: agents.runtime, managedByAppInstallId: agents.managedByAppInstallId, assistantOwnerUserId: agents.assistantOwnerUserId, machineId: agents.machineId })
     .from(agents)
     .where(and(eq(agents.id, credential.agentId), isNull(agents.deletedAt)));
   addTraceEvent("agent_credential_auth.agent_liveness.checked", {
@@ -1026,6 +1029,14 @@ async function authenticateAgentCredential(
   req.agentCredentialScopes = credential.scopes;
   req.actingAgentId = credential.agentId;
   req.serverId = asServerId(credential.serverId);
+  // #proj-apps:#88: whether this agent's CLI lists app inbox items.
+  noteAgentCliInboxItems({
+    agentId: credential.agentId,
+    machineId: agentRow.machineId,
+    client: req.header("X-Raft-Client"),
+    capabilities: req.header(RAFT_CLIENT_CAPABILITIES_HEADER),
+    daemonVersionHeader: req.header(RAFT_DAEMON_VERSION_HEADER),
+  });
 
   // Bind read-only service restrictions to identity, including alternate credentials.
   const [raftbenchBinding] = await getDb().select({ agentId: raftbenchServiceAgents.agentId })
@@ -1180,7 +1191,10 @@ export async function requireComputerAuth(
     // control surface. This keeps current attached hosts usable before the
     // wire prefix is renamed to `sk_computer_*`; the alias must not be
     // accepted on `/internal/agent-api/*`.
-    const machine = await findMachineByApiKey(apiKey);
+    const found = await findMachineByApiKey(apiKey);
+    // A departed registrant's key (#wg-rbac:#78) is answered as an invalid one;
+    // a deleted server keeps its own answer below.
+    const machine = found && await legacyMachineKeyStanding(found) !== "registrant_departed" ? found : null;
     if (!machine) {
       res.status(401).json({ error: "Invalid computer credential" });
       return;

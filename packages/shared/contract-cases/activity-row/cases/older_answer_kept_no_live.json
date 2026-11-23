@@ -1,0 +1,19 @@
+{
+  "formatVersion": 1,
+  "id": "older_answer_kept_no_live",
+  "rule": "position",
+  "title": "A row loaded from an answer at 101 keeps it when a late answer at 100 arrives, with no live message in between",
+  "why": "The guard is the row's delivered position, not a live message: an answer older than the one the row came from (a list read that left before a later one, answered after it) changes nothing, so the row keeps the 101 answer's latestActivitySeq (which orders and previews the row) and its unread.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow, mergeAnswer)",
+      "packages/web/src/store/inboxRowPosition.ts (mergeAnswerByPosition, with inbox_row_position_v1 on)"
+    ]
+  },
+  "given": { "row": { "unreadCount": 2, "hasMention": true, "position": "101", "mentionOnly": false } },
+  "steps": [
+    { "act": "answer", "row": { "unreadCount": 1, "hasMention": false, "position": "100", "mentionOnly": false } }
+  ],
+  "expect": { "row": { "unreadCount": 2, "hasMention": true, "position": "101", "mentionOnly": false }, "reread": false }
+}

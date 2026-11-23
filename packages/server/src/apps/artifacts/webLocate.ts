@@ -18,7 +18,8 @@
 // sees it from would answer (so it tells nothing a read there wouldn't):
 // - the first server the reader sees it from with Artifacts on there and on
 //   the Artifact's own server (a non-public read needs both, as
-//   visibleItemFor): 200 `{ serverSlug }`;
+//   readableItemFor; a closed server's Artifact kept in a joint it is still
+//   in counts as on, read-only: apiCommon itemReadable): 200 `{ serverSlug }`;
 // - a public Artifact whose own server has Artifacts on, seen only from
 //   servers of the reader's with Artifacts off (they aren't in its server):
 //   200 `{ serverSlug, serverArtifactsOff: true }`, the first server they see
@@ -43,7 +44,7 @@ import { WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY, type ArtifactWebLocation, type Se
 import { getDb } from "../../platform/db";
 import { appEnabledOnLiveServers } from "../../platform/flags";
 import { serversOfUser } from "../../platform/links";
-import { ARTIFACTS_NOT_ENABLED_ERROR, json, type ArtifactApiJson } from "./apiCommon";
+import { ARTIFACTS_NOT_ENABLED_ERROR, itemReadable, json, type ArtifactApiJson } from "./apiCommon";
 import { artifactItems } from "./schema";
 import { actorsWhoCanViewArtifact } from "./visibility";
 import { webFail, webNotVisible, type ArtifactWebApiError, type ArtifactWebReader } from "./webCommon";
@@ -63,10 +64,12 @@ export function createLocateOperations() {
         && (item.homeKind === "public" || item.homeKind === "conversation" || serverId === item.serverId));
       if (candidates.length === 0) return webNotVisible();
 
-      // Sight and the flags at once: the flags of every candidate, those it is seen from among them.
-      const [visible, [itemServerOn, ...candidateOn]] = await Promise.all([
+      // Sight and the flags at once: the flags of every candidate, those it is seen from among them;
+      // the Artifact's own server's as it is read at all (itemReadable: live, or closed and it kept in a joint).
+      const [visible, candidateOn, itemServerOn] = await Promise.all([
         actorsWhoCanViewArtifact(candidates.map((serverId) => ({ type: "user" as const, id: reader.userId, serverId })), item),
-        appEnabledOnLiveServers([item.serverId, ...candidates], WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY),
+        appEnabledOnLiveServers(candidates, WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY),
+        itemReadable(item),
       ]);
       const seenFrom = candidates.filter((_, index) => visible[index]);
       if (seenFrom.length === 0) return webNotVisible();

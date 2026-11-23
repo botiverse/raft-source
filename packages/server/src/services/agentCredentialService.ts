@@ -25,11 +25,11 @@
 
 import { randomBytes, createHmac, timingSafeEqual } from "node:crypto";
 import argon2 from "argon2";
-import { eq, and, isNull, isNotNull, desc, inArray, like, lt, max, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { eq, and, isNull, isNotNull, desc, gt, inArray, like, lt, max, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
 import { currentDate, isExternalAgentRuntime, makeIsMember } from "@botiverse/raft-shared";
-import { getDb, type DatabaseExecutor } from "../db/index";
-import { recordIntegrationAuditEvent, recordRunnerCredentialRenewed } from "./integrationAuditService";
-import { agentCredentials, agentBootstrapTokens, agents, servers, raftbenchServiceAgents, agentRuntimeProvisions, type AgentCredentialIssuedVia } from "../db/schema";
+import { getDb, type Database, type DatabaseExecutor } from "../db/index";
+import { newAuditOperationId, recordIntegrationAuditEvent, recordIntegrationAuditEvents, recordRunnerCredentialRenewed } from "./integrationAuditService";
+import { agentCredentials, agentBootstrapTokens, agents, servers, users, raftbenchServiceAgents, agentRuntimeProvisions, type AgentCredentialIssuedVia } from "../db/schema";
 import { hasExactRaftbenchServiceScopes } from "../raftbench/credentialScopes";
 import { assertAgentHumanCredentialCapacity } from "./agentCredentialMintLimits";
 import { addTraceEvent } from "../tracing/semanticTrace";
@@ -1211,15 +1211,36 @@ export const RUNNER_CREDENTIAL_RECONCILE_GRACE_MS = 5 * 60_000;
 /** More held ids than this is not a believable claim (one per launch): reconcile nothing. */
 export const RUNNER_CREDENTIAL_RECONCILE_MAX_HELD = 4096;
 /**
- * A key used this recently is spared whatever the list says: `last_used_at` is
- * written at most once a minute while a key is used, so a process calling the
- * server keeps its key even if a second daemon on the same Machine key (task
- * #374 duplicates) sent this list, or the list missed it.
+ * The first rule (#wg-rbac:#27): a key used this recently is spared whatever
+ * the list says. No longer what the revoke uses (RUNNER_CREDENTIAL_RECONCILE_UNUSED_MS);
+ * still counted while the switch is off, so the count-only telemetry stays
+ * comparable with what it logged before.
  */
 export const RUNNER_CREDENTIAL_RECONCILE_RECENT_USE_MS = 15 * 60_000;
+/**
+ * The revoke takes only a key unused this long (or, never used, minted this
+ * long ago). Production's count-only telemetry (#wg-rbac:#80) showed the held
+ * list cannot be trusted on its own: keys used 15 minutes to 24 hours before
+ * the ready were missing from it on 688 Machines, mostly orphans of lost
+ * launch-end DELETEs but indistinguishable from a live background user. A key
+ * nobody has used for a week costs nothing to revoke even if the list was
+ * wrong; one used yesterday might be a running process.
+ */
+export const RUNNER_CREDENTIAL_RECONCILE_UNUSED_MS = 7 * 24 * 60 * 60_000;
 /** Revoked per `ready` at most; a machine's older backlog goes on its next connection. */
 export const RUNNER_CREDENTIAL_RECONCILE_BATCH = 200;
+/** Ids kept per ready for the follow-up recount (captureRunnerCredentialsNotHeld). */
+export const RUNNER_CREDENTIAL_RECONCILE_FOLLOWUP_MAX_IDS = 4096;
 const CREDENTIAL_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+type RunnerCredentialReconcileInput = { machineId: string; heldIds: readonly string[]; issuedBefore: Date; now: Date };
+
+export type RunnerCredentialReconcileResult =
+  | { outcome: "ok"; revoked: number; revokedIds: string[] }
+  /** More ids than RUNNER_CREDENTIAL_RECONCILE_MAX_HELD. */
+  | { outcome: "refused_too_many" }
+  /** No credential id listed: a daemon's first ready after a start legitimately holds nothing. */
+  | { outcome: "skipped_empty_held" };
 
 /**
  * #wg-rbac:#27 reconcile: the daemon on `machineId` says (first `ready` of a
@@ -1229,78 +1250,152 @@ const CREDENTIAL_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-
  * that are not listed, were issued before `issuedBefore` (the ready's
  * arrival minus RUNNER_CREDENTIAL_RECONCILE_GRACE_MS: a mint whose response
  * had not reached the daemon when it built the frame is never listed), and
- * were not used in the last RUNNER_CREDENTIAL_RECONCILE_RECENT_USE_MS. Ids
- * the daemon lists that are not this Machine's, or not ids at all, change
- * nothing. No broadcast: no process holds these keys. Returns how many were
- * revoked, or null when the claim was refused as too large.
+ * were not used for RUNNER_CREDENTIAL_RECONCILE_UNUSED_MS (never used: minted
+ * that long ago). A list with no credential id in it revokes nothing
+ * (#wg-rbac:#80: empty on most Machines, as a just-started daemon holds
+ * nothing). Ids the daemon lists that are not this Machine's, or not ids at
+ * all, change nothing. No broadcast and no audit row, like the launch-end
+ * DELETE whose loss this cleans up: no process holds these keys.
  */
 export async function revokeRunnerCredentialsNotHeld(
-  input: { machineId: string; heldIds: readonly string[]; issuedBefore: Date; now: Date; limit?: number },
+  input: RunnerCredentialReconcileInput & { limit?: number },
   executor: DatabaseExecutor = getDb(),
-): Promise<number | null> {
+): Promise<RunnerCredentialReconcileResult> {
   const notHeldWhere = runnerCredentialsNotHeldWhere(input, executor);
-  if (!notHeldWhere) return null;
+  if (notHeldWhere === "refused_too_many") return { outcome: "refused_too_many" };
+  if (notHeldWhere.held.length === 0) return { outcome: "skipped_empty_held" };
   const notHeld = executor
     .select({ id: agentCredentials.id })
     .from(agentCredentials)
-    .where(notHeldWhere)
+    .where(and(notHeldWhere.where, runnerCredentialUnusedWhere(input.now)))
     .limit(input.limit ?? RUNNER_CREDENTIAL_RECONCILE_BATCH);
   const revoked = await executor
     .update(agentCredentials)
     .set({ revokedAt: input.now, revokedReason: RUNNER_NOT_HELD_REVOKE_REASON })
     .where(and(inArray(agentCredentials.id, notHeld), isNull(agentCredentials.revokedAt)))
     .returning({ id: agentCredentials.id });
-  return revoked.length;
+  return { outcome: "ok", revoked: revoked.length, revokedIds: revoked.map((row) => row.id) };
 }
 
 /**
  * Count-only twin of revokeRunnerCredentialsNotHeld (run while
- * runner_credential_reconcile is off): what it would revoke, uncapped,
- * and how many of those were used in the last 24 hours (a live but idle
- * process, or a second daemon on the Machine key: the ones a real revoke
- * could break). Writes nothing. Null when the claim is refused as too large.
+ * runner_credential_reconcile is off). Writes nothing; null when the claim is
+ * refused as too large.
+ * - `wouldRevoke`: what the revoke would take, uncapped (0 for a list with no
+ *   id, which it skips).
+ * - `wouldRevoke15mRule` / `usedLast24h`: under the first rule (spare only a
+ *   key used in the last 15 minutes, act on an empty list too), how many it
+ *   would take and how many of those were used in the last 24 hours. The
+ *   same numbers the count logged before the 7-day rule, kept so the series
+ *   continue; under the 7-day rule a 24-hour count is 0 by construction.
  */
 export async function countRunnerCredentialsNotHeld(
-  input: { machineId: string; heldIds: readonly string[]; issuedBefore: Date; now: Date },
+  input: RunnerCredentialReconcileInput,
   executor: DatabaseExecutor = getDb(),
-): Promise<{ wouldRevoke: number; usedLast24h: number } | null> {
+): Promise<{ wouldRevoke: number; wouldRevoke15mRule: number; usedLast24h: number } | null> {
   const notHeldWhere = runnerCredentialsNotHeldWhere(input, executor);
-  if (!notHeldWhere) return null;
+  if (notHeldWhere === "refused_too_many") return null;
   const dayAgo = new Date(input.now.getTime() - 24 * 60 * 60_000);
+  const recentUseCutoff = new Date(input.now.getTime() - RUNNER_CREDENTIAL_RECONCILE_RECENT_USE_MS);
+  const oldRule = sql`(${agentCredentials.lastUsedAt} IS NULL OR ${agentCredentials.lastUsedAt} < ${recentUseCutoff})`;
+  const newRule = notHeldWhere.held.length > 0 ? sql`(${runnerCredentialUnusedWhere(input.now)})` : sql`false`;
   const [row] = await executor
     .select({
-      wouldRevoke: sql<number>`count(*)::int`,
-      usedLast24h: sql<number>`(count(*) filter (where ${agentCredentials.lastUsedAt} >= ${dayAgo}))::int`,
+      wouldRevoke: sql<number>`(count(*) filter (where ${newRule}))::int`,
+      wouldRevoke15mRule: sql<number>`(count(*) filter (where ${oldRule}))::int`,
+      usedLast24h: sql<number>`(count(*) filter (where ${oldRule} AND ${agentCredentials.lastUsedAt} >= ${dayAgo}))::int`,
     })
     .from(agentCredentials)
-    .where(notHeldWhere);
-  return { wouldRevoke: Number(row?.wouldRevoke ?? 0), usedLast24h: Number(row?.usedLast24h ?? 0) };
+    .where(notHeldWhere.where);
+  return {
+    wouldRevoke: Number(row?.wouldRevoke ?? 0),
+    wouldRevoke15mRule: Number(row?.wouldRevoke15mRule ?? 0),
+    usedLast24h: Number(row?.usedLast24h ?? 0),
+  };
 }
 
+/**
+ * #wg-rbac:#80 measurement: at the ready, the ids of this Machine's live
+ * runner credentials the daemon did not list (grace applied, any last use),
+ * each marked when the revoke would take it, and their `last_used_at` as of
+ * now. A later recount (countRunnerCredentialsUsedSince) of which were used
+ * after the ready tells a live process the list missed from an orphan. At
+ * most RUNNER_CREDENTIAL_RECONCILE_FOLLOWUP_MAX_IDS ids (`truncated` past it).
+ * Null when the claim is refused as too large.
+ */
+export async function captureRunnerCredentialsNotHeld(
+  input: RunnerCredentialReconcileInput,
+  executor: DatabaseExecutor = getDb(),
+): Promise<{ ids: string[]; wouldRevokeIds: string[]; truncated: boolean } | null> {
+  const notHeldWhere = runnerCredentialsNotHeldWhere(input, executor);
+  if (notHeldWhere === "refused_too_many") return null;
+  const newRule = notHeldWhere.held.length > 0 ? sql`(${runnerCredentialUnusedWhere(input.now)})` : sql`false`;
+  const rows = await executor
+    .select({ id: agentCredentials.id, wouldRevoke: sql<boolean>`${newRule}` })
+    .from(agentCredentials)
+    .where(notHeldWhere.where)
+    .orderBy(agentCredentials.id)
+    .limit(RUNNER_CREDENTIAL_RECONCILE_FOLLOWUP_MAX_IDS + 1);
+  const kept = rows.slice(0, RUNNER_CREDENTIAL_RECONCILE_FOLLOWUP_MAX_IDS);
+  return {
+    ids: kept.map((row) => row.id),
+    wouldRevokeIds: kept.filter((row) => row.wouldRevoke === true).map((row) => row.id),
+    truncated: rows.length > RUNNER_CREDENTIAL_RECONCILE_FOLLOWUP_MAX_IDS,
+  };
+}
+
+/** Of `ids` (and of `wouldRevokeIds` among them), how many were used after `since`. One query. */
+export async function countRunnerCredentialsUsedSince(
+  input: { ids: readonly string[]; wouldRevokeIds: readonly string[]; since: Date },
+  executor: DatabaseExecutor = getDb(),
+): Promise<{ usedSince: number; wouldRevokeUsedSince: number }> {
+  if (input.ids.length === 0) return { usedSince: 0, wouldRevokeUsedSince: 0 };
+  const wouldRevoke = input.wouldRevokeIds.length > 0
+    ? inArray(agentCredentials.id, [...input.wouldRevokeIds])
+    : sql`false`;
+  const [row] = await executor
+    .select({
+      usedSince: sql<number>`count(*)::int`,
+      wouldRevokeUsedSince: sql<number>`(count(*) filter (where ${wouldRevoke}))::int`,
+    })
+    .from(agentCredentials)
+    .where(and(inArray(agentCredentials.id, [...input.ids]), gt(agentCredentials.lastUsedAt, input.since)));
+  return { usedSince: Number(row?.usedSince ?? 0), wouldRevokeUsedSince: Number(row?.wouldRevokeUsedSince ?? 0) };
+}
+
+/** Unused for RUNNER_CREDENTIAL_RECONCILE_UNUSED_MS; never used and minted that long ago. */
+function runnerCredentialUnusedWhere(now: Date): SQL {
+  const cutoff = new Date(now.getTime() - RUNNER_CREDENTIAL_RECONCILE_UNUSED_MS);
+  return or(
+    and(isNull(agentCredentials.lastUsedAt), lt(agentCredentials.createdAt, cutoff)),
+    lt(agentCredentials.lastUsedAt, cutoff),
+  )!;
+}
+
+/** The Machine's live runner credentials not listed and past the grace, whatever their last use. */
 function runnerCredentialsNotHeldWhere(
-  input: { machineId: string; heldIds: readonly string[]; issuedBefore: Date; now: Date },
+  input: RunnerCredentialReconcileInput,
   executor: DatabaseExecutor,
-): SQL | undefined {
-  if (input.heldIds.length > RUNNER_CREDENTIAL_RECONCILE_MAX_HELD) return undefined;
+): { where: SQL; held: string[] } | "refused_too_many" {
+  if (input.heldIds.length > RUNNER_CREDENTIAL_RECONCILE_MAX_HELD) return "refused_too_many";
   const held = input.heldIds.filter((id) => CREDENTIAL_ID_PATTERN.test(id));
   const providerHeld = executor
     .select({ id: agentRuntimeProvisions.credentialId })
     .from(agentRuntimeProvisions)
     .where(isNotNull(agentRuntimeProvisions.credentialId));
-  return and(
-    eq(agentCredentials.issuedByMachineId, input.machineId),
-    eq(agentCredentials.issuedVia, "computer"),
-    like(agentCredentials.name, "runner:%"),
-    isNull(agentCredentials.createdByUserId),
-    isNull(agentCredentials.revokedAt),
-    lt(agentCredentials.createdAt, input.issuedBefore),
-    or(
-      isNull(agentCredentials.lastUsedAt),
-      lt(agentCredentials.lastUsedAt, new Date(input.now.getTime() - RUNNER_CREDENTIAL_RECONCILE_RECENT_USE_MS)),
-    ),
-    held.length > 0 ? notInArray(agentCredentials.id, held) : undefined,
-    notInArray(agentCredentials.id, providerHeld),
-  );
+  return {
+    held,
+    where: and(
+      eq(agentCredentials.issuedByMachineId, input.machineId),
+      eq(agentCredentials.issuedVia, "computer"),
+      like(agentCredentials.name, "runner:%"),
+      isNull(agentCredentials.createdByUserId),
+      isNull(agentCredentials.revokedAt),
+      lt(agentCredentials.createdAt, input.issuedBefore),
+      held.length > 0 ? notInArray(agentCredentials.id, held) : undefined,
+      notInArray(agentCredentials.id, providerHeld),
+    )!,
+  };
 }
 
 export const ISSUER_LEFT_SERVER_REVOKE_REASON = "issuer_left_server";
@@ -1385,6 +1480,92 @@ export async function revokeAgentCredentialsIssuedBy(input: {
     ));
 
   return revoked;
+}
+
+export const AGENT_RESET_REVOKE_REASON = "agent_reset";
+
+/**
+ * The database's clock (`now()`, as text, to the microsecond): what
+ * `agent_credentials.created_at` defaults to, so a bound read here orders
+ * keys with no replica clock skew. For `createdBefore` below.
+ */
+export async function readDatabaseNow(db: Database = getDb()): Promise<string> {
+  const result = await db.execute(sql`select now()::text as now`);
+  const now = (result as unknown as { rows: Array<{ now: string }> }).rows[0]?.now;
+  if (!now) throw new Error("select now() returned no row");
+  return now;
+}
+
+/**
+ * A person's Restart / Reset of an agent (POST /api/agents/:id/reset, run by
+ * agentOrchestrator.applyResetPlan once the stopped launch is gone): revoke
+ * every live runner credential of that agent created before the reset began
+ * (`createdBefore`, from readDatabaseNow before the stop), so a launch's key whose
+ * stop-time DELETE from the daemon was lost (fire-and-forget; a runner key
+ * of a daemon that does not renew never expires) stops working. Runner
+ * credentials are what the reconcile revokes (runnerCredentialsNotHeldWhere):
+ * issued_via 'computer', name `runner:*`, no person issued it, not a cloud
+ * runtime's (agent_runtime_provisions.credential_id). The agent's human, app
+ * and provision credentials stay. The new launch's key is minted by its
+ * daemon only after the reset's start, so after `createdBefore`: the revoke
+ * may run after that start and never touches it.
+ *
+ * One transaction: the revoke and one `agent_credential.revoked` per key
+ * (actor: the person who reset; `via: "reset"`). Lock order: users (KEY
+ * SHARE), servers (KEY SHARE), then the credential rows. Returns the revoked
+ * ids; the caller broadcasts the revocation after commit.
+ */
+export async function revokeAgentRunnerCredentialsForReset(input: {
+  agentId: string;
+  serverId: string;
+  actorUserId: string | null;
+  /** The database's `now()` when the reset began (readDatabaseNow): only keys created before it go. */
+  createdBefore: string;
+  now?: Date;
+}, db: Database = getDb()): Promise<string[]> {
+  const now = input.now ?? currentDate();
+  return db.transaction(async (tx) => {
+    // The person may have gone since the reset was asked: then no actor.
+    const [actor] = input.actorUserId
+      ? await tx.select({ id: users.id }).from(users).where(eq(users.id, input.actorUserId)).for("key share")
+      : [];
+    const actorUserId = actor?.id ?? null;
+    await tx.select({ id: servers.id }).from(servers).where(eq(servers.id, input.serverId)).for("key share");
+    const providerHeld = tx
+      .select({ id: agentRuntimeProvisions.credentialId })
+      .from(agentRuntimeProvisions)
+      .where(and(eq(agentRuntimeProvisions.agentId, input.agentId), isNotNull(agentRuntimeProvisions.credentialId)));
+    const agentOnServer = tx
+      .select({ id: agents.id })
+      .from(agents)
+      .where(and(eq(agents.id, input.agentId), eq(agents.serverId, input.serverId)));
+    const revoked = await tx
+      .update(agentCredentials)
+      .set({ revokedAt: now, revokedReason: AGENT_RESET_REVOKE_REASON, revokedByUserId: actorUserId })
+      .where(and(
+        inArray(agentCredentials.agentId, agentOnServer),
+        eq(agentCredentials.issuedVia, "computer"),
+        like(agentCredentials.name, "runner:%"),
+        isNull(agentCredentials.createdByUserId),
+        isNull(agentCredentials.revokedAt),
+        notInArray(agentCredentials.id, providerHeld),
+        sql`${agentCredentials.createdAt} < ${input.createdBefore}::timestamptz`,
+      ))
+      .returning({ id: agentCredentials.id });
+    if (revoked.length === 0) return [];
+    const operationId = newAuditOperationId();
+    await recordIntegrationAuditEvents(revoked.map(({ id }) => ({
+      serverId: input.serverId,
+      eventType: "agent_credential.revoked" as const,
+      outcome: "success" as const,
+      source: actorUserId ? "web" as const : "system" as const,
+      actor: actorUserId ? { type: "human" as const, id: actorUserId } : { type: "system" as const },
+      subject: { type: "agent" as const, id: input.agentId },
+      target: { type: "agent_credential", id },
+      metadata: { agentId: input.agentId, credentialId: id, reason: AGENT_RESET_REVOKE_REASON, via: "reset", operationId },
+    })), tx);
+    return revoked.map(({ id }) => id);
+  });
 }
 
 // ----------------------------------------------------------------------------

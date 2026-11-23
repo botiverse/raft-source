@@ -56,10 +56,12 @@ function useMessageMarkdownInputs() {
 interface DrawnText {
   content: string;
   slots: MessageMarkdownSlots;
+  /** A search's words, marked in the text (MessageMarkdownBody `searchHitQuery`). */
+  highlight?: string;
 }
 
 /** In the app (under its router): a ref opens where it opens from a message. */
-function RoutedMessageMarkdownText({ content, slots }: DrawnText) {
+function RoutedMessageMarkdownText({ content, slots, highlight }: DrawnText) {
   const { formatMessage } = useIntl();
   const { timeFormatOptions, navigableChannels, serverSlug, taskByChannelNumber } = useMessageMarkdownInputs();
   const onThreadUnavailable = useCallback((id: MessageId) => {
@@ -103,12 +105,13 @@ function RoutedMessageMarkdownText({ content, slots }: DrawnText) {
       readReceiptChannelId=""
       readReceiptMessageSeq={undefined}
       readReceiptEnabled={false}
+      searchHitQuery={highlight}
     />
   );
 }
 
 /** Outside a router (a test, the visual harness): the same text, its refs drawn but going nowhere. */
-function StillMessageMarkdownText({ content, slots }: DrawnText) {
+function StillMessageMarkdownText({ content, slots, highlight }: DrawnText) {
   const { timeFormatOptions, navigableChannels, serverSlug, taskByChannelNumber } = useMessageMarkdownInputs();
   return (
     <MessageMarkdownBody
@@ -129,6 +132,7 @@ function StillMessageMarkdownText({ content, slots }: DrawnText) {
       readReceiptChannelId=""
       readReceiptMessageSeq={undefined}
       readReceiptEnabled={false}
+      searchHitQuery={highlight}
     />
   );
 }
@@ -142,8 +146,11 @@ function StillMessageMarkdownText({ content, slots }: DrawnText) {
  * drawn by the caller in place (messageMarkdownSlots), never found again in
  * the words: `@name` typed in a text run stays text. `parts` must be
  * referentially stable (memoized), as the renderer re-parses on a new one.
+ * `highlight`: words to mark as a search's hits are (space-separated, each
+ * in any case, as the result rows mark them: searchHighlightParts), in the
+ * text, link labels and code, never inside a structured part or a ref.
  */
-export function MessageMarkdownText({ parts }: { parts: readonly MessageMarkdownTextPart[] }) {
+export function MessageMarkdownText({ parts, highlight }: { parts: readonly MessageMarkdownTextPart[]; highlight?: string }) {
   const { content, slots } = useMemo(() => {
     const inline: Array<Extract<MessageMarkdownTextPart, { type: "inline" }>> = [];
     const source = parts.map((part) => {
@@ -159,6 +166,6 @@ export function MessageMarkdownText({ parts }: { parts: readonly MessageMarkdown
   }, [parts]);
   const routed = useInRouterContext();
   return routed
-    ? <RoutedMessageMarkdownText content={content} slots={slots} />
-    : <StillMessageMarkdownText content={content} slots={slots} />;
+    ? <RoutedMessageMarkdownText content={content} slots={slots} highlight={highlight} />
+    : <StillMessageMarkdownText content={content} slots={slots} highlight={highlight} />;
 }

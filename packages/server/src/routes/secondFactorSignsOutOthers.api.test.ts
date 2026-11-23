@@ -235,12 +235,12 @@ test("a password change signs out every sign-in, the one that made it too: each 
   assert.equal(reasons.get(other.familyId), "revoke_all");
 });
 
-test("signing out: the refresh token is session_revoked; a token never issued stays a plain 401", async ({ app, seed }) => {
+test("signing out: the refresh token is session_revoked; a token never issued is refresh_token_invalid", async ({ app, seed }) => {
   const human = await seed.human();
   const session = await signInForTest(human.id);
   const logout = await fetch(`${app.baseUrl}/api/auth/logout`, { method: "POST", headers: json, body: JSON.stringify({ refreshToken: session.refreshToken }) });
   assert.ok(logout.ok, `logout ${logout.status}`);
   assert.deepEqual(await refresh(app.baseUrl, session.refreshToken), { status: 401, code: "session_revoked" });
-  assert.deepEqual(await refresh(app.baseUrl, "0".repeat(64)), { status: 401, code: undefined });
+  assert.deepEqual(await refresh(app.baseUrl, "0".repeat(64)), { status: 401, code: "refresh_token_invalid" });
   assert.equal((await fetch(`${app.baseUrl}/api/auth/me`, { headers: { Authorization: `Bearer ${signAccessToken(human.id, session.familyId)}` } })).status, 401);
 });

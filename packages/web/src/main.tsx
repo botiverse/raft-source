@@ -17,6 +17,7 @@ import { NewWebVersionBanner } from "./components/errors/NewWebVersionBanner";
 import "./buildIdentity";
 import { trackVisualViewport } from "./utils/visualViewport";
 import { installViewSwitchTracking } from "./observability/viewSwitchSpan";
+import { startWebVitals } from "./observability/webVitals";
 import { captureLandingPage } from "./analytics/publicVisits";
 import { rememberSignupCampaign } from "./analytics/signupCampaign";
 import { captureMessageLinkLanding } from "./utils/messageLinkLanding";
@@ -92,6 +93,8 @@ captureMessageLinkLanding();
 applyBootServerTheme(window.location.pathname);
 // slock.web.boot_timing: what this load opens; milestones report as they come.
 startBootTiming();
+// slock.web.vitals: real-user LCP/CLS/INP and long tasks, emitted on visibilitychange->hidden / pagehide.
+startWebVitals();
 // The messages store reads replies for whoever the auth store has signed in,
 // from before the first request (store/signedInUser.ts).
 followSignedInUser();

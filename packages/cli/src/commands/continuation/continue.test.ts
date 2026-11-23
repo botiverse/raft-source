@@ -196,7 +196,14 @@ async function readAll(stream: NodeJS.ReadableStream | undefined): Promise<strin
 /** `raft <argv>` as `agentId`, the demo commands registered under `raft demo <verb>`. */
 async function runRaft(
   argv: string[],
-  options: { agentId: string; stdin?: string | NodeJS.ReadableStream; commands: readonly CliContinuationCommand[]; continuations?: Partial<CliContinuationOptions> },
+  options: {
+    agentId: string;
+    stdin?: string | NodeJS.ReadableStream;
+    commands: readonly CliContinuationCommand[];
+    continuations?: Partial<CliContinuationOptions>;
+    /** Over the fixture env: what the daemon sets (RAFT_CONTINUATION_TOOL, RAFT_CONTINUATION_VIA). */
+    env?: NodeJS.ProcessEnv;
+  },
 ): Promise<Run> {
   const stdout: string[] = [];
   const stderr: string[] = [];
@@ -208,7 +215,7 @@ async function runRaft(
       stdout: { write: (chunk: string | Uint8Array) => { stdout.push(String(chunk)); return true; } },
       stderr: { write: (chunk: string | Uint8Array) => { stderr.push(String(chunk)); return true; } },
     },
-    env: envOf(),
+    env: { ...envOf(), ...options.env },
     loadAgentContext: () => agentContext(options.agentId),
     continuations,
   };
@@ -319,6 +326,7 @@ test("cont answers it: the command carries on from its question, finishes, and e
     choice: "a",
     outcome: "done",
     elapsed_ms: 65_000,
+    via: "cont",
     runtime: "claude",
     ...CLI_VERSION_ATTR,
     serverId: "server-continue",
@@ -329,6 +337,78 @@ test("cont answers it: the command carries on from its question, finishes, and e
   assert.deepEqual(await runRaft(cont(id, "a"), { agentId, commands }), done);
   assert.equal(server.sendKeys.length, 1);
   assert.equal(spansNamed("cli.continuation.answered").length, 1);
+});
+
+// The daemon's answer tool (continuation_tool_v0): the launch sets
+// RAFT_CONTINUATION_TOOL=answer_continuation in the runtime's env, and the
+// `raft __continue` the tool runs also gets RAFT_CONTINUATION_VIA=tool.
+const TOOL_ENV = { RAFT_CONTINUATION_TOOL: "answer_continuation" };
+const TOOL_ANSWER_ENV = { ...TOOL_ENV, RAFT_CONTINUATION_VIA: "tool" };
+
+test("with the answer tool offered, the pause lists the options once and names the tool, `cont` the shell fallback", async () => {
+  const agentId = freshAgent();
+  const server = fakeServer();
+  const run = await runRaft(["demo", "send", "--target", "#ops"], { agentId, stdin: `${PRIVATE.body}\n`, commands: [demoSend(server)], env: TOOL_ENV });
+  assert.equal(run.exitCode, 10);
+  const id = /continuation ([0-9a-z]{10})/.exec(run.stdout)![1]!;
+  assert.equal(run.stdout, [
+    "New replies arrived in #ops since you started.",
+    "  @alice 13:01  I already fixed it in #11290",
+    `Choose one of these (continuation ${id}, expires at 13:12 UTC):`,
+    "  a) Send your original reply",
+    "  b) Write a new reply (your text)",
+    "  c) Cancel",
+    `Answer with the answer_continuation tool (id ${id}, choice, and text for an option that takes text); or in a shell: cont ${id} <choice> (text on stdin)`,
+    "",
+  ].join("\n"));
+  assert.equal(spansNamed("cli.continuation.created")[0]!.attrs.via, undefined, "a command's own first run was started by no answer");
+
+  // Any other value is not the tool: the `cont` lines, as without it.
+  const other = await runRaft(["demo", "send", "--target", "#ops"], { agentId, stdin: `${PRIVATE.body}\n`, commands: [demoSend(server)], env: { RAFT_CONTINUATION_TOOL: "something_else" } });
+  assert.match(other.stdout, /Answer with one of these \(continuation [0-9a-z]{10}, expires at 13:12 UTC\):\n  a\) Send your original reply\n     cont [0-9a-z]{10} a\n/);
+});
+
+test("with the answer tool offered, an ask for text alone names the tool too", async () => {
+  const agentId = freshAgent();
+  const run = await runRaft(["demo", "note", "--target", "#ops"], { agentId, commands: [demoNote(fakeServer())], env: TOOL_ENV });
+  assert.equal(run.exitCode, 10);
+  const id = /continuation ([0-9a-z]{10})/.exec(run.stdout)![1]!;
+  assert.equal(run.stdout, [
+    "Write the note to post in #ops.",
+    `Your text is the answer (continuation ${id}, expires at 13:12 UTC).`,
+    `Answer with the answer_continuation tool (id ${id} and text); or in a shell: cont ${id}, your text on stdin`,
+    "",
+  ].join("\n"));
+});
+
+test("spans say how the answer came in: via tool when the daemon's tool ran it, else via cont", async () => {
+  const agentId = freshAgent();
+  const server = fakeServer();
+  const commands = [demoChain(server)];
+  const id = await pausedId(agentId, "chain", commands);
+
+  // The tool's answer pauses again: the next question names the tool, and its spans say via tool.
+  const next = await runRaft(cont(id, "y"), { agentId, commands, env: TOOL_ANSWER_ENV });
+  assert.equal(next.exitCode, 10, next.stderr);
+  assert.match(next.stdout, /^Post the rest\?\nChoose one of these \(continuation [0-9a-z]{10}, expires at 13:12 UTC\):\n  y\) Yes\n  n\) No\nAnswer with the answer_continuation tool/);
+  const nextId = /continuation ([0-9a-z]{10})/.exec(next.stdout)![1]!;
+  assert.deepEqual(spansNamed("cli.continuation.answered").map((span) => [span.attrs.continuation_id, span.attrs.via]), [[id, "tool"]]);
+  assert.deepEqual(spansNamed("cli.continuation.created").map((span) => [span.attrs.continuation_id, span.attrs.via]), [[id, undefined], [nextId, "tool"]]);
+
+  // A refusal through the tool says so; the same refusal typed in a shell says cont.
+  assert.equal((await runRaft(cont(nextId, "maybe"), { agentId, commands, env: TOOL_ANSWER_ENV })).exitCode, 1);
+  assert.equal((await runRaft(cont(nextId, "maybe"), { agentId, commands })).exitCode, 1);
+  assert.equal((await runRaft(cont("not-an-id", "y"), { agentId, commands, env: TOOL_ANSWER_ENV })).exitCode, 1);
+  assert.deepEqual(spansNamed("cli.continuation.refused").map((span) => [span.attrs.code, span.attrs.via]), [
+    ["INVALID_ANSWER", "tool"],
+    ["INVALID_ANSWER", "cont"],
+    ["UNKNOWN", "tool"],
+  ]);
+
+  // Typed in a shell: via cont.
+  const done = await runRaft(cont(nextId, "y"), { agentId, commands });
+  assert.equal(done.exitCode, 0, done.stderr);
+  assert.equal(spansNamed("cli.continuation.answered")[1]!.attrs.via, "cont");
 });
 
 test("an option that takes text reads it from stdin; cancel runs nothing further", async () => {

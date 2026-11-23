@@ -1,7 +1,7 @@
 {
   "protocolVersion": 1,
   "runtimeId": "antigravity",
-  "schemaVersion": "antigravity.edit.v1",
+  "schemaVersion": "antigravity.create.v1",
   "sourceId": "reasoningEffort",
   "kind": "dependent_select",
   "pointer": "/reasoningEffort",

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { and, eq } from "drizzle-orm";
 import { getDb } from "../db";
-import { jointChannelAdmissions, jointChannelMembers, jointChannelServers, serverMembers } from "../db/schema";
+import { channelAgents, jointChannelAdmissions, jointChannelMembers, jointChannelServers, serverAgentMembers, serverMembers } from "../db/schema";
 import { createApiTest } from "../test/integration/apiTest";
 import { createSeed } from "../test/integration/seed";
 import { createHttpClient } from "../test/integration/http";
@@ -20,6 +20,7 @@ import { assertCanAdmitExternalGuest, EXTERNAL_CHANNEL_MAX_SLOTS } from "../serv
 import { channelConversionJobs, channelExternalInvites, channels, featureFlagRules } from "../db/schema";
 import { EXTERNAL_CHANNELS_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import { acceptExternalInviteAsGuest } from "../services/externalInviteService";
+import { actorHasChannelCapability } from "../lib/channelActorPermissions";
 
 /**
  * P3: guests in joint channels (design v2, #wg-rbac:#25). A Guest of the host,
@@ -261,7 +262,7 @@ test("other servers see the Guest only as from the host, with no guest role; the
 
 test("agents: the host's agents see the Guest with its guest role; another server's agents see it only as from the host", async ({ app }) => {
   const f = await seedJointWithGuest();
-  type Human = { name: string; role?: string | null; servers?: Array<{ name: string; slug: string }> };
+  type Human = { name: string; role?: string | null; servers?: Array<{ id?: string; name: string; slug: string }> };
   const suffix = Date.now() % 100000;
   const hostAgent = await createAgent(f.host.id, `hostbot${suffix}`, { runtime: "codex" });
   const peerAgent = await createAgent(f.peer.id, `peerbot${suffix}`, { runtime: "codex" });
@@ -289,7 +290,115 @@ test("agents: the host's agents see the Guest with its guest role; another serve
 
   const seenByPeerAgent = await guestRow(`/internal/agent-api/channel-members?${query(f.peerChannel)}`, await keyOf(peerAgent.id));
   assert.equal("role" in seenByPeerAgent, false, "no role for another server's person");
-  assert.deepEqual(seenByPeerAgent.servers, [{ name: f.host.name, slug: f.host.slug }], "from the host");
+  assert.deepEqual(seenByPeerAgent.servers, [{ id: f.host.id, name: f.host.name, slug: f.host.slug }], "from the host");
+});
+
+test("agents: a joint roster's channel roles are the web member list's: a person is admin when they can manage the channel, another server's agent only when it manages the channel", async ({ app }) => {
+  const http = createHttpClient(app.baseUrl);
+  const f = await seedJointWithGuest();
+  type Row = { name: string; channelRole?: string };
+  type WebRow = { name: string; effectiveChannelRole?: string };
+  const suffix = Date.now() % 100000;
+  const hostAgent = await createAgent(f.host.id, `hostadm${suffix}`, { runtime: "codex" });
+  const peerAgent = await createAgent(f.peer.id, `peerbot${suffix}`, { runtime: "codex" });
+  await addAgent(f.hostChannel.id, hostAgent.id, { role: "admin" });
+  await addAgent(f.peerChannel.id, peerAgent.id);
+  const keyOf = async (agentId: string) => (await mintAgentCredential({ agentId, scopes: ["channels"], name: "joint-roster-roles", issuedVia: "computer", createdByUserId: null })).apiKey;
+  const roster = async (channel: { name: string }, key: string) => {
+    const response = await fetch(`${app.baseUrl}/internal/agent-api/channel-members?channel=${encodeURIComponent(`#${channel.name}`)}`, { headers: { Authorization: `Bearer ${key}` } });
+    const text = await response.text();
+    assert.equal(response.status, 200, text);
+    const body = JSON.parse(text) as { agents: Row[]; humans: Row[] };
+    return { humans: Object.fromEntries(body.humans.map((row) => [row.name, row.channelRole ?? null])), agents: Object.fromEntries(body.agents.map((row) => [row.name, row.channelRole ?? null])) };
+  };
+  const webAdmins = async (viewer: { id: string }, server: { id: string }, channel: { id: string }) => {
+    const view = await status(http, viewer, server, `/api/channels/${channel.id}/members`);
+    assert.equal(view.status, 200, JSON.stringify(view.body));
+    const admins = (rows: WebRow[]) => rows.filter((row) => row.effectiveChannelRole === "admin").map((row) => row.name).sort();
+    return { humans: admins(view.body.humans as WebRow[]), agents: admins(view.body.agents as WebRow[]) };
+  };
+  const admins = (roles: Record<string, string | null>) => Object.entries(roles).filter(([, role]) => role === "admin").map(([name]) => name).sort();
+
+  // The host's agent: the host owner manages the channel; the host's appointed agent is a channel admin; the Guest is a plain member.
+  const host = await roster(f.hostChannel, await keyOf(hostAgent.id));
+  assert.deepEqual(host.humans, {
+    [f.hostOwner.name]: "admin",
+    [f.hostMember.name]: "member",
+    [f.peerAdmin.name]: "member", // the peer's owner: no authority over the host's channel
+    [f.peerMember.name]: "member",
+    [f.guest.name]: "member",
+  });
+  assert.deepEqual(host.agents, { [hostAgent.name]: "admin", [peerAgent.name]: null });
+  assert.deepEqual({ humans: admins(host.humans), agents: admins(host.agents) }, await webAdmins(f.hostMember, f.host, f.hostChannel));
+
+  // Another server's agent: the same people and the host's appointed agent are admins (who can manage the channel).
+  const peer = await roster(f.peerChannel, await keyOf(peerAgent.id));
+  assert.deepEqual(peer.humans, host.humans);
+  assert.deepEqual(peer.agents, { [hostAgent.name]: "admin", [peerAgent.name]: "member" });
+  assert.deepEqual({ humans: admins(peer.humans), agents: admins(peer.agents) }, await webAdmins(f.peerMember, f.peer, f.peerChannel));
+});
+
+test("agents: a joint roster shows an agent as admin only when it can manage the channel from the host; a stored admin or server admin elsewhere reads as a member", async ({ app }) => {
+  const http = createHttpClient(app.baseUrl);
+  const f = await seedJointWithGuest();
+  const suffix = Date.now() % 100000;
+  const agentOn = async (server: { id: string }, channel: { id: string }, name: string, roles: { channel?: "admin"; server?: "admin" } = {}) => {
+    const agent = await createAgent(server.id, `${name}${suffix}`, { runtime: "codex" });
+    if (roles.server) {
+      await getDb().update(serverAgentMembers).set({ role: roles.server })
+        .where(and(eq(serverAgentMembers.serverId, server.id), eq(serverAgentMembers.agentId, agent.id)));
+    }
+    await addAgent(channel.id, agent.id, roles.channel ? { role: roles.channel } : {});
+    return agent;
+  };
+  const hostAppointed = await agentOn(f.host, f.hostChannel, "happt", { channel: "admin" });
+  const hostServerAdmin = await agentOn(f.host, f.hostChannel, "hsadm", { server: "admin" });
+  const hostPlain = await agentOn(f.host, f.hostChannel, "hplain");
+  // Stored roles on the peer's copy: kept as they are, but they manage nothing in a joint channel.
+  const peerStoredAdmin = await agentOn(f.peer, f.peerChannel, "pappt", { channel: "admin" });
+  const peerServerAdmin = await agentOn(f.peer, f.peerChannel, "psadm", { server: "admin", channel: "admin" });
+  const keyOf = async (agentId: string) => (await mintAgentCredential({ agentId, scopes: ["channels"], name: "joint-roster-effective", issuedVia: "computer", createdByUserId: null })).apiKey;
+  const agentRoster = async (channel: { name: string }, agentId: string) => {
+    const response = await fetch(`${app.baseUrl}/internal/agent-api/channel-members?channel=${encodeURIComponent(`#${channel.name}`)}`, { headers: { Authorization: `Bearer ${await keyOf(agentId)}` } });
+    const text = await response.text();
+    assert.equal(response.status, 200, text);
+    return Object.fromEntries((JSON.parse(text) as { agents: Array<{ name: string; channelRole?: string }> }).agents.map((row) => [row.name, row.channelRole ?? null]));
+  };
+  const webRoster = async (viewer: { id: string }, server: { id: string }, channel: { id: string }) => {
+    const view = await status(http, viewer, server, `/api/channels/${channel.id}/members`);
+    assert.equal(view.status, 200, JSON.stringify(view.body));
+    return Object.fromEntries((view.body.agents as Array<{ name: string; effectiveChannelRole: string }>).map((row) => [row.name, row.effectiveChannelRole]));
+  };
+
+  // From the host: its appointed and its server-admin agents manage the channel; the peer's agents, managing nothing, carry no role.
+  assert.deepEqual(await agentRoster(f.hostChannel, hostPlain.id), {
+    [hostAppointed.name]: "admin", [hostServerAdmin.name]: "admin", [hostPlain.name]: "member",
+    [peerStoredAdmin.name]: null, [peerServerAdmin.name]: null,
+  });
+  assert.deepEqual(await webRoster(f.hostMember, f.host, f.hostChannel), {
+    [hostAppointed.name]: "admin", [hostServerAdmin.name]: "admin", [hostPlain.name]: "member",
+    [peerStoredAdmin.name]: "member", [peerServerAdmin.name]: "member",
+  });
+  // From the peer: its own agents' stored admin and server admin role read as member; the host's managing agents read as admin, its plain agent carries no role.
+  assert.deepEqual(await agentRoster(f.peerChannel, peerStoredAdmin.id), {
+    [hostAppointed.name]: "admin", [hostServerAdmin.name]: "admin", [hostPlain.name]: null,
+    [peerStoredAdmin.name]: "member", [peerServerAdmin.name]: "member",
+  });
+  assert.deepEqual(await webRoster(f.peerMember, f.peer, f.peerChannel), {
+    [hostAppointed.name]: "admin", [hostServerAdmin.name]: "admin", [hostPlain.name]: "member",
+    [peerStoredAdmin.name]: "member", [peerServerAdmin.name]: "member",
+  });
+  // The roster's admin is the authority: each agent, on its own server's copy, can edit the channel exactly when listed as admin.
+  for (const [agent, server, channel, admin] of [
+    [hostAppointed, f.host, f.hostChannel, true], [hostServerAdmin, f.host, f.hostChannel, true], [hostPlain, f.host, f.hostChannel, false],
+    [peerStoredAdmin, f.peer, f.peerChannel, false], [peerServerAdmin, f.peer, f.peerChannel, false],
+  ] as const) {
+    assert.equal(await actorHasChannelCapability(server.id, channel.id, "agent", agent.id, "editChannelMetadata"), admin, agent.name);
+  }
+  // Projection only: the stored roles are unchanged.
+  const stored = await getDb().select({ role: channelAgents.role }).from(channelAgents)
+    .where(and(eq(channelAgents.channelId, f.peerChannel.id), eq(channelAgents.agentId, peerStoredAdmin.id)));
+  assert.deepEqual(stored, [{ role: "admin" }]);
 });
 
 test("the Guest sees other servers' members with their server, opens their simplified card, and nobody outside the channel", async ({ app }) => {

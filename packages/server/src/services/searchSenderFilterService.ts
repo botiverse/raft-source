@@ -1,6 +1,7 @@
 import * as channelService from "./channelService";
 import { getActorServerRoleInServer } from "../lib/actorPermissions";
 import * as serverService from "./serverService";
+import { sentenceQuoting } from "../lib/refusal";
 
 type SearchSenderRequester =
   | { type: "agent"; id: string }
@@ -90,7 +91,7 @@ export async function resolveSearchSenderFilter(
     return {
       ok: false,
       status: 409,
-      error: `Member @${handle} is ambiguous`,
+      error: sentenceQuoting([handle], `Member @${handle} is ambiguous`, "That member name is ambiguous"),
       errorCode: "ambiguous_member_ref",
     };
   }
@@ -100,7 +101,8 @@ export async function resolveSearchSenderFilter(
     return {
       ok: false,
       status: 404,
-      error: `Member not found: @${handle}`,
+      // The sender is request input: a sentence quoting it must stay one (no line break, command or overlong value).
+      error: sentenceQuoting([handle], `Member not found: @${handle}`, "Member not found: no one here has that name"),
       errorCode: "member_not_found",
     };
   }

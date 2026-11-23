@@ -6,12 +6,8 @@ import { useIntl } from "react-intl";
 import { MonitorX, X } from "lucide-react";
 import {
   PanelAction,
-  PanelHeading,
-  PanelMeta,
-  PanelTitle,
   ProfilePanel,
   ProfilePanelBody,
-  Skeleton,
 } from "@botiverse/raft-ui";
 import { useProfileStore } from "../../store/profileStore";
 import { useAgentStore } from "../../store/agentStore";
@@ -25,9 +21,7 @@ import { useFocusRestore } from "../../hooks/useFocusRestore";
 import { AgentDetailPanel } from "../../features/agent/AgentDetailPanel";
 import HumanDetailPanel from "../member/HumanDetailPanel";
 import type { HumanProfile } from "../member/HumanDetailPanel";
-import PanelHeader, { PROFILE_HANDLE_FONT_CLASS } from "../ui/PanelHeader";
-import { SkeletonTextBar } from "../ui/Skeleton";
-import { TabBarRow } from "../../boot/bootSkeletons";
+import { ProfilePanelSkeleton } from "./ProfilePanelSkeleton";
 import { resolveHumanProfile } from "../member/resolveHumanProfile";
 import api from "../../api/client";
 import { canRenderAgentDetail, isRemoteAgentProjection } from "../agent/agentDetailAvailability";
@@ -164,6 +158,9 @@ export default function ConnectedProfilePanel({
   const profileType = target?.type ?? storeProfileType;
   const profileId = target?.id ?? storeProfileId;
   const profileChannelId = (target ? targetChannelId : storeProfileChannelId) ?? null;
+  // × and Esc close this pane and stay on the page under it (Computers,
+  // Members, a channel), however it was opened: returning to the page it was
+  // opened from is Back's (the top bar's ‹, the browser's, a phone's Back).
   const closePanel = onClose ?? closeProfile;
   const embedded = presentation === "embedded";
   // Its box is its host's: the drawer it is embedded in, or its column in the row (#189).
@@ -309,7 +306,8 @@ export default function ConnectedProfilePanel({
   // (their `useMobileBack(onClose ?? <route>)`). For the loading skeleton we
   // hand the same `closeProfile` so the chevron behaves identically once the
   // panel hydrates — overlay close, no skipping past the underlying surface.
-  const skeletonMobileBack = useMobileBack(closePanel);
+  // Back steps back whenever there is a page behind, so its fallback is the plain close.
+  const skeletonMobileBack = useMobileBack(onClose ?? closeProfile);
   const headerBack = onBack ?? skeletonMobileBack;
   // The divider between this pane and its left neighbour belongs to this
   // pane's own box, applied in index.css only when a neighbour exists (the
@@ -325,15 +323,6 @@ export default function ConnectedProfilePanel({
     [framed, isDesktop, width],
   );
   const agentDetailStyle = useMemo(() => (isDesktop && !framed ? { width } : undefined), [framed, isDesktop, width]);
-  const skeletonBackTestId = profileType === "agent"
-    ? "agent-mobile-back"
-    : profileType === "external"
-      ? "external-mobile-back"
-      : "human-mobile-back";
-  const skeletonMobileBackProps = useMemo(() => ({
-    "data-testid": skeletonBackTestId,
-    title: formatMessage({ id: "common.announcement.back" }),
-  }), [formatMessage, skeletonBackTestId]);
 
   // Render order:
   // 1. External message author → provider identity detail in this same panel
@@ -423,7 +412,7 @@ export default function ConnectedProfilePanel({
         style={agentDetailStyle}
       >
         {framed ? null : <ColumnResizeHandle column="detail" edge="left" visibleFrom="lg" />}
-        <AgentUnavailablePanel onClose={closeProfile} />
+        <AgentUnavailablePanel onClose={closePanel} />
       </ProfilePanel>
     );
   }
@@ -476,24 +465,10 @@ export default function ConnectedProfilePanel({
         {!framed && (
           <ColumnResizeHandle column="detail" edge="left" visibleFrom="lg" />
         )}
-        {/* The profile's head, tab bar (an agent's) and hero in their own
-            parts, with bars for what is not known yet, so the loaded profile
-            lands where they were (skeleton-vs-layout audit round 2: an empty
-            head over a centred "Loading…"). */}
-        <PanelHeader
-          title=""
-          iconSlot={<Skeleton aria-hidden="true" className="size-[35px] md:pointer-fine:size-[27px]" />}
-          iconAlwaysVisible
-          iconKind="avatar"
-          titleSlot={(
-            <>
-              <PanelHeading><PanelTitle render={<div />}><SkeletonTextBar className="w-32" /></PanelTitle></PanelHeading>
-              <PanelMeta render={<div />} className={PROFILE_HANDLE_FONT_CLASS}><SkeletonTextBar className="w-20" /></PanelMeta>
-            </>
-          )}
+        <ProfilePanelSkeleton
+          profileType={profileType}
           onMobileBack={headerBack}
-          backButtonVisibility={onBack ? "always" : "responsive"}
-          mobileBackProps={skeletonMobileBackProps}
+          alwaysBack={!!onBack}
           actions={onClose ? (
             <>
               {/* The profile's Expand (#189 rule 5), a window control against Close; none outside the planned row. */}
@@ -510,21 +485,6 @@ export default function ConnectedProfilePanel({
             </>
           ) : undefined}
         />
-        <RowRegionBody>
-          <ProfilePanelBody className="flex min-h-0 flex-1 flex-col bg-layer-canvas font-sans" aria-busy="true" data-testid="profile-panel-loading">
-            <span className="sr-only" role="status">{formatMessage({ id: "common.loading" })}</span>
-            {profileType === "agent" ? <TabBarRow /> : null}
-            {/* The hero (AgentDetailPanel's, HumanDetailPanel's): the 99px
-                avatar, the name and the handle. */}
-            <div className="flex items-start gap-4 px-(--surface-inset) py-5" aria-hidden="true" data-testid="profile-hero-skeleton">
-              <Skeleton className="size-[99px] shrink-0" />
-              <div className="min-w-0 flex-1 pt-1">
-                <PanelTitle render={<div />}><SkeletonTextBar className="w-36" /></PanelTitle>
-                <div className={`text-mono-meta ${PROFILE_HANDLE_FONT_CLASS}`}><SkeletonTextBar className="w-24" /></div>
-              </div>
-            </div>
-          </ProfilePanelBody>
-        </RowRegionBody>
       </ProfilePanel>
     );
   }

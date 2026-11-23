@@ -5,6 +5,8 @@ import {
   normalizeSidebarSectionOrder,
   removeSidebarItemPlacement,
   reorderSidebarSectionOrder,
+  sidebarItemSectionKey,
+  sidebarMoveToHomeUpdate,
 } from "../src/store/sidebarSections";
 
 test("sidebar sections preserve user ordering and append missing sections once", () => {
@@ -99,4 +101,26 @@ test("removing an item without a custom placement preserves the placement snapsh
     removeSidebarItemPlacement(placements, { kind: "agent", id: "agent-without-placement" }),
     placements,
   );
+});
+
+test("the section a row is shown in: Pinned wins over a placement; a placement in a deleted section is home", () => {
+  const customSections = [{ id: "project", name: "Project", emoji: null, sortMode: "manual" as const }];
+  const key = (pinned: boolean, placementSectionId: string | null) => sidebarItemSectionKey({ pinned, placementSectionId, customSections, homeKey: "system:channels" });
+  assert.equal(key(true, "project"), "system:pinned");
+  assert.equal(key(false, "project"), "project");
+  assert.equal(key(false, "deleted"), "system:channels");
+  assert.equal(key(false, null), "system:channels");
+});
+
+test("moving a row home unpins it and drops its placement; already home writes nothing", () => {
+  const item = { kind: "channel" as const, id: "c1" };
+  const other = { kind: "channel" as const, id: "c2" };
+  const state = {
+    pinned: [item, other],
+    sectionPlacements: [{ ...item, sectionId: "project", position: 0 }, { ...other, sectionId: "project", position: 1 }],
+  };
+  const update = sidebarMoveToHomeUpdate(state, item, item);
+  assert.deepEqual(update.pinned, [other]);
+  assert.deepEqual(update.sectionPlacements?.map((placement) => placement.id), ["c2"]);
+  assert.deepEqual(sidebarMoveToHomeUpdate({ pinned: [], sectionPlacements: [] }, item, item), {});
 });

@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { Event, EventObserver, EventsOptions, FailedTurn, FailureClass, Session } from "@botiverse/oar";
+import { utcInstantFromDate, type AccountUsageSnapshot, type AccountUsageWindow, type Event, type EventObserver, type EventsOptions, type FailedTurn, type FailureClass, type Session } from "@botiverse/oar";
 import type { ScriptedTurn } from "@botiverse/oar/testing";
 import { BasicTracer, type AgentConfig, type AgentMessage } from "@botiverse/raft-shared";
 import { LocalRotatingTraceSink } from "@botiverse/raft-trace-client";
 import { applyStartupMemoryBlock, buildStartupMemoryBlock } from "../startupMemoryBlock";
 import { exampleUnreadSummary } from "../axExampleFixtures";
 import { getDriver } from "../drivers/index";
+import { spawnCliTransportDir } from "../drivers/cliTransport";
+import { CONTEXT_SESSIONS_FILENAME, configPassiveAx, publishSpawnContextGeneration, readContextGeneration, rememberSessionContext } from "../contextGeneration";
 import { AGENT_STOP_KILL_GRACE_MS } from "../drivers/processStop";
 import { planStartupInput } from "../startupInput";
 import { formatInboxUpdateRuntimeInput, NATIVE_STANDING_PROMPT_STARTUP_INPUT, projectThreadJoinContextsForRuntimeInput } from "../agentRuntimeInput";
@@ -29,7 +31,7 @@ import {
 } from "../testing/oarAgentHostHarness";
 import { AgentHostRouter } from "./agentHostRouter";
 import type { AgentDeliveryContext, LegacyAgentHost } from "./agentLifecycleHost";
-import { isVerifiedGrokCli, OAR_OPEN_FAILURE_CLASSES, OAR_RETAINED_BYTES, oarFailureProviderLimit, oarOpenFailureClass, withOarRecordRetention, type OarAgentHostDeps } from "./oarAgentHost";
+import { fullWindowsResetAt, isOarRuntimeSupportedOnPlatform, isVerifiedGrokCli, OAR_OPEN_FAILURE_CLASSES, OAR_RETAINED_BYTES, oarFailureProviderLimit, oarOpenFailureClass, refusedOptionFields, serviceTierConfirmationFailure, withOarRecordRetention, type OarAgentHostDeps } from "./oarAgentHost";
 import type { OarLaunch } from "./oarLaunch";
 import { ProviderLimitLedger, providerLimitCredentialKey } from "../providerLimitLedger";
 import { createAgentAppInboxStore } from "../agentAppInbox";
@@ -63,6 +65,7 @@ test("a cold start runs on OAR with the grok driver's standing prompt and the le
       driver,
       runtimeConfig,
       isResume: false,
+      nativeStandingPrompt: Boolean(driver.supportsNativeStandingPrompt),
       standingPromptReachesSession: true,
       standingPromptInFirstInput: false,
       wakeMessageTransient: false,
@@ -114,6 +117,7 @@ test("a wake start gets the legacy wake input (inbox notice and unread suffix)",
       driver,
       runtimeConfig,
       isResume: false,
+      nativeStandingPrompt: Boolean(driver.supportsNativeStandingPrompt),
       standingPromptReachesSession: true,
       standingPromptInFirstInput: false,
       wakeMessage: wake,
@@ -225,6 +229,15 @@ test("oarOpenFailureClass maps a failed open to a closed class, never to its tex
   ];
   for (const [cause, expected] of cases) assert.equal(oarOpenFailureClass(cause), expected, String(cause));
   for (const [cause] of cases) assert.ok((OAR_OPEN_FAILURE_CLASSES as readonly string[]).includes(oarOpenFailureClass(cause)));
+});
+
+test("refusedOptionFields names an UnsupportedOptionError's option and cwd reason, and nothing for other errors", () => {
+  const refusal = (details: Record<string, unknown>) => Object.assign(new Error("refused"), { name: "UnsupportedOptionError", ...details });
+  assert.deepEqual(refusedOptionFields(refusal({ option: "appendSystemPrompt" })), { refused_option: "appendSystemPrompt" });
+  assert.deepEqual(refusedOptionFields(refusal({ option: "cwd", reason: "other_cwd" })), { refused_option: "cwd", resume_cwd_reason: "other_cwd" });
+  assert.deepEqual(refusedOptionFields(refusal({})), {});
+  assert.deepEqual(refusedOptionFields(Object.assign(new Error("x"), { option: "cwd" })), {}, "not an UnsupportedOptionError");
+  assert.deepEqual(refusedOptionFields("not an error"), {});
 });
 
 test("a failed open's class reaches the local diagnostic trace on disk, and its text does not", async () => {
@@ -1247,7 +1260,8 @@ test("supports(): every case it cannot run is named", async () => {
   const h = await harness();
   try {
     assert.deepEqual(h.host.supports(request()), { ok: true });
-    assert.deepEqual(h.host.supports(request({ config: makeConfig({ runtime: "claude" }) })), { ok: false, reason: "runtime_not_hosted:claude" });
+    assert.deepEqual(h.host.supports(request({ config: makeConfig({ runtime: "claude" }) })), { ok: true });
+    assert.deepEqual(h.host.supports(request({ config: makeConfig({ runtime: "kimi-sdk" }) })), { ok: false, reason: "runtime_not_hosted:kimi-sdk" });
     assert.deepEqual(h.host.supports(request({ config: makeConfig({ runtimeProfileControl: { kind: "daemon_release_notice", key: "k", message: "m" } as never }) })), { ok: false, reason: "runtime_profile_control" });
     assert.deepEqual(h.host.supports(request({ recoveryGrant: { grantId: "g" } as never })), { ok: false, reason: "recovery_grant" });
   } finally {
@@ -1258,8 +1272,9 @@ test("supports(): every case it cannot run is named", async () => {
     assert.deepEqual(windows.host.supports(request()), { ok: false, reason: "platform_unsupported" });
     assert.deepEqual(windows.host.supports(request({ config: makeConfig({ runtime: "qwen" }) })), { ok: false, reason: "platform_unsupported" });
     assert.deepEqual(windows.host.supports(request({ config: makeConfig({ runtime: "cursor" }) })), { ok: false, reason: "platform_unsupported" });
-    // Codex runs here on Windows too (its launch takes the driver's Windows resolution).
+    // Codex and Antigravity run here on Windows too.
     assert.deepEqual(windows.host.supports(request({ config: makeConfig({ runtime: "codex" }) })), { ok: true });
+    assert.deepEqual(windows.host.supports(request({ config: makeConfig({ runtime: "antigravity" }) })), { ok: true });
   } finally {
     await windows.cleanup();
   }
@@ -1295,11 +1310,16 @@ test("supports(): Grok runs here only as Grok Build itself at a checked version;
 test("supports(): an OAR-only runtime runs here what the legacy host would have taken", async () => {
   const h = await harness();
   try {
-    for (const runtime of ["qwen", "qoder"]) {
+    for (const runtime of ["codex", "dsh", "qwen", "qoder"]) {
       assert.deepEqual(h.host.supports(request({ config: makeConfig({ runtime }) })), { ok: true });
       assert.deepEqual(h.host.supports(request({ config: makeConfig({ runtime, runtimeProfileControl: { kind: "daemon_release_notice", key: "k", message: "m" } as never }) })), { ok: true });
       assert.deepEqual(h.host.supports(request({ config: makeConfig({ runtime }), recoveryGrant: { grantId: "g" } as never })), { ok: true });
     }
+    assert.equal(isOarRuntimeSupportedOnPlatform("codex", "win32"), true, "Windows keeps probing and hosting OAR-only Codex");
+    assert.equal(isOarRuntimeSupportedOnPlatform("antigravity", "win32"), true, "Windows hosts Antigravity on OAR");
+    assert.equal(isOarRuntimeSupportedOnPlatform("qwen", "win32"), false);
+    assert.equal(isOarRuntimeSupportedOnPlatform("qoder", "win32"), false);
+    assert.equal(isOarRuntimeSupportedOnPlatform("dsh", "win32"), false);
   } finally {
     await h.cleanup();
   }
@@ -1498,12 +1518,24 @@ test("a stop during the first-input readiness wait ends the start without a firs
   }
 });
 
-// #wg-ax:#3 D1/D2: a launch that steers (codex, qoder) into a busy turn.
+// #wg-ax:#3 D1/D2: a launch that steers into a busy turn as OAR's status
+// reads it (grok, cursor, antigravity, qoder, codex). OpenCode prompts first
+// (`PROMPT_FIRST_STEER_LAUNCH`).
 const STEER_LAUNCH: OarAgentHostDeps["prepareLaunch"] = async (ctx) => ({
   runtimeId: "grok",
   installation: { kind: "available", via: "bundled" },
   options: { cwd: ctx.workingDirectory, systemPrompt: ctx.standingPrompt },
   busyDelivery: "now",
+});
+
+// OpenCode's (oarOpencodeLaunch.ts, OAR #777): a prompt first whatever the
+// status reads; only the runtime's `busy` answer makes it a steer.
+const PROMPT_FIRST_STEER_LAUNCH: OarAgentHostDeps["prepareLaunch"] = async (ctx) => ({
+  runtimeId: "grok",
+  installation: { kind: "available", via: "bundled" },
+  options: { cwd: ctx.workingDirectory, systemPrompt: ctx.standingPrompt },
+  busyDelivery: "now",
+  promptFirst: true,
 });
 
 /** The session's event observer, so a test can say what the runtime reports (compaction). */
@@ -1517,14 +1549,23 @@ function withEventTap(taps: EventObserver[]) {
 
 const reported = (session: Session, body: Record<string, unknown>): Event => ({ sessionId: session.id, agentPath: [], seq: 1_000_000, receivedAt: Date.now(), ...body }) as unknown as Event;
 
-test("a delivery into a compacting turn is held, then steered when the compaction ends", async () => {
+async function compactingTurnHoldsThenSteers(prepareLaunch: OarAgentHostDeps["prepareLaunch"]): Promise<void> {
   const gate = deferred();
   const taps: EventObserver[] = [];
   let turns = 0;
+  const prompts: string[] = [];
   const h = await harness({
     turn: async (turn) => { turns += 1; if (turns === 1) await gate.promise; turn.say("done"); },
-    wrapSession: withEventTap(taps),
-    deps: { prepareLaunch: STEER_LAUNCH },
+    wrapSession: (session) => withEventTap(taps)(new Proxy(session, {
+      get: (target, prop, receiver) => prop === "prompt"
+        ? async (...args: Parameters<Session["prompt"]>) => {
+          const outcome = await target.prompt(...args);
+          prompts.push(outcome.kind === "accepted" ? "accepted" : outcome.code);
+          return outcome;
+        }
+        : Reflect.get(target, prop, receiver),
+    })),
+    deps: { prepareLaunch },
   });
   try {
     await h.host.start(request());
@@ -1538,9 +1579,90 @@ test("a delivery into a compacting turn is held, then steered when the compactio
     await until(() => h.steered().length === 1, "the turn took the steer");
     assert.match(h.steered()[0]!, /m-compacting|Inbox/);
     assert.equal(h.inputs.length, 1, "no turn of its own: it went into the running turn");
+    // Past the first input: prompt first tried a prompt at each hand-off, which
+    // the running turn answered `busy`; a status-led launch tried none.
+    const handOffPrompts = prompts.slice(1);
+    if (h.opened[0]!.promptFirst) assert.ok(handOffPrompts.length > 0 && handOffPrompts.every((code) => code === "busy"), handOffPrompts.join(","));
+    else assert.deepEqual(handOffPrompts, []);
   } finally {
     gate.resolve();
     await h.cleanup();
+  }
+}
+
+test("a delivery into a compacting turn is held, then steered when the compaction ends", async () => {
+  await compactingTurnHoldsThenSteers(STEER_LAUNCH);
+});
+
+test("prompt first (opencode): a delivery into a compacting turn is held after the runtime's busy answer, then steered when the compaction ends", async () => {
+  await compactingTurnHoldsThenSteers(PROMPT_FIRST_STEER_LAUNCH);
+});
+
+// RFC 072 §7.2 (glimpse G0): the launch publishes the planned context id, as `prepareCliTransport` does.
+const PUBLISHING_LAUNCH = (resumes = true): OarAgentHostDeps["prepareLaunch"] => async (ctx) => {
+  const dir = spawnCliTransportDir(ctx);
+  await mkdir(dir, { recursive: true });
+  publishSpawnContextGeneration(dir, { runtime: ctx.config.runtime ?? "codex", passiveAx: configPassiveAx(ctx.config), plan: ctx.contextGeneration });
+  return {
+    runtimeId: "grok",
+    installation: { kind: "available", via: "bundled" },
+    options: { cwd: ctx.workingDirectory, systemPrompt: ctx.standingPrompt, ...(resumes && ctx.config.sessionId ? { resume: ctx.config.sessionId } : {}) },
+    busyDelivery: "after_turn",
+  };
+};
+
+const g0Dir = (h: Harness) => spawnCliTransportDir({ slockHome: h.dataDir, agentId: "agent-1", launchId: "launch-1" });
+const g0Sessions = async (h: Harness): Promise<Record<string, { contextId: string }>> =>
+  (JSON.parse(await readFile(path.join(path.dirname(g0Dir(h)), CONTEXT_SESSIONS_FILENAME), "utf8")) as { sessions: Record<string, { contextId: string }> }).sessions;
+
+test("glimpse G0: the opened session is bound to the published context id, and compaction_started publishes a new one", async () => {
+  const taps: EventObserver[] = [];
+  const h = await harness({ wrapSession: withEventTap(taps), deps: { prepareLaunch: PUBLISHING_LAUNCH() } });
+  try {
+    await h.host.start(request({ config: codexShared({ passiveAx: true }) }));
+    await until(() => h.framesOf("agent:runtime:outcome").length > 0, "first turn");
+    const session = h.sessions[0]!;
+    const spawned = readContextGeneration(g0Dir(h))!;
+    assert.equal(spawned.reason, "spawn");
+    assert.deepEqual(Object.keys(await g0Sessions(h)), [session.id]);
+    assert.equal((await g0Sessions(h))[session.id]!.contextId, spawned.contextId);
+
+    for (const tap of taps) tap(reported(session, { kind: "compaction_started" }));
+    const compacted = readContextGeneration(g0Dir(h))!;
+    assert.equal(compacted.reason, "compaction");
+    assert.notEqual(compacted.contextId, spawned.contextId);
+    assert.equal(compacted.compactionReported, true);
+    assert.equal(compacted.passiveAx, true, "the gate is carried over");
+    // A later resume of this session gets the post-compaction id.
+    assert.equal((await g0Sessions(h))[session.id]!.contextId, compacted.contextId);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("glimpse G0: a resume of a known session reuses its context id; a runtime that opens another session gets a new one", async () => {
+  for (const resumes of [true, false]) {
+    const h = await harness({ deps: { prepareLaunch: PUBLISHING_LAUNCH(resumes) } });
+    try {
+      await mkdir(g0Dir(h), { recursive: true });
+      rememberSessionContext(g0Dir(h), "sess-known", "ctx-known");
+      await h.host.start(request({ config: codexShared({ sessionId: "sess-known" }) }));
+      await until(() => h.framesOf("agent:runtime:outcome").length > 0, "first turn");
+      const session = h.sessions[0]!;
+      const published = readContextGeneration(g0Dir(h))!;
+      if (resumes) {
+        assert.equal(session.id, "sess-known");
+        assert.equal(published.contextId, "ctx-known");
+        assert.equal(published.reason, "resume");
+      } else {
+        assert.notEqual(session.id, "sess-known");
+        assert.notEqual(published.contextId, "ctx-known");
+        assert.equal(published.reason, "spawn");
+      }
+      assert.equal((await g0Sessions(h))[session.id]!.contextId, published.contextId);
+    } finally {
+      await h.cleanup();
+    }
   }
 });
 
@@ -2040,6 +2162,70 @@ test("OAR's own failure class is never overridden by the text", async () => {
 const codexOwnHome = () => codexShared({ envVars: { CODEX_HOME: "/srv/codex-own" } });
 const heldForLimit = (h: Harness) => h.events.filter((event) => event.name === "daemon.agent.oar.delivery" && event.attrs.outcome === "held_for_provider_limit");
 
+test("#proj-runtime:#75: a used-up quota with no reset holds until the full window's reset the account reports, read with the session's launch", async () => {
+  const resetsAt = new Date(Date.now() + 3 * 24 * 60 * 60_000).toISOString();
+  const reads: OarLaunch[] = [];
+  const { h, ledger } = await limitHarness("unknown", {
+    readAccountUsage: async (launch) => {
+      reads.push(launch);
+      return usageWith({ usedRatio: 1, resetsAt });
+    },
+  });
+  try {
+    await h.host.start(startRequest("agent-1", codexShared()));
+    await until(() => limitEvents(h, "agent-1").length === 2, "the backoff, then the account's reset");
+    const [first, second] = limitEvents(h, "agent-1").map((event) => event.attrs);
+    assert.equal(first!.provider_limit_source, "text");
+    assert.equal(first!.delay_ms, 300, "at once: the backoff while the account is read");
+    assert.equal(second!.provider_limit_source, "account_usage");
+    assert.equal(second!.waits_for_reported_reset, true);
+    assert.equal(ledger.get("shared:codex", Date.now())?.resetsAt, resetsAt);
+    assert.ok((ledger.get("shared:codex", Date.now())?.untilMs ?? 0) >= Date.parse(resetsAt), "held until the reset");
+    assert.equal(reads.length, 1);
+    assert.equal(reads[0], h.opened[0], "the session's own launch (installation and env)");
+    const read = h.events.find((event) => event.name === "daemon.agent.provider_limit.account_usage_read");
+    assert.deepEqual([read?.attrs.snapshot_kind, read?.attrs.reset_found], ["available", true]);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("#proj-runtime:#75: a failed or windowless account read leaves the backoff", async () => {
+  for (const readAccountUsage of [
+    async (): Promise<AccountUsageSnapshot> => { throw new Error("timed out"); },
+    async (): Promise<AccountUsageSnapshot> => usageWith({ usedRatio: 0.5 }),
+  ]) {
+    const { h } = await limitHarness("unknown", { readAccountUsage });
+    try {
+      await h.host.start(startRequest("agent-1", codexShared()));
+      await until(() => h.events.some((event) => event.name === "daemon.agent.provider_limit.account_usage_read"), "the account read");
+      assert.equal(limitEvents(h, "agent-1").length, 1, "only the backoff");
+      assert.equal(h.events.find((event) => event.name === "daemon.agent.provider_limit.account_usage_read")?.attrs.reset_found, false);
+    } finally {
+      await h.cleanup();
+    }
+  }
+});
+
+test("#proj-runtime:#75: a limit released while the account is read is not held again", async () => {
+  let answer!: (snapshot: AccountUsageSnapshot) => void;
+  const { h, ledger } = await limitHarness("unknown", {
+    readAccountUsage: () => new Promise((resolve) => { answer = resolve; }),
+  });
+  try {
+    await h.host.start(startRequest("agent-1", codexShared()));
+    await until(() => answer !== undefined && limitEvents(h, "agent-1").length === 1, "the backoff and the read started");
+    ledger.release("shared:codex", "credentials_changed", { host: "legacy" });
+    answer(usageWith({ usedRatio: 1, resetsAt: new Date(Date.now() + 2 * 24 * 60 * 60_000).toISOString() }));
+    await until(() => h.events.some((event) => event.name === "daemon.agent.provider_limit.account_usage_read"), "the read answered");
+    assert.equal(h.events.find((event) => event.name === "daemon.agent.provider_limit.account_usage_read")?.attrs.dropped, "limit_changed");
+    assert.equal(limitEvents(h, "agent-1").length, 1, "no second hold");
+    assert.equal(ledger.has("shared:codex"), false);
+  } finally {
+    await h.cleanup();
+  }
+});
+
 test("C6: a quota failed turn holds the next delivery until the wait ends, then delivers it; the session is not ended", async () => {
   const { h, ledger, turnInputs } = await limitHarness("quota", { failing: ["agent-1"] });
   try {
@@ -2248,6 +2434,32 @@ test("oarFailureProviderLimit: quota, rate_limited, overloaded and an unknown fa
   assert.equal(oarFailureProviderLimit("unknown", failed("unknown")), null);
   assert.equal(oarFailureProviderLimit("provider", failed("provider")), null);
   assert.equal(oarFailureProviderLimit("billing", failed("billing")), null);
+});
+
+/** An account-usage reading with these windows (`resetsAt` as an ISO string). */
+function usageWith(...windows: Array<{ usedRatio: number; resetsAt?: string; scope?: AccountUsageWindow["scope"] }>): AccountUsageSnapshot {
+  return {
+    kind: "available",
+    rateLimited: windows.some((w) => w.usedRatio >= 1),
+    windows: windows.map(({ resetsAt, ...w }, i) => {
+      const instant = resetsAt ? utcInstantFromDate(new Date(resetsAt)) : null;
+      return { label: `w${i}`, ...w, ...(instant ? { resetsAt: instant } : {}) };
+    }),
+  };
+}
+
+test("#proj-runtime:#75 fullWindowsResetAt: the latest reset of the full account-level windows, only when each has a usable one", () => {
+  const now = Date.parse("2026-11-18T12:00:00Z");
+  const usage = usageWith;
+  assert.equal(fullWindowsResetAt(usage({ usedRatio: 0.4, resetsAt: "2026-11-18T15:00:00Z" }, { usedRatio: 1, resetsAt: "2026-11-21T18:21:00Z" }), now), "2026-11-21T18:21:00.000Z");
+  assert.equal(fullWindowsResetAt(usage({ usedRatio: 1, resetsAt: "2026-11-18T15:00:00Z" }, { usedRatio: 1, resetsAt: "2026-11-21T18:21:00Z" }), now), "2026-11-21T18:21:00.000Z", "both full: the later reset");
+  assert.equal(fullWindowsResetAt(usage({ usedRatio: 0.99, resetsAt: "2026-11-21T18:21:00Z" }), now), undefined, "no full window");
+  assert.equal(fullWindowsResetAt(usage({ usedRatio: 1 }), now), undefined, "a full window without a reset");
+  assert.equal(fullWindowsResetAt(usage({ usedRatio: 1, resetsAt: "2026-11-17T00:00:00Z" }), now), undefined, "a past reset");
+  assert.equal(fullWindowsResetAt(usage({ usedRatio: 1, resetsAt: "2026-12-30T00:00:00Z" }), now), undefined, "more than 8 days ahead");
+  assert.equal(fullWindowsResetAt(usage({ usedRatio: 1, resetsAt: "2026-11-24T00:00:00Z", scope: { kind: "model", name: "GPT-5.3-Codex-Spark" } }, { usedRatio: 1, resetsAt: "2026-11-18T14:00:00Z", scope: { kind: "account" } }), now), "2026-11-18T14:00:00.000Z", "a model's full window doesn't hold the sign-in");
+  assert.equal(fullWindowsResetAt(usage({ usedRatio: 1, resetsAt: "2026-11-24T00:00:00Z", scope: { kind: "model", name: "GPT-5.3-Codex-Spark" } }), now), undefined, "only a model's window is full");
+  assert.equal(fullWindowsResetAt({ kind: "unsupported" }, now), undefined);
 });
 
 test("every OAR launch bounds the records OAR keeps, unless the launch set its own bound", () => {
@@ -2690,7 +2902,7 @@ test("A6/A7: a Codex session's token usage and rate limits reach the legacy tele
 // withoutSessionStartedOnOtherSpec and the next start resumes the old thread.
 const specStops = featuresStops;
 
-test("runtime spec: an idle OAR session rebound on another model is ended at once, keeping its session", async () => {
+test("runtime spec: an idle OAR session rebound on another model is ended at once and opens a fresh session", async () => {
   const h = await harness();
   try {
     assert.deepEqual(await h.host.start(request()), { kind: "started" });
@@ -2706,10 +2918,12 @@ test("runtime spec: an idle OAR session rebound on another model is ended at onc
     assert.equal(h.host.owns("agent-1"), false);
     await h.host.unwound("agent-1");
     assert.equal(h.framesOf("agent:process_exited").length, 1);
-    // The Server's next start resumes it: another grok model is the same session.
+    // The Server's next start opens a fresh session: switching models drops the session on every runtime (#proj-runtime:#80).
     assert.deepEqual(await h.host.start(request({ launchId: "launch-4", config: makeConfig({ sessionId, model: "grok-other" }) })), { kind: "started" });
-    assert.equal(h.opened[1]!.options.resume, sessionId);
-    assert.deepEqual(h.events.filter((event) => event.name === "daemon.agent.session_dropped_for_spec"), []);
+    assert.equal(h.opened[1]!.options.resume, undefined);
+    assert.deepEqual(h.events.filter((event) => event.name === "daemon.agent.session_dropped_for_spec").map((event) => event.attrs), [
+      { agentId: "agent-1", launchId: "launch-4", reason: "model_changed", host: "oar" },
+    ]);
   } finally {
     await h.cleanup();
   }
@@ -2791,6 +3005,9 @@ test("A10: a turn whose only tool call spawned a sub-agent, or whose text was al
   });
   const turnsEnded = () => h.framesOf("agent:activity").filter((frame) => frame.detailKind === "idle").length;
   const runTurn = async (id: string) => {
+    // The idle row can come before OAR's status reads idle; a delivery then
+    // would steer into the ending turn and start none of its own.
+    await until(() => h.sessions[0]?.status().value.kind === "idle", `idle before the ${id} turn`);
     const before = turnsEnded();
     await h.host.deliverMessage("agent-1", message(id, { content: id }), { onMentionAck: () => {} });
     await until(() => turnsEnded() > before, `the ${id} turn's end`);
@@ -2855,7 +3072,7 @@ test("runtime spec: another Codex model on OAR ends the session, and the next st
     assert.deepEqual(await h.host.start(request({ launchId: "launch-3", config: codexShared({ model: "gpt-5.4", sessionId: thread }) })), { kind: "started" });
     assert.equal(h.opened[1]!.options.resume, undefined, "a new thread");
     assert.deepEqual(h.events.filter((event) => event.name === "daemon.agent.session_dropped_for_spec").map((event) => event.attrs), [
-      { agentId: "agent-1", launchId: "launch-3", reason: "codex_model_changed", host: "oar" },
+      { agentId: "agent-1", launchId: "launch-3", reason: "model_changed", host: "oar" },
     ]);
   } finally {
     await h.cleanup();
@@ -2983,7 +3200,8 @@ const OAR_REMINDER_DAEMON_SECTION_NOTICE = [
   "",
   "App items: 1",
   "",
-  "app=system.reminder · class=due · item=reminder · retention=until_explicit_ack · sourceRef=reminder:1598ee1a-81c7-4aba-a76b-c75aab407097:1 · action=raft reminder ack --id 1598ee1a --revision 1 · title=查看「今日待办」页面有没有新评论",
+  "app:system.reminder/1598ee1a · \"查看「今日待办」页面有没有新评论\"",
+  "  do: raft reminder ack --id 1598ee1a --revision 1",
   "]",
 ].join("\n");
 
@@ -3061,7 +3279,7 @@ test("the OAR host announces an app Inbox item again once it was removed and min
     const first = mint("first");
     assert.equal(await h.host.notifyAgentAppInbox("agent-1", first), true);
     await until(() => h.inputs.length === 2, "the notice's turn");
-    assert.match(h.inputs[1]!, /summary=first/);
+    assert.match(h.inputs[1]!, /^ {2}"first" \(preview\)$/m);
     assert.match(h.inputs[1]!, new RegExp(`\\n  dismiss: raft inbox dismiss --target "app:system\\.cleaner/${first.itemId.slice(0, 8)}"\\n`));
     await idle();
 
@@ -3078,7 +3296,7 @@ test("the OAR host announces an app Inbox item again once it was removed and min
     assert.equal(again.itemId, first.itemId, "the same id as the item before");
     assert.equal(await h.host.notifyAgentAppInbox("agent-1", again), true);
     await until(() => h.inputs.length === 3, "the notice of the item that came back");
-    assert.match(h.inputs[2]!, /summary=again/);
+    assert.match(h.inputs[2]!, /^ {2}"again" \(preview\)$/m);
     await idle();
 
     // And once only.
@@ -3087,5 +3305,115 @@ test("the OAR host announces an app Inbox item again once it was removed and min
     assert.equal(h.inputs.length, 3);
   } finally {
     await h.cleanup();
+  }
+});
+
+test("#wg-runtime-form:#27: a named Codex tier Codex did not confirm fails the start here instead of handing back", () => {
+  const refused = new Error("codex thread/start reports serviceTier priority although ultrafast was requested");
+  const message = serviceTierConfirmationFailure("codex", "ultrafast", refused);
+  assert.ok(message?.includes("(ultrafast)"), String(message));
+  // The primary tier, another runtime, and another failure hand back as before.
+  assert.equal(serviceTierConfirmationFailure("codex", "priority", new Error("codex thread/start reports serviceTier default although priority was requested")), null);
+  assert.equal(serviceTierConfirmationFailure("codex", undefined, refused), null);
+  assert.equal(serviceTierConfirmationFailure("claude", "ultrafast", refused), null);
+  assert.equal(serviceTierConfirmationFailure("codex", "ultrafast", new Error("spawn codex ENOENT")), null);
+  assert.equal(serviceTierConfirmationFailure("codex", "ultrafast", new Error("codex reasoningEffort high although max was requested")), null);
+});
+
+test("#oar-raft:#48: oar.turn_failed, rejected oar.delivery, and OAR turn_interrupt include runtime and scrubbed/bounded error excerpts", async () => {
+  // 1. oar.turn_failed carries runtime + scrubbed/bounded runtime_error_message_excerpt (redacting paths & tokens).
+  {
+    const longNoise = "x".repeat(4200);
+    const h = await harness({
+      turn: () => {
+        throw new Error(`upstream failed at /Users/alice/secret.txt with Authorization: Bearer sk-live-secret-1234567890 ${longNoise}`);
+      },
+    });
+    try {
+      await h.host.start(request());
+      await until(() => h.events.some((event) => event.name === "daemon.agent.oar.turn_failed"), "the failed turn");
+      const failed = h.events.find((event) => event.name === "daemon.agent.oar.turn_failed")!;
+      assert.equal(failed.attrs.runtime, "grok");
+      const excerpt = String(failed.attrs.runtime_error_message_excerpt ?? "");
+      assert.ok(excerpt.includes("[REDACTED_PATH]"), excerpt);
+      assert.ok(excerpt.includes("Bearer [REDACTED_TOKEN]"), excerpt);
+      assert.equal(excerpt.includes("secret.txt"), false);
+      assert.equal(excerpt.includes("sk-live-secret"), false);
+      assert.equal(failed.attrs.runtime_error_message_truncated, true);
+    } finally {
+      await h.cleanup();
+    }
+  }
+
+  // 2. Rejected oar.delivery carries runtime + scrubbed excerpt (while prompt_refused_recovery still omits text).
+  {
+    let prompts = 0;
+    const h = await harness({
+      wrapSession: (session) => new Proxy(session, {
+        get(target, property, receiver) {
+          if (property === "prompt") {
+            return async (input: string, options?: Parameters<Session["prompt"]>[1]) => {
+              prompts += 1;
+              if (prompts === 2) {
+                return {
+                  kind: "rejected" as const,
+                  code: "busy" as const,
+                  reason: "turn busy at /home/bob/private.key Bearer tok-secret-999999999",
+                };
+              }
+              return target.prompt(input, options);
+            };
+          }
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      }),
+    });
+    try {
+      await h.host.start(request());
+      await until(() => h.framesOf("agent:runtime:outcome").length > 0, "first turn");
+      await h.host.deliverMessage("agent-1", message("m-rej-01"));
+      await until(() => h.events.some((event) => event.name === "daemon.agent.oar.delivery" && event.attrs.code === "busy"), "rejected delivery");
+      const rejected = h.events.find((event) => event.name === "daemon.agent.oar.delivery" && event.attrs.code === "busy")!;
+      assert.equal(rejected.attrs.runtime, "grok");
+      const excerpt = String(rejected.attrs.runtime_error_message_excerpt ?? "");
+      assert.ok(excerpt.includes("[REDACTED_PATH]"), excerpt);
+      assert.ok(excerpt.includes("Bearer [REDACTED_TOKEN]"), excerpt);
+      assert.equal(excerpt.includes("private.key"), false);
+      assert.equal(excerpt.includes("tok-secret"), false);
+    } finally {
+      await h.cleanup();
+    }
+  }
+
+  // 3. OAR turn_interrupt carries runtime both when interrupting a running turn and when not_running on a known agent.
+  {
+    const gate = deferred();
+    const h = await harness({
+      turn: async (t) => {
+        t.say("working");
+        await Promise.race([gate.promise, new Promise<void>((resolve) => t.signal.addEventListener("abort", () => resolve(), { once: true }))]);
+      },
+    });
+    try {
+      await h.host.start(request());
+      await until(() => h.sessions[0]?.status().value.kind === "running", "turn running");
+      const interrupted = await h.host.interruptTurn("agent-1");
+      assert.equal(interrupted.outcome, "interrupted");
+      await until(() => h.sessions[0]?.status().value.kind === "idle", "turn ended after abort");
+      const notRunning = await h.host.interruptTurn("agent-1");
+      assert.equal(notRunning.outcome, "not_running");
+      const interrupts = h.events.filter((event) => event.name === "daemon.agent.turn_interrupt");
+      assert.equal(interrupts.length, 2);
+      assert.equal(interrupts[0]!.attrs.runtime, "grok");
+      assert.equal(interrupts[0]!.attrs.host, "oar");
+      assert.equal(interrupts[0]!.attrs.outcome, "interrupted");
+      assert.equal(interrupts[1]!.attrs.runtime, "grok");
+      assert.equal(interrupts[1]!.attrs.host, "oar");
+      assert.equal(interrupts[1]!.attrs.outcome, "not_running");
+    } finally {
+      gate.resolve();
+      await h.cleanup();
+    }
   }
 });

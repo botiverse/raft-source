@@ -6,7 +6,11 @@ import {
   addChannelMember,
   archiveChannel,
   createChannel,
+  formatHint,
+  RAFT_HINTS,
   removeChannelMember,
+  restyleDefaultNextAction,
+  setChannelMemberRole,
   unarchiveChannel,
   updateChannel,
   updateServer,
@@ -171,7 +175,7 @@ test("server update sends the trimmed name and refuses an empty change locally",
 });
 
 test("a 403 with no next action from the Server still says it is a permission problem", async () => {
-  const api = client(() => Response.json({ error: "Agent requires createChannels capability to create channels" }, { status: 403 }));
+  const api = client(() => Response.json({ error: "Agent requires createPublicChannels capability to create channels" }, { status: 403 }));
   const refused = await createChannel(api, { name: "design" });
   assert.equal(refused.ok, false);
   if (refused.ok) return;
@@ -198,4 +202,82 @@ test("known non-role 403 codes get their own next action, not the role sentence"
   // An unknown code is left as the Server sent it.
   const other = await updateChannel(refusal("something_else"), { target: "#design", name: "x" });
   assert.notEqual(other.ok ? null : other.error.nextAction, ADMIN_PERMISSION_NEXT_ACTION);
+});
+
+test("set-role: one request by handle, the CLI's text for changed and unchanged, and nothing sent for bad input", async () => {
+  const calls: Call[] = [];
+  let changed = true;
+  const api = client(() => Response.json({ ok: true, changed, channelId: DESIGN_ID, member: { type: "agent", id: "agent-2", name: "Kirby" }, channelRole: "admin" }), calls);
+
+  const made = await setChannelMemberRole(api, { target: "#design", agent: "@Kirby", role: "admin" });
+  assert.ok(made.ok);
+  assert.equal(made.state, "changed");
+  assert.equal(made.text, "Made @Kirby a channel admin of #design.");
+  assert.deepEqual(calls, [{ method: "POST", path: "/internal/agent-api/channels/member-role", body: { target: "#design", agent: "Kirby", role: "admin" } }]);
+
+  changed = false;
+  const again = await setChannelMemberRole(api, { target: "#design", agent: "Kirby", role: "admin" });
+  assert.ok(again.ok);
+  assert.equal(again.state, "unchanged");
+  assert.equal(again.text, "@Kirby is already a channel admin of #design.");
+
+  for (const bad of [
+    { target: "dm:@tygg", user: "@tygg", role: "admin" },
+    { target: "#design", role: "admin" },
+    { target: "#design", user: "@tygg", agent: "@Kirby", role: "admin" },
+    { target: "#design", user: "@tygg", role: "owner" },
+  ]) {
+    const refused = await setChannelMemberRole(api, bad as never);
+    assert.equal(refused.ok ? null : refused.error.code, "INVALID_REQUEST");
+  }
+  assert.equal(calls.length, 2, "nothing sent for bad input");
+});
+
+// The same Server refusals the CLI's set-role test feeds `raft channel set-role`
+// (packages/cli/src/commands/channel/set-role.test.ts): CLI-style text is the
+// CLI's byte for byte, and the tool style names tools and arguments instead.
+test("set-role refusals keep the Server's code and sentence with the CLI's next step, in either hint style", async () => {
+  const capability = client(() => Response.json({
+    error: "You do not have permission to change channel member roles",
+    code: "channel_capability_required",
+    suggestedNextAction: "Ask a channel admin of #engineering, or a server owner or admin, to change it.",
+  }, { status: 403 }));
+  const cli = await setChannelMemberRole(capability, { target: "#engineering", agent: "@bot", role: "member" });
+  assert.ok(!cli.ok);
+  assert.equal(cli.error.serverCode, "channel_capability_required");
+  assert.equal(cli.error.message, "You do not have permission to change channel member roles");
+  assert.equal(cli.error.nextAction, 'Ask a channel admin of #engineering, or a server owner or admin, to change it. `raft channel members "#engineering"` shows who they are: `channel role=admin` marks a channel admin, `(owner)` and `(admin)` a server owner or admin.');
+  const tool = restyleDefaultNextAction(await setChannelMemberRole(capability, { target: "#engineering", agent: "@bot", role: "member" }, { hints: "tool" }), "tool");
+  assert.ok(!tool.ok);
+  assert.equal(tool.error.message, "You do not have permission to change channel member roles");
+  assert.equal(tool.error.nextAction, 'Ask a channel admin of #engineering, or a server owner or admin, to change it. `channels_members({ target: "#engineering" })` shows who they are: `channel role=admin` marks a channel admin, `(owner)` and `(admin)` a server owner or admin.');
+
+  const members = RAFT_HINTS.channelMembers("#engineering");
+  const notMember = client(() => Response.json({
+    error: "Target must already be a channel member",
+    code: "channel_member_required",
+    next: members,
+    suggestedNextAction: formatHint(members),
+  }, { status: 409 }));
+  const user = await setChannelMemberRole(notMember, { target: "#engineering", user: "@scout", role: "admin" });
+  assert.ok(!user.ok);
+  assert.equal(user.error.serverCode, "channel_member_required");
+  assert.equal(user.error.message, "No person @scout is a member of #engineering (if @scout is an agent, use --agent @scout).");
+  assert.equal(user.error.nextAction, 'raft channel members "#engineering"');
+  assert.equal(user.next?.operation?.name, "channels.members");
+  const agent = restyleDefaultNextAction(await setChannelMemberRole(notMember, { target: "#engineering", agent: "@ada", role: "admin" }, { hints: "tool" }), "tool");
+  assert.ok(!agent.ok);
+  assert.equal(agent.error.message, 'No agent @ada is a member of #engineering (if @ada is a person, pass user: "@ada").');
+  assert.equal(agent.error.nextAction, 'channels_members({ target: "#engineering" })');
+  assert.doesNotMatch(agent.text, /raft |--[a-z]/);
+
+  // Any other refusal is the Server's, untouched.
+  const archived = await setChannelMemberRole(client(() => Response.json({
+    error: "This channel is archived",
+    code: "channel_archived",
+    suggestedNextAction: "Unarchive #engineering first, then change the role.",
+  }, { status: 409 })), { target: "#engineering", user: "@scout", role: "admin" });
+  assert.ok(!archived.ok);
+  assert.equal(archived.error.message, "This channel is archived");
+  assert.equal(archived.error.nextAction, "Unarchive #engineering first, then change the role.");
 });

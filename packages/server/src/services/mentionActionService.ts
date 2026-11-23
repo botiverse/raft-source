@@ -82,6 +82,9 @@ export type MentionActionRow = {
   channelName: string;
   channelArchivedAt: Date | null;
   channelDeletedAt: Date | null;
+  /** Set when the target is a human Guest of this server: its one bound channel. */
+  targetGuestChannelId: string | null;
+  targetIsGuest: boolean;
 };
 
 export type MentionActionResult = {
@@ -131,7 +134,18 @@ function canAddMentionTarget(row: MentionActionRow, actorType: MentionActionActo
   return actorType === "user"
     && (row.channelType === "channel" || isSubConversationRow(row))
     && !row.channelArchivedAt
-    && !row.channelDeletedAt;
+    && !row.channelDeletedAt
+    && guestTargetMayBeAdded(row);
+}
+
+/**
+ * A Guest joins only its one bound channel (channelService.addHuman refuses
+ * the rest), so the add is offered for a Guest only in that channel itself,
+ * never in another channel or in a thread/task under one.
+ */
+function guestTargetMayBeAdded(row: MentionActionRow): boolean {
+  if (row.targetType !== "user" || !row.targetIsGuest) return true;
+  return row.channelType === "channel" && row.targetGuestChannelId === row.channelId;
 }
 
 async function canActorUseMemberManagementAdd(row: MentionActionRow, actorType: MentionActionActorType, actorId: string): Promise<boolean> {
@@ -183,6 +197,20 @@ function mentionActionSelectShape() {
     channelName: channels.name,
     channelArchivedAt: channels.archivedAt,
     channelDeletedAt: channels.deletedAt,
+    targetIsGuest: sql<boolean>`exists (
+      select 1 from ${serverMembers}
+      where ${messageMentions.targetType} = 'user'
+        and ${serverMembers.serverId} = ${messageMentions.serverId}
+        and ${serverMembers.userId} = ${messageMentions.targetId}
+        and ${serverMembers.role} = 'guest'
+    )`,
+    targetGuestChannelId: sql<string | null>`(
+      select ${serverMembers.guestChannelId} from ${serverMembers}
+      where ${messageMentions.targetType} = 'user'
+        and ${serverMembers.serverId} = ${messageMentions.serverId}
+        and ${serverMembers.userId} = ${messageMentions.targetId}
+        and ${serverMembers.role} = 'guest'
+    )`,
   };
 }
 
@@ -209,6 +237,8 @@ function toMentionActionRow(row: Record<string, unknown>): MentionActionRow {
     channelName: row.channelName as string,
     channelArchivedAt: (row.channelArchivedAt as Date | null) ?? null,
     channelDeletedAt: (row.channelDeletedAt as Date | null) ?? null,
+    targetIsGuest: Boolean(row.targetIsGuest),
+    targetGuestChannelId: (row.targetGuestChannelId as string | null) ?? null,
   };
 }
 

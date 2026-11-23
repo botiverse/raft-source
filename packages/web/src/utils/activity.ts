@@ -395,6 +395,27 @@ export function credentialInvalidReasonOf(input: {
 }
 
 /**
+ * Whether the agent panel's runtime error banner shows the stored error
+ * (`lastRuntimeError`; an `error` activity is shown regardless). A failed
+ * start (`spawnFailureReason`) already has its presentation, the status
+ * badge's typed start-failure copy, so it adds the banner only for a viewer
+ * the server sent its text to (the agent's managers) and only when that text
+ * is the start's own (an older daemon's record is the frame's copy, which the
+ * badge stands in for). Members never get a second, generic banner for it.
+ */
+export function storedRuntimeErrorBannerShown(input: {
+  lastRuntimeError?: Pick<AgentRuntimeErrorState, "message" | "spawnFailureReason"> | null;
+  activityDetail?: string | null;
+  canViewDetails: boolean;
+}): boolean {
+  const error = input.lastRuntimeError;
+  if (!error) return false;
+  if (!error.spawnFailureReason) return true;
+  const text = error.message.trim();
+  return input.canViewDetails && text !== "" && text !== (input.activityDetail ?? "").trim();
+}
+
+/**
  * Detail kinds of an agent that stays down until someone starts it by hand,
  * though its chip is not the error light (the server projects them offline).
  */
@@ -463,6 +484,35 @@ export function agentNeedsManualRestart(input: {
   // The other failure reasons (runtime missing, bad config, ...): a restart is
   // still the last step once the cause is fixed, so Retry stays for them.
   return input.spawnFailurePaused === true && !RESTART_CANNOT_FIX_SPAWN_FAILURES.has(input.spawnFailureReason);
+}
+
+/**
+ * #triage:#494: the agent could not start because its runtime is not signed in
+ * on its Computer (a failed start with reason `runtime_login_required`), from
+ * typed data only, never the daemon's sentence. The reason arrives on the live
+ * failed start (`spawnFailure.reason`) or on the stored record
+ * (`lastRuntimeError.spawnFailureReason`, cleared by the next good start). Only
+ * while the agent is offline or in error, and not while another state already
+ * says why it is not running (its Computer offline or too old, a paused
+ * assistant, an external agent, a guess before any state arrived).
+ *
+ * The one check every status surface uses (sidebar, member list, DM header,
+ * profile badge): each shows the error light, "Sign-in needed" and the
+ * sentence from `formatRuntimeSignInNeededDetail` (utils/runtimeSignInNeededCopy.ts) in place of the daemon's.
+ */
+export function runtimeSignInNeededOf(input: {
+  activity: AgentActivity;
+  spawnFailure?: Pick<SpawnFailureActivityDiagnostic, "reason"> | null;
+  lastRuntimeError?: Pick<AgentRuntimeErrorState, "spawnFailureReason"> | null;
+  blocked?: AgentBlockedState | null;
+  paused?: true;
+  likelyOnline?: true;
+  isExternal?: boolean;
+}): boolean {
+  if (input.activity !== "offline" && input.activity !== "error") return false;
+  if (input.blocked || input.paused || input.likelyOnline || input.isExternal) return false;
+  return input.spawnFailure?.reason === "runtime_login_required"
+    || input.lastRuntimeError?.spawnFailureReason === "runtime_login_required";
 }
 
 /** The status text for `credentialInvalidReasonOf`'s reason, naming the agent's runtime or model. */

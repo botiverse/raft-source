@@ -25,12 +25,13 @@ export { PendingSecondFactorSignInStep } from "./SecondFactorSignInStep";
  */
 export function SignInPage(props: LoginPageProps) {
   const { pathname } = useLocation();
-  const offers = pathname.startsWith("/s/");
+  // Workspace links and canonical Artifact links (same generic sign-in page for private or nonexistent Artifacts, zero probing oracle).
+  const offers = pathname.startsWith("/s/") || pathname.startsWith("/artifacts/");
   return (
     <LoginPage
       {...props}
       topStrip={offers ? <OpenInAppOffers slot="top" /> : undefined}
-      bottomStrip={offers ? <OpenInAppOffers slot="bottom" /> : undefined}
+      bottomStrip={offers ? <OpenInAppOffers slot="bottom" signedOutHint /> : undefined}
     />
   );
 }

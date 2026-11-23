@@ -169,7 +169,8 @@ export function BrowserPanel({ bridge, conversationId, covering, artifactBehind 
         <BrowserBlockedNotice key={active.blocked.at} conversationId={conversationId} tab={active} blocked={active.blocked} />
       ) : null}
       <RowRegionBody>
-        <div className="min-h-0 flex-1 overflow-hidden">
+        {/* A page is full-bleed: cut on a hard line where a clipped column ends (index.css Rule 2). */}
+        <div className="min-h-0 flex-1 overflow-hidden" data-clip-edge={active.url === null ? undefined : "cut"}>
           <DesktopBrowserView bridge={bridge} conversationId={conversationId} tabId={active.id} title={activeLabel ?? formatMessage({ id: "webPreview.newTab" })}>
             {active.url === null ? (
               <div className="flex size-full items-center justify-center px-(--column-margin)" data-testid="web-preview-empty-tab">

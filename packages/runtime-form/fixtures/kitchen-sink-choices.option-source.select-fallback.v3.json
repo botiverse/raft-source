@@ -1,0 +1,26 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "kitchen-sink-choices",
+  "schemaVersion": "kitchen-sink-choices.create.v1",
+  "sourceId": "selectFallback",
+  "kind": "select",
+  "pointer": "/selectFallback",
+  "options": [
+    {
+      "value": "alpha",
+      "label": "Alpha"
+    },
+    {
+      "value": "beta",
+      "label": "Beta"
+    },
+    {
+      "value": "gamma",
+      "label": "Gamma"
+    }
+  ],
+  "defaultValue": "alpha",
+  "status": "fallback",
+  "reason": "missing_config",
+  "retryable": false
+}

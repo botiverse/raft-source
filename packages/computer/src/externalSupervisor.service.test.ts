@@ -186,8 +186,8 @@ test("#67: a system unit run without the right to open a scope refuses the upgra
 });
 
 test("#67: the scope probe asks systemd the way the installer does: --user only for a user unit", () => {
-  assert.deepEqual(systemdScopeProbeArgs("user"), ["--user", "--scope", "--quiet", "--collect", "--", "true"]);
-  assert.deepEqual(systemdScopeProbeArgs("system"), ["--scope", "--quiet", "--collect", "--", "true"]);
+  assert.deepEqual(systemdScopeProbeArgs("user"), ["--user", "--scope", "--quiet", "--collect", "--no-ask-password", "--", "true"]);
+  assert.deepEqual(systemdScopeProbeArgs("system"), ["--scope", "--quiet", "--collect", "--no-ask-password", "--", "true"]);
 });
 
 test("#67: a safe KillMode does not spare the new installer the probe (it escapes whatever the KillMode): refused when systemd says no", async () => {

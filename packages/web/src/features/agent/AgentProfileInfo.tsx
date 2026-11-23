@@ -6,16 +6,17 @@ import type { ReactNode, Ref } from "react";
 import { useIntl } from "react-intl";
 import { Pencil, HelpCircle, MoveRight } from "lucide-react";
 import { useAppNavigate } from "../../hooks/useAppNavigate";
-import { getRuntimeDisplayName, getModelLabel, isExternalAgentRuntime, runtimeConfigModelValue, REASONING_EFFORT_RUNTIMES } from "@botiverse/raft-shared";
+import { isExternalAgentRuntime, runtimeConfigModelValue } from "@botiverse/raft-shared";
 import type { ServerRole } from "@botiverse/raft-shared";
 import { useRuntimeDeprecatedHere } from "../../hooks/useServerRuntimeCatalog";
 import { formatRuntimeLabelWithStatus } from "../../utils/runtimeAvailabilityLabel";
-import { reasoningEffortLabelId } from "../../utils/reasoningEffortOptions";
+import { reasoningEffortDisplayLabel } from "../../utils/reasoningEffortOptions";
 import { RuntimeAccountUsageGateChip } from "../../components/machine/RuntimeAccountUsageChip";
 import { AgentRuntimeUsageRow } from "./AgentRuntimeUsageRow";
+import { useModelLabelCatalog } from "../../store/modelLabelCatalogStore";
 import { projectRuntimeModelLabelPresentation, useRuntimeModels } from "../../hooks/useRuntimeModels";
 import { useExistingAgentRuntimeOptions as useExistingAgentRuntimeSelectionOptions } from "../../hooks/useRuntimeSelectionCatalog";
-import { useAgentStore, useAgentDisplayState } from "../../store/agentStore";
+import { useAgentStore } from "../../store/agentStore";
 import type { Agent, ExternalAgentStatus, OnboardingIdentityAdoptionPreview } from "../../store/agentStore";
 import { useMachineStore } from "../../store/machineStore";
 import { resolveAgentMachineRow } from "../../utils/agentMachineRow";
@@ -74,13 +75,12 @@ type PendingConfirm = {
 /** What the panel may ask of the Profile tab (task #1351). */
 export type RuntimeConfigEditorHandle = { open: () => void };
 /**
- * `canRestartAgent`: may restart it (the menu's Restart); offers Restart now after a runtime config save.
  * task #1351, the billing banner's "View model settings" (the pencil's editor): on this tab the panel calls
  * `runtimeConfigEditorRef`; from another it lands here with `openRuntimeConfigRequested`, which holds the editor
  * open until it closes (`onRuntimeConfigOpenRequestHandled`).
  */
-export function AgentProfileInfo({ agent, canManageAgent, canChangeAgentRole, canRestartAgent = false, onOpenProfile, onEdit, showOperationalInfo = true, runtimeConfigEditorRef, openRuntimeConfigRequested = false, onRuntimeConfigOpenRequestHandled }: {
-  agent: Agent; canManageAgent: boolean; canChangeAgentRole: boolean; canRestartAgent?: boolean; onOpenProfile?: (type: "agent" | "human", id: string) => void; onEdit?: (field: AgentProfileEditField) => void; showOperationalInfo?: boolean;
+export function AgentProfileInfo({ agent, canManageAgent, canChangeAgentRole, onOpenProfile, onEdit, showOperationalInfo = true, runtimeConfigEditorRef, openRuntimeConfigRequested = false, onRuntimeConfigOpenRequestHandled }: {
+  agent: Agent; canManageAgent: boolean; canChangeAgentRole: boolean; onOpenProfile?: (type: "agent" | "human", id: string) => void; onEdit?: (field: AgentProfileEditField) => void; showOperationalInfo?: boolean;
   runtimeConfigEditorRef?: Ref<RuntimeConfigEditorHandle>; openRuntimeConfigRequested?: boolean; onRuntimeConfigOpenRequestHandled?: () => void;
 }) {
   const archivedMachineName = useArchivedAgentMachineName(agent.deletedAt ? agent.id : null);
@@ -93,7 +93,6 @@ export function AgentProfileInfo({ agent, canManageAgent, canChangeAgentRole, ca
   const adoptOnboardingIdentity = useAgentStore((s) => s.adoptOnboardingIdentity);
   const currentServer = useServerStore((s) => s.current);
   const deprecatedHere = useRuntimeDeprecatedHere();
-  const displayState = useAgentDisplayState(agent.id, agent);
   const machines = useMachineStore((s) => s.machines);
   const nav = useAppNavigate();
   const isExternalAgent = agent.external === true || isExternalAgentRuntime(agent.runtime);
@@ -135,24 +134,17 @@ export function AgentProfileInfo({ agent, canManageAgent, canChangeAgentRole, ca
   const [externalStatusError, setExternalStatusError] = useState("");
   const openProfile = useProfileStore((s) => s.openProfile);
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
-  const isActive = displayState.isOnline || agent.status === "active";
   // Only the read-only display reads the model list: its label for the stored model.
   const runtimeModels = useRuntimeModels(agent.machineId, currentRuntimeConfig.runtime);
+  // The label below reads the shared model-label catalog synchronously; subscribe
+  // so a catalog reload (after a live detect) re-renders it (#triage:#548).
+  useModelLabelCatalog();
   const currentRuntimeModelPresentation = projectRuntimeModelLabelPresentation(currentRuntimeConfig.runtime, currentRuntimeModel, runtimeModels, agent.machineId);
   const currentRuntimeModelLabel = currentRuntimeModelPresentation.kind === "pending"
     ? formatMessage({ id: "common.loading" })
     : currentRuntimeModelPresentation.label;
-  // Reconciler step 11c: what the running process reports it runs. A saved
-  // change waiting for the agent's idle point differs from it; unknown or equal says nothing.
-  const running = isActive ? agent.runtimeProfile?.current : null;
-  const runningRuntime = running?.runtime || null;
-  // A model name is set in Space Mono, as on the Model row (Raft DS); a runtime name is not.
-  const modelLabel = (key: string, model: string) => <span key={key} className="font-mono">{getModelLabel(currentRuntimeConfig.runtime, model) || model}</span>;
-  const runningConfigHint = runningRuntime && runningRuntime !== currentRuntimeConfig.runtime
-    ? { running: getRuntimeDisplayName(runningRuntime), saved: getRuntimeDisplayName(currentRuntimeConfig.runtime) }
-    : running?.model && currentRuntimeModel && running.model !== currentRuntimeModel
-      ? { running: modelLabel("running", running.model), saved: modelLabel("saved", currentRuntimeModel) }
-      : null;
+  // The Reasoning row's value, as the Members list and hover card write it; null where the runtime takes no effort.
+  const reasoningLabel = reasoningEffortDisplayLabel(currentRuntimeConfig, formatMessage);
   const availableRuntimes = agentMachine?.runtimes || [];
   // Gated on the same flag that governs display, so the loader and the surface
   // cannot drift apart: a remote joint agent shows no operational info and must
@@ -183,8 +175,8 @@ export function AgentProfileInfo({ agent, canManageAgent, canChangeAgentRole, ca
   const isCurrentServerOnboardingAgent = Boolean(
     canManageAgent
     && showOperationalInfo
-    && currentServer?.onboardingAgentId
-    && currentServer.onboardingAgentId === agent.id,
+    && currentServer?.officialOnboardingAgentId
+    && currentServer.officialOnboardingAgentId === agent.id,
   );
 
   const currentAgentServerRole = agent.serverRole === "admin" ? "admin" : agent.serverRole === "member" ? "member" : null;
@@ -627,7 +619,7 @@ export function AgentProfileInfo({ agent, canManageAgent, canChangeAgentRole, ca
                         {formatRuntimeLabelWithStatus(currentRuntimeConfig.runtime, formatMessage, currentRuntimeDeprecated)}
                       </RuntimeAccountUsageGateChip>
                   </InfoRow>
-                  <AgentRuntimeUsageRow enabled={canViewRuntimeAccountUsage && !isExternalAgent} serverId={currentServer?.id ?? null} machineId={agentMachine?.id ?? ""} runtimeId={currentRuntimeConfig.runtime} model={currentRuntimeModel} />
+                  <AgentRuntimeUsageRow enabled={canViewRuntimeAccountUsage && !isExternalAgent} serverId={currentServer?.id ?? null} machineId={agentMachine?.id ?? ""} runtimeId={currentRuntimeConfig.runtime} agentId={agent.id} model={currentRuntimeModel} />
                   {currentRuntimeDeprecated && (
                     <Banner intent="warning" density="sm" className="col-span-full my-1">
                       {formatMessage({ id: "agent.detail.deprecatedRuntimeWarning" })}
@@ -635,19 +627,10 @@ export function AgentProfileInfo({ agent, canManageAgent, canChangeAgentRole, ca
                   )}
                   <InfoRow label={formatMessage({ id: "agent.runtimeConfig.model" })}>
                     <span className="min-w-0 break-all font-mono">{currentRuntimeModelLabel}</span>
-                    {runningConfigHint && (
-                      <span className="mt-1 block text-caption text-foreground-muted" data-testid="agent-runtime-config-running">
-                        {formatMessage({ id: "agent.runtimeConfig.runningSwitchesWhenIdle" }, runningConfigHint)}
-                      </span>
-                    )}
                   </InfoRow>
-                  {REASONING_EFFORT_RUNTIMES.has(currentRuntimeConfig.runtime) && (
+                  {reasoningLabel !== null && (
                     <InfoRow label={formatMessage({ id: "agent.runtimeConfig.reasoning" })}>
-                      <span>
-                        {currentRuntimeConfig.reasoningEffort
-                          ? formatMessage({ id: reasoningEffortLabelId(currentRuntimeConfig.reasoningEffort) ?? "agent.runtimeConfig.default" })
-                          : formatMessage({ id: "agent.runtimeConfig.default" })}
-                      </span>
+                      <span>{reasoningLabel}</span>
                     </InfoRow>
                   )}
                   {supportsRuntimeFastMode(currentRuntimeConfig.runtime) && (
@@ -708,7 +691,7 @@ export function AgentProfileInfo({ agent, canManageAgent, canChangeAgentRole, ca
       )}
 
       {editingRuntimeConfig && (
-        <AgentRuntimeConfigEditor agent={agent} canRestartAgent={canRestartAgent} runtimeOptions={profileRuntimeOptions} onClose={closeRuntimeConfigEditor} />
+        <AgentRuntimeConfigEditor agent={agent} runtimeOptions={profileRuntimeOptions} onClose={closeRuntimeConfigEditor} />
       )}
     </>
   );

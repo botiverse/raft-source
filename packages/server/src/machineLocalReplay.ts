@@ -53,6 +53,8 @@ const MACHINE_LOCAL_ROUTE_ALLOWLIST: Array<{ method: string; path: RegExp }> = [
   { method: "GET", path: /^\/api\/agents\/[^/]+\/workspace-files\/read$/ },
   { method: "GET", path: /^\/api\/agents\/[^/]+\/skills$/ },
   { method: "DELETE", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+$/ },
+  // Revoke-and-delete (`{ delete: true }`) routes like DELETE; a plain revoke never asks to be routed.
+  { method: "POST", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/revoke-computer-key$/ },
   { method: "POST", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/computer\/(?:restart|upgrade)$/ },
   { method: "POST", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/computer-lifecycle-operations$/ },
   // The same record by the Computer's own key: it needs the connection epoch
@@ -60,7 +62,6 @@ const MACHINE_LOCAL_ROUTE_ALLOWLIST: Array<{ method: string; path: RegExp }> = [
   { method: "POST", path: /^\/internal\/computer\/lifecycle-operations$/ },
   { method: "GET", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/workspaces$/ },
   { method: "GET", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/runtime-models\/[^/]+$/ },
-  { method: "GET", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/runtime-form-definitions\/[^/]+\/option-sources\/[^/]+$/ },
   { method: "GET", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/runtime-forms\/v2\/[^/]+\/option-sources\/[^/]+$/ },
   // task #10: the Built-in v2 definition reads the Computer's model source to
   // decide which preset providers show the limit fields.

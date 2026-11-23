@@ -1531,7 +1531,7 @@ test("GET /api/channels/:id/threads/:messageId records the reject reason on ever
 
   const notFound = await lookup(channel.id, bareParent.id, ownerToken, server.id);
   assert.equal(notFound.status, 404);
-  assert.deepEqual(notFound.body, { code: "THREAD_NOT_FOUND", error: "No thread found for this message" }, "additive code; error text unchanged");
+  assert.deepEqual(notFound.body, { code: "THREAD_NOT_FOUND", errorCode: "THREAD_NOT_FOUND", error: "No thread found for this message" }, "additive code; error text unchanged");
   assert.deepEqual(notFound.rejected.map((event) => event.attrs), [
     { "threads.lookup.reject_reason": "not_found" },
   ]);
@@ -2557,7 +2557,7 @@ test("POST /api/channels/:id/threads rejects a missing JSON body without a fast 
     },
   });
   assert.equal(res.status, 400);
-  assert.deepEqual(await res.json(), { error: "parentMessageId is required" });
+  assert.deepEqual(await res.json(), { error: "parentMessageId is required", code: "parent_message_id_required", errorCode: "parent_message_id_required" });
 });
 
 
@@ -2577,7 +2577,7 @@ test("POST /api/channels/:id/threads rejects parent messages outside the request
     body: JSON.stringify({ parentMessageId: otherParent.id }),
   });
   assert.equal(res.status, 404);
-  assert.deepEqual(await res.json(), { error: "Parent message not found" });
+  assert.deepEqual(await res.json(), { error: "Parent message not found", code: "thread_parent_not_found", errorCode: "thread_parent_not_found" });
 });
 
 
@@ -2687,7 +2687,7 @@ test("POST /api/channels/:id/threads applies the message posting gate to the fir
     body: JSON.stringify({ parentMessageId: parentMessage.id, content: "reply from a non-member" }),
   });
   assert.equal(res.status, 403);
-  assert.deepEqual(await res.json(), { error: "You must join this channel to send messages" });
+  assert.deepEqual(await res.json(), { error: "You must join this channel to send messages", code: "channel_membership_required", errorCode: "channel_membership_required" });
   assert.equal((await threadRows()).length, 0, "a refused first reply must not materialize the thread");
   assert.equal(events.some((event) => event.event === "message:new"), false, "a refused first reply must not broadcast");
 
@@ -2697,7 +2697,7 @@ test("POST /api/channels/:id/threads applies the message posting gate to the fir
     body: JSON.stringify({ parentMessageId: parentMessage.id, content: "x".repeat(32_001) }),
   });
   assert.equal(res.status, 400);
-  assert.deepEqual(await res.json(), { error: "Message content exceeds maximum length of 32000 characters" });
+  assert.deepEqual(await res.json(), { error: "Message content exceeds maximum length of 32000 characters", code: "message_too_long", errorCode: "message_too_long" });
   assert.equal((await threadRows()).length, 0, "over-length content is refused before the thread exists");
 
   res = await fetch(url, {

@@ -6,6 +6,7 @@ import { RAFTBENCH_PATTERN_KINDS } from "@botiverse/raft-shared";
 import type { RaftbenchPatternKind, RaftbenchReport, HostedAgentModelView } from "@botiverse/raft-shared";
 import api from "../api/client";
 import { useAppNavigate } from "../hooks/useAppNavigate";
+import { useCurrentDay } from "../hooks/useCurrentDay";
 import { useServerStore } from "../store/serverStore";
 import Banner from "../components/ui/Banner";
 import { EvidenceChip } from "./EvidenceChip";
@@ -116,8 +117,10 @@ export default function HostedAnalysis({ allowed, options, onEnabled, channelId 
     return () => { controller.abort(); window.clearInterval(timer); };
   }, [agentId, current]);
   const selected = selection ?? (data?.channelIds.length ? data.channelIds : options.slice(0, 50).map(o => o.value));
-  const dateValue = historyDate ?? data?.historyFrom?.slice(0, 10) ?? new Date(Date.now() - 7 * 86_400_000).toISOString().slice(0, 10);
-  const invalidHistory = historyDate !== null && (!historyDate || !Number.isFinite(Date.parse(`${historyDate}T00:00:00Z`)) || Date.parse(`${historyDate}T00:00:00Z`) >= Date.now());
+  // Today's UTC date (the dates here are UTC days), kept current while the page stays open.
+  const today = useCurrentDay("UTC");
+  const dateValue = historyDate ?? data?.historyFrom?.slice(0, 10) ?? new Date(Date.parse(`${today}T00:00:00Z`) - 7 * 86_400_000).toISOString().slice(0, 10);
+  const invalidHistory = historyDate !== null && (!historyDate || !Number.isFinite(Date.parse(`${historyDate}T00:00:00Z`)) || Date.parse(`${historyDate}T00:00:00Z`) > Date.parse(`${today}T00:00:00Z`));
   const createServiceAgent = useCallback(async () => {
     if (!current() || !server || view.saving) return;
     saving.current = true; update({ saving: true, saveError: null });
@@ -260,7 +263,7 @@ export default function HostedAnalysis({ allowed, options, onEnabled, channelId 
     {server && <ReaderAccess key={`${server.id}:${useAuthStore.getState().user?.id}`} serverId={server.id} enabled={!!data?.enabled} />}
     {/* The sources list scrolls in a raft-ui ScrollArea: no tab stop (each box is one), and a scroll at its end carries on to the page. */}
     <details className="mt-4" open={!data?.enabled}><summary className="cursor-pointer text-callout font-semibold">{t({ id: "raftbench.aiSettings" })}</summary><fieldset className="mt-3" disabled={view.saving}><legend className="text-callout font-semibold">{t({ id: "raftbench.aiSources" })}</legend><p className="mt-1 text-caption text-foreground-hint">{t({ id: "raftbench.aiConsent" })}</p><p className="mt-1 text-caption text-foreground-hint">{t({ id: "raftbench.aiRuntime" })}</p><ScrollArea tabIndex={-1} overscroll="auto" className="mt-2 max-h-44" contentClassName="grid grid-cols-1 gap-2 sm:grid-cols-2">{options.map(option => <label key={option.value} className="flex min-w-0 items-center gap-2 text-callout"><input type="checkbox" checked={selected.includes(option.value)} value={option.value} onChange={toggle} /><span className="truncate">{option.label}</span></label>)}</ScrollArea>
-      <div className="mt-4"><label htmlFor="raftbench-history-from" className="block text-callout font-semibold">{t({ id: "raftbench.aiHistoryFrom" })}</label><Input id="raftbench-history-from" className="mt-2 w-full sm:w-auto" type="date" value={dateValue} max={new Date().toISOString().slice(0, 10)} onChange={changeHistory} /><div className="mt-2 flex flex-wrap gap-2">{[7, 30, 90].map(days => <Button key={days} size="md" data-days={days} onClick={chooseHistory}>{t({ id: "raftbench.aiHistoryDays" }, { days })}</Button>)}</div><p className="mt-2 text-caption text-foreground-hint">{t({ id: "raftbench.aiHistoryHelp" })}</p></div>
+      <div className="mt-4"><label htmlFor="raftbench-history-from" className="block text-callout font-semibold">{t({ id: "raftbench.aiHistoryFrom" })}</label><Input id="raftbench-history-from" className="mt-2 w-full sm:w-auto" type="date" value={dateValue} max={today} onChange={changeHistory} /><div className="mt-2 flex flex-wrap gap-2">{[7, 30, 90].map(days => <Button key={days} size="md" data-days={days} onClick={chooseHistory}>{t({ id: "raftbench.aiHistoryDays" }, { days })}</Button>)}</div><p className="mt-2 text-caption text-foreground-hint">{t({ id: "raftbench.aiHistoryHelp" })}</p></div>
       {data?.enabled && changed && <Button className="mt-3" onClick={applySettings} disabled={!selected.length || invalidHistory}>{t({ id: "raftbench.aiApplyScope" })}</Button>}
     </fieldset></details>
     </div>

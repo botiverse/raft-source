@@ -36,6 +36,11 @@ export interface ExternalInvitePreview {
   /** People already in the channel. Absent from an older server. */
   alreadyInChannel?: string[];
   /**
+   * The Server's members (not Guests) among `alreadyInChannel`, who may be
+   * invited to connect a server of theirs. Absent from an older server.
+   */
+  alreadyInChannelMembers?: string[];
+  /**
    * Guests of another channel of the host Server, who can't be invited; the
    * channel is named only when the viewer can see it. Absent from an older server.
    */
@@ -228,14 +233,24 @@ export async function previewExternalInvitesForNewChannel(emails: string[]): Pro
   return data;
 }
 
+/**
+ * `connectInviteMemberEmails`: the Server's members among `emails` who are
+ * also sent an invite to connect a server of theirs (the review's "Invite to
+ * connect"); every member is added to the channel either way.
+ */
 export async function sendExternalInvites(
   channelId: string,
   emails: string[],
   makePrivate: boolean,
+  connectInviteMemberEmails: string[] = [],
 ): Promise<SendExternalInvitesResult> {
   const { data } = await api.post<SendExternalInvitesResult>(
     `/channels/${channelId}/external-invites`,
-    makePrivate ? { emails, makePrivate: true } : { emails },
+    {
+      emails,
+      ...(makePrivate ? { makePrivate: true } : {}),
+      ...(connectInviteMemberEmails.length > 0 ? { connectInviteMemberEmails } : {}),
+    },
   );
   void loadChannelExternalInvites(channelId);
   return data;
@@ -290,9 +305,10 @@ export async function sendInvitesAndConnectServers(
   addresses: string[],
   serverIds: string[],
   makePrivate: boolean,
+  connectInviteMemberEmails: string[] = [],
 ): Promise<SendExternalInvitesResult> {
   const sent: SendExternalInvitesResult = addresses.length > 0
-    ? await sendExternalInvites(channelId, addresses, makePrivate)
+    ? await sendExternalInvites(channelId, addresses, makePrivate, connectInviteMemberEmails)
     : { sent: [], skipped: { duplicates: [], invalid: [], alreadyPending: [], alreadyMembers: [] } };
   if (serverIds.length === 0) return sent;
   try {

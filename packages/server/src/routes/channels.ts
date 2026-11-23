@@ -1,10 +1,11 @@
 import { AGENT_LOUNGE_OUTSIDER_ADD_REFUSAL, AgentLoungeImmutableError, filterLoungeOutsiderAgents, getLoungeAgentIds, isLoungeOutsiderAgent } from "../services/agentLoungeService";
 import { projectRuntimeErrorActivityDetail } from "../services/agentRuntimeErrorVisibility";
-import { isRuntimeErrorDetailActivity } from "@botiverse/raft-shared";
+import { createChannelCapabilityFor, isRuntimeErrorDetailActivity } from "@botiverse/raft-shared";
 import { refuse, RefusalError, type RefusalInput } from "../lib/refusal";
 import { isJointHostSideMember } from "../services/jointHumanMembershipAccess";
 import { JointActorUnavailableError } from "../services/jointHumanMembershipMirror";
 import { hideUnfindableAgentsByParam } from "./unfindableAgentGate";
+import { serviceMessageRefusal } from "./agentRouteRefusals";
 import { DEPRECATED_GRAVATAR_HASH, isExternalAgentRuntime, isSubConversationType } from "@botiverse/raft-shared";
 import { getProductEventSink } from "../services/productEventIngest";
 import { recordServerProductEvent } from "../services/serverProductEvents";
@@ -21,6 +22,7 @@ import { Router, type Request, type Response, type Router as RouterType } from "
 import { createHash } from "node:crypto";
 import { hostname } from "node:os";
 import * as channelService from "../services/channelService";
+import { deliverChannelMembershipRoleChange } from "../services/channelMembershipRoleOutbox";
 import { archivedNameCollisionBody } from "./archivedNameCollision";
 import { finishHumanChannelListItems, loadHumanChannelList, resolveExternalRelationViewer, withHumanChannelAuthorization } from "../services/channelListItems";
 import { noteInboxWriteBeforeReply, readWithStaleOnOverload, resolveSoftTimeoutMs, STALE_RESPONSE_HEADER } from "./rwStaleRead";
@@ -53,8 +55,8 @@ import {
   serializeServerConnectOutcome,
 } from "./externalInvites";
 import { refusedOutcome, type ConnectFinishedOutcome } from "../services/externalConnectProductEvents";
-import { asServerId, CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY, channelTypeSupportsThreadSort, isChannelThreadSort, EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, MAX_JOINT_CHANNEL_SERVERS, PUBLIC_SERVER_FEATURE_FLAG_KEY, channelTypeSupportsActivityMute, noopTracer, validateName, type ServerCapability, type ActiveSpan, type ServerId, type TraceAttributes, type Tracer } from "@botiverse/raft-shared";
-import { getServerPlan, getHistoryCutoff, channelBillingReadOnlyBody, getChannelBillingReadOnly, isChannelReadOnlyByQuota } from "../services/planService";
+import { asServerId, EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, MAX_JOINT_CHANNEL_SERVERS, PUBLIC_SERVER_FEATURE_FLAG_KEY, channelTypeSupportsActivityMute, noopTracer, validateName, type ServerCapability, type ActiveSpan, type ServerId, type TraceAttributes, type Tracer } from "@botiverse/raft-shared";
+import { getServerPlan, getHistoryCutoff, channelBillingReadOnlyBody, channelBillingReadOnlyRefusal, getChannelBillingReadOnly, isChannelReadOnlyByQuota } from "../services/planService";
 import { setRequestTraceErrorCode, setRequestTraceLimitSide } from "../middleware/requestObservability";
 import { noteLimitPaywallHit, notePaywallHit } from "./paywallHit";
 import { getServerHistoryWindowForRead, isBehindHistoryWindow } from "../services/historyWindow";
@@ -99,6 +101,7 @@ import {
   CHANNEL_FETCH_REASON_HEADER,
   channelGetTargetTraceAttrs,
   INBOX_FETCH_COALESCED_HEADER,
+  INBOX_FETCH_REFUSED_HEADER,
   INBOX_FETCH_TRIGGER_HEADER,
   inboxFetchTriggerTraceAttrs,
 } from "./channelGetTrace";
@@ -595,6 +598,7 @@ function sendJointLimitError(res: Response, error: unknown, req: Request, opts: 
   if (error instanceof AttributedJointChannelLimitError) setRequestTraceLimitSide(res, error.limitSide);
   if (error.code === "joint_free_server_limit") notePaywallHit(req, "joint_channel_free_cap");
   else if (error.code === "joint_channel_free_limit_reached" && !opts.acceptingInvite) notePaywallHit(req, "joint_channel_host_limit");
+  // refusal-ok: the web names the blocking channel from top-level blockingChannel.name (web/src/utils/jointChannelLimit.ts)
   res.status(403).json({
     error: error.message,
     code: error.code,
@@ -617,6 +621,7 @@ function sendExternalLimitError(res: Response, error: unknown, req: Request): bo
   setRequestTraceErrorCode(res, error.code);
   setRequestTraceLimitSide(res, error.limitSide);
   noteLimitPaywallHit(req, error);
+  // refusal-ok: the web reads top-level limitSide/limitServerId to say whose limit it is (web/src/components/externalInvite/externalInviteAccept.ts), as routes/externalInvites.ts answers
   res.status(409).json({ error: error.message, code: error.code, limitSide: error.limitSide, limitServerId: error.limitServerId });
   return true;
 }
@@ -625,6 +630,7 @@ function sendJointInviteValidationError(res: Response, error: unknown): boolean 
   if (!(error instanceof channelService.JointChannelInviteValidationError)) {
     return false;
   }
+  // refusal-ok: the web words an unavailable invitee from top-level invitee and targetServerSlug (web/src/features/channel/EditChannelDialog.tsx)
   res.status(400).json({
     error: error.message,
     code: error.code,
@@ -637,8 +643,8 @@ function sendJointInviteValidationError(res: Response, error: unknown): boolean 
   return true;
 }
 
-/** 403 body for a refused #all leave/removal: #all's audience is the whole server. */
-function allChannelMembershipRefusal(msg: string): { error: string; code: string } | null {
+/** 403 refusal for a refused #all leave/removal: #all's audience is the whole server. */
+function allChannelMembershipRefusal(msg: string): RefusalInput | null {
   return msg === channelService.ALL_CHANNEL_LEAVE_MESSAGE || msg === channelService.ALL_CHANNEL_REMOVE_MEMBERS_MESSAGE
     ? { error: msg, code: "all_channel_membership_fixed" }
     : null;
@@ -719,7 +725,11 @@ async function broadcastMembershipSystemMessage(
       .map((candidate) => candidate.id);
   }
 
-  const broadcast = persistedMessage
+  // A joint channel's notice is stored in canonical storage and fanned out to
+  // every server's copy (broadcastSystemMessageToLocalSurfaces); the plain
+  // writer would store it in this server's copy, which owns no storage
+  // (slock issue 15637 step 2: those rows reached no other server).
+  const broadcast = persistedMessage || channel.type === "joint"
     ? messageService.broadcastSystemMessageToLocalSurfaces
     : messageService.broadcastSystemMessage;
   await broadcast(io, agentOrchestrator, channel.id, content, {
@@ -790,7 +800,8 @@ async function broadcastChannelRenameSystemMessage(
 
   const actor = await userService.getUser(actorUserId);
   const actorName = actor?.name ? `@${actor.name}` : actor?.displayName || "Someone";
-  await messageService.broadcastSystemMessage(
+  // Joint-aware: a joint's notice goes to canonical storage, fanned out to every server (slock issue 15637).
+  await messageService.broadcastSystemMessageToLocalSurfaces(
     io,
     agentOrchestrator,
     channel.id,
@@ -848,6 +859,46 @@ async function withLatestMessageFactsOnConversations(items: readonly ActivityInb
   return items.map((item) => (isConversationInboxItem(item) ? withFacts[next++]! : item));
 }
 
+/**
+ * Activity rows by their own ids, exactly as GET /channels/inbox?ids= answers
+ * them (same read, same guest filter, history window and RFC 077 facts), for
+ * the sync pull's inbox_row changes (services/syncInboxRows.ts). Read rows
+ * only (`rowsOnly`: no groups or totals, which an ids answer never sends), so
+ * a RisingWave read also gives each row's target latest seq. At most
+ * INBOX_ROW_IDS_MAX ids per read; ids are compared lowercased.
+ */
+export async function readInboxRowsForSync(
+  reader: { userId: string; serverId: ServerId; sessionFamilyId: string | null },
+  ids: readonly string[],
+  /** Also these rows' Done watermarks and mutes as the read model holds them (the log arm's own changes). */
+  options: { sourceStateIds?: readonly string[] } = {},
+): Promise<{ items: channelService.InboxItem[]; backend?: channelService.InboxItemsResult["backend"]; targetLatestSeqs?: ReadonlyMap<string, string>; sourceStates?: channelService.InboxSourceStates }> {
+  const rowIds = [...new Set(ids.map((id) => id.toLowerCase()))];
+  if (rowIds.length === 0) return { items: [] };
+  if (rowIds.length > INBOX_ROW_IDS_MAX) throw new Error(`readInboxRowsForSync takes at most ${INBOX_ROW_IDS_MAX} ids`);
+  const historyCutoff = getHistoryCutoff(await getServerPlan(reader.serverId));
+  const loaded = await getActivityInboxItems(reader, {
+    filter: "all",
+    limit: rowIds.length,
+    offset: 0,
+    rowIds,
+    rowsOnly: true,
+    ...(options.sourceStateIds && options.sourceStateIds.length > 0 ? { sourceStateIds: options.sourceStateIds } : {}),
+    sort: "desc",
+    historyCutoff,
+    includeUnfollowedThreads: true,
+    traceQuery: createTraceDbQueryTracer("sync.inbox_rows.loaded"),
+  });
+  const filtered = await filterGuestInboxResult(loaded, reader.userId, reader.serverId);
+  const items = (await withLatestMessageFactsOnConversations(filtered.items)).flatMap((item): channelService.InboxItem[] => (item.kind === "object" ? [] : [item]));
+  return {
+    items,
+    ...(loaded.backend ? { backend: loaded.backend } : {}),
+    ...(loaded.targetLatestSeqs ? { targetLatestSeqs: loaded.targetLatestSeqs } : {}),
+    ...(loaded.sourceStates ? { sourceStates: loaded.sourceStates } : {}),
+  };
+}
+
 async function filterGuestHistoryResult<T extends { items: channelService.InboxItem[]; totalCount: null }>(
   result: T,
   userId: string,
@@ -867,6 +918,34 @@ async function guestVisibleChannelIds(channelIds: readonly string[], userId: str
   return channelService.filterUserAccessibleChannelIds([...new Set(channelIds)], userId, serverId);
 }
 
+// Access refusals that read the same for every reason (docs/contracts/agent-api-refusals.md, "Uniform refusals").
+const CHANNEL_CONVERSION_DISABLED_REFUSAL: RefusalInput = { code: "channel_to_joint_conversion_disabled", error: "Channel to Joint conversion is not enabled" };
+const CONVERSION_JOB_NOT_FOUND_REFUSAL: RefusalInput = { code: "job_not_found", error: "Conversion job not found" };
+const CHANNEL_FEDERATE_FORBIDDEN_REFUSAL: RefusalInput = { code: "channel_federate_forbidden", error: "You do not have permission to federate channels" };
+/** A route behind external_channels_v1 while the flag is off for the Server: as a route that doesn't exist. */
+const EXTERNAL_CHANNELS_OFF_REFUSAL: RefusalInput = { code: "not_found", error: "Not found" };
+const JOINT_INVITE_NOT_FOUND_REFUSAL: RefusalInput = { code: "joint_invite_not_found", error: "Joint channel invite not found" };
+const CHAT_NOT_FOUND_REFUSAL: RefusalInput = { code: "chat_not_found", error: "Chat not found" };
+/** A thread or task conversation a person can't see, missing or hidden (the agent routes' own is THREAD_NOT_FOUND_REFUSAL in agentRouteRefusals.ts). */
+const HUMAN_THREAD_NOT_FOUND_REFUSAL: RefusalInput = { code: "thread_not_found", error: "Thread not found" };
+/** A message a person can't see on Follow and Save, missing or hidden (the agent routes keep their own sentence for `message_not_found`). */
+const HUMAN_MESSAGE_NOT_FOUND_REFUSAL: RefusalInput = { code: "message_not_found", error: "Message not found" };
+/** An Agent that isn't a follower of the thread (remove, restore): missing, deleted, another server's, or never followed it. */
+const AGENT_FOLLOWER_NOT_FOUND_REFUSAL: RefusalInput = { code: "agent_follower_not_found", error: "Agent follower not found" };
+/** The Server's own #all is gone (hide / restore #all, after the admin check). */
+const SYSTEM_ALL_NOT_FOUND_REFUSAL: RefusalInput = { code: "all_channel_not_found", error: "Channel not found" };
+/**
+ * A channel a person can't see (update, the notification and display
+ * settings, archive, unarchive, delete, disconnect, the joint and external
+ * invite routes, member connect, the agents and members reads, adding and
+ * removing members and their channel role, leaving, marking read): missing,
+ * another server's or hidden, one body for every reason. Not GET /:id (the
+ * web tells a denial there by a body without a code, channelAccessLoss.ts),
+ * /:id/files and the thread routes (channelAccessDenial.ts's body), or
+ * read-all and unread (their contracts pin the body).
+ */
+const HUMAN_CHANNEL_NOT_FOUND_REFUSAL: RefusalInput = { code: "channel_not_found", error: "Channel not found" };
+
 /**
  * A conversion job (read, Retry, Cancel) is followed where external_channels_v1
  * is on for the Server: the flag that lets an external invite convert a
@@ -874,14 +953,14 @@ async function guestVisibleChannelIds(channelIds: readonly string[], userId: str
  */
 async function requireChannelConversionEnabled(req: Request, res: Response): Promise<boolean> {
   if (await externalInviteService.externalChannelsEnabled(req.serverId!, req.userId!)) return true;
-  res.status(404).json({ error: "Channel to Joint conversion is not enabled", code: "channel_to_joint_conversion_disabled" });
+  refuse(res, 404, CHANNEL_CONVERSION_DISABLED_REFUSAL);
   return false;
 }
 
 /** The answer of a retired way of making a joint channel: 404, nothing written. */
 function refuseRetiredJointEntry(res: Response,
   code: "joint_conversion_retired" | "joint_creation_retired" | "joint_server_invite_retired"): void {
-  res.status(404).json({ error: "This way of sharing a channel is retired. Invite people outside the server to the channel instead.", code });
+  refuse(res, 404, { code, error: "This way of sharing a channel is retired. Invite people outside the server to the channel instead." });
 }
 
 /**
@@ -908,13 +987,13 @@ async function requireVisibleChannelConversionJob(req: Request, res: Response) {
   const jobId = typeof req.params.jobId === "string" ? req.params.jobId : req.params.jobId[0];
   const job = jobId ? await channelConversionService.getChannelConversionJob(jobId) : null;
   if (!job || job.serverId !== req.serverId) {
-    res.status(404).json({ error: "Conversion job not found", code: "job_not_found" });
+    refuse(res, 404, CONVERSION_JOB_NOT_FOUND_REFUSAL);
     return null;
   }
   const source = await channelService.getChannel(job.sourceChannelId);
   if (!source || source.serverId !== req.serverId
     || !await canSeeChannel(source, req.userId!, req.serverId!)) {
-    res.status(404).json({ error: "Conversion job not found", code: "job_not_found" });
+    refuse(res, 404, CONVERSION_JOB_NOT_FOUND_REFUSAL);
     return null;
   }
   return job;
@@ -924,7 +1003,7 @@ function countInboxItemsByKind(list: readonly ActivityInboxItem[], kind: Activit
   return list.filter((item) => item.kind === kind).length;
 }
 
-const INBOX_ROW_IDS_MAX = 50;
+export const INBOX_ROW_IDS_MAX = 50;
 
 /**
  * Activity `ids` query param: comma-separated row ids (a channel/DM row's
@@ -1066,10 +1145,10 @@ function parseJointInviteRequests(raw: {
 async function admitJointInviteOrRefuse(req: Request, res: Response, people: number): Promise<boolean> {
   const admission = await admitJointInvite(req.userId!, people);
   if (admission.admitted) return true;
-  res.setHeader("Retry-After", String(admission.retryAfterSeconds));
-  res.status(429).json({
-    error: "Too many joint channel invites. Try again later.",
+  // refuse() also sets Retry-After from retryAfterSeconds.
+  refuse(res, 429, {
     code: "joint_invite_rate_limited",
+    error: "Too many joint channel invites. Try again later.",
     retryAfterSeconds: admission.retryAfterSeconds,
   });
   return false;
@@ -1084,7 +1163,7 @@ channelRouter.get("/", async (req, res) => {
     if (raw === undefined) archived = undefined;
     else if (raw === "exclude" || raw === "include" || raw === "only") archived = raw;
     else {
-      res.status(400).json({ error: "archived must be one of: exclude, include, only" });
+      refuse(res, 400, { code: "archived_filter_invalid", error: "archived must be one of: exclude, include, only" });
       return;
     }
     const archivedFilter = archived ?? "exclude";
@@ -1153,11 +1232,11 @@ channelRouter.post("/dm", async (req, res) => {
   try {
     const { agentId, userId } = req.body;
     if (!agentId && !userId) {
-      res.status(400).json({ error: "Either agentId or userId is required" });
+      refuse(res, 400, { code: "dm_target_required", error: "Either agentId or userId is required" });
       return;
     }
     if (agentId && userId) {
-      res.status(400).json({ error: "Cannot provide both agentId and userId" });
+      refuse(res, 400, { code: "dm_target_conflict", error: "Cannot provide both agentId and userId" });
       return;
     }
 
@@ -1197,14 +1276,17 @@ channelRouter.post("/dm", async (req, res) => {
 // Create channel
 channelRouter.post("/", async (req, res) => {
   try {
-    if (!(await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "createChannels"))) {
-      res.status(403).json({ error: "You do not have permission to create channels" });
+    // The capability follows the requested visibility, read before the body
+    // is validated so a refusal still comes before a 400, as it did.
+    const createCapability = createChannelCapabilityFor(req.body?.visibility);
+    if (!(await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, createCapability))) {
+      refuse(res, 403, { code: "channel_create_forbidden", error: "You do not have permission to create channels" });
       return;
     }
     const { name, description, visibility, agentIds, userIds, targetServerSlug, invitedPeople, sameAdmin, jointInvites, actionCardMessageId, actionCardConfirmationVersion } = req.body;
     const parsedVisibility = parseChannelVisibility(visibility);
     if (parsedVisibility === null) {
-      res.status(400).json({ error: "visibility must be one of: public, private, joint" });
+      refuse(res, 400, { code: "channel_visibility_invalid", error: "visibility must be one of: public, private, joint" });
       return;
     }
     const channelType: channelService.RegularChannelType = parsedVisibility === "private" ? "private" : "channel";
@@ -1217,26 +1299,26 @@ channelRouter.post("/", async (req, res) => {
     )) return;
     const nameError = validateName(name, "Channel name");
     if (nameError) {
-      res.status(400).json({ error: nameError });
+      refuse(res, 400, { code: "channel_name_invalid", error: nameError });
       return;
     }
     if (typeof name === "string" && name.trim() === "all") {
-      res.status(400).json({ error: 'Channel name "all" is reserved' });
+      refuse(res, 400, { code: "channel_name_reserved", error: 'Channel name "all" is reserved' });
       return;
     }
     if (parsedVisibility === "joint" && selectedJointInviteRequests.some((request) => !request.targetServerSlug)) {
-      res.status(400).json({ error: "Invite server slug is required" });
+      refuse(res, 400, { code: "joint_invite_server_required", error: "Invite server slug is required" });
       return;
     }
     if (parsedVisibility === "joint" && (
       selectedJointInviteRequests.length === 0
       || selectedJointInviteRequests.some((request) => request.invitedPeople.length === 0)
     )) {
-      res.status(400).json({ error: "At least one invited person is required" });
+      refuse(res, 400, { code: "joint_invite_people_required", error: "At least one invited person is required" });
       return;
     }
     if (description && (typeof description !== "string" || description.length > 500)) {
-      res.status(400).json({ error: "Description must be a string of at most 500 characters" });
+      refuse(res, 400, { code: "channel_description_invalid", error: "Description must be a string of at most 500 characters" });
       return;
     }
     const selectedAgentIds = Array.isArray(agentIds) ? [...new Set(agentIds.filter((id): id is string => typeof id === "string"))] : [];
@@ -1245,7 +1327,7 @@ channelRouter.post("/", async (req, res) => {
       parsedVisibility === "joint"
       && !(await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "federateChannels"))
     ) {
-      res.status(403).json({ error: "You do not have permission to federate channels" });
+      refuse(res, 403, CHANNEL_FEDERATE_FORBIDDEN_REFUSAL);
       return;
     }
     // Creation is the one add-member bootstrap: the creator and all selected
@@ -1257,14 +1339,20 @@ channelRouter.post("/", async (req, res) => {
       // Only its owner finds a personal assistant; for anyone else it is
       // answered exactly as an id that names no agent here.
       if (!agent || agent.serverId !== req.serverId || isOthersAssistant(agent, req.userId!)) {
-        res.status(400).json({ error: "Agent not found in this server" });
+        refuse(res, 400, { code: "agent_not_in_server", error: "Agent not found in this server" });
         return;
       }
     }
     for (const userId of selectedUserIds) {
       const role = await getActorServerRoleInServer(req.serverId!, "user", userId);
       if (!role) {
-        res.status(400).json({ error: "User is not a member of this server" });
+        refuse(res, 400, { code: "user_not_in_server", error: "User is not a member of this server" });
+        return;
+      }
+      // A Guest is in its one bound channel only (addHuman), never a new one,
+      // joint included.
+      if (role === "guest") {
+        refuse(res, 403, { code: channelService.GUEST_OTHER_CHANNEL_CODE, error: channelService.GUEST_OTHER_CHANNEL_MESSAGE });
         return;
       }
     }
@@ -1339,6 +1427,7 @@ channelRouter.post("/", async (req, res) => {
     });
   } catch (err: any) {
     if (err instanceof channelService.ArchivedNameCollisionError) {
+      // refusal-ok: the archived-name body: the web reads top-level archivedChannelId/Name/Type and canUnarchiveArchivedChannel (archivedNameCollision.ts)
       res.status(409).json(await humanArchivedNameCollisionBody(req, err));
       return;
     }
@@ -1346,7 +1435,7 @@ channelRouter.post("/", async (req, res) => {
     if (sendJointLimitError(res, err, req)) return;
     // The creator's account retired or being deleted meanwhile (createJointChannel): as one who may not federate.
     if (err instanceof JointActorUnavailableError) {
-      res.status(403).json({ error: "You do not have permission to federate channels" });
+      refuse(res, 403, CHANNEL_FEDERATE_FORBIDDEN_REFUSAL);
       return;
     }
     const msg = err?.message || "";
@@ -1354,11 +1443,12 @@ channelRouter.post("/", async (req, res) => {
       // The source action card is frozen or needs reconfirmation: an expected 409, not a server fault.
       res.status(err.status).json({ error: err.message, code: err.code });
     } else if (msg.includes("already taken")) {
+      // refusal-ok: must stay byte-identical to the hidden archived-name body (archivedNameCollision.ts), no existence oracle (#proj-chat:#19)
       res.status(409).json({ error: msg });
     } else if (msg.includes("Channel limit reached")) {
-      res.status(403).json({ error: msg });
+      refuse(res, 403, serviceMessageRefusal("channel_limit_reached", msg, "This server has reached its channel limit: archive unused channels or upgrade the plan."));
     } else if (msg.includes("requires the Pro plan")) {
-      res.status(403).json({ error: msg });
+      refuse(res, 403, serviceMessageRefusal("pro_plan_required", msg, "This kind of channel needs the Pro plan: upgrade the server to create it."));
     } else {
       sendJsonServerError(req, res, {
         error: "Failed to create channel",
@@ -1396,7 +1486,7 @@ async function emitSameAdminJointProjections(
 channelRouter.get("/joint-connections", async (req, res) => {
   try {
     if (!(await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "federateChannels"))) {
-      res.status(403).json({ error: "Only admins can manage joint channel connections" });
+      refuse(res, 403, { code: "joint_connections_forbidden", error: "Only admins can manage joint channel connections" });
       return;
     }
     const connections = await channelService.listServerJointConnections(req.serverId!, req.userId!);
@@ -1412,7 +1502,7 @@ channelRouter.get("/external-availability", async (req, res) => {
   try {
     const flag = await evaluateFeatureFlag({ key: EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, serverId: req.serverId!, userId: req.userId! });
     if (!flag.enabled) {
-      res.status(404).json({ error: "Not found" });
+      refuse(res, 404, EXTERNAL_CHANNELS_OFF_REFUSAL);
       return;
     }
     res.json(await externalInviteService.getExternalChannelAvailability(req.serverId!, req.userId!));
@@ -1428,7 +1518,7 @@ channelRouter.get("/external-connect-servers", async (req, res) => {
   try {
     const flag = await evaluateFeatureFlag({ key: EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, serverId: req.serverId!, userId: req.userId! });
     if (!flag.enabled) {
-      res.status(404).json({ error: "Not found" });
+      refuse(res, 404, EXTERNAL_CHANNELS_OFF_REFUSAL);
       return;
     }
     res.json({ servers: await externalInviteService.listOwnConnectableServers(req.serverId!, req.userId!) });
@@ -1454,7 +1544,7 @@ channelRouter.post("/joint-invites/accept-many",async(req,res)=>{
     const inviteIds=req.body?.inviteIds;
     if(!Array.isArray(inviteIds) || inviteIds.length===0 || inviteIds.length>=MAX_JOINT_CHANNEL_SERVERS
       || inviteIds.some((id:unknown)=>typeof id!=="string" || !channelService.isJointChannelInviteId(id))) {
-      res.status(400).json({error:"Select valid joint invitations"});return;
+      refuse(res,400,{code:"joint_invite_ids_invalid",error:"Select valid joint invitations"});return;
     }
     const channels=await channelService.acceptJointChannelInvites({inviteIds,acceptedByUserId:req.userId!});
     const projected=await channelService.attachJointChannelMetadata(channels.map(channel=>({...channel,joined:true})));
@@ -1474,16 +1564,24 @@ channelRouter.post("/joint-invites/accept-many",async(req,res)=>{
     res.json({channels:projected});
   } catch(error) {
     if(sendJointLimitError(res,error,req,{acceptingInvite:true}) || sendExternalLimitError(res,error,req)) return;
-    if(error instanceof channelService.JointChannelArchivedError){res.status(409).json({error:error.message,code:error.code});return;}
+    if(error instanceof channelService.JointChannelArchivedError){refuse(res,409,{code:error.code,error:error.message});return;}
+    if(error instanceof channelService.ArchivedNameCollisionError){
+      // The holder sits on whichever selected server the collision came from: its visibility is judged there.
+      const holder=await channelService.getChannel(error.archivedChannelId);
+      // refusal-ok: the archived-name body, the hidden case byte-identical to the live "already taken" below (archivedNameCollision.ts, #proj-chat:#19)
+      res.status(409).json(await humanArchivedNameCollisionBody(req,error,holder?asServerId(holder.serverId):undefined));return;
+    }
     const message=error instanceof Error?error.message:"Failed to accept joint invitations";
-    res.status(message.includes("not found")?404:message.includes("Only target server admins")?403:409).json({error:message});
+    // Every "not found" (invite, joint, projection) is the one answer: which part is missing is not the caller's to learn.
+    if(message.includes("not found")){refuse(res,404,JOINT_INVITE_NOT_FOUND_REFUSAL);return;}
+    res.status(message.includes("Only target server admins")?403:409).json({error:message});
   }
 });
 
 channelRouter.post("/joint-invites/:inviteId/accept", async (req, res) => {
   try {
     if (!channelService.isJointChannelInviteId(req.params.inviteId)) {
-      res.status(404).json({ error: "Joint channel invite not found" });
+      refuse(res, 404, JOINT_INVITE_NOT_FOUND_REFUSAL);
       return;
     }
     const channel = await channelService.acceptJointChannelInvite({
@@ -1501,16 +1599,25 @@ channelRouter.post("/joint-invites/:inviteId/accept", async (req, res) => {
   } catch (err: any) {
     if (sendJointLimitError(res, err, req, { acceptingInvite: true }) || sendExternalLimitError(res, err, req)) return;
     if (err instanceof channelService.JointChannelArchivedError) {
-      res.status(409).json({ error: err.message, code: err.code });
+      refuse(res, 409, { code: err.code, error: err.message });
+      return;
+    }
+    if (err instanceof channelService.ArchivedNameCollisionError) {
+      // refusal-ok: the archived-name body, the hidden case byte-identical to the live "already taken" below (archivedNameCollision.ts, #proj-chat:#19)
+      res.status(409).json(await humanArchivedNameCollisionBody(req, err));
       return;
     }
     const msg = err?.message || "";
     if (msg.includes("not found")) {
-      res.status(404).json({ error: msg });
+      // Every "not found" (invite, joint, projection) is the one answer: which part is missing is not the caller's to learn.
+      refuse(res, 404, JOINT_INVITE_NOT_FOUND_REFUSAL);
     } else if (msg.includes("Only target server admins")) {
-      res.status(403).json({ error: msg });
-    } else if (msg.includes("expired") || msg.includes("already taken") || msg.includes("already in this joint channel")) {
+      refuse(res, 403, serviceMessageRefusal("joint_invite_accept_forbidden", msg, "Only target server admins can accept joint channel invites"));
+    } else if (msg.includes("already taken")) {
+      // refusal-ok: must stay byte-identical to the hidden archived-name body (archivedNameCollision.ts), no existence oracle (#proj-chat:#19)
       res.status(409).json({ error: msg });
+    } else if (msg.includes("expired") || msg.includes("already in this joint channel")) {
+      refuse(res, 409, serviceMessageRefusal("joint_invite_not_acceptable", msg, "This joint channel invite can no longer be accepted."));
     } else {
       res.status(500).json({ error: "Failed to accept joint channel invite" });
     }
@@ -1583,8 +1690,8 @@ channelRouter.get("/unread", async (req, res) => {
 channelRouter.get("/inbox", async (req, res) => {
   addTraceEvent("activity.list.fetch", {
     ...activityListFetchTraceAttrs("inbox", req.headers[CHANNEL_FETCH_REASON_HEADER], req.query.ids),
-    // #triage:#229: the realtime event behind a realtime_fallback re-read.
-    ...inboxFetchTriggerTraceAttrs(req.headers[INBOX_FETCH_TRIGGER_HEADER], req.headers[INBOX_FETCH_COALESCED_HEADER]),
+    // #triage:#229: the realtime event behind a realtime_fallback re-read; #244: why it was not patched in place.
+    ...inboxFetchTriggerTraceAttrs(req.headers[INBOX_FETCH_TRIGGER_HEADER], req.headers[INBOX_FETCH_COALESCED_HEADER], req.headers[INBOX_FETCH_REFUSED_HEADER]),
   });
   const admission = getInboxRouteBackpressureAdmission(res);
   if (!admission) {
@@ -1607,10 +1714,12 @@ channelRouter.get("/inbox", async (req, res) => {
     // client cannot mistake it for list-level state.
     const rowIds = parseInboxRowIdsParam(req.query.ids);
     if (rowIds && !Array.isArray(rowIds)) {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(400).json({ error: rowIds.error });
       return;
     }
     if (rowIds && (channelIdParam !== undefined || q || req.query.scope !== undefined || offset > 0 || (filterParam !== undefined && filterParam !== "all"))) {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(400).json({ error: "ids cannot be combined with channelId, q, scope, offset or a filter other than all" });
       return;
     }
@@ -1847,6 +1956,7 @@ channelRouter.post("/inbox/done", noteInboxWriteBeforeReply, async (req, res) =>
   try {
     const { channelId, throughActivitySeq, frontierSpace: requestedFrontierSpace } = req.body;
     if (!channelId) {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(400).json({ error: "channelId is required" });
       return;
     }
@@ -1856,6 +1966,7 @@ channelRouter.post("/inbox/done", noteInboxWriteBeforeReply, async (req, res) =>
     // value without identity => refresh-required 412; unsupported identity =>
     // 400; storage value => the unchanged strict guard below.
     if (requestedFrontierSpace === undefined && throughActivitySeq !== undefined) {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(412).json({
         error: "frontierSpace is required; refresh and retry",
         code: "DONE_FRONTIER_SPACE_REQUIRED",
@@ -1863,6 +1974,7 @@ channelRouter.post("/inbox/done", noteInboxWriteBeforeReply, async (req, res) =>
       return;
     }
     if (requestedFrontierSpace !== undefined && requestedFrontierSpace !== "storage") {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(400).json({
         error: "frontierSpace must be storage",
         code: "DONE_FRONTIER_UNMAPPABLE",
@@ -1871,6 +1983,7 @@ channelRouter.post("/inbox/done", noteInboxWriteBeforeReply, async (req, res) =>
     }
     const channel = await channelService.getChannel(channelId);
     if (!channel || isSubConversationType(channel.type)) {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(404).json({ error: "Chat not found" });
       return;
     }
@@ -1879,11 +1992,13 @@ channelRouter.post("/inbox/done", noteInboxWriteBeforeReply, async (req, res) =>
     // resolve its canonical membership before applying conversation policy.
     const isCanonicalServerMember = await serverService.isMember(canonicalServerId, req.userId!);
     if (!isCanonicalServerMember) {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(404).json({ error: "Chat not found" });
       return;
     }
     const canAccess = await channelService.canUserAccessChannel(channelId, req.userId!, canonicalServerId);
     if (!canAccess) {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(404).json({ error: "Chat not found" });
       return;
     }
@@ -1892,10 +2007,12 @@ channelRouter.post("/inbox/done", noteInboxWriteBeforeReply, async (req, res) =>
     res.json({ ok: true });
   } catch (err) {
     if (err instanceof DoneFrontierRequiredError) {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(400).json({ error: err.message, code: err.code });
       return;
     }
     if (err instanceof DoneFrontierBeyondLatestError || err instanceof DoneFrontierAboveInt4AuthorityError) {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(409).json({ error: err.message, code: err.code });
       return;
     }
@@ -1908,23 +2025,23 @@ channelRouter.post("/inbox/undone", noteInboxWriteBeforeReply, async (req, res) 
   try {
     const { channelId } = req.body;
     if (!channelId) {
-      res.status(400).json({ error: "channelId is required" });
+      refuse(res, 400, { code: "channel_id_required", error: "channelId is required" });
       return;
     }
     const channel = await channelService.getChannel(channelId);
     if (!channel || isSubConversationType(channel.type)) {
-      res.status(404).json({ error: "Chat not found" });
+      refuse(res, 404, CHAT_NOT_FOUND_REFUSAL);
       return;
     }
     const canonicalServerId = channel.serverId as ServerId;
     const isCanonicalServerMember = await serverService.isMember(canonicalServerId, req.userId!);
     if (!isCanonicalServerMember) {
-      res.status(404).json({ error: "Chat not found" });
+      refuse(res, 404, CHAT_NOT_FOUND_REFUSAL);
       return;
     }
     const canAccess = await channelService.canUserAccessChannel(channelId, req.userId!, canonicalServerId);
     if (!canAccess) {
-      res.status(404).json({ error: "Chat not found" });
+      refuse(res, 404, CHAT_NOT_FOUND_REFUSAL);
       return;
     }
     await channelService.markChannelInboxActive(req.userId!, channelId);
@@ -2025,13 +2142,13 @@ channelRouter.get("/threads/followed", async (req, res) => {
     const limitParam = req.query.limit;
     const limit = limitParam === undefined ? undefined : Number(limitParam);
     if (limit !== undefined && !(Number.isInteger(limit) && limit >= 1 && limit <= FOLLOWED_THREADS_MAX_LIMIT)) {
-      res.status(400).json({ error: `limit must be an integer from 1 to ${FOLLOWED_THREADS_MAX_LIMIT}` });
+      refuse(res, 400, { code: "followed_threads_limit_invalid", error: `limit must be an integer from 1 to ${FOLLOWED_THREADS_MAX_LIMIT}` });
       return;
     }
     const cursorParam = req.query.cursor;
     const cursor = cursorParam === undefined ? null : channelService.parseFollowedThreadsCursor(cursorParam);
     if (cursorParam !== undefined && (cursor === null || limit === undefined)) {
-      res.status(400).json({ error: "cursor must be a value returned as next, with limit" });
+      refuse(res, 400, { code: "followed_threads_cursor_invalid", error: "cursor must be a value returned as next, with limit" });
       return;
     }
     const unreadOnly = req.query.unreadOnly === "1" || req.query.unreadOnly === "true";
@@ -2121,11 +2238,11 @@ channelRouter.get("/threads/followed", async (req, res) => {
 async function resolveManagedThread(req: Request, res: Response, threadChannelId: string) {
   const channel = await channelService.getChannel(threadChannelId);
   if (!channel || !isSubConversationType(channel.type) || channel.serverId !== req.serverId) {
-    res.status(404).json({ error: "Thread not found" });
+    refuse(res, 404, HUMAN_THREAD_NOT_FOUND_REFUSAL);
     return null;
   }
   if (!await channelService.canUserAccessChannel(threadChannelId, req.userId!, req.serverId!)) {
-    res.status(404).json({ error: "Thread not found" });
+    refuse(res, 404, HUMAN_THREAD_NOT_FOUND_REFUSAL);
     return null;
   }
   return channel;
@@ -2197,22 +2314,22 @@ async function authorizeManagedFollowerWrite(
   const management = await resolveThreadFollowerManagement(req, channel);
   const author = channel.type === "task" ? "task creator" : "thread author";
   if (!management.canManage) {
-    res.status(403).json({ error: `Only the ${author} or a channel manager can ${verb} followers` });
+    refuse(res, 403, { code: "thread_follower_manage_forbidden", error: `Only the ${author} or a channel manager can ${verb} followers` });
     return null;
   }
-  const agent = await agentService.getAgent(agentId);
-  const followerThreadChannelId = agent
-    ? await channelService.getManagedFollowerThreadChannelIdForServer(channel.id, agent.serverId)
-    : null;
-  if (!agent || !followerThreadChannelId) {
-    res.status(404).json({ error: "Agent follower not found" });
+  // Resolved as a follower of this thread before any server check: an Agent
+  // that doesn't follow it reads the same as one that doesn't exist, so the
+  // server-ownership 403 can't reveal another server's Agents.
+  const follower = await channelService.getManagedAgentFollowerOfThread(channel.id, agentId);
+  if (!follower) {
+    refuse(res, 404, AGENT_FOLLOWER_NOT_FOUND_REFUSAL);
     return null;
   }
-  if (!management.canManageAgentOf(agent.serverId)) {
-    res.status(403).json({ error: `Only a channel manager of the host server can ${verb} another server's Agent followers` });
+  if (!management.canManageAgentOf(follower.agentServerId)) {
+    refuse(res, 403, { code: "thread_follower_other_server_forbidden", error: `Only a channel manager of the host server can ${verb} another server's Agent followers` });
     return null;
   }
-  return { followerThreadChannelId };
+  return { followerThreadChannelId: follower.followerThreadChannelId };
 }
 
 const THREAD_FOLLOWER_ROSTER_MAX = 100;
@@ -2269,7 +2386,7 @@ channelRouter.get("/threads/followers", async (req, res) => {
     const raw = typeof req.query.threadChannelIds === "string" ? req.query.threadChannelIds : "";
     const ids = [...new Set(raw.split(",").map((id) => id.trim()).filter(Boolean))];
     if (ids.length === 0 || ids.length > THREAD_FOLLOWER_ROSTER_MAX || ids.some((id) => !ANY_UUID_RE.test(id))) {
-      res.status(400).json({ error: "threadChannelIds must contain 1-100 thread UUIDs" });
+      refuse(res, 400, { code: "thread_ids_invalid", error: "threadChannelIds must contain 1-100 thread UUIDs" });
       return;
     }
     const threads = [];
@@ -2305,7 +2422,7 @@ channelRouter.delete("/threads/:threadChannelId/followers/agents/:agentId", asyn
     const threadChannelId = String(req.params.threadChannelId);
     const agentId = String(req.params.agentId);
     if (!ANY_UUID_RE.test(threadChannelId) || !ANY_UUID_RE.test(agentId)) {
-      res.status(400).json({ error: "Invalid thread or Agent id" });
+      refuse(res, 400, { code: "thread_follower_ids_invalid", error: "Invalid thread or Agent id" });
       return;
     }
     const channel = await resolveManagedThread(req, res, threadChannelId);
@@ -2348,7 +2465,7 @@ channelRouter.post("/threads/:threadChannelId/followers/agents/:agentId/restore"
     const agentId = String(req.params.agentId);
     const removalToken = typeof req.body?.undoToken === "string" ? req.body.undoToken : "";
     if (!ANY_UUID_RE.test(threadChannelId) || !ANY_UUID_RE.test(agentId) || !removalToken) {
-      res.status(400).json({ error: "Valid thread, Agent, and undo token are required" });
+      refuse(res, 400, { code: "thread_follower_restore_invalid", error: "Valid thread, Agent, and undo token are required" });
       return;
     }
     const channel = await resolveManagedThread(req, res, threadChannelId);
@@ -2391,11 +2508,11 @@ channelRouter.post("/threads/follow", noteInboxWriteBeforeReply, async (req, res
     if (!parentMessageId && typeof threadChannelId === "string" && threadChannelId) {
       const conversation = await channelService.getChannel(threadChannelId).catch(() => null);
       if (!conversation || conversation.type !== "task" || conversation.serverId !== req.serverId) {
-        res.status(404).json({ error: "Thread not found" });
+        refuse(res, 404, HUMAN_THREAD_NOT_FOUND_REFUSAL);
         return;
       }
       if (!await channelService.canUserAccessChannel(conversation.id, req.userId!, req.serverId!)) {
-        res.status(404).json({ error: "Thread not found" });
+        refuse(res, 404, HUMAN_THREAD_NOT_FOUND_REFUSAL);
         return;
       }
       // The Follow button: the thread scope moves only the follow state (a thread has no level).
@@ -2407,19 +2524,19 @@ channelRouter.post("/threads/follow", noteInboxWriteBeforeReply, async (req, res
       return;
     }
     if (!parentMessageId) {
-      res.status(400).json({ error: "parentMessageId is required" });
+      refuse(res, 400, { code: "parent_message_id_required", error: "parentMessageId is required" });
       return;
     }
 
     // Verify the parent message exists and belongs to a channel in this server
     const parentMsg = await channelService.getMessage(parentMessageId);
     if (!parentMsg) {
-      res.status(404).json({ error: "Message not found" });
+      refuse(res, 404, HUMAN_MESSAGE_NOT_FOUND_REFUSAL);
       return;
     }
     const parentChannel = await channelService.getChannel(parentMsg.channelId);
     if (!parentChannel) {
-      res.status(404).json({ error: "Message not found" });
+      refuse(res, 404, HUMAN_MESSAGE_NOT_FOUND_REFUSAL);
       return;
     }
     let localParentChannelId = parentMsg.channelId;
@@ -2427,14 +2544,14 @@ channelRouter.post("/threads/follow", noteInboxWriteBeforeReply, async (req, res
       const localProjection = (await channelService.getActiveJointChannelProjectionsByLocalChannel(parentMsg.channelId))
         .find((projection) => projection.serverId === req.serverId);
       if (!localProjection) {
-        res.status(404).json({ error: "Message not found" });
+        refuse(res, 404, HUMAN_MESSAGE_NOT_FOUND_REFUSAL);
         return;
       }
       localParentChannelId = localProjection.localChannelId;
     }
     const canAccessParent = await channelService.canUserAccessChannel(localParentChannelId, req.userId!, req.serverId!);
     if (!canAccessParent) {
-      res.status(404).json({ error: "Message not found" });
+      refuse(res, 404, HUMAN_MESSAGE_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -2448,7 +2565,7 @@ channelRouter.post("/threads/follow", noteInboxWriteBeforeReply, async (req, res
     res.json({ ok: true, threadChannelId: thread.id });
   } catch (err: any) {
     if (err instanceof NotificationLevelError) {
-      res.status(404).json({ error: "Thread not found" });
+      refuse(res, 404, HUMAN_THREAD_NOT_FOUND_REFUSAL);
       return;
     }
     if (sendCompatibilityReadPending(res, err, { primaryOutcomeCommitted: true })) return;
@@ -2465,18 +2582,18 @@ channelRouter.post("/threads/unfollow", noteInboxWriteBeforeReply, async (req, r
   try {
     const { threadChannelId } = req.body;
     if (!threadChannelId) {
-      res.status(400).json({ error: "threadChannelId is required" });
+      refuse(res, 400, { code: "thread_channel_id_required", error: "threadChannelId is required" });
       return;
     }
     // Verify the thread channel belongs to this server
     const channel = await channelService.getChannel(threadChannelId);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Thread not found" });
+      refuse(res, 404, HUMAN_THREAD_NOT_FOUND_REFUSAL);
       return;
     }
     const canAccess = await channelService.canUserAccessChannel(threadChannelId, req.userId!, req.serverId!);
     if (!canAccess) {
-      res.status(404).json({ error: "Thread not found" });
+      refuse(res, 404, HUMAN_THREAD_NOT_FOUND_REFUSAL);
       return;
     }
     // The Unfollow button: the thread scope moves only the follow state (a thread has no level).
@@ -2487,7 +2604,7 @@ channelRouter.post("/threads/unfollow", noteInboxWriteBeforeReply, async (req, r
     res.json({ ok: true });
   } catch (err) {
     if (err instanceof NotificationLevelError) {
-      res.status(404).json({ error: "Thread not found" });
+      refuse(res, 404, HUMAN_THREAD_NOT_FOUND_REFUSAL);
       return;
     }
     if (sendCompatibilityReadPending(res, err, { primaryOutcomeCommitted: true })) return;
@@ -2500,6 +2617,7 @@ channelRouter.post("/threads/done", noteInboxWriteBeforeReply, async (req, res) 
   try {
     const { threadChannelId, throughActivitySeq, frontierSpace } = req.body;
     if (!threadChannelId) {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(400).json({ error: "threadChannelId is required" });
       return;
     }
@@ -2508,6 +2626,7 @@ channelRouter.post("/threads/done", noteInboxWriteBeforeReply, async (req, res) 
     // value without identity is refresh-required, an unsupported identity is
     // invalid, and only an explicit storage value enters the strict guard.
     if (frontierSpace === undefined && throughActivitySeq !== undefined) {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(412).json({
         error: "frontierSpace is required; refresh and retry",
         code: "DONE_FRONTIER_SPACE_REQUIRED",
@@ -2515,6 +2634,7 @@ channelRouter.post("/threads/done", noteInboxWriteBeforeReply, async (req, res) 
       return;
     }
     if (frontierSpace !== undefined && frontierSpace !== "storage") {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(400).json({
         error: "frontierSpace must be storage",
         code: "DONE_FRONTIER_UNMAPPABLE",
@@ -2533,12 +2653,14 @@ channelRouter.post("/threads/done", noteInboxWriteBeforeReply, async (req, res) 
         ?? await channelService.getChannel(threadChannelId, { includeDeleted: true });
     } catch (resolveErr) {
       console.error("[threads/done] resolve failed:", resolveErr);
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(404).json({ error: "Thread not found" });
       return;
     }
     // Never-existed and lives-in-another-server are merged deliberately: telling
     // them apart makes this endpoint an existence oracle over thread ids.
     if (!channel || channel.serverId !== req.serverId) {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(404).json({ error: "Thread not found" });
       return;
     }
@@ -2563,8 +2685,10 @@ channelRouter.post("/threads/done", noteInboxWriteBeforeReply, async (req, res) 
     // Task v2: a task conversation is sub-conversation Done like a thread.
     if (channel.type !== "thread" && channel.type !== "task") {
       if (await authorize()) {
+        // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
         res.status(400).json({ error: "Not a thread", code: "NOT_A_THREAD" });
       } else {
+        // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
         res.status(404).json({ error: "Thread not found" });
       }
       return;
@@ -2592,6 +2716,7 @@ channelRouter.post("/threads/done", noteInboxWriteBeforeReply, async (req, res) 
     // parents still pass through authorize() and remain merged into 404.
     if (activeChannel && await channelService.hasDeletedDmThreadParent(threadChannelId, req.serverId!)) {
       if (!await channelService.hasUserThreadResidue(req.userId!, req.serverId!, threadChannelId)) {
+        // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
         res.status(404).json({ error: "Thread not found" });
         return;
       }
@@ -2609,6 +2734,7 @@ channelRouter.post("/threads/done", noteInboxWriteBeforeReply, async (req, res) 
       return;
     }
     if (!await authorize()) {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(404).json({ error: "Thread not found" });
       return;
     }
@@ -2617,14 +2743,17 @@ channelRouter.post("/threads/done", noteInboxWriteBeforeReply, async (req, res) 
     res.json({ ok: true });
   } catch (err) {
     if (err instanceof DoneFrontierRequiredError) {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(400).json({ error: err.message, code: err.code });
       return;
     }
     if (err instanceof DoneFrontierBeyondLatestError || err instanceof DoneFrontierAboveInt4AuthorityError) {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(409).json({ error: err.message, code: err.code });
       return;
     }
     if (err instanceof ReadMutationError && err.code === "SCOPE_NOT_FOUND") {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(404).json({ error: "Thread not found" });
       return;
     }
@@ -2638,17 +2767,17 @@ channelRouter.post("/threads/undone", noteInboxWriteBeforeReply, async (req, res
   try {
     const { threadChannelId } = req.body;
     if (!threadChannelId) {
-      res.status(400).json({ error: "threadChannelId is required" });
+      refuse(res, 400, { code: "thread_channel_id_required", error: "threadChannelId is required" });
       return;
     }
     const channel = await channelService.getChannel(threadChannelId);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Thread not found" });
+      refuse(res, 404, HUMAN_THREAD_NOT_FOUND_REFUSAL);
       return;
     }
     const canAccess = await channelService.canUserAccessChannel(threadChannelId, req.userId!, req.serverId!);
     if (!canAccess) {
-      res.status(404).json({ error: "Thread not found" });
+      refuse(res, 404, HUMAN_THREAD_NOT_FOUND_REFUSAL);
       return;
     }
     await channelService.undoneThread(req.userId!, threadChannelId);
@@ -2711,11 +2840,11 @@ channelRouter.post("/saved", async (req, res) => {
   try {
     const { messageId, saved } = req.body;
     if (!messageId || typeof messageId !== "string") {
-      res.status(400).json({ error: "messageId is required" });
+      refuse(res, 400, { code: "message_id_required", error: "messageId is required" });
       return;
     }
     if (saved !== undefined && typeof saved !== "boolean") {
-      res.status(400).json({ error: "saved must be true or false" });
+      refuse(res, 400, { code: "saved_flag_invalid", error: "saved must be true or false" });
       return;
     }
     if (saved === false) {
@@ -2728,7 +2857,7 @@ channelRouter.post("/saved", async (req, res) => {
     // canonical storage, so raw message.channelId/serverId is not enough.
     const canAccess = await savedService.canSaveMessage(req.userId!, req.serverId!, messageId);
     if (!canAccess) {
-      res.status(404).json({ error: "Message not found" });
+      refuse(res, 404, HUMAN_MESSAGE_NOT_FOUND_REFUSAL);
       return;
     }
     // Saving also follows the message's thread (thread contract D, db/schema.ts).
@@ -2758,15 +2887,15 @@ channelRouter.post("/saved/check", async (req, res) => {
   try {
     const { messageIds } = req.body;
     if (!Array.isArray(messageIds)) {
-      res.status(400).json({ error: "messageIds array is required" });
+      refuse(res, 400, { code: "message_ids_required", error: "messageIds array is required" });
       return;
     }
     if (messageIds.length > 200) {
-      res.status(400).json({ error: "Maximum 200 messageIds per request" });
+      refuse(res, 400, { code: "message_ids_too_many", error: "Maximum 200 messageIds per request" });
       return;
     }
     if (!messageIds.every((id: unknown) => typeof id === "string")) {
-      res.status(400).json({ error: "messageIds must be strings" });
+      refuse(res, 400, { code: "message_ids_invalid", error: "messageIds must be strings" });
       return;
     }
     // Clients may include ids of messages that only exist locally (e.g. `local-send-…` optimistic
@@ -2804,17 +2933,17 @@ function parseRegularChannelVisibility(raw: unknown): channelService.RegularChan
 channelRouter.post("/system/all/hide", async (req, res) => {
   try {
     if (!(await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "changeChannelVisibility"))) {
-      res.status(403).json({ error: "Only admins can hide #all" });
+      refuse(res, 403, { code: "all_channel_visibility_forbidden", error: "Only admins can hide #all" });
       return;
     }
 
     const channel = await channelService.getSystemAllChannel(req.serverId!);
     if (!channel) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, SYSTEM_ALL_NOT_FOUND_REFUSAL);
       return;
     }
     if (channel.archivedAt) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, { code: "channel_archived", error: "This channel is archived" });
       return;
     }
 
@@ -2858,17 +2987,17 @@ channelRouter.post("/system/all/hide", async (req, res) => {
 channelRouter.post("/system/all/restore", async (req, res) => {
   try {
     if (!(await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "changeChannelVisibility"))) {
-      res.status(403).json({ error: "Only admins can restore #all" });
+      refuse(res, 403, { code: "all_channel_visibility_forbidden", error: "Only admins can restore #all" });
       return;
     }
 
     const channel = await channelService.getSystemAllChannel(req.serverId!);
     if (!channel) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, SYSTEM_ALL_NOT_FOUND_REFUSAL);
       return;
     }
     if (channel.archivedAt) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, { code: "channel_archived", error: "This channel is archived" });
       return;
     }
 
@@ -2885,14 +3014,19 @@ channelRouter.post("/system/all/restore", async (req, res) => {
 
 // Update channel (name / description / visibility)
 /** A person's 409 for a name an archived channel holds: specific only if they can see it (archivedNameCollision.ts). */
-function humanArchivedNameCollisionBody(req: Request, err: channelService.ArchivedNameCollisionError) {
+function humanArchivedNameCollisionBody(
+  req: Request,
+  err: channelService.ArchivedNameCollisionError,
+  /** The holder's server, when it may not be the request's (a multi-server accept). */
+  serverId: ServerId = req.serverId!,
+) {
   return archivedNameCollisionBody(
     err,
-    { type: "user", id: req.userId!, serverId: req.serverId! },
+    { type: "user", id: req.userId!, serverId },
     async () => err.archivedChannelType === "channel" || err.archivedChannelType === "private"
-      ? actorHasChannelCapability(req.serverId!, err.archivedChannelId, "user", req.userId!, "archiveChannels")
+      ? actorHasChannelCapability(serverId, err.archivedChannelId, "user", req.userId!, "archiveChannels")
       : err.archivedChannelType === "joint"
-        && actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "archiveChannels"),
+        && actorHasServerCapabilityInServer(serverId, "user", req.userId!, "archiveChannels"),
   );
 }
 
@@ -2913,6 +3047,9 @@ const VISITOR_VISIBILITY_REQUIRES_PUBLIC_SERVER: RefusalInput = {
   error: "Make the server public before making its channels visible to visitors",
   code: "visitor_visibility_requires_public_server",
 };
+/** PATCH /api/channels/:id refusals said in more than one place. */
+const CHANNEL_METADATA_EDIT_FORBIDDEN_REFUSAL: RefusalInput = { code: "channel_metadata_edit_forbidden", error: "You do not have permission to edit channel metadata" };
+const CHANNEL_UPDATE_CAPABILITY_REQUIRED_REFUSAL: RefusalInput = { code: "channel_update_capability_required", error: "You do not have permission to update channels" };
 
 /**
  * `visitorVisible`, or `guestVisible`, the legacy name older clients still
@@ -2961,7 +3098,7 @@ channelRouter.patch("/:id", async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     const [canEditChannelMetadata, canChangeChannelVisibility, canManageVisitorAccess] = await Promise.all([
@@ -2975,54 +3112,28 @@ channelRouter.patch("/:id", async (req, res) => {
     const isHiddenAllChannel = channelService.isAllSystemChannel(channel)
       && !channelService.isEnabledAllChannel(channel);
     if (isHiddenAllChannel && !canManageRequestedChange) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (!isHiddenAllChannel && !await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     // DMs cannot be renamed/updated
     if (channel.type === "dm") {
-      res.status(403).json({ error: "Cannot edit DM channels" });
+      refuse(res, 403, { code: "channel_update_forbidden", error: "Cannot edit DM channels" });
       return;
     }
     if (channel.archivedAt) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, { code: "channel_archived", error: "This channel is archived" });
       return;
     }
     // guestJoinable is retired (#wg-rbac:#47): a Guest never joins a channel
     // itself, so the field is no longer read. visitorVisible (legacy alias
     // guestVisible) puts the channel on its public server's page for
     // signed-out visitors (cindyz, #wg-rbac:#51, msg 4987425b).
-    const { name, description, visibility, threadSort } = req.body;
+    const { name, description, visibility } = req.body;
     const visitorVisibilityRequested = req.body.visitorVisible !== undefined || req.body.guestVisible !== undefined;
-    // Forum-style channels (#proj-chat:#24): behind channel_thread_sort_v0
-    // (404 while off, like an unknown field), editChannelMetadata like the name,
-    // regular channels only (not joint, DM, thread or task).
-    if (threadSort !== undefined) {
-      const threadSortGate = await evaluateFeatureFlag({
-        key: CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY,
-        serverId: req.serverId!,
-        userId: req.userId!,
-      });
-      if (!threadSortGate.enabled) {
-        res.status(404).json({ error: "Thread sort is not enabled" });
-        return;
-      }
-      if (!canEditChannelMetadata) {
-        res.status(403).json({ error: "You do not have permission to edit channel metadata" });
-        return;
-      }
-      if (!isChannelThreadSort(threadSort)) {
-        res.status(400).json({ error: "threadSort must be one of: time, activity" });
-        return;
-      }
-      if (!channelTypeSupportsThreadSort(channel.type)) {
-        res.status(400).json({ error: "Thread sort is supported only for ordinary channels", code: "thread_sort_unsupported" });
-        return;
-      }
-    }
     // Channel announcements (#proj-chat:#29): behind channel_announcement_v0,
     // editChannelMetadata like the name, an Artifact homed in this channel
     // (channelAnnouncements.ts; null removes it).
@@ -3041,11 +3152,11 @@ channelRouter.patch("/:id", async (req, res) => {
       announcementArtifactId = change.artifactId;
     }
     if ((name !== undefined || description !== undefined) && !canEditChannelMetadata) {
-      res.status(403).json({ error: "You do not have permission to edit channel metadata" });
+      refuse(res, 403, CHANNEL_METADATA_EDIT_FORBIDDEN_REFUSAL);
       return;
     }
     if (visibility !== undefined && !canChangeChannelVisibility) {
-      res.status(403).json({ error: "You do not have permission to change channel visibility" });
+      refuse(res, 403, { code: "channel_visibility_change_forbidden", error: "You do not have permission to change channel visibility" });
       return;
     }
     if (visitorVisibilityRequested && !canManageVisitorAccess) {
@@ -3059,25 +3170,25 @@ channelRouter.patch("/:id", async (req, res) => {
     }
     const visitorVisible = parsedVisitorVisible.value;
     if (name === undefined && description === undefined && visibility === undefined && !visitorVisibilityRequested && !canEditChannelMetadata) {
-      res.status(403).json({ error: "You do not have permission to update channels" });
+      refuse(res, 403, CHANNEL_UPDATE_CAPABILITY_REQUIRED_REFUSAL);
       return;
     }
     if (name !== undefined) {
       const nameError = validateName(name, "Channel name");
       if (nameError) {
-        res.status(400).json({ error: nameError });
+        refuse(res, 400, { code: "channel_name_invalid", error: nameError });
         return;
       }
     }
     if (description !== undefined && (typeof description !== "string" || description.length > 500)) {
-      res.status(400).json({ error: "Description must be a string of at most 500 characters" });
+      refuse(res, 400, { code: "channel_description_invalid", error: "Description must be a string of at most 500 characters" });
       return;
     }
     let type: channelService.RegularChannelType | undefined;
     try {
       type = parseRegularChannelVisibility(visibility);
     } catch {
-      res.status(400).json({ error: "visibility must be one of: public, private" });
+      refuse(res, 400, { code: "channel_visibility_invalid", error: "visibility must be one of: public, private" });
       return;
     }
     // #all is never reachable through the generic visibility field (@cindyz,
@@ -3092,10 +3203,7 @@ channelRouter.patch("/:id", async (req, res) => {
     // the day anything writes an explicit #all row the gate would reopen silently
     // and no test would go red.
     if (visibility !== undefined && channelService.isAllSystemChannel(channel)) {
-      res.status(403).json({
-        error: channelService.ALL_CHANNEL_VISIBILITY_REFUSAL,
-        code: "all_channel_visibility_managed_separately",
-      });
+      refuse(res, 403, { code: "all_channel_visibility_managed_separately", error: channelService.ALL_CHANNEL_VISIBILITY_REFUSAL });
       return;
     }
     // Both humans and agents must be members of the channel whose visibility they
@@ -3105,10 +3213,7 @@ channelRouter.patch("/:id", async (req, res) => {
     // just created. Requiring membership up front means the actor holds a row,
     // and ordinary channels preserve rows across the transition.
     if (visibility !== undefined && !await channelService.isChannelHuman(channel.id, req.userId!)) {
-      res.status(403).json({
-        error: "You must be a member of this channel to change its visibility",
-        code: "channel_membership_required",
-      });
+      refuse(res, 403, { code: "channel_membership_required", error: "You must be a member of this channel to change its visibility" });
       return;
     }
     if (visitorVisible !== undefined && channel.type !== "channel" && channel.type !== "private") {
@@ -3126,7 +3231,7 @@ channelRouter.patch("/:id", async (req, res) => {
       }
     }
     const requiredCapabilities: ServerCapability[] = [];
-    if (name !== undefined || description !== undefined || threadSort !== undefined || announcementArtifactId !== undefined) requiredCapabilities.push("editChannelMetadata");
+    if (name !== undefined || description !== undefined || announcementArtifactId !== undefined) requiredCapabilities.push("editChannelMetadata");
     if (visibility !== undefined) requiredCapabilities.push("changeChannelVisibility");
     if (visitorVisible !== undefined) requiredCapabilities.push("manageVisitorAccess");
     // The announcement as it was under the lock: which change the event line names (set, replaced, removed).
@@ -3151,7 +3256,6 @@ channelRouter.patch("/:id", async (req, res) => {
         description,
         type,
         guestVisible: visitorVisible,
-        threadSort,
         announcementArtifactId,
       }, tx);
       // Also when making the channel private turned it off.
@@ -3218,19 +3322,19 @@ channelRouter.patch("/:id", async (req, res) => {
     if (err instanceof RefusalError) {
       refuse(res, err.status, err.refusal);
     } else if (err instanceof channelService.ExternalMembersKeepPrivateError) {
-      res.status(409).json({ error: err.message, code: err.code });
+      refuse(res, 409, { code: err.code, error: err.message });
     } else if (err instanceof AgentLoungeImmutableError) {
-      res.status(409).json({ error: err.message, code: err.code });
+      refuse(res, 409, { code: err.code, error: err.message });
     } else if (msg === "Channel capability required") {
-      res.status(403).json({ error: "You do not have permission to update channels" });
+      refuse(res, 403, CHANNEL_UPDATE_CAPABILITY_REQUIRED_REFUSAL);
     } else if (err instanceof channelService.ArchivedNameCollisionError) {
+      // refusal-ok: the archived-name body: the web reads top-level archivedChannelId/Name/Type and canUnarchiveArchivedChannel (archivedNameCollision.ts)
       res.status(409).json(await humanArchivedNameCollisionBody(req, err));
     } else if (msg.includes("already taken")) {
+      // refusal-ok: must stay byte-identical to the hidden archived-name body (archivedNameCollision.ts), no existence oracle (#proj-chat:#19)
       res.status(409).json({ error: msg });
-    } else if (msg === "Thread sort is supported only for ordinary channels") {
-      res.status(400).json({ error: msg, code: "thread_sort_unsupported" });
     } else if (msg.includes("Cannot rename") || msg.includes("Cannot edit") || msg === channelService.JOINT_VISIBILITY_FIXED_MESSAGE || msg.includes("reserved")) {
-      res.status(403).json({ error: msg });
+      refuse(res, 403, serviceMessageRefusal("channel_update_forbidden", msg, "This channel can't be changed that way."));
     } else {
       res.status(500).json({ error: "Failed to update channel" });
     }
@@ -3244,6 +3348,7 @@ channelRouter.get("/:id/files", async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
+      // refusal-ok: must stay byte-identical to denyChannelAccess's 404 below (channelAccessDenial.ts), no existence oracle
       res.status(404).json(CHANNEL_NOT_FOUND_BODY);
       return;
     }
@@ -3260,7 +3365,7 @@ channelRouter.get("/:id/files", async (req, res) => {
     try {
       cursor = parseChannelFilesCursor(req.query.cursor);
     } catch {
-      res.status(400).json({ error: "Invalid cursor" });
+      refuse(res, 400, { code: "channel_files_cursor_invalid", error: "Invalid cursor" });
       return;
     }
     // Task v2: attachments posted in the channel's task conversations are
@@ -3316,16 +3421,18 @@ async function resolveActivityMuteTarget(req: Request, res: Response) {
   const channelId = typeof req.params.id === "string" ? req.params.id : req.params.id[0];
   const channel = await channelService.getChannel(channelId);
   if (!channel || channel.serverId !== req.serverId) {
-    res.status(404).json({ error: "Channel not found" });
+    refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
+    return null;
+  }
+  // Visibility before the shape check: a thread, DM or task the caller
+  // can't see answers the same 404 as a missing id, not the 400 below.
+  const canAccess = await channelService.canUserAccessChannel(channel.id, req.userId!, req.serverId!);
+  if (!canAccess) {
+    refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
     return null;
   }
   if (isSubConversationType(channel.type)) {
-    res.status(400).json({ error: "Thread notification settings are managed via follow/unfollow" });
-    return null;
-  }
-  const canAccess = await channelService.canUserAccessChannel(channel.id, req.userId!, req.serverId!);
-  if (!canAccess) {
-    res.status(404).json({ error: "Channel not found" });
+    refuse(res, 400, { code: "thread_notification_settings_unsupported", error: "Thread notification settings are managed via follow/unfollow" });
     return null;
   }
   return channel;
@@ -3335,11 +3442,17 @@ async function resolveMessageDisplayPrefsTarget(req: Request, res: Response) {
   const channelId = typeof req.params.id === "string" ? req.params.id : req.params.id[0];
   const channel = await channelService.getChannel(channelId);
   if (!channel || channel.serverId !== req.serverId) {
-    res.status(404).json({ error: "Channel not found" });
+    refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
     return null;
   }
   if (isSubConversationType(channel.type)) {
-    res.status(400).json({ error: "Thread message display settings are managed by the parent channel" });
+    // A sub-conversation the caller can't see answers the same 404 as a
+    // missing id; only a visible one is told where its settings live.
+    if (!await channelService.canUserAccessChannel(channel.id, req.userId!, req.serverId!)) {
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
+      return null;
+    }
+    refuse(res, 400, { code: "thread_message_display_settings_unsupported", error: "Thread message display settings are managed by the parent channel" });
     return null;
   }
   // Display prefs are a per-user "my channel" setting, so the gate is channel
@@ -3353,7 +3466,7 @@ async function resolveMessageDisplayPrefsTarget(req: Request, res: Response) {
       ? await channelService.isChannelHuman(channel.id, req.userId!)
       : await channelService.canUserAccessChannel(channel.id, req.userId!, req.serverId!);
   if (!isPrefsMember) {
-    res.status(404).json({ error: "Channel not found" });
+    refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
     return null;
   }
   return channel;
@@ -3392,7 +3505,7 @@ channelRouter.patch("/:id/notification-settings", noteInboxWriteBeforeReply, asy
     const channel = await resolveActivityMuteTarget(req, res);
     if (!channel) return;
     if (typeof req.body?.activityMuted !== "boolean") {
-      res.status(400).json({ error: "activityMuted must be a boolean" });
+      refuse(res, 400, { code: "activity_muted_invalid", error: "activityMuted must be a boolean" });
       return;
     }
     const activityMuteSupported = await channelService.userActivityMuteSupported(channel);
@@ -3400,7 +3513,7 @@ channelRouter.patch("/:id/notification-settings", noteInboxWriteBeforeReply, asy
     // ordinary agent, or a removed bot's DM). Unmuting is always accepted, so a
     // mute stored before the DM stopped qualifying can still be undone.
     if (req.body.activityMuted && !activityMuteSupported) {
-      res.status(400).json({ error: "This conversation can't be muted", code: "ACTIVITY_MUTE_NOT_SUPPORTED" });
+      refuse(res, 400, { code: "ACTIVITY_MUTE_NOT_SUPPORTED", error: "This conversation can't be muted" });
       return;
     }
     const state = await channelService.setInboxTargetActivityMuteState({
@@ -3483,7 +3596,7 @@ channelRouter.patch("/:id/message-display-settings", async (req, res) => {
     const channel = await resolveMessageDisplayPrefsTarget(req, res);
     if (!channel) return;
     if (typeof req.body?.collapseLongMessages !== "boolean") {
-      res.status(400).json({ error: "collapseLongMessages must be a boolean" });
+      refuse(res, 400, { code: "collapse_long_messages_invalid", error: "collapseLongMessages must be a boolean" });
       return;
     }
     const prefs = await channelService.setUserChannelMessageDisplayPrefs({
@@ -3532,14 +3645,11 @@ channelRouter.post("/conversion-jobs/:jobId/retry", async (req, res) => {
     const job = await requireVisibleChannelConversionJob(req, res);
     if (!job) return;
     if (!(await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "federateChannels"))) {
-      res.status(403).json({ error: "Only admins can retry channel conversion", code: "forbidden" });
+      refuse(res, 403, { code: "forbidden", error: "Only admins can retry channel conversion" });
       return;
     }
     if (job.status !== "failed") {
-      res.status(409).json({
-        error: "Only a failed conversion can be retried",
-        code: "channel_conversion_retry_not_allowed",
-      });
+      refuse(res, 409, { code: "channel_conversion_retry_not_allowed", error: "Only a failed conversion can be retried" });
       return;
     }
     const retried = await runConversionCommand({
@@ -3601,7 +3711,7 @@ channelRouter.post("/conversion-jobs/:jobId/cancel", async (req, res) => {
     const job = await requireVisibleChannelConversionJob(req, res);
     if (!job) return;
     if (!(await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "federateChannels"))) {
-      res.status(403).json({ error: "Only admins can cancel channel conversion", code: "forbidden" });
+      refuse(res, 403, { code: "forbidden", error: "Only admins can cancel channel conversion" });
       return;
     }
     const canceled = await runConversionCommand({
@@ -3634,12 +3744,14 @@ channelRouter.get("/:id", async (req, res) => {
     // A non-uuid :id already 404'd in the router.param guard (task #12).
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
+      // refusal-ok: the web tells a channel it can't open by this 404 without a code (web/src/store/channelAccessLoss.ts isChannelAccessDenial)
       res.status(404).json({ error: "Channel not found" });
       return;
     }
     // Every type uses the same current read policy. Threads inherit their
     // parent policy, and public channels still need Guest visibility checks.
     if (!await channelService.canUserAccessChannel(channel.id, req.userId!, req.serverId!)) {
+      // refusal-ok: the web tells a channel it can't open by this 404 without a code (web/src/store/channelAccessLoss.ts isChannelAccessDenial)
       res.status(404).json({ error: "Channel not found" });
       return;
     }
@@ -3730,25 +3842,30 @@ channelRouter.get("/:id", async (req, res) => {
   }
 });
 
+const CHANNEL_ARCHIVE_FORBIDDEN_REFUSAL: RefusalInput = { code: "channel_archive_forbidden", error: "Only admins can archive channels" };
+const CHANNEL_UNARCHIVE_FORBIDDEN_REFUSAL: RefusalInput = { code: "channel_unarchive_forbidden", error: "Only admins can unarchive channels" };
+
 // Archive channel (freezes writes, preserves name)
 channelRouter.post("/:id/archive", async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
+      return;
+    }
+    // Visibility before the shape check: a DM, thread or task the caller
+    // can't see answers the same 404 as a missing id.
+    if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (!["channel", "private", "joint"].includes(channel.type)) {
-      res.status(400).json({ error: "Only regular channels can be archived" });
-      return;
-    }
-    if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 400, { code: "channel_archive_unsupported", error: "Only regular channels can be archived" });
       return;
     }
     const canArchive = await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "archiveChannels");
     if (!canArchive) {
-      res.status(403).json({ error: "Only admins can archive channels" });
+      refuse(res, 403, CHANNEL_ARCHIVE_FORBIDDEN_REFUSAL);
       return;
     }
 
@@ -3782,11 +3899,11 @@ channelRouter.post("/:id/archive", async (req, res) => {
   } catch (err: any) {
     const msg = err?.message || "";
     if (msg === "Channel capability required") {
-      res.status(403).json({ error: "Only admins can archive channels" });
+      refuse(res, 403, CHANNEL_ARCHIVE_FORBIDDEN_REFUSAL);
     } else if (msg.includes("#all") || msg.includes("Only regular")) {
-      res.status(400).json({ error: msg });
+      refuse(res, 400, serviceMessageRefusal("channel_archive_unsupported", msg, "Only regular channels can be archived"));
     } else if (msg === "Channel not found") {
-      res.status(404).json({ error: msg });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
     } else {
       res.status(500).json({ error: "Failed to archive channel" });
     }
@@ -3798,11 +3915,7 @@ channelRouter.post("/:id/unarchive", async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
-      return;
-    }
-    if (!["channel", "private", "joint"].includes(channel.type)) {
-      res.status(400).json({ error: "Only regular channels can be unarchived" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     // A host owner/admin may bring back the host's archived joint copy when
@@ -3810,12 +3923,18 @@ channelRouter.post("/:id/unarchive", async (req, res) => {
     // unarchive rejoins them. Anyone else gets today's refusal.
     if (!await canSeeChannel(channel, req.userId!, req.serverId!)
       && !(channel.type === "joint" && await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "archiveChannels"))) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
+      return;
+    }
+    // After visibility, so a DM, thread or task the caller can't see answers
+    // the same 404 as a missing id.
+    if (!["channel", "private", "joint"].includes(channel.type)) {
+      refuse(res, 400, { code: "channel_unarchive_unsupported", error: "Only regular channels can be unarchived" });
       return;
     }
     const canUnarchive = await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "archiveChannels");
     if (!canUnarchive) {
-      res.status(403).json({ error: "Only admins can unarchive channels" });
+      refuse(res, 403, CHANNEL_UNARCHIVE_FORBIDDEN_REFUSAL);
       return;
     }
 
@@ -3867,7 +3986,8 @@ channelRouter.post("/:id/unarchive", async (req, res) => {
       const user = await userService.getUser(req.userId!);
       const userName = user?.displayName || user?.name || "Someone";
       const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
-      messageService.broadcastSystemMessage(io, agentOrchestrator, req.params.id,
+      // Joint-aware: a joint's notice goes to canonical storage, fanned out to every server (slock issue 15637).
+      messageService.broadcastSystemMessageToLocalSurfaces(io, agentOrchestrator, req.params.id,
         `📤 ${userName} unarchived this channel`, {
           inboxFactPolicy: {
             mode: "record",
@@ -3888,37 +4008,39 @@ channelRouter.post("/:id/unarchive", async (req, res) => {
     if (sendExternalLimitError(res, err, req)) return;
     const msg = err?.message || "";
     if (msg === "Channel capability required") {
-      res.status(403).json({ error: "Only admins can unarchive channels" });
+      refuse(res, 403, CHANNEL_UNARCHIVE_FORBIDDEN_REFUSAL);
     } else if (msg.includes("Only regular")) {
-      res.status(400).json({ error: msg });
+      refuse(res, 400, serviceMessageRefusal("channel_unarchive_unsupported", msg, "Only regular channels can be unarchived"));
     } else if (msg === "Channel not found") {
-      res.status(404).json({ error: msg });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
     } else {
       res.status(500).json({ error: "Failed to unarchive channel" });
     }
   }
 });
 
+const CHANNEL_DELETE_FORBIDDEN_REFUSAL: RefusalInput = { code: "channel_delete_forbidden", error: "Only admins can delete channels" };
+
 // Delete channel
 channelRouter.delete("/:id", async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (channel.type === "joint") {
-      res.status(400).json({ error: "Joint channels cannot be deleted; disconnect this server instead" });
+      refuse(res, 400, { code: "channel_delete_unsupported", error: "Joint channels cannot be deleted; disconnect this server instead" });
       return;
     }
     // DMs: only participants can delete; regular/private channels: admin/owner only
     if (channel.type !== "dm") {
       if (!(await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "deleteChannels"))) {
-        res.status(403).json({ error: "Only admins can delete channels" });
+        refuse(res, 403, CHANNEL_DELETE_FORBIDDEN_REFUSAL);
         return;
       }
     }
@@ -3928,9 +4050,9 @@ channelRouter.delete("/:id", async (req, res) => {
     const msg = err?.message || "";
     // The deleter's account retired or being deleted meanwhile (deleteChannel): as one who may not delete it.
     if (err instanceof JointActorUnavailableError) {
-      res.status(403).json({ error: "Only admins can delete channels" });
+      refuse(res, 403, CHANNEL_DELETE_FORBIDDEN_REFUSAL);
     } else if (msg.includes("cannot be deleted")) {
-      res.status(403).json({ error: msg });
+      refuse(res, 403, serviceMessageRefusal("all_channel_delete_forbidden", msg, "The #all channel cannot be deleted"));
     } else {
       res.status(500).json({ error: "Failed to delete channel" });
     }
@@ -3941,22 +4063,24 @@ channelRouter.post("/:id/disconnect", async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
+      return;
+    }
+    // Visibility first, for admins too: a channel the caller can't open reads
+    // like a missing id, before the shape 400 and before the service (which
+    // also requires the admin to be able to open it). A non-host copy whose
+    // last member left is disconnected automatically
+    // (jointHumanMembershipMirror), so none is stranded.
+    if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (channel.type !== "joint") {
-      res.status(400).json({ error: "Only joint channels can be disconnected" });
+      refuse(res, 400, { code: "channel_disconnect_unsupported", error: "Only joint channels can be disconnected" });
       return;
     }
-    // The server capability is checked here; disconnectJointChannel also requires the admin to be able to open the
-    // channel. A non-host copy whose last member left is disconnected
-    // automatically (jointHumanMembershipMirror), so none is stranded.
     if (!(await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "federateChannels"))) {
-      if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
-        res.status(404).json({ error: "Channel not found" });
-        return;
-      }
-      res.status(403).json({ error: "Only admins can disconnect joint channels" });
+      refuse(res, 403, { code: "channel_disconnect_forbidden", error: "Only admins can disconnect joint channels" });
       return;
     }
 
@@ -3979,25 +4103,27 @@ channelRouter.post("/:id/disconnect", async (req, res) => {
   } catch (err: any) {
     const msg = err?.message || "";
     if (err instanceof channelService.JointHostDisconnectError) {
-      res.status(403).json({ error: err.message, code: err.code });
+      refuse(res, 403, { code: err.code, error: err.message });
     } else if (err instanceof channelService.JointGuestsPresentError) {
       refuse(res, 409, { code: err.code, error: err.message });
     } else if (msg === "Joint channel not found" || msg === "Channel not found") {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
+    } else if (msg === "Channel capability required") {
+      // The service's recheck under its locks. A channel the caller can no
+      // longer open reads like a missing id; otherwise it is the admin refusal.
+      const channel = await channelService.getChannel(req.params.id).catch(() => null);
+      if (!channel || !await canSeeChannel(channel, req.userId!, req.serverId!).catch(() => false)) {
+        refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
+      } else {
+        refuse(res, 403, { code: "channel_disconnect_forbidden", error: "Only admins can disconnect joint channels" });
+      }
     } else if (msg.includes("Only joint")) {
-      res.status(400).json({ error: msg });
+      refuse(res, 400, serviceMessageRefusal("channel_disconnect_unsupported", msg, "Only joint channels can be disconnected"));
     } else {
       res.status(500).json({ error: "Failed to disconnect joint channel" });
     }
   }
 });
-
-/** The 404 every channel route here answers for a channel that is missing or
- * hidden from the caller: byte-identical, so the two can't be told apart. */
-function channelNotFound(res: Response) {
-  // refusal-ok: must stay byte-identical to this router's other "Channel not found" 404s (no existence oracle)
-  res.status(404).json({ error: "Channel not found" });
-}
 
 /**
  * The host's owner/admin disconnects a participant server from a joint channel
@@ -4009,11 +4135,11 @@ channelRouter.post("/:id/joint-servers/:serverId/disconnect", async (req, res) =
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId || !await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      channelNotFound(res);
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (!(await evaluateFeatureFlag({ key: EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, serverId: req.serverId!, userId: req.userId! })).enabled) {
-      channelNotFound(res);
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (channel.type !== "joint") {
@@ -4056,7 +4182,7 @@ channelRouter.post("/:id/joint-servers/:serverId/disconnect", async (req, res) =
     } else if (msg === "Channel capability required") {
       refuse(res, 403, { code: "forbidden", error: "Only admins of the host server can disconnect another server." });
     } else if (msg === "Channel not found") {
-      channelNotFound(res);
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
     } else {
       sendJsonServerError(req, res, {
         error: "Couldn't disconnect the server. Try again.",
@@ -4088,17 +4214,17 @@ channelRouter.get("/:id/connect-my-servers", async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId || !await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      channelNotFound(res);
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     const hostServerId = await jointMemberConnectService.memberConnectHostServerId(channel);
     if (!hostServerId || !await jointMemberConnectService.memberConnectEnabled(hostServerId, req.userId!)) {
-      channelNotFound(res);
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     const entry = await jointMemberConnectService.resolveMemberConnectEntry(channel, req.userId!);
     if (!entry) {
-      channelNotFound(res);
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     res.json({ servers: await jointMemberConnectService.listMemberConnectableServers(entry, req.userId!) });
@@ -4123,17 +4249,17 @@ channelRouter.post("/:id/connect-my-servers", async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId || !await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      channelNotFound(res);
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     const hostServerId = await jointMemberConnectService.memberConnectHostServerId(channel);
     if (!hostServerId || !await jointMemberConnectService.memberConnectEnabled(hostServerId, req.userId!)) {
-      channelNotFound(res);
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     const entry = await jointMemberConnectService.resolveMemberConnectEntry(channel, req.userId!);
     if (!entry) {
-      channelNotFound(res);
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     // From here on the attempt is made: each way it ends is a row (the 404s above are not attempts).
@@ -4162,7 +4288,7 @@ channelRouter.post("/:id/connect-my-servers", async (req, res) => {
     } else if (err instanceof externalInviteConnectService.ExternalConnectError && err.code === "invalid_server") {
       refuse(res, 400, { code: "invalid_input", error: "serverIds must be a list of 1 to 29 servers" });
     } else if (err instanceof externalInviteService.ExternalInviteError && err.code === "not_found") {
-      channelNotFound(res);
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
     } else if (err instanceof externalInviteService.ExternalInviteError) {
       refuse(res, 409, { code: err.code, error: err.message });
     } else {
@@ -4181,19 +4307,20 @@ channelRouter.post("/:id/joint-invite/resend", async (req, res) => {
     if (await refuseRetiredJointEntryWithExternalChannels(req, res, "joint_server_invite_retired")) return;
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
-      return;
-    }
-    if (channel.type !== "joint") {
-      res.status(400).json({ error: "Only joint channels can resend joint invites" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
+      return;
+    }
+    // After visibility, so a channel the caller can't see reads like a missing id.
+    if (channel.type !== "joint") {
+      refuse(res, 400, { code: "joint_invite_resend_unsupported", error: "Only joint channels can resend joint invites" });
       return;
     }
     if (!(await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "federateChannels"))) {
-      res.status(403).json({ error: "Only admins can resend joint channel invites" });
+      refuse(res, 403, { code: "joint_invite_resend_forbidden", error: "Only admins can resend joint channel invites" });
       return;
     }
 
@@ -4219,11 +4346,11 @@ channelRouter.post("/:id/joint-invite/resend", async (req, res) => {
     if (err instanceof RefusalError) {
       refuse(res, err.status, err.refusal);
     } else if (msg === "Joint channel not found" || msg === "Channel not found") {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
     } else if (msg.includes("No pending")) {
-      res.status(409).json({ error: msg });
+      refuse(res, 409, serviceMessageRefusal("joint_invite_none_pending", msg, "No pending joint channel invite found"));
     } else if (msg.includes("Only joint")) {
-      res.status(400).json({ error: msg });
+      refuse(res, 400, serviceMessageRefusal("joint_invite_resend_unsupported", msg, "Only joint channels can resend joint invites"));
     } else {
       res.status(500).json({ error: "Failed to resend joint channel invite" });
     }
@@ -4237,36 +4364,39 @@ channelRouter.post("/:id/convert-to-joint", (_req, res) => {
   refuseRetiredJointEntry(res, "joint_conversion_retired");
 });
 
+const JOINT_INVITE_FORBIDDEN_REFUSAL: RefusalInput = { code: "joint_invite_forbidden", error: "Only admins can invite servers to joint channels" };
+
 channelRouter.post("/:id/joint-invites", async (req, res) => {
   try {
     if (await refuseRetiredJointEntryWithExternalChannels(req, res, "joint_server_invite_retired")) return;
     const { targetServerSlug, invitedPeople, sameAdmin } = req.body || {};
     if (typeof targetServerSlug !== "string" || !targetServerSlug.trim()) {
-      res.status(400).json({ error: "Invite server slug is required" });
+      refuse(res, 400, { code: "joint_invite_server_required", error: "Invite server slug is required" });
       return;
     }
     const selectedInvitedPeople = normalizeStringList(invitedPeople, channelService.MAX_JOINT_CHANNEL_INVITED_PEOPLE_PER_TARGET);
     if (selectedInvitedPeople.length === 0) {
-      res.status(400).json({ error: "At least one invited person is required" });
+      refuse(res, 400, { code: "joint_invite_people_required", error: "At least one invited person is required" });
       return;
     }
     if (!await admitJointInviteOrRefuse(req, res, selectedInvitedPeople.length)) return;
 
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
-      return;
-    }
-    if (channel.type !== "joint") {
-      res.status(400).json({ error: "Only joint channels can invite servers" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
+      return;
+    }
+    // After visibility, so a channel the caller can't see reads like a missing id.
+    if (channel.type !== "joint") {
+      refuse(res, 400, { code: "joint_invite_unsupported", error: "Only joint channels can invite servers" });
       return;
     }
     if (!(await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "federateChannels"))) {
-      res.status(403).json({ error: "Only admins can invite servers to joint channels" });
+      refuse(res, 403, JOINT_INVITE_FORBIDDEN_REFUSAL);
       return;
     }
 
@@ -4288,12 +4418,12 @@ channelRouter.post("/:id/joint-invites", async (req, res) => {
     if (sendJointLimitError(res, err, req)) return;
     // The inviter's account retired or being deleted meanwhile (inviteServerToJointChannel): as one who may not federate.
     if (err instanceof JointActorUnavailableError) {
-      res.status(403).json({ error: "Only admins can invite servers to joint channels" });
+      refuse(res, 403, JOINT_INVITE_FORBIDDEN_REFUSAL);
       return;
     }
     const msg = err?.message || "";
     if (msg === "Joint channel not found" || msg === "Channel not found") {
-      res.status(404).json({ error: msg === "Joint channel not found" ? "Channel not found" : msg });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
     } else {
       sendJsonServerError(req, res, {
         error: "Failed to invite server to joint channel",
@@ -4335,13 +4465,13 @@ async function admitExternalInviteRequest(req: Request, res: Response, opts: { u
   if (!opts.ungated) {
     const flag = await evaluateFeatureFlag({ key: EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, serverId: req.serverId!, userId: req.userId! });
     if (!flag.enabled) {
-      res.status(404).json({ error: "Not found" });
+      refuse(res, 404, EXTERNAL_CHANNELS_OFF_REFUSAL);
       return false;
     }
   }
   const channel = await channelService.getChannel(String(req.params.id));
   if (!channel || channel.serverId !== req.serverId || !await canSeeChannel(channel, req.userId!, req.serverId!)) {
-    res.status(404).json({ error: "Channel not found" });
+    refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
     return false;
   }
   return true;
@@ -4352,6 +4482,18 @@ function parseExternalInviteEmails(body: unknown): string[] | null {
   const emails = (body as { emails?: unknown } | null)?.emails;
   if (!Array.isArray(emails) || emails.length === 0 || emails.length > externalInviteService.EXTERNAL_INVITE_MAX_ENTRIES) return null;
   return emails.every((email): email is string => typeof email === "string") ? emails : null;
+}
+
+/**
+ * A send's optional `connectInviteMemberEmails`: the host's members among
+ * `emails` who also get an invite to connect a server of theirs (the review's
+ * "Invite to connect"). Absent: none. Undefined when malformed.
+ */
+function parseConnectInviteMemberEmails(body: unknown): string[] | undefined {
+  const emails = (body as { connectInviteMemberEmails?: unknown } | null)?.connectInviteMemberEmails;
+  if (emails === undefined) return [];
+  if (!Array.isArray(emails) || emails.length > externalInviteService.EXTERNAL_INVITE_MAX_ENTRIES) return undefined;
+  return emails.every((email): email is string => typeof email === "string") ? emails : undefined;
 }
 
 function sendExternalInviteError(req: Request, res: Response, err: unknown, action: string): void {
@@ -4379,10 +4521,11 @@ function emitExternalRelationChanged(req: Request, channelId: string): void {
   (req.app.get("io") as SocketServer | undefined)?.to(`channel:${channelId}`).emit("channel:updated", { channelId });
 }
 
-const INVALID_EXTERNAL_INVITE_EMAILS = {
-  error: `emails must be a list of 1 to ${externalInviteService.EXTERNAL_INVITE_MAX_ENTRIES} email addresses`,
+const INVALID_EXTERNAL_INVITE_EMAILS: RefusalInput = {
   code: "invalid_input",
+  error: `emails must be a list of 1 to ${externalInviteService.EXTERNAL_INVITE_MAX_ENTRIES} email addresses`,
 };
+const MAKE_PRIVATE_INVALID_REFUSAL: RefusalInput = { code: "invalid_input", error: "makePrivate must be a boolean" };
 
 // The review before Create Channel's External creates the channel (design
 // E1): the same preview, for the request's Server, with no channel yet.
@@ -4390,12 +4533,12 @@ channelRouter.post("/external-invites/preview", async (req, res) => {
   try {
     const flag = await evaluateFeatureFlag({ key: EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, serverId: req.serverId!, userId: req.userId! });
     if (!flag.enabled) {
-      res.status(404).json({ error: "Not found" });
+      refuse(res, 404, EXTERNAL_CHANNELS_OFF_REFUSAL);
       return;
     }
     const emails = parseExternalInviteEmails(req.body);
     if (!emails) {
-      res.status(400).json(INVALID_EXTERNAL_INVITE_EMAILS);
+      refuse(res, 400, INVALID_EXTERNAL_INVITE_EMAILS);
       return;
     }
     res.json(await externalInviteService.previewExternalInvitesForNewChannel(req.serverId!, req.userId!, emails));
@@ -4465,7 +4608,7 @@ channelRouter.post("/:id/external-invites/preview", async (req, res) => {
     if (!await admitExternalInviteRequest(req, res)) return;
     const emails = parseExternalInviteEmails(req.body);
     if (!emails) {
-      res.status(400).json(INVALID_EXTERNAL_INVITE_EMAILS);
+      refuse(res, 400, INVALID_EXTERNAL_INVITE_EMAILS);
       return;
     }
     res.json(await externalInviteService.previewExternalInvites(req.params.id, req.userId!, emails));
@@ -4480,11 +4623,20 @@ channelRouter.post("/:id/external-invites", async (req, res) => {
     const emails = parseExternalInviteEmails(req.body);
     const makePrivate = (req.body as { makePrivate?: unknown } | null)?.makePrivate;
     if (!emails || (makePrivate !== undefined && typeof makePrivate !== "boolean")) {
-      res.status(400).json(emails ? { error: "makePrivate must be a boolean", code: "invalid_input" } : INVALID_EXTERNAL_INVITE_EMAILS);
+      refuse(res, 400, emails ? MAKE_PRIVATE_INVALID_REFUSAL : INVALID_EXTERNAL_INVITE_EMAILS);
+      return;
+    }
+    const connectInviteMemberEmails = parseConnectInviteMemberEmails(req.body);
+    if (!connectInviteMemberEmails) {
+      refuse(res, 400, {
+        code: "invalid_input",
+        error: `connectInviteMemberEmails is not a list of at most ${externalInviteService.EXTERNAL_INVITE_MAX_ENTRIES} email strings, so send it as one or leave it out`,
+      });
       return;
     }
     const result = await externalInviteService.sendExternalInvites(req.params.id, req.userId!, emails, {
       makePrivate,
+      connectMemberEmails: connectInviteMemberEmails,
       onEmails: inviteEmailRecorder(req, req.userId!, "send"),
     });
     if (result.madePrivate) await publishChannelUpdate(req.app.get("io"), result.madePrivate);
@@ -4514,7 +4666,7 @@ channelRouter.post("/:id/external-connect-servers", async (req, res) => {
     attempted = true;
     if (body?.makePrivate !== undefined && typeof body.makePrivate !== "boolean") {
       recordConnectFinished(req, [{ ...row, outcome: refusedOutcome("invalid_input") }]);
-      res.status(400).json({ error: "makePrivate must be a boolean", code: "invalid_input" });
+      refuse(res, 400, MAKE_PRIVATE_INVALID_REFUSAL);
       return;
     }
     const result = await externalInviteConnectService.connectOwnServersToChannel(
@@ -4536,7 +4688,7 @@ channelRouter.post("/:id/external-connect-servers", async (req, res) => {
       recordConnectFinished(req, [{ ...row, outcome }]);
     }
     if (err instanceof externalInviteConnectService.ExternalConnectError) {
-      res.status(400).json({ error: "serverIds must be a list of 1 to 29 servers", code: "invalid_input" });
+      refuse(res, 400, { code: "invalid_input", error: "serverIds must be a list of 1 to 29 servers" });
       return;
     }
     sendExternalInviteError(req, res, err, "connect servers");
@@ -4581,11 +4733,11 @@ channelRouter.get("/:id/agents", async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     const agentList = await channelService.getChannelAgents(req.params.id);
@@ -4602,16 +4754,16 @@ channelRouter.post("/:id/stop-all-agents", async (req, res) => {
     // member's stop-all reaches only the agents that member may stop alone
     // (ones they created, their own assistant).
     if (!await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "controlAgentRuntime")) {
-      res.status(403).json({ error: "The `controlAgentRuntime` capability is required to stop all agents in a channel" });
+      refuse(res, 403, { code: "channel_agents_stop_forbidden", error: "The `controlAgentRuntime` capability is required to stop all agents in a channel" });
       return;
     }
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     const agents = await channelService.getChannelAgents(req.params.id);
@@ -4668,25 +4820,25 @@ channelRouter.post("/:id/stop-all-agents", async (req, res) => {
 channelRouter.post("/:id/resume-all-agents", async (req, res) => {
   try {
     if (!await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "controlAgentRuntime")) {
-      res.status(403).json({ error: "The `controlAgentRuntime` capability is required to resume all agents in a channel" });
+      refuse(res, 403, { code: "channel_agents_resume_forbidden", error: "The `controlAgentRuntime` capability is required to resume all agents in a channel" });
       return;
     }
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     const { prompt, agentIds } = req.body as { prompt?: string; agentIds?: unknown };
     if (prompt && (typeof prompt !== "string" || prompt.length > 10000)) {
-      res.status(400).json({ error: "Prompt must be a string under 10000 characters" });
+      refuse(res, 400, { code: "channel_agents_resume_prompt_invalid", error: "Prompt must be a string under 10000 characters" });
       return;
     }
     if (agentIds !== undefined && (!Array.isArray(agentIds) || !agentIds.every((id) => typeof id === "string"))) {
-      res.status(400).json({ error: "agentIds must be an array of agent ids" });
+      refuse(res, 400, { code: "channel_agents_resume_agent_ids_invalid", error: "agentIds must be an array of agent ids" });
       return;
     }
     // A retry names only the agents the last attempt missed, so the ones that
@@ -4748,11 +4900,15 @@ function projectJointRosterForViewer(
   rawMembers: ChannelRoster,
   viewerServerId: string,
 ): { agents: ViewerRosterAgent[]; humans: ViewerRosterHuman[] } {
-  // Another server's agent: likewise no roles (as `toJointAgentProfile`).
+  // Another server's agent: likewise no server role (as `toJointAgentProfile`);
+  // as for people, it reads as a channel admin only when it manages the
+  // channel from the host (isManager), else as a plain member.
   const members = {
     ...rawMembers,
     agents: rawMembers.agents.map((agent): ViewerRosterAgent => (
-      agent.serverId === viewerServerId ? agent : { ...agent, serverRole: null, channelRole: null }
+      agent.serverId === viewerServerId ? agent
+        : agent.isManager ? { ...agent, serverRole: null, channelRole: "admin", isManager: true }
+        : { ...agent, serverRole: null, channelRole: null, isManager: undefined }
     )),
   };
   // Computed rows say directly whether the person is in the viewer's server
@@ -4825,11 +4981,13 @@ export async function buildChannelMembersView(
       // Another server's member carries no role (projectJointRosterForViewer):
       // they read as a plain member, without a made-up server role.
       serverRole: member.serverId !== undefined && member.serverId !== viewer.serverId ? null : serverRole,
-      effectiveChannelRole: member.isManager ? "admin" : serverRole === "owner"
-        ? "owner"
-        : serverRole === "admin" || member.channelRole === "admin"
-          ? "admin"
-          : serverRole === "guest" ? "guest" : "member",
+      // A joint roster row (`isManager` set) is admin exactly when the member
+      // can manage the channel (jointAuthorityManagesChannel); a server or a
+      // stored channel role off the host's copy grants nothing there.
+      effectiveChannelRole: member.isManager ? "admin"
+        : member.isManager === undefined && serverRole === "owner" ? "owner"
+        : member.isManager === undefined && (serverRole === "admin" || member.channelRole === "admin") ? "admin"
+        : serverRole === "guest" ? "guest" : "member",
       channelAdminBasis: member.isManager !== undefined ? null : serverRole === "owner" || serverRole === "admin"
         ? member.channelRole === "admin" ? "both" : "server_role"
         : member.channelRole === "admin" ? "channel_role" : null,
@@ -4941,11 +5099,11 @@ channelRouter.get("/:id/members", async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
@@ -4955,6 +5113,13 @@ channelRouter.get("/:id/members", async (req, res) => {
   }
 });
 
+/** A thread's or task conversation's membership is its followers, as joining one answers (channelJoinService). */
+const THREAD_MEMBERSHIP_REFUSAL: RefusalInput = { code: "thread_membership", error: "Thread membership is managed via follow/unfollow" };
+const CHANNEL_MEMBER_ADD_FORBIDDEN_REFUSAL: RefusalInput = { code: "channel_member_add_forbidden", error: "You do not have permission to add channel members" };
+const USER_NOT_IN_SERVER_REFUSAL: RefusalInput = { code: "users_not_in_server", error: "User is not a member of this server" };
+/** Removing a member (agent or human) the caller's channel capability doesn't reach, before or under the lock. */
+const CHANNEL_MEMBER_REMOVE_CAPABILITY_REQUIRED_REFUSAL: RefusalInput = { code: "channel_member_remove_capability_required", error: "Channel capability required" };
+
 // Add a mixed batch of agents and humans to a channel. The whole target set is
 // validated before the transaction, then membership rows and their durable
 // system notices commit under one channel capability lock. Existing members
@@ -4963,23 +5128,17 @@ channelRouter.post("/:id/members/batch", async (req, res) => {
   try {
     const batch = parseChannelMemberBatch(req.body);
     if (!batch) {
-      res.status(400).json({
-        error: "userIds and agentIds must be arrays of UUIDs",
-        code: "invalid_member_batch",
-      });
+      refuse(res, 400, { code: "invalid_member_batch", error: "userIds and agentIds must be arrays of UUIDs" });
       return;
     }
     if (batch.userIds.length === 0 && batch.agentIds.length === 0) {
-      res.status(400).json({
-        error: "At least one userId or agentId is required",
-        code: "empty_member_batch",
-      });
+      refuse(res, 400, { code: "empty_member_batch", error: "At least one userId or agentId is required" });
       return;
     }
 
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     const canSee = await canSeeChannel(channel, req.userId!, req.serverId!);
@@ -4987,30 +5146,30 @@ channelRouter.post("/:id/members/batch", async (req, res) => {
     const canManageUnjoined = (channel.type === "channel" || channel.type === "private")
       && (requesterRole === "owner" || requesterRole === "admin");
     if (!canSee && !canManageUnjoined) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (isSubConversationType(channel.type)) {
-      res.status(400).json({ error: "Thread membership is managed via follow/unfollow" });
+      refuse(res, 400, THREAD_MEMBERSHIP_REFUSAL);
       return;
     }
     if (channel.archivedAt) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, { code: "channel_archived", error: "This channel is archived" });
       return;
     }
     // A DM has two fixed parties (canAddChannelMembers): a participant gets the
     // shared rule's refusal below; anyone else the same 404 as before.
     if (channel.type === "dm" && !await channelService.isChannelHuman(channel.id, req.userId!)) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (!(await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "addChannelMembers"))) {
-      res.status(403).json({ error: "You do not have permission to add channel members" });
+      refuse(res, 403, CHANNEL_MEMBER_ADD_FORBIDDEN_REFUSAL);
       return;
     }
 
     if ((await filterLoungeOutsiderAgents(channel.id, batch.agentIds)).size > 0) {
-      res.status(403).json({ error: AGENT_LOUNGE_OUTSIDER_ADD_REFUSAL, code: "agent_lounge_outsider" });
+      refuse(res, 403, { code: "agent_lounge_outsider", error: AGENT_LOUNGE_OUTSIDER_ADD_REFUSAL });
       return;
     }
     // Every target in two queries, not one or two per id.
@@ -5023,6 +5182,7 @@ channelRouter.post("/:id/members/batch", async (req, res) => {
     const targetUsers = batch.userIds.map((userId) => memberUsers.get(userId) ?? null);
     const invalidAgentIds = batch.agentIds.filter((_, index) => targetAgents[index]?.serverId !== req.serverId || isOthersAssistant(targetAgents[index], req.userId!));
     if (invalidAgentIds.length > 0) {
+      // refusal-ok: top-level invalidAgentIds names the rejected ids (channels.membersBatch.api.test.ts pins the body); refuse() writes no top-level fields
       res.status(400).json({
         error: "One or more agents are not members of this server",
         code: "agents_not_in_server",
@@ -5032,6 +5192,7 @@ channelRouter.post("/:id/members/batch", async (req, res) => {
     }
     const invalidUserIds = batch.userIds.filter((_, index) => !targetUsers[index]);
     if (invalidUserIds.length > 0) {
+      // refusal-ok: top-level invalidUserIds names the rejected ids (channels.membersBatch.api.test.ts pins the body); refuse() writes no top-level fields
       res.status(400).json({
         error: "One or more users are not members of this server",
         code: "users_not_in_server",
@@ -5138,15 +5299,17 @@ channelRouter.post("/:id/members/batch", async (req, res) => {
       // The source action card is frozen or needs reconfirmation: an expected 409, not a server fault.
       res.status(err.status).json({ error: err.message, code: err.code });
     } else if (err instanceof Error && err.message === channelService.GUEST_ALL_CHANNEL_MESSAGE) {
-      res.status(403).json({ error: err.message });
+      refuse(res, 403, { code: "all_channel_guest_forbidden", error: err.message });
+    } else if (err instanceof Error && err.message === channelService.GUEST_OTHER_CHANNEL_MESSAGE) {
+      refuse(res, 403, { code: channelService.GUEST_OTHER_CHANNEL_CODE, error: err.message });
     } else if (err instanceof Error && err.message === "Channel capability required") {
-      res.status(403).json({ error: "You do not have permission to add channel members" });
+      refuse(res, 403, CHANNEL_MEMBER_ADD_FORBIDDEN_REFUSAL);
     } else if (err instanceof Error && err.message === channelService.ASSISTANT_CHANNEL_FORBIDDEN_MESSAGE) {
-      res.status(403).json({ error: err.message, code: channelService.ASSISTANT_CHANNEL_FORBIDDEN_CODE });
+      refuse(res, 403, { code: channelService.ASSISTANT_CHANNEL_FORBIDDEN_CODE, error: err.message });
     } else if (err instanceof Error && err.message === "Human is not a member of this channel's server") {
-      res.status(400).json({ error: "One or more users are not members of this server", code: "users_not_in_server" });
+      refuse(res, 400, { code: "users_not_in_server", error: "One or more users are not members of this server" });
     } else if (err instanceof Error && err.message === "Agent is not a member of this channel's server") {
-      res.status(400).json({ error: "One or more agents are not members of this server", code: "agents_not_in_server" });
+      refuse(res, 400, { code: "agents_not_in_server", error: "One or more agents are not members of this server" });
     } else {
       res.status(500).json({ error: "Failed to add channel members" });
     }
@@ -5159,7 +5322,7 @@ channelRouter.post("/:id/members", async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     const canSee = await canSeeChannel(channel, req.userId!, req.serverId!);
@@ -5167,35 +5330,35 @@ channelRouter.post("/:id/members", async (req, res) => {
     const canManageUnjoined = (channel.type === "channel" || channel.type === "private")
       && (requesterRole === "owner" || requesterRole === "admin");
     if (!canSee && !canManageUnjoined) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (isSubConversationType(channel.type)) {
-      res.status(400).json({ error: "Thread membership is managed via follow/unfollow" });
+      refuse(res, 400, THREAD_MEMBERSHIP_REFUSAL);
       return;
     }
     if (channel.archivedAt) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, { code: "channel_archived", error: "This channel is archived" });
       return;
     }
     // The object-aware add policy decides; server owner/admin may therefore
     // manage a private channel without first joining it. A DM has two fixed
     // parties: a participant gets its refusal, anyone else the same 404.
     if (channel.type === "dm" && !await channelService.isChannelHuman(channel.id, req.userId!)) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (!(await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "addChannelMembers"))) {
-      res.status(403).json({ error: "You do not have permission to add channel members" });
+      refuse(res, 403, CHANNEL_MEMBER_ADD_FORBIDDEN_REFUSAL);
       return;
     }
     const { agentId, userId } = req.body;
     if (!agentId && !userId) {
-      res.status(400).json({ error: "Either agentId or userId is required" });
+      refuse(res, 400, { code: "channel_member_target_required", error: "Either agentId or userId is required" });
       return;
     }
     if (agentId && await isLoungeOutsiderAgent(channel.id, agentId)) {
-      res.status(403).json({ error: AGENT_LOUNGE_OUTSIDER_ADD_REFUSAL, code: "agent_lounge_outsider" });
+      refuse(res, 403, { code: "agent_lounge_outsider", error: AGENT_LOUNGE_OUTSIDER_ADD_REFUSAL });
       return;
     }
     if (agentId) {
@@ -5204,7 +5367,7 @@ channelRouter.post("/:id/members", async (req, res) => {
       // Only its owner finds a personal assistant; for anyone else it is
       // answered exactly as an id that names no agent here.
       if (!agent || agent.serverId !== req.serverId || isOthersAssistant(agent, req.userId!)) {
-        res.status(400).json({ error: "Agent not found in this server" });
+        refuse(res, 400, { code: "agents_not_in_server", error: "Agent not found in this server" });
         return;
       }
       const wasAgentMember = await channelService.isChannelAgent(req.params.id, agentId);
@@ -5226,12 +5389,12 @@ channelRouter.post("/:id/members", async (req, res) => {
       // Verify target user is a member of this server
       const targetRole = await getActorServerRoleInServer(req.serverId!, "user", userId);
       if (!targetRole) {
-        res.status(400).json({ error: "User is not a member of this server" });
+        refuse(res, 400, USER_NOT_IN_SERVER_REFUSAL);
         return;
       }
       const targetUser = await userService.getUser(userId);
       if (!targetUser) {
-        res.status(400).json({ error: "User is not a member of this server" });
+        refuse(res, 400, USER_NOT_IN_SERVER_REFUSAL);
         return;
       }
       const addHumanWithNotice = (executor?: Parameters<typeof messageService.addHumanWithMembershipSystemMessage>[0]["executor"]) =>
@@ -5274,22 +5437,25 @@ channelRouter.post("/:id/members", async (req, res) => {
       // The source action card is frozen or needs reconfirmation: an expected 409, not a server fault.
       res.status(err.status).json({ error: err.message, code: err.code });
     } else if (err instanceof Error && err.message === channelService.GUEST_ALL_CHANNEL_MESSAGE) {
-      res.status(403).json({ error: err.message });
+      refuse(res, 403, { code: "all_channel_guest_forbidden", error: err.message });
+    } else if (err instanceof Error && err.message === channelService.GUEST_OTHER_CHANNEL_MESSAGE) {
+      refuse(res, 403, { code: channelService.GUEST_OTHER_CHANNEL_CODE, error: err.message });
     } else if (err instanceof Error && err.message === "Channel capability required") {
-      res.status(403).json({ error: "You do not have permission to add channel members" });
+      refuse(res, 403, CHANNEL_MEMBER_ADD_FORBIDDEN_REFUSAL);
     } else if (err instanceof Error && err.message === channelService.ASSISTANT_CHANNEL_FORBIDDEN_MESSAGE) {
-      res.status(403).json({ error: err.message, code: channelService.ASSISTANT_CHANNEL_FORBIDDEN_CODE });
+      refuse(res, 403, { code: channelService.ASSISTANT_CHANNEL_FORBIDDEN_CODE, error: err.message });
     } else {
       res.status(500).json({ error: "Failed to add member" });
     }
   }
 });
 
-// Human-only v1 surface for channel-local member/admin transitions. Agents can
-// hold the role but intentionally have no Agent API/CLI entry. An agent may
-// prepare lowering a role (never raising one) as a request card (RFC 085
-// `channel:remove_admin`, services/delegableCardRoutes.ts): the person it
-// names confirms, and this route runs as them with its own checks.
+// A person changes a channel member's channel role. An agent does the same on
+// its own authority through the Agent API (POST /internal/agent-api/channels/
+// member-role), under the same rule (channelService.changeChannelMembershipRole).
+// An agent may also prepare lowering a role (never raising one) as a request
+// card (RFC 085 `channel:remove_admin`, services/delegableCardRoutes.ts): the
+// person it names confirms, and this route runs as them with its own checks.
 channelRouter.patch("/:id/members/:targetType/:memberId/role", async (req, res) => {
   const targetType = req.params.targetType === "user" || req.params.targetType === "agent"
     ? req.params.targetType
@@ -5298,62 +5464,43 @@ channelRouter.patch("/:id/members/:targetType/:memberId/role", async (req, res) 
     ? req.body.role
     : null;
   if (!targetType || !nextRole) {
-    res.status(400).json({ error: "targetType and role must be user|agent and member|admin" });
+    refuse(res, 400, { code: "channel_member_role_invalid", error: "targetType and role must be user|agent and member|admin" });
     return;
   }
 
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
 
     const result = await channelService.changeChannelMembershipRole({
       serverId: req.serverId!,
       channelId: channel.id,
-      requesterUserId: req.userId!,
+      requester: { type: "user", id: req.userId! },
       targetType,
       targetId: req.params.memberId,
       nextRole,
     });
     if (result.changed) {
-      const io = req.app.get("io") as SocketServer | undefined;
-      emitChannelMembersUpdated(io, req.serverId!, channel, targetType === "user" ? result.targetId : undefined);
-      io?.to(targetType === "user" ? `user:${result.targetId}` : `agent:${result.targetId}`).emit(
-        "channel:authority-updated",
-        {
-          channelId: channel.id,
-          channelRole: result.channelRole,
-          authorityRevision: result.authorityRevision,
-        },
-      );
-      if (result.eventId) {
-        try {
-          await channelService.markChannelMembershipRoleEventDelivered(result.eventId);
-        } catch (deliveryError) {
-          // The role mutation and durable outbox row are already committed.
-          // Leave the event pending for retry rather than turning a successful
-          // authority change into an ambiguous HTTP 500.
-          console.error("Failed to mark channel role event delivered:", deliveryError);
-        }
-      }
+      await deliverChannelMembershipRoleChange(req.app.get("io") as SocketServer | undefined, channel, result);
     }
     res.json(result);
   } catch (err) {
     if (err instanceof channelService.ChannelMembershipRoleMutationError) {
       if (err.code === "channel_not_found") {
-        res.status(404).json({ error: err.message, code: err.code });
+        refuse(res, 404, { code: err.code, error: err.message });
       } else if (err.code === "channel_capability_required" || err.code === "protected_server_role") {
-        res.status(403).json({ error: err.message, code: err.code });
+        refuse(res, 403, { code: err.code, error: err.message });
       } else if (err.code === "unsupported_channel_shape") {
-        res.status(400).json({ error: err.message, code: err.code });
+        refuse(res, 400, { code: err.code, error: err.message });
       } else {
-        res.status(409).json({ error: err.message, code: err.code });
+        refuse(res, 409, { code: err.code, error: err.message });
       }
       return;
     }
@@ -5370,29 +5517,29 @@ channelRouter.delete("/:id/members/agent/:memberId", async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (isSubConversationType(channel.type)) {
-      res.status(400).json({ error: "Thread membership is managed via follow/unfollow" });
+      refuse(res, 400, THREAD_MEMBERSHIP_REFUSAL);
       return;
     }
     if (channel.type === "dm") {
       const isParticipant = await channelService.isChannelHuman(channel.id, req.userId!);
       if (!isParticipant) {
-        res.status(404).json({ error: "Channel not found" });
+        refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
         return;
       }
     } else if (!(await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "removeChannelMembers", getDb(), "agent"))) {
-      res.status(403).json({ error: "Only admins can remove channel agents" });
+      refuse(res, 403, { code: "channel_agent_remove_forbidden", error: "Only admins can remove channel agents" });
       return;
     }
     if (channel.archivedAt) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, { code: "channel_archived", error: "This channel is archived" });
       return;
     }
     assertAgentCanBeRemovedFromChannel(channel);
@@ -5400,7 +5547,7 @@ channelRouter.delete("/:id/members/agent/:memberId", async (req, res) => {
     const targetChannel = await channelService.getJointAgentRemovalChannel(channel.id, req.params.memberId);
     const actorContext = await resolveChannelActorContext(req.serverId!, channel.id, "user", req.userId!);
     if (actorContext?.jointAuthority && !actorContext.jointAuthority.isHostEntry && agent?.serverId !== req.serverId) {
-      res.status(403).json({ error: "Channel capability required" });
+      refuse(res, 403, CHANNEL_MEMBER_REMOVE_CAPABILITY_REQUIRED_REFUSAL);
       return;
     }
     const wasAgentMember = targetChannel ? await channelService.isChannelAgent(targetChannel.id, req.params.memberId) : false;
@@ -5444,9 +5591,9 @@ channelRouter.delete("/:id/members/agent/:memberId", async (req, res) => {
     const msg = err?.message || "";
     const allRefusal = allChannelMembershipRefusal(msg);
     if (allRefusal) {
-      res.status(403).json(allRefusal);
+      refuse(res, 403, allRefusal);
     } else if (msg === "Channel capability required") {
-      res.status(403).json({ error: msg });
+      refuse(res, 403, CHANNEL_MEMBER_REMOVE_CAPABILITY_REQUIRED_REFUSAL);
     } else {
       res.status(500).json({ error: "Failed to remove member" });
     }
@@ -5458,34 +5605,34 @@ channelRouter.delete("/:id/members/user/:memberId", async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (isSubConversationType(channel.type)) {
-      res.status(400).json({ error: "Thread membership is managed via follow/unfollow" });
+      refuse(res, 400, THREAD_MEMBERSHIP_REFUSAL);
       return;
     }
     if (channel.type === "dm") {
       // DMs: only participants can interact, and only remove self
       const isParticipant = await channelService.isChannelHuman(channel.id, req.userId!);
       if (!isParticipant) {
-        res.status(404).json({ error: "Channel not found" });
+        refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
         return;
       }
       if (req.params.memberId !== req.userId) {
-        res.status(403).json({ error: "Cannot remove other participants from a DM" });
+        refuse(res, 403, { code: "dm_member_remove_forbidden", error: "Cannot remove other participants from a DM" });
         return;
       }
     } else if (!(await actorHasChannelCapability(req.serverId!, channel.id, "user", req.userId!, "removeChannelMembers"))) {
-      res.status(403).json({ error: "Only admins can remove channel members" });
+      refuse(res, 403, { code: "channel_human_remove_forbidden", error: "Only admins can remove channel members" });
       return;
     }
     if (channel.archivedAt) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, { code: "channel_archived", error: "This channel is archived" });
       return;
     }
     if (channel.type === "dm") {
@@ -5512,9 +5659,9 @@ channelRouter.delete("/:id/members/user/:memberId", async (req, res) => {
     const msg = err?.message || "";
     const allRefusal = allChannelMembershipRefusal(msg);
     if (allRefusal) {
-      res.status(403).json(allRefusal);
+      refuse(res, 403, allRefusal);
     } else if (msg === "Channel capability required") {
-      res.status(403).json({ error: msg });
+      refuse(res, 403, CHANNEL_MEMBER_REMOVE_CAPABILITY_REQUIRED_REFUSAL);
     } else {
       res.status(500).json({ error: "Failed to remove member" });
     }
@@ -5543,23 +5690,23 @@ channelRouter.post("/:id/leave", async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canSeeChannel(channel, req.userId!, req.serverId!)) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (isSubConversationType(channel.type)) {
-      res.status(400).json({ error: "Thread membership is managed via follow/unfollow" });
+      refuse(res, 400, THREAD_MEMBERSHIP_REFUSAL);
       return;
     }
     if (channel.type === "dm") {
-      res.status(403).json({ error: "Cannot leave DM channels" });
+      refuse(res, 403, { code: "channel_type_not_leavable", error: "Cannot leave DM channels" });
       return;
     }
     if (channel.archivedAt) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, { code: "channel_archived", error: "This channel is archived" });
       return;
     }
     await channelService.removeHuman(req.params.id, req.userId!, { self: true });
@@ -5572,7 +5719,7 @@ channelRouter.post("/:id/leave", async (req, res) => {
     const msg = err?.message || "";
     const allRefusal = allChannelMembershipRefusal(msg);
     if (allRefusal) {
-      res.status(403).json(allRefusal);
+      refuse(res, 403, allRefusal);
     } else {
       res.status(500).json({ error: "Failed to leave channel" });
     }
@@ -5584,16 +5731,16 @@ channelRouter.post("/:id/read", noteInboxWriteBeforeReply, async (req, res) => {
   try {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await channelService.canUserAccessChannel(channel.id, req.userId!, req.serverId!)) {
-      res.status(404).json({ error: "Channel not found" });
+      refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
     const seq = Number(req.body.seq);
     if (!seq) {
-      res.status(400).json({ error: "seq is required" });
+      refuse(res, 400, { code: "read_seq_required", error: "seq is required" });
       return;
     }
     const state = await channelService.markRead(req.userId!, channel.id, seq);
@@ -5637,6 +5784,7 @@ channelRouter.post("/:id/read-all", noteInboxWriteBeforeReply, async (req, res) 
       || channel.serverId !== req.serverId
       || (deletedInboxResidueRead && receiver.kind !== "human")
     ) {
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(404).json({ error: "Channel not found" });
       return;
     }
@@ -5658,6 +5806,7 @@ channelRouter.post("/:id/read-all", noteInboxWriteBeforeReply, async (req, res) 
           // Unchanged: a caller the server has no record of gets the same 404 a
           // missing id gets. This is what stops the usability fix from reopening
           // the existence oracle the privacy half closed.
+          // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
           res.status(404).json({ error: "Channel not found" });
           return;
         }
@@ -5665,21 +5814,38 @@ channelRouter.post("/:id/read-all", noteInboxWriteBeforeReply, async (req, res) 
     }
 
     if (receiver.kind === "agent") {
-      const agent = await agentService.getAgent(receiver.id);
-      if (!agent || agent.serverId !== req.serverId) {
-        res.status(404).json({ error: "Read receiver not found" });
-        return;
-      }
-      const decision = await canHumanOperateAgentReadState(req.serverId!, req.userId!, agent);
-      if (!decision.allowed) {
-        addTraceEvent("channel_read_all.receiver.denied", {
-          caller_kind: "human",
-          caller_id: req.userId!,
-          receiver_kind: receiver.kind,
-          receiver_id: receiver.id,
-          delegation_basis: null,
-          scope_id: channel.id,
-        });
+      const rawAgent = await agentService.getAgent(receiver.id);
+      const agent = rawAgent && rawAgent.serverId === req.serverId ? rawAgent : null;
+      const decision = agent
+        ? await canHumanOperateAgentReadState(req.serverId!, req.userId!, agent)
+        : null;
+      if (!decision?.allowed) {
+        if (decision) {
+          addTraceEvent("channel_read_all.receiver.denied", {
+            caller_kind: "human",
+            caller_id: req.userId!,
+            receiver_kind: receiver.kind,
+            receiver_id: receiver.id,
+            delegation_basis: null,
+            scope_id: channel.id,
+          });
+        }
+        // The receiver refusals below would tell a hidden channel from a missing
+        // one, so a caller who can't see the channel gets the missing-channel 404
+        // for every receiver failure. The check runs only on failure: a person may
+        // mark read for an agent they operate in a channel they aren't in.
+        const canAccess = await channelService.canUserAccessChannel(channel.id, req.userId!, req.serverId!, { includeDeleted: true });
+        if (!canAccess) {
+          // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
+          res.status(404).json({ error: "Channel not found" });
+          return;
+        }
+        if (!decision) {
+          // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
+          res.status(404).json({ error: "Read receiver not found" });
+          return;
+        }
+        // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
         res.status(403).json({ error: "Read receiver is not authorized" });
         return;
       }
@@ -5733,6 +5899,7 @@ channelRouter.post("/:id/read-all", noteInboxWriteBeforeReply, async (req, res) 
         delegation_basis: delegationBasis,
         scope_id: req.params.id,
       });
+      // refusal-ok: the activity-v1 contract pins this body (packages/sync-core/contracts/activity-v1/activity-sync.tsp, strict Kotlin binding); it moves with a contract revision
       res.status(404).json({ error: "Channel not found" });
       return;
     }
@@ -5741,12 +5908,15 @@ channelRouter.post("/:id/read-all", noteInboxWriteBeforeReply, async (req, res) 
   }
 });
 
+/** The conversation-read-all scope a person can't read: missing, another server's or hidden, before the write or under it. */
+const CONVERSATION_NOT_FOUND_REFUSAL: RefusalInput = { code: "conversation_not_found", error: "Conversation not found" };
+
 // Explicit sidebar action: channel messages plus active followed threads.
 // The existing /read-all contract remains a single-scope read.
 channelRouter.post("/:id/conversation-read-all", noteInboxWriteBeforeReply, async (req, res) => {
   try {
     if (!await channelService.canUserAccessChannel(req.params.id, req.userId!, req.serverId!)) {
-      res.status(404).json({ error: "Conversation not found" });
+      refuse(res, 404, CONVERSATION_NOT_FOUND_REFUSAL);
       return;
     }
     const result = await channelService.markConversationReadLatest(req.serverId!, req.userId!, req.params.id);
@@ -5764,7 +5934,7 @@ channelRouter.post("/:id/conversation-read-all", noteInboxWriteBeforeReply, asyn
   } catch (err) {
     if (sendCompatibilityReadPending(res, err)) return;
     if (err instanceof ReadMutationError && err.code === "SCOPE_NOT_FOUND") {
-      res.status(404).json({ error: "Conversation not found" });
+      refuse(res, 404, CONVERSATION_NOT_FOUND_REFUSAL);
       return;
     }
     sendJsonServerError(req, res, { error: "Failed to mark conversation as read", logPrefix: "Failed to mark conversation as read:", err });
@@ -5777,10 +5947,12 @@ channelRouter.post("/:id/unread", noteInboxWriteBeforeReply, async (req, res) =>
     const channel = await channelService.getChannel(req.params.id)
       ?? await channelService.getChannel(req.params.id, { includeDeleted: true });
     if (!channel || channel.serverId !== req.serverId || (channel.deletedAt && channel.type !== "dm")) {
+      // refusal-ok: the read-state contract pins this body (packages/shared/src/readStateContract.ts readStateErrorResponseSchema, a strict object: error and only READ_MUTATION_FENCE_REFUSED as code)
       res.status(404).json({ error: "Channel not found" });
       return;
     }
     if (!await channelService.canUserAccessChannel(channel.id, req.userId!, req.serverId!, { includeDeleted: true })) {
+      // refusal-ok: the read-state contract pins this body (packages/shared/src/readStateContract.ts readStateErrorResponseSchema, a strict object: error and only READ_MUTATION_FENCE_REFUSED as code)
       res.status(404).json({ error: "Channel not found" });
       return;
     }
@@ -5821,13 +5993,14 @@ channelRouter.post("/:id/threads", async (req, res) => {
       : {};
     const { parentMessageId, content } = body;
     if (typeof parentMessageId !== "string" || parentMessageId.trim() === "") {
-      res.status(400).json({ error: "parentMessageId is required" });
+      refuse(res, 400, { code: "parent_message_id_required", error: "parentMessageId is required" });
       return;
     }
 
     // Verify the parent message belongs to this channel
     const channel = await channelService.getChannel(req.params.id);
     if (!channel || channel.serverId !== req.serverId) {
+      // refusal-ok: must stay byte-identical to denyChannelAccess's 404 below (channelAccessDenial.ts), no existence oracle
       res.status(404).json(CHANNEL_NOT_FOUND_BODY);
       return;
     }
@@ -5846,12 +6019,12 @@ channelRouter.post("/:id/threads", async (req, res) => {
     // Prevent nested threads: cannot create a thread inside a thread channel.
     // Only reported to a caller who can already see the channel.
     if (isSubConversationType(channel.type)) {
-      res.status(400).json({ error: "Cannot create a thread inside a thread" });
+      refuse(res, 400, { code: "nested_thread_unsupported", error: "Cannot create a thread inside a thread" });
       return;
     }
 
     if (channel.archivedAt) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, { code: "channel_archived", error: "This channel is archived" });
       return;
     }
 
@@ -5864,11 +6037,11 @@ channelRouter.post("/:id/threads", async (req, res) => {
     const firstReply = typeof content === "string" && content.trim().length > 0 ? content : null;
     if (firstReply !== null) {
       if (firstReply.length > MAX_MESSAGE_LENGTH) {
-        res.status(400).json({ error: `Message content exceeds maximum length of ${MAX_MESSAGE_LENGTH} characters` });
+        refuse(res, 400, { code: "message_too_long", error: `Message content exceeds maximum length of ${MAX_MESSAGE_LENGTH} characters` });
         return;
       }
       if (!(await channelService.canUserPostToChannel(channel.id, req.userId!))) {
-        res.status(403).json({ error: "You must join this channel to send messages" });
+        refuse(res, 403, { code: "channel_membership_required", error: "You must join this channel to send messages" });
         return;
       }
       const conversionTarget = await resolveChannelConversionLockTarget(getDb(), channel.id);
@@ -5878,11 +6051,16 @@ channelRouter.post("/:id/threads", async (req, res) => {
       const billingReadOnly = await getChannelBillingReadOnly(channel.id, req.serverId!);
       if (billingReadOnly) {
         if (billingReadOnly.reason === "joint_over_limit") notePaywallHit(req, "joint_channel_read_only");
-        res.status(403).json(channelBillingReadOnlyBody(billingReadOnly));
+        if (billingReadOnly.reason === "external_limit_frozen") {
+          // refusal-ok: top-level externalFreezeAt, as POST /messages answers (planService channelBillingReadOnlyBody); refuse() writes no top-level fields
+          res.status(403).json(channelBillingReadOnlyBody(billingReadOnly));
+        } else {
+          refuse(res, 403, channelBillingReadOnlyRefusal(billingReadOnly));
+        }
         return;
       }
       if (await isChannelReadOnlyByQuota(channel.id, req.serverId!)) {
-        res.status(403).json({ error: "This channel is read-only on your current plan. Upgrade to continue." });
+        refuse(res, 403, { code: "channel_read_only", error: "This channel is read-only on your current plan. Upgrade to continue." });
         return;
       }
     }
@@ -5916,12 +6094,13 @@ channelRouter.post("/:id/threads", async (req, res) => {
       return;
     }
     if (err instanceof channelService.ChannelArchivedError) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, { code: "channel_archived", error: "This channel is archived" });
       return;
     }
     const msg = err?.message || "";
     if (msg.includes("not found")) {
-      res.status(404).json({ error: msg });
+      // The parent isn't there (getOrCreateThreadForChannel: "Parent message not found", "Parent channel not found").
+      refuse(res, 404, serviceMessageRefusal("thread_parent_not_found", msg, "The message to start the thread on isn't in this channel."));
     } else {
       sendJsonServerError(req, res, {
         error: "Failed to create thread",
@@ -5962,6 +6141,7 @@ channelRouter.get("/:id/threads", async (req, res) => {
       }),
     );
     if (!channel || channel.serverId !== req.serverId) {
+      // refusal-ok: must stay byte-identical to denyChannelAccess's 404 below (channelAccessDenial.ts), no existence oracle
       res.status(404).json(CHANNEL_NOT_FOUND_BODY);
       return;
     }
@@ -5982,7 +6162,7 @@ channelRouter.get("/:id/threads", async (req, res) => {
 
     const requestedParentMessageIds = parseThreadSummaryParentMessageIds(req.query.parentMessageIds);
     if (requestedParentMessageIds === null) {
-      res.status(400).json({ error: "Invalid parentMessageIds" });
+      refuse(res, 400, { code: "thread_parent_message_ids_invalid", error: "Invalid parentMessageIds" });
       return;
     }
     const parentMessageIds = requestedParentMessageIds ?? await channelService.listRecentThreadParentMessageIdsForChannelView(
@@ -6051,6 +6231,7 @@ channelRouter.get("/:id/threads/:messageId", async (req, res) => {
     const channel = await channelService.getChannel(req.params.id);
     if (!channel) {
       recordThreadLookupRejected("channel_not_found");
+      // refusal-ok: must stay byte-identical to denyChannelAccess's 404 below (channelAccessDenial.ts), no existence oracle
       res.status(404).json(CHANNEL_NOT_FOUND_BODY);
       return;
     }
@@ -6059,6 +6240,7 @@ channelRouter.get("/:id/threads/:messageId", async (req, res) => {
         request_server_id: req.serverId ?? null,
         channel_server_id: channel.serverId ?? null,
       });
+      // refusal-ok: must stay byte-identical to denyChannelAccess's 404 below (channelAccessDenial.ts), no existence oracle
       res.status(404).json(CHANNEL_NOT_FOUND_BODY);
       return;
     }
@@ -6074,7 +6256,7 @@ channelRouter.get("/:id/threads/:messageId", async (req, res) => {
       recordThreadLookupRejected("not_found");
       // `code` is the machine-readable "no thread yet" signal clients key on;
       // the other 404s on this route are lookup failures, not an empty thread.
-      res.status(404).json({ code: "THREAD_NOT_FOUND", error: "No thread found for this message" });
+      refuse(res, 404, { code: "THREAD_NOT_FOUND", error: "No thread found for this message" });
       return;
     }
     // The lookup itself is not history-limited, but the thread panel's reply

@@ -1,0 +1,21 @@
+-- An emailed external invite sent to someone who was a member of the host
+-- server at send time (channel_external_invites.sent_to_host_member;
+-- services/externalInviteService.ts sendExternalInvites): the review's
+-- "Invite to connect" on a member row. The member is added to the channel
+-- directly, as before, and the invite lets them connect a server of theirs.
+-- Such an invite holds none of the channel's slots and no Free external
+-- channel allowance while open (services/externalChannelLimitService.ts);
+-- the connection's own checks still apply. Recorded at send time only, never
+-- an authorization input.
+--
+-- Existing rows read false (no backfill: every invite so far is an ordinary
+-- one). An older node during the rolling deploy and its rollback window
+-- inserts without the column and gets false, which is right for every invite
+-- it can make; it counts a member invite as an ordinary one, which only ever
+-- refuses more.
+--
+-- Additive only: a constant default on a new column rewrites no rows
+-- (PostgreSQL 11+). Bounded lock wait: give up after 5 s (the deploy
+-- retries) rather than queue writes behind a long transaction.
+SET LOCAL lock_timeout = '5s';--> statement-breakpoint
+ALTER TABLE "channel_external_invites" ADD COLUMN "sent_to_host_member" boolean DEFAULT false NOT NULL;

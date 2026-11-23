@@ -215,7 +215,7 @@ test("a DM has two fixed parties: its participants cannot add anyone, others sti
   assert.equal(await isChannelHuman(humanDm.id, bob.id), true);
   assert.equal(await isChannelAgent(agentDm.id, agent.id), true);
 
-  const refusal = { error: "You do not have permission to add channel members" };
+  const refusal = { error: "You do not have permission to add channel members", code: "channel_member_add_forbidden", errorCode: "channel_member_add_forbidden" };
   const attempts: Array<{ channelId: string; path: string; body: object }> = [];
   for (const dm of [humanDm, agentDm]) {
     attempts.push(
@@ -242,7 +242,7 @@ test("a DM has two fixed parties: its participants cannot add anyone, others sti
         body: JSON.stringify(attempt.body),
       });
       assert.equal(outsiderRes.status, 404, `${outsider.name} ${label}`);
-      assert.deepEqual(await outsiderRes.json(), { error: "Channel not found" }, `${outsider.name} ${label}`);
+      assert.deepEqual(await outsiderRes.json(), { error: "Channel not found", code: "channel_not_found", errorCode: "channel_not_found" }, `${outsider.name} ${label}`);
     }
   }
 

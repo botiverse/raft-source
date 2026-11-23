@@ -15,6 +15,9 @@ import { sql } from "drizzle-orm";
 import {
   AGENT_CONTEXT_VIEW_FEATURE_FLAG_KEY,
   AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY,
+  CONTINUATION_TOOL_FEATURE_FLAG_KEY,
+  INBOX_NOTICE_SERVER_ROWS_FEATURE_FLAG_KEY,
+  DAEMON_CAPABILITY_TURN_END_COMPACTION_V2,
   pickAgentServerFeatures,
   TASK_V2_CONVERSATIONS_FEATURE_FLAG_KEY,
   WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY,
@@ -25,7 +28,7 @@ import {
 import { getDb } from "../db/index";
 import { agents, featureFlagAudienceMembers, featureFlagAudiences, machines, oauthClientInstalls, oauthClients, reminderAppMigrations, serverMembers, servers, users } from "../db/schema";
 import { AgentOrchestrator } from "./agentOrchestrator";
-import { createFeatureFlag, createFeatureFlagRule, PASSIVE_AX_FEATURE_FLAG_KEY, PI_SESSION_ROTATION_FEATURE_FLAG_KEY, REMINDER_APP_FEATURE_FLAG_KEY, SUBAGENT_DELEGATION_FEATURE_FLAG_KEY, VAULT_APP_FEATURE_FLAG_KEY, WAKE_RECYCLE_OAR_FEATURE_FLAG_KEY, WAKE_RECYCLE_TIER_GATE_FEATURE_FLAG_KEY, WAKE_RECYCLE_WARM_FEATURE_FLAG_KEY, TURN_END_COMPACTION_FEATURE_FLAG_KEY } from "./featureFlagService";
+import { createFeatureFlag, createFeatureFlagRule, DM_REPLY_PLACEMENT_FEATURE_FLAG_KEY, PASSIVE_AX_FEATURE_FLAG_KEY, PI_SESSION_ROTATION_FEATURE_FLAG_KEY, REMINDER_APP_FEATURE_FLAG_KEY, SUBAGENT_DELEGATION_FEATURE_FLAG_KEY, VAULT_APP_FEATURE_FLAG_KEY, WAKE_RECYCLE_OAR_FEATURE_FLAG_KEY, WAKE_RECYCLE_TIER_GATE_FEATURE_FLAG_KEY, WAKE_RECYCLE_WARM_FEATURE_FLAG_KEY, TURN_END_COMPACTION_FEATURE_FLAG_KEY } from "./featureFlagService";
 import { __answerFlagForTests } from "../services/deploymentAnsweredFlags";
 
 afterEach(async () => {
@@ -71,7 +74,7 @@ async function seed(slug: string) {
   return { server: server!, machine: machine!, agent: agent! };
 }
 
-function bindMachine(orchestrator: AgentOrchestrator, machineId: string, serverId: string): void {
+function bindMachine(orchestrator: AgentOrchestrator, machineId: string, serverId: string, capabilities: readonly string[] = []): void {
   (orchestrator as any).machineConnections.set(machineId, {
     ws: {},
     machineId,
@@ -83,7 +86,7 @@ function bindMachine(orchestrator: AgentOrchestrator, machineId: string, serverI
     lastPong: Date.now(),
     lastIngressAt: Date.now(),
     daemonVersion: "1.0.40",
-    capabilities: new Set<string>(),
+    capabilities: new Set<string>(capabilities),
     runtimes: ["claude"],
     migrationTransport: null,
     shutdownIntent: null,
@@ -95,10 +98,10 @@ async function startConfig(slug: string) {
   return startSeededConfig(await seed(slug));
 }
 
-async function startSeededConfig({ server, machine, agent }: Awaited<ReturnType<typeof seed>>) {
+async function startSeededConfig({ server, machine, agent }: Awaited<ReturnType<typeof seed>>, capabilities: readonly string[] = []) {
   const orchestrator = new CapturingOrchestrator();
   try {
-    bindMachine(orchestrator, machine.id, server.id);
+    bindMachine(orchestrator, machine.id, server.id, capabilities);
     assert.equal((await orchestrator.startAgent(agent.id)).outcome, "dispatched");
     assert.equal(orchestrator.starts.length, 1);
     return orchestrator.starts[0]!.config;
@@ -138,6 +141,24 @@ test("sub-agent delegation: a flag that evaluates on for the server turns it on,
   assert.equal(config.constructedWakeContext, true);
 });
 
+// #triage:#540: the DM reply placement prompt rides the same per-server, default-off path.
+test("DM reply placement: as its migration ships it (default off, no rules), the start config leaves it off", async ({ db: _db }) => {
+  const config = await startConfig("drp-default");
+  assert.equal(config.dmReplyPlacement, undefined);
+});
+
+test("DM reply placement: a server rule turns it on for that server only, independently of the other gates", async ({ db: _db }) => {
+  // The flag row ships with its migration, default off.
+  const allowed = await seed("drp-on");
+  await createFeatureFlagRule({ flagKey: DM_REPLY_PLACEMENT_FEATURE_FLAG_KEY, stage: "server", decision: "allow", values: [allowed.server.id] });
+  const { config, answer } = await startAndAskFeatures(allowed);
+  assert.equal(config.dmReplyPlacement, true);
+  assert.equal(config.subagentDelegation, undefined);
+  assert.deepEqual(answer.msg.features, { dmReplyPlacement: true, enabledApps: [] });
+
+  const other = await startConfig("drp-other-server");
+  assert.equal(other.dmReplyPlacement, undefined);
+});
 
 // task #359: the RFC 072 passive AX gate rides the same per-server, default-off path.
 test("passive AX: no flag means the start config leaves it off", async ({ db: _db }) => {
@@ -282,8 +303,8 @@ test("turn end compaction: a server rule turns it on for that server only", asyn
   const allowed = await seed("tec-allowed");
   const other = await seed("tec-other");
   await createFeatureFlagRule({ flagKey: TURN_END_COMPACTION_FEATURE_FLAG_KEY, stage: "server", decision: "allow", values: [allowed.server.id] });
-  const allowedConfig = await startSeededConfig(allowed);
-  const otherConfig = await startSeededConfig(other);
+  const allowedConfig = await startSeededConfig(allowed, [DAEMON_CAPABILITY_TURN_END_COMPACTION_V2]);
+  const otherConfig = await startSeededConfig(other, [DAEMON_CAPABILITY_TURN_END_COMPACTION_V2]);
   assert.equal(allowedConfig.turnEndCompaction, true);
   assert.equal(allowedConfig.wakeRecycleTierGate, undefined, "independent of the recycle flags");
   assert.equal(otherConfig.turnEndCompaction, undefined);
@@ -308,6 +329,139 @@ test("warm wake recycle: a server rule turns it on for that server only", async 
   assert.equal(allowedConfig.wakeRecycleTierGate, undefined, "independent of the tier gate");
   assert.equal(allowedConfig.turnEndCompaction, undefined, "independent of turn-end compaction");
   assert.equal(otherConfig.wakeRecycleWarm, undefined);
+});
+
+// The continuation answer tool (#wg-ax:#5): the same per-server, default-off
+// path; the daemon then checks the runtime before it offers the tool.
+test("continuation answer tool: as its migration ships it (default off, no rules), the start config leaves it off", async ({ db: _db }) => {
+  const config = await startConfig("ctool-default");
+  assert.equal(config.continuationTool, undefined);
+});
+
+test("continuation answer tool: a server rule turns it on for that server only", async ({ db: _db }) => {
+  // The flag row ships with its migration, default off.
+  const allowed = await seed("ctool-allowed");
+  const other = await seed("ctool-other");
+  await createFeatureFlagRule({ flagKey: CONTINUATION_TOOL_FEATURE_FLAG_KEY, stage: "server", decision: "allow", values: [allowed.server.id] });
+  const allowedConfig = await startSeededConfig(allowed);
+  const otherConfig = await startSeededConfig(other);
+  assert.equal(allowedConfig.continuationTool, true);
+  assert.equal(otherConfig.continuationTool, undefined);
+});
+
+// The wake-up notice with the Server's numbers (#wg-ax:#42): the same
+// per-server, default-off path; the daemon also needs inbox items on.
+test("inbox notice server rows: as its migration ships it (default off, no rules), the start config leaves it off", async ({ db: _db }) => {
+  const config = await startConfig("inrows-default");
+  assert.equal(config.inboxNoticeServerRows, undefined);
+});
+
+test("inbox notice server rows: a server rule turns it on for that server only", async ({ db: _db }) => {
+  // The flag row ships with its migration, default off.
+  const allowed = await seed("inrows-allowed");
+  const other = await seed("inrows-other");
+  await createFeatureFlagRule({ flagKey: INBOX_NOTICE_SERVER_ROWS_FEATURE_FLAG_KEY, stage: "server", decision: "allow", values: [allowed.server.id] });
+  const allowedConfig = await startSeededConfig(allowed);
+  const otherConfig = await startSeededConfig(other);
+  assert.equal(allowedConfig.inboxNoticeServerRows, true);
+  assert.equal(otherConfig.inboxNoticeServerRows, undefined);
+});
+
+// #proj-runtime:#67: turn-end compaction is on only for a daemon that
+// advertised DAEMON_CAPABILITY_TURN_END_COMPACTION_V2 (its compaction resets
+// the context facts after a boundary and waits for a held or deferred inbox
+// drain). Computers from 1.0.69 obey the flag without those fixes, so every
+// other daemon stays off whatever the flag says, at agent:start and in the
+// server:features answer (the refresh path) alike.
+test("turn end compaction gate: flag on and the capability present turns it on in agent:start and server:features", async ({ db: _db }) => {
+  await createFeatureFlag({ key: TURN_END_COMPACTION_FEATURE_FLAG_KEY, randomizationUnit: "server", defaultEnabled: true });
+  const { config, answer } = await startAndAskFeatures(await seed("tecg-capable"), [DAEMON_CAPABILITY_TURN_END_COMPACTION_V2]);
+  assert.equal(config.turnEndCompaction, true);
+  assert.equal(answer.msg.features.turnEndCompaction, true);
+  assert.deepEqual(answer.msg.features, pickAgentServerFeatures(config));
+});
+
+test("turn end compaction gate: flag on and the capability missing leaves it off in agent:start and server:features", async ({ db: _db }) => {
+  await createFeatureFlag({ key: TURN_END_COMPACTION_FEATURE_FLAG_KEY, randomizationUnit: "server", defaultEnabled: true });
+  await createFeatureFlag({ key: SUBAGENT_DELEGATION_FEATURE_FLAG_KEY, randomizationUnit: "server", defaultEnabled: true });
+  const { config, answer } = await startAndAskFeatures(await seed("tecg-missing"));
+  assert.equal(config.turnEndCompaction, undefined);
+  assert.equal("turnEndCompaction" in answer.msg.features, false, "never sent, not even as false");
+  assert.equal(config.subagentDelegation, true, "only turn-end compaction is gated on the machine");
+  assert.deepEqual(answer.msg.features, { subagentDelegation: true, enabledApps: [] });
+  assert.deepEqual(answer.msg.features, pickAgentServerFeatures(config));
+});
+
+test("turn end compaction gate: flag off leaves it off even with the capability", async ({ db: _db }) => {
+  await createFeatureFlag({ key: TURN_END_COMPACTION_FEATURE_FLAG_KEY, randomizationUnit: "server", defaultEnabled: false });
+  const { config, answer } = await startAndAskFeatures(await seed("tecg-flag-off"), [DAEMON_CAPABILITY_TURN_END_COMPACTION_V2]);
+  assert.equal(config.turnEndCompaction, undefined);
+  assert.deepEqual(answer.msg.features, { enabledApps: [] });
+});
+
+/** A second Computer with its own agent on an already seeded server. */
+async function seedMachineOn(seeded: Awaited<ReturnType<typeof seed>>, name: string) {
+  const db = getDb();
+  const [machine] = await db.insert(machines).values({
+    serverId: seeded.server.id,
+    userId: seeded.server.ownerId,
+    name,
+    apiKeyHash: `hash-${seeded.server.slug}-${name}`,
+  }).returning();
+  const [agent] = await db.insert(agents).values({
+    serverId: seeded.server.id,
+    name: `${name}-agent`,
+    status: "inactive",
+    runtime: "claude",
+    model: "sonnet",
+    executionMode: "byoc",
+    machineId: machine!.id,
+  }).returning();
+  return { server: seeded.server, machine: machine!, agent: agent! };
+}
+
+test("turn end compaction gate: new and old daemons on one server, through a flag change, each get their own answer", async ({ db: _db }) => {
+  await createFeatureFlag({ key: TURN_END_COMPACTION_FEATURE_FLAG_KEY, randomizationUnit: "server", defaultEnabled: false });
+  const current = await seed("tecg-mixed");
+  const old = await seedMachineOn(current, "tecg-mixed-old");
+  const orchestrator = new CapturingOrchestrator();
+  try {
+    bindMachine(orchestrator, current.machine.id, current.server.id, [DAEMON_CAPABILITY_TURN_END_COMPACTION_V2]);
+    bindMachine(orchestrator, old.machine.id, current.server.id);
+    const answerFor = (machineId: string, requestId: string) => {
+      const answers = orchestrator.featureAnswers.filter((entry) => entry.machineId === machineId && entry.msg.requestId === requestId);
+      assert.equal(answers.length, 1, `one answer to ${requestId} on ${machineId}`);
+      return answers[0]!.msg.features;
+    };
+
+    // Flag off: both start off and both refresh answers are off.
+    assert.equal((await orchestrator.startAgent(current.agent.id)).outcome, "dispatched");
+    assert.equal((await orchestrator.startAgent(old.agent.id)).outcome, "dispatched");
+    await orchestrator.handleMachineMessage(current.machine.id, { type: "server:features:request", requestId: "before-current" });
+    await orchestrator.handleMachineMessage(old.machine.id, { type: "server:features:request", requestId: "before-old" });
+    assert.equal(answerFor(current.machine.id, "before-current").turnEndCompaction, undefined);
+    assert.equal(answerFor(old.machine.id, "before-old").turnEndCompaction, undefined);
+
+    // The flag is turned on for the server: each daemon is told
+    // (server:features-changed) and asks again. Only the capable one gets it.
+    await createFeatureFlagRule({ flagKey: TURN_END_COMPACTION_FEATURE_FLAG_KEY, stage: "server", decision: "allow", values: [current.server.id] });
+    await orchestrator.handleMachineMessage(current.machine.id, { type: "server:features:request", requestId: "after-current" });
+    await orchestrator.handleMachineMessage(old.machine.id, { type: "server:features:request", requestId: "after-old" });
+    assert.equal(answerFor(current.machine.id, "after-current").turnEndCompaction, true);
+    assert.equal("turnEndCompaction" in answerFor(old.machine.id, "after-old"), false, "the refresh cannot bypass the gate");
+
+    // And the configs built for each agent now (the next start, an agent:config push) agree.
+    const configOf = async (agentId: string) => (orchestrator as any).buildAgentConfig(
+      (await getDb().select().from(agents).where(sql`${agents.id} = ${agentId}`))[0],
+    ) as Promise<{ turnEndCompaction?: boolean }>;
+    assert.equal((await configOf(current.agent.id)).turnEndCompaction, true);
+    assert.equal((await configOf(old.agent.id)).turnEndCompaction, undefined);
+    for (const start of orchestrator.starts) {
+      assert.equal(start.config.turnEndCompaction, undefined, "the starts before the flag change were off");
+    }
+  } finally {
+    await orchestrator.shutdown();
+  }
 });
 
 // View Context rides the same per-server, default-off path: the daemon keeps
@@ -382,10 +536,10 @@ test("inbox items: the flag on with no RAFT_INBOX_ITEMS_LAUNCH_AT is off, in age
 // `server:features:request` (shared featuresChanged.ts): a daemon told that a
 // flag changed asks for the values instead of waiting for each agent's next
 // start, so the answer must be exactly what an agent:start now carries.
-async function startAndAskFeatures(seeded: Awaited<ReturnType<typeof seed>>) {
+async function startAndAskFeatures(seeded: Awaited<ReturnType<typeof seed>>, capabilities: readonly string[] = []) {
   const orchestrator = new CapturingOrchestrator();
   try {
-    bindMachine(orchestrator, seeded.machine.id, seeded.server.id);
+    bindMachine(orchestrator, seeded.machine.id, seeded.server.id, capabilities);
     assert.equal((await orchestrator.startAgent(seeded.agent.id)).outcome, "dispatched");
     await orchestrator.handleMachineMessage(seeded.machine.id, { type: "server:features:request", requestId: "req-1" });
     assert.equal(orchestrator.featureAnswers.length, 1);
@@ -467,8 +621,10 @@ test("server features: with every key on, the answer and agent:start still agree
   }
   const seeded = await seed("sf-all-on");
   await createFeatureFlagRule({ flagKey: TASK_V2_CONVERSATIONS_FEATURE_FLAG_KEY, stage: "server", decision: "allow", values: [seeded.server.id] });
+  await createFeatureFlagRule({ flagKey: DM_REPLY_PLACEMENT_FEATURE_FLAG_KEY, stage: "server", decision: "allow", values: [seeded.server.id] });
   __answerFlagForTests(WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY, true);
-  const { config, answer } = await startAndAskFeatures(seeded);
+  // turnEndCompaction also needs the daemon's capability (#proj-runtime:#67).
+  const { config, answer } = await startAndAskFeatures(seeded, [DAEMON_CAPABILITY_TURN_END_COMPACTION_V2]);
   assert.deepEqual(answer.msg.features, {
     subagentDelegation: true,
     passiveAx: true,
@@ -480,6 +636,7 @@ test("server features: with every key on, the answer and agent:start still agree
     turnEndCompaction: true,
     wakeRecycleWarm: true,
     taskConversations: true,
+    dmReplyPlacement: true,
     agentContextView: true,
     inboxItems: true,
     inboxItemsLaunchAt: "2026-01-01T00:00:00.000Z",

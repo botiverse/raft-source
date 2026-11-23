@@ -63,12 +63,13 @@ import { getDb } from "../db/index";
 import { refuse } from "../lib/refusal";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
 import {
-  claimAccountDeletionEmailCode,
-  consumeAccountDeletionEmailCode,
-  parseAccountDeletionEmailCode,
-  sendAccountDeletionEmailCode,
+  ACCOUNT_DELETION_EMAIL_CODE_FLOW,
+  claimEmailCode,
+  consumeEmailCode,
+  parseEmailCode,
+  sendEmailCode,
 } from "../services/accountDeletion/emailCode";
-import { accountDeletionReauthFor, type AccountDeletionReauthMethod } from "../services/accountDeletion/reauth";
+import { sensitiveReauthFor, type SensitiveReauthMethod } from "../services/sensitiveReauth";
 import {
   AccountDeletionUnavailableError,
   cancelAccountDeletion,
@@ -127,7 +128,7 @@ function effectDeps(req: Request): AccountDeletionEffectDeps {
   };
 }
 
-function sendReauthRequired(res: Response, methods: AccountDeletionReauthMethod[]): void {
+function sendReauthRequired(res: Response, methods: SensitiveReauthMethod[]): void {
   res.status(403).json({ error: "Confirm it's you before deleting your account.", code: "reauth_required", methods });
 }
 
@@ -238,12 +239,12 @@ accountDeletionRouter.delete("/requests/:requestId", async (req, res) => {
 accountDeletionRouter.post("/email-code", async (req, res) => {
   try {
     const userId = req.userId!;
-    const reauth = await accountDeletionReauthFor(userId);
+    const reauth = await sensitiveReauthFor(userId);
     if (reauth.kind !== "email_code") {
       res.status(409).json({ error: "Confirm it's you another way.", code: "email_code_not_available", methods: reauth.methods });
       return;
     }
-    const sent = await sendAccountDeletionEmailCode({ userId, familyId: webSessionFamilyOf(req)!, now: currentDate() });
+    const sent = await sendEmailCode(ACCOUNT_DELETION_EMAIL_CODE_FLOW, { userId, familyId: webSessionFamilyOf(req)!, now: currentDate() });
     if (!sent.ok) {
       res.setHeader("Retry-After", String(sent.retryAfterSeconds));
       res.status(429).json({ error: "A code was just sent. Wait a minute before asking for another.", code: "email_code_recently_sent", retryAfterSeconds: sent.retryAfterSeconds });
@@ -292,7 +293,7 @@ accountDeletionRouter.post("/", async (req, res) => {
     }
     const input = { userId, source: "self" as const, actorUserId: userId, now, forceAgentIds };
     const deps = effectDeps(req);
-    const reauth = await accountDeletionReauthFor(userId);
+    const reauth = await sensitiveReauthFor(userId);
 
     if (reauth.kind === "second_factor") {
       const answer = parseStepUpAnswer(body.secondFactor);
@@ -315,7 +316,7 @@ accountDeletionRouter.post("/", async (req, res) => {
       await reauthenticateWithPassword({ userId, familyId, password: body.password, now });
       recent = true;
     }
-    const emailCode = reauth.kind === "email_code" && !recent ? parseAccountDeletionEmailCode(body.emailCode) : null;
+    const emailCode = reauth.kind === "email_code" && !recent ? parseEmailCode(body.emailCode) : null;
     if (!recent && !emailCode) {
       if (reauth.kind === "email_code" && body.emailCode !== undefined) {
         res.status(400).json({ error: "Enter the 6-digit code from the email.", code: "email_code_invalid" });
@@ -331,7 +332,7 @@ accountDeletionRouter.post("/", async (req, res) => {
       return;
     }
 
-    const claimed = await claimAccountDeletionEmailCode({ userId, familyId, code: emailCode!, now });
+    const claimed = await claimEmailCode(ACCOUNT_DELETION_EMAIL_CODE_FLOW, { userId, familyId, code: emailCode!, now });
     if (!claimed.ok) {
       if (claimed.reason === "locked") {
         res.status(429).json({ error: "Too many wrong codes. Try again later.", code: "second_factor_locked", lockedUntil: claimed.lockedUntil.toISOString() });
@@ -344,7 +345,7 @@ accountDeletionRouter.post("/", async (req, res) => {
       await sendOutcome(res, userId, await requestAccountDeletion(input, {
         ...deps,
         inTransaction: async (tx) => {
-          if (!(await consumeAccountDeletionEmailCode(tx, { userId, challengeId: claimed.challengeId, now }))) throw new EmailCodeGone();
+          if (!(await consumeEmailCode(ACCOUNT_DELETION_EMAIL_CODE_FLOW, tx, { userId, challengeId: claimed.challengeId, now }))) throw new EmailCodeGone();
         },
       }));
     } catch (err) {

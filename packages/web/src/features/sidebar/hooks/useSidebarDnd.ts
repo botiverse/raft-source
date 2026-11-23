@@ -6,8 +6,8 @@ import { isSidebarDndProbeEnabled, recordSidebarDndCollisionBranch } from "../..
 import type { Channel } from "../../../store/channelStore";
 import { toggleChannelActivityMute as toggleSharedChannelActivityMute } from "../../../store/channelActivityMuteToggle";
 import { isSidebarExternalSectionChannel } from "../../../components/layout/sidebarChannelVisibility";
-import { moveSidebarItemToCustomSection, moveSidebarItemToCustomSectionAtPosition, reorderSidebarSectionOrder, removeSidebarItemPlacement, sidebarCreateSectionUpdate, sidebarMoveToCustomSectionUpdate, sidebarMoveToPinnedUpdate, sidebarSectionItemKey } from "../../../store/sidebarSections";
-import type { SidebarCustomSection } from "../../../store/sidebarSections";
+import { moveSidebarItemToCustomSection, moveSidebarItemToCustomSectionAtPosition, reorderSidebarSectionOrder, removeSidebarItemPlacement, sidebarCreateSectionUpdate, sidebarMoveToCustomSectionUpdate, sidebarMoveToHomeUpdate, sidebarMoveToPinnedUpdate, sidebarSectionItemKey } from "../../../store/sidebarSections";
+import type { SidebarCustomSection, SidebarSectionPlacement } from "../../../store/sidebarSections";
 import { hasSidebarPinnedRef, removeSidebarPinnedRef, sidebarPinnedRefKey, upsertSidebarPinnedRef } from "../../../utils/sidebarPinnedRefs";
 import type { SidebarPinnedRef } from "../../../utils/sidebarPinnedRefs";
 import { findSidebarDndContainer, isPointerWithinSidebarDndBounds, isSidebarDndData, moveSidebarDndItem, SIDEBAR_DND_DROP_INDEX_KEY, sidebarDndCollisionDropIndex, sidebarDndContainerDropIndex, resolveSidebarDndRetainedContainer, replaceSidebarSubsetOrder, sidebarCustomSectionId, SIDEBAR_CHANNELS_CONTAINER_ID, SIDEBAR_DMS_CONTAINER_ID, SIDEBAR_JOINT_CHANNELS_CONTAINER_ID, SIDEBAR_PINNED_CONTAINER_ID } from "../../../components/layout/sidebarDnd";
@@ -134,20 +134,38 @@ export function useSidebarDnd(data: SidebarData, view: SidebarViewState, sync: S
     return dm ? pinnedRefForDmChannel(dm) : { kind: "channel", id: item.id };
   }, [dmChannels]);
 
+  // The pins a move starts from: without a DM's legacy `channel:<dm id>` pin
+  // (what the old DM Pin switch wrote), which the sidebar never shows as
+  // Pinned but which hides the DM from a custom section, as channel settings'
+  // select drops it (useConversationSidebarSection `stalePinnedRefs`).
+  const basePinnedForMovableItem = useCallback((item: SidebarMovableItem): SidebarPinnedRef[] => {
+    if (item.kind !== "channel" || !dmChannels.some((channel) => channel.id === item.id)) return pinnedRefs;
+    const stale: SidebarPinnedRef = { kind: "channel", id: item.id };
+    return hasSidebarPinnedRef(pinnedRefs, stale) ? removeSidebarPinnedRef(pinnedRefs, stale) : pinnedRefs;
+  }, [dmChannels, pinnedRefs]);
+
+  /** Write `update`, with the stale pin dropped when the move left the pins alone. */
+  const writeMove = useCallback((base: SidebarPinnedRef[], update: Partial<{ pinned: SidebarPinnedRef[]; sectionPlacements: SidebarSectionPlacement[] }>) => {
+    const withStale = update.pinned || base === pinnedRefs ? update : { ...update, pinned: base };
+    if (Object.keys(withStale).length > 0) void updateSidebarOrder(withStale);
+  }, [pinnedRefs, updateSidebarOrder]);
+
   const moveItemToPinned = useCallback((item: SidebarMovableItem) => {
     const ref = pinnedRefForMovableItem(item);
     if (!ref) return;
-    void updateSidebarOrder(sidebarMoveToPinnedUpdate({ pinned: pinnedRefs, sectionPlacements }, item, ref));
-  }, [pinnedRefForMovableItem, pinnedRefs, sectionPlacements, updateSidebarOrder]);
+    const base = basePinnedForMovableItem(item);
+    writeMove(base, sidebarMoveToPinnedUpdate({ pinned: base, sectionPlacements }, item, ref));
+  }, [basePinnedForMovableItem, pinnedRefForMovableItem, sectionPlacements, writeMove]);
 
   const moveItemToCustomSection = useCallback((item: SidebarMovableItem, sectionId: string) => {
-    void updateSidebarOrder(sidebarMoveToCustomSectionUpdate(
-      { pinned: pinnedRefs, sectionPlacements },
+    const base = basePinnedForMovableItem(item);
+    writeMove(base, sidebarMoveToCustomSectionUpdate(
+      { pinned: base, sectionPlacements },
       item,
       sectionId,
       pinnedRefForMovableItem(item),
     ));
-  }, [pinnedRefForMovableItem, pinnedRefs, sectionPlacements, updateSidebarOrder]);
+  }, [basePinnedForMovableItem, pinnedRefForMovableItem, sectionPlacements, writeMove]);
 
   // Placements and pins after moving `added` into the section and `removed`
   // back to their default sections.
@@ -164,15 +182,20 @@ export function useSidebarDnd(data: SidebarData, view: SidebarViewState, sync: S
     return { sectionPlacements: nextPlacements, pinned: nextPinned };
   }, [pinnedRefForMovableItem, pinnedRefs, sectionPlacements]);
 
-  const removeItemFromCustomSection = useCallback((item: SidebarMovableItem) => {
-    void updateSidebarOrder({ sectionPlacements: removeSidebarItemPlacement(sectionPlacements, item) });
-  }, [sectionPlacements, updateSidebarOrder]);
+  // Back to its home section (Channels, Joint Channels / External or Direct
+  // Messages): out of Pinned and any custom section, as channel settings'
+  // select. Already home writes nothing, except to clear a stale pin or a
+  // placement in a deleted section.
+  const moveItemToHome = useCallback((item: SidebarMovableItem) => {
+    const base = basePinnedForMovableItem(item);
+    writeMove(base, sidebarMoveToHomeUpdate({ pinned: base, sectionPlacements }, item, pinnedRefForMovableItem(item)));
+  }, [basePinnedForMovableItem, pinnedRefForMovableItem, sectionPlacements, writeMove]);
 
   const createCustomSection = useCallback((value: { name: string; emoji: string | null }, moveItem?: SidebarMovableItem, insertBefore?: string) => {
     const id = crypto.randomUUID();
     const section: SidebarCustomSection = { id, name: value.name, emoji: value.emoji, sortMode: "manual" };
     void updateSidebarOrder(sidebarCreateSectionUpdate(
-      { customSections, sectionOrder, sectionPlacements, pinned: pinnedRefs },
+      { customSections, sectionOrder, sectionPlacements, pinned: moveItem ? basePinnedForMovableItem(moveItem) : pinnedRefs },
       section,
       { insertBefore, moveItem, moveItemRef: moveItem ? pinnedRefForMovableItem(moveItem) : null },
     ));
@@ -184,7 +207,7 @@ export function useSidebarDnd(data: SidebarData, view: SidebarViewState, sync: S
       sectionName: value.name,
       initialKeys: moveItem ? [sidebarSectionItemKey(moveItem.kind, moveItem.id)] : [],
     });
-  }, [customSections, pinnedRefForMovableItem, pinnedRefs, sectionOrder, sectionPlacements, updateSidebarOrder]);
+  }, [basePinnedForMovableItem, customSections, pinnedRefForMovableItem, pinnedRefs, sectionOrder, sectionPlacements, updateSidebarOrder]);
 
 
   const deleteCustomSection = useCallback((sectionId: string) => {
@@ -529,8 +552,8 @@ export function useSidebarDnd(data: SidebarData, view: SidebarViewState, sync: S
   ]);
   // Stryker restore all
   return {
-    togglePinnedRef, moveItemToPinned, moveItemToCustomSection, placementsForSectionChange,
-    removeItemFromCustomSection, createCustomSection, deleteCustomSection, togglePinChannel,
+    togglePinnedRef, pinnedRefForMovableItem, moveItemToPinned, moveItemToHome, moveItemToCustomSection, placementsForSectionChange,
+    createCustomSection, deleteCustomSection, togglePinChannel,
     toggleChannelActivityMute, togglePinAgent, togglePinDm, sidebarCollisionDetection, resetSidebarDnd,
     handleSidebarDragStart, handleSidebarDragOver, handleSidebarDragEnd,
   };

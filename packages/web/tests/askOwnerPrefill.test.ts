@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createIntl } from "react-intl";
 import { PLAN_UPGRADE_REASON_MAX_LENGTH, UPGRADE_GATES } from "@botiverse/raft-shared";
-import { askOwnerPrefill } from "../src/components/billing/upgradeGateCopy";
+import { askOwnerPrefill, formatFreezeDeadline } from "../src/components/billing/upgradeGateCopy";
 import { en } from "../src/i18n/messages/en";
 import { es } from "../src/i18n/messages/es";
 import { ja } from "../src/i18n/messages/ja";
@@ -72,5 +72,35 @@ test("a channel name too long for a request card falls back to the message witho
     const prefill = askOwnerPrefill(localized.formatMessage, "external_channel_free_limit", "Acme", PLAN_UPGRADE_REASON_MAX_LENGTH, { kind: "slot", channel: longChannel });
     assert.ok(codePoints(prefill) <= PLAN_UPGRADE_REASON_MAX_LENGTH, `${locale}: ${codePoints(prefill)}`);
     assert.equal(prefill, askOwnerPrefill(localized.formatMessage, "external_channel_free_limit", "Acme", PLAN_UPGRADE_REASON_MAX_LENGTH), `${locale}: the message without the channel`);
+  }
+});
+
+// Warden: before the freeze (ExternalFreezeNotice), the frozen gate's ask says from
+// when the server can't post, not "again"; only that gate reads the deadline, and a
+// long server name is still cut short around it.
+test("the external freeze's ask before it starts names the deadline, and still fits a request card", () => {
+  const intl = createIntl({ locale: "en", messages: en, timeZone: "UTC" });
+  const upcoming = { kind: "freeze_upcoming", deadline: "2026-11-25T15:00:00.000Z" } as const;
+  assert.equal(
+    askOwnerPrefill(intl.formatMessage, "external_channel_frozen", "Acme", PLAN_UPGRADE_REASON_MAX_LENGTH, upcoming, intl.formatDate),
+    "Acme can't post in its external channels from Nov 25, 2026, 3:00 PM. Could we upgrade Acme to Pro so we can keep posting in all of them?",
+  );
+  assert.equal(
+    askOwnerPrefill(intl.formatMessage, "external_channel_free_limit", "Acme", PLAN_UPGRADE_REASON_MAX_LENGTH, upcoming, intl.formatDate),
+    askOwnerPrefill(intl.formatMessage, "external_channel_free_limit", "Acme", PLAN_UPGRADE_REASON_MAX_LENGTH),
+    "the slot limit has no deadline to name",
+  );
+  assert.equal(
+    askOwnerPrefill(intl.formatMessage, "external_channel_frozen", "Acme", PLAN_UPGRADE_REASON_MAX_LENGTH, upcoming),
+    askOwnerPrefill(intl.formatMessage, "external_channel_frozen", "Acme", PLAN_UPGRADE_REASON_MAX_LENGTH),
+    "no formatDate: the gate's own ask, never a raw ISO date",
+  );
+
+  for (const [locale, messages] of Object.entries(CATALOGS)) {
+    const localized = createIntl({ locale, messages: { ...en, ...messages }, timeZone: "UTC" });
+    const prefill = askOwnerPrefill(localized.formatMessage, "external_channel_frozen", LONGEST_NAME, PLAN_UPGRADE_REASON_MAX_LENGTH, upcoming, localized.formatDate);
+    assert.ok(codePoints(prefill) <= PLAN_UPGRADE_REASON_MAX_LENGTH, `${locale}: ${codePoints(prefill)}`);
+    assert.ok(prefill.includes(formatFreezeDeadline(localized.formatDate, upcoming.deadline)), `${locale}: names the deadline`);
+    assert.ok(prefill.includes("Northwind") && prefill.includes("…"), `${locale}: the server name cut short`);
   }
 });

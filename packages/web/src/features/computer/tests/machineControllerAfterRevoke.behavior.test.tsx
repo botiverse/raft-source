@@ -46,12 +46,12 @@ const server: Server = {
 
 /**
  * A Computer the adopter took over from its previous machine-row owner, whose
- * key was then revoked: no live attach record, so the list sends no attacher
- * or creator, and the row still belongs to the previous owner (`userId`). The
- * server's routes keep its rename and rescan with the adopter
- * (computerControllerUserId), which `controlledByCurrentUser` carries.
+ * key was then revoked: no live attach record, so no controller
+ * (computerControllerUserId is the live attacher only). The list sends no
+ * attacher, creator or `controlledByCurrentUser` to anyone, and the row still
+ * belongs to the previous owner (`userId`). Only owners and admins act on it.
  */
-function revokedAdoptedComputer(viewer: string): Machine {
+function revokedAdoptedComputer(): Machine {
   return {
     id: "m1",
     name: "Build Box",
@@ -69,15 +69,15 @@ function revokedAdoptedComputer(viewer: string): Machine {
     computerAttachedByCurrentUser: false,
     creator: null,
     userId: PREVIOUS_OWNER,
-    controlledByCurrentUser: viewer === ADOPTER,
+    controlledByCurrentUser: false,
     runtimeDetection: { status: "incomplete", reason: "deadline", unfinishedRuntimes: [] },
   };
 }
 
-function renderAs(viewer: string) {
-  const target = revokedAdoptedComputer(viewer);
+function renderAs(viewer: string, role: Server["role"] = "member") {
+  const target = revokedAdoptedComputer();
   useAuthStore.setState({ user: { id: viewer } } as never);
-  useServerStore.setState({ current: server, members: [] });
+  useServerStore.setState({ current: { ...server, role }, members: [] });
   useAgentStore.setState({ agents: [] });
   useMachineStore.setState({
     machines: [target],
@@ -96,11 +96,17 @@ function renderAs(viewer: string) {
 
 const renameButton = () => screen.queryByRole("button", { name: "Edit computer name" });
 
-test("after a revoke the adopter, a plain member, still gets rename and rescan", () => {
+test("after a revoke the adopter, a plain member, no longer gets rename or rescan: the revoked record names no controller", () => {
   renderAs(ADOPTER);
-  assert.equal(renameButton() !== null, true, "rename offered to the adopter");
-  assert.equal(screen.queryByTestId("machine-runtime-detection-rescan") !== null, true, "rescan offered to the adopter");
-  assert.equal(screen.queryByTestId("machine-runtime-detection-rescan-hint") === null, true, "no rescan-not-allowed hint");
+  assert.equal(renameButton() === null, true, "no rename for the former attacher");
+  assert.equal(screen.queryByTestId("machine-runtime-detection-rescan") === null, true, "no rescan for the former attacher");
+  assert.equal(screen.queryByTestId("machine-runtime-detection-rescan-hint") !== null, true, "the rescan-not-allowed hint instead");
+});
+
+test("after a revoke an admin still gets rename and rescan", () => {
+  renderAs("user-admin", "admin");
+  assert.equal(renameButton() !== null, true, "rename offered to the admin");
+  assert.equal(screen.queryByTestId("machine-runtime-detection-rescan") !== null, true, "rescan offered to the admin");
 });
 
 test("after a revoke the previous machine-row owner gets neither, though the row is still theirs", () => {
@@ -110,7 +116,7 @@ test("after a revoke the previous machine-row owner gets neither, though the row
   assert.equal(screen.queryByTestId("machine-runtime-detection-rescan-hint") !== null, true, "the rescan-not-allowed hint instead");
 });
 
-test("restart and upgrade stay hidden from the adopter on the revoked Computer: the server refuses them as not a Computer", () => {
+test("restart and upgrade stay hidden from the adopter on the revoked Computer", () => {
   renderAs(ADOPTER);
   assert.equal(screen.queryByTestId("computer-service-actions") === null, true, "no restart/upgrade card");
   assert.equal(screen.queryByTestId("computer-upgrade-actions") === null, true, "no upgrade actions");

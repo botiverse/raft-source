@@ -186,4 +186,6 @@ try {
   await admin.query(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`).catch(() => {});
   await admin.end();
 }
-}, 120_000);
+// About 15 CLI runs, each a cold node + TypeScript start. Staging runs take 57-90 s and one took 127 s on a busy
+// runner (run 43908947189, all checks passed), so 120 s was too tight; 240 s keeps a real hang visible.
+}, 240_000);

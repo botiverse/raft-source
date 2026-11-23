@@ -3,6 +3,7 @@
     {
       "key": "notion",
       "name": "Notion",
+      "publisherName": "Notion",
       "description": "Search and update the Notion workspace you authorize.",
       "homepageUrl": "https://www.notion.so",
       "logoUrl": "https://app.raft.build/app-logos/notion.svg",
@@ -13,6 +14,7 @@
     {
       "key": "linear",
       "name": "Linear",
+      "publisherName": "Linear",
       "description": "Find, create, and update Linear issues, projects, and comments.",
       "homepageUrl": "https://linear.app",
       "logoUrl": "https://app.raft.build/app-logos/linear.svg",
@@ -23,6 +25,7 @@
     {
       "key": "atlassian",
       "name": "Jira and Confluence",
+      "publisherName": "Atlassian",
       "description": "Issues and knowledge in the Atlassian site you authorize.",
       "homepageUrl": "https://www.atlassian.com",
       "logoUrl": "https://app.raft.build/app-logos/atlassian.svg",
@@ -33,6 +36,7 @@
     {
       "key": "figma",
       "name": "Figma",
+      "publisherName": "Figma",
       "description": "Design context from Figma. Account access and OAuth client compatibility must be verified.",
       "homepageUrl": "https://www.figma.com",
       "logoUrl": "https://app.raft.build/app-logos/figma.svg",
@@ -44,6 +48,7 @@
     {
       "key": "gmail",
       "name": "Gmail",
+      "publisherName": "Google",
       "description": "Email access. Requires Google Workspace Developer Preview, API enablement, and an OAuth client.",
       "homepageUrl": "https://mail.google.com",
       "logoUrl": "https://app.raft.build/app-logos/gmail.png",
@@ -54,6 +59,7 @@
     {
       "key": "drive",
       "name": "Google Drive",
+      "publisherName": "Google",
       "description": "Files and search. Requires Google Workspace Developer Preview, API enablement, and an OAuth client.",
       "homepageUrl": "https://drive.google.com",
       "logoUrl": "https://app.raft.build/app-logos/drive.png",
@@ -64,6 +70,7 @@
     {
       "key": "calendar",
       "name": "Google Calendar",
+      "publisherName": "Google",
       "description": "Calendars and events. Requires Google Workspace Developer Preview, API enablement, and an OAuth client.",
       "homepageUrl": "https://calendar.google.com",
       "logoUrl": "https://app.raft.build/app-logos/calendar.png",
@@ -74,6 +81,7 @@
     {
       "key": "sentry",
       "name": "Sentry",
+      "publisherName": "Sentry",
       "description": "Errors and debugging context in your Sentry organization.",
       "homepageUrl": "https://sentry.io",
       "logoUrl": "https://app.raft.build/app-logos/sentry.ico",
@@ -84,6 +92,7 @@
     {
       "key": "airtable",
       "name": "Airtable",
+      "publisherName": "Airtable",
       "description": "Bases and records in the Airtable workspace you authorize.",
       "homepageUrl": "https://airtable.com",
       "logoUrl": "https://app.raft.build/app-logos/airtable.ico",
@@ -95,6 +104,7 @@
     {
       "key": "monday",
       "name": "monday.com",
+      "publisherName": "monday.com",
       "description": "Boards and work items. Workspace administrators may need to allow the callback URL.",
       "homepageUrl": "https://monday.com",
       "logoUrl": "https://app.raft.build/app-logos/monday.png",
@@ -105,6 +115,7 @@
     {
       "key": "asana",
       "name": "Asana",
+      "publisherName": "Asana",
       "description": "Tasks and projects. Register an OAuth client before connecting.",
       "homepageUrl": "https://asana.com",
       "logoUrl": "https://app.raft.build/app-logos/asana.ico",
@@ -116,6 +127,7 @@
     {
       "key": "hubspot",
       "name": "HubSpot",
+      "publisherName": "HubSpot",
       "description": "CRM context. Requires a HubSpot auth app and account authorization.",
       "homepageUrl": "https://www.hubspot.com",
       "logoUrl": "https://app.raft.build/app-logos/hubspot.png",
@@ -127,6 +139,7 @@
     {
       "key": "stripe",
       "name": "Stripe",
+      "publisherName": "Stripe",
       "description": "Stripe account tools. Choose a test account and review tool permissions before use.",
       "homepageUrl": "https://stripe.com",
       "logoUrl": "https://app.raft.build/app-logos/stripe.svg",
@@ -137,6 +150,7 @@
     {
       "key": "supabase",
       "name": "Supabase",
+      "publisherName": "Supabase",
       "description": "Supabase projects. Project-specific URL parameters are not yet supported by Raft.",
       "homepageUrl": "https://supabase.com",
       "logoUrl": "https://app.raft.build/app-logos/supabase.png",
@@ -147,6 +161,7 @@
     {
       "key": "sheets",
       "name": "Google Sheets",
+      "publisherName": "Google",
       "description": "Spreadsheets. Requires Google Workspace Developer Preview, API enablement, and an OAuth client.",
       "homepageUrl": "https://sheets.google.com",
       "logoUrl": "https://app.raft.build/app-logos/sheets.png",
@@ -157,6 +172,7 @@
     {
       "key": "docs",
       "name": "Google Docs",
+      "publisherName": "Google",
       "description": "Documents. Requires Google Workspace Developer Preview, API enablement, and an OAuth client.",
       "homepageUrl": "https://docs.google.com",
       "logoUrl": "https://app.raft.build/app-logos/docs.png",
@@ -167,6 +183,7 @@
     {
       "key": "slides",
       "name": "Google Slides",
+      "publisherName": "Google",
       "description": "Presentations. Requires Google Workspace Developer Preview, API enablement, and an OAuth client.",
       "homepageUrl": "https://slides.google.com",
       "logoUrl": "https://app.raft.build/app-logos/slides.png",
@@ -177,6 +194,7 @@
     {
       "key": "workiq",
       "name": "Microsoft 365 Work IQ",
+      "publisherName": "Microsoft",
       "description": "Microsoft 365 context. Requires tenant setup, delegated permissions, and an OAuth client.",
       "homepageUrl": "https://www.microsoft.com/microsoft-365",
       "logoUrl": "https://app.raft.build/app-logos/workiq.png",
@@ -188,6 +206,7 @@
     {
       "key": "canva",
       "name": "Canva",
+      "publisherName": "Canva",
       "description": "Designs in your Canva account. Requires OAuth client setup before connecting.",
       "homepageUrl": "https://www.canva.com",
       "logoUrl": "https://app.raft.build/app-logos/canva.svg",
@@ -199,6 +218,7 @@
     {
       "key": "perplexity",
       "name": "Perplexity",
+      "publisherName": "Perplexity",
       "description": "Web search and cited answers from Perplexity, using the Perplexity account you sign in with.",
       "homepageUrl": "https://www.perplexity.ai",
       "logoUrl": "https://app.raft.build/app-logos/perplexity.png",

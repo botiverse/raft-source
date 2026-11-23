@@ -26,6 +26,8 @@ const CONTEXT_SIZE = {
   "account-tile": "lg",
   /** The profile hover card: lg 51. */
   "mention-card": "lg",
+  /** The agent on a voice call's window (AgentVoiceCallWindow): lg 51. */
+  "call-window": "lg",
   /** A panel head's avatar: 35 on a phone and a touch screen (a 56px head);
    *  27 with a mouse on a desktop, in a 44px head beside its 28px tiles
    *  (raft-design panel.md: a head's avatar is `sm`; stdrc, 2026-11-04). */

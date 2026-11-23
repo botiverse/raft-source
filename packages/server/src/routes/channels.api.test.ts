@@ -25,7 +25,7 @@ import {
   userChannelDisplayPrefs, featureFlags,
   channelHumans, serverAgentMembers, notificationOutbox
 } from "../db/schema";
-import { addMember, updateServerOnboardingAgent } from "../services/serverService";
+import { addMember, linkOfficialOnboardingAgent } from "../services/serverService";
 import { createAgent } from "../services/agentService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import { createChannel, getOrCreateThread, addHuman, addAgent, removeHuman, findOrCreateUserDM, canUserPostToChannel, archiveChannel, deleteChannel, listThreadChannelIdsForParentChannel, markRead, getInboxItems, type InboxItem } from "../services/channelService";
@@ -711,7 +711,9 @@ testMuteFlagOff("GET/PATCH /api/channels/:id/notification-settings stores per-us
     const mentionInbox = await getInbox("mentions");
     const mentionItem = mentionInbox.items.find((item) => item.kind === "channel" && item.channelId === channel.id);
     assert.ok(mentionItem, "direct @mention should pierce channel activity mute for Mentions");
-    assert.equal(mentionItem.lastMessageId, mentionMessage.id);
+    // The row keeps its latest pre-mute message; the mention past the mute
+    // lights the @ without moving it (as RisingWave's muted prefix).
+    assert.equal(mentionItem.lastMessageId, ordinaryMutedMessage.id);
     assert.equal(mentionItem.hasMention, true);
     // Re-mute anchored mute_from_seq after the formerly-muted message, so
     // under live derivation that message is ordinary unread (it predates the
@@ -1454,7 +1456,7 @@ test("manually hidden #all does not auto-reveal when a second agent joins", asyn
   assert.equal(hide.status, 200, "admin manual hide should succeed");
 
   const oaAgent = await createAgent(server.id, "manual-hidden-agent-all-oa", { runtime: "codex" });
-  await updateServerOnboardingAgent(server.id, oaAgent.id);
+  await linkOfficialOnboardingAgent(server.id, oaAgent.id);
   await createAgent(server.id, "manual-hidden-agent-all-second", { runtime: "codex" });
 
   const [allAfterSecondAgent] = await getDb()
@@ -1492,7 +1494,7 @@ test("hiding an already-hidden #all still claims the unlock instruction", async 
   assert.equal(hide.status, 200, await hide.clone().text());
 
   const oaAgent = await createAgent(server.id, "already-hidden-all-oa", { runtime: "codex" });
-  await updateServerOnboardingAgent(server.id, oaAgent.id);
+  await linkOfficialOnboardingAgent(server.id, oaAgent.id);
   await createAgent(server.id, "already-hidden-all-second", { runtime: "codex" });
 
   const [allAfterGrowth] = await getDb()
@@ -1550,8 +1552,8 @@ test("opener-world hidden #all auto-reveals when the 2nd agent arrives", async (
 
     const firstAgent = await createAgent(server.id, "opener-first-agent", { runtime: "codex" });
     // Mirrors the real flow: the first (onboarding) agent is registered on the
-    // server so pickOnboardingAgent can address the unlock message to it.
-    await updateServerOnboardingAgent(server.id, firstAgent.id);
+    // server so pickOfficialOnboardingAgent can address the unlock message to it.
+    await linkOfficialOnboardingAgent(server.id, firstAgent.id);
     const agentOrchestrator = app.app.get("agentOrchestrator");
     const unlockedEarly = await triggerAllChannelUnlockOnboarding(app.io, agentOrchestrator, server.id);
     assert.equal(unlockedEarly, false, "one agent must not unlock #all");
@@ -2596,7 +2598,9 @@ test("POST /channels/:id/read-all delegates to a kinded agent receiver without t
     headers: headers(memberToken, server.id),
     body: JSON.stringify({ receiver: { kind: "agent", id: agent.id } }),
   });
-  assert.equal(denied.status, 403);
+  // The member can't see the private channel, so the refusal is the missing-channel 404.
+  assert.equal(denied.status, 404);
+  assert.deepEqual(await denied.json(), { error: "Channel not found" });
   const [afterDeniedCursor] = await db.select().from(agentChannelReadCursors).where(and(
     eq(agentChannelReadCursors.agentId, agent.id),
     eq(agentChannelReadCursors.channelId, privateChannel.id),
@@ -2619,6 +2623,77 @@ test("POST /channels/:id/read-all delegates to a kinded agent receiver without t
   );
 });
 
+
+test("POST /channels/:id/read-all agent receiver refusals can't tell a hidden channel from a missing one", async ({ app }) => {
+  const db = getDb();
+  installFakeIo(app.app);
+  const owner = await seedUser("agent-read-hide-owner@slock.test", "agent-read-hide-owner");
+  const member = await seedUser("agent-read-hide-member@slock.test", "agent-read-hide-member");
+  const server = await createServer("Agent Read Hide", "agent-read-hide", owner.id);
+  await addMember(server.id, member.id);
+  const otherServer = await createServer("Agent Read Hide Other", "agent-read-hide-other", owner.id);
+  const ownerAgent = await createAgent(server.id, "agent-read-hide-owner-agent", {
+    runtime: "codex",
+    creatorType: "user",
+    creatorId: owner.id,
+  });
+  const memberAgent = await createAgent(server.id, "agent-read-hide-member-agent", {
+    runtime: "codex",
+    creatorType: "user",
+    creatorId: member.id,
+  });
+  const otherServerAgent = await createAgent(otherServer.id, "agent-read-hide-other-agent", {
+    runtime: "codex",
+    creatorType: "user",
+    creatorId: owner.id,
+  });
+  const hidden = await createChannel(server.id, "agent-read-hide-private", undefined, "private");
+  await addAgent(hidden.id, ownerAgent.id);
+  await addAgent(hidden.id, memberAgent.id);
+  const message = await createMessage(hidden.id, "user", owner.id, "hidden read");
+  const memberToken = await tokenForHuman(member.email);
+
+  const readAll = (channelId: string, agentId: string) => fetch(`${app.baseUrl}/api/channels/${channelId}/read-all`, {
+    method: "POST",
+    headers: headers(memberToken, server.id),
+    body: JSON.stringify({ receiver: { kind: "agent", id: agentId } }),
+  });
+  const answer = async (res: Response) => ({ status: res.status, body: await res.json() });
+
+  const missing = await answer(await readAll(randomUUID(), randomUUID()));
+  assert.deepEqual(missing, { status: 404, body: { error: "Channel not found" } });
+  for (const [label, agentId] of [
+    ["unknown agent id", randomUUID()],
+    ["another server's agent", otherServerAgent.id],
+    ["an agent the caller can't operate", ownerAgent.id],
+  ] as const) {
+    assert.deepEqual(await answer(await readAll(hidden.id, agentId)), missing, `hidden channel, ${label}: same answer as a missing channel`);
+  }
+
+  // An agent the caller operates still goes through in a channel the caller isn't in.
+  const operated = await readAll(hidden.id, memberAgent.id);
+  assert.equal(operated.status, 200);
+  assert.deepEqual(await operated.json(), { ok: true, seq: message.seq, readStateVersion: 1 });
+  const [memberAgentCursor] = await db.select().from(agentChannelReadCursors).where(and(
+    eq(agentChannelReadCursors.agentId, memberAgent.id),
+    eq(agentChannelReadCursors.channelId, hidden.id),
+  ));
+  assert.equal(memberAgentCursor?.lastReadSeq, message.seq);
+
+  // Once the caller can see the channel, the receiver refusals answer as before.
+  await addHuman(hidden.id, member.id);
+  assert.deepEqual(await answer(await readAll(hidden.id, randomUUID())), { status: 404, body: { error: "Read receiver not found" } });
+  assert.deepEqual(await answer(await readAll(hidden.id, otherServerAgent.id)), { status: 404, body: { error: "Read receiver not found" } });
+  assert.deepEqual(await answer(await readAll(hidden.id, ownerAgent.id)), { status: 403, body: { error: "Read receiver is not authorized" } });
+  assert.equal(
+    (await db.select().from(agentChannelReadCursors).where(and(
+      eq(agentChannelReadCursors.agentId, ownerAgent.id),
+      eq(agentChannelReadCursors.channelId, hidden.id),
+    ))).length,
+    0,
+    "refused receivers write nothing",
+  );
+});
 
 test("read-state mutations emit versioned user-room events", async ({ app }) => {
   const previousInfo = console.info;

@@ -1,7 +1,7 @@
 import { SidebarItemIcon } from "@botiverse/raft-ui";
 import { FeedbackIcon } from "@botiverse/ricons";
 import { useCallback, useMemo } from "react";
-import { User, FileText, BookOpenText, Keyboard, ArrowLeftRight, Bell, Building2, Languages, Palette, Type, CreditCard, Shield, BadgeInfo, FlaskConical, KeyRound, AppWindow, BellDot } from "lucide-react";
+import { User, FileText, BookOpenText, Keyboard, ArrowLeftRight, Bell, Building2, Languages, Palette, Type, CreditCard, Shield, BadgeInfo, FlaskConical, AppWindow, BellDot } from "lucide-react";
 import { useServerStore } from "../../../store/serverStore";
 import { isComputerOpen } from "../../../utils/computerPanel";
 import { settingsTabIdForRouteSlug } from "../../../components/settings/settingsNavigation";
@@ -20,11 +20,11 @@ import type { SidebarRowHandlers } from "./useSidebarRowHandlers";
  */
 export function useSidebarRoute(mobileInline: boolean | undefined, data: SidebarData, view: SidebarViewState, rowHandlers: SidebarRowHandlers) {
   const {
-    formatMessage, navigate, location, raftBenchEnabled, labsUiEnabled, providerConnectionsEnabled,
+    formatMessage, navigate, location, raftBenchEnabled, labsUiEnabled,
     slackBridgeEnabled,
   } = data;
   const {
-    currentRole, canManageExternalAuth, canViewBillingSettings, canViewAdministrationSettings,
+    currentRole, canViewBillingSettings, canViewAdministrationSettings,
     canViewApplicationsSettings,
   } = view;
   const { openComputerId } = rowHandlers;
@@ -148,9 +148,6 @@ export function useSidebarRoute(mobileInline: boolean | undefined, data: Sidebar
             ...(labsUiEnabled
               ? [{ id: "labs", label: formatMessage({ id: "settings.tabs.labs" }), icon: <SidebarItemIcon><FlaskConical /></SidebarItemIcon>, onClick: () => navigate(`${pathBase}/settings/labs`) }]
               : []),
-            ...(providerConnectionsEnabled && canManageExternalAuth
-              ? [{ id: "providers", label: formatMessage({ id: "settings.tabs.providers" }), icon: <SidebarItemIcon><KeyRound /></SidebarItemIcon>, onClick: () => navigate(`${pathBase}/settings/providers`) }]
-              : []),
           ],
         },
         {
@@ -168,7 +165,6 @@ export function useSidebarRoute(mobileInline: boolean | undefined, data: Sidebar
         },
       ]
     : [], [
-    canManageExternalAuth,
     canViewAdministrationSettings,
     canViewApplicationsSettings,
     canViewBillingSettings,
@@ -179,7 +175,6 @@ export function useSidebarRoute(mobileInline: boolean | undefined, data: Sidebar
     raftBenchEnabled,
     navigate,
     pathBase,
-    providerConnectionsEnabled,
     settingsServerMuted,
     settingsServerName,
     slackBridgeEnabled,

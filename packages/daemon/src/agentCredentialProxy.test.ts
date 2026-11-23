@@ -6672,6 +6672,49 @@ function deliverIdleWithJoinContext(ledger: AgentVisibleDeliveryLedger, message:
   ledger.recordConsumed("agent-1", { messages: [message], source: "stdin_idle_delivery", contextId });
 }
 
+test("a launch with no coordinator (the OAR host) forwards the seqs its model was shown as seenExactSeqs: on a send, and on a task write only when the sender attested it", async () => {
+  const forwarded = new Map<string, Record<string, unknown>>();
+  const asked: string[] = [];
+  await withUpstream((req, res) => {
+    let raw = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      forwarded.set(`${req.url} ${forwarded.size}`, JSON.parse(raw) as Record<string, unknown>);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ state: "sent", messageId: "sent-1" }));
+    });
+  }, async (serverUrl) => {
+    const handle = await registerAgentCredentialProxy({
+      agentId: "agent-1",
+      launchId: "launch-1",
+      serverUrl,
+      apiKey: "sk_agent_server_side",
+      activeCapabilities: "send,read",
+      getExactSeenSeqs: (target) => { asked.push(target); return target === "dm:@richard" ? [41, 44] : []; },
+    });
+    const post = async (path: string, body: unknown) => {
+      const res = await fetch(`${handle.proxyUrl}${path}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${handle.proxyToken}`, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      assert.equal(res.status, 200);
+    };
+    await post("/internal/agent-api/send", { target: "dm:@richard", content: "reply" });
+    // The CLI's own boundary stays; only the seqs above it are added, beside the CLI's own.
+    await post("/internal/agent-api/send", { target: "dm:@richard", content: "again", seenUpToSeq: 42, seenExactSeqs: [50] });
+    await post("/internal/agent-api/send", { target: "#general", content: "elsewhere" });
+  });
+  const bodies = [...forwarded.values()];
+  assert.equal(bodies.length, 3);
+  assert.deepEqual(bodies[0]!.seenExactSeqs, [41, 44]);
+  assert.equal(bodies[0]!.seenUpToSeq, undefined, "no boundary is invented");
+  assert.deepEqual([bodies[1]!.seenUpToSeq, bodies[1]!.seenExactSeqs], [42, [44, 50]]);
+  assert.equal(bodies[2]!.seenExactSeqs, undefined, "nothing shown there: the send goes as written");
+  assert.deepEqual(asked, ["dm:@richard", "dm:@richard", "#general"]);
+});
+
 test("task #360 sample 1: a thread reply delivered in full is forwarded as an exact seen seq above the boundary", async () => {
   const ledger = new AgentVisibleDeliveryLedger();
   deliverIdleWithJoinContext(ledger, threadReplyWithJoinContext({ triggerSeq: 1030, recentSeqs: [1010, 1020] }));
@@ -7131,7 +7174,7 @@ test("RFC 081: with inbox items on, the inbox check snapshot leaves out the even
   assert.match(cli(off.body.rows), /^Third-party app events · 6 not in this list · /m, "before: the 5 listed events counted again");
   const after = cli(on.body.rows);
   assert.match(after, /^Third-party app events · 1 not in this list · /m);
-  assert.match(after, /^app:stamp\/pr-1 · 3 unread · from Stamp$/m);
+  assert.match(after, /^app:stamp\/pr-1 · 3 unread$/m);
 });
 
 test("RFC 081: a flag turned off after launch gives the inbox check snapshot from before", async () => {

@@ -22,7 +22,9 @@ import { useServerStore } from "../../store/serverStore";
 import { useAgentStore } from "../../store/agentStore";
 import type { Agent } from "../../store/agentStore";
 import { useMachineStore } from "../../store/machineStore";
+import { useServerPermissions } from "../../hooks/useServerPermissions";
 import { buildFeedbackExportBundle, snapshotAgentMachine } from "../../utils/feedbackExportBundle";
+import { privacyModeState } from "../../store/privacyMode";
 import type { FeedbackExportBundleV2 } from "../../utils/feedbackExportBundle";
 import { detectBrowserTimezone } from "../../utils/timeFormatting";
 import { WEB_APP_VERSION } from "../../utils/webAppVersion";
@@ -179,6 +181,7 @@ export default function ReportIssueDialog({
   const getActivityLog = useAgentStore((s) => s.getActivityLog);
   const getTrajectoryLog = useAgentStore((s) => s.getTrajectoryLog);
   const machines = useMachineStore((s) => s.machines);
+  const { capabilities } = useServerPermissions();
   const machine = useMemo(
     () => (agent.machineId ? machines.find((entry) => entry.id === agent.machineId) : null),
     [agent.machineId, machines]
@@ -189,18 +192,24 @@ export default function ReportIssueDialog({
   const [includeActivityLog, setIncludeActivityLog] = useState(true);
   const [includeTrajectoryLog, setIncludeTrajectoryLog] = useState(true);
   const [includeSessionTranscript, setIncludeSessionTranscript] = useState(Boolean(agent.machineId));
-  // Tier 2 (task #272): machine runner log tail, offered only to the human who
-  // attached the machine; the server re-checks ownership. task #279 (artin):
-  // for the reporter's OWN machine it defaults ON — most reports never carried
-  // it while it was off — and stays a visible, untickable box with disclosure.
-  const canIncludeMachineLog = Boolean(agent.machineId && machine?.computerAttachedByCurrentUser);
+  // Tier 2 (task #272): machine runner log tail. The server attaches it for
+  // whoever may edit the Computer (#15305, canManageComputer `edit`, refusal
+  // `machine_log_tail_owner_required`): the person who has it attached now,
+  // or a role with `editMachines` (owner/admin). The box is offered to the
+  // same people; the server re-checks. task #279 (artin): it defaults ON only
+  // for the reporter's OWN attached machine (most reports never carried it
+  // while it was off). On someone else's machine an editMachines role sees it
+  // OFF by default: the tail may hold lines from other people's agents.
+  const isOwnAttachedMachine = Boolean(agent.machineId && machine?.computerAttachedByCurrentUser);
+  const canIncludeMachineLog = isOwnAttachedMachine
+    || Boolean(agent.machineId && machine && capabilities.editMachines);
   // The machine list can load after the dialog mounts, so the default is
-  // DERIVED from ownership at render time rather than captured at mount: until
-  // the user touches the box it follows `canIncludeMachineLog`; once touched,
-  // the user's choice wins and later store updates cannot re-tick it
+  // DERIVED at render time rather than captured at mount: until the user
+  // touches the box it follows `isOwnAttachedMachine`; once touched, the
+  // user's choice wins and later store updates cannot re-tick it
   // (Jianwei, #7798 review).
   const [machineLogTailChoice, setMachineLogTailChoice] = useState<boolean | null>(null);
-  const includeMachineLogTail = machineLogTailChoice ?? canIncludeMachineLog;
+  const includeMachineLogTail = machineLogTailChoice ?? isOwnAttachedMachine;
   const [consented, setConsented] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -235,7 +244,9 @@ export default function ReportIssueDialog({
 
   const handleSubmit = useCallback(async () => {
     if (!consented || loading) return;
-    if (!feedbackExportUrl) {
+    // RAFT_PRIVACY_MODE: nothing goes to Raft's receiver unless the server has
+    // answered that privacy mode is off (still unknown counts as not off).
+    if (!feedbackExportUrl || privacyModeState() !== "off") {
       setError(formatMessage({ id: "agent.reportIssue.exportNotConfigured" }));
       return;
     }

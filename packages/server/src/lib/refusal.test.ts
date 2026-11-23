@@ -8,7 +8,7 @@ import type { AddressInfo } from "node:net";
 import express from "express";
 
 import { globalJsonServerErrorHandler, sendJsonServerError } from "../routes/errorResponse";
-import { rateLimitRefusal, refusalBody, refuse, RefusalError, sentenceQuoting } from "./refusal";
+import { isRefusalStatus, rateLimitRefusal, refusalBody, refuse, RefusalError, refuseServiceError, sentenceQuoting } from "./refusal";
 
 const MOVE_HINT = { cli: ["artifact", "move", "pt_abc", "--to", "server"], op: { name: "artifacts.move", args: { artifact: "pt_abc", to: "server" } } };
 
@@ -30,6 +30,10 @@ async function withApp<T>(fn: (baseUrl: string) => Promise<T>): Promise<T> {
     } catch (err) {
       sendJsonServerError(req, res, { error: "Failed to update channel", logPrefix: "test", err });
     }
+  });
+  app.get("/service/:status", (req, res) => {
+    const status = Number(req.params.status);
+    refuseServiceError(res, { status, code: "comment_empty", message: status < 500 ? "Comment content cannot be empty" : "Failed to create comment message" });
   });
   app.post("/echo", (req, res) => {
     res.json({ got: req.body });
@@ -73,6 +77,20 @@ test("refuse(): retryAfterSeconds is whole seconds, in the body and in Retry-Aft
     const body = await res.json() as { retryAfterSeconds?: number };
     assert.equal(body.retryAfterSeconds, 3);
   });
+});
+
+test("refuseServiceError(): a service error's 4xx is the envelope; a 5xx keeps its plain body", async () => {
+  await withApp(async (base) => {
+    const refused = await fetch(`${base}/service/400`);
+    assert.equal(refused.status, 400);
+    assert.deepEqual(await refused.json(), { error: "Comment content cannot be empty", code: "comment_empty", errorCode: "comment_empty" });
+    const failed = await fetch(`${base}/service/500`);
+    assert.equal(failed.status, 500);
+    assert.deepEqual(await failed.json(), { error: "Failed to create comment message", code: "comment_empty" });
+  });
+  assert.equal(isRefusalStatus(404), true);
+  assert.equal(isRefusalStatus(418), false);
+  assert.equal(isRefusalStatus(503), false);
 });
 
 test("RefusalError below a route is written by the global handler as the envelope", async () => {

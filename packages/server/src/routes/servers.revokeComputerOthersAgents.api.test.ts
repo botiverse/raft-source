@@ -268,3 +268,111 @@ test("no agent is bound to a machine whose Computer key was revoked: create and 
   await autoAssignMachine(server.id, fresh.id);
   assert.equal((await getAgent(auto.id))?.machineId, fresh.id);
 });
+
+// `{ delete: true }` (Delete Computer on one's own Computer): the revoke and the machine's deletion in one request
+// and one transaction, authorized once while the attach record is live. A member who attaches a Computer has no
+// controller authority once its key is revoked, so a revoke followed by a separate DELETE would leave it half done.
+
+/** A member who attaches their own Computer, a colleague's agent on it, and the server's owner. */
+async function seedMemberLaptop(seed: ReturnType<typeof createSeed>, app: { app: { get(name: string): unknown; set(name: string, value: unknown): void } }) {
+  const owner = await seed.human({ name: "Server Owner" });
+  const attacher = await seed.human({ name: "Member Attacher" });
+  const colleague = await seed.human({ name: "Colleague" });
+  const server = await seed.server({ owner, members: [attacher, colleague], name: "Shared" });
+  const laptop = await seedMachine(server.id, attacher.id, "member-laptop", "live");
+  const alpha = await createAgent(server.id, "alpha", { runtime: "external", creatorType: "user", creatorId: colleague.id });
+  await getDb().update(agents).set({ machineId: laptop.id, status: "active" }).where(eq(agents.id, alpha.id));
+  // The machine's socket is on this replica (no replay), and its disconnect is recorded.
+  const disconnected: string[] = [];
+  const real = app.app.get("agentOrchestrator") as object;
+  app.app.set("agentOrchestrator", Object.assign(Object.create(real), {
+    hasMachineLocally: () => true,
+    disconnectMachineForUnlink: async (machineId: string) => { disconnected.push(machineId); return true; },
+  }));
+  return { owner, attacher, colleague, server, laptop, alpha, disconnected, token: async (userId: string) => (await signInForTest(userId)).token };
+}
+
+async function machineAudits(serverId: string) {
+  return getDb().select({ eventType: integrationAuditEvents.eventType, actorId: integrationAuditEvents.actorId, requesterId: integrationAuditEvents.requesterId })
+    .from(integrationAuditEvents)
+    .where(and(eq(integrationAuditEvents.serverId, serverId), inArray(integrationAuditEvents.eventType, ["computer.key_revoked", "computer.removed", "computer.revoke_unbound_others_agents"])))
+    .orderBy(integrationAuditEvents.createdAt, integrationAuditEvents.id);
+}
+
+async function machineExists(machineId: string) {
+  return (await getDb().select({ id: machines.id }).from(machines).where(eq(machines.id, machineId))).length > 0;
+}
+
+test("delete: true — a member attacher deletes their own Computer in one request: key revoked, machine gone, both audit events", async ({ app, seed }) => {
+  const { attacher, server, laptop, alpha, disconnected, token } = await seedMemberLaptop(seed, app);
+  await getDb().update(agents).set({ machineId: null }).where(eq(agents.id, alpha.id));
+  const revokedKeys = await getDb().select({ id: computers.id }).from(computers).where(eq(computers.machineId, laptop.id));
+  // A bad flag is a 400 before anything.
+  const bad = await call(app.baseUrl, await token(attacher.id), "POST", revokePath(server.id, laptop.id), { delete: "yes" });
+  assert.equal(bad.status, 400);
+  assert.equal(await laptopKeyRevokedAt(laptop.id), null);
+
+  const done = await call(app.baseUrl, await token(attacher.id), "POST", revokePath(server.id, laptop.id), { delete: true });
+  assert.deepEqual(done, { status: 200, body: { ok: true, revokedComputers: 1, unboundAgentIds: [], deleted: true } });
+  assert.equal(await machineExists(laptop.id), false, "the machine is gone");
+  const keys = await getDb().select({ revokedAt: computers.revokedAt }).from(computers).where(inArray(computers.id, revokedKeys.map((row) => row.id)));
+  assert.ok(keys.every((key) => key.revokedAt !== null), "its key is revoked");
+  const audits = await machineAudits(server.id);
+  assert.deepEqual(audits.map((event) => event.eventType).sort(), ["computer.key_revoked", "computer.removed"]);
+  for (const event of audits) assert.deepEqual({ actorId: event.actorId, requesterId: event.requesterId }, { actorId: attacher.id, requesterId: attacher.id }, event.eventType);
+  assert.deepEqual(disconnected, [laptop.id], "disconnected after commit, as DELETE does");
+
+});
+
+test("delete: true — someone else's agent on it: the same 409 others_agents_on_computer, nothing revoked or deleted", async ({ app, seed }) => {
+  const { attacher, server, laptop, alpha, disconnected, token } = await seedMemberLaptop(seed, app);
+  const conflict = await call(app.baseUrl, await token(attacher.id), "POST", revokePath(server.id, laptop.id), { delete: true });
+  assert.equal(conflict.status, 409, JSON.stringify(conflict.body));
+  assert.equal(conflict.body.code, "others_agents_on_computer");
+  assert.deepEqual(conflict.body.agents.map((agent: { id: string }) => agent.id), [alpha.id]);
+  assert.equal(await laptopKeyRevokedAt(laptop.id), null);
+  assert.equal(await machineExists(laptop.id), true);
+  assert.equal((await getAgent(alpha.id))?.machineId, laptop.id);
+  assert.deepEqual(await machineAudits(server.id), []);
+  assert.deepEqual(disconnected, []);
+});
+
+test("delete: true — their own agent still on it: deleteMachine's 409 rolls the revoke back too", async ({ app, seed }) => {
+  const { attacher, server, laptop, alpha, token } = await seedMemberLaptop(seed, app);
+  await getDb().update(agents).set({ machineId: null }).where(eq(agents.id, alpha.id));
+  const mine = await createAgent(server.id, "mine", { runtime: "external", creatorType: "user", creatorId: attacher.id });
+  await getDb().update(agents).set({ machineId: laptop.id, status: "active" }).where(eq(agents.id, mine.id));
+  const refused = await call(app.baseUrl, await token(attacher.id), "POST", revokePath(server.id, laptop.id), { delete: true });
+  assert.equal(refused.status, 409, JSON.stringify(refused.body));
+  assert.equal(refused.body.code, "MACHINE_HAS_ASSIGNED_AGENTS");
+  assert.equal(await laptopKeyRevokedAt(laptop.id), null, "the revoke was rolled back with the delete");
+  assert.equal(await machineExists(laptop.id), true);
+  assert.deepEqual(await machineAudits(server.id), []);
+});
+
+test("delete: true with forceAgentIds — others' agents unbound and stopped, the key revoked, the machine deleted, all audited", async ({ app, seed }) => {
+  const { attacher, colleague, server, laptop, alpha, token } = await seedMemberLaptop(seed, app);
+  const forced = await call(app.baseUrl, await token(attacher.id), "POST", revokePath(server.id, laptop.id), { delete: true, forceAgentIds: [alpha.id] });
+  assert.equal(forced.status, 200, JSON.stringify(forced.body));
+  assert.deepEqual(forced.body, { ok: true, revokedComputers: 1, unboundAgentIds: [alpha.id], deleted: true });
+  assert.equal(await machineExists(laptop.id), false);
+  const [row] = await getDb().select({ machineId: agents.machineId, status: agents.status, deletedAt: agents.deletedAt }).from(agents).where(eq(agents.id, alpha.id));
+  assert.deepEqual(row, { machineId: null, status: "stopped", deletedAt: null }, "unbound and stopped, not deleted");
+  // One transaction: the same created_at, so compared as a set.
+  assert.deepEqual((await machineAudits(server.id)).map((event) => event.eventType).sort(), ["computer.key_revoked", "computer.removed", "computer.revoke_unbound_others_agents"]);
+  assert.equal((await systemNotices(server.id, colleague.id, alpha.id)).length, 1, "its owner is told");
+});
+
+test("delete: true — a member who does not attach it is refused; the server owner may", async ({ app, seed }) => {
+  const { owner, colleague, server, laptop, alpha, token } = await seedMemberLaptop(seed, app);
+  const refused = await call(app.baseUrl, await token(colleague.id), "POST", revokePath(server.id, laptop.id), { delete: true });
+  assert.equal(refused.status, 403);
+  assert.equal(refused.body.error, "The `removeMachines` capability or machine creator authority is required to revoke a Computer's key");
+  assert.equal(await laptopKeyRevokedAt(laptop.id), null);
+  assert.equal(await machineExists(laptop.id), true);
+
+  await getDb().update(agents).set({ machineId: null }).where(eq(agents.id, alpha.id));
+  const byOwner = await call(app.baseUrl, await token(owner.id), "POST", revokePath(server.id, laptop.id), { delete: true });
+  assert.equal(byOwner.status, 200, JSON.stringify(byOwner.body));
+  assert.equal(await machineExists(laptop.id), false);
+});

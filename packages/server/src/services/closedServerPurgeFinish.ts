@@ -26,6 +26,13 @@
 //     already ran (serverService.softDeleteServerInTransaction); again here
 //     so nothing bound since is left (iLink has no revoke: Raft forgets the
 //     token).
+//  2b. data_exports: the server's server exports (data_exports kind
+//     `server`): each archive's objects deleted (an open upload aborted),
+//     then the row, in batches (dataExport/jobs.ts deleteServerDataExports).
+//     Until now an owner could still download them (design v7 §6). A
+//     personal export holding this server's messages is the requester's own
+//     and stays until its 7 days run out: a known leftover
+//     (docs/development/data-export.md).
 //  3. server_rows: every table closedServerPurgeClassification.ts marks
 //     `server_rows`, in its order, ROW_BATCH rows a batch (by the server, or
 //     for a key to agents by the server's agents). Stays: a row naming a kept
@@ -85,6 +92,7 @@ import { uninstallOAuthClientInstallsOfClosedServer } from "./oauthService";
 import { getAgentMigrationGateActive } from "./agentMigrationService";
 import { beginProvisionedAgentDeletion, kickAgentRuntimeProvisionWorker } from "./agentRuntimeProvisionService";
 import { removeWeChatBridgeOfDeletedServer } from "./wechatBridgeCleanup";
+import { deleteServerDataExports } from "./dataExport/jobs";
 
 /** One batch of the server's purge (its transaction, after the lease check). */
 export type ClosedServerPurgeBatch = <T>(work: (tx: DatabaseExecutor) => Promise<T>) => Promise<T>;
@@ -95,7 +103,7 @@ export interface ClosedServerPurgeFinishInput {
   /** Adds to the server's counts (the delete event's attributes). */
   add: (key: string, n: number) => void;
   clock: () => Date;
-  /** The channels the purge keeps (closedServerPurgeDelete.ts keptChannelsOf): rows naming one stay. */
+  /** The channels the purge keeps (closedServerKeptChannels.ts keptChannelsOf): rows naming one stay. */
   keepChannelIds: readonly string[];
   /** The provider revoke calls (closedServerPurgeRevoke.ts). */
   revokers?: ClosedServerPurgeRevokers;
@@ -163,6 +171,17 @@ async function removeWeChatBridge({ serverId, batch, add }: ClosedServerPurgeFin
 }
 
 const ROW_BATCH = 1_000;
+/** Each export is a few storage deletes: a small batch. */
+const DATA_EXPORT_BATCH = 50;
+
+/** Step 2b (header). */
+async function deleteServerExports({ serverId, batch, add }: ClosedServerPurgeFinishInput): Promise<"done"> {
+  for (;;) {
+    const n = await batch((tx) => deleteServerDataExports(tx, serverId, DATA_EXPORT_BATCH));
+    add("data_exports_deleted", n);
+    if (n < DATA_EXPORT_BATCH) return "done";
+  }
+}
 
 /**
  * The rows of `t` (the entry's table) server_rows deletes: the server's (or
@@ -361,6 +380,7 @@ async function scrubAgentTombstones({ serverId, batch, add }: ClosedServerPurgeF
 export const CLOSED_SERVER_PURGE_FINISH_STEPS: readonly ClosedServerPurgeFinishStep[] = [
   { name: "hosted_runtimes", run: deleteHostedRuntimes },
   { name: "wechat_bridge", run: removeWeChatBridge },
+  { name: "data_exports", run: deleteServerExports },
   { name: "server_rows", run: deleteServerRows },
   { name: "credential_revoke", run: revokeCredentials },
   { name: "app_installs", run: uninstallApps },

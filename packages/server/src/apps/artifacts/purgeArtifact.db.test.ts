@@ -137,7 +137,7 @@ test("purge: everything of the Artifact goes, and of its blobs only those no oth
 
   const expected = {
     versions: 2, files: 3, versionTexts: 0, checks: 1, comments: 1, commentDrafts: 0, reviews: 0, auditRows: 1, subscriptions: 1, readPositions: 1,
-    attachmentSaves: 0, pendingNotices: 0, searchRows: 1, blobsUnshared: 2, blobBytesUnshared: "first page".length + "second page".length, blobsShared: 1,
+    attachmentSaves: 0, pendingNotices: 0, searchRows: 1, settledHolds: 0, blobsUnshared: 2, blobBytesUnshared: "first page".length + "second page".length, blobsShared: 1,
   };
   // The plan counts and deletes nothing.
   const plan = await planArtifactPurge(item.id);

@@ -332,11 +332,108 @@ test("the rail's Chat takes a Guest to the server's root (its channel), not a re
   for (const role of ["guest", "member"] as const) {
     useServerStore.setState({ current: { ...GUEST_SERVER, role } as never });
     // Remembered from before (a channel it was in as a member, a DM).
-    localStorage.setItem("slock:tabMemory:v2:acme:chat", `${BASE}/dm/d1`);
+    localStorage.setItem("slock:place:v1:acme", JSON.stringify({ tab: "chat", places: { chat: `${BASE}/dm/d1` } }));
     window.history.replaceState(null, "", `${BASE}/activity`);
     render(<BrowserRouter><RailChat /></BrowserRouter>);
     fireEvent.click(screen.getByTestId("rail-chat"));
     assert.equal(window.location.pathname, role === "guest" ? BASE : `${BASE}/dm/d1`, role);
     cleanup();
   }
+});
+
+// A Guest's Saved list (#triage:#551): the page members reach from the Chat
+// sidebar, on its own (no sidebar beside it), opened from the rail on desktop
+// and from the server tab on a phone. A member keeps the sidebar's Saved row.
+
+test("a Guest's Saved page has no navigation sidebar beside it; on a phone it is a pushed page", () => {
+  const desktop = layout("/saved", { isDesktop: true, guest: true });
+  assert.deepEqual(
+    { hidden: desktop.hideSidebar, collapsible: desktop.sidebarCollapsible },
+    { hidden: true, collapsible: false },
+  );
+  const phone = layout("/saved", { isDesktop: false, guest: true });
+  assert.deepEqual(
+    { inline: phone.mobileShowSidebarInline, hidden: phone.hideSidebar, tabRoot: phone.mobileTabRoot },
+    { inline: false, hidden: true, tabRoot: null },
+  );
+  // A member's Saved keeps the Chat sidebar beside it.
+  assert.equal(layout("/saved", { isDesktop: true, guest: false }).hideSidebar, false);
+});
+
+function signInAsMember({ desktop }: { desktop: boolean }) {
+  signInAsGuest({ desktop });
+  useServerStore.setState({ current: { ...GUEST_SERVER, role: "member" } as never });
+}
+
+test("on desktop the rail has a Saved entry for a Guest that opens its Saved page, selected there in place of Chat", async () => {
+  signInAsGuest({ desktop: true });
+  renderMainLayout(`${BASE}/channel/bound`);
+  const saved = await screen.findByTestId("left-rail-tab-saved", undefined, { timeout: 4000 });
+  assert.equal(saved.getAttribute("aria-label"), "Saved");
+  assert.equal(saved.getAttribute("aria-pressed"), "false");
+  fireEvent.click(saved);
+  await waitFor(() => assert.equal(window.location.pathname, `${BASE}/saved`));
+  await waitFor(() => assert.equal(screen.getByTestId("left-rail-tab-saved").getAttribute("aria-pressed"), "true"));
+  assert.equal(screen.getByTestId("left-rail-tab-chat").getAttribute("aria-pressed"), "false");
+  // Still no sidebar: its Saved row is not drawn beside the page.
+  assert.ok(screen.queryByTestId("sidebar-saved-entry") === null, "no sidebar Saved row");
+  // Chat goes back to its channel.
+  fireEvent.click(screen.getByTestId("left-rail-tab-chat"));
+  await waitFor(() => assert.equal(window.location.pathname, `${BASE}/channel/bound`));
+});
+
+test("a member's rail has no Saved entry: Saved stays the Chat sidebar's row, under a selected Chat", async () => {
+  signInAsMember({ desktop: true });
+  renderMainLayout(`${BASE}/saved`);
+  await screen.findByTestId("left-rail-tab-chat", undefined, { timeout: 4000 });
+  assert.ok(screen.queryByTestId("left-rail-tab-saved") === null, "no rail Saved entry for a member");
+  assert.equal(screen.getByTestId("left-rail-tab-chat").getAttribute("aria-pressed"), "true");
+  await screen.findByTestId("sidebar-saved-entry", undefined, { timeout: 4000 });
+});
+
+test("on a phone a Guest opens its Saved page from the server tab; a member's server tab has none", async () => {
+  signInAsGuest({ desktop: false });
+  renderMainLayout(`${BASE}/channel/bound`);
+  fireEvent.click(await screen.findByTestId("mobile-tab-server"));
+  await screen.findByTestId("mobile-server-tab-popover");
+  fireEvent.click(screen.getByTestId("mobile-server-tab-saved"));
+  await waitFor(() => assert.equal(window.location.pathname, `${BASE}/saved`));
+  // A pushed page: Back, and the tab bar is away.
+  await waitFor(() => assert.ok(screen.queryByTestId("mobile-tab-bar") === null));
+  cleanup();
+
+  signInAsMember({ desktop: false });
+  renderMainLayout(BASE);
+  fireEvent.click(await screen.findByTestId("mobile-tab-server", undefined, { timeout: 4000 }));
+  await screen.findByTestId("mobile-server-tab-popover");
+  assert.ok(screen.queryByTestId("mobile-server-tab-saved") === null, "no server-tab Saved for a member");
+});
+
+// Saved is a Chat place like Drafts, but a Guest's Chat always lands on the
+// server's root (TAB_HOMES.chat alwaysHomeFor "guest"): placeFor reads the
+// target server's role itself, so the `/` start and a server switch, which pass
+// no viewer, keep a Guest on its channel too (#triage:#551).
+
+test("a Guest whose Chat place is Saved: the `/` start and a server switch land on the server's root", async () => {
+  const { ServerRedirect } = await import("../src/App");
+  const { getServerSwitcherTarget } = await import("../src/utils/serverSwitcherNavigation");
+  const { LAST_SERVER_SLUG_STORAGE_KEY } = await import("../src/store/serverPersistenceRegistry");
+
+  localStorage.setItem("slock:place:v1:acme", JSON.stringify({ tab: "chat", places: { chat: `${BASE}/saved` } }));
+  signInAsGuest({ desktop: true });
+  assert.equal(getServerSwitcherTarget("acme"), BASE, "a server switch");
+  useServerStore.setState({ loading: false } as never);
+  localStorage.setItem(LAST_SERVER_SLUG_STORAGE_KEY, "acme");
+  window.history.replaceState(null, "", "/");
+  render(
+    <TestIntlProvider>
+      <BrowserRouter>
+        <Routes>
+          <Route path="/" element={<ServerRedirect />} />
+          <Route path="*" element={null} />
+        </Routes>
+      </BrowserRouter>
+    </TestIntlProvider>,
+  );
+  await waitFor(() => assert.equal(window.location.pathname, BASE, "the `/` start"));
 });

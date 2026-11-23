@@ -17,15 +17,18 @@
 // runtimeAuthHost.ts); the launch itself reads none of it.
 //
 // Resume: OAR's `resume` is `agy`'s own session id. The driver's id is its own
-// (it resumes with `--continue`), so `agy` doesn't know it, OAR's open fails and
-// that start falls back to the driver. An agent that has one moves here once
-// its session is reset.
+// (it resumes with `--continue`), so `agy` doesn't list it and OAR refuses the
+// resume (`ResumeCwdError`, `not_listed`). That start opens a new OAR session
+// instead of falling back (`newSessionOnResumeNotListed`): the agent moves here
+// once, losing its runtime context but not its memory or Raft history.
 
+import type { InstallationSnapshot } from "@botiverse/oar";
 import { hydrateRuntimeConfig, runtimeConfigToLaunchFields } from "@botiverse/raft-shared";
 import { prepareAntigravityEnvironment, resolveAntigravitySpawn } from "../drivers/index";
 import type { SpawnContext } from "../drivers/types";
+import { loadOarRuntime } from "../oarLoader";
 import { launchEnvOverlay } from "./oarGrokLaunch";
-import type { OarLaunch } from "./oarLaunch";
+import { OarLaunchDeclined, type OarLaunch } from "./oarLaunch";
 
 /** A prepared Antigravity launch as an OAR launch. */
 export function antigravityOarLaunch(
@@ -51,10 +54,44 @@ export function antigravityOarLaunch(
     },
     // A second native prompt steers the same loop (OAR runtimes/antigravity/session.js).
     busyDelivery: "now",
+    newSessionOnResumeNotListed: true,
   };
+}
+
+/**
+ * Resolves the `agy` command OAR will launch: prefers OAR's own installation
+ * probe (which checks `OAR_ANTIGRAVITY_BIN`, PATH, `%LOCALAPPDATA%\agy\bin\agy.exe`
+ * on Windows / `~/.local/bin/agy` on POSIX, and rejects unsupported versions)
+ * so Windows launches pass the actual executable/shim to OAR rather than a
+ * node-host wrapper. Falls back to `resolveAntigravitySpawn` only when OAR
+ * reports no installation.
+ */
+export async function resolveAntigravityOarCommand(
+  env: NodeJS.ProcessEnv,
+  deps: {
+    readInstallation?: (env: NodeJS.ProcessEnv) => Promise<InstallationSnapshot | null>;
+    fallbackResolve?: () => string;
+  } = {},
+): Promise<string> {
+  let installation: InstallationSnapshot | null = null;
+  try {
+    installation = deps.readInstallation
+      ? await deps.readInstallation(env)
+      : await (await loadOarRuntime("antigravity")).installation?.({ env: launchEnvOverlay(env) }) ?? null;
+  } catch {
+    installation = null;
+  }
+  if (installation?.kind === "available" && installation.via === "executable") {
+    return installation.command;
+  }
+  if (installation?.kind === "unsupported") {
+    throw new OarLaunchDeclined(`antigravity_installation_unsupported:${installation.code ?? "unsupported"}`);
+  }
+  return (deps.fallbackResolve ?? (() => resolveAntigravitySpawn([]).command))();
 }
 
 export async function prepareAntigravityOarLaunch(ctx: SpawnContext): Promise<OarLaunch> {
   const env = await prepareAntigravityEnvironment(ctx);
-  return antigravityOarLaunch(ctx, { command: resolveAntigravitySpawn([]).command, env });
+  const command = await resolveAntigravityOarCommand(env);
+  return antigravityOarLaunch(ctx, { command, env });
 }

@@ -11,6 +11,7 @@ export function SearchNoResultsState({
   query,
   searchIncomplete,
   tooBroad,
+  onlyLoadedEntities = false,
   incompleteSearchNote,
   loadingMore,
   onContinueSearching,
@@ -19,6 +20,8 @@ export function SearchNoResultsState({
   searchIncomplete: boolean;
   /** The server skipped the any-word search as too broad: the empty page is not "nothing matches". */
   tooBroad: boolean;
+  /** Core's channels and people couldn't be searched: only the loaded ones were (the incomplete line above says why). */
+  onlyLoadedEntities?: boolean;
   incompleteSearchNote: string;
   loadingMore: boolean;
   onContinueSearching: () => void;
@@ -30,7 +33,9 @@ export function SearchNoResultsState({
       icon={<Search size={36} aria-hidden="true" />}
       title={searchIncomplete
         ? formatMessage({ id: "search.incompleteNoMatchesYet" })
-        : query.trim() ? formatMessage({ id: "search.noResultsForQuery" }, { query: query.trim() }) : formatMessage({ id: "search.noMatchingMessages" })}
+        : onlyLoadedEntities
+          ? formatMessage({ id: "search.coreGroups.noLoadedMatches" })
+          : query.trim() ? formatMessage({ id: "search.noResultsForQuery" }, { query: query.trim() }) : formatMessage({ id: "search.noMatchingMessages" })}
       description={searchIncomplete
         ? incompleteSearchNote
         : tooBroad

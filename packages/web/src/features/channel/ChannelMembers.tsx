@@ -23,7 +23,7 @@ import ConfirmDialog from "../../components/ConfirmDialog";
 import Tooltip from "../../components/ui/Tooltip";
 import type { ProfilePanelProps, ProfilePanelTarget } from "../../components/profile/ProfilePanel";
 import { primeHumanProfileFromChannelMember, setCachedAgentProfile } from "../../components/profile/profileFallbackCache";
-import { isLocalProjectionMember, memberServerBadgeLabels } from "../../utils/channelLocalMembership";
+import { isAddableToChannel, isLocalProjectionMember, memberServerBadgeLabels } from "../../utils/channelLocalMembership";
 import type { ServerBadgeMember } from "../../utils/channelLocalMembership";
 import { useSidePanelEscapeStep } from "../../components/task/sidePanelEscape";
 import { MemberChoiceList, memberChoiceKey, useMemberChoiceSearch } from "../../components/channel/MemberChoiceList";
@@ -33,6 +33,7 @@ import { MemberRoleActions } from "../../components/agent/MemberRoleActions";
 import { ICON_SM_END_PULL, ICON_SM_START_PULL } from "../../components/ui/headEdges";
 import AgentActivitySubscription from "../../components/agent/AgentActivitySubscription";
 import { AgentActivityInfo, agentStatusFallbackActivity, JointServerBadges } from "../../components/agent/channelMemberParts";
+import { AgentRuntimeSignInRowAction } from "../../components/agent/AgentRuntimeSignInRowAction";
 import AddExternalMemberDialog from "../../components/channel/AddExternalMemberDialog";
 import ExternalInviteRows from "../../components/channel/ExternalInviteRows";
 import { useChannelExternalInvites, useExternalInviteAccess, useExternalInviteManagement } from "../../components/channel/externalInvites";
@@ -236,7 +237,7 @@ export function ChannelMembers({
           ? <AppBadge className="shrink-0" appName={agent.managedByApp?.name} botName={agent.displayName || agent.name} />
           : undefined,
       })),
-      ...serverMembers.filter((member) => !channelHumanIds.has(member.userId)).map((member) => ({
+      ...serverMembers.filter((member) => !channelHumanIds.has(member.userId) && isAddableToChannel(member, currentChannel)).map((member) => ({
         kind: "human" as const,
         id: member.userId,
         value: member,
@@ -433,7 +434,12 @@ export function ChannelMembers({
         secondary={<AgentActivityInfo agentId={agent.id} fallbackStatus={agent.status} />}
         onAvatarClick={!canOpenAgentProfiles || pageMode ? undefined : openAgentProfile}
         onRowClick={canOpenAgentProfiles && pageMode ? openAgentProfile : undefined}
-        trailing={<ChannelMemberRoleAndActions role={role} actions={actions} />}
+        trailing={(
+          <>
+            <AgentRuntimeSignInRowAction agentId={agent.id} fallbackStatus={agent.status} />
+            <ChannelMemberRoleAndActions role={role} actions={actions} />
+          </>
+        )}
       />
     );
   };

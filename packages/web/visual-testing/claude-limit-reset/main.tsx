@@ -5,7 +5,7 @@ import { preloadInitialLocaleMessages } from "../../src/i18n/preloadLocaleMessag
 import { ClaudeLimitResetStates } from "./ClaudeLimitResetStates";
 import "../../src/index.css";
 
-// The Claude limit-reset card and dialogs (claude_limit_reset) drawn with the
+// The Claude limit-reset card and dialogs (claude_limit_reset_v2) drawn with the
 // real components on fixture data and a fake client; no server.
 // ?case=<id>&mode=light|dark picks the state.
 const params = new URLSearchParams(window.location.search);

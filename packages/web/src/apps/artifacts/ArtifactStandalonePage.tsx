@@ -12,7 +12,7 @@ import {
   PanelStatus,
 } from "@botiverse/raft-ui";
 
-import { hostMenuItems, isChromeless, isHostShell, markHostToolbarDrawn } from "../../embed";
+import { hostConversationId, hostMenuItems, isChromeless, isHostShell, markHostToolbarDrawn } from "../../embed";
 import Tooltip from "../../components/ui/Tooltip";
 import { useMediaQuery } from "../../hooks/effectPrimitives";
 import { useArtifactPageDocumentTitle } from "../../utils/browserDocumentTitle";
@@ -22,11 +22,13 @@ import { offersForkInRaft, useArtifactForkMarker } from "./artifactForkInRaft";
 import { usePageFile } from "./artifactPageFile";
 import { artifactHashForPanel, artifactPageOpening, artifactPanelFromHash, isArtifactHostActionHash } from "./artifactPageOpening";
 import type { ArtifactPageOpening, ArtifactPagePanel } from "./artifactPageOpening";
-import type { ArtifactHome } from "@botiverse/raft-shared";
+import type { ArtifactHome, ArtifactId } from "@botiverse/raft-shared";
 
+import { artifactPagePath } from "./artifactLinks";
 import type { ArtifactLinkTarget } from "./artifactLinks";
 import { PHONE_QUERY } from "./artifactPhoneHistory";
-import { useArtifactViewer } from "./artifactSource";
+import { artifactSource, useArtifactViewer } from "./artifactSource";
+import { useStandaloneObjectWatchSocket } from "../../objects/objectWatch";
 import type { ArtifactViewerSeed } from "./artifactSource";
 import { useArtifactComments } from "./ArtifactCommentsContext";
 import { ArtifactLoadingSplash, ArtifactSplashScope } from "./ArtifactLoadingSplash";
@@ -36,7 +38,12 @@ import { artifactLinkWaitStarted } from "./artifactLinkWait";
 import { conversationLabel } from "./artifactHomeWords";
 import { isPlainPrimaryClick } from "./openArtifactInPlace";
 import { ArtifactShownFileProvider } from "./ArtifactShownFileProvider";
-import { ArtifactSurfaceActions, ArtifactSurfaceMain, ArtifactSurfaceMeta, ArtifactSurfaceProvider, ArtifactSurfaceTitle, ArtifactSurfaceVersionTag, useArtifactSurface, useArtifactSurfaceKeyDown } from "./ArtifactSurface";
+import { ArtifactConversationProvider } from "./ArtifactConversationProvider";
+import { ArtifactRecentTitle } from "./ArtifactRecentTitle";
+import { ArtifactShownFilePath } from "./ArtifactShownFilePath";
+import { ArtifactSurfaceActions, ArtifactSurfaceMain, ArtifactSurfaceProvider, useArtifactSurface, useArtifactSurfaceKeyDown } from "./ArtifactSurface";
+import { ArtifactSurfaceMeta, ArtifactSurfaceTitle, ArtifactSurfaceVersionTag } from "./ArtifactSurfaceHead";
+import { ArtifactDetailsTitle } from "./ArtifactDetailsTitle";
 import type { PickVersion } from "./ArtifactVersionHistory";
 
 /** The server the page is in: the one `open` named, which decides what the reader may do. */
@@ -89,9 +96,11 @@ export interface ArtifactStandalonePageProps {
  *   to where it lives (its home conversation, a DM by its name; the server
  *   for one of the whole server, public, or whose conversation is gone)
  *   (#proj-workspace:#104, Remy's rule 3). Then the title and
- *   version, the surface's meta line (ArtifactSurfaceMeta: the visibility
- *   chip, the original message, presence), then the surface's
- *   actions with Copy link among them. On a phone it collapses: Copy link
+ *   version, then the surface's actions with Copy link among them: one line,
+ *   the title opening the details (ArtifactDetailsTitle: the visibility
+ *   chip, the original message, versions, presence). On a phone the
+ *   surface's meta line (ArtifactSurfaceMeta) is under the title, as in the
+ *   App's toolbar, and it collapses: Copy link
  *   goes into ⋯ and Fork in Raft folds into it; presence stays in
  *   the meta line, as at every width, collapsing there (ArtifactMetaRow) as
  *   the line narrows (on a phone, faces alone). The title keeps at least
@@ -136,13 +145,18 @@ export interface ArtifactStandalonePageProps {
  *
  * The host has already asked where it opens and made that server current, so
  * every read here carries it (X-Server-Id) and the server's answer decides
- * what this reader may do. Links built here use the id in the address and
- * this deployment's origin (artifactUrl).
+ * what this reader may do. With no main layout here, the page connects the
+ * socket for that server itself (useStandaloneObjectWatchSocket), so new
+ * comments and versions show live as in the workspace's viewer. Links built
+ * here use the id in the address and this deployment's origin (artifactUrl).
  */
 export default function ArtifactStandalonePage({ target, server, seed = null, onGoBack, onGo, onPickVersion, unavailable }: ArtifactStandalonePageProps) {
   // View latest on the latest already shown reads it again (a newer one is out): the address stays.
   const [attempt, setAttempt] = useState(0);
   const result = useArtifactViewer(target, attempt, seed);
+  // Outside the main layout, no realtime bridge: its comments and new versions arrive live over the socket
+  // this page connects for its server (objects/objectWatch.ts). A stand-in source has no server to hear from.
+  useStandaloneObjectWatchSocket(artifactSource().kind === "api");
   const hostShell = isHostShell();
   // What the address asks it to open with (`?panel=`, `?comment=`): read once, from the address it was opened at.
   const [opening] = useState(() => artifactPageOpening(typeof window === "undefined" ? "" : window.location.search));
@@ -365,7 +379,7 @@ function StandaloneShell({ switching, server, phone, hostShell, opening, onGoBac
             <PanelHeaderContent className={ownBar ? "@container min-w-30" : "@container"}>
               {ownBar ? (
                 <PanelHeading>
-                  <ArtifactSurfaceTitle pageHeading testId="artifact-page-title" />
+                  <HostConversationTitle onGo={onGo} />
                   <PanelStatus><ArtifactSurfaceVersionTag /></PanelStatus>
                 </PanelHeading>
               ) : null}
@@ -394,10 +408,12 @@ function StandaloneShell({ switching, server, phone, hostShell, opening, onGoBac
                 name and the comment controls left it two letters ("D."). */}
             <PanelHeaderContent className="@container min-w-30">
               <PanelHeading>
-                <ArtifactSurfaceTitle pageHeading testId="artifact-page-title" />
+                {/* A desktop head is one line: the title opens the details (where it lives, its original message,
+                    versions, who's seen it); a phone's keeps the meta line under it. */}
+                {phone ? <ArtifactSurfaceTitle pageHeading testId="artifact-page-title" /> : <ArtifactDetailsTitle pageHeading testId="artifact-page-title" />}
                 <PanelStatus><ArtifactSurfaceVersionTag /></PanelStatus>
               </PanelHeading>
-              {where}
+              {phone ? where : null}
             </PanelHeaderContent>
             {actions}
           </PanelHeader>
@@ -406,4 +422,37 @@ function StandaloneShell({ switching, server, phone, hostShell, opening, onGoBac
       </Panel>
     </main>
   );
+}
+
+/**
+ * The title in the page's own bar in the App (`hostMenu`). Opened from a conversation (`hostConversation=`,
+ * #proj-workspace:#309), it is the menu of the Artifacts recently opened there, as the side card's beside a
+ * conversation (ArtifactRecentTitle, #proj-workspace:#291): this one joins them, and a picked one opens on its page
+ * (a new address; the keeper keeps the App's params). No "All Artifacts in" row: the App has its own Files.
+ */
+function HostConversationTitle({ onGo }: { onGo: (path: string) => void }) {
+  const { data } = useArtifactSurface();
+  const { card } = data;
+  const [conversationId] = useState(hostConversationId);
+  const name = hostConversationName(conversationId, card.home);
+  const pick = useCallback((id: ArtifactId) => onGo(artifactPagePath(id)), [onGo]);
+  const title = <ArtifactSurfaceTitle pageHeading testId="artifact-page-title" />;
+  if (conversationId === null) return title;
+  return (
+    <ArtifactConversationProvider conversationId={conversationId} name={name} onPick={pick}>
+      <ArtifactRecentTitle card={card} record plain={title} after={<ArtifactShownFilePath data={data} />} />
+    </ArtifactConversationProvider>
+  );
+}
+
+/**
+ * The conversation's name for the menu's label (read aloud; the App shows no row with it): the Artifact's own
+ * conversation's when it is that one, else none (the App's page loads no conversation list): the menu is then
+ * just "Recent Artifacts".
+ */
+function hostConversationName(conversationId: string | null, home: ArtifactHome): string {
+  if (conversationId !== null && home.kind === "conversation" && home.conversation.id === conversationId && home.conversation.name !== "") {
+    return conversationLabel(home.conversation);
+  }
+  return "";
 }

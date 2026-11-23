@@ -3,7 +3,7 @@
 // by the daemon from the agent id and the name; the command's basename is the
 // one free-text field and is folded onto its line.
 import type { DaemonApiResponseByRoute } from "@botiverse/raft-shared";
-import { foldAgentOneLineText, PROC_LOGS_FOLLOW_MAX_MS } from "@botiverse/raft-shared/src/agentCliSurface";
+import { foldAgentOneLineText, formatProcMemoryLimitExit, formatProcOwnerStopExit, PROC_LOGS_FOLLOW_MAX_MS } from "@botiverse/raft-shared/src/agentCliSurface";
 
 import { axSurface } from "../../core/renderer";
 
@@ -47,6 +47,10 @@ export function formatProcAge(ms: number): string {
 }
 
 function exitedText(job: ProcJob): string {
+  // The Computer stopped it at its cap: the same words as the Inbox notice and the Manual.
+  if (job.exitReason === "memory_limit") return formatProcMemoryLimitExit(job.memoryMaxBytes);
+  // A person stopped it from the Computer page: who, in the Inbox notice's and the Manual's words.
+  if (job.exitReason === "owner_stop") return formatProcOwnerStopExit(job.stoppedBy);
   if (job.exitCode !== null) return `exited (code ${job.exitCode})`;
   if (job.exitSignal) return `exited (${job.exitSignal})`;
   return "exited";
@@ -94,6 +98,8 @@ export const formatProcList = axSurface(
   {
     examples: [
       { args: [[SAMPLE_JOB, { ...SAMPLE_JOB, name: "bot", pid: 4300, state: "exited", exitCode: 1, exitedAt: "2026-11-10T11:55:00.000Z" }], SAMPLE_NOW] },
+      { args: [[{ ...SAMPLE_JOB, state: "exited", exitSignal: "SIGKILL", exitedAt: "2026-11-10T11:55:00.000Z", memoryMaxBytes: 4 * 1024 ** 3, exitReason: "memory_limit" }], SAMPLE_NOW] },
+      { args: [[{ ...SAMPLE_JOB, state: "exited", exitSignal: "SIGTERM", exitedAt: "2026-11-10T11:55:00.000Z", exitReason: "owner_stop", stoppedBy: "tygg" }], SAMPLE_NOW] },
       { args: [[], SAMPLE_NOW] },
     ],
   },

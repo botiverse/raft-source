@@ -83,16 +83,25 @@ const CORE_AGENT_API_ROUTE_META = {
   channelUpdate: naturalDestructive,
   channelMemberAdd: naturalWrite,
   channelMemberRemove: naturalDestructive,
+  // Sets the role: a repeat converges (`changed: false`).
+  channelMemberRole: naturalWrite,
   channelMembers: read,
   resolveChannel: read,
   threadFollow: naturalWrite,
   threadUnfollow: naturalDestructive,
   threadList: read,
+  // The agent's own attention state; repeating either converges. Focusing one more than the limit
+  // unfocuses another, which `raft focus` puts back: reversible, so not destructive (as mute/unmute).
+  focus: naturalWrite,
+  unfocus: naturalWrite,
+  focusList: read,
   inboxList: read,
   // RFC 081: consumes exactly the entries it returns (like `events`); clients must not auto-retry.
   inboxRead: { sideEffect: "destructive_read", idempotency: "none", destructive: true, audience: "both" },
   // Moves read state forward without showing anything; a repeat converges (nothing left to dismiss).
   inboxDismiss: naturalDestructive,
+  // POST only for its body: the `inbox check` rows of the named conversations; moves no read position.
+  inboxRows: read,
   assistantOwnerInbox: read,
   assistantOwnerArtifact: read,
   assistantOwnerArtifactPublish: write,

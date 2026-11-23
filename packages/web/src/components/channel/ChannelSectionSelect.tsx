@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
 import { useIntl } from "react-intl";
+import { FolderInput, FolderPlus, Pin } from "lucide-react";
 import {
   Select,
   SelectActionItem,
@@ -7,6 +8,7 @@ import {
   SelectIcon,
   SelectItem,
   SelectItemIndicator,
+  SelectItemLeading,
   SelectItemText,
   SelectList,
   SelectSeparator,
@@ -53,9 +55,10 @@ interface SectionOption {
  * conversation's home section. `section` is the sidebar's model of the
  * conversation (useConversationSidebarSection): its placement item, pinned
  * ref (a DM is pinned by its peer) and home section (Channels, Joint
- * Channels / External, or Direct Messages). "Create section" opens the
+ * Channels / External, or Direct Messages). "New section" opens the
  * sidebar's section dialog and creates the section with this conversation
- * already in it.
+ * already in it. Its rows look like the sidebar menu's (cindyz, #triage:#518):
+ * the same icons.
  */
 export function ChannelSectionSelect({
   section: { item, pinnedRef, stalePinnedRefs, homeKey, homeLabelId },
@@ -149,7 +152,7 @@ export function ChannelSectionSelect({
   return (
     <>
       <Select value={value} onValueChange={handleChange} items={options}>
-        <SelectTrigger className="w-full max-w-sm" aria-labelledby={ariaLabelledBy} data-testid={testId}>
+        <SelectTrigger fit className="@max-lg:w-full @max-lg:max-w-sm" aria-labelledby={ariaLabelledBy} data-testid={testId}>
           <SelectValue />
           <SelectIcon />
         </SelectTrigger>
@@ -157,6 +160,8 @@ export function ChannelSectionSelect({
           <SelectList>
             {options.map((option) => (
               <SelectItem key={option.value} value={option.value} data-testid={`${testId}-${option.value}`}>
+                {/* The sidebar row menu's Move to Section ▸ icons (cindyz, #triage:#518). */}
+                <SelectItemLeading>{option.value === PINNED_VALUE ? <Pin /> : <FolderInput />}</SelectItemLeading>
                 <SelectItemText>
                   {/* The emoji as the sidebar shows it (SidebarChatSections), apart from the name. */}
                   {option.emoji && <span aria-hidden className="mr-1">{option.emoji}</span>}
@@ -166,8 +171,10 @@ export function ChannelSectionSelect({
               </SelectItem>
             ))}
             <SelectSeparator />
-            <SelectActionItem closeOnAction onAction={openCreate} data-testid={`${testId}-create`}>
-              {formatMessage({ id: "message.channelSettings.sectionCreate" })}
+            {/* Named, drawn and inked as the sidebar's "New section" row. */}
+            <SelectActionItem closeOnAction onAction={openCreate} className="text-foreground" data-testid={`${testId}-create`}>
+              <FolderPlus className="text-foreground-muted" aria-hidden />
+              {formatMessage({ id: "layout.sidebar.newSectionMenu" })}
             </SelectActionItem>
           </SelectList>
         </SelectContent>

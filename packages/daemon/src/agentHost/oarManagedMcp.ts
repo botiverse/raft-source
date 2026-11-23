@@ -14,8 +14,15 @@
 //   (pinned by oarCodexLaunch.test.ts against OAR's own `codexThreadOpen`).
 // - grok: ACP `mcpServers[].headers` on `session/new` / `session/resume`
 //   (stdin). Grok declares `mcpCapabilities.http`.
-// - qwen (at or above QWEN_MIN_HTTP_MCP_VERSION): the stream-json
-//   `initialize` control request's `mcpServers` (stdin).
+// - qwen (where OAR declares `"http"` in `mcpTransports`: 0.26.0 and later):
+//   the stream-json `initialize` control request's `mcpServers` (stdin).
+// - pi (#oar-raft:#48): OAR's Pi RPC writes `mcpServers` to a `0600`
+//   `config.json` in a private temporary directory (`OAR_PI_RPC_DIRECTORY`)
+//   for the session's lifetime. Unlike Qoder (which never had managed MCP),
+//   Pi already exposed managed MCP tools in-process; the token is loopback-
+//   only, per-launch, revoked when the launch cleans up, and scoped strictly
+//   to this agent's assigned tools. Follow-up in OAR to unlink `config.json`
+//   and unset `OAR_PI_RPC_DIRECTORY` after the RPC extension loads it.
 //
 // The transport is verified (stdin, never argv or env). What a runtime then
 // writes to its own disk is verified only for some: OAR found agy storing
@@ -42,6 +49,10 @@
 //   Antigravity keeps the workspace `.agents/mcp_config.json`
 //   (oarAntigravityLaunch.ts). Moving the token into the URL would get past
 //   OAR's check, but the token would end up in that database anyway.
+// - dsh (DeepSeek Harness): OAR takes stdio session MCP servers only
+//   (`command` and `args`) and refuses an HTTP entry or one with `env` or
+//   `headers` (`mcpServerCredentials`); Raft's entry is an HTTP proxy with the
+//   launch token in a header, so DSH has no managed MCP.
 
 import type { McpServer } from "@botiverse/oar";
 import type { SpawnContext } from "../drivers/types";

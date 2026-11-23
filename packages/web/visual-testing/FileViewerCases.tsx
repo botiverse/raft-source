@@ -1,6 +1,7 @@
 import { useState } from "react";
 import api from "../src/api/client";
 import ImageLightbox from "../src/components/ImageLightbox";
+import { FileViewerHeader } from "../src/components/FileViewerShell";
 import { DocumentAttachmentPreviewModal } from "../src/components/message/attachmentPreviewSurfaces";
 import type { PreviewCommentsContext } from "../src/components/message/attachmentPreviewSurfaces";
 import type { DocumentAttachmentPreview } from "../src/components/message/attachmentPreview";
@@ -318,7 +319,45 @@ function CommentedDocumentCase({ kind, uncommented = false }: { kind: "markdown"
   );
 }
 
+const LONG_FILENAME = `${"harbor-launch-review-final-final-v2-with-every-comment-from-design-and-engineering-addressed-".repeat(2)}export-2026-11-19.png`;
+
+const HEADER_ROWS = [
+  { id: "single", label: "Single file: gta@2x.png (count 1)", filename: "gta@2x.png", index: 0, count: 1, full: false },
+  { id: "gallery", label: "Gallery: gta@2x.png, 2 / 5, comments + copy + download + close", filename: "gta@2x.png", index: 1, count: 5, full: true },
+  { id: "long-name", label: `Gallery, long name (${LONG_FILENAME.length} chars), 1 / 3: truncated, actions at the end`, filename: LONG_FILENAME, index: 0, count: 3, full: true },
+] as const;
+
+/** The viewer's header alone, full width (#triage:#537): the name only as wide as itself, the
+ *  spacer after it keeping the gallery count and the actions at the end. */
+function HeaderCase() {
+  return (
+    <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
+      <div data-visual-case="components.file-viewer.header" className="flex flex-col gap-4 py-4" style={{ width: 1280 }}>
+        {HEADER_ROWS.map((row) => (
+          <section key={row.id} data-file-viewer-header-case={row.id} className="flex flex-col gap-1">
+            <div className="px-4 text-xs text-foreground-hint">{row.label}</div>
+            <div className="border border-line-hairline">
+              <FileViewerHeader
+                filename={row.filename}
+                index={row.index}
+                count={row.count}
+                commentsLabel={row.full ? "Comments" : undefined}
+                commentsOpen={row.full ? false : undefined}
+                onToggleComments={row.full ? noop : undefined}
+                copyText={row.full ? "gta@2x.png" : undefined}
+                onDownload={noop}
+                onClose={noop}
+              />
+            </div>
+          </section>
+        ))}
+      </div>
+    </main>
+  );
+}
+
 export const FILE_VIEWER_CASE_IDS = [
+  "components.file-viewer.header",
   "components.file-viewer.image",
   "components.file-viewer.text",
   "components.file-viewer.markdown",
@@ -329,6 +368,7 @@ export const FILE_VIEWER_CASE_IDS = [
 ] as const;
 
 export function FileViewerCase({ caseId }: { caseId: string }) {
+  if (caseId === "components.file-viewer.header") return <HeaderCase />;
   if (caseId === "components.file-viewer.image") return <ImageCase />;
   if (caseId === "components.file-viewer.markdown.comments") return <CommentedDocumentCase kind="markdown" />;
   if (caseId === "components.file-viewer.text.comments") return <CommentedDocumentCase kind="text" />;

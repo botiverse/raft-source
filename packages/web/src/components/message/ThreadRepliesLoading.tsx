@@ -62,7 +62,8 @@ export function ThreadRepliesLoading({ since }: { since: number }) {
  * (#proj-o11y:#18); a retry that fails again mounts a new one.
  */
 export function ThreadRepliesLoadFailed({ onRetry, retryTestId, unavailableFrom }: {
-  onRetry: () => void;
+  /** Absent: retrying can't help (a link id nothing resolves, #503), so no Retry is offered. */
+  onRetry?: () => void;
   retryTestId: string;
   /** The server answered that it can't show this thread: the server's name, for the plain "not available from" copy. */
   unavailableFrom?: string | null;
@@ -80,15 +81,15 @@ export function ThreadRepliesLoadFailed({ onRetry, retryTestId, unavailableFrom 
         withIcon
         data-testid="thread-replies-load-failed"
         title={formatMessage({ id: "message.threadPanel.loadFailedTitle" })}
-        actions={(
+        actions={onRetry ? (
           <Button type="button" size="md" variant="outline" onClick={onRetry} data-testid={retryTestId}>
             {formatMessage({ id: "message.threadPanel.retry" })}
           </Button>
-        )}
+        ) : undefined}
       >
         {unavailableFrom
           ? formatMessage({ id: "message.threadPanel.unavailableBody" }, { server: unavailableFrom })
-          : formatMessage({ id: "message.threadPanel.loadFailedBody" })}
+          : formatMessage({ id: onRetry ? "message.threadPanel.loadFailedBody" : "message.messageItem.threadUnavailable" })}
         {traceId ? <span className="mt-1 block"><TraceIdNote traceId={traceId} /></span> : null}
       </Banner>
     </div>

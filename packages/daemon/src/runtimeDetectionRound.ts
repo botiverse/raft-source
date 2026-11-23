@@ -96,10 +96,19 @@ export function defaultRuntimeDetectionSelfExec(host: SelfExecHost = currentSelf
  * children). POSIX: the child runs in its own process group, so -pid reaches
  * the whole tree; Windows has no groups, so `taskkill /T` walks it.
  */
-export function killRuntimeDetectionTree(pid: number, platform: NodeJS.Platform): void {
+export interface KillTreeOptions {
+  /** On Windows: the taskkill to run (default `taskkill`, found on PATH). */
+  taskkill?: string;
+  /** On Windows: taskkill's environment (default the daemon's ambient env). */
+  env?: NodeJS.ProcessEnv;
+  spawnFn?: typeof nodeSpawn;
+}
+
+export function killRuntimeDetectionTree(pid: number, platform: NodeJS.Platform, options: KillTreeOptions = {}): void {
   try {
     if (platform === "win32") {
-      nodeSpawn("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true, env: ambientProcessEnv() }).on("error", () => {});
+      const spawnFn = options.spawnFn ?? nodeSpawn;
+      spawnFn(options.taskkill ?? "taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true, env: options.env ?? ambientProcessEnv() }).on("error", () => {});
     } else {
       process.kill(-pid, "SIGKILL");
     }

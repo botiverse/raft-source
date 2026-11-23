@@ -9,6 +9,7 @@ import {
   runtimeProviderForAgentRuntime,
   USAGE_LIMIT_STALE_AFTER_RESET_MS,
   USAGE_LIMIT_STALE_WITHOUT_RESET_MS,
+  usageLimitAttentionWindowStatus,
 } from "./usageLimitAttentionService";
 
 const EVALUATED_AT = new Date("2026-07-21T10:30:00.000Z");
@@ -166,6 +167,22 @@ test("usage-limit attention maps only runtimes sharing the provider account", ()
   assert.equal(runtimeProviderForAgentRuntime("kimi-sdk"), "kimi");
   assert.equal(runtimeProviderForAgentRuntime("antigravity"), "antigravity");
   assert.equal(runtimeProviderForAgentRuntime("pi"), null);
+});
+
+test("usage-limit attention: a full window is not reached while the account can still spend credits (#108)", () => {
+  const weekly = { id: "codex:secondary", label: "Codex · 1 week", status: "limit_reached" as const, scope: { kind: "account" as const } };
+  // Codex weekly at 0% left with 30784 credits: Codex keeps running on credits.
+  assert.equal(usageLimitAttentionWindowStatus({ credits: { available: true, balance: "30784" } }, weekly, false), "ok");
+  assert.equal(usageLimitAttentionWindowStatus({ credits: { available: true, unlimited: true } }, weekly, false), "ok");
+  // Credits spent, or not reported (older Computer / runtime): the window is reached.
+  assert.equal(usageLimitAttentionWindowStatus({ credits: { available: false, balance: "0" } }, weekly, true), "limit_reached");
+  assert.equal(usageLimitAttentionWindowStatus({}, weekly, true), "limit_reached");
+  // A window that is not full stays as it is.
+  assert.equal(usageLimitAttentionWindowStatus({ credits: { available: true } }, { ...weekly, status: "ok" }, false), "ok");
+  // A model's own window while the account still runs other models: clear, as before.
+  const modelWeek = { id: "w", label: "Current week (Fable)", status: "limit_reached" as const, scope: { kind: "model" as const, name: "Fable" } };
+  assert.equal(usageLimitAttentionWindowStatus({}, modelWeek, false), "ok");
+  assert.equal(usageLimitAttentionWindowStatus({}, modelWeek, true), "limit_reached");
 });
 
 test("usage-limit activation ignores stale/unknown data and resolves only on a newer authoritative ok", () => {

@@ -7,6 +7,7 @@ import { InvalidClientError, InvalidGrantError, ServerError } from "@modelcontex
 import {
   isManagedMcpAddressAllowed,
   ManagedMcpGatewayError,
+  managedMcpFailureTraceAttrs,
   managedMcpOAuthFailureDetail,
   managedMcpOAuthStartError,
   completeManagedMcpOAuth,
@@ -354,4 +355,48 @@ test("Raft's Google client: least-privilege scopes, and its deployment secret ne
     if (saved.id === undefined) delete process.env.MANAGED_MCP_GOOGLE_OAUTH_CLIENT_ID; else process.env.MANAGED_MCP_GOOGLE_OAUTH_CLIENT_ID = saved.id;
     if (saved.secret === undefined) delete process.env.MANAGED_MCP_GOOGLE_OAUTH_CLIENT_SECRET; else process.env.MANAGED_MCP_GOOGLE_OAUTH_CLIENT_SECRET = saved.secret;
   }
+});
+
+test("managed MCP failure trace attributes name the cause without any message text", async () => {
+  // An HTTP answer from the endpoint (e.g. Cloudflare 503/429 on a Worker).
+  const http = normalizeManagedMcpClientError(new StreamableHTTPError(503, "Error POSTing to endpoint: <html>secret body</html>"), false);
+  assert.equal(http.code, "managed_mcp_unreachable");
+  assert.deepEqual(managedMcpFailureTraceAttrs(http), {
+    mcp_timed_out: false,
+    mcp_cause_class: "StreamableHTTPError",
+    mcp_cause_http_status: 503,
+  });
+
+  // A token refresh whose server answered with a non-OAuth body: only the status survives.
+  const refresh = await parseErrorResponse(new Response("upstream exploded token=abc", { status: 502 }));
+  const refreshAttrs = managedMcpFailureTraceAttrs(normalizeManagedMcpClientError(refresh, false, "oauth"));
+  assert.equal(refreshAttrs.mcp_cause_class, "ServerError");
+  assert.equal(refreshAttrs.mcp_cause_http_status, 502);
+  assert.equal(refreshAttrs.mcp_cause_oauth_error, "server_error");
+  assert.ok(!JSON.stringify(refreshAttrs).includes("abc"));
+
+  // A parsed OAuth error keeps its code but never a status read from the provider's description.
+  const grant = await parseErrorResponse(new Response(JSON.stringify({ error: "invalid_grant", error_description: "HTTP 503 fake" }), { status: 400 }));
+  const grantAttrs = managedMcpFailureTraceAttrs(normalizeManagedMcpClientError(grant, false, "headers"));
+  assert.equal(grantAttrs.mcp_cause_oauth_error, "invalid_grant");
+  assert.equal(grantAttrs.mcp_cause_http_status, undefined);
+
+  // A non-Error cause is named as such.
+  assert.equal(managedMcpFailureTraceAttrs(new ManagedMcpGatewayError("x", "managed_mcp_unreachable", { cause: "boom" })).mcp_cause_class, "non_error");
+
+  // A connect failure from undici: the network code comes from the cause chain.
+  const connect = new TypeError("fetch failed", { cause: Object.assign(new Error("connect ECONNREFUSED 10.0.0.1:443"), { code: "ECONNREFUSED" }) });
+  assert.deepEqual(managedMcpFailureTraceAttrs(normalizeManagedMcpClientError(connect, false)), {
+    mcp_timed_out: false,
+    mcp_cause_class: "TypeError",
+    mcp_cause_network_code: "ECONNREFUSED",
+  });
+
+  // A timeout is marked as such.
+  const timedOut = normalizeManagedMcpClientError(new DOMException("This operation was aborted", "AbortError"), true);
+  assert.equal(managedMcpFailureTraceAttrs(timedOut).mcp_timed_out, true);
+
+  // Errors without a cause, and non-gateway errors, add nothing beyond what is known.
+  assert.deepEqual(managedMcpFailureTraceAttrs(new ManagedMcpGatewayError("too big", "managed_mcp_result_too_large")), {});
+  assert.deepEqual(managedMcpFailureTraceAttrs(new Error("x")), {});
 });

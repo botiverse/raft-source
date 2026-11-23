@@ -10,6 +10,7 @@ import type { AgentContext } from "../../auth/env";
 import { CliError, type CliErrorCode } from "../../core/errors";
 import type { RegisteredIntegrationService } from "./_format";
 import { cookieHeaderForUrl, type SessionCookie } from "./_session";
+import { ensureSystemCaTrustFor } from "../../proxy";
 import {
   actionContractDigest,
   buildV1RequestPlan,
@@ -656,6 +657,9 @@ export async function invokeManifestActionV1(input: ManifestActionPreflightV1Inp
 
   let response: Response;
   try {
+    // A direct HTTPS call to the integration: trust the OS store first, as
+    // every other direct CLI request does (proxy.ts ensureSystemCaTrustFor).
+    if (!input.fetchImpl) await ensureSystemCaTrustFor(plan.url);
     response = await (input.fetchImpl ?? fetch)(plan.url, requestInit);
   } catch {
     const receipt = buildReceipt({

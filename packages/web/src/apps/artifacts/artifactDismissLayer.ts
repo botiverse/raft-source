@@ -118,8 +118,10 @@ export function createDismissLayer(now: () => number = currentTimeMs) {
     },
     /** A click in Raft's own document: a press outside whatever is in the page's flow and doesn't hold its target. */
     press(event: Event): void {
-      const target = event.target;
-      if (!(target instanceof Node)) return;
+      // A node of any window: an object window's are another realm's (#337 PR3).
+      const raw = event.target;
+      if (typeof raw !== "object" || raw === null || typeof (raw as { nodeType?: unknown }).nodeType !== "number") return;
+      const target = raw as Node;
       // A menu, popover or dialog drawn over the page (raft-ui's `closestOverlay`): a press in one is not a press on the ground under it.
       const overlay = closestOverlay(target);
       for (const entry of [...entries]) {

@@ -2,7 +2,6 @@
 // Qwen Token Plan, ...) also takes a typed model id, and a Computer that
 // cannot run one for that provider never gets one.
 import assert from "node:assert/strict";
-import { vi } from "vitest";
 import { parseRuntimeConfig, PI_BUILTIN_PROVIDER_MODELS, type RuntimeConfig } from "@botiverse/raft-shared";
 import { buildRuntimeConfigFromFormValues, runtimeFormValuesFromRuntimeConfig } from "./runtimeFormV2Registry";
 import {
@@ -14,9 +13,6 @@ import {
 } from "./builtinModelCatalogCompatibility";
 import { buildBuiltInPiFormOptionSource, validateBuiltInPiDefinitionProjection } from "./runtimeFormDefinitionService";
 import { isBuiltInGatewayCustomModelConfig } from "./agentModelLimitsService";
-
-vi.mock("./providerConnectionFeature", () => ({ isProviderConnectionsEnabled: vi.fn(async () => false) }));
-vi.mock("./providerConnectionService", () => ({ listProviderConnections: vi.fn(async () => []) }));
 
 const listedOpenRouter = PI_BUILTIN_PROVIDER_MODELS.openrouter![0]!.id;
 const openrouter = (model: string, extra: Record<string, string> = {}) => ({ providerId: "openrouter", apiKey: "sk-or-test", model, ...extra });
@@ -105,17 +101,17 @@ test("a typed Qwen Token Plan id needs a Computer that reports the provider; an 
   assert.ok(parsed.ok);
   if (!parsed.ok) return;
   const config = parsed.config;
-  assert.equal(isBuiltInCatalogCheckedSelection(config, null), true, "the write paths ask the Computer first");
+  assert.equal(isBuiltInCatalogCheckedSelection(config), true, "the write paths ask the Computer first");
   // No customModelProviderIds at all, and a Computer that only knows OpenRouter (before this change).
   for (const older of [live(), live(["openrouter"])]) {
     assert.throws(
-      () => assertBuiltInPresetSupportedByCatalog(config, older, target, null),
+      () => assertBuiltInPresetSupportedByCatalog(config, older, target),
       (error: unknown) => error instanceof BuiltInModelCatalogError
         && error.code === "builtin_custom_model_upgrade_required"
         && error.requestedModel === "qwen4-preview",
     );
   }
-  assert.equal(assertBuiltInPresetSupportedByCatalog(config, live(["openrouter", "qwen-token-plan"]), target, null)?.requestedModel, "qwen4-preview");
+  assert.equal(assertBuiltInPresetSupportedByCatalog(config, live(["openrouter", "qwen-token-plan"]), target)?.requestedModel, "qwen4-preview");
 
   // The Model field there stays list-only for Qwen Token Plan.
   const source = buildBuiltInPiFormOptionSource("model")!;
@@ -134,21 +130,21 @@ test("a Computer whose catalog does not list OpenRouter keeps it list-only and r
   assert.equal(current.kind === "dependent_select" && current.customValueAllowedByValue.openrouter, true);
 
   const config = customOpenRouter();
-  assert.equal(isBuiltInCatalogCheckedSelection(config, null), true, "the write paths ask the Computer first");
+  assert.equal(isBuiltInCatalogCheckedSelection(config), true, "the write paths ask the Computer first");
   assert.throws(
-    () => assertBuiltInPresetSupportedByCatalog(config, live(), target, null),
+    () => assertBuiltInPresetSupportedByCatalog(config, live(), target),
     (error: unknown) => error instanceof BuiltInModelCatalogError
       && error.code === "builtin_custom_model_upgrade_required"
       && error.requestedModel === "vendor/unlisted-2099",
   );
-  const ticket = assertBuiltInPresetSupportedByCatalog(config, live(["openrouter"]), target, null);
+  const ticket = assertBuiltInPresetSupportedByCatalog(config, live(["openrouter"]), target);
   assert.equal(ticket?.requestedModel, "vendor/unlisted-2099");
 });
 
 test("changing the typed id is a new selection; the model-limits signal covers it", () => {
   const a = customOpenRouter("vendor/a");
   const b = customOpenRouter("vendor/b");
-  assert.equal(builtInPresetSelectionChanged(a, b, null), true);
-  assert.equal(builtInPresetSelectionChanged(a, customOpenRouter("vendor/a"), null), false);
-  assert.equal(isBuiltInGatewayCustomModelConfig(a, null), true);
+  assert.equal(builtInPresetSelectionChanged(a, b), true);
+  assert.equal(builtInPresetSelectionChanged(a, customOpenRouter("vendor/a")), false);
+  assert.equal(isBuiltInGatewayCustomModelConfig(a), true);
 });

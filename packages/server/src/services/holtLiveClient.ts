@@ -57,6 +57,8 @@ export type HoltLiveSessionStart = {
   instructions: string;
   tools: HoltLiveTool[];
   callback: { url: string; secret: string };
+  /** Publish the call's captions into the room as data messages (topic "caption"); holt-live's default is off. */
+  captions?: boolean;
 };
 
 export function createHoltLiveClient(config: HoltLiveConfig, transport: HoltLiveTransport = fetch): HoltLiveClient {

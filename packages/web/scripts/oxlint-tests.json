@@ -1,5 +1,5 @@
 {
-  "jsPlugins": ["./oxlint-plugins/raft-test/index.ts"],
+  "jsPlugins": [{ "name": "raft-test", "specifier": "@botiverse/lint/test" }],
   "plugins": ["typescript", "import"],
   "categories": {
     "correctness": "off"

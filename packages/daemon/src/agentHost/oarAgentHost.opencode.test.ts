@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import type { Session } from "@botiverse/oar";
 import { scriptedRuntime } from "@botiverse/oar/testing";
 import { harness, makeConfig, message, request, until } from "../testing/oarAgentHostHarness";
-import { OPENCODE_SESSION_ELSEWHERE_TEXT, type OarAgentHostDeps } from "./oarAgentHost";
+import { OPENCODE_SESSION_ELSEWHERE_TEXT, OPENCODE_SESSION_NOT_LISTED_TEXT, type OarAgentHostDeps } from "./oarAgentHost";
 import { OarLaunchDeclined, type OarLaunch } from "./oarLaunch";
 import { opencodeOarLaunch, type OpencodeRelease } from "./oarOpencodeLaunch";
 
@@ -114,7 +114,7 @@ test("prompt first (OAR #777): with OAR's status stuck on running after a turn, 
   }
 });
 
-test("prompt first is OpenCode's only: another runtime with the same stuck status still holds the delivery for the turn end", async () => {
+test("without prompt first: a runtime with the same stuck status still holds the delivery for the turn end", async () => {
   let stuck = false;
   // The harness's default launch: grok-shaped, `after_turn`, no promptFirst.
   const h = await harness({ wrapSession: wrap(() => stuck) });
@@ -200,6 +200,45 @@ test("2.x: a session OAR will not resume in the workspace (made before #14872) s
     assert.deepEqual(h.framesOf("agent:session:invalidate").map((frame) => [frame.sessionId, frame.reason]), [["ses_old", "runtime_host_migration"]]);
     await until(() => inputs.length > 0, "the new session's first input");
     await until(() => h.framesOf("agent:activity").some((frame) => frame.entries?.some((entry) => entry.kind === "system" && entry.text === OPENCODE_SESSION_ELSEWHERE_TEXT)), "the Activity Log row");
+    assert.ok(h.framesOf("agent:activity").every((frame) => frame.runtimeError === undefined), "not an error");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+/** OAR's refusal of a session OpenCode's `session/list` doesn't name (`ResumeCwdError`, which keeps the base class name). */
+const notListedRefusal = () => Object.assign(new Error("cannot confirm the saved directory of session ses_1x; this runtime resumes in its saved directory, so open a new session instead"), {
+  name: "UnsupportedOptionError",
+  option: "cwd",
+  reason: "not_listed",
+  sessionId: "ses_1x",
+  requestedCwd: "/work/agent-1",
+});
+
+test("2.x after an upgrade from 1.x: a session OpenCode 2.x doesn't list starts a new session here, told in the Activity Log", async () => {
+  const opened: Array<string | undefined> = [];
+  const inputs: string[] = [];
+  const fresh = scriptedRuntime({ turn: (turn) => { inputs.push(turn.input); turn.say("ok"); } });
+  const h = await harness({
+    deps: {
+      ...opencodeDeps(V2),
+      openSession: async (launch) => {
+        opened.push(launch.options.resume);
+        if (launch.options.resume) throw notListedRefusal();
+        return fresh.session({ kind: "available", via: "bundled" }, launch.options);
+      },
+    },
+  });
+  try {
+    const outcome = await h.host.start(request({ config: opencodeConfig({ sessionId: "ses_1x" }), wakeMessage: message("m-1") }));
+    assert.deepEqual(outcome, { kind: "started" });
+    assert.deepEqual(opened, ["ses_1x", undefined], "one refused resume, then a fresh open");
+    const event = h.events.find((candidate) => candidate.name === "daemon.agent.oar.resume_elsewhere_new_session");
+    assert.equal(event?.attrs.resume_cwd_reason, "not_listed");
+    assert.equal(h.events.some((candidate) => candidate.name === "daemon.agent.oar.fallback"), false, "not handed back to the driver");
+    assert.deepEqual(h.framesOf("agent:session:invalidate").map((frame) => [frame.sessionId, frame.reason]), [["ses_1x", "runtime_host_migration"]]);
+    await until(() => inputs.length > 0, "the new session's first input");
+    await until(() => h.framesOf("agent:activity").some((frame) => frame.entries?.some((entry) => entry.kind === "system" && entry.text === OPENCODE_SESSION_NOT_LISTED_TEXT)), "the Activity Log row");
     assert.ok(h.framesOf("agent:activity").every((frame) => frame.runtimeError === undefined), "not an error");
   } finally {
     await h.cleanup();

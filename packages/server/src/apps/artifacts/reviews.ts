@@ -44,6 +44,7 @@ import {
   type ArtifactCommentImage,
 } from "@botiverse/raft-shared";
 import { announceObjectEvents } from "../../platform/activity";
+import { announceArtifactChanged } from "./live";
 import { getDb, type DatabaseExecutor } from "../../platform/db";
 import type { ServerViewActor } from "../../platform/visibility";
 import {
@@ -346,6 +347,7 @@ export async function submitReview(input: {
   if (outcome.kind === "written") {
     await sendQueued(input.outbox, outcome.written.queued);
     await announceObjectEvents([outcome.written.eventId]);
+    announceArtifactChanged(input.item.id, "comments");
   }
   return outcome;
 }
@@ -413,7 +415,7 @@ export function createReviewOperations() {
       body: AgentApiArtifactReviewBody,
       outbox: ArtifactNoticeOutbox,
     ): Promise<ArtifactApiResult<AgentApiArtifactReviewCreated>> => answer(async () => {
-      const item = await resolveVisibleItem(agent, params.artifact);
+      const item = await resolveVisibleItem(agent, params.artifact, "write");
       if (!(await takesPartIn(viewActor(agent), item))) return mayNotTakePart("review it");
       // A retry of a review this agent posted under the key answers it, before anything that may have changed since.
       const { idempotencyKey, ...request } = body;

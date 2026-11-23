@@ -40,7 +40,7 @@ export function formatAddMemberResult(target: string, memberType: "user" | "agen
 export const channelAddMemberCommand = defineCommand(
   {
     name: "add-member",
-    description: "Add a human or agent from this server to a public, private, or joint channel when this agent has server admin authority",
+    description: "Add a human or agent from this server to a public, private, or joint channel you are in (with the admin role on this server, also to a public or private channel you are not in)",
     options: [
       {
         flags: "--target <target>",

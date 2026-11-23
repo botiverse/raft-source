@@ -1,0 +1,16 @@
+host: oar
+runtime: dsh
+scenario: resume-baseline-unknown
+promptSource: resume_empty
+note: launch.options.resume: session-1
+
+## standing prompt
+= standing-prompt.md
+
+## carrier
+launch.options.systemPrompt: = standing prompt
+launch.options.appendSystemPrompt: (absent)
+launch.options.env.OPENCODE_CONFIG_CONTENT: (absent)
+
+## first input (120 chars, sha256:ff860092fb9fea97, does not contain the standing prompt)
+No new messages while you were away. If you were in the middle of a task, continue it; otherwise stop (no reply needed).

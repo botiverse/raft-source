@@ -66,7 +66,8 @@ test("the permission model still has none of the five, and channel authority is 
 
   // Creating is a member capability; editing and archiving are channel-admin
   // capabilities; visibility, deletion and federation are neither.
-  assert.equal(hasServerCapability("member", "createChannels"), true);
+  assert.equal(hasServerCapability("member", "createPublicChannels"), true);
+  assert.equal(hasServerCapability("member", "createPrivateChannels"), true);
   for (const capability of ["editChannelMetadata", "archiveChannels"] as const) {
     assert.ok((CHANNEL_ADMIN_CAPABILITIES as readonly string[]).includes(capability));
     assert.equal(hasServerCapability("member", capability), false);
@@ -129,6 +130,7 @@ test("server-role.md does not present channel management as one admin-only gate"
   assert.ok(doc, "the topic must resolve");
   const line = doc.content.split("\n").find((l) => l.startsWith("- Channel management"));
   assert.ok(line, "the composition bullet must exist");
-  assert.match(line, /createChannels/, "the member half must be named");
+  assert.match(line, /createPublicChannels/, "the member half must be named");
+  assert.match(line, /createPrivateChannels/, "the member half must be named");
   assert.match(line, /channel-admin role/i, "the channel-admin path must be named");
 });

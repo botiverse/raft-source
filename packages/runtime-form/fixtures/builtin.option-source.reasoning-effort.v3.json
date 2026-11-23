@@ -1,0 +1,43 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "builtin",
+  "schemaVersion": "builtin-pi.create.v3",
+  "kind": "select",
+  "sourceId": "reasoningEffort",
+  "pointer": "/reasoningEffort",
+  "options": [
+    {
+      "value": "",
+      "label": "Default"
+    },
+    {
+      "value": "off",
+      "label": "No reasoning"
+    },
+    {
+      "value": "minimal",
+      "label": "Minimal"
+    },
+    {
+      "value": "low",
+      "label": "Low"
+    },
+    {
+      "value": "medium",
+      "label": "Medium"
+    },
+    {
+      "value": "high",
+      "label": "High"
+    },
+    {
+      "value": "xhigh",
+      "label": "Extra high"
+    },
+    {
+      "value": "max",
+      "label": "Max"
+    }
+  ],
+  "defaultValue": ""
+}

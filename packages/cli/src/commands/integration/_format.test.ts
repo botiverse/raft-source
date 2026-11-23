@@ -69,6 +69,29 @@ test("formatIntegrationLogin omits agent manifest line when service has none", (
   assert.doesNotMatch(output, /local CLI env/);
 });
 
+test("formatIntegrationLogin on a token-only App says there is no sign-in to hand off and points at its agent tokens", () => {
+  const output = formatIntegrationLogin({
+    status: "logged_in",
+    service: {
+      id: "client-1",
+      clientId: "aliyun-federation",
+      name: "Aliyun Federation",
+      description: null,
+      homepageUrl: null,
+      returnUrl: null,
+      agentManifestUrl: null,
+      createdAt: "2026-11-20T00:00:00.000Z",
+      updatedAt: "2026-11-20T00:00:00.000Z",
+    },
+    scopes: ["openid"],
+    requestId: "internal-request-id",
+  });
+
+  assert.match(output, /session: none; this App has no return URL, so it takes no sign-in \(a token-only App\)/);
+  assert.match(output, /raft integration token --service "aliyun-federation" --exec <program>/);
+  assert.doesNotMatch(output, /follow the service documentation/);
+});
+
 test("formatIntegrationLogin explains human approval requirement", () => {
   const output = formatIntegrationLogin({
     status: "approval_required",

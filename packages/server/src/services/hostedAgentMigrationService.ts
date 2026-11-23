@@ -15,6 +15,7 @@
  * conditioned on the migration revision the review was shown at.
  */
 import { agentConfigValues, recordAgentConfigChange } from "./agentConfigChangeEvents";
+import { openAgentRowSecrets } from "./agentSecretCrypto";
 import { randomUUID } from "node:crypto";
 import { and, eq, isNull, lt, or, sql } from "drizzle-orm";
 import {
@@ -275,14 +276,15 @@ export async function confirmHostedAgentMigration(input: {
       throw new HostedMigrationConfirmError("MIGRATION_SOURCE_MACHINE_MISMATCH", "The agent is no longer on the migration's source computer");
     }
 
+    const openedAgent = openAgentRowSecrets(agent);
     const runtimeSnapshot: AgentMigrationHostedRuntimeSnapshot = {
-      runtime: agent.runtime,
-      model: agent.model,
-      reasoningEffort: agent.reasoningEffort ?? null,
-      envVarsPresent: Boolean(agent.envVars && Object.keys(agent.envVars).length > 0),
+      runtime: openedAgent.runtime,
+      model: openedAgent.model,
+      reasoningEffort: openedAgent.reasoningEffort ?? null,
+      envVarsPresent: Boolean(openedAgent.envVars && Object.keys(openedAgent.envVars).length > 0),
       machineId: migration.sourceMachineId,
       encryptedRuntime: encryptProviderSecret(
-        JSON.stringify({ runtimeConfig: agent.runtimeConfig ?? null, envVars: agent.envVars ?? null }),
+        JSON.stringify({ runtimeConfig: openedAgent.runtimeConfig ?? null, envVars: openedAgent.envVars ?? null }),
         hostedRuntimeSnapshotScope(migration.id),
       ),
     };

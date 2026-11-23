@@ -51,6 +51,8 @@ export const ASSISTANT_DELEGATION_REFUSED_ACTION: Partial<Record<AgentApiRouteKe
   taskReply: "reply in a task",
   threadFollow: "follow a thread",
   threadUnfollow: "unfollow a thread",
+  focus: "focus a conversation",
+  unfocus: "unfocus a conversation",
   // RFC 081: they move the assistant's own read state (RFC 080 §4.3: delegated reads have none).
   inboxRead: "read an inbox item",
   inboxDismiss: "dismiss inbox items",

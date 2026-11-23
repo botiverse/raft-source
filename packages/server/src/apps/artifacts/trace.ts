@@ -2,7 +2,10 @@
 // the work worth seeing in a request's trace. Names and attributes:
 //
 // - `server.artifacts.publish` (agent API publish): `operation` (create |
-//   version), `files_bucket`, `inline_bytes_bucket`, `delete_bucket`; at the
+//   version), `files_bucket`, `inline_bytes_bucket`, `delete_bucket`,
+//   `entry` (named | default), `html_files_bucket`, `target_kind` (channel |
+//   thread | dm | dm_thread | task | id | other | none; the kind, never the
+//   place: what ENTRY_NOT_FOUND and TARGET_NOT_FOUND come from); at the
 //   end `outcome` (published | replayed | unchanged | missing, or the error
 //   code), `status_code`, `kind` of what was published, and `check` (the
 //   publish check of the version it answers: pending | skipped when just

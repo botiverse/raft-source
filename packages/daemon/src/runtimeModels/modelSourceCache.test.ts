@@ -144,3 +144,31 @@ test("a confirmed absence (runtime_not_found: not_installed, or no reason) drops
     assert.deepEqual(await cache.read("grok", detect), { outcome: gone, cache: "miss" }, `after ${JSON.stringify(gone)}`);
   }
 });
+
+test("Antigravity's list (one agy session per listing) stays fresh for a day; other runtimes keep the short window", async () => {
+  let now = 0;
+  const cache = new RuntimeModelSourceCache(() => now);
+  const agy = scripted(live("a"), live("b"), live("e"));
+  const codex = scripted(live("c"), live("d"));
+  await cache.read("antigravity", agy.detect);
+  await cache.read("codex", codex.detect);
+  now = 24 * 60 * 60_000 - 1;
+  assert.deepEqual(await cache.read("antigravity", agy.detect), { outcome: live("a"), cache: "fresh" });
+  assert.equal((await cache.read("codex", codex.detect)).cache, "stale");
+  now = 24 * 60 * 60_000;
+  assert.deepEqual(await cache.read("antigravity", agy.detect), { outcome: live("a"), cache: "stale" });
+  await settle();
+  assert.deepEqual(agy.calls, ["foreground", "background"]);
+  assert.deepEqual(await cache.read("antigravity", agy.detect, { force: true }), { outcome: live("e"), cache: "forced" }, "the form's refresh still bypasses the window");
+});
+
+test("peek returns the last live list at any age without a detection, and nothing once it is dropped", async () => {
+  let now = 0;
+  const cache = new RuntimeModelSourceCache(() => now, 60_000);
+  assert.equal(cache.peek("antigravity"), null);
+  cache.store("antigravity", live("a"));
+  now = 10 * 24 * 60 * 60_000;
+  assert.deepEqual(cache.peek("antigravity"), (live("a") as Extract<RuntimeModelSourceOutcome, { kind: "live" }>).value);
+  cache.store("antigravity", { kind: "unsupported" });
+  assert.equal(cache.peek("antigravity"), null);
+});

@@ -117,6 +117,10 @@ export const RUNTIME_FORM_V2_OPTION_SOURCE_REASONS = [
   "no_models",
   "unsupported",
   "machine_offline",
+  // The runtime's CLI on the Computer is not signed in (detection `runtime_not_authenticated`).
+  "not_signed_in",
+  // The runtime's CLI on the Computer is too old to list (detection `protocol_unsupported`).
+  "runtime_outdated",
 ] as const;
 export type RuntimeFormV2OptionSourceReason = (typeof RUNTIME_FORM_V2_OPTION_SOURCE_REASONS)[number];
 
@@ -174,16 +178,23 @@ const DERIVED_OPTIONS: Record<string, Record<string, RuntimeFormV2OptionsFrom>> 
   },
 };
 
-export type RuntimeFormV2FieldKind =
-  | "text"
-  | "secret"
-  | "url"
-  | "boolean"
-  | "string_map"
-  | "select"
-  | "dependent_select"
-  | "derived_select"
-  | "unsupported";
+/**
+ * Every field kind a client renders (client obligation 2), plus "unsupported"
+ * for a field it cannot. The kitchen-sink fixture (kitchen-sink/generate.ts)
+ * must cover each one, so a new kind here fails its test until it has rows.
+ */
+export const RUNTIME_FORM_V2_FIELD_KINDS = [
+  "text",
+  "secret",
+  "url",
+  "boolean",
+  "string_map",
+  "select",
+  "dependent_select",
+  "derived_select",
+  "unsupported",
+] as const;
+export type RuntimeFormV2FieldKind = (typeof RUNTIME_FORM_V2_FIELD_KINDS)[number];
 
 /** Display copy for one choice (FieldCopy.choices, capability `choice.labels`). */
 export type RuntimeFormV2ChoiceCopy = { label: string; description?: string };

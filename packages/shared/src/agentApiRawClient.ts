@@ -100,7 +100,10 @@ export type AgentApiRawClientMethodArgs<K extends AgentApiRouteKey> =
         ? [params: AgentApiRequestParamsByRoute[K]]
         : [params: AgentApiRequestParamsByRoute[K], body: AgentApiRequestBodyByRoute[K]]
       : [AgentApiRequestBodyByRoute[K]] extends [never]
-        ? [params: AgentApiRequestParamsByRoute[K], query: AgentApiRequestQueryByRoute[K]]
+        // As above: an all-optional query may be left out (`messages.resolve(params)`).
+        ? {} extends AgentApiRequestQueryByRoute[K]
+          ? [params: AgentApiRequestParamsByRoute[K], query?: AgentApiRequestQueryByRoute[K]]
+          : [params: AgentApiRequestParamsByRoute[K], query: AgentApiRequestQueryByRoute[K]]
         : [
           params: AgentApiRequestParamsByRoute[K],
           query: AgentApiRequestQueryByRoute[K],

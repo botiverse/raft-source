@@ -12,12 +12,14 @@ import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 
-import { DAEMON_CAPABILITY_CONTROL_START_CATCHUP_V1, type ServerToMachineMessage } from "@botiverse/raft-shared";
+import { eq } from "drizzle-orm";
+
+import { DAEMON_CAPABILITY_CONTROL_START_CATCHUP_V1, type AgentMessage, type ServerToMachineMessage } from "@botiverse/raft-shared";
 
 import { getDb } from "../db/index";
-import { agents, machines, serverMembers, servers, users } from "../db/schema";
+import { agents, machines, serverMembers, servers, tasks, users } from "../db/schema";
 import { referenceAgentInboxChain } from "../test/agentInboxChainReference";
-import { AgentOrchestrator } from "./agentOrchestrator";
+import { AgentOrchestrator, RESUME_CATCHUP_UNAVAILABLE_PROMPT } from "./agentOrchestrator";
 import * as agentRuntimeProfileService from "./agentRuntimeProfileService";
 import * as channelService from "./channelService";
 import * as messageService from "./messageService";
@@ -337,6 +339,118 @@ test("task #358: a readable inbox with nothing unread sends no resume prompt (th
     const start = orchestrator.starts[0]!;
     assert.equal(start.resumePrompt, undefined, "nothing unread is a verified empty, not an unverified one");
     assert.equal(start.unreadSummary, undefined);
+  } finally {
+    await orchestrator.shutdown();
+  }
+});
+
+// The open tasks an agent holds ride a resume start with nothing else to
+// deliver (`agent:start` `openTasks`), so the daemon does not tell it to stop.
+// Same real path as above: real rows, the reference inbox chain, a captured
+// socket. Tasks are written as rows (no host message), so the agent has
+// nothing unread unless a test posts a message.
+async function seedWithOpenTasks(sessionId: string | null) {
+  const fx = await seed(sessionId);
+  const db = getDb();
+  // A handle (the seed's display-style name has a space), so the DM has a task ref.
+  const handle = `ot-owner-${(sessionId ?? "fresh").replace(/[^a-z0-9]/gi, "").slice(-12)}`;
+  await db.update(users).set({ name: handle }).where(eq(users.id, fx.owner.id));
+  const dm = await channelService.findOrCreateDM(fx.server.id, fx.owner.id, fx.agent.id);
+  assert.ok(dm);
+  const row = (taskNumber: number, title: string, status: "todo" | "in_progress" | "in_review" | "done") => ({
+    channelId: dm.id, taskNumber, title, status, createdByType: "user" as const, createdById: fx.owner.id,
+    claimedByType: "agent" as const, claimedById: fx.agent.id,
+    updatedAt: new Date(Date.now() - taskNumber * 60_000),
+  });
+  await db.insert(tasks).values([
+    row(1, "Finish the rollout", "in_progress"),
+    row(2, "Write the follow-up", "todo"),
+    row(3, "Waiting on review", "in_review"),
+    row(4, "Already done", "done"),
+  ]);
+  return { ...fx, dm: dm!, handle };
+}
+
+function wakeFor(dmId: string, owner: { id: string; name: string }, message: { id: string; seq: number; content: string }): AgentMessage {
+  return {
+    channel_id: dmId, channel_name: owner.name, channel_type: "dm",
+    sender_id: owner.id, sender_name: owner.name, sender_type: "human",
+    content: message.content, timestamp: new Date().toISOString(), message_id: message.id, seq: message.seq,
+  };
+}
+
+test("resume open tasks: a resumed start with nothing to deliver names the agent's todo / in_progress tasks", async ({ db: _db }) => {
+  const { server, machine, agent, handle } = await seedWithOpenTasks("kimi-session-ot-1");
+  const orchestrator = new CapturingOrchestrator();
+  try {
+    bindMachine(orchestrator, machine.id, server.id);
+    assert.equal((await orchestrator.startAgent(agent.id)).outcome, "dispatched");
+    const start = orchestrator.starts[0]!;
+    assert.equal(start.wakeMessage, undefined);
+    assert.equal(start.resumePrompt, undefined, "precondition: the catch-up was read");
+    assert.equal(start.resumeMessages, undefined, "precondition: nothing unread");
+    assert.deepEqual(start.openTasks, {
+      tasks: [
+        { ref: `dm:@${handle}:#1`, title: "Finish the rollout", status: "in_progress" },
+        { ref: `dm:@${handle}:#2`, title: "Write the follow-up", status: "todo" },
+      ],
+      more: 0,
+    });
+  } finally {
+    await orchestrator.shutdown();
+  }
+});
+
+test("resume open tasks: also carried on fresh starts without a session (#proj-runtime:#80)", async ({ db: _db }) => {
+  const { server, machine, agent, handle } = await seedWithOpenTasks(null);
+  const orchestrator = new CapturingOrchestrator();
+  try {
+    bindMachine(orchestrator, machine.id, server.id);
+    assert.equal((await orchestrator.startAgent(agent.id)).outcome, "dispatched");
+    assert.deepEqual(orchestrator.starts[0]!.openTasks, {
+      tasks: [
+        { ref: `dm:@${handle}:#1`, title: "Finish the rollout", status: "in_progress" },
+        { ref: `dm:@${handle}:#2`, title: "Write the follow-up", status: "todo" },
+      ],
+      more: 0,
+    });
+  } finally {
+    await orchestrator.shutdown();
+  }
+});
+
+test("resume open tasks: absent when the start carries a wake message", async ({ db: _db }) => {
+  const { owner, server, machine, agent, dm } = await seedWithOpenTasks("kimi-session-ot-2");
+  const orchestrator = new CapturingOrchestrator();
+  try {
+    bindMachine(orchestrator, machine.id, server.id);
+    const [ownerRow] = await getDb().select({ id: users.id, name: users.name }).from(users).where(eq(users.id, owner.id));
+    const message = await createMessage(dm.id, "user", owner.id, "please look at this");
+    assert.equal((await orchestrator.startAgent(agent.id, { wakeMessage: wakeFor(dm.id, ownerRow!, message) })).outcome, "dispatched");
+    const start = orchestrator.starts[0]!;
+    assert.equal(start.wakeMessage?.message_id, message.id, "precondition: the wake message is carried");
+    assert.equal("openTasks" in start, false);
+  } finally {
+    await orchestrator.shutdown();
+  }
+});
+
+test("resume open tasks: absent when the start carries catch-up messages, or the catch-up could not be read", async ({ db: _db }) => {
+  const { owner, server, machine, agent, dm } = await seedWithOpenTasks("kimi-session-ot-3");
+  const orchestrator = new CapturingOrchestrator();
+  try {
+    bindMachine(orchestrator, machine.id, server.id);
+    orchestrator.failNextInboxRead = true;
+    assert.equal((await orchestrator.startAgent(agent.id)).outcome, "dispatched");
+    const unreadable = orchestrator.starts.at(-1)!;
+    assert.equal(unreadable.resumePrompt, RESUME_CATCHUP_UNAVAILABLE_PROMPT, "precondition: the catch-up read failed");
+    assert.equal("openTasks" in unreadable, false);
+
+    await createMessage(dm.id, "user", owner.id, "sent while it was away");
+    assert.equal((await orchestrator.startAgent(agent.id)).outcome, "dispatched");
+    const catchup = orchestrator.starts.at(-1)!;
+    assert.ok((catchup.resumeMessages?.length ?? 0) > 0, "precondition: the catch-up carries the message");
+    assert.equal("openTasks" in catchup, false);
   } finally {
     await orchestrator.shutdown();
   }

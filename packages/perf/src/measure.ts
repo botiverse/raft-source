@@ -27,6 +27,9 @@ import { type HostSample, busyPairs, hostBenchmark, hostExtra, lopsided, readPre
 import { MIN_PAIRS_TO_SETTLE, overallVerdict, pairedVerdict } from "./verdict";
 import type { MetricVerdict, Verdict } from "./verdict";
 import { BrowserError, type OpenedBrowser, leftOutAsBusy, openBrowser, planBrowser } from "./browser";
+import { fetchAndVerifyFixture } from "./benchCheck";
+import { loadBenchFixture, resolveFixtureTargets } from "./benchFixture";
+import { type BrowserDeviceProbe, buildCohort, dominantString, parseConnectRttMs, parseEdgeColo, parseServerTimingMs, probeBrowserDevice } from "./cohort";
 import { bootContentMs, isProductionHost, withoutBootPrefetch } from "./page";
 
 const HELP = `raft-perf measure — paired on/off page measurement with a JSON verdict
@@ -35,8 +38,10 @@ Required env: RAFT_PERF_EMAIL, RAFT_PERF_PASSWORD (a test account; never a real 
 Options:
   --origin <url>      web origin (default https://raft-app-staging.botiverse.dev)
   --api <url>         API origin (default: --origin; the web calls /api on its own origin)
-  --server <slug>     server slug (required)
-  --channel <name>    channel the channel entry opens (default all)
+  --fixture <name>    frozen benchmark fixture (e.g. bench-v1, or path to JSON): sets --server/--channel and verifies
+                      its message/thread digest before measuring
+  --server <slug>     server slug (required unless --fixture sets it)
+  --channel <name>    channel the channel entry opens (default all, or the fixture's channel)
   --entry <e>         channel | root  (root = /s/<slug>, lands on the remembered or first channel)
   --state <s>         cold | release | repeat
                         cold    new browser context per load, no local data, HTTP cache off
@@ -52,9 +57,8 @@ Options:
   --settle <ms>       wait after load before reading metrics (default 8000 fast / 15000 slow)
   --chromium-arg <a>  extra Chromium switch (repeatable), e.g. a host's run marker
   --browser <where>   local | browser-run (default local). browser-run: a Chromium on Cloudflare Browser Run, driven from
-                      here; needs RAFT_PERF_CF_ACCOUNT_ID and RAFT_PERF_CF_API_TOKEN. No pair is left out as busy (this
-                      host says nothing about that machine) and --jsonl is refused: compare such a report only with
-                      another taken there
+                      here; needs RAFT_PERF_CF_ACCOUNT_ID and RAFT_PERF_CF_API_TOKEN. Each row carries its cohort
+                      (browser_where, edge_colo, browser_benchmark_ms, connect_rtt_ms) so series stay apart
   --out <file>        also write the JSON here
   --jsonl <file>      also write one row per measured load (ScopeDB perf.page_runs); needs --project
   --project <name>    with --jsonl: the product this web belongs to (e.g. raft-web)
@@ -95,8 +99,9 @@ async function main(): Promise<number> {
     options: {
       origin: { type: "string", default: "https://raft-app-staging.botiverse.dev" },
       api: { type: "string" },
+      fixture: { type: "string" },
       server: { type: "string" },
-      channel: { type: "string", default: "all" },
+      channel: { type: "string" },
       entry: { type: "string", default: "channel" },
       state: { type: "string", default: "release" },
       net: { type: "string", default: "fast" },
@@ -133,8 +138,21 @@ async function main(): Promise<number> {
   const where = plan.where;
   /** The browser is on another machine: what this host was doing beside a load says nothing about that load. */
   const remote = where !== "local";
-  if (remote && args.jsonl) fail("--jsonl is refused with --browser browser-run: stored rows are one series per page, taken on one kind of machine");
-  if (!args.server) fail("--server <slug> is required");
+  const fixtureSpec = (() => {
+    try {
+      return args.fixture ? loadBenchFixture(args.fixture) : null;
+    } catch (error) {
+      return fail((error as Error).message);
+    }
+  })();
+  const resolved = (() => {
+    try {
+      return resolveFixtureTargets(fixtureSpec, { server: args.server, channel: args.channel }, { channel: "all" });
+    } catch (error) {
+      return fail((error as Error).message);
+    }
+  })();
+  if (!resolved.server) fail("--server <slug> (or --fixture <name>) is required");
   if (!["channel", "root"].includes(entry)) fail(`--entry must be channel or root, not ${entry}`);
   if (!["cold", "release", "repeat"].includes(state)) fail(`--state must be cold, release or repeat, not ${state}`);
   if (!["fast", "slow"].includes(net)) fail(`--net must be fast or slow, not ${net}`);
@@ -187,12 +205,21 @@ async function main(): Promise<number> {
   const first = await signIn();
   const auth = { authorization: `Bearer ${first.accessToken}` };
   const servers = (await json(`${api}/api/servers`, { headers: auth })) as Array<{ id: string; slug: string }> | { servers: Array<{ id: string; slug: string }> };
-  const server = (Array.isArray(servers) ? servers : servers.servers).find((s) => s.slug === args.server) ?? fail(`the account is not a member of server ${args.server}`);
+  const server = (Array.isArray(servers) ? servers : servers.servers).find((s) => s.slug === resolved.server) ?? fail(`the account is not a member of server ${resolved.server}`);
   const channels = (await json(`${api}/api/channels`, { headers: { ...auth, "x-server-id": server.id } })) as
     | Array<{ id: string; name: string }>
     | { channels: Array<{ id: string; name: string }> };
-  const channel = (Array.isArray(channels) ? channels : channels.channels).find((c) => c.name === args.channel) ?? fail(`no channel ${args.channel} in ${args.server}`);
+  const channel = (Array.isArray(channels) ? channels : channels.channels).find((c) => c.name === resolved.channel) ?? fail(`no channel ${resolved.channel} in ${resolved.server}`);
+  let verifiedFixtureTag: string | null = null;
+  if (fixtureSpec) {
+    const check = await fetchAndVerifyFixture(api, first.accessToken, server.id, channel.id, fixtureSpec).catch((error: Error) => fail(error.message));
+    if (!check.ok) fail(`fixture ${fixtureSpec.fixture} drifted (${check.mismatches.join("; ")}): refusing to measure`);
+    verifiedFixtureTag = check.tag;
+  }
   const url = entry === "channel" ? `${origin}/s/${server.slug}/channel/${channel.id}` : `${origin}/s/${server.slug}`;
+  const interceptDocument = ab !== "none";
+  const edgeColos: string[] = [];
+  const connectRtts: number[] = [];
 
   const storageState = (s: { accessToken: string; refreshToken: string }) => ({
     cookies: [],
@@ -245,25 +272,26 @@ async function main(): Promise<number> {
       const cdp = await context.newCDPSession(page);
       await cdp.send("Network.enable");
       await cdp.send("Network.setCacheDisabled", { cacheDisabled: cacheOff });
-      // Both arms pause the document's response at the same point (the browser makes the request, throttled and cached
-      // as usual; nothing else is intercepted); only the off arm's HTML is edited. Playwright's page.route is not used:
-      // it disables the HTTP cache and fetches the document from Node.
-      await cdp.send("Fetch.enable", { patterns: [{ urlPattern: `${url}*`, resourceType: "Document", requestStage: "Response" }] });
-      cdp.on("Fetch.requestPaused", (e) => {
-        void (async () => {
-          try {
-            const status = e.responseStatusCode ?? 0;
-            if (status < 200 || status >= 300) return void (await cdp.send("Fetch.continueRequest", { requestId: e.requestId }));
-            const raw = await cdp.send("Fetch.getResponseBody", { requestId: e.requestId });
-            const html = raw.base64Encoded ? Buffer.from(raw.body, "base64").toString("utf8") : raw.body;
-            const body = ab === "boot-prefetch" && arm === "off" ? withoutBootPrefetch(html) : html;
-            const responseHeaders = (e.responseHeaders ?? []).filter((h) => !/^(content-length|content-encoding)$/i.test(h.name));
-            await cdp.send("Fetch.fulfillRequest", { requestId: e.requestId, responseCode: status, responseHeaders, body: Buffer.from(body, "utf8").toString("base64") });
-          } catch {
-            await cdp.send("Fetch.continueRequest", { requestId: e.requestId }).catch(() => {});
-          }
-        })();
-      });
+      // When comparing boot-prefetch arms, both arms pause the document's response at the same point (only the off arm's
+      // HTML is edited). With --ab none neither arm edits HTML, so the document streams natively without the 2-RTT CDP pause.
+      if (interceptDocument) {
+        await cdp.send("Fetch.enable", { patterns: [{ urlPattern: `${url}*`, resourceType: "Document", requestStage: "Response" }] });
+        cdp.on("Fetch.requestPaused", (e) => {
+          void (async () => {
+            try {
+              const status = e.responseStatusCode ?? 0;
+              if (status < 200 || status >= 300) return void (await cdp.send("Fetch.continueRequest", { requestId: e.requestId }));
+              const raw = await cdp.send("Fetch.getResponseBody", { requestId: e.requestId });
+              const html = raw.base64Encoded ? Buffer.from(raw.body, "base64").toString("utf8") : raw.body;
+              const body = ab === "boot-prefetch" && arm === "off" ? withoutBootPrefetch(html) : html;
+              const responseHeaders = (e.responseHeaders ?? []).filter((h) => !/^(content-length|content-encoding)$/i.test(h.name));
+              await cdp.send("Fetch.fulfillRequest", { requestId: e.requestId, responseCode: status, responseHeaders, body: Buffer.from(body, "utf8").toString("base64") });
+            } catch {
+              await cdp.send("Fetch.continueRequest", { requestId: e.requestId }).catch(() => {});
+            }
+          })();
+        });
+      }
       if (net === "slow") {
         await cdp.send("Network.emulateNetworkConditions", { offline: false, latency: 150, downloadThroughput: 200_000, uploadThroughput: 94_000 });
         await cdp.send("Emulation.setCPUThrottlingRate", { rate: 4 });
@@ -273,6 +301,7 @@ async function main(): Promise<number> {
       let status5xx = 0;
       let scriptBytes = 0;
       let contentMs: number | null = null;
+      let serverTimingMs: number | null = null;
       const scripts = new Set<string>();
       cdp.on("Network.requestWillBeSent", (e) => {
         if (e.type === "Preflight" || e.request.method === "OPTIONS") preflights++;
@@ -281,6 +310,15 @@ async function main(): Promise<number> {
       cdp.on("Network.responseReceived", (e) => {
         if (e.response.status === 429) status429++;
         else if (e.response.status >= 500) status5xx++;
+        if (e.type === "Document" || e.response.url.startsWith(`${api}/api/`)) {
+          const colo = parseEdgeColo(e.response.headers);
+          if (colo) edgeColos.push(colo);
+          const rtt = parseConnectRttMs(e.response.timing, e.response.protocol);
+          if (rtt != null) connectRtts.push(rtt);
+        }
+        if (serverTimingMs == null && e.response.url.includes(`/api/messages/channel/${channel.id}`)) {
+          serverTimingMs = parseServerTimingMs(e.response.headers["server-timing"] ?? e.response.headers["Server-Timing"]);
+        }
       });
       cdp.on("Network.loadingFinished", (e) => {
         if (scripts.has(e.requestId)) scriptBytes += e.encodedDataLength;
@@ -323,6 +361,7 @@ async function main(): Promise<number> {
         status429,
         status5xx,
         scriptBytes,
+        ...(serverTimingMs != null ? { serverTimingMs } : {}),
       };
     } finally {
       await page.close().catch(() => {});
@@ -344,9 +383,11 @@ async function main(): Promise<number> {
   let outOfTime = false;
   const warnings: string[] = [];
   let opened: OpenedBrowser | null = null;
+  let deviceProbe: BrowserDeviceProbe | null = null;
   try {
     opened = await openBrowser(plan);
     browser = opened.browser;
+    deviceProbe = await probeBrowserDevice(browser);
     // release and repeat keep one context per arm, each with its own session, warmed by one unmeasured visit.
     const warm: Partial<Record<Arm, BrowserContext>> = {};
     const warmAt = Date.now();
@@ -421,8 +462,8 @@ async function main(): Promise<number> {
           lcp: judge(results, picks[1], droppedPairs),
         };
   if (remote) {
-    notes.push("the browser ran on Browser Run: this host's load says nothing about it, so no pair was left out as busy and `host` describes only the machine that drove it");
-    notes.push("every load hands the page its document through this machine (the pause in which the off arm loses its boot prefetch config; it is there with --ab none too), so its times include two round trips between here and Browser Run: arms are affected alike, the absolute times depend on where this command ran");
+    notes.push("the browser ran on Browser Run: this host's load says nothing about it, so no pair was left out as busy (`cohort.browserBenchmarkMs` and `cohort.edgeColo` describe the remote browser)");
+    if (interceptDocument) notes.push("every load hands the page its document through this machine (the pause in which the off arm loses its boot prefetch config), so its times include two round trips between here and Browser Run: arms are affected alike, the absolute times depend on where this command ran");
   }
   else if (ab !== "none" && hostSeen.dropped.length) warnings.push(`${hostSeen.dropped.length} pair(s) ${args["keep-busy"] ? "taken on a busy host (kept: --keep-busy)" : "left out of the verdict: the host was busy during them"} (pair ${hostSeen.dropped.map((i) => i + 1).join(", ")}; ${hostSeen.by === "pressure" ? "tasks on the host were stalled for 10% or more of those loads' time" : `the benchmark beside those loads took over 1.5x its median of ${hostSeen.benchmarkMedianMs} ms`})`);
   const tilted = ab === "none" || remote ? null : lopsided(hostSeen.busyOn, hostSeen.busyOff);
@@ -430,12 +471,29 @@ async function main(): Promise<number> {
   const info = ab === "none" ? null : { messagesFetched: pairedVerdict(results.on.map((r) => r.messagesFetched), results.off.map((r) => r.messagesFetched)) };
   let verdict: Verdict = verdictMetrics ? overallVerdict(Object.values(verdictMetrics).map((m) => m.verdict)) : "unknown";
   if (warnings.some((w) => /invalid/.test(w))) verdict = "unknown";
+  if (deviceProbe?.browserBenchmarkMs == null) {
+    warnings.push("in-browser CPU benchmark probe returned no reading; cohort lacks browserBenchmarkMs");
+  }
+  const cohort = buildCohort({
+    browserWhere: where,
+    edgeColo: dominantString(edgeColos),
+    hostCpuCount: cpus,
+    hostBenchmarkMs: hostSeen.benchmarkMedianMs,
+    device: deviceProbe,
+    connectRttSamplesMs: connectRtts,
+    cpuSlowdown: net === "slow" ? 4 : 1,
+    addedRttMs: net === "slow" ? 150 : 0,
+    net,
+    documentIntercepted: interceptDocument,
+    fixture: verifiedFixtureTag,
+  });
   const sum = (arm: Arm, key: "preflights" | "status429" | "status5xx") => results[arm].reduce((a, r) => a + r[key], 0);
   const report = {
     tool: "raft-perf measure",
     measuredAt: new Date().toISOString(),
     origin,
     page: { entry, server: server.slug, channel: channel.name },
+    cohort,
     state,
     net,
     ab,
@@ -481,6 +539,8 @@ async function main(): Promise<number> {
       ab,
       verdict,
       host: hostExtra(cpus, hostSeen.benchmarkMedianMs),
+      cohort,
+      storeTtfb: !interceptDocument && net === "fast",
     });
     writeFileSync(args.jsonl, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
   }

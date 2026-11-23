@@ -13,6 +13,16 @@ import {
 import { IntegrationV1Error, invokeManifestActionV1 } from "./invokeV1";
 import { validateAgentManifestV1, type AgentManifestV1 } from "./manifestV1";
 
+// F1 (#94 system CA): a v1 action called with the global fetch is a direct
+// HTTPS request to the integration, so OS trust must be installed first.
+const trustCalls: string[] = [];
+vi.mock("../../proxy", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../proxy")>()),
+  ensureSystemCaTrustFor: async (target: string | URL | Request) => {
+    trustCalls.push(`trust:${String(target)}`);
+  },
+}));
+
 const actorContext: AgentContext = {
   agentId: "agent-123",
   serverId: "server-456",
@@ -215,6 +225,36 @@ test("v1 mutation receipt is verified only after an independent readback receipt
   for (const name of invocationFiles) {
     assert.equal(fs.statSync(path.join(state.root, "integration-invocations-v1", name)).mode & 0o777, 0o600);
   }
+});
+
+test("a v1 action sent with the global fetch installs OS trust before connecting", async () => {
+  const state = profile();
+  const contract = manifest("not_supported");
+  trustCalls.length = 0;
+  const order: string[] = [];
+  vi.stubGlobal("fetch", async (url: string | URL | Request) => {
+    order.push(...trustCalls.splice(0), `fetch:${String(url)}`);
+    return new Response(JSON.stringify({ id: "survey-global", status: "draft" }), {
+      status: 201,
+      headers: { "content-type": "application/json" },
+    });
+  });
+  try {
+    await invokeManifestActionV1({
+      actorContext: state.context,
+      env: state.env,
+      service,
+      manifest: contract,
+      action: contract.actions[0]!,
+      payload: { title: "Global fetch" },
+      cookies: cookies(),
+    });
+  } finally {
+    vi.unstubAllGlobals();
+  }
+  assert.equal(order.length, 2, JSON.stringify(order));
+  assert.ok(order[0]!.startsWith("trust:https://"), "trust is installed first, for the action URL");
+  assert.equal(order[0]!.slice("trust:".length), order[1]!.slice("fetch:".length));
 });
 
 test("receipt target uses the durable canonical server binding", async () => {

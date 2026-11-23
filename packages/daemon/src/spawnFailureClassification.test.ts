@@ -1,16 +1,14 @@
 import assert from "node:assert/strict";
 import os from "node:os";
-import { classifySpawnFailure, displayHostDir } from "./spawnFailureClassification";
+import { classifyRuntimeStartupConfigFailure, classifySpawnFailure, displayHostDir, startFailureActivity } from "./spawnFailureClassification";
 import { RuntimeVersionTooOldError } from "./runtimeLaunchVersion";
 import {
   AgentProxyBindError,
-  ProviderConnectionMaterializationError,
   RuntimeExecutableNotFoundError,
   RuntimeModelNotFoundError,
   RuntimeSessionNeedsResetError,
   RuntimeSessionRuntimeMismatchError,
 } from "./spawnFailureErrors";
-import { startFailureActivity } from "./spawnFailureClassification";
 
 test("classifySpawnFailure identifies a known-incompatible runtime CLI version", () => {
   const error = new RuntimeVersionTooOldError({
@@ -45,7 +43,6 @@ test("classifySpawnFailure decides every known reason by code, never by message 
     { input: new RuntimeExecutableNotFoundError({ runtimeId: "codex", message: "Cannot resolve a compatible Codex CLI app-server entry point" }), reason: "runtime_not_found" },
     { input: Object.assign(new Error("spawn claude ENOENT"), { code: "ENOENT" }), reason: "runtime_not_found" },
     { input: new AgentProxyBindError("Agent Credential Proxy local proxy failed to bind 127.0.0.1 after 3 attempts"), reason: "agent_proxy_bind_failed" },
-    { input: new ProviderConnectionMaterializationError({ kind: "http", status: 503, message: "Provider connection materialization failed (HTTP 503): secret=x" }), reason: "provider_connection_materialization_failed" },
     { input: Object.assign(new Error("runner_credential_mint_failed: fetch failed"), { spawnFailureCode: "runner_credential_mint_failed" }), reason: "runner_credential_mint_failed" },
     // Text that used to match by accident now falls through to the generic fallback.
     { input: new Error("spawn claude ENOENT"), reason: "runtime_spawn_failed" },
@@ -57,10 +54,6 @@ test("classifySpawnFailure decides every known reason by code, never by message 
   for (const specimen of cases) {
     assert.equal(classifySpawnFailure(specimen.input).reason, specimen.reason, String((specimen.input as Error).message));
   }
-  const http = classifySpawnFailure(new ProviderConnectionMaterializationError({ kind: "http", status: 503, message: "x secret=poison" }));
-  assert.equal(http.userMessage, "Provider connection materialization failed (HTTP 503). Check Server Settings → AI Providers and retry.");
-  const env = classifySpawnFailure(new ProviderConnectionMaterializationError({ kind: "invalid_environment", message: "y" }));
-  assert.match(env.userMessage, /invalid environment/);
 });
 
 test("task #1242: a runtime_not_found start carries the resolver's lookup verdict, and only a confirmed miss keeps the install copy", () => {
@@ -80,7 +73,7 @@ test("task #1242: a runtime_not_found start carries the resolver's lookup verdic
     assert.equal(undecided.lookupReason, reason);
     assert.equal(undecided.userMessage, message, `${reason}: never "install it"`);
     assert.doesNotMatch(undecided.userMessage, /installed/i);
-    assert.deepEqual(startFailureActivity(undecided, "gpt-5").spawnFailure, { reason: "runtime_not_found", lookupReason: reason });
+    assert.deepEqual(startFailureActivity(undecided, "gpt-5").spawnFailure, { reason: "runtime_not_found", lookupReason: reason, message });
   }
 
   // The verdict is read from the cause too (a wrapped launch error).
@@ -102,7 +95,7 @@ test("task #1242: a runtime_not_found start carries the resolver's lookup verdic
     assert.equal(classified.lookupReason, undefined, noVerdict.message);
     assert.equal(classified.userMessage, neutral, noVerdict.message);
     assert.doesNotMatch(classified.userMessage, /installed/i);
-    assert.deepEqual(startFailureActivity(classified, "gpt-5").spawnFailure, { reason: "runtime_not_found" });
+    assert.deepEqual(startFailureActivity(classified, "gpt-5").spawnFailure, { reason: "runtime_not_found", message: noVerdict.message });
   }
 
   // A resolver that speaks the probe vocabulary (Grok's lookupCommandOnPath) is mapped at this boundary.
@@ -116,7 +109,7 @@ test("task #1242: a runtime_not_found start carries the resolver's lookup verdic
     const classified = classifySpawnFailure(new RuntimeExecutableNotFoundError({ runtimeId: "grok", message, reason: probeReason }));
     assert.equal(classified.lookupReason, launchReason, probeReason);
     assert.equal(classified.userMessage, installCopy ? install : message, probeReason);
-    assert.deepEqual(startFailureActivity(classified, null).spawnFailure, { reason: "runtime_not_found", lookupReason: launchReason });
+    assert.deepEqual(startFailureActivity(classified, null).spawnFailure, { reason: "runtime_not_found", lookupReason: launchReason, message });
   }
   // `unsupported_version` is a probe reason with no lookup meaning: no verdict.
   assert.equal(classifySpawnFailure(new RuntimeExecutableNotFoundError({ runtimeId: "grok", message: "x", reason: "unsupported_version" })).lookupReason, undefined);
@@ -125,7 +118,7 @@ test("task #1242: a runtime_not_found start carries the resolver's lookup verdic
   const other = classifySpawnFailure(Object.assign(new Error("boom"), { reason: "lookup_timed_out" }));
   assert.equal(other.reason, "runtime_spawn_failed");
   assert.equal(other.lookupReason, undefined);
-  assert.deepEqual(startFailureActivity(other, null).spawnFailure, { reason: "runtime_spawn_failed" });
+  assert.deepEqual(startFailureActivity(other, null).spawnFailure, { reason: "runtime_spawn_failed", message: "boom" });
 });
 
 test("task #10: a session stuck on compaction is classified session_needs_reset, with the Reset Session way out", () => {
@@ -133,7 +126,7 @@ test("task #10: a session stuck on compaction is classified session_needs_reset,
   assert.equal(classified.reason, "session_needs_reset");
   assert.match(classified.userMessage, /failed context compaction several times in a row/);
   assert.match(classified.userMessage, /open Restart \/ Reset and choose Reset Session & Restart/);
-  assert.deepEqual(startFailureActivity(classified, "deepseek/v4").spawnFailure, { reason: "session_needs_reset" });
+  assert.deepEqual(startFailureActivity(classified, "deepseek/v4").spawnFailure, { reason: "session_needs_reset", message: classified.detail });
 });
 
 test("task #1258: a session made by another runtime major line is session_runtime_mismatch, with Reset Session or the recorded line as the way out", () => {
@@ -143,7 +136,7 @@ test("task #1258: a session made by another runtime major line is session_runtim
   assert.match(classified.userMessage, /automatic restarts are paused/);
   assert.match(classified.userMessage, /open Restart \/ Reset and choose Reset Session & Restart/);
   assert.match(classified.userMessage, /install the runtime version line the session was created with/);
-  assert.deepEqual(startFailureActivity(classified, "opencode/gpt-5-nano").spawnFailure, { reason: "session_runtime_mismatch" });
+  assert.deepEqual(startFailureActivity(classified, "opencode/gpt-5-nano").spawnFailure, { reason: "session_runtime_mismatch", message: classified.detail });
 
   const unknown = classifySpawnFailure(new RuntimeSessionRuntimeMismatchError({ runtimeId: "opencode", sessionId: "ses_a", reason: "unrecorded", recordedMajor: null, installedVersion: "2.0.27" }));
   assert.match(unknown.userMessage, /its major version was not recorded/);
@@ -178,11 +171,14 @@ test("a provider API key that cannot go in an HTTP header is classified as provi
     assert.ok(!classification.detail.includes(part), `local detail must not carry ${part}`);
     assert.ok(!String((thrown as Error).message).includes(part), `error message must not carry ${part}`);
   }
-  // The activity the server and web get: the typed reason and the safe text only.
+  // The activity: the typed reason and the safe text; the carrier's `message`
+  // (the agent's managers only, see SpawnFailureActivityDiagnostic) is the
+  // local diagnostic, which names the variable and position, never the key.
   const activity = startFailureActivity(classification, "claude-opus-5");
-  assert.deepEqual(activity.spawnFailure, { reason: "provider_api_key_invalid" });
+  assert.deepEqual(activity.spawnFailure, { reason: "provider_api_key_invalid", message: classification.detail });
   assert.equal(activity.detail, PROVIDER_API_KEY_INVALID_USER_MESSAGE);
-  assert.doesNotMatch(JSON.stringify(activity), /SECRET|PASTED|position|ANTHROPIC/);
+  assert.doesNotMatch(activity.detail, /SECRET|PASTED|position|ANTHROPIC/);
+  assert.doesNotMatch(JSON.stringify(activity), /sk-live|SECRET|PASTED/);
 });
 
 test("other untyped start errors keep the generic runtime_spawn_failed", () => {
@@ -218,4 +214,84 @@ test("the agent dir in a user message never shows the home folder's path", () =>
   const error = new RuntimeModelNotFoundError({ runtimeId: "pi", model: "w/n", ignoredWorkspaceCode: [".pi/extensions"], hostExtensionDir: `${os.homedir()}/.pi/agent` });
   assert.match(classifySpawnFailure(error).userMessage, /in ~\/\.pi\/agent;/);
   assert.doesNotMatch(classifySpawnFailure(error).userMessage, new RegExp(os.homedir().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+test("a failed start's activity carries the start's own error text, scrubbed and then capped at 300 characters", () => {
+  const raw = [
+    "spawn failed: C:\\Users\\alice\\AppData\\Roaming\\npm\\codex.cmd and /home/bob/.codex/config.toml",
+    "and /Users/carol/.claude.json with key sk-proj-AbCdEfGh12345678ZyXw for dave@example.org",
+    "x".repeat(400),
+  ].join(" ");
+  const classification = classifySpawnFailure(new Error(raw));
+  assert.equal(classification.reason, "runtime_spawn_failed");
+  assert.equal(classification.detail, raw, "the local log keeps the raw text");
+  const activity = startFailureActivity(classification, null);
+  const message = activity.spawnFailure.message ?? "";
+  assert.equal(message.length, 300);
+  assert.ok(message.startsWith("spawn failed: [REDACTED_PATH] and [REDACTED_PATH] and [REDACTED_PATH] with key [REDACTED_TOKEN] for [REDACTED_EMAIL] xxx"), message);
+  for (const secret of ["alice", "bob", "carol", "AbCdEfGh", "dave@"]) assert.ok(!message.includes(secret), `${secret} must be gone`);
+  // The shown copy is still the fixed one; nothing of the error in it.
+  assert.equal(activity.detail, classification.userMessage);
+  assert.ok(!activity.detail.includes("spawn failed"));
+  // No text of its own: no field.
+  assert.equal("message" in startFailureActivity({ reason: "runtime_spawn_failed", detail: "  ", userMessage: "x" }, null).spawnFailure, false);
+});
+
+test("classifyRuntimeStartupConfigFailure splits macOS managed-preferences sync (5-try pause) from deterministic config parse errors (1-try pause)", () => {
+  // Managed preferences sync: most machines self-recover, so keep runtime_spawn_failed
+  // (server pauses after 5 consecutive failures, not attempt 1) with actionable macOS copy.
+  const managed = classifyRuntimeStartupConfigFailure("failed to load configuration: Failed to synchronize managed preferences", "codex");
+  assert.ok(managed);
+  assert.equal(managed.reason, "runtime_spawn_failed");
+  assert.equal(managed.errorText, "failed to load configuration: Failed to synchronize managed preferences");
+  assert.match(managed.userMessage, /macOS managed preferences/i);
+  assert.match(managed.userMessage, /logged-in macOS desktop session/i);
+  assert.match(managed.userMessage, /@openai\/codex@0\.156\.1/);
+
+  // Nested cause + multiline OAR processFailure stderr slices from the matching line.
+  const multilineNoise = `app-server exited: exit code 1; signal none\nstderr (tail):\n${"noise line\n".repeat(40)}Error: failed to load configuration: Failed to synchronize managed preferences`;
+  const wrapped = new Error("Codex app-server initialize failed", { cause: new Error(multilineNoise) });
+  const wrappedMatch = classifyRuntimeStartupConfigFailure(wrapped, "codex");
+  assert.equal(wrappedMatch?.reason, "runtime_spawn_failed");
+  assert.equal(wrappedMatch?.errorText, "Error: failed to load configuration: Failed to synchronize managed preferences");
+
+  // OAR JSON-RPC wrapped native cause object.
+  const nativeWrapped = new Error("initialize failed", {
+    cause: { native: { code: -32000, message: "failed to load configuration: Failed to synchronize managed preferences" } },
+  });
+  assert.equal(classifyRuntimeStartupConfigFailure(nativeWrapped, "codex")?.reason, "runtime_spawn_failed");
+
+  // Non-Codex runtime omits the @openai/codex pin hint.
+  const other = classifyRuntimeStartupConfigFailure("Failed to synchronize managed preferences", "grok");
+  assert.ok(other);
+  assert.equal(other.reason, "runtime_spawn_failed");
+  assert.doesNotMatch(other.userMessage, /@openai\/codex/);
+
+  // Deterministic TOML/JSON/schema parse errors cannot self-heal: pause on attempt 1.
+  const toml = classifyRuntimeStartupConfigFailure(
+    "failed to load configuration: TOML parse error at line 3, column 1: expected `=`, found `foo`",
+    "codex",
+  );
+  assert.ok(toml);
+  assert.equal(toml.reason, "runtime_config_invalid");
+  assert.match(toml.userMessage, /~\/\.codex\/config\.toml/);
+
+  // Split across outer wrapper and inner cause + Rust toml_edit phrasing without literal "TOML parse error".
+  const splitCause = new Error("Error loading config.toml", {
+    cause: new Error("duplicate key `model` at line 5"),
+  });
+  assert.equal(classifyRuntimeStartupConfigFailure(splitCause, "codex")?.reason, "runtime_config_invalid");
+
+  // Cyclic cause and primitive/null inputs terminate safely without throwing.
+  const cyclic: { message: string; cause?: unknown } = { message: "unrelated failure" };
+  cyclic.cause = cyclic;
+  assert.equal(classifyRuntimeStartupConfigFailure(cyclic, "codex"), null);
+  assert.equal(classifyRuntimeStartupConfigFailure(null, "codex"), null);
+  assert.equal(classifyRuntimeStartupConfigFailure(undefined, "codex"), null);
+  assert.equal(classifyRuntimeStartupConfigFailure(42, "codex"), null);
+
+  // Transient config load errors (timeout, HTTP status mismatch) must not false-positive as runtime_config_invalid.
+  assert.equal(classifyRuntimeStartupConfigFailure("failed to load configuration: connection timed out", "codex"), null);
+  assert.equal(classifyRuntimeStartupConfigFailure("failed to load configuration: expected 200, found 503", "codex"), null);
+  assert.equal(classifyRuntimeStartupConfigFailure("generic startup error", "codex"), null);
 });

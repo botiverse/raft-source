@@ -1200,6 +1200,17 @@ test("completed receipt names each ignore file and marks a count at the bound as
   });
   assert.match(partial, /as listed in \.raftmigrateignore: 1 path, at least 1200 files \(5 GB or more\)\./);
   assert.match(partial, /至少 1200 个文件（5 GB 以上）/);
+
+  // Paths the source could not read were left behind; the receipt names them.
+  const unreadable = receipt({
+    ...base,
+    skippedUnreadable: { count: 3, paths: ["docker-data/", "gradle/daemon.out.log"] },
+  });
+  assert.match(unreadable, /Not moved, because the source had no permission to read them: 3 paths \(docker-data\/, gradle\/daemon\.out\.log, …\)\./);
+  assert.match(unreadable, /没有读取权限、未迁移：3 个路径（docker-data\/, gradle\/daemon\.out\.log, …）。/);
+  const allNamed = receipt({ ...base, skippedUnreadable: { count: 1, paths: ["a.log"] } });
+  assert.match(allNamed, /no permission to read them: 1 path \(a\.log\)\./);
+  assert.doesNotMatch(receipt(base), /no permission|读取权限/);
 });
 
 test("receipt sizes are readable binary units", () => {
@@ -1344,4 +1355,21 @@ test("failed size receipt offers the agent's own retry only when the source supp
   // A retry that failed for another reason says so too.
   const retryLost = formatAgentMigrationTerminalReceipt({ ...base, reason: "MIGRATION_TRANSPORT_LOST", detail: "MIGRATION_TRANSPORT_LOST", isRetry: true });
   assert.match(retryLost, /^The automatic retry also failed; a person needs to start the next migration\.$/m);
+});
+
+test("a failed receipt names the key path the source could not read", () => {
+  const failed = (detail: string) => formatAgentMigrationTerminalReceipt({
+    kind: "failed",
+    sourceMachineName: "laptop",
+    targetMachineName: "server",
+    supportRef: "mig_x",
+    reason: "MIGRATION_WORKSPACE_KEY_PATH_UNREADABLE",
+    detail,
+  });
+  const notes = failed(`MIGRATION_WORKSPACE_KEY_PATH_UNREADABLE:path=${encodeURIComponent("notes/a b.md")}`);
+  assert.match(notes, /The source had no permission to read notes\/a b\.md\. MEMORY\.md and notes\/ always move with the agent/);
+  assert.match(notes, /源电脑没有权限读取 notes\/a b\.md。/);
+  assert.match(failed("MIGRATION_WORKSPACE_KEY_PATH_UNREADABLE:path=."), /no permission to read the workspace folder\./);
+  assert.doesNotMatch(failed("MIGRATION_WORKSPACE_KEY_PATH_UNREADABLE:path=%E0%A4%A"), /no permission/, "a malformed path adds nothing");
+  assert.doesNotMatch(failed("NODE_EACCES"), /no permission/);
 });

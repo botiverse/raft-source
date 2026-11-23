@@ -649,6 +649,7 @@ test("agent-api response contracts parse representative envelopes", () => {
     channelUpdate: { id: "chan-2", name: "design", type: "private", description: "Design reviews" },
     channelMemberAdd: { ok: true, alreadyMember: false, channelId: "chan-2", member: { type: "agent", id: "agent-2", name: "Kirby" } },
     channelMemberRemove: { ok: true, wasMember: true, channelId: "chan-2", member: { type: "agent", id: "agent-2", name: "Kirby" } },
+    channelMemberRole: { ok: true, changed: true, channelId: "chan-2", member: { type: "agent", id: "agent-2", name: "Kirby" }, channelRole: "admin" },
     channelMembers: {
       channel: { ref: "#proj-runtime", type: "channel" },
       agents: [{ name: "Stone", status: "active" }],
@@ -673,6 +674,9 @@ test("agent-api response contracts parse representative envelopes", () => {
         doneAt: null,
       }],
     },
+    focus: { ok: true, focused: { target: "#wg-raft-cli:abcd1234", kind: "thread", source: "manual", focusedAt: "2026-11-19T12:00:00.000Z", lastActiveAt: "2026-11-19T12:00:00.000Z" }, alreadyFocused: false, evicted: [], entries: [{ target: "#wg-raft-cli:abcd1234", kind: "thread", source: "manual", focusedAt: "2026-11-19T12:00:00.000Z", lastActiveAt: "2026-11-19T12:00:00.000Z" }], limit: 3 },
+    unfocus: { ok: true, target: "#wg-raft-cli:abcd1234", wasFocused: true, entries: [], limit: 3 },
+    focusList: { entries: [{ target: "#wg-raft-cli:abcd1234", kind: "thread", source: "manual", focusedAt: "2026-11-19T12:00:00.000Z", lastActiveAt: "2026-11-19T12:00:00.000Z" }], limit: 3 },
     assistantOwnerInbox: {
       owner: { userId: "33333333-3333-4333-8333-333333333333" },
       filter: "unread",
@@ -738,6 +742,7 @@ test("agent-api response contracts parse representative envelopes", () => {
     },
     inboxRead: { target: "app:stamp/pr-13754", kind: "app", entries: [{ id: "77777777-7777-4777-8777-777777777777", senderType: "third_party_app", senderName: "Stamp", content: "checks failed", mentioned: false }], unreadBefore: 3, remaining: 2, remainingCapped: false, consumed: false, nextCursor: null, app: { key: "stamp", name: "Stamp" }, related: { target: "#proj-workspace:#232" } },
     inboxDismiss: { dismissed: 2, conversations: 1, appItems: 1, skippedNeedsAck: 1, earliestActivityAt: "2026-11-01T00:00:00.000Z", remaining: 0 },
+    inboxRows: { rows: [{ channelId: "11111111-1111-4111-8111-111111111111", target: "#proj-workspace", kind: "conversation", conversationKind: "channel", mentions: 0, lastReadSeq: 1199, activitySeq: 1203, unread: 3, latestSender: { name: "richard", type: "user" }, preview: "deploy is green", previewTruncated: false, firstUnreadAt: "2026-11-01T00:00:00.000Z", latestAt: "2026-11-01T00:05:00.000Z", preLaunch: false }], behind: 1, otherUnread: { conversations: 4, messages: 9, mentions: 1, dms: 2 } },
     serverUpdate: {
       id: "server-1",
       name: "Renamed Server",

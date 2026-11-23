@@ -118,11 +118,15 @@ export const ASSISTANT_ROUTE_DECISIONS = {
   channelUpdate: { allow: false, reason: NOT_A_SERVER_ADMIN },
   channelMemberAdd: { allow: false, reason: NOT_A_SERVER_ADMIN },
   channelMemberRemove: { allow: false, reason: NOT_A_SERVER_ADMIN },
+  channelMemberRole: { allow: false, reason: NOT_A_SERVER_ADMIN },
   channelMembers: { allow: false, reason: OUTSIDE_OWNER_DM },
   resolveChannel: { allow: false, reason: "Resolves a channel for itself; it names things through assistantOwnerResolve." },
   threadFollow: { allow: false, reason: OUTSIDE_OWNER_DM },
   threadUnfollow: { allow: false, reason: OUTSIDE_OWNER_DM },
   threadList: { allow: false, reason: OUTSIDE_OWNER_DM },
+  focus: { allow: false, reason: OUTSIDE_OWNER_DM },
+  unfocus: { allow: false, reason: OUTSIDE_OWNER_DM },
+  focusList: { allow: false, reason: OUTSIDE_OWNER_DM },
   // RFC 081, app rows only (Tenny, #wg-ax:#17): its own app notices (`app:system.assistant/...`, its
   // Reminder app's) once `raft message check` is gone. Never a conversation, reminder or agent-event
   // target: the handlers list no conversation row and refuse those (agentInboxItemsRoutes.ts
@@ -130,6 +134,7 @@ export const ASSISTANT_ROUTE_DECISIONS = {
   inboxList: { allow: true, reason: "Lists its own app notices only (app rows): never a conversation row; what it watches is its owner's, through assistantOwnerInbox.", pairsWith: ["inboxRead"] },
   inboxRead: { allow: true, reason: "Reads and consumes its own app notices (app targets only); a conversation target is refused: its owner DM reaches it through events.", pairsWith: ["inboxList"] },
   inboxDismiss: { allow: true, reason: "Dismisses its own app notices (app targets only, `before` takes app rows only); never a conversation's read position.", pairsWith: ["inboxList"] },
+  inboxRows: { allow: false, reason: "Conversation rows only, and an assistant's inbox has none (app rows only): its owner DM reaches it through events." },
   mentionsList: { allow: false, reason: "Its own mentions; an assistant is in no channel." },
   mentionActionsPending: { allow: false, reason: OUTSIDE_OWNER_DM },
   senderMentionDeliveries: { allow: false, reason: OUTSIDE_OWNER_DM },
@@ -196,6 +201,8 @@ export const ASSISTANT_ROUTE_DECISIONS = {
   artifactReview: { allow: false, reason: NO_ARTIFACTS },
   artifactCommentResolve: { allow: false, reason: NO_ARTIFACTS },
   artifactCommentReopen: { allow: false, reason: NO_ARTIFACTS },
+  artifactSettle: { allow: false, reason: NO_ARTIFACTS },
+  artifactUnsettle: { allow: false, reason: NO_ARTIFACTS },
   artifactSubscribe: { allow: false, reason: NO_ARTIFACTS },
   artifactUnsubscribe: { allow: false, reason: NO_ARTIFACTS },
   artifactMove: { allow: false, reason: NO_ARTIFACTS },

@@ -43,10 +43,12 @@ const PAGE_PATH = /^\/artifacts\/([1-9A-HJ-NP-Za-km-z]{22})(?:\/v\/[1-9][0-9]{0,
 const LEGACY_LINK = /^\/artifacts\/pt_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(\/v\/[1-9][0-9]{0,8})?\/?$/;
 /** How much of index.md the page's article holds (UTF-8 bytes, cut at a character): the rest is in the Markdown version. */
 export const ARTICLE_TEXT_MAX_BYTES = 50 * 1024;
-// The square app icon: the one brand image a preview card can show.
-const PREVIEW_IMAGE_PATH = "/android-chrome-512x512.png";
+// The static brand preview image (fallback for non-Artifact cards).
+const PREVIEW_IMAGE_PATH = "/brand/og-raft.png";
 // Visually hidden (it is replaced when the app mounts), still text to a fetcher that reads the HTML.
 const ARTICLE_STYLE = "position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0";
+/** Static default OG/Twitter tags in index.html, stripped when a dynamic preview card is injected. */
+const DEFAULT_OG_META_TAG = /<meta\b[^>]*\bdata-raft-default-og\b[^>]*\/?>[ \t]*\r?\n?/gi;
 /** Marks every answer rewritten or made for a page: the web's service worker (sw.js keepShell) never keeps one as the shell. */
 export const PREVIEW_HEADER = "X-Raft-Artifact-Preview";
 /** Why a page answer is or isn't rewritten: `injected`, or `skipped=<reason>`; a Markdown request that fell back adds `markdown=<reason>`. */
@@ -69,6 +71,7 @@ function artifactApi(apiOrigin: string, id: string) {
   const base = `${apiOrigin}/api/public/artifacts/${id}`;
   return {
     markdown: `${base}/index.md`,
+    ogImage: `${base}/og-image.png`,
     zip: `${base}/download.zip`,
     file: (path: string) => `${base}/files/${encodePath(path)}`,
   };
@@ -120,6 +123,8 @@ export function artifactHeadTags({ meta, id, pageOrigin, apiOrigin }: { meta: Ar
   const entryType = entryAlternateType(meta.entry);
   const metaTag = (attr: string, name: string, content: string) => `<meta ${attr}="${escapeHtml(name)}" content="${escapeHtml(content)}">`;
   const link = (attrs: Record<string, string>) => `<link ${Object.entries(attrs).map(([name, value]) => `${name}="${escapeHtml(value)}"`).join(" ")}>`;
+  // Bust third-party unfurler caches (Slack, X, iMessage) whenever the Artifact is updated.
+  const imageUrl = meta.updatedAt ? `${api.ogImage}?v=${encodeURIComponent(meta.updatedAt)}` : api.ogImage;
   return [
     metaTag("name", "robots", "noindex, nofollow"),
     metaTag("name", "description", description),
@@ -128,12 +133,14 @@ export function artifactHeadTags({ meta, id, pageOrigin, apiOrigin }: { meta: Ar
     metaTag("property", "og:title", meta.title),
     metaTag("property", "og:description", description),
     metaTag("property", "og:url", canonical),
-    metaTag("property", "og:image", `${pageOrigin}${PREVIEW_IMAGE_PATH}`),
-    metaTag("property", "og:image:alt", "Raft"),
-    // The image is the square 512 px app icon: a small card, not a large image one.
-    metaTag("name", "twitter:card", "summary"),
+    metaTag("property", "og:image", imageUrl),
+    metaTag("property", "og:image:width", "1200"),
+    metaTag("property", "og:image:height", "630"),
+    metaTag("property", "og:image:alt", meta.title),
+    metaTag("name", "twitter:card", "summary_large_image"),
     metaTag("name", "twitter:title", meta.title),
     metaTag("name", "twitter:description", description),
+    metaTag("name", "twitter:image", imageUrl),
     link({ rel: "canonical", href: canonical }),
     link({ rel: "alternate", type: "text/markdown", href: api.markdown }),
     entryType ? link({ rel: "alternate", type: entryType, title: "Source", href: api.file(meta.entry) }) : "",
@@ -185,18 +192,19 @@ export function artifactArticle({ meta, id, apiOrigin, text = null }: { meta: Ar
  * shell's is `<div id="root" translate="no" class="notranslate">`).
  */
 export function injectPreview(shell: string, { title, head, article }: { title: string; head: string; article: string }): string | null {
-  const titleMatch = /<title>[^<]*<\/title>/i.exec(shell);
-  const headEnd = shell.search(/<\/head>/i);
-  const rootMatch = /<div id="root"(?:\s[^>]*)?>/i.exec(shell);
+  const cleaned = shell.replace(DEFAULT_OG_META_TAG, "");
+  const titleMatch = /<title>[^<]*<\/title>/i.exec(cleaned);
+  const headEnd = cleaned.search(/<\/head>/i);
+  const rootMatch = /<div id="root"(?:\s[^>]*)?>/i.exec(cleaned);
   if (!titleMatch || headEnd < 0 || !rootMatch || titleMatch.index > headEnd || rootMatch.index < headEnd) return null;
   const rootOpenEnd = rootMatch.index + rootMatch[0].length;
-  return shell.slice(0, titleMatch.index)
+  return cleaned.slice(0, titleMatch.index)
     + `<title>${escapeHtml(title)}</title>`
-    + shell.slice(titleMatch.index + titleMatch[0].length, headEnd)
+    + cleaned.slice(titleMatch.index + titleMatch[0].length, headEnd)
     + `${head}\n`
-    + shell.slice(headEnd, rootOpenEnd)
+    + cleaned.slice(headEnd, rootOpenEnd)
     + article
-    + shell.slice(rootOpenEnd);
+    + cleaned.slice(rootOpenEnd);
 }
 
 /** The 301 for an older link (`pt_<uuid>`), the query kept, or null for any other path. */

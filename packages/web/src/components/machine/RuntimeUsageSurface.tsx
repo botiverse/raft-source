@@ -1,35 +1,49 @@
-import { Badge, Status, Button, IconTile, ListRow, ListRowBody, ListRowBottom, ListRowDescription, ListRowGroup, ListRowTitle, ListRowTop, Separator, Spinner, TextLink } from "@botiverse/raft-ui";
+import { Badge, Banner, BannerAction, BannerDescription, Status, Button, DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, IconTile, ListRow, ListRowBody, ListRowBottom, ListRowDescription, ListRowGroup, ListRowTitle, ListRowTop, Separator, Spinner, TextLink } from "@botiverse/raft-ui";
 import { Meter, MeterHeader, MeterIndicator, MeterLabel, MeterTrack, MeterValue } from "@botiverse/raft-ui/wip";
 import CloseButton from "../ui/CloseButton";
-import { allModelsUsageAccount, currentTimeMs, isClaudeOAuthAppsWindow, runtimeAuthSignsInPerProvider } from "@botiverse/raft-shared";
-import type { Readiness, RuntimeAccountUsageProvider, RuntimeAccountUsageWindow, RuntimeAuthRuntime, RuntimeAuthSignedInProvider, RuntimeAuthStatus } from "@botiverse/raft-shared";
+import { allModelsUsageAccount, currentTimeMs, getRuntimeDisplayName, isClaudeOAuthAppsWindow, RUNTIME_ACCOUNT_USAGE_TEMPORARILY_UNAVAILABLE_CODE, runtimeAuthSignsInPerProvider, runtimeAuthStatusOnly } from "@botiverse/raft-shared";
+import type { Readiness, RuntimeAccountUsageProvider, RuntimeAccountUsageWindow, RuntimeAuthRuntime, RuntimeAuthSignedInProvider, RuntimeAuthStatus, RuntimeUpdateCheck } from "@botiverse/raft-shared";
+import { unsupportedReasonBadgeId, unsupportedReasonTextId } from "./runtimeUsageUnsupportedReason";
 import { formatReadiness, readinessBody, readinessHeading, readinessHolds } from "../../utils/readinessCopy";
-import { TriangleAlert, KeyRound, ListChecks, LogIn, LogOut, Plus, RefreshCw, TimerReset, UserRound, X } from "lucide-react";
+import { Ellipsis, TriangleAlert, KeyRound, ListChecks, LogIn, LogOut, Plus, RefreshCw, TimerReset, UserRound, X } from "lucide-react";
 import { Fragment, useCallback } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
 import { runtimeUsagePercentUsed } from "./bulkChangeModelPlan";
 import { usageResetText } from "./rack/rackResetText";
+import { modelLimitChip, usageCreditsText, usageOnCredits } from "./runtimeUsageCredits";
 import { formatRelativeTime } from "../../utils/relativeTime";
 import { hasProviderKey } from "./runtimeProviderKey";
 import { RUNTIME_INSTALL_COMMANDS } from "./runtimeInstallCommands";
+import { RuntimeCredentialsNote } from "./RuntimeCredentialsNote";
 import { RackCommand } from "../../features/computer/RackCommand";
 import type { RuntimeAccountUsageReadResult, RuntimeAccountUsageRefreshResult } from "../../utils/runtimeAccountUsageClient";
 import { runtimeAuthComputerSignsOut, runtimeAuthComputerSupports } from "../../utils/runtimeAuthClient";
 import type { RuntimeAuthView } from "../../utils/runtimeAuthClient";
-import { accountText } from "../../features/computer/accountText";
+import { accountText, formatRuntimePlanHeading } from "../../features/computer/accountText";
 import { ICON_BAR_END_PULL } from "../ui/headEdges";
+import { RuntimeVersionLine } from "./RuntimeVersionLine";
+import { runtimeUsageWindowLabel } from "./runtimeUsageText";
+import type { RuntimeUpgradeState } from "../../features/computer/runtimeUpgradeOutcomeCopy";
 
 /**
  * The runtime usage card's drawing: the usage block (also the agent move
- * dialog's), the sign-in line, and the one action row. Its state lives in
- * RuntimeAccountUsageChip's `useRuntimeUsageCard`.
+ * dialog's) and the sign-in line. Its state lives in RuntimeAccountUsageChip's
+ * `useRuntimeUsageCard`.
+ *
+ * #oar-raft:3a3f8fc1 (xxchan): a card is read for how much is left and when
+ * it comes back, so a healthy card has no action row. Each action sits beside
+ * what it acts on, and only while it means something: Upgrade in the version
+ * line (a text link, gone once it has an outcome), a limit reset under the
+ * account once a window is nearly used up, Sign out in the account's menu,
+ * Refresh beside "Updated …". Resets left and credits are always shown.
  */
 
 export type SurfaceRefreshState = RuntimeAccountUsageRefreshResult["state"] | "idle" | "requesting" | "unconfirmed";
 
-function UsageWindowMeter({ window }: { window: RuntimeAccountUsageWindow }) {
+/** `onCredits`: the account runs on credits once a window is used up (`usageOnCredits`); a full bar that says so. */
+function UsageWindowMeter({ window, onCredits }: { window: RuntimeAccountUsageWindow; onCredits: boolean }) {
   const { formatMessage, locale } = useIntl();
   // Used up by the provider's word or the ratio itself, not by rounding: a
   // window with 0.4% left reads "100% used" (rounded), as the bulk dialog
@@ -43,15 +57,15 @@ function UsageWindowMeter({ window }: { window: RuntimeAccountUsageWindow }) {
     : null;
   const valueText = usedUp
     ? reset === null
-      ? formatMessage({ id: "machine.runtimeUsage.windowUsedUpResetUnavailable" })
-      : formatMessage({ id: "machine.runtimeUsage.windowUsedUp" }, { reset })
+      ? formatMessage({ id: onCredits ? "machine.runtimeUsage.windowUsedUpOnCreditsResetUnavailable" : "machine.runtimeUsage.windowUsedUpResetUnavailable" })
+      : formatMessage({ id: onCredits ? "machine.runtimeUsage.windowUsedUpOnCredits" : "machine.runtimeUsage.windowUsedUp" }, { reset })
     : reset === null
-      ? formatMessage({ id: "machine.runtimeUsage.windowUsedResetUnavailable" }, { percent: percentUsed })
+      ? formatMessage({ id: "machine.rack.percentUsed" }, { percent: percentUsed })
       : formatMessage({ id: "machine.runtimeUsage.windowUsed" }, { percent: percentUsed, reset });
   return (
     <Meter used={used} valueText={valueText} size="sm">
       <MeterHeader>
-        <MeterLabel>{window.label}</MeterLabel>
+        <MeterLabel>{runtimeUsageWindowLabel(window, formatMessage)}</MeterLabel>
         <MeterValue />
       </MeterHeader>
       <MeterTrack>
@@ -90,35 +104,54 @@ export function RuntimeUsageContents({
   loading,
   loadError,
   metadata,
+  accountMenu,
+  accountActions,
+  footerAction,
 }: {
   result: RuntimeAccountUsageReadResult | null;
   loading: boolean;
   loadError: boolean;
   /** Replaces the closing "Updated …" line (the move dialog's offline computer says when it last reported). */
   metadata?: string;
+  /** The Computer's own (default) account's menu (Sign out), at the end of its name row. */
+  accountMenu?: ReactNode;
+  /** Under the Computer's own account: what can be done about its limits (a reset), when it means something. */
+  accountActions?: ReactNode;
+  /** Beside "Updated …" (Refresh); also drawn when there is nothing read yet. */
+  footerAction?: ReactNode;
 }) {
   const { formatMessage, locale } = useIntl();
+  const bare = (body: ReactNode) => (
+    <>
+      {body}
+      {footerAction ? (
+        <>
+          <Separator />
+          <div className="flex items-center justify-end gap-2 px-4 py-1.5">{footerAction}</div>
+        </>
+      ) : null}
+    </>
+  );
   if (loading && !result) {
-    return <div className="px-4 py-5 text-callout text-foreground-muted">{formatMessage({ id: "machine.runtimeUsage.reading" })}</div>;
+    return bare(<div className="px-4 py-5 text-callout text-foreground-muted">{formatMessage({ id: "machine.runtimeUsage.reading" })}</div>);
   }
   if (loadError && !result) {
-    return (
+    return bare(
       <div className="flex items-start gap-2 px-4 py-5 text-callout text-warning-strong">
         <TriangleAlert size={16} className="mt-0.5 shrink-0" />
         {formatMessage({ id: "machine.runtimeUsage.readFailed" })}
-      </div>
+      </div>,
     );
   }
   if (!result || result.snapshot === null) {
-    return (
+    return bare(
       <div className="px-4 py-5">
         <div className="text-callout font-bold text-foreground">{formatMessage({ id: "machine.runtimeUsage.noSnapshot" })}</div>
-        <p className="mt-1 text-footnote text-foreground-muted">
-          {formatMessage({ id: "machine.runtimeUsage.noSnapshotDescription" })}
-        </p>
-      </div>
+      </div>,
     );
   }
+  // The Computer's own account (not an agent's own folder's): where its menu and limit actions go.
+  const ownAccountKey = result.snapshot.accounts.find((account) => account.agentIds === undefined)?.accountKey ?? null;
 
   const stale = result.state === "stale";
   return (
@@ -135,54 +168,58 @@ export function RuntimeUsageContents({
           const reauth = account.health === "reauth_required";
           const identity = account.maskedLabel ?? account.displayName;
           const resets = account.limitResetsAvailable;
-          // Used up on the all-models basis only: a model's own window at
-          // its limit says so on its own row, not on the account.
+          const credits = usageCreditsText(account.credits, formatMessage);
+          const onCredits = usageOnCredits(account);
+          // "Used up" on the all-models basis only; a model's own window at its
+          // limit is "some models used up" (below), its row saying which.
           const health = allModelsUsageAccount(account).account.health;
+          // Not read this time, read again later (Kimi's token awaiting refresh): no error.
+          const notReadYet = account.parseErrorCode === RUNTIME_ACCOUNT_USAGE_TEMPORARILY_UNAVAILABLE_CODE;
+          // A model or group used up while the account runs others, or every group used up (`modelLimitChip`).
+          const modelChip = health === "ok" && !notReadYet ? modelLimitChip(account) : null;
+          const badgeOk = health === "ok" && !notReadYet && modelChip === null;
+          // Why an unsupported account has no reading (OAR's reason), when the Computer said.
+          const unsupportedLabel = health === "unsupported" ? unsupportedReasonBadgeId(account.unsupportedReason) : null;
+          const unsupportedText = health === "unsupported" ? unsupportedReasonTextId(account.unsupportedReason) : null;
+          const own = account.accountKey === ownAccountKey;
           return (
             <Fragment key={account.accountKey}>
             {index > 0 ? <Separator /> : null}
             <div className="px-4 py-3">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
-                  <div className="truncate text-callout font-bold text-foreground">
-                    {account.planLabel ?? formatMessage({ id: "machine.runtimeUsage.accountFallback" })}
+                  <div className="truncate text-callout font-bold text-foreground" data-testid="runtime-account-plan">
+                    {formatRuntimePlanHeading(account.planLabel, formatMessage)}
                   </div>
-                  {(identity || resets !== undefined) && (
-                    <div className="mt-0.5 flex min-w-0 items-baseline gap-2">
-                      {identity && (
-                        <span className="min-w-0 truncate font-mono text-mono-meta text-foreground-hint" data-testid="runtime-account-masked-label">
-                          {identity}
-                        </span>
-                      )}
-                      {identity && resets !== undefined ? <Separator orientation="vertical" className="h-3 self-center" /> : null}
-                      {/* The account's limit resets (Codex), beside the account they belong to. */}
-                      {resets !== undefined && (
-                        <span className="shrink-0 text-caption text-foreground-muted" data-testid="runtime-account-limit-resets">
-                          {resets > 0
-                            ? formatMessage({ id: "machine.runtimeUsage.limitResets.left" }, { count: resets })
-                            : formatMessage({ id: "machine.runtimeUsage.limitResets.none" })}
-                        </span>
-                      )}
+                  {identity && (
+                    <div className="mt-0.5 min-w-0 truncate font-mono text-mono-meta text-foreground-hint" data-testid="runtime-account-masked-label">
+                      {identity}
                     </div>
                   )}
                 </div>
-                {/* Raft DS StatusChip: soft wash, a square pixel, one word. */}
-                <Badge
-                  appearance="soft"
-                  variant={health === "ok" ? "success" : "warning"}
-                >
-                  <Status size="md" variant={health === "ok" ? "success" : "warning"} aria-hidden="true" />
-                  {formatMessage({ id: `machine.runtimeUsage.health.${health}` })}
-                </Badge>
+                <div className="flex shrink-0 items-center gap-1">
+                  {/* Raft DS StatusChip: soft wash, a square pixel, one word. Only for a problem: a healthy account needs no word. */}
+                  {badgeOk ? null : (
+                    <Badge appearance="soft" variant="warning" data-testid="runtime-account-health">
+                      <Status size="md" variant="warning" aria-hidden="true" />
+                      {formatMessage({ id: notReadYet ? "machine.runtimeUsage.health.temporarilyUnavailable" : modelChip ? `machine.runtimeUsage.health.${modelChip}` : unsupportedLabel ?? `machine.runtimeUsage.health.${health}` })}
+                    </Badge>
+                  )}
+                  {own ? accountMenu : null}
+                </div>
               </div>
-              {account.health === "unsupported" ? null : account.health === "error" ? (
-                <p className="mt-3 text-footnote text-foreground-muted">
-                  {formatMessage({ id: "machine.runtimeUsage.readFailed" })}
+              {account.health === "unsupported" ? (unsupportedText ? (
+                <p className="mt-3 text-footnote text-foreground-muted" data-testid="runtime-account-unsupported-reason">
+                  {formatMessage({ id: unsupportedText })}
                 </p>
-              ) : reauth ? (
+              ) : null) : notReadYet ? (
                 <p className="mt-3 text-footnote text-foreground-muted">
-                  {formatMessage({ id: "machine.runtimeUsage.reauthDescription" })}
+                  {formatMessage({ id: "machine.runtimeUsage.temporarilyUnavailable" })}
                 </p>
+              ) : account.health === "error" || reauth ? (
+                // Its tag says it ("error", "sign in again"; Sign in under the Computer's own account): no
+                // sentence repeating it, and no last-known meters until the provider reads it again.
+                null
               ) : (
                 <div className="mt-3 stack-y-3">
                   {/* Claude's OAuth apps' window (third-party apps' use) is never listed. */}
@@ -195,23 +232,46 @@ export function RuntimeUsageContents({
                     // Raft DS Meter (raft-ui 0.50): what is used, filling as
                     // it is used; cyan, orange from 80% used, a full orange
                     // bar when used up.
-                    <UsageWindowMeter key={window.id} window={window} />
+                    <UsageWindowMeter key={window.id} window={window} onCredits={onCredits} />
                   ))}
                 </div>
               )}
+              {/* Always in sight: the resets the account has left and its credits (Codex), one line of secondary text
+                  under the meters (Kirby: two numbers, not chips that look pressable). No credits left reads orange. */}
+              {(resets !== undefined || credits !== null) && (
+                <p className="mt-3 truncate text-footnote text-foreground-muted tabular-nums" data-testid="runtime-account-facts">
+                  {resets !== undefined && (
+                    <span data-testid="runtime-account-limit-resets">
+                      {resets > 0
+                        ? formatMessage({ id: "machine.runtimeUsage.limitResets.left" }, { count: resets })
+                        : formatMessage({ id: "machine.runtimeUsage.limitResets.none" })}
+                    </span>
+                  )}
+                  {resets !== undefined && credits !== null ? <>{" "}<span aria-hidden="true">·</span>{" "}</> : null}
+                  {credits !== null && (
+                    <span className={account.credits?.available === false ? "text-warning-strong" : undefined} data-testid="runtime-account-credits">
+                      {credits}
+                    </span>
+                  )}
+                </p>
+              )}
+              {own && accountActions ? <div className="mt-3">{accountActions}</div> : null}
             </div>
             </Fragment>
           );
         })}
       </div>
       <Separator />
-      <div className="px-4 py-2 text-caption text-foreground-hint">
-        {metadata ?? formatMessage(
-          { id: "machine.runtimeUsage.updated" },
-          {
-            updated: formatRelativeTime(result.snapshot.collectedAt, locale) ?? formatMessage({ id: "machine.runtimeUsage.recently" }),
-          },
-        )}
+      <div className="flex items-center justify-between gap-2 px-4 py-1.5">
+        <span className="min-w-0 py-0.5 text-caption text-foreground-hint">
+          {metadata ?? formatMessage(
+            { id: "machine.runtimeUsage.updated" },
+            {
+              updated: formatRelativeTime(result.snapshot.collectedAt, locale) ?? formatMessage({ id: "machine.runtimeUsage.recently" }),
+            },
+          )}
+        </span>
+        {footerAction}
       </div>
     </div>
   );
@@ -232,14 +292,72 @@ export interface SurfaceAuth {
   onConnectProvider: () => void;
   /** A per-provider runtime's (Pi's) Sign Out (an account) or Remove (a key) for one provider. */
   onSignOutProvider: (provider: RuntimeAuthSignedInProvider) => void;
+  /**
+   * Upgrade (runtime_upgrade_button), when the server offers it to this
+   * viewer for this runtime (the Computer reports it can upgrade it): what
+   * the last press learned, and the press. Absent: no Upgrade on the card.
+   */
+  upgrade?: { state: RuntimeUpgradeState; onUpgrade: () => void } | null;
+  /**
+   * With `upgrade`: the Computer's update check for this runtime
+   * (`runtimeUpdateOf`). Upgrade shows only where it found a newer version;
+   * null (an older Computer or server): Upgrade as before.
+   */
+  update?: RuntimeUpdateCheck | null;
 }
 
 /**
- * The sign-in state under the title. The account line shows only when the
- * usage block does not already name the plan and email below. A card with no
- * usage (Qoder) says it is signed in, as nothing else on it would.
+ * The signed-in account named under the title, only when the usage block does
+ * not already name the plan and email below. One rule for the line and the chip:
+ * a card shows the account line or the "Signed in" chip, never both.
  */
-function RuntimeAuthHeaderLine({ runtime, status, usageShowsAccount, authOnly }: { runtime: RuntimeAuthRuntime; status: RuntimeAuthStatus | null; usageShowsAccount: boolean; authOnly: boolean }) {
+function headerAccountText(runtime: RuntimeAuthRuntime, status: RuntimeAuthStatus | null, usageShowsAccount: boolean): string | null {
+  if (runtimeAuthSignsInPerProvider(runtime) || hasProviderKey(runtime)) return null;
+  return status?.kind === "logged_in" && !usageShowsAccount ? accountText(status.account) : null;
+}
+
+/**
+ * The runtime's sign-in state as a chip, at the end of the card's title line
+ * (Kirby: where an account's "Used up" sits on its row), so the version line
+ * stays the second line. A card with no usage (Qoder) and no account line says
+ * it is signed in, as nothing else on it would.
+ */
+function RuntimeAuthHeaderBadge({ runtime, status, usageShowsAccount, authOnly }: { runtime: RuntimeAuthRuntime; status: RuntimeAuthStatus | null; usageShowsAccount: boolean; authOnly: boolean }) {
+  const { formatMessage } = useIntl();
+  if (runtimeAuthSignsInPerProvider(runtime)) return null;
+  if (hasProviderKey(runtime)) {
+    // Presence only: configured or not; anything else (unknown, unavailable) says nothing.
+    if (status?.kind !== "logged_in" && status?.kind !== "logged_out") return null;
+    const configured = status.kind === "logged_in";
+    return (
+      <Badge appearance="soft" variant={configured ? "success" : "warning"} className="shrink-0" data-testid={configured ? "runtime-provider-configured" : "runtime-provider-not-configured"}>
+        <Status size="md" variant={configured ? "success" : "warning"} aria-hidden="true" />
+        {formatMessage({ id: configured ? "machine.runtimeAuth.provider.configured" : "machine.runtimeAuth.provider.notConfigured" })}
+      </Badge>
+    );
+  }
+  if (status?.kind === "logged_out") {
+    return (
+      // A soft chip in words, no pixel: a status light is for presence and
+      // task status, not for a runtime's sign-in (Raft DS Status), as the
+      // runtime chip says it.
+      <Badge appearance="soft" variant="warning" className="shrink-0" data-testid="runtime-auth-logged-out">
+        {formatMessage({ id: "machine.runtimeAuth.notSignedIn" })}
+      </Badge>
+    );
+  }
+  if (authOnly && status?.kind === "logged_in" && !headerAccountText(runtime, status, usageShowsAccount)) {
+    return (
+      <Badge appearance="soft" variant="success" className="shrink-0" data-testid="runtime-auth-logged-in">
+        {formatMessage({ id: "machine.runtimeAuth.signedIn" })}
+      </Badge>
+    );
+  }
+  return null;
+}
+
+/** The sign-in state in words under the title: Pi's "no providers", or the signed-in account when usage draws none. */
+function RuntimeAuthHeaderLine({ runtime, status, usageShowsAccount }: { runtime: RuntimeAuthRuntime; status: RuntimeAuthStatus | null; usageShowsAccount: boolean }) {
   const { formatMessage } = useIntl();
   if (runtimeAuthSignsInPerProvider(runtime)) {
     // Its providers are listed below. None stored is no "signed out": a key in the
@@ -251,43 +369,13 @@ function RuntimeAuthHeaderLine({ runtime, status, usageShowsAccount, authOnly }:
       </div>
     );
   }
-  if (hasProviderKey(runtime)) {
-    // Presence only: configured or not; anything else (unknown, unavailable) says nothing.
-    if (status?.kind !== "logged_in" && status?.kind !== "logged_out") return null;
-    const configured = status.kind === "logged_in";
-    return (
-      <Badge appearance="soft" variant={configured ? "success" : "warning"} className="mt-1" data-testid={configured ? "runtime-provider-configured" : "runtime-provider-not-configured"}>
-        <Status size="md" variant={configured ? "success" : "warning"} aria-hidden="true" />
-        {formatMessage({ id: configured ? "machine.runtimeAuth.provider.configured" : "machine.runtimeAuth.provider.notConfigured" })}
-      </Badge>
-    );
-  }
-  if (status?.kind === "logged_out") {
-    return (
-      // A soft chip in words, no pixel: a status light is for presence and
-      // task status, not for a runtime's sign-in (Raft DS Status), as the
-      // runtime chip says it.
-      <Badge appearance="soft" variant="warning" className="mt-1" data-testid="runtime-auth-logged-out">
-        {formatMessage({ id: "machine.runtimeAuth.notSignedIn" })}
-      </Badge>
-    );
-  }
-  const account = status?.kind === "logged_in" && !usageShowsAccount ? accountText(status.account) : null;
-  if (account) {
-    return (
-      <div className="mt-1 truncate text-callout font-bold text-foreground" data-testid="runtime-auth-account">
-        {account}
-      </div>
-    );
-  }
-  if (authOnly && status?.kind === "logged_in") {
-    return (
-      <Badge appearance="soft" variant="success" className="mt-1" data-testid="runtime-auth-logged-in">
-        {formatMessage({ id: "machine.runtimeAuth.signedIn" })}
-      </Badge>
-    );
-  }
-  return null;
+  const account = headerAccountText(runtime, status, usageShowsAccount);
+  if (!account) return null;
+  return (
+    <div className="mt-1 truncate text-callout font-bold text-foreground" data-testid="runtime-auth-account">
+      {account}
+    </div>
+  );
 }
 
 /**
@@ -296,8 +384,16 @@ function RuntimeAuthHeaderLine({ runtime, status, usageShowsAccount, authOnly }:
  * leaving the card without an action (#triage:#253). A runtime with no known
  * install command gets the sentence alone.
  */
-function RuntimeAuthUnavailable({ runtimeId, reason }: { runtimeId: string; reason: Extract<RuntimeAuthStatus, { kind: "unavailable" }>["reason"] }) {
+function RuntimeAuthUnavailable({ runtimeId, reason, upgrade }: { runtimeId: string; reason: Extract<RuntimeAuthStatus, { kind: "unavailable" }>["reason"]; upgrade: SurfaceAuth["upgrade"] }) {
   const { formatMessage } = useIntl();
+  // Too old, where Upgrade is offered: the card's Upgrade (runtimeAuthAction) replaces the "update it there" guidance.
+  if (reason === "version_unsupported" && upgrade) {
+    return (
+      <p className="text-caption text-foreground-hint" data-testid="runtime-auth-cli-unavailable">
+        {formatMessage({ id: "machine.runtimeUpgrade.tooOld" })}
+      </p>
+    );
+  }
   const install = reason === "unsupported_installation" ? undefined : RUNTIME_INSTALL_COMMANDS[runtimeId];
   return (
     <div className="stack-y-1 min-w-0" data-testid="runtime-auth-cli-unavailable">
@@ -319,13 +415,29 @@ function RuntimeAuthUnavailable({ runtimeId, reason }: { runtimeId: string; reas
   );
 }
 
-/**
- * The card's sign-in action for a person who may act on the Computer's
- * runtimes: a button (sign in, sign out, connect a provider), or the hint
- * that says why there is none here. Nothing for anyone else.
- */
+/** The card's one thing to do while signed out, or while the provider wants a sign-in again: a full-width call to action (Raft DS Button `xl`). */
+function signInButton(auth: SurfaceAuth, runtimeId: string, formatMessage: IntlShape["formatMessage"]): ReactNode {
+  return (
+    <Button size="xl" variant="primary" type="button" onClick={auth.onSignIn} data-testid="runtime-auth-sign-in">
+      <LogIn size={16} aria-hidden="true" />
+      {formatMessage({ id: "machine.runtimeAuth.signIn.title" }, { runtime: getRuntimeDisplayName(runtimeId) })}
+    </Button>
+  );
+}
+
+/** Whether this viewer can sign this runtime in from the card (the Sign in a signed-out card offers). */
+function canSignInHere(auth: SurfaceAuth): boolean {
+  const { runtime, status, view } = auth;
+  return view.canAct && view.availability === "ok" && runtimeAuthComputerSupports(view, runtime) && status?.kind !== "unavailable"
+    && !runtimeAuthStatusOnly(runtime) && !runtimeAuthSignsInPerProvider(runtime) && !hasProviderKey(runtime);
+}
+
 function runtimeAuthAction(auth: SurfaceAuth, runtimeId: string, formatMessage: IntlShape["formatMessage"]): ReactNode {
   const { runtime, status, view } = auth;
+  // Nothing to sign in from here (DeepSeek Harness): a missing or too-old CLI as for any runtime, else how its key is set (every viewer).
+  if (runtimeAuthStatusOnly(runtime)) return status?.kind === "unavailable" && view.availability === "ok"
+    ? <RuntimeAuthUnavailable runtimeId={runtimeId} reason={status.reason} upgrade={auth.upgrade} />
+    : <RuntimeCredentialsNote runtime={runtime} />;
   if (!view.canAct) return null;
   // A daemon that predates this runtime's sign-in from the web (Kimi, Qoder) would drop a start.
   const needsNewerComputer = view.availability === "ok" && !runtimeAuthComputerSupports(view, runtime);
@@ -341,7 +453,7 @@ function runtimeAuthAction(auth: SurfaceAuth, runtimeId: string, formatMessage: 
   }
   if (view.availability !== "ok") return null;
   // Before the provider button too: Qwen Code with no usable CLI can't connect a provider either.
-  if (status?.kind === "unavailable") return <RuntimeAuthUnavailable runtimeId={runtimeId} reason={status.reason} />;
+  if (status?.kind === "unavailable") return <RuntimeAuthUnavailable runtimeId={runtimeId} reason={status.reason} upgrade={auth.upgrade} />;
   if (runtimeAuthSignsInPerProvider(runtime)) {
     // Pi: one more provider at a time (an account or a key), from pi's own list.
     return (
@@ -374,14 +486,7 @@ function runtimeAuthAction(auth: SurfaceAuth, runtimeId: string, formatMessage: 
       </Button>
     );
   }
-  if (status === null || status.kind === "logged_out" || status.kind === "unknown") {
-    return (
-      <Button size="md" variant="primary" type="button" onClick={auth.onSignIn}>
-        <LogIn size={16} aria-hidden="true" />
-        {formatMessage({ id: "machine.runtimeAuth.signInAction" })}
-      </Button>
-    );
-  }
+  if (status === null || status.kind === "logged_out" || status.kind === "unknown") return signInButton(auth, runtimeId, formatMessage);
   return null;
 }
 
@@ -413,15 +518,15 @@ function PerProviderRow({ provider, onSignOut }: { provider: RuntimeAuthSignedIn
       <IconTile size="sm">{key ? <KeyRound aria-hidden /> : <UserRound aria-hidden />}</IconTile>
       <ListRowBody>
         <ListRowTop><ListRowTitle>{provider.label}</ListRowTitle></ListRowTop>
-        <ListRowBottom>
-          <ListRowDescription>
-            {formatMessage({ id: key
-              ? "machine.runtimeAuth.pi.method.apiKey"
-              // OpenCode does not say whether an account is a subscription: neither is claimed.
-              : provider.subscription === undefined ? "machine.runtimeAuth.signedIn"
-                : provider.subscription ? "machine.runtimeAuth.pi.method.subscription" : "machine.runtimeAuth.pi.method.account" })}
-          </ListRowDescription>
-        </ListRowBottom>
+        {/* Only what the row says nothing else of: a key, or a subscription. A plain account, or one OpenCode
+            does not say is a subscription, gets no line (being listed is being signed in; Kirby). */}
+        {key || provider.subscription ? (
+          <ListRowBottom>
+            <ListRowDescription>
+              {formatMessage({ id: key ? "machine.runtimeAuth.pi.method.apiKey" : "machine.runtimeAuth.pi.method.subscription" })}
+            </ListRowDescription>
+          </ListRowBottom>
+        ) : null}
       </ListRowBody>
       {onSignOut ? (
         <Button size="md" variant="ghost" type="button" onClick={handleSignOut} data-testid={`runtime-auth-provider-sign-out-${provider.id}`}>
@@ -438,21 +543,22 @@ export interface SurfaceLimitReset {
   /** The account is rate-limited right now: the reset is the card's main action then. */
   primary: boolean;
   onUse: () => void;
+  /** The account keeps running on credits past its used-up window: its agents are not waiting, the reset saves credits. */
+  onCredits?: boolean;
 }
 
 /**
- * Claude limit resets on the card (claude_limit_reset), for a person who may
- * act, on a Computer that can run them; null: nothing is drawn. What each
- * viewer is offered is `claudeLimitResetOffer`: "View available resets"
- * (`onView`) and, at the 5-hour limit, "Use 5-hour reset" (`onUseFiveHour`)
- * as the card's main action; a person who did not connect the Computer gets
- * only `onView`. `onView` is null for an account known to be on Claude's
- * older program at its 5-hour limit, where opening the list would use it.
+ * Claude limit resets on the card (claude_limit_reset_v2), for a person who may
+ * act, on a Computer that can run them; null: nothing is drawn. One entry
+ * (`onOpen`), as Claude Code's one `/limit-reset`: "Use a limit reset" for a
+ * viewer who may use them (`canUse`), the card's main action at the 5-hour
+ * limit; "View available resets" (a read-only list) for one who may not, who
+ * is offered nothing at the limit (`claudeLimitResetOffer`).
  */
 export interface SurfaceClaudeLimitReset {
   atFiveHourLimit: boolean;
-  onView: (() => void) | null;
-  onUseFiveHour: (() => void) | null;
+  canUse: boolean;
+  onOpen: () => void;
 }
 
 export function RuntimeUsageSurface({
@@ -507,15 +613,18 @@ export function RuntimeUsageSurface({
   const signedOut = auth?.status?.kind === "logged_out";
   // `unsupported`: this Computer reads no usage for it, as a runtime with none.
   const showsUsage = provider !== null && !signedOut && result?.state !== "unsupported";
-  const usageShowsAccount = showsUsage && result !== null && result.snapshot !== null && result.snapshot.accounts.length > 0;
+  const usageShowsAccount = showsUsage && result !== null && result.snapshot !== null && result.snapshot.accounts.some((account) => account.agentIds === undefined);
   const version = runtimeVersion?.trim() || null;
-  const authAction = auth ? runtimeAuthAction(auth, runtimeId, formatMessage) : null;
-  // Only a state worth saying: a refresh in flight or refused, the
-  // Computer offline, or what the last limit reset did.
+  // Signed in with usage drawn: Sign out lives in the account's menu, not as a button on the card.
+  const signOutInMenu = usageShowsAccount && auth !== null && auth.view.canAct && auth.view.availability === "ok"
+    && auth.status?.kind === "logged_in" && !runtimeAuthSignsInPerProvider(auth.runtime) && !hasProviderKey(auth.runtime)
+    && runtimeAuthComputerSupports(auth.view, auth.runtime) && runtimeAuthComputerSignsOut(auth.view, auth.runtime);
+  const authAction = auth && !signOutInMenu ? runtimeAuthAction(auth, runtimeId, formatMessage) : null;
+  // Only a state worth saying: a refresh refused or unanswered, the Computer
+  // offline, or what the last limit reset did. One in flight says nothing:
+  // Refresh's spinner shows it.
   const statusText = note
-    ?? (refreshState === "requested"
-      ? formatMessage({ id: "machine.runtimeUsage.refreshRequested" })
-      : refreshState === "unconfirmed"
+    ?? (refreshState === "unconfirmed"
         ? formatMessage({ id: "machine.runtimeUsage.refreshUnconfirmed" })
       : refreshState === "timeout"
         ? formatMessage({ id: "machine.runtimeUsage.refreshTimeout" })
@@ -527,21 +636,110 @@ export function RuntimeUsageSurface({
       : refreshState === "computer_offline"
         ? formatMessage({ id: "machine.runtimeUsage.computerOffline" })
         : null);
+  const accountMenu = signOutInMenu && auth ? (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={(
+          <Button size="icon-md" variant="ghost" type="button" aria-label={formatMessage({ id: "machine.runtimeUsage.accountMenu" })} data-testid="runtime-account-menu" />
+        )}
+      >
+        <Ellipsis size={16} aria-hidden="true" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent side="bottom" align="end" sideOffset={4}>
+        <DropdownMenuItem onClick={auth.onSignOut} data-testid="runtime-auth-sign-out">
+          <LogOut size={16} aria-hidden="true" />
+          {formatMessage({ id: "machine.runtimeAuth.signOutAction" })}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  ) : null;
+  // Limits: a used-up account gets the reset as the card's one main action,
+  // with why; nearly used up, a quiet button (the chip offers it from 80%).
+  // Claude: "Use a limit reset" leads at the 5-hour limit for someone who may use it.
+  const claudePrimary = claudeLimitReset?.canUse === true && claudeLimitReset.atFiveHourLimit;
+  const limitPrimary = limitReset?.primary === true || claudePrimary;
+  const limitButtons = (
+    <>
+      {limitReset ? (
+        <Button size="md"
+          variant={limitReset.primary ? "primary" : "outline"}
+          type="button"
+          onClick={limitReset.onUse}
+          className="shrink-0"
+          data-testid="runtime-limit-reset-action"
+          data-primary-action={limitReset.primary ? "" : undefined}
+        >
+          <TimerReset size={16} aria-hidden="true" />
+          {/* No count: the facts line above says how many are left. */}
+          {formatMessage({ id: "machine.runtimeUsage.limitReset.action" })}
+        </Button>
+      ) : null}
+      {claudeLimitReset ? (
+        <Button size="md"
+          variant={claudePrimary ? "primary" : "outline"}
+          type="button"
+          onClick={claudeLimitReset.onOpen}
+          className="shrink-0"
+          data-testid={claudeLimitReset.canUse ? "claude-limit-reset-action" : "claude-limit-resets-view-action"}
+          data-primary-action={claudePrimary ? "" : undefined}
+        >
+          {claudeLimitReset.canUse ? <TimerReset size={16} aria-hidden="true" /> : <ListChecks size={16} aria-hidden="true" />}
+          {formatMessage({ id: claudeLimitReset.canUse ? "machine.runtimeUsage.claudeReset.useAction" : "machine.runtimeUsage.claudeReset.viewAction" })}
+        </Button>
+      ) : null}
+    </>
+  );
+  const hasLimitActions = Boolean(limitReset || claudeLimitReset);
+  // The provider wants the Computer's own account signed in again: its tag says so, Sign in under it does it.
+  const ownReauth = showsUsage && result?.snapshot?.accounts.some((account) => account.agentIds === undefined && account.health === "reauth_required") === true;
+  const reauthSignIn = ownReauth && auth && canSignInHere(auth) ? signInButton(auth, runtimeId, formatMessage) : null;
+  const limitActions = hasLimitActions ? (
+    limitPrimary && limitReset?.onCredits ? (
+      // Raft DS Banner: only for what the "used up" tag can't say (it is spending credits).
+      // A plain used-up account gets the primary button alone: the tag already says agents wait.
+      <Banner status="warning" size="sm" data-testid="runtime-limit-callout">
+        <TriangleAlert aria-hidden="true" />
+        <BannerDescription>
+          {formatMessage({ id: "machine.runtimeUsage.limitReset.calloutOnCredits" })}
+        </BannerDescription>
+        <BannerAction>{limitButtons}</BannerAction>
+      </Banner>
+    ) : (
+      <div className="flex flex-wrap items-center gap-2">{limitButtons}</div>
+    )
+  ) : null;
+  const accountActions = reauthSignIn && limitActions
+    ? <div className="flex flex-col items-stretch gap-2">{reauthSignIn}{limitActions}</div>
+    : reauthSignIn ?? limitActions;
+  const refreshButton = (
+    <Button size="md"
+      variant="ghost"
+      type="button"
+      onClick={onRefresh}
+      disabled={refreshState === "requesting" || cooldownLeftMs > 0}
+      className="-mr-2 shrink-0"
+      data-testid="runtime-usage-refresh"
+    >
+      {/* Waiting with no known end: the pixel spinner (Raft DS Loading), also while a requested read is awaited. */}
+      {refreshState === "requesting" || refreshState === "requested"
+        ? <Spinner size="xs" aria-hidden="true" />
+        : <RefreshCw size={16} aria-hidden="true" />}
+      {formatMessage({ id: "machine.runtimeUsage.refresh" })}
+    </Button>
+  );
+  const privateLine = <div className="px-4 pb-2.5 text-caption text-foreground-hint">{formatMessage({ id: "machine.runtimeUsage.private" })}</div>;
   return (
     <div data-testid={provider ? `runtime-usage-surface-${provider}` : `runtime-auth-surface-${runtimeId}`}>
       <div className="flex items-center justify-between gap-3 border-b border-line-hairline px-4 py-3">
-        <div className="min-w-0">
-          <div className="text-headline text-foreground" data-testid="runtime-usage-title">
-            {showsUsage ? formatMessage({ id: "machine.runtimeUsage.title" }, { runtime: runtimeName }) : runtimeName}
-          </div>
-          {auth ? <RuntimeAuthHeaderLine runtime={auth.runtime} status={auth.status} usageShowsAccount={usageShowsAccount} authOnly={provider === null || result?.state === "unsupported"} /> : null}
-          {/* The bare version number, quiet: a mono meta line says what it is. None when unknown. */}
-          {version ? (
-            <div data-testid={`runtime-version-${provider ?? runtimeId}`} className="font-mono text-mono-meta text-foreground-hint">
-              {version}
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center justify-between gap-2">
+            <div className="min-w-0 text-headline text-foreground" data-testid="runtime-usage-title">
+              {showsUsage ? formatMessage({ id: "machine.runtimeUsage.title" }, { runtime: runtimeName }) : runtimeName}
             </div>
-          ) : null}
-          <div className="text-caption text-foreground-hint">{formatMessage({ id: "machine.runtimeUsage.private" })}</div>
+            {auth ? <RuntimeAuthHeaderBadge runtime={auth.runtime} status={auth.status} usageShowsAccount={usageShowsAccount} authOnly={provider === null || result?.state === "unsupported"} /> : null}
+          </div>
+          {auth ? <RuntimeAuthHeaderLine runtime={auth.runtime} status={auth.status} usageShowsAccount={usageShowsAccount} /> : null}
+          <RuntimeVersionLine runtimeId={runtimeId} provider={provider} version={version} auth={auth} />
         </div>
         {onClose ? (
           <CloseButton type="button" className={ICON_BAR_END_PULL} onClick={onClose} aria-label={formatMessage({ id: "machine.runtimeUsage.close" })}>
@@ -550,81 +748,37 @@ export function RuntimeUsageSurface({
         ) : null}
       </div>
       {readinessHolds(readiness) ? <RuntimeReadinessNotice readiness={readiness} runtimeId={runtimeId} /> : null}
-      {showsUsage ? <RuntimeUsageContents result={result} loading={loading} loadError={loadError} /> : null}
       {showsUsage ? (
-        // One action row: the quiet sign-in action on the left, Refresh and
-        // Use a reset on the right (the reset is the primary action only while
-        // the account is rate-limited). What just happened, if anything, is
-        // one caption line under it; nothing by default.
-        <div className="border-t border-line-hairline px-4 py-2.5" data-testid="runtime-usage-actions">
-          <div className="flex flex-wrap items-center gap-2">
-            {authAction}
-            <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
-              <Button size="md"
-                variant="outline"
-                type="button"
-                onClick={onRefresh}
-                disabled={refreshState === "requesting" || cooldownLeftMs > 0}
-                className="shrink-0"
-              >
-                {/* Waiting with no known end: the pixel spinner (Raft DS Loading). */}
-                {refreshState === "requesting"
-                  ? <Spinner size="xs" aria-hidden="true" />
-                  : <RefreshCw size={16} aria-hidden="true" />}
-                {formatMessage({ id: "machine.runtimeUsage.refresh" })}
-              </Button>
-              {limitReset ? (
-                <Button size="md"
-                  variant={limitReset.primary ? "primary" : "outline"}
-                  type="button"
-                  onClick={limitReset.onUse}
-                  className="shrink-0"
-                  data-testid="runtime-limit-reset-action"
-                  data-primary-action={limitReset.primary ? "" : undefined}
-                >
-                  <TimerReset size={16} aria-hidden="true" />
-                  {formatMessage({ id: "machine.runtimeUsage.limitReset.action" })}
-                </Button>
-              ) : null}
-              {claudeLimitReset?.onView ? (
-                <Button size="md"
-                  variant="outline"
-                  type="button"
-                  onClick={claudeLimitReset.onView}
-                  className="shrink-0"
-                  data-testid="claude-limit-resets-view-action"
-                >
-                  <ListChecks size={16} aria-hidden="true" />
-                  {formatMessage({ id: "machine.runtimeUsage.claudeReset.viewAction" })}
-                </Button>
-              ) : null}
-              {claudeLimitReset?.onUseFiveHour ? (
-                <Button size="md"
-                  variant="primary"
-                  type="button"
-                  onClick={claudeLimitReset.onUseFiveHour}
-                  className="shrink-0"
-                  data-testid="claude-limit-reset-five-hour-action"
-                  data-primary-action=""
-                >
-                  <TimerReset size={16} aria-hidden="true" />
-                  {formatMessage({ id: "machine.runtimeUsage.claudeReset.useFiveHourAction" })}
-                </Button>
-              ) : null}
+        <>
+          <RuntimeUsageContents
+            result={result}
+            loading={loading}
+            loadError={loadError}
+            accountMenu={accountMenu}
+            accountActions={usageShowsAccount ? accountActions : null}
+            footerAction={refreshButton}
+          />
+          {/* No own account drawn (nothing read yet): the limit and sign-in actions under the usage. */}
+          {(!usageShowsAccount && accountActions) || authAction ? (
+            <div className="flex flex-col items-start gap-2 border-t border-line-hairline px-4 py-2.5" data-testid="runtime-usage-actions">
+              {usageShowsAccount ? null : accountActions}
+              {authAction}
             </div>
-          </div>
-          {statusText ? (
-            <p className="mt-1.5 text-caption text-foreground-hint" role="status" data-testid="runtime-usage-status">{statusText}</p>
           ) : null}
-        </div>
+          {statusText ? (
+            <p className="px-4 pb-1 text-caption text-foreground-hint" role="status" data-testid="runtime-usage-status">{statusText}</p>
+          ) : null}
+          {privateLine}
+        </>
       ) : (
         <>
           {auth ? <PerProviderRows auth={auth} /> : null}
           {authAction ? (
-            <div className="flex flex-col items-start gap-1.5 px-4 py-2.5">
+            <div className="flex flex-col items-stretch gap-1.5 px-4 py-2.5">
               {authAction}
             </div>
           ) : null}
+          {privateLine}
         </>
       )}
     </div>

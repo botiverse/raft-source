@@ -19,9 +19,14 @@
       <div class="sb-search">
         <div class="box">
           <svg width="13" height="13" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="5.5" cy="5.5" r="4"/><path d="M8.6 8.6L12 12"/></svg>
-          <input id="vt-search" type="search" placeholder="Find components" autocomplete="off" aria-label="Find components"/>
+          <input id="vt-search" type="search" placeholder="Find cases" autocomplete="off" aria-label="Find components"/>
           <span class="kbd">/</span>
         </div>
+        <select id="vt-sort" class="sort" title="Sort cases" aria-label="Sort cases">
+          <option value="name">Name</option>
+          <option value="similarity">Similarity</option>
+          <option value="status">Status</option>
+        </select>
       </div>
       <nav class="sb-tree" id="vt-tree" aria-label="Visual cases"></nav>
       <div class="sb-foot-resizer" id="vt-foot-resizer" title="Drag to resize runs panel · double-click to reset" aria-hidden="true"></div>

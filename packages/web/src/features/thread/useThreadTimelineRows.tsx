@@ -24,8 +24,6 @@ import { buildSystemMessageRenderStates, foldedSystemMessageIds } from "../../co
 import { taskHandoffReturns } from "../../components/task/taskHandoffNotice";
 import { followedByFor, useStableMessageGrouping } from "../../components/message/messageGrouping";
 import { useTimeFormatter } from "../../hooks/useTimeFormatter";
-import { useAgentReadProgress } from "../../hooks/useAgentReadProgress";
-import { AgentReadSystemRow } from "../../components/message/AgentReadFaces";
 import { resolveMessageSenderMember } from "../../utils/messageSenderMember";
 import { ParentSlotMount } from "./ParentSlotMount";
 import { THREAD_PANEL_PARENT_CLASS_NAME } from "./threadPanelChrome";
@@ -174,29 +172,6 @@ export function useThreadTimelineRows({
     ? messages[messages.length - 1]?.id ?? null
     : null;
 
-  // Agent read progress (agent_read_progress_v0), as in a channel: a thread is
-  // its own read scope, so the faces are the agents' positions among the
-  // replies (the parent row belongs to the channel and carries none, but
-  // keeps the column so its right edge lines up with the replies). A thread
-  // under a DM keeps its "Read" line instead; until the parent is known
-  // (`parentRouteKind` null) it could be one, so nothing yet.
-  const agentReadScope = useMemo(() => (
-    threadChannelId && parentRouteKind === "channel"
-      ? { id: threadChannelId, name: "", type: "thread" as const }
-      : null
-  ), [parentRouteKind, threadChannelId]);
-  const { model: agentReadProgress, statusMessageId: agentReadStatusMessageId } = useAgentReadProgress({
-    scope: agentReadScope,
-    parentChannelId,
-    messages,
-    hasNewer,
-    foldedMessageIds: threadFoldedMessageIds,
-    typingChannelId,
-    typingParentMessageId: parentMessageId,
-    agentById,
-  });
-  const agentReadActive = agentReadProgress !== null;
-
   // Stryker disable all: focused sender-name mention behavior is covered through MessageItem/MessageInput; this memo only duplicates thread render pass-through and dependency invalidation.
   const renderThreadItem = useCallback((msg: Message, index: number) => {
     const systemMessageState = systemMessageRenderStates[index];
@@ -209,40 +184,38 @@ export function useThreadTimelineRows({
       const expanded = expandedSystemMessageGroups.has(systemMessageState.groupId);
       return (
         <div className={TIMELINE_ROW_INSET} style={{ overflow: "clip visible" }}>
-          <AgentReadSystemRow messageId={msg.id}>
-            <ThreadPanelSystemMessageGroupDisclosure
-              groupId={systemMessageState.groupId}
-              summary={systemMessageState.content}
-              expanded={expanded}
-              onToggleGroup={toggleSystemMessageGroup}
-            >
-              {systemMessageState.messageIndexes.map((messageIndex) => {
-                const originalMessage = messages[messageIndex];
-                if (!originalMessage) return null;
-                return (
-                  <MessageItem
-                    key={originalMessage.id}
-                    message={originalMessage}
-                    mentionMap={mentionMap}
-                    channels={channels}
-                    parentChannelId={parentChannelId || undefined}
-                    parentMessageId={parentMessageId || undefined}
-                    previewSenderAgent={getPreviewSenderAgent(originalMessage)}
-                    previewSenderMember={getPreviewSenderMember(originalMessage)}
-                    channelParticipantExternalsById={externalById}
-                    mentionComposerChannelId={threadMentionComposerChannelId}
-                    reactionParentScopeKey={threadReactionParentScopeKey}
-                    canReact={canReactToThread}
-                    hideThreadActions
-                    onOpenProfile={onOpenProfile}
-                    threadSearchHighlightQuery={getThreadSearchHighlightQuery(originalMessage.id)}
-                    threadSearchActive={originalMessage.id === activeThreadSearchMessageId}
-                    located={originalMessage.id === locatedReplyId}
-                  />
-                );
-              })}
-            </ThreadPanelSystemMessageGroupDisclosure>
-          </AgentReadSystemRow>
+          <ThreadPanelSystemMessageGroupDisclosure
+            groupId={systemMessageState.groupId}
+            summary={systemMessageState.content}
+            expanded={expanded}
+            onToggleGroup={toggleSystemMessageGroup}
+          >
+            {systemMessageState.messageIndexes.map((messageIndex) => {
+              const originalMessage = messages[messageIndex];
+              if (!originalMessage) return null;
+              return (
+                <MessageItem
+                  key={originalMessage.id}
+                  message={originalMessage}
+                  mentionMap={mentionMap}
+                  channels={channels}
+                  parentChannelId={parentChannelId || undefined}
+                  parentMessageId={parentMessageId || undefined}
+                  previewSenderAgent={getPreviewSenderAgent(originalMessage)}
+                  previewSenderMember={getPreviewSenderMember(originalMessage)}
+                  channelParticipantExternalsById={externalById}
+                  mentionComposerChannelId={threadMentionComposerChannelId}
+                  reactionParentScopeKey={threadReactionParentScopeKey}
+                  canReact={canReactToThread}
+                  hideThreadActions
+                  onOpenProfile={onOpenProfile}
+                  threadSearchHighlightQuery={getThreadSearchHighlightQuery(originalMessage.id)}
+                  threadSearchActive={originalMessage.id === activeThreadSearchMessageId}
+                  located={originalMessage.id === locatedReplyId}
+                />
+              );
+            })}
+          </ThreadPanelSystemMessageGroupDisclosure>
         </div>
       );
     }
@@ -273,13 +246,11 @@ export function useThreadTimelineRows({
           threadSearchActive={msg.id === activeThreadSearchMessageId}
           located={msg.id === locatedReplyId}
           showDmReadStatus={msg.id === dmThreadReadStatusMessageId}
-          showAgentReadStatus={msg.id === agentReadStatusMessageId}
-          agentReadFaces={agentReadActive}
           taskHandoffReturn={handoffReturns.get(msg.id) ?? null}
         />
       </div>
     );
-  }, [activeThreadSearchMessageId, agentReadActive, agentReadStatusMessageId, canReactToThread, channels, dmThreadReadStatusMessageId, expandedSystemMessageGroups, externalById, getPreviewSenderAgent, getPreviewSenderMember, handoffReturns, locatedReplyId, mentionMap, messageGrouping, messages, onOpenProfile, parentChannelId, parentMessageId, systemMessageRenderStates, threadMentionComposerChannelId, threadReactionParentScopeKey, threadSearchQuery, toggleSystemMessageGroup]);
+  }, [activeThreadSearchMessageId, canReactToThread, channels, dmThreadReadStatusMessageId, expandedSystemMessageGroups, externalById, getPreviewSenderAgent, getPreviewSenderMember, handoffReturns, locatedReplyId, mentionMap, messageGrouping, messages, onOpenProfile, parentChannelId, parentMessageId, systemMessageRenderStates, threadMentionComposerChannelId, threadReactionParentScopeKey, threadSearchQuery, toggleSystemMessageGroup]);
   // Stryker restore all
 
   // Stryker disable all: focused sender-name mention behavior is covered through MessageItem/MessageInput; this memo only duplicates thread parent pass-through and dependency invalidation.
@@ -349,12 +320,11 @@ export function useThreadTimelineRows({
               displayedParentMessageWithThreadId.id === activeThreadSearchMessageId ? threadSearchQuery : undefined
             }
             threadSearchActive={displayedParentMessageWithThreadId.id === activeThreadSearchMessageId}
-            agentReadFaces={agentReadActive}
           />
         </div>
       )}
     </>
-  ), [activeThreadSearchMessageId, agentReadActive, canReactToThread, channels, displayedParentMessageWithThreadId, locatedReplyId, displayedParentTask, parentSourceTasks, externalById, getPreviewSenderAgent, getPreviewSenderMember, hasMore, historyLimited, loadingOlder, mentionMap, onOpenProfile, displayedParentThreadSummary, parentReactionParentScopeKey, parentSlot, parentSlotHost, threadChannelId, threadPaywallScope, showsHiddenTarget, messages.length, threadMentionComposerChannelId, threadSearchQuery]);
+  ), [activeThreadSearchMessageId, canReactToThread, channels, displayedParentMessageWithThreadId, locatedReplyId, displayedParentTask, parentSourceTasks, externalById, getPreviewSenderAgent, getPreviewSenderMember, hasMore, historyLimited, loadingOlder, mentionMap, onOpenProfile, displayedParentThreadSummary, parentReactionParentScopeKey, parentSlot, parentSlotHost, threadChannelId, threadPaywallScope, showsHiddenTarget, messages.length, threadMentionComposerChannelId, threadSearchQuery]);
   // Stryker restore all
 
   // With a composer, the list ends right on it (only the composer's own 8px
@@ -380,7 +350,6 @@ export function useThreadTimelineRows({
   ), [formatMessage, loadingNewer, showComposer, typingChannelId, parentMessageId, selectModeListEnd]);
 
   return {
-    agentReadProgress,
     threadPaywallScope,
     threadFoldedMessageIds,
     getPreviewSenderAgent,

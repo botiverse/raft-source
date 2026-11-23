@@ -9,6 +9,9 @@ import { vi } from "vitest";
 // grey as the server written after someone from another server, never a
 // coloured chip (cindyz, 2026-11-13, #wg-rbac:38225c7c).
 vi.mock("../src/components/ui/Tooltip", () => ({ default: ({ children }: { children: unknown }) => children }));
+// The member parts' sign-in status reads the Computer's live sign-in state
+// (auth store, which needs a browser's localStorage): not part of this test.
+vi.mock("../src/components/machine/useAgentRuntimeSignInView", () => ({ useAgentRuntimeSignInView: () => ({ serverId: null, authRuntime: null, view: null, status: null, offered: false }) }));
 const { JointServerBadges } = await import("../src/components/agent/channelMemberParts");
 const messages = {
   "channel.membersPage.alsoIn": "Also in {servers}",

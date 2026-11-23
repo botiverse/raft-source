@@ -37,6 +37,7 @@ import type {
   AgentApiArtifactSubscriptionResponse,
   AgentApiArtifactCommentParams,
   AgentApiArtifactResolveBody,
+  AgentApiArtifactSettlement,
   AgentApiArtifactThreadResolution,
   AgentApiArtifactUploadParams,
 } from "./agentApiArtifactsContract";
@@ -147,6 +148,7 @@ type _Types = [
     artifactCommentImageUpload: AgentApiArtifactParams; artifactCommentImage: AgentApiArtifactCommentImageParams;
     artifactCheck: AgentApiArtifactParams; artifactCheckShot: AgentApiArtifactCheckShotParams;
     artifactCommentResolve: AgentApiArtifactCommentParams; artifactCommentReopen: AgentApiArtifactCommentParams;
+    artifactSettle: AgentApiArtifactParams; artifactUnsettle: AgentApiArtifactParams;
     artifactSubscribe: AgentApiArtifactParams; artifactUnsubscribe: AgentApiArtifactParams; artifactImport: never;
     artifactMove: AgentApiArtifactParams; artifactDelete: AgentApiArtifactParams; artifactSaveAttachment: never;
   }>>,
@@ -156,6 +158,7 @@ type _Types = [
     artifactCommentImageUpload: never; artifactCommentImage: never;
     artifactCheck: AgentApiArtifactCheckQuery; artifactCheckShot: AgentApiArtifactCheckQuery;
     artifactCommentResolve: never; artifactCommentReopen: never;
+    artifactSettle: never; artifactUnsettle: never;
     artifactSubscribe: never; artifactUnsubscribe: never; artifactImport: never;
     artifactMove: never; artifactDelete: never; artifactSaveAttachment: never;
   }>>,
@@ -165,6 +168,7 @@ type _Types = [
     artifactCommentImageUpload: never; artifactCommentImage: never;
     artifactCheck: never; artifactCheckShot: never;
     artifactCommentResolve: AgentApiArtifactResolveBody; artifactCommentReopen: never;
+    artifactSettle: never; artifactUnsettle: never;
     artifactSubscribe: never; artifactUnsubscribe: never; artifactImport: AgentApiArtifactImportBody;
     artifactMove: AgentApiArtifactMoveBody; artifactDelete: never; artifactSaveAttachment: AgentApiArtifactSaveAttachmentBody;
   }>>,
@@ -174,6 +178,7 @@ type _Types = [
     artifactCommentImageUpload: AgentApiArtifactCommentImage; artifactCommentImage: Uint8Array;
     artifactCheck: AgentApiArtifactCheckResponse; artifactCheckShot: Uint8Array;
     artifactCommentResolve: AgentApiArtifactThreadResolution; artifactCommentReopen: AgentApiArtifactThreadResolution;
+    artifactSettle: AgentApiArtifactSettlement; artifactUnsettle: AgentApiArtifactSettlement;
     artifactSubscribe: AgentApiArtifactSubscriptionResponse; artifactUnsubscribe: AgentApiArtifactSubscriptionResponse; artifactImport: AgentApiArtifactImported;
     artifactMove: AgentApiArtifactMoved; artifactDelete: AgentApiArtifactDeleted; artifactSaveAttachment: AgentApiArtifactSaved;
   }>>,

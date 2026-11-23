@@ -33,6 +33,7 @@ import { ColumnOverflowMenu } from "../layout/ColumnOverflowMenu";
 import type { ColumnMenuItem } from "../layout/ColumnOverflowMenu";
 import { OverflowMenuTrigger } from "../ui/OverflowSheet";
 import Tooltip from "../ui/Tooltip";
+import { trackConversationHeaderAction } from "../../analytics/entries";
 
 const EditChannelDialog = deferredDialog(() => import("../../features/channel/EditChannelDialog").then((mod) => ({ default: mod.EditChannelDialog })));
 // The members page (opened from the sheet), off the first download: under the
@@ -70,6 +71,10 @@ export interface ChannelOverflowMenuProps {
    * where the head is too narrow for them (#189 rule 6; ChatPanel measures it).
    */
   fold?: number;
+  /** What the header's entries record (conversation_header_action_selected): a channel (a Lounge too) or a DM. */
+  conversation: "channel" | "dm";
+  /** The header is folded: a phone's width, or some of its buttons folded into ⋯ (ChatPanel). */
+  compact: boolean;
   /** A button before Search (Show announcement while hidden): first in the head, first to fold into ⋯; `fold` counts it. */ lead?: { node: ReactNode; item: ColumnMenuItem };
   /** Activity-mute switch, rendered in the settings panel's preferences
    *  group between Pin and collapse (final11: Mute is a per-user
@@ -128,6 +133,8 @@ export default function ChannelOverflowMenu({
   middleActions,
   middleItems,
   fold = 0, lead,
+  conversation,
+  compact,
   activityMute,
   collapseLongMessages,
   showMembers = false,
@@ -222,7 +229,14 @@ export default function ChannelOverflowMenu({
     return true;
   }, [close]);
   // The details stand beside the conversation, so searching it leaves them open (they were a modal sheet).
-  const handleSearch = onSearch;
+  const handleSearch = useCallback(() => {
+    trackConversationHeaderAction("search", "header", conversation, compact);
+    onSearch();
+  }, [compact, conversation, onSearch]);
+  const handleMenuSearch = useCallback(() => {
+    trackConversationHeaderAction("search", "more_menu", conversation, compact);
+    onSearch();
+  }, [compact, conversation, onSearch]);
   // task #156: the sheet is keyed to a channel, but every nav.* call
   // (sidebar rows, #channel links, permalinks, agent/human entries, the
   // desktop search overlay) commits the route BEFORE this component's
@@ -316,6 +330,18 @@ export default function ChannelOverflowMenu({
     else handleOpen();
   }, [guardedClose, handleOpen, open]);
   const closeDetails = useCallback(() => guardedClose(), [guardedClose]);
+  // Settings opening the details is `open_details`, as the name's (ChatPanel); a click that closes them records nothing.
+  const handleSettings = useCallback(() => {
+    if (!open) trackConversationHeaderAction("open_details", "header", conversation, compact);
+    handleToggle();
+  }, [compact, conversation, handleToggle, open]);
+  const handleMenuSettings = useCallback(() => {
+    if (!open) trackConversationHeaderAction("open_details", "more_menu", conversation, compact);
+    handleToggle();
+  }, [compact, conversation, handleToggle, open]);
+  const handleMenuOpenChange = useCallback((menuOpen: boolean) => {
+    if (menuOpen) trackConversationHeaderAction("open_menu", "header", conversation, compact);
+  }, [compact, conversation]);
   // Escape closing the details gives focus back to what opened them; the gear when that is gone.
   const gearRef = useRef<HTMLButtonElement | null>(null);
   const gear = useCallback(() => gearRef.current, []);
@@ -331,10 +357,10 @@ export default function ChannelOverflowMenu({
   const settingsLabel = formatMessage({ id: "message.chatPanel.overflow.open" });
   const settingsItemLabel = formatMessage({ id: open ? "message.chatPanel.overflow.close" : "message.chatPanel.overflow.open" });
   const folded = useMemo(() => [...(leadItem ? [leadItem] : []), ...[
-    { id: "search", label: searchLabel, icon: <Search />, onSelect: handleSearch, testId: "channel-header-overflow-search" },
+    { id: "search", label: searchLabel, icon: <Search />, onSelect: handleMenuSearch, testId: "channel-header-overflow-search" },
     ...(middleItems ?? []),
-    { id: "settings", label: settingsItemLabel, icon: <Settings />, onSelect: handleToggle, testId: "channel-header-overflow-settings" },
-  ].slice(shown)], [handleSearch, handleToggle, leadItem, middleItems, searchLabel, settingsItemLabel, shown]);
+    { id: "settings", label: settingsItemLabel, icon: <Settings />, onSelect: handleMenuSettings, testId: "channel-header-overflow-settings" },
+  ].slice(shown)], [handleMenuSearch, handleMenuSettings, leadItem, middleItems, searchLabel, settingsItemLabel, shown]);
 
   const membersStrip = showMembers ? (
     <MembersStrip
@@ -365,7 +391,7 @@ export default function ChannelOverflowMenu({
           <PanelToggleAction
             ref={gearRef}
             pressed={open}
-            onPressedChange={handleToggle}
+            onPressedChange={handleSettings}
             aria-label={settingsLabel}
             data-testid="channel-overflow-trigger"
           >
@@ -373,7 +399,7 @@ export default function ChannelOverflowMenu({
           </PanelToggleAction>
         </Tooltip>
       ) : null}
-      <ColumnOverflowMenu items={folded} testId="channel-header-overflow" />
+      <ColumnOverflowMenu items={folded} testId="channel-header-overflow" onOpenChange={handleMenuOpenChange} />
       {showMembers && members && (
         <MemberAvatarPreloader
           channelAgents={members.agents}

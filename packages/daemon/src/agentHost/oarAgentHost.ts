@@ -13,14 +13,14 @@
 // config and CLI transport, the RFC 071 gate. What it cannot run it hands
 // back before anything ran (`supports()` before the start, `fallback` during
 // it), and the legacy host runs that start. A runtime with no legacy driver
-// (`RuntimeDriver.oarOnly`: Qwen Code, Qoder) is never handed back: the router
+// (`RuntimeDriver.oarOnly`: Qwen Code, Qoder, DeepSeek Harness) is never handed back: the router
 // fails what this host cannot run (agentHostRouter.ts).
 //
-// Scope today: antigravity, codex, cursor, grok, opencode, qwen, qoder (`OAR_LAUNCHES`). See README.md in this directory.
+// Scope today: antigravity, codex, cursor, grok, opencode, qwen, qoder, dsh (`OAR_LAUNCHES`). See README.md in this directory.
 
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import type { AuthStatus, Event, FailedTurn, FailureClass, RejectionCode, Session, TurnOutcome, Unsubscribe } from "@botiverse/oar";
+import type { AccountUsageSnapshot, AuthStatus, Event, FailedTurn, FailureClass, RawEvent, RejectionCode, Session, SessionCapabilityDeclaration, TurnOutcome, Unsubscribe } from "@botiverse/oar";
 import { activityTurnTokensFrom } from "../runtimeTurnTokens";
 import { resolveRaftHome } from "../raftHome";
 import { SessionSummaryRecorder, SessionSummaryStore, sessionSummaryDir } from "./oarSessionSummary";
@@ -34,6 +34,8 @@ import {
   type AgentMessage,
   type AgentRuntimeOutcome,
   type AgentServerFeatures,
+  type AgentSideAskOutcome,
+  type AgentSideAskRequest,
   type AgentStartNotSpawnedReason,
   type AgentSubagentInterruptOutcome,
   type AgentTurnEndedOutcome,
@@ -45,12 +47,24 @@ import {
   type TrajectoryEntry,
   type TraceContext,
   type Tracer,
+  hydrateRuntimeConfig,
   isRuntimeProgressDetailKind,
   pickAgentServerFeatures,
+  runtimeConfigToLaunchFields,
 } from "@botiverse/raft-shared";
 import { LegacyActivitySink, type ActivityProducerContext, type ActivitySink } from "../activity/activitySink";
 import type { AgentAppInboxNoticeOptions, AgentAppInboxStore } from "../agentAppInbox";
 import { AGENT_DRAIN_MAX_DEADLINE_MS, AgentDrains, type AgentDrainNotQuiet, type AgentDrainNotRunnable, type AgentDrainOptions, type AgentDrainProgress, type AgentDrainSummary } from "../agentDrain";
+import {
+  claudeSideQuestionArgs,
+  SIDE_ASK_FORK_MAX_CONTEXT_TOKENS,
+  SideQuestionRunner,
+  sideAskStatusText,
+  sideAskTimeoutMs,
+  sideQuestionEnv,
+  sideQuestionPrompt,
+} from "../agentSideAsk";
+import { agentStateFile, writeAgentStateText } from "../agentStateFiles";
 import {
   agentNotIdleReason,
   agentNotRunnableReason,
@@ -64,9 +78,13 @@ import {
 import { AgentIdleHoldTracker } from "../agentIdleHold";
 import { appInboxItemNoticed, appInboxNoticeText, inboxItemsLaunchAtMs } from "../agentAppInboxNotice";
 import { reportThirdPartyEventsDelivered } from "../agentCredentialProxy";
+import { focusedBodyTraceAttrs, modelSeenReportItems, modelSeenReportable } from "../focusBodies";
+import { breaksNoticeHold, isNoticeHoldEnabled, noticeHoldAppliesTo, OutstandingNoticeHold, type NoticeHoldReleaseReason } from "../outstandingNoticeHold";
 import { initializeLaunchWorkspace, withLocalRuntimeContext } from "../agentLaunchWorkspace";
 import {
   RUNTIME_PROFILE_DAEMON_NOTICE_MESSAGE_PREFIX,
+  selectFocusedBodies,
+  type FocusedBodySelection,
   formatConcreteMessagesRuntimeInput,
   formatInboxUpdateRuntimeInput,
   inboxUpdateRenderOptions,
@@ -80,7 +98,13 @@ import {
   type AxSurfaceText,
 } from "../agentRuntimeInput";
 import type { AgentStartAcceptance } from "../agentStartDispatchProjection";
-import { getDriver } from "../drivers/index";
+import {
+  claudeSideQuestionProviderEnv,
+  getDriver,
+  isClaudeCustomProviderConfig,
+  resolveRuntimeSessionRef,
+  startClaudeSideQuestion,
+} from "../drivers/index";
 import type { ParsedEvent, RuntimeDriver, SpawnContext } from "../drivers/types";
 import { CodexSessionTraces } from "./oarCodexTraces";
 import { OarTaskRows, type OarTaskRow } from "./oarTaskActivity";
@@ -90,10 +114,10 @@ import { appInboxTurnTriggerAttrs, messageTurnTriggerAttrs } from "../turnTrigge
 import { runtimeTelemetryVersionAttrs, sanitizeRuntimeTelemetryPayloadAttrs } from "../runtimeTelemetrySanitization";
 import { spawnCliTransportDir } from "../drivers/cliTransport";
 import { AGENT_STOP_KILL_CONFIRM_MS, AGENT_STOP_KILL_GRACE_MS, agentStopTraceAttrs, type AgentStopReason } from "../drivers/processStop";
-import { planSpawnContextGeneration } from "../contextGeneration";
+import { bindContextGenerationToSession, configPassiveAx, planSpawnContextGeneration, rememberSessionContext, writeContextGeneration } from "../contextGeneration";
 import { cleanupLaunchProxies, cleanupLaunchProxiesForLaunch } from "../launchProxyCleanup";
 import { logger } from "../logger";
-import { cursorSdkAvailable, loadOarObserve, loadOarRuntime, loadOarSessionRuntime, type OarObserve } from "../oarLoader";
+import { cursorSdkAvailable, loadOarObserve, loadOarRuntime, loadOarSessionRuntime, oarInstalledSessionCapabilities, piRpcAvailable, type OarObserve } from "../oarLoader";
 import {
   ProviderLimitLedger,
   credentialInvalidAppliesToModel,
@@ -131,6 +155,7 @@ import {
   isProviderStreamFailureText,
   isRuntimeUsageLimitText,
   providerLimitBackoffDelayMs,
+  providerLimitReportedResetInMs,
   QUOTA_RESET_BACKOFF_MAX_MS,
   RUNTIME_ERROR_DELIVERY_BACKOFF_BASE_MS,
   RUNTIME_ERROR_DELIVERY_BACKOFF_MAX_MS,
@@ -151,7 +176,7 @@ import {
   standingPromptRecordForReportedSession,
   standingPromptSessionBinding,
 } from "../standingPromptRefresh";
-import { applyStartupMemoryBlock, buildStartupMemoryBlock, resolveStartupMemoryBlockConfig } from "../startupMemoryBlock";
+import { LastSessionStore } from "../lastSessionStore";
 import { planStartupInput, type ThreadJoinContextProjector } from "../startupInput";
 import { thirdPartyEventIdsFromEvents } from "../thirdPartyEventDeliveryReporter";
 import { TurnSummaryTracker, turnOutcomeForActivity, turnTriggerFromMessages } from "../turnSummaryTracker";
@@ -171,6 +196,9 @@ import {
   type StalledWithWorkThresholds,
 } from "../stalledWithWork";
 import { chooseSession, RESUME_FAILURE_THRESHOLD } from "../chooseSession";
+import { canonicalVisibleTarget, formatAgentMessageVisibleTarget } from "../agentVisibleDeliveryLedger";
+import { SESSION_NEEDS_RESET_THRESHOLD, SessionCompactionFailureLedger } from "../sessionCompactionFailureLedger";
+import { RuntimeSessionNeedsResetError } from "../spawnFailureErrors";
 import {
   ExitStreaks,
   formatCrashStreakExhaustedMessage,
@@ -183,18 +211,22 @@ import {
 } from "../planExit";
 import { startFailureActivity } from "../spawnFailureClassification";
 import { reportedStickyFailureReason, type SessionResetCause } from "../stickyFailureRecords";
-import { TURN_END_COMPACTION_EVENT, TURN_END_COMPACTION_OAR_RUNTIMES, TurnEndCompactionArming, turnEndCompactionLogLine, decideTurnEndCompaction, resolveTurnEndCompactionConfig, turnEndCompactionTraceAttrs, type TurnEndContextFacts } from "../turnEndCompaction";
-import { COLD_IDLE_SWEEP_MS, IDLE_PROCESS_STOP_RUNTIMES, idleProcessStopMs, WAKE_RECYCLE_SUMMARY_FACTS_RUNTIMES, applyWakeRecycleBriefing, coldIdleGate, decideColdIdle, describeAppliedWakeRecycle, describeRecycledWakeLogLine, recycleThresholdTraceAttrs, planWakeSessionRecycle, resolveWakeRecycleConfig, sessionSummaryResumeFacts, wakeRecycleKindTraceAttrs } from "../wakeSessionRecycle";
+import { TURN_END_COMPACTION_EVENT, TurnEndCompactionArming, turnEndCompactionAllowed, turnEndCompactionLogLine, decideTurnEndCompaction, resolveTurnEndCompactionConfig, turnEndCompactionTraceAttrs, type TurnEndContextFacts } from "../turnEndCompaction";
+import { InterruptedTurnStore } from "../interruptedTurnStore";
+import { collectClaudeWorkingState, maskSecrets, todosFromItems } from "../wakeBriefingPanel";
+import { COLD_IDLE_RUNTIME_VERSION_FLOORS, COLD_IDLE_SWEEP_MS, IDLE_PROCESS_STOP_RUNTIMES, idleProcessStopMs, WakeRecycleFailureMemory, applyFreshConstructedInit, applyInterruptedTurnNote, applyWakeRecycleBriefing, buildFreshConstructedInit, coldIdleGate, decideColdIdle, describeAppliedWakeRecycle, describeRecycledWakeLogLine, readRuntimeSessionResumeFacts, recycleThresholdTraceAttrs, planWakeSessionRecycle, resolveWakeRecycleConfig, runtimeVersionAllowsColdIdle, sessionSummaryResumeFacts, summarySuppliesResumeFacts, wakeRecycleKindTraceAttrs } from "../wakeSessionRecycle";
 import { WARM_RECYCLE_CANCELLED_EVENT, WARM_RECYCLE_MARKED_EVENT, WARM_RECYCLE_STOPPED_EVENT, WarmRecycleMarks, decideWarmRecycleMark, describeWarmRecycleCancelled, describeWarmRecycleMarked, describeWarmRecycleStopped, resolveWarmRecycleConfig, warmRecycleCoversRuntime, warmRecycleSenderKind, type WarmRecycleCancelReason, type WarmRecycleConfig, type WarmRecycleMark, type WarmRecycleSenderKind, type WarmRecycleTimers } from "../wakeRecycleWarm";
 import type { AgentDeliveryContext, AgentIdleNoticeDelivery, AgentIdleNoticeFacts, AgentStartRequest, AgentTurnInterruptReport, HostedAgentSession } from "./agentLifecycleHost";
 import { OarActivityProjector, type OarToolClassifier } from "./oarActivity";
-import { OarTurnTrace, isOarModelWork, oarTraceCounterKinds, refusalTraceAttrs, type OarTurnStart } from "./oarTurnTrace";
+import { OarTurnTrace, isOarModelWork, oarTraceCounterKinds, refusalEventAttrs, refusalTraceAttrs, type OarTurnStart } from "./oarTurnTrace";
 import { withOarOomPreference } from "./oarOomPreference";
 import { prepareAntigravityOarLaunch } from "./oarAntigravityLaunch";
+import { prepareClaudeOarLaunch } from "./oarClaudeLaunch";
 import { CodexActivityReader } from "./oarCodexActivity";
-import { prepareCodexOarLaunch } from "./oarCodexLaunch";
+import { CODEX_OAR_SERVICE_TIER, prepareCodexOarLaunch } from "./oarCodexLaunch";
 import { cursorAuthEnv, cursorSdkCredentialPresent, cursorSdkSignIn, prepareCursorOarLaunch } from "./oarCursorLaunch";
 import { prepareGrokOarLaunch } from "./oarGrokLaunch";
+import { preparePiOarLaunch } from "./oarGenericLaunch";
 import { prepareOarOnlyLaunch } from "./oarOnlyLaunch";
 import { isOarOpencodeVersion, prepareOpencodeOarLaunch } from "./oarOpencodeLaunch";
 import { OarLaunchDeclined, type OarLaunch, type PrepareOarLaunch } from "./oarLaunch";
@@ -202,15 +234,30 @@ import { OarLaunchDeclined, type OarLaunch, type PrepareOarLaunch } from "./oarL
 /** How each runtime this host runs turns a Raft launch into an OAR launch. */
 const OAR_LAUNCHES: Readonly<Record<string, PrepareOarLaunch>> = {
   antigravity: (ctx) => prepareAntigravityOarLaunch(ctx),
+  // #oar-raft:#48, behind `agent_runtime_oar_claude` and `runtime-host:oar:claude` (oarClaudeLaunch.ts).
+  claude: (ctx) => prepareClaudeOarLaunch(ctx),
   codex: (ctx) => prepareCodexOarLaunch(ctx),
   // #oar-raft:#10, behind `agent_runtime_oar_cursor` (oarCursorLaunch.ts).
   cursor: (ctx) => prepareCursorOarLaunch(ctx),
   grok: (ctx) => prepareGrokOarLaunch(ctx),
-  // Behind `agent_runtime_oar_opencode` and `runtime-host:oar:opencode` (oarOpencodeLaunch.ts).
+  // Routed by `runtime-host:oar:opencode` (flag retired, #oar-raft:#46; oarOpencodeLaunch.ts).
   opencode: (ctx) => prepareOpencodeOarLaunch(ctx),
+  // #oar-raft:#48, behind `agent_runtime_oar_pi` and `runtime-host:oar:pi` (oarGenericLaunch.ts).
+  pi: (ctx) => preparePiOarLaunch(ctx),
   qwen: (ctx) => prepareOarOnlyLaunch("qwen", ctx),
   qoder: (ctx) => prepareOarOnlyLaunch("qoder", ctx),
+  dsh: (ctx) => prepareOarOnlyLaunch("dsh", ctx),
 };
+
+/**
+ * Whether a busy delivery steers into this session's running turn: the launch
+ * steers (`busyDelivery: "now"`) and OAR's session has `steer`. DSH has it
+ * only where its native method inventory advertises one; without it a
+ * delivery is held for the turn end, as an `after_turn` launch's.
+ */
+function launchSteers(agent: { launch?: Pick<OarLaunch, "busyDelivery"> | null }, session: Pick<Session, "steer">): boolean {
+  return agent.launch?.busyDelivery === "now" && session.steer !== undefined;
+}
 
 /**
  * What OAR keeps of one session's records in this process (#wg-ax:#3, M1):
@@ -231,6 +278,14 @@ export function withOarRecordRetention(launch: OarLaunch): OarLaunch {
 /** Runtimes this host can run; one with a legacy driver still needs its server flag (`agent_runtime_oar_<runtime>`). */
 export const OAR_HOSTED_RUNTIMES: ReadonlySet<string> = new Set(Object.keys(OAR_LAUNCHES));
 
+/**
+ * Runtimes whose OAR launch carries the standing prompt as a session option
+ * (`appendSystemPrompt`) although their legacy driver has no native carrier:
+ * antigravity (oarAntigravityLaunch.ts). Without this the prompt went twice
+ * on a fresh session: as the option and again ahead of the first input.
+ */
+const OAR_NATIVE_STANDING_PROMPT_RUNTIMES: ReadonlySet<string> = new Set(["antigravity"]);
+
 const HEARTBEAT_INTERVAL_MS = 60_000;
 /** #oar-raft:#10: how long a Cursor start waits for the SDK's sign-in status (its first load included). */
 const CURSOR_SIGN_IN_READ_MS = 20_000;
@@ -248,10 +303,24 @@ export const CURSOR_SIGN_IN_UNREADABLE_TEXT = "The agent didn't start because Ra
  * for a new session.
  */
 export const OPENCODE_SESSION_ELSEWHERE_TEXT = "Raft now keeps OpenCode sessions in the agent's workspace, and this agent's earlier OpenCode session was kept elsewhere, so it started a new OpenCode session. Its memory and Raft history are unchanged.";
+/**
+ * The Activity Log row when OpenCode 2.x doesn't list the agent's session
+ * (`not_listed`): mostly one made by OpenCode 1.x before an upgrade (2.x keeps
+ * its own session store), so the session is left for a new one.
+ */
+export const OPENCODE_SESSION_NOT_LISTED_TEXT = "OpenCode couldn't find this agent's earlier session (one made by OpenCode 1.x is not kept by OpenCode 2.x), so it started a new OpenCode session. Earlier runtime context may not be restored; its memory and Raft history are unchanged.";
+/**
+ * The Activity Log row when `agy` doesn't list the agent's session (`not_listed`):
+ * mostly one from the legacy driver, rarely one of OAR's that never got a prompt
+ * or lives under another `GEMINI_HOME`, so it names no cause.
+ */
+export const ANTIGRAVITY_SESSION_NOT_LISTED_TEXT = "Antigravity couldn't find this agent's earlier session, so it started a new Antigravity session. Earlier runtime context may not be restored; its memory and Raft history are unchanged.";
 /** #oar-raft:#10: the Activity Log row when a Cursor CLI session is left for a new SDK session. */
 export const CURSOR_SESSION_MIGRATED_TEXT = "Raft now runs Cursor through the Cursor SDK, which can't continue sessions from the Cursor CLI, so this agent started a new Cursor session. Its memory and Raft history are unchanged.";
 /** Steers the runtime may refuse in one turn before held deliveries wait for its end. */
 const STEER_REFUSALS_PER_TURN = 3;
+/** Focus: how many reported seqs are kept per target for the agent's sends (the newest). */
+const SEEN_SEQS_PER_TARGET_MAX = 500;
 /** The taken-id window (`HostedAgent.delivered`): past the server's longest re-send of a delivery. */
 const TAKEN_ID_LIMIT = 4096;
 const TAKEN_ID_MAX_AGE_MS = 60 * 60_000;
@@ -357,10 +426,22 @@ export interface OarAgentHostDeps {
   /**
    * Reconciler step 7: the runtime and model each agent's last session
    * started on, shared with the legacy host (its `sessionSpecs`), so a start
-   * on either host does not resume a session another runtime (or Codex
-   * model) ran. One of this host's own by default.
+   * on either host does not resume a session another runtime or model ran.
+   * One of this host's own by default.
    */
   sessionSpecs?: SessionSpecMemory;
+  /**
+   * #proj-runtime:#80: last committed `(runtime, sessionId)` per agent on disk,
+   * shared with the legacy host so cross-host runtime switches can read prior
+   * transcripts for constructed initial context.
+   */
+  lastSessions?: LastSessionStore;
+  /**
+   * #proj-runtime:#80: one-shot interrupted-turn handoff note written when an
+   * explicit config edit interrupts an active foreground turn; shared with the
+   * legacy host so cross-host switches pick it up too.
+   */
+  interruptedTurns?: InterruptedTurnStore;
   /**
    * Reconciler step 11: the order of the configs the server sends each
    * agent, and a push held until a host registers the agent; shared with the
@@ -386,6 +467,14 @@ export interface OarAgentHostDeps {
   /** RFC 070 §6.5: the warm-recycle quiet timer (tests fire it by hand); real timers when absent. */
   warmRecycleTimers?: WarmRecycleTimers;
   openSession?: OpenOarSession;
+  /**
+   * #proj-runtime:#75: the account's live usage windows, read with the
+   * session's installation and env (so an agent's own `CODEX_HOME` reads its
+   * own account), after a failed turn that hit a used-up quota with no reset.
+   */
+  readAccountUsage?: (launch: OarLaunch) => Promise<AccountUsageSnapshot>;
+  /** OAR's capability answer for a launch's installation; the runtime's own `oarInstalledSessionCapabilities` by default (tests fake an installation's declaration). */
+  sessionCapabilities?: (launch: OarLaunch) => Promise<SessionCapabilityDeclaration>;
   /** OAR's observe entry (`observeStalls`); the bundled one by default (tests delay it). */
   loadObserve?: () => Promise<OarObserve>;
   prepareLaunch?: PrepareOarLaunch;
@@ -395,6 +484,11 @@ export interface OarAgentHostDeps {
    * (`cursorSdkAvailable`: Linux, non-SEA, the SDK resolves); tests fake it.
    */
   cursorSdkAvailable?: () => boolean;
+  /**
+   * #oar-raft:#48: whether this daemon can run Pi through OAR's subprocess RPC
+   * (`piRpcAvailable`: Linux/macOS, non-SEA, Pi's rpc-entry resolves); tests fake it.
+   */
+  piRpcAvailable?: () => boolean;
   /** #oar-raft:#10: the Cursor SDK's sign-in status (OAR's local `authStatus`) in the environment given (`cursorAuthEnv`); tests fake it. */
   cursorAuthStatus?: (env: Record<string, string>) => Promise<AuthStatus>;
   /** How many taken ids a launch remembers for dedup (tests). */
@@ -415,11 +509,15 @@ export interface OarAgentHostDeps {
   featuresSweepMs?: number;
   /** Reconciler step 9: the stall thresholds (stalledWithWork.ts; tests shorten them). Also the "No runtime output" report's. */
   stalledWithWorkThresholds?: StalledWithWorkThresholds;
+  /** Silence after which a turn with nothing waiting is ended (`silentTurnEnd`); `SILENT_TURN_END_MS` by default. */
+  silentTurnEndMs?: number;
   /**
    * Reconciler step 9: the stalled-replacement streaks, shared with the
    * legacy host (its lifecycle records). One of this host's own by default.
    */
   stalledReplacements?: StalledReplacementStreaks;
+  /** #wg-ax:#3: prior sessions whose wake-recycle start failed before readiness, shared with the legacy host. */
+  wakeRecycleFailures?: WakeRecycleFailureMemory;
   /**
    * Reconciler step 10b: the exit streaks (crash and cap streaks, the
    * early-crash record of a resumed session; planExit.ts), shared with the
@@ -435,6 +533,8 @@ export interface OarAgentHostDeps {
   turnSpanEventLimits?: TurnSpanEventLimits;
   /** How long a turn cut short waits for the exit (OAR_TURN_EXIT_WAIT_MS by default; tests change it). */
   turnExitWaitMs?: number;
+  /** #wg-runtime-form:#22 / #oar-raft:#48: spawns the read-only Claude side-ask fork (`startClaudeSideQuestion` by default; tests fake it). */
+  startClaudeSideQuestion?: typeof startClaudeSideQuestion;
 }
 
 /**
@@ -466,9 +566,40 @@ interface Delivery {
   receivedAtMs: number;
   /** A pre-rendered input's turn span start (its reason and trigger); ordinary messages carry theirs. */
   turnStart?: OarTurnStart;
-  onAccepted?: () => void;
+  /** The runtime took it; `taken` says how the input landed and what the turn showed before the write. */
+  onAccepted?: (taken: InputTaken) => void;
+  /**
+   * Focus: this focused message alone was refused as one input too long
+   * (`input_too_large`). From then on it is a row of the notice, as it would
+   * be without the tag, and is not reported read.
+   */
+  focusBodyTooLong?: boolean;
   settled: Promise<boolean>;
   settle(accepted: boolean | Promise<boolean>): void;
+}
+
+/**
+ * How the runtime took an input, with what the host knew of the turn just
+ * before the write: a prompt's bodies count as shown only in the turn that
+ * prompt opened (`turnEnds` unchanged), and output the turn already had by
+ * the time the write settled (`turnOutput` grown) is that turn's.
+ * `turnOpenBefore`: a turn ran when the write went out, so an input that
+ * landed `prompted` after all was a steer OAR turned into a prompt once that
+ * turn had ended: its turn is the first one started after `turnStartsBefore`.
+ */
+interface InputTaken {
+  landed: "prompted" | "steered" | "queued";
+  turnEndsBefore: number;
+  turnOutputBefore: number;
+  turnOpenBefore: boolean;
+  turnStartsBefore: number;
+  /**
+   * The write was a prompt the runtime rejected as busy, then a busy
+   * delivery (a prompt-first launch). OAR records a `turn_started` for the
+   * rejected prompt too, so the turn counts no longer say which turn a
+   * `prompted` landing of that delivery opened.
+   */
+  afterBusyPrompt: boolean;
 }
 
 /** A delivery handed to another host after a fallback; `settle` with that host's answer. */
@@ -498,6 +629,8 @@ export type OarStartOutcome =
     refusal?: StartRefusalDecision;
     /** #oar-raft:#10: not for the legacy host (it would drop the session): the router fails the start with this sentence. */
     failHere?: string;
+    /** With `failHere`: the start failure's class (default `runtime_spawn_failed`). */
+    failHereReason?: SpawnFailureReason;
   };
 
 /** How long a turn-end compaction is waited for (its wait, not the compaction: OAR never cancels it). */
@@ -523,9 +656,22 @@ interface HostedAgent {
   processInstanceId: string;
   processOpened: boolean;
   launch: OarLaunch | null;
+  /**
+   * OAR's answer for `launch`'s installation (`oarInstalledSessionCapabilities`),
+   * read once the launch is prepared: what decides turn-end compaction and
+   * whether the session summary supplies resume facts. Null before, or when
+   * it could not be read (every capability off).
+   */
+  sessionCapabilities: SessionCapabilityDeclaration | null;
   session: Session | null;
   runtimeConfig: AgentConfig | null;
   launchConfig: AgentConfig | null;
+  /**
+   * RFC 072 §7.2 (glimpse G0): the launch's transport directory, where its
+   * context id is published, the session it planned to resume and its passive
+   * AX gate; null before the spawn is planned.
+   */
+  contextGeneration: { transportDir: string; resumeSessionId: string | null; passiveAx: boolean } | null;
   credentialReleased: boolean;
   capabilityWait: CapabilityWait | null;
   /** Deliveries the first input names while it is in flight. */
@@ -577,6 +723,45 @@ interface HostedAgent {
    */
   steerHold: { compacting: boolean; refusals: number };
   /**
+   * Task #triage:#399: a pure inbox notice landed in the session and the
+   * agent has not read since (outstandingNoticeHold.ts): busy notices wait in
+   * `pending` until it reads, the turn ends or a compaction ends; a new
+   * @mention or DM breaks through.
+   */
+  noticeHold: OutstandingNoticeHold;
+  /**
+   * Focus (docs/contracts/agent-focus.md): focused bodies a write that opened
+   * a turn carried (an idle prompt, the first input), each with the session
+   * that took the write. Reported as `agent:model-seen` at that session's
+   * next model output; dropped, unreported, when the turn ends without any or
+   * the session changes. A refused write adds nothing.
+   */
+  pendingModelSeen: { sessionId: string; message: AgentMessage; afterTurnStart: number | null }[];
+  /**
+   * Focus: the seqs reported as seen (`reportModelSeen`), by the target the
+   * agent names in a send (canonicalVisibleTarget). The agent's proxy adds
+   * them to its sends as `seenExactSeqs`: the report alone cannot move the
+   * Server's read position within the settle window, so a reply sent at once
+   * would be held for the message it answers. They speak for the model's
+   * current context only: forgotten when the session changes and when a
+   * compaction starts.
+   */
+  seenSeqsByTarget: Map<string, Set<number>>;
+  /**
+   * Focus: the steers the runtime accepted that carried focused bodies, by
+   * input id. An accept only puts the input in the running turn's buffer, so
+   * its bodies are reported when that turn ends `completed`, and never when
+   * the runtime reports the input dropped (`input_dropped`), which hands the
+   * whole input back (`onInputDropped`). After a turn that did not complete
+   * (`turnEnded`) an entry is kept, unreportable, until the next turn end, so
+   * a drop reported just after the turn end still finds its deliveries.
+   */
+  steeredFocusBodies: { inputId: string; sessionId: string; bodies: AgentMessage[]; deliveries: Delivery[]; turnEnded: boolean }[];
+  /** Turn starts seen in this launch (`InputTaken.turnStartsBefore`): the number of the turn that is open, or that ended last. */
+  turnStarts: number;
+  /** Turn ends seen in this launch (`InputTaken.turnEndsBefore`). */
+  turnEnds: number;
+  /**
    * #proj-runtime:#54 phase 3: native compaction at a turn end past the size
    * threshold (turnEndCompaction.ts). While one is in flight, deliveries are
    * held here and handed over when it settles.
@@ -584,6 +769,13 @@ interface HostedAgent {
   turnEndCompaction: { arming: TurnEndCompactionArming; inFlight: { startedAtMs: number; heldSinceMs: number | null } | null; lastSkipKey: string | null };
   catchupBatch: { launchId: string; batchId: string; renderedRows: number } | null;
   shownUnreadTargets: string[];
+  /**
+   * #wg-ax:#3: prior session id retired by wake-recycle on this launch, held
+   * until startup readiness (`sendRuntimeReady`). While set, the new session is
+   * not reported to the server and any failure/exit before readiness falls back
+   * to resuming this prior session without re-recycling.
+   */
+  recycledFromSessionId: string | null;
   turnEndedReported: boolean;
   runtimeReadySent: boolean;
   processExitedSent: boolean;
@@ -633,10 +825,11 @@ interface HostedAgent {
   /**
    * Reconciler step 9: the root agent's tool calls of the running turn that
    * started (`tool_call_started`) and have not ended (`tool_call_ended`);
-   * cleared at each turn start and end. OAR has no tool diagnostic
+   * cleared at each turn end/exit, in insertion order so the first entry is the
+   * oldest open call (used by `sideAsk` status). OAR has no tool diagnostic
    * snapshots, so an open one is never proven idle (`reconcileHealth`).
    */
-  openToolCalls: Set<string>;
+  openToolCalls: Map<string, { name: string; startedAtMs: number }>;
   /** #proj-runtime:#42: the sub-agents this launch has running. */
   taskRows: OarTaskRows;
   /**
@@ -669,10 +862,16 @@ interface HostedAgent {
   modelOutput: boolean;
   /** A turn runs (`turn_started` .. `turn_ended`). */
   turnOpen: boolean;
+  /** A turn the runtime opened itself runs (root `turn_active` .. `turn_ended` or exit): its output is the turn's, not outside one. */
+  nativeRunOpen: boolean;
   /** The last turn was cut by the process's end (failed `runtime_exited`, or aborted with no abort asked). */
   turnCutByExit: boolean;
   /** This host asked OAR to abort the running turn (a person's turn interrupt). */
   abortRequested: boolean;
+  /** That abort ended a turn silent past `silentTurnEndMs` (task #triage:#496): its end shows why, not Idle. */
+  silentTurnEnding: boolean;
+  /** Host-initiated abort facts folded from OAR's record stream by `turn_ended` seq (#oar-raft:#45). */
+  turnAborts: OarTurnAbortTracker | null;
   /**
    * The last turn failed and no turn started since (the legacy host's live
    * runtime error, cleared by the next delivery): OAR's class and the
@@ -701,6 +900,129 @@ interface HostedAgent {
 
 class LaunchStopped extends Error {}
 
+/** At most this many of the runtime's models are named in a model-gone start failure. */
+const MODEL_GONE_LISTED_MAX = 12;
+
+/**
+ * #oar-raft:#25, #oar-raft:#50 (D8): the start failure's sentence when an OAR
+ * session opened but the runtime did not confirm the agent's model because the
+ * model is absent from the catalog it read (OAR `ModelConfirmationError` with
+ * `catalogSelectorIds` not naming the requested model — e.g. Antigravity or
+ * Qoder when a model left the account or was renamed), else null. It names the
+ * models the runtime offers, so the person can pick one in the agent's
+ * settings. Without a catalog (e.g. Codex keeping its own model, which omits
+ * `catalogSelectorIds`), or with one that still names the model (a setting the
+ * runtime did not take in time: OAR says the error alone is no evidence the
+ * model is unavailable), it is null and the start falls back as before.
+ */
+export function modelConfirmationFailure(runtimeId: string, model: string | undefined, error: unknown): string | null {
+  if (errorName(error) !== "ModelConfirmationError") return null;
+  const details = error as { requested?: unknown; catalogSelectorIds?: unknown };
+  const requested = typeof details.requested === "string" && details.requested ? details.requested : model;
+  if (!requested || !Array.isArray(details.catalogSelectorIds)) return null;
+  const offered = details.catalogSelectorIds.filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 128);
+  // A model id that names its level ("gemini-4-hydrogen-xhigh") is the listed model's.
+  if (offered.some((id) => requested === id || requested.startsWith(`${id}-`))) return null;
+  const label = runtimeDisplayName(runtimeId);
+  const head = `${label} on this Computer no longer offers the model "${requested.slice(0, 128)}". Choose another model in the agent's settings.`;
+  if (offered.length === 0) return `${head} ${label} listed no models.`;
+  const listed = offered.slice(0, MODEL_GONE_LISTED_MAX).join(", ");
+  return `${head} Available: ${listed}${offered.length > MODEL_GONE_LISTED_MAX ? ", …" : ""}.`;
+}
+
+/**
+ * #wg-runtime-form:#27: Codex did not run the thread at the named fast tier
+ * the agent asks for (`ultrafast`; OAR refuses an open whose reported tier
+ * differs). The legacy driver would send the same tier without checking it,
+ * so the start fails here, saying which speed to change. Null for the primary
+ * tier and every other failure (they hand back as before).
+ */
+export function serviceTierConfirmationFailure(runtimeId: string, serviceTier: string | undefined, error: unknown): string | null {
+  if (runtimeId !== "codex" || !serviceTier || serviceTier === CODEX_OAR_SERVICE_TIER.fast || serviceTier === CODEX_OAR_SERVICE_TIER.standard) return null;
+  if (oarOpenFailureClass(error) !== "settings_not_confirmed" || !/serviceTier/i.test(errorMessage(error))) return null;
+  return `Codex on this Computer did not start at the chosen speed (${serviceTier.slice(0, 32)}); this account may not offer it for this model. Choose another speed, or turn off fast mode, in the agent's settings.`;
+}
+
+export interface CodexResumeProviderMismatch {
+  reason: "provider_mismatch" | "provider_not_configured" | "provider_policy_conflict";
+  sessionProvider?: string;
+  currentProvider?: string;
+}
+
+const CODEX_PROVIDER_ID_PATTERN = "[A-Za-z0-9._-]{1,64}";
+const CODEX_PROVIDER_MISMATCH_RE = new RegExp(
+  `This chat uses (${CODEX_PROVIDER_ID_PATTERN}), but (?:your current provider is|Codex now uses) (${CODEX_PROVIDER_ID_PATTERN})(?=[.,](?:\\s|$)|$)`,
+);
+const CODEX_PROVIDER_NOT_CONFIGURED_RE = new RegExp(
+  `This chat uses model provider (${CODEX_PROVIDER_ID_PATTERN}), which is no longer configured(?=[.,](?:\\s|$)|$)`,
+);
+const CODEX_PROVIDER_POLICY_CONFLICT_RE = new RegExp(
+  `This chat uses model provider (${CODEX_PROVIDER_ID_PATTERN}), but your organization requires (${CODEX_PROVIDER_ID_PATTERN})(?=[.,](?:\\s|$)|$)`,
+);
+
+/**
+ * #wg-ax:#3: detect Codex `thread/resume` refusals caused by the host's Codex
+ * model provider changing since the session was created (Codex
+ * `ModelProviderError`: `ModelProviderMismatch`, `ModelProviderNotConfigured`,
+ * `ModelProviderPolicyConflict`, via message text or JSON-RPC `native.data.type`).
+ */
+export function parseCodexResumeProviderMismatch(error: unknown): CodexResumeProviderMismatch | null {
+  const seen = new Set<unknown>();
+  const queue: unknown[] = [error];
+  let fallbackType: CodexResumeProviderMismatch["reason"] | null = null;
+
+  for (let steps = 0; queue.length > 0 && steps < 16; steps += 1) {
+    const current = queue.shift();
+    if (!current || typeof current !== "object" || seen.has(current)) continue;
+    seen.add(current);
+
+    const record = current as Record<string, unknown>;
+    if (typeof record.method === "string" && record.method !== "thread/resume") continue;
+    const message = typeof record.message === "string" ? record.message : null;
+    if (message) {
+      const mismatch = CODEX_PROVIDER_MISMATCH_RE.exec(message);
+      if (mismatch) {
+        return { reason: "provider_mismatch", sessionProvider: mismatch[1], currentProvider: mismatch[2] };
+      }
+      const notConfigured = CODEX_PROVIDER_NOT_CONFIGURED_RE.exec(message);
+      if (notConfigured) {
+        return { reason: "provider_not_configured", sessionProvider: notConfigured[1] };
+      }
+      const policyConflict = CODEX_PROVIDER_POLICY_CONFLICT_RE.exec(message);
+      if (policyConflict) {
+        return { reason: "provider_policy_conflict", sessionProvider: policyConflict[1], currentProvider: policyConflict[2] };
+      }
+    }
+
+    const data = record.data;
+    if (data && typeof data === "object" && !Array.isArray(data)) {
+      const dataType = (data as Record<string, unknown>).type;
+      if (dataType === "modelProviderMismatch") fallbackType = "provider_mismatch";
+      else if (dataType === "modelProviderNotConfigured") fallbackType = "provider_not_configured";
+      else if (dataType === "modelProviderPolicyConflict") fallbackType = "provider_policy_conflict";
+    }
+
+    if ("cause" in record && record.cause) queue.push(record.cause);
+    if ("native" in record && record.native) queue.push(record.native);
+  }
+
+  return fallbackType ? { reason: fallbackType } : null;
+}
+
+/** Human-visible Activity Log notice explaining why Codex started a fresh session. */
+export function codexResumeProviderMismatchNotice(mismatch: CodexResumeProviderMismatch): string {
+  if (mismatch.reason === "provider_not_configured" && mismatch.sessionProvider) {
+    return `Codex's model provider for the previous session (${mismatch.sessionProvider}) is no longer configured on this machine, so the previous Codex session could not be resumed. Started a new Codex session; earlier runtime context may not be restored, while memory and Raft history are unchanged.`;
+  }
+  if (mismatch.reason === "provider_policy_conflict" && mismatch.sessionProvider && mismatch.currentProvider) {
+    return `The previous Codex session used model provider ${mismatch.sessionProvider}, which is not allowed under this machine's configured provider (${mismatch.currentProvider}), so it could not be resumed. Started a new Codex session; earlier runtime context may not be restored, while memory and Raft history are unchanged.`;
+  }
+  if (mismatch.sessionProvider && mismatch.currentProvider) {
+    return `Codex's model provider on this machine changed (${mismatch.sessionProvider} → ${mismatch.currentProvider}), so the previous Codex session could not be resumed. Started a new Codex session; earlier runtime context may not be restored, while memory and Raft history are unchanged.`;
+  }
+  return "Codex's model provider on this machine changed, so the previous Codex session could not be resumed. Started a new Codex session; earlier runtime context may not be restored, while memory and Raft history are unchanged.";
+}
+
 /** A start the OAR host hands back to the legacy host; `reason` is traced. */
 class HandBack extends Error {
   /**
@@ -710,9 +1032,11 @@ class HandBack extends Error {
    * OAR again.
    */
   readonly failHere?: string;
-  constructor(readonly reason: string, readonly refusal?: StartRefusalDecision, options?: { cause?: unknown; failHere?: string }) {
+  readonly failHereReason?: SpawnFailureReason;
+  constructor(readonly reason: string, readonly refusal?: StartRefusalDecision, options?: { cause?: unknown; failHere?: string; failHereReason?: SpawnFailureReason }) {
     super(reason, options);
     if (options?.failHere) this.failHere = options.failHere;
+    if (options?.failHereReason) this.failHereReason = options.failHereReason;
   }
 }
 
@@ -757,8 +1081,8 @@ export function oarOpenFailureClass(cause: unknown): OarOpenFailureClass {
   // qoder 1.1.82+ (OAR 0.87.1): a selector that is not one catalog `value`, or
   // whose display name is not unique, is refused at open.
   if (/did not confirm model|kept model .* although|model catalog did not (?:contain requested selector|provide a resolved name)/i.test(text)) return "model_not_confirmed";
-  // codex: the thread came back with another service tier, effort or workspace roots than asked.
-  if (/reports serviceTier .* although|(?:effort|reasoningEffort) .*although|effort .* cannot be confirmed|did not confirm the requested additionalDirectories/i.test(text)) return "settings_not_confirmed";
+  // codex / claude: the session came back with another service tier, fast mode, effort or workspace roots than asked.
+  if (/reports (?:serviceTier|fast_mode_state) .* although|(?:effort|reasoningEffort) .*although|effort .* cannot be confirmed|did not confirm the requested additionalDirectories/i.test(text)) return "settings_not_confirmed";
   // ACP effort (grok `reasoning_effort`, kimi `thinking`): a level the model
   // does not offer is refused `-32602 Invalid params` (OAR shared/acp/effort.ts
   // wraps every failure of that call as "... was refused: <error>", so only
@@ -770,6 +1094,22 @@ export function oarOpenFailureClass(cause: unknown): OarOpenFailureClass {
   if (/\bETIMEDOUT\b|timed? ?out/i.test(text)) return "timeout";
   if (/\b(ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN)\b/i.test(text)) return "network";
   return "unknown";
+}
+
+/**
+ * Which option an OAR `UnsupportedOptionError` refused (`option`), and for a
+ * `ResumeCwdError` why the saved directory couldn't be confirmed (`reason`:
+ * `other_cwd`, `not_listed`, `cwd_unreported`, `listing_unavailable`), so a
+ * fallback says which setting sent the agent to the legacy host.
+ */
+export function refusedOptionFields(cause: unknown): { refused_option?: string; resume_cwd_reason?: string } {
+  // ResumeCwdError keeps its base class's name on purpose (OAR contracts).
+  if (!(cause instanceof Error) || cause.name !== "UnsupportedOptionError") return {};
+  const { option, reason } = cause as { option?: unknown; reason?: unknown };
+  return {
+    ...(typeof option === "string" ? { refused_option: option.slice(0, 64) } : {}),
+    ...(typeof reason === "string" ? { resume_cwd_reason: reason.slice(0, 64) } : {}),
+  };
 }
 
 /**
@@ -802,8 +1142,9 @@ function classifiedFailure(outcome: Extract<TurnOutcome, { kind: "failed" }>): {
  * runtime error's (`runtimeErrorProviderLimit`): `quota` is a used-up quota
  * (until the reset OAR reports, if any), `rate_limited` and `overloaded` a
  * transient throttle; a failure OAR left `unknown` whose text says the usage
- * limit is reached is a used-up quota with no known reset (C5). Null for
- * every other failure.
+ * limit is reached is a used-up quota with no known reset (C5; the account's
+ * live windows then supply one, waitForAccountUsageReset). Null for every
+ * other failure.
  */
 export function oarFailureProviderLimit(failure: FailureClass, outcome: FailedTurn): RuntimeErrorProviderLimit | null {
   switch (failure) {
@@ -817,6 +1158,31 @@ export function oarFailureProviderLimit(failure: FailureClass, outcome: FailedTu
     default:
       return null;
   }
+}
+
+/** How long the account-usage read after a used-up quota may take (it starts the runtime's own reader). */
+const ACCOUNT_USAGE_RESET_READ_TIMEOUT_MS = 30_000;
+
+/**
+ * The reset that ends a used-up quota, from the account's live windows
+ * (#proj-runtime:#75): the latest reset of the account-level windows (no
+ * scope, or `account`) at 100%, when each
+ * full window reports one in the future within PROVIDER_LIMIT_RESET_MAX_AHEAD_MS
+ * (providerLimitReportedResetInMs). Undefined otherwise: no full window, a
+ * full window without a usable reset, or no reading.
+ */
+export function fullWindowsResetAt(snapshot: AccountUsageSnapshot, nowMs: number): string | undefined {
+  if (snapshot.kind !== "available") return undefined;
+  // A model's or a model group's window limits that model, not the sign-in's other agents.
+  const full = snapshot.windows.filter((window) => window.usedRatio >= 1 && (!window.scope || window.scope.kind === "account"));
+  if (full.length === 0) return undefined;
+  let latest: { at: string; ms: number } | undefined;
+  for (const window of full) {
+    if (!window.resetsAt || providerLimitReportedResetInMs({ kind: "quota_exhausted", resetsAt: window.resetsAt }, nowMs) === undefined) return undefined;
+    const ms = Date.parse(window.resetsAt);
+    if (!latest || ms > latest.ms) latest = { at: new Date(ms).toISOString(), ms };
+  }
+  return latest?.at;
 }
 
 /**
@@ -849,6 +1215,37 @@ export function oarRecoverableExitError(failure: FailureClass, reason: string): 
  * only by real model output, never by turn-start bookkeeping.
  */
 const OAR_PROVIDER_LIMIT_REASON = "rate_limited";
+
+/**
+ * Root output the runtime produced with no turn open. Since OAR 0.121 only a
+ * prompt, a manual compaction or a native turn start opens one; output
+ * outside folds into the idle status's `activity`: Antigravity working on
+ * past `end_turn`, OpenCode 2.x's own reply after a background sub-agent
+ * reports. No turn end follows, so it is not shown as work: the agent stays
+ * idle and a delivery opens a turn the runtime folds into that run.
+ * `inRun` is the host's own event-ordered state (a prompted turn, a turn the
+ * runtime opened with `turn_active`, a compaction this host asked for), never
+ * OAR's status at callback time, which may already be past this event (a
+ * coalesced text flushed with its turn's `turn_ended`).
+ */
+export function outsideTurnContent(event: Pick<Event, "kind">, inRun: boolean): boolean {
+  if (inRun) return false;
+  switch (event.kind) {
+    case "text_delta":
+    case "reasoning":
+    case "tool_call_started":
+    case "tool_call_ended":
+    case "tool_call_progress":
+    case "tool_call_input_delta":
+    case "tool_call_input":
+    case "retry":
+    case "compaction_started":
+    case "compaction_ended":
+      return true;
+    default:
+      return false;
+  }
+}
 
 /** Grok's echo of an accepted `_x.ai/interject` for this input, in the session's records. */
 export function interjectionEchoed(session: Pick<Session, "records">, inputId: string): boolean {
@@ -890,6 +1287,118 @@ function formatPromptRefusedAgainMessage(label: string, reason: string): string 
   const words = typeof errorClass === "string" ? REFUSAL_CLASS_WORDS[errorClass as RuntimeErrorClass] : undefined;
   const why = words ? ` (${words})` : "";
   return `${label} refused new messages again right after Raft restarted its session${why}. Raft has paused this agent and will try again by itself later; messages sent to it stay unread until it starts. To try now, restart it (Restart / Reset in the agent menu). If it keeps happening, switch its model or runtime.`;
+}
+
+/** Task #triage:#496: silence after which a turn with nothing waiting is ended (Server flag `silent_turn_end`). */
+export const SILENT_TURN_END_MS = 60 * 60_000;
+export const SILENT_TURN_ENDED_EVENT = "daemon.runtime.stall.silent_turn_ended";
+
+function silentTurnEndedDetail(ms: number): string {
+  const minutes = Math.max(1, Math.round(ms / 60_000));
+  return `The turn produced no output for ${minutes} minute${minutes === 1 ? "" : "s"} and was ended`;
+}
+
+/**
+ * Tracks host-initiated turn aborts from OAR's record stream alone
+ * (`request(abort)` answered `accepted` before — or racing with — the root
+ * `turn_ended` frame).
+ *
+ * OAR deliberately keeps the runtime's own turn outcome on `turn_ended`
+ * (OpenCode 1.x answers cancel with `end_turn`, which OAR records as
+ * `outcome: "completed"`). Keying accepted aborts by each root `turn_ended`
+ * record's `seq` preserves the host-aborted fact both live and across
+ * `afterSeq: -1` replay, without relying only on an in-memory flag (#oar-raft:#45).
+ *
+ * An accepted root `prompt` clears any earlier abort whose request preceded
+ * that prompt, so an aborted operation that ends without `turn_ended` (such as
+ * manual compaction or an unstarted input dropped by abort) never leaks into
+ * the next turn.
+ */
+export class OarTurnAbortTracker {
+  /** Root `toRuntime` abort requests waiting for their response (`id -> request seq`). */
+  private readonly pendingAbortSeqs = new Map<string, number>();
+  /** Root `toRuntime` prompt requests waiting for their response (`id -> request seq`). */
+  private readonly pendingPromptSeqs = new Map<string, number>();
+  /**
+   * Aborts still in flight when a root `turn_ended` frame arrived (`id -> turn_ended seq`).
+   * Lets `afterSeq: -1` replay match `request(abort)` -> `turn_ended` -> `response(accepted)`
+   * without leaking that late response into the next turn.
+   */
+  private readonly pendingAfterTurnEnd = new Map<string, number>();
+  /** Request `seq` of an accepted abort in the current turn, or null. */
+  private acceptedAbortSeq: number | null = null;
+  private readonly abortedTurnEndSeqs = new Set<number>();
+
+  constructor(private readonly sessionId: string) {}
+
+  observe(record: RawEvent): void {
+    if (record.sessionId !== this.sessionId || record.agentPath.length > 0) return;
+    if (record.kind === "request") {
+      if (record.direction === "toRuntime") {
+        if (record.body.kind === "abort") this.pendingAbortSeqs.set(record.id, record.seq);
+        else if (record.body.kind === "prompt") this.pendingPromptSeqs.set(record.id, record.seq);
+      }
+      return;
+    }
+    if (record.kind === "response") {
+      if (record.body.kind === "exited" || record.body.kind === "released") {
+        this.pendingAbortSeqs.clear();
+        this.pendingPromptSeqs.clear();
+        this.pendingAfterTurnEnd.clear();
+        this.acceptedAbortSeq = null;
+        return;
+      }
+      const promptSeq = this.pendingPromptSeqs.get(record.requestId);
+      if (promptSeq !== undefined) {
+        this.pendingPromptSeqs.delete(record.requestId);
+        if (record.body.kind === "accepted") {
+          if (this.acceptedAbortSeq !== null && this.acceptedAbortSeq < promptSeq) {
+            this.acceptedAbortSeq = null;
+          }
+          for (const [id, abortSeq] of this.pendingAbortSeqs) {
+            if (abortSeq < promptSeq) this.pendingAbortSeqs.delete(id);
+          }
+        }
+        return;
+      }
+      const abortSeq = this.pendingAbortSeqs.get(record.requestId);
+      if (abortSeq !== undefined) {
+        this.pendingAbortSeqs.delete(record.requestId);
+        if (record.body.kind === "accepted") {
+          this.acceptedAbortSeq = this.acceptedAbortSeq === null ? abortSeq : Math.max(this.acceptedAbortSeq, abortSeq);
+        }
+        return;
+      }
+      const racedTurnEndSeq = this.pendingAfterTurnEnd.get(record.requestId);
+      if (racedTurnEndSeq !== undefined) {
+        this.pendingAfterTurnEnd.delete(record.requestId);
+        if (record.body.kind === "accepted") {
+          this.abortedTurnEndSeqs.add(racedTurnEndSeq);
+        }
+      }
+      return;
+    }
+    if (record.body.events.some((event) => event.kind === "turn_ended")) {
+      if (this.acceptedAbortSeq !== null) {
+        this.abortedTurnEndSeqs.add(record.seq);
+        this.pendingAbortSeqs.clear();
+        this.acceptedAbortSeq = null;
+      } else if (this.pendingAbortSeqs.size > 0) {
+        for (const id of this.pendingAbortSeqs.keys()) {
+          this.pendingAfterTurnEnd.set(id, record.seq);
+        }
+        this.pendingAbortSeqs.clear();
+      }
+    }
+  }
+
+  consumeAbortedTurnEnd(seq: number): boolean {
+    const hit = this.abortedTurnEndSeqs.delete(seq);
+    for (const candidate of this.abortedTurnEndSeqs) {
+      if (candidate <= seq) this.abortedTurnEndSeqs.delete(candidate);
+    }
+    return hit;
+  }
 }
 
 export class OarAgentHost {
@@ -934,12 +1443,22 @@ export class OarAgentHost {
   private readonly turnSummaries = new TurnSummaryTracker();
   private readonly sink: ActivitySink;
   private readonly openSession: OpenOarSession;
+  private readonly readAccountUsage: (launch: OarLaunch) => Promise<AccountUsageSnapshot>;
+  private readonly sessionCapabilities: (launch: OarLaunch) => Promise<SessionCapabilityDeclaration>;
+  /** Credentials whose account usage is being read after a used-up quota (one read each at a time). */
+  private readonly accountUsageReads = new Set<ProviderLimitCredentialKey>();
   private readonly loadObserve: () => Promise<OarObserve>;
   private readonly prepareLaunch: PrepareOarLaunch;
   private readonly standingPromptLedger: StandingPromptLedger;
+  /** task #10 / #oar-raft:#48: consecutive terminal compaction failures for runtimes where compaction failure sticks to the session (Pi). */
+  private readonly compactionFailureLedger: SessionCompactionFailureLedger;
+  private readonly lastSessions: LastSessionStore;
+  private readonly interruptedTurns: InterruptedTurnStore;
   private readonly sessionSummaries: SessionSummaryStore;
   /** RFC 070 §6.5: sessions marked for a warm recycle, and the stops the next start decides on (wakeRecycleWarm.ts). */
   private readonly warmRecycle: WarmRecycleMarks;
+  /** #wg-ax:#3: prior sessions whose recycled replacement failed before readiness (shared with AgentProcessManager). */
+  private readonly wakeRecycleFailures: WakeRecycleFailureMemory;
   private readonly now: () => number;
   private readonly providerLimits: ProviderLimitLedger;
   private readonly providerLimitBackoff: { baseMs: number; maxMs: number; jitterRatio: number; jitterRandom: () => number };
@@ -956,8 +1475,10 @@ export class OarAgentHost {
   private readonly configRevisions: AgentConfigRevisions;
   private readonly specHandbacks: SpecHandbacks;
   private readonly stallThresholds: StalledWithWorkThresholds;
+  private readonly silentTurnEndMs: number;
   private readonly stalledReplacements: StalledReplacementStreaks;
   private readonly exitStreaks: ExitStreaks;
+  private readonly sideQuestions = new SideQuestionRunner();
 
   /** Reconciler step 15: the account an agent's runtime signs in as. */
   private readonly readCredentialAccount: CredentialAccountReader;
@@ -966,11 +1487,13 @@ export class OarAgentHost {
     this.readCredentialAccount = deps.credentialAccountReader ?? createCredentialAccountReader(ambientProcessEnv);
     this.now = deps.now ?? Date.now;
     this.warmRecycle = new WarmRecycleMarks(deps.warmRecycleTimers);
+    this.wakeRecycleFailures = deps.wakeRecycleFailures ?? new WakeRecycleFailureMemory(() => this.now());
     this.providerLimits = deps.providerLimits ?? new ProviderLimitLedger();
     this.sessionSpecs = deps.sessionSpecs ?? new SessionSpecMemory();
     this.configRevisions = deps.configRevisions ?? new AgentConfigRevisions();
     this.specHandbacks = deps.specHandbacks ?? new SpecHandbacks(() => this.now());
     this.stallThresholds = deps.stalledWithWorkThresholds ?? STALLED_WITH_WORK_THRESHOLDS;
+    this.silentTurnEndMs = deps.silentTurnEndMs ?? SILENT_TURN_END_MS;
     this.stalledReplacements = deps.stalledReplacements ?? new StalledReplacementStreaks();
     this.exitStreaks = deps.exitStreaks ?? new ExitStreaks();
     this.providerLimits.subscribe((change) => this.onProviderLimitChange(change));
@@ -983,6 +1506,16 @@ export class OarAgentHost {
       jitterRandom: backoff.jitterRandom ?? Math.random,
     };
     this.openSession = deps.openSession ?? (async (launch) => (await loadOarSessionRuntime(launch.runtimeId)).session(launch.installation, launch.options));
+    this.readAccountUsage = deps.readAccountUsage ?? (async (launch) => {
+      const read = (await loadOarRuntime(launch.runtimeId)).accountUsage;
+      if (!read) return { kind: "unsupported" };
+      return read(launch.installation, {
+        ...(launch.options.env ? { env: launch.options.env } : {}),
+        timeoutMs: ACCOUNT_USAGE_RESET_READ_TIMEOUT_MS,
+        limitResetDetails: false,
+      });
+    });
+    this.sessionCapabilities = deps.sessionCapabilities ?? (async (launch) => oarInstalledSessionCapabilities(await loadOarRuntime(launch.runtimeId), launch.installation));
     this.loadObserve = deps.loadObserve ?? loadOarObserve;
     this.prepareLaunch = deps.prepareLaunch ?? ((ctx) => {
       const prepare = OAR_LAUNCHES[ctx.config.runtime || "claude"];
@@ -990,6 +1523,9 @@ export class OarAgentHost {
       return prepare(ctx);
     });
     this.standingPromptLedger = new StandingPromptLedger(deps.dataDir, () => this.now());
+    this.compactionFailureLedger = new SessionCompactionFailureLedger(deps.dataDir, () => this.now());
+    this.lastSessions = deps.lastSessions ?? new LastSessionStore(deps.dataDir, () => this.now());
+    this.interruptedTurns = deps.interruptedTurns ?? new InterruptedTurnStore(deps.dataDir, () => this.now());
     this.sessionSummaries = new SessionSummaryStore(deps.sessionSummaryDir ?? sessionSummaryDir(deps.slockHome ?? resolveRaftHome()), (agentId, error) => {
       logger.warn(`[Agent ${agentId}] session summary not written: ${errorMessage(error)}`);
     });
@@ -1028,12 +1564,13 @@ export class OarAgentHost {
     const runtime = config.runtime || "claude";
     if (!OAR_HOSTED_RUNTIMES.has(runtime)) return { ok: false, reason: `runtime_not_hosted:${runtime}` };
     const platform = this.deps.platform ?? process.platform;
-    // On Windows only Codex runs here so far (its launch takes the driver's
-    // Windows resolution, oarCodexLaunch.ts); the others keep the driver.
-    if (platform === "win32" && runtime !== "codex") return { ok: false, reason: "platform_unsupported" };
+    if (!isOarRuntimeSupportedOnPlatform(runtime, platform)) return { ok: false, reason: "platform_unsupported" };
     if (runtime === "cursor") {
       const cursor = this.cursorSupport();
       if (!cursor.ok) return cursor;
+    }
+    if (runtime === "pi" && !(this.deps.piRpcAvailable ?? (() => piRpcAvailable({ platform })))()) {
+      return { ok: false, reason: "pi_rpc_unavailable" };
     }
     // A runtime with no legacy host runs these starts here: its runtime
     // profile notice is not injected (the start's own config carries it again
@@ -1159,7 +1696,16 @@ export class OarAgentHost {
   private reportableSessionId(agent: HostedAgent, sessionId: string | null | undefined): string | null {
     if (!sessionId) return null;
     if (agent.startedSpec && sessionDropReason(agent.startedSpec, runtimeSpecOf(agent.request.config)) !== null) return null;
+    // #wg-ax:#3: hold reporting a wake-recycled replacement session until it
+    // reaches startup readiness, so the server keeps the prior session on failure.
+    if (agent.recycledFromSessionId) return null;
     return sessionId;
+  }
+
+  /** RFC 072 §7.2 (glimpse G0): a session this agent will not resume keeps no context id (the table is the agent's, any launch's directory finds it). */
+  private forgetSessionContext(agent: HostedAgent, sessionId: string): void {
+    const transportDir = agent.contextGeneration?.transportDir ?? spawnCliTransportDir({ slockHome: this.deps.slockHome, agentId: agent.agentId, launchId: agent.launchId });
+    rememberSessionContext(transportDir, sessionId, null);
   }
 
   private reportSession(agent: HostedAgent, sessionId: string): void {
@@ -1193,7 +1739,7 @@ export class OarAgentHost {
    * rebind with a wake keeps the session busy until that wake's turn ends,
    * a push only waits for the current turn (and any held delivery) to end.
    */
-  applyConfig(agentId: string, config: AgentConfig, revision: number): void {
+  applyConfig(agentId: string, config: AgentConfig, revision: number, options?: { interrupt?: boolean }): void {
     const agent = this.agents.get(agentId);
     if (!agent || agent.stopping) {
       // Not this host's any more: the next start (either host) takes it.
@@ -1204,6 +1750,7 @@ export class OarAgentHost {
     this.configRevisions.holdPush(agentId, { config, revision });
     this.takePushedConfig(agent, config);
     const drift = agent.startedSpec ? runtimeSpecDrift(agent.startedSpec, runtimeSpecOf(agent.request.config)) : [];
+    const interrupt = options?.interrupt === true;
     this.deps.recordEvent("daemon.agent.config_push", {
       agentId,
       revision,
@@ -1212,8 +1759,37 @@ export class OarAgentHost {
       launchId: agent.launchId ?? undefined,
       // Kinds only, never a value.
       drift: drift.join(",") || undefined,
+      ...(interrupt ? { interrupt: true } : {}),
       host: "oar",
     });
+    if (interrupt) {
+      // #proj-runtime:#80: server is immediately following with `resetAgent`.
+      // Record the interrupted-turn handoff note whenever a foreground turn is
+      // active — even if `drift` is empty — because server is restarting anyway.
+      const session = agent.session;
+      const foregroundBusy = !agent.committed
+        || (session !== null && session !== undefined
+          && this.agentNotIdle(agent, session, { ignoreBackgroundTasks: true, ignoreUntoldInbox: true }) !== null);
+      if (foregroundBusy) {
+        this.interruptedTurns.write(agentId, drift);
+      }
+      if (this.isCurrent(agent) && agent.committed && session) {
+        this.idleHolds.forget(agentId, "spec_restart");
+        this.deps.recordEvent("daemon.agent.spec_restart_stop", {
+          agentId,
+          launchId: agent.launchId ?? undefined,
+          session_id: session.id,
+          drift: drift.join(","),
+          ...(foregroundBusy ? { interrupted_turn: true } : {}),
+          trigger: "signal",
+          host: "oar",
+        });
+        logger.info(`[Agent ${agentId}] Config revision ${revision} interrupting ${foregroundBusy ? "active" : "idle"} OAR session (spec drift: ${drift.join(", ") || "none"}; session ${session.id})`);
+        this.specHandbacks.mark(agentId);
+        void this.endSession(agent, "spec_restart");
+        return;
+      }
+    }
     logger.info(`[Agent ${agentId}] Config revision ${revision} applied (OAR${drift.length > 0 ? `; spec drift: ${drift.join(", ")}; ends once idle` : ""})`);
     this.reconcile(agent, "signal");
   }
@@ -1287,9 +1863,11 @@ export class OarAgentHost {
       processInstanceId: randomUUID(),
       processOpened: false,
       launch: null,
+      sessionCapabilities: null,
       session: null,
       runtimeConfig: null,
       launchConfig: null,
+      contextGeneration: null,
       credentialReleased: false,
       capabilityWait: null,
       carried: [],
@@ -1309,9 +1887,16 @@ export class OarAgentHost {
       deliverSingly: 0,
       turn: { textEvents: 0, toolCalls: 0, runtimeErrors: 0, thinkingEvents: 0 },
       steerHold: { compacting: false, refusals: 0 },
+      noticeHold: new OutstandingNoticeHold(),
+      pendingModelSeen: [],
+      seenSeqsByTarget: new Map(),
+      steeredFocusBodies: [],
+      turnStarts: 0,
+      turnEnds: 0,
       turnEndCompaction: { arming: new TurnEndCompactionArming(), inFlight: null, lastSkipKey: null },
       catchupBatch: null,
       shownUnreadTargets: [],
+      recycledFromSessionId: null,
       turnEndedReported: false,
       runtimeReadySent: false,
       processExitedSent: false,
@@ -1323,7 +1908,7 @@ export class OarAgentHost {
       credentialAccount: null,
       credentialAccountChanged: false,
       pushAfterPlan: null,
-      openToolCalls: new Set(),
+      openToolCalls: new Map(),
       taskRows: new OarTaskRows(() => this.now()),
       subagentWake: { resultUnread: false, lastTurnAborted: false },
       stallDeadline: null,
@@ -1331,8 +1916,11 @@ export class OarAgentHost {
       lastEventAtMs: null,
       modelOutput: false,
       turnOpen: false,
+      nativeRunOpen: false,
       turnCutByExit: false,
       abortRequested: false,
+      silentTurnEnding: false,
+      turnAborts: null,
       lastFailure: null,
       startNotBeforeMs: restart?.notBeforeMs ?? null,
       startWait: restart?.untilLimitReleased ? { untilLimitReleased: true, end: null } : null,
@@ -1389,11 +1977,21 @@ export class OarAgentHost {
       // A stop that landed while the session was disposed wins: the start is
       // cancelled, never handed to the legacy host (its credential is revoked).
       if (!this.isCurrent(agent)) return this.cancelStart(agent);
+      if (
+        agent.recycledFromSessionId
+        && reason !== "stale_dispatch"
+        && reason !== "outcome_storage_blocked"
+        && !(error instanceof HandBack && error.cause instanceof OarLaunchDeclined)
+      ) {
+        this.recordFailedWakeRecycleStart(agent, reason);
+      }
       this.revokeLaunchOnlyCredential(agent);
       const cursorResume = this.cursorSdkResumeFailed(agent, error);
       if (cursorResume) return this.startCursorAfterResumeFailure(agent, cursorResume.sessionId, cursorResume.cause);
       const elsewhere = this.resumeRefusedElsewhere(agent, error);
       if (elsewhere) return this.startAfterResumeElsewhere(agent, elsewhere);
+      const codexProviderMismatch = this.codexResumeProviderMismatch(agent, error);
+      if (codexProviderMismatch) return this.startCodexAfterProviderMismatch(agent, codexProviderMismatch);
       this.deps.recordEvent("daemon.agent.oar.fallback", {
         agentId: agent.agentId,
         launchId: agent.launchId ?? undefined,
@@ -1402,6 +2000,7 @@ export class OarAgentHost {
         held_count: agent.pending.length,
         ...(error instanceof HandBack ? {} : { error_message: errorMessage(error).slice(0, 300) }),
         ...(error instanceof HandBack && /^(open|resume)_failed:/.test(reason) ? { open_failure_class: oarOpenFailureClass(error.cause) } : {}),
+        ...(error instanceof HandBack ? refusedOptionFields(error.cause) : {}),
       }, error instanceof HandBack ? "ok" : "error");
       const held = agent.pending.splice(0).map((delivery) => this.heldDelivery(delivery));
       this.agents.delete(agent.agentId);
@@ -1415,6 +2014,7 @@ export class OarAgentHost {
             ...(error.cause !== undefined ? { cause: error.cause } : {}),
             ...(error.refusal ? { refusal: error.refusal } : {}),
             ...(error.failHere ? { failHere: error.failHere } : {}),
+            ...(error.failHereReason ? { failHereReason: error.failHereReason } : {}),
           }
           : { cause: error }),
       };
@@ -1470,14 +2070,22 @@ export class OarAgentHost {
    * workspace (`UnsupportedOptionError` on `cwd`). Sessions made before
    * #14872 ran with the daemon's `$PWD`. The driver could reopen such a
    * session only in that other directory, so it is not handed back: a new
-   * session starts here. Any other open failure is handed back as before.
+   * session starts here. So does one 2.x doesn't list at all (`not_listed`:
+   * mostly a 1.x session after an upgrade, which oarOpencodeLaunch.ts offers
+   * OAR rather than refusing it). Antigravity (`newSessionOnResumeNotListed`):
+   * only when `agy` doesn't list the session (`not_listed`, a legacy driver id).
+   * Any other open failure is handed back as before.
    */
-  private resumeRefusedElsewhere(agent: HostedAgent, error: unknown): string | null {
-    if (agent.launch?.newSessionOnResumeElsewhere !== true || !(error instanceof HandBack)) return null;
-    if (error.reason !== "resume_failed:UnsupportedOptionError") return null;
-    const option = (error.cause as { option?: unknown } | undefined)?.option;
-    if (option !== "cwd") return null;
-    return agent.launch.options.resume ?? null;
+  private resumeRefusedElsewhere(agent: HostedAgent, error: unknown): { sessionId: string; reason: string | undefined } | null {
+    const launch = agent.launch;
+    if (!launch || !(error instanceof HandBack) || error.reason !== "resume_failed:UnsupportedOptionError") return null;
+    const cause = error.cause as { option?: unknown; reason?: unknown } | undefined;
+    if (cause?.option !== "cwd") return null;
+    // OAR 0.108+ `ResumeCwdError`: why the directory couldn't be confirmed.
+    const reason = typeof cause.reason === "string" ? cause.reason : undefined;
+    const allowed = launch.newSessionOnResumeElsewhere === true || (launch.newSessionOnResumeNotListed === true && reason === "not_listed");
+    const sessionId = launch.options.resume;
+    return allowed && sessionId ? { sessionId, reason } : null;
   }
 
   /**
@@ -1486,11 +2094,12 @@ export class OarAgentHost {
    * session (`runtime_host_migration`); the new session's Activity Log says
    * why, as for a Cursor CLI session left behind (not an error).
    */
-  private startAfterResumeElsewhere(agent: HostedAgent, sessionId: string): Promise<OarStartOutcome> {
+  private startAfterResumeElsewhere(agent: HostedAgent, refused: { sessionId: string; reason: string | undefined }): Promise<OarStartOutcome> {
     const { agentId } = agent;
+    const { sessionId } = refused;
     const launchId = agent.launchId ?? undefined;
-    logger.warn(`[Agent ${agentId}] ${agent.runtimeId} session ${sessionId} lives outside the agent's workspace; starting a new session`);
-    this.deps.recordEvent("daemon.agent.oar.resume_elsewhere_new_session", { agentId, launchId, runtime: agent.runtimeId });
+    logger.warn(`[Agent ${agentId}] ${agent.runtimeId} session ${sessionId} can't be resumed in the agent's workspace (${refused.reason ?? "cwd"}); starting a new session`);
+    this.deps.recordEvent("daemon.agent.oar.resume_elsewhere_new_session", { agentId, launchId, runtime: agent.runtimeId, resume_cwd_reason: refused.reason });
     this.deps.sendToServer({ type: "agent:session:invalidate", agentId, sessionId, ...(launchId ? { launchId } : {}), reason: "runtime_host_migration" });
     const carried = agent.pending.splice(0);
     this.agents.delete(agentId);
@@ -1499,7 +2108,62 @@ export class OarAgentHost {
       {
         carried,
         notBeforeMs: null,
-        sessionNotice: { kind: "system", title: "New OpenCode session", text: OPENCODE_SESSION_ELSEWHERE_TEXT },
+        sessionNotice: agent.runtimeId === "antigravity"
+          ? { kind: "system", title: "New Antigravity session", text: ANTIGRAVITY_SESSION_NOT_LISTED_TEXT }
+          : { kind: "system", title: "New OpenCode session", text: refused.reason === "not_listed" ? OPENCODE_SESSION_NOT_LISTED_TEXT : OPENCODE_SESSION_ELSEWHERE_TEXT },
+      },
+    );
+  }
+
+  /**
+   * #wg-ax:#3: Codex refuses `thread/resume` when the machine's configured
+   * model provider changed since the session was created (for example `openai`
+   * -> `custom`). Retrying the same session ID will fail on every wake, so
+   * invalidate it and start a fresh session with a visible Activity Log notice.
+   */
+  private codexResumeProviderMismatch(
+    agent: HostedAgent,
+    error: unknown,
+  ): { sessionId: string; mismatch: CodexResumeProviderMismatch } | null {
+    if (agent.runtimeId !== "codex" || !(error instanceof HandBack) || !error.reason.startsWith("resume_failed:")) return null;
+    const sessionId = agent.launch?.options.resume;
+    if (!sessionId) return null;
+    const mismatch = parseCodexResumeProviderMismatch(error.cause);
+    return mismatch ? { sessionId, mismatch } : null;
+  }
+
+  private startCodexAfterProviderMismatch(
+    agent: HostedAgent,
+    refused: { sessionId: string; mismatch: CodexResumeProviderMismatch },
+  ): Promise<OarStartOutcome> {
+    const { agentId } = agent;
+    const { sessionId, mismatch } = refused;
+    const launchId = agent.launchId ?? undefined;
+    logger.warn(
+      `[Agent ${agentId}] Codex session ${sessionId} rejected on resume due to model provider change (${mismatch.reason}${mismatch.sessionProvider ? `:${mismatch.sessionProvider}` : ""}${mismatch.currentProvider ? `->${mismatch.currentProvider}` : ""}); starting a new session`,
+    );
+    this.deps.recordEvent("daemon.agent.oar.resume_provider_mismatch_new_session", {
+      agentId,
+      launchId,
+      runtime: agent.runtimeId,
+      mismatch_reason: mismatch.reason,
+      ...(mismatch.sessionProvider ? { session_provider: mismatch.sessionProvider } : {}),
+      ...(mismatch.currentProvider ? { current_provider: mismatch.currentProvider } : {}),
+    });
+    this.lastSessions.write(agentId, agent.runtimeId, sessionId);
+    this.deps.sendToServer({ type: "agent:session:invalidate", agentId, sessionId, ...(launchId ? { launchId } : {}), reason: "provider_replay_rejected" });
+    const carried = agent.pending.splice(0);
+    this.agents.delete(agentId);
+    return this.startHosted(
+      { ...agent.request, launchId, config: { ...agent.request.config, sessionId: null } },
+      {
+        carried,
+        notBeforeMs: null,
+        sessionNotice: {
+          kind: "system",
+          title: "New Codex session",
+          text: codexResumeProviderMismatchNotice(mismatch),
+        },
       },
     );
   }
@@ -1553,6 +2217,9 @@ export class OarAgentHost {
     for (const unsubscribe of agent.unsubscribe.splice(0)) unsubscribe();
     const session = agent.session;
     agent.session = null;
+    agent.noticeHold.reset();
+    this.dropPendingModelSeen(agent, "session_changed");
+    agent.seenSeqsByTarget.clear();
     if (session) await this.disposeSession(agent, session, "abandoned_launch");
     // Only this launch's proxies: a start that came after a stop may hold its own.
     if (agent.proxyLaunch) cleanupLaunchProxiesForLaunch(agent.agentId, agent.proxyLaunch.launchId);
@@ -1669,6 +2336,9 @@ export class OarAgentHost {
     do {
       request = agent.request;
       runtimeConfig = this.withoutSessionStartedOnOtherSpec(agent, withLocalRuntimeContext(request.config, agentId, workingDirectory));
+      // #wg-ax:#3: an explicit session reset (or spec drop) clears any
+      // failed-recycle hold recorded for an earlier session.
+      if (!runtimeConfig.sessionId) this.wakeRecycleFailures.clear(agentId);
       // RFC 070: at a cold wake with a large prior context, retire the session.
       wakeRecycle = await planWakeSessionRecycle({
         config: runtimeConfig,
@@ -1676,10 +2346,12 @@ export class OarAgentHost {
         nowMs: this.now(),
         ...(this.deps.runtimeSessionHomeDir ? { homeDir: this.deps.runtimeSessionHomeDir } : {}),
         // #wg-ax task #3, #proj-runtime:#54: facts and panel from this host's
-        // session summary, for Codex and Grok while the Server's
-        // `wake_recycle_oar` is on (summaryFactsRuntimesFor).
+        // session summary while the Server's `wake_recycle_oar` is on, when
+        // OAR declared the context size for the installation that wrote it
+        // (summarySuppliesResumeFacts).
         readSessionSummary: () => this.sessionSummaries.read(agentId),
         warmStop,
+        priorRecycleFailed: this.wakeRecycleFailures.hasFailed(agentId, runtimeConfig.sessionId),
       });
       this.checkpoint(agent);
     } while (agent.request !== request);
@@ -1715,6 +2387,10 @@ export class OarAgentHost {
     // Reconciler step 8a: the last session rule, from the plan's facts.
     const wakeChoice = chooseSession({ sessionId: runtimeConfig.sessionId, wakeRecycle });
     if (wakeChoice.kind === "new" && wakeChoice.reason === "wake_recycle") {
+      // #wg-ax:#3: keep the prior session id until the recycled replacement
+      // reaches startup readiness (sendRuntimeReady); if open/first-input or
+      // early exit fails before readiness, fall back to resuming this session.
+      agent.recycledFromSessionId = runtimeConfig.sessionId || null;
       runtimeConfig = { ...runtimeConfig, sessionId: null };
       const applied = describeAppliedWakeRecycle(agentId, wakeChoice.recycle);
       const startTriggerKind = messageTurnTriggerAttrs(wakeMessage ? [wakeMessage] : undefined, this.now(), () => undefined).trigger_kind;
@@ -1733,7 +2409,12 @@ export class OarAgentHost {
     const isResume = Boolean(runtimeConfig.sessionId) || wakeRecycle.action === "recycle";
     const standingPrompt = driver.buildSystemPrompt(runtimeConfig, agentId);
     const stableStandingPrompt = String(driver.buildSystemPrompt(stableStandingPromptConfig(runtimeConfig), agentId));
-    const nativeStandingPrompt = Boolean(driver.supportsNativeStandingPrompt);
+    // On this host the launch decides the carrier: an option the runtime
+    // accepted at open is in effect (OAR contract), so a runtime whose OAR
+    // launch carries the standing prompt has a native one here even when its
+    // legacy driver has none. A refusal at open hands the start back to the
+    // legacy host, which puts it in the first input.
+    const nativeStandingPrompt = Boolean(driver.supportsNativeStandingPrompt) || OAR_NATIVE_STANDING_PROMPT_RUNTIMES.has(agent.runtimeId);
     const promptHash = standingPromptHash(stableStandingPrompt, { nativeStandingPrompt });
     const standingPromptPlan = planStandingPromptRefresh({
       ledger: this.standingPromptLedger,
@@ -1750,11 +2431,16 @@ export class OarAgentHost {
     // The first input, from the legacy host's own ladder. The deliveries it
     // names are taken in the same step, so nothing arriving later is counted
     // as seen by the model.
+    // Read non-destructively here and delete only in `commit()`, so a
+    // pre-commit failure or `OarLaunchDeclined` handback to the legacy host
+    // preserves the interrupted-turn handoff note.
+    const interruptedTurn = this.interruptedTurns.read(agentId);
     const arrived = agent.pending.filter((delivery) => !delivery.rawInput && !delivery.contexts.some((context) => context.transient));
     const planFirstInput = (withMessages: boolean) => planStartupInput({
       driver,
       runtimeConfig,
       isResume,
+      nativeStandingPrompt,
       standingPromptReachesSession: !runtimeConfig.sessionId || driver.standingPromptRefreshesOnResume === true,
       standingPromptInFirstInput,
       // Without its messages (one input too long with them): they follow as deliveries.
@@ -1762,27 +2448,68 @@ export class OarAgentHost {
       wakeMessageTransient: request.wakeMessageTransient,
       resumePrompt: request.resumePrompt,
       unreadSummary: request.unreadSummary,
+      openTasks: request.openTasks,
       startingInboxMessages: withMessages ? arrived.map((delivery) => delivery.message) : [],
+      ...(interruptedTurn ? { continueAfterCatchup: true } : {}),
       projectThreadJoinContexts: this.projector(agentId),
     });
     let startup = planFirstInput(true);
     const carriedMessages = new Set<AgentMessage>(startup.firstInputMessages);
     agent.carried = agent.pending.filter((delivery) => carriedMessages.has(delivery.message));
     agent.pending = agent.pending.filter((delivery) => !carriedMessages.has(delivery.message));
-    const memoryBlockConfig = !runtimeConfig.sessionId && wakeRecycle.action !== "recycle" ? resolveStartupMemoryBlockConfig(runtimeConfig.envVars) : null;
-    const memoryBlock = memoryBlockConfig?.enabled
-      ? await buildStartupMemoryBlock({ workspacePath: workingDirectory, budgetTokens: memoryBlockConfig.budgetTokens })
+    const constructedInit = !runtimeConfig.sessionId && wakeRecycle.action !== "recycle"
+      ? await buildFreshConstructedInit({
+          config: runtimeConfig,
+          workspacePath: workingDirectory,
+          ...(this.deps.runtimeSessionHomeDir ? { homeDir: this.deps.runtimeSessionHomeDir } : {}),
+          priorSession: this.lastSessions.read(agentId),
+          readSessionSummary: () => this.sessionSummaries.read(agentId),
+        })
       : null;
     this.checkpoint(agent);
-    // The ladder's input, then the briefing, MEMORY.md and the standing prompt.
+    // The ladder's input, then the briefing, constructed initial context, interrupted-turn note, and standing prompt.
     const firstInputOf = (plan: typeof startup) => {
       let { prompt, promptSource } = plan;
-      ({ prompt, promptSource } = applyWakeRecycleBriefing(wakeRecycle, prompt, promptSource));
-      if (memoryBlock) ({ prompt, promptSource } = applyStartupMemoryBlock(memoryBlock, prompt, promptSource));
+      if (wakeRecycle.action === "recycle") {
+        const promptWithInterrupt = applyInterruptedTurnNote(interruptedTurn, prompt, {
+          continuity: "fresh_with_context",
+          promptSource,
+        });
+        ({ prompt, promptSource } = applyWakeRecycleBriefing(wakeRecycle, promptWithInterrupt, promptSource));
+      } else if (constructedInit) {
+        ({ prompt, promptSource } = applyFreshConstructedInit(constructedInit, prompt, promptSource, interruptedTurn));
+      } else {
+        prompt = applyInterruptedTurnNote(interruptedTurn, prompt, {
+          continuity: "resumed",
+          promptSource,
+        });
+      }
       prompt = applyFreshSessionStandingPrompt(standingPromptInFirstInput, standingPrompt, prompt);
       return applyStandingPromptUpdate(standingPromptPlan, stableStandingPrompt, prompt, promptSource);
     };
     let { prompt, promptSource } = firstInputOf(startup);
+    if (constructedInit?.hasPanel) {
+      this.deps.recordEvent("daemon.agent.constructed_init", {
+        agentId,
+        launchId: agent.launchId ?? undefined,
+        runtime: runtimeConfig.runtime ?? "claude",
+        panel_source: constructedInit.panelSource,
+        has_memory: constructedInit.hasMemory,
+        ...(interruptedTurn ? { interrupted_turn: true } : {}),
+        prompt_source: promptSource,
+        host: "oar",
+      });
+      logger.info(`[Agent ${agentId}] Constructed initial context injected for fresh session (panel=${constructedInit.panelSource}, memory=${constructedInit.hasMemory}, interrupted=${Boolean(interruptedTurn)}, source=${promptSource})`);
+    } else if (interruptedTurn) {
+      this.deps.recordEvent("daemon.agent.interrupted_turn_resumed", {
+        agentId,
+        launchId: agent.launchId ?? undefined,
+        runtime: runtimeConfig.runtime ?? "claude",
+        drift: interruptedTurn.drift.join(","),
+        fresh_session: !runtimeConfig.sessionId || wakeRecycle.action === "recycle",
+        host: "oar",
+      });
+    }
     // task #13: the ledger records the current prompt only for a session it reached.
     const standingPromptBinding = standingPromptSessionBinding({
       nativeStandingPrompt,
@@ -1815,13 +2542,18 @@ export class OarAgentHost {
       agentCredentialProxyMessageCommitted: (input) => this.deps.contextView?.messageCommitted(agentId, input),
       // The turn span's Raft sends (`runtime_raft_messages_sent_count`), as the legacy host's coordinator hears them.
       agentCredentialProxySendOutcome: (outcome) => agent.turnTrace.noteSendOutcome(outcome.state),
+      // Task #triage:#399: the agent read its inbox: the outstanding notice no longer holds.
+      agentCredentialProxyInboxRead: () => this.onAgentInboxRead(agent),
+      // Focus: the bodies reported as seen ride on the agent's sends (seenExactSeqs).
+      agentCredentialProxyExactSeenSeqs: (target) => [...(agent.seenSeqsByTarget.get(canonicalVisibleTarget(target)) ?? [])].sort((a, b) => a - b),
       // The live flag, as this host's wake-up notice reads it.
       agentCredentialProxyInboxItems: () => inboxUpdateRenderOptions(agent.serverFeatures ?? agent.request.config).inboxItems === true,
       cliTransportTraceDir: this.cliTransportTraceDir,
       tracer: this.tracer,
     };
     // RFC 072: this spawn's context id, planned with the driver's compaction declaration.
-    ctx.contextGeneration = planSpawnContextGeneration(spawnCliTransportDir(ctx), {
+    agent.contextGeneration = { transportDir: spawnCliTransportDir(ctx), resumeSessionId: effectiveConfig.sessionId ?? null, passiveAx: configPassiveAx(effectiveConfig) };
+    ctx.contextGeneration = planSpawnContextGeneration(agent.contextGeneration.transportDir, {
       compaction: driver.session.compaction,
       resumeSessionId: effectiveConfig.sessionId,
     });
@@ -1838,6 +2570,11 @@ export class OarAgentHost {
       this.deps.platform,
     );
     agent.launch = launch;
+    agent.sessionCapabilities = await this.sessionCapabilities(launch).catch((error: unknown) => {
+      // Unknown is off: no turn-end compaction, no summary resume facts.
+      logger.warn(`[Agent ${agentId}] OAR session capabilities unreadable for ${launch.runtimeId}: ${errorMessage(error)}`);
+      return null;
+    });
     this.checkpoint(agent);
     // task #365: a start claimed against an earlier connection gets no process.
     if (agent.launchId && this.deps.isStaleClaim(agent.request.claimedConnectionEpochId)) throw new HandBack("stale_dispatch");
@@ -1871,12 +2608,35 @@ export class OarAgentHost {
       // tries again (no invalidate). "Not found" starts a new SDK session
       // (`cursorSdkResumeFailed`).
       const keepSdkSession = agent.runtimeId === "cursor" && isCursorSdkSessionId(resume) && errorName(error) !== "SessionNotFoundError";
+      // #oar-raft:#25: the agent's model is gone from the runtime's account
+      // (OAR `ModelConfirmationError`, Antigravity). The legacy driver passes
+      // the same model and fails the same way, and nothing picks another
+      // model for the person: the start fails here, as an unusable model,
+      // naming the models the runtime offers now.
+      const modelGone = modelConfirmationFailure(agent.runtimeId, launch.options.model, error);
+      const tierRefused = serviceTierConfirmationFailure(agent.runtimeId, launch.options.serviceTier, error);
       throw new HandBack(`${resume ? "resume_failed" : "open_failed"}:${errorName(error)}`, undefined, {
         cause: error,
         ...(keepSdkSession ? { failHere: `Cursor could not resume this agent's session (${errorName(error)}). The session is kept; retry the agent.` } : {}),
+        ...(modelGone ? { failHere: modelGone, failHereReason: "model_unsupported" } : {}),
+        ...(tierRefused ? { failHere: tierRefused } : {}),
       });
     }
     agent.session = session;
+    // RFC 072 §7.2.3, the legacy host's `session_init`: the published context
+    // id belongs to the session OAR opened; another session than the one this
+    // launch planned to resume gets a new id.
+    bindContextGenerationToSession(agent.contextGeneration.transportDir, {
+      runtime: agent.runtimeId,
+      compaction: driver.session.compaction,
+      sessionId: session.id,
+      expectedSessionId: agent.contextGeneration.resumeSessionId,
+    });
+    // Task #triage:#399: a new session has no outstanding notice.
+    agent.noticeHold.reset();
+    // Focus: what an earlier session took is not shown to have reached this one.
+    this.dropPendingModelSeen(agent, "session_changed");
+    agent.seenSeqsByTarget.clear();
     // Before the first input: OAR's stall observer reads live records only
     // (no replay, unlike the readers `observe` subscribes at the commit), and
     // the first input's turn starts before the commit. Subscribed later, it
@@ -1928,9 +2688,10 @@ export class OarAgentHost {
         launchId: agent.launchId ?? undefined,
         source: promptSource,
         carried_deliveries: agent.carried.length,
+        ...focusedBodyTraceAttrs(startup.focusedStartupBodies, startup.focusedStartupRows),
         ...this.holdTraceAttrs(hold),
       });
-      this.commit(agent, session, commitPromptHash, startup.renderedStartupThreadContextMessages, startup.startupBodyMessages, acceptedMessages, firstTurn, String(prompt));
+      this.commit(agent, session, commitPromptHash, startup.renderedStartupThreadContextMessages, startup.startupBodyMessages, startup.focusedStartupBodies, acceptedMessages, firstTurn, String(prompt));
       return;
     }
     const serverContext = this.pendingServerContext(agentId, session.id);
@@ -1941,6 +2702,8 @@ export class OarAgentHost {
         launchId: agent.launchId ?? undefined,
         source: promptSource,
         carried_deliveries: agent.carried.length,
+        // The rows are counted on the first input the runtime took (a refused one is planned again).
+        ...focusedBodyTraceAttrs(startup.focusedStartupBodies, outcome.kind === "accepted" ? startup.focusedStartupRows : []),
         outcome: outcome.kind,
         ...(outcome.kind === "rejected" ? { code: outcome.code, ...(outcome.failure ? { oar_failure: outcome.failure } : {}) } : {}),
         ...(withoutMessages ? { without_messages: true } : {}),
@@ -1983,7 +2746,7 @@ export class OarAgentHost {
     if (outcome.kind === "rejected") throw new HandBack(`first_input_rejected:${outcome.code}`);
     serverContext?.writtenTo.add(session.id);
 
-    this.commit(agent, session, commitPromptHash, startup.renderedStartupThreadContextMessages, startup.startupBodyMessages, acceptedMessages, firstTurn);
+    this.commit(agent, session, commitPromptHash, startup.renderedStartupThreadContextMessages, startup.startupBodyMessages, startup.focusedStartupBodies, acceptedMessages, firstTurn);
   }
 
   /**
@@ -1999,22 +2762,28 @@ export class OarAgentHost {
     promptHash: string,
     renderedThreadContext: readonly AgentMessage[],
     bodies: readonly AgentMessage[],
+    /** Focus: the messages of `bodies` the first input shows in full because they are focused. */
+    focusedBodies: readonly AgentMessage[],
     acceptedMessages: readonly AgentMessage[],
     firstTurn: OarTurnStart,
     heldFirstInput?: string,
   ): void {
     const { agentId } = agent;
     agent.committed = true;
+    this.interruptedTurns.delete(agentId);
     agent.birthLaunchId = agent.launchId;
     this.sendProcessSpawned(agent);
     this.sendStatus(agent, "active");
     // The old session is forgotten before the new one is reported.
     this.reportCursorSessionMigrated(agent);
     this.reportSession(agent, session.id);
-    const hosted = this.hostedSession(agentId);
-    if (hosted) this.deps.sendRuntimeProfileReport?.(agentId, hosted, "session_init");
-    this.reportContextViewSession(agent);
-    const firstInputTaken = () => {
+    if (!agent.recycledFromSessionId) {
+      const hosted = this.hostedSession(agentId);
+      if (hosted) this.deps.sendRuntimeProfileReport?.(agentId, hosted, "session_init");
+      this.reportContextViewSession(agent);
+    }
+    // `taken`: how a held first input landed; null for one taken before the commit (a prompt whose turn `observe` replays below).
+    const firstInputTaken = (taken: InputTaken | null) => {
       this.recordStandingPrompt(agentId, session.id, promptHash);
       this.noteRendered(agentId, renderedThreadContext);
       const thirdPartyEventIds = thirdPartyEventIdsFromEvents(bodies);
@@ -2022,14 +2791,21 @@ export class OarAgentHost {
       const ordinary = acceptedMessages.filter((message) => !runtimeProfileNotificationFromMessage(message));
       if (ordinary.length > 0) this.publishMessageReceived(agent, ordinary, true);
       for (const delivery of agent.carried.splice(0)) this.accept(agent, delivery);
+      // Focus: the first input opens a turn; its focused bodies are reported
+      // at that turn's first model output. Registered before `observe`
+      // replays the turn, or, for a held first input, once it landed as a
+      // prompt (one that was steered or queued instead opened no turn of its own).
+      if (taken === null) this.noteModelSeenPending(agent, session, focusedBodies);
+      else this.notePromptedFocusBodies(agent, session, focusedBodies, taken);
     };
     if (heldFirstInput === undefined) {
       // Its turn started before the commit; `observe` replays that `turn_started`.
       agent.nextTurn = firstTurn;
       this.publish(agent, "working", "Starting…", "starting");
-      firstInputTaken();
+      firstInputTaken(null);
     } else {
       // The session is open and idle: ready, with nothing running yet.
+      this.retireRecycledPriorSession(agent);
       this.sendRuntimeReady(agent, false);
       this.publish(agent, "online", "Idle", "idle");
       const message: AgentMessage = {
@@ -2129,7 +2905,7 @@ export class OarAgentHost {
     this.sendStatus(agent, "active");
     if (agent.runtimeReadySent) this.sendRuntimeReady(agent, true);
     if (agent.session) this.reportSession(agent, agent.session.id);
-    this.reportContextViewSession(agent);
+    if (!agent.recycledFromSessionId) this.reportContextViewSession(agent);
     if (request.wakeMessage) void this.deliverMessage(agentId, request.wakeMessage, { transient: request.wakeMessageTransient });
     // Reconciler step 7: the rebound config is the spec the session should
     // run with. Decided after its wake is held, which keeps it busy: the
@@ -2141,17 +2917,96 @@ export class OarAgentHost {
   /**
    * Only the fact (row C15): held deliveries make the stall a question for
    * reconcile (reconciler step 9), at its stall deadline.
+   *
+   * A silence while a tool call is still open is that tool running (a long
+   * build, a test run, a foreground `sleep`), not a stalled runtime: no error,
+   * the activity stays on the tool, as the legacy host does for a runtime that
+   * is silent but alive (#oar-raft:#22). OAR's last record (`frame:tool_call_started`)
+   * says so even when the host routed the tool to a sub-agent step; the host's
+   * own open calls cover a tool start followed by other records.
    */
   private observeStalls(agent: HostedAgent, session: Session, observe: OarObserve): void {
     agent.unsubscribe.push(observe.observeStalls(session, {
       stallAfterMs: this.stallThresholds.stallMs,
       onStall: (info) => {
-        if (this.isCurrent(agent) && agent.session === session) this.publish(agent, "error", `No runtime output for ${Math.round(info.silentForMs / 60_000)} min`, "runtime_stalled");
+        if (!this.isCurrent(agent) || agent.session !== session) return;
+        if (agent.openToolCalls.size > 0 || info.lastRecordKind === "frame:tool_call_started") {
+          this.deps.recordEvent("daemon.runtime.stall.silent_tool", {
+            ...this.stallTraceAttrs(agent),
+            silent_for_ms_bucket: bucketMs(info.silentForMs),
+            outstanding_tool_uses: agent.openToolCalls.size,
+            last_record_kind: info.lastRecordKind,
+          });
+          return;
+        }
+        this.publish(agent, "error", `No runtime output for ${Math.round(info.silentForMs / 60_000)} min`, "runtime_stalled");
       },
+    }));
+    agent.unsubscribe.push(observe.observeStalls(session, {
+      stallAfterMs: this.silentTurnEndMs,
+      onStall: (info) => { void this.onSilentTurnLimit(agent, session, info); },
     }));
   }
 
+  /**
+   * Task #triage:#496: a turn silent for `silentTurnEndMs` (60 min) with no
+   * tool open, no sub-agent or background task running, nothing held and no
+   * delivery waiting is ended (OAR's abort; the session stays), and the
+   * person sees why. Waiting deliveries are reconciler step 9's (replaced and
+   * resumed with them). With the Server's `silent_turn_end` off it is only
+   * recorded (`mode: would_end`), so the count comes from every Computer
+   * before it is on everywhere.
+   */
+  private async onSilentTurnLimit(agent: HostedAgent, session: Session, info: { silentForMs: number; lastRecordKind: string }): Promise<void> {
+    if (!this.isCurrent(agent) || agent.session !== session || agent.stopping) return;
+    const status = session.status().value;
+    if (status.kind !== "running" || (status.stop?.pendingAbortIds.length ?? 0) > 0) return;
+    const skip = agent.openToolCalls.size > 0 || info.lastRecordKind === "frame:tool_call_started"
+      ? "tool_open"
+      : agent.taskRows.runningCount(Number.POSITIVE_INFINITY) > 0
+        ? "subagents_running"
+        : agent.pending.length > 0 || agent.carried.length > 0
+          ? "deliveries_waiting"
+          : this.stalledWithWorkDeliveryHold(agent) !== null || agent.steerHold.compacting || agent.turnEndCompaction.inFlight
+            ? "held"
+            : null;
+    if (skip) return;
+    const features = agent.serverFeatures ?? pickAgentServerFeatures(this.agentConfig(agent));
+    const enabled = features.silentTurnEnd === true;
+    const attrs = {
+      ...this.stallTraceAttrs(agent),
+      silent_for_ms_bucket: bucketMs(info.silentForMs),
+      last_record_kind: info.lastRecordKind,
+      mode: enabled ? "end" : "would_end",
+    };
+    if (!enabled) {
+      this.deps.recordEvent(SILENT_TURN_ENDED_EVENT, { ...attrs, outcome: "would_end" });
+      return;
+    }
+    agent.abortRequested = true;
+    agent.silentTurnEnding = true;
+    const aborted = await session.abort();
+    if (aborted.kind === "accepted") {
+      this.deps.recordEvent(SILENT_TURN_ENDED_EVENT, { ...attrs, outcome: "ended" });
+      return;
+    }
+    agent.abortRequested = false;
+    agent.silentTurnEnding = false;
+    // The turn ended or was stopped meanwhile. A run the runtime starts on its
+    // own (Antigravity past `end_turn`) never reaches here since OAR 0.121: it
+    // is no turn, the status stays idle (outsideTurnContent).
+    this.deps.recordEvent(SILENT_TURN_ENDED_EVENT, {
+      ...attrs,
+      outcome: "abort_rejected",
+      ...(aborted.kind === "rejected" ? { code: aborted.code } : {}),
+    }, "error");
+  }
+
   private observe(agent: HostedAgent, session: Session): void {
+    // #wg-ax:#3: never overwrite lastSessions with an unready recycled session.
+    if (!agent.recycledFromSessionId) {
+      this.lastSessions.write(agent.agentId, agent.startedSpec?.runtime ?? agent.runtimeId, session.id);
+    }
     // Replays everything since the session opened (the first input's turn
     // started before the commit), then continues live.
     const summary = new SessionSummaryRecorder(
@@ -2161,9 +3016,16 @@ export class OarAgentHost {
       session.id,
       path.join(this.deps.dataDir, agent.agentId),
       () => this.now(),
+      agent.sessionCapabilities?.contextUsage ?? null,
     );
     agent.summary = summary;
     agent.unsubscribe.push(session.rawEvents((record) => summary.observe(record), { sessionId: session.id, afterSeq: -1 }));
+    // Subscribed before `session.events`: every root `abort` request/accepted
+    // response and `turn_ended` frame is folded before `onTurnEnded` runs, live
+    // and on `afterSeq: -1` replay (#oar-raft:#45).
+    const turnAborts = new OarTurnAbortTracker(session.id);
+    agent.turnAborts = turnAborts;
+    agent.unsubscribe.push(session.rawEvents((record) => turnAborts.observe(record), { sessionId: session.id, afterSeq: -1 }));
     // Subscribed before the events: a record's frame is read before its events arrive (oarCodexActivity.ts).
     const codex = agent.runtimeId === "codex" ? new CodexActivityReader(session.id) : null;
     agent.codexActivity = codex;
@@ -2232,10 +3094,23 @@ export class OarAgentHost {
       this.publishSubagentStep(agent, event);
       return;
     }
-    if (!agent.runtimeReadySent && event.kind !== "turn_started" && event.kind !== "turn_active" && event.kind !== "user_message") {
+    if (!agent.runtimeReadySent && event.kind !== "turn_started" && event.kind !== "turn_active" && event.kind !== "user_message" && event.kind !== "exited") {
       this.sendRuntimeReady(agent, false);
     }
+    // #wg-ax:#3: only retire a wake-recycled prior session once the new
+    // session produces real model/turn progress (not admission metadata like
+    // `input_handled`, `model`, `turn_started`, or a zero-output failure/exit).
+    const recycledProgress = (event.kind === "text_delta" && Boolean(event.text))
+      || event.kind === "reasoning"
+      || event.kind === "tool_call_started"
+      || event.kind === "tool_call_ended"
+      || (event.kind === "turn_ended" && event.outcome.kind === "completed" && (agent.turn.textEvents + agent.turn.toolCalls > 0));
+    if (recycledProgress) {
+      this.retireRecycledPriorSession(agent);
+    }
     if (event.kind === "turn_started") agent.turnStartedAtMs = event.receivedAt;
+    // Focus: the runtime discarded an input it had accepted; a steer with focused bodies is handed back.
+    if (event.kind === "input_dropped" && event.inputId) this.onInputDropped(agent, session, event.inputId);
     if (event.kind === "text_delta" && event.text) agent.turn.textEvents += 1;
     if (event.kind === "tool_call_started") agent.turn.toolCalls += 1;
     if (event.kind === "reasoning") agent.turn.thinkingEvents += 1;
@@ -2243,8 +3118,13 @@ export class OarAgentHost {
     // Reconciler step 9: open tool calls, and model output or a turn end ends
     // the stalled-replacement streak (as the legacy host's text, thinking and
     // tool calls do).
-    if (event.kind === "turn_started" || event.kind === "turn_ended") agent.openToolCalls.clear();
-    if (event.kind === "tool_call_started") agent.openToolCalls.add(event.callId);
+    // Cleared when the turn really ends: OAR turns every recorded prompt
+    // request into a turn_started, a rejected (busy) one too, which must not
+    // forget a tool that is still running (#oar-raft:#22, prompt-first OpenCode).
+    if (event.kind === "turn_ended" || event.kind === "exited") agent.openToolCalls.clear();
+    if (event.kind === "tool_call_started" && !agent.openToolCalls.has(event.callId)) {
+      agent.openToolCalls.set(event.callId, { name: event.tool, startedAtMs: this.now() });
+    }
     if (event.kind === "tool_call_ended") agent.openToolCalls.delete(event.callId);
     if ((event.kind === "text_delta" && event.text) || event.kind === "reasoning" || event.kind === "tool_call_started" || event.kind === "turn_ended") {
       this.stalledReplacements.delete(agent.agentId);
@@ -2252,11 +3132,16 @@ export class OarAgentHost {
     // Reconciler step 10b: the exit's facts. A turn start is the legacy
     // host's delivery: it clears the live runtime error.
     if (event.kind === "turn_started") {
+      agent.turnStarts += 1;
       agent.turnOpen = true;
       agent.turnCutByExit = false;
       agent.lastFailure = null;
     }
-    if ((event.kind === "text_delta" && event.text) || event.kind === "reasoning" || event.kind === "tool_call_started") this.noteModelOutput(agent, event.kind);
+    if ((event.kind === "text_delta" && event.text) || event.kind === "reasoning" || event.kind === "tool_call_started") {
+      this.noteModelOutput(agent, event.kind);
+      // Focus: the model answers the input that opened this turn, so it took the bodies in it.
+      this.flushPendingModelSeen(agent, session);
+    }
     if (event.kind === "retry") {
       this.deps.recordEvent("daemon.agent.provider_reconnect", {
         agentId: agent.agentId,
@@ -2268,20 +3153,69 @@ export class OarAgentHost {
       });
     }
     agent.codexTraces?.observeEvent(event.kind);
-    if (event.kind === "compaction_started") agent.steerHold.compacting = true;
-    if (event.kind === "compaction_ended") agent.steerHold.compacting = false;
+    if (event.kind === "compaction_started") {
+      agent.steerHold.compacting = true;
+      // Focus: what the model was shown before a compaction no longer vouches for a send.
+      agent.seenSeqsByTarget.clear();
+      // RFC 072 §7.2.3: the context may be gone from here on, so the new
+      // context id is issued at start; a later resume of this session must not
+      // get the pre-compaction id (a failed write forgets the session instead).
+      if (agent.contextGeneration) {
+        const contextId = writeContextGeneration(agent.contextGeneration.transportDir, { reason: "compaction", runtime: agent.runtimeId, compaction: agent.driver.session.compaction, passiveAx: agent.contextGeneration.passiveAx });
+        rememberSessionContext(agent.contextGeneration.transportDir, session.id, contextId);
+      }
+    }
+    if (event.kind === "compaction_ended") {
+      agent.steerHold.compacting = false;
+      this.releaseNoticeHold(agent, "compaction");
+      if (agent.driver.session.compactionFailure === "sticks_to_session") {
+        if (event.outcome === "completed") {
+          try {
+            this.compactionFailureLedger.clear(agent.agentId);
+          } catch (error) {
+            logger.warn(`[Agent ${agent.agentId}] compaction failure ledger not cleared: ${errorMessage(error)}`);
+          }
+        } else if (event.outcome === "failed") {
+          const activeModel = (agent.runtimeConfig ?? agent.request.config).model ?? null;
+          try {
+            const count = this.compactionFailureLedger.recordFailure(agent.agentId, session.id, activeModel);
+            this.deps.recordEvent("daemon.agent.compaction.terminal_failure_counted", {
+              agentId: agent.agentId,
+              launchId: agent.launchId ?? undefined,
+              runtime: agent.runtimeId,
+              model: activeModel ?? undefined,
+              consecutive_failures: count,
+              threshold: SESSION_NEEDS_RESET_THRESHOLD,
+              needs_reset: count >= SESSION_NEEDS_RESET_THRESHOLD,
+              host: "oar",
+            });
+          } catch (error) {
+            logger.warn(`[Agent ${agent.agentId}] compaction failure not recorded: ${errorMessage(error)}`);
+          }
+        }
+      }
+    }
     // A held delivery steers at the next tool start or compaction end, not
     // only at the turn end; not while it would only be held again.
-    if ((event.kind === "tool_call_started" || event.kind === "compaction_ended") && agent.pending.length > 0 && agent.launch?.busyDelivery === "now" && !this.steerHeldReason(agent)) {
+    if ((event.kind === "tool_call_started" || event.kind === "compaction_ended") && agent.pending.length > 0 && launchSteers(agent, session) && !this.steerHeldReason(agent) && !this.noticeHoldCovers(agent, session, agent.pending)) {
       void this.flushPending(agent, session);
     }
     const facts = agent.activity?.facts(event) ?? [];
     this.traceTurnEvent(agent, session, event, oarTraceCounterKinds(facts));
-    for (const fact of facts) this.publish(agent, fact.activityKind, fact.detail, fact.detailKind, fact.entries);
+    if (event.kind === "turn_active") agent.nativeRunOpen = true;
+    const inRun = agent.turnOpen || agent.nativeRunOpen || agent.turnEndCompaction.inFlight !== null;
+    if (outsideTurnContent(event, inRun)) {
+      // No turn will end it: a working display goes back to idle (a message now is safe, the
+      // runtime takes it into its run); an error or a notice shown stays.
+      if ((agent.last.activityKind === "working" || agent.last.activityKind === "thinking") && !agent.stopping) this.publish(agent, "online", "Idle", "idle");
+    } else {
+      for (const fact of facts) this.publish(agent, fact.activityKind, fact.detail, fact.detailKind, fact.entries);
+    }
     // Progress with deliveries waiting and no deadline armed (the last
     // decision found nothing to wait for: an open tool, a hold, no turn): the
     // earliest it could be stalled is the stall threshold from now.
     if (agent.pending.length > 0 && agent.stallDeadline === null) this.armStallDeadline(agent, session, this.stallThresholds.stallMs);
+    if (event.kind === "turn_ended" || event.kind === "exited") agent.nativeRunOpen = false;
     if (event.kind === "turn_ended") this.onTurnEnded(agent, session, event.outcome, event.seq);
     if (event.kind === "exited") this.onExited(agent, session, event.code);
   }
@@ -2425,12 +3359,15 @@ export class OarAgentHost {
    * waits for the exit (`onExited`), whose outcome it takes, as on the legacy
    * host; a release ends it if no exit comes.
    */
-  private endTurnTrace(agent: HostedAgent, outcome: TurnOutcome, seq: number): void {
+  private endTurnTrace(agent: HostedAgent, outcome: TurnOutcome, seq: number, nativeOutcomeKind: TurnOutcome["kind"] = outcome.kind): void {
     const trace = agent.turnTrace;
     // The turn's own token counts go on its summary (agent usage,
     // #proj-o11y:42f2af5c), as on the legacy host.
     this.turnSummaries.noteTokens(agent.agentId, activityTurnTokensFrom(trace.runtimeTraceCounters.tokens, (agent.runtimeConfig ?? agent.request.config).model));
-    trace.event("runtime.turn.completed", { turn_outcome: outcome.kind });
+    trace.event("runtime.turn.completed", {
+      turn_outcome: nativeOutcomeKind,
+      ...(nativeOutcomeKind !== outcome.kind ? { host_aborted: true } : {}),
+    });
     if (agent.turnCutByExit) {
       trace.awaitExit();
       return;
@@ -2475,33 +3412,41 @@ export class OarAgentHost {
     // ends the crash streaks (the legacy host's turn end with no runtime
     // error). A completed turn with no output is not progress: D6 counts it.
     agent.turnOpen = false;
-    agent.turnCutByExit = (outcome.kind === "failed" && outcome.failure === "runtime_exited") || (outcome.kind === "aborted" && !agent.abortRequested);
+    // OAR keeps the runtime's own turn outcome on `turn_ended` (OpenCode 1.x
+    // answers cancel with `end_turn` -> `completed`). When OAR's record stream
+    // already holds an accepted host `abort` before this `turn_ended`, treat
+    // that completed end as host-aborted (#oar-raft:#45).
+    const hostAbortedTurn = agent.turnAborts?.consumeAbortedTurnEnd(seq) ?? false;
+    const effectiveOutcome: TurnOutcome = outcome.kind === "completed" && hostAbortedTurn ? { kind: "aborted" } : outcome;
+    agent.turnCutByExit = (effectiveOutcome.kind === "failed" && effectiveOutcome.failure === "runtime_exited") || (effectiveOutcome.kind === "aborted" && !agent.abortRequested && !hostAbortedTurn);
     agent.abortRequested = false;
     // The turn that just ended had any waiting sub-agent results in its input.
-    agent.subagentWake = { resultUnread: false, lastTurnAborted: outcome.kind === "aborted" };
-    if (outcome.kind === "completed" && agent.turn.textEvents + agent.turn.toolCalls > 0) {
+    agent.subagentWake = { resultUnread: false, lastTurnAborted: effectiveOutcome.kind === "aborted" };
+    if (effectiveOutcome.kind === "completed" && agent.turn.textEvents + agent.turn.toolCalls > 0) {
       this.endExitStreaks(agent, "runtime_progress:turn_end");
       // Reconciler step 12: a turn of the session completed; it fits.
       this.exitStreaks.sticky.endSessionReset(agent.agentId);
     }
     let turnEnded: AgentTurnEndedOutcome;
     let terminal = false;
-    if (outcome.kind === "failed") {
+    if (effectiveOutcome.kind === "failed") {
       agent.turn.runtimeErrors += 1;
       turnEnded = "failed";
       // Ended before the failure is acted on: that may end the session.
-      this.endTurnTrace(agent, outcome, seq);
-      terminal = this.onFailedTurn(agent, outcome);
+      this.endTurnTrace(agent, effectiveOutcome, seq, outcome.kind);
+      terminal = this.onFailedTurn(agent, effectiveOutcome);
     } else {
-      turnEnded = outcome.kind === "aborted" ? "interrupted" : "completed";
-      const blank = outcome.kind === "completed" ? agent.codexActivity?.blankFinalAnswer() : null;
+      turnEnded = effectiveOutcome.kind === "aborted" ? "interrupted" : "completed";
+      const blank = effectiveOutcome.kind === "completed" ? agent.codexActivity?.blankFinalAnswer() : null;
       if (blank) this.publishDiagnostic(agent, blank);
-      if (outcome.kind === "completed") this.recordCommunicationGap(agent);
-      this.endTurnTrace(agent, outcome, seq);
-      this.publish(agent, "online", "Idle", "idle");
+      if (effectiveOutcome.kind === "completed") this.recordCommunicationGap(agent);
+      this.endTurnTrace(agent, effectiveOutcome, seq, outcome.kind);
+      if (effectiveOutcome.kind === "aborted" && agent.silentTurnEnding) this.publish(agent, "error", silentTurnEndedDetail(this.silentTurnEndMs), "runtime_stalled");
+      else this.publish(agent, "online", "Idle", "idle");
     }
+    agent.silentTurnEnding = false;
     // RFC 071 §4.4 E2: a clean turn with model output is recovery evidence.
-    if (outcome.kind === "completed" && agent.turn.runtimeErrors === 0 && agent.turn.textEvents + agent.turn.toolCalls > 0) {
+    if (effectiveOutcome.kind === "completed" && agent.turn.runtimeErrors === 0 && agent.turn.textEvents + agent.turn.toolCalls > 0) {
       const batch = agent.catchupBatch && agent.catchupBatch.launchId === agent.launchId ? agent.catchupBatch : null;
       this.sendRuntimeOutcome(agent, {
         kind: "turn_completed",
@@ -2509,18 +3454,26 @@ export class OarAgentHost {
         toolCalls: agent.turn.toolCalls,
         ...(batch && batch.renderedRows > 0 ? { catchupBatchId: batch.batchId, catchupRenderedRows: batch.renderedRows } : {}),
       });
-    } else if (outcome.kind === "completed" && turnEnded === "completed" && agent.turn.textEvents + agent.turn.toolCalls === 0) {
+    } else if (effectiveOutcome.kind === "completed" && turnEnded === "completed" && agent.turn.textEvents + agent.turn.toolCalls === 0) {
       turnEnded = "failed";
     }
     agent.catchupBatch = null;
     agent.turn = { textEvents: 0, toolCalls: 0, runtimeErrors: 0, thinkingEvents: 0 };
     agent.steerHold = { compacting: false, refusals: 0 };
+    agent.turnEnds += 1;
+    // Focus: a turn that ended with no model output shows nothing about the input that opened it.
+    this.dropPendingModelSeen(agent, "turn_ended_without_output");
+    // Focus: the steers this turn accepted are shown by its clean end only.
+    this.settleSteeredFocusBodies(agent, session, effectiveOutcome.kind === "completed");
+    // Task #triage:#399: the turn's outstanding notice ends with it; what it
+    // held is handed over below, once, as the next turn's input.
+    this.releaseNoticeHold(agent, "turn_end");
     this.reportFirstTurnEnded(agent, turnEnded);
     if (terminal) return;
     if (!this.isCurrent(agent) || agent.session !== session) return;
     // Working → Idle only when the turn is over and nothing waited for it: a
     // held delivery handed over now opens the next turn, whose end is the edge.
-    const idleEdge = outcome.kind !== "failed" && agent.pending.length === 0;
+    const idleEdge = effectiveOutcome.kind !== "failed" && agent.pending.length === 0;
     // A clean turn end: the runtime ended it itself, with output (not aborted, not failed).
     const cleanEnd = turnEnded === "completed";
     void this.flushPending(agent, session).then(() => {
@@ -2536,7 +3489,7 @@ export class OarAgentHost {
 
   /**
    * RFC 070 §6.5 (wakeRecycleWarm.ts): at a clean turn end with nothing
-   * running, held or queued, a Codex or Grok session whose last reported
+   * running, held or queued, a session of a summary runtime whose last reported
    * context is past the warm threshold (on a window of at least 400k) is
    * marked. Past the ceiling it is ended now; otherwise after the quiet
    * period, unless a delivery arrives first (`cancelWarmRecycle`). Only while
@@ -2553,7 +3506,17 @@ export class OarAgentHost {
     const summary = agent.summary?.current() ?? null;
     const context = summary && summary.sessionId === session.id ? summary.context : null;
     // The turn-end compaction gate's facts: the last reported context and the model's window.
-    const decision = cleanEnd && !this.warmRecycle.declined(agent.agentId, session.id) && this.warmRecycleStoppable(agent, session)
+    const priorRecycleYielded = this.wakeRecycleFailures.hasFailed(agent.agentId, session.id);
+    if (priorRecycleYielded && this.wakeRecycleFailures.noteYield(agent.agentId, session.id, "warm_recycle")) {
+      this.deps.recordEvent("daemon.agent.wake_recycle.yielded", {
+        agentId: agent.agentId,
+        runtime: agent.runtimeId,
+        gate: "warm_recycle",
+        reason: "prior_recycle_start_failed",
+        host: "oar",
+      });
+    }
+    const decision = cleanEnd && !this.warmRecycle.declined(agent.agentId, session.id) && !priorRecycleYielded && this.warmRecycleStoppable(agent, session)
       ? decideWarmRecycleMark(config, { contextTokens: context?.tokens ?? null, windowTokens: context?.window ?? null })
       : null;
     if (!decision?.mark || (yieldToCompaction && decision.band === "quiet")) {
@@ -2575,7 +3538,7 @@ export class OarAgentHost {
     const agentConfig = this.agentConfig(agent);
     const features = agent.serverFeatures ?? pickAgentServerFeatures(agentConfig);
     const config = resolveWarmRecycleConfig({ envVars: agentConfig.envVars, wakeRecycleWarm: features.wakeRecycleWarm === true });
-    if (!config.enabled || !warmRecycleCoversRuntime("oar", agent.runtimeId, { wakeRecycleOar: features.wakeRecycleOar === true })) return null;
+    if (!config.enabled || !warmRecycleCoversRuntime("oar", agent.runtimeId, { wakeRecycleOar: features.wakeRecycleOar === true }, agent.sessionCapabilities?.contextUsage)) return null;
     return config;
   }
 
@@ -2593,12 +3556,13 @@ export class OarAgentHost {
    * (cleared by a turn start, so set only by this session's latest turn).
    * Not mirrored, being covered elsewhere: a sticky failure (input too large,
    * an unusable model) fails its turn, which is no clean end, and ends or
-   * replaces the session there; and no CLI version floor applies here
-   * (`COLD_IDLE_RUNTIME_VERSION_FLOORS` names only Claude, which this host
-   * never marks: `warmRecycleCoversRuntime`).
+   * replaces the session there. Runtime CLI version floors
+   * (`COLD_IDLE_RUNTIME_VERSION_FLOORS`, e.g. Claude `2.1.220`) are enforced
+   * here just as in `AgentProcessManager.warmRecycleStoppable`.
    */
   private warmRecycleStoppable(agent: HostedAgent, session: Session): boolean {
     if (!this.isCurrent(agent) || agent.session !== session || agent.stopping || !agent.committed) return false;
+    if (!runtimeVersionAllowsColdIdle(agent.runtimeId, this.deps.detectedRuntimeCliVersion?.(agent.runtimeId))) return false;
     if (agent.steerHold.compacting || agent.turnEndCompaction.inFlight) return false;
     if (agent.lastFailure !== null || this.stalledWithWorkDeliveryHold(agent) !== null) return false;
     if (agent.pending.length > 0 || agent.carried.length > 0 || agent.flushing) return false;
@@ -2642,14 +3606,16 @@ export class OarAgentHost {
 
   /**
    * #proj-runtime:#54 phase 3: at a turn end with nothing running, held or
-   * queued, a Codex or Grok session whose last reported context is past the
+   * queued, a session whose installation OAR declares manual compaction and a
+   * trustworthy context size and window for, on a rolled-out runtime (`turnEndCompactionAllowed`),
+   * and whose last reported context is past the
    * threshold (on a window of at least 400k) compacts with OAR's
    * `Session.compact()`. A refusal (Codex: a goal active, input queued) is a
    * skip: the arm is kept for a later turn end. Deliveries that arrive during
    * it are held (`handOff`) and handed over once it settles.
    */
   private async maybeCompactAtTurnEnd(agent: HostedAgent, session: Session): Promise<void> {
-    if (!TURN_END_COMPACTION_OAR_RUNTIMES.has(agent.runtimeId)) return;
+    if (!turnEndCompactionAllowed(agent.runtimeId, agent.sessionCapabilities)) return;
     if (!this.isCurrent(agent) || agent.session !== session || agent.stopping || !agent.committed) return;
     const state = agent.turnEndCompaction;
     if (state.inFlight) return;
@@ -2672,15 +3638,18 @@ export class OarAgentHost {
       }
       return;
     }
+    const notIdle = this.agentNotIdle(agent, session);
     const blocked = !session.compact
       ? "unsupported"
       : agent.steerHold.compacting
         ? "compacting"
         : agent.pending.length > 0 || agent.carried.length > 0 || agent.flushing
           ? "deliveries_waiting"
-          : this.agentNotIdle(agent, session) !== null || session.status().value.kind !== "idle"
-            ? "agent_busy"
-            : null;
+          : notIdle !== null
+            ? notIdle
+            : session.status().value.kind !== "idle"
+              ? "agent_busy"
+              : null;
     if (blocked) {
       // Not this turn end; the next one decides again (the arm is kept).
       this.deps.recordEvent(TURN_END_COMPACTION_EVENT, { ...base, outcome: `skipped:${blocked}` });
@@ -2759,14 +3728,19 @@ export class OarAgentHost {
     // The plan does not include the model (task #352): the user changes the
     // model or the plan.
     const planAccess = failure === "unknown" && diagnostic.requiredAction === "user_model_access";
+    const failureEnvelope = outcome.reason ? buildRuntimeErrorDiagnosticEnvelope(outcome.reason) : null;
+    const failureExcerpt = failureEnvelope?.eventAttrs.runtime_error_message_excerpt;
     this.deps.recordEvent("daemon.agent.oar.turn_failed", {
       agentId: agent.agentId,
       launchId: agent.launchId ?? undefined,
+      runtime: runtimeId,
       failure,
       ...(fromText ? { failure_from_text: true } : {}),
       ...(planAccess ? { required_action: "user_model_access" } : {}),
       runtime_error_class: diagnostic.errorClass,
       runtime_error_fingerprint: diagnostic.fingerprint,
+      ...(typeof failureExcerpt === "string" && failureExcerpt.length > 0 ? { runtime_error_message_excerpt: failureExcerpt } : {}),
+      ...(failureEnvelope?.spanAttrs.runtime_error_message_truncated ? { runtime_error_message_truncated: true } : {}),
     }, "error", agent.turnTrace.traceContext);
     // #proj-raft-computer:#46 (reconciler step 4a): a rejected sign-in, a
     // plan without the model, an exhausted billing balance: the credential's
@@ -2801,7 +3775,12 @@ export class OarAgentHost {
       // those of every agent on the same shared sign-in on either host, until
       // it ends; the session keeps running.
       const providerLimit = oarFailureProviderLimit(failure, outcome);
-      if (providerLimit) this.recordProviderLimit(agent, providerLimit, failure);
+      if (providerLimit) {
+        this.recordProviderLimit(agent, providerLimit, failure);
+        if (providerLimit.kind === "quota_exhausted" && providerLimitReportedResetInMs(providerLimit, this.now()) === undefined) {
+          this.waitForAccountUsageReset(agent, failure).catch((error) => logger.warn(`[Agent ${agent.agentId}] account usage read after a used-up quota failed: ${String(error)}`));
+        }
+      }
       this.publish(agent, "error", `${runtimeDisplayName(runtimeId)} turn failed: ${outcome.reason}`, "runtime_error", [], diagnostic);
       return false;
     }
@@ -2841,8 +3820,13 @@ export class OarAgentHost {
    */
   private replaceSession(agent: HostedAgent, cause: SessionResetCause): void {
     const session = agent.session;
-    this.exitStreaks.sticky.noteSessionReset(agent.agentId, cause);
-    if (session?.id) {
+    if (agent.recycledFromSessionId) {
+      this.recordFailedWakeRecycleStart(agent, cause);
+    } else {
+      this.exitStreaks.sticky.noteSessionReset(agent.agentId, cause);
+    }
+    if (session?.id && !agent.recycledFromSessionId) {
+      this.forgetSessionContext(agent, session.id);
       this.deps.sendToServer({ type: "agent:session:invalidate", agentId: agent.agentId, sessionId: session.id, ...(agent.launchId ? { launchId: agent.launchId } : {}), reason: cause });
     }
     const label = runtimeDisplayName(agent.runtimeId);
@@ -2884,6 +3868,9 @@ export class OarAgentHost {
     diagnostic: RuntimeErrorActivityDiagnostic,
   ): void {
     const reason = reportedStickyFailureReason(stickyReason, this.serverCountsStickyReasons);
+    if (agent.recycledFromSessionId) {
+      this.recordFailedWakeRecycleStart(agent, stickyReason);
+    }
     this.deps.recordEvent("daemon.agent.sticky_failure.handed_to_server", {
       agentId: agent.agentId,
       launchId: agent.launchId ?? undefined,
@@ -2916,6 +3903,9 @@ export class OarAgentHost {
    */
   private onExited(agent: HostedAgent, session: Session, code: number | null): void {
     this.deps.recordEvent("daemon.agent.oar.exited", { agentId: agent.agentId, launchId: agent.launchId ?? undefined, code, held: agent.pending.length }, "error");
+    if (agent.recycledFromSessionId) {
+      this.recordFailedWakeRecycleStart(agent, "process_exited");
+    }
     const { facts, plan } = this.planEnd(agent, session, null, code);
     // A turn this exit cut short ends with it, as on the legacy host's close.
     agent.turnTrace.end(plan.clean ? "ok" : "error", {
@@ -3056,6 +4046,7 @@ export class OarAgentHost {
       }, "error");
     }
     if (plan.session.kind === "new" && plan.session.reason === "resume_failed") {
+      this.forgetSessionContext(agent, plan.session.sessionId);
       this.deps.sendToServer({ type: "agent:session:invalidate", agentId, sessionId: plan.session.sessionId, ...(launchId ? { launchId } : {}), reason: plan.session.cause });
     }
     this.deps.recordEvent("daemon.agent.exit.planned", {
@@ -3111,12 +4102,20 @@ export class OarAgentHost {
     const heldFirstInput = held.find((delivery) => delivery.firstInput);
     const carried = held.filter((delivery) => !delivery.firstInput);
     heldFirstInput?.settle(false);
-    const sameStartInputs = Boolean(heldFirstInput) || plan.kind === "resume_failed";
-    const config: AgentConfig = { ...agent.request.config, sessionId: plan.session.kind === "resume" ? plan.session.sessionId : null };
+    const fallingBackToPriorSession = Boolean(
+      agent.recycledFromSessionId
+      && !(plan.session.kind === "new" && plan.session.reason === "spec_drop"),
+    );
+    const sameStartInputs = Boolean(heldFirstInput) || plan.kind === "resume_failed" || fallingBackToPriorSession;
+    const fallbackSessionId = fallingBackToPriorSession
+      ? agent.recycledFromSessionId
+      : (plan.session.kind === "resume" ? plan.session.sessionId : null);
+    const config: AgentConfig = { ...agent.request.config, sessionId: fallbackSessionId };
     // The ended launch's runner credential is revoked with it; the next launch mints its own.
     delete config.agentCredentialKey;
     delete config.agentCredentialId;
-    const { wakeMessage, wakeMessageTransient, unreadSummary, resumePrompt, resumeMessages, catchupBatchId } = agent.request;
+    delete config.agentCredentialExpiresAt;
+    const { wakeMessage, wakeMessageTransient, unreadSummary, openTasks, resumePrompt, resumeMessages, catchupBatchId } = agent.request;
     end();
     this.deps.recordEvent("daemon.agent.oar.restart_scheduled", {
       agentId,
@@ -3138,6 +4137,10 @@ export class OarAgentHost {
       recoveryGrant: null,
       claimedConnectionEpochId: null,
       ...(sameStartInputs ? { wakeMessage, wakeMessageTransient, unreadSummary, resumePrompt, resumeMessages, catchupBatchId } : {}),
+      // Not a start input that was used up: a restart that resumes the session
+      // without its first input still names the tasks it holds (never an empty
+      // resume for an agent with open work); a new session ignores them.
+      ...(openTasks ? { openTasks } : {}),
     }, { carried, notBeforeMs: delayMs > 0 ? this.now() + delayMs : null, untilLimitReleased: plan.hold === "provider_limit" });
     void restart.then((outcome) => {
       if (outcome.kind === "fallback") this.restartFailed(agent, outcome, cause);
@@ -3215,7 +4218,7 @@ export class OarAgentHost {
     // The failed start for the start-failure breaker (F2). Reconciler step
     // 12: counted by this host after the start was ready (whose readiness
     // ended the server's own count), so it pauses at this first report.
-    this.reportStartFailure(agent, detail, reportedStickyFailureReason("runtime_repeated_failure", this.serverCountsStickyReasons));
+    this.reportStartFailure(agent, detail, reportedStickyFailureReason("runtime_repeated_failure", this.serverCountsStickyReasons), lastError || undefined);
     const { requiredAction: _requiredAction, ...runtimeError } = buildRuntimeErrorActivityDiagnostic(lastError || detail, { reasonProvenance: "daemon_fallback", nativeReasonPresent: false });
     this.publish(
       agent,
@@ -3234,8 +4237,10 @@ export class OarAgentHost {
    * start's activity with its typed reason, which the server's start-failure
    * breaker counts.
    */
-  private reportStartFailure(agent: HostedAgent, detail: string, reason: SpawnFailureReason = "runtime_spawn_failed"): void {
-    const report = startFailureActivity({ reason, detail, userMessage: detail }, this.agentConfig(agent).model);
+  private reportStartFailure(agent: HostedAgent, detail: string, reason: SpawnFailureReason = "runtime_spawn_failed", errorText?: string): void {
+    // The carrier's `message` is the runtime's own error text where this host
+    // has one (the last error of a crash streak), else the shown detail.
+    const report = startFailureActivity({ reason, detail: errorText ?? detail, userMessage: detail }, this.agentConfig(agent).model);
     this.sendStatus(agent, "inactive");
     this.deps.sendToServer({
       type: "agent:activity",
@@ -3365,17 +4370,60 @@ export class OarAgentHost {
   }
 
   /**
+   * #proj-runtime:#75: a used-up quota with no reported reset (OAR reports
+   * Codex's used-up plan as `quota` without `resetsAt`, or only as the text).
+   * The account's live windows say when it comes back: the account-level
+   * windows at 100%, each with a usable reset, hold the credential until the
+   * latest of them (fullWindowsResetAt). Recorded over the backoff the
+   * failure started, as the same attempt (the ledger keeps the longer end),
+   * and only while the credential is still limited: a release (model output,
+   * a sign-in, a stop) or a replaced or stopping agent in the meantime drops
+   * the reading. One read per credential at a
+   * time. A failed or windowless read leaves the backoff.
+   */
+  private async waitForAccountUsageReset(agent: HostedAgent, failure: FailureClass): Promise<void> {
+    const launch = agent.launch;
+    const key = this.credentialKey(agent);
+    const recorded = this.providerLimits.get(key, this.now());
+    if (!launch || !recorded || this.accountUsageReads.has(key)) return;
+    this.accountUsageReads.add(key);
+    let snapshot: AccountUsageSnapshot | null;
+    try {
+      snapshot = await this.readAccountUsage(launch);
+    } catch {
+      snapshot = null;
+    } finally {
+      this.accountUsageReads.delete(key);
+    }
+    const resetsAt = snapshot ? fullWindowsResetAt(snapshot, this.now()) : undefined;
+    const current = this.providerLimits.get(key, this.now());
+    // Released in the meantime (the record is gone, or a sign-in's restore replaced it with nothing newer): drop the reading. A newer hit is the same quota.
+    const stillHeld = current !== undefined && current.providerLimitKind === "quota_exhausted" && current.recordedAtMs >= recorded.recordedAtMs && this.agents.get(agent.agentId) === agent && !agent.stopping;
+    // `snapshot_kind`: available / unavailable / reauth_required / unsupported, or `read_failed` (thrown or timed out).
+    this.deps.recordEvent("daemon.agent.provider_limit.account_usage_read", {
+      agentId: agent.agentId,
+      runtime: agent.runtimeId,
+      snapshot_kind: snapshot?.kind ?? "read_failed",
+      reset_found: resetsAt !== undefined,
+      ...(resetsAt && !stillHeld ? { dropped: "limit_changed" } : {}),
+    }, "ok", agent.turnTrace.traceContext);
+    if (!resetsAt || !stillHeld) return;
+    this.recordProviderLimit(agent, { kind: "quota_exhausted", resetsAt, source: "account_usage" }, failure, { sameAttempt: true });
+  }
+
+  /**
    * A failed turn hit the provider limit `limit`: recorded on the agent's
-   * credential, with the legacy host's wait (a valid reported reset, else
-   * its exponential delivery backoff, at most QUOTA_RESET_BACKOFF_MAX_MS).
+   * credential, with the legacy host's wait (until a usable reported reset,
+   * else its exponential delivery backoff, at most QUOTA_RESET_BACKOFF_MAX_MS).
    * The attempts carry on from the credential's last limit, so a limit hit
    * again keeps growing the wait. The ledger announces it to both hosts:
    * this agent and the others on a shared sign-in hold their deliveries.
    */
-  private recordProviderLimit(agent: HostedAgent, limit: RuntimeErrorProviderLimit, failure: FailureClass): void {
+  private recordProviderLimit(agent: HostedAgent, limit: RuntimeErrorProviderLimit, failure: FailureClass, options: { sameAttempt?: boolean } = {}): void {
     const key = this.credentialKey(agent);
     const now = this.now();
-    const attempts = (this.providerLimits.get(key, now)?.attempts ?? 0) + 1;
+    // `sameAttempt`: a reset found for the failure already recorded (waitForAccountUsageReset), not another hit.
+    const attempts = Math.max(1, (this.providerLimits.get(key, now)?.attempts ?? 0) + (options.sameAttempt ? 0 : 1));
     const exponentialDelayMs = runtimeErrorDeliveryBackoffDelayMs(attempts, {
       baseMs: this.providerLimitBackoff.baseMs,
       maxMs: this.providerLimitBackoff.maxMs,
@@ -3852,7 +4900,7 @@ export class OarAgentHost {
     return custody ? true : delivery.settled;
   }
 
-  private newDelivery(message: AgentMessage, contexts: AgentDeliveryContext[], extra: Partial<Pick<Delivery, "custody" | "rawInput" | "firstInput" | "onAccepted" | "turnStart" | "startEventIds">> = {}): Delivery {
+  private newDelivery(message: AgentMessage, contexts: AgentDeliveryContext[], extra: Partial<Pick<Delivery, "custody" | "rawInput" | "firstInput" | "onAccepted" | "turnStart" | "startEventIds" | "focusBodyTooLong">> = {}): Delivery {
     let settle!: (accepted: boolean | Promise<boolean>) => void;
     const settled = new Promise<boolean>((resolve) => { settle = resolve; });
     return { message, contexts, custody: false, pendingReported: false, receivedAtMs: this.now(), settled, settle, ...extra };
@@ -3938,6 +4986,7 @@ export class OarAgentHost {
       this.deps.recordEvent("daemon.agent.oar.delivery", {
         agentId: agent.agentId,
         launchId: agent.launchId ?? undefined,
+        runtime: agent.runtimeId,
         count: agent.pending.length,
         ...this.holdTraceAttrs(hold),
       });
@@ -3950,6 +4999,7 @@ export class OarAgentHost {
       this.deps.recordEvent("daemon.agent.oar.delivery", {
         agentId: agent.agentId,
         launchId: agent.launchId ?? undefined,
+        runtime: agent.runtimeId,
         count: agent.pending.length,
         outcome: "held_for_drain",
       });
@@ -3963,6 +5013,9 @@ export class OarAgentHost {
     const messages = deliveries.map((delivery) => delivery.message);
     let input: AxSurfaceText | string;
     let rendered: AgentMessage[] = [];
+    let focused: AgentMessage[] = [];
+    let focusedRows: FocusedBodySelection<AgentMessage>["rows"] = [];
+    let bodies: AgentMessage[] = [];
     if (first.rawInput !== undefined) {
       input = first.rawInput;
     } else if (single) {
@@ -3970,38 +5023,63 @@ export class OarAgentHost {
     } else {
       const projection = this.projector(agent.agentId)(messages);
       rendered = projection.renderedContextMessages;
-      const renderedSet = new Set(rendered);
-      const noticeMessages = messages.filter((message) => !renderedSet.has(message));
+      // Focus: the messages the Server tagged `focused` are written in full
+      // too. With none (always, unless the agent's features have `agentFocus`)
+      // the bodies are the thread-context ones and the input is as before.
+      // The focused messages a size limit lists as rows instead are handled as unfocused ones.
+      const selection = this.focusSelection(agent, deliveries, rendered);
+      focused = selection.bodies;
+      focusedRows = selection.rows;
+      const bodySet = new Set([...rendered, ...focused]);
+      /** The messages written in full, in delivery order. */
+      bodies = focused.length > 0 ? messages.filter((message) => bodySet.has(message)) : rendered;
+      /** What is printed for them: a thread context only where the projection chose to show it. */
+      const bodyInputs = focused.length > 0
+        ? messages.flatMap((message, index) => (bodySet.has(message) ? [projection.messages[index]!] : []))
+        : rendered;
+      // Left out by message, not by conversation: an unfocused message of a focused conversation is still listed.
+      const noticeMessages = messages.filter((message) => !bodySet.has(message));
       // The Server's latest `server:features` answer, else the start's config.
       const inboxOptions = inboxUpdateRenderOptions(agent.serverFeatures ?? agent.request.config);
-      input = rendered.length > 0
+      input = bodies.length > 0
         ? formatConcreteMessagesRuntimeInput(
-          rendered,
+          bodyInputs,
           agent.driver,
           noticeMessages.length > 0 ? formatInboxUpdateRuntimeInput(noticeMessages, agent.driver, noticeMessages.length, inboxOptions) : undefined,
+          focused.length > 0 ? { focus: true } : undefined,
         )
         : formatInboxUpdateRuntimeInput(messages, agent.driver, messages.length, inboxOptions);
     }
+    // Task #triage:#399: an inbox notice with no body (no rendered thread context, no focused message).
+    const pureNotice = first.rawInput === undefined && !single && bodies.length === 0;
+    // Set when it goes past an outstanding notice: how many notices that one held.
+    let breakthroughHeld: number | null = null;
     const serverContext = this.pendingServerContext(agent.agentId, session.id);
     const text = serverContext ? `${formatServerContextPrefix(serverContext.body)}${input}` : String(input);
     const idle = session.status().value.kind === "idle";
-    const steers = agent.launch?.busyDelivery === "now" && session.steer !== undefined;
-    // OpenCode (`OarLaunch.promptFirst`): after background sub-agents OAR's
-    // status never reads idle again (OAR #777) though no turn runs, so the
-    // status decides nothing here: the input goes as a prompt, and only OAR's
-    // `busy` answer (a turn really runs) makes it a busy delivery below.
+    const steers = launchSteers(agent, session);
+    // `OarLaunch.promptFirst` (OpenCode): OAR's status can read running
+    // though no turn runs (after background sub-agents, OAR #777), so the
+    // status decides nothing here: the input goes as a prompt, and only the
+    // runtime's `busy` answer (a turn really runs) makes it a busy delivery
+    // below.
     const promptFirst = !idle && agent.launch?.promptFirst === true;
     const trace = (outcome: string, code?: RejectionCode, reason?: string | null, failure?: FailureClass) => this.deps.recordEvent("daemon.agent.oar.delivery", {
       agentId: agent.agentId,
       launchId: agent.launchId ?? undefined,
+      runtime: agent.runtimeId,
       count: deliveries.length,
       outcome,
       rendered_thread_context: rendered.length,
+      // The rows a size limit made are counted once, on the outcome where the
+      // runtime took the write: a held or refused batch is offered again.
+      ...focusedBodyTraceAttrs(focused, outcome === "prompted" || outcome === "steered" || outcome === "queued" ? focusedRows : []),
       ...(code ? { code } : {}),
-      // The runtime's refusal as its class and fingerprint, never its text.
-      ...(code ? refusalTraceAttrs(reason) : {}),
+      // The runtime's refusal as its class, fingerprint, and scrubbed/bounded excerpt (same redaction as daemon.runtime.error).
+      ...(code ? refusalEventAttrs(reason) : {}),
       // OAR's class of a refusal (`input_too_large`), where it gives one.
       ...(failure ? { oar_failure: failure } : {}),
+      ...(breakthroughHeld !== null ? { notice_hold_breakthrough: true, held_count: breakthroughHeld } : {}),
     }, code ? "error" : "ok");
     if (!idle && !steers && !promptFirst) {
       // `after_turn`: held here until the turn end flushes it as a new turn.
@@ -4021,14 +5099,28 @@ export class OarAgentHost {
       this.reportHeld(agent.pending);
       return;
     }
+    if (!idle && steers && !promptFirst && pureNotice) {
+      if (this.holdNotice(agent, session, deliveries)) return;
+      breakthroughHeld = this.breakthroughHeldCount(agent, session);
+    }
+    // Focus: a batch with a focused body does not wait behind an outstanding
+    // notice, whatever kind of message it is; it tells what was held with it.
+    if (!idle && steers && !promptFirst && focused.length > 0) breakthroughHeld = this.breakthroughHeldCount(agent, session);
     // The span of the turn this input starts (its `turn_started`): only an
     // idle session's; a steer into the running turn starts none.
     if (idle || promptFirst) agent.nextTurn = first.turnStart ?? this.turnStartFor("stdin-idle-delivery", messages, new Map(deliveries.map((delivery) => [delivery.message, delivery])));
     // Idle: a prompt, rejected `busy` if a turn started meanwhile (then held
     // like a busy delivery), never a steer into it.
     const inputId = randomUUID();
+    // Focus: what the turn showed before the write (`InputTaken`).
+    const turnEndsBefore = agent.turnEnds;
+    const turnOutputBefore = this.turnOutputCount(agent);
+    const turnOpenBefore = !idle || agent.turnOpen;
+    const turnStartsBefore = agent.turnStarts;
     // Whether this input went through OAR's `deliver` (a steer, or a prompt it chose), never a plain prompt.
     let viaDeliver = steers && !promptFirst;
+    // Focus: set when the prompt was rejected as busy and the input went as a busy delivery (`InputTaken`).
+    let afterBusyPrompt = false;
     let delivered: { landed: "prompted" | "steered" | "queued" } | { landed: "rejected"; code: RejectionCode; reason: string; failure?: FailureClass } = viaDeliver
       ? await session.deliver(text, { when: "now", origin: DELIVERY_ORIGIN, inputId })
       : await session.prompt(text, { origin: DELIVERY_ORIGIN }).then((outcome) => (outcome.kind === "accepted"
@@ -4050,7 +5142,13 @@ export class OarAgentHost {
         this.reportHeld(agent.pending);
         return;
       }
+      if (pureNotice) {
+        if (this.holdNotice(agent, session, deliveries)) return;
+        breakthroughHeld = this.breakthroughHeldCount(agent, session);
+      }
+      if (focused.length > 0) breakthroughHeld = this.breakthroughHeldCount(agent, session);
       viaDeliver = true;
+      afterBusyPrompt = true;
       delivered = await session.deliver(text, { when: "now", origin: DELIVERY_ORIGIN, inputId });
       if (!this.isCurrent(agent) || agent.session !== session) return;
     }
@@ -4130,6 +5228,14 @@ export class OarAgentHost {
       agent.flushAgain = true;
       return;
     }
+    if (tooLong && focused.includes(first.message) && !rendered.includes(first.message)) {
+      // Focus: one message, in full only because of its tag, is too long for
+      // one input. Without the tag it would have been a notice row, which
+      // fits: offered once more as that, never refused for the tag.
+      first.focusBodyTooLong = true;
+      agent.flushAgain = true;
+      return;
+    }
     agent.pending = agent.pending.filter((delivery) => !deliveries.includes(delivery));
     if (agent.deliverSingly > 0) agent.deliverSingly -= 1;
     if (code) {
@@ -4152,11 +5258,21 @@ export class OarAgentHost {
     // input again; a steer into a running turn does not (a session that keeps
     // refusing new turns could otherwise restart once per burst of messages).
     if (delivered.landed === "prompted") this.idleRefusalReopens.delete(agent.agentId);
+    // Task #triage:#399: this notice is now the outstanding one (only one the
+    // runtime took; Codex only, so no other runtime ever holds one).
+    if (pureNotice && isNoticeHoldEnabled() && noticeHoldAppliesTo(agent.runtimeId)) agent.noticeHold.arm(session.id);
+    // Focus: a write with a focused body arms no hold, and what an outstanding
+    // notice held went with it (the same batch), so that count is settled.
+    if (breakthroughHeld !== null && focused.length > 0) agent.noticeHold.settleSuppressed();
     serverContext?.writtenTo.add(session.id);
     this.noteRendered(agent.agentId, rendered);
-    const thirdPartyEventIds = thirdPartyEventIdsFromEvents(rendered);
+    const thirdPartyEventIds = thirdPartyEventIdsFromEvents(bodies);
     if (thirdPartyEventIds.length > 0) reportThirdPartyEventsDelivered(agent.agentId, thirdPartyEventIds);
-    for (const delivery of deliveries) this.accept(agent, delivery);
+    // Every refusal returned above (`code`).
+    if (delivered.landed === "rejected") return;
+    const taken: InputTaken = { landed: delivered.landed, turnEndsBefore, turnOutputBefore, turnOpenBefore, turnStartsBefore, afterBusyPrompt };
+    for (const delivery of deliveries) this.accept(agent, delivery, taken);
+    this.noteFocusedBodiesTaken(agent, session, focused, deliveries, inputId, taken);
     const ordinary = first.rawInput === undefined ? messages.filter((message) => !runtimeProfileNotificationFromMessage(message)) : [];
     if (ordinary.length > 0) this.publishMessageReceived(agent, ordinary, delivered.landed === "prompted");
     // More may have arrived while this input was in flight.
@@ -4185,6 +5301,9 @@ export class OarAgentHost {
       ...refusalTraceAttrs(reason),
     }, "error");
     if (!again) {
+      if (agent.recycledFromSessionId) {
+        this.recordFailedWakeRecycleStart(agent, "prompt_refused");
+      }
       logger.warn(`[Agent ${agentId}] ${label} refused a prompt on an idle OAR session; ending it and starting again on it`);
       this.idleRefusalReopens.add(agentId);
       this.publish(agent, "working", `${label} refused a new message; restarting its session…`, "stalled_recovery");
@@ -4209,12 +5328,313 @@ export class OarAgentHost {
     this.publish(agent, "error", detail, "runtime_error", [], buildRuntimeErrorActivityDiagnostic(detail, { errorClass: "MessageTooLargeError" }));
   }
 
+  /**
+   * Task #triage:#399: whether an outstanding notice holds a busy notice for
+   * these deliveries: none mentions the agent, is a DM or a runtime-profile
+   * message, and no input that is never batched (a system notice, an app
+   * notice) waits behind them in `pending`, which a held run would otherwise
+   * keep back.
+   * Ordinary messages that joined `pending` after `deliveries` were taken
+   * (while a prompt-first `prompt` was in flight) are held with them; they
+   * do not break through.
+   *
+   * Only one hand-off runs at a time (`flushPending`), so a notice in flight
+   * holds the next one already: the next hand-off starts after it landed
+   * (armed) or failed (never armed, nothing held).
+   */
+  private noticeHoldCovers(agent: HostedAgent, session: Session, deliveries: readonly Delivery[]): boolean {
+    if (!agent.noticeHold.holds(session.id)) return false;
+    const unbatched = (delivery: Delivery) => delivery.rawInput !== undefined || this.isTransient(delivery);
+    if (deliveries.some((delivery) => unbatched(delivery) || breaksNoticeHold(delivery.message))) return false;
+    // Focus: a focused message is written in full, never as a pure notice, so no notice hold covers its batch.
+    if (this.focusSelection(agent, deliveries).bodies.length > 0) return false;
+    // A mention that joined meanwhile is in the next hand-off's run, which breaks through then, once.
+    return !agent.pending.some((delivery) => !deliveries.includes(delivery) && unbatched(delivery));
+  }
+
+  /** Holds a busy notice behind the outstanding one (they stay in `pending`); false when it goes. */
+  private holdNotice(agent: HostedAgent, session: Session, deliveries: readonly Delivery[]): boolean {
+    if (!this.noticeHoldCovers(agent, session, deliveries)) return false;
+    const heldCount = agent.noticeHold.noteSuppressed();
+    this.deps.recordEvent("daemon.agent.oar.delivery", {
+      agentId: agent.agentId,
+      launchId: agent.launchId ?? undefined,
+      runtime: agent.runtimeId,
+      count: deliveries.length,
+      outcome: "held_notice_outstanding",
+      notice_held: true,
+      held_count: heldCount,
+    });
+    this.reportHeld(agent.pending);
+    return true;
+  }
+
+  /** A busy notice that goes while one is outstanding (a break-through): how many that one held. */
+  private breakthroughHeldCount(agent: HostedAgent, session: Session): number | null {
+    return agent.noticeHold.holds(session.id) ? agent.noticeHold.suppressedCount : null;
+  }
+
+  /** Task #triage:#399: the outstanding notice no longer holds; traced when it held any. */
+  private releaseNoticeHold(agent: HostedAgent, reason: NoticeHoldReleaseReason): number {
+    const released = agent.noticeHold.release();
+    if (!released) return 0;
+    if (released.suppressed > 0) {
+      this.deps.recordEvent("daemon.agent.notice_hold.released", {
+        agentId: agent.agentId,
+        launchId: agent.launchId ?? undefined,
+        runtime: agent.runtimeId,
+        host: "oar",
+        release_reason: reason,
+        held_count: released.suppressed,
+        pending_count: agent.pending.length,
+      });
+    }
+    return released.suppressed;
+  }
+
+  /**
+   * Task #triage:#399: the agent read its inbox through the proxy. What was
+   * held waits in `pending` (this host cannot tell which of it the read
+   * covered): told once now, as one busy notice, not as a new turn later.
+   */
+  private onAgentInboxRead(agent: HostedAgent): void {
+    const held = this.releaseNoticeHold(agent, "inbox_read");
+    const session = agent.session;
+    if (held === 0 || !session || !this.isCurrent(agent) || agent.pending.length === 0) return;
+    void this.flushPending(agent, session);
+  }
+
+  /**
+   * Focus: which messages of `deliveries` one write shows in full because the
+   * Server tagged them `focused`, and which focused ones a size limit lists
+   * as rows instead (`selectFocusedBodies`); nothing unless the agent's
+   * current features have `agentFocus`. One refused as too long on its own is
+   * a notice row from then on. `rendered`: the batch's thread-context bodies
+   * (in full anyway, so the limits leave them alone); read from the
+   * projection when the caller has none.
+   */
+  private focusSelection(agent: HostedAgent, deliveries: readonly Delivery[], rendered?: readonly AgentMessage[]): FocusedBodySelection<AgentMessage> {
+    // The Server's latest `server:features` answer, else the start's config.
+    const enabled = (agent.serverFeatures ?? agent.request.config).agentFocus === true;
+    if (!enabled) return selectFocusedBodies<AgentMessage>([], false);
+    const messages = deliveries.filter((delivery) => !delivery.focusBodyTooLong).map((delivery) => delivery.message);
+    const shownAnyway = new Set(rendered ?? this.projector(agent.agentId)(messages).renderedContextMessages);
+    return selectFocusedBodies(messages, true, shownAnyway);
+  }
+
+  /** Model output of the open turn so far (text, tool calls, reasoning); zero between turns. */
+  private turnOutputCount(agent: HostedAgent): number {
+    return agent.turn.textEvents + agent.turn.toolCalls + agent.turn.thinkingEvents;
+  }
+
+  /**
+   * Focus: the runtime took a write that showed these focused bodies in
+   * full. Only focused bodies are reported from this host; a refused write
+   * never gets here (its deliveries stay held and are written again).
+   *
+   * A steer it accepted is in the running turn's buffer, no more: reported
+   * when that turn ends `completed` (`settleSteeredFocusBodies`), unless the
+   * runtime reports the input dropped first (`onInputDropped`). A prompt
+   * opened a turn: reported at that turn's first model output
+   * (`notePromptedFocusBodies`). An input OAR queued and would not give back
+   * runs as a turn this host does not see start: not reported.
+   */
+  private noteFocusedBodiesTaken(agent: HostedAgent, session: Session, focused: readonly AgentMessage[], deliveries: readonly Delivery[], inputId: string, taken: InputTaken): void {
+    if (focused.length === 0) return;
+    if (taken.landed === "steered") {
+      // A turn end while the steer was in flight: that turn's end shows nothing about it.
+      const turnEnded = agent.turnEnds !== taken.turnEndsBefore;
+      if (turnEnded) this.recordModelSeenDropped(agent, "turn_not_completed", modelSeenReportable(focused).length);
+      agent.steeredFocusBodies.push({ inputId, sessionId: session.id, bodies: [...focused], deliveries: [...deliveries], turnEnded });
+    } else if (taken.landed === "prompted") {
+      this.notePromptedFocusBodies(agent, session, focused, taken);
+    } else {
+      this.recordModelSeenDropped(agent, "queued", modelSeenReportable(focused).length);
+    }
+  }
+
+  /**
+   * Focus: a prompt the runtime took carried these focused bodies. They are
+   * shown by model output of the turn that prompt opened: registered only
+   * while that turn is still open (the write settles after the turn can have
+   * started, spoken, even ended); reported now when it has spoken already.
+   * An input that landed otherwise opened no turn of its own: not reported.
+   */
+  private notePromptedFocusBodies(agent: HostedAgent, session: Session, focused: readonly AgentMessage[], taken: InputTaken): void {
+    const reportable = modelSeenReportable(focused);
+    if (reportable.length === 0) return;
+    if (taken.landed !== "prompted") {
+      this.recordModelSeenDropped(agent, taken.landed === "queued" ? "queued" : "not_prompted", reportable.length);
+    } else if (taken.afterBusyPrompt) {
+      // The rejected prompt already counted as a turn start, so a turn
+      // "started after the write" may be the old one still running: its
+      // output must not report these bodies. Not attributed to any turn.
+      this.recordModelSeenDropped(agent, "promoted_after_busy_prompt", reportable.length);
+    } else if (taken.turnOpenBefore) {
+      // A steer OAR turned into a prompt: the turn it was written into ended
+      // while the write was in flight, and this prompt opened the next one.
+      // That earlier turn's end and output say nothing about it; what counts
+      // is the first turn started after the write.
+      const started = agent.turnStarts > taken.turnStartsBefore;
+      // A turn end since the write reset the count, so any output is the new
+      // turn's; without one, only output past what the count held before the write.
+      const output = this.turnOutputCount(agent);
+      const spoke = agent.turnEnds !== taken.turnEndsBefore ? output > 0 : output > taken.turnOutputBefore;
+      if (started && !agent.turnOpen) this.recordModelSeenDropped(agent, "turn_ended_without_output", reportable.length);
+      else if (started && spoke) this.reportModelSeen(agent, reportable, "model_output");
+      else this.noteModelSeenPending(agent, session, reportable, taken.turnStartsBefore);
+    } else if (agent.turnEnds !== taken.turnEndsBefore) {
+      this.recordModelSeenDropped(agent, "turn_ended_without_output", reportable.length);
+    } else if (this.turnOutputCount(agent) > taken.turnOutputBefore) {
+      this.reportModelSeen(agent, reportable, "model_output");
+    } else {
+      this.noteModelSeenPending(agent, session, reportable);
+    }
+  }
+
+  /** `afterTurnStart`: the bodies belong to the first turn started after that many turn starts (a promoted steer); null: to the turn open now or opened next. */
+  private noteModelSeenPending(agent: HostedAgent, session: Session, messages: readonly AgentMessage[], afterTurnStart: number | null = null): void {
+    for (const message of modelSeenReportable(messages)) agent.pendingModelSeen.push({ sessionId: session.id, message, afterTurnStart });
+  }
+
+  /** The pending entries the turn now open (or just ended) speaks for; the rest wait for a turn that has not started. */
+  private takePendingModelSeenOfTurn(agent: HostedAgent): HostedAgent["pendingModelSeen"] {
+    const ofTurn = agent.pendingModelSeen.filter((entry) => entry.afterTurnStart === null || agent.turnStarts > entry.afterTurnStart);
+    if (ofTurn.length > 0) agent.pendingModelSeen = agent.pendingModelSeen.filter((entry) => !ofTurn.includes(entry));
+    return ofTurn;
+  }
+
+  /** Model output in `session`: the bodies of the write that opened its turn were taken. One written to another session is dropped. */
+  private flushPendingModelSeen(agent: HostedAgent, session: Session): void {
+    if (agent.pendingModelSeen.length === 0) return;
+    const pending = this.takePendingModelSeenOfTurn(agent);
+    const taken = pending.filter((entry) => entry.sessionId === session.id);
+    this.recordModelSeenDropped(agent, "session_changed", pending.length - taken.length);
+    this.reportModelSeen(agent, taken.map((entry) => entry.message), "model_output");
+  }
+
+  /**
+   * Focus: a turn ended. The steers it accepted are reported when it ended
+   * `completed`; after an aborted or failed turn they are not (the runtime
+   * may have discarded them) and are kept one more turn for a late
+   * `input_dropped`. Entries a turn end already passed are forgotten.
+   */
+  private settleSteeredFocusBodies(agent: HostedAgent, session: Session, completed: boolean): void {
+    if (agent.steeredFocusBodies.length === 0) return;
+    const open = agent.steeredFocusBodies.filter((entry) => !entry.turnEnded);
+    const bodies = modelSeenReportable(open.filter((entry) => entry.sessionId === session.id).flatMap((entry) => entry.bodies));
+    if (completed) {
+      agent.steeredFocusBodies = [];
+      this.reportModelSeen(agent, bodies, "steer_turn_completed");
+      return;
+    }
+    for (const entry of open) entry.turnEnded = true;
+    agent.steeredFocusBodies = open;
+    this.recordModelSeenDropped(agent, "turn_not_completed", bodies.length);
+  }
+
+  /**
+   * Focus: the runtime discarded an input it had accepted (`input_dropped`:
+   * the turn was interrupted, or it refused the input after all), which hands
+   * the input back. A steer that carried focused bodies was taken here at its
+   * accept (remembered for dedup, its mention acked, its custody settled), so
+   * its messages are held again as new deliveries with no mention to answer:
+   * written again, the focused ones in full, nothing acked a second time.
+   * Nothing is reported for the dropped input. Other accepted inputs are not
+   * tracked and stay as they were before Focus.
+   */
+  private onInputDropped(agent: HostedAgent, session: Session, inputId: string): void {
+    const entry = agent.steeredFocusBodies.find((each) => each.inputId === inputId);
+    if (!entry) return;
+    agent.steeredFocusBodies = agent.steeredFocusBodies.filter((each) => each !== entry);
+    if (!entry.turnEnded) this.recordModelSeenDropped(agent, "input_dropped", modelSeenReportable(entry.bodies).length);
+    const again = entry.deliveries.map((delivery) => this.newDelivery(delivery.message, [{}], { custody: true }));
+    agent.pending.unshift(...again);
+    this.deps.recordEvent("daemon.agent.focus_body.requeued", {
+      agentId: agent.agentId,
+      launchId: agent.launchId ?? undefined,
+      runtime: agent.runtimeId,
+      host: "oar",
+      reason: "input_dropped",
+      messages_count: again.length,
+      focused_bodies: entry.bodies.length,
+    });
+    // Inside the turn that dropped it, its end hands them over; after it, now.
+    if (!agent.turnOpen && agent.committed) void this.flushPending(agent, session);
+  }
+
+  /** Bodies that can no longer be shown to have reached the model are not reported; they stay unread on the Server. */
+  private dropPendingModelSeen(agent: HostedAgent, reason: "session_changed" | "turn_ended_without_output"): void {
+    // A turn end speaks only for the bodies of the write that opened that turn.
+    const pending = reason === "session_changed" ? agent.pendingModelSeen.splice(0) : this.takePendingModelSeenOfTurn(agent);
+    this.recordModelSeenDropped(agent, reason, pending.length);
+    if (reason === "session_changed") {
+      const steered = agent.steeredFocusBodies.splice(0).filter((entry) => !entry.turnEnded);
+      this.recordModelSeenDropped(agent, reason, modelSeenReportable(steered.flatMap((entry) => entry.bodies)).length);
+    }
+  }
+
+  private recordModelSeenDropped(agent: HostedAgent, reason: "session_changed" | "turn_ended_without_output" | "turn_not_completed" | "input_dropped" | "queued" | "not_prompted" | "promoted_after_busy_prompt", count: number): void {
+    if (count === 0) return;
+    this.deps.recordEvent("daemon.agent.model_seen.dropped", {
+      agentId: agent.agentId,
+      launchId: agent.launchId ?? undefined,
+      runtime: agent.runtimeId,
+      host: "oar",
+      reason,
+      messages_count: count,
+    });
+  }
+
+  /** Send `agent:model-seen` for these messages (each has a seq and a channel), and book them for the agent's sends (`seenSeqsByTarget`). */
+  private reportModelSeen(agent: HostedAgent, messages: readonly AgentMessage[], trigger: "steer_turn_completed" | "model_output"): void {
+    if (messages.length === 0) return;
+    const reports = modelSeenReportItems(messages);
+    for (const items of reports) {
+      this.deps.sendToServer({ type: "agent:model-seen", agentId: agent.agentId, ...(agent.launchId ? { launchId: agent.launchId } : {}), items });
+    }
+    for (const message of messages) {
+      const key = canonicalVisibleTarget(formatAgentMessageVisibleTarget(message));
+      let seqs = agent.seenSeqsByTarget.get(key);
+      if (!seqs) agent.seenSeqsByTarget.set(key, seqs = new Set());
+      seqs.add(message.seq!);
+      // The newest are the ones a send can still be held for.
+      if (seqs.size > SEEN_SEQS_PER_TARGET_MAX) seqs.delete(Math.min(...seqs));
+    }
+    this.deps.recordEvent("daemon.agent.model_seen.reported", {
+      agentId: agent.agentId,
+      launchId: agent.launchId ?? undefined,
+      host: "oar",
+      trigger,
+      conversations_count: reports.reduce((count, items) => count + items.length, 0),
+      messages_count: messages.length,
+    });
+  }
+
   /** Why a steer into the running turn waits, or null to steer now. */
   private steerHeldReason(agent: HostedAgent): string | null {
     if (agent.steerHold.compacting) return "held_while_compacting";
     if (agent.codexActivity?.inReview) return "held_while_reviewing";
     if (agent.steerHold.refusals >= STEER_REFUSALS_PER_TURN) return "held_after_steer_refusals";
+    if (this.turnSilentPastStall(agent)) return "held_while_silent";
     return null;
+  }
+
+  /**
+   * Task #triage:#496: a running turn with no record for the stall threshold
+   * and no tool open (the "No runtime output" report's condition, on the clock
+   * `stalledWithWorkFacts` reads). A steer into it would be taken by a turn
+   * that may never speak again, leave nothing held, and so never let
+   * reconciler step 9 replace the session; held, it does (`stalledWithWork`,
+   * resumed with the delivery). An open tool is a long command: still steered.
+   */
+  private turnSilentPastStall(agent: HostedAgent): boolean {
+    const session = agent.session;
+    if (!session || agent.openToolCalls.size > 0) return false;
+    const status = session.status().value;
+    if (status.kind !== "running") return false;
+    const lastProgressAt = Math.max(status.lastEventAt, agent.turnStartedAtMs ?? 0);
+    return this.now() - lastProgressAt >= this.stallThresholds.stallMs;
   }
 
   /**
@@ -4222,7 +5642,7 @@ export class OarAgentHost {
    * `daemon_drained` and acked once (the legacy host's
    * `completeTrackedMentionDelivery`).
    */
-  private accept(agent: HostedAgent, delivery: Delivery): void {
+  private accept(agent: HostedAgent, delivery: Delivery, taken: InputTaken | null = null): void {
     const now = this.now();
     if (delivery.message.message_id) agent.delivered.remember(delivery.message.message_id, now);
     for (const context of delivery.contexts) if (context.deliveryId) agent.delivered.remember(context.deliveryId, now);
@@ -4231,7 +5651,7 @@ export class OarAgentHost {
       mention.onMentionTransition?.("daemon_drained", "accepted");
       mention.onMentionAck?.();
     }
-    delivery.onAccepted?.();
+    if (taken) delivery.onAccepted?.(taken);
     delivery.settle(true);
   }
 
@@ -4458,11 +5878,20 @@ export class OarAgentHost {
     // Not started yet (its commit decides nothing: the first turn end does), or already ending.
     if (!this.isCurrent(agent) || !agent.committed || !session) return true;
     // Reconciler step 15: deliveries held for the old account wait for the next session, not this one;
-    // so do those of a drift that drops the session (another runtime, or a Codex model), else a
+    // so do those of a drift that drops the session (another runtime, or a model switch), else a
     // delivery held for the old runtime's usage limit holds the switch until that limit resets (#triage:#263).
     const nextSessionTakesInbox = drift.includes("credential_account")
       || (agent.startedSpec !== null && agent.startedSpec !== undefined && sessionDropReason(agent.startedSpec, runtimeSpecOf(agent.request.config)) !== null);
-    const notIdle = this.agentNotIdle(agent, session, nextSessionTakesInbox ? { ignoreUntoldInbox: true } : {});
+    // #proj-runtime:#80: non-interrupting pushes (rebind, reconnect resend,
+    // older servers) stay idle-safe for the foreground turn while ignoring
+    // background tasks for explicit agent config drift. Immediate mid-turn
+    // interrupts arrive via `agent:config` `{ interrupt: true }` paired with
+    // server `resetAgent` (`applyConfig`).
+    const hasAgentConfigDrift = drift.some((kind) => kind !== "features" && kind !== "credential_account");
+    const notIdle = this.agentNotIdle(agent, session, {
+      ...(hasAgentConfigDrift ? { ignoreBackgroundTasks: true } : {}),
+      ...(nextSessionTakesInbox ? { ignoreUntoldInbox: true } : {}),
+    });
     const long = this.idleHolds.observe(agent.agentId, agent.processInstanceId, "spec_restart", notIdle, this.now());
     if (long) {
       this.deps.recordEvent("daemon.agent.idle_hold_long", {
@@ -4513,19 +5942,38 @@ export class OarAgentHost {
    * Reconciler step 8a (`chooseSession`): `config` without its session when
    * it started on another runtime, or is a Codex session that started on
    * another model (step 7, SessionSpecMemory, either host's): this start
-   * opens a new one. Traced with the reason only. The OAR host has no
-   * stuck-session refusal (task #10): no runtime it hosts keeps compaction
-   * failures on the session.
+   * opens a new one. For runtimes where compaction failure sticks to the
+   * session (`compactionFailure === "sticks_to_session"`, e.g. Pi), refuses to
+   * resume once the compaction failure threshold is reached (`session_needs_reset`).
    */
   private withoutSessionStartedOnOtherSpec(agent: HostedAgent, config: AgentConfig): AgentConfig {
     if (!config.sessionId) return config;
+    const stuckFailures = agent.driver.session.compactionFailure === "sticks_to_session"
+      ? this.compactionFailureLedger.needsReset(agent.agentId, config.sessionId, config.model ?? null)
+      : null;
     const choice = chooseSession({
       sessionId: config.sessionId,
       // #oar-raft:#10: a Cursor CLI session cannot be resumed by the Cursor SDK.
       specDrop: this.sessionSpecs.sessionToDrop(agent.agentId, config.sessionId, runtimeSpecOf(config))
         ?? runtimeHostSessionDrop(config.runtime, config.sessionId, "oar"),
+      stuckFailures,
     });
+    if (choice.kind === "refuse") {
+      this.deps.recordEvent("daemon.agent.start.session_needs_reset", {
+        agentId: agent.agentId,
+        launchId: agent.launchId ?? undefined,
+        runtime: config.runtime,
+        model: config.model,
+        consecutive_failures: choice.failures,
+        host: "oar",
+      }, "error");
+      const err = new RuntimeSessionNeedsResetError({ runtimeId: config.runtime, failures: choice.failures });
+      const failHere = `${err.message}. ${formatRuntimeResetSessionGuidance()}`;
+      throw new HandBack("session_needs_reset", undefined, { cause: err, failHere, failHereReason: "session_needs_reset" });
+    }
     if (choice.kind !== "new" || choice.reason !== "spec_drop") return config;
+    const priorRuntime = this.sessionSpecs.sessionOf(agent.agentId)?.runtime ?? config.runtime ?? "claude";
+    this.lastSessions.write(agent.agentId, priorRuntime, config.sessionId);
     const reason = choice.dropReason;
     logger.info(`[Agent ${agent.agentId}] Not resuming session ${config.sessionId}: it started on ${sessionDropReasonText(reason)}; a new session starts`);
     this.deps.recordEvent("daemon.agent.session_dropped_for_spec", { agentId: agent.agentId, launchId: agent.launchId ?? undefined, reason, host: "oar" });
@@ -4755,7 +6203,8 @@ export class OarAgentHost {
    * process, the Server starts the agent, and the start's recycle decision
    * (planWakeSessionRecycle, from the same summary) starts it fresh with a
    * briefing. Only while the Server's `wake_recycle_oar` is on for the agent,
-   * for the runtimes whose summary supplies the facts (Codex, Grok).
+   * for a session whose summary supplies the facts (`summarySuppliesResumeFacts`:
+   * OAR declares the context size for its installation).
    */
   private reconcileColdIdle(agent: HostedAgent, trigger: RuntimeSpecReconcileTrigger): void {
     const session = agent.session;
@@ -4774,7 +6223,25 @@ export class OarAgentHost {
     if (!facts || facts.lastActivityAtMs === null) return;
     const nowMs = this.now();
     if (recycle) {
-      const gate = coldIdleGate({ config, liveSessionId: session.id, lastEventAtMs: facts.lastActivityAtMs, runtimeCliVersion: undefined, nowMs });
+      const gate = coldIdleGate({
+        config,
+        liveSessionId: session.id,
+        lastEventAtMs: facts.lastActivityAtMs,
+        runtimeCliVersion: COLD_IDLE_RUNTIME_VERSION_FLOORS[agent.runtimeId]
+          ? this.deps.detectedRuntimeCliVersion?.(agent.runtimeId)
+          : undefined,
+        priorRecycleFailed: this.wakeRecycleFailures.hasFailed(agent.agentId, session.id),
+        nowMs,
+      });
+      if (!gate.pass && gate.reason === "prior_recycle_start_failed" && this.wakeRecycleFailures.noteYield(agent.agentId, session.id, "cold_idle")) {
+        this.deps.recordEvent("daemon.agent.wake_recycle.yielded", {
+          agentId: agent.agentId,
+          runtime: agent.runtimeId,
+          gate: "cold_idle",
+          reason: "prior_recycle_start_failed",
+          host: "oar",
+        });
+      }
       const verdict = gate.pass ? decideColdIdle(facts, { config: gate.config, lastEventAtMs: facts.lastActivityAtMs, nowMs }) : null;
       if (verdict?.cold && this.mayEndIdleSession(agent, session)) {
         this.deps.recordEvent("daemon.agent.cold_idle_stop", {
@@ -4851,10 +6318,9 @@ export class OarAgentHost {
   /** Whether the sweep should keep looking at this session for cold idle (reconcileColdIdle's cheap half). */
   private coldIdleCandidate(agent: HostedAgent): boolean {
     if (!this.isCurrent(agent) || !agent.committed || !agent.session || agent.stopping) return false;
-    if (!WAKE_RECYCLE_SUMMARY_FACTS_RUNTIMES.has(agent.runtimeId)) return false;
     const config = this.agentConfig(agent);
     const features = agent.serverFeatures ?? pickAgentServerFeatures(config);
-    if (features.wakeRecycleOar !== true) return false;
+    if (!summarySuppliesResumeFacts({ wakeRecycleOar: features.wakeRecycleOar === true }, agent.runtimeId, agent.sessionCapabilities?.contextUsage)) return false;
     return resolveWakeRecycleConfig(config.envVars).enabled;
   }
 
@@ -4896,7 +6362,8 @@ export class OarAgentHost {
    * not stalled (prefer holding a session longer over killing a long tool):
    * - inbox: the deliveries this host holds for the session (`pending`);
    *   nothing is ever written behind OAR's back (`after_turn` holds busy
-   *   deliveries here, a steer that lands is taken).
+   *   deliveries here, a steer that lands is taken). An app Inbox notice is
+   *   one of them (notifyAgentAppInbox), so none waits outside `pending`.
    * - turn: OAR's status is `running`; a stop underway: this host ends the
    *   session, or a turn abort is in flight (OAR's `stop.pendingAbortIds`).
    * - holds: the credential's provider limit (and its wait) or invalid record.
@@ -4915,10 +6382,11 @@ export class OarAgentHost {
   private stalledWithWorkFacts(agent: HostedAgent, session: Session): StalledWithWorkFacts {
     const status = session.status().value;
     const running = status.kind === "running";
-    const steers = agent.launch?.busyDelivery === "now";
+    const steers = launchSteers(agent, session);
     const lastProgressAt = running ? Math.max(status.lastEventAt, agent.turnStartedAtMs ?? 0) : null;
     return {
       inboxLength: agent.pending.length,
+      appInboxNoticeWaiting: false,
       turnInProgress: running,
       recoveryUnderway: agent.stopping || (running && (status.stop?.pendingAbortIds.length ?? 0) > 0),
       deliveryHold: this.stalledWithWorkDeliveryHold(agent),
@@ -5007,6 +6475,9 @@ export class OarAgentHost {
       streak,
     });
     this.publish(agent, "working", `Restarting stalled ${runtimeLabel} runtime for queued message`, "stalled_recovery");
+    if (agent.recycledFromSessionId) {
+      this.recordFailedWakeRecycleStart(agent, "stalled_before_ready");
+    }
     // Reconciler step 10b: the daemon's own stop is planned as the legacy
     // host plans it (`stalled_recovery`: clean, start now with the held
     // work, on the same session). A stall replacement starts again even when
@@ -5077,7 +6548,10 @@ export class OarAgentHost {
   respondToActivityProbe(agentId: string, probeId: string): void {
     const agent = this.agents.get(agentId);
     if (!agent) return;
-    this.sink.respondToProbe({ agentId, ...agent.last, launchId: agent.launchId ?? undefined }, probeId, this.producer(agent));
+    // The probe reply carries no runtime-error diagnostic here (unchanged by
+    // #proj-runtime:#66, which adds one only to the legacy host's held-limit reply).
+    const { runtimeError: _runtimeError, ...last } = agent.last;
+    this.sink.respondToProbe({ agentId, ...last, launchId: agent.launchId ?? undefined }, probeId, this.producer(agent));
   }
 
   /**
@@ -5150,6 +6624,10 @@ export class OarAgentHost {
       phase: row.subagent.phase,
       // #oar-raft:#18: which sub-agent, so one agent's sub-agent timeline can be read (a runtime thread id, no content).
       ...(row.subagent.taskId ? { task_id: row.subagent.taskId } : {}),
+      // As the legacy host's event: the subagents still running after this one,
+      // so how long an agent had work out with subagents can be read from
+      // traces (#proj-o11y:#43; the sink drops `task_id`'s value).
+      background_tasks_outstanding: agent.taskRows.runningCount(),
       host: "oar",
     });
   }
@@ -5248,15 +6726,114 @@ export class OarAgentHost {
     const agent = this.agents.get(agentId);
     const session = agent?.committed && !agent.stopping ? agent.session : null;
     if (!agent || !session || session.status().value.kind !== "running") {
-      this.deps.recordEvent("daemon.agent.turn_interrupt", { agentId, outcome: "not_running", host: "oar" });
+      this.deps.recordEvent("daemon.agent.turn_interrupt", {
+        agentId,
+        ...(agent ? { runtime: agent.runtimeId } : {}),
+        outcome: "not_running",
+        host: "oar",
+      });
       return { outcome: "not_running" };
     }
     agent.abortRequested = true;
     const aborted = await session.abort();
     if (aborted.kind !== "accepted") agent.abortRequested = false;
     const outcome = aborted.kind === "accepted" ? "interrupted" : "not_running";
-    this.deps.recordEvent("daemon.agent.turn_interrupt", { agentId, outcome, host: "oar", ...(aborted.kind === "rejected" ? { code: aborted.code } : {}) });
+    this.deps.recordEvent("daemon.agent.turn_interrupt", {
+      agentId,
+      runtime: agent.runtimeId,
+      outcome,
+      host: "oar",
+      ...(aborted.kind === "rejected" ? { code: aborted.code } : {}),
+    });
     return { outcome };
+  }
+
+  /** Kill the agent's side-question fork (its stop, delete or migration). */
+  stopSideAsk(agentId: string): void {
+    this.sideQuestions.stopForAgent(agentId);
+  }
+
+  /**
+   * #wg-runtime-form:#22 / #oar-raft:#48: status now for any running OAR agent,
+   * or one read-only question answered by a fork of its live Claude session.
+   * Who may ask is the server's decision; here only whether it can be answered.
+   */
+  async sideAsk(request: AgentSideAskRequest): Promise<{ outcome: AgentSideAskOutcome; text?: string }> {
+    const { agentId } = request;
+    const agent = this.agents.get(agentId);
+    const result = await (async (): Promise<{ outcome: AgentSideAskOutcome; text?: string }> => {
+      if (!agent || agent.stopping || !agent.committed || !agent.session) return { outcome: "agent_not_running" };
+      const config = agent.launchConfig ?? this.agentConfig(agent);
+      const sessionId = agent.session.id;
+      const summary = agent.summary?.current() ?? null;
+      const transcriptRef = agent.runtimeId === "claude" && sessionId
+        ? resolveRuntimeSessionRef("claude", sessionId, this.deps.runtimeSessionHomeDir)
+        : null;
+      const transcriptPath = transcriptRef?.reachable ? (transcriptRef.path ?? null) : null;
+      if (request.kind === "status") {
+        const working = transcriptPath ? await collectClaudeWorkingState(transcriptPath) : { notes: [], todos: null };
+        if (this.agents.get(agentId) !== agent || agent.stopping || !agent.session || agent.session.id !== sessionId) {
+          return { outcome: "agent_not_running" };
+        }
+        const summaryTodos = summary?.todos && summary.todos.sessionId === sessionId
+          ? todosFromItems(summary.todos.items, summary.todos.at)
+          : null;
+        const summaryNoteEntry = summary?.notes?.filter((entry) => entry.sessionId === sessionId).at(-1)
+          ?? (summary?.lastNote?.sessionId === sessionId ? { at: summary.lastNote.at, text: maskSecrets(summary.lastNote.text) } : null);
+        const summaryNote = summaryNoteEntry ? { at: summaryNoteEntry.at, text: summaryNoteEntry.text } : null;
+        const openTool = agent.openToolCalls.values().next().value;
+        return {
+          outcome: "answered",
+          text: sideAskStatusText({
+            activityKind: agent.last.activityKind || "idle",
+            detail: agent.last.detail || "",
+            ...(openTool ? { openTool } : {}),
+            todos: working.todos ?? summaryTodos,
+            lastNote: working.notes.at(-1) ?? summaryNote,
+            nowMs: this.now(),
+          }),
+        };
+      }
+      if (agent.runtimeId !== "claude") return { outcome: "unsupported_runtime" };
+      if (!sessionId || !transcriptPath) return { outcome: "agent_not_running" };
+      if (this.sideQuestions.isRunning(agentId)) return { outcome: "busy" };
+      if (this.providerLimits.get(this.credentialKey(agent), this.now())) return { outcome: "usage_limited" };
+      const facts = await readRuntimeSessionResumeFacts("claude", sessionId, this.deps.runtimeSessionHomeDir);
+      if (this.agents.get(agentId) !== agent || agent.stopping || !agent.session || agent.session.id !== sessionId) {
+        return { outcome: "agent_not_running" };
+      }
+      if (this.providerLimits.get(this.credentialKey(agent), this.now())) return { outcome: "usage_limited" };
+      const summaryContextTokens = summary?.sessionId === sessionId ? (summary.context?.tokens ?? 0) : 0;
+      if (Math.max(facts.lastContextTokens ?? 0, summaryContextTokens) > SIDE_ASK_FORK_MAX_CONTEXT_TOKENS) {
+        return { outcome: "context_too_large" };
+      }
+      const standingPromptFilePath = agentStateFile(this.deps.dataDir, agentId, "side-ask-standing-prompt.txt");
+      writeAgentStateText(standingPromptFilePath, String(getDriver("claude").buildSystemPrompt(config, agentId)));
+      const launchFields = runtimeConfigToLaunchFields(hydrateRuntimeConfig(config));
+      const env = sideQuestionEnv(ambientProcessEnv(), claudeSideQuestionProviderEnv(config));
+      const model = launchFields.model === "default" ? null : (launchFields.model?.trim() || "sonnet");
+      const args = claudeSideQuestionArgs({
+        sessionId,
+        model,
+        standingPromptFilePath,
+        customProvider: isClaudeCustomProviderConfig(config),
+      });
+      const cwd = path.join(this.deps.dataDir, agentId);
+      const startFork = this.deps.startClaudeSideQuestion ?? startClaudeSideQuestion;
+      return await this.sideQuestions.run(agentId, {
+        start: () => startFork(config, args, env, cwd),
+        prompt: sideQuestionPrompt(request.question, request.asker),
+        timeoutMs: sideAskTimeoutMs(request.timeoutMs),
+      });
+    })();
+    this.deps.recordEvent("daemon.agent.side_ask", {
+      agentId,
+      kind: request.kind,
+      outcome: result.outcome,
+      host: "oar",
+      ...(agent ? { runtime: agent.runtimeId, launchId: agent.launchId ?? undefined } : {}),
+    });
+    return result;
   }
 
   /**
@@ -5266,10 +6843,14 @@ export class OarAgentHost {
    * exit; a migration and the daemon's shutdown rely on it.
    */
   async stopAgent(agentId: string, { wait = false, silent = false, reason }: { wait?: boolean; silent?: boolean; reason?: AgentStopReason } = {}): Promise<void> {
+    this.sideQuestions.stopForAgent(agentId);
     const stopStartedAtMs = Date.now();
     const stopReason: AgentStopReason = reason ?? (silent ? "internal" : "explicit");
     // RFC 070 §6.5: a stop ends a pending warm mark and its timer; an explicit
     // one (also how an agent leaves this computer) forgets everything kept for it.
+    // #wg-ax:#3: Retry (explicit stop + start) keeps failed-recycle memory so
+    // retrying resumes the prior session instead of looping; only reset,
+    // deletion/migration (core.ts), session change, or TTL expiry clears it.
     if (silent) this.warmRecycle.dropPending(agentId);
     else this.warmRecycle.forget(agentId);
     const agent = this.agents.get(agentId);
@@ -5357,6 +6938,7 @@ export class OarAgentHost {
    * before the outbox stops.
    */
   async stopAll(): Promise<void> {
+    this.sideQuestions.stopAll();
     // Task #17: these stops are silent (no closing frame), so a held empty
     // wake would go with the daemon; published first, as the legacy host does.
     for (const agent of this.agents.values()) if (agent.committed && !agent.stopping) this.publishReleasedTurn(agent);
@@ -5364,6 +6946,7 @@ export class OarAgentHost {
     await Promise.all([...this.unwinding.keys()].map((agentId) => this.unwound(agentId)));
     this.clearReconcileSweep();
     this.warmRecycle.clear();
+    this.wakeRecycleFailures.clearAll();
     this.drain.dispose();
   }
 
@@ -5449,11 +7032,13 @@ export class OarAgentHost {
    */
   private release(agent: HostedAgent, reason: string, { keepTurnSummary = false }: { keepTurnSummary?: boolean } = {}): void {
     agent.stopping = true;
+    this.sideQuestions.stopForAgent(agent.agentId);
     this.endTurnTraceOnRelease(agent, reason);
     agent.nextTurn = null;
     // The session's last turn may not have ended: keep what it did so far.
     agent.summary?.flush();
     agent.summary = null;
+    agent.turnAborts = null;
     agent.activity = null;
     agent.codexActivity = null;
     for (const unsubscribe of agent.unsubscribe.splice(0)) unsubscribe();
@@ -5473,7 +7058,11 @@ export class OarAgentHost {
       this.warmRecycle.dropPending(agent.agentId);
     }
     // Reconciler step 7: the session it ran, for the next start's check (either host).
-    if (agent.session && agent.startedSpec) this.sessionSpecs.remember(agent.agentId, agent.session.id, agent.startedSpec);
+    // #wg-ax:#3: never overwrite sessionSpecs or lastSessions with an unready recycled session.
+    if (agent.session && agent.startedSpec && !agent.recycledFromSessionId) {
+      this.sessionSpecs.remember(agent.agentId, agent.session.id, agent.startedSpec);
+      this.lastSessions.write(agent.agentId, agent.startedSpec.runtime, agent.session.id);
+    }
   }
 
   /**
@@ -5719,11 +7308,52 @@ export class OarAgentHost {
     });
   }
 
+  private retireRecycledPriorSession(agent: HostedAgent): void {
+    if (agent.recycledFromSessionId) {
+      // #wg-ax:#3: if this launch already failed or is stopping, a late event
+      // must never undo the fallback or overwrite the prior session.
+      if (
+        agent.stopping
+        || !this.isCurrent(agent)
+        || this.wakeRecycleFailures.hasFailed(agent.agentId, agent.recycledFromSessionId)
+      ) {
+        return;
+      }
+      const retiredSessionId = agent.recycledFromSessionId;
+      agent.recycledFromSessionId = null;
+      this.forgetSessionContext(agent, retiredSessionId);
+      this.wakeRecycleFailures.clear(agent.agentId);
+      if (agent.session) {
+        this.lastSessions.write(agent.agentId, agent.startedSpec?.runtime ?? agent.runtimeId, agent.session.id);
+        this.reportSession(agent, agent.session.id);
+        const hosted = this.hostedSession(agent.agentId);
+        if (hosted) this.deps.sendRuntimeProfileReport?.(agent.agentId, hosted, "session_init");
+        this.reportContextViewSession(agent);
+      }
+    } else if (agent.session && !this.wakeRecycleFailures.hasFailed(agent.agentId, agent.session.id)) {
+      this.wakeRecycleFailures.clear(agent.agentId);
+    }
+  }
+
   private sendRuntimeReady(agent: HostedAgent, again: boolean): void {
     agent.runtimeReadySent = true;
     if (!agent.launchId) return;
     if (!again) this.deps.recordEvent("daemon.agent.oar.runtime_ready", { agentId: agent.agentId, launchId: agent.launchId });
     this.deps.sendToServer({ type: "agent:runtime:ready", agentId: agent.agentId, launchId: agent.launchId });
+  }
+
+  private recordFailedWakeRecycleStart(agent: HostedAgent, reason: string): void {
+    const priorSessionId = agent.recycledFromSessionId;
+    if (!priorSessionId || this.wakeRecycleFailures.hasFailed(agent.agentId, priorSessionId)) return;
+    this.wakeRecycleFailures.recordFailedRecycle(agent.agentId, priorSessionId);
+    logger.warn(`[Agent ${agent.agentId}] Recycled ${agent.runtimeId} OAR start failed before readiness (${reason}); next wake will resume prior session ${priorSessionId}`);
+    this.deps.recordEvent("daemon.agent.wake_recycle.start_failed", {
+      agentId: agent.agentId,
+      launchId: agent.launchId ?? undefined,
+      runtime: agent.runtimeId,
+      reason,
+      host: "oar",
+    }, "error");
   }
 
   /** The first turn end of this process, once (the server marks read what the agent owes nothing in). */
@@ -5844,6 +7474,17 @@ export function isOarHostEnabled(env: NodeJS.ProcessEnv = process.env): boolean 
 }
 
 /**
+ * Whether the OAR host supports running `runtime` on `platform`.
+ * Shared by `OarAgentHost.supports` and `detectRuntimes` (`core.ts`) so
+ * OAR-only runtimes that work on Windows stay detected there.
+ * Antigravity is CI-verified on Windows in OAR against real `agy 1.5.11`;
+ * switch to OAR's `Runtime.verifiedPlatforms` once `@botiverse/oar` publishes it.
+ */
+export function isOarRuntimeSupportedOnPlatform(runtime: string, platform: NodeJS.Platform = process.platform): boolean {
+  return platform !== "win32" || runtime === "codex" || runtime === "antigravity";
+}
+
+/**
  * Reconciler step 11: a pushed config as a running launch's request takes
  * it: the launch keeps its own session and runner credential (the server's
  * push carries neither for it).
@@ -5854,5 +7495,6 @@ function withPushedConfig(current: AgentConfig, pushed: AgentConfig): AgentConfi
     sessionId: current.sessionId,
     agentCredentialKey: current.agentCredentialKey,
     agentCredentialId: current.agentCredentialId,
+    ...(current.agentCredentialExpiresAt !== undefined ? { agentCredentialExpiresAt: current.agentCredentialExpiresAt } : {}),
   };
 }

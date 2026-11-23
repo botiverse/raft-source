@@ -4,8 +4,8 @@
   "sourceCommit": "04e85a21e3fd5fb01ff7e1c7083636cb1353be50",
   "nodeVersion": "v24.21.0",
   "shardCount": 6,
-  "totalFiles": 77,
-  "totalDurationMsLocal": 430423,
+  "totalFiles": 78,
+  "totalDurationMsLocal": 433423,
   "maxFileDurationMsLocal": 23284,
   "profileVerdict": "failed_but_timed",
   "profileFailureReasons": [
@@ -248,6 +248,11 @@
       "profileStatus": "passed"
     },
     {
+      "file": "tests/e2e/tests/thread/folded-back-stays-in-channel.spec.ts",
+      "durationMs": 3000,
+      "profileStatus": "passed"
+    },
+    {
       "file": "tests/e2e/tests/agents/agent-detail-visibility.spec.ts",
       "durationMs": 2879,
       "profileStatus": "passed"
@@ -416,7 +421,7 @@
   "shards": [
     {
       "shard": 1,
-      "expectedDurationMs": 67302,
+      "expectedDurationMs": 70302,
       "files": [
         "tests/e2e/tests/channel/back-to-bottom.spec.ts",
         "tests/e2e/tests/channel/joint-add-member.spec.ts",
@@ -426,6 +431,7 @@
         "tests/e2e/tests/select/select-image-shot.spec.ts",
         "tests/e2e/tests/select/select-thread-share.spec.ts",
         "tests/e2e/tests/settings-server.spec.ts",
+        "tests/e2e/tests/thread/folded-back-stays-in-channel.spec.ts",
         "tests/e2e/tests/thread/inbox-contract.spec.ts",
         "tests/e2e/tests/thread/inline-replies-cold-entry.spec.ts",
         "tests/e2e/tests/thread/reopen-consistency.spec.ts",

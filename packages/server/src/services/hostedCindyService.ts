@@ -20,6 +20,8 @@ import { onProvisionImported, onProvisionImportFailed } from "./agentRuntimeProv
 import { assertProviderProvisioningAvailable, deleteProviderAgentNow, kickAgentRuntimeProvisionWorker, recordAgentProvisioning, retryAgentProvisioning, settleProvisionDeleted } from "./agentRuntimeProvisionService";
 import { kickAppNotificationDelivery } from "./appNotificationDeliveryService";
 import { createAgent } from "./agentService";
+import { sealAgentEnvVars, sealAgentRuntimeConfig } from "./agentSecretCrypto";
+import { isAgentSecretWriteEncryptionEnabled } from "./agentSecretFlags";
 import { PrincipalHandleConflictError } from "./principalHandleService";
 import { OFFICIAL_ONBOARDING_AGENT_IDENTITY } from "./officialOnboardingAgentIdentity";
 import * as serverService from "./serverService";
@@ -60,7 +62,7 @@ export function isHostedCindyTestEntryDeployment(env: NodeJS.ProcessEnv = proces
 export async function isHostedCindyTestEntryAvailable(input: { serverId: string; userId: string }): Promise<boolean> {
   if (!isHostedCindyTestEntryDeployment()) return false;
   const server = await serverService.getServer(input.serverId);
-  if (!server || server.ownerId !== input.userId || server.onboardingAgentId) return false;
+  if (!server || server.ownerId !== input.userId || server.officialOnboardingAgentId) return false;
   try {
     return await isAgentRuntimeProviderEnabledForServer(input.serverId, "antiproton");
   } catch {
@@ -226,12 +228,13 @@ export async function convertFailedHostedCindyToComputer(input: {
     // Runtime columns only (her profile, name and role stay): the computer runtime and
     // seed the owner picked, on the computer they picked.
     const now = currentDate();
+    const encryptOnWrite = await isAgentSecretWriteEncryptionEnabled(input.serverId, tx);
     const converted = await tx.update(agents).set({
       runtime: input.runtime,
       model: input.model,
-      runtimeConfig: input.runtimeConfig,
+      runtimeConfig: encryptOnWrite ? sealAgentRuntimeConfig(input.agentId, input.runtimeConfig) : input.runtimeConfig,
       reasoningEffort: input.reasoningEffort,
-      envVars: input.envVars,
+      envVars: encryptOnWrite ? sealAgentEnvVars(input.agentId, input.envVars) : input.envVars,
       sessionId: null,
       machineId: input.machineId,
       ...(input.machineId ? { machineReleaseReason: null, machineReleasedAt: null } : {}),
@@ -492,7 +495,7 @@ export async function provisionHostedCindy(input: {
   if (!enabled) return { outcome: "disabled" };
   const server = await serverService.getServer(input.serverId);
   if (!server) return { outcome: "unavailable" };
-  if (server.onboardingAgentId) return { outcome: "exists" };
+  if (server.officialOnboardingAgentId) return { outcome: "exists" };
   // A Cindy whose server link was lost (created before links committed together): relink her.
   const [orphan] = await getDb().select({ agentId: agentRuntimeProvisions.agentId }).from(agentRuntimeProvisions).where(and(
     eq(agentRuntimeProvisions.serverId, input.serverId),

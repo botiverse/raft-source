@@ -2,7 +2,7 @@ import type { CSSProperties } from "react";
 import { useIntl } from "react-intl";
 import RootFallbackScroller from "./RootFallbackScroller";
 import { TraceIdNote } from "./TraceIdNote";
-import { forgetRememberedPlaces } from "../../hooks/tabRouteMemoryKeys";
+import { forgetRememberedPlaces } from "../../hooks/placeMemoryKeys";
 
 function reloadApp() {
   window.location.reload();

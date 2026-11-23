@@ -346,12 +346,20 @@ export type OwnerIntent =
    */
   | { kind: "stop"; reason: "manual" | "internal"; daemonReason?: AgentStopReason }
   /**
-   * Reconciler step 11b: push the agent's current config to its daemon. Only
-   * the kind crosses Redis: the owner reads the database, builds the config
-   * (env vars may hold secrets) and sends it on its own socket. An owner on an
-   * older build answers it with no result (START_INTENT_UNANSWERED).
+   * Reconciler step 11b + #proj-runtime:#80: push the agent's current config to
+   * its daemon. Only the kind and fallback mode cross Redis: the owner reads
+   * the database, builds the config (env vars may hold secrets) and sends it on
+   * its own socket. When the daemon lacks `agent:config-push-v1` and
+   * `fallbackRestartMode` is set, the owner triggers an idle-safe fallback
+   * restart instead (immediately if idle, or when idle if busy). An owner on an
+   * older build ignores the optional fields or answers with no result
+   * (START_INTENT_UNANSWERED).
    */
-  | { kind: "config" }
+  | {
+      kind: "config";
+      fallbackRestartMode?: "restart" | "session";
+      terminalControl?: "runtime_config_changed";
+    }
   | {
       kind: "reset";
       mode: "restart" | "session" | "full";
@@ -360,6 +368,12 @@ export type OwnerIntent =
         restartIfStopped?: boolean;
         /** RFC 071 §5: a human E3 reset or a real runtime-config change. */
         terminalControl?: "human_reset" | "runtime_config_changed";
+        /**
+         * A person's reset: revoke the agent's runner credentials between the
+         * stop and the start. An owner on an older build ignores it (that
+         * reset revokes nothing, as before).
+         */
+        revokeRunnerCredentials?: { actorUserId: string };
       };
     };
 export interface StartIntentRequest {
@@ -383,8 +397,20 @@ export type StartIntentResult =
       | "terminal_failure_needs_manual";
   }
   | { outcome: "done" }
-  /** A `config` intent: whether the owner sent `agent:config`. */
-  | { outcome: "config"; pushed: boolean };
+  /**
+   * A `config` intent: whether the owner sent `agent:config` (`pushed`),
+   * whether the agent was running a foreground turn (`busy`) or was
+   * interrupted and immediately restarted (`restarted`, on Computers with
+   * `agent:config-interrupt-v1`), or whether an older daemon fell back to a
+   * server-side restart (`fallback`).
+   */
+  | {
+      outcome: "config";
+      pushed: boolean;
+      busy?: boolean;
+      restarted?: boolean;
+      fallback?: "restarted" | "when_idle";
+    };
 /**
  * The owner answered with neither a result nor a failure: an owner on an
  * older build that does not know the intent's kind (its switch falls through)
@@ -497,9 +523,7 @@ async function handleStartIntent(request: StartIntentRequest, replyReplicaId: st
     if (!_startIntentHandler) throw new Error("Start intent handler unavailable");
     reply = { result: await _startIntentHandler(request) };
   } catch (error) {
-    const err = error instanceof Error ? error : new Error(String(error));
-    const subkind = (err as { subkind?: unknown }).subkind;
-    reply = { failure: { name: err.name, message: err.message, ...(typeof subkind === "string" ? { subkind } : {}) } };
+    reply = { failure: startIntentFailureOf(error) };
   }
   await getRedis().publish(replicaChannel(replyReplicaId), JSON.stringify({
     type: "agent:start:intent:result", requestId: request.requestId, ...reply,
@@ -514,6 +538,13 @@ function settleStartIntent(requestId: string, result?: StartIntentResult, failur
   const settled = startIntentReply(result, failure);
   if (settled instanceof StartIntentRemoteError) pending.reject(settled);
   else pending.resolve(settled);
+}
+
+/** How an owner-side failure crosses the wire (name, message, subkind). Exported for tests. */
+export function startIntentFailureOf(error: unknown): StartIntentFailure {
+  const err = error instanceof Error ? error : new Error(String(error));
+  const subkind = (err as { subkind?: unknown }).subkind;
+  return { name: err.name, message: err.message, ...(typeof subkind === "string" ? { subkind } : {}) };
 }
 
 /** What a requester makes of an owner's reply. Exported for tests. */
@@ -1768,6 +1799,7 @@ export function buildAgentActivityHashFields(input: {
   detail: string;
   detailKind: AgentActivityDetailKind;
   observedAtMs?: number;
+  livenessAtMs?: number;
   carriers?: PersistedActivityTypedCarriers;
   updatedAtMs: number;
 }): Record<string, string> {
@@ -1777,6 +1809,7 @@ export function buildAgentActivityHashFields(input: {
     detailKind: input.detailKind,
     updatedAt: String(input.updatedAtMs),
     observedAtMs: input.observedAtMs !== undefined ? String(input.observedAtMs) : "",
+    livenessAtMs: input.livenessAtMs !== undefined ? String(input.livenessAtMs) : "",
     carriers: encodeActivityTypedCarriers(input.carriers) ?? "",
   };
 }
@@ -1788,11 +1821,12 @@ export async function setAgentActivity(
   detailKind: AgentActivityDetailKind,
   observedAtMs?: number,
   carriers?: PersistedActivityTypedCarriers,
+  livenessAtMs?: number,
 ) {
   if (!isRedisAvailable()) return;
   const redis = getRedis();
   const key = `slock:agent:${agentId}:activity`;
-  const fields = buildAgentActivityHashFields({ activity, detail, detailKind, observedAtMs, carriers, updatedAtMs: Date.now() });
+  const fields = buildAgentActivityHashFields({ activity, detail, detailKind, observedAtMs, livenessAtMs, carriers, updatedAtMs: Date.now() });
   const pipeline = redis.pipeline();
   pipeline.hset(key, fields);
   pipeline.expire(key, 600); // 10 min TTL
@@ -1847,6 +1881,8 @@ export function decodeActivityTypedCarriers(raw: string | undefined): PersistedA
 export function projectAgentActivityFromRedisHash(data: Record<string, string>): PersistedAgentActivity | null {
   if (!data.activity) return null;
   const observedAtMs = data.observedAtMs ? Number(data.observedAtMs) : NaN;
+  // Absent on hashes written before #oar-raft:#22 and on non-heartbeat writes.
+  const livenessAtMs = data.livenessAtMs ? Number(data.livenessAtMs) : NaN;
   const carriers = decodeActivityTypedCarriers(data.carriers);
   return {
     activity: normalizeActivity(data.activity),
@@ -1854,6 +1890,7 @@ export function projectAgentActivityFromRedisHash(data: Record<string, string>):
     detailKind: normalizeActivityDetailKind(data.detailKind),
     ...(Number.isFinite(observedAtMs) ? { observedAtMs } : {}),
     updatedAt: Number(data.updatedAt) || 0,
+    ...(Number.isFinite(livenessAtMs) ? { livenessAtMs } : {}),
     ...(carriers ? { carriers } : {}),
   };
 }
@@ -2579,6 +2616,8 @@ export interface MachineMeta {
   memoryTotalBytes?: string | null;
   /** #proj-raft-computer task #34: JSON of `ready.installerRepairHint` / its later change; null when there is nothing to hint. */
   installerRepairHint?: string | null;
+  /** JSON of `ready.upgradeScope` (a refusal of the web upgrade's scope); null when allowed or unknown. */
+  upgradeScope?: string | null;
 }
 
 // 1h TTL: long enough that brief Redis hiccups don't drop live metadata,

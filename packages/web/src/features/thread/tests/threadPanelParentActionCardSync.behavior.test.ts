@@ -22,11 +22,24 @@ if (typeof globalThis.localStorage?.getItem !== "function") {
 }
 
 const {
+  applyThreadParentMessagePatch,
   findCachedThreadParentMessage,
   findThreadParentMessage,
+  mergeThreadMessageUpdates,
+  mergeThreadMessages,
   pickFreshThreadParentMessage,
   syncThreadParentMessageFromStore,
 } = await import("../threadMessages");
+const {
+  applyLocalMessagePatch,
+  applyMessageUpdated,
+  subscribeMessageUpdated,
+} = await import("../../../store/messageUpdatedApply");
+const {
+  captureReceiverPrivateIngressContext,
+  useMessageStore,
+} = await import("../../../store/messageStore");
+import type { ActionCardMetadata } from "@botiverse/raft-shared";
 import type { Message } from "../../../store/messageStore";
 
 function message(overrides: Partial<Message> = {}): Message {
@@ -97,4 +110,134 @@ test("syncThreadParentMessageFromStore leaves local parent untouched without a s
   });
 
   assert.equal(called, false);
+});
+
+function questionCardMetadata(state: "prepared" | "executed"): ActionCardMetadata {
+  return {
+    kind: "action-card",
+    state,
+    confirmationVersion: 1,
+    action: {
+      type: "question:ask",
+      to: "@owner",
+      questions: [
+        {
+          id: "q1",
+          kind: "single",
+          text: "Strategy?",
+          required: true,
+          options: [{ value: "scale", label: "Scale" }, { value: "keep", label: "Keep" }],
+          other: true,
+        },
+      ],
+    },
+  };
+}
+
+test("applyLocalMessagePatch flips an uncached ThreadPanel parent action card to executed", () => {
+  useMessageStore.setState({ channelMessages: {}, messages: [] });
+  const preparedMeta = questionCardMetadata("prepared");
+  const executedMeta = questionCardMetadata("executed");
+  let localParent: Message | null = message({
+    id: "card-parent-1",
+    channelId: "uncached-parent-channel",
+    actionMetadata: preparedMeta,
+  });
+
+  const unsubscribe = subscribeMessageUpdated((patch) => {
+    applyThreadParentMessagePatch("card-parent-1", patch, (next) => {
+      localParent = typeof next === "function" ? next(localParent) : next;
+    });
+  });
+
+  try {
+    applyLocalMessagePatch({
+      id: "card-parent-1",
+      channelId: "uncached-parent-channel",
+      actionMetadata: executedMeta,
+    });
+
+    assert.equal(useMessageStore.getState().channelMessages["uncached-parent-channel"], undefined);
+    assert.equal(localParent?.actionMetadata, executedMeta);
+
+    // An out-of-order stale prepared snapshot must not revert an executed action card.
+    applyLocalMessagePatch({
+      id: "card-parent-1",
+      channelId: "uncached-parent-channel",
+      actionMetadata: preparedMeta,
+    });
+    assert.equal(localParent?.actionMetadata, executedMeta);
+  } finally {
+    unsubscribe();
+  }
+});
+
+test("applyMessageUpdated updates an uncached ThreadPanel parent message on live socket delivery", () => {
+  useMessageStore.setState({ channelMessages: {}, messages: [], currentUserId: "u-1" });
+  const preparedMeta = questionCardMetadata("prepared");
+  const executedMeta = questionCardMetadata("executed");
+  let localParent: Message | null = message({
+    id: "card-parent-2",
+    channelId: "uncached-parent-channel",
+    actionMetadata: preparedMeta,
+  });
+
+  const unsubscribe = subscribeMessageUpdated((patch) => {
+    applyThreadParentMessagePatch("card-parent-2", patch, (next) => {
+      localParent = typeof next === "function" ? next(localParent) : next;
+    });
+  });
+
+  try {
+    applyMessageUpdated(
+      message({
+        id: "card-parent-2",
+        channelId: "uncached-parent-channel",
+        actionMetadata: executedMeta,
+      }),
+      captureReceiverPrivateIngressContext("u-1"),
+    );
+
+    assert.equal(localParent?.actionMetadata, executedMeta);
+  } finally {
+    unsubscribe();
+  }
+});
+
+test("applyLocalMessagePatch and mergeThreadMessages propagate actionMetadata-only updates on thread replies", () => {
+  useMessageStore.setState({ channelMessages: {}, messages: [] });
+  const preparedMeta = questionCardMetadata("prepared");
+  const executedMeta = questionCardMetadata("executed");
+  const reply = message({
+    id: "reply-card-1",
+    channelId: "thread-channel-1",
+    seq: 10,
+    actionMetadata: preparedMeta,
+  });
+  let localReplies: Message[] = [reply];
+
+  const unsubscribe = subscribeMessageUpdated((patch) => {
+    if (patch.channelId !== "thread-channel-1") return;
+    localReplies = mergeThreadMessageUpdates(localReplies, [patch]);
+  });
+
+  try {
+    applyLocalMessagePatch({
+      id: "reply-card-1",
+      channelId: "thread-channel-1",
+      actionMetadata: executedMeta,
+    });
+
+    assert.equal(localReplies[0]?.actionMetadata, executedMeta);
+  } finally {
+    unsubscribe();
+  }
+
+  // mergeThreadMessages (used by mergeThreadBucketWithinWindow) must also detect actionMetadata changes.
+  const merged = mergeThreadMessages(
+    [reply],
+    [{ ...reply, actionMetadata: executedMeta }],
+  );
+  assert.notEqual(merged, [reply]);
+  assert.equal(merged[0]?.actionMetadata, executedMeta);
 });

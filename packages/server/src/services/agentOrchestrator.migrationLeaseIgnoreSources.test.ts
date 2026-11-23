@@ -3,6 +3,7 @@ import {
   AGENT_MIGRATION_CAPABILITY,
   AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY,
   AGENT_MIGRATION_TARGET_IGNORED_PARTIAL_CAPABILITY,
+  AGENT_MIGRATION_TARGET_SKIPPED_UNREADABLE_CAPABILITY,
 } from "@botiverse/raft-shared";
 import { AgentOrchestrator } from "./agentOrchestrator";
 
@@ -95,4 +96,19 @@ test("the source lease says the target accepts a partial ignored mark only when 
   });
   assert.deepEqual(h.sent[1]!.message, { ...lease("source", "target-sources"), targetAcceptsIgnoreSources: true });
   assert.deepEqual(h.sent[2]!.message, lease("target", "target-both"), "a target lease never carries either");
+});
+
+test("the source lease says the target accepts named unreadable paths only when the target advertises it", async () => {
+  const h = harness({
+    "target-new": [AGENT_MIGRATION_CAPABILITY, AGENT_MIGRATION_TARGET_SKIPPED_UNREADABLE_CAPABILITY],
+    "target-old": [AGENT_MIGRATION_CAPABILITY],
+  });
+
+  await send(h, "source-1", lease("source", "target-new"));
+  await send(h, "source-1", lease("source", "target-old"));
+  await send(h, "target-new", lease("target", "target-new"));
+
+  assert.deepEqual(h.sent[0]!.message, { ...lease("source", "target-new"), targetAcceptsSkippedUnreadable: true });
+  assert.deepEqual(h.sent[1]!.message, lease("source", "target-old"));
+  assert.deepEqual(h.sent[2]!.message, lease("target", "target-new"), "a target lease never carries it");
 });

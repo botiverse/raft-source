@@ -1,7 +1,8 @@
-// Server entities (channels, people, agents, machines) are a ranked list: every
-// reasonable match (up to MAX_ENTITY_RESULTS) is reachable. The section shows
-// the first ENTITY_PREVIEW_COUNT and a "Show All N" link that lists the rest in
-// place, so the messages below stay in reach without a nested scroller. The
+// Destinations come in sections (channels, people, computers): the server's
+// groups once they answer (every match reachable through "Show all N" and the
+// group's cursor), the local first paint (up to MAX_ENTITY_RESULTS) before. A
+// section shows the first ENTITY_PREVIEW_COUNT and a "Show all N" link that
+// lists the rest in place, so the messages below stay in reach without a nested scroller. The
 // page's one scroller is its ScrollArea (Raft DS › Search): a fixed-height
 // scroller inside it clipped the list on phones, leaving the rows past the
 // sixth unreachable under a blank page.

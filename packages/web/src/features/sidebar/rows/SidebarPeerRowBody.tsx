@@ -6,6 +6,8 @@ import { getDmUnreadIndicatorState } from "../../../utils/channelUnreadIndicator
 import { QuietUnreadDot } from "../../../components/layout/QuietUnreadDot";
 import { SIDEBAR_ROW_TRAILING_CLASS } from "./sidebarRowClasses";
 import { SidebarActivityMutedMark } from "./SidebarActivityMutedMark";
+import { SidebarBrowserInUseMark } from "./SidebarBrowserInUseMark";
+import type { SidebarBrowserInUse } from "./SidebarBrowserInUseMark";
 
 /**
  * What every person or agent conversation row shows, in whichever section it
@@ -23,7 +25,7 @@ import { SidebarActivityMutedMark } from "./SidebarActivityMutedMark";
  * can never squeeze it to nothing. A muted DM (only one with an App bot can be
  * muted) carries a muted channel row's bell-off and grey count.
  */
-export function SidebarPeerRowBody({ avatar, displayName, nameBadge, description, unread, markedUnread = false, hasDraft, agentMeta, activityMuted = false }: {
+export function SidebarPeerRowBody({ avatar, displayName, nameBadge, description, unread, markedUnread = false, hasDraft, agentMeta, activityMuted = false, browserInUse = null }: {
   avatar: ReactNode;
   displayName: ReactNode;
   nameBadge?: ReactNode;
@@ -34,6 +36,8 @@ export function SidebarPeerRowBody({ avatar, displayName, nameBadge, description
   hasDraft: boolean;
   agentMeta: ReactNode;
   activityMuted?: boolean;
+  /** The built-in browser's kept pages of this conversation use a device or play sound (SidebarBrowserInUseMark). */
+  browserInUse?: SidebarBrowserInUse | null;
 }) {
   const { formatMessage } = useIntl();
   // Muted unread is a grey mono number (`.rf-count`), not the pink badge.
@@ -50,6 +54,8 @@ export function SidebarPeerRowBody({ avatar, displayName, nameBadge, description
         {description ? <SidebarItemSubtitle data-sidebar-row-description="">{description}</SidebarItemSubtitle> : null}
       </SidebarItemContent>
       <span className={SIDEBAR_ROW_TRAILING_CLASS}>
+        {/* First in the trailing column: before the count / dot / pencil and the agent meta. */}
+        <SidebarBrowserInUseMark inUse={browserInUse} />
         {unread > 0 ? (
           <UnreadCount>
             {/* Stryker disable all: pre-existing unread cap is outside the workspace mutation corpus. */}

@@ -1,8 +1,10 @@
 import { TextLink } from "@botiverse/raft-ui";
+import { currentTimeMs } from "@botiverse/raft-shared";
 import type { ToolStuckActivityDiagnostic } from "@botiverse/raft-shared";
-import { useEffect, useState } from "react";
+import { useSyncExternalStore } from "react";
 import { useIntl } from "react-intl";
 import Tooltip from "../ui/Tooltip";
+import { subscribeLiveTime } from "../../hooks/liveTimeClock";
 import type { AgentDisplayState } from "../../store/agentStore";
 
 const MINUTE_MS = 60_000;
@@ -28,24 +30,21 @@ export function visibleToolStuck(
   return toolStuck && displayState.isOnline && !displayState.blocked ? toolStuck : undefined;
 }
 
+const subscribeNever = () => () => {};
+
 /**
- * The "stuck on <tool> · X min · N waiting" line, re-rendered once a minute
- * while the agent is stuck (no timer otherwise). Null when not stuck.
+ * The "stuck on <tool> · X min · N waiting" line, re-rendered when its minutes
+ * change while the agent is stuck (no clock otherwise). Null when not stuck.
  */
 export function useToolStuckText(toolStuck: ToolStuckActivityDiagnostic | undefined): string | null {
   const { formatMessage } = useIntl();
-  // A minute tick only re-renders; the clock is read when rendering.
-  const [, setMinuteTick] = useState(0);
-  const stuck = toolStuck !== undefined;
-  useEffect(() => {
-    if (!stuck) return;
-    const timer = setInterval(() => setMinuteTick((tick) => tick + 1), MINUTE_MS);
-    return () => clearInterval(timer);
-  }, [stuck]);
+  // The minutes are the live clock's value, not read while rendering; a tick re-reads them.
+  const readMinutes = () => (toolStuck ? toolStuckMinutes(toolStuck, currentTimeMs()) : 0);
+  const minutes = useSyncExternalStore(toolStuck ? subscribeLiveTime : subscribeNever, readMinutes, readMinutes);
   if (!toolStuck) return null;
   return formatMessage(
     { id: "agent.status.toolStuck" },
-    { tool: toolStuck.toolName, minutes: toolStuckMinutes(toolStuck, Date.now()), queued: toolStuck.queuedMessages },
+    { tool: toolStuck.toolName, minutes, queued: toolStuck.queuedMessages },
   );
 }
 

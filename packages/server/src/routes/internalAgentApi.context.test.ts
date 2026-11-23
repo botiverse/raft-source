@@ -16,17 +16,19 @@ import {
   INBOX_ITEMS_CAPABILITY,
   MANUAL_CONTEXT_CAPABILITY,
   RAFT_CLIENT_CAPABILITIES_HEADER,
+  REMINDER_APP_CLI_CAPABILITY,
+  TASK_V2_CONVERSATIONS_FEATURE_FLAG_KEY,
   WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY,
   type AgentApiAgentContextResponse,
 } from "@botiverse/raft-shared";
 
 import { getDb } from "../db/index";
 import { eq } from "drizzle-orm";
-import { agents, users } from "../db/schema";
+import { agents, oauthClientInstalls, oauthClients, reminderAppMigrations, users } from "../db/schema";
 import { createServer } from "../services/serverService";
 import { createAgent } from "../services/agentService";
 import { mintAgentCredential } from "../services/agentCredentialService";
-import { AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY, createFeatureFlag, createFeatureFlagRule, REMINDER_APP_FEATURE_FLAG_KEY, VAULT_APP_FEATURE_FLAG_KEY } from "../services/featureFlagService";
+import { AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY, createFeatureFlag, createFeatureFlagRule, DM_REPLY_PLACEMENT_FEATURE_FLAG_KEY, getFeatureFlag, REMINDER_APP_FEATURE_FLAG_KEY, VAULT_APP_FEATURE_FLAG_KEY } from "../services/featureFlagService";
 import { __answerFlagForTests } from "../services/deploymentAnsweredFlags";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
@@ -131,6 +133,64 @@ test("GET /context reports the server's app rollout flags, the values a Computer
   assert.deepEqual(await features(), { reminderApp: true, vaultApp: false, enabledApps: [] });
 });
 
+// `raft reminder` routes to the App on `features.reminderApp`, so it must be
+// the same gate as the legacy-write refusal: the flag, or the Reminder App
+// installed with its legacy migration completed.
+test("GET /context reports the Reminder App on where it is installed and migrated, with its flag off", async ({ app }) => {
+  vi.stubEnv("REMINDER_APP_CLIENT_ID", "reminder-ctx");
+  try {
+    const { server, ownerId } = await seed();
+    const agent = await createAgent(server.id, "ctx-migrated", { runtime: "external", model: "external" });
+    const minted = await mintAgentCredential({ agentId: agent.id, scopes: ["read"], name: "ctx", issuedVia: "computer", createdByUserId: null });
+    const features = async () => (await (await getContext(app.baseUrl, minted.apiKey)).json() as AgentApiAgentContextResponse).features;
+    await createFeatureFlag({ key: REMINDER_APP_FEATURE_FLAG_KEY, randomizationUnit: "server", defaultEnabled: false });
+    assert.equal((await features())?.reminderApp, false, "flag off, not installed");
+
+    const db = getDb();
+    const [client] = await db.insert(oauthClients).values({
+      serverId: server.id, clientId: "reminder-ctx", clientSecretHash: "h", name: "Reminder", createdByUserId: ownerId,
+      appType: "third_party_global",
+    }).returning();
+    const [install] = await db.insert(oauthClientInstalls).values({
+      serverId: server.id, clientId: client!.id, installedByUserId: ownerId, approvedScopes: ["agent:notification:write"],
+    }).returning();
+    await db.insert(reminderAppMigrations).values({ serverId: server.id, installId: install!.id, state: "running" });
+    assert.equal((await features())?.reminderApp, false, "installed, migration not completed");
+    await db.update(reminderAppMigrations).set({ state: "completed" }).where(eq(reminderAppMigrations.installId, install!.id));
+    assert.equal((await features())?.reminderApp, true, "installed and migrated");
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+// Where reminders live in the Reminder app, an external agent's CLI reaches it
+// through `raft reminder`, but only a CLI that declares it routes there: an
+// older one still gets "not yet supported".
+test("GET /context teaches an external agent the Reminder app's raft reminder only when its CLI declares it", async ({ app }) => {
+  const { server } = await seed();
+  const agent = await createAgent(server.id, "ctx-reminder-app", { runtime: "external", model: "external" });
+  const minted = await mintAgentCredential({ agentId: agent.id, scopes: ["read"], name: "ctx", issuedVia: "computer", createdByUserId: null });
+  const prompt = async (capabilities?: string) =>
+    (await (await getContext(app.baseUrl, minted.apiKey, capabilities)).json() as AgentApiAgentContextResponse).prompt?.text ?? "";
+  const declared = `${MANUAL_CONTEXT_CAPABILITY},${REMINDER_APP_CLI_CAPABILITY}`;
+  const appSection = "Reminders on this Server live in the Reminder app; `raft reminder` works with it.";
+
+  assert.match(await prompt(declared), /reminders_unsupported_for_external_agents/, "flag off: not supported, whatever the CLI");
+  await createFeatureFlag({ key: REMINDER_APP_FEATURE_FLAG_KEY, randomizationUnit: "server", defaultEnabled: false });
+  await createFeatureFlagRule({ flagKey: REMINDER_APP_FEATURE_FLAG_KEY, stage: "server", decision: "allow", values: [server.id] });
+
+  const older = await prompt(MANUAL_CONTEXT_CAPABILITY);
+  assert.match(older, /reminders_unsupported_for_external_agents/, "an older CLI: not supported");
+  assert.equal(older.includes(appSection), false);
+  assert.equal((await prompt(`${MANUAL_CONTEXT_CAPABILITY},reminder-app-cli@0`)).includes(appSection), false, "version 0 declares nothing");
+
+  const current = await prompt(declared);
+  assert.ok(current.includes(appSection), "a CLI that declares it: the Reminder app section");
+  assert.doesNotMatch(current, /reminders_unsupported_for_external_agents/);
+  assert.match(current, /9\. \*\*Reminders\*\* — `raft reminder schedule`, `raft reminder list`, `raft reminder show`/);
+  assert.match(current, /fired reminders come from the Reminder app as events in your inbox/);
+});
+
 test("GET /context lists Artifacts among the first-party apps while the deployment has it, beside the unchanged booleans, and renders the prompt from them", async ({ app }) => {
   const { server } = await seed();
   const agent = await createAgent(server.id, "ctx-apps", { runtime: "external", model: "external" });
@@ -169,43 +229,37 @@ test("GET /context lists to a personal assistant only the apps its credential ca
   assert.deepEqual(await features(assistant.apiKey), { reminderApp: false, vaultApp: false, enabledApps: [] });
 });
 
-test("GET /context reports the continuation pilot only while it is on for the agent's server, for managed and external agents alike", async ({ app }) => {
+test("GET /context reports the continuation pilot only while it is on for the agent's server", async ({ app }) => {
   const { server } = await seed();
   const other = await seed();
-  const keyOf = async (name: string, runtime: string) => {
-    const agent = await createAgent(server.id, name, { runtime, model: runtime });
-    return (await mintAgentCredential({ agentId: agent.id, scopes: ["read"], name: "ctx", issuedVia: "computer", createdByUserId: null })).apiKey;
-  };
-  const external = await keyOf("ctx-pilot-external", "external");
-  const managed = await keyOf("ctx-pilot-managed", "claude");
+  const agent = await createAgent(server.id, "ctx-pilot-managed", { runtime: "claude", model: "claude" });
+  const managed = (await mintAgentCredential({ agentId: agent.id, scopes: ["read"], name: "ctx", issuedVia: "computer", createdByUserId: null })).apiKey;
   const features = async (apiKey: string) => (await (await getContext(app.baseUrl, apiKey)).json() as AgentApiAgentContextResponse).features;
 
   // The flag row ships with its migration, default off: the features keep their shape.
-  for (const apiKey of [external, managed]) {
-    assert.deepEqual(await features(apiKey), { reminderApp: false, vaultApp: false, enabledApps: [] }, "off: no field");
-  }
+  assert.deepEqual(await features(managed), { reminderApp: false, vaultApp: false, enabledApps: [] }, "off: no field");
   await createFeatureFlagRule({ flagKey: CONTINUATIONS_PILOT_FEATURE_FLAG_KEY, stage: "server", decision: "allow", values: [other.server.id] });
-  assert.equal((await features(external))?.continuationsPilot, undefined, "on for another server only");
+  assert.equal((await features(managed))?.continuationsPilot, undefined, "on for another server only");
   await createFeatureFlagRule({ flagKey: CONTINUATIONS_PILOT_FEATURE_FLAG_KEY, stage: "server", decision: "allow", values: [server.id] });
-  for (const apiKey of [external, managed]) {
-    assert.deepEqual(await features(apiKey), { reminderApp: false, vaultApp: false, continuationsPilot: true, enabledApps: [] });
-  }
+  assert.deepEqual(await features(managed), { reminderApp: false, vaultApp: false, continuationsPilot: true, enabledApps: [] });
 });
 
-test("GET /context reports the continuation pilot off for a codex agent, on a server where it is on (#wg-ax:#5)", async ({ app }) => {
+test("GET /context reports the continuation pilot on only for a Claude agent, on a server where it is on (#wg-ax:#5)", async ({ app }) => {
   const { server } = await seed();
   const keyOf = async (name: string, runtime: string) => {
     const agent = await createAgent(server.id, name, { runtime, model: runtime });
     return (await mintAgentCredential({ agentId: agent.id, scopes: ["read"], name: "ctx", issuedVia: "computer", createdByUserId: null })).apiKey;
   };
-  const codex = await keyOf("ctx-pilot-codex", "codex");
   const claude = await keyOf("ctx-pilot-claude", "claude");
   const features = async (apiKey: string) => (await (await getContext(app.baseUrl, apiKey)).json() as AgentApiAgentContextResponse).features;
   await createFeatureFlagRule({ flagKey: CONTINUATIONS_PILOT_FEATURE_FLAG_KEY, stage: "server", decision: "allow", values: [server.id] });
 
   assert.equal((await features(claude))?.continuationsPilot, true, "control: on for the server");
-  // A CLI from before its own runtime check reads this, so the codex agent keeps the draft flow.
-  assert.deepEqual(await features(codex), { reminderApp: false, vaultApp: false, enabledApps: [] });
+  // The Server is the gate a CLI without its own runtime check (or without a runtime, as for an external agent) relies on.
+  for (const runtime of ["codex", "builtin", "kimi-sdk", "antigravity", "external"]) {
+    const apiKey = await keyOf(`ctx-pilot-${runtime}`, runtime);
+    assert.deepEqual(await features(apiKey), { reminderApp: false, vaultApp: false, enabledApps: [] }, runtime);
+  }
 });
 
 test("GET /context names an app's commands only to a client built with them; no token, an unknown one, one without a version, or the flag off give the historical guide", async ({ app }) => {
@@ -263,4 +317,43 @@ test("GET /context teaches raft inbox read only to a CLI that declares it, on a 
     assert.equal(await context(capabilities), historical, why);
   }
   assert.equal(await context(declared), withInboxItems, "a CLI with raft inbox read on a server with inbox items on");
+});
+
+// #triage:#540: `dm_reply_placement_prompt` gates the DM rule for an external
+// agent's guide exactly as agent:start gates it for a managed agent's prompt.
+test("GET /context adds the DM reply placement rule only on a server with the flag on, and only beside task conversations; otherwise the guide is unchanged byte for byte", async ({ app }) => {
+  const allow = async (key: string, serverId: string) => {
+    // The row ships with its migration where the test database has it; default off either way.
+    if (!(await getFeatureFlag(key))) await createFeatureFlag({ key, randomizationUnit: "server", defaultEnabled: false });
+    await createFeatureFlagRule({ flagKey: key, stage: "server", decision: "allow", values: [serverId] });
+  };
+  const external = async (serverId: string, name: string) => {
+    const agent = await createAgent(serverId, name, { runtime: "external", model: "external" });
+    const minted = await mintAgentCredential({ agentId: agent.id, scopes: ["read"], name: "ctx", issuedVia: "computer", createdByUserId: null });
+    const identity = { handle: name, displayName: name, description: null, serverName: "Context Test Server", serverRole: "member" };
+    return { identity, context: async () => await (await getContext(app.baseUrl, minted.apiKey)).json() as AgentApiAgentContextResponse };
+  };
+  const { server } = await seed();
+  const { server: other } = await seed();
+  const here = await external(server.id, "ctx-dm");
+  const elsewhere = await external(other.id, "ctx-dm-other");
+  const historical = buildRaftCliGuideMarkdown(here.identity);
+  const taskConversations = buildRaftCliGuideMarkdown(here.identity, { taskConversations: true });
+  const withDmRule = buildRaftCliGuideMarkdown(here.identity, { taskConversations: true, dmReplyPlacement: true });
+  assert.notEqual(withDmRule, taskConversations);
+
+  assert.equal((await here.context()).prompt?.text, historical, "no rules: the historical guide");
+  await allow(DM_REPLY_PLACEMENT_FEATURE_FLAG_KEY, server.id);
+  assert.equal((await here.context()).prompt?.text, historical, "the flag without task conversations renders nothing");
+
+  await allow(TASK_V2_CONVERSATIONS_FEATURE_FLAG_KEY, server.id);
+  await createFeatureFlagRule({ flagKey: TASK_V2_CONVERSATIONS_FEATURE_FLAG_KEY, stage: "server", decision: "allow", values: [other.id] });
+  const on = await here.context();
+  assert.equal(on.prompt?.text, withDmRule);
+  assert.match(on.prompt!.text, /In a DM with one person there is no one else to tell/);
+  assert.deepEqual(on.features, { reminderApp: false, vaultApp: false, taskConversations: true, enabledApps: [] }, "prompt text only: not a features field");
+
+  const off = await elsewhere.context();
+  assert.equal(off.prompt?.text, buildRaftCliGuideMarkdown(elsewhere.identity, { taskConversations: true }), "a server without the rule keeps the task-conversations guide");
+  assert.doesNotMatch(off.prompt!.text, /In a DM with one person/);
 });

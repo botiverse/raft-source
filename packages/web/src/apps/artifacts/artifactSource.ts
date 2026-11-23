@@ -5,7 +5,9 @@ import { invalidateObjectSummary, invalidateObjectSummaryRef, loadObjectSummarie
 import type { ObjectSummaryInvalidation, ObjectSummaryResult, ObjectSummaryResults } from "../../objects/objectSummaryLoader";
 import { useObjectSummaries } from "../../objects/useObjectSummaries";
 import { showObjectReadWhereShown } from "../../objects/objectRead";
+import { watchObject } from "../../objects/objectWatch";
 import { useServerStore } from "../../store/serverStore";
+import { timersOf, useOwnerDocument } from "../../utils/ownerDocument";
 import { apiArtifactSource, artifactObjectRefOf } from "./apiArtifactSource";
 import { fakeArtifactSourceSlot } from "./fakeArtifactSourceSlot";
 import type { FakeAttachment, FakeAttachmentSavedEvent } from "./fakeArtifactSource";
@@ -388,12 +390,16 @@ function coversArtifact(change: ObjectSummaryInvalidation, id: ArtifactId): bool
   return change.serverId === undefined || change.serverId === null || change.serverId === current;
 }
 
-const pageHidden = () => typeof document !== "undefined" && document.visibilityState === "hidden";
+/** Whether `doc` (the document the Artifact is drawn in: the main window's, or an object window's own) is hidden. */
+const pageHidden = (doc: Document | undefined) => typeof doc !== "undefined" && doc.visibilityState === "hidden";
 
 /**
  * A version of `card`'s Artifact newer than its `latestVersion` (as the
- * surface loaded it), once one is published; null while there is none. There
- * is no per-Artifact realtime event, so it asks, without side effects:
+ * surface loaded it), once one is published; null while there is none. It
+ * asks, without side effects:
+ * - at once on the Artifact's live `version` ping (objects/objectWatch.ts,
+ *   sent to whoever has it open after a version commits) and on a
+ *   reconnect's `resync`;
  * - every ARTIFACT_LATEST_POLL_MS while the page is visible (none while hidden);
  * - when the page becomes visible again (not on window focus: focus comes
  *   back from the content's frame every time the reader clicks out of it);
@@ -404,16 +410,20 @@ const pageHidden = () => typeof document !== "undefined" && document.visibilityS
  * pinned versions' stay kept) and the read follows the invalidation; a
  * stand-in source is read directly. Who published a version is read once per
  * version (kept for the mount), so a poll after the notice is one request.
+ * "The page" is the document the surface is drawn in, its timer that window's:
+ * an object window's (#337 PR3) is visible while the main window is hidden.
  */
 export function useArtifactNewerVersion(card: Pick<ArtifactCard, "id" | "latestVersion">): ArtifactNewerVersion | null {
   const { id, latestVersion: known } = card;
   const [found, setFound] = useState<{ id: ArtifactId; newer: ArtifactNewerVersion } | null>(null);
   /** Who published each version, by `id@version`, once answered. */
   const publishers = useRef(new Map<string, string | null>());
+  const doc = useOwnerDocument();
   useEffect(() => {
     let cancelled = false;
+    const timers = timersOf(doc);
     const read = () => {
-      if (pageHidden()) return;
+      if (pageHidden(doc)) return;
       void readLatestVersion(id).then(async (latest) => {
         if (cancelled || latest === null || latest <= known) return;
         const key = `${id}@${latest}`;
@@ -432,25 +442,30 @@ export function useArtifactNewerVersion(card: Pick<ArtifactCard, "id" | "latestV
       }, () => {});
     };
     const ask = () => {
-      if (pageHidden()) return;
+      if (pageHidden(doc)) return;
       if (source.kind === "api") invalidateObjectSummaryRef(null, "artifact", artifactObjectRefOf({ id, version: null }));
       else read();
     };
     const onVisibility = () => {
-      if (!pageHidden()) ask();
+      if (!pageHidden(doc)) ask();
     };
     const unsubscribe = subscribeObjectSummaryInvalidation((change) => {
       if (coversArtifact(change, id)) read();
     });
-    const timer = setInterval(ask, ARTIFACT_LATEST_POLL_MS);
-    document.addEventListener("visibilitychange", onVisibility);
+    // Its live ping (objects/objectWatch.ts): a new version asks at once, as does a reconnect (one may have been missed).
+    const unwatch = watchObject("artifact", id, (signal) => {
+      if (signal !== "comments") ask();
+    });
+    const timer = timers.setInterval(ask, ARTIFACT_LATEST_POLL_MS);
+    doc?.addEventListener("visibilitychange", onVisibility);
     return () => {
       cancelled = true;
       unsubscribe();
-      clearInterval(timer);
-      document.removeEventListener("visibilitychange", onVisibility);
+      unwatch();
+      timers.clearInterval(timer);
+      doc?.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [id, known]);
+  }, [id, known, doc]);
   return found && found.id === id && found.newer.version > known ? found.newer : null;
 }
 

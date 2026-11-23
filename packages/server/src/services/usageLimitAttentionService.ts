@@ -4,8 +4,10 @@ import {
   isClaudeOAuthAppsWindow,
   isModelScopedUsageWindow,
   SERVER_SYSTEM_ATTENTION_CONTRACT_VERSION,
+  type RuntimeAccountUsageAccount,
   type RuntimeAccountUsageProvider,
   type RuntimeAccountUsageSnapshot,
+  type RuntimeAccountUsageWindow,
   type ServerSystemAttentionResponse,
 } from "@botiverse/raft-shared";
 import { and, desc, eq, gte, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
@@ -114,6 +116,28 @@ function identityLockKey(input: {
   ].join(":");
 }
 
+/**
+ * The status a window raises or resolves "usage limit reached" with.
+ * A model's window (Claude's Fable week), a group of models' quota
+ * (Antigravity's "Gemini Models") or the OAuth apps' window: while the
+ * account is not used up on all models it still runs the other models, so
+ * one at its limit is not "<provider> used up" for every agent on it (read as
+ * clear: a notice it raised while the account was used up resolves). Once it
+ * is, these windows say so and when they reset. An account that can still
+ * spend extra credits (Codex, `credits.available`) keeps running past any
+ * full window, so none of its windows is reached either (#proj-raft-computer:#108).
+ */
+export function usageLimitAttentionWindowStatus(
+  account: Pick<RuntimeAccountUsageAccount, "credits">,
+  window: Pick<RuntimeAccountUsageWindow, "status" | "scope" | "id" | "label">,
+  accountUsedUp: boolean,
+): RuntimeAccountUsageWindow["status"] {
+  if (window.status !== "limit_reached") return window.status;
+  if (account.credits?.available === true) return "ok";
+  const leftOut = isModelScopedUsageWindow(window) || isClaudeOAuthAppsWindow(window);
+  return leftOut && !accountUsedUp ? "ok" : window.status;
+}
+
 export class UsageLimitAttentionService {
   constructor(private readonly now: () => Date = () => new Date()) {}
 
@@ -132,29 +156,28 @@ export class UsageLimitAttentionService {
       .select({ id: agents.id, runtime: agents.runtime })
       .from(agents)
       .where(and(eq(agents.serverId, machine.serverId), eq(agents.machineId, machineId), isNull(agents.deletedAt)));
-    const affectedAgentIds = machineAgents
+    const providerAgentIds = machineAgents
       .filter((agent) => runtimeProviderForAgentRuntime(agent.runtime) === snapshot.provider)
       .map((agent) => agent.id)
       .sort();
+    // Agents on their own account folder (`agentIds`) are held by that
+    // account only; the default account holds the provider's other agents.
+    const onOwnFolder = new Set(snapshot.accounts.flatMap((account) => account.agentIds ?? []));
 
     const observedAt = new Date(snapshot.collectedAt);
     // An older Computer's Claude windows carry no scope: read a model's own
     // window ("Current week (Fable)") as that model's, as the web does.
     for (const account of inferClaudeUsageWindowScopes(snapshot).accounts) {
+      const accountAgentIds = account.agentIds;
+      const affectedAgentIds = accountAgentIds
+        ? providerAgentIds.filter((id) => accountAgentIds.includes(id))
+        : providerAgentIds.filter((id) => !onOwnFolder.has(id));
       // Used up on the basis the web shows (allModelsUsageAccount): OAR says
       // rate limited when any window is at its limit, a model's too.
       const usedUp = allModelsUsageAccount(account).account.health === "rate_limited";
       for (const window of account.windows) {
         if (window.status === "parse_unavailable") continue;
-        // A model's window (Claude's Fable week), a group of models' quota
-        // (Antigravity's "Gemini Models") or the OAuth apps' window: while the
-        // account is not used up on all models it still runs the other
-        // models, so one at its limit is not "<provider> used up" for every
-        // agent on it (read as clear: a notice it raised while the account
-        // was used up resolves). Once it is, these windows say so and when
-        // they reset.
-        const leftOut = isModelScopedUsageWindow(window) || isClaudeOAuthAppsWindow(window);
-        const status = leftOut && !usedUp && window.status === "limit_reached" ? "ok" : window.status;
+        const status = usageLimitAttentionWindowStatus(account, window, usedUp);
         if (status === "limit_reached" && affectedAgentIds.length === 0) continue;
         await executor.transaction(async (tx) => {
           const identity = {

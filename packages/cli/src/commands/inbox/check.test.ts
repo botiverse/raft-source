@@ -349,7 +349,9 @@ test("inbox check renders twenty sealed reminder rows without ack actions and on
   const output = stdout.join("");
   assert.equal((output.match(/sealed owner=@Stone/g) ?? []).length, 20);
   assert.equal((output.match(/unseal_when=signed carrier deployed/g) ?? []).length, 20);
-  assert.equal((output.match(/action=raft reminder ack/g) ?? []).length, 1);
+  assert.equal((output.match(/^ {2}do: raft reminder ack/gm) ?? []).length, 1);
+  // A sealed row prints no action, so its source tells the twenty apart and matches the seal registry.
+  assert.equal(new Set(output.match(/sealed owner=@Stone · unseal_when=signed carrier deployed · source=reminder:\S+/g) ?? []).size, 20);
 });
 
 test("inbox check reports revision drift and detached id-only seals without projecting them onto items", async () => {
@@ -396,13 +398,13 @@ test("inbox check reports revision drift and detached id-only seals without proj
   await inboxCheckCommand.handler(ctx);
 
   const output = stdout.join("");
-  assert.match(output, /action=raft reminder ack --id 12345678 --revision 8/);
+  assert.match(output, /^ {2}do: raft reminder ack --id 12345678 --revision 8$/m);
   assert.doesNotMatch(output, /sealed owner=/);
   assert.match(output, /STALE\(sealed-specimen-mutated\) registered_revision=7 live_revision=8/);
   assert.match(output, /DETACHED\(id-only\)/);
 });
 
-test("inbox check command renders structured sourceRef and exact actionCli from OS mint", async () => {
+test("inbox check command renders the item's address and exact actionCli from OS mint", async () => {
   const { io, stdout, stderr } = memoryIo();
   const appItem = {
     source: "app" as const,
@@ -432,8 +434,8 @@ test("inbox check command renders structured sourceRef and exact actionCli from 
   assert.deepEqual(stderr, []);
   const output = stdout.join("");
   assert.match(output, /App items: 1/);
-  assert.match(output, /sourceRef=fixture:aaaaaaaa-0000-4000-8000-000000000001:3/);
-  assert.match(output, /action=raft fixture log --id aaaaaaaa/);
+  assert.match(output, /^app:test\.fixture\/item-uui · "Due"$/m);
+  assert.match(output, /^ {2}do: raft fixture log --id aaaaaaaa$/m);
   assert.doesNotMatch(output, /msg=|sender|seq=/);
 });
 
@@ -543,10 +545,10 @@ test("[items] every kind renders through the shared row, read with raft inbox re
     "dm:@richard · 3 unread · latest @richard 12m ago",
     "  \"can you look at the release notes?\" (preview)",
     "  read: raft inbox read --target \"dm:@richard\"",
-    "app:stamp/pr-13754 · 2 unread · from Stamp · about #general:#7 · latest 25m ago",
+    "app:stamp/pr-13754 · 2 unread · about #general:#7 · latest 25m ago",
     "  \"checks failed on 9ed73d5…\" (truncated preview)",
     "  read: raft inbox read --target \"app:stamp/pr-13754\"",
-    "app:artifacts · 4 unread · from Artifacts",
+    "app:artifacts · 4 unread",
     "  read: raft inbox read --target \"app:artifacts\"",
     `reminder:${REMINDER_ID} · 1 fired, not acked · latest 1h ago`,
     "  \"check the deploy\" (preview)",
@@ -580,7 +582,7 @@ test("[items] daemon pending counts annotate conversation rows; pending-only tar
   assert.equal(lines[3], "  read: raft inbox read --target \"#ops\"");
   assert.equal(lines[4], "dm:@richard · 3 unread · 2 new, not yet delivered · latest @richard 12m ago");
   // App rows never carry a conversation's not-yet-delivered count.
-  assert.match(output, /^app:stamp\/pr-13754 · 2 unread · from Stamp · about #general:#7 · latest 25m ago$/m);
+  assert.match(output, /^app:stamp\/pr-13754 · 2 unread · about #general:#7 · latest 25m ago$/m);
   assert.match(output, /^Next: read the first item above: raft inbox read --target "#ops"$/m);
 
   const older = render({ before: 900, list: emptyList({ rows: [dmItem] }), pendingRows: [{ target: "#ops", pendingCount: 1, flags: [] }] });
@@ -637,8 +639,8 @@ test("[items] inbox check asks for items and drops the daemon's reminder app ite
   assert.deepEqual(stderr, []);
   const output = stdout.join("");
   assert.match(output, /^App items: 1$/m);
-  assert.match(output, /action=raft cleaner log/);
-  assert.doesNotMatch(output, /action=raft reminder ack/);
+  assert.match(output, /^ {2}do: raft cleaner log/m);
+  assert.doesNotMatch(output, /do: raft reminder ack/);
   assert.equal((output.match(/raft reminder ack --id/g) ?? []).length, 1, "the reminder is listed once, as its server row");
 });
 
@@ -665,10 +667,13 @@ test("daemon section: a Computer-local app item's row is followed by its dismiss
     assert.equal(output.slice(output.indexOf("App items:")), [
       "App items: 2",
       "",
-      `app=system.cleaner · class=disk_space_hint · item=714fbfc6 · retention=transient · sourceRef=backup_ignore_hint:agent-1 · action=${cleanerReminderItem.actionCli} · title=${cleanerReminderItem.title} · summary=${cleanerReminderItem.summary}`,
+      `app:system.cleaner/714fbfc6 · ${JSON.stringify(cleanerReminderItem.title)}`,
+      `  ${JSON.stringify(cleanerReminderItem.summary)} (preview)`,
+      `  do: ${cleanerReminderItem.actionCli}`,
       '  dismiss: raft inbox dismiss --target "app:system.cleaner/714fbfc6"',
       "",
-      `app=system.reminder · class=due · item=reminder · retention=until_explicit_ack · sourceRef=reminder:${PRE_LAUNCH_ID}:2 · action=raft reminder ack --id 11112222 --revision 2`,
+      "app:system.reminder/11112222",
+      "  do: raft reminder ack --id 11112222 --revision 2",
     ].join("\n"));
     assert.equal((output.match(/^ {2}dismiss: /gm) ?? []).length, 1, "the reminder is acked, never dismissed");
   }
@@ -688,9 +693,9 @@ test("inbox check command prints the daemon's Cleaner item with its dismiss comm
   await inboxCheckCommand.handler(ctx);
   assert.deepEqual(stderr, []);
   const lines = stdout.join("").split("\n");
-  const row = lines.findIndex((line) => line.startsWith("app=system.cleaner · class=disk_space_hint · item=714fbfc6 · "));
+  const row = lines.findIndex((line) => line.startsWith("app:system.cleaner/714fbfc6 · "));
   assert.ok(row >= 0, stdout.join(""));
-  assert.equal(lines[row + 1], '  dismiss: raft inbox dismiss --target "app:system.cleaner/714fbfc6"');
+  assert.equal(lines[row + 3], '  dismiss: raft inbox dismiss --target "app:system.cleaner/714fbfc6"');
 });
 
 test("[items] a reminder that fired before launch is not a server row, so the daemon's copy still shows with its ack", () => {
@@ -701,8 +706,8 @@ test("[items] a reminder that fired before launch is not a server row, so the da
     appItems: [reminderDaemonItem(REMINDER_ID), reminderDaemonItem(PRE_LAUNCH_ID)],
   });
   assert.match(output, /^App items: 1$/m);
-  assert.match(output, /action=raft reminder ack --id 11112222 --revision 2/);
-  assert.doesNotMatch(output, new RegExp(`action=raft reminder ack --id ${REMINDER_ID.slice(0, 8)}`));
+  assert.match(output, /^ {2}do: raft reminder ack --id 11112222 --revision 2$/m);
+  assert.doesNotMatch(output, new RegExp(`do: raft reminder ack --id ${REMINDER_ID.slice(0, 8)}`));
 });
 
 test("[items] a daemon reminder with a short id is matched against the server's full id", () => {

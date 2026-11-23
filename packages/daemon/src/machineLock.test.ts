@@ -7,6 +7,7 @@ import {
   acquireDaemonMachineLock,
   DaemonMachineLockConflictError,
   getDaemonMachineLockId,
+  isLockOwnerProcessAlive,
   MACHINE_LOCK_PID_REUSE_TOLERANCE_MS,
   type MachineLockProcessProbe,
   resolveDefaultMachineStateRoot,
@@ -673,4 +674,23 @@ test("an own identity read without spawning (Linux) is written with the lock and
     assert.equal(asyncReads, 0);
     lock.release();
   });
+});
+
+test("a Linux lock owner that exited but was not reaped (zombie) is dead, so its lock can be reclaimed", () => {
+  const pid = process.pid;
+  const reads = (state: string) => ({
+    platform: "linux" as const,
+    readProcStat: () => `${pid} (raft (daemon)) ${state} 1 ${pid} ${pid} 0 -1`,
+    readSelfStat: () => `${pid} (node) R 1`,
+    selfPid: pid,
+  });
+  assert.equal(isLockOwnerProcessAlive(pid, reads("Z")), false);
+  assert.equal(isLockOwnerProcessAlive(pid, reads("X")), false);
+  assert.equal(isLockOwnerProcessAlive(pid, reads("S")), true);
+  const gone = () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); };
+  const denied = () => { throw Object.assign(new Error("denied"), { code: "EACCES" }); };
+  assert.equal(isLockOwnerProcessAlive(pid, { ...reads("S"), readProcStat: gone }), false, "/proc/<pid> gone: the owner is gone");
+  assert.equal(isLockOwnerProcessAlive(pid, { ...reads("Z"), readProcStat: denied }), true, "unreadable /proc keeps signal 0's answer");
+  assert.equal(isLockOwnerProcessAlive(pid, { ...reads("Z"), selfPid: pid + 1 }), true, "another pid namespace's /proc says nothing");
+  assert.equal(isLockOwnerProcessAlive(pid, { ...reads("Z"), platform: "darwin" }), true, "off Linux signal 0 decides alone");
 });

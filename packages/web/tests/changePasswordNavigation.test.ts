@@ -14,11 +14,11 @@ test("recognizes only the thin change-password intent route", () => {
   assert.equal(isChangePasswordIntentPath("/.well-known/change-password"), false);
 });
 
-test("the password intent overrides remembered surfaces and targets server-scoped account settings", () => {
+test("the password intent overrides the remembered place and targets server-scoped account settings", () => {
   assert.equal(
     serverEntryPath({
       serverSlug: "team space",
-      rememberedSurface: "/s/team-space/channel/general",
+      place: "/s/team-space/channel/general",
       changePasswordIntent: true,
     }),
     "/s/team%20space/settings/account?open=change-password",
@@ -26,22 +26,14 @@ test("the password intent overrides remembered surfaces and targets server-scope
   assert.equal(changePasswordSettingsPath("team"), "/s/team/settings/account?open=change-password");
 });
 
-test("ordinary entry still preserves the existing remembered/default-server behavior", () => {
+test("ordinary entry still lands on the server's place", () => {
   assert.equal(
     serverEntryPath({
       serverSlug: "team",
-      rememberedSurface: "/s/team/channel/general",
+      place: "/s/team/channel/general",
       changePasswordIntent: false,
     }),
     "/s/team/channel/general",
-  );
-  assert.equal(
-    serverEntryPath({
-      serverSlug: "team",
-      rememberedSurface: null,
-      changePasswordIntent: false,
-    }),
-    "/s/team",
   );
 });
 

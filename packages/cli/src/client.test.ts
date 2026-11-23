@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 
 import type { AgentContext } from "./auth/env";
-import { hasPlanUpgradeCardCapability, MANUAL_CONTEXT_CAPABILITY, PLAN_UPGRADE_CARD_CAPABILITY, RAFT_CLIENT_CAPABILITIES_HEADER } from "@botiverse/raft-shared";
+import { hasForwardedResolveCapability, hasPlanUpgradeCardCapability, MANUAL_CONTEXT_CAPABILITY, PLAN_UPGRADE_CARD_CAPABILITY, RAFT_CLIENT_CAPABILITIES_HEADER } from "@botiverse/raft-shared";
 import { ApiClient } from "./client";
 import { CliError } from "./core/errors";
 import {
@@ -52,8 +52,9 @@ test("ApiClient marks requests as slock CLI traffic", async () => {
   assert.equal(calls.length, 1);
   const headers = new Headers(calls[0].headers);
   assert.equal(headers.get("X-Raft-Client"), "cli");
-  // The Manual context contract, that it posts plan:upgrade cards, then the first-party app entries this CLI carries (artifacts).
-  assert.equal(headers.get(RAFT_CLIENT_CAPABILITIES_HEADER), `${MANUAL_CONTEXT_CAPABILITY},action-card:plan:upgrade@1,inbox-items@1,guide-app:artifacts@6`);
+  // The Manual context contract, that it posts plan:upgrade cards, `inbox read`, `message resolve --forwarded`, then the first-party app entries this CLI carries (artifacts).
+  assert.equal(headers.get(RAFT_CLIENT_CAPABILITIES_HEADER), `${MANUAL_CONTEXT_CAPABILITY},action-card:plan:upgrade@1,inbox-items@1,message-resolve-forwarded@1,reminder-app-cli@1,guide-app:artifacts@6`);
+  assert.equal(hasForwardedResolveCapability(headers.get(RAFT_CLIENT_CAPABILITIES_HEADER)), true);
   assert.equal(headers.get("X-Agent-Id"), "agent-1");
   assert.equal(headers.get("X-Server-Id"), "server-1");
 });

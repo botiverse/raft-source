@@ -25,6 +25,9 @@ import { artifactUrl } from "./artifactLinks";
 import { useArtifactOpenIntent } from "./artifactOpenIntent";
 import type { ArtifactDashboardItem } from "./artifactDashboardItems";
 import { isPlainPrimaryClick } from "./openArtifactInPlace";
+import { openInAnotherWindow, useArtifactMiniWindows } from "./artifactWindowOpening";
+import { ArtifactHomeMenu } from "./ArtifactHomeMenu";
+import { ArtifactSettledTag } from "./ArtifactSettledParts";
 
 /**
  * The picture at the top of a tile (design D4, D5, D13): the publish check's
@@ -79,7 +82,8 @@ const TILE_SCOPE_HIT_CLASS = "supports-[anchor-scope:all]:pointer-coarse:enabled
  * the tile, so the whole tile opens it and the scope chip stays a control of
  * its own. No "💬 0": a card without comments says none, as the message card.
  * A phone's tile says the time alone, short (Kirby: "9d ago", "9 天前"): which
- * time it is goes unmarked there, as on a phone's row.
+ * time it is goes unmarked there, as on a phone's row. Settled (#334): its tag
+ * leads the sticker's line, and the tile has the home page's menu (ArtifactHomeMenu).
  */
 export function ArtifactTile({ item, readerId, onOpen, phone }: {
   item: ArtifactDashboardItem;
@@ -93,17 +97,25 @@ export function ArtifactTile({ item, readerId, onOpen, phone }: {
   const url = artifactUrl(card.id, null);
   const target = useMemo(() => ({ id: card.id, version: null }), [card.id]);
   const intent = useArtifactOpenIntent(target, card);
+  const miniWindows = useArtifactMiniWindows();
   const open = useCallback((event: MouseEvent<HTMLAnchorElement>) => {
+    // Cmd/Ctrl-click: another Artifact window where Artifacts open in windows (artifactWindowOpening.ts).
+    if (openInAnotherWindow(event, card, miniWindows)) return;
     // Cmd/Ctrl and middle clicks keep the link's own new tab.
     if (!isPlainPrimaryClick(event)) return;
     event.preventDefault();
     onOpen(card, event.currentTarget);
-  }, [card, onOpen]);
+  }, [card, onOpen, miniWindows]);
   const time = phone
     ? formatShortRelativeTime(openedAt ?? card.updatedAt, intl.locale)
     : formatMessage({ id: openedAt ? "artifacts.dashboard.tile.opened" : "artifacts.dashboard.tile.updated" }, { time: formatRelativeTime(openedAt ?? card.updatedAt, intl.locale) });
+  const openFromMenu = useCallback((from: HTMLElement) => onOpen(card, from), [card, onOpen]);
   return (
-    <MessageEmbed interactive className="relative flex h-full min-w-0 flex-col" data-testid="artifacts-dashboard-row" data-view="tile" data-artifact-id={card.id}>
+    <ArtifactHomeMenu
+      card={card}
+      onOpen={openFromMenu}
+      render={<MessageEmbed interactive className="relative flex h-full min-w-0 flex-col" data-testid="artifacts-dashboard-row" data-view="tile" data-artifact-id={card.id} data-settled={card.settled ? "" : undefined} />}
+    >
       <TileCover card={card} />
       <MessageEmbedHeader className="grid min-w-0 gap-1.5">
         <div className="flex min-w-0 items-start gap-1.5">
@@ -120,7 +132,12 @@ export function ArtifactTile({ item, readerId, onOpen, phone }: {
           </a>
           <span className="shrink-0 pt-px"><ArtifactVersionBadge version={card.version} /></span>
         </div>
-        {hasNews(news) ? <span className="flex min-w-0"><ArtifactNewSticker news={news} twoLines /></span> : null}
+        {card.settled || hasNews(news) ? (
+          <span className="flex min-w-0 flex-wrap items-center gap-1">
+            {card.settled ? <ArtifactSettledTag settled={card.settled} /> : null}
+            <ArtifactNewSticker news={news} twoLines />
+          </span>
+        ) : null}
       </MessageEmbedHeader>
       {/* Wide, the author shares its line with the comments and who can see it, and the time has its own. A phone tile is
           about 150px inside (390px: two columns, 16px margins, an 8px gap, 12px padding), so there the author has the line
@@ -145,6 +162,6 @@ export function ArtifactTile({ item, readerId, onOpen, phone }: {
         </div>
         <p className="min-w-0 basis-full break-words font-mono text-mono-meta text-foreground-hint max-md:flex-[1_1_min-content] max-md:break-normal" data-testid="artifacts-tile-time">{time}</p>
       </MessageEmbedFooter>
-    </MessageEmbed>
+    </ArtifactHomeMenu>
   );
 }

@@ -27,6 +27,7 @@ import {
   type ServerId,
 } from "@botiverse/raft-shared";
 import * as channelService from "./channelService";
+import { getDb } from "../db/index";
 import * as messageService from "./messageService";
 import * as userService from "./userService";
 import * as agentService from "./agentService";
@@ -532,6 +533,12 @@ export async function resolveForwardDestinationStorage(
       .find((candidate) => candidate.localChannelId === destination.id);
     return { storageChannelId: projection?.canonicalChannelId ?? destination.id, parentChannelId: null };
   }
+  // An ordinary root in an online move (channel_conversion_online_move_v1)
+  // stores in its canonical channel: the id the persist's own resolution and
+  // its idempotent replay check (persistForwardBundle) agree on.
+  if (destination.type === "channel" || destination.type === "private") {
+    return { storageChannelId: await channelService.getMessageStorageChannelIdWithExecutor(getDb(), destination.id), parentChannelId: null };
+  }
   if (!isSubConversationType(destination.type)) return { storageChannelId: destination.id, parentChannelId: null };
 
   const unavailable = () => new ForwardRequestError(404, "Conversation not found", "destination_unavailable", "destination_conversation_unavailable");
@@ -565,7 +572,7 @@ export function forwardRequestRandomId(requestId: string, channelId: string): st
 export async function forwardBundleAsUser(input: {
   io: SocketServer;
   orchestrator: AgentOrchestrator;
-  serverId: string;
+  serverId: ServerId;
   userId: string;
   senderName: string;
   targetChannelId: string;

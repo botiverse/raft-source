@@ -1,12 +1,12 @@
 // Channel and server administration: create, update, archive, unarchive, add
-// and remove members, and update the server profile. The Server decides on
-// every call, from the agent's server role and, for update / archive /
-// unarchive / remove-member, its channel-admin role in that channel; these
-// operations never pre-check. A refusal's `code` and `suggestedNextAction`
+// and remove members, set a member's channel role, and update the server
+// profile. The Server decides on every call, from the agent's server role and,
+// for update / archive / unarchive / remove-member / set-role, its
+// channel-admin role in that channel; these operations never pre-check. A refusal's `code` and `suggestedNextAction`
 // reach the caller as `serverCode` and `nextAction`; a 403 that carries no
 // next action gets a permission one here (`adminFailure`), so the model is
 // never left with "read the error code" and no code. Text is the CLI's
-// (`raft channel create|update|archive|unarchive|add-member|remove-member`,
+// (`raft channel create|update|archive|unarchive|add-member|remove-member|set-role`,
 // `raft server update`).
 
 import { z } from "zod";
@@ -16,6 +16,7 @@ import type { AgentApiClient } from "../agentApiClient";
 import type {
   AgentApiChannelMemberAddResponse,
   AgentApiChannelMemberRemoveResponse,
+  AgentApiChannelMemberRoleResponse,
   AgentApiServerUpdateResponse,
 } from "../agentApiContract";
 import { parseRaftRegularChannelTarget } from "../agentApiChannelJoin";
@@ -24,7 +25,7 @@ import { formatHintName, hintStep, RAFT_HINTS, type RaftHintOptions } from "./hi
 import type { AgentApiClientFailure } from "../agentApiClient";
 import { failureFromClientResult, failureOutcome, opError, validateOpRequest, type RaftFailure, type RaftOutcome } from "./outcome";
 import { requestSchema } from "./requestSchema";
-import { formatAgentChannelUpdated, formatChannelDeletedWithLastMember, formatLastMemberRefusal, LAST_MEMBER_DELETES_CHANNEL } from "../agentText/server";
+import { formatAgentChannelUpdated, formatChannelDeletedWithLastMember, formatChannelMemberRoleRefusal, formatChannelMemberRoleSet, formatLastMemberRefusal, LAST_MEMBER_DELETES_CHANNEL } from "../agentText/server";
 import { CHANNEL_ANNOUNCEMENT_REF_INVALID, channelAnnouncementArtifactId } from "../channelAnnouncement";
 
 export type RaftChannelVisibility = "public" | "private";
@@ -65,7 +66,7 @@ export const updateChannelRequestSchema = lazySchema("updateChannelRequestSchema
   name: z.string().optional().describe("New name, with or without a leading `#`."),
   description: descriptionSchema.optional().describe("New description (at most 500 characters)."),
   visibility: visibilitySchema.optional().describe("`public` or `private`. Needs your server role (a channel-admin role is not enough), and you must be in the channel."),
-  announcement: z.string().nullable().optional().describe("An Artifact homed in this channel (`pt_…` id or link) to make the channel's announcement, replacing any other; `null` removes it. The channel's owner (channel admin) or a server owner or admin only."),
+  announcement: z.string().nullable().optional().describe("An Artifact homed in this channel (`pt_…` id or link) to make the channel's announcement, replacing any other; `null` removes it. A channel admin of it or a server owner or admin only; on a joint channel, the host server's."),
 })));
 
 export interface ChannelMemberRequest {
@@ -92,6 +93,20 @@ export const channelMemberRemoveRequestSchema = lazySchema("channelMemberRemoveR
   user: z.string().optional().describe("A human, `@handle`. Pass exactly one of user and agent."),
   agent: z.string().optional().describe("An agent, `@handle`. Pass exactly one of user and agent."),
   deleteIfLast: z.boolean().optional().describe("Only when the channel and all its messages should go: if they are a private channel's last member, removing them deletes it, which can't be undone. Without it that removal is refused and nothing changes."),
+})));
+
+export type RaftChannelMemberRole = "admin" | "member";
+
+export interface ChannelMemberRoleRequest extends ChannelMemberRequest {
+  /** `admin` makes them a channel admin; `member` makes a channel admin a plain member. */
+  role: RaftChannelMemberRole;
+}
+
+export const channelMemberRoleRequestSchema = lazySchema("channelMemberRoleRequestSchema", () => requestSchema<ChannelMemberRoleRequest>()(z.object({
+  target: z.string().describe("The channel, `#channel-name`."),
+  user: z.string().optional().describe("A human member, `@handle`. Pass exactly one of user and agent."),
+  agent: z.string().optional().describe("An agent member, `@handle`. Pass exactly one of user and agent."),
+  role: z.enum(["admin", "member"]).describe("`admin` (channel admin) or `member` (plain member)."),
 })));
 
 export interface UpdateServerRequest {
@@ -312,6 +327,37 @@ export async function removeChannelMember(
   }
   if (attention.threadBoundary) lines.push(attention.threadBoundary);
   return { ok: true, state: "removed", data: result.data, next: null, text: lines.join("\n") };
+}
+
+/**
+ * Set a channel member's channel role (`raft channel set-role`). Refusals keep
+ * the Server's code and sentence; a non-member names the other argument, and
+ * a missing capability says where to see who can change the role.
+ */
+export async function setChannelMemberRole(
+  client: Pick<AgentApiClient, "channels">,
+  request: ChannelMemberRoleRequest,
+  options: RaftHintOptions = {},
+): Promise<RaftOutcome<AgentApiChannelMemberRoleResponse, "changed" | "unchanged">> {
+  const invalid = validateOpRequest(channelMemberRoleRequestSchema, request); if (invalid) return invalid;
+  const channelName = parseRaftRegularChannelTarget(request.target ?? "");
+  if (!channelName) return failureOutcome(opError("INVALID_REQUEST", { message: INVALID_CHANNEL_TARGET }));
+  const body = memberBody(request);
+  if (!body) return failureOutcome(opError("INVALID_REQUEST", { message: MEMBER_REQUIRED }));
+  const target = `#${channelName}`;
+  const result = await client.channels.setMemberRole({ target, ...body, role: request.role });
+  if (!result.ok) {
+    const failure = adminFailure(result, options);
+    const { serverCode } = failure.error;
+    if (serverCode !== "channel_member_required" && serverCode !== "channel_capability_required") return failure;
+    const member = "user" in body ? { kind: "user" as const, name: body.user } : { kind: "agent" as const, name: body.agent };
+    // A Server hint stays in CLI form here; the caller's style renders it (restyleDefaultNextAction).
+    const refusal = formatChannelMemberRoleRefusal({ target, member, code: serverCode, serverMessage: failure.error.message, serverStep: failure.error.nextAction }, options.hints);
+    return failureOutcome({ ...failure.error, ...refusal });
+  }
+  const { data } = result;
+  const text = formatChannelMemberRoleSet(target, data.member.name, data.channelRole, data.changed);
+  return { ok: true, state: data.changed ? "changed" : "unchanged", data, next: null, text };
 }
 
 export async function updateServer(

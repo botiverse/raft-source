@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import { parseRuntimeFormV2, RUNTIME_FORM_V3_UNSUPPORTED_RULE } from "./v2";
 import {
@@ -119,7 +121,7 @@ test("v3 effort: the server's Default option comes first, the model's default is
   assert.equal(runtimeFormV2Submission(form, { ...defaulted, apiKey: "sk" }, src).reasoningEffort, "");
 });
 
-test("v3 effort on edit: a stored null or absent effort stays Default; create and a model change take the model's default", () => {
+test("v3 effort on edit: a stored null or absent effort stays Default, also across a model change; create takes the model's default", () => {
   const src = sources({
     reasoningEffort: {
       sourceId: "reasoningEffort", kind: "dependent_select", pointer: "/reasoningEffort", dependsOn: "/model",
@@ -138,8 +140,11 @@ test("v3 effort on edit: a stored null or absent effort stays Default; create an
     assert.equal(isRuntimeFormV2FieldVisible(field("reasoningEffort"), values, src), true);
     assert.deepEqual(validateRuntimeFormV2(edit, src, values, { editing: true }), {});
     assert.equal(runtimeFormV2Submission(edit, values, src).reasoningEffort, "", "saved untouched: still Default");
-    assert.equal(applyRuntimeFormV2Change(edit, src, values, "model", "m-other").reasoningEffort, "low", "a model change takes the new model's default");
+    assert.equal(applyRuntimeFormV2Change(edit, src, values, "model", "m-other").reasoningEffort, "", "a model change keeps Default (listed for the new model)");
   }
+  let created = applyRuntimeFormV2Change(form, src, initialRuntimeFormV2Values(form, src), "reasoningEffort", "high");
+  created = applyRuntimeFormV2Change(form, src, created, "model", "m-other");
+  assert.equal(created.reasoningEffort, "high", "a chosen effort the new model lists is kept, not reset to its default (low)");
   const explicit = parseRuntimeFormV2({ ...v3Json(), values: { providerId: "deepseek", model: "m-effort", reasoningEffort: "low" } })!;
   assert.equal(initialRuntimeFormV2Values(explicit, src).reasoningEffort, "low", "a stored effort is kept");
   // A branch the saved agent is not on (no stored model, e.g. Pi's "configured" model while it uses a provider):
@@ -200,4 +205,65 @@ test("v3 unavailable: a value equal to an unavailableOptions entry blocks (optio
   // Without customValueAllowed the same model blocks.
   const strict = sources({ model: { ...sources().model!, customValueAllowed: false } });
   assert.deepEqual(validateRuntimeFormV2(edit, strict, direct, { editing: true }), { model: "option_unavailable" });
+});
+
+test("v3 conformance (#wg-runtime-form:#31): Codex mutually-exclusive fastMode and speed controls across model tiers", () => {
+  const fixturesDir = fileURLToPath(new URL("../fixtures/", import.meta.url));
+  const readJson = (name: string) => JSON.parse(readFileSync(`${fixturesDir}${name}`, "utf8"));
+  const spec = readJson("codex.speed.conformance.v3.json") as {
+    form: string;
+    sources: Record<string, string>;
+    cases: Array<{
+      name: string;
+      editing: boolean;
+      storedValues?: Record<string, unknown>;
+      changes: Array<[string, string | boolean]>;
+      expectedVisible: string[];
+      expectedHidden: string[];
+      expectedSubmission: Record<string, unknown>;
+    }>;
+  };
+  const baseFormJson = readJson(spec.form) as Record<string, unknown>;
+  const src: RuntimeFormV2Sources = {
+    model: {
+      sourceId: "model",
+      kind: "select",
+      pointer: "/model",
+      status: "live",
+      customValueAllowed: true,
+      options: [
+        { value: "gpt-6.2-sol", label: "GPT-6.2-Sol" },
+        { value: "gpt-6.2-astra", label: "GPT-6.2-Astra" },
+        { value: "gpt-5-mini", label: "GPT-5 Mini" },
+      ],
+      defaultValue: "gpt-6.2-sol",
+    },
+    reasoningEffort: {
+      sourceId: "reasoningEffort",
+      kind: "dependent_select",
+      pointer: "/reasoningEffort",
+      dependsOn: "/model",
+      status: "live",
+      optionsByValue: {},
+    },
+    speed: readJson(spec.sources.speed!),
+  };
+  for (const item of spec.cases) {
+    const parsed = parseRuntimeFormV2(item.editing ? { ...baseFormJson, values: item.storedValues } : baseFormJson)!;
+    assert.ok(parsed, item.name);
+    let values = initialRuntimeFormV2Values(parsed, src);
+    for (const [key, next] of item.changes) {
+      values = applyRuntimeFormV2Change(parsed, src, values, key, next);
+    }
+    for (const key of item.expectedVisible) {
+      const f = parsed.fields.find((candidate) => candidate.key === key)!;
+      assert.equal(isRuntimeFormV2FieldVisible(f, values, src), true, `${item.name}: ${key} visible`);
+    }
+    for (const key of item.expectedHidden) {
+      const f = parsed.fields.find((candidate) => candidate.key === key)!;
+      assert.equal(isRuntimeFormV2FieldVisible(f, values, src), false, `${item.name}: ${key} hidden`);
+    }
+    assert.deepEqual(validateRuntimeFormV2(parsed, src, values, { editing: item.editing }), {}, item.name);
+    assert.deepEqual(runtimeFormV2Submission(parsed, values, src), item.expectedSubmission, item.name);
+  }
 });

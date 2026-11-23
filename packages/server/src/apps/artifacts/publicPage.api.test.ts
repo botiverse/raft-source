@@ -148,9 +148,16 @@ test("a public Artifact's page: its title, description, Open Graph, Twitter and 
     assert.match(tags.get("og:description") ?? "", /^Revenue grew &quot;12%&quot; &amp; margins held;/);
     assert.equal(tags.get("description"), tags.get("og:description"));
     assert.equal(tags.get("twitter:description"), tags.get("og:description"));
-    // No publicly servable screenshot (core's object route checks the reader): the app icon, a small card.
-    assert.equal(tags.get("og:image"), `${appUrl()}/android-chrome-512x512.png`);
-    assert.equal(tags.get("twitter:card"), "summary");
+    // Dynamic 1200x630 public Artifact card image (version-busted with ?v=<updatedAt>, title + description only, never author/server).
+    const ogImageUrl = tags.get("og:image") ?? "";
+    assert.ok(
+      ogImageUrl.startsWith(`https://api.example.test/api/public/artifacts/${open.short}/og-image.png?v=`),
+      `expected versioned og-image URL, got ${ogImageUrl}`,
+    );
+    assert.equal(tags.get("og:image:width"), "1200");
+    assert.equal(tags.get("og:image:height"), "630");
+    assert.equal(tags.get("twitter:card"), "summary_large_image");
+    assert.equal(tags.get("twitter:image"), ogImageUrl);
     assert.ok(!body.includes("/api/objects/"), "no screenshot's private address");
   }
 });

@@ -7,6 +7,15 @@
  * that second event observable: a shard launcher that does not exit within the
  * wall-clock budget emits a fail-closed PROCESS_DID_NOT_EXIT receipt, records
  * its live Linux process tree, and terminates the whole child process group.
+ *
+ * Per file (SERVER_FILE_TIME_LIMIT_MS): Server tests run with no per-test or
+ * per-hook timeout, and a file stuck in synchronous code could not time itself
+ * out anyway (#triage:#516: a PGlite closed under a running statement spins,
+ * and no timer in that process fires again). So this wrapper reads the timing
+ * journal, and a file still running after the limit is failed on its own: a
+ * FILE_TIME_LIMIT receipt names it and its Vitest worker is killed. Vitest
+ * reports that worker's exit as an error naming the file and runs the rest of
+ * the shard. A file with no live worker on record stops the shard instead.
  */
 
 import {
@@ -20,11 +29,20 @@ import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { emitFileTimings, SERVER_SHARD_TIMINGS_ENV } from "./serverShardTimings";
+import { emitFileTimings, readFileTimings, SERVER_SHARD_TIMINGS_ENV, type FileTimingsReason } from "./serverShardTimings";
 
-export const SERVER_SHARD_WATCHDOG_TIMEOUT_MS = 25 * 60_000;
+// 30 min (was 25, #triage:#497): slow whole-run windows on the shared
+// runners took healthy shards to 23.2 min in the week to 11-17. Raised
+// together with the 8-shard rebalance, never on its own.
+export const SERVER_SHARD_WATCHDOG_TIMEOUT_MS = 30 * 60_000;
 export const SERVER_SHARD_WATCHDOG_KILL_GRACE_MS = 5_000;
 export const SERVER_SHARD_WATCHDOG_EXIT_CODE = 124;
+// 10 min per file. The slowest file's CI duration is 226 s (src/routes/agents.api.test.ts),
+// the 99th percentile 98 s, the median 3.6 s: test-shard-manifest.json fileTimings, medians
+// of 7 staging unit-server runs since 11-15. 2.6x the slowest leaves room for slow-runner
+// windows (#triage:#497), and a hung file is named 20 min before the shard watchdog.
+export const SERVER_FILE_TIME_LIMIT_MS = 10 * 60_000;
+export const SERVER_FILE_CHECK_INTERVAL_MS = 10_000;
 
 const MAX_PROCESS_TREE_ENTRIES = 64;
 const MAX_COMMAND_LENGTH = 1_000;
@@ -53,6 +71,17 @@ export interface ProcessDidNotExitReceipt {
   processTree: ProcessTreeSnapshot;
 }
 
+export interface FileTimeLimitReceipt {
+  classification: "FILE_TIME_LIMIT";
+  shard: number;
+  file: string;
+  elapsedMs: number;
+  limitMs: number;
+  /** "worker": the file's worker was killed and the shard goes on; "shard": no live worker on record, the shard stops. */
+  stopped: "worker" | "shard";
+  workerPid: number | null;
+}
+
 interface ExitWatchdogOptions {
   shard: number;
   timeoutMs: number;
@@ -60,6 +89,10 @@ interface ExitWatchdogOptions {
   emit?: (receipt: ProcessDidNotExitReceipt) => void;
   timingJournal?: string;
   writeTimingSummary?: (text: string) => void;
+  /** Fail a test file still running after this long (needs timingJournal); see the file comment. */
+  fileTimeLimitMs?: number;
+  fileCheckIntervalMs?: number;
+  emitFileTimeLimit?: (receipt: FileTimeLimitReceipt) => void;
 }
 
 interface RunWithWatchdogOptions extends ExitWatchdogOptions {
@@ -159,7 +192,14 @@ export function formatProcessDidNotExitReceipt(
 }
 
 function emitProcessDidNotExitReceipt(receipt: ProcessDidNotExitReceipt): void {
-  const line = formatProcessDidNotExitReceipt(receipt);
+  emitWatchdogLine(formatProcessDidNotExitReceipt(receipt));
+}
+
+function emitFileTimeLimitReceipt(receipt: FileTimeLimitReceipt): void {
+  emitWatchdogLine(`[serverShardWatchdog] outcome ${JSON.stringify(receipt)}`);
+}
+
+function emitWatchdogLine(line: string): void {
   console.error(line);
   const summary = process.env.GITHUB_STEP_SUMMARY;
   if (!summary) return;
@@ -193,20 +233,36 @@ export function watchSpawnedChildExit(
 ): Promise<number> {
   return new Promise((resolve) => {
     let settled = false;
-    let timedOut = false;
+    let stoppedBy: Exclude<FileTimingsReason, "exit"> | null = null;
+    /** A file failed on the time limit: never report the run green. */
+    let fileLimitHit = false;
 
     const finish = (exitCode: number) => {
       if (settled) return;
       settled = true;
+      clearInterval(fileCheck);
       if (options.timingJournal) {
-        try { emitFileTimings(options.timingJournal, options.shard, timedOut ? "watchdog" : "exit", options.writeTimingSummary); }
+        try { emitFileTimings(options.timingJournal, options.shard, stoppedBy ?? "exit", options.writeTimingSummary); }
         catch { console.error("[serverShardTimings] diagnostic failed; exit code preserved"); }
       }
       resolve(exitCode);
     };
 
+    /** Stop the whole shard: SIGTERM its process group, SIGKILL after the grace, RED. */
+    const terminate = (reason: Exclude<FileTimingsReason, "exit">) => {
+      if (settled || stoppedBy) return;
+      stoppedBy = reason;
+      clearTimeout(watchdog);
+      clearInterval(fileCheck);
+      signalProcessGroup(child, "SIGTERM");
+      setTimeout(() => {
+        signalProcessGroup(child, "SIGKILL");
+        finish(SERVER_SHARD_WATCHDOG_EXIT_CODE);
+      }, options.killGraceMs);
+    };
+
     child.once("error", (error) => {
-      if (timedOut) return;
+      if (stoppedBy) return;
       clearTimeout(watchdog);
       console.error(
         `[serverShardWatchdog] outcome ${JSON.stringify({
@@ -222,14 +278,14 @@ export function watchSpawnedChildExit(
     // Settle on process termination, not stdio closure. A descendant can inherit
     // a pipe and keep `close` pending after the watched shard itself has exited.
     child.once("exit", (code) => {
-      if (timedOut) return;
+      if (stoppedBy) return;
       clearTimeout(watchdog);
-      finish(code ?? 1);
+      const exitCode = code ?? 1;
+      finish(fileLimitHit && exitCode === 0 ? 1 : exitCode);
     });
 
     const watchdog = setTimeout(() => {
-      if (settled) return;
-      timedOut = true;
+      if (settled || stoppedBy) return;
       const childPid = child.pid ?? -1;
       const receipt: ProcessDidNotExitReceipt = {
         classification: "PROCESS_DID_NOT_EXIT",
@@ -251,14 +307,60 @@ export function watchSpawnedChildExit(
           }`,
         );
       }
-      signalProcessGroup(child, "SIGTERM");
-
-      setTimeout(() => {
-        signalProcessGroup(child, "SIGKILL");
-        finish(SERVER_SHARD_WATCHDOG_EXIT_CODE);
-      }, options.killGraceMs);
+      terminate("watchdog");
     }, options.timeoutMs);
+
+    // Per-file limit: each file once, from the journal's unfinished files.
+    const overdue = new Set<string>();
+    const checkFiles = (journal: string, limitMs: number) => {
+      if (settled || stoppedBy) return;
+      for (const { file, elapsedMs, workerPid } of readFileTimings(journal).unfinished) {
+        if (elapsedMs < limitMs || overdue.has(file)) continue;
+        overdue.add(file);
+        // A worker on record that is gone already exited (Vitest reported it); nothing runs that file.
+        if (workerPid !== undefined && !isLiveDescendant(child.pid, workerPid)) continue;
+        fileLimitHit = true;
+        const receipt: FileTimeLimitReceipt = {
+          classification: "FILE_TIME_LIMIT",
+          shard: options.shard,
+          file,
+          elapsedMs,
+          limitMs,
+          stopped: workerPid === undefined ? "shard" : "worker",
+          workerPid: workerPid ?? null,
+        };
+        try { (options.emitFileTimeLimit ?? emitFileTimeLimitReceipt)(receipt); }
+        catch { console.error("[serverShardWatchdog] receipt emission failed"); }
+        if (workerPid === undefined) {
+          terminate("fileTimeLimit");
+          return;
+        }
+        // SIGKILL: a worker spinning in synchronous code never runs a SIGTERM handler.
+        try { process.kill(workerPid, "SIGKILL"); } catch { /* it exited meanwhile */ }
+      }
+    };
+    const journal = options.timingJournal;
+    const limitMs = options.fileTimeLimitMs;
+    const fileCheck = journal && limitMs
+      ? setInterval(() => {
+        try { checkFiles(journal, limitMs); }
+        catch { console.error("[serverShardWatchdog] per-file time check failed"); }
+      }, options.fileCheckIntervalMs ?? SERVER_FILE_CHECK_INTERVAL_MS)
+      : undefined;
   });
+}
+
+/** Whether pid is alive and, where the process tree can be read (Linux), one of root's descendants. */
+function isLiveDescendant(rootPid: number | undefined, pid: number): boolean {
+  if (rootPid === undefined || pid === rootPid) return false;
+  const tree = inspectLinuxProcessTree(rootPid);
+  if (!tree.error && !tree.truncated) return tree.entries.some((entry) => entry.pid === pid);
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -310,6 +412,7 @@ async function main(): Promise<void> {
       shard,
       timeoutMs: SERVER_SHARD_WATCHDOG_TIMEOUT_MS,
       killGraceMs: SERVER_SHARD_WATCHDOG_KILL_GRACE_MS,
+      fileTimeLimitMs: SERVER_FILE_TIME_LIMIT_MS,
     });
   } finally {
     try { rmSync(timingDirectory, { recursive: true, force: true }); }

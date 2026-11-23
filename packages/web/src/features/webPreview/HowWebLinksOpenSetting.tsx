@@ -47,7 +47,7 @@ function HowWebLinksOpenRow() {
   }, []);
 
   return (
-    // The same settings row as How links open (DS Forms › A setting's row): the select ends
+    // A settings row (DS Forms › A setting's row): the select ends
     // the row and goes under the text where the row is under 32rem wide. The group's
     // "saved on this device" line under it covers this row too.
     <ListRow variant="plain" interactive={false} className="@max-lg:flex-wrap" data-testid="how-web-links-open-setting">

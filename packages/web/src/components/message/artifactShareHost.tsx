@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo } from "react";
+import { useMatch } from "react-router-dom";
 import type { ChannelId, MessageId } from "@botiverse/raft-shared";
 
 import { setArtifactShareHost } from "../../apps/artifacts";
-import type { ArtifactHostConversation, ArtifactMessagePlace, ArtifactOpenMessageOptions, ArtifactShareHost, ArtifactUploadLimitsHost } from "../../apps/artifacts";
+import type { ArtifactHostConversation, ArtifactMessagePlace, ArtifactOpenMessageOptions, ArtifactPerson, ArtifactShareHost, ArtifactUploadLimitsHost } from "../../apps/artifacts";
 import { deferredDialog } from "../../boot/deferredUi";
 import { trackUploadLimitHit } from "../../analytics/paywall";
 import { useServerStore } from "../../store/serverStore";
@@ -13,6 +14,9 @@ import { useChannelStore } from "../../store/channelStore";
 import { findStoredChannel } from "../../store/storedChannel";
 import type { Channel } from "../../store/channelStore";
 import { useMessageStore } from "../../store/messageStore";
+import { useProfileStore } from "../../store/profileStore";
+import { raiseMainWindow, useObjectWindow } from "../../features/objectWindows";
+import { openConversationAgentProfile } from "../../utils/profilePanelUrl";
 
 // Core's side of workspace Artifacts' "Send to conversation" (S5, F29): the
 // Forward dialog, with the Artifact as what it forwards (#proj-workspace:#99).
@@ -45,23 +49,78 @@ function useOpenMessage(): ReturnType<ArtifactShareHost["useOpenMessage"]> {
   }, [nav]);
 }
 
+/**
+ * A person the Artifact names (who is here, who read it), opened by the app's
+ * rule for a person: inside the server's layout, the profile panel beside what
+ * is open, as a message's avatar and a mention open it (MessageItem's
+ * handleNavigateAgent / handleNavigateHuman: an agent on the reader's first
+ * tab, `ordered-first`); on the Artifact's own page (`/artifacts/<id>`, outside
+ * the layout, so no panel to open it in), the profile's address, as Working now
+ * goes there (a desktop shows it in the Members page's panel, a phone as its
+ * own page). The reader is opened like anyone else (their own avatar opens
+ * their profile in a message too). From an object window (the Artifact's mini
+ * window) the profile opens in the main window, which comes forward, as a link
+ * there brings it (features/objectWindows): opening the panel is a store
+ * change, so the main router's move is not counted on to raise it (it moves
+ * not at all for a profile already open, and the press's 1s raise window
+ * can pass first).
+ */
+function useOpenPerson(): ReturnType<ArtifactShareHost["useOpenPerson"]> {
+  const nav = useAppNavigate();
+  const inServerLayout = useMatch("/s/:serverSlug/*") !== null;
+  const inObjectWindow = useObjectWindow() !== null;
+  return useCallback((person: ArtifactPerson) => {
+    if (!inServerLayout) {
+      if (person.type === "agent") nav.toAgent(person.id);
+      else nav.toHuman(person.id);
+    } else {
+      const { openProfile } = useProfileStore.getState();
+      if (person.type === "agent") openConversationAgentProfile(openProfile, person.id);
+      else openProfile("human", person.id);
+    }
+    if (inObjectWindow) void raiseMainWindow();
+  }, [inServerLayout, inObjectWindow, nav]);
+}
+
 /** As the sidebar names it: a DM by the other person's display name, else their handle. */
 function describe(channel: Channel): ArtifactHostConversation {
   if (channel.type === "dm") return { id: channel.id, name: channel.peerDisplayName || channel.peerName || channel.name, type: "dm" };
   return { id: channel.id, name: channel.name, type: channel.type === "private" ? "private" : "channel" };
 }
 
-function useConversation(conversationId: ChannelId | null): ArtifactHostConversation | null {
-  const channel = useChannelStore((s) => (conversationId ? findConversation(s, conversationId) : undefined));
+/**
+ * A page outside the server layout (the Artifact's own page) has no list loaded yet: load the
+ * sidebar's (coalesced with the layout's own first load, which is already out when it has one).
+ */
+function useConversationListsLoaded(wanted: boolean): void {
   const loading = useChannelStore((s) => s.loading);
-  // A page outside the server layout (the Artifact's own page) has no list loaded yet: load the
-  // sidebar's (coalesced with the layout's own first load, which is already out when it has one).
   useEffect(() => {
-    if (!conversationId || !loading) return;
+    if (!wanted || !loading) return;
     void useChannelStore.getState().loadChannels();
     void useChannelStore.getState().loadDMChannels();
-  }, [conversationId, loading]);
+  }, [wanted, loading]);
+}
+
+function useConversation(conversationId: ChannelId | null): ArtifactHostConversation | null {
+  const channel = useChannelStore((s) => (conversationId ? findConversation(s, conversationId) : undefined));
+  useConversationListsLoaded(conversationId !== null);
   return useMemo(() => (channel ? describe(channel) : null), [channel]);
+}
+
+/**
+ * useConversation for many at once ("Linked from"'s discussions, #proj-workspace:#336 step 2): each
+ * conversation as the reader's own lists have it, null while it isn't there; a new function as the
+ * lists change, so what it names follows them.
+ */
+function useConversationNames(): (conversationId: ChannelId) => ArtifactHostConversation | null {
+  const channels = useChannelStore((s) => s.channels);
+  const dmChannels = useChannelStore((s) => s.dmChannels);
+  const loungeChannels = useChannelStore((s) => s.loungeChannels);
+  useConversationListsLoaded(true);
+  return useCallback((conversationId: ChannelId) => {
+    const channel = findConversation({ channels, dmChannels, loungeChannels }, conversationId);
+    return channel ? describe(channel) : null;
+  }, [channels, dmChannels, loungeChannels]);
 }
 
 function conversationOf(conversationId: string): ArtifactHostConversation | null {
@@ -98,7 +157,7 @@ function startNote(draftKey: string, text: string): void {
   if (!(drafts[draftKey] ?? "").trim()) setDraft(draftKey, text);
 }
 
-export const coreArtifactShareHost: ArtifactShareHost = { ForwardDialog, LinkSendDialog, useOpenMessage, useConversation, conversationOf, uploadLimits, startNote };
+export const coreArtifactShareHost: ArtifactShareHost = { ForwardDialog, LinkSendDialog, useOpenMessage, useOpenPerson, useConversation, useConversationNames, conversationOf, uploadLimits, startNote };
 
 /** Registered once, when the channel panel's module loads (ChatPanel imports this). */
 export function installArtifactShareHost(): void {

@@ -61,6 +61,9 @@ test("Codex: the last sub-agent ends after the turn ended: the agent is woken on
     task().end("completed");
     await until(() => wakes(h) === 1, "the wake");
     await until(() => wakeEvents(h).length === 1, "the wake's event");
+    // How many subagents are still out, as the legacy host's event says it (#proj-o11y:#43).
+    const progress = h.events.filter((e) => e.name === "daemon.runtime.subagent.progress").map((e) => [e.attrs.phase, e.attrs.background_tasks_outstanding]);
+    assert.deepEqual(progress, [["started", 1], ["notification", 0]]);
     assert.equal(h.inputs.at(-1), WAKE, "the input alone, as written");
     const [event] = wakeEvents(h);
     assert.equal(event!.outcome, "written");

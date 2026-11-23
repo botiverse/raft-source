@@ -24,7 +24,7 @@ for (const kind of ["agent-code", "agent-request", "human-code", "human-oidc"] a
       const server = await createServer("PKCE downgrade", `pkce-${suffix}`, owner.id);
       const redirectUri = "https://rp.example.test/login/generic_oauth";
       const { client, clientSecret } = await createOAuthClient({
-        serverId: server.id, createdByUserId: owner.id, clientId: `pkce-${suffix.slice(0, 8)}`,
+        serverId: server.id, createdByUserId: owner.id, clientId: `pkce-${suffix.slice(0, 8)}`, vouchAsCreator: true,
         name: "PKCE RP", returnUrl: redirectUri, allowedScopes: ["openid", "profile"],
       });
       let code: string;

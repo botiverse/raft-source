@@ -36,6 +36,7 @@ import {
   formatAgentSenderHandle,
   formatAgentTaskAssigneeSuffix,
   formatAgentTaskCurrentProjection,
+  formatAgentTaskEarlierDiscussion,
   formatAgentSearchResults,
   formatAgentSourceTasksSuffix,
   formatHint,
@@ -150,6 +151,9 @@ export interface HistoryMessage {
   sender_name?: string;
   senderDescription?: string | null;
   sender_description?: string | null;
+  /** Where an outside sender is from (shared AgentSenderOrigin); printed where the description would be. */
+  senderOrigin?: unknown;
+  sender_origin?: unknown;
   content?: string;
   attachments?: Array<{ id: string; filename: string }>;
   taskStatus?: string | null;
@@ -229,7 +233,7 @@ function formatHistoryMessageLine(channel: string, m: HistoryMessage, index: num
       ? ` [task #${m.taskNumber} status=${m.taskStatus}${formatTaskAssigneeSuffix(m.taskAssigneeId, assigneeName)}]`
       : "";
   const senderTimezone = typeof m.senderTimezone === "string" ? m.senderTimezone : typeof m.sender_timezone === "string" ? m.sender_timezone : null;
-  const handle = formatSenderHandleText(senderName, senderDescription, senderTimezone);
+  const handle = formatSenderHandleText(senderName, senderDescription, senderTimezone, m.senderOrigin ?? m.sender_origin);
   // RFC 082 §4.3: what the card says, under the body (`card:`, then its markdown).
   const cardBlock = formatAgentMessageCardBlock(m.message_card, m.content);
   return `[${headerParts.join(" ")}] ${handle}: ${indentAgentBodyContinuationLines(m.content ?? "")}${attachSuffix}${taskSuffix}${cardBlock}${formatTaskCurrentProjection(m.taskCurrentProjection)}${formatAgentMessageReactionsLine(m.reactions)}`;
@@ -242,6 +246,8 @@ export interface HistoryData {
   has_newer?: boolean;
   historyLimited?: boolean;
   historyLimitMessage?: string;
+  /** `raft task read` of a pre-v2 task: the thread its discussion had before its conversation. */
+  earlierDiscussion?: { target: string; replyCount: number } | null;
   last_read_seq?: number | null;
   unread_after_seq?: number | null;
   read_through_seq?: number | null;
@@ -366,7 +372,11 @@ export const formatHistory = axSurface(
     omitTopLevelCoverage?: boolean;
   },
 ): string => {
-  const coverage = opts?.omitTopLevelCoverage ? null : topLevelCoverageSentence(channel);
+  // `raft task read` of a pre-v2 task names its old thread, in every window shape.
+  const coverage = [
+    opts?.omitTopLevelCoverage ? null : topLevelCoverageSentence(channel),
+    data.earlierDiscussion ? formatAgentTaskEarlierDiscussion(data.earlierDiscussion) : null,
+  ].filter(Boolean).join("\n") || null;
   if (opts?.unread) return formatUnreadWindow(channel, data, coverage, opts.alreadyShownSeqs);
   if (!data.messages || data.messages.length === 0) {
     // An empty window on a plan that hides older history says why.

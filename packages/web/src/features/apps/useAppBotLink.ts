@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useEffectEvent, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useAppNavigate } from "../../hooks/useAppNavigate";
+import { APPS_SCOPE_PARAM } from "./appsScope";
 import type { InstalledConnectedApp } from "./connected-apps/connectedAppTypes";
 
 const APP_BOT = "app_bot";
@@ -9,6 +10,11 @@ const INSTALLED_APP = "installed_app";
 /** The Apps page search (with its `?`) that opens one installed App's detail, by the App's id (the row id, not its client_id). */
 export function installedAppDetailSearch(appId: string): string {
   return `?${new URLSearchParams({ [INSTALLED_APP]: appId }).toString()}`;
+}
+
+/** The address has one of the two links below: this hook's replace is the one that cleans it. */
+export function hasInstalledAppLink(params: URLSearchParams): boolean {
+  return params.has(APP_BOT) || params.has(INSTALLED_APP);
 }
 
 /**
@@ -29,6 +35,10 @@ export function installedAppDetailSearch(appId: string): string {
  *   (`installedAppDetailSearch`): the App's id, the row id the profile's
  *   `managedByApp.clientId` carries (server routes/agents.ts). The installed
  *   App with that id opens as its card opens it (`openInstalled(app)`).
+ *
+ * A scope named beside either (`?tab=`, already applied by
+ * `useAppsScopeLink`, which leaves the address to this hook then) goes in the
+ * same replace; the link's App opens on Yours whatever it named.
  */
 export function useAppBotLink({
   loaded,
@@ -65,13 +75,13 @@ export function useAppBotLink({
     }
     params.delete(APP_BOT);
     params.delete(INSTALLED_APP);
+    params.delete(APPS_SCOPE_PARAM);
     const search = params.toString();
     void navigate({ pathname: location.pathname, search: search ? `?${search}` : "", hash: location.hash }, { replace: true });
   }, [installedApps, loaded, location.hash, location.pathname, location.search, navigate, openInstalled, show]);
   const handleLinksFromLocation = useEffectEvent(handleLinks);
   useEffect(() => {
-    const params = new URLSearchParams(location.search);
-    if (params.has(APP_BOT) || params.has(INSTALLED_APP)) handleLinksFromLocation();
+    if (hasInstalledAppLink(new URLSearchParams(location.search))) handleLinksFromLocation();
   }, [location.search, loaded]);
   const dismissNotInstalled = useCallback(() => setNotInstalled(false), []);
   // A member's way on from the bot section: the Server's people, where its owners and admins are.

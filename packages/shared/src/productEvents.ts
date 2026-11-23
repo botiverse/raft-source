@@ -121,14 +121,15 @@ export const PAGE_VIEW_ROUTES = [
 /**
  * Retired Settings tabs, accepted from older web bundles: `mcp` (MCP Servers,
  * when MCP Apps moved into Applications); `shared-links` (Shared links, when
- * Share to X was retired on 2026-11-09).
+ * Share to X was retired on 2026-11-09); `providers` (AI Providers, when
+ * provider connections were retired, `provider_connections_v0`).
  */
-export const RETIRED_SETTINGS_PAGE_TABS = ["mcp", "shared-links"] as const;
+export const RETIRED_SETTINGS_PAGE_TABS = ["mcp", "shared-links", "providers"] as const;
 
 /** Settings tab ids (web `SETTINGS_TABS`; a web test keeps the two in sync). */
 export const SETTINGS_PAGE_TABS = [
   "account", "language-region", "appearance", "notifications", "theme", "server-notifications", "server", "billing", "administration",
-  "im-bridges", "integrations", "labs", "providers", "about", "feedback",
+  "im-bridges", "integrations", "labs", "about", "feedback",
   // Retired tabs: no current page sends them, but a bundle cached from before still may.
   ...RETIRED_SETTINGS_PAGE_TABS,
 ] as const;
@@ -285,7 +286,21 @@ const ENTRY_LEVEL_REQUESTED_BY = "xxchan (2026-10-23, #proj-analytics:11ec2a34)"
  */
 export const CHANNEL_TABS = ["chat", "tasks", "files"] as const;
 // `header_swipe`: the native apps switch the header's tabs by a swipe too (Lagoon, 2026-10-23).
-export const CHANNEL_TAB_SURFACES = ["header_tabs", "header_swipe", "side_card_toggle", "side_column_tabs", "side_card_close"] as const;
+// `more_menu`: Tasks or Files chosen inside the header's ⋯, where the header folded them (Nova, 2026-11-17).
+export const CHANNEL_TAB_SURFACES = ["header_tabs", "header_swipe", "side_card_toggle", "side_column_tabs", "side_card_close", "more_menu"] as const;
+
+/**
+ * The conversation header's own entries besides Chat / Tasks / Files (Nova, 2026-11-17). `search`: the header's
+ * Search; `open_details`: the conversation's details opened, by the header's Settings (`header`), its item in the ⋯
+ * (`more_menu`) or the conversation's name (`title`); `open_menu`: the header's ⋯ itself opened (`header`);
+ * `open_lounge` / `start_call`: an agent DM's Lounge / voice Call, its button (`header`) or its item in the ⋯
+ * (`more_menu`).
+ * `compact` (on `channel_tab_selected` too): the header was folded (a phone's width, or some of its buttons folded
+ * into ⋯).
+ */
+export const CONVERSATION_HEADER_ACTIONS = ["search", "open_menu", "open_details", "open_lounge", "start_call"] as const;
+export const CONVERSATION_HEADER_SURFACES = ["header", "more_menu", "title"] as const;
+export const CONVERSATION_HEADER_CONVERSATIONS = ["channel", "dm"] as const;
 
 /**
  * What someone did to one message, and from where. Surfaces: the hover toolbar;
@@ -572,7 +587,7 @@ export const ARTIFACT_OPEN_SOURCES = ["message_card", "message_chip", "link", "d
 /** Where the viewer was when it opened: the channel's side card, maximized (expanded, or the Artifacts page), or a phone's full screen. */
 export const ARTIFACT_VIEWER_SURFACES = ["side", "maximized", "phone"] as const;
 export const ARTIFACT_VIEWER_ACTIONS = [
-  "version_switch", "comments_open", "follow", "unfollow", "copy_link", "download", "maximize", "share_open", "embed_copy",
+  "version_switch", "comments_open", "follow", "unfollow", "copy_link", "download", "maximize", "share_open", "embed_copy", "share",
 ] as const;
 /** Where a comment points: the whole Artifact, a file, a place the page names, or text (a selection, lines or rows). */
 export const ARTIFACT_COMMENT_ANCHORS = ["none", "file", "page_anchor", "text"] as const;
@@ -715,11 +730,15 @@ export const EXTERNAL_INVITE_EMAIL_BUCKETS = ["0", "1", "2-5", "6-20"] as const;
 export const EXTERNAL_INVITE_SERVER_BUCKETS = ["0", "1", "2+"] as const;
 /** Where the person was when the flow closed; `details` and `people` are Create Channel's own steps. */
 export const EXTERNAL_INVITE_STAGES = ["details", "people", "input", "review"] as const;
-/** The server's refusal codes the dialog has a sentence for (web `ERROR_MESSAGE_IDS`); anything else is `other`. */
+/**
+ * The server's refusal codes the dialog has a sentence for (web `ERROR_MESSAGE_IDS`);
+ * `channel_name_taken`: Create Channel's create refused for its name (a 409 that
+ * deliberately carries no code, or archived_name_collision; #wg-rbac:#94); anything else is `other`.
+ */
 export const EXTERNAL_INVITE_SEND_ERROR_CODES = [
   "daily_cap", "free_external_limit", "channel_full", "external_members_keep_private", "channel_membership_required",
   "make_private_required", "channel_archived", "channel_not_invitable", "forbidden", "connecting", "invite_not_pending",
-  "invalid_input", "not_found", "other",
+  "invalid_input", "not_found", "channel_name_taken", "other",
 ] as const;
 const EXTERNAL_INVITE_FLOW = { type: "enum", values: EXTERNAL_INVITE_FLOWS, required: true } as const;
 // The end of each attempt to join or connect to an external channel (cindyz via Warden,
@@ -743,10 +762,13 @@ export const EXTERNAL_CONNECT_PATHS = [
  * How it finished. `connecting`: answered 202, the channel's conversion first
  * (the worker's own row follows); `declined`: a `decline` that went through;
  * `expired`: the worker found the invite run out; `error`: an unexpected
- * failure (a 500, a multi-connect's `internal_error`).
+ * failure (a 500, a multi-connect's `internal_error`); `already_connected`:
+ * a `host_direct` or `self_connect` choice of a server already connected (a repeated
+ * send), answered as connected with nothing done (#wg-rbac:#94; until
+ * then it was recorded as `refused` / `invalid_server`).
  */
 export const EXTERNAL_CONNECT_RESULTS = [
-  "connected", "connecting", "awaiting_approval", "declined", "refused", "expired", "error",
+  "connected", "connecting", "awaiting_approval", "declined", "refused", "expired", "error", "already_connected",
 ] as const;
 /**
  * `refusal_code` (with `refused` only): the refusal codes these routes answer,
@@ -765,6 +787,8 @@ export const EXTERNAL_CONNECT_REFUSAL_CODES = [
   // `connecting` is recorded as connect_in_progress.
   "channel_not_invitable", "make_private_required", "forbidden", "channel_membership_required", "invite_open",
   "invite_not_pending", "daily_cap",
+  // The connecting server already has a channel of this name (#triage:#536).
+  "channel_name_taken",
   "other",
 ] as const;
 export type ExternalConnectPath = (typeof EXTERNAL_CONNECT_PATHS)[number];
@@ -925,9 +949,6 @@ const GATED_FEATURES_REQUESTED_BY = "tygg (2026-11-08, #proj-o11y:a5f3094f); cou
 export const DRAFT_COUNT_BUCKETS = ["0", "1", "2-5", "6+"] as const;
 /** Where a draft was started: a channel's or DM's composer, a thread's, a task's. */
 export const DRAFT_PLACES = ["channel", "dm", "thread", "task"] as const;
-/** The two parts of agent read progress: the faces, and the line under your message that will not reach an agent. */
-export const AGENT_READ_PROGRESS_PARTS = ["faces", "not_reaching_line"] as const;
-export const AGENT_READ_PROGRESS_CONVERSATIONS = ["channel", "thread"] as const;
 
 // The native apps' device settings (Settings › Mobile on a phone; the same
 // cards under Settings › Appearance with a mouse or trackpad). artin via Lagoon,
@@ -1674,6 +1695,20 @@ export const PRODUCT_EVENT_REGISTRY = {
       tab: { type: "enum", values: CHANNEL_TABS, required: true },
       surface: { type: "enum", values: CHANNEL_TAB_SURFACES, required: true },
       was_active: { type: "boolean", required: true },
+      /** The header was folded (a phone's width, or buttons folded into ⋯); from release 1.30.0; older clients omit it. */
+      compact: { type: "boolean" },
+    },
+  },
+  conversation_header_action_selected: {
+    question: "Which of a conversation header's Search, details (its Settings or the name), an agent DM's Lounge and Call, and ⋯ do people use, from the header or from inside its ⋯, and does a folded header change that, per platform? (Decides what the header keeps outside ⋯.)",
+    requestedBy: "Nova (2026-11-17), entry-level tracking (xxchan, 2026-10-23, #proj-analytics:11ec2a34)",
+    sources: APP_CLIENTS,
+    properties: {
+      action: { type: "enum", values: CONVERSATION_HEADER_ACTIONS, required: true },
+      surface: { type: "enum", values: CONVERSATION_HEADER_SURFACES, required: true },
+      conversation: { type: "enum", values: CONVERSATION_HEADER_CONVERSATIONS, required: true },
+      /** The header was folded: a phone's width, or some of its buttons folded into ⋯. */
+      compact: { type: "boolean", required: true },
     },
   },
   message_action_selected: {
@@ -1979,7 +2014,7 @@ export const PRODUCT_EVENT_REGISTRY = {
     },
   },
   artifact_viewer_action: {
-    question: "Which Artifact viewer features do people use (versions, comments, follow, copy link, download, maximize, send)?",
+    question: "Which Artifact viewer features do people use (versions, comments, follow, copy link, download, share, maximize, send)?",
     requestedBy: ARTIFACTS_REQUESTED_BY,
     sources: WEB_CLIENTS,
     properties: { action: { type: "enum", values: ARTIFACT_VIEWER_ACTIONS, required: true } },
@@ -2077,21 +2112,6 @@ export const PRODUCT_EVENT_REGISTRY = {
     requestedBy: GATED_FEATURES_REQUESTED_BY,
     sources: APP_CLIENTS,
     properties: { place: { type: "enum", values: DRAFT_PLACES, required: true } },
-  },
-  // Agent read progress (agent_read_progress_v0): the display was generated in
-  // a conversation the person opened, once per conversation and part per page
-  // load. `faces`: at least one agent's face placed on a loaded timeline row;
-  // `not_reaching_line`: the line under your latest message saying it will not
-  // reach an agent was rendered. Not checked against the scrolled viewport (the
-  // timeline is virtualized), so not an impression (meichen, 2026-11-08). No ids.
-  agent_read_progress_shown: {
-    question: "How many people open conversations where agents' read progress is generated, and how often is the line saying a message will not reach an agent rendered?",
-    requestedBy: GATED_FEATURES_REQUESTED_BY,
-    sources: APP_CLIENTS,
-    properties: {
-      part: { type: "enum", values: AGENT_READ_PROGRESS_PARTS, required: true },
-      conversation: { type: "enum", values: AGENT_READ_PROGRESS_CONVERSATIONS, required: true },
-    },
   },
   /**
    * One event for every feature in the feature map (cindyz, 2026-10-26,

@@ -1,9 +1,10 @@
-import { allModelsUsageAccount, getModelLabel, getRuntimeDisplayName } from "@botiverse/raft-shared";
+import { allModelsUsageAccount, defaultRuntimeUsageAccount, getModelLabel, getRuntimeDisplayName, runtimeConfigModelValue } from "@botiverse/raft-shared";
 import type { ReasoningEffort, RuntimeAccountUsageSnapshot, RuntimeConfig } from "@botiverse/raft-shared";
 import {
   buildRuntimeConfig,
   supportsRuntimeFastMode,
 } from "../../utils/runtimeConfigForm";
+import { usageOnCredits } from "./runtimeUsageCredits";
 
 /**
  * Bulk "Change model" planner (task #1287, designs from task #1285).
@@ -79,7 +80,7 @@ export interface BulkPlan {
   applyCount: number;
   /** Agents restarted now ("N running agents will restart."). */
   restartCount: number;
-  /** Running agents among the changes, restarted now or switching when next idle. */
+  /** Running agents among the changes (applying immediately, restarting if busy). */
   runningChangeCount: number;
 }
 
@@ -115,8 +116,8 @@ function sameTarget(agent: BulkPlanAgentInput, target: BulkModelTarget): boolean
     && (agent.reasoningEffort ?? null) === (target.reasoningEffort ?? null);
 }
 
-/** `restartNow`: running agents restart at once instead of switching at their next idle point. */
-export function planBulkModelChange(agents: readonly BulkPlanAgentInput[], target: BulkModelTarget, { restartNow }: { restartNow: boolean }): BulkPlan {
+/** `restartNow` (default false): running agents apply immediately (stopping silently if idle, or restarting immediately if busy). */
+export function planBulkModelChange(agents: readonly BulkPlanAgentInput[], target: BulkModelTarget, { restartNow = false }: { restartNow?: boolean } = {}): BulkPlan {
   const rows: BulkPlanRow[] = agents.map((agent) => {
     if (agent.phase === "restart_pending" && sameTarget(agent, target)) {
       return { agentId: agent.id, kind: "restartOnly", restarts: true };
@@ -162,11 +163,16 @@ export function buildBulkAgentUpdate(agent: BulkPlanAgentInput, target: BulkMode
     // target model that does not run fast.
     && agent.runtimeConfig.mode.kind === "fast";
   const envVars = agent.runtimeConfig?.envVars ?? agent.envVars ?? null;
+  // A Codex speed tier is per model (#wg-runtime-form:#27): kept only when the
+  // model stays (an effort-only change); another model starts at plain fast.
+  const savedTier = keepFast && agent.runtimeConfig?.mode.kind === "fast" ? agent.runtimeConfig.mode.serviceTier : undefined;
+  const keepTier = savedTier && runtimeConfigModelValue(agent.runtimeConfig!) === target.model ? savedTier : undefined;
   const runtimeConfig = buildRuntimeConfig({
     runtime: target.runtime,
     model: target.model,
     customModelMode: false,
     fastMode: keepFast,
+    ...(keepTier ? { serviceTier: keepTier } : {}),
     reasoningEffort: target.reasoningEffort,
     envVars,
   });
@@ -210,16 +216,22 @@ export function formatBulkModelLabel(runtime: string, model: string, withRuntime
  */
 export type BulkRuntimeUsageSummary =
   | { kind: "limit"; plan: string | null; resetsAt: string | null }
+  /** A window used up, but the account keeps running on credits (Codex, `usageOnCredits`): not used up. */
+  | { kind: "credits"; plan: string | null; resetsAt: string | null }
   | { kind: "used"; plan: string | null; percent: number }
   | { kind: "attention"; plan: string | null };
 
 export function summarizeRuntimeUsage(snapshot: RuntimeAccountUsageSnapshot | null): BulkRuntimeUsageSummary | null {
-  const first = snapshot?.accounts[0];
+  // The Computer's default account, never an agent's own folder's (`agentIds`).
+  const first = defaultRuntimeUsageAccount(snapshot);
   if (!first) return null;
   const { account } = allModelsUsageAccount(first);
   const plan = account.planLabel ?? null;
   const limited = account.windows.filter((window) => window.status === "limit_reached");
-  if (limited.length > 0) return { kind: "limit", plan, resetsAt: usableAgainAt(limited.map((window) => window.resetsAt ?? null)) };
+  if (limited.length > 0) {
+    const resetsAt = usableAgainAt(limited.map((window) => window.resetsAt ?? null));
+    return { kind: usageOnCredits(account) ? "credits" : "limit", plan, resetsAt };
+  }
   if (account.health !== "ok") return { kind: "attention", plan };
   const ratios = account.windows
     .filter((window) => window.status === "ok" && typeof window.usedRatio === "number")

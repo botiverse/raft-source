@@ -12,6 +12,7 @@ import type {
 import { foldAgentOneLineText, formatAgentMessageLine, formatAgentMessageTarget, formatAgentReactorName, type AgentMessageLike } from "./agentMessageText";
 import { formatHint, RAFT_HINTS, type RaftHint, type RaftHintStyle } from "./agentOps/hint";
 import { toAgentMessageLike } from "./agentOps/message";
+import { agentInboxAppNameRepeatsKey } from "./agentInboxItemRow";
 import {
   messageIdOfReactionNoticeInboxTarget,
   REACTION_NOTICE_WITHDRAWN_SENTENCE,
@@ -57,10 +58,14 @@ function formatLeft(response: AgentApiInboxReadResponse): string {
   return `${response.remaining}${response.remainingCapped ? "+" : ""} left`;
 }
 
-/** `From Stamp, about #proj:#232.` for an app item; null when the server named neither. */
+/**
+ * `From GitHub, about #proj:#232.` for an app item; null when the server named
+ * neither. A name that only repeats the item's `app:<key>` address (Stamp for
+ * `app:stamp/…`) is left out, as on the list row.
+ */
 function formatReadSource(response: AgentApiInboxReadResponse): string | null {
   if (!APP_READ_KINDS.has(response.kind)) return null;
-  const from = response.app ? foldAgentOneLineText(response.app.name) : "";
+  const from = response.app && !agentInboxAppNameRepeatsKey(response.app) ? foldAgentOneLineText(response.app.name) : "";
   const about = response.related?.target ?? "";
   if (from) return `From ${from}${about ? `, about ${about}` : ""}.`;
   return about ? `About ${about}.` : null;

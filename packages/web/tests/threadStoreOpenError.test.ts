@@ -198,12 +198,14 @@ test("a successful openThread clears a stale openThreadError", async () => {
 // Task #14: the lookup route 404s for "channel not visible / wrong server" as
 // well as for "no thread yet". Only the latter is an empty thread; treating
 // every 404 as empty rendered a populated thread as "No replies yet".
-// A 403/404 is this server saying it can't show the thread (`unavailable`:
-// the panel names the server instead of the "just became public" hint, e.g.
-// a joint channel seen only through another server); a 500 stays generic.
+// Only a 403 is this server saying it can't show the thread to a reader who
+// had access (`unavailable`: the panel names the server, e.g. a joint channel
+// seen only through another server). A 404 is the same answer for missing,
+// other-server, stranger and a malformed id (#503): generic, as a 500.
 for (const [label, error, unavailable] of [
-  ["channel-not-visible 404", { response: { status: 404, data: { error: "Channel not found or not visible" } } }, true],
-  ["bodyless 404", { response: { status: 404 } }, true],
+  ["channel-not-visible 404", { response: { status: 404, data: { error: "Channel not found or not visible" } } }, false],
+  ["bodyless 404", { response: { status: 404 } }, false],
+  ["non-UUID guard 404", { response: { status: 404, data: { error: "Channel not found" } } }, false],
   ["403", { response: { status: 403, data: { error: "Access denied" } } }, true],
   ["500", { response: { status: 500, data: { error: "Failed to get thread info" } } }, false],
 ] as const) {
@@ -258,7 +260,7 @@ for (const [label, data, expectEmpty] of [
       assert.equal(state.openThreadLoading, false);
       assert.deepEqual(
         state.openThreadError,
-        expectEmpty ? null : { parentChannelId: "channel-1", parentMessageId: "parent-1", unavailable: true },
+        expectEmpty ? null : { parentChannelId: "channel-1", parentMessageId: "parent-1", unavailable: false },
       );
     } finally {
       console.error = originalConsoleError;

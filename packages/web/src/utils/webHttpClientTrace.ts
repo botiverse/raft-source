@@ -11,7 +11,7 @@ import type {
 } from "@botiverse/raft-shared";
 import { webTraceSink } from "../observability/webSpanSink";
 import { apiRouteTemplate } from "../observability/apiRouteTemplate";
-import { absoluteRequestUrl, contentLengthOf, performanceNow, requestTiming, watchResourceTiming } from "../observability/resourceTiming";
+import { absoluteRequestUrl, contentLengthOf, edgePopOf, performanceNow, requestTiming, watchResourceTiming } from "../observability/resourceTiming";
 import { finishViewSwitchRequest, noteViewSwitchRequest } from "../observability/viewSwitchSpan";
 import type { ViewSwitchRequest } from "../observability/viewSwitchSpan";
 
@@ -222,6 +222,7 @@ export function startWebHttpClientSpan(
           : "error";
       const timing = input.statusCode === undefined ? null : requestTiming(absoluteUrl, sentAt);
       const bytes = timing?.bytes ?? contentLengthOf(input.responseHeaders);
+      const edgePop = edgePopOf(input.responseHeaders);
       finishViewSwitchRequest(handle.viewSwitch, { bytes, timing });
       span.end(traceStatus, {
         attrs: {
@@ -229,6 +230,7 @@ export function startWebHttpClientSpan(
           status_bucket: bucket,
           status_code: input.statusCode,
           ...(bytes !== undefined ? { response_bytes: bytes } : {}),
+          ...(edgePop !== undefined ? { edge_pop: edgePop } : {}),
           ...(input.statusCode === undefined && input.failure !== undefined
             ? { error_code: webHttpNetworkErrorCode(input.failure) }
             : {}),

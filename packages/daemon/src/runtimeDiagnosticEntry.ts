@@ -6,6 +6,7 @@ import type { RuntimeDiagnosticEvent } from "./runtimeEventTrace";
 
 function runtimeDiagnosticTitle(event: RuntimeDiagnosticEvent): string {
   if (event.source === "pi_empty_response") return PI_RESPONSE_NOTICE_TITLE;
+  if (event.source === "opencode_background_wait") return "OpenCode background jobs";
   switch (event.itemType) {
     case "configWarning":
       return "Codex config warning";

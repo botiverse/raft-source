@@ -38,13 +38,19 @@ test("pick: booleans only when true, enabledApps as given, nothing else", () => 
     reminderApp: true,
     piSessionRotation: undefined,
     taskConversations: true,
+    dmReplyPlacement: true,
     inboxItems: true,
     enabledApps: ["b", "a", "b"],
     runtimeHost: "oar",
     installedApps: [{ name: "x", description: null, whenToUse: "y" }],
   }));
-  assert.deepEqual(picked, { subagentDelegation: true, reminderApp: true, taskConversations: true, inboxItems: true, enabledApps: ["b", "a", "b"] });
+  assert.deepEqual(picked, { subagentDelegation: true, reminderApp: true, taskConversations: true, dmReplyPlacement: true, inboxItems: true, enabledApps: ["b", "a", "b"] });
+  assert.equal("dmReplyPlacement" in pickAgentServerFeatures(config({ dmReplyPlacement: false })), false, "off is left out, as agent:start leaves it out");
   assert.deepEqual(pickAgentServerFeatures(config()), {}, "an older Server's config: enabledApps stays absent");
+  // Focus: a server feature like the others, present only when on.
+  assert.ok(AGENT_SERVER_FEATURE_KEYS.includes("agentFocus"));
+  assert.deepEqual(pickAgentServerFeatures(config({ agentFocus: true })), { agentFocus: true });
+  assert.deepEqual(pickAgentServerFeatures(config({ agentFocus: false })), {});
 });
 
 test("normalize: false and absent read the same; enabledApps sorted, de-duplicated, absent as none", () => {
@@ -69,6 +75,7 @@ test("with: every server feature replaced from the new values, every other field
     subagentDelegation: true,
     passiveAx: true,
     taskConversations: true,
+    dmReplyPlacement: true,
     enabledApps: ["artifacts"],
     runtimeHost: "oar",
     agentCredentialKey: "sk_agent_x",
@@ -81,6 +88,7 @@ test("with: every server feature replaced from the new values, every other field
     enabledApps: [],
   });
   assert.equal("subagentDelegation" in after, false, "a flag turned off is removed, as agent:start leaves it out");
+  assert.equal("dmReplyPlacement" in after, false);
   assert.equal("vaultApp" in after, false);
   assert.deepEqual(before.enabledApps, ["artifacts"], "the input is not modified");
   assert.equal(agentServerFeaturesEqual(pickAgentServerFeatures(after), { passiveAx: true, reminderApp: true }), true);

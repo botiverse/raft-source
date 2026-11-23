@@ -37,12 +37,16 @@ import { runtimeFormV1Entry } from "./runtimeFormDefinitionService";
 import {
   buildRuntimeConfigFromFormValues,
   buildRuntimeFormV2,
+  buildRuntimeFormV2EditBody,
   reasoningEffortChoices,
   reasoningModelOptionSource,
   reconcileRuntimeFormV2SubmissionWithLiveModels,
   runtimeFormV2Entry,
   runtimeFormV2RuntimeIds,
   runtimeFormValuesFromRuntimeConfig,
+  speedOptionSource,
+  withCodexSpeedVisibility,
+  withoutUncheckedServiceTier,
   type RuntimeFormOptionSourceContext,
 } from "./runtimeFormV2Registry";
 import {
@@ -62,6 +66,8 @@ test("codex and grok forms: fields by kind, capabilities, effort labels", () => 
         ["model", "select", true, false],
         ["reasoningEffort", "derived_select", false, false],
         ["fastMode", "boolean", false, false],
+        // #wg-runtime-form:#31: mutually exclusive with fastMode per model (withCodexSpeedVisibility).
+        ["speed", "dependent_select", false, false],
         ["envVars", "string_map", false, true],
       ],
       capabilities: ["select.custom_value"],
@@ -112,8 +118,6 @@ function sourceContext(detect: () => Promise<RuntimeModelSourceOutcome>, routing
     sourceId,
     machineId: "machine-1",
     machine: {},
-    // The v2 endpoint; the capability test below also resolves as v1.
-    sourceStatus: true,
     agentOrchestrator: {
       detectMachineRuntimeModels: async (_machineId: string, runtime: string) => {
         calls.push(runtime);
@@ -186,6 +190,11 @@ test("status per probe outcome: live has no reason; every non-live outcome falls
 test("the reason table covers every contract reason, and each mapping helper follows it", () => {
   assert.deepEqual(Object.keys(RUNTIME_FORM_V2_REASON_RETRYABLE).sort(), [...RUNTIME_FORM_V2_OPTION_SOURCE_REASONS].sort());
   assert.equal(optionSourceReasonForOutcome({ kind: "live", value: { models: LIVE } }), null);
+  // #oar-raft:#20: a signed-out or too-old CLI is said as such, not "could not list".
+  assert.equal(optionSourceReasonForOutcome({ kind: "error", retryable: true, code: "runtime_not_authenticated" }), "not_signed_in");
+  assert.equal(optionSourceReasonForOutcome({ kind: "error", retryable: true, code: "protocol_unsupported" }), "runtime_outdated");
+  assert.equal(optionSourceReasonForOutcome({ kind: "error", retryable: true, code: "detect_failed" }), "probe_failed");
+  assert.equal(optionSourceReasonForOutcome({ kind: "error", retryable: true }), "probe_failed");
   assert.equal(optionSourceReasonForProbeError(new RouteFailureError("daemon_timeout", "t")), "probe_timeout");
   assert.equal(optionSourceReasonForProbeError(new RouteFailureError("daemon_offline", "o")), "machine_offline");
   assert.equal(optionSourceReasonForProbeError(new Error("x")), "probe_failed");
@@ -273,23 +282,12 @@ test("no form lists choice.labels or option_source.status; status follows the pr
     for (const copy of Object.values(localization)) {
       if (copy && "choices" in copy) assert.equal(typeof copy.choices, "object", `${runtime}: choices`);
     }
-    // A runtime that also has a v1 form must keep status off its v1 bodies:
-    // v1 clients parse strictly and never asked for it.
-    const hasV1 = runtimeFormV1Entry(runtime) !== null;
     for (const sourceId of Object.keys(form.optionSources ?? {})) {
       for (const [detect, routing] of outcomes) {
         const context = sourceContext(detect, routing, sourceId).context;
         (context.agentOrchestrator as unknown as Record<string, unknown>).detectMachineRuntimeModelsWithAuthority = async () => {
           throw new RouteFailureError("daemon_offline", "offline");
         };
-        if (hasV1) {
-          const v1Resolution = await entry.resolveOptionSource({ ...context, sourceStatus: false }).catch(() => null);
-          if (v1Resolution?.kind === "source" && v1Resolution.source) {
-            for (const key of ["status", "reason", "retryable"]) {
-              assert.equal(key in v1Resolution.source, false, `${runtime}/${sourceId}: no ${key} on v1`);
-            }
-          }
-        }
         let resolution;
         try {
           resolution = await entry.resolveOptionSource(context);
@@ -306,7 +304,10 @@ test("no form lists choice.labels or option_source.status; status follows the pr
         // whenever the form lists select.custom_value. A
         // static source (Claude's provider select) has no probe to report on and
         // never allows a typed value (status omitted, customValueAllowed false).
-        if (sourceId === "model") {
+        if (sourceId === "speed") {
+          // #wg-runtime-form:#27: Codex's speed follows the model probe.
+          assert.ok(typeof source.status === "string", `${runtime}/${sourceId}: status`);
+        } else if (sourceId === "model") {
           if (!UNPROBED_MODEL_RUNTIMES.has(runtime)) assert.ok(typeof source.status === "string", `${runtime}/${sourceId}: status`);
           assert.equal(source.customValueAllowed === true, capabilities.has("select.custom_value"), `${runtime}/${sourceId}: customValueAllowed`);
         } else {
@@ -392,7 +393,7 @@ test("edit values round-trip the stored config: preset, custom model, fast mode,
     assert.equal("fastMode" in values, config.runtime === "codex", config.runtime);
     assertSameAsLegacy(submitted(config.runtime, values, { editing: true, existing: config }), config, JSON.stringify(config));
   }
-  assert.deepEqual(runtimeFormValuesFromRuntimeConfig(stored[1]!), { model: "my-org/custom", reasoningEffort: "low", fastMode: false, envVars: {} });
+  assert.deepEqual(runtimeFormValuesFromRuntimeConfig(stored[1]!), { model: "my-org/custom", reasoningEffort: "low", fastMode: false, speed: "", envVars: {} });
 });
 
 test("codex/grok submit errors point at the field", () => {
@@ -466,6 +467,18 @@ test("an effort the live list does not offer for the selected model is refused a
   }
 });
 
+test("a live model that declares no efforts offers none, over the bundled set, like the legacy web picker", async () => {
+  // gpt-5.6-sol is bundled with all six levels; this Computer says it takes none.
+  const liveModels: RuntimeModelInfo[] = [{ id: "gpt-5.6-sol", label: "Sol (live)", supportedReasoningEfforts: [], defaultReasoningEffort: "medium" }];
+  const source = await resolvedSource("codex", async () => ({ kind: "live", value: { models: liveModels } }));
+  // reasoningEffortNone: the form says the model takes none instead of hiding the field (triage #492).
+  assert.deepEqual(source.options, [{ value: "gpt-5.6-sol", label: "Sol (live)", supportedReasoningEfforts: [], reasoningEffortNone: true }]);
+  assert.deepEqual(reasoningEffortOptionsForModel("codex", "gpt-5.6-sol", liveModels), []);
+
+  const { result } = await reconcile("codex", { model: "gpt-5.6-sol", reasoningEffort: "ultra" }, liveList(liveModels));
+  assert.deepEqual(result, { kind: "rejected", issue: { code: "reasoning_effort_not_supported", pointer: "/formValues/reasoningEffort" } });
+});
+
 test("without a live list naming the model the static rule stands; nothing to decide means no probe", async () => {
   const values = { model: "grok-live-only", reasoningEffort: "max" };
   for (const detect of [
@@ -495,4 +508,173 @@ test("without a live list naming the model the static rule stands; nothing to de
     detect: async () => { throw new Error("must not probe"); },
   });
   assert.deepEqual(opencode, { kind: "unchanged" });
+});
+
+test("antigravity model options say why an effort list is empty; an older Computer's unexplained one stays bare", () => {
+  const models: RuntimeModelInfo[] = [
+    { id: "agy-levels", label: "Levels", supportedReasoningEfforts: ["low", "high"], defaultReasoningEffort: "high" },
+    { id: "agy-none", label: "None", supportedReasoningEfforts: [] },
+    { id: "agy-unread", label: "Unread", reasoningEffortUnavailableReason: "Native catalog did not expose this model's effort menu." },
+    // OAR 0.107 (an older Computer): no effort information at all.
+    { id: "agy-old", label: "Old" },
+  ];
+  const source = wire(reasoningModelOptionSource("antigravity", models, undefined, null, { customModel: false }));
+  assert.deepEqual(source.options, [
+    { value: "agy-levels", label: "Levels", supportedReasoningEfforts: ["low", "high"], defaultReasoningEffort: "high" },
+    { value: "agy-none", label: "None", supportedReasoningEfforts: [], reasoningEffortNone: true },
+    { value: "agy-unread", label: "Unread", supportedReasoningEfforts: [], reasoningEffortUnavailableReason: "Native catalog did not expose this model's effort menu." },
+    { value: "agy-old", label: "Old", supportedReasoningEfforts: [] },
+  ]);
+});
+
+// ── #wg-runtime-form:#27/#31: Codex speed (mutually exclusive fastMode checkbox / speed menu) ──
+
+const ASTRA_TIERS: RuntimeModelInfo = {
+  id: "gpt-6.2-astra",
+  label: "GPT-6.2-Astra",
+  serviceTierChoices: [{ id: "priority", name: "Fast" }, { id: "ultrafast", name: "Ultrafast" }],
+};
+const SOL_ONE_TIER: RuntimeModelInfo = { id: "gpt-6.2-sol", label: "GPT-6.2-Sol", serviceTierChoices: [{ id: "priority", name: "Fast" }] };
+const MINI_NO_FAST: RuntimeModelInfo = { id: "gpt-5-mini", label: "GPT-5 Mini", serviceTierChoices: [] };
+
+test("speed: speed dropdown maps '' -> default, 'priority' -> primary fast, other id -> named tier; fastMode maps boolean when speed absent", () => {
+  // Multi-tier speed dropdown (fastMode omitted by HIDE rule):
+  assert.deepEqual(submitted("codex", { model: "gpt-6.2-astra", speed: "" }).mode, { kind: "default" });
+  assert.deepEqual(submitted("codex", { model: "gpt-6.2-astra", speed: "priority" }).mode, { kind: "fast" });
+  assert.deepEqual(submitted("codex", { model: "gpt-6.2-astra", speed: "ultrafast" }).mode, { kind: "fast", serviceTier: "ultrafast" });
+  // Single-tier fastMode checkbox (speed omitted by SHOW rule):
+  assert.deepEqual(submitted("codex", { model: "gpt-6.2-sol", fastMode: true }).mode, { kind: "fast" });
+  assert.deepEqual(submitted("codex", { model: "gpt-6.2-sol", fastMode: false }).mode, { kind: "default" });
+  // Zero-fast-tier model (neither field submitted):
+  assert.deepEqual(submitted("codex", { model: "gpt-5-mini" }).mode, { kind: "default" });
+  assert.deepEqual(buildRuntimeConfigFromFormValues("codex", { model: "m", speed: "Ultra Fast" }), {
+    ok: false, issue: { code: "invalid_service_tier", pointer: "/formValues/speed" },
+  });
+  // Grok has no speed field: a stray value is ignored.
+  assert.equal("serviceTier" in (submitted("grok", { model: "grok-4.5", speed: "ultrafast" }) as unknown as RuntimeConfig).mode, false);
+  // Edit values populate both fields consistently for the stored mode.
+  const storedUltra = submitted("codex", { model: "gpt-6.2-astra", speed: "ultrafast" }) as unknown as RuntimeConfig;
+  assert.equal(runtimeFormValuesFromRuntimeConfig(storedUltra)!.speed, "ultrafast");
+  assert.equal(runtimeFormValuesFromRuntimeConfig(storedUltra)!.fastMode, true);
+  const storedFast = submitted("codex", { model: "gpt-6.2-astra", speed: "priority" }) as unknown as RuntimeConfig;
+  assert.equal(runtimeFormValuesFromRuntimeConfig(storedFast)!.speed, "priority");
+  assert.equal(runtimeFormValuesFromRuntimeConfig(storedFast)!.fastMode, true);
+  const storedDefault = submitted("codex", { model: "gpt-6.2-astra", speed: "" }) as unknown as RuntimeConfig;
+  assert.equal(runtimeFormValuesFromRuntimeConfig(storedDefault)!.speed, "");
+  assert.equal(runtimeFormValuesFromRuntimeConfig(storedDefault)!.fastMode, false);
+});
+
+test("speed: offline edit (speed absent) keeps saved named tier while model and fastMode stay on, clears on fastMode=false or model switch", () => {
+  const existing = submitted("codex", { model: "gpt-6.2-astra", speed: "ultrafast" }) as unknown as RuntimeConfig;
+  const edit = { editing: true, existing };
+  assert.deepEqual(submitted("codex", { model: "gpt-6.2-astra", fastMode: true }, edit).mode, { kind: "fast", serviceTier: "ultrafast" });
+  assert.deepEqual(submitted("codex", { model: "gpt-6.2-sol", fastMode: true }, edit).mode, { kind: "fast" }, "another model: the primary tier");
+  assert.deepEqual(submitted("codex", { model: "gpt-6.2-astra", fastMode: false }, edit).mode, { kind: "default" });
+  assert.deepEqual(submitted("codex", { model: "gpt-6.2-astra", speed: "" }, edit).mode, { kind: "default" }, "Standard clears fast mode");
+  assert.deepEqual(submitted("codex", { model: "gpt-6.2-astra", speed: "priority" }, edit).mode, { kind: "fast" }, "Fast clears named tier");
+});
+
+test("speed: the tier must be one the Computer lists for the model; zero-tier model drops fast mode; removed tier falls back", async () => {
+  const offered = await reconcile("codex", { model: "gpt-6.2-astra", speed: "ultrafast" }, liveList([ASTRA_TIERS]));
+  assert.equal(offered.result.kind, "updated");
+  assert.deepEqual((offered.result as { runtimeConfig: RuntimeConfig }).runtimeConfig.mode, { kind: "fast", serviceTier: "ultrafast" });
+  assert.deepEqual(offered.probes, ["codex"], "a tier alone is enough to ask the Computer");
+
+  const notListed = await reconcile("codex", { model: "gpt-6.2-sol", speed: "ultrafast" }, liveList([SOL_ONE_TIER]));
+  assert.deepEqual(notListed.result, { kind: "rejected", issue: { code: "service_tier_not_supported", pointer: "/formValues/speed" } });
+  const olderComputer = await reconcile("codex", { model: "gpt-6.2-astra", speed: "ultrafast" }, liveList([{ id: "gpt-6.2-astra", label: "A", serviceTiers: ["priority", "ultrafast"] }]));
+  assert.equal(olderComputer.result.kind, "rejected", "ids without serviceTierChoices: a Computer that would launch the primary tier");
+
+  // Model explicitly declaring zero fast tiers drops fast mode to default (both custom and bundled preset models).
+  const noFast = await reconcile("codex", { model: "gpt-5-mini", fastMode: true }, liveList([MINI_NO_FAST]));
+  assert.equal(noFast.result.kind, "updated");
+  assert.deepEqual((noFast.result as { runtimeConfig: RuntimeConfig }).runtimeConfig.mode, { kind: "default" });
+  const presetNoFast = await reconcile("codex", { model: "gpt-6.2-sol", fastMode: true }, liveList([{ id: "gpt-6.2-sol", label: "GPT-6.2-Sol", serviceTierChoices: [] }]));
+  assert.equal(presetNoFast.result.kind, "updated");
+  assert.deepEqual((presetNoFast.result as { runtimeConfig: RuntimeConfig }).runtimeConfig.mode, { kind: "default" });
+
+  const existing = normalized("codex", { model: "gpt-6.2-astra", speed: "ultrafast" });
+  const fallback = await reconcileRuntimeFormV2SubmissionWithLiveModels({
+    runtimeConfig: existing,
+    submittedReasoningEffort: null,
+    existing,
+    machineId: "machine-1",
+    detect: liveList([{ ...ASTRA_TIERS, serviceTierChoices: [{ id: "priority" }] }]),
+  });
+  assert.equal(fallback.kind, "updated");
+  assert.deepEqual((fallback as { runtimeConfig: RuntimeConfig }).runtimeConfig.mode, { kind: "fast" });
+});
+
+test("speed: the source has a key only for a model with two or more named tiers, Standard '' first then tier ids", () => {
+  const source = speedOptionSource("codex", [ASTRA_TIERS, SOL_ONE_TIER, MINI_NO_FAST, { id: "gpt-5.5", label: "GPT-5.5" }], null) as unknown as {
+    optionsByValue: Record<string, Array<{ value: string; label: string }>>; defaultValueByValue: Record<string, string>; status: string;
+  };
+  assert.deepEqual(Object.keys(source.optionsByValue), ["gpt-6.2-astra"]);
+  assert.deepEqual(source.optionsByValue["gpt-6.2-astra"]!.map((option) => option.value), ["", "priority", "ultrafast"]);
+  assert.equal(source.optionsByValue["gpt-6.2-astra"]![0]!.label, "Standard · Default speed");
+  assert.equal(source.defaultValueByValue["gpt-6.2-astra"], "");
+  assert.equal(source.status, "live");
+  const offline = speedOptionSource("codex", [], "machine_offline") as unknown as { optionsByValue: object; status: string };
+  assert.deepEqual(offline.optionsByValue, {});
+  assert.equal(offline.status, "unavailable");
+});
+
+test("speed: withCodexSpeedVisibility sets mutually-exclusive SHOW/HIDE rules and omits speed when no model has multiple fast tiers", () => {
+  // No multi-tier models (older Computer / offline): speed is omitted; fastMode stays visible.
+  const single = withCodexSpeedVisibility(buildRuntimeFormV2("codex"), [SOL_ONE_TIER]);
+  assert.equal("speed" in single.dataSchema.properties, false);
+  assert.equal(single.uiSchema?.order?.includes("speed"), false);
+  assert.equal("speed" in (single.uiSchema?.localization ?? {}), false);
+  assert.equal("speed" in (single.optionSources ?? {}), false);
+  assert.equal(single.uiSchema?.rules, undefined);
+  assert.ok(parseRuntimeFormV2(wire(single)), "valid form without speed");
+  const editSingle = withCodexSpeedVisibility(
+    buildRuntimeFormV2EditBody("codex", { runtime: "codex", model: { kind: "preset", id: "gpt-6.2-astra" }, mode: { kind: "fast", serviceTier: "ultrafast" } })!,
+    [],
+  );
+  assert.equal("speed" in ((editSingle as { values?: object }).values ?? {}), false);
+
+  // Mixed probe: multi-tier shows speed & hides fastMode; zero-tier hides both; single-tier shows fastMode & hides speed.
+  const tiered = withCodexSpeedVisibility(buildRuntimeFormV2("codex"), [ASTRA_TIERS, SOL_ONE_TIER, MINI_NO_FAST]);
+  assert.equal("speed" in tiered.dataSchema.properties, true);
+  assert.deepEqual(tiered.uiSchema?.rules, [
+    { scope: "#/properties/fastMode", effect: "HIDE", condition: { scope: "#/properties/model", schema: { enum: ["gpt-6.2-astra", "gpt-5-mini"] } } },
+    { scope: "#/properties/speed", effect: "SHOW", condition: { scope: "#/properties/model", schema: { enum: ["gpt-6.2-astra"] } } },
+  ]);
+});
+
+test("speed: a newly chosen tier nothing could check is refused; a saved one stays only on the same model", async () => {
+  const ultra = normalized("codex", { model: "gpt-6.2-astra", speed: "ultrafast" });
+  // No Computer to ask, or its list unreadable: a newly chosen tier is refused, so the person hears it did not take.
+  const refused = { kind: "rejected", issue: { code: "service_tier_unchecked", pointer: "/formValues/speed" } };
+  const noMachine = await reconcile("codex", { model: "gpt-6.2-astra", speed: "ultrafast" }, liveList([ASTRA_TIERS]), null);
+  assert.deepEqual(noMachine.result, refused);
+  const offline = await reconcile("codex", { model: "gpt-6.2-astra", speed: "ultrafast" }, async () => ({ kind: "error", retryable: true }));
+  assert.deepEqual(offline.result, refused);
+  // The primary tier needs no check.
+  const primary = await reconcile("codex", { model: "gpt-6.2-astra", fastMode: true }, async () => ({ kind: "error", retryable: true }));
+  assert.equal(primary.result.kind, "unchanged");
+  // The saved tier resent on the same model, unchecked: kept as it is.
+  const resent = await reconcileRuntimeFormV2SubmissionWithLiveModels({
+    runtimeConfig: ultra,
+    submittedReasoningEffort: undefined,
+    existing: ultra,
+    machineId: "machine-1",
+    detect: async () => ({ kind: "error", retryable: true }),
+  });
+  assert.equal(resent.kind, "unchanged");
+  // The saved one on the same model is kept; on another model it is not (a hidden field resent it).
+  assert.equal(withoutUncheckedServiceTier(ultra, ultra), ultra);
+  const otherModel = { ...ultra, model: { kind: "preset", id: "gpt-6.2-sol" } } as RuntimeConfig;
+  assert.deepEqual(withoutUncheckedServiceTier(otherModel, ultra).mode, { kind: "fast" });
+  assert.deepEqual(withoutUncheckedServiceTier(ultra, null).mode, { kind: "fast" });
+  const plain = normalized("codex", { model: "gpt-6.2-astra", fastMode: true });
+  assert.equal(withoutUncheckedServiceTier(plain, null), plain, "nothing to drop: same object");
+});
+
+test("speed: flex is never offered as a fast tier", () => {
+  const source = speedOptionSource("codex", [{ ...ASTRA_TIERS, serviceTierChoices: [{ id: "priority" }, { id: "flex" }] }], null) as unknown as {
+    optionsByValue: Record<string, unknown>;
+  };
+  assert.deepEqual(source.optionsByValue, {});
 });

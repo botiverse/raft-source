@@ -97,8 +97,13 @@ function sameKeys(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((key, i) => key === b[i]);
 }
 
+/** The snapshot now, outside React (useActivityUnreadSnapshot). */
+export function currentActivityUnreadSnapshot(): ActivityUnreadSnapshot | null {
+  return snapshot;
+}
+
 export function useActivityUnreadSnapshot(): ActivityUnreadSnapshot | null {
-  return useSyncExternalStore(subscribe, () => snapshot, () => null);
+  return useSyncExternalStore(subscribe, currentActivityUnreadSnapshot, () => null);
 }
 
 /**

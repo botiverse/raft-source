@@ -119,6 +119,7 @@ interface ProcessTimerInternals {
   exit: { kind: string };
   runtimeErrorDeliveryBackoff: { kind: string; timer?: Timer | null };
   sessionReadyDeliveryRetry: { kind: string; scheduler?: { clearTimer(): void } };
+  pendingIdleInboxHold: { timer: Timer } | null;
 }
 
 /**
@@ -144,6 +145,7 @@ export async function releaseAgentManagerForTests(
       exit: "field",
       runtimeErrorDeliveryBackoff: "field",
       sessionReadyDeliveryRetry: "field",
+      pendingIdleInboxHold: "field",
     });
     ap.notifications.clearTimer();
     if (ap.startup.kind === "waiting" && ap.startup.timer) clearTimeout(ap.startup.timer);
@@ -154,6 +156,7 @@ export async function releaseAgentManagerForTests(
       clearTimeout(ap.runtimeErrorDeliveryBackoff.timer);
     }
     if (ap.sessionReadyDeliveryRetry.kind === "scheduled") ap.sessionReadyDeliveryRetry.scheduler?.clearTimer();
+    if (ap.pendingIdleInboxHold) clearTimeout(ap.pendingIdleInboxHold.timer);
   }
   m.agents.clear();
   // withManager may install a custom session-ready retry scheduler factory; it

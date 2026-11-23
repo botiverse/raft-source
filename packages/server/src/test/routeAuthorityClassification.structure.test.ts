@@ -123,7 +123,7 @@ const PINNED_CARD_ROUTES: readonly string[] = [
  */
 const NEVER_DELEGABLE: Readonly<Record<string, readonly string[]>> = {
   // Agent credentials, machine and Computer keys (issuing, rotating, revoking), App and webhook secrets, provider and
-  // Computer runtime sign-ins, signed scope attestations.
+  // Computer runtime sign-ins, upgrades and installs, signed scope attestations.
   "credentials and keys": [
     "POST /api/agents/:id/credentials",
     "DELETE /api/agents/:id/credentials/:credentialId",
@@ -137,14 +137,15 @@ const NEVER_DELEGABLE: Readonly<Record<string, readonly string[]>> = {
     "POST /api/servers/:id/setup-reset",
     "POST /api/integrations/clients/:clientId/regenerate-secret",
     "POST /api/integrations/clients/:clientId/app-notifications/webhook/rotate-secret",
-    "POST /api/provider-connections",
-    "PATCH /api/provider-connections/:connectionId",
-    "DELETE /api/provider-connections/:connectionId",
-    "POST /api/provider-connections/:connectionId/credentials/rotate",
     "POST /api/servers/:id/machines/:machineId/runtime-auth/:runtime/login",
     "POST /api/servers/:id/machines/:machineId/runtime-auth/:runtime/login/:loginId/code",
     "POST /api/servers/:id/machines/:machineId/runtime-auth/:runtime/connect-provider",
     "POST /api/servers/:id/machines/:machineId/runtime-auth/:runtime/logout",
+    // Runs a runtime's own updater: changes the Computer's software.
+    "POST /api/servers/:id/machines/:machineId/runtimes/:runtime/upgrade",
+    // Installs software on the Computer, and reads the commands it would run there.
+    "POST /api/servers/:id/machines/:machineId/runtimes/:runtime/install-plan",
+    "POST /api/servers/:id/machines/:machineId/runtimes/:runtime/install",
     "POST /api/mcp/apps/:appId/connections",
     "PATCH /api/mcp/apps/:appId/connections/:connectionId",
     "POST /api/servers/:id/scope-attestation",
@@ -225,6 +226,8 @@ const NEVER_DELEGABLE: Readonly<Record<string, readonly string[]>> = {
     "DELETE /api/integrations/marketplace/:clientId/install",
     "PUT /api/integrations/marketplace/:clientId/install/app-notifications/grant",
     "POST /api/integrations/clients/:clientId/install/bot",
+    // Vouching lets every agent of the Server use the App with no one's approval.
+    "PUT /api/integrations/clients/:clientId/server-vouch",
     "POST /api/integration-invites/:token/install",
     "POST /api/integrations/clients/:clientId/link-preview-consent",
     "POST /api/actions/:messageId/execute",
@@ -235,6 +238,13 @@ const NEVER_DELEGABLE: Readonly<Record<string, readonly string[]>> = {
     "POST /api/mcp/servers/:mcpServerId/oauth/start",
     "DELETE /api/mcp/servers/:mcpServerId/oauth",
     "PUT /api/mcp/apps/:appId/default",
+    // As the App one above: every agent of the Server may use the MCP App with no one's approval.
+    "PUT /api/mcp/apps/:appId/server-vouch",
+    // RFC 087: whose account an agent acts as (members' own accounts, shared pins, revoking one).
+    "PUT /api/mcp/apps/:appId/members-can-connect",
+    "PUT /api/mcp/connections/:connectionId/agents",
+    "PUT /api/mcp/connections/:connectionId/agents/:agentId",
+    "DELETE /api/mcp/connections/:connectionId",
     "POST /api/agents/:id/connections/:provider",
     "POST /api/agents/:id/connections/:provider/confirm",
     "PUT /api/agents/:id/connections/:provider",
@@ -282,8 +292,8 @@ const NEVER_DELEGABLE_ROUTES = Object.values(NEVER_DELEGABLE).flat();
 
 type SensitiveRule = { name: string; method?: string; path?: RegExp; reason?: RegExp };
 
-/** Buckets whose every route is security-sensitive: external auth, App grants and provider credentials. */
-const NEVER_BUCKETS: readonly RouteAuthorityBucket[] = ["integrationLane", "providerConnectionResidual"];
+/** Buckets whose every route is security-sensitive: external auth and App grants. */
+const NEVER_BUCKETS: readonly RouteAuthorityBucket[] = ["integrationLane"];
 
 /**
  * Keyword rules (RFC 085 §3.1, §5): a route one catches, by its path or its row's reason, must be `never` whether the
@@ -296,7 +306,7 @@ const NEVER_BUCKETS: readonly RouteAuthorityBucket[] = ["integrationLane", "prov
 const SECURITY_SENSITIVE_RULES: readonly SensitiveRule[] = [
   {
     name: "credentials and keys",
-    path: /credential|secret|token|(^|[/-])keys?($|[/-])|\/runtime-auth\/|^\/api\/provider-connections|scope-attestation/i,
+    path: /credential|secret|token|(^|[/-])keys?($|[/-])|\/runtime-auth\/|scope-attestation/i,
     reason: /\b(credentials?|secrets?|issueAgentCredentials|rotateMachineKeys|rotateServerSecrets|(machine|Computer|API) keys?)\b/i,
   },
   { name: "payment and seat charges", path: /^\/api\/billing\/|seat|^\/api\/appsumo\/|limit-reset/i, reason: /\b(billing|seats?|manageBilling)\b/i },
@@ -324,6 +334,8 @@ const SECURITY_SENSITIVE_RULES: readonly SensitiveRule[] = [
     reason: /\bfederateChannels\b/,
   },
   { name: "deleting a channel or server", method: "DELETE", path: /^\/api\/(servers|channels)\/:$/, reason: /\bdeleteChannels\b/ },
+  // Data export (#triage:#512): copying a person's or a server's data out of Raft; a person's own web sign-in only.
+  { name: "data export", path: /(^|\/)data-exports(\/|$)/i, reason: /\bexportServerData\b/ },
 ];
 
 /**

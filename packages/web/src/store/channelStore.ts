@@ -1,4 +1,5 @@
 import type { ExternalFreezeFields } from "../utils/jointChannelLimit";
+import type { ChannelJointServer } from "./channelJointServer";
 import { channelConversionState, conversionResponseState } from "./channelConversionState";
 import { isAxiosError } from "axios";
 import { create } from "zustand";
@@ -16,7 +17,7 @@ import {
   toChannel,
   touchChannelActivity as reduceChannelActivity,
 } from "./channelDomain";
-import type { ChannelConversionCommandView, ChannelConversionJobView, ChannelConversionState, ChannelAdminBasis, ChannelRole, ChannelThreadSort, ChannelThreadSortFields, InboxScopeReadFrontier, ServerCapability } from "@botiverse/raft-shared";
+import type { ChannelConversionCommandView, ChannelConversionJobView, ChannelConversionState, ChannelAdminBasis, ChannelRole, InboxScopeReadFrontier, ServerCapability } from "@botiverse/raft-shared";
 import { bootListKey, coalesce, noteFreshLoad, useServerStore } from "./serverStore";
 import { consumeReadStateSnapshotRows, getReadStateLedgerGeneration } from "./readStateSync";
 import { registerServerReset } from "./serverResetRegistry";
@@ -27,11 +28,12 @@ import { localTableSession, writeChannelList } from "./localTables/storeWriters"
 import { emitStateTransitionTrace } from "../utils/stateTransitionTrace";
 import { joinChannelOnce, joinRealtimeChannel, withJoining } from "./channelJoin";
 import type { ChannelJoinSource } from "./channelJoin";
+import { refuseShortChannelId } from "./threadLinkIds";
 import { channelTraceStateChanged, transitionOutcomeDetail } from "../utils/stateTransitionChange";
 import { findStoredChannel } from "./storedChannel";
 import { noteChannelOpenResult } from "./channelAccessLoss";
 
-export interface Channel extends ExternalFreezeFields, ChannelThreadSortFields {
+export interface Channel extends ExternalFreezeFields {
   id: string;
   serverId?: string;
   name: string;
@@ -81,18 +83,7 @@ export interface Channel extends ExternalFreezeFields, ChannelThreadSortFields {
   jointPeerServerName?: string | null;
   jointPeerServerSlug?: string | null;
   jointPeerStatus?: "pending" | "active" | null;
-  jointServers?: Array<{
-    serverId: string;
-    serverName: string;
-    serverSlug: string;
-    role: "host" | "participant" | null;
-    status: "active" | "pending";
-    isCurrentServer?: boolean;
-    /** Free or paid as the joint's free-server cap counts it; absent from older servers. */
-    plan?: "free" | "paid";
-    /** Active servers: the channel's name on that server (names are per server). */
-    channelName?: string;
-  }>;
+  jointServers?: ChannelJointServer[];
   jointPendingInvites?: Array<{
     id: string;
     fromServerId: string;
@@ -242,7 +233,7 @@ interface ChannelState {
     actionCardMessageId?: string;
     actionCardConfirmationVersion?: number;
   }) => Promise<Channel>;
-  updateChannel: (channelId: string, updates: { name?: string; description?: string; visibility?: "public" | "private"; visitorVisible?: boolean; threadSort?: ChannelThreadSort; announcement?: string | null }) => Promise<Channel>;
+  updateChannel: (channelId: string, updates: { name?: string; description?: string; visibility?: "public" | "private"; visitorVisible?: boolean; announcement?: string | null }) => Promise<Channel>;
   restoreAllChannel: () => Promise<Channel>;
   hideAllChannel: () => Promise<Channel>;
   convertChannelToJoint: (channelId: string, opts?: { observeProgress?: boolean; commandId?: string }) => Promise<Channel>;
@@ -352,8 +343,7 @@ export const useChannelStore = create<ChannelState>((set, get) => ({
     const epoch = useServerStore.getState().serverEpoch;
     const serverId = useServerStore.getState().current?.id;
     const readLedgerGeneration = getReadStateLedgerGeneration();
-    if (!serverId) return null;
-
+    if (!serverId || refuseShortChannelId(channelId)) return null; // a link's short id: unavailable (#503)
     if (!opts?.refresh) {
       const pending = ensureChannelInFlight.get(channelId);
       if (pending) return pending;

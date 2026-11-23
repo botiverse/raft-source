@@ -983,7 +983,7 @@ test("CLI e2e: slock channel join adds agent to a visible public channel", async
   }
 });
 
-test("agent internal route allows the member role's createChannels capability", async ({ app }) => {
+test("agent internal route allows the member role's createPublicChannels capability", async ({ app }) => {
   const { agent, apiKey } = await seed();
 
   const res = await fetch(`${app.baseUrl}/internal/agent/${agent.id}/channels`, {
@@ -998,7 +998,7 @@ test("agent internal route allows the member role's createChannels capability", 
   assert.equal(body.createdByAgentId, agent.id);
 });
 
-test("agent channel create denial names the createChannels capability", async ({ app }) => {
+test("agent channel create denial names the createPublicChannels capability", async ({ app }) => {
   const { agent, apiKey, server } = await seed();
   await getDb()
     .delete(serverAgentMembers)
@@ -1012,13 +1012,11 @@ test("agent channel create denial names the createChannels capability", async ({
 
   assert.equal(res.status, 403, `expected 403, got ${res.status}`);
   assert.deepEqual(await res.json(), {
-    error: "Agent requires createChannels capability to create channels",
+    error: "Agent requires createPublicChannels capability to create channels",
     code: "server_role_required",
+    errorCode: "server_role_required",
     suggestedNextAction:
       "To create channels you need the member role on this server; you are not a member of this server. Ask a server owner or admin to do it, or to change your role.",
-    requiredCapabilities: ["createChannels"],
-    requiredRole: "member",
-    currentRole: null,
   });
 });
 
@@ -1056,7 +1054,7 @@ test("agent internal route creates channel for agent admin and joins creator age
   const traceEvents = new Map(span.events.map((event) => [event.name, event]));
   assert.equal(traceEvents.get("agent_channel_create.request.started")?.attrs?.actor_server_match, true);
   assert.equal(traceEvents.get("agent_channel_create.authorization.checked")?.attrs?.outcome, "allowed");
-  assert.equal(traceEvents.get("agent_channel_create.authorization.checked")?.attrs?.required_capability, "createChannels");
+  assert.equal(traceEvents.get("agent_channel_create.authorization.checked")?.attrs?.required_capability, "createPublicChannels");
   assert.equal(traceEvents.get("agent_channel_create.created")?.attrs?.visibility, "public");
   assert.equal(traceEvents.get("agent_channel_create.created")?.attrs?.creator_joined, true);
   assert.equal(traceEvents.get("agent_channel_create.broadcasted")?.attrs?.visibility, "public");

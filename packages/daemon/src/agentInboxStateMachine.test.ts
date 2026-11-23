@@ -60,6 +60,12 @@ test("inbox message normalization carries the sender time zone from either key c
   assert.equal(normalizeInboxVisibleMessage(message(4)).sender_timezone, null);
 });
 
+test("normalized inbox messages keep an outside sender's origin, from either spelling", () => {
+  assert.deepEqual(normalizeInboxVisibleMessage(message(1, { sender_origin: { kind: "guest" } })).sender_origin, { kind: "guest" });
+  assert.deepEqual(normalizeInboxVisibleMessage(message(2, { senderOrigin: { kind: "other_server", serverSlug: "acme" } })).sender_origin, { kind: "other_server", serverSlug: "acme" });
+  assert.equal("sender_origin" in normalizeInboxVisibleMessage(message(3)), false);
+});
+
 test("agent inbox state machine locally holds exact-target pending messages", () => {
   const pendingMessages = [40, 41, 42, 43, 44].map((seq) => message(seq));
 

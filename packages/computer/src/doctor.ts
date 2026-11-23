@@ -10,7 +10,7 @@
 // through `redactSecrets()` so even a future bug that drops a credential
 // into a check `detail` cannot leak it.
 import { redactDiagnosticCredentialLines, redactDiagnosticCredentials } from "@botiverse/raft-shared";
-import { buildStatusReport, type StatusReportDeps } from "./status";
+import { buildStatusReport, terminalSafe, type StatusReportDeps } from "./status";
 import { describeDuplicateKeyHolder, findDuplicateKeyHolder } from "./duplicateKeyGuard";
 import { describeRaftHomeConflict, findRaftHomeConflictFor, serverRunnerLockConflictPath, serverRunnerMemoryPath, serviceMemoryPath } from "./paths";
 import { lockOwnerCheckCommand, readRunnerLockConflictMarker } from "./runnerLockConflict";
@@ -31,6 +31,7 @@ import { readUserSessionAuth } from "./lib/userSession";
 import { describeOomPolicyRequirement, readSupervisorOomPolicy } from "./externalSupervisor";
 import type { ServerAttachment } from "./serverState";
 import { formatServerSlugDisplay, listServerAttachments } from "./serverState";
+import { applySelfMachineId } from "./machineIdBackfill";
 import { hasUnlinkedComputerHandshake, readRunnerLogTail } from "./internal/runner-log-diagnostics";
 
 // The CLI presenters (`runDoctor` / `runDoctorMigrationDetails`) live in
@@ -110,8 +111,7 @@ function computerSelfCheck(
     };
   }
   const agents = `${computer.agentCount} agent${computer.agentCount === 1 ? "" : "s"}`;
-  // A server-set display name: no control characters reach the terminal.
-  const machineName = computer.machineName.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+  const machineName = terminalSafe(computer.machineName);
   return { name, ok: true, detail: `the server knows this Computer as "${machineName}" (${agents})` };
 }
 
@@ -318,7 +318,7 @@ export async function runDoctorChecks(
       detail: "skipped (they need a user session, which this machine does not keep)",
     });
   }
-  for (const a of attachments) {
+  for (let a of attachments) {
     // Canonical `/<slug>` for user-facing labels; serverId fallback only
     // for pre-PR-G attachments not yet refreshed.
     const label = a.serverSlug ? formatServerSlugDisplay(a.serverSlug) : a.serverId;
@@ -364,6 +364,11 @@ export async function runDoctorChecks(
         ?? ((attachment: ServerAttachment) => new ComputerSelfClient(attachment.serverUrl, attachment.apiKey).self()))(a)
         .catch((): ComputerSelfResult => ({ status: "error", code: "request_failed" }))
       : null;
+    // Fill a missing linked machine id from this answer, so the check below
+    // (and the identity checks after it) run against it.
+    if (self && !a.machineId) {
+      a = (await applySelfMachineId(slockHome, a, self).catch(() => ({ attachment: a }))).attachment;
+    }
     if (self) checks.push(computerSelfCheck(a, label, self));
     let runnerOk = false;
     if (statusRow) {

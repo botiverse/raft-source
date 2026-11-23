@@ -15,9 +15,12 @@
  * | server wait timed out (RouteFailureError daemon_timeout) | probe_timeout   | true      |
  * | error with code computer_offline                         | machine_offline | true      |
  * | Computer not routed here / RouteFailureError daemon_offline | machine_offline | true   |
+ * | error with code runtime_not_authenticated (CLI signed out) | not_signed_in   | true      |
+ * | error with code protocol_unsupported (CLI too old to list) | runtime_outdated | true     |
  * | any other error outcome or thrown failure                | probe_failed    | true      |
  *
  * no_models is retryable because the user may add models on the Computer;
+ * not_signed_in and runtime_outdated because they may sign in or update there;
  * missing_config and unsupported need a change the form cannot make.
  *
  * `state` (additive, next to `status`; computerProbeCacheService), only when
@@ -42,6 +45,9 @@ export const RUNTIME_FORM_V2_REASON_RETRYABLE: Readonly<Record<RuntimeFormV2Opti
   no_models: true,
   missing_config: false,
   unsupported: false,
+  // Retry once signed in / updated on the Computer: the next probe reads it again.
+  not_signed_in: true,
+  runtime_outdated: true,
 });
 
 /** The reason a probe outcome is not a usable live list; null when it is live with models. */
@@ -54,6 +60,8 @@ export function optionSourceReasonForOutcome(outcome: RuntimeModelSourceOutcome)
     case "error":
       if (outcome.code === "detect_timeout") return "probe_timeout";
       if (outcome.code === "computer_offline") return "machine_offline";
+      if (outcome.code === "runtime_not_authenticated") return "not_signed_in";
+      if (outcome.code === "protocol_unsupported") return "runtime_outdated";
       return "probe_failed";
     default: return "probe_failed";
   }

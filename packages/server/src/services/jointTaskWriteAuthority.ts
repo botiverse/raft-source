@@ -5,6 +5,7 @@ import {
   resolveChannelActorContext,
 } from "../lib/channelActorPermissions";
 import { resolveJointHumanEntrySql } from "./jointHumanMembershipAccess";
+import { isOnlineMoveCanonicalSql } from "./channelConversionReadScope";
 
 export type JointTaskWriteActor = {
   type: "user" | "agent";
@@ -31,7 +32,10 @@ export async function lockJointTaskWriteAuthority(
     SELECT j.id AS "jointId" FROM joint_channels j JOIN channels c ON c.id=j.canonical_channel_id
     WHERE (j.canonical_channel_id=${channelId}::uuid OR EXISTS (SELECT 1 FROM joint_channel_servers p
       WHERE p.joint_channel_id=j.id AND p.local_channel_id=${channelId}::uuid))
-      AND c.type IN ('channel','private','joint') LIMIT 1`);
+      AND c.type IN ('channel','private','joint')
+      -- An online move's canonical channel is not a joint entry yet: its
+      -- writers are the source's ordinary members, as the send admitted them.
+      AND NOT ${isOnlineMoveCanonicalSql(sql`j.canonical_channel_id`)} LIMIT 1`);
   if (!root.rows.length) return;
   const permission =
     actor.type === "user"

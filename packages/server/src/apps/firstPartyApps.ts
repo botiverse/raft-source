@@ -27,7 +27,12 @@
 // - the apps on for a server that agents are told about, AgentConfig and the
 //   agent context's `enabledApps` (services/firstPartyAppFlags.ts);
 // - the apps told of reactions to messages
-//   (services/messageReactionService.ts, FirstPartyApp.messageReactions).
+//   (services/messageReactionService.ts, FirstPartyApp.messageReactions);
+// - the kinds whose links a saved profile description is checked for
+//   (services/profileDescriptionLinks.ts, AppObjectKind.linkId);
+// - the kinds told of a new message's links to their objects
+//   (services/firstPartyAppMessageLinks.ts from messageService
+//   broadcastAndDeliver, AppObjectKind.linkedInMessage).
 //
 // scripts/ci/check-app-module-boundaries.ts: this is the only core file that
 // imports an app, and only its register.ts.
@@ -125,6 +130,16 @@ export function channelAnnouncementObjectKind(): { app: FirstPartyApp; objectKin
     if (objectKind?.channelAnnouncement) return { app, objectKind: objectKind as AppObjectKind & Required<Pick<AppObjectKind, "channelAnnouncement">> };
   }
   return undefined;
+}
+
+/**
+ * The registered object kinds that read their links (AppObjectKind.linkId),
+ * each with its app, in registry order: what core asks to name the objects a
+ * profile description links (services/profileDescriptionLinks.ts).
+ */
+export function linkedObjectKinds(): Array<{ app: FirstPartyApp; objectKind: AppObjectKind & Required<Pick<AppObjectKind, "linkId">> }> {
+  return firstPartyApps().flatMap((app) => app.objectKinds.flatMap((objectKind) =>
+    objectKind.linkId ? [{ app, objectKind: objectKind as AppObjectKind & Required<Pick<AppObjectKind, "linkId">> }] : []));
 }
 
 /** The system apps of the apps that send agents notices: each needs its delivery guard (fail closed). */

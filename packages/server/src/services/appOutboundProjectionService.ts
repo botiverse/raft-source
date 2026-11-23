@@ -19,6 +19,7 @@ import type { VerifiedAppInstallationCredential } from "./appInstallationCredent
 import type { AppOutboundGroup } from "./appOutboundPermissionService";
 import { agentFindableBy, listedServerAgent } from "./agentMemberListPolicy";
 import { userCanActOnAgentResource } from "../lib/actorPermissions";
+import { isAccountLoginEnabledFor } from "./oauthAccountLogin";
 
 const MEMBER_REF_KEY_ENV = "RAFT_APP_MEMBER_REF_KEY";
 const MEMBER_REF_KEY_VERSION_ENV = "RAFT_APP_MEMBER_REF_KEY_VERSION";
@@ -145,8 +146,12 @@ export async function getAppServerProjection(
 // this App. A preview-only consent is not a login. Expired login tokens still
 // witness that login; explicit revocation marks every token revoked and also
 // revokes consent. Account-mode login has no Server, but only reaches a live
-// non-guest member on this installation's Server. The transaction passed by the
-// route also checked the installation and its effective server group.
+// non-guest member on this installation's Server, and only while the kill
+// switch (oauth_account_login) is on for the person: off, the answer is the
+// one for no login at all, so it never says the person signed in. A login
+// bound to this Server is preferred and never reads the switch. The
+// transaction passed by the route also checked the installation and its
+// effective server group.
 export async function getAppHumanMemberRole(
   credential: VerifiedAppInstallationCredential,
   sub: string,
@@ -164,7 +169,8 @@ export async function getAppHumanMemberRole(
       and(isNull(oauthUserConsents.serverId), isNull(oauthAccessTokens.serverId), ne(serverMembers.role, "guest")),
     ),
   ));
-  const [member] = await dbOrTx.select({ role: serverMembers.role }).from(serverMembers)
+  const [member] = await dbOrTx.select({ userId: serverMembers.userId, role: serverMembers.role, consentServerId: oauthUserConsents.serverId })
+    .from(serverMembers)
     .innerJoin(users, eq(users.id, serverMembers.userId))
     .innerJoin(servers, eq(servers.id, serverMembers.serverId))
     .innerJoin(oauthUserConsents, and(
@@ -179,8 +185,14 @@ export async function getAppHumanMemberRole(
       isNull(servers.deletedAt),
       ne(servers.kind, "joint_storage"),
       exists(login),
-    )).limit(1);
-  return member ?? null;
+    ))
+    // The login bound to this Server first: only when none applies does the
+    // one for every Server answer, and the kill switch is read.
+    .orderBy(sql`${oauthUserConsents.serverId} ASC NULLS LAST`)
+    .limit(1);
+  if (!member) return null;
+  if (member.consentServerId === null && !await isAccountLoginEnabledFor(member.userId, dbOrTx)) return null;
+  return { role: member.role };
 }
 
 // This exposes only a yes/no decision for directory-visible Agents, not their

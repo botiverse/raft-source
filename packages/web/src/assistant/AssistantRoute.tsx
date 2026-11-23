@@ -1,4 +1,6 @@
 // Route: /s/:serverSlug/assistant — the personal assistant (RFC 075 v4).
+// On a desktop its DM's route shows it too, in place beside the sidebar
+// (MainLayout's DmRoute); /assistant itself is the rail's sidebar-less page.
 //
 // Gate: the rail entry and the phone Home row show only when the server's
 // `personal_assistant` flag is on AND the assistant API says `enabled`.

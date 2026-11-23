@@ -14,14 +14,22 @@
  * Exit codes: 0 a report without warnings; 2 a report with warnings, or no report (usage, sign-in, browser).
  */
 
-import { writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+import { availableParallelism } from "node:os";
 import process from "node:process";
 import { parseArgs } from "node:util";
 import type { BrowserContext, CDPSession, Page } from "playwright";
 import { BrowserError, type OpenedBrowser, openBrowser, planBrowser } from "./browser";
 import { cliArgs } from "./args";
+import { fetchAndVerifyFixture } from "./benchCheck";
+import { loadBenchFixture, resolveFixtureTargets } from "./benchFixture";
+import { type BrowserDeviceProbe, buildCohort, cohortExtra, dominantString, parseConnectRttMs, parseEdgeColo, parseServerTimingMs, probeBrowserDevice } from "./cohort";
+import { hostBenchmarkMedian, hostExtra } from "./hostHealth";
+import type { PageRunRow } from "./pageRuns";
 import { bootContentMs, isProductionHost } from "./page";
-import { type ApiTiming, type LongTask, type StartupLoad, type StartupSplit, blameTasks, endpointOf, splitStartup, summarize, toPageClock, withinWindow } from "./startupSplit";
+import { RTT_RANGE_MS, type RttProxy, rttChromiumArgs, startRttProxy } from "./rttProxy";
+import { type ApiTiming, type LongTask, type StartupLoad, type StartupSplit, blameTasks, median, sessionAgreement, endpointOf, splitStartup, summarize, toPageClock, withinWindow } from "./startupSplit";
 
 const HELP = `raft-perf startup — where the time of opening a channel goes, on a deployed web
 
@@ -29,16 +37,28 @@ Required env: RAFT_PERF_EMAIL, RAFT_PERF_PASSWORD (a test account; never a real 
 Options:
   --origin <url>      web origin (default https://raft-app-staging.botiverse.dev)
   --api <url>         API origin (default: --origin)
-  --server <slug>     server slug (required)
-  --channel <name>    the channel opened (default all)
+  --fixture <name>    frozen benchmark fixture (e.g. bench-v1, or path to JSON): sets --server/--channel and verifies
+                      its message/thread digest before measuring
+  --server <slug>     server slug (required unless --fixture sets it)
+  --channel <name>    the channel opened (default all, or the fixture's channel)
   --runs <n>          runs; each is a new-device load and then a reopen in the same browser context (default 5)
+  --sessions <n>      repeat the runs in n separate browsers (1 to 5; default 1). On Browser Run each is its own
+                      session, and sessions of one build have read 2 to 3 times apart: use 2 or more there; the report
+                      gives each session's median, device benchmark and PoP, and warns when they disagree
   --settle <ms>       wait after the first message before reading the load (default 6000)
   --browser <where>   local | browser-run (default local; see measure --help)
   --cpu <n>           slow the page's CPU n times (1 to 20; default 1): a laptop standing in for an ordinary machine.
                       A stand-in, not that machine: only the main thread is slowed, not the network or the GPU
                       The waits (a minute for the first message, --settle) are not stretched: raise --settle with it
+  --rtt <ms>          add this round trip to every connection of a local browser, https only (0 to 1000; default 0): a machine near
+                      the servers standing in for a user far from them. Done by a local proxy, not DevTools emulation,
+                      which does not delay CORS preflights (src/rttProxy.ts)
   --chromium-arg <a>  extra Chromium switch for a local browser (repeatable)
   --out <file>        also write the JSON here
+  --jsonl <file>      also write one row per measured load (ScopeDB perf.page_runs); needs --project
+  --project <name>    with --jsonl: the product this web belongs to (e.g. raft-web)
+  --env <env>         with --jsonl: overrides the environment read from the page
+  --run-id <id>       with --jsonl: shared by every row of one collection (default: a new UUID)
   --allow-production  open *.raft.build (signs in and opens pages: production writes)
 Exit codes: 0 a report without warnings; 2 a report with warnings, or no report.
 `;
@@ -94,14 +114,21 @@ async function main(): Promise<number> {
     options: {
       origin: { type: "string", default: "https://raft-app-staging.botiverse.dev" },
       api: { type: "string" },
+      fixture: { type: "string" },
       server: { type: "string" },
-      channel: { type: "string", default: "all" },
+      channel: { type: "string" },
       runs: { type: "string", default: "5" },
+      sessions: { type: "string", default: "1" },
       settle: { type: "string", default: "6000" },
       browser: { type: "string" },
       cpu: { type: "string", default: "1" },
+      rtt: { type: "string", default: "0" },
       "chromium-arg": { type: "string", multiple: true, default: [] },
       out: { type: "string" },
+      jsonl: { type: "string" },
+      project: { type: "string" },
+      env: { type: "string" },
+      "run-id": { type: "string" },
       "allow-production": { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
@@ -115,12 +142,33 @@ async function main(): Promise<number> {
   const runs = Number(args.runs);
   const settle = Number(args.settle);
   const plan = planBrowser(args.browser, args["chromium-arg"], process.env);
-  if (!args.server) fail("--server <slug> is required");
+  const fixtureSpec = (() => {
+    try {
+      return args.fixture ? loadBenchFixture(args.fixture) : null;
+    } catch (error) {
+      return fail((error as Error).message);
+    }
+  })();
+  const resolved = (() => {
+    try {
+      return resolveFixtureTargets(fixtureSpec, { server: args.server, channel: args.channel }, { channel: "all" });
+    } catch (error) {
+      return fail((error as Error).message);
+    }
+  })();
+  if (!resolved.server) fail("--server <slug> (or --fixture <name>) is required");
+  if (args.jsonl && !args.project) fail("--jsonl needs --project (which product this web belongs to)");
   if (!Number.isInteger(runs) || runs < 1) fail("--runs must be an integer of at least 1");
+  const sessions = Number(args.sessions);
+  if (!Number.isInteger(sessions) || sessions < 1 || sessions > 5) fail("--sessions must be an integer from 1 to 5");
   if (!Number.isFinite(settle) || settle < 0) fail("--settle must be a number of milliseconds");
   const cpu = Number(args.cpu);
   if (!Number.isFinite(cpu) || cpu < 1 || cpu > 20) fail("--cpu must be a number from 1 to 20");
   if (cpu > 1 && plan.where !== "local") fail("--cpu slows a local browser; a Browser Run machine is already an ordinary one (4 cores, 2 GB)");
+  const rtt = Number(args.rtt);
+  if (!Number.isFinite(rtt) || rtt < RTT_RANGE_MS[0] || rtt > RTT_RANGE_MS[1]) fail(`--rtt must be a number of milliseconds from ${RTT_RANGE_MS[0]} to ${RTT_RANGE_MS[1]}`);
+  if (rtt > 0 && plan.where !== "local") fail("--rtt delays a local browser through a proxy on this machine; a Browser Run browser cannot reach it");
+  if (rtt > 0 && [args.origin!, args.api ?? args.origin!].some((u) => /^http:/i.test(u))) fail("--rtt works for https origins only (its proxy serves CONNECT): a plain-http origin or API would not load");
   let production = false;
   try {
     production = isProductionHost(origin) || isProductionHost(api);
@@ -147,14 +195,24 @@ async function main(): Promise<number> {
   const auth = { authorization: `Bearer ${first.accessToken}` };
   type Named = { id: string; name: string };
   const servers = (await json(`${api}/api/servers`, { headers: auth })) as Array<{ id: string; slug: string }> | { servers: Array<{ id: string; slug: string }> };
-  const server = (Array.isArray(servers) ? servers : servers.servers).find((s) => s.slug === args.server) ?? fail(`the account is not a member of server ${args.server}`);
+  const server = (Array.isArray(servers) ? servers : servers.servers).find((s) => s.slug === resolved.server) ?? fail(`the account is not a member of server ${resolved.server}`);
   const channels = (await json(`${api}/api/channels`, { headers: { ...auth, "x-server-id": server.id } })) as Named[] | { channels: Named[] };
-  const channel = (Array.isArray(channels) ? channels : channels.channels).find((c) => c.name === args.channel) ?? fail(`no channel ${args.channel} in ${args.server}`);
+  const channel = (Array.isArray(channels) ? channels : channels.channels).find((c) => c.name === resolved.channel) ?? fail(`no channel ${resolved.channel} in ${resolved.server}`);
+  let verifiedFixtureTag: string | null = null;
+  if (fixtureSpec) {
+    const check = await fetchAndVerifyFixture(api, first.accessToken, server.id, channel.id, fixtureSpec).catch((error: Error) => fail(error.message));
+    if (!check.ok) fail(`fixture ${fixtureSpec.fixture} drifted (${check.mismatches.join("; ")}): refusing to measure`);
+    verifiedFixtureTag = check.tag;
+  }
   const url = `${origin}/s/${server.slug}/channel/${channel.id}`;
   const apiHost = new URL(api).host;
+  let pageEnv: string | undefined;
+  const sessionColos = new Map<number, string[]>();
+  const sessionRtts = new Map<number, number[]>();
+  const sessionProbes = new Map<number, BrowserDeviceProbe>();
 
   /** One load of the channel in a context; the page is closed afterwards, the context keeps its data. */
-  const load = async (context: BrowserContext): Promise<{ load: StartupLoad; bufferFull: boolean }> => {
+  const load = async (context: BrowserContext, sn: number): Promise<{ load: StartupLoad; bufferFull: boolean; serverTimingMs: number | null }> => {
     const page: Page = await context.newPage();
     const cdp: CDPSession = await context.newCDPSession(page);
     try {
@@ -166,6 +224,7 @@ async function main(): Promise<number> {
       let docRequest: { timestamp: number; wallTime: number } | null = null;
       const sent = new Map<string, { path: string; sent: number; answered: number | null }>();
       let socketOpen: number | null = null;
+      let serverTimingMs: number | null = null;
       cdp.on("Network.requestWillBeSent", (event) => {
         if (event.type === "Document" && docRequest === null) docRequest = { timestamp: event.timestamp, wallTime: event.wallTime };
         // only the API's: a preflight to any other origin is not this page's API cost
@@ -175,6 +234,15 @@ async function main(): Promise<number> {
       cdp.on("Network.responseReceived", (event) => {
         const preflight = sent.get(event.requestId);
         if (preflight && preflight.answered === null) preflight.answered = event.timestamp;
+        if (event.type === "Document" || new URL(event.response.url).host === apiHost) {
+          const colo = parseEdgeColo(event.response.headers);
+          if (colo) sessionColos.set(sn, [...(sessionColos.get(sn) ?? []), colo]);
+          const rtt = parseConnectRttMs(event.response.timing, event.response.protocol);
+          if (rtt != null) sessionRtts.set(sn, [...(sessionRtts.get(sn) ?? []), rtt]);
+        }
+        if (serverTimingMs == null && event.response.url.includes(`/api/messages/channel/${channel.id}`)) {
+          serverTimingMs = parseServerTimingMs(event.response.headers["server-timing"] ?? event.response.headers["Server-Timing"]);
+        }
       });
       cdp.on("Network.webSocketHandshakeResponseReceived", (event) => {
         if (socketOpen === null) socketOpen = event.timestamp;
@@ -196,8 +264,11 @@ async function main(): Promise<number> {
           return u.host === host && u.pathname.startsWith("/api/");
         });
         let commitSha: string | null = null;
+        let deploymentEnvironment: string | null = null;
         try {
-          commitSha = (JSON.parse(document.getElementById("raft-frontend-release-identity")?.textContent ?? "{}").commitSha as string | undefined) ?? null;
+          const parsed = JSON.parse(document.getElementById("raft-frontend-release-identity")?.textContent ?? "{}") as { commitSha?: string; deploymentEnvironment?: string };
+          commitSha = parsed.commitSha ?? null;
+          deploymentEnvironment = parsed.deploymentEnvironment ?? null;
         } catch {
           // a page without a release identity
         }
@@ -211,8 +282,10 @@ async function main(): Promise<number> {
           timeOrigin: performance.timeOrigin,
           loadEnd: (performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined)?.loadEventEnd ?? 0,
           commitSha,
+          deploymentEnvironment,
         };
       }, apiHost);
+      pageEnv ??= read.deploymentEnvironment ?? undefined;
       const timings: ApiTiming[] = read.entries
         .map(({ url: full, ...rest }) => ({ ...endpointOf(full, channel.id), ...rest, start: Math.round(rest.start), requestStart: Math.round(rest.requestStart), responseStart: Math.round(rest.responseStart), responseEnd: Math.round(rest.responseEnd) }))
         .sort((a, b) => a.start - b.start);
@@ -232,46 +305,68 @@ async function main(): Promise<number> {
       };
       // Loads are read at different moments (the page's own report is waited for): count only up to `settle` after the
       // first message (after the load event when no message came), so every load is counted over the same stretch.
-      return { load: withinWindow(all, (all.firstRowMs ?? Math.round(read.loadEnd)) + settle), bufferFull: read.bufferFull };
+      return { load: withinWindow(all, (all.firstRowMs ?? Math.round(read.loadEnd)) + settle), bufferFull: read.bufferFull, serverTimingMs };
     } finally {
       await cdp.detach().catch(() => {});
       await page.close().catch(() => {});
     }
   };
 
-  const results: Record<Arm, Array<StartupSplit & { commitSha: string | null }>> = { "new-device": [], reopen: [] };
+  const results: Record<Arm, Array<StartupSplit & { commitSha: string | null; session: number; serverTimingMs: number | null }>> = { "new-device": [], reopen: [] };
   const warnings: string[] = [];
   let buffersFilled = 0;
   let opened: OpenedBrowser | null = null;
+  let proxy: RttProxy | null = null;
+  let tunnels: number | null = null;
   try {
-    opened = await openBrowser(plan);
-    for (let i = 0; i < runs; i++) {
-      const session = i === 0 ? first : await signIn();
-      const context = await opened.browser.newContext({
-        viewport: { width: 1440, height: 900 },
-        serviceWorkers: "block",
-        storageState: { cookies: [], origins: [{ origin, localStorage: [{ name: "slock_access_token", value: session.accessToken }, { name: "slock_refresh_token", value: session.refreshToken }] }] },
-      });
-      try {
-        await context.addInitScript(probe);
-        for (const arm of ["new-device", "reopen"] as const) {
-          const { load: one, bufferFull } = await load(context);
-          if (bufferFull) buffersFilled++;
-          const split = splitStartup(one);
-          results[arm].push({ ...split, commitSha: one.commitSha });
-          const m = split.messages;
-          process.stderr.write(`run ${i + 1}/${runs} ${arm}: first page ${m ? `asked ${m.start}, before send ${m.beforeSendMs ?? "?"}, first byte ${m.firstByteMs ?? "?"}, download ${m.downloadMs ?? "?"}` : "not requested"}; ${split.preflights} preflight(s); first message painted ${split.paintedMs ?? "never"}\n`);
+    if (rtt > 0) proxy = await startRttProxy(rtt);
+    for (let sn = 1; sn <= sessions; sn++) {
+      if (opened) {
+        const notEnded = await opened.close();
+        if (notEnded) process.stderr.write(`raft-perf startup: ${notEnded}\n`);
+        opened = null;
+      }
+      opened = await openBrowser(proxy && plan.where === "local" ? { ...plan, chromiumArgs: [...plan.chromiumArgs, ...rttChromiumArgs(proxy)] } : plan);
+      sessionProbes.set(sn, await probeBrowserDevice(opened.browser));
+      for (let i = 0; i < runs; i++) {
+        const session = sn === 1 && i === 0 ? first : await signIn();
+        const context = await opened.browser.newContext({
+          viewport: { width: 1440, height: 900 },
+          serviceWorkers: "block",
+          storageState: { cookies: [], origins: [{ origin, localStorage: [{ name: "slock_access_token", value: session.accessToken }, { name: "slock_refresh_token", value: session.refreshToken }] }] },
+        });
+        try {
+          await context.addInitScript(probe);
+          for (const arm of ["new-device", "reopen"] as const) {
+            const { load: one, bufferFull, serverTimingMs } = await load(context, sn);
+            if (bufferFull) buffersFilled++;
+            const split = splitStartup(one);
+            results[arm].push({ ...split, commitSha: one.commitSha, session: sn, serverTimingMs });
+            const m = split.messages;
+            process.stderr.write(`${sessions > 1 ? `session ${sn}/${sessions} ` : ""}run ${i + 1}/${runs} ${arm}: first page ${m ? `asked ${m.start}, before send ${m.beforeSendMs ?? "?"}, first byte ${m.firstByteMs ?? "?"}, download ${m.downloadMs ?? "?"}` : "not requested"}; ${split.preflights} preflight(s); first message painted ${split.paintedMs ?? "never"}\n`);
+          }
+        } finally {
+          await context.close().catch(() => {});
         }
-      } finally {
-        await context.close().catch(() => {});
       }
     }
   } finally {
-    const notEnded = await opened?.close();
-    if (notEnded) process.stderr.write(`raft-perf startup: ${notEnded}\n`);
+    try {
+      const notEnded = await opened?.close();
+      if (notEnded) process.stderr.write(`raft-perf startup: ${notEnded}\n`);
+    } finally {
+      tunnels = proxy?.tunnels() ?? null;
+      await proxy?.close();
+    }
   }
 
   const every = [...results["new-device"], ...results.reopen];
+  const bySession = (arm: Arm) => sessionAgreement(Array.from({ length: sessions }, (_, k) => results[arm].filter((r) => r.session === k + 1).map((r) => r.paintedMs)));
+  const agreement = { "new-device": bySession("new-device"), reopen: bySession("reopen") };
+  for (const arm of ["new-device", "reopen"] as const) {
+    const a = agreement[arm];
+    if (!a.agree) warnings.push(`the ${sessions} browser sessions disagree on "${arm}" first message painted (session medians ${a.medians.map((m) => (m == null ? "?" : `${Math.round(m)} ms`)).join(", ")}; ${a.ratio ?? "?"}x apart): the pooled median is not a reading of this build; take more sessions or compare like with like`);
+  }
   const commits = new Set(every.map((r) => r.commitSha).filter(Boolean));
   if (commits.size > 1) warnings.push(`the web changed during the run (${[...commits].map((c) => c!.slice(0, 8)).join(", ")}): the loads are of different builds`);
   if (every.some((r) => r.firstRowMs == null)) warnings.push(`${every.filter((r) => r.firstRowMs == null).length} load(s) showed no message row within a minute; they are counted in "withoutRow" and left out of the medians that need the row`);
@@ -285,21 +380,63 @@ async function main(): Promise<number> {
   const notes: string[] = [];
   if (plan.where !== "local") notes.push("the browser ran on Browser Run: its machine and network are not this one's; compare only with another report taken there");
   if (new URL(api).origin !== new URL(origin).origin) notes.push("the API is on another origin than the web: every first use of an API URL costs a CORS preflight (\"preflights\" counts the API host's); a reopen has them cached for up to two hours");
+  if (rtt > 0) notes.push(`every connection went through a local proxy adding ${rtt} ms per round trip (--rtt; ${tunnels ?? "?"} connection(s) through it): the TCP handshake, TLS setup, CORS preflights and requests all pay it; a stand-in for a distant user (no loss, no bandwidth limit, this machine's own round trip added on top); compare only with a report taken at the same --rtt`);
   if (cpu > 1) notes.push(`the page's CPU was slowed ${cpu} times (--cpu): script and paint times stand in for a slower machine's, network times are this machine's; compare only with a report taken at the same slowdown`);
   notes.push("a reopen here is the second load in one browser context a few seconds after the first: local data, the HTTP cache, the preflight cache and the connections are all warm, which is the best case of a return visit; service workers are blocked, so it is a return visit without the worker's shell cache");
   const early = every.filter((r) => r.shownBeforeAnswer).length;
   if (early) notes.push(`in ${early} load(s) the messages were on screen before the first request's answer had ended (the page used another answer): those loads have no answer-to-paint gap`);
+  const cpus = availableParallelism();
+  const hostBench = hostBenchmarkMedian();
+  const allProbes = [...sessionProbes.values()];
+  const round1 = (v: number | null) => (v == null ? null : Math.round(v * 10) / 10);
+  const pooledProbe: BrowserDeviceProbe = {
+    browserCpuCount: median(allProbes.map((p) => p.browserCpuCount)),
+    browserMemoryGb: round1(median(allProbes.map((p) => p.browserMemoryGb))),
+    browserBenchmarkMs: round1(median(allProbes.map((p) => p.browserBenchmarkMs))),
+  };
+  if (pooledProbe.browserBenchmarkMs == null) {
+    warnings.push("in-browser CPU benchmark probe returned no reading; cohort lacks browserBenchmarkMs");
+  }
+  const allColos = [...sessionColos.values()].flat();
+  const allRtts = [...sessionRtts.values()].flat();
+  const cohort = buildCohort({
+    browserWhere: plan.where,
+    edgeColo: dominantString(allColos),
+    hostCpuCount: cpus,
+    hostBenchmarkMs: hostBench,
+    device: pooledProbe,
+    connectRttSamplesMs: allRtts,
+    cpuSlowdown: cpu,
+    addedRttMs: rtt,
+    net: rtt > 0 || cpu > 1 ? "throttled" : "fast",
+    fixture: verifiedFixtureTag,
+  });
+  const sessionEnvironments = Array.from({ length: sessions }, (_, idx) => {
+    const sn = idx + 1;
+    const p = sessionProbes.get(sn) ?? { browserCpuCount: null, browserMemoryGb: null, browserBenchmarkMs: null };
+    return {
+      session: sn,
+      edgeColo: dominantString(sessionColos.get(sn) ?? []),
+      connectRttMs: round1(median(sessionRtts.get(sn) ?? [])),
+      ...p,
+    };
+  });
+  const measuredAt = new Date().toISOString();
   const report = {
     tool: "raft-perf startup",
-    measuredAt: new Date().toISOString(),
+    measuredAt,
     origin,
     api,
     page: { server: server.slug, channel: channel.name },
+    cohort,
     commitSha: [...commits][0] ?? null,
     browser: opened?.describe ?? null,
     cpuSlowdown: cpu,
+    addedRttMs: rtt,
+    ...(rtt > 0 ? { proxyTunnels: tunnels } : {}),
     requestedRuns: runs,
     summary: { "new-device": summarize(results["new-device"]), reopen: summarize(results.reopen) },
+    sessions: { count: sessions, "new-device": agreement["new-device"], reopen: agreement.reopen, environments: sessionEnvironments },
     notes,
     warnings,
     runs: results,
@@ -307,6 +444,57 @@ async function main(): Promise<number> {
   const text = JSON.stringify(report, null, 2);
   process.stdout.write(`${text}\n`);
   if (args.out) writeFileSync(args.out, `${text}\n`);
+  if (args.jsonl) {
+    const env = args.env ?? pageEnv;
+    if (!env) fail("the page names no environment; pass --env");
+    const resolvedEnv: string = env!;
+    const toolVersion: string = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+    const runId = args["run-id"] ?? randomUUID();
+    const host = hostExtra(cpus, hostBench);
+    const cohortFields = cohortExtra(cohort);
+    const verdict = warnings.length ? "unknown" : "measured";
+    const rows: PageRunRow[] = (["new-device", "reopen"] as const).flatMap((arm) =>
+      results[arm].map((r, i) => ({
+        project: args.project!,
+        env: resolvedEnv,
+        run_id: runId,
+        tool_version: toolVersion,
+        taken_at: measuredAt,
+        origin,
+        commit_sha: r.commitSha,
+        page: "channel",
+        state: arm === "new-device" ? "startup-cold" : "startup-reopen",
+        net: cohort.net,
+        ab: "none",
+        arm: "on" as const,
+        run_idx: i,
+        lcp_ms: null,
+        inp_ms: null,
+        cls: null,
+        ttfb_ms: null,
+        fcp_ms: null,
+        verdict,
+        extra: {
+          painted_ms: r.paintedMs,
+          first_row_ms: r.firstRowMs,
+          content_ms: r.contentMs,
+          messages_start_ms: r.messages?.start ?? null,
+          before_send_ms: r.messages?.beforeSendMs ?? null,
+          first_byte_ms: r.messages?.firstByteMs ?? null,
+          download_ms: r.messages?.downloadMs ?? null,
+          ...(r.serverTimingMs != null ? { server_timing_ms: r.serverTimingMs } : {}),
+          response_to_paint_ms: r.responseToPaintMs,
+          preflight_count: r.preflights,
+          encoded_bytes: r.messages?.encodedBytes ?? null,
+          decoded_bytes: r.messages?.decodedBytes ?? null,
+          session_idx: r.session,
+          ...host,
+          ...cohortFields,
+        },
+      })),
+    );
+    writeFileSync(args.jsonl, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  }
   for (const arm of ["new-device", "reopen"] as const) {
     const s = report.summary[arm];
     process.stderr.write(

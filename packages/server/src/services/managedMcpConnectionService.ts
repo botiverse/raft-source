@@ -5,9 +5,9 @@
  * is pinned to a specific Connection (managed_mcp_assignments); there is at most one default per
  * App (`idx_managed_mcp_credentials_default`).
  */
-import { mcpAgentGrant, mcpAgentGrantAllows, mcpAutoGrantCoversAgent, mcpAutoGrantCreatorScope } from "./managedMcpAgentGrant";
+import { mcpAgentGrant, mcpAgentGrantAllows, mcpAutoGrantCoversAgent } from "./managedMcpAgentGrant";
 import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
-import { currentDate, type ManagedMcpToolCatalogEntry } from "@botiverse/raft-shared";
+import { currentDate, type ManagedMcpToolCatalogEntry, type ServerRole } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import { agents, managedMcpAssignments, managedMcpCredentials, managedMcpServers } from "../db/schema";
 import { actorHasServerCapabilityInServer } from "../lib/actorPermissions";
@@ -19,7 +19,13 @@ import {
   type ManagedMcpOAuthCompletion,
 } from "./managedMcpOAuthService";
 import { hasConfiguredManagedMcpOAuthClient } from "./managedMcpOAuthClient";
+import { readSignedInByDeparted, signedInByView, type ManagedMcpSignedInBy } from "./managedMcpSignedInBy";
 import { ManagedMcpServiceError, resolveAdmittedConnectionCardsForApp } from "./managedMcpService";
+import { recordMcpConnectionAudit } from "./managedMcpConnectionAudit";
+import { notifyPersonalGrants } from "./managedMcpAccountNotices";
+// A cycle (managedMcpAccountsService imports setServerDefaultConnection): both are only called, never read at load.
+import { setMcpConnectionAgents } from "./managedMcpAccountsService";
+import { ServerMembershipRevokedError, withActorMembershipFence } from "../lib/actorMembershipFence";
 
 /**
  * Makes `connectionId` the App's server default (`null` leaves the App with none), in the caller's
@@ -30,12 +36,20 @@ import { ManagedMcpServiceError, resolveAdmittedConnectionCardsForApp } from "./
  */
 export async function setServerDefaultConnection(
   tx: DatabaseExecutor,
-  input: { serverId: string; mcpServerId: string; connectionId: string | null; userId: string },
+  input: {
+    serverId: string;
+    mcpServerId: string;
+    connectionId: string | null;
+    userId: string;
+    /** For the audit (RFC 087 §7.4): the actor's role when the caller read it, and which write it was. */
+    actorRole?: ServerRole | null;
+    via?: "default" | "agents_api" | "sign_in" | "api_key";
+  },
   /** Collects the closed cards' messages, for the caller to announce after commit (announceResolvedActionCards). */
   closedCards?: string[],
 ): Promise<{ previousDefaultConnectionId: string | null; defaultConnectionId: string | null; resolvedCards: number }> {
   const [app] = await tx
-    .select({ id: managedMcpServers.id, authMode: managedMcpServers.authMode })
+    .select({ id: managedMcpServers.id, name: managedMcpServers.name, authMode: managedMcpServers.authMode })
     .from(managedMcpServers)
     .where(and(eq(managedMcpServers.id, input.mcpServerId), eq(managedMcpServers.serverId, input.serverId)))
     .for("update");
@@ -45,6 +59,9 @@ export async function setServerDefaultConnection(
       id: managedMcpCredentials.id,
       isServerDefault: managedMcpCredentials.isServerDefault,
       authStatus: managedMcpCredentials.authStatus,
+      ownerKind: managedMcpCredentials.ownerKind,
+      ownerUserId: managedMcpCredentials.ownerUserId,
+      createdByUserId: managedMcpCredentials.createdByUserId,
     })
     .from(managedMcpCredentials)
     .where(and(eq(managedMcpCredentials.serverId, input.serverId), eq(managedMcpCredentials.mcpServerId, input.mcpServerId)));
@@ -52,6 +69,10 @@ export async function setServerDefaultConnection(
   const next = input.connectionId === null ? null : connections.find((connection) => connection.id === input.connectionId);
   if (next === undefined) {
     throw new ManagedMcpServiceError("MCP connection not found", "managed_mcp_connection_not_found");
+  }
+  // A member's personal Connection is never "All agents" (RFC 087 §6; the table's CHECK holds it too).
+  if (next?.ownerKind === "personal") {
+    throw new ManagedMcpServiceError("A member's own account can't be the App's default Connection.", "managed_mcp_connection_not_usable");
   }
   if (previous && previous.id !== next?.id) {
     await tx.update(managedMcpCredentials)
@@ -68,6 +89,29 @@ export async function setServerDefaultConnection(
       .set({ oauthStatus: next ? APP_OAUTH_STATUS_FOR_CONNECTION[next.authStatus] : "disconnected", updatedAt: new Date() })
       .where(eq(managedMcpServers.id, app.id));
   }
+  // "All agents" moved: `mcp_connection.agents_changed` with `allAgents` on the Connection that became
+  // the default (true) and the one that stopped being it (false), from whichever write did it.
+  for (const [changed, allAgents] of [[next, true], [previous, false]] as const) {
+    if (!changed || previous?.id === next?.id) continue;
+    await recordMcpConnectionAudit(tx, {
+      eventType: "mcp_connection.agents_changed",
+      serverId: input.serverId,
+      app: { id: app.id, name: app.name },
+      connection: { id: changed.id, ownerKind: changed.ownerKind, ownerUserId: changed.ownerUserId },
+      actorUserId: input.userId,
+      actorRole: input.actorRole ?? null,
+      metadata: {
+        granted_by: input.userId,
+        added: [],
+        removed: [],
+        moved_from: [],
+        allAgents,
+        connectionCreatedBy: changed.createdByUserId,
+        byConnectionCreator: changed.createdByUserId === input.userId,
+        via: input.via ?? "default",
+      },
+    });
+  }
   const resolvedCards = await resolveAdmittedConnectionCardsForApp(tx, input, closedCards);
   return { previousDefaultConnectionId: previous?.id ?? null, defaultConnectionId: next?.id ?? null, resolvedCards };
 }
@@ -77,26 +121,101 @@ export async function setServerDefaultConnection(
  * started for.
  *
  * `intent.makeDefault` is honoured only if the person who started the sign-in may STILL manage the
- * server's integrations; their role is re-read now, not trusted from when they started. A sign-in
- * never pins an Agent: granting the new Connection to an Agent is a separate, explicit step.
- * Either way the open Connect cards this sign-in satisfied are closed.
+ * server's integrations; their role is re-read now, not trusted from when they started. A shared
+ * sign-in without `intent.agentIds` (every older client, and the legacy `intent.agentId`) never pins
+ * an Agent: the card then offers the new Connection as its pending grant.
+ *
+ * A personal sign-in (RFC 087 §7.1; its owner, flag and toggle were re-checked by
+ * completeManagedMcpOAuthConnection before any token was stored) is never made the default.
+ * `intent.agentIds` (a personal sign-in, or a shared one started while `mcp_personal_accounts` is
+ * on) are given the new account with the agents API's own checks at this moment
+ * (setMcpConnectionAgents `add`: personal grants by their owner, shared pins by manageExternalAuth):
+ * an Agent deleted or no longer findable by the person is skipped, a refused choice gives it to
+ * nobody, and the sign-in stands either way. The open Connect cards this sign-in satisfied are
+ * closed, and the sign-in is audited (`mcp_connection.signed_in`, and `.created` for a Connection it made).
  */
 export async function completeManagedMcpOAuthCallback(input: {
   state: string;
   authorizationCode: string;
-}, closedCards?: string[]): Promise<ManagedMcpOAuthCompletion> {
+}, closedCards?: string[]): Promise<ManagedMcpOAuthCompletion & { changedAgentIds: string[] }> {
   const completion = await completeManagedMcpOAuthConnection(input);
-  const makeDefault = completion.intent?.makeDefault === true
+  const personal = completion.intent?.kind === "personal";
+  const makeDefault = !personal && completion.intent?.makeDefault === true
     && await actorHasServerCapabilityInServer(completion.serverId, "user", completion.userId, "manageIntegrations");
   await getDb().transaction(async (tx) => {
     const target = { serverId: completion.serverId, mcpServerId: completion.mcpServerId, userId: completion.userId };
+    await auditSignIn(tx, {
+      serverId: completion.serverId,
+      mcpServerId: completion.mcpServerId,
+      connectionId: completion.connectionId,
+      actorUserId: completion.userId,
+      created: completion.intent?.name !== undefined,
+    });
     if (makeDefault) {
-      await setServerDefaultConnection(tx, { ...target, connectionId: completion.connectionId }, closedCards);
+      await setServerDefaultConnection(tx, { ...target, connectionId: completion.connectionId, via: "sign_in" }, closedCards);
     } else {
       await resolveAdmittedConnectionCardsForApp(tx, target, closedCards);
     }
   });
-  return completion;
+  const agentIds = completion.intent?.agentIds ?? [];
+  if (agentIds.length === 0) return { ...completion, changedAgentIds: [] };
+  // The agent choice (RFC 087 §7.1), as the agents API writes it (setMcpConnectionAgents `add`):
+  // under the starter's membership row lock, their role read there, §6 asked again now (a personal
+  // Connection: its owner, flag on, a member not a guest; a shared one: manageExternalAuth) and
+  // audited. An Agent deleted since the start, or no longer one the starter can find, is skipped.
+  // A refusal (the flag, the role or the person changed in the instant since the sign-in's own
+  // check) leaves the Connection standing, given to nobody.
+  let given: Awaited<ReturnType<typeof setMcpConnectionAgents>> | null = null;
+  try {
+    given = await withActorMembershipFence(completion.serverId, completion.userId, (tx, role) => setMcpConnectionAgents(tx, {
+      serverId: completion.serverId,
+      connectionId: completion.connectionId,
+      actorUserId: completion.userId,
+      actorRole: role,
+      agentIds,
+      mode: "add",
+      onUnavailable: "skip",
+      via: "sign_in",
+    }, closedCards));
+  } catch (error) {
+    if (!(error instanceof ManagedMcpServiceError) && !(error instanceof ServerMembershipRevokedError)) throw error;
+    console.warn("mcp.oauth.callback_grant_refused", { code: (error as { code?: string }).code ?? null });
+  }
+  if (given?.personal?.notice) await notifyPersonalGrants(given.personal.notice);
+  return { ...completion, changedAgentIds: given?.changedAgentIds ?? [] };
+}
+
+/** `mcp_connection.signed_in` (and `.created` first, for a new Connection), in the caller's transaction. */
+async function auditSignIn(tx: DatabaseExecutor, input: {
+  serverId: string;
+  mcpServerId: string;
+  connectionId: string;
+  actorUserId: string;
+  created: boolean;
+}): Promise<void> {
+  const [row] = await tx
+    .select({
+      id: managedMcpCredentials.id,
+      ownerKind: managedMcpCredentials.ownerKind,
+      ownerUserId: managedMcpCredentials.ownerUserId,
+      authKind: managedMcpCredentials.authKind,
+      appName: managedMcpServers.name,
+      appAuthMode: managedMcpServers.authMode,
+    })
+    .from(managedMcpCredentials)
+    .innerJoin(managedMcpServers, eq(managedMcpServers.id, managedMcpCredentials.mcpServerId))
+    .where(and(eq(managedMcpCredentials.id, input.connectionId), eq(managedMcpCredentials.serverId, input.serverId)))
+    .limit(1);
+  if (!row) return;
+  const common = {
+    serverId: input.serverId,
+    app: { id: input.mcpServerId, name: row.appName },
+    connection: { id: row.id, ownerKind: row.ownerKind, ownerUserId: row.ownerUserId },
+    actorUserId: input.actorUserId,
+    metadata: { authKind: row.authKind ?? (row.appAuthMode === "oauth" ? "oauth" : "headers") },
+  };
+  if (input.created) await recordMcpConnectionAudit(tx, { ...common, eventType: "mcp_connection.created" });
+  await recordMcpConnectionAudit(tx, { ...common, eventType: "mcp_connection.signed_in" });
 }
 
 /* ------------------------------------------------------------------ Connection CRUD (API-key headers) */
@@ -119,9 +238,19 @@ export interface ManagedMcpConnectionView {
   lastCheckedAt: string | null;
   lastError: string | null;
   createdAt: string;
+  /**
+   * Whose account the stored secret acts as (who last signed it in or saved its key), and whether
+   * they have left this server (no membership, or account deleted); computed on read. Null when
+   * nobody's sign-in is recorded.
+   */
+  signedInBy: ManagedMcpSignedInBy;
+  /** RFC 087: `shared` (the admins') or `personal` (a member's own). */
+  ownerKind: CredentialRow["ownerKind"];
+  /** A personal Connection's owner, and whether they have left this server; null for a shared one. */
+  owner: ManagedMcpSignedInBy;
 }
 
-export function serializeConnection(row: CredentialRow, app: Pick<AppRow, "authMode">): ManagedMcpConnectionView {
+export function serializeConnection(row: CredentialRow, app: Pick<AppRow, "authMode">, departed: ReadonlyMap<string, boolean>): ManagedMcpConnectionView {
   return {
     id: row.id,
     name: row.name,
@@ -134,7 +263,16 @@ export function serializeConnection(row: CredentialRow, app: Pick<AppRow, "authM
     lastCheckedAt: row.lastCheckedAt?.toISOString() ?? null,
     lastError: row.lastError,
     createdAt: row.createdAt.toISOString(),
+    signedInBy: signedInByView(row.signedInByUserId, departed),
+    ownerKind: row.ownerKind,
+    owner: signedInByView(row.ownerUserId, departed),
   };
+}
+
+/** Views of one server's Connections, with one read for whether their signers and owners have left. */
+export async function serializeConnections(db: DatabaseExecutor, serverId: string, rows: CredentialRow[], app: Pick<AppRow, "authMode">): Promise<ManagedMcpConnectionView[]> {
+  const departed = await readSignedInByDeparted(db, serverId, rows.flatMap((row) => [row.signedInByUserId, row.ownerUserId]));
+  return rows.map((row) => serializeConnection(row, app, departed));
 }
 
 async function loadApp(db: DatabaseExecutor, serverId: string, mcpServerId: string, lock = false): Promise<AppRow> {
@@ -154,7 +292,7 @@ export async function listManagedMcpConnections(serverId: string, mcpServerId: s
     .from(managedMcpCredentials)
     .where(and(eq(managedMcpCredentials.serverId, serverId), eq(managedMcpCredentials.mcpServerId, mcpServerId)))
     .orderBy(asc(managedMcpCredentials.createdAt), asc(managedMcpCredentials.id));
-  return rows.map((row) => serializeConnection(row, app));
+  return serializeConnections(db, serverId, rows, app);
 }
 
 /**
@@ -253,13 +391,16 @@ export async function createManagedMcpHeaderConnection(input: {
       authorizedEndpointUrl: app.endpointUrl,
       lastCheckedAt: currentDate(),
       createdByUserId: input.userId,
+      signedInByUserId: input.userId,
     }).returning();
+    // Saving the key is this person's sign-in: the key acts as them (signed_in_by_user_id).
+    await auditSignIn(tx, { serverId: input.serverId, mcpServerId: input.mcpServerId, connectionId: row.id, actorUserId: input.userId, created: true });
     if (input.makeDefault) {
-      await setServerDefaultConnection(tx, { serverId: input.serverId, mcpServerId: input.mcpServerId, connectionId: row.id, userId: input.userId }, closedCards);
+      await setServerDefaultConnection(tx, { serverId: input.serverId, mcpServerId: input.mcpServerId, connectionId: row.id, userId: input.userId, via: "api_key" }, closedCards);
       await writeCatalogFromHandshake(tx, app, toolCatalog);
     }
     const [saved] = await tx.select().from(managedMcpCredentials).where(eq(managedMcpCredentials.id, row.id));
-    return serializeConnection(saved, app);
+    return (await serializeConnections(tx, input.serverId, [saved], app))[0]!;
   });
 }
 
@@ -304,13 +445,15 @@ export async function updateManagedMcpConnection(input: {
         lastError: null,
         lastCheckedAt: currentDate(),
         credentialVersion: sql`${managedMcpCredentials.credentialVersion} + 1`,
+        signedInByUserId: input.userId,
       } : {}),
       updatedAt: currentDate(),
     }).where(eq(managedMcpCredentials.id, existing.id)).returning();
     if (!row) throw new ManagedMcpServiceError("MCP connection not found", "managed_mcp_connection_not_found");
+    if (replacement) await auditSignIn(tx, { serverId: input.serverId, mcpServerId: input.mcpServerId, connectionId: row.id, actorUserId: input.userId, created: false });
     if (replacement && row.isServerDefault) await writeCatalogFromHandshake(tx, app, replacement.toolCatalog);
     if (replacement) await resolveAdmittedConnectionCardsForApp(tx, { serverId: input.serverId, mcpServerId: input.mcpServerId, userId: input.userId }, closedCards);
-    return serializeConnection(row, app);
+    return (await serializeConnections(tx, input.serverId, [row], app))[0]!;
   });
 }
 
@@ -329,33 +472,6 @@ async function loadConnection(
     .limit(1);
   if (!row) throw new ManagedMcpServiceError("MCP connection not found", "managed_mcp_connection_not_found");
   return row;
-}
-
-/**
- * Deletes a Connection.
- *
- * Agents pinned to it stay pinned to nothing (the FK sets the binding NULL) and are REFUSED; they
- * never fall back to the default, because that would re-grant through another account access that
- * was deliberately scoped (the dead-pin rule in `admitManagedMcpCall`). If it was the default, the
- * App has no default until someone sets one, and Agents following the default are refused too.
- */
-export async function deleteManagedMcpConnection(input: {
-  serverId: string;
-  mcpServerId: string;
-  connectionId: string;
-}): Promise<void> {
-  await getDb().transaction(async (tx) => {
-    const app = await loadApp(tx, input.serverId, input.mcpServerId, true);
-    const [deleted] = await tx.delete(managedMcpCredentials).where(and(
-      eq(managedMcpCredentials.id, input.connectionId),
-      eq(managedMcpCredentials.serverId, input.serverId),
-      eq(managedMcpCredentials.mcpServerId, input.mcpServerId),
-    )).returning({ isServerDefault: managedMcpCredentials.isServerDefault });
-    if (!deleted) throw new ManagedMcpServiceError("MCP connection not found", "managed_mcp_connection_not_found");
-    if (deleted.isServerDefault && app.authMode === "oauth") {
-      await tx.update(managedMcpServers).set({ oauthStatus: "disconnected", updatedAt: currentDate() }).where(eq(managedMcpServers.id, app.id));
-    }
-  });
 }
 
 /* ------------------------------------------------------------------ server default: impact */
@@ -409,11 +525,12 @@ export async function describeManagedMcpDefaultImpact(input: {
   let following = 0;
   let pinned = 0;
   let off = 0;
-  const creatorScope = await mcpAutoGrantCreatorScope(db, input.serverId, app);
   for (const row of rows) {
     // An Agent without the App (revoked, or never granted) is unaffected by the default, like one switched off.
+    // So is one that has it only through a member's personal grant: it never falls back to the default
+    // (`admitManagedMcpCall`), so only the admin layer's grant is asked here.
     const assignment = row.enabled === null ? null : { enabled: row.enabled };
-    if (!mcpAgentGrantAllows(mcpAgentGrant(assignment, mcpAutoGrantCoversAgent(creatorScope, row)))) off += 1;
+    if (!mcpAgentGrantAllows(mcpAgentGrant(assignment, mcpAutoGrantCoversAgent(app, row), false))) off += 1;
     else if (row.connectionMode === "pinned") pinned += 1;
     else following += 1;
   }

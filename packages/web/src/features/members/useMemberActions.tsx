@@ -84,13 +84,6 @@ export function useMemberActions(): { actions: MemberActions; dialogs: ReactNode
       isExternalAgent: resetTarget.external === true || isExternalAgentRuntime(resetTarget.runtime),
     })
     : null;
-  // Restart now in the saved toast: whoever may restart it (as the profile's canRestartAgent).
-  const editCanRestart = editTarget
-    ? agentRuntimePermissions(editTarget, userId, capabilities, {
-      isExternalAgent: editTarget.external === true || isExternalAgentRuntime(editTarget.runtime),
-    }).canControlAgentRuntime && !editTarget.deletedAt
-    : false;
-
   const dialogs = (
     <>
       {stopTarget ? (
@@ -115,7 +108,7 @@ export function useMemberActions(): { actions: MemberActions; dialogs: ReactNode
         />
       ) : null}
       {editTarget ? (
-        <AgentRuntimeConfigEditor key={editTarget.id} agent={editTarget} canRestartAgent={editCanRestart} onClose={closeEdit} />
+        <AgentRuntimeConfigEditor key={editTarget.id} agent={editTarget} onClose={closeEdit} />
       ) : null}
     </>
   );

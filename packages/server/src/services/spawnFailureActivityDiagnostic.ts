@@ -1,4 +1,4 @@
-import { SPAWN_FAILURE_REASONS, isSpawnFailureLookupReason, type SpawnFailureActivityDiagnostic } from "@botiverse/raft-shared";
+import { SPAWN_FAILURE_REASONS, boundedStartFailureMessage, isSpawnFailureLookupReason, type SpawnFailureActivityDiagnostic } from "@botiverse/raft-shared";
 import { PAUSE_RETRY_START_FAILURE_REASONS } from "./wakeCrashLoopBreaker";
 
 /**
@@ -39,10 +39,19 @@ export function normalizeSpawnFailureActivityDiagnostic(
   const lookup = reason === "runtime_not_found" && isSpawnFailureLookupReason(candidate.lookupReason)
     ? { lookupReason: candidate.lookupReason }
     : {};
-  if (candidate.model === undefined) return { reason, ...lookup, ...paused };
+  // The start's own error text, from a daemon only: scrubbed and capped
+  // again here (the Computer's word is not trusted for either). The caller
+  // takes it off before the carrier reaches any viewer (it is stored as the
+  // agent's runtime error, read by its managers only); a server read-back
+  // never carries it.
+  const boundedMessage = options.source !== "server" && typeof candidate.message === "string"
+    ? boundedStartFailureMessage(candidate.message)
+    : "";
+  const message = boundedMessage ? { message: boundedMessage } : {};
+  if (candidate.model === undefined) return { reason, ...lookup, ...paused, ...message };
   if (typeof candidate.model !== "string" || candidate.model.length === 0 || candidate.model.length > MAX_MODEL_LENGTH) return null;
   // Only the model reasons and a start timeout carry a model; drop it elsewhere rather than echo.
   return reason === "model_not_found" || reason === "model_not_configured" || reason === "model_unsupported" || reason === "runtime_start_timeout"
-    ? { reason, model: candidate.model, ...paused }
-    : { reason, ...lookup, ...paused };
+    ? { reason, model: candidate.model, ...paused, ...message }
+    : { reason, ...lookup, ...paused, ...message };
 }

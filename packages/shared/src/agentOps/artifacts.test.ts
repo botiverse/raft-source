@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { createAgentApiClient, type AgentApiClient } from "../agentApiClient";
 import { formatArtifactCheck } from "../agentText/artifacts";
 import { RAFT_HINTS } from "./hint";
-import { ARTIFACT_CHECK_POLL_MS, ARTIFACT_CHECK_WAIT_MS, artifactCommentImageUploaderForFetch, artifactsCheck, artifactsCheckShot, artifactsComment, artifactsCommentImage, artifactsCommentImageUpload, artifactsComments, artifactsDelete, artifactsFile, artifactsFileContent, artifactsList, artifactsMatchQuery, artifactsMove, artifactsPublish, ARTIFACTS_PROBE_GRACE_MS, artifactsRead, artifactsReview, artifactsReviewRefusal, artifactsFollow, artifactsSaveAttachment, artifactsUnfollow, artifactsUpload, artifactUploaderForFetch, artifactUploadFailure, searchMessages } from "./index";
+import { ARTIFACT_NOT_A_PAGE_HOLD_MS, type ArtifactPageHoldStore, memoryArtifactPageHoldStore, ARTIFACT_CHECK_POLL_MS, ARTIFACT_CHECK_WAIT_MS, artifactCommentImageUploaderForFetch, artifactsCheck, artifactsCheckShot, artifactsComment, artifactsCommentImage, artifactsCommentImageUpload, artifactsComments, artifactsDelete, artifactsFile, artifactsFileContent, artifactsList, artifactsMatchQuery, artifactsMove, artifactsPublish, ARTIFACTS_PROBE_GRACE_MS, artifactsRead, artifactsReview, artifactsReviewRefusal, artifactsFollow, artifactsSaveAttachment, artifactsUnfollow, artifactsUpload, artifactUploaderForFetch, artifactUploadFailure, searchMessages } from "./index";
 
 type Call = { method: string; path: string };
 
@@ -205,6 +205,133 @@ function pushRecorder(bodies: Array<Record<string, unknown>>): AgentApiClient {
   });
 }
 
+test("push: a new artifact's entry is picked as the Server picks it, and one it can't open at is refused before any request", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  const api = pushRecorder(bodies);
+  const page = (title: string) => `<!doctype html><html><head><title>${title}</title></head><body>hi</body></html>`;
+
+  assert.ok((await artifactsPublish(api, { target: "#ops", files: [{ path: "report.html", content: page("Report") }, { path: "data.json", content: "{}" }] })).ok);
+  assert.equal(bodies.at(-1)!.title, "Report", "the only page is the entry, its <title> the title");
+  assert.equal("entry" in bodies.at(-1)!, false, "the Server picks the same: nothing more is sent");
+  const sent = bodies.length;
+
+  const two = await artifactsPublish(api, { target: "#ops", title: "t", files: [{ path: "b.html", content: page("B") }, { path: "a.html", content: page("A") }] });
+  assert.ok(!two.ok);
+  assert.equal(two.error.serverCode, "ENTRY_NOT_FOUND");
+  assert.equal(two.error.message, `This push names no entry file and has no index.html, but more than one page it could open at: "a.html", "b.html". Nothing was sent.`);
+  assert.equal(two.error.nextAction, "Name the one it opens at, e.g. --entry a.html on the CLI (entry in a tool call), or rename it to index.html, then push again.");
+
+  const spaced = await artifactsPublish(api, { target: "#ops", title: "t", files: [{ path: "my page.html", content: page("M") }, { path: "z.html", content: page("Z") }] });
+  assert.ok(!spaced.ok);
+  assert.equal(spaced.error.nextAction, "Name the one it opens at, e.g. --entry 'my page.html' on the CLI (entry in a tool call), or rename it to index.html, then push again.", "a path with a space pastes as one argument");
+
+  const none = await artifactsPublish(api, { target: "#ops", title: "t", files: [{ path: "data.json", content: "{}" }, { path: "logo.png", content_base64: "AA==" }] });
+  assert.ok(!none.ok && none.error.serverCode === "ENTRY_NOT_FOUND");
+
+  const named = await artifactsPublish(api, { target: "#ops", title: "t", entry: "home.html", files: [{ path: "index.html", content: page("I") }] });
+  assert.ok(!named.ok && named.error.serverCode === "ENTRY_NOT_FOUND");
+  assert.equal(named.error.message, "The entry file \"home.html\" isn't among the files this push sends. Nothing was sent.");
+  assert.equal(bodies.length, sent, "nothing sent for any refusal");
+});
+
+// ── a new artifact with no page, held once (#345) ──
+
+/** A hold store in a Map, as the SDK's (memoryArtifactPageHoldStore), that can be told to fail. */
+function holdStore(fail: { read?: true; write?: true } = {}) {
+  const held = new Map<string, number>();
+  const store: ArtifactPageHoldStore = {
+    heldAt: (key) => { if (fail.read) throw new Error("ledger unreadable"); return held.get(key); },
+    hold: (key, at) => { if (fail.write) throw new Error("ledger read-only"); held.set(key, at); },
+    release: (key) => { held.delete(key); },
+  };
+  return { store, held };
+}
+
+test("push: a new artifact with no page is held once before any request (a held-once failure with no code of its own); the same push again goes through and forgets the hold", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  const api = pushRecorder(bodies);
+  const { store, held } = holdStore();
+  const push = { target: "#proj-workspace", title: "Report", files: [{ path: "report.pdf", content_base64: "JVBERi0=" }] };
+
+  const first = await artifactsPublish(api, push, { pageHold: { store, dir: "/work/q3" } });
+  assert.ok(!first.ok);
+  assert.equal(first.error.code, "CONFLICT");
+  assert.deepEqual([first.error.heldOnce, first.error.serverCode], [true, undefined]);
+  assert.equal(first.error.retryable, false);
+  assert.equal(first.error.message, "Held — not pushed. Send report.pdf as an attachment instead. An artifact keeps versions, takes comments and holds several files together, and it costs more to make and to keep up; a finished file that won't be revised needs none of that.");
+  assert.equal(first.error.nextAction, [
+    "Upload it:",
+    `  raft attachment upload --path /work/q3/report.pdf --target "#proj-workspace"`,
+    `then send your message with the id it prints: raft message send --target "#proj-workspace" --attachment-id <id>`,
+    "Only if you will revise it in Raft or people must comment on it there, run the same command again.",
+  ].join("\n"));
+  assert.equal(bodies.length, 0, "nothing sent");
+  assert.equal(held.size, 1, "the hold is recorded");
+
+  const again = await artifactsPublish(api, push, { pageHold: { store, dir: "/work/q3" } });
+  assert.ok(again.ok, again.ok ? "" : again.text);
+  assert.equal(bodies.length, 1, "pushed");
+  assert.equal(held.size, 0, "the hold is forgotten once the push went through");
+
+  const third = await artifactsPublish(api, push, { pageHold: { store, dir: "/work/q3" } });
+  assert.ok(!third.ok && third.error.heldOnce === true, "another new artifact of the same files is held again");
+});
+
+test("push: a held push with no page is held again once its files change, in another directory or target, or after 10 minutes", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  const api = pushRecorder(bodies);
+  const { store } = holdStore();
+  let now = Date.parse("2026-11-20T10:00:00.000Z");
+  const hold = (dir = "/work/q3") => ({ store, dir, now: () => now });
+  const files = [{ path: "report.pdf", content_base64: "JVBERi0=" }];
+  const push = (more: Array<{ path: string; content: string }> = [], target = "#ops") => ({ target, title: "Report", entry: "report.pdf", files: [...files, ...more] });
+  const isHeld = (out: Awaited<ReturnType<typeof artifactsPublish>>) => !out.ok && out.error.heldOnce === true;
+
+  assert.ok(isHeld(await artifactsPublish(api, push(), { pageHold: hold() })));
+  now += 60_000;
+  assert.ok(isHeld(await artifactsPublish(api, push([{ path: "data.csv", content: "a,b" }]), { pageHold: hold() })), "a file added: held again");
+  assert.ok(isHeld(await artifactsPublish(api, push([{ path: "data.csv", content: "a,b,c" }]), { pageHold: hold() })), "a file's size changed: held again");
+  assert.ok(isHeld(await artifactsPublish(api, push([{ path: "data.csv", content: "a,b,c" }]), { pageHold: hold("/work/q4") })), "another directory: held");
+  assert.ok(isHeld(await artifactsPublish(api, push([{ path: "data.csv", content: "a,b,c" }], "#other"), { pageHold: hold() })), "another target: held");
+  assert.equal(bodies.length, 0, "nothing sent yet");
+
+  now += ARTIFACT_NOT_A_PAGE_HOLD_MS + 1;
+  assert.ok(isHeld(await artifactsPublish(api, push([{ path: "data.csv", content: "a,b,c" }]), { pageHold: hold() })), "more than 10 minutes later: held again");
+  now += ARTIFACT_NOT_A_PAGE_HOLD_MS;
+  const within = await artifactsPublish(api, push([{ path: "data.csv", content: "a,b,c" }], " #ops "), { pageHold: hold() });
+  assert.ok(within.ok, within.ok ? "" : within.text);
+  assert.equal(bodies.length, 1, "the same push again within 10 minutes (the target trimmed) goes through");
+});
+
+test("push: never held: a new version, a new artifact with any HTML or Markdown page, a push without a hold store, or a store that can't record", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  const api = pushRecorder(bodies);
+  const pdf = { path: "report.pdf", content_base64: "JVBERi0=" };
+  const ok = (out: Awaited<ReturnType<typeof artifactsPublish>>, why: string) => assert.ok(out.ok, `${why}: ${out.ok ? "" : out.text}`);
+  ok(await artifactsPublish(api, { artifact: "pt_abc", base: 12, files: [pdf] }, { pageHold: { store: holdStore().store } }), "a new version");
+  for (const page of ["index.html", "notes.htm", "README.md", "guide.markdown"]) {
+    ok(await artifactsPublish(api, { target: "#ops", title: "Report", entry: "report.pdf", files: [pdf, { path: page, content: "x" }] }, { pageHold: { store: holdStore().store } }), page);
+  }
+  ok(await artifactsPublish(api, { target: "#ops", title: "Report", files: [pdf] }), "no hold store (a direct caller of the op)");
+  ok(await artifactsPublish(api, { target: "#ops", title: "Report", files: [pdf] }, { pageHold: { store: holdStore({ read: true, write: true }).store } }), "a store that can't record");
+  assert.equal(bodies.length, 7);
+});
+
+test("push: the hold in tool style names the typed upload and the tool calls; several files name three and how many more", async () => {
+  const api = pushRecorder([]);
+  const files = ["e.zip", "a.pdf", "d.zip", "b.png", "c.csv"].map((path) => ({ path, content_base64: "AA==" }));
+  const out = await artifactsPublish(api, { target: "#proj-workspace", title: "Data", entry: "a.pdf", files }, { hints: "tool", pageHold: { store: memoryArtifactPageHoldStore() } });
+  assert.ok(!out.ok);
+  assert.equal(out.error.message, "Held — not pushed. Send these 5 files as attachments instead (a.pdf, b.png, c.csv and 2 more). An artifact keeps versions, takes comments and holds several files together, and it costs more to make and to keep up; finished files that won't be revised need none of that.");
+  assert.equal(out.error.nextAction, [
+    "Upload each file:",
+    `  raft.attachments.upload({ target: "#proj-workspace", filename: "a.pdf", bytes: … }) (one call per file)`,
+    `then send your message with the id it returns: messages_send({ target: "#proj-workspace", attachmentIds: ["<id>"], content: … })`,
+    "Only if you will revise it in Raft or people must comment on it there, make the same artifacts_push call again.",
+  ].join("\n"));
+  assert.ok(!/\braft [a-z]/.test(out.text), out.text);
+});
+
 test("push: a new artifact needs a title: the one given, else its entry page's <title>; none is refused before any request", async () => {
   const bodies: Array<Record<string, unknown>> = [];
   const api = pushRecorder(bodies);
@@ -308,7 +435,7 @@ test("push: FILE_UPLOAD_QUOTA_EXCEEDED with the Server's upgrade card offers it 
   assert.equal(cli.error.nextAction, `${upgradeHint}\nUntil then, only files the server already has (unchanged ones) can be pushed.`);
   const tool = await artifactsPublish(client(refuse(403, "FILE_UPLOAD_QUOTA_EXCEEDED", details)), request, { hints: "tool" });
   assert.ok(!tool.ok);
-  assert.equal(tool.error.nextAction, `Say in the conversation that the files weren't stored and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: ${billingUrl}. Until then, only files the server already has (unchanged ones) can be pushed.`);
+  assert.equal(tool.error.nextAction, `Say in the conversation that the files weren't stored and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Plan & billing: ${billingUrl}. Until then, only files the server already has (unchanged ones) can be pushed.`);
 });
 
 test("SDK uploader: PUT …/uploads/:sha256 with the raw bytes and auth; refusals in the Artifacts' words", async () => {
@@ -342,7 +469,7 @@ test("SDK uploader: PUT …/uploads/:sha256 with the raw bytes and auth; refusal
     errorCode: "FILE_UPLOAD_QUOTA_EXCEEDED",
     code: "FILE_UPLOAD_QUOTA_EXCEEDED",
     billingUrl,
-    suggestedNextAction: `Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: ${billingUrl}`,
+    suggestedNextAction: `Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Plan & billing: ${billingUrl}`,
     details: { requestedBytes: 3, quota: monthlyQuota, billingUrl },
   }), "tool")(SHA, BYTES);
   assert.ok(!monthly.ok);
@@ -1178,7 +1305,7 @@ test("an image uploaded for a review's comment refused for the server's sake (it
   assert.ok(!quota.ok);
   assert.equal(quota.error.serverCode, "FILE_UPLOAD_QUOTA_EXCEEDED");
   assert.equal(quota.error.message, "Not stored: this server's monthly file upload quota is used up (100 MiB of 100 MiB used this month). The Free plan includes 100 MB of uploads a month, and comment images count against it as attachments do. Nothing of the review was posted.");
-  assert.equal(quota.error.nextAction, `Say in the conversation that the image wasn't stored and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: ${billingUrl}. Until then, take "images" out of the JSON and run the same command again (describe the images in words instead).`);
+  assert.equal(quota.error.nextAction, `Say in the conversation that the image wasn't stored and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Plan & billing: ${billingUrl}. Until then, take "images" out of the JSON and run the same command again (describe the images in words instead).`);
 
   // Storage not set up (a deliberate 503): the Server's sentence, which says retrying won't help, then that nothing of the review was posted.
   const storage = await artifactsCommentImageUpload(answer(503, { error: STORAGE_UNSET, code: "ARTIFACTS_STORAGE_UNAVAILABLE" }), { artifact: "pt_abc", bytes: PNG_BYTES }, forReview);

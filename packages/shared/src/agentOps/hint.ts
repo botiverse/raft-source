@@ -135,7 +135,7 @@ export interface RaftManualContext {
   reason: string;
 }
 
-/** A Manual fetch's intent or reason: double-quoted as the CLI's help prints them, single-quoted when it holds anything a shell reads inside double quotes. */
+/** A Manual fetch's intent or reason (or a push's title): double-quoted as the CLI's help prints them, single-quoted when it holds anything a shell reads inside double quotes. */
 function manualContextWord(value: string): string {
   return /^[^"\\$`!]*$/.test(value) ? q(value) : shellWord(value);
 }
@@ -143,6 +143,11 @@ function manualContextWord(value: string): string {
 /** An Artifact as a CLI argument: an id, an old name or a `<…>` placeholder bare; anything else (a title) quoted. */
 function artifactWord(artifact: string): string {
   return /^(?:<[^<>]*>|[A-Za-z0-9_-]+)$/.test(artifact) ? artifact : shellWord(artifact);
+}
+
+/** A local path as one shell word: bare when it has only safe characters (`/tmp/q3/report.pdf`), else in single quotes. */
+export function shellPathWord(path: string): string {
+  return /^[A-Za-z0-9._/-]+$/.test(path) ? path : shellWord(path);
 }
 
 /** A local file name as a CLI argument: bare when it is plain (`comment-c_812-1.png`, a `<…>` placeholder), else quoted. */
@@ -209,6 +214,8 @@ const RAFT_TASK_HINTS = {
   taskClaimName: (): RaftHint => hint(["task", "claim"], { name: "tasks.claim", args: {} }, ["target", "taskNumbers"]),
   /** A board's tasks (the idle task reminder, naming the boards in prose). */
   taskListName: (): RaftHint => hint(["task", "list", "--target", "<board>"], { name: "tasks.list", args: {} }, ["target"]),
+  /** The agent's own open tasks across channels (the idle task reminder, past the tasks it names). */
+  taskListMine: (): RaftHint => hint(["task", "list", "--mine"], { name: "tasks.list", args: { mine: true } }),
 } satisfies Record<string, (...args: never[]) => RaftHint>;
 
 /**
@@ -356,6 +363,10 @@ export const RAFT_HINTS = {
   channelMuteName: (): RaftHint => hint(["channel", "mute"], { name: "channels.mute", args: {} }, ["target"]),
   channelUnmuteName: (): RaftHint => hint(["channel", "unmute"], { name: "channels.unmute", args: {} }, ["target"]),
   threadUnfollowName: (): RaftHint => hint(["thread", "unfollow"], { name: "threads.unfollow", args: {} }, ["target"]),
+  /** Focus (flag `agent_focus_v0`; no SDK operation yet): focus or unfocus one conversation, or list what is focused. */
+  focus: (target: string): RaftHint => hint(["focus", q(target)]),
+  unfocus: (target: string): RaftHint => hint(["unfocus", q(target)]),
+  focusList: (): RaftHint => hint(["focus"]),
   /** Channel / server admin writes by name (prose). The Server checks the agent's role on each call. */
   channelCreateName: (): RaftHint => hint(["channel", "create"], { name: "channels.create", args: {} }, ["name"]),
   channelUpdateName: (): RaftHint => hint(["channel", "update"], { name: "channels.update", args: {} }, ["target"]),
@@ -374,6 +385,7 @@ export const RAFT_HINTS = {
   channelUnarchiveName: (): RaftHint => hint(["channel", "unarchive"], { name: "channels.unarchive", args: {} }, ["target"]),
   channelAddMemberName: (): RaftHint => hint(["channel", "add-member"], { name: "channels.addMember", args: {} }, ["target"]),
   channelRemoveMemberName: (): RaftHint => hint(["channel", "remove-member"], { name: "channels.removeMember", args: {} }, ["target"]),
+  channelSetRoleName: (): RaftHint => hint(["channel", "set-role"], { name: "channels.setRole", args: {} }, ["target", "role"]),
   /** Leave a private channel as its last member, deleting it and all its messages. */
   channelLeaveDeleting: (target: string): RaftHint => hint(["channel", "leave", "--target", q(target), "--delete-if-last"], { name: "channels.leave", args: { target, deleteIfLast: true } }),
   /** Remove a private channel's last member, deleting it and all its messages. `member` is `{ user: "@alice" }` or `{ agent: "@bot" }`. */
@@ -461,6 +473,19 @@ export const RAFT_HINTS = {
    * tool form, so tool-style text says to send a message instead and never renders this.
    */
   attachmentUpload: (): RaftHint => hint(["attachment", "upload", "--path", "<file>", "--target", "<conversation>"]),
+  /**
+   * One named file sent as an attachment into `target` (the CLI form takes `path` as given: absolute where
+   * the caller knows the directory). The tool form is the typed upload (binary input has no model tool),
+   * its bytes the caller's.
+   */
+  attachmentUploadFile: ({ path, target }: { path: string; target: string }): RaftHint => ({
+    ...hint(
+      ["attachment", "upload", "--path", shellPathWord(path), "--target", target.startsWith("<") ? target : q(target)],
+      { name: "attachments.upload", args: { target, filename: path.slice(path.lastIndexOf("/") + 1) } },
+      ["bytes"],
+    ),
+    codeOnly: true,
+  }),
   /** An Artifact's summary and what's new (`version`: an older one; `files`: every file). No artifact: left to fill. */
   artifactRead: ({ artifact, version, files }: { artifact?: string; version?: number; files?: true }): RaftHint => hint(
     ["artifact", "read", artifact === undefined ? "<artifact>" : artifactWord(artifact), ...(version === undefined ? [] : ["--rev", String(version)]), ...(files ? ["--files"] : [])],
@@ -478,16 +503,20 @@ export const RAFT_HINTS = {
     ],
     { name: "artifacts.list", args: { query, target, cursor, limit } },
   ),
-  /** Comments: what's new to the agent by default, every comment with `all`. */
-  artifactComments: ({ artifact, path, all, cursor, review }: { artifact: string; path?: string; all?: true; cursor?: string; review?: string }): RaftHint => hint(
+  /**
+   * Comments: what's new to the agent by default, every comment with `all`;
+   * `held`, the comments a hold showed it, by the range it gave (task #340).
+   */
+  artifactComments: ({ artifact, path, all, cursor, review, held }: { artifact: string; path?: string; all?: true; cursor?: string; review?: string; held?: string }): RaftHint => hint(
     [
       "artifact", "comments", artifactWord(artifact),
       ...(review === undefined ? [] : ["--review", review]),
+      ...(held === undefined ? [] : ["--held", held]),
       ...(path === undefined ? [] : ["--path", shellWord(path)]),
       ...(all ? ["--all"] : []),
       ...(cursor === undefined ? [] : ["--cursor", cursor]),
     ],
-    { name: "artifacts.comments", args: { artifact, review, path, ...(all ? { all } : {}), cursor } },
+    { name: "artifacts.comments", args: { artifact, review, ...(held === undefined ? {} : { held }), path, ...(all ? { all } : {}), cursor } },
   ),
   /**
    * One file: saved to disk by the CLI, read as text (or a short-lived URL) by the operation. No path: left to fill.
@@ -515,15 +544,19 @@ export const RAFT_HINTS = {
   artifactPull: ({ artifact, dir }: { artifact: string; dir?: string }): RaftHint => hint(
     ["artifact", "pull", artifactWord(artifact), ...(dir === undefined ? [] : ["--dir", dir.startsWith("<") ? dir : q(dir)])],
   ),
-  /** Push a directory's changes as a new version (CLI); the operation takes the files themselves, left to fill. `target`: a new one's home (a `<…>` placeholder stays bare). */
-  artifactPublish: ({ dir, artifact, base, deletePath, target, note }: { dir?: string; artifact?: string; base?: number; deletePath?: string; target?: string; note?: string }): RaftHint => hint(
+  /**
+   * Push a directory's changes as a new version (CLI); the operation takes the files themselves, left to fill. `target`: a new one's home (a `<…>` placeholder stays bare).
+   * `localDir`: the directory as an absolute local path, bare when plain (shellPathWord), in place of `dir`. `title`: a new one's --title.
+   */
+  artifactPublish: ({ dir, localDir, artifact, base, deletePath, target, title, note }: { dir?: string; localDir?: string; artifact?: string; base?: number; deletePath?: string; target?: string; title?: string; note?: string }): RaftHint => hint(
     [
-      "artifact", "push", dir === undefined ? "<dir>" : q(dir),
+      "artifact", "push", localDir !== undefined ? shellPathWord(localDir) : dir === undefined ? "<dir>" : q(dir),
       ...(target === undefined ? [] : ["--target", target.startsWith("<") ? target : q(target)]),
+      ...(title === undefined ? [] : ["--title", manualContextWord(title)]),
       ...(note === undefined ? [] : ["--note", q(note)]),
       ...(deletePath === undefined ? [] : ["--delete", shellWord(deletePath)]),
     ],
-    { name: "artifacts.push", args: { artifact, base, target, note, ...(deletePath === undefined ? {} : { delete: [deletePath] }) } },
+    { name: "artifacts.push", args: { artifact, base, target, title, note, ...(deletePath === undefined ? {} : { delete: [deletePath] }) } },
     ["files"],
   ),
   /** Answer in an Artifact's comments; the body is the caller's (stdin on the CLI). */
@@ -548,6 +581,10 @@ export const RAFT_HINTS = {
     ["artifact", "reopen", artifactWord(artifact), comment],
     { name: "artifacts.reopen", args: { artifact, comment } },
   ),
+  /** Mark an Artifact Settled (#334): done, no longer a draft under discussion. */
+  artifactSettle: ({ artifact }: { artifact: string }): RaftHint => hint(["artifact", "settle", artifactWord(artifact)], { name: "artifacts.settle", args: { artifact } }),
+  /** Take a Settled Artifact back to Working (#334). */
+  artifactUnsettle: ({ artifact }: { artifact: string }): RaftHint => hint(["artifact", "unsettle", artifactWord(artifact)], { name: "artifacts.unsettle", args: { artifact } }),
   /** Follow an Artifact again after unfollowing it. */
   artifactFollow: ({ artifact }: { artifact: string }): RaftHint => hint(["artifact", "follow", artifactWord(artifact)], { name: "artifacts.follow", args: { artifact } }),
   /** Stop following an Artifact (mentions still arrive). */

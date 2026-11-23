@@ -29,9 +29,9 @@ export function opensProfileInPanel(): boolean {
  * a bookmark or Create agent landing on a profile shows the Members page
  * beside it, never the old Members sidebar. The query (agentTab=, …) and hash
  * ride along, and the page scrolls the member into view (MembersLocateState).
- * The profile is opened in its store before the move: the right panel's
- * store→URL sync writes `profile=` from the store, so a URL that arrived
- * ahead of the store was rewritten without it, and the panel stayed shut.
+ * The profile is opened in its store as well as in the address (right after
+ * the move): the right panel's store→URL sync writes `profile=` from the
+ * store, so an address alone was rewritten without it, and the panel stayed shut.
  * A phone keeps the profile as its own page with Back, and a Guest, who has
  * no Members page, keeps it as before.
  */
@@ -62,8 +62,14 @@ function OpenInMembers({ to, type, id, agentTab }: { to: string; type: "agent" |
   const navigate = useNavigate();
   const state = useMemo<MembersLocateState>(() => ({ membersLocate: { type, id } }), [id, type]);
   useEffect(() => {
-    useProfileStore.getState().openProfile(type, id, agentTab ? { defaultAgentTabIntent: agentTab } : undefined);
+    // The move first, then the store (ComputerPanelRedirect's order): opened
+    // first, the store → URL sync pushed `/agent|human/<id>?profile=…` and the
+    // move replaced only that, leaving the bare `/agent|human/<id>` behind the
+    // panel, so a step back (closing it, Back) landed on the redirect again.
     navigate(to, { replace: true, state });
+    // A redirect on mount, as <Navigate> is, not an event handler: no event triggers it.
+    // oxlint-disable-next-line react-doctor/no-event-handler
+    useProfileStore.getState().openProfile(type, id, agentTab ? { defaultAgentTabIntent: agentTab } : undefined);
   }, [agentTab, id, navigate, state, to, type]);
   return null;
 }

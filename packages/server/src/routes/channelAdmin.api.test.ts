@@ -330,7 +330,7 @@ test("archived channels reject every human membership and metadata mutation exce
   assert.deepEqual(attempts.map((response) => response.status), [409, 409, 409, 409, 409]);
 });
 
-test("agent channel admin uses existing management actions without gaining visibility changes or role API", async ({ app }) => {
+test("agent channel admin uses existing management actions without gaining visibility changes", async ({ app }) => {
   const owner = await seedUser("agent-role-owner");
   const target = await seedUser("agent-role-target");
   const addedTarget = await seedUser("agent-role-added-target");
@@ -595,7 +595,7 @@ test("an agent cannot make a channel with a Guest public: 409 external_members_k
 
   const refused = await updateChannelForAgent({ actor, serverId: server.id, channelId: channel.id, body: { visibility: "public" } });
   assert.equal(refused.status, 409);
-  assert.equal((refused.body as { code?: string }).code, "external_members_keep_private");
+  assert.equal("refusal" in refused ? refused.refusal.code : undefined, "external_members_keep_private");
   const [still] = await getDb().select({ type: channels.type }).from(channels).where(eq(channels.id, channel.id));
   assert.equal(still?.type, "private");
 
@@ -603,5 +603,5 @@ test("an agent cannot make a channel with a Guest public: 409 external_members_k
   await getDb().delete(channelHumans).where(and(eq(channelHumans.channelId, channel.id), eq(channelHumans.userId, guest.id)));
   await getDb().delete(serverMembers).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, guest.id)));
   const allowed = await updateChannelForAgent({ actor, serverId: server.id, channelId: channel.id, body: { visibility: "public" } });
-  assert.equal(allowed.status, 200, JSON.stringify(allowed.body));
+  assert.equal(allowed.status, 200, JSON.stringify(allowed));
 });

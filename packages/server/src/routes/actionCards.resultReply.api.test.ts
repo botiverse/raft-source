@@ -20,6 +20,9 @@ import { AgentOrchestrator } from "../services/agentOrchestrator";
 import { prepareActionCard } from "../services/actionCardsService";
 import { __setExternalAgentInboxChainSelectorForTests } from "../services/messageService";
 import { referenceAgentInboxChain } from "../test/agentInboxChainReference";
+import { enableTaskV2ConversationsForServer } from "../test/integration/taskV2Flag";
+import { createTasks } from "../services/taskService";
+import { ensureTaskConversation } from "../services/taskConversationService";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
@@ -69,6 +72,22 @@ function installRecordingOrchestrator(app: { set: (key: string, value: unknown) 
   return deliveries;
 }
 
+type EmittedEvent = { room: string; event: string; payload: { parentMessageId?: string; threadChannelId?: string; replyCount?: number; latestReply?: { id?: string } } };
+
+function installFakeIo(app: { set: (key: string, value: unknown) => void }): EmittedEvent[] {
+  const events: EmittedEvent[] = [];
+  const joiner = { socketsJoin(_room: string) {} };
+  app.set("io", {
+    to(room: string) {
+      return { emit(event: string, payload: unknown) { events.push({ room, event, payload: payload as EmittedEvent["payload"] }); } };
+    },
+    in() {
+      return { ...joiner, in: () => joiner };
+    },
+  });
+  return events;
+}
+
 async function findResultReply(agentName: string, threadChannelId?: string) {
   const rows = await getDb().select().from(messages).where(eq(messages.systemSubtype, "action_card.result_reply"));
   return rows.filter((row) => row.content.startsWith(`@${agentName} `) && (!threadChannelId || row.channelId === threadChannelId));
@@ -92,6 +111,7 @@ test("a managed preparer gets an unread @mention reply in the card thread when i
   const agent = await createAgent(server.id, "card-reply-agent", { runtime: "claude" });
   await channelService.addAgent(channel.id, agent.id);
   const deliveries = installRecordingOrchestrator(app.app);
+  const events = installFakeIo(app.app);
   const token = await tokenForHuman(owner.email);
 
   const card = await prepareActionCard({
@@ -110,6 +130,16 @@ test("a managed preparer gets an unread @mention reply in the card thread when i
   assert.match(reply.content, new RegExp(`executed by @${owner.name} on Card Reply`));
   assert.match(reply.content, /created channel #card-reply-created/);
   assert.match(reply.content, new RegExp(card.messageId.slice(0, 8)));
+  // Open pages see the card's reply count change without a reload.
+  const summary = events.find((event) =>
+    event.event === "thread:updated"
+    && event.room === `channel:${channel.id}`
+    && event.payload.latestReply?.id === reply.id
+  );
+  assert.ok(summary, "the result reply emits thread:updated to the card's channel");
+  assert.equal(summary.payload.parentMessageId, card.messageId);
+  assert.equal(summary.payload.threadChannelId, thread.id);
+  assert.ok((summary.payload.replyCount ?? 0) >= 1);
 
   const [agentFact] = await db.select().from(inboxNotificationFacts).where(and(
     eq(inboxNotificationFacts.messageId, reply.id),
@@ -258,4 +288,51 @@ test("a member can confirm an action card prepared inside a Joint thread", async
 
   const executed = await execute(app.baseUrl, messageId, peerToken, peerServer.id);
   assert.equal(executed.status, 200, await executed.clone().text());
+});
+
+// #wg-rbac:#105: a card asked in a task conversation was answered in a new
+// thread on the card message, nested under the conversation and followed by
+// nobody. The reply belongs in the task conversation itself, like a thread carrier's.
+test("a card asked in a task conversation gets its result reply in that conversation, not in a nested thread", async ({ app }) => {
+  const db = getDb();
+  const owner = await seedUser("card-task-owner");
+  const server = await createServer("Card Task", `card-task-${randomUUID().slice(0, 8)}`, owner.id);
+  const channel = await channelService.createChannel(server.id, "card-task-room");
+  await channelService.addHuman(channel.id, owner.id);
+  const agent = await createAgent(server.id, "card-task-agent", { runtime: "claude" });
+  await channelService.addAgent(channel.id, agent.id);
+  await enableTaskV2ConversationsForServer(server.id);
+  const created = await createTasks(channel.id, "user", owner.id, [{ title: "set up the room" }], { initiatingServerId: server.id });
+  const task = created.tasks[0]!;
+  const conversation = (await ensureTaskConversation(task.id, { initiatingServerId: server.id }))?.conversation;
+  assert.ok(conversation, "the task has a conversation");
+  const conversationId = conversation.canonicalChannelId;
+  const deliveries = installRecordingOrchestrator(app.app);
+  installFakeIo(app.app);
+  const token = await tokenForHuman(owner.email);
+
+  const card = await prepareActionCard({
+    serverId: server.id,
+    requesterAgentId: agent.id,
+    targetChannelId: conversationId,
+    action: { type: "channel:create", name: "card-task-created", visibility: "public" },
+  });
+  const executed = await execute(app.baseUrl, card.messageId, token, server.id);
+  assert.equal(executed.status, 200, await executed.clone().text());
+
+  const [reply] = await findResultReply(agent.name, conversationId);
+  assert.ok(reply, "the result reply is in the task conversation");
+  const nested = await db.select().from(channels).where(and(eq(channels.type, "thread"), eq(channels.parentMessageId, card.messageId)));
+  assert.equal(nested.length, 0, "no thread is opened on the card message");
+  assert.ok(await channelService.isAgentActivelyFollowingThread(conversationId, agent.id), "the asking agent follows the task conversation");
+  const [agentFact] = await db.select().from(inboxNotificationFacts).where(and(
+    eq(inboxNotificationFacts.messageId, reply.id),
+    eq(inboxNotificationFacts.receiverType, "agent"),
+    eq(inboxNotificationFacts.receiverId, agent.id),
+  ));
+  assert.ok(agentFact, "the asking agent has a durable inbox fact");
+  assert.equal(agentFact.unreadEligible, true, "the reply is unread for the asking agent");
+  const delivered = deliveries.find((delivery) => delivery.agentId === agent.id && delivery.payload.message_id === reply.id);
+  assert.ok(delivered, "the asking agent is woken with the reply");
+  assert.equal(delivered.payload.mentioned, true);
 });

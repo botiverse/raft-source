@@ -2975,7 +2975,6 @@ exports[`each type, prepared and executed > plan:upgrade prepared 1`] = `
           "text": {
             "$msg": "actionCard.upgradeDialog.history.hint",
             "days": 30,
-            "freeServers": 2,
             "monthly": "100 MB",
             "proSingle": "200 MB",
             "server": "Botiverse",

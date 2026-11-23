@@ -11,6 +11,7 @@ import { ArrowLeft, LogIn, UserPlus } from "lucide-react";
 import Banner from "../ui/Banner";
 import { Button, Card, ScrollArea } from "@botiverse/raft-ui";
 import CenteredCardFrame from "./CenteredCardFrame";
+import { OpenInAppOffers } from "../deeplinks/OpenInAppOffers";
 import { AuthPageIntro } from "./AuthPageFrame";
 import AgreementBody from "../server/AgreementBody";
 import { DeploymentUserLimitText } from "../ui/DeploymentUserLimitText";
@@ -239,7 +240,7 @@ export default function InviteAcceptPage({
 
   if (loadingInfo) {
     return (
-      <CenteredCardFrame>
+      <CenteredCardFrame topStrip={<OpenInAppOffers slot="top" />} bottomStrip={<OpenInAppOffers slot="bottom" />}>
         <div className="w-full">
           <AuthPageIntro title={formatMessage({ id: "pages.invite.loadingTitle" })} />
         </div>
@@ -272,7 +273,7 @@ export default function InviteAcceptPage({
   }
 
   return (
-    <CenteredCardFrame>
+    <CenteredCardFrame topStrip={<OpenInAppOffers slot="top" />} bottomStrip={<OpenInAppOffers slot="bottom" />}>
       <div className="w-full">
         {hasError ? (
           <>

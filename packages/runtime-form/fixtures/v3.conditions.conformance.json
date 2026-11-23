@@ -65,6 +65,73 @@
       "expected": false
     },
     {
+      "name": "const boolean on false",
+      "condition": {
+        "scope": "#/properties/flag",
+        "schema": {
+          "const": true
+        }
+      },
+      "data": {
+        "flag": false
+      },
+      "expected": false
+    },
+    {
+      "name": "const boolean on absent value (\"\") is false",
+      "condition": {
+        "scope": "#/properties/flag",
+        "schema": {
+          "const": true
+        }
+      },
+      "data": {},
+      "expected": false
+    },
+    {
+      "name": "not const boolean on false",
+      "condition": {
+        "scope": "#/properties/flag",
+        "schema": {
+          "not": {
+            "const": true
+          }
+        }
+      },
+      "data": {
+        "flag": false
+      },
+      "expected": true
+    },
+    {
+      "name": "not const boolean on absent value",
+      "condition": {
+        "scope": "#/properties/flag",
+        "schema": {
+          "not": {
+            "const": true
+          }
+        }
+      },
+      "data": {},
+      "expected": true
+    },
+    {
+      "name": "not const boolean on true",
+      "condition": {
+        "scope": "#/properties/flag",
+        "schema": {
+          "not": {
+            "const": true
+          }
+        }
+      },
+      "data": {
+        "flag": true
+      },
+      "expected": false
+    },
+    {
       "name": "enum matches",
       "condition": {
         "scope": "#/properties/providerId",

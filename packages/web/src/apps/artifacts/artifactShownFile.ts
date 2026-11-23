@@ -1,6 +1,8 @@
 import { createContext, useContext } from "react";
 import type { ArtifactFile, ArtifactId, ArtifactViewerData } from "@botiverse/raft-shared";
 
+import { cutsAtClipEdge, opensInFrame } from "./artifactDrawnKind";
+
 import { artifactPagePath, artifactUrl } from "./artifactLinks";
 
 /**
@@ -42,6 +44,31 @@ export function useShownFile(data: Pick<ArtifactViewerData, "files">): { file: A
   const { path } = useContext(ArtifactShownFileContext);
   const file = shownFileOf(data.files, path);
   return { file, entry: file === entryFileOf(data.files) };
+}
+
+/**
+ * Whether the page shown can have a block of it picked to comment on: an HTML page in the frame
+ * (ArtifactContent draws the entry by the Artifact's kind, another file by its own). A Markdown
+ * file, a PDF or a file Raft draws itself is commented on by selecting its text, with or without
+ * comment mode, so there the header's Comment button writes on the whole Artifact instead
+ * (#proj-workspace:#323). No data yet: as an HTML page (nothing changes until it is known).
+ */
+export function useShownPicksElements(data: Pick<ArtifactViewerData, "card" | "files"> | null): boolean {
+  const { path } = useContext(ArtifactShownFileContext);
+  if (!data) return true;
+  const file = shownFileOf(data.files, path);
+  if (!file || file === entryFileOf(data.files)) return data.card.kind === "html";
+  return file.kind === "html" && opensInFrame(data.card.kind, file.kind);
+}
+
+/**
+ * Whether the file shown is full-bleed media (an HTML page or a PDF in the frame, an image), cut on a
+ * hard line where a clipped column ends; a Markdown page or text fades (`cutsAtClipEdge`).
+ */
+export function useShownCutsAtClipEdge(data: Pick<ArtifactViewerData, "card" | "files">): boolean {
+  const { path } = useContext(ArtifactShownFileContext);
+  const file = shownFileOf(data.files, path);
+  return cutsAtClipEdge(data.card.kind, file?.kind ?? null, !file || file === entryFileOf(data.files));
 }
 
 /** Asks the viewer for another file of the version (null: the entry). */

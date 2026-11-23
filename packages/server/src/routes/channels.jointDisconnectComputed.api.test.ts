@@ -163,6 +163,7 @@ test("external channels on for the host: its owner can't disconnect the host's c
   assert.equal(refused.status, 403, body);
   assert.deepEqual(JSON.parse(body), {
     code: "host_cannot_disconnect",
+    errorCode: "host_cannot_disconnect",
     error: "The host server can't disconnect from its own channel. Archive the channel instead.",
   }, "the host is told what it can do instead");
   assert.deepEqual(await projectionState(f.hostServer.id, f.hostProjection.id), { status: "active", role: "host", deleted: false }, "the host's copy is untouched");
@@ -184,4 +185,48 @@ test("external channels off: the host's owner can still disconnect the host's co
   assert.equal(disconnected.status, 200, await disconnected.text());
   assert.deepEqual(await projectionState(f.hostServer.id, f.hostProjection.id), { status: "disconnected", role: "host", deleted: true });
   assert.deepEqual(await auditRows("channel.server_disconnected"), [], "the host leaving its own channel is not a participant's disconnect: no event");
+});
+
+test("a channel the caller can't open answers disconnect, joint invite resend and joint invites like a missing id, admins included", async ({ app }) => {
+  const f = await seedComputedJoint(app.baseUrl);
+  const missingId = "00000000-0000-4000-8000-000000000000";
+  const call = async (token: string, serverId: string, path: string, body?: unknown) => {
+    const res = await fetch(`${app.baseUrl}${path}`, {
+      method: "POST",
+      headers: headers(token, serverId),
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+    return { status: res.status, body: await res.json() as unknown };
+  };
+
+  // A private, non-joint channel on the partner server that its plain member is not in.
+  const created = await fetch(`${app.baseUrl}/api/channels`, {
+    method: "POST",
+    headers: headers(f.token.peerOwner, f.peerServer.id),
+    body: JSON.stringify({ name: "jdc-private", visibility: "private" }),
+  });
+  assert.equal(created.status, 200, await created.clone().text());
+  const hiddenId = (await created.json() as { id: string }).id;
+  const inviteBody = { targetServerSlug: f.hostServer.slug, invitedPeople: ["@jdc-host-owner"] };
+  for (const [label, path, body] of [
+    ["disconnect", (id: string) => `/api/channels/${id}/disconnect`, undefined],
+    ["joint invite resend", (id: string) => `/api/channels/${id}/joint-invite/resend`, undefined],
+    ["joint invites", (id: string) => `/api/channels/${id}/joint-invites`, inviteBody],
+  ] as const) {
+    const missing = await call(f.token.peerMember, f.peerServer.id, path(missingId), body);
+    const hidden = await call(f.token.peerMember, f.peerServer.id, path(hiddenId), body);
+    assert.equal(missing.status, 404, `${label}: a missing id is a 404 (${JSON.stringify(missing.body)})`);
+    assert.deepEqual(hidden, missing, `${label}: a hidden non-joint channel must read exactly like a missing id`);
+  }
+
+  // A partner admin who is not in the joint channel and can't open it: disconnect used to answer 500.
+  const admin = await seedUser("jdc-peer-admin@slock.test", "jdc-peer-admin");
+  await addMember(f.peerServer.id, admin.id, "admin");
+  const adminToken = await tokenForHuman(admin.email);
+  const opened = await fetch(`${app.baseUrl}/api/channels/${f.peerProjection.id}`, { headers: headers(adminToken, f.peerServer.id) });
+  assert.equal(opened.status, 404, "fixture: the partner admin can't open the joint channel");
+  const adminMissing = await call(adminToken, f.peerServer.id, `/api/channels/${missingId}/disconnect`);
+  const adminHidden = await call(adminToken, f.peerServer.id, `/api/channels/${f.peerProjection.id}/disconnect`);
+  assert.deepEqual(adminHidden, adminMissing, "an admin who can't open the joint channel reads it like a missing id");
+  assert.deepEqual(await auditRows("channel.server_disconnected"), [], "nothing was disconnected");
 });

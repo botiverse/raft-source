@@ -28,9 +28,10 @@ import {
 } from "../db/schema";
 import { verifyActiveAccessToken } from "../middleware/auth";
 import {
-  claimAccountDeletionEmailCode,
-  consumeAccountDeletionEmailCode,
-  sendAccountDeletionEmailCode,
+  ACCOUNT_DELETION_EMAIL_CODE_FLOW,
+  claimEmailCode,
+  consumeEmailCode,
+  sendEmailCode,
 } from "../services/accountDeletion/emailCode";
 import { cancelAccountDeletion, findOthersAgentsOnComputers, requestAccountDeletion, requestAccountDeletionInTransaction, runAccountDeletionRequestedEffects } from "../services/accountDeletion/requests";
 import { AGENT_OWNER_NOTICE_INTERVAL_MS, notifyAgentOwners } from "../services/accountDeletion/ownerNotices";
@@ -260,25 +261,25 @@ test("email code: single use, expires after 10 minutes, and the second-step lock
   try {
     const familyId = randomUUID();
     const now = new Date();
-    assert.equal((await sendAccountDeletionEmailCode({ userId: human.id, familyId, now })).ok, true);
+    assert.equal((await sendEmailCode(ACCOUNT_DELETION_EMAIL_CODE_FLOW, { userId: human.id, familyId, now })).ok, true);
     const code = /\b(\d{6})\b/.exec(emails.deliveries[0]!.text!)![1]!;
-    const claimed = await claimAccountDeletionEmailCode({ userId: human.id, familyId, code, now });
+    const claimed = await claimEmailCode(ACCOUNT_DELETION_EMAIL_CODE_FLOW, { userId: human.id, familyId, code, now });
     assert.ok(claimed.ok);
-    assert.equal(await getDb().transaction((tx) => consumeAccountDeletionEmailCode(tx, { userId: human.id, challengeId: claimed.challengeId, now })), true);
-    assert.equal(await getDb().transaction((tx) => consumeAccountDeletionEmailCode(tx, { userId: human.id, challengeId: claimed.challengeId, now })), false);
-    assert.deepEqual(await claimAccountDeletionEmailCode({ userId: human.id, familyId, code, now }), { ok: false, reason: "invalid" });
+    assert.equal(await getDb().transaction((tx) => consumeEmailCode(ACCOUNT_DELETION_EMAIL_CODE_FLOW, tx, { userId: human.id, challengeId: claimed.challengeId, now })), true);
+    assert.equal(await getDb().transaction((tx) => consumeEmailCode(ACCOUNT_DELETION_EMAIL_CODE_FLOW, tx, { userId: human.id, challengeId: claimed.challengeId, now })), false);
+    assert.deepEqual(await claimEmailCode(ACCOUNT_DELETION_EMAIL_CODE_FLOW, { userId: human.id, familyId, code, now }), { ok: false, reason: "invalid" });
 
     // A new code, answered 10 minutes later: expired.
     const later = new Date(now.getTime() + 61_000);
-    assert.equal((await sendAccountDeletionEmailCode({ userId: human.id, familyId, now: later })).ok, true);
+    assert.equal((await sendEmailCode(ACCOUNT_DELETION_EMAIL_CODE_FLOW, { userId: human.id, familyId, now: later })).ok, true);
     const second = /\b(\d{6})\b/.exec(emails.deliveries[1]!.text!)![1]!;
-    assert.deepEqual(await claimAccountDeletionEmailCode({ userId: human.id, familyId, code: second, now: new Date(later.getTime() + 10 * 60_000) }), { ok: false, reason: "invalid" });
+    assert.deepEqual(await claimEmailCode(ACCOUNT_DELETION_EMAIL_CODE_FLOW, { userId: human.id, familyId, code: second, now: new Date(later.getTime() + 10 * 60_000) }), { ok: false, reason: "invalid" });
 
     // Locked: refused before the code is looked at.
     const lockedUntil = new Date(later.getTime() + 15 * 60_000);
     await getDb().insert(secondFactorAttemptWindows).values({ userId: human.id, windowStartedAt: later, attempts: 11, lockedUntil })
       .onConflictDoUpdate({ target: secondFactorAttemptWindows.userId, set: { attempts: 11, lockedUntil } });
-    const locked = await claimAccountDeletionEmailCode({ userId: human.id, familyId, code: second, now: later });
+    const locked = await claimEmailCode(ACCOUNT_DELETION_EMAIL_CODE_FLOW, { userId: human.id, familyId, code: second, now: later });
     assert.equal(locked.ok, false);
     assert.equal(!locked.ok && locked.reason, "locked");
   } finally {
@@ -632,7 +633,7 @@ test("a Computer the person attached on someone else's machine: the server's own
   assert.equal(notices.length, 1, JSON.stringify(notices));
   assert.match(
     notices[0]!.content,
-    /^@desk-agent is offline: the computer "borrowed-desk" it runs on was disconnected because the person who set it up is deleting their account\. It stays disconnected even if they cancel\. Someone in this server can set up that machine again \(the agent comes back as it was\), or move the agent to another computer\.\nAgent page: /,
+    /^@desk-agent is offline: the computer "borrowed-desk" it runs on was disconnected because the person who set it up is deleting their account\. It stays disconnected even if they cancel\. Move the agent to another computer to get it running again; it keeps its settings\.\nAgent page: /,
   );
 });
 

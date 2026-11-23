@@ -79,7 +79,7 @@ export async function agentUploadUpgradeHint(input: {
  * The monthly-quota refusal an agent gets: the card offer for the upload's
  * conversation as its next action where there is one (and the client can post
  * it), else the billing line (say why the file wasn't uploaded; a server owner
- * can look at Settings > Billing).
+ * can look at Settings > Plan & billing).
  */
 export async function agentFileUploadQuotaExceededResponse(
   input: { serverId: string; agentId: string; channelId: string | undefined; capabilities: string | undefined },

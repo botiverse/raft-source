@@ -162,8 +162,7 @@ export function sidebarMoveToCustomSectionUpdate(
 
 /**
  * Back to the item's home section: drop its placement and its pin, writing
- * only what changes (Remove from Section writes only the placements). Empty
- * when it is already home.
+ * only what changes. Empty when it is already home.
  */
 export function sidebarMoveToHomeUpdate(
   state: SidebarPlacementState,

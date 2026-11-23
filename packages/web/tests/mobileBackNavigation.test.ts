@@ -166,3 +166,4 @@ test("index-keyed records: a multi-entry POP or Forward lands at its real index;
   assert.deepEqual(resolveMobileBackAction(navigationStackFromEntries(afterReload, 2), "/s/dev"), { kind: "fallback", path: "/s/dev" });
   assert.deepEqual(resolveMobileBackAction(navigationStackFromEntries(afterReload, 2), "/"), { kind: "fallback", path: "/" });
 });
+

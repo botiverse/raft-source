@@ -3,21 +3,11 @@ import { useIntl } from "react-intl";
 import { Bell, Check } from "lucide-react";
 import { useAppNavigate } from "../../hooks/useAppNavigate";
 import {
-  ensurePushSubscriptionIfAllowed,
   getPushPermissionState,
-  isPushSubscribed,
   recordWebPushPromptEvent,
-  rememberedPushEndpoint,
 } from "../../utils/pushNotifications";
-import {
-  buildPushSubscribeFailure,
-  clearPushSubscribeFailure,
-  pushSubscribeFailureDetail,
-  readPushSubscribeFailure,
-  rememberPushSubscribeFailure,
-  shouldAutoRetryPushSubscribe,
-} from "../../utils/pushSubscribeFailure";
-import { enablePushAndRecord } from "../../utils/pushEnableRecording";
+import { clearPushSubscribeFailure } from "../../utils/pushSubscribeFailure";
+import { autoResubscribeAndRecord, enablePushAndRecord } from "../../utils/pushEnableRecording";
 import Banner from "../ui/Banner";
 import { Button, TextLink } from "@botiverse/raft-ui";
 import type { MessageId } from "../../i18n/messages";
@@ -131,43 +121,8 @@ export default function NotificationActivationBanner({
 
     reconcileInFlightRef.current = true;
     try {
-      if (!(await isPushSubscribed())) {
-        // A re-subscribe that already failed here is not retried (or re-logged)
-        // on every focus: only once permission, the endpoint or the app
-        // version changed, the backoff passed, or the user pressed Enable.
-        if (!shouldAutoRetryPushSubscribe({ permission: "granted", endpoint: rememberedPushEndpoint() })) return;
-        // The automatic path: never re-subscribes a browser the user disabled
-        // push in (design §8); only the Enable button below clears that.
-        const result = await ensurePushSubscriptionIfAllowed();
-        if (result === "opted_out") return;
-        const failure = result === "unavailable" || result === "error" ? readPushSubscribeFailure() : null;
-        void recordWebPushPromptEvent({
-          event: result === "granted"
-            ? "web_push_subscription_saved"
-            : "web_push_subscription_failed",
-          trigger: AUTO_RESOLVE_TRIGGER,
-          result,
-          permissionBefore: "granted",
-          permissionAfter: getPushPermissionState(),
-          ...(failure ? { detail: pushSubscribeFailureDetail(failure) } : {}),
-        });
-      }
-    } catch (err) {
-      const failure = buildPushSubscribeFailure({
-        kind: "unexpected",
-        error: err,
-        permission: "granted",
-        endpoint: rememberedPushEndpoint(),
-      });
-      rememberPushSubscribeFailure(failure);
-      void recordWebPushPromptEvent({
-        event: "web_push_subscription_failed",
-        trigger: AUTO_RESOLVE_TRIGGER,
-        result: "error",
-        permissionBefore: "granted",
-        permissionAfter: getPushPermissionState(),
-        detail: pushSubscribeFailureDetail(failure),
-      });
+      // Retried only when the guard allows it, one tab at a time (Web Locks).
+      await autoResubscribeAndRecord(AUTO_RESOLVE_TRIGGER);
     } finally {
       setPermission(getPushPermissionState());
       reconcileInFlightRef.current = false;

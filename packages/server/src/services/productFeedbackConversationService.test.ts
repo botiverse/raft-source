@@ -965,3 +965,385 @@ test("a background read marks nothing read, mints a session of its own outside t
   await background();
   await getProductFeedbackTicket({ userId: USER, reporterId: "reporter-a-opaque", ticketId: TICKET, commentLimit: 50, env: SESSION_ENV, now: () => now, fetchImpl });
 });
+
+// Reads go once more, on a fresh connection, after a lost first try (11-15
+// incident: ~5% of reads never got an answer and hit the 5 s bound).
+
+type FetchCall = { url: string; init: RequestInit | undefined };
+
+function timeoutError(): Error {
+  return new DOMException("The operation was aborted due to timeout", "TimeoutError");
+}
+
+function networkError(code = "UND_ERR_SOCKET"): Error {
+  return new TypeError("fetch failed", { cause: Object.assign(new Error("other side closed"), { code }) });
+}
+
+async function traced<T>(work: () => Promise<T>): Promise<{ result: T | Error; spans: Array<Record<string, unknown>> }> {
+  const { BasicTracer, MemoryTraceSink } = await import("@botiverse/raft-shared");
+  const { runWithTraceSpan } = await import("../tracing/semanticTrace");
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink });
+  const request = tracer.startSpan("server.http.request", { surface: "server", kind: "server" });
+  let result: T | Error;
+  try {
+    result = await runWithTraceSpan(request, work, tracer);
+  } catch (error) {
+    result = error as Error;
+  }
+  request.end("ok");
+  const spans = sink.getAllSpans()
+    .filter((span) => span.name === "server.product_feedback.hands_request")
+    .map((span) => ({ ...span.attrs }));
+  return { result, spans };
+}
+
+function listWith(fetchImpl: typeof fetch, now?: () => number) {
+  return listProductFeedbackTickets({ userId: USER, reporterId: "opaque-reporter", limit: 20, env: ENV, fetchImpl, now });
+}
+
+test("a read whose first try times out goes again on a fresh connection and answers, and the breaker counts no failure", async () => {
+  resetProductFeedbackBreakersForTest();
+  const calls: FetchCall[] = [];
+  let failFirst = true;
+  let failBoth = false;
+  const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), init });
+    if (failBoth || (failFirst && calls.length % 2 === 1)) throw timeoutError();
+    return listResponse();
+  }) as typeof fetch;
+
+  const { result, spans } = await traced(() => listWith(fetchImpl));
+  assert.ok(!(result instanceof Error), "the retry's answer is the read's answer");
+  assert.equal(calls.length, 2);
+  const { Agent } = await import("undici");
+  assert.equal((calls[0].init as { dispatcher?: unknown }).dispatcher, undefined, "the first try uses the shared pool");
+  assert.ok((calls[1].init as { dispatcher?: unknown }).dispatcher instanceof Agent, "the retry uses a dispatcher of its own");
+  assert.equal(calls[1].url, calls[0].url);
+  assert.equal(new Headers(calls[1].init?.headers).get("X-Hands-Reporter-Id"), "opaque-reporter");
+  assert.ok(calls[1].init?.signal instanceof AbortSignal && !calls[1].init.signal.aborted, "the retry stays bounded");
+
+  assert.equal(spans.length, 2);
+  assert.equal(spans[0].attempt, 1);
+  assert.equal(spans[0].retry_used, false);
+  assert.equal(spans[0].fresh_connection, false);
+  assert.equal(spans[0].attempt_timeout_ms, 3_000);
+  assert.equal(spans[0].reason, "timeout");
+  assert.equal(spans[0].retry_decision, "retry");
+  assert.equal(spans[1].attempt, 2);
+  assert.equal(spans[1].retry_used, true);
+  assert.equal(spans[1].fresh_connection, true);
+  assert.equal(spans[1].first_attempt_reason, "timeout");
+  assert.equal(typeof spans[1].first_attempt_ms, "number");
+  assert.equal(spans[1].upstream_status, 200);
+
+  // The breaker saw one success and no failure: the next read that fails on
+  // both tries is its first failure, counted once.
+  failBoth = true;
+  calls.length = 0;
+  await assert.rejects(listWith(fetchImpl), (error) => (
+    error instanceof ProductFeedbackConversationError
+    && error.status === 503
+    && error.code === "feedback_service_unavailable"
+    && error.diagnostic.stage === "upstream_transport"
+    && error.diagnostic.breakerFailures === 1
+  ));
+  assert.equal(calls.length, 2, "one retry, no more");
+});
+
+test("a read that fails on both tries is one 503 and one breaker failure", async () => {
+  resetProductFeedbackBreakersForTest();
+  let calls = 0;
+  const fetchImpl = (async () => {
+    calls += 1;
+    throw calls % 2 === 1 ? networkError("ECONNRESET") : timeoutError();
+  }) as typeof fetch;
+  const failures: Array<number | null> = [];
+  for (let index = 0; index < 3; index += 1) {
+    const { result, spans } = await traced(() => listWith(fetchImpl));
+    assert.ok(result instanceof ProductFeedbackConversationError);
+    assert.equal(result.code, "feedback_service_unavailable");
+    failures.push(result.diagnostic.breakerFailures);
+    assert.deepEqual(spans.map((span) => [span.attempt, span.reason]), [[1, "network_ECONNRESET"], [2, "timeout"]]);
+    assert.equal(spans[1].first_attempt_reason, "network_ECONNRESET");
+  }
+  assert.deepEqual(failures, [1, 2, 3]);
+  assert.equal(calls, 6);
+  await assert.rejects(listWith(fetchImpl), (error) => (
+    error instanceof ProductFeedbackConversationError && error.diagnostic.stage === "breaker_open"
+  ));
+  assert.equal(calls, 6);
+});
+
+test("a read retries only within its budget: under a second left, the first failure stands", async () => {
+  resetProductFeedbackBreakersForTest();
+  let nowMs = 1_700_000_000_000;
+  let calls = 0;
+  const fetchImpl = (async () => {
+    calls += 1;
+    nowMs += 4_100;
+    throw networkError("ECONNRESET");
+  }) as typeof fetch;
+  const { result, spans } = await traced(() => listWith(fetchImpl, () => nowMs));
+  assert.ok(result instanceof ProductFeedbackConversationError);
+  assert.equal(result.diagnostic.breakerFailures, 1);
+  assert.equal(calls, 1);
+  assert.equal(spans.length, 1);
+  assert.equal(spans[0].retry_decision, "budget_exhausted");
+});
+
+test("an HTTP answer, a non-network error, a caller's abort, a write or an attachment never retries", async () => {
+  // An HTTP 5xx is an answer.
+  resetProductFeedbackBreakersForTest();
+  let calls = 0;
+  await assert.rejects(listWith((async () => {
+    calls += 1;
+    return new Response("no", { status: 503 });
+  }) as typeof fetch), (error) => (
+    error instanceof ProductFeedbackConversationError && error.diagnostic.stage === "upstream_response"
+  ));
+  assert.equal(calls, 1, "5xx");
+
+  // An error without a connection-level code (not a lost connection).
+  calls = 0;
+  await assert.rejects(listWith((async () => {
+    calls += 1;
+    throw new TypeError("fetch failed");
+  }) as typeof fetch), ProductFeedbackConversationError);
+  assert.equal(calls, 1, "request_failed");
+
+  // The caller's abort.
+  resetProductFeedbackBreakersForTest();
+  const controller = new AbortController();
+  calls = 0;
+  const { result, spans } = await traced(() => getProductFeedbackTicket({
+    userId: USER, reporterId: "opaque-reporter", ticketId: TICKET, commentLimit: 50,
+    background: { signal: controller.signal }, env: ENV,
+    fetchImpl: (async () => {
+      calls += 1;
+      controller.abort();
+      throw new DOMException("This operation was aborted", "AbortError");
+    }) as typeof fetch,
+  }));
+  assert.ok(result instanceof ProductFeedbackConversationError);
+  assert.equal(calls, 1, "caller abort");
+  assert.equal(spans[0].retry_decision, "caller_aborted");
+
+  // A write (close, POST).
+  resetProductFeedbackBreakersForTest();
+  calls = 0;
+  await assert.rejects(closeProductFeedbackTicket({
+    reporterId: "opaque-reporter", ticketId: TICKET, reason: "completed", env: ENV,
+    fetchImpl: (async () => {
+      calls += 1;
+      throw networkError("ECONNRESET");
+    }) as typeof fetch,
+  }), ProductFeedbackConversationError);
+  assert.equal(calls, 1, "write");
+
+  // An attachment download (a GET, but its own operation with its own bound).
+  resetProductFeedbackBreakersForTest();
+  calls = 0;
+  await assert.rejects(getProductFeedbackAttachment({
+    userId: USER, reporterId: "opaque-reporter", ticketId: TICKET, attachmentId: TICKET, env: ENV,
+    fetchImpl: (async () => {
+      calls += 1;
+      throw networkError("ECONNRESET");
+    }) as typeof fetch,
+  }), ProductFeedbackConversationError);
+  assert.equal(calls, 1, "attachment");
+});
+
+test("a background read retries a lost connection inside the caller's own signal, never past it", async () => {
+  resetProductFeedbackBreakersForTest();
+  const signal = AbortSignal.timeout(5_000);
+  const calls: FetchCall[] = [];
+  const detail = await getProductFeedbackTicket({
+    userId: USER, reporterId: "opaque-reporter", ticketId: TICKET, commentLimit: 50,
+    background: { signal }, env: ENV,
+    fetchImpl: (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init });
+      if (calls.length === 1) throw networkError("ECONNRESET");
+      return Response.json({ ticket: ticket(), comments: [], attachments: [], next_comment_cursor: null, unread_total: 0 });
+    }) as typeof fetch,
+  });
+  assert.equal(detail.ticket.id, TICKET);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].init?.signal, signal, "no share of its own: the caller's signal bounds the first try");
+  assert.equal(calls[1].init?.signal, signal, "and the retry");
+});
+
+test("the retry opens a new connection over real sockets and closes it after the answer", async () => {
+  resetProductFeedbackBreakersForTest();
+  const { createServer } = await import("node:http");
+  const sockets: Array<{ closed: boolean }> = [];
+  let requests = 0;
+  const server = createServer((req, res) => {
+    requests += 1;
+    // The first request dies with its connection, as on a dead pooled socket.
+    if (requests === 1) {
+      req.socket.destroy();
+      return;
+    }
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ tickets: [], next_cursor: null, unread_total: 0 }));
+  });
+  server.on("connection", (socket) => {
+    const entry = { closed: false };
+    sockets.push(entry);
+    socket.on("close", () => { entry.closed = true; });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const port = (server.address() as { port: number }).port;
+    const { result, spans } = await traced(() => listProductFeedbackTickets({
+      userId: USER, reporterId: "opaque-reporter", limit: 20, env: { ...ENV, HANDS_FEEDBACK_BASE_URL: `http://127.0.0.1:${port}` },
+    }));
+    assert.ok(!(result instanceof Error), String(result));
+    assert.equal(requests, 2);
+    // Two sockets only shows the retry did not ride the first one (which died);
+    // the proof that keep-alive is off for it is sockets[1] closing below.
+    assert.equal(sockets.length, 2, "the retry did not reuse the first connection");
+    assert.equal(spans[0].reason, "network_UND_ERR_SOCKET");
+    assert.equal(spans[1].attempt, 2);
+    assert.equal(typeof spans[1].connect_ms, "number");
+    for (let index = 0; index < 50 && !sockets[1].closed; index += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(sockets[1].closed, true, "the retry's connection is not kept alive");
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a read's first try that gets no answer is cut at 3 s of its 5 s budget and goes again", async () => {
+  resetProductFeedbackBreakersForTest();
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const signals: AbortSignal[] = [];
+    const read = listWith((async (_url: string | URL | Request, init?: RequestInit) => {
+      const signal = init?.signal as AbortSignal;
+      signals.push(signal);
+      if (signals.length > 1) return listResponse();
+      // A request lost on the way: no answer until the try is aborted.
+      return new Promise<Response>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    }) as typeof fetch);
+    await vi.advanceTimersByTimeAsync(2_999);
+    assert.equal(signals.length, 1);
+    assert.equal(signals[0].aborted, false);
+    await vi.advanceTimersByTimeAsync(1);
+    assert.equal(signals[0].aborted, true);
+    await read;
+    assert.equal(signals.length, 2);
+    assert.equal(signals[1].aborted, false, "the retry runs in the rest of the read's budget");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("a background read given Node's fetch (as the unread reconcile passes it) retries over undici's own fetch with its agent", async () => {
+  resetProductFeedbackBreakersForTest();
+  const { createServer } = await import("node:http");
+  const sockets: Array<{ closed: boolean }> = [];
+  let requests = 0;
+  const server = createServer((req, res) => {
+    requests += 1;
+    if (requests === 1) {
+      req.socket.destroy();
+      return;
+    }
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ ticket: ticket(), comments: [], attachments: [], next_comment_cursor: null, unread_total: 0 }));
+  });
+  server.on("connection", (socket) => {
+    const entry = { closed: false };
+    sockets.push(entry);
+    socket.on("close", () => { entry.closed = true; });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const nodeFetch = globalThis.fetch;
+  let nodeFetchCalls = 0;
+  const spiedNodeFetch = ((...args: Parameters<typeof fetch>) => {
+    nodeFetchCalls += 1;
+    return nodeFetch(...args);
+  }) as typeof fetch;
+  globalThis.fetch = spiedNodeFetch;
+  try {
+    const port = (server.address() as { port: number }).port;
+    const { result, spans } = await traced(() => getProductFeedbackTicket({
+      userId: USER, reporterId: "opaque-reporter", ticketId: TICKET, commentLimit: 50,
+      background: { signal: AbortSignal.timeout(5_000) },
+      env: { ...ENV, HANDS_FEEDBACK_BASE_URL: `http://127.0.0.1:${port}` },
+      fetchImpl: globalThis.fetch,
+    }));
+    assert.ok(!(result instanceof Error), String(result));
+    assert.equal(requests, 2);
+    assert.equal(nodeFetchCalls, 1, "only the first try goes through Node's fetch");
+    assert.equal(spans[1].attempt, 2);
+    assert.equal(typeof spans[1].connect_ms, "number", "the retry connected through the agent's own connector");
+    for (let index = 0; index < 50 && !sockets[1]?.closed; index += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(sockets[1]?.closed, true, "the retry's connection is not kept alive");
+  } finally {
+    globalThis.fetch = nodeFetch;
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a retry answered 401 drops the reporter session and the route binding, once each", async () => {
+  resetProductFeedbackBreakersForTest();
+  resetProductFeedbackReporterSessionCacheForTest();
+  resetProductFeedbackRouteBindingCacheForTest();
+  const env = { ...BOUND_ENV, HANDS_FEEDBACK_CONVERSATION_SESSION_ENABLED: "true" } as NodeJS.ProcessEnv;
+  let puts = 0;
+  let mints = 0;
+  let reads = 0;
+  const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+    const target = String(url);
+    if (init?.method === "PUT" && target.endsWith("/reporter-feedback/route-subject")) {
+      puts += 1;
+      return Response.json({ changed: false, subject_version: "v1" }, { status: 200 });
+    }
+    if (target.endsWith("/reporter-feedback/session")) {
+      mints += 1;
+      return Response.json({
+        session_token: `hrps_v1_session-${mints}`,
+        expires_at: Math.floor(Date.now() / 1_000) + 60,
+        reporter_integration_id: INTEGRATION,
+        scopes: ["feedback:comment", "feedback:read"],
+      }, { status: 201 });
+    }
+    reads += 1;
+    if (reads === 1) throw networkError("ECONNRESET");
+    return listResponse();
+  }) as typeof fetch;
+  const retries: RequestInit[] = [];
+  const freshAttemptFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    retries.push(init as RequestInit);
+    return new Response("no", { status: 401 });
+  }) as typeof fetch;
+  const bind = () => ensureProductFeedbackRouteBinding({ userId: USER, env, fetchImpl, executor: committedRoot });
+  const { reporterId } = await bind();
+  await assert.rejects(
+    listProductFeedbackTickets({ userId: USER, reporterId, limit: 20, env, fetchImpl, freshAttemptFetch }),
+    (error) => error instanceof ProductFeedbackConversationError
+      && error.code === "feedback_integration_unavailable"
+      && error.diagnostic.upstreamStatus === 401
+      && error.diagnostic.breakerFailures === 1,
+  );
+  assert.equal(reads, 1, "the retry went through freshAttemptFetch, not fetchImpl");
+  assert.equal(retries.length, 1);
+  const { Agent } = await import("undici");
+  assert.ok((retries[0] as { dispatcher?: unknown }).dispatcher instanceof Agent);
+  assert.equal(mints, 1);
+
+  await bind();
+  assert.equal(puts, 2, "the route binding was forgotten, so it binds again (once)");
+  await bind();
+  assert.equal(puts, 2);
+  await listProductFeedbackTickets({ userId: USER, reporterId, limit: 20, env, fetchImpl });
+  assert.equal(mints, 2, "the rejected session was dropped, so the next read mints a new one");
+  await listProductFeedbackTickets({ userId: USER, reporterId, limit: 20, env, fetchImpl });
+  assert.equal(mints, 2, "and caches it again");
+});

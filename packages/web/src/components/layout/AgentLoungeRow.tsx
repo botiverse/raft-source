@@ -16,6 +16,8 @@ import { getDmUnreadIndicatorState } from "../../utils/channelUnreadIndicator";
 import { LoungeAvatar } from "../agent/LoungeAvatar";
 import { QuietUnreadDot } from "./QuietUnreadDot";
 import { SidebarActivityMutedMark } from "../../features/sidebar/rows/SidebarActivityMutedMark";
+import { SidebarBrowserInUseMark } from "../../features/sidebar/rows/SidebarBrowserInUseMark";
+import type { SidebarBrowserInUse } from "../../features/sidebar/rows/SidebarBrowserInUseMark";
 import type { SidebarCtxKind, SidebarLongPress } from "../../features/sidebar/sidebarContextMenu";
 
 /**
@@ -47,6 +49,7 @@ export const AgentLoungeRow = memo(function AgentLoungeRow({
   onSelect,
   onContextMenu,
   makeLongPress,
+  browserInUse = null,
 }: {
   channelId: string;
   agentId: string;
@@ -60,6 +63,8 @@ export const AgentLoungeRow = memo(function AgentLoungeRow({
   onSelect: (channelId: string) => void;
   onContextMenu: (e: React.MouseEvent, type: SidebarCtxKind, id: string) => void;
   makeLongPress: (type: SidebarCtxKind, id: string) => SidebarLongPress;
+  /** The built-in browser's kept pages of this Lounge use a device or play sound; never for the one on screen (stable object: memo). */
+  browserInUse?: SidebarBrowserInUse | null;
 }) {
   const { formatMessage } = useIntl();
   const liveUnread = useMessageStore((s) => s.unreadCounts[channelId]);
@@ -105,6 +110,8 @@ export const AgentLoungeRow = memo(function AgentLoungeRow({
           </SidebarItemIndicator>
         </Tooltip>
       )}
+      {/* After the name and the @, before the count / dot: as a channel row's. */}
+      <SidebarBrowserInUseMark inUse={browserInUse} />
       {unread > 0 ? (
         <UnreadCount className="ml-auto" data-testid="sidebar-lounge-unread">
           {capUnread(unread)}

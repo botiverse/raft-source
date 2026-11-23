@@ -47,7 +47,8 @@ import {
   withChannelConversionResourceTryLock
 } from "./channelConversionFenceService";
 import { ChannelConversionBusyError, ChannelConversionError, conversionTraceAttrs, stableStringify, stateForLegacyPhase, type ChannelConversionJob, type ChannelConversionPhase } from "./channelConversionPhaseContext";
-import { assertNoActiveAttachmentTransfers, carryTaskNumberHighWater, ChannelConversionUploadsInFlightError, moveParentMessages, moveThreadMessages, prepare, prepareExternalBindingsForChannelConversion, prepareTasks, prepareThreads, verify } from "./channelConversionPreparation";
+import { assertNoActiveAttachmentTransfers, carryTaskNumberHighWater, ChannelConversionUploadsInFlightError, moveParentMessages, moveThreadMessages, prepare, prepareExternalBindingsForChannelConversion, OnlineMoveStartBudget, OnlineMoveStartBudgetExceededError, prepareOnlineMove, prepareTasks, prepareThreads, verify } from "./channelConversionPreparation";
+import { CHANNEL_CONVERSION_ONLINE_MOVE_FEATURE_FLAG_KEY, evaluateFeatureFlag } from "./featureFlagService";
 import { restoreConversionResources } from "./channelConversionResources";
 import { lockJointUsersFirst } from "./jointHumanMembershipMirror";
 import { addTraceEvent, errorClassOf } from "../tracing/semanticTrace";
@@ -69,6 +70,7 @@ export type ChannelConversionPreJobPhase =
   | "active_job_check"
   | "eligibility_check"
   | "upload_check"
+  | "scope_size_check"
   | "source_lock"
   | "job_insert";
 type ChannelConversionEligibilitySubcheck = "direct_task" | "thread_task";
@@ -83,6 +85,8 @@ export type ChannelConversionPreJobTrace = (event: {
 const conversionBusy = (cause: unknown) => new ChannelConversionBusyError({ cause });
 const NEXT_PHASE: Record<Exclude<ChannelConversionPhase, "done">, ChannelConversionPhase> = {
   prepare: "prepare_tasks",
+  // The online start prepares inline and stays here; its mover and switch come later.
+  online_move: "online_move",
   prepare_tasks: "move_parent_messages",
   move_parent_messages: "prepare_threads",
   prepare_threads: "move_thread_messages",
@@ -122,6 +126,7 @@ export function describeChannelConversionPreJobFailure(phase: ChannelConversionP
     active_job_check: "checking for an existing conversion job",
     eligibility_check: "checking whether the channel contains tasks",
     upload_check: "checking whether attachment uploads have finished",
+    scope_size_check: "counting the channel's threads and task conversations",
     source_lock: "reserving the source channel",
     job_insert: "creating the conversion job",
   };
@@ -144,6 +149,110 @@ export function describeChannelConversionPreJobFailure(phase: ChannelConversionP
  * restored job ask again under the conversion resource lock, which a Guest's
  * acceptance takes too (shared, via withChannelWriterFence) before binding.
  */
+/**
+ * The most threads and task conversations a channel may have and still be
+ * converted (slock issue 15637). Each one becomes two conversations in the
+ * conversion's scope (its local projection and its canonical copy), and the
+ * cutover statements grow with that scope: the 2026-11-19 incident channel
+ * (331 threads, 28 task conversations: 720 scope ids) timed out every
+ * audience cutover. Tenny's starting number; not measured on staging.
+ */
+export const CHANNEL_CONVERSION_MAX_SUBCONVERSATIONS = 100;
+
+/**
+ * The most messages (any state: a rollback moves every row) the channel and
+ * its threads and task conversations may hold and still be converted. A
+ * rollback moves each one back, and each move fires two row triggers
+ * (message_server_timeline_on_update, messages_follow_parent_channel_id).
+ * Derived, not measured: the incident's cancel moved 4,048 messages in 4m23s,
+ * about 65 ms a message, so 15 s of statement_timeout fits about 230; 150
+ * leaves about a third spare (Ray; Tenny decided, #wg-rbac:#100). That rate
+ * is an upper bound (it includes the rest of the rollback). Raise it with
+ * PR 3's batched rollback, or a staging measurement.
+ */
+export const CHANNEL_CONVERSION_MAX_MESSAGES = 150;
+
+export interface ConversionScopeSize {
+  /** Threads and task conversations, counted up to one past their limit (0 when the messages alone are over). */
+  subconversations: number;
+  /** Messages in the source and those conversations, counted up to one past their limit. */
+  messages: number;
+}
+
+/**
+ * The scope's size in bounded index probes, so a quiet channel costs as little
+ * as a busy one (no OR / IN-subquery the planner could turn into a scan of
+ * messages). First the source's own messages (idx_messages_channel_seq, at
+ * most limit + 1 rows); over the limit, nothing else is read. Then its threads
+ * through its at most 150 parent messages (idx_channels_parent_message) and its
+ * task conversations (idx_channels_task_parent_channel), at most limit + 1
+ * together; then each one's messages, one LATERAL probe per id, the total
+ * stopping at the message limit + 1.
+ */
+export async function measureConversionScope(executor: DatabaseExecutor, sourceChannelId: string): Promise<ConversionScopeSize> {
+  const messageCap = CHANNEL_CONVERSION_MAX_MESSAGES + 1;
+  const own = await executor.execute(sql`
+    SELECT count(*)::int AS count FROM (
+      SELECT 1 FROM ${messages} WHERE channel_id = ${sourceChannelId} LIMIT ${messageCap}
+    ) bounded`);
+  const ownMessages = Number((own.rows[0] as { count?: unknown } | undefined)?.count ?? 0);
+  if (ownMessages > CHANNEL_CONVERSION_MAX_MESSAGES) return { subconversations: 0, messages: ownMessages };
+
+  const scope = await executor.execute(sql`
+    (SELECT thread_channel.id::text AS id
+       FROM ${messages} parent_message
+       JOIN ${channels} thread_channel
+         ON thread_channel.parent_message_id = parent_message.id
+        AND thread_channel.type = 'thread'
+        AND thread_channel.deleted_at IS NULL
+      WHERE parent_message.channel_id = ${sourceChannelId})
+    UNION ALL
+    (SELECT task_conversation.id::text
+       FROM ${channels} task_conversation
+      WHERE task_conversation.parent_channel_id = ${sourceChannelId}
+        AND task_conversation.type = 'task'
+        AND task_conversation.deleted_at IS NULL)
+    LIMIT ${CHANNEL_CONVERSION_MAX_SUBCONVERSATIONS + 1}`);
+  const scopeIds = (scope.rows as Array<{ id?: unknown }>).flatMap((row) => typeof row.id === "string" ? [row.id] : []);
+  if (scopeIds.length > CHANNEL_CONVERSION_MAX_SUBCONVERSATIONS || scopeIds.length === 0) {
+    return { subconversations: scopeIds.length, messages: ownMessages };
+  }
+  const nested = await executor.execute(sql`
+    SELECT count(*)::int AS count FROM (
+      SELECT 1
+        FROM unnest(${sql.raw("ARRAY[")}${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)}${sql.raw("]")}) AS scope(id)
+        CROSS JOIN LATERAL (
+          SELECT 1 FROM ${messages} scoped WHERE scoped.channel_id = scope.id LIMIT ${messageCap}
+        ) probe
+       LIMIT ${messageCap}
+    ) bounded`);
+  const nestedMessages = Number((nested.rows[0] as { count?: unknown } | undefined)?.count ?? 0);
+  return { subconversations: scopeIds.length, messages: Math.min(ownMessages + nestedMessages, messageCap) };
+}
+
+/** Refuses, before the source is fenced, a channel too large to convert today. */
+export async function assertConversionScopeWithinLimit(executor: DatabaseExecutor, sourceChannelId: string): Promise<void> {
+  const size = await measureConversionScope(executor, sourceChannelId);
+  const tooMany = size.subconversations > CHANNEL_CONVERSION_MAX_SUBCONVERSATIONS
+    ? `more than ${CHANNEL_CONVERSION_MAX_SUBCONVERSATIONS} threads and task conversations`
+    : size.messages > CHANNEL_CONVERSION_MAX_MESSAGES
+      ? `more than ${CHANNEL_CONVERSION_MAX_MESSAGES} messages`
+      : null;
+  if (!tooMany) return;
+  // Counts only (each capped one past its limit): how many real conversions the limit turns away.
+  addTraceEvent("server.channel_conversion.scope_too_large", {
+    channel_id: sourceChannelId,
+    limit_hit: size.subconversations > CHANNEL_CONVERSION_MAX_SUBCONVERSATIONS ? "subconversations" : "messages",
+    subconversations: size.subconversations,
+    messages: size.messages,
+    outcome: "refused",
+  });
+  throw new ChannelConversionError(
+    `This channel has ${tooMany}, which is more than can be moved to a shared channel right now. Nothing was changed. Start a new shared channel instead.`,
+    "channel_conversion_too_large",
+  );
+}
+
 export async function assertNoBoundGuests(executor: DatabaseExecutor, channel: { id: string; serverId: string }): Promise<void> {
   if (await boundGuestsBlockJoint(executor, channel)) {
     throw new ChannelConversionError("This channel has guests, so it can't become a joint channel yet.", "guests_present");
@@ -167,134 +276,245 @@ export async function startChannelToJointConversion(input: {
   tracePreJobPhase?: ChannelConversionPreJobTrace;
   transaction?: DatabaseTransaction;
   revalidateExternalPrivacy?: ChannelConversionPrivacyRevalidator;
+  /**
+   * Always today's fenced conversion, whatever channel_conversion_online_move_v1
+   * says: a caller that needs the conversion to run to its end through the
+   * worker (an external invite's connection) until the online move's mover
+   * and switch exist.
+   */
+  fencedOnly?: true;
 }): Promise<ChannelConversionReceipt> {
   await revalidateExternalPrivacyBeforeConversion(input.revalidateExternalPrivacy, input.serverId, input.sourceChannelId);
+  // Decided before any lock: a flag read must not hold the conversion lock.
+  const onlineMove = !input.fencedOnly && await isChannelConversionOnlineMoveEnabled(input.serverId);
   return withChannelConversionResourceBoundedLock(input.serverId, input.sourceChannelId, conversionBusy, async (tx) => {
-    const [source] = await tracePreJobPhase(input, "source_lookup", () => tx
-      .select()
-      .from(channels)
-      .where(and(
-        eq(channels.id, input.sourceChannelId),
-        isNull(channels.deletedAt),
-      ))
-      .limit(1));
-    if (!source || source.serverId !== input.serverId) throw new ChannelConversionError("Channel not found", "channel_not_found");
-    if (source.type !== "channel" && source.type !== "private") {
-      throw new ChannelConversionError("Only public or private channels can be converted", "unsupported_channel_type");
-    }
-    if (source.name === "all") {
-      throw new ChannelConversionError("The #all channel cannot be converted", "reserved_channel");
-    }
-    if (await isAgentLoungeChannel(source.id, tx)) {
-      throw new ChannelConversionError("An agent's lounge cannot be converted", "reserved_channel");
-    }
-    // Contract v0.3 §18.7: conversion is one of the four admission points.
-    // It only ever adds the host, so it cannot break a limit today; calling
-    // the shared check keeps the four entry points from drifting apart.
-    await assertJointAdmission(tx, null, { kind: "convert", hostServerId: input.serverId }, currentDate());
-
-    const [activeJob] = await tracePreJobPhase(input, "active_job_check", () => tx
-      .select()
-      .from(channelConversionJobs)
-      .where(and(
-        eq(channelConversionJobs.sourceChannelId, source.id),
-        inArray(channelConversionJobs.status, ["pending", "running", "failed"]),
-      ))
-      .limit(1));
-    // The active job and its epoch are the durable source-of-truth. A duplicate
-    // start never creates a second fence or silently advances a phase.
-    if (activeJob) {
-      // A compensated failure has deliberately released its source fence and
-      // restored the ordinary channel. Keep the receipt as the durable retry
-      // record; the command executor will mint a fresh epoch when the caller
-      // explicitly starts/retries it. Treating this row as an active fenced
-      // job would make a restored source permanently fail closed.
-      if (activeJob.status === "failed" && normalizeProgress(activeJob.progress).rollbackState === "restored") {
-        return projectConversionJob(activeJob);
-      }
-      const activeFence = await tx
-        .select({ status: channelConversionFences.status })
-        .from(channelConversionFences)
-        .where(and(
-          eq(channelConversionFences.sourceChannelId, source.id),
-          eq(channelConversionFences.status, "active"),
-        ))
-        .limit(1);
-      if (activeFence.length === 0) {
+    if (!onlineMove) return startConversionInTransaction(tx, input);
+    // The online start holds the conversion lock exclusively (writers queue
+    // on it) and then row locks writers wait on: bound every lock wait, every
+    // statement and the transaction as a whole (OnlineMoveStartBudget), so it
+    // gives up, and rolls back, instead of stalling them.
+    const restoreTimeouts = await setOnlineMoveStartTimeouts(tx);
+    const budget = new OnlineMoveStartBudget(
+      tx, CHANNEL_CONVERSION_ONLINE_START_BUDGET_MS, CHANNEL_CONVERSION_ONLINE_START_STATEMENT_TIMEOUT_MS, CHANNEL_CONVERSION_ONLINE_START_LOCK_TIMEOUT_MS,
+    );
+    let failed = false;
+    try {
+      return await startConversionInTransaction(tx, input, { onlineMove: budget });
+    } catch (error) {
+      failed = true;
+      if (isOnlineMoveStartAbort(error)) {
+        addTraceEvent("server.channel_conversion.online_move.start_aborted", {
+          channel_id: input.sourceChannelId,
+          error_class: error instanceof OnlineMoveStartBudgetExceededError ? "OnlineMoveStartBudgetExceeded" : classifyConversionErrorClass(error),
+          outcome: "timeout",
+        });
         throw new ChannelConversionError(
-          "Active conversion job is missing its source fence; retry or repair is required",
-          "channel_conversion_fence_missing",
+          "The channel is busy right now, so the move could not start. Nothing was changed. Try again in a moment.",
+          "channel_conversion_online_start_busy",
         );
       }
+      throw error;
+    } finally {
+      // A failure aborted the transaction (or the caller's savepoint): its
+      // rollback reverts these transaction-local settings, and no statement
+      // can run in it before then. Restore them only on the way out of a success.
+      if (!failed) await restoreTimeouts();
+    }
+  }, input.transaction);
+}
+
+/**
+ * The online start's limits (channel_conversion_online_move_v1): a lock wait
+ * longer than CHANNEL_CONVERSION_ONLINE_START_LOCK_TIMEOUT_MS (a writer or a
+ * reader holding the source row or one of its threads), a statement longer
+ * than CHANNEL_CONVERSION_ONLINE_START_STATEMENT_TIMEOUT_MS, a deadlock, or
+ * the whole transaction going past CHANNEL_CONVERSION_ONLINE_START_BUDGET_MS
+ * (checked between steps, each step capped at what is left) aborts the start:
+ * its transaction rolls back and nothing changes. At the size limits the
+ * start takes about 0.25 s (channelConversionOnlineMoveTiming.realPg.test.ts).
+ */
+export const CHANNEL_CONVERSION_ONLINE_START_LOCK_TIMEOUT_MS = 2_000;
+export const CHANNEL_CONVERSION_ONLINE_START_STATEMENT_TIMEOUT_MS = 10_000;
+export const CHANNEL_CONVERSION_ONLINE_START_BUDGET_MS = 5_000;
+
+async function setOnlineMoveStartTimeouts(tx: DatabaseExecutor): Promise<() => Promise<void>> {
+  const previous = await tx.execute(sql`
+    SELECT current_setting('lock_timeout') AS lock_timeout, current_setting('statement_timeout') AS statement_timeout`);
+  const row = previous.rows[0] as { lock_timeout?: unknown; statement_timeout?: unknown } | undefined;
+  await tx.execute(sql`SELECT set_config('lock_timeout', ${`${CHANNEL_CONVERSION_ONLINE_START_LOCK_TIMEOUT_MS}ms`}, true),
+    set_config('statement_timeout', ${`${Math.min(CHANNEL_CONVERSION_ONLINE_START_STATEMENT_TIMEOUT_MS, CHANNEL_CONVERSION_ONLINE_START_BUDGET_MS)}ms`}, true)`);
+  return async () => {
+    await tx.execute(sql`SELECT set_config('lock_timeout', ${typeof row?.lock_timeout === "string" ? row.lock_timeout : "0"}, true),
+      set_config('statement_timeout', ${typeof row?.statement_timeout === "string" ? row.statement_timeout : "0"}, true)`);
+  };
+}
+
+/** The SQLSTATEs a transaction that gave up waiting ends with: lock_not_available (55P03, lock_timeout), deadlock_detected (40P01). */
+function isLockWaitAbort(error: unknown): boolean {
+  for (let current: unknown = error, depth = 0; current && depth < 5; depth += 1) {
+    const code = (current as { code?: unknown }).code;
+    if (code === "55P03" || code === "40P01") return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/** A lock wait given up, a deadlock, a statement over its time (57014), or the start's whole budget spent. */
+function isOnlineMoveStartAbort(error: unknown): boolean {
+  if (error instanceof OnlineMoveStartBudgetExceededError || isLockWaitAbort(error)) return true;
+  for (let current: unknown = error, depth = 0; current && depth < 5; depth += 1) {
+    if ((current as { code?: unknown }).code === "57014") return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/** channel_conversion_online_move_v1, server-scoped; a failed read is off. */
+async function isChannelConversionOnlineMoveEnabled(serverId: string): Promise<boolean> {
+  try {
+    return (await evaluateFeatureFlag({ key: CHANNEL_CONVERSION_ONLINE_MOVE_FEATURE_FLAG_KEY, serverId })).enabled === true;
+  } catch (error) {
+    console.warn("[ChannelConversion] online move flag read failed; starting a fenced conversion", { serverId, errorClass: errorClassOf(error) });
+    return false;
+  }
+}
+
+/** The start's work in its transaction, which holds the conversion lock: fenced (today's), or online. */
+async function startConversionInTransaction(
+  tx: DatabaseTransaction,
+  input: Parameters<typeof startChannelToJointConversion>[0],
+  options: { onlineMove?: OnlineMoveStartBudget } = {},
+): Promise<ChannelConversionReceipt> {
+  const [source] = await tracePreJobPhase(input, "source_lookup", () => tx
+    .select()
+    .from(channels)
+    .where(and(
+      eq(channels.id, input.sourceChannelId),
+      isNull(channels.deletedAt),
+    ))
+    .limit(1));
+  if (!source || source.serverId !== input.serverId) throw new ChannelConversionError("Channel not found", "channel_not_found");
+  if (source.type !== "channel" && source.type !== "private") {
+    throw new ChannelConversionError("Only public or private channels can be converted", "unsupported_channel_type");
+  }
+  if (source.name === "all") {
+    throw new ChannelConversionError("The #all channel cannot be converted", "reserved_channel");
+  }
+  if (await isAgentLoungeChannel(source.id, tx)) {
+    throw new ChannelConversionError("An agent's lounge cannot be converted", "reserved_channel");
+  }
+  // Contract v0.3 §18.7: conversion is one of the four admission points.
+  // It only ever adds the host, so it cannot break a limit today; calling
+  // the shared check keeps the four entry points from drifting apart.
+  await assertJointAdmission(tx, null, { kind: "convert", hostServerId: input.serverId }, currentDate());
+
+  const [activeJob] = await tracePreJobPhase(input, "active_job_check", () => tx
+    .select()
+    .from(channelConversionJobs)
+    .where(and(
+      eq(channelConversionJobs.sourceChannelId, source.id),
+      inArray(channelConversionJobs.status, ["pending", "running", "failed"]),
+    ))
+    .limit(1));
+  // The active job and its epoch are the durable source-of-truth. A duplicate
+  // start never creates a second fence or silently advances a phase.
+  if (activeJob) {
+    // A compensated failure has deliberately released its source fence and
+    // restored the ordinary channel. Keep the receipt as the durable retry
+    // record; the command executor will mint a fresh epoch when the caller
+    // explicitly starts/retries it. Treating this row as an active fenced
+    // job would make a restored source permanently fail closed.
+    if (activeJob.status === "failed" && normalizeProgress(activeJob.progress).rollbackState === "restored") {
       return projectConversionJob(activeJob);
     }
-    const taskInventory = await tracePreJobPhase(input, "eligibility_check", async () => {
-      return collectTaskInventory(tx, source.id, input);
-    });
-    const now = currentDate();
-    const externalBindingsPaused = await tracePreJobPhase(input, "source_lock", async () => {
-      // Match external outbound admission's conversation-first lock order.
-      // The conversion fence owns write admission; archive remains lifecycle state.
-      const [lockedSource] = await tx.select().from(channels).where(and(
-        eq(channels.id, source.id), eq(channels.serverId, source.serverId), isNull(channels.deletedAt),
-      )).for("update").limit(1);
-      if (!lockedSource || (lockedSource.type !== "channel" && lockedSource.type !== "private")) {
-        throw new ChannelConversionError("Channel changed before conversion could reserve it", "channel_conversion_source_changed");
-      }
-      await assertNoBoundGuests(tx, lockedSource);
-      return prepareExternalBindingsForChannelConversion(tx, lockedSource.serverId, lockedSource.id, false);
-    });
-    // Uploads are a start precondition. Keep the prepare-phase assertion too:
-    // the source lock prevents new writers after this point, but a transfer
-    // already committed before the lock must still be rechecked by the worker.
-    await tracePreJobPhase(input, "upload_check", () => assertNoActiveAttachmentTransfers(tx, {
+    // An online move holds no fence by design: writers are admitted.
+    if (activeJob.phase === "online_move") return projectConversionJob(activeJob);
+    const activeFence = await tx
+      .select({ status: channelConversionFences.status })
+      .from(channelConversionFences)
+      .where(and(
+        eq(channelConversionFences.sourceChannelId, source.id),
+        eq(channelConversionFences.status, "active"),
+      ))
+      .limit(1);
+    if (activeFence.length === 0) {
+      throw new ChannelConversionError(
+        "Active conversion job is missing its source fence; retry or repair is required",
+        "channel_conversion_fence_missing",
+      );
+    }
+    return projectConversionJob(activeJob);
+  }
+  const taskInventory = await tracePreJobPhase(input, "eligibility_check", async () => {
+    return collectTaskInventory(tx, source.id, input);
+  });
+  const now = currentDate();
+  const externalBindingsPaused = await tracePreJobPhase(input, "source_lock", async () => {
+    // Match external outbound admission's conversation-first lock order.
+    // The conversion fence owns write admission; archive remains lifecycle state.
+    const [lockedSource] = await tx.select().from(channels).where(and(
+      eq(channels.id, source.id), eq(channels.serverId, source.serverId), isNull(channels.deletedAt),
+    )).for("update").limit(1);
+    if (!lockedSource || (lockedSource.type !== "channel" && lockedSource.type !== "private")) {
+      throw new ChannelConversionError("Channel changed before conversion could reserve it", "channel_conversion_source_changed");
+    }
+    await assertNoBoundGuests(tx, lockedSource);
+    return prepareExternalBindingsForChannelConversion(tx, lockedSource.serverId, lockedSource.id, false);
+  });
+  // Before anything is fenced or frozen (the source row lock keeps new
+  // threads out; the binding pause above rolls back with this refusal).
+  await tracePreJobPhase(input, "scope_size_check", () => assertConversionScopeWithinLimit(tx, source.id));
+  // Uploads are a start precondition. Keep the prepare-phase assertion too:
+  // the source lock prevents new writers after this point, but a transfer
+  // already committed before the lock must still be rechecked by the worker.
+  await tracePreJobPhase(input, "upload_check", () => assertNoActiveAttachmentTransfers(tx, {
+    serverId: input.serverId,
+    sourceChannelId: source.id,
+  }));
+  // Online move: the start rewrites every thread and task conversation of
+  // the source (parent_message_id, joint rows), and writers are admitted
+  // right after it commits. Lock them now, after the source row, in id
+  // order, FOR NO KEY UPDATE (see lockOnlineMoveSubConversations).
+  if (options.onlineMove) await options.onlineMove.step("lock_subconversations", () => lockOnlineMoveSubConversations(tx, source.id));
+
+  const [job] = await tracePreJobPhase(input, "job_insert", () => tx
+    .insert(channelConversionJobs)
+    .values({
       serverId: input.serverId,
       sourceChannelId: source.id,
-    }));
-
-    const [job] = await tracePreJobPhase(input, "job_insert", () => tx
-      .insert(channelConversionJobs)
-      .values({
-        serverId: input.serverId,
-        sourceChannelId: source.id,
-        sourceChannelType: source.type as "channel" | "private",
-        status: "pending",
-        phase: "prepare",
-        createdByUserId: input.createdByUserId,
-        progress: {
-          version: 1, ledgerVersion: 2, resources: {},
-          lockedAt: now.toISOString(),
-          sourceArchiveSnapshot: {
-            archivedAt: source.archivedAt?.toISOString() ?? null,
-            archivedByUserId: source.archivedByUserId,
-            archivedByAgentId: source.archivedByAgentId,
-          },
-
-
-          taskInventory: {
-            directTaskCount: taskInventory.directTaskCount,
-            threadTaskCount: taskInventory.threadTaskCount,
-            totalCount: taskInventory.totalCount,
-            canonicalDirectTaskCount: taskInventory.canonicalDirectTaskCount,
-            canonicalThreadTaskCount: taskInventory.canonicalThreadTaskCount,
-            canonicalTaskCount: taskInventory.canonicalTaskCount,
-            shadowOnlyTaskCount: taskInventory.shadowOnlyTaskCount,
-          },
-          externalBindingsPaused,
+      sourceChannelType: source.type as "channel" | "private",
+      status: "pending",
+      phase: "prepare",
+      createdByUserId: input.createdByUserId,
+      progress: {
+        version: 1, ledgerVersion: 2, resources: {},
+        lockedAt: now.toISOString(),
+        sourceArchiveSnapshot: {
+          archivedAt: source.archivedAt?.toISOString() ?? null,
+          archivedByUserId: source.archivedByUserId,
+          archivedByAgentId: source.archivedByAgentId,
         },
-      })
-      .returning());
-    const fence = await acquireChannelConversionFence(tx, {
-      jobId: job.id,
-      serverId: input.serverId,
-      sourceChannelId: source.id,
-      conversionEpoch: job.conversionEpoch,
-    });
+
+
+        taskInventory: {
+          directTaskCount: taskInventory.directTaskCount,
+          threadTaskCount: taskInventory.threadTaskCount,
+          totalCount: taskInventory.totalCount,
+          canonicalDirectTaskCount: taskInventory.canonicalDirectTaskCount,
+          canonicalThreadTaskCount: taskInventory.canonicalThreadTaskCount,
+          canonicalTaskCount: taskInventory.canonicalTaskCount,
+          shadowOnlyTaskCount: taskInventory.shadowOnlyTaskCount,
+        },
+        externalBindingsPaused,
+      },
+    })
+    .returning());
+  if (options.onlineMove) {
     await freezeActionCardsForConversion(tx, {
       id: job.id,
       serverId: input.serverId,
       sourceChannelId: source.id,
-      conversionEpoch: fence.conversionEpoch,
+      conversionEpoch: job.conversionEpoch,
     });
     await recordConversionPhaseCommit(tx, {
       jobId: job.id,
@@ -302,19 +522,78 @@ export async function startChannelToJointConversion(input: {
       phase: "prepared",
       checksumInput: `${job.id}:${source.id}:prepared`,
     });
-    await recordConversionPhaseCommit(tx, {
-      jobId: job.id,
-      conversionEpoch: job.conversionEpoch,
-      phase: "fenced",
-      checksumInput: `${job.id}:${fence.conversionEpoch}:fenced`,
-    });
-    const [fencedJob] = await tx
-      .update(channelConversionJobs)
-      .set({ state: "fenced", updatedAt: now })
-      .where(eq(channelConversionJobs.id, job.id))
-      .returning();
-    return projectConversionJob(fencedJob ?? job);
-  }, input.transaction);
+    // No fence row: writers are admitted. The route to the canonical
+    // channel changes in this transaction, under the source row's FOR UPDATE.
+    return projectConversionJob(await prepareOnlineMove(tx, job.id, options.onlineMove));
+  }
+  const fence = await acquireChannelConversionFence(tx, {
+    jobId: job.id,
+    serverId: input.serverId,
+    sourceChannelId: source.id,
+    conversionEpoch: job.conversionEpoch,
+  });
+  await freezeActionCardsForConversion(tx, {
+    id: job.id,
+    serverId: input.serverId,
+    sourceChannelId: source.id,
+    conversionEpoch: fence.conversionEpoch,
+  });
+  await recordConversionPhaseCommit(tx, {
+    jobId: job.id,
+    conversionEpoch: job.conversionEpoch,
+    phase: "prepared",
+    checksumInput: `${job.id}:${source.id}:prepared`,
+  });
+  await recordConversionPhaseCommit(tx, {
+    jobId: job.id,
+    conversionEpoch: job.conversionEpoch,
+    phase: "fenced",
+    checksumInput: `${job.id}:${fence.conversionEpoch}:fenced`,
+  });
+  const [fencedJob] = await tx
+    .update(channelConversionJobs)
+    .set({ state: "fenced", updatedAt: now })
+    .where(eq(channelConversionJobs.id, job.id))
+    .returning();
+  return projectConversionJob(fencedJob ?? job);
+}
+
+/**
+ * The source's live threads and task conversations, in id order: the rows an
+ * online start rewrites. Its caller holds the source row FOR UPDATE already.
+ *
+ * FOR NO KEY UPDATE, not FOR UPDATE: the start changes none of their key
+ * columns (parent_message_id and parent_channel_id are only in partial unique
+ * indexes), and read-state resolution (readMutationSequencer) takes FOR KEY
+ * SHARE on a thread or task conversation before its parent channel, the
+ * reverse of this. FOR KEY SHARE does not conflict with FOR NO KEY UPDATE, so
+ * a mark-read holding a thread and waiting for the source can never wait for
+ * the start here (no cycle). Writers are kept out by the conversion lock the
+ * start holds exclusively (they take it shared) and a thread's creator by the
+ * source row (getOrCreateThread takes it FOR KEY SHARE first). Pinned by
+ * channelConversionOnlineMove.realPg.test.ts.
+ */
+async function lockOnlineMoveSubConversations(tx: DatabaseExecutor, sourceChannelId: string): Promise<void> {
+  await tx.execute(sql`
+    SELECT sub.id
+      FROM ${channels} sub
+     WHERE sub.id IN (
+       SELECT thread_channel.id
+         FROM ${messages} parent_message
+         JOIN ${channels} thread_channel
+           ON thread_channel.parent_message_id = parent_message.id
+          AND thread_channel.type = 'thread'
+          AND thread_channel.deleted_at IS NULL
+        WHERE parent_message.channel_id = ${sourceChannelId}
+       UNION
+       SELECT task_conversation.id
+         FROM ${channels} task_conversation
+        WHERE task_conversation.parent_channel_id = ${sourceChannelId}
+          AND task_conversation.type = 'task'
+          AND task_conversation.deleted_at IS NULL
+     )
+     ORDER BY sub.id
+     FOR NO KEY UPDATE OF sub`);
 }
 
 /**
@@ -541,7 +820,7 @@ export async function retryChannelConversionJob(jobId: string, transaction?: Dat
         "channel_conversion_retry_not_allowed",
       );
     }
-    if (["done", "canceled", "succeeded"].includes(existing.status) || existing.phase === "done") {
+    if (["done", "canceled", "succeeded"].includes(existing.status) || existing.phase === "done" || existing.phase === "online_move") {
       throw new ChannelConversionError(
         "Only a failed conversion can be retried",
         "channel_conversion_retry_not_allowed",
@@ -562,6 +841,8 @@ export async function retryChannelConversionJob(jobId: string, transaction?: Dat
     if (rolledBack) {
       // The restored source took writes (and could take a Guest) since its fence was released.
       await assertNoBoundGuests(tx, { id: existing.sourceChannelId, serverId: existing.serverId });
+      // The restored source is unfenced: refuse a scope too large before fencing it again.
+      await assertConversionScopeWithinLimit(tx, existing.sourceChannelId);
       await tx.update(channelConversionJobs).set({
         conversionEpoch: nextEpoch,
         canonicalChannelId: null,
@@ -637,6 +918,8 @@ export async function runChannelConversionJob(
     if (job.phase === "done" || job.status === "done") return job;
     if (job.status === "failed") return job;
     if (job.status === "canceled") return job;
+    // An online move waits for its mover and switch (later steps): no phase runs it.
+    if (job.phase === "online_move") return job;
     if (opts.failBeforePhase && job.phase === opts.failBeforePhase) {
       await recordJobFailure(job, `injected failure before ${job.phase}`, new Error("InjectedChannelConversionFailure"));
       return (await getChannelConversionJob(job.id))!;
@@ -769,39 +1052,51 @@ export async function cancelChannelConversionJob(jobId: string, transaction?: Da
     .limit(1);
   if (!routing) throw new ChannelConversionError("Conversion job not found", "job_not_found");
 
-  return withChannelConversionResourceBoundedLock(routing.serverId, routing.sourceChannelId, conversionBusy, async (tx) => {
-    const [job] = await tx.select().from(channelConversionJobs).where(eq(channelConversionJobs.id, jobId)).limit(1);
-    if (!job) throw new ChannelConversionError("Conversion job not found", "job_not_found");
-    if (job.status === "canceled") return projectConversionJob(job);
-    if (["done", "succeeded"].includes(job.status) || job.phase === "done") {
-      throw new ChannelConversionError(
-        "This conversion has already reached a terminal state and cannot be canceled",
-        "channel_conversion_cancel_not_allowed",
-      );
-    }
-    if (!canCancelChannelConversion(job)) {
-      throw new ChannelConversionError(
-        "This conversion has already switched channel access; retry it to finish.",
-        "channel_conversion_cancel_after_copy",
-      );
-    }
-    await rollbackConversionToSource(tx, job);
-    const [canceled] = await tx
-      .update(channelConversionJobs)
-      .set({
-        state: "canceled",
-        status: "canceled",
-        phase: "done",
-        progress: { ...normalizeProgress(job.progress), completionBroadcastAt: null },
-        leaseOwner: null,
-        leaseExpiresAt: null,
-        updatedAt: currentDate(),
-      })
-      .where(eq(channelConversionJobs.id, job.id))
-      .returning();
-    return projectConversionJob(canceled);
-  }, transaction);
+  return withChannelConversionResourceBoundedLock(routing.serverId, routing.sourceChannelId, conversionBusy, (tx) => cancelInTransaction(tx, jobId), transaction)
+    .catch((error: unknown) => {
+      // An online move's rollback gave up a lock wait (or lost a deadlock
+      // check): its transaction rolled back, nothing changed. The same 409
+      // "in progress" a busy conversion lock answers; the request can be sent again.
+      if (isLockWaitAbort(error)) throw new ChannelConversionBusyError({ cause: error });
+      throw error;
+    });
 }
+
+async function cancelInTransaction(tx: DatabaseTransaction, jobId: string): Promise<ChannelConversionReceipt> {
+  const [job] = await tx.select().from(channelConversionJobs).where(eq(channelConversionJobs.id, jobId)).limit(1);
+  if (!job) throw new ChannelConversionError("Conversion job not found", "job_not_found");
+  if (job.status === "canceled") return projectConversionJob(job);
+  if (["done", "succeeded"].includes(job.status) || job.phase === "done") {
+    throw new ChannelConversionError(
+      "This conversion has already reached a terminal state and cannot be canceled",
+      "channel_conversion_cancel_not_allowed",
+    );
+  }
+  if (!canCancelChannelConversion(job)) {
+    throw new ChannelConversionError(
+      "This conversion has already switched channel access; retry it to finish.",
+      "channel_conversion_cancel_after_copy",
+    );
+  }
+  await rollbackConversionToSource(tx, job);
+  const [canceled] = await tx
+    .update(channelConversionJobs)
+    .set({
+      state: "canceled",
+      status: "canceled",
+      phase: "done",
+      progress: { ...normalizeProgress(job.progress), completionBroadcastAt: null },
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      updatedAt: currentDate(),
+    })
+    .where(eq(channelConversionJobs.id, job.id))
+    .returning();
+  return projectConversionJob(canceled);
+}
+
+/** How long an online move's cancel waits for the source row (below PostgreSQL's 1 s deadlock_timeout). */
+const ONLINE_MOVE_CANCEL_SOURCE_LOCK_TIMEOUT = "500ms";
 
 /** The phases whose transaction writes the source channel's people into the joint (audienceCutover's run ends with the finalize). */
 const AUDIENCE_WRITING_PHASES: ReadonlySet<ChannelConversionPhase> = new Set(["audience_cutover", "finalize"]);
@@ -811,6 +1106,14 @@ async function sourceChannelHumanIds(executor: DatabaseExecutor, sourceChannelId
   const rows = await executor.select({ userId: channelHumans.userId }).from(channelHumans)
     .where(eq(channelHumans.channelId, sourceChannelId)).orderBy(channelHumans.userId);
   return rows.map((row) => row.userId);
+}
+
+let rollbackFailureForTest = false;
+
+/** Test seam: make the failure compensation hit a real statement_timeout after its writes. */
+export function setConversionRollbackFailureForTest(fail: boolean): void {
+  if (process.env.NODE_ENV !== "test") throw new Error("conversion rollback seams are test-only");
+  rollbackFailureForTest = fail;
 }
 
 let phaseUsersLockObserverForTest: ((jobId: string) => void) | null = null;
@@ -928,7 +1231,14 @@ async function runOnePhase(job: ChannelConversionJob, tracer: Tracer, traceParen
         } catch (err) {
           // The savepoint rolled the phase back; the conversion lock is still ours.
           phaseError = { error: err };
-          await markJobFailed(lockedTx, attemptedJob, err instanceof Error ? err.message : String(err), err);
+          // An audience phase holds KEY SHARE on every member's users row
+          // (lockJointUsersFirst on `outer`) until this transaction ends, and
+          // /api/auth/refresh needs FOR UPDATE on those rows. The compensation
+          // rewrites every moved message (row triggers included) and can run
+          // for minutes: never run it under those locks. Record the failure
+          // with the source fenced; Cancel (no users locks) restores it, Retry
+          // resumes the phase.
+          await markJobFailed(lockedTx, attemptedJob, err instanceof Error ? err.message : String(err), err, { compensate: !audienceUserIds });
         }
       }, outer);
       if (!attempt.acquired) lock = "busy";
@@ -963,6 +1273,14 @@ async function runOnePhase(job: ChannelConversionJob, tracer: Tracer, traceParen
  * whose deleted personal state cannot be reconstructed from the conversion
  * tables alone. */
 async function rollbackConversionToSource(tx: DatabaseExecutor, job: ChannelConversionJob): Promise<void> {
+  // An online move (channel_conversion_online_move_v1) admits writers and
+  // routes the source's new messages to the canonical channel: the route
+  // goes back to the source only under the source row's FOR UPDATE (the
+  // writers' storage resolution holds it FOR KEY SHARE), and the job leaves
+  // online_move in this same transaction. Its threads and task conversations
+  // were prepared from the source's own parents, which may not have moved
+  // yet: look for them in both channels.
+  const onlineMove = normalizeProgress(job.progress).onlineMovePreparedAt !== undefined;
   const ownedProjection = await resolveOwnedConversionProjection(tx, job);
   const canonicalChannelId = ownedProjection?.canonicalChannelId ?? null;
   const jointChannelId = ownedProjection?.jointChannelId ?? null;
@@ -1011,7 +1329,7 @@ async function rollbackConversionToSource(tx: DatabaseExecutor, job: ChannelConv
        AND joint_thread.created_by_server_id = ${job.serverId}
        AND joint_thread.id <> ${jointChannelId ?? "00000000-0000-0000-0000-000000000000"}::uuid
        AND canonical_thread.type = 'thread'
-       AND parent.channel_id = ${canonicalChannelId}
+       AND ${onlineMove ? sql`parent.channel_id IN (${canonicalChannelId}, ${job.sourceChannelId})` : sql`parent.channel_id = ${canonicalChannelId}`}
      ORDER BY projection.local_channel_id
      FOR UPDATE OF projection, joint_thread, canonical_thread, parent
   `);
@@ -1032,7 +1350,7 @@ async function rollbackConversionToSource(tx: DatabaseExecutor, job: ChannelConv
        AND joint_conversation.created_by_server_id = ${job.serverId}
        AND joint_conversation.id <> ${jointChannelId ?? "00000000-0000-0000-0000-000000000000"}::uuid
        AND canonical_conversation.type = 'task'
-       AND task.channel_id = ${canonicalChannelId}
+       AND ${onlineMove ? sql`task.channel_id IN (${canonicalChannelId}, ${job.sourceChannelId})` : sql`task.channel_id = ${canonicalChannelId}`}
        AND task.conversation_channel_id = canonical_conversation.id
      ORDER BY projection.local_channel_id
      FOR UPDATE OF projection, joint_conversation, canonical_conversation, task
@@ -1044,6 +1362,22 @@ async function rollbackConversionToSource(tx: DatabaseExecutor, job: ChannelConv
     `);
   }
   await tx.execute(sql`SELECT 1 FROM ${channels} WHERE id = ${canonicalChannelId}::uuid FOR UPDATE`);
+  if (onlineMove) {
+    // Last, after every row above, as read-state resolution takes the
+    // parent channel last (a thread, then its parent: readMutationSequencer):
+    // a mark-read holding a thread's rows and waiting for the source never
+    // waits on a row this rollback holds. A whole-scope mark-read
+    // (global_read_all) takes root channels first, then threads, so it may
+    // hold the source while asking for a row locked above: this wait is
+    // bounded below deadlock_timeout, so this rollback is the one that gives
+    // up (cancelChannelConversionJob answers busy, nothing changed), never
+    // the reader.
+    const previous = await tx.execute(sql`SELECT current_setting('lock_timeout') AS lock_timeout`);
+    await tx.execute(sql`SELECT set_config('lock_timeout', ${ONLINE_MOVE_CANCEL_SOURCE_LOCK_TIMEOUT}, true)`);
+    await tx.select({ id: channels.id }).from(channels).where(eq(channels.id, job.sourceChannelId)).for("update");
+    const restore = (previous.rows[0] as { lock_timeout?: unknown } | undefined)?.lock_timeout;
+    await tx.execute(sql`SELECT set_config('lock_timeout', ${typeof restore === "string" ? restore : "0"}, true)`);
+  }
 
   for (const row of threadRows.rows as Array<{ local_id: string; canonical_id: string; parent_message_id: string; joint_id: string }>) {
     await moveRowsBackToSource(tx, row.canonical_id, row.local_id);
@@ -1178,7 +1512,7 @@ async function recordJobFailure(expected: ChannelConversionJob, error: string, c
 }
 
 /** In `tx`, which holds the conversion lock (the failed phase's own transaction, or recordJobFailure's). */
-async function markJobFailed(tx: DatabaseTransaction, expected: ChannelConversionJob, error: string, cause?: unknown) {
+async function markJobFailed(tx: DatabaseTransaction, expected: ChannelConversionJob, error: string, cause?: unknown, options: { compensate?: boolean } = {}) {
   const jobId = expected.id;
   const [job] = await tx.select().from(channelConversionJobs).where(eq(channelConversionJobs.id, jobId)).limit(1);
   // Compare with the persisted snapshot *before* the failed transaction.
@@ -1201,20 +1535,37 @@ async function markJobFailed(tx: DatabaseTransaction, expected: ChannelConversio
     residual_cleanup: "cleaning obsolete personal state",
     finalize: "committing the Joint channel",
     done: "finishing the conversion",
+    online_move: "moving channel history",
   };
-  const rollbackEligible = canCancelChannelConversion(job);
+  const rollbackEligible = options.compensate !== false && canCancelChannelConversion(job);
   const userFacingError = cause instanceof ChannelConversionUploadsInFlightError
     ? cause.message
     : cause instanceof ChannelConversionError
       ? error
-    : `Channel conversion failed while ${phaseCopy[job.phase] ?? "running a conversion phase"}. ${rollbackEligible ? "The original channel has been restored. You can use it or retry conversion." : "Retry to finish the conversion."}`;
+    : null;
   // Database/transport diagnostics belong to server logs, never the receipt.
   console.error("[ChannelConversion] phase failed", { jobId, phase: job.phase, cause });
   // Failures before audience cutover are compensating failures: restore every
   // committed move and release the source fence so the user can return to the
   // ordinary channel. New jobs commit cutover, cleanup and Done together;
   // only legacy jobs already past cutover need forward recovery.
-  if (rollbackEligible) await rollbackConversionToSource(tx, job);
+  // The compensation runs in a savepoint: if it fails too (a large channel's
+  // rollback hitting statement_timeout), the failure must still be recorded.
+  // Otherwise the whole transaction rolls back, the job stays pending/running
+  // and the worker picks it up again forever. Unrestored, the job keeps its
+  // source fence and Retry resumes the failed phase.
+  let restored = false;
+  if (rollbackEligible) {
+    try {
+      await tx.transaction(async (savepoint) => {
+        await rollbackConversionToSource(savepoint, job);
+        if (rollbackFailureForTest) await savepoint.execute(sql`SET LOCAL statement_timeout = '1ms'; SELECT pg_sleep(0.05)`);
+      });
+      restored = true;
+    } catch (rollbackError) {
+      console.error("[ChannelConversion] rollback failed; recording the failure with the source fence retained", { jobId, phase: job.phase, rollbackError });
+    }
+  }
   if (isActionCardConversionMutationForTest("failed_retry_unfreeze")) {
     await unfreezeActionCardsAfterCancellation(tx, {
       id: job.id,
@@ -1223,16 +1574,18 @@ async function markJobFailed(tx: DatabaseTransaction, expected: ChannelConversio
       conversionEpoch: job.conversionEpoch,
     });
   }
+  const failureMessage = userFacingError
+    ?? `Channel conversion failed while ${phaseCopy[job.phase] ?? "running a conversion phase"}. ${restored ? "The original channel has been restored. You can use it or retry conversion." : "Retry to finish the conversion, or cancel it to restore the original channel."}`;
   await tx
     .update(channelConversionJobs)
     .set({
       state: "retry_waiting",
       status: "failed",
-      error: userFacingError,
+      error: failureMessage,
       // A compensated failure deletes its temporary projection. Clear the
       // routing references in the receipt as part of the same transition so
       // the persisted job cannot point at a channel that no longer exists.
-      ...(rollbackEligible ? { canonicalChannelId: null, jointChannelId: null } : {}),
+      ...(restored ? { canonicalChannelId: null, jointChannelId: null } : {}),
       leaseOwner: null,
       leaseExpiresAt: null,
       updatedAt: failedAt,
@@ -1242,8 +1595,8 @@ async function markJobFailed(tx: DatabaseTransaction, expected: ChannelConversio
         awaitingRetryAt: failedAt.toISOString(),
         previousState: job.state,
         retryState: "awaiting_retry",
-        sourceLock: rollbackEligible ? "released" : "retained",
-        ...(rollbackEligible ? { rollbackState: "restored", rollbackAt: failedAt.toISOString() } : {}),
+        sourceLock: restored ? "released" : "retained",
+        ...(restored ? { rollbackState: "restored", rollbackAt: failedAt.toISOString() } : {}),
         errorClass: classifyConversionErrorClass(cause),
         errorPhase: job.phase,
         ...(cause instanceof ChannelConversionError ? { errorCode: cause.code } : {}),

@@ -32,7 +32,7 @@ import type { ComputersListComputerOpened, ComputersListControlChanged } from ".
 import type { RackVariant } from "./computersRackTypes";
 import { listMinWidthPx } from "./computersRackLayout";
 import { useOrderedMachines } from "./useOrderedMachines";
-import { effectiveRackSort, parseRemainingSortKey, rackSortValue, sortRackMachines } from "./computersRackSort";
+import { attentionFirst, effectiveRackSort, parseRemainingSortKey, rackSortValue, sortRackMachines } from "./computersRackSort";
 import { effectiveRuntimeFilter, filterRackMachines, groupRackMachines, rackSearchMatch, runtimeFilterOptions } from "./computersRackFilter";
 import type { RackGroup } from "./computersRackFilter";
 import { useAgentsByMachine } from "./useAgentsByMachine";
@@ -85,8 +85,10 @@ function isDropTarget(machine: Machine, agent: Agent | null): boolean {
  * The toolbar (ComputersRackToolbar, the phone's sheet) filters, groups and
  * sorts every layout; the desktop list's headings sort too, the same choice
  * (kept in this browser). With no sort chosen (the default, Mine first) the
- * list keeps useOrderedMachines' order: this device, the viewer's own
- * computers, the rest; grouped, the groups holding the viewer's own lead.
+ * list keeps useOrderedMachines' order (this device, the viewer's own
+ * computers, the rest) with the computers needing attention first
+ * (attentionFirst; this device stays pinned on top); grouped, the groups
+ * holding the viewer's own lead, attention first within each.
  */
 export function ComputersRackList({ variant, view }: { variant: RackVariant; view: ComputersRackView }) {
   const { formatMessage, locale } = useIntl();
@@ -140,9 +142,11 @@ export function ComputersRackList({ variant, view }: { variant: RackVariant; vie
     () => filterRackMachines(orderedMachines, { query: filters.query, status: filters.status, runtimes }),
     [filters.query, filters.status, orderedMachines, runtimes],
   );
+  const localMachineId = useLocalComputerMachineId();
   const machines = useMemo(
-    () => (sort ? sortRackMachines(filteredMachines, sort, usageByMachine, locale) : filteredMachines),
-    [filteredMachines, locale, sort, usageByMachine],
+    // No sort chosen: the list's own order, the computers needing attention first (#triage:#527).
+    () => (sort ? sortRackMachines(filteredMachines, sort, usageByMachine, locale) : attentionFirst(filteredMachines, localMachineId)),
+    [filteredMachines, locale, localMachineId, sort, usageByMachine],
   );
   // Desktop (Raft Desktop): the computer it runs on is marked "This device"
   // (ThisDeviceBadge) and leads the list (design §4.1), whatever the
@@ -153,7 +157,6 @@ export function ComputersRackList({ variant, view }: { variant: RackVariant; vie
   // wait on the rest of the host state. The phone has no device of its own.
   const thisDeviceEntry = useThisDeviceListEntry();
   const entry = variant === "desktop" ? thisDeviceEntry : null;
-  const localMachineId = useLocalComputerMachineId();
   // Only a shell that can drive this computer (hostCapable) takes over its
   // row's own recovery (the This device page); any other keeps the row as
   // every other computer's, restart command and manual upgrade included.

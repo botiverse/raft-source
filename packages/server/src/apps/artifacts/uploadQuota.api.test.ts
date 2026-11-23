@@ -196,7 +196,7 @@ function assertQuotaRefusal(res: Reply, world: World, requestedBytes: number) {
   assert.equal(res.body.quota.enforced, true);
   assert.equal(res.body.quota.limitBytes, LIMIT);
   assert.match(res.body.billingUrl, new RegExp(`/s/${world.server.slug}/settings/billing$`));
-  assert.equal(res.body.suggestedNextAction, `Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: ${res.body.billingUrl}`);
+  assert.equal(res.body.suggestedNextAction, `Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Plan & billing: ${res.body.billingUrl}`);
   assert.deepEqual(res.body.details, { requestedBytes, quota: res.body.quota, billingUrl: res.body.billingUrl });
 }
 

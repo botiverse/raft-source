@@ -383,6 +383,7 @@ const MIGRATION_ERROR_IDS = {
   MIGRATION_TARGET_COMPUTER_DETACHED: "migration.error.targetComputerDetached",
   MIGRATION_TRANSFER_SUMMARY_INVALID: "migration.error.transferSummaryInvalid",
   MIGRATION_USER_IGNORE_WRITE_FAILED: "migration.error.userIgnoreWriteFailed",
+  MIGRATION_WORKSPACE_KEY_PATH_UNREADABLE: "migration.error.keyPathUnreadable",
   // Transient transfer faults: the user can only retry, so they share one line.
   MIGRATION_CHUNK_DIGEST_MISMATCH: "migration.error.failedGeneric",
   MIGRATION_WHOLE_BUNDLE_DIGEST_MISMATCH: "migration.error.failedGeneric",

@@ -1,6 +1,8 @@
 import { clearClockTimeout, setClockTimeout } from "@botiverse/raft-shared";
 
 export interface ReconnectAwareSocket {
+  /** socket.io's live flag; when already true at subscribe time, the next `connect` is a reconnect. */
+  readonly connected?: boolean;
   on(event: "connect", listener: () => void): void;
   off(event: "connect", listener: () => void): void;
 }
@@ -40,7 +42,10 @@ export function registerActivityTrajectoryReconnectReload({
   limit,
   debounceMs = 500,
 }: RegisterActivityTrajectoryReconnectReloadOptions) {
-  let isFirstConnect = true;
+  // Only the socket's initial connect is skipped (the mount load covers it).
+  // If the tab opens on an already-connected socket, the next `connect` is a
+  // real reconnect and must reload what was recorded while disconnected.
+  let isFirstConnect = socket.connected !== true;
   let inFlight = false;
   let debounceTimer: unknown | null = null;
 

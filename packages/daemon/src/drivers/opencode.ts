@@ -9,11 +9,11 @@ import path from "node:path";
 import { formatRuntimeProviderModelLabel, hydrateRuntimeConfig, runtimeConfigToLaunchFields, runtimeModelSourceOutcomeFromSet, type AgentConfig, type AgentMessage, type RuntimeModelInfo, type RuntimeModelSet, type RuntimeModelSourceOutcome , type AxSurfaceText } from "@botiverse/raft-shared";
 import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
 import { resolveNodeHostLaunch } from "./nodeHostLaunch";
-import { lookupCommandOnPath, readCommandVersion, readCommandVersionDetailedAsync, resolveCommandOnPath, resolveCommandOnPathAsync, type CommandVersionRead, type ProbeDeps } from "./probe";
-import { ProbeChildError, runProbeChild } from "./probeChild";
-import type { ParsedEvent, RuntimeDriver, RuntimeProbeResult, SpawnContext, SpawnResult } from "./types";
+import { lookupCommandOnPath, readCommandVersion, readCommandVersionDetailedAsync, resolveCommandOnPath, resolveCommandOnPathAsync, withWindowsUserEnvironmentAsync, type CommandVersionRead, type ProbeDeps } from "./probe";
+import { ProbeChildError } from "./probeChild";
+import type { ParsedEvent, RuntimeDriver, RuntimeProbeResult, RuntimeQuietOutputDeadline, SpawnContext, SpawnResult } from "./types";
 import { prepareManagedMcpRuntimeProxy } from "../managedMcpRuntimeProxy";
-import type { ModelLister } from "@botiverse/oar";
+import type { InstallationSnapshot, ModelLister, Runtime } from "@botiverse/oar";
 import { loadOarRuntime } from "../oarLoader";
 import { detectModelSourceViaOar } from "../runtimeModels/oarListModels";
 
@@ -49,6 +49,8 @@ interface OpenCodeEvent {
     };
     message?: string;
   };
+  /** 2.x `background_wait` (since 2.2.6): the jobs the run waits for. */
+  jobs?: unknown;
 }
 
 interface OpenCodeModelsCommandResult {
@@ -477,6 +479,65 @@ export async function buildOpenCodeLaunchOptions(ctx: SpawnContext, home: string
 }
 
 /**
+ * The 2.x config isolation (task #1258, see buildOpenCodeLaunchEnv): the
+ * workspace's opencode.json and .opencode/plugins and the user's config
+ * directory are not read. Null for any other version: 1.x isolates with
+ * `--pure` / `--dir` flags instead, which only `opencode run` takes. Creates
+ * the empty config directory. Every process Raft starts for an agent's
+ * OpenCode in its workspace gets this (the launch, the skills read).
+ */
+export function openCodeConfigIsolationEnv(
+  version: string | null | undefined,
+  slockHome: string | undefined,
+): { OPENCODE_DISABLE_PROJECT_CONFIG: string; OPENCODE_CONFIG_DIR: string } | null {
+  if (!isOpenCodeV2Launch(version)) return null;
+  const emptyConfigDir = path.join(slockHome ? path.resolve(slockHome) : resolveRaftHome(), OPENCODE_EMPTY_CONFIG_DIR);
+  mkdirSync(emptyConfigDir, { recursive: true });
+  return { OPENCODE_DISABLE_PROJECT_CONFIG: "1", OPENCODE_CONFIG_DIR: emptyConfigDir };
+}
+
+/** A config document without its `plugin` list (2.x: see buildOpenCodeLaunchEnv). */
+function withoutOpenCodePlugins(config: Record<string, unknown>): Record<string, unknown> {
+  const { plugin: _plugin, ...rest } = config;
+  return rest;
+}
+
+/**
+ * 2.x: `compaction.background: false` unless the user's config (the agent's
+ * OPENCODE_CONFIG_CONTENT or the user's opencode.json, merged by
+ * buildOpenCodeConfig) already says `compaction.background` either way.
+ * OpenCode 2.3.1 compacts in the background by default, which can keep
+ * `opencode run` alive after the reply, and on 2.x that end of output is what
+ * ends the turn (OpenCodeDriver.parseStdoutEnd). Merged into an existing
+ * `compaction` object. 1.x does not know the key (its old switch,
+ * `experimental.background_compaction`, is gone in 2.3.1).
+ */
+function withForegroundCompaction(config: Record<string, unknown>): Record<string, unknown> {
+  const compaction = recordField(config.compaction);
+  if (Object.prototype.hasOwnProperty.call(compaction, "background")) return config;
+  return { ...config, compaction: { ...compaction, background: false } };
+}
+
+/**
+ * The env a short-lived OpenCode process Raft starts in an agent's workspace
+ * outside a session (the skills read's `opencode serve`) puts over the
+ * agent's env vars: the launch's config isolation, and the agent's
+ * `OPENCODE_CONFIG_CONTENT` without its `plugin` list (always set, so an
+ * inherited one is replaced too). Null where the launch has no isolation to
+ * copy (not 2.x): do not start one.
+ */
+export function openCodeWorkspaceProcessEnv(
+  version: string | null | undefined,
+  slockHome: string | undefined,
+  agentEnv: Readonly<Record<string, string>> | undefined,
+): Record<string, string> | null {
+  const isolation = openCodeConfigIsolationEnv(version, slockHome);
+  if (!isolation) return null;
+  const config = withoutOpenCodePlugins(parseOpenCodeConfigContent(agentEnv?.OPENCODE_CONFIG_CONTENT));
+  return { ...isolation, OPENCODE_CONFIG_CONTENT: JSON.stringify(config) };
+}
+
+/**
  * The environment OpenCode starts in, on either host (the legacy `opencode
  * run` per turn, the OAR host's `opencode acp` session,
  * agentHost/oarOpencodeLaunch.ts): Raft's CLI transport environment
@@ -515,18 +576,12 @@ export function buildOpenCodeLaunchEnv(
   // (verified: an injected agent beat project, config-dir and user agents of
   // the same name). Sessions, logs and auth stay in OpenCode's own data
   // directories under the host user's HOME/XDG, as on 1.x.
-  const { plugin: _plugin, ...configWithoutPlugins } = selectedConfig;
-  const config = v2 ? configWithoutPlugins : selectedConfig;
-  let emptyConfigDir: string | null = null;
-  if (v2) {
-    const slockHome = ctx.slockHome ? path.resolve(ctx.slockHome) : resolveRaftHome();
-    emptyConfigDir = path.join(slockHome, OPENCODE_EMPTY_CONFIG_DIR);
-    mkdirSync(emptyConfigDir, { recursive: true });
-  }
+  const config = v2 ? withForegroundCompaction(withoutOpenCodePlugins(selectedConfig)) : selectedConfig;
+  const isolation = openCodeConfigIsolationEnv(input.version, ctx.slockHome);
   const env: NodeJS.ProcessEnv = {
     ...spawnEnv,
     OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
-    ...(emptyConfigDir ? { OPENCODE_DISABLE_PROJECT_CONFIG: "1", OPENCODE_CONFIG_DIR: emptyConfigDir } : {}),
+    ...(isolation ?? {}),
     // 2.x has no `--dir` and takes its working directory from $PWD, not
     // from the process cwd (verified on 2.3.0: with cwd set to the
     // workspace and PWD inherited from the daemon, both the agent's and a
@@ -593,13 +648,11 @@ export function detectOpenCodeModelSource(
 }
 
 
-// ── task #1277: asynchronous twins of the Windows models listing above ───────
+// ── task #1277: the legacy driver's launch resolution off the event loop ─────
 //
-// After #9790 the Windows form detection is the only caller of the models
-// command; these twins keep its command resolution, environment and result
-// mapping and run every child (the PATH lookup, the version read, the models
-// listing, the optional `npm root -g`) through runProbeChild. The synchronous
-// functions stay for the launch path and the detection child until their PRs.
+// Every child (the PATH lookup, the version read, the optional `npm root -g`)
+// runs as a bounded probe child. The model listing no longer uses it: it goes
+// through OAR on every platform (detectOpenCodeModelSourceViaOar).
 
 function isProbeAbort(error: unknown): boolean {
   return error instanceof ProbeChildError && error.code === "ABORT_ERR";
@@ -623,7 +676,7 @@ async function resolveWindowsOpenCodePackageEntryAsync(commandPath: string | nul
         platform: deps.platform ?? process.platform,
         signal: deps.signal,
       })).stdout.trim();
-      if (globalRoot) candidates.push(...opencodePackageEntryCandidates(winPath.join(globalRoot, "opencode-ai")));
+      if (globalRoot) for (const pkg of OPENCODE_NPM_PACKAGES) candidates.push(...opencodePackageEntryCandidates(winPath.join(globalRoot, pkg)));
     } catch (error) {
       if (isProbeAbort(error)) throw error;
       // npm is not guaranteed to exist for native OpenCode installs.
@@ -632,7 +685,7 @@ async function resolveWindowsOpenCodePackageEntryAsync(commandPath: string | nul
 
   if (commandPath) {
     const commandDir = winPath.dirname(commandPath);
-    candidates.push(...opencodePackageEntryCandidates(winPath.join(commandDir, "node_modules", "opencode-ai")));
+    for (const pkg of OPENCODE_NPM_PACKAGES) candidates.push(...opencodePackageEntryCandidates(winPath.join(commandDir, "node_modules", pkg)));
     candidates.push(...extractWindowsShimTargets(commandPath, deps));
   }
 
@@ -646,7 +699,7 @@ async function resolveWindowsOpenCodePackageEntryAsync(commandPath: string | nul
 export async function resolveOpenCodeSpawnAsync(commandArgs: string[], deps: OpenCodeProbeDeps = {}): Promise<OpenCodeSpawnSpec> {
   const platform = deps.platform ?? process.platform;
   if (platform !== "win32") {
-    const command = await resolveCommandOnPathAsync("opencode", deps);
+    const command = await resolveCommandOnPathAsync("opencode", deps) ?? openCodeInstallScriptPosix(deps);
     if (!command) {
       throw new RuntimeExecutableNotFoundError({ runtimeId: "opencode", message: "Cannot resolve OpenCode CLI on PATH." });
     }
@@ -657,6 +710,8 @@ export async function resolveOpenCodeSpawnAsync(commandArgs: string[], deps: Ope
   if (command && path.win32.extname(command).toLowerCase() === ".exe") {
     return { command, args: commandArgs, shell: false };
   }
+  const installScriptExe = command ? null : openCodeInstallScriptExe(deps);
+  if (installScriptExe) return { command: installScriptExe, args: commandArgs, shell: false };
 
   const packageEntry = await resolveWindowsOpenCodePackageEntryAsync(command, deps);
   if (packageEntry) return openCodeSpecForEntry(packageEntry, commandArgs, deps);
@@ -667,8 +722,8 @@ export async function resolveOpenCodeSpawnAsync(commandArgs: string[], deps: Ope
 
   throw new RuntimeExecutableNotFoundError({ runtimeId: "opencode", message:
     "Cannot resolve OpenCode CLI entry point on Windows without cmd.exe. " +
-    "Install the native OpenCode executable or install opencode-ai globally so Slock can launch " +
-    "node_modules/opencode-ai/bin/opencode.exe directly." });
+    "Install the native OpenCode executable, or install OpenCode globally with npm " +
+    "(`npm i -g @opencode/cli` for 2.x, `npm i -g opencode-ai` for 1.x) so Raft can launch its opencode.exe directly." });
 }
 
 /**
@@ -694,16 +749,6 @@ export async function readOpenCodeVersionDetailedAsync(deps: OpenCodeProbeDeps &
   return { kind: "version", version: read.version };
 }
 
-async function readOpenCodeVersionAsync(deps: OpenCodeProbeDeps = {}): Promise<string | null> {
-  try {
-    const read = await readOpenCodeVersionDetailedAsync(deps);
-    return read.kind === "version" ? read.version : null;
-  } catch (error) {
-    if (isProbeAbort(error)) throw error;
-    return null;
-  }
-}
-
 /** task #1365 — a start whose OpenCode version could not be established; retryable (runtime_not_found with a lookup verdict). */
 export function openCodeVersionUnknownError(read: Extract<OpenCodeVersionRead, { kind: "unknown" }>): RuntimeExecutableNotFoundError {
   return new RuntimeExecutableNotFoundError({
@@ -716,67 +761,76 @@ export function openCodeVersionUnknownError(read: Extract<OpenCodeVersionRead, {
   });
 }
 
-type OpenCodeModelsCommandAsync = (home: string) => Promise<OpenCodeModelsCommandResult>;
-
-/** task #1277 — {@link runOpenCodeModelsCommand} off the event loop; same result shape (status / stdout / error). */
-export async function runOpenCodeModelsCommandAsync(
-  home: string,
-  deps: OpenCodeProbeDeps = {},
-): Promise<OpenCodeModelsCommandResult> {
-  const platform = deps.platform ?? process.platform;
-  const runChild = deps.runProbeChildFn ?? runProbeChild;
-  const env = { ...ambientProcessEnv(), HOME: home, FORCE_COLOR: "0", NO_COLOR: "1" };
-  // task #1258: on 2.x every subcommand, `models` included, attaches to or
-  // starts the per-user background server unless told to stand alone.
-  const modelsArgs = isOpenCodeV2Launch(await readOpenCodeVersionAsync({ ...deps, env })) ? ["models", "--standalone"] : ["models"];
-  let launch: { command: string; args: string[]; env?: NodeJS.ProcessEnv } = { command: "opencode", args: modelsArgs };
-  if (platform === "win32") {
-    try {
-      launch = await resolveOpenCodeSpawnAsync(modelsArgs, { ...deps, env });
-    } catch (error) {
-      if (isProbeAbort(error)) throw error;
-      return { status: null, stdout: "", error: error as Error };
-    }
-  }
-  try {
-    const { stdout } = await runChild(launch.command, launch.args, {
-      env: launch.env ?? env,
-      timeoutMs: 5000,
-      shell: false,
-      platform,
-      signal: deps.signal,
-    });
-    return { status: 0, stdout };
-  } catch (error) {
-    if (isProbeAbort(error)) throw error;
-    const failure = error as ProbeChildError;
-    // A non-zero exit carries its status, as spawnSync's result did; a timeout
-    // or spawn failure carries the error, as spawnSync's `error` did.
-    if (typeof failure.status === "number") return { status: failure.status, stdout: failure.stdout ?? "" };
-    return { status: null, stdout: failure.stdout ?? "", error: failure };
-  }
-}
-
-/** task #1277 — {@link detectOpenCodeModelSource} off the event loop; same outcome mapping. */
-export async function detectOpenCodeModelSourceAsync(
-  home: string = os.homedir(),
-  runCommand: OpenCodeModelsCommandAsync = runOpenCodeModelsCommandAsync,
-): Promise<RuntimeModelSourceOutcome> {
-  const commandResult = await runCommand(home);
-  if (commandResult.error || commandResult.status !== 0) {
-    return { kind: "error", retryable: true };
-  }
-  return runtimeModelSourceOutcomeFromSet(parseOpenCodeModelsOutput(commandResult.stdout));
-}
-
 /** Above OAR's cold first run (it also fetches models.dev) and under the server's 20 s per-detection budget. */
 const OPENCODE_MODEL_DETECTION_DEADLINE_MS = 15_000;
 
+/** The Windows environment read (ProbeDeps) and a stand-in for OAR's runtime. */
+export interface OpenCodeInstallationDeps extends ProbeDeps {
+  /** Stand-in for OAR's OpenCode runtime (tests). */
+  loadRuntime?: () => Promise<Pick<Runtime, "installation">>;
+}
+
 /**
- * Lists opencode models through OAR's `listModels`: asynchronous, so a slow
- * `opencode models` no longer blocks the daemon's event loop the way the
- * spawnSync path did. The listed binary is the one sessions launch: the bare
- * `opencode` command on PATH, which is what `runOpenCodeModelsCommand` ran.
+ * OpenCode as OAR finds it: `opencode` on PATH (with PATHEXT on Windows),
+ * then the install script's `~/.opencode/bin`, its `--version` run through a
+ * Windows command shim's own target (npm's `%dp0%` and pnpm's `%~dp0` shims
+ * alike, so `npm i -g @opencode/cli` is found). Detection, the model listing
+ * and the OAR host's launch all take this one installation; Raft keeps no
+ * OpenCode lookup of its own for them. On Windows the PATH is first refreshed
+ * from the registry, as Raft's own lookups do, so a CLI installed after the
+ * Computer started is found. Rejects when OAR's `--version` run fails.
+ */
+export async function readOpenCodeInstallation(deps: OpenCodeInstallationDeps = {}): Promise<InstallationSnapshot> {
+  const runtime = await (deps.loadRuntime ?? (() => loadOarRuntime("opencode")))();
+  if (!runtime.installation) throw new Error("OAR's opencode runtime has no installation probe");
+  const base = (deps.platform ?? process.platform) === "win32"
+    ? await withWindowsUserEnvironmentAsync(deps.env ?? ambientProcessEnv(), deps)
+    : deps.env;
+  if (!base) return runtime.installation();
+  const env: Record<string, string> = {};
+  for (const [name, value] of Object.entries(base)) {
+    if (value !== undefined) env[name] = value;
+  }
+  return runtime.installation({ env });
+}
+
+/** What the runtime inventory reports for OAR's OpenCode installation; the version range is Raft's own (unsupportedOpenCodeVersionMessage). */
+export async function probeOpenCodeInstallation(read: () => Promise<InstallationSnapshot> = readOpenCodeInstallation): Promise<RuntimeProbeResult> {
+  let installation: InstallationSnapshot;
+  try {
+    installation = await read();
+  } catch (error) {
+    // Found, but its `--version` could not run (spawn failure, timeout): not
+    // "not installed". The diagnostic names no path (a Windows path carries
+    // the user name).
+    const code = (error as { code?: unknown } | null)?.code;
+    return {
+      available: false,
+      unavailableReason: "probe_failed",
+      diagnostic: `OpenCode's installation could not be checked (\`opencode --version\` or the lookup itself failed)${typeof code === "string" ? ` (${code})` : ""}.`,
+    };
+  }
+  if (installation.kind === "not_found") return { available: false, unavailableReason: "not_installed" };
+  if (installation.kind === "unsupported") {
+    return installation.code === "version_unsupported"
+      ? { available: false, unavailableReason: "unsupported_version", ...(installation.installedVersion ? { version: `${installation.installedVersion} (requires ${openCodeSupportedRangeText()})` } : {}) }
+      : { available: false, unavailableReason: "probe_failed" };
+  }
+  const version = installation.via === "executable" ? installation.version ?? null : null;
+  if (unsupportedOpenCodeVersionMessage(version)) {
+    return {
+      available: false,
+      unavailableReason: "unsupported_version",
+      version: `${version} (requires ${openCodeSupportedRangeText()})`,
+    };
+  }
+  return { available: true, ...(version ? { version } : {}) };
+}
+
+/**
+ * Lists opencode models through OAR's `listModels`, asynchronously, on every
+ * platform. The listed binary is OAR's installation (readOpenCodeInstallation),
+ * the one the OAR host launches; its version read spares OAR a second one.
  */
 async function opencodeModelLister(): Promise<ModelLister> {
   const { listModels } = await loadOarRuntime("opencode");
@@ -787,11 +841,22 @@ async function opencodeModelLister(): Promise<ModelLister> {
 export async function detectOpenCodeModelSourceViaOar(
   lister?: ModelLister,
   deadlineMs: number = OPENCODE_MODEL_DETECTION_DEADLINE_MS,
+  readInstallation: () => Promise<InstallationSnapshot> = readOpenCodeInstallation,
 ): Promise<RuntimeModelSourceOutcome> {
+  const startedAt = Date.now();
+  let installation: InstallationSnapshot;
+  try {
+    installation = await readInstallation();
+  } catch {
+    return { kind: "error", retryable: true, code: "detect_failed" };
+  }
+  if (installation.kind === "not_found") return { kind: "error", retryable: true, code: "runtime_not_found" };
+  if (installation.kind !== "available") return { kind: "error", retryable: true, code: "protocol_unsupported" };
   return detectModelSourceViaOar({
     lister: lister ?? await opencodeModelLister(),
-    installation: { kind: "available", via: "executable", command: "opencode" },
-    deadlineMs,
+    installation,
+    // One budget for the installation read and the listing.
+    deadlineMs: Math.max(1_000, deadlineMs - (Date.now() - startedAt)),
     // OAR's 1.x display name drops the provider ("GPT-5 Nano"); keep the
     // daemon's provider-qualified label ("GPT 5 Nano · OpenCode Zen").
     label: (entry) => formatRuntimeProviderModelLabel(entry.id),
@@ -840,6 +905,41 @@ function isWindowsCommandShim(commandPath: string): boolean {
   return ext === ".cmd" || ext === ".bat";
 }
 
+/**
+ * The npm packages OpenCode ships as: 1.x `opencode-ai`, 2.x `@opencode/cli`.
+ * Windows only, for the legacy driver, which launches the package's
+ * `bin/opencode.exe` itself (no cmd.exe). TEMPORARY (#proj-runtime:#71,
+ * #oar-raft:38631b94): goes with the legacy driver once OpenCode runs on the
+ * OAR host on Windows, where OAR resolves npm's shims.
+ */
+const OPENCODE_NPM_PACKAGES = ["opencode-ai", "@opencode/cli"] as const;
+
+/**
+ * The install script's `%USERPROFILE%\.opencode\bin\opencode.exe`, which OAR's
+ * detection also finds off PATH: without it the runtime list could say
+ * available while the legacy launch says not found. Same TEMPORARY scope as
+ * OPENCODE_NPM_PACKAGES.
+ */
+function openCodeInstallScriptExe(deps: OpenCodeProbeDeps): string | null {
+  const env = deps.env ?? ambientProcessEnv();
+  const home = env.USERPROFILE || env.HOME || os.homedir();
+  const exe = path.win32.join(home, ".opencode", "bin", "opencode.exe");
+  return (deps.existsSyncFn ?? existsSync)(exe) ? exe : null;
+}
+
+/**
+ * The install script's `~/.opencode/bin/opencode` on macOS and Linux (what
+ * Install on the web runs for OpenCode 2.x, and OAR's detection finds off
+ * PATH). The script adds that folder to the shell profile only, so a daemon
+ * started before the install, or as a service, never has it on PATH.
+ */
+function openCodeInstallScriptPosix(deps: OpenCodeProbeDeps): string | null {
+  const env = deps.env ?? ambientProcessEnv();
+  const home = env.HOME || os.homedir();
+  const bin = path.posix.join(home, ".opencode", "bin", "opencode");
+  return (deps.existsSyncFn ?? existsSync)(bin) ? bin : null;
+}
+
 function opencodePackageEntryCandidates(packageRoot: string): string[] {
   const winPath = path.win32;
   return [
@@ -882,7 +982,7 @@ function resolveWindowsOpenCodePackageEntry(commandPath: string | null, deps: Op
         env,
       })).trim();
       if (globalRoot) {
-        candidates.push(...opencodePackageEntryCandidates(winPath.join(globalRoot, "opencode-ai")));
+        for (const pkg of OPENCODE_NPM_PACKAGES) candidates.push(...opencodePackageEntryCandidates(winPath.join(globalRoot, pkg)));
       }
     } catch {
       // npm is not guaranteed to exist for native OpenCode installs.
@@ -891,7 +991,7 @@ function resolveWindowsOpenCodePackageEntry(commandPath: string | null, deps: Op
 
   if (commandPath) {
     const commandDir = winPath.dirname(commandPath);
-    candidates.push(...opencodePackageEntryCandidates(winPath.join(commandDir, "node_modules", "opencode-ai")));
+    for (const pkg of OPENCODE_NPM_PACKAGES) candidates.push(...opencodePackageEntryCandidates(winPath.join(commandDir, "node_modules", pkg)));
     candidates.push(...extractWindowsShimTargets(commandPath, deps));
   }
 
@@ -926,7 +1026,7 @@ function extractWindowsShimTargets(commandPath: string, deps: OpenCodeProbeDeps 
 export function resolveOpenCodeSpawn(commandArgs: string[], deps: OpenCodeProbeDeps = {}): OpenCodeSpawnSpec {
   const platform = deps.platform ?? process.platform;
   if (platform !== "win32") {
-    const command = resolveCommandOnPath("opencode", deps);
+    const command = resolveCommandOnPath("opencode", deps) ?? openCodeInstallScriptPosix(deps);
     if (!command) {
       throw new RuntimeExecutableNotFoundError({ runtimeId: "opencode", message: "Cannot resolve OpenCode CLI on PATH." });
     }
@@ -941,6 +1041,8 @@ export function resolveOpenCodeSpawn(commandArgs: string[], deps: OpenCodeProbeD
   if (command && path.win32.extname(command).toLowerCase() === ".exe") {
     return { command, args: commandArgs, shell: false };
   }
+  const installScriptExe = command ? null : openCodeInstallScriptExe(deps);
+  if (installScriptExe) return { command: installScriptExe, args: commandArgs, shell: false };
 
   const packageEntry = resolveWindowsOpenCodePackageEntry(command, deps);
   if (packageEntry) return openCodeSpecForEntry(packageEntry, commandArgs, deps);
@@ -951,8 +1053,8 @@ export function resolveOpenCodeSpawn(commandArgs: string[], deps: OpenCodeProbeD
 
   throw new RuntimeExecutableNotFoundError({ runtimeId: "opencode", message:
     "Cannot resolve OpenCode CLI entry point on Windows without cmd.exe. " +
-    "Install the native OpenCode executable or install opencode-ai globally so Slock can launch " +
-    "node_modules/opencode-ai/bin/opencode.exe directly." });
+    "Install the native OpenCode executable, or install OpenCode globally with npm " +
+    "(`npm i -g @opencode/cli` for 2.x, `npm i -g opencode-ai` for 1.x) so Raft can launch its opencode.exe directly." });
 }
 
 function readOpenCodeVersion(deps: OpenCodeProbeDeps = {}): string | null {
@@ -965,6 +1067,90 @@ function readOpenCodeVersion(deps: OpenCodeProbeDeps = {}): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * How long a 2.x turn whose reply is printed may wait in `background_wait`
+ * before the daemon stops the run (OpenCodeDriver.quietOutputDeadline). Since
+ * 2.3.1 a shell command still running at its tool timeout always moves to the
+ * background, and `opencode run` stays alive until it ends: a dev server
+ * started through the shell tool would keep the turn open forever. Shell jobs
+ * only: 10 minutes. Any other kind (2.3+ runs sub-agents in the background,
+ * and they do real work), or no job list at all: 30 minutes.
+ */
+export const OPENCODE_BACKGROUND_WAIT_SHELL_CAP_MS = 10 * 60_000;
+export const OPENCODE_BACKGROUND_WAIT_OTHER_CAP_MS = 30 * 60_000;
+
+export interface OpenCodeDriverOptions {
+  /** Overrides of the background wait caps (tests). */
+  backgroundWaitCapMs?: { shell?: number; other?: number };
+  /** Stand-in for OAR's OpenCode installation behind probeAsync and detectModels (tests). */
+  readInstallation?: () => Promise<InstallationSnapshot>;
+}
+
+interface OpenCodeBackgroundJob {
+  /** OpenCode's job id (`sh_...`); compares job sets. Empty when it sent none. */
+  id: string;
+  /** Bounded token (trace-safe); "other" when OpenCode sent none or an odd one. */
+  kind: string;
+  /** The job's title as OpenCode printed it (a shell job's command line): Activity only, never traces. */
+  title: string;
+}
+
+function openCodeBackgroundJobs(raw: unknown): OpenCodeBackgroundJob[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((job) => {
+    const record = recordField(job);
+    const kind = typeof record.kind === "string" && /^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(record.kind) ? record.kind : "other";
+    const title = typeof record.title === "string" ? record.title.trim() : "";
+    const id = typeof record.id === "string" ? record.id : "";
+    return { id, kind, title };
+  });
+}
+
+/** The job set's identity: its ids (kind and title stand in for a missing id), order-free. */
+function backgroundJobSetKey(jobs: OpenCodeBackgroundJob[]): string {
+  return JSON.stringify(jobs.map((job) => job.id || `${job.kind}:${job.title}`).sort());
+}
+
+/** Shell jobs only can take the short cap; any other kind, or an empty or missing list (unknown), takes the long one. */
+function backgroundJobsNeedLongCap(jobs: OpenCodeBackgroundJob[]): boolean {
+  return jobs.length === 0 || jobs.some((job) => job.kind !== "shell");
+}
+
+/** The bounded wait of a 2.x turn whose reply is printed (OpenCodeDriver.quietOutputDeadline). */
+interface OpenCodeBackgroundWaitState {
+  /** Date.now() of the first `background_wait` after the reply. */
+  startedAtMs: number;
+  /** Fixed at the start; only ever moved later (to start + long cap). */
+  deadlineAtMs: number;
+  longCap: boolean;
+  /** The last job set printed. */
+  jobs: OpenCodeBackgroundJob[];
+}
+
+function truncateText(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+/** Up to three titles, each cut to 80 characters, then "+N more". */
+function backgroundJobTitles(jobs: OpenCodeBackgroundJob[]): string {
+  const titles = jobs.map((job) => job.title || job.kind);
+  const shown = titles.slice(0, 3).map((title) => truncateText(title.replace(/\s+/g, " "), 80));
+  const more = titles.length - shown.length;
+  return more > 0 ? `${shown.join(", ")} (+${more} more)` : shown.join(", ");
+}
+
+function formatCapDuration(ms: number): string {
+  return ms >= 60_000 && ms % 60_000 === 0 ? `${ms / 60_000} min` : `${Math.round(ms / 1000)} s`;
+}
+
+function backgroundJobsTraceFields(jobs: OpenCodeBackgroundJob[], capMs?: number): { count: number; kinds: string[]; capMinutes?: number } {
+  return {
+    count: jobs.length,
+    kinds: [...new Set(jobs.map((job) => job.kind))].sort(),
+    ...(capMs !== undefined ? { capMinutes: Math.round((capMs / 60_000) * 100) / 100 } : {}),
+  };
 }
 
 function isSystemFirstMessageTask(message: AgentMessage): boolean {
@@ -992,6 +1178,17 @@ function buildOpenCodeSystemPrompt(config: AgentConfig): AxSurfaceText {
  */
 export class OpenCodeDriver implements RuntimeDriver {
   readonly id = "opencode";
+  private readonly backgroundWaitCapMs: { shell: number; other: number };
+  private readonly readInstallation: () => Promise<InstallationSnapshot>;
+
+  constructor(options: OpenCodeDriverOptions = {}) {
+    this.backgroundWaitCapMs = {
+      shell: options.backgroundWaitCapMs?.shell ?? OPENCODE_BACKGROUND_WAIT_SHELL_CAP_MS,
+      other: options.backgroundWaitCapMs?.other ?? OPENCODE_BACKGROUND_WAIT_OTHER_CAP_MS,
+    };
+    this.readInstallation = options.readInstallation ?? (() => readOpenCodeInstallation());
+  }
+
   readonly lifecycle = {
     kind: "per_turn",
     start: "defer_until_concrete_message",
@@ -1050,6 +1247,14 @@ export class OpenCodeDriver implements RuntimeDriver {
   private sessionRecord: { path: string; major: number; version: string } | null = null;
   /** 2.x: the last step was a finished reply (step_finish, not tool-calls) with nothing after it yet; see parseStdoutEnd. */
   private replyFinished = false;
+  /**
+   * 2.x: the turn is answered (a finished reply, then `background_wait`) and
+   * `opencode run` only waits for background jobs; see quietOutputDeadline.
+   * Cleared only by new model work (step_start, text, tool_use) or the cap.
+   */
+  private backgroundWait: OpenCodeBackgroundWaitState | null = null;
+  /** The job set of the last `background_wait` Activity row since the last model work (one row per distinct set). */
+  private backgroundWaitShownKey: string | null = null;
   /** The CLI version read for the last launch (see RuntimeDriver.launchedCliVersion). */
   launchedCliVersion: string | null = null;
   /**
@@ -1062,6 +1267,12 @@ export class OpenCodeDriver implements RuntimeDriver {
    */
   private sessionRecordState: "pending" | "persisted" | "failed" = "pending";
 
+  /**
+   * The synchronous inventory, only for a server without asynchronous runtime
+   * detection (`emitReady`'s in-process round): Raft's own lookup, which
+   * cannot see every Windows install (an npm `@opencode/cli` shim). The
+   * detection round (`detectRuntimesAsync`) uses probeAsync.
+   */
   probe(deps: OpenCodeProbeDeps = {}): RuntimeProbeResult {
     let version: string | null;
     try {
@@ -1088,12 +1299,15 @@ export class OpenCodeDriver implements RuntimeDriver {
     return { available: true, version: version ?? undefined };
   }
 
+  /** The runtime inventory from OAR's installation (readOpenCodeInstallation), with Raft's supported version range. */
+  probeAsync(): Promise<RuntimeProbeResult> {
+    return probeOpenCodeInstallation(this.readInstallation);
+  }
+
   async detectModels(): Promise<RuntimeModelSourceOutcome> {
-    // Windows keeps the daemon's own launch resolution: opencode there is often
-    // an npm .cmd shim that resolveOpenCodeSpawn unwraps to node + entry script.
-    // task #1277: the Windows listing runs as bounded probe children too.
-    if (process.platform === "win32") return detectOpenCodeModelSourceAsync();
-    return detectOpenCodeModelSourceViaOar();
+    // Every platform through OAR, Windows included: OAR runs a command shim's
+    // own target (an npm `@opencode/cli` or `opencode-ai` shim).
+    return detectOpenCodeModelSourceViaOar(undefined, undefined, this.readInstallation);
   }
 
   async spawn(ctx: SpawnContext): Promise<SpawnResult> {
@@ -1102,6 +1316,9 @@ export class OpenCodeDriver implements RuntimeDriver {
     this.seenToolCallIds.clear();
     this.persistedSessionId = null;
     this.sessionRecordState = "pending";
+    this.replyFinished = false;
+    this.backgroundWait = null;
+    this.backgroundWaitShownKey = null;
 
     // task #1277: the version read and the launch resolution run as bounded
     // probe children under this start attempt's signal; a cancelled lookup is
@@ -1279,6 +1496,14 @@ export class OpenCodeDriver implements RuntimeDriver {
       this.announcedId = announced;
     }
 
+    // New model work ends a background wait (and its cap); nothing else does:
+    // a stray line, an error or an unknown event type leaves the deadline
+    // running (see quietOutputDeadline).
+    if (event.type === "step_start" || event.type === "text" || event.type === "tool_use") {
+      this.backgroundWait = null;
+      this.backgroundWaitShownKey = null;
+    }
+
     switch (event.type) {
       case "step_start":
         this.replyFinished = false;
@@ -1314,10 +1539,52 @@ export class OpenCodeDriver implements RuntimeDriver {
         }
         break;
 
-      case "background_wait":
+      case "background_wait": {
         // 2.3.0: the parent waits for background sub-agents and resumes after.
+        // 2.3.1: also for a shell command still running at its tool timeout
+        // (always moved to the background now). Observed on 2.3.1: reply,
+        // background_wait 10 ms later, the wait for the job, then a new step
+        // with a second reply and an exit about 10 ms after it.
+        const jobs = openCodeBackgroundJobs(event.jobs);
+        const jobSetKey = backgroundJobSetKey(jobs);
+        const longCap = backgroundJobsNeedLongCap(jobs);
+        const replied = this.replyFinished;
         this.replyFinished = false;
+        // One Activity row per distinct job set: a repeated wait adds none.
+        if (jobSetKey !== this.backgroundWaitShownKey) {
+          this.backgroundWaitShownKey = jobSetKey;
+          events.push({
+            kind: "runtime_diagnostic",
+            severity: "info",
+            source: "opencode_background_wait",
+            itemType: "background_wait",
+            message: jobs.length > 0 ? `Waiting for ${jobs.length} background job(s): ${backgroundJobTitles(jobs)}` : "Waiting for background jobs",
+            backgroundJobs: backgroundJobsTraceFields(jobs),
+          });
+        }
+        const wait = this.backgroundWait;
+        if (wait) {
+          // Already waiting: never restart the clock (a CLI that re-prints
+          // the wait would never be bounded) and never shorten it; a job set
+          // that now needs the long cap moves the deadline to start + long cap.
+          wait.jobs = jobs;
+          if (longCap && !wait.longCap) {
+            wait.longCap = true;
+            wait.deadlineAtMs = Math.max(wait.deadlineAtMs, wait.startedAtMs + this.backgroundWaitCapMs.other);
+          }
+        } else if (replied && isOpenCodeV2Launch(this.launchedCliVersion)) {
+          // Bounded only once this turn's reply is printed: a wait mid-step
+          // is the model's own work in progress.
+          const startedAtMs = Date.now();
+          this.backgroundWait = {
+            startedAtMs,
+            deadlineAtMs: startedAtMs + (longCap ? this.backgroundWaitCapMs.other : this.backgroundWaitCapMs.shell),
+            longCap,
+            jobs,
+          };
+        }
         break;
+      }
 
       case "error": {
         const message =
@@ -1336,11 +1603,58 @@ export class OpenCodeDriver implements RuntimeDriver {
   }
 
   /**
+   * 2.x: the bounded background wait. After a finished reply, `background_wait`
+   * means the turn is answered and `opencode run` only waits for background
+   * jobs (2.3.1: a shell command past its tool timeout, e.g. a dev server,
+   * which may never end). The deadline is fixed when the wait starts: 10 min
+   * for shell jobs only, 30 min when any job is something else (e.g. a
+   * sub-agent) or the list is empty; a later job set that needs the long cap
+   * extends it to start + 30 min, never shortens it, and a repeated wait
+   * does not restart it. Only new model work (step_start, text, tool_use)
+   * cancels it; if that ends in another reply and wait, a fresh one starts.
+   * When it passes, the session emits a notice and a turn_end: the turn ends as
+   * completed, and the daemon's turn end stop (terminate_on_turn_end:
+   * SIGTERM, which 2.3.1 answers by exiting with 143 and killing the jobs, then
+   * the tree after the grace) ends the run. The exit after a turn_end is the
+   * expected termination, not a runtime failure.
+   */
+  quietOutputDeadline(): RuntimeQuietOutputDeadline | null {
+    const wait = this.backgroundWait;
+    if (!wait) return null;
+    return {
+      atMs: wait.deadlineAtMs,
+      stopReason: "opencode_background_wait_cap",
+      expire: () => {
+        if (this.backgroundWait !== wait) return [];
+        this.backgroundWait = null;
+        this.backgroundWaitShownKey = null;
+        this.replyFinished = false;
+        const capMs = wait.deadlineAtMs - wait.startedAtMs;
+        return [
+          {
+            kind: "runtime_diagnostic",
+            severity: "info",
+            source: "opencode_background_wait",
+            itemType: "background_wait_stopped",
+            message: `Stopped background job(s) still running after ${formatCapDuration(capMs)}${wait.jobs.length > 0 ? `: ${backgroundJobTitles(wait.jobs)}` : ""}`,
+            backgroundJobs: backgroundJobsTraceFields(wait.jobs, capMs),
+          },
+          { kind: "turn_end", sessionId: this.announcedSessionId() },
+        ];
+      },
+    };
+  }
+
+  /**
    * 2.x: the turn ends when the output does, if the last thing printed was
    * reply output (a step_finish other than tool-calls, or text). A run that
    * stopped mid-step (crash, tool call, background wait) gets no turn_end; its
-   * process exit decides the outcome. Known risk, accepted: a 2.x run that
-   * prints its reply and then never exits is not ended here (1.x was killed at
+   * process exit decides the outcome. A 2.x run that prints its reply and then
+   * stays alive is bounded only where it says why: `background_wait` after
+   * the reply ends the turn after the cap (quietOutputDeadline), and
+   * background compaction is turned off at launch (withForegroundCompaction).
+   * Known risk, still accepted: a run that prints its reply and then hangs
+   * silently, without `background_wait`, is not ended here (1.x was killed at
    * its final step_finish). 2.3.0 exits about 80 ms after the reply.
    */
   parseStdoutEnd(): ParsedEvent[] {

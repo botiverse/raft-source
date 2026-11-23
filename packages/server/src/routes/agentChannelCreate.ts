@@ -1,11 +1,11 @@
 import { publishChannelUpdate } from "../services/channelRealtimeEvents";
-import { validateName, type ServerId } from "@botiverse/raft-shared";
+import { createChannelCapabilityFor, validateName, type ServerId } from "@botiverse/raft-shared";
 import type { Server as SocketServer } from "socket.io";
 import * as channelService from "../services/channelService";
 import { archivedNameCollisionBody } from "./archivedNameCollision";
 import { actorHasServerCapabilityInServer } from "../lib/actorPermissions";
 import { addTraceEvent, errorClassOf } from "../tracing/semanticTrace";
-import { agentRefusalBody, agentServerRoleRequiredBody } from "../lib/agentServerRoleRequired";
+import { AGENT_NO_LONGER_EXISTS_REFUSAL, agentRefusalBody, agentServerRoleRequiredBody, type AgentRouteResult } from "../lib/agentServerRoleRequired";
 
 export interface AgentChannelCreateActor {
   id: string;
@@ -13,10 +13,7 @@ export interface AgentChannelCreateActor {
   serverId: string;
 }
 
-export interface AgentChannelCreateResult {
-  status: number;
-  body: Record<string, unknown>;
-}
+export type AgentChannelCreateResult = AgentRouteResult;
 
 function parseVisibility(raw: unknown): channelService.RegularChannelType | null {
   if (raw === undefined || raw === null || raw === "" || raw === "public" || raw === "channel") {
@@ -50,23 +47,26 @@ export async function createChannelForAgent(input: {
       reason: "agent_server_mismatch",
       status_code: 401,
     });
-    return { status: 401, body: { error: "Agent no longer exists" } };
+    return { ok: false, status: 401, refusal: AGENT_NO_LONGER_EXISTS_REFUSAL };
   }
 
-  const hasAuthority = await actorHasServerCapabilityInServer(serverId, "agent", actor.id, "createChannels");
+  const payload = typeof body === "object" && body !== null ? body as Record<string, unknown> : {};
+  // The capability follows the requested visibility, read before the body is
+  // validated so a refusal still comes before a 400, as it did.
+  const requiredCapability = createChannelCapabilityFor(payload.visibility);
+  const hasAuthority = await actorHasServerCapabilityInServer(serverId, "agent", actor.id, requiredCapability);
   addTraceEvent("agent_channel_create.authorization.checked", {
     outcome: hasAuthority ? "allowed" : "denied",
-    required_capability: "createChannels",
+    required_capability: requiredCapability,
   });
   if (!hasAuthority) {
     addTraceEvent("agent_channel_create.request.failed", {
       reason: "capability_required",
       status_code: 403,
     });
-    return { status: 403, body: await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["createChannels"], action: "create channels" }) };
+    return { ok: false, status: 403, refusal: await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: [requiredCapability], action: "create channels" }) };
   }
 
-  const payload = typeof body === "object" && body !== null ? body as Record<string, unknown> : {};
   const rawName = typeof payload.name === "string" ? payload.name.trim().replace(/^#/, "") : "";
   const nameError = validateName(rawName, "Channel name");
   if (nameError) {
@@ -75,7 +75,7 @@ export async function createChannelForAgent(input: {
       reason: "invalid_name",
       status_code: 400,
     });
-    return { status: 400, body: { error: nameError } };
+    return { ok: false, status: 400, refusal: { code: "channel_name_invalid", error: nameError } };
   }
   if (rawName === "all") {
     addTraceEvent("agent_channel_create.validation.failed", { reason: "reserved_name" });
@@ -83,7 +83,7 @@ export async function createChannelForAgent(input: {
       reason: "reserved_name",
       status_code: 400,
     });
-    return { status: 400, body: { error: 'Channel name "all" is reserved' } };
+    return { ok: false, status: 400, refusal: { code: "channel_name_reserved", error: 'Channel name "all" is reserved' } };
   }
 
   const type = parseVisibility(payload.visibility);
@@ -93,7 +93,7 @@ export async function createChannelForAgent(input: {
       reason: "invalid_visibility",
       status_code: 400,
     });
-    return { status: 400, body: { error: "Visibility must be public or private" } };
+    return { ok: false, status: 400, refusal: { code: "channel_visibility_invalid", error: "Visibility must be public or private" } };
   }
   const description = normalizeDescription(payload.description);
   if (typeof description === "object") {
@@ -102,7 +102,7 @@ export async function createChannelForAgent(input: {
       reason: "invalid_description",
       status_code: 400,
     });
-    return { status: 400, body: { error: description.error } };
+    return { ok: false, status: 400, refusal: { code: "channel_description_invalid", error: description.error } };
   }
 
   try {
@@ -126,14 +126,16 @@ export async function createChannelForAgent(input: {
       visibility: type === "private" ? "private" : "public",
     });
 
-    return { status: 200, body: { ...channelWithMetadata, createdByAgentId: actor.id } };
+    return { ok: true, status: 200, body: { ...channelWithMetadata, createdByAgentId: actor.id } };
   } catch (err) {
     if (err instanceof channelService.ArchivedNameCollisionError) {
       addTraceEvent("agent_channel_create.request.failed", {
         reason: "archived_name_collision",
         status_code: 409,
       });
+      // refusal-ok: the archived-name body, the hidden case byte-identical to the live "already taken" below (archivedNameCollision.ts, #proj-chat:#19)
       return {
+        ok: false,
         status: 409,
         body: await archivedNameCollisionBody(err, { type: "agent", id: actor.id, serverId: serverId as ServerId }),
       };
@@ -144,7 +146,8 @@ export async function createChannelForAgent(input: {
         reason: "name_taken",
         status_code: 409,
       });
-      return { status: 409, body: { error: msg } };
+      // refusal-ok: must stay byte-identical to the hidden archived-name body (archivedNameCollision.ts), no existence oracle (#proj-chat:#19)
+      return { ok: false, status: 409, body: { error: msg } };
     }
     if (msg.includes("Channel limit reached")) {
       addTraceEvent("agent_channel_create.request.failed", {
@@ -152,8 +155,9 @@ export async function createChannelForAgent(input: {
         status_code: 403,
       });
       return {
+        ok: false,
         status: 403,
-        body: agentRefusalBody(
+        refusal: agentRefusalBody(
           msg,
           "channel_limit_reached",
           "This server has reached its channel limit. Tell a server owner: they can archive unused channels or change the plan. Do not retry until then.",
@@ -165,6 +169,6 @@ export async function createChannelForAgent(input: {
       status_code: 500,
       error_class: errorClassOf(err),
     });
-    return { status: 500, body: { error: "Failed to create channel" } };
+    return { ok: false, status: 500, body: { error: "Failed to create channel" } };
   }
 }

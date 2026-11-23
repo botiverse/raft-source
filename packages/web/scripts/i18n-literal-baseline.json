@@ -200,14 +200,6 @@
     "reason": "Example webhook URL placeholder in AppNotificationsControls."
   },
   {
-    "path": "src/components/settings/ProviderConnectionsSettings.tsx",
-    "rule": "formatjs/no-literal-string-in-jsx",
-    "source": "placeholder=\"https://gateway.example.com/v1\"",
-    "count": 1,
-    "classification": "code_example",
-    "reason": "Example custom gateway endpoint URL placeholder."
-  },
-  {
     "path": "src/components/settings/settingsNavigation.ts",
     "rule": "formatjs/no-literal-string-in-object",
     "source": "\"About\"",
@@ -230,14 +222,6 @@
     "count": 2,
     "classification": "legacy",
     "reason": "Legacy SETTINGS_TABS English Administration field; production display uses the catalog."
-  },
-  {
-    "path": "src/components/settings/settingsNavigation.ts",
-    "rule": "formatjs/no-literal-string-in-object",
-    "source": "\"AI Providers\"",
-    "count": 2,
-    "classification": "legacy",
-    "reason": "Legacy SETTINGS_TABS English label/title; production nav uses catalog ids and does not consume SETTINGS_LABEL_BY_ID."
   },
   {
     "path": "src/components/settings/settingsNavigation.ts",

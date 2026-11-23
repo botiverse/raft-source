@@ -462,7 +462,7 @@ exports[`channel join / leave / members > raft channel leave --target #general 1
     },
   ],
   "stderr": "",
-  "stdout": "Left #general. You can still inspect visible public channel history there, but you can no longer send or receive ordinary channel delivery until you join the public channel again or a human re-adds you to a private channel.
+  "stdout": "Left #general. You can still inspect visible public channel history there, but you can no longer send or receive ordinary channel delivery until you join the public channel again or a member of the private channel adds you back.
 Still arrives:
 - If #general is public, followed threads still notify until you unfollow them.
 Leaving a channel does not unfollow existing thread follows.
@@ -498,6 +498,166 @@ Server and stored channel roles are shown separately when available.
 }
 `;
 
+exports[`focus / unfocus > raft focus #general (a plain channel) 1`] = `
+{
+  "exitCode": 1,
+  "requests": [
+    {
+      "body": {
+        "target": "#general",
+      },
+      "method": "POST",
+      "path": "/internal/agent-api/focus",
+    },
+  ],
+  "stderr": "Error: Channel focus is deliberately not available yet: focus a thread, a DM or a task conversation instead, as your inbox names them.
+Code: FOCUS_CHANNEL_UNAVAILABLE
+Next action: raft inbox check
+",
+  "stdout": "",
+}
+`;
+
+exports[`focus / unfocus > raft focus #general:aaaabbbb (Focus off) 1`] = `
+{
+  "exitCode": 1,
+  "requests": [
+    {
+      "body": {
+        "target": "#general:aaaabbbb",
+      },
+      "method": "POST",
+      "path": "/internal/agent-api/focus",
+    },
+  ],
+  "stderr": "Error: Focus is not switched on for this server yet: nothing was focused, and every conversation reaches your inbox as before.
+Code: AGENT_FOCUS_DISABLED
+Next action: raft inbox check
+",
+  "stdout": "",
+}
+`;
+
+exports[`focus / unfocus > raft focus #general:aaaabbbb (a fourth: one unfocused) 1`] = `
+{
+  "exitCode": 0,
+  "requests": [
+    {
+      "body": {
+        "target": "#general:aaaabbbb",
+      },
+      "method": "POST",
+      "path": "/internal/agent-api/focus",
+    },
+  ],
+  "stderr": "",
+  "stdout": "Focused #general:aaaabbbb.
+Unfocused dm:@richard (least recently active). Its updates go to your inbox again. To return: raft focus "dm:@richard"
+Focused (3 of 3): #general:aaaabbbb, task #general:#7, #general:ccccdddd
+Unfocus: raft unfocus "#general:aaaabbbb"
+",
+}
+`;
+
+exports[`focus / unfocus > raft focus #general:aaaabbbb (already focused) 1`] = `
+{
+  "exitCode": 0,
+  "requests": [
+    {
+      "body": {
+        "target": "#general:aaaabbbb",
+      },
+      "method": "POST",
+      "path": "/internal/agent-api/focus",
+    },
+  ],
+  "stderr": "",
+  "stdout": "Already focused on #general:aaaabbbb.
+Focused (2 of 3): #general:aaaabbbb, task #general:#7
+",
+}
+`;
+
+exports[`focus / unfocus > raft focus (nothing focused) 1`] = `
+{
+  "exitCode": 0,
+  "requests": [
+    {
+      "method": "GET",
+      "path": "/internal/agent-api/focus",
+    },
+  ],
+  "stderr": "",
+  "stdout": "Nothing focused. Focus a thread, DM or task conversation: raft focus "<target>"
+",
+}
+`;
+
+exports[`focus / unfocus > raft focus 1`] = `
+{
+  "exitCode": 0,
+  "requests": [
+    {
+      "method": "GET",
+      "path": "/internal/agent-api/focus",
+    },
+  ],
+  "stderr": "",
+  "stdout": "Focused (2 of 3): #general:aaaabbbb, task #general:#7
+Unfocus one: raft unfocus "<target>"
+",
+}
+`;
+
+exports[`focus / unfocus > raft unfocus #general:#7 1`] = `
+{
+  "exitCode": 0,
+  "requests": [
+    {
+      "body": {
+        "target": "#general:#7",
+      },
+      "method": "POST",
+      "path": "/internal/agent-api/unfocus",
+    },
+  ],
+  "stderr": "",
+  "stdout": "Unfocused task #general:#7. Its updates go to your inbox.
+Focused (1 of 3): #general:aaaabbbb
+",
+}
+`;
+
+exports[`focus / unfocus > raft unfocus (no target) 1`] = `
+{
+  "exitCode": 1,
+  "requests": [],
+  "stderr": "Error: Name the conversation to unfocus, as the focus list names it.
+Code: INVALID_ARG
+Next action: See what is focused: raft focus
+",
+  "stdout": "",
+}
+`;
+
+exports[`focus / unfocus > raft unfocus dm:@richard (not focused) 1`] = `
+{
+  "exitCode": 0,
+  "requests": [
+    {
+      "body": {
+        "target": "dm:@richard",
+      },
+      "method": "POST",
+      "path": "/internal/agent-api/unfocus",
+    },
+  ],
+  "stderr": "",
+  "stdout": "dm:@richard was not focused.
+",
+}
+`;
+
 exports[`inbox check (inbox items, RFC 081) > raft inbox check 1`] = `
 {
   "exitCode": 0,
@@ -513,7 +673,7 @@ exports[`inbox check (inbox items, RFC 081) > raft inbox check 1`] = `
 dm:@richard · 3 unread · latest @richard 12m ago
   "can you look at the release notes?" (preview)
   read: raft inbox read --target "dm:@richard"
-app:stamp/pr-13754 · 2 unread · from Stamp · about #general:aaaabbbb · latest 25m ago
+app:stamp/pr-13754 · 2 unread · about #general:aaaabbbb · latest 25m ago
   "checks failed on 9ed73d5…" (truncated preview)
   read: raft inbox read --target "app:stamp/pr-13754"
 reminder:76d9397d-1111-4222-8333-444455556666 · 1 fired, not acked · latest 1h ago
@@ -1119,6 +1279,10 @@ exports[`reminder schedule / list / cancel > raft reminder cancel --id 76d9397d 
   "requests": [
     {
       "method": "GET",
+      "path": "/internal/agent-api/context",
+    },
+    {
+      "method": "GET",
       "path": "/internal/agent-api/reminders?status=scheduled%2Cfired",
     },
     {
@@ -1139,6 +1303,10 @@ exports[`reminder schedule / list / cancel > raft reminder list --status fired 1
   "requests": [
     {
       "method": "GET",
+      "path": "/internal/agent-api/context",
+    },
+    {
+      "method": "GET",
       "path": "/internal/agent-api/reminders?status=fired",
     },
   ],
@@ -1153,6 +1321,10 @@ exports[`reminder schedule / list / cancel > raft reminder list 1`] = `
 {
   "exitCode": 0,
   "requests": [
+    {
+      "method": "GET",
+      "path": "/internal/agent-api/context",
+    },
     {
       "method": "GET",
       "path": "/internal/agent-api/reminders?status=scheduled%2Cfired&includeMigrated=true",
@@ -1170,6 +1342,10 @@ exports[`reminder schedule / list / cancel > raft reminder schedule --title chec
 {
   "exitCode": 0,
   "requests": [
+    {
+      "method": "GET",
+      "path": "/internal/agent-api/context",
+    },
     {
       "body": {
         "delaySeconds": 1800,
@@ -1272,7 +1448,7 @@ Authoritative context for this agent process. Do not infer computer identity fro
 - Role: member
 
 ### Channels
-Visible public channels may appear even when \`joined=false\`. Private channels are shown only when you are a member; do not disclose private-channel names, membership, or content outside that channel. Use channel attention commands (\`raft channel join\`, \`leave\`, \`mute\`, \`unmute\`; \`raft thread unfollow\`) for your own delivery state. Existing channel management commands (\`raft channel create\`, \`update\`, \`archive\`, \`unarchive\`, \`add-member\`, \`remove-member\`) work when your server role allows them, or, for update, archive, unarchive and remove-member, your channel-admin role in that channel; the Server checks on each call, and a refusal says what is missing. A channel-admin role never grants delete, visibility, federation, or server-profile actions. There is no Agent command for changing channel roles. Run any subcommand with \`--help\` for syntax.
+Visible public channels may appear even when \`joined=false\`. Private channels are shown only when you are a member; do not disclose private-channel names, membership, or content outside that channel. Use channel attention commands (\`raft channel join\`, \`leave\`, \`mute\`, \`unmute\`; \`raft thread unfollow\`) for your own delivery state. Existing channel management commands (\`raft channel create\`, \`update\`, \`archive\`, \`unarchive\`, \`add-member\`, \`remove-member\`, \`set-role\`) work when your server role allows them, or, for update, archive, unarchive, remove-member and set-role, your channel-admin role in that channel; the Server checks on each call, and a refusal says what is missing. A channel-admin role never grants delete, visibility, federation, or server-profile actions. Run any subcommand with \`--help\` for syntax.
 Server-profile changes still use raft server update and remain server-role gated.
 Mute state is shown when the server provides it; otherwise it is omitted.
   - #general [public, joined] — team-wide chat
@@ -1350,7 +1526,7 @@ Follow up in each task's thread:
 
 exports[`task claim > raft task claim --target #general --number 3 (freshness held) 1`] = `
 {
-  "exitCode": 0,
+  "exitCode": 1,
   "requests": [
     {
       "body": {
@@ -1363,7 +1539,10 @@ exports[`task claim > raft task claim --target #general --number 3 (freshness he
       "path": "/internal/agent-api/tasks/claim",
     },
   ],
-  "stderr": "",
+  "stderr": "Error: Held for unseen messages. Your task claim was not applied.
+Code: TASK_WRITE_HELD
+Retryable: yes
+",
   "stdout": "Held — 1 unread message in #general:#3. Your task claim was not applied.
 
   ├ Latest 1 ────────────────────────────
@@ -1582,7 +1761,7 @@ exports[`user info > raft user info scout 1`] = `
 User: @scout
 Kind: agent
 Status: active; idle
-Description: release scout
+Description (written by them, not by Raft): release scout
 
 ### Visible Channel Memberships
 #general [public, joined]

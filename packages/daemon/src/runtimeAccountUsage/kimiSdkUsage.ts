@@ -63,7 +63,11 @@ function window(label: string, usage: KimiQuotaUsage | undefined): AccountUsageW
   return { label, usedRatio: ratio(usage.usedRatio), ...(resetsAt === undefined ? {} : { resetsAt }) };
 }
 
-/** The SDK's quota as OAR's Kimi reader would report it. Throws when it holds no usable window (as OAR does). */
+/**
+ * The SDK's quota as OAR's Kimi reader reports it. No usable window: the
+ * account has no quota data, `unsupported` / `quota_unavailable` (OAR 0.117,
+ * oar#923; native Kimi says "No usage data available"), not a failed read.
+ */
 export function projectKimiManagedQuota(quota: KimiManagedQuota): OarAccountUsageSnapshot {
   const windows: AccountUsageWindow[] = [
     window("5h limit", quota.usages.limit5h),
@@ -77,7 +81,7 @@ export function projectKimiManagedQuota(quota: KimiManagedQuota): OarAccountUsag
   if (extra && monthlyCap !== null) {
     windows.push({ label: "Extra Usage monthly limit", usedRatio: ratio(extra.monthlyUsedCents / monthlyCap) });
   }
-  if (windows.length === 0) throw new Error("Kimi usage contains no usable quota windows");
+  if (windows.length === 0) return { kind: "unsupported", reason: "quota_unavailable" };
   // Extra Usage's balance bypasses exhausted subscription windows; its monthly cap is the only further blocker.
   const extraHeadroom = extra !== null
     && extra.balanceCents > 0

@@ -18,11 +18,12 @@ import { focusField } from "@botiverse/porthole";
 import { ARTIFACT_COMMENT_MAX_MENTIONS, ARTIFACT_DRAFT_MAX_PER_ARTIFACT } from "@botiverse/raft-shared";
 import type { ArtifactActor, ArtifactCommentImage, ArtifactCommentPart, ArtifactWebCommentInput } from "@botiverse/raft-shared";
 
-import { asFirstPartyAppId, asFirstPartyObjectId, asFirstPartyObjectKind, MentionSuggestionList, useMentionPicker } from "../../components/mention";
+import { asFirstPartyAppId, asFirstPartyObjectId, asFirstPartyObjectKind, COMPOSER_SUGGESTION_MAX_RESULTS, MentionSuggestionList, useMentionPicker } from "../../components/mention";
 import type { MentionCandidate, MentionSource, MentionSuggestionGroup } from "../../components/mention";
 import { useToastViewportFloor } from "../../components/toastViewportBottom";
 import Tooltip from "../../components/ui/Tooltip";
 import { useMediaQuery } from "../../hooks/effectPrimitives";
+import { useArtifactPhoneLayout } from "./artifactPhoneLayout";
 import { ArtifactCardHoldContext } from "./artifactCardHold";
 import { commentAnchorOf, eventServer, trackArtifactCommentPosted } from "./artifactAnalytics";
 import { artifactErrorCode, artifactErrorDetails } from "./artifactApi";
@@ -36,7 +37,7 @@ import {
   mergeWillNotify,
 } from "./artifactComments";
 import { useArtifactComments } from "./ArtifactCommentsContext";
-import { watchFocusIntent } from "../../utils/focusRequest";
+import { requestFocus, watchFocusIntent } from "../../utils/focusRequest";
 import { TOUCH_QUERY } from "./ArtifactReviewContext";
 import type { SentFrom } from "./ArtifactCommentsContext";
 import { CommentImageChips, KeptCommentImages } from "./ArtifactCommentImageChips";
@@ -53,7 +54,6 @@ import { flushArtifactLocalDrafts } from "./artifactLocalDrafts";
 import { useCommentBoxLocalDraft, useKeptWords } from "./useCommentBoxLocalDraft";
 import { artifactActorName } from "./artifactFacts";
 
-const PHONE_QUERY = "(max-width: 767px)";
 const NO_IMAGES: readonly ArtifactCommentImage[] = [];
 
 export type { ArtifactCommentBoxBatch, ArtifactCommentBoxDraftOption, ArtifactCommentBoxKeep, ArtifactCommentBoxMode } from "./artifactCommentBoxShapes";
@@ -192,14 +192,14 @@ export default function ArtifactCommentBox({
    * kept here, gone from there.
    */
   adoptKey?: string | null;
-  /** Words to put in the box once per `key`, after any it holds (a new comment's box). */
+  /** Words to put in the box once per `key`, after any it holds (a new comment's box); none: just focus it. */
   insert?: { key: number; text: string } | null;
 }) {
   const intl = useIntl();
   const { formatMessage } = intl;
   const comments = useArtifactComments();
   const hold = useContext(ArtifactCardHoldContext);
-  const phone = useMediaQuery(PHONE_QUERY);
+  const phone = useArtifactPhoneLayout();
   const coarse = useMediaQuery(TOUCH_QUERY);
   const pageDraft = mode.kind === "new" ? pageOpen?.draft ?? null : null;
   const fromPage = mode.kind === "new" && pageOpen !== null;
@@ -252,7 +252,7 @@ export default function ArtifactCommentBox({
   );
   const groupCandidates = useCallback((ranked: MentionCandidate[]): MentionSuggestionGroup[] => {
     const already = atMentionCap ? new Set(mentioned.map(actorKey)) : null;
-    const offered = already ? ranked.filter((c) => already.has(actorKey(c))) : ranked;
+    const offered = (already ? ranked.filter((c) => already.has(actorKey(c))) : ranked).slice(0, COMPOSER_SUGGESTION_MAX_RESULTS);
     const people = formatMessage({ id: "artifacts.comments.mentionPeople" });
     const agents = formatMessage({ id: "artifacts.comments.mentionAgents" });
     return [
@@ -438,6 +438,13 @@ export default function ArtifactCommentBox({
   useEffect(() => {
     if (!insert || mode.kind !== "new" || inserted.current === insert.key) return;
     inserted.current = insert.key;
+    // Nothing handed in: the person asked to write here (the header's Comment button, artifactListCompose
+    // `writeInList`): the box, focused, the words it holds kept.
+    // oxlint-disable-next-line react-doctor/no-event-handler -- once per key (the guard above), as the words below: the ask comes from the list's opener, which can't reach this box's field before it mounts
+    if (insert.text === "") {
+      requestFocus(() => inputRef.current, { reason: "user" });
+      return;
+    }
     // oxlint-disable-next-line react-doctor/no-derived-state, react-doctor/no-pass-live-state-to-parent -- once per key (the guard above): words handed in, then the person's, as if typed; not state kept in sync
     putIn(insert.text);
   }, [insert, mode.kind, putIn]);

@@ -2,8 +2,8 @@
   "formatVersion": 1,
   "id": "predicate_muted_channel_mention",
   "rule": "predicate",
-  "title": "In a muted channel, a mention of the viewer lights the @ and does not count",
-  "why": "RisingWave counts only the pre-mute prefix and surfaces the mention through the mention arm. Decided (Tenny, #14988 review): follow the server (RisingWave). The canonical Postgres read in getInboxItems follows it too: its count stops at the mute boundary (inboxRowMessageCountsUnreadSql), and the mention still admits the row and lights the @ (activityPromotionAllowedByMuteSql, inboxPersonalMentionSql).",
+  "title": "In a muted channel, a mention of the viewer lights the @, does not count and does not move the row",
+  "why": "RisingWave counts only the pre-mute prefix and surfaces the mention through the mention arm. Decided (Tenny, #14988 review): follow the server (RisingWave). The canonical Postgres read in getInboxItems follows it too: its count stops at the mute boundary (inboxRowMessageCountsUnreadSql), and the mention lights the @ (inboxPersonalMentionSql). It does not move a row with a pre-mute message: RisingWave keeps the row at its last message before the mute (rw_inbox_serving_v9: latest_activity_seq is the muted prefix's latest_seq; a mention-only row follows its mentions), and the Postgres read picks the row's latest message the same way (legacyChatLatestActivityMessageSql). Decided: Tenny, #triage:#244, 2026-11-16 (follow RisingWave).",
   "status": "agreed",
   "sources": {
     "web": [
@@ -43,7 +43,8 @@
   "expect": {
     "verdict": {
       "counts": false,
-      "mention": true
+      "mention": true,
+      "moves": false
     }
   }
 }

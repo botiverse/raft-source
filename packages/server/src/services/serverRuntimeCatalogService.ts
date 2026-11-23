@@ -9,7 +9,7 @@ import {
   type ServerRuntimeCatalogEntry,
   type ServerRuntimeCatalogForm,
 } from "@botiverse/raft-shared";
-import { isRuntimeAdmittedForNewUse, isRuntimeRevived, type RuntimeAdmissionPolicy } from "./runtimeAdmissionService";
+import { isRuntimeAdmittedForNewUse, type RuntimeAdmissionPolicy } from "./runtimeAdmissionService";
 import { runtimeFormV1Entry } from "./runtimeFormDefinitionService";
 import { runtimeFormV2Entry } from "./runtimeFormV2Registry";
 
@@ -25,11 +25,11 @@ export function projectServerRuntimeCatalog(policy: RuntimeAdmissionPolicy): Ser
     catalogVersion: SERVER_RUNTIME_CATALOG_VERSION,
     runtimes: RUNTIMES
       .filter((runtime) => isRuntimeAdmittedForNewUse(runtime.id, policy))
-      .map((runtime) => projectEntry(runtime, policy)),
+      .map(projectEntry),
   };
 }
 
-function projectEntry(runtime: RuntimeInfo, policy: RuntimeAdmissionPolicy): ServerRuntimeCatalogEntry {
+function projectEntry(runtime: RuntimeInfo): ServerRuntimeCatalogEntry {
   return {
     id: runtime.id,
     displayName: runtime.displayName,
@@ -37,8 +37,7 @@ function projectEntry(runtime: RuntimeInfo, policy: RuntimeAdmissionPolicy): Ser
     binary: runtime.binary,
     supported: runtime.supported,
     experimental: Boolean(runtime.experimental),
-    // A deprecated runtime this server revived (its OAR flag is on) is offered for new agents.
-    deprecated: Boolean(runtime.deprecated) && !isRuntimeRevived(runtime.id, policy),
+    deprecated: Boolean(runtime.deprecated),
     oarOnly: isOarOnlyRuntime(runtime.id),
     models: RUNTIME_MODELS[runtime.id] ?? [],
     modelsSource: hasStaticRuntimeModelSource(runtime.id) ? "static" : "fallback",

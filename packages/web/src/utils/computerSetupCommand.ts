@@ -35,6 +35,11 @@ function computerInstallChannelArgs(deploymentEnv: string | undefined, versionPi
   return deploymentEnv === "staging" && !versionPin ? ["--channel", STAGING_COMPUTER_CHANNEL] : [];
 }
 
+/** The Hands channel an unpinned install command for `deploymentEnv` installs from. */
+export function computerInstallChannel(deploymentEnv: string | undefined): "main" | "alpha" {
+  return deploymentEnv === "staging" ? STAGING_COMPUTER_CHANNEL : "main";
+}
+
 function computerInstallShellCommand(
   deploymentEnv: string | undefined,
   version: string | null | undefined,
@@ -79,6 +84,14 @@ export interface ComputerSetupCommandOptions {
   // uses the currently published Computer artifact instead of relying on a
   // CDN edge's potentially stale latest manifest.
   version?: string | null;
+  // Add Computer's pairing (docs/contracts/computer-pairing.md): `--pair=<id>`
+  // (one token: a base64url id may start with `-`, which a shell script's own
+  // option parsing could take for a flag)
+  // so the window that copied the command can approve the Computer without a
+  // code. Only in the one-paste install-and-setup form, which installs the
+  // current raft-computer before its setup sees the option; an older
+  // installed raft-computer would refuse it in the plain `setup` command.
+  pairingId?: string | null;
 }
 
 export interface ComputerCommands {
@@ -182,7 +195,9 @@ export function getComputerCommands(
     setup: `raft-computer setup /${slug}${setupArgs}`,
     installAndSetup: platform === "windows"
       ? null
-      : computerInstallShellCommand(deploymentEnv, options.version, [`--setup /${slug}${setupArgs}`]),
+      : computerInstallShellCommand(deploymentEnv, options.version, [
+        `--setup /${slug}${setupArgs}${options.pairingId ? ` --pair=${options.pairingId}` : ""}`,
+      ]),
     status: "raft-computer status",
     doctor: "raft-computer doctor",
     upgrade: "raft-computer upgrade",

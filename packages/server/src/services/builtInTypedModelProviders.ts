@@ -22,19 +22,16 @@ import {
  *   Built-in model source exactly as the option-source route resolves it
  *   (bounded probe, shared cache, machine-local routing).
  * Anything else (no capability, no Computer, offline, legacy catalog, an
- * error) is none. `connections`: those of them the Computer also runs through
- * a saved connection (its catalog's customModelConnectionProviderIds; none on
- * a Computer released before that). "handled": the request was routed to the
- * replica that owns the machine, which already answered it.
+ * error) is none. "handled": the request was routed to the replica that owns
+ * the machine, which already answered it.
  */
 export async function builtInTypedModelProvidersFor(input: {
   req: Request;
   res: Response;
-  serverId: string;
   machine: NonNullable<Awaited<ReturnType<typeof machineService.getMachine>>> | null;
   clientCapabilities: readonly string[];
 }): Promise<BuiltInTypedModelProviders | "handled"> {
-  const none: BuiltInTypedModelProviders = { presets: [], connections: [] };
+  const none: BuiltInTypedModelProviders = { presets: [] };
   const { req, res, machine } = input;
   if (!machine || !clientRendersDependentCustomWithOptions(input.clientCapabilities)) return none;
   const entry = runtimeFormV2Entry("builtin");
@@ -51,28 +48,15 @@ export async function builtInTypedModelProvidersFor(input: {
       () => agentOrchestrator.hasMachineLocally(machine.id),
     ),
   });
-  // The catalog the model source was filtered by, for the connection set.
-  let catalog: unknown;
-  const probe: typeof computerProbe.probe = {
-    ...computerProbe.probe,
-    async detectMachineRuntimeModelsWithAuthority(...args) {
-      const detection = await computerProbe.probe.detectMachineRuntimeModelsWithAuthority(...args);
-      catalog = detection.outcome.kind === "live" ? detection.outcome.value.catalog : undefined;
-      return detection;
-    },
-  };
   try {
     const resolution = await entry.resolveOptionSource({
       sourceId: "model",
       machineId: machine.id,
       machine,
-      serverId: input.serverId,
       formRevision: undefined,
-      connectionsVisible: false,
       refresh: false,
-      sourceStatus: true,
       clientCapabilities: input.clientCapabilities,
-      agentOrchestrator: probe,
+      agentOrchestrator: computerProbe.probe,
       routeToComputer: computerProbe.routeToComputer,
     });
     if (resolution.kind === "handled") return "handled";
@@ -82,11 +66,7 @@ export async function builtInTypedModelProvidersFor(input: {
     const presets = Object.entries(source.customValueAllowedByValue ?? {})
       .filter(([providerId, allowed]) => allowed && isBuiltInRuntimeCustomModelPresetProviderId(providerId))
       .map(([providerId]) => providerId);
-    const throughConnection = (catalog as { customModelConnectionProviderIds?: unknown } | undefined)?.customModelConnectionProviderIds;
-    return {
-      presets,
-      connections: Array.isArray(throughConnection) ? presets.filter((providerId) => throughConnection.includes(providerId)) : [],
-    };
+    return { presets };
   } catch {
     return none;
   }

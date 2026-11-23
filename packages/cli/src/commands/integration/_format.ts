@@ -387,6 +387,10 @@ export const formatIntegrationLogin = axSurface(
     lines.push(data.session.authentication === "verified"
       ? `next: use \`raft integration invoke --service ${JSON.stringify(data.service.clientId)} --list-actions\` for login_with_raft HTTP API action manifests`
       : `next: use \`raft integration invoke --service ${JSON.stringify(data.service.clientId)} --list-actions\` only for login_with_raft HTTP API action manifests; for session-cookie services, verify authentication with a documented read-only service check before use`);
+  } else if (!data.service.returnUrl?.trim()) {
+    // A token-only App: no redirect URL, so there is no sign-in to hand off to.
+    lines.push("session: none; this App has no return URL, so it takes no sign-in (a token-only App)");
+    lines.push(`next: for its agent tokens use \`raft integration token --service ${JSON.stringify(data.service.clientId)} --exec <program>\``);
   } else {
     lines.push("session: no service callback session was established; Raft grant is active");
     lines.push("next: follow the service documentation to establish and verify application authentication");

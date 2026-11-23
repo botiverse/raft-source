@@ -10,11 +10,17 @@ import type {
   AgentApiIntegrationAppManageResponse,
   AgentApiIntegrationAppPrepareResponse,
   AgentApiOwnedIntegrationApp,
+  AgentTokenSigningAlg,
+  AgentTokenType,
   OAuthClientCategory,
 } from "@botiverse/raft-shared";
 import {
+  AGENT_TOKEN_SIGNING_ALGS,
+  AGENT_TOKEN_TYPES,
   OAUTH_CLIENT_CATEGORIES,
   canonicalizeOAuthClientCategory,
+  isAgentTokenSigningAlg,
+  isAgentTokenType,
 } from "@botiverse/raft-shared/src/agentCliSurface";
 
 import { defineCommand, registerCliCommand } from "../../core/command";
@@ -99,6 +105,25 @@ function optionalCategory(value: string | undefined): OAuthClientCategory | unde
   return category;
 }
 
+function optionalAgentTokenSigningAlg(value: string | undefined): AgentTokenSigningAlg | undefined {
+  if (value === undefined) return undefined;
+  const alg = value.trim().toUpperCase();
+  if (!isAgentTokenSigningAlg(alg)) {
+    throw cliError("INVALID_ARG", `--agent-token-signing-alg must be one of: ${AGENT_TOKEN_SIGNING_ALGS.join(", ")}`);
+  }
+  return alg;
+}
+
+/** Exactly at+jwt or JWT (surrounding spaces trimmed): the header value, so no case folding. */
+function optionalAgentTokenType(value: string | undefined): AgentTokenType | undefined {
+  if (value === undefined) return undefined;
+  const typ = value.trim();
+  if (!isAgentTokenType(typ)) {
+    throw cliError("INVALID_ARG", `--agent-token-type must be exactly one of: ${AGENT_TOKEN_TYPES.join(", ")}`);
+  }
+  return typ;
+}
+
 function formatAppPrepare(data: AgentApiIntegrationAppPrepareResponse): string {
   const lines = [
     `Integration app ${data.mode} card prepared`,
@@ -152,7 +177,7 @@ async function prepareApp(
     : { ...commonBody, mode: "register" as const, clientKey: optionalTrimmed(opts.clientKey) };
   if (body.mode === "register") {
     requiredTrimmed(body.name, "--name");
-    requiredTrimmed(body.returnUrl, "--redirect-url");
+    // No --redirect-url registers a token-only App: nobody signs in to it.
   }
 
   const res = await createAgentApiSurfaceClient(client).integrations.prepareApp(body);
@@ -304,6 +329,8 @@ interface AppUpdateOptions {
   scope?: string[];
   scopes?: string[];
   clearScopes?: boolean;
+  agentTokenSigningAlg?: string;
+  agentTokenType?: string;
   unsafeDemoUrlOverride?: boolean;
   json?: boolean;
 }
@@ -311,9 +338,8 @@ interface AppUpdateOptions {
 async function updateApp(ctx: CommandContext, opts: AppUpdateOptions): Promise<void> {
   const clientKey = requiredTrimmed(opts.client, "--client");
   const category = optionalCategory(opts.category);
-  if (opts.redirectUrl !== undefined && !opts.redirectUrl.trim()) {
-    throw cliError("INVALID_ARG", "--redirect-url cannot be empty; OAuth apps must keep a registered callback URL");
-  }
+  const agentTokenSigningAlg = optionalAgentTokenSigningAlg(opts.agentTokenSigningAlg);
+  const agentTokenType = optionalAgentTokenType(opts.agentTokenType);
   if (opts.clearScopes && ((opts.scope?.length ?? 0) > 0 || (opts.scopes?.length ?? 0) > 0)) {
     throw cliError("INVALID_ARG", "--clear-scopes cannot be combined with --scope/--scopes");
   }
@@ -331,6 +357,8 @@ async function updateApp(ctx: CommandContext, opts: AppUpdateOptions): Promise<v
     ...(opts.setupUrl !== undefined ? { setupUrl: opts.setupUrl.trim() } : {}),
     ...(opts.setupDescription !== undefined ? { setupDescription: opts.setupDescription.trim() } : {}),
     scopes,
+    ...(agentTokenSigningAlg !== undefined ? { agentTokenSigningAlg } : {}),
+    ...(agentTokenType !== undefined ? { agentTokenType } : {}),
     unsafeDemoUrlOverride: opts.unsafeDemoUrlOverride === true,
   };
   if (body.name !== undefined && !body.name) throw cliError("INVALID_ARG", "--name must not be empty");
@@ -346,7 +374,10 @@ async function updateApp(ctx: CommandContext, opts: AppUpdateOptions): Promise<v
     writeJson(ctx.io, { ok: true, data: receipt });
     return;
   }
-  writeText(ctx.io, adoptCliReplyText(`Integration app ${receipt.clientName} (${receipt.clientKey}) updated: ${receipt.updatedFields.join(", ")}\n`));
+  const tail = agentTokenType !== undefined && receipt.updatedFields.includes("agentTokenType")
+    ? `agent token type: ${agentTokenType}\n`
+    : "";
+  writeText(ctx.io, adoptCliReplyText(`Integration app ${receipt.clientName} (${receipt.clientKey}) updated: ${receipt.updatedFields.join(", ")}\n${tail}`));
 }
 
 export const integrationAppUpdateCommand = defineCommand(
@@ -364,7 +395,7 @@ export const integrationAppUpdateCommand = defineCommand(
         description: `New Connected App category: ${OAUTH_CLIENT_CATEGORIES.join(", ")}`,
       },
       { flags: "--homepage-url <url>", description: "New homepage URL; pass an empty value to clear" },
-      { flags: "--redirect-url <url>", description: "New OAuth redirect URL; cannot be cleared" },
+      { flags: "--redirect-url <url>", description: "New OAuth redirect URL; pass an empty value to clear it (a token-only app nobody signs in to)" },
       { flags: "--agent-manifest-url <url>", description: "New agent manifest URL; pass an empty value to clear" },
       { flags: "--setup-url <url>", description: "Post-install configuration page; pass an empty value to disable setup" },
       { flags: "--setup-description <text>", description: "Short explanation of configuration needed after installation" },
@@ -374,6 +405,8 @@ export const integrationAppUpdateCommand = defineCommand(
         parse: (value: string, previous: string[] = []) => { previous.push(value); return previous; },
       },
       { flags: "--clear-scopes", description: "Clear the app-specific allowed scope list" },
+      { flags: "--agent-token-signing-alg <alg>", description: "How Raft signs this app's agent tokens: ES256 (default) or RS256 (for relying parties that accept only RSA keys)" },
+      { flags: "--agent-token-type <typ>", description: "The typ header of this app's agent tokens: at+jwt (default) or JWT (for relying parties that accept only JWT); JWT only on an app without a redirect URL" },
       { flags: "--unsafe-demo-url-override", description: "Allow explicit localhost/private demo URLs" },
       { flags: "--json", description: "Emit machine-readable JSON" },
     ],
@@ -696,7 +729,7 @@ async function getAppStatus(ctx: CommandContext, opts: AppQueryOptions): Promise
 export const integrationAppListCommand = defineCommand(
   {
     name: "list",
-    description: "List pending registrations and apps you may manage; server admins see all server-owned apps",
+    description: "List pending registrations and apps you may manage (with the admin role on this server, all of its apps)",
     options: [{ flags: "--json", description: "Emit machine-readable JSON" }],
   },
   async (ctx, opts: AppQueryOptions) => listApps(ctx, opts),
@@ -768,7 +801,7 @@ export const integrationAppPrepareRecoverOwnerCommand = defineCommand(
 const sharedOptions = [
   { flags: "--client-key <key>", description: "App client key / OAuth client_id to reserve or update; register defaults to the app name, and refuses if that is taken" },
   { flags: "--name <name>", description: "App display name" },
-  { flags: "--redirect-url <url>", description: "OAuth redirect/callback URL" },
+  { flags: "--redirect-url <url>", description: "OAuth redirect/callback URL; leave out for a token-only app nobody signs in to" },
   { flags: "--app-url <url>", description: "App homepage URL" },
   { flags: "--homepage-url <url>", description: "App homepage URL (alias-friendly explicit name)" },
   { flags: "--description <text>", description: "App description" },

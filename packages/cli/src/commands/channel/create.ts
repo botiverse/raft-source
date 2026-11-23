@@ -35,7 +35,7 @@ export function formatCreateChannelResult(channel: CreatedChannel): string {
 export const channelCreateCommand = defineCommand(
   {
     name: "create",
-    description: "Create a public or private channel when this agent has server admin authority",
+    description: "Create a public or private channel; you join it as its channel admin",
     options: [
       {
         flags: "--name <name>",

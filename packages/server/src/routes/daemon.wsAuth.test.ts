@@ -6,11 +6,11 @@ import { RAFT_SERVER_CAPABILITIES_HEADER, SERVER_CAPABILITY_RUNTIME_DETECTION_AS
 import { randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { WebSocket } from "ws";
 
 import { getDb } from "../db/index";
-import { computers, machines, servers, users } from "../db/schema";
+import { computers, machines, serverMembers, servers, users } from "../db/schema";
 import { setupMachineWebSocket } from "./daemon";
 import { createServer as createRaftServer, addMember } from "../services/serverService";
 import { registerMachine } from "../services/machineService";
@@ -371,6 +371,27 @@ test("legacy sk_machine_* key that is migrated → 401 legacy_machine_key_migrat
   assert.equal(res.status, 401);
   assert.equal(res.reason, "legacy_machine_key_migrated");
   assertRejectSpanContract("legacy_machine_key_migrated", "legacy_migration");
+});
+
+test("#wg-rbac:#78: a legacy key whose registrant is no longer a member → 401 machine_key_invalid; it connects again once they are back", async () => {
+  const ownerId = await seedUser();
+  const adminId = await seedUser();
+  const server = await createRaftServer("Departed Co", `ws-dp-${randomUUID()}`, ownerId);
+  await addMember(server.id, adminId, "admin");
+  const { apiKey } = await registerMachine(server.id, adminId, "departed-m");
+  assert.equal((await attemptConnect(apiKey)).open, true, "connects while its registrant is a member");
+
+  // A departure from before removals revoked these keys: the member row is simply gone.
+  await getDb().delete(serverMembers).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, adminId)));
+  __resetMachineConnectRateLimitForTests();
+  const departed = await attemptConnect(apiKey);
+  assert.equal(departed.status, 401);
+  assert.equal(departed.reason, "machine_key_invalid");
+  assertRejectSpanContract("machine_key_invalid", "registrant_membership");
+
+  await addMember(server.id, adminId, "member");
+  __resetMachineConnectRateLimitForTests();
+  assert.equal((await attemptConnect(apiKey)).open, true, "a returning member's unrevoked key connects again");
 });
 
 test("live attachment whose server is soft-deleted → 401 server_not_found", async () => {

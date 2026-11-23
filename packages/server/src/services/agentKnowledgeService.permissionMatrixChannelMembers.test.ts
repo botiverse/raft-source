@@ -95,12 +95,14 @@ test("permission-matrix states both channel-member rules the server applies", as
 
 // The same defect ran through four more rows of this table: create, rename,
 // edit description and archive all said a Member cannot, and all said an agent
-// needs server-admin authority. createChannels is a member capability, and
+// needs server-admin authority. createPublicChannels / createPrivateChannels are member capabilities, and
 // editChannelMetadata / archiveChannels are channel-admin capabilities, so a
 // member holding the channel-admin role has them (Josh, 2026-09-23).
-test("implementation still gives every member createChannels", () => {
-  assert.equal(hasServerCapability("member", "createChannels"), true);
-  assert.equal(hasServerCapability("guest", "createChannels"), false);
+test("implementation still gives every member both create-channel capabilities", () => {
+  for (const capability of ["createPublicChannels", "createPrivateChannels"] as const) {
+    assert.equal(hasServerCapability("member", capability), true);
+    assert.equal(hasServerCapability("guest", capability), false);
+  }
 });
 
 test("edit and archive are channel-admin capabilities, reachable without server admin", () => {
@@ -130,8 +132,10 @@ test("permission-matrix channel-operation rows carry their real conditions", asy
 
   const create = rowCells(doc.content, "Create channel");
   assert.equal(create.member, "✅", "a member can create a channel");
-  assert.match(create.agentCli, /createChannels/,
-    "the agent create cell must name the capability the route checks");
+  assert.match(create.agentCli, /createPublicChannels/,
+    "the agent create cell must name the capabilities the route checks");
+  assert.match(create.agentCli, /createPrivateChannels/,
+    "the agent create cell must name the capabilities the route checks");
 
   for (const label of ["Rename channel", "Edit description", "Archive / Unarchive"]) {
     const cells = rowCells(doc.content, label);

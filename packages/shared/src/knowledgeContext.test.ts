@@ -3,11 +3,13 @@ import assert from "node:assert/strict";
 import {
   hasManualContextCapability,
   hasPlanUpgradeCardCapability,
+  hasReminderAppCliCapability,
   hasReminderServerAckCapability,
   INBOX_ITEMS_CAPABILITY,
   MANUAL_CONTEXT_CAPABILITY,
   MANUAL_INDEX_COMMAND,
   PLAN_UPGRADE_CARD_CAPABILITY,
+  REMINDER_APP_CLI_CAPABILITY,
   REMINDER_SERVER_ACK_CAPABILITY,
   validateKnowledgeContext,
 } from "./knowledgeContext";
@@ -70,5 +72,14 @@ test("RFC 081 D17: the reminder server-ack capability is a versioned comma-delim
   assert.equal(hasReminderServerAckCapability("reminder-server-ack@2"), true, "a later version");
   for (const header of [undefined, null, 1, "", `${MANUAL_CONTEXT_CAPABILITY},${INBOX_ITEMS_CAPABILITY}`, "reminder-server-ack", "reminder-server-ack@0", "reminder-server-ack@01", "reminder-server-ack@1x", "x-reminder-server-ack@1", "reminder-server-ack@1;reminder"]) {
     assert.equal(hasReminderServerAckCapability(header), false, String(header));
+  }
+});
+
+test("the reminder-app CLI capability is a versioned comma-delimited token, at its version or later", () => {
+  assert.equal(REMINDER_APP_CLI_CAPABILITY, "reminder-app-cli@1");
+  assert.equal(hasReminderAppCliCapability(`${MANUAL_CONTEXT_CAPABILITY}, ${REMINDER_APP_CLI_CAPABILITY} `), true);
+  assert.equal(hasReminderAppCliCapability("reminder-app-cli@2"), true, "a later version");
+  for (const header of [undefined, null, 1, "", MANUAL_CONTEXT_CAPABILITY, "reminder-app-cli", "reminder-app-cli@0", "reminder-app-cli@01", "reminder-app-cli@1x", "x-reminder-app-cli@1"]) {
+    assert.equal(hasReminderAppCliCapability(header), false, String(header));
   }
 });

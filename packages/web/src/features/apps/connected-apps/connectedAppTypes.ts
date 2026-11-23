@@ -5,7 +5,6 @@ import type { AppPromptTextFields } from "../../../lib/appPromptText";
 import type { OAuthClientRecord } from "./oauthClientRecords";
 
 export type ConnectedAppStatus = "private" | "publish_requested" | "in_review" | "published" | "rejected" | "unpublish_requested";
-export type ConnectedAppsViewMode = "grid" | "list";
 
 const CONNECTED_APP_EDITOR_SECTION_IDS = ["profile", "login", "setup", "permissions", "notifications", "distribution", "danger"] as const;
 export type ConnectedAppEditorSectionId = typeof CONNECTED_APP_EDITOR_SECTION_IDS[number];

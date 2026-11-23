@@ -470,7 +470,7 @@ test("attachment comments: boundaries (unlinked 404, non-member 403, read-only A
       body: JSON.stringify({ content: "too early" }),
     });
     assert.equal(unlinkedRes.status, 404);
-    assert.deepEqual(await unlinkedRes.json(), { error: "Attachment not found" });
+    assert.deepEqual(await unlinkedRes.json(), { error: "Attachment not found", code: "attachment_not_found", errorCode: "attachment_not_found" });
 
     // Seed one comment so read paths have content.
     const seedComment = await fetch(`${baseUrl}/api/attachments/${fx.linked.id}/comments`, {

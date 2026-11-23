@@ -4,12 +4,13 @@ import { resolveAgentKnowledgeDoc } from "./agentKnowledgeService";
 
 // Four pages told a member-role agent it cannot create a channel or add
 // members, and pointed it at an action card instead. The server disagrees:
-// createChannels is a member capability, and canAddChannelMembers admits any
+// createPublicChannels / createPrivateChannels are member capabilities, and canAddChannelMembers admits any
 // current member of that channel. The shared mistake was treating "server
 // admin" and "channel admin" as one tier (Josh's sweep, 2026-09-23).
 
 test("implementation keeps both operations reachable for a member", () => {
-  assert.equal(hasServerCapability("member", "createChannels"), true);
+  assert.equal(hasServerCapability("member", "createPublicChannels"), true);
+  assert.equal(hasServerCapability("member", "createPrivateChannels"), true);
   assert.equal(
     canAddChannelMembers({
       serverRole: "member",

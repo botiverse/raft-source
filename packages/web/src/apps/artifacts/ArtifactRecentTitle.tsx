@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
-import type { ReactNode } from "react";
+import { useCallback } from "react";
+import type { MouseEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { Paperclip } from "lucide-react";
 import { ArtifactIcon } from "@botiverse/ricons";
@@ -19,12 +19,15 @@ import type { ArtifactId } from "@botiverse/raft-shared";
 
 import { formatRelativeTime, formatShortRelativeTime } from "../../utils/relativeTime";
 import { useRecentArtifactsHere } from "./artifactRecentConversation";
+import { RecentArtifactRecord } from "./ArtifactRecentRecord";
 import type { ArtifactConversationPlace } from "./artifactRecentConversation";
 import type { RecentArtifact } from "./artifactRecentStore";
 import { useArtifactViewerStore } from "./artifactViewerStore";
+import { ArtifactPopoverRowButton } from "./ArtifactPresence";
 
 /**
- * The side card's title (#proj-workspace:#291). With two or more Artifacts recently opened in this conversation
+ * The side card's title on a phone, and the App's own bar's (#proj-workspace:#291; a desktop head's title opens the
+ * details instead, ArtifactDetailsTitle, which lists these too). With two or more Artifacts recently opened in this conversation
  * (artifactRecentStore: per person, per device) it is the trigger of their menu: raft-ui's PanelTitleTrigger, the title
  * and a small chevron after it, which stays when the title truncates. Picking one opens it in this card
  * as any in-app opening does (the viewer store: one Artifact in front, the page's `?artifact=` follows), at its
@@ -64,21 +67,6 @@ export function ArtifactRecentTitle({ card, record = false, plain, after }: {
 }
 
 /**
- * Mounted while the loaded viewer shows this Artifact beside a conversation: keeps it in that conversation's list
- * (its title and the version shown; its time is the side card's opening, so the same opening is written once).
- */
-function RecentArtifactRecord({ id, title, version }: { id: string; title: string; version: number }) {
-  const { remember } = useRecentArtifactsHere();
-  const opening = useArtifactViewerStore((s) => s.openedAt);
-  const [mountedAt] = useState(() => Date.now());
-  const openedAt = opening > 0 ? opening : mountedAt;
-  useEffect(() => {
-    remember({ id, title, version, openedAt });
-  }, [id, openedAt, remember, title, version]);
-  return null;
-}
-
-/**
  * The menu's rows (raft-design dropdown-menu): the Artifact icon, the title (truncated), then its version and how
  * long ago it was opened, as short as the Artifacts home's rows say it ("3m ago", "2d ago"), in Space Mono; the
  * current one is the checked radio item.
@@ -86,16 +74,11 @@ function RecentArtifactRecord({ id, title, version }: { id: string; title: strin
  */
 function RecentArtifactsMenu({ place, items, current }: { place: ArtifactConversationPlace; items: readonly RecentArtifact[]; current: string }) {
   const { formatMessage, locale } = useIntl();
-  const { conversationId } = place;
-  const pick = useCallback((value: unknown) => {
-    if (typeof value !== "string" || value === current) return;
-    const id = parseArtifactId(value);
-    if (id) useArtifactViewerStore.getState().openArtifact({ id, version: null, conversationId, source: "other" });
-  }, [conversationId, current]);
+  const pick = useRecentPick(place, current);
   return (
     <DropdownMenuContent
       align="start"
-      aria-label={formatMessage({ id: "artifacts.viewer.recent.menuLabel" }, { conversation: place.name })}
+      aria-label={place.name ? formatMessage({ id: "artifacts.viewer.recent.menuLabel" }, { conversation: place.name }) : formatMessage({ id: "artifacts.viewer.recent.menuLabelPlain" })}
       className="w-88"
       data-testid="artifact-recent-menu"
     >
@@ -129,5 +112,77 @@ function RecentArtifactsMenu({ place, items, current }: { place: ArtifactConvers
         </>
       ) : null}
     </DropdownMenuContent>
+  );
+}
+
+/** Opens a picked one (its link id) as the menu and the details' rows do: in this card, or where `place` says; not the one shown. */
+function useRecentPick(place: ArtifactConversationPlace, current: string): (value: unknown) => void {
+  const { conversationId, onPick } = place;
+  return useCallback((value: unknown) => {
+    if (typeof value !== "string" || value === current) return;
+    const id = parseArtifactId(value);
+    if (!id) return;
+    if (onPick) onPick(id);
+    else useArtifactViewerStore.getState().openArtifact({ id, version: null, conversationId, source: "other" });
+  }, [conversationId, current, onPick]);
+}
+
+/**
+ * The Artifacts opened lately in this conversation, as the details behind a desktop head's title list them
+ * (ArtifactDetailsTitle, after who has seen it): the menu's rows above as buttons in a popover, the one shown marked
+ * (`aria-current`), then the conversation's Files card. `onPicked`: the popover closes. Nothing with fewer than two
+ * (useRecentArtifactsHere `trigger`), as the title is no menu then either.
+ */
+export function ArtifactRecentRows({ current, onPicked }: { current: ArtifactId; onPicked: () => void }) {
+  const { place, items, trigger } = useRecentArtifactsHere();
+  if (!trigger || !place) return null;
+  return <RecentRows place={place} items={items} current={artifactLinkId(current)} onPicked={onPicked} />;
+}
+
+function RecentRows({ place, items, current, onPicked }: { place: ArtifactConversationPlace; items: readonly RecentArtifact[]; current: string; onPicked: () => void }) {
+  const { formatMessage, locale } = useIntl();
+  const pick = useRecentPick(place, current);
+  const showAll = place.onShowAll;
+  // One handler for every row: the Artifact is on the row (`data-artifact-recent`), so no row gets a closure of its own.
+  const pickRow = useCallback((event: MouseEvent<HTMLButtonElement>) => {
+    onPicked();
+    pick(event.currentTarget.dataset.artifactRecent);
+  }, [onPicked, pick]);
+  const openAll = useCallback(() => {
+    onPicked();
+    showAll?.();
+  }, [onPicked, showAll]);
+  return (
+    // -mx: a row's hover and focus reach past its text, which stays in line with the panel's inset.
+    <ul className="-mx-1.5 flex flex-col gap-0.5" data-testid="artifact-details-recent">
+      {items.map((item) => {
+        const opened = new Date(item.openedAt).toISOString();
+        return (
+          <li key={item.id} className="text-callout text-foreground">
+            <ArtifactPopoverRowButton
+              current={item.id === current}
+              onClick={pickRow}
+              aria-label={formatMessage({ id: "artifacts.viewer.recent.itemLabel" }, { title: item.title, version: item.version, time: formatRelativeTime(opened, locale) ?? "" })}
+              data-testid="artifact-recent-row"
+              data-artifact-recent={item.id}
+            >
+              <ArtifactIcon aria-hidden className="size-4 shrink-0" />
+              <span className="min-w-0 truncate">{item.title}</span>
+              <span className="ms-auto shrink-0 ps-3 font-mono text-mono-meta font-normal whitespace-nowrap text-foreground-hint">
+                {formatMessage({ id: "artifacts.viewer.recent.itemMeta" }, { version: item.version, time: formatShortRelativeTime(opened, locale) ?? "" })}
+              </span>
+            </ArtifactPopoverRowButton>
+          </li>
+        );
+      })}
+      {showAll ? (
+        <li className="text-callout text-foreground">
+          <ArtifactPopoverRowButton onClick={openAll} data-testid="artifact-recent-all">
+            <Paperclip aria-hidden className="size-4 shrink-0" />
+            <span className="min-w-0 truncate">{formatMessage({ id: "artifacts.viewer.recent.all" }, { conversation: place.name })}</span>
+          </ArtifactPopoverRowButton>
+        </li>
+      ) : null}
+    </ul>
   );
 }

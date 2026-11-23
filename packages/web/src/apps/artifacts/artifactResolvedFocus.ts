@@ -1,6 +1,7 @@
 import type { ArtifactCommentId } from "@botiverse/raft-shared";
 import { focusLost } from "../../utils/focusGuard";
 import { isTextEditableElement } from "../../utils/keyboardShortcuts";
+import { timersOf } from "../../utils/ownerDocument";
 
 import type { ArtifactCommentsState } from "./ArtifactCommentsContext";
 import { focusArtifactSurface } from "./artifactRestoredFocus";
@@ -19,10 +20,12 @@ const SHEET_SETTLE_MS = 400;
  * last; else the Artifact's surface. The markers are read now, before the list draws the change.
  * The person's last act was Resolve in the card, so the first move overrides the card's own return
  * of the focus (to what had it before the card opened, by now anything); the later look, for a
- * phone's sheet, moves it only off the body.
+ * phone's sheet, moves it only off the body. In `doc`, the document the Artifact is drawn in, on its window's timers
+ * (an object window's own, #337 PR3: the main window's are slowed while it is hidden).
  */
-export function focusAfterResolvedCard(comments: ArtifactCommentsState, threadId: ArtifactCommentId): void {
-  const shellIds = [...document.querySelectorAll<HTMLElement>(MARKERS)].map((marker) => marker.dataset.threadId!);
+export function focusAfterResolvedCard(comments: ArtifactCommentsState, threadId: ArtifactCommentId, doc: Document = document): void {
+  const timers = timersOf(doc);
+  const shellIds = [...doc.querySelectorAll<HTMLElement>(MARKERS)].map((marker) => marker.dataset.threadId!);
   const ids = shellIds.length > 0 ? shellIds : comments.frame.marks.filter((mark) => !("kind" in mark && mark.kind === "draft")).map((mark) => mark.id);
   const at = ids.indexOf(threadId);
   const next = at < 0 ? ids[0] ?? null : ids[at + 1] ?? ids[at - 1] ?? null;
@@ -30,12 +33,12 @@ export function focusAfterResolvedCard(comments: ArtifactCommentsState, threadId
   const frame = comments.frame.box?.current?.querySelector("iframe") ?? null;
   const { focusMark } = comments;
   const settle = () => {
-    const toggle = listOpen ? document.querySelector(RESOLVED_TOGGLE) : null;
+    const toggle = listOpen ? doc.querySelector(RESOLVED_TOGGLE) : null;
     if (toggle && canTakeFocus(toggle)) {
       toggle.focus({ preventScroll: true });
       return;
     }
-    const marker = next && shellIds.length > 0 ? document.querySelector(`${MARKERS}[data-thread-id="${CSS.escape(next)}"]`) : null;
+    const marker = next && shellIds.length > 0 ? doc.querySelector(`${MARKERS}[data-thread-id="${CSS.escape(next)}"]`) : null;
     if (marker && canTakeFocus(marker)) {
       marker.focus({ preventScroll: true });
       return;
@@ -44,14 +47,14 @@ export function focusAfterResolvedCard(comments: ArtifactCommentsState, threadId
       frame.focus({ preventScroll: true });
       if (focusMark(next as ArtifactCommentId)) return;
     }
-    focusArtifactSurface();
+    focusArtifactSurface(doc);
   };
-  window.setTimeout(() => {
+  timers.setTimeout(() => {
     // Not off the person's own words, should a box have taken the focus since.
-    const active = document.activeElement;
+    const active = doc.activeElement;
     if (!active || !isTextEditableElement(active)) settle();
   }, 0);
-  window.setTimeout(() => {
-    if (focusLost()) settle();
+  timers.setTimeout(() => {
+    if (focusLost(null, doc)) settle();
   }, SHEET_SETTLE_MS);
 }

@@ -124,6 +124,20 @@ export type ComputerKeyRevokeResult =
   | { kind: "revoked" }
   | { kind: "others_agents"; agents: OthersAgent[] };
 
+/** Revoke-and-delete: `deleted` when the server removed the machine in the same request. */
+export type ComputerRevokeAndDeleteResult = ComputerKeyRevokeResult | { kind: "deleted" };
+
+function othersAgentsOf(err: unknown): OthersAgent[] | null {
+  const response = getApiErrorResponse(err);
+  const listed = (err as { response?: { data?: { agents?: unknown } } }).response?.data?.agents;
+  if (response?.status !== 409 || response.code !== "others_agents_on_computer" || !Array.isArray(listed)) return null;
+  const agents = listed.flatMap((entry: unknown) => {
+    const record = entry && typeof entry === "object" ? entry as Record<string, unknown> : null;
+    return record && typeof record.id === "string" ? [othersAgentOf(record as Record<string, unknown> & { id: string })] : [];
+  });
+  return agents.length > 0 ? agents : null;
+}
+
 /**
  * POST /servers/:id/machines/:machineId/revoke-computer-key, by the person
  * who attached the computer: it goes offline for good (a new attach brings it
@@ -142,14 +156,35 @@ export async function revokeComputerKey(serverId: string, machineId: string, for
   } catch (err) {
     const response = getApiErrorResponse(err);
     if (response?.status === 409 && response.code === "no_live_computer_key") return { kind: "revoked" };
-    const listed = (err as { response?: { data?: { agents?: unknown } } }).response?.data?.agents;
-    if (response?.status === 409 && response.code === "others_agents_on_computer" && Array.isArray(listed)) {
-      const agents = listed.flatMap((entry: unknown) => {
-        const record = entry && typeof entry === "object" ? entry as Record<string, unknown> : null;
-        return record && typeof record.id === "string" ? [othersAgentOf(record as Record<string, unknown> & { id: string })] : [];
-      });
-      if (agents.length > 0) return { kind: "others_agents", agents };
-    }
+    const agents = othersAgentsOf(err);
+    if (agents) return { kind: "others_agents", agents };
+    throw err;
+  }
+}
+
+/**
+ * The same POST with `delete: true`, for Delete Computer on the person's own
+ * computer: the server revokes the key and removes the machine in one request
+ * and one transaction, authorized while it is still attached by them (after a
+ * revoke on its own they could no longer remove it: only an owner or admin
+ * can). `deleted`: both happened. `others_agents`: the 409 above, nothing
+ * happened. Any other refusal (an agent of theirs still on it, a move in
+ * progress: deleteMachine's 409) rejects with nothing changed. `revoked`: the
+ * key was revoked but the machine is still there (its key had already been
+ * revoked, or a server without `delete`); the caller removes it with DELETE.
+ */
+export async function revokeKeyAndDeleteComputer(serverId: string, machineId: string, forceAgentIds: readonly string[] = []): Promise<ComputerRevokeAndDeleteResult> {
+  try {
+    const { data } = await api.post<{ deleted?: unknown }>(
+      `${machinePath(serverId, machineId)}/revoke-computer-key`,
+      { delete: true, ...(forceAgentIds.length > 0 ? { forceAgentIds: [...forceAgentIds] } : {}) },
+    );
+    return data?.deleted === true ? { kind: "deleted" } : { kind: "revoked" };
+  } catch (err) {
+    const response = getApiErrorResponse(err);
+    if (response?.status === 409 && response.code === "no_live_computer_key") return { kind: "revoked" };
+    const agents = othersAgentsOf(err);
+    if (agents) return { kind: "others_agents", agents };
     throw err;
   }
 }

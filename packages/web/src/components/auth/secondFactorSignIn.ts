@@ -23,6 +23,8 @@
 import { create } from "zustand";
 
 import api from "../../api/client";
+import { otherRpsOf, rpBody } from "./passkeyRpGroups";
+import type { PasskeyRpGroup, StartedPasskeyAssertion } from "./passkeyRpGroups";
 import { canUsePasskeys } from "./webauthn";
 import type { PasskeyAssertionJSON, PasskeyRequestOptionsJSON } from "./webauthn";
 
@@ -113,10 +115,17 @@ export type SecondFactorSignInAnswer =
   | { webauthn: PasskeyAssertionJSON }
   | { recovery: true };
 
-/** POST /auth/second-factor/passkeys/assertion/options { challenge }: a passkey assertion for this sign-in. */
-export async function startSignInPasskeyStep(challenge: SecondFactorChallengeToken): Promise<PasskeyRequestOptionsJSON> {
-  const { data } = await api.post<{ options: PasskeyRequestOptionsJSON }>("/auth/second-factor/passkeys/assertion/options", { challenge });
-  return data.options;
+/**
+ * POST /auth/second-factor/passkeys/assertion/options { challenge, rp? }: a
+ * passkey assertion for this sign-in, in the server's default RP group or
+ * `rp`, and the person's other groups (passkeyRpGroups.ts).
+ */
+export async function startSignInPasskeyStep(challenge: SecondFactorChallengeToken, rp?: PasskeyRpGroup): Promise<StartedPasskeyAssertion> {
+  const { data } = await api.post<{ options: PasskeyRequestOptionsJSON; otherRps?: unknown }>(
+    "/auth/second-factor/passkeys/assertion/options",
+    { challenge, ...rpBody(rp) },
+  );
+  return { options: data.options, otherRps: otherRpsOf(data.otherRps) };
 }
 
 /** POST /auth/second-factor/verify: resolves the first step's success body. */

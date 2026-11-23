@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  DEFAULT_WAKE_RECYCLE_FAILURE_TTL_MS,
+  WakeRecycleFailureMemory,
   buildRecycleBriefing,
   buildWarmRecycleNotice,
   wakeRecycleKindTraceAttrs,
@@ -21,8 +23,7 @@ import {
   readClaudeSessionResumeFacts,
   readRuntimeSessionResumeFacts,
   resolveWakeRecycleConfig,
-  WAKE_RECYCLE_SUMMARY_FACTS_RUNTIMES,
-  summaryFactsRuntimesFor,
+  summarySuppliesResumeFacts,
   type SessionResumeFacts,
   type WakeRecycleConfig,
 } from "./wakeSessionRecycle";
@@ -87,7 +88,7 @@ test("cold gap with large context recycles; the plan carries facts and briefing"
 test("every failed gate resolves to resume with its own reason", () => {
   const cases: Array<[Record<string, unknown>, string]> = [
     [{ config: enabledConfig({ enabled: false }) }, "disabled"],
-    [{ runtime: "cursor" }, "unsupported_runtime"],
+    [{ runtime: "gemini" }, "unsupported_runtime"],
     [{ runtime: "codex", facts: facts({ lastContextTokens: null }) }, "session_facts_unavailable"],
     [{ sessionId: null }, "no_prior_session"],
     [{ hasResumePrompt: true }, "explicit_resume_prompt"],
@@ -290,19 +291,21 @@ test("planWakeSessionRecycle recycles end to end from a real transcript tail", a
   assert.equal(processEnvDisabledPlan.action, "resume");
 });
 
-test("task #3: an OAR session summary feeds the facts and the panel only for a listed runtime and its own session", async () => {
+const DECLARED = { tokens: true, contextWindow: true } as const;
+
+test("task #3: an OAR session summary feeds the facts and the panel only while wake_recycle_oar is on, for its own session, when OAR declared its context size", async () => {
   const nowMs = Date.now();
   const sessionId = "oar-sess-1";
   const summary = {
     ...emptySessionSummary("grok", sessionId, nowMs - 3 * HOUR_MS),
     lastActivityAt: new Date(nowMs - 3 * HOUR_MS).toISOString(),
     context: { tokens: 300_000, window: 1_000_000, at: new Date(nowMs - 3 * HOUR_MS).toISOString() },
+    contextUsage: { tokens: true, contextWindow: false },
     lastNote: { sessionId, at: new Date(nowMs - 3 * HOUR_MS).toISOString(), text: "Waiting on review." },
     messages: [{ sessionId, direction: "received" as const, at: "2026-11-03 06:00:00Z", target: "#ops", msgId: "aaaaaaaa", raw: "[target=#ops msg=aaaaaaaa time=2026-11-03 06:00:00Z type=human] @alice: please review" }],
   };
   const config = { runtime: "grok", sessionId, envVars: null } as unknown as AgentConfig;
 
-  assert.deepEqual([...WAKE_RECYCLE_SUMMARY_FACTS_RUNTIMES].sort(), ["codex", "grok"], "the OAR host's runtimes with summary facts");
   const byDefault = await planWakeSessionRecycle({ config, hasResumePrompt: false, processEnv: {}, readSessionSummary: () => summary });
   assert.deepEqual(byDefault, { action: "resume", reason: "session_facts_unavailable" }, "flag off (absent): the summary is not read");
   const flagOff = await planWakeSessionRecycle({ config: { ...config, wakeRecycleOar: false } as AgentConfig, hasResumePrompt: false, processEnv: {}, readSessionSummary: () => summary });
@@ -312,8 +315,8 @@ test("task #3: an OAR session summary feeds the facts and the panel only for a l
   const flagOnLocalOff = await planWakeSessionRecycle({ config: { ...config, wakeRecycleOar: true, envVars: { RAFT_WAKE_RECYCLE: "0" } } as AgentConfig, hasResumePrompt: false, processEnv: {}, readSessionSummary: () => summary });
   assert.equal(flagOnLocalOff.action, "resume", "the local off switch still wins");
 
-  const listed = new Set(["grok"]);
-  const plan = await planWakeSessionRecycle({ config, hasResumePrompt: false, processEnv: {}, readSessionSummary: () => summary, summaryFactsRuntimes: listed });
+  const on = { ...config, wakeRecycleOar: true } as AgentConfig;
+  const plan = await planWakeSessionRecycle({ config: on, hasResumePrompt: false, processEnv: {}, readSessionSummary: () => summary });
   assert.equal(plan.action, "recycle");
   if (plan.action === "recycle") {
     assert.equal(plan.priorContextTokens, 300_000);
@@ -323,28 +326,78 @@ test("task #3: an OAR session summary feeds the facts and the panel only for a l
   }
 
   const otherSession = await planWakeSessionRecycle({
-    config: { ...config, sessionId: "oar-sess-0" } as AgentConfig,
+    config: { ...on, sessionId: "oar-sess-0" } as AgentConfig,
     hasResumePrompt: false,
     processEnv: {},
     readSessionSummary: () => summary,
-    summaryFactsRuntimes: listed,
   });
   assert.deepEqual(otherSession, { action: "resume", reason: "session_facts_unavailable" }, "a summary of another session says nothing");
 
   const unreadable = await planWakeSessionRecycle({
-    config,
+    config: on,
     hasResumePrompt: false,
     processEnv: {},
     readSessionSummary: () => { throw new Error("EACCES"); },
-    summaryFactsRuntimes: listed,
   });
   assert.equal(unreadable.action, "resume");
 });
 
-test("#54: summaryFactsRuntimesFor lists Codex and Grok only while wake_recycle_oar is on", () => {
-  assert.equal(summaryFactsRuntimesFor({}).size, 0);
-  assert.equal(summaryFactsRuntimesFor({ wakeRecycleOar: false }).size, 0);
-  assert.deepEqual([...summaryFactsRuntimesFor({ wakeRecycleOar: true })].sort(), ["codex", "grok"]);
+test("#54: the summary supplies resume facts by OAR's contextUsage declaration for the installation that wrote it, not by runtime id", async () => {
+  // The rule: wake_recycle_oar on, a runtime RFC 070 enables, and `contextUsage.tokens` declared.
+  assert.equal(summarySuppliesResumeFacts({ wakeRecycleOar: true }, "grok", DECLARED), true);
+  assert.equal(summarySuppliesResumeFacts({ wakeRecycleOar: true }, "cursor", { tokens: true, contextWindow: false }), true, "no window needed");
+  assert.equal(summarySuppliesResumeFacts({}, "grok", DECLARED), false, "flag off");
+  assert.equal(summarySuppliesResumeFacts({ wakeRecycleOar: false }, "grok", DECLARED), false, "flag off");
+  assert.equal(summarySuppliesResumeFacts({ wakeRecycleOar: true }, "grok", { tokens: false, contextWindow: false }), false, "declared untrustworthy");
+  assert.equal(summarySuppliesResumeFacts({ wakeRecycleOar: true }, "grok", undefined), false, "unmeasured: off");
+  assert.equal(summarySuppliesResumeFacts({ wakeRecycleOar: true }, "dsh", DECLARED), false, "a runtime RFC 070 does not enable stays off");
+
+  // A fake installation's declaration decides, whatever the runtime id says.
+  const nowMs = Date.now();
+  const sessionId = "oar-sess-caps";
+  const base = {
+    ...emptySessionSummary("qoder", sessionId, nowMs - 3 * HOUR_MS),
+    lastActivityAt: new Date(nowMs - 3 * HOUR_MS).toISOString(),
+    context: { tokens: 300_000, window: 1_000_000, at: new Date(nowMs - 3 * HOUR_MS).toISOString() },
+  };
+  const planWith = (runtime: string, summary: SessionSummary) => planWakeSessionRecycle({
+    config: { runtime, sessionId, envVars: null, wakeRecycleOar: true } as unknown as AgentConfig,
+    hasResumePrompt: false,
+    processEnv: {},
+    readSessionSummary: () => summary,
+  });
+  for (const runtime of ["grok", "codex", "claude"]) {
+    assert.equal((await planWith(runtime, { ...base, contextUsage: DECLARED })).action, "recycle", `${runtime}: declared`);
+    assert.deepEqual(await planWith(runtime, base), { action: "resume", reason: "session_facts_unavailable" }, `${runtime}: not declared (an older file, an unmeasured installation)`);
+    assert.deepEqual(await planWith(runtime, { ...base, contextUsage: { tokens: false, contextWindow: true } }), { action: "resume", reason: "session_facts_unavailable" }, `${runtime}: tokens declared untrustworthy`);
+  }
+});
+
+test("#raft-feature-flag:#12: OpenCode, Cursor, Qwen and Antigravity recycle from their OAR summary; runtimes OAR reports no context size for resume", async () => {
+  const nowMs = Date.now();
+  const sessionId = "oar-sess-acp";
+  const summaryFor = (runtime: string) => ({
+    ...emptySessionSummary(runtime, sessionId, nowMs - 3 * HOUR_MS),
+    lastActivityAt: new Date(nowMs - 3 * HOUR_MS).toISOString(),
+    context: { tokens: 300_000, window: 1_048_576, at: new Date(nowMs - 3 * HOUR_MS).toISOString() },
+  });
+  const planFor = (runtime: string, summary: SessionSummary, contextUsage: SessionSummary["contextUsage"]) => planWakeSessionRecycle({
+    config: { runtime, sessionId, envVars: null, wakeRecycleOar: true } as unknown as AgentConfig,
+    hasResumePrompt: false,
+    processEnv: {},
+    readSessionSummary: () => (contextUsage ? { ...summary, contextUsage } : summary),
+  });
+  // Each runtime's declaration as OAR 0.123 gives it (oarLoader.test.ts pins the real answers).
+  const opencode = await planFor("opencode", summaryFor("opencode"), DECLARED);
+  assert.equal(opencode.action, "recycle", "a large OpenCode context past the gate starts fresh");
+  assert.deepEqual(await planFor("opencode", { ...summaryFor("opencode"), context: null }, DECLARED), { action: "resume", reason: "session_facts_unavailable" }, "no size reported: resume");
+  // Cursor: tokens, no window; Qwen from 0.26.0; Antigravity's real-Gemini size (#oar-raft a4043a70).
+  for (const [runtime, contextUsage] of [["cursor", { tokens: true, contextWindow: false }], ["qwen", DECLARED], ["antigravity", DECLARED]] as const) {
+    assert.equal((await planFor(runtime, summaryFor(runtime), contextUsage)).action, "recycle", `${runtime}: a large context past the gate starts fresh`);
+  }
+  // Qoder: OAR declares its context size untrustworthy (OAR #core:#277).
+  const qoder = await planFor("qoder", summaryFor("qoder"), { tokens: false, contextWindow: false });
+  assert.equal(qoder.action, "resume", "qoder: no trustworthy context size from OAR");
 });
 
 test("task #3: summary facts are unknown when the latest turn never ended or no context was reported", async () => {
@@ -357,9 +410,10 @@ test("task #3: summary facts are unknown when the latest turn never ended or no 
     context: { tokens: 300_000, window: 1_000_000, at: at(3 * HOUR_MS) },
     wake: { at: at(3.5 * HOUR_MS), input: "do the thing" },
     turns: { count: 4, lastEndedAt: at(3 * HOUR_MS), lastOutcome: "completed" },
+    contextUsage: DECLARED,
   };
-  const config = { runtime: "grok", sessionId, envVars: null } as unknown as AgentConfig;
-  const plan = (summary: SessionSummary) => planWakeSessionRecycle({ config, hasResumePrompt: false, processEnv: {}, readSessionSummary: () => summary, summaryFactsRuntimes: new Set(["grok"]) });
+  const config = { runtime: "grok", sessionId, envVars: null, wakeRecycleOar: true } as unknown as AgentConfig;
+  const plan = (summary: SessionSummary) => planWakeSessionRecycle({ config, hasResumePrompt: false, processEnv: {}, readSessionSummary: () => summary });
 
   assert.equal((await plan(finished)).action, "recycle");
   // The daemon died mid-turn: a wake after the last turn end means the turn never finished.
@@ -380,12 +434,11 @@ test("task #3: a readable Claude transcript wins over a session summary", async 
   }) + "\n");
   let summaryRead = false;
   const plan = await planWakeSessionRecycle({
-    config: { runtime: "claude", sessionId, envVars: null } as unknown as AgentConfig,
+    config: { runtime: "claude", sessionId, envVars: null, wakeRecycleOar: true } as unknown as AgentConfig,
     hasResumePrompt: false,
     homeDir: home,
     processEnv: {},
     readSessionSummary: () => { summaryRead = true; return null; },
-    summaryFactsRuntimes: new Set(["claude"]),
   });
   assert.equal(plan.action, "recycle");
   if (plan.action === "recycle") assert.equal(plan.priorContextTokens, 601_505);
@@ -613,7 +666,7 @@ test("§6.5: flag off, no stop remembered, or another session's stop: exactly to
 test("§6.5: the same exclusions as the cold recycle", () => {
   for (const [reason, overrides] of [
     ["disabled", { config: enabledConfig({ enabled: false }) }],
-    ["unsupported_runtime", { runtime: "opencode" }],
+    ["unsupported_runtime", { runtime: "gemini" }],
     ["no_prior_session", { sessionId: null }],
     ["explicit_resume_prompt", { hasResumePrompt: true }],
     ["runtime_profile_control", { hasRuntimeProfileControl: true }],
@@ -774,4 +827,85 @@ test("§6.5: a recycle with nothing added to its briefing is the decision's own 
     describeRecycledWakeLogLine("agent-1", plan, "legacy"),
     `[WakeRecycle] recycled: agent agent-1 kind cold, old session session-bare, new session pending, gap ${plan.idleMs}ms, briefing 0 tokens (panel no, memory no) (legacy)`,
   );
+});
+
+test("#wg-ax:#3: WakeRecycleFailureMemory TTL, noteYield dedup, decideWakeRecycle, planWakeSessionRecycle, and coldIdleGate", async () => {
+  let clock = Date.UTC(2026, 10, 19, 18, 0, 0);
+  const memory = new WakeRecycleFailureMemory(() => clock);
+  assert.equal(memory.hasFailed("agent-1", "sess-old"), false);
+  memory.recordFailedRecycle("agent-1", "sess-old");
+  assert.equal(memory.hasFailed("agent-1", "sess-old"), true);
+  assert.equal(memory.hasFailed("agent-1", "sess-other"), false);
+  assert.equal(memory.hasFailed("agent-2", "sess-old"), false);
+  assert.equal(memory.noteYield("agent-1", "sess-old", "cold_idle"), true);
+  assert.equal(memory.noteYield("agent-1", "sess-old", "cold_idle"), false, "deduped per gate");
+  assert.equal(memory.noteYield("agent-1", "sess-old", "warm_recycle"), true, "distinct gate emits once");
+  // Still active just before TTL, expires at TTL.
+  clock += DEFAULT_WAKE_RECYCLE_FAILURE_TTL_MS - 1;
+  assert.equal(memory.hasFailed("agent-1", "sess-old"), true);
+  clock += 1;
+  assert.equal(memory.hasFailed("agent-1", "sess-old"), false, "expires after TTL so recovered hosts resume recycling");
+  memory.recordFailedRecycle("agent-1", "sess-old");
+  memory.clear("agent-1");
+  assert.equal(memory.hasFailed("agent-1", "sess-old"), false);
+
+  const nowMs = Date.UTC(2026, 10, 19, 18, 0, 0);
+  const decide = decideWakeRecycle({
+    config: resolveWakeRecycleConfig(null, {}),
+    runtime: "claude",
+    sessionId: "sess-old",
+    hasResumePrompt: false,
+    hasRuntimeProfileControl: false,
+    priorRecycleFailed: true,
+    facts: { transcriptPath: "/tmp/t.jsonl", lastActivityAtMs: nowMs - 2 * 60 * 60_000, lastContextTokens: 250_000 },
+    nowMs,
+  });
+  assert.deepEqual(decide, { action: "resume", reason: "prior_recycle_start_failed" });
+
+  let summaryRead = false;
+  const planned = await planWakeSessionRecycle({
+    config: {
+      name: "a",
+      displayName: "A",
+      description: "",
+      model: "opus",
+      runtime: "codex",
+      reasoningEffort: null,
+      envVars: null,
+      sessionId: "sess-old",
+      serverUrl: "http://localhost:3001",
+      authToken: "sk_machine_test",
+      wakeRecycleOar: true,
+    },
+    hasResumePrompt: false,
+    priorRecycleFailed: true,
+    nowMs,
+    readSessionSummary: () => {
+      summaryRead = true;
+      return null;
+    },
+  });
+  assert.deepEqual(planned, { action: "resume", reason: "prior_recycle_start_failed" });
+  assert.equal(summaryRead, false, "short-circuits before reading transcript/summary facts");
+
+  const gate = coldIdleGate({
+    config: {
+      name: "a",
+      displayName: "A",
+      description: "",
+      model: "opus",
+      runtime: "claude",
+      reasoningEffort: null,
+      envVars: null,
+      sessionId: "sess-old",
+      serverUrl: "http://localhost:3001",
+      authToken: "sk_machine_test",
+    },
+    liveSessionId: "sess-old",
+    lastEventAtMs: nowMs - 2 * 60 * 60_000,
+    runtimeCliVersion: "2.1.220",
+    priorRecycleFailed: true,
+    nowMs,
+  });
+  assert.deepEqual(gate, { pass: false, reason: "prior_recycle_start_failed" });
 });

@@ -619,7 +619,21 @@ export class DaemonConnection {
       }, "error", connectAttempt.context);
       connectAttempt.end("error", { outcome: "handshake_timeout" });
 
-      try { ws.terminate(); } catch { /* ignore */ }
+      try {
+        ws.terminate();
+      } catch (err) {
+        // #6248: a throwing terminate() may never emit 'close', which is what
+        // clears `this.ws` and schedules the reconnect; without that the daemon
+        // stays offline on the dead CONNECTING socket. Do the close handler's
+        // part here. Clearing `this.ws` first makes a late 'close' from this
+        // socket a no-op, so the reconnect is scheduled once.
+        if (this.ws !== ws) return;
+        logger.warn(`[Daemon] Terminating the timed-out WebSocket failed (${errorClassOf(err)}) — reconnecting without its close event`);
+        this.ws = null;
+        this.clearWatchdog();
+        this.options.onDisconnect();
+        this.scheduleReconnect();
+      }
     }, ms);
   }
 

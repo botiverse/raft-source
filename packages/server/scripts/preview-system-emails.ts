@@ -28,6 +28,15 @@ for (const requestKind of ["publish", "offline"] as const) {
 for (const locale of email.MOBILE_APP_EMAIL_LOCALES) {
   examples.push({ id: `mobile-${locale}`, label: `移动端通知 · ${locale}`, html: email.renderMobileAppDownloadEmailHtml(locale, "https://example.com/unsubscribe?token=preview"), note: "仅调整已有模板，不改变活动启停状态。" });
 }
+for (const event of [
+  { kind: "ready", exportId: "00000000-0000-4000-8000-000000000001", expiresAt: new Date("2026-11-25T10:00:00Z") },
+  { kind: "ready", exportId: "00000000-0000-4000-8000-000000000002", serverName: "Launch team", expiresAt: new Date("2026-11-25T10:00:00Z") },
+  { kind: "failed", exportId: "00000000-0000-4000-8000-000000000003" },
+  { kind: "email_code", code: "123456", expiresInMinutes: 10 },
+] satisfies email.DataExportEmailEvent[]) {
+  const id = `data-export-${event.kind}${"serverName" in event ? "-server" : ""}`;
+  examples.push({ id, label: `数据导出 · ${{ ready: "已就绪", failed: "失败", email_code: "验证码" }[event.kind]}${"serverName" in event ? "（server）" : ""}`, html: email.renderDataExportEmail("Martin", event).html });
+}
 examples.push({ id: "long-name", label: "长名称与中文", html: email.renderInviteEmailHtml("名字很长的协作伙伴与团队".repeat(4), "A".repeat(180), "preview-long-token") });
 for (const item of examples) writeFileSync(resolve(output, `${item.id}.html`), item.html);
 writeFileSync(resolve(output, "manifest.json"), JSON.stringify(examples, null, 2));

@@ -39,6 +39,7 @@ export function DeferredArtifactViewer(props: ArtifactViewerProps) {
       onToggleExpanded={props.onToggleExpanded}
       onClose={props.onClose}
       onRetry={onRetry}
+      inWindow={!!props.inWindow}
     />
   );
   // One loading splash from the opening, across the placeholder and the viewer taking over (ArtifactLoadingSplash).
@@ -238,6 +239,7 @@ export function ArtifactCoverViewer() {
     const position = getComputedStyle(cover).position;
     if (position && position !== "static") return;
     const before = cover.style.position;
+    // oxlint-disable-next-line react/immutability -- the dialog's DOM node (from the viewer store), positioned in the layout effect and put back in its cleanup: the imperative write this effect is for.
     cover.style.position = "relative";
     return () => {
       cover.style.position = before;

@@ -63,7 +63,7 @@ async function checkedVersionOf(agent: ArtifactAgent, ref: string, requested: st
   current: ArtifactVersionRow | null;
   check: ArtifactVersionCheckRow | null;
 }> {
-  const item = await resolveVisibleItem(agent, ref);
+  const item = await resolveVisibleItem(agent, ref, "read");
   if (accessOf(agent, item).historyLimited) throw new ArtifactApiFailure(notVisible());
   const current = await currentVersionOf(item);
   const number = requested === undefined ? null : Number(requested);

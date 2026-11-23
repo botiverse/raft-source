@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- A stand-in App logo for the sheet's shots (?logo=1): a shape, not letters, so it can't be read as the initials. -->
+  <rect width="128" height="128" fill="#2f6fde"/>
+  <circle cx="64" cy="64" r="34" fill="none" stroke="#ffffff" stroke-width="12"/>
+  <path d="M64 30 L64 98 M30 64 L98 64" stroke="#ffd34d" stroke-width="10" stroke-linecap="round"/>
+</svg>

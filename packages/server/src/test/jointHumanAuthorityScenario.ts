@@ -89,7 +89,7 @@ export async function jointHumanAuthorityScenario({
     changeChannelMembershipRole({
       serverId: h.id,
       channelId: created.channel.id,
-      requesterUserId,
+      requester: { type: "user", id: requesterUserId },
       targetType: "user",
       targetId,
       nextRole,

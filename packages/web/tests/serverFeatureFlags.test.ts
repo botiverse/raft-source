@@ -2,8 +2,7 @@ import assert from "node:assert/strict";
 import "./helpers/domSetup";
 
 import {
-  CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY,
-  PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY,
+  CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY,
   SLACK_BRIDGE_FEATURE_FLAG_KEYS,
   WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY,
   CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY,
@@ -27,13 +26,13 @@ import {
   INTERACTIVE_LINK_CARDS_FEATURE_FLAG_KEY,
   WEB_PREVIEW_FLAG_KEY,
   DESKTOP_WEB_PREVIEW_VIEW_FLAG_KEY,
+  ARTIFACT_MINI_WINDOW_FLAG_KEY,
   DESKTOP_BROWSER_RAFT_SIGN_IN_FLAG_KEY,
   INBOX_READ_INPLACE_FLAG_KEY,
   INBOX_MESSAGE_INPLACE_FLAG_KEY,
   INBOX_ROW_POSITION_FLAG_KEY,
   DEEP_LINKS_FLAG_KEY,
   DRAFTS_SECTION_FLAG_KEY,
-  AGENT_READ_PROGRESS_FEATURE_FLAG_KEY,
   HUMAN_AVATAR_BUILDER_FEATURE_FLAG_KEY,
   REFERRAL_SOURCE_PROMPT_FEATURE_FLAG_KEY,
 } from "../src/store/serverFeatureFlags";
@@ -42,14 +41,15 @@ const originalPost = api.post.bind(api);
 const originalAuthState = useAuthStore.getState();
 const originalServerState = useServerStore.getState();
 
-test("provider connections are registered and fail closed before server evaluation", () => {
-  assert.ok(REGISTERED_SERVER_FEATURE_FLAG_KEYS.includes(PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY));
-  assert.equal(readServerFeatureFlag("server-a", PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY), false);
+test("provider connections are no longer a web flag", () => {
+  // Retired with the feature (#raft-feature-flag:#11): the web neither
+  // evaluates nor reads provider_connections_v0.
+  assert.ok(!(REGISTERED_SERVER_FEATURE_FLAG_KEYS as readonly string[]).includes("provider_connections_v0"));
 });
 
 test("flag state distinguishes loading from a resolved disabled result", async () => {
   assert.equal(
-    readServerFeatureFlagState("server-a", CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY),
+    readServerFeatureFlagState("server-a", CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY),
     "loading",
   );
   api.post = (async () => ({ data: { evaluations: [] } })) as typeof api.post;
@@ -57,7 +57,7 @@ test("flag state distinguishes loading from a resolved disabled result", async (
   await prefetchServerFeatureFlags("server-a");
 
   assert.equal(
-    readServerFeatureFlagState("server-a", CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY),
+    readServerFeatureFlagState("server-a", CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY),
     "disabled",
   );
 });
@@ -108,10 +108,8 @@ test("account deletion is not a web flag any more: account_deletion_v0 was retir
   assert.equal(REGISTERED_SERVER_FEATURE_FLAG_KEYS.includes("account_deletion_v0" as never), false);
 });
 
-test("agent read progress is registered under the migration's key and fail closed before server evaluation", () => {
-  assert.equal(AGENT_READ_PROGRESS_FEATURE_FLAG_KEY, "agent_read_progress_v0");
-  assert.ok(REGISTERED_SERVER_FEATURE_FLAG_KEYS.includes(AGENT_READ_PROGRESS_FEATURE_FLAG_KEY));
-  assert.equal(readServerFeatureFlag("server-a", AGENT_READ_PROGRESS_FEATURE_FLAG_KEY), false);
+test("agent read progress is removed: the web no longer registers agent_read_progress_v0 (#raft-feature-flag:#9)", () => {
+  assert.equal(REGISTERED_SERVER_FEATURE_FLAG_KEYS.includes("agent_read_progress_v0" as never), false);
 });
 
 test("web preview is registered under the migration's key and fail closed before server evaluation", () => {
@@ -124,6 +122,12 @@ test("desktop web preview view is registered under the migration's key and fail 
   assert.equal(DESKTOP_WEB_PREVIEW_VIEW_FLAG_KEY, "desktop_web_preview_view_v0");
   assert.ok(REGISTERED_SERVER_FEATURE_FLAG_KEYS.includes(DESKTOP_WEB_PREVIEW_VIEW_FLAG_KEY));
   assert.equal(readServerFeatureFlag("server-a", DESKTOP_WEB_PREVIEW_VIEW_FLAG_KEY), false);
+});
+
+test("Artifact mini window is registered under the migration's key and fail closed before server evaluation", () => {
+  assert.equal(ARTIFACT_MINI_WINDOW_FLAG_KEY, "artifact_mini_window_v0");
+  assert.ok(REGISTERED_SERVER_FEATURE_FLAG_KEYS.includes(ARTIFACT_MINI_WINDOW_FLAG_KEY));
+  assert.equal(readServerFeatureFlag("server-a", ARTIFACT_MINI_WINDOW_FLAG_KEY), false);
 });
 
 test("desktop browser Raft sign-in is registered under the migration's key and fail closed before server evaluation", () => {
@@ -151,7 +155,7 @@ test("inbox row position is registered under the migration's key and fail closed
 });
 
 test("Claude limit resets are registered under the shared key and fail closed before server evaluation", () => {
-  assert.equal(CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY, "claude_limit_reset");
+  assert.equal(CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY, "claude_limit_reset_v2");
   assert.ok(REGISTERED_SERVER_FEATURE_FLAG_KEYS.includes(CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY));
   assert.equal(readServerFeatureFlag("server-a", CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY), false);
 });
@@ -197,7 +201,7 @@ test("registered server flags evaluate once as one batch and repeated consumers 
       data: {
         evaluations: REGISTERED_SERVER_FEATURE_FLAG_KEYS.map((key) => ({
           key,
-          enabled: key === CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY,
+          enabled: key === CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY,
         })),
       },
     };
@@ -205,7 +209,7 @@ test("registered server flags evaluate once as one batch and repeated consumers 
 
   for (let index = 0; index < 100; index += 1) {
     assert.equal(
-      readServerFeatureFlag("server-a", CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY),
+      readServerFeatureFlag("server-a", CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY),
       false,
       "message consumers stay fail-closed while the one batch is pending",
     );
@@ -222,18 +226,18 @@ test("registered server flags evaluate once as one batch and repeated consumers 
   assert.equal(second, third);
   assert.equal(postCalls, 1);
   assert.equal(first.resolved, true);
-  assert.equal(first.values[CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY], true);
+  assert.equal(first.values[CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY], true);
   assert.equal(
-    readServerFeatureFlagState("server-a", CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY),
+    readServerFeatureFlagState("server-a", CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY),
     "enabled",
   );
   assert.equal(
-    getServerFeatureFlagSnapshot("server-a").values[CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY],
+    getServerFeatureFlagSnapshot("server-a").values[CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY],
     true,
   );
   for (let index = 0; index < 100; index += 1) {
     assert.equal(
-      readServerFeatureFlag("server-a", CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY),
+      readServerFeatureFlag("server-a", CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY),
       true,
       "new message consumers read the resolved cache without another request",
     );
@@ -255,7 +259,7 @@ test("transient batch evaluate failures retry once before resolving the server c
     if (postCalls === 1) throw new Error("transient feature flag failure");
     return {
       data: {
-        evaluations: [{ key: CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY, enabled: true }],
+        evaluations: [{ key: CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY, enabled: true }],
       },
     };
   }) as typeof api.post;
@@ -270,9 +274,9 @@ test("transient batch evaluate failures retry once before resolving the server c
   assert.equal(second, third);
   assert.equal(postCalls, 2);
   assert.equal(first.resolved, true);
-  assert.equal(first.values[CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY], true);
+  assert.equal(first.values[CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY], true);
   assert.equal(
-    readServerFeatureFlag("server-a", CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY),
+    readServerFeatureFlag("server-a", CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY),
     true,
     "one transient failure must not pin registered flags false for the session",
   );
@@ -312,7 +316,7 @@ test("server flag cache is scoped per server and repeated request failures resol
     if (serverId === "server-b") throw new Error("feature flag service unavailable");
     return {
       data: {
-        evaluations: [{ key: CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY, enabled: true }],
+        evaluations: [{ key: CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY, enabled: true }],
       },
     };
   }) as typeof api.post;
@@ -323,16 +327,16 @@ test("server flag cache is scoped per server and repeated request failures resol
   await prefetchServerFeatureFlags("server-b");
 
   assert.deepEqual(requestedServers, ["server-a", "server-b", "server-b"]);
-  assert.equal(serverA.values[CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY], true);
+  assert.equal(serverA.values[CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY], true);
   assert.equal(serverB.resolved, true);
   assert.equal(serverB.resolution, "undetermined");
   assert.equal(
-    readServerFeatureFlagState("server-b", CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY),
+    readServerFeatureFlagState("server-b", CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY),
     "undetermined",
     "a terminal evaluation failure must not masquerade as a disabled flag",
   );
   assert.equal(
-    readServerFeatureFlag("server-b", CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY),
+    readServerFeatureFlag("server-b", CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY),
     false,
     "undetermined flags remain fail-closed for existing boolean consumers",
   );
@@ -357,7 +361,7 @@ test("Lab readback stays determinate when the batch evaluator is undetermined", 
     serverLabVersion: 1,
     masterEnabled: true,
     labs: [{
-      key: CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY,
+      key: CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY,
       name: "Attachment comments",
       description: "Attachment comments.",
       state: "open",
@@ -367,11 +371,11 @@ test("Lab readback stays determinate when the batch evaluator is undetermined", 
   });
 
   assert.equal(
-    readServerFeatureFlagState("server-a", CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY),
+    readServerFeatureFlagState("server-a", CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY),
     "enabled",
   );
   assert.equal(
-    readServerFeatureFlagState("server-a", PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY),
+    readServerFeatureFlagState("server-a", WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY),
     "undetermined",
   );
 });
@@ -382,7 +386,7 @@ test("Lab readback stays determinate while the batch evaluator is still loading"
     serverLabVersion: 1,
     masterEnabled: true,
     labs: [{
-      key: CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY,
+      key: CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY,
       name: "Attachment comments",
       description: "Attachment comments.",
       state: "open",
@@ -395,7 +399,7 @@ test("Lab readback stays determinate while the batch evaluator is still loading"
     serverLabVersion: 1,
     masterEnabled: true,
     labs: [{
-      key: CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY,
+      key: CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY,
       name: "Attachment comments",
       description: "Attachment comments.",
       state: "open",
@@ -405,15 +409,15 @@ test("Lab readback stays determinate while the batch evaluator is still loading"
   });
 
   assert.equal(
-    readServerFeatureFlagState("server-enabled", CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY),
+    readServerFeatureFlagState("server-enabled", CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY),
     "enabled",
   );
   assert.equal(
-    readServerFeatureFlagState("server-disabled", CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY),
+    readServerFeatureFlagState("server-disabled", CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY),
     "disabled",
   );
   assert.equal(
-    readServerFeatureFlagState("server-enabled", PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY),
+    readServerFeatureFlagState("server-enabled", WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY),
     "loading",
   );
 });
@@ -441,7 +445,7 @@ test("Lab readback-derived flag values win over slower evaluator responses", asy
     serverLabVersion: 3,
     masterEnabled: true,
     labs: [{
-      key: CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY,
+      key: CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY,
       name: "Attachment comments",
       description: "Attachment comments.",
       state: "open",
@@ -450,18 +454,18 @@ test("Lab readback-derived flag values win over slower evaluator responses", asy
     }],
   });
 
-  assert.equal(readServerFeatureFlag("server-a", CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY), true);
+  assert.equal(readServerFeatureFlag("server-a", CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY), true);
 
   await refreshServerFeatureFlags("server-a");
 
   assert.equal(postCalls, 2);
   assert.equal(
-    readServerFeatureFlag("server-a", CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY),
+    readServerFeatureFlag("server-a", CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY),
     true,
     "a delayed evaluator refresh must not resurrect the older Lab gate result",
   );
   assert.equal(
-    readServerFeatureFlagState("server-a", CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY),
+    readServerFeatureFlagState("server-a", CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY),
     "enabled",
     "the Lab-derived state stays authoritative after batch evaluation resolves",
   );
@@ -515,12 +519,12 @@ test("socket lifecycle prefetches the registered server flags", async () => {
 test("logout invalidates the resolved server feature-flag session cache", () => {
   setServerFeatureFlagForTests(
     "server-before-logout",
-    CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY,
+    CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY,
     true,
   );
   assert.equal(getServerFeatureFlagSnapshot("server-before-logout").resolved, true);
   assert.equal(
-    readServerFeatureFlag("server-before-logout", CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY),
+    readServerFeatureFlag("server-before-logout", CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY),
     true,
   );
   useAuthStore.setState({

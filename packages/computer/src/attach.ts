@@ -9,9 +9,12 @@
 // `useUserSession` keeps the user-session attach for setup's legacy-daemon
 // migration branch, which already signed in to read the legacy roster.
 import { presentAttachEvent, presentDeviceCode } from "./deviceApprovalPrompt";
+import { createLoopbackLoginPresenter } from "./loopbackLoginPrompt";
 import { fail, info, present } from "./output";
 import { resolveRaftHome } from "./paths";
+import { normalizeServerSlug } from "./serverState";
 import { createComputerApi } from "./lib/api";
+import { createComputerTracer } from "./lib/computerTracer";
 import type { ComputerCliAttachJson } from "@botiverse/raft-shared";
 
 export async function runAttach(opts: {
@@ -24,13 +27,24 @@ export async function runAttach(opts: {
   useUserSession?: boolean;
   input?: NodeJS.ReadableStream;
   openUrl?: (url: string) => void;
+  /** `--device-code`: approve with a code even when the browser is on this machine. */
+  deviceCode?: boolean;
+  /** `--pair`, already checked (pairFlag.ts): sent on a device-code approval only. */
+  pairingId?: string;
 }): Promise<void> {
-  const api = createComputerApi(resolveRaftHome());
+  const slockHome = resolveRaftHome();
+  const api = createComputerApi(slockHome);
+  const loopback = createLoopbackLoginPresenter({
+    deviceCode: opts.deviceCode,
+    tracer: createComputerTracer(slockHome, "computer.cli"),
+    ...(opts.input ? { input: opts.input } : {}),
+  });
   let cleanupEnterToOpen: (() => void) | undefined;
   await present(async () => {
     try {
       const attachOpts = { serverSlug: opts.serverSlug, serverUrl: opts.serverUrl, name: opts.name };
       const onEvent = (event: Parameters<typeof presentAttachEvent>[0]) => {
+        if (loopback.handleEvent(event)) return;
         if (event.kind === "login.device-code") {
           cleanupEnterToOpen?.();
           cleanupEnterToOpen = presentDeviceCode(event, {
@@ -51,9 +65,17 @@ export async function runAttach(opts: {
       if (opts.useUserSession) {
         await api.attach(attachOpts, onEvent);
       } else {
-        await api.attachWithApproval(attachOpts, onEvent);
+        await api.attachWithApproval(
+          {
+            ...attachOpts,
+            loopback: loopback.options,
+            ...(opts.pairingId ? { pairing: { pairingId: opts.pairingId, serverSlug: normalizeServerSlug(opts.serverSlug) } } : {}),
+          },
+          onEvent,
+        );
       }
     } finally {
+      loopback.cleanup();
       cleanupEnterToOpen?.();
     }
   });

@@ -1,9 +1,11 @@
-import { useEffect, useState } from "react";
+import { useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
+import { currentTimeMs } from "@botiverse/raft-shared";
 import { ChevronRight } from "lucide-react";
 import { Badge, Card, CardContent, OtterIndicator, Text } from "@botiverse/raft-ui";
 import { useAgentCurrentActivityState } from "../../store/agentStore";
+import { createTickingClock } from "../../hooks/tickingClock";
 import { useTimeFormatter } from "../../hooks/useTimeFormatter";
 import SectionEyebrow from "../ui/SectionEyebrow";
 import { formatActivityText } from "../../utils/activity";
@@ -21,22 +23,21 @@ function useTurnTime(): (ms: number) => string {
   return (ms) => (calendarDayKey(new Date(ms), options) === calendarDayKey(new Date(), options) ? formatClock(ms) : formatShortDateTime(ms));
 }
 
-/** Milliseconds since `startedAt`, counting each second while `active`. */
+const subscribeEachSecond = createTickingClock(() => 1000);
+const subscribeNever = () => () => {};
+
+/** Milliseconds since `startedAt` (in whole seconds, as it is shown), counting each second while `active`. */
 function useElapsed(startedAt: number | undefined, active: boolean): number {
-  // A second tick only re-renders; the clock is read when rendering.
-  const [, setTick] = useState(0);
-  useEffect(() => {
-    if (!active) return;
-    const timer = setInterval(() => setTick((tick) => tick + 1), 1000);
-    return () => clearInterval(timer);
-  }, [active]);
-  return startedAt === undefined ? 0 : Date.now() - startedAt;
+  // The clock is read as the store's value, not while rendering; a tick re-reads it.
+  const read = () => (startedAt === undefined ? 0 : Math.round((currentTimeMs() - startedAt) / 1000) * 1000);
+  return useSyncExternalStore(active ? subscribeEachSecond : subscribeNever, read, read);
 }
 
 /**
  * What the agent is doing now, in words, then who the running (else the last)
- * turn answers and what it has done; the profile adds its last turns, one line
- * each, and a way to the Activity tab (xxchan, 2026-11-05).
+ * turn answers and what it has done; the profile adds its last turns, one row
+ * each (wrapping when it does not fit), and a way to the Activity tab (xxchan,
+ * 2026-11-05).
  *
  * `status` is the agent's status as the profile shows it (AgentStatusBadge:
  * every state it resolves, blocked, external, a stuck tool call and its Stop);
@@ -101,7 +102,8 @@ export function AgentNowCard({ agentId, turns, running, status, onOpenActivity, 
             {!status && busy && running && current?.activityDetail
               ? <Text.Sans className="truncate text-callout text-foreground" data-testid="agent-now-step">{formatActivityText(formatMessage, activity, current.activityDetail, current.detailKind)}</Text.Sans>
               : null}
-            {focusLine ? <Text.Sans className="truncate text-callout text-foreground-muted" data-testid="agent-now-focus">{focusLine}</Text.Sans> : null}
+            {/* Phone width: the whole "Last turn: … / This turn …" line wraps instead of being cut (artin, #triage:4ee8933c; App alike); wider, one line. */}
+            {focusLine ? <Text.Sans className="break-words text-callout text-foreground-muted sm:truncate" data-testid="agent-now-focus">{focusLine}</Text.Sans> : null}
           </div>
         </div>
         {rows.length > 0 ? (
@@ -138,11 +140,16 @@ function RecentTurnRow({ turn, turnTime }: { turn: TurnSummaryView; turnTime: (m
   const intl = useIntl();
   const trigger = formatCompactTrigger(intl.formatMessage, turn.trigger);
   return (
-    <div data-testid="agent-now-row" className="flex min-w-0 items-center gap-2 overflow-hidden text-callout">
+    // Nothing is cut off: what does not fit on the line moves to the next one
+    // (a badge as a whole), indented under the text, not under the time. The
+    // same rule as the App's row (mobile #4965).
+    <div data-testid="agent-now-row" className="flex min-w-0 items-baseline gap-2 text-callout">
       <span className="shrink-0 whitespace-nowrap font-mono text-mono-meta text-foreground-hint">{turnTime(turn.startedAt)}</span>
-      {trigger ? <span className="max-w-[45%] shrink-0 truncate text-foreground">{trigger}</span> : null}
-      <span className="min-w-0 flex-1 truncate text-foreground-muted">{formatTurnActions(intl, turn.actions, turn.messagesSent)}</span>
-      <TurnRowBadges turn={turn} />
+      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1">
+        {trigger ? <span className="min-w-0 break-words text-foreground">{trigger}</span> : null}
+        <span className="min-w-0 break-words text-foreground-muted">{formatTurnActions(intl, turn.actions, turn.messagesSent)}</span>
+        <TurnRowBadges turn={turn} />
+      </div>
     </div>
   );
 }

@@ -25,6 +25,7 @@ export const loadDeviceLoginRevokePage = sharedModule(() => import("./DeviceLogi
 export const loadSecondFactorRecoveryLinkPage = sharedModule(() => import("./SecondFactorRecoveryLinkPage"));
 export const loadAccountDeletionCancelLinkPage = sharedModule(() => import("./AccountDeletionCancelLinkPage").then((module) => ({ default: module.AccountDeletionCancelLinkPage })));
 export const loadAppLoginPage = sharedModule(() => import("./AppLoginPage"));
+export const loadAppStepUpPage = sharedModule(() => import("./AppStepUpPage").then((module) => ({ default: module.AppStepUpPage })));
 export const loadIntegrationInvitePage = sharedModule(() => import("./IntegrationInvitePage"));
 export const loadExternalInvitePage = sharedModule(() => import("./ExternalInvitePage"));
 export const loadExternalInviteLandingPage = sharedModule(() => import("./ExternalInviteLandingPage").then((module) => ({ default: module.ExternalInviteLandingPage })));
@@ -61,6 +62,7 @@ const ROUTES: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
   ["/login-with-slock-human/setup", loadHumanLoginSetupPage],
   ["/login/device", loadDeviceLoginPage],
   ["/login/app", loadAppLoginPage],
+  ["/login/app/verify", loadAppStepUpPage],
   [INTEGRATION_INVITE_ROUTE, loadIntegrationInvitePage],
   [EXTERNAL_INVITE_ROUTE, loadExternalInvitePage],
   // Signed out, the same address opens the invite's landing page first.

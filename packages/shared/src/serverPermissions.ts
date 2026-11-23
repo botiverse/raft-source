@@ -13,7 +13,10 @@ export const MANAGEABLE_SERVER_ROLES = ["owner", "admin", "member"] as const sat
  * visibility entry (visibilityService.canView) decides it.
  */
 export const SERVER_CAPABILITY_KEYS = [
-  "createChannels",
+  // Each gates creating a channel of that visibility (createChannelCapabilityFor
+  // picks one from the requested visibility). They replaced one createChannels.
+  "createPublicChannels",
+  "createPrivateChannels",
   "editChannelMetadata",
   "archiveChannels",
   "deleteChannels",
@@ -59,6 +62,9 @@ export const SERVER_CAPABILITY_KEYS = [
   // SSO connection and sign-in rules (rfcs/083-server-sso.md §7): owner only,
   // since a broken connection or "require SSO" can lock a whole company out.
   "manageSso",
+  // Exporting the server's public channels out of Raft (data export, design
+  // v7 decision 4): owner only, like manageSso; admins are not granted it.
+  "exportServerData",
 ] as const;
 
 export type ServerCapability = typeof SERVER_CAPABILITY_KEYS[number];
@@ -87,11 +93,12 @@ function capabilitiesFrom(granted: readonly ServerCapability[]): ServerCapabilit
 
 const EMPTY_SERVER_CAPABILITIES = capabilitiesFrom([]);
 const ADMIN_SERVER_CAPABILITIES = capabilitiesFrom(
-  SERVER_CAPABILITY_KEYS.filter((capability) => capability !== "manageBilling" && capability !== "manageSso")
+  SERVER_CAPABILITY_KEYS.filter((capability) => capability !== "manageBilling" && capability !== "manageSso" && capability !== "exportServerData")
 );
 const MEMBER_SERVER_CAPABILITIES = capabilitiesFrom([
   "viewServerProfile",
-  "createChannels",
+  "createPublicChannels",
+  "createPrivateChannels",
   "joinPublicChannels",
   "addChannelMembers",
   "viewMembers",
@@ -166,6 +173,36 @@ export function getServerSurfaceCapabilities(
 
 export function hasServerCapability(role: ServerRole | null | undefined, capability: ServerCapability): boolean {
   return getServerCapabilities(role)[capability];
+}
+
+export type CreateChannelCapability = "createPublicChannels" | "createPrivateChannels";
+
+/**
+ * The capability creating a channel of `visibility` takes: "private" takes
+ * createPrivateChannels, anything else createPublicChannels: public, the
+ * default when absent, and a joint channel (its own type, not "private"; its
+ * route also takes federateChannels).
+ * Takes the raw request value so a route can check before it validates the
+ * body, as it did with one createChannels.
+ */
+export function createChannelCapabilityFor(visibility: unknown): CreateChannelCapability {
+  return visibility === "private" ? "createPrivateChannels" : "createPublicChannels";
+}
+
+/** Whether any channel can be created at all: the entry points (sidebar +, Create Channel) show for either. */
+export function canCreateAnyChannel(capabilities: Pick<ServerCapabilities, CreateChannelCapability>): boolean {
+  return capabilities.createPublicChannels || capabilities.createPrivateChannels;
+}
+
+/**
+ * The capability object as it goes over the wire to agents (server info,
+ * whoami). Adds `createChannels` (public OR private), the key it carried
+ * before the split, so a reader of the old key keeps its answer. Deprecated:
+ * read createPublicChannels / createPrivateChannels.
+ */
+export function serverCapabilitiesWireView(role: ServerRole | null | undefined): ServerCapabilities & { createChannels: boolean } {
+  const capabilities = getServerCapabilities(role);
+  return { ...capabilities, createChannels: canCreateAnyChannel(capabilities) };
 }
 
 export function canReadBillingSummary(role: ServerRole | null | undefined): boolean {

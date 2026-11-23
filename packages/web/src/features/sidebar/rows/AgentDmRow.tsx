@@ -13,6 +13,7 @@ import { sidebarItemClass } from "./sidebarRowClasses";
 import { SidebarAgentActivityBadge } from "./SidebarAgentActivityBadge";
 import { SidebarAgentMeta } from "./SidebarAgentMeta";
 import { SidebarPeerRowBody } from "./SidebarPeerRowBody";
+import type { SidebarBrowserInUse } from "./SidebarBrowserInUseMark";
 
 // Pinned agent DM row — keyed off the agent entity; subscribes to the agent's
 // DM channel unread (if a DM channel exists yet).
@@ -25,6 +26,7 @@ export const AgentDmRow = memo(function AgentDmRow({
   onSelect,
   onContextMenu,
   makeLongPress,
+  browserInUse = null,
 }: {
   agent: Agent;
   dmId: string | undefined;
@@ -35,6 +37,8 @@ export const AgentDmRow = memo(function AgentDmRow({
   onSelect: (agent: Agent, dmId: string | undefined, clickCount: number) => void;
   onContextMenu: (e: React.MouseEvent, type: SidebarCtxKind, id: string) => void;
   makeLongPress: (type: SidebarCtxKind, id: string) => SidebarLongPress;
+  /** The built-in browser's kept pages of this conversation use a device or play sound (stable object: memo). */
+  browserInUse?: SidebarBrowserInUse | null;
 }) {
   // Stryker disable all: visual class-token mutations are equivalent in the DOM oracle; agent DM profile/source, unread and pin-menu behavior are covered by behavior tests.
   const unread = useMessageStore((s) => (dmId ? s.unreadCounts[dmId] || 0 : 0));
@@ -83,6 +87,7 @@ export const AgentDmRow = memo(function AgentDmRow({
         markedUnread={markedUnread}
         hasDraft={hasDraft}
         activityMuted={activityMuted}
+        browserInUse={browserInUse}
         agentMeta={agent.managedByAppInstallId
           ? null
           : <SidebarAgentMeta agentId={agent.id} runtime={agent.runtime} external={agent.external === true || isExternalAgentRuntime(agent.runtime)} />}

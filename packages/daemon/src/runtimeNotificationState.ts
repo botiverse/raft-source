@@ -1,4 +1,5 @@
 import { clearTimeout as clearNodeTimeout, setTimeout as scheduleNodeTimeout } from "node:timers";
+import { OutstandingNoticeHold } from "./outstandingNoticeHold";
 
 /**
  * Derived dedup-key for a busy stdin inbox notice: the sorted set of
@@ -80,6 +81,12 @@ export function computeInboxNoticeFingerprint(
  * count, but they must not count an already-contributed row as changed again.
  * Pruning against the current inbox keeps the memo from hiding a row that was
  * consumed/read and then re-arrived with the same server identity.
+ *
+ * Task #triage:#399: the outstanding-notice hold (outstandingNoticeHold.ts).
+ * A held busy notice moves its debt from `pendingCount` to `heldNoticeDebt`,
+ * so runtime progress does not retry it; the messages stay in the inbox,
+ * uncontributed, so the turn-end delivery tells them. Releasing the hold
+ * gives the debt back to `pendingCount`, the state before the hold.
  */
 export class RuntimeNotificationState {
   private timerValue: unknown | null = null;
@@ -94,11 +101,27 @@ export class RuntimeNotificationState {
   /** Identity -> when it was first told (contributionSeq at that write). */
   private contributedIdentities = new Map<string, number>();
   private contributionSeq = 0;
+  private readonly noticeHold = new OutstandingNoticeHold();
+  private heldNoticeDebtValue = 0;
+  /** The "Older unread" count of the last wake-up notice written with the Server's rows, and the session it was written to. */
+  private olderMessagesValue: number | null = null;
+  private olderMessagesSessionId: string | null = null;
 
   constructor(private readonly scheduler: RuntimeNotificationScheduler = systemNotificationScheduler) {}
 
   get pendingCount(): number {
     return this.pendingCountValue;
+  }
+
+  /** What the last notice written to `sessionId` returned as `olderMessages` (shared formatAgentInboxNotice); null in another session. */
+  previousOlderMessages(sessionId: string | null): number | null {
+    return this.olderMessagesSessionId === sessionId ? this.olderMessagesValue : null;
+  }
+
+  /** Call ONLY after a successful write of that notice. */
+  recordOlderMessagesWritten(olderMessages: number | null, sessionId: string | null) {
+    this.olderMessagesValue = olderMessages;
+    this.olderMessagesSessionId = sessionId;
   }
 
   get timer(): unknown | null {
@@ -132,9 +155,72 @@ export class RuntimeNotificationState {
   }
 
   clear() {
+    this.noticeHold.reset();
+    this.heldNoticeDebtValue = 0;
     this.clearPending();
     this.clearTimer();
     this.clearNoticeFingerprint();
+  }
+
+  /** Busy notice debt held behind an outstanding notice (not in `pendingCount`). */
+  get heldNoticeDebt(): number {
+    return this.heldNoticeDebtValue;
+  }
+
+  /** Whether a hold is armed in any session (cheap check before computing what it gives back). */
+  get isNoticeHoldArmed(): boolean {
+    return this.noticeHold.isArmed;
+  }
+
+  /** Busy notices held since the outstanding one landed. */
+  get heldNoticeCount(): number {
+    return this.noticeHold.suppressedCount;
+  }
+
+  /** Whether a busy pure notice to this session waits behind an outstanding one. */
+  isNoticeHeld(sessionId: string | null): boolean {
+    return this.noticeHold.holds(sessionId);
+  }
+
+  /** Hold a busy notice whose debt `count` was taken from pending; returns the notices held so far. */
+  holdNotice(count: number): number {
+    if (Number.isFinite(count) && count > 0) this.heldNoticeDebtValue += Math.floor(count);
+    return this.noticeHold.noteSuppressed();
+  }
+
+  /**
+   * A pure notice landed in `sessionId` (call ONLY after a successful write).
+   * It covered what was held (its window included the held debt), so the
+   * debt is settled. Returns how many notices were held before it (a
+   * break-through), else 0.
+   */
+  armNoticeHold(sessionId: string | null): number {
+    this.heldNoticeDebtValue = 0;
+    return this.noticeHold.arm(sessionId);
+  }
+
+  /**
+   * A write that is not a pure notice told what was held (call ONLY after a
+   * successful write): the held debt is settled. The hold itself stays as it
+   * is: the outstanding notice is still outstanding.
+   */
+  settleHeldNoticeDebt(): void {
+    this.heldNoticeDebtValue = 0;
+  }
+
+  /**
+   * Ends the hold and gives its held debt back to pending, at most
+   * `untoldCount` (the inbox rows still untold in this session: reads,
+   * purges and wake-loop parks take rows out without touching the debt, and
+   * debt with nothing behind it would read as untold work for ever).
+   * Returns what was given back; null when no hold was armed.
+   */
+  releaseNoticeHold(untoldCount: number): { suppressed: number; heldDebt: number } | null {
+    const released = this.noticeHold.release();
+    const heldDebt = Math.min(this.heldNoticeDebtValue, Math.max(0, Math.floor(untoldCount)));
+    this.heldNoticeDebtValue = 0;
+    if (heldDebt > 0) this.pendingCountValue += heldDebt;
+    return released ? { ...released, heldDebt } : null;
   }
 
   /**
@@ -234,7 +320,15 @@ export class RuntimeNotificationState {
     this.lastEncodeFailedSessionId = sessionId;
   }
 
+  /**
+   * Forgets what was told; an outstanding notice goes with it. Its held debt
+   * is dropped, not given back (callers that owe a flush release the hold
+   * first): the rows stay uncontributed, so the next idle or turn-end
+   * delivery tells them.
+   */
   clearNoticeFingerprint() {
+    this.noticeHold.reset();
+    this.heldNoticeDebtValue = 0;
     this.lastNoticeFingerprint = null;
     this.lastNoticeSessionId = null;
     this.lastEncodeFailedFingerprint = null;

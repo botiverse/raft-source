@@ -87,6 +87,8 @@ async function seedServer(agentCount = 1) {
     name: "Registry Docs",
     endpointUrl: "https://registry-docs.example.test/mcp",
     enabled: true,
+    // No recorded creator: every agent has it only because the Server vouched for it (as 0732 does).
+    serverVouchedAt: new Date(),
     sourceKind: "url",
     authMode: "headers",
     requiredHeaderNames: ["X-Api-Key"],

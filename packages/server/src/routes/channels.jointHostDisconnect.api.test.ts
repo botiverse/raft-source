@@ -25,6 +25,9 @@ const test = createApiTest();
 
 type Seed = ReturnType<typeof createSeed>;
 
+/** A channel that is missing or hidden, and the flag-off answer: one body (HUMAN_CHANNEL_NOT_FOUND_REFUSAL). */
+const CHANNEL_NOT_FOUND = { error: "Channel not found", code: "channel_not_found", errorCode: "channel_not_found" };
+
 /** The one gate (#wg-rbac:#55): external_channels_v1 on for the host. */
 const enableHostDisconnect = (hostServerId: string) => enableExternalChannelsFlag(hostServerId);
 
@@ -84,7 +87,7 @@ test("external_channels_v1 off for the host: answered as an unknown channel and 
     if (retired) await storeRetiredMemberConnectFlag(retired === "killed" ? retired : { allow: [...retired.allow] });
     const refused = await call(app.baseUrl, x.hostOwner, x.h, x.hLocal, x.b.id);
     assert.equal(refused.status, 404, JSON.stringify([retired, refused.body]));
-    assert.deepEqual(refused.body, { error: "Channel not found" }, JSON.stringify(retired));
+    assert.deepEqual(refused.body, CHANNEL_NOT_FOUND, JSON.stringify(retired));
     await assertUntouched(db, x);
   }
 });
@@ -159,12 +162,12 @@ test("a host owner/admin who can't open the host's copy is refused; an outsider 
   assert.equal(unknown.status, 404);
   assert.equal(hidden.status, 404);
   assert.deepEqual(hidden.body, unknown.body, "byte-identical to an unknown channel");
-  assert.deepEqual(hidden.body, { error: "Channel not found" });
+  assert.deepEqual(hidden.body, CHANNEL_NOT_FOUND);
 
   // An admin outside the channel: canSeeChannel hides it, as for anyone outside.
   const admin = await call(app.baseUrl, hostAdmin, x.h, x.hLocal, x.b.id);
   assert.equal(admin.status, 404, JSON.stringify(admin.body));
-  assert.deepEqual(admin.body, { error: "Channel not found" });
+  assert.deepEqual(admin.body, CHANNEL_NOT_FOUND);
   await assertUntouched(db, x);
 });
 
@@ -218,7 +221,7 @@ test("external_channels_v1 turned off after the route's check: the service re-re
     }),
     () => call(app.baseUrl, x.hostOwner, x.h, x.hLocal, x.b.id));
   assert.equal(refused.status, 404, JSON.stringify(refused.body));
-  assert.deepEqual(refused.body, { error: "Channel not found" });
+  assert.deepEqual(refused.body, CHANNEL_NOT_FOUND);
   await assertUntouched(db, x);
 });
 

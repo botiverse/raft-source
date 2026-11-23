@@ -19,6 +19,7 @@ import {
   CURRENT_SCHEMA_VERSION,
 } from "./paths";
 import { canonicalizeServerUrl, LEGACY_PRODUCTION_SERVER_URL } from "./serverUrl";
+import { writeDurableTextFile } from "./durableFile";
 
 export interface ServerAttachment {
   kind: "computer-attachment";
@@ -219,7 +220,8 @@ export async function writeServerAttachment(
   await mkdir(dirname(path), { recursive: true });
   // Stamp the current on-disk schema version on every write.
   const stamped: ServerAttachment = { ...attachment, schemaVersion: CURRENT_SCHEMA_VERSION };
-  await writeFile(path, JSON.stringify(stamped, null, 2), { mode: 0o600 });
+  // Temp file + rename: a reader never sees a half-written credential file.
+  await writeDurableTextFile(path, JSON.stringify(stamped, null, 2));
   await chmod(path, 0o600);
 }
 

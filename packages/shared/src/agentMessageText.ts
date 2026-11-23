@@ -12,6 +12,7 @@ import { formatAgentReplyAffordanceSuffix } from "./agentInbox";
 import { formatHint, RAFT_HINTS, type RaftHintStyle } from "./agentOps/hint";
 import { formatRaftChannelTaskRef, formatRaftDmTaskRef, type RaftTargetString } from "./raftRefs";
 import { formatAgentTaskRef } from "./agentText/taskRef";
+import { validateServerSlugReferenceReason } from "./serverSlugValidation";
 import { renderThirdPartyEventPayload } from "./thirdPartyInertRenderer";
 import { formatUtcTimestamp } from "./utcTimestamp";
 import type { AgentMessageCardMarker } from "./messageCard";
@@ -133,6 +134,12 @@ export interface AgentMessageLike {
   sender_type?: string;
   sender_name?: string;
   sender_description?: string | null;
+  /**
+   * Where an outside sender is from (AgentSenderOrigin), in place of the
+   * description the Server withholds from this reader. Wire data: read it
+   * through parseAgentSenderOrigin.
+   */
+  sender_origin?: unknown;
   /** IANA zone of a human web sender; transport only, not rendered yet. */
   sender_timezone?: string | null;
   /** RFC 077: the personal assistant that sent this as its owner (the sender). */
@@ -253,13 +260,58 @@ export function formatAgentMessageTarget(m: AgentMessageLike): RaftTargetString 
  * their own profile: its line breaks are prefixed like a body's, so none can
  * start a forged `[target=…]` header.
  */
-export function formatSenderHandleText(name: string, description?: string | null, timezone?: string | null): string {
+export function formatSenderHandleText(name: string, description?: string | null, timezone?: string | null, origin?: unknown): string {
   const zone = timezone ? ` (${timezone})` : "";
-  return indentAgentBodyContinuationLines(description ? `@${name}${zone} — ${description}` : `@${name}${zone}`);
+  // An outside sender's origin stands where a description would: the Server
+  // sends one or the other (lib/descriptionVisibility.ts), and the origin wins.
+  const label = formatAgentSenderOriginLabel(origin) ?? description;
+  return indentAgentBodyContinuationLines(label ? `@${name}${zone} — ${label}` : `@${name}${zone}`);
 }
 
 export function formatAgentSenderHandle(m: AgentMessageLike): string {
-  return formatSenderHandleText(m.sender_name ?? "unknown", m.sender_description ?? null, m.sender_timezone ?? null);
+  return formatSenderHandleText(m.sender_name ?? "unknown", m.sender_description ?? null, m.sender_timezone ?? null, m.sender_origin);
+}
+
+/**
+ * Where a message's sender is from, for an agent reader, when the sender is
+ * not a non-guest member of the reader's server (the Server then withholds
+ * their description): `guest` (a guest of the reader's server), or
+ * `other_server` with that server's slug when the reader already sees the
+ * server in a joint conversation, without one otherwise. Absent for every
+ * other sender. The Agent API spells the slug `serverSlug`, the daemon
+ * delivery `server_slug`.
+ */
+export type AgentSenderOrigin = { kind: "other_server"; serverSlug?: string } | { kind: "guest" };
+
+/** The daemon delivery's spelling of AgentSenderOrigin (`AgentMessage.sender_origin`). */
+export type AgentSenderOriginWire = { kind: "other_server"; server_slug?: string } | { kind: "guest" };
+
+
+/** A wire `sender_origin` / `senderOrigin`, either slug spelling; null for anything else (a later kind included). */
+export function parseAgentSenderOrigin(value: unknown): AgentSenderOrigin | null {
+  if (!value || typeof value !== "object") return null;
+  const wire = value as { kind?: unknown; serverSlug?: unknown; server_slug?: unknown };
+  if (wire.kind === "guest") return { kind: "guest" };
+  if (wire.kind !== "other_server") return null;
+  const slug = wire.serverSlug ?? wire.server_slug;
+  // A server slug's own charset (serverSlugValidation.ts). The slug lands on
+  // the header line, so anything else is dropped, never folded.
+  return typeof slug === "string" && validateServerSlugReferenceReason(slug) === null
+    ? { kind: "other_server", serverSlug: slug }
+    : { kind: "other_server" };
+}
+
+/**
+ * What the header says after `@name — ` for an outside sender:
+ * `from another server (/acme)`, `from another server`, or `guest`. Short and
+ * Raft's own words, so it prints on every message (never elided like a
+ * description).
+ */
+export function formatAgentSenderOriginLabel(origin: unknown): string | null {
+  const parsed = parseAgentSenderOrigin(origin);
+  if (!parsed) return null;
+  if (parsed.kind === "guest") return "guest";
+  return parsed.serverSlug ? `from another server (/${parsed.serverSlug})` : "from another server";
 }
 
 /**
@@ -366,28 +418,32 @@ export function formatAgentTaskAssigneeSuffix(assigneeId?: string | null, assign
 }
 
 /**
- * Superseded-task projection suffix. `neutralize`, when given, rewrites quoted
+ * Edited-task suffix: `[task #7 edited by @who at <time>; the text above is
+ * the original]`, then the task's current title and description. Without a
+ * known editor `by …` is left out (a system edit reads `by system`); without
+ * a time, `at …`. `neutralize`, when given, rewrites quoted
  * title/description/actor text so pasted refs cannot route attention (the CLI
  * passes its search-preview neutraliser); the actor handle is then `user:<name>`.
+ * `original` says where the caller prints the original text: `above` (a
+ * message line, the default) or `below` (a search result, whose text follows).
  */
 export function formatAgentTaskCurrentProjection(
   projection: AgentMessageTaskCurrentProjectionLike | null | undefined,
   taskNumber?: number | null,
   neutralize?: (text: string) => string,
+  original: "above" | "below" = "above",
 ): string {
   const neutralizeRefs = neutralize !== undefined;
   const renderPreviewText = neutralize ?? ((text: string) => text);
   if (!projection?.superseded) return "";
-  const revision = Number.isInteger(projection.revision) ? projection.revision : "?";
-  const source = projection.source ?? "tasks_current_projection";
-  const actorName = projection.amendedByName ?? projection.amended_by_name ?? null;
+  const actorName = foldAgentOneLineText(projection.amendedByName ?? projection.amended_by_name ?? "");
   const actorType = projection.amendedByType ?? projection.amended_by_type ?? null;
   const actor = actorName
     ? neutralizeRefs ? `user:${actorName}` : `@${actorName}`
-    : actorType === "system" ? "system" : "<unresolved>";
+    : actorType === "system" ? "system" : null;
   const amendedAt = projection.amendedAt ?? projection.amended_at ?? null;
   const lines = [
-    `[${taskNumber ? `task #${taskNumber} ` : "task "}superseded: current projection rev=${revision} source=${source} actor=${actor} time=${amendedAt ? formatUtcTimestamp(amendedAt) : "-"}]`,
+    `[${taskNumber ? `task #${taskNumber} ` : "task "}edited${actor ? ` by ${actor}` : ""}${amendedAt ? ` at ${formatUtcTimestamp(amendedAt)}` : ""}; the text ${original} is the original]`,
     `Current title: ${indentAgentBodyContinuationLines(neutralizeRefs ? renderPreviewText(projection.title ?? "") : projection.title ?? "")}`,
   ];
   if (projection.description != null) {

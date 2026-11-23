@@ -30,8 +30,10 @@ afterAll(() => capture.restore());
  * Route ("METHOD /path" as registered) -> where its gate is called and for what.
  * `onlyForReason`: the route is gated by the body's `reason`, only that one
  * needs the second factor; `handler` is the registration as written in `file`.
+ * `sameCallAs`: another listed route whose handler (one router, two mounts)
+ * makes this route's gate call: the call is counted once.
  */
-const GATED_ROUTES: Record<string, { file: string; action: StepUpAction; onlyForReason?: { reason: string; handler: string } }> = {
+const GATED_ROUTES: Record<string, { file: string; action: StepUpAction; onlyForReason?: { reason: string; handler: string }; sameCallAs?: string }> = {
   "PATCH /api/auth/me": { file: "routes/auth.ts", action: "password_change" },
   "DELETE /api/auth/identities/:provider": { file: "routes/auth.ts", action: "identity_unlink" },
   "POST /api/auth/:provider/link/start": { file: "routes/auth.ts", action: "identity_link" },
@@ -65,6 +67,9 @@ const GATED_ROUTES: Record<string, { file: string; action: StepUpAction; onlyFor
     action: "session_revoke",
     onlyForReason: { reason: "lost_device", handler: 'mySessionsRouter.post("/revoke-others"' },
   },
+  // Starting a data export: one router, mounted for personal and server exports (#triage:#512).
+  "POST /api/me/data-exports": { file: "routes/dataExports.ts", action: "data_export" },
+  "POST /api/servers/:id/data-exports": { file: "routes/dataExports.ts", action: "data_export", sameCallAs: "POST /api/me/data-exports" },
 };
 
 /**
@@ -76,6 +81,9 @@ const APPROVAL_GATED_ROUTES: Record<string, { file: string; handler: string }> =
   "POST /api/auth/app-login/requests/:id/approve": { file: "routes/appLogin.ts", handler: 'appLoginRouter.post("/requests/:id/approve"' },
   // `approve: false` (a refusal) skips the check.
   "POST /api/auth/device/approve": { file: "routes/deviceAuth.ts", handler: 'deviceAuthRouter.post("/approve"' },
+  // The Add Computer window approving the device authorization its pairing linked
+  // (design #110 §11 B): the same approver check as /device/approve; a denial skips it.
+  "POST /api/computer-pairings/approve": { file: "routes/computerPairings.ts", handler: 'computerPairingRouter.post("/approve"' },
   // Login with Raft consent: issues an app a code for this person. One handler for both mounts;
   // the OIDC mount's guard answers 404 before it (oidcScopedMountGuard), still gated if served.
   "POST /api/oauth/authorize/human": { file: "routes/oauth.ts", handler: 'oauthRouter.post("/authorize/human"' },
@@ -92,6 +100,9 @@ const APPROVAL_GATED_ROUTES: Record<string, { file: string; handler: string }> =
   "PUT /api/integrations/marketplace/:clientId/install/app-notifications/grant": { file: "routes/integrations.ts", handler: 'integrationRouter.put("/marketplace/:clientId/install/app-notifications/grant"' },
   // `action: "grant"` only; removing the bot skips the check.
   "POST /api/integrations/clients/:clientId/install/bot": { file: "routes/integrations.ts", handler: 'integrationRouter.post("/clients/:clientId/install/bot"' },
+  // `vouched: true` only (every agent of the Server may then use the App); ending the vouch skips the check.
+  "PUT /api/integrations/clients/:clientId/server-vouch": { file: "routes/integrations.ts", handler: 'integrationRouter.put("/clients/:clientId/server-vouch"' },
+  "PUT /api/mcp/apps/:appId/server-vouch": { file: "routes/managedMcp.ts", handler: 'managedMcpRouter.put("/apps/:appId/server-vouch"' },
 };
 
 /**
@@ -124,6 +135,8 @@ const SENSITIVE_ROUTE_PATTERNS: Array<{ kind: string; pattern: RegExp }> = [
   // A future change-email, and what sends or redeems an account email today.
   { kind: "email", pattern: /^\w+ \/api\/(?:auth|me)\/.*(?:e-?mail|verification|recovery)/i },
   { kind: "approval", pattern: /^\w+ \/(?:api|internal|oidc)\/.*(?:approve|deny|reject|consent|authorize)/i },
+  // A Server vouching for an App: every agent there may then use it with no one's approval.
+  { kind: "approval", pattern: /^PUT \/api\/.*\/server-vouch$/ },
   // Creating an app (an integration client): it comes with a client secret, though no path word says so.
   { kind: "app registration", pattern: /^POST \/(?:api|internal|oidc)\/(?:.*\/)?(?:clients|apps?)(?:\/register)?$/ },
   // Installing an app (or anything under an install), and what an action card does.
@@ -134,10 +147,13 @@ const SENSITIVE_ROUTE_PATTERNS: Array<{ kind: string; pattern: RegExp }> = [
   { kind: "token or secret", pattern: /^POST \/api\/agent\/login$/ },
   // Signing out the person's own other sign-ins (routes/mySessions.ts).
   { kind: "sign-ins", pattern: /^(?:POST|DELETE|PATCH|PUT) \/api\/me\/sessions(?:\/|$)/ },
+  // Starting a data export: copies data out of Raft (routes/dataExports.ts).
+  { kind: "data export", pattern: /^POST \/api\/(?:me|servers\/:id)\/data-exports$/ },
 ];
 
 /** Matching routes that need no step-up, and why. */
 const EXEMPTIONS: Record<string, string> = {
+  "POST /api/servers/:id/machines/:machineId/runtimes/:runtime/install": "runs a runtime's official installer on the Computer (OAR's, never a command from the web), for the same people and with no step-up, as that runtime's Upgrade (`.../upgrade`); installs no app and grants no access or credential (#oar-raft:#24)",
   "POST /api/agents/:id/voice/calls/:callId/token": "renews a short-lived media room token for the caller's own running call (start rule re-read); not an account credential or a sensitive action (Tenny, #14860)",
   "POST /api/auth/:provider/callback": "provider redirect; a link is bound to its gated /:provider/link/start (signed state)",
   "POST /api/auth/:provider/complete": "link mode is bound to a gated start; login mode is a sign-in (its pending link waits for the second step)",
@@ -155,12 +171,12 @@ const EXEMPTIONS: Record<string, string> = {
   "POST /internal/computer/runners/:agentId/credentials/renew": "a Computer with its own key renews a runner key it minted (machine's own key)",
   "DELETE /internal/computer/runners/:agentId/credentials/:credentialId": "a Computer with its own key revokes; mints nothing",
   "POST /internal/agent-api/credentials/self/revoke": "an agent key revokes itself (its own key, no person's session); mints nothing",
-  "POST /api/provider-connections/:connectionId/credentials/rotate": "a model provider's API key the person supplies; not a Raft credential",
   "POST /api/servers/:id/machines/:machineId/revoke-computer-key": "revokes a Computer key; mints nothing",
   // Email.
   "POST /api/auth/verify-email": "unauthenticated; redeems the emailed verification token for the address already on the account",
   "POST /api/auth/resend-verification": "re-sends the verification email to the address already on the account; changes nothing",
   "POST /api/me/account/deletion/email-code": "emails a deletion code to the account's own address; deletion itself checks the code (accountDeletion.ts)",
+  "POST /api/me/data-exports/email-code": "emails a data export code to the account's own address; starting the export checks the code (dataExports.ts), a code of no other flow",
   "POST /api/auth/second-factor/recovery": "unauthenticated; only emails a recovery link to the account's address, the same answer for every address",
   "POST /api/auth/second-factor/recovery/confirm": "unauthenticated by the emailed token; starts the 72-hour delayed, notified reset (recovery.ts), the designed path for a lost second step",
   "POST /api/auth/second-factor/recovery/cancel": "cancels a pending reset by the emailed token; weakens nothing",
@@ -228,7 +244,13 @@ test("the gate calls in the source are exactly GATED_ROUTES, by file and action"
     if (actions.length > 0) found[file] = actions.sort();
   }
   const expected: Record<string, string[]> = {};
-  for (const { file, action } of Object.values(GATED_ROUTES)) (expected[file] ??= []).push(action);
+  for (const { file, action, sameCallAs } of Object.values(GATED_ROUTES)) {
+    if (sameCallAs) {
+      assert.equal(GATED_ROUTES[sameCallAs]?.file, file, `${sameCallAs} is listed, in ${file}`);
+      continue;
+    }
+    (expected[file] ??= []).push(action);
+  }
   for (const actions of Object.values(expected)) actions.sort();
   assert.deepEqual(found, expected);
 });

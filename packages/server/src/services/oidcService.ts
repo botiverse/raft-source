@@ -1,4 +1,5 @@
 import {
+  checkPrimeSync,
   createCipheriv,
   createDecipheriv,
   createECDH,
@@ -11,7 +12,7 @@ import {
   timingSafeEqual,
   type KeyObject,
 } from "node:crypto";
-import { currentDate, type ServerRole } from "@botiverse/raft-shared";
+import { AGENT_TOKEN_SIGNING_ALGS, AGENT_TOKEN_TYPES, currentDate, type AgentTokenSigningAlg, type AgentTokenType, type ServerRole } from "@botiverse/raft-shared";
 
 const AUTHORIZATION_CODE_PREFIX = "raft_oidc_";
 const AUTHORIZATION_CODE_VERSION = 1;
@@ -43,15 +44,21 @@ export type OidcIdentity = {
   picture?: string | null;
   email?: string | null;
   emailVerified?: boolean | null;
+  /**
+   * An Agent's login only: the `sub` its owner gets when they log in (their
+   * Raft user id, as every human `sub` today). Signed as `owner_sub`, after
+   * the server claims; absent when the Agent has no owner (findAgentOwner).
+   */
+  ownerSub?: string | null;
 };
 
 /**
  * An account-mode login's identity (RFC 079 phase 3a): a person's, on no
  * Server, so without the server claims (design §1 row 7).
  */
-export type OidcAccountIdentity = Omit<OidcIdentity, "type" | "serverId" | "serverSlug" | "serverRole"> & { type: "human" };
+export type OidcAccountIdentity = Omit<OidcIdentity, "type" | "serverId" | "serverSlug" | "serverRole" | "ownerSub"> & { type: "human" };
 
-type OidcJwk = {
+type OidcEcJwk = {
   kty: "EC";
   crv: "P-256";
   x: string;
@@ -62,13 +69,36 @@ type OidcJwk = {
   alg: "ES256";
 };
 
+/** A published RSA key: public members only (`n`, `e`), never d/p/q/dp/dq/qi. */
+type OidcRsaJwk = {
+  kty: "RSA";
+  n: string;
+  e: string;
+  kid: string;
+  use: "sig";
+  alg: "RS256";
+};
+
+type OidcJwk = OidcEcJwk | OidcRsaJwk;
+
 type DerivedSigningKey = {
   privateKey: KeyObject;
-  publicJwk: OidcJwk;
+  publicJwk: OidcEcJwk;
+};
+
+type RsaSigningKey = {
+  privateKey: KeyObject;
+  publicJwk: OidcRsaJwk;
 };
 
 let cachedSigningSecret: string | null = null;
 let cachedSigningKey: DerivedSigningKey | null = null;
+let cachedRsaSigningSecret: string | null = null;
+let cachedRsaSigningKey: RsaSigningKey | null = null;
+
+const RSA_PUBLIC_EXPONENT = 65537n;
+const RSA_MIN_MODULUS_BITS = 2048;
+const RSA_MAX_MODULUS_BITS = 4096;
 
 function requiredRootSecret(): string {
   const secret = process.env.JWT_SECRET?.trim();
@@ -112,7 +142,7 @@ function deriveSigningKey(): DerivedSigningKey {
   const x = publicBytes.subarray(1, 33);
   const y = publicBytes.subarray(33, 65);
   const kid = toBase64Url(createHash("sha256").update(publicBytes).digest().subarray(0, 16));
-  const privateJwk: OidcJwk = {
+  const privateJwk: OidcEcJwk = {
     kty: "EC",
     crv: "P-256",
     x: toBase64Url(x),
@@ -123,7 +153,7 @@ function deriveSigningKey(): DerivedSigningKey {
     kid,
   };
   const privateKey = createPrivateKey({ key: privateJwk, format: "jwk" });
-  const publicJwk: OidcJwk = {
+  const publicJwk: OidcEcJwk = {
     kty: "EC",
     crv: "P-256",
     x: privateJwk.x,
@@ -154,12 +184,170 @@ function configuredSigningKey(): DerivedSigningKey {
   }
 }
 
+/**
+ * A deterministic RSA prime of exactly 1024 bits for the dev/test RS256 key:
+ * the first prime at or above an HKDF-derived start (top two bits set, so
+ * p*q is exactly 2048 bits) with gcd(e, p-1) = 1. OpenSSL's Miller-Rabin
+ * (checkPrimeSync) never rejects a prime, so the result depends only on
+ * JWT_SECRET, like the ES256 fallback.
+ */
+function deriveRsaPrime(label: string): bigint {
+  const seed = deriveKey(label, 128);
+  let candidate = BigInt(`0x${seed.toString("hex")}`) | (3n << 1022n) | 1n;
+  const limit = 1n << 1024n;
+  while (candidate < limit) {
+    if ((candidate - 1n) % RSA_PUBLIC_EXPONENT !== 0n && checkPrimeSync(candidate)) return candidate;
+    candidate += 2n;
+  }
+  throw new Error("Could not derive the development RS256 signing key");
+}
+
+function modInverse(value: bigint, modulus: bigint): bigint {
+  let [oldR, r] = [((value % modulus) + modulus) % modulus, modulus];
+  let [oldS, s] = [1n, 0n];
+  while (r !== 0n) {
+    const quotient = oldR / r;
+    [oldR, r] = [r, oldR - quotient * r];
+    [oldS, s] = [s, oldS - quotient * s];
+  }
+  if (oldR !== 1n) throw new Error("not invertible");
+  return ((oldS % modulus) + modulus) % modulus;
+}
+
+function bigIntToBase64Url(value: bigint): string {
+  const hex = value.toString(16);
+  return toBase64Url(Buffer.from(hex.length % 2 ? `0${hex}` : hex, "hex"));
+}
+
+/**
+ * The kid of an RSA key: as for ES256, the first 16 bytes of a SHA-256 over
+ * the public key, here its DER SubjectPublicKeyInfo, base64url.
+ */
+function rsaKid(publicKey: KeyObject): string {
+  const der = publicKey.export({ type: "spki", format: "der" });
+  return toBase64Url(createHash("sha256").update(der).digest().subarray(0, 16));
+}
+
+/**
+ * The public JWK of an RSA signing key, or a throw unless it is a plain RSA
+ * (not RSA-PSS) key of 2048 to 4096 bits with e = 65537. Only `n` and `e`
+ * are taken from the key, so no private member can reach the JWKS.
+ */
+function rsaPublicJwk(key: KeyObject): OidcRsaJwk {
+  const publicKey = key.type === "private" ? createPublicKey(key) : key;
+  const details = publicKey.asymmetricKeyDetails;
+  if (publicKey.asymmetricKeyType !== "rsa" || !details?.modulusLength
+    || details.modulusLength < RSA_MIN_MODULUS_BITS || details.modulusLength > RSA_MAX_MODULUS_BITS
+    || details.publicExponent !== RSA_PUBLIC_EXPONENT) throw new Error();
+  const exported = publicKey.export({ format: "jwk" });
+  if (exported.kty !== "RSA" || !exported.n || !exported.e) throw new Error();
+  return { kty: "RSA", n: exported.n, e: exported.e, alg: "RS256", use: "sig", kid: rsaKid(publicKey) };
+}
+
+/**
+ * The dev/test RS256 key, derived from JWT_SECRET like the ES256 fallback, so
+ * every process (and every restart) of one environment publishes the same key
+ * and kid. RSA has no standard seed-to-key derivation, so the primes are
+ * found deterministically from HKDF output (deriveRsaPrime). Computed once
+ * per JWT_SECRET per process, about 0.1 s. Never used in production.
+ */
+function deriveRsaSigningKey(): RsaSigningKey {
+  const secret = requiredRootSecret();
+  if (cachedRsaSigningKey && cachedRsaSigningSecret === secret) return cachedRsaSigningKey;
+  const p = deriveRsaPrime("agent-token-rs256-private-p");
+  const q = deriveRsaPrime("agent-token-rs256-private-q");
+  if (p === q) throw new Error("Could not derive the development RS256 signing key");
+  const d = modInverse(RSA_PUBLIC_EXPONENT, (p - 1n) * (q - 1n));
+  const privateKey = createPrivateKey({
+    format: "jwk",
+    key: {
+      kty: "RSA",
+      n: bigIntToBase64Url(p * q),
+      e: bigIntToBase64Url(RSA_PUBLIC_EXPONENT),
+      d: bigIntToBase64Url(d),
+      p: bigIntToBase64Url(p),
+      q: bigIntToBase64Url(q),
+      dp: bigIntToBase64Url(d % (p - 1n)),
+      dq: bigIntToBase64Url(d % (q - 1n)),
+      qi: bigIntToBase64Url(modInverse(q, p)),
+    },
+  });
+  const signingKey = { privateKey, publicJwk: rsaPublicJwk(privateKey) };
+  cachedRsaSigningSecret = secret;
+  cachedRsaSigningKey = signingKey;
+  return signingKey;
+}
+
+/**
+ * Where a key derived from JWT_SECRET may stand in for a configured RS256
+ * key: development and tests. Vitest counts as a test even where the machine
+ * presets NODE_ENV=production (agent VMs; lib/refusal.ts does the same).
+ */
+function derivedRsaKeyAllowed(): boolean {
+  return Boolean(process.env.VITEST) || process.env.NODE_ENV !== "production";
+}
+
+/**
+ * The RS256 key for agent tokens of Apps set to RS256, or null when none is
+ * configured in production. `RAFT_OIDC_RS256_SIGNING_PRIVATE_KEY` is a PEM
+ * RSA private key (2048-4096 bits, e = 65537); without it development and
+ * tests use a key derived from JWT_SECRET, and production has no RS256 key:
+ * the JWKS publishes only ES256 and signing an RS256 token fails closed.
+ */
+function configuredRsaSigningKey(): RsaSigningKey | null {
+  const pem = process.env.RAFT_OIDC_RS256_SIGNING_PRIVATE_KEY?.trim();
+  if (!pem) return derivedRsaKeyAllowed() ? deriveRsaSigningKey() : null;
+  try {
+    const privateKey = createPrivateKey(pem);
+    return { privateKey, publicJwk: rsaPublicJwk(privateKey) };
+  } catch {
+    throw new Error("Invalid OIDC RS256 signing key configuration");
+  }
+}
+
+/** An App is set to RS256 but this deployment has no RS256 signing key. */
+export class OidcRs256SigningKeyUnavailableError extends Error {
+  constructor() {
+    super("RS256 agent token signing is not configured: set RAFT_OIDC_RS256_SIGNING_PRIVATE_KEY (PEM RSA private key) to sign agent tokens for Apps set to RS256");
+    this.name = "OidcRs256SigningKeyUnavailableError";
+  }
+}
+
+const ADDITIONAL_EC_KEY_MEMBERS = ["kty", "crv", "x", "y", "kid", "alg", "use"];
+const ADDITIONAL_RSA_KEY_MEMBERS = ["kty", "n", "e", "kid", "alg", "use"];
+
+function additionalPublicKey(item: Record<string, unknown>): OidcJwk {
+  if (item.kty === "RSA") {
+    if (Object.keys(item).some((key) => !ADDITIONAL_RSA_KEY_MEMBERS.includes(key))) throw new Error();
+    if (item.alg !== "RS256" || item.use !== "sig" || typeof item.n !== "string" || typeof item.e !== "string"
+      || typeof item.kid !== "string" || !/^[A-Za-z0-9_-]+$/.test(item.n) || !/^[A-Za-z0-9_-]+$/.test(item.e)) throw new Error();
+    const key = rsaPublicJwk(createPublicKey({ key: { kty: "RSA", n: item.n, e: item.e }, format: "jwk" }));
+    // The members must be the key's canonical encoding (no leading zeros), and the kid the one derived from it.
+    if (key.n !== item.n || key.e !== item.e || key.kid !== item.kid) throw new Error();
+    return key;
+  }
+  if (Object.keys(item).some((key) => !ADDITIONAL_EC_KEY_MEMBERS.includes(key))) throw new Error();
+  if (item.kty !== "EC" || item.crv !== "P-256" || item.alg !== "ES256" || item.use !== "sig"
+    || typeof item.x !== "string" || typeof item.y !== "string" || typeof item.kid !== "string"
+    || !/^[A-Za-z0-9_-]{43}$/.test(item.x) || !/^[A-Za-z0-9_-]{43}$/.test(item.y)) throw new Error();
+  const publicBytes = Buffer.concat([Buffer.from([4]), Buffer.from(item.x, "base64url"), Buffer.from(item.y, "base64url")]);
+  const kid = toBase64Url(createHash("sha256").update(publicBytes).digest().subarray(0, 16));
+  if (kid !== item.kid) throw new Error();
+  const key: OidcEcJwk = { kty: "EC", crv: "P-256", x: item.x, y: item.y, kid, alg: "ES256", use: "sig" };
+  createPublicKey({ key, format: "jwk" });
+  return key;
+}
+
 // Publish prospective and retiring public keys independently of the active
 // signer. Operators pre-publish before switching and retain until all tokens
 // (including one-hour ID tokens) expire. Never change JWT_SECRET to rotate here.
+// The JWKS holds the active ES256 key, then the active RS256 key (when this
+// deployment has one), then the additional keys: EC P-256/ES256 or RSA/RS256,
+// public members only, each kid recomputed from its key.
 export function getOidcJwks() {
-  const active = configuredSigningKey().publicJwk;
-  const keys: OidcJwk[] = [active];
+  const keys: OidcJwk[] = [configuredSigningKey().publicJwk];
+  const rsa = configuredRsaSigningKey();
+  if (rsa) keys.push(rsa.publicJwk);
   const raw = process.env.RAFT_OIDC_ADDITIONAL_PUBLIC_KEYS?.trim();
   if (!raw) return { keys };
   try {
@@ -167,17 +355,8 @@ export function getOidcJwks() {
     if (!Array.isArray(extra) || extra.length > 10) throw new Error();
     for (const value of extra) {
       if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
-      const item = value as Record<string, unknown>;
-      if (Object.keys(item).some((key) => !["kty", "crv", "x", "y", "kid", "alg", "use"].includes(key))) throw new Error();
-      if (item.kty !== "EC" || item.crv !== "P-256" || item.alg !== "ES256" || item.use !== "sig"
-        || typeof item.x !== "string" || typeof item.y !== "string" || typeof item.kid !== "string"
-        || !/^[A-Za-z0-9_-]{43}$/.test(item.x) || !/^[A-Za-z0-9_-]{43}$/.test(item.y)) throw new Error();
-      const publicBytes = Buffer.concat([Buffer.from([4]), Buffer.from(item.x, "base64url"), Buffer.from(item.y, "base64url")]);
-      const kid = toBase64Url(createHash("sha256").update(publicBytes).digest().subarray(0, 16));
-      if (kid !== item.kid) throw new Error();
-      const key: OidcJwk = { kty: "EC", crv: "P-256", x: item.x, y: item.y, kid, alg: "ES256", use: "sig" };
-      createPublicKey({ key, format: "jwk" });
-      if (!keys.some((existing) => existing.kid === kid)) keys.push(key);
+      const key = additionalPublicKey(value as Record<string, unknown>);
+      if (!keys.some((existing) => existing.kid === key.kid)) keys.push(key);
     }
     return { keys };
   } catch {
@@ -327,16 +506,35 @@ export function signCardActionAssertion(input: CardActionAssertionInput): string
   return `${signingInput}.${toBase64Url(signature)}`;
 }
 
+/**
+ * An agent token (agent audience JWT). `alg` is the App's stored setting
+ * (oauth_clients.agent_token_signing_alg), never a request's: ES256 with the
+ * same key as ID tokens, or RS256 with the RS256 key, which fails closed
+ * (OidcRs256SigningKeyUnavailableError) where none is configured. `typ` is
+ * the App's stored oauth_clients.agent_token_type, also never a request's:
+ * at+jwt, or JWT on a token-only App (no redirect URL); header and claims are
+ * otherwise the same.
+ */
 export function signAgentAccessJwt(input: {
   issuer: string; agentId: string; clientId: string; serverId: string;
   serverSlug: string; serverRole: string; agentName: string; displayName: string;
-  jti: string; now: Date;
+  jti: string; now: Date; alg: AgentTokenSigningAlg; typ: AgentTokenType;
 }): string {
+  if (!AGENT_TOKEN_SIGNING_ALGS.includes(input.alg)) throw new Error("Unsupported agent token signing algorithm");
+  if (!AGENT_TOKEN_TYPES.includes(input.typ)) throw new Error("Unsupported agent token type");
   const now = Math.floor(input.now.getTime() / 1000);
-  const { privateKey, publicJwk } = configuredSigningKey();
+  let signingKey: DerivedSigningKey | RsaSigningKey;
+  if (input.alg === "RS256") {
+    const rsa = configuredRsaSigningKey();
+    if (!rsa) throw new OidcRs256SigningKeyUnavailableError();
+    signingKey = rsa;
+  } else {
+    signingKey = configuredSigningKey();
+  }
+  const { privateKey, publicJwk } = signingKey;
   // Validate the publication configuration before issuing credentials.
   getOidcJwks();
-  const header = toBase64Url(JSON.stringify({ alg: "ES256", kid: publicJwk.kid, typ: "at+jwt" }));
+  const header = toBase64Url(JSON.stringify({ alg: input.alg, kid: publicJwk.kid, typ: input.typ }));
   const payload = toBase64Url(JSON.stringify({
     iss: input.issuer, aud: input.clientId, sub: input.agentId,
     iat: now, nbf: now, exp: now + 300, jti: input.jti,
@@ -346,7 +544,10 @@ export function signAgentAccessJwt(input: {
     login: `raft-agent-${input.agentId}`,
   }));
   const signingInput = `${header}.${payload}`;
-  const signature = sign("sha256", Buffer.from(signingInput, "ascii"), { key: privateKey, dsaEncoding: "ieee-p1363" });
+  // RS256 is RSASSA-PKCS1-v1_5 with SHA-256, node's default padding for an RSA key.
+  const signature = input.alg === "RS256"
+    ? sign("sha256", Buffer.from(signingInput, "ascii"), privateKey)
+    : sign("sha256", Buffer.from(signingInput, "ascii"), { key: privateKey, dsaEncoding: "ieee-p1363" });
   return `${signingInput}.${toBase64Url(signature)}`;
 }
 
@@ -478,6 +679,10 @@ export function signOidcIdToken(input: OidcIdTokenInput<OidcIdentity>): string {
     server_id: input.identity.serverId,
     server_slug: input.identity.serverSlug,
     server_role: input.identity.serverRole,
+    // #proj-apps:#75: who the Agent belongs to, from Raft and not from the
+    // Agent, so a relying party (AirWing) can apply the owner's own rights.
+    // Only on an Agent's token, and only while it has an owner.
+    ...(input.identity.type === "agent" && input.identity.ownerSub ? { owner_sub: input.identity.ownerSub } : {}),
   });
 }
 
@@ -563,7 +768,12 @@ export function oidcDiscoveryDocument(serverSegment?: string) {
     response_types_supported: ["code"],
     response_modes_supported: ["query"],
     subject_types_supported: ["public"],
-    id_token_signing_alg_values_supported: ["ES256"],
+    // ID tokens are ES256. RS256 is listed for agent tokens of Apps set to
+    // RS256 (same issuer and JWKS) only when this deployment has an RS256 key,
+    // as the JWKS does: some relying parties (Alibaba Cloud's OIDC provider)
+    // refuse an issuer whose discovery lists no RSA algorithm, and none should
+    // be told of an algorithm it cannot get a token in.
+    id_token_signing_alg_values_supported: configuredRsaSigningKey() ? ["ES256", "RS256"] : ["ES256"],
     token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post"],
     code_challenge_methods_supported: ["S256"],
     claims_supported: [
@@ -577,6 +787,7 @@ export function oidcDiscoveryDocument(serverSegment?: string) {
       "server_id",
       "server_slug",
       "server_role",
+      "owner_sub",
     ],
   };
 }

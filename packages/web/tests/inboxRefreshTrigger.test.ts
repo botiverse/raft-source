@@ -26,11 +26,14 @@ const { useServerStore } = await import("../src/store/serverStore");
 const { notifyChannelReadPersistedLocally } = await import("../src/store/readStateSync");
 const { getCurrentPrincipalId } = await import("../src/store/principalRuntime");
 const { default: api } = await import("../src/api/client");
+const { foldInboxRefreshTrigger, listFetchReasonHeaders } = await import("../src/store/listFetchReason");
 
 const originalGet = api.get.bind(api);
 
 type Seen = { reason: unknown; trigger: unknown; coalesced: unknown };
 let seen: Seen[] = [];
+/** X-Raft-Fetch-Refused of each read, in order (#244). */
+let refusedSeen: unknown[] = [];
 let hold: Promise<void> | null = null;
 
 function serve() {
@@ -41,6 +44,7 @@ function serve() {
       trigger: config?.headers?.["X-Raft-Fetch-Trigger"],
       coalesced: config?.headers?.["X-Raft-Fetch-Coalesced"],
     });
+    refusedSeen.push(config?.headers?.["X-Raft-Fetch-Refused"]);
     if (hold) await hold;
     return {
       headers: {},
@@ -67,6 +71,7 @@ function reset() {
     activeUnreadCount: 0,
   });
   seen = [];
+  refusedSeen = [];
   hold = null;
 }
 
@@ -210,4 +215,38 @@ test("a persisted read while Activity is loaded asks with read_persisted", async
     await vi.advanceTimersByTimeAsync(0);
     assert.deepEqual(seen, [{ reason: "realtime_fallback", trigger: "read_persisted", coalesced: "1" }]);
   } finally { restore(); }
+});
+
+test("#244: a throttled read carries the refusal of its FIRST request, never a later one's", async () => {
+  reset();
+  serve();
+  vi.useFakeTimers();
+  try {
+    requestInboxBackgroundRefresh("thread_reply", "not_listed");
+    await vi.advanceTimersByTimeAsync(0);
+    requestInboxBackgroundRefresh("message_new", "not_settled");
+    requestInboxBackgroundRefresh("thread_reply", "flag_off");
+    await vi.advanceTimersByTimeAsync(INBOX_BACKGROUND_REFRESH_INTERVAL_MS);
+    // A window whose first request had no refusal sends none, even if a later one did.
+    await vi.advanceTimersByTimeAsync(INBOX_BACKGROUND_REFRESH_INTERVAL_MS);
+    requestInboxBackgroundRefresh("activity_changed");
+    await vi.advanceTimersByTimeAsync(0);
+    requestInboxBackgroundRefresh("thread_reply", "repeat");
+    await vi.advanceTimersByTimeAsync(INBOX_BACKGROUND_REFRESH_INTERVAL_MS);
+    assert.deepEqual(seen.map((read) => read.trigger), ["thread_reply", "message_new", "activity_changed", "thread_reply"]);
+    assert.deepEqual(refusedSeen, ["not_listed", "not_settled", undefined, "repeat"]);
+  } finally { restore(); }
+});
+
+test("#244: the refusal is sent only with a realtime_fallback message_new or thread_reply", () => {
+  assert.equal(listFetchReasonHeaders("realtime_fallback", { trigger: "message_new", coalesced: 1, refused: "no_seq" })?.["X-Raft-Fetch-Refused"], "no_seq");
+  assert.equal(listFetchReasonHeaders("realtime_fallback", { trigger: "thread_reply", coalesced: 2, refused: "flag_off" })?.["X-Raft-Fetch-Refused"], "flag_off");
+  assert.equal(listFetchReasonHeaders("realtime_fallback", { trigger: "counted_cap", coalesced: 1, refused: "counted_cap" })?.["X-Raft-Fetch-Refused"], undefined);
+  assert.equal(listFetchReasonHeaders("sync_reset", { trigger: "thread_reply", coalesced: 1, refused: "not_listed" })?.["X-Raft-Fetch-Refused"], undefined);
+  assert.equal(listFetchReasonHeaders("realtime_fallback", { trigger: "thread_reply", coalesced: 1 })?.["X-Raft-Fetch-Refused"], undefined);
+  assert.deepEqual(
+    foldInboxRefreshTrigger({ trigger: "dm_new", coalesced: 1 }, { trigger: "thread_reply", coalesced: 1, refused: "not_listed" }),
+    { trigger: "dm_new", coalesced: 2 },
+    "the refusal belongs to the first request",
+  );
 });

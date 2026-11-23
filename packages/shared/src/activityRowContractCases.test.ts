@@ -1,6 +1,7 @@
 // The Activity row contract cases (contract-cases/activity-row/, README there):
 // every case file is valid against case.schema.json, and every agreed case
-// holds for the shared rule (reduceActivityRow, activityLiveUnread). Web runs
+// holds for the shared rule (reduceActivityRow, activityLiveUnread,
+// applySyncInboxRowChange for sync_inbox_row deletes). Web runs
 // the same cases (packages/web/tests/contractCases.activityRow.test.ts), the
 // app its vendored copy, and the server the predicate cases against the
 // RisingWave SQL (packages/server/src/services/activityUnreadPredicate.contractCases.test.ts).
@@ -62,6 +63,10 @@ test("the schema rejects what it should", () => {
   assert.equal(validate({ ...position, steps: [{ act: "read", seq: "0101" }] }), false, "a non-canonical seq");
   assert.equal(validate({ ...position, expect: { row: { unreadCount: 1 } } }), false, "a position case without reread");
   assert.equal(validate({ ...position, expect: { reread: false, verdict: { counts: true, mention: false } } }), false, "a verdict on a position case");
+  assert.equal(validate({ ...position, steps: [{ act: "syncDelete", position: null, reason: "left" }] }), false, "a syncDelete on a position case");
+  assert.equal(validate({ ...position, expect: { removed: true, reread: false } }), false, "removed on a position case");
+  assert.equal(validate({ ...position, rule: "sync_inbox_row", steps: [{ act: "syncDelete", position: "1", reason: "gone" }] }), false, "an unknown delete reason");
+  assert.equal(validate({ ...position, rule: "sync_inbox_row", steps: [{ act: "syncDelete", position: null, reason: "left" }], expect: { removed: true, reread: false } }), true, "control: a sync_inbox_row delete case");
   assert.equal(validate({ ...predicate, steps: [{ act: "read", seq: 1 }] }), false, "steps on a predicate case");
   assert.equal(validate({ ...predicate, expect: { reread: true } }), false, "a predicate case without a verdict");
   assert.equal(validate({ ...predicate, status: "pending-product-decision" }), false, "pending without a decision (and with expect)");

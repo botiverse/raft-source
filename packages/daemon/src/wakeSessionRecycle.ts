@@ -1,12 +1,14 @@
 import { open, stat } from "node:fs/promises";
 import os from "node:os";
+import type { ContextUsageCapability } from "@botiverse/oar";
 import type { AgentConfig } from "@botiverse/raft-shared";
 import { resolveRuntimeSessionRef } from "./drivers/index";
 import { logger } from "./logger";
 import { compareRuntimeCliVersions } from "./runtimeCliVersionTracker";
 import type { AxSurfaceText } from "@botiverse/raft-shared";
-import { axSurface, composeAxSurfaces } from "./agentRuntimeInput";
-import { WAKE_SECTION_BREAK, buildStartupMemoryBlock, resolveStartupMemoryBlockConfig } from "./startupMemoryBlock";
+import { axSurface, composeAxSurfaces, formatInterruptedTurnNote, type InterruptedTurnContinuity } from "./agentRuntimeInput";
+import type { InterruptedTurnRecord } from "./interruptedTurnStore";
+import { WAKE_SECTION_BREAK, applyStartupMemoryBlock, buildStartupMemoryBlock, resolveStartupMemoryBlockConfig } from "./startupMemoryBlock";
 import { buildConstructedPanel, buildConstructedPanelFromSummary } from "./wakeBriefingPanel";
 import type { SessionSummary } from "./agentHost/oarSessionSummary";
 
@@ -72,31 +74,45 @@ const TRANSCRIPT_TAIL_BYTES = 512 * 1024;
 
 /** RFC 070 §6.3 enabled set (decided 2026-09-03): recycling considers these
  * runtimes; everything else resumes as unsupported. Within the set, actually
- * firing additionally requires readable resume facts — today only the claude
- * transcript reader exists, so other members resolve to a facts-unavailable
- * resume until the daemon journal (§6.2) supplies their facts. */
+ * firing additionally requires readable resume facts: Claude's transcript on
+ * the legacy host, the session summary on the OAR host when OAR declares the
+ * installation's context size (`summarySuppliesResumeFacts`). A member with neither (Built-in,
+ * Kimi; Pi and OpenCode on their legacy drivers) resolves to a facts-unavailable resume.
+ * Cursor, Qwen and Antigravity join with the context size OAR reports for
+ * them on the OAR host (#raft-feature-flag:#12); Cursor's and Antigravity's
+ * legacy drivers have no facts, so there they resume as
+ * `session_facts_unavailable` and are never stopped cold. */
 export const WAKE_RECYCLE_ENABLED_RUNTIMES = new Set([
-  "claude", "codex", "pi", "builtin", "grok", "kimi-sdk",
+  "claude", "codex", "pi", "builtin", "grok", "kimi-sdk", "opencode", "cursor", "qwen", "antigravity",
 ]);
 
 /**
- * Runtimes whose resume facts come from the OAR host's session summary
- * (#wg-ax task #3, #proj-runtime:#54): an agent on the OAR host whose runtime
- * is listed here can be recycled, and its fresh session gets the panel built
- * from that summary. Only while the Server's `wake_recycle_oar` flag is on for
- * the agent (`summaryFactsRuntimesFor`): the rollout decision is the flag's,
- * and with it off this set is never read. Codex and Grok run on the OAR host;
- * their summaries carry the context size Codex and Grok report (Codex: the
- * last call's tokens in the context window, the quantity the Claude reader
- * takes from its transcript).
+ * Whether the OAR host's session summary supplies the resume facts for a
+ * session (#wg-ax task #3, #proj-runtime:#54): such a session can be recycled,
+ * and its fresh session gets the panel built from that summary.
+ *
+ * The facts `sessionSummaryResumeFacts` takes from a summary: the context size
+ * (`context.tokens`, from the runtime's usage reports, the size
+ * `Session.contextUsage()` reports), the last activity (when the host received
+ * the session's last record, the same for every runtime), and the cache tier
+ * (optional: absent, no tier gate). Only the size depends on the runtime, so
+ * the answer is OAR's declaration for the installation the session ran on:
+ * `contextUsage.tokens` (`oarInstalledSessionCapabilities`), never a list of
+ * runtime ids. The window is not needed: the cold recycle reads none, and the
+ * warm mark skips `window_unknown` by itself (Cursor: tokens, no window, the
+ * cold gap only). Absent (unmeasured) is no facts: the start resumes.
+ *
+ * The rollout stays the Server's: only while `wake_recycle_oar` is on for the
+ * agent, and only for a runtime RFC 070 enables (WAKE_RECYCLE_ENABLED_RUNTIMES,
+ * shared with the legacy host), so a runtime whose start would never recycle
+ * is never stopped for one.
  */
-export const WAKE_RECYCLE_SUMMARY_FACTS_RUNTIMES: ReadonlySet<string> = new Set<string>(["codex", "grok"]);
-
-const NO_SUMMARY_FACTS_RUNTIMES: ReadonlySet<string> = new Set<string>();
-
-/** The runtimes whose session summary may supply resume facts for this agent: none unless the Server turned `wake_recycle_oar` on. */
-export function summaryFactsRuntimesFor(config: Pick<AgentConfig, "wakeRecycleOar">): ReadonlySet<string> {
-  return config.wakeRecycleOar === true ? WAKE_RECYCLE_SUMMARY_FACTS_RUNTIMES : NO_SUMMARY_FACTS_RUNTIMES;
+export function summarySuppliesResumeFacts(
+  config: Pick<AgentConfig, "wakeRecycleOar">,
+  runtime: string,
+  contextUsage: ContextUsageCapability | null | undefined,
+): boolean {
+  return config.wakeRecycleOar === true && WAKE_RECYCLE_ENABLED_RUNTIMES.has(runtime) && contextUsage?.tokens === true;
 }
 
 export interface WakeRecycleConfig {
@@ -185,7 +201,13 @@ export function sessionSummaryResumeFacts(summary: SessionSummary | null, sessio
   }
   const lastActivityAtMs = summary.lastActivityAt ? Date.parse(summary.lastActivityAt) : Number.NaN;
   if (!Number.isFinite(lastActivityAtMs)) return null;
-  return { transcriptPath: null, lastActivityAtMs, lastContextTokens: summary.context.tokens, summary };
+  return {
+    transcriptPath: null,
+    lastActivityAtMs,
+    lastContextTokens: summary.context.tokens,
+    ...(summary.cacheTier ? { cacheTier: summary.cacheTier } : {}),
+    summary,
+  };
 }
 
 export type WakeRecyclePlan =
@@ -221,6 +243,85 @@ export interface WarmRecycleStop {
   stoppedAtMs: number;
   contextTokens: number;
   band: "quiet" | "ceiling";
+}
+
+/** How long a failed wake-recycle suppresses re-recycling the same prior session (6 h). */
+export const DEFAULT_WAKE_RECYCLE_FAILURE_TTL_MS = 6 * 60 * 60_000;
+
+export type WakeRecycleYieldGate = "cold_idle" | "warm_recycle";
+
+/**
+ * Remembers prior sessions whose wake-recycle replacement failed before
+ * reaching startup readiness (#wg-ax:#3). While an unexpired record stands for
+ * `(agentId, priorSessionId)`, subsequent starts skip wake-recycle
+ * (`prior_recycle_start_failed`) and resume the prior session instead of
+ * looping on repeated recycle failures, and cold-idle / warm-recycle stops
+ * yield for that same session.
+ *
+ * Bounded by a TTL (`DEFAULT_WAKE_RECYCLE_FAILURE_TTL_MS`, 6 h) so transient
+ * host/provider outages recover automatically without a daemon restart; also
+ * cleared when a recycled start reaches readiness, when the agent resets or
+ * moves to a different session, when the agent is deleted, or on shutdown.
+ * Explicit Stop / Retry keeps the record so retrying does not re-enter the
+ * timeout loop. Shared between legacy and OAR hosts via DaemonCore.
+ */
+export class WakeRecycleFailureMemory {
+  /** agentId -> active failed-recycle record for one prior session. */
+  private readonly failedPriorSessions = new Map<
+    string,
+    { priorSessionId: string; recordedAtMs: number; yieldedGates: Set<WakeRecycleYieldGate> }
+  >();
+
+  constructor(
+    private readonly now: () => number = Date.now,
+    private readonly ttlMs: number = DEFAULT_WAKE_RECYCLE_FAILURE_TTL_MS,
+  ) {}
+
+  recordFailedRecycle(agentId: string, priorSessionId: string): void {
+    this.failedPriorSessions.set(agentId, {
+      priorSessionId,
+      recordedAtMs: this.now(),
+      yieldedGates: new Set(),
+    });
+  }
+
+  hasFailed(agentId: string, sessionId: string | null | undefined): boolean {
+    if (!sessionId) return false;
+    const entry = this.activeEntry(agentId);
+    return entry !== null && entry.priorSessionId === sessionId;
+  }
+
+  /**
+   * Returns true once per `(agentId, sessionId, gate)` while the failure
+   * record is active, so repeated cold-idle sweeps or warm-recycle turn ends
+   * emit one trace event per yield instead of flooding telemetry.
+   */
+  noteYield(agentId: string, sessionId: string | null | undefined, gate: WakeRecycleYieldGate): boolean {
+    if (!sessionId) return false;
+    const entry = this.activeEntry(agentId);
+    if (!entry || entry.priorSessionId !== sessionId) return false;
+    if (entry.yieldedGates.has(gate)) return false;
+    entry.yieldedGates.add(gate);
+    return true;
+  }
+
+  clear(agentId: string): void {
+    this.failedPriorSessions.delete(agentId);
+  }
+
+  clearAll(): void {
+    this.failedPriorSessions.clear();
+  }
+
+  private activeEntry(agentId: string) {
+    const entry = this.failedPriorSessions.get(agentId);
+    if (!entry) return null;
+    if (this.now() - entry.recordedAtMs >= this.ttlMs) {
+      this.failedPriorSessions.delete(agentId);
+      return null;
+    }
+    return entry;
+  }
 }
 
 function parseBooleanFlag(value: string | undefined): boolean | undefined {
@@ -373,6 +474,8 @@ export interface WakeRecycleDecisionInput {
   sessionId: string | null | undefined;
   hasResumePrompt: boolean;
   hasRuntimeProfileControl: boolean;
+  /** #wg-ax:#3: a prior wake-recycle start from this exact session failed before reaching readiness; resume it instead of recycling again. */
+  priorRecycleFailed?: boolean;
   facts: SessionResumeFacts;
   nowMs: number;
   /** The Server's `wake_recycle_warm` for this agent (`AgentConfig.wakeRecycleWarm`). */
@@ -422,6 +525,7 @@ export function decideWakeRecycle(input: WakeRecycleDecisionInput): WakeRecycleP
   if (!input.sessionId) return { action: "resume", reason: "no_prior_session" };
   if (input.hasResumePrompt) return { action: "resume", reason: "explicit_resume_prompt" };
   if (input.hasRuntimeProfileControl) return { action: "resume", reason: "runtime_profile_control" };
+  if (input.priorRecycleFailed) return { action: "resume", reason: "prior_recycle_start_failed" };
   if (facts.lastActivityAtMs === null || facts.lastContextTokens === null) {
     return { action: "resume", reason: "session_facts_unavailable" };
   }
@@ -609,6 +713,7 @@ export type ColdIdleSkipReason =
   | "unsupported_runtime"
   | "runtime_version_below_floor"
   | "no_session"
+  | "prior_recycle_start_failed"
   | "recent_event"
   /** decideColdIdle */
   | "session_facts_unavailable"
@@ -617,7 +722,7 @@ export type ColdIdleSkipReason =
 
 export type ColdIdleGate =
   | { pass: true; sessionId: string; config: WakeRecycleConfig; sinceEventMs: number }
-  | { pass: false; reason: Extract<ColdIdleSkipReason, "disabled" | "unsupported_runtime" | "runtime_version_below_floor" | "no_session" | "recent_event"> };
+  | { pass: false; reason: Extract<ColdIdleSkipReason, "disabled" | "unsupported_runtime" | "runtime_version_below_floor" | "no_session" | "prior_recycle_start_failed" | "recent_event"> };
 
 /**
  * The oldest runtime CLI a process may run to be stopped as cold, per
@@ -650,6 +755,8 @@ export function coldIdleGate(input: {
   lastEventAtMs: number;
   /** The runtime CLI version the process runs, when known (unknown is below any floor). */
   runtimeCliVersion: string | null | undefined;
+  /** #wg-ax:#3: a prior wake-recycle start from this session failed before readiness. */
+  priorRecycleFailed?: boolean;
   nowMs: number;
   processEnv?: NodeJS.ProcessEnv;
 }): ColdIdleGate {
@@ -660,6 +767,7 @@ export function coldIdleGate(input: {
   if (!runtimeVersionAllowsColdIdle(runtime, input.runtimeCliVersion)) return { pass: false, reason: "runtime_version_below_floor" };
   const sessionId = input.liveSessionId ?? input.config.sessionId;
   if (!sessionId) return { pass: false, reason: "no_session" };
+  if (input.priorRecycleFailed) return { pass: false, reason: "prior_recycle_start_failed" };
   const sinceEventMs = input.nowMs - input.lastEventAtMs;
   // The session's own gate needs its tier (read with the facts, decideColdIdle);
   // here only what no session of this agent can be cold before.
@@ -710,37 +818,42 @@ export interface PlanWakeSessionRecycleArgs {
   processEnv?: NodeJS.ProcessEnv;
   /** The OAR host's summary for this agent (its `SessionSummaryStore`); absent on the legacy host. */
   readSessionSummary?: () => SessionSummary | null;
-  /** Defaults to `summaryFactsRuntimesFor(config)` (the Server's `wake_recycle_oar`); tests pass their own. */
-  summaryFactsRuntimes?: ReadonlySet<string>;
   /** The warm-recycle stop the host remembers for this agent (`WarmRecycleMarks.takeStopped`); read only with `wake_recycle_warm` on. */
   warmStop?: WarmRecycleStop | null;
+  /** #wg-ax:#3: a prior wake-recycle start from this session failed before readiness; skip recycling and resume it. */
+  priorRecycleFailed?: boolean;
 }
 
 /** Async entry point for AgentProcessManager: resolve knobs, read transcript
  * facts, decide. Never throws — any failure is a plain resume. */
 export async function planWakeSessionRecycle(args: PlanWakeSessionRecycleArgs): Promise<WakeRecyclePlan> {
   const recycleConfig = resolveAgentWakeRecycleConfig(args.config, args.processEnv ?? process.env);
-  if (!recycleConfig.enabled || !args.config.sessionId || !WAKE_RECYCLE_ENABLED_RUNTIMES.has(args.config.runtime ?? "claude")) {
+  if (!recycleConfig.enabled || !args.config.sessionId || !WAKE_RECYCLE_ENABLED_RUNTIMES.has(args.config.runtime ?? "claude") || args.priorRecycleFailed) {
     return decideWakeRecycle({
       config: recycleConfig,
       runtime: args.config.runtime,
       sessionId: args.config.sessionId,
       hasResumePrompt: args.hasResumePrompt,
       hasRuntimeProfileControl: runtimeProfileControlBlocksRecycle(args.config.runtimeProfileControl),
+      priorRecycleFailed: args.priorRecycleFailed,
       facts: { transcriptPath: null, lastActivityAtMs: null, lastContextTokens: null },
       nowMs: args.nowMs ?? Date.now(),
     });
   }
   let facts = await readRuntimeSessionResumeFacts(args.config.runtime ?? "claude", args.config.sessionId, args.homeDir);
-  const summaryFactsRuntimes = args.summaryFactsRuntimes ?? summaryFactsRuntimesFor(args.config);
-  if (facts.lastActivityAtMs === null && args.readSessionSummary && summaryFactsRuntimes.has(args.config.runtime ?? "claude")) {
+  // The summary is read only while `wake_recycle_oar` is on; its facts count
+  // only when OAR declared the context size for the installation that wrote
+  // it (`summary.contextUsage`, summarySuppliesResumeFacts).
+  if (facts.lastActivityAtMs === null && args.readSessionSummary && args.config.wakeRecycleOar === true) {
     let summary: SessionSummary | null = null;
     try {
       summary = args.readSessionSummary();
     } catch (err) {
       logger.warn(`[WakeRecycle] session summary unreadable, resuming: ${err instanceof Error ? err.message : String(err)}`);
     }
-    facts = sessionSummaryResumeFacts(summary, args.config.sessionId) ?? facts;
+    if (summary && summarySuppliesResumeFacts(args.config, args.config.runtime ?? "claude", summary.contextUsage)) {
+      facts = sessionSummaryResumeFacts(summary, args.config.sessionId) ?? facts;
+    }
   }
   const plan = decideWakeRecycle({
     config: recycleConfig,
@@ -824,4 +937,180 @@ export async function planWakeSessionRecycle(args: PlanWakeSessionRecycleArgs): 
   }
   // Nothing added: the decision's own plan (no `briefingParts`: neither part).
   return memory ? { ...plan, briefing, briefingParts: { memory, panel: false } } : plan;
+}
+
+export interface BuildFreshConstructedInitArgs {
+  config: AgentConfig;
+  workspacePath: string;
+  homeDir?: string;
+  processEnv?: NodeJS.ProcessEnv;
+  /** Prior `(runtime, sessionId)` from `spec_drop` or `LastSessionStore`. */
+  priorSession?: { runtime: string; sessionId: string; updatedAtMs?: number } | null;
+  /** Latest OAR `SessionSummary` for this agent, if any. */
+  readSessionSummary?: () => SessionSummary | null;
+}
+
+export interface FreshConstructedInitResult {
+  /** Combined briefing (header + optional `<memory-index>` + constructed panel) when prior state yielded a panel. */
+  briefing: AxSurfaceText | null;
+  /** Standalone `<memory-index>` when no prior panel existed (brand-new agent or no prior state). */
+  memoryBlock: AxSurfaceText | null;
+  hasMemory: boolean;
+  hasPanel: boolean;
+  panelSource: "transcript" | "summary" | "none";
+}
+
+/**
+ * #proj-runtime:#80: unified constructed initial context for EVERY non-resume
+ * start (brand-new agent, model switch, runtime switch, migration, manual
+ * session reset).
+ *
+ * - Always builds `<memory-index>` from `MEMORY.md` when enabled.
+ * - When prior session state exists (OAR `SessionSummary` and/or a readable
+ *   prior transcript such as Claude JSONL), builds the warm constructed panel
+ *   (`<objects-in-play>`, `<recent-messages>`, `<recent-actions>`,
+ *   `<last-note>`, `<open-todos>`) using the fresher source.
+ * - When no prior session state exists (e.g. a brand-new agent or after a full
+ *   workspace reset), degrades cleanly to `<memory-index>` alone (or nothing if
+ *   `MEMORY.md` does not exist yet), keeping brand-new starts short.
+ */
+export async function buildFreshConstructedInit(args: BuildFreshConstructedInitArgs): Promise<FreshConstructedInitResult> {
+  const processEnv = args.processEnv ?? process.env;
+  const memoryConfig = resolveStartupMemoryBlockConfig(args.config.envVars, processEnv);
+  const memoryBlock = memoryConfig.enabled && args.workspacePath
+    ? await buildStartupMemoryBlock({ workspacePath: args.workspacePath, budgetTokens: memoryConfig.budgetTokens })
+    : null;
+  const hasMemory = Boolean(memoryBlock);
+
+  const panelTokensRaw = (args.config.envVars ?? undefined)?.RAFT_WAKE_RECYCLE_PANEL_TOKENS
+    ?? processEnv.RAFT_WAKE_RECYCLE_PANEL_TOKENS;
+  const panelBudget = panelTokensRaw?.trim() === "0" ? 0 : (parsePositiveInteger(panelTokensRaw) ?? 8_000);
+  if (panelBudget <= 0) {
+    return { briefing: null, memoryBlock, hasMemory, hasPanel: false, panelSource: "none" };
+  }
+  const recentMessagesRaw = (args.config.envVars ?? undefined)?.RAFT_WAKE_RECYCLE_RECENT_MESSAGES
+    ?? processEnv.RAFT_WAKE_RECYCLE_RECENT_MESSAGES;
+  const recentMessagesMax = recentMessagesRaw?.trim() === "0" ? 0 : parsePositiveInteger(recentMessagesRaw);
+
+  let summary: SessionSummary | null = null;
+  if (args.readSessionSummary) {
+    try {
+      summary = args.readSessionSummary();
+    } catch (err) {
+      logger.warn(`[ConstructedInit] session summary unreadable: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  let transcriptPath: string | null = null;
+  let transcriptTs = -1;
+  if (args.priorSession && runtimeSessionTranscriptReadable(args.priorSession.runtime)) {
+    try {
+      const facts = await readRuntimeSessionResumeFacts(args.priorSession.runtime, args.priorSession.sessionId, args.homeDir);
+      transcriptPath = facts.transcriptPath;
+      transcriptTs = facts.lastActivityAtMs ?? args.priorSession.updatedAtMs ?? 0;
+    } catch (err) {
+      logger.warn(`[ConstructedInit] prior transcript unreadable: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  const summaryParsedTs = summary?.lastActivityAt ? Date.parse(summary.lastActivityAt) : Number.NaN;
+  const summaryTs = Number.isFinite(summaryParsedTs) ? summaryParsedTs : (summary ? 0 : -1);
+
+  const tryTranscript = async (): Promise<AxSurfaceText | null> => {
+    if (!transcriptPath) return null;
+    try {
+      return await buildConstructedPanel({
+        transcriptPath,
+        workspacePath: args.workspacePath || undefined,
+        budgetTokens: panelBudget,
+        recentMessagesMax,
+        warm: true,
+        allowShortSession: true,
+      });
+    } catch (err) {
+      logger.warn(`[ConstructedInit] transcript panel failed: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+  };
+
+  const trySummary = async (): Promise<AxSurfaceText | null> => {
+    if (!summary) return null;
+    try {
+      return await buildConstructedPanelFromSummary({
+        summary,
+        workspacePath: args.workspacePath || undefined,
+        budgetTokens: panelBudget,
+        recentMessagesMax,
+        warm: true,
+      });
+    } catch (err) {
+      logger.warn(`[ConstructedInit] summary panel failed: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+  };
+
+  let panel: AxSurfaceText | null = null;
+  let panelSource: "transcript" | "summary" | "none" = "none";
+  if (transcriptPath && (!summary || transcriptTs >= summaryTs)) {
+    panel = await tryTranscript();
+    if (panel) panelSource = "transcript";
+    else {
+      panel = await trySummary();
+      if (panel) panelSource = "summary";
+    }
+  } else if (summary) {
+    panel = await trySummary();
+    if (panel) panelSource = "summary";
+    else {
+      panel = await tryTranscript();
+      if (panel) panelSource = "transcript";
+    }
+  }
+
+  if (!panel) {
+    return { briefing: null, memoryBlock, hasMemory, hasPanel: false, panelSource: "none" };
+  }
+
+  // Match v2 `buildRecycleBriefing`: no announcement chrome — XML-delimited
+  // `<memory-index>` and constructed panel blocks sit quietly above the
+  // ordinary startup prompt.
+  const briefing = memoryBlock ? composeWakeSections(memoryBlock, panel) : panel;
+  return { briefing, memoryBlock: null, hasMemory, hasPanel: true, panelSource };
+}
+
+function promptHasFollowingWork(promptSource: string): boolean {
+  return promptSource !== "cold_start" && promptSource !== "resume_empty";
+}
+
+export function applyInterruptedTurnNote(
+  interruptedTurn: InterruptedTurnRecord | null | undefined,
+  prompt: AxSurfaceText,
+  options: { continuity: InterruptedTurnContinuity; promptSource: string },
+): AxSurfaceText {
+  if (!interruptedTurn) return prompt;
+  return composeWakeSections(
+    formatInterruptedTurnNote(interruptedTurn.drift, options.continuity, promptHasFollowingWork(options.promptSource)),
+    prompt,
+  );
+}
+
+export function applyFreshConstructedInit(
+  init: FreshConstructedInitResult | null | undefined,
+  prompt: AxSurfaceText,
+  promptSource: string,
+  interruptedTurn?: InterruptedTurnRecord | null,
+): { prompt: AxSurfaceText; promptSource: string } {
+  const hasPriorContext = Boolean(init?.briefing);
+  const promptWithInterrupt = applyInterruptedTurnNote(interruptedTurn, prompt, {
+    continuity: hasPriorContext ? "fresh_with_context" : "fresh_no_context",
+    promptSource,
+  });
+  if (!init) return { prompt: promptWithInterrupt, promptSource };
+  if (init.briefing) {
+    return { prompt: composeWakeSections(init.briefing, promptWithInterrupt), promptSource: `constructed_${promptSource}` };
+  }
+  if (init.memoryBlock) {
+    return applyStartupMemoryBlock(init.memoryBlock, promptWithInterrupt, promptSource);
+  }
+  return { prompt: promptWithInterrupt, promptSource };
 }

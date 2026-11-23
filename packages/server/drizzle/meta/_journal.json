@@ -5055,6 +5055,307 @@
       "when": 1794790564523,
       "tag": "0721_messages_voice_call_id",
       "breakpoints": true
+    },
+    {
+      "idx": 722,
+      "version": "7",
+      "when": 1794808058071,
+      "tag": "0722_legacy_machine_keys_departed_registrant_revoke",
+      "breakpoints": true
+    },
+    {
+      "idx": 723,
+      "version": "7",
+      "when": 1794892537130,
+      "tag": "0723_channel_role_events_agent_requester",
+      "breakpoints": true
+    },
+    {
+      "idx": 724,
+      "version": "7",
+      "when": 1794901187794,
+      "tag": "0724_ffa_server_plan_change",
+      "breakpoints": true
+    },
+    {
+      "idx": 725,
+      "version": "7",
+      "when": 1794909981942,
+      "tag": "0725_external_invite_sent_to_host_member",
+      "breakpoints": true
+    },
+    {
+      "idx": 726,
+      "version": "7",
+      "when": 1794916049042,
+      "tag": "0726_remove_provider_connections",
+      "breakpoints": true
+    },
+    {
+      "idx": 727,
+      "version": "7",
+      "when": 1794936063748,
+      "tag": "0727_oauth_clients_agent_token_signing_alg",
+      "breakpoints": true
+    },
+    {
+      "idx": 728,
+      "version": "7",
+      "when": 1794947811722,
+      "tag": "0728_official_onboarding_agent",
+      "breakpoints": true
+    },
+    {
+      "idx": 729,
+      "version": "7",
+      "when": 1794976697019,
+      "tag": "0729_mcp_app_templates_publisher_name",
+      "breakpoints": true
+    },
+    {
+      "idx": 730,
+      "version": "7",
+      "when": 1794977586142,
+      "tag": "0730_managed_mcp_credentials_signed_in_by",
+      "breakpoints": true
+    },
+    {
+      "idx": 731,
+      "version": "7",
+      "when": 1794977777779,
+      "tag": "0731_oauth_clients_server_vouch",
+      "breakpoints": true
+    },
+    {
+      "idx": 732,
+      "version": "7",
+      "when": 1794978060752,
+      "tag": "0732_managed_mcp_servers_server_vouch",
+      "breakpoints": true
+    },
+    {
+      "idx": 733,
+      "version": "7",
+      "when": 1794980301129,
+      "tag": "0733_change_log_inbox_rows",
+      "breakpoints": true
+    },
+    {
+      "idx": 734,
+      "version": "7",
+      "when": 1795000081486,
+      "tag": "0734_data_exports",
+      "breakpoints": true
+    },
+    {
+      "idx": 735,
+      "version": "7",
+      "when": 1795019431614,
+      "tag": "0735_servers_member_context_export",
+      "breakpoints": true
+    },
+    {
+      "idx": 736,
+      "version": "7",
+      "when": 1795056874137,
+      "tag": "0736_device_authorizations_loopback",
+      "breakpoints": true
+    },
+    {
+      "idx": 737,
+      "version": "7",
+      "when": 1795065682346,
+      "tag": "0737_webauthn_credentials_rp_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 738,
+      "version": "7",
+      "when": 1795074662226,
+      "tag": "0738_channel_thread_sort_undeclared",
+      "breakpoints": true
+    },
+    {
+      "idx": 739,
+      "version": "7",
+      "when": 1795079840449,
+      "tag": "0739_oauth_link_preview_declines_account",
+      "breakpoints": true
+    },
+    {
+      "idx": 740,
+      "version": "7",
+      "when": 1795086278940,
+      "tag": "0740_read_mutations_principal_stats",
+      "breakpoints": true
+    },
+    {
+      "idx": 741,
+      "version": "7",
+      "when": 1795087033739,
+      "tag": "0741_channels_thread_server_name_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 742,
+      "version": "7",
+      "when": 1795087750615,
+      "tag": "0742_managed_mcp_personal_accounts",
+      "breakpoints": true
+    },
+    {
+      "idx": 743,
+      "version": "7",
+      "when": 1795092306032,
+      "tag": "0743_continuation_tool_flag",
+      "breakpoints": true
+    },
+    {
+      "idx": 744,
+      "version": "7",
+      "when": 1795095744709,
+      "tag": "0744_drop_provider_connection_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 745,
+      "version": "7",
+      "when": 1795101351385,
+      "tag": "0745_agent_event_delivery",
+      "breakpoints": true
+    },
+    {
+      "idx": 746,
+      "version": "7",
+      "when": 1795102976395,
+      "tag": "0746_announcement_audit_reason",
+      "breakpoints": true
+    },
+    {
+      "idx": 747,
+      "version": "7",
+      "when": 1795104383252,
+      "tag": "0747_quote_reply_flag",
+      "breakpoints": true
+    },
+    {
+      "idx": 748,
+      "version": "7",
+      "when": 1795108492190,
+      "tag": "0748_artifact_origin_via_link",
+      "breakpoints": true
+    },
+    {
+      "idx": 749,
+      "version": "7",
+      "when": 1795109356615,
+      "tag": "0749_artifact_settled",
+      "breakpoints": true
+    },
+    {
+      "idx": 750,
+      "version": "7",
+      "when": 1795110930400,
+      "tag": "0750_artifact_versions_references_extractor",
+      "breakpoints": true
+    },
+    {
+      "idx": 751,
+      "version": "7",
+      "when": 1795110935621,
+      "tag": "0751_object_references",
+      "breakpoints": true
+    },
+    {
+      "idx": 752,
+      "version": "7",
+      "when": 1795111865409,
+      "tag": "0752_agent_focus_targets",
+      "breakpoints": true
+    },
+    {
+      "idx": 753,
+      "version": "7",
+      "when": 1795111869863,
+      "tag": "0753_agent_focus_flag",
+      "breakpoints": true
+    },
+    {
+      "idx": 754,
+      "version": "7",
+      "when": 1795121722656,
+      "tag": "0754_dm_reply_placement_flag",
+      "breakpoints": true
+    },
+    {
+      "idx": 755,
+      "version": "7",
+      "when": 1795122663574,
+      "tag": "0755_app_web_step_up",
+      "breakpoints": true
+    },
+    {
+      "idx": 756,
+      "version": "7",
+      "when": 1795123541173,
+      "tag": "0756_computer_pairings",
+      "breakpoints": true
+    },
+    {
+      "idx": 757,
+      "version": "7",
+      "when": 1795126124098,
+      "tag": "0757_app_step_up_target_set_null",
+      "breakpoints": true
+    },
+    {
+      "idx": 758,
+      "version": "7",
+      "when": 1795126942340,
+      "tag": "0758_artifact_mini_window_flag",
+      "breakpoints": true
+    },
+    {
+      "idx": 759,
+      "version": "7",
+      "when": 1795137076786,
+      "tag": "0759_agent_focus_unfocused_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 760,
+      "version": "7",
+      "when": 1795139133326,
+      "tag": "0760_inbox_notice_server_rows_flag",
+      "breakpoints": true
+    },
+    {
+      "idx": 761,
+      "version": "7",
+      "when": 1795144261556,
+      "tag": "0761_oauth_clients_agent_token_type",
+      "breakpoints": true
+    },
+    {
+      "idx": 762,
+      "version": "7",
+      "when": 1795150561930,
+      "tag": "0762_device_authorizations_login_fallback_reason",
+      "breakpoints": true
+    },
+    {
+      "idx": 763,
+      "version": "7",
+      "when": 1795156281629,
+      "tag": "0763_agents_cli_inbox_items",
+      "breakpoints": true
+    },
+    {
+      "idx": 764,
+      "version": "7",
+      "when": 1795157222534,
+      "tag": "0764_message_server_timeline_conversation_id",
+      "breakpoints": true
     }
   ]
 }

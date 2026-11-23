@@ -318,6 +318,44 @@ export function resolveSearchHistoryEditing({
 }
 
 /**
+ * Whether the filter bar shows. The ⌘K overlay with nothing typed is its home
+ * (recent conversations) and keeps filters for when there is a query, except a
+ * filter the opener set: ⌘F in a channel opens the overlay filtered to it
+ * (`defer=1`), and the person sees that from the start and can clear it
+ * (#triage:#542).
+ */
+export function searchFilterBarShown({
+  overlayHome,
+  deferUntilQuery,
+  hasActiveFilters,
+}: {
+  overlayHome: boolean;
+  deferUntilQuery: boolean;
+  hasActiveFilters: boolean;
+}): boolean {
+  return !overlayHome || (deferUntilQuery && hasActiveFilters);
+}
+
+/**
+ * The channel the ⌘K overlay's home is about instead of recent conversations:
+ * the one ⌘F opened it filtered to (`defer=1`), while that filter is on and
+ * nothing is typed (#triage:#542). "" otherwise.
+ */
+export function searchHomeFilterConversationId({
+  scoped,
+  overlayHome,
+  deferUntilQuery,
+  channelFilterParam,
+}: {
+  scoped: boolean;
+  overlayHome: boolean;
+  deferUntilQuery: boolean;
+  channelFilterParam: string;
+}): string {
+  return !scoped && overlayHome && deferUntilQuery ? channelFilterParam : "";
+}
+
+/**
  * Desktop keeps the hover-revealed remove control on every tag. Touch renders
  * no remove control at all until edit mode is entered — absent, not merely
  * transparent, so it is neither tappable nor focusable at rest.

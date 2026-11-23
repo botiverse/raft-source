@@ -118,6 +118,7 @@ export async function seedServer(seed: Seed) {
   await insertMessage(receipt!.id, owner.id);
 
   const skipped = { joint: [local!.id, thread!.id], receipt: [receipt!.id] };
-  return { owner, server, serverId: server.id as ServerId, storage, skipped };
+  // The joint's storage channel, on the storage server: not the server's, so never walked; its apps' objects there are kept.
+  return { owner, server, serverId: server.id as ServerId, storage, skipped, jointStorage: { jointId: joint!.id, channelId: canonical!.id } };
 }
 

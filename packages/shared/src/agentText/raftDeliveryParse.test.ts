@@ -145,10 +145,11 @@ test("an unknown bracketed Raft notice, or a known one that doesn't read as its 
 const INBOX_RFC081 = [
   "[Raft inbox notice:",
   "Inbox update: 4 messages pending your read across all conversations; 3 changed targets",
-  "#general · first msg=00000000 · mentions you · 1 new, not yet delivered · latest @richard · attention_hint={\"kind\":\"mention\"}",
+  "#general · mentions you · 1 new, not yet delivered · latest @richard",
   "  [Raft notice: You were notified as a non-member, so you can read and reply in this thread but not in the channel.]",
   "  \"hey, can you look?\" (preview)",
   "  read: raft inbox read --target \"#general\"",
+  "  hint: You've received 12 updates from #general with no action taken. Run: raft channel mute \"#general\"",
   "task #proj:#7 · 2 unread · mentions you 2x · latest @mira",
   "  \"a long message…\" (truncated preview)",
   "Third-party app events · 1 pending · latest @stamp · fetch with raft message check",
@@ -168,6 +169,18 @@ test("RFC 081 inbox rows read: target (task label dropped), count, mention, late
     { target: "#proj:#7", pending: 2, latestSender: "mira", preview: "a long message…", mentioned: true },
     { target: "Third-party app events", pending: 1, latestSender: "stamp", preview: null, mentioned: false },
   ]);
+});
+
+test("rows recorded before 2026-11-20 still read: `first msg=` and the JSON `attention_hint=` at the end of the row", () => {
+  const text = INBOX_RFC081
+    .replace("#general · mentions you", "#general · first msg=00000000 · mentions you")
+    .replace("latest @richard\n", "latest @richard · attention_hint={\"kind\":\"mention\"}\n");
+  assert.notEqual(text, INBOX_RFC081);
+  const delivery = parseRaftDelivery(text);
+  assert.ok(delivery);
+  const inbox = delivery.segments[0]!;
+  assert.ok(inbox.kind === "inbox");
+  assert.deepEqual(inbox.targets[0], { target: "#general", pending: 1, latestSender: "richard", preview: "hey, can you look?", mentioned: true });
 });
 
 test("the old inbox rows still read after RFC 081 (recorded contexts keep them)", () => {
@@ -190,4 +203,67 @@ test("with inbox items on, the grouped third-party row's count reads `N not in t
   const inbox = delivery.segments.find((segment) => segment.kind === "inbox");
   assert.ok(inbox && inbox.kind === "inbox");
   assert.deepEqual(inbox.targets, [{ target: "Third-party app events", pending: 3, latestSender: "stamp", preview: null, mentioned: false }]);
+});
+
+// The notice whose opener carries its header (formatAgentInboxNotice).
+const INBOX_WITH_HEADER = [
+  "[Raft inbox notice: new since your last notice, in 3 targets",
+  "#proj-x · 3 unread · mentions you · latest @alice",
+  "  \"@Sage can you check [section 3]?\" (preview)",
+  "  read: raft inbox read --target \"#proj-x\"",
+  "dm:@bob",
+  "  read: raft inbox read --target \"dm:@bob\"",
+  "#ops · 2 messages below · latest @carol",
+  "  [target=#ops msg=3f2a91c0 time=2026-11-06 09:41:00Z type=human] @carol: first line",
+  "    │ second line with a ] bracket",
+  "  [target=#ops msg=3f2a91c1 time=2026-11-06 09:42:00Z type=human] @carol: another",
+  "Older unread: 4 messages in 2 targets. List everything: raft inbox check",
+  "]",
+].join("\n");
+
+test("an inbox notice with its header on the opener: reason, rows with and without a number, the older unread line; it ends at its bracket", () => {
+  const text = `New message received:\n\n${INBOX_WITH_HEADER}\n\nRespond as appropriate.`;
+  const delivery = parseRaftDelivery(text)!;
+  assert.deepEqual(kinds(delivery.segments), ["text", "inbox", "text"]);
+  assert.equal(delivery.notices, 1, "a message printed under its row is the row's, not a notice of its own");
+  const notice = delivery.segments[1]!;
+  assert.ok(notice.kind === "inbox");
+  assert.equal(text.slice(notice.start, notice.end), INBOX_WITH_HEADER);
+  assert.equal(notice.reason, "new");
+  assert.equal(notice.pendingTotal, null);
+  assert.deepEqual(notice.older, { messages: 4, targets: 2 });
+  assert.deepEqual(notice.targets, [
+    { target: "#proj-x", pending: 3, latestSender: "alice", preview: "@Sage can you check [section 3]?", mentioned: true },
+    { target: "dm:@bob", pending: null, latestSender: null, preview: null, mentioned: false },
+    { target: "#ops", pending: 2, latestSender: "carol", preview: null, mentioned: false },
+  ]);
+});
+
+test("the other headers: away, and nothing new with or without its counts; no older line reads as none", () => {
+  const read = (opener: string, ...rows: string[]) => {
+    const text = [opener, ...rows, "]"].join("\n");
+    const delivery = parseRaftDelivery(text)!;
+    assert.deepEqual(kinds(delivery.segments), ["inbox"], opener);
+    const notice = delivery.segments[0]!;
+    assert.ok(notice.kind === "inbox");
+    assert.equal(notice.end, text.length);
+    return notice;
+  };
+  const away = read("[Raft inbox notice: unread from while you were away, in 1 target", "#proj-x · 1 message below", "  read: raft inbox read --target \"#proj-x\"");
+  assert.deepEqual([away.reason, away.older, away.pendingTotal], ["away", null, null]);
+  assert.deepEqual(away.targets.map((target) => [target.target, target.pending]), [["#proj-x", 1]]);
+  for (const opener of [
+    "[Raft inbox notice: nothing new",
+    "[Raft inbox notice: nothing new, 2 tasks waiting on you",
+    "[Raft inbox notice: nothing new, 1 reminder not acked",
+    "[Raft inbox notice: nothing new, 1 task waiting on you, 3 reminders not acked",
+  ]) {
+    const idle = read(opener);
+    assert.deepEqual([idle.reason, idle.older, idle.targets], ["idle", null, []]);
+  }
+});
+
+test("a header this build does not know, or one without its closing line, is a generic notice", () => {
+  assert.deepEqual(kinds(parseRaftDelivery("[Raft inbox notice: something else, in 2 targets\n#proj-x · 1 unread\n]")!.segments), ["generic"]);
+  assert.deepEqual(kinds(parseRaftDelivery("[Raft inbox notice: new since your last notice, in 1 target\n#proj-x · 1 unread")!.segments), ["generic", "text"]);
 });

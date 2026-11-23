@@ -213,7 +213,7 @@ test("a push while busy stops nothing; the turn end with an empty inbox stops it
     await flush();
     const snapshot = (ctx.manager as any).lifecycleRecords.getRestartSnapshot("agent-busy");
     assert.equal(snapshot.config.model, "opus", "the next wake starts on the pushed config");
-    assert.equal(snapshot.sessionId, "session-agent-busy", "resuming the session (another Claude model)");
+    assert.equal(snapshot.sessionId, null, "model switch opens a fresh session on every runtime");
     assert.equal(ctx.driver.spawnCalls.length, 1, "nothing restarted it");
   });
 });
@@ -230,20 +230,20 @@ test("a push with the same spec changes nothing: no stop, no spawn", async () =>
   });
 });
 
-test("managed MCP and provider connection revisions drift only when both sides carry them", async () => {
+test("a managed MCP fingerprint drifts only when both sides carry it", async () => {
   await withManager(async (ctx) => {
-    // Started without (an older server): a push that names them is no drift.
+    // Started without (an older server): a push that names it is no drift.
     await startIdle(ctx, "agent-old");
-    ctx.manager.applyConfig("agent-old", pushed({ managedMcpFingerprint: "mcp-1", providerConnectionRevision: 3 }), 1);
+    ctx.manager.applyConfig("agent-old", pushed({ managedMcpFingerprint: "mcp-1" }), 1);
     assert.equal(ctx.driver.processes[0]!.killed, false);
 
-    // Started with them: a change of either stops the idle process.
-    await startIdle(ctx, "agent-mcp", { managedMcpFingerprint: "mcp-1", providerConnectionRevision: 3 });
-    ctx.manager.applyConfig("agent-mcp", pushed({ managedMcpFingerprint: "mcp-1" }), 1);
+    // Started with it: a change stops the idle process.
+    await startIdle(ctx, "agent-mcp", { managedMcpFingerprint: "mcp-1" });
+    ctx.manager.applyConfig("agent-mcp", pushed({}), 1);
     assert.equal(ctx.driver.processes[1]!.killed, false, "absent in the push: no drift");
-    ctx.manager.applyConfig("agent-mcp", pushed({ managedMcpFingerprint: "mcp-2", providerConnectionRevision: 4 }), 2);
+    ctx.manager.applyConfig("agent-mcp", pushed({ managedMcpFingerprint: "mcp-2" }), 2);
     assert.equal(ctx.driver.processes[1]!.kills, 1);
-    assert.deepEqual(specStops(ctx).map((stop) => stop.drift), ["managed_mcp,provider_connection"]);
+    assert.deepEqual(specStops(ctx).map((stop) => stop.drift), ["managed_mcp"]);
   });
 });
 
@@ -473,20 +473,20 @@ test("step 11d: a start or an explicit stop before the deadline cancels it: no r
   }, new FakeDriver(), { specHandbackDeadlineMs: SHORT_DEADLINE_MS });
 });
 
-test("an idle agent with only a restart snapshot: the snapshot takes the push; a runtime change drops it for the server", async () => {
+test("an idle agent with only a restart snapshot: a session-keeping push updates it; a model or runtime change drops it for the server", async () => {
   await withManager(async (ctx) => {
     await startIdle(ctx, "agent-idle");
     ctx.manager.applyConfig("agent-idle", pushed({ envVars: { A: "1" } }), 1);
     await flush();
     assert.equal(ctx.driver.processes[0]!.kills, 1);
-    ctx.manager.applyConfig("agent-idle", pushed({ envVars: { A: "1" }, model: "opus" }), 2);
+    ctx.manager.applyConfig("agent-idle", pushed({ envVars: { A: "1" }, reasoningEffort: "high" }), 2);
     const snapshot = (ctx.manager as any).lifecycleRecords.getRestartSnapshot("agent-idle");
-    assert.equal(snapshot.config.model, "opus");
+    assert.equal(snapshot.config.reasoningEffort, "high");
     assert.equal(snapshot.sessionId, "session-agent-idle");
     assert.equal(snapshot.config.agentCredentialKey ?? null, null, "credential-free");
 
-    ctx.manager.applyConfig("agent-idle", pushed({ runtime: "codex", model: "gpt-5.5" }), 3);
-    assert.equal((ctx.manager as any).lifecycleRecords.getRestartSnapshot("agent-idle"), undefined);
+    ctx.manager.applyConfig("agent-idle", pushed({ envVars: { A: "1" }, model: "opus" }), 3);
+    assert.equal((ctx.manager as any).lifecycleRecords.getRestartSnapshot("agent-idle"), undefined, "model switch hands off to server for a fresh session");
     assert.equal(ctx.driver.spawnCalls.length, 1);
   });
 });
@@ -549,13 +549,13 @@ test("a start older than the applied push rebinds launch, session and wake, but 
 
     // r6 arrives first (the core accepts it), then the r5 start built before it.
     assert.equal(ctx.manager.configRevisions.acceptPush("agent-order", 6), true);
-    ctx.manager.applyConfig("agent-order", pushed({ model: "opus" }), 6);
-    const r5 = makeConfig({ model: "sonnet", sessionId: "session-agent-order" });
+    ctx.manager.applyConfig("agent-order", pushed({ reasoningEffort: "high" }), 6);
+    const r5 = makeConfig({ model: "sonnet", reasoningEffort: "low", sessionId: "session-agent-order" });
     ctx.manager.configRevisions.noteStart("agent-order", 5, r5);
     await ctx.manager.startAgent("agent-order", r5, message(9), undefined, undefined, "launch-5");
 
-    assert.equal(ap.config.model, "opus", "the newer config stays");
-    assert.equal((ctx.manager as any).lifecycleRecords.getRestartSnapshot("agent-order").config.model, "opus");
+    assert.equal(ap.config.reasoningEffort, "high", "the newer config stays");
+    assert.equal((ctx.manager as any).lifecycleRecords.getRestartSnapshot("agent-order").config.reasoningEffort, "high");
     assert.equal(ap.launchId, "launch-5", "the launch rebinds");
     assert.deepEqual(sessionFrames(ctx).at(-1), { type: "agent:session", agentId: "agent-order", sessionId: "session-agent-order", launchId: "launch-5" });
     const routed = ctx.events.filter((event) => event.name === "daemon.agent.delivery.routed" && event.attrs.messageId === "msg-9");
@@ -565,10 +565,10 @@ test("a start older than the applied push rebinds launch, session and wake, but 
     assert.ok(pushEvents(ctx).some((event) => event.outcome === "stale_start_config_kept"));
 
     // Equal revision: the start's config is the server's (the same one), so it is taken.
-    const r6 = makeConfig({ model: "haiku", sessionId: "session-agent-order" });
+    const r6 = makeConfig({ reasoningEffort: "medium", sessionId: "session-agent-order" });
     ctx.manager.configRevisions.noteStart("agent-order", 6, r6);
     await ctx.manager.startAgent("agent-order", r6, undefined, undefined, undefined, "launch-6");
-    assert.equal(ap.config.model, "haiku");
+    assert.equal(ap.config.reasoningEffort, "medium");
   });
 });
 
@@ -697,4 +697,88 @@ test("task #1357: a manager without a daemon instance id reports nothing (the se
     emitModelLimits(ctx, "agent-noinst");
     assert.deepEqual(limitsFrames(ctx), []);
   });
+});
+
+test("#proj-runtime:#80: a config push waits for the foreground turn, never for background tasks", async () => {
+  await withManager(async (ctx) => {
+    await ctx.manager.startAgent("agent-bg-cfg", makeConfig({ sessionId: "session-agent-bg-cfg" }));
+    const ap = (ctx.manager as any).agents.get("agent-bg-cfg");
+    ap.sessionId = "session-agent-bg-cfg";
+    ap.backgroundTasks.set("bg-task-1", { startedAtMs: Date.now(), lastEventAtMs: Date.now(), taskKind: "command" });
+    const child = ctx.driver.processes[0]!;
+
+    // Still inside the foreground turn: held until turn_end.
+    ctx.manager.applyConfig("agent-bg-cfg", pushed({ model: "opus", configRevision: 3 }), 3);
+    assert.equal(child.kills, 0, "does not interrupt the running foreground turn");
+
+    // Foreground turn finishes while the background task is still running: stops immediately.
+    emitTurnEnd(ctx, "agent-bg-cfg");
+    assert.equal(child.kills, 1, "stops at foreground turn_end despite live background task");
+    const stops = ctx.events.filter((event) => event.name === "daemon.agent.spec_restart_stop").map((event) => event.attrs);
+    assert.deepEqual(stops.map((stop) => [stop.drift, stop.trigger]), [["model", "turn_end"]]);
+  });
+});
+
+test("#proj-runtime:#80: interrupting config push stops busy turn immediately via silent handoff, writes interrupted-turn note, and deletes only on commit", async () => {
+  await withManager(async (ctx) => {
+    await ctx.manager.startAgent("agent-int", makeConfig({ sessionId: "session-agent-int" }));
+    const ap = (ctx.manager as any).agents.get("agent-int");
+    ap.inbox.push(message(99));
+    assert.equal(ap.gatedSteering.isIdle, false, "precondition: foreground turn running");
+
+    ctx.manager.applyConfig("agent-int", pushed({ model: "opus", configRevision: 8 }), 8, { interrupt: true });
+    assert.equal(ctx.driver.processes[0]!.kills, 1, "interrupts active turn immediately");
+    assert.deepEqual(
+      specStops(ctx).map((stop) => [stop.drift, stop.interrupted_turn, stop.hand_to_server, stop.trigger]),
+      [["model", true, true, "signal"]],
+    );
+    await flush();
+    assert.equal(ctx.driver.spawnCalls.length, 1, "silent handoff never locally restarts and steals the handoff note");
+    assert.deepEqual(ctx.manager.interruptedTurns.read("agent-int")?.drift, ["model"]);
+
+    // Pre-spawn failure preserves interrupted-turn.json for the retry/next start.
+    const origBuild = (ctx.manager as any).buildSpawnConfig.bind(ctx.manager);
+    (ctx.manager as any).buildSpawnConfig = async () => { throw new Error("transient credential error"); };
+    await assert.rejects(() => ctx.manager.startAgent("agent-int", makeConfig({ model: "opus", sessionId: null })));
+    assert.deepEqual(ctx.manager.interruptedTurns.read("agent-int")?.drift, ["model"], "preserved across pre-spawn failure");
+
+    // Successful replacement start injects <interrupted-turn> and deletes it on commit.
+    (ctx.manager as any).buildSpawnConfig = origBuild;
+    await ctx.manager.startAgent("agent-int", makeConfig({ model: "opus", sessionId: null }));
+    assert.equal(ctx.driver.spawnCalls.length, 2);
+    assert.match(
+      String(ctx.driver.spawnCalls[1]!.prompt),
+      /<interrupted-turn>\nYour previous turn was stopped partway to apply a settings change someone made \(model\)\. This is a new session and nothing from that turn was carried over\./,
+    );
+    assert.equal(ctx.manager.interruptedTurns.read("agent-int"), null, "deleted once committed");
+  });
+});
+
+test("#proj-runtime:#80: interrupting config push with empty spec drift still records interrupted-turn note when busy", async () => {
+  await withManager(async (ctx) => {
+    await ctx.manager.startAgent("agent-nodrift", makeConfig({ sessionId: "session-nodrift" }));
+    ctx.manager.applyConfig("agent-nodrift", pushed({}), 2, { interrupt: true });
+    assert.equal(ctx.driver.processes[0]!.kills, 1, "interrupts immediately even when spec drift is empty");
+    assert.deepEqual(ctx.manager.interruptedTurns.read("agent-nodrift")?.drift, []);
+    await flush();
+    await ctx.manager.startAgent("agent-nodrift", makeConfig({ sessionId: "session-nodrift" }));
+    assert.match(
+      String(ctx.driver.spawnCalls[1]!.prompt),
+      /<interrupted-turn>\nYour previous turn was stopped partway to apply a settings change someone made \(runtime settings\)\. A step that was running may not have finished/,
+    );
+  });
+});
+
+test("#proj-runtime:#80: deferSpawnUntilMessage does not defer when an interrupted-turn handoff note is pending", async () => {
+  const deferDriver = Object.assign(new FakeDriver(), { deferSpawnUntilMessage: true as const });
+  await withManager(async (ctx) => {
+    ctx.manager.interruptedTurns.write("agent-defer", ["runtime_config"]);
+    await ctx.manager.startAgent("agent-defer", makeConfig({ sessionId: "session-defer" }));
+    assert.equal(ctx.driver.spawnCalls.length, 1, "spawns immediately instead of deferring");
+    assert.match(
+      String(ctx.driver.spawnCalls[0]!.prompt),
+      /<interrupted-turn>\nYour previous turn was stopped partway to apply a settings change someone made \(runtime settings\)\. A step that was running may not have finished/,
+    );
+    assert.equal(ctx.manager.interruptedTurns.read("agent-defer"), null, "deleted on commit");
+  }, deferDriver);
 });

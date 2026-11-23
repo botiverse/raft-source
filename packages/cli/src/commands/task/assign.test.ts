@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 
+import { Command } from "commander";
+
 import type { ApiResponse } from "../../client";
 import type { AgentContext } from "../../auth/env";
 import { createCommandContext } from "../../core/context";
-import { CliError } from "../../core/errors";
+import { CliError, CliExit } from "../../core/errors";
 import type { CliIo } from "../../core/io";
-import { taskAssignCommand } from "./assign";
+import { registerTaskAssignCommand, taskAssignCommand } from "./assign";
 
 function memoryIo(): { io: CliIo; stdout: string[]; stderr: string[] } {
   const stdout: string[] = [];
@@ -274,4 +276,41 @@ test("a ref the shell cut off (unquoted #) is named as the likely cause, before 
     async () => { await taskAssignCommand.handler(ctx, undefined, undefined, {}); },
     (err: unknown) => err instanceof CliError && err.code === "INVALID_ARG" && /# starts a shell comment/.test(err.message),
   );
+});
+
+test("a held task assign prints the hold once, exits 1 and names TASK_WRITE_HELD on stderr", async () => {
+  const { io, stdout, stderr } = memoryIo();
+  const requests: unknown[] = [];
+  const program = new Command();
+  program.exitOverride();
+  registerTaskAssignCommand(program.command("task"), {
+    io,
+    env: {},
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (_method: string, _path: string, body?: unknown): Promise<ApiResponse<unknown>> => {
+        requests.push(body);
+        return {
+          ok: true,
+          status: 200,
+          error: null,
+          data: { state: "held", newMessageCount: 1, seenUpToSeq: 17, heldMessages: [{ seq: 17, id: "m-17", senderName: "ana", content: "I'm on #7 already" }] },
+        };
+      },
+    }) as any,
+  });
+
+  await assert.rejects(
+    async () => {
+      await program.parseAsync(["node", "raft", "task", "assign", "#proj-runtime:#7", "@akko", "--reason", "Your call"]);
+    },
+    (err: unknown) => err instanceof CliExit && err.exitCode === 1,
+  );
+  assert.equal(requests.length, 1);
+  const output = stdout.join("");
+  assert.match(output, /^Held — 1 unread message in #proj-runtime:#7\./);
+  assert.equal(output.match(/Your task assignment was not applied\./g)?.length, 1, "the hold is printed once");
+  assert.doesNotMatch(output, /assigned to @akko/);
+  // Classification only: the hold above already says what happened and what to do.
+  assert.equal(stderr.join(""), "Error: Held for unseen messages. Your task assignment was not applied.\nCode: TASK_WRITE_HELD\nRetryable: yes\n");
 });

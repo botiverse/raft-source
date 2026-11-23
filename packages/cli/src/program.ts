@@ -16,12 +16,14 @@
 //   raft channel unarchive --target "#name"
 //   raft channel add-member --target "#name" --user @name
 //   raft channel remove-member --target "#name" --user @name
+//   raft channel set-role --target "#name" --user @name --role admin
 //   raft channel join --target "#name"
 //   raft channel leave --target "#name"
 //   raft channel mute --target "#name"
 //   raft channel unmute --target "#name"
 //   raft thread list
 //   raft thread unfollow --target "#name:shortid"
+//   raft focus ["<target>"] / raft unfocus "<target>"
 //   raft manual get <topic>
 //   raft manual search <keywords>
 //   raft inbox check/read/dismiss
@@ -57,6 +59,7 @@ import { registerChannelUpdateCommand } from "./commands/channel/update";
 import { registerChannelArchiveCommand, registerChannelUnarchiveCommand } from "./commands/channel/lifecycle";
 import { registerChannelAddMemberCommand } from "./commands/channel/add-member";
 import { registerChannelRemoveMemberCommand } from "./commands/channel/remove-member";
+import { registerChannelSetRoleCommand } from "./commands/channel/set-role";
 import { registerChannelJoinCommand } from "./commands/channel/join";
 import { registerChannelMuteCommand, registerChannelUnmuteCommand } from "./commands/channel/mute";
 import { registerServerInfoCommand } from "./commands/server/info";
@@ -75,6 +78,7 @@ import { registerProcLogsCommand } from "./commands/proc/logs";
 import { registerProcStopCommand } from "./commands/proc/stop";
 import { registerThreadFollowCommand } from "./commands/thread/follow";
 import { registerThreadUnfollowCommand } from "./commands/thread/unfollow";
+import { registerFocusCommands } from "./commands/focus/focus";
 import { registerContextSearchCommand } from "./commands/context/search";
 import { registerContextReadCommand } from "./commands/context/read";
 import { registerSendCommand } from "./commands/message/send";
@@ -118,6 +122,7 @@ import { registerIntegrationInvokeCommand } from "./commands/integration/invoke"
 import { registerIntegrationAppCommands } from "./commands/integration/app";
 import { registerReminderScheduleCommand } from "./commands/reminder/schedule";
 import { registerReminderListCommand } from "./commands/reminder/list";
+import { registerReminderShowCommand } from "./commands/reminder/show";
 import { registerReminderCancelCommand } from "./commands/reminder/cancel";
 import { registerReminderSnoozeCommand } from "./commands/reminder/snooze";
 import { registerReminderUpdateCommand } from "./commands/reminder/update";
@@ -307,6 +312,7 @@ export function buildRaftProgram(runtime: RaftProgramOptions = {}): Command {
   registerChannelUnarchiveCommand(channelCmd, runtimeOptions);
   registerChannelAddMemberCommand(channelCmd, runtimeOptions);
   registerChannelRemoveMemberCommand(channelCmd, runtimeOptions);
+  registerChannelSetRoleCommand(channelCmd, runtimeOptions);
   registerChannelJoinCommand(channelCmd, runtimeOptions);
   registerChannelLeaveCommand(channelCmd, runtimeOptions);
   registerChannelMuteCommand(channelCmd, runtimeOptions);
@@ -316,6 +322,9 @@ export function buildRaftProgram(runtime: RaftProgramOptions = {}): Command {
   registerThreadListCommand(threadCmd, runtimeOptions);
   registerThreadFollowCommand(threadCmd, runtimeOptions);
   registerThreadUnfollowCommand(threadCmd, runtimeOptions);
+
+  // Focus (Server flag agent_focus_v0): `raft focus [target]`, `raft unfocus <target>`.
+  registerFocusCommands(program, runtimeOptions);
 
   const serverCmd = program.command("server").description("Server / workspace introspection");
   registerServerInfoCommand(serverCmd, runtimeOptions);
@@ -405,6 +414,7 @@ export function buildRaftProgram(runtime: RaftProgramOptions = {}): Command {
   const reminderCmd = program.command("reminder").description("Reminder operations");
   registerReminderScheduleCommand(reminderCmd, runtimeOptions);
   registerReminderListCommand(reminderCmd, runtimeOptions);
+  registerReminderShowCommand(reminderCmd, runtimeOptions);
   registerReminderCancelCommand(reminderCmd, runtimeOptions);
   registerReminderSnoozeCommand(reminderCmd, runtimeOptions);
   registerReminderUpdateCommand(reminderCmd, runtimeOptions);

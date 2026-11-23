@@ -17,14 +17,12 @@ import {
   projectRuntimeToolDiagnosticActivity,
   projectApmRuntimeTerminationTrace,
   reduceApmControlPlaneEvent,
-  reduceApmGatedError,
   reduceApmToolUse,
   reduceApmStalledRecoveryTermination,
   reduceApmStartupTimeoutTermination,
 } from "./apmStateMachine";
 import { STALLED_WITH_WORK_THRESHOLDS } from "./stalledWithWork";
 import { classifyDaemonConnectionTraceEvent } from "./connection";
-import { classifyCodexResumeError, type CodexResumeErrorClassification } from "./drivers/codex";
 
 const EXECUTABLE_REDUCER_ROW_IDS = [
   "direct-stdin-tool-output-stale-queued-message",
@@ -32,12 +30,6 @@ const EXECUTABLE_REDUCER_ROW_IDS = [
   "active-tool-without-direct-recovery-evidence-blocks-restart",
   "startup-no-ready-timeout-terminates",
   "startup-progress-started-blocks-timeout",
-] as const satisfies readonly ApmStatusTransitionContractId[];
-
-const EXECUTABLE_DRIVER_CLASSIFIER_ROW_IDS = [
-  "codex-resume-missing-rollout-falls-back-fresh-thread",
-  "codex-resume-thread-writer-busy-falls-back-fresh-thread",
-  "codex-resume-permission-denied-stays-terminal-error",
 ] as const satisfies readonly ApmStatusTransitionContractId[];
 
 const EXECUTABLE_CONTROL_PLANE_ROW_IDS = [
@@ -62,7 +54,6 @@ test("APM status transition contract uses stable low-cardinality rows", () => {
 test("APM status transition contract marks executable rows separately from future anchors", () => {
   const executableIds: ReadonlySet<string> = new Set([
     ...EXECUTABLE_REDUCER_ROW_IDS,
-    ...EXECUTABLE_DRIVER_CLASSIFIER_ROW_IDS,
     ...EXECUTABLE_CONTROL_PLANE_ROW_IDS,
   ]);
   for (const row of APM_STATUS_TRANSITION_CONTRACT) {
@@ -114,6 +105,7 @@ test("APM contract matrix: stale direct-stdin tool output enters stalled recover
   const afterToolOutput = reduceApmToolUse(afterToolCall, { kind: "tool_output" }).nextState;
   const reduction = reduceApmStalledRecoveryTermination(afterToolOutput, {
     inboxLength: 1,
+    appInboxNoticeWaiting: false,
     supportsStdinNotification: true,
     busyDeliveryMode: "direct",
     hasSession: true,
@@ -165,6 +157,7 @@ test("APM contract matrix: stale direct-stdin tool output enters stalled recover
 
   const repeated = reduceApmStalledRecoveryTermination(reduction.nextState, {
     inboxLength: 1,
+    appInboxNoticeWaiting: false,
     supportsStdinNotification: true,
     busyDeliveryMode: "direct",
     hasSession: true,
@@ -323,6 +316,7 @@ test("APM contract matrix: recent progress blocks stalled recovery", () => {
 
   const reduction = reduceApmStalledRecoveryTermination(createInitialApmGatedSteeringState(), {
     inboxLength: 1,
+    appInboxNoticeWaiting: false,
     supportsStdinNotification: true,
     busyDeliveryMode: "direct",
     hasSession: true,
@@ -355,6 +349,7 @@ test("APM contract matrix: active tool without recovery evidence blocks direct-s
   }).nextState;
   const reduction = reduceApmStalledRecoveryTermination(activeTool, {
     inboxLength: 1,
+    appInboxNoticeWaiting: false,
     supportsStdinNotification: true,
     busyDeliveryMode: "direct",
     hasSession: true,
@@ -424,85 +419,6 @@ test("APM contract matrix: startup timeout separates no-ready from started-progr
   assert.equal(projectStartupTimeoutStatus(progressStartedReduction), progressStarted.to);
 });
 
-test("APM contract matrix: provider error rows keep missing rollout distinct from permission denied", () => {
-  const missingRollout = getApmStatusTransitionContract("codex-resume-missing-rollout-falls-back-fresh-thread");
-  assertExecutableRow(missingRollout, {
-    from: "running",
-    eventClass: "resume_missing_rollout",
-  });
-  const missingRolloutClassification = classifyCodexResumeError("No rollout found for thread missing-thread-1");
-  assert.equal(missingRolloutClassification.kind, "missing_rollout");
-  assert.equal(missingRolloutClassification.resumeErrorClass, missingRollout.expectation.resumeErrorClass);
-  assert.equal(missingRolloutClassification.recoveryAction, missingRollout.expectation.recoveryAction);
-  assert.equal(missingRolloutClassification.telemetry.name, "recovery");
-  assert.equal(missingRolloutClassification.telemetry.source, "codex_resume_missing_rollout");
-  assert.equal(missingRolloutClassification.telemetry.attrs.resume_error_class, "missing_rollout");
-  assert.equal(missingRolloutClassification.telemetry.attrs.recovery_action, "fallback_fresh_thread");
-  assert.equal(missingRolloutClassification.recovery.kind, "runtime_recovery");
-  assert.equal(missingRolloutClassification.recovery.source, "codex_resume_missing_rollout");
-  assert.equal(missingRolloutClassification.recovery.resumeErrorClass, "missing_rollout");
-  assert.equal(missingRolloutClassification.recovery.recoveryAction, "fallback_fresh_thread");
-  assert.equal(projectCodexResumeClassifierStatus(missingRolloutClassification), missingRollout.to);
-  assert.equal(missingRollout.expectation.resumeErrorClass, "missing_rollout");
-  assert.equal(missingRollout.expectation.recoveryAction, "fallback_fresh_thread");
-  assert.equal(missingRollout.expectation.traceEvent, "runtime.telemetry.recovery");
-
-  const threadWriterBusy = getApmStatusTransitionContract("codex-resume-thread-writer-busy-falls-back-fresh-thread");
-  assertExecutableRow(threadWriterBusy, {
-    from: "running",
-    eventClass: "resume_thread_writer_busy",
-  });
-  const threadWriterBusyClassification = classifyCodexResumeError(
-    "Thread busy-thread-1 already has an active writer",
-  );
-  assert.equal(threadWriterBusyClassification.kind, "thread_writer_busy");
-  assert.equal(threadWriterBusyClassification.resumeErrorClass, threadWriterBusy.expectation.resumeErrorClass);
-  assert.equal(threadWriterBusyClassification.recoveryAction, threadWriterBusy.expectation.recoveryAction);
-  assert.equal(threadWriterBusyClassification.telemetry.name, "recovery");
-  assert.equal(threadWriterBusyClassification.telemetry.source, "codex_resume_thread_writer_busy");
-  assert.equal(threadWriterBusyClassification.telemetry.attrs.resume_error_class, "thread_writer_busy");
-  assert.equal(threadWriterBusyClassification.telemetry.attrs.recovery_action, "fallback_fresh_thread");
-  assert.equal(threadWriterBusyClassification.recovery.kind, "runtime_recovery");
-  assert.equal(threadWriterBusyClassification.recovery.source, "codex_resume_thread_writer_busy");
-  assert.equal(threadWriterBusyClassification.recovery.resumeErrorClass, "thread_writer_busy");
-  assert.equal(threadWriterBusyClassification.recovery.recoveryAction, "fallback_fresh_thread");
-  assert.equal(projectCodexResumeClassifierStatus(threadWriterBusyClassification), threadWriterBusy.to);
-  assert.equal(threadWriterBusy.expectation.resumeErrorClass, "thread_writer_busy");
-  assert.equal(threadWriterBusy.expectation.recoveryAction, "fallback_fresh_thread");
-  assert.equal(threadWriterBusy.expectation.traceEvent, "runtime.telemetry.recovery");
-
-  const noActiveWriterClassification = classifyCodexResumeError("No active writer found for thread busy-thread-1");
-  assert.equal(noActiveWriterClassification.kind, "terminal_error");
-  assert.equal(noActiveWriterClassification.resumeErrorClass, "unknown");
-  assert.equal(noActiveWriterClassification.recoveryAction, undefined);
-  assert.equal(projectCodexResumeClassifierStatus(noActiveWriterClassification), "error");
-
-  const permissionDenied = getApmStatusTransitionContract("codex-resume-permission-denied-stays-terminal-error");
-  assertExecutableRow(permissionDenied, {
-    from: "running",
-    eventClass: "resume_permission_denied",
-  });
-  const permissionDeniedClassification = classifyCodexResumeError("No permission to access thread forbidden-thread-1");
-  assert.equal(permissionDeniedClassification.kind, "terminal_error");
-  assert.equal(permissionDeniedClassification.resumeErrorClass, permissionDenied.expectation.resumeErrorClass);
-  assert.equal(permissionDeniedClassification.recoveryAction, undefined);
-  assert.equal(projectCodexResumeClassifierStatus(permissionDeniedClassification), permissionDenied.to);
-  assert.equal(permissionDenied.expectation.resumeErrorClass, "permission_denied");
-  assert.equal(permissionDenied.expectation.recoveryAction, undefined);
-  assert.equal(permissionDenied.expectation.traceEvent, "runtime.error");
-
-  const activeWriterPermissionClassification = classifyCodexResumeError(
-    "Permission denied: active writer access is forbidden",
-  );
-  assert.equal(activeWriterPermissionClassification.kind, "terminal_error");
-  assert.equal(activeWriterPermissionClassification.resumeErrorClass, "permission_denied");
-  assert.equal(activeWriterPermissionClassification.recoveryAction, undefined);
-  assert.equal(projectCodexResumeClassifierStatus(activeWriterPermissionClassification), permissionDenied.to);
-
-  const reduction = reduceApmGatedError(createInitialApmGatedSteeringState(), { terminalWakeable: true });
-  assert.equal(reduction.nextState.expectedTerminationReason, permissionDenied.expectation.expectedTerminationReason);
-});
-
 test("APM contract matrix: control-plane reconnect stays outside runtime recovery", () => {
   const row = getApmStatusTransitionContract("control-plane-reconnect-does-not-imply-runtime-recovery");
   assertExecutableRow(row, {
@@ -566,15 +482,6 @@ function projectStartupTimeoutStatus(
     return "error";
   }
   return "running";
-}
-
-function projectCodexResumeClassifierStatus(
-  classification: CodexResumeErrorClassification,
-): ApmUserVisibleStatus {
-  if (classification.recoveryAction === "fallback_fresh_thread") {
-    return "recovering";
-  }
-  return "error";
 }
 
 function projectControlPlaneStatus(

@@ -8,6 +8,9 @@ import { buildClaudeManagedMcpConfig } from "./claudeLaunch";
 import { CLAUDE_CUSTOM_PROVIDER_HOST_ENV_KEYS, LEGACY_CLAUDE_PROVIDER_CONFIG_DIR } from "./claudeProviderIsolation";
 import { subscribeDaemonLogs, type DaemonLogEvent } from "../logger";
 import type { SpawnContext } from "./types";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { __resetManagedMcpRuntimeProxyForTest } from "../managedMcpRuntimeProxy";
 
 const driver = new ClaudeDriver();
 const config = {
@@ -247,6 +250,116 @@ process.stdin.on("data", () => {
   } finally {
     globalThis.fetch = originalFetch;
     unsubscribe();
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// The answer tool (continuation_tool_v0) end to end through the driver: the
+// launch's managed MCP server lists answer_continuation and the runtime gets
+// RAFT_CONTINUATION_TOOL only with the flag on; the tool runs this launch's
+// own `raft` wrapper (here over a fake CLI that prints what it was given),
+// as this agent, with RAFT_CONTINUATION_VIA=tool. Off: neither.
+async function spawnWithAnswerTool(continuationTool: boolean) {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-claude-answer-tool-"));
+  const capturePath = path.join(tmp, "capture.json");
+  const fakeClaudePath = path.join(tmp, "fake-claude.mjs");
+  const fakeCliPath = path.join(tmp, "fake-cli.mjs");
+  writeFileSync(fakeCliPath, `process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), agent: process.env.SLOCK_AGENT_ID, via: process.env.RAFT_CONTINUATION_VIA, tool: process.env.RAFT_CONTINUATION_TOOL }) + "\\n");\n`);
+  writeFileSync(
+    fakeClaudePath,
+    `#!/usr/bin/env node
+import { readFileSync, writeFileSync } from "node:fs";
+const argv = process.argv.slice(2);
+const at = argv.indexOf("--mcp-config");
+process.stdin.on("data", () => {
+  writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ tool: process.env.RAFT_CONTINUATION_TOOL ?? null, via: process.env.RAFT_CONTINUATION_VIA ?? null, mcp: at >= 0 ? JSON.parse(readFileSync(argv[at + 1], "utf8")) : null }));
+  process.exit(0);
+});
+`,
+    { mode: 0o755 },
+  );
+  const result = await driver.spawn({
+    ...makeSpawnContext(tmp, {
+      agentCredentialKey: "sk_agent_test",
+      ...(continuationTool ? { continuationTool: true } : {}),
+      runtimeConfig: {
+        version: 1,
+        runtime: "claude",
+        provider: { kind: "default" },
+        model: { kind: "preset", id: "sonnet" },
+        mode: { kind: "default" },
+        command: fakeClaudePath,
+      },
+    }),
+    slockHome: path.join(tmp, "home"),
+    slockCliPath: fakeCliPath,
+  });
+  await once(result.process, "exit");
+  const capture = JSON.parse(readFileSync(capturePath, "utf8")) as {
+    tool: string | null;
+    via: string | null;
+    mcp: { mcpServers: Record<string, { url: string }> } | null;
+  };
+  return { tmp, capture };
+}
+
+/** The Server's (empty) managed MCP catalog; loopback (the proxy itself) goes through. */
+function mockCatalogFetch(): () => void {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    if (url.hostname === "127.0.0.1") return originalFetch(input, init);
+    return new Response(JSON.stringify({ catalogVersion: 1, tools: [] }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  return () => {
+    globalThis.fetch = originalFetch;
+  };
+}
+
+async function withManagedMcp<T>(url: string, run: (client: Client) => Promise<T>): Promise<T> {
+  const client = new Client({ name: "claude-answer-tool-test", version: "1.0.0" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+  try {
+    return await run(client);
+  } finally {
+    await client.close();
+  }
+}
+
+test("continuation_tool_v0 on: the launch lists answer_continuation, sets RAFT_CONTINUATION_TOOL, and the tool runs this launch's raft as this agent", async () => {
+  const restoreFetch = mockCatalogFetch();
+  const { tmp, capture } = await spawnWithAnswerTool(true);
+  try {
+    assert.equal(capture.tool, "answer_continuation");
+    assert.equal(capture.via, null, "RAFT_CONTINUATION_VIA is only for the raft the tool runs");
+    const [server] = Object.values(capture.mcp?.mcpServers ?? {});
+    assert.ok(server);
+    await withManagedMcp(server.url, async (client) => {
+      assert.deepEqual((await client.listTools()).tools.map((tool) => tool.name), ["answer_continuation"]);
+      const result = await client.callTool({ name: "answer_continuation", arguments: { id: "k7q2m3x9ab", choice: "a" } }) as { isError?: boolean; content: Array<{ text?: string }> };
+      assert.equal(result.isError, undefined, JSON.stringify(result));
+      assert.deepEqual(JSON.parse(result.content[0]!.text!), { argv: ["__continue", "k7q2m3x9ab", "a"], agent: "agent-1", via: "tool", tool: "answer_continuation" });
+    });
+  } finally {
+    restoreFetch();
+    await __resetManagedMcpRuntimeProxyForTest();
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("continuation_tool_v0 off: no tool listed and no RAFT_CONTINUATION_TOOL", async () => {
+  const restoreFetch = mockCatalogFetch();
+  const { tmp, capture } = await spawnWithAnswerTool(false);
+  try {
+    assert.equal(capture.tool, null);
+    const [server] = Object.values(capture.mcp?.mcpServers ?? {});
+    assert.ok(server);
+    await withManagedMcp(server.url, async (client) => {
+      assert.deepEqual((await client.listTools()).tools, []);
+    });
+  } finally {
+    restoreFetch();
+    await __resetManagedMcpRuntimeProxyForTest();
     rmSync(tmp, { recursive: true, force: true });
   }
 });

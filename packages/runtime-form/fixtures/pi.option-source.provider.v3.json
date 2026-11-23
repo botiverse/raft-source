@@ -1,0 +1,20 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "pi",
+  "schemaVersion": "pi.create.v1",
+  "sourceId": "provider",
+  "kind": "select",
+  "pointer": "/provider",
+  "options": [
+    {
+      "value": "configured",
+      "label": "Configured"
+    },
+    {
+      "value": "deepseek",
+      "label": "DeepSeek"
+    }
+  ],
+  "defaultValue": "configured",
+  "customValueAllowed": false
+}

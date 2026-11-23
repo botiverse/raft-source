@@ -90,6 +90,7 @@ import { postAgentActionRequiredNotice } from "../agentActionRequiredNoticeServi
 import type { AgentOrchestrator } from "../agentOrchestrator";
 import { closeDeviceSessionKeys } from "../deviceSessionKeys";
 import { clearComputerOwnershipOf } from "../computerOwnerService";
+import { revokeOAuthConnectionsSignedInBy } from "../managedMcpSignedInBy";
 import {
   cancelScheduledEmail,
   deleteResendContact,
@@ -105,6 +106,7 @@ import {
   type ServerMemberRoleTransitionResult,
 } from "../serverService";
 import { revokeAllUserSessionsInTransaction } from "../sessionService";
+import { deleteDataExportsOfDeletedUser } from "../dataExport/jobs";
 import { unbindAndStopAgents } from "../computerAgents";
 import { revokeRunnerCredentialsOffMachine } from "../agentCredentialService";
 import {
@@ -937,6 +939,8 @@ const DELETE_STEP_OVERRIDES: Partial<Record<UserForeignKey, DeleteStepOverride>>
   "newsletter_audience_contacts.user_id": { run: deleteNewsletterContacts },
   "paid_lifecycle_journeys.user_id": { run: deletePaidLifecycleJourney },
   "onboarding_email_journeys.user_id": { run: deleteOnboardingEmailJourneys },
+  // The archives in storage go first (an open upload aborted), then the rows (design v7 §6).
+  "data_exports.requester_user_id": { run: (ctx) => deleteDataExportsOfDeletedUser(ctx.userId) },
 };
 
 /** Each newsletter contact leaves Resend before its row goes; a failure keeps the row for the next run. */
@@ -1078,6 +1082,16 @@ const KEEP_ACTIONS: Record<AccountDeletionKeepAction, KeepActionRun> = {
   revoke_push_registrations: async (tx, { userId, now }) => {
     await tx.execute(sql`update push_registrations set revoked_at = ${now}, revoked_reason = ${REVOKED_REASON}, revoked_user_id = ${userId} where user_id = ${userId} and revoked_at is null`);
   },
+  // MCP App Connections the person signed in with OAuth, on any server: disconnected as the
+  // Connection's Disconnect does (managedMcpSignedInBy.ts), each under its own credential lease, so
+  // after this transaction. The row, its default flag and its pins stay; API-key ones are untouched.
+  // Only at execution: a request cancelled in its grace period never gets here. A failure throws,
+  // and the next run tries the ones still signed in by the person again.
+  revoke_managed_mcp_sign_ins: async (_tx, { userId }) => ({
+    afterCommit: async () => {
+      await revokeOAuthConnectionsSignedInBy(userId);
+    },
+  }),
 };
 
 type CleanupStep = { name: string; run: (ctx: CleanupContext) => Promise<StepOutcome> };

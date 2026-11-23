@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { SOFT_KEYBOARD_CLOSED_MS, trackVisualViewport } from "../src/utils/visualViewport";
+import { readSoftKeyboardBox, SOFT_KEYBOARD_CLOSED_MS, trackVisualViewport } from "../src/utils/visualViewport";
 
 class FakeStyle {
   private values = new Map<string, string>();
@@ -330,6 +330,29 @@ test("trackVisualViewport never reads the focused element's style inside a focus
     env.flushFrames();
     assert.equal(styleReads, 0, "no keyboard gap: the focused element is never inspected");
     assert.equal(env.style.getPropertyValue("height"), "");
+  } finally {
+    env.restore();
+  }
+});
+
+// A phone's comment sheet is drawn outside #root (raft-ui's Drawer), so it reads where the
+// keyboard's top edge is to sit on it (xxchan, #proj-mobile msg=9e51cd9d).
+test("readSoftKeyboardBox gives the keyboard's top edge only while #root says the keyboard is up", () => {
+  const env = installViewportGlobals({
+    activeElement: new FakeTextAreaElement(),
+    innerHeight: 844,
+    visualHeight: 430,
+  });
+
+  try {
+    assert.equal(readSoftKeyboardBox(), null, "before the page has seen the keyboard");
+    trackVisualViewport();
+    assert.deepEqual(readSoftKeyboardBox(), { bottom: 442, inset: 402, height: 430 });
+
+    env.setActiveElement(null);
+    env.fireVisualViewport("resize");
+    assert.equal(env.dataset.softKeyboard, "closed");
+    assert.equal(readSoftKeyboardBox(), null, "closing is not open");
   } finally {
     env.restore();
   }

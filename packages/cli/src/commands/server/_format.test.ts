@@ -110,7 +110,8 @@ test("formatChannelMembers: full channel member list", () => {
   assert.match(out, /@kuku \(idle\)/);
   assert.match(out, /### Humans/);
   assert.match(out, /Server and stored channel roles are shown separately/);
-  assert.match(out, /@xxchan \(owner\) \[server role=owner, channel role=member, admin via=server_role\] — tech lead/);
+  // A plain member is the default: only a channel admin is marked.
+  assert.match(out, /@xxchan \(owner\) \[server role=owner, admin via=server_role\] — tech lead/);
   assert.match(out, /@alice/);
 });
 
@@ -135,6 +136,32 @@ test("formatChannelMembers: joint roster lists every server a person takes part 
 
   const plain = formatChannelMembers({ channel: { ref: "#all", type: "channel" }, agents: [], humans: [{ name: "local" }] });
   assert.doesNotMatch(plain, /servers/);
+});
+
+test("formatChannelMembers: the channel role the Server sends marks channel admins, agents and people alike", () => {
+  const out = formatChannelMembers({
+    channel: { ref: "#design", type: "channel" },
+    agents: [
+      { name: "kirby", status: "active", role: "member", channelRole: "admin" },
+      { name: "scout", status: "idle", role: "member", channelRole: "member" },
+    ],
+    humans: [
+      { name: "tygg", role: "member", channelRole: "admin" },
+      { name: "boss", role: "owner", channelRole: "member" },
+      { name: "alice", role: "member", channelRole: "member" },
+    ],
+  });
+  assert.match(out, /  - @kirby \(active\) \[channel role=admin\]\n/);
+  assert.match(out, /  - @scout \(idle\)\n/);
+  assert.match(out, /  - @tygg \[channel role=admin\]\n/);
+  assert.match(out, /  - @boss \(owner\)\n/);
+  assert.match(out, /  - @alice\n/);
+
+  // No channel roles (#all, a DM, a thread): the Server sends none, and nothing is added.
+  const all = formatChannelMembers({ channel: { ref: "#all", type: "channel" }, agents: [{ name: "kirby", status: "active" }], humans: [{ name: "tygg", role: "member" }] });
+  assert.doesNotMatch(all, /channel role=/);
+  assert.match(all, /  - @kirby \(active\)\n/);
+  assert.match(all, /  - @tygg\n/);
 });
 
 test("formatChannelMembers: empty members", () => {

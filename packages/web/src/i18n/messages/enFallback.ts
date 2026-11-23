@@ -15,7 +15,7 @@ import type { MessageId } from "./en";
 
 export const enFallback = {
   "agent.runtimeError.rootPrivileges": "Claude Code cannot start with root or sudo privileges while permission checks are disabled. Run Raft Computer as a non-root user, then start the agent again.",
-  "agent.runtimeError.code.authRequired.title": "Sign-in required",
+  "agent.runtimeError.code.authRequired.title": "Sign-in needed",
   "agent.runtimeError.code.billing.title": "Provider balance exhausted",
   "agent.runtimeError.code.inputTooLarge.title": "Input too large",
   "agent.runtimeError.code.messageTooLarge.title": "Message too long",
@@ -25,7 +25,7 @@ export const enFallback = {
   "agent.status.credentialInvalid.billing": "Provider balance exhausted",
   "agent.status.credentialInvalid.planDefaultModel": "Plan doesn't include this model",
   "agent.status.credentialInvalid.planModel": "Plan doesn't include {model}",
-  "agent.status.credentialInvalid.signIn": "Sign-in needed for {runtime}",
+  "agent.status.credentialInvalid.signIn": "Sign in again to {runtime}",
   "activity.live.agentFallback": "Agent",
   "activity.log.freshnessHold.send": "Reading new messages before sending",
   "activity.log.freshnessHold.taskAmend": "Reading new messages before changing the task",

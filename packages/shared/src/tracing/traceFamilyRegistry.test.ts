@@ -20,7 +20,7 @@ import {
 test("trace family registry has live consumers for every registered family", () => {
   assert.deepEqual(
     TRACE_FAMILY_REGISTRY.map((entry) => entry.family),
-    ["slock.state.transition", "slock.state.violation", "slock.client_error", "slock.media_preview.error", "slock.web.boot_timing", "slock.web.shell_keep_failed", "slock.context_view", "slock.open_in_app", "server.db.query"],
+    ["slock.state.transition", "slock.state.violation", "slock.client_error", "slock.media_preview.error", "slock.web.boot_timing", "slock.web.vitals", "slock.web.shell_keep_failed", "slock.web.message_receive", "slock.web.sync_gap_recovered", "slock.context_view", "slock.open_in_app", "slock.attachment.upload_finished", "mobile.thread_open", "mobile.thread_open.shift", "server.db.query"],
   );
 
   for (const registration of TRACE_FAMILY_REGISTRY) {
@@ -41,6 +41,9 @@ test("entity-filterability is declared per family and invalid dimensions fail cl
   assert.deepEqual(traceFamilyRegistration("slock.client_error").entityFilterableDimensions, []);
   assert.deepEqual(traceFamilyRegistration("slock.media_preview.error").entityFilterableDimensions, []);
   assert.deepEqual(traceFamilyRegistration("slock.web.boot_timing").entityFilterableDimensions, []);
+  assert.deepEqual(traceFamilyRegistration("slock.web.vitals").entityFilterableDimensions, []);
+  assert.deepEqual(traceFamilyRegistration("mobile.thread_open").entityFilterableDimensions, []);
+  assert.deepEqual(traceFamilyRegistration("mobile.thread_open.shift").entityFilterableDimensions, []);
   assert.deepEqual(traceFamilyRegistration("server.db.query").entityFilterableDimensions, []);
 
   assert.doesNotThrow(() => assertTraceFamilyEntityFilterable("slock.state.transition", "entityId"));

@@ -400,7 +400,7 @@ test("single-id attachment reads cloak cross-server UUIDs as not found", async (
   for (const url of singleIdPaths(attachmentId)) {
     const res = await fetch(`${app.baseUrl}${url}`, { headers, redirect: "manual" });
     assert.equal(res.status, 404, `${url} must cloak cross-server existence`);
-    assert.deepEqual(await res.json(), { error: "Attachment not found" });
+    assert.deepEqual(await res.json(), { error: "Attachment not found", code: "attachment_not_found", errorCode: "attachment_not_found" });
   }
 
   // The HTML route has two token-specific rejection branches after lookup.
@@ -409,7 +409,7 @@ test("single-id attachment reads cloak cross-server UUIDs as not found", async (
     const url = `/api/attachments/${attachmentId}/html-preview?${query}`;
     const res = await fetch(`${app.baseUrl}${url}`, { headers, redirect: "manual" });
     assert.equal(res.status, 404, `${url} must cloak cross-server existence`);
-    assert.deepEqual(await res.json(), { error: "Attachment not found" });
+    assert.deepEqual(await res.json(), { error: "Attachment not found", code: "attachment_not_found", errorCode: "attachment_not_found" });
   }
 });
 
@@ -499,7 +499,7 @@ test("missing attachment object is a 404, not a 500", async ({ app }) => {
       headers: { Authorization: `Bearer ${token}`, "X-Server-Id": server.id },
     });
     assert.equal(response.status, 404, `missing object must 404, got ${response.status}`);
-    assert.deepEqual(await response.json(), { error: "Attachment not found" });
+    assert.deepEqual(await response.json(), { error: "Attachment not found", code: "attachment_not_found", errorCode: "attachment_not_found" });
   } finally {
     resetStorageForTests();
   }
@@ -1178,7 +1178,7 @@ test("POST /api/attachments/upload rejects zero-byte files", async ({ app }) => 
     body,
   });
   assert.equal(res.status, 400, `expected 400, got ${res.status}`);
-  assert.deepEqual(await res.json(), { error: "Empty files are not allowed" });
+  assert.deepEqual(await res.json(), { error: "Empty files are not allowed", code: "invalid_input", errorCode: "invalid_input" });
 });
 
 test("identical uploads create distinct attachment projections instead of hash-deduping", async () => {

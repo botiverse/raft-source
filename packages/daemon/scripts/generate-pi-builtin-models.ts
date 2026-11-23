@@ -1,10 +1,20 @@
 /**
- * Generate `packages/shared/src/piBuiltinModels.generated.ts` from the
- * `@earendil-works/pi-ai` SDK. The Pi SDK's model registry is the source of
- * truth for Pi-builtin provider model lists; we mirror a curated subset (the
- * providers we surface in the
- * create-agent UI per `BUILTIN_RUNTIME_PROVIDERS` in shared) into a
- * web-importable constant.
+ * Generate `packages/shared/src/piBuiltinModels.generated.ts` from the Pi SDK.
+ * Built-in (Raft's packaged Pi) surfaces every Pi provider whose sign-in is a
+ * single API key: OAR's Pi provider list (`createPiProviderAuth().loginProviders()`)
+ * says which providers take an API key, and running each one's API-key login
+ * against a scratch `auth.json` counts its prompts. Models come from
+ * `@earendil-works/pi-ai`'s model registry, the default model from
+ * `@earendil-works/pi-coding-agent`'s `defaultModelPerProvider`, and the env
+ * var from pi-ai's public `findEnvKeys`.
+ *
+ * A provider is surfaced when it has an API-key login with exactly one prompt
+ * (the key), catalog models, a default model and an https base URL without
+ * credential headers. Every other provider must be named, with its reason, in
+ * `PI_EXCLUDED_PROVIDERS`; an unlisted provider that does not qualify, a
+ * released provider that stops qualifying, or a surfaced set or key variable
+ * other than `EXPECTED_SURFACED_PROVIDER_ENV_KEYS` fails the run, so a Pi bump
+ * that adds or changes providers is reviewed rather than shipped silently.
  *
  * Why this exists: `pi-ai` is Node-only, so the web bundle can't import it
  * directly. Codegen at SDK-bump time gives us SDK fidelity without dragging
@@ -13,6 +23,8 @@
  *
  * Run:
  *   pnpm --filter @botiverse/raft-daemon generate:pi-builtin-models
+ *   pnpm --filter @botiverse/raft-shared generate:runtime-provider-display-names
+ * (the second reads this output for the provider names).
  *
  * CI gate (companion script):
  *   pnpm --filter @botiverse/raft-daemon check:pi-builtin-models-fresh
@@ -20,41 +32,113 @@
  * pushes), not on PRs: rerun the generator in the PR that bumps Pi.
  *
  * Do not edit `packages/shared/src/piBuiltinModels.generated.ts` directly —
- * edit `PI_SURFACED_PROVIDERS` below + rerun this script.
+ * edit the tables below + rerun this script.
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import type { LoginProvider, ProviderAuthFacade, ProviderLoginPrompt } from "@botiverse/oar";
 
-// Providers we surface in the Built-in/Quick Start create-agent UI.
-//
-// Provider API-key env names are verified against Pi 0.80.10 internal source
-// `@earendil-works/pi-ai/dist/env-api-keys.js#getApiKeyEnvVars`. Pi does not
-// expose a public raw `getApiKeyEnvVars(provider)` API yet. Its public
-// `findEnvKeys(provider, env)` is presence-filtered and cannot safely generate
-// a scrub table because unset host keys must still be blocked. Keep this as the
-// single local mirror until Pi exports provider env metadata.
-// TODO: switch this to codegen-read once Pi exports `getApiKeyEnvVars` or the
-// canonical provider env map.
-const PI_SURFACED_PROVIDER_ENVS = {
-  deepseek: { apiKeyEnvKey: "DEEPSEEK_API_KEY" },
-  minimax: { apiKeyEnvKey: "MINIMAX_API_KEY" },
-  "minimax-cn": { apiKeyEnvKey: "MINIMAX_CN_API_KEY" },
-  zai: { apiKeyEnvKey: "ZAI_API_KEY" },
-  "zai-coding-cn": { apiKeyEnvKey: "ZAI_CODING_CN_API_KEY" },
-  moonshotai: { apiKeyEnvKey: "MOONSHOT_API_KEY" },
-  "moonshotai-cn": { apiKeyEnvKey: "MOONSHOT_API_KEY" },
-  "kimi-coding": { apiKeyEnvKey: "KIMI_API_KEY" },
-  "qwen-token-plan": { apiKeyEnvKey: "QWEN_TOKEN_PLAN_API_KEY" },
-  "qwen-token-plan-cn": { apiKeyEnvKey: "QWEN_TOKEN_PLAN_CN_API_KEY" },
-  openrouter: { apiKeyEnvKey: "OPENROUTER_API_KEY" },
-  openai: { apiKeyEnvKey: "OPENAI_API_KEY" },
+/**
+ * Pi providers Built-in does not surface, each with the reason. Every provider
+ * OAR lists is either surfaced or named here.
+ */
+const PI_EXCLUDED_PROVIDERS: Readonly<Record<string, string>> = {
+  "openai-codex": "OAuth sign-in only; there is no API key to enter",
+  "amazon-bedrock": "multi-field credential (asks which AWS credential first); out of scope",
+  "google-vertex": "multi-field credential (asks API key or ADC first, then project/location); out of scope",
+  "cloudflare-workers-ai": "multi-field credential (asks the account id after the key); out of scope",
+  "cloudflare-ai-gateway": "multi-field credential (asks account and gateway ids after the key); out of scope",
+  azure: "multi-field credential (needs a resource/base URL besides the key; its catalog has none); out of scope",
+  typesafe: "Pi ships no catalog models for it",
+  "github-copilot": "a Copilot subscription token sent with fixed editor headers, not an API key",
+  radius: "the account's gateway catalog replaces Pi's shipped list, so the models shown would be wrong",
+  // Built-in owns every surfaced provider's key variable and strips it from an
+  // agent's saved Environment Variables; HF_TOKEN is widely set for the agent's
+  // own Hugging Face tools, so surfacing it would silently remove it there.
+  huggingface: "its key variable HF_TOKEN is commonly set for an agent's own tools; making it Raft-owned would strip it from existing agents",
+};
+
+/**
+ * Providers whose Raft env var is not Pi's only one. Anthropic: Pi also lists
+ * ANTHROPIC_AUTH_TOKEN and ANTHROPIC_OAUTH_TOKEN; Raft has always materialized
+ * the key as ANTHROPIC_API_KEY (and blocks the host's OAuth token).
+ */
+const PI_PROVIDER_ENV_OVERRIDES: Readonly<Record<string, { apiKeyEnvKey: string; blockedHostEnvKeys: readonly string[] }>> = {
   anthropic: { apiKeyEnvKey: "ANTHROPIC_API_KEY", blockedHostEnvKeys: ["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"] },
-  google: { apiKeyEnvKey: "GEMINI_API_KEY" },
-  xai: { apiKeyEnvKey: "XAI_API_KEY" },
-  xiaomi: { apiKeyEnvKey: "XIAOMI_API_KEY" },
-} as const satisfies Record<string, { apiKeyEnvKey: string; blockedHostEnvKeys?: readonly string[] }>;
+};
+
+/**
+ * Providers Built-in already offered before it surfaced every API-key
+ * provider, in their form order (the first is the form's default provider).
+ * Stored agents use them, so one that stops qualifying fails the run. Newer
+ * providers follow, sorted by id.
+ */
+const RELEASED_PROVIDER_ORDER = [
+  "deepseek",
+  "minimax",
+  "minimax-cn",
+  "zai",
+  "zai-coding-cn",
+  "moonshotai",
+  "moonshotai-cn",
+  "kimi-coding",
+  "qwen-token-plan",
+  "qwen-token-plan-cn",
+  "openrouter",
+  "openai",
+  "anthropic",
+  "google",
+  "xai",
+  "xiaomi",
+  "xiaomi-token-plan-cn",
+  "xiaomi-token-plan-sgp",
+  "xiaomi-token-plan-ams",
+] as const;
+
+/**
+ * The surfaced providers and the key variable Raft owns for each, as last
+ * reviewed. A Pi bump that adds, drops or renames any fails the run: each new
+ * key variable becomes Built-in-owned (stripped from agents' saved env vars),
+ * so it needs a look before it ships.
+ */
+const EXPECTED_SURFACED_PROVIDER_ENV_KEYS: Readonly<Record<string, string>> = {
+  "deepseek": "DEEPSEEK_API_KEY",
+  "minimax": "MINIMAX_API_KEY",
+  "minimax-cn": "MINIMAX_CN_API_KEY",
+  "zai": "ZAI_API_KEY",
+  "zai-coding-cn": "ZAI_CODING_CN_API_KEY",
+  "moonshotai": "MOONSHOT_API_KEY",
+  "moonshotai-cn": "MOONSHOT_API_KEY",
+  "kimi-coding": "KIMI_API_KEY",
+  "qwen-token-plan": "QWEN_TOKEN_PLAN_API_KEY",
+  "qwen-token-plan-cn": "QWEN_TOKEN_PLAN_CN_API_KEY",
+  "openrouter": "OPENROUTER_API_KEY",
+  "openai": "OPENAI_API_KEY",
+  "anthropic": "ANTHROPIC_API_KEY",
+  "google": "GEMINI_API_KEY",
+  "xai": "XAI_API_KEY",
+  "xiaomi": "XIAOMI_API_KEY",
+  "xiaomi-token-plan-cn": "XIAOMI_TOKEN_PLAN_CN_API_KEY",
+  "xiaomi-token-plan-sgp": "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
+  "xiaomi-token-plan-ams": "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
+  "ant-ling": "ANT_LING_API_KEY",
+  "baseten": "BASETEN_API_KEY",
+  "cerebras": "CEREBRAS_API_KEY",
+  "fireworks": "FIREWORKS_API_KEY",
+  "groq": "GROQ_API_KEY",
+  "meta": "META_API_KEY",
+  "mistral": "MISTRAL_API_KEY",
+  "nvidia": "NVIDIA_API_KEY",
+  "opencode": "OPENCODE_API_KEY",
+  "opencode-go": "OPENCODE_API_KEY",
+  "qwen-token-plan-individual": "QWEN_TOKEN_PLAN_API_KEY",
+  "qwen-token-plan-individual-cn": "QWEN_TOKEN_PLAN_CN_API_KEY",
+  "together": "TOGETHER_API_KEY",
+  "vercel-ai-gateway": "AI_GATEWAY_API_KEY",
+};
 
 interface GeneratedProvider {
   providerId: string;
@@ -96,9 +180,10 @@ type PiSdkModelsByProvider = Record<string, Record<string, PiSdkModel>>;
 interface PiSdkVersions {
   piAi: string;
   piCodingAgent: string;
+  oar: string;
 }
 
-function loadPackageVersion(packageName: "@earendil-works/pi-ai" | "@earendil-works/pi-coding-agent"): string {
+function loadPackageVersion(packageName: "@earendil-works/pi-ai" | "@earendil-works/pi-coding-agent" | "@botiverse/oar"): string {
   const entryPath = fileURLToPath(import.meta.resolve(packageName));
   const packageJsonPath = resolve(dirname(entryPath), "..", "package.json");
   const manifest = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { version?: unknown };
@@ -112,6 +197,7 @@ function loadPiSdkVersions(): PiSdkVersions {
   return {
     piAi: loadPackageVersion("@earendil-works/pi-ai"),
     piCodingAgent: loadPackageVersion("@earendil-works/pi-coding-agent"),
+    oar: loadPackageVersion("@botiverse/oar"),
   };
 }
 
@@ -223,25 +309,145 @@ function buildModelList(
   return list;
 }
 
+/**
+ * The prompts a provider's API-key login asks, run against a throwaway
+ * `auth.json`: the key prompt is answered with a placeholder and a second
+ * prompt stops the flow (so the count tops out at 2). No network: the facade
+ * runs with model network off and an API-key login only stores the key.
+ */
+async function countApiKeyLoginPrompts(auth: ProviderAuthFacade, providerId: string): Promise<{ count: number; kinds: string[] }> {
+  const kinds: string[] = [];
+  const stop = new Error("second prompt");
+  try {
+    await auth.login(providerId, "api_key", {
+      onEvent: () => {
+        // An API-key login surfaces no URL or device code worth recording here.
+      },
+      prompt: async (prompt: ProviderLoginPrompt) => {
+        await Promise.resolve();
+        kinds.push(prompt.kind);
+        if (kinds.length > 1) throw stop;
+        return prompt.kind === "select" ? prompt.options[0]?.id ?? "" : "raft-codegen-placeholder";
+      },
+    });
+  } catch (error) {
+    if (error !== stop) throw new Error(`Pi API-key login for ${providerId} failed during codegen: ${String(error)}`);
+  }
+  return { count: kinds.length, kinds };
+}
+
+/** OAR's Pi provider list, read on a scratch agent dir so the host's Pi config never leaks in. */
+async function loadPiLoginProviders(): Promise<{ providers: readonly LoginProvider[]; auth: ProviderAuthFacade; cleanup: () => void }> {
+  const scratch = mkdtempSync(join(tmpdir(), "raft-pi-builtin-codegen-"));
+  process.env.OAR_PI_AGENT_DIR = scratch;
+  const { createPiProviderAuth } = await import("@botiverse/oar/runtimes/pi");
+  const auth = await createPiProviderAuth({ authPath: join(scratch, "auth.json"), modelsPath: null });
+  return { providers: auth.loginProviders(), auth, cleanup: () => rmSync(scratch, { recursive: true, force: true }) };
+}
+
+async function loadFindEnvKeys(): Promise<(providerId: string) => string[]> {
+  const { findEnvKeys } = await import("@earendil-works/pi-ai/compat");
+  // findEnvKeys only reports keys present in `env`; an env reporting every key
+  // set yields all the env vars Pi reads for the provider.
+  const everyKeySet = new Proxy({} as Record<string, string>, { get: () => "set", has: () => true });
+  return (providerId) => findEnvKeys(providerId, everyKeySet) ?? [];
+}
+
+/** Why a provider cannot be surfaced, or null when it qualifies. */
+async function disqualification(
+  provider: LoginProvider,
+  auth: ProviderAuthFacade,
+  defaultModelPerProvider: Record<string, string>,
+  modelsByProvider: PiSdkModelsByProvider,
+): Promise<string | null> {
+  const apiKey = provider.methods.find((method) => method.method === "api_key");
+  if (!apiKey) return "no API-key login";
+  if ("ambient" in apiKey && apiKey.ambient) return "API key is configured outside Pi (no login prompt)";
+  const prompts = await countApiKeyLoginPrompts(auth, provider.providerId);
+  if (prompts.count !== 1 || prompts.kinds[0] !== "secret") {
+    return `API-key login asks ${prompts.count === 1 ? "one" : "more than one"} prompt (${prompts.kinds.join(", ")}), not just the key`;
+  }
+  if (Object.keys(modelsByProvider[provider.providerId] ?? {}).length === 0) return "no catalog models";
+  const defaultModelId = defaultModelPerProvider[provider.providerId];
+  if (!defaultModelId) return "no defaultModelPerProvider entry";
+  const defaultModel = modelsByProvider[provider.providerId]?.[defaultModelId];
+  if (!defaultModel?.api || !defaultModel.baseUrl) return `default model ${defaultModelId} has no API/base URL`;
+  return null;
+}
+
 async function buildProviders(): Promise<GeneratedProvider[]> {
   const defaultModelPerProvider = await loadPiDefaultModelPerProvider();
   const modelsByProvider = await loadPiModelsByProvider();
-  const providers: GeneratedProvider[] = [];
-  for (const [providerId, envConfig] of Object.entries(PI_SURFACED_PROVIDER_ENVS)) {
-    const defaultModelId = defaultModelPerProvider[providerId];
-    if (!defaultModelId) {
-      throw new Error(`Pi SDK has no defaultModelPerProvider entry for surfaced provider ${providerId}`);
+  const envKeysOf = await loadFindEnvKeys();
+  const { providers: loginProviders, auth, cleanup } = await loadPiLoginProviders();
+  const surfacedIds: string[] = [];
+  try {
+    const listedIds = new Set(loginProviders.map((provider) => provider.providerId));
+    for (const excludedId of Object.keys(PI_EXCLUDED_PROVIDERS)) {
+      if (!listedIds.has(excludedId)) {
+        throw new Error(`PI_EXCLUDED_PROVIDERS names ${excludedId}, which OAR's Pi provider list no longer has; drop it`);
+      }
     }
-    const apiKeyEnvKey = envConfig.apiKeyEnvKey;
-    const blockedHostEnvKeys = envConfig.blockedHostEnvKeys ?? [apiKeyEnvKey];
+    for (const provider of loginProviders) {
+      if (Object.hasOwn(PI_EXCLUDED_PROVIDERS, provider.providerId)) continue;
+      const reason = await disqualification(provider, auth, defaultModelPerProvider, modelsByProvider);
+      if (reason) {
+        throw new Error(
+          `Pi provider ${provider.providerId} (${provider.name}) cannot be surfaced: ${reason}. `
+          + "Review it and add it to PI_EXCLUDED_PROVIDERS with the reason, or make it qualify.",
+        );
+      }
+      surfacedIds.push(provider.providerId);
+    }
+  } finally {
+    cleanup();
+  }
+
+  const released: readonly string[] = RELEASED_PROVIDER_ORDER;
+  for (const releasedId of released) {
+    if (!surfacedIds.includes(releasedId)) {
+      throw new Error(`Released Built-in provider ${releasedId} no longer qualifies; stored agents use it`);
+    }
+  }
+  const orderedIds = [
+    ...released,
+    ...surfacedIds.filter((id) => !released.includes(id)).sort((left, right) => left.localeCompare(right)),
+  ];
+  const expectedIds = Object.keys(EXPECTED_SURFACED_PROVIDER_ENV_KEYS).sort();
+  if ([...orderedIds].sort().join(",") !== expectedIds.join(",")) {
+    throw new Error(
+      `Surfaced Pi providers changed: ${orderedIds.join(", ")} (expected ${expectedIds.join(", ")}). `
+      + "Review the providers the Pi bump added or dropped, then update EXPECTED_SURFACED_PROVIDER_ENV_KEYS.",
+    );
+  }
+
+  const providers: GeneratedProvider[] = [];
+  for (const providerId of orderedIds) {
+    const defaultModelId = defaultModelPerProvider[providerId]!;
+    const piEnvKeys = envKeysOf(providerId);
+    const override = PI_PROVIDER_ENV_OVERRIDES[providerId];
+    if (override && !piEnvKeys.includes(override.apiKeyEnvKey)) {
+      throw new Error(`Pi no longer reads ${override.apiKeyEnvKey} for ${providerId} (it reads ${piEnvKeys.join(", ") || "none"})`);
+    }
+    if (!override && piEnvKeys.length !== 1) {
+      throw new Error(
+        `Pi reads ${piEnvKeys.length} env vars for ${providerId} (${piEnvKeys.join(", ")}); `
+        + "pick Raft's in PI_PROVIDER_ENV_OVERRIDES",
+      );
+    }
+    const apiKeyEnvKey = override?.apiKeyEnvKey ?? piEnvKeys[0]!;
+    if (apiKeyEnvKey !== EXPECTED_SURFACED_PROVIDER_ENV_KEYS[providerId]) {
+      throw new Error(
+        `${providerId} key variable is ${apiKeyEnvKey}, expected ${EXPECTED_SURFACED_PROVIDER_ENV_KEYS[providerId]}; `
+        + "review it (it becomes Built-in-owned), then update EXPECTED_SURFACED_PROVIDER_ENV_KEYS.",
+      );
+    }
+    const blockedHostEnvKeys = override?.blockedHostEnvKeys ?? [apiKeyEnvKey];
     const models = buildModelList(providerId, defaultModelId, modelsByProvider);
     if (models.length === 0) {
       throw new Error(`No SDK models found for Pi provider ${providerId}`);
     }
-    const defaultModel = modelsByProvider[providerId]?.[defaultModelId];
-    if (!defaultModel?.api || !defaultModel.baseUrl) {
-      throw new Error(`Pi SDK default model ${providerId}/${defaultModelId} has no API/base URL probe metadata`);
-    }
+    const defaultModel = modelsByProvider[providerId]![defaultModelId]!;
     const probeUrl = new URL(defaultModel.baseUrl);
     if (
       probeUrl.protocol !== "https:"
@@ -298,9 +504,9 @@ function buildSource(providers: readonly GeneratedProvider[], versions: PiSdkVer
     "// Do NOT edit by hand. Source:",
     "// - @earendil-works/pi-ai generated model registry",
     "// - @earendil-works/pi-coding-agent defaultModelPerProvider",
-    `// Pi SDK versions: @earendil-works/pi-ai ${versions.piAi}; @earendil-works/pi-coding-agent ${versions.piCodingAgent}.`,
-    "// - local provider env mirror copied from Pi getApiKeyEnvVars until Pi exports raw provider env metadata",
-    "// TODO: switch provider env metadata to codegen-read once Pi exports getApiKeyEnvVars.",
+    "// - @botiverse/oar Pi provider list (every provider whose sign-in is a single API key)",
+    "// - @earendil-works/pi-ai findEnvKeys (provider env vars)",
+    `// Pi SDK versions: @earendil-works/pi-ai ${versions.piAi}; @earendil-works/pi-coding-agent ${versions.piCodingAgent}; @botiverse/oar ${versions.oar}.`,
     "// Regenerate after any Pi SDK bump that affects exposed provider/model metadata.",
     "//",
     "// CI gate (check:pi-builtin-models-fresh) keeps this in sync with the SDK by",

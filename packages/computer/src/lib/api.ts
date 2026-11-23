@@ -26,7 +26,7 @@ import {
   type ResetServiceResult,
   type LegacyMachineCandidate,
 } from "./types";
-import { ServersClient, type UserServerEntry, type UserServersResult } from "../apiClient";
+import { ServersClient, type DevicePairingRequest, type UserServerEntry, type UserServersResult } from "../apiClient";
 import {
   resetRunner as resetRunnerDisk,
   resetService as resetServiceDisk,
@@ -44,7 +44,7 @@ import {
   serviceLogPath,
 } from "../paths";
 import { resolveServerUrl, resolveServerUrlEnv } from "../serverUrl";
-import { login as loginService, type LoginResult } from "../services/login";
+import { login as loginService, type LoginResult, type LoopbackLoginOptions } from "../services/login";
 import { attach as attachService, type AttachResult } from "../services/attach";
 import {
   approveMachine as approveMachineService,
@@ -186,7 +186,7 @@ export interface ComputerApi {
    * the device-code flow; the presenter-supplied `onEvent` sink prints the
    * verification URL/code + waiting lines. The api itself never prints.
    */
-  login(opts: { serverUrl?: string }, onEvent?: (event: ComputerApiEvent) => void): Promise<LoginResult>;
+  login(opts: { serverUrl?: string; loopback?: LoopbackLoginOptions }, onEvent?: (event: ComputerApiEvent) => void): Promise<LoginResult>;
   /** Clear the saved user session (idempotent). Pure: returns a result. */
   logout(onEvent?: (event: ComputerApiEvent) => void, deps?: StopDeps): Promise<LogoutResult>;
   /**
@@ -204,7 +204,7 @@ export interface ComputerApi {
    * grants this falls back to the user-session attach.
    */
   attachWithApproval(
-    opts: { serverSlug: string; serverUrl?: string; name?: string },
+    opts: { serverSlug: string; serverUrl?: string; name?: string; loopback?: LoopbackLoginOptions; pairing?: DevicePairingRequest },
     onEvent?: (event: ComputerApiEvent) => void,
   ): Promise<AttachResult>;
   /**
@@ -223,7 +223,7 @@ export interface ComputerApi {
    * with a user session instead.
    */
   approveMachine(
-    opts: { serverUrl?: string; name?: string },
+    opts: { serverUrl?: string; name?: string; loopback?: LoopbackLoginOptions },
     onEvent?: (event: ComputerApiEvent) => void,
   ): Promise<ApproveMachineResult>;
   /** Start/ensure the Computer service. `onEvent` formats the start lines. */
@@ -354,6 +354,15 @@ export interface CreateComputerApiOptions {
  * injects a `computer.cli` trace-client, the menu-bar a `computer.menu-bar`
  * one — so the same lib code attributes correctly across both surfaces.
  */
+/** The service options of an approval: the event sink and, from a terminal adapter, the loopback offer and `--pair`. */
+function loginOptions(
+  loopback: LoopbackLoginOptions | undefined,
+  onEvent: ((event: ComputerApiEvent) => void) | undefined,
+  pairing?: DevicePairingRequest,
+): { onEvent?: (event: ComputerApiEvent) => void; loopback?: LoopbackLoginOptions; pairing?: DevicePairingRequest } {
+  return { ...(onEvent ? { onEvent } : {}), ...(loopback ? { loopback } : {}), ...(pairing ? { pairing } : {}) };
+}
+
 export function createComputerApi(slockHome: string, opts?: CreateComputerApiOptions): ComputerApi {
   const tracer = opts?.tracer ?? noopTracer;
   const configuredHostLifecycleOwner = opts?.hostLifecycleOwner ?? "none";
@@ -411,7 +420,7 @@ export function createComputerApi(slockHome: string, opts?: CreateComputerApiOpt
 
     login(opts, onEvent): Promise<LoginResult> {
       return viaService(() =>
-        loginService({ serverUrl: opts.serverUrl, slockHome }, onEvent ? { onEvent } : {}),
+        loginService({ serverUrl: opts.serverUrl, slockHome }, loginOptions(opts.loopback, onEvent)),
       );
     },
 
@@ -465,7 +474,7 @@ export function createComputerApi(slockHome: string, opts?: CreateComputerApiOpt
       return viaService(() =>
         attachWithApprovalService(
           { serverSlug: opts.serverSlug, serverUrl: opts.serverUrl, name: opts.name, slockHome },
-          onEvent ? { onEvent } : {},
+          loginOptions(opts.loopback, onEvent, opts.pairing),
         ),
       );
     },
@@ -490,7 +499,7 @@ export function createComputerApi(slockHome: string, opts?: CreateComputerApiOpt
       return viaService(() =>
         approveMachineService(
           { serverUrl: opts.serverUrl, name: opts.name, slockHome },
-          onEvent ? { onEvent } : {},
+          loginOptions(opts.loopback, onEvent),
         ),
       );
     },

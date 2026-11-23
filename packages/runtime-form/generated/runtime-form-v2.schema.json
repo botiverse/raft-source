@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "Generated from packages/runtime-form/contract/runtime-form-v2.contract.json (sha256 3cb5909f1162bb26). Do not edit.",
+  "$comment": "Generated from packages/runtime-form/contract/runtime-form-v2.contract.json (sha256 6c5557d2bb7ac919). Do not edit.",
   "$defs": {
     "Definition": {
       "type": "object",
@@ -412,7 +412,9 @@
             "missing_config",
             "no_models",
             "unsupported",
-            "machine_offline"
+            "machine_offline",
+            "not_signed_in",
+            "runtime_outdated"
           ]
         },
         "retryable": {
@@ -461,6 +463,12 @@
         },
         "defaultReasoningEffort": {
           "type": "string"
+        },
+        "reasoningEffortUnavailableReason": {
+          "type": "string"
+        },
+        "reasoningEffortNone": {
+          "type": "boolean"
         },
         "connectionId": {
           "type": "string"

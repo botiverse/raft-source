@@ -25,6 +25,12 @@ return {n, ttl}`;
 export interface FixedWindowCounter {
   /** Spends `units` (default one) of `name`'s window of `windowSeconds`; refused once more than `limit` were spent in it. */
   admit(name: string, limit: number, windowSeconds: number, nowMs?: number, units?: number): Promise<FixedWindowAdmission>;
+  /**
+   * Spends `units` of `name`'s window and answers how many of them fit under
+   * `limit` (0 to `units`): a partial budget, for work that can do part of a
+   * batch (the rest still counts as spent).
+   */
+  grant(name: string, limit: number, windowSeconds: number, units: number, nowMs?: number): Promise<number>;
   /** Tests only: forget this process's counts. */
   clear(): void;
 }
@@ -43,21 +49,24 @@ export function createFixedWindowCounter(): FixedWindowCounter {
     }
     return [entry.count, (entry.resetAtMs - nowMs) / 1000];
   };
+  const count = async (name: string, windowSeconds: number, nowMs: number, spend: number): Promise<[number, number]> => {
+    if (!isRedisAvailable()) return countInMemory(name, windowSeconds, nowMs, spend);
+    try {
+      const result = await getRedis().eval(COUNT, 1, name, String(windowSeconds), String(spend)) as [number, number];
+      return [Number(result[0]), Number(result[1])];
+    } catch {
+      return countInMemory(name, windowSeconds, nowMs, spend);
+    }
+  };
   return {
     async admit(name, limit, windowSeconds, nowMs = Date.now(), units = 1) {
+      const [spent, ttlSeconds] = await count(name, windowSeconds, nowMs, Math.max(1, Math.floor(units)));
+      return spent <= limit ? { admitted: true } : { admitted: false, retryAfterSeconds: Math.max(1, Math.ceil(ttlSeconds)) };
+    },
+    async grant(name, limit, windowSeconds, units, nowMs = Date.now()) {
       const spend = Math.max(1, Math.floor(units));
-      let count: number; let ttlSeconds: number;
-      if (isRedisAvailable()) {
-        try {
-          const result = await getRedis().eval(COUNT, 1, name, String(windowSeconds), String(spend)) as [number, number];
-          [count, ttlSeconds] = [Number(result[0]), Number(result[1])];
-        } catch {
-          [count, ttlSeconds] = countInMemory(name, windowSeconds, nowMs, spend);
-        }
-      } else {
-        [count, ttlSeconds] = countInMemory(name, windowSeconds, nowMs, spend);
-      }
-      return count <= limit ? { admitted: true } : { admitted: false, retryAfterSeconds: Math.max(1, Math.ceil(ttlSeconds)) };
+      const [spent] = await count(name, windowSeconds, nowMs, spend);
+      return Math.min(spend, Math.max(0, limit - (spent - spend)));
     },
     clear: () => memory.clear(),
   };

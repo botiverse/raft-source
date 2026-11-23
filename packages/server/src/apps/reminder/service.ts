@@ -7,6 +7,7 @@ import type {
   ReminderSummary,
   ReminderStatus,
   RaftTargetString,
+  ServerId,
 } from "@botiverse/raft-shared";
 import { formatRaftChannelTaskRef, isSubConversationType } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../../db/index";
@@ -14,6 +15,7 @@ import { agents, machines, reminders, reminderEvents, servers, messages, channel
 import { reminderSourceAcknowledgements } from "./sourceAckSchema";
 import * as channelService from "../../services/channelService";
 import * as messageService from "../../services/messageService";
+import { localConversationIds } from "../../platform/conversations";
 import type { AgentOrchestrator } from "../../services/agentOrchestrator";
 import { getConfiguredAppUrl } from "../../config/appUrl";
 import {
@@ -1339,10 +1341,22 @@ async function resolveLegacyReminderWakeChannelId(
   if (isOnboardingDay2Reminder(row)) return resolveOnboardingOwnerChannelId(row, opts);
   if (!row.msgId) return null;
   const [anchor] = await getExecutor(opts)
-    .select({ channelId: messages.channelId })
+    .select({ channelId: messages.channelId, channelType: channels.type, serverKind: servers.kind })
     .from(messages)
+    .innerJoin(channels, eq(channels.id, messages.channelId))
+    .innerJoin(servers, eq(servers.id, channels.serverId))
     .where(eq(messages.id, row.msgId));
-  return anchor?.channelId ?? null;
+  if (!anchor) return null;
+  if (anchor.serverKind !== "joint_storage") return anchor.channelId;
+  // A joint's message is stored in the joint's storage channel (a joint
+  // thread's in its storage thread): the wake names the owner server's
+  // projection of it, as the agent reads it there. With none (the server left
+  // the joint) the wake keeps the stored channel, as before.
+  if (isSubConversationType(anchor.channelType)) {
+    const [projection] = await channelService.getActiveJointThreadProjectionsByCanonicalThreadsForServer([anchor.channelId], row.serverId, getExecutor(opts));
+    return projection?.localThreadChannelId ?? anchor.channelId;
+  }
+  return (await localConversationIds(row.serverId as ServerId, [anchor.channelId])).get(anchor.channelId) ?? anchor.channelId;
 }
 
 async function buildLegacyReminderWakeContent(
@@ -1416,6 +1430,13 @@ interface PermalinkContext {
 }
 
 interface MessageAnchor {
+  /**
+   * The top-level channel the anchor is named by (the message's own, a
+   * thread's parent) when it is a joint's storage channel (a channel of a
+   * `joint_storage` server): never shown as it is, only by the recipient
+   * server's projection of it (projectJointAnchors).
+   */
+  storageChannelId: string | null;
   messageId: string;
   channelId: string;
   channelType: "channel" | "private" | "joint" | "dm" | "thread";
@@ -1446,6 +1467,8 @@ export async function resolveAnchors(
 
   const parentMessages = alias(messages, "parent_messages");
   const parentChannels = alias(channels, "parent_channels");
+  const channelServers = alias(servers, "channel_servers");
+  const parentChannelServers = alias(servers, "parent_channel_servers");
 
   const anchors = await db
     .select({
@@ -1460,18 +1483,26 @@ export async function resolveAnchors(
       parentChannelName: parentChannels.name,
       parentChannelDeletedAt: parentChannels.deletedAt,
       channelTaskId: channels.taskId,
+      channelServerKind: channelServers.kind,
+      parentChannelServerKind: parentChannelServers.kind,
     })
     .from(messages)
     .innerJoin(channels, eq(messages.channelId, channels.id))
+    .leftJoin(channelServers, eq(channelServers.id, channels.serverId))
     .leftJoin(parentMessages, eq(parentMessages.id, channels.parentMessageId))
     .leftJoin(parentChannels, eq(parentChannels.id, parentMessages.channelId))
+    .leftJoin(parentChannelServers, eq(parentChannelServers.id, parentChannels.serverId))
     .where(inArray(messages.id, msgIds));
 
   const byMsgId = new Map<string, MessageAnchor>();
   for (const a of anchors) {
     if (a.channelDeletedAt) continue;
     if (a.channelType === "thread" && a.parentChannelDeletedAt) continue;
+    const storageChannelId = a.channelType === "thread"
+      ? (a.parentChannelServerKind === "joint_storage" ? a.parentChannelId : null)
+      : (a.channelServerKind === "joint_storage" ? a.channelId : null);
     byMsgId.set(a.messageId, {
+      storageChannelId,
       messageId: a.messageId,
       channelId: a.channelId,
       channelType: a.channelType as "channel" | "private" | "joint" | "dm" | "thread",
@@ -1484,6 +1515,7 @@ export async function resolveAnchors(
   }
 
   const taskAnchors = await resolveTaskConversationAnchors(rows, anchors, db);
+  const jointAnchors = await projectJointAnchors(rows, byMsgId, db);
   for (const r of rows) {
     if (!r.msgId) continue;
     const taskAnchor = taskAnchors.get(r.id);
@@ -1501,7 +1533,10 @@ export async function resolveAnchors(
       });
       continue;
     }
-    const anchor = byMsgId.get(r.msgId);
+    const stored = byMsgId.get(r.msgId);
+    // A joint's message by the recipient server's projection; none when that
+    // server has no active projection (never the storage channel's name or id).
+    const anchor = stored?.storageChannelId ? jointAnchors.get(r.id) : stored;
     if (!anchor) continue;
     result.set(r.id, {
       msgRef: formatMsgRef(anchor, r.msgId),
@@ -1509,6 +1544,52 @@ export async function resolveAnchors(
     });
   }
   return result;
+}
+
+/**
+ * Anchors in a joint (their message, or a thread's parent, stored in the
+ * joint's storage channel) as the reminder's server has them: the storage
+ * channel replaced by that server's active projection of it (platform
+ * localConversationIds), its name and type; absent when the server has none.
+ * By reminder, since the projection is the reminder's server's. No query when
+ * no anchor is a joint's.
+ */
+async function projectJointAnchors(
+  rows: ReminderRow[],
+  byMsgId: ReadonlyMap<string, MessageAnchor>,
+  db: DatabaseExecutor,
+): Promise<Map<string, MessageAnchor>> {
+  const out = new Map<string, MessageAnchor>();
+  const storageIdsByServer = new Map<string, Set<string>>();
+  for (const r of rows) {
+    const storageChannelId = r.msgId ? byMsgId.get(r.msgId)?.storageChannelId : null;
+    if (!storageChannelId) continue;
+    const ids = storageIdsByServer.get(r.serverId) ?? new Set<string>();
+    ids.add(storageChannelId);
+    storageIdsByServer.set(r.serverId, ids);
+  }
+  if (storageIdsByServer.size === 0) return out;
+  const localByServer = new Map<string, Map<string, string>>();
+  for (const [serverId, ids] of storageIdsByServer) {
+    localByServer.set(serverId, await localConversationIds(serverId as ServerId, [...ids]));
+  }
+  const localIds = [...new Set([...localByServer.values()].flatMap((local) => [...local.values()]))];
+  const projections = localIds.length === 0 ? [] : await db
+    .select({ id: channels.id, name: channels.name, type: channels.type })
+    .from(channels)
+    .where(and(inArray(channels.id, localIds), isNull(channels.deletedAt)));
+  const projectionById = new Map(projections.map((projection) => [projection.id, projection]));
+  for (const r of rows) {
+    const anchor = r.msgId ? byMsgId.get(r.msgId) : undefined;
+    if (!anchor?.storageChannelId) continue;
+    const projection = projectionById.get(localByServer.get(r.serverId)?.get(anchor.storageChannelId) ?? "");
+    if (!projection) continue;
+    const type = projection.type as NonNullable<MessageAnchor["parentChannelType"]>;
+    out.set(r.id, anchor.channelType === "thread"
+      ? { ...anchor, parentChannelId: projection.id, parentChannelType: type, parentChannelName: projection.name }
+      : { ...anchor, channelId: projection.id, channelType: type, channelName: projection.name });
+  }
+  return out;
 }
 
 /**
@@ -1570,7 +1651,7 @@ async function resolveTaskConversationAnchors(
 
 function formatMsgRef(anchor: MessageAnchor, messageId: string): RaftTargetString {
   const shortId = messageId.slice(0, 8);
-  if ((anchor.channelType === "channel" || anchor.channelType === "private") && anchor.channelName) {
+  if ((anchor.channelType === "channel" || anchor.channelType === "private" || anchor.channelType === "joint") && anchor.channelName) {
     return `#${anchor.channelName}:${shortId}`;
   }
   if (anchor.channelType === "thread") {

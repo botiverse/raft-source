@@ -369,7 +369,7 @@ function biggest(name: number, prose: number, scope: number, groups: number): Re
     },
     "integration:connect_mcp": { action: { ...FIXTURES["integration:connect_mcp"].action, draftHint: text(2000) }, result: FIXTURES["integration:connect_mcp"].result },
     "feedback:submit": { action: { type: "feedback:submit", feedbackType: "idea", message: text(10_000), draftHint: text(2000) }, result: FIXTURES["feedback:submit"].result },
-    "plan:upgrade": { action: { type: "plan:upgrade", reason: text(200), gate: "joint_channel_over_limit" }, result: null },
+    "plan:upgrade": { action: { type: "plan:upgrade", reason: text(200), gate: "history_30d" }, result: null },
     "agent:migrate": { action: { ...FIXTURES["agent:migrate"].action, draftHint: text(2000) }, result: FIXTURES["agent:migrate"].result },
   } as Record<ActionCardActionType, { action: ActionCardAction; result: ActionCardResult | null }>;
   return Object.fromEntries(Object.entries(big).map(([type, fixture]) => [type, { ...fixture, ctx }])) as ReturnType<typeof biggest>;

@@ -49,7 +49,7 @@ import { ensureTaskConversation } from "../services/taskConversationService";
 import { createTasks } from "../services/taskService";
 import { createApiTest } from "../test/integration/apiTest";
 import { enableTaskV2ConversationsForServer } from "../test/integration/taskV2Flag";
-import { captureEmails, enableExternalChannelsFlag, login, seedUser, sha256 } from "../test/externalInviteFixture";
+import { captureEmails, enableExternalChannelsFlag, login, seedUser, sha256, tokenOf } from "../test/externalInviteFixture";
 
 // Joint membership sources recorded by one external invite (the operation)
 // in computed membership mode (externalInviteConnectService, "Membership
@@ -1062,4 +1062,125 @@ test("connecting one's own server again after leaving and rejoining (a new gener
   assert.equal(await admissionRow(jointId, admin.id, rejoined, s.id), null, "no source of the new membership");
   assert.equal((await projectionOn(room.id, s.id)), null, "not connected");
   assert.deepEqual(await readmittedEvents(), []);
+});
+
+// ── An emailed invite accepted by someone already in the channel (Invite to connect) ──
+
+/**
+ * The host's owner sends, through the route, an invite to `member` (a member
+ * of the host, not in the room yet) with "Invite to connect" checked: they
+ * are added to the room directly and emailed an ordinary invite. Its token.
+ */
+async function inviteMemberToConnect(baseUrl: string, host: Host, roomId: string, member: Person): Promise<{ id: string; token: string }> {
+  const mail = captureEmails();
+  try {
+    await expectStatus(await call(baseUrl, host.owner, "POST", `channels/${roomId}/external-invites`,
+      { emails: [member.email], connectInviteMemberEmails: [member.email] }, host.server.id), 200);
+    const token = tokenOf(mail.deliveries.find((delivery) => delivery.to === member.email)!);
+    const [row] = await getDb().select({ id: channelExternalInvites.id }).from(channelExternalInvites).where(eq(channelExternalInvites.tokenHash, sha256(token)));
+    return { id: row!.id, token };
+  } finally {
+    mail.stop();
+  }
+}
+
+async function hostMember(baseUrl: string, host: Host, label: string) {
+  const member = await person(baseUrl, label);
+  await getDb().insert(serverMembers).values({ serverId: host.server.id, userId: member.id, role: "member" });
+  return member;
+}
+
+/**
+ * With joint_source_exit_v1 on, `member` leaves the host server: still in the
+ * joint (the same membership) through `server`, whose source keeps them, as a
+ * member's self_connect's does; a witness with the host as their only source
+ * is removed by the same leave.
+ */
+async function leaveHostKeptThrough(baseUrl: string, host: Host, roomId: string, member: Person, server: { id: string }, generation: number) {
+  const jointId = await jointOf(roomId);
+  const witness = await hostMember(baseUrl, host, "src-mi-witness");
+  await addHuman(roomId, witness.id);
+  assert.ok(await memberOf(jointId, witness.id));
+  await sourceExit(true);
+  await removeMember(host.server.id, member.id, { reason: "left", actorUserId: member.id });
+  await removeMember(host.server.id, witness.id, { reason: "left", actorUserId: witness.id });
+  assert.equal(await memberOf(jointId, witness.id), null, "witness: the host was their only source");
+  assert.equal((await memberOf(jointId, member.id))?.generation, generation, "still in the joint, the same membership");
+  const local = (await projectionOn(roomId, server.id))!.localChannelId;
+  assert.equal(await canUserAccessChannel(local, member.id, asServerId(server.id)), true, "entered through the server they connected");
+}
+
+test("Invite to connect, a private channel: the member (in the channel) connects a server they own; the conversion's membership is the operation's (member_at_start), the server a source of it; leaving the host keeps them in through it", async ({ app }) => {
+  const host = await seedHost(app.baseUrl);
+  const member = await hostMember(app.baseUrl, host, "src-mi-private");
+  const s = await seedTarget(member);
+  const room = await host.room();
+  const invite = await inviteMemberToConnect(app.baseUrl, host, room.id, member);
+  assert.equal((await inviteRow(invite.id)).sentToHostMember, true);
+
+  await expectStatus(await quietly(() => call(app.baseUrl, member, "POST", `external-invites/${invite.token}/connect`, { serverId: s.id })), 202);
+  assert.equal((await inviteRow(invite.id)).sourceState, "awaiting_joint_creation", "bound to the membership its conversion writes");
+  await quietly(() => driveWorker(invite.id));
+  const jointId = await jointOf(room.id);
+  const generation = (await memberOf(jointId, member.id))!.generation;
+  const row = await inviteRow(invite.id);
+  assert.deepEqual({ status: row.status, state: row.sourceState, generation: row.sourceGeneration }, { status: "accepted", state: "member_at_start", generation });
+  assert.deepEqual((await sourcesOf(jointId, member.id)).filter((entry) => entry.serverId === s.id), [source(s.id, generation, member.id)]);
+
+  await leaveHostKeptThrough(app.baseUrl, host, room.id, member, s, generation);
+});
+
+test("Invite to connect, a joint channel: the member connects directly; the server is a source of the membership they had", async ({ app }) => {
+  const host = await seedHost(app.baseUrl);
+  const member = await hostMember(app.baseUrl, host, "src-mi-joint");
+  const s = await seedTarget(member);
+  const room = await host.room();
+  await convertToJoint(host, room.id);
+  const invite = await inviteMemberToConnect(app.baseUrl, host, room.id, member);
+  const jointId = await jointOf(room.id);
+  const generation = (await memberOf(jointId, member.id))!.generation;
+
+  await expectStatus(await quietly(() => call(app.baseUrl, member, "POST", `external-invites/${invite.token}/connect`, { serverId: s.id })), 200);
+  const row = await inviteRow(invite.id);
+  assert.deepEqual({ status: row.status, state: row.sourceState, generation: row.sourceGeneration }, { status: "accepted", state: "member_at_start", generation });
+  assert.equal((await memberOf(jointId, member.id))?.generation, generation, "no new membership");
+  assert.deepEqual((await sourcesOf(jointId, member.id)).filter((entry) => entry.serverId === s.id), [source(s.id, generation, member.id)]);
+
+  await leaveHostKeptThrough(app.baseUrl, host, room.id, member, s, generation);
+});
+
+test("Invite to connect through an approval (a server the member only belongs to): once approved, the server is a source of the membership the conversion made (admitted by the approver)", async ({ app }) => {
+  const host = await seedHost(app.baseUrl);
+  const member = await hostMember(app.baseUrl, host, "src-mi-approval");
+  const approver = await person(app.baseUrl, "src-mi-approver");
+  const m = await seedTarget(approver, [[member, "member"]]);
+  const room = await host.room();
+  const invite = await inviteMemberToConnect(app.baseUrl, host, room.id, member);
+
+  const outcomes = outcomesOf(await expectStatus(await connectServers(app.baseUrl, member, invite.token, [{ serverId: m.id, approverUserId: approver.id }]), 200));
+  assert.equal(outcomes[m.id]!.state, "awaiting_approval");
+  await expectStatus(await approve(app.baseUrl, approver, outcomes[m.id]!.requestId!), 202);
+  await quietly(() => driveWorker(invite.id));
+  const jointId = await jointOf(room.id);
+  const generation = (await memberOf(jointId, member.id))!.generation;
+  assert.deepEqual({ state: (await inviteRow(invite.id)).sourceState, generation: (await inviteRow(invite.id)).sourceGeneration }, { state: "member_at_start", generation });
+  assert.deepEqual((await sourcesOf(jointId, member.id)).filter((entry) => entry.serverId === m.id), [source(m.id, generation, approver.id)]);
+
+  await leaveHostKeptThrough(app.baseUrl, host, room.id, member, m, generation);
+});
+
+test("Invite to connect by creating a new server: the new server is a source of the member's membership", async ({ app }) => {
+  const host = await seedHost(app.baseUrl);
+  const member = await hostMember(app.baseUrl, host, "src-mi-new");
+  const room = await host.room();
+  const invite = await inviteMemberToConnect(app.baseUrl, host, room.id, member);
+
+  const created = await expectStatus(await quietly(() => call(app.baseUrl, member, "POST", `external-invites/${invite.token}/connect-new-server`,
+    { name: "Member's New Server", slug: `src-mi-new-${randomBytes(4).toString("hex")}` })), 202);
+  const serverId = created.serverId as string;
+  await quietly(() => driveWorker(invite.id));
+  const jointId = await jointOf(room.id);
+  const generation = (await memberOf(jointId, member.id))!.generation;
+  assert.deepEqual({ outcome: (await inviteRow(invite.id)).outcome, state: (await inviteRow(invite.id)).sourceState }, { outcome: "new_server", state: "member_at_start" });
+  assert.deepEqual((await sourcesOf(jointId, member.id)).filter((entry) => entry.serverId === serverId), [source(serverId, generation, member.id)]);
 });

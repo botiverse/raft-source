@@ -13,6 +13,9 @@
 //      `cursor`; while `hasMore`, call again at once with the new cursor.
 //   3. `reset` set: drop the cursor's state, take `reset.snapshots`, continue
 //      from the returned cursor (`changes` is empty).
+//   4. inbox_row capability (`capabilities=inbox_row`, SyncInboxRowChange):
+//      apply `inbox_row` changes to the held Activity rows; `inboxReset` set:
+//      retake the inbox snapshot (`changes` still apply).
 //
 // Pull failures (web syncChangesClient.ts and the mobile app follow this, so a
 // deploy rollout does not send every open client into a full reload at once):
@@ -37,6 +40,14 @@
 //     SyncSnapshotName, or for `message` / `task` the list it belongs to);
 //   - an unknown snapshot name in a list: take every snapshot you know.
 // New entities, ops and fields are added, never renamed or removed.
+//
+// Cursor rollback (inbox_row capability): a capable cursor carries a message
+// position (`c1.<seq>.<h>.m<mseq>.<mh>`). A server from before it answers such
+// a cursor 400 `invalid_cursor`, so a client drops it and takes every snapshot
+// (above): a rollback costs one full resync per client, never lost changes.
+// Order: turn the server flag sync_inbox_rows_v0 off first (no new cursor
+// carries a position; a server with the flag off still accepts one and
+// answers without it), then roll the server back.
 
 /** Opaque position in the change log. Echo it back unchanged; never parse or compare it. */
 export type SyncChangesCursor = string & { readonly __brand: "SyncChangesCursor" };
@@ -118,7 +129,7 @@ export const SYNC_CHANNEL_SCOPE_SNAPSHOTS = ["channels", "channel_members", "inb
  */
 export type SyncRowEntity = "channel" | "channel_member" | "server_member" | "agent" | "machine" | "sidebar_order" | "server_order" | "message" | "task";
 
-export type SyncEntity = SyncRowEntity | "conversation" | "scope";
+export type SyncEntity = SyncRowEntity | "conversation" | "scope" | "inbox_row";
 
 /**
  * The row type per entity. The rows are the list endpoints' items, which
@@ -159,6 +170,12 @@ export type SyncTaskResnapshot = { seq: number; entity: "task"; id: string; op: 
  *   (see SyncConversationDoneState for how to apply it to a list row).
  * - follow: the viewer's follow of a thread or task conversation; `threadDone`
  *   = that thread marked done.
+ *
+ * inbox_row capability only: also when the conversation's Activity row
+ * changed for a reason none of the kinds covers (a mention Done, a mute or
+ * unmute, a retracted message), with no sub-object for it and refSeq null (or
+ * the group's read position). Usually with an `inbox_row` for the same id;
+ * without one, re-read the row via ?ids= (SyncInboxRowChange).
  */
 export type SyncConversationChange = {
   seq: number;
@@ -207,7 +224,47 @@ export type SyncScopeChange = {
   snapshots: SyncSnapshotName[];
 };
 
-export type SyncChange<Rows extends SyncRowTypes = SyncRowTypes> = SyncRowChange<Rows> | SyncConversationChange | SyncScopeChange;
+/**
+ * The capability a client names in GET /api/sync/changes?capabilities=<list>
+ * (comma-separated; unknown names are ignored) to receive `inbox_row` changes
+ * and `inboxReset`. Served only where the server's `sync_inbox_rows_v0` flag is
+ * on; without the capability (or with the flag off) the response is exactly as
+ * before. Guests get nothing new (their inbox is not read from RisingWave).
+ */
+export const SYNC_CAPABILITY_INBOX_ROW = "inbox_row";
+
+/**
+ * One Activity row (inbox_row capability): `id` = the row's own id, as
+ * GET /api/channels/inbox?ids= takes it (a channel / DM row's channelId, a
+ * thread / task row's threadChannelId). At most one change per id per response.
+ *
+ * - upsert: `row` is that row as GET /api/channels/inbox?ids=<id> answers it
+ *   now (byte for byte). Apply it as that answer: the same merge
+ *   (reduceActivityRow's `answer`, readSeq kept as the higher of the two). An
+ *   upsert whose `row.latestActivitySeq` is below the held row's is ignored;
+ *   equal replaces. `source`: `log` = rebuilt for a change_log change (a read,
+ *   Done, a mention Done, follow, leave, mute / unmute, a retracted message,
+ *   the channel renamed, the task's status); `message` = rebuilt because a
+ *   new message reached it.
+ * - delete: the row left the inbox. `reason`: `done` (marked Done, or a
+ *   mention Done; `position` = the Done's frontier: the conversation's latest
+ *   seq when it was done) or `left` (the viewer lost the conversation, or it
+ *   was archived or deleted; `position` null). Apply it when `position` is null
+ *   or position >= the held row's latestActivitySeq (as BigInt); otherwise a
+ *   newer message brought the row back: keep it.
+ *
+ * Changes of `conversation` keep coming as before, usually with an
+ * `inbox_row` for the same id. A `conversation` change with no `inbox_row`
+ * for its id in the same response: re-read it via ?ids= as before.
+ * Shared apply: applySyncInboxRowChange (activityRowPosition.ts).
+ */
+export type SyncInboxRowChange<Row extends object = object> =
+  | { seq: number; entity: "inbox_row"; id: string; op: "upsert"; row: Row; source: "log" | "message" }
+  | SyncInboxRowDelete;
+
+export type SyncInboxRowDelete = { seq: number; entity: "inbox_row"; id: string; op: "delete"; position: string | null; reason: "done" | "left" };
+
+export type SyncChange<Rows extends SyncRowTypes = SyncRowTypes> = SyncRowChange<Rows> | SyncConversationChange | SyncScopeChange | SyncInboxRowChange;
 
 /**
  * - too_old: the cursor is older than the change log keeps (7 days).
@@ -222,4 +279,28 @@ export type SyncChangesResponse<Rows extends SyncRowTypes = SyncRowTypes> = {
   hasMore: boolean;
   changes: SyncChange<Rows>[];
   reset: null | { reason: SyncResetReason; snapshots: SyncSnapshotName[] };
+  /**
+   * inbox_row capability only (absent otherwise): retake the inbox snapshot.
+   * `changes` still apply (it does not empty them); the cursor continues.
+   * - init: the cursor came without a message position (a cursor from before
+   *   the capability); the response's cursor has one now.
+   * - too_many: more inbox rows changed by messages than one pull pages through.
+   * - held_too_long: a row's newest message, or the viewer's own change of it
+   *   (a Done, a mute), has not reached the inbox read model within 30 s. Comes with `retryAfterMs`: take the snapshot after
+   *   that delay (the snapshot is read from the same lagging read model).
+   */
+  inboxReset?: SyncInboxReset | null;
+  /**
+   * inbox_row capability only, present only while the server holds back a row
+   * whose read model has not caught up with its newest message or with the
+   * viewer's own change of it (a Done, a mute; the changes after that one wait
+   * with it, so the cursor stays before it): pull again
+   * (from `cursor`) after about this many milliseconds, even without a new
+   * event. Not `hasMore`: the row is not ready yet, so pulling at once would loop.
+   * With inboxReset held_too_long: take the inbox snapshot after this delay.
+   */
+  retryAfterMs?: number;
 };
+
+export type SyncInboxResetReason = "init" | "too_many" | "held_too_long";
+export type SyncInboxReset = { reason: SyncInboxResetReason; snapshots: ["inbox"] };

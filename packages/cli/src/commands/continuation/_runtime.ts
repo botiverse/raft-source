@@ -22,6 +22,8 @@ import type { Readable } from "node:stream";
 import type { ContinuationRefusalView } from "@botiverse/raft-shared/src/agentText/continuations";
 import {
   CONTINUATION_PAUSED_EXIT_CODE,
+  continuationAnswerToolOffered,
+  continuationAnswerVia,
   ContinuationStepError,
   DEFAULT_CONTINUATION_RESULT_RETENTION_MS,
   DEFAULT_CONTINUATION_TTL_MS,
@@ -206,7 +208,13 @@ interface Session {
   trace: ContinuationTraceScope;
 }
 
-function openSession(ctx: CommandContext, options: CliContinuationOptions | undefined, commands: readonly CliContinuationCommand[]): Session {
+/** `answering`: this call answers a continuation (`raft __continue`), so its spans say how the answer came in. */
+function openSession(
+  ctx: CommandContext,
+  options: CliContinuationOptions | undefined,
+  commands: readonly CliContinuationCommand[],
+  answering = false,
+): Session {
   const agentContext = ctx.loadAgentContext();
   const storeTrace: StoreTrace = { runStarted: false };
   const store = guardStore((options?.store ?? createCliContinuationStore)(agentContext.agentId, ctx.env), storeTrace);
@@ -224,7 +232,12 @@ function openSession(ctx: CommandContext, options: CliContinuationOptions | unde
       ...(options?.now ? { now: options.now } : {}),
     },
     now: options?.now ?? Date.now,
-    trace: { agentId: agentContext.agentId, serverId: agentContext.serverId, env: ctx.env },
+    trace: {
+      agentId: agentContext.agentId,
+      serverId: agentContext.serverId,
+      env: ctx.env,
+      ...(answering ? { via: continuationAnswerVia(ctx.env) } : {}),
+    },
   };
 }
 
@@ -268,7 +281,9 @@ async function pause(
   chain: { rootId: string; command: string },
   entry: CliContinuationCommand | undefined,
 ): Promise<never> {
-  writeText(session.io, formatContinuationPausedOutput({ id: continuation.id, ask: continuation.ask, expiresAt: continuation.expiresAt }), NL);
+  // The launch offers the daemon's answer tool (RAFT_CONTINUATION_TOOL): the text names it instead of a `cont` line per option.
+  const answerTool = continuationAnswerToolOffered(session.trace.env);
+  writeText(session.io, formatContinuationPausedOutput({ id: continuation.id, ask: continuation.ask, expiresAt: continuation.expiresAt }, { answerTool }), NL);
   emitContinuationCreated(session.trace, {
     id: continuation.id,
     rootId: chain.rootId,
@@ -430,14 +445,14 @@ export async function answerContinuation(
   choice: string | undefined,
 ): Promise<void> {
   const id = parseContinuationId(rawId);
-  if (id === null) refuse(openSession(ctx, options, []), { code: "UNKNOWN", id: typedId(rawId) }, { id: undefined });
+  if (id === null) refuse(openSession(ctx, options, [], true), { code: "UNKNOWN", id: typedId(rawId) }, { id: undefined });
 
   const text = await readAnswerText(ctx.io.stdin, options?.stdinWindowMs ?? CONTINUATION_STDIN_WINDOW_MS);
   // Empty stdin is no text (`/dev/null` is what Claude Code's Bash gives); the runtime treats blank text the same.
   const answer: Answer = { ...(choice === undefined ? {} : { choice }), ...(text === undefined ? {} : { input: text }) };
   const withInput = typeof text === "string" && text.trim().length > 0;
   const commands = bindCommands(ctx, sources, { answering: { id, choice, withInput } });
-  const session = openSession(ctx, options, commands);
+  const session = openSession(ctx, options, commands, true);
   // Read first, for what the spans need: which command, which chain, since when, and whether this call runs the answer.
   let before: ContinuationRecord | undefined;
   // Before this call's run started, no step of it ran: the same `cont` again is safe. After, one may have.

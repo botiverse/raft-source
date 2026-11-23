@@ -66,7 +66,7 @@ function gatewayConfig(providerId: "openai-compatible" | "anthropic-compatible",
 }
 
 function registeredLimits(registry: ModelRegistry, config: Parameters<typeof resolvePiModelFromRegistry>[2], name: string) {
-  const model = resolvePiModelFromRegistry(name, registry, config, null);
+  const model = resolvePiModelFromRegistry(name, registry, config);
   assert.ok(model, "the gateway model is registered");
   return { contextWindow: model.contextWindow, maxTokens: model.maxTokens };
 }
@@ -74,7 +74,7 @@ function registeredLimits(registry: ModelRegistry, config: Parameters<typeof res
 test("an endpoint + id pair no catalog entry matches registers Raft's defaults and reports raft_default for both fields", async () => {
   const registry = await freshRegistry();
   const config = gatewayConfig("openai-compatible", "https://gateway.example.test/v1", "my-model");
-  const { modelLimits } = configureBuiltInGatewayCustomModel(registry, config, null);
+  const { modelLimits } = configureBuiltInGatewayCustomModel(registry, config);
   assert.deepEqual(modelLimits, RAFT_DEFAULTS);
   assert.deepEqual(registeredLimits(registry, config, "my-model"), { contextWindow: 200_000, maxTokens: 8192 }, "the report is what was registered");
 });
@@ -84,7 +84,7 @@ test("a catalog pair (Qwen Token Plan) registers and reports the catalog's value
   const catalog = registry.getAll().find((model) => model.id === "qwen3.8-max" && model.api === "openai-completions" && model.baseUrl.startsWith("https://token-plan.cn-beijing"));
   assert.ok(catalog, "fixture precondition: the SDK catalog knows the Qwen Token Plan pair");
   const config = gatewayConfig("openai-compatible", QWEN_TOKEN_PLAN_BASE_URL, "qwen3.8-max");
-  const { modelLimits } = configureBuiltInGatewayCustomModel(registry, config, null);
+  const { modelLimits } = configureBuiltInGatewayCustomModel(registry, config);
   assert.deepEqual(modelLimits, {
     contextWindow: { value: catalog.contextWindow, source: "catalog" },
     maxTokens: { value: catalog.maxTokens, source: "catalog" },
@@ -101,7 +101,7 @@ test("each field has its own source: a catalog entry without maxTokens reports c
     find: () => registered[0]?.models[0],
   } as unknown as ModelRegistry;
   const config = gatewayConfig("openai-compatible", "https://partial.example.test/v1/", "partial-model");
-  const { modelLimits } = configureBuiltInGatewayCustomModel(registry, config, null);
+  const { modelLimits } = configureBuiltInGatewayCustomModel(registry, config);
   assert.deepEqual(modelLimits, {
     contextWindow: { value: 64_000, source: "catalog" },
     maxTokens: { value: 8192, source: "raft_default" },
@@ -113,26 +113,18 @@ test("each field has its own source: a catalog entry without maxTokens reports c
 test("an Anthropic-compatible pair with an on-record thinking contract but no catalog entry still reports raft_default", async () => {
   const registry = await freshRegistry();
   const config = gatewayConfig("anthropic-compatible", "https://api.minimax.cn/anthropic", "MiniMax-M3.1-Flash-Preview");
-  const { thinkingContract, modelLimits } = configureBuiltInGatewayCustomModel(registry, config, null);
+  const { thinkingContract, modelLimits } = configureBuiltInGatewayCustomModel(registry, config);
   assert.ok(thinkingContract, "fixture precondition: the pair has a thinking contract");
   assert.deepEqual(modelLimits, RAFT_DEFAULTS, "a thinking contract carries no limits");
   assert.deepEqual(registeredLimits(registry, config, "MiniMax-M3.1-Flash-Preview"), { contextWindow: 200_000, maxTokens: 8192 });
 });
 
-test("a managed gateway connection reports limits; presets and non-gateway connections report none", async () => {
-  const connection = {
-    version: RUNTIME_CONFIG_VERSION,
-    runtime: "builtin",
-    provider: { kind: "connection", connectionId: "11111111-1111-4111-8111-111111111111" },
-    hostUserState: "forbidden",
-    model: { kind: "custom", name: "my-model" },
-    mode: { kind: "default" },
-  } as const;
-  const projection = { providerId: "openai-compatible", endpointUrl: "https://gateway.example.test/v1", supportsImageInput: false } as const;
-  assert.deepEqual(configureBuiltInGatewayCustomModel(await freshRegistry(), connection, projection).modelLimits, RAFT_DEFAULTS);
-  assert.equal(configureBuiltInGatewayCustomModel(await freshRegistry(), connection, null).modelLimits, null, "a connection the launch does not resolve to a gateway");
-  const preset = { ...connection, model: { kind: "preset", id: "moonshotai/kimi-k3" } } as const;
-  assert.equal(configureBuiltInGatewayCustomModel(await freshRegistry(), preset, projection).modelLimits, null);
+test("a catalog model through a gateway and a preset provider register no gateway limits", async () => {
+  const gateway = gatewayConfig("openai-compatible", "https://gateway.example.test/v1", "my-model");
+  const catalogModel = { ...gateway, model: { kind: "preset", id: "moonshotai/kimi-k3" } } as const;
+  assert.equal(configureBuiltInGatewayCustomModel(await freshRegistry(), catalogModel as never).modelLimits, null);
+  const preset = { ...gateway, provider: { kind: "preset", providerId: "openrouter", apiKey: "k" } } as const;
+  assert.equal(configureBuiltInGatewayCustomModel(await freshRegistry(), preset as never).modelLimits, null);
 });
 
 function builtInContext(workingDirectory: string, baseUrl: string, name: string): SpawnContext {
@@ -295,7 +287,7 @@ test("a models.json override wins over a declared value too, and the report says
     const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath, allowModelNetwork: false });
     const registry = new ModelRegistry(runtime);
     const declared = { ...gatewayConfig("openai-compatible", "https://gateway.example.test/v1", "my-model"), model: { kind: "custom", name: "my-model", contextWindow: 96_000 } } as const;
-    const { modelLimits } = configureBuiltInGatewayCustomModel(registry, declared as never, null);
+    const { modelLimits } = configureBuiltInGatewayCustomModel(registry, declared as never);
     assert.deepEqual(modelLimits?.contextWindow, { value: 50_000, source: "catalog" });
     assert.equal(registeredLimits(registry, declared as never, "my-model").contextWindow, 50_000);
   } finally {
@@ -306,13 +298,13 @@ test("a models.json override wins over a declared value too, and the report says
 test("the agent's declared limits win over the catalog and Raft's default, each field on its own (#proj-runtime:#50)", async () => {
   const registry = await freshRegistry();
   const declared = { ...gatewayConfig("openai-compatible", QWEN_TOKEN_PLAN_BASE_URL, "qwen3.8-max"), model: { kind: "custom", name: "qwen3.8-max", contextWindow: 96_000 } } as const;
-  const { modelLimits } = configureBuiltInGatewayCustomModel(registry, declared as never, null);
+  const { modelLimits } = configureBuiltInGatewayCustomModel(registry, declared as never);
   assert.deepEqual(modelLimits?.contextWindow, { value: 96_000, source: "agent_config" }, "declared beats the catalog");
   assert.equal(modelLimits?.maxTokens.source, "catalog", "the undeclared field keeps the catalog value");
   assert.deepEqual(registeredLimits(registry, declared as never, "qwen3.8-max").contextWindow, 96_000, "the report is what was registered");
 
   const unknownPair = { ...gatewayConfig("openai-compatible", "https://gateway.example.test/v1", "devin/swe-2-flash"), model: { kind: "custom", name: "devin/swe-2-flash", maxOutputTokens: 32_000 } } as const;
-  const both = configureBuiltInGatewayCustomModel(await freshRegistry(), unknownPair as never, null).modelLimits;
+  const both = configureBuiltInGatewayCustomModel(await freshRegistry(), unknownPair as never).modelLimits;
   assert.deepEqual(both, {
     contextWindow: { value: 200_000, source: "raft_default" },
     maxTokens: { value: 32_000, source: "agent_config" },
@@ -322,20 +314,20 @@ test("the agent's declared limits win over the catalog and Raft's default, each 
 test("the gateway's value sits between the agent's own and the catalog's, each field on its own (#proj-runtime:#53)", async () => {
   const catalogPair = gatewayConfig("openai-compatible", QWEN_TOKEN_PLAN_BASE_URL, "qwen3.8-max");
   const registry = await freshRegistry();
-  const { modelLimits } = configureBuiltInGatewayCustomModel(registry, catalogPair, null, {}, { contextWindow: 77_000 });
+  const { modelLimits } = configureBuiltInGatewayCustomModel(registry, catalogPair, {}, { contextWindow: 77_000 });
   assert.deepEqual(modelLimits?.contextWindow, { value: 77_000, source: "gateway" }, "the gateway beats the catalog");
   assert.equal(modelLimits?.maxTokens.source, "catalog", "a field the gateway did not report keeps the catalog value");
   assert.equal(registeredLimits(registry, catalogPair, "qwen3.8-max").contextWindow, 77_000, "the report is what was registered");
 
   const declared = { ...catalogPair, model: { kind: "custom", name: "qwen3.8-max", contextWindow: 96_000 } } as const;
-  const both = configureBuiltInGatewayCustomModel(await freshRegistry(), declared as never, null, {}, { contextWindow: 77_000, maxTokens: 9_000 }).modelLimits;
+  const both = configureBuiltInGatewayCustomModel(await freshRegistry(), declared as never, {}, { contextWindow: 77_000, maxTokens: 9_000 }).modelLimits;
   assert.deepEqual(both, {
     contextWindow: { value: 96_000, source: "agent_config" },
     maxTokens: { value: 9_000, source: "gateway" },
   }, "the agent's own value beats the gateway's");
 
   const unknownPair = gatewayConfig("openai-compatible", "https://gateway.example.test/v1", "my-model");
-  assert.deepEqual(configureBuiltInGatewayCustomModel(await freshRegistry(), unknownPair, null, {}, { maxTokens: 12_000 }).modelLimits, {
+  assert.deepEqual(configureBuiltInGatewayCustomModel(await freshRegistry(), unknownPair, {}, { maxTokens: 12_000 }).modelLimits, {
     contextWindow: { value: 200_000, source: "raft_default" },
     maxTokens: { value: 12_000, source: "gateway" },
   }, "an unreported field still falls back to Raft's default");
@@ -343,47 +335,26 @@ test("the gateway's value sits between the agent's own and the catalog's, each f
 
 test("a gateway max output larger than the context window the model ends up with is ignored", async () => {
   const unknownPair = gatewayConfig("openai-compatible", "https://gateway.example.test/v1", "my-model");
-  assert.deepEqual(configureBuiltInGatewayCustomModel(await freshRegistry(), unknownPair, null, {}, { contextWindow: 32_000, maxTokens: 64_000 }).modelLimits, {
+  assert.deepEqual(configureBuiltInGatewayCustomModel(await freshRegistry(), unknownPair, {}, { contextWindow: 32_000, maxTokens: 64_000 }).modelLimits, {
     contextWindow: { value: 32_000, source: "gateway" },
     maxTokens: { value: 8192, source: "raft_default" },
   }, "against the gateway's own context window");
   const declared = { ...unknownPair, model: { kind: "custom", name: "my-model", contextWindow: 16_000 } } as const;
-  assert.deepEqual(configureBuiltInGatewayCustomModel(await freshRegistry(), declared as never, null, {}, { maxTokens: 20_000 }).modelLimits, {
+  assert.deepEqual(configureBuiltInGatewayCustomModel(await freshRegistry(), declared as never, {}, { maxTokens: 20_000 }).modelLimits, {
     contextWindow: { value: 16_000, source: "agent_config" },
     maxTokens: { value: 8192, source: "raft_default" },
   }, "against the agent's own context window");
-  assert.equal(configureBuiltInGatewayCustomModel(await freshRegistry(), unknownPair, null, {}, { maxTokens: 200_000 }).modelLimits?.maxTokens.source, "gateway", "equal to the context window still fits");
+  assert.equal(configureBuiltInGatewayCustomModel(await freshRegistry(), unknownPair, {}, { maxTokens: 200_000 }).modelLimits?.maxTokens.source, "gateway", "equal to the context window still fits");
 });
 
 test("no gateway read when the agent set both limits, there is no key, or the model is not a gateway custom model", async () => {
   const fetchSpy = (async () => { throw new Error("no request expected"); }) as unknown as typeof fetch;
   const declaredBoth = { ...gatewayConfig("openai-compatible", "https://gateway.example.test/v1", "m"), model: { kind: "custom", name: "m", contextWindow: 1, maxOutputTokens: 1 } } as const;
-  assert.equal((await readBuiltInGatewayModelLimits(declaredBoth as never, null, null, fetchSpy)).outcome, "skipped");
+  assert.equal((await readBuiltInGatewayModelLimits(declaredBoth as never, fetchSpy)).outcome, "skipped");
   const noKey = { ...gatewayConfig("openai-compatible", "https://gateway.example.test/v1", "m"), provider: { kind: "gateway", providerId: "openai-compatible", baseUrl: "https://gateway.example.test/v1", apiKey: "" } } as const;
-  assert.equal((await readBuiltInGatewayModelLimits(noKey as never, null, null, fetchSpy)).outcome, "skipped");
+  assert.equal((await readBuiltInGatewayModelLimits(noKey as never, fetchSpy)).outcome, "skipped");
   const preset = { ...gatewayConfig("openai-compatible", "https://gateway.example.test/v1", "m"), model: { kind: "preset", id: "moonshotai/kimi-k3" } } as const;
-  assert.equal((await readBuiltInGatewayModelLimits(preset as never, null, null, fetchSpy)).outcome, "skipped");
-});
-
-test("a managed gateway connection reads with the key from the launch env, not from anywhere else", async () => {
-  const connection = {
-    version: RUNTIME_CONFIG_VERSION,
-    runtime: "builtin",
-    provider: { kind: "connection", connectionId: "11111111-1111-4111-8111-111111111111" },
-    hostUserState: "forbidden",
-    model: { kind: "custom", name: "my-model" },
-    mode: { kind: "default" },
-  } as const;
-  const projection = { providerId: "openai-compatible", endpointUrl: "https://gateway.example.test/v1", supportsImageInput: false } as const;
-  const seen: Array<{ url: string; authorization: string | null }> = [];
-  const fetchSpy = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    seen.push({ url: String(input), authorization: new Headers(init?.headers).get("authorization") });
-    return Response.json({ data: [{ id: "my-model", context_length: 64_000 }] });
-  }) as typeof fetch;
-  const result = await readBuiltInGatewayModelLimits(connection, projection, { OPENAI_API_KEY: "sk-managed" }, fetchSpy);
-  assert.deepEqual(result.limits, { contextWindow: 64_000 });
-  assert.deepEqual(seen, [{ url: "https://gateway.example.test/v1/models", authorization: "Bearer sk-managed" }]);
-  assert.equal((await readBuiltInGatewayModelLimits(connection, projection, null, fetchSpy)).outcome, "skipped", "no launch key, no read");
+  assert.equal((await readBuiltInGatewayModelLimits(preset as never, fetchSpy)).outcome, "skipped");
 });
 
 test("a gateway (stock CLIProxyAPI) whose plain list has no limits is read again at ?client_version=pi", async () => {
@@ -395,7 +366,7 @@ test("a gateway (stock CLIProxyAPI) whose plain list has no limits is read again
       ? Response.json({ models: [{ slug: "my-model", context_window: 272_000, max_context_window: 872_000 }] })
       : Response.json({ object: "list", data: [{ id: "my-model", object: "model" }] });
   }) as typeof fetch;
-  const result = await readBuiltInGatewayModelLimits(gatewayConfig("openai-compatible", "https://gateway.example.test/v1", "my-model"), null, null, fetchSpy);
+  const result = await readBuiltInGatewayModelLimits(gatewayConfig("openai-compatible", "https://gateway.example.test/v1", "my-model"), fetchSpy);
   assert.deepEqual(result, { limits: { contextWindow: 272_000 }, outcome: "ok", cached: false, format: "cliproxyapi_pi", fallbackRead: true });
   assert.deepEqual(seen, ["https://gateway.example.test/v1/models", "https://gateway.example.test/v1/models?client_version=pi"]);
 });

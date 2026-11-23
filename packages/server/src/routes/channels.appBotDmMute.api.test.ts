@@ -127,7 +127,7 @@ test("muting a DM that cannot be muted is refused and changes nothing; unmuting 
   const refused = async (dmId: string, label: string) => {
     const res = await patch(dmId, true);
     assert.equal(res.status, 400, label);
-    assert.deepEqual(await res.json(), { error: "This conversation can't be muted", code: "ACTIVITY_MUTE_NOT_SUPPORTED" }, label);
+    assert.deepEqual(await res.json(), { error: "This conversation can't be muted", code: "ACTIVITY_MUTE_NOT_SUPPORTED", errorCode: "ACTIVITY_MUTE_NOT_SUPPORTED" }, label);
   };
   const stored = async (dmId: string) => (await getDb()
     .select({ activityMuted: inboxTargetMuteStates.activityMuted, prefsVersion: inboxTargetMuteStates.prefsVersion })

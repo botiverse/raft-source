@@ -10,8 +10,8 @@ import {
 // rather than hardcoding per-variant level lists. These assertions pin the
 // picker behavior against that shared data.
 
-test("codex default model is GPT-6.1 Sol", () => {
-  assert.equal(getDefaultModel("codex"), "gpt-6.1-sol");
+test("codex default model is GPT-6.2 Sol", () => {
+  assert.equal(getDefaultModel("codex"), "gpt-6.2-sol");
 });
 
 test("GPT-6.1 Sol exposes all six reasoning levels including Ultra; GPT-6 Luna stops at Max", () => {
@@ -95,4 +95,26 @@ test("Antigravity offers an effort only for a model whose levels the Computer li
   assert.equal(reconcileReasoningEffort("antigravity", "gemini-3.8-flash", null, live), "medium");
   // Other runtimes keep the base set for an undeclared model.
   assert.equal(reconcileReasoningEffort("claude", "claude-unlisted", "high", []), "high");
+});
+
+test("a live Codex model that lists no efforts offers none and clears a stale choice, over the static catalog", () => {
+  // gpt-5.6-sol is in the static catalog with all six levels; the Computer says this one takes none.
+  const live = [{ id: "gpt-5.6-sol", label: "GPT-5.6 Sol (live)", supportedReasoningEfforts: [] }];
+  assert.deepEqual(reasoningEffortOptionsForModel("codex", "gpt-5.6-sol", live), []);
+  assert.equal(reconcileReasoningEffort("codex", "gpt-5.6-sol", "ultra", live), null);
+  assert.equal(reconcileReasoningEffort("codex", "gpt-5.6-sol", null, live), null);
+
+  // A model only the Computer lists, declaring none: no BASE fallback either.
+  const liveOnly = [{ id: "gpt-no-reasoning", label: "GPT No Reasoning", supportedReasoningEfforts: [] }];
+  assert.deepEqual(reasoningEffortOptionsForModel("codex", "gpt-no-reasoning", liveOnly), []);
+  assert.equal(reconcileReasoningEffort("codex", "gpt-no-reasoning", "high", liveOnly), null);
+});
+
+test("a live Codex model that omits its efforts keeps the static catalog and the choice", () => {
+  const live = [{ id: "gpt-5.6-sol", label: "GPT-5.6 Sol (live, no metadata)" }];
+  assert.deepEqual(
+    reasoningEffortOptionsForModel("codex", "gpt-5.6-sol", live).map((option) => option.value),
+    ["low", "medium", "high", "xhigh", "max", "ultra"],
+  );
+  assert.equal(reconcileReasoningEffort("codex", "gpt-5.6-sol", "ultra", live), "ultra");
 });

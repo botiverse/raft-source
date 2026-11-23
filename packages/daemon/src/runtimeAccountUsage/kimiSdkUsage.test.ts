@@ -42,10 +42,10 @@ test("a full window is rate limited unless Extra Usage has headroom; its monthly
   assert.equal(capped.kind === "available" && capped.rateLimited, true);
 });
 
-test("a bad reset is dropped, ratios are clamped, and a quota with no usable window throws (never zero usage)", () => {
+test("a bad reset is dropped, ratios are clamped, and a quota with no usable window is unsupported / quota_unavailable (never zero usage, not an error)", () => {
   const odd = projectKimiManagedQuota(quota({ usages: { limit5h: { usedRatio: 1.7, resetAt: "not a date" } } }));
   assert.deepEqual(odd.kind === "available" ? odd.windows : null, [{ label: "5h limit", usedRatio: 1 }]);
-  assert.throws(() => projectKimiManagedQuota(quota({ usages: {} })));
+  assert.deepEqual(projectKimiManagedQuota(quota({ usages: {} })), { kind: "unsupported", reason: "quota_unavailable" });
 });
 
 test("signed out: reauth without loading the SDK; 401/403 rejected; 404 unsupported; other errors throw", async () => {

@@ -18,6 +18,7 @@ import {
   RISINGWAVE_DISABLED_WARNING,
   postgresDockerRunArgs,
   RAFTDEV_MANAGED_LABEL,
+  raftdevAgentLabelArgs,
   replicaMetricsPort,
   replicaServerPort,
   resolveRisingWaveDependency,
@@ -32,6 +33,10 @@ import {
   shouldRefuseRisingWaveSeedWithoutState,
   waitForRisingWaveReadiness,
 } from "./raftdev";
+import {
+  RAFTDEV_AGENT_LABEL,
+  RAFTDEV_MANAGED_LABEL as SHARED_RAFTDEV_MANAGED_LABEL,
+} from "../../packages/shared/src/agentLeftovers";
 import {
   buildRisingWaveBootstrapStatements,
   createCdcTableStatement,
@@ -416,10 +421,32 @@ test("Postgres Docker args keep the non-CDC shape while adding ownership", () =>
       "-e", "POSTGRES_DB=slock",
       "-e", "POSTGRES_USER=postgres",
       "-e", "POSTGRES_PASSWORD=dev-secret",
-      "-p", "15500:5432",
+      "-p", "127.0.0.1:15500:5432",
       "postgres:16-alpine",
     ],
   );
+});
+
+// #raft-architecture:#34: `raft-computer leftovers` shows each container's owner by this label.
+test("containers an agent creates carry its id as a label; none without one", () => {
+  const agent = "5e4d3c2b-1a0f-4e9d-8c7b-6a5f4e3d2c1b";
+  const env = { CONTAINER: "slock-dev-demo-postgres", PG_PORT: 15500, POSTGRES_PASSWORD: "dev-secret", RISINGWAVE_NETWORK: "unused" };
+  const labelled = postgresDockerRunArgs(env, false, agent);
+  assert.deepEqual(labelled.slice(0, 8), [
+    "run", "-d", "--name", "slock-dev-demo-postgres",
+    "--label", `${RAFTDEV_MANAGED_LABEL}=true`,
+    "--label", `com.botiverse.raftdev.agent=${agent}`,
+  ]);
+  assert.deepEqual(postgresDockerRunArgs(env, false, null), postgresDockerRunArgs(env));
+  assert.deepEqual(raftdevAgentLabelArgs(agent), ["--label", `${RAFTDEV_AGENT_LABEL}=${agent}`]);
+  assert.deepEqual(raftdevAgentLabelArgs(null), []);
+  assert.equal(RAFTDEV_MANAGED_LABEL, SHARED_RAFTDEV_MANAGED_LABEL);
+  const risingWave = risingWaveDockerRunArgs({
+    RISINGWAVE_CONTAINER: "slock-dev-demo-risingwave",
+    RISINGWAVE_PORT: 4566,
+    RISINGWAVE_DASHBOARD_PORT: 5691,
+  }, "img", undefined, { agentId: agent });
+  assert.ok(risingWave.includes(`com.botiverse.raftdev.agent=${agent}`), risingWave.join(" "));
 });
 
 test("full Postgres Docker args enable bounded logical replication on the shared network", () => {
@@ -437,7 +464,7 @@ test("full Postgres Docker args enable bounded logical replication on the shared
       "-e", "POSTGRES_DB=slock",
       "-e", "POSTGRES_USER=postgres",
       "-e", "POSTGRES_PASSWORD=dev-secret",
-      "-p", "15500:5432",
+      "-p", "127.0.0.1:15500:5432",
       "postgres:16-alpine",
       "-c", "wal_level=logical",
       "-c", "max_replication_slots=10",

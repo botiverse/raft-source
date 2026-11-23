@@ -35,7 +35,8 @@
   "expect": {
     "verdict": {
       "counts": null,
-      "mention": false
+      "mention": false,
+      "moves": true
     }
   }
 }

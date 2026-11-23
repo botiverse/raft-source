@@ -1,4 +1,4 @@
-import { EllipsisVertical, Pause, Play, RotateCcw, Square } from "lucide-react";
+import { EllipsisVertical, Pause, Phone, Play, RotateCcw, Square } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -43,6 +43,8 @@ interface AgentProfileOverflowMenuProps {
   messageInMenu?: boolean;
   /** Agent Lounge v0: open this agent's Lounge (flag on, not a Guest). Omitted: no Lounge item. */
   onOpenLounge?: () => void;
+  /** Raft voice calls: call this agent (agentVoiceCallEntry decides who may). Omitted: no Call item. */
+  onCall?: () => void;
 }
 
 // The profile action strip sits flush against the top edge of its panel.
@@ -73,6 +75,7 @@ export default function AgentProfileOverflowMenu({
   onRestartReset,
   onPauseAssistant,
   onOpenLounge,
+  onCall,
   messageInMenu = false,
 }: AgentProfileOverflowMenuProps) {
   const { formatMessage } = useIntl();
@@ -80,6 +83,7 @@ export default function AgentProfileOverflowMenu({
   const restartResetLabel = formatMessage({ id: "agent.detail.restartReset" });
   const pauseAssistantLabel = formatMessage({ id: "assistant.pause.action" });
   const loungeLabel = formatMessage({ id: "agent.lounge.label" });
+  const callLabel = formatMessage({ id: "agent.voice.call.action" });
   // Start when offline; Stop only for those who may stop the agent; neither Start nor Restart / Reset while the
   // Computer is offline (agentRuntimeControls, the rule every surface shares).
   const controls = agentRuntimeControls({ canControl: canControlAgentRuntime, canStop: canStopAgent, isOnline, computerOffline, stoppedByPerson });
@@ -90,7 +94,7 @@ export default function AgentProfileOverflowMenu({
   const canRestartReset = controls.restartReset;
 
   // What shows as buttons with room and in ⋯ without (Start/Stop needs runtime control too).
-  const hasFoldingCommands = Boolean(onOpenLounge) || controls.start || controls.stop || controls.restartReset || Boolean(onPauseAssistant);
+  const hasFoldingCommands = Boolean(onCall) || Boolean(onOpenLounge) || controls.start || controls.stop || controls.restartReset || Boolean(onPauseAssistant);
   // In the row's column: Move Left / Move Right in ⋯, and Direct Message there where the head is narrow (#189).
   const region = useContext(RowRegionContext);
   const moves = useColumnMoveItems(region);
@@ -117,6 +121,17 @@ export default function AgentProfileOverflowMenu({
       className="agent-profile-inline-actions hidden items-center gap-0.5 md:pointer-fine:gap-1"
       data-testid="agent-profile-inline-actions"
     >
+      {onCall && (
+        <Tooltip content={callLabel} contentProps={PROFILE_TOOLTIP_CONTENT_PROPS}>
+          <PanelAction
+            aria-label={callLabel}
+            onClick={onCall}
+            data-testid="agent-profile-inline-call"
+          >
+            <Phone />
+          </PanelAction>
+        </Tooltip>
+      )}
       {onOpenLounge && (
         <Tooltip content={loungeLabel} contentProps={PROFILE_TOOLTIP_CONTENT_PROPS}>
           <PanelAction
@@ -190,6 +205,12 @@ export default function AgentProfileOverflowMenu({
             <DropdownMenuItem onClick={onMessage} data-testid="agent-profile-overflow-message">
               <DirectMessageIcon />
               {messageLabel}
+            </DropdownMenuItem>
+          )}
+          {onCall && (
+            <DropdownMenuItem onClick={onCall} data-testid="agent-profile-overflow-call">
+              <Phone />
+              {callLabel}
             </DropdownMenuItem>
           )}
           {onOpenLounge && (

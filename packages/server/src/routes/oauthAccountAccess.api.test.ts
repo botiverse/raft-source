@@ -603,6 +603,6 @@ test("agent-events: an account-mode token gets the 403 a server-mode person's to
   const f = await seedAccountApp(app);
   const ref = await postEvent(app, f.serverTokens.a);
   assert.equal(ref.status, 403);
-  assert.deepEqual(JSON.parse(ref.body), { error: "agent token required" });
+  assert.deepEqual(JSON.parse(ref.body), { error: "agent token required", code: "forbidden", errorCode: "forbidden" });
   assert.deepEqual(await postEvent(app, f.accountToken), ref);
 });

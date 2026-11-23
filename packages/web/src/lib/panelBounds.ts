@@ -9,9 +9,10 @@ import type { CSSProperties } from "react";
  * profile under `storageKey` (see store/columnWidthStore.ts). `legacyStorageKeys` are the keys earlier builds wrote
  * for the same column: the first one present is adopted when `storageKey` has no value yet, then all are removed.
  *
- * The maximum of a column right of the conversation (thread, detail, sideCards; `growsToMainMin`) is not a number
- * in this table: it is as wide as the column can get while the conversation beside it keeps `MAIN_COLUMN_MIN_WIDTH`
- * (task #74, Tenny and Jasper, 2026-10-23; it was 720 / 640 / 652, about half of a 1280-1440 window). The handle
+ * The maximum of a column right of the conversation (thread, detail, sideCards, artifactComments; `growsToMainMin`)
+ * is not a number in this table: it is as wide as the column can get while the conversation beside it (for the
+ * Artifact's comment list, the Artifact's content) keeps `MAIN_COLUMN_MIN_WIDTH` (task #74, Tenny and Jasper,
+ * 2026-10-23; it was 720 / 640 / 652, about half of a 1280-1440 window). The handle
  * works it out from the layout when a drag or a key starts (`growToMainMinMax`); `max` there is only the safety
  * bound stored widths are clamped to.
  */
@@ -81,6 +82,20 @@ export const COLUMN_BOUNDS = {
     max: GROWS_TO_MAIN_MIN_SAFETY_MAX,
     growsToMainMin: true,
     storageKey: "slock:channelSideCardsWidth",
+    legacyStorageKeys: [],
+  },
+  /**
+   * The Artifact viewer's comment list (or comment mode's review in its place) beside the content, in the in-app
+   * viewer and on the Artifact's own page: 340 by default, its width before it could be dragged; at least 280, the
+   * width the attachment comment margin and Task v2's sections lay comments and cards out at. It stands inside the
+   * Artifact's own column, not in MainLayout's row, so it drags alone (ColumnResizeHandle `outsideRow`).
+   */
+  artifactComments: {
+    defaultWidth: 340,
+    min: 280,
+    max: GROWS_TO_MAIN_MIN_SAFETY_MAX,
+    growsToMainMin: true,
+    storageKey: "slock:artifactCommentsWidth",
     legacyStorageKeys: [],
   },
   /** File tree in an agent's Workspace tab. */

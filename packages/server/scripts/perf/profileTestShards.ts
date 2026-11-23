@@ -90,6 +90,10 @@ const MANIFEST_SCHEMA_VERSION = 1;
 // data; an 8-shard trial run could confirm whether N=8 holds <240s/shard
 // (would save ~420/day instead) — until then N=8's nominal win is unreliable.
 const MIN_SHARDS = 4;
+// 2026-11-17 (#triage:#497): an 8-shard trial (#15308, #15311) ran 10 staging
+// rounds with the slowest shard at 19.4-23.0 min and 128-143 machine-minutes,
+// against 15.6-19.1 min and 103-129 for 7 shards. Static balance does not hold
+// (the heaviest shard changed every round), so the cap is back to 7.
 const MAX_SHARDS = 7;
 const SERVER_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const SRC_DIR = path.join(SERVER_DIR, "src");

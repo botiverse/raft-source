@@ -31,8 +31,8 @@ const displays = defineDisplays({
       egress: LIBRARY_CDNS,
       runtime: "1",
       // As ArtifactFrame's RAFT_ARTIFACT_DISPLAYS and the content Worker's (annotate for comment mode,
-      // find for the find bar).
-      capabilities: { annotate: {}, comments: {}, copyText: {}, find: {}, openLink: {} },
+      // find for the find bar, linkLabels for the titles of links to other Artifacts).
+      capabilities: { annotate: {}, comments: {}, copyText: {}, find: {}, linkLabels: {}, openLink: {} },
       layout: { kind: "fill" },
       errors: "host",
       theme: { variables: ARTIFACT_PAGE_THEME_VARIABLES },

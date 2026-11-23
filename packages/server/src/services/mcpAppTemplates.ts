@@ -24,6 +24,8 @@ const templateSchema = z.object({
   authKind: z.enum(["none", "headers", "oauth"]),
   // Optional in the bundled JSON; every row carries it (default "either").
   oauthClientMode: z.enum(MANAGED_MCP_OAUTH_CLIENT_MODES).default("either"),
+  // Who builds and hosts the MCP server ("By Notion"); null on rows App Admin created before it had the field.
+  publisherName: z.string().trim().min(1).max(120).nullable().default(null),
 }).strict();
 
 // The bundled JSON can mark a template retired, so the fallback (an unreadable table) hides the same
@@ -112,6 +114,7 @@ const templateColumns = {
   endpointUrl: mcpAppTemplates.endpointUrl,
   authKind: mcpAppTemplates.authKind,
   oauthClientMode: mcpAppTemplates.oauthClientMode,
+  publisherName: mcpAppTemplates.publisherName,
   status: mcpAppTemplates.status,
   createdAt: mcpAppTemplates.createdAt,
 } as const;
@@ -174,6 +177,16 @@ export async function findMcpAppTemplate(key: string): Promise<McpAppTemplateMet
   // templateKey and logo; the template just stops being offered to new Apps (listMcpAppTemplates).
   const entry = all.find((candidate) => candidate.row.key === key);
   return entry ? templateMetadata(entry.row) : null;
+}
+
+/**
+ * Every template's publisher by key, retired and unselectable ones included, so an existing App
+ * still shows who publishes it. One catalog read; the bundled JSON when the catalog cannot be read.
+ */
+export async function mcpAppTemplatePublisherNames(): Promise<Map<string, string | null>> {
+  const all = await readAllTemplateRows();
+  const templates = all ? all.map((entry) => entry.row) : bundledEntries().map((entry) => entry.template);
+  return new Map(templates.map((template) => [template.key, template.publisherName]));
 }
 
 /**

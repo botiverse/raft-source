@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 
+import { Command } from "commander";
+
 import type { ApiResponse } from "../../client";
 import type { AgentContext } from "../../auth/env";
 import { createCommandContext } from "../../core/context";
-import { CliError } from "../../core/errors";
+import { CliError, CliExit } from "../../core/errors";
 import type { CliIo } from "../../core/io";
-import { taskCreateCommand } from "./create";
+import { registerTaskCreateCommand, taskCreateCommand } from "./create";
 
 function memoryIo(): { io: CliIo; stdout: string[]; stderr: string[] } {
   const stdout: string[] = [];
@@ -476,4 +478,36 @@ test("task create sends --status for every title and refuses a status a task can
   assert.equal(requests.length, 3, "a refused status sends nothing");
   const option = taskCreateCommand.spec.options?.find((candidate) => candidate.flags === "--status <status>");
   assert.match(option?.description ?? "", /Default: in_progress when you assign yourself, otherwise todo/);
+});
+
+test("a held task create prints the hold once, exits 1 and names TASK_WRITE_HELD on stderr", async () => {
+  const { io, stdout, stderr } = memoryIo();
+  const program = new Command();
+  program.exitOverride();
+  registerTaskCreateCommand(program.command("task"), {
+    io,
+    env: {},
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (): Promise<ApiResponse<unknown>> => ({
+        ok: true,
+        status: 200,
+        error: null,
+        data: { state: "held", newMessageCount: 1, seenUpToSeq: 17, heldMessages: [{ seq: 17, id: "m-17", senderName: "ana", content: "I already filed this" }] },
+      }),
+    }) as any,
+  });
+
+  await assert.rejects(
+    async () => {
+      await program.parseAsync(["node", "raft", "task", "create", "--target", "#proj-runtime", "--message-id", "abcdef12", "--title", "Ship it"]);
+    },
+    (err: unknown) => err instanceof CliExit && err.exitCode === 1,
+  );
+  const output = stdout.join("");
+  assert.match(output, /^Held — 1 unread message in /);
+  assert.equal(output.match(/Your task was not created\./g)?.length, 1, "the hold is printed once");
+  assert.match(output, /rerun the same task create command/);
+  // Classification only: the hold above already says what happened and what to do.
+  assert.equal(stderr.join(""), "Error: Held for unseen messages. Your task was not created.\nCode: TASK_WRITE_HELD\nRetryable: yes\n");
 });

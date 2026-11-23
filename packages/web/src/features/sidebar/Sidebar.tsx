@@ -9,6 +9,7 @@ import { useSidebarRoute } from "./hooks/useSidebarRoute";
 import { useSidebarCreateActions } from "./hooks/useSidebarCreateActions";
 import { useSidebarItems } from "./hooks/useSidebarItems";
 import { useSidebarProjection } from "./hooks/useSidebarProjection";
+import { useSidebarBrowserInUse } from "./hooks/useSidebarBrowserInUse";
 import { useSidebarDnd } from "./hooks/useSidebarDnd";
 import { useSidebarHomeEntries } from "./hooks/useSidebarHomeEntries";
 import { useSidebarMenuActions } from "./hooks/useSidebarMenuActions";
@@ -53,6 +54,7 @@ export const Sidebar = memo(function Sidebar({ mobileInline, hideTitle = false, 
   const dnd = useSidebarDnd(data, view, sync, items, projection);
   const home = useSidebarHomeEntries(mobileInline, data, view, route);
   const menuActions = useSidebarMenuActions(data, view, sync, items, dnd);
+  const browserInUse = useSidebarBrowserInUse(data, view, items, projection);
   const { sidebarScrollRef } = data;
   const { railMode, showSettingsRail, showComputersRail, showChatRail } = view;
   const { openSidebarSurfaceCtxMenu } = rowHandlers;
@@ -129,6 +131,7 @@ export const Sidebar = memo(function Sidebar({ mobileInline, hideTitle = false, 
               <SidebarChatSections
                 data={data} view={view} sync={sync} rowHandlers={rowHandlers} route={route}
                 createActions={createActions} items={items} projection={projection} dnd={dnd}
+                browserInUse={browserInUse}
               />
             </>
           ) : null /* Members is its own page with no sidebar (shellRouteLayout). */}

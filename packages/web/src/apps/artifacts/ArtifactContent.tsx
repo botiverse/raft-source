@@ -10,6 +10,7 @@ import { prefetchAfterFirstScreen } from "../../boot/appChunkLoading";
 import EmptyState from "../../components/ui/EmptyState";
 import { trackArtifactViewerAction } from "./artifactAnalytics";
 import { artifactUrl } from "./artifactLinks";
+import { ArtifactBacklinksBlock } from "./ArtifactBacklinks";
 import { ArtifactChunkBoundary, useRetryableLazy } from "./artifactLazyChunk";
 import type { LazyChunkSlot } from "./artifactLazyChunk";
 import { ArtifactLoadingArea, ArtifactLoadingSplash } from "./ArtifactLoadingSplash";
@@ -108,8 +109,8 @@ export default function ArtifactContent({ data, onOpenFile }: {
   );
   const downloadFile = useCallback(() => {
     trackArtifactViewerAction("download");
-    if (file) void downloadArtifactFile(file).catch(() => {});
-  }, [file]);
+    if (shownPath) void downloadArtifactFile(data, shownPath).catch(() => {});
+  }, [data, shownPath]);
   // Downloads are the Artifact's own server's: another server's reader is offered none (readsInOwnServer).
   const download = file && readsInOwnServer(card) ? downloadFile : undefined;
   // The frame of another page than the entry: asked of the frame route with that page's path, on
@@ -223,11 +224,14 @@ function ImageContent({ file, alt, onDownload, fallback }: { file: ArtifactFileT
   return (
     <SplashedContent kind="image" loaded={src !== null}>
       {src ? (
-        // A raft-ui ScrollArea, the centring and the padding on its content, which is
-        // as tall as the area: the image is fitted to it, so it scrolls only if the
-        // padding alone outgrows a very short area.
-        <ScrollArea className="min-h-0 flex-1 bg-fill-muted" contentClassName="flex h-full items-center justify-center p-4" data-testid="artifact-viewer-image-area">
-          <img src={src} alt={alt} className="max-h-full max-w-full object-contain" data-testid="artifact-viewer-image" />
+        // A raft-ui ScrollArea, the centring and the padding in a box as tall as the
+        // area: the image is fitted to it, so it scrolls only if the padding alone
+        // outgrows a very short area, or to "Linked from" under it (#proj-workspace:#336 step 2).
+        <ScrollArea className="min-h-0 flex-1 bg-fill-muted" data-testid="artifact-viewer-image-area">
+          <div className="flex h-full items-center justify-center p-4">
+            <img src={src} alt={alt} className="max-h-full max-w-full object-contain" data-testid="artifact-viewer-image" />
+          </div>
+          <ArtifactBacklinksBlock inset="mx-4" />
         </ScrollArea>
       ) : null}
     </SplashedContent>
@@ -276,6 +280,8 @@ function CsvContent({ file, fallback }: { file: ArtifactFileTarget; fallback?: R
             </TableBody>
           </Table>
         </ArtifactShellComments>
+        {/* "Linked from" directly under the table (#proj-workspace:#336 step 2). */}
+        <ArtifactBacklinksBlock />
       </ScrollArea>
     </SplashedContent>
   );
@@ -312,6 +318,8 @@ function TextContent({ file, fallback }: { file: ArtifactFileTarget; fallback?: 
             ))}
           </div>
         </ArtifactShellComments>
+        {/* "Linked from" directly under the text (#proj-workspace:#336 step 2). */}
+        <ArtifactBacklinksBlock />
       </ScrollArea>
     </SplashedContent>
   );

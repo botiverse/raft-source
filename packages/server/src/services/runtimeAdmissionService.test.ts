@@ -4,7 +4,6 @@ import {
   projectExistingAgentRuntimeOptions as projectExistingAgentRuntimeOptionsFor,
   projectNewAgentRuntimeOptions as projectNewAgentRuntimeOptionsFor,
   projectSetupRuntimeOptions,
-  isRuntimeDeprecatedForServer,
   resolveRuntimeAdmissionPolicy,
   runtimeOptionProjectionFromHeaders,
 } from "./runtimeAdmissionService";
@@ -100,7 +99,7 @@ test("an existing Grok agent is current and admitted, and other agents can switc
 });
 
 test("deprecated current runtimes use the same explicit grandfathered contract", () => {
-  for (const runtime of ["kimi", "antigravity", "copilot"]) {
+  for (const runtime of ["kimi", "gemini", "copilot"]) {
     const options = projectExistingAgentRuntimeOptions([runtime], runtime);
     assert.deepEqual(options.find((option) => option.runtimeId === runtime), {
       runtimeId: runtime,
@@ -129,8 +128,8 @@ test("the runtimeFormV2 marker is on exactly the runtimes with a v2 form, indepe
   const withMarker = (options: ReturnType<typeof projectNewAgentRuntimeOptions>) =>
     options.filter((option) => option.runtimeFormV2 !== undefined).map((option) => option.runtimeId).sort();
   const created = projectNewAgentRuntimeOptions(everyRuntime);
-  // Deprecated runtimes with a v2 form (kimi, gemini, antigravity, copilot) are not offered for new agents.
-  assert.deepEqual(withMarker(created), ["builtin", "claude", "codex", "cursor", "grok", "kimi-sdk", "opencode", "pi", "qoder", "qwen"]);
+  // Deprecated runtimes with a v2 form (kimi, gemini, copilot) are not offered for new agents.
+  assert.deepEqual(withMarker(created), ["antigravity", "builtin", "claude", "codex", "cursor", "dsh", "grok", "kimi-sdk", "opencode", "pi", "qoder", "qwen"]);
   for (const option of created.filter((candidate) => candidate.runtimeFormV2)) {
     assert.deepEqual(option.runtimeFormV2, { protocolVersion: 2 });
   }
@@ -138,12 +137,12 @@ test("the runtimeFormV2 marker is on exactly the runtimes with a v2 form, indepe
   assert.deepEqual(withMarker(projectSetupRuntimeOptions(everyRuntime)), []);
   assert.deepEqual(
     withMarker(projectExistingAgentRuntimeOptions(everyRuntime, "kimi-sdk")),
-    ["builtin", "claude", "codex", "cursor", "grok", "kimi-sdk", "opencode", "pi", "qoder", "qwen"],
+    ["antigravity", "builtin", "claude", "codex", "cursor", "dsh", "grok", "kimi-sdk", "opencode", "pi", "qoder", "qwen"],
   );
   // ...and appear, with the marker, only as an edited agent's current runtime.
-  for (const deprecated of ["kimi", "gemini", "antigravity", "copilot"]) {
+  for (const deprecated of ["kimi", "gemini", "copilot"]) {
     const options = projectExistingAgentRuntimeOptions(everyRuntime, deprecated);
-    assert.deepEqual(withMarker(options), ["builtin", "claude", "codex", "cursor", deprecated, "grok", "kimi-sdk", "opencode", "pi", "qoder", "qwen"].sort(), deprecated);
+    assert.deepEqual(withMarker(options), ["antigravity", "builtin", "claude", "codex", "cursor", deprecated, "dsh", "grok", "kimi-sdk", "opencode", "pi", "qoder", "qwen"].sort(), deprecated);
     const current = options.find((option) => option.runtimeId === deprecated);
     assert.equal(current?.current, true, deprecated);
     assert.equal(current?.admissionReason, "deprecated", deprecated);
@@ -221,8 +220,8 @@ test("the opt-in header is exact: only `1` turns the marker on", () => {
 // OAR-only runtimes (Qwen Code, Qoder) have no server flag: the Computer's
 // report decides (xxchan, #proj-runtime:a5762001).
 test("an OAR-only runtime is offered whenever the Computer reports it, with no server flag", () => {
-  const reported = projectNewAgentRuntimeOptionsFor(["qwen", "qoder", "codex"], WEB);
-  for (const runtimeId of ["qwen", "qoder"]) {
+  const reported = projectNewAgentRuntimeOptionsFor(["qwen", "qoder", "dsh", "codex"], WEB);
+  for (const runtimeId of ["qwen", "qoder", "dsh"]) {
     const option = reported.find((candidate) => candidate.runtimeId === runtimeId);
     assert.equal(option?.capabilityStatus, "available", runtimeId);
     assert.equal(option?.canSelectInThisContext, true, runtimeId);
@@ -240,47 +239,37 @@ test("an agent can switch into an OAR-only runtime its Computer reports", () => 
 });
 
 test("server setup never offers an OAR-only runtime", () => {
-  assert.equal(projectSetupRuntimeOptions(["qwen", "qoder", "codex"]).some((option) => option.runtimeId === "qwen" || option.runtimeId === "qoder"), false);
+  assert.equal(projectSetupRuntimeOptions(["qwen", "qoder", "dsh", "codex"]).some((option) => ["qwen", "qoder", "dsh"].includes(option.runtimeId)), false);
 });
 
-test("with no flag-gated runtime a failing flag store disables nothing and revives nothing", async () => {
+test("with no flag-gated runtime a failing flag store disables nothing", async () => {
   const policy = await resolveRuntimeAdmissionPolicy({ serverId: "s", userId: "u" }, async () => { throw new Error("db down"); });
   assert.deepEqual([...policy.disabledRuntimeIds], []);
-  assert.deepEqual([...(policy.revivedRuntimeIds ?? [])], []);
 });
 
 const evaluateAntigravity = (enabled: boolean) => async (requests: Array<{ key: string }>) =>
   requests.map((request) => ({ key: request.key, enabled: enabled && request.key === "agent_runtime_oar_antigravity" }));
 
-test("agent_runtime_oar_antigravity on revives Antigravity for new agents and switches (tygg, #oar-raft:e9798673)", async () => {
-  const on = await resolveRuntimeAdmissionPolicy({ serverId: "s", userId: "u" }, evaluateAntigravity(true) as never);
-  assert.deepEqual([...(on.revivedRuntimeIds ?? [])], ["antigravity"]);
-  assert.equal(isRuntimeDeprecatedForServer("antigravity", on), false);
-  assert.equal(isRuntimeDeprecatedForServer("gemini", on), true);
+// Antigravity is no longer deprecated (tygg): offered for new agents and
+// switches whether its OAR host flag is on or off; the flag only routes it.
+for (const flag of [true, false]) {
+  test(`Antigravity is offered for new agents and switches with agent_runtime_oar_antigravity ${flag ? "on" : "off"}`, async () => {
+    const policy = await resolveRuntimeAdmissionPolicy({ serverId: "s", userId: "u" }, evaluateAntigravity(flag) as never);
+    assert.deepEqual([...policy.disabledRuntimeIds], []);
 
-  const created = projectNewAgentRuntimeOptionsFor(["antigravity"], WEB, on).find((option) => option.runtimeId === "antigravity");
-  assert.equal(created?.availableForNew, true);
-  assert.equal(created?.canSelectInThisContext, true);
-  assert.equal(created?.admissionReason, null);
-  // Only creation is revived: other deprecated runtimes stay hidden.
-  assert.equal(projectNewAgentRuntimeOptionsFor(["gemini"], WEB, on).some((option) => option.runtimeId === "gemini"), false);
+    const created = projectNewAgentRuntimeOptionsFor(["antigravity"], WEB, policy).find((option) => option.runtimeId === "antigravity");
+    assert.equal(created?.availableForNew, true);
+    assert.equal(created?.canSelectInThisContext, true);
+    assert.equal(created?.admissionReason, null);
+    // Other deprecated runtimes stay hidden for new agents.
+    assert.equal(projectNewAgentRuntimeOptionsFor(["gemini"], WEB, policy).some((option) => option.runtimeId === "gemini"), false);
 
-  const current = projectExistingAgentRuntimeOptionsFor(["antigravity"], "antigravity", WEB, on).find((option) => option.runtimeId === "antigravity");
-  assert.equal(current?.admissionReason, null);
-  assert.equal(current?.availableForNew, true);
-  const switchable = projectExistingAgentRuntimeOptionsFor(["antigravity", "claude"], "claude", WEB, on);
-  assert.equal(switchable.find((option) => option.runtimeId === "antigravity")?.canSelectInThisContext, true);
-  // Catalog order is kept when a revived runtime joins the list.
-  const order = switchable.map((option) => option.runtimeId);
-  assert.deepEqual(order, RUNTIMES.filter((runtime) => order.includes(runtime.id)).map((runtime) => runtime.id));
-});
-
-test("agent_runtime_oar_antigravity off keeps Antigravity deprecated: hidden for new agents, current-only", async () => {
-  const off = await resolveRuntimeAdmissionPolicy({ serverId: "s", userId: "u" }, evaluateAntigravity(false) as never);
-  assert.deepEqual([...(off.revivedRuntimeIds ?? [])], []);
-  assert.equal(isRuntimeDeprecatedForServer("antigravity", off), true);
-  assert.equal(projectNewAgentRuntimeOptionsFor(["antigravity"], WEB, off).some((option) => option.runtimeId === "antigravity"), false);
-  assert.equal(projectExistingAgentRuntimeOptionsFor(["antigravity"], "claude", WEB, off).some((option) => option.runtimeId === "antigravity"), false);
-  assert.equal(projectExistingAgentRuntimeOptionsFor(["antigravity"], "antigravity", WEB, off)
-    .find((option) => option.runtimeId === "antigravity")?.admissionReason, "deprecated");
-});
+    const current = projectExistingAgentRuntimeOptionsFor(["antigravity"], "antigravity", WEB, policy).find((option) => option.runtimeId === "antigravity");
+    assert.equal(current?.admissionReason, null);
+    assert.equal(current?.availableForNew, true);
+    const switchable = projectExistingAgentRuntimeOptionsFor(["antigravity", "claude"], "claude", WEB, policy);
+    assert.equal(switchable.find((option) => option.runtimeId === "antigravity")?.canSelectInThisContext, true);
+    const order = switchable.map((option) => option.runtimeId);
+    assert.deepEqual(order, RUNTIMES.filter((runtime) => order.includes(runtime.id)).map((runtime) => runtime.id));
+  });
+}

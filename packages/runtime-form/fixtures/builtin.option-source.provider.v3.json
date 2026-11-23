@@ -1,0 +1,186 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "builtin",
+  "schemaVersion": "builtin-pi.create.v3",
+  "sourceId": "provider",
+  "kind": "select",
+  "pointer": "/providerId",
+  "options": [
+    {
+      "value": "deepseek",
+      "label": "DeepSeek",
+      "providerKind": "preset"
+    },
+    {
+      "value": "minimax",
+      "label": "MiniMax",
+      "providerKind": "preset"
+    },
+    {
+      "value": "minimax-cn",
+      "label": "MiniMax CN",
+      "providerKind": "preset"
+    },
+    {
+      "value": "zai",
+      "label": "Z.AI",
+      "providerKind": "preset"
+    },
+    {
+      "value": "zai-coding-cn",
+      "label": "Z.AI Coding CN",
+      "providerKind": "preset"
+    },
+    {
+      "value": "moonshotai",
+      "label": "Moonshot AI",
+      "providerKind": "preset"
+    },
+    {
+      "value": "moonshotai-cn",
+      "label": "Moonshot AI CN",
+      "providerKind": "preset"
+    },
+    {
+      "value": "kimi-coding",
+      "label": "Kimi For Coding",
+      "providerKind": "preset"
+    },
+    {
+      "value": "qwen-token-plan",
+      "label": "Qwen Token Plan",
+      "providerKind": "preset"
+    },
+    {
+      "value": "qwen-token-plan-cn",
+      "label": "Qwen Token Plan CN",
+      "providerKind": "preset"
+    },
+    {
+      "value": "openrouter",
+      "label": "OpenRouter",
+      "providerKind": "preset"
+    },
+    {
+      "value": "openai",
+      "label": "OpenAI",
+      "providerKind": "preset"
+    },
+    {
+      "value": "anthropic",
+      "label": "Anthropic",
+      "providerKind": "preset"
+    },
+    {
+      "value": "google",
+      "label": "Google",
+      "providerKind": "preset"
+    },
+    {
+      "value": "xai",
+      "label": "xAI",
+      "providerKind": "preset"
+    },
+    {
+      "value": "xiaomi",
+      "label": "Xiaomi",
+      "providerKind": "preset"
+    },
+    {
+      "value": "xiaomi-token-plan-cn",
+      "label": "Xiaomi Token Plan CN",
+      "providerKind": "preset"
+    },
+    {
+      "value": "xiaomi-token-plan-sgp",
+      "label": "Xiaomi Token Plan SGP",
+      "providerKind": "preset"
+    },
+    {
+      "value": "xiaomi-token-plan-ams",
+      "label": "Xiaomi Token Plan AMS",
+      "providerKind": "preset"
+    },
+    {
+      "value": "ant-ling",
+      "label": "Ant Ling",
+      "providerKind": "preset"
+    },
+    {
+      "value": "baseten",
+      "label": "Baseten",
+      "providerKind": "preset"
+    },
+    {
+      "value": "cerebras",
+      "label": "Cerebras",
+      "providerKind": "preset"
+    },
+    {
+      "value": "fireworks",
+      "label": "Fireworks",
+      "providerKind": "preset"
+    },
+    {
+      "value": "groq",
+      "label": "Groq",
+      "providerKind": "preset"
+    },
+    {
+      "value": "meta",
+      "label": "Meta",
+      "providerKind": "preset"
+    },
+    {
+      "value": "mistral",
+      "label": "Mistral",
+      "providerKind": "preset"
+    },
+    {
+      "value": "nvidia",
+      "label": "NVIDIA",
+      "providerKind": "preset"
+    },
+    {
+      "value": "opencode",
+      "label": "OpenCode Zen",
+      "providerKind": "preset"
+    },
+    {
+      "value": "opencode-go",
+      "label": "OpenCode Go",
+      "providerKind": "preset"
+    },
+    {
+      "value": "qwen-token-plan-individual",
+      "label": "Qwen Token Plan Individual",
+      "providerKind": "preset"
+    },
+    {
+      "value": "qwen-token-plan-individual-cn",
+      "label": "Qwen Token Plan Individual CN",
+      "providerKind": "preset"
+    },
+    {
+      "value": "together",
+      "label": "Together",
+      "providerKind": "preset"
+    },
+    {
+      "value": "vercel-ai-gateway",
+      "label": "Vercel AI Gateway",
+      "providerKind": "preset"
+    },
+    {
+      "value": "openai-compatible",
+      "label": "OpenAI Compatible",
+      "providerKind": "gateway"
+    },
+    {
+      "value": "anthropic-compatible",
+      "label": "Anthropic Compatible",
+      "providerKind": "gateway"
+    }
+  ],
+  "defaultValue": "deepseek"
+}

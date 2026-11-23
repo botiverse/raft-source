@@ -776,7 +776,7 @@ test("bot-token and bot-status refusals say why: not_added and declined carry ad
   await getDb().update(oauthClientInstalls).set({ status: "suspended" }).where(eq(oauthClientInstalls.id, install.id));
   assert.deepEqual(await botToken(), { status: 403, body: { ...notGranted, state: "installation_suspended" } });
   // bot-status keeps answering a suspended installation as not found, as before.
-  assert.deepEqual(await botStatus(), { status: 404, body: { error: "Active installation not found", code: "installation_not_found" } });
+  assert.deepEqual(await botStatus(), { status: 404, body: { error: "Active installation not found", code: "installation_not_found", errorCode: "installation_not_found" } });
 
   // An App without a bot: not added, and no link to a bot that does not exist.
   const botless = await seedBotlessApp(fx);

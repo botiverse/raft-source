@@ -1,20 +1,21 @@
 import { useCallback, useMemo, useState } from "react";
-import type { FocusEvent, PointerEvent, ReactElement, ReactNode } from "react";
+import type { FocusEvent, MouseEvent, PointerEvent, ReactElement, ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { FileText } from "lucide-react";
-import { MessageReferenceLabel, MessageReferencePending, MessageReferenceUnavailable } from "@botiverse/raft-ui";
+import { MessageReferenceLabel, MessageReferencePending } from "@botiverse/raft-ui";
 
-import { artifactLinkOf, artifactObjectRefOf, useArtifactLinkSummaries, useArtifactLinkTargets } from "../../apps/artifacts";
+import { artifactLinkOf, artifactObjectRefOf, artifactUrl, openArtifactOnPlainClick, useArtifactLinkSummaries, useArtifactLinkTargets } from "../../apps/artifacts";
 import type { ArtifactLink, ArtifactLinkTarget } from "../../apps/artifacts";
 import { objectRefKey } from "../../objects/objectSummaryLoader";
 import Tooltip from "../ui/Tooltip";
-import { DeletedObjectChip, ObjectLinkChip } from "./AppLinkChip";
-import { descriptionPieces, descriptionUrls } from "./descriptionLinks";
+import { DeletedObjectChip, ObjectLinkChip, UnavailableObjectChip } from "./AppLinkChip";
+import { descriptionPieces, descriptionUrls } from "@botiverse/raft-shared";
 
 type Shown = { kind: "text"; text: string } | { kind: "artifact"; url: string; link: ArtifactLink };
 
-// A chip with its own hover card (not the deleted chip, which has none: over
-// it the description's tooltip still shows).
+// A chip that opens something on hover or focus (its hover card; the pending
+// chip, a link about to become one): not the deleted chip, which has none,
+// so over it the description's tooltip still shows.
 const CHIP_SELECTOR = '[data-app-link-chip]:not([data-app-link-chip="deleted"])';
 const inChip = (target: EventTarget | null | undefined) => target instanceof Element && target.closest(CHIP_SELECTOR) !== null;
 
@@ -34,11 +35,17 @@ const inChip = (target: EventTarget | null | undefined) => target instanceof Ele
  *   one request.
  * - Until it answers: a pending chip reading "Artifact". Unavailable to this
  *   viewer, or failed: the same words, gray (never the address, never a
- *   title they may not read). Deleted, to a viewer who could see it: the
- *   message body's deleted chip.
+ *   title they may not read), with the Artifact hover card's shell saying
+ *   only that they can't see it and that opening it says why
+ *   (UnavailableObjectChip). Both are still the Artifact's link, as an
+ *   unanswered link in a message body stays the author's: a plain click opens
+ *   it in place (the viewer's own "can't open" state when they can't read
+ *   it), a modified or middle click follows `artifactUrl`. Deleted, to a
+ *   viewer who could see it: the message body's deleted chip.
  * - The tooltip says the description with titles for addresses, and stays
  *   closed while the pointer or keyboard focus is on a chip, whose own hover
- *   card says more (over a deleted chip, which has none, it still shows).
+ *   card says more (over a deleted chip, which has none, it still shows; over
+ *   the pending chip, a link, it stays closed too).
  * - The chip is capped at 16em and sits on the line's baseline, so the row
  *   neither grows nor wraps.
  */
@@ -96,24 +103,39 @@ export function ProfileDescription({ text, children }: { text: string; children:
   );
 }
 
+/**
+ * One Artifact link in the description. The loading and unavailable chips
+ * are links too (a plain click opens in place); a share image turns each chip
+ * back into the author's link. A loading chip that has keyboard focus loses
+ * it when its answer replaces it with another chip (a short window, left as is).
+ */
 function DescriptionArtifact({ url, link, placeholder }: { url: string; link: ArtifactLink; placeholder: string }) {
   const chip = useMemo(() => (link.state === "ok" ? { kind: "object" as const, url, ...link } : null), [link, url]);
+  const { target } = link.data;
+  const onClick = useCallback((event: MouseEvent<HTMLAnchorElement>) => openArtifactOnPlainClick(event, target), [target]);
+  const pendingLink = useMemo(() => <a href={artifactUrl(target.id, target.version)} aria-label={placeholder} onClick={onClick} />, [target, placeholder, onClick]);
   let drawn: ReactNode;
   if (chip) drawn = <ObjectLinkChip link={chip} />;
   else if (link.state === "deleted") drawn = <DeletedObjectChip title={link.data.deleted.title} url={url} />;
   else if (link.state === "loading") {
     drawn = (
-      <MessageReferencePending capped data-description-artifact="pending">
+      <MessageReferencePending
+        capped
+        className="cursor-pointer"
+        render={pendingLink}
+        data-description-artifact="pending"
+        data-app-link-chip="description-pending"
+        data-select-screenshot-author-link={url}
+      >
         <FileText aria-hidden />
         <MessageReferenceLabel>{placeholder}</MessageReferenceLabel>
       </MessageReferencePending>
     );
   } else {
     drawn = (
-      <MessageReferenceUnavailable data-description-artifact="unavailable">
-        <FileText aria-hidden />
-        <MessageReferenceLabel>{placeholder}</MessageReferenceLabel>
-      </MessageReferenceUnavailable>
+      <span className="contents" data-description-artifact="unavailable">
+        <UnavailableObjectChip url={url} target={target} label={placeholder} />
+      </span>
     );
   }
   // 16em, not the message body's 24em: a description is the row's quietest

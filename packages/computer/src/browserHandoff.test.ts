@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 
-import { browserOpenCommand, canInstallEnterToOpenUrl, installEnterToOpenUrl, openUrlInBrowser } from "./browserHandoff";
+import { EventEmitter } from "node:events";
+
+import { browserOpenCommand, canInstallEnterToOpenUrl, installEnterToOpenUrl, openUrlInBrowser, startBrowser } from "./browserHandoff";
 
 test("installEnterToOpenUrl opens the URL on Enter and only once", () => {
   const input = new PassThrough() as PassThrough & { isTTY: boolean };
@@ -80,4 +82,36 @@ test("openUrlInBrowser does not spawn anything for a non-http(s) URL", () => {
   assert.equal(spawned.length, 0);
   openUrlInBrowser("https://app.raft.build/login", fakeSpawn);
   assert.equal(spawned.length, 1);
+});
+
+function fakeOpener(script: (child: EventEmitter) => void) {
+  const calls: unknown[][] = [];
+  const spawnImpl = ((...args: unknown[]) => {
+    calls.push(args);
+    const child = Object.assign(new EventEmitter(), { unref() {} });
+    setImmediate(() => script(child));
+    return child;
+  }) as unknown as NonNullable<Parameters<typeof startBrowser>[1]>["spawnImpl"];
+  return { calls, spawnImpl };
+}
+
+test("startBrowser: an opener that starts and keeps running counts as opened", async () => {
+  const { calls, spawnImpl } = fakeOpener((child) => child.emit("spawn"));
+  assert.equal(await startBrowser("https://app.raft.build/login/device?request=r", { spawnImpl, platform: "darwin", settleMs: 5 }), true);
+  assert.deepEqual(calls[0]?.slice(0, 2), ["open", ["https://app.raft.build/login/device?request=r"]]);
+});
+
+test("startBrowser: exit 0 is opened; a spawn error or a non-zero exit is not", async () => {
+  const ok = fakeOpener((child) => { child.emit("spawn"); child.emit("exit", 0); });
+  assert.equal(await startBrowser("https://app.raft.build/x", { spawnImpl: ok.spawnImpl, platform: "linux", settleMs: 1_000 }), true);
+  const missing = fakeOpener((child) => child.emit("error", Object.assign(new Error("ENOENT"), { code: "ENOENT" })));
+  assert.equal(await startBrowser("https://app.raft.build/x", { spawnImpl: missing.spawnImpl, platform: "linux" }), false);
+  const noBrowser = fakeOpener((child) => { child.emit("spawn"); child.emit("exit", 3); });
+  assert.equal(await startBrowser("https://app.raft.build/x", { spawnImpl: noBrowser.spawnImpl, platform: "linux", settleMs: 1_000 }), false);
+});
+
+test("startBrowser: a non-http(s) URL is never handed to the opener", async () => {
+  const { calls, spawnImpl } = fakeOpener((child) => child.emit("spawn"));
+  assert.equal(await startBrowser("file:///etc/passwd", { spawnImpl }), false);
+  assert.equal(calls.length, 0);
 });

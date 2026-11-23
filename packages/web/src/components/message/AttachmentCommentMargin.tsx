@@ -237,6 +237,7 @@ function DiscussionCard({
   useEffect(() => {
     const request = focusOnOpen.current;
     if (!request || request.key !== discussion.key) return;
+    // oxlint-disable-next-line react/immutability -- `focusOnOpen` is a ref object passed as a prop; taking the request out of it in the effect is what a ref is for.
     focusOnOpen.current = null;
     if (request.target === "input") {
       const input = card.current?.querySelector<HTMLTextAreaElement>("textarea");
@@ -1110,6 +1111,7 @@ function NewCommentCard({
   const describedById = useId();
   useEffect(() => {
     if (focusOnOpen.current?.key !== DRAFT_KEY) return;
+    // oxlint-disable-next-line react/immutability -- `focusOnOpen` is a ref object passed as a prop; taking the request out of it in the effect is what a ref is for.
     focusOnOpen.current = null;
     const input = card.current?.querySelector<HTMLTextAreaElement>("textarea");
     (input ?? card.current)?.focus({ preventScroll: true });

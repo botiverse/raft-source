@@ -57,6 +57,21 @@ export const agentApiArtifactCheckFindingsSchema = lazySchema("agentApiArtifactC
   blank: z.boolean(),
   /** At phone width the page scrolls sideways: its content's width against the screen's. Null when it doesn't. */
   phoneOverflow: passthroughObject({ contentWidth: z.number().int(), viewportWidth: z.number().int() }).nullable(),
+  /**
+   * A soft hint, not an error (it may be intended): at these viewports the page is taller than the
+   * window and nothing lets a reader scroll to the rest (shared artifactCheckContract.ts
+   * ArtifactCheckCantScroll). Left out or empty when it scrolls or fits, and by a check from before
+   * the hint. Agents only: no person's view shows findings.
+   */
+  pageCantScroll: z.array(passthroughObject({
+    shot: z.enum(ARTIFACT_CHECK_SHOTS),
+    viewportWidth: z.number().int(),
+    viewportHeight: z.number().int(),
+    contentHeight: z.number().int(),
+    hiddenHeight: z.number().int(),
+    /** What holds it to one screen: `html`, `body` or an element of the page (its own name), and its style. */
+    heldBy: z.array(passthroughObject({ element: z.string(), style: z.string() })),
+  })).optional(),
 }));
 
 export const agentApiArtifactCheckSchema = lazySchema("agentApiArtifactCheckSchema", () => passthroughObject({

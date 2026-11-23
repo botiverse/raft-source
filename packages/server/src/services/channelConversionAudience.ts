@@ -188,59 +188,29 @@ export async function audienceCutover(
   const finalAgentSet = new Set(finalAgents.map((row) => row.agentId));
   const threadIds = (await conversionScopeChannelIds(tx, job, canonicalChannelId)).filter((id) => id !== job.sourceChannelId && id !== canonicalChannelId);
   const scopeIds = [job.sourceChannelId, canonicalChannelId, ...threadIds];
-  const residue = await tx.execute(sql`
-    SELECT DISTINCT receiver_id::text AS id, receiver_type::text AS type
-      FROM ${inboxNotificationFacts}
-     WHERE source_channel_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
-    UNION
-    SELECT DISTINCT follower_id::text, follower_type::text
-      FROM ${threadFollows}
-     WHERE thread_channel_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
-    UNION
-    SELECT DISTINCT user_id::text, 'user'::text
-      FROM ${userChannelInboxStates}
-     WHERE channel_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
-    UNION
-    SELECT DISTINCT user_id::text, 'user'::text
-      FROM ${userChannelReadCursors}
-     WHERE channel_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
-    UNION
-    SELECT DISTINCT user_id::text, 'user'::text
-      FROM ${userChannelDisplayPrefs}
-     WHERE channel_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
-    UNION
-    SELECT DISTINCT user_id::text, 'user'::text
-      FROM ${userChannelNotificationPrefs}
-     WHERE channel_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
-    UNION
-    SELECT DISTINCT receiver_id::text, receiver_type::text
-      FROM ${inboxSuppressionStates}
-     WHERE target_channel_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
-        OR source_channel_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
-    UNION
-    SELECT DISTINCT receiver_id::text, receiver_type::text
-      FROM ${inboxTargetMuteStates}
-     WHERE source_channel_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
-    UNION
-    SELECT DISTINCT receiver_id::text, receiver_type::text
-      FROM ${notificationOutbox}
-     WHERE source_channel_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
-    UNION
-    SELECT DISTINCT principal_id::text, 'user'::text
-      FROM ${activitySyncRows}
-     WHERE server_id = ${job.serverId}::uuid
-       AND row_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
-    UNION
-    SELECT DISTINCT principal_id::text, 'user'::text
-      FROM ${activitySyncChanges}
-     WHERE server_id = ${job.serverId}::uuid
-       AND row_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
-       AND ${audienceCleanupMutationForTest !== "activity_change_only_principal_discovery"}
-    UNION
-    SELECT DISTINCT agent_id::text, 'agent'::text
-      FROM ${agentChannelReadCursors}
-     WHERE channel_id IN (${sql.join(scopeIds.map((id) => sql`${id}::uuid`), sql`, `)})
-  `);
+  // One probe per scope id. A single IN/ANY list over the whole scope lets the
+  // planner sum per-channel estimates (a busy channel's 720 ids came to ~945k
+  // estimated vs 16k real inbox_notification_facts rows) and pick a full seq
+  // scan of the table. LATERAL + OFFSET 0 keeps the per-id index lookup.
+  const residueBranch = (columns: SQL, table: AnyPgTable, match: SQL) => sql`
+    SELECT DISTINCT hit.id, hit.type
+      FROM unnest(${sql.param(scopeIds)}::uuid[]) AS scope(id)
+     CROSS JOIN LATERAL (SELECT ${columns} FROM ${table} WHERE ${match} OFFSET 0) hit`;
+  const residue = await tx.execute(sql.join([
+    residueBranch(sql`receiver_id::text AS id, receiver_type::text AS type`, inboxNotificationFacts, sql`source_channel_id = scope.id`),
+    residueBranch(sql`follower_id::text AS id, follower_type::text AS type`, threadFollows, sql`thread_channel_id = scope.id`),
+    residueBranch(sql`user_id::text AS id, 'user'::text AS type`, userChannelInboxStates, sql`channel_id = scope.id`),
+    residueBranch(sql`user_id::text AS id, 'user'::text AS type`, userChannelReadCursors, sql`channel_id = scope.id`),
+    residueBranch(sql`user_id::text AS id, 'user'::text AS type`, userChannelDisplayPrefs, sql`channel_id = scope.id`),
+    residueBranch(sql`user_id::text AS id, 'user'::text AS type`, userChannelNotificationPrefs, sql`channel_id = scope.id`),
+    residueBranch(sql`receiver_id::text AS id, receiver_type::text AS type`, inboxSuppressionStates, sql`target_channel_id = scope.id`),
+    residueBranch(sql`receiver_id::text AS id, receiver_type::text AS type`, inboxSuppressionStates, sql`source_channel_id = scope.id`),
+    residueBranch(sql`receiver_id::text AS id, receiver_type::text AS type`, inboxTargetMuteStates, sql`source_channel_id = scope.id`),
+    residueBranch(sql`receiver_id::text AS id, receiver_type::text AS type`, notificationOutbox, sql`source_channel_id = scope.id`),
+    residueBranch(sql`principal_id::text AS id, 'user'::text AS type`, activitySyncRows, sql`server_id = ${job.serverId}::uuid AND row_id = scope.id`),
+    residueBranch(sql`principal_id::text AS id, 'user'::text AS type`, activitySyncChanges, sql`server_id = ${job.serverId}::uuid AND row_id = scope.id AND ${audienceCleanupMutationForTest !== "activity_change_only_principal_discovery"}`),
+    residueBranch(sql`agent_id::text AS id, 'agent'::text AS type`, agentChannelReadCursors, sql`channel_id = scope.id`),
+  ], sql` UNION `));
   const residueUsers = (residue.rows as Array<{ id?: unknown; type?: unknown }>)
     .filter((row) => row.type === "user" && typeof row.id === "string")
     .map((row) => row.id as string);

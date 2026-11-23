@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import Redis from "ioredis";
 import { MachineResponseRelay, redisMachineReplyStore, asMachineReplyRequestId, asMachineReplyReplicaId, type MachineReplyStore, type RelayedMachineResponse } from "./machineResponseRelay";
-import { asProviderProbeId } from "@botiverse/raft-shared";
 import { AgentOrchestrator } from "./services/agentOrchestrator";
 import { asMachineId, type ServerToMachineMessage, type RuntimeAccountUsageSnapshot } from "@botiverse/raft-shared";
 
@@ -15,7 +14,6 @@ function memoryStore(): MachineReplyStore {
       if (!row || row.machineId !== machineId || row.type !== response.type) return null;
       if (row.agentId && (!("agentId" in response) || row.agentId !== response.agentId)) return null;
       if (row.migrationId && (!("migrationId" in response) || row.migrationId !== response.migrationId)) return null;
-    if (row.probeId && (!("probeId" in response) || row.probeId !== response.probeId)) return null;
       if (!row.response) { row.response = response; row.sourceReplicaId = sourceReplicaId; }
       return row.replyReplicaId;
     },
@@ -150,77 +148,6 @@ test.skipIf(!process.env.MACHINE_REPLY_REDIS_URL)("real Redis atomic mailbox and
     await store.remove(id);
     assert.equal(await store.write("machine", { type: "machine:runtime_models:result", requestId: id, models: [] }, asMachineReplyReplicaId("owner")), null);
   } finally { redis.disconnect(); }
-});
-
-test("a wrong-probe response never occupies the reply slot (memory store mirror of the Lua bound)", async () => {
-  const store = memoryStore();
-  const requestId = `req-${Math.random().toString(36).slice(2)}`;
-  const owner = new MachineResponseRelay("owner", store, async () => {}, 25);
-  const requester = new MachineResponseRelay("requester", store, async () => {}, 25);
-  await store.open({
-    requestId,
-    machineId: "machine-1",
-    type: "machine:provider_probe:result",
-    probeId: "probe-correct",
-  } as never, 30_000);
-  await owner.forward("machine-1", {
-    type: "machine:provider_probe:result",
-    requestId,
-    probeId: asProviderProbeId("probe-wrong"),
-    outcome: "success",
-    category: null,
-    latencyMs: 1,
-    responseSha256: null,
-    responseBytes: null,
-    resultDigest: "x",
-    authorityEcho: { connectionEpochId: "e", replicaGeneration: "g" },
-    daemonVersion: null,
-    computerVersion: null,
-    runtimeVersion: null,
-    reply: null,
-  }, () => {});
-  const afterWrong = await store.read(asMachineReplyRequestId(requestId));
-  assert.equal(afterWrong?.response, undefined, "wrong-probe response must not occupy the slot");
-  const settled = await requester.request({
-    requestId: asMachineReplyRequestId(requestId),
-    machineId: "machine-1",
-    type: "machine:provider_probe:result",
-    probeId: "probe-correct",
-  }, 5_000, async () => {
-    await owner.forward("machine-1", {
-      type: "machine:provider_probe:result",
-      requestId,
-      probeId: asProviderProbeId("probe-wrong"),
-      outcome: "success",
-      category: null,
-      latencyMs: 1,
-      responseSha256: null,
-      responseBytes: null,
-      resultDigest: "x",
-      authorityEcho: { connectionEpochId: "e", replicaGeneration: "g" },
-      daemonVersion: null,
-      computerVersion: null,
-      runtimeVersion: null,
-      reply: null,
-    }, () => {});
-    await owner.forward("machine-1", {
-      type: "machine:provider_probe:result",
-      requestId,
-      probeId: asProviderProbeId("probe-correct"),
-      outcome: "success",
-      category: null,
-      latencyMs: 1,
-      responseSha256: null,
-      responseBytes: null,
-      resultDigest: "y",
-      authorityEcho: { connectionEpochId: "e", replicaGeneration: "g" },
-      daemonVersion: null,
-      computerVersion: null,
-      runtimeVersion: null,
-      reply: null,
-    }, () => {});
-  }, () => {});
-  assert.equal((settled as { probeId?: string }).probeId, "probe-correct");
 });
 
 const usageSnapshot: RuntimeAccountUsageSnapshot = {

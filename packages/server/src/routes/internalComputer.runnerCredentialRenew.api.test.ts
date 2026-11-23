@@ -263,9 +263,9 @@ test("renew: the new key works for 7 days; the old one keeps working for at most
   assert.equal(audit?.metadata.via, "runner_renewed");
   assert.equal(audit?.metadata.machineId, f.machineId);
 
-  // Reconcile at the next ready (daemon lists nothing yet): the fresh key is
-  // inside the grace window and stays; reconcile reads no expires_at.
-  await revokeRunnerCredentialsNotHeld({ machineId: f.machineId, heldIds: [], issuedBefore: new Date(Date.now() - RUNNER_CREDENTIAL_RECONCILE_GRACE_MS), now: new Date() });
+  // Reconcile at the next ready (daemon lists only the old key yet): the
+  // fresh key is inside the grace window and stays; reconcile reads no expires_at.
+  await revokeRunnerCredentialsNotHeld({ machineId: f.machineId, heldIds: [old.credentialId], issuedBefore: new Date(Date.now() - RUNNER_CREDENTIAL_RECONCILE_GRACE_MS), now: new Date() });
   assert.equal((await credentialRow(renewed.credentialId)).revokedAt, null, "reconcile leaves a fresh renewal alone");
 
   // 6 minutes on: the old key is expired, the new one still works.

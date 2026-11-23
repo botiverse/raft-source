@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import {
   attachmentTransferIntents,
+  channelConversionJobs,
   attachmentUploadReservations,
   attachmentUploadSessions,
   channels,
@@ -17,6 +18,7 @@ import {
   tasks
 } from "../db/schema";
 import {
+  parseConversionProgress,
   type ConversionThreadProjection,
   type ConversionUploadScope
 } from "./channelConversionContracts";
@@ -24,7 +26,7 @@ import {
   ChannelConversionLedgerConflictError,
   recordConversionPhaseCommit
 } from "./channelConversionFenceService";
-import { advance, ChannelConversionError, conversionTraceAttrs, persistResourceBatchProgress, requireCanonicalChannelId, requireStorageNamespaceId, stableStringify, type ChannelConversionJob, type ChannelConversionPhase } from "./channelConversionPhaseContext";
+import { advance, ChannelConversionError, conversionTraceAttrs, persistResourceBatchProgress, requireCanonicalChannelId, requireStorageNamespaceId, stableStringify, stateForLegacyPhase, type ChannelConversionJob, type ChannelConversionPhase } from "./channelConversionPhaseContext";
 import { CHANNEL_CONVERSION_BATCH_SIZE, conversionThreadMapping, moveConversionResources, verifyConversionResources } from "./channelConversionResources";
 import { taskConversationChannelName } from "./taskConversationService";
 import { RESERVATION_IN_FLIGHT, SESSION_IN_FLIGHT, TRANSFER_INTENT_IN_FLIGHT } from "./channelConversionUploadActivity";
@@ -519,6 +521,60 @@ export async function prepareThreads(
   { tx, job, progress, span }: ConversionPhaseContext) {
   const canonicalChannelId = await requireCanonicalChannelId(tx, job);
   const storageNamespaceId = await requireStorageNamespaceId(tx, canonicalChannelId);
+  const sourceThreads = await prepareCanonicalThreads(tx, job, canonicalChannelId, storageNamespaceId);
+
+  const preparedThreads = (typeof progress.preparedThreads === "number" ? progress.preparedThreads : 0) + sourceThreads.length;
+  if (sourceThreads.length) await recordConversionPhaseCommit(tx, {
+    jobId: job.id, conversionEpoch: job.conversionEpoch, phase: job.phase,
+    batchKey: `threads:${progress.preparedThreadsCursor ?? "start"}`,
+    sourceCount: sourceThreads.length, targetCount: sourceThreads.length,
+    checksumInput: stableStringify(sourceThreads),
+  });
+  progress.preparedThreads = preparedThreads;
+  if (sourceThreads.length) progress.preparedThreadsCursor = sourceThreads.at(-1)!.oldThreadId;
+  if (sourceThreads.length === CHANNEL_CONVERSION_BATCH_SIZE) {
+    await persistResourceBatchProgress(tx, job, progress);
+    return;
+  }
+  const preparedTaskConversations = await prepareTaskConversationProjections(tx, job, canonicalChannelId, storageNamespaceId, canonicalChannelId);
+  progress.preparedTaskConversations = (progress.preparedTaskConversations ?? 0) + preparedTaskConversations;
+  if (preparedTaskConversations === CHANNEL_CONVERSION_BATCH_SIZE) {
+    await persistResourceBatchProgress(tx, job, progress);
+    return;
+  }
+  const threadProjectionMap = await readThreadProjectionMap(tx, job, canonicalChannelId);
+  await advance(tx, job.id, "move_thread_messages", {
+    progress: { ...progress, preparedThreads, threadProjectionMap },
+  });
+  span?.addEvent("server.channel_conversion.phase.finished", conversionTraceAttrs(job, {
+    outcome: "ok",
+    rowsCopied: preparedThreads,
+  }));
+}
+
+type PreparedSourceThread = {
+  oldThreadId: string;
+  oldThreadDescription: string | null;
+  oldThreadCreatedAt: Date;
+  parentMessageId: string;
+};
+
+/**
+ * One batch of the host's threads under messages of `parentChannelId` (the
+ * canonical channel once the parents moved; the source channel itself in an
+ * online move, where the parents move later) becomes joint threads: each
+ * local thread becomes the host's projection (parent_message_id nulled), a
+ * canonical thread on the storage server takes the parent message (a thread
+ * points at its parent message's id, so it stays valid when the parent
+ * moves), the parent message's thread_id points at it, and joint_channels +
+ * joint_channel_servers link them. Returns the threads of this batch.
+ */
+async function prepareCanonicalThreads(
+  tx: DatabaseExecutor,
+  job: ChannelConversionJob,
+  parentChannelId: string,
+  storageNamespaceId: string,
+): Promise<PreparedSourceThread[]> {
   const sourceThreadsResult = await tx.execute(sql`
       SELECT
         thread_channel.id::text AS "oldThreadId",
@@ -531,7 +587,7 @@ export async function prepareThreads(
       WHERE thread_channel.server_id = ${job.serverId}
         AND thread_channel.type = 'thread'
         AND thread_channel.deleted_at IS NULL
-        AND parent_message.channel_id = ${canonicalChannelId}
+        AND parent_message.channel_id = ${parentChannelId}
         AND NOT EXISTS (
           SELECT 1
           FROM ${jointChannelServers} existing_projection
@@ -540,12 +596,7 @@ export async function prepareThreads(
         )
       ORDER BY thread_channel.id LIMIT ${CHANNEL_CONVERSION_BATCH_SIZE}
   `);
-  const sourceThreads = sourceThreadsResult.rows as Array<{
-    oldThreadId: string;
-    oldThreadDescription: string | null;
-    oldThreadCreatedAt: Date;
-    parentMessageId: string;
-  }>;
+  const sourceThreads = sourceThreadsResult.rows as PreparedSourceThread[];
 
   for (const sourceThread of sourceThreads) {
     const canonicalThreadId = randomUUID();
@@ -583,34 +634,7 @@ export async function prepareThreads(
     await tx.update(messages).set({ threadId: canonicalThreadId })
       .where(eq(messages.id, sourceThread.parentMessageId));
   }
-
-  const preparedThreads = (typeof progress.preparedThreads === "number" ? progress.preparedThreads : 0) + sourceThreads.length;
-  if (sourceThreads.length) await recordConversionPhaseCommit(tx, {
-    jobId: job.id, conversionEpoch: job.conversionEpoch, phase: job.phase,
-    batchKey: `threads:${progress.preparedThreadsCursor ?? "start"}`,
-    sourceCount: sourceThreads.length, targetCount: sourceThreads.length,
-    checksumInput: stableStringify(sourceThreads),
-  });
-  progress.preparedThreads = preparedThreads;
-  if (sourceThreads.length) progress.preparedThreadsCursor = sourceThreads.at(-1)!.oldThreadId;
-  if (sourceThreads.length === CHANNEL_CONVERSION_BATCH_SIZE) {
-    await persistResourceBatchProgress(tx, job, progress);
-    return;
-  }
-  const preparedTaskConversations = await prepareTaskConversationProjections(tx, job, canonicalChannelId, storageNamespaceId);
-  progress.preparedTaskConversations = (progress.preparedTaskConversations ?? 0) + preparedTaskConversations;
-  if (preparedTaskConversations === CHANNEL_CONVERSION_BATCH_SIZE) {
-    await persistResourceBatchProgress(tx, job, progress);
-    return;
-  }
-  const threadProjectionMap = await readThreadProjectionMap(tx, job, canonicalChannelId);
-  await advance(tx, job.id, "move_thread_messages", {
-    progress: { ...progress, preparedThreads, threadProjectionMap },
-  });
-  span?.addEvent("server.channel_conversion.phase.finished", conversionTraceAttrs(job, {
-    outcome: "ok",
-    rowsCopied: preparedThreads,
-  }));
+  return sourceThreads;
 }
 
 /**
@@ -637,6 +661,8 @@ async function prepareTaskConversationProjections(
   job: ChannelConversionJob,
   canonicalChannelId: string,
   storageNamespaceId: string,
+  /** The channel the tasks are in: the canonical channel, or the source in an online move. */
+  taskChannelId: string,
 ): Promise<number> {
   const result = await tx.execute(sql`
     SELECT
@@ -649,7 +675,7 @@ async function prepareTaskConversationProjections(
       ON conversation.id = task.conversation_channel_id
      AND conversation.type = 'task'
      AND conversation.deleted_at IS NULL
-    WHERE task.channel_id = ${canonicalChannelId}
+    WHERE task.channel_id = ${taskChannelId}
       AND conversation.server_id = ${job.serverId}
       AND NOT EXISTS (
         SELECT 1
@@ -736,7 +762,8 @@ export async function verify(
 async function readThreadProjectionMap(
   tx: DatabaseExecutor,
   job: ChannelConversionJob,
-  canonicalChannelId: string,
+  /** The channel the parent messages are in (the canonical, or the source in an online move). */
+  parentChannelId: string,
 ): Promise<ConversionThreadProjection[]> {
   const result = await tx.execute(sql`
     SELECT
@@ -762,7 +789,7 @@ async function readThreadProjectionMap(
       ON parent_message.id = canonical_thread.parent_message_id
     WHERE projection.server_id = ${job.serverId}
       AND canonical_thread.type = 'thread'
-      AND parent_message.channel_id = ${canonicalChannelId}
+      AND parent_message.channel_id = ${parentChannelId}
     ORDER BY projection.local_channel_id, projection.joint_channel_id
   `);
   return (result.rows as Array<Record<string, unknown>>).map((row) => ({
@@ -780,4 +807,147 @@ async function readThreadProjectionMap(
     joinedByUserId: typeof row.joinedByUserId === "string" ? row.joinedByUserId : null,
     disconnectedByUserId: typeof row.disconnectedByUserId === "string" ? row.disconnectedByUserId : null,
   }));
+}
+
+/**
+ * channel_conversion_online_move_v1: the whole preparation, inline in the
+ * start's transaction (which holds the conversion lock exclusively, the
+ * source row and its threads and task conversations FOR UPDATE): today's
+ * prepare (canonical channel, joint rows, host projection) and prepare_tasks
+ * phases with their ledger entries, the task-number high-water carried to
+ * the canonical channel, then every existing thread and task conversation of
+ * the source turned joint from the source's current parents. The job ends in
+ * phase `online_move`, from which onlineMoveCanonicalForRoot routes the
+ * source's new root messages to the canonical channel. Its ledger entry
+ * (phase online_move, batch "prepared") records what was prepared.
+ */
+let onlineMoveStepObserverForTest: ((step: string, ms: number) => void) | null = null;
+
+/** Test seam (the timing measurement): told each step of the online start and how long it took. */
+export function setOnlineMoveStepObserverForTest(observer: ((step: string, ms: number) => void) | null): void {
+  if (process.env.NODE_ENV !== "test") throw new Error("online move step observers are test-only");
+  onlineMoveStepObserverForTest = observer;
+}
+
+/** The online start ran out of its whole-transaction budget between two steps (nothing is committed). */
+export class OnlineMoveStartBudgetExceededError extends Error {
+  readonly code = "online_move_start_budget_exceeded" as const;
+  constructor(readonly step: string) {
+    super(`online move start ran out of its time budget before ${step}`);
+    this.name = "OnlineMoveStartBudgetExceededError";
+  }
+}
+
+/**
+ * The online start's time budget for its whole transaction (writers queue on
+ * the exclusive conversion lock it holds for all of it). Before each step it
+ * aborts once the budget is spent, and caps that step's statements and lock
+ * waits at what is left (statement_timeout, lock_timeout: transaction-local),
+ * so the transaction ends within the budget plus one round trip.
+ */
+export class OnlineMoveStartBudget {
+  private readonly deadline: number;
+  constructor(
+    private readonly tx: DatabaseExecutor,
+    totalMs: number,
+    private readonly statementCapMs: number,
+    private readonly lockCapMs: number,
+  ) {
+    this.deadline = performance.now() + totalMs;
+  }
+
+  async step<T>(step: string, work: () => Promise<T>): Promise<T> {
+    const remaining = Math.floor(this.deadline - performance.now());
+    if (remaining <= 0) throw new OnlineMoveStartBudgetExceededError(step);
+    await this.tx.execute(sql`SELECT set_config('statement_timeout', ${`${Math.min(this.statementCapMs, remaining)}ms`}, true),
+      set_config('lock_timeout', ${`${Math.min(this.lockCapMs, remaining)}ms`}, true)`);
+    return onlineMoveStep(step, work);
+  }
+}
+
+/** Runs one step of the online start; times it only while the test seam is set. */
+async function onlineMoveStep<T>(step: string, work: () => Promise<T>): Promise<T> {
+  if (!onlineMoveStepObserverForTest) return work();
+  const startedAt = performance.now();
+  try {
+    return await work();
+  } finally {
+    onlineMoveStepObserverForTest?.(step, performance.now() - startedAt);
+  }
+}
+
+export async function prepareOnlineMove(tx: DatabaseExecutor, jobId: string, budget: OnlineMoveStartBudget): Promise<ChannelConversionJob> {
+  const onlineMoveStep = <T>(step: string, work: () => Promise<T>) => budget.step(step, work);
+  const reload = async () => {
+    const [current] = await tx.select().from(channelConversionJobs).where(eq(channelConversionJobs.id, jobId)).limit(1);
+    if (!current) throw new Error("conversion job missing while preparing an online move");
+    return current;
+  };
+  let current = await reload();
+  if (current.phase !== "prepare") throw new Error(`online move prepares from phase prepare, not ${current.phase}`);
+  await onlineMoveStep("prepare", () => prepare({ tx, job: current, progress: parseConversionProgress(current.progress) }));
+  current = await reload();
+  await onlineMoveStep("prepare_tasks", async () => {
+    while (current.phase === "prepare_tasks") {
+      await prepareTasks({ tx, job: current, progress: parseConversionProgress(current.progress) });
+      current = await reload();
+    }
+  });
+  if (current.phase !== "move_parent_messages") throw new Error(`online move expected move_parent_messages after prepare_tasks, not ${current.phase}`);
+  const canonicalChannelId = await requireCanonicalChannelId(tx, current);
+  const storageNamespaceId = await requireStorageNamespaceId(tx, canonicalChannelId);
+  // The canonical channel numbers the tasks created during the move: past
+  // every number the source handed out (RFC 078: never reused).
+  await onlineMoveStep("high_water", () => carryTaskNumberHighWater(tx, current.sourceChannelId, canonicalChannelId));
+
+  const ledgerJob: ChannelConversionJob = { ...current, phase: "online_move" };
+  const preparedThreads: PreparedSourceThread[] = [];
+  await onlineMoveStep("threads", async () => {
+    for (;;) {
+      const batch = await prepareCanonicalThreads(tx, ledgerJob, current.sourceChannelId, storageNamespaceId);
+      preparedThreads.push(...batch);
+      if (batch.length < CHANNEL_CONVERSION_BATCH_SIZE) break;
+    }
+  });
+  let preparedTaskConversations = 0;
+  await onlineMoveStep("task_conversations", async () => {
+    for (;;) {
+      const batch = await prepareTaskConversationProjections(tx, ledgerJob, canonicalChannelId, storageNamespaceId, current.sourceChannelId);
+      preparedTaskConversations += batch;
+      if (batch < CHANNEL_CONVERSION_BATCH_SIZE) break;
+    }
+  });
+  const threadProjectionMap = await onlineMoveStep("projection_map", () => readThreadProjectionMap(tx, current, current.sourceChannelId));
+  const progress = parseConversionProgress(current.progress);
+  const preparedAt = currentDate();
+  await recordConversionPhaseCommit(tx, {
+    jobId: current.id, conversionEpoch: current.conversionEpoch, phase: "online_move", batchKey: "prepared",
+    sourceCount: preparedThreads.length + preparedTaskConversations,
+    targetCount: preparedThreads.length + preparedTaskConversations,
+    checksumInput: stableStringify({
+      canonicalChannelId,
+      jointChannelId: current.jointChannelId,
+      preparedThreads: preparedThreads.length,
+      preparedTaskConversations,
+      threadProjectionMap,
+      taskRowsAffected: progress.taskRowsAffected ?? 0,
+      threadTaskRowsAffected: progress.threadTaskRowsAffected ?? 0,
+    }),
+  });
+  const [prepared] = await tx.update(channelConversionJobs).set({
+    phase: "online_move",
+    state: stateForLegacyPhase("online_move"),
+    status: "running",
+    progress: {
+      ...progress,
+      preparedThreads: preparedThreads.length,
+      ...(preparedThreads.length ? { preparedThreadsCursor: preparedThreads.at(-1)!.oldThreadId } : {}),
+      preparedTaskConversations,
+      threadProjectionMap,
+      onlineMovePreparedAt: preparedAt.toISOString(),
+    },
+    updatedAt: preparedAt,
+  }).where(eq(channelConversionJobs.id, current.id)).returning();
+  if (!prepared) throw new Error("conversion job missing while preparing an online move");
+  return prepared;
 }

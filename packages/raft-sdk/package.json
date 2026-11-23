@@ -1,6 +1,6 @@
 {
   "name": "@botiverse/raft-sdk",
-  "version": "0.37.0",
+  "version": "0.38.0",
   "license": "LicenseRef-Raft-License",
   "description": "Typed Raft Agent API client for external agents and bots.",
   "type": "module",

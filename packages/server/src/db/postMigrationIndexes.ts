@@ -647,14 +647,6 @@ export const POST_MIGRATION_INDEXES: readonly PostMigrationIndexSpec[] = [
     createScript: "db:create-device-session-key-indexes",
   },
   {
-    name: "idx_provider_probe_intents_connection",
-    table: "provider_probe_intents",
-    columns: ["connection_id"],
-    unique: false,
-    predicate: null,
-    createScript: "db:create-device-session-key-indexes",
-  },
-  {
     name: "idx_official_app_auto_install_transitions_installation",
     table: "official_app_auto_install_transitions",
     columns: ["installation_id"],
@@ -709,6 +701,14 @@ export const POST_MIGRATION_INDEXES: readonly PostMigrationIndexSpec[] = [
     columns: ["client_id"],
     unique: false,
     predicate: null,
+    createScript: "db:create-device-session-key-indexes",
+  },  {
+    // Live threads by name (migration channels_thread_server_name_index).
+    name: "idx_channels_thread_server_name",
+    table: "channels",
+    columns: ["server_id", "name"],
+    unique: false,
+    predicate: "((type = 'thread'::text) AND (deleted_at IS NULL))",
     createScript: "db:create-device-session-key-indexes",
   },
 ];

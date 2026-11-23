@@ -17,7 +17,7 @@ const NO_TURNS: readonly TurnSummaryView[] = [];
 /**
  * The profile's "Recent activity" (xxchan, 2026-11-05): the now card, with
  * the profile's status chip (`status`) as its first line and the agent's last
- * few turns one line each; its heading opens the Activity tab. It shows from
+ * few turns one row each (wrapping when it does not fit); its heading opens the Activity tab. It shows from
  * the start (the status needs no turns) and follows the agent's activity as
  * the Activity overview does: each activity push and each reconnect reload it.
  */

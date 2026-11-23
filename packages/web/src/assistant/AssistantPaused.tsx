@@ -8,7 +8,7 @@
 // (Banner › Variants: information, not an error) with at most one bordered
 // button (Banner › Rules: `variant="default" size="sm"`, never pink).
 
-import { useCallback, useState } from "react";
+import { useCallback, useState, useSyncExternalStore } from "react";
 import { useIntl } from "react-intl";
 import { Badge, Banner, BannerAction, BannerDescription, BannerTitle, Button, Spinner } from "@botiverse/raft-ui";
 import { Info } from "lucide-react";
@@ -16,6 +16,7 @@ import StatusDot from "../components/ui/StatusDot";
 import { useAgentStore } from "../store/agentStore";
 import { useAuthStore } from "../store/authStore";
 import type { Agent } from "../store/agentStore";
+import { subscribeLiveTime } from "../hooks/liveTimeClock";
 import { formatRelativeTime } from "../utils/relativeTime";
 
 type PausedBy = { id: string; name: string } | null;
@@ -49,7 +50,9 @@ export function useIsAssistantOwner(agentId: string): boolean {
  */
 export function useAssistantPausedLine(pausedAt: string, pausedBy: PausedBy): string {
   const intl = useIntl();
-  const time = formatRelativeTime(pausedAt, intl.locale);
+  // On the live clock: the notice sits in a quiet DM, where nothing else renders it again as the minutes pass.
+  const readTime = useCallback(() => formatRelativeTime(pausedAt, intl.locale), [pausedAt, intl.locale]);
+  const time = useSyncExternalStore(subscribeLiveTime, readTime, readTime);
   const name = pausedBy?.name?.trim() || null;
   if (name && time) return intl.formatMessage({ id: "assistant.paused.byAt" }, { name, time });
   if (name) return intl.formatMessage({ id: "assistant.paused.by" }, { name });

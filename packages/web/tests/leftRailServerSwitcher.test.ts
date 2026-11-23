@@ -8,13 +8,13 @@ test("server switcher rows expose remembered targets for new-tab actions", () =>
   const calls: Array<[string, "_blank", "noopener,noreferrer"]> = [];
   let prevented = 0;
   let stopped = 0;
-  const readSurface = (slug: string) => slug === "ops" ? "/s/ops/tasks?view=mine" : null;
+  const readPlace = (slug: string) => slug === "ops" ? "/s/ops/tasks?view=mine" : `/s/${slug}`;
   const openNewTab = (...args: [string, "_blank", "noopener,noreferrer"]) => {
     calls.push(args);
   };
 
-  assert.equal(getServerSwitcherTarget("ops", readSurface), "/s/ops/tasks?view=mine");
-  assert.equal(getServerSwitcherTarget("new-server", readSurface), "/s/new-server");
+  assert.equal(getServerSwitcherTarget("ops", readPlace), "/s/ops/tasks?view=mine");
+  assert.equal(getServerSwitcherTarget("new-server", readPlace), "/s/new-server");
 
   const ignored = openServerSwitcherAuxClickTarget(
     {
@@ -23,7 +23,7 @@ test("server switcher rows expose remembered targets for new-tab actions", () =>
       stopPropagation: () => { stopped += 1; },
     },
     "ops",
-    { readSurface, openNewTab },
+    { readPlace, openNewTab },
   );
   assert.equal(ignored, false);
   assert.deepEqual(calls, []);
@@ -37,7 +37,7 @@ test("server switcher rows expose remembered targets for new-tab actions", () =>
       stopPropagation: () => { stopped += 1; },
     },
     "ops",
-    { readSurface, openNewTab },
+    { readPlace, openNewTab },
   );
   assert.equal(opened, true);
   assert.deepEqual(calls, [["/s/ops/tasks?view=mine", "_blank", "noopener,noreferrer"]]);

@@ -32,6 +32,7 @@ import {
   computers,
   integrationAuditEvents,
   machines,
+  managedMcpServers,
   oauthAccessRequests,
   oauthClientInstalls,
   oauthAppWebhookConfigs,
@@ -44,6 +45,7 @@ import {
 import { signAccessToken } from "../middleware/auth";
 import { createAgent } from "../services/agentService";
 import { configureAppWebhook } from "../services/appWebhookConfigService";
+import { createManagedMcpServer } from "../services/managedMcpService";
 import { createOAuthClient, createOAuthClientShareLink, installMarketplaceOAuthClient } from "../services/oauthService";
 import { expectedAppPermissionsBody } from "../test/integration/appPermissions";
 import { addMember } from "../services/serverService";
@@ -599,6 +601,20 @@ async function installOf(p: Person, clientId: string) {
 
 const INSTALL_ERROR = "Confirm it's you with your second step before installing this app.";
 
+/** An MCP App of the person's Server nobody vouched for yet (made on first use). */
+const mcpAppsOf = new WeakMap<Person, Promise<string>>();
+function mcpAppOf(p: Person) {
+  let made = mcpAppsOf.get(p);
+  if (!made) {
+    made = createManagedMcpServer({ serverId: p.serverId, userId: p.human.id, name: "Step-up MCP App", endpointUrl: "https://step-up.example.test/mcp" })
+      .then((created) => created.id);
+    mcpAppsOf.set(p, made);
+  }
+  return made;
+}
+
+const SERVER_VOUCH_ERROR = "Confirm it's you with your second step before letting every agent use this app.";
+
 const APPROVALS: ApprovalRoute[] = [
   {
     name: "POST /api/oauth/authorize/human (Login with Raft consent)",
@@ -648,6 +664,20 @@ const APPROVALS: ApprovalRoute[] = [
       return call(baseUrl, "POST", `/api/integrations/clients/${id}/install/bot`, token, { action: "grant" }, { "X-Server-Id": p.serverId });
     },
     sideEffects: async (seed, _baseUrl, p) => (await installOf(p, (await marketplaceAppOf(seed, p, "bot")).id))?.botGrant,
+  },
+  {
+    name: "PUT /api/integrations/clients/:clientId/server-vouch (vouch)",
+    error: SERVER_VOUCH_ERROR,
+    send: async (_seed, baseUrl, p, token) => call(baseUrl, "PUT", `/api/integrations/clients/${(await appOf(p)).id}/server-vouch`, token, { vouched: true }, { "X-Server-Id": p.serverId }),
+    sideEffects: async (_seed, _baseUrl, p) => (await getDb().select({ at: oauthClients.serverVouchedAt }).from(oauthClients)
+      .where(eq(oauthClients.id, (await appOf(p)).id)))[0]!.at !== null,
+  },
+  {
+    name: "PUT /api/mcp/apps/:appId/server-vouch (vouch)",
+    error: SERVER_VOUCH_ERROR,
+    send: async (_seed, baseUrl, p, token) => call(baseUrl, "PUT", `/api/mcp/apps/${await mcpAppOf(p)}/server-vouch`, token, { vouched: true }, { "X-Server-Id": p.serverId }),
+    sideEffects: async (_seed, _baseUrl, p) => (await getDb().select({ at: managedMcpServers.serverVouchedAt }).from(managedMcpServers)
+      .where(eq(managedMcpServers.id, await mcpAppOf(p))))[0]!.at !== null,
   },
 ];
 

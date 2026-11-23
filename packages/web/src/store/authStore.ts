@@ -2,7 +2,7 @@ import { assertAccountLinkCompleted } from "../utils/pendingAccountLink";
 import { afterFirstScreen } from "../boot/deferredUi";
 import { markBootMilestone, markBootTokenRefreshedFirst } from "../boot/bootTiming";
 import type { PendingAccountLink } from "../utils/pendingAccountLink";
-import type { StoredComposerSendKey, StoredShortcutOverrides } from "@botiverse/raft-shared";
+import type { DescriptionLinkWarning, StoredComposerSendKey, StoredShortcutOverrides } from "@botiverse/raft-shared";
 import { create } from "zustand";
 import { clearSignupCampaign, signupCampaignBody } from "../analytics/signupCampaign";
 import { landingBody } from "../utils/verificationLandingBody";
@@ -36,10 +36,7 @@ import {
   nextAuthRestoreState,
   nextAuthRestoreStateAfterExternalTokenSync,
 } from "../utils/authRestoreMachine";
-import type {
-  AuthRestoreState,
-  AuthRestoreEvent,
-} from "../utils/authRestoreMachine";
+import type { AuthRestoreState, AuthRestoreEvent } from "../utils/authRestoreMachine";
 import { updateAuthRuntimeSnapshot } from "../utils/authSessionRuntime";
 import { emitHostEvent } from "../embed/hostBridge";
 import {
@@ -49,15 +46,12 @@ import {
   setAuthTracePrincipalIdGetter,
   startWebSpan,
 } from "../utils/webAuthTrace";
-import type {
-  EmitWebEventOptions,
-  LogoutTrigger,
-  WebSpanHandle,
-} from "../utils/webAuthTrace";
+import type { EmitWebEventOptions, LogoutTrigger, WebSpanHandle } from "../utils/webAuthTrace";
 import { seedMessageBodyFontSizeFromProfile } from "./appearanceStore";
 import { resetServerFeatureFlagsForSession } from "./serverFeatureFlags";
 import { resetServerLabsSettingsForSession } from "./serverLabsSettingsStore";
 import { useAnnouncementStore } from "./announcementStore";
+import { useAgentVoiceCallStore } from "../features/agent/agentVoiceCallStore";
 import { AVATAR_TOO_LARGE_CODE, isAvatarFileTooLarge } from "../utils/avatarUpload";
 import { detectBrowserTimezone } from "../utils/timeFormatting";
 import { getEmbedMode } from "../embed";
@@ -139,12 +133,10 @@ interface AuthState {
   login: (email: string, password: string, pendingLink?: PendingAccountLink) => Promise<LoginOutcome>;
   /**
    * Passkey sign-in (POST /auth/passkey/verify with the challenge from POST
-   * /auth/passkey/options): both factors at once, so never a second step;
-   * signs in exactly as a password sign-in does. No pending account link:
-   * the server's passkey sign-in can't complete one (the sign-in page offers
-   * passkeys only without one).
+   * /auth/passkey/options): both factors at once, never a second step; signs
+   * in as a password sign-in does and resolves its body. No pending account link: the server can't finish one.
    */
-  loginWithPasskey: (challenge: string, response: PasskeyAssertionJSON) => Promise<void>;
+  loginWithPasskey: (challenge: string, response: PasskeyAssertionJSON) => Promise<unknown>;
   /**
    * A session handed over in the password sign-in's body (`{ user,
    * accessToken, refreshToken }`) by another flow: Raft Desktop's passkey
@@ -196,7 +188,7 @@ interface AuthState {
     signupSurveyServerId?: string;
     currentPassword?: string;
     newPassword?: string;
-  }) => Promise<void>;
+  }) => Promise<{ warnings: DescriptionLinkWarning[] }>;
   /** Shows the new rail tab order at once and saves it to the account; a failed
    *  save puts the previous order back. */
   updateRailTabOrder: (railTabOrder: string[]) => Promise<void>;
@@ -488,6 +480,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     try {
       const { data } = await api.post("/auth/passkey/verify", { challenge, response });
       applyPasswordSignIn(set, get, data);
+      return data as unknown;
     } catch (err: unknown) {
       set({ loading: false });
       throw err;
@@ -560,6 +553,9 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       clearSessionCaller: "logout",
       logoutTrigger: trigger,
     });
+    // A voice call ends with the session: its hang-up goes out now, while the access token is still there to read.
+    useAgentVoiceCallStore.getState().hangUp();
+    useAgentVoiceCallStore.getState().close();
     const { refreshToken } = get();
     if (refreshToken) {
       api.post("/auth/logout", { refreshToken }).catch(() => {});
@@ -710,8 +706,11 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   updateProfile: async (fields) => {
     const { data } = await api.patch("/auth/me", fields);
-    seedMessageBodyFontSizeFromProfile(data.preferredMessageBodyFontSize);
-    set({ user: data });
+    // A new description's link warnings (#457) are the caller's to show, never part of the user.
+    const { warnings, ...user } = data as typeof data & { warnings?: DescriptionLinkWarning[] };
+    seedMessageBodyFontSizeFromProfile(user.preferredMessageBodyFontSize);
+    set({ user });
+    return { warnings: warnings ?? [] };
   },
 
   updateRailTabOrder: async (railTabOrder) => {

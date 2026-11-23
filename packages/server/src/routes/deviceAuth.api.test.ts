@@ -481,6 +481,30 @@ test("a login without a grant keeps the User-Agent it asked with, capped, and cl
   });
 });
 
+test("authorize keeps a well-formed loginFallbackReason and stores null for a missing or malformed one, never refusing the login", async () => {
+  await withEnv(true, async (app) => {
+    const stored = async (userCode: string) => {
+      const [row] = await getDb()
+        .select({ reason: deviceAuthorizations.loginFallbackReason, userAgent: deviceAuthorizations.requestedUserAgent })
+        .from(deviceAuthorizations)
+        .where(eq(deviceAuthorizations.userCode, userCode));
+      return row!;
+    };
+    const userAgent = "raft-computer/1.25.9 (linux; x64)";
+    const fellBack = await startLogin(app, { "User-Agent": userAgent }, { clientName: "raft-computer", loginFallbackReason: "browser_open_failed" });
+    assert.deepEqual(await stored(fellBack.userCode), { reason: "browser_open_failed", userAgent });
+
+    const omitted = await startLogin(app);
+    assert.equal((await stored(omitted.userCode)).reason, null);
+
+    // startLogin asserts 201: an audit field never locks a Computer out.
+    for (const loginFallbackReason of ["DROP TABLE", "x".repeat(500), 42, "", "browser-open", { reason: "ssh" }, null]) {
+      const login = await startLogin(app, {}, { clientName: "raft-computer", loginFallbackReason });
+      assert.equal((await stored(login.userCode)).reason, null, JSON.stringify(loginFallbackReason));
+    }
+  });
+});
+
 test("a typed code is read the way people type it", () => {
   assert.equal(normalizeUserCode("abcd-efgh"), "ABCD-EFGH");
   assert.equal(normalizeUserCode("ABCDEFGH"), "ABCD-EFGH");

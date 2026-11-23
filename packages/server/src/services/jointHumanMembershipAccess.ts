@@ -9,14 +9,14 @@ import { DEPRECATED_GRAVATAR_HASH,
 } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../db";
 import { channels, jointChannels, jointChannelServers } from "../db/schema";
-import { acquireFeatureFlagReadLock, evaluateFeatureFlags } from "./featureFlagService";
+import {
+  acquireFeatureFlagReadLock,
+  evaluateFeatureFlags,
+  JOINT_SOURCE_EXIT_FEATURE_FLAG_KEY,
+} from "./featureFlagService";
 import { EXTERNAL_CHANNELS_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 
-/** Host-scoped: a person stays in J only while they hold a live source
- * (jointHumanHasLiveSourceSql). J membership itself is always computed from
- * joint_channel_members (the retired joint_human_membership_v1 rollout flag is
- * not read; a leftover row of it changes nothing). */
-export const JOINT_SOURCE_EXIT_FEATURE_FLAG_KEY = "joint_source_exit_v1";
+export { JOINT_SOURCE_EXIT_FEATURE_FLAG_KEY };
 
 /** Every writer that decides or depends on J membership pins the source-exit
  * flag and reads its mode after it. Lock order: identity and resource rows
@@ -581,7 +581,7 @@ export async function getComputedJointHumanPublicRowsForScopes(
     displayName: string | null;
     description: string | null;
     avatarUrl: string | null;
-    servers: Array<{ id: string; name: string; slug: string }>;
+    servers: Array<{ id: string; name: string; slug: string; avatarUrl: string | null }>;
     entryServerRole: string | null;
     isManager: boolean;
   }>(sql`WITH views(joint_id,local_channel_id,entry_server_id) AS (VALUES
@@ -593,7 +593,7 @@ export async function getComputedJointHumanPublicRowsForScopes(
       sql`, `,
     )})
     SELECT v.local_channel_id AS "localChannelId",u.id,u.name,u.display_name AS "displayName",u.description,u.avatar_url AS "avatarUrl",
-    coalesce((SELECT jsonb_agg(jsonb_build_object('id',s.id,'name',s.name,'slug',s.slug)
+    coalesce((SELECT jsonb_agg(jsonb_build_object('id',s.id,'name',s.name,'slug',s.slug,'avatarUrl',s.avatar_url)
       ORDER BY (s.id=v.entry_server_id) DESC,s.name,s.id)
       FROM joint_channel_admissions label JOIN servers s ON s.id=label.server_id
       WHERE s.id<>v.entry_server_id AND label.joint_channel_id=m.joint_channel_id AND label.user_id=u.id AND label.generation=m.generation AND label.ended_at IS NULL

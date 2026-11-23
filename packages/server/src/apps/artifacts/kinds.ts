@@ -3,6 +3,8 @@
 // core and events.ts records them. A leaf module (no imports): core's
 // registry reads these while loading, through an import cycle.
 
+/** The app's id (register.ts): its schema `app_artifacts`, its routes, `system.artifacts`. */
+export const ARTIFACTS_APP_ID = "artifacts";
 export const ARTIFACT_OBJECT_KIND = "artifact";
 /** The app's key in core's agent event queue (`third_party_agent_events.system_app`). */
 export const ARTIFACTS_SYSTEM_APP = "system.artifacts";
@@ -14,9 +16,10 @@ export const ARTIFACTS_SYSTEM_APP = "system.artifacts";
  * `deleted` (manage.ts), `renamed` (a push that changes only the title, with
  * `from` and `to`: publish.ts retitle; no one's Activity), `comment_resolved`
  * (for the thread's author, a person) and `comment_reopened` (for no one), a
- * thread's resolution (resolutions.ts, #249).
+ * thread's resolution (resolutions.ts, #249), `settled` and `unsettled`
+ * (settle.ts, #334: for its following people, read, so no unread).
  */
-export const ARTIFACT_OBJECT_EVENTS = ["version", "comment", "comment_edited", "comment_deleted", "renamed", "moved", "deleted", "review", "comment_resolved", "comment_reopened"] as const;
+export const ARTIFACT_OBJECT_EVENTS = ["version", "comment", "comment_edited", "comment_deleted", "renamed", "moved", "deleted", "review", "comment_resolved", "comment_reopened", "settled", "unsettled"] as const;
 export type ArtifactObjectEvent = (typeof ARTIFACT_OBJECT_EVENTS)[number];
 /** The tables whose writes change what others see of an Artifact (§十 check 3). */
 export const ARTIFACT_OBJECT_TABLES = ["items", "versions", "comments"] as const;

@@ -3,7 +3,8 @@ import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
 import type { ArtifactCommentId, ArtifactId } from "@botiverse/raft-shared";
 
-import { showToast } from "../../components/toastBridge";
+import { useToast } from "@botiverse/raft-ui";
+import { timersOf, useOwnerDocument } from "../../utils/ownerDocument";
 import { watchFocusIntent } from "../../utils/focusRequest";
 import { isTextEditableElement } from "../../utils/keyboardShortcuts";
 import type { ArtifactCommentsState } from "./ArtifactCommentsContext";
@@ -14,6 +15,7 @@ import { useArtifactComments } from "./ArtifactCommentsContext";
 import { focusArtifactSurface } from "./artifactRestoredFocus";
 import { artifactSource } from "./artifactSource";
 import { canTakeFocus } from "./artifactViewerStore";
+import { POLITE_ERROR } from "./artifactToasts";
 
 export interface ThreadResolution {
   /** The viewer may resolve and reopen it (mayResolveThread: the server's rule). */
@@ -30,10 +32,13 @@ export interface ThreadResolution {
  * section (or out of it) and takes its marker off the page (or puts it back). A held card
  * (artifactCardHold) writes nothing until pressed in. A refusal (another's change raced it: a
  * role, a reply) says it went wrong, and the list is read again. `onChanged`: done, resolved now
- * or open. Resolved, a toast says so (announced) with Undo, which reopens it (undoResolve).
+ * or open. Resolved, a toast says so (announced) with Undo, which reopens it (undoResolve). In the window the card is
+ * drawn in (an object window's own, #337 PR3): its toasts, its focus, its timers.
  */
 export function useThreadResolution(thread: ArtifactCommentThread, onChanged?: (threadId: ArtifactCommentId, resolved: boolean, wanted: () => boolean) => void): ThreadResolution {
   const { formatMessage } = useIntl();
+  const toast = useToast();
+  const doc = useOwnerDocument();
   const comments = useArtifactComments();
   const hold = useContext(ArtifactCardHoldContext);
   const [busy, setBusy] = useState(false);
@@ -60,20 +65,18 @@ export function useThreadResolution(thread: ArtifactCommentThread, onChanged?: (
       if (onChanged) onChanged(thread.id, answer.comment.resolvedAt !== null, wanted);
       else wanted();
       if (!resolved && answer.changed && comments) {
-        showToast({
-          title: formatMessage({ id: "artifacts.comments.resolvedToast" }),
-          type: "success",
-          actionProps: { children: formatMessage({ id: "artifacts.review.undo" }), onClick: () => void undoResolve(comments, id, thread.id, formatMessage) },
+        toast.success(formatMessage({ id: "artifacts.comments.resolvedToast" }), {
+          action: { label: formatMessage({ id: "artifacts.review.undo" }), onClick: () => void undoResolve(comments, id, thread.id, { formatMessage, toast, doc }, onChanged) },
         });
       }
     } catch {
       wanted();
-      showToast({ title: formatMessage({ id: "common.confirm.somethingWentWrong" }), type: "error" });
+      toast.error(formatMessage({ id: "common.confirm.somethingWentWrong" }), POLITE_ERROR);
       reload?.();
     } finally {
       setBusy(false);
     }
-  }, [root, id, busy, hold, resolved, replaced, added, onChanged, thread.id, formatMessage, reload, comments]);
+  }, [root, id, busy, hold, resolved, replaced, added, onChanged, thread.id, formatMessage, reload, comments, toast, doc]);
   return { may, resolved, busy, toggle };
 }
 
@@ -90,48 +93,59 @@ const UNDO_FOCUS_HELD = 10;
  * fallback that picks the header's first control) don't stand: the card takes it back. Only the
  * person ends that early, with a press or a key of their own, or by writing in a box. With the list
  * closed, or the card not drawn within about two seconds, the Artifact's surface (its marker is back).
+ * `onChanged` (the list's, which resolved it) hears it reopened, so the card moves back as a Reopen
+ * moves it; it plans no focus of its own (its `wanted` says no): the focus is this one's.
  */
-async function undoResolve(comments: ArtifactCommentsState, id: ArtifactId, rootId: ArtifactCommentId, formatMessage: IntlShape["formatMessage"]): Promise<void> {
+async function undoResolve(
+  comments: ArtifactCommentsState,
+  id: ArtifactId,
+  rootId: ArtifactCommentId,
+  { formatMessage, toast, doc }: { formatMessage: IntlShape["formatMessage"]; toast: ReturnType<typeof useToast>; doc: Document },
+  onChanged?: (threadId: ArtifactCommentId, resolved: boolean, wanted: () => boolean) => void,
+): Promise<void> {
+  // The card's own document and window: an object window draws frames and runs timers while the main one is hidden.
+  const timers = timersOf(doc);
   let theirs = false;
   const stop = () => {
     theirs = true;
   };
-  document.addEventListener("pointerdown", stop, true);
+  doc.addEventListener("pointerdown", stop, true);
   // keydown-global-exempt: ends the post-Undo focus hold on the user's own key press; never handles, prevents or redirects the key
-  document.addEventListener("keydown", stop, true);
+  doc.addEventListener("keydown", stop, true);
   const done = () => {
-    document.removeEventListener("pointerdown", stop, true);
-    document.removeEventListener("keydown", stop, true);
+    doc.removeEventListener("pointerdown", stop, true);
+    doc.removeEventListener("keydown", stop, true);
   };
   try {
     comments.replaced((await artifactSource().reopenComment(id, rootId)).comment);
+    onChanged?.(rootId, false, () => false);
   } catch {
     done();
-    showToast({ title: formatMessage({ id: "common.confirm.somethingWentWrong" }), type: "error" });
+    toast.error(formatMessage({ id: "common.confirm.somethingWentWrong" }), POLITE_ERROR);
     comments.reload();
     return;
   }
   const writing = () => {
-    const active = document.activeElement;
+    const active = doc.activeElement;
     return !!active && isTextEditableElement(active);
   };
   const openCard = (): HTMLElement | null => {
-    const card = document.querySelector<HTMLElement>(`[data-testid='artifact-comments-panel'] [data-thread-id="${CSS.escape(rootId)}"]`);
+    const card = doc.querySelector<HTMLElement>(`[data-testid='artifact-comments-panel'] [data-thread-id="${CSS.escape(rootId)}"]`);
     return card && !card.closest("[data-testid='artifact-comments-resolved']") && canTakeFocus(card) ? card : null;
   };
   const look = (tries: number, held: number) => {
     if (theirs || writing()) return done();
     const card = openCard();
-    if (card && document.activeElement !== card) card.focus({ preventScroll: true });
-    const holding = card !== null && document.activeElement === card ? held + 1 : 0;
+    if (card && doc.activeElement !== card) card.focus({ preventScroll: true });
+    const holding = card !== null && doc.activeElement === card ? held + 1 : 0;
     if (holding >= UNDO_FOCUS_HELD) return done();
-    const listShown = document.querySelector("[data-testid='artifact-comments-panel']") !== null;
+    const listShown = doc.querySelector("[data-testid='artifact-comments-panel']") !== null;
     if (tries > 0 && (listShown || holding > 0)) {
-      window.setTimeout(() => look(tries - 1, holding), UNDO_FOCUS_STEP_MS);
+      timers.setTimeout(() => look(tries - 1, holding), UNDO_FOCUS_STEP_MS);
       return;
     }
     done();
-    if (!card) focusArtifactSurface();
+    if (!card) focusArtifactSurface(doc);
   };
-  window.setTimeout(() => look(UNDO_FOCUS_TRIES, 0), 0);
+  timers.setTimeout(() => look(UNDO_FOCUS_TRIES, 0), 0);
 }

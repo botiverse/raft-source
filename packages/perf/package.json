@@ -1,9 +1,12 @@
 {
   "name": "@botiverse/raft-perf",
-  "version": "0.23.0",
+  "version": "0.29.0",
   "license": "LicenseRef-Raft-License",
   "private": true,
   "type": "module",
+  "bin": {
+    "raft-perf": "./bin/raft-perf.mjs"
+  },
   "description": "Web performance tools for agents: paired on/off page measurement with a JSON verdict, and first-screen snapshots/diffs of deployed builds (docs/frontend/perf-measure.md).",
   "scripts": {
     "measure": "node --import @oxc-node/core/register src/measure.ts",
@@ -14,10 +17,17 @@
     "snapshot": "node --import @oxc-node/core/register src/snapshot.ts",
     "diff": "node --import @oxc-node/core/register src/diff.ts",
     "interact": "node --import @oxc-node/core/register src/interact.ts",
+    "input": "node --import @oxc-node/core/register src/input.ts",
+    "resize": "node --import @oxc-node/core/register src/resize.ts",
+    "soak": "node --import @oxc-node/core/register src/soak.ts",
     "ab": "node --import @oxc-node/core/register src/ab.ts",
     "startup": "node --import @oxc-node/core/register src/startup.ts",
+    "diagnose": "node --import @oxc-node/core/register src/diagnose.ts",
+    "diagnose-backfill": "node --import @oxc-node/core/register src/diagnoseBackfill.ts",
     "check": "node --import @oxc-node/core/register src/check.ts",
     "claim": "node --import @oxc-node/core/register src/claim.ts",
+    "bench-check": "node --import @oxc-node/core/register src/benchCheck.ts",
+    "suite": "node --import @oxc-node/core/register src/suite.ts",
     "test": "vitest run",
     "typecheck": "tsrs --noEmit",
     "typecheck:tsc": "tsc --noEmit"

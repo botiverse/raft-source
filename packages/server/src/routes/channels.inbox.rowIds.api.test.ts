@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
-import { INBOX_BACKEND_HEADER } from "@botiverse/raft-shared";
+import { INBOX_BACKEND_HEADER, type ServerId } from "@botiverse/raft-shared";
 import { tokenForHuman } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import { getDb } from "../db/index";
@@ -11,6 +11,7 @@ import { seedBoundGuest } from "../test/guestFixture";
 import { addHuman, createChannel, getOrCreateThread, inboxItemRowId, recordThreadFollow, type InboxItem } from "../services/channelService";
 import { createMessage } from "../services/messageService";
 import { createServer, headers, seedUser } from "./channels.api.fixtures";
+import { readInboxRowsForSync } from "./channels";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
@@ -179,4 +180,24 @@ test("GET /channels/inbox says which source answered in X-Raft-Inbox-Backend, li
   assert.equal(await read("filter=unread&limit=30"), "risingwave");
   assert.equal(await read(`ids=${f.room.id},${f.thread.id}`), "risingwave");
   assert.equal(await read("filter=all&limit=30&q=room"), "postgres");
+});
+
+// The sync pull's rows (inbox_row capability) are this route's rows, read rows
+// only (no groups or totals; the unfollowed overlay narrowed to the asked
+// threads): readInboxRowsForSync must answer exactly what ?ids= answers.
+test("readInboxRowsForSync (rows only) answers exactly the ?ids= rows", async ({ app }) => {
+  const f = await seedFixture();
+  const token = await tokenForHuman(f.owner.email);
+  const ids = [f.room.id, f.thread.id, f.otherThread.id, f.unfollowedThread.id, f.control.id, f.peerPrivate.id, randomUUID()];
+  const { status, body } = await readInbox(app.baseUrl, token, f.server.id, `ids=${ids.join(",")}`);
+  assert.equal(status, 200);
+  const sorted = (items: InboxItem[]) => [...items].sort((a, b) => inboxItemRowId(a).localeCompare(inboxItemRowId(b)));
+  const rowsOnly = await readInboxRowsForSync({ userId: f.owner.id, serverId: f.server.id as ServerId, sessionFamilyId: null }, ids.map((id) => id.toUpperCase()));
+  assert.equal(body.items.length, 5, "control: the five visible rows");
+  assert.deepEqual(JSON.parse(JSON.stringify(rowsOnly.items)), body.items, "same rows, same order, byte for byte");
+  assert.deepEqual(sorted(rowsOnly.items).map(inboxItemRowId), sorted(body.items).map(inboxItemRowId));
+  assert.equal(rowsOnly.backend, "risingwave");
+  // One id: the unfollowed thread alone (the overlay narrowed to it) is still its list row.
+  const single = await readInboxRowsForSync({ userId: f.owner.id, serverId: f.server.id as ServerId, sessionFamilyId: null }, [f.unfollowedThread.id]);
+  assert.deepEqual(JSON.parse(JSON.stringify(single.items)), (await readInbox(app.baseUrl, token, f.server.id, `ids=${f.unfollowedThread.id}`)).body.items);
 });

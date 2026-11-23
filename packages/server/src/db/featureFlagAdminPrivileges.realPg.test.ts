@@ -177,6 +177,8 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
   await target.query(rulesReachMigration.replaceAll("--> statement-breakpoint", ""));
   const planEntitlementMigration = readFileSync(new URL("../../drizzle/0716_ffa_server_plan_entitlement_inputs.sql", import.meta.url), "utf8");
   await target.query(planEntitlementMigration.replaceAll("--> statement-breakpoint", ""));
+  const serverPlanChangeMigration = readFileSync(new URL("../../drizzle/0724_ffa_server_plan_change.sql", import.meta.url), "utf8");
+  await target.query(serverPlanChangeMigration.replaceAll("--> statement-breakpoint", ""));
   await assert.rejects(
     reconcileAndVerifyFeatureFlagAdminPrivileges((text, values) => target.query(text, values)),
     (error: unknown) => (error as { code?: string }).code === "42704",
@@ -220,6 +222,7 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
   await target.query(`GRANT UPDATE (state, resolved_by_user_id, resolution_reason, resolved_at, updated_at) ON TABLE public.link_card_operations TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
   await target.query(`GRANT EXECUTE ON FUNCTION public.announcement_rules_reach(jsonb, text, uuid[], uuid[], timestamptz) TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
   await target.query(`GRANT EXECUTE ON FUNCTION public.ffa_server_plan_entitlement_inputs(uuid, timestamptz) TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT EXECUTE ON FUNCTION public.ffa_change_server_plan(text, text, text, text, text, text, text, text, text, text, text) TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
   await verifyFeatureFlagAdminPrivileges((text, values) => target.query(text, values));
   await assert.rejects(
     verifyFeatureFlagAdminPrivilegeReceipt((text, values) => target.query(text, values)),
@@ -402,6 +405,40 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
       forbiddenPlanQuery,
     );
   }
+  // Change one server's plan (0724): only through the compare-and-set function, never a direct UPDATE.
+  await target.query("ALTER TABLE servers ADD COLUMN plan_downgraded_at timestamptz, ADD COLUMN updated_at timestamptz NOT NULL DEFAULT now()");
+  const changePlan = (slug: string, expected: string, plan: string) => operator!.query(
+    "SELECT public.ffa_change_server_plan($1, $2, $3, 'Founder deal', 'human', '00000000-0000-4000-8000-0000000000a1', 'Operator', 'cindyz: yes', 'c0ffee12', 'req-plan', 'ffa-audit-plan') AS result",
+    [slug, expected, plan],
+  );
+  // plan-preview-srv has an active AppSumo license and prepaid time: refused, nothing written.
+  assert.equal((await changePlan("plan-preview-srv", "free", "founder")).rows[0].result.outcome, "paid_source_active");
+  await target.query(
+    "INSERT INTO servers (id, slug, name, plan, kind) VALUES ('00000000-0000-4000-8000-0000000000c5', 'plan-change-srv', 'plan-change-srv', 'free', 'normal')",
+  );
+  assert.equal((await changePlan("plan-change-srv", "pro", "founder")).rows[0].result.outcome, "plan_mismatch");
+  const changed = (await changePlan("plan-change-srv", "free", "founder")).rows[0].result;
+  assert.equal(changed.outcome, "updated");
+  assert.equal(changed.plan, "founder");
+  assert.equal(
+    (await target.query("SELECT plan FROM servers WHERE id = '00000000-0000-4000-8000-0000000000c5'")).rows[0].plan,
+    "founder",
+  );
+  const planAudit = await target.query(
+    "SELECT event_type, actor_id, metadata FROM integration_audit_events WHERE server_id = '00000000-0000-4000-8000-0000000000c5'",
+  );
+  assert.equal(planAudit.rows.length, 1);
+  assert.equal(planAudit.rows[0].event_type, "server.plan_changed");
+  assert.equal(planAudit.rows[0].metadata.approvalMessageId, "c0ffee12");
+  // There is no caller-supplied time.
+  await assert.rejects(
+    operator.query("SELECT public.ffa_change_server_plan('plan-change-srv', 'founder', 'free', now())"),
+    (error: unknown) => (error as { code?: string }).code === "42883",
+  );
+  await assert.rejects(
+    operator.query("UPDATE servers SET plan = 'pro' WHERE slug = 'plan-change-srv'"),
+    (error: unknown) => (error as { code?: string }).code === "42501",
+  );
   // Stuck link card operations (0387): list them and resolve one manually; nothing else.
   const linkCardOp = (id: string, state: string) => target.query(
     "INSERT INTO link_card_operations (operation_id, viewer_id, server_id, provider_kind, provider_key, installation_key, registration_revision, view_nonce, message_id, url_sha256, action_endpoint_sha256, action_origin, created_at, first_send_deadline, action_id, request_sha256, state) VALUES ($1, '00000000-0000-4000-8000-0000000000b1', '00000000-0000-4000-8000-0000000000a3', 'app', 'vault-1a2b3c', '00000000-0000-4000-8000-0000000000b2', 'rev-1', 'nonce-1', '00000000-0000-4000-8000-0000000000b3', encode(sha256('https://vault.example/r/1'), 'hex'), repeat('a', 64), 'https://vault.example', date_trunc('second', now()), date_trunc('second', now()) + interval '10 minutes', 'approve', 'r', $2)",

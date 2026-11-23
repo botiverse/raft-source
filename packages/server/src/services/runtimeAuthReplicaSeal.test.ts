@@ -106,7 +106,122 @@ test("a connect that arrives from another replica unsealed is never written to a
   assert.deepEqual(openAfterReplicaHop("machine-1", logout), { ok: true, message: logout });
 });
 
-test("without a server secret the connect is not sent across replicas at all", () => {
+test("without a server secret the connect is not sent across replicas at all, and openAfterReplicaHop returns unopenable instead of throwing", () => {
+  const wire = overRedis(sealForReplicaHop("machine-1", connect, NOW));
   delete process.env.JWT_SECRET;
+  delete process.env.SLOCK_REPLICA_REPLAY_SECRET;
   assert.throws(() => sealForReplicaHop("machine-1", connect), (error: Error) => !error.message.includes(API_KEY));
+  assert.deepEqual(openAfterReplicaHop("machine-1", asMessage(wire), NOW), { ok: false, reason: "unopenable", requestId: "req-1" });
+});
+
+test("agent:start and agent:config support rolling-deploy receive_only, staged seal, and strict enforcement modes (#proj-runtime:#79)", () => {
+  const startMsg: ServerToMachineMessage = {
+    type: "agent:start",
+    agentId: "agent-1",
+    config: {
+      name: "alpha",
+      displayName: "Alpha",
+      description: null,
+      model: "claude-opus-4-6",
+      runtime: "claude",
+      runtimeConfig: {
+        version: 1,
+        runtime: "claude",
+        provider: { kind: "custom", apiUrl: "https://gw.example.test/v1", apiKey: API_KEY },
+        model: { kind: "custom", name: "claude-opus-4-6" },
+        mode: { kind: "default" },
+        reasoningEffort: null,
+        envVars: { SECRET_ENV: API_KEY },
+      },
+      reasoningEffort: null,
+      executionMode: "byoc",
+      envVars: { ANTHROPIC_API_KEY: API_KEY },
+      sessionId: null,
+      serverUrl: "https://raft.example.test",
+      authToken: "",
+    },
+  };
+  const configMsg: ServerToMachineMessage = {
+    type: "agent:config",
+    agentId: "agent-1",
+    config: startMsg.config,
+    revision: 3,
+  };
+
+  // 1. Default receive_only (PR 1 rolling-deploy safe): receive-ready without breaking older replicas
+  assert.equal(sealForReplicaHop("machine-1", startMsg, NOW, "receive_only"), startMsg);
+  assert.deepEqual(openAfterReplicaHop("machine-1", startMsg, NOW, "receive_only"), { ok: true, message: startMsg });
+
+  // 2. Staged send-sealing ("seal"): seals outbound frames while still accepting unsealed from draining peers
+  const stagedWire = overRedis(sealForReplicaHop("machine-1", startMsg, NOW, "seal"));
+  assert.equal(JSON.stringify(stagedWire).includes(API_KEY), false);
+  // Even in default receive_only mode, a new replica opens sealed frames strictly!
+  assert.deepEqual(openAfterReplicaHop("machine-1", asMessage(stagedWire), NOW, "receive_only"), { ok: true, message: startMsg });
+  assert.deepEqual(openAfterReplicaHop("machine-1", asMessage(stagedWire), NOW, "receive_only"), { ok: false, reason: "replayed", requestId: null });
+
+  // 3. Strict mode ("strict"): seals outbound AND refuses unsealed, tampered, replayed, or wrong-machine copies
+  for (const original of [startMsg, configMsg]) {
+    const wire = overRedis(sealForReplicaHop("machine-1", original, NOW, "strict"));
+    assert.equal(JSON.stringify(wire).includes(API_KEY), false, `${original.type}: key must not appear on the Redis wire`);
+    assert.equal(sealForReplicaHop("machine-1", asMessage(wire), NOW, "strict"), wire, `${original.type}: already-sealed hop is not double-sealed`);
+
+    assert.deepEqual(
+      openAfterReplicaHop("machine-2", asMessage(wire), NOW, "strict"),
+      { ok: false, reason: "unopenable", requestId: null },
+      `${original.type}: wrong machine cannot open`,
+    );
+    assert.deepEqual(
+      openAfterReplicaHop("machine-1", asMessage({ ...wire, agentId: "agent-other" }), NOW, "strict"),
+      { ok: false, reason: "unopenable", requestId: null },
+      `${original.type}: wrong agentId cannot open`,
+    );
+    assert.deepEqual(
+      openAfterReplicaHop("machine-1", original, NOW, "strict"),
+      { ok: false, reason: "unsealed", requestId: null },
+      `${original.type}: unsealed frame on Redis is refused in strict mode`,
+    );
+    assert.deepEqual(openAfterReplicaHop("machine-1", asMessage(wire), NOW, "strict"), { ok: true, message: original });
+    assert.deepEqual(
+      openAfterReplicaHop("machine-1", asMessage(wire), NOW, "strict"),
+      { ok: false, reason: "replayed", requestId: null },
+      `${original.type}: second open is refused as replay`,
+    );
+  }
+});
+
+test("replay cache evicts expired head entries in insertion order while keeping unexpired entries", () => {
+  const mkStart = (agentId: string): ServerToMachineMessage => ({
+    type: "agent:config",
+    agentId,
+    revision: 1,
+    config: {
+      name: agentId,
+      displayName: agentId,
+      description: null,
+      model: "claude-opus-4-6",
+      runtime: "claude",
+      reasoningEffort: null,
+      envVars: null,
+      sessionId: null,
+      serverUrl: "https://raft.example.test",
+      authToken: "",
+    },
+  });
+  const wireOld = overRedis(sealForReplicaHop("machine-1", mkStart("agent-old"), NOW, "seal"));
+  const wireMid = overRedis(sealForReplicaHop("machine-1", mkStart("agent-mid"), NOW + 30_000, "seal"));
+  const wireNew = overRedis(sealForReplicaHop("machine-1", mkStart("agent-new"), NOW + REPLICA_HOP_SEAL_TTL_MS + 1_000, "seal"));
+
+  assert.equal(openAfterReplicaHop("machine-1", asMessage(wireOld), NOW, "seal").ok, true);
+  assert.equal(openAfterReplicaHop("machine-1", asMessage(wireMid), NOW + 30_000, "seal").ok, true);
+  // At NOW + TTL + 1s, wireOld has expired and is evicted from head; wireMid is still live and must remain protected against replay.
+  const later = NOW + REPLICA_HOP_SEAL_TTL_MS + 1_000;
+  assert.equal(openAfterReplicaHop("machine-1", asMessage(wireNew), later, "seal").ok, true);
+  assert.deepEqual(
+    openAfterReplicaHop("machine-1", asMessage(wireMid), later, "seal"),
+    { ok: false, reason: "replayed", requestId: null },
+  );
+  assert.deepEqual(
+    openAfterReplicaHop("machine-1", asMessage(wireOld), later, "seal"),
+    { ok: false, reason: "expired", requestId: null },
+  );
 });

@@ -224,3 +224,36 @@ test("channel member role UI hides Member and swaps Channel Admin for hover acti
   renderIntl(createElement(MemberRoleTag, { role: "member" }));
   assert.ok(screen.queryByTestId("member-page-role-channel-admin") === null);
 });
+
+test("AddMembersDialog drops a suggested Guest bound to another channel and keeps a member (#15347)", async () => {
+  api.get = (async () => ({ data: { agents: [], humans: [] } })) as typeof api.get;
+  useChannelStore.setState({
+    channels: [{
+      id: "channel-general",
+      serverId: "server-alpha",
+      name: "general",
+      description: null,
+      type: "channel",
+      createdAt: "2026-08-21T00:00:00.000Z",
+      joined: true,
+    }],
+  } as never);
+  const human = { email: null, description: null, avatarUrl: null, joinedAt: "2026-08-21T00:00:00.000Z" };
+  useServerStore.setState({
+    members: [
+      { ...human, userId: "user-mei", name: "mei", displayName: "Mei", role: "member" },
+      { ...human, userId: "user-gus", name: "gus", displayName: "Gus", role: "guest", guestChannel: { id: "channel-other", name: "other" } },
+    ],
+  } as never);
+
+  renderIntl(createElement(AddMembersDialog, {
+    channelId: "channel-general",
+    prefilledHumanIds: ["user-mei", "user-gus"],
+    onClose: () => {},
+    onSubmitted: () => {},
+  }));
+
+  await screen.findByText("Mei");
+  assert.ok(screen.queryByText("Gus") === null, "the Guest is not offered");
+  assert.ok(screen.getByRole("button", { name: "Add 1 member" }));
+});

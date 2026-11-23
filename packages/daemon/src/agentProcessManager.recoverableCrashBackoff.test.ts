@@ -299,6 +299,48 @@ test("a turn end after a runtime error is not progress", async () => {
   });
 }, 20_000);
 
+const resetSources = (h: Harness) => h.events
+  .filter((event) => event.name === "daemon.agent.runtime_error_process_restart.reset")
+  .map((event) => event.attrs.reset_source);
+
+// Field (AndyLok, #proj-runtime:#81): Grok ends a rejected initial prompt's
+// turn bare (turn_end with no model output) right before the RateLimitError
+// arrives. That bare turn_end used to reset the close streak on every launch,
+// pinning restart backoff at attempts=1 (~10s) forever.
+test("a bare turn end before a rate-limit startup failure does not reset the crash backoff", async () => {
+  await withManager(async (h) => {
+    await startWithPendingMessage(h, "first");
+    const grokRateLimitedTurn = async () => {
+      await h.emit([
+        { kind: "turn_end", sessionId: "session-1" },
+        { kind: "error", message: "Rate limited", startupRequestMethod: "session/prompt" },
+      ]);
+      await settle(() => !h.m.agents.has(AGENT));
+    };
+
+    await grokRateLimitedTurn();
+    expect(h.m.lifecycleRecords.getRuntimeErrorCloseStreak(AGENT)).toBe(1);
+    await expectRestartAfter(h, 10_000);
+
+    await grokRateLimitedTurn();
+    expect(h.m.lifecycleRecords.getRuntimeErrorCloseStreak(AGENT)).toBe(2);
+    await expectRestartAfter(h, 20_000);
+
+    await grokRateLimitedTurn();
+    expect(h.m.lifecycleRecords.getRuntimeErrorCloseStreak(AGENT)).toBe(3);
+    expect(resetSources(h)).toEqual([]);
+    await expectRestartAfter(h, 40_000);
+
+    // Once the provider recovers and real model output arrives, the streak resets.
+    await h.emit([{ kind: "text", text: "back online" }, { kind: "turn_end", sessionId: "session-1" }]);
+    expect(h.m.lifecycleRecords.getRuntimeErrorCloseStreak(AGENT)).toBe(0);
+    expect(resetSources(h)).toEqual(["runtime_progress:text"]);
+    await grokRateLimitedTurn();
+    expect(h.m.lifecycleRecords.getRuntimeErrorCloseStreak(AGENT)).toBe(1);
+    await expectRestartAfter(h, 10_000);
+  });
+}, 20_000);
+
 test("a clean exit with a queued message still restarts at once", async () => {
   await withManager(async (h) => {
     await startWithPendingMessage(h, "first");
@@ -353,10 +395,6 @@ test("subagent output does not reset the crash backoff", async () => {
   });
 }, 20_000);
 
-const resetSources = (h: Harness) => h.events
-  .filter((event) => event.name === "daemon.agent.runtime_error_process_restart.reset")
-  .map((event) => event.attrs.reset_source);
-
 // Reconciler step 10a (D5): a non-recoverable close no longer resets the
 // streak; it counts into it (the loop guard) and keeps the restart snapshot.
 test("a non-recoverable close counts into the crash streak and keeps the restart snapshot", async () => {
@@ -407,18 +445,20 @@ test("a fence trip leaves the crash streak as it was", async () => {
 }, 20_000);
 
 // Field (Grace, #proj-runtime:af29bda9): a Claude weekly quota ran out with
-// the reset 5 days away. The provider-limit delivery backoff (60 min per wait,
-// task #379) lived only on the process, so once that process closed the next
-// delivery respawned the agent straight into the same limit. The backoff now
-// survives on the agent record until real model output clears it.
+// the reset 5 days away. The provider-limit delivery backoff lived only on the
+// process, so once that process closed the next delivery respawned the agent
+// straight into the same limit. The backoff now survives on the agent record
+// until real model output clears it. (Since #proj-runtime:#66 a reported
+// reset is waited for in full; these tests use one an hour away to keep the
+// wait short.)
 const QUOTA_TEXT = "You've reached your Fable limit. Switch to another model, or manage usage credits at claude.ai.";
 const HOUR_MS = 60 * 60_000;
 
 async function hitWeeklyQuota(h: Harness, key = SHARED_CODEX): Promise<void> {
-  const resetsAt = new Date(Date.now() + 5 * 24 * HOUR_MS).toISOString();
+  const resetsAt = new Date(Date.now() + HOUR_MS).toISOString();
   await h.emit([{ kind: "error", message: QUOTA_TEXT, providerLimit: { kind: "quota_exhausted", resetsAt } }]);
   const armed = h.events.filter((event) => event.name === "daemon.agent.runtime_error_delivery_backoff").at(-1);
-  expect(armed?.attrs.delay_ms, "the wait is capped at 60 minutes").toBe(HOUR_MS);
+  expect(armed?.attrs.delay_ms, "the wait runs to the reported reset").toBe(HOUR_MS);
   expect(h.m.lifecycleRecords.getProviderLimit(key)).toMatchObject({
     attempts: 1, reason: "rate_limited", untilMs: Date.now() + HOUR_MS, providerLimitKind: "quota_exhausted", resetsAt,
   });

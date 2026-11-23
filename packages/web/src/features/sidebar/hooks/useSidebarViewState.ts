@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { canCreateAnyChannel } from "@botiverse/raft-shared";
 import { useAppearanceStore } from "../../../store/appearanceStore";
 import { useServerStore } from "../../../store/serverStore";
 import { useRailMode } from "../../../hooks/useSidebarTab";
@@ -33,9 +34,7 @@ export function useSidebarViewState(data: SidebarData) {
   } = data;
 
   const [sectionCtxMenu, setSectionCtxMenu] = useState<SectionCtxMenu | null>(null);
-  const sectionCtxMenuRef = useRef<HTMLDivElement | null>(null);
   const [sidebarSurfaceCtxMenu, setSidebarSurfaceCtxMenu] = useState<SidebarSurfaceCtxMenu | null>(null);
-  const sidebarSurfaceCtxMenuRef = useRef<HTMLDivElement | null>(null);
   const [sectionDialog, setSectionDialog] = useState<
     // `insertBefore`: the sectionOrder key of the section the menu was opened
     // on, so the new section lands right above it (task #34).
@@ -105,7 +104,8 @@ export function useSidebarViewState(data: SidebarData) {
   const members = useServerStore((s) => s.members);
   const { role: currentRole, capabilities } = useServerPermissions();
   const canManageServer = capabilities.editServerSettings;
-  const canCreateChannel = capabilities.createChannels;
+  // Shown for either visibility; Create Channel offers only the ones this person may create.
+  const canCreateChannel = canCreateAnyChannel(capabilities);
   // The Joint Channels / External section's create entries ("+", section and
   // surface menus): with external_channels_v1 on they open Create Channel with
   // External chosen, for whoever Create Channel offers External to (owners and
@@ -117,7 +117,6 @@ export function useSidebarViewState(data: SidebarData) {
   // read when clicked: Create Channel, which says so itself.
   const gateExternalCreate = useExternalLimitGate(externalChannelsEnabled && externalChannelCreateAccess, "sidebar");
   const canRegisterMachines = capabilities.registerMachines;
-  const canManageExternalAuth = capabilities.manageExternalAuth;
   const canViewBillingSettings = canOpenSettingsTab("billing", capabilities);
   const canViewAdministrationSettings = canOpenSettingsTab("administration", capabilities);
   const canViewApplicationsSettings = canOpenSettingsTab("integrations", capabilities);
@@ -228,13 +227,13 @@ export function useSidebarViewState(data: SidebarData) {
 
   // Stryker restore all
   return {
-    setSectionCtxMenu, sectionCtxMenu, sectionCtxMenuRef, setSidebarSurfaceCtxMenu, sidebarSurfaceCtxMenu,
-    sidebarSurfaceCtxMenuRef, setSectionDialog, sectionDialog, setCollapsedCustomSections,
+    setSectionCtxMenu, sectionCtxMenu, setSidebarSurfaceCtxMenu, sidebarSurfaceCtxMenu,
+    setSectionDialog, sectionDialog, setCollapsedCustomSections,
     collapsedCustomSections, setDeleteSectionConfirm, deleteSectionConfirm, ctxMenuClickShielded,
     setCtxMenuClickShielded, ctxMenuShieldTimerRef, setDeleteConfirm, deleteConfirm, archiveConfirm,
     setArchiveConfirm, setLeaveConfirm, leaveConfirm, setShowUserMenu, showUserMenu, showServerMenu,
     setShowServerMenu, members, currentRole, capabilities, canManageServer, canCreateChannel,
-    canCreateJointChannel, gateExternalCreate, canRegisterMachines, canManageExternalAuth, canViewBillingSettings,
+    canCreateJointChannel, gateExternalCreate, canRegisterMachines, canViewBillingSettings,
     canViewAdministrationSettings, canViewApplicationsSettings, railMode, showSettingsRail,
     showComputersRail, showChatRail, railLabel, collapsed, setCollapsed, channelSortMode,
     jointChannelSortMode, dmSortMode, pinnedSortMode, openSortMenu, setOpenSortMenu, joinedChannelsOnly,

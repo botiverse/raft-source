@@ -9,6 +9,7 @@
 // "@botiverse/raft-shared/src/agentText/continuations".
 
 import type { AskOption, AskSpec, InvalidAnswerCategory } from "../continuations/index";
+import { CONTINUATION_ANSWER_TOOL_NAME } from "../continuations/tool";
 
 /** Typed where a heredoc closes; the same delimiter `raft message send` teaches. */
 const HEREDOC_DELIMITER = "RAFTMSG";
@@ -97,13 +98,41 @@ function answerLines(id: string, ask: AskSpec): string[] {
   return Object.entries(ask.options).flatMap(([key, option]) => optionLines(id, key, option));
 }
 
+/**
+ * How the paused text tells the agent to answer. `answerTool`: its launch
+ * offers the daemon's answer tool (RAFT_CONTINUATION_TOOL), so the options are
+ * listed once and one line names the tool, with `cont` as the shell fallback,
+ * instead of a `cont` line per option. Absent or false: the `cont` lines.
+ */
+export interface ContinuationPausedOptions {
+  answerTool?: boolean;
+}
+
+/** The options as a list, without commands: what the tool's one line refers to. */
+function toolOptionLines(ask: AskSpec & { options: Record<string, AskOption> }): string[] {
+  return Object.entries(ask.options).map(([key, option]) => (typeof option === "string" ? `  ${key}) ${option}` : `  ${key}) ${option.label} (your text)`));
+}
+
 /** The question, its preview, and every way to answer it. */
-export function formatContinuationPaused(view: ContinuationPausedView): string {
+export function formatContinuationPaused(view: ContinuationPausedView, options: ContinuationPausedOptions = {}): string {
   const { id, ask } = view;
   const lines = [ask.question];
   const preview = ask.preview?.replace(/\n+$/, "");
   if (preview) lines.push(indent(preview, "  "));
   const where = `continuation ${id}, expires at ${utcClock(view.expiresAt)} UTC`;
+  if (options.answerTool === true) {
+    const tool = CONTINUATION_ANSWER_TOOL_NAME;
+    if (ask.options === undefined) {
+      lines.push(`Your text is the answer (${where}).`);
+      lines.push(`Answer with the ${tool} tool (id ${id} and text); or in a shell: cont ${id}, your text on stdin`);
+    } else {
+      lines.push(`Choose one of these (${where}):`);
+      lines.push(...toolOptionLines(ask));
+      const takesText = Object.values(ask.options).some((option) => typeof option !== "string");
+      lines.push(`Answer with the ${tool} tool (id ${id}, choice, and text for an option that takes text); or in a shell: cont ${id} <choice>${takesText ? " (text on stdin)" : ""}`);
+    }
+    return lines.join("\n");
+  }
   lines.push(ask.options === undefined ? `Answer with your text on stdin (${where}):` : `Answer with one of these (${where}):`);
   lines.push(...answerLines(id, ask));
   return lines.join("\n");

@@ -20,3 +20,10 @@ test("both groups are drawn, global first, when both hold skills", () => {
 test("no group at all when the agent has no skills", () => {
   assert.deepEqual(skillSections([], []), []);
 });
+
+test("built-in skills (from a Computer that reads them through OAR) come first", () => {
+  const sections = skillSections([skill("a")], [skill("b")], [skill("simplify")]);
+  assert.deepEqual(sections.map((section) => [section.scope, section.skills.length]), [["builtin", 1], ["global", 1], ["workspace", 1]]);
+  assert.deepEqual(skillSections([], [], [skill("simplify")]).map((section) => section.scope), ["builtin"]);
+  assert.deepEqual(skillSections([skill("a")], [], []).map((section) => section.scope), ["global"], "an empty built-in list draws nothing");
+});

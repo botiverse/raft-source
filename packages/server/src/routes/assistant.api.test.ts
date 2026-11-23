@@ -853,6 +853,36 @@ test("the retraction's message:updated carries deletedAt into the V2 fact; a liv
   assert.deepEqual(normalizeLegacyRetraction(live.payload.deletedAt), {}, "a live message's V2 fact omits deletedAt");
 });
 
+test("the retraction logs its conversation's inbox_row (sync's Activity rows) in its transaction, visible by the time message:updated goes; a repeat logs nothing", async ({ app }) => {
+  const f = await seedSender();
+  await setAssistantSendAsOwner(f.assistant.id, true);
+  const sent = await sendAsOwner(app.baseUrl, f.sendKey, { channelId: f.room.id, content: "delegated, then retracted" });
+  assert.equal(sent.status, 200, JSON.stringify(sent.body));
+  const watermark = Number((await getDb().execute(sql`SELECT COALESCE(max(seq), 0) AS m FROM change_log`)).rows[0]!.m as string);
+  const inboxRows = async () => (await getDb().execute(sql`
+    SELECT scope_kind, scope_id::text AS scope_id, entity_id FROM change_log WHERE seq > ${watermark} AND entity = 'inbox_row' ORDER BY seq`)).rows;
+  const counted: Array<Promise<number>> = [];
+  const io = {
+    to: () => ({ emit: (event: string) => {
+      // At the emit the transaction has committed: another connection sees the row.
+      if (event === "message:updated") counted.push(inboxRows().then((rows) => rows.length));
+    } }),
+    in: () => ({ socketsJoin: () => undefined }),
+  };
+  const retract = () => retractDelegatedMessage({
+    io: io as unknown as Parameters<typeof retractDelegatedMessage>[0]["io"],
+    serverId: f.server.id,
+    userId: f.owner.id,
+    messageId: sent.body.messageId,
+  });
+  await retract();
+  assert.deepEqual(await inboxRows(), [{ scope_kind: "channel", scope_id: f.room.id, entity_id: f.room.id }]);
+  assert.ok(counted.length > 0);
+  for (const n of await Promise.all(counted)) assert.equal(n, 1, "committed by the realtime update");
+  await retract();
+  assert.equal((await inboxRows()).length, 1, "already retracted: nothing more");
+});
+
 test("the retraction finds receipts only in the owner's DM with the assistant, on the channel index", async ({ app }) => {
   assert.ok(app);
   // Unscoped, this lookup scanned every message and hit statement_timeout on staging.
@@ -1696,7 +1726,7 @@ test("the web's forward refuses more than 20 messages with too_many_messages", a
     body: JSON.stringify({ channelId: f.dest.id, sourceMessageIds: Array.from({ length: 21 }, () => randomUUID()) }),
   });
   assert.equal(res.status, 400);
-  assert.deepEqual(await res.json(), { error: "You can forward up to 20 messages at a time", code: "too_many_messages" });
+  assert.deepEqual(await res.json(), { error: "You can forward up to 20 messages at a time", code: "too_many_messages", errorCode: "too_many_messages" });
 });
 
 

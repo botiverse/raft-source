@@ -171,6 +171,10 @@
       "types": "./src/artifactPageTheme.ts",
       "default": "./src/artifactPageTheme.ts"
     },
+    "./src/bareLinkEnd": {
+      "types": "./src/bareLinkEnd.ts",
+      "default": "./src/bareLinkEnd.ts"
+    },
     "./src/artifactCheckContract": {
       "types": "./src/artifactCheckContract.ts",
       "default": "./src/artifactCheckContract.ts"
@@ -215,6 +219,14 @@
       "types": "./src/noProxy.ts",
       "default": "./src/noProxy.ts"
     },
+    "./src/agentLeftovers": {
+      "types": "./src/agentLeftovers.ts",
+      "default": "./src/agentLeftovers.ts"
+    },
+    "./src/systemTrust": {
+      "types": "./src/systemTrust.ts",
+      "default": "./src/systemTrust.ts"
+    },
     "./src/traceUploadUrl": {
       "types": "./src/traceUploadUrl.ts",
       "default": "./src/traceUploadUrl.ts"
@@ -234,6 +246,10 @@
     "./src/brandedIds": {
       "types": "./src/brandedIds.ts",
       "default": "./src/brandedIds.ts"
+    },
+    "./src/fetchWithoutRedirect": {
+      "types": "./src/fetchWithoutRedirect.ts",
+      "default": "./src/fetchWithoutRedirect.ts"
     },
     "./src/generated/openapi": {
       "types": "./src/generated/openapi.ts",

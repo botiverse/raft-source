@@ -1,7 +1,7 @@
 // A Built-in agent writes `.builtin-runtime/models.json` in its own workspace.
 // Pi must never take a provider's endpoint, headers or credentials from it:
-// otherwise one line redirects the provider key Raft seeds (the agent's own or
-// a team connection's) to any host, and header values read the daemon's env.
+// otherwise one line redirects the provider key Raft seeds to any host, and
+// header values read the daemon's env.
 // Only modelOverrides limits and metadata apply (piBuiltInModelsJson.ts).
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -278,30 +278,6 @@ test("a typed model id on a preset provider takes the catalog transport, not mod
   });
 });
 
-test("a saved preset Provider connection: the team key stays on the catalog endpoint", async () => {
-  await withWorkspace(async ({ agentDir, workingDirectory, open }) => {
-    writeFileSync(path.join(agentDir, "models.json"), hostileModelsJson("anthropic", "claude-opus-5-5"));
-    const config = {
-      version: RUNTIME_CONFIG_VERSION,
-      runtime: "builtin",
-      provider: { kind: "connection", connectionId: "11111111-1111-4111-8111-111111111111" },
-      hostUserState: "forbidden",
-      model: { kind: "preset", id: "anthropic/claude-opus-5-5" },
-      mode: { kind: "default" },
-    } as RuntimeConfig;
-    const handle = await open(builtInContext(workingDirectory, "anthropic/claude-opus-5-5", config, {
-      envVars: { ANTHROPIC_API_KEY: "sk-team-connection-key" },
-      providerConnection: { providerId: "anthropic", endpointUrl: null, supportsImageInput: false },
-    }));
-    try {
-      assert.equal(handle.session.model?.baseUrl, "https://api.anthropic.com");
-      await assertOneTurnStaysOn(handle, "api.anthropic.com", "sk-team-connection-key");
-    } finally {
-      handle.session.dispose();
-    }
-  });
-});
-
 test("control: a gateway runs on its configured endpoint, and its modelOverrides limit applies", async () => {
   await withWorkspace(async ({ agentDir, workingDirectory, open }) => {
     writeFileSync(path.join(agentDir, "models.json"), hostileModelsJson("anthropic", "gateway-model"));
@@ -333,8 +309,8 @@ test("the transport check refuses a model off its provider's endpoint, at start 
   assert.throws(() => assertBuiltInModelTransport({ provider: "raft-unknown", id: "m", baseUrl: "https://x.test" }, piCatalogProviderOrigins("raft-unknown")), BuiltInModelTransportMismatchError);
 
   const gateway = { version: RUNTIME_CONFIG_VERSION, runtime: "builtin", provider: { kind: "gateway", providerId: "openai-compatible", baseUrl: "https://gw.example.test/v1", apiKey: "k" }, hostUserState: "forbidden", model: { kind: "custom", name: "m" }, mode: { kind: "default" } } as RuntimeConfig;
-  assert.deepEqual([...builtInModelTransportOrigins(gateway, null, { provider: "openai" })!], ["https://gw.example.test"]);
-  assert.equal(builtInModelTransportOrigins({ ...gateway, runtime: "pi" } as RuntimeConfig, null, { provider: "openai" }), null, "a Pi runtime keeps the host's own config");
+  assert.deepEqual([...builtInModelTransportOrigins(gateway, { provider: "openai" })!], ["https://gw.example.test"]);
+  assert.equal(builtInModelTransportOrigins({ ...gateway, runtime: "pi" } as RuntimeConfig, { provider: "openai" }), null, "a Pi runtime keeps the host's own config");
 
   // A provider call with a model moved off the endpoint is refused before any request.
   await withWorkspace(async ({ workingDirectory, open }) => {

@@ -1,15 +1,18 @@
 import { Badge, Button, Card, InlineCode, PanelScrollViewport, TextLink, ScrollArea } from "@botiverse/raft-ui";
 import { useState, useEffect, useCallback } from "react";
-import { ChevronDown, ChevronRight, Globe, FolderOpen, RefreshCw } from "lucide-react";
+import { ChevronDown, ChevronRight, Globe, FolderOpen, Package, RefreshCw } from "lucide-react";
 import { useIntl } from "react-intl";
 import apiClient from "../../api/client";
 import type { SkillInfo } from "@botiverse/raft-shared";
 import SectionHeader from "../ui/SectionHeader";
 import { skillSections } from "./skillSections";
+import type { SkillSection } from "./skillSections";
 
 interface SkillsData {
   global: SkillInfo[];
   workspace: SkillInfo[];
+  /** Additive: skills the runtime ships, sent only by Computers that read them through OAR. */
+  builtin: SkillInfo[];
   /**
    * Additive (older servers send none: ok). stale: the Computer did not answer
    * in time and this is its last list; unavailable: no list in time.
@@ -22,11 +25,20 @@ function parseSkillsData(payload: unknown): SkillsData {
   return {
     global: Array.isArray(body.global) ? body.global as SkillInfo[] : [],
     workspace: Array.isArray(body.workspace) ? body.workspace as SkillInfo[] : [],
+    builtin: Array.isArray(body.builtin) ? body.builtin as SkillInfo[] : [],
     state: body.state === "stale" || body.state === "unavailable" ? body.state : "ok",
   };
 }
 
 const EMPTY_SKILLS: SkillInfo[] = [];
+
+const SECTION_LABEL_IDS = {
+  builtin: "agent.skills.builtin",
+  global: "agent.skills.global",
+  workspace: "agent.skills.workspace",
+} as const satisfies Record<SkillSection["scope"], string>;
+
+const SECTION_ICONS = { builtin: Package, global: Globe, workspace: FolderOpen } as const satisfies Record<SkillSection["scope"], typeof Globe>;
 
 /**
  * One line per skill (name, `/command` badge, truncated description); clicking
@@ -67,7 +79,8 @@ function SkillRow({ skill }: { skill: SkillInfo }) {
 function groupByPath(skills: SkillInfo[]): Map<string, SkillInfo[]> {
   const groups = new Map<string, SkillInfo[]>();
   for (const skill of skills) {
-    const key = skill.sourcePath || "unknown";
+    // "": the runtime reported no folder (Claude's built-in skills); no path line.
+    const key = skill.sourcePath || "";
     const list = groups.get(key) || [];
     list.push(skill);
     groups.set(key, list);
@@ -78,10 +91,12 @@ function groupByPath(skills: SkillInfo[]): Map<string, SkillInfo[]> {
 function PathGroup({ path, skills }: { path: string; skills: SkillInfo[] }) {
   return (
     <div>
-      <div className="mb-2 flex min-w-0 items-center gap-2">
-        <InlineCode className="min-w-0 text-mono-meta text-foreground-hint">{path}</InlineCode>
-        <span className="shrink-0 font-mono text-mono-meta text-foreground-hint">({skills.length})</span>
-      </div>
+      {path && (
+        <div className="mb-2 flex min-w-0 items-center gap-2">
+          <InlineCode className="min-w-0 text-mono-meta text-foreground-hint">{path}</InlineCode>
+          <span className="shrink-0 font-mono text-mono-meta text-foreground-hint">({skills.length})</span>
+        </div>
+      )}
       {/* Fixed-height box that scrolls on its own, so a long list does not
           stretch the profile page (about ten rows visible). The Card is the
           frame (max height, border, rounded clip); the rows scroll in a
@@ -176,7 +191,7 @@ export default function AgentSkills({ agentId, embedded }: { agentId: string; em
     );
   }
 
-  const sections = skillSections(data?.global ?? EMPTY_SKILLS, data?.workspace ?? EMPTY_SKILLS);
+  const sections = skillSections(data?.global ?? EMPTY_SKILLS, data?.workspace ?? EMPTY_SKILLS, data?.builtin ?? EMPTY_SKILLS);
   const totalSkills = sections.reduce((total, section) => total + section.skills.length, 0);
 
   const body = (
@@ -205,8 +220,8 @@ export default function AgentSkills({ agentId, embedded }: { agentId: string; em
           {sections.map((section) => (
             <SkillSubSection
               key={section.scope}
-              label={formatMessage({ id: section.scope === "global" ? "agent.skills.global" : "agent.skills.workspace" })}
-              icon={section.scope === "global" ? Globe : FolderOpen}
+              label={formatMessage({ id: SECTION_LABEL_IDS[section.scope] })}
+              icon={SECTION_ICONS[section.scope]}
               skills={section.skills}
             />
           ))}

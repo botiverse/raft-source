@@ -10,20 +10,20 @@ const m = (id: string): RuntimeModelInfo => ({ id, label: id } as RuntimeModelIn
 
 const LIVE_CODEX = ["gpt-5.5", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"].map(m);
 
-test("codex default stays the machine default when the live catalog has no GPT-6.1 Sol", () => {
+test("codex default stays the machine default when the live catalog has no GPT-6.2 Sol", () => {
   // The bundled default is only preferred when the machine surfaced it; Raft
   // never adds an unverified static suggestion to the live list.
   const out = canonicalizeCodexPresentation("codex", LIVE_CODEX, "gpt-5.5");
   assert.equal(out.default, "gpt-5.5");
-  assert.ok(!out.models.some((x) => x.id === "gpt-6.1-sol"));
+  assert.ok(!out.models.some((x) => x.id === "gpt-6.2-sol"));
 });
 
-test("live catalog with GPT-6.1 Sol: it is ordered first and becomes the default", () => {
-  const live = [...LIVE_CODEX, m("gpt-6-luna"), m("gpt-6.1-sol"), m("gpt-6-sol")];
+test("live catalog with GPT-6.2 Sol: it is ordered first and becomes the default", () => {
+  const live = [...LIVE_CODEX, m("gpt-6-luna"), m("gpt-6.1-sol"), m("gpt-6-sol"), m("gpt-6.2-sol"), m("gpt-6.2-astra")];
   const out = canonicalizeCodexPresentation("codex", live, "gpt-5.5");
-  assert.equal(out.default, "gpt-6.1-sol");
-  assert.deepEqual(out.models.slice(0, 7).map((x) => x.id), [
-    "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+  assert.equal(out.default, "gpt-6.2-sol");
+  assert.deepEqual(out.models.slice(0, 9).map((x) => x.id), [
+    "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
   ]);
 });
 

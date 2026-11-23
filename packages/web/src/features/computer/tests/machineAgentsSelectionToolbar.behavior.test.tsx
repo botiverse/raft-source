@@ -94,7 +94,7 @@ function Page({ status }: { status: Machine["status"] }) {
   return (
     <MemoryRouter>
       <div data-testid="scroller">
-        <MachineAgentList machine={machine(status)} canManageMachines canViewRuntimeAccountUsage={false} selectionDock={dock} onSelectingChange={noop} />
+        <MachineAgentList machine={machine(status)} canManageMachines canControl={false} canViewRuntimeAccountUsage={false} selectionDock={dock} onSelectingChange={noop} />
       </div>
       <div ref={setDock} data-testid="dock" />
     </MemoryRouter>

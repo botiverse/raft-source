@@ -21,9 +21,21 @@
  *   GET    /passkeys                      -> { passkeys: [{ id, name, createdAt, lastUsedAt, synced }] }
  *   PATCH  /passkeys/:id                  { name } -> { passkey }
  *   DELETE /passkeys/:id                  { code? | backupCode? | webauthn? } -> { removed: true }
- *   POST   /passkeys/assertion/options    {} -> { options } (bound to this sign-in)
+ *   POST   /passkeys/assertion/options    { rp? } -> { options, rp? } (bound to this sign-in)
  * `webauthn` is the browser's `PublicKeyCredential.toJSON()` from an
  * assertion with those options.
+ *
+ * RP IDs (WEBAUTHN_LEGACY_RP_ID, services/secondFactor/webauthn.ts): every
+ * assertion options request (this one, the sign-in's below, POST
+ * /api/auth/passkey/options) takes `rp: "current" | "legacy"` (anything else:
+ * 400 invalid_request). Without it: the person's passkeys under the current
+ * RP ID if they have any, else the legacy ones. With it: that group, or 404
+ * `passkey_rp_unavailable` { rp, availableRps } when it has none of their
+ * passkeys but another group has (404 `passkey_not_found` when they have
+ * none at all). The options' `rpId` is the RP ID to ask under, and while a
+ * legacy RP ID is set the body also says which group: `rp`.
+ * Legacy passkeys stay valid and are never replaced; new ones are registered
+ * under the current RP ID (services/secondFactor/passkeyManagement.ts).
  *
  * The unauthenticated second step of a sign-in, POST /verify
  * { challenge, code (or totp) | backupCode | webauthn }, is mounted ahead of this
@@ -97,6 +109,9 @@
  *     paths is in DEVICE_SESSION_ROUTES) and a token with no session family
  *     (401); requireWebSessionFamily below narrows the family the rest reads
  *     (re-authentication and the verified mark live on it).
+ *   - Adding a factor (/totp/setup, /passkeys/registration/options) or
+ *     turning it on (/enable) also needs a verified email (403
+ *     `email_verification_required`, refuseUnverifiedEmail).
  */
 import { Router, type NextFunction, type Request, type RequestHandler, type Response, type Router as RouterType } from "express";
 import { currentDate } from "@botiverse/raft-shared";
@@ -135,12 +150,13 @@ import {
   startRecovery,
 } from "../services/secondFactor/recovery";
 import { SecondFactorSignInError, signInSecondFactorMethods, startSignInPasskeyAssertion } from "../services/secondFactor/signIn";
-import { parsePasskeyRegistrationResponse } from "../services/secondFactor/webauthn";
+import { parsePasskeyRegistrationResponse, parsePasskeyRpGroup } from "../services/secondFactor/webauthn";
 import { approverSecondFactorCheck } from "../services/sessionIssueGate";
 import { STEP_UP_ACTIONS, recentSecondFactorCheck, type StepUpAction } from "../services/secondFactor/stepUpGate";
 import { webSessionFamilyOf } from "../services/sessionService";
 import { noteOwnerDispatchStepUp } from "../services/ownerDispatchMark";
 import { sendJsonServerError } from "./errorResponse";
+import { refuse } from "../lib/refusal";
 
 export const secondFactorRouter: RouterType = Router();
 
@@ -272,11 +288,12 @@ export function signInPasskeyAssertionOptions(limiter: RequestHandler): RequestH
 
 function answerSignInPasskeyAssertionOptions(req: Request, res: Response): void {
   const challenge = parseAuthChallengeToken(req.body?.challenge);
-  if (!challenge) {
-    res.status(400).json({ error: "Send the sign-in challenge.", code: "invalid_request" });
+  const rp = parsePasskeyRpGroup(req.body?.rp);
+  if (!challenge || rp === null) {
+    res.status(400).json({ error: rp === null ? "rp must be \"current\" or \"legacy\"." : "Send the sign-in challenge.", code: "invalid_request" });
     return;
   }
-  void startSignInPasskeyAssertion(challenge).then((started) => {
+  void startSignInPasskeyAssertion(challenge, currentDate(), rp).then((started) => {
     res.setHeader("Cache-Control", "no-store");
     res.json(started);
   }).catch((err: unknown) => {
@@ -288,7 +305,19 @@ function answerSignInPasskeyAssertionOptions(req: Request, res: Response): void 
   });
 }
 
-secondFactorRouter.post("/passkeys/assertion/options", managementRoute(startStepUpPasskeyAssertion, "Failed to start passkey verification"));
+secondFactorRouter.post("/passkeys/assertion/options", async (req, res) => {
+  const rp = parsePasskeyRpGroup(req.body?.rp);
+  if (rp === null) {
+    refuse(res, 400, { code: "invalid_request", error: "rp must be \"current\" or \"legacy\"." });
+    return;
+  }
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    res.json(await startStepUpPasskeyAssertion({ userId: req.userId!, familyId: webSessionFamilyOf(req)!, rp }));
+  } catch (err) {
+    sendSecondFactorError(req, res, err, "Failed to start passkey verification");
+  }
+});
 secondFactorRouter.post("/passkeys/registration/options", managementRoute(startPasskeyRegistration, "Failed to start adding a passkey"));
 
 secondFactorRouter.post("/passkeys/registration/verify", async (req, res) => {

@@ -7,14 +7,11 @@ import {
   buildVisibleConversationChannelsSql,
   buildVisibleConversationRowCheckSql,
   buildMessageSearchBreadthProbeSql,
-  buildMessageSearchTextMatchProbeSql,
+  buildMessageSearchOlderHiddenCountSql,
   buildSearchCandidateCtes,
   buildSnippet,
   classifyMessageSearchBreadth,
-  classifyMessageSearchTextMatchBreadth,
-  MESSAGE_SEARCH_COMMON_TERM_CORPUS_FRACTION,
   MESSAGE_SEARCH_RELEVANCE_ESTIMATED_CANDIDATE_LIMIT,
-  MESSAGE_SEARCH_RELEVANCE_ESTIMATED_TEXT_MATCH_LIMIT,
   readMessageSearchEstimatedCandidateRows,
   chooseMessageSearchRecentPlan,
   MESSAGE_SEARCH_RECENT_COLLECT_FIRST_TEXT_MATCH_LIMIT,
@@ -193,18 +190,23 @@ test("relevance search collects text matches first, then keeps the visible ones 
     offset: 0,
     channelFilter: sql``,
     channelScopeFilter: sql``,
-    textMatchChannelScopeFilter: sql``,
     senderFilter: sql``,
     senderTypeFilter: sql``,
     mentionTargetFilter: sql``,
     afterFilter: sql``,
     beforeFilter: sql``,
+    textMatchServerIds: ["00000000-0000-4000-8000-000000000001"],
   })).sql);
 
   // A fixed shape, so the planner never chooses to run the GIN match once per
-  // visible channel: text_matches holds only ids, content and rank read
-  // visible rows only.
-  assert.match(rendered, /^text_matches AS MATERIALIZED \( SELECT m\.id AS id, m\.channel_id AS channel_id FROM messages m WHERE m\.search_vector @@ \(plainto_tsquery\('simple', \$\d+\)\)/);
+  // visible channel: text_matches holds only ids, read from the searched
+  // servers' timeline (never every server's messages); content and rank read
+  // visible rows only, and the message's own vector is re-checked without
+  // becoming an index condition on idx_messages_search_vector_gin.
+  assert.match(rendered, /^text_matches AS MATERIALIZED \( SELECT t\.message_id AS id, t\.channel_id AS channel_id FROM message_server_timeline t WHERE t\.server_id = ANY\(\$\d+::uuid\[\]\) AND t\.search_vector @@ \(plainto_tsquery\('simple', \$\d+\)\)/);
+  assert.match(rendered, /\bAND m\.channel_id = tm\.channel_id AND \(m\.search_vector @@ \(plainto_tsquery\('simple', \$\d+\)\)\) IS TRUE\b/);
+  assert.doesNotMatch(rendered, /\bFROM messages m WHERE\b/);
+  assert.doesNotMatch(rendered, /\bAND m\.search_vector @@/);
   assert.match(rendered, /\bmatched_messages AS MATERIALIZED \(.*\bFROM text_matches tm JOIN visible_channels vc ON vc\.id = tm\.channel_id JOIN messages m ON m\.id = tm\.id WHERE\b/);
   assert.match(rendered, /\bFROM matched_messages mm ORDER BY\b/);
   assert.doesNotMatch(rendered, /\bFROM visible_channels vc JOIN messages m\b/);
@@ -220,17 +222,18 @@ test("relevance search narrows text matches to the filtered channel and keeps th
     offset: 0,
     channelFilter: sql`AND (m.channel_id = ${"channel-1"} OR vc.parent_channel_id = ${"channel-1"})`,
     channelScopeFilter: sql`AND m.channel_id IN (SELECT ${"channel-1"}::uuid)`,
-    textMatchChannelScopeFilter: sql`AND m.channel_id = ANY(ARRAY(SELECT ${"channel-1"}::uuid))`,
+    timelineTextMatchChannelScopeFilter: sql`AND t.channel_id = ANY(ARRAY(SELECT ${"channel-1"}::uuid))`,
     senderFilter: sql``,
     senderTypeFilter: sql``,
     mentionTargetFilter: sql``,
     afterFilter: sql``,
     beforeFilter: sql``,
+    textMatchServerIds: ["00000000-0000-4000-8000-000000000001"],
   })).sql);
 
   assert.match(
     rendered,
-    /^text_matches AS MATERIALIZED \(.*\bAND m\.channel_id = ANY\(ARRAY\(SELECT \$\d+::uuid\)\).*\), matched_messages AS MATERIALIZED \(.*\bAND \(m\.channel_id = \$\d+ OR vc\.parent_channel_id = \$\d+\).*\), search_candidates AS \(/,
+    /^text_matches AS MATERIALIZED \(.*\bAND t\.channel_id = ANY\(ARRAY\(SELECT \$\d+::uuid\)\).*\), matched_messages AS MATERIALIZED \(.*\bAND \(m\.channel_id = \$\d+ OR vc\.parent_channel_id = \$\d+\).*\), search_candidates AS \(/,
   );
 });
 
@@ -239,7 +242,7 @@ test("channel filter: text matches get the scope as a precomputed array, the wal
   const dialect = new PgDialect();
   const render = (sort: "relevance" | "recent", recentPlan?: "walk" | "text_matches_first") => normalizeSql(dialect.sqlToQuery(buildMessageSearchStatement(
     sql`SELECT NULL::uuid AS id, NULL::uuid AS parent_channel_id`,
-    { serverId: "00000000-0000-4000-8000-000000000001", channelId: "00000000-0000-4000-8000-000000000009", sort, recentPlan, limit: 20, offset: 0 },
+    { serverId: "00000000-0000-4000-8000-000000000001", channelId: "00000000-0000-4000-8000-000000000009", sort, recentPlan, limit: 20, offset: 0, textMatchServerIds: ["00000000-0000-4000-8000-000000000001"] },
     sql`plainto_tsquery('simple', ${"flaky"})`,
   )).sql);
 
@@ -247,13 +250,17 @@ test("channel filter: text matches get the scope as a precomputed array, the wal
   // thread (3,241 rescans, 4.8s on a 3,240-thread channel); an InitPlan array
   // keeps it to one GIN scan.
   for (const rendered of [render("relevance"), render("recent", "text_matches_first")]) {
-    assert.match(rendered, /\bWITH visible_channels AS \(.*\), text_matches AS MATERIALIZED \( SELECT m\.id AS id, m\.channel_id AS channel_id FROM messages m WHERE m\.search_vector @@ \(plainto_tsquery\('simple', \$\d+\)\) AND m\.channel_id = ANY\(ARRAY\( SELECT \$\d+::uuid UNION ALL SELECT scoped_thread\.id FROM channels scoped_thread/);
+    assert.match(rendered, /\bWITH visible_channels AS \(.*\), text_matches AS MATERIALIZED \( SELECT t\.message_id AS id, t\.channel_id AS channel_id FROM message_server_timeline t WHERE t\.server_id = ANY\(\$\d+::uuid\[\]\) AND t\.search_vector @@ \(plainto_tsquery\('simple', \$\d+\)\) AND t\.channel_id = ANY\(ARRAY\( SELECT \$\d+::uuid UNION ALL SELECT scoped_thread\.id FROM channels scoped_thread/);
     assert.doesNotMatch(rendered, /\bm\.channel_id IN \(/);
+    assert.doesNotMatch(rendered, /\bAND m\.search_vector @@/, "the message re-check never reads idx_messages_search_vector_gin");
   }
   // The walk filters every row it passes by the scope: IN is hashed, a parameter array is not (15.5s vs 0.6s).
   const walk = render("recent", "walk");
   assert.match(walk, /\bAND m\.channel_id IN \( SELECT \$\d+::uuid UNION ALL SELECT scoped_thread\.id/);
   assert.doesNotMatch(walk, /\bANY\(ARRAY\(/);
+  // The walk's text match is a per-row filter, never a GIN index condition.
+  assert.match(walk, /\bAND \(m\.search_vector @@ \(plainto_tsquery\('simple', \$\d+\)\)\) IS TRUE\b/);
+  assert.doesNotMatch(walk, /\bAND m\.search_vector @@/);
 });
 
 test("server timeline walk: the text match cannot become a GIN index condition", async () => {
@@ -272,22 +279,52 @@ test("server timeline walk: the text match cannot become a GIN index condition",
   assert.doesNotMatch(rendered, /\bAND m\.search_vector @@/);
 });
 
-test("server timeline walk: with search_server_gin_v0 it pre-filters on the timeline's vector and still re-checks the message", async () => {
+test("server timeline walk pre-filters on the timeline's vector and still re-checks the message", async () => {
   const { buildMessageSearchStatement } = await import("./searchService");
   const dialect = new PgDialect();
-  const render = (textMatchServerIds?: readonly string[]) => normalizeSql(dialect.sqlToQuery(buildMessageSearchStatement(
+  const on = normalizeSql(dialect.sqlToQuery(buildMessageSearchStatement(
     sql`SELECT NULL::uuid AS id, NULL::uuid AS parent_channel_id`,
-    { serverId: "00000000-0000-4000-8000-000000000001", sort: "recent", recentPlan: "server_timeline_walk", limit: 20, offset: 0, textMatchServerIds },
+    { serverId: "00000000-0000-4000-8000-000000000001", sort: "recent", recentPlan: "server_timeline_walk", limit: 20, offset: 0, textMatchServerIds: ["00000000-0000-4000-8000-000000000001"] },
     sql`plainto_tsquery('simple', ${"means"})`,
   )).sql);
 
-  // Flag on: rows that do not match cost no messages read (prod 1.5 s -> 0.3 s);
-  // the message check stays, so a stale timeline copy can only drop a message.
-  const on = render(["00000000-0000-4000-8000-000000000001"]);
+  // Rows that do not match cost no messages read (prod 1.5 s -> 0.3 s); the
+  // message check stays, so a stale timeline copy can only drop a message.
   assert.match(on, /\bAND \(t\.search_vector @@ \(plainto_tsquery\('simple', \$\d+\)\)\) IS TRUE AND \(m\.search_vector @@ \(plainto_tsquery\('simple', \$\d+\)\)\) IS TRUE ORDER BY t\.created_at DESC, t\.message_id DESC\b/);
   assert.doesNotMatch(on, /\bAND t\.search_vector @@/, "IS TRUE keeps it from becoming a GIN index condition");
-  // Flag off: the timeline's vector may not be filled; only the message's is read.
-  assert.doesNotMatch(render(), /\bt\.search_vector\b/);
+});
+
+test("server timeline walk with the joint lane: two budgeted lanes merged newest first, a per-conversation frontier", async () => {
+  const { buildMessageSearchStatement, buildMessageSearchJointWalkFrontierSql } = await import("./searchService");
+  const dialect = new PgDialect();
+  const conversationIds = ["00000000-0000-4000-8000-000000000014", "00000000-0000-4000-8000-000000000015"];
+  const rendered = normalizeSql(dialect.sqlToQuery(buildMessageSearchStatement(
+    sql`SELECT NULL::uuid AS id, NULL::uuid AS parent_channel_id`,
+    {
+      serverId: "00000000-0000-4000-8000-000000000001",
+      sort: "recent",
+      recentPlan: "server_timeline_walk",
+      walkWindow: { budget: 3000, jointConversationIds: conversationIds },
+      limit: 20,
+      offset: 0,
+    },
+    sql`plainto_tsquery('simple', ${"means"})`,
+  )).sql);
+
+  // Each lane walks its own index (server_id / conversation_id) with the same
+  // text pre-filter and message re-check, joined to the visible channels per
+  // message; one ORDER BY merges them in the walk's order.
+  assert.match(rendered, /\bsearch_candidates AS \( SELECT lanes\.\* FROM \( \( SELECT t\.message_id AS "id".*\bJOIN visible_channels vc ON vc\.id = m\.channel_id WHERE t\.server_id = \$\d+\b.*\bORDER BY t\.created_at DESC, t\.message_id DESC LIMIT \$\d+\) UNION ALL \( SELECT t\.message_id AS "id".*\bJOIN visible_channels vc ON vc\.id = m\.channel_id WHERE t\.conversation_id = ANY\(\$\d+::uuid\[\]\).*\bAND \(t\.search_vector @@ \(plainto_tsquery\('simple', \$\d+\)\)\) IS TRUE AND \(m\.search_vector @@ \(plainto_tsquery\('simple', \$\d+\)\)\) IS TRUE ORDER BY t\.created_at DESC, t\.message_id DESC LIMIT \$\d+\) \) lanes ORDER BY lanes\."createdAt" DESC, lanes\."id" DESC LIMIT \$\d+ OFFSET \$\d+ \)/);
+  assert.doesNotMatch(rendered, /\bAND [tm]\.search_vector @@/);
+
+  // The frontier: one ordered branch per conversation (the partial index in
+  // order, budget + 1 rows each), merged, never a sort of every row.
+  const frontier = dialect.sqlToQuery(buildMessageSearchJointWalkFrontierSql({ conversationIds, budget: 3000 }));
+  const frontierSql = normalizeSql(frontier.sql);
+  assert.equal(frontierSql.match(/\( SELECT t\.created_at, t\.message_id FROM message_server_timeline t WHERE t\.conversation_id = \$\d+::uuid ORDER BY t\.created_at DESC, t\.message_id DESC LIMIT \$\d+ \)/g)?.length, 2);
+  assert.match(frontierSql, /\) UNION ALL \(/);
+  assert.match(frontierSql, /\) lanes ORDER BY lanes\.created_at DESC, lanes\.message_id DESC OFFSET \$\d+ LIMIT 2$/);
+  assert.deepEqual(frontier.params.filter((param) => param === 3001 || param === 2999), [3001, 3001, 2999]);
 });
 
 test("filter-only search keeps the page-first visible-channel plan", () => {
@@ -299,7 +336,6 @@ test("filter-only search keeps the page-first visible-channel plan", () => {
     offset: 0,
     channelFilter: sql``,
     channelScopeFilter: sql``,
-    textMatchChannelScopeFilter: sql``,
     senderFilter: sql`AND m.sender_id = ${"sender-1"}`,
     senderTypeFilter: sql``,
     mentionTargetFilter: sql``,
@@ -322,7 +358,6 @@ test("broad recent search uses the exact page-first visible-channel plan", () =>
     offset: 0,
     channelFilter: sql``,
     channelScopeFilter: sql``,
-    textMatchChannelScopeFilter: sql``,
     senderFilter: sql``,
     senderTypeFilter: sql``,
     mentionTargetFilter: sql``,
@@ -332,7 +367,8 @@ test("broad recent search uses the exact page-first visible-channel plan", () =>
 
   assert.match(rendered, /^search_candidates AS \(/);
   assert.match(rendered, /\bFROM visible_channels vc JOIN messages m ON m\.channel_id = vc\.id\b/);
-  assert.match(rendered, /\bm\.search_vector @@ \(plainto_tsquery\('simple', \$\d+\)\)/);
+  assert.match(rendered, /\bAND \(m\.search_vector @@ \(plainto_tsquery\('simple', \$\d+\)\)\) IS TRUE\b/);
+  assert.doesNotMatch(rendered, /\bAND m\.search_vector @@/);
   assert.doesNotMatch(rendered, /\bmatched_messages AS MATERIALIZED\b/);
 });
 
@@ -346,12 +382,12 @@ test("recent search on a bounded term takes text matches first and orders by tim
     offset: 0,
     channelFilter: sql``,
     channelScopeFilter: sql``,
-    textMatchChannelScopeFilter: sql``,
     senderFilter: sql``,
     senderTypeFilter: sql``,
     mentionTargetFilter: sql``,
     afterFilter: sql``,
     beforeFilter: sql``,
+    textMatchServerIds: ["00000000-0000-4000-8000-000000000001"],
   })).sql);
 
   assert.match(rendered, /^text_matches AS MATERIALIZED \(/);
@@ -381,31 +417,73 @@ test("breadth probe uses non-executing EXPLAIN over the viewer-scoped filtered F
   assert.doesNotMatch(rendered, /\bLIMIT\b|\bANALYZE\b/);
 });
 
-test("text-match probe plans the relevance statement's corpus-wide text_matches predicate without executing it", () => {
-  const dialect = new PgDialect();
-  const rendered = normalizeSql(dialect.sqlToQuery(buildMessageSearchTextMatchProbeSql({
-    tsQuery: sql`plainto_tsquery('simple', ${"the"})`,
-    channelScopeFilter: sql`AND m.channel_id IN (SELECT ${"channel-1"}::uuid)`,
-    senderFilter: sql`AND m.sender_id = ${"sender-1"}`,
+test("text match server ids are required once there is search text", () => {
+  assert.throws(() => buildSearchCandidateCtes({
+    tsQuery: sql`plainto_tsquery('simple', ${"hehe"})`,
+    sort: "relevance",
+    limit: 20,
+    offset: 0,
+    channelFilter: sql``,
+    channelScopeFilter: sql``,
+    senderFilter: sql``,
     senderTypeFilter: sql``,
-  })).sql);
-
-  assert.match(rendered, /^EXPLAIN \(FORMAT JSON\) SELECT m\.id FROM messages m WHERE m\.search_vector @@ \(plainto_tsquery\('simple', \$\d+\)\) AND m\.channel_id IN \(SELECT \$\d+::uuid\) AND m\.sender_id = \$\d+$/);
-  assert.doesNotMatch(rendered, /\bvisible_channels\b|\bLIMIT\b|\bANALYZE\b/);
+    mentionTargetFilter: sql``,
+    afterFilter: sql``,
+    beforeFilter: sql``,
+  }), /servers its text match reads/);
 });
 
-test("text-match classification rejects only estimates above both the fixed limit and the common-term share of the corpus", () => {
-  const small = 1_000_000;
-  assert.equal(classifyMessageSearchTextMatchBreadth(MESSAGE_SEARCH_RELEVANCE_ESTIMATED_TEXT_MATCH_LIMIT, small), "within_limit");
-  assert.equal(classifyMessageSearchTextMatchBreadth(MESSAGE_SEARCH_RELEVANCE_ESTIMATED_TEXT_MATCH_LIMIT + 1, small), "over_limit");
-  // A term missing from the statistics is estimated at up to 0.5% of the
-  // corpus; on a corpus large enough for that to pass the fixed limit, such a
-  // term must stay admitted.
-  const large = 100_000_000;
-  assert.equal(classifyMessageSearchTextMatchBreadth(large * 0.005, large), "within_limit");
-  assert.equal(classifyMessageSearchTextMatchBreadth(large * MESSAGE_SEARCH_COMMON_TERM_CORPUS_FRACTION + 1, large), "over_limit");
-  assert.throws(() => classifyMessageSearchTextMatchBreadth(-1, small));
-  assert.throws(() => classifyMessageSearchTextMatchBreadth(1, Number.NaN));
+function renderOlderHiddenCount(params: { tsQuery: SQL | null; fallbackTsQuery?: SQL | null; withTimeline?: boolean }): string {
+  const dialect = new PgDialect();
+  return normalizeSql(dialect.sqlToQuery(buildMessageSearchOlderHiddenCountSql({
+    visibleChannelsSql: sql`SELECT ${"channel-1"}::uuid AS id, ${"channel-1"}::uuid AS parent_channel_id`,
+    tsQuery: params.tsQuery,
+    fallbackTsQuery: params.fallbackTsQuery,
+    timelineTextMatch: params.withTimeline === false ? undefined : {
+      serverIds: ["00000000-0000-4000-8000-000000000001"],
+      timelineChannelScopeFilter: sql`AND t.channel_id = ANY(ARRAY(SELECT ${"channel-1"}::uuid))`,
+      timelineRangeFilter: sql`AND t.created_at >= ${new Date("2026-01-01T00:00:00.000Z")}`,
+    },
+    channelFilter: sql``,
+    senderFilter: sql`AND m.sender_id = ${"sender-1"}`,
+    senderTypeFilter: sql``,
+    mentionTargetFilter: sql``,
+    afterFilter: sql`AND m.created_at >= ${new Date("2026-01-01T00:00:00.000Z")}`,
+    beforeFilter: sql``,
+    historyCutoff: new Date("2026-09-21T00:00:00.000Z"),
+    cap: 100,
+  })).sql);
+}
+
+test("olderHidden count reads the text match through the searched servers' timeline GIN, never messages.search_vector's", () => {
+  const rendered = renderOlderHiddenCount({ tsQuery: sql`plainto_tsquery('simple', ${"deploy"})` });
+
+  assert.match(rendered, /\bFROM message_server_timeline t JOIN messages m ON m\.id = t\.message_id JOIN visible_channels vc ON vc\.id = m\.channel_id WHERE t\.server_id = ANY\(\$\d+::uuid\[\]\) AND t\.search_vector @@ \(plainto_tsquery\('simple', \$\d+\)\) AND t\.channel_id = ANY\(ARRAY\(SELECT \$\d+::uuid\)\) AND t\.created_at >= \$\d+ AND m\.channel_id = t\.channel_id AND \(/);
+  // The message is re-checked (a stale timeline row can only drop a match),
+  // written so it can never be an index condition on idx_messages_search_vector_gin.
+  assert.match(rendered, /\bAND m\.sender_id = \$\d+ AND m\.created_at >= \$\d+ AND \(m\.search_vector @@ \(plainto_tsquery\('simple', \$\d+\)\)\) IS TRUE AND m\.created_at < \$\d+ AND t\.created_at < \$\d+ LIMIT \$\d+\b/);
+  assert.doesNotMatch(rendered, /\bAND m\.search_vector @@/);
+  assert.doesNotMatch(rendered, /\bFROM visible_channels vc JOIN messages m\b/);
+});
+
+test("olderHidden count's any-word branch reads the timeline too", () => {
+  const rendered = renderOlderHiddenCount({
+    tsQuery: sql`plainto_tsquery('simple', ${"deploy staging"})`,
+    fallbackTsQuery: sql`plainto_tsquery('simple', ${"deploy"}) || plainto_tsquery('simple', ${"staging"})`,
+  });
+
+  assert.match(rendered, /\ball_words AS MATERIALIZED\b.*\bCASE WHEN all_words\."hidden" > 0 THEN all_words\."hidden" ELSE\b/);
+  assert.equal(rendered.match(/\bFROM message_server_timeline t\b/g)?.length, 2);
+  assert.equal(rendered.match(/\bt\.search_vector @@/g)?.length, 2);
+  assert.doesNotMatch(rendered, /\bAND m\.search_vector @@/);
+});
+
+test("filter-only olderHidden count keeps the visible-channel plan and needs no timeline", () => {
+  const rendered = renderOlderHiddenCount({ tsQuery: null, withTimeline: false });
+
+  assert.match(rendered, /\bFROM visible_channels vc JOIN messages m ON m\.channel_id = vc\.id\b/);
+  assert.doesNotMatch(rendered, /\bmessage_server_timeline\b|\bsearch_vector\b/);
+  assert.throws(() => renderOlderHiddenCount({ tsQuery: sql`plainto_tsquery('simple', ${"deploy"})`, withTimeline: false }), /servers its text match reads/);
 });
 
 test("a Free server's history cutoff narrows the results, never the breadth probes", async () => {
@@ -415,8 +493,8 @@ test("a Free server's history cutoff narrows the results, never the breadth prob
     searchMessagesForUser,
   } = await import("./searchService");
   const dialect = new PgDialect();
-  // The probes estimate how many text matches the GIN index reads across every
-  // server. A date bound shrinks that estimate but not the read, so a cutoff in
+  // The probes estimate how many text matches the GIN index reads in the
+  // searched servers. A date bound shrinks that estimate but not the read, so a cutoff in
   // the probe would admit common terms that then run to the statement timeout.
   const probesFor = async (historyCutoff: Date | undefined, requested: { after?: Date; before?: Date } = {}) => {
     const probes: Array<{ sql: string; params: unknown[] }> = [];
@@ -430,11 +508,12 @@ test("a Free server's history cutoff narrows the results, never the breadth prob
         if (probes.length === 2) throw new Error("breadth probes done");
         if (rendered.startsWith("EXPLAIN")) {
           probes.push({ sql: rendered, params: query.params });
-          // Few visible candidates, too many corpus-wide text matches: over the cap after both probes.
+          // Few visible candidates, too many text matches: over the cap after both probes.
           const planRows = rendered.includes("visible_channels") ? 1 : 10_000_000;
           return { rows: [{ "QUERY PLAN": [{ Plan: { "Node Type": "Bitmap Heap Scan", "Plan Rows": planRows } }] }] };
         }
-        if (rendered.includes("reltuples")) return { rows: [{ corpus_rows: 20_000_000 }] };
+        // The joint storage server lookup (resolveTextMatchServerIds): the same server.
+        if (rendered.includes("SELECT DISTINCT c.server_id")) return { rows: [] };
         throw new Error(`unexpected statement: ${rendered.slice(0, 80)}`);
       }) as never,
     });
@@ -459,12 +538,12 @@ test("a Free server's history cutoff narrows the results, never the breadth prob
 
   const unlimited = await probesFor(undefined);
   const free = await probesFor(new Date("2026-09-21T00:00:00.000Z"));
-  assert.equal(unlimited.length, 2, "candidate probe and corpus-wide text-match probe");
+  assert.equal(unlimited.length, 2, "candidate probe and the searched servers' text-match probe");
   assert.deepEqual(free, unlimited, "the cutoff leaves both probes exactly as on an unlimited plan");
   assert.ok(free.every((probe) => !/\bm\.created_at\b/.test(probe.sql)), "no date bound the caller did not ask for");
 
   // A range the caller asks for narrows the visible-candidate probe, but the
-  // corpus-wide text-match probe stays date-free: the GIN index reads every
+  // text-match probe stays date-free: the GIN index reads every
   // match of the term whatever the range, so `deploy` + one week must still be
   // over the cap (answered newest first) instead of running to the statement timeout.
   const ranged = await probesFor(undefined, {
@@ -475,6 +554,7 @@ test("a Free server's history cutoff narrows the results, never the breadth prob
   const textMatchProbe = ranged.find((probe) => !probe.sql.includes("visible_channels"));
   assert.ok(candidateProbe && textMatchProbe, "both probes ran");
   assert.match(candidateProbe.sql, /\bm\.created_at >= \$\d+.*\bm\.created_at <= \$\d+/);
+  assert.match(textMatchProbe.sql, /\bFROM message_server_timeline t\b/);
   assert.doesNotMatch(textMatchProbe.sql, /\bcreated_at\b/);
   assert.deepEqual(textMatchProbe, unlimited.find((probe) => !probe.sql.includes("visible_channels")));
 });

@@ -52,6 +52,7 @@ import TaskCard, { TaskCardSkeleton } from "./TaskCard";
 import { taskLanePlaceholders, useRememberedTaskLaneCounts } from "./taskLaneCounts";
 import { CreateTaskDialog } from "./DeferredCreateTaskDialog";
 import { TaskBacklogReasonPopover } from "./TaskBacklogReasonPopover";
+import { useCanWriteTaskChannel } from "./taskChannelWrite";
 import { TASK_STATUS_UI, toRuiTaskStatus } from "./taskStatusUi";
 import { backlogColumnHeading, useTaskBoardDrag } from "./useTaskBoardDrag";
 import type { BoardDropData } from "./useTaskBoardDrag";
@@ -1069,6 +1070,8 @@ export default function TasksPanel({ channelId }: TasksPanelProps = {}) {
   );
 
   const openCreateDialog = useCallback(() => setShowCreateDialog(true), []);
+  // A reader of a public channel they have not joined (or of an archived one) gets no New task: the server refuses it.
+  const canCreateInChannel = useCanWriteTaskChannel(channelId);
   const closeCreateDialog = useCallback(() => setShowCreateDialog(false), []);
 
   const toggleStatusCollapsed = useCallback((status: TaskStatus) => {
@@ -1184,7 +1187,7 @@ export default function TasksPanel({ channelId }: TasksPanelProps = {}) {
           <ListToolbarMore testId="tasks-toolbar-more" />
           {/* New task: channel mode only. The server-wide board has no channel
               to post a task in, so it offers none. */}
-          {isChannelMode && (
+          {isChannelMode && canCreateInChannel && (
             <FitToolbarButton variant="primary" icon={<Plus />} plusOrder={LIST_TOOLBAR_STEP.primaryPlus} onClick={openCreateDialog}>
               {newTaskLabel}
             </FitToolbarButton>

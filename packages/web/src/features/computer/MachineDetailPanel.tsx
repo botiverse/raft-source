@@ -626,7 +626,7 @@ export function MachineDetailPanel({
           )}
 
           {/* Agents on this machine — isolated to prevent activity re-renders */}
-          <MachineAgentList machine={machine} canManageMachines={canManageMachines} canViewRuntimeAccountUsage={canViewRuntimeAccountUsage} selectionDock={selectionDock} onSelectingChange={setSelectingAgents} />
+          <MachineAgentList machine={machine} canManageMachines={canManageMachines} canControl={canControl} canViewRuntimeAccountUsage={canViewRuntimeAccountUsage} selectionDock={selectionDock} onSelectingChange={setSelectingAgents} />
 
           {/* Agent Workspaces — only when machine is online */}
           {machine.status === "online" && (

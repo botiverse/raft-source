@@ -12,11 +12,11 @@ export { installFakeArtifactSourceForDev } from "./artifactSource";
 export { artifactObjectRefOf } from "./apiArtifactSource";
 export { artifactAppHosts, artifactUrl, useArtifactAppHosts } from "./artifactLinks";
 export type { ArtifactLinkTarget } from "./artifactLinks";
-export { ArtifactLinkPreview, useArtifactsAppName } from "./ArtifactLinkPreview";
+export { ArtifactLinkPreview, ArtifactUnavailableLinkPreview, useArtifactsAppName } from "./ArtifactLinkPreview";
 /** An Artifact kind's icon, as an Artifact link's chip shows it. */
 export { artifactKindIcon } from "./ArtifactCardParts";
 /** An Artifact's Activity row (core's `GET /api/channels/inbox` object rows): its icon, title, who did what, and the version and review it opens at. */
-export { artifactActivityComment, artifactActivityExcerpt, artifactActivityImagesOnly, artifactActivityPinnedVersion, artifactActivityReview, artifactActivityRowParts, artifactActivityTarget } from "./artifactActivityRow";
+export { artifactActivityComment, artifactActivityExcerpt, artifactActivityImagesOnly, artifactActivityReview, artifactActivityRowParts, artifactActivityTarget } from "./artifactActivityRow";
 /** What an opener of an Artifact (a card, a Files or Activity row) spreads on itself: pressing, hovering or focusing it starts the open. */
 export { rememberArtifactCard, useArtifactOpenIntent } from "./artifactOpenIntent";
 export type { ArtifactActivityRowParts } from "./artifactActivityRow";
@@ -42,10 +42,10 @@ export type { ArtifactForward } from "./ArtifactForward";
 export { artifactMentionCandidates } from "./artifactMentionCandidates";
 /** A conversation's own Artifacts in its Files tab (#proj-workspace:#59): their list and one row each. */
 export { openConversationArtifact, useConversationArtifacts } from "./conversationArtifacts";
-/** A channel's announcement (its strip, its details row): opened beside the channel, and whether it is open there. */
-export { openChannelAnnouncement, useArtifactOpenBeside } from "./conversationArtifacts";
+/** A channel's announcement (its strip, its details row): opened beside the channel, whether it is open there, and its kind (the row's icon). */
+export { openChannelAnnouncement, useArtifactOpenBeside, useChannelAnnouncementKind } from "./conversationArtifacts";
 export type { ConversationArtifactsView } from "./conversationArtifacts";
-export type { ArtifactForwardDialogProps, ArtifactForwardTarget, ArtifactLinkSendDialogProps, ArtifactHostConversation, ArtifactMessagePlace, ArtifactOpenMessageOptions, ArtifactShareHost, ArtifactUploadLimitsHost } from "./artifactShareHost";
+export type { ArtifactForwardDialogProps, ArtifactForwardTarget, ArtifactLinkSendDialogProps, ArtifactHostConversation, ArtifactMessagePlace, ArtifactOpenMessageOptions, ArtifactPerson, ArtifactShareHost, ArtifactUploadLimitsHost } from "./artifactShareHost";
 /** The Artifacts home page (S7), loaded only on its route. */
 export const loadArtifactsDashboard = () => import("./ArtifactsDashboard");
 export type { ArtifactsDashboardProps } from "./ArtifactsDashboard";
@@ -71,3 +71,9 @@ export { useWorkspaceArtifactsEnabled } from "./useWorkspaceArtifactsEnabled";
 /** The open Artifact viewer (which conversation it belongs to); a guest shell reads it to keep that conversation reachable. */
 export { openArtifactOverDialog, useArtifactViewerStore } from "./artifactViewerStore";
 export type { ArtifactAddressedPlaces } from "./artifactViewerStore";
+/**
+ * The Artifact mini window (Raft Desktop, artifact_mini_window_v0; #337 PR3): the layout mounts the kind's
+ * registration beside the object windows' host, and an Artifact's Activity row opens another window on Cmd/Ctrl-click.
+ */
+export { ArtifactObjectWindows } from "./ArtifactObjectWindow";
+export { openActivityRowInAnotherWindow, useArtifactMiniWindows } from "./artifactWindowOpening";

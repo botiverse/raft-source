@@ -18,9 +18,9 @@ import { getLocalComputerBridge, useLocalComputerMachineId } from "./localComput
 const COMPUTER_SERVICE_REPORT_MIN_VERSION = "1.0.54";
 
 /** A refused Upgrade click, mapped from the server's code (never its text). */
-export type UpgradeRefusal = "web_upgrade_off" | "too_old" | "not_allowed" | "managed_by_desktop" | "unknown";
+export type UpgradeRefusal = "web_upgrade_off" | "too_old" | "not_allowed" | "managed_by_desktop" | "system_service" | "unknown";
 
-function upgradeRefusalFromCode(code: string | undefined): UpgradeRefusal {
+export function upgradeRefusalFromCode(code: string | undefined): UpgradeRefusal {
   switch (code) {
     // Older servers' answer while remote_computer_upgrade_v2 was off.
     case "remote_upgrade_disabled":
@@ -31,6 +31,10 @@ function upgradeRefusalFromCode(code: string | undefined): UpgradeRefusal {
       return "not_allowed";
     case "computer_managed_by_desktop":
       return "managed_by_desktop";
+    // The Computer's systemd manager refuses the installer's scope
+    // (ready.upgradeScope), on a page loaded before the server knew it.
+    case "scope_unavailable":
+      return "system_service";
     default:
       return "unknown";
   }
@@ -51,6 +55,10 @@ export type ComputerUpgradeCardState =
   | { kind: "upgrading"; version: string; waitingAgents?: number }
   | { kind: "oneClick"; version: string }
   | { kind: "manualUpgrade"; version: string }
+  // The Computer reported its systemd manager refuses the scope a web
+  // upgrade's installer needs (`ready.upgradeScope`; the server refuses it with
+  // `scope_unavailable`): no Upgrade, the steps on the machine instead.
+  | { kind: "systemService"; version: string }
   | { kind: "commands"; version: string; sentence: "runCommands" | "refusedNotAllowed" };
 
 /**
@@ -201,11 +209,14 @@ export function useComputerUpgradeCard(machine: Machine) {
       return { kind: "managedByDesktop" };
     }
     if (upgradeRefusal === "not_allowed") return { kind: "commands", version, sentence: "refusedNotAllowed" };
+    if (upgradeRefusal === "system_service") return { kind: "systemService", version };
     // Web upgrade off or refused, or this version too old for
     // it: the same "run these two commands" state.
     if (upgradeRefusal === "web_upgrade_off" || upgradeRefusal === "too_old") return { kind: "commands", version, sentence: "runCommands" };
     if (!remoteUpgradeSupported) return { kind: "manualUpgrade", version };
-    if (webUpgradeOn && oneClickTarget) return { kind: "oneClick", version: oneClickTarget };
+    if (webUpgradeOn && oneClickTarget) {
+      return machine.upgradeScope?.ok === false ? { kind: "systemService", version } : { kind: "oneClick", version: oneClickTarget };
+    }
     return { kind: "commands", version, sentence: "runCommands" };
   })();
   // The last web upgrade failed in a way only the install command on the

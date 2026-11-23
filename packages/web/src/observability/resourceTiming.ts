@@ -11,6 +11,12 @@ export interface RequestTimingSegments {
   queue_ms?: number;
   /** DNS, TCP and TLS (0 on a reused connection). */
   connect_ms?: number;
+  /** The parts of connect_ms, only when this request opened a connection: the DNS lookup, */
+  dns_ms?: number;
+  /** the TCP handshake (for HTTP/3 the whole QUIC handshake, with tls_ms 0 or inside it), */
+  tcp_ms?: number;
+  /** and the TLS handshake. */
+  tls_ms?: number;
   /** Request sent to the first response byte. */
   ttfb_ms?: number;
   /** First to last response byte. */
@@ -148,6 +154,13 @@ export function requestTiming(url: string | null, sentAt: number | null): Reques
       const dnsStart = entry.domainLookupStart > 0 ? entry.domainLookupStart : entry.fetchStart;
       segments.queue_ms = round(dnsStart - entry.startTime);
       segments.connect_ms = round(entry.requestStart - dnsStart);
+      // A reused connection has connectStart == connectEnd: no parts to report.
+      if (entry.connectEnd > entry.connectStart && entry.connectStart > 0) {
+        const tlsStart = entry.secureConnectionStart > 0 ? entry.secureConnectionStart : entry.connectEnd;
+        segments.dns_ms = round(entry.domainLookupEnd - entry.domainLookupStart);
+        segments.tcp_ms = round(tlsStart - entry.connectStart);
+        segments.tls_ms = round(entry.connectEnd - tlsStart);
+      }
       segments.ttfb_ms = round(entry.responseStart - entry.requestStart);
       segments.download_ms = round(entry.responseEnd - entry.responseStart);
     }
@@ -168,6 +181,23 @@ export function contentLengthOf(headers: unknown): number | undefined {
       : (headers as Record<string, unknown>)["content-length"];
     const value = Number(raw);
     return raw !== undefined && raw !== null && raw !== "" && Number.isFinite(value) && value >= 0 ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The CloudFront edge location that answered (`X-Amz-Cf-Pop`, e.g. `NRT57-P2`),
+ * from Axios headers or a plain object. Only a value of that shape is kept.
+ */
+export function edgePopOf(headers: unknown): string | undefined {
+  try {
+    if (!headers || typeof headers !== "object") return undefined;
+    const getter = (headers as { get?: unknown }).get;
+    const raw = typeof getter === "function"
+      ? getter.call(headers, "x-amz-cf-pop")
+      : (headers as Record<string, unknown>)["x-amz-cf-pop"];
+    return typeof raw === "string" && /^[A-Z]{3}\d{1,3}(?:-[A-Z]\d{1,2})?$/.test(raw) ? raw : undefined;
   } catch {
     return undefined;
   }

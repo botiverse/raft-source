@@ -300,6 +300,7 @@ test("public search: a long thread is truncated and says so", async () => {
 });
 
 test("public search settings: owner-only switch, and going public gives older rows public ids", async () => {
+  const refusal = (code: string, error: string) => ({ error, code, errorCode: code });
   const app = await openApp();
   try {
     const db = getDb();
@@ -333,10 +334,24 @@ test("public search settings: owner-only switch, and going public gives older ro
       method: "PATCH", headers: adminHeaders, body: JSON.stringify({ publicSearchEnabled: false }),
     });
     assert.equal(adminWrite.status, 403, "admins cannot change the owner's search decision");
+    assert.deepEqual(await adminWrite.json(), refusal("insufficient_role", "Only the server owner can manage public search"));
     const badBody = await fetch(`${settingsUrl}/public-search`, {
       method: "PATCH", headers: ownerHeaders, body: JSON.stringify({ publicSearchEnabled: "no" }),
     });
     assert.equal(badBody.status, 400);
+    assert.deepEqual(await badBody.json(), refusal("invalid_input", "publicSearchEnabled must be a boolean"));
+    // The visibility switch refuses the same way, in its own words.
+    const ownerOnlyVisibility = [403, refusal("insufficient_role", "Only the server owner can manage public visibility")];
+    const adminRead = await fetch(`${settingsUrl}/public-visibility`, { headers: adminHeaders });
+    assert.deepEqual([adminRead.status, await adminRead.json()], ownerOnlyVisibility);
+    const adminPublish = await fetch(`${settingsUrl}/public-visibility`, {
+      method: "PATCH", headers: adminHeaders, body: JSON.stringify({ publiclyVisible: false }),
+    });
+    assert.deepEqual([adminPublish.status, await adminPublish.json()], ownerOnlyVisibility);
+    const badVisibility = await fetch(`${settingsUrl}/public-visibility`, {
+      method: "PATCH", headers: ownerHeaders, body: JSON.stringify({ publiclyVisible: "no" }),
+    });
+    assert.deepEqual([badVisibility.status, await badVisibility.json()], [400, refusal("invalid_input", "publiclyVisible must be a boolean")]);
     const ownerWrite = await fetch(`${settingsUrl}/public-search`, {
       method: "PATCH", headers: ownerHeaders, body: JSON.stringify({ publicSearchEnabled: false }),
     });
@@ -349,6 +364,14 @@ test("public search settings: owner-only switch, and going public gives older ro
       method: "PATCH", headers: ownerHeaders, body: JSON.stringify({ publicSearchEnabled: true }),
     });
     assert.equal(gated.status, 404, "the owner write fails closed while the public server rollout is off");
+    const flagOff = [404, refusal("not_found", "Not found")];
+    assert.deepEqual(await gated.json(), flagOff[1]);
+    const gatedRead = await fetch(`${settingsUrl}/public-visibility`, { headers: ownerHeaders });
+    assert.deepEqual([gatedRead.status, await gatedRead.json()], flagOff);
+    const gatedPublish = await fetch(`${settingsUrl}/public-visibility`, {
+      method: "PATCH", headers: ownerHeaders, body: JSON.stringify({ publiclyVisible: true }),
+    });
+    assert.deepEqual([gatedPublish.status, await gatedPublish.json()], flagOff);
   } finally {
     await app.close();
   }

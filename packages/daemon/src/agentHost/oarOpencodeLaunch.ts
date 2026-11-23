@@ -1,4 +1,5 @@
-// OpenCode on OAR, behind the server flag `agent_runtime_oar_opencode`
+// OpenCode on OAR, routed wherever the Computer advertises `runtime-host:oar:opencode`
+// (code-side `agent_runtime_oar_opencode` flag retired, #oar-raft:#46; Windows and older CLIs keep legacy driver).
 // (default off) and the Computer capability `runtime-host:oar:opencode`.
 //
 // OAR runs `opencode acp`: one session that lives across turns, where the
@@ -26,8 +27,13 @@
 //   XDG directories and workspace the driver uses), so either host resumes the
 //   other's session. Raft's rule stands: never across OpenCode major lines
 //   (`decideOpenCodeSessionResume`, the driver's record file); a session the
-//   rule refuses is handed back to the driver, which shows the refusal. A
-//   session this host opens is recorded the same way (`sessionOpened`).
+//   rule refuses is handed back to the driver, which shows the refusal. On
+//   2.x a 1.x or unrecorded session goes to OAR instead, which resumes it
+//   only if 2.x lists it, else the start opens a new session
+//   (`opencodeResumeOrDecline`). A session this host opens is recorded the
+//   same way (`sessionOpened`).
+// - Installation: OAR's (`readOpenCodeInstallation`), its command and version;
+//   OAR launches that command itself (a Windows command shim included).
 // - Version: 1.x from 1.18.30, 2.x from 2.0.27, nothing from 3.0 (OAR's
 //   adapter was checked against these). Another version keeps the driver.
 // - Opens are serialized per Computer (`openOpencodeSerially`).
@@ -36,21 +42,21 @@
 //   advertises `_session/steering`), else held for the turn end.
 
 import { hydrateRuntimeConfig, runtimeConfigToLaunchFields } from "@botiverse/raft-shared";
-import type { Session } from "@botiverse/oar";
+import type { InstallationSnapshot, Session } from "@botiverse/oar";
 import path from "node:path";
 import {
   decideOpenCodeSessionResume,
   ensureOpenCodeSessionRecordWritable,
+  openCodeMajor,
   openCodeSessionRecordPath,
   prepareOpenCodeOarEnvironment,
+  readOpenCodeInstallation,
   readOpenCodeSessionRecord,
-  readOpenCodeVersionDetailedAsync,
-  resolveOpenCodeSpawnAsync,
   writeOpenCodeSessionRecord,
   type OpenCodeSessionResumeDecision,
-  type OpenCodeVersionRead,
 } from "../drivers/index";
 import type { SpawnContext } from "../drivers/types";
+import { RuntimeExecutableNotFoundError } from "../spawnFailureErrors";
 import { prepareManagedMcpRuntimeProxy, type ManagedMcpRuntimeEndpoint } from "../managedMcpRuntimeProxy";
 import { resolveRaftHome } from "../raftHome";
 import { launchEnvOverlay } from "./oarGrokLaunch";
@@ -137,8 +143,8 @@ export const openOpencodeSerially = createOpenGate();
 
 /** What the OpenCode launch reads before it builds anything; tests replace them. */
 export interface OpencodeLaunchDeps {
-  readVersion?: (signal?: AbortSignal) => Promise<OpenCodeVersionRead>;
-  resolveCommand?: (signal?: AbortSignal) => Promise<string>;
+  /** OAR's OpenCode installation (`readOpenCodeInstallation`): the command OAR launches and its version. */
+  readInstallation?: () => Promise<InstallationSnapshot>;
   prepareEnvironment?: (ctx: SpawnContext, version: string) => Promise<NodeJS.ProcessEnv>;
   prepareManagedMcp?: (ctx: SpawnContext) => Promise<ManagedMcpRuntimeEndpoint | null>;
   openGate?: OarLaunch["openGate"];
@@ -149,11 +155,46 @@ export interface OpencodeLaunchDeps {
  * Whether a start may resume its session on the installed OpenCode, by the
  * driver's rule and record (`decideOpenCodeSessionResume`). Anything but
  * `fresh` or `resume` is the driver's to show: declined.
+ *
+ * Except on 2.x, for a session the rule refuses as another major's
+ * (`major_mismatch`) or as unrecorded (made before the record, so by 1.x):
+ * after an upgrade from 1.x that refusal left the agent stuck until a reset.
+ * Such a session is offered to OAR, which resumes an OpenCode session only
+ * once OpenCode's own `session/list` names it in the workspace. One 2.x does
+ * not know (a 1.x session: 2.x keeps its own store) is refused
+ * (`ResumeCwdError`, `not_listed`) and the start opens a new session
+ * (`newSessionOnResumeElsewhere`); it is never silently created under the old
+ * id, which is why the driver's `opencode run --session` refuses it.
  */
-export function opencodeResumeOrDecline(decision: OpenCodeSessionResumeDecision): "fresh" | "resume" {
+export function opencodeResumeOrDecline(decision: OpenCodeSessionResumeDecision, major: OpencodeRelease["major"]): "fresh" | "resume" {
   if (decision.kind === "fresh" || decision.kind === "resume") return decision.kind;
   if (decision.kind === "version_unknown") throw new OarLaunchDeclined("opencode_version_unknown");
+  if (major === 2 && (decision.reason === "major_mismatch" || decision.reason === "unrecorded")) return "resume";
   throw new OarLaunchDeclined(`opencode_session_refused:${decision.reason}`);
+}
+
+/**
+ * The OpenCode OAR finds (`readOpenCodeInstallation`), which OAR also
+ * launches: a Windows command shim is run by OAR itself. A `--version` OAR
+ * could not run or read is the driver's to show (declined), as is a version
+ * outside the range the OAR host runs.
+ */
+async function installedOpencode(read: () => Promise<InstallationSnapshot>): Promise<{ command: string; version: string; release: OpencodeRelease }> {
+  let installation: InstallationSnapshot;
+  try {
+    installation = await read();
+  } catch {
+    throw new OarLaunchDeclined("opencode_version_unknown");
+  }
+  if (installation.kind === "not_found") {
+    throw new RuntimeExecutableNotFoundError({ runtimeId: "opencode", message: "OpenCode CLI (opencode) was not found on this computer" });
+  }
+  if (installation.kind !== "available" || installation.via !== "executable") throw new OarLaunchDeclined("opencode_version_unsupported");
+  const version = installation.version;
+  if (!version || openCodeMajor(version) === null) throw new OarLaunchDeclined("opencode_version_unknown");
+  const release = opencodeReleaseOf(version);
+  if (!release || !isOarOpencodeVersion(version)) throw new OarLaunchDeclined("opencode_version_unsupported");
+  return { command: installation.command, version, release };
 }
 
 /** A prepared OpenCode launch as an OAR launch. */
@@ -219,28 +260,24 @@ export function opencodeOarLaunch(
 }
 
 export async function prepareOpencodeOarLaunch(ctx: SpawnContext, deps: OpencodeLaunchDeps = {}): Promise<OarLaunch> {
-  const signal = ctx.launchSignal;
   // The installed OpenCode, read now: the ready frame's version can be older
   // than an upgrade since.
-  const read = await (deps.readVersion ?? ((s) => readOpenCodeVersionDetailedAsync({ signal: s })))(signal);
-  if (read.kind === "unknown") throw new OarLaunchDeclined("opencode_version_unknown");
-  const release = opencodeReleaseOf(read.version);
-  if (!release || !isOarOpencodeVersion(read.version)) throw new OarLaunchDeclined("opencode_version_unsupported");
-  const command = await (deps.resolveCommand ?? (async (s) => (await resolveOpenCodeSpawnAsync([], { signal: s })).command))(signal);
+  const { command, version, release } = await installedOpencode(deps.readInstallation ?? (() => readOpenCodeInstallation()));
 
-  // Never across OpenCode major lines (the driver's rule and record file).
+  // Never across OpenCode major lines (the driver's rule and record file),
+  // but on 2.x OAR decides whether 2.x knows the session (opencodeResumeOrDecline).
   const slockHome = ctx.slockHome ? path.resolve(ctx.slockHome) : resolveRaftHome();
   const recordPath = openCodeSessionRecordPath(slockHome, ctx.agentId);
   const recordRead = readOpenCodeSessionRecord(recordPath);
   const sessionId = ctx.config.sessionId?.trim() || null;
-  const choice = opencodeResumeOrDecline(decideOpenCodeSessionResume(sessionId, recordRead, read.version));
+  const choice = opencodeResumeOrDecline(decideOpenCodeSessionResume(sessionId, recordRead, version), release.major);
   // A session that could not be recorded afterwards would be resumable
   // without provenance: proved writable before anything starts.
   ensureOpenCodeSessionRecordWritable(recordPath);
   const alreadyRecorded = choice === "resume" && recordRead.kind === "record"
     && recordRead.record.sessionId === sessionId && recordRead.record.opencodeMajor === release.major;
 
-  const env = await (deps.prepareEnvironment ?? prepareOpenCodeOarEnvironment)(ctx, read.version);
+  const env = await (deps.prepareEnvironment ?? prepareOpenCodeOarEnvironment)(ctx, version);
   // Attached as the driver attaches it: always, an empty catalog included.
   const managedMcp = await (deps.prepareManagedMcp ?? ((c: SpawnContext) => prepareManagedMcpRuntimeProxy({
     agentId: c.agentId,
@@ -256,7 +293,7 @@ export async function prepareOpencodeOarLaunch(ctx: SpawnContext, deps: Opencode
     env,
     resume: choice === "resume" ? sessionId : null,
     managedMcp,
-    record: { path: recordPath, version: read.version, alreadyRecorded },
+    record: { path: recordPath, version, alreadyRecorded },
     openGate: deps.openGate ?? openOpencodeSerially,
   }, deps.inherited);
 }

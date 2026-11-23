@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test as nodeTest } from "vitest";
+import { test as nodeTest, vi } from "vitest";
 import "../../../../tests/helpers/domSetup";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 
@@ -207,7 +207,7 @@ test("Free: the plan, what is used, then what Pro adds, with Upgrade opening the
   const plan = screen.getByTestId("billing-current-plan-card");
   assert.ok(within(plan).getByRole("heading", { name: "Free" }));
   // The plan's facts are data in body ink, not the card's (muted) description.
-  assert.equal(within(plan).getByTestId("billing-current-plan-summary").textContent, "Messages from the last 30 days · 100 MB of file uploads a month");
+  assert.equal(within(plan).getByTestId("billing-current-plan-summary").textContent, "Messages from the last 30 days · 100 MB of file uploads a month, 50 MB per file · 1 external channel");
   assert.ok(plan.querySelector("[data-slot='card-description']") === null, "no CardDescription for plan data");
 
   const usage = screen.getByTestId("billing-usage-card");
@@ -222,9 +222,24 @@ test("Free: the plan, what is used, then what Pro adds, with Upgrade opening the
   assert.ok(usage.compareDocumentPosition(upgrade) & Node.DOCUMENT_POSITION_FOLLOWING);
   assert.match(within(upgrade).getByTestId("billing-upgrade-price").textContent ?? "", /this server needs 5 seats today\./);
   assert.ok(upgrade.querySelector("[data-slot='card-description']") === null, "prices are body ink, not CardDescription");
-  for (const feature of ["Unlimited message history", "Higher file upload limits", "Agent migration", "Use external channels"]) {
-    assert.ok(within(upgrade).getByText(feature), `Upgrade to Pro lists "${feature}"`);
-  }
+  // The upgrade dialog's own list, in its order (#proj-commercial:#28).
+  assert.deepEqual(
+    within(upgrade).getAllByRole("listitem").map((item) => item.textContent),
+    [
+      "Unlimited message history",
+      "No monthly upload limit, 200\u00a0MB per file",
+      "Unlimited external channels",
+      "Move agents between computers",
+    ],
+  );
+  // What an external channel is: an info icon, named for screen readers, whose sentence opens on
+  // a tap as well as on hover, so touch screens reach it (cindyz, ba39bee1; raft-design Tooltip).
+  const info = within(upgrade).getByRole("button", { name: "Channels you share with people outside your server" });
+  act(() => {
+    fireEvent.click(info);
+  });
+  assert.ok(screen.getByRole("dialog", { name: "Unlimited external channels" }));
+  assert.ok(within(usage).getByText("Counts files people and agents upload, Artifacts included."));
   const compare = within(upgrade).getByRole("button", { name: "Compare plans (opens in a new tab)" });
   assert.equal(compare.getAttribute("href"), "https://raft.build/pricing");
   assert.equal(compare.getAttribute("target"), "_blank");
@@ -253,12 +268,13 @@ test("after a downgrade the page says what Free took away; only the owner is tol
   seedBilling({ plan: "free", planDowngradedAt: twoDaysAgo });
   renderPlanSection();
   assert.ok(screen.getByText("Billing is on Free now"));
-  assert.ok(screen.getByText("Messages over 30 days old are hidden. Pro features are off. Upgrade to bring them back."));
+  assert.ok(screen.getByText("Messages over 30 days old are hidden, and Free limits apply again. Upgrade to lift them."));
+  assert.ok(screen.getByText("On Free, file uploads are limited to 100 MB a month and 50 MB per file, the server can be in 1 external channel, and agents can't move between computers."));
 
   cleanup();
   seedBilling({ plan: "free", canManageBilling: false, serverRole: "admin", planDowngradedAt: twoDaysAgo });
   renderPlanSection();
-  assert.ok(screen.getByText("Messages over 30 days old are hidden. Pro features are off."));
+  assert.ok(screen.getByText("Messages over 30 days old are hidden, and Free limits apply again."));
 });
 
 test("Free admin asks an owner through the same dialog; without Stripe nothing can be bought", () => {
@@ -292,6 +308,11 @@ test("Pro owner: price, seats and renewal on the plan card; seat meter; billing 
   const usage = screen.getByTestId("billing-usage-card");
   assert.ok(within(usage).getByRole("meter", { name: "Seats" }));
   assert.ok(within(usage).getByText("1 of 2 used"));
+  // What the seats in use are made of, as the upgrade dialog says it (option 2, #proj-commercial:83cff16f):
+  // two columns, no "·" between a count and its seats, no Agents row with none.
+  const breakdown = within(usage).getByTestId("billing-seats-breakdown");
+  assert.equal(within(breakdown).getByText("1 person").nextElementSibling?.textContent, "1 seat");
+  assert.ok(within(breakdown).queryByText(/agents?$/) === null, "absent");
   // 1 seat in use of 2 bought: one can go, from under the seat count (task #18),
   // outside the meter, whose contents are not controls.
   assert.ok(within(usage).getByRole("button", { name: "Manage seats" }));
@@ -306,10 +327,40 @@ test("Pro owner: price, seats and renewal on the plan card; seat meter; billing 
 
   const cancel = screen.getByTestId("billing-cancel-card");
   assert.ok(details.compareDocumentPosition(cancel) & Node.DOCUMENT_POSITION_FOLLOWING, "cancelling comes last");
-  assert.ok(within(cancel).getByText(/^Pro stays until Aug 20, 2026\./));
+  assert.ok(within(cancel).getByText(/^Pro stays until Aug 20, 2026\. After that, this server moves to Free: messages older than 30 days are hidden, file uploads are limited to 100 MB a month and 50 MB per file, and agents can't move between computers\.$/));
   assert.ok(screen.queryByTestId("billing-upgrade-card") === null, "absent");
   assert.ok(screen.queryByTestId("billing-past-due") === null, "absent");
   assert.ok(screen.queryByTestId("billing-ending") === null, "absent");
+});
+
+// Prepaid Pro's reminder starts a week before the end. The page read the clock
+// once at its render, so one left open across that moment never showed it.
+test("prepaid Pro: the ending-soon reminder appears on a page left open when the last week begins", () => {
+  vi.useFakeTimers();
+  try {
+    const DAY = 24 * 60 * 60 * 1000;
+    seedBilling({ plan: "pro", capacity: { maxHumans: 2, maxAgents: 20, maxUniversalSeats: 2 }, provisioned: { humans: 2, agents: 20, proPackQuantity: 2 } });
+    useServerStore.setState((state) => ({
+      billing: {
+        ...state.billing!,
+        source: "prepaid",
+        prepaid: {
+          seatQuantity: 2,
+          // Five minutes more than a week away.
+          endsAt: new Date(Date.now() + 7 * DAY + 5 * 60_000).toISOString(),
+          graceEndsAt: new Date(Date.now() + 14 * DAY).toISOString(),
+          inGrace: false,
+        },
+      },
+    } as never));
+    renderPlanSection();
+    assert.ok(screen.queryByTestId("billing-prepaid-ending") === null, "more than a week left: no reminder yet");
+
+    act(() => { vi.advanceTimersByTime(6 * 60_000); });
+    assert.ok(screen.getByTestId("billing-prepaid-ending"));
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test("Manage in Stripe posts /billing/portal, saying which button (billing_portal_opened)", async () => {
@@ -468,6 +519,7 @@ test("a scheduled cancellation shows the end date and Keep Pro, which reactivate
 
   const banner = screen.getByTestId("billing-ending");
   assert.ok(within(banner).getByText("Pro ends on Aug 20, 2026"));
+  assert.ok(within(banner).getByText("After that, this server moves to Free: messages older than 30 days are hidden, file uploads are limited to 100 MB a month and 50 MB per file, and agents can't move between computers."));
   assert.ok(within(screen.getByTestId("billing-current-plan-card")).getByText("$211.20 a year · 2 seats · Ends Aug 20, 2026"));
   assert.ok(within(screen.getByTestId("billing-details-card")).getByText("Last day of Pro"));
   // Changing seats now would quietly take the cancellation back, so neither is offered.

@@ -1,7 +1,7 @@
 {
   "jsPlugins": [
     { "name": "formatjs", "specifier": "eslint-plugin-formatjs" },
-    "./oxlint-plugins/raft-i18n/index.ts"
+    { "name": "raft-i18n", "specifier": "@botiverse/lint/i18n" }
   ],
   "categories": {
     "correctness": "off"

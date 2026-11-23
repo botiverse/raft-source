@@ -1094,6 +1094,9 @@ for (const order of ["enter_then_clear", "clear_then_enter"] as const) {
     slack.state.script.push(() => slack.error("channel_not_found"));
     await run.step();
     const enterB = async () => {
+      // B enters a moment after A was held, so when both are due again A's
+      // retry comes first (the worker takes the earliest due sync).
+      advance(1);
       await updateCard(other, "Ready", clock.now);
       slack.state.others.get(TS_B)!.script.push(() => slack.error("missing_scope"));
       const entered = await run.step();

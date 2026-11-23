@@ -3283,3 +3283,72 @@ test("picker grammar: duplicate candidate display names get fp8 disambiguators w
   assert.doesNotMatch(out, /desert-flute \(desert-flute\)/);
   assert.doesNotMatch(out, /Found at:/);
 });
+
+const PAIRING_ID = "pAiR_0123456789abcdefghijklmnopqrstuvwxyzAB";
+
+test("setup --pair: the fresh attach's approval gets the pairing for this server; without --pair it gets none", async () => {
+  for (const pairingId of [PAIRING_ID, undefined]) {
+    await withHome(async (home) => {
+      await writeSession(home);
+      const seen: unknown[] = [];
+      const cap = captureOut();
+      try {
+        await runSetup(
+          { serverSlug: "/alpha", yes: true, ...(pairingId ? { pairingId } : {}) },
+          {
+            isTty: false,
+            attachWithApprovalService: async (_input, options) => {
+              seen.push(options?.pairing);
+              await writeAttach(home);
+              return {
+                serverId: SERVER_A,
+                serverMachineId: `cm-${SERVER_A}`,
+                serverSlug: SLUG_A,
+                serverUrl: "https://api.example.test",
+                attachmentPath: serverAttachmentPath(home, SERVER_A),
+                resumed: false,
+                apiKeyRedactedPrefix: "sk_compu",
+              };
+            },
+            startService: async () => startResult(home),
+          },
+        );
+      } finally {
+        cap.restore();
+      }
+      assert.deepEqual(seen, [pairingId ? { pairingId, serverSlug: "alpha" } : undefined]);
+      assert.ok(!cap.text().includes(PAIRING_ID));
+    });
+  }
+});
+
+test("setup --pair (legacy-daemon branch): only the first approval (computer_migrate) gets the pairing; the attach after it doesn't, so a second request can't void it", async () => {
+  await withHome(async (home) => {
+    await writeSession(home);
+    const calls: string[] = [];
+    const pairings: unknown[] = [];
+    const attachPairingIds: unknown[] = [];
+    await runSetup(
+      { serverSlug: "/alpha", pairingId: PAIRING_ID },
+      {
+        isTty: true,
+        detectLegacyMigration: detectWithLegacyEvidence(calls),
+        buildRosterClient: () => emptyRosterClient(),
+        buildServersClient: () => ({ list: async () => ({ status: "success" as const, servers: DEFAULT_USER_SERVERS }) }),
+        refreshUserSession: async () => true,
+        requestMigrateApproval: async (input, options) => {
+          pairings.push(options?.pairing);
+          return approvedMigration(calls)(input, options);
+        },
+        runLogin: async () => { calls.push("login"); },
+        runAttach: async (opts) => {
+          attachPairingIds.push(opts.pairingId);
+          await writeAttach(home);
+        },
+        runStart: async () => {},
+      },
+    );
+    assert.deepEqual(pairings, [{ pairingId: PAIRING_ID, serverSlug: "alpha" }]);
+    assert.deepEqual(attachPairingIds, [undefined]);
+  });
+});

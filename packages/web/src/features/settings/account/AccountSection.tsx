@@ -35,7 +35,7 @@ import { AccountSignOutSection } from "./AccountSignOutSection";
 import { AppLoginsSection } from "./AppLoginsSection";
 import { DeleteAccountSection } from "./DeleteAccountSection";
 import { SignedInDevicesSection } from "./SignedInDevicesSection";
-import { UsageDataSettingsCard } from "../../../components/settings/UsageDataSettings";
+import { DataPrivacySection } from "./DataExportSection";
 
 // Exported for the sub-batch-A i18n DOM smoke test: renders the Account section
 // in isolation.
@@ -642,9 +642,10 @@ export function AccountSection({
           one moves focus to the next section's heading. */}
       <AppLoginsSection emptiedFocus={signOutHeadingRef} />
 
-      {/* Share usage data: its own section, before Session, so Delete Account
-          stays last on the page. */}
-      <UsageDataSettingsCard />
+      {/* Share usage data (and, with data export on, Export My Data: Data &
+          privacy): its own section, before Session, so Delete Account stays
+          last on the page. */}
+      <DataPrivacySection />
 
       {/* Sign out — sibling section so it gets its own mb-6 spacing and
           renders at the same indent level as Account / Browser / Server. */}

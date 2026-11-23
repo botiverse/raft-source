@@ -31,9 +31,19 @@
 // Requests without since_horizon behave exactly as before (no finished-
 // transaction filter, no late rows); they still get the horizon, so a client
 // can start using it from its next round.
+//
+// Held ids (socket `sync:resume` only, #triage:#553): with since_horizon, a
+// client may also send the ids of the messages it received live (`message:new`)
+// since it adopted that horizon, at most SYNC_HELD_IDS_CAP. The late arm leaves
+// exactly those rows out (it would only send them back); the page (seq >
+// since_seq) is unaffected, and held rows never count toward the late cap. A
+// client with more than the cap sends none and gets the full late arm. An
+// invalid list (not an array of UUIDs, or over the cap) is ignored as a whole;
+// held ids without since_horizon mean nothing and are ignored.
 
 import { sql, type SQL } from "drizzle-orm";
 import { getDb } from "../db/index";
+import { UUID_RE } from "../lib/messageId";
 
 /** The most late rows one sync read returns; above it the read signals a reset. */
 export const SYNC_LATE_CAP = 500;
@@ -47,6 +57,20 @@ export function syncLateCap(): number {
 /** Tests only: a small cap so the reset path needs few rows. null restores SYNC_LATE_CAP. */
 export function __setSyncLateCapForTests(cap: number | null): void {
   lateCapOverrideForTests = cap;
+}
+
+/** The most held ids (messages the client already got live) one resume may send. */
+export const SYNC_HELD_IDS_CAP = 200;
+
+/**
+ * A client-supplied held-id list: an array of at most SYNC_HELD_IDS_CAP
+ * message ids (UUID shape), deduplicated. Anything else is null (ignore the
+ * field as a whole).
+ */
+export function parseSyncHeldIds(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length > SYNC_HELD_IDS_CAP) return null;
+  if (!value.every((id) => typeof id === "string" && UUID_RE.test(id))) return null;
+  return [...new Set((value as string[]).map((id) => id.toLowerCase()))];
 }
 
 /** HTTP response header carrying the horizon (decimal xid8). */

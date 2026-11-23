@@ -31,18 +31,24 @@ export const MAX_LEGACY_READ_ROUTES = 85;
  */
 // +1: GET /internal/agent-api/prepare-action/operations (RFC 085 `raft action prepare --list`: the list's own docs, no conversation objects).
 // +1: GET /api/me/sessions (the caller's own sign-ins, services/mySessions.ts).
-export const EXPECTED_NONE_READ_ROUTES = 248;
+// -5: the /api/provider-connections reads (saved providers removed with provider_connections_v0).
+// +4: the data export reads (routes/dataExports.ts, #triage:#512): the caller's own export rows only.
+// +2: GET /api/servers/:id/data-exports/summary (counts only, owner) and /data-export-settings (one switch).
+// +1: GET /api/servers/:id/machines/:machineId/proc-jobs (a Computer's raft proc job names and states; docs/contracts/proc-jobs.md).
+// +1: GET /api/servers/:id/machines/:machineId/computer-checks (what developer tools a Computer has; docs/contracts/computer-checks.md).
+// +1: GET /api/auth/app-login/step-up/requests/:id (the app step-up page: app name, action, masked account).
+export const EXPECTED_NONE_READ_ROUTES = 253;
 
 export const READ_ROUTE_VISIBILITY_CLASSIFICATION: readonly ReadRouteClassification[] = [
   // Messages: history, context, sync, reactions, search.
   { route: "GET /api/messages/:messageId/app-link-previews", entry: "unified", reason: "link previews of a message; readPreviewableMessage: the viewer's conversation for it (its local channel, or the viewer's Server's active joint projection: personLocalConversationId) + canView + that Server's history window, else the unknown message's 404" },
   { route: "GET /api/link-cards/operations", entry: "unified", reason: "the viewer's own link-card operations (viewer + Server from the session); each operation's message re-read through readPreviewableMessage (the viewer's conversation for it: its local channel, or the viewer's Server's active joint projection; + canView + that Server's history window) on every page, else not_visible / empty" },
   { route: "GET /api/messages/:messageId/card-revisions", entry: "unified", reason: "a card message's kept revisions (RFC 082 §4.5); messageVisibleToViewer: the viewer's conversation for it (its local channel, or the viewer's Server's active joint projection: personLocalConversationId) + canView + that Server's history window, else the unknown message's 404" },
+  { route: "GET /api/messages/:messageId/resolved-quotes", entry: "unified", reason: "per-viewer verified same-conversation inline quote metadata (quote_reply_v0); messageVisibility (personLocalConversationId + canView + server history window, else 404) then resolveInlineQuotesMapForViewer (same stored conversation/thread root/task source + canView + history window + excerpt match, else omitted identically)" },
   { route: "GET /api/messages/:messageId/mention-deliveries", entry: "legacy:canUserAccessChannel", reason: "mention deliveries; sender-only + canUserAccessChannel on message.channelId" },
   { route: "GET /api/messages/:messageId/reactions/actors", entry: "legacy:loadVisibleMessageForUser", reason: "reaction actors; resolveMessageIdVisibleToUser + local projection canUserAccessChannel" },
   { route: "GET /api/messages/:messageId/reactions/viewer", entry: "legacy:loadVisibleMessageForUser", reason: "viewer reaction state; resolveMessageIdVisibleToUser + local projection canUserAccessChannel" },
   { route: "GET /api/messages/attachment-preview/enabled", entry: "none", reason: "feature flag check; no conversation objects" },
-  { route: "GET /api/messages/channel/:channelId/by-activity", entry: "unified", reason: "forum-style channel page by latest activity (channel_thread_sort_v0): canView on the conversation, regular channels set to activity only, the plan's history cutoff" },
   { route: "GET /api/messages/channel/:channelId/human-outline", entry: "unified", reason: "the conversation outline: canView on the conversation; resolveChannelAccess for joint storage" },
   { route: "GET /api/messages/channel/:channelId", entry: "legacy:canUserAccessChannel", reason: "channel history gated by canUserAccessChannel; resolveChannelAccess for joint storage" },
   { route: "GET /api/messages/context/:messageId", entry: "legacy:canUserAccessChannel", reason: "message context window; resolveChannelAccess for joint, canUserAccessChannel on response channel" },
@@ -53,7 +59,7 @@ export const READ_ROUTE_VISIBILITY_CLASSIFICATION: readonly ReadRouteClassificat
   { route: "GET /api/search", entry: "unified", reason: "core's search across first-party apps: visibleHomes (visibleRootChannelIds as one uuid[] + canView of the server home, the reader's server named) read once, each app's query carries it as a condition on its home columns, beside its order and LIMIT" },
   { route: "GET /api/messages/search", entry: "unified", reason: "searchMessagesForUser: visibleRootChannelIds + visibleConversationSql, intersected with the guest listChannels prefilter" },
   { route: "GET /api/messages/sync", entry: "legacy:canUserAccessChannel", reason: "sync by seq; canUserAccessChannel with channel_id, else inline visibility SQL in syncMessages" },
-  { route: "GET /api/sync/changes", entry: "unified", reason: "incremental client sync (syncChanges): channel-scope rows limited to visibleRootChannelIds (+ their threads, + recently deleted channels the viewer saw); server/user rows rebuilt per viewer by the list builders, invisible ones dropped; a message row (RFC 082) only through its visible channel scope, rebuilt by the message list's access and read (readVisibleMessageRow), else dropped" },
+  { route: "GET /api/sync/changes", entry: "unified", reason: "incremental client sync (syncChanges): channel-scope rows limited to visibleRootChannelIds (+ their threads, + recently deleted channels the viewer saw); server/user rows rebuilt per viewer by the list builders, invisible ones dropped; a message row (RFC 082) only through its visible channel scope, rebuilt by the message list's access and read (readVisibleMessageRow), else dropped; inbox_row changes (capabilities=inbox_row, non-guests) are GET /api/channels/inbox?ids= rows (readInboxRowsForSync: that read's visibility and guest filter), the message arm's conversations limited to the viewer's channels, follows with a readable parent and mentions of them" },
   // Channels, inbox, threads, saved, unread: the next migrations off the legacy checks.
   { route: "GET /api/channels", entry: "legacy:listChannels", reason: "sidebar channel list; listChannels membership/type rules" },
   { route: "GET /api/channels/:id", entry: "legacy:canUserAccessChannel", reason: "single channel read gated by canUserAccessChannel" },
@@ -134,6 +140,8 @@ export const READ_ROUTE_VISIBILITY_CLASSIFICATION: readonly ReadRouteClassificat
   { route: "GET /api/artifacts/:id/details", entry: "unified", reason: "the web viewer's answer without a frame ticket or a read position move: canViewArtifacts -> canViewHomedObjects (members-only history for outsiders)" },
   { route: "GET /api/artifacts/:id/locate", entry: "unified", reason: "which of the reader's servers an artifact's canonical link opens in: canViewArtifacts for the reader standing in each server they are a member of (actorsWhoCanViewArtifact -> canActorsViewHomedObject), both servers' flags (a public Artifact: its own server's only); only a server slug (and serverArtifactsOff), one 404 otherwise" },
   { route: "GET /api/artifacts/:id/open", entry: "unified", reason: "the standalone page's one call, no server scoping (the session's person): the Artifact's own server only; a member reads it there by readableItemFor (canViewArtifacts with that server as theirs, its flag) and gets the viewer's answer; otherwise a public Artifact (canViewArtifactsAnonymously, its own server's flag) read as an outsider; one 404 otherwise" },
+  { route: "GET /api/artifacts/:id/links", entry: "unified", reason: "a version's links to other artifacts for a person (#336): the source by readableItemFor (canViewArtifacts -> canViewHomedObjects; members-only history for outsiders); each target in one batch, `ok` (live title, kind) only where canViewArtifacts and itemsReadable answer as opening it would, `deleted` only where the deleted card's rule does (artifactSight: canViewHomedObjects on the home it had, a public one read as its server; a delete on record), else `unavailable`; no read position moved" },
+  { route: "GET /api/artifacts/:id/backlinks", entry: "unified", reason: "what links to an artifact for a person (#336 step 2, \"Linked from\"): the artifact by readableItemFor (canViewArtifacts -> canViewHomedObjects); other artifacts linking it only through visibleArtifactsSql (visibleHomesSql) in the same statement as their count; chat messages linking it only for a reader inside its server, through services/messageBacklinks: visibleRootChannelIds + visibleConversationSql (the guest listChannels prefilter, as message search), the history window, live messages; joint storage ids mapped to the reader's projections; no read position moved" },
   { route: "GET /api/artifacts/:id/comments", entry: "unified", reason: "an artifact's comments for a person: canViewArtifacts -> canViewHomedObjects; none for outsiders" },
   { route: "GET /api/artifacts/:id/review/drafts", entry: "unified", reason: "the reader's own review drafts on an artifact they can see: canViewArtifacts -> canViewHomedObjects; never anyone else's" },
   { route: "GET /api/artifacts/:id/files/:path", entry: "unified", reason: "an artifact file's bytes for a person: canViewArtifacts -> canViewHomedObjects" },
@@ -149,13 +157,16 @@ export const READ_ROUTE_VISIBILITY_CLASSIFICATION: readonly ReadRouteClassificat
   { route: "GET /api/public/artifacts/:id/download.zip", entry: "unified", reason: "every file of a public artifact's current version in one zip, for a signed-out visitor or AI tool (no credential read): publicItemOf, the view's check (canViewArtifactsAnonymously -> visibilityService.canAnonymousViewHomedObjects, public homes only; its own server's flag); bytes through the version's own file rows only" },
   { route: "GET /api/public/artifacts/:id/files/*path", entry: "unified", reason: "one file of a public artifact's current version, as an attachment, for a signed-out visitor or AI tool (no credential read): publicItemOf, the view's check (canViewArtifactsAnonymously -> visibilityService.canAnonymousViewHomedObjects, public homes only; its own server's flag); the path matched exactly against the version's files" },
   { route: "GET /api/public/artifacts/:id/*path", entry: "unified", reason: "the same file as files/*path at the address an AI tool guesses from a file's path (registered last: every named route wins): publicItemOf, the view's check (canViewArtifactsAnonymously -> visibilityService.canAnonymousViewHomedObjects, public homes only; its own server's flag); the path matched exactly against the version's files" },
+  { route: "GET /api/public/artifacts/:id/links", entry: "unified", reason: "a public artifact's current version's links to other artifacts for a signed-out visitor (no credential read): publicItemOf, the view's check, for the source; each target `ok` (title, kind) only where it passes the same check itself (canViewArtifactsAnonymously -> visibilityService.canAnonymousViewHomedObjects, a published current version, its own server's flag), else `unavailable`, never `deleted`" },
   { route: "GET /api/public/artifacts/:id/meta", entry: "unified", reason: "a public artifact's link-preview fields for a signed-out visitor (the web's edge; no credential read): publicItemOf, the view's check (canViewArtifactsAnonymously -> visibilityService.canAnonymousViewHomedObjects, public homes only; its own server's flag); title, description, time, kind, entry and file list" },
+  { route: "GET /api/public/artifacts/:id/og-image.png", entry: "unified", reason: "a public artifact's 1200x630 link-preview image for a signed-out visitor (no credential read): publicItemOf, the view's check (canViewArtifactsAnonymously -> visibilityService.canAnonymousViewHomedObjects, public homes only; its own server's flag); title and description only, never author or server" },
   { route: "GET /internal/artifacts-content/embeds/:artifact", entry: "none", reason: "the content Worker's embed question (first-party token, no reader): an Artifact's current version, kind and title only where the signed-out public page shows it (publicItemOf: public, live, workspace_artifacts_v0) and the kind is framed; every other case the one 404" },
   { route: "GET /internal/artifacts-content/versions/:version", entry: "none", reason: "the content Worker's manifest of a version (first-party token, no reader); who may see the bytes is decided per request by POST /internal/artifacts-content/authorize (canViewArtifacts)" },
   { route: "GET /internal/agent-api/channel-members", entry: "legacy:resolveChannelByName", reason: "channel roster; target resolved via resolveChannelByName membership/joint checks" },
   { route: "GET /internal/agent-api/context", entry: "none", reason: "agent identity, server, prompt, features" },
   { route: "GET /internal/agent-api/events", entry: "legacy:canAgentReceiveChannelDelivery", reason: "queued/durable inbox messages via partitionDeliverableInboxMessages per channel" },
   { route: "GET /internal/agent-api/feedback-locators", entry: "none", reason: "feedback locator receipts for server" },
+  { route: "GET /internal/agent-api/focus", entry: "unified", reason: "the agent's own focus list (agent_focus_v0); every entry's conversation filtered by canView before it is named" },
   { route: "GET /internal/agent-api/history", entry: "legacy:canAgentAccessChannel", reason: "channel/thread history; resolveChannelByName then canAgentAccessChannel and assistant DM confinement" },
   { route: "GET /internal/agent-api/inbox/conversations", entry: "legacy:readAgentInboxChainRows", reason: "unread conversations from RisingWave inbox chain rows; no per-read channel recheck" },
   { route: "GET /internal/agent-api/integrations", entry: "none", reason: "integration inventory" },
@@ -265,11 +276,13 @@ export const READ_ROUTE_VISIBILITY_CLASSIFICATION: readonly ReadRouteClassificat
   { route: "GET /api/servers/:id/machines/:machineId/agents/:agentId/diagnostic/mention-delivery/:messageId", entry: "legacy:authorizeMentionDeliveryDiagnostic", reason: "mention delivery of a message; canInspectAgentPrivateSurfaces only, no channel access check" },
   { route: "GET /api/servers/:id/machines/:machineId/agents/:agentId/diagnostic/session-transcript", entry: "none", reason: "agent runtime session transcript (canInspectAgentPrivateSurfaces); not channel-homed" },
   { route: "GET /api/servers/:id/machine-operations/:operationId", entry: "none", reason: "a Computer wait's answer (limit-reset read/redeem result) to the person who started it; no conversation objects" },
+  { route: "GET /api/servers/:id/machines/:machineId/computer-checks", entry: "none", reason: "a Computer's last checks report (installed tools, versions, local sign-in names; the attaching human or editMachines, as runtime accounts); no conversation objects" },
+  { route: "GET /api/servers/:id/machines/:machineId/proc-jobs", entry: "none", reason: "a Computer's raft proc job names and states (viewMachines, agents the viewer may find); no conversation objects" },
   { route: "GET /api/servers/:id/machines/:machineId/runtime-account-usage/:provider", entry: "none", reason: "runtime account usage; no conversation objects" },
   { route: "GET /api/servers/:id/machines/:machineId/runtime-auth", entry: "none", reason: "runtime auth state; no conversation objects" },
   { route: "GET /api/servers/:id/machines/:machineId/runtime-auth/:runtime/providers", entry: "none", reason: "a runtime's model providers on the Computer; no conversation objects" },
-  { route: "GET /api/servers/:id/machines/:machineId/runtime-form-definitions/:runtimeId", entry: "none", reason: "runtime form definition; no conversation objects" },
-  { route: "GET /api/servers/:id/machines/:machineId/runtime-form-definitions/:runtimeId/option-sources/:sourceId", entry: "none", reason: "runtime form option source; no conversation objects" },
+  { route: "GET /api/servers/:id/machines/:machineId/runtime-form-definitions/:runtimeId", entry: "none", reason: "retired runtime form v1; answers 410, no conversation objects" },
+  { route: "GET /api/servers/:id/machines/:machineId/runtime-form-definitions/:runtimeId/option-sources/:sourceId", entry: "none", reason: "retired runtime form v1 option source; answers 410, no conversation objects" },
   { route: "GET /api/servers/:id/machines/:machineId/runtime-forms/v2/:runtimeId", entry: "none", reason: "runtime form v2; no conversation objects" },
   { route: "GET /api/servers/:id/machines/:machineId/runtime-forms/v2/:runtimeId/option-sources/:sourceId", entry: "none", reason: "runtime form v2 option source; no conversation objects" },
   { route: "GET /api/servers/:id/machines/:machineId/runtime-models/:runtime", entry: "none", reason: "runtime models; no conversation objects" },
@@ -284,6 +297,12 @@ export const READ_ROUTE_VISIBILITY_CLASSIFICATION: readonly ReadRouteClassificat
   { route: "GET /api/me/notification-settings", entry: "none", reason: "caller's own account notification settings and server levels; no conversation objects" },
   { route: "GET /api/me/account/deletion", entry: "none", reason: "caller's own account deletion and billing-cancellation confirmation status; no conversation objects" },
   { route: "GET /api/me/sessions", entry: "none", reason: "caller's own live full sign-ins (session family ids, the clients' own platform/version claims, dates, the current flag, counts of live Computers and agent keys each approved or issued); a person's full session only; no conversation objects" },
+  { route: "GET /api/me/data-exports", entry: "none", reason: "caller's own personal data export rows (status, scope, sizes, dates; no storage keys) behind data_export_v0, a full web sign-in only; whether a producer is available; no conversation objects" },
+  { route: "GET /api/me/data-exports/:exportId", entry: "none", reason: "one of the caller's own personal data export rows (requester-filtered, another's id is 404); no conversation objects" },
+  { route: "GET /api/servers/:id/data-exports", entry: "none", reason: "caller's own server data export rows for a server they are a member of (one 404 for a non-member, an unknown id or the flag off); no conversation objects" },
+  { route: "GET /api/servers/:id/data-exports/summary", entry: "none", reason: "exportServerData (owner only): counts of what a server export would hold (public channels, messages and files in the plan's window, capped), no message, file or name; no conversation objects" },
+  { route: "GET /api/servers/:id/data-export-settings", entry: "none", reason: "the server's data export switch (members may export context) behind data_export_v0 for a member; no conversation objects" },
+  { route: "GET /api/servers/:id/data-exports/:exportId", entry: "none", reason: "one of the caller's own server data export rows (requester- and server-filtered, else 404); no conversation objects" },
   { route: "GET /api/me/app-logins", entry: "none", reason: "caller's own account-mode Login with Raft consents (App key, name, logo, scopes, date); no conversation objects" },
   { route: "GET /api/notification-levels", entry: "none", reason: "caller's own explicit levels in one server: conversation ids only, no content" },
   { route: "GET /api/servers/:id/notification-settings", entry: "none", reason: "server notification prefs; no conversation objects" },
@@ -319,6 +338,7 @@ export const READ_ROUTE_VISIBILITY_CLASSIFICATION: readonly ReadRouteClassificat
   { route: "GET /api/auth/sso/servers/:serverId/start", entry: "none", reason: "SSO (RFC 083) login start from a Server's stable link; no conversation objects" },
   { route: "GET /api/auth/sso/start", entry: "none", reason: "SSO (RFC 083) login start; no conversation objects" },
   { route: "GET /api/auth/app-login/requests/:id", entry: "none", reason: "app login request state; no conversation objects" },
+  { route: "GET /api/auth/app-login/step-up/requests/:id", entry: "none", reason: "app step-up request state (app name, action, masked account); no conversation objects" },
   { route: "GET /api/auth/identities", entry: "none", reason: "linked login identities; no conversation objects" },
   { route: "GET /api/auth/invite-info", entry: "none", reason: "invite metadata; no conversation objects" },
   { route: "GET /api/auth/me", entry: "none", reason: "current user; no conversation objects" },
@@ -365,6 +385,7 @@ export const READ_ROUTE_VISIBILITY_CLASSIFICATION: readonly ReadRouteClassificat
   { route: "GET /api/integrations/marketplace/:clientId/install/app-notifications", entry: "none", reason: "marketplace install notification config; no conversation objects" },
   { route: "GET /api/integrations/overview", entry: "none", reason: "integrations overview; no conversation objects" },
   { route: "GET /api/integrations/permission-updates", entry: "none", reason: "manager-only count of current Server App installations needing permission approval, and whether any installed App awaits its admins; no conversation objects" },
+  { route: "GET /api/mcp/accounts", entry: "none", reason: "MCP App accounts (Connections and the agents using them); per agent only a yes/no for external channels, no conversation objects" },
   { route: "GET /api/mcp/agents/:agentId", entry: "none", reason: "agent managed MCP config; no conversation objects" },
   { route: "GET /api/mcp/app-templates", entry: "none", reason: "MCP app templates; no conversation objects" },
   { route: "GET /api/mcp/apps", entry: "none", reason: "MCP apps; no conversation objects" },
@@ -395,11 +416,6 @@ export const READ_ROUTE_VISIBILITY_CLASSIFICATION: readonly ReadRouteClassificat
   { route: "GET /api/product-feedback/tickets", entry: "none", reason: "user feedback tickets; no conversation objects" },
   { route: "GET /api/product-feedback/tickets/:ticketId", entry: "none", reason: "feedback ticket; no conversation objects" },
   { route: "GET /api/product-feedback/tickets/:ticketId/attachments/:attachmentId", entry: "none", reason: "feedback ticket attachment (not channel attachment); no conversation objects" },
-  { route: "GET /api/provider-connections", entry: "none", reason: "provider connections; no conversation objects" },
-  { route: "GET /api/provider-connections/:connectionId/agents", entry: "none", reason: "provider connection agents; no conversation objects" },
-  { route: "GET /api/provider-connections/:connectionId/models", entry: "none", reason: "provider connection models; no conversation objects" },
-  { route: "GET /api/provider-connections/:connectionId/probes", entry: "none", reason: "provider probes; no conversation objects" },
-  { route: "GET /api/provider-connections/:connectionId/probes/:probeId", entry: "none", reason: "provider probe; no conversation objects" },
   { route: "GET /api/push/delivery-status", entry: "none", reason: "push delivery status; no conversation objects" },
   { route: "GET /api/push/vapid-key", entry: "none", reason: "VAPID public key; no conversation objects" },
   { route: "GET /api/raftbench", entry: "legacy:requireAdmin", reason: "raftbench dashboard findings/examples from channel messages; admin-only gate" },

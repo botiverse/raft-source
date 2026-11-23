@@ -46,6 +46,8 @@ async function seed() {
   const server = await createServer("Service requests", `svc-req-${suffix}`, user!.id);
   const agent = await createAgent(server.id, `SvcReq${suffix.slice(0, 6)}`);
   const [mcpApp] = await db.insert(managedMcpServers).values({
+    // No recorded creator: vouched, as migration 0732 does for legacy Apps (fail-closed rule).
+    serverVouchedAt: new Date(),
     serverId: server.id, name: "Team Notion", endpointUrl: "https://notion.example.test/mcp", authMode: "none",
     toolCatalog: [{ name: "search", inputSchema: { type: "object" as const } }], catalogVersion: 1,
   }).returning();
@@ -69,11 +71,11 @@ test("login: a name nothing answers to is recorded as the listed service or `oth
     return { status: res.status, body: await res.json() as Record<string, unknown> };
   };
 
-  // The refusal is byte for byte what it was before the event existed.
-  assert.deepEqual(await login("Google Mail"), { status: 404, body: { error: "Registered service not found" } });
-  assert.deepEqual(await login("gmail"), { status: 404, body: { error: "Registered service not found" } }, "the same service again today");
-  assert.deepEqual(await login("acme-internal-crm"), { status: 404, body: { error: "Registered service not found" } });
-  assert.deepEqual(await login("another-unlisted-thing"), { status: 404, body: { error: "Registered service not found" } }, "a second unlisted name is the same `other`");
+  // Recording the event leaves the refusal as it is: the plain not-found.
+  assert.deepEqual(await login("Google Mail"), { status: 404, body: { error: "Registered service not found", code: "service_not_found", errorCode: "service_not_found" } });
+  assert.deepEqual(await login("gmail"), { status: 404, body: { error: "Registered service not found", code: "service_not_found", errorCode: "service_not_found" } }, "the same service again today");
+  assert.deepEqual(await login("acme-internal-crm"), { status: 404, body: { error: "Registered service not found", code: "service_not_found", errorCode: "service_not_found" } });
+  assert.deepEqual(await login("another-unlisted-thing"), { status: 404, body: { error: "Registered service not found", code: "service_not_found", errorCode: "service_not_found" } }, "a second unlisted name is the same `other`");
   // A public Marketplace app the server lacks.
   const install = await login(f.marketKey);
   assert.equal(install.status, 200);
@@ -133,7 +135,7 @@ test("a server that turned product analytics off records nothing; the older logi
 
   await getDb().update(servers).set({ productAnalyticsEnabled: false }).where(eq(servers.id, f.serverId));
   const res = await fetch(`${app.baseUrl}/internal/agent-api/integrations/login`, { method: "POST", headers: f.headers, body: JSON.stringify({ service: "jira" }) });
-  assert.deepEqual([res.status, await res.json()], [404, { error: "Registered service not found" }]);
+  assert.deepEqual([res.status, await res.json()], [404, { error: "Registered service not found", code: "service_not_found", errorCode: "service_not_found" }]);
   await settle(store.rows, 2);
   assert.equal(store.rows.length, 1, "nothing for the opted-out server");
 });

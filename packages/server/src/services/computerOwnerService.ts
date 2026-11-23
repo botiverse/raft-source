@@ -8,10 +8,13 @@
  *
  * Who may set it (PUT /api/servers/:id/machines/:machineId/owner,
  * routes/computerOwnerRoutes.ts):
- * - a server owner or admin (`editMachines`): assign, transfer, make Public;
+ * - a server owner or admin (computerRoleAllows `edit`, `editMachines`):
+ *   assign, transfer, make Public;
  * - the current owner: transfer to another member, or make it Public;
- * - the connector (who attached the live Computer; for a raw daemon, the
- *   machine row's registrant): only "Make it mine", on a Public Computer.
+ * - the connector, the machine's controller (computerControllerUserId: who
+ *   its live Computer is attached by; nobody for a raw daemon, a revoked
+ *   Computer or a live record naming no one): only "Make it mine", on a
+ *   Public Computer.
  * The new owner is a person in this server who is not a Guest (an agent or a
  * personal assistant is never a server member, so it is refused the same way).
  *
@@ -23,11 +26,12 @@
  * owner other than the actor gets a `system_notice`.
  */
 import { createHash } from "node:crypto";
-import { and, eq, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, eq, isNotNull, sql } from "drizzle-orm";
 import { currentDate, type ServerRole } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../db/index";
-import { computers, machines, serverMembers, users } from "../db/schema";
+import { machines, serverMembers, users } from "../db/schema";
 import { actorRoleHasServerCapability } from "../lib/actorPermissions";
+import { computerControllerUserId, computerRoleAllows } from "./computerControlAuthorization";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import { recordIntegrationAuditEvent, serverAuditContextMetadata, type ServerAuditContext } from "./integrationAuditService";
 import { enqueueNotificationRows } from "./notifications/enqueue";
@@ -80,21 +84,6 @@ export async function getComputerOwners(serverId: string): Promise<Map<string, C
 }
 
 /**
- * Who connected this machine: the human who attached its live Computer, or,
- * for a raw daemon (no live Computer), the machine row's registrant. The same
- * person the web treats as the connector (`computerAttachedByCurrentUser`,
- * else `userId`).
- */
-async function connectorOf(tx: DatabaseExecutor, machine: { id: string; serverId: string; userId: string }): Promise<string | null> {
-  const [live] = await tx
-    .select({ attachedByUserId: computers.attachedByUserId })
-    .from(computers)
-    .where(and(eq(computers.machineId, machine.id), eq(computers.serverId, machine.serverId), isNull(computers.revokedAt)))
-    .limit(1);
-  return live ? live.attachedByUserId : machine.userId;
-}
-
-/**
  * Set (or clear, `ownerUserId: null`) a Computer's owner. One transaction:
  * the actor's and the new owner's membership rows FOR SHARE in user-id order
  * (a removal or role change of either waits for this write, or committed
@@ -133,10 +122,11 @@ export async function setComputerOwner(input: {
     if (!machine) return { ok: false, status: 404, code: "machine_not_found" };
 
     const previousOwnerUserId = machine.ownerUserId;
-    const isManager = actorRoleHasServerCapability(actorRole, "editMachines");
+    // The role half of the one Computer check only: the connector may claim it, not assign it to someone else.
+    const isManager = computerRoleAllows(actorRole, "edit");
     const isOwner = previousOwnerUserId === actorUserId;
     const claimsPublic = previousOwnerUserId === null && ownerUserId === actorUserId
-      && (await connectorOf(tx, machine)) === actorUserId;
+      && (await computerControllerUserId(tx, serverId, machine)) === actorUserId;
     if (!isManager && !isOwner && !claimsPublic) return { ok: false, status: 403, code: "computer_owner_forbidden" };
 
     if (ownerUserId !== null) {

@@ -14,8 +14,9 @@
 //    content access; platform/session signedIn);
 // 3. the Artifact exists and isn't deleted or revoked, and the version is a
 //    published one of it (`deleted`);
-// 4. Artifacts is on for the deployment and the Artifact's own server
-//    isn't deleted (apiCommon itemServerEnabled), the user still stands in
+// 4. Artifacts is on for the deployment and the Artifact is read at all
+//    (apiCommon itemReadable: its own server isn't deleted, or is but the
+//    Artifact is kept in a joint it is still in), the user still stands in
 //    the subject's server (a
 //    member of any role: this binds the subject to its server for every
 //    home, public included, so neither a removed member nor a subject naming
@@ -37,7 +38,8 @@
 // 4. the version is its current one (`not-current`: a newer version, or one
 //    revoked, ends the old frame);
 // 5. workspace_artifacts_v0 is on for the Artifact's own server, which
-//    isn't deleted (`not-visible`; apiCommon itemServerEnabled).
+//    isn't deleted (`not-visible`; apiCommon itemReadable: a closed
+//    server's Artifact is read only in a joint, never public).
 // Unpublishing or deleting it therefore denies the next content request the
 // Worker doesn't answer from its 30 s cache.
 //
@@ -99,7 +101,7 @@ import type { RefusalInput } from "../../platform/refusals";
 import { signedIn } from "../../platform/session";
 import { countAppOperation, withAppSpan } from "../../platform/tracing";
 import { standsInOwnServer, type ViewActor } from "../../platform/visibility";
-import { artifactsEnabled, currentVersionOf, itemServerEnabled, readableVersion, readsAsOutsider, type ArtifactApiJson } from "./apiCommon";
+import { artifactsEnabled, currentVersionOf, itemReadable, itemWritable, readableVersion, readsAsOutsider, type ArtifactApiJson } from "./apiCommon";
 import { isCheckRunning } from "./checks";
 import { checksConfigured } from "./checkWorkerToken";
 import {
@@ -185,7 +187,7 @@ async function decideAnonymous(subject: AnonymousContentSubject, artifact: strin
   const { item } = found;
   if (!canViewArtifactsAnonymously([item])[0]) return deny("not-public");
   if (item.currentVersionId !== version) return deny("not-current");
-  if (!(await itemServerEnabled(item))) return deny("not-visible");
+  if (!(await itemReadable(item))) return deny("not-visible");
   return { kind: "json", body: { allow: true } };
 }
 
@@ -195,7 +197,8 @@ async function decideCheck(subject: CheckContentSubject, artifact: string, versi
   const found = await publishedVersion(artifact, version);
   if (!found) return deny("deleted");
   const { item } = found;
-  if (!checksConfigured() || !(await itemServerEnabled(item))) return deny("not-visible");
+  // A check is part of a publish: only while the Artifact may be written (a closed server's never is).
+  if (!checksConfigured() || !(await itemWritable(item))) return deny("not-visible");
   // A kind no check opens (shared ARTIFACT_CHECKED_KINDS: Markdown, PDF for now) is never being checked.
   if (!isArtifactCheckedKind(artifactFileType(found.version.entry).kind)) return deny("not-checking");
   if (!(await isCheckRunning(version))) return deny("not-checking");
@@ -220,8 +223,8 @@ async function decideAuthorize(body: unknown): Promise<AuthorizeAnswer> {
   const found = await publishedVersion(artifact, version);
   if (!found) return deny("deleted");
   const { item } = found;
-  // Artifacts on for the deployment, and the Artifact's own server still exists (apiCommon itemServerEnabled).
-  if (!(await itemServerEnabled(item))) return deny("not-visible");
+  // Artifacts on for the deployment, and the Artifact read at all (apiCommon itemReadable: its server live, or closed and it kept in a joint).
+  if (!(await itemReadable(item))) return deny("not-visible");
   const actor: ViewActor = { type: "user", id: reader.userId, serverId: reader.serverId };
   if (!(await standsInOwnServer(actor))) return deny("not-visible");
   const [visible] = await canViewArtifacts(actor, [item]);

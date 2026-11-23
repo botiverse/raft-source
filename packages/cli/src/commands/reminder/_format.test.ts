@@ -208,6 +208,6 @@ test("a migrated reminder shows where it went, with no next fire here, and the l
   );
   const listed = formatReminderList([sample({}), moved], AFTER_FIRE).split("\n");
   assert.equal(listed.length, 3);
-  assert.match(listed[2]!, /^Reminders marked \[migrated\] moved to the Reminder app .*raft integration list/);
+  assert.equal(listed[2], "Reminders marked [migrated] moved to the Reminder app and fire there now, under new ids.");
   assert.equal(formatReminderList([sample({})], AFTER_FIRE).includes("[migrated]"), false, "no hint without a migrated row");
 });

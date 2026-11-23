@@ -2314,6 +2314,52 @@
       }
     },
     {
+      "id": "components.members.agent-now-card.recent-rows-narrow",
+      "title": "Agent Profile Recent activity: rows on a phone (390px)",
+      "captureType": "component-fixture",
+      "surface": "members",
+      "category": "members",
+      "fixture": "packages/web/visual-testing/AgentNowCardCases.tsx#AGENT_NOW_CARD_TURNS",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Long Last turn line; long trigger and actions; error ending with no message sent; short with no message sent",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.members.agent-now-card.recent-rows-narrow']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/agent/AgentNowCard.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agent/AgentNowCard"
+          ],
+          "fixture": "packages/web/visual-testing/AgentNowCardCases.tsx#AGENT_NOW_CARD_TURNS",
+          "path": "packages/web/visual-testing/AgentNowCardCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate. The agent profile's Recent activity card (AgentNowCard, recentRows 3; rows as AgentRecentActivity lays them out, without its status chip) in a 390px column, on fixture turns: a long trigger (@Tenny in a thread of #proj-raft-computer-reconciler) with long actions; an error ending that sent nothing (both badges, 'Ended with an error' and 'No message sent'); a short DM turn with only 'No message sent'. Nothing in a row is truncated: what does not fit wraps to the next line (a badge as a whole), indented under the text, not under the time. The card's 'Last turn: …' line (also a long thread trigger) wraps too at this width; from sm up it is one truncated line."
+    },
+    {
       "id": "components.members.agent-detail.status.credential-held-sign-in",
       "title": "Agent Profile Status: Invalid Credential, Held for another agent's sign-in",
       "captureType": "component-fixture",
@@ -4703,774 +4749,6 @@
       "notes": "Narrow (260px) markdown message-row wrap net: forces a channel/task chip to wrap to the next line to reproduce the Android inline-box line-wrap bug. Mentions (@artin @Android-Developer-2), channel #对话流专修, and task #607 all chip. Body mirrors the Android md_wrap_task607 thread fixture byte-for-byte."
     },
     {
-      "id": "components.thread.message.agent-read-line.muted-channel",
-      "title": "Agent read line: muted channel",
-      "captureType": "component-fixture",
-      "surface": "thread",
-      "category": "app/thread",
-      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "muted-channel",
-          "name": "Agent read line: muted channel",
-          "props": {
-            "lang": "zh-CN"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.thread.message.agent-read-line.muted-channel']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/message/MessageItem",
-            "components/message/AgentReadFaces",
-            "components/message/MessageReadStatusLine"
-          ],
-          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Your latest message in #design: Cindy's face (she read it) at the end of its last line, and the line under it, \"Muted: Niko · Mention them to reach them\" with the mute bell (Niko muted the channel and has not read it). React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
-    },
-    {
-      "id": "components.thread.message.agent-read-line.muted-channel.dark",
-      "title": "Agent read line: muted channel (dark)",
-      "captureType": "component-fixture",
-      "surface": "thread",
-      "category": "app/thread",
-      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "dark",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "muted-channel",
-          "name": "Agent read line: muted channel",
-          "props": {
-            "lang": "zh-CN"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.thread.message.agent-read-line.muted-channel.dark']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/message/MessageItem",
-            "components/message/AgentReadFaces",
-            "components/message/MessageReadStatusLine"
-          ],
-          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Your latest message in #design: Cindy's face (she read it) at the end of its last line, and the line under it, \"Muted: Niko · Mention them to reach them\" with the mute bell (Niko muted the channel and has not read it). React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
-    },
-    {
-      "id": "components.thread.message.agent-read-line.muted-channel.en",
-      "title": "Agent read line: muted channel (en)",
-      "captureType": "component-fixture",
-      "surface": "thread",
-      "category": "app/thread",
-      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "en",
-      "variants": [
-        {
-          "id": "muted-channel",
-          "name": "Agent read line: muted channel",
-          "props": {
-            "lang": "en"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.thread.message.agent-read-line.muted-channel.en']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/message/MessageItem",
-            "components/message/AgentReadFaces",
-            "components/message/MessageReadStatusLine"
-          ],
-          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Your latest message in #design: Cindy's face (she read it) at the end of its last line, and the line under it, \"Muted: Niko · Mention them to reach them\" with the mute bell (Niko muted the channel and has not read it). React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
-    },
-    {
-      "id": "components.thread.message.agent-read-line.muted-channel.en.dark",
-      "title": "Agent read line: muted channel (en, dark)",
-      "captureType": "component-fixture",
-      "surface": "thread",
-      "category": "app/thread",
-      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "dark",
-      "locale": "en",
-      "variants": [
-        {
-          "id": "muted-channel",
-          "name": "Agent read line: muted channel",
-          "props": {
-            "lang": "en"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.thread.message.agent-read-line.muted-channel.en.dark']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/message/MessageItem",
-            "components/message/AgentReadFaces",
-            "components/message/MessageReadStatusLine"
-          ],
-          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Your latest message in #design: Cindy's face (she read it) at the end of its last line, and the line under it, \"Muted: Niko · Mention them to reach them\" with the mute bell (Niko muted the channel and has not read it). React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
-    },
-    {
-      "id": "components.thread.message.agent-read-line.stopped-following-thread",
-      "title": "Agent read line: stopped following a thread",
-      "captureType": "component-fixture",
-      "surface": "thread",
-      "category": "app/thread",
-      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "stopped-following-thread",
-          "name": "Agent read line: stopped following a thread",
-          "props": {
-            "lang": "zh-CN"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.thread.message.agent-read-line.stopped-following-thread']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/message/MessageItem",
-            "components/message/AgentReadFaces",
-            "components/message/MessageReadStatusLine"
-          ],
-          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Your latest reply in a thread under #design: Cindy's face (she read it) and \"Stopped following: Niko · Mention them to reach them\" with the unfollow icon. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
-    },
-    {
-      "id": "components.thread.message.agent-read-line.stopped-following-thread.dark",
-      "title": "Agent read line: stopped following a thread (dark)",
-      "captureType": "component-fixture",
-      "surface": "thread",
-      "category": "app/thread",
-      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "dark",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "stopped-following-thread",
-          "name": "Agent read line: stopped following a thread",
-          "props": {
-            "lang": "zh-CN"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.thread.message.agent-read-line.stopped-following-thread.dark']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/message/MessageItem",
-            "components/message/AgentReadFaces",
-            "components/message/MessageReadStatusLine"
-          ],
-          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Your latest reply in a thread under #design: Cindy's face (she read it) and \"Stopped following: Niko · Mention them to reach them\" with the unfollow icon. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
-    },
-    {
-      "id": "components.thread.message.agent-read-line.stopped-following-thread.en",
-      "title": "Agent read line: stopped following a thread (en)",
-      "captureType": "component-fixture",
-      "surface": "thread",
-      "category": "app/thread",
-      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "en",
-      "variants": [
-        {
-          "id": "stopped-following-thread",
-          "name": "Agent read line: stopped following a thread",
-          "props": {
-            "lang": "en"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.thread.message.agent-read-line.stopped-following-thread.en']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/message/MessageItem",
-            "components/message/AgentReadFaces",
-            "components/message/MessageReadStatusLine"
-          ],
-          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Your latest reply in a thread under #design: Cindy's face (she read it) and \"Stopped following: Niko · Mention them to reach them\" with the unfollow icon. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
-    },
-    {
-      "id": "components.thread.message.agent-read-line.stopped-following-thread.en.dark",
-      "title": "Agent read line: stopped following a thread (en, dark)",
-      "captureType": "component-fixture",
-      "surface": "thread",
-      "category": "app/thread",
-      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "dark",
-      "locale": "en",
-      "variants": [
-        {
-          "id": "stopped-following-thread",
-          "name": "Agent read line: stopped following a thread",
-          "props": {
-            "lang": "en"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.thread.message.agent-read-line.stopped-following-thread.en.dark']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/message/MessageItem",
-            "components/message/AgentReadFaces",
-            "components/message/MessageReadStatusLine"
-          ],
-          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Your latest reply in a thread under #design: Cindy's face (she read it) and \"Stopped following: Niko · Mention them to reach them\" with the unfollow icon. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
-    },
-    {
-      "id": "components.thread.message.agent-read-line.many-narrow",
-      "title": "Agent read line: four muted agents, narrow",
-      "captureType": "component-fixture",
-      "surface": "thread",
-      "category": "app/thread",
-      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-      "viewport": {
-        "width": 320,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "many-narrow",
-          "name": "Agent read line: four muted agents, narrow",
-          "props": {
-            "lang": "zh-CN"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.thread.message.agent-read-line.many-narrow']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/message/MessageItem",
-            "components/message/AgentReadFaces",
-            "components/message/MessageReadStatusLine"
-          ],
-          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Four muted agents at 320 wide. The names take the room left over beside the verb, \"+1\", \"·\" and the whole hint (zh: \"已静音：Produ… +1 · @ 对方才会看到\"). When not even a name's first letters fit (en), the segment shows its count instead of names and +1: \"Muted: 4 agents\", and the hint, still too long for the row, loses its tail (\"Muted: 4 agents · Mention them t…\"). Cindy's face: she read it. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
-    },
-    {
-      "id": "components.thread.message.agent-read-line.many-narrow.dark",
-      "title": "Agent read line: four muted agents, narrow (dark)",
-      "captureType": "component-fixture",
-      "surface": "thread",
-      "category": "app/thread",
-      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-      "viewport": {
-        "width": 320,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "dark",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "many-narrow",
-          "name": "Agent read line: four muted agents, narrow",
-          "props": {
-            "lang": "zh-CN"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.thread.message.agent-read-line.many-narrow.dark']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/message/MessageItem",
-            "components/message/AgentReadFaces",
-            "components/message/MessageReadStatusLine"
-          ],
-          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Four muted agents at 320 wide. The names take the room left over beside the verb, \"+1\", \"·\" and the whole hint (zh: \"已静音：Produ… +1 · @ 对方才会看到\"). When not even a name's first letters fit (en), the segment shows its count instead of names and +1: \"Muted: 4 agents\", and the hint, still too long for the row, loses its tail (\"Muted: 4 agents · Mention them t…\"). Cindy's face: she read it. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
-    },
-    {
-      "id": "components.thread.message.agent-read-line.many-narrow.en",
-      "title": "Agent read line: four muted agents, narrow (en)",
-      "captureType": "component-fixture",
-      "surface": "thread",
-      "category": "app/thread",
-      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-      "viewport": {
-        "width": 320,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "en",
-      "variants": [
-        {
-          "id": "many-narrow",
-          "name": "Agent read line: four muted agents, narrow",
-          "props": {
-            "lang": "en"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.thread.message.agent-read-line.many-narrow.en']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/message/MessageItem",
-            "components/message/AgentReadFaces",
-            "components/message/MessageReadStatusLine"
-          ],
-          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Four muted agents at 320 wide. The names take the room left over beside the verb, \"+1\", \"·\" and the whole hint (zh: \"已静音：Produ… +1 · @ 对方才会看到\"). When not even a name's first letters fit (en), the segment shows its count instead of names and +1: \"Muted: 4 agents\", and the hint, still too long for the row, loses its tail (\"Muted: 4 agents · Mention them t…\"). Cindy's face: she read it. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
-    },
-    {
-      "id": "components.thread.message.agent-read-line.many-narrow.en.dark",
-      "title": "Agent read line: four muted agents, narrow (en, dark)",
-      "captureType": "component-fixture",
-      "surface": "thread",
-      "category": "app/thread",
-      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-      "viewport": {
-        "width": 320,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "dark",
-      "locale": "en",
-      "variants": [
-        {
-          "id": "many-narrow",
-          "name": "Agent read line: four muted agents, narrow",
-          "props": {
-            "lang": "en"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.thread.message.agent-read-line.many-narrow.en.dark']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/message/MessageItem",
-            "components/message/AgentReadFaces",
-            "components/message/MessageReadStatusLine"
-          ],
-          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Four muted agents at 320 wide. The names take the room left over beside the verb, \"+1\", \"·\" and the whole hint (zh: \"已静音：Produ… +1 · @ 对方才会看到\"). When not even a name's first letters fit (en), the segment shows its count instead of names and +1: \"Muted: 4 agents\", and the hint, still too long for the row, loses its tail (\"Muted: 4 agents · Mention them t…\"). Cindy's face: she read it. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
-    },
-    {
-      "id": "components.thread.message.agent-read-line.all-reachable",
-      "title": "Agent read line: everyone reached (no line)",
-      "captureType": "component-fixture",
-      "surface": "thread",
-      "category": "app/thread",
-      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "all-reachable",
-          "name": "Agent read line: everyone reached (no line)",
-          "props": {
-            "lang": "zh-CN"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.thread.message.agent-read-line.all-reachable']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/message/MessageItem",
-            "components/message/AgentReadFaces",
-            "components/message/MessageReadStatusLine"
-          ],
-          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Niko muted #design but read your message (his face on it) and Cindy replied (her face on her reply): the message reaches everyone, so there is no line. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
-    },
-    {
-      "id": "components.thread.message.agent-read-line.all-reachable.dark",
-      "title": "Agent read line: everyone reached (no line) (dark)",
-      "captureType": "component-fixture",
-      "surface": "thread",
-      "category": "app/thread",
-      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "dark",
-      "locale": "zh-CN",
-      "variants": [
-        {
-          "id": "all-reachable",
-          "name": "Agent read line: everyone reached (no line)",
-          "props": {
-            "lang": "zh-CN"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.thread.message.agent-read-line.all-reachable.dark']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/message/MessageItem",
-            "components/message/AgentReadFaces",
-            "components/message/MessageReadStatusLine"
-          ],
-          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Niko muted #design but read your message (his face on it) and Cindy replied (her face on her reply): the message reaches everyone, so there is no line. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
-    },
-    {
-      "id": "components.thread.message.agent-read-line.all-reachable.en",
-      "title": "Agent read line: everyone reached (no line) (en)",
-      "captureType": "component-fixture",
-      "surface": "thread",
-      "category": "app/thread",
-      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "light",
-      "locale": "en",
-      "variants": [
-        {
-          "id": "all-reachable",
-          "name": "Agent read line: everyone reached (no line)",
-          "props": {
-            "lang": "en"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.thread.message.agent-read-line.all-reachable.en']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/message/MessageItem",
-            "components/message/AgentReadFaces",
-            "components/message/MessageReadStatusLine"
-          ],
-          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Niko muted #design but read your message (his face on it) and Cindy replied (her face on her reply): the message reaches everyone, so there is no line. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
-    },
-    {
-      "id": "components.thread.message.agent-read-line.all-reachable.en.dark",
-      "title": "Agent read line: everyone reached (no line) (en, dark)",
-      "captureType": "component-fixture",
-      "surface": "thread",
-      "category": "app/thread",
-      "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-      "viewport": {
-        "width": 390,
-        "height": 844,
-        "density": 3
-      },
-      "theme": "dark",
-      "locale": "en",
-      "variants": [
-        {
-          "id": "all-reachable",
-          "name": "Agent read line: everyone reached (no line)",
-          "props": {
-            "lang": "en"
-          }
-        }
-      ],
-      "capture": {
-        "selector": "[data-visual-case='components.thread.message.agent-read-line.all-reachable.en.dark']",
-        "crop": "element",
-        "contract": "component-bounds"
-      },
-      "reactPathHint": "packages/web/src/components/message/AgentReadFaces.tsx",
-      "providerMatrix": {
-        "react": {
-          "status": "active",
-          "components": [
-            "components/message/MessageItem",
-            "components/message/AgentReadFaces",
-            "components/message/MessageReadStatusLine"
-          ],
-          "fixture": "packages/web/visual-testing/AgentReadLineCases.tsx#scenario",
-          "path": "packages/web/visual-testing/AgentReadLineCases.tsx"
-        }
-      },
-      "tolerance": {
-        "pixelRatio": 0.02,
-        "layoutDp": 1,
-        "ignoreAntialiasing": true
-      },
-      "notes": "Niko muted #design but read your message (his face on it) and Cindy replied (her face on her reply): the message reaches everyone, so there is no line. React only: the agent read faces and line are web-only. The real MessageItem rows from your latest message on, with the model useAgentReadProgress builds from the pure projection (agentReadProgressDomain) over the fixture in AgentReadLineCases.tsx; the UI language comes from the variant's `lang`, so zh-CN shows the Chinese line."
-    },
-    {
       "id": "components.members.create-agent.dialog-no-computer",
       "title": "Members Create Agent Dialog - no computer branch",
       "surface": "members",
@@ -6313,6 +5591,307 @@
       "notes": "#wg-ax:#9 (Kirby): a session saved by a newer runtime than the Computer's Raft reads. The orange banner, no Retry, and Open computer for a viewer who can open that Computer. react-only: the panel is web-only."
     },
     {
+      "id": "components.agent.voice-call.states",
+      "title": "Voice call window: states",
+      "captureType": "component-fixture",
+      "surface": "agent-voice-call",
+      "category": "app/agent",
+      "fixture": "packages/web/visual-testing/AgentVoiceCallCases.tsx#VOICE_CALL_STATES",
+      "viewport": {
+        "width": 1280,
+        "height": 1200,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "all-states",
+          "name": "Voice call window: connecting, live with captions, live with the microphone lost, ended (connection lost), failed (agent offline)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.agent.voice-call.states']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/features/agent/AgentVoiceCallPanel.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/agent/AgentVoiceCallPanel"
+          ],
+          "fixture": "packages/web/visual-testing/AgentVoiceCallCases.tsx#VOICE_CALL_STATES",
+          "path": "packages/web/visual-testing/AgentVoiceCallCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: voice calls are web-only (#wg-runtime-form:#22, agent_voice_v1). The call window's card (AgentVoiceCallPanel, as AgentVoiceCallWindow draws it: layer-popover, line-seam ring, shadow-float; without its fixed place or the call store) on fixture calls and a fixed clock, no room. One sheet, because the React provider shoots one image per case (variants[0]); top to bottom, each wrapped in [data-voice-call-state]: connecting; live 3:12 with the agent speaking (ring) and two caption lines, the person's finished and the agent's unfinished one clamped to two lines; live with the microphone taken by another app mid-call (warning banner, Mute unavailable); ended 7:45 after the connection dropped; failed, agent offline (Send it a message instead). Phone width: components.agent.voice-call.phone; in place over the composer: components.agent.voice-call.over-composer."
+    },
+    {
+      "id": "components.agent.voice-call.phone",
+      "title": "Voice call window: states (phone)",
+      "captureType": "component-fixture",
+      "surface": "agent-voice-call",
+      "category": "app/agent",
+      "fixture": "packages/web/visual-testing/AgentVoiceCallCases.tsx#VOICE_CALL_STATES",
+      "viewport": {
+        "width": 390,
+        "height": 1400,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "all-states",
+          "name": "Voice call window at a phone's width: connecting, live with captions, live with the microphone lost, ended (connection lost), failed (agent offline)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.agent.voice-call.phone']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/features/agent/AgentVoiceCallPanel.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/agent/AgentVoiceCallPanel"
+          ],
+          "fixture": "packages/web/visual-testing/AgentVoiceCallCases.tsx#VOICE_CALL_STATES",
+          "path": "packages/web/visual-testing/AgentVoiceCallCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: voice calls are web-only (#wg-runtime-form:#22). components.agent.voice-call.states at a phone's width (390): each card as the window takes it on a phone, 12px from each side (at most 360 wide)."
+    },
+    {
+      "id": "components.agent.voice-call.over-composer",
+      "title": "Voice call window over the composer",
+      "captureType": "component-fixture",
+      "surface": "agent-voice-call",
+      "category": "app/agent",
+      "fixture": "packages/web/visual-testing/AgentVoiceCallCases.tsx#liveVoiceCallFixture",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Voice call window, live with captions, in its place above the composer",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.agent.voice-call.over-composer']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/agent/AgentVoiceCallCard.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/agent/AgentVoiceCallCard",
+            "features/agent/AgentVoiceCallPanel",
+            "features/composer/MessageInput"
+          ],
+          "fixture": "packages/web/visual-testing/AgentVoiceCallCases.tsx#liveVoiceCallFixture",
+          "path": "packages/web/visual-testing/VisualTestingCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: voice calls are web-only (#wg-runtime-form:#22). The real call window (AgentVoiceCallCard: fixed at z-app, placed 16px above the toast-viewport floors) over the real composer (MessageInput, which registers itself as a floor, with a draft so Send is live) at desktop width: the window sits above the composer, clear of Send. A live call with captions; its timer runs from when the case opens (about 3:12). No message list: the composer is what the window must stay clear of."
+    },
+    {
+      "id": "components.agent.runtime-picker.hints",
+      "title": "Runtime picker: the list shows names, Claude Code and Codex Recommended, runtimes without mid-turn steering Limited (top of the list)",
+      "captureType": "component-fixture",
+      "surface": "agent-runtime-picker",
+      "category": "app/agent",
+      "fixture": "packages/web/visual-testing/RuntimePickerHintCases.tsx#RuntimePickerHintsCase",
+      "viewport": {
+        "width": 480,
+        "height": 560,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "open-list",
+          "name": "The runtime list open on Claude Code: every runtime offered for a new agent, all ready on this computer",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "body",
+        "crop": "element",
+        "contract": "modal-viewport",
+        "interactions": [
+          {
+            "type": "click",
+            "target": "[data-testid='runtime-picker-hints'] [role='combobox']"
+          },
+          {
+            "type": "wait",
+            "ms": 240
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/components/agent/RuntimeConfigFields.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agent/RuntimeConfigFields",
+            "utils/runtimeCapabilityHint"
+          ],
+          "fixture": "packages/web/visual-testing/RuntimePickerHintCases.tsx#RuntimePickerHintsCase",
+          "path": "packages/web/visual-testing/RuntimePickerHintCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#triage:#524. React only, no baseline or parity gate. The runtime field of Create agent and Edit runtime config (RuntimeConfigFields over groupRuntimePickerRows), its list opened by the capture interaction: each runtime's name, Claude Code and Codex with a Recommended badge after it, and the runtimes that can't take new messages while working (no mid-turn steering in the shared RUNTIME_RAFT_CAPABILITIES: Cursor CLI, OpenCode, Qwen Code) with a quieter muted Limited badge there; no hint and no Experimental badge in the list. The list opens scrolled to the chosen runtime: this case Claude Code (top), .hints-end Qoder (bottom). .hints-selected shows the closed field with Cursor CLI chosen and its hint under it."
+    },
+    {
+      "id": "components.agent.runtime-picker.hints-end",
+      "title": "Runtime picker: the list shows names, Claude Code and Codex Recommended, runtimes without mid-turn steering Limited (list open on Qoder)",
+      "captureType": "component-fixture",
+      "surface": "agent-runtime-picker",
+      "category": "app/agent",
+      "fixture": "packages/web/visual-testing/RuntimePickerHintCases.tsx#RuntimePickerHintsCase",
+      "viewport": {
+        "width": 480,
+        "height": 560,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "open-list-qoder",
+          "name": "The runtime list open on Qoder",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "body",
+        "crop": "element",
+        "contract": "modal-viewport",
+        "interactions": [
+          {
+            "type": "click",
+            "target": "[data-testid='runtime-picker-hints'] [role='combobox']"
+          },
+          {
+            "type": "wait",
+            "ms": 240
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/components/agent/RuntimeConfigFields.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agent/RuntimeConfigFields",
+            "utils/runtimeCapabilityHint"
+          ],
+          "fixture": "packages/web/visual-testing/RuntimePickerHintCases.tsx#RuntimePickerHintsCase",
+          "path": "packages/web/visual-testing/RuntimePickerHintCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#triage:#524. As components.agent.runtime-picker.hints, with Qoder chosen, so the list opens scrolled to the end."
+    },
+    {
+      "id": "components.agent.runtime-picker.hints-selected",
+      "title": "Runtime picker: Cursor CLI chosen, what it lacks in Raft under the select",
+      "captureType": "component-fixture",
+      "surface": "agent-runtime-picker",
+      "category": "app/agent",
+      "fixture": "packages/web/visual-testing/RuntimePickerHintCases.tsx#RuntimePickerHintsCase",
+      "viewport": {
+        "width": 480,
+        "height": 560,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "closed-cursor",
+          "name": "The closed runtime field with Cursor CLI chosen: its hint is the field's description",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.agent.runtime-picker.hints-selected']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/agent/RuntimeConfigFields.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agent/RuntimeConfigFields",
+            "utils/runtimeCapabilityHint"
+          ],
+          "fixture": "packages/web/visual-testing/RuntimePickerHintCases.tsx#RuntimePickerHintsCase",
+          "path": "packages/web/visual-testing/RuntimePickerHintCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "#triage:#524. React only, no baseline or parity gate. The runtime field of Create agent and Edit runtime config with Cursor CLI chosen and the list closed: under the select, in the field's description slot (the trigger's aria-describedby), the muted hint saying what Cursor lacks in Raft, from the shared RUNTIME_RAFT_CAPABILITIES. Claude Code, Codex and Kimi Code have no hint."
+    },
+    {
       "id": "screens.shell.open-in-app.desktop-used",
       "title": "Open in Raft Desktop: the account used the app lately",
       "captureType": "real-screen",
@@ -6401,6 +5980,376 @@
         "ignoreAntialiasing": true
       },
       "notes": "React only, no baseline or parity gate. The real MainLayout, opened fresh so the app's own boot capture records a landing from outside, with deep_links_v1 seeded on: the open-in-app offer in the strip across the window, under the top bar (ShellFrame topStrip). A computer on the Computers page with no sign of Raft Desktop: \"Don't have it yet?\" and this computer's download as a text link."
+    },
+    {
+      "id": "screens.guest.rail.channel",
+      "title": "Guest rail: in its channel, Chat selected",
+      "captureType": "real-screen",
+      "surface": "shell",
+      "category": "app/shell",
+      "fixture": "packages/web/visual-testing/GuestSavedCases.tsx#prime",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Guest rail: in its channel, Chat selected",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.guest.rail.channel']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/components/layout/LeftRail.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout",
+            "components/layout/LeftRail"
+          ],
+          "path": "packages/web/visual-testing/GuestSavedCases.tsx",
+          "fixture": "packages/web/visual-testing/GuestSavedCases.tsx#prime"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate (#triage:#551). The real MainLayout as a Guest of the fixture server (role guest), bound to its one channel (channel-home): no navigation sidebar. The harness serves no message loads, so the channel shows its loading rows. Desktop, light. The rail's tabs (Search, Chat, Activity, Tasks; no Members, Computers or Apps), then the Guest's Saved entry after the sortable group and above the footer (Bell, Help, Settings). Chat is selected; Saved is not."
+    },
+    {
+      "id": "screens.guest.rail.channel.dark",
+      "title": "Guest rail: in its channel, Chat selected (dark)",
+      "captureType": "real-screen",
+      "surface": "shell",
+      "category": "app/shell",
+      "fixture": "packages/web/visual-testing/GuestSavedCases.tsx#prime",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 1
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Guest rail: in its channel, Chat selected (dark)",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.guest.rail.channel.dark']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/components/layout/LeftRail.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout",
+            "components/layout/LeftRail"
+          ],
+          "path": "packages/web/visual-testing/GuestSavedCases.tsx",
+          "fixture": "packages/web/visual-testing/GuestSavedCases.tsx#prime"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate (#triage:#551). The real MainLayout as a Guest of the fixture server (role guest), bound to its one channel (channel-home): no navigation sidebar. The harness serves no message loads, so the channel shows its loading rows. Desktop, dark. As screens.guest.rail.channel."
+    },
+    {
+      "id": "screens.guest.rail.saved",
+      "title": "Guest rail: on its Saved page, Saved selected",
+      "captureType": "real-screen",
+      "surface": "shell",
+      "category": "app/shell",
+      "fixture": "packages/web/visual-testing/GuestSavedCases.tsx#prime",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Guest rail: on its Saved page, Saved selected",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.guest.rail.saved']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/components/layout/LeftRail.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout",
+            "components/layout/LeftRail"
+          ],
+          "path": "packages/web/visual-testing/GuestSavedCases.tsx",
+          "fixture": "packages/web/visual-testing/GuestSavedCases.tsx#prime"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate (#triage:#551). The real MainLayout as a Guest of the fixture server (role guest), bound to its one channel (channel-home): no navigation sidebar. The harness serves no message loads, so the channel shows its loading rows. Desktop, light. /saved: the Saved rail entry selected (Chat not), and the Saved page (SavedPanel) full width beside the rail, no sidebar, with the shared savedMessagesFixture.json rows."
+    },
+    {
+      "id": "screens.guest.rail.saved.dark",
+      "title": "Guest rail: on its Saved page, Saved selected (dark)",
+      "captureType": "real-screen",
+      "surface": "shell",
+      "category": "app/shell",
+      "fixture": "packages/web/visual-testing/GuestSavedCases.tsx#prime",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 1
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Guest rail: on its Saved page, Saved selected (dark)",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.guest.rail.saved.dark']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/components/layout/LeftRail.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout",
+            "components/layout/LeftRail"
+          ],
+          "path": "packages/web/visual-testing/GuestSavedCases.tsx",
+          "fixture": "packages/web/visual-testing/GuestSavedCases.tsx#prime"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate (#triage:#551). The real MainLayout as a Guest of the fixture server (role guest), bound to its one channel (channel-home): no navigation sidebar. The harness serves no message loads, so the channel shows its loading rows. Desktop, dark. As screens.guest.rail.saved."
+    },
+    {
+      "id": "screens.guest.saved.empty",
+      "title": "Guest Saved page: nothing saved",
+      "captureType": "real-screen",
+      "surface": "shell",
+      "category": "app/shell",
+      "fixture": "packages/web/visual-testing/GuestSavedCases.tsx#prime",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Guest Saved page: nothing saved",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.guest.saved.empty']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/components/saved/SavedPanel.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout",
+            "components/saved/SavedPanel"
+          ],
+          "path": "packages/web/visual-testing/GuestSavedCases.tsx",
+          "fixture": "packages/web/visual-testing/GuestSavedCases.tsx#prime"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate (#triage:#551). The real MainLayout as a Guest of the fixture server (role guest), bound to its one channel (channel-home): no navigation sidebar. The harness serves no message loads, so the channel shows its loading rows. Desktop, light. /saved with nothing saved (the spec answers /api/channels/saved empty): SavedPanel's empty state, whose copy names the bookmark icon, not a sidebar. Saved selected on the rail."
+    },
+    {
+      "id": "screens.guest.phone.server-tab",
+      "title": "Guest phone: server tab popover with Saved",
+      "captureType": "real-screen",
+      "surface": "shell",
+      "category": "app/shell",
+      "fixture": "packages/web/visual-testing/GuestSavedCases.tsx#prime",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Guest phone: server tab popover with Saved",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.guest.phone.server-tab']",
+        "crop": "element",
+        "contract": "viewport-with-portal",
+        "interactions": [
+          {
+            "type": "click",
+            "target": "[data-testid='mobile-tab-server']"
+          },
+          {
+            "type": "wait",
+            "ms": 400
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/components/layout/MobileServerTab.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout",
+            "components/layout/MobileServerTab"
+          ],
+          "path": "packages/web/visual-testing/GuestSavedCases.tsx",
+          "fixture": "packages/web/visual-testing/GuestSavedCases.tsx#prime"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate (#triage:#551). The real MainLayout as a Guest of the fixture server (role guest), bound to its one channel (channel-home): no navigation sidebar. The harness serves no message loads, so the channel shows its loading rows. Phone, light. The Guest's Home (its channel) with the tab bar; the case clicks the server tab, opening its popover: the server list, the footer actions, then the server's pages for a Guest: Saved and Settings (no Members, Computers or Apps)."
+    },
+    {
+      "id": "screens.guest.phone.saved",
+      "title": "Guest phone: Saved page",
+      "captureType": "real-screen",
+      "surface": "shell",
+      "category": "app/shell",
+      "fixture": "packages/web/visual-testing/GuestSavedCases.tsx#prime",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Guest phone: Saved page",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.guest.phone.saved']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/components/saved/SavedPanel.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout",
+            "components/saved/SavedPanel"
+          ],
+          "path": "packages/web/visual-testing/GuestSavedCases.tsx",
+          "fixture": "packages/web/visual-testing/GuestSavedCases.tsx#prime"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate (#triage:#551). The real MainLayout as a Guest of the fixture server (role guest), bound to its one channel (channel-home): no navigation sidebar. The harness serves no message loads, so the channel shows its loading rows. Phone, light. /saved as a pushed page: a paper head with Back, no tab bar, the shared savedMessagesFixture.json rows."
+    },
+    {
+      "id": "screens.guest.phone.saved.empty",
+      "title": "Guest phone: Saved page, nothing saved",
+      "captureType": "real-screen",
+      "surface": "shell",
+      "category": "app/shell",
+      "fixture": "packages/web/visual-testing/GuestSavedCases.tsx#prime",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Guest phone: Saved page, nothing saved",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.guest.phone.saved.empty']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/components/saved/SavedPanel.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout",
+            "components/saved/SavedPanel"
+          ],
+          "path": "packages/web/visual-testing/GuestSavedCases.tsx",
+          "fixture": "packages/web/visual-testing/GuestSavedCases.tsx#prime"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate (#triage:#551). The real MainLayout as a Guest of the fixture server (role guest), bound to its one channel (channel-home): no navigation sidebar. The harness serves no message loads, so the channel shows its loading rows. Phone, light. /saved as a pushed page with nothing saved: SavedPanel's empty state, whose copy names the bookmark icon, not a sidebar."
     },
     {
       "id": "screens.computers.rack.needs-attention",
@@ -6597,6 +6546,2661 @@
         "ignoreAntialiasing": true
       },
       "notes": "React only, no baseline or parity gate (#proj-raft-computer:#68). The real MainLayout at /s/visual/computers: the desktop Computers rail (sidebar Computer rows) and the Computers page, over the fixture's own fleet whose machine-list `attention` and `readiness` are composed by the shared composeReadinessAttention / composeReadiness from readiness facts and trimmed for the viewer, as the server does. The fleet of needs-attention.single seen by an ordinary member, who may not see the reason on Olive's Computers: 'Needs attention on elm-studio · 2 agents · Olive can verify the account', no action link."
+    },
+    {
+      "id": "screens.agent-migration-log.table",
+      "title": "Migration log: table view",
+      "captureType": "real-screen",
+      "surface": "agent-migration-log",
+      "category": "app/agents",
+      "fixture": "packages/web/visual-testing/MigrationLogCases.tsx#LOG",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Migration log: table view",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.agent-migration-log.table']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/components/agentMigration/log/MigrationLogTable.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout",
+            "components/agentMigration/log/MigrationLogPage",
+            "components/agentMigration/log/MigrationLogTable"
+          ],
+          "path": "packages/web/visual-testing/MigrationLogCases.tsx",
+          "fixture": "packages/web/visual-testing/MigrationLogCases.tsx#LOG"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate. The real MainLayout at /s/visual/migrations as the server's owner: the agent migration log (迁移记录) over the fixture's own log, which api.get answers: eight moves of three agents (succeeded, a failure, a cancel, one in progress, a move to the cloud), a computer renamed since (studio-mac, now mac-studio-2) and one no longer on the server (old-runner). Opened with ?view=table: the Chart / Table switch on Table, the search field in the filter row, one row per move, newest first (time, agent, from → to, result, duration)."
+    },
+    {
+      "id": "screens.agent-migration-log.chart",
+      "title": "Migration log: chart view",
+      "captureType": "real-screen",
+      "surface": "agent-migration-log",
+      "category": "app/agents",
+      "fixture": "packages/web/visual-testing/MigrationLogCases.tsx#LOG",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Migration log: chart view",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.agent-migration-log.chart']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/components/agentMigration/log/MigrationChord.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout",
+            "components/agentMigration/log/MigrationLogPage",
+            "components/agentMigration/log/MigrationChord"
+          ],
+          "path": "packages/web/visual-testing/MigrationLogCases.tsx",
+          "fixture": "packages/web/visual-testing/MigrationLogCases.tsx#LOG"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate. The real MainLayout at /s/visual/migrations as the server's owner: the agent migration log (迁移记录) over the fixture's own log, which api.get answers: eight moves of three agents (succeeded, a failure, a cancel, one in progress, a move to the cloud), a computer renamed since (studio-mac, now mac-studio-2) and one no longer on the server (old-runner). The same log in the default chart view (the chord chart, its side hint and legend), for comparison with screens.agent-migration-log.table."
+    },
+    {
+      "id": "components.file-viewer.header",
+      "title": "File viewer header: name, gallery count and actions",
+      "captureType": "component-fixture",
+      "surface": "file-viewer",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/FileViewerCases.tsx#HEADER_ROWS",
+      "viewport": {
+        "width": 1280,
+        "height": 400,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "File viewer header: single file, gallery with every action, long name in a gallery",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.file-viewer.header']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/components/FileViewerShell.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/FileViewerShell#FileViewerHeader"
+          ],
+          "fixture": "packages/web/visual-testing/FileViewerCases.tsx#HEADER_ROWS",
+          "path": "packages/web/visual-testing/FileViewerCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate (#triage:#537). The file viewer's header (FileViewerHeader) alone at 1280px, three rows each in a bordered box under its label, wrapped in [data-file-viewer-header-case]: a single file (gta@2x.png), a gallery (gta@2x.png, 2 / 5) with comments, copy, download and close, and a 207-character name in a gallery (1 / 3). The name block is only as wide as the name (flex-initial) and truncates; a min-w-0 flex-1 spacer after it keeps the count and the actions at the row's end."
+    },
+    {
+      "id": "components.apps.app-card.states",
+      "title": "App card: states (desktop)",
+      "captureType": "component-fixture",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppCardCases.tsx#APP_CARD_STATES",
+      "viewport": {
+        "width": 1280,
+        "height": 1000,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "all-states",
+          "name": "App card: normal, official, internal (made by), shared, long name and long description, updateNeedsApproval, signInExpired, cannotConnect, signInExpired for a member (no button), discover-add, discover-added, skeleton",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.apps.app-card.states']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/features/apps/AppCard.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/AppCard"
+          ],
+          "fixture": "packages/web/visual-testing/AppCardCases.tsx#APP_CARD_STATES",
+          "path": "packages/web/visual-testing/AppCardCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The redesigned App card (features/apps/AppCard.tsx) on fixture AppViews, with no page around it and not yet used by one. One sheet, because the React provider shoots one image per case (variants[0]); each card under its state's name, wrapped in [data-app-card-case]: normal, official, internal (made by), shared, long name and long description, updateNeedsApproval, signInExpired, cannotConnect, signInExpired for a member (no button), discover-add, discover-added, skeleton. Two columns in 960px, as the Apps page lays cards out on a desktop: the button sits at the card's end."
+    },
+    {
+      "id": "components.apps.app-card.states.dark",
+      "title": "App card: states (desktop, dark)",
+      "captureType": "component-fixture",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppCardCases.tsx#APP_CARD_STATES",
+      "viewport": {
+        "width": 1280,
+        "height": 1000,
+        "density": 1
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "all-states",
+          "name": "App card: normal, official, internal (made by), shared, long name and long description, updateNeedsApproval, signInExpired, cannotConnect, signInExpired for a member (no button), discover-add, discover-added, skeleton",
+          "props": {
+            "lang": "en",
+            "theme": "dark"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.apps.app-card.states.dark']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/features/apps/AppCard.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/AppCard"
+          ],
+          "fixture": "packages/web/visual-testing/AppCardCases.tsx#APP_CARD_STATES",
+          "path": "packages/web/visual-testing/AppCardCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "components.apps.app-card.states in the dark theme."
+    },
+    {
+      "id": "components.apps.app-card.narrow",
+      "title": "App card: states (360px)",
+      "captureType": "component-fixture",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppCardCases.tsx#APP_CARD_STATES",
+      "viewport": {
+        "width": 360,
+        "height": 2200,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "all-states",
+          "name": "App card: normal, official, internal (made by), shared, long name and long description, updateNeedsApproval, signInExpired, cannotConnect, signInExpired for a member (no button), discover-add, discover-added, skeleton",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.apps.app-card.narrow']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/features/apps/AppCard.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/AppCard"
+          ],
+          "fixture": "packages/web/visual-testing/AppCardCases.tsx#APP_CARD_STATES",
+          "path": "packages/web/visual-testing/AppCardCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The redesigned App card (features/apps/AppCard.tsx) on fixture AppViews, with no page around it and not yet used by one. One sheet, because the React provider shoots one image per case (variants[0]); each card under its state's name, wrapped in [data-app-card-case]: normal, official, internal (made by), shared, long name and long description, updateNeedsApproval, signInExpired, cannotConnect, signInExpired for a member (no button), discover-add, discover-added, skeleton. One column in a 360px window: each card is under 360px wide, so its button takes a line of its own under the text, and nothing overflows the card."
+    },
+    {
+      "id": "components.apps.app-card.narrow.dark",
+      "title": "App card: states (360px, dark)",
+      "captureType": "component-fixture",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppCardCases.tsx#APP_CARD_STATES",
+      "viewport": {
+        "width": 360,
+        "height": 2200,
+        "density": 2
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "all-states",
+          "name": "App card: normal, official, internal (made by), shared, long name and long description, updateNeedsApproval, signInExpired, cannotConnect, signInExpired for a member (no button), discover-add, discover-added, skeleton",
+          "props": {
+            "lang": "en",
+            "theme": "dark"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.apps.app-card.narrow.dark']",
+        "crop": "element",
+        "contract": "component-bounds"
+      },
+      "reactPathHint": "packages/web/src/features/apps/AppCard.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/AppCard"
+          ],
+          "fixture": "packages/web/visual-testing/AppCardCases.tsx#APP_CARD_STATES",
+          "path": "packages/web/visual-testing/AppCardCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "components.apps.app-card.narrow in the dark theme."
+    },
+    {
+      "id": "components.runtime-form.kitchen-sink.inputs",
+      "title": "Runtime Form - Kitchen Sink (inputs)",
+      "surface": "members",
+      "captureType": "component-fixture",
+      "fixture": "packages/runtime-form/fixtures/kitchen-sink-inputs.form.v3.json",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Kitchen sink, inputs",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.runtime-form.kitchen-sink.inputs']",
+        "crop": "element",
+        "contract": "component-bounds",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/components/agent/RuntimeConfigFields.tsx",
+      "androidCaseHint": "compose_runtime_form_visual",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agent/RuntimeConfigFields#RuntimeFormV2Fields"
+          ],
+          "path": "packages/web/visual-testing/RuntimeFormCases.tsx",
+          "fixture": "packages/runtime-form/fixtures/kitchen-sink-inputs.form.v3.json"
+        },
+        "android": {
+          "status": "pending",
+          "components": [
+            "build.raft.app.RuntimeFormV2Fields"
+          ],
+          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/RuntimeFormVisualFixture.kt",
+          "fixture": "compose_runtime_form_visual"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Generated (packages/runtime-form/kitchen-sink/generate.ts), one page of the kitchen sink: v3 create form rows for every field kind of the protocol (RUNTIME_FORM_V2_FIELD_KINDS) in each state, cut into pages that fit the 2700 dp full-length cap. This page: text, secret, URL, switch, key/value and number rows: empty, filled, required-missing, invalid URL, a hint with a link, shown / hidden / required by a v3 rule (on the switch), the Advanced group (open: it holds values), and number fields (the protocol's unsupported kind: optional is skipped, required blocks saving). Rendered by the production field renderer from the fixtures (values from kitchen-sink-inputs.state.v3.json, validation errors shown), no API; mobile renders the same files. A new field kind fails src/kitchenSink.test.ts until it has rows."
+    },
+    {
+      "id": "components.runtime-form.kitchen-sink.choices",
+      "title": "Runtime Form - Kitchen Sink (choices)",
+      "surface": "members",
+      "captureType": "component-fixture",
+      "fixture": "packages/runtime-form/fixtures/kitchen-sink-choices.form.v3.json",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Kitchen sink, choices",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.runtime-form.kitchen-sink.choices']",
+        "crop": "element",
+        "contract": "component-bounds",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/components/agent/RuntimeConfigFields.tsx",
+      "androidCaseHint": "compose_runtime_form_visual",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agent/RuntimeConfigFields#RuntimeFormV2Fields"
+          ],
+          "path": "packages/web/visual-testing/RuntimeFormCases.tsx",
+          "fixture": "packages/runtime-form/fixtures/kitchen-sink-choices.form.v3.json"
+        },
+        "android": {
+          "status": "pending",
+          "components": [
+            "build.raft.app.RuntimeFormV2Fields"
+          ],
+          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/RuntimeFormVisualFixture.kt",
+          "fixture": "compose_runtime_form_visual"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Generated (packages/runtime-form/kitchen-sink/generate.ts), one page of the kitchen sink: v3 create form rows for every field kind of the protocol (RUNTIME_FORM_V2_FIELD_KINDS) in each state, cut into pages that fit the 2700 dp full-length cap. This page: select and dependent select rows: empty, filled with choice labels, required-missing, value not listed, option source fallback / stale / unavailable with Retry / being retried (the per-source loading state) / unavailable and optional (hidden), a value no longer available, a typed custom value, dependent select list-only / combobox / typed-only / required / no list for the parent's value (hidden). Rendered by the production field renderer from the fixtures (values from kitchen-sink-choices.state.v3.json, validation errors shown), no API; mobile renders the same files. A new field kind fails src/kitchenSink.test.ts until it has rows."
+    },
+    {
+      "id": "components.runtime-form.create.builtin",
+      "title": "Runtime Form - Built-in create",
+      "surface": "members",
+      "captureType": "component-fixture",
+      "fixture": "packages/runtime-form/fixtures/builtin.form.v3.json",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Create form",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.runtime-form.create.builtin']",
+        "crop": "element",
+        "contract": "component-bounds",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/components/agent/RuntimeConfigFields.tsx",
+      "androidCaseHint": "compose_runtime_form_visual",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agent/RuntimeConfigFields#RuntimeFormV2Fields"
+          ],
+          "path": "packages/web/visual-testing/RuntimeFormCases.tsx",
+          "fixture": "packages/runtime-form/fixtures/builtin.form.v3.json"
+        },
+        "android": {
+          "status": "pending",
+          "components": [
+            "build.raft.app.RuntimeFormV2Fields"
+          ],
+          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/RuntimeFormVisualFixture.kt",
+          "fixture": "compose_runtime_form_visual"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Built-in's real v3 create form as the server sends it (fixtures/builtin.form.v3.json) with the server's option source fixtures listed in fixtures/visual-cases.v3.json, at its initial values plus any the case sets (REAL_FORM_VISUAL_VALUES in packages/runtime-form/src/kitchenSink.ts, so fields drawn only after a choice are in the capture; the test fails when a field is neither drawn nor listed hidden with a reason); rendered by the production field renderer, no API. Mobile renders the same files."
+    },
+    {
+      "id": "components.runtime-form.create.claude",
+      "title": "Runtime Form - Claude Code create",
+      "surface": "members",
+      "captureType": "component-fixture",
+      "fixture": "packages/runtime-form/fixtures/claude.form.v3.json",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Create form",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.runtime-form.create.claude']",
+        "crop": "element",
+        "contract": "component-bounds",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/components/agent/RuntimeConfigFields.tsx",
+      "androidCaseHint": "compose_runtime_form_visual",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agent/RuntimeConfigFields#RuntimeFormV2Fields"
+          ],
+          "path": "packages/web/visual-testing/RuntimeFormCases.tsx",
+          "fixture": "packages/runtime-form/fixtures/claude.form.v3.json"
+        },
+        "android": {
+          "status": "pending",
+          "components": [
+            "build.raft.app.RuntimeFormV2Fields"
+          ],
+          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/RuntimeFormVisualFixture.kt",
+          "fixture": "compose_runtime_form_visual"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Claude Code's real v3 create form as the server sends it (fixtures/claude.form.v3.json) with the server's option source fixtures listed in fixtures/visual-cases.v3.json, at its initial values plus any the case sets (REAL_FORM_VISUAL_VALUES in packages/runtime-form/src/kitchenSink.ts, so fields drawn only after a choice are in the capture; the test fails when a field is neither drawn nor listed hidden with a reason); rendered by the production field renderer, no API. Mobile renders the same files."
+    },
+    {
+      "id": "components.runtime-form.create.codex",
+      "title": "Runtime Form - Codex create",
+      "surface": "members",
+      "captureType": "component-fixture",
+      "fixture": "packages/runtime-form/fixtures/codex.form.v3.json",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Create form",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.runtime-form.create.codex']",
+        "crop": "element",
+        "contract": "component-bounds",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/components/agent/RuntimeConfigFields.tsx",
+      "androidCaseHint": "compose_runtime_form_visual",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agent/RuntimeConfigFields#RuntimeFormV2Fields"
+          ],
+          "path": "packages/web/visual-testing/RuntimeFormCases.tsx",
+          "fixture": "packages/runtime-form/fixtures/codex.form.v3.json"
+        },
+        "android": {
+          "status": "pending",
+          "components": [
+            "build.raft.app.RuntimeFormV2Fields"
+          ],
+          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/RuntimeFormVisualFixture.kt",
+          "fixture": "compose_runtime_form_visual"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Codex's real v3 create form as the server sends it (fixtures/codex.form.v3.json) with the server's option source fixtures listed in fixtures/visual-cases.v3.json, at its initial values plus any the case sets (REAL_FORM_VISUAL_VALUES in packages/runtime-form/src/kitchenSink.ts, so fields drawn only after a choice are in the capture; the test fails when a field is neither drawn nor listed hidden with a reason); rendered by the production field renderer, no API. Mobile renders the same files."
+    },
+    {
+      "id": "components.runtime-form.create.grok",
+      "title": "Runtime Form - Grok create",
+      "surface": "members",
+      "captureType": "component-fixture",
+      "fixture": "packages/runtime-form/fixtures/grok.form.v3.json",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Create form",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.runtime-form.create.grok']",
+        "crop": "element",
+        "contract": "component-bounds",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/components/agent/RuntimeConfigFields.tsx",
+      "androidCaseHint": "compose_runtime_form_visual",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agent/RuntimeConfigFields#RuntimeFormV2Fields"
+          ],
+          "path": "packages/web/visual-testing/RuntimeFormCases.tsx",
+          "fixture": "packages/runtime-form/fixtures/grok.form.v3.json"
+        },
+        "android": {
+          "status": "pending",
+          "components": [
+            "build.raft.app.RuntimeFormV2Fields"
+          ],
+          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/RuntimeFormVisualFixture.kt",
+          "fixture": "compose_runtime_form_visual"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Grok's real v3 create form as the server sends it (fixtures/grok.form.v3.json) with the server's option source fixtures listed in fixtures/visual-cases.v3.json, at its initial values plus any the case sets (REAL_FORM_VISUAL_VALUES in packages/runtime-form/src/kitchenSink.ts, so fields drawn only after a choice are in the capture; the test fails when a field is neither drawn nor listed hidden with a reason); rendered by the production field renderer, no API. Mobile renders the same files."
+    },
+    {
+      "id": "components.runtime-form.create.kimi-sdk",
+      "title": "Runtime Form - Kimi Code create",
+      "surface": "members",
+      "captureType": "component-fixture",
+      "fixture": "packages/runtime-form/fixtures/kimi-sdk.form.v3.json",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Create form",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.runtime-form.create.kimi-sdk']",
+        "crop": "element",
+        "contract": "component-bounds",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/components/agent/RuntimeConfigFields.tsx",
+      "androidCaseHint": "compose_runtime_form_visual",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agent/RuntimeConfigFields#RuntimeFormV2Fields"
+          ],
+          "path": "packages/web/visual-testing/RuntimeFormCases.tsx",
+          "fixture": "packages/runtime-form/fixtures/kimi-sdk.form.v3.json"
+        },
+        "android": {
+          "status": "pending",
+          "components": [
+            "build.raft.app.RuntimeFormV2Fields"
+          ],
+          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/RuntimeFormVisualFixture.kt",
+          "fixture": "compose_runtime_form_visual"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Kimi Code's real v3 create form as the server sends it (fixtures/kimi-sdk.form.v3.json) with the server's option source fixtures listed in fixtures/visual-cases.v3.json, at its initial values plus any the case sets (REAL_FORM_VISUAL_VALUES in packages/runtime-form/src/kitchenSink.ts, so fields drawn only after a choice are in the capture; the test fails when a field is neither drawn nor listed hidden with a reason); rendered by the production field renderer, no API. Mobile renders the same files."
+    },
+    {
+      "id": "components.runtime-form.create.pi",
+      "title": "Runtime Form - Pi create",
+      "surface": "members",
+      "captureType": "component-fixture",
+      "fixture": "packages/runtime-form/fixtures/pi.form.v3.json",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Create form",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.runtime-form.create.pi']",
+        "crop": "element",
+        "contract": "component-bounds",
+        "fullLength": true
+      },
+      "reactPathHint": "packages/web/src/components/agent/RuntimeConfigFields.tsx",
+      "androidCaseHint": "compose_runtime_form_visual",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/agent/RuntimeConfigFields#RuntimeFormV2Fields"
+          ],
+          "path": "packages/web/visual-testing/RuntimeFormCases.tsx",
+          "fixture": "packages/runtime-form/fixtures/pi.form.v3.json"
+        },
+        "android": {
+          "status": "pending",
+          "components": [
+            "build.raft.app.RuntimeFormV2Fields"
+          ],
+          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/RuntimeFormVisualFixture.kt",
+          "fixture": "compose_runtime_form_visual"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Pi's real v3 create form as the server sends it (fixtures/pi.form.v3.json) with the server's option source fixtures listed in fixtures/visual-cases.v3.json, at its initial values plus any the case sets (REAL_FORM_VISUAL_VALUES in packages/runtime-form/src/kitchenSink.ts, so fields drawn only after a choice are in the capture; the test fails when a field is neither drawn nor listed hidden with a reason); rendered by the production field renderer, no API. Mobile renders the same files."
+    },
+    {
+      "id": "screens.apps.yours.admin",
+      "title": "Apps page, Yours: an owner with a mix of Apps (desktop)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 1280,
+        "height": 900,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Yours: an owner with a mix of Apps (desktop)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.yours.admin']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/YoursAppsList",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsYoursCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsYoursCases.tsx stubs api.get). Viewer is the Server's owner. Nine Apps under Yours, the one whose update waits first (Figma: 'Update needs your approval' in place of its source line, the attention dot on its logo, Review as its button), then today's order: Raft's own App (Stamp, Official), Linear, a private share (Ledger, 'Shared with you'), an App with a long name, description and publisher, an App built and installed here (Deploy bot, 'Internal · made by artin': its maker is among the Server's people), a listed service (Notion, 'Listed by Raft'), one connected by its address (Team wiki, 'Internal') and an App built here and not installed (Draft tool, 'Internal' alone: its maker left the Server). The notice above the list counts the waiting update. Toolbar: Yours 9 / Discover 24, the search, the origin filter showing All, Add app; no view switch (Apps are cards only). No card names an App type or shows an address. At 1280px: two columns of cards."
+    },
+    {
+      "id": "screens.apps.yours.admin.dark",
+      "title": "Apps page, Yours: an owner with a mix of Apps (desktop, dark)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 1280,
+        "height": 900,
+        "density": 1
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Yours: an owner with a mix of Apps (desktop, dark)",
+          "props": {
+            "lang": "en",
+            "theme": "dark"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.yours.admin.dark']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/YoursAppsList",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsYoursCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "screens.apps.yours.admin in the dark theme."
+    },
+    {
+      "id": "screens.apps.yours.admin.narrow",
+      "title": "Apps page, Yours: an owner with a mix of Apps (360px)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 360,
+        "height": 1500,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Yours: an owner with a mix of Apps (360px)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.yours.admin.narrow']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/YoursAppsList",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsYoursCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsYoursCases.tsx stubs api.get). Viewer is the Server's owner. Nine Apps under Yours, the one whose update waits first (Figma: 'Update needs your approval' in place of its source line, the attention dot on its logo, Review as its button), then today's order: Raft's own App (Stamp, Official), Linear, a private share (Ledger, 'Shared with you'), an App with a long name, description and publisher, an App built and installed here (Deploy bot, 'Internal · made by artin': its maker is among the Server's people), a listed service (Notion, 'Listed by Raft'), one connected by its address (Team wiki, 'Internal') and an App built here and not installed (Draft tool, 'Internal' alone: its maker left the Server). The notice above the list counts the waiting update. Toolbar: Yours 9 / Discover 24, the search, the origin filter showing All, Add app; no view switch (Apps are cards only). No card names an App type or shows an address. In a 360px window: one column of cards, the toolbar on its narrow steps (the scope as a Select, Add app as +), nothing wider than the window."
+    },
+    {
+      "id": "screens.apps.yours.admin.narrow.dark",
+      "title": "Apps page, Yours: an owner with a mix of Apps (360px, dark)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 360,
+        "height": 1500,
+        "density": 2
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Yours: an owner with a mix of Apps (360px, dark)",
+          "props": {
+            "lang": "en",
+            "theme": "dark"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.yours.admin.narrow.dark']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/YoursAppsList",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsYoursCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "screens.apps.yours.admin.narrow in the dark theme."
+    },
+    {
+      "id": "screens.apps.yours.member",
+      "title": "Apps page, Yours: a member, read-only (desktop)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 1280,
+        "height": 900,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Yours: a member, read-only (desktop)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.yours.member']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/YoursAppsList",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsYoursCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsYoursCases.tsx stubs api.get). The same Server read by a member: Yours alone with no scope switch (members have no Discover, R15), the line that says who can change Apps, no Add app, no state and no button on any card (the server marks what waits for App managers only), the Apps in today's order. An App built here names its maker for a member too (Deploy bot, 'Internal · made by artin'; Draft tool, whose maker left, 'Internal'). The notice still tells a member that an update waits for an owner or admin. At 1280px: two columns of cards."
+    },
+    {
+      "id": "screens.apps.yours.member.dark",
+      "title": "Apps page, Yours: a member, read-only (desktop, dark)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 1280,
+        "height": 900,
+        "density": 1
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Yours: a member, read-only (desktop, dark)",
+          "props": {
+            "lang": "en",
+            "theme": "dark"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.yours.member.dark']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/YoursAppsList",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsYoursCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "screens.apps.yours.member in the dark theme."
+    },
+    {
+      "id": "screens.apps.yours.member.narrow",
+      "title": "Apps page, Yours: a member, read-only (360px)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 360,
+        "height": 1500,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Yours: a member, read-only (360px)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.yours.member.narrow']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/YoursAppsList",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsYoursCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsYoursCases.tsx stubs api.get). The same Server read by a member: Yours alone with no scope switch (members have no Discover, R15), the line that says who can change Apps, no Add app, no state and no button on any card (the server marks what waits for App managers only), the Apps in today's order. An App built here names its maker for a member too (Deploy bot, 'Internal · made by artin'; Draft tool, whose maker left, 'Internal'). The notice still tells a member that an update waits for an owner or admin. In a 360px window: one column of cards, the toolbar on its narrow steps (no scope and no Add app for a member), nothing wider than the window."
+    },
+    {
+      "id": "screens.apps.yours.member.narrow.dark",
+      "title": "Apps page, Yours: a member, read-only (360px, dark)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 360,
+        "height": 1500,
+        "density": 2
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Yours: a member, read-only (360px, dark)",
+          "props": {
+            "lang": "en",
+            "theme": "dark"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.yours.member.narrow.dark']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/YoursAppsList",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsYoursCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "screens.apps.yours.member.narrow in the dark theme."
+    },
+    {
+      "id": "screens.apps.yours.no-match",
+      "title": "Apps page, Yours: filters that match nothing (desktop)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 1280,
+        "height": 900,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Yours: filters that match nothing (desktop)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.yours.no-match']",
+        "crop": "element",
+        "contract": "viewport-with-portal",
+        "interactions": [
+          {
+            "type": "fill",
+            "target": "[data-testid='connected-apps-search']",
+            "value": "calendar"
+          },
+          {
+            "type": "click",
+            "target": "[data-testid='apps-filter-origin']"
+          },
+          {
+            "type": "click",
+            "target": "[data-testid='apps-filter-origin-shared']"
+          },
+          {
+            "type": "wait",
+            "ms": 400
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/YoursAppsList",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsYoursCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsYoursCases.tsx stubs api.get). The owner's list, then the case's interactions type 'calendar' into the search and pick Shared with you in the origin filter (the page takes no starting filters): no card; the empty state names both conditions and offers Clear all. The origin filter is filled (applied) and Clear all ends the filters. At 1280px: two columns of cards."
+    },
+    {
+      "id": "screens.apps.yours.no-match.dark",
+      "title": "Apps page, Yours: filters that match nothing (desktop, dark)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 1280,
+        "height": 900,
+        "density": 1
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Yours: filters that match nothing (desktop, dark)",
+          "props": {
+            "lang": "en",
+            "theme": "dark"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.yours.no-match.dark']",
+        "crop": "element",
+        "contract": "viewport-with-portal",
+        "interactions": [
+          {
+            "type": "fill",
+            "target": "[data-testid='connected-apps-search']",
+            "value": "calendar"
+          },
+          {
+            "type": "click",
+            "target": "[data-testid='apps-filter-origin']"
+          },
+          {
+            "type": "click",
+            "target": "[data-testid='apps-filter-origin-shared']"
+          },
+          {
+            "type": "wait",
+            "ms": 400
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/YoursAppsList",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsYoursCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "screens.apps.yours.no-match in the dark theme."
+    },
+    {
+      "id": "screens.apps.yours.no-match.narrow",
+      "title": "Apps page, Yours: filters that match nothing (360px)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 360,
+        "height": 1500,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Yours: filters that match nothing (360px)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.yours.no-match.narrow']",
+        "crop": "element",
+        "contract": "viewport-with-portal",
+        "interactions": [
+          {
+            "type": "fill",
+            "target": "[data-testid='connected-apps-search']",
+            "value": "calendar"
+          },
+          {
+            "type": "click",
+            "target": "[data-testid='apps-filter-origin']"
+          },
+          {
+            "type": "click",
+            "target": "[data-testid='apps-filter-origin-shared']"
+          },
+          {
+            "type": "wait",
+            "ms": 400
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/YoursAppsList",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsYoursCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsYoursCases.tsx stubs api.get). The owner's list, then the case's interactions type 'calendar' into the search and pick Shared with you in the origin filter (the page takes no starting filters): no card; the empty state names both conditions and offers Clear all. The origin filter is filled (applied) and Clear all ends the filters. In a 360px window: one column of cards, the toolbar on its narrow steps (the scope as a Select, Add app as +), nothing wider than the window."
+    },
+    {
+      "id": "screens.apps.yours.no-match.narrow.dark",
+      "title": "Apps page, Yours: filters that match nothing (360px, dark)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 360,
+        "height": 1500,
+        "density": 2
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Yours: filters that match nothing (360px, dark)",
+          "props": {
+            "lang": "en",
+            "theme": "dark"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.yours.no-match.narrow.dark']",
+        "crop": "element",
+        "contract": "viewport-with-portal",
+        "interactions": [
+          {
+            "type": "fill",
+            "target": "[data-testid='connected-apps-search']",
+            "value": "calendar"
+          },
+          {
+            "type": "click",
+            "target": "[data-testid='apps-filter-origin']"
+          },
+          {
+            "type": "click",
+            "target": "[data-testid='apps-filter-origin-shared']"
+          },
+          {
+            "type": "wait",
+            "ms": 400
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/YoursAppsList",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsYoursCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsYoursCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "screens.apps.yours.no-match.narrow in the dark theme."
+    },
+    {
+      "id": "screens.apps.discover.admin",
+      "title": "Apps page, Discover: an owner (desktop)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 1280,
+        "height": 900,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Discover: an owner (desktop)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.discover.admin']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/DiscoverAppsList",
+            "components/apps/AppsRecommendedSection",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsDiscoverCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsDiscoverCases.tsx stubs api.get); the page opens from its address with ?tab=discover. Discover: 'Recommended for {server}' on top with Stamp (Raft's, Official, not added: Add; no line saying why), then 'All apps': Stamp, Tracker (added), Notion (a connected service, added), Linear (a connected service, not added), Retro Board (a Raft App, not added), Postgres (a connected service with no maker named: 'Listed by Raft'), and an App with a long name, description and publisher. Every card is the same AppCard as Yours, its Discover variant: who makes it and how widely it is used, then Add or Added; no state, no App type, no address. Toolbar: Yours 2 / Discover 7, the search, one filter (Category, showing All categories); no Type, no Sort. Viewer is the Server's owner: Add on what isn't added, Added on Tracker and Notion; Add app ends the toolbar. At 1280px: two columns of cards."
+    },
+    {
+      "id": "screens.apps.discover.admin.dark",
+      "title": "Apps page, Discover: an owner (desktop, dark)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 1280,
+        "height": 900,
+        "density": 1
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Discover: an owner (desktop, dark)",
+          "props": {
+            "lang": "en",
+            "theme": "dark"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.discover.admin.dark']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/DiscoverAppsList",
+            "components/apps/AppsRecommendedSection",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsDiscoverCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsDiscoverCases.tsx stubs api.get); the page opens from its address with ?tab=discover. Discover: 'Recommended for {server}' on top with Stamp (Raft's, Official, not added: Add; no line saying why), then 'All apps': Stamp, Tracker (added), Notion (a connected service, added), Linear (a connected service, not added), Retro Board (a Raft App, not added), Postgres (a connected service with no maker named: 'Listed by Raft'), and an App with a long name, description and publisher. Every card is the same AppCard as Yours, its Discover variant: who makes it and how widely it is used, then Add or Added; no state, no App type, no address. Toolbar: Yours 2 / Discover 7, the search, one filter (Category, showing All categories); no Type, no Sort. Viewer is the Server's owner: Add on what isn't added, Added on Tracker and Notion; Add app ends the toolbar. At 1280px: two columns of cards."
+    },
+    {
+      "id": "screens.apps.discover.admin.narrow",
+      "title": "Apps page, Discover: an owner (360px)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 360,
+        "height": 1500,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Discover: an owner (360px)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.discover.admin.narrow']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/DiscoverAppsList",
+            "components/apps/AppsRecommendedSection",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsDiscoverCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsDiscoverCases.tsx stubs api.get); the page opens from its address with ?tab=discover. Discover: 'Recommended for {server}' on top with Stamp (Raft's, Official, not added: Add; no line saying why), then 'All apps': Stamp, Tracker (added), Notion (a connected service, added), Linear (a connected service, not added), Retro Board (a Raft App, not added), Postgres (a connected service with no maker named: 'Listed by Raft'), and an App with a long name, description and publisher. Every card is the same AppCard as Yours, its Discover variant: who makes it and how widely it is used, then Add or Added; no state, no App type, no address. Toolbar: Yours 2 / Discover 7, the search, one filter (Category, showing All categories); no Type, no Sort. Viewer is the Server's owner: Add on what isn't added, Added on Tracker and Notion; Add app ends the toolbar. In a 360px window: one column of cards, the toolbar on its narrow steps (the scope as a Select and Add app as + for the owner), nothing wider than the window."
+    },
+    {
+      "id": "screens.apps.discover.member-no-discover",
+      "title": "Apps page, Discover: a member has no Discover (desktop)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 1280,
+        "height": 900,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Discover: a member has no Discover (desktop)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.discover.member-no-discover']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/YoursAppsList",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsDiscoverCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsDiscoverCases.tsx stubs api.get); the page opens from its address with ?tab=discover. Viewer is a member following the same link: members have no Discover (R15), so the page shows Yours alone, read-only (Tracker, Notion), with no scope switch, no Add app and no Recommended; nothing of Discover is read. At 1280px: two columns of cards."
+    },
+    {
+      "id": "screens.apps.discover.member-no-discover.narrow",
+      "title": "Apps page, Discover: a member has no Discover (360px)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 360,
+        "height": 1500,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Discover: a member has no Discover (360px)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.discover.member-no-discover.narrow']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/YoursAppsList",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsDiscoverCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsDiscoverCases.tsx stubs api.get); the page opens from its address with ?tab=discover. Viewer is a member following the same link: members have no Discover (R15), so the page shows Yours alone, read-only (Tracker, Notion), with no scope switch, no Add app and no Recommended; nothing of Discover is read. In a 360px window: one column of cards, the toolbar on its narrow steps (the search and the Source filter; no scope, no Add app), nothing wider than the window."
+    },
+    {
+      "id": "screens.apps.discover.detail",
+      "title": "Apps page, Discover: an owner opened Retro Board, not added (desktop)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 1280,
+        "height": 900,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Discover: an owner opened Retro Board, not added (desktop)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.discover.detail']",
+        "crop": "element",
+        "contract": "viewport-with-portal",
+        "interactions": [
+          {
+            "type": "click",
+            "target": "[data-testid='apps-marketplace-row-app:visual-retro'] [data-app-card-open]"
+          },
+          {
+            "type": "wait",
+            "ms": 400
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/DiscoverAppsList",
+            "features/apps/MarketplaceListingDetail",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsDiscoverCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsDiscoverCases.tsx stubs api.get); the page opens from its address with ?tab=discover. Discover: 'Recommended for {server}' on top with Stamp (Raft's, Official, not added: Add; no line saying why), then 'All apps': Stamp, Tracker (added), Notion (a connected service, added), Linear (a connected service, not added), Retro Board (a Raft App, not added), Postgres (a connected service with no maker named: 'Listed by Raft'), and an App with a long name, description and publisher. Every card is the same AppCard as Yours, its Discover variant: who makes it and how widely it is used, then Add or Added; no state, no App type, no address. Toolbar: Yours 2 / Discover 7, the search, one filter (Category, showing All categories); no Type, no Sort. Viewer is the Server's owner; the case's interactions press Retro Board's card (not its Add): its details open in the same dialog as Yours' details, with Add at the head's top right before x (R41, the A2 example), and what adding approves further down. Close in the footer. At 1280px: two columns of cards."
+    },
+    {
+      "id": "screens.apps.discover.detail.narrow",
+      "title": "Apps page, Discover: an owner opened Retro Board, not added (360px)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 360,
+        "height": 1500,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Discover: an owner opened Retro Board, not added (360px)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.discover.detail.narrow']",
+        "crop": "element",
+        "contract": "viewport-with-portal",
+        "interactions": [
+          {
+            "type": "click",
+            "target": "[data-testid='apps-marketplace-row-app:visual-retro'] [data-app-card-open]"
+          },
+          {
+            "type": "wait",
+            "ms": 400
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/DiscoverAppsList",
+            "features/apps/MarketplaceListingDetail",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsDiscoverCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsDiscoverCases.tsx stubs api.get); the page opens from its address with ?tab=discover. Discover: 'Recommended for {server}' on top with Stamp (Raft's, Official, not added: Add; no line saying why), then 'All apps': Stamp, Tracker (added), Notion (a connected service, added), Linear (a connected service, not added), Retro Board (a Raft App, not added), Postgres (a connected service with no maker named: 'Listed by Raft'), and an App with a long name, description and publisher. Every card is the same AppCard as Yours, its Discover variant: who makes it and how widely it is used, then Add or Added; no state, no App type, no address. Toolbar: Yours 2 / Discover 7, the search, one filter (Category, showing All categories); no Type, no Sort. Viewer is the Server's owner; the case's interactions press Retro Board's card (not its Add): its details open in the same dialog as Yours' details, with Add at the head's top right before x (R41, the A2 example), and what adding approves further down. Close in the footer. In a 360px window: one column of cards, the toolbar on its narrow steps (the scope as a Select and Add app as + for the owner), nothing wider than the window."
+    },
+    {
+      "id": "screens.apps.discover.service-detail",
+      "title": "Apps page, Discover: an owner opened Linear, a connected service not added (desktop)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 1280,
+        "height": 900,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Discover: an owner opened Linear, a connected service not added (desktop)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.discover.service-detail']",
+        "crop": "element",
+        "contract": "viewport-with-portal",
+        "interactions": [
+          {
+            "type": "click",
+            "target": "[data-testid='apps-marketplace-row-mcp:visual-linear'] [data-app-card-open]"
+          },
+          {
+            "type": "wait",
+            "ms": 400
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/DiscoverAppsList",
+            "features/apps/DiscoverServiceDetail",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsDiscoverCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsDiscoverCases.tsx stubs api.get); the page opens from its address with ?tab=discover. Discover: 'Recommended for {server}' on top with Stamp (Raft's, Official, not added: Add; no line saying why), then 'All apps': Stamp, Tracker (added), Notion (a connected service, added), Linear (a connected service, not added), Retro Board (a Raft App, not added), Postgres (a connected service with no maker named: 'Listed by Raft'), and an App with a long name, description and publisher. Every card is the same AppCard as Yours, its Discover variant: who makes it and how widely it is used, then Add or Added; no state, no App type, no address. Toolbar: Yours 2 / Discover 7, the search, one filter (Category, showing All categories); no Type, no Sort. Viewer is the Server's owner; the case's interactions press Linear's card (not its Add): its details say what Raft's listing says (R40): 'By Linear' under the name, Add at the head's top right, About (its description) and Information (Developer, Listed by Raft, Website, Category). No Tools section (the service lists its tools only once someone signs in) and no Try asking (the listing has no examples). At 1280px: two columns of cards."
+    },
+    {
+      "id": "screens.apps.discover.service-detail.dark",
+      "title": "Apps page, Discover: an owner opened Linear, a connected service not added (desktop, dark)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 1280,
+        "height": 900,
+        "density": 1
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Discover: an owner opened Linear, a connected service not added (desktop, dark)",
+          "props": {
+            "lang": "en",
+            "theme": "dark"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.discover.service-detail.dark']",
+        "crop": "element",
+        "contract": "viewport-with-portal",
+        "interactions": [
+          {
+            "type": "click",
+            "target": "[data-testid='apps-marketplace-row-mcp:visual-linear'] [data-app-card-open]"
+          },
+          {
+            "type": "wait",
+            "ms": 400
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/DiscoverAppsList",
+            "features/apps/DiscoverServiceDetail",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsDiscoverCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsDiscoverCases.tsx stubs api.get); the page opens from its address with ?tab=discover. Discover: 'Recommended for {server}' on top with Stamp (Raft's, Official, not added: Add; no line saying why), then 'All apps': Stamp, Tracker (added), Notion (a connected service, added), Linear (a connected service, not added), Retro Board (a Raft App, not added), Postgres (a connected service with no maker named: 'Listed by Raft'), and an App with a long name, description and publisher. Every card is the same AppCard as Yours, its Discover variant: who makes it and how widely it is used, then Add or Added; no state, no App type, no address. Toolbar: Yours 2 / Discover 7, the search, one filter (Category, showing All categories); no Type, no Sort. Viewer is the Server's owner; the case's interactions press Linear's card (not its Add): its details say what Raft's listing says (R40): 'By Linear' under the name, Add at the head's top right, About (its description) and Information (Developer, Listed by Raft, Website, Category). No Tools section (the service lists its tools only once someone signs in) and no Try asking (the listing has no examples). At 1280px: two columns of cards."
+    },
+    {
+      "id": "screens.apps.discover.install-confirm",
+      "title": "Apps page, Discover: an owner pressed Retro Board's Add, its install confirmation (desktop)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 1280,
+        "height": 900,
+        "density": 1
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Discover: an owner pressed Retro Board's Add, its install confirmation (desktop)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.discover.install-confirm']",
+        "crop": "element",
+        "contract": "viewport-with-portal",
+        "interactions": [
+          {
+            "type": "click",
+            "target": "[data-testid='apps-marketplace-row-app:visual-retro'] [data-testid='app-card-add']"
+          },
+          {
+            "type": "wait",
+            "ms": 400
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/DiscoverAppsList",
+            "features/apps/MarketplaceInstallConfirm",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsDiscoverCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsDiscoverCases.tsx stubs api.get); the page opens from its address with ?tab=discover. Discover: 'Recommended for {server}' on top with Stamp (Raft's, Official, not added: Add; no line saying why), then 'All apps': Stamp, Tracker (added), Notion (a connected service, added), Linear (a connected service, not added), Retro Board (a Raft App, not added), Postgres (a connected service with no maker named: 'Listed by Raft'), and an App with a long name, description and publisher. Every card is the same AppCard as Yours, its Discover variant: who makes it and how widely it is used, then Add or Added; no state, no App type, no address. Toolbar: Yours 2 / Discover 7, the search, one filter (Category, showing All categories); no Type, no Sort. Viewer is the Server's owner; the case's interactions press Retro Board's Add on its card (not the card): its install confirmation opens (MarketplaceInstallConfirm), not its details: what installing approves (its permissions; Retro Board offers no bot, and with the agent-text consent flag off no agent text), then Cancel and Add. At 1280px: the dialog over two columns of cards."
+    },
+    {
+      "id": "screens.apps.discover.install-confirm.narrow",
+      "title": "Apps page, Discover: an owner pressed Retro Board's Add, its install confirmation (360px)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 360,
+        "height": 1500,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Discover: an owner pressed Retro Board's Add, its install confirmation (360px)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.discover.install-confirm.narrow']",
+        "crop": "element",
+        "contract": "viewport-with-portal",
+        "interactions": [
+          {
+            "type": "click",
+            "target": "[data-testid='apps-marketplace-row-app:visual-retro'] [data-testid='app-card-add']"
+          },
+          {
+            "type": "wait",
+            "ms": 400
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/DiscoverAppsList",
+            "features/apps/MarketplaceInstallConfirm",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsDiscoverCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsDiscoverCases.tsx stubs api.get); the page opens from its address with ?tab=discover. Discover: 'Recommended for {server}' on top with Stamp (Raft's, Official, not added: Add; no line saying why), then 'All apps': Stamp, Tracker (added), Notion (a connected service, added), Linear (a connected service, not added), Retro Board (a Raft App, not added), Postgres (a connected service with no maker named: 'Listed by Raft'), and an App with a long name, description and publisher. Every card is the same AppCard as Yours, its Discover variant: who makes it and how widely it is used, then Add or Added; no state, no App type, no address. Toolbar: Yours 2 / Discover 7, the search, one filter (Category, showing All categories); no Type, no Sort. Viewer is the Server's owner; the case's interactions press Retro Board's Add on its card (not the card): its install confirmation opens (MarketplaceInstallConfirm), not its details: what installing approves (its permissions; Retro Board offers no bot, and with the agent-text consent flag off no agent text), then Cancel and Add. In a 360px window: the dialog fits the window, nothing wider than it, Cancel and Add reachable."
+    },
+    {
+      "id": "screens.apps.discover.service-detail.narrow",
+      "title": "Apps page, Discover: an owner opened Linear, a connected service not added (360px)",
+      "captureType": "real-screen",
+      "surface": "apps",
+      "category": "app/apps",
+      "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+      "viewport": {
+        "width": 360,
+        "height": 1500,
+        "density": 2
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Apps page, Discover: an owner opened Linear, a connected service not added (360px)",
+          "props": {
+            "lang": "en"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.apps.discover.service-detail.narrow']",
+        "crop": "element",
+        "contract": "viewport-with-portal",
+        "interactions": [
+          {
+            "type": "click",
+            "target": "[data-testid='apps-marketplace-row-mcp:visual-linear'] [data-app-card-open]"
+          },
+          {
+            "type": "wait",
+            "ms": 400
+          }
+        ]
+      },
+      "reactPathHint": "packages/web/src/features/apps/IntegrationsSection.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "features/apps/IntegrationsSection",
+            "features/apps/DiscoverAppsList",
+            "features/apps/DiscoverServiceDetail",
+            "features/apps/AppCard",
+            "components/apps/AppsToolbar"
+          ],
+          "fixture": "packages/web/visual-testing/AppsDiscoverCases.tsx#fixtureAnswers",
+          "path": "packages/web/visual-testing/AppsDiscoverCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "React only, no baseline or parity gate: the Apps page is web-only in phase 1 of the Apps redesign (#wg-apps-ux:#2). The real IntegrationsSection (variant page) with no app shell around it, over fixture answers to its reads (AppsDiscoverCases.tsx stubs api.get); the page opens from its address with ?tab=discover. Discover: 'Recommended for {server}' on top with Stamp (Raft's, Official, not added: Add; no line saying why), then 'All apps': Stamp, Tracker (added), Notion (a connected service, added), Linear (a connected service, not added), Retro Board (a Raft App, not added), Postgres (a connected service with no maker named: 'Listed by Raft'), and an App with a long name, description and publisher. Every card is the same AppCard as Yours, its Discover variant: who makes it and how widely it is used, then Add or Added; no state, no App type, no address. Toolbar: Yours 2 / Discover 7, the search, one filter (Category, showing All categories); no Type, no Sort. Viewer is the Server's owner; the case's interactions press Linear's card (not its Add): its details say what Raft's listing says (R40): 'By Linear' under the name, Add at the head's top right, About (its description) and Information (Developer, Listed by Raft, Website, Category). No Tools section (the service lists its tools only once someone signs in) and no Try asking (the listing has no examples). In a 360px window: the details fit the window, the head's name, source and Add without overflow, Information's rows nothing wider than the window."
+    },
+    {
+      "id": "components.channel.conversion-strip.running",
+      "title": "Channel conversion strip: running at 45%",
+      "captureType": "component-fixture",
+      "surface": "channel",
+      "category": "channel",
+      "viewport": {
+        "width": 800,
+        "height": 600,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.channel.conversion-strip.running']",
+        "crop": "element",
+        "contract": "page-viewport"
+      },
+      "reactPathHint": "packages/web/src/components/channel/ChannelConversionStrip.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/channel/ChannelConversionStrip"
+          ],
+          "path": "packages/web/visual-testing/ChannelConversionStripCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "A channel being made an external channel: the strip at the top of the conversation (Kirby, 2026-11-19). react-only: the apps have no conversion strip yet."
+    },
+    {
+      "id": "components.channel.conversion-strip.running.dark",
+      "title": "Channel conversion strip: running at 45% (Dark)",
+      "captureType": "component-fixture",
+      "surface": "channel",
+      "category": "channel",
+      "viewport": {
+        "width": 800,
+        "height": 600,
+        "density": 3
+      },
+      "theme": "dark",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {
+            "theme": "dark"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.channel.conversion-strip.running.dark']",
+        "crop": "element",
+        "contract": "page-viewport"
+      },
+      "reactPathHint": "packages/web/src/components/channel/ChannelConversionStrip.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/channel/ChannelConversionStrip"
+          ],
+          "path": "packages/web/visual-testing/ChannelConversionStripCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "A channel being made an external channel: the strip at the top of the conversation (Kirby, 2026-11-19). react-only: the apps have no conversion strip yet."
+    },
+    {
+      "id": "components.channel.conversion-strip.phone",
+      "title": "Channel conversion strip: 390px phone, the bar hidden",
+      "captureType": "component-fixture",
+      "surface": "channel",
+      "category": "channel",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.channel.conversion-strip.phone']",
+        "crop": "element",
+        "contract": "page-viewport"
+      },
+      "reactPathHint": "packages/web/src/components/channel/ChannelConversionStrip.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/channel/ChannelConversionStrip"
+          ],
+          "path": "packages/web/visual-testing/ChannelConversionStripCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "A channel being made an external channel: the strip at the top of the conversation (Kirby, 2026-11-19). react-only: the apps have no conversion strip yet."
+    },
+    {
+      "id": "components.channel.conversion-strip.phone-360",
+      "title": "Channel conversion strip: 360px phone",
+      "captureType": "component-fixture",
+      "surface": "channel",
+      "category": "channel",
+      "viewport": {
+        "width": 360,
+        "height": 780,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.channel.conversion-strip.phone-360']",
+        "crop": "element",
+        "contract": "page-viewport"
+      },
+      "reactPathHint": "packages/web/src/components/channel/ChannelConversionStrip.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/channel/ChannelConversionStrip"
+          ],
+          "path": "packages/web/visual-testing/ChannelConversionStripCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "A channel being made an external channel: the strip at the top of the conversation (Kirby, 2026-11-19). react-only: the apps have no conversion strip yet."
+    },
+    {
+      "id": "components.channel.conversion-strip.long-name-zh",
+      "title": "Channel conversion strip: zh-CN with a long Chinese channel name",
+      "captureType": "component-fixture",
+      "surface": "channel",
+      "category": "channel",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "zh-CN",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {
+            "lang": "zh-CN"
+          }
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.channel.conversion-strip.long-name-zh']",
+        "crop": "element",
+        "contract": "page-viewport"
+      },
+      "reactPathHint": "packages/web/src/components/channel/ChannelConversionStrip.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/channel/ChannelConversionStrip"
+          ],
+          "path": "packages/web/visual-testing/ChannelConversionStripCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "A channel being made an external channel: the strip at the top of the conversation (Kirby, 2026-11-19). react-only: the apps have no conversion strip yet."
+    },
+    {
+      "id": "components.channel.conversion-strip.complete",
+      "title": "Channel conversion strip: 100%, three digits",
+      "captureType": "component-fixture",
+      "surface": "channel",
+      "category": "channel",
+      "viewport": {
+        "width": 800,
+        "height": 600,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.channel.conversion-strip.complete']",
+        "crop": "element",
+        "contract": "page-viewport"
+      },
+      "reactPathHint": "packages/web/src/components/channel/ChannelConversionStrip.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/channel/ChannelConversionStrip"
+          ],
+          "path": "packages/web/visual-testing/ChannelConversionStripCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "A channel being made an external channel: the strip at the top of the conversation (Kirby, 2026-11-19). react-only: the apps have no conversion strip yet."
+    },
+    {
+      "id": "components.channel.conversion-strip.failed",
+      "title": "Channel conversion strip: failed, a PanelNotice with Retry",
+      "captureType": "component-fixture",
+      "surface": "channel",
+      "category": "channel",
+      "viewport": {
+        "width": 800,
+        "height": 600,
+        "density": 3
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Default",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='components.channel.conversion-strip.failed']",
+        "crop": "element",
+        "contract": "page-viewport"
+      },
+      "reactPathHint": "packages/web/src/components/channel/ChannelConversionStrip.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/channel/ChannelConversionStrip"
+          ],
+          "path": "packages/web/visual-testing/ChannelConversionStripCases.tsx"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "A channel being made an external channel: the strip at the top of the conversation (Kirby, 2026-11-19). react-only: the apps have no conversion strip yet."
+    },
+    {
+      "id": "screens.wide.activity-task",
+      "title": "Wide: Activity beside an open task",
+      "captureType": "real-screen",
+      "surface": "activity",
+      "category": "app/activity",
+      "fixture": "packages/web/visual-testing/WideShellCases.tsx#prime",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 2,
+        "pointer": "coarse"
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Wide: Activity beside an open task",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.wide.activity-task']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/features/thread/ThreadsInbox.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout"
+          ],
+          "path": "packages/web/visual-testing/WideShellCases.tsx",
+          "fixture": "packages/web/visual-testing/WideShellCases.tsx#prime"
+        },
+        "android": {
+          "status": "active",
+          "components": [
+            "build.raft.app.WideShellVisualFixture"
+          ],
+          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/WideShellVisualFixtures.kt",
+          "fixture": "compose_wide_shell_visual?scene=activity-task"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Wide-layout parity (mobile #proj-mobile:#195): a 1280x800 window (a 10-11\" tablet in landscape) by touch, `viewport.pointer: coarse`, captured at 2x (Android wide lane: wm size 2560x1600, wm density 320). Activity column (head on the canvas with title and counts on one line, the inbox toolbar 49px by touch, compact rows) beside a task conversation (its bar one line from 768). React renders the real MainLayout route with the shared primed stores; the harness serves no task, thread or message loads yet, so on React the task / thread columns are not open and channel messages show their loading rows: a known gap, not a parity verdict."
+    },
+    {
+      "id": "screens.wide.channel",
+      "title": "Wide: channel conversation",
+      "captureType": "real-screen",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/WideShellCases.tsx#prime",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 2,
+        "pointer": "coarse"
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Wide: channel conversation",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.wide.channel']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/components/layout/MainLayout.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout"
+          ],
+          "path": "packages/web/visual-testing/WideShellCases.tsx",
+          "fixture": "packages/web/visual-testing/WideShellCases.tsx#prime"
+        },
+        "android": {
+          "status": "active",
+          "components": [
+            "build.raft.app.WideShellVisualFixture"
+          ],
+          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/WideShellVisualFixtures.kt",
+          "fixture": "compose_wide_shell_visual?scene=channel"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Wide-layout parity (mobile #proj-mobile:#195): a 1280x800 window (a 10-11\" tablet in landscape) by touch, `viewport.pointer: coarse`, captured at 2x (Android wide lane: wm size 2560x1600, wm density 320). The Chat sidebar (no head under the top bar) beside a channel conversation and its composer. React renders the real MainLayout route with the shared primed stores; the harness serves no task, thread or message loads yet, so on React the task / thread columns are not open and channel messages show their loading rows: a known gap, not a parity verdict."
+    },
+    {
+      "id": "screens.wide.channel-thread",
+      "title": "Wide: channel with its thread beside it",
+      "captureType": "real-screen",
+      "surface": "thread",
+      "category": "app/thread",
+      "fixture": "packages/web/visual-testing/WideShellCases.tsx#prime",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 2,
+        "pointer": "coarse"
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Wide: channel with its thread beside it",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.wide.channel-thread']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/components/layout/MainLayout.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout"
+          ],
+          "path": "packages/web/visual-testing/WideShellCases.tsx",
+          "fixture": "packages/web/visual-testing/WideShellCases.tsx#prime"
+        },
+        "android": {
+          "status": "active",
+          "components": [
+            "build.raft.app.WideShellVisualFixture"
+          ],
+          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/WideShellVisualFixtures.kt",
+          "fixture": "compose_wide_shell_visual?scene=channel-thread"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Wide-layout parity (mobile #proj-mobile:#195): a 1280x800 window (a 10-11\" tablet in landscape) by touch, `viewport.pointer: coarse`, captured at 2x (Android wide lane: wm size 2560x1600, wm density 320). The channel with a thread column beside it (the thread splits off from a 720px row in landscape). React renders the real MainLayout route with the shared primed stores; the harness serves no task, thread or message loads yet, so on React the task / thread columns are not open and channel messages show their loading rows: a known gap, not a parity verdict."
+    },
+    {
+      "id": "screens.wide.settings",
+      "title": "Wide: Settings with Appearance open",
+      "captureType": "real-screen",
+      "surface": "settings",
+      "category": "app/settings",
+      "fixture": "packages/web/visual-testing/WideShellCases.tsx#prime",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 2,
+        "pointer": "coarse"
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Wide: Settings with Appearance open",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.wide.settings']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/components/settings/SettingsPanel.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout"
+          ],
+          "path": "packages/web/visual-testing/WideShellCases.tsx",
+          "fixture": "packages/web/visual-testing/WideShellCases.tsx#prime"
+        },
+        "android": {
+          "status": "active",
+          "components": [
+            "build.raft.app.WideShellVisualFixture"
+          ],
+          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/WideShellVisualFixtures.kt",
+          "fixture": "compose_wide_shell_visual?scene=settings"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Wide-layout parity (mobile #proj-mobile:#195): a 1280x800 window (a 10-11\" tablet in landscape) by touch, `viewport.pointer: coarse`, captured at 2x (Android wide lane: wm size 2560x1600, wm density 320). Settings groups in the list column, Appearance in the detail. React renders the real MainLayout route with the shared primed stores; the harness serves no task, thread or message loads yet, so on React the task / thread columns are not open and channel messages show their loading rows: a known gap, not a parity verdict."
+    },
+    {
+      "id": "screens.wide.tasks-task",
+      "title": "Wide: Tasks list with a task open",
+      "captureType": "real-screen",
+      "surface": "tasks",
+      "category": "app/tasks",
+      "fixture": "packages/web/visual-testing/WideShellCases.tsx#prime",
+      "viewport": {
+        "width": 1280,
+        "height": 800,
+        "density": 2,
+        "pointer": "coarse"
+      },
+      "theme": "light",
+      "locale": "en",
+      "variants": [
+        {
+          "id": "default",
+          "name": "Wide: Tasks list with a task open",
+          "props": {}
+        }
+      ],
+      "capture": {
+        "selector": "[data-visual-case='screens.wide.tasks-task']",
+        "crop": "element",
+        "contract": "viewport-with-portal"
+      },
+      "reactPathHint": "packages/web/src/components/task/TasksPanel.tsx",
+      "providerMatrix": {
+        "react": {
+          "status": "active",
+          "components": [
+            "components/layout/MainLayout"
+          ],
+          "path": "packages/web/visual-testing/WideShellCases.tsx",
+          "fixture": "packages/web/visual-testing/WideShellCases.tsx#prime"
+        },
+        "android": {
+          "status": "active",
+          "components": [
+            "build.raft.app.WideShellVisualFixture"
+          ],
+          "path": "compose/shared/src/visualFixtures/kotlin/build/raft/app/WideShellVisualFixtures.kt",
+          "fixture": "compose_wide_shell_visual?scene=tasks-task"
+        }
+      },
+      "tolerance": {
+        "pixelRatio": 0.02,
+        "layoutDp": 1,
+        "ignoreAntialiasing": true
+      },
+      "notes": "Wide-layout parity (mobile #proj-mobile:#195): a 1280x800 window (a 10-11\" tablet in landscape) by touch, `viewport.pointer: coarse`, captured at 2x (Android wide lane: wm size 2560x1600, wm density 320). A page of a list (head, toolbar, list) with the open task's conversation in its column. React renders the real MainLayout route with the shared primed stores; the harness serves no task, thread or message loads yet, so on React the task / thread columns are not open and channel messages show their loading rows: a known gap, not a parity verdict."
     }
   ],
   "componentMatrix": [

@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { Session } from "@botiverse/oar";
+import type { InstallationSnapshot, Session } from "@botiverse/oar";
 import type { AgentConfig } from "@botiverse/raft-shared";
 import { buildOpenCodeLaunchEnv, openCodeSessionRecordPath, writeOpenCodeSessionRecord } from "../drivers/opencode";
 import type { SpawnContext } from "../drivers/types";
+import { RuntimeExecutableNotFoundError } from "../spawnFailureErrors";
 import { OarLaunchDeclined } from "./oarLaunch";
 import {
   createOpenGate,
@@ -115,8 +116,7 @@ test("the OAR environment: the slock agent selected by default_agent, no managed
 
 function deps(version: string, overrides: Partial<OpencodeLaunchDeps> = {}): OpencodeLaunchDeps {
   return {
-    readVersion: async () => ({ kind: "version", version }),
-    resolveCommand: async () => "/usr/local/bin/opencode",
+    readInstallation: async () => ({ kind: "available", via: "executable", command: "/usr/local/bin/opencode", version }),
     prepareEnvironment: async () => ({ PATH: "/bin" }),
     prepareManagedMcp: async () => null,
     openGate: undefined,
@@ -139,28 +139,74 @@ test("prepare: an OpenCode outside the verified range, or of unknown version, is
   try {
     assert.equal(await declined(prepareOpencodeOarLaunch(ctx({}, home), deps("1.18.29", counting))), "opencode_version_unsupported");
     assert.equal(await declined(prepareOpencodeOarLaunch(ctx({}, home), deps("opencode v3.0.1", counting))), "opencode_version_unsupported");
-    assert.equal(await declined(prepareOpencodeOarLaunch(ctx({}, home), deps("x", {
-      ...counting,
-      readVersion: async () => ({ kind: "unknown", reason: "probe_timeout", detail: "timed out" }),
-    }))), "opencode_version_unknown");
+    // OAR's `--version` failed to run, exited non-zero (no version), or printed no version.
+    for (const readInstallation of [
+      async (): Promise<InstallationSnapshot> => { throw Object.assign(new Error("Failed to run opencode --version"), { code: "ETIMEDOUT" }); },
+      async (): Promise<InstallationSnapshot> => ({ kind: "available", via: "executable", command: "/usr/local/bin/opencode" }),
+      async (): Promise<InstallationSnapshot> => ({ kind: "available", via: "executable", command: "/usr/local/bin/opencode", version: "usage: opencode" }),
+    ]) {
+      assert.equal(await declined(prepareOpencodeOarLaunch(ctx({}, home), deps("x", { ...counting, readInstallation }))), "opencode_version_unknown");
+    }
     assert.equal(built, 0);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
 });
 
-test("prepare: never resumes across OpenCode major lines; the driver's refusal stays the driver's to show", async () => {
+test("prepare: never resumes across OpenCode major lines on 1.x; the driver's refusal stays the driver's to show", async () => {
   const home = mkdtempSync(path.join(os.tmpdir(), "oc-oar-major-"));
   try {
     const recordPath = openCodeSessionRecordPath(home, "agent-1");
-    // No record and a 2.x CLI: a pre-record session was made by 1.x.
-    assert.equal(await declined(prepareOpencodeOarLaunch(ctx({ sessionId: "ses_old" }, home), deps("opencode v2.3.0"))), "opencode_session_refused:unrecorded");
+    writeOpenCodeSessionRecord(recordPath, { version: 1, sessionId: "ses_new", opencodeMajor: 2, opencodeVersion: "opencode v2.3.0", recordedAt: "2026-11-01T00:00:00Z" });
+    // A 2.x session on a 1.x CLI (a downgrade): the driver's refusal.
+    assert.equal(await declined(prepareOpencodeOarLaunch(ctx({ sessionId: "ses_new" }, home), deps("1.18.35"))), "opencode_session_refused:major_mismatch");
     writeOpenCodeSessionRecord(recordPath, { version: 1, sessionId: "ses_old", opencodeMajor: 1, opencodeVersion: "1.18.35", recordedAt: "2026-11-01T00:00:00Z" });
-    assert.equal(await declined(prepareOpencodeOarLaunch(ctx({ sessionId: "ses_old" }, home), deps("opencode v2.3.0"))), "opencode_session_refused:major_mismatch");
     // The same major: resumed, and the record is already right.
     const resumed = await prepareOpencodeOarLaunch(ctx({ sessionId: "ses_old" }, home), deps("1.18.35"));
     assert.equal(resumed.options.resume, "ses_old");
     assert.equal(resumed.newSessionOnResumeElsewhere, undefined);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("prepare: after an upgrade to 2.x, a 1.x or unrecorded session goes to OAR, whose not-listed refusal opens a new session (never the driver's stuck refusal)", async () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), "oc-oar-upgrade-"));
+  try {
+    const recordPath = openCodeSessionRecordPath(home, "agent-1");
+    // No record and a 2.x CLI: a pre-record session, made by 1.x.
+    const unrecorded = await prepareOpencodeOarLaunch(ctx({ sessionId: "ses_old" }, home), deps("opencode v2.3.0"));
+    assert.equal(unrecorded.options.resume, "ses_old", "OAR checks OpenCode's own session list");
+    assert.equal(unrecorded.newSessionOnResumeElsewhere, true, "a session 2.x doesn't list becomes a new session");
+    // A 1.x record and a 2.x CLI: the same.
+    writeOpenCodeSessionRecord(recordPath, { version: 1, sessionId: "ses_old", opencodeMajor: 1, opencodeVersion: "1.18.35", recordedAt: "2026-11-01T00:00:00Z" });
+    const upgraded = await prepareOpencodeOarLaunch(ctx({ sessionId: "ses_old" }, home), deps("opencode v2.3.0"));
+    assert.equal(upgraded.options.resume, "ses_old");
+    assert.equal(upgraded.newSessionOnResumeElsewhere, true);
+    // Should 2.x list and resume it, the session is recorded as 2.x's from now on.
+    await upgraded.sessionOpened!({ id: "ses_old" } as Session);
+    const record = JSON.parse(readFileSync(recordPath, "utf8")) as { sessionId: string; opencodeMajor: number };
+    assert.deepEqual([record.sessionId, record.opencodeMajor], ["ses_old", 2]);
+    // An unreadable record proves nothing: still the driver's refusal.
+    writeFileSync(recordPath, "{not json");
+    assert.equal(await declined(prepareOpencodeOarLaunch(ctx({ sessionId: "ses_old" }, home), deps("opencode v2.3.0"))), "opencode_session_refused:record_unreadable");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("prepare: OAR launches the command of OAR's own installation (a Windows npm @opencode/cli shim included); none found is runtime_not_found", async () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), "oc-oar-installation-"));
+  try {
+    const shim = "C:\\Users\\tester\\AppData\\Roaming\\npm\\opencode.cmd";
+    const launch = await prepareOpencodeOarLaunch(ctx({}, home), deps("x", {
+      readInstallation: async () => ({ kind: "available", via: "executable", command: shim, version: "opencode v2.3.0" }),
+    }));
+    assert.deepEqual(launch.installation, { kind: "available", via: "executable", command: shim, version: "2.3.0" });
+    await assert.rejects(
+      prepareOpencodeOarLaunch(ctx({}, home), deps("x", { readInstallation: async () => ({ kind: "not_found" }) })),
+      (error: unknown) => error instanceof RuntimeExecutableNotFoundError,
+    );
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -225,10 +271,19 @@ test("open gate: one open at a time, in order; a start stopped while it waits ne
   assert.equal((await gate(async () => session("4"), new AbortController().signal)).id, "4");
 });
 
-test("OAR upgrade check: OAR's OpenCode takes launchArgs, model, resume and session MCP servers", async () => {
+test("OAR upgrade check: OAR's OpenCode takes launchArgs, model, resume and session MCP servers, and reports v1 vs v2 installation capabilities", async () => {
   const { opencodeRuntime } = await import("@botiverse/oar/runtimes/opencode");
-  const refused: Readonly<Record<string, string | undefined>> = opencodeRuntime.refusedSessionOptions ?? {};
-  for (const option of ["launchArgs", "model", "resume", "mcpServers", "env", "cwd"]) {
-    assert.equal(refused[option], undefined, option);
+  const { oarInstalledSessionCapabilities } = await import("../oarLoader");
+  const v1 = oarInstalledSessionCapabilities(opencodeRuntime, { kind: "available", via: "executable", command: "/usr/bin/opencode", version: "1.18.30" });
+  const v2 = oarInstalledSessionCapabilities(opencodeRuntime, { kind: "available", via: "executable", command: "/usr/bin/opencode", version: "2.2.7" });
+  for (const caps of [v1, v2]) {
+    const refused: Readonly<Record<string, string | undefined>> = caps.refusedSessionOptions ?? {};
+    for (const option of ["launchArgs", "model", "resume", "mcpServers", "env", "cwd"]) {
+      assert.equal(refused[option], undefined, option);
+    }
   }
+  assert.ok(v1.refusedSessionOptions?.fork, "OpenCode v1 refuses fork per-installation");
+  assert.equal(v1.manualCompaction?.kind, "unsupported");
+  assert.equal(v2.refusedSessionOptions?.fork, undefined, "OpenCode v2 allows fork");
+  assert.equal(v2.manualCompaction?.kind, "supported");
 });

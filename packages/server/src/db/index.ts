@@ -1210,6 +1210,14 @@ export async function initPgliteDatabase(client: PGlite): Promise<Database> {
     await client.close();
     throw error;
   }
+  return attachPgliteDatabase(client);
+}
+
+/**
+ * Attach a PGlite instance as it is, without migrating it: initPgliteDatabase's last step, and how
+ * tests take back a database closeDatabase detached (src/test/integration/reuseProbe.ts).
+ */
+export function attachPgliteDatabase(client: PGlite): Database {
   _pglite = client;
   _rootDb = drizzlePglite(client, { schema }) as unknown as Database;
   _db = scopeTransactions(_rootDb);
@@ -1382,16 +1390,37 @@ export function getBoundedAuthDb(timeoutMs: number): Database | null {
   return _authDb;
 }
 
-export async function closeDatabase() {
+/**
+ * `afterBackgroundWork` (tests only): runs once the test close hooks have drained background work
+ * and before any connection closes (the test database's reuse, src/test/integration/reuseProbe.ts).
+ * When it returns "detach" and nothing failed, the PGlite connection stays open and is returned,
+ * for attachPgliteDatabase; everything else closes as usual.
+ * `closePglite` (tests only) closes the PGlite connection in place of its close(): test databases
+ * close once nothing uses them (src/test/integration/pgliteClose.ts).
+ */
+export async function closeDatabase(options: {
+  afterBackgroundWork?: () => Promise<"detach" | void>;
+  closePglite?: (client: PGlite) => Promise<void>;
+} = {}): Promise<PGlite | null> {
   stopPoolMetricsReporting();
   const errors: Error[] = [];
+  const afterBackgroundWork = options.afterBackgroundWork;
+  let detach = false;
+  let detached: PGlite | null = null;
   const closers = [
     runDatabaseCloseHooksForTests,
+    ...(afterBackgroundWork ? [async () => { detach = await afterBackgroundWork() === "detach"; }] : []),
     closeRisingWavePool,
     ...(_pool ? [() => _pool!.end()] : []),
     ...(_searchPool && _searchPool !== _pool ? [() => _searchPool!.end()] : []),
     ...(_authPool ? [() => _authPool!.end()] : []),
-    ...(_pglite ? [() => _pglite!.close()] : []),
+    // Last, so a detach only happens when every closer before it succeeded.
+    ...(_pglite ? [async () => {
+      const client = _pglite!;
+      if (detach && !errors.length) detached = client;
+      else if (options.closePglite) await options.closePglite(client);
+      else await client.close();
+    }] : []),
   ];
   try {
     for (const close of closers) {
@@ -1414,4 +1443,5 @@ export async function closeDatabase() {
   }
   if (errors.length === 1) throw errors[0];
   if (errors.length > 1) throw new AggregateError(errors, "Database cleanup failed");
+  return detached;
 }

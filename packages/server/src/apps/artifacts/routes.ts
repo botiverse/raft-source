@@ -3,8 +3,8 @@
 // (S1a) is here; publishing (S1b) is in publish.ts, commenting and following
 // (S1c) in comments.ts, reviews (S8) in reviews.ts, the notices they send in notices.ts, moving to the
 // whole server and deleting in manage.ts, importing from the standalone app
-// in import.ts, saving an attachment in save.ts, a version's publish check
-// in checkRead.ts; the list with
+// in import.ts, saving an attachment in save.ts, settling (#334) in
+// settleRoutes.ts, a version's publish check in checkRead.ts; the list with
 // `query` searches the index in search.ts (S9). Each operation answers a
 // result core's agent API writes: JSON (checked against the contract there),
 // bytes, or an error code; mount.ts registers them (the app's registration,
@@ -15,11 +15,13 @@
 //
 // Every operation checks first that Artifacts is on for the deployment
 // (apiCommon requireEnabled) and answers nothing else when it is off. A read
-// of one Artifact also needs the Artifact's own server to still exist
-// (apiCommon itemServerEnabled). Visibility is canViewArtifacts /
+// of one Artifact also needs it to be read at all (apiCommon itemReadable:
+// its own server still exists, or was closed and the Artifact is kept in a
+// joint it is still in); a write, that server to exist (requireWritable:
+// else one 403 FORBIDDEN, read-only). Visibility is canViewArtifacts /
 // visibleArtifactsSql only; anything the caller can't see answers the same
 // 404 NOT_VISIBLE.
-import { and, asc, desc, eq, gt, inArray, ne, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, lte, ne, sql, type SQL } from "drizzle-orm";
 import {
   AGENT_API_ARTIFACT_COMMENTS_PAGE_LIMIT,
   AGENT_API_ARTIFACT_DOWNLOAD_URL_TTL_SECONDS,
@@ -29,6 +31,8 @@ import {
   AGENT_API_ARTIFACT_READ_VERSIONS_SHOWN,
   AGENT_API_ARTIFACT_TEXT_CONTENT_MAX_BYTES,
   artifactFileType,
+  artifactHeldRange,
+  parseArtifactHeldRange,
   isWellFormedArtifactFilePath,
   type AgentApiArtifactCommentsQuery,
   type AgentApiArtifactCommentsResponse,
@@ -78,7 +82,7 @@ import {
   storageUnavailable,
   summarize,
   targetNotFound,
-  takesPartIn,
+  keepsOwnStateOn,
   versionFileOf,
   versionNotFound,
   versionNumbers,
@@ -86,6 +90,7 @@ import {
   viewActor,
   legacyNameOf,
 } from "./apiCommon";
+import { agentLinkedFromOf } from "./backlinks";
 import { attachmentDisposition } from "./blobStore";
 import { createCheckReadOperations } from "./checkRead";
 import { createCommentOperations } from "./comments";
@@ -96,6 +101,7 @@ import { agentOriginOf } from "./origin";
 import { createPublishOperations } from "./publish";
 import { agentReview, createReviewOperations, reviewComments } from "./reviews";
 import { createSaveOperations } from "./save";
+import { createSettleOperations } from "./settleRoutes";
 import {
   artifactComments,
   artifactItems,
@@ -124,6 +130,11 @@ export { artifactNoticeDeliveryVerdicts, flushDueArtifactNotices, type ArtifactN
 const invalidCursor = (): ArtifactApiError => fail(400, {
   code: "agent_api_contract_invalid",
   error: "That cursor isn't one this list gave out: pass the cursor the previous page gave exactly, or leave it out to start from the beginning.",
+});
+/** A `held` range that isn't `<from>..<through>` (#proj-workspace:#340). */
+const invalidHeldRange = (): ArtifactApiError => fail(400, {
+  code: "agent_api_contract_invalid",
+  error: "That held range isn't one a hold gave out: pass the `<from>..<through>` its message names exactly.",
 });
 /** The list's cursor belongs to one list: a plain one, or one query's. */
 const invalidListCursor = (): ArtifactApiError => fail(400, {
@@ -165,7 +176,7 @@ async function fileOf(
     await requireEnabled(agent);
     throw new ArtifactApiFailure(invalidPath(params.path));
   }
-  const item = await resolveVisibleItem(agent, params.artifact);
+  const item = await resolveVisibleItem(agent, params.artifact, "read");
   const { version } = await shownVersionOf(agent, item, query.version);
   if (!version) throw new ArtifactApiFailure(versionNotFound(item.id, null, null));
   const missing = () => new ArtifactApiFailure(fileNotFound(item.id, params.path, version.number));
@@ -176,11 +187,12 @@ async function fileOf(
 }
 
 /**
- * Whether reading the Artifact writes the agent's read position: one it takes
- * part in (apiCommon takesPartIn: its own server's, or its joint's), as a
- * comment's hold reads that position. An outsider reads statelessly.
+ * Whether reading the Artifact writes the agent's read position (apiCommon
+ * keepsOwnStateOn: its own server's, or its joint's, a closed server's kept
+ * one included), as a comment's hold reads that position. An outsider reads
+ * statelessly.
  */
-const keepsReadPosition = (agent: ArtifactAgent, item: ArtifactItemRow): Promise<boolean> => takesPartIn(viewActor(agent), item);
+const keepsReadPosition = (agent: ArtifactAgent, item: ArtifactItemRow): Promise<boolean> => keepsOwnStateOn(viewActor(agent), item);
 
 export function createArtifactAgentApi() {
   return {
@@ -191,6 +203,7 @@ export function createArtifactAgentApi() {
     ...createReviewOperations(),
     ...createManageOperations(),
     ...createSaveOperations(),
+    ...createSettleOperations(),
     importArtifact: createImportOperations().importArtifact,
 
     list: (agent: ArtifactAgent, query: AgentApiArtifactListQuery): Promise<ArtifactApiResult<AgentApiArtifactListResponse>> => answer(async () => {
@@ -238,7 +251,7 @@ export function createArtifactAgentApi() {
     }),
 
     read: (agent: ArtifactAgent, params: AgentApiArtifactParams, query: AgentApiArtifactReadQuery): Promise<ArtifactApiResult<AgentApiArtifactReadResponse>> => answer(async () => {
-      const item = await resolveVisibleItem(agent, params.artifact);
+      const item = await resolveVisibleItem(agent, params.artifact, "read");
       const access = accessOf(agent, item);
       const { version, current } = await shownVersionOf(agent, item, query.version);
       // `version` naming the current version reads the current version too.
@@ -316,6 +329,8 @@ export function createArtifactAgentApi() {
       ]);
       const [summary] = await summarize(agent, [item]);
       const commentVersions = await versionNumbers((unseen?.comments ?? []).map((comment) => comment.versionId));
+      // Where it came from and what links to it ("Linked from", #proj-workspace:#336 step 2: backlinks.ts), at once.
+      const [origin, linkedFrom] = await Promise.all([agentOriginOf(agent, item), agentLinkedFromOf(agent, item)]);
       const body: AgentApiArtifactReadResponse = {
         artifact: summary!,
         version: version && {
@@ -348,7 +363,8 @@ export function createArtifactAgentApi() {
           commentsCursor: unseen.commentCount > unseen.comments.length ? positionCursor(unseen.after) : null,
           unread: unseen.unread,
         },
-        origin: await agentOriginOf(agent, item),
+        origin,
+        ...(linkedFrom ? { linkedFrom } : {}),
         // The push route's rule: only the Artifact's own server pushes to it (publish.ts).
         mayPush: item.serverId === agent.serverId,
         viewing: [],
@@ -406,12 +422,20 @@ export function createArtifactAgentApi() {
     }),
 
     comments: (agent: ArtifactAgent, params: AgentApiArtifactParams, query: AgentApiArtifactCommentsQuery): Promise<ArtifactApiResult<AgentApiArtifactCommentsResponse>> => answer(async () => {
-      const item = await resolveVisibleItem(agent, params.artifact);
+      const item = await resolveVisibleItem(agent, params.artifact, "read");
       const access = accessOf(agent, item);
       // One review's comments (S8): every one of them, as `all`; its summary is the review's `body`, not listed.
       const reviewRow = query.review === undefined || !access.comments ? null : (await getDb().select().from(artifactReviews)
         .where(and(eq(artifactReviews.id, query.review), eq(artifactReviews.itemId, item.id))).limit(1))[0] ?? null;
-      const view = query.all === undefined && query.review === undefined ? "unseen" as const : "all" as const;
+      // A hold's range (#proj-workspace:#340): the comments by others a hold
+      // marked seen (after its `seenFrom`, up to its `seen`; those it showed
+      // in full, and any it passed over: `skipped.otherComments`),
+      // listed again as `all` lists, for an agent whose held output was cut.
+      // Only a single read position is kept, so the range the hold gave is
+      // what names them.
+      const held = query.held === undefined ? null : parseArtifactHeldRange(query.held);
+      if (query.held !== undefined && held === null) return invalidHeldRange();
+      const view = query.all === undefined && query.review === undefined && held === null ? "unseen" as const : "all" as const;
       const path = query.path ?? null;
       const cursor = query.cursor === undefined ? null : parsePositionCursor(query.cursor);
       if (query.cursor !== undefined && cursor === null) return invalidCursor();
@@ -419,7 +443,7 @@ export function createArtifactAgentApi() {
       const others = byOthers(agent);
       const position = await readPositionOf(agentActor(agent), item.id);
       const seen = position ?? 0;
-      const after = cursor ?? (view === "unseen" ? seen : 0);
+      const after = Math.max(cursor ?? (view === "unseen" ? seen : 0), held?.from ?? 0);
       const pathFilter = path === null ? undefined : eq(artifactComments.path, path);
 
       const rows = access.comments && (query.review === undefined || reviewRow !== null)
@@ -431,7 +455,8 @@ export function createArtifactAgentApi() {
             pathFilter,
             reviewRow === null ? undefined : eq(artifactComments.reviewId, reviewRow.id),
             reviewRow?.summaryCommentId ? ne(artifactComments.id, reviewRow.summaryCommentId) : undefined,
-            view === "unseen" ? others.comment : undefined,
+            view === "unseen" || held !== null ? others.comment : undefined,
+            held === null ? undefined : lte(artifactComments.position, held.through),
           ))
           .orderBy(asc(artifactComments.position))
           .limit(AGENT_API_ARTIFACT_COMMENTS_PAGE_LIMIT + 1)
@@ -466,6 +491,7 @@ export function createArtifactAgentApi() {
         review: query.review === undefined ? null : reviewRow && await agentReview(reviewRow, (await reviewComments(db, reviewRow)).summary),
         nextCursor: rows.length > AGENT_API_ARTIFACT_COMMENTS_PAGE_LIMIT ? positionCursor(page[page.length - 1]!.position) : null,
         unseenVersionCount: unseenVersions.length,
+        held: held === null ? null : artifactHeldRange(held.from, held.through),
       });
     }),
   };

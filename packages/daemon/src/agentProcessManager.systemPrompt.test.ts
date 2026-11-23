@@ -7,7 +7,7 @@ import path from "node:path";
 import { asAxSurfaceText, type AgentConfig, type AgentMessage } from "@botiverse/raft-shared";
 import { AgentProcessManager } from "./agentProcessManager";
 import { setDaemonFetchImplForTests } from "./daemonFetch";
-import { formatResumeEmptyPrompt, formatResumeUnreadSummaryPrompt } from "./agentRuntimeInput";
+import { formatResumeEmptyPrompt, formatResumeOpenTasksPrompt, formatResumeUnreadSummaryPrompt } from "./agentRuntimeInput";
 import type { RuntimeDriver, SpawnContext } from "./drivers/index";
 import { buildCopilotArgs, CopilotDriver } from "./drivers/copilot";
 import { buildCursorArgs, CursorDriver } from "./drivers/cursor";
@@ -196,6 +196,40 @@ test("resume selects unread catch-up input instead of empty-resume input", async
     expect(spawns).toHaveLength(1);
     expect(spawns[0].prompt).toBe(formatResumeUnreadSummaryPrompt(unread, driver));
     expect(spawns[0].standingPrompt).toBe("standing:");
+  });
+});
+
+test("a resume start's open tasks reach the first input instead of the empty-resume stop", async () => {
+  await withPromptManager(true, async ({ manager, driver, spawns }) => {
+    const openTasks = { tasks: [{ ref: "#proj:#7", title: "Ship it", status: "in_progress" as const }], more: 0 };
+    await manager.startAgent("agent-1", promptConfig({ sessionId: "session-1" }), undefined, undefined, undefined, undefined, false, undefined, undefined, null, undefined, null, null, openTasks);
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0].prompt).toBe(formatResumeOpenTasksPrompt(openTasks, driver));
+    expect(spawns[0].prompt).not.toBe(formatResumeEmptyPrompt(driver));
+  });
+});
+
+test("the open tasks a spawn carried are kept for the daemon's own restarts of that session, and cleared by a spawn that named none", async () => {
+  await withPromptManager(true, async ({ manager, spawns }) => {
+    const openTasks = { tasks: [{ ref: "#proj:#7", title: "Ship it", status: "in_progress" as const }], more: 0 };
+    await manager.startAgent("agent-1", promptConfig({ sessionId: "session-1" }), undefined, undefined, undefined, undefined, false, undefined, undefined, null, undefined, null, null, openTasks);
+    expect(spawns).toHaveLength(1);
+    // What a recoverable-error restart or an ended spawn-fail cooldown passes on (no server start).
+    expect((manager as any).lastSpawnOpenTasks.get("agent-1")).toEqual(openTasks);
+    await manager.stopAgent("agent-1", { wait: true });
+    await manager.startAgent("agent-1", promptConfig({ sessionId: "session-1" }));
+    expect(spawns).toHaveLength(2);
+    expect((manager as any).lastSpawnOpenTasks.has("agent-1")).toBe(false);
+  });
+});
+
+test("resume with unread messages and open tasks lists both", async () => {
+  await withPromptManager(true, async ({ manager, driver, spawns }) => {
+    const unread = { "#general": 2 };
+    const openTasks = { tasks: [{ ref: "#proj:#7", title: "Ship it", status: "todo" as const }], more: 1 };
+    await manager.startAgent("agent-1", promptConfig({ sessionId: "session-1" }), undefined, unread, undefined, undefined, false, undefined, undefined, null, undefined, null, null, openTasks);
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0].prompt).toBe(formatResumeUnreadSummaryPrompt(unread, driver, openTasks));
   });
 });
 

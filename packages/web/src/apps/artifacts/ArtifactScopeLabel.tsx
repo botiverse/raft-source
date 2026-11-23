@@ -23,7 +23,7 @@ import type { ArtifactHome, ArtifactViewerData, ChannelId } from "@botiverse/raf
 
 import Tooltip from "../../components/ui/Tooltip";
 import { useOverflowTitle } from "../../hooks/useOverflowTitle";
-import { artifactHomeWords, conversationLabel, conversationName } from "./artifactHomeWords";
+import { artifactHomeWords, conversationLabel, conversationName, homeConversationLabel } from "./artifactHomeWords";
 import { artifactShareHost } from "./artifactShareHost";
 import { useArtifactServerName } from "./artifactServerName";
 import type { ArtifactServerName } from "./artifactServerName";
@@ -60,6 +60,8 @@ export function artifactAudience(formatMessage: IntlShape["formatMessage"], home
   // TODO(Remy): a self-DM's "peer" is the reader, so it reads "You and <own name>"; the home
   // would have to say it is a self-DM (a shared-contract field) for "Only you".
   if (home.conversation.type === "dm") return dmAudience(formatMessage, [conversationName(home.conversation)]);
+  // A joint the reader's server has no copy of comes with no name (homeConversationLabel).
+  if (home.conversation.type === "joint" && home.conversation.name === "") return formatMessage({ id: "artifacts.scope.whoSharedChannel" });
   const id = home.conversation.type === "joint" ? "artifacts.scope.whoJoint" : "artifacts.scope.whoConversation";
   return formatMessage({ id }, { name: conversationLabel(home.conversation) });
 }
@@ -207,7 +209,9 @@ function scopeText(formatMessage: IntlShape["formatMessage"], home: ArtifactHome
     : home.kind === "public"
       ? formatMessage({ id: "artifacts.scope.public" })
       // The icon says the kind of conversation; the name goes bare (no "#"), a DM by its peer's display name.
-      : conversationName(home.conversation);
+      : home.conversation.type === "joint" && home.conversation.name === ""
+        ? homeConversationLabel(formatMessage, home.conversation)
+        : conversationName(home.conversation);
 }
 
 /**

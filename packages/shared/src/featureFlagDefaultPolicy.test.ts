@@ -35,6 +35,16 @@ test("default-on: a stored-off fallback answers on, except for exceptions", () =
     reason: FEATURE_FLAG_DEFAULT_ON_EXCEPTIONS.pro_seat_add,
   });
   assert.equal(effectiveDefaultEnabled({ key: "wiki_v0", defaultEnabled: false }, policy), false);
+  // Focus is half built (state only, no delivery yet): off on staging too.
+  assert.equal(effectiveDefaultEnabled({ key: "agent_focus_v0", defaultEnabled: false }, policy), false);
+  // The DM reply placement prompt (#triage:#540) is on the standard policy: off in production, on under staging's default-on.
+  const dmReplyPlacement = { key: "dm_reply_placement_prompt", defaultEnabled: false };
+  assert.deepEqual(describeEffectiveDefault(dmReplyPlacement, policy), { enabled: true, source: "default_on" });
+  assert.deepEqual(describeEffectiveDefault(dmReplyPlacement, { defaultOn: false }), { enabled: false, source: "stored" });
+  // The wake-up notice with the Server's numbers (#wg-ax:#42) is on the standard policy too: both halves ship together.
+  const inboxNoticeServerRows = { key: "inbox_notice_server_rows_v0", defaultEnabled: false };
+  assert.deepEqual(describeEffectiveDefault(inboxNoticeServerRows, policy), { enabled: true, source: "default_on" });
+  assert.deepEqual(describeEffectiveDefault(inboxNoticeServerRows, { defaultOn: false }), { enabled: false, source: "stored" });
   assert.equal(effectiveDefaultEnabled(off, policy), true);
 });
 
@@ -58,10 +68,16 @@ test("exception entries: exact keys, `prefix_*` entries, and a reason for every 
 
 test("flags under security review stay off under default-on (Tenny, task #255)", () => {
   const policy = featureFlagDefaultPolicyFromEnv({ FEATURE_FLAGS_DEFAULT_ON: "1" });
-  for (const key of ["prepared_request_card_v0", "desktop_browser_raft_sign_in_v0"]) {
+  for (const key of ["prepared_request_card_v0", "data_export_v0"]) {
     assert.match(featureFlagDefaultOnException(key) ?? "", /^security: /, key);
     assert.equal(effectiveDefaultEnabled({ key, defaultEnabled: false }, policy), false, key);
   }
+});
+
+test("Sign in with Raft in the desktop browser is no longer held off (review closed: Tenny, xxchan's Mac pass, #proj-workspace:1ed9baf2)", () => {
+  const policy = featureFlagDefaultPolicyFromEnv({ FEATURE_FLAGS_DEFAULT_ON: "1" });
+  assert.equal(featureFlagDefaultOnException("desktop_browser_raft_sign_in_v0"), null);
+  assert.equal(effectiveDefaultEnabled({ key: "desktop_browser_raft_sign_in_v0", defaultEnabled: false }, policy), true);
 });
 
 test("minimum supported mobile build gates stay off under default-on", () => {

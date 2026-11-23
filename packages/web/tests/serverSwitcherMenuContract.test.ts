@@ -256,7 +256,7 @@ test("server switcher primitive renders a sortable handle for every server row",
 });
 
 test("server switcher primitive honors desktop and mobile navigation modes", () => {
-  localStorage.setItem("slock:serverSurface:v1:beta", "/s/beta/tasks");
+  localStorage.setItem("slock:place:v1:beta", JSON.stringify({ tab: "tasks", places: { tasks: "/s/beta/tasks" } }));
   const { rerender } = renderMenu({ testId: "desktop-server-switcher-menu" });
   assert.ok(screen.getByTestId("desktop-server-switcher-menu"));
   assert.equal(screen.getByRole("link", { name: /Beta/ }).getAttribute("href"), "/s/beta/tasks");

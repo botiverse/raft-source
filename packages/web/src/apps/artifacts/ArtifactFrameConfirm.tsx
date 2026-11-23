@@ -16,6 +16,7 @@ import { ARM_DELAY_MS } from "@botiverse/porthole/react";
 import type { ConfirmActions } from "@botiverse/porthole/react";
 
 import { DialogActions, DialogCommit, NarrowDialogContent } from "../../components/ui/NarrowDialog";
+import { useOwnerTimers } from "../../utils/ownerDocument";
 import { confirmWords } from "./artifactConfirmWords";
 
 /** Each request its own dialog: a new one at the head of Porthole's queue starts unarmed, on Cancel. */
@@ -61,10 +62,12 @@ function FrameConfirmDialog({ request, answer }: Props) {
   const cancelRef = useRef<HTMLButtonElement | null>(null);
   const answered = useRef(false);
   const [armed, setArmed] = useState(false);
+  // Armed on the dialog's own window's timer: an object window's runs while the main window is hidden (#337 PR3).
+  const timers = useOwnerTimers();
   useEffect(() => {
-    const timer = setTimeout(() => setArmed(true), ARM_DELAY_MS);
-    return () => clearTimeout(timer);
-  }, []);
+    const timer = timers.setTimeout(() => setArmed(true), ARM_DELAY_MS);
+    return () => timers.clearTimeout(timer);
+  }, [timers]);
   const words = useMemo(() => confirmWords(request, formatMessage), [request, formatMessage]);
   const closeLabel = formatMessage({ id: "common.confirm.closeDialog" });
   const sourceId = useId();

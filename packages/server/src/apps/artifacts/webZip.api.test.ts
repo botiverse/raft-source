@@ -141,8 +141,9 @@ test("download.zip: every file of the shown version, paths and bytes as publishe
   const res = await get(app, artifactWebPaths.downloadZip(notes), world.who.reader);
   assert.equal(res.status, 200);
   assert.equal(res.headers.get("content-type"), "application/zip");
-  // The title's unsafe characters dropped (the name a browser saves it as), the version after it.
-  assert.match(res.headers.get("content-disposition") ?? "", /^attachment; filename="Q3 notes draft final v2\.zip"/);
+  // The title's letters kept in any script, only what no file name may hold dropped (artifactSafeFileName), the version after it.
+  const v2Name = "Q3 notes «draft» final v2.zip";
+  assert.equal(res.headers.get("content-disposition"), `attachment; filename="Q3 notes _draft_ final v2.zip"; filename*=UTF-8''${encodeURIComponent(v2Name)}`);
   assert.equal(res.headers.get("x-content-type-options"), "nosniff");
   assert.equal(res.headers.get("cache-control"), "private, no-store");
   assert.equal(Number(res.headers.get("content-length")), res.bytes.length);
@@ -154,13 +155,18 @@ test("download.zip: every file of the shown version, paths and bytes as publishe
   // `?version=`: that version's files, as the file route reads them.
   const v1 = await get(app, artifactWebPaths.downloadZip(notes, 1), world.who.reader);
   assert.equal(v1.status, 200);
-  assert.match(v1.headers.get("content-disposition") ?? "", /filename="Q3 notes draft final v1\.zip"/);
+  assert.match(v1.headers.get("content-disposition") ?? "", new RegExp(`filename\\*=UTF-8''${encodeURIComponent("Q3 notes «draft» final v1.zip")}$`));
   const v1Entries = readStoredZip(v1.bytes);
   assert.deepEqual(v1Entries.map((entry) => entry.name), ["images/chart.png", "index.md"]);
   for (const entry of v1Entries) assert.deepEqual(entry.bytes, byPath(V1).get(entry.name), entry.name);
   const unknown = await get(app, artifactWebPaths.downloadZip(notes, 9), world.who.reader);
   assert.deepEqual([unknown.status, unknown.body], [404, webVersionNotFound(9, 2).body]);
   assert.equal((await get(app, `/api/artifacts/${notes}/download.zip?version=one`, world.who.reader)).body.code, "INVALID_REQUEST");
+  // A Chinese title keeps its letters (never the id or a bare "v2.zip").
+  await getDb().update(artifactItems).set({ title: "周计划 / 第一周" }).where(eq(artifactItems.id, world.notes.id));
+  const chinese = await get(app, artifactWebPaths.downloadZip(notes), world.who.reader);
+  assert.equal(chinese.status, 200);
+  assert.match(chinese.headers.get("content-disposition") ?? "", new RegExp(`filename\\*=UTF-8''${encodeURIComponent("周计划 第一周 v2.zip")}$`));
   // Every archive gave its slot back.
   const until = Date.now() + 5_000;
   while (zipsInFlight("web") !== 0 && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 10));

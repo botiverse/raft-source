@@ -35,7 +35,7 @@
  * (`risingwave` / `postgres`), copied unchanged; absent when it had none.
  */
 import { currentTimeMs } from "@botiverse/raft-shared";
-import type { InboxRefreshTrigger } from "@botiverse/raft-shared";
+import type { InboxRefreshRefusal, InboxRefreshTrigger } from "@botiverse/raft-shared";
 import { emitStateTransitionTrace } from "../utils/stateTransitionTrace";
 import { hasActivityReadHold } from "./activityReadState";
 import { compareActivitySeq, safeSeqToDecimalString } from "./activitySeq";
@@ -191,9 +191,43 @@ export function noteLiveApplied(row: ConversationRow, message: Message, live: In
 /**
  * `skipped` / `eligible_sent`: steps 3a/3b (flag on / off). `position`: the
  * per-row position rule took it (inbox_row_position_v1, inboxRowPosition.ts):
- * no list re-read, at most a re-read of its row.
+ * no list re-read, at most a re-read of its row. `inserted`: a thread the list
+ * did not show, inserted from its `thread:updated` (inboxThreadInsert.ts), no
+ * re-read; its checks say `row_existed=false`, and its row checks and audits
+ * say `inserted` while the row is still at the inserted reply. `unfollowed`:
+ * a thread not followed and not listed, whose re-read was skipped
+ * (inboxUnfollowedThreadReply.ts): a later answer that shows it is a conflict.
  */
-export type RereadOutcome = "skipped" | "eligible_sent" | "position";
+export type RereadOutcome = "skipped" | "eligible_sent" | "position" | "inserted" | "unfollowed";
+
+/**
+ * Rows inserted, by scope: the inserted reply's seq (a row check of one still
+ * at it says `inserted`), the unread the server's totals already had for it
+ * (`baseline`), until when a first-window answer without it may be lag, and
+ * whether one already was (takeInsertedRowKeep).
+ */
+const insertedRows = new Map<string, { seq: string; baseline: number; until: number; kept: boolean }>();
+
+export function noteInsertedRow(scopeId: string, seq: string, baseline: number): void {
+  insertedRows.delete(scopeId);
+  insertedRows.set(scopeId, { seq, baseline, until: currentTimeMs() + IN_PLACE_CHECK_TTL_MS, kept: false });
+  while (insertedRows.size > IN_PLACE_EXPECTATIONS_CAP) insertedRows.delete(insertedRows.keys().next().value!);
+}
+
+/**
+ * A first-window answer left out the inserted row of `scopeId`, now at `seq`
+ * (the inserted reply, or a later one it took since): the first such answer
+ * within the stale-list bound is lag (the read model behind the reply), so the
+ * row is kept, once; this returns the unread the server's totals already had
+ * for it. Null: not inserted, below the inserted reply (an answer or a read
+ * replaced it), past the bound, or kept once already (the answer wins).
+ */
+export function takeInsertedRowKeep(scopeId: string, seq: string | null): number | null {
+  const entry = insertedRows.get(scopeId);
+  if (!entry || seq === null || compareActivitySeq(seq, entry.seq) < 0 || entry.kept || currentTimeMs() > entry.until) return null;
+  entry.kept = true;
+  return entry.baseline;
+}
 
 type InPlaceExpectation = {
   /** What patched the row (a list check); for a row check, the trigger of the row re-read. */
@@ -233,7 +267,7 @@ const expectations = new Map<string, InPlaceExpectation>();
 const IN_PLACE_NOOP_SAMPLE = 20;
 let noopChecks = 0;
 let expiredAbsentChecks = 0;
-registerServerReset(() => expectations.clear());
+registerServerReset(() => { expectations.clear(); insertedRows.clear(); });
 
 function remember(scopeId: string, expected: Omit<InPlaceExpectation, "until" | "at" | "readState" | "readBehind">): void {
   const now = currentTimeMs();
@@ -270,6 +304,12 @@ export function noteInPlaceRow(
   const live = event === "read_persisted" ? undefined : event;
   const trigger = live ? live.trigger : "read_persisted";
   remember(scopeId, { trigger, existed: true, seq: row.latestActivitySeq ?? null, reread, cause: causeDetail(message, row), loaded: live ? live.loaded : null, live: liveDetail(live, late) });
+}
+
+/** An unlisted row's re-read skipped (unfollowed thread): its absent note says so. */
+export function noteAbsentRereadSkipped(scopeId: string): void {
+  const expected = expectations.get(scopeId);
+  if (expected && !expected.existed) expected.reread = "unfollowed";
 }
 
 function noteAbsent(scopeId: string, trigger: InPlaceTrigger, seq: string | null, message?: Message, live?: InboxLiveUnread): void {
@@ -398,6 +438,41 @@ export function liveMessageRereadOutcome(
 }
 
 /**
+ * What a live message did to its listed row (inboxStore receiveThreadReply /
+ * receiveChannelMessage): `skipped` its re-read, or not, and why not
+ * (`refused`, sent as `X-Raft-Fetch-Refused` with the re-read it asks for).
+ */
+export type LiveRowReceipt = { skipped: true } | { skipped: false; refused: InboxRefreshRefusal };
+
+export const LIVE_ROW_SKIPPED: LiveRowReceipt = { skipped: true };
+
+export function liveRowRefused(refused: InboxRefreshRefusal): LiveRowReceipt {
+  return { skipped: false, refused };
+}
+
+/** A live message's re-read is skipped only if its patch skipped it and the row kept counting; else the first reason it was not. */
+export function liveRowReceipt(skipsReread: boolean, kept: boolean, refused: InboxRefreshRefusal | undefined): LiveRowReceipt {
+  if (skipsReread && kept) return LIVE_ROW_SKIPPED;
+  return liveRowRefused(skipsReread ? "counted_cap" : (refused ?? "patch_incomplete"));
+}
+
+/** `message:new` tries the message's thread row and its channel or DM row; at most one is listed, the other says not_listed. */
+export function liveMessageReceipt(thread: LiveRowReceipt, channel: LiveRowReceipt): LiveRowReceipt {
+  if (thread.skipped || channel.skipped) return LIVE_ROW_SKIPPED;
+  return channel.refused === "not_listed" ? thread : channel;
+}
+
+/**
+ * Why liveMessageRereadOutcome did not skip the re-read, in its own order
+ * (`listSettled` as passed to it); undefined when it did.
+ */
+export function liveRereadRefusal(reread: RereadOutcome | null, live: InboxLiveUnread | undefined, listSettled: boolean): InboxRefreshRefusal | undefined {
+  if (reread === "skipped" || reread === "position") return undefined;
+  if (reread === "eligible_sent") return "flag_off";
+  return live && !listSettled ? "not_settled" : "patch_incomplete";
+}
+
+/**
  * Step 3b: the same message again on a row it already moved (a reply comes as
  * message_new and as thread_reply). Skips its re-read only if the first one
  * did, on a list still settled.
@@ -519,7 +594,8 @@ export function checkInPlaceDrift(
       detail = `;unread=${localRow.unreadCount}/${servedRow.unreadCount};mention=${localRow.hasMention ? 1 : 0}/${servedRow.hasMention ? 1 : 0};order=${localIndex}/${servedIndex};ahead=${ahead.size}${servedAheadOnly ? ";served_ahead=1" : ""}`;
     }
     expectations.delete(scopeId);
-    const agrees = result === "match" || result === "appeared";
+    // A row whose re-read was skipped as unfollowed must not appear: that skip was wrong.
+    const agrees = result === "match" || (result === "appeared" && expected.reread !== "unfollowed");
     // Every conflict; one agreement in IN_PLACE_NOOP_SAMPLE (counted, so it is exact over a session).
     if (agrees && noopChecks++ % IN_PLACE_NOOP_SAMPLE !== 0) continue;
     emitCheck(expected, now, localRow ? getInboxItemKey(localRow) : servedRow ? getInboxItemKey(servedRow) : scopeId, {
@@ -551,6 +627,8 @@ function emitCheck(
   check: { outcome: "noop" | "conflict"; result: string; detail: string; sampleRate: number; readBehindAlways?: boolean; backend: string | null; scope?: "list" | "row"; notJudgedCause?: AuditNotJudgedCause },
 ): void {
   const readBehind = expected.readBehind > 0 || check.readBehindAlways ? `;read_behind=${expected.readBehind}` : "";
+  // An inserted row is judged as a patched one, but was not listed when its event came.
+  const existed = expected.existed && expected.reread !== "inserted";
   emitStateTransitionTrace({
     domain: "inbox",
     event: "activity:inplace_check",
@@ -560,12 +638,12 @@ function emitCheck(
     // event's cause, its age, whether a read state arrived meanwhile, and for a live message
     // whether the loaded messages' projection had already counted it, whether it counted, came
     // late (below the row's seq) and was first stored by a catch-up (#244 diagnostics).
-    outcomeDetail: `trigger=${expected.trigger};existed=${expected.existed ? 1 : 0};result=${check.result}${check.detail}${expected.reread ? `;reread=${expected.reread}` : ""}${expected.cause};age_ms=${now - expected.at};read_state=${expected.readState ? 1 : 0}${readBehind}${expected.loaded === null ? "" : `;loaded=${expected.loaded ? 1 : 0}`}${expected.live ? `;counts=${expected.live.counts ? 1 : 0};late=${expected.live.late ? 1 : 0};via=${expected.live.via};open=${expected.live.open ? 1 : 0};event=${expected.live.event}` : ""}`,
+    outcomeDetail: `trigger=${expected.trigger};existed=${existed ? 1 : 0};result=${check.result}${check.detail}${expected.reread ? `;reread=${expected.reread}` : ""}${expected.cause};age_ms=${now - expected.at};read_state=${expected.readState ? 1 : 0}${readBehind}${expected.loaded === null ? "" : `;loaded=${expected.loaded ? 1 : 0}`}${expected.live ? `;counts=${expected.live.counts ? 1 : 0};late=${expected.live.late ? 1 : 0};via=${expected.live.via};open=${expected.live.open ? 1 : 0};event=${expected.live.event}` : ""}`,
     touched: 1,
     timestamp: now,
   }, {
     "inbox.inplace.trigger": expected.trigger,
-    "inbox.inplace.row_existed": expected.existed ? "true" : "false",
+    "inbox.inplace.row_existed": existed ? "true" : "false",
     "inbox.inplace.result": check.result,
     "inbox.inplace.sample_rate": String(check.sampleRate),
     // `list`: judged by a list answer (order included); `row`: by a row re-read's answer (no order).
@@ -639,7 +717,7 @@ export function checkRowAnswerDrift(
   const sampled = agrees && !audit;
   if (sampled && noopChecks++ % IN_PLACE_NOOP_SAMPLE !== 0) return false;
   const upToAnswer = behind && merged !== null;
-  emitCheck(rowCheckExpectation(trigger, localSeq, now), now, getInboxItemKey(local), {
+  emitCheck(rowCheckExpectation(trigger, local, now), now, getInboxItemKey(local), {
     outcome: agrees ? "noop" : "conflict",
     result: `${agrees ? "match" : drift.join("+")}${upToAnswer ? "_up_to_answer" : ""}`,
     detail: `${detail}${upToAnswer ? `;answer_behind=1;merged=${judged.unreadCount}/${judgedSeq ?? "-"}${mergeNote}` : ""}`,
@@ -683,8 +761,7 @@ export type AuditNotJudgedCause =
  */
 export function recordAuditNotJudged(row: ConversationRow, cause: AuditNotJudgedCause, backend: string | null = null, detail = ""): void {
   const now = currentTimeMs();
-  const seq = row.latestActivitySeq ?? null;
-  emitCheck(rowCheckExpectation("position_audit", seq, now), now, getInboxItemKey(row), {
+  emitCheck(rowCheckExpectation("position_audit", row, now), now, getInboxItemKey(row), {
     outcome: "noop",
     result: "not_judged",
     detail: `;cause=${cause}${detail}`,
@@ -695,12 +772,16 @@ export function recordAuditNotJudged(row: ConversationRow, cause: AuditNotJudged
   });
 }
 
-function rowCheckExpectation(trigger: InboxRefreshTrigger, seq: string | null, now: number): InPlaceExpectation {
-  return { trigger, existed: true, seq, reread: "position", until: now, at: now, cause: "", readState: false, readBehind: 0, loaded: null, live: null };
+function rowCheckExpectation(trigger: InboxRefreshTrigger, row: ConversationRow, now: number): InPlaceExpectation {
+  const seq = row.latestActivitySeq ?? null;
+  const scopeId = inboxItemChannelId(row);
+  const inserted = seq !== null && !!scopeId && insertedRows.get(scopeId)?.seq === seq;
+  return { trigger, existed: true, seq, reread: inserted ? "inserted" : "position", until: now, at: now, cause: "", readState: false, readBehind: 0, loaded: null, live: null };
 }
 
 export function resetInPlaceDriftForTests(): void {
   expectations.clear();
+  insertedRows.clear();
   noopChecks = 0;
   expiredAbsentChecks = 0;
 }

@@ -13,6 +13,7 @@ import {
   transferAttachmentObjectHoldsWithExecutor,
 } from "./attachmentObjectHoldService";
 import { UUID_RE } from "../lib/messageId";
+import type { RefusalInput } from "../lib/refusal";
 import { type ResolvedAttachment, withAttachmentObjectMetadata } from "./attachmentRecord";
 
 export type AttachmentLinkErrorCode =
@@ -27,13 +28,21 @@ export type AttachmentLinkErrorCode =
 
 export class AttachmentLinkError extends Error {
   readonly code: AttachmentLinkErrorCode;
-  readonly status: number;
+  readonly status: 400 | 410;
+  /** The fix, when it names how to send (a CLI flag, an API field): the refusal's step, never its sentence. */
+  readonly suggestedNextAction?: string;
 
-  constructor(code: AttachmentLinkErrorCode, message: string, status = 400) {
+  constructor(code: AttachmentLinkErrorCode, message: string, status: 400 | 410 = 400, suggestedNextAction?: string) {
     super(message);
     this.name = "AttachmentLinkError";
     this.code = code;
     this.status = status;
+    if (suggestedNextAction) this.suggestedNextAction = suggestedNextAction;
+  }
+
+  /** The refusal every send route answers with (refuse(res, err.status, err.toRefusal())). */
+  toRefusal(): RefusalInput {
+    return { code: this.code, error: this.message, ...(this.suggestedNextAction ? { suggestedNextAction: this.suggestedNextAction } : {}) };
   }
 }
 
@@ -45,10 +54,12 @@ export type AttachmentLinkHooks = Readonly<{
 /** Names the entry by position only; the rejected value is never echoed. */
 export function attachmentIdInvalidMessage(entryNumber: number): string {
   return `Not sent: attachmentIds entry ${entryNumber} is not a single attachment ID. `
-    + "Each entry must be one ID returned when the file was uploaded. "
-    + "CLI: pass one ID per --attachment-id and repeat the flag for more files. "
-    + "API/SDK: put one ID in each attachmentIds entry.";
+    + "Each entry must be one ID returned when the file was uploaded.";
 }
+
+/** How to pass several attachments: the step of attachment_id_invalid (it names a flag, so it is not in the sentence). */
+export const ATTACHMENT_ID_INVALID_NEXT_ACTION =
+  "Pass one ID per --attachment-id and repeat the flag for more files; through the API or SDK, put one ID in each attachmentIds entry.";
 
 /**
  * Reject ids that are not UUIDs before they reach a uuid column, where
@@ -58,7 +69,7 @@ export function attachmentIdInvalidMessage(entryNumber: number): string {
 function assertWellFormedAttachmentIds(attachmentIds: string[]): void {
   const index = attachmentIds.findIndex((id) => typeof id !== "string" || !UUID_RE.test(id));
   if (index < 0) return;
-  throw new AttachmentLinkError("attachment_id_invalid", attachmentIdInvalidMessage(index + 1));
+  throw new AttachmentLinkError("attachment_id_invalid", attachmentIdInvalidMessage(index + 1), 400, ATTACHMENT_ID_INVALID_NEXT_ACTION);
 }
 
 function assertNoDuplicateAttachmentIds(attachmentIds: string[]): void {

@@ -3,7 +3,6 @@ import { formatHint, RAFT_HINTS, type RaftHint, type RaftHintStyle } from "./age
 import { foldAgentOneLineText } from "./agentMessageText";
 import {
   formatAgentReplyAffordance,
-  formatAttentionHintField,
   isThirdPartyEventsTarget,
   THIRD_PARTY_EVENTS_LABEL,
   type AgentInboxTargetRow,
@@ -28,18 +27,20 @@ export type AgentInboxItemRow = AgentApiInboxItemRow & {
    */
   notDelivered?: number;
   /**
-   * The wake-up notice's own details (the daemon fills them from what its
-   * notice showed before inbox items; `inbox check` leaves them unset), in
-   * the words agents already know:
-   * `first msg=<8 chars>` after the unread count,
+   * The wake-up notice's own details (the daemon fills them; `inbox check`
+   * leaves them unset): a `  hint:` line under the row (the attention hint's
+   * sentence and its command, formatAttentionHintLine),
    */
-  firstUnreadMsgId?: string;
-  /** `N suppressed (not delivered)` after the not-delivered count, */
-  suppressed?: number;
-  /** `attention_hint=<json>` at the end of the row line, */
   attentionHint?: AttentionHint;
   /** and the non-member guidance on its own line under the row. */
   nonMemberMention?: true;
+  /**
+   * Conversation rows, set by the Computer only: the Server gave no unread
+   * number for this conversation right now (it had no row for it, or was not
+   * reached). The row then prints no count at all, because "0 unread" would
+   * be a claim nobody made.
+   */
+  unreadUnknown?: true;
 };
 
 /**
@@ -158,23 +159,46 @@ function formatAgo(row: AgentInboxItemRow, options: AgentInboxItemRowOptions): s
 /** `#general · 3 unread · mentions you · 1 new, not yet delivered · latest @alice 5m ago` */
 function formatConversationSummary(row: AgentInboxItemRow, options: AgentInboxItemRowOptions): string {
   const parts = [formatItemLabel(row.target, row.title)];
-  if (row.unread > 0 || !row.notDelivered) parts.push(`${row.unread} unread`);
-  if (row.firstUnreadMsgId) parts.push(`first msg=${foldAgentOneLineText(row.firstUnreadMsgId).slice(0, 8)}`);
+  const counted = !row.unreadUnknown;
+  if (counted && (row.unread > 0 || !row.notDelivered)) parts.push(`${row.unread} unread`);
   const mentions = row.mentions ?? 0;
   if (mentions > 0) parts.push(mentions === 1 ? "mentions you" : `mentions you ${mentions}x`);
-  if (row.notDelivered && row.notDelivered > 0) parts.push(`${row.notDelivered} new, not yet delivered`);
-  if (row.suppressed && row.suppressed > 0) parts.push(`${row.suppressed} suppressed (not delivered)`);
+  if (counted && row.notDelivered && row.notDelivered > 0) parts.push(`${row.notDelivered} new, not yet delivered`);
   const sender = row.latestSender?.name ? `@${foldAgentOneLineText(row.latestSender.name)}` : null;
   const latest = [sender, formatAgo(row, options)].filter(Boolean).join(" ");
   if (latest) parts.push(`latest ${latest}`);
-  if (row.attentionHint) parts.push(`attention_hint=${formatAttentionHintField(row.attentionHint)}`);
   return parts.join(" · ");
 }
 
-/** `app:stamp/pr-13754 · 2 unread · from Stamp · about #proj:#232 · latest 5m ago` */
+/**
+ * An attention hint as one line: its sentence, then its command unless the
+ * sentence already holds it. The hint's other fields (schema, trigger, scope,
+ * copy version, time, thresholds) are for programs and are not printed.
+ */
+export function formatAttentionHintLine(hint: AttentionHint): string {
+  const sentence = foldAgentOneLineText(hint.copy);
+  const command = foldAgentOneLineText(hint.suggested_command);
+  if (!command || sentence.includes(command)) return sentence;
+  return sentence ? `${sentence} Run: ${command}` : `Run: ${command}`;
+}
+
+const appNameKey = (text: string): string => text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+
+/**
+ * Whether an app's display name only repeats the key its `app:<key>` address
+ * already shows (`Stamp` for `stamp`, `Reaction notices` for
+ * `system.reaction-notices`). Such a name is not printed again beside the
+ * address (the row's `from …`, the read page's `From ….`).
+ */
+export function agentInboxAppNameRepeatsKey(app: { key: string; name: string }): boolean {
+  const name = appNameKey(app.name);
+  return name === appNameKey(app.key) || name === appNameKey(app.key.replace(/^system\./, ""));
+}
+
+/** `app:gh-7f3a/pr-13754 · 2 unread · from GitHub · about #proj:#232 · latest 5m ago`; no `from` when the name repeats the address (`app:stamp/…`, Stamp). */
 function formatAppSummary(row: AgentInboxItemRow, options: AgentInboxItemRowOptions): string {
   const parts = [row.target, `${row.unread} unread`];
-  const appName = row.app ? foldAgentOneLineText(row.app.name) : "";
+  const appName = row.app && !agentInboxAppNameRepeatsKey(row.app) ? foldAgentOneLineText(row.app.name) : "";
   if (appName) parts.push(`from ${appName}`);
   if (row.related?.target) parts.push(`about ${row.related.target}`);
   const ago = formatAgo(row, options);
@@ -210,7 +234,7 @@ function formatSummary(row: AgentInboxItemRow, options: AgentInboxItemRowOptions
  *     "first line of the latest message…" (truncated preview)
  *     read: raft inbox read --target "#general"
  *
- * A reminder row adds one `ack:` line per fired revision not yet acked.
+ * A wake-up row with an attention hint adds a `  hint:` line. A reminder row adds one `ack:` line per fired revision not yet acked.
  */
 export function formatAgentInboxItemRow(row: AgentInboxItemRow, options: AgentInboxItemRowOptions = {}): string[] {
   if (isThirdPartyEventsTarget(row.target)) return formatThirdPartyEventsRow(row, options);
@@ -222,6 +246,10 @@ export function formatAgentInboxItemRow(row: AgentInboxItemRow, options: AgentIn
     lines.push(`  ${JSON.stringify(row.previewTruncated ? `${text}…` : text)} (${row.previewTruncated ? "truncated preview" : "preview"})`);
   }
   lines.push(`  read: ${agentInboxReadCommand(row.target, { style, inboxRead: options.inboxRead === true })}`);
+  if (row.attentionHint) {
+    const hint = formatAttentionHintLine(row.attentionHint);
+    if (hint) lines.push(`  hint: ${hint}`);
+  }
   if (row.kind === "reminder") {
     for (const ack of row.ack ?? []) {
       lines.push(`  ack: ${formatCliOnlyHint(RAFT_HINTS.reminderAck({ id: ack.id, revision: ack.revision }), style)}`);

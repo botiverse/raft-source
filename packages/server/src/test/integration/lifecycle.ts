@@ -2,6 +2,8 @@
 export class IntegrationLifecycle {
   private readonly resources = new Set<() => Promise<void>>();
   readonly timings: Record<string, number> = {};
+  /** Set once the case is over and its resources close; a database closed before then the case closed itself. */
+  closing = false;
 
   own(dispose: () => Promise<void>): () => void {
     this.resources.add(dispose);
@@ -18,6 +20,7 @@ export class IntegrationLifecycle {
   }
 
   async close(): Promise<void> {
+    this.closing = true;
     const errors: Error[] = [];
     // Reverse acquisition order: stop HTTP producers before closing their DB.
     for (const dispose of [...this.resources].reverse()) {

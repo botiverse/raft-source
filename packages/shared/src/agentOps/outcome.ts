@@ -20,7 +20,7 @@ import type { AgentApiRouteKey } from "../agentApiContract";
 import { AGENT_API_CLIENT_UPGRADE_REQUIRED_CODE, AGENT_API_CLIENT_UPGRADE_REQUIRED_STATUS, parseAgentApiClientUpgradeRequiredBody } from "../agentApiClientUpgrade";
 import { agentApiRateLimitedSentence, parseAgentApiRateLimitedBody } from "../agentApiRateLimit";
 import { formatHint, RAFT_HINTS, type RaftHint, type RaftHintStyle, type RaftNextOperation } from "./hint";
-import { readRefusal } from "../refusal";
+import { readRefusal, REFUSAL_COMMAND_PATTERN } from "../refusal";
 
 export interface RaftNextStep {
   /** Stable step kind, for example `read_target`, `run_inbox_check`, `retry_after_review`. */
@@ -75,6 +75,13 @@ export interface RaftOpError {
   status?: number;
   /** The Server's stable machine code for an HTTP rejection, when it sent one. */
   serverCode?: string;
+  /**
+   * The client's own one-time hold, not a refusal: nothing was sent, and the
+   * same call again goes through. Its sentence and next step are all there is
+   * to it; it has no code of its own, because no program acts on which hold
+   * it was.
+   */
+  heldOnce?: true;
   /** What to do now; from the Server when it said, otherwise the SDK default for this code. */
   nextAction: string;
   retryable: boolean;
@@ -310,8 +317,21 @@ export function failureOutcome(error: RaftOpError): RaftFailure {
   return { ok: false, state: "error", error, next: { kind: "recover", why: error.nextAction, ...(operation ? { operation } : {}) }, text: formatOpErrorText(error) };
 }
 
-/** A next action written for the CLI: it names a `raft` command or a `--flag`. */
-export const CLI_NEXT_ACTION_PATTERN = /\braft [a-z]|(^|[\s`'"(])--[a-z]/;
+/** A next action written for the CLI: it names a `raft` command or a `--flag` (the rule a refusal's `error` follows, so a handle such as `@ops-raft` is no command here either). */
+export const CLI_NEXT_ACTION_PATTERN = REFUSAL_COMMAND_PATTERN;
+
+/** A double-quoted (JSON) string: how a sentence or step quotes a value someone typed (a title, a path, a query). */
+const QUOTED_VALUE = /"(?:[^"\\]|\\.)*"/g;
+
+/**
+ * Whether a sentence or step is written for the CLI (CLI_NEXT_ACTION_PATTERN),
+ * read outside the values it quotes: a title or path someone typed ("raft docs
+ * plan", "notes/--draft.md") is theirs, not a command, whether the Server's
+ * sentence quotes it or a tool-style step echoes it as JSON.
+ */
+export function namesCliCommand(text: string): boolean {
+  return CLI_NEXT_ACTION_PATTERN.test(text.replace(QUOTED_VALUE, '""'));
+}
 
 /**
  * The attachment routes answer one uniform 404 for missing, unreadable and
@@ -339,13 +359,13 @@ export function restyleDefaultNextAction<T>(outcome: T, style: RaftHintStyle): T
   if (hint) nextAction = formatHint(hint, style);
   else if (current === DEFAULT_NEXT_ACTION.NOT_FOUND) nextAction = notFoundNextAction(style);
   else if (failure.error.serverCode === "ATTACHMENT_UNAVAILABLE") nextAction = ATTACHMENT_UNAVAILABLE_TOOL_NEXT_ACTION;
-  else if (CLI_NEXT_ACTION_PATTERN.test(current)) {
+  else if (namesCliCommand(current)) {
     nextAction = failure.error.code === "NOT_FOUND" ? notFoundNextAction(style) : DEFAULT_NEXT_ACTION[failure.error.code];
   }
   // A Server sentence written for the CLI (it names a command or a flag, as
   // ATTACHMENT_UNAVAILABLE's does) is not for a model that can't run one: the
   // code's own sentence instead.
-  const message = CLI_NEXT_ACTION_PATTERN.test(failure.error.message) ? DEFAULT_MESSAGES[failure.error.code] : failure.error.message;
+  const message = namesCliCommand(failure.error.message) ? DEFAULT_MESSAGES[failure.error.code] : failure.error.message;
   if (nextAction === current && message === failure.error.message) return outcome;
   const error: RaftOpError = { ...failure.error, message, nextAction };
   const next = failure.next && failure.next.why === current ? { ...failure.next, why: nextAction } : failure.next ?? null;

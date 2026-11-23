@@ -94,6 +94,9 @@ const ACTIVITY_LABEL_IDS: Record<string, MessageId> = {
   online: "activity.log.status.idle",
   thinking: "activity.log.status.thinking",
   working: "activity.log.status.working",
+  // A live error with no more specific label: the same translated "Error" the
+  // member list uses, never the raw status value (#proj-raft-ui:9815555f).
+  error: "activity.status.error",
 };
 
 
@@ -152,9 +155,7 @@ function resolveStatusDisplay(
       primary,
       secondary: (detailKind === "runtime_crashed" || detailKind === "claude_root_privileges")
         ? detail
-        : stoppedReason
-          ? ` - ${stoppedReason}`
-          : "",
+        : stoppedReason,
     };
   }
 
@@ -320,12 +321,14 @@ function StatusEntry({ activity, detail, detailKind, timestamp, formatTimestamp,
       <span className={`block ${LOG_TITLE_CLASS}`}>
         <span>{primaryText}</span>
         {subagent && <SubagentBadge lineage={subagent} />}
-        {secondary && (
-          <span className="ml-1.5 break-words text-foreground-hint">
-            <RefText text={secondaryText} />
-          </span>
-        )}
       </span>
+      {/* Title on top, explanation below in the detail style: the same
+          layout every other row type in the raw log uses. */}
+      {secondary && (
+        <span className={`block break-words ${LOG_DETAIL_CLASS}`}>
+          <RefText text={secondaryText} />
+        </span>
+      )}
     </LogItem>
   );
 }

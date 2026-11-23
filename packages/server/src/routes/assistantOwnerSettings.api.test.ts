@@ -11,7 +11,9 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
+import { RAFT_THEME_IDS } from "@botiverse/raft-shared";
 import { createApiTest } from "../test/integration/apiTest";
+import { refusalBody } from "../lib/refusal";
 import { tokenForHuman } from "../test/integration/credentials";
 import { getDb } from "../db/index";
 import { agents, featureFlags, integrationAuditEvents, serverMembers, servers, users } from "../db/schema";
@@ -200,26 +202,30 @@ test("invalid values are refused with the web's own errors and nothing is writte
   const f = await seed();
   await getDb().update(users).set({ displayLanguage: "en", preferredTimezone: "UTC" }).where(eq(users.id, f.owner.id));
   const before = await ownerView(app.baseUrl, f);
-  const cases: Array<{ body: Record<string, unknown>; web: { path: string } }> = [
-    { body: { theme: "neon" }, web: { path: `/servers/${f.server.id}/appearance-settings` } },
-    { body: { theme: null }, web: { path: `/servers/${f.server.id}/appearance-settings` } },
-    { body: { themeDecor: "yes" }, web: { path: `/servers/${f.server.id}/appearance-settings` } },
-    { body: { preferredTimezone: "Mars/Olympus" }, web: { path: "/auth/me" } },
-    { body: { preferredTimezone: 42 }, web: { path: "/auth/me" } },
-    { body: { displayLanguage: "fr" }, web: { path: "/auth/me" } },
-    { body: { displayLanguage: false }, web: { path: "/auth/me" } },
+  // The web's status and words, in the refusal envelope with a code; the web's
+  // bare `invalid_theme` is the code, and the agent reads a sentence.
+  const themeSentence = `theme must be one of ${RAFT_THEME_IDS.join(", ")}`;
+  const cases: Array<{ body: Record<string, unknown>; web: { path: string }; code: string; error?: string }> = [
+    { body: { theme: "neon" }, web: { path: `/servers/${f.server.id}/appearance-settings` }, code: "invalid_theme", error: themeSentence },
+    { body: { theme: null }, web: { path: `/servers/${f.server.id}/appearance-settings` }, code: "invalid_theme", error: themeSentence },
+    { body: { themeDecor: "yes" }, web: { path: `/servers/${f.server.id}/appearance-settings` }, code: "theme_decor_invalid" },
+    { body: { preferredTimezone: "Mars/Olympus" }, web: { path: "/auth/me" }, code: "preferred_timezone_invalid" },
+    { body: { preferredTimezone: 42 }, web: { path: "/auth/me" }, code: "preferred_timezone_invalid" },
+    { body: { displayLanguage: "fr" }, web: { path: "/auth/me" }, code: "display_language_invalid" },
+    { body: { displayLanguage: false }, web: { path: "/auth/me" }, code: "display_language_invalid" },
   ];
-  for (const { body, web } of cases) {
+  for (const { body, web, code, error } of cases) {
     const mine = await agentCall(app.baseUrl, f.apiKey, "PATCH", body);
     const theirs = await humanCall(app.baseUrl, f.ownerToken, f.server.id, "PATCH", web.path, body);
     assert.equal(mine.status, 400, JSON.stringify(body));
-    assert.deepEqual([mine.status, mine.body], [theirs.status, theirs.body], `${JSON.stringify(body)}: the web's refusal`);
+    assert.equal(theirs.status, 400, `${JSON.stringify(body)}: the web's status`);
+    assert.deepEqual(mine.body, refusalBody({ code, error: error ?? String(theirs.body.error) }), `${JSON.stringify(body)}: the web's refusal`);
   }
   // A valid field with an invalid one: nothing of it lands.
   const mixed = await agentCall(app.baseUrl, f.apiKey, "PATCH", { theme: "space", preferredTimezone: "Mars/Olympus" });
   assert.equal(mixed.status, 400);
   const empty = await agentCall(app.baseUrl, f.apiKey, "PATCH", {});
-  assert.deepEqual([empty.status, empty.body.error], [400, "theme, themeDecor, displayLanguage or preferredTimezone is required"]);
+  assert.deepEqual([empty.status, empty.body.code, empty.body.error], [400, "owner_settings_required", "theme, themeDecor, displayLanguage or preferredTimezone is required"]);
   assert.deepEqual(await ownerView(app.baseUrl, f), before);
   assert.deepEqual(await auditRowsOf(f.assistant.id), []);
 });

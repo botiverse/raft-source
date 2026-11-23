@@ -50,6 +50,9 @@ import {
   isNotesPath,
   listAgentMigrationWorkspace,
   startMeasuringAgentMigrationIgnoredEntries,
+  AgentMigrationKeyPathUnreadableError,
+  isKeyWorkspacePath,
+  isPermissionError,
   summarizeAgentMigrationTransfer,
   type AgentMigrationExcludedIgnoredEntry,
   type AgentMigrationExportProgress,
@@ -191,6 +194,13 @@ export interface StreamAgentMigrationResumableBundleInput {
    * reportIgnoredBySource.
    */
   reportIgnoredPartial?: () => boolean;
+  /**
+   * Both ends accept SERVER_CAPABILITY_MIGRATION_SKIPPED_UNREADABLE_V1, so the
+   * summary may name the paths left behind because they could not be read
+   * (`skippedUnreadable`). They are skipped either way. Read when the summary
+   * is built, like reportIgnoredBySource.
+   */
+  reportSkippedUnreadable?: () => boolean;
   /** Tests only: a smaller bound than the summary's for sizing ignored files. */
   ignoredFileMeasureLimit?: number;
   /** Uploads one sealed chunk (retrying is up to the caller); a rejection fails the bundle. */
@@ -282,6 +292,8 @@ export async function streamAgentMigrationResumableBundle(
   const totals = { entries: 0, bytes: 0, maxEntryBytes: 0, memoryMdPresent: false, notesPresent: false };
   const resizedEntries: string[] = [];
   let resizedEntryCount = 0;
+  // Files no permission lets us read (EACCES/EPERM): left behind, not a failed move.
+  const unreadableFiles: string[] = [];
   let stopped = false;
   // Small files are read a few entries ahead of the tar writer; they are still
   // written in walk order, so the bundle bytes do not depend on read timing.
@@ -290,9 +302,14 @@ export async function streamAgentMigrationResumableBundle(
     const next = readAhead.shift()!;
     const prepared = await next.prepared;
     if (!prepared) return;
-    const packed = await writePreparedWorkspaceEntry(tarPack, prepared);
-    if (!packed) return;
     const relativePath = next.relativePath;
+    const packed = await writePreparedWorkspaceEntry(tarPack, prepared);
+    if (packed === "unreadable") {
+      if (isKeyWorkspacePath(relativePath)) throw new AgentMigrationKeyPathUnreadableError(relativePath);
+      unreadableFiles.push(relativePath);
+      return;
+    }
+    if (!packed) return;
     totals.entries += 1;
     // The workspace grew between the two walks.
     if (totals.entries > maxEntries) {
@@ -312,7 +329,7 @@ export async function streamAgentMigrationResumableBundle(
     input.onProgress?.({ phase: "packing", files: totals.entries, bytes: totals.bytes });
   };
   const packing = (async () => {
-    await listAgentMigrationWorkspace({
+    const packedListing = await listAgentMigrationWorkspace({
       workspacePath,
       measureIgnored: false,
       async onEntry(relativePath) {
@@ -328,12 +345,14 @@ export async function streamAgentMigrationResumableBundle(
     });
     while (readAhead.length > 0) await writeNext();
     tarPack.finalize();
+    return packedListing;
   })();
   packing.catch((error: unknown) => {
     tarPack.destroy(error instanceof Error ? error : new Error(String(error)));
   });
+  let packedListing: Awaited<typeof packing>;
   try {
-    await Promise.all([archiveWrite, packing]);
+    [, packedListing] = await Promise.all([archiveWrite, packing]);
   } catch (error) {
     stopMeasuringIgnored.abort();
     if (error instanceof AgentMigrationBundleTooLargeError) {
@@ -361,6 +380,13 @@ export async function streamAgentMigrationResumableBundle(
   }
 
   const ignored = await finishMeasuringIgnored(measuringIgnored, stopMeasuringIgnored, IGNORED_MEASURE_GRACE_MS);
+  // Directories the packing walk had no permission to list, and files it could not open.
+  const unreadablePaths = [
+    ...packedListing.unreachable
+      .filter((entry) => entry.detail === "EACCES" || entry.detail === "EPERM")
+      .map((entry) => `${entry.path}/`),
+    ...unreadableFiles,
+  ].sort((a, b) => a.localeCompare(b));
   const control = buildControlManifest(input, {
     bundle: {
       totalBytes: chunkWriter.totalBytes,
@@ -378,6 +404,9 @@ export async function streamAgentMigrationResumableBundle(
       excludedIgnored: ignored.entries,
       reportIgnoredBySource: input.reportIgnoredBySource?.() === true,
       ignoredPartial: !ignored.complete && input.reportIgnoredPartial?.() === true,
+      ...(input.reportSkippedUnreadable?.() === true
+        ? { skippedUnreadable: { count: unreadablePaths.length, paths: unreadablePaths } }
+        : {}),
     }),
   });
   const { sha256: controlSha256, bytes: controlBytes } = validateAgentMigrationControlManifest(control);
@@ -409,7 +438,8 @@ async function finishMeasuringIgnored(
 
 type PreparedWorkspaceEntry =
   | { kind: "buffered"; header: Headers; bytes: Buffer; resized: boolean }
-  | { kind: "streamed"; header: Headers; sourcePath: string; sizeBytes: number };
+  | { kind: "streamed"; header: Headers; sourcePath: string; sizeBytes: number }
+  | { kind: "unreadable" };
 
 /**
  * Stats one listed workspace path and reads it if it is small. Returns null
@@ -445,20 +475,22 @@ async function prepareWorkspaceEntry(
   const header: Headers = { name, type: "file", size: sizeBytes, mode, mtime };
   if (sizeBytes > READ_AHEAD_MAX_FILE_BYTES) return { kind: "streamed", header, sourcePath, sizeBytes };
   const read = await readFileExactly(sourcePath, sizeBytes);
+  if (read === "unreadable") return { kind: "unreadable" };
   return read ? { kind: "buffered", header, ...read } : null;
 }
 
 async function writePreparedWorkspaceEntry(
   tarPack: Pack,
   prepared: PreparedWorkspaceEntry,
-): Promise<{ sizeBytes: number; resized: boolean } | null> {
+): Promise<{ sizeBytes: number; resized: boolean } | "unreadable" | null> {
+  if (prepared.kind === "unreadable") return "unreadable";
   if (prepared.kind === "buffered") {
     await writeBufferedEntry(tarPack, prepared.header, prepared.bytes);
     return { sizeBytes: prepared.bytes.byteLength, resized: prepared.resized };
   }
   // Open before the tar entry exists, so a file that vanished is skipped like a small one.
   const handle = await openIfPresent(prepared.sourcePath);
-  if (!handle) return null;
+  if (!handle || handle === "unreadable") return handle;
   try {
     const { readBytes, sizeAfterRead } = await pipeFileExactly(
       handle,
@@ -474,26 +506,32 @@ async function writePreparedWorkspaceEntry(
   }
 }
 
-/** Null if the file vanished after it was listed. */
-async function openIfPresent(sourcePath: string): Promise<FileHandle | null> {
+/**
+ * Null if the file vanished after it was listed; "unreadable" if no
+ * permission lets us open it (EACCES/EPERM), so it is left behind. On Windows
+ * a file another process holds locked reports EBUSY, which still fails the move.
+ */
+async function openIfPresent(sourcePath: string): Promise<FileHandle | "unreadable" | null> {
   try {
     return await open(sourcePath, "r");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if (isPermissionError(error)) return "unreadable";
     throw error;
   }
 }
 
 /**
  * Reads exactly `sizeBytes` (zero-padded if the file shrank, cut if it grew).
- * Returns null if the file vanished after it was listed.
+ * Returns null if the file vanished after it was listed, "unreadable" if no
+ * permission lets us open it.
  */
 export async function readFileExactly(
   sourcePath: string,
   sizeBytes: number,
-): Promise<{ bytes: Buffer; resized: boolean } | null> {
+): Promise<{ bytes: Buffer; resized: boolean } | "unreadable" | null> {
   const handle = await openIfPresent(sourcePath);
-  if (!handle) return null;
+  if (!handle || handle === "unreadable") return handle;
   try {
     const bytes = Buffer.alloc(sizeBytes);
     let readBytes = 0;

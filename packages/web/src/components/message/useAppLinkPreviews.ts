@@ -3,7 +3,7 @@ import { IntlContext } from "react-intl";
 import type { RefObject } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { clearClockTimeout, currentTimeMs, setClockTimeout } from "@botiverse/raft-shared";
-import type { AppLinkPreviewContent, LinkCardReadAnswerItem, LinkCardV2 } from "@botiverse/raft-shared/src/appLinkPreview";
+import type { AppLinkPreviewContent, LinkCardObjectKeySha256, LinkCardReadAnswerItem, LinkCardV2 } from "@botiverse/raft-shared/src/appLinkPreview";
 import { appLinkReadUrls, publicPreviewUrl } from "@botiverse/raft-shared/src/appLinkPreview";
 import { useArtifactAppHosts } from "../../apps/artifacts";
 import { htmlLangForLocale } from "../../i18n/locale";
@@ -25,6 +25,7 @@ import {
   appLinkResultKey, jitterMs, nextLinkCardRetry, rateLimitedBackoffMs, readAppLinkPreviewAnswer, readLinkCardAnswer, retryAfterMsOf, setLinkCardRetryRandomForTests,
 } from "./linkCardAnswers";
 import type { LinkCardRetry } from "./linkCardAnswers";
+import { linkCardViewBusy, onLinkCardChanged, useLinkCardChangedRereads } from "./linkCardChangedRereads";
 import type { AppLinkDrawn } from "./linkCardItems";
 import type { LinkCardView, MessageLinksRead } from "./linkCardRead";
 import type { LinkCardSealTo } from "./linkCardSeal";
@@ -55,7 +56,9 @@ export type LinkCardActionHandle = Extract<LinkCardReadAnswerItem, { kind: "v2" 
  *   answer is read the same way, with `drawn` (linkCardItems.ts): whether
  *   the link is a chip and where its card goes (hover, block or none). A
  *   card message's press result carries `sealsTo`: by action_id, what a
- *   SecretInput button's values are sealed to (linkCardSeal.ts).
+ *   SecretInput button's values are sealed to (linkCardSeal.ts). `objectKey`:
+ *   the object the card shows, which a link_card.changed nudge names
+ *   (linkCardChangedRereads.ts).
  * - `connect_account`: a chip with the App's icon and the shortened address;
  *   the hover card holds Raft's own words and a button to `connectUrl`. Only
  *   a v2 or v3 read produces it.
@@ -68,7 +71,7 @@ export type AppLinkResult =
   | {
     kind: "card"; url: string; app: AppLinkApp; title: string; card?: AppLinkPreviewContent["card"]; cardV2?: LinkCardV2; inlineTitle?: string;
     actions?: readonly LinkCardActionHandle[]; businessRevision?: string; readAt?: number; view?: LinkCardMessageView; drawn?: AppLinkDrawn;
-    sealsTo?: Readonly<Record<string, LinkCardSealTo>>;
+    sealsTo?: Readonly<Record<string, LinkCardSealTo>>; objectKey?: LinkCardObjectKeySha256;
   }
   | { kind: "connect_account"; url: string; app: AppLinkApp; connectUrl: string }
   | { kind: "consent"; url: string; app: LinkPreviewApp }
@@ -123,6 +126,8 @@ type Loaded = {
   failure?: number;
   /** A card message's acting buttons (RFC 086): this viewer's `message_card` answer, read with the same request (messageCardActions.ts). */
   card?: LoadedMessageCard;
+  /** Cached while a nudge said a card's object changed: a row mounted with it shows it and reads the message again once on screen. */
+  changed?: true;
 };
 type ConsentResult = Extract<AppLinkResult, { kind: "consent" }>;
 const consentsOf = (results: AppLinkResults) => [...results.values()].filter((result): result is ConsentResult => result.kind === "consent");
@@ -263,6 +268,14 @@ export function clearAppLinkPreviewCacheForTests() {
   readHold = null;
   setLinkCardRetryRandomForTests(null);
 }
+const showsObject = (results: AppLinkResults, key: string) => [...results.values()].some((result) => result.kind === "card" && result.objectKey === key);
+// A link_card.changed nudge (linkCardChangedRereads.ts): mounted rows read
+// their cards of that object again; a cached answer showing it is marked, so a
+// row mounted with it later reads it again rather than showing the old card
+// for good (a card message's, whose buttons would show loading, is left).
+onLinkCardChanged(({ object_key_sha256: key }) => {
+  for (const [scope, entry] of resultCache) if (!entry.card && showsObject(entry.results, key)) resultCache.set(scope, { ...entry, changed: true });
+});
 useLinkPreviewConsentStore.subscribe((state, previous) => {
   const answered = Object.entries(state.status).filter(([key, status]) => previous.status[key] !== status);
   if (answered.some(([, status]) => status === "declined")) {
@@ -580,7 +593,7 @@ export function useAppLinkPreviews({ messageId, content, conversationId, enabled
     const shown = latest.current.answer;
     if (shown?.scope === scope) setCardRetry({ scope, n: (shown.card?.attempt ?? 0) + 1 });
   }, [scope]);
-  const wantsAnswer = active && (current ? stale || current.mode !== mode || reentered || (!!card && cardTries > (current.card?.attempt ?? 0)) : seen);
+  const wantsAnswer = active && (current ? stale || current.mode !== mode || reentered || (!!current.changed && seen) || (!!card && cardTries > (current.card?.attempt ?? 0)) : seen);
   useEffect(() => {
     if (!wantsAnswer) return;
     const controller = new AbortController();
@@ -661,7 +674,7 @@ export function useAppLinkPreviews({ messageId, content, conversationId, enabled
           const results = new Map([...base.results].filter(([, result]) => result.kind !== "consent" || status[linkPreviewAppKey(viewerKey, result.app.id)] !== "allowed"));
           // The allowed App's prompts go: their links are unread now.
           const unread = new Set([...base.unread ?? [], ...[...base.results.keys()].filter((url) => !results.has(url))]);
-          return { ...base, results, epochs: askedAt, unread, failure: failedRead, ...failedCard };
+          return { ...base, results, epochs: askedAt, unread, failure: failedRead, changed: undefined, ...failedCard };
         });
       });
     return () => {
@@ -874,10 +887,12 @@ export function useAppLinkPreviews({ messageId, content, conversationId, enabled
   // message; what it reads with is the latest render's. A button's re-read
   // (Refresh, or an old handle's) waits while the page's reads are held: the
   // press shows Working… meanwhile and reads as soon as Raft allows.
-  const messageView = useMemo<LinkCardMessageView>(() => ({
-    key: `${viewerKey}|${messageId}`,
-    messageId,
-    reread: async (url: string): Promise<LinkCardReread> => {
+  // `nudge` reads one link for a link_card.changed nudge, the same way: an
+  // answer with no card there keeps the card shown (Kirby; only the person's
+  // own Refresh or reopening shows it gone), and `limited` says it was rate_limited.
+  type Reread = LinkCardReread | { kind: "failed"; limited: true };
+  const messageView = useMemo<LinkCardMessageView & { nudge(url: string): Promise<Reread> }>(() => {
+    const reread = async (url: string, nudged = false): Promise<Reread> => {
       const asked = latest.current;
       // Nothing on screen yet: its first read comes once it is in view.
       if (!asked.shown) return { kind: "unshown" };
@@ -896,8 +911,9 @@ export function useAppLinkPreviews({ messageId, content, conversationId, enabled
         return { kind: "read", result: messageCardActionResult(url, asked.card, again) };
       }
       const again = readLinkCardAnswer(read.items, null);
-      if (again.retry?.urls.includes(url)) return { kind: "failed" }; // rate_limited: the card stays as it was
+      if (again.retry?.urls.includes(url)) return { kind: "failed", limited: true }; // rate_limited: the card stays as it was
       const result = again.results.get(url) ?? null;
+      if (nudged && result?.kind !== "card") return { kind: "read", result };
       setLoaded((previous) => {
         const base = previous?.scope === asked.scope ? previous : resultCache.get(asked.scope);
         if (!base) return previous;
@@ -910,12 +926,43 @@ export function useAppLinkPreviews({ messageId, content, conversationId, enabled
         return answer;
       });
       return { kind: "read", result };
+    };
+    return {
+      key: `${viewerKey}|${messageId}`, messageId, reread, nudge: (url: string) => reread(url, true),
+      beginExecute: () => {
+        const view = views.current?.scope === latest.current.scope ? views.current.view : null;
+        if (view) bumpLinkCardViewSeq(view);
+      },
+    };
+  }, [viewerKey, messageId, readSome]);
+
+  // A link_card.changed nudge for a card shown here (linkCardChangedRereads.ts):
+  // read again as Refresh reads it (one read of the view at a time, the hold,
+  // an answer that replaces the card and its cache entry), but an answer with
+  // no card keeps it. Not the view's LINK_CARD_READ_RETRIES (the hook spaces
+  // them per object); a rate_limited answer is followed up within them, as a
+  // rate-limited link is. A card whose buttons are busy or have an operation
+  // open is left to that work, which reads it again when it ends. Not on the
+  // GET (no read of one link), nor for a card message (its re-read reads its buttons).
+  useLinkCardChangedRereads({
+    enabled: active,
+    target,
+    view: messageView,
+    keyedUrls: (key) => {
+      const { answer, scope: shownScope, batched: batchedNow, card: acting } = latest.current;
+      if (!batchedNow || acting || answer?.scope !== shownScope) return [];
+      return [...answer.results.values()].flatMap((result) => (result.kind === "card" && result.objectKey === key ? [result.url] : []));
     },
-    beginExecute: () => {
-      const view = views.current?.scope === latest.current.scope ? views.current.view : null;
-      if (view) bumpLinkCardViewSeq(view);
+    afterHold: (delayMs, go) => afterReadHold(reader, delayMs, go),
+    reread: async (url) => {
+      if (linkCardViewBusy(messageView, url)) return false;
+      const read = await messageView.nudge(url);
+      const asked = latest.current.scope;
+      if (!("limited" in read) || !rereadsLeft(views, asked)) return false;
+      messageViewFor(views, asked).rereads += 1;
+      return true;
     },
-  }), [viewerKey, messageId, readSome]);
+  });
 
   // While mounted with the batched read, the message is registered with the
   // card actions: they recover the viewer's operations on its links (local

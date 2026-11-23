@@ -29,6 +29,7 @@ import {
 } from "./artifactSplash";
 import { artifactSplashDone, holdArtifactSplashCover } from "./artifactSplashHost";
 import type { ArtifactSplashIcon, ArtifactSplashSize, ArtifactSplashStage } from "./artifactSplash";
+import { useOwnerTimers } from "../../utils/ownerDocument";
 
 /**
  * The Artifact's loading splash: ONE cover over the content area from the moment the viewer (or the
@@ -189,15 +190,17 @@ export function ArtifactLoadingSplash({ stage, kind, done = false, startedAt: ow
     }
     return holdArtifactSplashCover();
   }, [done]);
+  // The splash's own window's timers (an object window's run while the main window is hidden, #337 PR3).
+  const timers = useOwnerTimers();
   useEffect(() => {
     if (!ending) return;
-    const fade = window.setTimeout(() => setEnd("fading"), ARTIFACT_SPLASH_FILL_MS + ARTIFACT_SPLASH_HOLD_MS);
-    const gone = window.setTimeout(() => setEnd("gone"), ARTIFACT_SPLASH_FILL_MS + ARTIFACT_SPLASH_HOLD_MS + ARTIFACT_SPLASH_FADE_MS);
+    const fade = timers.setTimeout(() => setEnd("fading"), ARTIFACT_SPLASH_FILL_MS + ARTIFACT_SPLASH_HOLD_MS);
+    const gone = timers.setTimeout(() => setEnd("gone"), ARTIFACT_SPLASH_FILL_MS + ARTIFACT_SPLASH_HOLD_MS + ARTIFACT_SPLASH_FADE_MS);
     return () => {
-      window.clearTimeout(fade);
-      window.clearTimeout(gone);
+      timers.clearTimeout(fade);
+      timers.clearTimeout(gone);
     };
-  }, [ending]);
+  }, [ending, timers]);
   if ((done && !ending) || (ending && end === "gone")) return null;
   const line = label ?? formatMessage({ id: stage === "starting" ? "artifacts.viewer.startingPage" : "artifacts.viewer.gettingPage" });
   const fading = ending && end === "fading";

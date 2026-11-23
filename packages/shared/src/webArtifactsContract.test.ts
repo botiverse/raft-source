@@ -7,6 +7,7 @@ import {
   ARTIFACT_COMMENT_IMAGE_MAX_BYTES,
   ARTIFACT_COMMENT_IMAGE_TYPES,
   ARTIFACT_COMMENT_MAX_IMAGES,
+  ARTIFACT_CONTENT_LINKS_MAX,
   ARTIFACT_DASHBOARD_ALL_DEFAULT_DIRS,
   ARTIFACT_DASHBOARD_ALL_DIRS,
   ARTIFACT_DASHBOARD_ALL_PAGE_LIMIT,
@@ -19,9 +20,11 @@ import {
   ARTIFACT_FRAME_SANDBOX,
   ARTIFACT_WEB_ERROR_CODES,
   artifactWebPaths,
+  type ArtifactLinkTarget,
   type ArtifactReviewRejected,
   type ArtifactReviewSubmitted,
 } from "./webArtifactsContract";
+import { artifactPublicPaths } from "./publicArtifactsContract";
 
 const id = asArtifactId("pt_3c10b4ed-d947-49df-9031-91ae837f010a");
 
@@ -41,6 +44,9 @@ test("query options are encoded and left out when absent", () => {
   assert.equal(artifactWebPaths.willNotify(id, { replyTo: asArtifactCommentId("c_9") }), `/api/artifacts/${id}/will-notify?replyTo=c_9`);
   assert.equal(artifactWebPaths.mentionCandidates(id, { q: "ki&rby" }), `/api/artifacts/${id}/mention-candidates?q=ki%26rby`);
   assert.equal(artifactWebPaths.mentionCandidates(id, {}), `/api/artifacts/${id}/mention-candidates`);
+  // Settled (#334): one path, POST to settle and DELETE to unsettle.
+  assert.equal(artifactWebPaths.settle(id), `/api/artifacts/${id}/settle`);
+  assert.ok(ARTIFACT_WEB_ERROR_CODES.includes("SETTLED_NOT_AVAILABLE"));
 });
 
 test("S5 paths: save an attachment, the share audience for a conversation, share; the home route and its narrowing preview", () => {
@@ -59,6 +65,21 @@ test("S5 paths: save an attachment, the share audience for a conversation, share
 test("locate: where the canonical link opens, one segment", () => {
   assert.equal(artifactWebPaths.locate(id), `/api/artifacts/${id}/locate`);
   assert.equal(artifactWebPaths.locate(asArtifactId("pt_a/b")), "/api/artifacts/pt_a%2Fb/locate");
+});
+
+test("links (#336): a version's links, the version only when given; the signed-out route the current version's", () => {
+  assert.equal(artifactWebPaths.links(id), `/api/artifacts/${id}/links`);
+  assert.equal(artifactWebPaths.links(id, 2), `/api/artifacts/${id}/links?version=2`);
+  assert.equal(artifactWebPaths.links(asArtifactId("pt_a/b")), "/api/artifacts/pt_a%2Fb/links");
+  assert.equal(artifactPublicPaths.links(id), `/api/public/artifacts/${id}/links`);
+  assert.equal(ARTIFACT_CONTENT_LINKS_MAX, 200);
+  // What links to it (#336 step 2, "Linked from"): signed in only, one segment.
+  assert.equal(artifactWebPaths.backlinks(id), `/api/artifacts/${id}/backlinks`);
+  assert.equal(artifactWebPaths.backlinks(asArtifactId("pt_a/b")), "/api/artifacts/pt_a%2Fb/backlinks");
+  assert.ok(!("backlinks" in artifactPublicPaths));
+  // Each target is one of three states; `deleted` and `unavailable` carry nothing else.
+  const targets: ArtifactLinkTarget[] = [{ state: "ok", title: "Plan", kind: "markdown", versionExists: true }, { state: "deleted" }, { state: "unavailable" }];
+  assert.deepEqual(targets.map((target) => target.state), ["ok", "deleted", "unavailable"]);
 });
 
 test("S2: the frame path, and which kinds are framed", () => {

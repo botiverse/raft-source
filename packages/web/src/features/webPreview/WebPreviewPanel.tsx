@@ -265,7 +265,8 @@ export function WebPreviewPanel({ page, covering }: { page: WebPreviewPage; cove
       )}
       <RowRegionBody>
         {framed ? (
-          <div className="flex min-h-0 flex-1 flex-col">
+          // The page is full-bleed: cut on a hard line where a clipped column ends (index.css Rule 2).
+          <div className="flex min-h-0 flex-1 flex-col" data-clip-edge="cut">
             <div className="min-h-0 flex-1 overflow-hidden">
               <SiteFrame url={page.url} title={host} width={covering || native ? "desktop" : width} reloads={reloads} native={native} />
             </div>

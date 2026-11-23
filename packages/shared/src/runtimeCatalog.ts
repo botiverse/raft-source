@@ -25,7 +25,15 @@ export interface RuntimeInfo {
   supported: boolean;
   /** Deprecated runtimes are hidden from selectors + detection display, but kept for backward compat with existing agents on that runtime. */
   deprecated?: boolean;
-  /** Experimental runtimes can be used but are marked as such wherever a runtime is named: not yet run end to end on a real account in Raft. */
+  /**
+   * Experimental runtimes can be used but are labelled "Experimental" wherever a
+   * runtime is named, until they have enough users and few problems (as traces
+   * and feedback show). The server decides: its catalog
+   * (`GET /api/servers/:id/runtimes`, docs/contracts/server-runtime-catalog.md)
+   * is what clients display, so dropping the label is a server release, not an
+   * app release. Clients fall back to this bundled copy only while the catalog
+   * loads, for a server too old to serve it, or for a runtime it does not list.
+   */
   experimental?: boolean;
 }
 
@@ -34,7 +42,7 @@ export const RUNTIMES: RuntimeInfo[] = [
   { id: "codex", displayName: "Codex CLI", abbreviation: "CX", binary: "codex", supported: true },
   { id: "grok", displayName: "Grok Build", abbreviation: "GK", binary: "grok", supported: true },
   { id: "builtin", displayName: "Built-in Pi", abbreviation: "BP", binary: "", supported: true },
-  { id: "antigravity", displayName: "Antigravity CLI", abbreviation: "AG", binary: "agy", supported: true, deprecated: true },
+  { id: "antigravity", displayName: "Antigravity CLI", abbreviation: "AG", binary: "agy", supported: true, experimental: true },
   // Kimi: prefer the in-process SDK (`kimi-sdk` → "Kimi Code") for new agents.
   // The legacy `kimi` (kimi-cli child-process) entry stays for backward compat
   // with existing `runtime=kimi` agents but is labelled deprecated.
@@ -52,14 +60,17 @@ export const RUNTIMES: RuntimeInfo[] = [
   { id: "opencode", displayName: "OpenCode", abbreviation: "OC", binary: "opencode", supported: true },
   { id: "pi", displayName: "Pi", abbreviation: "PI", binary: "pi", supported: true },
   // Run only on the Computer's OAR host (daemon drivers/oarOnly.ts). Creating or
-  // switching an agent to them also needs the server's per-runtime flag
-  // (`agent_runtime_oar_<id>`) and a Computer that reports the runtime.
+  // switching an agent to them needs a Computer that reports the runtime (no
+  // server flag: server runtimeAdmissionService.ts).
   { id: "qwen", displayName: "Qwen Code", abbreviation: "QW", binary: "qwen", supported: true, experimental: true },
   { id: "qoder", displayName: "Qoder", abbreviation: "QD", binary: "qodercli", supported: true, experimental: true },
+  // DeepSeek Harness (OAR's `dsh`, 0.2.1-rc.5 or later): DeepSeek credentials
+  // are configured in dsh itself, not signed in from Raft.
+  { id: "dsh", displayName: "DeepSeek Harness", abbreviation: "DS", binary: "dsh", supported: true, experimental: true },
 ];
 
 /** Runtimes that run only on the Computer's OAR host: there is no legacy driver to fall back to. */
-export const OAR_ONLY_RUNTIME_IDS: readonly string[] = ["qwen", "qoder"];
+export const OAR_ONLY_RUNTIME_IDS: readonly string[] = ["qwen", "qoder", "dsh"];
 
 /**
  * Runtimes whose own telemetry the daemon folds into per-turn token counts:
@@ -74,7 +85,7 @@ export const RUNTIMES_REPORTING_TURN_TOKENS_FROM_TELEMETRY: readonly string[] = 
  * (`trace.noteUsage` in packages/daemon/src/agentHost/oarAgentHost.ts) because
  * they run only on the OAR host (OAR_ONLY_RUNTIME_IDS) and emit `usage`.
  */
-export const RUNTIMES_REPORTING_TURN_TOKENS_FROM_OAR_USAGE: readonly string[] = ["qwen", "qoder"];
+export const RUNTIMES_REPORTING_TURN_TOKENS_FROM_OAR_USAGE: readonly string[] = ["qwen", "qoder", "dsh"];
 
 /**
  * Runtimes whose finished turns carry token counts, counted by the host the
@@ -103,15 +114,87 @@ export function runtimeReportsTurnTokens(runtime: string | null | undefined): bo
 }
 
 /**
- * Runtimes whose agents can start sub-agents that Activity lists: Claude Code,
- * Codex and Kimi Code report them from their own events (daemon
- * claudeEventNormalizer, codexEventNormalizer, drivers/kimi-sdk), Qwen Code and
- * Qoder as OAR tasks of type `agent` (agentHost/oarTaskActivity). Grok reports
- * them only on its OAR route, behind a per-server flag that is off by default:
- * add it here when that route is the default. An agent of one of these shows
- * the Sub-agents view at all times, with 0 when it has none (stdrc, 2026-11-14).
+ * What a runtime can do in Raft on the host it runs on by default, as the
+ * daemon declares it. The runtime pickers say what a missing one costs (more
+ * time, more tokens, harder to correct; web runtimeCapabilityHint.ts). The
+ * daemon test drivers/runtimeCapabilities.test.ts fails when these and the
+ * daemon's declarations disagree.
  */
-export const RUNTIMES_WITH_SUBAGENTS: readonly string[] = ["claude", "codex", "kimi-sdk", "qwen", "qoder"];
+export interface RuntimeRaftCapabilities {
+  /**
+   * A message sent while the agent works reaches it in the same turn (the
+   * driver's `busyDeliveryMode` is not "none"; on the OAR host, the launch's
+   * `busyDelivery` is "now"). Without it, it waits for the turn to end.
+   */
+  midTurnSteering: boolean;
+  /** It can split work into sub-agents that run in parallel, and Activity lists them. */
+  subagents: boolean;
+  /**
+   * It tells Raft when it compacts its context (`session.compaction:
+   * "reported"`), so Raft can plan around it; without it, a long session
+   * tends to use more tokens.
+   */
+  compactionReported: boolean;
+}
+
+/**
+ * Keyed by runtime id; every id in RUNTIMES has an entry. The default host is
+ * the legacy driver, except: Qwen Code, Qoder and DeepSeek Harness
+ * (OAR-only), Antigravity (on OAR for every server,
+ * `agent_runtime_oar_antigravity`). Grok, Cursor and
+ * OpenCode can also run on OAR behind per-server flags that are off by
+ * default; there OpenCode and Cursor steer and Grok reports sub-agents:
+ * revisit them here when one of those routes becomes the default.
+ */
+export const RUNTIME_RAFT_CAPABILITIES: Readonly<Record<string, RuntimeRaftCapabilities>> = {
+  claude: { midTurnSteering: true, subagents: true, compactionReported: true },
+  codex: { midTurnSteering: true, subagents: true, compactionReported: true },
+  grok: { midTurnSteering: true, subagents: false, compactionReported: false },
+  builtin: { midTurnSteering: true, subagents: false, compactionReported: true },
+  antigravity: { midTurnSteering: true, subagents: false, compactionReported: false },
+  "kimi-sdk": { midTurnSteering: true, subagents: true, compactionReported: true },
+  kimi: { midTurnSteering: true, subagents: false, compactionReported: true },
+  copilot: { midTurnSteering: false, subagents: false, compactionReported: false },
+  cursor: { midTurnSteering: false, subagents: false, compactionReported: true },
+  gemini: { midTurnSteering: false, subagents: false, compactionReported: false },
+  opencode: { midTurnSteering: false, subagents: false, compactionReported: false },
+  pi: { midTurnSteering: true, subagents: false, compactionReported: true },
+  qwen: { midTurnSteering: false, subagents: true, compactionReported: false },
+  qoder: { midTurnSteering: true, subagents: true, compactionReported: false },
+  dsh: { midTurnSteering: true, subagents: false, compactionReported: false },
+};
+
+export function getRuntimeRaftCapabilities(runtime: string | null | undefined): RuntimeRaftCapabilities | undefined {
+  return typeof runtime === "string" && Object.hasOwn(RUNTIME_RAFT_CAPABILITIES, runtime) ? RUNTIME_RAFT_CAPABILITIES[runtime] : undefined;
+}
+
+/**
+ * The runtimes Raft recommends: Claude Code and Codex, the best-tested with
+ * Raft. Server setup lists them first under Recommended; the runtime pickers
+ * mark them Recommended.
+ */
+export const RECOMMENDED_RUNTIME_IDS: readonly string[] = ["claude", "codex"];
+
+export function isRecommendedRuntime(runtime: string | null | undefined): boolean {
+  return typeof runtime === "string" && RECOMMENDED_RUNTIME_IDS.includes(runtime);
+}
+
+/**
+ * Runtimes whose agents can start sub-agents that Activity lists
+ * (RUNTIME_RAFT_CAPABILITIES' `subagents`): Claude Code, Codex and Kimi Code
+ * report them from their own events (daemon claudeEventNormalizer,
+ * codexEventNormalizer, drivers/kimi-sdk), Qwen Code and Qoder as OAR tasks of
+ * type `agent` (agentHost/oarTaskActivity). Grok reports them only on its OAR
+ * route, behind a per-server flag that is off by default: mark it there when
+ * that route is the default. An agent of one of these shows the Sub-agents
+ * view at all times, with 0 when it has none (stdrc, 2026-11-14).
+ * DeepSeek Harness is left out on purpose: OAR projects dsh's native child
+ * agents (linked sessions and `agent` tasks), but Raft does not read that
+ * projection for it yet, so the view would always say 0.
+ */
+export const RUNTIMES_WITH_SUBAGENTS: readonly string[] = RUNTIMES
+  .filter((runtime) => getRuntimeRaftCapabilities(runtime.id)?.subagents === true)
+  .map((runtime) => runtime.id);
 
 export function runtimeHasSubagents(runtime: string | null | undefined): boolean {
   return typeof runtime === "string" && RUNTIMES_WITH_SUBAGENTS.includes(runtime);
@@ -157,6 +240,7 @@ export function isRuntimeDeprecated(runtimeId: string): boolean {
   return RUNTIMES.some((runtime) => runtime.id === runtimeId && Boolean(runtime.deprecated));
 }
 
+/** The bundled answer; clients display the server catalog's `experimental` and use this only as its fallback. */
 export function isRuntimeExperimental(runtimeId: string): boolean {
   return RUNTIMES.some((runtime) => runtime.id === runtimeId && Boolean(runtime.experimental));
 }

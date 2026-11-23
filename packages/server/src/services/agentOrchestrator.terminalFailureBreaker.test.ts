@@ -861,12 +861,15 @@ test("dormant switch (RFC 071 §6): with outcome acks off, an open record with a
     assert.equal(await localTerminalFailureBreakerStore.compareAndSetTerminalFailureBreakerState(agent.id, 0, record), true);
     const raw = localTerminalFailureBreakerStore.getRawForTest(agent.id);
 
-    // No session, no #1221 debt: today no catch-up at all (an obligation would force one).
+    // No session, no #1221 debt (#proj-runtime:#80): ordinary read-cursor
+    // catch-up (rows 1-5), not from the obligation cursor (row 4), and no
+    // obligation batch id.
     await orchestrator.handleMachineMessage(machine.id, wakeRequest(agent.id));
     assert.equal(orchestrator.wakeOutcomes().at(-1)!.outcome, "dispatched", "the open record does not gate");
     const sessionless = orchestrator.starts.at(-1)!;
-    assert.equal(sessionless.resumeMessages, undefined);
+    assert.deepEqual(ids(sessionless.resumeMessages), rows.slice(0, 5).map((m) => m.id));
     assert.equal(sessionless.catchupBatchId, undefined);
+    assert.equal(sessionless.breakerGeneration, undefined);
 
     // With a session: today's catch-up from the read cursor (rows 1-5), not from the obligation cursor (row 4).
     await orchestrator.handleMachineMessage(machine.id, { type: "agent:status", agentId: agent.id, status: "inactive", launchId: sessionless.launchId });

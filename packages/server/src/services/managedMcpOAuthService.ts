@@ -16,8 +16,10 @@ import {
   managedMcpAssignments,
   managedMcpCredentials,
   managedMcpOAuthAttempts,
+  managedMcpPersonalGrants,
   managedMcpServers,
 } from "../db/schema";
+import { PERSONAL_ACCOUNT_REFUSAL_MESSAGES, personalSignInRefusal } from "./managedMcpPersonalAccounts";
 import {
   decryptManagedMcpSecret,
   encryptManagedMcpSecret,
@@ -355,6 +357,8 @@ async function recordConnectionOAuthStatus(
     accountLabel?: string | null;
     /** The endpoint this sign-in is now valid for (`authorized_endpoint_url`); written with `ready`. */
     authorizedEndpointUrl?: string;
+    /** Whose account a completed sign-in acts as (`signed_in_by_user_id`); written with `ready`. */
+    signedInByUserId?: string;
     appValues?: ManagedMcpServerUpdateValues;
     defaultValues?: ManagedMcpServerUpdateValues;
     /**
@@ -414,6 +418,7 @@ async function recordConnectionOAuthStatus(
           lastError: input.lastError ?? null,
           ...(input.accountLabel !== undefined ? { accountLabel: input.accountLabel } : {}),
           ...(input.authorizedEndpointUrl !== undefined ? { authorizedEndpointUrl: input.authorizedEndpointUrl } : {}),
+          ...(input.signedInByUserId !== undefined ? { signedInByUserId: input.signedInByUserId } : {}),
           updatedAt: currentDate(),
         })
         .where(eq(managedMcpCredentials.id, connection.id));
@@ -508,16 +513,26 @@ async function updateCatalog(
   connectionId: string,
   toolCatalog: ManagedMcpToolCatalogEntry[],
   accountLabel: string | null,
+  signedInByUserId: string,
+  /**
+   * Whether this sign-in's tool list becomes the App's catalogue, which every viewer and Agent reads.
+   * Only a shared Connection's: a member's own account (RFC 087) must not change what everyone sees.
+   */
+  writeAppCatalog: boolean,
 ): Promise<void> {
   const updated = await recordConnectionOAuthStatus(server, connectionId, {
     status: "ready",
     accountLabel,
     // Fenced on the App's configuration in the same transaction, so this is the server signed in to.
     authorizedEndpointUrl: server.endpointUrl,
-    appValues: {
-      toolCatalog,
-      catalogVersion: sql`${managedMcpServers.catalogVersion} + 1`,
-    },
+    // The person whose sign-in this is: the tokens act as their account.
+    signedInByUserId,
+    ...(writeAppCatalog ? {
+      appValues: {
+        toolCatalog,
+        catalogVersion: sql`${managedMcpServers.catalogVersion} + 1`,
+      },
+    } : {}),
     defaultValues: {
       lastCheckedAt: currentDate(),
       lastCheckError: null,
@@ -556,7 +571,7 @@ export type ManagedMcpOAuthStartTarget =
  * age past the attempt TTL, so a row whose first attempt is being written right now is safe.
  * Returns the reused Connection id, if any.
  */
-async function reclaimAbandonedOAuthConnections(server: ServerRow, userId: string, name: string): Promise<string | null> {
+async function reclaimAbandonedOAuthConnections(server: ServerRow, userId: string, name: string, personal: boolean): Promise<string | null> {
   const now = currentDate();
   const abandoned = and(
     eq(managedMcpCredentials.serverId, server.serverId),
@@ -566,6 +581,12 @@ async function reclaimAbandonedOAuthConnections(server: ServerRow, userId: strin
     inArray(managedMcpCredentials.authStatus, ["pending", "error"]),
     sql`not exists (select 1 from ${managedMcpOAuthAttempts} where ${managedMcpOAuthAttempts.connectionId} = ${managedMcpCredentials.id} and ${managedMcpOAuthAttempts.status} = 'consumed')`,
     sql`not exists (select 1 from ${managedMcpAssignments} where ${managedMcpAssignments.boundConnectionId} = ${managedMcpCredentials.id})`,
+    sql`not exists (select 1 from ${managedMcpPersonalGrants} where ${managedMcpPersonalGrants.connectionId} = ${managedMcpCredentials.id})`,
+    // A personal start reclaims only the starter's own abandoned rows, a shared start only shared
+    // ones: a member's sign-in never deletes an admin's pending Connection or another member's.
+    personal
+      ? and(eq(managedMcpCredentials.ownerKind, "personal"), eq(managedMcpCredentials.ownerUserId, userId))
+      : eq(managedMcpCredentials.ownerKind, "shared"),
   );
   await getDb().delete(managedMcpCredentials).where(and(
     abandoned,
@@ -575,18 +596,29 @@ async function reclaimAbandonedOAuthConnections(server: ServerRow, userId: strin
   const [mine] = await getDb()
     .select({ id: managedMcpCredentials.id })
     .from(managedMcpCredentials)
-    .where(and(abandoned, eq(managedMcpCredentials.createdByUserId, userId), eq(managedMcpCredentials.name, name)))
+    .where(and(
+      abandoned,
+      eq(managedMcpCredentials.createdByUserId, userId),
+      eq(managedMcpCredentials.name, name),
+    ))
     .limit(1);
   return mine?.id ?? null;
 }
 
+/**
+ * `personal`: the sign-in is for the starter's own Connection (RFC 087 §7.1). A new one is written
+ * as theirs (`owner_kind` personal, `owner_user_id` the starter; fixed at insert), and an existing one
+ * must already be theirs. A shared sign-in never lands on a personal Connection: nobody signs in
+ * someone else's own account, an admin included. Either mismatch answers as an unknown Connection.
+ */
 async function resolveStartTarget(
   server: ServerRow,
   userId: string,
   target: ManagedMcpOAuthStartTarget | undefined,
+  personal = false,
 ): Promise<{ connectionId: string; created: boolean; isServerDefault: boolean }> {
   if (target && "newConnectionName" in target) {
-    const reused = await reclaimAbandonedOAuthConnections(server, userId, target.newConnectionName);
+    const reused = await reclaimAbandonedOAuthConnections(server, userId, target.newConnectionName, personal);
     if (reused) return { connectionId: reused, created: true, isServerDefault: false };
     // A new Connection is never the default when it is created: it has no tokens yet. Becoming the
     // default is a separate, admin-only decision applied after a successful sign-in.
@@ -598,8 +630,13 @@ async function resolveStartTarget(
       authKind: "oauth",
       authStatus: "pending",
       createdByUserId: userId,
+      ...(personal ? { ownerKind: "personal" as const, ownerUserId: userId } : {}),
     }).returning({ id: managedMcpCredentials.id });
     return { connectionId: row.id, created: true, isServerDefault: false };
+  }
+  // A personal sign-in always names its Connection (new or the person's own); never the default.
+  if (personal && !target) {
+    throw new ManagedMcpOAuthError("MCP OAuth connection not found", "managed_mcp_oauth_connection_not_found");
   }
   const connectionId = target?.connectionId ?? null;
   const select = () => getDb()
@@ -607,6 +644,8 @@ async function resolveStartTarget(
       id: managedMcpCredentials.id,
       isServerDefault: managedMcpCredentials.isServerDefault,
       authKind: managedMcpCredentials.authKind,
+      ownerKind: managedMcpCredentials.ownerKind,
+      ownerUserId: managedMcpCredentials.ownerUserId,
     })
     .from(managedMcpCredentials)
     .where(connectionScope(server.serverId, server.id, connectionId))
@@ -624,7 +663,10 @@ async function resolveStartTarget(
     }).onConflictDoNothing();
     [row] = await select();
   }
-  if (!row || row.authKind === "headers") {
+  const sameOwner = personal
+    ? row?.ownerKind === "personal" && row.ownerUserId === userId
+    : row?.ownerKind === "shared";
+  if (!row || row.authKind === "headers" || !sameOwner) {
     throw new ManagedMcpOAuthError(
       "MCP OAuth connection not found",
       "managed_mcp_oauth_connection_not_found",
@@ -710,7 +752,11 @@ export async function startManagedMcpOAuthConnection(input: {
   const submittedClient = normalizeManagedMcpOAuthClient(input.oauthClient);
   enforceOAuthClientMode(clientMode, submittedClient, raftClient);
   const oauthClient = enforceOAuthClientPolicy(policy, submittedClient, raftClient);
-  const target = await resolveStartTarget(initialServer, input.userId, input.connection);
+  const target = await resolveStartTarget(initialServer, input.userId, input.connection, input.intent?.kind === "personal");
+  // The callback audits `mcp_connection.created` for a Connection this sign-in made (`name`).
+  const intent: ManagedMcpOAuthIntent | null = target.created && input.connection && "newConnectionName" in input.connection
+    ? { ...input.intent, name: input.connection.newConnectionName }
+    : input.intent ?? null;
   const state = randomBytes(32).toString("base64url");
   let attemptId: string | null = null;
   try {
@@ -730,7 +776,7 @@ export async function startManagedMcpOAuthConnection(input: {
           state,
           connectionId: target.connectionId,
           replacesLegacyAttempts: target.isServerDefault,
-          intent: input.intent ?? null,
+          intent,
         }));
         // The lease and the replaced pending attempt fence this Connection only. Never change
         // another Connection's client or the App's assignment/default selection.
@@ -841,9 +887,22 @@ export async function completeManagedMcpOAuthConnection(input: {
   let superseded = false;
   // Which step failed, so the Connection says why: no tokens, or tokens the MCP server refused.
   let stage: "token" | "tools" | null = null;
+  // RFC 087 §7.1: a personal sign-in (old rows have no kind: shared).
+  const personal = attempt.intent?.kind === "personal";
+  // A personal sign-in refused at the callback: nothing is stored on it.
+  let refusedPersonal = false;
 
   try {
-    if (
+    // Re-checked now, not trusted from the start: a shared sign-in needs manageExternalAuth still; a
+    // personal one needs the flag, the App's members_can_connect and the starter still a member who
+    // is not a guest (the toggle or the person may have changed while they were at the provider).
+    if (personal) {
+      const refusal = await personalSignInRefusal(getDb(), { serverId: attempt.serverId, appId: attempt.mcpServerId, userId: attempt.userId });
+      if (refusal) {
+        refusedPersonal = true;
+        throw new ManagedMcpOAuthError(PERSONAL_ACCOUNT_REFUSAL_MESSAGES[refusal], "managed_mcp_oauth_invalid_state");
+      }
+    } else if (
       !(await actorHasServerCapabilityInServer(
         attempt.serverId,
         "user",
@@ -865,6 +924,15 @@ export async function completeManagedMcpOAuthConnection(input: {
       attempt.configVersion,
       async (server, provider, storage, lease) => {
         connectionId = lease.credentialId;
+        // The Connection is the kind the sign-in was started for: the starter's own for a personal
+        // one, a shared one otherwise (resolveStartTarget held it; owner columns never change).
+        const ownerMatches = personal
+          ? lease.credential.ownerKind === "personal" && lease.credential.ownerUserId === attempt.userId
+          : lease.credential.ownerKind === "shared";
+        if (!ownerMatches) {
+          refusedPersonal = personal;
+          throw new ManagedMcpOAuthError("MCP OAuth authorization is no longer permitted", "managed_mcp_oauth_invalid_state");
+        }
         if (storage.authorizationState !== undefined && storage.authorizationState !== input.state) {
           superseded = true;
           throw new ManagedMcpOAuthError("MCP OAuth sign-in was replaced", "managed_mcp_oauth_invalid_state");
@@ -882,7 +950,7 @@ export async function completeManagedMcpOAuthConnection(input: {
         );
         // Network steps are done; a failure from here on is Raft's own, not the provider's.
         stage = null;
-        await updateCatalog(server, lease.credentialId, toolCatalog, accountLabelFromTokens(storage.tokens));
+        await updateCatalog(server, lease.credentialId, toolCatalog, accountLabelFromTokens(storage.tokens), attempt.userId, lease.credential.ownerKind === "shared");
       },
     );
     return {
@@ -909,6 +977,17 @@ export async function completeManagedMcpOAuthConnection(input: {
         ),
       )
       .limit(1);
+    // A personal Connection this sign-in made, refused at the callback, is not created: its pending
+    // row goes (never signed in, so it holds no tokens and no grants). One that existed stays.
+    if (refusedPersonal && attempt.intent?.name !== undefined && connectionId !== null) {
+      await getDb().delete(managedMcpCredentials).where(and(
+        eq(managedMcpCredentials.id, connectionId),
+        eq(managedMcpCredentials.ownerKind, "personal"),
+        eq(managedMcpCredentials.ownerUserId, attempt.userId),
+        sql`${managedMcpCredentials.authStatus} <> 'ready'`,
+      ));
+      throw error;
+    }
     const lastError = managedMcpOAuthCompletionError(stage, error);
     if (frozenServer && !superseded) await recordConnectionOAuthStatus(frozenServer, connectionId, {
       status: "error",
@@ -1101,6 +1180,8 @@ export async function disconnectManagedMcpOAuthConnection(
             ...(storage.raftClientScope ? { raftClientScope: storage.raftClientScope } : {}),
             authorizationState: randomBytes(32).toString("base64url"),
           } satisfies ManagedMcpOAuthStorage),
+          // No sign-in is held any more, so it acts as nobody.
+          signedInByUserId: null,
           credentialVersion: sql`${managedMcpCredentials.credentialVersion} + 1`,
           updatedAt: currentDate(),
         })

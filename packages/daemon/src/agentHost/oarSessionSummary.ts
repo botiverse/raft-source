@@ -25,7 +25,7 @@
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import type { RawEvent, ToolOutputPart } from "@botiverse/oar";
+import type { ContextUsageCapability, RawEvent, ToolOutputPart } from "@botiverse/oar";
 import { isMutatingCommand, isRaftMessageReaderCommand, maskSecrets, parseMessageChunks, parseSentMessage, pathsIn, todoItems, type PanelTodoItem } from "../wakeBriefingPanel";
 
 export const SESSION_SUMMARY_VERSION = 1;
@@ -84,6 +84,17 @@ export interface SessionSummary {
   lastActivityAt: string | null;
   /** The last context size the runtime reported; null when it reported none (the fresh-session decision then resumes). */
   context: { tokens: number; window: number | null; at: string } | null;
+  /**
+   * What OAR declares about `context` for the installation the session runs
+   * on (`oarInstalledSessionCapabilities(...).contextUsage`), set when the
+   * session's recorder starts. The fresh-session decision trusts `context`
+   * only when `tokens` is declared (`summarySuppliesResumeFacts`). Optional:
+   * absent (a file an older daemon wrote, an unmeasured installation) is
+   * unknown, and the summary then supplies no resume facts.
+   */
+  contextUsage?: ContextUsageCapability;
+  /** The prompt-cache write TTL tier last reported by `UsageReport.cacheWriteByTtl` (OAR 0.123+, e.g. Claude 5m vs 1h); optional so older files stay valid. */
+  cacheTier?: "5m" | "1h" | null;
   turns: { count: number; lastEndedAt: string | null; lastOutcome: string | null };
   compactions: { count: number; lastAt: string | null };
   /** The input that started the session's latest turn. */
@@ -130,6 +141,7 @@ export function emptySessionSummary(runtime: string, sessionId: string, nowMs: n
     updatedAt: iso(nowMs),
     lastActivityAt: null,
     context: null,
+    cacheTier: null,
     turns: { count: 0, lastEndedAt: null, lastOutcome: null },
     compactions: { count: 0, lastAt: null },
     wake: null,
@@ -143,7 +155,15 @@ export function emptySessionSummary(runtime: string, sessionId: string, nowMs: n
 }
 
 /** The summary a session starts from: the rolling windows carry over, the session's own facts reset. */
-export function summaryForSession(previous: SessionSummary | null, runtime: string, sessionId: string, nowMs: number): SessionSummary {
+export function summaryForSession(previous: SessionSummary | null, runtime: string, sessionId: string, nowMs: number, contextUsage?: ContextUsageCapability | null): SessionSummary {
+  const summary = summaryCarriedOver(previous, runtime, sessionId, nowMs);
+  // The installation opening the session now answers for its context, never an earlier one.
+  delete summary.contextUsage;
+  if (contextUsage) summary.contextUsage = { tokens: contextUsage.tokens, contextWindow: contextUsage.contextWindow };
+  return summary;
+}
+
+function summaryCarriedOver(previous: SessionSummary | null, runtime: string, sessionId: string, nowMs: number): SessionSummary {
   if (previous && previous.sessionId === sessionId) return { ...previous, runtime };
   const fresh = emptySessionSummary(runtime, sessionId, nowMs);
   if (!previous) return fresh;
@@ -239,8 +259,10 @@ export class SessionSummaryRecorder {
     private readonly sessionId: string,
     private readonly workingDirectory: string,
     private readonly now: () => number,
+    /** OAR's `contextUsage` declaration for the session's installation; null or absent when unknown. */
+    contextUsage: ContextUsageCapability | null = null,
   ) {
-    this.summary = summaryForSession(store.read(agentId), runtime, sessionId, now());
+    this.summary = summaryForSession(store.read(agentId), runtime, sessionId, now(), contextUsage);
   }
 
   current(): SessionSummary {
@@ -316,6 +338,12 @@ export class SessionSummaryRecorder {
           const context = event.usage.context;
           if (context && typeof context.tokens === "number" && context.tokens > 0) {
             this.summary.context = { tokens: context.tokens, window: context.contextWindow ?? null, at: iso(record.receivedAt) };
+          }
+          const byTtl = event.usage.cacheWriteByTtl;
+          if (byTtl) {
+            const positive = (value: unknown): boolean => typeof value === "number" && Number.isFinite(value) && value > 0;
+            if (positive(byTtl["1h"])) this.summary.cacheTier = "1h";
+            else if (positive(byTtl["5m"])) this.summary.cacheTier = "5m";
           }
           break;
         }
@@ -515,6 +543,10 @@ export function sessionSummaryFromJson(value: unknown): SessionSummary | null {
   const context = isRecord(value.context) && typeof value.context.tokens === "number" && value.context.tokens > 0 && isString(value.context.at)
     ? { tokens: value.context.tokens, window: typeof value.context.window === "number" ? value.context.window : null, at: value.context.at }
     : null;
+  const cacheTier = value.cacheTier === "5m" || value.cacheTier === "1h" ? value.cacheTier : null;
+  const contextUsage = isRecord(value.contextUsage) && typeof value.contextUsage.tokens === "boolean" && typeof value.contextUsage.contextWindow === "boolean"
+    ? { tokens: value.contextUsage.tokens, contextWindow: value.contextUsage.contextWindow }
+    : null;
   const turns = isRecord(value.turns) && isCount(value.turns.count)
     ? { count: value.turns.count, lastEndedAt: isNullableString(value.turns.lastEndedAt) ? value.turns.lastEndedAt : null, lastOutcome: isNullableString(value.turns.lastOutcome) ? value.turns.lastOutcome : null }
     : { count: 0, lastEndedAt: null, lastOutcome: null };
@@ -543,6 +575,8 @@ export function sessionSummaryFromJson(value: unknown): SessionSummary | null {
     updatedAt: isString(value.updatedAt) ? value.updatedAt : new Date(0).toISOString(),
     lastActivityAt: isNullableString(value.lastActivityAt) ? value.lastActivityAt : null,
     context,
+    ...(contextUsage ? { contextUsage } : {}),
+    ...(cacheTier ? { cacheTier } : {}),
     turns,
     compactions,
     wake,
@@ -591,6 +625,14 @@ export class SessionSummaryStore {
         rmSync(temp, { force: true });
         throw error;
       }
+    } catch (error) {
+      this.onError(agentId, error);
+    }
+  }
+
+  delete(agentId: string): void {
+    try {
+      rmSync(this.filePath(agentId), { force: true });
     } catch (error) {
       this.onError(agentId, error);
     }

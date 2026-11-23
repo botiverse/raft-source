@@ -174,7 +174,7 @@ test("an agent's removal through the agent API is agent_api with the agent as ac
     channelId: channel.id,
     body: { userId: member.id },
   });
-  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(result.status, 200, JSON.stringify(result));
   assert.equal(await isChannelHuman(channel.id, member.id), false);
   const [event, ...rest] = await channelEvents(member.id);
   assert.equal(rest.length, 0);

@@ -1,0 +1,18 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "kimi-sdk",
+  "schemaVersion": "kimi-sdk.create.v1",
+  "sourceId": "model",
+  "kind": "select",
+  "pointer": "/model",
+  "options": [
+    {
+      "value": "kimi-code/kimi-for-coding",
+      "label": "Kimi for Coding (default)"
+    }
+  ],
+  "defaultValue": "kimi-code/kimi-for-coding",
+  "status": "fallback",
+  "reason": "missing_config",
+  "retryable": false
+}

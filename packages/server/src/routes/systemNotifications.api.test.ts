@@ -258,6 +258,21 @@ test("usage-limit attention syncs per-recipient seen/dismiss and resurfaces on a
     );
     assert.equal(response.status, 200);
   };
+  const refusedReceipt = async (token: string, incidentId: string, action: "seen" | "dismiss") => {
+    const response = await fetch(
+      `${app.baseUrl}/api/servers/${server.id}/system-notifications-v2/${incidentId}/${action}`,
+      { method: "POST", headers: headers(token) },
+    );
+    return [response.status, await response.json()];
+  };
+  // A member who is not an owner or admin, and an id no live incident has, read the same. An id that isn't a UUID
+  // never reaches the route: the router's path guard (guardUuidPathParams) answers it, with the sentence and no code.
+  const notFound = [404, { error: "System attention incident not found", code: "system_attention_incident_not_found", errorCode: "system_attention_incident_not_found" }];
+  for (const action of ["seen", "dismiss"] as const) {
+    assert.deepEqual(await refusedReceipt(memberToken, first.id, action), notFound);
+    assert.deepEqual(await refusedReceipt(ownerToken, randomUUID(), action), notFound);
+    assert.deepEqual(await refusedReceipt(ownerToken, "not-an-incident", action), [404, { error: "System attention incident not found" }]);
+  }
 
   const ownerInitial = await read(ownerToken);
   assert.equal(ownerInitial.contractVersion, "server-system-attention-v1");
@@ -510,6 +525,44 @@ test("usage-limit attention comes from model groups' windows only once the accou
   }));
   const used = (await laterService.listForReceiver(server.id, owner.id)).notifications;
   assert.deepEqual(used.map((notification) => notification.provider), ["antigravity", "antigravity"], "rate limited: the groups' windows notify");
+});
+
+// Agents on their own account folder (CODEX_HOME): an account the Computer
+// read from a folder holds only its agents; the default account the rest.
+test("usage-limit attention: a folder account names only its agents, the default account the provider's others", async ({ db }) => {
+  void db;
+  const owner = await createVerifiedUser(`ula-folder-${randomUUID().slice(0, 8)}@slock.test`);
+  const server = await createServer("Usage attention folders", `usage-attention-folder-${randomUUID().slice(0, 8)}`, owner.id);
+  const [machine] = await getDb().insert(machines).values({
+    serverId: server.id,
+    userId: owner.id,
+    name: "Codex folders box",
+    apiKeyHash: `unused-folder-attention-${randomUUID()}`,
+  }).returning();
+  const [shared, ownA, ownB] = await getDb().insert(agents).values([
+    { serverId: server.id, name: "shared-codex", machineId: machine!.id, runtime: "codex", status: "active" },
+    { serverId: server.id, name: "own-a", machineId: machine!.id, runtime: "codex", status: "active" },
+    { serverId: server.id, name: "own-b", machineId: machine!.id, runtime: "codex", status: "active" },
+  ]).returning();
+  const now = new Date("2026-11-18T08:00:00.000Z");
+  const service = new UsageLimitAttentionService(() => now);
+  const window = (status: "ok" | "limit_reached") => ({ id: "w0_aaaaaaaaaaaa", label: "5h", status, usedRatio: status === "ok" ? 0.4 : 1 });
+  await service.ingest(machine!.id, parseRuntimeAccountUsageSnapshot({
+    protocolVersion: RUNTIME_ACCOUNT_USAGE_PROTOCOL_VERSION,
+    provider: "codex",
+    collectedAt: now.toISOString(),
+    staleAfter: new Date(now.getTime() + 60_000).toISOString(),
+    collectorVersion: "test",
+    accounts: [
+      { accountKey: "a".repeat(64), health: "rate_limited", windows: [window("limit_reached")] },
+      // A listed agent no longer on this Computer is not named.
+      { accountKey: "b".repeat(64), health: "rate_limited", windows: [window("limit_reached")], agentIds: [ownA!.id, randomUUID()] },
+      { accountKey: "c".repeat(64), health: "ok", windows: [window("ok")], agentIds: [ownB!.id] },
+    ],
+  }));
+  const rows = await getDb().select().from(systemAttentionIncidents).where(eq(systemAttentionIncidents.machineId, machine!.id));
+  const byAccount = Object.fromEntries(rows.map((row) => [row.accountKeyHash[0], [...row.affectedAgentIds].sort()]));
+  assert.deepEqual(byAccount, { a: [shared!.id], b: [ownA!.id] }, "the default account holds the shared agent only; own-b's account is not at its limit");
 });
 
 // Claude's Fable week at its limit: OAR says rate limited, but all models

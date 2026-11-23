@@ -36,7 +36,7 @@ const REAL_PG_REQUIRED = process.env.SHARE_LINK_TARGET_REAL_PG_REQUIRED === "1";
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("../../drizzle", import.meta.url));
 const REAL_PG_TEST = { skip: !(REAL_PG_URL || REAL_PG_REQUIRED), timeout: 120_000 };
 
-const INVALID_INVITE = { error: "This private app invite is invalid or has expired", code: "private_app_invite_invalid" };
+const INVALID_INVITE = { error: "This private app invite is invalid or has expired", code: "private_app_invite_invalid", errorCode: "private_app_invite_invalid" };
 
 /** Polls until `count` backends of this database wait on a heavyweight lock. */
 async function waitForLockWaiters(count: number) {

@@ -5,8 +5,8 @@ import { EventEmitter } from "node:events";
 import { guardRuntimeChild, spawnRuntimeChild } from "./runtimeChild";
 import { logger } from "../logger";
 import { AGENT_STOP_KILL_CONFIRM_MS, AGENT_STOP_KILL_GRACE_MS } from "./processStop";
-import { ChildProcessRuntimeSession } from "./runtimeSession";
-import type { ParsedEvent, RuntimeDriver, SpawnContext, SpawnResult } from "./types";
+import { CLOSE_AFTER_EXIT_GRACE_MS, ChildProcessRuntimeSession } from "./runtimeSession";
+import type { ParsedEvent, RuntimeDriver, RuntimeExitInfo, SpawnContext, SpawnResult } from "./types";
 
 class FakeChildProcess extends EventEmitter {
   stdout = new EventEmitter();
@@ -526,6 +526,67 @@ test(
 );
 
 test(
+  "#o11y-alerts:#5 (real processes): a runtime that exits while a child still holds and writes its stdio is released (close follows), and the child lives on",
+  { skip: process.platform === "win32", timeout: 20_000 },
+  async () => {
+    const { spawn } = await import("node:child_process");
+    const { mkdtemp, readFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = await mkdtemp(join(tmpdir(), "runtime-stdio-held-"));
+    const { rm, writeFile } = await import("node:fs/promises");
+    onTestFinished(() => rm(dir, { recursive: true, force: true }));
+    const writerFile = join(dir, "writer.js");
+    await writeFile(writerFile, `setInterval(() => { process.stdout.write(JSON.stringify({ text: "tick" }) + "\\n"); process.stderr.write("tock\\n"); }, 200);\n`);
+    const pidFile = join(dir, "child.pid");
+    // An MCP server or a tool's command that inherited the runtime's stdout
+    // and stderr: Node's `close` waits for it. The runtime exits on SIGTERM.
+    const script = [
+      // It keeps writing: a pipe with no reader would kill it (SIGPIPE).
+      `const c = require("child_process").spawn(process.execPath, [${JSON.stringify(writerFile)}], { detached: true, stdio: ["ignore", "inherit", "inherit"] });`,
+      `require("fs").writeFileSync(${JSON.stringify(pidFile)}, String(c.pid));`,
+      `process.on("SIGTERM", () => process.exit(0));`,
+      `setInterval(() => {}, 1000);`,
+    ].join("\n");
+    const root = spawn(process.execPath, ["-e", script], { stdio: ["pipe", "pipe", "pipe"] });
+    let childPid = 0;
+    for (let i = 0; i < 100 && !childPid; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      childPid = Number((await readFile(pidFile, "utf8").catch(() => "")).trim()) || 0;
+    }
+    assert.ok(childPid > 0, "precondition: the child holding the stdio started");
+    onTestFinished(() => {
+      try {
+        process.kill(childPid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    });
+    const driver = new Utf8Driver();
+    (driver as { spawned: unknown }).spawned = root;
+    const session = new ChildProcessRuntimeSession(driver, spawnContext);
+    const closes: RuntimeExitInfo[] = [];
+    session.on("close", (info) => closes.push(info));
+    await session.start({ text: "start" });
+
+    await session.stop({ signal: "SIGTERM", forceAfterMs: 3_000 });
+    assert.equal(session.closed, true, "the runtime itself exited on SIGTERM");
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    assert.equal(closes.length, 0, "precondition: the child's hold on the pipes delays Node's close");
+
+    for (let i = 0; i < 200 && closes.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(closes.length, 1, "close follows once the session releases the process");
+    const closed: RuntimeExitInfo = closes[0]!;
+    assert.ok((closed.stdioHeldAfterExit?.waitedMs ?? 0) >= CLOSE_AFTER_EXIT_GRACE_MS - 50, JSON.stringify(closed));
+    // Still writing a second later: the pipes are drained, not destroyed.
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    assert.equal(pidAlive(childPid), true, "what the agent left running, still writing, is not killed (task #25)");
+  },
+);
+
+test(
   "task #25 (real processes): a runtime still alive at the deadline is SIGKILLed with its hung child",
   { skip: process.platform === "win32" },
   async () => {
@@ -581,6 +642,98 @@ test(
     assert.equal(session.closed, true, "the runtime is SIGKILLed");
     assert.equal(escalations.length, 1);
     assert.equal(pidAlive(grandchildPid), false, "the grandchild in its group is killed with it");
+  },
+);
+
+/** Gone, or a zombie nobody reaped yet (a container whose PID 1 doesn't reap orphans): either way it no longer runs. */
+async function processGone(pid: number): Promise<boolean> {
+  if (!pidAlive(pid)) return true;
+  const { execFileSync } = await import("node:child_process");
+  try {
+    return execFileSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).trim().startsWith("Z");
+  } catch {
+    return true;
+  }
+}
+
+async function psField(pid: number, field: "pgid" | "ppid" | "sid"): Promise<number> {
+  const { execFileSync } = await import("node:child_process");
+  return Number(execFileSync("ps", ["-o", `${field}=`, "-p", String(pid)], { encoding: "utf8" }).trim());
+}
+
+/**
+ * #proj-raft-computer:#59: an agent's runtime, started the way every driver
+ * starts one, that puts a long-running job in the background with `nohup ... &`
+ * from a shell that exits at once (the job is reparented: ppid 1 on macOS, the
+ * nearest subreaper on Linux) and ignores SIGTERM, so a stop has to escalate.
+ */
+async function realAgentRuntimeWithNohupJob(label: string) {
+  const { mkdtemp, readFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), `runtime-agent-${label}-`));
+  onTestFinished(() => rm(dir, { recursive: true, force: true }));
+  const jobPidFile = join(dir, "job.pid");
+  const script = [
+    `process.on("SIGTERM", () => {});`,
+    `require("child_process").spawn("sh", ["-c", ${JSON.stringify(`nohup sleep 60 >/dev/null 2>&1 & echo $! > ${jobPidFile}`)}], { stdio: "ignore" });`,
+    `setInterval(() => {}, 1000);`,
+  ].join("\n");
+  const root = spawnRuntimeChild(process.execPath, ["-e", script], { stdio: ["pipe", "pipe", "pipe"] });
+  let jobPid = 0;
+  for (let i = 0; i < 100 && !jobPid; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    jobPid = Number((await readFile(jobPidFile, "utf8").catch(() => "")).trim()) || 0;
+  }
+  assert.ok(jobPid > 0, `precondition: agent ${label}'s background job started`);
+  onTestFinished(() => {
+    for (const pid of [jobPid, root.pid]) {
+      if (typeof pid === "number" && pid > 0 && pidAlive(pid)) process.kill(pid, "SIGKILL");
+    }
+  });
+  const driver = new Utf8Driver();
+  (driver as { spawned: unknown }).spawned = root;
+  const session = new ChildProcessRuntimeSession(driver, { ...spawnContext, agentId: `agent-${label}` });
+  await session.start({ text: "start" });
+  return { session, rootPid: root.pid!, jobPid };
+}
+
+test(
+  "#59 (real processes): a runtime leads its own process group and session; a nohup'd job stays in it after being reparented",
+  { skip: process.platform === "win32" },
+  async () => {
+    const { session, rootPid, jobPid } = await realAgentRuntimeWithNohupJob("a");
+    onTestFinished(() => session.stop({ signal: "SIGKILL" }));
+
+    assert.equal(await psField(rootPid, "pgid"), rootPid, "the runtime leads its own process group");
+    assert.notEqual(await psField(rootPid, "pgid"), await psField(process.pid, "pgid"), "not the daemon's group");
+    // Session ids via ps are checked on Linux only (macOS ps has no portable sid column).
+    if (process.platform === "linux") assert.equal(await psField(rootPid, "sid"), rootPid, "and its own session (setsid)");
+    for (let i = 0; i < 50 && (await psField(jobPid, "ppid")) === rootPid; i += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.notEqual(await psField(jobPid, "ppid"), rootPid, "precondition: the job's shell exited and the job was reparented");
+    assert.equal(await psField(jobPid, "pgid"), rootPid, "the reparented job is still in the agent's group");
+  },
+);
+
+test(
+  "#59 (real processes): stopping one agent kills its whole group, the reparented nohup job included, and leaves another agent's processes alone",
+  { skip: process.platform === "win32" },
+  async () => {
+    const a = await realAgentRuntimeWithNohupJob("a");
+    const b = await realAgentRuntimeWithNohupJob("b");
+    onTestFinished(() => b.session.stop({ signal: "SIGKILL" }));
+    const escalations: Array<{ treeKilledCount: number }> = [];
+
+    await a.session.stop({ signal: "SIGTERM", forceAfterMs: 300, onEscalated: (escalation) => escalations.push(escalation) });
+    for (let i = 0; i < 100 && !((await processGone(a.jobPid)) && (await processGone(a.rootPid))); i += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(escalations.length, 1, "agent a ignored SIGTERM: the stop escalated");
+    assert.equal(a.session.closed, true);
+    assert.equal(await processGone(a.rootPid), true, "agent a's runtime is gone");
+    assert.equal(await processGone(a.jobPid), true, "agent a's nohup job is gone with its group");
+    assert.equal(pidAlive(b.rootPid), true, "agent b's runtime is untouched");
+    assert.equal(pidAlive(b.jobPid), true, "agent b's nohup job is untouched");
+    assert.equal(b.session.closed, false);
   },
 );
 

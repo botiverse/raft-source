@@ -81,7 +81,11 @@ test("only the owning App can report setup; revision changes, replay and uninsta
   assert.equal((await f.report(1, "anything")).status, 400);
   const patch = await fetch(`${app.baseUrl}/api/integrations/clients/${f.client.id}`, { method: "PATCH", headers: f.sourceHeaders, body: JSON.stringify({ setupUrl: "https://setup.example.test/second" }) });
   assert.equal(patch.status, 200, await patch.clone().text());
-  assert.equal((await f.report(1, "complete")).status, 409);
+  const stale = await f.report(1, "complete");
+  assert.equal(stale.status, 409);
+  const staleBody = await stale.json() as { error: string; code: string; errorCode: string };
+  assert.deepEqual([staleBody.code, staleBody.errorCode], ["app_setup_conflict", "app_setup_conflict"]);
+  assert.ok(staleBody.error.length > 0);
   const complete = await f.report(2, "complete"); assert.equal(complete.status, 200, await complete.clone().text());
   const completed = await complete.json();
   assert.deepEqual(await (await f.report(2, "complete")).json(), completed);

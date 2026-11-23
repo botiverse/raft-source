@@ -5,11 +5,11 @@ import { InfoRow } from "./InfoRow";
 
 /**
  * Runtime config's Usage row: the windows of the runtime's account on the
- * agent's Computer that can hold this agent (for Antigravity, its model's
- * group's and the account's, `agentUsageWindows`); none while there is
- * nothing to show.
+ * agent's Computer that can hold this agent (its own account folder's when
+ * it has one; for Antigravity, its model's group's and the account's,
+ * `agentUsageWindows`); none while there is nothing to show.
  */
-export function AgentRuntimeUsageRow({ model, ...props }: { enabled: boolean; serverId: string | null; machineId: string; runtimeId: string; model: string | null | undefined }) {
+export function AgentRuntimeUsageRow({ model, ...props }: { enabled: boolean; serverId: string | null; machineId: string; runtimeId: string; agentId: string | null; model: string | null | undefined }) {
   const { formatMessage } = useIntl();
   const windows = agentUsageWindows(useRuntimeUsageWindows(props), props.runtimeId, model);
   if (windows.length === 0) return null;

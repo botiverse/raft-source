@@ -1,0 +1,15 @@
+host: legacy
+runtime: opencode
+scenario: resume-unchanged
+promptSource: (none)
+note: driver: supportsNativeStandingPrompt=true standingPromptRefreshesOnResume=true deferSpawnUntilMessage=true
+note: no spawn: the driver deferred the empty start until a concrete message
+
+## standing prompt
+(none: no runtime started)
+
+## carrier
+SpawnContext.standingPrompt: (absent)
+
+## first input
+(no runtime started)

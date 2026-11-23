@@ -81,8 +81,15 @@ function withTracer<T>(work: (sink: MemoryTraceSink) => Promise<T>): Promise<T> 
 
 const eventsNamed = (sink: MemoryTraceSink, name: string) => sink.getAllLogEvents().filter((event) => event.name === name);
 
-/** An app whose count says one thing, and one whose count tries to write (the transaction is read only). */
-const countingApp = { id: "fake-app", purgeServer: async () => ({ remaining: true, counts: { fooBar: 7 } }) } as unknown as FirstPartyApp;
+/** An app whose count says one thing (and keeps what it is told to keep, by server), and one whose count tries to write (the transaction is read only). */
+const countKeeps = new Map<string, readonly string[] | undefined>();
+const countingApp = {
+  id: "fake-app",
+  purgeServer: async (serverId: ServerId, options: { keepChannelIds?: readonly string[] }) => {
+    countKeeps.set(serverId, options.keepChannelIds);
+    return { remaining: true, counts: { fooBar: 7 } };
+  },
+} as unknown as FirstPartyApp;
 const writingApp = {
   id: "writer",
   purgeServer: async (_serverId: ServerId, options: { executor: { execute: (q: unknown) => Promise<unknown> } }) => {
@@ -154,6 +161,9 @@ test("counts a server closed 31 days ago, table by table, skipping joint project
   assert.equal(runEvents[0]!.attrs?.stopped_reason, "pass_done");
   assert.equal(runEvents[0]!.attrs?.old_bucket_delete_capability, "unknown");
   assert.equal(runEvents[0]!.attrs?.servers_counted, result.serversCounted);
+
+  // The count tells the apps what the delete tells them: the kept channels and the joint's storage channel.
+  assert.deepEqual([...(countKeeps.get(old.serverId) ?? [])].sort(), [...old.skipped.joint, ...old.skipped.receipt, old.jointStorage.channelId].sort());
 
   assert.deepEqual(await snapshot(), before, "nothing deleted or changed");
 });

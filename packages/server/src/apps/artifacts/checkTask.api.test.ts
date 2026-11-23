@@ -565,6 +565,35 @@ test("result: the report is capped (ten console errors, twenty blocked URLs, eac
   assert.equal((await rowOf(check.id)).desktopFileId, null, "no screenshot sent: none kept");
 });
 
+test("result: the can't-scroll hint is kept as sent, an element's name cut; an entry that isn't one is left out and the check still done", async ({ app, seed }) => {
+  configure();
+  const world = await seedWorld(seed);
+  const both = await world.push((await world.makeItem()).id, 1);
+  const leased = (await lease(app.baseUrl)).body!;
+  const desktop = { shot: "desktop" as const, viewportWidth: 1280, viewportHeight: 800, contentHeight: 2340, hiddenHeight: 1540, heldBy: [{ element: "html", style: "overflow: hidden" as const }, { element: "body", style: "overflow: hidden" as const }] };
+  const answer = await result(app.baseUrl, both.check.id, okReport(leased, {
+    pageCantScroll: [
+      desktop,
+      { shot: "phone", viewportWidth: 390, viewportHeight: 844, contentHeight: 3100, hiddenHeight: 2256, heldBy: [{ element: `div#${"r".repeat(80)}\u0000`, style: "position: fixed" }, { element: "body", style: "overflow: sideways" as never }] },
+      { ...desktop, contentHeight: 1 },
+    ],
+  }));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  const findings = (await rowOf(both.check.id)).findings!;
+  assert.deepEqual(findings.pageCantScroll, [
+    desktop,
+    { shot: "phone", viewportWidth: 390, viewportHeight: 844, contentHeight: 3100, hiddenHeight: 2256, heldBy: [{ element: `div#${"r".repeat(56)}`, style: "position: fixed" }] },
+  ], "one a shot (the first), at most 60 characters a name, an unknown style left out");
+
+  // Not a list, or entries that aren't hints: no hint, and the report stands.
+  const bad = await world.push((await world.makeItem()).id, 1);
+  const second = (await lease(app.baseUrl)).body!;
+  assert.equal((await result(app.baseUrl, bad.check.id, okReport(second, { pageCantScroll: [{ shot: "watch", viewportWidth: 1, viewportHeight: 1, contentHeight: 1, hiddenHeight: 1, heldBy: [] }, { ...desktop, hiddenHeight: -1 }] as never }))).status, 200);
+  const kept = (await rowOf(bad.check.id)).findings!;
+  assert.equal(kept.pageCantScroll, undefined);
+  assert.equal(kept.consoleErrors.length, 1);
+});
+
 // ---- retry and expiry ------------------------------------------------------------------
 
 test("a lost lease is leased again within the run window, the stale holder's result refused; past the window the expiry fails it", async ({ app, seed }) => {

@@ -2,7 +2,9 @@ import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase, openTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 import { getDb } from "../db/index";
-import { channels, messages, servers, users } from "../db/schema";
+import { eq } from "drizzle-orm";
+import { channels, jointChannelServers, messages, servers, users } from "../db/schema";
+import { seedJointChannel } from "../test/integration/jointFixture";
 import {
   formatCanonicalAgentMessageRef,
   replacePermalinksOutsideMarkdownCode,
@@ -238,4 +240,41 @@ test("renderAgentReadablePermalinks fails open and preserves original content", 
 
   assert.equal(await renderAgentReadablePermalinks(content, "not-a-server-uuid"), content);
   assert.deepEqual(await renderAgentReadablePermalinksInTexts([content], "not-a-server-uuid"), [content]);
+});
+
+// #460: a joint channel's messages live in its canonical channel (on the joint_storage server), so a permalink into
+// the server's own projection of a joint was left raw. It renders by that projection, as the server's channels do;
+// one into another server's projection, or a joint the server has left, stays raw.
+test("renderAgentReadablePermalinks renders a permalink into the server's own joint projection by that projection", async ({ db: _db }) => {
+  const db = getDb();
+  const [owner] = await db.insert(users).values({ email: "joint-permalink-owner@slock.test", name: "joint-permalink-owner", passwordHash: "hash", emailVerified: true }).returning();
+  const [host, peer] = await db.insert(servers).values([
+    { name: "Host", slug: "jp-host", ownerId: owner!.id },
+    { name: "Peer", slug: "jp-peer", ownerId: owner!.id },
+  ]).returning();
+  const joint = await seedJointChannel({ name: "partners", serverIds: [host!.id, peer!.id], createdByUserId: owner!.id });
+  const [hostCopy, peerCopy] = joint.projections as [typeof joint.projections[number], typeof joint.projections[number]];
+  const [top, parent] = await db.insert(messages).values([
+    { channelId: joint.canonical.id, senderType: "user", senderId: owner!.id, content: "joint top" },
+    { channelId: joint.canonical.id, senderType: "user", senderId: owner!.id, content: "joint parent" },
+  ]).returning();
+  const [thread] = await db.insert(channels).values({ serverId: joint.canonical.serverId, name: `thread-${parent!.id.slice(0, 8)}`, type: "thread", parentMessageId: parent!.id }).returning();
+  const [reply] = await db.insert(messages).values({ channelId: thread!.id, senderType: "user", senderId: owner!.id, content: "joint reply" }).returning();
+
+  const link = (slug: string, channelId: string, msg: string) => `https://app.slock.ai/s/${slug}/channel/${channelId}?msg=${msg}`;
+  assert.equal(
+    await renderAgentReadablePermalinks(`see ${link("jp-host", hostCopy.id, top!.id)} and ${link("jp-host", hostCopy.id, top!.id.slice(0, 8))}`, host!.id),
+    `see #partners msg=${top!.id.slice(0, 8)} and #partners msg=${top!.id.slice(0, 8)}`,
+  );
+  assert.equal(
+    await renderAgentReadablePermalinks(`reply ${link("jp-host", hostCopy.id, reply!.id.slice(0, 8))}`, host!.id),
+    `reply #partners:${parent!.id.slice(0, 8)} msg=${reply!.id.slice(0, 8)}`,
+  );
+  // Another server's projection: not this server's conversation, raw (its slug is not this server's either).
+  const foreign = `x ${link("jp-host", peerCopy.id, top!.id)}`;
+  assert.equal(await renderAgentReadablePermalinks(foreign, host!.id), foreign);
+  // The host leaves the joint: raw.
+  await db.update(jointChannelServers).set({ status: "disconnected" }).where(eq(jointChannelServers.localChannelId, hostCopy.id));
+  const left = `y ${link("jp-host", hostCopy.id, top!.id)}`;
+  assert.equal(await renderAgentReadablePermalinks(left, host!.id), left);
 });

@@ -18,7 +18,7 @@ test("receive projects typed snake/camel message fields and preserves batch curs
     assert.equal(url.searchParams.get("limit"), "100");
     assert.equal(init?.method, "GET");
     assert.equal(init?.cache, "no-store");
-    assert.equal(init?.redirect, "error");
+    assert.equal(init?.redirect, "manual");
     assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${credential}`);
     return Response.json({ ...batch([
       { message_id: "first", seq: 13, sender_type: "human", sender_name: "Ada",

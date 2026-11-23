@@ -55,9 +55,12 @@
  * than re-adding them or recording sources of a membership it never made.
  * Whether an operation by someone already a member records sources depends
  * on the invite's origin (inviteFlow): a host owner/admin's own "Your
- * servers" (host_direct) does, for the membership it started from; an
- * emailed or legacy (NULL) invite does not. An origin this release does not
- * connect is refused everywhere a connection starts, and the worker leaves it.
+ * servers" (host_direct), a member's self_connect and an emailed invite
+ * (external_invite: e.g. a member of the host invited to connect a server of
+ * theirs) do, for the membership it started from (member_at_start; on a
+ * private channel the membership its own conversion writes); a legacy (NULL)
+ * invite does not. An origin this release does not connect is refused
+ * everywhere a connection starts, and the worker leaves it.
  */
 import { and, asc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
@@ -76,7 +79,9 @@ import {
 } from "../db/schema";
 import {
   acceptJointChannelInviteInCallerTransaction,
+  ArchivedNameCollisionError,
   attachJointChannelMetadata,
+  ChannelNameTakenError,
   createExternalConnectJointInvite,
   getChannel,
   JointChannelArchivedError,
@@ -172,13 +177,29 @@ export type ExternalConnectErrorCode =
   | "requester_left"
   | "membership_changed"
   | "guest_has_computer"
-  | "connect_unavailable";
+  | "connect_unavailable"
+  | "channel_name_taken";
 
 export class ExternalConnectError extends Error {
   constructor(readonly code: ExternalConnectErrorCode, message: string) {
     super(message);
     this.name = "ExternalConnectError";
   }
+}
+
+/**
+ * The connecting server already has a channel with this channel's name (live
+ * or archived: one sentence for both, so an archived channel the person can't
+ * see isn't revealed). A joint channel has one name on every server, so this
+ * can't succeed on a retry: refused, so the worker settles it and the channel
+ * isn't held by a reservation that retries forever (#triage:#536).
+ */
+function connectNameTaken(err: unknown): unknown {
+  if (!(err instanceof ChannelNameTakenError) && !(err instanceof ArchivedNameCollisionError)) return err;
+  return new ExternalConnectError(
+    "channel_name_taken",
+    "That server already has a channel with this name. Rename that channel, then connect again.",
+  );
 }
 
 /** The invite stopped being what this attempt started from (revoked, connected meanwhile, channel gone). */
@@ -524,16 +545,20 @@ function assertFlowFor(invite: Pick<Invite, "origin">, path: "self" | "invite"):
 /**
  * Whether an operation by someone already in the joint records each server
  * it connects as a source of that membership (cindyz c6f0faee, fb29b618):
- * a host owner/admin's own "Your servers" connect, and a channel member's
- * self_connect (jointMemberConnectService). A legacy (NULL) or emailed invite
- * records none (no_sources).
+ * a host owner/admin's own "Your servers" connect, a channel member's
+ * self_connect (jointMemberConnectService), and an emailed invite accepted by
+ * someone already in the channel (a member of the host invited to connect a
+ * server of theirs, sent_to_host_member, or anyone who joined another way
+ * before they used it): the server they connect keeps them in the channel as
+ * a self_connect's does (jointMembershipDeparture). A legacy (NULL) invite
+ * records none (no_sources), as it always did.
  */
 function existingMemberIsSource(flow: InviteFlow): boolean {
   switch (flow) {
     case "host_direct":
-    case "self_connect": return true;
-    case "legacy":
-    case "external_invite": return false;
+    case "self_connect":
+    case "external_invite": return true;
+    case "legacy": return false;
   }
 }
 
@@ -648,7 +673,9 @@ async function reserveConnection(input: ConnectInput): Promise<ExternalConnectRe
       if (active.some((job) => !(job.status === "failed" && (job.progress as { rollbackState?: unknown }).rollbackState === "restored"))) {
         throw connectInProgress();
       }
-      let job = await startChannelToJointConversion({ serverId: channel.serverId, sourceChannelId: channel.id, createdByUserId, transaction: tx });
+      // Fenced: the connection rides the conversion to its end (the worker's
+      // phases), which an online move (channel_conversion_online_move_v1) does not have yet.
+      let job = await startChannelToJointConversion({ serverId: channel.serverId, sourceChannelId: channel.id, createdByUserId, transaction: tx, fencedOnly: true });
       if (job.status === "failed") job = await retryChannelConversionJob(job.id, tx);
       const generation = randomUUID();
       await tx.update(channelConversionJobs).set({ externalConnectGeneration: generation }).where(eq(channelConversionJobs.id, job.id));
@@ -666,6 +693,7 @@ async function reserveConnection(input: ConnectInput): Promise<ExternalConnectRe
       // A reservation only starts on an invite nothing is being connected with.
       const locked = await lockInviteFrom(tx, invite.id, { open: input.from.open.filter((status) => !isReservationStatus(status)) }, parties);
       if (inviteFlow(locked.origin) !== flow) throw new StaleInviteError();
+      const emailedMember = flow === "external_invite" ? await emailedMemberAtReservation(tx, channel.id, locked, parties.joinerUserId) : null;
       await lockPendingRequestRow(tx, input.requestId);
       await lockReferencedRows(tx, { userIds: [parties.joinerUserId, parties.authorizerUserId] });
       const now = await revalidateUnderLocks(tx, { invite, joinerUserId: parties.joinerUserId });
@@ -674,6 +702,7 @@ async function reserveConnection(input: ConnectInput): Promise<ExternalConnectRe
         ...CLEARED_CONNECT_STATE,
         status: reservationStatusOf(flow),
         ...(self ? self : {}),
+        ...(emailedMember ? emailedMember : {}),
         connectPhase: "conversion",
         connectServerId: parties.targetServerId,
         connectJoinerUserId: parties.joinerUserId,
@@ -721,6 +750,29 @@ async function selfMembershipAtReservation(tx: DatabaseTransaction, channel: Cha
     sourceStartGeneration: null,
     sourceGeneration: null,
   };
+}
+
+/**
+ * An emailed invite's operation on a private channel whose joiner is in the
+ * channel when its reservation starts (a member of the host invited to
+ * connect a server of theirs, who was added to the channel directly): the
+ * conversion this reservation starts makes their joint membership, so, as a
+ * host owner/admin's own connect on a channel not joint yet, the operation
+ * waits for it (awaiting_joint_creation) and the conversion's finalize
+ * resolves it from the membership it wrote (resolveJointCreationSources:
+ * member_at_start at that generation, so each server the operation connects
+ * is a source of it, as a member's self_connect records). Read under the
+ * channel row (FOR UPDATE, by the conversion start) and the conversion fence
+ * it published, and the invite row: only an operation that started on the
+ * private channel (awaiting_first_join from a joint that did not exist, 0).
+ * Anyone not in the channel: null, the first join as before.
+ */
+async function emailedMemberAtReservation(tx: DatabaseTransaction, channelId: string, invite: Invite, joinerUserId: string) {
+  if (invite.sourceState !== "awaiting_first_join" || invite.sourceStartGeneration !== 0) return null;
+  const [row] = (await tx.execute<{ inChannel: boolean }>(sql`SELECT EXISTS (SELECT 1 FROM channel_humans
+    WHERE channel_id = ${channelId}::uuid AND user_id = ${joinerUserId}::uuid) AS "inChannel"`)).rows;
+  if (!row?.inChannel) return null;
+  return { sourceState: "awaiting_joint_creation" as const, sourceStartGeneration: null, sourceGeneration: null };
 }
 
 /**
@@ -817,7 +869,7 @@ async function connectJointChannel(input: {
     }).catch((err: unknown) => {
       // The accept's own check under the lifecycle lock: the same answer as the final host check.
       if (err instanceof JointChannelArchivedError) throw new ExternalConnectError("channel_archived", "This channel is archived.");
-      throw err;
+      throw connectNameTaken(err);
     });
     const sourceState = sources
       ? await recordInviteSource(tx, sources, {
@@ -1022,7 +1074,7 @@ async function selfConnectInTransaction(tx: DatabaseTransaction, input: {
     joinerUserId: actorUserId,
   }, releasing ? { releasingGuest: { serverId: hostServerId, userId: actorUserId } } : {}).catch((err: unknown) => {
     if (err instanceof JointChannelArchivedError) throw new ExternalConnectError("channel_archived", "This channel is archived.");
-    throw err;
+    throw connectNameTaken(err);
   });
   // The new source first (the seat's removal below, with source exit on, keeps them only through a live one).
   await recordInviteSource(tx, sources, { jointChannelId, parties, reopenOwnEnded: { hostServerId, hostChannelId: channel.id } });
@@ -1171,12 +1223,14 @@ const membershipChanged = () => new ExternalConnectError("membership_changed", "
  *   exactly the counter of a joint that does not exist yet.
  * - On a joint channel, a member, by an operation whose origin records
  *   sources for an existing member (existingMemberIsSource: a host
- *   owner/admin's own "Your servers", host_direct; cindyz c6f0faee):
- *   member_at_start at their membership's generation now, so each server it
- *   connects is a source of exactly that membership; one who left or
- *   rejoined (a new generation) by then is refused (planInviteSources).
- * - On a joint channel, a member, any other origin (an emailed invite, or a
- *   legacy NULL one): no_sources, as before.
+ *   owner/admin's own "Your servers", host_direct, cindyz c6f0faee; an
+ *   emailed invite, external_invite): member_at_start at their membership's
+ *   generation now, so each server it connects is a source of exactly that
+ *   membership; one who left or rejoined (a new generation) by then is
+ *   refused (planInviteSources). An emailed invite on a private channel
+ *   whose invitee is in it is bound when its reservation starts
+ *   (emailedMemberAtReservation).
+ * - On a joint channel, a member, a legacy NULL invite: no_sources, as before.
  * - On a joint channel, not a member: awaiting_first_join with their
  *   membership counter now (0 for none).
  * An origin this release does not connect (inviteFlow): nothing set.
@@ -1626,7 +1680,8 @@ export interface ServerSelection {
  * same refusal a connection of that server alone would have met).
  */
 export type ServerConnectOutcome =
-  | { serverId: string; state: "connected"; channelId: string }
+  /** `alreadyConnected`: it was connected before this request (a repeated host_direct or self_connect choice), nothing was done. */
+  | { serverId: string; state: "connected"; channelId: string; alreadyConnected?: true }
   | { serverId: string; state: "connecting" }
   | { serverId: string; state: "awaiting_approval"; requestId: string }
   /** `askedApproval`: refused on the way to its approver (the chooser only belongs to it), not as a connect of theirs. */
@@ -1694,9 +1749,16 @@ async function connectSelectedServers(input: {
     outcomes.set(serverId, { serverId, state: "refused", error, ...(askedApproval ? { askedApproval: true as const } : {}) });
   const direct: string[] = [];
   const approvals: Array<{ serverId: string; approverUserId: string }> = [];
+  // A host owner/admin's own servers only: an invitee whose server is already
+  // in keeps its own answer (already_connected: ask its admins to add you).
+  const alreadyIn = input.directOnly
+    ? await alreadyConnectedProjections(input.channel, userId, input.selections.filter((selection) => !offered.has(selection.serverId)).map((selection) => selection.serverId))
+    : new Map<string, string>();
   for (const selection of input.selections) {
     const server = offered.get(selection.serverId);
-    if (!server) refuse(selection.serverId, invalidServer());
+    const projection = alreadyIn.get(selection.serverId.toLowerCase());
+    if (!server && projection) outcomes.set(selection.serverId, { serverId: selection.serverId, state: "connected", channelId: projection, alreadyConnected: true });
+    else if (!server) refuse(selection.serverId, invalidServer());
     else if (server.atLimit) {
       refuse(server.id, new ExternalChannelLimitError("free_external_limit", "This server is already in a channel shared with another server or guests. Upgrade it to connect it to more.", "connecting", server.id), !server.canConnectDirectly && !input.directOnly);
     } else if (server.canConnectDirectly) direct.push(server.id);
@@ -1724,6 +1786,35 @@ async function connectSelectedServers(input: {
   for (const result of requested) if ("requestId" in result) await emailApprover(result.requestId);
   await settleAfterChoice(invite.id);
   return { servers: input.selections.map((selection) => outcomes.get(selection.serverId)!), connections };
+}
+
+/**
+ * A chosen server that is already connected to this channel (active on its
+ * joint) and that the chooser belongs to, other than as a Guest: its local
+ * channel, by server id (lowercase). A second submit of the same choice (a
+ * retry, a double send) by a host owner/admin is answered as connected
+ * rather than refused as invalid_server (#wg-rbac:#94). Anything else stays refused as before, so
+ * this says nothing about a server the chooser isn't in.
+ */
+async function alreadyConnectedProjections(channel: Channel, userId: string, serverIds: readonly string[]): Promise<Map<string, string>> {
+  const found = new Map<string, string>();
+  if (serverIds.length === 0) return found;
+  const db = getDb();
+  const jointChannelId = await hostJointOf(db, channel);
+  if (!jointChannelId) return found;
+  const rows = await db.select({ serverId: jointChannelServers.serverId, localChannelId: jointChannelServers.localChannelId })
+    .from(jointChannelServers)
+    .innerJoin(serverMembers, and(eq(serverMembers.serverId, jointChannelServers.serverId), eq(serverMembers.userId, userId)))
+    .where(and(
+      eq(jointChannelServers.jointChannelId, jointChannelId),
+      eq(jointChannelServers.status, "active"),
+      inArray(jointChannelServers.serverId, serverIds.map((id) => id.toLowerCase())),
+      sql`${serverMembers.role} <> 'guest'`,
+    ));
+  for (const row of rows) {
+    if (row.serverId !== channel.serverId && row.localChannelId) found.set(row.serverId.toLowerCase(), row.localChannelId);
+  }
+  return found;
 }
 
 /**

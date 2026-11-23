@@ -42,6 +42,7 @@ import {
   reasoningEffortChoices,
   reconcileRuntimeFormV2SubmissionWithLiveModels,
   redactWriteOnlyRuntimeConfig,
+  retainLegacyBlankWriteOnlySecrets,
   retainOmittedClaudeAuthType,
   retainOmittedWriteOnlySecrets,
   runtimeFormV2Entry,
@@ -405,12 +406,19 @@ test("edit with a blank API key keeps the stored key only while the API URL is u
   assert.equal("apiKey" in v1Moved.provider, false);
 });
 
-test("v1 agent reads keep Claude's key for released clients (redactOnAgentRead: false); Built-in's stays blanked", () => {
-  // Installed mobile apps prefill the Claude custom-provider key from GET
-  // /api/agents/:id and refuse to save a blank one; see CLAUDE_CUSTOM_PROVIDER_API_KEY.
+test("v1 agent reads blank Claude's key (redactOnAgentRead: true), while legacy v1 blank PATCH keeps stored key on same URL", () => {
   const stored = claudeCustom("https://gw.example.test", "sk-stored");
-  assert.equal(redactWriteOnlyRuntimeConfig(stored), stored);
-  assert.deepEqual(runtimeFormV2Entry("claude")!.writeOnlySecrets?.map((secret) => [secret.path, secret.redactOnAgentRead]), [[["provider", "apiKey"], false]]);
+  const redacted = redactWriteOnlyRuntimeConfig(stored) as { provider: { apiKey: string } };
+  assert.equal(redacted.provider.apiKey, "");
+  assert.deepEqual(runtimeFormV2Entry("claude")!.writeOnlySecrets?.map((secret) => [secret.path, secret.redactOnAgentRead]), [[["provider", "apiKey"], true]]);
+  // Legacy v1 mobile client (<=1.23) sending blank apiKey on the same URL preserves the stored key.
+  const blankSameUrl = { ...stored, provider: { ...(stored as { provider: Record<string, unknown> }).provider, apiKey: "" } };
+  const keptBlank = retainLegacyBlankWriteOnlySecrets(blankSameUrl, stored) as { provider: { apiKey: string } };
+  assert.equal(keptBlank.provider.apiKey, "sk-stored");
+  // Changing the URL never inherits the stored key.
+  const blankOtherUrl = { ...stored, provider: { ...(stored as { provider: Record<string, unknown> }).provider, apiUrl: "https://other.example.test", apiKey: "" } };
+  const movedBlank = retainLegacyBlankWriteOnlySecrets(blankOtherUrl, stored) as { provider: { apiKey: string } };
+  assert.equal(movedBlank.provider.apiKey, "");
   assert.equal(runtimeFormV2Entry("cursor")!.writeOnlySecrets, undefined);
   assert.equal(runtimeFormV2Entry("copilot")!.writeOnlySecrets, undefined);
 });

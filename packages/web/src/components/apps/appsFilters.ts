@@ -1,39 +1,38 @@
-import type { MarketplaceListingSort, MarketplaceListingType, OAuthClientCategory } from "@botiverse/raft-shared";
+import type { OAuthClientCategory } from "@botiverse/raft-shared";
 import type { MessageId } from "../../i18n/messages";
+import type { AppOrigin } from "../../features/apps/appView";
+import type { ConnectedAppsTab } from "../settings/SettingsSegmentedControls";
+
+/** Yours' one filter: where this Server got the App. */
+export type AppsOriginFilter = AppOrigin | "all";
 
 /**
- * The Apps page's toolbar (#proj-apps task #22): search, then Type, Category
- * and Sort. The Marketplace sends them to GET /integrations/marketplace/listings;
- * Installed and My Apps filter their own lists with the same values.
+ * The Apps page's toolbar: search on both scopes; Yours narrows its own list
+ * by where the App came from (`origin`); Discover sends its Category to GET
+ * /integrations/marketplace/listings. A scope ignores the other's filter.
+ * Neither names an App type (R4), and Discover keeps the server's order (the
+ * most used first): no Type, no Sort.
  */
 export interface AppsFilters {
   search: string;
-  type: MarketplaceListingType;
+  origin: AppsOriginFilter;
   category: OAuthClientCategory | "all";
-  sort: MarketplaceListingSort;
 }
 
-export const DEFAULT_APPS_FILTERS: AppsFilters = { search: "", type: "all", category: "all", sort: "installs" };
+export const DEFAULT_APPS_FILTERS: AppsFilters = { search: "", origin: "all", category: "all" };
 
-/** Search, Type and Category narrow the list; Sort only orders it, so Clear All leaves it. */
-export function hasActiveAppsFilters(filters: AppsFilters): boolean {
-  return filters.search.trim() !== "" || filters.type !== "all" || filters.category !== "all";
+/** Whether something narrows the scope's list: the search, and the scope's own filter (Yours: origin; Discover: Category). */
+export function hasActiveAppsFilters(filters: AppsFilters, scope: ConnectedAppsTab): boolean {
+  if (filters.search.trim() !== "") return true;
+  return scope === "yours" ? filters.origin !== "all" : filters.category !== "all";
 }
 
-export const APPS_TYPE_LABEL_ID: Record<MarketplaceListingType, MessageId> = {
-  all: "apps.filter.typeAll",
-  app: "apps.filter.typeApp",
-  mcp: "apps.filter.typeMcp",
+/** Yours' origin filter, in the order its menu lists them. */
+export const APPS_ORIGIN_FILTERS: readonly AppsOriginFilter[] = ["all", "internal", "shared", "marketplace"];
+
+export const APPS_ORIGIN_LABEL_ID: Record<AppsOriginFilter, MessageId> = {
+  all: "apps.filter.originAll",
+  internal: "apps.filter.originInternal",
+  shared: "apps.filter.originShared",
+  marketplace: "apps.filter.originMarketplace",
 };
-
-export const APPS_SORT_LABEL_ID: Record<MarketplaceListingSort, MessageId> = {
-  installs: "apps.filter.sortInstalls",
-  published: "apps.filter.sortPublished",
-  name: "apps.filter.sortName",
-};
-
-/** Whether a row of this kind shows under the Type filter. */
-export function matchesAppsType(type: MarketplaceListingType, mcp: boolean): boolean {
-  return type === "all" || (type === "mcp") === mcp;
-}
-

@@ -153,9 +153,8 @@ export function buildBuiltInPiFormOptionSource(sourceId: string): AgentCreateFor
 
 /**
  * The list-only projection: a preset provider that takes a typed id (task #10:
- * OpenRouter, Qwen Token Plan, ...) stays list-only. Served on v1 (v1 clients build runtimeConfig
- * themselves and only ever build a custom model for a gateway) and on v2 to a
- * client without `dependent_select.custom_value_with_options`.
+ * OpenRouter, Qwen Token Plan, ...) stays list-only. Served on v2 to a client
+ * without `dependent_select.custom_value_with_options`.
  */
 export function builtInPiListOnlyOptionSource(source: AgentCreateFormOptionSource): AgentCreateFormOptionSource {
   if (source.kind !== "dependent_select" || source.pointer !== "/model") return source;
@@ -470,28 +469,19 @@ export function validateBuiltInPiDefinitionProjection(
 }
 
 /**
- * The v1 (schemaVersion-pinned) form a runtime serves, if any. Only these
- * runtimes answer the v1 definition routes and carry `formDefinitionRef` on the
- * admission row; a runtime whose form exists only on protocol v2 lives in
- * runtimeFormV2Registry and stays invisible to v1 clients.
+ * The v1 (schemaVersion-pinned) form ref a runtime has, if any. Only these
+ * runtimes carry `formDefinitionRef` on the admission row and accept a v1
+ * `formDefinitionRef` on submit; a runtime whose form exists only on protocol
+ * v2 lives in runtimeFormV2Registry. The v1 definition routes themselves are
+ * retired and answer 410 (#wg-runtime-form:#20).
  */
 export interface RuntimeFormV1Entry {
   ref: RuntimeFormDefinitionRef;
-  buildDefinition(): AgentCreateFormDefinition;
-  validateProjection(): AgentCreateFormIssue[];
 }
 
 const RUNTIME_FORM_V1_ENTRIES = new Map<string, RuntimeFormV1Entry>([
-  [BUILTIN_PI_FORM_DEFINITION_REF.runtimeId, {
-    ref: BUILTIN_PI_FORM_DEFINITION_REF,
-    buildDefinition: buildBuiltInPiFormDefinition,
-    validateProjection: () => validateBuiltInPiDefinitionProjection(),
-  }],
-  [KIMI_SDK_FORM_DEFINITION_REF.runtimeId, {
-    ref: KIMI_SDK_FORM_DEFINITION_REF,
-    buildDefinition: buildKimiSdkFormDefinition,
-    validateProjection: () => validateKimiSdkDefinitionProjection(),
-  }],
+  [BUILTIN_PI_FORM_DEFINITION_REF.runtimeId, { ref: BUILTIN_PI_FORM_DEFINITION_REF }],
+  [KIMI_SDK_FORM_DEFINITION_REF.runtimeId, { ref: KIMI_SDK_FORM_DEFINITION_REF }],
 ]);
 
 export function runtimeFormV1Entry(runtimeId: unknown): RuntimeFormV1Entry | null {

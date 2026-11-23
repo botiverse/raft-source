@@ -7,7 +7,7 @@
 
 export const SEA_CLI_ENTRY = "__cli";
 /** Hidden argv[2] entries that run daemon code: they get the full bundle. */
-export const SEA_RUNNER_ENTRIES = ["__run", "__detect-runtimes", "__restore-context-view", "__verify-bundled-oauth", "__verify-bundled-kimi", "__verify-bundled-oar"];
+export const SEA_RUNNER_ENTRIES = ["__run", "__detect-runtimes", "__restore-context-view", "__verify-bundled-oauth", "__verify-bundled-kimi", "__verify-bundled-bedrock", "__verify-bundled-oar"];
 
 export const SEA_ASSET_FULL = "computer.cjs";
 export const SEA_ASSET_LITE = "computer-lite.cjs";
@@ -19,7 +19,14 @@ export const SEA_ASSET_CLI = "cli.cjs";
 // drivers/kimi-sdk.ts loadKimiSdk()); build.mjs aliases the package to a shim
 // (sea-lazy-kimi.cjs) that asks the loader for the asset through this hook.
 export const SEA_ASSET_KIMI = "kimi.cjs";
-export const SEA_LAZY_ASSETS = { "@botiverse/kimi-code-sdk": SEA_ASSET_KIMI };
+// The AWS SDK behind pi's Amazon Bedrock provider (~1.1 MB of source, ~4 MB
+// per runner): pi-ai imports its Bedrock stream only on the first Bedrock
+// request (lazy-bedrock-provider), and only that module imports the SDK. The
+// asset also carries @smithy/node-http-handler, which the stream builds its
+// HTTP/1.1 and proxy handler from, so the client and that handler are one copy
+// (build.mjs SEA_LAZY_ASSET_PACKAGES).
+export const SEA_ASSET_BEDROCK = "bedrock.cjs";
+export const SEA_LAZY_ASSETS = { "@botiverse/kimi-code-sdk": SEA_ASSET_KIMI, "@aws-sdk/client-bedrock-runtime": SEA_ASSET_BEDROCK };
 // The same for cli.cjs. undici is a third of the agent CLI's source, but a
 // managed agent's `raft` call reaches the loopback proxy through Node's
 // built-in fetch; the CLI imports undici dynamically (cli/src/proxy.ts) only

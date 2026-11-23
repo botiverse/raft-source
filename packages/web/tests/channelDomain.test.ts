@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   applyActivityMuteState,
+  applyMessageDisplayPrefsState,
   canToggleActivityMute,
   hydrateChannels,
   hydrateDmChannels,
@@ -212,4 +213,137 @@ test("a read answer is stamped as of its request start, so a list that started l
   const read = patchChannel(base, apiCh("a", { name: "a-old" }), "channel", readSeq);
   const after = hydrateChannels(read, [apiCh("a", { name: "a-fresh" })], listSeq);
   assert.deepEqual(after.channels.map((c) => c.name), ["a-fresh"]);
+});
+
+// Task #441: both answers are re-read on every channel open, and every mounted
+// message row reads these arrays.
+test("an activity mute answer the channel already holds returns the same state", () => {
+  const state = {
+    channels: [ch("c1", { activityMuted: true, muteFromSeq: "10", activityMuteSupported: true, prefsVersion: 4 }), ch("c2")],
+    dmChannels: [ch("d1", { type: "dm" })],
+    loungeChannels: [],
+    channelActivity: {},
+  };
+  const next = applyActivityMuteState(state, "c1", { activityMuted: true, muteFromSeq: "10", activityMuteSupported: true, prefsVersion: 4 });
+  assert.equal(next, state);
+  // No stated support keeps the channel's own.
+  assert.equal(applyActivityMuteState(state, "c1", { activityMuted: true, muteFromSeq: "10" }), state);
+  // An older version, and a channel that is in no collection, too.
+  assert.equal(applyActivityMuteState(state, "c1", { activityMuted: false, muteFromSeq: null, prefsVersion: 3 }), state);
+  assert.equal(applyActivityMuteState(state, "gone", { activityMuted: true, muteFromSeq: "1", prefsVersion: 9 }), state);
+});
+
+test("an activity mute change replaces only the channel and the collection it is in", () => {
+  const state = {
+    channels: [ch("c1", { activityMuted: false, muteFromSeq: null, prefsVersion: 1 }), ch("c2")],
+    dmChannels: [ch("d1", { type: "dm" })],
+    loungeChannels: [ch("l1")],
+    channelActivity: {},
+  };
+  const next = applyActivityMuteState(state, "c1", { activityMuted: true, muteFromSeq: "7", prefsVersion: 2 });
+  assert.notEqual(next, state);
+  assert.notEqual(next.channels, state.channels);
+  assert.equal(next.channels[0]?.activityMuted, true);
+  assert.equal(next.channels[1], state.channels[1]);
+  assert.equal(next.dmChannels, state.dmChannels);
+  assert.equal(next.loungeChannels, state.loungeChannels);
+  // Each differing field alone is a change.
+  for (const patch of [
+    { activityMuted: true, muteFromSeq: null, prefsVersion: 1 },
+    { activityMuted: false, muteFromSeq: "7", prefsVersion: 1 },
+    { activityMuted: false, muteFromSeq: null, prefsVersion: 2 },
+    { activityMuted: false, muteFromSeq: null, activityMuteSupported: true, prefsVersion: 1 },
+  ]) {
+    const changed = applyActivityMuteState(state, "c1", patch);
+    assert.notEqual(changed.channels, state.channels);
+    assert.deepEqual(
+      { activityMuted: changed.channels[0]?.activityMuted, muteFromSeq: changed.channels[0]?.muteFromSeq, prefsVersion: changed.channels[0]?.prefsVersion },
+      { activityMuted: patch.activityMuted, muteFromSeq: patch.muteFromSeq, prefsVersion: patch.prefsVersion },
+    );
+  }
+  // A state without Lounges gets no Lounge list.
+  const noLounges = applyActivityMuteState({ channels: state.channels, dmChannels: [], channelActivity: {} }, "c1", { activityMuted: true, muteFromSeq: "7" });
+  assert.equal("loungeChannels" in noLounges, false);
+});
+
+test("message display prefs the channel already holds return the same state; a change replaces only its collection", () => {
+  const state = {
+    channels: [ch("c1", { collapseLongMessages: true, displayPrefsVersion: 2 })],
+    dmChannels: [ch("d1", { type: "dm", collapseLongMessages: false, displayPrefsVersion: 1 })],
+    loungeChannels: [],
+    channelActivity: {},
+  };
+  assert.equal(applyMessageDisplayPrefsState(state, "c1", { collapseLongMessages: true, prefsVersion: 2 }), state);
+  assert.equal(applyMessageDisplayPrefsState(state, "c1", { collapseLongMessages: true }), state);
+  assert.equal(applyMessageDisplayPrefsState(state, "c1", { collapseLongMessages: false, prefsVersion: 1 }), state);
+
+  const dm = applyMessageDisplayPrefsState(state, "d1", { collapseLongMessages: true, prefsVersion: 2 });
+  assert.equal(dm.channels, state.channels);
+  assert.equal(dm.loungeChannels, state.loungeChannels);
+  assert.equal(dm.dmChannels[0]?.collapseLongMessages, true);
+  assert.equal(dm.dmChannels[0]?.displayPrefsVersion, 2);
+  // A newer version of the same value is still a change (the version is kept).
+  const versionOnly = applyMessageDisplayPrefsState(state, "c1", { collapseLongMessages: true, prefsVersion: 3 });
+  assert.equal(versionOnly.channels[0]?.displayPrefsVersion, 3);
+});
+
+test("a Lounge's mute or display-prefs change replaces the Lounge list alone", () => {
+  const state = {
+    channels: [ch("c1")],
+    dmChannels: [ch("d1", { type: "dm" })],
+    loungeChannels: [ch("l1", { loungeAgentId: "agent-1" }), ch("l2", { loungeAgentId: "agent-2" })],
+    channelActivity: {},
+  };
+  const muted = applyActivityMuteState(state, "l1", { activityMuted: true, muteFromSeq: "4", prefsVersion: 1 });
+  assert.equal(muted.channels, state.channels);
+  assert.equal(muted.dmChannels, state.dmChannels);
+  assert.notEqual(muted.loungeChannels, state.loungeChannels);
+  assert.equal(muted.loungeChannels?.[0]?.activityMuted, true);
+  assert.equal(muted.loungeChannels?.[1], state.loungeChannels[1]);
+  assert.equal(applyActivityMuteState(muted, "l1", { activityMuted: true, muteFromSeq: "4", prefsVersion: 1 }), muted);
+
+  const collapsed = applyMessageDisplayPrefsState(muted, "l1", { collapseLongMessages: true, prefsVersion: 1 });
+  assert.equal(collapsed.channels, state.channels);
+  assert.equal(collapsed.dmChannels, state.dmChannels);
+  assert.equal(collapsed.loungeChannels?.[0]?.collapseLongMessages, true);
+  assert.equal(collapsed.loungeChannels?.[0]?.activityMuted, true);
+});
+
+// #532: `channel:updated` floods re-send rows that did not change; a patch that
+// changes nothing must keep every list, record and the activity map as they were.
+test("a patch that changes nothing keeps the same lists, records and activity map", () => {
+  const base = hydrateDmChannels(
+    hydrateChannels({ channels: [], dmChannels: [], loungeChannels: [ch("l1", { loungeAgentId: "agent-1" })], channelActivity: {} }, [apiCh("all"), apiCh("a", { lastMessageAt: "t1" }), apiCh("b")]),
+    [apiCh("d1", { type: "dm", lastMessageAt: "t2" })],
+  );
+  const sameChannel = patchChannel(base, apiCh("a", { lastMessageAt: "t1" }));
+  assert.equal(sameChannel.channels, base.channels, "same channel list");
+  assert.equal(sameChannel.channels[1], base.channels[1], "same channel record");
+  assert.equal(sameChannel.channelActivity, base.channelActivity, "same activity map");
+
+  // A partial row (fewer fields than the stored one) merges onto it: still unchanged.
+  const { description: _d, ...partial } = apiCh("b");
+  void _d;
+  assert.equal(patchChannel(base, partial as ApiChannel).channels, base.channels);
+
+  const sameDm = patchChannel(base, apiCh("d1", { type: "dm", lastMessageAt: "t2" }));
+  assert.equal(sameDm.dmChannels, base.dmChannels);
+  assert.equal(sameDm.channelActivity, base.channelActivity);
+
+  const sameLounge = patchChannel(base, apiCh("l1", { loungeAgentId: "agent-1", type: "channel" }));
+  const sameLoungeAgain = patchChannel(sameLounge, apiCh("l1", { loungeAgentId: "agent-1", type: "channel" }));
+  assert.equal(sameLoungeAgain.loungeChannels, sameLounge.loungeChannels);
+  assert.equal(sameLoungeAgain.channels, sameLounge.channels);
+  assert.equal(sameLoungeAgain.channelActivity, sameLounge.channelActivity);
+
+  const renamed = patchChannel(base, apiCh("a", { name: "renamed", lastMessageAt: "t1" }));
+  assert.notEqual(renamed.channels, base.channels);
+  assert.equal(renamed.channels.find((c) => c.id === "a")?.name, "renamed");
+  assert.equal(renamed.channels.find((c) => c.id === "b"), base.channels.find((c) => c.id === "b"), "other record kept");
+  assert.equal(renamed.channels[0]?.name, "all", "#all stays first");
+
+  const bumped = patchChannel(base, apiCh("a", { lastMessageAt: "t9" }));
+  assert.equal(bumped.channels, base.channels, "an activity bump alone keeps the list");
+  assert.notEqual(bumped.channelActivity, base.channelActivity);
+  assert.equal(bumped.channelActivity.a, "t9");
 });

@@ -1,0 +1,82 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "grok",
+  "schemaVersion": "grok.create.v1",
+  "sourceId": "reasoningEffort",
+  "kind": "dependent_select",
+  "pointer": "/reasoningEffort",
+  "dependsOn": "/model",
+  "optionsByValue": {
+    "grok-4.5": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      }
+    ],
+    "grok-4.6": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      }
+    ],
+    "grok-composer-2.5-fast": [
+      {
+        "value": "",
+        "label": "Default"
+      },
+      {
+        "value": "low",
+        "label": "Low"
+      },
+      {
+        "value": "medium",
+        "label": "Medium"
+      },
+      {
+        "value": "high",
+        "label": "High"
+      },
+      {
+        "value": "xhigh",
+        "label": "Extra high"
+      }
+    ]
+  },
+  "defaultValueByValue": {
+    "grok-4.5": "high",
+    "grok-4.6": "",
+    "grok-composer-2.5-fast": ""
+  },
+  "customValueAllowedByValue": {},
+  "status": "fallback",
+  "reason": "missing_config",
+  "retryable": false
+}

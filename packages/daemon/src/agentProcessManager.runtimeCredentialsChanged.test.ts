@@ -408,18 +408,18 @@ function limitKey(config: AgentConfig): string {
   return shared ? `shared:${shared}` : `agent:${AGENT}`;
 }
 
-async function closeInsideQuotaBackoff(h: Harness, config: AgentConfig): Promise<void> {
+async function closeInsideQuotaBackoff(h: Harness, config: AgentConfig, resetInMs = HOUR_MS): Promise<void> {
   await h.manager.startAgent(AGENT, config);
   await h.manager.deliverMessage(AGENT, message("first"));
   await settle(() => (h.m.agents.get(AGENT)?.inbox.length ?? 0) > 0);
-  // A weekly quota days from its reset: the wait is capped at an hour, then tried again (agentProcessManager.recoverableCrashBackoff.test.ts).
-  const resetsAt = new Date(Date.now() + 5 * 24 * HOUR_MS).toISOString();
+  // A quota whose reported reset is an hour away: the wait runs to it (agentProcessManager.recoverableCrashBackoff.test.ts).
+  const resetsAt = new Date(Date.now() + resetInMs).toISOString();
   await h.emit([{ kind: "error", message: QUOTA_TEXT, providerLimit: { kind: "quota_exhausted", resetsAt } }]);
-  expect(h.m.lifecycleRecords.getProviderLimit(limitKey(config))?.untilMs).toBe(Date.now() + HOUR_MS);
+  expect(h.m.lifecycleRecords.getProviderLimit(limitKey(config))?.untilMs).toBe(Date.now() + resetInMs);
   h.children.at(-1)!.end(1);
   await settle();
   expect(h.m.agents.has(AGENT)).toBe(false);
-  expect(h.m.lifecycleRecords.getSpawnFailBackoff(AGENT)?.untilMs, "held in the cooldown until the quota wait ends").toBe(Date.now() + HOUR_MS);
+  expect(h.m.lifecycleRecords.getSpawnFailBackoff(AGENT)?.untilMs, "held in the cooldown until the quota wait ends").toBe(Date.now() + resetInMs);
   expect(await h.manager.deliverMessage(AGENT, message("during the wait"))).toBe(true);
   await settle();
   expect(h.children, "no respawn inside the wait").toHaveLength(1);
@@ -438,6 +438,19 @@ test("a Codex login ends the provider-limit wait of an agent on the shared login
     expect(h.m.agents.get(AGENT)?.runtimeErrorDeliveryBackoff.kind, "the new process inherits no wait").toBe("idle");
     expect(h.m.agents.get(AGENT)?.inbox.map((entry) => entry.content)).toEqual(["first", "during the wait"]);
     expect(clearedEvents(h).at(-1)?.attrs).toMatchObject({ provider_limit_backoffs_cleared: 1, cooldowns_ended: 1 });
+  });
+}, 20_000);
+
+// #proj-runtime:#66 (Tenny's condition): a weekly limit is waited for until
+// its reset, days away; a new sign-in still ends that wait at once.
+test("a Codex login ends a provider-limit wait days long: the closed agent starts from its pending inbox at once", async () => {
+  await withManager(async (h) => {
+    await closeInsideQuotaBackoff(h, agentConfig(), 3 * 24 * HOUR_MS);
+    h.manager.noteRuntimeCredentialsChanged("codex", "login");
+    await settle(() => h.children.length > 1, 2_000);
+    expect(h.children, "started without waiting for the reset").toHaveLength(2);
+    expect(h.m.lifecycleRecords.getProviderLimit("shared:codex")).toBeUndefined();
+    expect(h.m.agents.get(AGENT)?.inbox.map((entry) => entry.content)).toEqual(["first", "during the wait"]);
   });
 }, 20_000);
 

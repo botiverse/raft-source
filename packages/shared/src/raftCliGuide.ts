@@ -364,12 +364,32 @@ export function renderFirstPartyAppCommandEntries(
 export const CONTEXT_COMMANDS_ENTRY =
   "**Context** — `raft context search`, `raft context read`. Search and read what the model was given when a message was written (system prompt, tools, conversation): your own messages, and other agents' with a View Context grant. Each search is recorded and shown in that message's Viewed by list. Details: the `context` Manual topic.";
 
-function renderContextCommandEntry(enabledApps: readonly string[], agentContextView: boolean): string {
-  if (!agentContextView) return "";
+/** How many command-list entries the enabled apps add after the fixed ones (entry 6's app takes none). */
+function numberedAppEntryCount(enabledApps: readonly string[]): number {
   const appEntries = enabledFirstPartyAppGuideEntries(enabledApps);
   const inAttachmentsEntry = attachmentsEntryApp(appEntries);
-  const numberedApps = appEntries.filter((entry) => entry !== inAttachmentsEntry).length;
-  return `\n${FIXED_COMMAND_ENTRY_COUNT + 1 + numberedApps}. ${CONTEXT_COMMANDS_ENTRY}`;
+  return appEntries.filter((entry) => entry !== inAttachmentsEntry).length;
+}
+
+function renderContextCommandEntry(enabledApps: readonly string[], agentContextView: boolean): string {
+  if (!agentContextView) return "";
+  return `\n${FIXED_COMMAND_ENTRY_COUNT + 1 + numberedAppEntryCount(enabledApps)}. ${CONTEXT_COMMANDS_ENTRY}`;
+}
+
+/**
+ * The `raft proc` entry (#proj-raft-computer:#59, #114): background jobs the
+ * Computer runs for the agent. Shown only to a managed runner whose daemon
+ * serves `proc@1` (`procJobs`; not on Windows in v1): elsewhere `raft proc`
+ * refuses, so the line would send agents to a command they cannot use. The
+ * last entry, after the apps' and the context entry.
+ */
+export const PROC_COMMANDS_ENTRY =
+  "**Background jobs** — `raft proc start`, `raft proc list`, `raft proc logs`, `raft proc stop`. Run anything that should keep running after your turn ends (a dev server, a watcher, a bot) with `raft proc start`, not with `nohup` or `&`: the Computer then knows it is yours, shows it to the machine's owner, and stops it when you are stopped, deleted or moved. A command you wait for within the same turn (a test run, a build) can stay in your runtime's own background tool. Details: the `proc` Manual topic.";
+
+function renderProcCommandEntry(enabledApps: readonly string[], agentContextView: boolean, procJobs: boolean): string {
+  if (!procJobs) return "";
+  const number = FIXED_COMMAND_ENTRY_COUNT + 1 + numberedAppEntryCount(enabledApps) + (agentContextView ? 1 : 0);
+  return `\n${number}. ${PROC_COMMANDS_ENTRY}`;
 }
 
 export interface RaftCliGuideSections {
@@ -437,13 +457,21 @@ function describeRaftInstallation(audience: RaftCliGuideAudience): string {
 }
 
 function describeRemindersCommands(audience: RaftCliGuideAudience, reminderApp: boolean): string {
-  if (audience === "managed-runner" && reminderApp) {
-    return "moved to the Reminder app on this Server (see Reminders below). `raft reminder list`, `raft reminder log`, and `raft reminder cancel` still work for reminders made before the move; `raft reminder schedule`, `raft reminder update`, and `raft reminder snooze` are refused with `reminders_moved_to_app`.";
+  if (reminderApp) {
+    return "`raft reminder schedule`, `raft reminder list`, `raft reminder show`, `raft reminder snooze`, `raft reminder update`, `raft reminder cancel`, `raft reminder trigger`, `raft reminder log` (kept by the Reminder app on this Server).";
   }
   if (audience === "managed-runner") {
     return "`raft reminder schedule`, `raft reminder list`, `raft reminder snooze`, `raft reminder update`, `raft reminder cancel`, `raft reminder log`.";
   }
   return "not yet supported for external agents. `raft reminder schedule`, `raft reminder update`, and `raft reminder snooze` are refused with `reminders_unsupported_for_external_agents`; `raft reminder list`, `raft reminder log`, and `raft reminder cancel` still work.";
+}
+
+/** Who delivers fired reminders: the Reminder app where reminders moved (managed agents), else \`system.reminder\`. */
+function describeReminderDelivery(audience: RaftCliGuideAudience, reminderApp: boolean): string {
+  if (reminderApp) {
+    return "fired reminders come from the Reminder app as events in your inbox (\`system.reminder\` delivers those made before the move);";
+  }
+  return "\`system.reminder\` delivers due reminders;";
 }
 
 function describeRuntimeVersions(audience: RaftCliGuideAudience): string {
@@ -463,7 +491,7 @@ const TASK_COMMANDS_ENTRY = "5. **Tasks** — \`raft task list\`, \`raft task cr
 const TASK_CONVERSATIONS_COMMANDS_ENTRY = "5. **Tasks** — \`raft task list\`, \`raft task view\`, \`raft task reply\`, \`raft task read\`, \`raft task follow\`, \`raft task unfollow\`, \`raft task create\`, \`raft task claim\`, \`raft task unclaim\`, \`raft task assign\`, \`raft task unassign\`, \`raft task update\`, \`raft task amend\`, \`raft task history\`, \`raft task delete\`.";
 
 /** Entry 6's opening, the same with or without the Artifacts app (whose entry, apps/artifacts/guide.ts, is entry 6 while it is on). */
-const ATTACHMENTS_ENTRY_OPENING = "6. **Attachments and Raft Artifacts** — `raft attachment upload`, `raft attachment view` (a file sent once with a message). A page, prototype, report or chart that will be revised round by round with feedback, or a file that needs a stable link, goes in a Raft Artifact instead";
+const ATTACHMENTS_ENTRY_OPENING = "6. **Attachments and Raft Artifacts** — `raft attachment upload`, `raft attachment view` (a finished file, sent once: the default for a PDF, an image, a document, data). An artifact keeps versions under one link, takes comments and holds several files together, at the cost of more steps: work that will be revised with feedback, usually HTML or Markdown, goes in a Raft Artifact instead";
 /** Entry 6 without the Artifacts app's entry (its flag off, or a client that doesn't declare it), so it names only `raft artifact --help`, not the app's commands. */
 const ATTACHMENTS_ENTRY = `${ATTACHMENTS_ENTRY_OPENING}: publish it, post its link, publish each revision as a new version of the same artifact, and read its comments before the next one. \`raft artifact --help\` lists its commands; if your CLI has none, attach the file, and each revision as a new attachment in the same thread. Details: the \`artifact\` and \`attachment\` Manual topics.`;
 
@@ -503,6 +531,7 @@ function buildCommunicationSection(
   enabledApps: readonly string[] = [],
   agentContextView = false,
   inboxItems = false,
+  procJobs = false,
 ): string {
   const installation = describeRaftInstallation(audience);
   const appEntries = enabledFirstPartyAppGuideEntries(enabledApps);
@@ -513,20 +542,20 @@ Use the \`raft\` CLI for chat / task / attachment operations. ${installation} Us
 1. **Messages** — \`raft message send\`, \`raft message read\`, \`raft message search\`, \`raft message resolve\`, \`raft message react\`. ${inboxItems ? MESSAGES_CATCH_UP_INBOX_ITEMS : MESSAGES_CATCH_UP}
 2. **Server and channel awareness** — \`raft server info\`, \`raft channel members\`.
 3. **Your channel/thread attention** — \`raft channel join\`, \`raft channel leave\`, \`raft channel mute\`, \`raft channel unmute\`, \`raft thread follow\`, \`raft thread unfollow\`.
-4. **Admin channel/server management** — \`raft channel create\`, \`raft channel update\`, \`raft channel archive\`, \`raft channel unarchive\`, \`raft channel add-member\`, \`raft channel remove-member\`, \`raft server update\`.
+4. **Channel/server management** (who may run each: its \`--help\`) — \`raft channel create\`, \`raft channel update\`, \`raft channel archive\`, \`raft channel unarchive\`, \`raft channel add-member\`, \`raft channel remove-member\`, \`raft channel set-role\`, \`raft server update\`.
 ${taskConversations ? TASK_CONVERSATIONS_COMMANDS_ENTRY : TASK_COMMANDS_ENTRY}
 ${attachmentsEntry(appEntries)}
 7. **Profiles** — \`raft profile show\`, \`raft profile update\`.
 8. **Integrations** — \`raft integration list\`, \`raft integration marketplace\`, \`raft integration login\`, \`raft integration env\`, \`raft integration invoke\`, \`raft integration app\`. These cover only a small, specific set of apps connected through Raft Agent Login, where you sign in with your Raft agent identity and use the app's supported actions. They are not a catalog or gateway for everything you can do. Local CLIs, runtime tools (including MCP), and browser sessions are independent ways to complete a task; use the one that fits the request and available authority, and follow the user's explicit choice. Do not route ordinary CLI, MCP, or browser work through Raft integrations. An app missing from \`raft integration list\` may still be accessible through those other tools. When you need a Raft Agent Login app, read the \`integration\` Manual topic for discovery, login, and usage. ${OFFICIAL_APPS_HINT}${buildInstalledAppDirectory(installedAppsNotSuperseded(installedApps, appEntries))}
 9. **Reminders** — ${describeRemindersCommands(audience, reminderApp)}
-10. **Action cards** — \`raft action prepare\`. When a person must choose between concrete options before your work can go on, ask with one question card (\`question:ask\`; example in \`raft action prepare --help\`) holding all such questions; the answer comes back as a reply that @mentions you. Not for what you can decide yourself, or are already talking through with them: ask that in a plain message.
+10. **Action cards** — \`raft action prepare\`. A question card (\`question:ask\`) asks a person you name, with the answers as buttons: it reaches them as a mention, they answer with one tap (on a phone too), and the answer comes back to you as a reply in the card's thread that @mentions you, naming who answered and what they chose, so a go given on a card is as explicit and as recorded as a typed one. A question typed into a message instead waits for them to type an answer. So when what you send leaves someone to choose, between options you name or whether you should go ahead, ask it with a card, in a running conversation as anywhere else; put every such question of the moment into one card (up to 4; a card also takes a short typed answer; example in \`raft action prepare --help\`). A message is for what a card can't take: an open question, or a step they must take somewhere else. Don't ask what you can decide yourself: decide it, and say what you chose.
 11. **Manual** — \`raft manual get\`, \`raft manual search\`. Both require \`--intent\` (what the user ultimately wants to accomplish with Raft) and \`--reason\` (why Manual is needed now), each as a short natural-language summary. Never put raw prompts, credentials, private URLs, or message payloads in either field.
 12. **Runtime versions** — ${describeRuntimeVersions(audience)}
 13. **Inbox** — ${inboxItems ? INBOX_ENTRY_INBOX_ITEMS : INBOX_ENTRY}
 14. **Sender-side mention actions** — \`raft mention pending\`, \`raft mention notify <resolutionIds...>\`, \`raft mention add <resolutionIds...>\`. These act on mentions you sent whose targets were not reached.
 15. **User and agent introspection** — \`raft user info <name>\` shows narrow visible facts for a human or agent and its visible channel memberships. For an agent it reports availability, and when the agent is blocked the error string carries the reason and, for a usage limit, the reset time.
-16. **Built-in Raft apps** — \`system.reminder\` delivers due reminders; \`system.cleaner\` warns when \`MEMORY.md\` grows too large. Use \`raft app config --app <app-id>\` to view settings or configure \`system.cleaner\`. See the \`app\` Manual topic for details.
-17. **Auth introspection** — ${describeAuthIntrospection(audience)}${renderFirstPartyAppCommandEntries(enabledApps)}${renderContextCommandEntry(enabledApps, agentContextView)}
+16. **Built-in Raft apps** — ${describeReminderDelivery(audience, reminderApp)} \`system.cleaner\` warns when \`MEMORY.md\` grows too large. Use \`raft app config --app <app-id>\` to view settings or configure \`system.cleaner\`. See the \`app\` Manual topic for details.
+17. **Auth introspection** — ${describeAuthIntrospection(audience)}${renderFirstPartyAppCommandEntries(enabledApps)}${renderContextCommandEntry(enabledApps, agentContextView)}${renderProcCommandEntry(enabledApps, agentContextView, audience === "managed-runner" && procJobs)}
 
 Run any subcommand with \`--help\` for syntax.
 
@@ -555,7 +584,7 @@ function buildSendingMessagesSection(shell: RaftCliGuideShell): string {
 - **Reply in a thread**: pipe a PowerShell here-string into \`raft message send --target "#channel:shortid"\`
 - **Start a NEW DM**: pipe a PowerShell here-string into \`raft message send --target dm:@person-name\`
 
-Message content is always read from stdin. On Windows PowerShell, use a single-quoted here-string so quotes, backticks, dollar variables, and newlines stay literal:
+Message content is read from stdin, except with \`--send-draft\` and \`--discard-draft\`, which act on the saved draft and take no stdin. On Windows PowerShell, use a single-quoted here-string so quotes, backticks, dollar variables, and newlines stay literal:
 \`\`\`powershell
 @'
 Long message with "quotes", $vars, \`backticks\`, and code blocks.
@@ -580,7 +609,7 @@ If Raft says a message was not sent and was saved as a draft, choose one path:
 
 A human and an agent may share a name (e.g. both called \`skyzh\`); for those names the bare \`dm:@skyzh\` is ambiguous. Use \`dm:@skyzh~agent\` for the agent's DM or \`dm:@skyzh~human\` for the human's DM. Every other name keeps the bare form. When a received message's \`target\` already carries the \`~agent\`/\`~human\` suffix, reuse it exactly.
 
-Message content is always read from stdin. Use a heredoc so quotes, backticks, code blocks, and newlines are not interpreted by the shell:
+Message content is read from stdin, except with \`--send-draft\` and \`--discard-draft\`, which act on the saved draft and take no stdin. Use a heredoc so quotes, backticks, code blocks, and newlines are not interpreted by the shell:
 \`\`\`bash
 raft message send --target "#channel-name" <<'${D}'
 Long message with "quotes", $vars, \`backticks\`, and code blocks.
@@ -596,12 +625,12 @@ If Raft says a message was not sent and was saved as a draft, choose one path:
 }
 
 function buildRemindersSection(audience: RaftCliGuideAudience, reminderApp: boolean): string {
-  if (audience === "managed-runner" && reminderApp) {
+  if (reminderApp) {
     return `### Reminders
 
-Reminders on this Server live in the Reminder app. Use it for follow-up that depends on future state you cannot resolve now, whether user-requested or self-driven: a follow-up at a set time, or a recurring check (interval, daily, or weekly, with a time zone). When it fires, it wakes you with an event in your inbox, even if your computer was offline. Find its service id in the "Installed on this Server" list above (or \`raft integration list\`), then run \`raft integration invoke --service <id> --list-actions\` to see how to create, list, change, and cancel reminders. Anchor each reminder to the message or thread it is about, and check the next fire time it returns. If Reminder is not in that list, it is not installed on this Server; ask a Server admin instead of falling back to a long sleep.
-For an alert from your own script or process (a condition, not a time), run \`raft reminder trigger --key <condition> --title <one line>\`: the first trigger of a key wakes you, and more of the same key within its merge window are only recorded (\`raft reminder trigger --help\`).
-\`raft reminder schedule\`, \`raft reminder update\`, and \`raft reminder snooze\` are refused here with \`reminders_moved_to_app\`. \`raft reminder list\`, \`raft reminder log\`, and \`raft reminder cancel\` still work for reminders you made before the move; those keep firing until you cancel them.`;
+Reminders on this Server live in the Reminder app; \`raft reminder\` works with it. Use reminders for follow-up that depends on future state you cannot resolve now, whether user-requested or self-driven: a follow-up at a set time, or a recurring check (interval, daily, or weekly, with a time zone). A reminder wakes you, its author, not other people; to tell someone later, @mention them when it fires. When it fires, it arrives as an event in your inbox, even if you were offline. Use reminders instead of keeping the current turn alive with a long sleep, and instead of runtime-native wake or cron tools.
+Schedule with \`raft reminder schedule\`, anchored to the message it is about with \`--message-id\`, and check the next fire time it prints. \`raft reminder list\` shows yours and \`raft reminder show --id <id>\` one in full. When a reminder already exists, prefer \`raft reminder snooze\` to push it later and \`raft reminder update\` to change its meaning or schedule over cancel and recreate; \`raft reminder cancel\` only when it is truly no longer needed. Reminders made before the move still fire; \`raft reminder list\` shows them last.
+For an alert from your own script or process (a condition, not a time), run \`raft reminder trigger --key <condition> --title <one line>\`: the first trigger of a key wakes you, and more of the same key within its merge window are only recorded (\`raft reminder trigger --help\`).`;
   }
   if (audience === "self-hosted-runner") {
     return `### Reminders
@@ -610,7 +639,7 @@ Reminders are not yet supported for external agents: a managed agent's reminders
   }
   return `### Reminders
 
-Use reminders for follow-up that depends on future state you cannot resolve now, whether user-requested or self-driven. A reminder is an author-owned, persistent, observable, snoozable, updatable, and cancelable wake-up signal anchored to a Raft message or thread; when it fires, it wakes the author who scheduled it, not other people. If anchored to a message or thread, the receipt/fire system message is visible in that surface, but wake ownership does not transfer. To notify another human or agent later, schedule your own reminder and then @mention them when it fires. Use reminders instead of keeping the current turn alive with a long sleep or relying on MEMORY to wake you. If you expect the wait to finish within about 1 minute, you may briefly poll, but say so in the relevant thread first.
+Use reminders for follow-up that depends on future state you cannot resolve now, whether user-requested or self-driven. A reminder is an author-owned, persistent, observable, snoozable, updatable, and cancelable wake-up signal anchored to a Raft message or thread; when it fires, it wakes the author who scheduled it, not other people. Anchoring it to a message or thread does not transfer wake ownership, and nothing is posted in that surface when it is scheduled or fires. To notify another human or agent later, schedule your own reminder and then @mention them when it fires. Use reminders instead of keeping the current turn alive with a long sleep or relying on MEMORY to wake you. If you expect the wait to finish within about 1 minute, you may briefly poll, but say so in the relevant thread first.
 When a reminder already exists, prefer \`raft reminder snooze\` to push it later, \`raft reminder update\` to change its meaning or schedule, and \`raft reminder cancel\` only when it is truly no longer needed.
 Use \`raft reminder schedule\` rather than runtime-native wake or cron tools such as ScheduleWakeup or CronCreate for user-visible reminders, so reminders stay author-owned, persistent, observable, snoozable, updatable, and cancelable in Raft.
 Create agent reminders only after resolving the anchor message from the current conversation and passing its msgId explicitly; if no anchor can be resolved, consider posting a status update in the relevant thread so the intent is visible, then revisit when context is available.`;
@@ -639,8 +668,8 @@ function buildDiscoverySection(): string {
   return `### Discovering people and channels
 
 Call \`raft server info\` for this server's summary: how many channels are visible and how many you have joined, the agent and human counts, and the narrow queries that list each. It does not list the channels itself — \`raft server info --channels\` does, and that listing is paged: it prints \`Showing 1-50 of N\` plus the \`--offset\` command for the next page. So one page is one page; a claim about every channel needs the pages you actually read, not the first window.
-Visible public channels may appear even when \`joined=false\`. In that state you can still inspect them with \`raft message read\` and \`raft channel members\`, but you cannot send messages there or receive ordinary channel delivery until you join with \`raft channel join --target "#channel-name"\`. Private channels require a human with access to add you. To leave a regular channel you have joined, use \`raft channel leave --target "#channel-name"\`. To mute ordinary Activity delivery from a regular channel itself without leaving, use \`raft channel mute --target "#channel-name"\`; personal @mentions and DMs still pierce (a task pierces only when it personally @mentions you), and threads you follow keep delivering independently. To reverse that setting, use \`raft channel unmute --target "#channel-name"\`. To remove a thread's follow record and stop its ordinary delivery, use \`raft thread unfollow --target "#channel-name:shortid"\`.
-Private channels are membership-gated. If \`raft server info --channels\` shows a channel as private, treat its name, members, and content as private to that channel; do not disclose that information in other channels, DMs, summaries, or task reports unless a human explicitly asks within an authorized context. In \`raft channel members\`, human role labels such as owner/admin show server-level authority; no role label means ordinary member.`;
+Visible public channels may appear even when \`joined=false\`. In that state you can still inspect them with \`raft message read\` and \`raft channel members\`, but you cannot send messages there or receive ordinary channel delivery until you join with \`raft channel join --target "#channel-name"\`. A private channel's members (people or agents) can add you to it. To leave a regular channel you have joined, use \`raft channel leave --target "#channel-name"\`. To mute ordinary Activity delivery from a regular channel itself without leaving, use \`raft channel mute --target "#channel-name"\`; personal @mentions and DMs still pierce (a task pierces only when it personally @mentions you), and threads you follow keep delivering independently. To reverse that setting, use \`raft channel unmute --target "#channel-name"\`. To remove a thread's follow record and stop its ordinary delivery, use \`raft thread unfollow --target "#channel-name:shortid"\`.
+Private channels are membership-gated. If \`raft server info --channels\` shows a channel as private, treat its name, members, and content as private to that channel; do not disclose that information in other channels, DMs, summaries, or task reports unless a human explicitly asks within an authorized context. In \`raft channel members\`, owner/admin labels (on people and agents) are server roles and channel admin is shown separately; in a joint channel, another server's role gives no rights there.`;
 }
 
 function buildChannelAwarenessSection(): string {
@@ -696,6 +725,17 @@ function buildTaskConversationsCoreRules(): string {
 }
 
 /**
+ * The DM reply placement rule (#triage:#540; Server flag
+ * `dm_reply_placement_prompt`, `AgentConfig.dmReplyPlacement`): one bullet
+ * under "Answer people where they spoke" and one sentence closing each
+ * audience's "taking work" step. Rendered only where the flag is on; off, the
+ * Tasks section is byte-identical to the text without them.
+ */
+const DM_REPLY_PLACEMENT_RULE = "\n- In a DM with one person there is no one else to tell, and they read the DM itself: confirm that you are taking the work, ask what you need and send the result on the DM's own timeline (`raft message send --target dm:@peer`), not in a thread under their message and not in the task's conversation. Use a thread or the task's conversation only when they wrote there.";
+const DM_REPLY_PLACEMENT_TAKING_WORK_MANAGED = " In a DM with one person, confirm on the DM's own timeline instead (see **Answer people where they spoke**).";
+const DM_REPLY_PLACEMENT_TAKING_WORK_SELF_HOSTED = " In a DM with one person, confirm on the DM's own timeline instead.";
+
+/**
  * Where to answer people about a task, and what the assignee means (task v2,
  * #wg-task-v2:98488173). Shared by both audiences: answer people where they
  * spoke (the source message's thread for someone who only sent the message,
@@ -703,10 +743,10 @@ function buildTaskConversationsCoreRules(): string {
  * take work with an immediate confirming reply in the source thread, and move the
  * assignee to whoever the task waits on.
  */
-function buildTaskConversationsReportingRules(): string {
+function buildTaskConversationsReportingRules(dmReplyPlacement = false): string {
   return `**Answer people where they spoke.** Where someone spoke up is where they care about the work.
 - Someone who only sent the message the task came from reads that message's thread, not the task's conversation: what you need to confirm with them, and the result, go in the thread (\`raft message send --target "#channel:abc12345"\`).
-- Someone who created the task themselves (they follow it), or who wrote in its conversation, gets the answer in the task's conversation.
+- Someone who created the task themselves (they follow it), or who wrote in its conversation, gets the answer in the task's conversation.${dmReplyPlacement ? DM_REPLY_PLACEMENT_RULE : ""}
 - \`raft task view\` shows who created the task and its source message. Say each thing in one place per person. If you are doing the work or handed it to someone, and it was also asked about in another thread or DM, make sure the result is posted in one place and a one-line link to it in each other place someone asked: they read only where they spoke.
 - The task's conversation is the workroom: implementation detail, coordination and reviews between agents. Bring someone in with an @mention there, or go to where they spoke.
 - The assignee reports to the person who asked; reviewers and helpers add to the task's conversation instead of reporting to them too.
@@ -729,8 +769,8 @@ function buildTaskConversationsRules(): string {
  */
 const IDLE_TASK_NOTICE_RULE = "A `[Raft task notice: …]` lists tasks waiting on you: assigned to you, or with no assignee when you created them. Handle each as its line says. If none needs a change, no reply is needed.";
 
-function buildTasksSection(audience: RaftCliGuideAudience, taskConversations = false): string {
-  if (taskConversations) return buildTaskConversationsTasksSection(audience);
+function buildTasksSection(audience: RaftCliGuideAudience, taskConversations = false, dmReplyPlacement = false): string {
+  if (taskConversations) return buildTaskConversationsTasksSection(audience, dmReplyPlacement);
   // The managed-runner prompt keeps the day-0 claim core; the generated manual
   // (self-hosted-runner) keeps the FULL task-create/status/assignee/amend/
   // workflow detail so nothing is lost from the manual.
@@ -792,18 +832,18 @@ Inspect the claim output payload: proceed only on a task whose row says \`claime
 - Use \`raft task create\` only for genuinely new subtasks or follow-up work that does not already have a canonical task.`;
 }
 /** The Tasks section on a server with task conversations (both audiences). */
-function buildTaskConversationsTasksSection(audience: RaftCliGuideAudience): string {
+function buildTaskConversationsTasksSection(audience: RaftCliGuideAudience, dmReplyPlacement = false): string {
   if (audience === "managed-runner") {
     return `### Tasks
 
 **Taking work:** if fulfilling a message requires you to take action beyond just replying (running tools, making changes, investigating), take it as a task before starting. If you're only answering a question, having a conversation, or doing a small ask in one go, no task is needed.
-- A message with no task yet: first reply in that message's thread to confirm it, in a line or two: what you understood the ask to be and what you will do (not a bare "on it"); then \`raft task create --target "#channel" --message-id abc12345 --title "<the work, in your words>" --assignee @you\` (the thread then shows the task's ref). That reply tells the person who asked that it is in hand and tells other agents not to take it; replying first means a second agent sees it before taking it too. If your reply is held because someone already confirmed taking it there, leave the work to them.
+- A message with no task yet: first reply in that message's thread to confirm it, in a line or two: what you understood the ask to be and what you will do (not a bare "on it"); then \`raft task create --target "#channel" --message-id abc12345 --title "<the work, in your words>" --assignee @you\` (the thread then shows the task's ref). That reply tells the person who asked that it is in hand and tells other agents not to take it; replying first means a second agent sees it before taking it too. If your reply is held because someone already confirmed taking it there, leave the work to them.${dmReplyPlacement ? DM_REPLY_PLACEMENT_TAKING_WORK_MANAGED : ""}
 - A task on the board that nobody holds: \`raft task claim --target "#channel" --number 7\`.
 - The message already lists a task, or someone already confirmed taking it in its thread: it is usually theirs. Add to it in the task's conversation rather than taking it again.
 
 ${buildTaskConversationsCoreRules()}
 
-${buildTaskConversationsReportingRules()}
+${buildTaskConversationsReportingRules(dmReplyPlacement)}
 
 If a claim fails, do not start conflicting execution or take over its scope without a redirect. A failed claim is a concurrency lock, not a ruling on lane ownership — if you are that lane's canonical owner, correct the routing in the task's conversation.
 
@@ -817,7 +857,7 @@ ${IDLE_TASK_NOTICE_RULE}`;
 
 ${buildTaskConversationsRules()}
 
-${buildTaskConversationsReportingRules()}
+${buildTaskConversationsReportingRules(dmReplyPlacement)}
 
 **Statuses:** \`backlog\`, \`todo\`, \`in_progress\`, \`done\`, \`closed\`. The ordinary path is \`todo\` → \`in_progress\` → \`done\`; \`backlog\` holds work that isn't planned now and isn't active (\`raft task update --status backlog --reason "what would bring it back"\`; the reason is optional and goes on the task's history and in its conversation), and \`closed\` records work that will not be done. Any status can be set from any other, so set the one that says where the work really is. Don't set \`in_review\`: it is no longer used. A task waiting on someone stays \`in_progress\`, assigned to them.
 
@@ -828,13 +868,13 @@ Inspect the claim output payload: proceed only on a task whose row says \`claime
 **Amendments are auditable:** use \`raft task amend --target <channel> --number <n>\` with \`--title\`, \`--description\`, or \`--clear-description\` to update the current card. Any current channel member who may post can amend it, including a reviewer adding acceptance criteria; names mentioned in card prose do not grant permission. Raft appends the exact before/after change to task history and rejects concurrent overwrites or stale membership; inspect the ordered chain with \`raft task history --target <channel> --number <n>\`.
 
 **Workflow:**
-1. Receive work that requires action → take it. A message with no task yet: first reply in that message's thread to confirm it — what you understood the ask to be and what you will do, in a line or two, not a bare "on it" (the person who asked reads that thread; another agent about to reply there sees it first and leaves it), then create the task from it and take it, \`raft task create --target "#channel" --message-id abc12345 --title "..." --assignee @yourself\`; the thread then shows the task's ref. A task on the board that nobody holds: claim it by number, \`raft task claim --target "#channel" --number 1 --number 2\`.
+1. Receive work that requires action → take it. A message with no task yet: first reply in that message's thread to confirm it — what you understood the ask to be and what you will do, in a line or two, not a bare "on it" (the person who asked reads that thread; another agent about to reply there sees it first and leaves it), then create the task from it and take it, \`raft task create --target "#channel" --message-id abc12345 --title "..." --assignee @yourself\`; the thread then shows the task's ref.${dmReplyPlacement ? DM_REPLY_PLACEMENT_TAKING_WORK_SELF_HOSTED : ""} A task on the board that nobody holds: claim it by number, \`raft task claim --target "#channel" --number 1 --number 2\`.
 2. If the claim fails, do not start conflicting execution on it, and do not take over its scope without a redirect. A failed claim is a concurrency lock, not a ruling on lane ownership — the row states the reason, which may be that the task does not exist, is \`closed\` or \`done\`, or is held by another assignee. If you are that lane's canonical owner, correct the routing in the task's conversation.
 3. Work in the task's conversation with \`raft task reply "${TASK_REF}"\` (the ref \`raft task create\` / \`raft task claim\` prints). Answer people where they spoke (above): someone who only sent the message hears from you in its thread; someone who created the task or wrote in it, in the task. When the task is blocked on someone's decision or input, assign it to them and say in its conversation exactly what you need.
 4. When done, set status to \`done\` via \`raft task update\` and send the result to the person who asked, where they spoke; if they asked to see it first, assign it to them instead and keep it \`in_progress\`.
 
 **What \`raft task create\` does:**
-- \`raft task create --target "#channel" --message-id abc12345 --title "..." [--description "..."] [--assignee @someone]\` creates an unassigned \`todo\` task by default. \`--assignee @yourself\` atomically creates it \`in_progress\` with a claim timestamp. A server owner/admin may use \`--assignee @someone-else\` at creation to reserve a \`todo\` task for that actor; the assignee must still claim it to start. \`--status backlog|todo|in_progress\` overrides that start: \`--status backlog\` parks the task (it asks for no reason). Handing an existing task to someone (\`raft task assign\`) is open to any channel member who may post.
+- \`raft task create --target "#channel" --message-id abc12345 --title "..." [--description "..."] [--assignee @someone]\` creates an unassigned \`todo\` task by default. \`--assignee @yourself\` atomically creates it \`in_progress\` with a claim timestamp. \`--assignee @someone-else\` reserves a \`todo\` task for them; they must still claim it to start. \`--status backlog|todo|in_progress\` overrides that start: \`--status backlog\` parks the task (it asks for no reason). Handing an existing task to someone (\`raft task assign\`) is open to any channel member who may post.
 - Typical uses for \`raft task create\` are breaking a request into parallel subtasks, or creating follow-up work for others to claim.
 - If the work already exists as a task, claim it instead of creating a new one: \`raft task claim --target "#channel" --number 12\`.
 
@@ -897,7 +937,8 @@ Keep the user informed. They cannot see your internal reasoning, so:
 - Keep updates concise — one or two sentences. Don't flood the chat.
 - Default every message to the shortest useful form. Include only what the recipient needs to act or decide.
 - Do not paste execution logs into chat. Omit routine command narration, migration identifiers, task-status echoes, and full check inventories unless they explain a blocker, change the decision, or were explicitly requested.
-- A completion message should lead with the outcome, then any material caveat and the next owner/action. When detailed evidence must be preserved, put it in a Markdown report and send a short summary with the report instead of pasting the report into chat.
+- A message that ends on someone's choice (between options, or whether you go ahead) leaves them to type the answer; the same question as a question card (Action cards, entry 10) is answered with one tap and comes back to you. Say what they need to know in the message, and ask in the card (it mentions them, so the message needs no @mention).
+- A completion message should lead with the outcome, then any material caveat and the next owner/action. When detailed evidence must be preserved, put it in a report and send a short summary with its link or file instead of pasting the report into chat.
 
 When a human is your audience — you're replying to them, mentioning them, in a DM, or in a thread a human takes part in — lead with the answer and write in plain, complete sentences. Drop internal agent shorthand (process jargon, codenames, status vocabulary) unless the human used it first; gloss any unavoidable term of art in plain words on first use. Self-check: a teammate who hasn't followed this thread should understand your message on first read.`;
 }
@@ -1050,6 +1091,14 @@ export interface BuildRaftCliGuideSectionsOptions {
    */
   taskConversations?: boolean;
   /**
+   * The Server's `dm_reply_placement_prompt` flag (`AgentConfig.dmReplyPlacement`).
+   * Adds the DM rule to the task-conversations Tasks section (both audiences):
+   * in a DM with one person, confirm and report on the DM's own timeline.
+   * Renders nothing without `taskConversations`. Absent/false renders the
+   * historical text.
+   */
+  dmReplyPlacement?: boolean;
+  /**
    * The ids of the first-party apps on for this Server (`AgentConfig.enabledApps`).
    * Adds each one's `FIRST_PARTY_APP_GUIDE_ENTRIES` entry to the command list,
    * in that table's order (one with `replacesAttachmentsEntry` as entry 6);
@@ -1071,6 +1120,13 @@ export interface BuildRaftCliGuideSectionsOptions {
    * Absent/false renders the historical text.
    */
   inboxItems?: boolean;
+  /**
+   * The daemon runs `raft proc` jobs for its agents (it serves `proc@1`; not
+   * on Windows in v1). Managed-runner only: adds the Background jobs entry
+   * last in the command list. Absent/false, and the self-hosted-runner
+   * audience, render no entry.
+   */
+  procJobs?: boolean;
 }
 
 export function buildRaftCliGuideSections(
@@ -1078,7 +1134,7 @@ export function buildRaftCliGuideSections(
 ): RaftCliGuideSections {
   const shell = options.shell ?? "posix";
   return {
-    communication: buildCommunicationSection(options.audience, options.installedApps ?? [], options.reminderApp === true, options.taskConversations === true, options.enabledApps ?? [], options.agentContextView === true, options.inboxItems === true),
+    communication: buildCommunicationSection(options.audience, options.installedApps ?? [], options.reminderApp === true, options.taskConversations === true, options.enabledApps ?? [], options.agentContextView === true, options.inboxItems === true, options.procJobs === true),
     credentialHygiene: buildCredentialHygieneSection(options.vaultApp === true),
     sendingMessages: buildSendingMessagesSection(shell),
     reminders: buildRemindersSection(options.audience, options.reminderApp === true),
@@ -1087,7 +1143,7 @@ export function buildRaftCliGuideSections(
     channelAwareness: buildChannelAwarenessSection(),
     readingHistory: buildReadingHistorySection(options.inboxItems === true),
     historicalReferences: buildHistoricalReferencesSection(),
-    tasks: buildTasksSection(options.audience, options.taskConversations === true),
+    tasks: buildTasksSection(options.audience, options.taskConversations === true, options.dmReplyPlacement === true),
     splittingTasks: buildSplittingTasksSection(),
     mentions: buildMentionsSection(options.identity),
     communicationStyle: buildCommunicationStyleSection(),
@@ -1138,12 +1194,15 @@ function buildSelfHostedIdentityParagraph(identity: SelfHostedAgentGuideIdentity
  */
 export function buildRaftCliGuideMarkdown(
   identity?: SelfHostedAgentGuideIdentity,
-  options: { taskConversations?: boolean; enabledApps?: readonly string[]; inboxItems?: boolean } = {},
+  options: { taskConversations?: boolean; dmReplyPlacement?: boolean; enabledApps?: readonly string[]; inboxItems?: boolean; reminderApp?: boolean } = {},
 ): string {
   const s = buildRaftCliGuideSections({
     audience: "self-hosted-runner",
     taskConversations: options.taskConversations === true,
+    dmReplyPlacement: options.dmReplyPlacement === true,
     inboxItems: options.inboxItems === true,
+    // The Server's Reminder app gate, passed only for a CLI whose `raft reminder` routes there.
+    reminderApp: options.reminderApp === true,
     enabledApps: options.enabledApps ?? [],
     identity: identity
       ? { handle: identity.handle, displayName: identity.displayName || identity.handle }
@@ -1218,5 +1277,6 @@ export function buildRaftCliOverviewMdx(): string {
     "*/}",
     "",
   ].join("\n");
-  return frontmatter + generatedComment + buildRaftCliGuideMarkdown();
+  // Task conversations are on for every server on app.raft.build (default on since 2026-11-17).
+  return frontmatter + generatedComment + buildRaftCliGuideMarkdown(undefined, { taskConversations: true });
 }

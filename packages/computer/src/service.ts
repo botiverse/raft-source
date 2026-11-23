@@ -18,10 +18,12 @@
 // child's memory (loaded from `servers/<serverId>/runner.state.json`);
 // it is never read by the service, never logged, never printed.
 import { readChannel } from "./lib/channelState";
+import { installSystemCaTrust } from "@botiverse/raft-shared/src/systemTrust";
 import { startServiceMemorySampler } from "./serviceMemory";
 import type { UpgradeStartParams, UpgradeStartResult } from "./lib/types";
 import { compareComputerVersions } from "./computerVersionOrder";
 import { readInstallerRepairHint } from "./installerRepairHint";
+import { probeUpgradeScope, upgradeScopeForReady } from "./upgradeScope";
 import { acknowledgeMigratedFrom, readMigratedFromForServer } from "./migratedFromMarker";
 import { installerArgs, launchInstallerDetached, scrubInstallerOperationEnv, readInstallerVersion, readLastRemoteUpgradeReceipt, REMOTE_UPGRADE_FAILURE_WATCH_MS, UNIT_ESCAPING_INSTALLER_VERSION, type InstallerDownloadStats, recordRemoteUpgradeLaunch, recordRemoteUpgradeRefusal, remoteUpgradeInstallerFailure, waitForRemoteUpgradeFailureReceipt, watchRemoteUpgradeOutcome,
   installerChannel,
@@ -48,6 +50,7 @@ import { createRequire } from "node:module";
 import { COMPUTER_VERSION } from "./version";
 import { clearResidentConnectedMarker, readResidentConnectedMarker, writeResidentConnectedMarker } from "./residentConnectionMarker";
 import { residentCoreIdentity } from "./residentCoreIdentity";
+import { backfillAttachmentMachineId, describeMachineIdBackfill, type ReadComputerSelf } from "./machineIdBackfill";
 import { mkdir, writeFile, open, stat, unlink } from "node:fs/promises";
 import { dirname, join as joinPath } from "node:path";
 import {
@@ -522,6 +525,9 @@ const defaultCoreFactory: ResidentCoreFactory = async (creds, hooks) => {
   const slockHome = resolveRaftHome();
   const liveService = await readLiveServiceSnapshot(slockHome);
   const lifecycleBridge = await prepareResidentLifecycleBridge(slockHome, creds.serverId);
+  // Once per runner start (so again after every upgrade): may a web upgrade's
+  // installer leave the systemd unit? Asked afresh for every ready (a
+  // reconnect too), so a passing failure at boot does not stick (upgradeScope.ts).
   // Restarts this runner is still requesting (task #924); their outcome is
   // not proven yet.
   const inFlightRestartRequestIds = new Set<string>();
@@ -560,6 +566,8 @@ const defaultCoreFactory: ResidentCoreFactory = async (creds, hooks) => {
     getComputerLastUpgradeReceipt: () => readLastRemoteUpgradeReceipt(resolveRaftHome()),
     // task #34: advisory hint that the installer needs a repair run on the machine.
     getComputerInstallerRepairHint: () => readInstallerRepairHint(resolveRaftHome()),
+    // Explicit refusal of the scope a web upgrade's installer needs; null = allowed or unknown.
+    getComputerUpgradeScope: () => upgradeScopeForReady(probeUpgradeScope(slockHome)),
     // Raft Desktop moved this home from its embedded Computer: the first ready
     // to each server says so (`migratedFrom`), then the note goes (migratedFromMarker.ts).
     getComputerMigratedFrom: () => readMigratedFromForServer(resolveRaftHome(), creds.serverId),
@@ -939,8 +947,13 @@ export async function runResident(
     coreFactory?: ResidentCoreFactory;
     exit?: (code: number) => void;
     machineKeyRevokedStopDeadlineMs?: number;
+    /** Seam for the one machine-id backfill per start (GET /internal/computer/self). */
+    readComputerSelf?: ReadComputerSelf;
   } = {},
 ): Promise<void> {
+  // Idempotent; also here because Raft Desktop routes `__run` to this function
+  // from its own argv guard, without the CLI entry's bootstrap.
+  installSystemCaTrust();
   const exit = deps.exit ?? ((code: number) => process.exit(code));
   assertValidServerId(serverId);
   const slockHome = resolveRaftHome();
@@ -950,6 +963,15 @@ export async function runResident(
       "NO_ATTACHMENT",
       `No attachment for server ${serverId}. Run \`raft-computer attach ${serverId}\` first.`,
     );
+  }
+  // Once per start, in the background: never delays or fails the connect.
+  if (!a.machineId) {
+    void backfillAttachmentMachineId(slockHome, a, deps.readComputerSelf)
+      .then(({ outcome }) => {
+        const line = describeMachineIdBackfill(a.serverId, outcome);
+        if (line) process.stderr.write(line);
+      })
+      .catch(() => {});
   }
   const markerPath = serverConnectedMarkerPath(slockHome, a.serverId);
   // One stop per runner: a signal during the revoked stop below must not
@@ -1129,6 +1151,9 @@ export interface RunServiceDeps {
  * a loser must not supervise runners or publish service identity evidence.
  */
 export async function runService(deps: RunServiceDeps = {}): Promise<void> {
+  // Idempotent; also here because Raft Desktop routes `__service` to this
+  // function from its own argv guard, without the CLI entry's bootstrap.
+  installSystemCaTrust();
   const slockHome = resolveRaftHome();
   await mkdir(serviceRunDir(slockHome), { recursive: true });
   await runServiceStartupRecovery(slockHome);

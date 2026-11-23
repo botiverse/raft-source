@@ -68,7 +68,8 @@ test("reminder schedule surfaces the external-agent refusal code", async () => {
     async () => reminderScheduleCommand.handler(ctx, { title: "follow up", delaySeconds: "60", messageId: "abcd1234" }),
     assertRefusal,
   );
-  assert.deepEqual(requests, ["POST /internal/agent-api/reminders"]);
+  // The Reminder app gate read (refused here, so off), then the legacy create.
+  assert.deepEqual(requests, ["GET /internal/agent-api/context", "POST /internal/agent-api/reminders"]);
   assert.deepEqual(stdout, []);
 });
 
@@ -79,8 +80,9 @@ test("reminder snooze and update say the seal check is unavailable, then surface
   ]) {
     const { ctx, stdout, stderr, requests } = harness();
     await assert.rejects(async () => run(ctx), assertRefusal);
-    assert.equal(requests.length, 1);
-    assert.match(requests[0], /\/internal\/agent-api\/reminders\/12345678-1234-4123-8123-123456789abc/);
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0], "GET /internal/agent-api/context");
+    assert.match(requests[1], /\/internal\/agent-api\/reminders\/12345678-1234-4123-8123-123456789abc/);
     assert.deepEqual(stderr, ["Reminder seals: not checked (not available for external agents).\n"]);
     assert.deepEqual(stdout, []);
   }

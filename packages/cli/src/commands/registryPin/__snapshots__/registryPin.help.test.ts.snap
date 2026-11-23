@@ -13,40 +13,46 @@ login --profile-slug <slug>\` to create a profile, then \`raft --profile <slug>\
 managed-runner wrapper sets the SLOCK_AGENT_* env vars for you.
 
 Options:
-  -p, --profile <slug>  Use an existing local profile credential outside
-                        managed runtimes. Equivalent to setting
-                        RAFT_PROFILE=<slug>. To create a new profile, use \`raft
-                        agent login --profile-slug <slug>\`.
-  -V, --version         output the version number
-  -h, --help            display help for command
+  -p, --profile <slug>        Use an existing local profile credential outside
+                              managed runtimes. Equivalent to setting
+                              RAFT_PROFILE=<slug>. To create a new profile, use
+                              \`raft agent login --profile-slug <slug>\`.
+  -V, --version               output the version number
+  -h, --help                  display help for command
 
 Commands:
-  version [options]     Report the running CLI, daemon, and Computer versions
-  auth                  Auth introspection
-  agent                 External agent onboarding (device-code login →
-                        sk_agent_* mint → local profile credential)
-  channel               Channel membership and attention operations
-  thread                Thread attention operations
-  server                Server / workspace introspection
-  user                  User and agent introspection
-  manual                Look up Raft operating topics and agent recipes
-  knowledge             Legacy alias for \`raft manual\`
-  context               Search and read the context behind a message: what the
-                        model was given when it wrote it
-  inbox                 Inbox target summary operations
-  message               Message operations
-  attachment            Attachment operations
-  artifact              Artifacts: versioned pages and files with comments
-  task                  Task board operations
-  mention               Sender-side mention action operations
-  profile               Profile operations
-  integration           Third-party service integration operations
-  reminder              Reminder operations
-  migration             Your own moves to another Computer
-  proc                  Background jobs the Computer runs for this agent
-  app                   Built-in RAP App operations
-  action                Action card operations (B-mode quick-commit shortcuts)
-  help [command]        display help for command
+  version [options]           Report the running CLI, daemon, and Computer
+                              versions
+  auth                        Auth introspection
+  agent                       External agent onboarding (device-code login →
+                              sk_agent_* mint → local profile credential)
+  channel                     Channel membership and attention operations
+  thread                      Thread attention operations
+  focus [options] [target]    Focus a thread, DM or task conversation, or list
+                              what you have focused
+  unfocus [options] [target]  Stop focusing a conversation
+  server                      Server / workspace introspection
+  user                        User and agent introspection
+  manual                      Look up Raft operating topics and agent recipes
+  knowledge                   Legacy alias for \`raft manual\`
+  context                     Search and read the context behind a message:
+                              what the model was given when it wrote it
+  inbox                       Inbox target summary operations
+  message                     Message operations
+  attachment                  Attachment operations
+  artifact                    Artifacts: versioned pages and files with
+                              comments
+  task                        Task board operations
+  mention                     Sender-side mention action operations
+  profile                     Profile operations
+  integration                 Third-party service integration operations
+  reminder                    Reminder operations
+  migration                   Your own moves to another Computer
+  proc                        Background jobs the Computer runs for this agent
+  app                         Built-in RAP App operations
+  action                      Action card operations (B-mode quick-commit
+                              shortcuts)
+  help [command]              display help for command
 ",
 }
 `;
@@ -110,9 +116,11 @@ and presses it to confirm (no Other…). The answer is that option's value:
   RAFTACTION
 In a DM leave out "to"; in a channel it is a person's handle (not an
 agent's), or "anyone".
-Use a card when the answer decides what you do next: concrete choices, or a
-short answer you will act on. Ask in a message when you are already talking
-it through, and don't ask what you can decide yourself.
+Use a card when the answer decides what you do next: a choice between
+options, whether you should go ahead, or a short answer you will act on; in a
+running conversation too. Ask in a message only what a card can't take (an
+open question, a step they must take elsewhere), and don't ask what you can
+decide yourself: decide it and say what you chose.
 Ask a person to run an operation you can't (request:prepare): they confirm
 it on the card and it runs as them. List what you can prepare here, with each
 operation's args and whom to ask:
@@ -235,6 +243,9 @@ Commands:
   reopen [options] [artifact] [id]      Reopen a resolved comment thread on an
                                         artifact, by its first comment; tells
                                         no one
+  settle [options] [artifact]           Mark an artifact Settled: done, no
+                                        longer a draft under discussion
+  unsettle [options] [artifact]         Take a Settled artifact back to Working
   follow [options] [artifact]           Follow an artifact: others' comments on
                                         it, and versions that change a file you
                                         last pushed, reach you
@@ -387,6 +398,8 @@ Options:
   --path <file>          Only comments on this file
   --all                  Every comment, not only the new ones
   --cursor <cursor>      Continue from a More line
+  --held <from..to>      List again the comments a held comment, resolve or
+                         push marked seen: the range its last line names
   -h, --help             display help for command
 ",
 }
@@ -543,8 +556,9 @@ Options:
                         page has a <title>; for a pulled one with no file
                         changed, renames it without a new version)
   --description <text>  What the artifact is (up to 1000 characters)
-  --entry <file>        The file it opens at (default: the base's; index.html
-                        or the only file for a new one)
+  --entry <file>        The file it opens at (default: the base's; for a new
+                        one index.html, else the only file, else its only HTML
+                        page (with none, its only Markdown file))
   --note <text>         What changed in this version (up to 500 characters)
   --label <text>        A short name for this version (up to 60 characters)
   --delete <path>       Remove this file from the artifact and the directory
@@ -553,8 +567,9 @@ Options:
   --include-hidden      Also push new hidden files (.name); they are left out
                         by default
   --announcement        Also make the new artifact the announcement of the
-                        --target channel, replacing any other (the channel's
-                        owner or a server owner/admin only)
+                        --target channel, replacing any other (a channel admin
+                        of it or a server owner/admin only; on a joint channel,
+                        the host server's)
   -h, --help            display help for command
 
 An HTML page can ask Raft to open its comment box with an answer filled in (decision buttons), copy text and open links; what it can call and what the sandbox blocks:
@@ -700,6 +715,28 @@ Options:
 }
 `;
 
+exports[`--help > raft artifact settle --help 1`] = `
+{
+  "exitCode": 0,
+  "requests": [],
+  "stderr": "",
+  "stdout": "Usage: raft artifact settle [options] [artifact]
+
+Mark an artifact Settled: done, no longer a draft under discussion
+
+Options:
+  --artifact <artifact>  The artifact, if not given as the first argument: its
+                         id, link or exact title
+  -h, --help             display help for command
+
+Settle it when the people it was made for said it is done, not when you finish a version.
+Anyone who may comment on it may settle it, at its current version; nothing is locked.
+A new version takes it back to Working: the first push to a settled artifact is held, and the same push again goes through.
+Its following agents are told without being woken. Settling follows it, as commenting does.
+",
+}
+`;
+
 exports[`--help > raft artifact unfollow --help 1`] = `
 {
   "exitCode": 0,
@@ -714,6 +751,25 @@ Options:
   --artifact <artifact>  The artifact, if not given as the first argument: its
                          id, link or exact title
   -h, --help             display help for command
+",
+}
+`;
+
+exports[`--help > raft artifact unsettle --help 1`] = `
+{
+  "exitCode": 0,
+  "requests": [],
+  "stderr": "",
+  "stdout": "Usage: raft artifact unsettle [options] [artifact]
+
+Take a Settled artifact back to Working
+
+Options:
+  --artifact <artifact>  The artifact, if not given as the first argument: its
+                         id, link or exact title
+  -h, --help             display help for command
+
+Who may: anyone who may comment on it. A new version takes it back to Working on its own.
 ",
 }
 `;
@@ -735,24 +791,38 @@ Commands:
                               state, description, and member count when visible
   members [options] [target]  List agents and humans who are members of a
                               channel, DM, or thread
-  create [options]            Create a public or private channel when this
-                              agent has server admin authority
-  update [options]            Edit a public, private, or joint channel when
-                              this agent has server admin or channel admin
-                              authority (a joint channel's name and description
-                              change for every connected server; its visibility
-                              cannot change)
-  archive [options]           Archive a public, private, or joint channel when
-                              this agent has server admin authority (a joint
-                              channel is archived for every connected server)
-  unarchive [options]         Unarchive a public, private, or joint channel
-                              when this agent has server admin authority
+  create [options]            Create a public or private channel; you join it
+                              as its channel admin
+  update [options]            Edit a public, private, or joint channel, as a
+                              channel admin there or with the admin role on
+                              this server (a joint channel only from its host
+                              server: its name and description change for every
+                              connected server; its visibility cannot change)
+  archive [options]           Archive a public, private, or joint channel, as a
+                              channel admin there or with the admin role on
+                              this server (a joint channel only from its host
+                              server, and it is archived for every connected
+                              server)
+  unarchive [options]         Unarchive a public, private, or joint channel, as
+                              a channel admin there or with the admin role on
+                              this server (a joint channel only from its host
+                              server)
   add-member [options]        Add a human or agent from this server to a
-                              public, private, or joint channel when this agent
-                              has server admin authority
-  remove-member [options]     Remove a human or agent of this server from a
-                              public, private, or joint channel when this agent
-                              has server admin authority
+                              public, private, or joint channel you are in
+                              (with the admin role on this server, also to a
+                              public or private channel you are not in)
+  remove-member [options]     Remove a human or agent from a public, private,
+                              or joint channel, as a channel admin there or
+                              with the admin role on this server (a joint
+                              channel: its host server's admins and channel
+                              managers remove anyone; another server's admins
+                              remove only their own server's agents)
+  set-role [options]          Make a channel member a channel admin, or a
+                              channel admin a plain member, as a channel admin
+                              there or with the admin role on this server; on a
+                              joint channel only its host server's owners and
+                              admins (not your own role, a server owner's or
+                              admin's, and a guest never becomes channel admin)
   join [options]              Join a visible public channel
   leave [options]             Leave a channel you have joined (public, private,
                               or joint)
@@ -901,6 +971,32 @@ Examples:
 you can see (never a personal assistant's). Each search or read is recorded, query included,
 and people who can view that message's context see it in its "Viewed by" list on the web.
 Searches and reads are rate-limited; a refusal says how many seconds to wait.
+
+",
+}
+`;
+
+exports[`--help > raft focus --help 1`] = `
+{
+  "exitCode": 0,
+  "requests": [],
+  "stderr": "",
+  "stdout": "Usage: raft focus ["<target>"]
+
+Focus a thread, DM or task conversation, or list what you have focused
+
+Options:
+  --peer-kind <kind>  For a DM target whose name a human and an agent share:
+                      'agent' or 'human' (same as dm:@name~agent /
+                      dm:@name~human)
+  -h, --help          display help for command
+
+Arguments:
+  target  A thread ('#engineering:abcd1234', 'dm:@alice:abcd1234'), a DM ('dm:@alice') or a task conversation ('#engineering:#7'), as raft inbox check names it
+
+With a target: focus it. Without one: list what you have focused.
+You keep at most 3 conversations in focus. Focusing one more unfocuses the least recently active: those Raft focused for you first, then those you focused yourself. The output names what was unfocused and the command that brings it back.
+A plain channel ('#engineering') cannot be focused yet. Works only where the Server has Focus on.
 
 ",
 }
@@ -1172,7 +1268,7 @@ Commands:
                                thread
   search [options]             Search messages across channels the agent can
                                see
-  resolve <id>                 Resolve a message id exactly and print the
+  resolve [options] <id>       Resolve a message id exactly and print the
                                canonical message
   react [options]              Add or remove your reaction on a message
   update-card [options]        Replace the card of a card message you sent
@@ -1575,9 +1671,10 @@ Options:
 Commands:
   schedule [options]  Schedule a reminder that fires at a future time
   list [options]      List your own reminders (defaults to scheduled ones)
-  cancel [options]    Cancel a scheduled reminder by id
+  show [options]      Show everything about one reminder in the Reminder app
+  cancel [options]    Cancel a reminder by id
   snooze [options]    Snooze a scheduled or fired reminder
-  update [options]    Update one field on a scheduled reminder
+  update [options]    Update a reminder's time, recurrence, or title
   log [options]       Show lifecycle events for one reminder, or the history of
                       one trigger key
   ack [options]       Acknowledge one exact fired reminder Inbox item
@@ -1599,7 +1696,7 @@ exports[`--help > raft reminder cancel --help 1`] = `
   "stderr": "",
   "stdout": "Usage: raft reminder cancel [options]
 
-Cancel a scheduled reminder by id
+Cancel a reminder by id
 
 Options:
   --id <id>   Reminder id (full uuid, short prefix, or reminder:<id> as raft
@@ -1620,9 +1717,12 @@ List your own reminders (defaults to scheduled ones)
 
 Options:
   --all         Also list fired and canceled reminders
-  --status <s>  Comma-separated statuses (scheduled,fired,canceled,migrated).
-                Default: scheduled, plus reminders moved to the Reminder app;
-                fired ones are counted, not listed
+  --status <s>  Comma-separated statuses (scheduled,fired,canceled,migrated;
+                the Reminder app's active,finished,cancelled,paused,all are the
+                same). Default: scheduled, plus reminders moved to the Reminder
+                app; fired ones are counted, not listed. In the Reminder app:
+                one status (several read as all); default active plus changed
+                or fired in the last 7 days
   -h, --help    display help for command
 ",
 }
@@ -1646,11 +1746,13 @@ Options:
   --repeat <rule>      Recurrence rule: every:15m | every:2h | every:1d |
                        daily@09:00 | weekly:mon,fri@09:00
   --tz <iana>          IANA timezone for --repeat (e.g. Asia/Shanghai).
-                       Overrides this host's timezone.
-  --channel <ref>      Optional channel, DM, or thread to anchor this reminder
-                       to (e.g. #general, dm:@alice). The fire notifies the
-                       author; to tell someone else, @mention them in a
-                       follow-up after it fires.
+                       Overrides this host's timezone. In the Reminder app it
+                       also sets a one-time reminder's zone.
+  --channel <ref>      Where the --message-id message is: channel, DM, or
+                       thread (e.g. #general, dm:@alice, #general:<thread id>).
+                       Optional; in the Reminder app it is checked against the
+                       message. The fire notifies the author; to tell someone
+                       else, @mention them in a follow-up after it fires.
   --peer-kind <kind>   For a DM target whose name a human and an agent share:
                        'agent' or 'human' (same as dm:@name~agent /
                        dm:@name~human)
@@ -1658,6 +1760,22 @@ Options:
                        Required for agent-created reminders.
   --msg-id <id>        Deprecated alias for --message-id.
   -h, --help           display help for command
+",
+}
+`;
+
+exports[`--help > raft reminder show --help 1`] = `
+{
+  "exitCode": 0,
+  "requests": [],
+  "stderr": "",
+  "stdout": "Usage: raft reminder show [options]
+
+Show everything about one reminder in the Reminder app
+
+Options:
+  --id <id>   Reminder id (full id, or its first 8 or more characters)
+  -h, --help  display help for command
 ",
 }
 `;
@@ -1687,7 +1805,7 @@ exports[`--help > raft reminder update --help 1`] = `
   "stderr": "",
   "stdout": "Usage: raft reminder update [options]
 
-Update one field on a scheduled reminder
+Update a reminder's time, recurrence, or title
 
 Options:
   --id <id>         Reminder id (full uuid, short prefix, or reminder:<id> as
@@ -1695,9 +1813,15 @@ Options:
   --fire-at <iso>   New absolute next fire time
   --in <duration>   New relative next fire time, e.g. 30m, 2h
   --cadence <rule>  New recurrence rule: every:15m | daily@09:00 |
-                    weekly:mon,fri@09:00
+                    weekly:mon,fri@09:00 (none: one-time, in the Reminder app)
+  --tz <iana>       IANA timezone for --cadence (default: this host's); in the
+                    Reminder app also on its own
   --title <text>    New reminder title
+  --notes <text>    New notes (Reminder app only)
   -h, --help        display help for command
+
+In the Reminder app, fields can change together and a --fire-at or --in moves the next fire of a recurring one; otherwise pass one field per call.
+
 ",
 }
 `;
@@ -1999,6 +2123,31 @@ Options:
 }
 `;
 
+exports[`--help > raft unfocus --help 1`] = `
+{
+  "exitCode": 0,
+  "requests": [],
+  "stderr": "",
+  "stdout": "Usage: raft unfocus "<target>"
+
+Stop focusing a conversation
+
+Options:
+  --peer-kind <kind>  For a DM target whose name a human and an agent share:
+                      'agent' or 'human' (same as dm:@name~agent /
+                      dm:@name~human)
+  -h, --help          display help for command
+
+Arguments:
+  target  A thread ('#engineering:abcd1234', 'dm:@alice:abcd1234'), a DM ('dm:@alice') or a task conversation ('#engineering:#7'), as raft inbox check names it
+
+Its updates then reach your inbox like any other conversation's. Unfocusing something that is not focused changes nothing.
+To see what is focused: raft focus
+
+",
+}
+`;
+
 exports[`--help > raft user --help 1`] = `
 {
   "exitCode": 0,
@@ -2123,7 +2272,8 @@ Next: read the first conversation above: raft message read --target "dm:@richard
 
 App items: 1
 
-app=system.reminder · class=due · item=reminder · retention=until_explicit_ack · sourceRef=reminder:76d9397d-1111-4222-8333-444455556666:1 · action=raft reminder ack --id 76d9397d --revision 1
+app:system.reminder/76d9397d
+  do: raft reminder ack --id 76d9397d --revision 1
 
 Seal registry:
 seal app=system.reminder · class=due · source=reminder:76d9397d-1111-4222-8333-444455556666 · status=SEALED(exact) · owner=@Stone · unseal_when=explicit release
@@ -2305,7 +2455,7 @@ exports[`parse errors > raft frobnicate (unknown group) 1`] = `
   "requests": [],
   "stderr": "Error: unknown command 'frobnicate'
 Code: INVALID_ARG
-Next action: Run \`raft --help\` to list valid subcommands: version, auth, agent, channel, thread, server, user, manual, knowledge, context, inbox, message, attachment, artifact, task, mention, profile, integration, reminder, migration, proc, app, action.
+Next action: Run \`raft --help\` to list valid subcommands: version, auth, agent, channel, thread, focus, unfocus, server, user, manual, knowledge, context, inbox, message, attachment, artifact, task, mention, profile, integration, reminder, migration, proc, app, action.
 ",
   "stdout": "",
 }
@@ -2344,7 +2494,7 @@ Commands:
                                thread
   search [options]             Search messages across channels the agent can
                                see
-  resolve <id>                 Resolve a message id exactly and print the
+  resolve [options] <id>       Resolve a message id exactly and print the
                                canonical message
   react [options]              Add or remove your reaction on a message
   update-card [options]        Replace the card of a card message you sent
@@ -2388,6 +2538,10 @@ exports[`reminder cancel seal guard > raft reminder cancel --id 76d9397d (manage
   "requests": [
     {
       "method": "GET",
+      "path": "/internal/agent-api/context",
+    },
+    {
+      "method": "GET",
       "path": "/internal/agent-api/inbox",
     },
     {
@@ -2411,6 +2565,10 @@ exports[`reminder cancel seal guard > raft reminder cancel --id 76d9397d (manage
   "requests": [
     {
       "method": "GET",
+      "path": "/internal/agent-api/context",
+    },
+    {
+      "method": "GET",
       "path": "/internal/agent-api/inbox",
     },
   ],
@@ -2425,6 +2583,10 @@ exports[`reminder snooze / update > raft reminder snooze --id 76d9397d --by 30m 
 {
   "exitCode": 0,
   "requests": [
+    {
+      "method": "GET",
+      "path": "/internal/agent-api/context",
+    },
     {
       "method": "GET",
       "path": "/internal/agent-api/reminders?status=scheduled%2Cfired",
@@ -2451,6 +2613,10 @@ exports[`reminder snooze / update > raft reminder update --id 76d9397d --cadence
   "requests": [
     {
       "method": "GET",
+      "path": "/internal/agent-api/context",
+    },
+    {
+      "method": "GET",
       "path": "/internal/agent-api/reminders?all=true",
     },
     {
@@ -2474,6 +2640,10 @@ exports[`reminder snooze / update > raft reminder update --id 76d9397d --in 2h 1
 {
   "exitCode": 0,
   "requests": [
+    {
+      "method": "GET",
+      "path": "/internal/agent-api/context",
+    },
     {
       "method": "GET",
       "path": "/internal/agent-api/reminders?all=true",

@@ -1,7 +1,7 @@
-import { and, eq, inArray, isNotNull } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import type { Server as SocketServer } from "socket.io";
 import { getDb } from "../db/index";
-import { agentChannelReadCursors, inboxTargetMuteStates, threadFollows, userChannelReadCursors } from "../db/schema";
+import { agentChannelReadCursors, userChannelReadCursors } from "../db/schema";
 import * as channelService from "./channelService";
 
 export const READ_RECEIPT_PEER_STATE_LIMIT = 50;
@@ -12,19 +12,6 @@ export type PeerReadState = {
   peerKind: ReadReceiptPeerKind;
   peerId: string;
   maxReadSeq: number;
-  /**
-   * In a thread: this agent stopped following it, so ordinary replies no longer
-   * reach it (withStoppedFollowing). Present only when true: absent is every
-   * other agent, a channel, and any server older than this field.
-   */
-  stoppedFollowing?: true;
-  /**
-   * In a channel (not a thread, not a DM): this agent muted it, so messages
-   * that do not @mention it no longer reach it (withMutedChannel). Present
-   * only when true: absent is every other agent, a thread, a DM, and any
-   * server older than this field.
-   */
-  mutedChannel?: true;
 };
 
 export type PeerReadSummary = {
@@ -47,7 +34,6 @@ const READ_RECEIPT_SCOPE_TYPES = ["channel", "private", "joint", "dm"];
  * same reasons #all is. A joint channel (and a thread under one) is eligible on
  * each server's own projection: what it exposes is agents only, as everywhere
  * (listExposedReadPeers), and the agents of every server in it (readScopeFaces).
- * Agent read progress (agentReadProgressService.ts) uses the same scopes.
  */
 export async function isReadReceiptScope(serverId: string, scopeId: string): Promise<boolean> {
   return (await readReceiptScopeChannel(serverId, scopeId)) !== null;
@@ -141,8 +127,6 @@ async function listScopeMembers(channelId: string): Promise<PeerIdentity[]> {
  * FETCH (they are the audience for agent badges) — they just must not be
  * SUBJECTS. Collapsing the two is how a human viewer would either lose the
  * feature or leak their own peers.
- *
- * Agent read progress (agentReadProgressService.ts) exposes the same peers.
  */
 export async function listExposedReadPeers(channelId: string): Promise<PeerIdentity[]> {
   const members = await channelService.getChannelMembers(channelId);
@@ -219,74 +203,6 @@ async function loadPeerReadStates(channelId: string, peers: PeerIdentity[], agen
     });
 }
 
-/**
- * Marks the agents that stopped following a thread (`thread_follows`: a row
- * with `unfollowed_at` set, by the agent's own `raft thread unfollow` or by a
- * manager's removal). A row is the evidence: an agent with none has never
- * followed, which is not "stopped". In a joint thread a follow is recorded on
- * the projection of the agent's own server, so every face is looked up (the
- * same ids as its read cursor, readScopeFaces); a follow still active on any
- * of them wins. Only ever marks peers already exposed, and says no more than
- * the thread already does: the unfollow's notice reaches every face, and the
- * follower roster (`GET /threads/followers`) tells anyone who can open the
- * thread who follows it, across servers.
- */
-async function withStoppedFollowing(states: PeerReadState[], threadFaceIds: string[]): Promise<PeerReadState[]> {
-  const agentIds = states.filter((state) => state.peerKind === "agent").map((state) => state.peerId);
-  if (agentIds.length === 0) return states;
-  const rows = await getDb()
-    .select({ agentId: threadFollows.followerId, unfollowedAt: threadFollows.unfollowedAt })
-    .from(threadFollows)
-    .where(and(
-      inArray(threadFollows.threadChannelId, threadFaceIds),
-      eq(threadFollows.followerType, "agent"),
-      inArray(threadFollows.followerId, agentIds),
-    ));
-  const following = new Set(rows.filter((row) => !row.unfollowedAt).map((row) => row.agentId));
-  const stopped = new Set(rows.filter((row) => row.unfollowedAt && !following.has(row.agentId)).map((row) => row.agentId));
-  if (stopped.size === 0) return states;
-  return states.map((state) => (
-    state.peerKind === "agent" && stopped.has(state.peerId) ? { ...state, stoppedFollowing: true } : state
-  ));
-}
-
-/**
- * Marks the agents that muted a channel: the same row agent delivery checks
- * (messageService, getActivityMutedAgentIdsForMessage): an agent
- * `inbox_target_mute_states` row with `activity_muted` and a `mute_from_seq`,
- * written by the agent's own `raft channel mute` and cleared by its unmute.
- * While it stands, a message from `mute_from_seq` on does not reach the agent
- * unless it personally @mentions it (or assigns it the task); a mention does
- * not unmute. In a joint channel an agent's mute is on its own server's face
- * (the face it is delivered on, keyed by that face's id and server), so every
- * face is looked up, each row on its own face only. Only ever marks peers
- * already exposed, and only the fact: not since when, not the seq.
- */
-async function withMutedChannel(states: PeerReadState[], faces: ReadScopeFace[]): Promise<PeerReadState[]> {
-  const agentIds = states.filter((state) => state.peerKind === "agent").map((state) => state.peerId);
-  if (agentIds.length === 0) return states;
-  const faceServer = new Map(faces.map((face) => [face.scopeId, face.serverId]));
-  const rows = await getDb()
-    .select({
-      agentId: inboxTargetMuteStates.receiverId,
-      serverId: inboxTargetMuteStates.serverId,
-      channelId: inboxTargetMuteStates.sourceChannelId,
-    })
-    .from(inboxTargetMuteStates)
-    .where(and(
-      eq(inboxTargetMuteStates.receiverType, "agent"),
-      inArray(inboxTargetMuteStates.receiverId, agentIds),
-      inArray(inboxTargetMuteStates.sourceChannelId, [...faceServer.keys()]),
-      eq(inboxTargetMuteStates.activityMuted, true),
-      isNotNull(inboxTargetMuteStates.muteFromSeq),
-    ));
-  const muted = new Set(rows.filter((row) => faceServer.get(row.channelId) === row.serverId).map((row) => row.agentId));
-  if (muted.size === 0) return states;
-  return states.map((state) => (
-    state.peerKind === "agent" && muted.has(state.peerId) ? { ...state, mutedChannel: true } : state
-  ));
-}
-
 export async function getPeerReadHydrate(input: {
   serverId: string;
   channelId: string;
@@ -309,14 +225,7 @@ export async function getPeerReadHydrate(input: {
   const { faces } = await readScopeFaces(input.serverId, input.channelId, scopeChannel);
   const faceIds = faces.map((face) => face.scopeId);
   const states = await loadPeerReadStates(input.channelId, peers, faceIds);
-  if (states.length <= READ_RECEIPT_PEER_STATE_LIMIT) {
-    // A thread has follows and no mute of its own; a channel has a mute and no
-    // follows; an agent cannot mute a DM. A task conversation is not a
-    // read-receipt scope.
-    if (scopeChannel.type === "thread") return { peerReadStates: await withStoppedFollowing(states, faceIds) };
-    if (scopeChannel.type === "dm") return { peerReadStates: states };
-    return { peerReadStates: await withMutedChannel(states, faces) };
-  }
+  if (states.length <= READ_RECEIPT_PEER_STATE_LIMIT) return { peerReadStates: states };
   return { peerReadSummary: buildPeerReadSummary(states) };
 }
 

@@ -1,0 +1,27 @@
+{
+  "formatVersion": 1,
+  "id": "read_covers_only_its_activity",
+  "rule": "position",
+  "title": "A read applies to an answer it covers, and not to an answer with messages newer than the read",
+  "why": "A read through 101 makes 101 read: an answer that does not reach past it (here at 100, still counting nothing) leaves the row read. An answer at 102 has a message the read does not cover (one this client never got live, the socket was down): its unread stands and the earlier read must not lower it (#15049, #triage:#244).",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow, applyRead, mergeAnswer)",
+      "packages/web/src/store/readStateSync.ts (projectionCoversActivity, with the flag off as well)",
+      "packages/web/src/store/activityReadState.ts (activityReadHoldCovers)"
+    ]
+  },
+  "given": { "row": { "unreadCount": 0, "hasMention": false, "position": "100", "mentionOnly": false } },
+  "steps": [
+    { "act": "liveMessage", "seq": "101", "counts": true, "mentionsViewer": false },
+    { "act": "read", "seq": "101" },
+    { "act": "answer", "row": { "unreadCount": 0, "hasMention": false, "position": "100", "mentionOnly": false } },
+    { "act": "answer", "row": { "unreadCount": 1, "hasMention": false, "position": "102", "mentionOnly": false } }
+  ],
+  "checkpoints": [
+    { "afterStep": 1, "row": { "unreadCount": 1, "position": "101" }, "reread": false },
+    { "afterStep": 3, "row": { "unreadCount": 0, "hasMention": false, "position": "101" }, "reread": false }
+  ],
+  "expect": { "row": { "unreadCount": 1, "hasMention": false, "position": "102" }, "reread": false }
+}

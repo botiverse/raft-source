@@ -1,4 +1,4 @@
-import { INBOX_REFRESH_COALESCED_HEADER, INBOX_REFRESH_TRIGGER_HEADER, INBOX_REFRESH_TRIGGERS } from "@botiverse/raft-shared";
+import { INBOX_REFRESH_COALESCED_HEADER, INBOX_REFRESH_REFUSALS, INBOX_REFRESH_REFUSED_HEADER, INBOX_REFRESH_TRIGGER_HEADER, INBOX_REFRESH_TRIGGERS } from "@botiverse/raft-shared";
 import type { TraceAttributes } from "@botiverse/raft-shared";
 
 /**
@@ -112,6 +112,7 @@ export function activityListFetchTraceAttrs(
  */
 export const INBOX_FETCH_TRIGGER_HEADER = INBOX_REFRESH_TRIGGER_HEADER.toLowerCase();
 export const INBOX_FETCH_COALESCED_HEADER = INBOX_REFRESH_COALESCED_HEADER.toLowerCase();
+export const INBOX_FETCH_REFUSED_HEADER = INBOX_REFRESH_REFUSED_HEADER.toLowerCase();
 
 // A window is 2.5 s; anything above this is recorded as the cap, so a
 // malformed header can't put an arbitrary number on the span.
@@ -124,12 +125,22 @@ function coalescedCount(raw: string | string[] | undefined): number {
   return Math.min(Number(value), INBOX_FETCH_COALESCED_CAP);
 }
 
+/**
+ * #244: `fetch_refused` is `X-Raft-Fetch-Refused`, why the live message or
+ * reply behind a `message_new` / `thread_reply` re-read could not patch its
+ * row in place (values in shared `INBOX_REFRESH_REFUSALS`); an unlisted value
+ * is `other`. Absent with the header (older webs, every other read), so it is
+ * never `unknown`.
+ */
 export function inboxFetchTriggerTraceAttrs(
   triggerHeader: string | string[] | undefined,
   coalescedHeader: string | string[] | undefined,
+  refusedHeader?: string | string[] | undefined,
 ): TraceAttributes {
+  const refused = enumReasonAttr(refusedHeader, INBOX_REFRESH_REFUSALS);
   return {
     fetch_trigger: enumReasonAttr(triggerHeader, INBOX_REFRESH_TRIGGERS),
     fetch_coalesced: coalescedCount(coalescedHeader),
+    ...(refused === "unknown" ? {} : { fetch_refused: refused }),
   };
 }

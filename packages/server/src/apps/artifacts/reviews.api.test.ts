@@ -229,6 +229,34 @@ test("at most 50 drafts per person and Artifact (the 51st 409 DRAFT_LIMIT); a dr
   assert.equal(await purgeExpiredArtifactDrafts({ now: new Date(now + 5 * DAY) }), 1, "the 26-day-old one five days later");
 });
 
+test("a draft at an element keeps its section (Porthole P152), cleaned as a comment's, through an edit and into the posted review", async ({ app, seed }) => {
+  const world = await seedWorld(seed, app);
+  const annotation = (context?: unknown) => ({ type: "annotation", data: {
+    kind: "element", label: "h2 Plans", selectors: [{ type: "CssSelector", value: "#plans" }], ...(context === undefined ? {} : { context }),
+  } });
+  const kept = annotation({ headings: ["Pricing", "Plans"], region: "Design" });
+  const made = await draft(app, world, world.who.reader, input([text("too many tiers")], { target: { scope: "file", path: "a.html", anchor: annotation({ headings: [" Pricing", "Plans "], region: " Design" }) } }));
+  assert.equal(made.status, 201, JSON.stringify(made.body));
+  assert.deepEqual(made.body.draft.target, { scope: "file", path: "a.html", anchor: kept });
+  const listed = await web(app, "GET", artifactWebPaths.reviewDrafts(world.site), world.who.reader);
+  assert.deepEqual(listed.body.drafts[0].target.anchor, kept);
+  const edited = await web(app, "PATCH", artifactWebPaths.reviewDraft(world.site, made.body.draft.id), world.who.reader, { body: [text("two tiers?")] });
+  assert.equal(edited.status, 200, JSON.stringify(edited.body));
+  assert.deepEqual(edited.body.draft.target.anchor, kept);
+  // An oversized one is left out and the place kept, as a comment's is (Tenny on #15709).
+  const dropped = await draft(app, world, world.who.reader, input([text("x")], { target: { scope: "file", path: "a.html", anchor: annotation({ headings: ["h".repeat(81)] }) } }));
+  assert.equal(dropped.status, 201, JSON.stringify(dropped.body));
+  assert.deepEqual(dropped.body.draft.target.anchor, annotation());
+  const res = await submit(app, world, world.who.reader);
+  assert.equal(res.status, 201, JSON.stringify(res.body));
+  assert.deepEqual(res.body.comments.map((comment: { target: unknown }) => comment.target), [
+    { scope: "file", path: "a.html", anchor: kept },
+    { scope: "file", path: "a.html", anchor: annotation() },
+  ]);
+  const rows = (await commentsOf(world.site)).sort((a, b) => a.position - b.position);
+  assert.deepEqual(rows.map((row) => row.anchor), [kept, annotation()]);
+});
+
 // ---- submitting from the web ---------------------------------------------------------
 
 test("submit: every draft becomes a comment in order, the summary last on the whole Artifact, the drafts go; one event and one notice per recipient; the same clientKey answers it again", async ({ app, seed }) => {

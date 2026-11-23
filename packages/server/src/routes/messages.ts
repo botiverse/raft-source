@@ -1,7 +1,9 @@
 import { JointChannelAccessChangedError } from "../lib/channelActorPermissions";
-import { refuse } from "../lib/refusal";
+import { refuse, type RefusalInput } from "../lib/refusal";
+import { EMOJI_INVALID_REFUSAL } from "./agentRouteRefusals";
 import { DmPeerNotMemberError } from "../services/dmSendPolicy";
-import { CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY, channelTypeSupportsThreadSort, decodeChannelActivityCursor, isMessageCardMetadata, isSubConversationType } from "@botiverse/raft-shared";
+import { hasSameConversationQuoteRef, isMessageCardMetadata, isSubConversationType } from "@botiverse/raft-shared";
+import { attachResolvedInlineQuotesForViewer, resolveInlineQuotesMapForViewer } from "../services/quoteReplyService";
 import { listMessageCardRevisions } from "../services/messageCardService";
 import { getTaskForConversationChannel } from "../services/taskConversationService";
 import rateLimit from "express-rate-limit";
@@ -20,7 +22,7 @@ import * as userService from "../services/userService";
 import * as serverService from "../services/serverService";
 import * as searchService from "../services/searchService";
 import * as onboardingService from "../services/onboardingService";
-import { getServerPlan, getHistoryCutoff, getServerHistoryWindow, channelBillingReadOnlyBody, getChannelBillingReadOnly, isChannelReadOnlyByQuota } from "../services/planService";
+import { getServerPlan, getHistoryCutoff, getServerHistoryWindow, channelBillingReadOnlyBody, channelBillingReadOnlyRefusal, getChannelBillingReadOnly, isChannelReadOnlyByQuota, type ChannelBillingReadOnly } from "../services/planService";
 import { notePaywallHit } from "./paywallHit";
 import { getRequestHistoryWindow, getServerHistoryWindowForRead, humanHistoryLimitedError, isBehindHistoryWindow } from "../services/historyWindow";
 import { personLocalConversationId, resolveMessageResourceAccess } from "../services/messageResourceAccess";
@@ -43,7 +45,6 @@ import { listMentionDeliveryOccurrencesForMessage, evaluateMentionDeliveryOccurr
 import { projectMentionDeliveryForSender } from "../services/senderMentionDeliveryProjection";
 import { AttachmentLinkError } from "../services/attachmentLinkingService";
 import { isAttachmentPreviewUnifiedEnabledForServer } from "../config/attachmentPreviewUnified";
-import { evaluateFeatureFlag } from "../services/featureFlagService";
 import { bindRequestAbortSignal } from "./requestAbortSignal";
 import { sendJsonServerError } from "./errorResponse";
 import {
@@ -101,12 +102,57 @@ export const messageV2Router: RouterType = Router();
 // /context/:messageId also takes the 8-hex short id and validates inline.
 guardUuidPathParams(messageRouter, { channelId: "Channel" });
 
+/**
+ * A message this person can't read on the card revisions read and the link
+ * previews (the v1 GET and the batched link-card read): a malformed id, no
+ * such message, a deleted one (card revisions), one with nothing to preview
+ * (not plain chat, and on the batched read not a card message either), one
+ * in a conversation they can't read, or one behind the history window, one
+ * body for every reason. The people's channel routes
+ * (Follow, Save) and task convert answer the same. Not the context route,
+ * whose not-found a test pins without a code.
+ */
+const HUMAN_MESSAGE_NOT_FOUND_REFUSAL: RefusalInput = { code: "message_not_found", error: "Message not found" };
+/**
+ * A channel this person can't search in (missing, another server's or one
+ * they can't read, one body for every reason), or, on the context route,
+ * the conversation a found message is read through when it is missing or
+ * another server's (as the people's channel routes' `channel_not_found`).
+ */
+const HUMAN_CHANNEL_NOT_FOUND_REFUSAL: RefusalInput = { code: "channel_not_found", error: "Channel not found" };
+const MESSAGE_PAGE_CURSOR_INVALID_REFUSAL: RefusalInput = { code: "invalid_message_page_cursor", error: "Invalid message page cursor" };
+/** A forward whose destinations, source ids, note, request id or randomId aren't usable (the forward service's and the trace's `invalid_request`). */
+const FORWARD_REQUEST_INVALID_REFUSAL: RefusalInput = { code: "invalid_request", error: "Destination channel and full source message ids are required" };
+
 export const MAX_MESSAGE_LENGTH = 32_000;
 const HUMAN_OUTLINE_DEFAULT_LIMIT = 200;
 const HUMAN_OUTLINE_MAX_LIMIT = 500;
 const MAX_RANDOM_ID_LENGTH = 128;
 const INVALID_RANDOM_ID = Symbol("invalidRandomId");
 const MAX_REACTION_LENGTH = 16;
+
+/** The send's archived conversation, and the reaction routes' (the forward's and the people's channel routes' `channel_archived`). */
+const HUMAN_CHANNEL_ARCHIVED_REFUSAL: RefusalInput = { code: "channel_archived", error: "This channel is archived" };
+/** A reaction on a system message (the agent API's `system_message_not_reactable`). */
+const REACTION_SYSTEM_MESSAGE_REFUSAL: RefusalInput = { code: "system_message_not_reactable", error: "System messages cannot receive reactions" };
+/** A reaction by someone who can read the conversation but not post in it (`channel_membership_required`, as the people's send and the agent reactions). */
+const REACTION_MEMBERSHIP_REQUIRED_HUMAN_REFUSAL: RefusalInput = { code: "channel_membership_required", error: "You must join this channel to react to messages" };
+/** A reaction in a channel over its plan's quota (`channel_read_only`, as the people's thread send). */
+const REACTION_QUOTA_READ_ONLY_REFUSAL: RefusalInput = { code: "channel_read_only", error: "This channel is read-only on your current plan. Upgrade to continue." };
+/**
+ * A write refused by the plan (getChannelBillingReadOnly), as the people's
+ * thread send answers it: the joint channel over its free-server limit
+ * through refuse() (`channel_read_only`); the external freeze keeps its own
+ * body, whose top-level `externalFreezeAt` refuse() can't write.
+ */
+function answerChannelBillingReadOnly(res: Response, billing: ChannelBillingReadOnly): void {
+  if (billing.reason === "external_limit_frozen") {
+    // refusal-ok: top-level externalFreezeAt beside error and code (planService channelBillingReadOnlyBody), as the people's thread send keeps it; refuse() writes no top-level fields
+    res.status(403).json(channelBillingReadOnlyBody(billing));
+    return;
+  }
+  refuse(res, 403, channelBillingReadOnlyRefusal(billing));
+}
 // The authenticated human author can inspect only coarse outcomes of their own
 // mentions while they still have access to the original conversation. Runtime
 // identities and terminal provenance remain on the existing diagnostic surface.
@@ -116,6 +162,7 @@ messageRouter.get("/:messageId/mention-deliveries", async (req, res) => {
     const message = UUID_RE.test(messageId) ? await messageService.getMessage(messageId) : null;
     if (!message || message.senderType !== "user" || message.senderId !== req.userId
       || !await channelService.canUserAccessChannel(message.channelId, req.userId!, req.serverId!)) {
+      // refusal-ok: the mention delivery read answers a lookup status, not a refusal sentence (top-level status NOT_JOINABLE, as its 500 answers status LOOKUP_FAILED; messages.mentionDeliveries.api.test.ts pins the body)
       res.status(404).json({ status: "NOT_JOINABLE" });
       return;
     }
@@ -296,7 +343,7 @@ async function loadVisibleMessageForUser(
     return null;
   }
   if (access.kind === "history_limited") {
-    res.status(404).json(humanHistoryLimitedError(access.historyWindow));
+    refuse(res, 404, humanHistoryLimitedError(access.historyWindow));
     return null;
   }
   return { message: access.message, localChannelId: access.localChannelId, localServerId: serverId };
@@ -388,11 +435,11 @@ export async function readVisibleMessageRow(messageId: string, userId: string, s
 messageRouter.get("/:messageId/card-revisions", async (req, res) => {
   res.setHeader("Cache-Control", "private, no-store");
   const messageId = req.params.messageId;
-  if (typeof messageId !== "string" || !UUID_RE.test(messageId)) { res.status(404).json({ error: "Message not found" }); return; }
+  if (typeof messageId !== "string" || !UUID_RE.test(messageId)) { refuse(res, 404, HUMAN_MESSAGE_NOT_FOUND_REFUSAL); return; }
   try {
     const message = await messageService.getMessage(messageId);
     // getMessage does not filter deleted rows: a deleted (or retracted) message is the unknown one's 404.
-    if (!message || message.deletedAt || !await messageVisibleToViewer(req, message)) { res.status(404).json({ error: "Message not found" }); return; }
+    if (!message || message.deletedAt || !await messageVisibleToViewer(req, message)) { refuse(res, 404, HUMAN_MESSAGE_NOT_FOUND_REFUSAL); return; }
     const revisions = isMessageCardMetadata(message.actionMetadata) ? await listMessageCardRevisions(message.id) : [];
     res.json({ messageId: message.id, revisions });
   } catch {
@@ -490,12 +537,12 @@ messageRouter.get("/search", async (req, res) => {
     const scopedChannel = channelId ? await channelService.getChannel(channelId) : undefined;
     if (channelId) {
       if (!scopedChannel || scopedChannel.serverId !== req.serverId) {
-        res.status(404).json({ error: "Channel not found" });
+        refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
         return;
       }
       const canAccess = await channelService.canUserAccessChannel(channelId, req.userId!, req.serverId!);
       if (!canAccess) {
-        res.status(404).json({ error: "Channel not found" });
+        refuse(res, 404, HUMAN_CHANNEL_NOT_FOUND_REFUSAL);
         return;
       }
     }
@@ -508,23 +555,23 @@ messageRouter.get("/search", async (req, res) => {
     const senderId = typeof req.query.senderId === "string" ? req.query.senderId : undefined;
     const senderType = parseSearchSenderType(req.query.senderType);
     if (senderType === "invalid") {
-      res.status(400).json({ error: "Invalid sender type" });
+      refuse(res, 400, { code: "search_sender_type_invalid", error: "Invalid sender type" });
       return;
     }
     const mentionTarget = parseMentionTarget(req.query.mentionTarget);
     if (mentionTarget === "invalid") {
-      res.status(400).json({ error: "Invalid mention target" });
+      refuse(res, 400, { code: "search_mention_target_invalid", error: "Invalid mention target" });
       return;
     }
     const after = parseDateFilter(req.query.after);
     const before = parseDateFilter(req.query.before);
     if (after === "invalid" || before === "invalid") {
-      res.status(400).json({ error: "Invalid date filter" });
+      refuse(res, 400, { code: "INVALID_DATE_FILTER", error: "Invalid date filter" });
       return;
     }
     const sort = parseSearchSort(req.query.sort);
     if (sort === "invalid") {
-      res.status(400).json({ error: "Invalid search sort" });
+      refuse(res, 400, { code: "search_sort_invalid", error: "Invalid search sort" });
       return;
     }
     const rawCursor = typeof req.query.cursor === "string" && req.query.cursor ? req.query.cursor : undefined;
@@ -532,7 +579,7 @@ messageRouter.get("/search", async (req, res) => {
     // A cursor continues a recent page, or a relevance page answered newest
     // first (relevanceFallback).
     if (cursor === null || (cursor && !query)) {
-      res.status(400).json({ error: "Invalid search cursor" });
+      refuse(res, 400, { code: "search_cursor_invalid", error: "Invalid search cursor" });
       return;
     }
     const hasMeaningfulFilter = Boolean(channelId || senderId || senderType || mentionTarget || after || before);
@@ -638,7 +685,7 @@ messageRouter.get("/search", async (req, res) => {
     if (searchService.isMessageSearchPublicError(err)) {
       addTraceEvent("message_search.route.rejected", {
         event_kind: "message_search",
-        outcome: err.status === 422 ? "rejected" : "error",
+        outcome: "error",
         reason: err.code.toLowerCase(),
         http_status: err.status,
       });
@@ -821,18 +868,57 @@ function tracePreviewFailure(route: "app_link_previews" | "link_cards_read", mes
 messageRouter.get("/:messageId/app-link-previews", appLinkPreviewLimiter, async (req, res) => {
   res.setHeader("Cache-Control", "private, no-store");
   const messageId = req.params.messageId;
-  if (typeof messageId !== "string" || !UUID_RE.test(messageId)) { res.status(404).json({ error: "Message not found" }); return; }
+  if (typeof messageId !== "string" || !UUID_RE.test(messageId)) { refuse(res, 404, HUMAN_MESSAGE_NOT_FOUND_REFUSAL); return; }
   const readVisible = () => readPreviewableMessage(req, messageId);
   try {
     const first = await readPreviewableMessageOrRefusal(req, messageId);
-    if ("refusal" in first) { tracePreviewRefusal("app_link_previews", messageId, first.refusal); res.status(404).json({ error: "Message not found" }); return; }
+    if ("refusal" in first) { tracePreviewRefusal("app_link_previews", messageId, first.refusal); refuse(res, 404, HUMAN_MESSAGE_NOT_FOUND_REFUSAL); return; }
     const message = first.message;
-    const { previews, prompts, appIcons } = await resolveAppLinkPreviews({ serverId: req.serverId!, userId: req.userId!, content: message.content,
+    const { previews, prompts, appIcons, objectKeys } = await resolveAppLinkPreviews({ serverId: req.serverId!, userId: req.userId!, content: message.content,
       stillVisible: async () => (await readVisible())?.content === message.content });
-    res.json({ previews, prompts, appIcons });
+    // `objectKeys` only when an App named an object: otherwise the answer is exactly as before.
+    res.json({ previews, prompts, appIcons, ...(Object.keys(objectKeys).length ? { objectKeys } : {}) });
   } catch (err) {
     tracePreviewFailure("app_link_previews", messageId, err);
     res.json({ previews: [], prompts: [], appIcons: {} });
+  }
+});
+
+// Per-reader inline quote resolution for real-time WebSocket messages
+// (services/quoteReplyService.ts): room-wide broadcasts carry raw content only,
+// so clients fetch viewer-scoped author/timestamp/jump targets here through the
+// exact same visibility and history-window gate as GET /channel/:channelId.
+messageRouter.get("/:messageId/resolved-quotes", async (req, res) => {
+  res.setHeader("Cache-Control", "private, no-store");
+  const messageId = req.params.messageId;
+  if (typeof messageId !== "string" || !UUID_RE.test(messageId)) {
+    refuse(res, 404, HUMAN_MESSAGE_NOT_FOUND_REFUSAL);
+    return;
+  }
+  try {
+    const message = await messageService.getMessage(messageId);
+    if (!message || message.deletedAt) {
+      refuse(res, 404, HUMAN_MESSAGE_NOT_FOUND_REFUSAL);
+      return;
+    }
+    const visibility = await messageVisibility(req, message);
+    if ("refusal" in visibility) {
+      refuse(res, 404, HUMAN_MESSAGE_NOT_FOUND_REFUSAL);
+      return;
+    }
+    const resolvedMap = await resolveInlineQuotesMapForViewer([message], {
+      serverId: req.serverId!,
+      userId: req.userId!,
+      historyCutoff: visibility.historyWindow.cutoff,
+      storageChannelId: message.channelId,
+    });
+    res.json({ resolvedQuotes: resolvedMap.get(message.id) ?? {} });
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to resolve message quotes",
+      logPrefix: "Resolve message quotes error:",
+      err,
+    });
   }
 });
 
@@ -859,9 +945,9 @@ const linkCardReadLimiter = rateLimit({
 messageRouter.post("/:messageId/link-cards/read", linkCardReadLimiter, async (req, res) => {
   res.setHeader("Cache-Control", "private, no-store");
   const messageId = req.params.messageId;
-  if (typeof messageId !== "string" || !UUID_RE.test(messageId)) { res.status(404).json({ error: "Message not found" }); return; }
+  if (typeof messageId !== "string" || !UUID_RE.test(messageId)) { refuse(res, 404, HUMAN_MESSAGE_NOT_FOUND_REFUSAL); return; }
   const request = parseLinkCardReadBody(req.body);
-  if (!request) { res.status(400).json({ error: "Invalid link card read request" }); return; }
+  if (!request) { refuse(res, 400, { code: "INVALID_REQUEST", error: "Invalid link card read request" }); return; }
   const readVisible = () => readPreviewableMessage(req, messageId);
   try {
     const first = await readPreviewableMessageOrRefusal(req, messageId);
@@ -876,7 +962,7 @@ messageRouter.post("/:messageId/link-cards/read", linkCardReadLimiter, async (re
     }
     if ("refusal" in first) {
       tracePreviewRefusal("link_cards_read", messageId, card && "refusal" in card ? card.refusal : first.refusal);
-      res.status(404).json({ error: "Message not found" });
+      refuse(res, 404, HUMAN_MESSAGE_NOT_FOUND_REFUSAL);
       return;
     }
     const message = first.message;
@@ -893,11 +979,11 @@ messageRouter.get("/context/:messageId", async (req, res) => {
   // it) is a client error, not a uuid-cast 500.
   const looksLikeFullUuid = UUID_RE.test(req.params.messageId);
   if (!looksLikeFullUuid && !isMessageShortId(req.params.messageId)) {
-    res.status(400).json({ error: "Invalid message id" });
+    refuse(res, 400, { code: "message_id_invalid", error: "Invalid message id" });
     return;
   }
   if (typeof req.query.channelId === "string" && !UUID_RE.test(req.query.channelId)) {
-    res.status(400).json({ error: "Invalid channel id" });
+    refuse(res, 400, { code: "channel_id_invalid", error: "Invalid channel id" });
     return;
   }
   try {
@@ -931,7 +1017,8 @@ messageRouter.get("/context/:messageId", async (req, res) => {
       ? queryJointResolved.canonicalChannelId
       : queryJointThreadProjection?.canonicalThreadChannelId ?? channelId;
     if (channelId && !contextChannelId) {
-      res.status(404).json({ error: "Message not found" });
+      // The context route's one not-found (a missing message, one in a channel the caller can't read, another server's): all three answer the same bytes.
+      refuse(res, 404, HUMAN_MESSAGE_NOT_FOUND_REFUSAL);
       return;
     }
     const contextBefore = parseContextWindowSide(req.query.before);
@@ -991,7 +1078,7 @@ messageRouter.get("/context/:messageId", async (req, res) => {
         .find((projection) => projection.serverId === req.serverId);
       if (localReadProjection) responseChannelId = localReadProjection.localChannelId;
       const channel = await channelService.getChannel(responseChannelId);
-      if (!channel || channel.serverId !== req.serverId) return { denied: "channel" as const };
+      if (!channel || channel.serverId !== req.serverId) return { denied: "conversation" as const };
       const canAccess = await channelService.canUserAccessChannel(responseChannelId, req.userId!, req.serverId!);
       if (!canAccess) return { denied: "message" as const };
       // Local ids only: a thread target names this server's projection of it.
@@ -1023,6 +1110,7 @@ messageRouter.get("/context/:messageId", async (req, res) => {
       if (hiddenTarget && hiddenAccess?.denied === null) {
         notePaywallHit(req, "history_30d");
         // Still a 404 for older clients, which treat it as not found.
+        // refusal-ok: top-level channelId, targetMessageId, canonicalTarget and hiddenTarget place the history paywall on the hidden target (web hiddenHistoryStore.ts readHistoryLimitedError reads the last three); refuse() writes no top-level fields
         res.status(404).json({
           ...humanHistoryLimitedError({ plan, cutoff: historyCutoff }),
           channelId: hiddenAccess.responseChannelId,
@@ -1034,17 +1122,17 @@ messageRouter.get("/context/:messageId", async (req, res) => {
         });
         return;
       }
-      res.status(404).json({ error: "Message not found" });
+      refuse(res, 404, HUMAN_MESSAGE_NOT_FOUND_REFUSAL);
       return;
     }
 
     const access = await authorizeContext(context);
-    if (access.denied === "channel") {
-      res.status(404).json({ error: "Channel not found" });
-      return;
-    }
-    if (access.denied === "message") {
-      res.status(404).json({ error: "Message not found" });
+    if (access.denied) {
+      // A message whose conversation is missing, on another server or one the
+      // caller can't read answers exactly like a missing message: with a
+      // foreign `channelId` the lookup runs in that channel (short ids too),
+      // so any other answer would tell which ids exist there.
+      refuse(res, 404, HUMAN_MESSAGE_NOT_FOUND_REFUSAL);
       return;
     }
     const { responseChannelId } = access;
@@ -1076,8 +1164,16 @@ messageRouter.get("/context/:messageId", async (req, res) => {
     });
 
     const channelArchived = await channelService.isChannelArchived(responseChannelId);
-    const projectedContextMessages = await messageService.projectJointMessagesToLocalChannel(
-      context.messages, responseChannelId, req.serverId!,
+    const projectedContextMessages = await attachResolvedInlineQuotesForViewer(
+      await messageService.projectJointMessagesToLocalChannel(
+        context.messages, responseChannelId, req.serverId!,
+      ),
+      {
+        serverId: req.serverId!,
+        userId: req.userId!,
+        historyCutoff,
+        storageChannelId: context.channelId,
+      },
     );
     const contextParentMessageIds = projectedContextMessages.map((message) => message.id);
     const threadSummariesByParentMessageId = contextParentMessageIds.length === 0
@@ -1123,6 +1219,7 @@ messageRouter.get("/channel/:channelId", async (req, res) => {
       }),
     );
     if (!channel || channel.serverId !== req.serverId) {
+      // refusal-ok: must stay byte-identical to denyChannelAccess's 404 below (channelAccessDenial.ts), no existence oracle
       res.status(404).json(CHANNEL_NOT_FOUND_BODY);
       return;
     }
@@ -1160,7 +1257,7 @@ messageRouter.get("/channel/:channelId", async (req, res) => {
       afterSeq === "invalid" ||
       (beforeSeq !== undefined && afterSeq !== undefined)
     ) {
-      res.status(400).json({ error: "Invalid message page cursor", code: "invalid_message_page_cursor" });
+      refuse(res, 400, MESSAGE_PAGE_CURSOR_INVALID_REFUSAL);
       return;
     }
 
@@ -1285,14 +1382,21 @@ messageRouter.get("/channel/:channelId", async (req, res) => {
           }),
         );
 
+    const messagesWithQuotes = await attachResolvedInlineQuotesForViewer(projectedMsgs, {
+      serverId: req.serverId!,
+      userId: req.userId!,
+      historyCutoff,
+      storageChannelId,
+    });
+
     addTraceEvent("response.ready", {
-      messages_count: projectedMsgs.length,
+      messages_count: messagesWithQuotes.length,
       history_limited: historyLimited,
       thread_summaries_count: Object.keys(threadSummariesByParentMessageId).length,
     });
     if (startingHorizon) res.setHeader(SYNC_HORIZON_HEADER, startingHorizon.horizon);
     res.json({
-      messages: projectedMsgs,
+      messages: messagesWithQuotes,
       threadSummariesByParentMessageId,
       historyLimited,
       ...(hiddenHistory ? { hiddenHistory } : {}),
@@ -1350,74 +1454,6 @@ messageRouter.get("/channel/:channelId/human-outline", async (req, res) => {
     res.json({ items: page.items, hasMore: page.hasMore });
   } catch {
     res.status(500).json({ error: "Failed to list the conversation outline" });
-  }
-});
-
-// Forum-style channels (#proj-chat:#24): a page of the channel's top-level
-// messages ordered by latest activity (own time or latest thread reply),
-// oldest first, newest activity last. `before` is the opaque keyset cursor the
-// previous page returned (`nextCursor`). 404 while channel_thread_sort_v0 is
-// off or the channel is not a regular channel set to `activity`; same access
-// and history window as GET /channel/:channelId.
-messageRouter.get("/channel/:channelId/by-activity", async (req, res) => {
-  try {
-    const channel = await channelService.getChannel(req.params.channelId);
-    if (!channel || channel.serverId !== req.serverId) {
-      res.status(404).json(CHANNEL_NOT_FOUND_BODY);
-      return;
-    }
-    const [visible] = await canView({ type: "user", id: req.userId!, serverId: req.serverId! }, [{ kind: "conversation", channelId: channel.id }]);
-    if (!visible) {
-      await denyChannelAccess(res, req.userId!, req.params.channelId, "You do not have access to this channel");
-      return;
-    }
-    const gate = await evaluateFeatureFlag({
-      key: CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY,
-      serverId: req.serverId!,
-      userId: req.userId!,
-    });
-    if (!gate.enabled || !channelTypeSupportsThreadSort(channel.type) || channel.threadSort !== "activity") {
-      res.status(404).json({ error: "This channel is not ordered by activity", code: "thread_sort_not_activity" });
-      return;
-    }
-    const limit = Math.max(1, Math.min(Number(req.query.limit) || 50, 200));
-    const before = req.query.before === undefined ? null : decodeChannelActivityCursor(req.query.before);
-    if (req.query.before !== undefined && !before) {
-      res.status(400).json({ error: "Invalid message page cursor", code: "invalid_message_page_cursor" });
-      return;
-    }
-    const historyCutoff = getHistoryCutoff(await getServerPlan(req.serverId!));
-    const page = await messageService.listTopLevelMessagesByActivity(channel.id, limit, before, historyCutoff, {
-      traceQuery: createTraceDbQueryTracer("messages.activity_paged"),
-      attachmentCommentViewerUserId: req.userId,
-      forwardedBundleViewerUserId: req.userId,
-      viewerServerId: req.serverId,
-    });
-    // Joint channels never get here (type gate above): no joint thread
-    // projection, only the conversion scope's rows shown under this channel.
-    const projected = messageService.projectMessagesToChannel(page.messages, channel.id);
-    const activityById = new Map(page.messages.map((message) => [message.id, message.activityAt]));
-    const pageMessages = projected.map((message) => ({ ...message, activityAt: activityById.get(message.id) ?? null }));
-    const historyLimited = Boolean(historyCutoff) && !page.hasMore
-      && await messageService.hasOlderMessages(channel.id, historyCutoff!, undefined, {});
-    const threadSummariesByParentMessageId = pageMessages.length === 0
-      ? {}
-      : await channelService.getThreadSummaries(channel.id, {
-          userId: req.userId!,
-          parentMessageIds: pageMessages.map((message) => message.id),
-          parentMessageScopeSource: "messages_page",
-          previewChars: parseThreadPreviewChars(req.query[THREAD_PREVIEW_CHARS_PARAM]),
-          traceQuery: createTraceDbQueryTracer("messages.activity_thread_summaries"),
-        });
-    res.json({
-      messages: pageMessages,
-      threadSummariesByParentMessageId,
-      hasMore: page.hasMore,
-      nextCursor: page.nextCursor,
-      historyLimited,
-    });
-  } catch {
-    res.status(500).json({ error: "Failed to list messages" });
   }
 });
 
@@ -1569,7 +1605,7 @@ messageRouter.post("/forward", async (req, res) => {
         : "invalid";
     if (parsedDestinationChannelIds === "invalid") {
       recordForwardTerminal(req, { phase, outcome: "rejected", status: 400, stableCode: "invalid_request", errorClass: "ValidationError" });
-      res.status(400).json({ error: "Destination channel and full source message ids are required" });
+      refuse(res, 400, FORWARD_REQUEST_INVALID_REFUSAL);
       return;
     }
     const isBatchRequest = parsedDestinationChannelIds !== null;
@@ -1580,7 +1616,7 @@ messageRouter.post("/forward", async (req, res) => {
 
     if (isOverForwardMessageCap(req.body?.sourceMessageIds)) {
       recordForwardTerminal(req, { phase, outcome: "rejected", status: 400, stableCode: FORWARD_TOO_MANY_MESSAGES_CODE, errorClass: "ValidationError" });
-      res.status(400).json({ error: FORWARD_TOO_MANY_MESSAGES_ERROR, code: FORWARD_TOO_MANY_MESSAGES_CODE });
+      refuse(res, 400, { code: FORWARD_TOO_MANY_MESSAGES_CODE, error: FORWARD_TOO_MANY_MESSAGES_ERROR });
       return;
     }
     if (
@@ -1592,12 +1628,12 @@ messageRouter.post("/forward", async (req, res) => {
       || parsedRandomId === INVALID_RANDOM_ID
     ) {
       recordForwardTerminal(req, { phase, outcome: "rejected", status: 400, stableCode: "invalid_request", errorClass: "ValidationError" });
-      res.status(400).json({ error: "Destination channel and full source message ids are required" });
+      refuse(res, 400, FORWARD_REQUEST_INVALID_REFUSAL);
       return;
     }
     if (note.length > MAX_MESSAGE_LENGTH) {
       recordForwardTerminal(req, { phase, outcome: "rejected", status: 400, stableCode: "note_too_long", errorClass: "ValidationError" });
-      res.status(400).json({ error: `Message content exceeds maximum length of ${MAX_MESSAGE_LENGTH} characters` });
+      refuse(res, 400, { code: "message_too_long", error: `Message content exceeds maximum length of ${MAX_MESSAGE_LENGTH} characters` });
       return;
     }
 
@@ -1787,11 +1823,11 @@ messageRouter.post("/forward", async (req, res) => {
       return;
     }
     if (err instanceof ForwardPersistenceError) {
-      res.status(409).json({ error: err.message, code: err.code });
+      refuse(res, 409, { code: err.code, error: err.message });
       return;
     }
     if (err instanceof channelService.ChannelArchivedError) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, { code: "channel_archived", error: "This channel is archived" });
       return;
     }
     console.error("Forward request failed unexpectedly", {
@@ -1812,35 +1848,35 @@ async function createHumanMessage(
   try {
     const parsedBody = parseHumanMessageCreateBody(req.body);
     if (parsedBody === "invalid") {
-      res.status(400).json({ error: "Invalid message request body" });
+      refuse(res, 400, { code: "invalid_request", error: "Invalid message request body" });
       return;
     }
     const { channelId, content, attachmentIds, asTask } = parsedBody;
     const randomId = parseRandomId(req.body.randomId);
     if (randomId === INVALID_RANDOM_ID) {
-      res.status(400).json({ error: `randomId must be a non-empty string with at most ${MAX_RANDOM_ID_LENGTH} characters` });
+      refuse(res, 400, { code: "invalid_request", error: `randomId must be a non-empty string with at most ${MAX_RANDOM_ID_LENGTH} characters` });
       return;
     }
     const mentions = parseStructuredMentions(req.body.mentions);
     if (mentions === "invalid") {
-      res.status(400).json({ error: "Invalid mentions payload" });
+      refuse(res, 400, { code: "mentions_invalid", error: "Invalid mentions payload" });
       return;
     }
     // Best-effort: the web client reports its IANA zone for agents. A bad or
     // missing value is stored as null and never fails the send.
     const senderTimezone = parseOptionalIanaTimezone(req.body.timezone);
     if (!channelId || !content) {
-      res.status(400).json({ error: "Channel ID and content are required" });
+      refuse(res, 400, { code: "content_required", error: "Channel ID and content are required" });
       return;
     }
 
     // Validate content
     if (typeof content !== "string" || content.trim().length === 0) {
-      res.status(400).json({ error: "Message content cannot be empty" });
+      refuse(res, 400, { code: "content_required", error: "Message content cannot be empty" });
       return;
     }
     if (content.length > MAX_MESSAGE_LENGTH) {
-      res.status(400).json({ error: `Message content exceeds maximum length of ${MAX_MESSAGE_LENGTH} characters` });
+      refuse(res, 400, { code: "message_too_long", error: `Message content exceeds maximum length of ${MAX_MESSAGE_LENGTH} characters` });
       return;
     }
 
@@ -1849,11 +1885,11 @@ async function createHumanMessage(
     if (!admission.ok) {
       if (admission.refusal === "billing_read_only") {
         if (admission.billing.reason === "joint_over_limit") notePaywallHit(req, "joint_channel_read_only");
-        res.status(403).json(channelBillingReadOnlyBody(admission.billing));
+        answerChannelBillingReadOnly(res, admission.billing);
         return;
       }
       const refusal = HUMAN_POST_REFUSALS[admission.refusal];
-      res.status(refusal.status).json({ error: refusal.error, ...(admission.refusal === "joint_task_read_only" ? { code: "joint_task_read_only" } : {}) });
+      refuse(res, refusal.status, { code: refusal.code, error: refusal.error });
       return;
     }
     const { channel } = admission;
@@ -1903,9 +1939,22 @@ async function createHumanMessage(
     const pendingMentionActions = messageService.getSenderPendingMentionActions(enriched);
     const unresolvedMentionHandles = messageService.getSenderUnresolvedMentionHandles(enriched);
     const deliveryWarnings = messageService.getSenderDeliveryWarnings(enriched);
+    // Attach viewer-scoped resolvedQuotes ONLY to the sender's HTTP response
+    // (never to `enriched` before broadcastAndDeliver, keeping room broadcasts clean).
+    let responseMessage: typeof enriched & { resolvedQuotes?: Record<string, unknown> } = enriched;
+    if (hasSameConversationQuoteRef(enriched.content)) {
+      const senderPlan = await getServerPlan(req.serverId!);
+      const senderHistoryCutoff = getHistoryCutoff(senderPlan);
+      const [withQuotes] = await attachResolvedInlineQuotesForViewer([enriched], {
+        serverId: req.serverId!,
+        userId: userId,
+        historyCutoff: senderHistoryCutoff,
+      });
+      if (withQuotes) responseMessage = withQuotes;
+    }
     if (mentionContract === "v2") {
       res.json({
-        message: enriched,
+        message: responseMessage,
         ...(pendingMentionActions.length > 0 ? { pendingMentionActions } : {}),
         ...(unresolvedMentionHandles.length > 0 ? { unresolvedMentionHandles } : {}),
         ...(deliveryWarnings.length > 0 ? { deliveryWarnings } : {}),
@@ -1913,11 +1962,11 @@ async function createHumanMessage(
       return;
     }
     if (pendingMentionActions.length > 0) {
-      res.json({ message: enriched, pendingMentionActions });
+      res.json({ message: responseMessage, pendingMentionActions });
       return;
     }
 
-    res.json(enriched);
+    res.json(responseMessage);
   } catch (err) {
     if (err instanceof DmPeerNotMemberError || err instanceof JointChannelAccessChangedError) {
       res.status(err.status).json({ error: err.message, code: err.code });
@@ -1928,16 +1977,12 @@ async function createHumanMessage(
       return;
     }
     if (err instanceof channelService.ChannelArchivedError) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, HUMAN_CHANNEL_ARCHIVED_REFUSAL);
       return;
     }
     if (err instanceof messageService.MentionValidationError) {
-      res.status(400).json(mentionContract === "v2"
-        ? {
-            error: err.message,
-            ...(err.code ? { code: err.code } : {}),
-          }
-        : { error: err.message });
+      // The one MentionValidationError (a handle bound to two actors) is thrown only on v2 and always has its code.
+      refuse(res, 400, { code: err.code ?? "mention_binding_conflict", error: err.message });
       return;
     }
     if (err instanceof messageService.UserRandomIdConflictError) {
@@ -1945,7 +1990,7 @@ async function createHumanMessage(
       return;
     }
     if (err instanceof AttachmentLinkError) {
-      res.status(err.status).json({ error: err.message, code: err.code });
+      refuse(res, err.status, err.toRefusal());
       return;
     }
     const projected = projectSlackBridgeOutboundAdmissionFailure(err, process.env.NODE_ENV);
@@ -1965,7 +2010,7 @@ messageRouter.post("/mention-actions/execute", async (req, res) => {
     const serverId = req.serverId!;
     const action = typeof req.body?.action === "string" ? req.body.action : "";
     if (action !== "notify" && action !== "add") {
-      res.status(400).json({ error: "action must be notify or add" });
+      refuse(res, 400, { code: "mention_action_invalid", error: "action must be notify or add" });
       return;
     }
     const actionKind: MentionActionKind = action;
@@ -1974,7 +2019,7 @@ messageRouter.post("/mention-actions/execute", async (req, res) => {
       .filter((id, index, ids) => ids.indexOf(id) === index)
       .slice(0, 100);
     if (resolutionIds.length === 0) {
-      res.status(400).json({ error: "resolutionIds must include at least one id" });
+      refuse(res, 400, { code: "mention_resolution_ids_required", error: "resolutionIds must include at least one id" });
       return;
     }
 
@@ -2043,17 +2088,17 @@ messageRouter.get("/:messageId/reactions/actors", async (req, res) => {
   try {
     const emoji = parseReactionEmoji(req.query.emoji);
     if (!emoji) {
-      res.status(400).json({ error: "A valid emoji is required", code: "invalid_reaction_emoji" });
+      refuse(res, 400, EMOJI_INVALID_REFUSAL);
       return;
     }
     const limit = parseReactionActorPageLimit(req.query.limit);
     if (limit === null) {
-      res.status(400).json({ error: "limit must be an integer between 1 and 100", code: "invalid_reaction_actor_limit" });
+      refuse(res, 400, { code: "invalid_reaction_actor_limit", error: "limit must be an integer between 1 and 100" });
       return;
     }
     const cursor = req.query.cursor;
     if (cursor !== undefined && typeof cursor !== "string") {
-      res.status(400).json({ error: "Invalid reaction actors cursor", code: "invalid_reaction_actors_cursor" });
+      refuse(res, 400, { code: "invalid_reaction_actors_cursor", error: "Invalid reaction actors cursor" });
       return;
     }
 
@@ -2061,12 +2106,13 @@ messageRouter.get("/:messageId/reactions/actors", async (req, res) => {
     if (!visibleMessage) return;
     const { message, localChannelId, localServerId } = visibleMessage;
     if (message.messageType === "system") {
-      res.status(400).json({ error: "System messages cannot receive reactions" });
+      refuse(res, 400, REACTION_SYSTEM_MESSAGE_REFUSAL);
       return;
     }
     await channelService.assertChannelNotArchived(localChannelId);
     const localChannel = await channelService.getChannel(localChannelId);
     if (!localChannel) {
+      // refusal-ok: must stay byte-identical to loadVisibleMessageForUser's not-found for a missing or hidden message (the resolver's codeless 404, which historyWindow.byId.api.test.ts pins without a code); they move together
       res.status(404).json({ error: "Message not found" });
       return;
     }
@@ -2099,14 +2145,15 @@ messageRouter.get("/:messageId/reactions/actors", async (req, res) => {
     });
   } catch (err) {
     if (err instanceof channelService.ChannelArchivedError) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, HUMAN_CHANNEL_ARCHIVED_REFUSAL);
       return;
     }
     if (err instanceof InvalidReactionActorsCursorError) {
-      res.status(400).json({ error: "Invalid reaction actors cursor", code: err.code });
+      refuse(res, 400, { code: err.code, error: "Invalid reaction actors cursor" });
       return;
     }
     if (err instanceof ReactionDiscussionVersionChangedError) {
+      // refusal-ok: top-level currentDiscussionVersion and rebaselineRequired tell the reader which version to re-read from (messages.api.test.ts pins the body); refuse() writes no top-level fields
       res.status(409).json({
         error: err.message,
         code: err.code,
@@ -2116,6 +2163,7 @@ messageRouter.get("/:messageId/reactions/actors", async (req, res) => {
       return;
     }
     if (err instanceof ReactionActorVisibilityChangedError) {
+      // refusal-ok: top-level rebaselineRequired, as the discussion-changed 409 above; refuse() writes no top-level fields
       res.status(409).json({ error: err.message, code: err.code, rebaselineRequired: true });
       return;
     }
@@ -2129,7 +2177,7 @@ messageRouter.get("/:messageId/reactions/viewer", async (req, res) => {
     if (!visibleMessage) return;
     const { message, localChannelId, localServerId } = visibleMessage;
     if (message.messageType === "system") {
-      res.status(400).json({ error: "System messages cannot receive reactions" });
+      refuse(res, 400, REACTION_SYSTEM_MESSAGE_REFUSAL);
       return;
     }
     await channelService.assertChannelNotArchived(localChannelId);
@@ -2140,7 +2188,7 @@ messageRouter.get("/:messageId/reactions/viewer", async (req, res) => {
     }));
   } catch (err) {
     if (err instanceof channelService.ChannelArchivedError) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, HUMAN_CHANNEL_ARCHIVED_REFUSAL);
       return;
     }
     sendJsonServerError(req, res, { error: "Failed to hydrate reaction viewer state", logPrefix: "Hydrate reaction viewer error:", err });
@@ -2151,7 +2199,7 @@ messageRouter.post("/:messageId/reactions", async (req, res) => {
   try {
     const emoji = parseReactionEmoji(req.body?.emoji);
     if (!emoji) {
-      res.status(400).json({ error: "A valid emoji is required" });
+      refuse(res, 400, EMOJI_INVALID_REFUSAL);
       return;
     }
 
@@ -2159,13 +2207,13 @@ messageRouter.post("/:messageId/reactions", async (req, res) => {
     if (!visibleMessage) return;
     const { message, localChannelId } = visibleMessage;
     if (message.messageType === "system") {
-      res.status(400).json({ error: "System messages cannot receive reactions" });
+      refuse(res, 400, REACTION_SYSTEM_MESSAGE_REFUSAL);
       return;
     }
 
     const canPost = await channelService.canUserPostToChannel(localChannelId, req.userId!);
     if (!canPost) {
-      res.status(403).json({ error: "You must join this channel to react to messages" });
+      refuse(res, 403, REACTION_MEMBERSHIP_REQUIRED_HUMAN_REFUSAL);
       return;
     }
 
@@ -2174,11 +2222,11 @@ messageRouter.post("/:messageId/reactions", async (req, res) => {
     const billingReadOnly = await getChannelBillingReadOnly(localChannelId, req.serverId!);
     if (billingReadOnly) {
       if (billingReadOnly.reason === "joint_over_limit") notePaywallHit(req, "joint_channel_read_only");
-      res.status(403).json(channelBillingReadOnlyBody(billingReadOnly));
+      answerChannelBillingReadOnly(res, billingReadOnly);
       return;
     }
     if (await isChannelReadOnlyByQuota(localChannelId, req.serverId!)) {
-      res.status(403).json({ error: "This channel is read-only on your current plan. Upgrade to continue." });
+      refuse(res, 403, REACTION_QUOTA_READ_ONLY_REFUSAL);
       return;
     }
 
@@ -2221,7 +2269,7 @@ messageRouter.post("/:messageId/reactions", async (req, res) => {
       return;
     }
     if (err instanceof channelService.ChannelArchivedError) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, HUMAN_CHANNEL_ARCHIVED_REFUSAL);
       return;
     }
     sendJsonServerError(req, res, { error: "Failed to add reaction", logPrefix: "Add reaction error:", err });
@@ -2232,7 +2280,7 @@ messageRouter.delete("/:messageId/reactions", async (req, res) => {
   try {
     const emoji = parseReactionEmoji(req.body?.emoji);
     if (!emoji) {
-      res.status(400).json({ error: "A valid emoji is required" });
+      refuse(res, 400, EMOJI_INVALID_REFUSAL);
       return;
     }
 
@@ -2240,13 +2288,13 @@ messageRouter.delete("/:messageId/reactions", async (req, res) => {
     if (!visibleMessage) return;
     const { message, localChannelId } = visibleMessage;
     if (message.messageType === "system") {
-      res.status(400).json({ error: "System messages cannot receive reactions" });
+      refuse(res, 400, REACTION_SYSTEM_MESSAGE_REFUSAL);
       return;
     }
 
     const canPost = await channelService.canUserPostToChannel(localChannelId, req.userId!);
     if (!canPost) {
-      res.status(403).json({ error: "You must join this channel to react to messages" });
+      refuse(res, 403, REACTION_MEMBERSHIP_REQUIRED_HUMAN_REFUSAL);
       return;
     }
 
@@ -2255,11 +2303,11 @@ messageRouter.delete("/:messageId/reactions", async (req, res) => {
     const billingReadOnly = await getChannelBillingReadOnly(localChannelId, req.serverId!);
     if (billingReadOnly) {
       if (billingReadOnly.reason === "joint_over_limit") notePaywallHit(req, "joint_channel_read_only");
-      res.status(403).json(channelBillingReadOnlyBody(billingReadOnly));
+      answerChannelBillingReadOnly(res, billingReadOnly);
       return;
     }
     if (await isChannelReadOnlyByQuota(localChannelId, req.serverId!)) {
-      res.status(403).json({ error: "This channel is read-only on your current plan. Upgrade to continue." });
+      refuse(res, 403, REACTION_QUOTA_READ_ONLY_REFUSAL);
       return;
     }
 
@@ -2302,7 +2350,7 @@ messageRouter.delete("/:messageId/reactions", async (req, res) => {
       return;
     }
     if (err instanceof channelService.ChannelArchivedError) {
-      res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+      refuse(res, 409, HUMAN_CHANNEL_ARCHIVED_REFUSAL);
       return;
     }
     sendJsonServerError(req, res, { error: "Failed to remove reaction", logPrefix: "Remove reaction error:", err });
@@ -2332,7 +2380,7 @@ messageRouter.get("/sync", async (req, res) => {
     const sinceHorizon = rawSinceHorizon === undefined ? null : parseSyncHorizon(rawSinceHorizon);
     if (rawSinceHorizon !== undefined && !sinceHorizon) {
       addTraceEvent("messages.sync.rejected", { reason: "since_horizon_invalid" });
-      res.status(400).json({ error: "since_horizon must be the decimal string of a non-negative 64-bit transaction id", code: "invalid_since_horizon" });
+      refuse(res, 400, { code: "invalid_since_horizon", error: "since_horizon must be the decimal string of a non-negative 64-bit transaction id" });
       return;
     }
     let jointResolved: channelService.ChannelAccessResolution | null = null;
@@ -2341,6 +2389,7 @@ messageRouter.get("/sync", async (req, res) => {
       // Verify channel belongs to this server + DM access control
       const channel = await channelService.getChannel(channelId);
       if (!channel || channel.serverId !== req.serverId) {
+        // refusal-ok: must stay byte-identical to denyChannelAccess's 404 below (channelAccessDenial.ts), no existence oracle; the web's channelAccessLoss.ts reads this codeless 404 as losing the channel
         res.status(404).json(CHANNEL_NOT_FOUND_BODY);
         return;
       }
@@ -2384,12 +2433,22 @@ messageRouter.get("/sync", async (req, res) => {
         req.serverId!,
         { sinceHorizon },
       );
-      sendSync(result, await messageService.projectJointMessagesToLocalChannel(result.messages, jointResolved.localChannelId, req.serverId!));
+      const projected = await messageService.projectJointMessagesToLocalChannel(result.messages, jointResolved.localChannelId, req.serverId!);
+      sendSync(result, await attachResolvedInlineQuotesForViewer(projected, {
+        serverId: req.serverId!,
+        userId: req.userId!,
+        historyCutoff,
+        storageChannelId: jointResolved.canonicalChannelId,
+      }));
       return;
     }
 
     const result = await messageService.syncMessagesWithHorizon(sinceSeq, channelId, limit, req.serverId!, historyCutoff, req.userId!, req.serverId!, { sinceHorizon });
-    sendSync(result, result.messages);
+    sendSync(result, await attachResolvedInlineQuotesForViewer(result.messages, {
+      serverId: req.serverId!,
+      userId: req.userId!,
+      historyCutoff,
+    }));
   } catch {
     res.status(500).json({ error: "Failed to sync messages" });
   }

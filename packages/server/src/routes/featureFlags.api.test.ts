@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import argon2 from "argon2";
 import { openTestApp } from "../test/integration/app";
 import { getDb } from "../db/index";
+import { resolveTraceSampleRate, traceSampleKeys } from "@botiverse/raft-shared";
 import { users } from "../db/schema";
 import { createServer } from "../services/serverService";
 import {
@@ -277,6 +278,43 @@ test("feature flags API: the answer is the flags only; Raft's app hosts are not 
     else process.env.APP_URL = before.APP_URL;
     if (before.APP_PERMALINK_HOSTS === undefined) delete process.env.APP_PERMALINK_HOSTS;
     else process.env.APP_PERMALINK_HOSTS = before.APP_PERMALINK_HOSTS;
+    await close();
+  }
+});
+
+test("feature flags API: trace_sample.* flags carry the rate as a variant per platform (docs/observability/trace-sampling.md)", async () => {
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
+  try {
+    const db = getDb();
+    const [owner] = await db.insert(users).values({
+      email: "trace-sample-owner@slock.test",
+      name: "trace-sample-owner",
+      passwordHash: await argon2.hash("password123"),
+      emailVerified: true,
+      profileSetupCompletedAt: new Date(),
+    }).returning();
+    const server = await createServer("Trace Sample", "trace-sample", owner.id);
+    const token = await tokenForHuman(owner.email);
+    const key = "trace_sample.mobile.thread_open";
+    await createFeatureFlag({ key, randomizationUnit: "user", defaultEnabled: true, defaultVariant: "1", salt: key });
+    await createFeatureFlagRule({ flagKey: key, stage: "platform", decision: "allow", values: ["mobile"], variant: "0.1" });
+
+    const rateFor = async (platform: "web" | "mobile") => {
+      const res = await fetch(`${baseUrl}/api/feature-flags/evaluate`, {
+        method: "POST",
+        headers: authHeaders(token),
+        body: JSON.stringify({ serverId: server.id, platform, keys: traceSampleKeys("mobile.thread_open") }),
+      });
+      assert.equal(res.status, 200, await res.clone().text());
+      const { evaluations } = await res.json() as { evaluations: Array<{ key: string; enabled: boolean; reason: string; variant?: string }> };
+      assert.deepEqual(evaluations.find((evaluation) => evaluation.key === key), platform === "mobile"
+        ? { key, enabled: true, reason: "platform_rule", variant: "0.1" }
+        : { key, enabled: true, reason: "default", variant: "1" });
+      return resolveTraceSampleRate("mobile.thread_open", evaluations, 0.5);
+    };
+    assert.equal(await rateFor("mobile"), 0.1);
+    assert.equal(await rateFor("web"), 1);
+  } finally {
     await close();
   }
 });

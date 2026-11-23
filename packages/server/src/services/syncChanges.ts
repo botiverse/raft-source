@@ -18,6 +18,18 @@
 // marks the later pages of one pull (hasMore): the too_many count already
 // ran on its first page and is skipped.
 //
+// With the inbox_row capability (./syncInboxRows), the cursor also carries the
+// message position of its inbox rows: `c1.<seq>.<horizon>.m<mseq>.<mh>[.k]`,
+// the same invariant over `messages` (seq, inserting transaction id) instead of change_log.
+// Without the capability an `m` part is parsed and ignored, and never emitted.
+// The `inbox_row` change_log rows (a Done watermark, a mute, a retracted
+// message: an Activity row changed and nothing else says so) are read only
+// with the capability (`inboxRows`): each is a `conversation` stale change
+// for its row's id, and its Done watermark (ref_seq), first seq and time go to
+// the inbox arm as `inboxRowEntries` (it holds a row whose read model has not
+// caught up with them). Without it they are left out in SQL, so the pages,
+// the cursor and the counts are exactly as before.
+//
 // Scope filter: channel rows of the viewer's visible conversations (by the
 // channel id or a thread's parent id, joint canonical storage ids included,
 // plus the channels they saw that were deleted within retention),
@@ -90,10 +102,16 @@ const GUEST_ACCESS_RESET_SCOPE = "00000000-0000-0000-0000-000000000000";
 const CHANGE_LOG_RETENTION_DAYS = 8;
 
 const INT8_MAX = (1n << 63n) - 1n;
-const CURSOR_RE = /^c1\.(0|[1-9][0-9]{0,18})\.([0-9]+)(\.k)?$/;
+const CURSOR_RE = /^c1\.(0|[1-9][0-9]{0,18})\.([0-9]+)(?:\.m(0|[1-9][0-9]{0,18})\.([0-9]+))?(\.k)?$/;
 
-/** `counted`: a later page of a pull (`.k`), whose first page ran the too_many count. */
-export type ParsedSyncCursor = { seq: bigint; horizon: SyncHorizon; counted: boolean };
+/** The message position of a cursor's inbox rows (inbox_row capability): `m<seq>.<horizon>` over messages. */
+export type SyncMessagePosition = { seq: bigint; horizon: SyncHorizon };
+
+/**
+ * `counted`: a later page of a pull (`.k`), whose first page ran the too_many count.
+ * `messages`: the inbox rows' message position, null when the cursor has none.
+ */
+export type ParsedSyncCursor = { seq: bigint; horizon: SyncHorizon; counted: boolean; messages: SyncMessagePosition | null };
 
 /** A client-echoed cursor, or null when it is not one this server issued (version, digits, range). */
 export function parseSyncChangesCursor(value: unknown): ParsedSyncCursor | null {
@@ -103,12 +121,19 @@ export function parseSyncChangesCursor(value: unknown): ParsedSyncCursor | null 
   const seq = BigInt(match[1]!);
   const horizon = parseSyncHorizon(match[2]);
   if (seq > INT8_MAX || !horizon) return null;
-  return { seq, horizon, counted: match[3] !== undefined };
+  let messages: SyncMessagePosition | null = null;
+  if (match[3] !== undefined) {
+    const messageSeq = BigInt(match[3]);
+    const messageHorizon = parseSyncHorizon(match[4]);
+    if (messageSeq > INT8_MAX || !messageHorizon) return null;
+    messages = { seq: messageSeq, horizon: messageHorizon };
+  }
+  return { seq, horizon, counted: match[5] !== undefined, messages };
 }
 
-/** The producing adapter for cursors. */
-export function formatSyncChangesCursor(seq: bigint, horizon: SyncHorizon, counted = false): SyncChangesCursor {
-  return `c1.${seq}.${horizon}${counted ? ".k" : ""}` as SyncChangesCursor;
+/** The producing adapter for cursors. `messages`: the inbox rows' message position (inbox_row capability only). */
+export function formatSyncChangesCursor(seq: bigint, horizon: SyncHorizon, counted = false, messages: SyncMessagePosition | null = null): SyncChangesCursor {
+  return `c1.${seq}.${horizon}${messages ? `.m${messages.seq}.${messages.horizon}` : ""}${counted ? ".k" : ""}` as SyncChangesCursor;
 }
 
 /** A changed entity whose current row the route rebuilds for the viewer (upsert), or its removal. */
@@ -133,12 +158,28 @@ export type PendingSyncChange = PendingRowChange | SyncConversationChange | Sync
 
 export type SyncChangesRead = {
   cursor: SyncChangesCursor;
+  /** The cursor's parts (without a message position), for a caller that adds one (./syncInboxRows). */
+  position: { seq: bigint; horizon: SyncHorizon; counted: boolean };
   hasMore: boolean;
   reset: SyncResetReason | null;
   /** In output order (seq of each entity's last row); row entities still to be built. */
   changes: PendingSyncChange[];
+  /**
+   * inboxRows only (empty otherwise): per conversation id (the output id), its
+   * `inbox_row` rows of this read: `position`, the Done watermark of the last
+   * (null: cleared, or a row without one: a mute, a retracted message;
+   * ./syncInboxRows treats a watermark as a Done at that position); `firstSeq`
+   * / `firstAt`, the seq and created_at of the first; `lastAt`, the newest
+   * created_at (a hold's age: the newest change is the one a read model may
+   * still be behind on); `late` when any was a
+   * late row (seq at or below the cursor's); `own`: one was in the viewer's
+   * user scope (a Done watermark or a mute: their read model state is checked).
+   */
+  inboxRowEntries: ReadonlyMap<string, SyncInboxRowEntry>;
   stats: { rowsScanned: number; lateRows: number; horizonLag: number | null; skippedRows: number };
 };
+
+export type SyncInboxRowEntry = { position: string | null; firstSeq: bigint; firstAt: Date; lastAt: Date; late: boolean; own: boolean };
 
 type StatementRow = {
   horizon: unknown;
@@ -157,6 +198,7 @@ type StatementRow = {
   entity_id: string | null;
   op: string | null;
   ref_seq: unknown;
+  created_at?: unknown;
   late: unknown;
 };
 
@@ -170,6 +212,8 @@ type ChangeRow = {
   scopeKind: string;
   scopeId: string;
   parentId: string | null;
+  createdAt: Date | null;
+  late: boolean;
 };
 
 function bigintOrNull(value: unknown): bigint | null {
@@ -235,6 +279,8 @@ function syncChangesStatement(input: {
   /** Whether to count the scoped rows after the cursor (too_many): a pull's first page only. */
   countScoped: boolean;
   scopedCap: number;
+  /** Whether to read the `inbox_row` rows (the inbox_row capability); left out otherwise. */
+  inboxRows: boolean;
 }): SQL {
   const highSeq = sql`(SELECT CASE WHEN s.is_called THEN s.last_value ELSE 0 END FROM public.change_log_seq_seq s)`;
   if (!input.since) {
@@ -249,7 +295,10 @@ function syncChangesStatement(input: {
   }
   const { since, viewer, visibleIds, peerProjectionIds, limit, lateCap } = input;
   const sinceSeq = since.seq.toString();
-  const columns = sql`c.seq, c.entity, c.entity_id, c.op, c.ref_seq, c.server_id, c.scope_kind, c.scope_id, c.parent_id`;
+  // Without the capability the inbox_row rows are not there at all: the same pages, cursor and counts as before them.
+  const entities = input.inboxRows ? sql`` : sql` AND c.entity <> 'inbox_row'`;
+  // created_at only for a capable read (the inbox arm's hold age of an inbox_row row).
+  const columns = sql`c.seq, c.entity, c.entity_id, c.op, c.ref_seq, c.server_id, c.scope_kind, c.scope_id, c.parent_id${input.inboxRows ? sql`, c.created_at` : sql``}`;
   return sql`
     WITH sync_horizon AS MATERIALIZED (
       SELECT pg_snapshot_xmin(s.snap) AS h, pg_snapshot_xmax(s.snap) AS xmax
@@ -257,7 +306,7 @@ function syncChangesStatement(input: {
     ),
     sync_page AS (
       SELECT p.*, FALSE AS late FROM (
-        ${scopedRows(viewer, visibleIds, peerProjectionIds, sql`c.seq > ${sinceSeq}::bigint AND c.xid < (SELECT h FROM sync_horizon)`, columns, limit + 1)}
+        ${scopedRows(viewer, visibleIds, peerProjectionIds, sql`c.seq > ${sinceSeq}::bigint AND c.xid < (SELECT h FROM sync_horizon)${entities}`, columns, limit + 1)}
       ) p
     ),
     -- Late rows are few (transactions in flight at the previous read), and
@@ -269,7 +318,7 @@ function syncChangesStatement(input: {
     -- below every retained row is too_old (sync_head.min_xid) before this runs.
     sync_late AS (
       SELECT l.*, TRUE AS late FROM (
-        ${scopedRows(viewer, visibleIds, peerProjectionIds, sql`c.xid >= ${since.horizon}::xid8 AND c.xid < (SELECT h FROM sync_horizon) AND c.seq <= ${sinceSeq}::bigint AND ${since.horizon}::xid8 >= (SELECT min(x.xid) FROM public.change_log x)`, columns, lateCap + 1, "xid")}
+        ${scopedRows(viewer, visibleIds, peerProjectionIds, sql`c.xid >= ${since.horizon}::xid8 AND c.xid < (SELECT h FROM sync_horizon) AND c.seq <= ${sinceSeq}::bigint AND ${since.horizon}::xid8 >= (SELECT min(x.xid) FROM public.change_log x)${entities}`, columns, lateCap + 1, "xid")}
       ) l
     ),
     sync_head AS MATERIALIZED (
@@ -299,14 +348,14 @@ function syncChangesStatement(input: {
         -- common read stays one page, a long pull counts once.
         CASE WHEN ${input.countScoped} AND (SELECT count(*) FROM sync_page) > ${limit} THEN (
           SELECT count(*) FROM (
-            ${scopedRows(viewer, visibleIds, peerProjectionIds, sql`c.seq > ${sinceSeq}::bigint AND c.xid < (SELECT h FROM sync_horizon)`, sql`c.seq`, input.scopedCap + 1)}
+            ${scopedRows(viewer, visibleIds, peerProjectionIds, sql`c.seq > ${sinceSeq}::bigint AND c.xid < (SELECT h FROM sync_horizon)${entities}`, sql`c.seq`, input.scopedCap + 1)}
           ) counted
         ) END AS scoped_count
     )
     SELECT h.h::text AS horizon, h.xmax::text AS xmax,
       head.min_seq::text AS min_seq, head.min_xid AS min_xid, head.high_seq::text AS high_seq, head.forced, head.scoped_count::text AS scoped_count,
       r.seq::text AS seq, r.entity, r.entity_id, r.op, r.ref_seq::text AS ref_seq, r.late,
-      r.server_id::text AS server_id, r.scope_kind, r.scope_id::text AS scope_id, r.parent_id::text AS parent_id
+      r.server_id::text AS server_id, r.scope_kind, r.scope_id::text AS scope_id, r.parent_id::text AS parent_id${input.inboxRows ? sql`, r.created_at` : sql``}
     FROM sync_horizon h
     CROSS JOIN sync_head head
     LEFT JOIN (SELECT * FROM sync_page UNION ALL SELECT * FROM sync_late) r ON TRUE
@@ -367,6 +416,8 @@ type MappedRow = {
   change: PendingSyncChange;
   channel?: { id: string; local: boolean; serverId: string | null };
   conversation?: { kind: ConversationKind; stateId: string };
+  /** An `inbox_row` row (inboxRows reads only): its Done watermark (null: none), and whether in the viewer's user scope. */
+  inboxPosition?: { value: string | null; own: boolean; at: Date | null; late: boolean; seq: bigint };
 };
 
 /**
@@ -398,6 +449,18 @@ function mapChangeRow(
         snapshots: scopeSnapshots(row.entity),
       },
       channel,
+    };
+  }
+  // Read only with the inbox_row capability (left out in SQL otherwise). In the
+  // viewer's user scope: their own row (a Done watermark, a mute); in a
+  // channel's scope: every member's row of that conversation (a retracted message).
+  if (row.entity === "inbox_row") {
+    if (row.op !== "upsert" || (row.scopeKind !== "user" && row.scopeKind !== "channel")) return null;
+    const channel = channelRef(row.entityId);
+    return {
+      change: { seq, entity: "conversation", id: channel.id, op: "stale", refSeq: null },
+      ...(row.scopeKind === "channel" ? { channel } : {}),
+      inboxPosition: { value: row.scopeKind === "user" && row.refSeq !== null ? String(row.refSeq) : null, own: row.scopeKind === "user", at: row.createdAt, late: row.late, seq: row.seq },
     };
   }
   const kind = CONVERSATION_KINDS.get(row.entity);
@@ -650,8 +713,11 @@ export async function readSyncChanges(input: {
   since: ParsedSyncCursor | null;
   limit: number;
   traceQuery?: DbQueryTracer;
+  /** The inbox_row capability is served for this pull (./syncInboxRows): also read the `inbox_row` rows. */
+  inboxRows?: boolean;
 }): Promise<SyncChangesRead> {
   const { viewer, since, limit } = input;
+  const inboxRows = input.inboxRows === true;
   const traceQuery = input.traceQuery ?? untracedDbQuery;
   const lateCap = syncLateCap();
   const scopedCap = scopedRowsCap();
@@ -678,6 +744,7 @@ export async function readSyncChanges(input: {
       lateCap,
       countScoped: !since?.counted,
       scopedCap,
+      inboxRows,
     })),
     (rows) => ({ rows_count: rows.rows.length }),
   );
@@ -687,8 +754,9 @@ export async function readSyncChanges(input: {
   const horizonLag = snapshotXidSpan(horizon, head?.xmax);
   const highSeq = bigintOrNull(head?.high_seq) ?? 0n;
   const current = formatSyncChangesCursor(highSeq, horizon);
+  const currentPosition = { seq: highSeq, horizon, counted: false };
   const stats = { rowsScanned: 0, lateRows: 0, horizonLag, skippedRows: 0 };
-  if (!since) return { cursor: current, hasMore: false, reset: null, changes: [], stats };
+  if (!since) return { cursor: current, position: currentPosition, hasMore: false, reset: null, changes: [], inboxRowEntries: new Map(), stats };
 
   const page: ChangeRow[] = [];
   const late: ChangeRow[] = [];
@@ -704,6 +772,8 @@ export async function readSyncChanges(input: {
       scopeKind: row.scope_kind!,
       scopeId: row.scope_id!,
       parentId: row.parent_id,
+      createdAt: row.created_at instanceof Date ? row.created_at : row.created_at ? new Date(String(row.created_at)) : null,
+      late: isTrue(row.late),
     };
     (isTrue(row.late) ? late : page).push(change);
   }
@@ -730,7 +800,7 @@ export async function readSyncChanges(input: {
   if (minXid !== null && minSeq !== null && since.seq >= minSeq && BigInt(since.horizon) < minXid) reset = "too_old";
   if (reset === null && (isTrue(head?.forced) || late.some(resetRow))) reset = "forced";
   if (reset === null && (late.length > lateCap || Number(head?.scoped_count ?? 0) > scopedCap)) reset = "too_many";
-  if (reset) return { cursor: current, hasMore: false, reset, changes: [], stats };
+  if (reset) return { cursor: current, position: currentPosition, hasMore: false, reset, changes: [], inboxRowEntries: new Map(), stats };
 
   const hasMore = page.length > limit;
   if (hasMore) page.length = limit;
@@ -764,12 +834,29 @@ export async function readSyncChanges(input: {
     kept.push(row);
   }
   const { changes, kinds } = coalesce(kept);
+  // In seq order: each conversation keeps its last inbox_row row's watermark and its first's seq and time.
+  const inboxRowEntries = new Map<string, SyncInboxRowEntry>();
+  for (const row of [...kept].sort((a, b) => a.change.seq - b.change.seq)) {
+    const entry = row.inboxPosition;
+    if (!entry) continue;
+    const seen = inboxRowEntries.get(row.change.id);
+    inboxRowEntries.set(row.change.id, {
+      position: entry.value,
+      firstSeq: seen?.firstSeq ?? entry.seq,
+      firstAt: seen?.firstAt ?? entry.at ?? new Date(),
+      lastAt: seen && entry.at && entry.at < seen.lastAt ? seen.lastAt : entry.at ?? seen?.lastAt ?? new Date(),
+      late: (seen?.late ?? false) || entry.late,
+      own: (seen?.own ?? false) || entry.own,
+    });
+  }
   return {
     // A later page of this pull skips the too_many count its first page ran.
     cursor: formatSyncChangesCursor(cursorSeq, horizon, hasMore),
+    position: { seq: cursorSeq, horizon, counted: hasMore },
     hasMore,
     reset: null,
     changes: await withConversationStates(changes, kinds, viewer, traceQuery),
+    inboxRowEntries,
     stats,
   };
 }

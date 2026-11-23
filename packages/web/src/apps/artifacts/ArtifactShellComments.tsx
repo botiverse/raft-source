@@ -17,6 +17,7 @@ import type { ArtifactCommentDraft, ArtifactCommentId } from "@botiverse/raft-sh
 import Tooltip from "../../components/ui/Tooltip";
 import { labelWithShortcut } from "../../components/ui/LabelWithShortcut";
 import { useShortcut, useShortcutBinding } from "../../features/shortcuts";
+import { isElementNode, resizeObserverOf } from "../../utils/ownerDocument";
 import { ArtifactActorAvatar, anchorLabel } from "./ArtifactActorParts";
 import { actorKey, anchorOf, buildThreads, isResolvedThread, isShellAnchor, shellAnchorFound, shortQuote } from "./artifactComments";
 import type { ArtifactCommentThread, ShellAnchor } from "./artifactComments";
@@ -44,7 +45,8 @@ function unitRange(doc: HTMLElement, kind: UnitKind, start: number, end: number)
   const first = doc.querySelector(`[${UNIT_ATTR[kind]}="${start}"]`);
   const last = doc.querySelector(`[${UNIT_ATTR[kind]}="${end}"]`);
   if (!first || !last) return null;
-  const range = document.createRange();
+  // The shell's own document's range (an object window's, #337 PR3).
+  const range = doc.ownerDocument.createRange();
   range.setStart(first, 0);
   range.setEnd(last, last.childNodes.length);
   return range;
@@ -52,7 +54,7 @@ function unitRange(doc: HTMLElement, kind: UnitKind, start: number, end: number)
 
 /** The unit an element is in, by its data attribute. */
 function unitOf(node: Node | null, kind: UnitKind): number | null {
-  const element = node instanceof Element ? node : node?.parentElement ?? null;
+  const element = isElementNode(node) ? node : node?.parentElement ?? null;
   const unit = element?.closest(`[${UNIT_ATTR[kind]}]`);
   const n = Number(unit?.getAttribute(UNIT_ATTR[kind]));
   return Number.isInteger(n) && n > 0 ? n : null;
@@ -137,8 +139,9 @@ export default function ArtifactShellComments({ kind, path, units, children }: {
       setTops(next);
     };
     measure();
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(measure);
+    const Observer = resizeObserverOf(doc);
+    if (!Observer) return;
+    const observer = new Observer(measure);
     observer.observe(doc);
     return () => observer.disconnect();
   }, [doc, margin, marked, draftMarked, kind]);
@@ -164,8 +167,10 @@ export default function ArtifactShellComments({ kind, path, units, children }: {
   // A selection inside the document becomes the place a comment can start.
   useEffect(() => {
     if (!doc || !frame || !comments?.data.capabilities.comment) return;
+    // The selection of the document the shell is drawn in (an object window's own, #337 PR3).
+    const ownDoc = doc.ownerDocument;
     const read = (): { anchor: ShellAnchor; top: number } | null => {
-      const sel = document.getSelection();
+      const sel = ownDoc.getSelection();
       if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
       const range = sel.getRangeAt(0);
       if (!doc.contains(range.commonAncestorContainer)) return null;
@@ -181,8 +186,8 @@ export default function ArtifactShellComments({ kind, path, units, children }: {
       return { anchor: { type: kind, data: { start, end, ...(quote ? { quote } : {}) } }, top };
     };
     const update = () => setSelection(read());
-    document.addEventListener("selectionchange", update);
-    return () => document.removeEventListener("selectionchange", update);
+    ownDoc.addEventListener("selectionchange", update);
+    return () => ownDoc.removeEventListener("selectionchange", update);
   }, [doc, frame, kind, units, comments?.data.capabilities.comment]);
 
   const composeAt = comments?.composeAt;
@@ -190,8 +195,12 @@ export default function ArtifactShellComments({ kind, path, units, children }: {
   const commentOnSelection = useCallback(() => {
     if (!selection || !composeAt) return;
     const box = selectionButton?.getBoundingClientRect();
-    composeAt({ scope: "file", path, anchor: selection.anchor }, box ? { x: box.left, y: box.top, width: box.width, height: box.height } : null);
-  }, [selection, composeAt, path, selectionButton]);
+    composeAt(
+      { scope: "file", path, anchor: selection.anchor },
+      box ? { x: box.left, y: box.top, width: box.width, height: box.height } : null,
+      frame,
+    );
+  }, [selection, composeAt, path, selectionButton, frame]);
 
   // Landed on from Activity: the thread's card at its marker, once drawn; a passage not found, the list.
   const shellLanding = comments?.shellLanding ?? null;
@@ -205,7 +214,7 @@ export default function ArtifactShellComments({ kind, path, units, children }: {
     const marker = margin?.querySelector<HTMLElement>(`[data-testid='artifact-comment-marker'][data-thread-id="${CSS.escape(shellLanding)}"]`);
     if (!marker) return;
     const box = marker.getBoundingClientRect();
-    landBubble({ x: box.left, y: box.top, width: box.width, height: box.height });
+    landBubble({ x: box.left, y: box.top, width: box.width, height: box.height }, marker);
   }, [shellLanding, landBubble, loaded, marked, margin]);
   // A new comment left unsent here before a reload (useUnsentCommentOffer): its card opens again at
   // the document's right edge level with its passage, once drawn; a passage not found (the file
@@ -221,7 +230,7 @@ export default function ArtifactShellComments({ kind, path, units, children }: {
     const unit = doc?.querySelector(`[${UNIT_ATTR[kind]}="${unsentAt.anchor.data.start}"]`);
     if (!unit) return;
     const box = unit.getBoundingClientRect();
-    reopenUnsent({ x: box.right, y: box.top, width: 0, height: box.height });
+    reopenUnsent({ x: box.right, y: box.top, width: 0, height: box.height }, unit);
   }, [unsentAt, reopenUnsent, path, kind, units, doc]);
   // ⌘⌥M / Ctrl+Alt+M (or the person's keys) while text in the file is selected. After a mouse selection focus is on
   // the viewer (or the page), not in the file, so the shortcut is heard wherever the focus is while a selection exists.
@@ -301,7 +310,7 @@ function ShellMarker({ thread, anchor, active }: { thread: ArtifactCommentThread
       return;
     }
     const box = event.currentTarget.getBoundingClientRect();
-    openThreadBubble(id, { x: box.left, y: box.top, width: box.width, height: box.height });
+    openThreadBubble(id, { x: box.left, y: box.top, width: box.width, height: box.height }, event.currentTarget);
   }, [setActive, panelOpen, openThreadBubble, id]);
   const enter = useCallback(() => setHovered?.(id), [setHovered, id]);
   const leave = useCallback(() => setHovered?.(null), [setHovered]);

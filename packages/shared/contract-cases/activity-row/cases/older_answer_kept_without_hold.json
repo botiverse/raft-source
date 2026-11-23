@@ -1,0 +1,23 @@
+{
+  "formatVersion": 1,
+  "id": "older_answer_kept_without_hold",
+  "rule": "position",
+  "title": "After a read, a late answer from before it is still kept out, however long after it arrives: the guard is the position, not a timed hold",
+  "why": "A client may hold a row read for a while after the viewer reads it (a local read hold). The rule has no clock: the row is kept by its delivered position alone, so an answer older than it changes nothing whether it lands at once or after any hold has expired. A late answer from before the read (the read not yet on the server) must not bring the read row's unread back.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow, mergeAnswer; no time input)",
+      "packages/web/src/store/inboxRowPosition.ts (mergeAnswerByPosition, with inbox_row_position_v1 on)"
+    ]
+  },
+  "given": { "row": { "unreadCount": 2, "hasMention": true, "position": "101", "mentionOnly": false } },
+  "steps": [
+    { "act": "read", "seq": "101" },
+    { "act": "answer", "row": { "unreadCount": 1, "hasMention": true, "position": "100", "mentionOnly": false } }
+  ],
+  "checkpoints": [
+    { "afterStep": 1, "row": { "unreadCount": 0, "hasMention": false, "position": "101" }, "reread": false }
+  ],
+  "expect": { "row": { "unreadCount": 0, "hasMention": false, "position": "101" }, "reread": false }
+}

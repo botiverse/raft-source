@@ -24,7 +24,7 @@ import { useAgentStore } from "../../store/agentStore";
 import { useServerStore } from "../../store/serverStore";
 import { useChannelStore } from "../../store/channelStore";
 import { useChannelMembers } from "../../hooks/useChannelMembers";
-import { isLocalProjectionMember } from "../../utils/channelLocalMembership";
+import { isAddableToChannel, isLocalProjectionMember } from "../../utils/channelLocalMembership";
 import { Button, Card, IconTile } from "@botiverse/raft-ui";
 import MemberPicker, { agentCandidate, serverMemberCandidate } from "../pickers/MemberPicker";
 import type { MemberKind } from "../pickers/MemberPicker";
@@ -107,8 +107,8 @@ export default function AddMembersDialog({
     return (prefilledHumanIds ?? [])
       .filter((id) => !existingHumanIds.has(id))
       .map((id) => members.find((m) => m.userId === id))
-      .filter((m): m is NonNullable<typeof m> => !!m);
-  }, [prefilledHumanIds, existingHumanIds, members]);
+      .filter((m): m is NonNullable<typeof m> => !!m && isAddableToChannel(m, channel));
+  }, [prefilledHumanIds, existingHumanIds, members, channel]);
 
   const candidateAgents = useMemo(() => {
     return (prefilledAgentIds ?? [])

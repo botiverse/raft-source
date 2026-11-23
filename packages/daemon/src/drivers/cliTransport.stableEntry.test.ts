@@ -85,6 +85,16 @@ writeFileSync(process.env.RAFT_TEST_OUT, JSON.stringify(Object.fromEntries(pick.
     assert.equal(old.SLOCK_AGENT_PROXY_TOKEN_FILE, tokenFile("b5b6d993-old"));
     assert.equal(old.RAFT_CLI_ENTRY, undefined);
 
+    // Another agent's process is refused by the stable entry too; the CLI never runs.
+    rmSync(outPath, { force: true });
+    const foreign = spawnSync(stableRaft, ["server", "info"], {
+      env: { ...second.spawnEnv, SLOCK_AGENT_ID: "agent-other", RAFT_TEST_OUT: outPath },
+      encoding: "utf8",
+    });
+    assert.equal(foreign.status, 1);
+    assert.equal(foreign.stderr, `raft: this CLI belongs to agent ${AGENT}; the calling process is agent agent-other. Use your own raft command.\n`);
+    assert.equal(existsSync(outPath), false);
+
     // Launch-wrapper upgrades never touch the stable entry.
     const before = readFileSync(stableRaft, "utf8");
     const scanned = upgradeExistingAgentWrappers(path.dirname(second.slockDir), second.slockDir, "linux");
@@ -111,7 +121,7 @@ test("on Windows the stable entry has .cmd and .ps1 flavors that say they are th
     const result = await prepareCliTransport(makeCtx(tmp, "launch-w", "/fake/cli.js"), {}, "win32");
     const stableDir = buildCliStableEntryDir(path.join(tmp, "home"), AGENT);
     const cmd = readFileSync(path.join(stableDir, "raft.cmd"), "utf8");
-    assert.match(cmd, /^@echo off\r\n@REM .*stable entry/);
+    assert.match(cmd, /^@echo off\r\n(?:.*\r\n)*?@REM .*stable entry/);
     assert.match(cmd, /\r\nsetlocal\r\n/);
     assert.match(cmd, /set "RAFT_CLI_ENTRY=stable_entry"/);
     assert.match(cmd, new RegExp(`set "SLOCK_CLI_TRANSPORT_DIR=${result.slockDir.replace(/[\\.]/g, "\\$&")}"`));

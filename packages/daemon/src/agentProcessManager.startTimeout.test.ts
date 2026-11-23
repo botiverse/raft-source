@@ -180,7 +180,7 @@ test("a start timeout is reported as a typed runtime_start_timeout start failure
     const failure = h.sent.find((m): m is Extract<MachineToServerMessage, { type: "agent:activity" }> =>
       m.type === "agent:activity" && m.detailKind === "runtime_unavailable" && m.launchId === "launch-1");
     assert.ok(failure, "a typed start-failure activity");
-    assert.deepEqual(failure.spawnFailure, { reason: "runtime_start_timeout", model: MODEL });
+    assert.deepEqual(failure.spawnFailure, { reason: "runtime_start_timeout", model: MODEL, message: failure.detail });
     assert.equal(
       failure.detail,
       `OpenCode did not finish starting within 1 second. The selected model (${MODEL}, free tier) may be slow to respond, queued or rate-limited by its provider. Try again later, or switch to another model.`,

@@ -15,6 +15,8 @@ comments and the forward dialog. One component per file, named exports.
     (module-scope cache, subscribed to `authStore` on import).
   - `pendingMentionActions.ts`: notify/add results for mentions that did not
     reach anyone, and the failed-send draft helpers.
+  - `echoedSend.ts`: a send that rejects after its socket echo (same
+    `randomId`) landed counts as sent, no draft restore (#triage:#482).
   - `pendingFilePreview.ts`, `composerTypes.ts` (`PendingFile`,
     `ComposerReference`), `composerPointerHandlers.ts`.
   - `composerSendKey.ts`: how the box sends, the account's choice

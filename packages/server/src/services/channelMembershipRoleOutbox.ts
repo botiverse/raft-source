@@ -1,4 +1,4 @@
-import { and, asc, eq, lt } from "drizzle-orm";
+import { and, asc, eq, lt, sql } from "drizzle-orm";
 import type { Server as SocketServer } from "socket.io";
 import { clearClockInterval, currentDate, noopTracer, setClockInterval, type Tracer } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
@@ -8,6 +8,43 @@ import { withTraceRoot } from "../tracing/semanticTrace";
 const DEFAULT_INTERVAL_MS = 5_000;
 const DEFAULT_BATCH_SIZE = 50;
 const MAX_DELIVERY_ATTEMPTS = 5;
+
+/**
+ * Right after a committed channel role change (the web route's or the Agent
+ * API's): the channel's audience rereads its members, the member gets its new
+ * authority, and the event is marked sent. A failure here leaves the event
+ * pending for the outbox worker below rather than failing the request.
+ */
+export async function deliverChannelMembershipRoleChange(
+  io: SocketServer | undefined,
+  channel: { id: string; serverId: string; type: string },
+  change: { targetType: "user" | "agent"; targetId: string; channelRole: "admin" | "member"; authorityRevision: number; eventId: string | null },
+): Promise<void> {
+  if (change.targetType === "user") {
+    io?.to(`user:${change.targetId}`).emit("channel:updated", { channel: { ...channel, joined: true } });
+  }
+  io?.to(channel.type === "private" ? `channel:${channel.id}` : `server:${channel.serverId}`)
+    .emit("channel:members-updated", { channelId: channel.id });
+  io?.to(`${change.targetType}:${change.targetId}`).emit("channel:authority-updated", {
+    channelId: channel.id,
+    channelRole: change.channelRole,
+    authorityRevision: change.authorityRevision,
+  });
+  if (!change.eventId) return;
+  try {
+    await getDb().update(channelMembershipRoleEvents).set({
+      deliveryStatus: "sent",
+      deliveryAttempts: sql`${channelMembershipRoleEvents.deliveryAttempts} + 1`,
+      deliveredAt: currentDate(),
+      lastDeliveryError: null,
+    }).where(eq(channelMembershipRoleEvents.id, change.eventId));
+  } catch (deliveryError) {
+    // The role mutation and durable outbox row are already committed.
+    // Leave the event pending for retry rather than turning a successful
+    // authority change into an ambiguous HTTP 500.
+    console.error("Failed to mark channel role event delivered:", deliveryError);
+  }
+}
 
 export async function drainChannelMembershipRoleOutbox(input: {
   io: SocketServer;

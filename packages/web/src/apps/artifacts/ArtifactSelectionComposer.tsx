@@ -14,10 +14,12 @@ import {
 import { AddCommentIcon } from "@botiverse/ricons";
 import { CommentMarker, PopoverBody } from "@botiverse/raft-ui/wip";
 import type { AnnotationRect } from "@botiverse/porthole";
+import { isElementNode, isHTMLElementNode, useOwnerDocument } from "../../utils/ownerDocument";
 
 import { DraftPlace } from "./ArtifactActorParts";
 import { ArtifactCardShell } from "./ArtifactCardShell";
 import { useCardTabOut } from "./artifactCardTabOut";
+import { useSoftKeyboardBox } from "./artifactSoftKeyboard";
 import { anchorAt } from "./ArtifactCommentBubble";
 import type { ArtifactCommentBoxKeep } from "./ArtifactCommentBox";
 import { ArtifactComposeCard } from "./ArtifactComposeCard";
@@ -25,7 +27,7 @@ import { useArtifactComments } from "./ArtifactCommentsContext";
 import type { SentFrom } from "./ArtifactCommentsContext";
 import { useArtifactReview } from "./ArtifactReviewContext";
 import type { ArtifactReviewSelection } from "./ArtifactReviewContext";
-import { EDGE_MARKER_PX, edgeMarkerPlace, sameRect, selectionPlace, sheetLift } from "./artifactTrackedPlaces";
+import { composerPlace, EDGE_MARKER_PX, edgeMarkerPlace, sameRect, sheetLift } from "./artifactTrackedPlaces";
 import type { PlaceStore, SelectionFollow } from "./artifactTrackedPlaces";
 import { useArmed } from "./useArmed";
 import { useDismissable } from "./useArtifactDismiss";
@@ -86,30 +88,42 @@ export function SelectionBox({ selection, phone, viewer }: { selection: Artifact
   const [atEdge, setAtEdge] = useState(false);
   if (atEdge && edge === null) setAtEdge(false);
   const hidden = edge !== null && !atEdge;
+  // A picked element taller than half the frame: inside it, at a point (`composerPlace`, #proj-workspace:#315).
+  const element = selection.place.type === "annotation" && selection.place.data.kind === "element";
   const place = phone ? null
-    : attached?.inView ? selectionPlace(attached, frameBox)
+    : attached?.inView ? composerPlace(attached, frameBox, { element, point: selection.point })
     : edge ? { x: edge.x, y: edge.y, width: EDGE_MARKER_PX, height: edge.edge === "top" ? 0 : EDGE_MARKER_PX }
     : null;
   // Where it is drawn (its last place while hidden), and the key of its last move or showing again,
   // which arms it against presses (THREAT_MODEL §6: it moves at the page's word). Only a real move:
   // the same place again changes nothing.
   // oxlint-disable-next-line react-doctor/no-derived-useState -- where the composer was last drawn and the move that put it there, adjusted during render as the frame's reports come (React's "adjusting state when a prop changes").
-  const [moved, setMoved] = useState<{ rect: AnnotationRect | null; key: number | null; hidden: boolean }>({ rect: selection.rect, key: null, hidden: false });
+  const [moved, setMoved] = useState<{ rect: AnnotationRect | null; liveAnchor: typeof selection.liveAnchor; key: number | null; hidden: boolean }>({ rect: selection.rect, liveAnchor: selection.liveAnchor ?? null, key: null, hidden: false });
   if (hidden && !moved.hidden) setMoved({ ...moved, hidden: true });
-  if (!hidden && place && (moved.hidden || !moved.rect || !sameRect(moved.rect, place))) setMoved({ rect: place, key: (moved.key ?? 0) + 1, hidden: false });
+  if (!hidden && place && (moved.hidden || !moved.rect || !sameRect(moved.rect, place))) {
+    const nextLiveAnchor = selection.liveAnchor && frameBox
+      ? { element: selection.liveAnchor.element, dx: place.x - frameBox.left, dy: place.y - frameBox.top }
+      : selection.liveAnchor ?? null;
+    setMoved({ rect: place, liveAnchor: nextLiveAnchor, key: (moved.key ?? 0) + 1, hidden: false });
+  }
   const moveArmed = useArmed(moved.key);
   const shownRect = moved.rect ?? selection.rect;
+  const shownLiveAnchor = moved.liveAnchor ?? selection.liveAnchor ?? null;
+  const boundary = viewer();
   // The Comment button sits at the selection's end; the box opens under it, from the same corner.
-  const anchor = useMemo(() => anchorAt(shownRect), [shownRect]);
+  const anchor = useMemo(() => anchorAt(shownRect, shownLiveAnchor), [shownRect, shownLiveAnchor]);
   const { clearSelection, commentSent, setComposerHasOwnText, addDraft } = review;
   const label = formatMessage({ id: writing ? "artifacts.comments.boxLabel" : "artifacts.review.optionsLabel" });
   const path = comments?.shownPath ?? null;
   const mode = useMemo(() => ({ kind: "new" as const, target: { scope: "file" as const, path: path ?? "", anchor: selection.place }, replyTo: null }), [path, selection.place]);
   // Sent, the new thread's card opens where the composer is then (read as the answer comes).
-  const [sentFrom] = useState<SentFrom>(() => ({ rect: selection.rect, bubbleKey: null }));
+  const [sentFrom] = useState<SentFrom>(() => ({ rect: selection.rect, liveAnchor: selection.liveAnchor ?? null, bubbleKey: null }));
   useLayoutEffect(() => {
+    // oxlint-disable-next-line react/immutability -- a holder kept for the composer's life (useState only gives it a stable identity; it has no setter and nothing renders from it), read when the send answers.
     sentFrom.rect = shownRect;
-  }, [sentFrom, shownRect]);
+    // oxlint-disable-next-line react/immutability -- keep the captured live anchor in sync with shownRect for revealSent handoff.
+    sentFrom.liveAnchor = shownLiveAnchor;
+  }, [sentFrom, shownRect, shownLiveAnchor]);
   // Send posts it now; Save Draft keeps it with the others until they are sent together (the bar).
   // With drafts already waiting, Enter saves one more.
   const draftOption = useDraftOption(addDraft);
@@ -200,7 +214,7 @@ export function SelectionBox({ selection, phone, viewer }: { selection: Artifact
     }
     // A press on its own marker at the frame's edge shows it: not a press outside it.
     const target = details?.event?.target;
-    if (details?.reason === "outside-press" && target instanceof Element && target.closest("[data-testid='artifact-review-composer-edge-popup']")) return;
+    if (details?.reason === "outside-press" && isElementNode(target) && target.closest("[data-testid='artifact-review-composer-edge-popup']")) return;
     change(open, details);
   }, [writing, clearSelection, change]);
   // The box's Tab past its ends: as Esc, its words kept and the focus on the viewer (`finalFocus`).
@@ -210,12 +224,14 @@ export function SelectionBox({ selection, phone, viewer }: { selection: Artifact
   // control): a header button focused as by the keyboard opens its tooltip, which takes that next
   // Esc for itself. Moved here, as Base UI would move it only to a tabbable element (the viewer is
   // not one). Focus elsewhere (the page, whose Esc closed the box) stays there.
+  // The composer's own document: an object window's has its own focus (#337 PR3).
+  const ownDoc = useOwnerDocument();
   const finalFocus = useCallback(() => {
-    const active = document.activeElement;
+    const active = ownDoc.activeElement;
     // After React's commit, which would give focus back to what had it as it began (artifactDraftDelete).
-    if (!active || active === document.body || active.closest("[data-testid='artifact-review-composer']")) queueMicrotask(() => viewer()?.focus({ preventScroll: true }));
+    if (!active || active === ownDoc.body || active.closest("[data-testid='artifact-review-composer']")) queueMicrotask(() => viewer()?.focus({ preventScroll: true }));
     return false;
-  }, [viewer]);
+  }, [viewer, ownDoc]);
 
   // Hidden with the focus in it (visibility hidden may drop it to the body): back where it was when
   // it shows again, unless the person put the focus somewhere else meanwhile. Raft's own press on
@@ -223,17 +239,17 @@ export function SelectionBox({ selection, phone, viewer }: { selection: Artifact
   const focusWhenShown = useRef<HTMLElement | null>(null);
   const markerPressed = useRef(false);
   useLayoutEffect(() => {
-    const active = document.activeElement;
+    const active = ownDoc.activeElement;
     if (hidden) {
-      if (active instanceof HTMLElement && popup.current?.contains(active)) focusWhenShown.current = active;
+      if (isHTMLElementNode(active) && popup.current?.contains(active)) focusWhenShown.current = active;
       return;
     }
     const back = focusWhenShown.current;
     const pressedMarker = markerPressed.current;
     focusWhenShown.current = null;
     markerPressed.current = false;
-    if (back?.isConnected && (pressedMarker || !active || active === document.body || active === back)) back.focus({ preventScroll: true });
-  }, [hidden]);
+    if (back?.isConnected && (pressedMarker || !active || active === ownDoc.body || active === back)) back.focus({ preventScroll: true });
+  }, [hidden, ownDoc]);
   const showAtEdge = useCallback(() => {
     markerPressed.current = true;
     focusWhenShown.current ??= popup.current?.querySelector<HTMLElement>("textarea") ?? null;
@@ -248,21 +264,31 @@ export function SelectionBox({ selection, phone, viewer }: { selection: Artifact
   }, [moveArmed]);
 
   // On a phone, the frame lifted so the selection is above the sheet (`sheetLift`), as the page
-  // scrolls or reflows; back in place once the sheet goes.
+  // scrolls or reflows, the sheet grows or shrinks, or the keyboard comes and goes (the sheet sits
+  // on it then, ArtifactCardShell); back in place once the sheet goes.
   const frameRegion = comments?.frame.box ?? null;
   const lifted = useRef(0);
+  const keyboardInset = useSoftKeyboardBox(phone && sheet !== null)?.inset ?? null;
+  const [sheetHeight, setSheetHeight] = useState(0);
+  useEffect(() => {
+    if (!sheet || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => setSheetHeight(sheet.offsetHeight));
+    observer.observe(sheet);
+    return () => observer.disconnect();
+  }, [sheet]);
   useLayoutEffect(() => {
     const box = frameRegion?.current;
     if (!phone || !box || !sheet || !attached) return;
     const frame = box.getBoundingClientRect();
     const top = frame.top + lifted.current;
-    const sheetTop = document.documentElement.clientHeight - sheet.offsetHeight;
+    // With the keyboard up, from the edge the sheet sits on (keyboardSheetStyle's `bottom`), not the page's.
+    const sheetTop = (keyboardInset === null ? document.documentElement.clientHeight : window.innerHeight - keyboardInset) - sheet.offsetHeight;
     const target = { top: attached.documentRect.y - attached.scroll.y, bottom: attached.documentRect.y + attached.documentRect.height - attached.scroll.y };
     const next = sheetLift(target, sheetTop - top, frame.height);
     if (next === lifted.current) return;
     lifted.current = next;
     liftFrame(box, next);
-  }, [phone, sheet, attached, frameRegion]);
+  }, [phone, sheet, attached, frameRegion, keyboardInset, sheetHeight]);
   useEffect(() => () => {
     const box = frameRegion?.current;
     if (box && lifted.current > 0) liftFrame(box, 0);
@@ -288,14 +314,21 @@ export function SelectionBox({ selection, phone, viewer }: { selection: Artifact
   // The marker's place: a box of its width and no height at the edge, its popup under it from its start.
   const edgeX = edge?.x ?? 0;
   const edgeY = edge?.y ?? 0;
-  const edgeAnchor = useMemo(() => anchorAt({ x: edgeX, y: edgeY, width: EDGE_MARKER_PX, height: 0 }), [edgeX, edgeY]);
+  const frameEl = selection.liveAnchor?.element ?? null;
+  const frameLeft = frameBox?.left ?? null;
+  const frameTop = frameBox?.top ?? null;
+  const edgeAnchor = useMemo(() => anchorAt(
+    { x: edgeX, y: edgeY, width: EDGE_MARKER_PX, height: 0 },
+    frameEl && frameLeft !== null && frameTop !== null
+      ? { element: frameEl, dx: edgeX - frameLeft, dy: edgeY - frameTop }
+      : null,
+  ), [edgeX, edgeY, frameEl, frameLeft, frameTop]);
   // Its own popover never closes itself: it is there exactly while the composer is hidden.
   const keepMarker = useCallback(() => {}, []);
   // One surface for both of its states (ArtifactCardShell), so the Comment button becomes the box
   // in place: the button is no card (`none`: raft-ui's TextSelectionToolbar is its own surface, and
   // on a phone the quote and the button are the sheet's body and footer), the box is the card.
   const guarded = moveArmed ? guardPress : undefined;
-  const boundary = viewer();
   const sheetPart = useMemo(() => ({ ref: setSheet }), []);
   const popoverPart = useMemo(() => ({
     ref: popup,

@@ -6,6 +6,7 @@ import { isPortableAbsolutePath, normalizeAgentMigrationSymlinkTarget } from "@b
 import {
   agentMigrationTransferSummarySchema,
   MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT,
+  MAX_AGENT_MIGRATION_SKIPPED_UNREADABLE_PATHS,
   type AgentMigrationTransferSummary,
 } from "@botiverse/raft-shared";
 
@@ -105,6 +106,30 @@ const REGENERABLE_DIRECTORY_NAME_SET = new Set(REGENERABLE_DIRECTORY_NAMES);
 
 const EXCLUDED_IGNORED_SUMMARY_LARGEST = 5;
 
+/** A read refused for lack of permission (a file or directory owned by another user, say). */
+export function isPermissionError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return code === "EACCES" || code === "EPERM";
+}
+
+/**
+ * Paths a move never leaves behind: the workspace itself, `MEMORY.md` and
+ * `notes/`. Without them the agent loses its memory, so one that cannot be
+ * read fails the move (AgentMigrationKeyPathUnreadableError) instead of being
+ * skipped like any other unreadable path.
+ */
+export function isKeyWorkspacePath(workspaceRelativePath: string): boolean {
+  return workspaceRelativePath === "" || workspaceRelativePath === "MEMORY.md" || isNotesPath(workspaceRelativePath);
+}
+
+/** `MEMORY.md`, `notes/` or the workspace could not be read; the message names which (URI-encoded). */
+export class AgentMigrationKeyPathUnreadableError extends Error {
+  constructor(readonly workspaceRelativePath: string) {
+    super(`MIGRATION_WORKSPACE_KEY_PATH_UNREADABLE:path=${encodeURIComponent(workspaceRelativePath)}`);
+    this.name = "AgentMigrationKeyPathUnreadableError";
+  }
+}
+
 /** Whether a moved workspace path is the agent's `notes/` directory or under it. */
 export function isNotesPath(workspaceRelativePath: string): boolean {
   return workspaceRelativePath === "notes" || workspaceRelativePath.startsWith("notes/");
@@ -129,6 +154,14 @@ export function summarizeAgentMigrationTransfer(input: {
    * `excludedIgnoredPartial`. An older Server's strict schema rejects it.
    */
   ignoredPartial?: boolean;
+  /**
+   * Workspace paths left behind because they could not be read (EACCES/EPERM),
+   * sorted, and how many there were in all. Added as
+   * `skippedUnreadable` only when both ends accept it
+   * (SERVER_CAPABILITY_MIGRATION_SKIPPED_UNREADABLE_V1); an older Server's
+   * strict schema rejects it.
+   */
+  skippedUnreadable?: { count: number; paths: string[] };
 }): AgentMigrationTransferSummary {
   const excludedRegenerableByCategory = {
     thirdPartyDependencies: 0,
@@ -163,6 +196,14 @@ export function summarizeAgentMigrationTransfer(input: {
       ? {
         ...summarizeExcludedIgnored(input.excludedIgnored, input.reportIgnoredBySource === true),
         ...(input.ignoredPartial === true ? { excludedIgnoredPartial: true as const } : {}),
+      }
+      : {}),
+    ...(input.skippedUnreadable && input.skippedUnreadable.count > 0
+      ? {
+        skippedUnreadable: {
+          count: Math.min(input.skippedUnreadable.count, MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT),
+          paths: input.skippedUnreadable.paths.slice(0, MAX_AGENT_MIGRATION_SKIPPED_UNREADABLE_PATHS),
+        },
       }
       : {}),
   });
@@ -347,12 +388,20 @@ async function walkWorkspace(
   let entries;
   try {
     entries = await readdir(absoluteDir, { withFileTypes: true });
-  } catch {
-    state.unreachable.push({
-      path: relativeDir || ".",
-      reason: "read_error",
-    });
-    return;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    // Gone, or no longer a directory, since it was listed: skipped like a
+    // file that vanished. The workspace itself must exist.
+    if ((code === "ENOENT" || code === "ENOTDIR") && relativeDir !== "") return;
+    if (isPermissionError(error)) {
+      // The agent's memory must not be left behind: the move fails instead.
+      if (isKeyWorkspacePath(relativeDir)) throw new AgentMigrationKeyPathUnreadableError(relativeDir || ".");
+      state.unreachable.push({ path: relativeDir, reason: "read_error", detail: code });
+      return;
+    }
+    // Anything else (EMFILE, EIO, ...) fails the move: a later try may well
+    // read it, while a silently dropped directory would not come back.
+    throw error;
   }
 
   entries.sort((a, b) => a.name.localeCompare(b.name));

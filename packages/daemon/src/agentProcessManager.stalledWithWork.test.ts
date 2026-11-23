@@ -9,14 +9,18 @@
 // nothing) and the acceptance test replaces nothing at the threshold (only
 // the sweep at minute 20 would); drop the delivery-hold fact and the three
 // hold tests replace the process at the sweep; drop the streak cap and the
-// loop test replaces a third time.
+// loop test replaces a third time; drop the app-notice fact (or the
+// reconcile at a refused busy notice) and the app-notice test arms no
+// deadline; drop the after-turn wake at the stall stop and nothing restarts.
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { asAxSurfaceText, type AgentMessage, type MachineToServerMessage } from "@botiverse/raft-shared";
+import { createAgentAppInboxStore, type AgentAppInboxStore } from "./agentAppInbox";
 import { AgentProcessManager } from "./agentProcessManager";
+import { REMINDER_AGENT_INBOX_REGISTRY } from "./apps/reminder/inboxDefinition";
 import { setDaemonFetchImplForTests } from "./daemonFetch";
 import type { ParsedEvent, RuntimeDriver } from "./drivers/index";
 import { providerLimitCredentialKey } from "./providerLimitLedger";
@@ -66,6 +70,11 @@ type Harness = {
   /** Runtime events on the newest process. */
   emit: (events: ParsedEvent[]) => Promise<void>;
   sweep: () => Promise<void>;
+  /** What each spawn was started with, and every stdin write (with its mode). */
+  spawnPrompts: string[];
+  writes: Array<{ text: string; mode: string | undefined }>;
+  /** The runtime refuses input written into a running turn (codex between steerable points). */
+  refuseBusyWrites: { value: boolean };
 };
 
 let seq = 0;
@@ -79,10 +88,13 @@ function message(content: string): AgentMessage {
   };
 }
 
-async function withManager(run: (h: Harness) => Promise<void>): Promise<void> {
+async function withManager(run: (h: Harness) => Promise<void>, options: { appInbox?: AgentAppInboxStore } = {}): Promise<void> {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "raft-stalled-with-work-test-"));
   const children: FakeChild[] = [];
   const parsed = new Map<string, ParsedEvent[]>();
+  const spawnPrompts: string[] = [];
+  const writes: Harness["writes"] = [];
+  const refuseBusyWrites = { value: false };
   const driver: RuntimeDriver = {
     id: "prompt-test",
     lifecycle: { kind: "persistent", stdin: "direct", inFlightWake: "steer" },
@@ -93,13 +105,18 @@ async function withManager(run: (h: Harness) => Promise<void>): Promise<void> {
     busyDeliveryMode: "direct",
     supportsNativeStandingPrompt: true,
     buildSystemPrompt: () => asAxSurfaceText("standing"),
-    spawn: () => {
+    spawn: (ctx) => {
+      spawnPrompts.push(String(ctx.prompt ?? ""));
       const child = new FakeChild();
       children.push(child);
       return { process: child as unknown as ChildProcess };
     },
     parseLine: (line) => parsed.get(line) ?? [],
-    encodeStdinMessage: (text) => text,
+    encodeStdinMessage: (text, _sessionId, opts) => {
+      if (refuseBusyWrites.value && opts?.mode === "busy") return null;
+      writes.push({ text, mode: opts?.mode });
+      return text;
+    },
   };
   const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const url = String(input instanceof Request ? input.url : input);
@@ -122,6 +139,7 @@ async function withManager(run: (h: Harness) => Promise<void>): Promise<void> {
     daemonVersion: "1.0.1-test", computerVersion: "2.0.1-test",
     serverUrl: "https://raft.example.test", driverResolver: () => driver,
     runtimeStartScheduler: { minStartIntervalMs: 0 },
+    ...(options.appInbox ? { appInboxForAgent: () => options.appInbox! } : {}),
   });
   const events: Harness["events"] = [];
   const internals = manager as any;
@@ -146,6 +164,9 @@ async function withManager(run: (h: Harness) => Promise<void>): Promise<void> {
       internals,
       process: () => internals.agents.get(AGENT),
       emit,
+      spawnPrompts,
+      writes,
+      refuseBusyWrites,
       sweep: async () => {
         await internals.sweepColdIdleRuntimes();
         await settle();
@@ -266,6 +287,67 @@ test("stalled without queued messages is only a fact (C15): not replaced, no dea
     expect(h.children[0]!.killedSignals).toEqual([]);
     expect(replacements(h)).toEqual([]);
   });
+});
+
+// Production (Computer 1.25.4): a reminder hit a busy turn, the runtime
+// refused the busy write and the busy flag could not be cleared, so the
+// notice waited for a turn end that never came. With no message queued the
+// silent turn was only a fact (C15): the agent sat behind it for good.
+test("stalled past the threshold with only an app Inbox notice waiting (no messages): replaced at the threshold, the notice reaches the new process", async () => {
+  const store = createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY });
+  await withManager(async (h) => {
+    const t0 = Date.now();
+    await startBusyWithQueued(h, []);
+    expect(h.process()!.stallDeadlineTimer, "precondition: no queued work, no deadline").toBeUndefined();
+
+    h.refuseBusyWrites.value = true;
+    const minted = store.mint({
+      appId: "system.reminder",
+      notificationClass: "due",
+      sourceRef: { kind: "reminder", id: "11111111-1111-4111-8111-111111111111", revision: "1" },
+    });
+    if (!minted.ok) throw new Error("failed to mint the reminder item");
+    expect(await h.manager.notifyAgentAppInbox(AGENT, minted.item), "the busy write is refused").toBe(false);
+    expect(named(h, "daemon.agent.app_inbox_notice").map((attrs) => attrs.outcome)).toEqual(["write_failed"]);
+    expect(h.process()!.stallDeadlineTimer, "the refused notice arms one deadline").toBeDefined();
+
+    await advance(THRESHOLD_MS - 1 - (Date.now() - t0));
+    expect(h.children[0]!.killedSignals, "not yet past the threshold").toEqual([]);
+
+    await advance(1);
+    await settle(() => h.children.length > 1, 2_000);
+    expect(h.children[0]!.killedSignals, "killed without waiting for idle (E2)").toEqual(["SIGTERM"]);
+    expect(replacements(h)).toEqual([expect.objectContaining({ trigger: "stall_deadline", streak: 1, app_inbox_notice_waiting: true })]);
+    expect(h.children.length, "started again for the waiting notice").toBe(2);
+    expect(named(h, "daemon.agent.app_inbox_notice").map((attrs) => attrs.outcome)).toEqual(["write_failed", "restart_requested"]);
+    expect(named(h, "daemon.agent.app_inbox_notice").at(-1)).toMatchObject({ item_id: minted.item.itemId, busy_retry_attempts: 1 });
+    expect(h.spawnPrompts.at(-1), "the restart carries the notice").toContain("App items pending: 1");
+
+    await h.emit([{ kind: "session_init", sessionId: "session-1" }]);
+    expect(h.process()!.sessionId, "the session is resumed").toBe("session-1");
+  }, { appInbox: store });
+});
+
+test("an app notice that is advisory, or whose item the agent acknowledged in its turn, is no queued work: not replaced", async () => {
+  for (const variant of ["advisory", "acknowledged"] as const) {
+    const store = createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY });
+    await withManager(async (h) => {
+      await startBusyWithQueued(h, []);
+      h.refuseBusyWrites.value = true;
+      const minted = store.mint({
+        appId: "system.reminder",
+        notificationClass: "due",
+        sourceRef: { kind: "reminder", id: "11111111-1111-4111-8111-111111111111", revision: "1" },
+      });
+      if (!minted.ok) throw new Error("failed to mint the reminder item");
+      expect(await h.manager.notifyAgentAppInbox(AGENT, minted.item, variant === "advisory" ? { startStoppedAgent: false } : undefined)).toBe(false);
+      if (variant === "acknowledged") expect(store.ack(minted.item.itemId)).toBe(true);
+      await advance(THRESHOLD_MS);
+      await h.sweep();
+      expect(h.children[0]!.killedSignals, variant).toEqual([]);
+      expect(replacements(h), variant).toEqual([]);
+    }, { appInbox: store });
+  }
 });
 
 const HOLDS: Array<{ hold: string; apply: (h: Harness, ap: Process) => void }> = [

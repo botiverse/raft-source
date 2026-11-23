@@ -12,18 +12,20 @@ export function ArtifactListComposeProvider({ children }: { children: ReactNode 
   const setPanelOpen = comments?.setPanelOpen;
   const reviewShown = comments?.reviewShown ?? null;
   const showAllComments = comments?.showAllComments;
-  const [compose, setCompose] = useState<{ key: number; text: string } | null>(null);
+  const [compose, setCompose] = useState<ArtifactListComposeState["compose"]>(null);
   // The list closed: the words handed to its box go (React's "adjusting state when a prop changes";
   // kept, its next opening would put them in again).
   if (!panelOpen && compose !== null) setCompose(null);
   const composeKey = useRef(0);
-  const composeInList = useCallback((text: string) => {
+  const open = useCallback((text: string, write: boolean) => {
     composeKey.current += 1;
-    setCompose({ key: composeKey.current, text });
+    setCompose(write ? { key: composeKey.current, text, write: true } : { key: composeKey.current, text });
     setPanelOpen?.(true);
     // A list showing one review alone has no foot box (what is sent wouldn't show there): every comment.
     if (reviewShown !== null) showAllComments?.();
   }, [setPanelOpen, reviewShown, showAllComments]);
-  const value = useMemo<ArtifactListComposeState>(() => ({ compose, composeInList }), [compose, composeInList]);
+  const composeInList = useCallback((text: string) => open(text, false), [open]);
+  const writeInList = useCallback(() => open("", true), [open]);
+  const value = useMemo<ArtifactListComposeState>(() => ({ compose, composeInList, writeInList }), [compose, composeInList, writeInList]);
   return <ArtifactListComposeContext.Provider value={value}>{children}</ArtifactListComposeContext.Provider>;
 }

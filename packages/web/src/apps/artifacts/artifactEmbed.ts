@@ -61,11 +61,14 @@ export type LaterCopy = "copied" | "skipped" | "failed";
  * `ClipboardItem`'s promise of the text (Safari, Chrome and Firefox take one), and resolves when the
  * text does. Where that isn't there or is refused, it falls back to writing the text once known (a
  * browser without the gesture rule takes that). `text` resolves null when nothing is to be copied
- * (the server refused): then nothing is written, and `skipped`. Never rejects.
+ * (the server refused): then nothing is written, and `skipped`. Never rejects. `view`: the window the click was in,
+ * whose clipboard takes it (an object window's has the focus, not the main window's; #337 PR3).
  */
-export async function copyTextLater(text: Promise<string | null>): Promise<LaterCopy> {
-  const clipboard = typeof navigator === "undefined" ? undefined : navigator.clipboard;
-  if (typeof clipboard?.write === "function" && typeof ClipboardItem !== "undefined") {
+export async function copyTextLater(text: Promise<string | null>, view: Window = globalThis.window): Promise<LaterCopy> {
+  const own = view as Window & { ClipboardItem?: typeof ClipboardItem };
+  const clipboard = typeof own?.navigator === "undefined" ? undefined : own.navigator.clipboard;
+  const Item = own?.ClipboardItem;
+  if (typeof clipboard?.write === "function" && typeof Item !== "undefined") {
     let skipped = false;
     const blob = text.then((value) => {
       if (value === null) {
@@ -76,7 +79,7 @@ export async function copyTextLater(text: Promise<string | null>): Promise<Later
     });
     try {
       // Called before any await: still inside the click.
-      await clipboard.write([new ClipboardItem({ "text/plain": blob })]);
+      await clipboard.write([new Item({ "text/plain": blob })]);
       return "copied";
     } catch {
       if (skipped) return "skipped";
@@ -86,7 +89,7 @@ export async function copyTextLater(text: Promise<string | null>): Promise<Later
   const value = await text;
   if (value === null) return "skipped";
   try {
-    await copyTextToClipboard(value);
+    await copyTextToClipboard(value, undefined, { view });
     return "copied";
   } catch {
     return "failed";

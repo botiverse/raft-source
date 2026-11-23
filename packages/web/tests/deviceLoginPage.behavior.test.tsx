@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { act } from "react";
 import api from "../src/api/client";
 import DeviceLoginPage from "../src/pages/DeviceLoginPage";
+import { deviceLoginRedirect } from "../src/pages/deviceLoginRedirect";
 import { useAuthStore } from "../src/store/authStore";
 // DeviceLoginPage now calls useIntl() (pages.deviceLogin.* migration), so it
 // needs an <IntlProvider> ancestor. Default locale (en) keeps these English
@@ -96,6 +97,24 @@ test("a code in the link is never filled in, and is dropped from the address", a
   await waitFor(() => assert.equal(window.location.search, ""));
   assert.equal((screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement).disabled, true);
   assert.deepEqual(posts, []);
+});
+
+// A page left open while the person decides: the label read the clock once, at
+// the render that showed the request, and kept saying "2 minutes ago".
+test("how long ago the login was started keeps counting while the page waits open", async () => {
+  vi.useFakeTimers();
+  try {
+    mockApi({ describe: () => ({ ...REQUEST, requestedAt: new Date(Date.now() - 2 * 60_000).toISOString() }) });
+    renderPage();
+    await typeCodeAndContinue();
+    assert.ok(screen.getByText(/2 minutes ago/));
+
+    act(() => { vi.advanceTimersByTime(3 * 60_000); });
+    assert.ok(screen.getByText(/5 minutes ago/));
+    assert.ok(screen.queryByText(/2 minutes ago/) === null, "the old label is gone");
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 for (const [code, text] of [
@@ -433,4 +452,119 @@ test("a grant kind this page doesn't know is refused before anything can be appr
   assert.ok(await screen.findByText(/This kind of device login isn't supported here/));
   assert.ok(screen.getByPlaceholderText("XXXX-XXXX"));
   assert.deepEqual(posts.map((post) => post.url), ["/auth/device/describe"]);
+});
+
+// Loopback (`?request=<id>`): the program on this computer opened the page for
+// its own request. No code to type; the same confirm screen, step-up and
+// picker; approve and deny send the browser back to the program.
+const REQUEST_ID = "Zm9vYmFyYmF6cXV4cXV1eHF1dXpxdXV6cXV1enF1dXo";
+const LOOPBACK_REQUEST = {
+  mode: "loopback",
+  requestId: REQUEST_ID,
+  clientName: "raft-computer",
+  requestedAt: new Date(Date.now() - 60_000).toISOString(),
+  requester: { ip: null, location: null },
+  approvalTicket: "ticket-1",
+  grant: ATTACH_REQUEST.grant,
+};
+const SAME_COMPUTER = "Only approve if you just ran a raft-computer command on this computer.";
+
+function captureRedirects(): string[] {
+  const assigned: string[] = [];
+  const original = deviceLoginRedirect.assign;
+  deviceLoginRedirect.assign = (url: string) => {
+    assigned.push(url);
+  };
+  onTestFinished(() => {
+    deviceLoginRedirect.assign = original;
+  });
+  return assigned;
+}
+
+test("loopback: describes the request from the link, no code field, says to approve only a command just run here; approve goes back to the program", async () => {
+  const assigned = captureRedirects();
+  const redirectUrl = "http://127.0.0.1:53682/callback?state=st_0123456789abcdef&code=one-time";
+  const posts = mockApi({ describe: () => LOOPBACK_REQUEST, approve: () => ({ ok: true, action: "approved", redirectUrl }) });
+  renderPage(`?request=${REQUEST_ID}`);
+
+  assert.ok(await screen.findByRole("heading", { name: "Add “Maria's laptop” to a server" }));
+  assert.deepEqual(posts[0], { url: "/auth/device/describe", body: { requestId: REQUEST_ID } });
+  assert.ok(screen.queryByPlaceholderText("XXXX-XXXX") === null);
+  assert.ok(screen.getByText(SAME_COMPUTER));
+  assert.ok(screen.queryByText("Code") === null, "no code row");
+  assert.ok(screen.queryByRole("button", { name: "Enter a different code" }) === null);
+  // Nothing picked for them.
+  assert.equal(approveButton("Add to server").disabled, true);
+  await click(screen.getByRole("radio", { name: /Alpha Co/ }));
+  await click(approveButton("Add to server"));
+
+  assert.deepEqual(posts[1], {
+    url: "/auth/device/approve",
+    body: { requestId: REQUEST_ID, approve: true, approvalTicket: "ticket-1", serverId: ALPHA.id },
+  });
+  await waitFor(() => assert.deepEqual(assigned, [redirectUrl]));
+});
+
+test("loopback: deny goes back to the program with the denial", async () => {
+  const assigned = captureRedirects();
+  const redirectUrl = "http://127.0.0.1:53682/callback?state=st_0123456789abcdef&error=access_denied";
+  const posts = mockApi({ describe: () => LOOPBACK_REQUEST, approve: () => ({ ok: true, action: "denied", redirectUrl }) });
+  renderPage(`?request=${REQUEST_ID}`);
+  await click(await screen.findByRole("button", { name: "Deny" }));
+
+  assert.deepEqual(posts[1], { url: "/auth/device/approve", body: { requestId: REQUEST_ID, approve: false } });
+  await waitFor(() => assert.deepEqual(assigned, [redirectUrl]));
+});
+
+test("loopback: a redirect anywhere but this computer's loopback callback is never followed", async () => {
+  const assigned = captureRedirects();
+  mockApi({ describe: () => LOOPBACK_REQUEST, approve: () => ({ ok: true, action: "approved", redirectUrl: "https://evil.example/callback?code=x" }) });
+  renderPage(`?request=${REQUEST_ID}`);
+  await click(await screen.findByRole("radio", { name: /Alpha Co/ }));
+  await click(approveButton("Add to server"));
+
+  assert.ok(await screen.findByRole("heading", { name: "Computer approved" }));
+  assert.deepEqual(assigned, []);
+});
+
+test("loopback: a link that no longer works says so, and offers the code field", async () => {
+  const posts = mockApi({ describe: failWith("request_invalid") });
+  renderPage(`?request=${REQUEST_ID}`);
+
+  assert.ok(await screen.findByText("This approval link doesn’t work. Run the raft-computer command again."));
+  assert.ok(screen.getByPlaceholderText("XXXX-XXXX"));
+  assert.deepEqual(posts.map((post) => post.url), ["/auth/device/describe"]);
+});
+
+test("loopback: two-step verification on asks for the step-up, then approves the same request", async () => {
+  captureRedirects();
+  let calls = 0;
+  const posts = mockApi({
+    describe: () => LOOPBACK_REQUEST,
+    approve: () => {
+      calls += 1;
+      if (calls === 1) throw { response: { data: { code: "second_factor_step_up_required", methods: ["totp"] } } };
+      return { ok: true, action: "approved", redirectUrl: "http://127.0.0.1:53682/callback?code=x" };
+    },
+  });
+  renderPage(`?request=${REQUEST_ID}`);
+  await click(await screen.findByRole("radio", { name: /Alpha Co/ }));
+  await click(approveButton("Add to server"));
+
+  assert.ok(await screen.findByText("Two-step verification is on for this account. Verify it's you before approving a device login."));
+  assert.equal(posts.filter((post) => post.url === "/auth/device/approve").length, 1);
+});
+
+test("a device login is unchanged: no loopback line, and no redirect even if one were answered", async () => {
+  const assigned = captureRedirects();
+  mockApi({ describe: () => ATTACH_REQUEST, approve: () => ({ ok: true, action: "approved", redirectUrl: "http://127.0.0.1:53682/callback?code=x" }) });
+  renderPage();
+  await typeCodeAndContinue();
+  assert.ok(await screen.findByRole("heading", { name: "Add “Maria's laptop” to a server" }));
+  assert.ok(screen.queryByText(SAME_COMPUTER) === null);
+  assert.ok(screen.getByText("VSWA-7M58"));
+  await click(screen.getByRole("radio", { name: /Alpha Co/ }));
+  await click(approveButton("Add to server"));
+  assert.ok(await screen.findByRole("heading", { name: "Computer approved" }));
+  assert.deepEqual(assigned, []);
 });

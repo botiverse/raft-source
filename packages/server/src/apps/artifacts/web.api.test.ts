@@ -14,7 +14,10 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { and, eq, sql } from "drizzle-orm";
+import { ANNOTATION_LIMITS, parseAnchor } from "@botiverse/porthole";
 import {
+  ARTIFACT_ANCHOR_CONTEXT_LIMITS,
+  artifactAnchorContextSchema,
   ARTIFACT_COMMENT_MAX_CHARS,
   BasicTracer,
   MemoryTraceSink,
@@ -53,7 +56,7 @@ import { __setArtifactR2StoreForTests, r2KeyOf, type ArtifactR2Store } from "./b
 import { artifactsApp } from "./register";
 import { createArtifactWebApi } from "./webRoutes";
 import { createViewerOperations } from "./webViewer";
-import { webFileNotFound, webInvalidPath, webNotVisible, webVersionNotFound } from "./webCommon";
+import { webCommentAnchorSchema, webFileNotFound, webInvalidPath, webNotVisible, webVersionNotFound } from "./webCommon";
 import { mayManageArtifactActions } from "./manage";
 import { mayRename } from "./rename";
 import type { ServerViewActor } from "../../platform/visibility";
@@ -398,9 +401,53 @@ test("viewer: the current version as ArtifactViewerData; opening it moves the re
     savedFrom: null,
     origin: null,
     originalHome: null,
+    // Never opened: agent A's two versions are new to the reader (there are no comments).
+    unseenAtOpen: { newerVersion: true, newComments: 0, firstNewComment: null },
   });
   const [position] = await getDb().select().from(artifactReadPositions).where(and(eq(artifactReadPositions.itemId, page.id), eq(artifactReadPositions.actorId, world.reader.id)));
   assert.equal(position!.position, item!.lastPosition);
+});
+
+test("viewer: `unseenAtOpen` is what was new to the reader before this open moved their read position: others' live comments on a first open, none on the next, then only what came since; their own never", async ({ app, seed }) => {
+  const world = await seedWorld(seed, app);
+  const { page, memo } = world.items;
+  const db = getDb();
+  const me: Actor = { type: "user", id: world.reader.id };
+  const owner: Actor = { type: "user", id: world.owner.id };
+  const byA: Actor = { type: "agent", id: world.agentA.id };
+  const comment = (author: Actor, position: number, deleted = false) => ({
+    id: `c_${randomUUID()}`, itemId: page.id, versionId: world.versions.v2.id, authorType: author.type, authorId: author.id,
+    body: `at ${position}`, position, deletedAt: deleted ? new Date() : null,
+  });
+  const lastAt = (position: number) => db.update(artifactItems).set({ lastPosition: position }).where(eq(artifactItems.id, page.id));
+  const open = async (version?: number) => {
+    const res = await call(app, "GET", artifactWebPaths.viewer(id(page), version), world.who.reader);
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    return res.body.unseenAtOpen;
+  };
+
+  // Never opened, two comments by others (the owner's, agent A's), the reader's own between them, a deleted one.
+  const first = comment(owner, 3);
+  await db.insert(artifactComments).values([first, comment(me, 4), comment(owner, 5, true), comment(byA, 6)]);
+  await lastAt(6);
+  assert.deepEqual(await open(), { newerVersion: true, newComments: 2, firstNewComment: first.id }, "both of the others' live comments, from the first; never its own or a deleted one");
+  assert.deepEqual(await open(), { newerVersion: false, newComments: 0, firstNewComment: null }, "opened again: the first open moved the read position over everything");
+
+  // A new comment by someone else, and the reader's own reply after it: just that one.
+  const later = comment(byA, 7);
+  await db.insert(artifactComments).values([later, comment(me, 8)]);
+  await lastAt(8);
+  const details = (await call(app, "GET", artifactWebPaths.details(id(page)), world.who.reader)).body.unseenAtOpen;
+  assert.deepEqual(details, { newerVersion: false, newComments: 1, firstNewComment: later.id }, "details says it too, and moves nothing");
+  // An older version shown moves nothing either: the same answer twice.
+  assert.deepEqual(await open(1), { newerVersion: false, newComments: 1, firstNewComment: later.id });
+  assert.deepEqual(await open(), { newerVersion: false, newComments: 1, firstNewComment: later.id }, "the current version: what was new before it moved");
+  assert.deepEqual(await open(), { newerVersion: false, newComments: 0, firstNewComment: null });
+
+  // Another server's reader of a public Artifact reads it as an outsider and keeps no read position: null.
+  const outsider = await call(app, "GET", artifactWebPaths.viewer(id(memo)), world.who.peerUser);
+  assert.equal(outsider.status, 200, JSON.stringify(outsider.body));
+  assert.equal(outsider.body.unseenAtOpen, null);
 });
 
 test("details: the viewer's answer without moving the read position, `?version=` as the viewer's", async ({ app, seed }) => {
@@ -542,17 +589,25 @@ test("viewer: savedFrom names the attachment's message only for a reader who can
  * check flag only when the version has some, so not here), capabilities
  * (standing, the author agent's manager; whether the reader may rename it,
  * #12841, comes from that standing read: mayManageArtifactActions `rename`),
- * following, savedFrom, and the read position (2). 23 since the viewer read
+ * following, savedFrom, and the read position (2: what was new before the
+ * open, read in the move's own statement, and its report to Activity;
+ * webCards viewerUnseenOf). 23 since the viewer read
  * its versions once and its flags once (it was 27); 24 with the screenshots
  * (25 while the rename standing was a read of its own, folded back since). A
  * new statement here is a round trip on the Artifact's first screen: make it
  * a parallel or batched read of an existing one before raising this. 22 since
  * the Artifacts key is answered by the deployment: the two flag statements
- * (the flag and its rules) are gone.
+ * (the flag and its rules) are gone. 23 (measured) while Settled is behind
+ * its flag (#334): the cards' `artifact_settled_v0` read (webCards
+ * settledServers, platform/flags appEnabledOnCached; two statements, the flag
+ * and its rules, against the one statement of room the budget had), run in
+ * parallel with the other card reads (no extra round trip) and answered by the
+ * 30 s flag cache in production; this test runs with that cache off. Back down
+ * when the flag is retired.
  */
-const VIEWER_MEMBER_STATEMENTS = 22;
+const VIEWER_MEMBER_STATEMENTS = 23;
 
-test("viewer: a member opens an Artifact in a fixed, small number of statements, however many versions it has; no flag is read from the store", async ({ app, seed }) => {
+test("viewer: a member opens an Artifact in a fixed, small number of statements, however many versions it has; the only flag read is Settled's, through the flag cache", async ({ app, seed }) => {
   const world = await seedWorld(seed, app);
   const { page } = world.items;
   const viewer = createViewerOperations();
@@ -573,12 +628,14 @@ test("viewer: a member opens an Artifact in a fixed, small number of statements,
   assert.equal(pinned.value.kind === "json" && pinned.value.body.card.version, 2);
   assert.ok(pinned.queries < two.queries, "a pinned version is found among the versions read (and moves no read position)");
 
-  // The Artifacts key is answered by the deployment (deployment.ts), never read from the flag store: a warm flag cache saves no statement, there is none to save.
+  // The Artifacts key is answered by the deployment (deployment.ts), never read from the flag store. The one flag the
+  // cards read is artifact_settled_v0 (appEnabledOnCached): a warm flag cache saves that read and nothing else.
   __setFlagReadCacheTtlForTests(30_000);
   try {
     await open();
     const warm = await open();
-    assert.equal(warm.queries, two.queries, "no flag statement, cold or warm");
+    assert.ok(warm.queries < two.queries, "a warm flag cache saves Settled's flag read");
+    assert.ok(two.queries - warm.queries <= 2, "and nothing else is a flag read (one batched evaluation: the flag and its rules at most)");
   } finally {
     __setFlagReadCacheTtlForTests(0);
   }
@@ -610,6 +667,13 @@ test("file: the exact bytes as an attachment, with a type a browser never runs a
   assert.match(svg.headers.get("content-disposition") ?? "", /^attachment;/);
   assert.equal(svg.headers.get("x-content-type-options"), "nosniff");
   assert.equal(svg.headers.get("content-security-policy"), "default-src 'none'; sandbox");
+  // A version of one file is saved by the title with the file's extension (what the App names it by), a version of
+  // several by each file's own name (logo.png above); a Chinese title keeps its letters.
+  const drawingName = `${world.items.drawing.title}.svg`;
+  assert.equal(svg.headers.get("content-disposition"), `attachment; filename="${drawingName}"; filename*=UTF-8''${encodeURIComponent(drawingName)}`);
+  await getDb().update(artifactItems).set({ title: "周计划: 第一周" }).where(eq(artifactItems.id, world.items.drawing.id));
+  const chinese = await call(app, "GET", artifactWebPaths.file(id(world.items.drawing), "d.svg"), world.who.reader);
+  assert.equal(chinese.headers.get("content-disposition"), `attachment; filename="___ ___.svg"; filename*=UTF-8''${encodeURIComponent("周计划 第一周.svg")}`);
   const v1 = await call(app, "GET", artifactWebPaths.file(page, "index.html", 1), world.who.reader);
   assert.equal(v1.bytes.toString("utf8"), "<h1>v1</h1>");
 
@@ -1135,6 +1199,101 @@ test("a page anchor (P108): a place the page names, stored as given; its name an
     assert.equal(refused.body.code, "INVALID_REQUEST", JSON.stringify(data));
   }
   assert.equal((await commentsOf(world.items.page.id)).length, before, "nothing written");
+});
+
+test("an element or text anchor's section (Porthole P152): kept cleaned, read back by the web and agents; malformed or oversized refused; over 4 KiB it gives way, never the comment", async ({ app, seed }) => {
+  const world = await seedWorld(seed, app);
+  const { page } = world.items;
+  const annotation = (context: unknown, exact = "新增") => ({ type: "annotation", data: {
+    kind: "element", label: "ins 新增", selectors: [{ type: "CssSelector", value: "#p-fulldata > div > ins:nth-of-type(4)" }, { type: "TextQuoteSelector", exact }],
+    ...(context === undefined ? {} : { context }),
+  } });
+  const at = (anchor: unknown) => commentInput([text("Which source?")], { target: { scope: "file", path: "index.html", anchor } });
+  const res = await post(app, world, world.who.reader, at(annotation({ headings: [" Agent 收件箱现状 ", "", "P5 · 读取页"], region: "设计\u200B" })));
+  assert.equal(res.status, 201, JSON.stringify(res.body));
+  const kept = annotation({ headings: ["Agent 收件箱现状", "P5 · 读取页"], region: "设计" });
+  assert.deepEqual(res.body.comment.target, { scope: "file", path: "index.html", anchor: kept });
+  const [row] = await getDb().select().from(artifactComments).where(eq(artifactComments.id, res.body.comment.id));
+  assert.deepEqual(row!.anchor, kept);
+  // Read back: the web's list, and agents through the agent API.
+  const listed = await call(app, "GET", artifactWebPaths.comments(id(page)), world.who.reader);
+  assert.deepEqual(listed.body.comments.find((c: { id: string }) => c.id === row!.id).target.anchor, kept);
+  const key = (await mintAgentCredential({ agentId: world.agentC.id, scopes: ["read"], name: `wa-${label()}`, issuedVia: "computer", createdByUserId: null })).apiKey;
+  const agentView = await fetch(`${app.baseUrl}/internal/agent-api/artifacts/${page.id}/comments?all=1`, { headers: { Authorization: `Bearer ${key}` } });
+  const agentBody = await agentView.json() as { comments: Array<{ id: string; anchor: unknown }> };
+  assert.deepEqual(agentBody.comments.find((c) => c.id === row!.id)!.anchor, kept);
+  // A context with nothing in it is none; an anchor without one is as before.
+  assert.deepEqual((await post(app, world, world.who.reader, at(annotation({ headings: [" "], region: "" })))).body.comment.target.anchor, annotation(undefined));
+  assert.deepEqual((await post(app, world, world.who.reader, at(annotation(undefined)))).body.comment.target.anchor, annotation(undefined));
+  // A stored context the web wouldn't keep (an agent's, from before the check) reads as none, the place kept.
+  await getDb().update(artifactComments).set({ anchor: annotation({ headings: "P5" }) }).where(eq(artifactComments.id, row!.id));
+  const reread = await call(app, "GET", artifactWebPaths.comments(id(page)), world.who.reader);
+  assert.deepEqual(reread.body.comments.find((c: { id: string }) => c.id === row!.id).target.anchor, annotation(undefined));
+
+  // Past Porthole's limits (more than 6 headings, one or the region over 80 characters) or not that shape: the section
+  // is left out and the comment kept, place and all (Tenny on #15709: a section never stops a comment).
+  for (const context of [{ headings: Array.from({ length: 7 }, () => "h") }, { headings: ["h".repeat(81)] }, { region: "r".repeat(81) }, { headings: "P5" }, { region: 3 }, "P5", null]) {
+    const kept = await post(app, world, world.who.reader, at(annotation(context)));
+    assert.equal(kept.status, 201, JSON.stringify(context));
+    assert.deepEqual(kept.body.comment.target.anchor, annotation(undefined), JSON.stringify(context));
+  }
+
+  // The worst case CJK section (6 headings and a region of 80 characters, ~1.7 KB) fits beside a long selection.
+  const full = { headings: Array.from({ length: 6 }, (_, index) => `${index}${"节".repeat(79)}`), region: "区".repeat(80) };
+  const worst = await post(app, world, world.who.reader, at(annotation(full, "引".repeat(500))));
+  assert.equal(worst.status, 201, JSON.stringify(worst.body));
+  assert.deepEqual(worst.body.comment.target.anchor, annotation(full, "引".repeat(500)));
+  // Over 4 KiB: the region goes, then the outermost headings, never the comment. A quote that leaves room for the five innermost headings exactly.
+  const fits = Buffer.byteLength(JSON.stringify(annotation({ headings: full.headings.slice(1) }, "")), "utf8");
+  const exact = "q".repeat(4096 - fits);
+  const fitted = await post(app, world, world.who.reader, at(annotation(full, exact)));
+  assert.equal(fitted.status, 201, JSON.stringify(fitted.body));
+  assert.deepEqual(fitted.body.comment.target.anchor, annotation({ headings: full.headings.slice(1) }, exact));
+  // A place over 4 KiB on its own is refused as before.
+  const tooLong = await post(app, world, world.who.reader, at(annotation({ headings: ["P5"] }, "q".repeat(5000))));
+  assert.equal(tooLong.status, 400, JSON.stringify(tooLong.body));
+  assert.deepEqual([tooLong.body.code, tooLong.body.details], ["FIELD_TOO_LONG", { field: "anchor", limit: 4096 }]);
+});
+
+test("an anchor's section is kept as Porthole's parseAnchor keeps it (0.17.0, P152): the same limits, the same cleaning; what Porthole refuses is left out", () => {
+  // Shared mirrors Porthole's limits (it doesn't depend on Porthole); they must not drift.
+  assert.deepEqual(ARTIFACT_ANCHOR_CONTEXT_LIMITS, { heading: ANNOTATION_LIMITS.heading, headings: ANNOTATION_LIMITS.headings, region: ANNOTATION_LIMITS.region });
+  const base = { kind: "element", label: "h2 Plans", selectors: [{ type: "CssSelector", value: "#plans" }] };
+  const contexts: unknown[] = [
+    { headings: [" Agent 收件箱现状 ", "P5 · 读取页"], region: "设计" },
+    // What a person can't see: format characters (the joiners among them), controls, variation selectors, default-ignorables, private use.
+    { headings: ["Pri\u200Bcing", "a\u0000b\u007Fc\u0085d", "x\uFE0Fy\u{E0100}z", "👩\u200D💻 team", "a\u034Fb\u115Fc\u180Bd", "p\uE000q"], region: "\u202Eslp\u202C" },
+    // Nothing visible: left out.
+    { headings: ["\u3164", " \u200B ", "Plans"], region: "\u3164" },
+    { headings: ["two\nlines\tand  spaces"], region: "  " },
+    { headings: [] },
+    {},
+    // At the limits, and past them.
+    { headings: Array.from({ length: 6 }, () => "h".repeat(80)), region: "r".repeat(80) },
+    { headings: Array.from({ length: 7 }, () => "h") },
+    { headings: ["h".repeat(81)] },
+    { region: "r".repeat(81) },
+    // Not the shape.
+    { headings: "Plans" },
+    { headings: [1] },
+    { region: ["Design"] },
+    "Plans",
+    null,
+  ];
+  for (const context of contexts) {
+    const porthole = parseAnchor({ ...base, context });
+    const ours = webCommentAnchorSchema.safeParse({ type: "annotation", data: { ...base, context } });
+    // The section's own check refuses what Porthole refuses; the anchor then keeps its place without it.
+    assert.equal(artifactAnchorContextSchema.safeParse(context).success, porthole !== null, `Porthole and Raft agree: ${JSON.stringify(context)}`);
+    if (porthole === null) {
+      assert.ok(ours.success && ours.data?.type === "annotation" && ours.data.data.context === undefined, `left out, the place kept: ${JSON.stringify(context)}`);
+      continue;
+    }
+    assert.ok(ours.success, `Porthole keeps it, so does Raft: ${JSON.stringify(context)}`);
+    const anchor = ours.data;
+    const kept = anchor?.type === "annotation" ? anchor.data.context : "not an annotation";
+    assert.deepEqual(kept, porthole.context, JSON.stringify(context));
+  }
 });
 
 test("comment refusals, in order, and nothing written: outside the server, the request, the version, the file, the reply, mentions, the text", async ({ app, seed }) => {

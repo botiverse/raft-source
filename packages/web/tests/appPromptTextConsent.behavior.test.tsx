@@ -13,6 +13,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { buildActionCardPresentation, buildActionCardSpec, effectiveAllowedOAuthScopes } from "@botiverse/raft-shared";
 import type { ActionCardMetadata, StoredActionCardAction } from "@botiverse/raft-shared";
+import { openOwnAppEditor } from "./helpers/appsYours";
 import { TestIntlProvider } from "./helpers/intl";
 import api from "../src/api/client";
 import { ActionCard } from "../src/components/actions/ActionCard";
@@ -354,17 +355,17 @@ test("marketplace install: shows the live text and confirms it; a text 409 shows
   }) as typeof api.post;
 
   renderSettings();
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-marketplace"));
-  fireEvent.click(await screen.findByText("Orbital Notes"));
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-discover"));
+  fireEvent.click(await screen.findByRole("button", { name: "Orbital Notes" }));
   const detail = detailDialog();
   assert.ok(within(detail).getByText("Text added to agent prompts"));
   assert.match(linesIn(detail, "app-prompt-text"), /Use it when: When someone asks for launch notes\./u);
 
-  fireEvent.click(within(detail).getByRole("button", { name: "Install to this server" }));
+  fireEvent.click(within(detail).getByRole("button", { name: "Add Orbital Notes" }));
   assert.ok(await within(detail).findByText("The text this app adds to agent prompts just changed. Review the current text, then try again."));
   await waitFor(() => assert.match(linesIn(detailDialog(), "app-prompt-text"), /Use it when: When launch notes are needed\./u));
 
-  fireEvent.click(within(detailDialog()).getByRole("button", { name: "Install to this server" }));
+  fireEvent.click(within(detailDialog()).getByRole("button", { name: "Add Orbital Notes" }));
   assert.ok(await screen.findByText("This page is out of date. Reload it, review the app's permissions, then try again."));
   const expectedPermissions = { expected_scopes: effectiveAllowedOAuthScopes(["openid", "profile"]), expected_groups: [] };
   assert.deepEqual(installBodies, [
@@ -384,11 +385,11 @@ test("marketplace install, flag off: no text section and the same body as before
   }) as typeof api.post;
 
   renderSettings();
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-marketplace"));
-  fireEvent.click(await screen.findByText("Orbital Notes"));
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-discover"));
+  fireEvent.click(await screen.findByRole("button", { name: "Orbital Notes" }));
   const detail = detailDialog();
   assert.ok(within(detail).queryByText("Text added to agent prompts") === null);
-  fireEvent.click(within(detail).getByRole("button", { name: "Install to this server" }));
+  fireEvent.click(within(detail).getByRole("button", { name: "Add Orbital Notes" }));
   await waitFor(() => assert.equal(installBodies.length, 1));
   assert.deepEqual(installBodies[0], { expected_scopes: effectiveAllowedOAuthScopes(["openid", "profile"]), expected_groups: [] });
 });
@@ -431,8 +432,8 @@ function installationState(overrides: Record<string, unknown> = {}) {
 }
 
 async function openInstalledTab() {
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-installed"));
-  return screen.findByTestId("connected-apps-installed-tab");
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-yours"));
+  return screen.findByTestId("connected-apps-yours-tab");
 }
 
 async function openInstalledDetail() {
@@ -468,10 +469,10 @@ test("installed app: marked Needs confirmation; Approve Update shows old/new tex
   renderSettings();
   const installedTab = await openInstalledTab();
   // The mark comes from the Marketplace list row itself: no per-app request.
-  assert.ok(await within(installedTab).findByTestId("app-prompt-text-needs-confirmation"));
-  assert.ok(within(installedTab).getByText("Needs confirmation"));
+  // On the card it is the update state, with Review as its step.
+  assert.equal((await within(installedTab).findByTestId("app-card-status")).textContent, "Update needs your approval");
   assert.deepEqual(getUrls.filter((url) => url.includes("/install/app-notifications")), []);
-  fireEvent.click(within(installedTab).getByRole("button", { name: "Orbital Notes" }));
+  fireEvent.click(within(installedTab).getByRole("button", { name: "Review Orbital Notes" }));
 
   const banner = await screen.findByTestId("app-prompt-text-confirmation-required");
   assert.ok(within(banner).getByText(
@@ -489,7 +490,7 @@ test("installed app: marked Needs confirmation; Approve Update shows old/new tex
   assert.deepEqual(putBodies, [{ expected_scopes: ["openid", "profile"], expected_groups: ["server"], expected_text_revision_id: "rev-2" }]);
   // Confirmed: the detail shows the text agents now use, and the list drops its mark.
   assert.ok(await screen.findByTestId("app-prompt-text-confirmed"));
-  await waitFor(() => assert.ok(within(installedTab).queryByTestId("app-prompt-text-needs-confirmation") === null));
+  await waitFor(() => assert.ok(within(installedTab).queryByTestId("app-card-status") === null));
 });
 
 test("installed app with a permission update too: one Approve Update covers both; a newer text revision is reported", async () => {
@@ -562,7 +563,7 @@ test("installed app, flag off: no mark, no text, and Approve Update sends only t
   renderSettings();
   const installedTab = await openInstalledDetail();
   const banner = await screen.findByTestId("app-notifications-approval-required");
-  assert.ok(within(installedTab).queryByTestId("app-prompt-text-needs-confirmation") === null);
+  assert.ok(within(installedTab).queryByTestId("app-card-status") === null);
   assert.ok(within(banner).queryByTestId("app-prompt-text-comparison") === null);
   assert.ok(screen.queryByTestId("app-prompt-text-confirmed") === null);
   fireEvent.click(within(banner).getByRole("button", { name: "Approve update" }));
@@ -629,8 +630,7 @@ function developerRoutes(promptText: () => unknown) {
 }
 
 async function openEditor() {
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-my-apps"));
-  fireEvent.click(within(await screen.findByTestId("connected-apps-my-apps-tab")).getByRole("button", { name: "Edit" }));
+  await openOwnAppEditor();
   return screen.findByTestId("connected-app-editor");
 }
 
@@ -665,11 +665,13 @@ test("self-built app: an agent's text edit is marked and confirmed with Confirm 
   }) as typeof api.put;
 
   renderSettings();
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-installed"));
-  const installedTab = await screen.findByTestId("connected-apps-installed-tab");
-  assert.ok(await within(installedTab).findByTestId("app-prompt-text-needs-confirmation"));
-
-  const editor = await openEditor();
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-yours"));
+  const installedTab = await screen.findByTestId("connected-apps-yours-tab");
+  // The card says an update waits; its Review opens the editor, where an
+  // App built here confirms its own text.
+  assert.equal((await within(installedTab).findByTestId("app-card-status")).textContent, "Update needs your approval");
+  fireEvent.click(within(installedTab).getByRole("button", { name: "Review Own Reports" }));
+  const editor = await screen.findByTestId("connected-app-editor");
   const panel = await within(editor).findByTestId("app-prompt-text-self-built-confirm");
   assert.ok(within(panel).getByText(
     "An agent changed the text this app adds to agent prompts. Until an admin confirms it, agents keep using the last confirmed version. Confirmed text reaches each agent the next time it starts.",
@@ -686,10 +688,10 @@ test("self-built app: an agent's text edit is marked and confirmed with Confirm 
     { url: "/integrations/clients/own-client/prompt-text/confirm", body: { expected_revision_id: "rev-6" } },
   ]);
   fireEvent.click(screen.getByRole("button", { name: "Close app form" }));
-  fireEvent.click(screen.getByTestId("connected-apps-tab-installed"));
-  const installedAgain = await screen.findByTestId("connected-apps-installed-tab");
+  fireEvent.click(screen.getByTestId("connected-apps-tab-yours"));
+  const installedAgain = await screen.findByTestId("connected-apps-yours-tab");
   assert.ok(within(installedAgain).getByText("Own Reports"));
-  await waitFor(() => assert.ok(within(installedAgain).queryByTestId("app-prompt-text-needs-confirmation") === null));
+  await waitFor(() => assert.ok(within(installedAgain).queryByTestId("app-card-status") === null));
 });
 
 test("published app's editor: review notice, the pending text compared and pre-filled; a rejection shows its reason", async () => {
@@ -763,8 +765,8 @@ test("reviewer: compares live and submitted text; a stale approve reloads; rejec
   }) as typeof api.post;
 
   renderSettings();
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-marketplace"));
-  fireEvent.click(await screen.findByText("Orbital Notes"));
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-discover"));
+  fireEvent.click(await screen.findByRole("button", { name: "Orbital Notes" }));
   const review = await within(detailDialog()).findByTestId("app-prompt-text-review");
   assert.ok(within(detailDialog()).getByText("Agent prompt text"));
   assert.ok(within(review).getByText("Live now"));
@@ -807,8 +809,8 @@ test("reviewer: a revision someone else already reviewed (404) says nothing is w
   }) as typeof api.post;
 
   renderSettings();
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-marketplace"));
-  fireEvent.click(await screen.findByText("Orbital Notes"));
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-discover"));
+  fireEvent.click(await screen.findByRole("button", { name: "Orbital Notes" }));
   const review = await within(detailDialog()).findByTestId("app-prompt-text-review");
   fireEvent.click(within(review).getByRole("button", { name: "Approve text update" }));
   assert.ok(await within(detailDialog()).findByText("Nothing is waiting for review any more."));
@@ -826,8 +828,8 @@ test("reviewer, flag off: no prompt-text request and no text review", async () =
     },
   });
   renderSettings();
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-marketplace"));
-  fireEvent.click(await screen.findByText("Orbital Notes"));
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-discover"));
+  fireEvent.click(await screen.findByRole("button", { name: "Orbital Notes" }));
   assert.ok(within(detailDialog()).queryByTestId("app-prompt-text-review") === null);
   assert.equal(promptTextReads, 0);
 });
@@ -1013,8 +1015,8 @@ test("a block shows 'not added to agent prompts' when the app has no When to use
   setConsent(true);
   mockSettingsGets({ "/integrations/marketplace": () => [marketplaceListing({ whenToUse: null })] });
   renderSettings();
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-marketplace"));
-  fireEvent.click(await screen.findByText("Orbital Notes"));
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-discover"));
+  fireEvent.click(await screen.findByRole("button", { name: "Orbital Notes" }));
   const block = within(detailDialog()).getByTestId("app-prompt-text");
   assert.equal(block.getAttribute("data-empty"), "true");
   assert.ok(within(block).getByText("Not added to agent prompts: this app has no When to use."));

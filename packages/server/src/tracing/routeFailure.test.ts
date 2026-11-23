@@ -168,3 +168,21 @@ test("sanitizeRouteErrorMessage redacts connection strings in every form", () =>
     "non-secret DSN keys stay readable for diagnosis",
   );
 });
+
+test("sanitizeRouteErrorMessage redacts customer LLM API keys and sealed envelopes (#proj-runtime:#79)", () => {
+  const cases: Array<[string, string]> = [
+    ["upstream rejected sk-ant-api03-secretvalue1234567890", "sk-ant-api03-secretvalue1234567890"],
+    ["upstream rejected sk-proj-secretvalue1234567890", "sk-proj-secretvalue1234567890"],
+    ["upstream rejected sk-or-v1-secretvalue1234567890", "sk-or-v1-secretvalue1234567890"],
+    ["upstream rejected sk-1234567890abcdefghijklmno", "sk-1234567890abcdefghijklmno"],
+    ["upstream rejected AIzaSyDummyKeyValue1234567890123456", "AIzaSyDummyKeyValue1234567890123456"],
+    ["upstream rejected gsk_dummyvalue1234567890", "gsk_dummyvalue1234567890"],
+    ["upstream rejected xai-dummyvalue1234567890", "xai-dummyvalue1234567890"],
+    ["bad envelope 0123456789abcdef:env-aes-256-gcm:v1:eyJzY2hlbWEiOiJ0ZXN0In0", "eyJzY2hlbWEiOiJ0ZXN0In0"],
+  ];
+  for (const [raw, leaked] of cases) {
+    const clean = sanitizeRouteErrorMessage(raw);
+    assert.equal(clean.includes(leaked), false, `secret survived sanitization: ${clean}`);
+  }
+  assert.equal(sanitizeRouteErrorMessage("short token sk-short stays readable"), "short token sk-short stays readable");
+});

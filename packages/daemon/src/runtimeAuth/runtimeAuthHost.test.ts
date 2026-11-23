@@ -11,6 +11,7 @@ import type { LoginProvider, ProviderAuthFacade, ProviderAuthStatus, ProviderLog
 import { createPiProviderAuth } from "@botiverse/oar/runtimes/pi";
 import { antigravityRuntime } from "@botiverse/oar/runtimes/antigravity";
 import { grokRuntime } from "@botiverse/oar/runtimes/grok";
+import { dshRuntime } from "@botiverse/oar/runtimes/dsh";
 import { QwenProviderAuthError, qwenRuntime, type QwenProvider, type QwenProviderAuth, type QwenProviderConnectOptions } from "@botiverse/oar/runtimes/qwen";
 import {
   RUNTIME_AUTH_LOGOUT_RELAY_BUDGET_MS,
@@ -26,7 +27,7 @@ import {
 
 import type { OarProviderAuth } from "../oarLoader";
 import { DAEMON_CORE_TRACE_ATTR_CONTRACTS } from "../core";
-import { ANTIGRAVITY_ENV_OVERRIDES } from "../drivers/antigravity.deprecated";
+import { ANTIGRAVITY_ENV_OVERRIDES } from "../drivers/antigravity";
 import type { KimiSdkAuth } from "./kimiSdkAuth";
 import { PI_KEY_PROVIDERS_ASKING_MORE, PI_OAUTH_FLOWS } from "./piProviderSignIn";
 import {
@@ -102,8 +103,9 @@ function harness(runtime: Partial<Runtime>, options: {
         return { loginProviders: () => PI_PROVIDERS, listProviders: async () => [], ...options.piAuth } as ProviderAuthFacade;
       },
       piDeviceId: () => "6f1c9d3e-2b7a-4c55-9e1d-0a2b3c4d5e6f",
-      rescanModels: (runtime: RuntimeAuthRuntime) => { rescans.push(runtime); },
     } : {}),
+    // Wired for every runtime, as core.ts does.
+    rescanModels: (runtime: RuntimeAuthRuntime) => { rescans.push(runtime); },
   });
   const settle = async () => {
     for (let i = 0; i < 10; i += 1) await new Promise((resolve) => setImmediate(resolve));
@@ -342,6 +344,28 @@ test("browser_suppression_unavailable reaches the web as an unsupported installa
   assert.deepEqual(logout.result, { kind: "unsupported", reason: "unsupported_installation" });
 });
 
+test("a CLI OAR finds too old reads version_unsupported (the web offers the update); any other unusable installation stays unsupported_installation", async () => {
+  const tooOld = { kind: "unsupported", code: "version_unsupported", via: "executable", command: "/usr/local/bin/agy", reason: "needs agy 1.5.0", installedVersion: "1.4.2", requiredVersion: "1.5.0" } as const;
+  for (const [snapshot, reason] of [[tooOld, "version_unsupported"], [{ kind: "unsupported", reason: "unrecognized build" }, "unsupported_installation"]] as const) {
+    let ran = false;
+    const { host, sent, settle } = harness({
+      installation: async () => snapshot,
+      authStatus: async () => { ran = true; return { kind: "logged_in", source: "x" }; },
+      login: async () => { ran = true; return { kind: "logged_in" }; },
+      logout: async () => { ran = true; return { kind: "logged_out" }; },
+    });
+    assert.deepEqual((await host.collectStatus(RUNTIME_AUTH_RUNTIMES, ["antigravity"])).runtimes.antigravity, { kind: "unavailable", reason }, reason);
+    host.startLogin(loginId(`old${reason.length}`), "antigravity");
+    await settle();
+    const login = sent.find((message) => message.type === "machine:runtime_auth:login:result") as { result: unknown };
+    assert.deepEqual(login.result, { kind: "unsupported", reason }, reason);
+    await host.logout(`req-old-${reason}`, "antigravity");
+    const logout = sent.find((message) => message.type === "machine:runtime_auth:logout:result") as { result: unknown };
+    assert.deepEqual(logout.result, { kind: "unsupported", reason }, reason);
+    assert.equal(ran, false, "nothing runs against an installation OAR refused");
+  }
+});
+
 test("task #17: logout relays OAR's result, still_logged_in included, and reports the status after", async () => {
   const { host, sent } = harness({
     authStatus: async () => ({ kind: "logged_in", source: "x" }),
@@ -444,6 +468,8 @@ test("a V1 server is sent exactly Claude Code and Codex; a V2 server every runti
     pi: { kind: "unavailable", reason: "not_installed" },
     grok: { kind: "unavailable", reason: "not_installed" },
     opencode: { kind: "unavailable", reason: "not_installed" },
+    // A V2 server from before DeepSeek Harness drops this key too.
+    dsh: { kind: "unavailable", reason: "not_installed" },
   });
   assert.deepEqual(v2.loads.sort(), ["kimi-status", "qoder"], "Kimi Code's status is read from its token files: neither OAR's kimi nor the SDK is loaded");
 
@@ -549,7 +575,41 @@ test("the runtimes a server reads follow its capabilities", () => {
   assert.deepEqual(runtimeAuthRuntimesReadBy([SERVER_CAPABILITY_RUNTIME_AUTH_V1]), ["claude", "codex"]);
   // A V2 server reads every runtime this daemon knows, Pi included (a server from before Pi drops the
   // key and keeps the rest); what the server may send back is the daemon's capabilities' say, not this.
-  assert.deepEqual(runtimeAuthRuntimesReadBy([SERVER_CAPABILITY_RUNTIME_AUTH_V1, SERVER_CAPABILITY_RUNTIME_AUTH_V2]), ["claude", "codex", "kimi", "qoder", "qwen", "antigravity", "pi", "grok", "opencode"]);
+  assert.deepEqual(runtimeAuthRuntimesReadBy([SERVER_CAPABILITY_RUNTIME_AUTH_V1, SERVER_CAPABILITY_RUNTIME_AUTH_V2]), ["claude", "codex", "kimi", "qoder", "qwen", "antigravity", "pi", "grok", "opencode", "dsh"]);
+});
+
+// ─── DeepSeek Harness (OAR-only): status only, no sign-in ───
+
+test("DeepSeek Harness has no status query (OAR has none): OAR's real installation probe decides, installed reads unknown, below its floor version_unsupported; never on Windows", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "rt-auth-dsh-"));
+  const previous = process.env.OAR_DSH_BIN;
+  const withVersion = async (name: string, version: string) => {
+    const bin = path.join(root, name);
+    await writeFile(bin, `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(`${version}\n`)});\n`, { mode: 0o755 });
+    process.env.OAR_DSH_BIN = bin;
+  };
+  const host = (platform: NodeJS.Platform) => new RuntimeAuthHost({
+    loadRuntime: async (id) => (id === "dsh" ? dshRuntime : assert.fail(`only dsh is read here, not ${id}`)),
+    loadProviderAuth: async () => null,
+    kimiStatus: async () => ({ kind: "logged_out" }),
+    loadKimiAuth: async () => assert.fail("no Kimi sign-in here"),
+    send: () => {},
+    recordEvent: () => {},
+    now: () => 1_000,
+    serverReads: () => ["dsh"],
+    platform,
+  });
+  try {
+    await withVersion("dsh-current", "0.2.2-rc.5");
+    assert.deepEqual((await host("linux").collectStatus(["dsh"], ["dsh"])).runtimes.dsh, { kind: "unknown" }, "installed and usable: its credentials are not Raft's to read");
+    await withVersion("dsh-old", "0.2.0");
+    assert.deepEqual((await host("linux").collectStatus(["dsh"], ["dsh"])).runtimes.dsh, { kind: "unavailable", reason: "version_unsupported" });
+    assert.deepEqual((await host("linux").collectStatus(["dsh"], ["claude"])).runtimes.dsh, { kind: "unavailable", reason: "not_installed" });
+    assert.deepEqual((await host("win32").collectStatus(["dsh"], ["dsh"])).runtimes.dsh, { kind: "unavailable", reason: "unsupported_installation" }, "the OAR host does not run on Windows");
+  } finally {
+    if (previous === undefined) delete process.env.OAR_DSH_BIN; else process.env.OAR_DSH_BIN = previous;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 // ─── Antigravity: status and login (OAR 0.97), logout (OAR 0.98) ───
@@ -577,7 +637,7 @@ test("Antigravity's status is agy's own (OAR authStatus), read without the SSH s
 test("Antigravity's login relays the Google link and the paste step; the pasted code or landing address reaches agy's prompt only", async () => {
   let answered: string | null = null;
   let options: unknown;
-  const { host, sent, events, settle } = harness({
+  const { host, sent, events, settle, rescans } = harness({
     authStatus: async () => ({ kind: "logged_in", source: "agy models" }),
     login: async (_installation, interaction, loginOptions) => {
       options = loginOptions;
@@ -605,6 +665,7 @@ test("Antigravity's login relays the Google link and the paste step; the pasted 
   assert.ok(!JSON.stringify(events).includes("google-auth-code-secret"), "nor in a trace");
   assert.ok(!JSON.stringify(events).includes("accounts.google.com"), "nor the link");
   assert.deepEqual(events.find((event) => event.name === "daemon.runtime_auth.login.result")?.attrs, { runtime: "antigravity", outcome: "logged_in", reason: undefined, code_prompts: 1, duration_ms: 0 });
+  assert.deepEqual(rescans, ["antigravity"], "the account decides which models agy offers: its day-long cached list is detected again");
 });
 
 const AGY_ENV = { SSH_CLIENT: null, SSH_CONNECTION: null, SSH_TTY: null };
@@ -612,7 +673,7 @@ const AGY_ENV = { SSH_CLIENT: null, SSH_CONNECTION: null, SSH_TTY: null };
 test("Antigravity's logout (OAR 0.98) runs agy's own, without the SSH session, and reports the status after", async () => {
   const seen: unknown[] = [];
   const changes: Array<[RuntimeAuthRuntime, RuntimeAuthCredentialsChange]> = [];
-  const { host, sent, events } = harness({
+  const { host, sent, events, rescans } = harness({
     authStatus: async () => ({ kind: "logged_out", source: "agy models" }),
     logout: async (_installation, options) => { seen.push(options); return { kind: "logged_out" }; },
   }, { onCredentialsChanged: (runtime, reason) => changes.push([runtime, reason]) });
@@ -624,6 +685,7 @@ test("Antigravity's logout (OAR 0.98) runs agy's own, without the SSH session, a
   assert.ok(RUNTIME_AUTH_LOGOUT_TIMEOUT_MS + 1_000 + 10_000 <= RUNTIME_AUTH_LOGOUT_RELAY_BUDGET_MS);
   assert.deepEqual(changes, [["antigravity", "logout"]]);
   assert.ok(sent.some((message) => message.type === "machine:runtime_auth:status"), "a fresh status follows the logout");
+  assert.deepEqual(rescans, ["antigravity"], "signed out: its models are detected again (the Computer's cached list is dropped)");
   assert.deepEqual(events.find((event) => event.name === "daemon.runtime_auth.logout.result")?.attrs, { runtime: "antigravity", outcome: "logged_out", reason: undefined, duration_ms: 0 });
 });
 
@@ -954,6 +1016,24 @@ test("Qwen Code is never run on Windows: status, providers and connect answer un
   ]);
   assert.equal(started, false);
   assert.deepEqual(loads, [], "neither OAR's qwen nor its provider facade was loaded");
+});
+
+test("Qwen Code's provider facade is never started on a too-old or a bundled installation", async () => {
+  const cases = [
+    [{ kind: "unsupported", code: "version_unsupported", via: "executable", command: "/usr/local/bin/qwen", reason: "too old" }, "version_unsupported"],
+    [{ kind: "unsupported", reason: "unrecognized" }, "unsupported_installation"],
+    [{ kind: "available", via: "bundled" }, "unsupported_installation"],
+  ] as const;
+  for (const [snapshot, reason] of cases) {
+    let started = false;
+    const { host, sent, facadeOptions } = harness({ installation: async () => snapshot }, {
+      providerAuth: { listProviders: async () => { started = true; return []; } },
+    });
+    await host.listProviders(`req-${reason}`, "qwen");
+    assert.deepEqual((sent[0] as { result: unknown }).result, { kind: "unsupported", reason }, JSON.stringify(snapshot));
+    assert.equal(started, false);
+    assert.deepEqual(facadeOptions, [], "the facade was never created");
+  }
 });
 
 test("Qwen Code without a provider facade, or not installed, answers unsupported", async () => {

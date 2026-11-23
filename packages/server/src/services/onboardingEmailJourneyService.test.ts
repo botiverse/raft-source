@@ -11,6 +11,7 @@ import {
   resetOnboardingEmailJourneyTestOverrides,
   setOnboardingEmailJourneyConfigForTest,
 } from "./onboardingEmailJourneyService";
+import { __setEmailDeliveryObserverForTests, type EmailDelivery } from "./emailService";
 
 
 async function seedVerifiedUser(email: string, name: string) {
@@ -31,8 +32,45 @@ async function getJourneysForUser(userId: string) {
 }
 
 afterEach(async () => {
+  __setEmailDeliveryObserverForTests(null);
   resetOnboardingEmailJourneyTestOverrides();
   await closeTestDatabase().catch(() => {});
+});
+
+test("both onboarding deliveries use only a usable display name, never a username fallback", async ({ db }) => {
+  const now = new Date("2026-11-19T00:00:00.000Z");
+  setOnboardingEmailJourneyConfigForTest({ mode: "all", now, day1DelayHours: 24 });
+  const cases = [
+    { name: "pending_0123456789abcdef0123", displayName: null, greeting: "Hi there," },
+    { name: "ordinary-handle", displayName: "  ", greeting: "Hi there," },
+    { name: "pending_123456789abcdef01234", displayName: "  Avery Chen  ", greeting: "Hi Avery Chen," },
+    { name: "ordinary-handle-two", displayName: " PeNdInG_abcdef0123456789abcd ", greeting: "Hi there," },
+  ];
+  const deliveries: EmailDelivery[] = [];
+  __setEmailDeliveryObserverForTests((delivery) => deliveries.push(delivery));
+
+  for (const [index, value] of cases.entries()) {
+    const [user] = await db.insert(users).values({
+      email: `greeting-${index}@example.com`,
+      name: value.name,
+      displayName: value.displayName,
+      passwordHash: await fixturePasswordHash("password123"),
+      emailVerified: true,
+    }).returning();
+    const before = deliveries.length;
+    assert.deepEqual(await enqueueOnboardingEmailJourneyForUser(user), { status: "started" });
+    const sent = deliveries.slice(before);
+    assert.equal(sent.length, 2);
+    for (const delivery of sent) {
+      assert.ok(delivery.html.includes(value.greeting));
+      assert.ok(!delivery.html.includes(value.name));
+      assert.doesNotMatch(delivery.html, /pending_/i);
+    }
+    assert.equal(sent[1].subject, "How's it going with Raft?");
+    assert.equal(sent[1].scheduledAt, "2026-11-20T00:00:00.000Z");
+    assert.deepEqual(await enqueueOnboardingEmailJourneyForUser(user), { status: "already_started" });
+    assert.equal(deliveries.length, before + 2);
+  }
 });
 
 test("onboarding email journey starts for verified users by default", async ({ db }) => {

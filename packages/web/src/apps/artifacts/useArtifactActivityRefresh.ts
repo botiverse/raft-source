@@ -2,23 +2,34 @@ import { useCallback, useEffect, useRef } from "react";
 import type { ArtifactCard, ArtifactCommentId, ArtifactId, ObjectInboxItem } from "@botiverse/raft-shared";
 
 import { useReadObjectWhileShown } from "../../objects/objectRead";
+import { watchObject } from "../../objects/objectWatch";
 import { subscribeObjectSummaryInvalidation } from "../../objects/objectSummaryLoader";
 import { useServerStore } from "../../store/serverStore";
 import { artifactActivityUnread } from "./artifactActivityRow";
 
 /**
  * Calls `listener` on new activity on Artifacts in `serverId` (`id`: on that one; null: any) until
- * unsubscribed. There is no per-Artifact realtime event: `activity:changed` invalidates one
- * server's object summaries (every kind), as do a reconnect (every server's) and a change made
- * here. Another server's activity is left alone: what a page reads is its own server's. Not one
- * reference's card asked again (useArtifactNewerVersion's poll).
+ * unsubscribed: `activity:changed` invalidates one server's object summaries (every kind), as do a
+ * reconnect (every server's) and a change made here. Another server's activity is left alone: what
+ * a page reads is its own server's. Not one reference's card asked again (useArtifactNewerVersion's
+ * poll). With an `id`, also its live ping (core's object watch, objects/objectWatch.ts: sent to
+ * whoever has it open, followers or not, after any comment change commits) and a reconnect's
+ * `resync`; not its `version` ping (useArtifactNewerVersion's).
  */
 function subscribeArtifactActivity(serverId: string, id: ArtifactId | null, listener: () => void): () => void {
-  return subscribeObjectSummaryInvalidation((change) => {
+  const unsubscribe = subscribeObjectSummaryInvalidation((change) => {
     if (change.ref !== undefined || (change.kind !== undefined && change.kind !== "artifact")) return;
     if (typeof change.serverId === "string" && change.serverId !== serverId) return;
     if (id === null || change.id === undefined || change.id === id) listener();
   });
+  if (id === null) return unsubscribe;
+  const unwatch = watchObject("artifact", id, (signal) => {
+    if (signal !== "version") listener();
+  });
+  return () => {
+    unsubscribe();
+    unwatch();
+  };
 }
 
 /**

@@ -63,6 +63,18 @@ test("a codex launch: the driver's executable and env, managed MCP as a session 
   assert.equal(launch.options.systemPrompt, undefined);
 });
 
+test("the version Raft's probe read goes on the installation, so OAR's capability answer for it holds (contextUsage from codex 0.151.0)", async () => {
+  const { oarInstalledSessionCapabilities, loadOarRuntime } = await import("../oarLoader");
+  const codex = await loadOarRuntime("codex");
+  const current = codexOarLaunch(ctx(), { ...prep(), version: "codex-cli 0.166.0" }, {});
+  assert.deepEqual(current.installation, { kind: "available", via: "executable", command: "/opt/codex", version: "codex-cli 0.166.0" });
+  assert.deepEqual(oarInstalledSessionCapabilities(codex, current.installation).contextUsage, { tokens: true, contextWindow: true });
+  const old = codexOarLaunch(ctx(), { ...prep(), version: "codex-cli 0.150.0" }, {});
+  assert.equal(oarInstalledSessionCapabilities(codex, old.installation).contextUsage, undefined, "below OAR's floor: not declared");
+  const unread = codexOarLaunch(ctx(), prep(), {});
+  assert.equal(oarInstalledSessionCapabilities(codex, unread.installation).contextUsage, undefined, "no version read: unknown");
+});
+
 test("the server the first input waits for is the one the launch attaches", async () => {
   const launch = codexOarLaunch(ctx(), prep(), {});
   const attached = launch.options.mcpServers?.map((server) => server.name);
@@ -89,6 +101,13 @@ test("a resumed codex launch keeps the standing prompt and an explicit tier; fas
   assert.equal(bareLaunch.options.model, codexThreadFields(bare).model);
   assert.equal(bareLaunch.options.effort, undefined);
   assert.equal(bareLaunch.options.serviceTier, "default");
+});
+
+test("#wg-runtime-form:#27: a named fast tier reaches OAR as Codex names it", () => {
+  const launch = (mode: unknown) => codexOarLaunch(ctx({ runtimeConfig: { version: 1, runtime: "codex", model: { kind: "preset", id: "gpt-6.2-astra" }, mode } } as Partial<AgentConfig>), prep(null), {});
+  assert.equal(launch({ kind: "fast", serviceTier: "ultrafast" }).options.serviceTier, "ultrafast");
+  assert.equal(launch({ kind: "fast" }).options.serviceTier, "priority");
+  assert.equal(launch({ kind: "default" }).options.serviceTier, "default");
 });
 
 test("Windows: a codex the driver runs through a node host goes to OAR as the npm shim it came from, with the transport env", () => {

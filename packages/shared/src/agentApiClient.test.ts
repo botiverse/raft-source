@@ -202,6 +202,10 @@ const coreSdkFixtures: Record<CoreAgentApiRouteKey, {
     input: [{ channelId: asChannelId("chan-2") }, { agent: "Kirby" }],
     response: { ok: true, wasMember: true, channelId: "chan-2", member: { type: "agent", id: "agent-2", name: "Kirby" } },
   },
+  channelMemberRole: {
+    input: [{ target: "#design", agent: "Kirby", role: "admin" }],
+    response: { ok: true, changed: true, channelId: "chan-2", member: { type: "agent", id: "agent-2", name: "Kirby" }, channelRole: "admin" },
+  },
   channelMembers: {
     input: [{ channel: "#wg-raft-cli" }],
     response: {
@@ -238,6 +242,18 @@ const coreSdkFixtures: Record<CoreAgentApiRouteKey, {
         doneAt: null,
       }],
     },
+  },
+  focus: {
+    input: [{ target: "#wg-raft-cli:abcd1234" }],
+    response: { ok: true, focused: { target: "#wg-raft-cli:abcd1234", kind: "thread", source: "manual", focusedAt: "2026-11-19T12:00:00.000Z", lastActiveAt: "2026-11-19T12:00:00.000Z" }, alreadyFocused: false, evicted: [], entries: [{ target: "#wg-raft-cli:abcd1234", kind: "thread", source: "manual", focusedAt: "2026-11-19T12:00:00.000Z", lastActiveAt: "2026-11-19T12:00:00.000Z" }], limit: 3 },
+  },
+  unfocus: {
+    input: [{ target: "#wg-raft-cli:abcd1234" }],
+    response: { ok: true, target: "#wg-raft-cli:abcd1234", wasFocused: true, entries: [], limit: 3 },
+  },
+  focusList: {
+    input: [],
+    response: { entries: [{ target: "#wg-raft-cli:abcd1234", kind: "thread", source: "manual", focusedAt: "2026-11-19T12:00:00.000Z", lastActiveAt: "2026-11-19T12:00:00.000Z" }], limit: 3 },
   },
   assistantOwnerInbox: {
     input: [{ filter: "unread", limit: "20" }],
@@ -375,6 +391,10 @@ const coreSdkFixtures: Record<CoreAgentApiRouteKey, {
   inboxDismiss: {
     input: [{ before: "2026-11-01" }],
     response: { dismissed: 2, conversations: 1, appItems: 1, skippedNeedsAck: 1, earliestActivityAt: "2026-11-01T00:00:00.000Z", remaining: 0 },
+  },
+  inboxRows: {
+    input: [{ targets: [{ channelId: "11111111-1111-4111-8111-111111111111", newestSeq: 1203 }] }],
+    response: { rows: [{ channelId: "11111111-1111-4111-8111-111111111111", target: "#proj-workspace", kind: "conversation", conversationKind: "channel", mentions: 0, lastReadSeq: 1199, activitySeq: 1203, unread: 3, latestSender: { name: "richard", type: "user" }, preview: "deploy is green", previewTruncated: false, firstUnreadAt: "2026-11-01T00:00:00.000Z", latestAt: "2026-11-01T00:05:00.000Z", preLaunch: false }], behind: 1, otherUnread: { conversations: 4, messages: 9, mentions: 1, dms: 2 } },
   },
   agentContext: {
     input: [],

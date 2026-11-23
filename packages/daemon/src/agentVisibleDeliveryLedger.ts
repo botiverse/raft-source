@@ -123,7 +123,7 @@ function eventIdFromTarget(target: string): string | undefined {
     .exec(target)?.[1].toLowerCase();
 }
 
-function canonicalVisibleTarget(target: string): string {
+export function canonicalVisibleTarget(target: string): string {
   const eventId = eventIdFromTarget(target);
   return eventId ? `agent-event:${getMessageShortId(eventId)}` : target;
 }

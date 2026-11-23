@@ -2,12 +2,15 @@ import { AssistantCannotUseComputerError, lockMachineIfTakesAgents, lockMachineT
 import { revokeRunnerCredentialsOffMachine } from "./agentCredentialService";
 import { retireAgentApprovals } from "./agentRuntimeApprovalService";
 import { ensureAllChannelHumanRows } from "./allChannelMembership";
+import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { openAgentRowSecrets, openAgentRowSecretsIsolated, sealAgentEnvVars, sealAgentRuntimeConfig } from "./agentSecretCrypto";
+import { isAgentSecretWriteEncryptionEnabled } from "./agentSecretFlags";
 import { eq, and, inArray, isNull, sql, asc, ne, or, type SQL } from "drizzle-orm";
 import { getDb, registerDatabaseCloseHookForTests, withDbTraceAttributes, type DatabaseExecutor, type DatabaseTransaction } from "../db/index";
 import { actorRoleHasServerCapability } from "../lib/actorPermissions";
 import { FencedAuthorizationDeniedError, ServerMembershipRevokedError } from "../lib/actorMembershipFence";
-import { raftbenchConfigs, raftbenchFindings, raftbenchLatestRuns, raftbenchServiceAgents, thirdPartyAgentEvents, agents, machines, channels, channelAgents, servers, serverMembers, serverAgentMembers, users, agentRuntimeProfiles, assistantCheckState, assistantChecks, assistantContactRules, assistantContactSettings, assistantTold, messages, tasks, taskEvents, agentProviderConnections, providerConnections, providerConnectionCredentials, oauthClientInstalls, inboxTargetMuteStates, agentCredentials, agentBootstrapTokens } from "../db/schema";
+import { raftbenchConfigs, raftbenchFindings, raftbenchLatestRuns, raftbenchServiceAgents, thirdPartyAgentEvents, agents, machines, channels, channelAgents, servers, serverMembers, serverAgentMembers, users, agentRuntimeProfiles, assistantCheckState, assistantChecks, assistantContactRules, assistantContactSettings, assistantTold, messages, tasks, taskEvents, oauthClientInstalls, inboxTargetMuteStates, agentCredentials, agentBootstrapTokens } from "../db/schema";
 import { DEPRECATED_GRAVATAR_HASH, 
   replaceAgentLineBreaks, ALL_CHANNEL_TEAM_THRESHOLD, EXTERNAL_AGENT_RUNTIME_ID, PLAN_CONFIG, currentDate, currentTimeMs, getEffectiveLimits, type AgentRuntimeErrorState, type AgentStatus, type ServerPlan, type ReasoningEffort, type LegacyColumnReasoningEffort, type RuntimeConfig, getDefaultModel, isExternalAgentRuntime, validateAgentName, type ServerRole } from "@botiverse/raft-shared";
 import { assertAgentCapacityAvailable, getServerBillingEntitlement, getServerBillingUsage, withAgentCreateLock } from "./planService";
@@ -18,7 +21,6 @@ import { refreshSubscriptionForServerIfStale } from "./billingService";
 import { recordSecondAgentCreatedEvent } from "./productEventsService";
 import { emitAppFacingMemberEvents, emitAppFacingNotificationEvent, kickAppNotificationDelivery } from "./appNotificationDeliveryService";
 import { assertActionCardWritable, assertActionCardWritableInTransaction } from "./actionCardConversionService";
-import { recordIntegrationAuditEvent } from "./integrationAuditService";
 import { agentConfigValues, recordAgentConfigChange, type AgentConfigChangeActor, type AgentConfigChangeSource } from "./agentConfigChangeEvents";
 
 export type CreatorType = "user" | "agent";
@@ -78,12 +80,6 @@ export async function createAgent(
     creatorType?: CreatorType;
     creatorId?: string;
     expectedSetupStatus?: "not_started" | "in_progress" | "deferred" | "complete" | null;
-    providerConnection?: {
-      id: string;
-      configVersion: number;
-      credentialVersion: number;
-      updatedByUserId: string;
-    };
     actionCardMessageId?: string;
     actionCardConfirmationVersion?: number;
     /**
@@ -197,9 +193,12 @@ export async function createAgent(
       }
     }
 
+    const agentId = randomUUID();
+    const encryptOnWrite = await isAgentSecretWriteEncryptionEnabled(serverId, tx);
     const [newAgent] = await tx
       .insert(agents)
       .values({
+        id: agentId,
         serverId,
         name,
         displayName: replaceAgentLineBreaks(opts.displayName ?? name, " "),
@@ -207,15 +206,16 @@ export async function createAgent(
         avatarUrl: opts.avatarUrl || null,
         runtime,
         model: opts.model || getDefaultModel(runtime),
-        runtimeConfig: opts.runtimeConfig || null,
+        runtimeConfig: encryptOnWrite ? sealAgentRuntimeConfig(agentId, opts.runtimeConfig || null) : (opts.runtimeConfig || null),
         reasoningEffort: opts.reasoningEffort || null,
-        envVars: opts.envVars || null,
+        envVars: encryptOnWrite ? sealAgentEnvVars(agentId, opts.envVars || null) : (opts.envVars || null),
         creatorType: opts.creatorType || null,
         creatorId: opts.creatorId || null,
         executionMode: "byoc",
         machineId,
       })
       .returning();
+    const openedNewAgent = openAgentRowSecrets(newAgent);
     await recordAgentConfigChange(tx, {
       serverId,
       agentId: newAgent.id,
@@ -244,18 +244,7 @@ export async function createAgent(
     }
 
     if (opts.afterInsert) {
-      await opts.afterInsert(tx, newAgent);
-    }
-
-    if (opts.providerConnection) {
-      await tx.insert(agentProviderConnections).values({
-        serverId,
-        agentId: newAgent.id,
-        connectionId: opts.providerConnection.id,
-        expectedConfigVersion: opts.providerConnection.configVersion,
-        expectedCredentialVersion: opts.providerConnection.credentialVersion,
-        updatedByUserId: opts.providerConnection.updatedByUserId,
-      });
+      await opts.afterInsert(tx, openedNewAgent);
     }
 
     // Feature-activation evidence, not the activation definition: when a
@@ -341,7 +330,7 @@ export async function createAgent(
     // may not be Cindy. Someone running a non-Cindy agent has still set their server up.
     await markServerSetupCompleteOnFirstAgent(tx, serverId, ownerSetupStamp);
 
-    return newAgent;
+    return openedNewAgent;
   });
 
   kickAppNotificationDelivery();
@@ -469,7 +458,7 @@ export async function listAgents(
     conditions.push(inArray(agents.id, [...new Set(opts.agentIds)]));
   }
   const traceQuery = opts.traceQuery ?? untracedDbQuery;
-  return traceQuery(
+  const rows = await traceQuery(
     "agents.list_by_server",
     () => db
       .select()
@@ -481,6 +470,7 @@ export async function listAgents(
       include_deleted: includeDeleted,
     }),
   );
+  return rows.map((row) => openAgentRowSecretsIsolated(row));
 }
 
 /**
@@ -533,7 +523,7 @@ export async function getAgent(
     },
   );
   const [agent] = rows;
-  return agent || null;
+  return (agent && openAgentRowSecretsIsolated(agent)) || null;
 }
 
 export async function getAgentCreator(agent: { serverId: string; creatorType: string | null; creatorId: string | null }): Promise<CreatorSummary | null> {
@@ -1041,6 +1031,9 @@ function billingErrorIsNewerThanStoredSql(incoming: AgentRuntimeErrorState) {
  * It replaces a stored BillingError only when it provably came after it
  * (billingErrorIsNewerThanStoredSql); a replay or a late 402 from another
  * launch leaves the stored one.
+ *
+ * A failed start (`spawnFailureReason`) is written only over no error or
+ * another failed start; any other stored error stays and is returned.
  */
 export async function setAgentLastRuntimeError(
   agentId: string,
@@ -1060,9 +1053,15 @@ export async function setAgentLastRuntimeError(
       ${stored} IS NOT NULL
       AND ${stored}->>'message' IS NOT DISTINCT FROM ${lastRuntimeError.message}
       AND ${stored}->>'errorClass' IS NOT DISTINCT FROM ${lastRuntimeError.errorClass ?? null}::text
+      AND ${stored}->>'spawnFailureReason' IS NOT DISTINCT FROM ${lastRuntimeError.spawnFailureReason ?? null}::text
       AND (${stored}->>'actionRequired')::boolean IS NOT DISTINCT FROM ${lastRuntimeError.actionRequired}
       AND (${stored}->>'at')::timestamptz > ${lastRuntimeError.at}::timestamptz - make_interval(secs => ${AGENT_RUNTIME_ERROR_REWRITE_WINDOW_MS / 1000})
-    )`;
+    )${lastRuntimeError.spawnFailureReason
+      // A failed start replaces nothing but another failed start: a runtime
+      // error (a provider limit, a BillingError, a typed sign-in or model
+      // error) stays, whatever this replica's cache shows.
+      ? sql` AND (${stored} IS NULL OR (${stored}->>'spawnFailureReason') IS NOT NULL)`
+      : sql``}`;
   const [updated] = await db.update(agents)
     .set({
       lastRuntimeError,
@@ -1229,12 +1228,6 @@ export async function updateAgent(
     reasoningEffort?: LegacyColumnReasoningEffort | null;
     envVars?: Record<string, string> | null;
     sessionId?: string | null;
-    providerConnection?: {
-      id: string;
-      configVersion: number;
-      credentialVersion: number;
-      updatedByUserId: string;
-    } | null;
   },
   options: {
     executor?: DatabaseExecutor;
@@ -1254,7 +1247,17 @@ export async function updateAgent(
       if (binding) throw new FencedAuthorizationDeniedError("forbidden");
     }
 
-    const { reasoningEffort, envVars, runtimeConfig, sessionId, providerConnection, ...rest } = fields;
+    const { reasoningEffort, envVars, runtimeConfig, sessionId, ...rest } = fields;
+    const openedExisting = openAgentRowSecretsIsolated(existing);
+    const encryptOnWrite = (envVars !== undefined || runtimeConfig !== undefined)
+      ? await isAgentSecretWriteEncryptionEnabled(existing.serverId, tx)
+      : false;
+    const persistedEnvVars = envVars !== undefined
+      ? (encryptOnWrite ? sealAgentEnvVars(agentId, envVars) : envVars)
+      : undefined;
+    const persistedRuntimeConfig = runtimeConfig !== undefined
+      ? (encryptOnWrite ? sealAgentRuntimeConfig(agentId, runtimeConfig) : runtimeConfig)
+      : undefined;
     const now = currentDate();
     const [updated] = await tx.update(agents)
       .set({
@@ -1263,73 +1266,49 @@ export async function updateAgent(
         ...(typeof rest.displayName === "string" ? { displayName: replaceAgentLineBreaks(rest.displayName, " ") } : {}),
         ...(typeof rest.description === "string" ? { description: replaceAgentLineBreaks(rest.description, "\n") } : {}),
         ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
-        ...(envVars !== undefined ? { envVars } : {}),
-        ...(runtimeConfig !== undefined ? { runtimeConfig } : {}),
+        ...(persistedEnvVars !== undefined ? { envVars: persistedEnvVars } : {}),
+        ...(persistedRuntimeConfig !== undefined ? { runtimeConfig: persistedRuntimeConfig } : {}),
         ...(sessionId !== undefined ? { sessionId } : {}),
         updatedAt: now,
       })
       .where(and(eq(agents.id, agentId), isNull(agents.deletedAt)))
       .returning();
     if (!updated) return null;
+    const openedUpdated = openAgentRowSecretsIsolated(updated);
     await recordAgentConfigChange(tx, {
-      serverId: updated.serverId,
-      agentId: updated.id,
+      serverId: openedUpdated.serverId,
+      agentId: openedUpdated.id,
       source: options.configChange?.source ?? "agent_update",
       actor: options.configChange?.actor ?? null,
-      before: agentConfigValues(existing),
-      after: agentConfigValues(updated),
+      before: agentConfigValues(openedExisting),
+      after: agentConfigValues(openedUpdated),
       changedAt: now,
     });
 
-    if (providerConnection === null) {
-      await tx.delete(agentProviderConnections).where(and(
-        eq(agentProviderConnections.serverId, updated.serverId),
-        eq(agentProviderConnections.agentId, updated.id),
-      ));
-    } else if (providerConnection !== undefined) {
-      await tx.insert(agentProviderConnections).values({
-        serverId: updated.serverId,
-        agentId: updated.id,
-        connectionId: providerConnection.id,
-        expectedConfigVersion: providerConnection.configVersion,
-        expectedCredentialVersion: providerConnection.credentialVersion,
-        updatedByUserId: providerConnection.updatedByUserId,
-      }).onConflictDoUpdate({
-        target: agentProviderConnections.agentId,
-        set: {
-          connectionId: providerConnection.id,
-          expectedConfigVersion: providerConnection.configVersion,
-          expectedCredentialVersion: providerConnection.credentialVersion,
-          updatedByUserId: providerConnection.updatedByUserId,
-          updatedAt: now,
-        },
-      });
-    }
-
     const profileFields = [
-      existing.displayName !== updated.displayName ? "display_name" : null,
-      existing.description !== updated.description ? "description" : null,
-      existing.avatarUrl !== updated.avatarUrl ? "avatar_url" : null,
+      openedExisting.displayName !== openedUpdated.displayName ? "display_name" : null,
+      openedExisting.description !== openedUpdated.description ? "description" : null,
+      openedExisting.avatarUrl !== openedUpdated.avatarUrl ? "avatar_url" : null,
     ].filter((field): field is string => field !== null);
     if (profileFields.length > 0) {
-      await emitAgentNotificationEvent(tx, updated, "agent.profile_updated", profileFields, now);
+      await emitAgentNotificationEvent(tx, openedUpdated, "agent.profile_updated", profileFields, now);
     }
 
     const runtimeFields = [
-      existing.runtime !== updated.runtime ? "runtime" : null,
-      existing.reasoningEffort !== updated.reasoningEffort ? "reasoning_effort" : null,
-      !isDeepStrictEqual(existing.envVars, updated.envVars) ? "env_vars" : null,
-      !isDeepStrictEqual(runtimeConfigWithoutModel(existing.runtimeConfig), runtimeConfigWithoutModel(updated.runtimeConfig))
+      openedExisting.runtime !== openedUpdated.runtime ? "runtime" : null,
+      openedExisting.reasoningEffort !== openedUpdated.reasoningEffort ? "reasoning_effort" : null,
+      !isDeepStrictEqual(openedExisting.envVars, openedUpdated.envVars) ? "env_vars" : null,
+      !isDeepStrictEqual(runtimeConfigWithoutModel(openedExisting.runtimeConfig), runtimeConfigWithoutModel(openedUpdated.runtimeConfig))
         ? "runtime_config"
         : null,
     ].filter((field): field is string => field !== null);
     if (runtimeFields.length > 0) {
-      await emitAgentNotificationEvent(tx, updated, "agent.runtime_changed", runtimeFields, now);
+      await emitAgentNotificationEvent(tx, openedUpdated, "agent.runtime_changed", runtimeFields, now);
     }
-    if (existing.model !== updated.model) {
-      await emitAgentNotificationEvent(tx, updated, "agent.model_changed", ["model"], now);
+    if (openedExisting.model !== openedUpdated.model) {
+      await emitAgentNotificationEvent(tx, openedUpdated, "agent.model_changed", ["model"], now);
     }
-    return updated;
+    return openedUpdated;
   });
   return result;
 }
@@ -1414,7 +1393,7 @@ export async function adoptOfficialOnboardingAgentIdentity(
           },
         });
     }
-    return updated || null;
+    return (updated && openAgentRowSecretsIsolated(updated)) || null;
   });
 }
 
@@ -1558,49 +1537,6 @@ export async function deleteAgent(agentId: string, options: { executor?: Databas
         members: [{ principalType: "agent", principalId: agentId, role: membership.role }],
         occurredAt: deletedAt,
         provenance: { source: "agent_service", actor_type: "human", reason: "removed" },
-      }, tx);
-    }
-
-    // A deleted Agent can never launch again, so its provider connection
-    // assignment is dead weight. Keeping the row would leave the connection
-    // permanently undeletable with no reachable Agent to unbind it from —
-    // the same release already applied to task claims below.
-    const [releasedProviderAssignment] = await tx.select({
-      serverId: agentProviderConnections.serverId,
-      connectionId: agentProviderConnections.connectionId,
-      providerId: providerConnections.providerId,
-      configVersion: providerConnections.configVersion,
-      credentialVersion: providerConnectionCredentials.credentialVersion,
-    }).from(agentProviderConnections)
-      .innerJoin(providerConnections, and(
-        eq(providerConnections.serverId, agentProviderConnections.serverId),
-        eq(providerConnections.id, agentProviderConnections.connectionId),
-      ))
-      .leftJoin(providerConnectionCredentials, and(
-        eq(providerConnectionCredentials.serverId, agentProviderConnections.serverId),
-        eq(providerConnectionCredentials.connectionId, agentProviderConnections.connectionId),
-      ))
-      .where(eq(agentProviderConnections.agentId, agentId))
-      .limit(1);
-
-    if (releasedProviderAssignment) {
-      await tx.delete(agentProviderConnections)
-        .where(eq(agentProviderConnections.agentId, agentId));
-      await recordIntegrationAuditEvent({
-        serverId: releasedProviderAssignment.serverId,
-        eventType: "provider_connection.assignment_detached",
-        outcome: "success",
-        source: "system",
-        actor: { type: "system" },
-        subject: { type: "agent", id: agentId },
-        target: { type: "provider_connection", id: releasedProviderAssignment.connectionId },
-        metadata: {
-          providerId: releasedProviderAssignment.providerId,
-          configVersion: releasedProviderAssignment.configVersion,
-          credentialVersion: releasedProviderAssignment.credentialVersion,
-          agentId,
-          reason: "agent_deleted",
-        },
       }, tx);
     }
 
@@ -1769,18 +1705,20 @@ export async function getAgentsByIds(agentIds: readonly string[]) {
   const ids = [...new Set(agentIds)];
   if (ids.length === 0) return [];
   const db = getDb();
-  return db
+  const rows = await db
     .select()
     .from(agents)
     .where(and(inArray(agents.id, ids), isNull(agents.deletedAt)));
+  return rows.map((row) => openAgentRowSecretsIsolated(row));
 }
 
 export async function getAgentsForMachine(machineId: string) {
   const db = getDb();
-  return db
+  const rows = await db
     .select()
     .from(agents)
     .where(and(eq(agents.machineId, machineId), isNull(agents.deletedAt)));
+  return rows.map((row) => openAgentRowSecretsIsolated(row));
 }
 
 export async function autoAssignMachine(serverId: string, machineId: string) {

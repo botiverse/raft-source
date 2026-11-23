@@ -11,7 +11,7 @@ import { clearSecondFactorSignIn } from "../src/components/auth/secondFactorSign
 import { useAuthStore } from "../src/store/authStore";
 import { installFakeDesktopAuth } from "./helpers/fakeDesktopAuth";
 import type { FakeDesktopAuth } from "./helpers/fakeDesktopAuth";
-import { assertionJSON, closedPrompt, credentialFor, installFakeWebAuthn } from "./helpers/fakeWebAuthn";
+import { assertionJSON, closedPrompt, credentialFor, installFakeWebAuthn, registrationJSON } from "./helpers/fakeWebAuthn";
 import type { FakeWebAuthn } from "./helpers/fakeWebAuthn";
 import { TestIntlProvider } from "./helpers/intl";
 
@@ -340,4 +340,117 @@ test("with the autofill, a server without passkeys hides the link before anyone 
   await waitFor(() => assert.equal(passkeyLinks().length, 0));
   assert.deepEqual(webauthn.gets, []);
   assert.ok(screen.queryByText("Sign-in failed") === null);
+});
+
+// Passkeys under the old RP ID (raft.build → app.raft.build): options name
+// their group (`rp`) only while the server also verifies the old one.
+
+/** Options as a server with a legacy RP ID answers them: `rp` names the group asked for. */
+function groupedOptionsHandler(): Handler {
+  let n = 0;
+  return (body) => {
+    n += 1;
+    const rp = (body as { rp?: string } | undefined)?.rp === "legacy" ? "legacy" : "current";
+    return {
+      options: { challenge: String(n).repeat(43), rpId: rp === "legacy" ? "raft.build" : "app.raft.build", userVerification: "required", allowCredentials: [] },
+      expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+      rp,
+    };
+  };
+}
+
+function earlierPasskeyLinks() {
+  return screen.queryAllByRole("button", { name: "Use an earlier passkey" });
+}
+
+test("nothing to pick under the new RP ID: \"Use an earlier passkey\" shows, and only its click prompts again, for the old one", async () => {
+  let n = 0;
+  webauthn = installFakeWebAuthn({
+    get: () => {
+      n += 1;
+      if (n === 1) throw closedPrompt();
+      return credentialFor(assertionJSON("old-cred"));
+    },
+  });
+  const posts = stubPosts({ [OPTIONS_URL]: [groupedOptionsHandler()], [VERIFY_URL]: [() => SIGNED_IN] });
+  renderLogin();
+
+  assert.equal(earlierPasskeyLinks().length, 0, "not before a prompt found nothing");
+  await clickPasskeyLink();
+  const earlier = await screen.findByRole("button", { name: "Use an earlier passkey" });
+  await settle();
+  assert.equal(webauthn.gets.length, 1, "never a second prompt on its own");
+  assert.deepEqual(posts.map((post) => post.body), [{}]);
+
+  await waitFor(() => assert.equal(earlier.hasAttribute("disabled"), false));
+  await act(async () => {
+    fireEvent.click(earlier);
+  });
+  await waitFor(() => assert.equal(useAuthStore.getState().user?.id, "user-1"));
+  assert.deepEqual(posts.filter((post) => post.url === OPTIONS_URL).map((post) => post.body), [{}, { rp: "legacy" }]);
+  assert.equal(webauthn.gets.length, 2);
+  assert.equal(webauthn.gets[1]!.publicKey?.rpId, "raft.build");
+});
+
+test("a server without a legacy RP ID (no `rp` in its options) never shows the line", async () => {
+  webauthn = installFakeWebAuthn({ get: () => { throw closedPrompt(); } });
+  stubPosts({ [OPTIONS_URL]: [optionsHandler()] });
+  renderLogin();
+
+  await clickPasskeyLink();
+  await screen.findByText("The passkey prompt was closed, so you haven't been signed in. Try again, or sign in another way.");
+  assert.equal(earlierPasskeyLinks().length, 0);
+});
+
+test("the legacy RP ID gone meanwhile (404 passkey_rp_unavailable): the line goes, with the generic failure", async () => {
+  webauthn = installFakeWebAuthn({ get: () => { throw closedPrompt(); } });
+  const grouped = groupedOptionsHandler();
+  stubPosts({
+    [OPTIONS_URL]: [
+      grouped,
+      fail(404, { code: "passkey_rp_unavailable", error: "There are no earlier passkeys to sign in with.", rp: "legacy", availableRps: [] }),
+    ],
+  });
+  renderLogin();
+
+  await clickPasskeyLink();
+  const earlier = await screen.findByRole("button", { name: "Use an earlier passkey" });
+  await waitFor(() => assert.equal(earlier.hasAttribute("disabled"), false));
+  await act(async () => {
+    fireEvent.click(earlier);
+  });
+  await screen.findByText("Sign-in failed");
+  assert.equal(earlierPasskeyLinks().length, 0);
+  assert.equal(webauthn.gets.length, 1, "no prompt without options");
+});
+
+// An earlier passkey keeps working as it is: nothing asks to replace it, even
+// where the server still offers a swap (artin, #proj-mobile:#188).
+test("signing in with an old passkey asks for nothing more, even when the server offers a swap", async () => {
+  webauthn = installFakeWebAuthn({ get: () => credentialFor(assertionJSON("old-cred")), create: () => credentialFor(registrationJSON()) });
+  const swapChallenge = "s".repeat(43);
+  const posts = stubPosts({
+    [OPTIONS_URL]: [optionsHandler()],
+    [VERIFY_URL]: [() => ({
+      ...SIGNED_IN,
+      swapSuggested: true,
+      passkeySwap: {
+        options: {
+          challenge: swapChallenge,
+          rp: { id: "app.raft.build", name: "Raft" },
+          user: { id: "dXNlcg", name: "owner@example.com", displayName: "owner" },
+          pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+        },
+        expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+      },
+    })],
+  });
+  renderLogin();
+
+  await clickPasskeyLink();
+  await waitFor(() => assert.equal(useAuthStore.getState().user?.id, "user-1"));
+  // Give a swap, were there one, the turns it would take to start.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(webauthn.creates.length, 0, "no new passkey is created");
+  assert.deepEqual(posts.map((post) => post.url), [OPTIONS_URL, VERIFY_URL]);
 });

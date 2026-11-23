@@ -1,8 +1,9 @@
-import { ContextMenuPopup, ScrollArea } from "@botiverse/raft-ui";
-import { createPortal } from "react-dom";
+import { ScrollArea } from "@botiverse/raft-ui";
 import { Archive, ChevronRight, X, Pin, PinOff, Bell, BellOff, Check, FolderInput, FolderPlus } from "lucide-react";
 import { canToggleActivityMute } from "../../../store/channelDomain";
 import { useMessageStore } from "../../../store/messageStore";
+import { AnchoredMenuPopover } from "../../../components/ui/AnchoredMenuPopover";
+import { TRIGGER_MENU_COLLISION_AVOIDANCE } from "../../../components/ui/useAnchorHiddenClose";
 import ContextMenuDivider from "../../../components/ui/ContextMenuDivider";
 import MenuItem from "../../../components/ui/MenuItem";
 import { NotificationLevelSubmenu } from "../../../components/notifications/NotificationLevelMenu";
@@ -12,13 +13,18 @@ import DismissBackdrop from "../../../components/ui/DismissBackdrop";
 import { SidebarReadToggleMenuItem } from "../../../components/layout/SidebarReadToggleMenuItem";
 import { MoveToSectionMenuItem } from "../../../components/layout/MoveToSectionMenuItem";
 import { hasSidebarPinnedRef } from "../../../utils/sidebarPinnedRefs";
-import { getSidebarContextMenuStyle, stopSidebarContextMenuPropagation } from "../sidebarContextMenu";
+import { stopSidebarContextMenuPropagation } from "../sidebarContextMenu";
 import { pinnedRefForDmChannel } from "../sidebarDisplayItems";
 import type { SidebarData } from "../hooks/useSidebarData";
 import type { SidebarViewState } from "../hooks/useSidebarViewState";
 import type { SidebarSync } from "../hooks/useSidebarSync";
 import type { SidebarItems } from "../hooks/useSidebarItems";
 import type { SidebarMenuActions } from "../hooks/useSidebarMenuActions";
+
+function swallowShieldedClick(event: { stopPropagation: () => void; preventDefault: () => void }) {
+  event.stopPropagation();
+  event.preventDefault();
+}
 
 /**
  * A row's context menu (channel, DM, person, agent, Agent Lounge) and its
@@ -32,21 +38,21 @@ export function SidebarRowContextMenu({ data, view, sync, items, menuActions }: 
   menuActions: SidebarMenuActions;
 }) {
   const {
-    formatMessage, customSections, ctxMenu, ctxMenuRef, moveToSectionTriggerRef,
-    moveToSectionMenuOpen, setMoveToSectionMenuNode,
+    formatMessage, customSections, ctxMenu, moveToSectionTriggerRef,
+    moveToSectionMenuOpen,
   } = data;
   const { ctxMenuClickShielded, capabilities } = view;
   const { clearCtxMenu, closeCtx } = sync;
   const { pinnedRefs, pinnedAgentIds } = items;
   const {
-    contextMovableItem, contextPlacement, contextItemPinned, ctxChannel, ctxHumanDmChannel, ctxDmChannel,
+    contextMovableItem, contextItemPinned, ctxChannel, ctxHumanDmChannel, ctxDmChannel,
     ctxAgent, ctxAgentDmChannelId, closeMoveToSectionMenuFromHover,
-    closeMoveToSectionMenuFromFocus, openMoveToSectionMenu, ctxMuteTarget, toggleContextActivityMute,
+    closeMoveToSectionMenuFromFocus, openMoveToSectionMenu, closeMoveToSectionMenu, ctxMuteTarget, toggleContextActivityMute,
     contextNotificationLevelTarget, toggleContextChannelPin, archiveContextChannel, leaveContextChannel,
     toggleContextHumanPin, toggleContextDmPin, toggleContextAgentPin, closeContextDm, ctxLounge,
-    toggleContextLoungePin, closeContextLounge, moveToSectionMenuStyle,
-    moveContextItemToPinned, moveContextItemToSection, createSectionWithContextItem,
-    removeContextItemFromSection,
+    toggleContextLoungePin, closeContextLounge,
+    moveContextItemToPinned, moveContextItemToSection, moveContextItemToHome, createSectionWithContextItem,
+    contextHomeLabelId, contextItemHome, contextCurrentSectionId,
   } = menuActions;
 
   const renderReadToggleAction = (channelId: string, hasUnread: boolean, includeThreads = false) => (
@@ -74,17 +80,24 @@ export function SidebarRowContextMenu({ data, view, sync, items, menuActions }: 
   // Stryker restore all
   return (
     <>
-      {/* Context menu — portal to body to escape sidebar transform containment */}
-      {ctxMenu && createPortal(
+      {ctxMenu && (
         <>
           {/* Outside-click overlay. onClick (not onMouseDown) so the synthetic
               mousedown after a long-press touchend doesn't close it instantly.
               Same pattern as MessageItem context menu. */}
           <DismissBackdrop onDismiss={closeCtx} trapContextMenu />
-          <ContextMenuPopup
-            ref={ctxMenuRef}
-            className="fixed z-popup max-h-[calc(100vh-16px)] w-60 select-none p-0"
-            style={getSidebarContextMenuStyle(ctxMenu)}
+          {/* Phantom-click shield for iOS PWA. The shield DismissBackdrop absorbs
+              synthetic outside taps, while onClickCapture + pointer-events-none on
+              the menu absorbs any synthetic tap landing over a row or scrollbar gutter. */}
+          {ctxMenuClickShielded && (
+            <DismissBackdrop onDismiss={closeCtx} stopPropagation />
+          )}
+          <AnchoredMenuPopover
+            open
+            anchor={ctxMenu.anchor}
+            onAnchorHidden={closeCtx}
+            className={ctxMenuClickShielded ? "w-60 p-0 pointer-events-none" : "w-60 p-0"}
+            onClickCapture={ctxMenuClickShielded ? swallowShieldedClick : undefined}
             onMouseDown={stopSidebarContextMenuPropagation}
             onTouchStart={stopSidebarContextMenuPropagation}
             onMouseOver={closeMoveToSectionMenuFromHover}
@@ -300,32 +313,50 @@ export function SidebarRowContextMenu({ data, view, sync, items, menuActions }: 
             );
           })()}
           </ScrollArea>
-          </ContextMenuPopup>
+          </AnchoredMenuPopover>
           {contextMovableItem && moveToSectionMenuOpen && (
-            <ContextMenuPopup
-              ref={setMoveToSectionMenuNode}
+            <AnchoredMenuPopover
+              open
+              anchor={moveToSectionTriggerRef}
+              side="right"
+              align="start"
+              sideOffset={4}
+              collisionAvoidance={TRIGGER_MENU_COLLISION_AVOIDANCE}
+              onAnchorHidden={closeMoveToSectionMenu}
               role="menu"
               aria-label={formatMessage({ id: "layout.sidebar.moveToSection" })}
-              className="fixed z-popup max-h-[calc(100vh-16px)] w-60 select-none p-0"
-              style={moveToSectionMenuStyle}
+              className="w-60 p-0"
               onMouseDown={stopSidebarContextMenuPropagation}
               onTouchStart={stopSidebarContextMenuPropagation}
             >
               <ScrollArea tabIndex={-1} className="min-h-0 flex-1" contentClassName="flex flex-col p-1">
+              {/* As channel settings' Sidebar section select (cindyz, #triage:#518):
+                  the home section first, the current section checked and bold (on the
+                  label: MenuItem's own font-medium would win over font-bold on the row).
+                  Home always writes: it also clears a stale pin or an orphaned placement. */}
+              {contextHomeLabelId && (
+                <MenuItem
+                  icon={<FolderInput size={14} />}
+                  trailing={contextItemHome ? <Check size={16} /> : null}
+                  onClick={moveContextItemToHome}
+                  data-testid="sidebar-move-to-home"
+                >
+                  <span className={contextItemHome ? "font-bold" : undefined}>{formatMessage({ id: contextHomeLabelId })}</span>
+                </MenuItem>
+              )}
               <MenuItem
                 icon={<Pin size={14} />}
-                disabled={contextItemPinned}
                 trailing={contextItemPinned ? <Check size={16} /> : null}
-                onClick={moveContextItemToPinned}
+                onClick={contextItemPinned ? closeCtx : moveContextItemToPinned}
               >
-                {formatMessage({ id: "layout.sidebar.pinned" })}
+                <span className={contextItemPinned ? "font-bold" : undefined}>{formatMessage({ id: "layout.sidebar.pinned" })}</span>
               </MenuItem>
               {customSections.map((section) => (
                 <MoveToSectionMenuItem
                   key={section.id}
                   section={section}
-                  current={contextPlacement?.sectionId === section.id}
-                  onMove={moveContextItemToSection}
+                  current={contextCurrentSectionId === section.id}
+                  onMove={contextCurrentSectionId === section.id ? closeCtx : moveContextItemToSection}
                 />
               ))}
               <ContextMenuDivider />
@@ -335,24 +366,10 @@ export function SidebarRowContextMenu({ data, view, sync, items, menuActions }: 
               >
                 {formatMessage({ id: "layout.sidebar.newSectionMenu" })}
               </MenuItem>
-              {contextPlacement && (
-                <MenuItem
-                  icon={<X size={14} />}
-                  onClick={removeContextItemFromSection}
-                >
-                  {formatMessage({ id: "layout.sidebar.removeFromSection" })}
-                </MenuItem>
-              )}
             </ScrollArea>
-          </ContextMenuPopup>
+          </AnchoredMenuPopover>
           )}
-          {/* Phantom-click shield for iOS PWA. See ctxMenuClickShielded. Over
-              the menus: all are z-popup, and it comes after them in the DOM. */}
-          {ctxMenuClickShielded && (
-            <DismissBackdrop onDismiss={closeCtx} stopPropagation />
-          )}
-        </>,
-        document.body
+        </>
       )}
     </>
   );

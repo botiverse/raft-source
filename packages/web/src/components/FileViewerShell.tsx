@@ -136,8 +136,10 @@ export function FileViewerHeader({
     >
       <AttachmentTooltip content={filename}>
         {/* Desktop: keep the pointer here so the full-name tooltip shows (the
-            rest of the header is a window drag region). */}
-        <LightboxHeaderMeta className="gap-2" {...{ [OVERLAY_TITLEBAR_NO_DRAG_ATTR]: "" }}>
+            rest of the header is a window drag region). As wide as the name,
+            not the row (raft-ui's meta grows): grown, it left nothing to drag
+            the window by (#triage:#537). The spacer below takes the row. */}
+        <LightboxHeaderMeta className="flex-initial gap-2" {...{ [OVERLAY_TITLEBAR_NO_DRAG_ATTR]: "" }}>
           {phone ? null : (
             <AttachmentTypeBadge
               filename={filename}
@@ -148,6 +150,9 @@ export function FileViewerHeader({
           <LightboxTitle>{filename}</LightboxTitle>
         </LightboxHeaderMeta>
       </AttachmentTooltip>
+      {/* Pushes the counter and actions to the end; on desktop it is the
+          header's drag handle (not no-drag). */}
+      <div aria-hidden="true" className="min-w-0 flex-1" data-testid="file-viewer-header-spacer" />
       {count > 1 && !phone ? (
         <Badge appearance="outline" className="shrink-0 tabular-nums">
           {index + 1} / {count}

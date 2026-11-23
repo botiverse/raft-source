@@ -72,7 +72,7 @@ import {
 import { recordTotpStep, verifyTotp } from "./totp";
 import { checkPasskeyAssertion, countActivePasskeys, recordPasskeyUse, sendPasskeyCounterWarning, startPasskeyAssertion, type CheckedPasskeyAssertion } from "./passkeys";
 import { decryptTotpSecret, TotpSecretCryptoError } from "./totpSecretCrypto";
-import { parsePasskeyAssertionResponse, webauthnRelyingParty, type PasskeyAssertionResponse } from "./webauthn";
+import { parsePasskeyAssertionResponse, webauthnRelyingParty, type PasskeyAssertionResponse, type PasskeyRpGroup } from "./webauthn";
 
 export const SECOND_FACTOR_SIGN_IN_TTL_MS = 5 * 60_000;
 
@@ -220,6 +220,7 @@ export type SecondFactorSignInErrorCode =
   | "second_factor_unavailable"
   | "passkeys_unavailable"
   | "passkey_not_found"
+  | "passkey_rp_unavailable"
   | "recovery_not_found"
   | "recovery_not_ready";
 
@@ -234,6 +235,7 @@ const STATUS_OF: Record<SecondFactorSignInErrorCode, number> = {
   second_factor_unavailable: 503,
   passkeys_unavailable: 503,
   passkey_not_found: 404,
+  passkey_rp_unavailable: 404,
   recovery_not_found: 409,
   recovery_not_ready: 409,
 };
@@ -281,12 +283,15 @@ export function parseSecondFactorSignInAnswer(body: unknown): SecondFactorSignIn
 }
 
 /**
- * POST /api/auth/second-factor/passkeys/assertion/options { challenge }:
+ * POST /api/auth/second-factor/passkeys/assertion/options { challenge, rp? }:
  * assertion options for the person a live second-factor sign-in challenge
- * belongs to, bound to that challenge (passkeys.ts). Takes no attempt; the
- * answer at /verify does.
+ * belongs to, bound to that challenge (passkeys.ts), for the RP group `rp`
+ * (`current` | `legacy`) or the default one. Takes no attempt; the
+ * answer at /verify does. 404 `passkey_rp_unavailable` { rp, availableRps }
+ * when the group asked for has none of the person's passkeys but another
+ * has.
  */
-export async function startSignInPasskeyAssertion(challenge: AuthChallengeToken, now: Date = currentDate()) {
+export async function startSignInPasskeyAssertion(challenge: AuthChallengeToken, now: Date = currentDate(), group?: PasskeyRpGroup) {
   const live = await findLiveAuthChallenge(getDb(), challenge, "second_factor_login", now);
   if (!live?.userId) throw challengeExpired();
   if (live.attempts >= AUTH_CHALLENGE_MAX_ATTEMPTS) {
@@ -294,8 +299,11 @@ export async function startSignInPasskeyAssertion(challenge: AuthChallengeToken,
   }
   const rp = webauthnRelyingParty();
   if (!rp) throw new SecondFactorSignInError("passkeys_unavailable", "Passkeys are not available right now.");
-  const started = await startPasskeyAssertion(rp, { userId: live.userId, binding: { signInChallengeId: live.id }, now });
-  if (!started) throw new SecondFactorSignInError("passkey_not_found", "There is no passkey on this account.");
+  const started = await startPasskeyAssertion(rp, { userId: live.userId, binding: { signInChallengeId: live.id }, now, rp: group });
+  if ("refused" in started) {
+    if (started.refused === "none") throw new SecondFactorSignInError("passkey_not_found", "There is no passkey on this account.");
+    throw new SecondFactorSignInError("passkey_rp_unavailable", "None of this account's passkeys can be used here.", { rp: started.rp, availableRps: started.available });
+  }
   return started;
 }
 
@@ -309,6 +317,8 @@ export type SignInFinish<T> = (tx: DatabaseExecutor, proof: SessionIssueProof) =
 
 export type SecondFactorSignInVerified<T> = {
   context: SecondFactorSignInContext;
+  /** Whose sign-in it is. */
+  userId: string;
   /** What answered: a factor, or `recovery` (completeSecondFactorRecoverySignIn). */
   method: SignInChallengeMethod;
   result: T;
@@ -434,7 +444,7 @@ export async function verifySecondFactorSignIn<T>(
       await releaseSecondFactorAttempt(tx, userId, now);
       recoveryCancelled = await autoCancelRecoveryInTransaction(tx, userId, now);
       const result = await finish(tx, proofForSecondFactorVerified(consumed, method));
-      return { context, method, result, backupCodesRemaining };
+      return { context, userId, method, result, backupCodesRemaining };
     });
     if (counterRegressed) await sendPasskeyCounterWarning(userId);
     if (backupCodeUsed) await sendBackupCodeUsedEmail(userId, backupCodeUsed);
@@ -502,7 +512,7 @@ export async function completeSecondFactorRecoverySignIn<T>(
       if (!consumed) throw challengeExpired();
       await completeRecoveryInTransaction(tx, { userId, flow: context.flow, now });
       const result = await finish(tx, proofForSecondFactorRecovered(consumed));
-      return { context, method: "recovery" as const, result, backupCodesRemaining: null };
+      return { context, userId, method: "recovery" as const, result, backupCodesRemaining: null };
     });
   } catch (err) {
     throw recoveryRefusal(err);

@@ -27,7 +27,8 @@ import {
 } from "../db/schema";
 import { createServer } from "./serverService";
 import {
-  AGENT_READ_PROGRESS_FEATURE_FLAG_KEY,
+  DM_REPLY_PLACEMENT_FEATURE_FLAG_KEY,
+  SEARCH_JOINT_CONVERSATION_WALK_FEATURE_FLAG_KEY,
   SERVER_LABS_UI_FEATURE_FLAG_KEY,
   bumpFeatureFlagConfigVersion,
   computeFeatureFlagBucket,
@@ -368,6 +369,84 @@ test("feature flags: the continuation pilot is default-off, server-scoped, witho
   assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
 });
 
+test("feature flags: the continuation answer tool is default-off, server-scoped, without allow rules", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0743_continuation_tool_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, "'continuation_tool_v0'");
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "every agent keeps answering with cont until FFA allows the tool");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
+test("feature flags: Focus is default-off, server-scoped, without allow rules", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0753_agent_focus_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, "'agent_focus_v0'");
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "the focus routes refuse until FFA allows a server");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
+test("feature flags: the wake-up notice with the Server's numbers is default-off, server-scoped, without allow rules", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0760_inbox_notice_server_rows_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, "'inbox_notice_server_rows_v0'");
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "every Computer keeps today's notice and asks nothing until FFA allows a server");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
+test("feature flags: the joint conversation search walk is default-off, server-scoped, without allow rules, its gate in the description", () => {
+  // By name, not number: renumbered if another migration lands first.
+  const drizzleDir = resolve(import.meta.dirname, "../../drizzle");
+  const file = readdirSync(drizzleDir).find((entry) => /^\d{4}_message_server_timeline_conversation_id\.sql$/.test(entry));
+  assert.ok(file, "the message_server_timeline_conversation_id migration exists");
+  const migration = readFileSync(resolve(drizzleDir, file), "utf8");
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, `'${SEARCH_JOINT_CONVERSATION_WALK_FEATURE_FLAG_KEY}'`);
+  assert.equal(mapped.key, "'search_joint_conversation_walk_v0'", "FFA rules are stored by key: renaming it would orphan a rollout");
+  assert.equal(mapped.default_enabled, "false", "the walk reads this server only until an operator turns it on after the backfill");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.match(mapped.description ?? "", /--conversation-id` reported 0 missing \/ 0 divergent over the whole timeline AND idx_message_server_timeline_conversation_created is valid/);
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
+test("feature flags: the DM reply placement prompt is default-off, server-scoped, without allow rules", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0754_dm_reply_placement_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, `'${DM_REPLY_PLACEMENT_FEATURE_FLAG_KEY}'`);
+  assert.equal(mapped.key, "'dm_reply_placement_prompt'", "FFA rules are stored by key: renaming it would orphan a rollout");
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "every agent keeps today's prompt until FFA allows a server");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+  assert.match(migration, /^SET LOCAL lock_timeout = '2s';$/m);
+});
+
 test("feature flags: computers rack overview is default-off without allow rules", () => {
   const migration = readFileSync(
     resolve(import.meta.dirname, "../../drizzle/0440_computers_rack_overview_flag.sql"),
@@ -464,6 +543,22 @@ test("feature flags: desktop browser Raft sign-in is default-off, server-scoped 
   assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
 });
 
+test("feature flags: Artifact mini window (#337) is default-off, server-scoped and without rules", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0758_artifact_mini_window_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, "'artifact_mini_window_v0'");
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "the Artifact mini window must be disabled by default");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.equal(mapped.pre_auth_evaluable, "false");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
 test("feature flags: inbox message in place (#244 step 3b) is default-off, server-scoped and without rules", () => {
   const migration = readFileSync(
     resolve(import.meta.dirname, "../../drizzle/0700_inbox_message_inplace_flag.sql"),
@@ -549,22 +644,6 @@ test("feature flags: drafts section is default-off and allowed for botiverse and
   assert.match(migration, /'drafts_section_v0',\s*'server',\s*0,\s*'allow'/);
   assert.doesNotMatch(migration, /'deny'/);
   assert.doesNotMatch(migration, /'community'/);
-});
-
-test("feature flags: agent read progress is default-off, server-scoped and without rules", () => {
-  const migration = readFileSync(
-    resolve(import.meta.dirname, "../../drizzle/0576_agent_read_progress_flag.sql"),
-    "utf8",
-  );
-
-  const mapped = parseChannelJointMigration(migration);
-  assert.equal(mapped.key, `'${AGENT_READ_PROGRESS_FEATURE_FLAG_KEY}'`);
-  assert.equal(mapped.enabled, "true");
-  assert.equal(mapped.kill_switch, "false");
-  assert.equal(mapped.default_enabled, "false", "agent read progress must be off by default");
-  assert.equal(mapped.randomization_unit, "'server'");
-  assert.equal(mapped.pre_auth_evaluable, "false");
-  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
 });
 
 test("feature flags: activity conversation list is default-off without allow rules", () => {

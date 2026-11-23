@@ -65,11 +65,11 @@ export const SETTINGS_SEARCH_COPY: Readonly<Record<string, SettingsSearchCopy>> 
   "invite-links": { nameId: "settings.joinLinks.sectionLabel" },
   "single-sign-on": { nameId: "settings.sso.sectionLabel" },
   "member-permissions": { nameId: "settings.memberPermissions.sectionLabel" },
-  "ai-providers": { nameId: "settings.providers.sectionTitle", descriptionId: "settings.providers.description" },
   "desktop-app": { nameId: "settings.desktopApp.sectionLabel" },
 };
 
 /** The index's entries for this client, in the list's order: its platform's, and none experimental. */
 export function settingsSearchEntriesFor(platform: SettingsSearchPlatform): SettingsSearchEntry[] {
-  return SETTINGS_SEARCH_INDEX.entries.filter((entry) => entry.platforms.includes(platform) && entry.experimental !== true);
+  return SETTINGS_SEARCH_INDEX.entries.filter((entry) => entry.platforms.includes(platform)
+    && entry.experimental !== true);
 }

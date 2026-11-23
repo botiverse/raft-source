@@ -16,9 +16,8 @@ import { useMessageStore } from "../../../store/messageStore";
 import { useInboxStore } from "../../../store/inboxStore";
 import { useSavedStore } from "../../../store/savedStore";
 import { useAppNavigate } from "../../../hooks/useAppNavigate";
-import { placeSidebarContextSubmenu } from "../../../components/layout/sidebarContextMenuPosition";
 import type { SidebarCustomSection, SidebarSectionPlacement } from "../../../store/sidebarSections";
-import { EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY, SERVER_LABS_UI_FEATURE_FLAG_KEY, SLACK_BRIDGE_FEATURE_FLAG_KEYS } from "@botiverse/raft-shared";
+import { EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, SERVER_LABS_UI_FEATURE_FLAG_KEY, SLACK_BRIDGE_FEATURE_FLAG_KEYS } from "@botiverse/raft-shared";
 import { isSlackBridgeSurfaceEnabled } from "../../../components/settings/slackBridgeVisibility";
 import { RAFTBENCH_OVERVIEW_FLAG_KEY, useServerFeatureFlag } from "../../../store/serverFeatureFlags";
 import { readSidebarComputerRowCount, readSidebarSectionRowCounts, writeSidebarComputerRowCount } from "../../../components/layout/sidebarSectionRowCounts";
@@ -193,7 +192,6 @@ export function useSidebarData() {
   const handledSidebarFocusLocationKeyRef = useRef<string | null>(null);
   const raftBenchEnabled = useServerFeatureFlag(RAFTBENCH_OVERVIEW_FLAG_KEY).enabled;
   const labsUiEnabled = useServerFeatureFlag(SERVER_LABS_UI_FEATURE_FLAG_KEY).enabled;
-  const providerConnectionsEnabled = useServerFeatureFlag(PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY).enabled;
   // External channels (#wg-rbac:#16): the Joint Channels section holds joint
   // channels and channels with a Guest or an open external invite, flag or
   // not (an external channel keeps its group when the flag is off). Its label
@@ -210,10 +208,8 @@ export function useSidebarData() {
   const serverUnreadCounts = useServerStore((s) => s.serverUnreadCounts);
   const loadServerUnreadSummary = useServerStore((s) => s.loadServerUnreadSummary);
   const [ctxMenu, setCtxMenu] = useState<CtxMenu | null>(null);
-  const ctxMenuRef = useRef<HTMLDivElement | null>(null);
   const moveToSectionTriggerRef = useRef<HTMLDivElement | null>(null);
   const [moveToSectionMenuOpen, setMoveToSectionMenuOpen] = useState(false);
-  const [moveToSectionMenuPosition, setMoveToSectionMenuPosition] = useState<{ x: number; y: number } | null>(null);
   // The live drag projection is a store, not state: each section subscribes to
   // its own container, so a move doesn't re-render the Sidebar.
   const [sidebarDndProjectionStore] = useState(createSidebarDndProjectionStore);
@@ -224,23 +220,6 @@ export function useSidebarData() {
   const [sidebarDndSourceContainerId, setSidebarDndSourceContainerId] = useState<string | null>(null);
   const sidebarDndSnapshotRef = useRef<SidebarDndProjection | null>(null);
   const sidebarDndProjectionRef = useRef<SidebarDndProjection | null>(null);
-  const setMoveToSectionMenuNode = useCallback((menu: HTMLDivElement | null) => {
-    const trigger = moveToSectionTriggerRef.current;
-    if (!trigger || !menu) return;
-    const triggerRect = trigger.getBoundingClientRect();
-    const menuRect = menu.getBoundingClientRect();
-    setMoveToSectionMenuPosition(placeSidebarContextSubmenu({
-      anchor: {
-        left: triggerRect.left,
-        right: triggerRect.right,
-        top: triggerRect.top,
-      },
-      menuWidth: menuRect.width,
-      menuHeight: menuRect.height,
-      viewportWidth: window.innerWidth,
-      viewportHeight: window.innerHeight,
-    }));
-  }, []);
   return {
     sidebarRowLimit,
     formatMessage, dmChannels, channelsLoading, dmsLoading, channels, channelRowsDisplayOnlyRef,
@@ -250,14 +229,14 @@ export function useSidebarData() {
     sidebarOrderLoaded, pinnedHeld, channelSectionsHeld, dmsHeld, rowCountUserId, rememberedRows, rememberedComputerRows,
     customSections, sectionOrder, sectionPlacements, updateSidebarOrder, setSidebarOpen, hasLocalUnread,
     loadInbox, savedTotal, navigate, nav, location, sidebarScrollRef,
-    handledSidebarFocusLocationKeyRef, raftBenchEnabled, labsUiEnabled, providerConnectionsEnabled,
+    handledSidebarFocusLocationKeyRef, raftBenchEnabled, labsUiEnabled,
     externalChannelsEnabled, slackBridgeEnabled, showCreateChannel, setShowCreateChannel,
     setShowCreateJointChannel, showCreateJointChannel, serverUnreadCounts, loadServerUnreadSummary,
-    setCtxMenu, ctxMenu, ctxMenuRef, moveToSectionTriggerRef, setMoveToSectionMenuOpen,
-    moveToSectionMenuOpen, moveToSectionMenuPosition, setMoveToSectionMenuPosition,
+    setCtxMenu, ctxMenu, moveToSectionTriggerRef, setMoveToSectionMenuOpen,
+    moveToSectionMenuOpen,
     setSidebarDndProjection, sidebarDndProjectionStore, sidebarDndActiveId, setSidebarDndActiveId,
     sidebarDndSourceContainerId, setSidebarDndSourceContainerId, sidebarDndSnapshotRef,
-    sidebarDndProjectionRef, setMoveToSectionMenuNode,
+    sidebarDndProjectionRef,
   };
 }
 

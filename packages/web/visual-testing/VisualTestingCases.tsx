@@ -62,16 +62,33 @@ import { VisualMessageRow } from "./VisualMessageRow";
 import SelectSharePreviewPrototype from "./SelectSharePreviewPrototype";
 import { FILE_VIEWER_CASE_IDS, FileViewerCase } from "./FileViewerCases";
 import { MESSAGE_CARD_CASE_IDS, MessageCardCase } from "./MessageCardCases";
-import { AGENT_READ_LINE_CASE_IDS, AgentReadLineCase } from "./AgentReadLineCases";
 import { ACTION_CARD_CASE_IDS, ActionCardCase } from "./ActionCardCases";
 import { ASSISTANT_OTTER_CASE_IDS, AssistantOtterCase } from "./AssistantOtterCases";
 import { EXTERNAL_AGENT_CREATE_CASE_IDS, ExternalAgentCreateCase } from "./ExternalAgentCreateCases";
+import { isRuntimePickerHintsCase, RuntimePickerHintsCase } from "./RuntimePickerHintCases";
+import { RUNTIME_FORM_CASE_IDS, RuntimeFormCase } from "./RuntimeFormCases";
 import { EXTERNAL_AGENT_PAGE_CASE_IDS, ExternalAgentPageCase } from "./ExternalAgentPageCases";
 import { AGENT_CONTEXT_VIEW_CASE_IDS, AgentContextViewCase } from "./AgentContextViewCases";
 import { AGENT_ACTIVITY_LOG_CASE_IDS, AgentActivityLogCase } from "./AgentActivityLogCases";
+import { AGENT_NOW_CARD_CASE_IDS, AgentNowCardCase } from "./AgentNowCardCases";
+import { APP_CARD_CASE_IDS, AppCardCase } from "./AppCardCases";
+import { CHANNEL_CONVERSION_STRIP_CASE_IDS, ChannelConversionStripCase } from "./ChannelConversionStripCases";
+import { APPS_YOURS_CASE_IDS, AppsYoursCase } from "./AppsYoursCases";
+import { APPS_DISCOVER_CASE_IDS, APPS_DISCOVER_CASE_PATH, AppsDiscoverCase } from "./AppsDiscoverCases";
 import { ARTIFACT_FILTER_CASE_IDS, ArtifactFilterCase } from "./ArtifactFilterCases";
+import {
+  AGENT_VOICE_CALL_CASE_ID,
+  AGENT_VOICE_CALL_OVER_COMPOSER_CASE_ID,
+  AGENT_VOICE_CALL_PHONE_CASE_ID,
+  AgentVoiceCallCase,
+  liveVoiceCallFixture,
+} from "./AgentVoiceCallCases";
+import { AgentVoiceCallCard } from "../src/features/agent/AgentVoiceCallCard";
 import { COMPUTERS_RACK_CASE_PATH, ComputersRackCase, isComputersRackCase } from "./ComputersRackCases";
+import { MIGRATION_LOG_CASE_PATH, MigrationLogCase, isMigrationLogCase, migrationLogCaseParams } from "./MigrationLogCases";
 import { isOpenInAppOfferCase, OPEN_IN_APP_OFFER_CASE_PATH, OpenInAppOfferCase } from "./OpenInAppOfferCases";
+import { WideShellCase, isWideShellCase, wideShellCaseRoute } from "./WideShellCases";
+import { GuestSavedCase, guestSavedCaseRoute, isGuestSavedCase } from "./GuestSavedCases";
 import { STATUS_STYLES } from "../src/components/task/taskStatusUi";
 import { SettingsPanel } from "../src/components/settings/SettingsPanel";
 import { IntegrationsSection } from "../src/features/apps/IntegrationsSection";
@@ -90,11 +107,9 @@ import type { Message } from "../src/store/messageStore";
 import { useSavedStore } from "../src/store/savedStore";
 import {
   getModelLabel,
-  PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY,
   RUNTIME_ERROR_CODE_SENTENCES,
 } from "@botiverse/raft-shared";
 import { useModelLabelCatalogStore } from "../src/store/modelLabelCatalogStore";
-import { setServerFeatureFlagForTests } from "../src/store/serverFeatureFlags";
 import { useServerStore } from "../src/store/serverStore";
 import { useSelectionStore } from "../src/store/selectionStore";
 import { useTaskStore } from "../src/store/taskStore";
@@ -383,7 +398,6 @@ type DirectVisualCase = {
     | "thread-message-md-wrap-adjacent"
     | "thread-message-md-wrap-status606"
     | "thread-message-md-wrap-task607"
-    | "thread-message-agent-read-line"
     | "thread-forward-modal"
     | "thread-comment-anchor"
     | "channel-members"
@@ -596,13 +610,11 @@ const AGENT_DETAIL_CASES: Record<string, AgentDetailVisualCase> = {
     id: "screens.members.agent-detail.activity",
     route: "members-agent-detail",
   },
-  /* Agent Details with a saved provider connection in use. Exists so the
-     provider-connection Select can be MEASURED: it renders only for Built-in
-     runtime with the connections feature on and a connection saved, and nothing
-     in the default fixture supplies any of that — which is why that control had
-     no coverage at all until task #28. */
-  "screens.members.agent-detail.runtime-connection": {
-    id: "screens.members.agent-detail.runtime-connection",
+  /* Agent Details for a Built-in agent, whose runtime editor holds the
+     agent-local provider fields and the env-var key/value rows that
+     keyValueInputMetrics.spec.ts measures. */
+  "screens.members.agent-detail.runtime-builtin": {
+    id: "screens.members.agent-detail.runtime-builtin",
     route: "members-agent-detail",
   },
   "screens.members.agent-detail.activity.stop-computer": {
@@ -813,7 +825,6 @@ const DIRECT_CASES: Record<string, DirectVisualCase> = {
     id: "components.thread.message-row.md-wrap-task607",
     kind: "thread-message-md-wrap-task607",
   },
-  ...Object.fromEntries(AGENT_READ_LINE_CASE_IDS.map((id) => [id, { id, kind: "thread-message-agent-read-line" as const }])),
   "components.thread.forward-modal": {
     id: "components.thread.forward-modal",
     kind: "thread-forward-modal",
@@ -1214,18 +1225,11 @@ function primeCreateAgentStores(caseConfig: CreateAgentVisualCase) {
 }
 
 function primeAgentDetailStores(caseId = "") {
-  /* The connections feature is read from the serverFeatureFlags STORE, not from
-     the evaluate endpoint, so a route mock cannot switch it on — it has to be
-     seeded here. Missing this is exactly why the select never rendered under
-     test. */
-  const wantsProviderConnection = caseId === "screens.members.agent-detail.runtime-connection";
+  const wantsBuiltinRuntime = caseId === "screens.members.agent-detail.runtime-builtin";
   const fxAgent = fixtureData.agents[AGENT_DETAIL_CASES[caseId]?.agentKey ?? "productUx"];
   const agentMachineId = machineIdForFixtureAgent(fxAgent);
   const agentMachine = [fxPrimaryMachine, fxStudioMachine, fxLongNameMachine, fxDaemonOnlyMachine].find((m) => m.id === agentMachineId) ?? null;
   const machinesLoading = AGENT_DETAIL_CASES[caseId]?.machinesLoading === true;
-  if (wantsProviderConnection) {
-    setServerFeatureFlagForTests(fxServer.id, PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY, true);
-  }
   const visualUser = {
     id: fxOwner.id,
     email: fxOwner.email,
@@ -1259,7 +1263,7 @@ function primeAgentDetailStores(caseId = "") {
     // noMembership carries no serverRole on purpose (no membership row on the wire).
     serverRole: ((fxAgent as { serverRole?: string }).serverRole ?? null) as "member" | "admin" | null,
     model: fxCindy.model,
-    runtime: wantsProviderConnection ? "builtin" : "codex",
+    runtime: wantsBuiltinRuntime ? "builtin" : "codex",
     reasoningEffort: "medium" as const,
     executionMode: "byoc" as const,
     envVars: {
@@ -1313,7 +1317,7 @@ function primeAgentDetailStores(caseId = "") {
   // lands mid-flight shows "Loading…" (screens.members.agent-detail.profile in
   // mobile run 40999051412). Seed the catalog the server would serve for the
   // agent's machine so the label is there on the first render. Only that case:
-  // loading-state must stay loading, and runtime-connection (builtin) is a
+  // loading-state must stay loading, and runtime-builtin (builtin) is a
   // runtime the server never sends a catalog for.
   if (caseId === "screens.members.agent-detail.profile" && agentMachineId) {
     useModelLabelCatalogStore.setState((state) => ({
@@ -2347,7 +2351,12 @@ function visualRoutePathForCase(caseId: string): { path: string; params?: Record
     return { path: `/s/${fxServer.slug}/human/${fxOwner.id}` };
   }
   if (isComputersRackCase(caseId)) return { path: COMPUTERS_RACK_CASE_PATH };
+  if (isMigrationLogCase(caseId)) return { path: MIGRATION_LOG_CASE_PATH, params: migrationLogCaseParams(caseId) };
+  // The Apps page opens on Discover from its address, as a link names the scope.
+  if (APPS_DISCOVER_CASE_IDS.includes(caseId)) return { path: APPS_DISCOVER_CASE_PATH, params: { tab: "discover" } };
   if (isOpenInAppOfferCase(caseId)) return { path: OPEN_IN_APP_OFFER_CASE_PATH };
+  if (isWideShellCase(caseId)) return wideShellCaseRoute(caseId);
+  if (isGuestSavedCase(caseId)) return guestSavedCaseRoute(caseId);
   if (HOME_LOADING_CASES[caseId] || HOME_CHANNEL_LIST_CASES[caseId]) {
     return { path: `/s/${fxServer.slug}` };
   }
@@ -2466,12 +2475,25 @@ export default function VisualTestingCases() {
   if ((ACTION_CARD_CASE_IDS as readonly string[]).includes(caseId)) return <ActionCardCase caseId={caseId as (typeof ACTION_CARD_CASE_IDS)[number]} />;
   if ((ASSISTANT_OTTER_CASE_IDS as readonly string[]).includes(caseId)) return <AssistantOtterCase caseId={caseId} />;
   if ((EXTERNAL_AGENT_CREATE_CASE_IDS as readonly string[]).includes(caseId)) return <ExternalAgentCreateCase caseId={caseId} />;
+  if (RUNTIME_FORM_CASE_IDS.includes(caseId)) return <RuntimeFormCase caseId={caseId} />;
+  if (isRuntimePickerHintsCase(caseId)) return <RuntimePickerHintsCase caseId={caseId} />;
   if ((EXTERNAL_AGENT_PAGE_CASE_IDS as readonly string[]).includes(caseId)) return <ExternalAgentPageCase caseId={caseId} />;
   if ((AGENT_CONTEXT_VIEW_CASE_IDS as readonly string[]).includes(caseId)) return <AgentContextViewCase caseId={caseId} />;
   if ((AGENT_ACTIVITY_LOG_CASE_IDS as readonly string[]).includes(caseId)) return <AgentActivityLogCase caseId={caseId} />;
+  if ((AGENT_NOW_CARD_CASE_IDS as readonly string[]).includes(caseId)) return <AgentNowCardCase caseId={caseId} />;
   if ((ARTIFACT_FILTER_CASE_IDS as readonly string[]).includes(caseId)) return <ArtifactFilterCase caseId={caseId} />;
+  if ((APP_CARD_CASE_IDS as readonly string[]).includes(caseId)) return <AppCardCase caseId={caseId} />;
+  if ((CHANNEL_CONVERSION_STRIP_CASE_IDS as readonly string[]).includes(caseId)) return <ChannelConversionStripCase caseId={caseId} />;
+  if (APPS_YOURS_CASE_IDS.includes(caseId)) return <AppsYoursCase caseId={caseId} primeShell={primeNavigationVisualStores} />;
+  if (APPS_DISCOVER_CASE_IDS.includes(caseId)) return <AppsDiscoverCase caseId={caseId} primeShell={primeNavigationVisualStores} />;
+  if (caseId === AGENT_VOICE_CALL_CASE_ID) return <AgentVoiceCallCase />;
+  if (caseId === AGENT_VOICE_CALL_PHONE_CASE_ID) return <AgentVoiceCallCase phone />;
+  if (caseId === AGENT_VOICE_CALL_OVER_COMPOSER_CASE_ID) return <VoiceCallOverComposerCase />;
   if (isComputersRackCase(caseId)) return <ComputersRackCase caseId={caseId} primeShell={primeNavigationVisualStores} />;
+  if (isMigrationLogCase(caseId)) return <MigrationLogCase caseId={caseId} primeShell={primeNavigationVisualStores} />;
   if (isOpenInAppOfferCase(caseId)) return <OpenInAppOfferCase caseId={caseId} primeShell={primeNavigationVisualStores} />;
+  if (isWideShellCase(caseId)) return <WideShellCase caseId={caseId} primeShell={primeNavigationVisualStores} />;
+  if (isGuestSavedCase(caseId)) return <GuestSavedCase caseId={caseId} primeShell={primeNavigationVisualStores} />;
 
   const authCase = AUTH_CASES[caseId];
   if (authCase) return <AuthVisualCaseView caseConfig={authCase} />;
@@ -2549,6 +2571,33 @@ function ComposerVisualCaseView({ caseConfig }: { caseConfig: ComposerVisualCase
           <NotificationActivationBanner placement="desktop" composerChannelId={VISUAL_CHANNEL_ID} />
         ) : null}
       </div>
+    </main>
+  );
+}
+
+/**
+ * Raft voice calls: the real call window (AgentVoiceCallCard, fixed at z-app and
+ * placed by the toast-viewport floors) over the real composer, which registers
+ * itself as a floor, at desktop width: the window must sit above the composer,
+ * clear of Send. A live call with captions; the store is not involved.
+ */
+function VoiceCallOverComposerCase() {
+  const composerCase = COMPOSER_CASES["components.thread.composer.states"]!;
+  useMemo(() => primeVisualStores(composerCase), [composerCase]);
+  const [call] = useState(() => liveVoiceCallFixture(Date.now()));
+  return (
+    <main className="h-dvh bg-layer-canvas p-0 font-display text-foreground">
+      <div data-visual-case={AGENT_VOICE_CALL_OVER_COMPOSER_CASE_ID} className="flex h-dvh w-full flex-col">
+        <div className="min-h-0 flex-1" />
+        <MessageInput
+          channelId={VISUAL_CHANNEL_ID}
+          channelName={fxChannels.design.name}
+          showTaskButton
+          placeholder={composerCase.placeholder}
+          onSendOverride={asyncNoop}
+        />
+      </div>
+      <AgentVoiceCallCard call={call} />
     </main>
   );
 }
@@ -2775,12 +2824,6 @@ export type VisualMessageRowFixture = {
   hideThreadActions?: boolean;
   threadSummary?: ThreadSummary;
   linkedTask?: Task;
-  /** A thread reply: the thread's parent conversation and message. */
-  parentChannelId?: string;
-  parentMessageId?: string;
-  /** Agent read progress (AgentReadLineCases): the line under your latest message, and the faces. */
-  showAgentReadStatus?: boolean;
-  agentReadFaces?: boolean;
 };
 
 const THREAD_MESSAGE: Message = {
@@ -4161,10 +4204,6 @@ function DirectVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) 
         </div>
       </main>
     );
-  }
-
-  if (caseConfig.kind === "thread-message-agent-read-line") {
-    return <AgentReadLineCase caseId={caseConfig.id} />;
   }
 
   if (caseConfig.kind === "thread-forward-modal") {

@@ -9,6 +9,7 @@ import type { ChangeEvent, FormEvent } from "react";
 import { useIntl } from "react-intl";
 import { Bot, Code } from "lucide-react";
 import { Button, Input, SegmentedControl, SegmentedControlItem, Textarea, TextLink, TextLinkExternalIcon } from "@botiverse/raft-ui";
+import { PROFILE_DESCRIPTION_MAX_LENGTH } from "@botiverse/raft-shared";
 import api from "../../api/client";
 import { AVATAR_KEYS } from "../../components/agent/PixelAvatar";
 import { isSecondFactorStepUpCancelled, withSecondFactorStepUp } from "../../components/settings/secondFactorStepUp";
@@ -21,12 +22,13 @@ import { useAppNavigate } from "../../hooks/useAppNavigate";
 import { useAgentStore } from "../../store/agentStore";
 import { trackExternalAgentSetupAction, trackExternalAgentSetupClosed, trackExternalAgentSetupProgress } from "../../analytics/externalAgentSetup";
 import type { ExternalAgentSetupAction } from "../../analytics/externalAgentSetup";
-import { existingAgentPrompt, PAGE_CREDENTIAL_NAME, RAFT_SDK_DOCS_URL, SDK_INSTALL_COMMAND, sdkStarterCode, STATUS_POLL_MS } from "./externalAgentSetup";
+import { existingAgentPrompt, usePromptRecipientHandle, PAGE_CREDENTIAL_NAME, RAFT_SDK_DOCS_URL, SDK_INSTALL_COMMAND, sdkStarterCode, STATUS_POLL_MS } from "./externalAgentSetup";
 import type { Created, ExternalSetupMethod } from "./externalAgentSetup";
 import { CopyBlock, CopyField } from "./ExternalSetupCopy";
 
 export function CreateExternalAgentDialog({ onClose }: { onClose: () => void }) {
   const { formatMessage } = useIntl();
+  const promptRecipient = usePromptRecipientHandle();
   const nav = useAppNavigate();
   const createAgent = useAgentStore((s) => s.createAgent);
   const deleteAgent = useAgentStore((s) => s.deleteAgent);
@@ -194,7 +196,7 @@ export function CreateExternalAgentDialog({ onClose }: { onClose: () => void }) 
             <Input id={nameId} value={name} onChange={handleName} autoFocus data-testid="create-external-agent-name" />
           </FormField>
           <FormField label={formatMessage({ id: "agent.createExternal.description" })} optional>
-            <Textarea value={description} onChange={handleDescription} placeholder={formatMessage({ id: "agent.createExternal.descriptionPlaceholder" })} />
+            <Textarea value={description} onChange={handleDescription} maxLength={PROFILE_DESCRIPTION_MAX_LENGTH} placeholder={formatMessage({ id: "agent.createExternal.descriptionPlaceholder" })} />
           </FormField>
           <FormField label={formatMessage({ id: "agent.createExternal.howItRuns" })}>
             <div className="stack-y-2">
@@ -263,7 +265,7 @@ export function CreateExternalAgentDialog({ onClose }: { onClose: () => void }) 
               <div className="stack-y-4" data-testid="create-external-agent-existing-steps">
                 <section className="stack-y-2">
                   <h3 className="text-body font-semibold">{formatMessage({ id: "agent.createExternal.step1Existing" })}</h3>
-                  <CopyBlock text={existingAgentPrompt(created, formatMessage)} label={formatMessage({ id: "agent.createExternal.copyPrompt" })} testId="create-external-agent-prompt" primary collapsed onCopied={handlePromptCopied} />
+                  <CopyBlock text={existingAgentPrompt(created, formatMessage, promptRecipient)} label={formatMessage({ id: "agent.createExternal.copyPrompt" })} testId="create-external-agent-prompt" primary collapsed onCopied={handlePromptCopied} />
                 </section>
                 <section className="stack-y-2">
                   <h3 className="text-body font-semibold">{formatMessage({ id: "agent.createExternal.step2Existing" })}</h3>

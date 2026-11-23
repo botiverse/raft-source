@@ -37,6 +37,8 @@ import {
   type AgentApiInboxListResponse,
   type AgentApiInboxReadBody,
   type AgentApiInboxReadResponse,
+  type AgentApiInboxRowsBody,
+  type AgentApiInboxRowsResponse,
   type AgentMessage,
 } from "@botiverse/raft-shared";
 import type { Server as SocketServer } from "socket.io";
@@ -202,6 +204,38 @@ export async function inboxItemsListFields(input: {
     preLaunch: launch && preLaunchCount > 0 ? { count: preLaunchCount, before: launch.day } : null,
     omitted: omittedApps > 0 || omittedReminders > 0 ? { app: omittedApps, reminder: omittedReminders } : null,
   };
+}
+
+/**
+ * `POST /inbox/rows`: the conversation rows of the named conversations, built
+ * as `inbox check` builds them (conversationItemRows over the same list
+ * entries). Reads only. Traced with counts, never a conversation's id or name.
+ */
+export async function inboxRowsForTargets(input: {
+  agentId: string;
+  serverId: string;
+  targets: AgentApiInboxRowsBody["targets"];
+  /** The body's `withBehind`: answer the rows that are behind too (the asker adds what it holds). */
+  withBehind?: boolean;
+  /** agentApiClientKind(req): `daemon` when the agent's Computer asks, not the agent. */
+  clientKind: string;
+}): Promise<AgentApiInboxRowsResponse> {
+  // The contract takes a UUID in either case; the view's target_id is the lowercase text Postgres prints.
+  const targets = input.targets.map((target) => ({ channelId: target.channelId.toLowerCase(), newestSeq: target.newestSeq }));
+  const { items, pageRows, behind, otherUnread } = await channelService.listAgentInboxRowsForTargets(input.agentId, targets, { withBehind: input.withBehind === true });
+  const listed = await conversationItemRows({ items, pageRows, preLaunchBefore: inboxItemsLaunch()?.dayStart ?? null });
+  // The Computer matches rows to what it asked by id, not by `target` (it builds that string in its own code). `pageRows` is in the rows' order.
+  const rows = listed.map((row, index) => ({ ...row, channelId: pageRows[index]!.targetId }));
+  recordTraceEvent("server.agent_api.inbox_rows", {
+    agent_id: input.agentId,
+    server_id: input.serverId,
+    client_kind: input.clientKind,
+    requested_count: input.targets.length,
+    rows_count: rows.length,
+    behind_count: behind,
+    with_behind_mode: input.withBehind === true ? "on" : "off",
+  });
+  return { rows, ...(input.withBehind === true ? { withBehind: true as const } : {}), behind, otherUnread };
 }
 
 // ---------------------------------------------------------------------------

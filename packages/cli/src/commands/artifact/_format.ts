@@ -16,6 +16,7 @@ import type {
   AgentApiArtifactReadResponse,
   AgentApiArtifactReviewCreated,
   AgentApiArtifactSaved,
+  AgentApiArtifactSettlement,
   AgentApiArtifactSubscriptionResponse,
   AgentApiArtifactSummary,
   AgentApiArtifactThreadResolution,
@@ -38,6 +39,7 @@ import {
   formatArtifactRead as formatRead,
   formatArtifactReviewed as formatReviewed,
   formatArtifactSaved as formatSaved,
+  formatArtifactSettlement as formatSettlement,
   formatArtifactSubscription as formatSubscription,
   formatArtifactThreadResolution as formatThreadResolution,
 } from "@botiverse/raft-shared/src/agentCliSurface";
@@ -59,6 +61,8 @@ const summary: AgentApiArtifactSummary = {
   createdAt: "2026-10-20T08:00:00.000Z",
   updatedAt: "2026-10-22T14:02:00.000Z",
 };
+
+const settledExample = { by: xxchan, at: "2026-11-18T16:20:00.000Z", version: 12 };
 
 const v12 = { number: 12, publisher: remy, createdAt: "2026-10-22T14:02:00.000Z", note: "card states", changedPaths: ["components.html"] };
 
@@ -93,12 +97,14 @@ export const formatArtifactRead = axSurface(
       { title: "nothing new", args: [{ ...readExample, viewing: [], unseen: { firstRead: false, versionCount: 0, commentCount: 0, versions: [], comments: [], commentsCursor: null } }, false] },
       { title: "an older version", args: [{ ...readExample, version: { ...readExample.version!, number: 9, current: false }, unseen: null }, false] },
       { title: "the message it came from", args: [{ ...readExample, origin: { target: "#proj-workspace", messageId: "1dbe5d8c-0000-4000-8000-000000000001", via: "share" } }, false] },
+      { title: "settled", args: [{ ...readExample, artifact: { ...summary, settled: settledExample, reopened: null } }, false] },
+      { title: "working again after a new version", args: [{ ...readExample, artifact: { ...summary, currentVersion: 13, settled: null, reopened: { version: 13, was: settledExample } } }, false] },
     ],
   },
 );
 
 const listExample: AgentApiArtifactListResponse = {
-  artifacts: [summary, { ...summary, id: "pt_def", title: "Q4 report", home: { kind: "server" }, currentVersion: 3 }],
+  artifacts: [summary, { ...summary, id: "pt_def", title: "Q4 report", home: { kind: "server" }, currentVersion: 3, settled: { by: xxchan, at: "2026-11-18T16:20:00.000Z", version: 3 }, reopened: null }],
   nextCursor: "c2",
   target: null,
 };
@@ -207,7 +213,7 @@ const reviewCommentsExample: AgentApiArtifactCommentsResponse = {
 
 export const formatArtifactComments = axSurface(
   "An artifact's comments in full, oldest first: new ones by default, with versions not shown and how to page.",
-  (data: AgentApiArtifactCommentsResponse, opts: { review?: string } = {}): string => formatComments(data, "cli", opts),
+  (data: AgentApiArtifactCommentsResponse, opts: { review?: string; held?: string } = {}): string => formatComments(data, "cli", opts),
   {
     examples: [
       { title: "new comments", args: [commentsExample] },
@@ -215,6 +221,7 @@ export const formatArtifactComments = axSurface(
       { title: "one review (--review)", args: [reviewCommentsExample, { review: "rv_7" }] },
       { title: "comments with images (one of images alone)", args: [imageCommentsExample] },
       { title: "a resolved thread and open ones (--all)", args: [resolvedCommentsExample] },
+      { title: "the comments a held command marked seen, again (--held)", args: [{ ...commentsExample, view: "all" as const, held: "41..57" }, { held: "41..57" }] },
     ],
   },
 );
@@ -271,6 +278,7 @@ export const formatArtifactPublished = axSurface(
       { title: "its publish check, pending", args: [{ ...publishedExample, version: { ...publishedExample.version, merged: [] }, unseen: { otherComments: 0 }, check: { id: "chk_14", status: "pending" } }, { dir: "./workspace-prototype" }] },
       { title: "its publish check, skipped (the files are the previous version's)", args: [{ ...publishedExample, version: { ...publishedExample.version, merged: [] }, unseen: { otherComments: 0 }, check: { id: "chk_14", status: "skipped", skipReason: "unchanged" } }, { dir: "./workspace-prototype" }] },
       { title: "a replayed push: its check as it is now", args: [{ ...publishedExample, version: { ...publishedExample.version, merged: [] }, unseen: { otherComments: 0 }, replayed: true, check: { id: "chk_14", status: "done" } }, {}] },
+      { title: "the push took a settled artifact back to Working", args: [{ ...publishedExample, version: { ...publishedExample.version, merged: [] }, unseen: { otherComments: 0 }, wasSettled: settledExample }, { dir: "./workspace-prototype" }] },
     ],
   },
 );
@@ -296,15 +304,25 @@ const checkExample: AgentApiArtifactCheckResponse = {
 };
 const checkWith = (check: Partial<NonNullable<AgentApiArtifactCheckResponse["check"]>>): AgentApiArtifactCheckResponse => ({ ...checkExample, check: { ...checkExample.check!, ...check } });
 const unfinished = { findings: null, finishedAt: null, screenshots: [] };
+/** A Vite + raft-ui page held to one screen by html and body at `shot`'s width. */
+const cantScroll = (shot: "desktop" | "phone") => ({
+  shot,
+  ...(shot === "desktop" ? { viewportWidth: 1280, viewportHeight: 800, hiddenHeight: 1540 } : { viewportWidth: 390, viewportHeight: 844, hiddenHeight: 1496 }),
+  contentHeight: 2340,
+  heldBy: [{ element: "html", style: "overflow: hidden" }, { element: "body", style: "overflow: hidden" }],
+});
 const savedShots = { saved: [{ shot: "desktop" as const, path: ".raft-check/pt_abc-v14-desktop.png" }, { shot: "phone" as const, path: ".raft-check/pt_abc-v14-phone.png" }] };
 
 export const formatArtifactCheck = axSurface(
-  "A version's publish check by status: pending or running (and how to wait for it; a wait that ran out says so), done (what the page got wrong, in its own words, quoted, or that nothing was found; where its screenshots were saved; the fix), failed or skipped (why, and whether a later push is checked), or none.",
+  "A version's publish check by status: pending or running (and how to wait for it; a wait that ran out says so), done (what the page got wrong, in its own words, quoted, or that nothing was found; a soft hint apart, such as a page readers may not be able to scroll; where its screenshots were saved; the fix), failed or skipped (why, and whether a later push is checked), or none.",
   (data: AgentApiArtifactCheckResponse, local: { saved?: Array<{ shot: "desktop" | "phone"; path: string }>; notSaved?: Array<{ shot: "desktop" | "phone"; reason: string }>; timedOut?: boolean }): string => formatCheck(data, "cli", local),
   {
     examples: [
       { title: "done, with findings and the screenshots saved", args: [checkExample, savedShots] },
       { title: "done, nothing found", args: [checkWith({ findings: { consoleErrors: [], blockedResources: [], blank: false, phoneOverflow: null } }), savedShots] },
+      { title: "done, only the soft hint that readers may not be able to scroll (at both widths)", args: [checkWith({ findings: { consoleErrors: [], blockedResources: [], blank: false, phoneOverflow: null, pageCantScroll: [cantScroll("desktop"), cantScroll("phone")] } }), savedShots] },
+      { title: "done, the can't-scroll hint on a phone only", args: [checkWith({ findings: { consoleErrors: [], blockedResources: [], blank: false, phoneOverflow: null, pageCantScroll: [cantScroll("phone")] } }), savedShots] },
+      { title: "done, a finding and the can't-scroll hint", args: [checkWith({ findings: { ...checkFound, phoneOverflow: null, pageCantScroll: [cantScroll("desktop")] } }), savedShots] },
       { title: "done, a blank page; one screenshot couldn't be downloaded", args: [checkWith({ findings: { consoleErrors: [], blockedResources: [], blank: true, phoneOverflow: null } }), { saved: [savedShots.saved[0]!], notSaved: [{ shot: "phone", reason: `the download failed: v14 of "pt_abc" has no phone screenshot from its publish check.` }] }] },
       { title: "done, an older version whose screenshots were let go", args: [{ ...checkWith({ findings: { consoleErrors: [], blockedResources: [], blank: false, phoneOverflow: null }, screenshots: [] }), version: 9 }, { saved: [] }] },
       { title: "pending", args: [checkWith({ status: "pending", ...unfinished }), {}] },
@@ -405,7 +423,10 @@ export const formatArtifactThreadResolution = axSurface(
   {
     examples: [
       { title: "resolved with a note (raft artifact resolve --note)", args: [resolutionExample] },
-      { title: "resolved, an agent's thread", args: [{ ...resolutionExample, comment: { ...resolutionExample.comment, author: { type: "agent" as const, name: "Kirby" } }, note: null, notified: [{ actor: { type: "agent" as const, name: "Kirby" }, reason: "resolved" as const }], notNotified: [] }] },
+      { title: "resolved, an agent's thread", args: [{ ...resolutionExample, comment: { ...resolutionExample.comment, author: { type: "agent" as const, name: "Kirby" } }, note: null, notified: [{ actor: { type: "agent" as const, name: "Kirby" }, reason: "resolved" as const, delivery: "inbox" as const }], notNotified: [] }] },
+      { title: "resolved, a person's thread", args: [{ ...resolutionExample, note: null, notified: [{ actor: xxchan, reason: "resolved" as const, delivery: "activity" as const }], notNotified: [] }] },
+      { title: "resolved, an agent's thread, on a Server before delivery", args: [{ ...resolutionExample, comment: { ...resolutionExample.comment, author: { type: "agent" as const, name: "Kirby" } }, note: null, notified: [{ actor: { type: "agent" as const, name: "Kirby" }, reason: "resolved" as const }], notNotified: [] }] },
+      { title: "resolved, your own thread", args: [{ ...resolutionExample, comment: { ...resolutionExample.comment, author: remy }, note: null, notified: [], notNotified: [] }] },
       { title: "already resolved", args: [{ ...resolutionExample, note: null, changed: false, notified: [], notNotified: [] }] },
       { title: "reopened (raft artifact reopen)", args: [{ ...resolutionExample, comment: { ...resolutionExample.comment, resolvedAt: null, resolvedBy: null }, note: null, notified: [], notNotified: [] }] },
     ],
@@ -419,6 +440,18 @@ export const formatArtifactSubscription = axSurface(
     examples: [
       { title: "following", args: [{ artifact: artifactRef, following: true }] },
       { title: "not following", args: [{ artifact: artifactRef, following: false }] },
+    ],
+  },
+);
+
+export const formatArtifactSettlement = axSurface(
+  "An artifact settled (done; a new version takes it back to Working) or back to Working, or already so (nothing changed).",
+  (data: AgentApiArtifactSettlement, settle: boolean): string => formatSettlement(data, settle, "cli"),
+  {
+    examples: [
+      { title: "settled (raft artifact settle)", args: [{ artifact: { ...summary, settled: { by: remy, at: "2026-11-19T15:30:00.000Z", version: 12 }, reopened: null }, changed: true, newlySubscribed: false, notified: [] }, true] },
+      { title: "already settled", args: [{ artifact: { ...summary, settled: settledExample, reopened: null }, changed: false, newlySubscribed: false, notified: [] }, true] },
+      { title: "back to Working (raft artifact unsettle)", args: [{ artifact: { ...summary, settled: null, reopened: null }, changed: true, newlySubscribed: false, notified: [] }, false] },
     ],
   },
 );

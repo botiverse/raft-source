@@ -15,6 +15,7 @@ import {
 } from "../../../features/apps/connected-apps/connectedAppStatus";
 import { ConnectedAppEditorActionRow } from "../../../features/apps/connected-apps/ConnectedAppEditorActionRow";
 import { ConnectedAppEditorSection } from "../../../features/apps/connected-apps/ConnectedAppEditorSection";
+import { ServerVouchSwitch } from "../../../features/apps/AppServerVouchSwitch";
 import { McpAppAgentsSection } from "./McpAppAgentsSection";
 import { McpAppConnectionsSection } from "./McpAppConnectionsSection";
 import { McpAppDangerZone } from "./McpAppDangerZone";
@@ -133,6 +134,9 @@ export function McpAppEditor({
       setError(mcpAppErrorMessage(reloadError, formatMessage));
     }
   }, [formatMessage, onChanged, view]);
+
+  // The server vouch answers the App view; the Profile draft being edited is kept.
+  const handleVouchUpdated = useCallback((next: McpAppView) => setView(next), []);
 
   const handleDeleted = useCallback(() => {
     onChanged();
@@ -426,6 +430,13 @@ export function McpAppEditor({
                     title={formatMessage({ id: SECTION_LABEL_ID.distribution })}
                     status={sectionStatus.distribution}
                   >
+                    {/* Owners and admins: whether every agent here can use it (as a Raft App's editor). */}
+                    <ServerVouchSwitch<McpAppView>
+                      vouched={view.serverVouched === true}
+                      path={`/mcp/apps/${view.id}/server-vouch`}
+                      onUpdated={handleVouchUpdated}
+                      onError={setError}
+                    />
                     {/* An ordinary private App's Distribution, with publishing not offered yet (follow-up). */}
                     <ConnectedAppEditorActionRow
                       testId="connected-app-publish-request-card"

@@ -7,7 +7,7 @@ import type { RaftFailure } from "@botiverse/raft-shared";
 import { AGENT_API_ARTIFACT_ERROR_CODES, AGENT_API_CLIENT_UPGRADE_REQUIRED_CODE, AGENT_API_RATE_LIMITED_CODE, opError } from "@botiverse/raft-shared/src/agentCliSurface";
 
 import { rateLimitedCliError } from "../../core/apiFailure";
-import { CliError, cliError, type CliErrorCode } from "../../core/errors";
+import { CliError, cliError, heldOnceCliError, type CliErrorCode } from "../../core/errors";
 
 /** The Artifacts codes the CLI shows as they are (CliErrorCode lists each). */
 const ARTIFACT_CLI_CODES = new Set<string>(AGENT_API_ARTIFACT_ERROR_CODES);
@@ -30,6 +30,8 @@ export function artifactCliError(failure: RaftFailure, again?: string | null, ra
   if (error.serverCode === AGENT_API_CLIENT_UPGRADE_REQUIRED_CODE) {
     return new CliError({ code: "CLIENT_UPGRADE_REQUIRED", message: error.message, suggestedNextAction: error.nextAction });
   }
+  // A new artifact with no page, held once by the push itself (#345): the same command again goes through.
+  if (error.heldOnce) return heldOnceCliError(error);
   if (error.serverCode && ARTIFACT_CLI_CODES.has(error.serverCode)) {
     return new CliError({ code: error.serverCode as CliErrorCode, message: error.message, suggestedNextAction: error.nextAction });
   }
@@ -49,7 +51,7 @@ export function artifactCliError(failure: RaftFailure, again?: string | null, ra
       ? `The Raft Server refused the request (${error.serverCode}) and sent no explanation.`
       : error.message;
     const suggestedNextAction = generic && error.nextAction === generic.nextAction
-      ? "Change what the error says, then run the same command again. If it doesn't say what to change, this Raft CLI may be older than the Raft Server: ask the owner of this computer to update its Raft Computer to the latest version."
+      ? "Change what the error says, then run the same command again. If it doesn't say what to change, this Raft CLI may be older than the Raft Server: ask the person who connected this computer, or a server owner or admin, to update its Raft Computer to the latest version."
       : error.nextAction;
     return cliError(error.serverCode, message, { suggestedNextAction, retryable: error.retryable });
   }

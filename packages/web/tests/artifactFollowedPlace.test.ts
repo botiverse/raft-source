@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { EDGE_MARKER_PX, edgeMarkerPlace, followedPlace, selectionPlace, sheetLift } from "../src/apps/artifacts/artifactTrackedPlaces";
+import { composerPlace, EDGE_MARKER_PX, edgeMarkerPlace, followedPlace, INSIDE_INSET_PX, selectionPlace, sheetLift } from "../src/apps/artifacts/artifactTrackedPlaces";
 
 // A card opened beside its marker moves as its mark's box moves; the frame clamps that box to its
 // edges (Porthole P104), so a clamped side says nothing about the move (review of #11839).
@@ -115,4 +115,48 @@ test("a phone's sheet: the frame is lifted just enough for the selection to clea
   assert.equal(sheetLift({ top: 200, bottom: 700 }, 300, 500), 200 - 16, "taller than the room: its top stays in view");
   assert.equal(sheetLift({ top: 10_000_000, bottom: 10_000_040 }, 300, 500), 500, "the page's word, bounded by the frame");
   assert.equal(sheetLift({ top: -400, bottom: -360 }, 300, 500), 0, "above the frame: no lift");
+});
+
+// The composer at a picked element taller than half the frame opens inside it, at a point
+// (#proj-workspace:#315): there is no room for it beside such an element.
+
+/** What `selectionTracked` reports for an element whose whole box is `doc` (document px), the frame (`frame`) scrolled by `scroll`. */
+const tracked = (doc: { x: number; y: number; width: number; height: number }, scroll = { x: 0, y: 0 }) => {
+  const left = Math.max(0, Math.min(doc.x - scroll.x, frame.width));
+  const right = Math.max(0, Math.min(doc.x + doc.width - scroll.x, frame.width));
+  const top = Math.max(0, Math.min(doc.y - scroll.y, frame.height));
+  const bottom = Math.max(0, Math.min(doc.y + doc.height - scroll.y, frame.height));
+  return { rect: { x: left, y: top, width: right - left, height: bottom - top }, lastLineDocumentRect: doc, scroll };
+};
+
+test("a normal-size pick, and any text selection: beside it, as selectionPlace places it", () => {
+  const small = tracked({ x: 20, y: 40, width: 300, height: 120 });
+  assert.deepEqual(composerPlace(small, frame, { element: true }), selectionPlace(small, frame));
+  const tall = tracked({ x: 0, y: 10, width: 600, height: 380 });
+  assert.deepEqual(composerPlace(tall, frame, { element: false }), selectionPlace(tall, frame), "a text selection, however tall");
+  assert.deepEqual(composerPlace(tall, null, { element: true }), selectionPlace(tall, null), "no frame box: as before");
+});
+
+test("a huge pick: inside it, its visible top left inset", () => {
+  const huge = tracked({ x: 0, y: 30, width: 600, height: 380 });
+  assert.deepEqual(composerPlace(huge, frame, { element: true }), { x: frame.left + INSIDE_INSET_PX, y: frame.top + 30 + INSIDE_INSET_PX, width: 0, height: 0 });
+});
+
+test("a huge pick scrolled partly out above: the visible part's top left, so it stays in view", () => {
+  const scrolled = tracked({ x: 0, y: 30, width: 600, height: 800 }, { x: 0, y: 500 });
+  assert.deepEqual(composerPlace(scrolled, frame, { element: true }), { x: frame.left + INSIDE_INSET_PX, y: frame.top + INSIDE_INSET_PX, width: 0, height: 0 });
+  // Only a sliver still in view: clamped into it.
+  const sliver = tracked({ x: 0, y: 30, width: 600, height: 800 }, { x: 0, y: 820 });
+  assert.deepEqual(composerPlace(sliver, frame, { element: true }), { x: frame.left + INSIDE_INSET_PX, y: frame.top + 10, width: 0, height: 0 });
+});
+
+test("a huge pick with a press point: at that point, made viewport px with the scroll and clamped into the visible part", () => {
+  const huge = tracked({ x: 0, y: 30, width: 600, height: 800 }, { x: 0, y: 200 });
+  assert.deepEqual(composerPlace(huge, frame, { element: true, point: { x: 250, y: 400 } }), { x: frame.left + 250, y: frame.top + 200, width: 0, height: 0 });
+  // Pressed where the page has since scrolled out of view: the nearest visible point.
+  assert.deepEqual(composerPlace(huge, frame, { element: true, point: { x: 250, y: 100 } }), { x: frame.left + 250, y: frame.top, width: 0, height: 0 });
+  // The page's word: a point far outside is clamped into the frame like every other box from it.
+  const placed = composerPlace(huge, frame, { element: true, point: { x: 10_000_000, y: -10_000_000 } });
+  assert.deepEqual(placed, { x: frame.left + frame.width, y: frame.top, width: 0, height: 0 });
+  assert.deepEqual(composerPlace(huge, frame, { element: true, point: { x: Number.NaN, y: 0 } }), { x: frame.left + INSIDE_INSET_PX, y: frame.top + INSIDE_INSET_PX, width: 0, height: 0 }, "not a number: the fallback");
 });

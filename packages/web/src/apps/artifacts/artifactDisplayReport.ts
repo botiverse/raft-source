@@ -113,7 +113,9 @@ export function measurePageArea(page: HTMLElement | null): DisplayReportFacts["p
 
 /** The facts for the version shown, measured now. */
 export function measureDisplayReportFacts(page: HTMLElement | null, version: number): DisplayReportFacts {
-  const ratio = typeof window === "undefined" ? 1 : window.devicePixelRatio;
+  // The page's own window's (an object window may be on another screen, #337 PR3).
+  const view = page?.ownerDocument.defaultView ?? (typeof window === "undefined" ? null : window);
+  const ratio = view ? view.devicePixelRatio : 1;
   return {
     version,
     pageArea: measurePageArea(page),

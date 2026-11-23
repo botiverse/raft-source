@@ -31,6 +31,8 @@ const { triggerServerReset } = await import("../src/store/serverResetRegistry");
 const { useInboxStore } = await import("../src/store/inboxStore");
 const { useMessageStore } = await import("../src/store/messageStore");
 const { useServerStore } = await import("../src/store/serverStore");
+const { reportListRowsLowered, __resetPendingLocalReadsForTest } = await import("../src/store/inboxListRowLowered");
+const { __setStateTransitionEmitterForTest } = await import("../src/utils/stateTransitionTrace");
 
 const originalGet = api.get.bind(api);
 const originalPost = api.post.bind(api);
@@ -129,6 +131,37 @@ test("stale Activity read failure cannot roll back or refresh a newer A-to-B-to-
     assert.equal(refreshCalls, 0);
   } finally {
     api.get = originalGet as typeof api.get;
+    api.post = originalPost as typeof api.post;
+    resetInbox();
+  }
+});
+
+test("markRead's ack settles a held local_read lowering for that scope as corrected (#triage:#244)", async () => {
+  const unread = makeChannelItem();
+  const events: Array<Record<string, unknown>> = [];
+  __setStateTransitionEmitterForTest((name, attrs) => {
+    if (name === "slock.state.transition") events.push(attrs as Record<string, unknown>);
+  });
+  api.post = (async () => ({ data: { seq: 9, readStateVersion: 2 } })) as typeof api.post;
+  // An earlier test's read ack of this scope is still recent (kept for a hold registered after it).
+  __resetPendingLocalReadsForTest();
+  try {
+    resetInbox([unread]);
+    useServerStore.setState({ current: { id: "server-a" } as never, serverEpoch: 21 });
+    reportListRowsLowered({
+      served: [unread],
+      servedFrontiers: [{ kind: "present", readStateVersion: 1, maxReadSeq: "3", latestActivity: { messageId: "message-a-1", seq: "9" } }],
+      before: [unread],
+      stages: [["local_read", [{ ...unread, unreadCount: 0 }]]],
+      reason: "realtime_fallback", trigger: undefined, rowPosition: true,
+    });
+    assert.equal(events.length, 0);
+    await useInboxStore.getState().markRead(unread);
+    const names = events.map((attrs) => (attrs as { key?: { event?: string } }).key?.event).filter((name) => name?.startsWith("activity:list_row"));
+    assert.deepEqual(names, ["activity:list_row_corrected"]);
+  } finally {
+    __resetPendingLocalReadsForTest();
+    __setStateTransitionEmitterForTest(null);
     api.post = originalPost as typeof api.post;
     resetInbox();
   }

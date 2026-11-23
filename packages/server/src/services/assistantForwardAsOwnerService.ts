@@ -36,7 +36,7 @@ import { and, eq, isNotNull } from "drizzle-orm";
 import type { Server as SocketServer } from "socket.io";
 import { getDb } from "../db/index";
 import { messages } from "../db/schema";
-import { MAX_FORWARD_DESTINATIONS, asServerId, isSubConversationType } from "@botiverse/raft-shared";
+import { MAX_FORWARD_DESTINATIONS, isSubConversationType, type ServerId } from "@botiverse/raft-shared";
 import type { AgentOrchestrator } from "./agentOrchestrator";
 import * as channelService from "./channelService";
 import * as messageService from "./messageService";
@@ -132,6 +132,7 @@ const RETRACTED_BY_OWNER_ERROR = "Your owner retracted the message this forward 
  */
 function forwardRefusalForAgent(err: ForwardRequestError, sourceIds?: unknown): string {
   const passed = Array.isArray(sourceIds) && err.sourceIndex !== undefined ? sourceIds[err.sourceIndex] : undefined;
+  // Safe to quote: a source refused by position already passed resolveForwardSourceMessageIds (a UUID or an 8-character short id).
   const source = err.sourceIndex !== undefined
     ? `messages[${err.sourceIndex}]${typeof passed === "string" ? ` (${JSON.stringify(passed.trim())})` : ""}`
     : "A message";
@@ -219,7 +220,7 @@ async function messageLink(serverSlug: string | null, channelId: string, message
 export async function forwardAsOwner(input: {
   io: SocketServer;
   orchestrator: AgentOrchestrator;
-  serverId: string;
+  serverId: ServerId;
   agentId: string;
   ownerUserId: string;
   messages: unknown;
@@ -261,7 +262,7 @@ export async function forwardAsOwner(input: {
     return fail(400, "invalid_request", `messages takes 1 to ${MAX_FORWARD_BUNDLE_ITEMS} distinct message ids (full, or the 8-character msg= id), all from one conversation.`);
   }
   const bundle: ForwardedBundleMetadata = await asRequestError(input.messages, () => buildForwardedBundleMetadata({
-    serverId: asServerId(serverId),
+    serverId,
     forwarderUserId: ownerUserId,
     delegatedByAgentId: agentId,
     sourceMessageIds,
@@ -278,7 +279,7 @@ export async function forwardAsOwner(input: {
     join: boolean,
   ): Promise<Failure | Ready> => {
     // Access first: a conversation the owner is not in reads the same whatever it is (no DM switch or own-DM answer for it).
-    if (!await channelService.canUserAccessChannel(channel.id, ownerUserId, asServerId(serverId))) {
+    if (!await channelService.canUserAccessChannel(channel.id, ownerUserId, serverId)) {
       return failed("channel_not_found", "No such conversation, or your owner cannot see it.");
     }
     const scope = await dmScopeOf(channel);
@@ -539,7 +540,7 @@ const ASSISTANT_READS_DMS_OFF_SEARCH_REASON = "Your owner has not let you read t
  * dropped".
  */
 export async function searchForwardTargetsForOwner(input: {
-  serverId: string;
+  serverId: ServerId;
   agentId: string;
   ownerUserId: string;
   q: string;
@@ -550,7 +551,7 @@ export async function searchForwardTargetsForOwner(input: {
   omittedReason?: string;
 }> {
   const [{ targets, conversations }, readsDms, ownDmId] = await Promise.all([
-    searchForwardTargets({ serverId: asServerId(input.serverId), userId: input.ownerUserId, q: input.q, limit: input.limit }),
+    searchForwardTargets({ serverId: input.serverId, userId: input.ownerUserId, q: input.q, limit: input.limit }),
     assistantReadsOwnerDms(input.agentId),
     channelService.findHumanAgentDmChannelId(input.serverId, input.ownerUserId, input.agentId),
   ]);

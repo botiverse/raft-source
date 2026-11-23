@@ -4,7 +4,9 @@
 // wake is skipped: the event stays readable in the item, and no re-delivery
 // (the daemon's rebuild, the inbox push sweep) pushes it as a wake later.
 // After the item is read, the next event wakes as usual. Inbox items off:
-// every event is its own notice, as before.
+// every event is its own notice, as before. The same for an agent whose
+// `raft` CLI hasn't said it lists app inbox items (#proj-apps:#88): a merged
+// event is never pushed, so that agent would never see it.
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { eq, inArray } from "drizzle-orm";
@@ -22,7 +24,8 @@ import { AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY, createFeatureFlag } from "../servic
 import { INBOX_ITEMS_LAUNCH_AT_ENV, listAgentAppItemGroups } from "../services/agentInboxItems";
 import { __resetInboxItemsLaunchWarningsForTests, inboxItemsLaunch } from "../services/inboxItemsLaunch";
 import { createSystemAppAgentEvent, deliverSystemAppAgentEvent } from "../services/systemAppAgentEvents";
-import { wakeForEventsMergedSinceHandover } from "../services/appItemWakeCoalescing";
+import { APP_ITEM_WAKE_COALESCE_WINDOW_MS, wakeForEventsMergedSinceHandover } from "../services/appItemWakeCoalescing";
+import { recordAgentCliInboxItems } from "../services/agentCliInboxItems";
 
 const test = createApiTest();
 
@@ -35,7 +38,8 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-async function seed(app: { baseUrl: string }) {
+/** `cli: true` (default): the agent's CLI already said it lists app inbox items. */
+async function seed(app: { baseUrl: string }, options: { cli?: boolean } = {}) {
   const db = getDb();
   const suffix = randomUUID().slice(0, 8);
   const [owner] = await db.insert(users).values({
@@ -89,6 +93,7 @@ async function seed(app: { baseUrl: string }) {
     });
     return { status: res.status, body: await res.json() as any };
   };
+  if (options.cli !== false) await recordAgentCliInboxItems(agent.id, null, true);
   return { server, agent, general, hidden, client, send };
 }
 
@@ -159,6 +164,35 @@ test("once the item is read, the next event on it wakes again", async ({ app }) 
   assert.equal(after.body.wake, undefined);
   assert.equal((await stored(after.body.id)).status, "delivering");
   assert.equal((await stored(after.body.id)).wakeCoalescedAt, null);
+});
+
+test("an unread item whose last wake is older than the window does not silence a new event (#wg-ax:#35)", async ({ app }) => {
+  await itemsOn();
+  const s = await seed(app);
+  // The agent dealt with the first notice in the app (replied in the doc) and never read the item.
+  const first = await s.send({ object: { ref: "doc-1" }, summary: "comment at 08:23" });
+  await getDb().update(thirdPartyAgentEvents)
+    .set({ createdAt: new Date(Date.now() - APP_ITEM_WAKE_COALESCE_WINDOW_MS - 1000) })
+    .where(eq(thirdPartyAgentEvents.id, first.body.id));
+  const later = await s.send({ object: { ref: "doc-1" }, summary: "comment at 20:51" });
+  assert.equal(later.body.wake, undefined, "a later ask wakes again");
+  assert.deepEqual([(await stored(later.body.id)).status, (await stored(later.body.id)).wakeCoalescedAt], ["delivering", null]);
+  // A burst right after it still merges into that new wake.
+  const burst = await s.send({ object: { ref: "doc-1" } });
+  assert.equal(burst.body.wake, "merged");
+});
+
+test("events merged and left unread do not hold the item once its wake was handed over", async ({ app }) => {
+  await itemsOn();
+  const s = await seed(app);
+  const first = await s.send({ object: { ref: "doc-1" } });
+  const merged = await s.send({ object: { ref: "doc-1" } });
+  assert.equal(merged.body.wake, "merged");
+  // The wake is handed over; the merged event stays unread in the item.
+  await markThirdPartyAgentEventsDelivered([first.body.id], { agentId: s.agent.id });
+  const next = await s.send({ object: { ref: "doc-1" } });
+  assert.equal(next.body.wake, undefined, "the merged event woke no one, so it holds nothing");
+  assert.equal((await stored(merged.body.id)).status, "queued", "still readable in the item");
 });
 
 test("an expired unread event does not hold the item's wake", async ({ app }) => {
@@ -240,4 +274,59 @@ test("with no orchestrator to push through, a handover releases nothing", async 
   // No deliverer (no orchestrator): nothing is released, so the sweep can't double it later.
   assert.deepEqual(await wakeForEventsMergedSinceHandover(undefined, s.agent.id, [first.body.id]), []);
   assert.ok((await stored(merged.body.id)).wakeCoalescedAt instanceof Date);
+});
+
+test("an agent whose CLI can't list app inbox items, or hasn't said yet, gets a wake for every event (#proj-apps:#88)", async ({ app }) => {
+  await itemsOn();
+  for (const cli of ["lists", "unknown", "old_cli"] as const) {
+    const s = await seed(app, { cli: cli === "lists" });
+    if (cli === "old_cli") await recordAgentCliInboxItems(s.agent.id, null, false);
+    const first = await s.send({ object: { ref: "pr-1" } });
+    const second = await s.send({ object: { ref: "pr-1" } });
+    assert.equal((await stored(first.body.id)).status, "delivering", `${cli}: the first wakes`);
+    const row = await stored(second.body.id);
+    if (cli === "lists") {
+      assert.equal(second.body.wake, "merged", "a CLI that lists items still merges");
+      assert.equal(row.status, "queued");
+      assert.ok(row.wakeCoalescedAt instanceof Date);
+    } else {
+      assert.equal(second.body.wake, undefined, `${cli}: not merged`);
+      assert.deepEqual([row.status, row.wakeCoalescedAt], ["delivering", null], `${cli}: pushed`);
+    }
+  }
+});
+
+test("a system app's notice wakes an agent whose CLI can't list app inbox items, or hasn't said yet (#proj-apps:#88)", async ({ app }) => {
+  await itemsOn();
+  for (const cli of ["lists", "unknown", "old_cli"] as const) {
+    const s = await seed(app, { cli: cli === "lists" });
+    if (cli === "old_cli") await recordAgentCliInboxItems(s.agent.id, null, false);
+    const delivered: string[] = [];
+    const deliverer = { deliverMessage: async (_agentId: string, message: { third_party_event?: { id: string } | null }) => { delivered.push(message.third_party_event!.id); } };
+    // A system app with no delivery guard, so the push itself shows.
+    const notice = () => createSystemAppAgentEvent({
+      serverId: s.server.id,
+      agentId: s.agent.id,
+      systemApp: "system.assistant",
+      summary: "Your owner answered the card",
+      payload: {},
+      ttlMs: 60_000,
+      objectRef: "card/3f4b1fd4",
+    });
+    // Its first notice was pushed and is unread.
+    const first = await notice();
+    await getDb().update(thirdPartyAgentEvents).set({ status: "delivering" }).where(eq(thirdPartyAgentEvents.id, first.id));
+    const second = await notice();
+    const pushed = await deliverSystemAppAgentEvent({ event: second, deliverer: deliverer as never });
+    const row = await stored(second.id);
+    if (cli === "lists") {
+      assert.equal(pushed, false, "a CLI that lists items still merges");
+      assert.deepEqual(delivered, []);
+      assert.ok(row.wakeCoalescedAt instanceof Date);
+    } else {
+      assert.equal(pushed, true, `${cli}: pushed`);
+      assert.deepEqual(delivered, [second.id]);
+      assert.deepEqual([row.status, row.wakeCoalescedAt], ["delivering", null], `${cli}: not merged into the item's wake`);
+    }
+  }
 });

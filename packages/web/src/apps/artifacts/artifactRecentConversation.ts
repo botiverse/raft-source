@@ -15,6 +15,7 @@ import {
   subscribeRecentArtifacts,
 } from "./artifactRecentStore";
 import type { RecentArtifact } from "./artifactRecentStore";
+import type { ArtifactId } from "@botiverse/raft-shared";
 
 /**
  * The conversation whose side card the viewer is (#proj-workspace:#291): its page provides it around the card
@@ -23,10 +24,12 @@ import type { RecentArtifact } from "./artifactRecentStore";
  */
 export interface ArtifactConversationPlace {
   conversationId: string;
-  /** The conversation as people know it ("#general", "@Niko"), for the menu's words. */
+  /** The conversation as people know it ("#general", "@Niko"), for the menu's words; "" when this page can't name it. */
   name: string;
   /** Opens the conversation's Files card (the header's paperclip), where all its Artifacts are; absent: no such item. */
   onShowAll?: () => void;
+  /** Opens a picked one where this title is not a side card's (the App's Artifact page: its page); absent: in the same card. */
+  onPick?: (id: ArtifactId) => void;
 }
 
 export const ArtifactConversationContext = createContext<ArtifactConversationPlace | null>(null);

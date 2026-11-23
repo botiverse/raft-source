@@ -57,6 +57,13 @@ const GITHUB_TOKEN_FAMILY_PATTERN =
 const GENERIC_CREDENTIAL_ASSIGNMENT_PATTERN =
   /\b((?:password|passwd|secret|token)\s*[:=]\s*)("[^"]*(?:"|$)|'[^']*(?:'|$)|[^\s;,]+)/gi;
 
+// A Windows profile path: any drive-letter case, `\` or `/` separators, and
+// a user name that may hold spaces (`C:\Users\John Smith\...`), read through
+// the next separator; with no separator after it, up to the next space.
+// Linear: the lazy name stops at the next separator, quote, colon or line end.
+const WINDOWS_USER_PATH_PATTERN =
+  /[A-Za-z]:[\\/]users[\\/](?:[^\\/"'<>:\r\n]+?(?=[\\/])|[^\s"'<>:\\/]+)(?:[\\/][^\s"'<>:\\/]+)*/gi;
+
 function redactUrlQuery(value: string): string {
   try {
     const url = new URL(value);
@@ -79,9 +86,10 @@ export function scrubRuntimeErrorText(value: string): string {
     .replace(/\b(?:sk|sk-ant|sk-proj|xox[baprs]?)-[A-Za-z0-9_-]{8,}\b/g, "[REDACTED_TOKEN]")
     .replace(EMAIL_PATTERN, "[REDACTED_EMAIL]")
     .replace(/https?:\/\/[^\s"'<>]+/gi, (url) => redactUrlQuery(url))
+    // Windows first: `C:/Users/x` is not left as `C:` + a POSIX path.
+    .replace(WINDOWS_USER_PATH_PATTERN, "[REDACTED_PATH]")
     .replace(/\/Users\/[^\s"'<>:]+(?:\/[^\s"'<>:]+)*/g, "[REDACTED_PATH]")
-    .replace(/\/home\/[^\s"'<>:]+(?:\/[^\s"'<>:]+)*/g, "[REDACTED_PATH]")
-    .replace(/[A-Za-z]:\\Users\\[^\s"'<>:]+(?:\\[^\s"'<>:]+)*/g, "[REDACTED_PATH]");
+    .replace(/\/home\/[^\s"'<>:]+(?:\/[^\s"'<>:]+)*/g, "[REDACTED_PATH]");
   // Env/field assignments with a secret-shaped key: keep the key label, redact value.
   scrubbed = scrubbed.replace(SECRET_ASSIGNMENT_KEY_PATTERN, (_match, key: string) => `${String(key).trim()}=[REDACTED_TOKEN]`);
   // Generic credential assignment (password/secret/token = value): redact value.
@@ -125,6 +133,20 @@ function scrubberInput(raw: string): string {
 export function boundedRuntimeErrorDetail(raw: string): string {
   const scrubbed = scrubRuntimeErrorText(scrubberInput(raw));
   return scrubbed.length <= MAX_VISIBLE_RUNTIME_ERROR_DETAIL_CHARS ? scrubbed : scrubbed.slice(0, MAX_VISIBLE_RUNTIME_ERROR_DETAIL_CHARS);
+}
+
+/** The most characters of a failed start's own error text (SpawnFailureActivityDiagnostic.message). */
+export const MAX_START_FAILURE_MESSAGE_CHARS = 300;
+
+/**
+ * A failed start's error text as it may travel and be stored: scrubbed
+ * first, then cut to MAX_START_FAILURE_MESSAGE_CHARS (so the cap counts the
+ * text a manager reads, and a cut can never leave a credential's tail that
+ * scrubbing would have caught whole). Idempotent. Empty when nothing is left.
+ */
+export function boundedStartFailureMessage(raw: string): string {
+  const bounded = boundedRuntimeErrorDetail(raw).trim();
+  return bounded.length <= MAX_START_FAILURE_MESSAGE_CHARS ? bounded : bounded.slice(0, MAX_START_FAILURE_MESSAGE_CHARS).trimEnd();
 }
 
 /**

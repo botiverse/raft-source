@@ -4,7 +4,7 @@ import type { AppSearchHit } from "./AppSearchGroupSection";
 import { isSearchKeyboardComposing } from "./searchComposition";
 import { ENTITY_PREVIEW_COUNT } from "./searchConstants";
 import { findExactDestination } from "./searchEntities";
-import type { SearchEntityResult as SearchEntityRecord } from "./searchEntities";
+import type { SearchEntityGroupId, SearchEntityGroupView, SearchEntityResult as SearchEntityRecord } from "./searchEntities";
 import { isSelectableRow, OVERLAY_ALL_RESULTS_ROW } from "./searchResultTypes";
 import type { MessageSearchResult, SelectableSearchResult } from "./searchResultTypes";
 import { expandedEntitySearches } from "./searchSnapshot";
@@ -21,7 +21,7 @@ export function useSearchKeyboardSelection({
   query,
   serverId,
   searchSurface,
-  rankedEntityResults,
+  entityGroups,
   entityResults,
   recentConversationRows,
   appHits,
@@ -47,8 +47,10 @@ export function useSearchKeyboardSelection({
   query: string;
   serverId: string | undefined;
   searchSurface: string;
-  rankedEntityResults: readonly SearchEntityRecord[];
-  entityResults: SearchEntityRecord[];
+  /** The destinations sections (useSearchEntityResults). */
+  entityGroups: readonly SearchEntityGroupView[];
+  /** Every destination row of the sections, in order. */
+  entityResults: readonly SearchEntityRecord[];
   recentConversationRows: SelectableSearchResult[];
   appHits: AppSearchHit[];
   visibleMessageResults: MessageSearchResult[];
@@ -75,12 +77,11 @@ export function useSearchKeyboardSelection({
   // message preview follow. Full page: unchanged order, no action row.
   // oxlint-disable-next-line react-doctor/no-event-handler -- render-derived row visibility (task #102): composes the overlay's selectable rows, no Effect or setState-in-Effect involved.
   const showAllResultsAction = activateResultsInChat && hasSearchIntent;
-  // Searched over the FULL ranked list (not the MAX_ENTITY_RESULTS slice): the
-  // looser ranking score can place a punctuation-different sibling first, and a
-  // strict match may sit past the display cut. See findExactDestination.
+  // Searched over every row of every section (not just the previewed ones):
+  // a strict match may sit past the preview cut. See findExactDestination.
   const exactDestinationCandidate = useMemo(
-    () => findExactDestination(query, rankedEntityResults),
-    [query, rankedEntityResults],
+    () => findExactDestination(query, entityResults),
+    [query, entityResults],
   );
   const exactDestination = showAllResultsAction ? exactDestinationCandidate : null;
   const allResultsRow = showAllResultsAction ? OVERLAY_ALL_RESULTS_ROW : null;
@@ -88,30 +89,44 @@ export function useSearchKeyboardSelection({
     () => (exactDestination === null ? null : { key: exactDestination.key, kind: "entity", result: exactDestination }),
     [exactDestination],
   );
-  const remainingEntityResults = useMemo(
-    () => (exactDestination ? entityResults.filter((result) => result.key !== exactDestination.key) : entityResults),
-    [entityResults, exactDestination],
-  );
-  // Expanded for this server and typed query only: a new query starts collapsed.
+  // Expanded per section, for this server and typed query only: a new query starts collapsed.
   const entityListKey = `${serverId ?? ""}|${query.trim()}`;
-  const [expandedEntitySearch, setExpandedEntitySearch] = useState(() => expandedEntitySearches.get(searchSurface) ?? null);
-  // oxlint-disable-next-line react-doctor/no-event-handler -- render-derived: the list is expanded for the query it was expanded for; the state is set only by the Show All click, no Effect involved.
-  const entityListExpanded = expandedEntitySearch === entityListKey;
-  const visibleEntityResults = useMemo(
-    () => (entityListExpanded ? remainingEntityResults : remainingEntityResults.slice(0, ENTITY_PREVIEW_COUNT)),
-    [entityListExpanded, remainingEntityResults],
-  );
-  // Show All / Show Fewer stays mounted, so keyboard focus stays on it and the
+  const expandedKey = useCallback((group: SearchEntityGroupId) => `${searchSurface}|${group}`, [searchSurface]);
+  const [expandedEntitySearch, setExpandedEntitySearch] = useState<ReadonlyMap<SearchEntityGroupId, string>>(() => new Map(
+    (["channels", "people", "computers"] as const).flatMap((group) => {
+      const key = expandedEntitySearches.get(`${searchSurface}|${group}`);
+      return key ? [[group, key] as const] : [];
+    }),
+  ));
+  // Each section: its rows less the hoisted exact destination, the first
+  // ENTITY_PREVIEW_COUNT of them until Show all, and how many it has in all.
+  // A section still waiting for its server answer has no count (null): its
+  // total is the server's, so the heading changes once, when that arrives
+  // (raft-design patterns/responsive.md). A section the reader expanded stays
+  // expanded meanwhile (a Retry asks a failed group again).
+  const visibleEntityGroups = useMemo(() => entityGroups.map((group) => {
+    const rows = exactDestination ? group.results.filter((result) => result.key !== exactDestination.key) : group.results;
+    const hoisted = rows.length !== group.results.length ? 1 : 0;
+    // oxlint-disable-next-line react-doctor/no-event-handler -- render-derived: the section is expanded for the query it was expanded for; the state is set only by the Show all click, no Effect involved.
+    const expanded = expandedEntitySearch.get(group.id) === entityListKey;
+    const total = Math.max(group.total - hoisted, rows.length);
+    return { group, rows: expanded ? rows : rows.slice(0, ENTITY_PREVIEW_COUNT), count: group.pending ? null : total, total, expanded };
+  }), [entityGroups, entityListKey, exactDestination, expandedEntitySearch]);
+  const remainingEntityCount = useMemo(() => visibleEntityGroups.reduce((sum, view) => sum + view.total, 0), [visibleEntityGroups]);
+  const visibleEntityResults = useMemo(() => visibleEntityGroups.flatMap((view) => view.rows), [visibleEntityGroups]);
+  // Show all / Show fewer stays mounted, so keyboard focus stays on it and the
   // page's arrow keys keep working after the list expands.
-  const toggleEntityResults = useCallback(() => {
-    if (entityListExpanded) {
-      expandedEntitySearches.delete(searchSurface);
-      setExpandedEntitySearch(null);
-      return;
+  const toggleEntityGroup = useCallback((group: SearchEntityGroupId) => {
+    const next = new Map(expandedEntitySearch);
+    if (next.get(group) === entityListKey) {
+      expandedEntitySearches.delete(expandedKey(group));
+      next.delete(group);
+    } else {
+      expandedEntitySearches.set(expandedKey(group), entityListKey);
+      next.set(group, entityListKey);
     }
-    expandedEntitySearches.set(searchSurface, entityListKey);
-    setExpandedEntitySearch(entityListKey);
-  }, [entityListExpanded, entityListKey, searchSurface]);
+    setExpandedEntitySearch(next);
+  }, [entityListKey, expandedEntitySearch, expandedKey]);
   const selectableResults = useMemo<SelectableSearchResult[]>(
     () => [
       // Overlay empty state: the recent-conversation rows are the keyboard rail
@@ -253,10 +268,9 @@ export function useSearchKeyboardSelection({
   return {
     showAllResultsAction,
     exactDestination,
-    remainingEntityResults,
-    entityListExpanded,
-    visibleEntityResults,
-    toggleEntityResults,
+    remainingEntityCount,
+    visibleEntityGroups,
+    toggleEntityGroup,
     selectableResults,
     selectedResultKey,
     entityResultsListRef,

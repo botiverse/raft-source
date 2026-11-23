@@ -15,7 +15,7 @@ type Profile = {
   serverSlug: string;
   role: string | null;
   email: string | null;
-  servers?: Array<{ id: string; name: string; slug: string }>;
+  servers?: Array<{ id: string; name: string; slug: string; avatarUrl: string | null }>;
 };
 
 // #wg-rbac:#58: a profile opened from a channel (`?channelId=`) names the
@@ -29,6 +29,9 @@ apiTest("a profile opened from a channel names the person's servers in that chan
   const b = await seed.server({ owner: ownerB, name: "Bravo", members: [pat] });
   await db.update(servers).set({ plan: "founder" }).where(eq(servers.id, v.id));
   await db.update(servers).set({ plan: "founder" }).where(eq(servers.id, b.id));
+  // Alpha has a logo (an uploaded server avatar's URL shape); Bravo has none.
+  const alphaLogo = `/api/avatars/server-${a.id}/${"a".repeat(32)}.webp`;
+  await db.update(servers).set({ avatarUrl: alphaLogo }).where(eq(servers.id, a.id));
   // #acme-launch: hosted by V, Pat in through Alpha.
   const launch = await createJointChannel({
     hostServerId: v.id, createdByUserId: ownerV.id, name: "acme-launch",
@@ -65,7 +68,7 @@ apiTest("a profile opened from a channel names the person's servers in that chan
     const body = (await response.json()) as { humans: Array<{ id: string; servers?: Profile["servers"] }> };
     return body.humans.find((human) => human.id === pat.id);
   };
-  const serverOf = (server: { id: string; name: string; slug: string }) => ({ id: server.id, name: server.name, slug: server.slug });
+  const serverOf = (server: { id: string; name: string; slug: string; avatarUrl?: string | null }) => ({ id: server.id, name: server.name, slug: server.slug, avatarUrl: server.avatarUrl ?? null });
 
   // Without channelId (older clients): unchanged, one of the shared channels' servers and no `servers`.
   const legacy = await ok(viewer, pat.id);
@@ -74,11 +77,18 @@ apiTest("a profile opened from a channel names the person's servers in that chan
 
   // Each channel names its own server, as its roster row does; roles stay with their server.
   const inLaunch = await ok(viewer, pat.id, launch.channel.id);
-  assert.deepEqual(inLaunch.servers, [serverOf(a)]);
+  assert.deepEqual(inLaunch.servers, [serverOf({ ...a, avatarUrl: alphaLogo })], "a server's logo rides with its origin label");
   assert.deepEqual(inLaunch.servers, (await roster(viewer, launch.channel.id))?.servers);
   assert.deepEqual([inLaunch.serverId, inLaunch.serverName, inLaunch.serverSlug], [a.id, "Alpha", a.slug]);
   assert.equal(inLaunch.role, null);
   assert.equal(inLaunch.email, null);
+  // The channel's server list carries each active server's logo too (authors
+  // and mention candidates known only by their home server id use it).
+  const launchView = await http.as(viewer, v).get(`/api/channels/${launch.channel.id}`);
+  assert.equal(launchView.status, 200);
+  const launchServers = ((await launchView.json()) as { jointServers?: Array<{ serverId: string; serverAvatarUrl: string | null }> }).jointServers ?? [];
+  assert.equal(launchServers.find((server) => server.serverId === a.id)?.serverAvatarUrl, alphaLogo);
+  assert.equal(launchServers.find((server) => server.serverId === v.id)?.serverAvatarUrl, null);
   const inOps = await ok(viewer, pat.id, opsVictor.id);
   assert.deepEqual(inOps.servers, [serverOf(b)]);
   assert.deepEqual(inOps.servers, (await roster(viewer, opsVictor.id))?.servers);
@@ -105,7 +115,7 @@ apiTest("a profile opened from a channel names the person's servers in that chan
     await mirror.apply([guest.id], { actorUserId: ownerV.id });
   });
   const guestCard = await ok(guest, pat.id, launch.channel.id);
-  assert.deepEqual(guestCard.servers, [serverOf(a)]);
+  assert.deepEqual(guestCard.servers, [serverOf({ ...a, avatarUrl: alphaLogo })]);
   assert.deepEqual([guestCard.serverId, guestCard.serverName], [a.id, "Alpha"]);
   assert.equal(guestCard.role, null);
   const guestUnknown = await profileOf(guest, randomUUID());

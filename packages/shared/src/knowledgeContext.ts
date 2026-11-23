@@ -36,6 +36,27 @@ export function hasInboxItemsCapability(raw: unknown): boolean {
 }
 
 /**
+ * A client's declaration that its `raft reminder` commands call the Reminder
+ * app where a Server's reminders moved there (the agent context's
+ * `features.reminderApp`). The Server teaches an external agent's guide
+ * (`GET /context`) the Reminder app's `raft reminder` only for a client that
+ * declares it: an older CLI sends those commands to the legacy reminder API,
+ * which refuses external agents. Managed agents need no token: the daemon
+ * builds their prompt with the CLI it ships. Versioned like the other tokens.
+ */
+const REMINDER_APP_CLI_CAPABILITY_VERSION = 1;
+export const REMINDER_APP_CLI_CAPABILITY = `reminder-app-cli@${REMINDER_APP_CLI_CAPABILITY_VERSION}`;
+
+/** Whether a request's `X-Raft-Client-Capabilities` value declares REMINDER_APP_CLI_CAPABILITY, at its version or later. */
+export function hasReminderAppCliCapability(raw: unknown): boolean {
+  if (typeof raw !== "string") return false;
+  return raw.split(",").some((value) => {
+    const match = /^reminder-app-cli@([1-9][0-9]*)$/u.exec(value.trim());
+    return match !== null && Number(match[1]) >= REMINDER_APP_CLI_CAPABILITY_VERSION;
+  });
+}
+
+/**
  * A runner's declaration that it acks reminder due items through the Server
  * (`POST /app-sources/ack`, which writes `reminder_source_acknowledgements`),
  * never only in its local reminder cache (RFC 081 D17). The Server lists
@@ -58,7 +79,26 @@ export function hasReminderServerAckCapability(raw: unknown): boolean {
   });
 }
 
-export const MANUAL_INDEX_COMMAND = "raft manual get index --intent \"Learn available Raft workflows\" --reason \"Browse the topic catalog after a missing topic\"";
+/**
+ * A client's declaration that its `raft message resolve` takes
+ * `--forwarded <n>`. A forwarded message cut in an agent's snapshot names that
+ * command only for a client that declares it: an older CLI refuses the option.
+ * The CLI declares it, and the daemon too, for the deliveries it receives (it
+ * ships the same CLI). Versioned like the other tokens.
+ */
+const FORWARDED_RESOLVE_CAPABILITY_VERSION = 1;
+export const FORWARDED_RESOLVE_CAPABILITY = `message-resolve-forwarded@${FORWARDED_RESOLVE_CAPABILITY_VERSION}`;
+
+/** Whether a request's `X-Raft-Client-Capabilities` value declares FORWARDED_RESOLVE_CAPABILITY, at its version or later. */
+export function hasForwardedResolveCapability(raw: unknown): boolean {
+  if (typeof raw !== "string") return false;
+  return raw.split(",").some((value) => {
+    const match = /^message-resolve-forwarded@([1-9][0-9]*)$/u.exec(value.trim());
+    return match !== null && Number(match[1]) >= FORWARDED_RESOLVE_CAPABILITY_VERSION;
+  });
+}
+
+export const MANUAL_INDEX_COMMAND ="raft manual get index --intent \"Learn available Raft workflows\" --reason \"Browse the topic catalog after a missing topic\"";
 
 export type KnowledgeContextField = "intent" | "reason";
 

@@ -22,6 +22,8 @@ import type { ArtifactDashboardItem } from "./artifactDashboardItems";
 import { artifactShownTitle } from "./artifactFacts";
 import { ArtifactNewSticker } from "./ArtifactNewSticker";
 import type { OpenRow } from "./artifactDashboardParts";
+import { ArtifactHomeMenu } from "./ArtifactHomeMenu";
+import { ArtifactSettledTag } from "./ArtifactSettledParts";
 
 /**
  * One Artifact of a phone's list (design p3): the kind's tile, the title on one
@@ -29,6 +31,7 @@ import type { OpenRow } from "./artifactDashboardParts";
  * comments"), at the end when it was last opened in that order, else updated, short as a phone's tile says it;
  * then who made it and what is new. Every place reads alike; a public one has a globe before it.
  * Every home page row shows its title without an old `.md` or `.html` (artifactShownTitle).
+ * Settled (#334): its tag after who made it, and the home page's menu (ArtifactHomeMenu: a long press).
  */
 export function AllRow({ item, index, onOpen, readerId }: { item: ArtifactDashboardItem; index: number; onOpen: OpenRow; readerId: string | null }) {
   const intl = useIntl();
@@ -40,13 +43,14 @@ export function AllRow({ item, index, onOpen, readerId }: { item: ArtifactDashbo
     (event: { currentTarget: HTMLElement }) => onOpen(card, event.currentTarget, index),
     [card, onOpen, index],
   );
+  const openFromMenu = useCallback((from: HTMLElement) => onOpen(card, from, index), [card, onOpen, index]);
   const facts = [
     formatMessage({ id: "artifacts.card.version" }, { version: card.version }),
     card.commentCount > 0 ? formatMessage({ id: "artifacts.card.comments" }, { count: card.commentCount }) : null,
   ].filter((part): part is string => part !== null);
   return (
     // Compact: the title and the line under it one line each (raft-ui InboxItem density), the time beside the title.
-    <InboxItem density="compact" data-testid="artifacts-all-row" data-artifact-id={card.id}>
+    <ArtifactHomeMenu card={card} onOpen={openFromMenu} render={<InboxItem density="compact" data-testid="artifacts-all-row" data-artifact-id={card.id} data-settled={card.settled ? "" : undefined} />}>
       <InboxItemTrigger aria-labelledby={`${ids.title} ${ids.meta}`} onClick={open} data-artifact-open="" />
       <InboxItemLeading>
         <IconTile>{artifactKindIcon(card.kind)}</IconTile>
@@ -67,7 +71,7 @@ export function AllRow({ item, index, onOpen, readerId }: { item: ArtifactDashbo
       <InboxItemTrailing>
         <InboxItemTimestamp>{formatShortRelativeTime(item.openedAt ?? card.updatedAt, intl.locale)}</InboxItemTimestamp>
       </InboxItemTrailing>
-    </InboxItem>
+    </ArtifactHomeMenu>
   );
 }
 
@@ -76,6 +80,7 @@ function RowMetadata({ item, readerId }: { item: ArtifactDashboardItem; readerId
   return (
     <InboxItemMetadata className="relative min-w-0">
       <ArtifactAuthor actor={item.card.author} readerId={readerId} wrap />
+      {item.card.settled ? <ArtifactSettledTag settled={item.card.settled} /> : null}
       <ArtifactNewSticker news={item.news} />
     </InboxItemMetadata>
   );

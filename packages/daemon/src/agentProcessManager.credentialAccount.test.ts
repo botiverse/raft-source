@@ -323,3 +323,48 @@ test("the account was not known at the start: release only", async () => {
     await expectReleasedOnly(h, ap, held, "started_unknown");
   });
 }, 20_000);
+
+// #proj-runtime:#66 (Tenny's condition for waiting until a reported reset):
+// a sign-in to another account on this Computer outside Raft (a terminal
+// login) ends a provider-limit wait at once, checked when a message arrives
+// for the held agent. The same account (a token refresh) does not: it has the
+// same quota. A web login ends it whatever the account
+// (agentProcessManager.runtimeCredentialsChanged.test.ts).
+async function limitedAgent(h: Harness): Promise<void> {
+  await h.manager.startAgent(AGENT, agentConfig());
+  await h.emit([{ kind: "turn_end", sessionId: "session-1" }]);
+  const resetsAt = new Date(Date.now() + 3 * 24 * 60 * 60_000).toISOString();
+  await h.emit([
+    { kind: "error", message: "You've hit your usage limit. Try again later.", providerLimit: { kind: "quota_exhausted", resetsAt } },
+    { kind: "turn_end", sessionId: "session-1" },
+  ]);
+  expect(await deliveryReachesRuntime(h, "held 1")).toBe(false);
+  expect(h.m.lifecycleRecords.getProviderLimit("shared:codex")).toBeDefined();
+}
+
+test("#proj-runtime:#66: a terminal login to another account ends a provider-limit wait: the held process restarts on its session with its held message", async () => {
+  await withManager(async (h) => {
+    writeCodexAccount(h, "acct-A");
+    await limitedAgent(h);
+    writeCodexAccount(h, "acct-B");
+    expect(await h.manager.deliverMessage(AGENT, message("after the login"))).toBe(true);
+    expect(h.m.lifecycleRecords.getProviderLimit("shared:codex"), "the limit is released").toBeUndefined();
+    expect(eventsNamed(h, "daemon.agent.runtime_error_delivery_backoff.reset").at(-1)?.attrs).toMatchObject({
+      reset_source: "credential_account_changed",
+      release_cause: "credentials_changed",
+      account_check: "account_changed",
+    });
+    await expectRestartedOnSession(h, "account_changed");
+  });
+}, 20_000);
+
+test("#proj-runtime:#66: the same account signed in again does not end a provider-limit wait", async () => {
+  await withManager(async (h) => {
+    writeCodexAccount(h, "acct-A");
+    await limitedAgent(h);
+    writeCodexAccount(h, "acct-A");
+    expect(await deliveryReachesRuntime(h, "after a token refresh")).toBe(false);
+    expect(h.m.lifecycleRecords.getProviderLimit("shared:codex")).toBeDefined();
+    expect(h.children).toHaveLength(1);
+  });
+}, 20_000);

@@ -26,6 +26,7 @@ import EmptyState from "../ui/EmptyState";
 import { TaskAssigneeLabel } from "./TaskAssignee";
 import { CreateTaskDialog } from "./DeferredCreateTaskDialog";
 import TaskChipList from "./TaskChipList";
+import { useCanWriteTaskChannel } from "./taskChannelWrite";
 import { TASK_STATUS_UI, toRuiTaskStatus } from "./taskStatusUi";
 import { useOpenTask } from "./useOpenTask";
 import { SideCardContext } from "./sideCardsLayout";
@@ -108,7 +109,9 @@ export default function ChannelTasksPanel({ channelId, onClose }: { channelId: s
   }, [channelAgents, channelHumans, viewerId]);
 
   const newTaskLabel = formatMessage({ id: "task.board.newTask" });
-  const newTaskAction = useMemo(() => [{ id: "new-task", label: newTaskLabel, icon: <Plus />, onSelect: openCreate, testId: "channel-tasks-panel-new" }], [newTaskLabel, openCreate]);
+  // Not for a reader of a public channel they have not joined (nor in an archived one): the server refuses the create.
+  const canCreate = useCanWriteTaskChannel(channelId);
+  const newTaskAction = useMemo(() => (canCreate ? [{ id: "new-task", label: newTaskLabel, icon: <Plus />, onSelect: openCreate, testId: "channel-tasks-panel-new" }] : []), [canCreate, newTaskLabel, openCreate]);
 
   return (
     <ChannelSideCard

@@ -19,6 +19,14 @@ One component per file, named exports.
   - `CreateAgentDialog.tsx`: opened through
     `components/agent/DeferredCreateAgentDialog.ts` (kept out of the first
     download). `pickFallbackMachine.ts` is its computer-choice helper.
+- Voice calls (`agent_voice_v1`): `agentVoiceCallEntry.ts` decides who gets
+  a Call button (the agent DM's head via `features/channel/useChannelHeadToggles`,
+  the profile header); `agentVoiceCallStore.ts` holds the one call (start,
+  `@holtjs/live-client` room, captions, hang-up); `AgentVoiceCallWindow.tsx`,
+  mounted once in `App.tsx`, draws it (`AgentVoiceCallCard.tsx` places and
+  wires `AgentVoiceCallPanel.tsx`, which takes props only; the visual case
+  `components.agent.voice-call.states` renders it from fixtures). Routes in
+  `agentVoiceCallClient.ts`. Tests: `tests/agentVoiceCall.behavior.test.tsx`.
 - Shared here: `agentDetailClassNames.ts`, `agentDetailTabs.ts` (the panel's
   tabs and which are public), `useEditableAgentRoleOptions.ts`.
 - Most agent code still lives in `components/agent/` (rows, dialogs,

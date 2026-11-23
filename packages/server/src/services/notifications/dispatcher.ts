@@ -17,8 +17,9 @@
 import type { Server as SocketServer } from "socket.io";
 import { randomInt } from "node:crypto";
 import { setTimeout as sleepTimer, setImmediate as waitUntilNextTurn } from "node:timers/promises";
-import { and, asc, desc, eq, exists, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, exists, gt, inArray, isNull, lt, or, sql, type SQL } from "drizzle-orm";
 import { mapWithConcurrency } from "../../lib/mapWithConcurrency";
+import { oncePushLagObserver } from "../../metrics";
 import {
   DEFAULT_NOTIFICATION_ACCOUNT_SETTINGS,
   isNotificationCategory,
@@ -50,7 +51,8 @@ import {
 import { UUID_RE } from "../../lib/messageId";
 import { addTraceEvent, errorClassOf, runWithTraceSpan } from "../../tracing/semanticTrace";
 import { withChannelWriterFence } from "../channelConversionFenceService";
-import { getJointThreadProjectionByLocalThread, getMessageStorageChannelIdWithExecutor } from "../channelService";
+import { getJointThreadProjectionByLocalThread, getMessageStorageChannelIdWithExecutor, resolveConversationRoot } from "../channelService";
+import { onlineMoveOtherChannelSql } from "../channelConversionReadScope";
 import { resolveJointHumanEntrySql } from "../jointHumanMembershipAccess";
 import { systemMessageNotificationEvent } from "../systemMessageBornReadRegistry";
 import { alertBadge, loadLastSentBadges, loadNotificationBadges, rememberSentBadge, serverBadgeOf, type NotificationBadge } from "./badge";
@@ -630,16 +632,24 @@ async function loadSenderName(executor: DatabaseExecutor, senderType: string, se
 /** A task conversation push lands on a message in the parent channel: the task's source message, else the latest. */
 async function loadTaskAnchorMessageId(executor: DatabaseExecutor, parentChannelId: string, taskId: string | null): Promise<string | null> {
   const storageChannelId = await getMessageStorageChannelIdWithExecutor(executor, parentChannelId);
+  // During an online move (channel_conversion_online_move_v1) the root's
+  // messages are in it and its canonical channel: the other channel of the
+  // pair, NULL (matching nothing) otherwise. Folded into each statement.
+  const otherChannel = onlineMoveOtherChannelSql(sql`${storageChannelId}::uuid`);
   if (taskId) {
     const [source] = await executor
       .select({ id: messages.id })
       .from(tasks)
       .innerJoin(messages, eq(messages.id, tasks.sourceMessageId))
-      .where(and(eq(tasks.id, taskId), eq(messages.channelId, storageChannelId)))
+      .where(and(eq(tasks.id, taskId), or(eq(messages.channelId, storageChannelId), sql`${messages.channelId} = ${otherChannel}`)))
       .limit(1);
     if (source) return source.id;
   }
-  const [latest] = await executor.select({ id: messages.id }).from(messages).where(eq(messages.channelId, storageChannelId)).orderBy(desc(messages.seq)).limit(1);
+  const latestIn = (channel: SQL) => sql`(SELECT ${messages.id}, ${messages.seq} FROM ${messages} WHERE ${messages.channelId} = ${channel} ORDER BY ${messages.seq} DESC LIMIT 1)`;
+  const latestRows = await executor.execute(sql`
+    SELECT latest.id::text AS id FROM (${latestIn(sql`${storageChannelId}::uuid`)} UNION ALL ${latestIn(otherChannel)}) latest
+    ORDER BY latest.seq DESC LIMIT 1`);
+  const latest = latestRows.rows[0] as { id?: string } | undefined;
   return latest?.id ?? null;
 }
 
@@ -736,6 +746,15 @@ async function loadMessageEvent(executor: DatabaseExecutor, row: NotificationOut
     levelChannelSeq = null;
   } else {
     conversation = { surface: channel.type === "dm" ? "dm" : "channel", channelId: channel.id, channelName: channel.type === "dm" ? null : channel.name };
+  }
+  // A conversation nested under another sub-conversation (a thread started in
+  // a thread or a task conversation) has a parent that is not a root, and
+  // receiversWithoutAccess only rechecks root types: recheck against the root,
+  // and drop the notification when the root can't be found (fail closed).
+  if (accessChannel.type === "thread" || accessChannel.type === "task") {
+    const root = await resolveConversationRoot(accessChannel.id, executor);
+    if (!root) return null;
+    accessChannel = { id: root.id, type: root.type };
   }
   const notice = await loadMessageNotice(executor, message, channel);
   const senderType = message.messageType === "system" ? "system" : message.senderType === "agent" ? "agent" : message.senderType === "user" ? "user" : "system";
@@ -1141,6 +1160,12 @@ async function deliverPrepared(
       continue;
     }
     const built = entry.built;
+    // slock_message_push_lag_seconds: once per row per receiver class, at its
+    // first send. Message rows only (a notice's createdAt is not a message's).
+    const pushLagCreatedAt = row.messageId ? built.envelope.createdAt : null;
+    const notePushedToDesktop = oncePushLagObserver("desktop", pushLagCreatedAt);
+    const notePushedToWebPush = oncePushLagObserver("web_push", pushLagCreatedAt);
+    const notePushedToPhone = oncePushLagObserver("mobile_push", pushLagCreatedAt);
     const webSubscriptions = inputs.subscriptions.get(userId) ?? [];
     const presence = inputs.presence.get(userId);
     // Only a path that can deliver now may count as the computer in use (the plan's invariant).
@@ -1180,6 +1205,8 @@ async function deliverPrepared(
                 }
               });
             ackWaits.push(acked);
+            // The emit above is synchronous; the ack wait is not part of the push lag.
+            notePushedToDesktop();
             result.counts.desktop += 1;
           }
           : async () => {
@@ -1190,6 +1217,7 @@ async function deliverPrepared(
             }
             try {
               emitDesktopNotification(io, userId, built.envelope);
+              notePushedToDesktop();
               confirmation.desktop = true;
             } catch (error) {
               await releaseNotificationSend(row.id, "desktop", "socket");
@@ -1230,6 +1258,7 @@ async function deliverPrepared(
               return;
             }
             if (outcome.outcome === "sent") {
+              notePushedToWebPush();
               result.counts.web += 1;
               if (reachesActiveBrowser) confirmation.web = true;
             } else if (outcome.outcome === "terminal") {
@@ -1263,6 +1292,7 @@ async function deliverPrepared(
           : deliverExternalWithRetry("fcm", () => fcmTransport.send(registration, fcmAlertMessage(built, badge, { serverBadge, previewKeySet: registration.previewKeySet })), fcmTransport, { category: built.envelope.category }, mobileTargetContext(registration)));
         if (!outcome) return;
         if (outcome.outcome === "sent") {
+          notePushedToPhone();
           if (registration.provider === "apns") result.counts.apns += 1;
           else result.counts.fcm += 1;
           let groups = shownGroupsByUser.get(userId);

@@ -13,6 +13,7 @@
  */
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useOwnerWindow } from "../utils/ownerDocument";
 
 /**
  * DOM measurement/synchronization effect. Runs before paint (layout effect)
@@ -99,18 +100,20 @@ export function useEventBridge<E extends Event>(
  * subscribe). SSR-safe: returns `fallback` when `window` is unavailable.
  */
 export function useMediaQuery(query: string, fallback = false): boolean {
+  // The window it is drawn in: an object window's own size and scheme (useOwnerWindow), else the main window's.
+  const view = useOwnerWindow();
   const [matches, setMatches] = useState(() =>
-    typeof window !== "undefined" && typeof window.matchMedia === "function"
-      ? window.matchMedia(query).matches
+    view && typeof view.matchMedia === "function"
+      ? view.matchMedia(query).matches
       : fallback,
   );
   useEffect(() => {
-    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
-    const mq = window.matchMedia(query);
+    if (!view || typeof view.matchMedia !== "function") return;
+    const mq = view.matchMedia(query);
     setMatches(mq.matches);
     const handler = (e: MediaQueryListEvent) => setMatches(e.matches);
     mq.addEventListener("change", handler);
     return () => mq.removeEventListener("change", handler);
-  }, [query]);
+  }, [query, view]);
   return matches;
 }

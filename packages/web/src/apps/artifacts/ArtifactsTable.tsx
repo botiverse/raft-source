@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useRef } from "react";
+import { memo, useCallback, useId, useMemo, useRef } from "react";
 import type { CSSProperties, KeyboardEvent, MouseEvent, PointerEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
 import {
@@ -34,7 +34,12 @@ import {
 } from "./artifactDashboardPrefs";
 import type { ArtifactTableColumn, ArtifactTableSizedColumn } from "./artifactDashboardPrefs";
 import { isPlainPrimaryClick } from "./openArtifactInPlace";
+import { openInAnotherWindow, useArtifactMiniWindows } from "./artifactWindowOpening";
 import { useSkeletonShown } from "./artifactSkeletonShown";
+import { ArtifactHomeMenu } from "./ArtifactHomeMenu";
+import { ArtifactOtherHead, ArtifactWorkingHead } from "./ArtifactHomeGroupHeads";
+import type { ArtifactHomeSections } from "./artifactSettled";
+import { ArtifactSettledTag } from "./ArtifactSettledParts";
 
 /**
  * The home page's list view on a wider screen (#proj-workspace:#133, design D20,
@@ -80,8 +85,13 @@ const columnVar = (column: ArtifactTableSizedColumn) => `--artifacts-col-${colum
 const COLUMN_STYLES = ARTIFACT_TABLE_COLUMNS.map((column) => (column === "title" ? undefined : { width: `var(${columnVar(column)})` }));
 const tableMinWidth = (widths: Record<ArtifactTableSizedColumn, number>) => TITLE_MIN_WIDTH + Object.values(widths).reduce((sum, width) => sum + width, 0);
 
-export function ArtifactsTable({ items, byOpened, widths, onWidthChange, readerId, onOpen, empty, testId, loadingRows = 0 }: {
+export function ArtifactsTable({ items, sections = null, byOpened, widths, onWidthChange, readerId, onOpen, empty, testId, loadingRows = 0 }: {
   items: readonly ArtifactDashboardItem[];
+  /**
+   * Working and Other (#334): a head row over each group, Other's rows in a body of their own while unfolded (`items`
+   * is then Working's rows, then Other's). Null: one body, as before.
+   */
+  sections?: ArtifactHomeSections | null;
   /** The rows are in the order they were opened: the time column says when, not when they were updated. */
   byOpened: boolean;
   widths: Record<ArtifactTableSizedColumn, number>;
@@ -136,7 +146,9 @@ export function ArtifactsTable({ items, byOpened, widths, onWidthChange, readerI
               })}
             </TableRow>
           </TableHeader>
-          {items.length > 0 ? (
+          {items.length > 0 && sections && sections.groups.working !== null ? (
+            <GroupedBodies sections={sections} readerId={readerId} onOpen={onOpen} />
+          ) : items.length > 0 ? (
             <TableBody>
               {items.map((item, index) => <ArtifactTableRow key={item.card.id} item={item} index={index} readerId={readerId} onOpen={onOpen} />)}
             </TableBody>
@@ -149,6 +161,40 @@ export function ArtifactsTable({ items, byOpened, widths, onWidthChange, readerI
       </TableScroll>
       {/* Past the area, not in it: the content box is as wide as the table, so it would centre off to the right and fade. */}
       {items.length === 0 && loadingRows === 0 && empty ? empty : null}
+    </>
+  );
+}
+
+/**
+ * Working's head row and rows, then Other's head row (#334); unfolded, Other's rows in a body of their own, which its
+ * head's button controls. Each head spans the row, its words where the title starts.
+ */
+function GroupedBodies({ sections, readerId, onOpen }: { sections: ArtifactHomeSections; readerId: string | null; onOpen: OpenRow }) {
+  const otherId = useId();
+  const { groups, otherOpen, onToggleOther } = sections;
+  const working = groups.working ?? [];
+  const { other } = groups;
+  const span = ARTIFACT_TABLE_COLUMNS.length;
+  return (
+    <>
+      <TableBody data-group="working">
+        {working.length > 0 ? (
+          <TableRow data-testid="artifacts-table-group-row">
+            <TableCell colSpan={span} className="py-1"><ArtifactWorkingHead count={working.length} /></TableCell>
+          </TableRow>
+        ) : null}
+        {working.map((item, index) => <ArtifactTableRow key={item.card.id} item={item} index={index} readerId={readerId} onOpen={onOpen} />)}
+        {other.length > 0 ? (
+          <TableRow data-testid="artifacts-table-group-row">
+            <TableCell colSpan={span} className="py-1"><ArtifactOtherHead items={other} open={otherOpen} onToggle={onToggleOther} controls={otherId} /></TableCell>
+          </TableRow>
+        ) : null}
+      </TableBody>
+      {otherOpen && other.length > 0 ? (
+        <TableBody id={otherId} data-group="other">
+          {other.map((item, index) => <ArtifactTableRow key={item.card.id} item={item} index={working.length + index} readerId={readerId} onOpen={onOpen} />)}
+        </TableBody>
+      ) : null}
     </>
   );
 }
@@ -188,13 +234,16 @@ const ArtifactTableRow = memo(function ArtifactTableRow({ item, index, readerId,
   const intl = useIntl();
   const { formatMessage } = intl;
   const { card, news } = item;
+  const miniWindows = useArtifactMiniWindows();
   const open = useCallback((event: MouseEvent<HTMLAnchorElement>) => {
+    if (openInAnotherWindow(event, card, miniWindows)) return;
     if (!isPlainPrimaryClick(event)) return;
     event.preventDefault();
     onOpen(card, event.currentTarget, index);
-  }, [card, onOpen, index]);
+  }, [card, onOpen, index, miniWindows]);
+  const openFromMenu = useCallback((from: HTMLElement) => onOpen(card, from, index), [card, onOpen, index]);
   return (
-    <TableRow className="relative cursor-pointer" data-testid="artifacts-dashboard-row" data-view="table" data-artifact-id={card.id}>
+    <ArtifactHomeMenu card={card} onOpen={openFromMenu} render={<TableRow className="relative cursor-pointer" data-testid="artifacts-dashboard-row" data-view="table" data-artifact-id={card.id} data-settled={card.settled ? "" : undefined} />}>
       <TableCell>
         <div className="flex min-w-0 items-start gap-2">
           <span className="mt-0.5 shrink-0 text-foreground-muted [&_svg]:size-4" aria-hidden>{artifactKindIcon(card.kind)}</span>
@@ -209,6 +258,7 @@ const ArtifactTableRow = memo(function ArtifactTableRow({ item, index, readerId,
             >
               {artifactShownTitle(card.title)}
             </a>
+            {card.settled ? <ArtifactSettledTag settled={card.settled} /> : null}
             <ArtifactNewSticker news={news} />
           </div>
         </div>
@@ -222,7 +272,7 @@ const ArtifactTableRow = memo(function ArtifactTableRow({ item, index, readerId,
         </span>
       </TableCell>
       <TableCell><ArtifactScopeLabel home={card.home} fromAnotherServer={card.fromAnotherServer} onCard /></TableCell>
-    </TableRow>
+    </ArtifactHomeMenu>
   );
 });
 

@@ -13,7 +13,7 @@ import { addAgent, addHuman, canUserAccessChannel, createChannel, findOrCreateDM
 import { registerMachine } from "../services/machineService";
 import { createMessage } from "../services/messageService";
 import { canView } from "../services/visibilityService";
-import { seedBoundGuest } from "../test/guestFixture";
+import { seedBoundGuest, seedStrayGuestChannelRow } from "../test/guestFixture";
 
 // Search answers what the visibility entry answers (services/visibilityService):
 // joint conversations and their threads are searchable for their members,
@@ -128,7 +128,7 @@ test("guest search results are its one bound channel's; a guest-visible channel,
   await db.update(channels).set({ guestVisible: true }).where(eq(channels.id, guestOpen.id));
   const hiddenFromGuest = await createChannel(server.id, `search-guest-hidden-${label()}`);
   const guestPrivate = await createChannel(server.id, `search-guest-private-${label()}`, undefined, "private");
-  await addHuman(guestPrivate.id, guest.id);
+  await seedStrayGuestChannelRow({ channelId: guestPrivate.id, userId: guest.id });
   const guestDm = (await findOrCreateDM(server.id, guest.id, agent.id))!;
 
   const homeMessage = await createMessage(guestHome.id, "user", owner.id, "guestneedle guest home channel");

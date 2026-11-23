@@ -23,7 +23,6 @@ import {
   RUNTIME_AUTH_RUNTIMES,
   isOpencodeLiteralApiKey,
   isPiLiteralApiKey,
-  isRuntimeAuthServerGated,
   parseRuntimeAuthProviderConnectInput,
   runtimeAuthChoosesOAuthMethod,
   runtimeAuthLoginRegionFits,
@@ -38,6 +37,7 @@ import {
   runtimeAuthProviderConnectResultSchema,
   runtimeAuthProvidersResultSchema,
   runtimeAuthRuntimeFor,
+  runtimeAuthStatusOnly,
   runtimeAuthStatusReportSchema,
   runtimeAuthSupports,
 } from "./runtimeAuth";
@@ -65,6 +65,17 @@ describe("runtime auth runtimes", () => {
     assert.deepEqual(withAction("login"), ["claude", "codex", "kimi", "qoder", "antigravity", "pi", "grok", "opencode"]);
     assert.deepEqual(withAction("logout"), ["claude", "codex", "kimi", "antigravity", "pi", "grok", "opencode"]);
     assert.deepEqual(withAction("connect_provider"), ["qwen", "pi", "opencode"]);
+  });
+
+  it("gives DeepSeek Harness no action at all: its card is status and Install only, on its own Raft runtime", () => {
+    assert.deepEqual(RUNTIME_AUTH_RUNTIMES.filter(runtimeAuthStatusOnly), ["dsh"]);
+    assert.equal(runtimeAuthRuntimeFor("dsh"), "dsh");
+    assert.ok(runtimeAuthLoginRegionFits("dsh", undefined));
+    assert.equal(runtimeAuthSignsInPerProvider("dsh"), false);
+    // A server that knows it keeps its status; one from before it drops the key and keeps the rest.
+    const parsed = runtimeAuthStatusReportSchema.parse({ collectedAt: "2026-11-19T10:00:00.000Z", runtimes: { dsh: { kind: "unknown" } }, installable: ["dsh"] });
+    assert.deepEqual(parsed.runtimes.dsh, { kind: "unknown" });
+    assert.deepEqual(parsed.installable, ["dsh"]);
   });
 
   it("signs Pi and OpenCode in per provider, and only them: a provider id is required there and refused elsewhere", () => {
@@ -105,7 +116,8 @@ describe("runtime auth runtimes", () => {
     assert.deepEqual(runtimeAuthRuntimesOfComputer([auth, v2, qwen, agy, pi, grok]).includes("opencode"), false, "a Computer from before OpenCode's sign-in (OAR 0.99) drops its requests");
     assert.deepEqual(runtimeAuthRuntimesOfComputer([auth, v2, DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE]), ["claude", "codex", "kimi", "qoder", "opencode"]);
     assert.deepEqual(runtimeAuthRuntimesOfComputer([auth, DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE]), ["claude", "codex"], "OpenCode needs V2 too");
-    assert.deepEqual(runtimeAuthRuntimesOfComputer([auth, v2, qwen, agy, pi, grok, DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE]), RUNTIME_AUTH_RUNTIMES);
+    // DeepSeek Harness has nothing for the server to send (no sign-in), so no capability names it.
+    assert.deepEqual(runtimeAuthRuntimesOfComputer([auth, v2, qwen, agy, pi, grok, DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE]), RUNTIME_AUTH_RUNTIMES.filter((runtime) => !runtimeAuthStatusOnly(runtime)));
     assert.equal(runtimeAuthRuntimesOfComputer([auth, v2, qwen]), runtimeAuthRuntimesOfComputer([qwen, v2, auth]), "the same capabilities give the same array");
     assert.equal(runtimeAuthRuntimesOfComputer([auth, v2, pi, qwen]), runtimeAuthRuntimesOfComputer([qwen, pi, v2, auth]));
   });
@@ -127,10 +139,6 @@ describe("runtime auth runtimes", () => {
     assert.deepEqual(runtimeAuthLogoutRuntimesOfComputer([auth, v2, DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE]), ["claude", "codex", "kimi", "opencode"], "OpenCode's sign-out comes with its sign-in");
     assert.deepEqual(runtimeAuthLogoutRuntimesOfComputer([auth, v2, qwen, agy, agyLogout]).includes("grok"), false, "an OAR 0.98 Computer is never sent a Grok sign-out");
     assert.deepEqual(RUNTIME_AUTH_RUNTIMES.filter(runtimeAuthLogoutNeedsCapability), ["antigravity"]);
-  });
-
-  it("leaves Antigravity alone to the server's say (its revive flag)", () => {
-    assert.deepEqual(RUNTIME_AUTH_RUNTIMES.filter(isRuntimeAuthServerGated), ["antigravity"]);
   });
 });
 
@@ -208,6 +216,49 @@ describe("runtimeAuthStatusReportSchema", () => {
 
   it("still refuses a known runtime's malformed status", () => {
     assert.equal(runtimeAuthStatusReportSchema.safeParse({ collectedAt, runtimes: { kimi: { kind: "signed_in" } } }).success, false);
+  });
+
+  it("reads each runtime's update check, without a source, a path or a runtime it does not know", () => {
+    const checkedAt = collectedAt;
+    const updates = {
+      antigravity: { kind: "ok", installed: "1.5.10", latest: "1.5.11", updateAvailable: true, checkedAt },
+      claude: { kind: "ok", installed: "2.1.3", latest: "2.1.3", updateAvailable: false, checkedAt },
+      grok: { kind: "unavailable", reason: "package_manager", checkedAt },
+    };
+    const parsed = runtimeAuthStatusReportSchema.parse({ collectedAt, runtimes: {}, updates: { ...updates, someFutureRuntime: { kind: "ok" } } });
+    assert.deepEqual(parsed.updates, updates);
+    // A reason this build does not know reads as a failed lookup rather than refusing the report.
+    assert.deepEqual(
+      runtimeAuthStatusReportSchema.parse({ collectedAt, runtimes: {}, updates: { codex: { kind: "unavailable", reason: "some_future_reason", checkedAt } } }).updates,
+      { codex: { kind: "unavailable", reason: "lookup_failed", checkedAt } },
+    );
+    // A key this build does not know is stripped, so a source or detail is never stored or forwarded.
+    const stripped = runtimeAuthStatusReportSchema.parse({
+      collectedAt,
+      runtimes: {},
+      updates: {
+        claude: { kind: "ok", installed: "1.5.10", latest: "1.5.11", updateAvailable: true, checkedAt, source: "https://example.com/latest" },
+        codex: { kind: "unavailable", reason: "lookup_failed", checkedAt, detail: "ENOTFOUND /home/someone" },
+      },
+    });
+    assert.deepEqual(stripped.updates, {
+      claude: { kind: "ok", installed: "1.5.10", latest: "1.5.11", updateAvailable: true, checkedAt },
+      codex: { kind: "unavailable", reason: "lookup_failed", checkedAt },
+    });
+    // An entry that does not parse is dropped on its own; the report and the other entries stand.
+    const odd = runtimeAuthStatusReportSchema.safeParse({
+      collectedAt,
+      runtimes: { claude: { kind: "logged_in" } },
+      updates: {
+        claude: { kind: "ok", installed: "/home/someone/.local/bin/agy", latest: "1.5.11", updateAvailable: true, checkedAt },
+        grok: { kind: "some_future_kind", checkedAt },
+        qoder: "not an object",
+        antigravity: updates.antigravity,
+      },
+    });
+    assert.ok(odd.success);
+    assert.deepEqual(odd.data.updates, { antigravity: updates.antigravity });
+    assert.deepEqual(odd.data.runtimes, { claude: { kind: "logged_in" } });
   });
 });
 
@@ -299,6 +350,15 @@ describe("Grok agents and the Computer's shared sign-in", () => {
     assert.equal(sharedCredentialsAuthRuntime({ runtime: "grok", model: "default", envVars: { GROK_HOME: "/srv/grok" } }), null);
     assert.equal(sharedCredentialsAuthRuntime({ runtime: "grok", model: "default", envVars: { HOME: "/srv/home" } }), null);
     assert.equal(sharedCredentialsAuthRuntime({ runtime: "grok", model: "default", envVars: { XAI_API_KEY: "xai-1" } }), null);
+  });
+});
+
+describe("DeepSeek Harness agents and the Computer's shared DeepSeek key", () => {
+  it("run on dsh's shared key unless DSH_HOME, HOME or their own DEEPSEEK_API_KEY gives one its own", () => {
+    assert.equal(sharedCredentialsAuthRuntime({ runtime: "dsh", model: "default" }), "dsh");
+    assert.equal(sharedCredentialsAuthRuntime({ runtime: "dsh", model: "default", envVars: { DSH_HOME: "/srv/dsh" } }), null);
+    assert.equal(sharedCredentialsAuthRuntime({ runtime: "dsh", model: "default", envVars: { HOME: "/srv/home" } }), null);
+    assert.equal(sharedCredentialsAuthRuntime({ runtime: "dsh", model: "default", envVars: { DEEPSEEK_API_KEY: "sk-1" } }), null);
   });
 });
 

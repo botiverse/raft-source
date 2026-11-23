@@ -24,8 +24,81 @@ export const VISIBLE_POLL_COALESCE_MS = 1_000;
  */
 export const PINGED_LIST_SAFETY_POLL_MS = 5 * 60_000;
 
+/**
+ * Documents shown in windows of their own that the main page's code renders
+ * into (features/objectWindows): while one of them is visible the page is not
+ * hidden, even with the main window hidden or minimized behind it (Raft
+ * Desktop on macOS hides the main window on close), since what they show is
+ * the main page's live data.
+ */
+const companionDocuments = new Map<Document, (event: Event) => void>();
+/** Listeners of onPageVisibilityChange, which also hear the companion documents' visibilitychange. */
+const visibilityListeners = new Set<(event: Event) => void>();
+
 export function isPageHidden(): boolean {
-  return typeof document !== "undefined" && document.visibilityState === "hidden";
+  if (typeof document === "undefined" || document.visibilityState !== "hidden") return false;
+  for (const companion of companionDocuments.keys()) {
+    if (companion.visibilityState === "visible") return false;
+  }
+  return true;
+}
+
+/** The page is visible: the main document is, or a companion document (an object window's) is. */
+export function isPageVisible(): boolean {
+  if (typeof document !== "undefined" && document.visibilityState === "visible") return true;
+  for (const companion of companionDocuments.keys()) {
+    if (companion.visibilityState === "visible") return true;
+  }
+  return false;
+}
+
+function notifyPageVisibility(event: Event): void {
+  for (const listener of [...visibilityListeners]) listener(event);
+}
+
+/** Runs `change` and tells the visibility listeners when it showed or hid the page (a companion came or went). */
+function changeCompanions(change: () => void): void {
+  const hiddenBefore = isPageHidden();
+  change();
+  if (isPageHidden() !== hiddenBefore) notifyPageVisibility(new Event("visibilitychange"));
+}
+
+/**
+ * Count `doc` (an object window's document) as part of the page while it is
+ * open: isPageHidden is false while it is visible, and its visibilitychange
+ * reaches onPageVisibilityChange's listeners. Returns the removal.
+ */
+export function addPageCompanionDocument(doc: Document): () => void {
+  if (companionDocuments.has(doc)) return () => removePageCompanionDocument(doc);
+  const relay = (event: Event) => notifyPageVisibility(event);
+  changeCompanions(() => {
+    companionDocuments.set(doc, relay);
+    doc.addEventListener("visibilitychange", relay);
+  });
+  return () => removePageCompanionDocument(doc);
+}
+
+function removePageCompanionDocument(doc: Document): void {
+  const relay = companionDocuments.get(doc);
+  if (!relay) return;
+  changeCompanions(() => {
+    companionDocuments.delete(doc);
+    doc.removeEventListener("visibilitychange", relay);
+  });
+}
+
+/**
+ * The page's visibilitychange: the main document's, a companion document's
+ * (an object window's), and a companion opening or closing that shows or
+ * hides the page. Read the state with isPageHidden. Returns the unsubscribe.
+ */
+export function onPageVisibilityChange(listener: (event: Event) => void): () => void {
+  document.addEventListener("visibilitychange", listener);
+  visibilityListeners.add(listener);
+  return () => {
+    document.removeEventListener("visibilitychange", listener);
+    visibilityListeners.delete(listener);
+  };
 }
 
 /** A visible poll that also takes reads asked for outside it (a ping, a reconnect, the mount). */
@@ -91,7 +164,7 @@ export function createVisiblePoll(
   };
 
   if (!isPageHidden()) startTimer();
-  document.addEventListener("visibilitychange", onVisibilityChange);
+  const stopVisibility = onPageVisibilityChange(onVisibilityChange);
   if (refreshOnFocus) window.addEventListener("focus", runForEvent);
   window.addEventListener("focus", payOwed);
   window.addEventListener("pageshow", payOwed);
@@ -105,7 +178,7 @@ export function createVisiblePoll(
     },
     stop: () => {
       stopTimer();
-      document.removeEventListener("visibilitychange", onVisibilityChange);
+      stopVisibility();
       if (refreshOnFocus) window.removeEventListener("focus", runForEvent);
       window.removeEventListener("focus", payOwed);
       window.removeEventListener("pageshow", payOwed);
@@ -120,12 +193,12 @@ export function createVisiblePoll(
  */
 export function createOwedReads<T>(run: (key: string, owed: T) => void, merge: (owed: T, next: T) => T) {
   const owed = new Map<string, T>();
-  let listening = false;
-  // listening: something is owed.
+  // Set while something is owed: the unsubscribe from the page's visibility.
+  let stopListening: (() => void) | null = null;
   const onVisibilityChange = () => {
-    if (isPageHidden() || !listening) return;
-    document.removeEventListener("visibilitychange", onVisibilityChange);
-    listening = false;
+    if (isPageHidden() || !stopListening) return;
+    stopListening();
+    stopListening = null;
     const due = [...owed];
     owed.clear();
     for (const [key, value] of due) run(key, value);
@@ -134,18 +207,15 @@ export function createOwedReads<T>(run: (key: string, owed: T) => void, merge: (
     owe(key: string, value: T): void {
       const earlier = owed.get(key);
       owed.set(key, earlier === undefined ? value : merge(earlier, value));
-      if (!listening) {
-        document.addEventListener("visibilitychange", onVisibilityChange);
-        listening = true;
-      }
+      stopListening ??= onPageVisibilityChange(onVisibilityChange);
     },
     /** Run the owed reads now if the page is visible (a show that fired no visibilitychange). */
     flush: onVisibilityChange,
     /** Drop every owed read (a Server switch, logout, teardown). */
     clear(): void {
       owed.clear();
-      if (listening) document.removeEventListener("visibilitychange", onVisibilityChange);
-      listening = false;
+      stopListening?.();
+      stopListening = null;
     },
   };
 }

@@ -1,6 +1,8 @@
 import { SidebarItemMeta } from "@botiverse/raft-ui";
 import { useIntl } from "react-intl";
-import { useAgentCurrentActivityState, useAgentStore } from "../../../store/agentStore";
+import { useAgentCurrentActivityState, useAgentDisplayState, useAgentStore } from "../../../store/agentStore";
+import { useAgentRuntimeSignInNeeded } from "../../../components/agent/useAgentRuntimeSignInNeeded";
+import Tooltip from "../../../components/ui/Tooltip";
 import { formatActivityText } from "../../../utils/activity";
 import { getRuntimeDisplayName } from "@botiverse/raft-shared";
 
@@ -33,6 +35,24 @@ export function SidebarAgentMeta({ agentId, runtime, external = false }: {
   // runtime is the "External agent" placeholder, which its messages never
   // say. It reads as what it is, as its messages' "Personal assistant of …".
   const isAssistant = useAgentStore((s) => Boolean(s.agents.find((a) => a.id === agentId)?.assistantOwnerUserId));
+  // #triage:#494: a start waiting for the runtime's sign-in says so in place
+  // of the runtime ("Sign-in needed": the row has no room for the runtime's
+  // name), the sentence on hover. No Sign in here: the row is itself a
+  // button, and the DM's header and the member list carry it.
+  const signIn = useAgentRuntimeSignInNeeded(agentId, useAgentDisplayState(agentId));
+  if (signIn && !external) {
+    // The sentence is also said to a screen reader (a tooltip is hover only).
+    return (
+      <>
+        <Tooltip content={signIn.detail}>
+          <SidebarItemMeta className="whitespace-nowrap" data-testid="sidebar-agent-sign-in-needed">
+            {signIn.shortText}
+          </SidebarItemMeta>
+        </Tooltip>
+        <span className="sr-only" data-testid="sidebar-agent-sign-in-detail">{signIn.detail}</span>
+      </>
+    );
+  }
   if (paused) {
     return (
       <SidebarItemMeta className="whitespace-nowrap" data-testid="sidebar-agent-paused">

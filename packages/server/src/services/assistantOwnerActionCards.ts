@@ -54,6 +54,7 @@ import {
 import { recordIntegrationAuditEventBestEffort } from "./integrationAuditService";
 import { createSystemAppAgentEvent, type SystemAppAgentEvent } from "./systemAppAgentEvents";
 import { runInOwnerDispatch } from "./ownerDispatchContext";
+import { delegableRouteBackstopRule } from "./delegableRouteBackstop";
 import { OWNER_DISPATCH_MARK, type OwnerDispatchMark } from "./ownerDispatchMark";
 export { OWNER_DISPATCH_MARK, isOwnerDispatch, ownerDispatchMarkOf, type OwnerDispatchMark } from "./ownerDispatchMark";
 
@@ -297,6 +298,9 @@ export type OwnerRouteDispatcher = (input: {
  */
 export const OWNER_DISPATCH_TIMEOUT_MS = 30_000;
 export const OWNER_DISPATCH_TIMEOUT_CODE = "assistant_owner_action_timeout";
+/** A dispatch the delegable backstop refuses: the code and sentence of preparedRequestCards' requestNotAvailable. */
+export const OWNER_DISPATCH_REFUSED_CODE = "request_not_available";
+const OWNER_DISPATCH_REFUSED_ERROR = "This request can't be confirmed from a card here any more. Nothing ran.";
 const UNKNOWN_SUMMARY = "Confirmed, but Raft didn't hear back in time, so it may have run.";
 /** What the assistant can be told about a route's answer; more is cut and marked. */
 export const OWNER_DISPATCH_MAX_RESPONSE_BYTES = 256 * 1024;
@@ -325,6 +329,17 @@ export function setOwnerDispatchBoundsForTest(bounds: { timeoutMs?: number; maxB
  */
 export const dispatchOwnerRoute: OwnerRouteDispatcher = ({ ownerRequest, serverId, request, cardMessageId, idempotencyKey, requestId: givenRequestId }) => new Promise((resolve, reject) => {
   const requestId = givenRequestId ?? randomUUID();
+  // The delegable backstop, here too (Tenny): a route of a class that never runs from a card
+  // (credentials, sign-in and OAuth, MCP and connections, payment, ...) is refused before any request
+  // is made, whoever called the dispatcher, not only behind the card prepare/commit checks. Answered
+  // as a request card's backstop refusal (requestNotAvailable): a 4xx, so every caller records
+  // "refused, nothing ran".
+  const blocked = delegableRouteBackstopRule(`${request.method} ${request.path.split("?")[0]}`);
+  if (blocked) {
+    console.error("[owner-dispatch] the delegable backstop refused a dispatch", request.method, request.path, blocked.name);
+    resolve({ status: 409, body: { error: OWNER_DISPATCH_REFUSED_ERROR, code: OWNER_DISPATCH_REFUSED_CODE }, requestId });
+    return;
+  }
   const payload = Buffer.from(JSON.stringify(request.body));
   const socket = new Socket();
   // Not connected: the owner's own address, so the rate limits count this against them.

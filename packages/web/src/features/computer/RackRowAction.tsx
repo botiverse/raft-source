@@ -126,7 +126,7 @@ export function RackRowAction({ machine, canManage, canControl, variant, upgrade
   }
   // useComputerUpgradeCard already says managedByDesktop for this device; the
   // terminal popover must never be its next step, whatever the server says.
-  if (cardState.kind === "manualUpgrade" && !thisDevice) {
+  if ((cardState.kind === "manualUpgrade" || cardState.kind === "systemService") && !thisDevice) {
     const commands = getComputerCommands(serverSlug, deploymentEnv, getServerUrl(), { platform: windows ? "windows" : "mac-linux" });
     return (
       <Popover>
@@ -140,7 +140,7 @@ export function RackRowAction({ machine, canManage, canControl, variant, upgrade
         </PopoverTrigger>
         <PopoverContent side="bottom" align="end" className="w-[420px] max-w-[calc(100vw-2rem)] p-4" data-testid="rack-manual-upgrade-popover">
           <p className="text-footnote text-foreground-muted">
-            {formatMessage({ id: "machine.detail.upgradeStatus.manualUpgrade" }, { version: cardState.version })}
+            {formatMessage({ id: cardState.kind === "systemService" ? "machine.detail.upgradeStatus.systemService" : "machine.detail.upgradeStatus.manualUpgrade" }, { version: cardState.version })}
           </p>
           <ComputerManualInstall
             platform={windows ? "windows" : "mac-linux"}

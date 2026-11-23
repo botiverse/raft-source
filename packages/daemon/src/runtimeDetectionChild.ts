@@ -48,22 +48,25 @@ export function parseRuntimeDetectionChildLine(line: string): RuntimeDetectionCh
 }
 
 /**
- * Child-mode main: run the synchronous detection round and stream it. Exits 0
- * after `done`, 1 after `error`. Loaded only in the child (via the daemon
- * entry's `__detect-runtimes` dispatch), so the parent's module graph is not
- * touched.
+ * Child-mode main: run the detection round (`detectRuntimesAsync`: a driver's
+ * asynchronous probe where it has one) and stream it. Exits 0 after `done`, 1
+ * after `error`. Loaded only in the child (via the daemon entry's
+ * `__detect-runtimes` dispatch), so the parent's module graph is not touched.
  */
 export async function runRuntimeDetectionChildMain(
-  deps: { detect?: (hooks: { onRuntimeChecked: (checked: RuntimeDetectionCheckedRuntime) => void }) => RuntimeDetection; write?: (line: string) => void } = {},
+  deps: {
+    detect?: (hooks: { onRuntimeChecked: (checked: RuntimeDetectionCheckedRuntime) => void }) => RuntimeDetection | Promise<RuntimeDetection>;
+    write?: (line: string) => void;
+  } = {},
 ): Promise<number> {
   const write = deps.write ?? ((line: string) => { process.stdout.write(`${line}\n`); });
   let detect = deps.detect;
   if (!detect) {
-    const { detectRuntimes } = await import("./core");
-    detect = (hooks) => detectRuntimes(undefined, hooks);
+    const { detectRuntimesAsync } = await import("./core");
+    detect = (hooks) => detectRuntimesAsync(undefined, hooks);
   }
   try {
-    const detection = detect({
+    const detection = await detect({
       onRuntimeChecked: (checked) => write(JSON.stringify({ event: "checked", ...checked })),
     });
     write(JSON.stringify({ event: "done", detection }));

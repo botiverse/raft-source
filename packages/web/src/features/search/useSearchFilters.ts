@@ -35,7 +35,6 @@ export function useSearchFilters({
   senderIdParam,
   scopes,
   formatMessage,
-  filtersPortalRef,
 }: Pick<SearchEntitySourceParams, "channels" | "members" | "agents" | "currentUser"> & {
   location: Location;
   setSearchParams: SetURLSearchParams;
@@ -43,7 +42,6 @@ export function useSearchFilters({
   senderIdParam: string;
   scopes: SearchScope[];
   formatMessage: IntlShape["formatMessage"];
-  filtersPortalRef: RefObject<HTMLDivElement | null>;
 }) {
   const [openFilterMenu, setOpenFilterMenu] = useState<SearchFilterMenu | null>(null);
   const [channelFilterQuery, setChannelFilterQuery] = useState("");
@@ -181,8 +179,6 @@ export function useSearchFilters({
     }, { replace: true, state: location.state });
   }, [location.state, senderOptions, setSearchParams, skipNextSearchStateRestoreRef]);
 
-  // Filter menus render into the filters bar so they stay inside the overlay.
-  const filtersPortalProps = useMemo(() => ({ container: filtersPortalRef }), [filtersPortalRef]);
   const handleFromMenuOpenChange = useCallback((open: boolean) => setOpenFilterMenu(open ? "from" : null), []);
   const handleScopeMenuOpenChange = useCallback((open: boolean) => setOpenFilterMenu(open ? "scope" : null), []);
   const handleChannelMenuOpenChange = useCallback((open: boolean) => setOpenFilterMenu(open ? "channel" : null), []);
@@ -261,7 +257,6 @@ export function useSearchFilters({
     filteredSenderOptions,
     selectedSender,
     setScopeFilters,
-    filtersPortalProps,
     handleFromMenuOpenChange,
     handleScopeMenuOpenChange,
     handleChannelMenuOpenChange,

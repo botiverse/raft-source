@@ -1,3 +1,4 @@
+import { useCallback, useSyncExternalStore } from "react";
 import type { Agent } from "../../store/agentStore";
 import type { ChannelHuman } from "../../hooks/useChannelMembers";
 import type { HumanProfile } from "../member/HumanDetailPanel";
@@ -24,7 +25,32 @@ export function getCachedAgentProfile(viewerServerId: string | null | undefined,
 
 export function setCachedAgentProfile(viewerServerId: string | null | undefined, agent: Agent) {
   if (!viewerServerId) return;
-  agentProfileCache.set(agentCacheKey(viewerServerId, agent.id), agent);
+  const key = agentCacheKey(viewerServerId, agent.id);
+  if (agentProfileCache.get(key) === agent) return;
+  agentProfileCache.set(key, agent);
+  notifyAgentProfileListeners();
+}
+
+// The agent cache is filled after a page that reads it has rendered (a row's
+// click, a profile's fetch, the beside column's check), so a component that
+// shows a cached profile subscribes to it instead of reading it once.
+const agentProfileListeners = new Set<() => void>();
+
+function notifyAgentProfileListeners() {
+  for (const listener of [...agentProfileListeners]) listener();
+}
+
+function subscribeAgentProfiles(listener: () => void) {
+  agentProfileListeners.add(listener);
+  return () => {
+    agentProfileListeners.delete(listener);
+  };
+}
+
+/** `getCachedAgentProfile`, kept current: the component renders again when that entry is set or cleared. */
+export function useCachedAgentProfile(viewerServerId: string | null | undefined, agentId: string): Agent | null {
+  const read = useCallback(() => getCachedAgentProfile(viewerServerId, agentId), [viewerServerId, agentId]);
+  return useSyncExternalStore(subscribeAgentProfiles, read, read);
 }
 
 export function getCachedHumanProfile(serverId: string, userId: string, channelId?: string | null): HumanProfile | null {
@@ -58,4 +84,5 @@ export function primeHumanProfileFromChannelMember(serverId: string, channelId: 
 registerServerReset(() => {
   agentProfileCache.clear();
   humanProfileCache.clear();
+  notifyAgentProfileListeners();
 });

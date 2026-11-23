@@ -45,10 +45,12 @@ const AGENT_LOUNGE_WRITE_CLASSIFICATION: Readonly<Record<string, LoungeWriteClas
   channelUnarchive: "capability",
   channelUpdate: "capability",
   channelMemberRemove: "capability",
+  channelMemberRole: "capability",
 
   channelJoin: "loungeCheck",
   channelMemberAdd: "loungeCheck",
   threadFollow: "loungeCheck",
+  focus: "loungeCheck",
   taskFollow: "loungeCheck",
   mentionActionsExecute: "loungeCheck",
   reminderCreate: "loungeCheck",
@@ -69,12 +71,16 @@ const AGENT_LOUNGE_WRITE_CLASSIFICATION: Readonly<Record<string, LoungeWriteClas
   // RFC 081: the agent's own read state (its read position, its own app events); posts nothing.
   inboxRead: "notChannel",
   inboxDismiss: "notChannel",
+  // Reads the agent's own inbox rows (POST for its body); posts nothing.
+  inboxRows: "notChannel",
   raftbenchSubmit: "notChannel",
   feedbackLocatorIngest: "notChannel",
   managedMcpCall: "notChannel",
   channelCreate: "notChannel",
   resolveChannel: "notChannel",
   threadUnfollow: "notChannel",
+  // The agent's own focus list; writes nothing into a conversation.
+  unfocus: "notChannel",
   taskUnfollow: "notChannel",
   taskIdleNudge: "notChannel",
   migrationRetry: "notChannel",
@@ -117,6 +123,8 @@ const AGENT_LOUNGE_WRITE_CLASSIFICATION: Readonly<Record<string, LoungeWriteClas
   artifactReview: "notChannel",
   artifactCommentResolve: "notChannel",
   artifactCommentReopen: "notChannel",
+  artifactSettle: "notChannel",
+  artifactUnsettle: "notChannel",
   artifactSubscribe: "notChannel",
   artifactUnsubscribe: "notChannel",
   artifactMove: "notChannel",

@@ -30,6 +30,7 @@ import { accountSettingsForClient, isFollowedThreadRepliesSwitchOn } from "../se
 import { sendTestNotification } from "../services/notifications/testNotification";
 import { mapWithConcurrency } from "../lib/mapWithConcurrency";
 import { sendJsonServerError } from "./errorResponse";
+import { refuse } from "../lib/refusal";
 import { clientIpForRateLimit } from "../lib/clientIpForRateLimit";
 
 export const pushRouter: RouterType = Router();
@@ -172,7 +173,7 @@ pushRouter.post("/prompt-events", requireAuth, async (req, res) => {
   const event = cleanEventField(req.body?.event);
   const trigger = cleanEventField(req.body?.trigger);
   if (!event || !PUSH_PROMPT_EVENTS.has(event) || !trigger) {
-    res.status(400).json({ error: "Invalid push prompt event" });
+    refuse(res, 400, { code: "invalid_input", error: "Invalid push prompt event" });
     return;
   }
 
@@ -224,22 +225,22 @@ pushRouter.post("/subscribe", requireAuth, requireVerified, async (req, res) => 
 
   const { endpoint, keys, oldEndpoint } = req.body ?? {};
   if (!endpoint || !keys?.p256dh || !keys?.auth) {
-    res.status(400).json({ error: "Missing endpoint or subscription keys" });
+    refuse(res, 400, { code: "invalid_input", error: "Missing endpoint or subscription keys" });
     return;
   }
   if (!webPushEndpointHostname(endpoint)) {
-    res.status(400).json({ error: "Push endpoint must be a public HTTPS URL" });
+    refuse(res, 400, { code: "invalid_input", error: "Push endpoint must be a public HTTPS URL" });
     return;
   }
   // Only the browsers' own push services: never a host of the subscriber's choosing.
   if (!isAllowedWebPushEndpoint(endpoint)) {
-    res.status(400).json({ error: "Push endpoint is not on a supported push service", code: "push_endpoint_host_not_allowed" });
+    refuse(res, 400, { code: "push_endpoint_host_not_allowed", error: "Push endpoint is not on a supported push service" });
     return;
   }
   // From a service worker's pushsubscriptionchange: the browser replaced the
   // subscription, so the old endpoint goes (contract §3.2).
   if (oldEndpoint !== undefined && oldEndpoint !== null && (typeof oldEndpoint !== "string" || oldEndpoint.length > 4096)) {
-    res.status(400).json({ error: "Invalid oldEndpoint" });
+    refuse(res, 400, { code: "invalid_input", error: "Invalid oldEndpoint" });
     return;
   }
 
@@ -278,7 +279,7 @@ pushRouter.delete("/subscribe", requireAuth, requireVerified, async (req, res) =
 
   const { endpoint } = req.body ?? {};
   if (!endpoint) {
-    res.status(400).json({ error: "Missing endpoint" });
+    refuse(res, 400, { code: "invalid_input", error: "Missing endpoint" });
     return;
   }
 
@@ -309,7 +310,7 @@ const familyRevokeLimiter = rateLimit({
 pushRouter.post("/family-revoke", familyRevokeLimiter, async (req, res) => {
   const capability = typeof req.body?.capability === "string" ? req.body.capability.trim() : "";
   if (!capability || capability.length > 256 || !/^[A-Za-z0-9._-]+$/.test(capability)) {
-    res.status(400).json({ error: "Invalid revoke capability shape" });
+    refuse(res, 400, { code: "invalid_input", error: "Invalid revoke capability shape" });
     return;
   }
 
@@ -341,7 +342,7 @@ pushRouter.get("/delivery-status", requireAuth, requireVerified, async (req, res
   }
   const installationId = cleanBoundedRegistrationField(req.query.installationId, MAX_INSTALLATION_ID_LENGTH, REGISTRATION_ID_PATTERN);
   if (!installationId) {
-    res.status(400).json({ error: "Invalid installation id" });
+    refuse(res, 400, { code: "invalid_input", error: "Invalid installation id" });
     return;
   }
 
@@ -391,46 +392,46 @@ pushRouter.post("/registrations", requireAuth, requireVerified, requireServer, a
   const previewKeySet = parsePreviewKeySet(req.body?.previewKeySet);
 
   if (!provider) {
-    res.status(400).json({ error: "Invalid push provider" });
+    refuse(res, 400, { code: "invalid_input", error: "Invalid push provider" });
     return;
   }
   if (!env) {
-    res.status(400).json({ error: "Invalid or missing push environment" });
+    refuse(res, 400, { code: "invalid_input", error: "Invalid or missing push environment" });
     return;
   }
   // FCM has no sandbox: one endpoint serves debug and release builds alike.
   if (provider === "fcm" && env !== "production") {
-    res.status(400).json({ error: "FCM registrations use the production environment" });
+    refuse(res, 400, { code: "invalid_input", error: "FCM registrations use the production environment" });
     return;
   }
   if (!installationId || !deviceToken || !topic) {
-    res.status(400).json({ error: "Invalid push registration tuple" });
+    refuse(res, 400, { code: "invalid_input", error: "Invalid push registration tuple" });
     return;
   }
   // Our APNs key pushes only to our own app: another bundle id (a fork or a
   // third-party build pointed at this server) would only get TopicDisallowed.
   if (provider === "apns" && !isAllowedApnsTopic(topic)) {
-    res.status(400).json({ error: "Push topic is not supported by this server", code: "push_topic_not_allowed" });
+    refuse(res, 400, { code: "push_topic_not_allowed", error: "Push topic is not supported by this server" });
     return;
   }
   if (appVersionInput !== undefined && appVersionInput !== null && !appVersion) {
-    res.status(400).json({ error: "Invalid app version" });
+    refuse(res, 400, { code: "invalid_input", error: "Invalid app version" });
     return;
   }
   if (previewMode === null) {
-    res.status(400).json({ error: "Invalid preview mode" });
+    refuse(res, 400, { code: "invalid_input", error: "Invalid preview mode" });
     return;
   }
   if (alertsEnabled === null) {
-    res.status(400).json({ error: "alertsEnabled must be a boolean" });
+    refuse(res, 400, { code: "invalid_input", error: "alertsEnabled must be a boolean" });
     return;
   }
   if (osPermission === null) {
-    res.status(400).json({ error: "Invalid OS permission" });
+    refuse(res, 400, { code: "invalid_input", error: "Invalid OS permission" });
     return;
   }
   if (previewKeySet === null) {
-    res.status(400).json({ error: "previewKeySet must be a positive integer" });
+    refuse(res, 400, { code: "invalid_input", error: "previewKeySet must be a positive integer" });
     return;
   }
 
@@ -517,21 +518,21 @@ pushRouter.patch("/registrations/:installationId", requireAuth, requireVerified,
   }
   const installationId = cleanBoundedRegistrationField(req.params.installationId, MAX_INSTALLATION_ID_LENGTH, REGISTRATION_ID_PATTERN);
   if (!installationId) {
-    res.status(400).json({ error: "Invalid installation id" });
+    refuse(res, 400, { code: "invalid_input", error: "Invalid installation id" });
     return;
   }
   const alertsEnabled = parseAlertsEnabled(req.body?.alertsEnabled);
   const osPermission = parseOsPermission(req.body?.osPermission);
   if (alertsEnabled === null) {
-    res.status(400).json({ error: "alertsEnabled must be a boolean" });
+    refuse(res, 400, { code: "invalid_input", error: "alertsEnabled must be a boolean" });
     return;
   }
   if (osPermission === null) {
-    res.status(400).json({ error: "Invalid OS permission" });
+    refuse(res, 400, { code: "invalid_input", error: "Invalid OS permission" });
     return;
   }
   if (alertsEnabled === undefined && osPermission === undefined) {
-    res.status(400).json({ error: "alertsEnabled or osPermission is required" });
+    refuse(res, 400, { code: "invalid_input", error: "alertsEnabled or osPermission is required" });
     return;
   }
 
@@ -546,7 +547,7 @@ pushRouter.patch("/registrations/:installationId", requireAuth, requireVerified,
       .where(and(eq(pushRegistrations.installationId, installationId), eq(pushRegistrations.userId, userId)))
       .returning();
     if (!registration) {
-      res.status(404).json({ error: "Push registration not found" });
+      refuse(res, 404, { code: "push_registration_not_found", error: "Push registration not found" });
       return;
     }
     res.json({ ok: true, registration: serializeRegistration(registration) });
@@ -569,7 +570,7 @@ pushRouter.delete("/registrations/:installationId", requireAuth, requireVerified
 
   const installationId = cleanRegistrationField(req.params.installationId);
   if (!installationId) {
-    res.status(400).json({ error: "Missing installation id" });
+    refuse(res, 400, { code: "invalid_input", error: "Missing installation id" });
     return;
   }
 
@@ -612,7 +613,7 @@ pushRouter.post("/test", requireAuth, requireVerified, async (req, res) => {
       ? headerServerId
       : (await notificationSettings.listServerLevels(userId))[0]?.serverId ?? null;
     if (subscriptions.length === 0 || !serverId) {
-      res.status(409).json({ error: "No push subscription found for this user on this server" });
+      refuse(res, 409, { code: "push_subscription_missing", error: "No push subscription found for this user on this server" });
       return;
     }
 

@@ -6,9 +6,12 @@ import { promptConfig } from "../testing/promptFixture";
 // Store shared copy once and lossless unified diffs for each real driver's output.
 // These detect copy changes, not whether a model follows the instructions.
 // Local runs update snapshots; review and commit the diff. CI only checks.
+// The common copy is a daemon that runs `raft proc` jobs (every platform but
+// Windows), so only the Windows variants show the Background jobs entry gone.
 function commonPrompt(): string {
   return buildCliSystemPrompt(promptConfig(), {
     extraCriticalRules: [],
+    procJobs: true,
   });
 }
 
@@ -69,6 +72,7 @@ test("configured role, context and release notice output", async () => {
     },
   }), {
     extraCriticalRules: ["- Example runtime restriction."],
+    procJobs: true,
   });
   await expectVariant("configured", prompt);
 });
@@ -82,6 +86,7 @@ test("Artifacts app on: its commands in entry 6, no entry of its own, artifact-s
     ],
   }), {
     extraCriticalRules: [],
+    procJobs: true,
   });
   await expectVariant("artifacts-app", prompt);
 });

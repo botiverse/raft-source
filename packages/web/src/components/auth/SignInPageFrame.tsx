@@ -81,12 +81,12 @@ function ReservedSignInForm() {
 export function SignInPageFrame({ purpose, children }: { purpose?: string; children?: ReactNode }) {
   const { formatMessage } = useIntl();
   const { pathname } = useLocation();
-  // As SignInPage: the open-in-app offers at a workspace address.
-  const offers = pathname.startsWith("/s/");
+  // As SignInPage: the open-in-app offers at workspace and canonical Artifact addresses.
+  const offers = pathname.startsWith("/s/") || pathname.startsWith("/artifacts/");
   return (
     <AuthPageFrame
       topStrip={offers ? <OpenInAppOffers slot="top" /> : undefined}
-      bottomStrip={offers ? <OpenInAppOffers slot="bottom" /> : undefined}
+      bottomStrip={offers ? <OpenInAppOffers slot="bottom" signedOutHint /> : undefined}
     >
       <div className="w-full" aria-busy="true" data-testid="sign-in-frame">
         <AuthPageIntro

@@ -9,7 +9,7 @@ import { revokeSocketAccess } from "../socket/accessRevocation";
 import { broadcastAgentCredentialRevocation } from "../replicaRouter";
 import { ISSUER_LEFT_SERVER_REVOKE_REASON, revokeAgentCredentialsIssuedBy } from "./agentCredentialService";
 import { clearComputerOwnershipOf } from "./computerOwnerService";
-import { revokeComputerKeyInTransaction, type DetachedComputer } from "./computerKeyRevocation";
+import { liveLegacyMachinesRegisteredBy, revokeComputerKeyInTransaction, revokeLegacyMachineKeysOfDepartingRegistrant, type DetachedComputer } from "./computerKeyRevocation";
 import { findAgentsBoundToMachines } from "./computerAgents";
 import { closeDeviceSessionKeys } from "./deviceSessionKeys";
 import { createHash } from "crypto";
@@ -18,7 +18,7 @@ import { headcountAgent } from "./agentMemberListPolicy";
 import { getDb, type DatabaseExecutor, type DatabaseTransaction } from "../db/index";
 import { sqlUuidOrNull } from "../db/sqlUuid";
 import { CURRENT_CONTRACT_VERSION } from "./serverSetupStateService";
-import { computers, servers, serverMembers, serverMembershipDepartures, serverMemberRoleAuditEvents, serverAgentMembers, users, channels, channelHumans, messages, agents, subscriptions, threadFollows, oauthAccessTokens, oauthUserConsents, oauthLinkPreviewDeclines, jointChannelServers, userNotificationLevelVersions } from "../db/schema";
+import { computers, machines, servers, serverMembers, serverMembershipDepartures, serverMemberRoleAuditEvents, serverAgentMembers, users, channels, channelHumans, messages, agents, subscriptions, threadFollows, oauthAccessTokens, oauthUserConsents, oauthLinkPreviewDeclines, jointChannelServers, userNotificationLevelVersions } from "../db/schema";
 import { emitAppFacingMemberEvents, kickAppNotificationDelivery } from "./appNotificationDeliveryService";
 import { ALL_CHANNEL_TEAM_THRESHOLD, DEPRECATED_GRAVATAR_HASH, canTransitionServerRole, currentDate, hasServerCapability, isAdminOrOwner, isOwnerRole, isRaftThemeId, MEMBER_REMOVAL_IMPACT_MAX_COMPUTER_NAMES, parseChannelSideLayout, type ChannelSideLayout, type MemberRemovalImpact, type RaftThemeId, type ServerRole } from "@botiverse/raft-shared";
 import { untracedDbQuery, type DbQueryTracer } from "../tracing/dbQueryTrace";
@@ -223,7 +223,11 @@ interface RemoveMemberOptions {
 export async function createServer(name: string, slug: string, ownerId: string) {
   const db = getDb();
 
-  const [existing] = await db.select({ id: servers.id }).from(servers).where(and(eq(servers.slug, slug), isNull(servers.deletedAt)));
+  // Any row holds its slug, a deleted server's included: servers.slug is unique
+  // over every row, and the closed-server purge keeps a deleted server's slug on
+  // purpose (closedServerPurgeClassification). The answer is the same "already
+  // taken" for a live or a deleted holder, so it reveals no deleted server.
+  const [existing] = await db.select({ id: servers.id }).from(servers).where(eq(servers.slug, slug));
   if (existing) {
     throw new Error(`Server slug "${slug}" is already taken`);
   }
@@ -352,6 +356,7 @@ export async function getUserServers(userId: string, opts: { traceQuery?: DbQuer
         slug: servers.slug,
         ownerId: servers.ownerId,
         onboardingAgentId: servers.onboardingAgentId,
+        officialOnboardingAgentId: servers.officialOnboardingAgentId,
         hideHumansFromMembers: servers.hideHumansFromMembers,
         plan: servers.plan,
         planDowngradedAt: servers.planDowngradedAt,
@@ -505,29 +510,49 @@ export async function updateServerSwitcherOrder(userId: string, serverOrder: str
   return { serverOrder: filtered, serverOrderVersion };
 }
 
+/** The joiner greeter only. Not a setup signal: setting it never touches setup state. */
 export async function updateServerOnboardingAgent(
   serverId: string,
   onboardingAgentId: string | null,
+  options: { executor?: DatabaseTransaction } = {},
+) {
+  const [updated] = await (options.executor ?? getDb())
+    .update(servers)
+    .set({
+      onboardingAgentId,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(servers.id, serverId), isNull(servers.deletedAt)))
+    .returning();
+  return updated ?? null;
+}
+
+/**
+ * Record `agentId` as the server's official onboarding agent (Cindy). She also becomes the
+ * joiner greeter when the server has none, as a freshly created Cindy always was; a greeter
+ * someone already picked is kept.
+ *
+ * Linking her is a change to the (owner × checkpoint) set (#4883): the owner who created her
+ * was stamped `normal` in the agent's own transaction, so sweep every other owner to the
+ * server-wide completion now (already-complete rows are left untouched by the reconcile).
+ */
+export async function linkOfficialOnboardingAgent(
+  serverId: string,
+  agentId: string,
   options: { executor?: DatabaseTransaction } = {},
 ) {
   const run = async (tx: DatabaseTransaction) => {
     const [updated] = await tx
       .update(servers)
       .set({
-        onboardingAgentId,
+        officialOnboardingAgentId: agentId,
+        onboardingAgentId: sql`coalesce(${servers.onboardingAgentId}, ${agentId}::uuid)`,
         updatedAt: new Date(),
       })
       .where(and(eq(servers.id, serverId), isNull(servers.deletedAt)))
       .returning();
     if (!updated) return null;
-
-    // Crossing the checkpoint is the third way the (owner × checkpoint) set changes (#4883): a
-    // co-owner who existed BEFORE Cindy would otherwise stay not_started, since first-agent
-    // completion only stamps `servers.owner_id`. Sweep every owner now (already-complete rows,
-    // incl. the original owner's `normal`, are left untouched by the reconcile).
-    if (onboardingAgentId) {
-      await reconcileOwnersToSetupCheckpoint(tx, serverId);
-    }
+    await reconcileOwnersToSetupCheckpoint(tx, serverId);
     return updated;
   };
   // With a caller's transaction the link commits together with the caller's writes.
@@ -641,14 +666,8 @@ export async function updateServerOnboardingSettings(
 
     if (!updated) return null;
 
-    // This is the OTHER path that crosses the Cindy checkpoint (Settings → set onboarding agent),
-    // so it must enforce the owner invariant in the same transaction — see
-    // `reconcileOwnersToSetupCheckpoint` and `updateServerOnboardingAgent`. Any new writer of
-    // `servers.onboarding_agent_id` must call the reconcile too, or a co-owner drifts (#4883).
-    if (setsOnboardingAgent && updates.onboardingAgentId) {
-      await reconcileOwnersToSetupCheckpoint(tx, serverId);
-    }
-
+    // The greeter is not a setup signal: picking one never completes (or reconciles) setup.
+    // Only `linkOfficialOnboardingAgent` crosses the Cindy checkpoint.
     return {
       onboardingAgentId: updated.onboardingAgentId ?? null,
       agentAllChannelGreetingEnabled: updated.agentAllChannelGreetingEnabled !== false,
@@ -1231,6 +1250,8 @@ export interface RemovedMemberEffects {
   revokedCredentialAgentIds: string[];
   /** The Computers this person attached here, revoked with the membership: what to close after commit. */
   revokedComputers: { agentIds: string[]; machineIds: string[]; detached: DetachedComputer[] };
+  /** Set when a membership ended: its MCP Connections still signed in as the person are told about after commit. */
+  departedAt?: Date;
 }
 
 export interface RemovedMember {
@@ -1501,6 +1522,7 @@ export async function executeMemberRemoval(tx: DatabaseTransaction, prepared: Pr
   });
 
   if (removedRole === undefined) return { ...effects, announced: false };
+  effects.departedAt = departedAt;
   // A seat freed: the server's seat notices show only while the seats are full.
   if (removedRole !== "guest") await announceSeatJoinBlocksForSeatChange(tx, serverId);
   // A Guest leaving can leave its channel with no Guest, no longer external:
@@ -1566,6 +1588,20 @@ export async function executeMemberRemoval(tx: DatabaseTransaction, prepared: Pr
     for (const machineId of result?.reach.machineIds ?? []) computerReach.machineIds.add(machineId);
     if (result?.detached) effects.revokedComputers.detached.push(result.detached);
   }
+  // And every legacy machine key (`sk_machine_*`) they registered here, with
+  // what those machines minted (#wg-rbac:#78): the key acted for them, as the
+  // server's agents on that machine. Legacy-key sign-in also refuses a
+  // departed registrant (lib/legacyMachineKeyStanding.ts).
+  const legacy = await revokeLegacyMachineKeysOfDepartingRegistrant(tx, {
+    serverId,
+    userId,
+    by: { via: "member_removed", actorUserId: auditActorId, actorRole: audit.actorRole, departureReason: reason },
+    now: departedAt,
+    operationId: audit.operationId,
+  });
+  for (const agentId of legacy.reach.agentIds) computerReach.agentIds.add(agentId);
+  for (const machineId of legacy.reach.machineIds) computerReach.machineIds.add(machineId);
+  effects.revokedComputers.detached.push(...legacy.detached);
   effects.revokedComputers.agentIds = [...computerReach.agentIds];
   effects.revokedComputers.machineIds = [...computerReach.machineIds];
 
@@ -1633,6 +1669,13 @@ export async function getMemberRemovalImpact(serverId: string, userId: string): 
     .from(computers)
     .where(liveComputersAttachedBy(serverId, userId))
     .orderBy(asc(computers.name), asc(computers.id));
+  // And the legacy machines they registered here, whose keys the removal revokes too (#wg-rbac:#78).
+  const legacy = await getDb()
+    .select({ name: machines.name, machineId: machines.id })
+    .from(machines)
+    .where(liveLegacyMachinesRegisteredBy(serverId, userId))
+    .orderBy(asc(machines.name), asc(machines.id));
+  attached.push(...legacy);
   const machineIds = [...new Set(attached.flatMap((computer) => computer.machineId ? [computer.machineId] : []))];
   const bound = await findAgentsBoundToMachines(getDb(), machineIds, userId);
   return {
@@ -1658,17 +1701,22 @@ export async function finishRemovedMember(serverId: string, userId: string, effe
   }
   // The revoked Computers' connections and what their machines minted, on every replica.
   await closeDeviceSessionKeys({ agentIds: effects.revokedComputers.agentIds, machineIds: effects.revokedComputers.machineIds });
+  // MCP Connections that still act as the person: their admins and the person are told; nothing is revoked. Never throws.
+  if (effects.departedAt) {
+    const { noticeConnectionsOfDepartedMember } = await import("./managedMcpSignedInBy");
+    await noticeConnectionsOfDepartedMember({ serverId, userId, departedAt: effects.departedAt });
+  }
   return { archivedAssistantIds: departed?.agentIds ?? [], detachedComputers: effects.revokedComputers.detached };
 }
 
 /**
  * Keep a newly-created owner row aligned with the server-wide setup state (#4883, task #240).
- * Once any owner completed setup (or the Cindy compatibility checkpoint is set), later owners
- * inherit `complete`; setup is not owed independently by every owner.
+ * Once any owner completed setup, later owners inherit `complete`; setup is not owed
+ * independently by every owner.
  *
  * A member BECOMES owner through `updateMemberRole` or `addMember`; pass their `onlyUserId`.
- * The Cindy compatibility checkpoint is set through `updateServerOnboardingAgent` or
- * `updateServerOnboardingSettings`; omit `onlyUserId` to sweep every existing owner. The
+ * Linking the official Cindy (`linkOfficialOnboardingAgent`) omits `onlyUserId` to sweep
+ * every existing owner. Picking a greeter is not a checkpoint and does not call this. The
  * projection independently derives server completion from any completed owner, so historical
  * incomplete co-owner rows fail open without a data backfill. Rows already `complete` are never
  * touched, so the
@@ -1855,7 +1903,11 @@ export async function transitionMemberRoleInTransaction(
   const [ownerCountRow] = await tx
     .select({ value: count() })
     .from(serverMembers)
-    .where(and(eq(serverMembers.serverId, input.serverId), eq(serverMembers.role, "owner")));
+    // Live owners only: a deleted account's kept owner row is no handover.
+    // A plain read of users (no lock clause): the member rows above are
+    // locked FOR UPDATE, and users are only ever locked before them.
+    .innerJoin(users, eq(users.id, serverMembers.userId))
+    .where(and(eq(serverMembers.serverId, input.serverId), eq(serverMembers.role, "owner"), isNull(users.retiredAt)));
   const ownerCount = Number(ownerCountRow?.value ?? 0);
   if (!canTransitionServerRole({
     actorRole: actor.role,
@@ -1962,7 +2014,7 @@ export async function grantOnboardingAgentRole(
 ): Promise<void> {
   const run = async (tx: DatabaseTransaction) => {
     const previousRole = await getAgentMemberRole(serverId, agentId, tx);
-    await updateServerOnboardingAgent(serverId, agentId, { executor: tx });
+    await linkOfficialOnboardingAgent(serverId, agentId, { executor: tx });
     await updateAgentMemberRole(serverId, agentId, role, { executor: tx });
     if (previousRole !== role) {
       await recordSystemAgentRoleGrant({ serverId, agentId, nextRole: role, previousRole, grantedBy: "onboarding_agent_created" }, tx);
@@ -2006,16 +2058,24 @@ export async function updateAgentMemberRole(
   return updated;
 }
 
-export async function countOwners(serverId: string) {
+/**
+ * Live owners of a live server: a deleted account's (users.retired_at) kept
+ * owner row is no owner. `excludingUserId` leaves one person out (the live
+ * owners left once they are removed). A plain join read, no row lock.
+ */
+export async function countOwners(serverId: string, opts: { excludingUserId?: string } = {}) {
   const db = getDb();
   const [row] = await db
     .select({ value: count() })
     .from(serverMembers)
     .innerJoin(servers, eq(serverMembers.serverId, servers.id))
+    .innerJoin(users, eq(users.id, serverMembers.userId))
     .where(and(
       eq(serverMembers.serverId, serverId),
       eq(serverMembers.role, "owner"),
       isNull(servers.deletedAt),
+      isNull(users.retiredAt),
+      opts.excludingUserId ? ne(serverMembers.userId, opts.excludingUserId) : undefined,
     ));
   return Number(row?.value ?? 0);
 }
@@ -2408,6 +2468,14 @@ export async function isMember(serverId: string, userId: string, opts: { traceQu
   return !!member;
 }
 
+/**
+ * A user's standing role in a live server, or null. A deleted account
+ * (users.retired_at) keeps its server_members row and role for history
+ * (accountDeletion/tableClassification), but holds no authority: it reads as
+ * null here, so no rule that reads a third party's role (an App's creator, an
+ * approver, an assistant's owner) inherits a retired owner/admin's role. A
+ * plain join read: no row lock on users (lock order: users KEY SHARE first).
+ */
 export async function getMemberRole(
   serverId: string,
   userId: string,
@@ -2415,6 +2483,30 @@ export async function getMemberRole(
 ): Promise<ServerRole | null> {
   const db = executor;
   const [member] = await db
+    .select({ role: serverMembers.role })
+    .from(serverMembers)
+    .innerJoin(servers, eq(serverMembers.serverId, servers.id))
+    .innerJoin(users, eq(users.id, serverMembers.userId))
+    .where(and(
+      eq(serverMembers.serverId, serverId),
+      eq(serverMembers.userId, userId),
+      isNull(servers.deletedAt),
+      isNull(users.retiredAt),
+    ));
+  return (member?.role as ServerRole | undefined) || null;
+}
+
+/**
+ * The role a user's server_members row holds in a live server, a deleted
+ * account's kept row included. Only for the row as a record (whether there is
+ * a membership to remove or address), never for authority: use getMemberRole.
+ */
+export async function getMemberRoleIncludingRetired(
+  serverId: string,
+  userId: string,
+  executor: DatabaseExecutor = getDb(),
+): Promise<ServerRole | null> {
+  const [member] = await executor
     .select({ role: serverMembers.role })
     .from(serverMembers)
     .innerJoin(servers, eq(serverMembers.serverId, servers.id))

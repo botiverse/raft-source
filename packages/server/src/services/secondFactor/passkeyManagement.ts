@@ -21,6 +21,11 @@
  * and keeps this one (management.ts, "Other sign-ins"); adding one signs
  * nobody out.
  * Every addition and removal is audited and emailed.
+ *
+ * Legacy passkeys (WEBAUTHN_LEGACY_RP_ID, webauthn.ts): new passkeys are
+ * always registered under the current RP ID; the ones registered under the
+ * legacy RP ID stay valid (verified under their own RP ID) and are kept for
+ * good: nobody is asked to replace them.
  */
 import { and, asc, eq, isNotNull, isNull } from "drizzle-orm";
 import { currentDate } from "@botiverse/raft-shared";
@@ -36,11 +41,12 @@ import {
   lockLiveSetupSession,
   lockUser,
   notify,
+  refuseUnverifiedEmail,
   SecondFactorError,
   withSecondFactorAnswer,
   type StepUpAnswer,
 } from "./management";
-import { activePasskeys, countActivePasskeys, PASSKEY_CEREMONY_TTL_MS, startPasskeyAssertion } from "./passkeys";
+import { activePasskeys, countActivePasskeys, groupPasskeys, PASSKEY_CEREMONY_TTL_MS, startPasskeyAssertion } from "./passkeys";
 import { isRecentlyReauthenticated } from "./reauthentication";
 import {
   ceremonyChallenge,
@@ -51,6 +57,7 @@ import {
   verifyPasskeyRegistration,
   webauthnRelyingParty,
   type PasskeyRegistrationResponse,
+  type PasskeyRpGroup,
   type RelyingParty,
 } from "./webauthn";
 
@@ -123,6 +130,7 @@ export async function startPasskeyRegistration(input: { userId: string; familyId
   const now = input.now ?? currentDate();
   const { userId, familyId } = input;
   const rp = relyingParty();
+  await refuseUnverifiedEmail(userId);
   const [user] = await getDb().select({ email: users.email, name: users.name, displayName: users.displayName, requiredAt: users.secondFactorRequiredAt })
     .from(users).where(eq(users.id, userId));
   if (!user) throw new SecondFactorError("session_family_required", "Sign in again to continue.");
@@ -144,7 +152,8 @@ export async function startPasskeyRegistration(input: { userId: string; familyId
     userHandle: await webauthnUserHandleFor(userId),
     userName: user.email,
     displayName: user.displayName || user.name,
-    exclude: await activePasskeys(getDb(), userId),
+    // Only the passkeys under the current RP ID can collide with the new one.
+    exclude: groupPasskeys(rp, await activePasskeys(getDb(), userId)).current,
   });
   return { options, expiresAt: created.expiresAt.toISOString() };
 }
@@ -201,6 +210,7 @@ export async function finishPasskeyRegistration(input: {
         backupEligible: registered.backupEligible,
         backupState: registered.backupState,
         transports: registered.transports,
+        rpId: rp.rpID,
         name: input.name ?? defaultPasskeyName(registered.aaguid),
         createdAt: now,
       }).returning(summaryColumns);
@@ -295,13 +305,19 @@ export async function removePasskey(input: { userId: string; familyId: string; p
 }
 
 /**
- * POST /passkeys/assertion/options (signed in): options to answer step-up,
+ * POST /passkeys/assertion/options { rp? } (signed in): options to answer step-up,
  * turning two-step verification on or off, regenerating backup codes or
- * removing a passkey with a passkey; bound to this sign-in.
+ * removing a passkey with a passkey; bound to this sign-in. `rp`
+ * (`current` | `legacy`) picks the RP group (passkeys.ts); 404
+ * `passkey_rp_unavailable` { rp, availableRps } when it has none of the
+ * person's passkeys but another group has.
  */
-export async function startStepUpPasskeyAssertion(input: { userId: string; familyId: string; now?: Date }) {
+export async function startStepUpPasskeyAssertion(input: { userId: string; familyId: string; rp?: PasskeyRpGroup; now?: Date }) {
   const now = input.now ?? currentDate();
-  const started = await startPasskeyAssertion(relyingParty(), { userId: input.userId, binding: { familyId: input.familyId }, now });
-  if (!started) throw passkeyNotFound();
+  const started = await startPasskeyAssertion(relyingParty(), { userId: input.userId, binding: { familyId: input.familyId }, now, rp: input.rp });
+  if ("refused" in started) {
+    if (started.refused === "none") throw passkeyNotFound();
+    throw new SecondFactorError("passkey_rp_unavailable", "None of your passkeys can be used here.", { rp: started.rp, availableRps: started.available });
+  }
   return started;
 }

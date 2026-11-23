@@ -7,9 +7,9 @@ import type { ConnectedAppCategory, ConnectedAppListing, ConnectedAppStatus, Ins
 import type { MarketplaceOAuthClientRecord, OAuthClientRecord } from "./oauthClientRecords";
 
 /**
- * A GET /integrations/marketplace row the Marketplace tab shows. The list also
- * carries Apps installed here that are not publicly listed, for the Installed
- * tab and its Review permissions: private shares, and this Server's own App
+ * A GET /integrations/marketplace row Discover shows. The list also
+ * carries Apps installed here that are not publicly listed, for Yours
+ * and its Review permissions: private shares, and this Server's own App
  * while it is private, in review, rejected or unlisted (#triage:59b61529).
  */
 export function isMarketplaceTabClient(client: MarketplaceOAuthClientRecord, serverId: string | undefined) {

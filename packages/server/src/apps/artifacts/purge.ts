@@ -6,7 +6,8 @@
 // - `count` deletes nothing: how many Artifacts, versions and comments the
 //   server has, and its blobs and their bytes (the purge's count report).
 // - Both leave an Artifact homed in one of `keepChannelIds` (a joint channel
-//   or projection, a migration receipt channel, what is under them): other
+//   or projection, a joint's storage channel, a migration receipt channel,
+//   what is under them): other
 //   servers still see it through the joint (platform/visibility
 //   seenThroughJoint), so it is neither counted nor deleted (the blob
 //   count stays the server's: a kept Artifact's blobs stay with it).
@@ -14,7 +15,7 @@
 //   already deleted). Everything of an Artifact goes with its item row by
 //   cascade: versions, their files and texts and publish checks, comments,
 //   drafts, reviews, audit rows, saves, read positions, subscriptions,
-//   notices, search rows. The bytes stay for the jobs that already collect
+//   notices, search rows, settled holds. The bytes stay for the jobs that already collect
 //   them: a blob no version uses goes in prune_artifact_blobs (blobs.ts), a
 //   check's screenshots in core's object-file sweep (a soft-deleted server's).
 //
@@ -33,10 +34,11 @@
 // - lets every core object file of the Artifact go (publish-check
 //   screenshots, comment images: deleteObjectFiles; their bytes after the
 //   commit, and core's sweep retries a failed one), forgets its people's
-//   Activity rows and its object events (platform/activity, platform/objects);
+//   Activity rows, its object events and its links to other Artifacts
+//   (platform/activity, platform/objects, platform/references);
 // - deletes the item row, and with it by cascade everything of it: versions,
 //   their files, texts and checks, comments, drafts, reviews, audit rows,
-//   saves, read positions, subscriptions, notices, its search row;
+//   saves, read positions, subscriptions, notices, settled holds, its search row;
 // - deletes the rows of its versions' blobs that no remaining version uses
 //   (blobs.ts deleteUnusedBlobsOf: bytes another of the server's Artifacts
 //   still has stay, as does one a publish holds right now);
@@ -59,6 +61,7 @@ import { getDb, type DatabaseExecutor } from "../../platform/db";
 import { isClosedServer } from "../../platform/flags";
 import { deleteObjectFileBytes, deleteObjectFiles } from "../../platform/objectFiles";
 import { forgetObjectEvents } from "../../platform/objects";
+import { deleteReferencesOfSource } from "../../platform/references";
 import { forgetArtifactActivity } from "./activity";
 import { deleteUnusedBlobsOf } from "./blobs";
 import type { ArtifactR2Store } from "./blobStore";
@@ -76,6 +79,7 @@ import {
   artifactReadPositions,
   artifactReviews,
   artifactSearch,
+  artifactSettledHolds,
   artifactSubscriptions,
   artifactVersionChecks,
   artifactVersionFiles,
@@ -100,7 +104,8 @@ export async function purgeArtifactsOfServer(serverId: ServerId, options: AppPur
     : and(
       eq(artifactItems.serverId, serverId),
       // IS NOT NULL first: a conversation home whose channel is gone (set null) is purgeable, not NULL.
-      not(and(eq(artifactItems.homeKind, "conversation"), isNotNull(artifactItems.homeChannelId), inArray(artifactItems.homeChannelId, [...keep]))!),
+      // One uuid[] parameter, however many channels are kept (a bind parameter each would meet Postgres's 65,535).
+      not(and(eq(artifactItems.homeKind, "conversation"), isNotNull(artifactItems.homeChannelId), sql`${artifactItems.homeChannelId} = ANY(${`{${keep.join(",")}}`}::uuid[])`)!),
     )!;
 
   if (options.mode === "count") {
@@ -148,6 +153,8 @@ export interface ArtifactPurgeCounts {
   attachmentSaves: number;
   pendingNotices: number;
   searchRows: number;
+  /** Who a held push told it was Settled (#334). */
+  settledHolds: number;
   /** Its versions' blobs no other Artifact's version uses: deleted, rows and objects. */
   blobsUnshared: number;
   blobBytesUnshared: number;
@@ -189,7 +196,8 @@ async function purgeCounts(executor: DatabaseExecutor, itemId: string): Promise<
       ${ofItem(artifactReadPositions)} AS read_positions,
       ${ofItem(artifactAttachmentSaves)} AS attachment_saves,
       ${ofItem(artifactPendingNotices)} AS pending_notices,
-      ${ofItem(artifactSearch)} AS search_rows`),
+      ${ofItem(artifactSearch)} AS search_rows,
+      ${ofItem(artifactSettledHolds)} AS settled_holds`),
     // Its versions' blobs, each shared or not: whether a version of another Artifact uses it too.
     executor.execute(sql`
       SELECT b.size_bytes AS size, EXISTS (
@@ -217,6 +225,7 @@ async function purgeCounts(executor: DatabaseExecutor, itemId: string): Promise<
     attachmentSaves: n("attachment_saves"),
     pendingNotices: n("pending_notices"),
     searchRows: n("search_rows"),
+    settledHolds: n("settled_holds"),
     blobsUnshared: unshared.length,
     blobBytesUnshared: unshared.reduce((total, blob) => total + Number(blob.size), 0),
     blobsShared: all.length - unshared.length,
@@ -275,6 +284,8 @@ export async function purgeArtifact(itemId: string, reason: string, store: Artif
     const files = await deleteObjectFiles({ object: artifactFileObject(locked.id), executor: tx });
     const activityRows = (await forgetArtifactActivity(tx, locked.id)).length;
     const events = await forgetObjectEvents(tx, { kind: ARTIFACT_OBJECT_KIND, objectId: locked.id });
+    // What it links to (core's object_references), which no cascade reaches.
+    await deleteReferencesOfSource(tx, ARTIFACT_OBJECT_KIND, locked.id);
     // Everything else of it goes with the row (cascade).
     await tx.delete(artifactItems).where(eq(artifactItems.id, locked.id));
     const blobs = await deleteUnusedBlobsOf(tx, locked.serverId, blobIds);

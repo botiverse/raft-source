@@ -236,7 +236,8 @@ export const integrationRegisterAppOperationSchema = lazySchema("integrationRegi
   type: z.literal("integration:register_app"),
   name: z.string().trim().min(1).max(120),
   clientKey: z.string().trim().min(1).max(120).optional(),
-  returnUrl: z.string().trim().min(1).max(2_000),
+  // Optional: an App without a redirect URL is token-only (nobody signs in to it).
+  returnUrl: z.string().trim().min(1).max(2_000).optional(),
   scopes: z.array(z.string().trim().min(1).max(120)).max(64).default([]),
   unsafeDemoUrlOverride: z.boolean().optional(),
   draftHint: draftHintSchema,
@@ -381,7 +382,8 @@ export const PLAN_UPGRADE_REASON_PLACEHOLDER_MESSAGE =
  * `general`). The server refuses to prepare it unless the server is on Free,
  * refuses it in a shared (joint) channel, answers a repeat for the same
  * conversation and gate within a day with that card, and otherwise refuses another one in a conversation that had an
- * agent's upgrade card lately (409 UPGRADE_CARD_COOLDOWN, 14 days).
+ * agent's upgrade card lately (409 UPGRADE_CARD_COOLDOWN, 14 days), then one for a gate an agent's card
+ * already offered anywhere on the server lately (409 UPGRADE_CARD_ALREADY_OFFERED, 7 days, naming that card).
  */
 export const planUpgradeOperationSchema = lazySchema("planUpgradeOperationSchema", () => z.strictObject({
   type: z.literal("plan:upgrade"),

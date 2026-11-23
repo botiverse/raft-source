@@ -28,10 +28,15 @@
 //   sandboxing CSP); files and the zip are attachments (a file `text/plain`
 //   for a text kind, else `application/octet-stream`; nosniff, a sandboxing
 //   CSP), so nothing renders or runs on the API's origin.
+// - For the signed-out page's links to other Artifacts (#proj-workspace:#336):
+//   `links`, the current version's links, each target `ok` (its title and
+//   kind) only when that target is itself one a visitor may view by the rule
+//   above, else `unavailable`: never `deleted`, nothing of an Artifact that
+//   isn't public.
 
 import { artifactLinkId } from "./artifactRef";
 import type { ArtifactId, ArtifactKind } from "./workspaceArtifacts";
-import type { ArtifactWebFrame } from "./webArtifactsContract";
+import type { ArtifactWebFrame, ArtifactWebLinks } from "./webArtifactsContract";
 
 const enc = encodeURIComponent;
 
@@ -84,8 +89,27 @@ export const artifactPublicPaths = {
    * link; the route reads both forms.
    */
   downloadZip: (id: ArtifactId) => `/api/public/artifacts/${enc(artifactLinkId(id))}/download.zip`,
+  /**
+   * GET → ArtifactPublicLinks: the current version's links to other
+   * Artifacts (at most ARTIFACT_CONTENT_LINKS_MAX), each target `ok` with
+   * its live title and kind only when the target is itself viewable here
+   * (public, live, published, its server's Artifacts on; a pinned version
+   * exists for a visitor only when it is that target's current one), else
+   * `unavailable`; `authorSees` true for each (what a visitor is shown is
+   * public). Its links not readable now: 503 CONTENT_UNAVAILABLE. 60 a
+   * minute per client address. A file named `links` at the version's root
+   * is read only at `file` (this route has its short form's address).
+   */
+  links: (id: ArtifactId) => `/api/public/artifacts/${enc(id)}/links`,
   /** GET → ArtifactPublicMeta: what a link preview of the page shows. 300 a minute per client address (the web's edge asks on every page view; never cached). */
   meta: (id: ArtifactId) => `/api/public/artifacts/${enc(id)}/meta`,
+  /**
+   * GET → 1200x630 PNG Open Graph preview image for a public Artifact (same
+   * visibility checks as view/meta; never names author or server; private,
+   * no-store). Uses the short id (artifactLinkId) like `markdown`/`file`/`downloadZip`
+   * because crawlers and link unfurlers fetch this URL directly from the page head.
+   */
+  ogImage: (id: ArtifactId) => `/api/public/artifacts/${enc(artifactLinkId(id))}/og-image.png`,
 } as const;
 
 /** The most `index.md` answers, header included (UTF-8 bytes). */
@@ -140,6 +164,12 @@ export interface ArtifactPublicView {
   version: { number: number; updatedAt: string };
   attribution: ArtifactPublicAttribution;
 }
+
+/**
+ * The `links` route's answer: the signed-in route's shape (ArtifactWebLinks),
+ * the current version's, and a target only ever `ok` or `unavailable`.
+ */
+export type ArtifactPublicLinks = ArtifactWebLinks;
 
 /** The frame route's answer: the same FrameLocation the signed-in viewer gets, always for the current version. */
 export type ArtifactPublicFrame = ArtifactWebFrame;

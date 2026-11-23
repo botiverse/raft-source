@@ -1,4 +1,5 @@
 import {
+  isBuiltInRuntimeConfigMissingProvider,
   isBuiltInRuntimeCustomModelPresetProviderId,
   PI_BUILTIN_PROVIDER_MODELS,
   type AgentCreateFormOptionSource,
@@ -67,8 +68,6 @@ export interface BuiltInModelCatalogValidation {
   supportedModelIds: ReadonlySet<string>;
   /** task #10: preset providers this Computer runs a typed model id for; empty on older Computers. */
   customModelProviderIds: ReadonlySet<string>;
-  /** Of those, the ones it also runs through a saved provider connection; empty on older Computers. */
-  customModelConnectionProviderIds: ReadonlySet<string>;
 }
 
 export type BuiltInCatalogRead = Omit<
@@ -79,66 +78,46 @@ export type BuiltInCatalogRead = Omit<
 /**
  * A Built-in selection the target Computer's catalog must vouch for, with the
  * preset provider it runs on: a preset model, or (task #10) a typed model on a
- * preset provider that takes one (OpenRouter, Qwen Token Plan, ...), chosen
- * directly; or such a typed model through a saved preset connection, whose
- * provider only the server knows (`connectionProviderId`, resolved by the
- * caller). An older Computer's parser rejects a direct typed model outright,
- * and one before saved-connection typed ids cannot run it through a
- * connection. A gateway (direct or saved) and a listed model through a saved
- * connection are not checked here.
+ * preset provider that takes one (OpenRouter, Qwen Token Plan, ...). An older
+ * Computer's parser rejects a typed model outright. A gateway is not checked
+ * here.
  */
 export interface BuiltInCatalogSelection {
   providerId: string;
   model: RuntimeModelConfig;
-  /** Through a saved connection (`customModelConnectionProviderIds` decides), not direct. */
-  viaConnection: boolean;
   /** Identity for "did the selection change" (builtInPresetSelectionChanged). */
   key: string;
 }
 
-export function builtInCatalogSelection(
-  config: RuntimeConfig,
-  connectionProviderId: string | null,
-): BuiltInCatalogSelection | null {
+export function builtInCatalogSelection(config: RuntimeConfig): BuiltInCatalogSelection | null {
   if (config.runtime !== "builtin") return null;
+  // A Built-in row that lost its provider (lenient hydration) has no provider
+  // to check a model against; reading it must not throw (a settings save that
+  // adds the provider compares against the stored config here).
+  if (isBuiltInRuntimeConfigMissingProvider(config)) return null;
   const { provider, model } = config;
   if (provider.kind === "preset") {
     if (model.kind !== "preset" && !isBuiltInRuntimeCustomModelPresetProviderId(provider.providerId)) return null;
     return {
       providerId: provider.providerId,
       model,
-      viaConnection: false,
       key: model.kind === "preset" ? `${provider.providerId}\0${model.id}` : `${provider.providerId}\0custom\0${model.name}`,
-    };
-  }
-  if (provider.kind === "connection" && model.kind === "custom" && connectionProviderId
-    && isBuiltInRuntimeCustomModelPresetProviderId(connectionProviderId)) {
-    return {
-      providerId: connectionProviderId,
-      model,
-      viaConnection: true,
-      key: `connection\0${provider.connectionId}\0custom\0${model.name}`,
     };
   }
   return null;
 }
 
-export function isBuiltInCatalogCheckedSelection(config: RuntimeConfig, connectionProviderId: string | null): boolean {
-  return builtInCatalogSelection(config, connectionProviderId) !== null;
+export function isBuiltInCatalogCheckedSelection(config: RuntimeConfig): boolean {
+  return builtInCatalogSelection(config) !== null;
 }
 
-/**
- * Revalidate only a newly selected preset identity, not profile/reasoning/key-only edits.
- * `connectionProviderId`: the next config's saved connection's provider (a
- * previous config bound to the same connection has the same one).
- */
+/** Revalidate only a newly selected preset identity, not profile/reasoning/key-only edits. */
 export function builtInPresetSelectionChanged(
   previous: RuntimeConfig,
   next: RuntimeConfig,
-  connectionProviderId: string | null,
 ): boolean {
-  const nextKey = builtInCatalogSelection(next, connectionProviderId)?.key ?? null;
-  return nextKey !== null && nextKey !== (builtInCatalogSelection(previous, connectionProviderId)?.key ?? null);
+  const nextKey = builtInCatalogSelection(next)?.key ?? null;
+  return nextKey !== null && nextKey !== (builtInCatalogSelection(previous)?.key ?? null);
 }
 
 function unavailable(
@@ -187,7 +166,6 @@ export function requireBuiltInCatalogCapability(
     catalogRuntimeVersion: catalog.runtimeVersion,
     supportedModelIds: new Set(outcome.value.models.map((model) => model.id)),
     customModelProviderIds: providerIdSet(catalog.customModelProviderIds),
-    customModelConnectionProviderIds: providerIdSet(catalog.customModelConnectionProviderIds),
   };
 }
 
@@ -195,15 +173,13 @@ function providerIdSet(ids: unknown): ReadonlySet<string> {
   return new Set(Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : []);
 }
 
-/** Validate only the closed Built-in preset namespace; gateways/connections are intentionally out of scope. */
+/** Validate only the closed Built-in preset namespace; gateways are intentionally out of scope. */
 export function assertBuiltInPresetSupportedByCatalog(
   config: RuntimeConfig,
   outcome: RuntimeModelSourceOutcome,
   target: BuiltInModelCatalogTarget,
-  /** A saved connection's provider (builtInCatalogSelection); null when the config has none. */
-  connectionProviderId: string | null,
 ): BuiltInModelCatalogValidation | null {
-  const selection = builtInCatalogSelection(config, connectionProviderId);
+  const selection = builtInCatalogSelection(config);
   if (!selection) return null;
 
   const requestedModel = selection.model.kind === "preset" ? selection.model.id : selection.model.name;
@@ -215,10 +191,9 @@ export function assertBuiltInPresetSupportedByCatalog(
   const { supportedModelIds } = catalog;
   if (selection.model.kind === "custom") {
     // task #10: only a Computer that says it runs a typed id on this provider
-    // (through a saved connection, when it comes through one) may get one; an
-    // older one would refuse the config, or fail to resolve the model, at start.
-    const runs = selection.viaConnection ? catalog.customModelConnectionProviderIds : catalog.customModelProviderIds;
-    if (!runs.has(selection.providerId)) {
+    // may get one; an older one would refuse the config, or fail to resolve
+    // the model, at start.
+    if (!catalog.customModelProviderIds.has(selection.providerId)) {
       // A listed model is stored as custom only for its limits
       // (normalizeBuiltInPresetCustomModel): the user did pick from the
       // list, so the way out is the limits, not another model.
@@ -259,7 +234,6 @@ export function assertBuiltInPresetSupportedByCatalog(
     catalogRuntimeVersion: catalog.catalogRuntimeVersion,
     supportedModelIds,
     customModelProviderIds: catalog.customModelProviderIds,
-    customModelConnectionProviderIds: catalog.customModelConnectionProviderIds,
   };
 }
 

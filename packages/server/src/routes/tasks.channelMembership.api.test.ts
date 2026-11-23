@@ -4,10 +4,13 @@ import assert from "node:assert/strict";
 
 import { getDb } from "../db/index";
 import { serverMembers, users } from "../db/schema";
-import { createChannel, addHuman } from "../services/channelService";
+import { randomUUID } from "node:crypto";
+import { createChannel, addHuman, getOrCreateThread } from "../services/channelService";
 import { createMessage } from "../services/messageService";
 import { createServer } from "../services/serverService";
 import * as taskService from "../services/taskService";
+import { ensureTaskConversation } from "../services/taskConversationService";
+import { enableTaskV2ConversationsForServer } from "../test/integration/taskV2Flag";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
@@ -130,6 +133,60 @@ test("private channel tasks are not readable by server humans outside the channe
     body: JSON.stringify({ messageId: privateMessage.id }),
   });
   assert.equal(convertRes.status, 404, `expected convert 404, got ${convertRes.status}`);
+});
+
+test("create and convert answer a private channel, its thread or task conversation, or a message in it, exactly like a missing one", async ({ app }) => {
+  const db = getDb();
+  const owner = await seedUser("hidden-create-owner@slock.test", "hidden-create-owner");
+  const member = await seedUser("hidden-create-member@slock.test", "hidden-create-member");
+  const outsider = await seedUser("hidden-create-outsider@slock.test", "hidden-create-outsider");
+  const server = await createServer("Hidden Create Contract", "hidden-create-contract", owner.id);
+  await db.insert(serverMembers).values([
+    { serverId: server.id, userId: member.id, role: "member" },
+    { serverId: server.id, userId: outsider.id, role: "member" },
+  ]).onConflictDoNothing();
+  await enableTaskV2ConversationsForServer(server.id);
+  const channel = await createChannel(server.id, "hidden-create", undefined, "private");
+  await addHuman(channel.id, owner.id);
+  await addHuman(channel.id, member.id);
+  const parent = await createMessage(channel.id, "user", member.id, "a thread starts here");
+  const thread = await getOrCreateThread(parent.id, member.id, "user");
+  const { tasks: [task] } = await taskService.createTasks(channel.id, "user", member.id, [{ title: "hidden task" }], { initiatingServerId: server.id });
+  const conversation = (await ensureTaskConversation(task.id, { initiatingServerId: server.id }))!.conversation;
+  const message = await createMessage(channel.id, "user", member.id, "hidden convert target");
+
+  const memberHeaders = authHeaders(await tokenForHuman(member.email), server.id);
+  const headers = authHeaders(await tokenForHuman(outsider.email), server.id);
+  const create = (channelId: string, as = headers) => fetch(`${app.baseUrl}/api/tasks/channel/${channelId}`, {
+    method: "POST",
+    headers: as,
+    body: JSON.stringify({ tasks: [{ title: "should not create" }] }),
+  });
+  const convert = (messageId: string, as = headers) => fetch(`${app.baseUrl}/api/tasks/convert-message`, {
+    method: "POST",
+    headers: as,
+    body: JSON.stringify({ messageId }),
+  });
+  const answer = async (res: Response) => ({ status: res.status, body: await res.text() });
+
+  const missingCreate = await answer(await create(randomUUID()));
+  assert.equal(missingCreate.status, 404);
+  for (const [what, id] of [["private channel", channel.id], ["thread", thread.id], ["task conversation", conversation.canonicalChannelId]] as const) {
+    assert.deepEqual(await answer(await create(id)), missingCreate, `create in a hidden ${what} answers like a missing channel`);
+  }
+  // A member who can read them still gets the thread refusal.
+  assert.equal((await create(thread.id, memberHeaders)).status, 409);
+  assert.equal((await create(conversation.canonicalChannelId, memberHeaders)).status, 409);
+
+  const missingConvert = await answer(await convert(randomUUID()));
+  assert.equal(missingConvert.status, 404);
+  assert.deepEqual(await answer(await convert(message.id)), missingConvert, "convert of a hidden message answers like a missing one");
+  const conversationMessage = await createMessage(conversation.canonicalChannelId, "user", member.id, "said in the task's conversation");
+  assert.deepEqual(await answer(await convert(conversationMessage.id)), missingConvert, "convert of a message in a hidden task conversation answers like a missing one");
+  // A member who can read it gets the thread refusal, not a 500.
+  assert.equal((await convert(conversationMessage.id, memberHeaders)).status, 409);
+
+  assert.equal((await taskService.listTasks(channel.id)).length, 1, "nothing was created");
 });
 
 test("GET /api/tasks/channel/:id validates the ?status filter", async ({ app }) => {

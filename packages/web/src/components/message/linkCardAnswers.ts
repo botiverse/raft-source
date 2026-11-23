@@ -28,11 +28,13 @@ export function readAppLinkPreviewAnswer(data: unknown): AppLinkResults {
   const previews = appLinkPreviewListResponseSchema.safeParse(data);
   if (previews.success) {
     const icons = previews.data.appIcons ?? {};
+    const objectKeys = previews.data.objectKeys ?? {};
     for (const preview of previews.data.previews) {
       const key = appLinkResultKey(preview.url);
       if (!key || results.has(key)) continue;
       const icon = Object.hasOwn(icons, preview.url) ? icons[preview.url] ?? null : null;
-      results.set(key, { kind: "card", url: key, app: { name: preview.appName, icon }, title: preview.title, card: preview.card });
+      const objectKey = Object.hasOwn(objectKeys, preview.url) ? objectKeys[preview.url] : undefined;
+      results.set(key, { kind: "card", url: key, app: { name: preview.appName, icon }, title: preview.title, card: preview.card, ...(objectKey ? { objectKey } : {}) });
     }
   }
   return withPrompts(results, data);
@@ -100,10 +102,12 @@ export function readLinkCardAnswer(items: LinkCardReadAnswerItem[], data: unknow
     if (!key || results.has(key) || later.has(key)) continue;
     if (item.kind === "rate_limited") { later.set(key, item.retry_after); continue; }
     const app = { name: item.app.name, icon: item.app.icon };
-    if (item.kind === "v1") { results.set(key, { kind: "card", url: key, app, title: item.preview.title, card: item.preview.card }); continue; }
+    // The object the card shows (`card.changed.v1`): a link_card.changed nudge naming it reads the card again.
+    const objectKey = item.object_key_sha256 ? { objectKey: item.object_key_sha256 } : {};
+    if (item.kind === "v1") { results.set(key, { kind: "card", url: key, app, title: item.preview.title, card: item.preview.card, ...objectKey }); continue; }
     // v2 and v3 (linkCardItems.ts): a card, a connect_account chip, or (v3) a chip with no card.
     const result = appLinkResultOfItem(item, key, item.app.reviewed === false ? { ...app, reviewed: false } : app);
-    if (result) results.set(key, result);
+    if (result) results.set(key, result.kind === "card" ? { ...result, ...objectKey } : result);
   }
   if (!later.size) return { results: withPrompts(results, data), retry: null };
   const backoffMs = rateLimitedBackoffMs([...later.values()]);

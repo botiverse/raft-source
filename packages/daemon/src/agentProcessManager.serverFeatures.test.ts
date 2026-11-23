@@ -881,9 +881,13 @@ test("View Context reads an agent on another host, while it runs and after its s
       const index = path.join(slockHome, "agent-context", "srv_cv", "agent-hosted", "index.jsonl");
       await waitFor(() => existsSync(index), "index line under the agent's server");
 
-      // A new connection reports it again, as a running agent.
+      // A new connection reports it again, as a running agent. The first index
+      // line may report too (`first_index`, around the ready's clear), so the
+      // count of reports is not fixed: wait for the ready's own report.
+      const readyReported = () => ctx.events.some((event) => event.name === "daemon.agent_context_view.availability" && event.attrs.trigger === "ready");
       ctx.manager.reportAgentContextViewAvailability("ready");
-      await waitFor(() => availability(ctx).length === 2, "availability after a ready");
+      await waitFor(readyReported, "availability after a ready");
+      assert.equal((availability(ctx).at(-1) as { supported?: boolean }).supported, true);
 
       // Its session ended: its message can still be viewed.
       running.clear();

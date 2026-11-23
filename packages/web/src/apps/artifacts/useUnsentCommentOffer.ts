@@ -6,6 +6,7 @@ import type { AnnotationRect } from "@botiverse/porthole";
 import type { ArtifactCommentTarget } from "./ArtifactCommentsContext";
 import { isShellAnchor } from "./artifactComments";
 import { newestUnsentComment, useArtifactLocalDraftScope } from "./artifactLocalDrafts";
+import { useOwnerTimers } from "../../utils/ownerDocument";
 
 /** How long an unsent comment waits at most for its lines or rows to be drawn: then the list's foot. */
 export const UNSENT_REOPEN_CAP_MS = 10_000;
@@ -41,7 +42,7 @@ export function useUnsentCommentOffer({ id, kind, shownPath, canComment, held, o
   shownPath: string | null;
   canComment: boolean;
   held: boolean;
-  openCard: (target: ArtifactCommentTarget, rect: AnnotationRect) => void;
+  openCard: (target: ArtifactCommentTarget, rect: AnnotationRect, anchorEl?: Element | null) => void;
   /** The provider's own list state (set while it renders, as React's "adjusting state"). */
   openList: (open: boolean) => void;
 }) {
@@ -60,11 +61,11 @@ export function useUnsentCommentOffer({ id, kind, shownPath, canComment, held, o
     if (unsent && !inShell) openList(true);
   }
   const current = offer?.id === id ? offer : null;
-  const reopenUnsent = useCallback((rect: AnnotationRect | null) => {
+  const reopenUnsent = useCallback((rect: AnnotationRect | null, anchorEl?: Element | null) => {
     if (current?.at !== "shell") return;
     if (rect) {
       setOffer(null);
-      openCard(current.target, rect);
+      openCard(current.target, rect, anchorEl);
       return;
     }
     setOffer({ ...current, at: "list" });
@@ -74,11 +75,12 @@ export function useUnsentCommentOffer({ id, kind, shownPath, canComment, held, o
   const reopenRef = useRef(reopenUnsent);
   reopenRef.current = reopenUnsent;
   const waits = current?.at === "shell";
+  const timers = useOwnerTimers();
   useEffect(() => {
     if (!waits) return;
-    const timer = window.setTimeout(() => reopenRef.current(null), UNSENT_REOPEN_CAP_MS);
-    return () => window.clearTimeout(timer);
-  }, [waits]);
+    const timer = timers.setTimeout(() => reopenRef.current(null), UNSENT_REOPEN_CAP_MS);
+    return () => timers.clearTimeout(timer);
+  }, [waits, timers]);
   return {
     unsentAt: current?.at === "shell" ? current.target : null,
     reopenUnsent,

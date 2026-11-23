@@ -6,14 +6,12 @@
 // what `default` inherits is computed with the shared resolver, so the label
 // says exactly what the server's policy will apply.
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, ReactElement, ReactNode } from "react";
-import { createPortal } from "react-dom";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactElement, ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { Bell, BellMinus, BellRing, Check, ChevronRight } from "lucide-react";
 import {
   ContextMenuLabel,
-  ContextMenuPopup,
   Select,
   ScrollArea,
   SelectContent,
@@ -38,8 +36,9 @@ import {
   useNotificationSettingsStore,
   useServerNotificationLevel,
 } from "../../store/notificationSettingsStore";
+import { AnchoredMenuPopover } from "../ui/AnchoredMenuPopover";
+import { TRIGGER_MENU_COLLISION_AVOIDANCE } from "../ui/useAnchorHiddenClose";
 import MenuItem from "../ui/MenuItem";
-import { placeSidebarContextSubmenu } from "../layout/sidebarContextMenuPosition";
 
 export const NOTIFICATION_LEVEL_LABEL_ID: Record<NotificationLevel, MessageId> = {
   all: "notifications.level.all",
@@ -164,16 +163,6 @@ function useLevelNotes(model: Pick<NotificationLevelModel, "muted">): string[] {
   return model.muted ? [formatMessage({ id: "notifications.level.muteNote" })] : [];
 }
 
-export function NotificationLevelNotes({ model, className = "" }: { model: Pick<NotificationLevelModel, "muted">; className?: string }) {
-  const notes = useLevelNotes(model);
-  if (notes.length === 0) return null;
-  return (
-    <div className={`stack-y-1 text-footnote text-foreground-muted ${className}`} data-testid="notification-level-notes">
-      {notes.map((note) => <p key={note}>{note}</p>)}
-    </div>
-  );
-}
-
 /**
  * The level's icon. "Nothing" is BellMinus, not BellOff: BellOff means the
  * Activity mute (icon audit v7), which is shown separately from the level.
@@ -190,20 +179,22 @@ export function levelIcon(level: NotificationLevel, size = 14): ReactElement {
 
 export function NotificationLevelSelect({
   target,
-  className = "w-full max-w-sm",
-  fit = false,
+  className = "@max-lg:w-full @max-lg:max-w-sm",
+  fit = true,
   disabled = false,
-  showNotes = true,
   "aria-label": ariaLabel,
   "aria-labelledby": ariaLabelledBy,
   testId,
 }: {
   target: NotificationLevelTarget;
   className?: string;
-  /** raft-ui's `SelectTrigger fit`: as wide as the longest level, for a select at a settings row's end. */
+  /**
+   * raft-ui's `SelectTrigger fit`: as wide as the longest level. The defaults are a select at a settings
+   * row's end, under the row's text while its `@container` group is narrow. What Mute means goes in the
+   * row's text (DS Forms, "A setting's row"), so the select shows no note of its own.
+   */
   fit?: boolean;
   disabled?: boolean;
-  showNotes?: boolean;
   "aria-label"?: string;
   "aria-labelledby"?: string;
   testId?: string;
@@ -216,25 +207,22 @@ export function NotificationLevelSelect({
     void model.set(next).finally(() => setBusy(false));
   }, [model]);
   return (
-    <div className="stack-y-1.5">
-      <Select value={model.value} onValueChange={handleChange} disabled={disabled || busy} items={model.options}>
-        <SelectTrigger fit={fit} className={className} aria-label={ariaLabel} aria-labelledby={ariaLabelledBy} data-testid={testId}>
-          <SelectValue />
-          <SelectIcon />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectList>
-            {model.options.map((option) => (
-              <SelectItem key={option.value} value={option.value} data-testid={testId ? `${testId}-${option.value}` : undefined}>
-                <SelectItemText>{option.label}</SelectItemText>
-                <SelectItemIndicator />
-              </SelectItem>
-            ))}
-          </SelectList>
-        </SelectContent>
-      </Select>
-      {showNotes && <NotificationLevelNotes model={model} />}
-    </div>
+    <Select value={model.value} onValueChange={handleChange} disabled={disabled || busy} items={model.options}>
+      <SelectTrigger fit={fit} className={className} aria-label={ariaLabel} aria-labelledby={ariaLabelledBy} data-testid={testId}>
+        <SelectValue />
+        <SelectIcon />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectList>
+          {model.options.map((option) => (
+            <SelectItem key={option.value} value={option.value} data-testid={testId ? `${testId}-${option.value}` : undefined}>
+              <SelectItemText>{option.label}</SelectItemText>
+              <SelectItemIndicator />
+            </SelectItem>
+          ))}
+        </SelectList>
+      </SelectContent>
+    </Select>
   );
 }
 
@@ -259,31 +247,12 @@ export function NotificationLevelSubmenu({
   const model = useNotificationLevelModel(target);
   const notes = useLevelNotes(model);
   const [open, setOpen] = useState(false);
-  const [position, setPosition] = useState<{ x: number; y: number } | null>(null);
   const triggerRef = useRef<HTMLDivElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const label = formatMessage({ id: "notifications.level.menuLabel" });
 
   const openMenu = useCallback(() => setOpen(true), []);
-
-  useLayoutEffect(() => {
-    if (!open) {
-      setPosition(null);
-      return;
-    }
-    const trigger = triggerRef.current;
-    const menu = menuRef.current;
-    if (!trigger || !menu) return;
-    const triggerRect = trigger.getBoundingClientRect();
-    const menuRect = menu.getBoundingClientRect();
-    setPosition(placeSidebarContextSubmenu({
-      anchor: { left: triggerRect.left, right: triggerRect.right, top: triggerRect.top },
-      menuWidth: menuRect.width,
-      menuHeight: menuRect.height,
-      viewportWidth: window.innerWidth,
-      viewportHeight: window.innerHeight,
-    }));
-  }, [open]);
+  const closeMenu = useCallback(() => setOpen(false), []);
 
   // Another row of the parent menu hovered or focused: close, like Move to section ▸.
   useEffect(() => {
@@ -302,12 +271,6 @@ export function NotificationLevelSubmenu({
       document.removeEventListener("focusin", closeFrom);
     };
   }, [open]);
-
-  const menuStyle = useMemo<CSSProperties>(() => ({
-    left: position?.x ?? 0,
-    top: position?.y ?? 0,
-    visibility: position ? "visible" : "hidden",
-  }), [position]);
 
   const choose = useCallback((choice: NotificationLevelChoice) => {
     if (choice !== model.value) void model.set(choice);
@@ -330,13 +293,19 @@ export function NotificationLevelSubmenu({
           {label}
         </MenuItem>
       </div>
-      {open && createPortal(
-        <ContextMenuPopup
+      {open && (
+        <AnchoredMenuPopover
+          open
           ref={menuRef}
+          anchor={triggerRef}
+          side="right"
+          align="start"
+          sideOffset={4}
+          collisionAvoidance={TRIGGER_MENU_COLLISION_AVOIDANCE}
+          onAnchorHidden={closeMenu}
           role="menu"
           aria-label={label}
-          className="fixed z-popup max-h-[calc(100vh-16px)] w-72 select-none p-0"
-          style={menuStyle}
+          className="w-72 p-0"
           onMouseDown={stopPropagation}
           onTouchStart={stopPropagation}
           data-testid="sidebar-ctx-notification-level-menu"
@@ -351,8 +320,7 @@ export function NotificationLevelSubmenu({
               <ContextMenuLabel key={note} className="whitespace-normal font-normal text-foreground-muted">{note}</ContextMenuLabel>
             ))}
           </ScrollArea>
-        </ContextMenuPopup>,
-        document.body,
+        </AnchoredMenuPopover>
       )}
     </>
   );

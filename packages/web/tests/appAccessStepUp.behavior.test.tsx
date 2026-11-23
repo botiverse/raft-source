@@ -32,6 +32,7 @@ import { useAuthStore } from "../src/store/authStore";
 import { resetServerFeatureFlagsForTests } from "../src/store/serverFeatureFlags";
 import { useServerStore } from "../src/store/serverStore";
 import type { Server } from "../src/store/serverStore";
+import { openOwnAppEditor } from "./helpers/appsYours";
 import { TestIntlProvider } from "./helpers/intl";
 import { serveMarketplaceListingsFromAppRecords } from "./helpers/marketplaceListings";
 import { chooseRegisterAppMenuItem } from "./helpers/registerAppMenu";
@@ -372,9 +373,8 @@ async function confirmRegenerate() {
       <SecondFactorStepUpHost />
     </TestIntlProvider>,
   );
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-my-apps"));
-  const myAppsTab = await screen.findByTestId("connected-apps-my-apps-tab");
-  fireEvent.click(within(myAppsTab).getByRole("button", { name: "Edit" }));
+  // Yours' card of the App built here opens its editor (the card has no Edit button).
+  await openOwnAppEditor();
   fireEvent.click(await screen.findByTestId("connected-app-regenerate-secret-button"));
   fireEvent.click(await screen.findByTestId("connected-app-regenerate-secret-confirm-button"));
 }
@@ -570,14 +570,14 @@ function detailDialog(): HTMLElement | null {
   return document.getElementById("connected-app-detail-title")?.closest<HTMLElement>('[data-slot="dialog-content"]') ?? null;
 }
 
-async function clickInstallToServer() {
+async function clickDetailAdd() {
   renderIntegrations();
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-marketplace"));
-  fireEvent.click(await screen.findByText("Orbital Notes"));
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-discover"));
+  fireEvent.click(await screen.findByRole("button", { name: "Orbital Notes" }));
   await waitFor(() => assert.ok(detailDialog() !== null));
   const detail = detailDialog();
   if (!detail) throw new Error("no app detail");
-  await clickWhenEnabled(within(detail).getByRole("button", { name: "Install to this server" }));
+  await clickWhenEnabled(within(detail).getByRole("button", { name: "Add Orbital Notes" }));
 }
 
 test("installing a Marketplace app asks for the second step, then installs once more", async () => {
@@ -586,7 +586,7 @@ test("installing a Marketplace app asks for the second step, then installs once 
     [MARKETPLACE_INSTALL_URL]: [fail(stepUpRequired()), () => ({})],
     [STEP_UP_URL]: [() => ({ verified: true })],
   });
-  await clickInstallToServer();
+  await clickDetailAdd();
 
   const dialog = await findVerifyDialog();
   assert.ok(dialog.textContent?.includes(APP_ACCESS_DESCRIPTION));
@@ -602,19 +602,19 @@ test("installing a Marketplace app asks for the second step, then installs once 
   assert.equal(bodyText().includes(REFUSAL), false);
 });
 
-test("closing the dialog on Install to This Server installs nothing and reports nothing", async () => {
+test("closing the dialog on the detail's Add installs nothing and reports nothing", async () => {
   stubMarketplaceGets({ "/integrations/marketplace": () => [marketplaceListing()] });
   const calls = stubPosts({ [MARKETPLACE_INSTALL_URL]: [fail(stepUpRequired())] });
-  await clickInstallToServer();
+  await clickDetailAdd();
 
   await cancelDialog(await findVerifyDialog());
 
   assert.equal(bodyText().includes(REFUSAL), false);
   assert.equal(bodyText().includes(INSTALL_FAILED), false);
-  // The detail stays open and its Install is usable again (not stuck saving).
+  // The detail stays open and its Add is usable again (not stuck saving).
   const detail = detailDialog();
   if (!detail) throw new Error("the app detail closed");
-  const install = within(detail).getByRole("button", { name: "Install to this server" });
+  const install = within(detail).getByRole("button", { name: "Add Orbital Notes" });
   await waitFor(() => assert.equal(install.hasAttribute("disabled"), false));
   assert.deepEqual(calls.map((call) => call.url), [MARKETPLACE_INSTALL_URL]);
 });
@@ -646,8 +646,8 @@ async function clickApproveUpdate(grant: Handler[]) {
   }) as typeof api.post;
 
   renderIntegrations();
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-installed"));
-  const installedTab = await screen.findByTestId("connected-apps-installed-tab");
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-yours"));
+  const installedTab = await screen.findByTestId("connected-apps-yours-tab");
   fireEvent.click(within(installedTab).getByRole("button", { name: "Orbital Notes" }));
   const banner = await screen.findByTestId("app-notifications-approval-required");
   await clickWhenEnabled(within(banner).getByRole("button", { name: "Approve update" }));
@@ -802,7 +802,7 @@ async function clickAddBot(bot: () => BotOffer) {
     "/mcp/apps": () => ({ apps: [] }),
   });
   renderIntegrations();
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-installed"));
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-yours"));
   const row = await screen.findByTestId("connected-app-item-stamp-app");
   fireEvent.click(within(row).getByRole("button", { name: "Stamp" }));
   const section = await screen.findByTestId("connected-app-bot-section");

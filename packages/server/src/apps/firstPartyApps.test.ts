@@ -5,10 +5,10 @@
 // recipients), and AgentMessage.app_event.
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { appAgentApiRoutesOf, asServerId, firstPartyAppAgentApis, type ArtifactAgentNotice, type ReactionAgentNotice } from "@botiverse/raft-shared";
 import type { Database } from "../db/index";
-import { agents, objectEventRecipients, objectEvents, thirdPartyAgentEvents } from "../db/schema";
+import { agents, objectEventRecipients, objectEvents, objectInboxStates, thirdPartyAgentEvents } from "../db/schema";
 import type { AppObjectKind, FirstPartyApp } from "../platform/apps";
 import { mountFirstPartyAppInternals, mountFirstPartyAppWebApis } from "../routes/firstPartyAppRoutes";
 import {
@@ -75,7 +75,7 @@ test("the registry lists Artifacts, and its object kind and events; every app's 
   assert.equal(firstPartyAppOfSystemApp("system.assistant"), undefined);
   const artifact = registeredObjectKind("artifact");
   assert.equal(artifact?.app.id, "artifacts");
-  assert.deepEqual(artifact?.objectKind.events, ["version", "comment", "comment_edited", "comment_deleted", "renamed", "moved", "deleted", "review", "comment_resolved", "comment_reopened"]);
+  assert.deepEqual(artifact?.objectKind.events, ["version", "comment", "comment_edited", "comment_deleted", "renamed", "moved", "deleted", "review", "comment_resolved", "comment_reopened", "settled", "unsettled"]);
   assert.deepEqual(artifact?.objectKind.objectTables, ["items", "versions", "comments"]);
   assert.equal(registeredObjectKind("message"), undefined);
 });
@@ -116,7 +116,7 @@ test("mounting: each app's agent API, web API and internal routes where the regi
   // Account routes (no server scoping) only where an app declares one: Artifacts' `GET /:id/open`.
   assert.deepEqual(web.accountRouters.map((entry) => entry.path), ["/api/artifacts"]);
   assert.ok(limits.every((key) => firstPartyApps().some((entry) => key.startsWith(`${entry.id}.`))), limits.join(", "));
-  assert.deepEqual(limits.filter((key) => key.startsWith("artifacts.")).sort(), ["artifacts.attachmentSaves", "artifacts.commentImages", "artifacts.dashboard", "artifacts.downloadZip", "artifacts.frame", "artifacts.homeChange", "artifacts.locate", "artifacts.mentionCandidates", "artifacts.shareAudience", "artifacts.write"]);
+  assert.deepEqual(limits.filter((key) => key.startsWith("artifacts.")).sort(), ["artifacts.attachmentSaves", "artifacts.backlinks", "artifacts.commentImages", "artifacts.dashboard", "artifacts.downloadZip", "artifacts.frame", "artifacts.homeChange", "artifacts.links", "artifacts.locate", "artifacts.mentionCandidates", "artifacts.shareAudience", "artifacts.write"]);
   const internals = mountFirstPartyAppInternals().map((entry) => entry.path);
   assert.ok(internals.includes("/internal/artifacts-content"));
   // The publish check Worker's lease and result (task #130), behind a token of its own.
@@ -169,6 +169,8 @@ test("write budgets: every app agent API route but a GET spends core's agent wri
     artifactReview: "artifactWrites",
     artifactCommentResolve: "artifactWrites",
     artifactCommentReopen: "artifactWrites",
+    artifactSettle: "artifactWrites",
+    artifactUnsettle: "artifactWrites",
     artifactSubscribe: "artifactWrites",
     artifactUnsubscribe: "artifactWrites",
     artifactMove: "artifactWrites",
@@ -283,7 +285,7 @@ test("recordObjectEvent: only registered kinds and events, nothing written other
   assert.equal((await db.select().from(objectEvents).where(eq(objectEvents.objectId, objectId))).length, 0);
   // Every registered event of the kind goes in, the declared-only ones too.
   for (const eventKind of registeredObjectKind("artifact")!.objectKind.events) await recordObjectEvent(db, input({ eventKind }));
-  assert.equal((await db.select().from(objectEvents).where(eq(objectEvents.objectId, objectId))).length, 10);
+  assert.equal((await db.select().from(objectEvents).where(eq(objectEvents.objectId, objectId))).length, 12);
 });
 
 test("recordObjectEvent: the home and the recipients, one row each with its strongest reason, the actor left out, in the caller's transaction", async ({ db, seed }) => {
@@ -333,4 +335,44 @@ test("recordObjectEvent: the home and the recipients, one row each with its stro
   // Recipients go with their event.
   await db.delete(objectEvents).where(eq(objectEvents.id, recorded.id));
   assert.equal((await db.select().from(objectEventRecipients).where(eq(objectEventRecipients.eventId, recorded.id))).length, 0);
+});
+
+test("recordObjectEvent: a recipient marked read gets the event on its Activity row without an unread; a row unread before stays unread, a Done one stays Done", async ({ db, seed }) => {
+  const { serverId, agentId } = await seedAgent(db, seed);
+  const objectId = `pt_${randomUUID()}`;
+  const [unreadUser, readUser, doneUser, newUser, twiceUser] = [randomUUID(), randomUUID(), randomUUID(), randomUUID(), randomUUID()];
+  const base: ObjectEventInput = {
+    serverId: asServerId(serverId), kind: "artifact", objectId, eventKind: "comment", home: { kind: "public" },
+    actor: { type: "agent", id: agentId }, data: { position: 1 }, recipients: [],
+  };
+  const following = (id: string) => ({ actor: { type: "user" as const, id }, reason: "following" as const });
+  await recordObjectEvent(db, { ...base, recipients: [unreadUser, readUser, doneUser, twiceUser].map(following) });
+  const rowOf = async (userId: string) => (await db.select().from(objectInboxStates).where(and(eq(objectInboxStates.userId, userId), eq(objectInboxStates.objectId, objectId))))[0]!;
+  const first = await rowOf(readUser);
+  await db.update(objectInboxStates).set({ readThroughSeq: first.lastEventSeq }).where(and(eq(objectInboxStates.userId, readUser), eq(objectInboxStates.objectId, objectId)));
+  await db.update(objectInboxStates).set({ doneThroughSeq: first.lastEventSeq, doneAt: new Date() }).where(and(eq(objectInboxStates.userId, doneUser), eq(objectInboxStates.objectId, objectId)));
+  await db.update(objectInboxStates).set({ readThroughSeq: first.lastEventSeq }).where(and(eq(objectInboxStates.userId, twiceUser), eq(objectInboxStates.objectId, objectId)));
+
+  const settled = await recordObjectEvent(db, {
+    ...base,
+    eventKind: "settled",
+    data: { position: 1, version: 1 },
+    recipients: [
+      ...[unreadUser, readUser, doneUser, newUser].map((id) => ({ ...following(id), read: true as const })),
+      // Listed twice, once not read: the event is unread for it.
+      { ...following(twiceUser), read: true as const },
+      { actor: { type: "user", id: twiceUser }, reason: "mentioned" },
+    ],
+  });
+  const unread = (row: Awaited<ReturnType<typeof rowOf>>) => row.lastEventSeq > Math.max(row.doneThroughSeq ?? 0, row.readThroughSeq ?? 0);
+  for (const userId of [unreadUser, readUser, doneUser, newUser, twiceUser]) assert.equal((await rowOf(userId)).lastEventSeq, settled.seq, "every row moves to the event");
+  assert.equal(unread(await rowOf(unreadUser)), true, "unread before: still unread");
+  assert.equal((await rowOf(readUser)).readThroughSeq, settled.seq, "read before: read through the event");
+  const done = await rowOf(doneUser);
+  assert.deepEqual([done.doneThroughSeq, unread(done)], [settled.seq, false], "Done before: still Done");
+  assert.equal((await rowOf(newUser)).readThroughSeq, settled.seq, "a new row starts read");
+  assert.equal(unread(await rowOf(twiceUser)), true);
+  // The recipient rows themselves say nothing of it: one per recipient, its strongest reason.
+  const recipients = await db.select().from(objectEventRecipients).where(eq(objectEventRecipients.eventId, settled.id));
+  assert.equal(recipients.length, 5);
 });

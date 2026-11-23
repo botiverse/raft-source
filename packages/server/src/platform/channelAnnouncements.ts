@@ -22,4 +22,4 @@
 // answer as for no announcement.
 //
 // Channels, their rosters, joints and the flag are core's.
-export { channelAnnouncementAudience, channelAnnouncementPushRefusal, clearChannelAnnouncementsOf } from "../services/channelAnnouncements";
+export { channelAnnouncementAudience, channelAnnouncementPushRefusal, clearChannelAnnouncementsOf, type ChannelAnnouncementPushRefusal } from "../services/channelAnnouncements";

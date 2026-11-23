@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { __embedTestInternals, __setEmbedModeForTests, markHostToolbarDrawn, needsEmbedRepair, readHostDesktop, withEmbedParams } from "../src/embed";
+import { __embedTestInternals, __setEmbedModeForTests, hostConversationId, markHostToolbarDrawn, needsEmbedRepair, readHostDesktop, withEmbedParams } from "../src/embed";
 
 const { parseEmbedMode } = __embedTestInternals;
 
@@ -84,6 +84,7 @@ test("hostMenu with the host shell: the App's own items for the page's ⋯, know
   assert.deepEqual(parseEmbedMode("?embed=raft-settings-v1&shell=host&hostMenu=desktop-mode,open-in-browser").hostMenu, ["desktop-mode", "open-in-browser"]);
   assert.deepEqual(parseEmbedMode("?embed=raft-settings-v1&shell=host&hostMenu=open-in-browser,desktop-mode").hostMenu, ["open-in-browser", "desktop-mode"], "the App's order");
   assert.deepEqual(parseEmbedMode("?embed=raft-settings-v1&shell=host&hostMenu=print,desktop-mode,desktop-mode").hostMenu, ["desktop-mode"], "an unknown name dropped, a repeat once");
+  assert.deepEqual(parseEmbedMode("?embed=raft-settings-v1&shell=host&hostMenu=desktop-mode,open-in-browser,copy-link").hostMenu, ["desktop-mode", "open-in-browser", "copy-link"], "copy-link: the App copies the link");
   assert.equal(parseEmbedMode("?embed=raft-settings-v1&shell=host&hostMenu=print").hostMenu, undefined, "none known: none");
   assert.equal(parseEmbedMode("?embed=raft-settings-v1&shell=host&hostMenu=").hostMenu, undefined);
   assert.equal(parseEmbedMode("?embed=raft-settings-v1&shell=web&hostMenu=desktop-mode").hostMenu, undefined, "only with the host shell");
@@ -112,6 +113,34 @@ test("the keeper keeps the one bar: hostToolbar=1 once drawn, the App's hostMenu
     assert.equal(withEmbedParams(new URLSearchParams(`${entry.replace("hostDesktop=on", "hostDesktop=off")}&hostToolbar=1`)).get("hostDesktop"), "off");
   } finally {
     restore();
+    __embedTestInternals.reset();
+  }
+});
+
+test("hostConversation with the host shell: the conversation the App opened the Artifact from, an id's characters only (#proj-workspace:#309)", () => {
+  const id = "0b6d3c1e-9a2f-4c7e-8d11-2f3a4b5c6d7e";
+  assert.equal(parseEmbedMode(`?embed=raft-settings-v1&shell=host&hostConversation=${id}`).hostConversation, id);
+  assert.equal(parseEmbedMode("?embed=raft-settings-v1&shell=host&hostConversation=").hostConversation, undefined);
+  assert.equal(parseEmbedMode("?embed=raft-settings-v1&shell=host&hostConversation=a%2Fb").hostConversation, undefined, "not an id: ignored");
+  assert.equal(parseEmbedMode(`?embed=raft-settings-v1&shell=host&hostConversation=${"a".repeat(65)}`).hostConversation, undefined, "too long: ignored");
+  assert.equal(parseEmbedMode(`?embed=raft-settings-v1&shell=web&hostConversation=${id}`).hostConversation, undefined, "only with the host shell");
+  __embedTestInternals.reset();
+  const restore = __setEmbedModeForTests({ embedded: true, shell: "host", hostConversation: id });
+  try {
+    assert.equal(hostConversationId(), id);
+    // Picking another Artifact is a new address without the query: the keeper puts it back with the rest.
+    assert.equal(needsEmbedRepair(`?embed=raft-settings-v1&shell=host&hostConversation=${id}`), false);
+    assert.equal(needsEmbedRepair("?embed=raft-settings-v1&shell=host"), true);
+    assert.equal(withEmbedParams(new URLSearchParams("")).get("hostConversation"), id);
+  } finally {
+    restore();
+    __embedTestInternals.reset();
+  }
+  const plain = __setEmbedModeForTests({ embedded: true, shell: "host" });
+  try {
+    assert.equal(hostConversationId(), null, "none named: none");
+  } finally {
+    plain();
     __embedTestInternals.reset();
   }
 });

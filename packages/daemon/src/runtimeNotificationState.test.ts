@@ -194,3 +194,61 @@ test("a contribution mark separates what was told before it from what was told a
   assert.equal(state.hasContributedMessage({ seq: 2 }, "session-1", mark), false, "told only after the mark");
   assert.equal(state.hasContributedMessage({ seq: 2 }, "session-1"), true, "without a mark, told is told");
 });
+
+test("task #triage:#399: a held notice moves its debt out of pending; release gives it back, clear drops it", () => {
+  const state = new RuntimeNotificationState();
+  state.add(1);
+  assert.equal(state.takePendingAndClearTimer(), 1);
+  state.armNoticeHold("session-1");
+  assert.equal(state.isNoticeHeld("session-1"), true);
+  assert.equal(state.isNoticeHeld("session-2"), false);
+
+  for (let i = 0; i < 50; i += 1) {
+    state.add(1);
+    assert.equal(state.holdNotice(state.takePendingAndClearTimer()), i + 1);
+  }
+  assert.equal(state.pendingCount, 0, "held debt is not pending: runtime progress does not retry it");
+  assert.equal(state.heldNoticeDebt, 50);
+  assert.equal(state.heldNoticeCount, 50);
+
+  assert.deepEqual(state.releaseNoticeHold(50), { suppressed: 50, heldDebt: 50 });
+  assert.equal(state.pendingCount, 50, "released debt is pending again: the next flush tells it once");
+  assert.equal(state.isNoticeHeld("session-1"), false);
+  assert.equal(state.releaseNoticeHold(50), null);
+
+  state.armNoticeHold("session-1");
+  state.holdNotice(3);
+  state.clear();
+  assert.equal(state.pendingCount, 0);
+  assert.equal(state.heldNoticeDebt, 0);
+  assert.equal(state.isNoticeHeld("session-1"), false);
+});
+
+test("task #triage:#399: a notice that lands settles the held debt (it covered it); forgetting what was told releases the hold", () => {
+  const state = new RuntimeNotificationState();
+  state.armNoticeHold("session-1");
+  state.holdNotice(4);
+  assert.equal(state.armNoticeHold("session-1"), 1, "a break-through: one notice was held behind the last");
+  assert.equal(state.heldNoticeDebt, 0);
+  assert.equal(state.isNoticeHeld("session-1"), true);
+
+  state.holdNotice(2);
+  state.clearNoticeFingerprint();
+  assert.equal(state.isNoticeHeld("session-1"), false, "a rejected notice never reached the model");
+  assert.equal(state.heldNoticeDebt, 0);
+  assert.equal(state.pendingCount, 0, "dropped, not given back: the rows stay uncontributed for the next idle delivery");
+});
+
+test("task #triage:#399: release gives back no more debt than rows still untold (a read or purge took the rest)", () => {
+  const state = new RuntimeNotificationState();
+  state.armNoticeHold("session-1");
+  state.holdNotice(5);
+  assert.deepEqual(state.releaseNoticeHold(2), { suppressed: 1, heldDebt: 2 });
+  assert.equal(state.pendingCount, 2);
+
+  state.clearPending();
+  state.armNoticeHold("session-1");
+  state.holdNotice(3);
+  assert.deepEqual(state.releaseNoticeHold(0), { suppressed: 1, heldDebt: 0 });
+  assert.equal(state.pendingCount, 0, "an emptied inbox leaves no phantom untold work");
+});

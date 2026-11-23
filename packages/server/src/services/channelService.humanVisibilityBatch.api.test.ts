@@ -5,7 +5,7 @@ import { and, eq } from "drizzle-orm";
 import { type ServerId } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import { channelHumans, channels, serverMembers, servers } from "../db/schema";
-import { seedBoundGuest } from "../test/guestFixture";
+import { seedBoundGuest, seedStrayGuestChannelRow } from "../test/guestFixture";
 import { actorsShownToPerson } from "../platform/actors";
 import {
   addHuman,
@@ -48,7 +48,11 @@ test("canUserSeeHumansThroughLocalChannel answers every target exactly as canUse
 
   const conversation = async (type: "channel" | "private", humans: Array<{ id: string }>, set: Partial<typeof channels.$inferInsert> = {}, serverId = server.id) => {
     const channel = await createChannel(serverId, `seen-${label()}`, undefined, type);
-    for (const human of humans) await addHuman(channel.id, human.id);
+    for (const human of humans) {
+      // The guest's rows outside its bound channel: data addHuman no longer writes.
+      if (human === guest && serverId === server.id) await seedStrayGuestChannelRow({ channelId: channel.id, userId: guest.id });
+      else await addHuman(channel.id, human.id);
+    }
     if (Object.keys(set).length > 0) await db.update(channels).set(set).where(eq(channels.id, channel.id));
     return channel;
   };

@@ -83,7 +83,8 @@ export type RackRuntimeCell =
   | { kind: "unavailable"; provider: RuntimeAccountUsageProvider; runtimeId: string; attention: BulkRuntimeUsageSummary | null }
   /**
    * The tightest account's share used; `warn` from 80% used, `usedUp` when
-   * its limit is reached; `attention` when another account needs it.
+   * its limit is reached (not when it runs on credits past it: a full bar,
+   * `summary.kind === "credits"`); `attention` when another account needs it.
    */
   | {
     kind: "value";
@@ -101,7 +102,7 @@ export type RackRuntimeCell =
 
 function usedOf(summary: BulkRuntimeUsageSummary | null): number | null {
   if (summary?.kind === "used") return summary.percent;
-  if (summary?.kind === "limit") return 100;
+  if (summary?.kind === "limit" || summary?.kind === "credits") return 100;
   return null;
 }
 

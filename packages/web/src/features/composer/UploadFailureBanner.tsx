@@ -1,4 +1,5 @@
 import { useCallback } from "react";
+import type { MouseEvent } from "react";
 import { useIntl } from "react-intl";
 import { Button } from "@botiverse/raft-ui";
 import Banner from "../../components/ui/Banner";
@@ -8,6 +9,18 @@ import Banner from "../../components/ui/Banner";
 // Remove before it; without, with the × (Raft Design System › Banner).
 // raft-ui's BannerAction places the actions. Own component so each banner
 // binds its id in memoized handlers (react-perf: no inline closures).
+
+/**
+ * Every button here (Remove, Retry, the ×) makes the banner go away, so a
+ * mouse or finger press that focused one would drop the focus to the page and
+ * the text box someone was typing in would lose it (#triage:#507, like
+ * #triage:db62c967 for the chips). Only presses on buttons: text in the
+ * banner stays selectable. Keyboard use is unchanged.
+ */
+function keepFocusOnButtonPress(event: MouseEvent<HTMLDivElement>) {
+  if (event.target instanceof Element && event.target.closest("button")) event.preventDefault();
+}
+
 export function UploadFailureBanner({
   fileId,
   fileName,
@@ -34,6 +47,7 @@ export function UploadFailureBanner({
       intent="warning"
       density="sm"
       role="alert"
+      onMouseDown={keepFocusOnButtonPress}
       title={<span className="break-all">{fileName}</span>}
       actions={canRetry ? (
         <>

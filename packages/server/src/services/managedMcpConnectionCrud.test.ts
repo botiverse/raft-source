@@ -24,13 +24,13 @@ import {
 } from "./managedMcpService";
 import {
   createManagedMcpHeaderConnection,
-  deleteManagedMcpConnection,
   describeManagedMcpDefaultImpact,
   listManagedMcpConnections,
   setServerDefaultConnection,
   updateManagedMcpConnection,
 } from "./managedMcpConnectionService";
 import { ensureMcpConnectionCard } from "./managedMcpConnectionCardService";
+import { deleteMcpConnection } from "./managedMcpAccountsService";
 import { updateMcpApp } from "./managedMcpAppService";
 
 const originalCredentialKey = process.env.SLOCK_MCP_CREDENTIAL_KEY;
@@ -63,6 +63,8 @@ async function seedHeaderApp(requiredHeaderNames: string[] | null = ["X-Api-Key"
   const app = await createManagedMcpServer({
     serverId: server.id, userId: user.id, name: "Docs", endpointUrl: "https://docs.example.test/mcp",
     authMode: "headers", headers: { "X-Api-Key": "default-fixture-key" },
+    // The owner's App reaches every Agent (also ones it did not create) because the Server vouched for it.
+    vouchAsCreator: true,
   });
   await getDb().update(managedMcpServers).set({ toolCatalog: catalog, requiredHeaderNames })
     .where(eq(managedMcpServers.id, app.id));
@@ -166,16 +168,16 @@ test("⭐ deleting a pinned Connection refuses its Agents with no fallback to th
     serverId: f.server.id, userId: f.user.id, mcpServerId: f.appId, name: "Second", headers: { "X-Api-Key": "second-fixture-key" },
   }, { listTools: handshakeOk });
   await setManagedMcpAssignment({ serverId: f.server.id, userId: f.user.id, agentId: f.agent.id, mcpServerId: f.appId, connectionId: second.id });
-  await deleteManagedMcpConnection({ serverId: f.server.id, mcpServerId: f.appId, connectionId: second.id });
+  await deleteMcpConnection({ serverId: f.server.id, appId: f.appId, connectionId: second.id, actorUserId: f.user.id });
   const { sent, call } = caller(f);
   await assert.rejects(call(f.agent.id), { code: "managed_mcp_login_required" });
   assert.deepEqual(sent, [], "⭐ the default's key was not sent in its place");
 
   const follower = await createAgent(f.server.id, `follower-${randomUUID().slice(0, 8)}`);
-  await deleteManagedMcpConnection({ serverId: f.server.id, mcpServerId: f.appId, connectionId: f.defaultConnectionId });
+  await deleteMcpConnection({ serverId: f.server.id, appId: f.appId, connectionId: f.defaultConnectionId, actorUserId: f.user.id });
   await assert.rejects(call(follower.id), { code: "managed_mcp_login_required" }, "no default: followers are refused too");
   await assert.rejects(
-    deleteManagedMcpConnection({ serverId: f.server.id, mcpServerId: f.appId, connectionId: f.defaultConnectionId }),
+    deleteMcpConnection({ serverId: f.server.id, appId: f.appId, connectionId: f.defaultConnectionId, actorUserId: f.user.id }),
     { code: "managed_mcp_connection_not_found" },
   );
 });
@@ -223,7 +225,7 @@ test("⭐ setting a default closes the cards of Agents it admits, and only those
     serverId: f.server.id, userId: f.user.id, mcpServerId: f.appId, name: "Doomed", headers: { "X-Api-Key": "doomed-fixture-key" },
   }, { listTools: handshakeOk });
   await setManagedMcpAssignment({ serverId: f.server.id, userId: f.user.id, agentId: pinned.id, mcpServerId: f.appId, connectionId: doomed.id });
-  await deleteManagedMcpConnection({ serverId: f.server.id, mcpServerId: f.appId, connectionId: doomed.id });
+  await deleteMcpConnection({ serverId: f.server.id, appId: f.appId, connectionId: doomed.id, actorUserId: f.user.id });
   await getDb().transaction((tx) => setServerDefaultConnection(tx, {
     serverId: f.server.id, mcpServerId: f.appId, connectionId: null, userId: f.user.id,
   }));
@@ -270,7 +272,7 @@ test("⭐ an App with no recorded header names never accepts arbitrary names onc
     serverId: legacy.server.id, userId: legacy.user.id, mcpServerId: legacy.appId, name, headers,
   }, { listTools: handshakeOk });
   const second = await create("Second", { "X-Api-Key": "second-key" });
-  await deleteManagedMcpConnection({ serverId: legacy.server.id, mcpServerId: legacy.appId, connectionId: legacy.defaultConnectionId });
+  await deleteMcpConnection({ serverId: legacy.server.id, appId: legacy.appId, connectionId: legacy.defaultConnectionId, actorUserId: legacy.user.id });
 
   // The names come from the Connections that remain.
   await assert.rejects(create("Other", { Authorization: "Bearer fixture" }), { code: "managed_mcp_headers_incomplete" });
@@ -278,7 +280,7 @@ test("⭐ an App with no recorded header names never accepts arbitrary names onc
 
   // With no Connection left to take them from, the admin must set them on the App.
   for (const row of await rows(legacy)) {
-    await deleteManagedMcpConnection({ serverId: legacy.server.id, mcpServerId: legacy.appId, connectionId: row.id });
+    await deleteMcpConnection({ serverId: legacy.server.id, appId: legacy.appId, connectionId: row.id, actorUserId: legacy.user.id });
   }
   assert.ok(second.id);
   await assert.rejects(create("Any", { "X-Whatever": "fixture" }), { code: "managed_mcp_header_names_unset" });

@@ -4,8 +4,10 @@
 import assert from "node:assert/strict";
 
 import { RUNTIME_CONFIG_VERSION, type ModelLimits, type RuntimeConfig } from "@botiverse/raft-shared";
+import type { DatabaseExecutor } from "../db/index";
 import {
   deriveAgentModelLimitsWarning,
+  getAgentModelLimitsWarnings,
   isBuiltInGatewayCustomModelConfig,
   parseAgentModelLimitsFrame,
   type StoredAgentModelLimitsReport,
@@ -69,16 +71,30 @@ test("only a Built-in custom model reached through a gateway or on a preset that
     model: { kind: "custom", name: "m" },
     mode: { kind: "default" },
   } as unknown as RuntimeConfig;
-  assert.equal(isBuiltInGatewayCustomModelConfig(gateway, null), true);
+  assert.equal(isBuiltInGatewayCustomModelConfig(gateway), true);
   const connection = { ...gateway, provider: { kind: "connection", connectionId: "c" } } as unknown as RuntimeConfig;
-  assert.equal(isBuiltInGatewayCustomModelConfig(connection, { providerId: "anthropic-compatible", endpointUrl: "https://gw.example.test" }), true);
-  assert.equal(isBuiltInGatewayCustomModelConfig(connection, { providerId: "anthropic-compatible", endpointUrl: null }), false, "no endpoint: the daemon does not resolve it to a gateway");
-  assert.equal(isBuiltInGatewayCustomModelConfig(connection, { providerId: "anthropic-compatible", endpointUrl: "" }), false);
-  assert.equal(isBuiltInGatewayCustomModelConfig(connection, { providerId: "deepseek", endpointUrl: null }), true, "a typed id through a preset connection, as on the preset");
-  assert.equal(isBuiltInGatewayCustomModelConfig(connection, null), false);
-  assert.equal(isBuiltInGatewayCustomModelConfig({ ...gateway, model: { kind: "preset", id: "x/y" } } as unknown as RuntimeConfig, null), false);
-  assert.equal(isBuiltInGatewayCustomModelConfig({ ...gateway, runtime: "pi" } as unknown as RuntimeConfig, null), false);
-  assert.equal(isBuiltInGatewayCustomModelConfig(null, null), false);
+  assert.equal(isBuiltInGatewayCustomModelConfig(connection), false, "a stored saved connection (removed) reaches no gateway");
+  assert.equal(isBuiltInGatewayCustomModelConfig({ ...gateway, model: { kind: "preset", id: "x/y" } } as unknown as RuntimeConfig), false);
+  assert.equal(isBuiltInGatewayCustomModelConfig({ ...gateway, runtime: "pi" } as unknown as RuntimeConfig), false);
+  assert.equal(isBuiltInGatewayCustomModelConfig(null), false);
+});
+
+test("a Built-in agent whose stored config lost its provider gets no signal, and the others' lookup does not throw", async () => {
+  // Lenient hydration keeps a Built-in row with no provider (runtimeConfigLegacy.ts).
+  const providerless = {
+    version: RUNTIME_CONFIG_VERSION,
+    runtime: "builtin",
+    model: { kind: "custom", name: "m" },
+    mode: { kind: "default" },
+  } as unknown as RuntimeConfig;
+  // Before: `runtimeConfig.provider.kind` threw a TypeError.
+  assert.equal(isBuiltInGatewayCustomModelConfig(providerless), false);
+  // Skipped before any query: with no other candidate, the database is never read.
+  const warnings = await getAgentModelLimitsWarnings({
+    agents: [{ id: "agent-providerless", serverId: "server-1", runtimeConfig: providerless }],
+    db: {} as DatabaseExecutor,
+  });
+  assert.equal(warnings.size, 0);
 });
 
 test("parseAgentModelLimitsFrame accepts the daemon's frame and rejects malformed fields", () => {

@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import {
   allowedReasoningEffortsForModel,
   BUILTIN_RUNTIME_HOST_PROVIDER_ENV_SCRUB_KEYS,
-  BUILTIN_RUNTIME_GATEWAY_PROVIDER_ENV_KEYS,
   BUILTIN_RUNTIME_PROVIDER_BLOCKED_HOST_ENV_KEYS,
   BUILTIN_RUNTIME_PROVIDER_ENV_KEYS,
   BUILTIN_RUNTIME_PROVIDERS,
@@ -10,14 +9,13 @@ import {
   PI_BUILTIN_PROVIDER_DEFAULT_MODELS,
   PI_BUILTIN_PROVIDER_CONNECTION_PROBES,
   PI_BUILTIN_PROVIDER_MODELS,
-  PROVIDER_CONNECTION_PROVIDER_IDS,
+  ANTIGRAVITY_AGY_CHOOSES_MODEL,
   getDefaultModel,
   getStaticRuntimeModelSourceSet,
   hasStaticRuntimeModelSource,
   hydrateRuntimeConfig,
   parseRuntimeConfig,
   RUNTIME_MODELS,
-  runtimeChoiceModel,
   STATIC_RUNTIME_MODEL_SOURCE_IDS,
   STATIC_RUNTIME_MODEL_SOURCE_VERIFICATION,
   runtimeConfigToLaunchFields,
@@ -61,11 +59,13 @@ test("declared static model sources carry their daemon verification contract", (
   assert.equal(getStaticRuntimeModelSourceSet("opencode"), undefined);
 });
 
-test("Codex bundled fallback tracks upstream picker order and default (GPT-6.1 Sol first)", () => {
-  // Upstream codex-rs/models-manager/models.json (rust-v0.162.0) priorities:
-  // gpt-6.1-sol 1, gpt-6-astra 2, gpt-6-sol 3, gpt-6-luna 4, gpt-5.6-sol 5, ...
-  assert.equal(getDefaultModel("codex"), "gpt-6.1-sol");
-  assert.deepEqual(RUNTIME_MODELS.codex.slice(0, 7).map((model) => model.id), [
+test("Codex bundled fallback tracks upstream picker order and default (GPT-6.2 Sol first)", () => {
+  // Upstream codex-rs/models-manager/models.json (rust-v0.169.1) priorities:
+  // gpt-6.2-sol 1, gpt-6.2-astra 2, gpt-6.1-terra 3, gpt-6.1-sol 4, gpt-6-astra 5, ...
+  assert.equal(getDefaultModel("codex"), "gpt-6.2-sol");
+  assert.deepEqual(RUNTIME_MODELS.codex.slice(0, 9).map((model) => model.id), [
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
     "gpt-6.1-sol",
     "gpt-6-astra",
     "gpt-6-sol",
@@ -75,6 +75,20 @@ test("Codex bundled fallback tracks upstream picker order and default (GPT-6.1 S
     "gpt-5.6-luna",
   ]);
   const byId = (id: string) => RUNTIME_MODELS.codex.find((model) => model.id === id);
+  assert.deepEqual(byId("gpt-6.2-sol"), {
+    id: "gpt-6.2-sol",
+    label: "GPT-6.2 Sol",
+    supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    defaultReasoningEffort: "low",
+    verified: "launchable",
+  });
+  assert.deepEqual(byId("gpt-6.2-astra"), {
+    id: "gpt-6.2-astra",
+    label: "GPT-6.2 Astra",
+    supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    defaultReasoningEffort: "low",
+    verified: "launchable",
+  });
   assert.deepEqual(byId("gpt-6.1-sol"), {
     id: "gpt-6.1-sol",
     label: "GPT-6.1 Sol",
@@ -231,18 +245,11 @@ test("Built-in provider env keys are generated for every surfaced Pi provider", 
   assert.ok(BUILTIN_RUNTIME_PROVIDER_BLOCKED_HOST_ENV_KEYS.includes("ANTHROPIC_OAUTH_TOKEN"));
 });
 
-test("Provider Connections accepts exactly the builtin Pi schema provider catalog", () => {
-  assert.deepEqual(
-    [...PROVIDER_CONNECTION_PROVIDER_IDS].sort(),
-    [
-      ...Object.keys(BUILTIN_RUNTIME_PROVIDER_ENV_KEYS),
-      ...Object.keys(BUILTIN_RUNTIME_GATEWAY_PROVIDER_ENV_KEYS),
-    ].sort(),
-  );
+test("every builtin Pi provider's catalog transport uses a known protocol over https", () => {
   for (const [providerId, probe] of Object.entries(PI_BUILTIN_PROVIDER_CONNECTION_PROBES)) {
     assert.ok(
-      ["anthropic-messages", "google-generative-ai", "openai-completions", "openai-responses"].includes(probe.api),
-      `${providerId} must use a connection-test protocol implemented by Provider Connections`,
+      ["anthropic-messages", "google-generative-ai", "mistral-conversations", "openai-completions", "openai-responses"].includes(probe.api),
+      `${providerId} must use a known catalog transport protocol`,
     );
     assert.match(probe.baseUrl, /^https:\/\//u);
   }
@@ -262,15 +269,14 @@ test("runtime-reported unavailable models are validated, de-duplicated and lengt
   assert.equal(sanitizeRuntimeModelUnavailable(Array.from({ length: 80 }, (_, i) => ({ id: `m${i}`, label: "", reason: "" })))!.length, 50);
 });
 
-test("Antigravity's configured default allows no effort; a model only the Computer lists is left to its live list", () => {
-  assert.deepEqual(allowedReasoningEffortsForModel("antigravity", "default"), []);
+test("Antigravity has no bundled models: a model only the Computer lists is left to its live list", () => {
+  assert.deepEqual(RUNTIME_MODELS.antigravity, []);
   assert.ok(allowedReasoningEffortsForModel("antigravity", "gemini-3.8-flash").includes("high"));
   assert.ok(allowedReasoningEffortsForModel("claude", "claude-unlisted").includes("high"), "other runtimes keep the base set");
-  assert.equal(runtimeChoiceModel("antigravity")?.id, "default");
-  assert.equal(runtimeChoiceModel("claude"), undefined);
+  // #oar-raft:#25: an agent stored with agy's own choice keeps it, never Claude's default.
+  assert.equal(getDefaultModel("antigravity"), ANTIGRAVITY_AGY_CHOOSES_MODEL);
   const parsed = parseRuntimeConfig({
-    runtimeConfig: { version: 1, runtime: "antigravity", model: { kind: "preset", id: "default" }, mode: { kind: "default" }, reasoningEffort: "high", envVars: null },
+    runtimeConfig: { version: 1, runtime: "antigravity", model: { kind: "preset", id: "default" }, mode: { kind: "default" }, reasoningEffort: null, envVars: null },
   });
-  assert.ok(parsed.ok);
-  assert.equal(parsed.config.reasoningEffort, null, "an effort sent with agy's default is dropped");
+  assert.ok(parsed.ok, "a stored agy default still parses");
 });

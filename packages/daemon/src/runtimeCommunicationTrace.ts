@@ -16,6 +16,10 @@ export interface RuntimeTraceCounters {
   compactionFinishes: number;
   textEvents: number;
   thinkingEvents: number;
+  /** `internal_progress` events in the turn. Only the first one goes on the
+   * span as events (#proj-runtime:#68: one pair per signal overflowed the
+   * span budget and cut off the turn's end); the rest are counted here. */
+  internalProgress: number;
   /** What the turn span carries: estimated bytes of the events kept, and the events left off it. */
   spanEventBytes: number;
   spanEventsDropped: number;
@@ -37,6 +41,7 @@ export function createRuntimeTraceCounters(): RuntimeTraceCounters {
     compactionFinishes: 0,
     textEvents: 0,
     thinkingEvents: 0,
+    internalProgress: 0,
     spanEventBytes: 0,
     spanEventsDropped: 0,
     spanEventBytesDropped: 0,
@@ -130,6 +135,7 @@ export function runtimeTraceCounterAttrs(
     runtime_compaction_finishes_count: counters.compactionFinishes,
     runtime_text_events_count: counters.textEvents,
     runtime_thinking_events_count: counters.thinkingEvents,
+    runtime_internal_progress_count: counters.internalProgress,
     runtime_span_events_dropped_count: counters.spanEventsDropped,
     ...(counters.spanEventsDropped > 0 ? { runtime_span_event_bytes_dropped: counters.spanEventBytesDropped } : {}),
     ...turnTokenTraceAttrs(counters.tokens),

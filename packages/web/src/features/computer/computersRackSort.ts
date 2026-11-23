@@ -4,6 +4,7 @@ import type { Machine } from "../../store/machineStore";
 import type { ComputersRackSort, ComputersRackSortDirection, ComputersRackSortKey } from "../../store/computersRackSortPreference";
 import { liveDiskStatus, liveMemoryStatus } from "../../components/agentMigration/targetComputerInfo";
 import { rackProviderRuntime } from "../../components/machine/rack/rackRuntimeColumns";
+import { machineNeedsAttention } from "../../utils/computerUpgradeIndicator";
 import type { RackRuntimeColumns, RackUsageResults } from "../../components/machine/rack/rackRuntimeColumns";
 
 /**
@@ -12,8 +13,9 @@ import type { RackRuntimeColumns, RackUsageResults } from "../../components/mach
  * cards and the phone follow too. With no sort chosen (the default, the
  * menu's "Mine first") the list keeps the Computers list's own order: this
  * device, then the viewer's own computers, then the rest
- * (sidebarMachineOrder.ts; artin, #triage:#332), and no heading is marked.
- * Numbers (Disk
+ * (sidebarMachineOrder.ts; artin, #triage:#332), and no heading is marked,
+ * except that the computers needing attention come first (`attentionFirst`;
+ * artin, #triage:#527). Numbers (Disk
  * and Memory used, a runtime's remaining quota) start high to low, text (the
  * name) A to Z (`firstSortDirection`). A computer with no value for the key
  * (offline, nothing to read, an account that needs signing in again) is last
@@ -122,4 +124,25 @@ export function sortRackMachines(
     return sign * order;
   });
   return keyed.map(({ machine }) => machine);
+}
+
+/**
+ * The Computers page's default order (no sort chosen; artin, #triage:#527):
+ * the computers needing attention (`machineNeedsAttention`, the rule of the
+ * left rail's "N of M needs attention" count and the update reminder) first,
+ * then the rest, each in the order given (the list's own: this device, the
+ * viewer's own, the rest). Only this page: every other list of computers
+ * keeps the sidebar's order.
+ */
+export function attentionFirst(machines: readonly Machine[], pinnedId: string | null = null): readonly Machine[] {
+  // The pinned machine (this device) keeps its place at the top whatever it needs.
+  const pinned: Machine[] = [];
+  const needing: Machine[] = [];
+  const rest: Machine[] = [];
+  for (const machine of machines) {
+    if (pinnedId && machine.id === pinnedId) pinned.push(machine);
+    else (machineNeedsAttention(machine) ? needing : rest).push(machine);
+  }
+  if (needing.length === 0 || rest.length === 0) return machines;
+  return [...pinned, ...needing, ...rest];
 }

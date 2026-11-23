@@ -1,7 +1,7 @@
 /**
  * Where the app goes once a pending deletion is cancelled: Settings › Account
  * of the server in the address, or else of the last server the person was in
- * (the location the app resumes, hooks/useLastLocationResume.ts), or else the
+ * (the one `/` enters, store/serverPersistenceRegistry.ts), or else the
  * app's start; keeping the App's embed params. A full load, so the shell
  * starts over with the session it now has; never the current address, which
  * may be the Delete Account page itself. Signing in again from "/" and
@@ -14,7 +14,7 @@
  * of the server's shape (a UUID) are carried; anything else is dropped.
  */
 import { withEmbedParams } from "../embed";
-import { readLastLocationPath } from "../hooks/useLastLocationResume";
+import { serverPersistence } from "../store/serverPersistenceRegistry";
 
 /** The full load after Cancel Deletion; replaceable in tests (jsdom can't navigate). */
 export const afterCancelRedirect = {
@@ -33,8 +33,8 @@ export function appLoginAfterCancel(pathname: string, search: string): string | 
   return `${APP_LOGIN_PATH}?${withEmbedParams(new URLSearchParams({ request })).toString()}`;
 }
 
-export function accountSettingsAfterCancel(pathname: string, lastLocation: string | null = readLastLocationPath()): string {
-  const slug = SERVER_SLUG.exec(pathname)?.[1] ?? (lastLocation ? SERVER_SLUG.exec(lastLocation)?.[1] : undefined);
+export function accountSettingsAfterCancel(pathname: string, lastServerSlug: string | null = serverPersistence.readLastServerSlug()): string {
+  const slug = SERVER_SLUG.exec(pathname)?.[1] ?? (lastServerSlug ? encodeURIComponent(lastServerSlug) : undefined);
   const query = withEmbedParams(new URLSearchParams()).toString();
   return `${slug ? `/s/${slug}/settings/account` : "/"}${query ? `?${query}` : ""}`;
 }

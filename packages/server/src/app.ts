@@ -33,7 +33,7 @@ import { getPublicContentBaseUrl } from "./services/storageService";
 import { STALE_RESPONSE_HEADER } from "./routes/rwStaleRead";
 import { isLinkCardReadRequest, LINK_CARD_READ_PATH, linkCardReadBodyErrorHandler, linkCardReadBodyParser, messageRouter, messageV2Router } from "./routes/messages";
 import {
-  LINK_CARD_EXECUTE_PATH, LINK_CARD_PREPARE_PATH, LINK_CARD_STATUS_PATH, LINK_CARD_UPDATES_PATH, linkCardBodyErrorHandler, linkCardExecuteBodyParser,
+  LINK_CARD_CHANGED_PATH, LINK_CARD_EXECUTE_PATH, LINK_CARD_PREPARE_PATH, LINK_CARD_STATUS_PATH, LINK_CARD_UPDATES_PATH, linkCardBodyErrorHandler, linkCardChangedBodyParser, linkCardExecuteBodyParser,
   linkCardPrepareBodyParser, linkCardRouter, linkCardStatusBodyParser, linkCardUpdatesBodyParser,
 } from "./routes/linkCards";
 import { agentRouter, agentAvatarRouter } from "./routes/agents";
@@ -58,6 +58,7 @@ import { accountDeletionCancelLinkHandler, accountDeletionRouter } from "./route
 import { externalInviteRouter, serverConnectRequestRouter } from "./routes/externalInvites";
 import { agentLoginRouter } from "./routes/agentLogin";
 import { deviceAuthRouter, deviceLoginRevokeHandler } from "./routes/deviceAuth";
+import { computerPairingCreateHandler, computerPairingRouter } from "./routes/computerPairings";
 import { appLoginRouter } from "./routes/appLogin";
 import { computerAttachRouter } from "./routes/computerAttach";
 import { computerRetireSessionHandler } from "./routes/computerRetireSession";
@@ -93,6 +94,7 @@ import { notificationRouter } from "./routes/notifications";
 import { notificationLevelsRouter } from "./routes/notificationLevels";
 import { meRouter } from "./routes/me";
 import { mySessionsRouter } from "./routes/mySessions";
+import { myDataExportsRouter } from "./routes/dataExports";
 import { runWithSessionClient } from "./services/sessionClient";
 import { announcementRouter } from "./routes/announcements";
 import { integrationInviteRouter, integrationLogoPublicRouter, integrationRouter } from "./routes/integrations";
@@ -102,7 +104,6 @@ import { ACTOR_RESOLVE_PATH, actorResolveBodyErrorHandler, actorResolveBodyParse
 import { productEventsRouter } from "./routes/productEvents";
 import { managedMcpOAuthCallbackRouter, managedMcpRouter } from "./routes/managedMcp";
 import { agentConnectionCallbackRouter } from "./routes/agentConnectionCallback";
-import { providerConnectionRouter } from "./routes/providerConnections";
 import { agentRuntimeProviderRouter } from "./routes/agentRuntimeProviders";
 import { runtimeProviderControlRouter } from "./routes/runtimeProviderControl";
 import { productFeedbackRouter } from "./routes/productFeedback";
@@ -221,6 +222,7 @@ export function shouldSkipAuthRateLimit(input: {
 
 /** The auth limiter's requests per IP a minute; the OAuth identity endpoints' invalid tokens get the same, on their own counter. */
 const AUTH_RATE_LIMIT_PER_MINUTE = 200;
+const COMPUTER_PAIRING_RATE_LIMIT_PER_MINUTE = 60;
 
 /** The auth limiter's 429 body; the OAuth identity endpoints' limits answer the same. */
 const AUTH_RATE_LIMITED_BODY = { error: "Too many requests, please try again later" };
@@ -415,12 +417,14 @@ export function createApp(options: CreateAppOptions = {}): Express {
   // and X-Raft-Stale / Retry-After of the unread and Activity reads to say
   // they may be out of date and to pace its retries (routes/rwStaleRead.ts),
   // X-Trace-Id to show a reportable id on errors (#proj-o11y:#18), and
-  // X-Raft-Inbox-Backend of the Activity read for its drift check (#244).
+  // X-Raft-Inbox-Backend of the Activity read for its drift check (#244),
+  // and X-Amz-Cf-Pop (set by CloudFront) so web.http.client can say which
+  // edge location answered.
   app.use(cors({
     origin: corsOrigin,
     credentials: true,
     maxAge: CORS_PREFLIGHT_MAX_AGE_SECONDS,
-    exposedHeaders: [SYNC_HORIZON_HEADER, SYNC_HORIZON_RESET_HEADER, STALE_RESPONSE_HEADER, "Retry-After", TRACE_ID_RESPONSE_HEADER, INBOX_BACKEND_HEADER],
+    exposedHeaders: [SYNC_HORIZON_HEADER, SYNC_HORIZON_RESET_HEADER, STALE_RESPONSE_HEADER, "Retry-After", TRACE_ID_RESPONSE_HEADER, INBOX_BACKEND_HEADER, "X-Amz-Cf-Pop"],
   }));
   // Resource Timing gives a cross-origin page only the total duration of a
   // request unless the response allows its origin: echo the request's Origin
@@ -623,6 +627,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
   app.post(LINK_CARD_EXECUTE_PATH, linkCardExecuteBodyParser, linkCardBodyErrorHandler);
   app.post(LINK_CARD_STATUS_PATH, linkCardStatusBodyParser, linkCardBodyErrorHandler);
   app.post(LINK_CARD_UPDATES_PATH, linkCardUpdatesBodyParser, linkCardBodyErrorHandler);
+  app.post(LINK_CARD_CHANGED_PATH, linkCardChangedBodyParser, linkCardBodyErrorHandler);
   // View Context: the daemon's result POST and its hop to the viewer's
   // replica stream the raw body through (agentContextViewRelay.ts); no parser
   // may read it first, so both are registered before the global one.
@@ -656,6 +661,18 @@ export function createApp(options: CreateAppOptions = {}): Express {
   app.use("/share", shareArtifactPublicRouter);
 
   // Rate limiter for auth endpoints (general)
+  // The Add Computer window's pairing calls (routes/computerPairings.ts): per
+  // signed-in person, after requireAuth. The window polls status every 10 s
+  // at most as a fallback to its realtime event.
+  const computerPairingLimiter = rateLimit({
+    keyGenerator: (req) => `computer-pairing:${req.userId ?? ipKeyGenerator(clientIpForRateLimit(req))}`,
+    windowMs: 60 * 1000,
+    max: COMPUTER_PAIRING_RATE_LIMIT_PER_MINUTE,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: AUTH_RATE_LIMITED_BODY,
+    skip: () => isTestEnv && (options.testHarness?.skipAuthRateLimit ?? false),
+  });
   const authLimiter = rateLimit({
     // replica-local for now: keyed by IP, and spans carry no client IP to
     // check a shared budget against (many Computers or an office behind one
@@ -767,6 +784,14 @@ export function createApp(options: CreateAppOptions = {}): Express {
   app.post("/api/computer/retire-session", authLimiter, computerRetireSessionHandler);
   if (isDeviceAuthSurfaceEnabled()) {
     app.use("/api/auth/device", authLimiter, deviceAuthRouter);
+    // The Add Computer window's pairing with the device authorization its
+    // copied command starts (routes/computerPairings.ts): the person's own
+    // full sign-in; same feature gate as the device login it completes.
+    app.post("/api/servers/:id/computer-pairings", authLimiter, requireAuth, computerPairingCreateHandler);
+    // Status, renew, cancel and approve are counted per person, not per IP
+    // (Tenny 9ee59a28): the window's fallback poll must not use up the login
+    // budget of everyone else behind the same address.
+    app.use("/api/computer-pairings", requireAuth, computerPairingLimiter, computerPairingRouter);
     // task #30 PR-B 3/n: user-authed Computer attach. Same Computer-login
     // feature gate (login + attach ship together). OUT of routeAuthPolicy
     // BY DESIGN (/api/* user-authed pre-attach, not /internal/* principal
@@ -941,6 +966,8 @@ export function createApp(options: CreateAppOptions = {}): Express {
   }));
 
   // Server routes (auth + verified required, no server context needed)
+  // A server's data exports re-authenticate: rate-limited like /api/me/data-exports below.
+  app.use("/api/servers/:id/data-exports", authLimiter);
   app.use("/api/servers", requireAuth, requireVerified, serverRouter);
   // A person deleting their own account (routes/accountDeletion.ts). Ahead of
   // /api/me and without requireVerified: any account may be deleted, and a
@@ -951,6 +978,9 @@ export function createApp(options: CreateAppOptions = {}): Express {
   // like account deletion, so anyone signed in can sign a lost device out.
   // Rate-limited like the other re-authenticated account routes.
   app.use("/api/me/sessions", authLimiter, requireAuth, mySessionsRouter);
+  // The person's own data exports (routes/dataExports.ts; 404 while data_export_v0
+  // is off). Ahead of /api/me; rate-limited like the other re-authenticated routes.
+  app.use("/api/me/data-exports", authLimiter, requireAuth, requireVerified, myDataExportsRouter);
   // Unified notification settings (docs/contracts/notifications.md §2) and
   // the person's account-mode app logins (docs/raft-app/README.md).
   app.use("/api/me", requireAuth, requireVerified, meRouter);
@@ -1378,7 +1408,6 @@ export function createApp(options: CreateAppOptions = {}): Express {
   // callback consumes a one-time hashed state and derives Server scope from it.
   app.use("/api/mcp/oauth", authLimiter, managedMcpOAuthCallbackRouter);
   app.use("/api/mcp", requireAuth, requireVerified, requireServer, managedMcpRouter);
-  app.use("/api/provider-connections", requireAuth, requireVerified, requireServer, providerConnectionRouter);
   app.use("/api/agent-runtime-providers", requireAuth, requireVerified, requireServer, agentRuntimeProviderRouter);
   // A hosted runtime provider returns the browser here after an account-connection
   // OAuth round trip; the route only forwards the outcome to the web landing page.

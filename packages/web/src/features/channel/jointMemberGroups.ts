@@ -10,7 +10,7 @@
 import type { ServerRole } from "@botiverse/raft-shared";
 import type { ChannelAgent, ChannelHuman } from "../../hooks/useChannelMembers";
 import { LOCAL_MEMBER_ORIGIN, memberOrigin } from "../../utils/memberOrigin";
-import type { MemberOrigin, MemberOriginSource } from "../../utils/memberOrigin";
+import type { KnownServer, MemberOrigin, MemberOriginSource } from "../../utils/memberOrigin";
 
 export interface ViewerServerGroup {
   inViewerServer: boolean;
@@ -59,11 +59,12 @@ export function rosterRoleTag(
 /**
  * Where a roster row is from, seen from the channel's server (#wg-rbac:#46):
  * someone from another server carries that server's tile on the avatar and its
- * name after theirs. Only a joint channel has such rows.
+ * name after theirs. Only a joint channel has such rows. The tile's logo is
+ * the row's own (`servers[].avatarUrl`), else the channel's `jointServers`.
  */
 export function jointMemberOrigin(
   member: MemberOriginSource,
-  channel: { type?: string; serverId?: string | null } | null | undefined,
+  channel: { type?: string; serverId?: string | null; jointServers?: readonly KnownServer[] | null } | null | undefined,
 ): MemberOrigin {
-  return channel?.type === "joint" ? memberOrigin(member, channel.serverId) : LOCAL_MEMBER_ORIGIN;
+  return channel?.type === "joint" ? memberOrigin(member, channel.serverId, channel.jointServers) : LOCAL_MEMBER_ORIGIN;
 }

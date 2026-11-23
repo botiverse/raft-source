@@ -1,3 +1,4 @@
+import type { PreparedAttachmentFile } from "../../utils/attachmentImageResize";
 import { isWebSafeImageMimeType } from "../../utils/imageMimeTypes";
 import type { PendingFile } from "./composerTypes";
 
@@ -37,4 +38,15 @@ export function readLocalImageDimensions(previewUrl: string): Promise<LocalImage
     image.onerror = () => resolve({ decoded: false });
     image.src = previewUrl;
   });
+}
+/**
+ * The chip once a large photo was resized before upload (attachmentImageResize.ts):
+ * its file, size, local preview and dimensions describe what is actually sent,
+ * not the original that was picked.
+ */
+export function pendingFileWithResizedUpload(pf: PendingFile, prepared: PreparedAttachmentFile, preview: string | null): PendingFile {
+  const dimensions = preview && prepared.width && prepared.height
+    ? { previewDecoded: true, previewWidth: prepared.width, previewHeight: prepared.height }
+    : {};
+  return { ...pf, file: prepared.file, preview, ...dimensions };
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { configForms, toModelListing, validateConfig, type FormValues, type RuntimeConfigForm } from "@botiverse/oar/forms";
+import { configForms, type RuntimeConfigForm } from "@botiverse/oar/forms";
 import { narrowOarForm, reasoningModelOptionsFromOar } from "./runtimeFormFromOar";
 import { GROK_RAFT_NARROWING, grokRaftForm, runtimeFormV2Entry } from "./runtimeFormV2Registry";
 
@@ -54,14 +54,4 @@ test("Raft's Grok form only narrows OAR's: nothing offered that OAR does not, no
   assert.throws(() => narrowOarForm(required, { ...GROK_RAFT_NARROWING, required: false }), /optional/);
   const hintless: RuntimeConfigForm = { ...oarGrok, fields: oarGrok.fields.map((field) => field.kind === "model" ? { ...field, hint: undefined } : field) };
   assert.throws(() => narrowOarForm(hintless, GROK_RAFT_NARROWING), /hint/);
-});
-
-// OAR-layer behavior only: Raft's save path does not call validateConfig yet
-// (and today rewrites a stored custom model as a preset; see the edit test above).
-test("OAR validation of Raft's narrowed form preserves stored rows Raft no longer offers", () => {
-  const listing = toModelListing({ kind: "ok", models: [{ id: "grok-4", effortLevels: ["high"] }] });
-  for (const stored of [{ model: { kind: "inherit" } }, { model: { kind: "custom", name: "grok-4" } }] satisfies FormValues[]) {
-    assert.deepEqual(validateConfig(grok, stored, { mode: "edit", stored, models: listing }), [], JSON.stringify(stored));
-    assert.deepEqual(validateConfig(grok, stored, { mode: "create", models: listing }).map((issue) => issue.code), ["mode_not_allowed"]);
-  }
 });

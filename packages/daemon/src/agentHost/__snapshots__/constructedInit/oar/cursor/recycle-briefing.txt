@@ -1,0 +1,50 @@
+host: oar
+runtime: cursor
+scenario: recycle-briefing
+promptSource: recycled_wake_inbox_update
+
+## standing prompt
+= standing-prompt.md
+
+## carrier
+launch.options.systemPrompt: (absent)
+launch.options.appendSystemPrompt: (absent)
+launch.options.env.OPENCODE_CONFIG_CONTENT: (absent)
+
+## first input (1346 chars, sha256:ce94d757df516201, the standing prompt written as ⟪STANDING_PROMPT⟫)
+⟪STANDING_PROMPT⟫
+
+<memory-index file="MEMORY.md" size="0.1 KB" complete="true" note="no need to re-read MEMORY.md unless you change it">
+# Alice
+
+## Role
+Keeps the release notes
+
+## Key Knowledge
+- No notes yet.
+
+## Active Context
+- First startup.
+</memory-index>
+
+<recent-messages order="newest last" note="recent tail only; older messages not shown">
+[target=#ops msg=aaaaaaaa time=2026-10-01 09:00:00Z type=human] @bob: please review the deploy notes
+</recent-messages>
+
+<last-note written="2026-10-01 09:00:00Z" note="your own text at the end of a turn; delivered to no one">
+  │ Waiting on review of the deploy notes.
+</last-note>
+
+<objects-in-play>
+</objects-in-play>
+
+<recent-actions span="1 of 1" order="oldest first">
+s1       2026-10-01 09:00:00Z shell(command=git status)
+</recent-actions>
+
+[Raft inbox notice:
+Inbox update: 1 message pending your read across all conversations; 1 changed target
+#general  pending: 1 message · first msg=wake-1 · latest sender @bob · latest msg=wake-1
+  latest @bob: "Can you check the deploy notes?" (preview; still unread, full text: raft message read --target "#general" --unread)
+]
+These messages have not been read. Choose when to read them: `raft message read --target <target> --unread` reads one conversation's unread messages; `raft inbox check` lists every conversation with unread messages.

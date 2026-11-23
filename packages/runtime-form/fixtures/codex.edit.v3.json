@@ -24,6 +24,11 @@
         "type": "boolean",
         "title": "Fast mode"
       },
+      "speed": {
+        "type": "string",
+        "title": "Speed",
+        "x-optionSource": "speed"
+      },
       "envVars": {
         "type": "object",
         "title": "Environment Variables",
@@ -38,6 +43,7 @@
       "model",
       "reasoningEffort",
       "fastMode",
+      "speed",
       "envVars"
     ],
     "layout": {
@@ -92,12 +98,42 @@
         "label": "Fast mode",
         "hint": "Launch this runtime with higher speed at a higher cost per token."
       },
+      "speed": {
+        "label": "Speed",
+        "hint": "Speeds this model offers on this computer's Codex account. Faster speeds use more of your plan."
+      },
       "envVars": {
         "label": "Environment Variables",
         "hint": "These will be injected into the runtime command environment."
       }
     },
-    "rules": []
+    "rules": [
+      {
+        "scope": "#/properties/fastMode",
+        "effect": "HIDE",
+        "condition": {
+          "scope": "#/properties/model",
+          "schema": {
+            "enum": [
+              "gpt-6.2-astra",
+              "gpt-5-mini"
+            ]
+          }
+        }
+      },
+      {
+        "scope": "#/properties/speed",
+        "effect": "SHOW",
+        "condition": {
+          "scope": "#/properties/model",
+          "schema": {
+            "enum": [
+              "gpt-6.2-astra"
+            ]
+          }
+        }
+      }
+    ]
   },
   "capabilities": {
     "providerKinds": [],
@@ -115,6 +151,15 @@
       "kind": "select",
       "pointer": "/model"
     },
+    "speed": {
+      "protocolVersion": 1,
+      "runtimeId": "codex",
+      "schemaVersion": "codex.create.v1",
+      "sourceId": "speed",
+      "kind": "dependent_select",
+      "pointer": "/speed",
+      "dependsOn": "/model"
+    },
     "reasoningEffort": {
       "protocolVersion": 1,
       "runtimeId": "codex",
@@ -129,6 +174,7 @@
     "model": "my-org/codex-custom",
     "reasoningEffort": "high",
     "fastMode": true,
+    "speed": "priority",
     "envVars": {
       "EXAMPLE_FLAG": "1"
     }

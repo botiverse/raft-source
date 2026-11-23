@@ -4,6 +4,7 @@ import type { RuntimeAccountUsageWindow } from "@botiverse/raft-shared";
 import { useIntl } from "react-intl";
 import { usageResetText } from "./rack/rackResetText";
 import { runtimeUsagePercentUsed } from "./bulkChangeModelPlan";
+import type { RuntimeUsageListWindow } from "./runtimeUsageCredits";
 
 /** Used up by the provider's word or the ratio itself (as the usage card). */
 function windowUsedUp(window: RuntimeAccountUsageWindow): boolean {
@@ -11,7 +12,7 @@ function windowUsedUp(window: RuntimeAccountUsageWindow): boolean {
 }
 
 /** One window: its name on a line, then a thin bar and the share used ("40%"). */
-function UsageWindowLine({ window }: { window: RuntimeAccountUsageWindow }) {
+function UsageWindowLine({ window }: { window: RuntimeUsageListWindow }) {
   const { formatMessage, locale } = useIntl();
   if (window.status === "parse_unavailable") {
     return (
@@ -26,13 +27,14 @@ function UsageWindowLine({ window }: { window: RuntimeAccountUsageWindow }) {
   const reset = window.resetsAt
     ? usageResetText(window.resetsAt, locale, currentTimeMs()) ?? formatMessage({ id: "machine.runtimeUsage.later" })
     : null;
+  const onCredits = window.onCredits === true;
   // The words a screen reader hears, as the usage card says them.
   const valueText = usedUp
     ? reset === null
-      ? formatMessage({ id: "machine.runtimeUsage.windowUsedUpResetUnavailable" })
-      : formatMessage({ id: "machine.runtimeUsage.windowUsedUp" }, { reset })
+      ? formatMessage({ id: onCredits ? "machine.runtimeUsage.windowUsedUpOnCreditsResetUnavailable" : "machine.runtimeUsage.windowUsedUpResetUnavailable" })
+      : formatMessage({ id: onCredits ? "machine.runtimeUsage.windowUsedUpOnCredits" : "machine.runtimeUsage.windowUsedUp" }, { reset })
     : reset === null
-      ? formatMessage({ id: "machine.runtimeUsage.windowUsedResetUnavailable" }, { percent })
+      ? formatMessage({ id: "machine.rack.percentUsed" }, { percent })
       : formatMessage({ id: "machine.runtimeUsage.windowUsed" }, { percent, reset });
   return (
     <div className="flex flex-col gap-1" data-testid="runtime-usage-window" data-usage-full={usedUp ? "true" : undefined}>
@@ -50,7 +52,7 @@ function UsageWindowLine({ window }: { window: RuntimeAccountUsageWindow }) {
   );
 }
 
-export function RuntimeUsageWindowList({ windows }: { windows: readonly RuntimeAccountUsageWindow[] }) {
+export function RuntimeUsageWindowList({ windows }: { windows: readonly RuntimeUsageListWindow[] }) {
   return (
     <div className="flex min-w-0 flex-col gap-2" data-testid="runtime-usage-windows">
       {windows.map((window, index) => <UsageWindowLine key={`${window.id}-${index}`} window={window} />)}

@@ -45,7 +45,7 @@ test("no rule applies (or none was read): the session is resumed", () => {
 
 test("rule 1, step 7: a session started on another spec is replaced by a new one", () => {
   assert.deepEqual(chooseSession({ sessionId: "session-1", specDrop: "runtime_changed" }), { kind: "new", reason: "spec_drop", dropReason: "runtime_changed" });
-  assert.deepEqual(chooseSession({ sessionId: "session-1", specDrop: "codex_model_changed" }), { kind: "new", reason: "spec_drop", dropReason: "codex_model_changed" });
+  assert.deepEqual(chooseSession({ sessionId: "session-1", specDrop: "model_changed" }), { kind: "new", reason: "spec_drop", dropReason: "model_changed" });
 });
 
 test("rule 2, task #10: a session that needs a reset refuses the start, never a new session", () => {
@@ -65,8 +65,8 @@ test("precedence: the spec drop wins over the refusal (a dropped session is not 
 
 test("precedence: the spec drop wins over the recycle (no briefing for a dropped session)", () => {
   assert.deepEqual(
-    chooseSession({ sessionId: "session-1", specDrop: "codex_model_changed", wakeRecycle: recycle }),
-    { kind: "new", reason: "spec_drop", dropReason: "codex_model_changed" },
+    chooseSession({ sessionId: "session-1", specDrop: "model_changed", wakeRecycle: recycle }),
+    { kind: "new", reason: "spec_drop", dropReason: "model_changed" },
   );
 });
 

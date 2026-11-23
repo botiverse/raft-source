@@ -87,7 +87,7 @@ describe("input delay", () => {
 describe("isMessageRoute", () => {
   it("is a channel's page or a message's context, and nothing else under the prefix", () => {
     expect(["/api/messages/channel/:id", "/api/messages/context/:id"].every(isMessageRoute)).toBe(true);
-    expect(["/api/messages/sync", "/api/messages/search", "/api/messages/channel/:id/human-outline", "/api/messages/channel/:id/by-activity", "/api/messages"].some(isMessageRoute)).toBe(false);
+    expect(["/api/messages/sync", "/api/messages/search", "/api/messages/channel/:id/human-outline", "/api/messages"].some(isMessageRoute)).toBe(false);
   });
 });
 

@@ -34,8 +34,7 @@ export interface BoundedRuntimeFormProbe {
  *   already maps to `probe_timeout` / its bundled list.
  * - When the replay to the owner replica failed, routing reports the probe as
  *   answerable here and the probe reads only the shared cache: the resolver
- *   still runs, so saved-connection enrichment and revision checks are the
- *   same as for a live answer.
+ *   still runs, so its revision checks are the same as for a live answer.
  */
 export function createBoundedRuntimeFormProbe(input: {
   machine: { daemonVersion?: string | null; computerVersion?: string | null };

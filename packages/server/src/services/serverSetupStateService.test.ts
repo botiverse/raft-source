@@ -683,7 +683,19 @@ test("Drizzle adapter persists transitions and rejects arbitrary onboarding agen
     machineId: machine.id,
   }).returning();
   await db.insert(serverAgentMembers).values({ serverId: server.id, agentId: arbitraryAgent.id, role: "admin" });
+  // Picked as the joiner greeter it is not Cindy at all: missing, not unusable.
   await db.update(servers).set({ onboardingAgentId: arbitraryAgent.id }).where(eq(servers.id, server.id));
+  const greeterOnly = await resolveServerSetupLiveFacts(server.id, owner.id, { getMachineStatus: async () => "online" });
+  assert.equal(greeterOnly.officialOnboardingAgent, "missing");
+  assert.equal(greeterOnly.everHadAgent, true, "the reset guard still refuses on a greeter, so no reset is offered");
+  await assert.rejects(
+    transitionServerSetupState({ serverId: server.id, userId: owner.id, actor, action: "complete" }),
+    (error: unknown) => error instanceof ServerSetupStateError,
+  );
+  assert.equal((await getServerSetupState(server.id, owner.id))?.status, "in_progress");
+
+  // Recorded as the official onboarding agent it is checked, and fails the identity test.
+  await db.update(servers).set({ officialOnboardingAgentId: arbitraryAgent.id }).where(eq(servers.id, server.id));
 
   await assert.rejects(
     transitionServerSetupState({ serverId: server.id, userId: owner.id, actor, action: "complete" }),
@@ -702,7 +714,7 @@ test("Drizzle adapter persists transitions and rejects arbitrary onboarding agen
     machineId: machine.id,
   }).returning();
   await db.insert(serverAgentMembers).values({ serverId: server.id, agentId: officialAgent.id, role: "admin" });
-  await db.update(servers).set({ onboardingAgentId: officialAgent.id }).where(eq(servers.id, server.id));
+  await db.update(servers).set({ officialOnboardingAgentId: officialAgent.id }).where(eq(servers.id, server.id));
 
   const completed = await transitionServerSetupState({
     serverId: server.id,

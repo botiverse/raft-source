@@ -7,6 +7,15 @@ import { computerFetch } from "./proxy";
 import { isValidServerId } from "./paths";
 import { COMPUTER_VERSION } from "./version";
 import { classifyAdoptLegacyAccessResponse, type AdoptLegacyAccessResult } from "./lib/adoptLegacyResponse";
+import type { LoginModeFallbackReason } from "./lib/events";
+
+/**
+ * The User-Agent of the device-auth requests (authorize, poll, loopback
+ * redeem): the Server keeps it on the authorization (#wg-device-auth:#1), so
+ * a login can be traced to the Computer version and OS/arch that started it
+ * (undici's default names neither).
+ */
+export const DEVICE_AUTH_USER_AGENT = `raft-computer/${COMPUTER_VERSION} (${process.platform}; ${process.arch})`;
 
 export interface DeviceAuthorizeResult {
   deviceCode: string;
@@ -14,7 +23,75 @@ export interface DeviceAuthorizeResult {
   verificationUri: string;
   expiresIn: number;
   interval: number;
+  /**
+   * Only when `pairing` was sent: true when the server linked this request
+   * to the Add Computer window the command was copied from (it can be
+   * approved there). Absent from an older server, which ignores `pairing`.
+   */
+  paired?: boolean;
 }
+
+/**
+ * The Add Computer window a copied setup command came from
+ * (docs/contracts/computer-pairing.md): sent on a computer grant's
+ * device-code authorize so the server can show the request in that window.
+ * `pairingId` routes only and grants nothing, but it is never logged, traced
+ * or put on an event or an error.
+ */
+export interface DevicePairingRequest {
+  pairingId: string;
+  /** The server the command sets up (bare slug). */
+  serverSlug: string;
+}
+
+/**
+ * What authorize is sent to finish by loopback redirect (RFC 8252 + PKCE
+ * S256) instead of a typed code: the browser comes back to `returnUri` on
+ * this machine with a one-time code, redeemed with the PKCE verifier.
+ */
+export interface DeviceLoopbackRequest {
+  /** `http://127.0.0.1:<port>/callback?state=<state>` */
+  returnUri: string;
+  /** base64url(sha256(verifier)) */
+  codeChallenge: string;
+}
+
+/** A server that supports loopback answers with this; there is no code to type or poll. */
+export interface LoopbackAuthorizeResult {
+  requestId: string;
+  /** The approval page for this request (opened in this machine's browser). */
+  approvalUrl: string;
+  expiresIn: number;
+}
+
+/**
+ * Authorize with `loopback`: a server that supports it answers `loopback`; an
+ * older one ignores the field and answers (and has already started) a
+ * device-code request, which is then used as is.
+ */
+export type LoopbackAuthorizeOutcome =
+  | { kind: "loopback"; authorization: LoopbackAuthorizeResult }
+  | { kind: "device"; authorization: DeviceAuthorizeResult };
+
+/**
+ * The server refused the `loopback` field itself at authorize (400 with a
+ * loopback refusal code). Nothing was started there; a device-code request
+ * can be made instead.
+ */
+export class DeviceLoopbackRejectedError extends Error {
+  constructor(readonly code: string) {
+    super(`the server refused the loopback request (${code})`);
+    this.name = "DeviceLoopbackRejectedError";
+  }
+}
+
+const LOOPBACK_REFUSAL_CODES = new Set([
+  "loopback_invalid",
+  "loopback_grant_required",
+  "return_uri_not_allowed",
+  "code_challenge_method_unsupported",
+  "code_challenge_invalid",
+]);
 
 /**
  * A one-time grant asked for at authorize (device-auth design v2 §3.1): "add
@@ -82,14 +159,67 @@ export class DeviceAuthClient {
     return new URL(p, this.baseUrl).toString();
   }
 
-  async authorize(clientName: string, grant?: DeviceGrantRequest): Promise<DeviceAuthorizeResult> {
+  /**
+   * `loginFallbackReason`: why this device-code request replaced a loopback
+   * login, kept on the Server's row for audit only (an older Server ignores
+   * it). Absent when loopback was never involved.
+   */
+  async authorize(
+    clientName: string,
+    grant?: DeviceGrantRequest,
+    pairing?: DevicePairingRequest,
+    loginFallbackReason?: LoginModeFallbackReason,
+  ): Promise<DeviceAuthorizeResult> {
+    // A pairing goes only with a one-time computer grant (the server links
+    // nothing else). An older server ignores the two fields.
+    const paired = grant && pairing ? { pairingId: pairing.pairingId, serverSlug: pairing.serverSlug } : {};
+    const fallback = loginFallbackReason ? { loginFallbackReason } : {};
+    const { body } = await this.postAuthorize(grant ? { clientName, grant, ...paired, ...fallback } : { clientName, ...fallback }, grant);
+    const authorization = asDeviceAuthorization(body);
+    return grant && pairing ? { ...authorization, paired: body?.paired === true } : authorization;
+  }
+
+  /**
+   * Authorize a one-time grant to be finished by loopback redirect. An older
+   * server ignores `loopback` and answers with a device code (`kind:
+   * "device"`); that request is already started, so it is used, not repeated.
+   */
+  async authorizeLoopback(
+    clientName: string,
+    grant: DeviceGrantRequest,
+    loopback: DeviceLoopbackRequest,
+  ): Promise<LoopbackAuthorizeOutcome> {
+    const { body } = await this.postAuthorize(
+      { clientName, grant, loopback: { returnUri: loopback.returnUri, codeChallenge: loopback.codeChallenge, codeChallengeMethod: "S256" } },
+      grant,
+      true,
+    );
+    if (body && typeof body.approvalUrl === "string") {
+      if (
+        typeof body.requestId !== "string" ||
+        body.requestId.length === 0 ||
+        typeof body.expiresIn !== "number" ||
+        !Number.isFinite(body.expiresIn)
+      ) {
+        throw new Error("device authorize returned an unexpected response — server may be incompatible");
+      }
+      return {
+        kind: "loopback",
+        authorization: { requestId: body.requestId, approvalUrl: body.approvalUrl, expiresIn: body.expiresIn },
+      };
+    }
+    return { kind: "device", authorization: asDeviceAuthorization(body) };
+  }
+
+  private async postAuthorize(
+    payload: Record<string, unknown>,
+    grant: DeviceGrantRequest | undefined,
+    loopback = false,
+  ): Promise<{ body: Record<string, unknown> | null }> {
     const res = await computerFetch(this.url("/api/auth/device/authorize"), {
       method: "POST",
-      // #wg-device-auth:#1: the Server records the requester's User-Agent on
-      // the authorization, so a login can be traced to the Computer version
-      // that started it (undici's default names no version).
-      headers: { "Content-Type": "application/json", "User-Agent": `raft-computer/${COMPUTER_VERSION}` },
-      body: JSON.stringify(grant ? { clientName, grant } : { clientName }),
+      headers: { "Content-Type": "application/json", "User-Agent": DEVICE_AUTH_USER_AGENT },
+      body: JSON.stringify(payload),
     });
     if (res.status === 404) {
       throw new Error(
@@ -103,15 +233,12 @@ export class DeviceAuthClient {
       // grant_invalid: what Servers from before that code answer for an unknown
       // kind; drop it once no supported Server answers that way.
       if (code === "grant_kind_unsupported" || code === "grant_invalid") throw new DeviceGrantRejectedError(code);
+      if (loopback && code && LOOPBACK_REFUSAL_CODES.has(code)) throw new DeviceLoopbackRejectedError(code);
     }
     if (res.status !== 201) {
       throw new Error(`device authorize failed (HTTP ${res.status}) — check --server-url / server version`);
     }
-    const body = (await res.json().catch(() => null)) as DeviceAuthorizeResult | null;
-    if (!body || typeof body.deviceCode !== "string" || typeof body.userCode !== "string") {
-      throw new Error("device authorize returned an unexpected response — server may be incompatible");
-    }
-    return body;
+    return { body: (await res.json().catch(() => null)) as Record<string, unknown> | null };
   }
 
   /**
@@ -120,69 +247,98 @@ export class DeviceAuthClient {
    * cancel) aborts it too.
    */
   async token(deviceCode: string, signal?: AbortSignal): Promise<DeviceTokenResult> {
+    return this.postToken({ deviceCode }, signal);
+  }
+
+  /**
+   * Redeem a loopback approval: the one-time code the browser brought back
+   * plus the PKCE verifier. Same answers as a device-code poll; never
+   * `pending`. Bounded by DEVICE_TOKEN_TIMEOUT_MS like a poll.
+   */
+  async redeemLoopback(
+    input: { requestId: string; code: string; codeVerifier: string },
+    signal?: AbortSignal,
+  ): Promise<DeviceTokenResult> {
+    return this.postToken({ requestId: input.requestId, code: input.code, codeVerifier: input.codeVerifier }, signal);
+  }
+
+  private async postToken(payload: Record<string, string>, signal?: AbortSignal): Promise<DeviceTokenResult> {
     const timeout = AbortSignal.timeout(DEVICE_TOKEN_TIMEOUT_MS);
     const res = await computerFetch(this.url("/api/auth/device/token"), {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ deviceCode }),
+      // The Server records the poll's User-Agent as consumed_user_agent.
+      headers: { "Content-Type": "application/json", "User-Agent": DEVICE_AUTH_USER_AGENT },
+      body: JSON.stringify(payload),
       signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
     });
     const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    // A one-time grant's answer is recognised by its shape: `kind` plus a
-    // `dvat_*` token. A session is only ever taken from an answer that is not
-    // a grant answer, so an answer carrying both is never read as a session.
-    if (res.status === 200 && body && body.kind === "computer_attach") {
-      if (
-        typeof body.attachToken === "string" &&
-        body.attachToken.startsWith(ATTACH_TOKEN_PREFIX) &&
-        typeof body.serverId === "string" &&
-        // A server id names a local directory (servers/<id>/): only a UUID.
-        isValidServerId(body.serverId) &&
-        typeof body.serverSlug === "string" &&
-        body.serverSlug.length > 0
-      ) {
-        return {
-          status: "attach_token",
-          attachToken: body.attachToken,
-          serverId: body.serverId,
-          serverSlug: body.serverSlug,
-        };
-      }
-      return { status: "error", code: "unexpected_response" };
-    }
-    if (res.status === 200 && body && body.kind === "computer_migrate") {
-      if (
-        typeof body.migrateToken === "string" &&
-        body.migrateToken.startsWith(MIGRATE_TOKEN_PREFIX) &&
-        body.migrateToken.length > MIGRATE_TOKEN_PREFIX.length &&
-        typeof body.serverId === "string" &&
-        isValidServerId(body.serverId) &&
-        typeof body.serverSlug === "string" &&
-        body.serverSlug.length > 0
-      ) {
-        return {
-          status: "migrate_token",
-          migrateToken: body.migrateToken,
-          serverId: body.serverId,
-          serverSlug: body.serverSlug,
-        };
-      }
-      return { status: "error", code: "unexpected_response" };
-    }
-    if (res.status === 200 && body && typeof body.accessToken === "string") {
+    return parseDeviceTokenResponse(res.status, body);
+  }
+}
+
+function asDeviceAuthorization(body: Record<string, unknown> | null): DeviceAuthorizeResult {
+  if (!body || typeof body.deviceCode !== "string" || typeof body.userCode !== "string") {
+    throw new Error("device authorize returned an unexpected response — server may be incompatible");
+  }
+  return body as unknown as DeviceAuthorizeResult;
+}
+
+/** One `/api/auth/device/token` answer, by status and body (device-code poll and loopback redeem alike). */
+function parseDeviceTokenResponse(status: number, body: Record<string, unknown> | null): DeviceTokenResult {
+  // A one-time grant's answer is recognised by its shape: `kind` plus a
+  // `dvat_*` token. A session is only ever taken from an answer that is not
+  // a grant answer, so an answer carrying both is never read as a session.
+  if (status === 200 && body && body.kind === "computer_attach") {
+    if (
+      typeof body.attachToken === "string" &&
+      body.attachToken.startsWith(ATTACH_TOKEN_PREFIX) &&
+      typeof body.serverId === "string" &&
+      // A server id names a local directory (servers/<id>/): only a UUID.
+      isValidServerId(body.serverId) &&
+      typeof body.serverSlug === "string" &&
+      body.serverSlug.length > 0
+    ) {
       return {
-        status: "success",
-        accessToken: body.accessToken as string,
-        refreshToken: String(body.refreshToken ?? ""),
-        userId: String(body.userId ?? ""),
+        status: "attach_token",
+        attachToken: body.attachToken,
+        serverId: body.serverId,
+        serverSlug: body.serverSlug,
       };
     }
-    const code = body && typeof body.code === "string" ? (body.code as string) : `http_${res.status}`;
-    if (code === "authorization_pending") return { status: "pending" };
-    if (code === "access_denied") return { status: "denied" };
-    if (code === "expired_token") return { status: "expired" };
-    return { status: "error", code };
+    return { status: "error", code: "unexpected_response" };
   }
+  if (status === 200 && body && body.kind === "computer_migrate") {
+    if (
+      typeof body.migrateToken === "string" &&
+      body.migrateToken.startsWith(MIGRATE_TOKEN_PREFIX) &&
+      body.migrateToken.length > MIGRATE_TOKEN_PREFIX.length &&
+      typeof body.serverId === "string" &&
+      isValidServerId(body.serverId) &&
+      typeof body.serverSlug === "string" &&
+      body.serverSlug.length > 0
+    ) {
+      return {
+        status: "migrate_token",
+        migrateToken: body.migrateToken,
+        serverId: body.serverId,
+        serverSlug: body.serverSlug,
+      };
+    }
+    return { status: "error", code: "unexpected_response" };
+  }
+  if (status === 200 && body && typeof body.accessToken === "string") {
+    return {
+      status: "success",
+      accessToken: body.accessToken as string,
+      refreshToken: String(body.refreshToken ?? ""),
+      userId: String(body.userId ?? ""),
+    };
+  }
+  const code = body && typeof body.code === "string" ? (body.code as string) : `http_${status}`;
+  if (code === "authorization_pending") return { status: "pending" };
+  if (code === "access_denied") return { status: "denied" };
+  if (code === "expired_token") return { status: "expired" };
+  return { status: "error", code };
 }
 
 // --- Computer attach (RFC v0.8 contract v3 §6/§9) ---
@@ -992,12 +1148,13 @@ export class ComputerSelfClient {
     return new URL(p, this.baseUrl).toString();
   }
 
-  async self(): Promise<ComputerSelfResult> {
+  async self(opts: { signal?: AbortSignal } = {}): Promise<ComputerSelfResult> {
     let res: Awaited<ReturnType<typeof fetch>>;
     try {
       res = await computerFetch(this.url("/internal/computer/self"), {
         method: "GET",
         headers: { Authorization: `Bearer ${this.computerApiKey}` },
+        ...(opts.signal ? { signal: opts.signal } : {}),
       });
     } catch {
       return { status: "error", code: "request_failed" };

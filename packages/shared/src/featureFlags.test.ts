@@ -1,9 +1,14 @@
 import { strict as assert } from "node:assert";
 
 import {
+  AGENT_FOCUS_FEATURE_FLAG_KEY,
   AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY,
   AGENT_REACTION_NOTICES_FEATURE_FLAG_KEY,
+  ARTIFACT_SETTLED_FEATURE_FLAG_KEY,
+  LINK_CARD_CHANGED_HINTS_FEATURE_FLAG_KEY,
+  CONTINUATION_TOOL_FEATURE_FLAG_KEY,
   CONTINUATIONS_PILOT_FEATURE_FLAG_KEY,
+  INBOX_NOTICE_SERVER_ROWS_FEATURE_FLAG_KEY,
   isSlackBridgeProductFeatureFlagKey,
   MOBILE_INBOX_INPLACE_FEATURE_FLAG_KEY,
   SLACK_BRIDGE_FEATURE_FLAG_KEYS,
@@ -35,6 +40,31 @@ test("Slack Bridge exposes product flags without hidden per-direction fuses", ()
 test("the continuation pilot has its own server flag key", () => {
   // FFA rules are stored by key: renaming it would silently orphan a rollout.
   assert.equal(CONTINUATIONS_PILOT_FEATURE_FLAG_KEY, "continuations_pilot_v0");
+});
+
+test("the continuation answer tool has its own server flag key", () => {
+  // FFA rules are stored by key: renaming it would silently orphan a rollout.
+  assert.equal(CONTINUATION_TOOL_FEATURE_FLAG_KEY, "continuation_tool_v0");
+});
+
+test("the wake-up notice with the Server's numbers has its own server flag key", () => {
+  // FFA rules are stored by key: renaming it would silently orphan a rollout.
+  assert.equal(INBOX_NOTICE_SERVER_ROWS_FEATURE_FLAG_KEY, "inbox_notice_server_rows_v0");
+});
+
+test("settled Artifacts have their own server flag key", () => {
+  // FFA rules are stored by key: renaming it would silently orphan a rollout.
+  assert.equal(ARTIFACT_SETTLED_FEATURE_FLAG_KEY, "artifact_settled_v0");
+});
+
+test("link cards that update themselves have their own server flag key", () => {
+  // FFA rules are stored by key: renaming it would silently orphan a rollout.
+  assert.equal(LINK_CARD_CHANGED_HINTS_FEATURE_FLAG_KEY, "link_card_changed_hints");
+});
+
+test("Focus has its own server flag key", () => {
+  // FFA rules are stored by key: renaming it would silently orphan a rollout.
+  assert.equal(AGENT_FOCUS_FEATURE_FLAG_KEY, "agent_focus_v0");
 });
 
 test("RFC 081 inbox items have their own server flag key", () => {

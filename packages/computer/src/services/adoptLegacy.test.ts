@@ -255,6 +255,8 @@ test("adoptLegacy service: happy path emits adopting + preflight + adopted, writ
       assert.equal(persisted.apiKey, "sk_computer_test1234567890abcdef");
       assert.equal(persisted.adoptedFromLegacy, true);
       assert.equal(persisted.legacyMachineId, "mch-1");
+      // The linked machines.id that status --json reports and Raft Desktop matches by.
+      assert.equal(persisted.machineId, "mch-1");
       assert.equal(
         persisted.legacyApiKeyFingerprint,
         createHash("sha256").update(LEGACY_KEY).digest("hex").slice(0, 16),

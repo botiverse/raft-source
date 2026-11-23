@@ -68,6 +68,16 @@ export type ActivityUnreadVerdict = {
   counts: boolean | null;
   /** It @-mentions the viewer, so the row's @ lights (also when it does not count). */
   mention: boolean;
+  /**
+   * It becomes the row's latest activity (its position, preview and order).
+   * False for every message past a channel or DM mute, a mention included:
+   * RisingWave keeps that row at its last message before the mute
+   * (rw_inbox_muted_prefix_v2's latest_seq stops at mute_from_seq;
+   * rw_inbox_serving_v9 shows it). The position rule then leaves the row as
+   * it is, except that a mention lights its @ (and moves a mention-only row,
+   * whose position is its highest mention).
+   */
+  moves: boolean;
 };
 
 export function activityLiveUnread(
@@ -76,15 +86,17 @@ export function activityLiveUnread(
   scope: ActivityUnreadScope,
 ): ActivityUnreadVerdict {
   const own = message.senderType === viewer.type && message.senderId === viewer.id;
-  if (own || scope.readOnArrival) return { counts: false, mention: false };
   const isThreadRow = scope.rowKind === "thread" || scope.rowKind === "task";
+  const mentionsViewer = (message.mentions ?? []).some((target) => target.type === viewer.type && target.id === viewer.id);
+  // The mute decides whether the row moves, whoever sent it and whether it is read.
+  const moves = isThreadRow || !scope.activityMuted;
+  if (own || scope.readOnArrival) return { counts: false, mention: false, moves };
   // An unfollowed thread row: no count and no @, even for a mention of the
   // viewer. Correct only because a mention makes the server follow the thread
   // for them and send the change that makes the client re-read the row; it
   // does not mean mentions in unfollowed threads are dropped.
-  if (isThreadRow && scope.threadFollowed === false) return { counts: false, mention: false };
-  const mention = (message.mentions ?? []).some((target) => target.type === viewer.type && target.id === viewer.id);
-  return { counts: countsForViewer(message, viewer, scope), mention };
+  if (isThreadRow && scope.threadFollowed === false) return { counts: false, mention: false, moves };
+  return { counts: countsForViewer(message, viewer, scope), mention: mentionsViewer, moves };
 }
 
 function countsForViewer(message: ActivityUnreadMessage, viewer: ActivityUnreadViewer, scope: ActivityUnreadScope): boolean | null {

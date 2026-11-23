@@ -175,6 +175,16 @@ export function sanitizeRouteErrorMessage(message: string): string {
     .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[jwt redacted]")
     .replace(/sk_(?:agent|machine|computer|daemon)_[A-Za-z0-9_-]+/g, "sk_[redacted]")
     .replace(/sap_[A-Za-z0-9_-]+/g, "sap_[redacted]")
+    // Customer model provider API keys (#proj-runtime:#79) and sealed envelopes.
+    .replace(/\bsk-ant-[A-Za-z0-9_-]{8,}/g, "sk-ant-[redacted]")
+    .replace(/\bsk-proj-[A-Za-z0-9_-]{8,}/g, "sk-proj-[redacted]")
+    .replace(/\bsk-or-(?:v1-)?[A-Za-z0-9_-]{8,}/g, "sk-or-[redacted]")
+    .replace(/\bsk-(?:svcacct|admin)-[A-Za-z0-9_-]{8,}/g, "sk-[redacted]")
+    .replace(/\bsk-[A-Za-z0-9_-]{20,}/g, "sk-[redacted]")
+    .replace(/\bAIza[0-9A-Za-z_-]{20,}/g, "AIza[redacted]")
+    .replace(/\bgsk_[A-Za-z0-9_-]{16,}/g, "gsk_[redacted]")
+    .replace(/\bxai-[A-Za-z0-9_-]{16,}/g, "xai-[redacted]")
+    .replace(/(?:[0-9a-f]{16}:)?env-aes-256-gcm:v\d+:[A-Za-z0-9_-]+/g, "[sealed redacted]")
     // Any scheme, not just http(s): a connection string pasted into an error
     // is `postgres://user:pw@host/...`, and an `https?`-only rule lets the whole
     // thing through -- credentials included. Kept in step with

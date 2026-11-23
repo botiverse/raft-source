@@ -19,7 +19,7 @@ import { foldAgentOneLineText, indentAgentBodyContinuationLines, quoteAgentOneLi
 import { agentTaskThreadTarget } from "../agentText/tasks";
 import { lazySchema } from "../lazySchema";
 import { formatHint, formatHintName, hintStep, RAFT_HINTS, type RaftHintOptions, type RaftHintStyle } from "./hint";
-import { CLI_NEXT_ACTION_PATTERN, failureFromClientResult, failureOutcome, formatOpErrorText, keyedWriteFailure, opError, validateOpRequest, type RaftFailure, type RaftNextStep, type RaftOutcome } from "./outcome";
+import { failureFromClientResult, failureOutcome, formatOpErrorText, keyedWriteFailure, namesCliCommand, opError, validateOpRequest, type RaftFailure, type RaftNextStep, type RaftOutcome } from "./outcome";
 import { requestSchema } from "./requestSchema";
 import { getParentTargetForThread } from "./seenPolicy/consumedSeqs";
 
@@ -501,7 +501,7 @@ function withdrawFailure(
   const serverStep = typeof error.suggestedNextAction === "string" ? error.suggestedNextAction.trim() : "";
   const prepare = formatHintName(RAFT_HINTS.actionPrepareName(), style);
   // The Server's step where it wrote one, else ours; a tool-mode caller gets ours when the Server's names a CLI command.
-  const step = (own: string) => (serverStep && (style === "cli" || !CLI_NEXT_ACTION_PATTERN.test(serverStep)) ? serverStep : own);
+  const step = (own: string) => (serverStep && (style === "cli" || !namesCliCommand(serverStep)) ? serverStep : own);
   const code = failure.error.serverCode;
   if (code === QUESTION_CARD_ERROR_CODES.alreadyAnswered) {
     const metadata = error.response && typeof error.response === "object" ? (error.response as { metadata?: unknown }).metadata : undefined;

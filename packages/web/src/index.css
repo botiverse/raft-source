@@ -1220,8 +1220,15 @@
    start edge; the rest is clipped, with no scrollbar (clip, not hidden: no
    scroll container), and fades over its last --fade-edge (24px, raft-ui's
    sideways edge fade, as the row tabs' mask-fade-x) so the cut reads as
-   content going on. The column itself does not clip:
-   its resize handle stands over its edge. */
+   content going on. Only text, rows and controls fade: the mask reveals the
+   column's own surface behind them. Full-bleed media that is the body under
+   the head (an HTML or PDF Artifact's frame, an image, the page beside the
+   conversation; `data-clip-edge="cut"`) stops on a hard line at the column's
+   edge instead: faded, a dark page would show the lighter surface behind it
+   as a glow (raft-design spacing.md "Edges fade", responsive.md;
+   #proj-raft-ui:#270; mobile #5016). A Markdown Artifact is a document, text:
+   it fades. Media inside a list (a message's image) fades with the list.
+   The column itself does not clip: its resize handle stands over its edge. */
 [data-slot="thread-panel-root"] {
   --content-min: 360px;
 }
@@ -1315,6 +1322,14 @@
   min-width: var(--content-min, 0px);
   -webkit-mask-image: linear-gradient(to right, #000 calc(var(--clip-width) - var(--clip-fade)), transparent var(--clip-width));
   mask-image: linear-gradient(to right, #000 calc(var(--clip-width) - var(--clip-fade)), transparent var(--clip-width));
+}
+
+/* Full-bleed media is cut hard (Rule 2 above): the content's minimum and the
+   clip stay, the fade goes. `:not(#_)` outranks the rule above's
+   RowRegionBody selector. */
+[data-clipped] [data-clip-edge="cut"]:not(#_) {
+  -webkit-mask-image: none;
+  mask-image: none;
 }
 
 /* The Artifact loading splash in a clipped column: its icon and line centre

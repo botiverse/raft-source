@@ -10,25 +10,67 @@ import { buildVitestArguments } from "../scripts/runTestShard";
 import { watchSpawnedChildExit } from "../scripts/runServerShardWithWatchdog";
 import { formatFileTimings, readFileTimings, recordFileTiming, SERVER_SHARD_TIMINGS_ENV } from "../scripts/serverShardTimings";
 
-test("file timing summaries keep completed work, distinguish active time, and report truncated metadata", () => {
+test("file timing summaries keep completed work, distinguish active time with its worker, and report truncated metadata", () => {
   const directory = mkdtempSync(path.join(tmpdir(), "raft-shard-timing-summary-"));
   const journal = path.join(directory, "timings.jsonl");
   try {
     recordFileTiming(journal, { event: "run-start", files: 3 });
     recordFileTiming(journal, { event: "queued", file: "finished.test.ts", at: 100 });
     recordFileTiming(journal, { event: "finished", file: "finished.test.ts", durationMs: 7, wallMs: 12, state: "passed" });
+    // A worker can report its file (src/test/setup/shardFileWorker.ts) before the coordinator queues it.
+    recordFileTiming(journal, { event: "worker", file: "active.test.ts", pid: 4242 });
     recordFileTiming(journal, { event: "queued", file: "active.test.ts", at: 110 });
     appendFileSync(journal, '{"event":"finished"');
     const summary = readFileTimings(journal, 150);
     assert.deepEqual(summary.completed.map(({ file, durationMs, wallMs }) => ({ file, durationMs, wallMs })),
       [{ file: "finished.test.ts", durationMs: 7, wallMs: 12 }]);
-    assert.deepEqual(summary.unfinished, [{ file: "active.test.ts", elapsedMs: 40 }]);
+    assert.deepEqual(summary.unfinished, [{ file: "active.test.ts", elapsedMs: 40, workerPid: 4242 }]);
     assert.equal(summary.notStarted, 1);
     assert.equal(summary.invalidRecords, 1);
     assert.equal(summary.runFinished, false, "an interrupted run is not reported as complete");
     const text = formatFileTimings(2, "watchdog", summary);
     assert.match(text, /\[serverShardTimings\] completed .*finished\.test\.ts/);
     assert.match(text, /\[serverShardTimings\] unfinished .*active\.test\.ts/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("reuse-probe counts survive the journal and add up on the shard summary line", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "raft-shard-timing-reuse-"));
+  const journal = path.join(directory, "timings.jsonl");
+  try {
+    recordFileTiming(journal, { event: "run-start", files: 4 });
+    recordFileTiming(journal, { event: "finished", file: "a.api.test.ts", durationMs: 9, wallMs: 10, state: "passed", integrationCases: 2, phasesMs: { database: 2 }, reuse: { probed: 2, reusable: 1, "drop.catalog": 1 } });
+    recordFileTiming(journal, { event: "finished", file: "b.api.test.ts", durationMs: 5, wallMs: 6, state: "passed", integrationCases: 1, phasesMs: { database: 1 }, reuse: { probed: 1, reusable: 1 } });
+    recordFileTiming(journal, { event: "finished", file: "c.api.test.ts", durationMs: 5, wallMs: 6, state: "passed", integrationCases: 1, phasesMs: { database: 1 } });
+    appendFileSync(journal, `${JSON.stringify({ event: "finished", file: "bad.test.ts", durationMs: 1, wallMs: 1, state: "passed", integrationCases: 1, phasesMs: { database: 1 }, reuse: { probed: -1 } })}\n`);
+    const summary = readFileTimings(journal);
+    assert.equal(summary.invalidRecords, 1, "a negative count is an invalid record");
+    assert.deepEqual(summary.completed.find((file) => file.file === "a.api.test.ts")?.reuse, { probed: 2, reusable: 1, "drop.catalog": 1 });
+    assert.equal(summary.completed.find((file) => file.file === "c.api.test.ts")?.reuse, undefined);
+    const text = formatFileTimings(1, "exit", summary);
+    assert.match(text, /\[serverShardTimings\] summary .*"integrationCases":4,"phasesMs":\{"database":4\},"reuse":\{"probed":3,"reusable":2,"drop\.catalog":1\}/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("integration phase totals survive the journal and add up on the shard summary line", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "raft-shard-timing-phases-"));
+  const journal = path.join(directory, "timings.jsonl");
+  try {
+    recordFileTiming(journal, { event: "run-start", files: 3 });
+    recordFileTiming(journal, { event: "finished", file: "a.api.test.ts", durationMs: 9, wallMs: 10, state: "passed", integrationCases: 2, phasesMs: { database: 1.4, app: 2 } });
+    recordFileTiming(journal, { event: "finished", file: "b.api.test.ts", durationMs: 5, wallMs: 6, state: "passed", integrationCases: 1, phasesMs: { database: 0.4 } });
+    recordFileTiming(journal, { event: "finished", file: "unit.test.ts", durationMs: 1, wallMs: 2, state: "passed" });
+    appendFileSync(journal, `${JSON.stringify({ event: "finished", file: "bad.test.ts", durationMs: 1, wallMs: 1, state: "passed", integrationCases: 1, phasesMs: { database: -1 } })}\n`);
+    const summary = readFileTimings(journal);
+    assert.equal(summary.invalidRecords, 1, "a negative phase time is an invalid record");
+    assert.deepEqual(summary.completed.find((file) => file.file === "a.api.test.ts")?.phasesMs, { database: 1.4, app: 2 });
+    const text = formatFileTimings(1, "exit", summary);
+    assert.match(text, /\[serverShardTimings\] summary .*"integrationCases":3,"phasesMs":\{"database":2,"app":2\}/);
+    assert.match(text, /\[serverShardTimings\] completed \{"file":"unit\.test\.ts","durationMs":1,"wallMs":2,"state":"passed"\}/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -41,7 +83,8 @@ test("the real Vitest reporter and watchdog retain a completed file and an unfin
   const config = path.join(directory, "vitest.config.mjs");
   const passed = path.join(directory, "a.test.ts");
   const unfinished = path.join(directory, "b.test.ts");
-  writeFileSync(passed, 'test("completed", () => { expect(1).toBe(1); });\n');
+  writeFileSync(passed, 'test("completed", ({ task }) => { task.meta.integrationPhasesMs = { database: 5, app: 2 }; expect(1).toBe(1); });\n'
+    + 'test("no integration fixtures", () => { expect(1).toBe(1); });\n');
   writeFileSync(unfinished, 'test("unfinished", async () => { await new Promise(() => {}); });\n');
   writeFileSync(config, `export default {
     root: ${JSON.stringify(directory)},
@@ -76,7 +119,8 @@ test("the real Vitest reporter and watchdog retain a completed file and an unfin
     assert.equal(exitCode, 124, "timing collection cannot turn a hung test green");
     assert.equal(output.length, 1, "the real watchdog emits one final summary");
     assert.match(output[0], /"reason":"watchdog"/);
-    assert.match(output[0], /\[serverShardTimings\] completed .*a\.test\.ts/);
+    assert.match(output[0], /\[serverShardTimings\] completed .*a\.test\.ts.*"integrationCases":1,"phasesMs":\{"database":5,"app":2\}/,
+      "phase timings a case leaves on its meta reach the reporter");
     assert.match(output[0], /\[serverShardTimings\] unfinished .*b\.test\.ts/);
     // Vitest can report its interrupted run end after SIGTERM, before SIGKILL.
     // runFinished records that callback, not whether every file completed.

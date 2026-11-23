@@ -47,6 +47,7 @@ import { oauthClientIsUserManagedPredicate } from "./oauthClientManagementPolicy
 import { deriveAppMemberRef } from "./appOutboundProjectionService";
 import { agentFindableBy } from "./agentMemberListPolicy";
 import { responseRequestId } from "./externalRequestCorrelation";
+import { isAccountLoginEnabledFor } from "./oauthAccountLogin";
 
 const DELIVERY_LOCK_TIMEOUT_MS = 2 * 60 * 1000;
 const DELIVERY_TIMEOUT_MS = 10_000;
@@ -518,10 +519,21 @@ export function kickAppNotificationDelivery(): void {
 
 /**
  * Render an event subject for one installation. A member is identified by the
- * installation-scoped member_ref. `sub` is added only when this principal has
- * already signed in to this same app on this same Server, and it is exactly
- * the `sub` that app received then (RFC 051 amendment, 2026-10-05): it tells
- * the app nothing it does not already know.
+ * installation-scoped member_ref. `sub` is added only when the App already
+ * received exactly this `sub` at a sign-in (RFC 051 amendment, 2026-10-05), so
+ * it tells the App nothing it does not already know:
+ * - this principal signed in to this same App on this same Server (server
+ *   mode, and every Agent); or
+ * - RFC 079 D18 (allowed by D8): the person signed in to the App in account
+ *   mode, a login that names no Server. Then `sub` goes with their events on
+ *   every Server in the App's audience: a delivery goes only to an active
+ *   installation on the event's Server, and for a server-local App only its
+ *   own Server counts. Not with an event that shows them only as a guest
+ *   there (joining or leaving as one): a guest cannot use an account-mode App
+ *   on that Server (D7), as /servers does not list it. A role change into or
+ *   out of guest carries it, so the App learns whose access to suspend.
+ *   Only while the kill switch oauth_account_login is on for the person: off,
+ *   their account-mode login gives no `sub` (a Server-bound one still does).
  */
 async function renderEventSubject(
   event: typeof notificationEvents.$inferSelect,
@@ -532,20 +544,38 @@ async function renderEventSubject(
     return { type: event.subjectType, id: event.subjectId };
   }
   const principalType = event.provenance.principal_type === "agent" ? "agent" : "human";
+  const previousRole = event.provenance.previous_role;
+  const usableHere = event.provenance.role !== "guest" || (typeof previousRole === "string" && previousRole !== "guest");
   // Any token ever issued counts, expired or revoked included, on purpose: a
   // removal revokes the member's tokens in the same commit, and the App still
   // needs `sub` to know whose access to suspend. Do not add `revokedAt IS
   // NULL`. If expired tokens are ever pruned, keep a separate record of which
   // principal signed in to which App first, or early sign-ins lose `sub`.
-  const [signedIn] = await executor.select({ id: oauthAccessTokens.id }).from(oauthAccessTokens)
+  const [signedIn] = await executor.select({ serverId: oauthAccessTokens.serverId }).from(oauthAccessTokens)
+    .innerJoin(oauthClients, eq(oauthClients.id, oauthAccessTokens.clientId))
     .where(and(
       eq(oauthAccessTokens.clientId, installation.clientId),
-      eq(oauthAccessTokens.serverId, installation.serverId),
       eq(oauthAccessTokens.principalType, principalType),
       principalType === "agent"
         ? eq(oauthAccessTokens.agentId, event.subjectId)
         : eq(oauthAccessTokens.userId, event.subjectId),
-    )).limit(1);
+      or(
+        eq(oauthAccessTokens.serverId, installation.serverId),
+        principalType === "human" && usableHere
+          ? and(
+            isNull(oauthAccessTokens.serverId),
+            eq(oauthClients.loginMode, "account"),
+            or(eq(oauthClients.appType, "third_party_global"), eq(oauthClients.serverId, installation.serverId)),
+          )
+          : undefined,
+      ),
+    ))
+    // A login on this Server first: it needs no kill switch read.
+    .orderBy(sql`${oauthAccessTokens.serverId} ASC NULLS LAST`)
+    .limit(1);
+  // An account-mode login counts only while the kill switch is on for the
+  // person, read at send time (a retry reads it again).
+  const withSub = !!signedIn && (signedIn.serverId !== null || await isAccountLoginEnabledFor(event.subjectId, executor));
   return {
     type: "member",
     principal_type: principalType,
@@ -554,7 +584,7 @@ async function renderEventSubject(
       installationId: installation.id,
       principalId: event.subjectId,
     }),
-    ...(signedIn ? { sub: event.subjectId } : {}),
+    ...(withSub ? { sub: event.subjectId } : {}),
   };
 }
 

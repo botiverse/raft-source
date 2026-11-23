@@ -9,6 +9,7 @@ import { markClipped, registerSeamColumn } from "../ui/rowSeams";
 import { SEAM_COLUMN_MIN_WIDTH } from "../ui/seamCascade";
 import { CONVERSATION, planRow, SHORTCUT_HELP, sideColumnOf, splitPair, TASKS_PAGE_TASK, THREAD, unitWidths } from "./rowPlan";
 import type { PlanColumn, RowPlan } from "./rowPlan";
+import { applyRowFacts } from "./rowFacts";
 import { activeUnit, restoreRowExpand, useRowPlanStore } from "./rowPlanStore";
 
 /**
@@ -103,12 +104,61 @@ export interface RowPlanSource {
   taskExpanded?: boolean;
 }
 
+export interface LiveRowResizeRoom {
+  room: number | null;
+  viewportWidth: number;
+  panelHeight: number;
+  composerHeight: number;
+  rowWidth: number;
+  threadOpen: boolean;
+  threadInRow: boolean;
+  threadCoversRow: boolean;
+  threadMaximized: boolean;
+  legacyTask: boolean;
+  touchPortrait: boolean;
+}
+
+export type LiveRowResizeHandler = (prev: LiveRowResizeRoom, next: LiveRowResizeRoom) => boolean;
+
+export interface LiveRowLayoutBinding {
+  columns: readonly PlanColumn[];
+  thread: boolean;
+  helpBeside: boolean;
+  handlerRef: { current: LiveRowResizeHandler | null };
+}
+
+/** Whether two plans share the exact discrete topology (fold, units, tab groups, expansion, and no pending rebalance), differing only in continuous column widths. */
+export function samePlanTopology(a: RowPlan | null, b: RowPlan | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  if (a.fold !== b.fold || a.expanded !== b.expanded || a.expandedUnit !== b.expandedUnit) return false;
+  if (a.rebalance !== null || b.rebalance !== null) return false;
+  if (a.units.length !== b.units.length || a.groups.length !== b.groups.length) return false;
+  for (let i = 0; i < a.units.length; i += 1) {
+    const ua = a.units[i]!;
+    const ub = b.units[i]!;
+    if (ua.key !== ub.key || ua.regions.length !== ub.regions.length) return false;
+    for (let j = 0; j < ua.regions.length; j += 1) {
+      if (ua.regions[j] !== ub.regions[j]) return false;
+    }
+  }
+  for (let g = 0; g < a.groups.length; g += 1) {
+    const ga = a.groups[g]!;
+    const gb = b.groups[g]!;
+    if (ga.length !== gb.length) return false;
+    for (let j = 0; j < ga.length; j += 1) {
+      if (ga[j] !== gb[j]) return false;
+    }
+  }
+  return true;
+}
+
 /**
  * The row's plan (rowPlan `planRow`) from every column's saved width, published for the heads (rowPlanStore); null
  * where the row isn't planned. Coming out of the fold it saves the conversation's and the thread's widths the plan
  * gives them, as the prototype does, so neither comes back under its 360.
  */
-export function useRowPlan(source: RowPlanSource): RowPlan | null {
+export function useRowPlan(source: RowPlanSource, row?: HTMLElement | null): RowPlan | null {
   const thread = useColumnWidth("thread");
   const conversation = useConversationWidth((s) => s.width);
   const stored = useRowPlanStore((s) => s.expanded);
@@ -119,12 +169,14 @@ export function useRowPlan(source: RowPlanSource): RowPlan | null {
   const wasFolded = useRef(false);
   const { active, available, columns, forceFold } = source;
   const threadOpen = source.thread;
+  const liveWidth = row ? row.getBoundingClientRect().width : 0;
+  const effectiveAvailable = liveWidth > 0 ? liveWidth : available;
   const plan = useMemo(() => {
-    if (!active || available <= 0) return null;
+    if (!active || effectiveAvailable <= 0) return null;
     const others = columns.reduce((total, column) => total + column.saved, 0);
     return planRow({
-      available,
-      conversation: { saved: conversation ?? Math.max(CONVERSATION_DEFAULT_WIDTH, available - others), contentMin: MAIN_COLUMN_MIN_WIDTH },
+      available: effectiveAvailable,
+      conversation: { saved: conversation ?? Math.max(CONVERSATION_DEFAULT_WIDTH, effectiveAvailable - others), contentMin: MAIN_COLUMN_MIN_WIDTH },
       thread: threadOpen ? { saved: thread, contentMin: COLUMN_BOUNDS.thread.contentMin } : null,
       columns,
       expanded,
@@ -132,7 +184,7 @@ export function useRowPlan(source: RowPlanSource): RowPlan | null {
       wasFolded: wasFolded.current,
       forceFold,
     });
-  }, [active, available, columns, conversation, expandFold, expanded, forceFold, thread, threadOpen]);
+  }, [active, columns, conversation, effectiveAvailable, expandFold, expanded, forceFold, thread, threadOpen]);
   // The regions in the row the last plan had: one opening while a column is expanded restores the row (rule 5, the
   // prototype's openRegion), so the new column shows as the row's rules place it.
   const regionsBefore = useRef<ReadonlySet<string> | null>(null);
@@ -175,6 +227,50 @@ function unitElement(row: HTMLElement, key: string, regions: readonly string[], 
   return row.querySelector<HTMLElement>(`[data-testid="channel-side-column"][data-in-row="true"][data-column="${sideColumnOf(key)}"]`);
 }
 
+function releaseShown(shown: { current: Set<HTMLElement> }, keep?: ReadonlySet<HTMLElement>) {
+  for (const element of shown.current) {
+    if (keep?.has(element)) continue;
+    showAt(element, null);
+    hideAsTab(element, false);
+  }
+  shown.current = keep ? new Set(keep) : new Set();
+}
+
+function applyPlannedRow(
+  row: HTMLElement,
+  channel: HTMLElement,
+  plan: RowPlan,
+  active: Record<string, string>,
+  shown: { current: Set<HTMLElement> },
+  helpBeside: boolean,
+) {
+  const laidOut = new Set<HTMLElement>();
+  row.dataset.rowPlan = "";
+  // Synchronize `data-covers` with `--row-width` atomically so fold/unfold never paints a split-brain intermediate frame.
+  if (!helpBeside) {
+    const threadEl = row.querySelector<HTMLElement>(":scope > .thread-side-column");
+    if (threadEl) {
+      if (plan.fold) {
+        if (threadEl.getAttribute("data-covers") !== "first") threadEl.setAttribute("data-covers", "first");
+      } else if (threadEl.hasAttribute("data-covers")) {
+        threadEl.removeAttribute("data-covers");
+      }
+    }
+  }
+  const widths = unitWidths(plan, (group) => plan.groups[group]![activeUnit(plan, plan.groups[group]!, active)]!);
+  plan.units.forEach((unit, index) => {
+    const element = unitElement(row, unit.key, unit.regions, plan.fold);
+    if (!element) return;
+    laidOut.add(element);
+    hideAsTab(element, widths[index] === 0);
+    showAt(element, widths[index] === 0 ? null : widths[index]!);
+  });
+  releaseShown(shown, laidOut);
+  applyRowFacts(row);
+  // Its content clipped like the others' below its 360 (rule 2): measured as it stands, again once the row settles.
+  markClipped(channel, null, MAIN_COLUMN_MIN_WIDTH);
+}
+
 /**
  * Lays `plan` out on `row` (MainLayout's), which ChannelSideArea measures (`measured` changes whenever the row or a
  * column in it does): each column other than the conversation at its width (`--row-width`; React keeps rendering
@@ -183,38 +279,85 @@ function unitElement(row: HTMLElement, key: string, regions: readonly string[], 
  * the conversation's width (index.css `[data-covers]`). Registers the conversation as a column of the row's seams:
  * folded, a seam drag on it shares its width between the conversation and the thread (rowPlan `splitPair`).
  */
-export function useRowLayout(row: HTMLElement | null, measured: unknown, plan: RowPlan | null): void {
+export function useRowLayout(row: HTMLElement | null, measured: unknown, plan: RowPlan | null, live?: LiveRowLayoutBinding): void {
   const active = useRowPlanStore((s) => s.active);
   const shown = useRef(new Set<HTMLElement>());
+  const planRef = useRef<RowPlan | null>(plan);
+  planRef.current = plan;
   useLayoutEffect(() => {
-    const laidOut = new Set<HTMLElement>();
-    const release = () => {
-      for (const element of shown.current) {
-        if (laidOut.has(element)) continue;
-        showAt(element, null);
-        hideAsTab(element, false);
+    if (!live) return;
+    const { columns, thread: threadOpen, helpBeside, handlerRef } = live;
+    handlerRef.current = (prev, next) => {
+      if (!row) return false;
+      const wasPlanned = prev.room !== null && prev.viewportWidth >= 768 && !prev.legacyTask;
+      const nextPlanned = next.room !== null && next.viewportWidth >= 768 && !next.legacyTask;
+      if (!wasPlanned || !nextPlanned || next.rowWidth <= 0) return false;
+      const wasThread = prev.threadOpen || prev.threadInRow || prev.threadCoversRow;
+      const nextThread = next.threadOpen || next.threadInRow || next.threadCoversRow;
+      if (
+        wasThread !== nextThread ||
+        prev.threadMaximized !== next.threadMaximized ||
+        prev.touchPortrait !== next.touchPortrait ||
+        prev.panelHeight !== next.panelHeight ||
+        prev.composerHeight !== next.composerHeight
+      ) {
+        return false;
       }
-      shown.current = laidOut;
+      const channel = row.querySelector<HTMLElement>(":scope > .thread-main-column");
+      if (!channel) return false;
+      const savedThread = getColumnWidth("thread");
+      const savedConv = useConversationWidth.getState().width;
+      const planState = useRowPlanStore.getState();
+      const taskExpanded = planState.taskColumn !== null && planState.taskColumn.focused;
+      const expanded = next.threadMaximized && !helpBeside ? THREAD : taskExpanded ? TASKS_PAGE_TASK : planState.expanded;
+      const others = columns.reduce((total, column) => total + column.saved, 0);
+      const current = planRef.current;
+      const nextPlan = planRow({
+        available: next.rowWidth,
+        conversation: { saved: savedConv ?? Math.max(CONVERSATION_DEFAULT_WIDTH, next.rowWidth - others), contentMin: MAIN_COLUMN_MIN_WIDTH },
+        thread: threadOpen ? { saved: savedThread, contentMin: COLUMN_BOUNDS.thread.contentMin } : null,
+        columns,
+        expanded,
+        expandFold: planState.expandFold,
+        wasFolded: !!current?.fold,
+        forceFold: next.touchPortrait,
+      });
+      const domPlan = nextPlan.rebalance && threadOpen
+        ? planRow({
+            available: next.rowWidth,
+            conversation: { saved: nextPlan.rebalance.conversation, contentMin: MAIN_COLUMN_MIN_WIDTH },
+            thread: { saved: nextPlan.rebalance.thread, contentMin: COLUMN_BOUNDS.thread.contentMin },
+            columns: columns.map((c) => (c.regions.includes(THREAD) ? { ...c, saved: nextPlan.rebalance!.thread } : c)),
+            expanded,
+            expandFold: planState.expandFold,
+            wasFolded: false,
+            forceFold: next.touchPortrait,
+          })
+        : nextPlan;
+      // Always apply the target widths and `data-covers` before paint; skip React state when topology is unchanged.
+      applyPlannedRow(row, channel, domPlan, planState.active, shown, helpBeside);
+      if (!samePlanTopology(current, nextPlan)) return false;
+      planRef.current = nextPlan;
+      return true;
     };
+    return () => {
+      handlerRef.current = null;
+    };
+  }, [live, row]);
+  useLayoutEffect(() => {
     const channel = row?.querySelector<HTMLElement>(":scope > .thread-main-column") ?? null;
     if (!row || !channel || !plan) {
-      release();
-      if (row) delete row.dataset.rowPlan;
+      releaseShown(shown);
+      if (row) {
+        // oxlint-disable-next-line react/immutability -- the row's DOM node, passed in to be laid out: this hook's layout effect writes its data attributes and styles by design.
+        delete row.dataset.rowPlan;
+        const thread = row.querySelector<HTMLElement>(":scope > .thread-side-column");
+        if (thread && !live?.helpBeside) delete thread.dataset.covers;
+      }
       if (channel) markClipped(channel, null, undefined);
       return;
     }
-    row.dataset.rowPlan = "";
-    const widths = unitWidths(plan, (group) => plan.groups[group]![activeUnit(plan, plan.groups[group]!, active)]!);
-    plan.units.forEach((unit, index) => {
-      const element = unitElement(row, unit.key, unit.regions, plan.fold);
-      if (!element) return;
-      laidOut.add(element);
-      hideAsTab(element, widths[index] === 0);
-      showAt(element, widths[index] === 0 ? null : widths[index]!);
-    });
-    release();
-    // Its content clipped like the others' below its 360 (rule 2): measured as it stands, again once the row settles.
-    markClipped(channel, null, MAIN_COLUMN_MIN_WIDTH);
+    applyPlannedRow(row, channel, plan, active, shown, live?.helpBeside ?? false);
     const fold = plan.fold;
     return registerSeamColumn(channel, () => ({
       key: "conversation",
@@ -236,12 +379,8 @@ export function useRowLayout(row: HTMLElement | null, measured: unknown, plan: R
         commitColumnWidth("thread", pair.thread);
       },
     }));
-  }, [active, measured, plan, row]);
+  }, [active, live?.helpBeside, measured, plan, row]);
   useLayoutEffect(() => () => {
-    for (const element of shown.current) {
-      showAt(element, null);
-      hideAsTab(element, false);
-    }
-    shown.current = new Set();
+    releaseShown(shown);
   }, []);
 }

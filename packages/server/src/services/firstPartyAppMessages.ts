@@ -95,6 +95,8 @@ export async function postMessageAsReader(input: {
       senderName: user?.displayName || user?.name || "User",
       content,
       ...(randomId !== undefined ? { randomId } : {}),
+      // Its object links are told to the apps as this app's own (AppLinkingMessage.postedByApp).
+      postedByApp: input.appId,
     });
     return { kind: "posted", messageId: message.id, ...(keyUsed ? { replayed: true as const } : {}) };
   } catch (error) {

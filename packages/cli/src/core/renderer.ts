@@ -142,7 +142,8 @@ export const formatErrorEnvelope = axSurface(
     const omitRestated = err.textDetailMode === "omit_restated_lines";
     const lines: string[] = [];
     lines.push(`Error: ${err.message}`);
-    lines.push(`Code: ${err.code}`);
+    // An informative error is its sentence and its next step: no code line (CliErrorOptions.informative).
+    if (!err.informative) lines.push(`Code: ${err.code}`);
     if (err.fault_domain && err.fault_domain !== err.layer) {
       lines.push(`Fault domain: ${err.fault_domain}`);
     }

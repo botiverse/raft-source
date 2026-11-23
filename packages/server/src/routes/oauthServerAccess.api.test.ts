@@ -87,13 +87,14 @@ type Audience = Awaited<ReturnType<typeof seedAudience>>;
 
 /**
  * The same people and Servers with a server-local app of A in place of the
- * third-party one. A's owner registers it, so A's agents are granted it
- * without a person.
+ * third-party one. A's owner registers it as themselves (vouched), so A's
+ * agents are granted it without a person.
  */
 async function withServerLocalAppOfA(f: Audience): Promise<Audience> {
   const { client, clientSecret } = await createOAuthClient({
     serverId: f.a.id,
     createdByUserId: f.owner.id,
+    vouchAsCreator: true,
     clientId: `access-local-${randomUUID().slice(0, 8)}`,
     name: "Access Local",
     returnUrl: RETURN_URL,
@@ -367,7 +368,7 @@ test("agent-events keeps today's answers (RFC 079 §5.4: unchanged in server mod
   }
   const invalidKind = await postEvent(app, eventToken, "not-a-kind");
   assert.equal(invalidKind.status, 400);
-  assert.deepEqual(JSON.parse(invalidKind.body), { error: "kind must be event or notification" });
+  assert.deepEqual(JSON.parse(invalidKind.body), { error: "kind must be event or notification", code: "invalid_input", errorCode: "invalid_input" });
 
   // New: a disabled app had no answer here before (the token lookup never
   // read `enabled`). It gets the one Server-access refusal, the same bytes as

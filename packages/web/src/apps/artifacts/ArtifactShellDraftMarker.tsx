@@ -38,7 +38,7 @@ export function ShellDraftMarker({ draft, anchor }: { draft: ArtifactCommentDraf
       }
     }
     const box = event.currentTarget.getBoundingClientRect();
-    openDraftView?.(draftId, { x: box.left, y: box.top, width: box.width, height: box.height });
+    openDraftView?.(draftId, { x: box.left, y: box.top, width: box.width, height: box.height }, event.currentTarget);
   }, [panelOpen, openDraftView, draftId]);
   // Made again by its deletion's toast (its Undo): focus comes as it is drawn (a ref, at once on mount).
   const attach = useCallback((element: HTMLButtonElement | null) => {

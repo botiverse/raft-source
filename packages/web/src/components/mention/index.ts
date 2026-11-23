@@ -6,3 +6,4 @@ export type { MentionPicker, MentionSuggestionGroup, MentionSuggestionItem } fro
 export { asFirstPartyAppId, asFirstPartyObjectId, asFirstPartyObjectKind } from "./mentionAudience";
 export type { FirstPartyAppId, FirstPartyObjectId, FirstPartyObjectKind, MentionAudience, MentionSource } from "./mentionAudience";
 export type { MentionCandidate } from "../message/mentionCandidates";
+export { COMPOSER_SUGGESTION_MAX_RESULTS } from "../../utils/composerSuggestionSearch";

@@ -31,6 +31,12 @@
 //    request again goes through unless some are left `unread` (then the
 //    comments list shows them in full). Others' comments on other files are
 //    only counted;
+//    then Settled (#334, settle.ts): a new version of a Settled Artifact
+//    takes it back to Working, so unless this push's reader was told of the
+//    settle that stands (settled_holds names it), it is held: 409 SETTLED,
+//    nothing published, and the hold records that the reader was told, so the
+//    same request again goes through (only while artifact_settled_v0 is on
+//    for the Artifact's server);
 // 5. bytes: listed blobs this server lacks answer 200 `{ missing }`; inline
 //    files are stored. New bytes (not those the server has) count against
 //    the server's monthly file upload quota, the attachments' one: no room
@@ -43,7 +49,9 @@
 //    current now, the blobs locked, then the version, its files, the item's
 //    current version and position. The publisher's read position moves to the
 //    new version, but not past others' comments it wasn't shown (those on
-//    other files, `unseen.otherComments`): it stops before the first; the
+//    other files, `unseen.otherComments`): it stops before the first; a
+//    settle that stood lapses (`settled_lapsed_version`: Working again, the
+//    answer's `wasSettled`, the version event's `wasSettled`); the
 //    object event is recorded; the publisher follows the
 //    Artifact (unless it stopped); other followers who were the last to
 //    publish a file this version changed are told (notices.ts), pushed after
@@ -59,9 +67,11 @@
 //    from a library CDN (bundledLibraries.ts); best effort, bounded in bytes
 //    and time. A Markdown entry's excerpt, what its card shows, is stored
 //    beside them, as bounded, never failing the push (excerpt.ts
-//    fillVersionExcerpt). For an entry a check opens (HTML: shared
-//    ARTIFACT_CHECKED_KINDS) the version's publish check is recorded in the
-//    same transaction, in a savepoint (checks.ts recordVersionCheck:
+//    fillVersionExcerpt), and so are its links to other Artifacts, in place
+//    of the last version's (references.ts fillArtifactReferences). For an
+//    entry a check opens (HTML: shared ARTIFACT_CHECKED_KINDS) the version's
+//    publish check is recorded in the same transaction, in a savepoint
+//    (checks.ts recordVersionCheck:
 //    `pending`, or `skipped` from the start; nothing where the deployment
 //    has no check Worker; a failure rolls back the check alone and
 //    never fails the push), and the answer's `check` names it. A replay (step
@@ -89,6 +99,7 @@ import {
   AGENT_API_ARTIFACT_MAX_TITLE_CHARS,
   AGENT_API_ARTIFACT_MAX_UNREFERENCED_UPLOAD_BYTES,
   AGENT_API_ARTIFACT_READ_UNSEEN_SHOWN,
+  artifactDefaultEntry,
   artifactFileType,
   currentDate,
   isWellFormedArtifactFilePath,
@@ -99,6 +110,7 @@ import {
   type AgentApiArtifactPublishResponse,
   type AgentApiArtifactPushCheck,
   type AgentApiArtifactSetting,
+  type AgentApiArtifactSettled,
   type AgentApiArtifactSummary,
   type AgentApiArtifactUploadParams,
   type ServerId,
@@ -152,6 +164,7 @@ import { byteSizeBucket, countBucket, withAppSpan } from "../../platform/tracing
 import { presentBlobs, storeBlob, unreferencedBytes } from "./blobs";
 import { artifactR2Store } from "./blobStore";
 import { announceObjectEvents } from "../../platform/activity";
+import { announceArtifactChanged } from "./live";
 import { recordVersionCheck, versionCheckOf } from "./checks";
 import { fillVersionExcerpt } from "./excerpt";
 import { followerRecipients, recordArtifactEvent } from "./events";
@@ -169,9 +182,12 @@ import {
   type ArtifactVersionRow,
 } from "./schema";
 import { fillPublicText } from "./publicText";
+import { fillArtifactReferences, forgetArtifactReferences } from "./references";
 import { mayPublish, retitleItem, storedTitle } from "./rename";
 import { scrollLockWarnings } from "./scrollLock";
 import { indexArtifactSearch } from "./search";
+import { nextVersionNumber, recordToldOfSettle, toldOfSettle } from "./settle";
+import { settledEnabled, settledOf, type SettledState } from "./settledState";
 import { answerAttrs, answerStatus } from "./trace";
 
 /** One file this request lists, with its bytes when they came inline. */
@@ -249,6 +265,8 @@ type Evaluation =
     /** What else moving the read position to `through` passes over: others' versions (never a comment: shownThrough stops before one not shown). */
     skipped: { versions: number; otherComments: number };
   }
+  /** The Artifact is Settled and this push's reader wasn't told of that settle yet (#334): `next`, the version it would make. */
+  | { kind: "settled"; settled: SettledState; next: number }
   /** The result would be the current version exactly (files and settings): nothing to publish. */
   | { kind: "unchanged"; current: ArtifactVersionRow; base: ArtifactVersionRow }
   /** The result would be the current version but for the title: the item takes `title`, no version is made. */
@@ -548,6 +566,11 @@ async function evaluateVersion(
       const unread = Math.max(0, count - full.filter((at) => at <= through).length);
       return { kind: "held", comments: newest.reverse(), count, after, through, unread, skipped: { versions, otherComments: 0 } };
     }
+    // Settled (#334): this version would take it back to Working; held once per reader and settle.
+    const standing = settledOf(item);
+    if (standing && !(await toldOfSettle(executor, publisher.reader, item, standing)) && await settledEnabled(item.serverId, { executor })) {
+      return { kind: "settled", settled: standing, next: await nextVersionNumber(executor, item.id) };
+    }
     const elsewhere = touchedPaths.length > 0 ? and(isNotNull(artifactComments.path), notInArray(artifactComments.path, touchedPaths))! : isNotNull(artifactComments.path);
     [{ count: otherComments } = { count: 0 }] = await executor.select({ count: sql<number>`count(*)::int` }).from(artifactComments).where(and(theirs, elsewhere));
   }
@@ -573,8 +596,9 @@ function evaluateNew(request: PublishRequest, title: string): Extract<Evaluation
     refuse(400, { code: "FILE_NOT_FOUND", error: "A new artifact has no files to delete: leave the deletes out of its first push.", details: { path: request.deletes[0], version: null } });
   }
   const files: Manifest = new Map(request.listed.map((file) => [file.path, { sha256: file.sha256, size: file.size, blobId: null }]));
-  const only = files.size === 1 ? [...files.keys()][0]! : null;
-  const entry = request.entry ?? (files.has("index.html") || !only ? "index.html" : only);
+  const picked = request.entry === undefined ? artifactDefaultEntry([...files.keys()]) : { entry: request.entry };
+  if ("candidates" in picked) return refuse(400, noDefaultEntry(picked.candidates));
+  const entry = picked.entry;
   return {
     kind: "ok",
     files,
@@ -606,6 +630,25 @@ function checkResult(evaluation: Extract<Evaluation, { kind: "ok" }>): void {
       details: { entry: evaluation.entry },
     });
   }
+}
+
+/** A new Artifact's push that names no entry and has no file to open at by default (artifactDefaultEntry). */
+function noDefaultEntry(candidates: readonly string[]): ArtifactRefusal {
+  const shown = candidates.slice(0, 10).map(quotedPath).join(", ");
+  const more = candidates.length > 10 ? ` and ${candidates.length - 10} more` : "";
+  return candidates.length === 0
+    ? {
+      code: "ENTRY_NOT_FOUND",
+      error: "This push names no entry file, and it has no index.html, HTML page or Markdown file to open at.",
+      suggestedNextAction: "Push the page it should open at, or name the entry file (--entry on the CLI, entry in a tool call).",
+      details: { entry: null, candidates: [] },
+    }
+    : {
+      code: "ENTRY_NOT_FOUND",
+      error: `This push names no entry file and has no index.html, but more than one page it could open at: ${shown}${more}.`,
+      suggestedNextAction: "Name the one it opens at (--entry on the CLI, entry in a tool call), then push again.",
+      details: { entry: null, candidates: candidates.slice(0, 10) },
+    };
 }
 
 /** The entry's bytes when this request brought them inline (the version's own: the same sha256), else undefined. */
@@ -717,6 +760,8 @@ type Committed =
     newlySubscribed: boolean;
     /** Its object event, announced to people's Activity after the commit. */
     eventId: string;
+    /** The settle this version ended (#334): it was Settled, it is Working again. */
+    wasSettled: SettledState | null;
     /** Its publish check, recorded in the same transaction (null: none, checks.ts recordVersionCheck). */
     check: ArtifactVersionCheckRow | null;
   }
@@ -752,12 +797,30 @@ function publishSpanAttrs(body: AgentApiArtifactPublishBody): Record<string, str
       : "content_base64" in file && typeof file.content_base64 === "string" ? Math.floor((file.content_base64.length * 3) / 4)
         : 0
   ), 0);
+  const pages = files.filter((file) => typeof file?.path === "string" && artifactFileType(file.path).kind === "html").length;
   return {
     operation: body.artifact === undefined ? "create" : "version",
     files_bucket: countBucket(files.length),
     inline_bytes_bucket: byteSizeBucket(inlineBytes),
     delete_bucket: countBucket(Array.isArray(body.delete) ? body.delete.length : 0),
+    // Why pushes are refused (ENTRY_NOT_FOUND, TARGET_NOT_FOUND): whether the entry was named, how many pages came, and what kind of place the target names.
+    entry: body.entry === undefined ? "default" : "named",
+    html_files_bucket: countBucket(pages),
+    target_kind: body.target === undefined ? "none" : targetKindOf(body.target),
   };
+}
+
+/** The kind of place a publish `target` names, never the place: a task ref is refused as a home, so it is told apart. */
+function targetKindOf(target: unknown): string {
+  if (typeof target !== "string") return "other";
+  const t = target.trim();
+  if (/^#[^:\s]+:#\d+$/.test(t) || /^dm:@[^:\s]+:#\d+$/.test(t)) return "task";
+  if (/^dm:@[^:\s]+:[0-9a-f-]{8,}$/i.test(t)) return "dm_thread";
+  if (/^dm:@/.test(t)) return "dm";
+  if (/^#[^:\s]+:[0-9a-f-]{8,}$/i.test(t)) return "thread";
+  if (/^#[^:\s]+$/.test(t)) return "channel";
+  if (/^[0-9a-f-]{8,}$/i.test(t)) return "id";
+  return "other";
 }
 
 /**
@@ -805,13 +868,17 @@ export type PublishLocation = { existing: ArtifactItemRow } | { home: NewHome };
  * comments it lists as seen (default yes: the agent API shows them, so the
  * same request again goes through). The person door says no: its caller
  * doesn't show them (an assistant publishing as its owner, Tenny #33), so
- * only a request carrying `seen` gets past the hold.
+ * only a request carrying `seen` gets past the hold. `holdNamesSettler`,
+ * whether a 409 SETTLED names who settled it (default yes); the person door
+ * says no, by the same precedent (Tenny, #15649): the hold says when and at
+ * which version, and the same request again still goes through.
  */
 export interface PublishDoor {
   locate(): Promise<PublishLocation | ArtifactApiError>;
   summaryOf(items: readonly ArtifactItemRow[]): Promise<AgentApiArtifactSummary[]>;
   assistantAgentId: string | undefined;
   holdMovesReadPosition?: boolean;
+  holdNamesSettler?: boolean;
 }
 
 export function createPublishOperations() {
@@ -830,6 +897,13 @@ export function createPublishOperations() {
    * what it shows), or 200 `unchanged`: the current version already is what
    * this request would make.
    */
+  /** The answer's `wasSettled` (#334): the settle the new version ended, while Settled is on for the Artifact's server. */
+  async function wasSettledOf(item: ArtifactItemRow, settled: SettledState | null): Promise<AgentApiArtifactSettled | null> {
+    if (!settled || !(await settledEnabled(item.serverId))) return null;
+    const name = await namer([settled.by]);
+    return { by: name(settled.by), at: settled.at.toISOString(), version: settled.version };
+  }
+
   /** 200 `unchanged`: no version was made (the current one is `at.current`); `from`, the title this request replaced (`titleChanged`). */
   async function noVersion(door: PublishDoor, item: ArtifactItemRow, at: { current: ArtifactVersionRow; base: ArtifactVersionRow }, from?: string): Promise<ArtifactApiJson<AgentApiArtifactPublishResponse>> {
     const [summary] = await door.summaryOf([item]);
@@ -848,6 +922,18 @@ export function createPublishOperations() {
   async function notWritten(publisher: Publisher, door: PublishDoor, item: ArtifactItemRow, evaluation: NotWritten): Promise<ArtifactApiError | ArtifactApiJson<AgentApiArtifactPublishResponse>> {
     if (evaluation.kind === "unchanged") return noVersion(door, item, evaluation);
     const itemId = item.id;
+    if (evaluation.kind === "settled") {
+      // The reader is told now: the same request again goes through (#334).
+      const { settled, next } = evaluation;
+      await recordToldOfSettle(getDb(), publisher.reader, itemId, settled);
+      // Who settled it, unless the door's caller withholds a hold's detail (an assistant pushing as its owner).
+      const by = door.holdNamesSettler === false ? {} : { by: (await namer([settled.by]))(settled.by) };
+      return fail(409, {
+        code: "SETTLED",
+        error: `Not pushed: this artifact was settled on ${settled.at.toISOString().slice(0, 10)} at v${settled.version}, and v${next} would take it back to Working; if that's intended, push the same request again, and it goes through now.`,
+        details: { title: item.title, settled: { ...by, at: settled.at.toISOString(), version: settled.version }, next },
+      });
+    }
     if (evaluation.kind === "base_moved") {
       const overlaps = await changesFor(evaluation.overlaps);
       const base = evaluation.base.number;
@@ -887,6 +973,10 @@ export function createPublishOperations() {
         commentsCursor: evaluation.count > evaluation.comments.length ? positionCursor(evaluation.after) : null,
         unread: evaluation.unread,
       },
+      // Where the read position stood before the hold moved it to `seen`
+      // (only a door whose hold moves it): the range that lists the comments
+      // it marked seen again (artifactComments `held`, #proj-workspace:#340).
+      ...(door.holdMovesReadPosition === false ? {} : { seenFrom: evaluation.after }),
       seen: evaluation.through,
       skipped: evaluation.skipped,
       },
@@ -1082,13 +1172,19 @@ export function createPublishOperations() {
       })));
       // The version's publish check, after its files (its `unchanged` compares them with the previous version's).
       const check = await recordVersionCheck(tx, { item, version: version! });
+      // A settle that stood lapses (#334): Working again, the settle it ended kept for "a new version came since it was settled".
+      const wasSettled = settledOf(item);
       const [updated] = await tx.update(artifactItems).set({
         currentVersionId: version!.id,
         lastPosition: position,
         title: evaluation.title,
         description: evaluation.description,
         updatedAt: sql`now()`,
+        ...(wasSettled ? { settledLapsedVersion: version!.number } : {}),
       }).where(eq(artifactItems.id, item.id)).returning();
+      // The last version's links go now: if reading this version's (after the commit) fails or runs out of time,
+      // the Artifact has no references for a while, never the old version's (references.ts).
+      await forgetArtifactReferences(tx, item.id);
       await indexArtifactSearch(tx, updated!);
       // Its own version is nothing new to the publisher, nor are others'
       // versions it was built on; others' comments it wasn't shown (those on
@@ -1104,7 +1200,8 @@ export function createPublishOperations() {
         item: updated!,
         eventKind: "version",
         actor,
-        data: { position, version: version!.number },
+        // A version that ended a settle says so only while Settled is on for the Artifact's server.
+        data: { position, version: version!.number, ...(wasSettled && await settledEnabled(updated!.serverId, { executor: tx }) ? { wasSettled: wasSettled.version } : {}) },
         recipients: followerRecipients(updated!, following),
       });
       const newlySubscribed = await autoSubscribe(tx, item.id, actor, "published");
@@ -1114,7 +1211,7 @@ export function createPublishOperations() {
       const noticed = await noticeVersion({ executor: tx, outbox: input.outbox, item: updated!, version: version!, previous: evaluation.previous, now: currentDate(), following, ...except });
       // A channel's announcement (channel_announcement_v0): its channel's other agents hear of the version, queued only.
       await noticeChannelAnnouncement({ executor: tx, outbox: input.outbox, item: updated!, version: version!, now: currentDate(), told: noticed.queued.map((notice) => notice.agentId), ...except });
-      return { kind: "published", item: updated!, version: version!, evaluation, newlySubscribed, eventId: event.id, check, ...noticed };
+      return { kind: "published", item: updated!, version: version!, evaluation, newlySubscribed, eventId: event.id, check, wasSettled, ...noticed };
     });
   }
 
@@ -1182,16 +1279,20 @@ export function createPublishOperations() {
       case "published": {
         await sendQueued(outbox, committed.queued);
         await announceObjectEvents([committed.eventId]);
+        // Open pages of it offer the new version at once (live.ts).
+        announceArtifactChanged(committed.item.id, "version");
         // A public Artifact's new current version: its signed-out text, in the background (publicText.ts).
         if (committed.item.homeKind === "public") fillPublicText(committed.item, committed.version, { entry: inlineEntryOf(request, committed.evaluation) });
-        // Pages held to one screen or holding frames, and copies of common libraries (scrollLock.ts), and a Markdown entry's excerpt (excerpt.ts): beside the answer, best effort, bounded in bytes and time.
+        // Pages held to one screen or holding frames, and copies of common libraries (scrollLock.ts), a Markdown entry's excerpt (excerpt.ts), and its links to other Artifacts in place of the last version's (references.ts): beside the answer, best effort, bounded in bytes and time.
         const [answered, warnings] = await Promise.all([
           published(door, committed.item, committed.version, committed.evaluation, committed),
           scrollLockWarnings({ serverId: publisher.serverId, entry: committed.evaluation.entry, files: committed.evaluation.files, changed: committed.evaluation.changed, inline: inlineFilesOf(request, committed.evaluation) }),
           fillVersionExcerpt(committed.item, committed.version, { entry: inlineEntryOf(request, committed.evaluation) }),
+          fillArtifactReferences(committed.item, { version: committed.version, inline: inlineFilesOf(request, committed.evaluation) }),
         ]);
         const check = pushCheckOf(committed.check);
-        return json<AgentApiArtifactPublishResponse>({ ...answered, ...(warnings.length > 0 ? { warnings } : {}), ...(check ? { check } : {}) }, 201);
+        const wasSettled = await wasSettledOf(committed.item, committed.wasSettled);
+        return json<AgentApiArtifactPublishResponse>({ ...answered, ...(warnings.length > 0 ? { warnings } : {}), ...(check ? { check } : {}), ...(wasSettled ? { wasSettled } : {}) }, 201);
       }
       case "retitled":
         return noVersion(door, committed.item, committed, committed.from);
@@ -1211,7 +1312,7 @@ export function createPublishOperations() {
       // Step 1 as the agent API has it: an Artifact the agent sees and may push to, or the conversation its `target` names.
       locate: async () => {
         if (body.artifact !== undefined) {
-          const existing = await resolveVisibleItem(agent, body.artifact);
+          const existing = await resolveVisibleItem(agent, body.artifact, "write");
           if (!mayPublish(agent, existing)) return mayNotTakePart("push to it");
           return { existing };
         }

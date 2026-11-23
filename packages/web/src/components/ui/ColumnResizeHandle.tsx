@@ -60,12 +60,14 @@ const LABEL_ID = {
   detail: "layout.columnResize.detail",
   workspaceTree: "layout.columnResize.workspaceTree",
   sideCards: "layout.columnResize.sideCards",
+  artifactComments: "layout.columnResize.artifactComments",
 } as const satisfies Record<ColumnId, string>;
 
 /**
  * Put on the conversation (the flexible column a `growsToMainMin` column takes its room from): ChatPanel's message
  * column for the side cards, MainLayout's channel column (and the thread, where it takes the channel's place) for the
- * thread and detail columns, the public server page's main slot for its thread.
+ * thread and detail columns, the public server page's main slot for its thread, the Artifact's content for its
+ * comment list (ArtifactSurface).
  */
 export const MAIN_COLUMN_ATTRIBUTE = "data-main-column";
 
@@ -149,6 +151,11 @@ export interface ColumnResizeHandleProps {
    * list, has the thread's Focus Mode (TasksRoute).
    */
   snap?: ColumnSnap;
+  /**
+   * The column stands inside another column, not in MainLayout's row (the Artifact viewer's comment list, inside the
+   * Artifact's column): it drags alone, and never joins the row's seam trade (rowSeams) as a column of its own.
+   */
+  outsideRow?: boolean;
   "data-testid"?: string;
 }
 
@@ -210,6 +217,7 @@ export default function ColumnResizeHandle({
   highlight,
   ownBorder = false,
   snap,
+  outsideRow = false,
   "data-testid": testId,
 }: ColumnResizeHandleProps) {
   const { formatMessage } = useIntl();
@@ -261,14 +269,14 @@ export default function ColumnResizeHandle({
     if (!columnElement) return;
     if (!columnElement.id) columnElement.id = fallbackColumnId;
     setColumnElementId(columnElement.id);
-    const unregister = registerSeamColumn(columnElement, () => seamEntry.current!);
+    const unregister = outsideRow ? null : registerSeamColumn(columnElement, () => seamEntry.current!);
     const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => measure());
     // The conversation can change width while the column does not (a window resize), so it is watched too.
     let observedMain: HTMLElement | null = null;
     const measure = () => {
       const measured = shownWidth(columnElement);
       setRenderedColumnWidth(measured > 0 ? Math.round(measured) : null);
-      const seam = measured > 0 ? startSeamDrag(columnElement, edge, mainColumn(columnElement)) : null;
+      const seam = measured > 0 && !outsideRow ? startSeamDrag(columnElement, edge, mainColumn(columnElement)) : null;
       setMeasuredMax(measured > 0 ? seam?.max ?? columnDragMax(column, columnElement, maxWidth, mainColumn) : null);
       markClipped(columnElement, handleRef.current, contentMinRef.current);
       const growsToMainMin = (COLUMN_BOUNDS[column] as ColumnBounds).growsToMainMin === true;
@@ -283,10 +291,10 @@ export default function ColumnResizeHandle({
     observer?.observe(columnElement);
     return () => {
       observer?.disconnect();
-      unregister();
+      unregister?.();
       markClipped(columnElement, null, undefined);
     };
-  }, [fallbackColumnId, column, edge, maxWidth, mainColumn]);
+  }, [fallbackColumnId, column, edge, maxWidth, mainColumn, outsideRow]);
   const max = measuredMax ?? staticMax;
   // Moving the pointer right by 1px changes the width by this much.
   const grow = edge === "right" ? 1 : -1;
@@ -296,7 +304,7 @@ export default function ColumnResizeHandle({
     return clampWidth(measured && measured > 0 ? measured : rememberedWidth());
   };
   const maxNow = (handle: HTMLElement) => columnDragMax(column, handle.parentElement, maxWidth, mainColumn);
-  const rowSeam = (handle: HTMLElement) => (handle.parentElement ? startSeamDrag(handle.parentElement, edge, mainColumn(handle.parentElement)) : null);
+  const rowSeam = (handle: HTMLElement) => (handle.parentElement && !outsideRow ? startSeamDrag(handle.parentElement, edge, mainColumn(handle.parentElement)) : null);
 
   const setSnapped = (next: boolean, via: "pointer" | "keyboard"): boolean => {
     const current = snapRef.current;

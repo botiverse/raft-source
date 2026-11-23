@@ -1,9 +1,10 @@
 /**
  * Released runtime form versions are frozen (task #1217, packages/runtime-form).
  *
- * The route answers a released schemaVersion from its frozen sample in
- * @botiverse/raft-runtime-form. These checks keep the rest of the server honest
- * about that: every version the server serves must have a sample, and while the
+ * Until v1 was retired (2026-11-18; its route now answers 410) the route
+ * answered a released schemaVersion from its frozen sample in
+ * @botiverse/raft-runtime-form. The builders still back submit validation and
+ * the v2 conversion, so every released version must have a sample, and while the
  * code builder is still the source of server-side validation for that version it
  * must produce exactly the sample, so the form clients render and the rules the
  * server enforces cannot drift apart.

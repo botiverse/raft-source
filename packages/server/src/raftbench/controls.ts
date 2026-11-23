@@ -9,7 +9,7 @@ import * as channelService from "../services/channelService";
 import { createAgent, invalidateRaftBenchServiceAgentBindings } from "../services/agentService";
 import { updateAgentScopes } from "../services/agentScopesService";
 import { assertProviderProvisioningAvailable, kickAgentRuntimeProvisionWorker, recordAgentProvisioning } from "../services/agentRuntimeProvisionService";
-import { evaluateFeatureFlag } from "../services/featureFlagService";
+import { evaluateFeatureFlag, RAFTBENCH_OVERVIEW_FEATURE_FLAG_KEY } from "../services/featureFlagService";
 import { createSystemAppAgentEvent } from "../services/systemAppAgentEvents";
 import { getActorServerRoleInServer } from "../lib/actorPermissions";
 import { pilotServerIds, READ_GRANTS } from "./contract";
@@ -31,7 +31,7 @@ export async function requireAdmin(serverId: string, userId: string, requireFlag
   requirePilot(serverId);
   const role = await getActorServerRoleInServer(serverId, "user", userId);
   if (role !== "owner" && role !== "admin") refuse(403, "raftbench_admin_required", "Only this server's owner or administrator can use RaftBench.");
-  if (requireFlag && !(await evaluateFeatureFlag({ key: "raftbench_overview_v0", serverId, userId })).enabled) refuse(403, "raftbench_disabled", "RaftBench is unavailable on this server.");
+  if (requireFlag && !(await evaluateFeatureFlag({ key: RAFTBENCH_OVERVIEW_FEATURE_FLAG_KEY, serverId, userId })).enabled) refuse(403, "raftbench_disabled", "RaftBench is unavailable on this server.");
 }
 async function validateChannels(serverId: string, userId: string, channelIds: string[], executor: DatabaseExecutor = getDb()) {
   for (const id of channelIds) {
@@ -55,7 +55,7 @@ async function clearRun(tx: DatabaseTransaction, serverId: string, clearFindings
 async function fenceAdmin(tx: DatabaseTransaction, serverId: string, userId: string) {
   const [member] = await tx.select().from(serverMembers).where(and(eq(serverMembers.serverId, serverId), eq(serverMembers.userId, userId))).for("share");
   if (!member || !["owner", "admin"].includes(member.role)) refuse(403, "raftbench_admin_required", "Your administrator permission changed before this update.");
-  if (!(await evaluateFeatureFlag({ key: "raftbench_overview_v0", serverId, userId }, tx)).enabled) refuse(403, "raftbench_disabled", "RaftBench is unavailable on this server.");
+  if (!(await evaluateFeatureFlag({ key: RAFTBENCH_OVERVIEW_FEATURE_FLAG_KEY, serverId, userId }, tx)).enabled) refuse(403, "raftbench_disabled", "RaftBench is unavailable on this server.");
 }
 export async function configure(serverId: string, userId: string, input: { enabled: boolean; channelIds: string[]; expectedRevision: number; historyFrom?: string; providerTarget?: "default" | "canary" }) {
   // Disable remains available to an admin even when the enrollment flag is off.
@@ -225,7 +225,7 @@ export async function advanceServer(serverId: string, now = currentDate(), force
     if (!config.enabled || !config.agentId) { if (run) await clearRun(tx, serverId); return; }
     let sources: Awaited<ReturnType<typeof assertLiveSources>>;
     try {
-      const flag = await evaluateFeatureFlag({ key: "raftbench_overview_v0", serverId, userId: config.configuredByUserId }, tx);
+      const flag = await evaluateFeatureFlag({ key: RAFTBENCH_OVERVIEW_FEATURE_FLAG_KEY, serverId, userId: config.configuredByUserId }, tx);
       if (!flag.enabled) refuse(403, "raftbench_disabled", "Enrollment is disabled.");
       sources = await assertLiveSources(config, config.agentId);
     } catch (error) {

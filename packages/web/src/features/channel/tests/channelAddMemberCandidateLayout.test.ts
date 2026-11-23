@@ -330,3 +330,32 @@ test("channel add-member: an owner still sees the Create agent row", async () =>
   });
   assert.ok(document.querySelector("[data-slot=choice-list-footer]"));
 });
+
+test("channel add-member: a Guest is offered only in its bound channel, and still listed as a member (#15347)", async () => {
+  const channel = seedAddMemberCandidates();
+  const guest = makeHuman({ userId: "guest-elsewhere", name: "guest-elsewhere", displayName: "Visiting Guest", role: "guest", guestChannel: { id: "channel-other", name: "other" } });
+  const boundGuest = makeHuman({ userId: "guest-bound", name: "guest-bound", displayName: "Bound Guest", role: "guest", guestChannel: { id: channel.id, name: channel.name } });
+  const memberGuest = makeHuman({ userId: "guest-member", name: "guest-member", displayName: "Seated Guest", role: "guest", guestChannel: { id: "channel-other", name: "other" } });
+  api.get = (async (url: string) => {
+    if (url === `/channels/${channel.id}/members`) {
+      return { data: { agents: [], humans: [{ id: memberGuest.userId, name: memberGuest.name, displayName: memberGuest.displayName, avatarUrl: null, description: null, role: "member", serverRole: "guest" }] } };
+    }
+    return { data: {} };
+  }) as typeof api.get;
+  useServerStore.setState({ members: [...useServerStore.getState().members, guest, boundGuest, memberGuest] });
+
+  render(
+    createElement(TestIntlProvider, null,
+      createElement(ChannelMembers, { channelId: channel.id, presentation: "page" }),
+    ),
+  );
+  // Already in the channel: the Guest is still in the member list.
+  await screen.findByText("Seated Guest");
+  fireEvent.click(await screen.findByRole("button", { name: "Add member" }));
+  await screen.findByRole("checkbox", { name: "Design Partner" });
+
+  assert.ok(screen.getByRole("checkbox", { name: "Design Partner" }), "a member is still offered");
+  assert.ok(screen.getByRole("checkbox", { name: "Bound Guest" }), "a Guest is offered in its own channel");
+  assert.ok(screen.queryByRole("checkbox", { name: "Visiting Guest" }) === null, "a Guest bound elsewhere is not offered");
+  assert.ok(screen.queryByRole("checkbox", { name: "Seated Guest" }) === null, "a member is not offered again");
+});

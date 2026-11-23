@@ -19,6 +19,18 @@
 //   drafts, share-audience, home-change);
 // - `GET /:id/locate` (webLocate.ts) names the server of the reader's the
 //   Artifact opens in, reading each candidate server (one may be deleted).
+// - `GET /:id/links?version=` (linkTargets.ts): readableItemFor and the
+//   version as the viewer reads it, then the version's links to other
+//   Artifacts, each target `ok`, `deleted` or `unavailable` for the reader,
+//   and `authorSees`, whether the version's publisher sees it now (the
+//   viewer labels no other link; 503 CONTENT_UNAVAILABLE when the links
+//   can't be read now);
+// - `GET /:id/backlinks` (backlinks.ts, #336 step 2 "Linked from"):
+//   readableItemFor, then what links to the Artifact for this reader: other
+//   Artifacts whose current version links it (only those the reader sees),
+//   and chat messages that link it (only those the reader can read, and only
+//   for a reader inside the Artifact's server), each group newest first with
+//   its count after the filters, capped;
 // - `GET /:id/open` (webOpen.ts), the standalone page's one call, is
 //   core's account route (no server scoping): readableItemFor in the
 //   Artifact's own server for a member, else a public Artifact read as an
@@ -27,7 +39,8 @@
 // S2: the frame route (docs/development/workspace-artifacts-content-origin.md,
 // "Flow" step 1). Web API phase 1: the viewer, files and presence
 // (webViewer.ts), comments, `@` candidates, who a comment would notify and
-// following (webComments.ts). S8: review drafts and submitting a review
+// following (webComments.ts). Settled (#334): settling and unsettling
+// (settleRoutes.ts). S8: review drafts and submitting a review
 // (webReviews.ts). S7: the dashboard, the
 // reader's waiting, following and recent Artifacts, and its All tab, every
 // Artifact the reader can see (webDashboard.ts). S5:
@@ -90,7 +103,8 @@
 // `POST /api/artifacts/:id/frame { version?, path? }` checks, in this order:
 // 1-2. the Artifact (readableItemFor): Artifacts on for the deployment (403
 //    ARTIFACTS_NOT_ENABLED), then seen by the reader (canViewArtifacts) while
-//    its own server still exists, else one 404 NOT_VISIBLE for every reason;
+//    it is read at all (apiCommon itemReadable), else one 404 NOT_VISIBLE for
+//    every reason;
 // 3. the body: `{}`, `{ version: <positive integer> }`, `{ path: <string> }` or
 //    both (400 INVALID_REQUEST);
 // 4. the version: the current one, or `version` among the published ones (a
@@ -113,6 +127,7 @@ import {
   artifactFileType,
   asChannelId,
   channelAnnouncementChangeForbiddenText,
+  channelAnnouncementElsewhereChangeForbiddenText,
   isArtifactFramedKind,
   type ArtifactViewerData,
   type ArtifactWebFrame,
@@ -147,7 +162,9 @@ import {
   type ArtifactWebApiError,
   type ArtifactWebReader,
 } from "./webCommon";
+import { createBacklinkOperations } from "./backlinks";
 import { createImportOperations } from "./import";
+import { createLinkOperations } from "./linkTargets";
 import { renameArtifact, storedTitle } from "./rename";
 import { restoreArtifact, takedownAnswer, takedownArtifact, takedownReason } from "./takedown";
 import { createConversationOperations } from "./webConversation";
@@ -155,6 +172,7 @@ import { createDashboardOperations } from "./webDashboard";
 import { createLocateOperations } from "./webLocate";
 import { createOpenOperations } from "./webOpen";
 import { createWebCommentOperations } from "./webComments";
+import { createWebSettleOperations } from "./settleRoutes";
 import { createWebCommentImageOperations } from "./commentImages";
 import { createWebReviewOperations } from "./webReviews";
 import { createShareOperations } from "./webShare";
@@ -233,12 +251,15 @@ export function createArtifactWebApi() {
     ...viewerOperations,
     ...createShareOperations(viewerWithoutFrame),
     ...createWebCommentOperations(),
+    ...createWebSettleOperations(),
     ...createWebCommentImageOperations(),
     ...createWebReviewOperations(),
     ...createDashboardOperations(),
     ...createConversationOperations(),
     ...createLocateOperations(),
     ...createOpenOperations(),
+    ...createLinkOperations(),
+    ...createBacklinkOperations(),
     webImport: createImportOperations().webImport,
 
     /**
@@ -331,6 +352,8 @@ export function createArtifactWebApi() {
       if (title === "") return fail(400, { code: "INVALID_REQUEST", error: "A title can't be blank: give the artifact a title with words in it." });
       const result = await renameArtifact(readerViewActor(reader), id, title, outbox);
       if (result.kind === "channel_announcement") {
+        // A shared channel the reader's server has no copy of: nobody there can change it, so no step (#460).
+        if (result.channel === null) return fail(403, { code: "CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN", error: channelAnnouncementElsewhereChangeForbiddenText().message, details: { title: result.title } });
         const text = channelAnnouncementChangeForbiddenText(result.channel);
         return fail(403, { code: "CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN", error: text.message, suggestedNextAction: text.nextAction, details: { channel: result.channel, title: result.title } });
       }

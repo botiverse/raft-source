@@ -59,6 +59,48 @@ export function artifactTitleFromFileName(name: string): string {
   return name.slice(0, dot).trim() || name;
 }
 
+/** The most characters (code points) of a title a downloaded file's name keeps. */
+export const ARTIFACT_FILE_NAME_MAX_CHARS = 80;
+
+/** Characters no saved file's name may hold: path separators, Windows' reserved ones, and control characters. */
+const UNSAFE_FILE_NAME_CHARS = /[\p{Cc}/\\:*?"<>|]/gu;
+/** Invisible marks that would reorder how a name reads (`gpj.exe` shown as `exe.jpg`): dropped. */
+const BIDI_CONTROLS = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu;
+
+/**
+ * A title as the name of a downloaded file (Download All's zip, a version's
+ * only file): its letters and digits in any script kept (NFC), the
+ * characters no file name may hold (`/ \ : * ? " < > |`, control
+ * characters) dropped as spaces, whitespace collapsed, leading and trailing
+ * spaces and dots trimmed, at most ARTIFACT_FILE_NAME_MAX_CHARS code points.
+ * Empty when nothing is left: the caller names its own fallback. The server
+ * (Content-Disposition) and the web (a blob's `download`) name files by it.
+ */
+export function artifactSafeFileName(title: string): string {
+  const cleaned = title.normalize("NFC").replace(BIDI_CONTROLS, "").replace(UNSAFE_FILE_NAME_CHARS, " ").replace(/\s+/gu, " ");
+  return trimFileName(Array.from(trimFileName(cleaned)).slice(0, ARTIFACT_FILE_NAME_MAX_CHARS).join(""));
+}
+
+const trimFileName = (name: string): string => name.replace(/^[\s.]+|[\s.]+$/gu, "");
+
+/**
+ * The name one file of a version downloads as. A version of one file is
+ * named by its title with that file's own extension (`周计划` with
+ * `index.html`: `周计划.html`; a title that already ends in it keeps it as
+ * it is); with no title left (artifactSafeFileName), and in a version of
+ * several files, the file's own name (its path's last segment).
+ */
+export function artifactDownloadFileName(input: { title: string; fileCount: number; path: string }): string {
+  const own = input.path.slice(input.path.lastIndexOf("/") + 1);
+  if (input.fileCount !== 1) return own;
+  const base = artifactSafeFileName(input.title);
+  if (base === "") return own;
+  const dot = own.lastIndexOf(".");
+  const ext = dot > 0 ? own.slice(dot).replace(BIDI_CONTROLS, "").replace(UNSAFE_FILE_NAME_CHARS, "").replace(/\s+/gu, "") : "";
+  if (ext.length < 2 || base.toLowerCase().endsWith(ext.toLowerCase())) return base;
+  return `${base}${ext}`;
+}
+
 /** The page's `<title>` is looked for in its first 256 KiB: it belongs in `<head>`. */
 const HTML_TITLE_SCAN_CHARS = 256 * 1024;
 const HTML_ENTITIES: Readonly<Record<string, string>> = { amp: "&", lt: "<", gt: ">", quot: "\"", apos: "'", nbsp: " " };
@@ -81,6 +123,25 @@ export function artifactTitleFromHtml(html: string): string | null {
     .replace(/\s+/g, " ")
     .trim();
   return text === "" ? null : text;
+}
+
+/**
+ * A new Artifact's entry when its push names none: index.html; else its only
+ * file; else its only HTML page; else, with no HTML page, its only Markdown
+ * file. Otherwise no entry can be picked, and `candidates` are the pages (or
+ * the Markdown files) to choose from, sorted. The Server picks by this, and
+ * clients check by it before sending, so a push that can't open anywhere is
+ * stopped before its files go up (about 100 a day were refused after).
+ */
+export function artifactDefaultEntry(paths: readonly string[]): { entry: string } | { candidates: string[] } {
+  if (paths.includes("index.html")) return { entry: "index.html" };
+  if (paths.length === 1) return { entry: paths[0]! };
+  const pages = paths.filter((path) => artifactFileType(path).kind === "html").sort();
+  if (pages.length === 1) return { entry: pages[0]! };
+  if (pages.length > 1) return { candidates: pages };
+  const notes = paths.filter((path) => artifactFileType(path).kind === "markdown").sort();
+  if (notes.length === 1) return { entry: notes[0]! };
+  return { candidates: notes };
 }
 
 export function artifactFileType(path: string): ArtifactFileType {

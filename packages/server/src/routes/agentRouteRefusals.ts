@@ -3,9 +3,9 @@
 // defined once so the two routes can't drift apart
 // (docs/contracts/agent-api-refusals.md).
 
-import { OAUTH_CLIENT_CATEGORIES, RAFT_HINTS, TASK_ASSIGN_REASON_UNCHANGED, TASK_ASSIGN_REASON_UNCHANGED_MESSAGE } from "@botiverse/raft-shared";
+import { OAUTH_CLIENT_CATEGORIES, PROFILE_DESCRIPTION_MAX_LENGTH, profileDescriptionTooLong, RAFT_HINTS, TASK_ASSIGN_REASON_UNCHANGED, TASK_ASSIGN_REASON_UNCHANGED_MESSAGE } from "@botiverse/raft-shared";
 import { sentenceQuoting, type RefusalInput } from "../lib/refusal";
-import { PROFILE_AVATAR_MAX_SIZE_LABEL } from "../services/avatarService";
+import { PROFILE_AVATAR_MAX_SIZE_LABEL } from "../services/avatarLimits";
 import { taskStatusRejectionCode } from "./agentApiErrorTrace";
 import { isThreadTarget } from "./agentWritableTarget";
 
@@ -311,7 +311,6 @@ export const UPLOAD_MEMBERSHIP_REQUIRED_REFUSAL: RefusalInput = {
 
 // Agent profile: display name, description and avatar.
 
-export const MAX_AGENT_PROFILE_DESCRIPTION_LENGTH = 3000;
 export const MAX_AGENT_PROFILE_DISPLAY_NAME_LENGTH = 80;
 
 export const PROFILE_UPDATE_NO_FIELDS_REFUSAL: RefusalInput = { code: "PROFILE_UPDATE_NO_FIELDS", error: "A profile update needs something to change: give a display name, a description or an avatar URL." };
@@ -322,16 +321,18 @@ const AVATAR_URL_INVALID_REFUSAL: RefusalInput = { code: "PROFILE_AVATAR_URL_BAD
 const DISPLAY_NAME_EMPTY_REFUSAL: RefusalInput = { code: "profile_display_name_invalid", error: "A display name can't be empty: give the name to show, or leave it out to keep the current one." };
 const DISPLAY_NAME_TOO_LONG_REFUSAL: RefusalInput = { code: "profile_display_name_invalid", error: `A display name can be at most ${MAX_AGENT_PROFILE_DISPLAY_NAME_LENGTH} characters: shorten it.` };
 const DESCRIPTION_EMPTY_REFUSAL: RefusalInput = { code: "profile_description_invalid", error: "A description can't be empty: give one, or leave it out to keep the current one." };
-const DESCRIPTION_TOO_LONG_REFUSAL: RefusalInput = { code: "profile_description_invalid", error: `A description can be at most ${MAX_AGENT_PROFILE_DESCRIPTION_LENGTH} characters: shorten it.` };
+const DESCRIPTION_TOO_LONG_REFUSAL: RefusalInput = { code: "profile_description_invalid", error: `A new or changed description can be at most ${PROFILE_DESCRIPTION_MAX_LENGTH} characters: shorten it.` };
 
 export type AgentProfileFields = { avatarUrl?: string; displayName?: string; description?: string };
 
 /**
  * The fields of an agent's profile update, checked the same way on the agent
  * API and the legacy route: present fields only, trimmed (a description keeps
- * its whitespace), or the 400 refusal for the first field that is wrong.
+ * its whitespace), or the 400 refusal for the first field that is wrong. A
+ * description over the limit passes only when it is the one already stored
+ * (`storedDescription`): one saved under the older, longer limit keeps saving.
  */
-export function agentProfileUpdateFields(body: { avatarUrl?: unknown; displayName?: unknown; description?: unknown }): { ok: true; fields: AgentProfileFields } | { ok: false; refusal: RefusalInput } {
+export function agentProfileUpdateFields(body: { avatarUrl?: unknown; displayName?: unknown; description?: unknown }, storedDescription?: string | null): { ok: true; fields: AgentProfileFields } | { ok: false; refusal: RefusalInput } {
   const has = (key: "avatarUrl" | "displayName" | "description") => Object.prototype.hasOwnProperty.call(body, key);
   if (!has("avatarUrl") && !has("displayName") && !has("description")) return { ok: false, refusal: PROFILE_UPDATE_NO_FIELDS_REFUSAL };
   const fields: AgentProfileFields = {};
@@ -349,7 +350,7 @@ export function agentProfileUpdateFields(body: { avatarUrl?: unknown; displayNam
   if (has("description")) {
     const value = typeof body.description === "string" ? body.description : "";
     if (!value) return { ok: false, refusal: DESCRIPTION_EMPTY_REFUSAL };
-    if (value.length > MAX_AGENT_PROFILE_DESCRIPTION_LENGTH) return { ok: false, refusal: DESCRIPTION_TOO_LONG_REFUSAL };
+    if (profileDescriptionTooLong(value, storedDescription)) return { ok: false, refusal: DESCRIPTION_TOO_LONG_REFUSAL };
     fields.description = value;
   }
   return { ok: true, fields };
@@ -479,7 +480,6 @@ export const APP_CARD_MODE_INVALID_REFUSAL: RefusalInput = { code: "mode_invalid
 export const APP_SCOPE_UNKNOWN_REFUSAL: RefusalInput = { code: "INVALID_SCOPE", error: "One of the scopes isn't a scope Raft defines: ask only for Raft scopes, such as openid and profile." };
 export const APP_CATEGORY_INVALID_REFUSAL: RefusalInput = { code: "INVALID_CATEGORY", error: `That isn't an app category: use one of ${OAUTH_CLIENT_CATEGORIES.join(", ")}.` };
 export const APP_NAME_REQUIRED_REFUSAL: RefusalInput = { code: "app_name_required", error: "Registering an app needs its name: give the name people will see." };
-export const APP_RETURN_URL_REQUIRED_REFUSAL: RefusalInput = { code: "return_url_required", error: "Registering an app needs its return URL, where people land after logging in with Raft: give it." };
 
 // App management: rotate secret, transfer, update, manage and logo.
 
@@ -521,7 +521,8 @@ export function appTransferTargetNotFoundRefusal(name: string): RefusalInput {
   };
 }
 export const APP_UPDATE_NO_FIELDS_REFUSAL: RefusalInput = { code: "app_update_no_fields", error: "An app update needs something to change: give at least one field, such as its name, description or return URL." };
-export const APP_RETURN_URL_EMPTY_REFUSAL: RefusalInput = { code: "RETURN_URL_REQUIRED", error: "An app's return URL can't be empty, since an OAuth app keeps a registered callback address: give a new one, or leave it out to keep the current one." };
+/** An unsafe return URL on update. An empty one is not refused: it clears the URL, leaving a token-only App nobody signs in to. */
+export const APP_RETURN_URL_INVALID_REFUSAL: RefusalInput = { code: "RETURN_URL_INVALID", error: "That return URL can't be used: it must be HTTPS (or HTTP to a loopback address), without credentials or a fragment. Give another, an empty one to clear it, or leave it out to keep the current one." };
 export function shareLinkTargetNotApplicableRefusal(action: string): RefusalInput {
   return {
     code: "SHARE_LINK_TARGET_NOT_APPLICABLE",
@@ -578,6 +579,22 @@ export function messageResolveRefusal(error: string): RefusalInput {
 }
 
 /**
+ * A message resolve asking for a forwarded message (`forwarded=<n>`) the
+ * message doesn't carry (400): how many it forwards, or that it forwards none.
+ * Informative codes; the sentence names no flag, the next step does.
+ */
+export function forwardedMessageRefusal(total: number): RefusalInput {
+  if (total === 0) {
+    return { code: "NOT_A_FORWARD", error: "This message forwards no messages: resolve it without a forwarded message number." };
+  }
+  return {
+    code: "FORWARDED_OUT_OF_RANGE",
+    error: `This message forwards ${total} ${total === 1 ? "message" : "messages"}; ask for forwarded message 1 to ${total}.`,
+    suggestedNextAction: total === 1 ? "Use --forwarded 1." : `Use --forwarded 1 to ${total}.`,
+  };
+}
+
+/**
  * The single answer BOTH for "no message with that short id in this channel"
  * and for "that short id belongs to some other channel" (404 `NOT_FOUND`):
  * one function, so the two are identical by construction. Saying "it lives in
@@ -625,6 +642,41 @@ export function agentLoginNotFoundRefusal(message: string): RefusalInput {
   return serviceMessageRefusal("not_found", message, "Something this login needs no longer exists: start the login again.");
 }
 
+/**
+ * An Agent Login service name that matched nothing to log in to
+ * (oauthClientKeys.resolveAgentLoginClient), by its status: none given (400),
+ * a name several services share (409), or none (404; a key whose App isn't
+ * available here reads the same as an unknown one).
+ */
+export function agentLoginServiceRefusal(failure: { status: 400 | 404 | 409; error: string }): RefusalInput {
+  const code = failure.status === 400 ? "service_required" : failure.status === 409 ? "service_ambiguous" : "service_not_found";
+  return { code, error: failure.error };
+}
+
+/** A profile target that isn't `@handle` (400 `profile_target_invalid`), in the parser's words. */
+export function profileTargetInvalidRefusal(message: string): RefusalInput {
+  return serviceMessageRefusal("profile_target_invalid", message, "A profile target is an @handle: give one, or leave it out to read your own profile.");
+}
+
+/** A profile handle a person and an agent share (409 `profile_handle_ambiguous`). */
+export function profileHandleAmbiguousRefusal(handle: string): RefusalInput {
+  return {
+    code: "profile_handle_ambiguous",
+    error: sentenceQuoting([handle], `Profile handle @${handle} is ambiguous`, "That profile handle is ambiguous"),
+  };
+}
+
+/**
+ * No profile this agent can see has that handle (404 `profile_not_found`):
+ * nobody by that name and a person the agent's directory hides read the same.
+ */
+export function profileNotFoundRefusal(handle: string): RefusalInput {
+  return {
+    code: "profile_not_found",
+    error: sentenceQuoting([handle], `Profile @${handle} not found`, "No profile you can see has that handle"),
+  };
+}
+
 /** App fields the app service refused, in its words (400 `INVALID_APP_METADATA`). */
 export function appMetadataInvalidRefusal(message: string): RefusalInput {
   return serviceMessageRefusal("INVALID_APP_METADATA", message, "One of the app's fields isn't valid: check its manifest URL, setup fields, scopes and when-to-use text.");
@@ -652,6 +704,27 @@ export function taskAssignRefusal(reason: string, channel: string, taskNumber: n
       return { code: TASK_ASSIGN_REASON_UNCHANGED, error: reason };
     default:
       return serviceMessageRefusal("task_assign_rejected", reason, "The task couldn't be assigned as asked: look at the task again, then try once more.");
+  }
+}
+
+/**
+ * A resource receipt the task service refused (taskService.recordTaskResourceReceipt),
+ * by its kind: a receipt that isn't valid (400), no such task (404, the plain
+ * task not-found), or a task whose state takes no receipt now (409). The
+ * sentences are the service's fixed reasons.
+ */
+export function taskResourceReceiptRefusal(
+  refused: { refused: "invalid" | "not_found" | "conflict"; code: string; reason: string },
+  channel: string,
+  taskNumber: number,
+): { status: 400 | 404 | 409; refusal: RefusalInput } {
+  switch (refused.refused) {
+    case "not_found":
+      return { status: 404, refusal: taskNotFoundRefusal(channel, taskNumber) };
+    case "invalid":
+      return { status: 400, refusal: { code: refused.code, error: refused.reason } };
+    case "conflict":
+      return { status: 409, refusal: { code: refused.code, error: refused.reason } };
   }
 }
 

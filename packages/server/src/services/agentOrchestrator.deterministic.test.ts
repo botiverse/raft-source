@@ -3,11 +3,17 @@ import { dbTest as test } from "../test/integration/dbTest";
 import assert from "node:assert/strict";
 import { vi } from "vitest";
 import { Server as SocketServer } from "socket.io";
+import {
+  __resetReplicaAgentConfigSealModeCacheForTests,
+  __setReplicaAgentConfigSealModeForTests,
+} from "./agentSecretFlags";
 
 import {
   StartIntentRemoteError,
   StartIntentTimeoutError,
   StartIntentTransportError,
+  startIntentFailureOf,
+  startIntentReply,
   type StartIntentRequest,
 } from "../replicaRouter";
 import { RouteFailureError } from "../tracing/routeFailure";
@@ -43,6 +49,7 @@ import {
   type MachineId,
   type SkillInfo,
   type RuntimeAccountUsageProvider,
+  type RuntimeLimitResetIdempotencyKey,
   MODEL_SEEN_MAX_ITEMS_PER_REPORT,
   SPAWN_FAILURE_RETRY_ONCE_DELAY_MS,
   TurnSummaryTracker,
@@ -51,6 +58,7 @@ import {
   COMPUTER_UPGRADE_DRAIN_MAX_DEADLINE_MS,
   DAEMON_CAPABILITY_COMPUTER_UPGRADE_DRAIN_V1,
   DAEMON_CAPABILITY_RUNTIME_ACCOUNT_USAGE_ANTIGRAVITY,
+  type SpawnFailureActivityDiagnostic,
 } from "@botiverse/raft-shared";
 import {
   REPLICA_ID,
@@ -64,6 +72,7 @@ import { runWithTraceSpan } from "../tracing/semanticTrace";
 import {
   AgentOrchestrator,
   KimiReasoningEffortUpgradeRequiredError,
+  BuiltInProviderMissingStartError,
   deliveryChannelKind,
   mapExternalPluginActivityEvent,
   nextActivityServerSeq,
@@ -91,7 +100,7 @@ import { computerUpgradeRequestDeadlineMs, createComputerUpgradeRequest, getOpen
 import { computerUpgradeRequests } from "../db/schema";
 import { ComputerVersionFloor } from "./computerVersionFloorService";
 import { randomUUID } from "node:crypto";
-import { agentDeliveryAckSeconds, agentDeliveryOutcomesTotal, agentDeliveryPending, agentDeliveryTrackedTotal } from "../metrics";
+import { agentDeliveryAckSeconds, agentDeliveryE2eSeconds, agentDeliveryOutcomesTotal, agentDeliveryPending, agentDeliveryQueueSeconds, agentDeliveryTrackedTotal, agentWakeStartSeconds, messagePushLagSeconds } from "../metrics";
 import { eq } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { machines, users } from "../db/schema";
@@ -100,6 +109,7 @@ import type { LocalAgentInboxes } from "./localAgentInboxes";
 import { createServer } from "./serverService";
 import { getMachine, recordMachineComputerVersion, registerMachine } from "./machineService";
 import { BuiltInModelCatalogError } from "./builtinModelCatalogCompatibility";
+import { ComputerReadUnavailableError } from "./computerProbeCacheService";
 import type { AgentRuntimeErrorClearResult, AgentSignalStatusWriteOutcome } from "./agentService";
 
 /**
@@ -233,6 +243,7 @@ class InMemoryReplicaStateStore implements ReplicaStateStore {
     detailKind: AgentActivityDetailKind,
     observedAtMs?: number,
     carriers?: PersistedActivityTypedCarriers,
+    livenessAtMs?: number,
   ): Promise<void> {
     this.agentActivities.set(agentId, {
       activity,
@@ -240,6 +251,7 @@ class InMemoryReplicaStateStore implements ReplicaStateStore {
       detailKind,
       ...(observedAtMs !== undefined ? { observedAtMs } : {}),
       updatedAt: Date.now(),
+      ...(livenessAtMs !== undefined ? { livenessAtMs } : {}),
       ...(carriers ? { carriers: structuredClone(carriers) } : {}),
     });
   }
@@ -590,6 +602,7 @@ class ControlledReplicaStateStore implements ReplicaStateStore {
     detailKind: AgentActivityDetailKind,
     observedAtMs?: number,
     carriers?: PersistedActivityTypedCarriers,
+    livenessAtMs?: number,
   ): Promise<void> {
     this.shared.agentActivities.set(agentId, {
       activity,
@@ -597,6 +610,7 @@ class ControlledReplicaStateStore implements ReplicaStateStore {
       detailKind,
       ...(observedAtMs !== undefined ? { observedAtMs } : {}),
       updatedAt: Date.now(),
+      ...(livenessAtMs !== undefined ? { livenessAtMs } : {}),
       ...(carriers ? { carriers: structuredClone(carriers) } : {}),
     });
   }
@@ -1439,6 +1453,25 @@ class LegacyKimiCapabilityStartOrchestrator extends WakeLockDeterministicAgentOr
         models: [{ id: "kimi-code/k3", label: "Kimi K3" }],
       },
     };
+  }
+}
+
+class ProviderlessBuiltInStartOrchestrator extends WakeLockDeterministicAgentOrchestrator {
+  constructor(private readonly persistedSessionId: string | null) {
+    super(new InMemoryReplicaStateStore());
+  }
+
+  protected override async loadAgentForStart(agentId: string) {
+    const agent = await super.loadAgentForStart(agentId);
+    // A legacy Built-in row with no versioned config hydrates with no provider.
+    return {
+      ...agent,
+      sessionId: this.persistedSessionId,
+      runtime: "builtin",
+      model: "deepseek/deepseek-v4-pro",
+      runtimeConfig: null,
+      envVars: null,
+    } as Awaited<ReturnType<WakeLockDeterministicAgentOrchestrator["loadAgentForStart"]>>;
   }
 }
 
@@ -2564,6 +2597,47 @@ test("agent skills list preserves legacy unscoped daemon result fallback", async
 
   const result = await pending;
   assert.deepEqual(result.global.map((skill) => skill.name), ["legacy"]);
+  assert.equal("builtin" in result, false, "an older daemon sends no built-in list");
+  orchestrator.shutdown();
+});
+
+test("agent skills list: a result saying OAR could not read them rejects as read-unavailable, not an empty list", async () => {
+  const orchestrator = new SkillsListDeterministicOrchestrator();
+  const pending = orchestrator.getAgentSkills("agent-1", "antigravity");
+  await flushMicrotasks();
+  const requestId = orchestrator.skillsRequests[0]?.requestId;
+  await orchestrator.handleMachineMessage("machine-1", {
+    type: "agent:skills:list_result",
+    agentId: "agent-1",
+    requestId,
+    global: [],
+    workspace: [],
+    unavailable: { reason: "deadline" },
+  });
+  await assert.rejects(pending, (error: unknown) => error instanceof ComputerReadUnavailableError && error.reason === "deadline");
+  orchestrator.shutdown();
+});
+
+test("agent skills list passes the daemon's built-in list through", async () => {
+  const orchestrator = new SkillsListDeterministicOrchestrator();
+  const pending = orchestrator.getAgentSkills("agent-1", "claude");
+  await flushMicrotasks();
+  const requestId = orchestrator.skillsRequests[0]?.requestId;
+
+  await orchestrator.handleMachineMessage("machine-1", {
+    type: "agent:skills:list_result",
+    agentId: "agent-1",
+    requestId,
+    global: [testSkill("review")],
+    workspace: [testSkill("deploy")],
+    builtin: [testSkill("simplify")],
+  });
+
+  const result = await pending;
+  assert.deepEqual(
+    [result.global, result.workspace, result.builtin].map((list) => list?.map((skill) => skill.name)),
+    [["review"], ["deploy"], ["simplify"]],
+  );
   orchestrator.shutdown();
 });
 
@@ -2867,6 +2941,37 @@ function runtimeAccountUsageBoundarySnapshot() {
   };
 }
 
+class ProcJobsDeterministicOrchestrator extends RuntimeAccountUsageBoundaryDeterministicOrchestrator {
+  readonly procSnapshots: Array<{ machineId: string; snapshot: unknown }> = [];
+  protected override async loadProcJobsAssignedAgentIds(): Promise<Set<string>> {
+    return new Set(["agent-1"]);
+  }
+  protected override async writeProcJobsSnapshot(machineId: string, snapshot: unknown): Promise<void> {
+    this.procSnapshots.push({ machineId, snapshot });
+  }
+}
+
+// docs/contracts/proc-jobs.md: machine:proc_jobs:snapshot goes through the usage
+// snapshot's boundary (attached Computer only) before anything is cached.
+test("raft proc snapshots are cached from an attached Computer and dropped from a raw daemon", async () => {
+  const message = {
+    type: "machine:proc_jobs:snapshot",
+    snapshot: { protocolVersion: 1, reportedAt: "2026-11-19T10:05:00.000Z", jobs: [{ agentId: "agent-1", name: "web", state: "running", startedAt: "2026-11-19T10:00:00.000Z" }] },
+  } as MachineToServerMessage;
+  const attached = new ProcJobsDeterministicOrchestrator();
+  attached.seedRuntimeUsageConnection("attached-computer", "computer");
+  attached.attachedByMachine.set("attached-computer", "user-1");
+  await attached.handleMachineMessage("attached-computer", message);
+  assert.equal(attached.procSnapshots.length, 1);
+  attached.shutdown();
+  const raw = new ProcJobsDeterministicOrchestrator();
+  raw.seedRuntimeUsageConnection("legacy-machine", "legacy_machine");
+  raw.attachedByMachine.set("legacy-machine", "user-1");
+  await raw.handleMachineMessage("legacy-machine", message);
+  assert.deepEqual(raw.procSnapshots, []);
+  raw.shutdown();
+});
+
 test("runtime account usage drops scheduled refresh and snapshot ingest from raw or unattached connections", async () => {
   for (const scenario of [
     { machineId: "legacy-machine", principalKind: "legacy_machine" as const, attachedBy: "user-1" },
@@ -2953,6 +3058,135 @@ test("a limit-reset result caches its usage read before the reply is forwarded, 
     result: { kind: "reset" },
   }], "the outcome still reaches the person, without the read");
   unattached.shutdown();
+});
+
+const RUNTIME_USAGE_FOLDER_AGENTS = [
+  { id: "shared-codex", runtime: "codex", model: "gpt-5.5", envVars: null, runtimeConfig: null, reasoningEffort: null },
+  { id: "own-a2", runtime: "codex", model: "gpt-5.5", envVars: { CODEX_HOME: "/srv/a" }, runtimeConfig: null, reasoningEffort: null },
+  { id: "own-a1", runtime: "codex", model: "gpt-5.5", envVars: { CODEX_HOME: "/srv/a", TEAM_FLAG: "x" }, runtimeConfig: null, reasoningEffort: null },
+  { id: "own-home", runtime: "codex", model: "gpt-5.5", envVars: { HOME: "/home/b" }, runtimeConfig: null, reasoningEffort: null },
+  { id: "key-codex", runtime: "codex", model: "gpt-5.5", envVars: { CODEX_HOME: "/srv/k", OPENAI_API_KEY: "sk-test" }, runtimeConfig: null, reasoningEffort: null },
+  { id: "own-claude", runtime: "claude", model: "sonnet", envVars: { CLAUDE_CONFIG_DIR: "/srv/c" }, runtimeConfig: null, reasoningEffort: null },
+  { id: "token-claude", runtime: "claude", model: "sonnet", envVars: { CLAUDE_CONFIG_DIR: "/srv/t", ANTHROPIC_AUTH_TOKEN: "t" }, runtimeConfig: null, reasoningEffort: null },
+  {
+    id: "custom-claude",
+    runtime: "claude",
+    model: "internal-gateway/claude-opus",
+    envVars: { CLAUDE_CONFIG_DIR: "/srv/d", ANTHROPIC_BASE_URL: "https://gateway.example.test/v1", ANTHROPIC_API_KEY: "sk-ant-test" },
+    runtimeConfig: null,
+    reasoningEffort: null,
+  },
+];
+
+test("a Codex or Claude refresh carries the account folders of the Computer's agents that set their own, grouped; other providers and agents none", async () => {
+  class FolderOrchestrator extends DeterministicAgentOrchestrator {
+    readonly sent: ServerToMachineMessage[] = [];
+    protected override async loadAgentsForReadyReconcile() {
+      return RUNTIME_USAGE_FOLDER_AGENTS as never;
+    }
+    protected override async sendToMachine(_machineId: string, msg: ServerToMachineMessage): Promise<boolean> {
+      this.sent.push(msg);
+      return true;
+    }
+  }
+  const orchestrator = new FolderOrchestrator();
+  try {
+    await orchestrator.requestRuntimeAccountUsageRefresh("folders-computer", "codex", "scheduled");
+    await orchestrator.requestRuntimeAccountUsageRefresh("folders-computer", "claude", "stale_or_missing");
+    await orchestrator.requestRuntimeAccountUsageRefresh("folders-computer", "kimi", "scheduled");
+    const homes = orchestrator.sent.map((msg) => (msg.type === "machine:runtime_account_usage:refresh" ? [msg.provider, msg.accountHomes ?? null] : null));
+    assert.deepEqual(homes, [
+      ["codex", [
+        { agentIds: ["own-a1", "own-a2"], env: { CODEX_HOME: "/srv/a" } },
+        { agentIds: ["own-home"], env: { HOME: "/home/b" } },
+      ]],
+      ["claude", [{ agentIds: ["own-claude"], env: { CLAUDE_CONFIG_DIR: "/srv/c" } }]],
+      ["kimi", null],
+    ]);
+  } finally {
+    orchestrator.shutdown();
+  }
+
+  // No agent with its own folder: the refresh is exactly as before.
+  class PlainOrchestrator extends FolderOrchestrator {
+    protected override async loadAgentsForReadyReconcile() {
+      return [RUNTIME_USAGE_FOLDER_AGENTS[0]] as never;
+    }
+  }
+  const plain = new PlainOrchestrator();
+  try {
+    await plain.requestRuntimeAccountUsageRefresh("plain-computer", "codex", "manual");
+    assert.equal("accountHomes" in plain.sent[0]!, false);
+  } finally {
+    plain.shutdown();
+  }
+});
+
+test("after a limit reset's default-only read, a Computer with agents on their own folders is asked to read them again", async () => {
+  class FolderBoundaryOrchestrator extends RuntimeAccountUsageBoundaryDeterministicOrchestrator {
+    agents: unknown[] = RUNTIME_USAGE_FOLDER_AGENTS;
+    protected override async loadAgentsForReadyReconcile() {
+      return this.agents as never;
+    }
+  }
+  const result = {
+    type: "machine:runtime_account_usage:limit_reset:result",
+    requestId: "redeem-folders",
+    result: { kind: "reset" },
+    snapshot: runtimeAccountUsageBoundarySnapshot(),
+  } as MachineToServerMessage;
+  const orchestrator = new FolderBoundaryOrchestrator();
+  orchestrator.seedRuntimeUsageConnection("folder-computer", "computer");
+  orchestrator.attachedByMachine.set("folder-computer", "user-1");
+  try {
+    await orchestrator.handleMachineMessage("folder-computer", result);
+    await waitForCondition(() => orchestrator.refreshRequests.length > 0);
+    assert.deepEqual(orchestrator.refreshRequests, [{ machineId: "folder-computer", provider: "codex" }]);
+
+    orchestrator.agents = [RUNTIME_USAGE_FOLDER_AGENTS[0]];
+    await orchestrator.handleMachineMessage("folder-computer", result);
+    await waitForCondition(() => false, 5);
+    assert.equal(orchestrator.refreshRequests.length, 1, "no agent on its own folder: no second read");
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("a limit-reset redeem and read tell the Computer it may answer unsupported: onboarding_required only when the page asked", async () => {
+  // Without the flag a Computer answers a first-run page as not_attempted, which is all an older server can parse.
+  class LimitResetRequestOrchestrator extends DeterministicAgentOrchestrator {
+    readonly sent: ServerToMachineMessage[] = [];
+    protected override async sendRequiredToMachine(_machineId: string, msg: ServerToMachineMessage): Promise<"local"> {
+      this.sent.push(msg);
+      return "local";
+    }
+    protected override getMachineResponseRelay() {
+      return {
+        request: async (input: { requestId: string; type: string }, _timeoutMs: number, send: () => Promise<unknown>) => {
+          await send();
+          return { type: input.type, requestId: input.requestId, result: { kind: "unsupported", reason: "onboarding_required" } };
+        },
+      } as never;
+    }
+  }
+  const orchestrator = new LimitResetRequestOrchestrator();
+  try {
+    const key = "0f6b1f8e-5c3a-4c55-9c1e-6a7b8c9d0e1f" as RuntimeLimitResetIdempotencyKey;
+    await orchestrator.redeemRuntimeLimitReset("machine-1", "claude", key, "weekly", true);
+    await orchestrator.redeemRuntimeLimitReset("machine-1", "codex", key);
+    await orchestrator.readRuntimeLimitResets("machine-1", "claude", { atFiveHourLimit: false, atFiveHourLimitConsent: false, includeFiveHour: true, onboardingRequiredReason: true });
+    await orchestrator.readRuntimeLimitResets("machine-1", "claude", { atFiveHourLimit: false, atFiveHourLimitConsent: false, includeFiveHour: true });
+    // Each request id is a fresh UUID: compared as "r".
+    assert.deepEqual(orchestrator.sent.map((msg) => ({ ...msg, requestId: "r" })), [
+      { type: "machine:runtime_account_usage:limit_reset:redeem", requestId: "r", provider: "claude", idempotencyKey: key, kind: "weekly", onboardingRequiredReason: true },
+      // Only when the page said it reads the reason: an older bundle never asks, so never gets it.
+      { type: "machine:runtime_account_usage:limit_reset:redeem", requestId: "r", provider: "codex", idempotencyKey: key },
+      { type: "machine:runtime_account_usage:limit_resets:read", requestId: "r", provider: "claude", atFiveHourLimit: false, includeFiveHour: true, onboardingRequiredReason: true },
+      { type: "machine:runtime_account_usage:limit_resets:read", requestId: "r", provider: "claude", atFiveHourLimit: false, includeFiveHour: true },
+    ]);
+  } finally {
+    orchestrator.shutdown();
+  }
 });
 
 function startHeartbeat(orchestrator: AgentOrchestrator, machineId: string, conn: unknown) {
@@ -3960,6 +4194,87 @@ test("an owner-side start failure is rethrown on the requester with its original
       // The owner's own message, not a locally produced one: the requester did
       // not try to start the agent itself.
       assert.equal((error as RouteFailureError).message, "owner-side: machine offline");
+      return true;
+    });
+    peer.shutdown();
+  }
+});
+
+/**
+ * Routes an intent as replicaRouter does across replicas: an owner-side
+ * failure reaches the requester only as its name, message and subkind.
+ */
+class WireStartIntentRoutingOrchestrator extends StartIntentRoutingOrchestrator {
+  protected override async routeIntentToOwner(ownerReplicaId: string, request: StartIntentRequest) {
+    try {
+      return await super.routeIntentToOwner(ownerReplicaId, request);
+    } catch (error) {
+      throw startIntentReply(undefined, startIntentFailureOf(error));
+    }
+  }
+}
+
+class ProviderlessBuiltInWireRoutingOrchestrator extends WireStartIntentRoutingOrchestrator {
+  protected override async loadAgentForStart(agentId: string) {
+    const agent = await super.loadAgentForStart(agentId);
+    // A legacy Built-in row with no versioned config hydrates with no provider.
+    return {
+      ...agent,
+      runtime: "builtin",
+      model: "deepseek/deepseek-v4-pro",
+      runtimeConfig: null,
+      envVars: null,
+    } as Awaited<ReturnType<StartRoutingDeterministicOrchestrator["loadAgentForStart"]>>;
+  }
+}
+
+test("a Built-in start with no provider refused on the owner replica reaches the requester as the same refusal, not a 500", async () => {
+  const shared = new ControlledReplicaState();
+  const network: StartRoutingNetwork = { shared, replicas: new Map() };
+  const owner = new ProviderlessBuiltInWireRoutingOrchestrator("replica-a", network, new ControlledReplicaStateStore(shared, "replica-a"));
+  const peer = new ProviderlessBuiltInWireRoutingOrchestrator("replica-b", network, new ControlledReplicaStateStore(shared, "replica-b"));
+  const ws = makeFakeWs(1);
+  seedMachineConnection(owner, "machine-1", ws);
+  shared.machineOwners.set("machine-1", "replica-a");
+
+  await assert.rejects(peer.startAgent("agent-1"), (error: unknown) => {
+    // Before: a StartIntentRemoteError, which the route answered 500.
+    assert.ok(error instanceof BuiltInProviderMissingStartError, "the start route maps this class to 422");
+    assert.equal(error.code, "builtin_provider_missing");
+    assert.equal(error.message, "This agent has no model provider. Open its settings, choose a provider and save, then start it again.");
+    return true;
+  });
+  assert.deepEqual(owner.intentsHandled, ["start"], "the owner ran the start and refused it");
+  assert.equal(startMessagesSentOn(ws).length, 0, "nothing reached the daemon");
+  owner.shutdown();
+  peer.shutdown();
+});
+
+test("an owner-side Kimi upgrade or missing-provider refusal is rebuilt on the requester by name, with the owner's words", async () => {
+  for (const [name, message, check] of [
+    [
+      "KimiReasoningEffortUpgradeRequiredError",
+      "owner-side: update Raft on this computer",
+      (error: unknown) => error instanceof KimiReasoningEffortUpgradeRequiredError && error.code === "upgrade_required",
+    ],
+    [
+      "BuiltInProviderMissingStartError",
+      "owner-side: this agent has no model provider",
+      (error: unknown) => error instanceof BuiltInProviderMissingStartError && error.code === "builtin_provider_missing",
+    ],
+  ] as const) {
+    class FailingOwnerRoute extends StartIntentRoutingOrchestrator {
+      protected override async routeIntentToOwner(): Promise<never> {
+        throw new StartIntentRemoteError({ name, message });
+      }
+    }
+    const shared = new ControlledReplicaState();
+    const network: StartRoutingNetwork = { shared, replicas: new Map() };
+    const peer = new FailingOwnerRoute("replica-b", network, new ControlledReplicaStateStore(shared, "replica-b"));
+    shared.machineOwners.set("machine-1", "replica-a");
+    await assert.rejects(peer.startAgent("agent-1"), (error: unknown) => {
+      assert.ok(check(error), `${name} is rebuilt with its class and code`);
+      assert.equal((error as Error).message, message);
       return true;
     });
     peer.shutdown();
@@ -8958,14 +9273,15 @@ test("redis activity does not mask a missing machine replica heartbeat", async (
 
 test("stale redis transient activity downgrades to online when the machine is still reachable", async () => {
   const clock = new FakeClock();
-  clock.advance(120_000);
+  clock.advance(200_000);
   const store = new InMemoryReplicaStateStore();
   store.machineReplicas.add("machine-1");
+  // Past the read threshold (150 s, #oar-raft:#22), not just the sweep's 90 s.
   store.agentActivities.set("agent-1", {
     activity: "working",
     detail: "stuck",
     detailKind: "other",
-    observedAtMs: clock.now() - 91_000,
+    observedAtMs: clock.now() - 151_000,
     updatedAt: clock.now(),
   });
 
@@ -13153,6 +13469,28 @@ test("Kimi explicit reasoning rejects legacy daemon capability before fresh or r
   }
 });
 
+test("a Built-in agent with no provider is refused in plain words before dispatch", async () => {
+  for (const sessionId of [null, "persisted-session"] as const) {
+    const orchestrator = new ProviderlessBuiltInStartOrchestrator(sessionId);
+    await assert.rejects(
+      () => orchestrator.startAgent("agent-1"),
+      (error: unknown) => {
+        // Before: a bare TypeError from the launch projection ("Cannot read properties of undefined").
+        assert.ok(error instanceof BuiltInProviderMissingStartError);
+        assert.equal(error.code, "builtin_provider_missing");
+        assert.equal(error.message, "This agent has no model provider. Open its settings, choose a provider and save, then start it again.");
+        assert.doesNotMatch(error.message, /runtimeConfig\./, "no internal field path in the person's words");
+        return true;
+      },
+    );
+    assert.equal(orchestrator.startMessages.length, 0, "the refusal comes before any dispatch");
+    const failed = orchestrator.getRecentLifecycleEvents("agent-1").filter((event) => event.action === "start" && event.outcome === "failed");
+    // Not the daemon's `runtime_config_invalid` spawn-failure reason, which means something else.
+    assert.deepEqual(failed.map((event) => event.detail), ["builtin_provider_missing"]);
+    orchestrator.shutdown();
+  }
+});
+
 test("reset restart failure leaves the agent inactive rather than stuck in stopped", async () => {
   const orchestrator = new ResetFailureDeterministicOrchestrator();
   seedActiveAgent(orchestrator, "agent-1", "machine-1");
@@ -14931,6 +15269,94 @@ test("SLO v1 SLI 4: one tracked delivery, latency measured from the first attemp
   orchestrator.shutdown();
 });
 
+async function histogramBucket(
+  histogram: { get(): Promise<{ values: ReadonlyArray<{ labels: Partial<Record<string, string | number>>; value: number; metricName?: string }> }> },
+  match: Record<string, string>,
+  le: number | "+Inf",
+): Promise<number> {
+  const { values } = await histogram.get();
+  return values
+    .filter((v) => v.metricName?.endsWith("_bucket") && v.labels.le === le
+      && Object.entries(match).every(([key, value]) => v.labels[key] === value))
+    .reduce((sum, v) => sum + v.value, 0);
+}
+
+test("push latency: an online delivery records the queue segment and agent push lag at the first send, e2e at the ack", async () => {
+  const clock = new FakeClock();
+  clock.advance(1_000);
+  const orchestrator = new DeterministicAgentOrchestrator(undefined, clock);
+  seedActiveAgent(orchestrator);
+  const ws = makeFakeWs(1);
+  seedMachineConnection(orchestrator, "machine-1", ws);
+  const online = { online_at_first_attempt: "true", delivery_kind: "plain" };
+  const agentLag = { receiver: "agent" };
+  const before = {
+    queueFast: await histogramBucket(agentDeliveryQueueSeconds, online, 0.05),
+    lagWithin1s: await histogramBucket(messagePushLagSeconds, agentLag, 1),
+    lagWithin05s: await histogramBucket(messagePushLagSeconds, agentLag, 0.5),
+    e2eWithin5s: await histogramBucket(agentDeliveryE2eSeconds, online, 5),
+    e2eWithin2s: await histogramBucket(agentDeliveryE2eSeconds, online, 2),
+  };
+
+  // makeAgentMessage's createdAt (timestamp) is the epoch; the clock is at 1 s.
+  await orchestrator.deliverMessage("agent-1", makeAgentMessage("push latency sample", 45));
+  const delivered = JSON.parse(ws.sent[0] ?? "{}") as Extract<ServerToMachineMessage, { type: "agent:deliver" }>;
+  assert.equal(delivered.type, "agent:deliver");
+  assert.equal(await histogramBucket(agentDeliveryQueueSeconds, online, 0.05) - before.queueFast, 1, "sent at once: queue segment ~0");
+  assert.equal(await histogramBucket(messagePushLagSeconds, agentLag, 1) - before.lagWithin1s, 1, "1 s from createdAt to the first send");
+  assert.equal(await histogramBucket(messagePushLagSeconds, agentLag, 0.5) - before.lagWithin05s, 0);
+
+  clock.advance(3_000);
+  await orchestrator.handleMachineMessage("machine-1", {
+    type: "agent:deliver:ack",
+    agentId: "agent-1",
+    seq: delivered.seq,
+  });
+  assert.equal(await histogramBucket(agentDeliveryE2eSeconds, online, 5) - before.e2eWithin5s, 1, "4 s from createdAt to the ack lands in le=5");
+  assert.equal(await histogramBucket(agentDeliveryE2eSeconds, online, 2) - before.e2eWithin2s, 0, "and not in le=2");
+  orchestrator.shutdown();
+});
+
+test("push latency: a start dispatch records first agent:start send to daemon ack once, by outcome", async () => {
+  const clock = new FakeClock();
+  clock.advance(1_000);
+  const orchestrator = new StartRoutingMismatchDeterministicOrchestrator(
+    new InMemoryReplicaStateStore(),
+    clock,
+  );
+  const ws = makeFakeWs(1);
+  seedMachineConnection(orchestrator, "machine-1", ws);
+  const acked = { outcome: "acked" };
+  const before = {
+    within5s: await histogramBucket(agentWakeStartSeconds, acked, 5),
+    within2s: await histogramBucket(agentWakeStartSeconds, acked, 2),
+    total: await histogramBucket(agentWakeStartSeconds, acked, "+Inf"),
+  };
+
+  await orchestrator.startAgent("agent-1");
+  await flushMicrotasks();
+  const start = JSON.parse(ws.sent[0] ?? "{}") as Extract<ServerToMachineMessage, { type: "agent:start" }> & { startDispatchId?: string };
+  assert.equal(start.type, "agent:start");
+  assert.ok(start.startDispatchId);
+
+  clock.advance(3_000);
+  await orchestrator.handleMachineMessage("machine-1", {
+    type: "agent:start:ack",
+    agentId: "agent-1",
+    launchId: start.launchId,
+    startDispatchId: start.startDispatchId,
+    queueState: "queued",
+    queueDepth: 1,
+    queueAgeMs: 0,
+  } as MachineToServerMessage);
+  await flushMicrotasks();
+
+  assert.equal(await histogramBucket(agentWakeStartSeconds, acked, 5) - before.within5s, 1, "3 s from send to ack lands in le=5");
+  assert.equal(await histogramBucket(agentWakeStartSeconds, acked, 2) - before.within2s, 0, "and not in le=2");
+  assert.equal(await histogramBucket(agentWakeStartSeconds, acked, "+Inf") - before.total, 1, "observed once per dispatch");
+  orchestrator.shutdown();
+});
+
 test("SLO v1 SLI 4: pending records are a scrape-time gauge, and shutdown logs those still awaiting an ack", async () => {
   const clock = new FakeClock();
   clock.advance(1_000);
@@ -15522,6 +15948,76 @@ test("delivery ack clears inbox but does not author turn-active when runtime liv
     .flatMap((span) => spanEvents(sink, span))
     .find((event) => event.name === "turn_active.skipped");
   assert.equal(skipped?.attrs?.reason, "runtime_liveness_failed_or_unknown");
+  orchestrator.shutdown();
+});
+
+// #proj-runtime:#66: an agent at its weekly limit showed "working: Message
+// received" for days. Its daemon acks each delivery it holds for the limit;
+// the ack wrote "Message received" over the provider-limit error, and the
+// daemon's later frame lost to it (earlier send time, `stale_observed`).
+// While the agent shows an error only model output clears, the ack writes nothing.
+for (const errorClass of ["RateLimitError", "BillingError"] as const) {
+  test(`delivery ack clears inbox but does not write Message received over a ${errorClass} the agent shows`, async () => {
+    const { sink, tracer } = makeDeterministicTracer();
+    const orchestrator = new DeterministicAgentOrchestrator(new InMemoryReplicaStateStore(), undefined, tracer);
+    seedActiveAgent(orchestrator);
+    (orchestrator as any).updateCache("agent-1", {
+      lastRuntimeError: { message: "You've hit your weekly limit", at: new Date(0).toISOString(), launchId: null, actionRequired: false, errorClass },
+    });
+    seedMachineConnection(orchestrator, "machine-1", makeFakeWs(1));
+    orchestrator.deliverToLocalInbox("agent-1", makeAgentMessage("held by the weekly limit", 42));
+    const shown = {
+      activity: "error",
+      detail: "You've hit your weekly limit (limit resets at 2026-11-18T09:00:00.000Z)",
+      detailKind: "runtime_error",
+      observedAtMs: Date.now(),
+      updatedAt: Date.now(),
+    };
+    (orchestrator as any).agentActivity.set("agent-1", { ...shown });
+
+    await orchestrator.handleMachineMessage("machine-1", {
+      type: "agent:deliver:ack",
+      agentId: "agent-1",
+      seq: 42,
+    } as MachineToServerMessage);
+
+    assert.deepEqual(await orchestrator.receiveMessages("agent-1", false, 0), [], "the ack still clears the inbox");
+    const snapshot = (orchestrator as any).agentActivity.get("agent-1");
+    assert.equal(snapshot?.activity, "error");
+    assert.equal(snapshot?.detail, shown.detail);
+    assert.equal(snapshot?.detailKind, "runtime_error");
+    const events = sink.getAllSpans().flatMap((span) => spanEvents(sink, span));
+    assert.equal(events.find((event) => event.name === "turn_active.skipped")?.attrs?.reason, "provider_limit_error_holds");
+    assert.equal(events.some((event) => event.name === "turn_active.observed"), false);
+    orchestrator.shutdown();
+  });
+}
+
+test("delivery ack still writes Message received over an error that is not a provider limit (control)", async () => {
+  const { sink, tracer } = makeDeterministicTracer();
+  const orchestrator = new DeterministicAgentOrchestrator(new InMemoryReplicaStateStore(), undefined, tracer);
+  seedActiveAgent(orchestrator);
+  (orchestrator as any).updateCache("agent-1", {
+    lastRuntimeError: { message: "Runtime crashed", at: new Date(0).toISOString(), launchId: null, actionRequired: false },
+  });
+  seedMachineConnection(orchestrator, "machine-1", makeFakeWs(1));
+  orchestrator.deliverToLocalInbox("agent-1", makeAgentMessage("starts a turn", 42));
+  (orchestrator as any).agentActivity.set("agent-1", {
+    activity: "error",
+    detail: "Runtime crashed",
+    detailKind: "runtime_error",
+    observedAtMs: Date.now(),
+    updatedAt: Date.now(),
+  });
+
+  await orchestrator.handleMachineMessage("machine-1", {
+    type: "agent:deliver:ack",
+    agentId: "agent-1",
+    seq: 42,
+  } as MachineToServerMessage);
+
+  const events = sink.getAllSpans().flatMap((span) => spanEvents(sink, span));
+  assert.equal(events.some((event) => event.name === "turn_active.skipped"), false, "the gate admits the turn-active write");
   orchestrator.shutdown();
 });
 
@@ -19926,7 +20422,7 @@ test("gamma-2 runtime_error shadow pair: observed error set, synthetic online re
   orchestrator.shutdown();
 });
 
-test("gamma-2.1 slock_action_status contrast pair: explicit transition = control authority, history append = plain synthetic (task #460, Kai v3 \u00a7B)", () => {
+test("gamma-2.1 slock_action_status contrast pair: explicit transition = control authority, history append = plain synthetic (task #460, Kai v3 \u00a7B)", async () => {
   // Leiysky's gamma-2 blocker: the control-command family must not be filed
   // under no_authority. Both action AND reason are asserted on both sides
   // (the bare-site assert was how the contradiction passed silently).
@@ -19942,16 +20438,20 @@ test("gamma-2.1 slock_action_status contrast pair: explicit transition = control
     updatedAt: clock.now() - 1_000,
   });
 
+  // The agent's Computer is on this replica: a history append elsewhere only
+  // stores its row and files no verdict.
+  (orchestrator as any).hasMachineLocally = (id: string) => id === "machine-1";
+
   // Explicit status transition (SMR-006 statusEntry family): authorized
   // control command, its own axis's authoritative writer.
-  (orchestrator as any).broadcastRaftAction("agent-1", {
+  await (orchestrator as any).broadcastRaftAction("agent-1", {
     title: "Send draft held",
     text: "target: #general",
     activity: "working",
     activityDetail: "Send draft held",
   });
   // History append (CLI action record): claims no new value.
-  (orchestrator as any).broadcastRaftAction("agent-1", {
+  await (orchestrator as any).broadcastRaftAction("agent-1", {
     title: "Message sent",
     text: "target: #general",
   });
@@ -22656,6 +23156,339 @@ test("re-arming on ready replaces a stale retry timer with the record's current 
   }
 });
 
+// An error banner stayed up after the agent was healthy again (a daemon
+// reconnect clears nothing), until the agent's next real turn. The agent's
+// next successful start, its launch's `agent:runtime:ready`, now ends an error
+// an earlier launch left; a provider-limit or billing error still waits for
+// model output.
+function seedEarlierLaunchRuntimeError(
+  orchestrator: AgentOrchestrator,
+  options: { errorClass?: "RateLimitError" | "BillingError"; launchId?: string } = {},
+): AgentRuntimeErrorState {
+  const { errorClass } = options;
+  const error: AgentRuntimeErrorState = {
+    message: errorClass ? "You've hit your weekly limit · resets Nov 6, 9am" : "Codex exited unexpectedly",
+    at: new Date(0).toISOString(),
+    launchId: options.launchId ?? "launch-earlier",
+    actionRequired: false,
+    ...(errorClass
+      ? {
+          errorClass,
+          errorReason: errorClass === "RateLimitError" ? "rate_limited" as const : "billing_exhausted" as const,
+          fingerprint: "0123456789abcdef",
+          reasonProvenance: "runtime_error_event" as const,
+        }
+      : {}),
+  };
+  (orchestrator as any).updateCache("agent-1", { lastRuntimeError: error });
+  (orchestrator as any).agentActivity.set("agent-1", { activity: "error", detail: error.message, updatedAt: 0 });
+  return error;
+}
+
+function runtimeErrorStateEvents(orchestrator: StartTimeoutDeterministicOrchestrator, name: "cleared" | "preserved") {
+  return orchestrator.events.filter((e) => e.name === `runtime_error_state.${name}`);
+}
+
+test("the agent's runtime ready for the current launch clears an earlier launch's runtime error", async () => {
+  const orchestrator = startTimeoutOrchestrator({ readinessCapable: true });
+  try {
+    const launchId = await wakeToSpawn(orchestrator, 1);
+    seedEarlierLaunchRuntimeError(orchestrator);
+    const emittedBefore = orchestrator.emitted.length;
+
+    await reportRuntimeReady(orchestrator, launchId);
+
+    assert.equal((orchestrator as any).agentStateCache.get("agent-1").lastRuntimeError, null);
+    assert.equal((orchestrator as any).agentActivity.get("agent-1")?.activity, "online", "the error activity goes back to online");
+    assert.deepEqual(runtimeErrorStateEvents(orchestrator, "cleared").map((e) => e.attrs.reason), ["runtime_ready"]);
+    assert.ok(
+      orchestrator.emitted.slice(emittedBefore).some((e) => e.event === "agent:updated" && (e.payload as { agentId?: string }).agentId === "agent-1"),
+      "open agent pages re-read the cleared record",
+    );
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+for (const errorClass of ["RateLimitError", "BillingError"] as const) {
+  test(`a ${errorClass} survives the agent's runtime ready: a start is not model output`, async () => {
+    const orchestrator = startTimeoutOrchestrator({ readinessCapable: true });
+    try {
+      const launchId = await wakeToSpawn(orchestrator, 1);
+      const error = seedEarlierLaunchRuntimeError(orchestrator, { errorClass });
+
+      await reportRuntimeReady(orchestrator, launchId);
+
+      assert.deepEqual((orchestrator as any).agentStateCache.get("agent-1").lastRuntimeError, error);
+      assert.equal((orchestrator as any).agentActivity.get("agent-1")?.activity, "error");
+      assert.equal(runtimeErrorStateEvents(orchestrator, "cleared").length, 0);
+      assert.deepEqual(
+        runtimeErrorStateEvents(orchestrator, "preserved").map((e) => e.attrs.reason),
+        [errorClass === "BillingError" ? "billing_runtime_ready" : "provider_limit_runtime_ready"],
+      );
+    } finally {
+      orchestrator.shutdown();
+    }
+  });
+}
+
+test("a runtime ready for an old launch does not clear the runtime error; the current launch's does", async () => {
+  const orchestrator = startTimeoutOrchestrator({ readinessCapable: true });
+  try {
+    const oldLaunch = await wakeToSpawn(orchestrator, 1);
+    await orchestrator.handleMachineMessage("machine-1", { type: "agent:status", agentId: "agent-1", status: "inactive", launchId: oldLaunch } as MachineToServerMessage);
+    await flushMicrotasks();
+    const currentLaunch = await wakeToSpawn(orchestrator, 2);
+    assert.notEqual(currentLaunch, oldLaunch);
+    const error = seedEarlierLaunchRuntimeError(orchestrator);
+
+    // The old launch's readiness arrives late (e.g. replayed after a reconnect).
+    await reportRuntimeReady(orchestrator, oldLaunch);
+    assert.deepEqual((orchestrator as any).agentStateCache.get("agent-1").lastRuntimeError, error);
+    assert.equal((orchestrator as any).agentActivity.get("agent-1")?.activity, "error");
+    assert.deepEqual(runtimeErrorStateEvents(orchestrator, "preserved").map((e) => e.attrs.reason), ["runtime_ready_not_current_launch"]);
+
+    await reportRuntimeReady(orchestrator, currentLaunch);
+    assert.equal((orchestrator as any).agentStateCache.get("agent-1").lastRuntimeError, null);
+    assert.deepEqual(runtimeErrorStateEvents(orchestrator, "cleared").map((e) => e.attrs.reason), ["runtime_ready"]);
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("a runtime error the current launch reported is newer than its start: that launch's runtime ready keeps it", async () => {
+  const orchestrator = startTimeoutOrchestrator({ readinessCapable: true });
+  try {
+    const launchId = await wakeToSpawn(orchestrator, 1);
+    const error = seedEarlierLaunchRuntimeError(orchestrator, { launchId });
+
+    await reportRuntimeReady(orchestrator, launchId);
+
+    assert.deepEqual((orchestrator as any).agentStateCache.get("agent-1").lastRuntimeError, error);
+    assert.deepEqual(runtimeErrorStateEvents(orchestrator, "preserved").map((e) => e.attrs.reason), ["runtime_ready_same_launch"]);
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+// A failed start (`runtime_unavailable` with its typed carrier) is stored as
+// the agent's runtime error: the start's own error text (the carrier's
+// `message`, managers only through projectRuntimeErrorState) or, from an older
+// daemon, the frame's fixed copy. The carrier every viewer receives never
+// carries the text, and the shown activity stays the failed start's.
+async function reportTypedStartFailure(
+  orchestrator: WakeCrashLoopDeterministicOrchestrator,
+  launchId: string,
+  spawnFailure: SpawnFailureActivityDiagnostic,
+  detail = "Runtime failed to start. Check the Computer logs for details and retry.",
+  options: { inactive?: boolean } = {},
+): Promise<void> {
+  if (options.inactive !== false) {
+    await orchestrator.handleMachineMessage("machine-1", { type: "agent:status", agentId: "agent-1", status: "inactive", launchId } as MachineToServerMessage);
+  }
+  await orchestrator.handleMachineMessage("machine-1", {
+    type: "agent:activity",
+    agentId: "agent-1",
+    detail,
+    detailKind: "runtime_unavailable",
+    launchId,
+    observedAtMs: 1_000,
+    isHeartbeat: false,
+    spawnFailure,
+  } as MachineToServerMessage);
+  await flushMicrotasks();
+}
+
+test("a failed start is stored as the agent's runtime error with its scrubbed message; the carrier and the activity carry no text", async () => {
+  const orchestrator = startTimeoutOrchestrator({ readinessCapable: true });
+  try {
+    const launchId = await wakeToSpawn(orchestrator, 1);
+    const emittedBefore = orchestrator.emitted.length;
+    await reportTypedStartFailure(orchestrator, launchId, {
+      reason: "runtime_login_required",
+      message: "Kimi Code is not signed in: no token in /home/alice/.kimi-code/credentials (alice@example.com)",
+    }, "The runtime needs you to log in on this computer before it can start.");
+
+    const stored: AgentRuntimeErrorState = (orchestrator as any).agentStateCache.get("agent-1").lastRuntimeError;
+    assert.equal(stored.message, "Kimi Code is not signed in: no token in [REDACTED_PATH] ([REDACTED_EMAIL])");
+    assert.equal(stored.spawnFailureReason, "runtime_login_required");
+    assert.equal(stored.launchId, launchId);
+    assert.equal(stored.errorClass, undefined, "no runtime error class: the reason is the start failure's");
+    const carrier = (orchestrator as StartTimeoutDeterministicOrchestrator).lastSpawnFailure() as Record<string, unknown>;
+    assert.equal(carrier.reason, "runtime_login_required");
+    assert.equal("message" in carrier, false, "the carrier every viewer receives has no error text");
+    assert.doesNotMatch(JSON.stringify(orchestrator.emitted.slice(emittedBefore)), /not signed in|alice/);
+    const activity = await orchestrator.getActivity("agent-1");
+    assert.equal(activity.activityDetailKind, "runtime_unavailable", "the failed start stays the shown activity");
+    assert.equal(activity.activity, "offline");
+    assert.ok(
+      orchestrator.emitted.slice(emittedBefore).some((e) => e.event === "agent:updated" && (e.payload as { agentId?: string }).agentId === "agent-1"),
+      "open agent pages re-read the stored record",
+    );
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("a failed start from an older daemon (no message) still stores its reason, with the frame's copy as the text", async () => {
+  const orchestrator = startTimeoutOrchestrator({ readinessCapable: true });
+  try {
+    const launchId = await wakeToSpawn(orchestrator, 1);
+    await reportTypedStartFailure(orchestrator, launchId, { reason: "runtime_spawn_failed" });
+    const stored: AgentRuntimeErrorState = (orchestrator as any).agentStateCache.get("agent-1").lastRuntimeError;
+    assert.equal(stored.spawnFailureReason, "runtime_spawn_failed");
+    assert.equal(stored.message, "Runtime failed to start. Check the Computer logs for details and retry.");
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("a stored failed start is cleared by the next successful start, also of the same launch (a daemon-local restart)", async () => {
+  for (const sameLaunch of [false, true]) {
+    const orchestrator = startTimeoutOrchestrator({ readinessCapable: true });
+    try {
+      const failed = await wakeToSpawn(orchestrator, 1);
+      // Same launch: the launch is still the current one (no `inactive`), as
+      // when the daemon's own restart of it comes up after the failure.
+      await reportTypedStartFailure(orchestrator, failed, { reason: "runtime_spawn_failed", message: "bootstrap exploded" }, undefined, { inactive: !sameLaunch });
+      const stored: AgentRuntimeErrorState = (orchestrator as any).agentStateCache.get("agent-1").lastRuntimeError;
+      assert.equal(stored?.spawnFailureReason, "runtime_spawn_failed");
+
+      const next = sameLaunch ? failed : await wakeToSpawn(orchestrator, 2);
+      // The harness's start reloads the agent without its stored error (no DB): put it back.
+      (orchestrator as any).updateCache("agent-1", { lastRuntimeError: stored });
+      await reportRuntimeReady(orchestrator, next);
+
+      assert.equal((orchestrator as any).agentStateCache.get("agent-1").lastRuntimeError, null, `same launch: ${sameLaunch}`);
+      assert.deepEqual(runtimeErrorStateEvents(orchestrator, "cleared").map((e) => e.attrs.reason), ["runtime_ready"]);
+    } finally {
+      orchestrator.shutdown();
+    }
+  }
+});
+
+test("a stored failed start is cleared when the agent's runtime or model changes", async () => {
+  const orchestrator = startTimeoutOrchestrator({ readinessCapable: true });
+  try {
+    const launchId = await wakeToSpawn(orchestrator, 1);
+    await reportTypedStartFailure(orchestrator, launchId, { reason: "runtime_not_found", message: "spawn kimi ENOENT" });
+    assert.equal((orchestrator as any).agentStateCache.get("agent-1").lastRuntimeError?.spawnFailureReason, "runtime_not_found");
+
+    await orchestrator.liftWakeBlockForConfigChange("agent-1", { runtimeValuesChanged: true, runtimeOrModelChanged: true });
+
+    assert.equal((orchestrator as any).agentStateCache.get("agent-1").lastRuntimeError, null);
+    assert.deepEqual(runtimeErrorStateEvents(orchestrator, "cleared").map((e) => e.attrs.reason), ["runtime_or_model_changed"]);
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+for (const errorClass of ["RateLimitError", "BillingError", undefined] as const) {
+  test(`a failed start leaves a stored runtime error (${errorClass ?? "untyped"}) in place`, async () => {
+    const orchestrator = startTimeoutOrchestrator({ readinessCapable: true });
+    try {
+      const launchId = await wakeToSpawn(orchestrator, 1);
+      const kept = seedEarlierLaunchRuntimeError(orchestrator, { errorClass });
+      const emittedBefore = orchestrator.emitted.length;
+      await reportTypedStartFailure(orchestrator, launchId, { reason: "runtime_spawn_failed", message: "bootstrap exploded" });
+      assert.deepEqual((orchestrator as any).agentStateCache.get("agent-1").lastRuntimeError, kept);
+      assert.deepEqual(runtimeErrorStateEvents(orchestrator, "preserved").map((e) => e.attrs.reason), ["runtime_error_over_start_failure"]);
+      assert.equal(orchestrator.emitted.slice(emittedBefore).some((e) => e.event === "agent:updated"), false);
+    } finally {
+      orchestrator.shutdown();
+    }
+  });
+}
+
+test("a runtime error the database holds (this cache missed it) stays over a failed start; the cache learns it", async () => {
+  const orchestrator = startTimeoutOrchestrator({ readinessCapable: true });
+  try {
+    const launchId = await wakeToSpawn(orchestrator, 1);
+    const inStore: AgentRuntimeErrorState = {
+      message: "You've hit your weekly limit", at: new Date(0).toISOString(), actionRequired: false,
+      errorClass: "RateLimitError", errorReason: "rate_limited", fingerprint: "0123456789abcdef", reasonProvenance: "runtime_error_event",
+    };
+    (orchestrator as any).persistAgentLastRuntimeError = async () => inStore;
+    const emittedBefore = orchestrator.emitted.length;
+    await reportTypedStartFailure(orchestrator, launchId, { reason: "runtime_spawn_failed", message: "bootstrap exploded" });
+    assert.deepEqual((orchestrator as any).agentStateCache.get("agent-1").lastRuntimeError, inStore);
+    assert.deepEqual(runtimeErrorStateEvents(orchestrator, "preserved").map((e) => e.attrs.reason), ["runtime_error_over_start_failure_in_store"]);
+    assert.equal(orchestrator.emitted.slice(emittedBefore).some((e) => e.event === "agent:updated"), false);
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("a repeated failed start (the daemon re-shows it on each rejected delivery) announces the stored record once", async () => {
+  const orchestrator = startTimeoutOrchestrator({ readinessCapable: true });
+  try {
+    const launchId = await wakeToSpawn(orchestrator, 1);
+    const emittedBefore = orchestrator.emitted.length;
+    const mirrored: unknown[] = [];
+    const mirror = (orchestrator as any).mirrorAgentRuntimeError.bind(orchestrator);
+    (orchestrator as any).mirrorAgentRuntimeError = async (agentId: string, error: unknown) => { mirrored.push(error); return mirror(agentId, error); };
+    for (let repeat = 0; repeat < 3; repeat += 1) {
+      await reportTypedStartFailure(orchestrator, launchId, { reason: "runtime_spawn_failed", message: "bootstrap exploded" }, undefined, { inactive: repeat === 0 });
+    }
+    const updates = orchestrator.emitted.slice(emittedBefore).filter((e) => e.event === "agent:updated" && (e.payload as { agentId?: string }).agentId === "agent-1");
+    assert.equal(updates.length, 1, "one agent:updated, not one per repeat");
+    assert.equal(mirrored.length, 1, "one Redis write");
+    assert.equal(orchestrator.events.filter((e) => e.name === "runtime_error_state.unchanged").length, 2);
+    // A different failure is news again.
+    await reportTypedStartFailure(orchestrator, launchId, { reason: "runtime_not_found", message: "spawn codex ENOENT" }, undefined, { inactive: false });
+    assert.equal(orchestrator.emitted.slice(emittedBefore).filter((e) => e.event === "agent:updated").length, 2);
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("a later runtime error still replaces a stored failed start", async () => {
+  const orchestrator = startTimeoutOrchestrator({ readinessCapable: true });
+  try {
+    const next = await wakeToSpawn(orchestrator, 1);
+    await reportTypedStartFailure(orchestrator, next, { reason: "runtime_spawn_failed", message: "bootstrap exploded" });
+    await orchestrator.handleMachineMessage("machine-1", {
+      type: "agent:activity",
+      agentId: "agent-1",
+      activity: "error",
+      detail: "Codex exited unexpectedly",
+      detailKind: "runtime_error",
+      launchId: next,
+      observedAtMs: 2_000,
+      isHeartbeat: false,
+    } as MachineToServerMessage);
+    await flushMicrotasks();
+    const stored: AgentRuntimeErrorState = (orchestrator as any).agentStateCache.get("agent-1").lastRuntimeError;
+    assert.equal(stored.message, "Codex exited unexpectedly");
+    assert.equal(stored.spawnFailureReason, undefined);
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("a machine reconnect alone does not clear a runtime error", async () => {
+  const orchestrator = startTimeoutOrchestrator({ readinessCapable: true });
+  try {
+    await wakeToSpawn(orchestrator, 1);
+    const error = seedEarlierLaunchRuntimeError(orchestrator);
+
+    // The daemon reconnects with the agent still running and healthy.
+    await orchestrator.handleMachineMessage("machine-1", {
+      type: "ready",
+      capabilities: [DAEMON_CAPABILITY_STARTUP_READINESS],
+      runtimes: ["codex"],
+      daemonVersion: "1.0.40",
+      runningAgents: ["agent-1"],
+    } as MachineToServerMessage);
+    await flushMicrotasks();
+
+    assert.deepEqual((orchestrator as any).agentStateCache.get("agent-1").lastRuntimeError, error);
+    assert.equal(runtimeErrorStateEvents(orchestrator, "cleared").length, 0);
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
 test("the orchestrator's injected random source sets the try's jitter", async () => {
   const orchestrator = new StartTimeoutDeterministicOrchestrator(undefined, undefined, () => 0);
   seedMachineConnection(orchestrator, "machine-1", makeFakeWs(1), "1.0.40", [DAEMON_CAPABILITY_STARTUP_READINESS]);
@@ -22946,6 +23779,47 @@ test("task #34: a ready without the installer repair hint clears one reported ea
   assert.equal(await orchestrator.getMachineInstallerRepairHint("machine-1"), null);
   assert.ok(meta.get("machine-1") && "installerRepairHint" in meta.get("machine-1")!, "the ready wrote the field");
   assert.equal(meta.get("machine-1")?.installerRepairHint, null);
+  orchestrator.shutdown();
+});
+
+test("ready.upgradeScope: a refusal is stored in memory and in the replica meta; the next ready replaces it, and one without it clears it", async () => {
+  const orchestrator = new ReadyReconcileDeterministicOrchestrator();
+  seedMachineConnection(orchestrator, "machine-1", makeFakeWs());
+  const meta = (orchestrator as unknown as { replicaStateStore: { machineMeta: Map<string, { upgradeScope?: string | null }> } }).replicaStateStore.machineMeta;
+  const ready = (extra: Record<string, unknown>) => orchestrator.handleMachineMessage("machine-1", {
+    type: "ready",
+    capabilities: [],
+    runtimes: [],
+    daemonVersion: "1.0.0",
+    computerVersion: "1.0.62",
+    runningAgents: [],
+    ...extra,
+  } as MachineToServerMessage);
+  const REFUSAL = { ok: false, reason: "Failed to start transient scope unit: Access denied" } as const;
+
+  assert.equal(await orchestrator.getMachineUpgradeScope("machine-1"), null, "never reported: unknown");
+  await ready({ upgradeScope: REFUSAL });
+  await flushMicrotasks();
+  assert.deepEqual(await orchestrator.getMachineUpgradeScope("machine-1"), REFUSAL);
+  assert.equal(meta.get("machine-1")?.upgradeScope, JSON.stringify(REFUSAL));
+
+  // Anything but an explicit refusal is unknown.
+  await ready({ upgradeScope: { ok: true } });
+  await flushMicrotasks();
+  assert.equal(await orchestrator.getMachineUpgradeScope("machine-1"), null);
+
+  await ready({ upgradeScope: { ok: false, reason: `line one\n${"x".repeat(400)}` } });
+  await flushMicrotasks();
+  const bounded = await orchestrator.getMachineUpgradeScope("machine-1");
+  assert.ok(bounded && bounded.reason.length <= 200 && !bounded.reason.includes("\n"), "the reason is one bounded line");
+
+  // After an upgrade (or a probe that could not run) the ready carries nothing: cleared.
+  await ready({});
+  await flushMicrotasks();
+  assert.equal(await orchestrator.getMachineUpgradeScope("machine-1"), null);
+  assert.ok(meta.get("machine-1") && "upgradeScope" in meta.get("machine-1")!, "the ready wrote the field");
+  assert.equal(meta.get("machine-1")?.upgradeScope, null);
+  assert.equal(await orchestrator.getMachineUpgradeScope("machine-unknown"), null);
   orchestrator.shutdown();
 });
 
@@ -23836,9 +24710,17 @@ test("task #17: a Computer's login events and result go to the person who starte
     } as MachineToServerMessage);
     assert.deepEqual(emitted.map((entry) => [entry.room, entry.event]), [["user:user-starter", "runtime_auth:login:event"]]);
 
+    // #oar-raft:#52: a sign-in asks the Computer for fresh usage at once.
+    const usageRefreshes: Array<[string, string, string]> = [];
+    (orchestrator as unknown as { requestRuntimeAccountUsageRefresh: (machineId: string, provider: string, reason: string) => Promise<boolean> })
+      .requestRuntimeAccountUsageRefresh = async (machineId, provider, reason) => {
+        usageRefreshes.push([machineId, provider, reason]);
+        return true;
+      };
     await orchestrator.handleMachineMessage("auth-computer", {
       type: "machine:runtime_auth:login:result", loginId, result: { kind: "logged_in" },
     } as MachineToServerMessage);
+    assert.deepEqual(usageRefreshes, [["auth-computer", "claude", "stale_or_missing"]]);
     assert.deepEqual(emitted.at(-1)?.room, "user:user-starter");
     assert.equal(emitted.at(-1)?.event, "runtime_auth:login:result");
     assert.equal(await runtimeAuthService.getSession(loginId), null, "the result ends the login");
@@ -23930,6 +24812,87 @@ test("task #17: a status report is kept only from an attached Computer, and the 
     assert.deepEqual(await runtimeAuthService.getStatus("attached"), report);
     assert.deepEqual(emitted, [{ room: "server:server-1", event: "machine:runtime_auth:updated", payload: { machineId: "attached" } }]);
     assert.ok(!JSON.stringify(emitted).includes("example.com"), "no account in the broadcast");
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("Upgrade on the web: a report's `upgradable` is kept apart, so the stored status stays what an older replica's strict schema reads", async () => {
+  const { __clearRuntimeAuthLocalStoreForTests, runtimeAuthService } = await import("./runtimeAuthService");
+  const { runtimeAuthStatusReportSchema } = await import("@botiverse/raft-shared");
+  __clearRuntimeAuthLocalStoreForTests();
+  const orchestrator = new RuntimeAccountUsageBoundaryDeterministicOrchestrator();
+  orchestrator.seedRuntimeUsageConnection("upgradable-computer", "computer");
+  orchestrator.attachedByMachine.set("upgradable-computer", "user-1");
+  const { io } = fakeIo();
+  orchestrator.setIO(io as never);
+  const status = { collectedAt: "2026-11-16T00:00:00.000Z", runtimes: { claude: { kind: "logged_out" } } };
+  try {
+    await orchestrator.handleMachineMessage("upgradable-computer", {
+      type: "machine:runtime_auth:status",
+      report: { ...status, upgradable: ["claude", "someFutureRuntime"] },
+    } as MachineToServerMessage);
+    const stored = await runtimeAuthService.getStatus("upgradable-computer");
+    assert.deepEqual(stored, status, "no `upgradable` in the stored status");
+    // What a replica from before this field reads: the schema without `upgradable`, strict.
+    assert.ok(runtimeAuthStatusReportSchema.omit({ upgradable: true }).safeParse(stored).success);
+    assert.deepEqual(await runtimeAuthService.getUpgradable("upgradable-computer"), ["claude"], "an unknown runtime is dropped");
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("Upgrade on the web: a report's `updates` is kept apart too, and a later report without it clears it", async () => {
+  const { __clearRuntimeAuthLocalStoreForTests, runtimeAuthService } = await import("./runtimeAuthService");
+  const { runtimeAuthStatusReportSchema } = await import("@botiverse/raft-shared");
+  __clearRuntimeAuthLocalStoreForTests();
+  const orchestrator = new RuntimeAccountUsageBoundaryDeterministicOrchestrator();
+  orchestrator.seedRuntimeUsageConnection("updates-computer", "computer");
+  orchestrator.attachedByMachine.set("updates-computer", "user-1");
+  const { io } = fakeIo();
+  orchestrator.setIO(io as never);
+  const status = { collectedAt: "2026-11-18T00:00:00.000Z", runtimes: { claude: { kind: "logged_out" } } };
+  const check = { kind: "ok", installed: "2.0.5", latest: "2.0.6", updateAvailable: true, checkedAt: "2026-11-18T00:00:00.000Z" };
+  try {
+    await orchestrator.handleMachineMessage("updates-computer", {
+      type: "machine:runtime_auth:status",
+      report: { ...status, upgradable: ["claude"], updates: { claude: check, someFutureRuntime: check } },
+    } as MachineToServerMessage);
+    const stored = await runtimeAuthService.getStatus("updates-computer");
+    assert.deepEqual(stored, status, "no `updates` in the stored status");
+    assert.ok(runtimeAuthStatusReportSchema.omit({ upgradable: true, updates: true }).safeParse(stored).success);
+    assert.deepEqual(await runtimeAuthService.getUpdates("updates-computer"), { claude: check }, "an unknown runtime is dropped");
+
+    await orchestrator.handleMachineMessage("updates-computer", {
+      type: "machine:runtime_auth:status",
+      report: { ...status, upgradable: ["claude"] },
+    } as MachineToServerMessage);
+    assert.deepEqual(await runtimeAuthService.getUpdates("updates-computer"), {}, "a Computer that no longer checks says nothing");
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("Install on the web: a report's `installable` is kept apart, so the stored status stays what an older replica's strict schema reads", async () => {
+  const { __clearRuntimeAuthLocalStoreForTests, runtimeAuthService } = await import("./runtimeAuthService");
+  const { runtimeAuthStatusReportSchema } = await import("@botiverse/raft-shared");
+  __clearRuntimeAuthLocalStoreForTests();
+  const orchestrator = new RuntimeAccountUsageBoundaryDeterministicOrchestrator();
+  orchestrator.seedRuntimeUsageConnection("installable-computer", "computer");
+  orchestrator.attachedByMachine.set("installable-computer", "user-1");
+  const { io } = fakeIo();
+  orchestrator.setIO(io as never);
+  const status = { collectedAt: "2026-11-17T00:00:00.000Z", runtimes: { grok: { kind: "unavailable", reason: "not_installed" } } };
+  try {
+    await orchestrator.handleMachineMessage("installable-computer", {
+      type: "machine:runtime_auth:status",
+      report: { ...status, installable: ["grok", "someFutureRuntime"] },
+    } as MachineToServerMessage);
+    const stored = await runtimeAuthService.getStatus("installable-computer");
+    assert.deepEqual(stored, status, "no `installable` in the stored status");
+    // What a replica from before this field reads: the schema without `upgradable` and `installable`, strict.
+    assert.ok(runtimeAuthStatusReportSchema.omit({ upgradable: true, installable: true }).safeParse(stored).success);
+    assert.deepEqual(await runtimeAuthService.getInstallable("installable-computer"), ["grok"], "an unknown runtime is dropped");
   } finally {
     orchestrator.shutdown();
   }
@@ -25151,6 +26114,141 @@ test("a sealed connect the Computer's replica cannot open is answered at once, s
   }
 });
 
+test("agent:start crosses replicas sealed so customer API keys never traverse Redis in the clear (#proj-runtime:#79)", async () => {
+  const apiKey = "sk-ant-cross-replica-start-secret-99";
+  const network: DeliverabilityNetwork = { owners: new Map([["machine-s", "replica-b"]]), replicas: new Map() };
+  const source = new HopRecordingOrchestrator("replica-a", network);
+  const target = new HopRecordingOrchestrator("replica-b", network);
+  const ws = makeFakeWs(1);
+  seedMachineConnection(target, "machine-s", ws);
+  const startMessage: ServerToMachineMessage = {
+    type: "agent:start",
+    agentId: "agent-secret-1",
+    config: {
+      name: "secret-agent",
+      displayName: "Secret Agent",
+      description: null,
+      model: "claude-opus-4-6",
+      runtime: "claude",
+      runtimeConfig: {
+        version: 1,
+        runtime: "claude",
+        provider: { kind: "custom", apiUrl: "https://gw.example.test/v1", apiKey },
+        model: { kind: "custom", name: "claude-opus-4-6" },
+        mode: { kind: "default" },
+        reasoningEffort: null,
+        envVars: { SECRET_VAR: apiKey },
+      },
+      reasoningEffort: null,
+      executionMode: "byoc",
+      envVars: { ANTHROPIC_API_KEY: apiKey },
+      sessionId: null,
+      serverUrl: "https://raft.example.test",
+      authToken: "",
+    },
+  };
+  __setReplicaAgentConfigSealModeForTests("strict");
+  try {
+    await withReplicaSecret(async () => {
+      assert.equal(await sendRequired(source, "machine-s", startMessage), "cross_replica");
+    });
+    assert.equal(source.hops.length, 1);
+    assert.equal(source.hops[0]!.includes(apiKey), false, "Redis hop must not carry plaintext API key");
+    const frames = ws.sent.map((frame) => JSON.parse(frame) as { type: string });
+    assert.deepEqual(frames.filter((frame) => frame.type === "agent:start"), [startMessage]);
+  } finally {
+    __setReplicaAgentConfigSealModeForTests(null);
+    source.shutdown();
+    target.shutdown();
+  }
+});
+
+test("cross-replica agent:start followed immediately by another frame preserves FIFO arrival order even when the seal-mode cache just expired (#proj-runtime:#79)", async () => {
+  const network: DeliverabilityNetwork = { owners: new Map([["machine-order", "replica-b"]]), replicas: new Map() };
+  const source = new HopRecordingOrchestrator("replica-a", network);
+  const target = new HopRecordingOrchestrator("replica-b", network);
+  const ws = makeFakeWs(1);
+  seedMachineConnection(target, "machine-order", ws);
+
+  const apiKey = "sk-ant-order-secret-555";
+  const startMessage: ServerToMachineMessage = {
+    type: "agent:start",
+    agentId: "agent-order",
+    launchId: "launch-order-1",
+    config: {
+      name: "order-agent",
+      displayName: "Order Agent",
+      description: null,
+      model: "claude-opus-4-6",
+      runtime: "claude",
+      runtimeConfig: {
+        version: 1,
+        runtime: "claude",
+        provider: { kind: "custom", apiUrl: "https://gw.example.test/v1", apiKey },
+        model: { kind: "custom", name: "claude-opus-4-6" },
+        mode: { kind: "default" },
+        reasoningEffort: null,
+        envVars: null,
+      },
+      reasoningEffort: null,
+      executionMode: "byoc",
+      envVars: { ANTHROPIC_API_KEY: apiKey },
+      sessionId: null,
+      serverUrl: "https://raft.example.test",
+      authToken: "",
+    },
+  };
+  const followUpDeliver: ServerToMachineMessage = {
+    type: "agent:deliver",
+    agentId: "agent-order",
+    message: makeAgentMessage("hello right after start"),
+    seq: 1,
+  };
+
+  let resolveSlowFetch!: (answer: { enabled: boolean; variant: string | null }) => void;
+  let fetchCalls = 0;
+  const slowFetch = new Promise<{ enabled: boolean; variant: string | null }>((resolve) => {
+    resolveSlowFetch = resolve;
+  });
+
+  // Simulate an expired cache (expiresAtMs: 0) with a slow DB read in flight.
+  __resetReplicaAgentConfigSealModeCacheForTests({
+    initialMode: "receive_only",
+    expiresAtMs: 0,
+    fetcher: () => {
+      fetchCalls++;
+      return slowFetch;
+    },
+  });
+  try {
+    await withReplicaSecret(async () => {
+      // Fire start + follow-up frame back-to-back without awaiting between them.
+      const p1 = sendRequired(source, "machine-order", startMessage);
+      const p2 = sendRequired(source, "machine-order", followUpDeliver);
+      const [r1, r2] = await Promise.all([p1, p2]);
+      assert.equal(r1, "cross_replica");
+      assert.equal(r2, "cross_replica");
+
+      // Both frames arrived in strict FIFO order BEFORE the slow DB refresh resolved!
+      assert.equal(fetchCalls, 1, "background refresh was kicked off without blocking delivery");
+      const receivedTypes = ws.sent.map((frame) => (JSON.parse(frame) as { type: string }).type);
+      assert.deepEqual(receivedTypes, ["agent:start", "agent:deliver"]);
+
+      // Now let the background refresh settle to "seal"; subsequent starts seal over Redis.
+      resolveSlowFetch({ enabled: true, variant: null });
+      await slowFetch;
+      await Promise.resolve();
+      const start2: ServerToMachineMessage = { ...startMessage, launchId: "launch-order-2" };
+      assert.equal(await sendRequired(source, "machine-order", start2), "cross_replica");
+      assert.equal(source.hops.at(-1)!.includes(apiKey), false, "after background refresh settles, subsequent starts cross Redis sealed");
+    });
+  } finally {
+    __resetReplicaAgentConfigSealModeCacheForTests();
+    source.shutdown();
+    target.shutdown();
+  }
+});
+
 // Reconciler step 12 (#proj-raft-computer:#48, decision 3): a runtime that
 // gets ready and then fails for good (an unsupported model, the same error
 // again and again, a crash streak) is reported after its readiness reset the
@@ -25403,4 +26501,255 @@ test("#68 F1: readiness reports are rate limited per Computer (20 per window), b
   await orchestrator.handleMachineMessage("machine-1", { type: "machine:runtime_readiness", seq: 26, facts: [] } as MachineToServerMessage);
   assert.equal(ingested, 21, "a new window takes reports again");
   orchestrator.shutdown();
+});
+
+// --- #oar-raft:#22: a live agent's heartbeat keeps its busy state readable ---
+//
+// A daemon re-sends its unchanged busy activity every 60 s (`isHeartbeat:
+// true`). The read path served `online` once the snapshot's observed time was
+// 90 s old, and a heartbeat never refreshed it, so a live agent read `online`
+// on most reads. A same-content heartbeat now refreshes only a server-time
+// liveness stamp (local snapshot and owner mirror), and reads use a 150 s
+// threshold, longer than the 90 s sweep.
+
+const LIVENESS_ACTIVITY = { activity: "working", activityKind: "working", detail: "Running tests", detailKind: "running_command" } as const;
+
+function livenessFactFrame(clientSeq: number, observedAtMs: number, extra: Record<string, unknown> = {}): MachineToServerMessage {
+  return {
+    type: "agent:activity",
+    agentId: "agent-1",
+    ...LIVENESS_ACTIVITY,
+    entries: [{ kind: "status", ...LIVENESS_ACTIVITY }],
+    launchId: "L-1",
+    clientSeq,
+    producerFactId: `daemon_activity:agent-1:L-1:${clientSeq}`,
+    observedAtMs,
+    isHeartbeat: false,
+    ...extra,
+  } as unknown as MachineToServerMessage;
+}
+
+function livenessHeartbeatFrame(clientSeq: number, observedAtMs: number, extra: Record<string, unknown> = {}): MachineToServerMessage {
+  return {
+    type: "agent:activity",
+    agentId: "agent-1",
+    ...LIVENESS_ACTIVITY,
+    launchId: "L-1",
+    clientSeq,
+    producerFactId: `daemon_activity:agent-1:L-1:${clientSeq}`,
+    observedAtMs,
+    isHeartbeat: true,
+    ...extra,
+  } as unknown as MachineToServerMessage;
+}
+
+function setupLivenessOwner(tracer?: Tracer) {
+  const clock = new FakeClock();
+  clock.advance(10_000);
+  const orchestrator = new PersistedActivityLogDeterministicOrchestrator(new Map(), clock, tracer);
+  const store = (orchestrator as any).replicaStateStore as InMemoryReplicaStateStore;
+  seedActiveAgent(orchestrator);
+  const conn = seedMachineConnection(orchestrator, "machine-1", makeFakeWs());
+  // The Computer stays connected (ws ping/pong) whatever the agent does.
+  const keepMachineConnected = () => { conn.lastPong = clock.now(); };
+  return { clock, orchestrator, store, keepMachineConnected };
+}
+
+for (const kernel of [false, true]) {
+  const mode = `kernel arbitration ${kernel ? "on" : "off"}`;
+
+  test(`#oar-raft:#22 a same-content heartbeat refreshes only the liveness stamp, at server time, without a log row or broadcast (${mode})`, async () => {
+    await withKernelEnvAsync(kernel, async () => {
+      const { sink, tracer } = makeDeterministicTracer();
+      const { clock, orchestrator, store } = setupLivenessOwner(tracer);
+      try {
+        await orchestrator.handleMachineMessage("machine-1", livenessFactFrame(1, clock.now()));
+        await flushMicrotasks();
+        const factSnapshot = structuredClone((orchestrator as any).agentActivity.get("agent-1"));
+        assert.equal(factSnapshot.observedAtMs, 10_000);
+        assert.equal(factSnapshot.livenessAtMs, undefined);
+        const logBefore = await orchestrator.listRecentActivityLog("agent-1");
+        assert.equal(logBefore.length, 1, "the fact itself is the one durable row");
+        const emittedBefore = orchestrator.emittedActivityPayloads.length;
+
+        clock.advance(60_000);
+        // The daemon's clock runs 10 min ahead: the stamp must be this server's receive time.
+        await orchestrator.handleMachineMessage("machine-1", livenessHeartbeatFrame(2, clock.now() + 600_000));
+        await flushMicrotasks();
+
+        const snapshot = (orchestrator as any).agentActivity.get("agent-1");
+        assert.equal(snapshot.livenessAtMs, 70_000, "server receive time, not the daemon clock");
+        assert.equal(snapshot.observedAtMs, 10_000, "a replay never moves the kernel's observed clock");
+        assert.equal(snapshot.activity, "working");
+        assert.equal(snapshot.detail, "Running tests");
+        assert.equal(snapshot.detailKind, "running_command");
+        if (kernel) {
+          assert.deepEqual(snapshot, { ...factSnapshot, livenessAtMs: 70_000 }, "time-only write: nothing else in the snapshot changes");
+        }
+
+        const mirrored = store.agentActivities.get("agent-1");
+        assert.equal(mirrored?.livenessAtMs, 70_000, "the owner mirror carries the stamp to other replicas");
+        assert.equal(mirrored?.observedAtMs, 10_000);
+        assert.equal(mirrored?.activity, "working");
+        assert.equal(mirrored?.detail, "Running tests");
+
+        assert.deepEqual(await orchestrator.listRecentActivityLog("agent-1"), logBefore, "no activity log row");
+        const newFrames = orchestrator.emittedActivityPayloads.slice(emittedBefore);
+        if (kernel) {
+          assert.deepEqual(newFrames, [], "no broadcast to clients");
+        } else {
+          // Kernel-off already sent heartbeats as refresh-only frames (the web's
+          // Working-now row relies on them); the liveness refresh adds none.
+          assert.equal(newFrames.length, 1);
+          assert.equal(newFrames[0]?.isRefreshOnly, true);
+          assert.equal(newFrames[0]?.isHeartbeat, true);
+          assert.equal(newFrames[0]?.entries, undefined);
+        }
+
+        const refreshEvents = logEventAttrs(sink, "activity.liveness.refresh");
+        assert.equal(refreshEvents.length, 1);
+        assert.equal(refreshEvents[0]?.action, "liveness_refresh");
+        assert.equal(refreshEvents[0]?.reason, "replayed_heartbeat_same_content");
+        assert.equal(refreshEvents[0]?.liveness_age_sec, 60);
+      } finally {
+        orchestrator.shutdown();
+      }
+    });
+  });
+
+  test(`#oar-raft:#22 a 60 s heartbeat stream keeps owner and non-owner reads working well past 90 s (${mode})`, async () => {
+    await withKernelEnvAsync(kernel, async () => {
+      const { clock, orchestrator, store, keepMachineConnected } = setupLivenessOwner();
+      store.machineReplicas.add("machine-1");
+      const reader = new DeterministicAgentOrchestrator(store, clock);
+      seedActiveAgent(reader);
+      try {
+        await orchestrator.handleMachineMessage("machine-1", livenessFactFrame(1, clock.now()));
+        await flushMicrotasks();
+
+        // Five heartbeat periods: 300 s past the fact, well past both 90 s and 150 s.
+        for (let beat = 1; beat <= 5; beat += 1) {
+          clock.advance(59_000);
+          keepMachineConnected();
+          const at = `${(beat - 1) * 60 + 59} s after the fact`;
+          assert.equal((await orchestrator.getActivity("agent-1")).activity, "working", `owner read ${at}`);
+          assert.equal((await reader.getActivity("agent-1")).activity, "working", `non-owner (mirror) read ${at}`);
+          clock.advance(1_000);
+          await orchestrator.handleMachineMessage("machine-1", livenessHeartbeatFrame(beat + 1, clock.now()));
+          await flushMicrotasks();
+        }
+        assert.equal((orchestrator as any).agentActivity.get("agent-1").observedAtMs, 10_000, "still the fact's observed time");
+        assert.equal((orchestrator as any).agentActivity.get("agent-1").livenessAtMs, 310_000);
+      } finally {
+        reader.shutdown();
+        orchestrator.shutdown();
+      }
+    });
+  });
+
+  test(`#oar-raft:#22 a stale launch's heartbeat does not refresh liveness (${mode})`, async () => {
+    await withKernelEnvAsync(kernel, async () => {
+      const { sink, tracer } = makeDeterministicTracer();
+      const { clock, orchestrator, store } = setupLivenessOwner(tracer);
+      try {
+        await orchestrator.handleMachineMessage("machine-1", livenessFactFrame(1, clock.now()));
+        await flushMicrotasks();
+
+        // The agent restarted as L-2. Unguarded, the L-1 heartbeat passes the
+        // launch guard, but proves nothing about the current launch.
+        (orchestrator as any).updateCache("agent-1", { expectedLaunchId: "L-2", launchGuardMode: "legacy" });
+        clock.advance(60_000);
+        await orchestrator.handleMachineMessage("machine-1", livenessHeartbeatFrame(2, clock.now()));
+        await flushMicrotasks();
+        assert.equal((orchestrator as any).agentActivity.get("agent-1").livenessAtMs, undefined);
+        assert.equal(store.agentActivities.get("agent-1")?.livenessAtMs, undefined);
+        const refreshEvents = logEventAttrs(sink, "activity.liveness.refresh");
+        assert.equal(refreshEvents.at(-1)?.action, "none");
+        assert.equal(refreshEvents.at(-1)?.reason, "stale_launch");
+
+        // Guarded, the launch guard drops it before any write.
+        (orchestrator as any).updateCache("agent-1", { expectedLaunchId: "L-2", launchGuardMode: "guarded" });
+        clock.advance(60_000);
+        await orchestrator.handleMachineMessage("machine-1", livenessHeartbeatFrame(3, clock.now()));
+        await flushMicrotasks();
+        assert.equal((orchestrator as any).agentActivity.get("agent-1").livenessAtMs, undefined);
+        assert.equal(store.agentActivities.get("agent-1")?.livenessAtMs, undefined);
+        assert.equal(logEventAttrs(sink, "activity.ingest.dropped").at(-1)?.reason, "stale_launch_guard");
+      } finally {
+        orchestrator.shutdown();
+      }
+    });
+  });
+
+  test(`#oar-raft:#22 with heartbeats stopped, a read falls back to online only after 150 s, and says why (${mode})`, async () => {
+    await withKernelEnvAsync(kernel, async () => {
+      const { sink, tracer } = makeDeterministicTracer();
+      const { clock, orchestrator, keepMachineConnected } = setupLivenessOwner(tracer);
+      try {
+        await orchestrator.handleMachineMessage("machine-1", livenessFactFrame(1, clock.now()));
+        await flushMicrotasks();
+        clock.advance(60_000);
+        await orchestrator.handleMachineMessage("machine-1", livenessHeartbeatFrame(2, clock.now()));
+        await flushMicrotasks();
+
+        // The runtime stops: no more heartbeats. Past the sweep's 90 s, the
+        // read still serves the state while a probe could answer.
+        clock.advance(149_000);
+        keepMachineConnected();
+        assert.equal((await orchestrator.getActivity("agent-1")).activity, "working", "149 s after the last heartbeat");
+
+        clock.advance(2_000);
+        keepMachineConnected();
+        assert.deepEqual(await orchestrator.getActivity("agent-1"), { activity: "online", activityDetail: "" }, "151 s after the last heartbeat");
+
+        const normalized = sink.getAllSpans()
+          .filter((span) => span.name === "server.agent.activity.resolve")
+          .flatMap((span) => spanEvents(sink, span))
+          .filter((event) => event.name === "activity.hint.normalized");
+        assert.equal(normalized.length, 1, "only the stale read is normalized");
+        assert.equal(normalized[0]?.attrs?.reason, "observed_at_stale");
+        assert.equal(normalized[0]?.attrs?.age_sec, 151);
+        assert.equal(normalized[0]?.attrs?.stale_after_sec, 150);
+        assert.equal(normalized[0]?.attrs?.activity, "working");
+        assert.equal(normalized[0]?.attrs?.result, "online");
+      } finally {
+        orchestrator.shutdown();
+      }
+    });
+  });
+}
+
+test("#oar-raft:#22 kernel arbitration on: a liveness refresh never orders later daemon facts out", async () => {
+  // The stamp is server time; facts carry the daemon's clock. Had the
+  // heartbeat moved observedAtMs to its receive time, an idle fact the daemon
+  // stamped a moment earlier (in flight, or a slightly slow clock) would lose
+  // as stale_observed and the agent would stay busy.
+  await withKernelEnvAsync(true, async () => {
+    const { clock, orchestrator } = setupLivenessOwner();
+    try {
+      await orchestrator.handleMachineMessage("machine-1", livenessFactFrame(1, clock.now()));
+      await flushMicrotasks();
+      clock.advance(60_000);
+      await orchestrator.handleMachineMessage("machine-1", livenessHeartbeatFrame(2, clock.now()));
+      await flushMicrotasks();
+      assert.equal((orchestrator as any).agentActivity.get("agent-1").livenessAtMs, 70_000);
+
+      clock.advance(100);
+      await orchestrator.handleMachineMessage("machine-1", livenessFactFrame(3, 69_000, {
+        activity: "online",
+        activityKind: "online",
+        detail: "",
+        detailKind: "idle",
+        entries: [{ kind: "status", activity: "online", activityKind: "online", detail: "", detailKind: "idle" }],
+      }));
+      await flushMicrotasks();
+
+      const snapshot = (orchestrator as any).agentActivity.get("agent-1");
+      assert.equal(snapshot.activity, "online", "the daemon's later fact wins on its own clock");
+      assert.equal(snapshot.observedAtMs, 69_000);
+      assert.equal(snapshot.livenessAtMs, undefined, "the stamp belonged to the replaced content");
+    } finally {
+      orchestrator.shutdown();
+    }
+  });
 });

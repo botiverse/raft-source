@@ -1,0 +1,27 @@
+host: oar
+runtime: codex
+scenario: fresh-memory-md
+promptSource: wake_inbox_update_with_memory
+
+## standing prompt
+= standing-prompt.md
+
+## carrier
+launch.options.systemPrompt: (absent)
+launch.options.appendSystemPrompt: = standing prompt
+launch.options.env.OPENCODE_CONFIG_CONTENT: (absent)
+
+## first input (752 chars, sha256:313a96d0788a3176, does not contain the standing prompt)
+<memory-index file="MEMORY.md" size="0.1 KB" complete="true" note="no need to re-read MEMORY.md unless you change it">
+# Notes
+
+- Release train: Thursdays.
+- [deploy runbook](notes/deploy.md)
+</memory-index>
+
+[Raft inbox notice:
+Inbox update: 1 message pending your read across all conversations; 1 changed target
+#general  pending: 1 message · first msg=wake-1 · latest sender @bob · latest msg=wake-1
+  latest @bob: "Can you check the deploy notes?" (preview; still unread, full text: raft message read --target "#general" --unread)
+]
+These messages have not been read. Choose when to read them: `raft message read --target <target> --unread` reads one conversation's unread messages; `raft inbox check` lists every conversation with unread messages.

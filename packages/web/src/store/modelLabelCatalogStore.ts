@@ -93,6 +93,20 @@ export function modelLabelFromCatalog(
   return runtime?.models.find((model) => model.id === modelId)?.label ?? null;
 }
 
+/**
+ * A live model detect for a Computer was just upserted into the server's
+ * catalog (the runtime-models probe, or a runtime-config form's model list
+ * answered live): reload our copy so every surface shows the name the
+ * dropdown shows (#triage:#548: after a Claude Code upgrade the editor said
+ * Fable 5.2 while the chat and profile still said 5.1). Only when the app
+ * already uses the catalog: nothing to align otherwise.
+ */
+export function refreshModelLabelCatalogAfterLiveDetect(serverId: string | null | undefined): void {
+  if (!serverId) return;
+  const store = useModelLabelCatalogStore.getState();
+  if (store.byServer[serverId]) store.load(serverId, { force: true });
+}
+
 /** Synchronous read for render paths that already hold a machine + model. */
 export function catalogModelLabel(
   serverId: string | null | undefined,

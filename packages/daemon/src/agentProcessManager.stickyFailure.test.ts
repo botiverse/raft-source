@@ -26,6 +26,7 @@ import { asAxSurfaceText, type AgentConfig, type AgentMessage } from "@botiverse
 import { AgentProcessManager } from "./agentProcessManager";
 import { setDaemonFetchImplForTests } from "./daemonFetch";
 import type { ParsedEvent, RuntimeDriver } from "./drivers/index";
+import { OpenCodeDriver } from "./drivers/opencode";
 import { CRASH_STREAK_CAP } from "./planExit";
 import type { StickyFailureRecords } from "./stickyFailureRecords";
 import { promptConfig } from "./testing/promptFixture";
@@ -33,6 +34,7 @@ import { drainAgentManagerForTests } from "./testing/agentManagerTeardown";
 
 const AGENT = "agent-sticky";
 const TOO_LARGE = "API Error: 400 maximum context length is 100 tokens; you requested 101 tokens";
+const OPENCODE_TOO_LARGE = "Your input exceeds the context window of this model. Please adjust your input and try again.";
 const MODEL_ERROR = "The requested model is not supported for this account.";
 const SAME_ERROR = "Error: deterministic tool failure in the runtime";
 const OPAQUE_ERROR = "Error: something went wrong while loading the conversation";
@@ -106,7 +108,7 @@ async function settle(until: () => boolean = () => false, realMs = 100): Promise
   }
 }
 
-async function withManager(run: (h: Harness) => Promise<void>, options: { capable?: boolean } = {}): Promise<void> {
+async function withManager(run: (h: Harness) => Promise<void>, options: { capable?: boolean; driver?: Partial<RuntimeDriver> } = {}): Promise<void> {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "raft-sticky-failure-test-"));
   const children: FakeChild[] = [];
   const spawnedSessionIds: Array<string | null> = [];
@@ -131,6 +133,7 @@ async function withManager(run: (h: Harness) => Promise<void>, options: { capabl
     },
     parseLine: (line) => parsed.get(line) ?? [],
     encodeStdinMessage: (text) => text,
+    ...options.driver,
   };
   const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const url = String(input instanceof Request ? input.url : input);
@@ -279,6 +282,44 @@ describe("reconciler step 12, C8: a session that no longer fits is replaced once
       expect(h.spawnedSessionIds).toEqual(["session-1", null]);
     });
   }, 20_000);
+
+  // OpenCode reports a context overflow as an `error` line, which its parser
+  // turns into error + turn_end, and `opencode run` then exits. Its wording
+  // ("exceeds the context window") was not recognised as input too large, so
+  // the session was never replaced. The real driver's parser and lifecycle
+  // (per turn, no stdin, ends its process at the turn end); only its deferred
+  // first spawn is left out, so the start here spawns as the others do.
+  test("OpenCode's context-window overflow (error + turn_end, then exit) replaces the session once", async () => {
+    const opencode = new OpenCodeDriver();
+    await withManager(async (h) => {
+      await h.startReady("launch-1");
+      const parsedLine = opencode.parseLine(JSON.stringify({
+        type: "error",
+        sessionID: "session-1",
+        error: { name: "UnknownError", data: { message: OPENCODE_TOO_LARGE } },
+      }));
+      expect(parsedLine.map((event) => event.kind), "OpenCode's own parse of the line").toEqual(["session_init", "error", "turn_end"]);
+      await h.emit(parsedLine);
+      h.children[0]!.end(0);
+      await settle();
+      expect(h.events.filter((event) => event.name === "daemon.agent.session_replaced").map((event) => event.attrs.cause)).toEqual(["input_too_large"]);
+      expect(invalidations(h)).toEqual([{ sessionId: "session-1", reason: "input_too_large" }]);
+      expect(h.children.length, "nothing queued: no process now").toBe(1);
+      expect(h.m.lifecycleRecords.getRestartSnapshot(AGENT)?.sessionId, "kept wakeable, on no session").toBeNull();
+      expect(startFailures(h), "no start failure: the agent recovers by itself").toEqual([]);
+      expect(await h.deliver("wake")).toBe(true);
+      await settle(() => h.children.length > 1, 2_000);
+      expect(h.spawnedSessionIds).toEqual(["session-1", null]);
+    }, {
+      driver: {
+        id: opencode.id,
+        lifecycle: opencode.lifecycle,
+        supportsStdinNotification: opencode.supportsStdinNotification,
+        busyDeliveryMode: opencode.busyDeliveryMode,
+        terminateProcessOnTurnEnd: opencode.terminateProcessOnTurnEnd,
+      },
+    });
+  }, 20_000);
 });
 
 describe("reconciler step 12, C9: a model the runtime cannot use goes to the server at once", () => {
@@ -399,21 +440,4 @@ describe("reconciler step 12: crashes the daemon counted after the start was rea
       expect(startFailures(h).at(-1)).toEqual({ reason: "runtime_repeated_failure", launchId: "launch-next" });
     }, { capable: true });
   }, 30_000);
-
-  test("C10: a Codex turn that did nothing counts like a crash and is handed over at the cap", async () => {
-    await withManager(async (h) => {
-      await h.startReady("launch-1");
-      const zeroEvidence = "Codex runtime returned an empty response. Please retry. (codex_zero_evidence_turn_completed)";
-      for (let turn = 1; turn < CRASH_STREAK_CAP; turn += 1) {
-        await h.emit([{ kind: "error", message: zeroEvidence }, { kind: "turn_end", sessionId: "session-1" }]);
-        expect(h.m.agents.has(AGENT), `turn ${turn}: the process stays`).toBe(true);
-        expect(h.m.lifecycleRecords.getCrashCapStreak(AGENT)).toBe(turn);
-      }
-      expect(startFailures(h), "not sticky: nothing reported before the cap").toEqual([]);
-      expect(h.m.lifecycleRecords.getRuntimeErrorFingerprintFence(AGENT), "not counted by the same-fingerprint fence").toBeUndefined();
-      await h.emit([{ kind: "error", message: zeroEvidence }]);
-      expect(h.m.agents.has(AGENT)).toBe(false);
-      expect(startFailures(h)).toEqual([{ reason: "runtime_repeated_failure", launchId: "launch-1" }]);
-    }, { capable: true });
-  }, 20_000);
 });

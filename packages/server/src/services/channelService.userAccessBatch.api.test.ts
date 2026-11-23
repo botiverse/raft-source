@@ -5,7 +5,7 @@ import { eq, sql } from "drizzle-orm";
 import { type ServerId } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import { channelHumans, channels } from "../db/schema";
-import { seedBoundGuest } from "../test/guestFixture";
+import { seedBoundGuest, seedStrayGuestChannelRow } from "../test/guestFixture";
 import { createAgent } from "./agentService";
 import {
   addHuman,
@@ -37,7 +37,7 @@ test("filterUserAccessibleChannelIds answers every channel type exactly as canUs
   // The guest's one channel (#wg-rbac:#15); another it is a member of grants it nothing.
   await seedBoundGuest({ serverId: server.id, userId: guest.id, channelId: joined.id });
   const guestOther = await createChannel(server.id, `parity-guest-other-${label()}`, undefined, "private");
-  await addHuman(guestOther.id, guest.id);
+  await seedStrayGuestChannelRow({ channelId: guestOther.id, userId: guest.id });
   const closed = await createChannel(server.id, `parity-closed-${label()}`, undefined, "private");
   const archived = await createChannel(server.id, `parity-archived-${label()}`);
   await db.update(channels).set({ archivedAt: new Date() }).where(eq(channels.id, archived.id));

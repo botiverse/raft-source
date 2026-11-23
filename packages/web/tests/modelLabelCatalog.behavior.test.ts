@@ -5,6 +5,7 @@ import api from "../src/api/client";
 import {
   catalogModelLabel,
   modelLabelFromCatalog,
+  refreshModelLabelCatalogAfterLiveDetect,
   useModelLabelCatalogStore,
 } from "../src/store/modelLabelCatalogStore";
 import { useServerStore } from "../src/store/serverStore";
@@ -99,4 +100,33 @@ test("the panel/profile presentation is catalog-first", () => {
     { kind: "resolved", label: "GPT-6-Astra" },
     "without a catalog the configured/table fallback still answers",
   );
+});
+
+test("a live detect reloads a catalog the app already holds, and only then (#triage:#548)", async () => {
+  const originalGet = api.get;
+  let calls = 0;
+  // Before a Claude Code upgrade the alias resolved to 5.1; the server's copy
+  // was rewritten by the live detect, so the reload brings the new name.
+  const stale: ServerModelLabelCatalog = { machines: { "machine-1": { runtimes: { claude: { models: [{ id: "fable", label: "Claude Fable (Fable 5.1)" }], updatedAt: "t1" } } } } };
+  const fresh: ServerModelLabelCatalog = { machines: { "machine-1": { runtimes: { claude: { models: [{ id: "fable", label: "Claude Fable (Fable 5.2)" }], updatedAt: "t2" } } } } };
+  api.get = (async () => {
+    calls += 1;
+    return { data: fresh };
+  }) as typeof api.get;
+  try {
+    // Nothing loaded yet: a live detect does not start a catalog request.
+    refreshModelLabelCatalogAfterLiveDetect("server-1");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(calls, 0);
+
+    // A catalog fetched moments ago (inside the cache window) is still reloaded.
+    setCatalog(stale);
+    assert.equal(catalogModelLabel("server-1", "machine-1", "claude", "fable"), "Claude Fable (Fable 5.1)");
+    refreshModelLabelCatalogAfterLiveDetect("server-1");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(calls, 1);
+    assert.equal(catalogModelLabel("server-1", "machine-1", "claude", "fable"), "Claude Fable (Fable 5.2)");
+  } finally {
+    api.get = originalGet;
+  }
 });

@@ -1,28 +1,15 @@
 import { useIntl } from "react-intl";
-import { Blocks, Plug } from "lucide-react";
-import { Badge, Button, Text } from "@botiverse/raft-ui";
+import { Blocks } from "lucide-react";
+import { Button, Text } from "@botiverse/raft-ui";
 import EmptyState from "../ui/EmptyState";
 import { CONNECTED_APP_CATEGORY_LABEL_ID } from "../../features/apps/connected-apps/connectedAppCatalog";
-import { APPS_TYPE_LABEL_ID } from "./appsFilters";
+import type { ConnectedAppsTab } from "../settings/SettingsSegmentedControls";
+import { APPS_ORIGIN_LABEL_ID } from "./appsFilters";
 import type { AppsFilters } from "./appsFilters";
 
 /**
- * An MCP App's tag after its name: the outline Space Mono tag the `agent` tag
- * is (Raft DS › Status › Agent tag), with a plug. No new color.
- */
-export function McpTag() {
-  const { formatMessage } = useIntl();
-  return (
-    <Badge appearance="outline" variant="muted" className="shrink-0 gap-1 font-mono" data-testid="apps-mcp-tag">
-      <Plug aria-hidden size={12} />
-      {formatMessage({ id: "settings.connectedApps.mcp.badge" })}
-    </Badge>
-  );
-}
-
-/**
- * The heading of a section of the Apps page ("Recommended for you", and
- * "Installed" under it): Raft DS › Text `group`, the heading of a group of
+ * The heading of a section of the Apps page ("Recommended for {server}", and
+ * "All apps" under it, on Discover): Raft DS › Text `group`, the heading of a group of
  * rows or cards, in an `h3` (the page's title is its `h2`).
  */
 export function AppsSectionHeading({ id, children }: { id: string; children: string }) {
@@ -37,17 +24,21 @@ export function AppsSectionHeading({ id, children }: { id: string; children: str
  * Filters or a search that match nothing (Raft DS › EmptyState): say which
  * conditions are on, so it doesn't read as an empty list, and offer Clear All.
  */
-export function AppsNoMatchState({ title, filters, onClearAll }: {
-  /** The tab's own line: No installed apps match this view, … */
+export function AppsNoMatchState({ title, scope, filters, onClearAll }: {
+  /** The scope's own line: No apps match this view, … */
   title: string;
+  /** Whose filter is on: Yours has its origin filter, Discover its Category. */
+  scope: ConnectedAppsTab;
   filters: AppsFilters;
   onClearAll: () => void;
 }) {
   const { formatMessage, formatList } = useIntl();
+  const scopeCondition = scope === "yours"
+    ? (filters.origin !== "all" ? formatMessage({ id: APPS_ORIGIN_LABEL_ID[filters.origin] }) : null)
+    : (filters.category !== "all" ? formatMessage({ id: CONNECTED_APP_CATEGORY_LABEL_ID[filters.category] ?? "settings.connectedApps.categoryOther" }) : null);
   const conditions = [
     filters.search.trim() ? `“${filters.search.trim()}”` : null,
-    filters.type !== "all" ? formatMessage({ id: APPS_TYPE_LABEL_ID[filters.type] }) : null,
-    filters.category !== "all" ? formatMessage({ id: CONNECTED_APP_CATEGORY_LABEL_ID[filters.category] ?? "settings.connectedApps.categoryOther" }) : null,
+    scopeCondition,
   ].filter((condition): condition is string => condition !== null);
   return (
     <EmptyState

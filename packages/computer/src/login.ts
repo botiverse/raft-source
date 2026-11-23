@@ -15,27 +15,38 @@
 //     `computer_migrate` approval (services/migrateGrant.ts).
 // §6 closed-set error codes stay byte-identical.
 import { presentAttachEvent, presentDeviceCode } from "./deviceApprovalPrompt";
+import { createLoopbackLoginPresenter } from "./loopbackLoginPrompt";
 import { info, present } from "./output";
 import { resolveRaftHome } from "./paths";
 import { createComputerApi } from "./lib/api";
+import { createComputerTracer } from "./lib/computerTracer";
 
 export type RunLoginOptions = {
   serverUrl?: string;
   orchestrated?: boolean;
   input?: NodeJS.ReadableStream;
   openUrl?: (url: string) => void;
+  /** `--device-code`: approve with a code even when the browser is on this machine. */
+  deviceCode?: boolean;
 };
 
 /** `raft-computer login`: points at `attach`, then runs its approval flow. */
 export async function runLogin(opts: Omit<RunLoginOptions, "orchestrated">): Promise<void> {
-  const api = createComputerApi(resolveRaftHome());
+  const slockHome = resolveRaftHome();
+  const api = createComputerApi(slockHome);
+  const loopback = createLoopbackLoginPresenter({
+    deviceCode: opts.deviceCode,
+    tracer: createComputerTracer(slockHome, "computer.cli"),
+    ...(opts.input ? { input: opts.input } : {}),
+  });
   let cleanupEnterToOpen: (() => void) | undefined;
   info("Note: `raft-computer login` is no longer a separate step. Use `raft-computer attach /<server>`: it asks for one approval and connects this machine to that server.");
   info("Continuing as attach; choose the server on the approval page.");
   const signedIn: { sessionPath: string | null } = { sessionPath: null };
   await present(async () => {
     try {
-      const result = await api.approveMachine({ serverUrl: opts.serverUrl }, (event) => {
+      const result = await api.approveMachine({ serverUrl: opts.serverUrl, loopback: loopback.options }, (event) => {
+        if (loopback.handleEvent(event)) return;
         if (event.kind === "login.device-code") {
           cleanupEnterToOpen = presentDeviceCode(event, {
             purpose: "approval",
@@ -58,6 +69,7 @@ export async function runLogin(opts: Omit<RunLoginOptions, "orchestrated">): Pro
       });
       if (result.outcome === "signed-in") signedIn.sessionPath = result.sessionPath;
     } finally {
+      loopback.cleanup();
       cleanupEnterToOpen?.();
     }
   });
@@ -76,11 +88,20 @@ export async function runLogin(opts: Omit<RunLoginOptions, "orchestrated">): Pro
  * that refuses the `computer_migrate` grant kind (older than it).
  */
 export async function runSessionLogin(opts: RunLoginOptions): Promise<void> {
-  const api = createComputerApi(resolveRaftHome());
+  const slockHome = resolveRaftHome();
+  const api = createComputerApi(slockHome);
+  // A device session is never finished by loopback (no grant): the offer
+  // only records why (`no_grant`).
+  const loopback = createLoopbackLoginPresenter({
+    deviceCode: opts.deviceCode,
+    tracer: createComputerTracer(slockHome, "computer.cli"),
+    ...(opts.input ? { input: opts.input } : {}),
+  });
   let cleanupEnterToOpen: (() => void) | undefined;
   await present(async () => {
     try {
-      await api.login({ serverUrl: opts.serverUrl }, (event) => {
+      await api.login({ serverUrl: opts.serverUrl, loopback: loopback.options }, (event) => {
+        if (loopback.handleEvent(event)) return;
         if (event.kind === "login.device-code") {
           cleanupEnterToOpen = presentDeviceCode(event, {
             purpose: "sign-in",
@@ -93,6 +114,7 @@ export async function runSessionLogin(opts: RunLoginOptions): Promise<void> {
         }
       });
     } finally {
+      loopback.cleanup();
       cleanupEnterToOpen?.();
     }
   });

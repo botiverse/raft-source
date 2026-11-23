@@ -1,0 +1,20 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "claude",
+  "schemaVersion": "claude.create.v1",
+  "sourceId": "authType",
+  "kind": "select",
+  "pointer": "/authType",
+  "options": [
+    {
+      "value": "api_key",
+      "label": "API key (x-api-key)"
+    },
+    {
+      "value": "auth_token",
+      "label": "Bearer token (Authorization)"
+    }
+  ],
+  "defaultValue": "api_key",
+  "customValueAllowed": false
+}

@@ -5,6 +5,7 @@
 // was lost, and it keeps its own pending restore for now.
 
 import { behindModalLayer, focusLost, mayTakeFocus, OVERLAY } from "./focusGuard";
+import { animationFramesOf, isElementNode } from "./ownerDocument";
 
 /**
  * Why focus should move: `user`, the person's own key press, click or command (rule 2: the only kind that may take
@@ -17,6 +18,12 @@ export interface FocusRequestOptions<T extends HTMLElement> {
   reason: FocusReason;
   /** Runs once focus landed on the target (the search field selects its words). */
   onFocused?: (target: T) => void;
+  /**
+   * The document the target will be in, for a target not there yet: its presses and focus moves cancel the wait, and
+   * its window's next frame tries again (an object window's: useOwnerDocument). Default: the target's own document
+   * when it is there, else the main window's.
+   */
+  doc?: Document;
 }
 
 let cancelPending: (() => void) | null = null;
@@ -29,8 +36,7 @@ function mayFocus(target: HTMLElement, reason: FocusReason): boolean {
 }
 
 /** Focuses the target if it is there and allowed; false when it isn't there yet. */
-function attempt<T extends HTMLElement>(getTarget: () => T | null | undefined, options: FocusRequestOptions<T>): boolean {
-  const target = getTarget();
+function attempt<T extends HTMLElement>(target: T | null | undefined, options: FocusRequestOptions<T>): boolean {
   if (!target?.isConnected) return false;
   if (mayFocus(target, options.reason)) {
     target.focus({ preventScroll: true });
@@ -46,20 +52,24 @@ function attempt<T extends HTMLElement>(getTarget: () => T | null | undefined, o
  */
 export function requestFocus<T extends HTMLElement>(getTarget: () => T | null | undefined, options: FocusRequestOptions<T>): void {
   cancelPending?.();
-  if (attempt(getTarget, options)) return;
+  const first = getTarget();
+  if (attempt(first, options)) return;
+  // The target's own window waits a frame (a hidden main window draws none while an object window is up).
+  const doc = options.doc ?? first?.ownerDocument ?? document;
+  const view = animationFramesOf(doc);
   let frame = 0;
   const cancel = () => {
-    cancelAnimationFrame(frame);
-    document.removeEventListener("pointerdown", cancel, true);
-    document.removeEventListener("focusin", cancel, true);
+    view.cancelAnimationFrame(frame);
+    doc.removeEventListener("pointerdown", cancel, true);
+    doc.removeEventListener("focusin", cancel, true);
     if (cancelPending === cancel) cancelPending = null;
   };
   cancelPending = cancel;
-  document.addEventListener("pointerdown", cancel, true);
-  document.addEventListener("focusin", cancel, true);
-  frame = requestAnimationFrame(() => {
+  doc.addEventListener("pointerdown", cancel, true);
+  doc.addEventListener("focusin", cancel, true);
+  frame = view.requestAnimationFrame(() => {
     cancel();
-    attempt(getTarget, options);
+    attempt(getTarget(), options);
   });
 }
 
@@ -72,22 +82,27 @@ export function requestFocus<T extends HTMLElement>(getTarget: () => T | null | 
  * Asking stops watching; make the move itself with requestFocus. With `repeat`, asking doesn't: the check can be asked
  * at each step of longer work (a page that opens, then draws its target later), until a press stops it.
  */
-export function watchFocusIntent(scope?: () => Element | null | undefined, { repeat = false }: { repeat?: boolean } = {}): () => boolean {
-  const from = document.activeElement;
+export function watchFocusIntent(
+  scope?: () => Element | null | undefined,
+  { repeat = false, doc: givenDoc }: { repeat?: boolean; doc?: Document } = {},
+): () => boolean {
+  // The document the press is in: the scope's (an object window's), or the one given, else the main window's.
+  const doc = givenDoc ?? scope?.()?.ownerDocument ?? document;
+  const from = doc.activeElement;
   let pressed = false;
   const onPress = (event: Event) => {
-    const layer = event.target instanceof Element ? event.target.closest(OVERLAY) : null;
+    const layer = isElementNode(event.target) ? event.target.closest(OVERLAY) : null;
     const within = scope?.();
     if (layer && within && !layer.contains(within)) return;
     pressed = true;
     stop();
   };
-  const stop = () => document.removeEventListener("pointerdown", onPress, true);
-  document.addEventListener("pointerdown", onPress, true);
+  const stop = () => doc.removeEventListener("pointerdown", onPress, true);
+  doc.addEventListener("pointerdown", onPress, true);
   return () => {
     if (!repeat) stop();
     if (pressed) return false;
-    const active = document.activeElement;
-    return focusLost() || (!!active && (active === from || !!scope?.()?.contains(active)));
+    const active = doc.activeElement;
+    return focusLost(undefined, doc) || (!!active && (active === from || !!scope?.()?.contains(active)));
   };
 }

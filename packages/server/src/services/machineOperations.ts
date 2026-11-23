@@ -18,6 +18,7 @@
 import { randomUUID } from "node:crypto";
 import { asMachineOperationId, type JsonValue, type MachineOperationId, type MachineOperationView, type ServerId } from "@botiverse/raft-shared";
 import { getRedis, isRedisAvailable } from "../redis";
+import { withTraceChildSpan } from "../tracing/semanticTrace";
 
 export const MACHINE_OPERATION_TTL_SECONDS = 10 * 60;
 
@@ -37,13 +38,13 @@ type Stored = MachineOperationOwner & ({ state: "pending" } | ({ state: "done" }
 const key = (operationId: string) => `slock:machine-operation:${operationId}`;
 const memory = new Map<string, { value: Stored; expiresAtMs: number }>();
 
-async function put(operationId: string, value: Stored): Promise<void> {
+async function put(operationId: string, value: Stored, ttlSeconds: number): Promise<void> {
   if (!isRedisAvailable()) {
-    memory.set(operationId, { value, expiresAtMs: Date.now() + MACHINE_OPERATION_TTL_SECONDS * 1000 });
+    memory.set(operationId, { value, expiresAtMs: Date.now() + ttlSeconds * 1000 });
     for (const [id, entry] of memory) if (entry.expiresAtMs <= Date.now()) memory.delete(id);
     return;
   }
-  await getRedis().set(key(operationId), JSON.stringify(value), "EX", MACHINE_OPERATION_TTL_SECONDS);
+  await getRedis().set(key(operationId), JSON.stringify(value), "EX", ttlSeconds);
 }
 
 async function get(operationId: string): Promise<Stored | null> {
@@ -58,24 +59,35 @@ async function get(operationId: string): Promise<Stored | null> {
 /**
  * Starts `run` and answers its id once the pending record is written. `run`
  * never rejects into the void: a throw is kept as the 500 the request would
- * have answered.
+ * have answered. `ttlSeconds`: for a wait longer than the default (a runtime
+ * upgrade), so its pending record outlives the wait.
  */
 export async function startMachineOperation(
   owner: MachineOperationOwner,
   run: () => Promise<MachineOperationAnswer>,
   failure: MachineOperationAnswer,
+  ttlSeconds: number = MACHINE_OPERATION_TTL_SECONDS,
 ): Promise<MachineOperationId> {
   const operationId = asMachineOperationId(randomUUID())!;
-  await put(operationId, { ...owner, state: "pending" });
-  void (async () => {
-    let answer: MachineOperationAnswer;
-    try {
-      answer = await run();
-    } catch {
-      answer = failure;
-    }
-    await put(operationId, { ...owner, state: "done", ...answer }).catch(() => {});
-  })();
+  await put(operationId, { ...owner, state: "pending" }, ttlSeconds);
+  // The request's span ends with the 202, so the wait runs in its own child
+  // span: trace events the wait adds (a limit-reset read's result) land there
+  // instead of on an ended span that drops them.
+  void withTraceChildSpan(
+    "server.machine_operation.wait",
+    { surface: "server", kind: "internal", attrs: { operation_surface: owner.surface.split(":")[0] } },
+    async (): Promise<MachineOperationAnswer> => {
+      let answer: MachineOperationAnswer;
+      try {
+        answer = await run();
+      } catch {
+        answer = failure;
+      }
+      await put(operationId, { ...owner, state: "done", ...answer }, ttlSeconds).catch(() => {});
+      return answer;
+    },
+    { onSuccess: (answer) => ({ status_code: answer.status }), statusOf: (answer) => (answer.status >= 500 ? "error" : "ok") },
+  ).catch(() => {});
   return operationId;
 }
 

@@ -135,6 +135,8 @@ export function ComputerServiceActionsCard({
                   : formatMessage({ id: "machine.detail.upgradeStatus.manualUpgradeAbove" }, { version: cardState.version });
               case "commands":
                 return formatMessage({ id: `machine.detail.upgradeStatus.${cardState.sentence}` }, { version: cardState.version });
+              case "systemService":
+                return formatMessage({ id: "machine.detail.upgradeStatus.systemService" }, { version: cardState.version });
             }
           })();
           // Install the latest release, then restart.
@@ -272,6 +274,13 @@ export function ComputerServiceActionsCard({
                   platform={windowsMachine ? "windows" : "mac-linux"}
                   commands={computerFreshInstallCommands}
                   testId="computer-upgrade-manual"
+                />
+              )}
+              {cardState.kind === "systemService" && (
+                <ComputerManualInstall
+                  platform={windowsMachine ? "windows" : "mac-linux"}
+                  commands={computerFreshInstallCommands}
+                  testId="computer-upgrade-system-service"
                 />
               )}
               {cardState.kind === "commands" && upgradeInstallCommand && upgradeRestartCommand && (

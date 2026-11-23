@@ -45,6 +45,13 @@
 // Everything is read from existing facts: task_events, the task rows, and the
 // messages of the task's conversation (its own, or a pre-v2 task's host
 // message thread) and of its source message's thread.
+//
+// Without task v2 (`task_v2_conversations_v0` off) only the new-session listing
+// runs (#wg-task-v2:#26): the first ask of a new session or model context
+// (compaction) lists the agent's todo / in_progress tasks, the few most
+// recently updated by name and the rest counted, as a resumed start does
+// (agentResumeOpenTasks). Nothing is recorded and no other reason applies;
+// the Computer asks with `freshSession` until one is delivered.
 
 import { and, eq, gt, inArray, isNull, lt, sql } from "drizzle-orm";
 import {
@@ -67,6 +74,7 @@ import { getDb, type DatabaseExecutor } from "../db/index";
 import { agents, agentTaskNudges, agentTaskNudgeSends, channels, servers, users } from "../db/schema";
 import { addTraceEvent } from "../tracing/semanticTrace";
 import { resolveAgentTaskSurfaces, type AgentTaskSurface } from "./agentAssignedTaskSurfaces";
+import { AGENT_RESUME_OPEN_TASK_STATUSES, AGENT_RESUME_OPEN_TASKS_LISTED } from "./agentResumeOpenTasks";
 import * as agentService from "./agentService";
 import * as channelService from "./channelService";
 import { getTaskReadOnlyReason } from "./taskChannelSurface";
@@ -86,8 +94,9 @@ export type IdleTaskReminderOpenStatus = (typeof IDLE_TASK_REMINDER_OPEN_STATUSE
  * Parked tasks are listed compactly on a reminder that is sent anyway, never
  * a reason to send one: they are not in IDLE_TASK_REMINDER_OPEN_STATUSES, so
  * they are never decided, never "untouched" and never count as open. The
- * reminder only runs where task v2 is on (isIdleTaskReminderEnabled), which is
- * where the status exists, so its rules always say how to park a task.
+ * reminder's full rules run only where task v2 is on (isIdleTaskReminderEnabled),
+ * which is where the status exists, so they always say how to park a task; the
+ * new-session listing without task v2 leaves the backlog out.
  */
 const BACKLOG_STATUS = "backlog" as const satisfies TaskStatus;
 export const IDLE_TASK_REMINDER_BACKLOG_ACTIVE = true;
@@ -685,6 +694,57 @@ function skipped(reason: IdleTaskReminderSkipReason): IdleTaskReminderResult {
 }
 
 /**
+ * The new-session listing on a server without task v2: the agent's todo /
+ * in_progress tasks read through its task surfaces, the few most recently
+ * updated named and the rest counted (`moreAssigned`), as `new session`. No
+ * record, cap or backlog (that status needs task v2); the rules point at the
+ * task's thread. `no_open_tasks` when it holds none (or none it can see a
+ * ref for), which settles the session on the Computer as `disabled` did.
+ */
+async function computeNewSessionListingWithoutTaskV2(
+  serverId: string,
+  agentId: string,
+  backgroundTasks: number,
+  rulesShown: boolean,
+): Promise<{ result: IdleTaskReminderResult; openTasks: number; taskIds: string[] }> {
+  const none = { result: skipped("no_open_tasks"), openTasks: 0, taskIds: [] };
+  const surfaces = await resolveAgentTaskSurfaces(serverId, agentId);
+  if (surfaces.size === 0) return none;
+  const { rows, total } = await taskService.listRecentTasksAssignedToAgent(
+    [...surfaces.keys()],
+    agentId,
+    AGENT_RESUME_OPEN_TASKS_LISTED,
+    { statuses: AGENT_RESUME_OPEN_TASK_STATUSES },
+  );
+  const why = formatIdleTaskReminderWhy({ reason: "new_session" });
+  const listed: Array<{ id: string; item: AgentApiTaskIdleNudgeItem }> = [];
+  for (const row of rows) {
+    const surface = surfaces.get(row.channelId);
+    const ref = surface ? formatAgentTaskRef(surface.channelRef, row.taskNumber) : null;
+    if (!surface || !ref) continue;
+    listed.push({
+      id: row.id,
+      item: { ref, taskNumber: row.taskNumber, channel: surface.channelRef, title: row.title, status: row.status, reason: "new_session", why },
+    });
+  }
+  if (listed.length === 0) return { ...none, openTasks: total };
+  const items = listed.map(({ item }) => item);
+  const noticeInput = {
+    items,
+    moreAssigned: Math.max(0, total - items.length),
+    backgroundTasks,
+    backlogActive: false,
+    taskConversations: false,
+    rules: !rulesShown,
+  };
+  return {
+    result: { send: true, items, backlog: [], text: formatIdleTaskReminderNotice(noticeInput), rules: idleTaskReminderNoticeHasRules(noticeInput) },
+    openTasks: total,
+    taskIds: listed.map(({ id }) => id),
+  };
+}
+
+/**
  * Decide, record and word the idle task reminder for one agent (its
  * credential's server). See the module comment for the rules.
  */
@@ -728,7 +788,11 @@ export async function computeIdleTaskReminder(input: {
     return result;
   };
 
-  if (!(await isIdleTaskReminderEnabled(input.serverId))) return trace(skipped("disabled"), { openTasks: 0 });
+  if (!(await isIdleTaskReminderEnabled(input.serverId))) {
+    if (!freshSession) return trace(skipped("disabled"), { openTasks: 0 });
+    const listing = await computeNewSessionListingWithoutTaskV2(input.serverId, input.agentId, backgroundTasks, input.rulesShown === true);
+    return trace(listing.result, { openTasks: listing.openTasks, taskIds: listing.taskIds });
+  }
 
   const now = input.now ?? currentDate();
   const activeSince = await ensureTaskV2OnSince(input.serverId, now);

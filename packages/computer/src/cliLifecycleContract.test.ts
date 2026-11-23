@@ -428,6 +428,9 @@ test("hidden CLI dispatch executes isolated service, takeover, supervisor and bu
     const kimi = run(["__verify-bundled-kimi"]);
     assert.equal(kimi.status, 0, kimi.stderr);
     assert.equal(kimi.stdout.trim(), "kimi-bundle-ok");
+    const bedrock = run(["__verify-bundled-bedrock"]);
+    assert.equal(bedrock.status, 0, bedrock.stderr);
+    assert.equal(bedrock.stdout.trim(), "bedrock-bundle-ok");
     const oar = run(["__verify-bundled-oar"]);
     assert.equal(oar.status, 0, oar.stderr);
     assert.equal(oar.stdout.trim(), "oar-bundle-ok");

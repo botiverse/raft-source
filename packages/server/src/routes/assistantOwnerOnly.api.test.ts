@@ -173,8 +173,10 @@ test("only the owner moves the assistant's read position", async ({ app }) => {
       headers: headers(await tokenForHuman(email), s.server.id),
       body: JSON.stringify({ receiver: { kind: "agent", id: s.agentId } }),
     })).status;
-    assert.equal(await readAll(s.admin.email), 403);
-    assert.equal(await readAll(s.serverOwner.email), 403);
+    // Admin and server owner can't see the owner's DM with the assistant, so the
+    // refusal is the missing-channel 404, not "Read receiver is not authorized".
+    assert.equal(await readAll(s.admin.email), 404);
+    assert.equal(await readAll(s.serverOwner.email), 404);
     assert.equal(await readAll(s.owner.email), 200);
   });
 });

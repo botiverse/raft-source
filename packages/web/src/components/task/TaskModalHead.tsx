@@ -10,6 +10,7 @@ import SectionEyebrow from "../ui/SectionEyebrow";
 import ShowMoreToggle from "../ui/ShowMoreToggle";
 import { SkeletonTextBar } from "../ui/Skeleton";
 
+import { useCanWriteTaskChannel } from "./taskChannelWrite";
 import { TaskHeadEditButton, TaskHeadFieldEditor } from "./TaskHeadEditor";
 import type { TaskHeadEditField } from "./TaskHeadEditor";
 import TaskProperties, { PropertyRow } from "./TaskProperties";
@@ -139,12 +140,15 @@ export default function TaskModalHead({ task, propertyRows, divider = true, onOp
   const descriptionCollapsed = descriptionCollapsible && !descriptionExpanded;
 
   // Editing the title and description (#wg-task-v2:#22). Offered as the assignee
-  // picker is (TaskProperties' canEditAssignee): the shared rule with channel
-  // access assumed, since the head only shows to readers of the task, and the
-  // server (PATCH /tasks/:id) is the authority, answering 403 with its reason.
+  // picker is (TaskProperties' canEditAssignee): the shared rule, with read
+  // access assumed (the head only shows to readers of the task) and write
+  // access read off the task's channel (not to a reader of a public channel
+  // who has not joined it). The server (PATCH /tasks/:id) is the authority,
+  // answering 403 with its reason.
   // Never on a legacy card, which the server cannot amend. The edit is keyed
   // by task, so a head reused for another task does not carry it over.
-  const canEdit = !task.isLegacy && authorizeTaskAction({ action: "amend", canReadChannel: true, canWriteChannel: true, readOnlyReason: task.readOnlyReason });
+  const canWriteChannel = useCanWriteTaskChannel(task.channelId);
+  const canEdit = !task.isLegacy && authorizeTaskAction({ action: "amend", canReadChannel: true, canWriteChannel, readOnlyReason: task.readOnlyReason });
   // A summary row has no description body (only `hasDescription`): editing it
   // from there would start from nothing and could wipe what is stored.
   const descriptionLoaded = task.description !== undefined || task.hasDescription === false;

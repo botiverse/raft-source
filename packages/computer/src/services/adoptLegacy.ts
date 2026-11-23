@@ -41,7 +41,7 @@ import { formatServerSlugDisplay, normalizeServerSlug } from "../serverState";
 import { resolveServerUrl, resolveServerUrlEnv } from "../serverUrl";
 import { ComputerServiceError } from "./errors";
 import { startedAfterRecord } from "@botiverse/raft-shared";
-import { readProcessStartTimeMsBeforeActing } from "../internal/process-primitives";
+import { isProcessAlive, readProcessStartTimeMsBeforeActing } from "../internal/process-primitives";
 
 interface UserSession {
   kind?: string;
@@ -198,17 +198,6 @@ export function legacyLockOwnerPath(slockHome: string, rawKey: string): string {
 
 function legacyApiKeyFingerprint(rawKey: string): string {
   return createHash("sha256").update(rawKey).digest("hex").slice(0, 16);
-}
-
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    const code = typeof err === "object" && err && "code" in err ? (err as { code?: string }).code : undefined;
-    return code !== "ESRCH";
-  }
 }
 
 async function stopLegacyDaemonByOwnerFile(
@@ -524,6 +513,9 @@ async function completeAdoptionExchange(
         serverId: result.serverId,
         serverSlug: slugForServer,
         serverMachineId: result.computerId,
+        // The linked `machines.id`: what `status --json` reports as
+        // `servers[].machineId`, which Raft Desktop matches "this Mac" by.
+        machineId: result.machineId,
         apiKey: result.apiKey,
         serverUrl: baseUrl,
         attachedAt: new Date().toISOString(),

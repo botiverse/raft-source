@@ -6,6 +6,7 @@ import {
   formatContinuationPaused,
   formatContinuationRefusal,
   heldSendContinuationAsk,
+  type ContinuationPausedOptions,
   type ContinuationPausedView,
   type ContinuationRefusalView,
 } from "@botiverse/raft-shared/src/agentText/continuations";
@@ -24,12 +25,20 @@ const FRESH_REPLIES_ASK = {
 const EXPIRES_AT = Date.UTC(2026, 9, 26, 13, 12);
 
 export const formatContinuationPausedOutput = axSurface(
-  "A command paused to ask the agent something (exit 10): the question, its preview, and the `cont` command for each answer, with the continuation id and its deadline.",
-  (view: ContinuationPausedView): string => formatContinuationPaused(view),
+  "A command paused to ask the agent something (exit 10): the question, its preview, and the `cont` command for each answer (or, when the launch offers the daemon's answer_continuation tool, the options and one line naming the tool), with the continuation id and its deadline.",
+  (view: ContinuationPausedView, options?: ContinuationPausedOptions): string => formatContinuationPaused(view, options),
   {
     examples: [
       { title: "options, one taking text on stdin", args: [{ id: "k7q2m3x9ab", ask: FRESH_REPLIES_ASK, expiresAt: EXPIRES_AT }] },
       { title: "text alone", args: [{ id: "k7q2m3x9ab", ask: { question: "Write the reply to send.", input: "stdin" }, expiresAt: EXPIRES_AT }] },
+      {
+        title: "options, the launch offering the answer_continuation tool (RAFT_CONTINUATION_TOOL)",
+        args: [{ id: "k7q2m3x9ab", ask: FRESH_REPLIES_ASK, expiresAt: EXPIRES_AT }, { answerTool: true }],
+      },
+      {
+        title: "text alone, the launch offering the answer_continuation tool",
+        args: [{ id: "k7q2m3x9ab", ask: { question: "Write the reply to send.", input: "stdin" }, expiresAt: EXPIRES_AT }, { answerTool: true }],
+      },
       {
         title: "a held message send, held 3 times (the continuation pilot)",
         args: [{

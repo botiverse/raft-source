@@ -239,6 +239,26 @@ test("integration app prepare register posts sanitized action-card request", asy
   assert.match(out, /invalidates the previous one/);
 });
 
+test("integration app prepare register without --redirect-url prepares a token-only App", async () => {
+  const { io, stdout } = memoryIo();
+  const requests: Array<{ path: string; body?: unknown }> = [];
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (_method: string, path: string, body?: unknown): Promise<ApiResponse<unknown>> => {
+        requests.push({ path, body });
+        return { ok: true, status: 201, error: null, data: { status: "prepared", mode: "register", target: "#proj-auth", actionCardMessageId: "card-message-3", action: { type: "integration:register_app", name: "Token App", scopes: [] } } };
+      },
+    }) as any,
+  });
+
+  await integrationAppPrepareRegisterCommand.handler(ctx, { name: "Token App", target: "#proj-auth" });
+  assert.equal(requests.length, 1);
+  assert.equal((requests[0]!.body as { returnUrl?: string }).returnUrl, undefined);
+  assert.doesNotMatch(stdout.join(""), /redirect URL:/);
+});
+
 test("integration app prepare register allows server-generated client key", async () => {
   const { io, stdout, stderr } = memoryIo();
   const requests: Array<{ method: string; path: string; body?: unknown }> = [];
@@ -324,6 +344,7 @@ test("integration app CLI does not expose the legacy prepare-update authority pa
     "status",
   ]);
   assert.ok(update?.options.some((option) => option.long === "--category"));
+  assert.ok(update?.options.some((option) => option.long === "--agent-token-signing-alg"));
 });
 
 test("integration app rotate-secret writes only to a new mode-0600 sink and emits a sanitized receipt", async () => {
@@ -760,10 +781,6 @@ test("integration app update and transfer-owner call owner-or-admin direct route
   await integrationAppUpdateCommand.handler(ctx, { client: "demo-app", name: "Demo App 2", category: "Storage", whenToUse: "when the queue backs up" });
   await integrationAppTransferOwnerCommand.handler(ctx, { client: "demo-app", toAgent: "box" });
   await assert.rejects(
-    async () => integrationAppUpdateCommand.handler(ctx, { client: "demo-app", redirectUrl: "" }),
-    /OAuth apps must keep a registered callback URL/,
-  );
-  await assert.rejects(
     async () => integrationAppUpdateCommand.handler(ctx, { client: "demo-app", category: "Automation" }),
     /--category must be one of: AI & Automation/,
   );
@@ -862,6 +879,79 @@ test("integration app update --client-key sends the new client id next to the Ap
     ["demo-app", "demo-next"],
   );
   assert.match(stdout.join(""), /demo-next\) updated: clientKey/);
+});
+
+test("integration app update --agent-token-signing-alg sends the App's signing algorithm and refuses others locally", async () => {
+  const { io, stdout } = memoryIo();
+  const requests: Array<{ path: string; body: unknown }> = [];
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (_method: string, path: string, body?: unknown): Promise<ApiResponse<unknown>> => {
+        requests.push({ path, body });
+        return { ok: true, status: 200, error: null, data: { clientId: "client-1", clientKey: "demo-app", clientName: "Demo App", updatedFields: ["agentTokenSigningAlg"] } };
+      },
+    }) as any,
+  });
+
+  await integrationAppUpdateCommand.handler(ctx, { client: "demo-app", agentTokenSigningAlg: " rs256 " });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]!.path, "/internal/agent-api/integrations/app/update");
+  assert.equal((requests[0]!.body as { agentTokenSigningAlg: string }).agentTokenSigningAlg, "RS256");
+  assert.match(stdout.join(""), /updated: agentTokenSigningAlg/);
+
+  await integrationAppUpdateCommand.handler(ctx, { client: "demo-app", name: "Demo App" });
+  assert.equal("agentTokenSigningAlg" in (requests[1]!.body as object), false, "omitted when the flag is absent");
+
+  await assert.rejects(
+    async () => { await integrationAppUpdateCommand.handler(ctx, { client: "demo-app", agentTokenSigningAlg: "HS256" }); },
+    /--agent-token-signing-alg must be one of: ES256, RS256/,
+  );
+  assert.equal(requests.length, 2, "an invalid value never reaches the server");
+});
+
+test("integration app update --agent-token-type sends the App's agent token typ exactly, and --redirect-url \"\" clears the redirect URL", async () => {
+  const { io, stdout } = memoryIo();
+  const requests: Array<{ path: string; body: unknown }> = [];
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (_method: string, path: string, body?: unknown): Promise<ApiResponse<unknown>> => {
+        requests.push({ path, body });
+        const sent = body as Record<string, unknown>;
+        const updatedFields = ["returnUrl", "agentTokenType"].filter((field) => sent[field] !== undefined);
+        return { ok: true, status: 200, error: null, data: { clientId: "client-1", clientKey: "demo-app", clientName: "Demo App", updatedFields } };
+      },
+    }) as any,
+  });
+
+  // A token-only App in one update: clear the redirect URL and set JWT.
+  await integrationAppUpdateCommand.handler(ctx, { client: "demo-app", redirectUrl: "", agentTokenType: " JWT " });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]!.path, "/internal/agent-api/integrations/app/update");
+  const first = requests[0]!.body as { returnUrl?: string; agentTokenType?: string };
+  assert.equal(first.returnUrl, "", "an empty --redirect-url is sent as the clear, not dropped");
+  assert.equal(first.agentTokenType, "JWT");
+  assert.match(stdout.join(""), /updated: returnUrl, agentTokenType/);
+  assert.match(stdout.join(""), /agent token type: JWT/);
+
+  await integrationAppUpdateCommand.handler(ctx, { client: "demo-app", agentTokenType: "at+jwt" });
+  assert.equal((requests[1]!.body as { agentTokenType: string }).agentTokenType, "at+jwt");
+
+  await integrationAppUpdateCommand.handler(ctx, { client: "demo-app", name: "Demo App" });
+  assert.equal("agentTokenType" in (requests[2]!.body as object), false, "omitted when the flag is absent");
+
+  for (const value of ["jwt", "at+JWT", "none", ""]) {
+    await assert.rejects(
+      async () => { await integrationAppUpdateCommand.handler(ctx, { client: "demo-app", agentTokenType: value }); },
+      /--agent-token-type must be exactly one of: at\+jwt, JWT/,
+      value,
+    );
+  }
+  assert.equal(requests.length, 3, "an invalid value never reaches the server");
+  assert.ok(integrationAppUpdateCommand.spec.options?.some((option) => option.flags.startsWith("--agent-token-type")));
 });
 
 test("integration app transfer-owner JSON emits a fixed audited no-op receipt", async () => {

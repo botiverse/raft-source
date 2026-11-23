@@ -278,7 +278,7 @@ test.describe("thread view-in-channel routing", () => {
     await expect(page.getByTestId("message-scroller")).toBeVisible();
   });
 
-  test("desktop: the channel name in the thread header opens the parent message in the channel", async ({
+  test("desktop: the channel name in the thread header locates the parent message in the channel", async ({
     page,
     request,
   }) => {
@@ -311,12 +311,18 @@ test.describe("thread view-in-channel routing", () => {
     await expect(channelLink).toHaveText(`#${seedState.channel.name}`);
     await channelLink.click();
 
-    await expect(page).toHaveURL(
-      new RegExp(`/s/${seedState.server.slug}/channel/${seedState.channel.id}\\?msg=${parentMsg.id}$`),
+    // Beside its own channel, the parent is located in place and the thread stays open (#proj-chat:#31).
+    await expect(page.getByTestId("message-scroller").locator(`#message-${parentMsg.id}`)).toHaveAttribute(
+      "data-highlighted",
+      "true",
     );
+    await expect(page).toHaveURL(
+      new RegExp(`/s/${seedState.server.slug}/channel/${seedState.channel.id}\\?thread=${seedState.channel.id}%3A${parentMsg.id}$`),
+    );
+    await expect(page.getByTestId("thread-message-scroller")).toBeVisible();
   });
 
-  test("desktop: DM thread → toDmMessage builds /dm/ permalink", async ({
+  test("desktop: DM thread → View in channel locates the parent in the open DM", async ({
     page,
     request,
   }) => {
@@ -368,9 +374,16 @@ test.describe("thread view-in-channel routing", () => {
     await page.getByTestId("thread-overflow-trigger").click();
     await page.getByTestId("thread-overflow-view-in-channel").click();
 
-    await expect(page).toHaveURL(
-      new RegExp(`/s/${seedState.server.slug}/dm/${dm.id}\\?msg=${parentMsg.id}$`),
+    // Beside its own DM, the parent is located in place and the thread stays open (#proj-chat:#31); the
+    // phone test above still covers the /dm/ `?msg=` permalink.
+    await expect(page.getByTestId("message-scroller").locator(`#message-${parentMsg.id}`)).toHaveAttribute(
+      "data-highlighted",
+      "true",
     );
+    await expect(page).toHaveURL(
+      new RegExp(`/s/${seedState.server.slug}/dm/${dm.id}\\?thread=${dm.id}%3A${parentMsg.id}$`),
+    );
+    await expect(page.getByTestId("thread-message-scroller")).toBeVisible();
   });
 
   test("desktop: thread panel does not render parent channel context when msg points outside the thread", async ({

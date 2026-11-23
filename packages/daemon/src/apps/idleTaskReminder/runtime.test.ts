@@ -164,6 +164,62 @@ test("a new session is fresh again; a resumed one never is", async () => {
   assert.equal(h.asks[3]?.freshSession, false, "a resumed session already holds its reminders");
 });
 
+test("a compaction (a new context id) lists everything once, even in a resumed session", async () => {
+  let current = facts({ resumed: true, contextId: "ctx-1" });
+  let delivery: AgentIdleNoticeDelivery = "written";
+  const h = harness({
+    answers: [skipped("no_change"), skipped("no_change"), sent(), sent(), skipped("no_change"), skipped("no_change")],
+    facts: () => current,
+    delivery: async () => delivery,
+  });
+  await h.idle();
+  await h.idle();
+  assert.deepEqual(h.asks.map((ask) => ask.freshSession), [false, false], "the first context seen is the baseline");
+
+  current = facts({ resumed: true, contextId: "ctx-2" }); // a compaction
+  delivery = "busy";
+  await h.idle();
+  assert.equal(h.asks[2]?.freshSession, true, "a new context asks for the full listing");
+
+  delivery = "written";
+  await h.idle();
+  assert.equal(h.asks[3]?.freshSession, true, "an undelivered listing does not settle the new context");
+
+  await h.idle();
+  assert.equal(h.asks[4]?.freshSession, false, "the new context got its listing");
+
+  current = facts({ resumed: true, contextId: null }); // the id is not known
+  await h.idle();
+  assert.equal(h.asks[5]?.freshSession, false, "an unknown context id never counts as new");
+  assert.deepEqual(h.calls().map((call) => call.attrs.fresh_session), [false, false, true, true, false, false]);
+});
+
+test("after a daemon restart a resumed session is not listed just because this process has not seen its context", async () => {
+  const h = harness({ answers: [skipped("no_change"), skipped("no_change")], facts: () => facts({ resumed: true, contextId: "ctx-restored" }) });
+  await h.idle();
+  await h.idle();
+  assert.deepEqual(h.asks.map((ask) => ask.freshSession), [false, false]);
+
+  // clear() (a lost Server connection) forgets the baseline the same way: re-seeded, not listed.
+  h.runtime.clear();
+  h.runtime.setServerCapable(true);
+  await h.idle();
+  assert.equal(h.asks[2]?.freshSession, false);
+});
+
+test("a context settled by a fresh session's listing stays settled; the next compaction is fresh again", async () => {
+  let current = facts({ contextId: "ctx-1" });
+  const h = harness({ answers: [skipped("no_open_tasks"), skipped("no_change"), skipped("no_open_tasks"), skipped("no_change")], facts: () => current });
+  await h.idle();
+  await h.idle();
+  assert.deepEqual(h.asks.map((ask) => ask.freshSession), [true, false], "no open tasks settles session and context");
+
+  current = facts({ contextId: "ctx-2" });
+  await h.idle();
+  await h.idle();
+  assert.deepEqual(h.asks.slice(2).map((ask) => ask.freshSession), [true, false]);
+});
+
 test("no open tasks or a disabled Server settles the fresh listing", async () => {
   const h = harness({ answers: [skipped("no_open_tasks"), skipped("no_change")] });
   await h.idle();

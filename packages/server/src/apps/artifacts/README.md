@@ -68,13 +68,19 @@ checks imports:
     the reader's server, a thread's as its parent, that the person can see
     now by core's channel access, visibilityService `canView`, and the home
     it names: a joint projection's canonical channel; null for every other
-    case), `postableConversation` (a top-level conversation of the person's
+    case), `conversationHome` (that home for a top-level conversation of a
+    server, with no visibility check, for any author: `linkOrigin.ts`, once
+    `messageSource` found the message there), `postableConversation` (a top-level conversation of the person's
     server they may post in now, as core's send has it, and the home it
     names: what a person's publish through their assistant places into, and
     what `services/firstPartyAppMessages` posts as the reader into),
     `agentConversationRefs` (`#name`, `dm:@peer` as
     the agent names it), `conversationNames` (a DM by its peer, as the
-    reader sees it), `conversationGuestAccess` (a guest of the server in
+    reader sees it; both name a joint's canonical channel by the reader's
+    server's projection, `localConversationIds`, and leave it out when there
+    is none: `unresolvedJointHomes` finds those, shown as
+    `UNRESOLVED_JOINT_HOME`, no id and no name, never the joint's storage
+    channel), `conversationGuestAccess` (a guest of the server in
     it, or a channel guests may read without joining), `isConversationMember`
     (on its roster, not merely able to read it: an agent author a narrowing
     keeps) and
@@ -87,13 +93,23 @@ checks imports:
     clears when the flag changes, and count a flag that can't be read as off,
     never for a write. Artifacts' own key is answered by the deployment
     (`deployment.ts`), with no read to cache: `apiCommon.artifactsEnabled`
-    and `itemServerEnabled` (that, and the item's server still exists);
+    and `itemsReadable` / `itemWritable` (that, and whether the item's
+    server answers for a read or a write: `platform/visibility`
+    `objectServersAnswer`, see "Who sees what");
   - `platform/objects`: `recordObjectEvent` (the kind and event kind as
     registered, the home, the recipients), in the module's own transaction,
     and `forgetObjectEvents` (one Artifact's events gone for good, with an
     operator's purge: `purge.ts`)
     (reads go through core's `POST /api/objects/summaries`, which filters by
     the homes the registration reports);
+  - `platform/references`: core's `object_references`, what objects name in
+    their content (#proj-workspace:#336): `replaceReferences` (all of one
+    source's references at once, in order, at most
+    `OBJECT_REFERENCES_MAX_PER_SOURCE`, kinds checked against the registry
+    (a source may also be core's `message`), in
+    the module's own transaction), `referencesOfSource` and
+    `deleteReferencesOfSource`; the closed-server purge deletes a server's rows
+    by `server_id`. See "Links in content";
   - `platform/activity`: people's Activity rows (core's
     `object_inbox_states`): `markObjectRead` (a person's read position moved,
     reported in the transaction that moves it: `apiCommon.ts`
@@ -108,6 +124,8 @@ checks imports:
     `objectActivityPeople`, of those who can't see it there) and
     `announceObjectEvents` (after the commit of a comment, an edit or a
     version: `activity:changed` to the people it is for);
+  - `platform/objectWatch`: open pages watching an Artifact live
+    (`announceObjectChanged`, `forgetObjectWatchers`; see "Live pages");
   - `platform/session`: `signedIn` (users and session families, as
     `verifyActiveAccessToken`);
   - `platform/searchTokenizer`: the platform's search tokenizer, for the
@@ -166,7 +184,9 @@ checks imports:
     pushed), `channelAnnouncementPushRefusal` (while it is a channel's
     announcement, publish.ts refuses a push, a new version or title, by an
     agent without editChannelMetadata on that channel: 403
-    `CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN`, asked before anything is stored
+    `CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN`, or
+    `CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN_ELSEWHERE` naming no channel when it
+    is a joint the agent's server has no copy of, asked before anything is stored
     and again under the item lock; `announcement.ts`
     channelAnnouncementPushRefused) and `clearChannelAnnouncementsOf` (manage.ts: delete, widen and a
     narrowing out of the channel clear it in their transaction). Core reads
@@ -219,10 +239,25 @@ checks imports:
     deletedBy, deletedAt }`, `deletedBy` the audit's `deleted` row shown as a
     card's author: no id outside an anyone-with-the-link Artifact's server); nothing of its
     content, versions, files, comments or home;
+  - `linkId` (`webCards.ts` `artifactIdOfLink`; core's check of a saved
+    profile description's links, `services/profileDescriptionLinks.ts`,
+    #457): the id a link names (`parseArtifactRef` on `appHosts()`, as
+    message cards read links: the short link, `/s/<slug>/artifacts/<id>`,
+    the redirect host, the content origin), its `/v/<n>` dropped; a link by
+    name, an old per-version link or any other address names none. Core
+    then asks `homes` and decides by its own rules;
+  - `linkedInMessage` (`linkOrigin.ts` `recordLinkOrigins`; core's
+    `services/firstPartyAppMessageLinks.ts`): the Artifacts a new message's
+    links name (by `linkId`), after its send committed: the message becomes
+    the original message (`link`) of those in its home conversation that have
+    none (see "Original message");
   - `system.artifacts`: its notices' schema (shared `artifactAgentNoticeSchema`,
     which `AgentMessage.app_event` is checked by) and its delivery guard
     (`artifactNoticeDeliveryVerdicts`; required, since the app sends
     notices);
+  - `watch` (`live.ts` `watchArtifact`; core's socket `object:watch`,
+    `socket/objectWatch.ts`): whether the socket's person reads an Artifact
+    now and which parts (see "Live pages");
   - the routes (`mount.ts`): the agent API's (core's
     `routes/internalAgentApi.ts` validates, runs and writes them, and
     charges every write to core's agent write budgets, per agent and per
@@ -297,6 +332,11 @@ and reaches core data through the platform entry points.
 
 ## Files
 
+- `live.ts`: open pages kept up to date ("Live pages"): `watchArtifact`
+  (the registration's `watch`), `announceArtifactChanged` and
+  `forgetArtifactWatchers`. Guard: `live.api.test.ts` (and core's
+  `socket/objectWatch.test.ts`).
+
 - `schema.ts`: the `app_artifacts` tables. `drizzle.config.ts` lists it next
   to `src/db/schema.ts`; migrations stay in `packages/server/drizzle/`.
   Deploy note: `drizzle.config.ts` is config-coupled
@@ -370,7 +410,13 @@ and reaches core data through the platform entry points.
   rows, the object event and the follow are the person's, and the
   unseen-comments hold is the assistant's (its read position, comments by
   anyone but it, the owner's too; Tenny, option 2): the owner's read
-  position and Activity never move. The assistant isn't told of its own push
+  position and Activity never move. Its caller doesn't show a hold's
+  comments (the assistant's route strips them), so a hold moves no read
+  position there (`holdMovesReadPosition: false`); by the same precedent a
+  Settled hold (409 `SETTLED`, #334) names no settler there
+  (`holdNamesSettler: false`, Tenny on #15649): it says the Artifact was
+  settled on which day at which version, and the same request again still
+  goes through (the hold is recorded for the assistant, the reader). The assistant isn't told of its own push
   (the notices' `except`), no upgrade card is offered on a quota refusal,
   and the answer names the home by id (`apiCommon.ts` `summarizeForPerson`,
   never an agent's names for conversations). A new Artifact is marked with the assistant
@@ -412,8 +458,11 @@ and reaches core data through the platform entry points.
   - After the commit, when the entry is a page, the answer's optional
     `warnings` name the pages that hold themselves to one screen
     (`scroll-lock`, task #71) and the pages with frames or plugins of their
-    own, which never load in Raft's frame (`nested-frame`, 2026-11-01)
-    (`scrollLock.ts`): Porthole's `lintFiles` scroll-lock and nested-frame
+    own, which never load in Raft's frame (`nested-frame`, 2026-11-01),
+    and the pages with a `<form>`, which never submits in Raft's frame (no
+    `allow-forms`; some browsers fire no submit event, so a submit button
+    does nothing: `form`, #triage:9199f0bd)
+    (`scrollLock.ts`): Porthole's `lintFiles` scroll-lock, nested-frame and form
     rules (P106/P110; `@botiverse/porthole` at the content Worker's version)
     over the pages it reads (the entry and 7 more) and the stylesheets they
     link or import, from the request's inline bytes, else storage; at most
@@ -619,7 +668,11 @@ and reaches core data through the platform entry points.
   `PUT|DELETE …/:artifact/subscription`. Its header lists the checks in order:
   who may comment (an agent of the Artifact's server, else 403 `FORBIDDEN`),
   the request (`body` ≤ 8000 characters, `anchor` ≤ 4 KiB and only with a
-  `path`, `replyTo` a live comment whose file and place a reply without
+  `path`; an `annotation` anchor's `context`, Porthole P152's section, kept
+  cleaned and within Porthole's limits when well formed and left out
+  otherwise, never refused (shared `artifactAnchorContext.ts`; the web's
+  comments and drafts the same, `webCommentAnchorSchema`), and over 4 KiB given up before
+  the anchor is refused: the region, then the headings from the top; `replyTo` a live comment whose file and place a reply without
   `path` takes, `version` default the current one and having the file),
   `@name`s, then one transaction with the item row locked: the hold
   (freshness v2 §2.2: a comment on `path` X is held by others' new comments
@@ -654,6 +707,38 @@ and reaches core data through the platform entry points.
     `following: false` and writes nothing. People follow the same way (the
     web API); a person hears through their Activity (S6), an agent through
     the notices below.
+- `settle.ts`, `settledState.ts`, `settleRoutes.ts`: Settled (#334, flag
+  `artifact_settled_v0`, evaluated on the Artifact's own server). Whoever may
+  comment on an Artifact (sees it, may write to it, takes part in it) may mark
+  it Settled at its current version and take it back to Working: the agent
+  API's `POST …/:artifact/settle | unsettle` and the web's `POST | DELETE
+  /:id/settle`, both through settle.ts changeSettlement (flag off: 404
+  `SETTLED_NOT_AVAILABLE`, after visibility; already so: `changed: false`,
+  nothing written). The state is on the item (`settled_*`, all or none, and
+  `settled_lapsed_version`); settledState.ts reads it (`settledOf`, the settle
+  that stands; `reopenedOf`, Working again after a new version, with the
+  settle it ended) for the readers, which show it only while the flag is on
+  and to a reader that isn't an outsider (cards' and agent summaries'
+  `settled` and `reopened`, absent otherwise; never the signed-out page). In
+  one transaction under the item lock: the columns, the object event
+  (`settled` / `unsettled`, for its following people recorded read: core's
+  ObjectEventRecipient `read` moves their Activity row without an unread, a
+  Done row stays Done), the settler's follow (as commenting), the settler's
+  `settled_holds` row (its own next push isn't held), and notices to its
+  following agents and its agent author (`settlement`, queued and never
+  pushed: a status change wakes no one). A new version (publish.ts step 6)
+  sets `settled_lapsed_version`, and, while the flag is on, its event's
+  `wasSettled` and the answer's (Activity's target shows it only while the
+  flag is on too); an unsettle with only a lapsed settle left clears it
+  quietly (`changed: true`, no event, no notice: it was Working already); a
+  settle notice to an agent author that doesn't follow it has no "stop"
+  clause; a push that
+  would make one is held first (step 4: 409 `SETTLED`, the hold writes the
+  reader's `settled_holds` row so the same request again goes through; a new
+  settle has another `settled_at` and holds again). Comments, resolves,
+  renames and a push that changes nothing leave the state alone. Guard:
+  `settle.api.test.ts`, core's `firstPartyApps.test.ts` (read recipients),
+  shared `agentText/artifacts.test.ts`.
 - `resolutions.ts`: resolving comment threads (#proj-workspace:#249), the one
   rule behind the agent API's `POST …/:artifact/comments/:comment/resolve |
   reopen` (`artifactCommentResolve`, `artifactCommentReopen`; comments.ts)
@@ -820,7 +905,9 @@ and reaches core data through the platform entry points.
   /api/artifacts/:id/takedown { reason }` and `/restore { reason }` (web,
   the writes' 60 a minute; no agent route): the owners and admins of the
   Artifact's own server only (`mayManageArtifact "moderate"`, never its
-  author or an agent's manager as such), without having to see it; anyone
+  author or an agent's manager as such), without having to see it; for a
+  closed server's Artifact kept in a joint, the joint channel's managers on
+  its host instead (takedown and restore only, "Who sees what"); anyone
   else 403 if they see it, else the one 404. A Raft operator runs the same
   functions through `scripts/artifacts-takedown.ts` (`pnpm
   db:artifacts-takedown`, the server's `DATABASE_URL`) as the ops actor
@@ -1105,7 +1192,10 @@ and reaches core data through the platform entry points.
     author); `savedFrom` only when
     the reader can see the message's conversation, `platform/attachments`
     `attachmentSource`; `origin`, the original message, by the same rule:
-    see "Original message"). Opening the current
+    see "Original message"; `unseenAtOpen`, on this route's answer and `details`:
+    what was new to the reader before this open, `webCards.ts`
+    `viewerUnseenOf`, the old read position read in the move's own
+    statement, a reader with none yet past nothing). Opening the current
     version moves the reader's read position to the end (a person's viewer
     shows the comments whole; an agent's read moves only over what it shows
     whole, see "What an agent has seen").
@@ -1223,7 +1313,9 @@ and reaches core data through the platform entry points.
     creator), the owners and admins of the Artifact's own server, each while
     standing in it; an author who left hands it to the owners and admins;
     another server (a joint conversation's other side, its owners and admins
-    included, or an anyone-with-the-link Artifact's outside reader) never may. Moving shows
+    included, or an anyone-with-the-link Artifact's outside reader) never may
+    (a closed server's Artifact kept in a joint too: its host's channel
+    managers only take it down, "Who sees what"). Moving shows
     it to more people, so it needs a non-guest member or a live agent: a
     guest may delete their own Artifact, never widen it (403, and the
     viewer's `changeHome` is false for them). Moving also needs seeing it now
@@ -1536,6 +1628,15 @@ and reaches core data through the platform entry points.
     ARTIFACTS_NOT_ENABLED with `details.serverSlug`, so the web shows that
     server's "not on" page. Reads
     only. 120 a minute per user (`locate`). Guard: `locate.api.test.ts`.
+  - `linkTargets.ts`: `GET /:id/links?version=` (ArtifactWebLinks) and the
+    signed-out `GET /api/public/artifacts/:id/links` (publicRoutes.ts): a
+    version's links to other Artifacts and what each names for the reader
+    (below, "Links in content"). 120 a minute per user (`links`), 60 per
+    client address (`public.links`). Guard: `links.api.test.ts`.
+  - `backlinks.ts`: `GET /:id/backlinks` (ArtifactWebBacklinks), what links
+    to the Artifact for the reader ("Linked from", below, "Links in
+    content"). Signed in only. 120 a minute per user (`backlinks`). Guard:
+    `backlinks.api.test.ts`.
   - `webOpen.ts`: `GET /:id/open` (ArtifactWebOpen `{ opensIn, viewer }`),
     the standalone page's one call in place of `/auth/me`, `/servers`,
     `locate` and the viewer in turn. Core's account route
@@ -1738,7 +1839,7 @@ and reaches core data through the platform entry points.
   `details.upgradeHint`, which the CLI shows as the next action, followed by
   the refusal's own way on; without it the next action is the billing line
   (say why nothing was stored; a server owner can look at Settings >
-  Billing). No card for an Artifact homed in the whole server or public, for
+  Plan & billing). No card for an Artifact homed in the whole server or public, for
   the raw upload (`PUT uploads/:sha256` names no Artifact: a push's declare
   step refuses first, so the upload's refusal is only the backstop), or
   for an agent's import (no released client imports any more). Other
@@ -2060,16 +2161,17 @@ there is skipped by id, nothing moves. JSON on stdout (`mode:
 
 | Table | Holds |
 |---|---|
-| `items` | One Artifact (`pt_…` id, `url_key`, names, current version) and its one home: `home_kind` conversation (with `home_channel_id`, a top-level conversation; NULL once that channel is hard-deleted: an orphan), server, or public (anyone with the link); its original message (`origin_message_id`, `origin_via`; see "Original message"); its original conversation (`original_home_channel_id`, no foreign key; see "Original conversation"); the personal assistant that published it (`published_by_assistant_agent_id`, set when made, null for every other Artifact; `publishAs.ts`) |
-| `versions` | Immutable versions, numbered per item; a Markdown version's `excerpt` and `excerpt_blocks`, what its card shows (`excerpt.ts`, `excerptBlocks.ts`) |
+| `items` | One Artifact (`pt_…` id, `url_key`, names, current version) and its one home: `home_kind` conversation (with `home_channel_id`, a top-level conversation; NULL once that channel is hard-deleted: an orphan), server, or public (anyone with the link); its original message (`origin_message_id`, `origin_via`; see "Original message"); its original conversation (`original_home_channel_id`, no foreign key; see "Original conversation"); the personal assistant that published it (`published_by_assistant_agent_id`, set when made, null for every other Artifact; `publishAs.ts`); Settled (#334, `settle.ts`): `settled_at`, `settled_by_type`, `settled_by_id`, `settled_version_number` (all or none, CHECK `items_settled`) and `settled_lapsed_version`, the version that took it back to Working (only with a settle, CHECK `items_settled_lapsed`) |
+| `versions` | Immutable versions, numbered per item; a Markdown version's `excerpt` and `excerpt_blocks`, what its card shows (`excerpt.ts`, `excerptBlocks.ts`); `references_extractor`, the mark of the one version whose links core's `object_references` holds (see "Links in content") |
 | `version_files` | The files of a version, each pointing at a blob |
 | `version_texts` | A public Artifact's version's readable text as the signed-out `meta` and `index.md` answer it (`publicText.ts`): description, body (at most 200 KB), truncated, the entry's `kind` and the `extractor` it was made with; one row per version, going with it (`ON DELETE CASCADE`) |
 | `version_checks` | A version's publish check (task #130, `checks.ts`): status, skip reason, the screenshots' core object file ids (only the newest three versions of an Artifact keep them), findings, error class; one row per version, going with it (`ON DELETE CASCADE`); deleted with its Artifact, and by the hourly sweep for a deleted server, objects after rows |
 | `blobs` | Content-addressed bytes in R2 (`r2_key`), one row per server and sha256 |
 | `comments` | Comments on the Artifact, each on a version, optionally on a path and anchor; a thread's root carries its resolution (`resolved_at`, `resolved_by_type`, `resolved_by_id`: all or none, roots only, CHECK `comments_resolution`) |
-| `audit` | Home changes, turning on link sharing, deletion, import (`import.ts`: one row per import, `after.legacyArtifactId` and `after.legacyCreator`; the per-server move's by the ops actor, with `after.ops.operator`), old comments copied (`legacyComments.ts`: `import_comments`, by the ops actor, `after: { legacyArtifactId, comments, ops, approvedBy?, approvalRef? }`), takedown and restore (`takedown.ts`: `taken_down` / `restored` with `after.reason`; an operator's by the moderation ops actor `ARTIFACT_OPS_MODERATION_ACTOR`, with `after.ops.operator`) |
+| `audit` | Home changes, turning on link sharing, deletion, import (`import.ts`: one row per import, `after.legacyArtifactId` and `after.legacyCreator`; the per-server move's by the ops actor, with `after.ops.operator`), old comments copied (`legacyComments.ts`: `import_comments`, by the ops actor, `after: { legacyArtifactId, comments, ops, approvedBy?, approvalRef? }`), takedown and restore (`takedown.ts`: `taken_down` / `restored` with `after.reason`; an operator's by the moderation ops actor `ARTIFACT_OPS_MODERATION_ACTOR`, with `after.ops.operator`; a closed server's kept Artifact's by a joint manager on its host, with `after.joint_manager { server_id, channel_id }`) |
 | `attachment_saves` | Which Artifact an attachment was saved as (goes with the attachment: `ON DELETE CASCADE`) |
 | `read_positions` | How far each user or agent has looked, as an item position (only moves forward) |
+| `settled_holds` | Who a held push told that an Artifact is Settled (#334, `settle.ts`): one row per Artifact and actor (a push's reader), the `settled_at` of the settle it was told of; a push isn't held again for that settle (goes with its item: `ON DELETE CASCADE`) |
 | `subscriptions` | Who follows an Artifact and how it came to (`published`, `commented`, `followed`); `unsubscribed_at` is a sticky stop |
 | `pending_notices` | Legacy (#55): followers' comment notices that collected for two minutes (one row per Artifact and agent, the comment ids, when it is due); nothing writes it now, the flush job drains what is left; drop both once none can remain |
 | `comment_drafts` | A person's review drafts (S8): author, item, version number, path and anchor, the body's parts as sent; 30 days after `updated_at` they are gone |
@@ -2150,8 +2252,28 @@ An Artifact records the message through which it entered a conversation
   (`UPDATE … WHERE origin_via IS NULL`). A retry's replay posted nothing and
   sets nothing; an Artifact saved from an attachment, or shared before, keeps
   its own.
-- A link in an ordinary message (`link`): later, through a platform hook;
-  nothing writes it yet.
+- Linked in an ordinary message (`linkOrigin.ts`, the registration's
+  `linkedInMessage`, `platform/apps` AppObjectKind; core's
+  `services/firstPartyAppMessageLinks.ts`, called by `messageService`
+  `broadcastAndDeliver` after a new chat message of a person or an agent
+  committed, never awaited by the send): when it has none yet, the first
+  message in its home conversation, at its top level or in one of its
+  threads, whose visible links name it (as the message's cards read them:
+  shared `messageVisibleLinks`, bare or with words, the first ten object
+  links; `artifactIdOfLink`: the app hosts, the redirect host, the content
+  origin), `link`. Only a live Artifact with a conversation home, of the
+  server the message was posted through; the message where its author reads
+  it (`platform/messages` `messageSource`, a thread reply's or task
+  conversation's parent, a joint's by that server's projection, or the
+  joint's canonical channel, `platform/conversations` `conversationHome`: a
+  save homes it at the projection, a push at the canonical channel) is that home;
+  and the author can see the Artifact (`canViewArtifacts`). Never a message
+  in another conversation (a DM that isn't its home included), an edit, an
+  idempotent replay, or a share's own message (`postedByApp`: the share
+  records it as `share`). One conditional UPDATE (`WHERE origin_via IS NULL
+  AND origin_message_id IS NULL`, the home rechecked): of two messages racing,
+  the first update to commit wins. Best effort: a failure is logged and the
+  send stands. Existing Artifacts are not backfilled.
 - Never moved: neither column changes once set. No foreign key to
   `messages` (Tenny, review of #11613): a message core deletes leaves the id
   dangling, never shown (`messageSource` finds no message), and the Artifact
@@ -2173,8 +2295,11 @@ An Artifact records the message through which it entered a conversation
   `#channel:<root short id>`; `messageId`; `via`).
 - The migration (`artifact_origin_message`) backfilled saved Artifacts from
   their earliest `attachment_saves` row's message.
-- Guards: `share.api.test.ts` ("origin: …"), `saveAgent.api.test.ts` (the
-  agent read), `schema.db.test.ts` (constraints, the delete, the backfill).
+- Migration `artifact_origin_via_link` (app_artifacts only): the
+  `items_origin_via` CHECK takes `link`.
+- Guards: `share.api.test.ts` ("origin: …"), `linkOrigin.api.test.ts` (a
+  link in a message), `saveAgent.api.test.ts` (the agent read),
+  `schema.db.test.ts` (constraints, the delete, the backfill).
 
 ## Who sees what
 
@@ -2242,8 +2367,8 @@ Each server names the home by its own projection (`conversationNames`,
 `agentConversationRefs`). A thread or another server's channel is never a
 home, nor is a joint's thread or task conversation (a joint record too,
 whose projections are not `joint` channels): such an item is visible to
-nobody. S1's write paths reject them. Whoever takes part in the item keeps a
-read position on it (web viewer, agent read and comments; an agent's comment
+nobody. S1's write paths reject them. Whoever takes part in the item, or reads a
+closed server's kept one, keeps a read position on it (web viewer, agent read and comments; an agent's comment
 is held by it), the joint's members of another server too (Tenny on #68, in
 place of F5's "no peer read positions"); an outsider of a public item writes
 none.
@@ -2254,25 +2379,87 @@ both the reader's server and the item's own server (Tenny's decision on the
 joint review's F2): a joint's Artifact is seen across servers only while
 both have Artifacts on, and so is another server's anyone-with-the-link one. A reader
 whose server has it off is refused (403 ARTIFACTS_NOT_ENABLED; the Worker's
-`not-visible`; every summary `unavailable`, drawn as a plain link). An item whose own server was soft-deleted is read by no one, whatever its
-flag (`apiCommon.itemServerEnabled`, `platform/flags`
-`appEnabledOnLiveServer`; core's summaries likewise). Writing
+`not-visible`; every summary `unavailable`, drawn as a plain link). Writing
 follows the writer's server's flag. Lists (the dashboard, a conversation's
 Artifacts, search, the agent list) are behind the reader's server's flag, and keep another server's
 joint item only while its own server has the flag on (`platform/visibility`
 `visibleHomes`, asked for the app's flag).
 
+A closed server (`servers.deleted_at`) acts no more: nobody signs in to it,
+none of its agents calls the API. Its Artifacts are read by no one, whatever
+their flag, with one exception (Warden for RBAC, Tenny for the architecture,
+after the purge kept them, #15248): an item homed in a channel the
+closed-server purge keeps for the apps (`services/closedServerKeptChannels.ts`
+`keptChannelsOf` `apps`, the one rule both ask: the storage channel of a joint
+the server is still in, an active projection, since closing doesn't
+disconnect it; the server's own copy of such a joint; and what is under them,
+never under a copy it has left; `purge.db.test.ts` pins both on the same
+Artifacts) is kept by the purge (`purge.ts`), and the
+joint's members on live servers read it exactly as while its server was
+live (the viewer, its files, versions and comments, the content Worker,
+core's summaries and Activity rows, lists, search, the agent API's reads),
+read-only (who reads it is still `canViewHomes`'s: one homed in a thread or
+task conversation is no home, read by nobody, as on a live server). A reader keeps its own state on it as on a live one: opening or
+reading it moves its read position and reads its Activity row, Done works,
+and it may stop following it (`apiCommon.keepsOwnStateOn`: `takesPartIn`'s
+rule asked for `read`; web and agent unfollow resolve it as a read). One
+predicate answers it everywhere: `platform/visibility`
+`closedServerJointObjects`, inside `objectServersAnswer` (`read`: live, or
+closed and kept; `write`: live only), which `apiCommon.itemsReadable`
+(every read of one item), `visibleHomes` (lists and search: a closed server
+still in a joint is one of its participants), `seenThroughJoint` (Activity
+rows ask it for `read`, `takesPartIn` and the `@` audience for `write`) and
+core's summaries, object files and profile links ask. Who among them sees
+it is still `canViewHomes`; nobody else ever does. Every write (a version, a
+comment or reply, a review, a resolve, a new follow, a rename, a
+move, a share, a delete, a takedown but as below; and the write-side reads that prepare
+one: `@` candidates, who a comment would notify, review drafts, the share
+audience, the narrowing preview) is refused with one 403 FORBIDDEN and one
+sentence (`apiCommon.CLOSED_SERVER_READ_ONLY_ERROR`): the web's
+`visibleItemFor`, the agent API's `resolveVisibleItem(…, "write")` (every
+caller says `read` or `write`), and the delete and takedown refusals of
+`manage.ts` and `takedown.ts`, which resolve the item themselves. A publish
+check never runs for it (`checkTask.ts`, `contentRoutes.ts` decideCheck:
+`itemWritable`). Nobody is told of it any more (no event happens; the
+recipients' and notices' rule, `jointViewersOf`, `takesPartIn`, is the
+`write` one). Its own server's people can't act, so it is moderated by
+whoever manages the place it is shown (Tenny for the architecture, Warden
+for RBAC): the people who manage the joint channel from its host, a host
+owner or admin or the host's appointed channel manager while in the channel
+(`takedown.ts` moderatorOf, over `platform/visibility`
+`closedServerJointObjectManagedBy`, which asks the actor's own server's
+active copy of the joint and `lib/channelActorPermissions`
+`managesJointChannel`, `jointAuthorityManagesChannel`'s rule: the roster's
+managers), may take it down and restore it (Tenny: takedown and restore
+only), which hides it from, or shows it again to, every participant; the
+audit row names their host server and its copy (`after.joint_manager {
+server_id, channel_id }`). Nobody else: another participant's owners,
+admins or appointed channel managers, a plain member, and any agent (a
+takedown is a person's) get the read-only 403; whoever doesn't see it the
+one 404. Every other write stays the 403, for them too, a delete included
+(the viewer offers none). Removing one for good stays a Raft operator's
+(the takedown script's `purge`, `purgeArtifact`), who is also the fallback
+for a takedown, the only one when the host is the closed server itself.
+Guard: `closedServerJoint.api.test.ts` (the moderation test). A joint the closed server
+shares has no channel announcement on any side
+(`services/channelAnnouncements.ts` `jointsWithoutAnnouncements`: the
+closed server's app reads as off). Once its copy is disconnected (or the
+joint closes) the item is an orphan of the closed server, read by no one.
+Guard: `closedServerJoint.api.test.ts`.
+
 Signed-out visitors (`publicRoutes.ts`, `/api/public/artifacts/*`, mounted
 by core's signed-out app mount with no auth; contract
 `packages/shared/src/publicArtifactsContract.ts`) see a live anyone-with-the-link item
-whose own server still exists and has the flag on (`canViewArtifactsAnonymously`, over
+whose own server still exists (a closed server's never: only one in a joint is kept readable) and has the flag on (`canViewArtifactsAnonymously`, over
 `platform/visibility` `canViewHomesAnonymously`), its current version only:
 title, kind, version number and time, and an anonymous content frame; for AI
 tools and link previews also the version as Markdown (`index.md`, listing its
 files, and in words where each one is), each file to download (`files/<path>`, also `<path>`
 without `files/` as an AI tool guesses it; an attachment that never
-renders on the API's origin), all of them as one zip (`download.zip`) and a
-preview's fields (`meta`); never an author, server or viewer, and nothing
+renders on the API's origin), all of them as one zip (`download.zip`), a
+preview's fields (`meta`) and its links to other Artifacts (`links`, each
+target named only when it is itself one they may view: "Links in content");
+never an author, server or viewer, and nothing
 cached (`private, no-store`). `index.md` and `meta` read the entry's text
 from `version_texts` (`publicText.ts`: written after a push to a public
 Artifact or once it is made public, else by the first signed-out view that
@@ -2328,6 +2515,197 @@ isn't in that conversation" was the result).
   conversation home its `audit` rows record (`before.home_kind`
   conversation, ordered by `created_at`, `id`); none recorded: null. Guard:
   `schema.db.test.ts`.
+
+## Live pages
+
+An open Artifact page shows others' comments and new versions without a
+reload, whether or not its reader follows the Artifact or is mentioned
+(`activity:changed` reaches only an event's recipients, and only the main
+layout handles it). Core's object watch (shared `objectWatch.ts`):
+
+- The web watches (`object:watch { kind: "artifact", id }`, its `pt_` id or
+  short id) while a viewer is open, again after every reconnect, and
+  unwatches when it closes (web `objects/objectWatch.ts`, used by the comment
+  list's refresh, `useArtifactActivityRefresh.ts`, and the newer-version
+  check, `artifactSource.ts` `useArtifactNewerVersion`). Core asks
+  `watchArtifact` as the socket's person in the socket's server: the
+  viewer's own read rule (`webCommon` `readableItemFor`: the deployment's
+  Artifacts on, `canViewArtifacts`, `itemReadable`; the one refusal for
+  everything else), and joins the socket to `object-watch:artifact:<id>:comments`
+  only when the comment list would list comments to them (`apiCommon`
+  `accessOf`: an outsider of a public Artifact reads none) and to
+  `…:version` always. A socket of no server, a refusal or a failed read joins
+  nothing. At most 20 Artifacts per socket and 60 watch requests a minute
+  (`OBJECT_WATCH_MAX_PER_SOCKET`, `OBJECT_WATCH_MAX_PER_MINUTE`).
+- After the commit of every change the viewer shows, beside its
+  `activity:changed` where it has one, `announceArtifactChanged` sends
+  `object:changed { kind, id, part }` (no content) to that part's room
+  through the socket server's adapter (Redis across replicas): `comments`
+  for a comment written (web, agent API, a resolve's note), edited or
+  deleted (web), a thread resolved or reopened (only when it changed), a
+  review submitted; `version` for a new version (`publish.ts`, a person's
+  publish through their assistant too). A held write (`UNSEEN_CHANGES`)
+  writes nothing and sends nothing. The page reads the part again through
+  its ordinary reads (comments: the list; version: the latest card), and
+  does both after a reconnect, since pings may have been missed.
+- After the commit of a delete, a narrowing or an unpublish (`manage.ts`),
+  `forgetArtifactWatchers` takes every socket out of the Artifact's rooms;
+  a page still open joins again only when it next watches (its next mount or
+  reconnect), checked again. Losing sight of it any other way is core's: a
+  person removed from (or leaving) its channel or its server, a role change,
+  a channel made private, a joint ending all close that person's sockets
+  (all of them, or that server's) after the commit (`socket/accessRevocation.ts` `revokeSocketAccess`, on
+  every replica), and the rooms go with them; the web reconnects and watches
+  again, checked again. Agents have no sockets, so watch nothing. Still not
+  covered: a public channel converted to a joint one takes those who lose it
+  out of its channel rooms only (`channelConversionAudience.ts`), so a socket
+  of theirs stays in its Artifacts' rooms until it unwatches or disconnects:
+  it then still hears that something changed, never what (the id it already
+  had, the part, the time).
+- The Artifact's own page (`/artifacts/:id`, outside the main layout, so no
+  realtime bridge) connects the web's one socket for the server it opened in
+  (`ArtifactStandalonePage`, `useStandaloneObjectWatchSocket`), only while
+  a viewer watches; a public Artifact read as an outsider there, and a
+  signed-out reader, have no socket.
+- Not pinged: a rename (the viewer's title), a widening, presence.
+
+## Links in content
+
+An Artifact's links to other Artifacts (#proj-workspace:#336, step 1 of
+"links show the linked Artifact's live title"; Tenny's design): stored so the
+viewer can ask which Artifacts a version links to and what each is now (the
+read route, below), and later an Artifact which link to it (backlinks),
+without reading the page's DOM.
+
+- Where: core's `object_references` (`platform/references`), one row per link:
+  source `artifact` / the item id, target `artifact` / the id the link names,
+  `target_detail` `{ version, href, bare, path }` (the pinned `/v/<n>` or null,
+  the WHATWG href, whether the link's text is its own address: the only links
+  the viewer relabels, the file it is in). No text of the page is stored.
+- Which links (`contentLinks.ts`, pure): in the version's Markdown and HTML
+  files, the absolute links shared `parseArtifactRef` reads as an Artifact id on
+  this deployment's hosts (`platform/links` `appHosts`, as message cards read
+  them): never another host, a look-alike one, a relative link, a link by name,
+  or the Artifact itself. HTML: `<a href>` / `<area href>` (`readableText.ts`
+  `htmlLinks`, none in comments, scripts, styles, templates). Markdown: inline,
+  reference, auto and literal links and raw `<a href>`, none in code, comments
+  or script-like elements; not a CommonMark parser (linear on hostile input,
+  #proj-workspace:#218), so a link is read within one line. Once per file and
+  address, entry first then by path, at most 200 a version.
+- Only the current version's (`references.ts`): read after the commit of a
+  push (inline bytes where it brought them, beside its warnings and excerpt),
+  a save, an import and a restore, outside any transaction, waited for at most
+  1.5 s, never failing the request; written in one short transaction only
+  while that version is still current and the Artifact live, replacing the
+  last version's rows, and marked on the version (`versions.references_extractor`
+  = `CONTENT_LINKS_EXTRACTOR`; only that version keeps a mark). Size caps (2
+  MiB of each file, 8 MiB and 64 files a version) store what was read; a file
+  that can't be read now or isn't read in time writes nothing (the next ask
+  tries again, with 5 s). A file's parse is linear, so its 2 MiB is its time
+  limit.
+- `ensureArtifactReferences` fills the current version when it has no mark of
+  this extractor (published before, or an extractor bump): lazily, when the
+  read route asks, and from the backfill
+  (`scripts/backfill-artifact-references.ts`, `db:backfill-artifact-references`:
+  live Artifacts without the mark, four at a time, resumable; not against
+  production without a human's confirmation of the run, `--dry-run` first). An older version has no rows: its links are
+  read on the fly (`extractVersionLinks`, stores nothing).
+- Read (`linkTargets.ts`; contract `artifactWebPaths.links`,
+  `artifactPublicPaths.links`): `GET /api/artifacts/:id/links?version=`, the
+  source and the version as the viewer reads them (readableItemFor, then
+  shownVersionOf: the flag's 403, the one 404, 400 INVALID_REQUEST, 404
+  VERSION_NOT_FOUND); signed out `GET /api/public/artifacts/:id/links`, the
+  current version of an Artifact publicItemOf passes (else the one 404). The
+  current version's links are the rows, filled first when unmarked, read with
+  the version's mark in one snapshot (a push since reads it as an older
+  version); an older one's are read from its files, one read per version at a
+  time in a process. Not readable now: 503 CONTENT_UNAVAILABLE. Each link:
+  `href` (as stored: the viewer matches the page's links by it), `path`,
+  `bare`, the target `id`, its pinned `version` or null, and `target`, decided
+  for this reader at each ask in a constant number of queries (the targets'
+  rows, one batched visibility check, their versions, deletes on record):
+  - signed in: `ok` (live title, the kind of the version the link opens, and
+    for a pinned link `versionExists`, as shownVersionOf reads it: an
+    outsider of a public target only its current one) exactly when opening
+    it would answer (canViewArtifacts and itemsReadable, as readableItemFor)
+    and it has a published current version (a card's rule); `deleted` exactly
+    when a message card for it is the deleted card (core's
+    `objectSummaries.ts` deletedSummaries over `deletedArtifactHomes`, and
+    `summarizeDeletedArtifacts`): deleted, never revoked, seen on the home it
+    had (a public one read as its own server's, `visibility.ts`
+    homeWhenDeleted; asked with the live ones in one canViewHomes call,
+    `artifactSight`), its server answering for it there, its delete on
+    record; only the state, never its title, who or when. The viewer, open
+    and locate still answer it the one 404.
+  - signed out: `ok` only for a target publicItemOf's checks pass (public,
+    live, a published current version, its server's flag), a pinned version
+    existing only as that current one; never `deleted`.
+  - anything else `unavailable`, one answer for every reason (one the reader
+    can't see and one that doesn't exist alike). Reads only; `private,
+    no-store` like every answer, so a rename shows at once. 120 a minute per
+    user, 60 per client address signed out.
+  - `authorSees` on each link: whether the version's publisher
+    (`versions.publisher_type`/`publisher_id`, read in the source's server)
+    sees the target now, by the same `artifactSight` (live and seen, or
+    deleted and seen on the home it had), and only while its account is there
+    (`platform/actors` actorProfiles: a public home answers yes to anyone).
+    The page's scripts are its author's and read every label, so the web
+    labels no other link (Tenny). Two lookups more, beside the reader's, however
+    many links. Signed out, true for every link (what a visitor is shown is
+    public).
+- Messages are sources too (#336 step 2; core's
+  `services/messageReferences.ts`, docs/development/first-party-apps.md
+  "Object references"): a chat message's visible links that `linkId` reads as
+  an Artifact are rows with source `message` / the message id, target
+  `artifact`, `target_detail` `{ href, bare }`, written after the message's
+  commit (a send, an edit, a card update; deleted with a retraction), so an
+  Artifact can later list the messages that link it ("Linked from"). The
+  registration's `linkHosts` (`webCards.ts` `ARTIFACT_LINK_ID_HOSTS`) says
+  where besides the app hosts `artifactIdOfLink` names one.
+- "Linked from" (#336 step 2, part A2; `backlinks.ts`; contract
+  `artifactWebPaths.backlinks`, ArtifactWebBacklinks): `GET
+  /api/artifacts/:id/backlinks`, signed in only, the Artifact read as the
+  viewer reads it (readableItemFor). Two groups, each the newest
+  `ARTIFACT_BACKLINKS_PAGE_LIMIT` (50) with `total` counted after the
+  reader's filters up to `ARTIFACT_BACKLINKS_COUNT_CAP` (1000; `capped` past
+  it):
+  - `documents`: other live Artifacts whose current version links it (rows
+    of source `artifact`, through `platform/references`
+    `sourcesReferencingSql`), a published current version, never itself,
+    only those `visibleArtifactsSql` lets the reader see (in the same
+    statement as the count); newest current version first; as cards
+    (`artifactCards`, the live title).
+  - `discussions`: chat messages that link it, only for a reader inside its
+    server (accessOf `inside`, as the original message), through core's
+    `platform/references` `messageBacklinks` (services/messageBacklinks.ts:
+    message search's visibility, the history window, live messages, a joint
+    by the reader's projection, an excerpt of the text now, a page re-read
+    so a message edited away from the link isn't listed). Known limit: a
+    message whose rows outlived an edit (its write not run yet, or failed)
+    and whose text still names some Raft address, but no longer this
+    Artifact, is still counted (never listed).
+  A constant number of queries however many links. No signed-out route.
+- The agent read's `linkedFrom` (#336 step 2, PR-C; `backlinks.ts`
+  `agentLinkedFromOf`, `routes.ts` read; contract
+  `agentApiArtifactReadResponseSchema.linkedFrom`): the same two groups with
+  the agent as the viewer (`visibleArtifactsSql` and `messageBacklinks` for
+  the agent, its channels through `filterAgentAccessibleChannelIds`;
+  messages only inside the Artifact's server), the newest
+  `AGENT_API_ARTIFACT_READ_LINKED_FROM_SHOWN` (10) of each. A document as
+  `{ id, title }`; a message as `{ target, messageId, author }`, `target` the
+  conversation as the agent names it (`agentConversationRefs`, a thread's
+  reply by its thread target, as `origin`), `author` its sender's handle; one
+  whose conversation the agent can't name is counted, not listed. A personal
+  assistant can't call the read (assistantRouteAllowlist), so no owner's-DM
+  narrowing applies. Shown as `raft artifact read`'s "Linked from" block
+  (shared `agentText/artifacts.ts`). Constant queries too (two lookups more:
+  the names and the handles). Guard: `backlinks.api.test.ts`.
+- Gone with the Artifact: a delete and a takedown remove the rows and clear
+  the marks (a restore reads them again); an operator's purge removes them; a
+  closed server's purge deletes the server's rows by `server_id` (a kept
+  channel's Artifact's too).
+- Counted in `slock_app_operations_total{app="artifacts",operation="references"}`
+  (filled, stale, fill_failed). No flag of its own.
 
 ## Not here yet
 

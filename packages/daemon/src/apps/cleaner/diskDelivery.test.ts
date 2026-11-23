@@ -98,7 +98,7 @@ test("low disk space is traced per owner and reaches only an agent that finished
       delivered.map(({ owner, item, notice }) => [owner, item.notificationClass, notice]),
       [["owner-a", "disk_space_hint", { startStoppedAgent: false, requireIdle: true }]],
     );
-    assert.match(formatAgentInboxAppItems(inboxes.get("owner-a")!.list()), /summary=Disk is low \(36\.0 KiB free\)/);
+    assert.match(formatAgentInboxAppItems(inboxes.get("owner-a")!.list()), /^ {2}"Disk is low \(36\.0 KiB free\)/m);
     assert.equal(inboxes.get("owner-b")?.list().length ?? 0, 0, "an agent that did not work is not asked");
   } finally {
     runtime.stop();
@@ -124,7 +124,7 @@ test("the memory hint asks the production notice path never to start a stopped a
         ["owner-b", "memory_size_hint", { startStoppedAgent: false, requireIdle: true }],
       ],
     );
-    assert.match(formatAgentInboxAppItems(inboxes.get("owner-a")!.list()), /class=memory_size_hint/);
+    assert.match(formatAgentInboxAppItems(inboxes.get("owner-a")!.list()), /^app:system\.cleaner\//m);
   } finally {
     runtime.stop();
     vi.useRealTimers();

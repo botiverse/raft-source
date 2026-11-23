@@ -23,10 +23,13 @@ export type AgentInboxStateMachineMessage = {
   sender_type?: string;
   sender_name?: string;
   sender_description?: string | null;
+  /** Where an outside sender is from (shared AgentSenderOrigin); read through parseAgentSenderOrigin. */
+  sender_origin?: unknown;
   sender_timezone?: string | null;
   senderType?: string;
   senderName?: string;
   senderDescription?: string | null;
+  senderOrigin?: unknown;
   senderTimezone?: string | null;
   content?: string;
   timestamp?: string;
@@ -285,6 +288,7 @@ export function normalizeInboxVisibleMessage(
     sender_type: message.sender_type ?? message.senderType,
     sender_name: message.sender_name ?? message.senderName,
     sender_description: message.sender_description ?? message.senderDescription ?? null,
+    ...((message.sender_origin ?? message.senderOrigin) != null && { sender_origin: message.sender_origin ?? message.senderOrigin }),
     sender_timezone: message.sender_timezone ?? message.senderTimezone ?? null,
   };
   const senderId = messageSenderId(message);

@@ -108,7 +108,7 @@ test("reviewer-isolation task claim uses withheld mode and reprojects poisoned l
     }) as any,
   });
 
-  await taskClaimCommand.handler(ctx, undefined, { target: "#engineering", number: ["7"] });
+  await assert.rejects(async () => { await taskClaimCommand.handler(ctx, undefined, { target: "#engineering", number: ["7"] }); }, (err: unknown) => err instanceof CliError && err.code === "TASK_WRITE_HELD" && err.exitCode === 1);
 
   assert.deepEqual(requests, [{
     channel: "#engineering",
@@ -311,7 +311,7 @@ test("a held claim is counted for the daemon's turn report while passive AX is o
         }),
       }) as any,
     });
-    await taskClaimCommand.handler(ctx, undefined, { target: "#engineering", number: ["7"] });
+    await assert.rejects(async () => { await taskClaimCommand.handler(ctx, undefined, { target: "#engineering", number: ["7"] }); }, (err: unknown) => err instanceof CliError && err.code === "TASK_WRITE_HELD" && err.exitCode === 1);
     const held = stdout.join("");
     assert.match(held, /Your task claim was not applied/);
     assert.deepEqual(readPassiveRenderCountsForTest("agent-1"), [

@@ -393,7 +393,7 @@ export const AGENT_API_ROUTE_MANIFEST = [
     "audience": "both",
     "request": {
       "params": true,
-      "query": false,
+      "query": true,
       "body": false
     },
     "response": {
@@ -752,6 +752,31 @@ export const AGENT_API_ROUTE_MANIFEST = [
     }
   },
   {
+    "key": "channelMemberRole",
+    "method": "POST",
+    "path": "/channels/member-role",
+    "fullPath": "/internal/agent-api/channels/member-role",
+    "client": {
+      "resource": "channels",
+      "method": "setMemberRole"
+    },
+    "capability": "channels",
+    "description": "Make a channel member a channel admin, or a channel admin a plain member, under the bound agent's own authority: it must be a channel admin there, or a server owner or admin who can access the channel. Not its own role, nor a server owner's or admin's.",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
     "key": "channelMembers",
     "method": "GET",
     "path": "/channel-members",
@@ -877,6 +902,81 @@ export const AGENT_API_ROUTE_MANIFEST = [
     }
   },
   {
+    "key": "focus",
+    "method": "POST",
+    "path": "/focus",
+    "fullPath": "/internal/agent-api/focus",
+    "client": {
+      "resource": "focus",
+      "method": "add"
+    },
+    "capability": "channels",
+    "description": "Focus a thread, a DM or a task conversation the bound agent can read (not a plain channel). At most 3 are focused: one more unfocuses the least recently active, those Raft focused by itself before those the agent focused. Focusing a focused one refreshes it. Only on a server with Focus on (flag `agent_focus_v0`); elsewhere 404 `AGENT_FOCUS_DISABLED`.",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "unfocus",
+    "method": "POST",
+    "path": "/unfocus",
+    "fullPath": "/internal/agent-api/unfocus",
+    "client": {
+      "resource": "focus",
+      "method": "remove"
+    },
+    "capability": "channels",
+    "description": "Stop focusing a conversation. Idempotent: `wasFocused` is false when it was not focused.",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "focusList",
+    "method": "GET",
+    "path": "/focus",
+    "fullPath": "/internal/agent-api/focus",
+    "client": {
+      "resource": "focus",
+      "method": "list"
+    },
+    "capability": "channels",
+    "description": "List the conversations the bound agent has in focus, most recently active first.",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
     "key": "inboxList",
     "method": "GET",
     "path": "/inbox/conversations",
@@ -940,6 +1040,31 @@ export const AGENT_API_ROUTE_MANIFEST = [
     "sideEffect": "write",
     "idempotency": "natural",
     "destructive": true,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "inboxRows",
+    "method": "POST",
+    "path": "/inbox/rows",
+    "fullPath": "/internal/agent-api/inbox/rows",
+    "client": {
+      "resource": "inbox",
+      "method": "rows"
+    },
+    "capability": "read",
+    "description": "The `inbox check` rows of the named conversations only (asked by the agent's Computer before a wake-up notice; at most 50 conversations, each by its channel id and the seq of the newest message the asker holds). A conversation is listed when the Server has an unread number for it that already includes that newest message. A named conversation with no row means only that there is no number for it right now (the unread source has not seen the message yet, the agent has nothing unread there, or it can't see it; not told apart): list it without a number, never as nothing unread. `behind` is a diagnostic: how many of the conversations without a row already had one in the unread source, older than that newest message. With `withBehind: true` in the body, every named conversation the unread source has a row for is answered, each with its `activitySeq` (the row counts what is unread up to that seq), the response says `withBehind: true`, a conversation without a row has nothing unread in the source, and `behind` counts every named conversation whose newest message the source has not reached. `otherUnread` is the agent's unread that was not named: `conversations`, `messages` (the sum of their rows' `unread`), `mentions` and `dms` (how many of them have an unread mention, or are DMs). Reads only: no read position moves.",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
     "audience": "both",
     "request": {
       "params": false,
@@ -1061,7 +1186,7 @@ export const AGENT_API_ROUTE_MANIFEST = [
       "method": "publishArtifactAsOwner"
     },
     "capability": "send",
-    "description": "Personal assistants only, and only while your owner has \"send as me\" on: publish an Artifact AS your owner (they are its author) into a conversation they may post in now, named as they name it (home: #channel, dm:@peer, or an id); or a new version of one you published as them (artifact + base, the version you read; no home). The rules of sending as them apply: not your own DM with them (publish there as yourself with owner-artifact), a DM only while they let you read DMs, never a conversation bridged to an external chat. Any home you can't use answers the one TARGET_NOT_FOUND, whatever the reason; joint (shared) channels are not supported yet: a joint as home, or a new version of one homed in a joint, answers not-found too. Raft posts a receipt in your DM with your owner; you needn't tell them. If the answer is UNSEEN_CHANGES, read it with owner-artifact first and send the same publish with seen = the position it returned: the same publish without seen is held again.",
+    "description": "Personal assistants only, and only while your owner has \"send as me\" on: publish an Artifact AS your owner (they are its author) into a conversation they may post in now, named as they name it (home: #channel, dm:@peer, or an id); or a new version of one you published as them (artifact + base, the version you read; no home). The rules of sending as them apply: not your own DM with them (publish there as yourself with owner-artifact), a DM only while they let you read DMs, never a conversation bridged to an external chat. Any home you can't use answers the one TARGET_NOT_FOUND, whatever the reason; a joint (shared) channel as home is not supported yet and answers not-found too; a new version of one homed in a joint goes through your owner's server's copy of it, by these same rules. Raft posts a receipt in your DM with your owner; you needn't tell them. If the answer is UNSEEN_CHANGES, read it with owner-artifact first and send the same publish with seen = the position it returned: the same publish without seen is held again.",
     "sideEffect": "write",
     "idempotency": "none",
     "destructive": false,
@@ -3336,7 +3461,7 @@ export const AGENT_API_ROUTE_MANIFEST = [
       "method": "comments"
     },
     "capability": "read",
-    "description": "List a Workspace Artifact's comments, oldest first, in full: by default those since the agent last looked (moving its read position over what is shown), `all=1` every comment, `path` one file's, `review` one review's (all of them, in order, with the review and its summary).",
+    "description": "List a Workspace Artifact's comments, oldest first, in full: by default those since the agent last looked (moving its read position over what is shown), `all=1` every comment, `path` one file's, `review` one review's (all of them, in order, with the review and its summary), `held` the comments a hold marked seen (its `<seenFrom>..<seen>`, moving nothing).",
     "sideEffect": "read",
     "idempotency": "natural",
     "destructive": false,
@@ -3361,7 +3486,7 @@ export const AGENT_API_ROUTE_MANIFEST = [
       "method": "push"
     },
     "capability": "send",
-    "description": "Push a Workspace Artifact: create one homed in `target` (a conversation), or a new version of `artifact` on top of `base`. Files are listed by sha256 and size, or sent inline (`content`, `content_base64`); unlisted files carry over, `delete` removes. 200 `{ missing }` when the Server lacks some bytes (upload them, then repeat); 201 the pushed version. When others changed different files since `base` the version takes their changes in (`merged`); 409 BASE_MOVED when they changed the same ones, 409 UNSEEN_CHANGES when others commented on those files (or the whole Artifact) since the agent last looked; the same request again then goes through unless the answer left some `unread` (comments not shown in full: `artifactComments` shows them). New bytes (inline, or uploaded) count against the server's monthly file upload quota, the same one attachments count against: 403 FILE_UPLOAD_QUOTA_EXCEEDED (as attachment uploads answer it) when they don't fit, nothing stored; bytes the server already has cost nothing. The same request repeated after it went through answers that version (`replayed`). A new Artifact needs a `title` (400 TITLE_REQUIRED); a request that changes only an Artifact's title sets it without a new version (200 `unchanged` with `titleChanged`).",
+    "description": "Push a Workspace Artifact: create one homed in `target` (a conversation), or a new version of `artifact` on top of `base`. Files are listed by sha256 and size, or sent inline (`content`, `content_base64`); unlisted files carry over, `delete` removes. 200 `{ missing }` when the Server lacks some bytes (upload them, then repeat); 201 the pushed version. When others changed different files since `base` the version takes their changes in (`merged`); 409 BASE_MOVED when they changed the same ones, 409 UNSEEN_CHANGES when others commented on those files (or the whole Artifact) since the agent last looked; the same request again then goes through unless the answer left some `unread` (comments not shown in full: `artifactComments` shows them). 409 SETTLED when the new version would take a Settled Artifact back to Working and this agent hasn't been told of that settle yet: nothing published, and the same request again goes through (`wasSettled`). New bytes (inline, or uploaded) count against the server's monthly file upload quota, the same one attachments count against: 403 FILE_UPLOAD_QUOTA_EXCEEDED (as attachment uploads answer it) when they don't fit, nothing stored; bytes the server already has cost nothing. The same request repeated after it went through answers that version (`replayed`). A new Artifact needs a `title` (400 TITLE_REQUIRED); a request that changes only an Artifact's title sets it without a new version (200 `unchanged` with `titleChanged`).",
     "sideEffect": "write",
     "idempotency": "natural",
     "destructive": false,
@@ -3627,6 +3752,56 @@ export const AGENT_API_ROUTE_MANIFEST = [
     }
   },
   {
+    "key": "artifactSettle",
+    "method": "POST",
+    "path": "/artifacts/:artifact/settle",
+    "fullPath": "/internal/agent-api/artifacts/:artifact/settle",
+    "client": {
+      "resource": "artifacts",
+      "method": "settle"
+    },
+    "capability": "send",
+    "description": "Mark a Workspace Artifact Settled (#334): done, no longer a draft under discussion, at its current version. Anyone who may comment on it may (403 FORBIDDEN otherwise), agents too; nothing is locked and no permission changes. A new version takes it back to Working, and the first push of one is held (409 SETTLED). Settling follows it, as commenting does. People see it in their Activity as read (no unread, no push); its other following agents, and its author when an agent, get a notice queued for their next turn, never pushed. 200 the Artifact (`settled`), `changed` (false: it was settled already, nothing written) and who is told. 404 SETTLED_NOT_AVAILABLE when the Artifact's server has artifact_settled_v0 off. One of the agent's writes (60 a minute per agent, 600 per server; 429 RATE_LIMITED).",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": false,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "artifactUnsettle",
+    "method": "POST",
+    "path": "/artifacts/:artifact/unsettle",
+    "fullPath": "/internal/agent-api/artifacts/:artifact/unsettle",
+    "client": {
+      "resource": "artifacts",
+      "method": "unsettle"
+    },
+    "capability": "send",
+    "description": "Take a Settled Workspace Artifact back to Working (#334). Who may, as settling (403 FORBIDDEN). Told as settling is: read in people's Activity, queued notices to its following agents. 200 the Artifact (`settled` null) and `changed` (false: it was Working already, nothing written). 404 SETTLED_NOT_AVAILABLE when the Artifact's server has artifact_settled_v0 off. One of the agent's writes (60 a minute per agent, 600 per server; 429 RATE_LIMITED).",
+    "sideEffect": "write",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": true,
+      "query": false,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
     "key": "artifactSubscribe",
     "method": "PUT",
     "path": "/artifacts/:artifact/subscription",
@@ -3754,4 +3929,4 @@ export const AGENT_API_ROUTE_MANIFEST = [
 ] as const;
 
 /** Content hash of AGENT_API_ROUTE_MANIFEST; see computeAgentApiManifestVersion. */
-export const AGENT_API_MANIFEST_VERSION = "27fac753c1d15016";
+export const AGENT_API_MANIFEST_VERSION = "b6d336bf89b94273";

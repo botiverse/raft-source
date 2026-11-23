@@ -81,7 +81,7 @@ test("Built-in Pi dataSchema stays byte-compatible with released mobile clients 
   assert.deepEqual(definition.uiSchema.layout.advanced, ["/loadLocalPlugins", "/envVars"]);
 });
 
-test("Built-in Pi form lists Qwen Token Plan global and CN as first-class presets", () => {
+test("Built-in Pi form lists Qwen Token Plan global and CN (team and individual) as first-class presets", () => {
   const providerSource = buildBuiltInPiFormOptionSource("provider");
   assert.equal(providerSource?.kind, "select");
   if (!providerSource || providerSource.kind !== "select") return;
@@ -90,6 +90,8 @@ test("Built-in Pi form lists Qwen Token Plan global and CN as first-class preset
     [
       { value: "qwen-token-plan", label: "Qwen Token Plan", providerKind: "preset" },
       { value: "qwen-token-plan-cn", label: "Qwen Token Plan CN", providerKind: "preset" },
+      { value: "qwen-token-plan-individual", label: "Qwen Token Plan Individual", providerKind: "preset" },
+      { value: "qwen-token-plan-individual-cn", label: "Qwen Token Plan Individual CN", providerKind: "preset" },
     ],
   );
 

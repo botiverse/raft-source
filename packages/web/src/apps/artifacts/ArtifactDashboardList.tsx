@@ -1,4 +1,4 @@
-import { useCallback, useMemo } from "react";
+import { useCallback, useId, useMemo } from "react";
 import type { ChangeEvent, ReactNode, Ref } from "react";
 import { useIntl } from "react-intl";
 import { Search, TriangleAlert } from "lucide-react";
@@ -30,6 +30,10 @@ import type { ArtifactHomeSort } from "./artifactDashboardPrefs";
 import { DashboardToolbar, RelevantToggle, SortPicker } from "./ArtifactDashboardToolbar";
 import { DASHBOARD_SEARCH_CLASS } from "./artifactDashboardToolbarLayout";
 import { AllRow } from "./ArtifactDashboardRows";
+import { ArtifactOtherHead, ArtifactWorkingHead } from "./ArtifactHomeGroupHeads";
+import { ArtifactHomeSettleContext } from "./artifactSettled";
+import type { ArtifactHomeSections } from "./artifactSettled";
+import { useArtifactHomeGroups } from "./useArtifactHomeGroups";
 
 /**
  * The home page's one list (#proj-workspace:#210): the filter bar, then every
@@ -39,9 +43,16 @@ import { AllRow } from "./ArtifactDashboardRows";
  * next page. 和我有关 narrows it to what concerns the reader, in an order the
  * server fixes: no sort then. Skeleton rows while the first page loads, an empty state
  * (the table keeps its header row over it), a warning with Retry when a read fails.
+ *
+ * Where the rows say whether they are settled (#334, `artifact_settled_v0`), every view lists them in two groups:
+ * Working on top, Other folded at the end (open or folded kept on the device, `otherOpen`); a title search lists them
+ * in one run, Working first (useArtifactHomeGroups, which also keeps them where they were while the page is open).
+ * Each tile or row has a menu then (ArtifactHomeMenu), whose Settle or Unsettle moves it at once.
  */
-export function DashboardList({ all, place, onPlace, author, onAuthor, search, onSearch, query, relevant, onRelevant, sort, onSort, listRef, onOpen, layout, phone, view, readerId, table }: {
+export function DashboardList({ all, serverId, place, onPlace, author, onAuthor, search, onSearch, query, relevant, onRelevant, sort, onSort, listRef, onOpen, layout, phone, view, readerId, table, otherOpen, onOtherOpen }: {
   all: AllArtifacts;
+  /** The server listed: another's Working and Other are decided afresh. */
+  serverId: string | null;
   place: ArtifactPlace | null;
   onPlace: (place: ArtifactPlace | null) => void;
   author: ArtifactDashboardAuthor | null;
@@ -63,12 +74,22 @@ export function DashboardList({ all, place, onPlace, author, onAuthor, search, o
   view: ReactNode;
   readerId: string | null;
   table: TableProps;
+  /** Other (#334) is unfolded (kept on the device). */
+  otherOpen: boolean;
+  onOtherOpen: (open: boolean) => void;
 }) {
   const { formatMessage } = useIntl();
   const { state, read, loadMore } = all;
   const { page, pageByOpened } = state;
   const rows = useMemo(() => page?.rows ?? [], [page]);
-  const items = useMemo(() => allItems(rows, pageByOpened), [rows, pageByOpened]);
+  const listed = useMemo(() => allItems(rows, pageByOpened), [rows, pageByOpened]);
+  // The tab's cached page (artifactDashboardCache) is generation 0; a page this list read is later.
+  const fresh = state.pageGeneration > 0;
+  const { items, groups, settle } = useArtifactHomeGroups({ items: listed, page, fresh, serverId, searching: query !== "", extended: state.extended, read });
+  const toggleOther = useCallback(() => onOtherOpen(!otherOpen), [onOtherOpen, otherOpen]);
+  const sections = useMemo(() => (groups ? { groups, otherOpen, onToggleOther: toggleOther } : null), [groups, otherOpen, toggleOther]);
+  const renderTiles = useCallback((part: readonly ArtifactDashboardItem[], start: number) => <TileGrid items={part} start={start} readerId={readerId} onOpen={onOpen} phone={phone} />, [readerId, onOpen, phone]);
+  const renderRows = useCallback((part: readonly ArtifactDashboardItem[], start: number) => <PhoneRows items={part} start={start} readerId={readerId} onOpen={onOpen} />, [readerId, onOpen]);
   const nextCursor = page?.nextCursor ?? null;
   const refreshing = state.status === "loading" && page !== null;
   const changeSearch = useCallback((event: ChangeEvent<HTMLInputElement>) => onSearch(event.target.value), [onSearch]);
@@ -118,7 +139,7 @@ export function DashboardList({ all, place, onPlace, author, onAuthor, search, o
   );
 
   return (
-    <>
+    <ArtifactHomeSettleContext.Provider value={groups ? settle : null}>
       <DashboardToolbar
         phone={phone}
         view={view}
@@ -183,18 +204,23 @@ export function DashboardList({ all, place, onPlace, author, onAuthor, search, o
             testId="artifacts-all-table"
             loadingRows={page === null ? SKELETON_TABLE_ROWS : 0}
             byOpened={pageByOpened}
-            items={items}
+            items={groups ? groups.all : items}
+            sections={sections}
             empty={empty}
             readerId={readerId}
             onOpen={onOpen}
             {...table}
           />
         ) : rows.length === 0 ? empty : layout === "grid" ? (
-          <TileGrid items={items} readerId={readerId} onOpen={onOpen} phone={phone} />
+          sections ? (
+            <GroupedList sections={sections} render={renderTiles} />
+          ) : (
+            <TileGrid items={items} readerId={readerId} onOpen={onOpen} phone={phone} />
+          )
+        ) : sections ? (
+          <GroupedList sections={sections} render={renderRows} />
         ) : (
-          <div className="flex flex-col gap-0.5 py-2" data-testid="artifacts-all-rows">
-            {items.map((item, index) => <AllRow key={item.card.id} item={item} index={index} onOpen={onOpen} readerId={readerId} />)}
-          </div>
+          <PhoneRows items={items} readerId={readerId} onOpen={onOpen} />
         )}
         {nextCursor ? (
           <div className="px-(--column-margin) pt-1">
@@ -213,15 +239,51 @@ export function DashboardList({ all, place, onPlace, author, onAuthor, search, o
           </div>
         ) : null}
       </ScrollArea>
-    </>
+    </ArtifactHomeSettleContext.Provider>
+  );
+}
+
+/**
+ * Working's head and rows, then Other's head and, unfolded, its rows (`render` draws a part, `start` its first row's
+ * place in the list, for focus once the viewer closes). Searching: everything in one run, no heads.
+ */
+function GroupedList({ sections, render }: { sections: ArtifactHomeSections; render: (items: readonly ArtifactDashboardItem[], start: number) => ReactNode }) {
+  const otherId = useId();
+  const { groups, otherOpen, onToggleOther } = sections;
+  if (groups.working === null) return <>{render(groups.all, 0)}</>;
+  const { working, other } = groups;
+  return (
+    <div className="flex flex-col py-1" data-testid="artifacts-groups">
+      {working.length > 0 ? (
+        <section className="flex flex-col pt-1" data-group="working">
+          <div className="px-(--column-margin)"><ArtifactWorkingHead count={working.length} /></div>
+          {render(working, 0)}
+        </section>
+      ) : null}
+      {other.length > 0 ? (
+        <section className="flex flex-col pt-1" data-group="other">
+          <div className="px-(--column-margin)"><ArtifactOtherHead items={other} open={otherOpen} onToggle={onToggleOther} controls={otherId} /></div>
+          {otherOpen ? <div id={otherId}>{render(other, working.length)}</div> : null}
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
+/** A phone's list: one row per Artifact (AllRow). */
+function PhoneRows({ items, start = 0, readerId, onOpen }: { items: readonly ArtifactDashboardItem[]; start?: number; readerId: string | null; onOpen: OpenRow }) {
+  return (
+    <div className="flex flex-col gap-0.5 py-2" data-testid="artifacts-all-rows">
+      {items.map((item, index) => <AllRow key={item.card.id} item={item} index={start + index} onOpen={onOpen} readerId={readerId} />)}
+    </div>
   );
 }
 
 /** The Artifacts in a grid of tiles (design D16): at least 248px a column, 12px apart; two columns on a phone, 8px apart. */
-function TileGrid({ items, readerId, onOpen, phone }: { items: readonly ArtifactDashboardItem[]; readerId: string | null; onOpen: OpenRow; phone: boolean }) {
+function TileGrid({ items, start = 0, readerId, onOpen, phone }: { items: readonly ArtifactDashboardItem[]; start?: number; readerId: string | null; onOpen: OpenRow; phone: boolean }) {
   return (
     <div className={TILE_GRID_CLASS} data-testid="artifacts-dashboard-grid">
-      {items.map((item, index) => <GridTile key={item.card.id} item={item} index={index} readerId={readerId} onOpen={onOpen} phone={phone} />)}
+      {items.map((item, index) => <GridTile key={item.card.id} item={item} index={start + index} readerId={readerId} onOpen={onOpen} phone={phone} />)}
     </div>
   );
 }

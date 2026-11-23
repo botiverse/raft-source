@@ -34,7 +34,19 @@ export type MessageRealtimeTarget = {
 
 // `senderTimezone` is agent-facing only: a human's browser zone must not reach
 // other humans' clients.
-type StorageOnlyMessageSocketKey = "agentSendKey" | "searchText" | "searchVector" | "senderHandle" | "serverId" | "senderTimezone";
+// `senderOrigin` too: it is set for one agent reader (lib/descriptionVisibility.ts).
+// `resolvedQuotes` is viewer-scoped (services/quoteReplyService.ts): room-wide
+// broadcasts reach members/guests with different history windows and must never
+// carry resolved quote author/timestamp/jump metadata.
+export type StorageOnlyMessageSocketKey =
+  | "agentSendKey"
+  | "searchText"
+  | "searchVector"
+  | "senderHandle"
+  | "serverId"
+  | "senderTimezone"
+  | "senderOrigin"
+  | "resolvedQuotes";
 
 type MessageAudience = {
   emit(event: "message:new" | "message:updated" | "task:created" | "task:updated" | "task:deleted", payload: unknown): unknown;
@@ -88,7 +100,13 @@ export function projectRichMessageSocketPayload<T extends Record<string, unknown
     senderHandle: _senderHandle,
     serverId: _serverId,
     senderTimezone: _senderTimezone,
+    senderOrigin: _senderOrigin,
+    resolvedQuotes: _resolvedQuotes,
     ...projected
   } = payload;
+  // `senderDescription` is viewer-scoped (lib/descriptionVisibility.ts): a
+  // room broadcast reaches Guests and other servers' members alike, so it
+  // carries none; only a reader's own response or read carries theirs.
+  if ("senderDescription" in projected) return { ...projected, senderDescription: null };
   return projected;
 }

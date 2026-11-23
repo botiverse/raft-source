@@ -331,6 +331,55 @@ test("comment refusals: path, anchor, reply, version, length; who may comment", 
   assert.equal((await getDb().select().from(artifactComments).where(eq(artifactComments.itemId, id))).length, 0);
 });
 
+test("an annotation anchor's section (Porthole P152) from an agent: kept cleaned and listed, left out when malformed; over 4 KiB it gives way before the comment is refused", async ({ app, seed }) => {
+  const world = await seedWorld(seed, app);
+  const id = await createSite(world, app);
+  // B has read what A pushed, so its comments aren't held for unseen changes.
+  await read(app, world.keys.b, id);
+  const annotation = (context: unknown, exact = "新增") => ({ type: "annotation", data: {
+    kind: "text", label: "新增", selectors: [{ type: "CssSelector", value: "#p-fulldata > div > ins:nth-of-type(4)" }, { type: "TextQuoteSelector", exact }],
+    ...(context === undefined ? {} : { context }),
+  } });
+  const posted = await comment(app, world.keys.b, id, { body: "which source?", path: "a.html", anchor: annotation({ headings: [" Agent 收件箱现状 ", "P5 · 读取页"], region: "设计\u200B" }) });
+  assert.equal(posted.status, 201, JSON.stringify(posted.body));
+  const kept = annotation({ headings: ["Agent 收件箱现状", "P5 · 读取页"], region: "设计" });
+  assert.deepEqual(posted.body.comment.anchor, kept);
+  const listed = await call(app.baseUrl, "GET", `/artifacts/${id}/comments?all=1`, world.keys.a);
+  assert.deepEqual(listed.body.comments.find((c: { id: string }) => c.id === posted.body.comment.id).anchor, kept);
+  // A context with nothing in it is none.
+  const empty = await comment(app, world.keys.b, id, { body: "x", path: "a.html", anchor: annotation({ headings: [" "] }) });
+  assert.deepEqual(empty.body.comment.anchor, annotation(undefined));
+
+  // A malformed context, or one past Porthole's limits, is left out: the comment is never refused for it.
+  for (const context of [{ headings: Array.from({ length: 7 }, () => "h") }, { headings: ["h".repeat(81)] }, { region: "r".repeat(81) }, { headings: "P5" }, "P5", null]) {
+    const res = await comment(app, world.keys.b, id, { body: "x", path: "a.html", anchor: annotation(context) });
+    assert.equal(res.status, 201, `${JSON.stringify(context)}: ${JSON.stringify(res.body)}`);
+    assert.deepEqual(res.body.comment.anchor, annotation(undefined), JSON.stringify(context));
+    const [row] = await getDb().select().from(artifactComments).where(eq(artifactComments.id, res.body.comment.id));
+    assert.deepEqual(row!.anchor, annotation(undefined), JSON.stringify(context));
+  }
+  // An agent's own format is still stored as given.
+  const own = { type: "html-region", data: { selector: "#card", context: "free-form" } };
+  assert.deepEqual((await comment(app, world.keys.b, id, { body: "x", path: "a.html", anchor: own })).body.comment.anchor, own);
+
+  // Over 4 KiB: the region goes, then the outermost headings, never the comment. A quote that
+  // leaves room for the five innermost headings exactly.
+  const headings = Array.from({ length: 6 }, (_, index) => `${index}${"节".repeat(79)}`);
+  const fits = Buffer.byteLength(JSON.stringify(annotation({ headings: headings.slice(1) }, "")), "utf8");
+  const exact = "q".repeat(4096 - fits);
+  const fitted = await comment(app, world.keys.b, id, { body: "x", path: "a.html", anchor: annotation({ headings, region: "区".repeat(80) }, exact) });
+  assert.equal(fitted.status, 201, JSON.stringify(fitted.body));
+  assert.deepEqual(fitted.body.comment.anchor, annotation({ headings: headings.slice(1) }, exact));
+  // A place over 4 KiB on its own is refused as before.
+  const tooLong = await comment(app, world.keys.b, id, { body: "x", path: "a.html", anchor: annotation({ headings: ["P5"] }, "q".repeat(5000)) });
+  assert.equal(tooLong.status, 400, JSON.stringify(tooLong.body));
+  assert.deepEqual([tooLong.body.code, tooLong.body.details], ["FIELD_TOO_LONG", { field: "anchor", limit: 4096 }]);
+  // A reply without a path takes its parent's place, section and all.
+  const reply = await comment(app, world.keys.b, id, { body: "the 10-K", replyTo: posted.body.comment.id });
+  assert.equal(reply.status, 201, JSON.stringify(reply.body));
+  assert.deepEqual(reply.body.comment.anchor, kept);
+});
+
 // Only its owner finds a personal assistant (agentFindableBy): another agent
 // naming its handle reads exactly as a name nobody has, wherever the Artifact is.
 test("mentions: another person's assistant is an unknown name to an agent", async ({ app, seed }) => {
@@ -510,6 +559,52 @@ test("the comment hold (freshness v2 §2.2): by others' comments on the file or 
   assert.equal((await comment(app, world.keys.out, id, { body: "first look" })).status, 201);
 });
 
+test("#proj-workspace:#340: a hold's range lists again exactly the comments it showed and marked seen, by others, moving nothing", async ({ app, seed }) => {
+  const world = await seedWorld(seed, app);
+  const id = await createSite(world, app);
+  assert.equal((await unfollow(app, world.keys.a, id)).status, 200);
+  await read(app, world.keys.b, id);
+  const one = await comment(app, world.keys.b, id, { body: "one", path: "a.html" });
+  const two = await comment(app, world.keys.b, id, { body: "two", path: "a.html" });
+  assert.equal(two.status, 201, JSON.stringify(two.body));
+
+  const held = await comment(app, world.keys.a, id, { body: "renamed it", path: "a.html" });
+  assert.equal(held.status, 409, JSON.stringify(held.body));
+  const { seenFrom, seen } = held.body.details as { seenFrom: number; seen: number };
+  assert.equal(typeof seenFrom, "number");
+  assert.equal(held.body.details.unseen.unread, 0);
+  // The hold marked them seen: the new-only list no longer has them (an output cut short loses them).
+  const unseen = await call(app.baseUrl, "GET", `/artifacts/${id}/comments`, world.keys.a);
+  assert.deepEqual(unseen.body.comments, []);
+
+  // B comments again after the hold: outside its range. A's own comment (the retry) too.
+  assert.equal((await comment(app, world.keys.a, id, { body: "renamed it", path: "a.html" })).status, 201);
+  await read(app, world.keys.b, id);
+  const three = await comment(app, world.keys.b, id, { body: "three", path: "a.html" });
+  assert.equal(three.status, 201, JSON.stringify(three.body));
+
+  const range = `${seenFrom}..${seen}`;
+  const again = await call(app.baseUrl, "GET", `/artifacts/${id}/comments?held=${range}`, world.keys.a);
+  assert.equal(again.status, 200, JSON.stringify(again.body));
+  assert.deepEqual(again.body.comments.map((c: { id: string }) => c.id), [one.body.comment.id, two.body.comment.id]);
+  assert.equal(again.body.view, "all");
+  assert.equal(again.body.held, range);
+  assert.equal(again.body.nextCursor, null);
+  // With a cursor (a More line), from there; with another file, none.
+  const oneRow = (await getDb().select().from(artifactComments).where(eq(artifactComments.id, one.body.comment.id)))[0]!;
+  const paged = await call(app.baseUrl, "GET", `/artifacts/${id}/comments?held=${range}&cursor=${oneRow.position}`, world.keys.a);
+  assert.deepEqual(paged.body.comments.map((c: { id: string }) => c.id), [two.body.comment.id]);
+  assert.deepEqual((await call(app.baseUrl, "GET", `/artifacts/${id}/comments?held=${range}&path=b.html`, world.keys.a)).body.comments, []);
+  // Listing them moved nothing: B's comment after the hold is still new to A.
+  const stillNew = await call(app.baseUrl, "GET", `/artifacts/${id}/comments`, world.keys.a);
+  assert.deepEqual(stillNew.body.comments.map((c: { id: string }) => c.id), [three.body.comment.id]);
+  // The plain list carries no range.
+  assert.equal(stillNew.body.held, null);
+
+  const malformed = await call(app.baseUrl, "GET", `/artifacts/${id}/comments?held=12-40`, world.keys.a);
+  assert.equal(malformed.status, 400, JSON.stringify(malformed.body));
+});
+
 test("a held comment with seen passes over versions that didn't hold it, counted in skipped, but stops before a comment it didn't show", async ({ app, seed }) => {
   const world = await seedWorld(seed, app);
   const id = await createSite(world, app);
@@ -667,6 +762,11 @@ test("a notice marks nothing seen: right after a short comment's notice, the fol
   assert.equal(held.status, 409, JSON.stringify(held.body));
   assert.equal(held.body.code, "UNSEEN_CHANGES");
   assert.deepEqual(held.body.details.unseen.comments.map((c: { id: string }) => c.id), [short.body.comment.id]);
+  // Where the read position stood before the hold (#proj-workspace:#340): its range lists what it showed again.
+  assert.equal(held.body.details.seenFrom, before);
+  assert.ok(held.body.details.seen > before, JSON.stringify(held.body.details));
+  const again = await call(app.baseUrl, "GET", `/artifacts/${id}/comments?held=${held.body.details.seenFrom}..${held.body.details.seen}`, world.keys.a);
+  assert.deepEqual(again.body.comments.map((c: { id: string }) => c.id), [short.body.comment.id]);
 
   // A reads the Artifact (as `raft artifact pull` does), which shows the comment whole: the same publish goes through.
   const pulled = await read(app, world.keys.a, id);

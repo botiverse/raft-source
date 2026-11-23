@@ -61,6 +61,11 @@ Feedback) render from there.
   `SystemChannelsSection`, `InvitesSection`, `JoinLinksSection`,
   `PreJoinAgreementSection`, `OnboardingAgentSection`,
   `ServerTranslationSection`, `MemberPermissionsSection`,
+  `ServerDataPrivacySection` (owners: one Data & privacy section, the
+  product analytics switch with the members' context export switch and
+  Export server data, while `/servers/:id/data-exports` answers; otherwise,
+  and for admins, `WorkspaceProductAnalyticsSection` alone as Product
+  analytics; docs/development/data-export.md),
   `ContextViewGrantsSection`: owners and admins, behind
   `agent_context_view_v0`, list and revoke which agents may read other
   agents' context, and grant it in `GrantContextViewDialog`, calls in
@@ -79,6 +84,12 @@ Feedback) render from there.
     `/servers/:id/onboarding-settings`, `/servers/:id/setup-transition`,
     `/servers/:id/agent-context-view-grants`; role,
     profile and translation changes go through the stores.
+- `dataExport/`: what the personal (`account/DataExportSection.tsx`) and
+  server (`administration/ServerDataPrivacySection.tsx`) data exports share:
+  `dataExportApi.ts` (each call through a mount: `/me/data-exports` or
+  `/servers/:id/data-exports`), `dataExportHooks.ts` (the list and its
+  polling, the emailed link's export), `DataExportRow`,
+  `DataExportRequestDialog` (the scope step is the caller's, then the proof).
 - `server/`: Settings › Server. Entry `ServerTabContent.tsx`; `ProfileSection`,
   `PublicVisibilitySection` (with `PublicChannelList` and
   `publicVisibilityUiReducer.ts`), `DangerZoneSection` (with
@@ -172,8 +183,8 @@ Feedback) render from there.
   with Archer's server PR; the cancel link's proposed `POST /auth/account-deletion/cancel`). The pending-deletion page is
   `pages/AccountDeletionPendingPage.tsx` (Cancel Deletion then loads Settings ›
   Account, `pages/accountDeletionReturn.ts`: the address's server, else the last
-  location saved by `hooks/useLastLocationResume.ts`, which never saves the
-  Delete Account page; an App's sign-in, `/login/app?request=<uuid>`, goes back
+  server used (the one `/` enters; Delete Account is never a remembered place,
+  `navigation/surfaces.ts`); an App's sign-in, `/login/app?request=<uuid>`, goes back
   to that confirmation instead), which App shows through
   `pages/AccountDeletionGate.tsx` from `store/accountDeletionPending.ts`; the
   API client sets that on any 403 `account_deletion_pending`. Its copy is the

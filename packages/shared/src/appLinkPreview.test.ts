@@ -6,6 +6,7 @@ import {
   inlineBadgeDisplayTone, LINK_CARD_CAPABILITIES, LINK_CARD_INLINE_BADGE_TONES, LINK_CARD_LEGACY_INLINE_BADGE_TONES, linkCardBadgeColorsForCapabilities, linkCardInlineForCapabilities,
   linkCardInlineToneForCapabilities, linkCardExecuteActions, linkCardExecuteToastForCapabilities, linkCardPlacementForCapabilities, linkCardV2Schema, matchesAppPreview, messageBareLinks, messagePreviewUrls, messageVisibleLinks,
   parseAppLinkPreviewV2, parseAppLinkPreviewV3, parseLinkCardReadAnswer, stripLinkCardActions, type AppLinkPreviewItem, type LinkCardActionTier, type LinkCardV2,
+  appLinkPreviewListResponseSchema, asLinkCardObjectRef, linkCardReadItemSchema, takeLinkCardObjectRef,
 } from "./appLinkPreview";
 import { parseActionCardSpec } from "./actionCardSpec";
 import { parseMessageCard } from "./messageCard";
@@ -209,8 +210,8 @@ test("stripping: the provider's tier and the client's capabilities decide the bu
   assert.deepEqual(ids(stripLinkCardActions(disabled.card, { tier: 'execute', capabilities: all })), ['approve', 'merge', 'root'], 'and it stays visible');
 });
 
-test("capabilities: four plus inline.v1, inline.tone.v2, block.v1, preview.v3, badge.color.v1, unreviewed_app.v1 and execute.toast.v1; relative_time.v1 is gone (addendum 1 §2, addendum 2 §3, addenda 6 and 7, RFC 076 §6.3, §15, §17)", () => {
-  assert.deepEqual([...LINK_CARD_CAPABILITIES], ['card.v2', 'button.v1', 'confirm.v1', 'undo.v1', 'inline.v1', 'inline.tone.v2', 'block.v1', 'preview.v3', 'badge.color.v1', 'unreviewed_app.v1', 'execute.toast.v1']);
+test("capabilities: four plus inline.v1, inline.tone.v2, block.v1, preview.v3, badge.color.v1, unreviewed_app.v1, execute.toast.v1 and card.changed.v1; relative_time.v1 is gone (addendum 1 §2, addendum 2 §3, addenda 6 and 7, RFC 076 §6.3, §15, §17)", () => {
+  assert.deepEqual([...LINK_CARD_CAPABILITIES], ['card.v2', 'button.v1', 'confirm.v1', 'undo.v1', 'inline.v1', 'inline.tone.v2', 'block.v1', 'preview.v3', 'badge.color.v1', 'unreviewed_app.v1', 'execute.toast.v1', 'card.changed.v1']);
   const toast = { tone: 'success', text: 'Merged' };
   assert.equal(linkCardExecuteToastForCapabilities(toast, ['card.v2', 'button.v1', 'execute.toast.v1']), toast, "the App's toast on execute's answer for a client that declared execute.toast.v1");
   assert.equal(linkCardExecuteToastForCapabilities(toast, ['card.v2', 'button.v1', 'confirm.v1', 'undo.v1']), null, 'never for one that did not: it may read the answer strictly');
@@ -651,4 +652,43 @@ test("an App link read leaves first-party object links out before the limit", ()
   assert.deepEqual(appLinkReadUrls(mixed, hosts), apps.slice(0, 3));
   // Only bare, public links, as messagePreviewUrls takes them.
   assert.deepEqual(appLinkReadUrls(`[words](${appLink}) \`https://app.example/pr/9\` http://app.example/pr/8`, hosts, 10), []);
+});
+
+test("object_ref: taken out of a version 1 or 2 answer and a version 3 card item before the schema; an invalid one only loses the label", () => {
+  const card = { root: 'root', elements: { root: { type: 'Text', props: { text: 'PR' } } } };
+  const v1 = { version: 1, title: 'PR #1', object_ref: 'pr:o/r#1' };
+  const taken1 = takeLinkCardObjectRef(v1);
+  assert.equal(taken1.objectRef, 'pr:o/r#1');
+  assert.deepEqual(taken1.answer, { version: 1, title: 'PR #1' });
+  assert.ok(appLinkPreviewResponseSchema.safeParse(taken1.answer).success, 'the strict schema reads the rest');
+  assert.equal(v1.object_ref, 'pr:o/r#1', 'never mutates the answer');
+  const v2 = { version: 2, display: 'card', title: 'PR', card_revision: 'c', business_revision: 'b', card, object_ref: 'request:req_abc' };
+  const taken2 = takeLinkCardObjectRef(v2);
+  assert.equal(taken2.objectRef, 'request:req_abc');
+  assert.ok(parseAppLinkPreviewV2(taken2.answer, origin));
+  const v3 = { version: 3, items: [{ type: 'inline', title: 'PR' }, { type: 'card', placement: 'block', title: 'PR', card_revision: 'c', business_revision: 'b', card, object_ref: 'pr:o/r#1' }] };
+  const taken3 = takeLinkCardObjectRef(v3);
+  assert.equal(taken3.objectRef, 'pr:o/r#1');
+  assert.ok(parseAppLinkPreviewV3(taken3.answer, origin)?.items.length === 2);
+  const onInline = { version: 3, items: [{ type: 'inline', title: 'PR', object_ref: 'pr:o/r#1' }] };
+  assert.deepEqual(takeLinkCardObjectRef(onInline), { answer: onInline, objectRef: null }, 'only a card item names an object in version 3');
+  assert.equal(parseAppLinkPreviewV3(onInline, origin), null, 'elsewhere it is an unknown field, as any other');
+  for (const invalid of ['', 'x'.repeat(201), 'pr:caf\u00e9', 'tab\there', 'new\nline', 42, null, ['pr:1'], { id: 1 }]) {
+    const taken = takeLinkCardObjectRef({ ...v1, object_ref: invalid });
+    assert.equal(taken.objectRef, null, JSON.stringify(invalid));
+    assert.ok(appLinkPreviewResponseSchema.safeParse(taken.answer).success, `the card stands without ${JSON.stringify(invalid)}`);
+  }
+  assert.equal(asLinkCardObjectRef('x'.repeat(200)), 'x'.repeat(200));
+  assert.equal(asLinkCardObjectRef(' ~'), ' ~', 'printable ASCII from space to tilde');
+  assert.deepEqual(takeLinkCardObjectRef('text'), { answer: 'text', objectRef: null });
+});
+
+test("object_key_sha256: an optional 64-hex field on read items and the GET's objectKeys; anything else leaves the item out", () => {
+  const key = 'a'.repeat(64);
+  const item = { kind: 'v1', url: `${origin}/pr/1`, app: { id: 'app', name: 'App', icon: null }, preview: { version: 1, title: 'PR' } };
+  assert.ok(linkCardReadItemSchema.safeParse(item).success, 'absent: as before');
+  assert.ok(linkCardReadItemSchema.safeParse({ ...item, object_key_sha256: key }).success);
+  assert.equal(parseLinkCardReadAnswer({ items: [{ ...item, object_key_sha256: 'A'.repeat(64) }] }).length, 0);
+  assert.ok(appLinkPreviewListResponseSchema.safeParse({ previews: [], objectKeys: { [`${origin}/pr/1`]: key } }).success);
+  assert.ok(!appLinkPreviewListResponseSchema.safeParse({ previews: [], objectKeys: { [`${origin}/pr/1`]: 'nope' } }).success);
 });

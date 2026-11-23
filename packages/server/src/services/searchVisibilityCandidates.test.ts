@@ -301,7 +301,8 @@ test("parent_channel_id visibility equals the parent-message join, minus cross-s
       for (const sort of (text ? ["relevance", "recent"] : ["recent"]) as Array<"relevance" | "recent">) {
         for (const channelId of channelFilters) {
           for (const filters of filterSets) {
-            const params = { serverId: server.id, channelId, ...filters, sort, limit: 100, offset: 0 };
+            // The text match reads this server's timeline rows (#raft-architecture:#29).
+            const params = { serverId: server.id, channelId, ...filters, sort, limit: 100, offset: 0, textMatchServerIds: [server.id] };
             const run = async (vis: SQL) =>
               (await db.execute(buildMessageSearchStatement(vis, params, tsQuery))).rows as Array<{ id: string; channelId: string; parentChannelId: string }>;
             const legacy = await run(legacyVisibleSql(principal));
@@ -358,7 +359,7 @@ test("parent_channel_id visibility equals the parent-message join, minus cross-s
               recentTextRows += current.length;
             }
             if (sort === "relevance") {
-              // Relevance collects text matches across servers before joining
+              // Relevance collects the server's text matches before joining
               // visibility (and narrows them by the channel filter on its own);
               // it must keep exactly the rows the visibility-first shape finds.
               const visibilityFirst = (await db.execute(buildMessageSearchStatement(visibleSql(), { ...params, sort: "recent" }, tsQuery))).rows as Array<{ id: string }>;

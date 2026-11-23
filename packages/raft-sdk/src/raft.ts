@@ -1,3 +1,4 @@
+import { fetchWithoutRedirect } from "@botiverse/raft-shared/src/fetchWithoutRedirect";
 import type { RaftbenchFindingsQuery, RaftbenchFindingsResponse } from "@botiverse/raft-shared";
 // `createRaft`: the 1.0 client. Operations are organised by what an agent
 // wants to do (identity, wake, inbox, messages, tasks) and return outcomes with
@@ -16,12 +17,14 @@ import {
   archiveChannel,
   createChannel,
   removeChannelMember,
+  setChannelMemberRole,
   unarchiveChannel,
   updateChannel,
   updateServer,
   type ChannelLeaveRequest,
   type ChannelMemberRemoveRequest,
   type ChannelMemberRequest,
+  type ChannelMemberRoleRequest,
   type CreateChannelRequest,
   type RaftChannelArchiveState,
   type RaftChannelSummary,
@@ -171,6 +174,7 @@ import type {
   AgentApiChannelMembersResponse,
   AgentApiChannelMemberAddResponse,
   AgentApiChannelMemberRemoveResponse,
+  AgentApiChannelMemberRoleResponse,
   AgentApiServerUpdateResponse,
   AgentApiServerLabsResponse,
   AgentApiServerLabsMutationResponse,
@@ -492,6 +496,8 @@ export interface Raft {
     /** Exactly one of `user` (a human) and `agent`. */
     addMember(request: ChannelMemberRequest): Promise<RaftOutcome<AgentApiChannelMemberAddResponse, "added" | "already_member">>;
     removeMember(request: ChannelMemberRemoveRequest): Promise<RaftOutcome<AgentApiChannelMemberRemoveResponse, "removed" | "not_member">>;
+    /** A member's channel role: `admin` or `member`. Exactly one of `user` (a human) and `agent`. */
+    setRole(request: ChannelMemberRoleRequest): Promise<RaftOutcome<AgentApiChannelMemberRoleResponse, "changed" | "unchanged">>;
   };
   threads: {
     list(): Promise<RaftOutcome<AgentApiThreadListItem[], "threads" | "empty">>;
@@ -727,7 +733,7 @@ export function createRaftAgent(options: CreateRaftAgentOptions): RaftAgent {
   const inboxApi: AgentApiClient = createAgentApiClient({
     fetch: {
       baseUrl: serverUrl,
-      fetch: (input, init) => (options.fetch ?? fetch)(input, { ...init, cache: "no-store", redirect: "error" }),
+      fetch: (input, init) => fetchWithoutRedirect(options.fetch ?? fetch, input, { ...init, cache: "no-store" }),
       headers,
       retry: { attempts: 1 },
       throttle: options.throttle,
@@ -884,6 +890,7 @@ export function createRaftAgent(options: CreateRaftAgentOptions): RaftAgent {
       unarchive: (request) => unarchiveChannel(api, request).then(styled),
       addMember: (request) => addChannelMember(api, request, style).then(styled),
       removeMember: (request) => removeChannelMember(api, request, style).then(styled),
+      setRole: (request) => setChannelMemberRole(api, request, style).then(styled),
     },
     threads: {
       list: () => listThreads(api).then(styled),
@@ -1028,6 +1035,7 @@ export function createRaftAgent(options: CreateRaftAgentOptions): RaftAgent {
     "channels.unarchive": (args: { target: string }) => raft.channels.unarchive(args),
     "channels.addMember": (args: ChannelMemberRequest) => raft.channels.addMember(args),
     "channels.removeMember": (args: ChannelMemberRemoveRequest) => raft.channels.removeMember(args),
+    "channels.setRole": (args: ChannelMemberRoleRequest) => raft.channels.setRole(args),
     "threads.list": () => raft.threads.list(),
     "threads.unfollow": (args: { target: string; reason?: string }) => raft.threads.unfollow(args),
     "server.info": (args: ServerInfoRequest) => raft.server.info(args),

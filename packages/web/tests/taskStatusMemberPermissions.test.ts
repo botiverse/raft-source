@@ -48,6 +48,12 @@ test("a Guest moves its own channel's tasks like a member (guest matrix §1); th
   assert.equal(canEditTaskStatus(taskWith({ readOnlyReason: "historical_joint_task" }), OTHER, false), false);
 });
 
+test("status is a member's action: a reader of a public channel they have not joined cannot move its tasks (the server answers 403)", () => {
+  assert.equal(canEditTaskStatus(taskWith(), OTHER, false, false), false);
+  assert.equal(canEditTaskStatus(taskWith(), ASSIGNEE, true, false), false, "not the assignee or an admin either: the server gates every task write on channel write access");
+  assert.equal(canEditTaskStatus(taskWith(), OTHER, false, true), true);
+});
+
 test("a member can edit status on an unclaimed task", () => {
   assert.equal(
     canEditTaskStatus(taskWith({ claimedById: null, claimedByType: null }), OTHER, false),

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { pickCreateAgentRuntime, suggestedRuntimeUnavailable } from "../src/features/agent/pickCreateAgentRuntime";
+import { onboardingRuntimeCandidates, pickCreateAgentRuntime, reconcileCreateAgentRuntime, suggestedRuntimeUnavailable } from "../src/features/agent/pickCreateAgentRuntime";
+import { pickSignedInRuntime, runtimeSignInState } from "../src/utils/runtimeSignInState";
+import type { RuntimeSignInState } from "../src/utils/runtimeSignInState";
+import type { RuntimeAuthView } from "../src/utils/runtimeAuthClient";
 
 const AVAILABLE = ["claude", "codex", "kimi-sdk"];
 const SUPPORTED = new Set(["claude", "codex", "kimi-sdk", "builtin"]);
@@ -48,4 +51,66 @@ test("the notice follows the cause: the computer reports the runtime but this se
   assert.equal(suggestedRuntimeUnavailable(notAdmitted), "not_admitted");
   // Not reported by the computer: the computer is the cause, whatever the server offers.
   assert.equal(suggestedRuntimeUnavailable({ ...notAdmitted, computerRuntimes: ["claude"] }), "not_on_computer");
+});
+
+// Mail #214: a bundled runtime (Kimi Code) is always "available", signed in or
+// not, so Create Cindy picked it on a Windows Computer where it was signed out
+// and Cindy exited a second after every start.
+const signIn = (states: Record<string, RuntimeSignInState>) => (runtimeId: string): RuntimeSignInState => states[runtimeId] ?? "unknown";
+
+test("onboarding skips a signed-out runtime and starts on a signed-in one, priority or not", () => {
+  assert.equal(
+    pickCreateAgentRuntime(["claude", "codex", "kimi-sdk"], SUPPORTED, true, null, undefined, signIn({ claude: "signed_out", codex: "signed_out", "kimi-sdk": "signed_in" })),
+    "kimi-sdk",
+  );
+  assert.equal(
+    pickCreateAgentRuntime(["claude", "codex", "kimi-sdk"], SUPPORTED, true, null, undefined, signIn({ claude: "signed_out", codex: "signed_in", "kimi-sdk": "signed_in" })),
+    "codex",
+    "among signed-in ones, its priority still decides",
+  );
+  // A signed-in one beats a higher-priority one the Computer could not report.
+  assert.equal(pickCreateAgentRuntime(["claude", "kimi-sdk"], SUPPORTED, true, null, undefined, signIn({ "kimi-sdk": "signed_in" })), "kimi-sdk");
+});
+
+test("onboarding picks nothing when every runtime is signed out, and preselects an unknown one", () => {
+  assert.equal(pickCreateAgentRuntime(["kimi-sdk"], SUPPORTED, true, null, undefined, signIn({ "kimi-sdk": "signed_out" })), "");
+  assert.equal(pickCreateAgentRuntime(["claude", "kimi-sdk"], SUPPORTED, true, null, undefined, signIn({ claude: "signed_out", "kimi-sdk": "signed_out" })), "");
+  // Unknown (an older Computer, or the read not in yet): preselected, as before; the dialog shows its notice.
+  assert.equal(pickCreateAgentRuntime(["claude", "kimi-sdk"], SUPPORTED, true, null), "claude");
+  assert.equal(pickCreateAgentRuntime(["claude", "kimi-sdk"], SUPPORTED, true, null, undefined, signIn({ claude: "signed_out" })), "kimi-sdk");
+  // The candidates: its priority first, then the rest this computer can run.
+  assert.deepEqual(onboardingRuntimeCandidates(["kimi-sdk", "codex", "claude"], SUPPORTED), ["claude", "codex", "kimi-sdk"]);
+});
+
+test("the Computer's report decides the state: Kimi Code reads Kimi's sign-in; Built-in has none", () => {
+  const view: RuntimeAuthView = {
+    status: { collectedAt: "2026-11-17T10:00:00.000Z", runtimes: { claude: { kind: "logged_in" }, kimi: { kind: "logged_out" } } },
+    availability: "ok",
+    canAct: true,
+  };
+  assert.equal(runtimeSignInState(view, "claude"), "signed_in");
+  assert.equal(runtimeSignInState(view, "kimi-sdk"), "signed_out");
+  assert.equal(runtimeSignInState(view, "codex"), "unknown", "not in the report");
+  assert.equal(runtimeSignInState(null, "claude"), "unknown", "not read");
+  assert.equal(runtimeSignInState(view, "builtin"), "no_sign_in");
+  assert.equal(pickSignedInRuntime(["kimi-sdk", "claude"], (id) => runtimeSignInState(view, id)), "claude");
+});
+
+test("Create Cindy's re-pick follows the sign-in read until the person chooses", () => {
+  const available = ["claude", "kimi-sdk"];
+  let states: Record<string, RuntimeSignInState> = {};
+  const pick = () => pickCreateAgentRuntime(available, SUPPORTED, true, null, undefined, signIn(states));
+  // Before the read lands everything is unknown: Claude Code, as before.
+  let runtime = reconcileCreateAgentRuntime("", available, true, pick);
+  assert.equal(runtime, "claude");
+  // The read lands: Claude Code signed out, Kimi Code signed in. Still following: re-picked.
+  states = { claude: "signed_out", "kimi-sdk": "signed_in" };
+  runtime = reconcileCreateAgentRuntime(runtime, available, true, pick);
+  assert.equal(runtime, "kimi-sdk");
+  // The person picks Claude Code themselves: kept, whatever the read says next.
+  assert.equal(reconcileCreateAgentRuntime("claude", available, false, pick), "claude", "stops once the person chooses");
+  // ...unless it can no longer be picked on this Computer.
+  assert.equal(reconcileCreateAgentRuntime("codex", available, false, pick), "kimi-sdk");
+  // No rows yet: unchanged.
+  assert.equal(reconcileCreateAgentRuntime("claude", [], true, pick), "claude");
 });

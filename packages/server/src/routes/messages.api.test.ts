@@ -47,7 +47,7 @@ import {
   __resetSearchServiceDepsForTests,
   __setSearchServiceDepsForTests,
   MESSAGE_SEARCH_RELEVANCE_ESTIMATED_CANDIDATE_LIMIT,
-  MESSAGE_SEARCH_RELEVANCE_ESTIMATED_TEXT_MATCH_LIMIT,
+  MESSAGE_SEARCH_SERVER_GIN_ESTIMATED_TEXT_MATCH_LIMIT,
   MESSAGE_SEARCH_RECENT_COLLECT_FIRST_TEXT_MATCH_LIMIT,
 } from "../services/searchService";
 import { openTestApp } from "../test/integration/app";
@@ -393,15 +393,18 @@ test("GET /messages/channel/:channelId records page-load phases and constant que
         "messages.senders.server_members",
         "messages.senders.server_membership_departures",
         "messages.senders.user_profiles",
+        // The reader's and senders' roles on the reader's server (descriptionVisibility): one query per page.
+        "messages.senders.viewer_server_roles",
       ],
-      dbQueryCount: 15,
+      dbQueryCount: 16,
     },
   );
   // +2: page-scoped thread summary and provider-neutral external reactions — still constant.
   // -1: the coverage bounds ride the page statement.
   // +1: Slack-side mention facts (external_mention_facts, one batched lookup by message id).
   // -1: the retired attachment-comment flag no longer needs its channel→server gate query.
-  assert.ok(dbEvents.length <= 15, "message page query count should stay constant for mixed senders/attachments/reactions");
+  // +1: roles on the reader's server for sender descriptions (descriptionVisibility), one batched lookup.
+  assert.ok(dbEvents.length <= 16, "message page query count should stay constant for mixed senders/attachments/reactions");
 
   const dbEventByQuery = new Map(dbEvents.map((event) => [event.attrs?.query_name, event]));
   assert.equal(dbEventByQuery.get("messages.channel.loaded_page")?.attrs?.phase, "messages.paged");
@@ -736,7 +739,7 @@ test("jumping to a message behind a Free server's history window says so, for a 
   // Someone who may not read the channel learns nothing: a plain not found.
   const denied = await context(secretOld.id, secret.id, memberToken);
   assert.equal(denied.status, 404);
-  assert.equal(denied.body.code, undefined);
+  assert.equal(denied.body.code, "message_not_found");
   assert.equal(denied.body.hiddenTarget, undefined);
 
   // So does someone on another Free server, asking from it for this server's message.
@@ -748,13 +751,14 @@ test("jumping to a message behind a Free server's history window says so, for a 
   });
   assert.equal(crossServer.status, 404);
   const crossServerBody = await crossServer.json() as HiddenTargetBody;
-  assert.equal(crossServerBody.code, undefined);
+  assert.equal(crossServerBody.code, "message_not_found");
   assert.equal(crossServerBody.hiddenTarget, undefined);
 
   // A message that does not exist is not found.
   const missing = await context("00000000-0000-4000-8000-000000000000", channel.id);
   assert.equal(missing.status, 404);
-  assert.equal(missing.body.code, undefined);
+  assert.equal(missing.body.code, "message_not_found");
+  assert.deepEqual(denied.body, missing.body, "a channel the caller can't read answers exactly like a missing message");
 
   // A target inside the window whose context reaches the cutoff carries the count, as a page that reaches it does.
   const visible = await context(recent.id, channel.id);
@@ -4478,7 +4482,7 @@ test("reaction actor read names private, archived, short-id collision, wrong-ser
     headers: authHeaders(ownerToken, server.id),
   });
   assert.equal(invalidEmoji.status, 400);
-  assert.equal((await invalidEmoji.json() as { code: string }).code, "invalid_reaction_emoji");
+  assert.equal((await invalidEmoji.json() as { code: string }).code, "emoji_invalid");
 
   const invalidCursor = await fetch(`${app.baseUrl}/api/messages/eeeeeeee-1111-4111-8111-111111111111/reactions/actors?emoji=${encodeURIComponent("👍")}&cursor=tampered`, {
     headers: authHeaders(ownerToken, server.id),
@@ -4961,10 +4965,9 @@ test("relevance search above the documented boundary answers newest first, marke
     await createMessage(channel.id, "user", owner.id, "breadthboundary searchable row");
 
     // Two probes: the viewer-scoped estimate (WITH visible_channels) and the
-    // corpus-wide text-match estimate (FROM messages m), sized against the
-    // corpus row count.
+    // searched servers' text-match estimate (FROM message_server_timeline t).
     let injectedEstimate = MESSAGE_SEARCH_RELEVANCE_ESTIMATED_CANDIDATE_LIMIT;
-    let injectedTextMatchEstimate = MESSAGE_SEARCH_RELEVANCE_ESTIMATED_TEXT_MATCH_LIMIT;
+    let injectedTextMatchEstimate = MESSAGE_SEARCH_SERVER_GIN_ESTIMATED_TEXT_MATCH_LIMIT;
     const dialect = new PgDialect();
     __setSearchServiceDepsForTests({
       executeSearchSql: (async (statement: SQL, options?: { signal?: AbortSignal }) => {
@@ -4975,7 +4978,6 @@ test("relevance search above the documented boundary answers newest first, marke
             rows: [{ "QUERY PLAN": [{ Plan: { "Node Type": "Nested Loop", "Plan Rows": planRows } }] }],
           };
         }
-        if (rendered.includes("FROM pg_class")) return { rows: [{ corpus_rows: 1_000_000 }] };
         return executeSearchSqlFromDb(statement, options);
       }) as typeof executeSearchSqlFromDb,
     });
@@ -4991,9 +4993,9 @@ test("relevance search above the documented boundary answers newest first, marke
 
     assert.equal((atLimitBody as { relevanceFallback?: string }).relevanceFallback, undefined);
 
-    // Rare in this server but common across all servers: the corpus-wide
-    // text-match set the relevance statement reads first is too large. Not
-    // refused: answered newest first, marked relevanceFallback.
+    // Few visible candidates, but the searched servers' text-match set the
+    // relevance statement reads first is too large. Not refused: answered
+    // newest first, marked relevanceFallback.
     const expectFallback = async (response: Response) => {
       assert.equal(response.status, 200);
       const body = await response.json() as { results: unknown[]; relevanceFallback?: string; code?: string };
@@ -5001,11 +5003,11 @@ test("relevance search above the documented boundary answers newest first, marke
       assert.equal(body.relevanceFallback, "too_broad");
       assert.equal(body.results.length, 1, "the newest-first page still finds the row");
     };
-    injectedTextMatchEstimate = MESSAGE_SEARCH_RELEVANCE_ESTIMATED_TEXT_MATCH_LIMIT + 1;
+    injectedTextMatchEstimate = MESSAGE_SEARCH_SERVER_GIN_ESTIMATED_TEXT_MATCH_LIMIT + 1;
     await expectFallback(await fetch(`${app.baseUrl}/api/messages/search?q=breadthboundary&limit=1`, {
       headers: userHeaders,
     }));
-    injectedTextMatchEstimate = MESSAGE_SEARCH_RELEVANCE_ESTIMATED_TEXT_MATCH_LIMIT;
+    injectedTextMatchEstimate = MESSAGE_SEARCH_SERVER_GIN_ESTIMATED_TEXT_MATCH_LIMIT;
 
     injectedEstimate = MESSAGE_SEARCH_RELEVANCE_ESTIMATED_CANDIDATE_LIMIT + 1;
     await expectFallback(await fetch(`${app.baseUrl}/api/messages/search?q=breadthboundary&limit=1`, {
@@ -5027,14 +5029,14 @@ test("relevance search above the documented boundary answers newest first, marke
   }
 });
 
-test("recent search on a term above the corpus-wide cap walks the server timeline when no channel narrows it", async ({ app }) => {
+test("recent search on a term above the text-match cap walks the server timeline when no channel narrows it", async ({ app }) => {
   try {
     const owner = await seedUser("search-timeline-owner@slock.test", "search-timeline-owner");
     const server = await createServer("Search Timeline Server", "search-timeline-server", owner.id);
     const channel = await createChannel(server.id, "search-timeline-channel");
     await createMessage(channel.id, "user", owner.id, "timelinewalk searchable row");
 
-    // The corpus-wide text-match estimate says the term is dense: recent sort
+    // The text-match estimate says the term is dense: recent sort
     // never rejects, it walks newest first.
     const dialect = new PgDialect();
     const executed: string[] = [];
@@ -5042,9 +5044,8 @@ test("recent search on a term above the corpus-wide cap walks the server timelin
       executeSearchSql: (async (statement: SQL, options?: { signal?: AbortSignal }) => {
         const rendered = dialect.sqlToQuery(statement).sql.replace(/\s+/g, " ").trim();
         if (rendered.startsWith("EXPLAIN (FORMAT JSON)")) {
-          return { rows: [{ "QUERY PLAN": [{ Plan: { "Node Type": "Bitmap Heap Scan", "Plan Rows": MESSAGE_SEARCH_RELEVANCE_ESTIMATED_TEXT_MATCH_LIMIT + 1 } }] }] };
+          return { rows: [{ "QUERY PLAN": [{ Plan: { "Node Type": "Bitmap Heap Scan", "Plan Rows": MESSAGE_SEARCH_SERVER_GIN_ESTIMATED_TEXT_MATCH_LIMIT + 1 } }] }] };
         }
-        if (rendered.includes("FROM pg_class")) return { rows: [{ corpus_rows: 1_000_000 }] };
         executed.push(rendered);
         return executeSearchSqlFromDb(statement, options);
       }) as typeof executeSearchSqlFromDb,
@@ -5082,7 +5083,6 @@ test("recent search collects text matches first only up to the recent cap; above
         if (rendered.startsWith("EXPLAIN (FORMAT JSON)")) {
           return { rows: [{ "QUERY PLAN": [{ Plan: { "Node Type": "Bitmap Heap Scan", "Plan Rows": estimate } }] }] };
         }
-        if (rendered.includes("FROM pg_class")) return { rows: [{ corpus_rows: 1_000_000 }] };
         executed.push(rendered);
         return executeSearchSqlFromDb(statement, options);
       }) as typeof executeSearchSqlFromDb,
@@ -5097,18 +5097,18 @@ test("recent search collects text matches first only up to the recent cap; above
 
     // At the cap: collect the matches first.
     assert.match(await search(), /\btext_matches AS MATERIALIZED\b/);
-    // One over (well below the 200k relevance cap, where these used to collect
+    // One over (well below the relevance cap, where these used to collect
     // first and time out): walk this server's timeline...
     estimate = MESSAGE_SEARCH_RECENT_COLLECT_FIRST_TEXT_MATCH_LIMIT + 1;
-    assert.ok(estimate < MESSAGE_SEARCH_RELEVANCE_ESTIMATED_TEXT_MATCH_LIMIT);
+    assert.ok(estimate < MESSAGE_SEARCH_SERVER_GIN_ESTIMATED_TEXT_MATCH_LIMIT);
     const walked = await search();
     assert.match(walked, /\bFROM message_server_timeline t JOIN messages m ON m\.id = t\.message_id\b/);
     assert.doesNotMatch(walked, /\btext_matches AS MATERIALIZED\b/);
     // A channel filter has no budgeted walk, so the relevance cap still
     // decides: this estimate collects first.
     const narrowed = await search(`&channelId=${channel.id}`);
-    assert.doesNotMatch(narrowed, /\bmessage_server_timeline\b/);
-    assert.match(narrowed, /\btext_matches AS MATERIALIZED\b/);
+    assert.doesNotMatch(narrowed, /\bFROM message_server_timeline t JOIN messages m ON m\.id = t\.message_id\b/, "no timeline walk");
+    assert.match(narrowed, /\btext_matches AS MATERIALIZED \( SELECT t\.message_id AS id, t\.channel_id AS channel_id FROM message_server_timeline t\b/);
   } finally {
     __resetSearchServiceDepsForTests();
     await app.close();
@@ -5133,7 +5133,6 @@ test("the server timeline walk stops at its row budget: incomplete page, exact c
         if (rendered.startsWith("EXPLAIN (FORMAT JSON)")) {
           return { rows: [{ "QUERY PLAN": [{ Plan: { "Node Type": "Bitmap Heap Scan", "Plan Rows": MESSAGE_SEARCH_RECENT_COLLECT_FIRST_TEXT_MATCH_LIMIT + 1 } }] }] };
         }
-        if (rendered.includes("FROM pg_class")) return { rows: [{ corpus_rows: 1_000_000 }] };
         return executeSearchSqlFromDb(statement, options);
       }) as typeof executeSearchSqlFromDb,
     });
@@ -5207,7 +5206,6 @@ test("message search maps admitted PostgreSQL statement timeout to typed SEARCH_
             rows: [{ "QUERY PLAN": [{ Plan: { "Node Type": "Nested Loop", "Plan Rows": 1 } }] }],
           };
         }
-        if (rendered.includes("FROM pg_class")) return { rows: [{ corpus_rows: 1_000_000 }] };
         throw Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
       }) as typeof executeSearchSqlFromDb,
     });
@@ -5702,7 +5700,7 @@ test("POST /messages/forward records validation rejection on the propagated trac
       body: JSON.stringify({}),
     });
     assert.equal(res.status, 400);
-    assert.deepEqual(await res.json(), { error: "Destination channel and full source message ids are required" });
+    assert.deepEqual(await res.json(), { error: "Destination channel and full source message ids are required", code: "invalid_request", errorCode: "invalid_request" });
     const span = findForwardAttemptSpan(sink, traceId);
     const terminal = span?.events.find((event) => event.name === "messages.forward.terminal");
     assert.deepEqual(terminal?.attrs, {
@@ -6254,7 +6252,8 @@ test("POST /messages/forward batches canonical destinations with truthful partia
     const source = await createChannel(server.id, "forward-batch-source");
     const destinationA = await createChannel(server.id, "forward-batch-a");
     const destinationB = await createChannel(server.id, "forward-batch-b");
-    const deniedDestination = await createChannel(server.id, "forward-batch-denied", undefined, "private");
+    // Readable but not joined: a conversation the caller can't read would answer like a missing one.
+    const deniedDestination = await createChannel(server.id, "forward-batch-denied");
     await db.insert(channelHumans).values([
       { channelId: source.id, userId: owner.id },
       { channelId: destinationA.id, userId: owner.id },
@@ -7587,4 +7586,73 @@ test("GET /messages/forward/targets/search returns channels, DMs, agents, and hu
   } finally {
     await app.close();
   }
+});
+
+test("message context answers another server's recent message exactly like a missing one, by full or short id", async ({ app }) => {
+  const db = getDb();
+  const owner = await seedUser("context-foreign-owner@slock.test", "context-foreign-owner");
+  const stranger = await seedUser("context-foreign-stranger@slock.test", "context-foreign-stranger");
+  const server = await createServer("Context Foreign", "context-foreign", owner.id);
+  const otherServer = await createServer("Context Foreign Other", "context-foreign-other", stranger.id);
+  await db.update(serversTable).set({ plan: "pro" }).where(inArray(serversTable.id, [server.id, otherServer.id]));
+  const channel = await createChannel(server.id, "context-foreign-room");
+  await addHuman(channel.id, owner.id);
+  const message = await createMessage(channel.id, "user", owner.id, "a recent message on the other server");
+  const headers = authHeaders(await tokenForHuman(stranger.email), otherServer.id);
+  const answer = async (id: string) => {
+    const res = await fetch(`${app.baseUrl}/api/messages/context/${id}?channelId=${channel.id}`, { headers });
+    return { status: res.status, body: await res.text() };
+  };
+
+  // A short id no message has: the first 8 hex digits of the real one, changed.
+  const realShort = message.id.slice(0, 8);
+  const missingShort = (realShort[0] === "0" ? "1" : "0") + realShort.slice(1);
+  const missing = await answer(missingShort);
+  assert.equal(missing.status, 404);
+  assert.deepEqual(await answer(realShort), missing, "a real short id on another server reads like one no message has");
+  assert.deepEqual(await answer(message.id), await answer(randomUUID()), "and so does the full id");
+});
+
+test("send and forward answer a conversation the caller can't read exactly like a missing one", async ({ app }) => {
+  const db = getDb();
+  const owner = await seedUser("send-hidden-owner@slock.test", "send-hidden-owner");
+  const peer = await seedUser("send-hidden-peer@slock.test", "send-hidden-peer");
+  const member = await seedUser("send-hidden-member@slock.test", "send-hidden-member");
+  const server = await createServer("Send Hidden", "send-hidden", owner.id);
+  await db.insert(serverMembers).values([
+    { serverId: server.id, userId: owner.id, role: "owner" },
+    { serverId: server.id, userId: peer.id, role: "member" },
+    { serverId: server.id, userId: member.id, role: "member" },
+  ]).onConflictDoNothing();
+  const source = await createChannel(server.id, "send-hidden-source");
+  await addHuman(source.id, member.id);
+  const sourceMessage = await createMessage(source.id, "user", member.id, "a message to forward");
+  const secret = await createChannel(server.id, "send-hidden-private", undefined, "private");
+  await addHuman(secret.id, owner.id);
+  const dm = await findOrCreateUserDM(server.id, owner.id, peer.id);
+  assert.ok(dm);
+  const unjoined = await createChannel(server.id, "send-hidden-public");
+  await addHuman(unjoined.id, owner.id);
+  const headers = { ...authHeaders(await tokenForHuman(member.email), server.id), "Content-Type": "application/json" };
+  const answer = async (path: string, body: Record<string, unknown>) => {
+    const res = await fetch(`${app.baseUrl}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
+    return { status: res.status, body: await res.text() };
+  };
+  const send = (channelId: string) => answer("/api/messages", { channelId, content: "hello" });
+  const forward = (destinationChannelId: string) => answer("/api/messages/forward", { destinationChannelId, sourceMessageIds: [sourceMessage.id] });
+
+  const missingSend = await send(randomUUID());
+  assert.equal(missingSend.status, 404);
+  assert.deepEqual(await send(secret.id), missingSend, "a private channel the caller isn't in reads like a missing one");
+  assert.deepEqual(await send(dm.id), missingSend, "so does another pair's DM");
+  const missingForward = await forward(randomUUID());
+  assert.equal(missingForward.status, 404);
+  assert.deepEqual(await forward(secret.id), missingForward, "forward into a private channel the caller isn't in reads like a missing one");
+  assert.deepEqual(await forward(dm.id), missingForward, "and into another pair's DM");
+
+  // A channel the caller can read but hasn't joined still says why.
+  const unjoinedSend = await send(unjoined.id);
+  assert.equal(unjoinedSend.status, 403);
+  assert.equal((JSON.parse(unjoinedSend.body) as { error: string }).error, "You must join this channel to send messages");
+  assert.equal((await forward(unjoined.id)).status, 403);
 });

@@ -22,6 +22,7 @@
 //   `web_zip`: started, busy, failed, timeout).
 import { addAbortSignal, type Readable } from "node:stream";
 import { and, asc, eq } from "drizzle-orm";
+import { artifactSafeFileName } from "@botiverse/raft-shared";
 import type { AppBytes } from "../../platform/apps";
 import { getDb } from "../../platform/db";
 import { countAppOperation } from "../../platform/tracing";
@@ -108,10 +109,9 @@ export async function versionZipOf(item: ArtifactItemRow, version: ArtifactVersi
   };
 }
 
-/** A file name for an archive: the title's letters, digits, spaces, dots, dashes and underscores (at most 80), else the id. */
-export function zipBaseName(item: ArtifactItemRow): string {
-  const safe = item.title.normalize("NFKD").replace(/[^A-Za-z0-9 ._-]+/g, " ").replace(/\s+/g, " ").trim().replace(/^\.+/, "").slice(0, 80).trim();
-  return safe || item.id;
+/** A file name for an archive: the title as a file name (artifactSafeFileName, letters of any script kept), else the id. */
+export function zipBaseName(item: Pick<ArtifactItemRow, "id" | "title">): string {
+  return artifactSafeFileName(item.title) || item.id;
 }
 
 /** A blob's whole bytes (at most `maxBytes`: its row's size), closing the stream. */

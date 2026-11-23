@@ -1,29 +1,23 @@
+import type { PopupAnchorTarget } from "../../components/ui/popupAnchor";
 import type { SidebarSortSection } from "./sections/sidebarSortSections";
 
 export interface CtxMenu {
-  x: number;
-  y: number;
+  anchor: PopupAnchorTarget;
   /** `lounge`: an Agent Lounge row; `id` is the Lounge's channel id. */
   type: "channel" | "agent" | "human" | "dm" | "lounge";
   id: string;
 }
 
 export interface SectionCtxMenu {
-  x: number;
-  y: number;
+  anchor: PopupAnchorTarget;
   section: SidebarSortSection | `custom:${string}`;
 }
 
 export interface SidebarSurfaceCtxMenu {
-  x: number;
-  y: number;
+  anchor: PopupAnchorTarget;
 }
 
-// Stryker disable all: shared context-menu geometry and propagation shielding predate the Activity mute action and have separate position/interaction coverage.
-export function getSidebarContextMenuStyle(ctxMenu: Pick<CtxMenu, "x" | "y">) {
-  return { left: ctxMenu.x, top: ctxMenu.y };
-}
-
+// Stryker disable all: shared propagation shielding predates the Activity mute action and has separate interaction coverage.
 export function stopSidebarContextMenuPropagation(event: { stopPropagation: () => void }) {
   event.stopPropagation();
 }

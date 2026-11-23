@@ -97,6 +97,8 @@ export interface MarketplaceMcpListing extends MarketplaceListingBase {
   /** `source.templateKey` for `POST /api/mcp/apps`. */
   templateKey: string;
   homepageUrl: string;
+  /** Who builds and hosts the MCP server ("Notion"); null when the template does not name one. */
+  publisherName: string | null;
 }
 
 export type MarketplaceListing<App> = MarketplaceAppListing<App> | MarketplaceMcpListing;

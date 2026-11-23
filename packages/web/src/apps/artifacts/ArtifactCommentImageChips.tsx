@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useRef } from "react";
-import type { KeyboardEvent } from "react";
+import type { KeyboardEvent, MouseEvent as ReactMouseEvent } from "react";
 import { useIntl } from "react-intl";
 import { ImageOff, RefreshCw, TriangleAlert, X } from "lucide-react";
 import {
@@ -20,6 +20,14 @@ import { transparentImageBackgroundClass } from "../../utils/imagePreviewStyles"
 import { commentImageName, commentImageProblem } from "./artifactCommentImageText";
 import { useCommentImageUrls } from "./artifactCommentImageUrls";
 import type { CommentImageItem } from "./useCommentImageAttachments";
+
+/**
+ * Remove goes away with its chip: a press that took the focus would drop it to the page, out of the comment box
+ * someone was typing in (#triage:db62c967). Keyboard Remove is unchanged. Local: apps may not import utils/.
+ */
+function keepFocusOnRemovePress(event: ReactMouseEvent) {
+  event.preventDefault();
+}
 
 /** The file id of an image the box holds by id only (restored from this device): drawn from it. */
 const restoredIdOf = (item: CommentImageItem): ObjectFileId | null => (item.preview === null && (item.status === "ready" || item.status === "expired") ? item.image.fileId : null);
@@ -151,7 +159,7 @@ function CommentImageChip({ item, name, src, onRemove, onRetry, onPreview }: {
           )}
         </ComposerAttachmentFailedOverlay>
       ) : null}
-      <ComposerAttachmentRemove onClick={remove} aria-label={formatMessage({ id: "message.composer.removeAttachment" }, { file: name })} data-testid="artifact-comment-attachment-remove">
+      <ComposerAttachmentRemove onMouseDown={keepFocusOnRemovePress} onClick={remove} aria-label={formatMessage({ id: "message.composer.removeAttachment" }, { file: name })} data-testid="artifact-comment-attachment-remove">
         <X size={10} />
       </ComposerAttachmentRemove>
     </ComposerAttachment>

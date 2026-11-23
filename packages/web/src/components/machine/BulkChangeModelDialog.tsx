@@ -1,15 +1,14 @@
-import { Button, Checkbox, Spinner, TextLink } from "@botiverse/raft-ui";
+import { Button, Spinner, TextLink } from "@botiverse/raft-ui";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
-import { formatRuntimeLabelBesideBadge, runtimeShowsExperimentalBadge } from "../../utils/runtimeAvailabilityLabel";
+import { formatRuntimeLabelWithStatus } from "../../utils/runtimeAvailabilityLabel";
 import { ArrowRight, Check, X } from "lucide-react";
 import {
   REASONING_EFFORT_RUNTIMES,
   currentTimeMs,
   getDefaultModel,
   getRuntimeDisplayName,
-  runtimeChoiceModel,
 } from "@botiverse/raft-shared";
 import type { ReasoningEffort } from "@botiverse/raft-shared";
 import api from "../../api/client";
@@ -228,8 +227,6 @@ export default function BulkChangeModelDialog({
   const [runtimeAllowed, setRuntimeAllowed] = useState<Record<string, boolean> | null>(null);
   const [checkingRuntime, setCheckingRuntime] = useState(false);
   const [applyStates, setApplyStates] = useState<Record<string, ApplyState>>({});
-  // Reconciler step 11c: running agents switch at their next idle point unless asked to restart now.
-  const [restartNow, setRestartNow] = useState(false);
 
   // Usage events (RFC-067): one operation per dialog open, pinned to the
   // server it was opened in. The ref keeps React's dev double-run of effects
@@ -243,20 +240,15 @@ export default function BulkChangeModelDialog({
   }, [agents.length, operation, retry]);
 
   const runtimeModels = useRuntimeModels(machine.id, runtime, { reuseRecentMs: 60_000 });
-  // "The runtime chooses" (Antigravity's configured default) stays first and
-  // preselected, so confirming without a pick does not pin agents to the
-  // model the runtime happens to start on today, nor to its effort.
-  const runtimeChoice = runtimeChoiceModel(runtime);
-  const models = useMemo(
-    () => (runtimeChoice ? [runtimeChoice, ...runtimeModels.models.filter((m) => m.id !== runtimeChoice.id)] : runtimeModels.models),
-    [runtimeChoice, runtimeModels.models],
-  );
+  // Antigravity has no "the runtime chooses" entry (#oar-raft:#25): the
+  // model agy starts on (the live list's default) is preselected.
+  const models = runtimeModels.models;
 
   const model = useMemo(() => {
     if (models.some((m) => m.id === modelChoice)) return modelChoice;
-    const preferred = runtimeChoice?.id ?? runtimeModels.default ?? getDefaultModel(runtime);
+    const preferred = runtimeModels.default ?? getDefaultModel(runtime);
     return models.find((m) => m.id === preferred)?.id ?? models[0]?.id ?? "";
-  }, [modelChoice, models, runtime, runtimeChoice, runtimeModels.default]);
+  }, [modelChoice, models, runtime, runtimeModels.default]);
 
   const supportsReasoning = REASONING_EFFORT_RUNTIMES.has(runtime);
   const reasoning = useMemo(
@@ -288,23 +280,21 @@ export default function BulkChangeModelDialog({
     ...(phaseById.has(agent.id) ? { phase: phaseById.get(agent.id) } : {}),
   })), [agents, isRunning, phaseById, runtimeAllowed]);
 
-  const plan = useMemo(() => planBulkModelChange(planInputs, target, { restartNow }), [planInputs, restartNow, target]);
+  const plan = useMemo(() => planBulkModelChange(planInputs, target), [planInputs, target]);
   const agentById = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
 
   const usageText = useCallback(
     (summary: BulkRuntimeUsageSummary | null | undefined) => runtimeUsageText(summary, formatMessage, locale),
     [formatMessage, locale],
   );
-  // "(deprecated)" is this server's answer: a runtime it offers again is not.
+  // "(deprecated)" is this server's answer: a runtime it offers again is not deprecated.
   const runtimeCatalog = useServerRuntimeCatalog(serverId);
   const runtimeOptions = useMemo(() => runtimeIds.map((id) => {
     const description = usageText(usageByRuntime[id]);
     const deprecated = isRuntimeDeprecatedOnServer(id, runtimeCatalog);
-    // Like every runtime picker: raft-ui's Experimental badge, not "(experimental)" text.
     return {
       value: id,
-      label: formatRuntimeLabelBesideBadge(id, formatMessage, deprecated),
-      ...(runtimeShowsExperimentalBadge(id, deprecated) ? { experimental: true } : {}),
+      label: formatRuntimeLabelWithStatus(id, formatMessage, deprecated),
       ...(description ? { description } : {}),
     };
   }), [formatMessage, runtimeCatalog, runtimeIds, usageByRuntime, usageText]);
@@ -559,12 +549,6 @@ export default function BulkChangeModelDialog({
               })}
             </ul>
             {plan.runningChangeCount > 0 && (
-              <label className="mt-3 flex select-none items-center gap-2">
-                <Checkbox checked={restartNow} onCheckedChange={setRestartNow} data-testid="bulk-model-restart-now" />
-                <span className="text-callout font-semibold">{formatMessage({ id: "machine.detail.bulkModel.restartNow" })}</span>
-              </label>
-            )}
-            {!restartNow && plan.runningChangeCount > 0 && (
               <p className="mt-3 text-footnote text-foreground-muted" data-testid="bulk-model-idle-line">
                 {formatMessage({ id: "machine.detail.bulkModel.idleLine" }, { count: plan.runningChangeCount })}
               </p>

@@ -146,6 +146,12 @@ export type InboxPolicyNotificationFact = {
   activityAt: Date | number | string;
   personalMention: boolean;
   unreadEligible?: boolean;
+  /**
+   * Written past the receiver's mute (a personal mention piercing it): the row
+   * keeps its latest earlier fact as its Activity anchor and moves to this one
+   * only when it has no fact before the mute (receiverActivityMessages).
+   */
+  pastMute?: boolean;
 };
 
 export type InboxPolicyServingRow = InboxPolicySqlRow & {
@@ -378,6 +384,8 @@ export function projectInboxServingRowsFromNotificationFacts(opts: {
     const orderedFacts = [...facts].sort((a, b) => a.seq - b.seq || asTime(a.activityAt) - asTime(b.activityAt));
     const latest = orderedFacts[orderedFacts.length - 1];
     if (!latest) return [];
+    const preMuteFacts = orderedFacts.filter((fact) => fact.pastMute !== true);
+    const anchor = preMuteFacts[preMuteFacts.length - 1] ?? latest;
     const readSeq = opts.lastReadSeqByChannel[latest.sourceChannelId] ?? 0;
     const unread = orderedFacts.filter((fact) => fact.seq > readSeq && fact.unreadEligible !== false);
     const personalMentions = orderedFacts.filter((fact) => fact.personalMention);
@@ -388,8 +396,8 @@ export function projectInboxServingRowsFromNotificationFacts(opts: {
       sourceChannelId: latest.sourceChannelId,
       channelId: latest.kind === "thread" ? undefined : latest.sourceChannelId,
       threadChannelId: latest.kind === "thread" ? latest.sourceChannelId : undefined,
-      activityAt: latest.activityAt,
-      latestMessageId: latest.messageId,
+      activityAt: anchor.activityAt,
+      latestMessageId: anchor.messageId,
       firstUnreadMessageId: unread[0]?.messageId ?? null,
       firstMentionMessageId: unreadMentions[0]?.messageId ?? null,
       latestNotifiedSeq: latest.seq,
@@ -716,13 +724,19 @@ function unreadVisibleMentionMessages(model: InboxPolicyModel, sourceChannelId: 
   return visibleMentionMessages(model, sourceChannelId).filter((message) => message.seq > cursor);
 }
 
+/**
+ * The messages a channel or DM row's latest activity is taken from, as
+ * legacyChatLatestActivityMessageSql and rw_inbox_serving_v9: unmuted, every
+ * message; muted, the messages before the mute, so a personal mention past the
+ * mute lights the @ without moving the row. Only a muted row with no message
+ * before the mute falls back to its personal mentions past the mute.
+ */
 function receiverActivityMessages(model: InboxPolicyModel, sourceChannelId: string): InboxPolicyMessage[] {
   const muteStartSeq = receiverMuteStartSeq(model, sourceChannelId);
   if (muteStartSeq == null) return channelMessages(model, sourceChannelId);
-  const mentionSeqs = new Set(visibleMentionMessages(model, sourceChannelId).map((message) => message.seq));
-  return channelMessages(model, sourceChannelId).filter((message) =>
-    message.seq < muteStartSeq || mentionSeqs.has(message.seq)
-  );
+  const preMute = channelMessages(model, sourceChannelId).filter((message) => message.seq < muteStartSeq);
+  if (preMute.length > 0) return preMute;
+  return visibleMentionMessages(model, sourceChannelId).filter((message) => message.seq >= muteStartSeq);
 }
 
 /**

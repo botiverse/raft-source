@@ -9,6 +9,7 @@ import {
   type ManagedMcpRuntimeTool,
 } from "@botiverse/raft-shared";
 import { managedMcpRefusalGuidance } from "../managedMcpRefusal";
+import { fetchWithRunnerCredential } from "../runnerCredentialRenewal";
 import {
   confirmRuntimeTurnOrigin,
   type RuntimeTurnOriginReader,
@@ -37,16 +38,18 @@ async function requestJson<T>(input: {
 }): Promise<T> {
   const timeout = AbortSignal.timeout(MANAGED_MCP_HTTP_TIMEOUT_MS);
   const signal = input.signal ? AbortSignal.any([input.signal, timeout]) : timeout;
-  const response = await fetch(input.url, {
+  // #wg-rbac:#27: the launch's runner key as renewed; a 401
+  // agent_credential_expired renews it and sends once more.
+  const response = await fetchWithRunnerCredential(input.token, (token) => fetch(input.url, {
     method: input.method ?? "GET",
     headers: {
-      Authorization: `Bearer ${input.token}`,
+      Authorization: `Bearer ${token}`,
       "X-Slock-Agent-Active-Capabilities": "mcp",
       ...(input.body === undefined ? {} : { "Content-Type": "application/json" }),
     },
     ...(input.body === undefined ? {} : { body: JSON.stringify(input.body) }),
     signal,
-  });
+  }));
   const payload = await response.json().catch(() => null) as
     | { error?: unknown; code?: unknown; connectionRequested?: unknown; suggestedNextAction?: unknown }
     | T
@@ -102,6 +105,103 @@ function refusalWithGuidance(error: ManagedMcpHttpError): ManagedMcpHttpError {
   );
 }
 
+type JsonValueKind = "object" | "array" | "string";
+
+function jsonValueKind(value: unknown): JsonValueKind | null {
+  if (typeof value === "string") return "string";
+  if (Array.isArray(value)) return "array";
+  if (typeof value === "object" && value !== null) return "object";
+  return null;
+}
+
+function isSchemaObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function resolveLocalSchemaRef(root: Record<string, unknown>, ref: string): unknown {
+  if (!ref.startsWith("#/")) return undefined;
+  let current: unknown = root;
+  for (const token of ref.slice(2).split("/")) {
+    if (!isSchemaObject(current)) return undefined;
+    current = current[token.replaceAll("~1", "/").replaceAll("~0", "~")];
+  }
+  return typeof current === "boolean" || isSchemaObject(current) ? current : undefined;
+}
+
+/**
+ * Whether `schema` may accept a value of `kind`. Errs towards "yes": anything this small check
+ * cannot prove (`not`, unresolved `$ref`s, cycles, unconstrained schemas) counts as accepting, so
+ * the caller leaves the value alone rather than coercing it through a guess.
+ */
+function schemaMayAccept(
+  schema: unknown,
+  kind: JsonValueKind,
+  root: Record<string, unknown>,
+  refs: ReadonlySet<string> = new Set(),
+): boolean {
+  if (typeof schema === "boolean") return schema;
+  if (!isSchemaObject(schema)) return true;
+
+  if (typeof schema.$ref === "string") {
+    if (refs.has(schema.$ref)) return true;
+    const resolved = resolveLocalSchemaRef(root, schema.$ref);
+    if (resolved === undefined) return true;
+    return schemaMayAccept(resolved, kind, root, new Set(refs).add(schema.$ref));
+  }
+  if (schema.not !== undefined) return true;
+
+  let allowed = true;
+  if (schema.type !== undefined) {
+    const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+    allowed &&= types.includes(kind);
+  }
+  if (schema.const !== undefined) allowed &&= jsonValueKind(schema.const) === kind;
+  if (Array.isArray(schema.enum)) allowed &&= schema.enum.some((value) => jsonValueKind(value) === kind);
+  for (const keyword of ["anyOf", "oneOf"] as const) {
+    const branches = schema[keyword];
+    if (Array.isArray(branches)) allowed &&= branches.some((branch) => schemaMayAccept(branch, kind, root, refs));
+  }
+  if (Array.isArray(schema.allOf)) {
+    allowed &&= schema.allOf.every((branch) => schemaMayAccept(branch, kind, root, refs));
+  }
+  return allowed;
+}
+
+/**
+ * A JSON-encoded object or array where the schema wants one, decoded. Models sometimes send
+ * `"{\"page_id\":\"…\"}"` for an object-typed field; Pi's validation coerces scalars but never
+ * JSON-parses, so the call would fail. Only a value the schema cannot take as a string, that parses
+ * to a kind the schema can take, is replaced; anything else is returned unchanged for validation to
+ * judge.
+ */
+function decodeJsonStringFor(schema: unknown, value: unknown, root: Record<string, unknown>): unknown {
+  if (typeof value !== "string" || schemaMayAccept(schema, "string", root)) return value;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return value;
+  }
+  const kind = jsonValueKind(parsed);
+  return (kind === "object" || kind === "array") && schemaMayAccept(schema, kind, root) ? parsed : value;
+}
+
+/** `prepareArguments` for a managed MCP tool: repairs JSON-string arguments (whole, or per top-level property). */
+function prepareManagedMcpArguments(schema: Record<string, unknown>, args: unknown): unknown {
+  const decoded = decodeJsonStringFor(schema, args, schema);
+  if (!isSchemaObject(decoded) || !isSchemaObject(schema.properties)) return decoded;
+  let prepared: Record<string, unknown> | undefined;
+  for (const [name, propertySchema] of Object.entries(schema.properties)) {
+    if (!Object.hasOwn(decoded, name)) continue;
+    const value = decoded[name];
+    const repaired = decodeJsonStringFor(propertySchema, value, schema);
+    if (repaired === value) continue;
+    prepared ??= { ...decoded };
+    prepared[name] = repaired;
+  }
+  return prepared ?? decoded;
+}
+
 function buildTool(input: {
   tool: ManagedMcpRuntimeTool;
   serverUrl: string;
@@ -124,6 +224,9 @@ function buildTool(input: {
     description: tool.description || `Call ${formatManagedMcpPromptName(tool.toolName)} on the managed MCP server ${formatManagedMcpPromptName(tool.serverName)}.`,
     promptSnippet: `${tool.runtimeName}: ${tool.description ? flattenManagedMcpPromptText(tool.description) : `Call ${formatManagedMcpPromptName(tool.toolName)} on ${formatManagedMcpPromptName(tool.serverName)}`}`,
     parameters: tool.inputSchema as TSchema,
+    // Against the same schema `parameters` validates with, not a later refreshed one. What it returns
+    // is unvalidated (it can still be a string): Pi's validation runs next and judges it.
+    prepareArguments: (args) => prepareManagedMcpArguments(input.tool.inputSchema, args),
     async execute(_toolCallId, params, signal) {
       // The tools are built once per session, so the origin cannot be baked in: it is read here, at
       // call time, from the getter bound to this session's process (task #21).

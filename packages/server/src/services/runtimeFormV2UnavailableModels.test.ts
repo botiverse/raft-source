@@ -8,7 +8,6 @@ import type { RuntimeModelSourceOutcome } from "@botiverse/raft-shared";
 
 import {
   runtimeFormV2Entry,
-  withoutV2OnlyOptionSourceFields,
   type RuntimeFormOptionSourceContext,
   type RuntimeFormV2OptionSourceBody,
 } from "./runtimeFormV2Registry";
@@ -18,7 +17,6 @@ async function modelSource(runtimeId: string, outcome: RuntimeModelSourceOutcome
     sourceId: "model",
     machineId: "machine-1",
     machine: {},
-    sourceStatus: true,
     agentOrchestrator: { detectMachineRuntimeModels: async () => outcome },
     routeToComputer: async () => "confirmed_local",
   } as unknown as RuntimeFormOptionSourceContext;
@@ -65,16 +63,4 @@ test("a runtime without a bundled catalog still reports the models its listing d
   });
   assert.deepEqual(optionValues(opencode), ["a/one"]);
   assert.deepEqual(opencode.unavailableOptions, [{ value: "a/two", label: "Two" }]);
-});
-
-test("v1 option-source responses never carry the v2 field", () => {
-  const body = {
-    protocolVersion: 1, runtimeId: "claude", schemaVersion: "s", sourceId: "model", pointer: "/model",
-    kind: "select", options: [{ value: "opus", label: "Opus" }], defaultValue: "opus",
-    unavailableOptions: [{ value: "x", label: "X" }],
-  } as RuntimeFormV2OptionSourceBody;
-  assert.ok(!("unavailableOptions" in withoutV2OnlyOptionSourceFields(body)));
-  const plain = { ...body, unavailableOptions: undefined };
-  delete plain.unavailableOptions;
-  assert.equal(withoutV2OnlyOptionSourceFields(plain), plain);
 });

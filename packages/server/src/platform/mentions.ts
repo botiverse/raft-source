@@ -266,7 +266,7 @@ async function jointObjectAudience(
 ): Promise<MentionAudienceCandidates | null> {
   if (located.homeKind !== "conversation" || located.homeChannelId === null) return null;
   const subject = { id: objectId, serverId: located.serverId, homeKind: located.homeKind, homeChannelId: located.homeChannelId, author: located.author };
-  const seen = await seenThroughJoint({ type: "user", id: reader.userId, serverId: reader.serverId }, [subject], registered.app.flag);
+  const seen = await seenThroughJoint({ type: "user", id: reader.userId, serverId: reader.serverId }, [subject], registered.app.flag, { access: "write" });
   if (!seen.has(objectId)) return null;
   const projection = (await localConversationIds(reader.serverId, [located.homeChannelId])).get(located.homeChannelId);
   if (!projection) return null;

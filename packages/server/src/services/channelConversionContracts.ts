@@ -89,6 +89,8 @@ const progressSchema = z.object({
   awaitingRetryAt: z.string().optional(), errorClass: z.string().optional(), errorPhase: z.string().optional(),
   errorCode: z.string().optional(), uploadCount: count.optional(), taskIdentityPreservedAt: z.string().optional(),
   canonicalCopyStarted: z.boolean().optional(), externalBindingsPaused: count.optional(),
+  /** channel_conversion_online_move_v1: the start prepared everything inline and admitted writers. */
+  onlineMovePreparedAt: z.string().optional(),
 });
 /** Internal state: no legacy keys or unvalidated JSON may enter phase functions. */
 export type ConversionProgress = z.infer<typeof progressSchema> & { resources: ConversionResources };

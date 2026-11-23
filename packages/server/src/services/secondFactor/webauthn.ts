@@ -4,16 +4,39 @@
  * `@simplewebauthn/server`. Nothing else imports that library; passkeys.ts
  * holds the storage and challenge rules on top of this.
  *
- * Relying party (explicit, never derived: once anyone registers a passkey the
- * RP ID can never change, every passkey is bound to it):
+ * Relying party (explicit, never derived: every passkey is bound to the RP
+ * ID it was registered under, so moving WEBAUTHN_RP_ID needs
+ * WEBAUTHN_LEGACY_RP_ID, below, for the passkeys already registered):
  *   - `WEBAUTHN_RP_ID`: the RP ID, e.g. `raft.build` in production (covers
  *     `app.raft.build`), the staging domain on staging, `localhost` locally.
  *     It must be the APP_URL hostname or a registrable suffix of it.
  *   - `WEBAUTHN_ORIGINS`: comma-separated web origins a passkey ceremony may
  *     come from, e.g. `https://app.raft.build`. Each is https (plain http only
- *     for localhost outside production) and its host is the RP ID or below it.
+ *     for localhost or *.localhost outside production) and its host is the RP ID or below it.
  *     Desktop's `app://raft` cannot carry an RP ID and is never one (design §5).
- * Both unset: passkeys are unavailable (the passkey routes answer 503
+ *     The iOS app's native passkey assertions carry `https://<RP ID>`, so
+ *     with WEBAUTHN_RP_ID `app.raft.build` they need no extra origin (iOS asks
+ *     only for passkeys under it). `https://raft.build` is never listed.
+ *   - `WEBAUTHN_ANDROID_APK_KEY_HASHES` (optional): comma-separated SHA-256
+ *     fingerprints of the Android app's signing certificates, colon hex as in
+ *     assetlinks.json. The Android app's native passkey assertions carry the
+ *     origin `android:apk-key-hash:<base64url of that SHA-256>`, not a web
+ *     origin; each fingerprint allows exactly that one origin, for assertions
+ *     only (registration stays web-only). Never a pattern: an apk-key-hash not
+ *     listed is refused like any other wrong origin. Credential Manager only
+ *     offers a passkey to an app the RP ID's assetlinks.json delegates
+ *     `get_login_creds` to, so the list matches what raft.build serves.
+ *   - `WEBAUTHN_LEGACY_RP_ID` (optional): the RP ID passkeys were registered
+ *     under before WEBAUTHN_RP_ID moved (production: `raft.build`, while
+ *     WEBAUTHN_RP_ID is `app.raft.build`). Only to verify those passkeys
+ *     (a stored row's `rp_id`, NULL meaning this one); never offered for
+ *     registration. It must be a strict parent domain of WEBAUTHN_RP_ID, so
+ *     every web origin (which is on WEBAUTHN_RP_ID) is on it too. It adds no
+ *     origin: `https://<legacy RP ID>` is accepted only if WEBAUTHN_ORIGINS
+ *     lists it, and it cannot (not on WEBAUTHN_RP_ID). The Android
+ *     apk-key-hash origins answer for either RP ID. Unset: everything is as
+ *     before it existed (a NULL `rp_id` is WEBAUTHN_RP_ID).
+ * Both RP variables unset: passkeys are unavailable (the passkey routes answer 503
  * `passkeys_unavailable`; nothing else changes). Set but inconsistent: the
  * server refuses to start (server.ts calls readWebauthnRelyingParty).
  */
@@ -33,10 +56,53 @@ import { getAppUrl } from "../../config/appUrl";
 
 export const WEBAUTHN_RP_ID_ENV = "WEBAUTHN_RP_ID";
 export const WEBAUTHN_ORIGINS_ENV = "WEBAUTHN_ORIGINS";
+export const WEBAUTHN_ANDROID_APK_KEY_HASHES_ENV = "WEBAUTHN_ANDROID_APK_KEY_HASHES";
+export const WEBAUTHN_LEGACY_RP_ID_ENV = "WEBAUTHN_LEGACY_RP_ID";
 const RP_NAME = "Raft";
 const CEREMONY_TIMEOUT_MS = 5 * 60_000;
 
-export type RelyingParty = { rpID: string; origins: string[] };
+/**
+ * origins: the web origins (registration and assertion). androidOrigins: the
+ * allow-listed `android:apk-key-hash:` origins (assertion only). legacyRpID:
+ * WEBAUTHN_LEGACY_RP_ID, present only when set (assertion only).
+ */
+export type RelyingParty = { rpID: string; origins: string[]; androidOrigins: string[]; legacyRpID?: string };
+
+/**
+ * Which of the relying party's RP IDs a passkey (or a ceremony) belongs to:
+ * `current` is WEBAUTHN_RP_ID, `legacy` WEBAUTHN_LEGACY_RP_ID.
+ */
+export type PasskeyRpGroup = "current" | "legacy";
+
+export function parsePasskeyRpGroup(raw: unknown): PasskeyRpGroup | null | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  return raw === "current" || raw === "legacy" ? raw : null;
+}
+
+/** The RP ID of `group`; null for `legacy` without WEBAUTHN_LEGACY_RP_ID. */
+export function rpIdOfGroup(rp: RelyingParty, group: PasskeyRpGroup): string | null {
+  return group === "current" ? rp.rpID : rp.legacyRpID ?? null;
+}
+
+/**
+ * The RP ID a stored passkey is bound to: its `rp_id`, or for a row from
+ * before that column (NULL) the legacy RP ID when one is set, else the
+ * current one (as it was then).
+ */
+export function effectivePasskeyRpId(rp: RelyingParty, storedRpId: string | null): string {
+  return storedRpId ?? rp.legacyRpID ?? rp.rpID;
+}
+
+/**
+ * The group a stored passkey answers in; null when its RP ID is neither
+ * configured one (e.g. registered under an RP ID since rolled back): such a
+ * passkey is offered nowhere and verifies nowhere.
+ */
+export function passkeyRpGroup(rp: RelyingParty, storedRpId: string | null): PasskeyRpGroup | null {
+  const rpId = effectivePasskeyRpId(rp, storedRpId);
+  if (rpId === rp.rpID) return "current";
+  return rp.legacyRpID !== undefined && rpId === rp.legacyRpID ? "legacy" : null;
+}
 
 export class WebauthnConfigError extends Error {
   constructor(message: string) {
@@ -49,8 +115,31 @@ function isLocalhost(hostname: string): boolean {
   return hostname === "localhost";
 }
 
+const SHA256_FINGERPRINT = /^[0-9a-f]{2}(:[0-9a-f]{2}){31}$/i;
+
+/** The native Android origin for one signing-certificate SHA-256 fingerprint (colon hex). */
+export function androidApkKeyHashOrigin(fingerprint: string): string {
+  return `android:apk-key-hash:${Buffer.from(fingerprint.replace(/:/g, ""), "hex").toString("base64url")}`;
+}
+
+function readAndroidOrigins(env: NodeJS.ProcessEnv): string[] {
+  const fingerprints = (env[WEBAUTHN_ANDROID_APK_KEY_HASHES_ENV] ?? "").split(",").map((entry) => entry.trim()).filter(Boolean);
+  const origins = fingerprints.map((fingerprint) => {
+    if (!SHA256_FINGERPRINT.test(fingerprint)) {
+      throw new WebauthnConfigError(`${WEBAUTHN_ANDROID_APK_KEY_HASHES_ENV} entry "${fingerprint}" is not a SHA-256 fingerprint (32 colon-separated hex bytes)`);
+    }
+    return androidApkKeyHashOrigin(fingerprint);
+  });
+  return [...new Set(origins)];
+}
+
 function isWithin(hostname: string, rpID: string): boolean {
   return hostname === rpID || hostname.endsWith(`.${rpID}`);
+}
+
+function isDomain(value: string): boolean {
+  // A registrable domain has a dot (no bare TLD), or is localhost.
+  return /^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(value) && (value.includes(".") || isLocalhost(value));
 }
 
 /**
@@ -61,12 +150,24 @@ function isWithin(hostname: string, rpID: string): boolean {
 export function readWebauthnRelyingParty(env: NodeJS.ProcessEnv = process.env): RelyingParty | null {
   const rpID = env[WEBAUTHN_RP_ID_ENV]?.trim().toLowerCase() ?? "";
   const rawOrigins = (env[WEBAUTHN_ORIGINS_ENV] ?? "").split(",").map((origin) => origin.trim()).filter(Boolean);
-  if (!rpID && rawOrigins.length === 0) return null;
+  const androidOrigins = readAndroidOrigins(env);
+  const legacyRpID = env[WEBAUTHN_LEGACY_RP_ID_ENV]?.trim().toLowerCase() ?? "";
+  if (!rpID && rawOrigins.length === 0) {
+    if (androidOrigins.length > 0) throw new WebauthnConfigError(`${WEBAUTHN_ANDROID_APK_KEY_HASHES_ENV} is set but ${WEBAUTHN_RP_ID_ENV} is not`);
+    if (legacyRpID) throw new WebauthnConfigError(`${WEBAUTHN_LEGACY_RP_ID_ENV} is set but ${WEBAUTHN_RP_ID_ENV} is not`);
+    return null;
+  }
   if (!rpID) throw new WebauthnConfigError(`${WEBAUTHN_ORIGINS_ENV} is set but ${WEBAUTHN_RP_ID_ENV} is not`);
   if (rawOrigins.length === 0) throw new WebauthnConfigError(`${WEBAUTHN_RP_ID_ENV} is set but ${WEBAUTHN_ORIGINS_ENV} is not`);
-  // A registrable domain has a dot (no bare TLD), or is localhost.
-  if (!/^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(rpID) || (!rpID.includes(".") && !isLocalhost(rpID))) {
+  if (!isDomain(rpID)) {
     throw new WebauthnConfigError(`${WEBAUTHN_RP_ID_ENV} "${rpID}" is not a domain`);
+  }
+  if (legacyRpID) {
+    if (!isDomain(legacyRpID)) throw new WebauthnConfigError(`${WEBAUTHN_LEGACY_RP_ID_ENV} "${legacyRpID}" is not a domain`);
+    if (legacyRpID === rpID) throw new WebauthnConfigError(`${WEBAUTHN_LEGACY_RP_ID_ENV} "${legacyRpID}" is the same as ${WEBAUTHN_RP_ID_ENV}`);
+    if (!rpID.endsWith(`.${legacyRpID}`)) {
+      throw new WebauthnConfigError(`${WEBAUTHN_LEGACY_RP_ID_ENV} "${legacyRpID}" must be a parent domain of ${WEBAUTHN_RP_ID_ENV} "${rpID}"`);
+    }
   }
   const appHost = new URL(getAppUrl()).hostname;
   if (!isWithin(appHost, rpID)) {
@@ -81,16 +182,24 @@ export function readWebauthnRelyingParty(env: NodeJS.ProcessEnv = process.env): 
       throw new WebauthnConfigError(`${WEBAUTHN_ORIGINS_ENV} entry "${raw}" is not a URL`);
     }
     if (url.origin !== raw.replace(/\/$/, "")) throw new WebauthnConfigError(`${WEBAUTHN_ORIGINS_ENV} entry "${raw}" must be a bare origin`);
-    const httpAllowed = !production && isLocalhost(url.hostname);
+    // `localhost` and its subdomains: browsers treat both as secure contexts,
+    // and subdomains let a local stack mirror a move of the RP ID to a
+    // subdomain (app.pk.localhost with WEBAUTHN_LEGACY_RP_ID=pk.localhost;
+    // not app.localhost + localhost: Chrome refuses rpId "localhost" there).
+    const httpAllowed = !production && (isLocalhost(url.hostname) || url.hostname.endsWith(".localhost"));
     if (url.protocol !== "https:" && !(url.protocol === "http:" && httpAllowed)) {
-      throw new WebauthnConfigError(`${WEBAUTHN_ORIGINS_ENV} entry "${raw}" must be https (plain http only for localhost outside production)`);
+      throw new WebauthnConfigError(`${WEBAUTHN_ORIGINS_ENV} entry "${raw}" must be https (plain http only for localhost or *.localhost outside production)`);
     }
     if (!isWithin(url.hostname, rpID)) {
       throw new WebauthnConfigError(`${WEBAUTHN_ORIGINS_ENV} entry "${raw}" is not on ${WEBAUTHN_RP_ID_ENV} "${rpID}"`);
     }
+    // Implied by the parent-domain rule above; stated so the rule cannot drift.
+    if (legacyRpID && !isWithin(url.hostname, legacyRpID)) {
+      throw new WebauthnConfigError(`${WEBAUTHN_ORIGINS_ENV} entry "${raw}" is not on ${WEBAUTHN_LEGACY_RP_ID_ENV} "${legacyRpID}"`);
+    }
     return url.origin;
   });
-  return { rpID, origins: [...new Set(origins)] };
+  return { rpID, origins: [...new Set(origins)], androidOrigins, ...(legacyRpID ? { legacyRpID } : {}) };
 }
 
 /**
@@ -255,9 +364,10 @@ export async function verifyPasskeyRegistration(rp: RelyingParty, response: Pass
   }
 }
 
-export async function passkeyAssertionOptions(rp: RelyingParty, input: { challenge: string; allow: StoredPasskey[] }): Promise<PublicKeyCredentialRequestOptionsJSON> {
+/** Assertion options under `input.rpID` (one of the relying party's: WebAuthn asks under exactly one RP ID). */
+export async function passkeyAssertionOptions(_rp: RelyingParty, input: { challenge: string; allow: StoredPasskey[]; rpID: string }): Promise<PublicKeyCredentialRequestOptionsJSON> {
   return generateAuthenticationOptions({
-    rpID: rp.rpID,
+    rpID: input.rpID,
     challenge: challengeBytes(input.challenge),
     timeout: CEREMONY_TIMEOUT_MS,
     userVerification: "required",
@@ -269,23 +379,27 @@ export async function passkeyAssertionOptions(rp: RelyingParty, input: { challen
 }
 
 /**
- * Verify an assertion by `passkey` against `challenge` (origin, RP ID,
- * signature, user verification). Returns the authenticator's counter; the
+ * Verify an assertion by `passkey` against `challenge` (origin: a web origin
+ * or an allow-listed Android app, the same list whichever RP ID; RP ID
+ * `expectedRPID`, the passkey's own (effectivePasskeyRpId); signature, user
+ * verification). Returns the authenticator's counter; the
  * counter rule (design §5: a regression is a signal, never a refusal) is the
  * caller's, so the library is never given the stored counter to reject on.
+ * `webOrigin`: it came from a web origin (not the Android app).
  */
 export async function verifyPasskeyAssertion(
   rp: RelyingParty,
   response: PasskeyAssertionResponse,
   challenge: string,
   passkey: StoredPasskey,
-): Promise<{ counter: number; backupState: boolean } | null> {
+  expectedRPID: string,
+): Promise<{ counter: number; backupState: boolean; webOrigin: boolean } | null> {
   try {
     const result = await verifyAuthenticationResponse({
       response,
       expectedChallenge: challenge,
-      expectedOrigin: rp.origins,
-      expectedRPID: rp.rpID,
+      expectedOrigin: [...rp.origins, ...rp.androidOrigins],
+      expectedRPID,
       requireUserVerification: true,
       credential: {
         id: Buffer.from(passkey.credentialId).toString("base64url"),
@@ -295,7 +409,11 @@ export async function verifyPasskeyAssertion(
       },
     });
     if (!result.verified || !result.authenticationInfo.userVerified) return null;
-    return { counter: result.authenticationInfo.newCounter, backupState: result.authenticationInfo.credentialBackedUp };
+    return {
+      counter: result.authenticationInfo.newCounter,
+      backupState: result.authenticationInfo.credentialBackedUp,
+      webOrigin: rp.origins.includes(result.authenticationInfo.origin),
+    };
   } catch {
     return null;
   }

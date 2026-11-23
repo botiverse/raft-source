@@ -38,7 +38,8 @@
  *                and stands for no person or address
  *   phase        download only: offer (before Open) | opening (after Open:
  *                "Nothing happened? Download")
- *   remembered   open/stay on desktop: "Remember my choice" was ticked
+ *   remembered   open/stay on desktop: always false since 2026-11-17 (nothing
+ *                is remembered any more); kept so the report's fields don't change
  *
  * Consumer: @AndyLok's report (offered → open → handed_over without an
  * app_missing of the same attempt, by surface and platform); registered in
@@ -161,8 +162,8 @@ export function reportOpenInAppOffered(context: OpenInAppContext): void {
   emit("offered", context);
 }
 
-export function reportOpenInAppStay(context: OpenInAppContext, remembered = false): void {
-  emit("stay", context, context.surface === "desktop_banner" ? { remembered } : {});
+export function reportOpenInAppStay(context: OpenInAppContext): void {
+  emit("stay", context, context.surface === "desktop_banner" ? { remembered: false } : {});
 }
 
 export function reportOpenInAppMissing(context: OpenInAppContext): void {
@@ -188,13 +189,15 @@ export function __resetOpenInAppWatchForTest(): void {
  * of the two, once, for the latest Open only; the listeners go either way.
  * Both `open` and `handed_over` are sent at once: the page may be leaving.
  */
-export function reportOpenInAppOpen(context: OpenInAppContext, remembered = false): void {
+export function reportOpenInAppOpen(context: OpenInAppContext): void {
+  // `remembered` is always false since nothing is remembered (2026-11-17); kept for the report's fields.
+  const remembered = context.surface === "desktop_banner" ? { remembered: false } : {};
   if (!context.signedIn || typeof window === "undefined" || typeof document === "undefined") {
-    emit("open", context, context.surface === "desktop_banner" ? { remembered } : {}, true);
+    emit("open", context, remembered, true);
     return;
   }
   const attempt = newAttempt();
-  emit("open", context, { attempt, ...(context.surface === "desktop_banner" ? { remembered } : {}) }, true);
+  emit("open", context, { attempt, ...remembered }, true);
   stopWatching?.();
   let settled = false;
   const stop = () => {

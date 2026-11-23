@@ -122,7 +122,7 @@ function ServerLevelRow({ server, isCurrent }: { server: Server; isCurrent: bool
           </ListRowTitle>
         </ListRowBody>
         <div className={hasCustomized ? "shrink-0 @max-lg:basis-full @lg:col-start-2 @lg:row-span-2 @lg:row-start-1" : "shrink-0 @max-lg:basis-full"}>
-          <NotificationLevelSelect target={target} fit className="@max-lg:w-full @max-lg:max-w-sm" showNotes={false} aria-labelledby={labelId} testId={`notification-server-level-${server.id}`} />
+          <NotificationLevelSelect target={target} aria-labelledby={labelId} testId={`notification-server-level-${server.id}`} />
         </div>
         {hasCustomized && (
           <ListRowDescription className="@max-lg:basis-full @lg:col-start-1 @lg:row-start-2" data-testid={`notification-server-customized-line-${server.id}`}>

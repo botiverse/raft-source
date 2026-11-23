@@ -1,7 +1,9 @@
 // `raft artifact resolve` / `reopen` (#249) through the real parser: the
 // thread and --note reach the request, a missing comment is refused before
-// any request, the answers and refusals are the shared text with a next step,
-// and `raft artifact comments` marks resolved threads and lists open ones.
+// any request, the answers and refusals are the shared text with a next step
+// (how the thread's author hears of it, #proj-workspace:#340), `raft artifact comments` marks
+// resolved threads and lists open ones, and `--held` lists a hold's comments
+// again.
 import assert from "node:assert/strict";
 
 import type { ApiResponse } from "../../client";
@@ -61,7 +63,7 @@ test("resolve --note: the thread and the note reach the request; the answer says
     comment: { ...root, resolvedAt: "2026-10-23T09:00:00.000Z", resolvedBy: sage },
     note: { ...root, id: "c_9", author: sage, version: 13, replyTo: "c_1", body: "Done in v13.", resolvedAt: null, resolvedBy: null },
     changed: true,
-    notified: [{ actor: kirby, reason: "resolved" }],
+    notified: [{ actor: kirby, reason: "resolved", delivery: "inbox" }],
     notNotified: [],
   }));
   assert.equal(r.stderr, "");
@@ -69,10 +71,58 @@ test("resolve --note: the thread and the note reach the request; the answer says
   assert.equal(r.stdout, [
     `Resolved @Kirby's thread c_1 on a.html (v12) of "Proto" (pt_abc).`,
     "Your note is reply c_9 in the thread.",
-    "Told: @Kirby (the thread's author).",
+    "@Kirby gets a notice with its next wake-up; this does not wake it. If you need it to act, @mention it.",
     "To reopen it: raft artifact reopen pt_abc c_1",
     "",
   ].join("\n"));
+});
+
+test("#proj-workspace:#340: resolve says how its author hears of it, by the Server's delivery: a person in Activity without an unread, nothing for your own thread, an agent that can't see it gets nothing, an older Server's line as it was", async () => {
+  const resolvedBy = (by: typeof sage, notified: unknown[], author: { type: "agent" | "user"; name: string } = kirby) => run(["artifact", "resolve", "pt_abc", "c_1"], () => ok({
+    artifact: artifactRef, comment: { ...root, author, resolvedAt: "2026-10-23T09:00:00.000Z", resolvedBy: by }, note: null, changed: true, notified, notNotified: [],
+  }));
+  const xxchan = { type: "user" as const, name: "xxchan" };
+  const person = await resolvedBy(sage, [{ actor: xxchan, reason: "resolved", delivery: "activity" }], xxchan);
+  assert.equal(person.stdout, [
+    `Resolved @xxchan's thread c_1 on a.html (v12) of "Proto" (pt_abc).`,
+    "@xxchan sees it in Activity; it is not marked unread.",
+    "To reopen it: raft artifact reopen pt_abc c_1",
+    "",
+  ].join("\n"));
+  const own = await resolvedBy(kirby, []);
+  assert.equal(own.stdout, `Resolved @Kirby's thread c_1 on a.html (v12) of "Proto" (pt_abc).\nTo reopen it: raft artifact reopen pt_abc c_1\n`);
+  const cantSee = await resolvedBy(sage, []);
+  assert.ok(cantSee.stdout.includes("\n@Kirby gets no notice: it can't see the artifact.\n"), cantSee.stdout);
+  // A Server before #340 gives no `delivery` (it pushed the notice): the line it always had.
+  const older = await resolvedBy(sage, [{ actor: kirby, reason: "resolved" }]);
+  assert.ok(older.stdout.includes("\nTold: @Kirby (the thread's author).\n"), older.stdout);
+  assert.ok(!older.stdout.includes("wake-up"), older.stdout);
+});
+
+test("comments --held: the range reaches the request (with all and its start as the cursor, for older Servers); the list says what it is and pages with it", async () => {
+  const listed = {
+    artifact: artifactRef,
+    view: "all",
+    path: null,
+    comments: [{ ...root, resolvedAt: null, resolvedBy: null }],
+    nextCursor: "57",
+    unseenVersionCount: 0,
+  };
+  const r = await run(["artifact", "comments", "pt_abc", "--held", "41..57"], () => ok({ ...listed, held: "41..57" }));
+  assert.equal(r.stderr, "");
+  assert.equal(r.requests.length, 1);
+  const url = new URL(`https://raft.example${r.requests[0]!.path}`);
+  assert.equal(url.pathname, `${BASE}/pt_abc/comments`);
+  assert.deepEqual(Object.fromEntries(url.searchParams), { all: "1", cursor: "41", held: "41..57" });
+  assert.ok(r.stdout.startsWith(`The comments in "Proto" that a held command marked seen, again (oldest first):\n`), r.stdout);
+  assert.ok(r.stdout.includes("More: raft artifact comments pt_abc --held 41..57 --cursor 57"), r.stdout);
+  // A Server before it ignores `held`: said so.
+  const older = await run(["artifact", "comments", "pt_abc", "--held", "41..57"], () => ok(listed));
+  assert.ok(older.stdout.startsWith("This Server can't list them by range yet; these are all the comments after where that held command started.\n"), older.stdout);
+  // Not a range: refused before any request.
+  const malformed = await run(["artifact", "comments", "pt_abc", "--held", "41-57"], () => { throw new Error("no request expected"); });
+  assert.deepEqual(malformed.requests, []);
+  assert.notEqual(malformed.stderr, "");
 });
 
 test("resolve again: already resolved, nothing changed and no note; reopen without a body", async () => {

@@ -1,7 +1,7 @@
 import { useCallback, useMemo } from "react";
 import type { MouseEvent } from "react";
 import { useIntl } from "react-intl";
-import { ArrowUpRight } from "lucide-react";
+import { AppWindow, ArrowUpRight } from "lucide-react";
 import {
   Badge,
   FilePreview,
@@ -27,12 +27,14 @@ import type { ArtifactCard, ArtifactReference } from "@botiverse/raft-shared";
 import { ARTIFACT_KIND_BADGE, artifactDeletedOf, formatArtifactDeleted, formatArtifactFacts, formatArtifactUpdated } from "./artifactFacts";
 import type { ArtifactDeletedShown } from "./artifactFacts";
 import { artifactUrl } from "./artifactLinks";
-import { useArtifactOpenIntent } from "./artifactOpenIntent";
+import { rememberArtifactCard, useArtifactOpenIntent } from "./artifactOpenIntent";
+import { isNewWindowClick, openArtifactInWindow, useArtifactMiniWindows } from "./artifactWindowOpening";
 import { isPlainPrimaryClick, openArtifactCardInPlace } from "./openArtifactInPlace";
 import { artifactOpenLabelId, openArtifactWindow, opensArtifactWindows } from "./artifactWindow";
 import ArtifactScopeLabel from "./ArtifactScopeLabel";
 import { useArtifactCardPicture } from "./artifactCardPicture";
 import { ArtifactCardExcerpt } from "./ArtifactCardExcerpt";
+import { ArtifactSettledTag } from "./ArtifactSettledParts";
 
 // The file badge on the glyph: the file type as people know it, not a word
 // for the kind. A card has no file name (AttachmentTypeBadge reads one), so
@@ -145,6 +147,10 @@ export function NewSticker({ mentioned = false, newerVersion, newComments, twoLi
  *
  * What is new to this reader since they last looked (`card.unseen`, unseenMarks): one sticker after the version
  * badge, "Updated", "N new comments" or both (NewSticker); the footer's comment count stays plain.
+ *
+ * Settled (#334): the Settled tag between the version tag and the sticker while the Artifact is settled now, as the
+ * version and the comment count follow it now: an older message's card says so once it is, and stops when a new
+ * version takes it back to Working. Nothing where the card says nothing of it (`settled` absent: the flag off).
  */
 export default function ArtifactMessageCard({ reference, preview = false }: { reference: ArtifactReference; preview?: boolean }) {
   if (reference.status === "ok") return preview ? <OkCard card={reference.card} preview /> : <OkCard card={reference.card} />;
@@ -197,10 +203,19 @@ export function ArtifactDeletedCard({ deleted }: { deleted: ArtifactDeletedShown
 function OkCard({ card, preview = false }: { card: ArtifactCard; preview?: boolean }) {
   const intl = useIntl();
   const { formatMessage } = intl;
+  // Raft Desktop with the Artifact mini window (artifactWindowOpening.ts): Open in new page is Open in new window, the
+  // reused Artifact window (another with Cmd/Ctrl), and a Cmd/Ctrl-click on the title opens another window too. A plain
+  // click on the card stays in place.
+  const miniWindows = useArtifactMiniWindows();
   const handleOpen = useCallback((event: MouseEvent<HTMLAnchorElement>) => {
+    if (miniWindows && isNewWindowClick(event)) {
+      rememberArtifactCard(card);
+      if (openArtifactInWindow({ id: card.id, version: card.pinned ? card.version : null }, { enabled: miniWindows, source: "message_card", additional: true, from: event.currentTarget, title: card.title })) event.preventDefault();
+      return;
+    }
     if (!isPlainPrimaryClick(event)) return;
     if (openArtifactCardInPlace(card, event.currentTarget)) event.preventDefault();
-  }, [card]);
+  }, [card, miniWindows]);
   const facts = formatArtifactFacts(card.kind, card.facts, intl);
   const url = artifactUrl(card.id, card.pinned ? card.version : null);
   // The comment count opens the Artifact on its comments; outside the app shell, its page (the title's link).
@@ -210,16 +225,24 @@ function OkCard({ card, preview = false }: { card: ArtifactCard; preview?: boole
   // Installed on a computer, Open in new page is a window of its own (artifactWindow); the href stays for a
   // middle click, Cmd/Ctrl-click and Copy link.
   const handleOpenInNewPage = useCallback((event: MouseEvent<HTMLAnchorElement>) => {
+    if (miniWindows && (isPlainPrimaryClick(event) || isNewWindowClick(event))) {
+      rememberArtifactCard(card);
+      const target = { id: card.id, version: card.pinned ? card.version : null };
+      if (openArtifactInWindow(target, { enabled: miniWindows, source: "message_card", additional: isNewWindowClick(event), from: event.currentTarget, title: card.title })) {
+        event.preventDefault();
+        return;
+      }
+    }
     if (!isPlainPrimaryClick(event) || !opensArtifactWindows()) return;
     event.preventDefault();
     openArtifactWindow(url, card.id);
-  }, [card.id, url]);
+  }, [card, url, miniWindows]);
   const target = useMemo(() => ({ id: card.id, version: card.pinned ? card.version : null }), [card.id, card.pinned, card.version]);
   // The title's ::after covers the card: pressing, hovering or focusing it is intent to open.
   const intent = useArtifactOpenIntent(target, card);
   const [picture, pictureRef] = useArtifactCardPicture(card);
   const meta = formatArtifactUpdated(card, intl);
-  const openInNewPage = formatMessage({ id: artifactOpenLabelId("artifacts.card.openInNewPage") });
+  const openInNewPage = formatMessage({ id: miniWindows ? "artifacts.card.openInNewWindow" : artifactOpenLabelId("artifacts.card.openInNewPage") });
   const marks = unseenMarks(card, preview);
   const parts = messageCard();
   const titleClass = parts.title({ className: "min-w-0 flex-[1_1_8rem] break-words" });
@@ -229,10 +252,10 @@ function OkCard({ card, preview = false }: { card: ArtifactCard; preview?: boole
     // does (raft-ui MessageEmbed `interactive`); a preview opens nothing, so it doesn't.
     <MessageEmbed ref={pictureRef} size="item" interactive={!preview} className="relative" data-testid="artifact-card" data-artifact-id={card.id} inert={preview || undefined}>
       {/* A screenshot or a publisher's cover: 16:10, at most 192 px tall (max-h-48, cut from the top: the page's top and first screen), as the DS link card and near the conversation's other media; the home page's tile, a browsing grid, shows it whole. A Markdown version's excerpt follows its words, up to the same 192 px. */}
-      {/* Until a screenshot is read (only once the card nears the screen; off screen too, the card says there is one), its place is kept (an empty box), so the conversation doesn't move when it comes; one that can't be read gives the place back. */}
-      {picture?.loading ? (
+      {/* Until a screenshot is read (only once the card nears the screen; off screen too, the card says there is one), its place is kept (an empty box), so the conversation doesn't move when it comes; so does a publisher's cover, and one that can't be read keeps it too (#proj-uiux:#1311). */}
+      {picture?.loading || picture?.unreadable ? (
         <MessageEmbedContent>
-          <div className="aspect-[16/10] max-h-48 w-full border-b border-line-hairline bg-fill-muted" data-testid="artifact-card-cover-pending" />
+          <div className="aspect-[16/10] max-h-48 w-full border-b border-line-hairline bg-fill-muted" data-testid="artifact-card-cover-pending" data-cover-state={picture.loading ? "loading" : "unreadable"} />
         </MessageEmbedContent>
       ) : picture?.src ? (
         <MessageEmbedContent>
@@ -272,8 +295,9 @@ function OkCard({ card, preview = false }: { card: ArtifactCard; preview?: boole
                 </a>
               </p>
             )}
-            <span className="flex min-w-0 max-w-full items-center gap-1 pt-px">
+            <span className={`flex min-w-0 max-w-full items-center gap-1 pt-px ${card.settled ? "flex-wrap" : ""}`}>
               <ArtifactVersionBadge version={card.version} latest={card.pinned ? card.latestVersion : undefined} />
+              {card.settled ? <ArtifactSettledTag settled={card.settled} /> : null}
               <NewSticker newerVersion={marks.newerVersion} newComments={marks.newComments} />
             </span>
           </div>
@@ -288,7 +312,7 @@ function OkCard({ card, preview = false }: { card: ArtifactCard; preview?: boole
             nativeButton={false}
             render={<a href={url} target="_blank" rel="noopener noreferrer" onClick={handleOpenInNewPage} aria-label={openInNewPage} />}
           >
-            <ArrowUpRight aria-hidden />
+            {miniWindows ? <AppWindow aria-hidden /> : <ArrowUpRight aria-hidden />}
           </PanelAction>
         )}
       </MessageEmbedHeader>

@@ -43,6 +43,7 @@ export function releaseInlineAudioKeepAliveScope(scope: InlineAudioKeepAliveScop
 export function useInlineAudioKeepAliveScope(conversationKey: string | undefined): InlineAudioKeepAliveScope {
   const [scope] = useState(createInlineAudioKeepAliveScope);
   useLayoutEffect(() => {
+    // oxlint-disable-next-line react/immutability -- the scope is a holder kept for the timeline's life (useState only gives it a stable identity; it has no setter and nothing renders from it), switched on in the effect.
     scope.active = true;
     return () => releaseInlineAudioKeepAliveScope(scope);
   }, [scope, conversationKey]);

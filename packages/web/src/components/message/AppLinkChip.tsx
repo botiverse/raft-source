@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useRef } from "react";
 import type { KeyboardEvent, MouseEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
-import { FileX, Link as LinkIcon } from "lucide-react";
+import { FileText, FileX, Link as LinkIcon } from "lucide-react";
 import {
   Button,
   MessageReferenceChip,
@@ -26,7 +26,8 @@ import {
   PreviewCardFooter,
   useTruncated,
 } from "@botiverse/raft-ui/wip";
-import { ArtifactLinkPreview, artifactKindIcon, artifactUrl, openArtifactOnPlainClick, useArtifactsAppName } from "../../apps/artifacts";
+import { ArtifactLinkPreview, ArtifactUnavailableLinkPreview, artifactKindIcon, artifactUrl, openArtifactOnPlainClick, useArtifactsAppName } from "../../apps/artifacts";
+import type { ArtifactLinkTarget } from "../../apps/artifacts";
 import { appLinkDomain, appLinkOpenHref, appLinkShortAddress } from "../../utils/appLinkAddress";
 import { useAuthStore } from "../../store/authStore";
 import { linkPreviewAppKey, linkPreviewViewerKey, useLinkPreviewConsentStore } from "../../store/linkPreviewConsentStore";
@@ -290,6 +291,47 @@ export function ObjectLinkChip({ link }: { link: Extract<ObjectLinkCard, { state
   );
 }
 
+/**
+ * An Artifact link this viewer can't read (a profile description's, while
+ * unavailable or failed): the gray chip of a reference that can't be shown
+ * (`MessageReferenceUnavailable`, with a pointer: it is a link) with the
+ * placeholder words (`label`), never the title or anything else the viewer
+ * may not read (the address is the author's public text; the chip shows the
+ * words rather than it only as a display choice), and the same hover card
+ * shell as ObjectLinkChip, its body only what to do
+ * (ArtifactUnavailableLinkPreview). It is still the
+ * Artifact's link, as an unanswered link in a message body stays the
+ * author's: a plain click opens it in place, where the viewer's "can't open"
+ * state says why (artifactLinkNoAccess.behavior); Cmd/Ctrl, Shift and middle
+ * clicks follow `artifactUrl`. `url` is the author's link (share images).
+ */
+export function UnavailableObjectChip({ url, target, label }: { url: string; target: ArtifactLinkTarget; label: string }) {
+  const owner = useId();
+  const appName = useArtifactsAppName();
+  const onClick = useCallback((event: MouseEvent<HTMLAnchorElement>) => openArtifactOnPlainClick(event, target), [target]);
+  const open = useMemo<InRaftLink>(() => ({ href: artifactUrl(target.id, target.version), onClick }), [target, onClick]);
+  const href = appLinkOpenHref(url);
+  if (!href) return null;
+  return (
+    <AppLinkHoverCard
+      label={label}
+      chip={
+        <>
+          <FileText aria-hidden />
+          <MessageReferenceLabel>{label}</MessageReferenceLabel>
+        </>
+      }
+      href={href}
+      open={open}
+      kind="object-unavailable"
+      owner={owner}
+    >
+      <ArtifactUnavailableLinkPreview />
+      <LinkCardFooter app={appName} />
+    </AppLinkHoverCard>
+  );
+}
+
 const FOCUSABLE = "a[href], button:not([disabled]), [tabindex]:not([tabindex='-1'])";
 
 /**
@@ -312,8 +354,8 @@ function AppLinkHoverCard({ chip, label, href, open, kind, confirmFor, owner, ch
   href: string;
   /** A first-party chip's own page in Raft and its click; without it the chip opens `href` in a new tab. */
   open?: InRaftLink;
-  /** What the chip is: an App result's kind, or a first-party `object`. */
-  kind: AppLinkResult["kind"] | "object";
+  /** What the chip is: an App result's kind, a first-party `object`, or one this viewer can't read (the gray chip). */
+  kind: AppLinkResult["kind"] | "object" | "object-unavailable";
   confirmFor?: Extract<AppLinkResult, { kind: "card" }>;
   owner: string;
   children: ReactNode;
@@ -347,7 +389,9 @@ function AppLinkHoverCard({ chip, label, href, open, kind, confirmFor, owner, ch
     <PreviewCard onOpenChange={returnFocus}>
       <PreviewCardTrigger
         ref={chipRef}
-        render={<MessageReferenceChip variant="info" capped render={open ? inRaftLink(open, label) : newTabLink(href, label)} />}
+        render={kind === "object-unavailable"
+          ? <MessageReferenceUnavailable className="cursor-pointer" render={open ? inRaftLink(open, label) : newTabLink(href, label)} />
+          : <MessageReferenceChip variant="info" capped render={open ? inRaftLink(open, label) : newTabLink(href, label)} />}
         onKeyDown={intoCard}
         data-app-link-chip={kind}
         data-app-link-chip-url={href}
@@ -356,7 +400,7 @@ function AppLinkHoverCard({ chip, label, href, open, kind, confirmFor, owner, ch
       </PreviewCardTrigger>
       {/* Per-viewer App data: share screenshots strip it (selectScreenshot.ts).
           A card showing one item is item-wide; one asking for one action (connect, allow) keeps the default. */}
-      <PreviewCardContent ref={cardRef} size={kind === "card" || kind === "object" ? "item" : "profile"} onKeyDown={outOfCard} data-app-link-preview="">
+      <PreviewCardContent ref={cardRef} size={kind === "card" || kind === "object" || kind === "object-unavailable" ? "item" : "profile"} onKeyDown={outOfCard} data-app-link-preview="">
         {children}
       </PreviewCardContent>
     </PreviewCard>

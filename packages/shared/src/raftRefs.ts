@@ -2,6 +2,13 @@ import { markdownStructure, visitOutsideRanges } from "./markdownRanges";
 import type { SourceRange } from "./markdownRanges";
 export const RAFT_REF_CHANNEL_NAME_PATTERN = String.raw`[\p{L}\p{N}_-]+`;
 export const RAFT_REF_USER_NAME_PATTERN = RAFT_REF_CHANNEL_NAME_PATTERN;
+/**
+ * What may come right before the `@` of a free-text mention (one capture
+ * group): the line start or any character that is not a letter, digit, `_` or
+ * `-`, so `a@b.com` and `草案@Mona` are no mention. Search previews neutralise
+ * with the same boundary (agentText/search.ts).
+ */
+export const RAFT_MENTION_LEFT_BOUNDARY_PATTERN = String.raw`(^|[^\p{L}\p{N}_-])`;
 // Built-in app conversations use dotted peer names. Keep this a literal
 // peer-name grammar (not a path/glob): dots are the only addition to the
 // existing word/hyphen alphabet.
@@ -81,7 +88,7 @@ export function resolveRaftMentionHandle(
 }
 
 export function createRaftUserRefRegex(): RegExp {
-  return new RegExp(`(^|[^\\p{L}\\p{N}_-])@(${RAFT_REF_USER_NAME_PATTERN})`, "gu");
+  return new RegExp(`${RAFT_MENTION_LEFT_BOUNDARY_PATTERN}@(${RAFT_REF_USER_NAME_PATTERN})`, "gu");
 }
 
 /**

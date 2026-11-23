@@ -6,7 +6,6 @@
 // limits gives the preset back. On an older Computer they are hidden and such
 // a save is refused.
 import assert from "node:assert/strict";
-import { vi } from "vitest";
 import {
   applyRuntimeFormV2Change,
   initialRuntimeFormV2Values,
@@ -25,9 +24,6 @@ import {
 } from "./runtimeFormV2Registry";
 import { BuiltInModelCatalogError, assertBuiltInPresetSupportedByCatalog } from "./builtinModelCatalogCompatibility";
 import { buildBuiltInPiFormOptionSource } from "./runtimeFormDefinitionService";
-
-vi.mock("./providerConnectionFeature", () => ({ isProviderConnectionsEnabled: vi.fn(async () => false) }));
-vi.mock("./providerConnectionService", () => ({ listProviderConnections: vi.fn(async () => []) }));
 
 const KIMI = "openrouter/moonshotai/kimi-k2.6";
 const AUTO = "openrouter/openrouter/auto";
@@ -114,7 +110,7 @@ test("an older Computer: the limit fields are hidden for OpenRouter, and a liste
     () => assertBuiltInPresetSupportedByCatalog(config, {
       kind: "live",
       value: { models: [{ id: KIMI, label: "Kimi" }], catalog: { protocolVersion: 1, runtime: "builtin", runtimeVersion: "1.5.0" } },
-    }, { machineId: "m", daemonVersion: "1.0.67", computerVersion: "1.0.67" }, null),
+    }, { machineId: "m", daemonVersion: "1.0.67", computerVersion: "1.0.67" }),
     (error: unknown) => error instanceof BuiltInModelCatalogError && error.code === "builtin_custom_model_upgrade_required",
   );
 });

@@ -51,7 +51,8 @@ test("tool style: server summary and overview name tools, including the role-gat
   assert.ok(summary.includes(`Full dump: server_info({ view: "full" })`));
   const full = formatAgentServerInfo(SERVER, "tool");
   assert.ok(full.includes("Use the channel attention tools (`channels_join`, `channels_leave`, `channels_mute`, `channels_unmute`; `threads_unfollow`)"));
-  assert.ok(full.includes("Channel management tools (`channels_create`, `channels_update`, `channels_archive`, `channels_unarchive`, `channels_add_member`, `channels_remove_member`) work when your server role allows them, or, for update, archive, unarchive and remove-member, your channel-admin role in that channel; the Server checks on each call, and a refusal says what is missing."));
+  assert.ok(full.includes("Channel management tools (`channels_create`, `channels_update`, `channels_archive`, `channels_unarchive`, `channels_add_member`, `channels_remove_member`, `channels_set_role`) work when your server role allows them, or, for update, archive, unarchive, remove-member and set-role, your channel-admin role in that channel; the Server checks on each call, and a refusal says what is missing."));
+  assert.ok(!full.includes("There is no tool for changing channel roles"));
   assert.ok(full.includes("Server-profile changes use `server_update` and remain server-role gated.\n"));
   assert.ok(!full.includes("actions_prepare"), "admin writes are tools now, not action cards");
   assert.ok(full.includes(`To start a new DM: messages_send({ target: "dm:@name", content: … }). To reply`));

@@ -2,32 +2,29 @@
  * Shared v3 wire fixtures (`*.v3.json` in packages/runtime-form/fixtures):
  * exactly what the server sends to a client that advertises
  * `runtime_form.v3`, for the runtimes whose forms change in v3 (Built-in:
- * rules, saved connections, unavailable connections; Codex, Grok, Claude,
+ * rules; Codex, Grok, Claude,
  * Copilot, Kimi Code, Pi, Antigravity: the reasoning effort as a dependent_select). The v2
  * fixtures stay byte-identical (runtimeFormV2Fixtures.test.ts). Regenerate
  * with UPDATE_RUNTIME_FORM_FIXTURES=1 and review the diff as a client-visible
- * change.
+ * change. The saved-connection fixtures (`builtin.*saved-connections*`,
+ * `builtin.edit.connection-unavailable`) stay for the client conformance
+ * tests in packages/runtime-form; the server no longer sends such forms.
  */
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { RuntimeFormV2Definition } from "@botiverse/raft-runtime-form";
-import { BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS } from "@botiverse/raft-shared";
 
 import {
   buildRuntimeFormV2,
   buildRuntimeFormV2EditBody,
-  runtimeFormV2Entry,
-  withSavedConnectionForm,
+  withCodexSpeedVisibility,
   type RuntimeFormOptionSourceContext,
-  type RuntimeFormV2OptionSourceBody,
 } from "./runtimeFormV2Registry";
 import {
   resolveRuntimeFormV3OptionSource,
   runtimeFormV3Revision,
   toRuntimeFormV3,
-  toRuntimeFormV3OptionSource,
-  type RuntimeFormV3Connection,
 } from "./runtimeFormV3";
 
 const FIXTURES_DIR = fileURLToPath(new URL("../../../runtime-form/fixtures/", import.meta.url));
@@ -36,42 +33,39 @@ const wire = (value: unknown) => JSON.parse(JSON.stringify(value)) as unknown;
 
 /** What web advertises once it renders v3. */
 const V3_CAPABILITIES = ["dependent_select.custom_value_with_options", "runtime_form.v3"];
-const CONNECTIONS: RuntimeFormV3Connection[] = [
-  { value: "connection:conn-deepseek", underlyingProviderId: "deepseek" },
-  { value: "connection:conn-gateway", underlyingProviderId: "openai-compatible" },
-  { value: "connection:conn-off", underlyingProviderId: "deepseek" },
-];
 
 /**
  * A served v2 form (create or edit body) as the v3 routes send it, for a
  * current Computer: the built form shows the limit fields for every preset
- * provider that takes a typed id, and that Computer runs those through a
- * saved connection too.
+ * provider that takes a typed id.
  */
-function v3(runtimeId: string, form: RuntimeFormV2Definition, connections: RuntimeFormV3Connection[] = []): RuntimeFormV2Definition {
+function v3(runtimeId: string, form: RuntimeFormV2Definition): RuntimeFormV2Definition {
   return toRuntimeFormV3(form, {
-    connections,
-    typedConnectionProviderIds: BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS,
-    revision: runtimeFormV3Revision(runtimeId, form, V3_CAPABILITIES, connections),
+    revision: runtimeFormV3Revision(runtimeId, form, V3_CAPABILITIES),
   });
 }
 
 const edit = (runtimeId: string, runtimeConfig: Record<string, unknown>) =>
   buildRuntimeFormV2EditBody(runtimeId, { runtime: runtimeId, ...runtimeConfig })!;
 
-const builtinEntry = runtimeFormV2Entry("builtin")!;
-const savedConnectionBuild = (form: RuntimeFormV2Definition) => withSavedConnectionForm(builtinEntry, form, V3_CAPABILITIES);
-
-/** An option source as the v3 route resolves it, with a model probe answering `outcome`. */
-async function v3Source(runtimeId: string, sourceId: string, outcome: unknown = { kind: "missing_config" }): Promise<unknown> {
+/**
+ * An option source as the v3 route resolves it, with a model probe answering
+ * `outcome`; `routing: "not_routed"` resolves it for a Computer that is not
+ * connected (Built-in answers from its bundled catalog then).
+ */
+async function v3Source(
+  runtimeId: string,
+  sourceId: string,
+  outcome: unknown = { kind: "missing_config" },
+  routing: "confirmed_local" | "not_routed" = "confirmed_local",
+): Promise<unknown> {
   const context = {
     sourceId,
     machineId: "fixture-machine",
     machine: {},
-    sourceStatus: true,
     clientCapabilities: V3_CAPABILITIES,
     agentOrchestrator: { detectMachineRuntimeModels: async () => outcome },
-    routeToComputer: async () => "confirmed_local",
+    routeToComputer: async () => routing,
   } as unknown as RuntimeFormOptionSourceContext;
   const resolution = await resolveRuntimeFormV3OptionSource(buildRuntimeFormV2(runtimeId), context);
   assert.equal(resolution.kind, "source");
@@ -91,52 +85,51 @@ const CODEX_LIVE = {
   },
 };
 
-/** Built-in's provider select with saved connections (one disabled), as withSavedConnectionOptions builds it. */
-async function builtinProviderWithConnections(): Promise<RuntimeFormV2OptionSourceBody> {
-  const context = {
-    sourceId: "provider",
-    machineId: "fixture-machine",
-    machine: {},
-    sourceStatus: true,
-    clientCapabilities: V3_CAPABILITIES,
-    agentOrchestrator: { detectMachineRuntimeModels: async () => { throw new Error("offline"); } },
-    routeToComputer: async () => "not_routed",
-  } as unknown as RuntimeFormOptionSourceContext;
-  const resolution = await builtinEntry.resolveOptionSource(context);
-  const source = (resolution as { source: RuntimeFormV2OptionSourceBody }).source;
-  assert.equal(source.kind, "select");
-  return {
-    ...source,
-    options: [
-      { value: "connection:conn-deepseek", label: "DeepSeek · Team", providerKind: "preset", connectionId: "conn-deepseek", underlyingProviderId: "deepseek", group: "saved" },
-      { value: "connection:conn-gateway", label: "OpenAI Compatible · Team gateway", providerKind: "gateway", connectionId: "conn-gateway", underlyingProviderId: "openai-compatible", group: "saved" },
-      { value: "connection:conn-off", label: "DeepSeek · Old", providerKind: "preset", connectionId: "conn-off", underlyingProviderId: "deepseek", group: "saved", unavailable: true, unavailableReason: "disabled" },
-      ...(source.kind === "select" ? source.options.map((option) => ({ ...option, group: "direct" })) : []),
+const CODEX_TIERED_LIVE = {
+  kind: "live",
+  value: {
+    models: [
+      { id: "gpt-6.2-sol", label: "GPT-6.2-Sol", serviceTierChoices: [{ id: "priority", name: "Fast", description: "2x speed, increased usage" }] },
+      {
+        id: "gpt-6.2-astra",
+        label: "GPT-6.2-Astra",
+        serviceTierChoices: [
+          { id: "priority", name: "Fast", description: "2x speed, increased usage" },
+          { id: "ultrafast", name: "Ultrafast", description: "Up to 4.5x speed, uses more of your plan" },
+        ],
+      },
+      { id: "gpt-5-mini", label: "GPT-5 Mini", serviceTierChoices: [] },
     ],
-  } as RuntimeFormV2OptionSourceBody;
-}
+    default: "gpt-6.2-sol",
+  },
+};
+
+/**
+ * Codex's model list for the visual case: both lists above, so the model
+ * source names every model the effort (CODEX_LIVE) and speed
+ * (CODEX_TIERED_LIVE) sources are keyed by.
+ */
+const CODEX_ALL_LIVE = {
+  kind: "live",
+  value: { models: [...CODEX_LIVE.value.models, ...CODEX_TIERED_LIVE.value.models], default: CODEX_LIVE.value.default },
+};
+
+const CLAUDE_OFFLINE = { kind: "error", retryable: true, code: "computer_offline" };
 
 const fixtures = async (): Promise<Record<string, unknown>> => ({
-  // Built-in: rules instead of visibility; with saved connections the owned
-  // fields hide by rule and the gateway connection keeps the limit fields.
+  // Built-in: rules instead of visibility.
   "builtin.form.v3.json": v3("builtin", buildRuntimeFormV2("builtin")),
-  "builtin.form.saved-connections.v3.json": v3("builtin", savedConnectionBuild(buildRuntimeFormV2("builtin")), CONNECTIONS),
-  "builtin.edit.connection-unavailable.v3.json": v3("builtin", savedConnectionBuild(edit("builtin", {
-    provider: { kind: "connection", connectionId: "conn-off" },
-    model: { kind: "preset", id: "deepseek/deepseek-v4-pro" },
-    loadLocalPlugins: false,
-    envVars: {},
-  })), CONNECTIONS),
-  "builtin.option-source.provider.saved-connections.v3.json": toRuntimeFormV3OptionSource(await builtinProviderWithConnections()),
-  // Reasoning effort as a dependent_select keyed by model.
-  "codex.form.v3.json": v3("codex", buildRuntimeFormV2("codex")),
-  "codex.edit.v3.json": v3("codex", edit("codex", {
+  // Reasoning effort and mutually-exclusive speed controls for a tiered Codex probe.
+  "codex.form.v3.json": v3("codex", withCodexSpeedVisibility(buildRuntimeFormV2("codex"), CODEX_TIERED_LIVE.value.models)),
+  "codex.edit.v3.json": v3("codex", withCodexSpeedVisibility(edit("codex", {
     model: { kind: "custom", name: "my-org/codex-custom" },
     mode: { kind: "fast" },
     reasoningEffort: "high",
     envVars: { EXAMPLE_FLAG: "1" },
-  })),
+  }), CODEX_TIERED_LIVE.value.models)),
   "codex.option-source.reasoning-effort.v3.json": await v3Source("codex", "reasoningEffort", CODEX_LIVE),
+  // #wg-runtime-form:#27: a key only for a model with two or more named fast tiers.
+  "codex.option-source.speed.v3.json": await v3Source("codex", "speed", CODEX_TIERED_LIVE),
   "grok.form.v3.json": v3("grok", buildRuntimeFormV2("grok")),
   "claude.form.v3.json": v3("claude", buildRuntimeFormV2("claude")),
   "claude.edit.v3.json": v3("claude", edit("claude", {
@@ -147,7 +140,7 @@ const fixtures = async (): Promise<Record<string, unknown>> => ({
     envVars: { EXAMPLE_FLAG: "1" },
     command: "/usr/local/bin/claude",
   })),
-  "claude.option-source.reasoning-effort.v3.json": await v3Source("claude", "reasoningEffort", { kind: "error", retryable: true, code: "computer_offline" }),
+  "claude.option-source.reasoning-effort.v3.json": await v3Source("claude", "reasoningEffort", CLAUDE_OFFLINE),
   "copilot.edit.v3.json": v3("copilot", edit("copilot", {
     model: { kind: "custom", name: "vendor/copilot-custom" },
     reasoningEffort: "high",
@@ -166,6 +159,24 @@ const fixtures = async (): Promise<Record<string, unknown>> => ({
   })),
   "pi.option-source.reasoning-effort.v3.json": await v3Source("pi", "reasoningEffort"),
   "pi.option-source.provider-reasoning-effort.v3.json": await v3Source("pi", "providerReasoningEffort"),
+  // Every option source of every create form above, so a client (the visual
+  // cases in packages/runtime-form/fixtures/visual-cases.v3.json) can render
+  // each real create form from server output alone. One probe outcome per
+  // runtime, the same one its reasoning effort source above was built from, so
+  // a model list and its effort list agree.
+  "builtin.option-source.provider.v3.json": await v3Source("builtin", "provider", undefined, "not_routed"),
+  "builtin.option-source.model.v3.json": await v3Source("builtin", "model", undefined, "not_routed"),
+  "builtin.option-source.reasoning-effort.v3.json": await v3Source("builtin", "reasoningEffort", undefined, "not_routed"),
+  "claude.option-source.provider.v3.json": await v3Source("claude", "provider", CLAUDE_OFFLINE),
+  "claude.option-source.auth-type.v3.json": await v3Source("claude", "authType", CLAUDE_OFFLINE),
+  "claude.option-source.model.v3.json": await v3Source("claude", "model", CLAUDE_OFFLINE),
+  "codex.option-source.model.v3.json": await v3Source("codex", "model", CODEX_ALL_LIVE),
+  "grok.option-source.model.v3.json": await v3Source("grok", "model"),
+  "grok.option-source.reasoning-effort.v3.json": await v3Source("grok", "reasoningEffort"),
+  "kimi-sdk.option-source.model.v3.json": await v3Source("kimi-sdk", "model"),
+  "pi.option-source.provider.v3.json": await v3Source("pi", "provider"),
+  "pi.option-source.model.v3.json": await v3Source("pi", "model"),
+  "pi.option-source.provider-model.v3.json": await v3Source("pi", "providerModel"),
   // Only a model whose thought levels agy listed has an effort; "default" (agy's choice) has none.
   "antigravity.edit.v3.json": v3("antigravity", edit("antigravity", { model: { kind: "preset", id: "default" }, envVars: {} })),
   "antigravity.option-source.reasoning-effort.v3.json": await v3Source("antigravity", "reasoningEffort", {

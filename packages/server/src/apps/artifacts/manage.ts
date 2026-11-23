@@ -96,6 +96,9 @@
 // and the `deleted` object event (for no one), and drops the item's pending
 // notices, search row and people's Activity rows (forgetArtifactActivity;
 // the route tells their clients after the commit: announceForgottenActivity).
+// After the commit of a delete, a narrowing or an unpublish, every socket
+// watching the Artifact leaves its rooms (live.ts forgetArtifactWatchers):
+// a page still open joins again only when it next watches, checked again.
 //
 // The agent API (an agent may manage only what it made: it is never a
 // manager, an owner or an admin): the flag, the Artifact the agent sees
@@ -127,11 +130,14 @@ import { getDb, type DatabaseExecutor } from "../../platform/db";
 import { deleteObjectFileBytes, deleteObjectFiles } from "../../platform/objectFiles";
 import { agentManagerOf, assertNeverViewActor, canManageObject, canManageObjectActionsWithStanding, type HomedObjectManagement, type ServerViewActor, type ViewActor } from "../../platform/visibility";
 import { forgetArtifactActivity, forgetArtifactActivityOfThoseWhoLost } from "./activity";
+import { forgetArtifactWatchers } from "./live";
 import {
   answer,
   artifactRef,
+  CLOSED_SERVER_READ_ONLY_ERROR,
   fail,
   homesOf,
+  itemWritable,
   json,
   namer,
   notVisible,
@@ -144,6 +150,7 @@ import {
 } from "./apiCommon";
 import { artifactFileObject, deleteItemChecks } from "./checks";
 import { clearItemExcerpts } from "./excerpt";
+import { forgetArtifactReferences } from "./references";
 import { artifactHome, followerRecipients, recordArtifactEvent } from "./events";
 import { isNameTakenInHome, isUniqueViolation, type ArtifactHomeRef } from "./names";
 import { followersOf } from "./notices";
@@ -479,7 +486,7 @@ export async function narrowArtifactHome(
   const actor = managingActor(viewer);
   if (actor === null) return DELEGATED_MANAGES_NONE;
   try {
-    return await getDb().transaction(async (tx) => {
+    const result = await getDb().transaction(async (tx) => {
       const [locked] = await tx.select().from(artifactItems).where(eq(artifactItems.id, itemId)).for("update");
       if (!locked) throw new Refused({ kind: "not_visible" });
       const target = await narrowingTarget(tx, actor, locked, to);
@@ -524,6 +531,9 @@ export async function narrowArtifactHome(
       });
       return { kind: "moved" as const, item: moved!, impact, forgotten };
     });
+    // Open pages of it hear nothing more until they watch again, checked in its new home (live.ts).
+    forgetArtifactWatchers(result.item.id);
+    return result;
   } catch (error) {
     if (error instanceof Refused) return error.refusal;
     // Another Artifact took the name in that home between the check and the move.
@@ -540,7 +550,7 @@ export async function unpublishArtifact(viewer: ViewActor, itemId: string): Prom
   const actor = managingActor(viewer);
   if (actor === null) return DELEGATED_MANAGES_NONE;
   try {
-    return await getDb().transaction(async (tx) => {
+    const result = await getDb().transaction(async (tx) => {
       const [locked] = await tx.select().from(artifactItems).where(eq(artifactItems.id, itemId)).for("update");
       if (!locked || !(await canViewArtifacts(actor, [locked], { executor: tx }))[0]) throw new Refused({ kind: "not_visible" });
       if (!(await mayManageArtifact(actor, locked, "widen", { executor: tx })) || managerKind(actor) !== "person") {
@@ -570,6 +580,9 @@ export async function unpublishArtifact(viewer: ViewActor, itemId: string): Prom
       });
       return { kind: "moved" as const, item: moved! };
     });
+    // Outsiders' open pages of it hear nothing more (live.ts); its own server's watch again, checked again.
+    forgetArtifactWatchers(result.item.id);
+    return result;
   } catch (error) {
     if (error instanceof Refused) return error.refusal;
     if (isUniqueViolation(error)) {
@@ -593,11 +606,11 @@ export async function deleteArtifact(viewer: ViewActor, itemId: string): Promise
       const [locked] = await tx.select().from(artifactItems).where(eq(artifactItems.id, itemId)).for("update");
       if (!locked || locked.deletedAt !== null || locked.revokedAt !== null) throw new Refused({ kind: "not_visible" });
       if (!(await mayManageArtifact(actor, locked, "delete", { executor: tx }))) {
-        // One who may not learns nothing about an Artifact they can't see.
+        // One who may not learns nothing about an Artifact they can't see; one who sees a closed server's (kept in a joint) is told it is read-only.
         const [visible] = await canViewArtifacts(actor, [locked], { executor: tx });
-        throw new Refused(visible
-          ? { kind: "forbidden", reason: "Only the artifact's author, the person who manages an agent author, and the server's owners and admins can delete it: ask one of them to." }
-          : { kind: "not_visible" });
+        throw new Refused(!visible
+          ? { kind: "not_visible" }
+          : { kind: "forbidden", reason: (await itemWritable(locked)) ? "Only the artifact's author, the person who manages an agent author, and the server's owners and admins can delete it: ask one of them to." : CLOSED_SERVER_READ_ONLY_ERROR });
       }
       const [deleted] = await tx.update(artifactItems).set({ deletedAt: sql`now()` })
         .where(eq(artifactItems.id, locked.id)).returning();
@@ -620,11 +633,15 @@ export async function deleteArtifact(viewer: ViewActor, itemId: string): Promise
       // Nor are its publish checks kept, nor its excerpts, nor any of its files (core's: the checks' screenshots; their bytes after the commit, below).
       await deleteItemChecks(tx, locked.id);
       await clearItemExcerpts(tx, locked.id);
+      // Nor what it links to (core's object_references; nothing lists it as linking any more).
+      await forgetArtifactReferences(tx, locked.id);
       const files = await deleteObjectFiles({ object: artifactFileObject(locked.id), executor: tx });
       // Nor is it in anyone's Activity: the rows go with the delete, and the badge with them.
       const forgotten = await forgetArtifactActivity(tx, locked.id);
       return { kind: "deleted" as const, forgotten, files };
     });
+    // No open page of it hears anything more (live.ts).
+    forgetArtifactWatchers(itemId);
     await deleteObjectFileBytes(files);
     return deleted;
   } catch (error) {
@@ -691,7 +708,7 @@ export function createManageOperations() {
   return {
     move: (agent: ArtifactAgent, params: AgentApiArtifactParams, body: AgentApiArtifactMoveBody): Promise<ArtifactApiResult<AgentApiArtifactMoved>> => answer(async () => {
       // resolveVisibleItem checks the caller's flag first.
-      const item = await resolveVisibleItem(agent, params.artifact);
+      const item = await resolveVisibleItem(agent, params.artifact, "write");
       const result = await widenArtifactHome(viewActor(agent), item.id, body.to);
       if (result.kind !== "moved") return agentRefusal(agent, item, result);
       const [artifact] = await summarize(agent, [result.item]);
@@ -702,7 +719,7 @@ export function createManageOperations() {
 
     delete: (agent: ArtifactAgent, params: AgentApiArtifactParams): Promise<ArtifactApiResult<AgentApiArtifactDeleted>> => answer(async () => {
       // resolveVisibleItem checks the caller's flag first.
-      const item = await resolveVisibleItem(agent, params.artifact);
+      const item = await resolveVisibleItem(agent, params.artifact, "write");
       const result = await deleteArtifact(viewActor(agent), item.id);
       if (result.kind !== "deleted") return agentRefusal(agent, item, result);
       announceForgottenActivity(result.forgotten);

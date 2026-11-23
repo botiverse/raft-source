@@ -45,7 +45,7 @@ import { createAppReminder } from "../apps/reminder/crud";
 import { createMessage } from "../services/messageService";
 import { inboxNotificationFacts, messages, reminders } from "../db/schema";
 import { ANTIPROTON_CINDY_FEATURE_FLAG_KEY, ANTIPROTON_MODEL_PICKER_FEATURE_FLAG_KEY, createFeatureFlag, createFeatureFlagRule, setFeatureFlagKillSwitch } from "../services/featureFlagService";
-import { buildCindyMemoryMd, buildCindySeedFiles, EXTERNAL_AGENT_RUNTIME_ID, EXTERNAL_AGENT_RUNTIME_MODEL } from "@botiverse/raft-shared";
+import { buildCindyMemoryMd, buildCindySeedFiles, EXTERNAL_AGENT_RUNTIME_ID, EXTERNAL_AGENT_RUNTIME_MODEL, GENERIC_RUNTIME_ERROR_MESSAGE } from "@botiverse/raft-shared";
 import { createHash } from "node:crypto";
 import { createAgent as createAgentRow } from "../services/agentService";
 
@@ -2539,8 +2539,8 @@ test("a hosted Cindy is created once per server under antiproton_cindy; the setu
       const cindyId = (created[0] as { agentId: string }).agentId;
       const [cindy] = await getDb().select().from(agents).where(eq(agents.id, cindyId));
       assert.deepEqual([cindy!.name, cindy!.displayName, cindy!.runtime, cindy!.avatarUrl], ["Cindy", "Cindy", "external", "pixel:mug"]);
-      const [linked] = await getDb().select({ onboardingAgentId: servers.onboardingAgentId }).from(servers).where(eq(servers.id, server.id));
-      assert.equal(linked!.onboardingAgentId, cindyId);
+      const [linked] = await getDb().select({ officialOnboardingAgentId: servers.officialOnboardingAgentId }).from(servers).where(eq(servers.id, server.id));
+      assert.equal(linked!.officialOnboardingAgentId, cindyId);
       const [membership] = await getDb().select({ role: serverAgentMembers.role }).from(serverAgentMembers).where(and(eq(serverAgentMembers.serverId, server.id), eq(serverAgentMembers.agentId, cindyId)));
       assert.equal(membership?.role, "admin");
       const row = await provisionRow(cindyId);
@@ -2558,11 +2558,11 @@ test("a hosted Cindy is created once per server under antiproton_cindy; the setu
       assert.deepEqual(await provisionHostedCindy({ serverId: server.id, ownerUserId: owner.id }), { outcome: "exists" });
 
       // A Cindy whose server link was lost (a crash before links committed together): the backstop relinks her.
-      await getDb().update(servers).set({ onboardingAgentId: null }).where(eq(servers.id, server.id));
+      await getDb().update(servers).set({ onboardingAgentId: null, officialOnboardingAgentId: null }).where(eq(servers.id, server.id));
       await getDb().update(serverAgentMembers).set({ role: "member" }).where(and(eq(serverAgentMembers.serverId, server.id), eq(serverAgentMembers.agentId, cindyId)));
       assert.deepEqual(await provisionHostedCindy({ serverId: server.id, ownerUserId: owner.id }), { outcome: "exists" });
-      const [relinked] = await getDb().select({ onboardingAgentId: servers.onboardingAgentId }).from(servers).where(eq(servers.id, server.id));
-      assert.equal(relinked!.onboardingAgentId, cindyId, "relinked to the same Cindy, no second one");
+      const [relinked] = await getDb().select({ officialOnboardingAgentId: servers.officialOnboardingAgentId }).from(servers).where(eq(servers.id, server.id));
+      assert.equal(relinked!.officialOnboardingAgentId, cindyId, "relinked to the same Cindy, no second one");
       const [relinkedRole] = await getDb().select({ role: serverAgentMembers.role }).from(serverAgentMembers).where(and(eq(serverAgentMembers.serverId, server.id), eq(serverAgentMembers.agentId, cindyId)));
       assert.equal(relinkedRole?.role, "admin");
       assert.equal((await getDb().select().from(agents).where(and(eq(agents.serverId, server.id), eq(agents.name, "Cindy")))).length, 1);
@@ -2574,8 +2574,19 @@ test("a hosted Cindy is created once per server under antiproton_cindy; the setu
       await createFeatureFlagRule({ flagKey: ANTIPROTON_CINDY_FEATURE_FLAG_KEY, stage: "user", decision: "allow", values: [owner.id] });
       const projection = await api(app.baseUrl, await tokenForHuman(owner.email), second.id).get(`/servers/${second.id}/setup-projection`);
       assert.equal(projection.status, 200);
-      const [backstopped] = await getDb().select({ onboardingAgentId: servers.onboardingAgentId }).from(servers).where(eq(servers.id, second.id));
-      assert.ok(backstopped!.onboardingAgentId, "the backstop created her");
+      const [backstopped] = await getDb().select({ officialOnboardingAgentId: servers.officialOnboardingAgentId }).from(servers).where(eq(servers.id, second.id));
+      assert.ok(backstopped!.officialOnboardingAgentId, "the backstop created her");
+
+      // A finished server without an official Cindy (a greeter-only server, say) is never
+      // backstopped: the owner loading setup creates nothing.
+      const finished = await createServer("Hosted Cindy finished", "hosted-cindy-finished", owner.id);
+      await getDb().update(serverMembers).set({ setupStatus: "complete", setupCompletionReason: "normal" })
+        .where(and(eq(serverMembers.serverId, finished.id), eq(serverMembers.userId, owner.id)));
+      const finishedProjection = await api(app.baseUrl, await tokenForHuman(owner.email), finished.id).get(`/servers/${finished.id}/setup-projection`);
+      assert.equal(finishedProjection.status, 200);
+      const [notBackstopped] = await getDb().select({ officialOnboardingAgentId: servers.officialOnboardingAgentId }).from(servers).where(eq(servers.id, finished.id));
+      assert.equal(notBackstopped!.officialOnboardingAgentId, null);
+      assert.equal((await getDb().select().from(agents).where(eq(agents.serverId, finished.id))).length, 0, "no hosted Cindy on a finished server");
 
       // Daily cap reached: falls back to the computer flow.
       process.env.HOSTED_CINDY_DAILY_CAP = "2";
@@ -2617,8 +2628,8 @@ test("staging test entry: the owner creates a hosted Cindy without antiproton_ci
       const created = await ownerApi.send("POST", `/servers/${server.id}/hosted-cindy`);
       assert.equal(created.status, 201);
       const { agentId } = await created.json() as { agentId: string };
-      const [linked] = await getDb().select({ onboardingAgentId: servers.onboardingAgentId }).from(servers).where(eq(servers.id, server.id));
-      assert.equal(linked!.onboardingAgentId, agentId, "she is the server's onboarding agent");
+      const [linked] = await getDb().select({ officialOnboardingAgentId: servers.officialOnboardingAgentId }).from(servers).where(eq(servers.id, server.id));
+      assert.equal(linked!.officialOnboardingAgentId, agentId, "she is the server's onboarding agent");
       assert.equal((await provisionRow(agentId))!.importSource, "cindy_seed");
       // The owner continues in Cindy's flow (survey, then handoff), as on a flag-on server.
       const projected = await (await ownerApi.get(`/servers/${server.id}/setup-projection`)).json() as { postSetup?: { surveyPending: boolean }; hostedCindyTestEntry?: boolean };
@@ -2633,7 +2644,7 @@ test("staging test entry: the owner creates a hosted Cindy without antiproton_ci
       delete process.env.DEPLOYMENT_ENV;
       const offStaging = await ownerApi.send("POST", `/servers/${server.id}/hosted-cindy`);
       assert.equal(offStaging.status, 404);
-      assert.deepEqual(await offStaging.json(), { error: "Not found", code: "hosted_cindy_test_entry_unavailable" });
+      assert.deepEqual(await offStaging.json(), { error: "Not found", code: "hosted_cindy_test_entry_unavailable", errorCode: "hosted_cindy_test_entry_unavailable" });
       process.env.DEPLOYMENT_ENV = "staging";
 
       // The hosted runtime is still required.
@@ -2691,11 +2702,21 @@ test("hosted Cindy setup (flag rolled back after she was created): usable while 
       assert.equal(stillHosted!.runtime, "external");
       assert.notEqual((await provisionRow(cindyId))!.state, "deleted");
 
+      // A runtime error she kept (a failed start's text included) is for her
+      // managers only; the conversion is announced to every member: the
+      // generic sentence, never the text (#wg-rbac:#57).
+      await getDb().update(agents).set({
+        lastRuntimeError: { message: "Codex failed: open /srv/cindy-private/x", at: new Date().toISOString(), actionRequired: true, spawnFailureReason: "runtime_spawn_failed" },
+      }).where(eq(agents.id, cindyId));
+
       // Confirmed: the same agent becomes the computer Cindy; the hosted side is gone.
       fake.setFallback(() => ({ status: 200, body: { status: "deleted" } }));
       const converted = await client.send("POST", "/agents", computerCindy);
       assert.equal(converted.status, 200, await converted.clone().text());
-      assert.equal((await converted.json() as { id: string }).id, cindyId, "converted in place, same id");
+      const convertedBody = await converted.json() as { id: string; lastRuntimeError?: { message: string } | null };
+      assert.equal(convertedBody.id, cindyId, "converted in place, same id");
+      assert.equal(convertedBody.lastRuntimeError?.message, GENERIC_RUNTIME_ERROR_MESSAGE);
+      assert.doesNotMatch(JSON.stringify(convertedBody), /cindy-private/);
       const [now] = await getDb().select().from(agents).where(eq(agents.id, cindyId));
       assert.equal(now!.runtime, "codex");
       // Her history: the hosted create, then one conversion by the owner (the
@@ -2714,8 +2735,8 @@ test("hosted Cindy setup (flag rolled back after she was created): usable while 
       const liveCredentials = await getDb().select().from(agentCredentials).where(and(eq(agentCredentials.agentId, cindyId), isNull(agentCredentials.revokedAt)));
       assert.equal(liveCredentials.length, 0, "her hosted credential is revoked");
       assert.equal((await getDb().select().from(agents).where(and(eq(agents.serverId, server.id), eq(agents.name, "Cindy")))).length, 1);
-      const [linked] = await getDb().select({ onboardingAgentId: servers.onboardingAgentId }).from(servers).where(eq(servers.id, server.id));
-      assert.equal(linked!.onboardingAgentId, cindyId);
+      const [linked] = await getDb().select({ officialOnboardingAgentId: servers.officialOnboardingAgentId }).from(servers).where(eq(servers.id, server.id));
+      assert.equal(linked!.officialOnboardingAgentId, cindyId);
 
       // Only a failed hosted Cindy converts: a computer (or active) Cindy is still a 409.
       assert.equal((await client.send("POST", "/agents", computerCindy)).status, 409);
@@ -2983,8 +3004,8 @@ test("with antiproton_cindy off, a new owner's new server keeps the original onb
       const serverId = (JSON.parse(text) as { id: string }).id;
       assert.equal(await isAgentRuntimeProviderEnabledForServer(serverId, "antiproton"), true, "hosted agents are on here");
 
-      const [server] = await getDb().select({ onboardingAgentId: servers.onboardingAgentId }).from(servers).where(eq(servers.id, serverId));
-      assert.equal(server!.onboardingAgentId, null, "no Cindy yet");
+      const [server] = await getDb().select({ officialOnboardingAgentId: servers.officialOnboardingAgentId }).from(servers).where(eq(servers.id, serverId));
+      assert.equal(server!.officialOnboardingAgentId, null, "no Cindy yet");
       assert.equal((await getDb().select().from(agentRuntimeProvisions).where(eq(agentRuntimeProvisions.serverId, serverId))).length, 0, "no hosted Cindy");
       const [ownerSetup] = await getDb().select({ status: serverMembers.setupStatus, reason: serverMembers.setupCompletionReason })
         .from(serverMembers).where(and(eq(serverMembers.serverId, serverId), eq(serverMembers.userId, owner.id)));

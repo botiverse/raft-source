@@ -1,6 +1,9 @@
 import type { Request, Response } from "express";
 import { CURRENT_PRIVACY_VERSION } from "@botiverse/raft-shared";
-import { evaluateFeatureFlag } from "./featureFlagService";
+import {
+  evaluateFeatureFlag,
+  LEGACY_MOBILE_OAUTH_UPGRADE_REQUIRED_FEATURE_FLAG_KEY,
+} from "./featureFlagService";
 import { runtimeFormCopyLocale } from "./runtimeFormV2Copy";
 
 /**
@@ -20,7 +23,7 @@ import { runtimeFormCopyLocale } from "./runtimeFormV2Copy";
  * (`/mobile/oauth/:provider/link/*`) and native Apple `start`/`authorize` are not
  * gated. See docs/operations/legacy-mobile-oauth-upgrade.md.
  */
-export const LEGACY_MOBILE_OAUTH_UPGRADE_REQUIRED_FLAG = "legacy_mobile_oauth_upgrade_required_v0";
+export const LEGACY_MOBILE_OAUTH_UPGRADE_REQUIRED_FLAG = LEGACY_MOBILE_OAUTH_UPGRADE_REQUIRED_FEATURE_FLAG_KEY;
 
 export const APP_UPDATE_REQUIRED_CODE = "APP_UPDATE_REQUIRED";
 

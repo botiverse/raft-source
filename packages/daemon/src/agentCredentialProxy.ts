@@ -55,6 +55,12 @@ import type { AgentInboxTargetRow } from "./agentInboxProjection";
 import type { AgentAppInboxStore } from "./agentAppInbox";
 import { daemonFetch, type DaemonFetchOptions } from "./daemonFetch";
 import { logger } from "./logger";
+import {
+  currentRunnerCredentialKey,
+  fetchWithRunnerCredential,
+  noteRunnerCredentialLaunch,
+  noteRunnerCredentialStreamExpired,
+} from "./runnerCredentialRenewal";
 import { REMINDER_SERVER_ACK_CAPABILITY } from "./reminderServerAck";
 import { handleProcRequest, type ProcJobManager } from "./procJobs";
 import {
@@ -82,6 +88,15 @@ type ProxyRegistration = {
   recordMessageCommitted?: AgentProxyInboxCoordinator["recordMessageCommitted"];
   /** For a launch with no coordinator (the OAR host): `recordSendOutcome`, on its own. */
   recordSendOutcome?: AgentProxyInboxCoordinator["recordSendOutcome"];
+  /** For a launch with no coordinator (the OAR host): the agent read its inbox (`isAgentInboxReadPath`, a 2xx). */
+  recordInboxRead?: () => void;
+  /**
+   * For a launch with no coordinator (the OAR host): the exact seqs of
+   * `target` the model was shown in full (Focus bodies), merged into a send's
+   * `seenExactSeqs` as a coordinator's are. Nothing else of the coordinator's
+   * path runs for such a launch: no local hold, no preflight.
+   */
+  getExactSeenSeqs?: AgentProxyInboxCoordinator["getExactSeenSeqs"];
   /** Phase 1 typed app Inbox store (Computer-local). Optional for legacy tests. */
   appInbox?: AgentAppInboxStore;
   tracer: Tracer;
@@ -205,10 +220,13 @@ export type AgentProxyVisibleMessage = {
   sender_type?: string;
   sender_name?: string;
   sender_description?: string | null;
+  /** Where an outside sender is from (shared AgentSenderOrigin); read through parseAgentSenderOrigin. */
+  sender_origin?: unknown;
   sender_timezone?: string | null;
   senderType?: string;
   senderName?: string;
   senderDescription?: string | null;
+  senderOrigin?: unknown;
   senderTimezone?: string | null;
   content?: string;
   timestamp?: string;
@@ -430,7 +448,7 @@ const thirdPartyEventDeliveryReporter = createThirdPartyEventDeliveryReporter({
     for (const registration of registrations.values()) {
       if (registration.agentId === agentId) latest = registration;
     }
-    return latest ? { serverUrl: latest.serverUrl, apiKey: latest.apiKey } : null;
+    return latest ? { serverUrl: latest.serverUrl, apiKey: currentRunnerCredentialKey(latest.apiKey) } : null;
   },
   fetch: (url, init) => daemonFetch(url, init, process.env, { isolationKey: AGENT_CREDENTIAL_PROXY_FETCH_ISOLATION_KEY }),
   retryBaseMs: () => thirdPartyEventDeliveryReportRetryBaseMs,
@@ -844,7 +862,8 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
     // decodedUpstreamBuffer above is the backstop for upstreams that compress
     // regardless (CloudFront does, for large cached responses).
     headers.set("accept-encoding", "identity");
-    headers.set("Authorization", `Bearer ${registration.apiKey}`);
+    // #wg-rbac:#27: the launch's key as renewed (runnerCredentialRenewal.ts).
+    headers.set("Authorization", `Bearer ${currentRunnerCredentialKey(registration.apiKey)}`);
     headers.set("X-Agent-Id", registration.agentId);
     // The launch and model context this request belongs to: the server's
     // agent-context return events (glimpse input duplication) group what it
@@ -1107,18 +1126,26 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
     }
 
     const upstreamTarget = target;
-    const fetchUpstream = () => daemonFetch(
-      upstreamTarget,
-      {
-        method,
-        headers,
-        body,
-        redirect: shouldRelayAgentAttachmentRedirect(upstreamTarget.pathname) ? "manual" : "follow",
-        signal: clientGone.signal,
-      },
-      process.env,
-      agentCredentialProxyFetchOptions(upstreamTarget.pathname, process.env),
-    );
+    // #wg-rbac:#27: a 401 agent_credential_expired renews the key and sends
+    // once more with the new one (the Server refused before acting, so any
+    // method may be sent again). The key it went out with, for the stream tap.
+    let upstreamKey = currentRunnerCredentialKey(registration.apiKey);
+    const fetchUpstream = () => fetchWithRunnerCredential(registration.apiKey, (key) => {
+      upstreamKey = key;
+      headers.set("Authorization", `Bearer ${key}`);
+      return daemonFetch(
+        upstreamTarget,
+        {
+          method,
+          headers,
+          body,
+          redirect: shouldRelayAgentAttachmentRedirect(upstreamTarget.pathname) ? "manual" : "follow",
+          signal: clientGone.signal,
+        },
+        process.env,
+        agentCredentialProxyFetchOptions(upstreamTarget.pathname, process.env),
+      );
+    });
     let upstream: Awaited<ReturnType<typeof fetchUpstream>>;
     try {
       upstream = await fetchUpstream();
@@ -1140,6 +1167,7 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
       retry.outcome = "ok";
     }
     upstreamResponseStarted = true;
+    noteInboxRead(registration, target.pathname, upstream.status);
 
     const shouldBufferReviewerIsolationResponse =
       sideEffectFreshnessContextMode === "withheld"
@@ -1266,9 +1294,13 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
       upstreamResponseComplete = true;
     } else if (upstream.body) {
       const reader = upstream.body.getReader();
+      const expiryTap = target.pathname === WAKE_HINTS_STREAM_PATH ? createCredentialExpiredTap() : null;
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        // #wg-rbac:#27: the stream ends `credential-expired` when the key
+        // expires; renew now, so the CLI's reconnect goes out with the new key.
+        if (expiryTap?.(value)) noteRunnerCredentialStreamExpired(upstreamKey);
         res.write(Buffer.from(value));
       }
       upstreamResponseComplete = true;
@@ -1320,6 +1352,26 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
     }
     proxySpan.end(proxySpanStatus, { attrs: proxySpanEndAttrs });
   }
+}
+
+const WAKE_HINTS_STREAM_PATH = "/internal/agent-api/wake-hints/stream";
+const CREDENTIAL_EXPIRED_SSE_EVENT = "event: credential-expired";
+
+/** Whether the SSE stream has carried `event: credential-expired` (once; a frame may be split across chunks). */
+function createCredentialExpiredTap(): (chunk: Uint8Array) => boolean {
+  const decoder = new TextDecoder();
+  let carry = "";
+  let seen = false;
+  return (chunk) => {
+    if (seen) return false;
+    const text = carry + decoder.decode(chunk, { stream: true });
+    if (text.includes(CREDENTIAL_EXPIRED_SSE_EVENT)) {
+      seen = true;
+      return true;
+    }
+    carry = text.slice(-CREDENTIAL_EXPIRED_SSE_EVENT.length);
+    return false;
+  };
 }
 
 function isAbortError(err: unknown): boolean {
@@ -2607,6 +2659,27 @@ function sendOutcomeOf(
  * a coordinator does (`consumeVisibleResponse`). Bookkeeping only: whatever it
  * throws is dropped, the agent gets the response as is.
  */
+/**
+ * Task #triage:#399: the routes an agent reads its messages on (`message
+ * check`, `inbox read`, `message read` / history, `task read`). Only the
+ * agent's own CLI calls them; the bridge reads wake hints elsewhere.
+ */
+export function isAgentInboxReadPath(pathname: string): boolean {
+  return pathname === "/internal/agent-api/events"
+    || pathname === INBOX_READ_PATH
+    || AGENT_API_HISTORY_WINDOW_TARGETS.has(pathname);
+}
+
+/** The agent read its inbox (a 2xx on a read route): `recordInboxRead`. Bookkeeping only: whatever it throws is dropped. */
+function noteInboxRead(registration: ProxyRegistration, pathname: string, status: number): void {
+  if (!registration.recordInboxRead || status < 200 || status >= 300 || !isAgentInboxReadPath(pathname)) return;
+  try {
+    registration.recordInboxRead();
+  } catch {
+    // the recorder failed: the agent still gets its answer
+  }
+}
+
 function noteSendOutcomeWithoutCoordinator(registration: ProxyRegistration, pathname: string, responseText: string): void {
   if (!registration.recordSendOutcome) return;
   try {
@@ -2777,6 +2850,21 @@ async function prepareAgentApiSideEffectForward(
   }
   const coordinator = registration.inboxCoordinator;
   if (!target || !coordinator) {
+    // A launch with no coordinator (the OAR host) still says which messages
+    // its model was shown in full, or the Server holds the reply to a message
+    // it has just delivered: a read report cannot move the read position
+    // inside the settle window. A send always; a task write only when its
+    // sender already attests the landing (`seenFor`), so this never turns an
+    // unattested write into a checked one.
+    if (target && registration.getExactSeenSeqs && (action === "send" || typeof body.seenFor === "string")) {
+      let seqs: number[] = [];
+      try {
+        seqs = registration.getExactSeenSeqs(target) ?? [];
+      } catch {
+        // Bookkeeping only: the write goes as the sender wrote it.
+      }
+      mergeDaemonExactSeenSeqs(body, seqs);
+    }
     return { bodyText: JSON.stringify(body), target, freshnessContextMode };
   }
   const existingBoundary = typeof body.seenUpToSeq === "number" && Number.isFinite(body.seenUpToSeq)
@@ -3167,28 +3255,30 @@ function writeLocalProxyRefusal(res: http.ServerResponse, refusal: LocalProxyRef
 export async function fetchAgentApiAsAgent(
   agentId: string,
   pathname: string,
-  init: { method: "POST"; body: unknown; signal?: AbortSignal },
+  init: { method: "POST"; body: unknown; signal?: AbortSignal; traceparent?: string },
 ): Promise<Response | null> {
   const latest = latestRegistrationForAgent(agentId);
   if (!latest) return null;
-  return daemonFetch(new URL(pathname, latest.serverUrl), {
+  return fetchWithRunnerCredential(latest.apiKey, (key) => daemonFetch(new URL(pathname, latest.serverUrl), {
     method: init.method,
-    headers: daemonAsAgentHeaders(latest),
+    headers: daemonAsAgentHeaders(latest, key, init.traceparent),
     body: JSON.stringify(init.body),
     ...(init.signal ? { signal: init.signal } : {}),
-  }, process.env, { isolationKey: AGENT_CREDENTIAL_PROXY_FETCH_ISOLATION_KEY });
+  }, process.env, { isolationKey: AGENT_CREDENTIAL_PROXY_FETCH_ISOLATION_KEY }));
 }
 
 /** Headers for a request the daemon itself makes to the Agent API as the agent. */
-function daemonAsAgentHeaders(registration: ProxyRegistration): Headers {
+function daemonAsAgentHeaders(registration: ProxyRegistration, apiKey: string = currentRunnerCredentialKey(registration.apiKey), traceparent?: string): Headers {
   const headers = new Headers({
-    Authorization: `Bearer ${registration.apiKey}`,
+    Authorization: `Bearer ${apiKey}`,
     "Content-Type": "application/json",
     "X-Agent-Id": registration.agentId,
     "X-Raft-Client": "daemon",
     "X-Slock-Agent-Active-Capabilities": registration.activeCapabilities,
   });
   if (registration.launchId) headers.set("X-Agent-Launch-Id", registration.launchId);
+  // The caller's own trace, so its event joins the Server's for this request.
+  if (traceparent) headers.set("traceparent", traceparent);
   appendDaemonClientCapabilities(headers);
   setOrDeleteHeader(headers, RAFT_COMPUTER_VERSION_HEADER, registration.computerVersion);
   setOrDeleteHeader(headers, RAFT_DAEMON_VERSION_HEADER, registration.daemonVersion);
@@ -3281,6 +3371,8 @@ export async function registerAgentCredentialProxy(input: {
   inboxCoordinator?: AgentProxyInboxCoordinator;
   recordMessageCommitted?: AgentProxyInboxCoordinator["recordMessageCommitted"];
   recordSendOutcome?: AgentProxyInboxCoordinator["recordSendOutcome"];
+  recordInboxRead?: () => void;
+  getExactSeenSeqs?: AgentProxyInboxCoordinator["getExactSeenSeqs"];
   appInbox?: AgentAppInboxStore;
   tracer?: Tracer;
   daemonVersion?: string | null;
@@ -3301,6 +3393,8 @@ export async function registerAgentCredentialProxy(input: {
     inboxCoordinator: input.inboxCoordinator,
     recordMessageCommitted: input.recordMessageCommitted,
     recordSendOutcome: input.recordSendOutcome,
+    ...(input.recordInboxRead ? { recordInboxRead: input.recordInboxRead } : {}),
+    ...(input.getExactSeenSeqs ? { getExactSeenSeqs: input.getExactSeenSeqs } : {}),
     appInbox: input.appInbox,
     tracer: input.tracer ?? noopTracer,
     daemonVersion: input.daemonVersion?.trim() || null,
@@ -3310,6 +3404,7 @@ export async function registerAgentCredentialProxy(input: {
     stableEntryPath: input.stableEntryPath ?? null,
   };
   registrations.set(proxyToken, registration);
+  noteRunnerCredentialLaunch(input.apiKey, registration.launchId);
   return {
     proxyUrl: server.proxyUrl,
     proxyToken,

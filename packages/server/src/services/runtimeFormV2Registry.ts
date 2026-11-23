@@ -27,9 +27,9 @@ import {
   type RuntimeFormV2SubmitRef,
   type RuntimeFormV2UnavailableOption,
 } from "@botiverse/raft-runtime-form";
-import { createHash } from "node:crypto";
 
 import {
+  ANTIGRAVITY_AGY_CHOOSES_MODEL,
   BASE_REASONING_EFFORTS,
   BUILTIN_RUNTIME_GATEWAY_PROVIDER_ENV_KEYS,
   CUSTOM_MODEL_CONTEXT_WINDOW_MAX,
@@ -37,17 +37,15 @@ import {
   defaultReasoningEffortsForRuntime,
   isReasoningEffortOfferedOnRuntime,
   runtimeOffersUndeclaredReasoningEfforts,
-  runtimeChoiceModel,
+  sanitizeRuntimeEffortUnavailableReason,
   isControlledRuntimeEnvKey,
   getDefaultModel,
   getRuntimeProviderDisplayName,
   builtInPresetProviderModelId,
   isBuiltInRuntimeCustomModelPresetProviderId,
   builtInPresetTypedModelReasons,
-  isBuiltInRuntimeGatewayProviderId,
   BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS,
   isRuntimeDeprecated,
-  normalizeBuiltInPresetCustomModel,
   PI_BUILTIN_PROVIDER_DEFAULT_MODELS,
   PI_BUILTIN_PROVIDER_ENV_KEYS,
   PI_BUILTIN_PROVIDER_MODELS,
@@ -56,6 +54,12 @@ import {
   RUNTIME_CONFIG_VERSION,
   RUNTIME_MODELS,
   runtimeModelSupportsFastMode,
+  CODEX_PRIMARY_FAST_SERVICE_TIER,
+  CODEX_NON_FAST_SERVICE_TIERS,
+  runtimeConfigModelValue,
+  runtimeServiceTierText,
+  isRuntimeServiceTierId,
+  type RuntimeServiceTierChoice,
   sanitizeRuntimeModelUnavailable,
   type AgentCreateFormIssue,
   type AgentCreateFormOption,
@@ -76,8 +80,6 @@ import {
   filterBuiltInPiFormOptionSourceForCatalog,
   requireBuiltInCatalogCapability,
 } from "./builtinModelCatalogCompatibility";
-import { isProviderConnectionsEnabled } from "./providerConnectionFeature";
-import { listProviderConnections } from "./providerConnectionService";
 import {
   builtInPiListOnlyOptionSource,
   buildBuiltInPiFormDefinition,
@@ -95,84 +97,10 @@ import {
 
 export const RUNTIME_FORM_V2_MARKER: RuntimeFormV2Marker = Object.freeze({ protocolVersion: 2 });
 
-/**
- * Saved provider connections inside a v2 form (contract capability
- * `provider.saved_connection`, task #46). An entry opts in with
- * `savedConnection`; the served form then lists the capability, marks the
- * connection-owned fields with `x-connectionOwned` and carries a `revision`
- * token the client echoes on option-source requests (?formRevision=). The
- * token binds the form's semantics — not the option data — so a flag flip or
- * an entry change invalidates it and the client refetches the whole form
- * (409 form_revision_stale) instead of seeing options its copy never declared.
- * Bump the salt when the meaning of any of this changes.
- */
-export const RUNTIME_FORM_V2_SAVED_CONNECTION_CAPABILITY = "provider.saved_connection";
-/** Option value encoding for a saved connection (contract: value === "connection:" + connectionId). */
-export const SAVED_CONNECTION_VALUE_PREFIX = "connection:";
-/** The field whose source carries the saved-connection options (Built-in's provider select). */
-export const SAVED_CONNECTION_FIELD = "providerId";
-const SAVED_CONNECTION_REVISION_SALT = "saved-connection.v1";
-
-export function savedConnectionFormRevision(
-  runtimeId: string,
-  baseForm: { schemaVersion: string; requiredClientCapabilities?: string[] | null },
-  /** task #10: the client's advertised capabilities; a client that sends none keeps the revision it always had. */
-  clientCapabilities: readonly string[] = [],
-): string {
-  const parts: unknown[] = [runtimeId, baseForm.schemaVersion, [...(baseForm.requiredClientCapabilities ?? [])].sort(), SAVED_CONNECTION_REVISION_SALT];
-  if (clientCapabilities.length > 0) parts.push([...clientCapabilities].sort());
-  return createHash("sha256")
-    .update(JSON.stringify(parts))
-    .digest("hex")
-    .slice(0, 24);
-}
-
 /** task #10: whether the client renders a dependent value with options + typing as a combobox (advertised capability; implied by runtime_form.v3). */
 export function clientRendersDependentCustomWithOptions(clientCapabilities: readonly string[] | undefined): boolean {
   const advertised = clientCapabilities ?? [];
   return advertised.includes("dependent_select.custom_value_with_options") || advertised.includes(RUNTIME_FORM_V3_CLIENT_CAPABILITY);
-}
-
-/**
- * The v2 form as a server serves it: the entry's static form, plus the
- * saved-connection capability when the entry supports it and the server has
- * provider connections enabled. Without the flag the form is served exactly
- * as before — no capability, no revision, no x-connectionOwned.
- */
-export async function buildRuntimeFormV2ForServer(
-  runtimeId: unknown,
-  serverId: string,
-  clientCapabilities: readonly string[] = [],
-): Promise<RuntimeFormV2Definition | null> {
-  const entry = runtimeFormV2Entry(runtimeId);
-  if (!entry) return null;
-  const form = entry.buildForm();
-  if (!entry.savedConnection || !await isProviderConnectionsEnabled(serverId)) return form;
-  return withSavedConnectionForm(entry, form, clientCapabilities);
-}
-
-/** The saved-connection build of an entry's form (flag on): capability, x-connectionOwned markers, revision. */
-export function withSavedConnectionForm(
-  entry: RuntimeFormV2Entry,
-  form: RuntimeFormV2Definition,
-  clientCapabilities: readonly string[] = [],
-): RuntimeFormV2Definition {
-  if (!entry.savedConnection) return form;
-  const capabilities = [...new Set([...(form.requiredClientCapabilities ?? []), RUNTIME_FORM_V2_SAVED_CONNECTION_CAPABILITY])];
-  const owned = new Set(entry.savedConnection.connectionOwnedFields);
-  const dataSchema = {
-    ...form.dataSchema,
-    properties: Object.fromEntries(
-      Object.entries(form.dataSchema.properties ?? {}).map(([key, property]) =>
-        owned.has(key) ? [key, { ...property, "x-connectionOwned": true }] : [key, property]),
-    ),
-  };
-  return {
-    ...form,
-    dataSchema,
-    requiredClientCapabilities: capabilities,
-    revision: savedConnectionFormRevision(entry.runtimeId, form, clientCapabilities),
-  };
 }
 
 /** What an option-source resolver asks of the Computer: its model probe, and the Built-in catalog with versions. */
@@ -199,24 +127,11 @@ export interface RuntimeFormOptionSourceContext {
    */
   refresh?: boolean;
   /**
-   * The request came on the v2 endpoint, whose forms carry
-   * `option_source.status`: a non-live source is answered with
-   * status/reason/retryable instead of a 409. Absent on the v1 endpoint, whose
-   * clients keep the old bodies exactly (strict parsers, no status fields).
-   */
-  sourceStatus?: boolean;
-  /** The server the form belongs to; saved-connection options are server-scoped. */
-  serverId?: string;
-  /**
-   * `?formRevision=` from Definition.revision (capability
-   * `provider.saved_connection`). Absent: answer with the plain direct-option
-   * protocol — never any connection options. Present: it must match the
+   * `?formRevision=` from Definition.revision. Present: it must match the
    * server's current build or the client gets 409 form_revision_stale and
    * refetches the whole form.
    */
   formRevision?: string;
-  /** The caller may list this server's provider connections (manageExternalAuth). */
-  connectionsVisible?: boolean;
   /**
    * task #10: the client's advertised capabilities (`?clientCapabilities=`).
    * Without `dependent_select.custom_value_with_options` a preset provider that
@@ -323,31 +238,12 @@ export interface RuntimeFormValuesOptions {
    * show but the saved config keeps.
    */
   existing?: RuntimeConfig | null;
-  /**
-   * Saved-connection submits only: the providerId of the connection the route
-   * resolved server-side before mapping (capability
-   * `provider.saved_connection`). The connection's provider — never the model
-   * name — decides the model kind: a gateway connection always takes a custom
-   * model even when the typed name collides with a built-in preset id, and a
-   * preset connection only takes a model from its own list. Absent (unit
-   * tests, non-connection submits): the static fallback applies and the
-   * route's per-connection compatibility check stays the final authority.
-   */
-  savedConnectionProviderId?: string;
 }
 
 export interface RuntimeFormV2Entry {
   runtimeId: string;
   /** The form served on v2 create, and the base of the v2 edit response. */
   buildForm(): RuntimeFormV2Definition;
-  /**
-   * Saved provider connections (capability `provider.saved_connection`):
-   * present on runtimes whose form offers them. `connectionOwnedFields` are
-   * the dataSchema keys a selected connection owns — marked
-   * `x-connectionOwned` on the served form, kept out of formValues by the
-   * client and refused on submit by the server.
-   */
-  savedConnection?: { connectionOwnedFields: readonly string[] };
   /** Self-check of the served projection; any issue is a 500 drift. */
   validateProjection(): AgentCreateFormIssue[];
   resolveOptionSource(context: RuntimeFormOptionSourceContext): Promise<RuntimeFormOptionSourceResolution>;
@@ -362,11 +258,9 @@ export interface RuntimeFormV2Entry {
   ): RuntimeConfigBuild;
   /**
    * Stored runtimeConfig → field values for edit; writeOnly fields never
-   * included. Null: not editable here. `context.connectionProviderId`: the
-   * provider of the saved connection the config is bound to, when the caller
-   * resolved it.
+   * included. Null: not editable here.
    */
-  valuesFromRuntimeConfig(runtimeConfig: Record<string, unknown>, context?: RuntimeFormValuesContext): Record<string, unknown> | null;
+  valuesFromRuntimeConfig(runtimeConfig: Record<string, unknown>): Record<string, unknown> | null;
   writeOnlySecrets?: readonly RuntimeConfigWriteOnlySecret[];
   /**
    * v2 submit only: reconcile the validated runtimeConfig with the Computer's
@@ -379,6 +273,8 @@ export interface RuntimeFormV2Entry {
     models: readonly RuntimeModelInfo[],
     /** Edit only: the effort the agent has saved now (same runtime), else null. */
     storedReasoningEffort?: string | null,
+    /** Edit only: the fast tier the agent has saved now (same runtime), else null. */
+    storedServiceTier?: string | null,
   ): LiveModelReconciliation;
 }
 
@@ -471,8 +367,7 @@ const envVarsOf = (runtimeConfig: Record<string, unknown>) =>
   isPlainRecord(runtimeConfig.envVars) ? runtimeConfig.envVars : {};
 
 /**
- * The Built-in model a submit stores for a provider, chosen directly or
- * through a saved connection to it (same rule for both). A gateway always
+ * The Built-in model a submit stores for a provider. A gateway always
  * stores a custom model. On a preset provider that takes a typed id (task
  * #10) the limits are explicit overrides for any model: a listed model
  * without one is its preset; a listed model with one is a custom model named
@@ -508,68 +403,6 @@ function builtInModelFromValues(
   if (!customModel) return { ok: true, model: { kind: "preset", id: modelValue } };
   const name = listedOverride ? builtInPresetProviderModelId(providerId, modelValue) : modelValue;
   return { ok: true, model: { kind: "custom", name, ...limits.limits } };
-}
-
-/**
- * Extend a catalog-filtered Built-in source with the server's saved provider
- * connections: saved options lead the provider list, and the model maps are
- * keyed by the same `connection:<id>` values (one key space, contract). All
- * connection fields are display metadata — on save the route re-resolves the
- * connection by id in the current server scope and re-checks flag, credential
- * and model compatibility. A gateway connection keeps the direct gateway's
- * custom-model semantics: the Computer's catalog never narrows what it may
- * type. A preset connection takes what its provider takes here (its list, and
- * a typed id where the provider's own key allows one), except that a typed id
- * also needs a Computer that runs it through a connection
- * (`connectionTypedProviderIds`, the catalog's
- * customModelConnectionProviderIds; null when no Computer answered, as the
- * direct providers then keep the bundled rule). Connections that are not
- * selectable right now stay listed as `unavailable` so an edit of a bound
- * agent can show the binding and block a silent rewrite.
- */
-async function withSavedConnectionOptions(
-  serverId: string,
-  source: AgentCreateFormOptionSource,
-  connectionTypedProviderIds: ReadonlySet<string> | null,
-): Promise<AgentCreateFormOptionSource> {
-  const connections = await listProviderConnections(serverId);
-  if (source.kind === "select" && source.pointer === `/${SAVED_CONNECTION_FIELD}`) {
-    const saved = connections.map((connection) => ({
-      value: `${SAVED_CONNECTION_VALUE_PREFIX}${connection.id}`,
-      label: `${getRuntimeProviderDisplayName(connection.providerId as string)} · ${connection.name}`,
-      providerKind: isBuiltInRuntimeGatewayProviderId(connection.providerId) ? "gateway" as const : "preset" as const,
-      connectionId: connection.id,
-      underlyingProviderId: connection.providerId,
-      group: "saved" as const,
-      ...(connection.enabled && connection.hasCredential
-        ? {}
-        : { unavailable: true, unavailableReason: connection.enabled ? "missing_credential" : "disabled" }),
-    }));
-    return {
-      ...source,
-      options: [...saved, ...source.options.map((option) => ({ ...option, group: "direct" as const }))],
-    };
-  }
-  if (source.kind === "dependent_select" && source.pointer === "/model") {
-    const optionsByValue = { ...source.optionsByValue };
-    const defaultValueByValue = { ...source.defaultValueByValue };
-    const customValueAllowedByValue = { ...source.customValueAllowedByValue };
-    for (const connection of connections) {
-      const key = `${SAVED_CONNECTION_VALUE_PREFIX}${connection.id}`;
-      if (isBuiltInRuntimeGatewayProviderId(connection.providerId)) {
-        optionsByValue[key] = [];
-        customValueAllowedByValue[key] = true;
-        continue;
-      }
-      optionsByValue[key] = optionsByValue[connection.providerId] ?? [];
-      const presetDefault = defaultValueByValue[connection.providerId];
-      if (typeof presetDefault === "string" && presetDefault) defaultValueByValue[key] = presetDefault;
-      customValueAllowedByValue[key] = customValueAllowedByValue[connection.providerId] === true
-        && (connectionTypedProviderIds === null || connectionTypedProviderIds.has(connection.providerId));
-    }
-    return { ...source, optionsByValue, defaultValueByValue, customValueAllowedByValue };
-  }
-  return source;
 }
 
 /** #proj-runtime:#50: the Built-in form's optional model limits, keyed as on `RuntimeConfig.model`. */
@@ -621,11 +454,6 @@ const BUILTIN_MAX_OUTPUT_TOKENS_HINT =
 
 const builtinEntry: RuntimeFormV2Entry = {
   runtimeId: "builtin",
-  // Saved provider connections (capability `provider.saved_connection`): the
-  // connection owns the credential and the gateway endpoint fields; the form
-  // marks them x-connectionOwned, clients keep them out of formValues and the
-  // submit mapping below refuses any client-sent value for them.
-  savedConnection: { connectionOwnedFields: ["apiKey", "baseUrl", "supportsImageInput"] },
   // v2-only copy lives here, never in the v1 definition: changing that would
   // force a schemaVersion bump that breaks every installed app still on v1
   // (packages/runtime-form/README.md, "Bumping a version"). Only v2 clients
@@ -695,33 +523,21 @@ const builtinEntry: RuntimeFormV2Entry = {
   },
   validateProjection: () => validateBuiltInPiDefinitionProjection(),
   async resolveOptionSource(context) {
-    // Form-consistency gate (contract, Definition.revision): a revisioned
-    // request is answered only when the token matches the current build;
-    // otherwise the client must refetch the whole form. An unrevisioned
-    // request keeps the plain direct-option protocol and never sees
-    // connection options, so pre-existing clients are unaffected.
-    const revisioned = context.formRevision !== undefined;
-    let savedConnectionsEnabled = false;
-    if (revisioned) {
-      savedConnectionsEnabled = context.serverId !== undefined
-        && await isProviderConnectionsEnabled(context.serverId);
-    }
-    // A v3 request's revision is checked by the route (runtimeFormV3Revision).
-    if (revisioned && !(context.clientCapabilities ?? []).includes(RUNTIME_FORM_V3_CLIENT_CAPABILITY)) {
-      const current = savedConnectionsEnabled
-        ? savedConnectionFormRevision("builtin", builtinEntry.buildForm(), context.clientCapabilities ?? [])
-        : null;
-      if (context.formRevision !== current) {
-        return {
-          kind: "reply",
-          status: 409,
-          body: {
-            error: "Runtime form has changed; refetch it before loading options",
-            code: "form_revision_stale",
-            recovery: "refetch_form",
-          },
-        };
-      }
+    // Form-consistency gate (contract, Definition.revision): a v2 form carries
+    // no revision any more (only the retired saved provider connections gave
+    // it one), so a revisioned v2 request comes from a form served before
+    // that and must refetch the whole form. A v3 request's revision is
+    // checked by the route (runtimeFormV3Revision).
+    if (context.formRevision !== undefined && !(context.clientCapabilities ?? []).includes(RUNTIME_FORM_V3_CLIENT_CAPABILITY)) {
+      return {
+        kind: "reply",
+        status: 409,
+        body: {
+          error: "Runtime form has changed; refetch it before loading options",
+          code: "form_revision_stale",
+          recovery: "refetch_form",
+        },
+      };
     }
     if (context.sourceId === "reasoningEffort") {
       return {
@@ -747,11 +563,8 @@ const builtinEntry: RuntimeFormV2Entry = {
     // Offline or unreachable Computer: the bundled catalog, so the form stays
     // usable. Starting the agent still checks the Computer's own catalog
     // (agentOrchestrator, builtin_catalog_*), so an unsupported pick fails there.
-    // Saved-connection enrichment still applies on this path: the connections
-    // are server data, independent of the Computer's liveness.
-    const withEnrichment = async (
+    const forClient = async (
       sourceIn: AgentCreateFormOptionSource | null,
-      connectionTypedProviderIds: ReadonlySet<string> | null = null,
     ): Promise<RuntimeFormOptionSourceResolution> => {
       // task #10: a client that does not advertise
       // dependent_select.custom_value_with_options would render a listed
@@ -760,18 +573,15 @@ const builtinEntry: RuntimeFormV2Entry = {
       const source = sourceIn && !clientRendersDependentCustomWithOptions(context.clientCapabilities)
         ? builtInPiListOnlyOptionSource(sourceIn)
         : sourceIn;
-      if (!revisioned || !savedConnectionsEnabled || !context.connectionsVisible || !context.serverId || !source) {
-        return { kind: "source", source };
-      }
-      return { kind: "source", source: await withSavedConnectionOptions(context.serverId, source, connectionTypedProviderIds) };
+      return { kind: "source", source };
     };
     // Only the model source carries a status (v2): the provider select is static.
     const withStatus = (source: AgentCreateFormOptionSource | null, reason: RuntimeFormV2OptionSourceReason | null) =>
-      source && context.sourceStatus && context.sourceId === "model"
+      source && context.sourceId === "model"
         ? { ...source, ...optionSourceStatusFields(reason, sourceHasOptions(source)) }
         : source;
     const bundled = (reason: RuntimeFormV2OptionSourceReason) =>
-      withEnrichment(withStatus(buildBuiltInPiFormOptionSource(context.sourceId), reason));
+      forClient(withStatus(buildBuiltInPiFormOptionSource(context.sourceId), reason));
     const routing = await context.routeToComputer();
     if (routing === "handled") return { kind: "handled" };
     if (routing !== "confirmed_local") return bundled("machine_offline");
@@ -782,14 +592,13 @@ const builtinEntry: RuntimeFormV2Entry = {
       if (!(error instanceof RouteFailureError)) throw error;
       return bundled(optionSourceReasonForProbeError(error));
     }
-    // A probe that answered without the catalog fails closed, as on v1, but
-    // per source on v2: `unavailable` with the reason and no options, instead
-    // of the 409 builtin_catalog_unavailable. A live answer without a catalog
-    // stays the typed 409 builtin_catalog_capability_required on both: that
+    // A probe that answered without the catalog fails closed per source:
+    // `unavailable` with the reason and no options. A live answer without a
+    // catalog stays the typed 409 builtin_catalog_capability_required: that
     // Computer must be upgraded before any Built-in model can run.
-    if (context.sourceStatus && context.sourceId === "model" && detection.outcome.kind !== "live") {
+    if (context.sourceId === "model" && detection.outcome.kind !== "live") {
       const source = buildBuiltInPiFormOptionSource(context.sourceId);
-      return withEnrichment(source && unavailableSource(source, optionSourceReasonForOutcome(detection.outcome) ?? "probe_failed"));
+      return forClient(source && unavailableSource(source, optionSourceReasonForOutcome(detection.outcome) ?? "probe_failed"));
     }
     const catalog = requireBuiltInCatalogCapability(detection.outcome, {
       machineId: context.machineId,
@@ -800,7 +609,7 @@ const builtinEntry: RuntimeFormV2Entry = {
     const source = unfilteredSource
       ? filterBuiltInPiFormOptionSourceForCatalog(unfilteredSource, catalog.supportedModelIds, catalog.customModelProviderIds)
       : null;
-    return withEnrichment(withStatus(source, null), catalog.customModelConnectionProviderIds);
+    return forClient(withStatus(source, null));
   },
   runtimeConfigFromValues(values, envVars, options) {
     const effort = piEffort(values, "reasoningEffort");
@@ -814,67 +623,6 @@ const builtinEntry: RuntimeFormV2Entry = {
       return { ok: false, issue: { code: "option_sources_invalid", pointer: "/formValues" } };
     }
     const providerId = typeof values.providerId === "string" ? values.providerId : "";
-    // A saved-connection selection: decode the id and refuse every field the
-    // connection owns — any client-sent value, empty string or null included
-    // (contract, `provider.saved_connection`; clients omit these fields). The
-    // route then re-resolves the connection by id in the current server scope
-    // (flag, enabled, credential, model compatibility); nothing here trusts
-    // the submitted metadata.
-    if (providerId.startsWith(SAVED_CONNECTION_VALUE_PREFIX)) {
-      const connectionId = providerId.slice(SAVED_CONNECTION_VALUE_PREFIX.length).trim();
-      if (!connectionId) return formValueIssue("select_valid_provider", "providerId");
-      for (const owned of builtinEntry.savedConnection!.connectionOwnedFields) {
-        if (owned in values) return formValueIssue("connection_field_forbidden", owned);
-      }
-      const connectionModel = typeof values.model === "string" ? values.model.trim() : "";
-      if (!connectionModel) return formValueIssue("model_required", "model");
-      // The model follows the connection's server-resolved provider, not the
-      // typed name, by the same rule as that provider chosen directly
-      // (builtInModelFromValues): a gateway connection always stores a custom
-      // model (even when the name collides with a built-in preset id); a
-      // preset connection takes a listed model, and a typed id and limits
-      // where its provider does. The route's per-connection and catalog checks
-      // remain the final authority. Without a resolved provider (unit-level
-      // calls) the static lists are the fallback.
-      const connectionProviderId = options.savedConnectionProviderId;
-      let connectionModelConfig: RuntimeModelConfig;
-      if (connectionProviderId !== undefined) {
-        const decided = builtInModelFromValues(
-          connectionProviderId,
-          isBuiltInRuntimeGatewayProviderId(connectionProviderId),
-          connectionModel,
-          values,
-          effort.value,
-          model,
-        );
-        if (!decided.ok) return decided.build;
-        // The parser normalizes a direct preset's typed id; only the server
-        // knows a connection's provider, so it does so here.
-        connectionModelConfig = decided.model.kind === "custom" && isBuiltInRuntimeCustomModelPresetProviderId(connectionProviderId)
-          ? normalizeBuiltInPresetCustomModel(connectionProviderId, decided.model)
-          : decided.model;
-      } else {
-        const presetKnown = Object.values(PI_BUILTIN_PROVIDER_MODELS)
-          .some((models) => models.some((candidate) => candidate.id === connectionModel));
-        const connectionLimits = readModelLimitValues(values, !presetKnown);
-        if (!connectionLimits.ok) return connectionLimits.build;
-        connectionModelConfig = presetKnown ? { kind: "preset", id: connectionModel } : { kind: "custom", name: connectionModel, ...connectionLimits.limits };
-      }
-      return {
-        ok: true,
-        runtimeConfig: {
-          version: RUNTIME_CONFIG_VERSION,
-          runtime: "builtin",
-          provider: { kind: "connection", connectionId },
-          model: connectionModelConfig,
-          mode: { kind: "default" },
-          reasoningEffort: effort.value,
-          envVars,
-          hostUserState: "forbidden",
-          loadLocalPlugins: values.loadLocalPlugins === true,
-        },
-      };
-    }
     const option = provider.options.find((candidate) => candidate.value === providerId);
     if (!option) return formValueIssue("select_valid_provider", "providerId");
     const apiKey = typeof values.apiKey === "string" ? values.apiKey.trim() : "";
@@ -908,26 +656,9 @@ const builtinEntry: RuntimeFormV2Entry = {
       },
     };
   },
-  valuesFromRuntimeConfig(runtimeConfig, context) {
+  valuesFromRuntimeConfig(runtimeConfig) {
     const reasoningEffort = typeof runtimeConfig.reasoningEffort === "string" ? runtimeConfig.reasoningEffort : "";
     const provider = isPlainRecord(runtimeConfig.provider) ? runtimeConfig.provider : null;
-    // A bound saved connection edits through the same v2 form: the provider
-    // field carries the connection option value; the credential itself is
-    // connection-owned and never appears in the values (writeOnly rule). Its
-    // model reads back as on its provider directly (a listed model saved with
-    // limits shows as that listed model) once its provider is known.
-    if (provider && provider.kind === "connection" && typeof provider.connectionId === "string" && provider.connectionId) {
-      return {
-        providerId: `${SAVED_CONNECTION_VALUE_PREFIX}${provider.connectionId}`,
-        model: context?.connectionProviderId
-          ? listedModelValueOf(context.connectionProviderId, runtimeConfig)
-          : modelValueOf(runtimeConfig),
-        ...modelLimitValuesOf(runtimeConfig),
-        reasoningEffort,
-        loadLocalPlugins: runtimeConfig.loadLocalPlugins === true,
-        envVars: envVarsOf(runtimeConfig),
-      };
-    }
     // An older row hydrated without a provider (none stored, no provider key
     // among its env vars) still opens: the provider is blank and must be
     // chosen, as on create. Edit has no v1 fallback any more (task #8).
@@ -961,11 +692,10 @@ const builtinEntry: RuntimeFormV2Entry = {
       // blank/null values and provider switches still reach the parser and fail
       // closed; clients can never recover the retained value.
       path: ["provider", "apiKey"],
-      appliesTo: (config) => isPlainRecord(config.provider) && config.provider.kind !== "connection",
+      appliesTo: (config) => isPlainRecord(config.provider),
       keepsIdentity(incoming, existing) {
         const next = incoming.provider as Record<string, unknown>;
         const saved = existing.provider as Record<string, unknown>;
-        if (next.kind === "connection" || saved.kind === "connection") return false;
         if (next.kind !== saved.kind || next.providerId !== saved.providerId) return false;
         return saved.kind !== "gateway"
           || (typeof next.baseUrl === "string" && typeof saved.baseUrl === "string" && sameApiEndpoint(next.baseUrl, saved.baseUrl));
@@ -991,7 +721,7 @@ const kimiSdkEntry: RuntimeFormV2Entry = {
         models: RUNTIME_MODELS["kimi-sdk"] ?? [],
         defaultModel: getDefaultModel("kimi-sdk"),
       });
-      return { kind: "source", source: context.sourceStatus ? { ...source, ...optionSourceStatusFields(reason, true) } : source };
+      return { kind: "source", source: { ...source, ...optionSourceStatusFields(reason, true) } };
     };
     const routing = await context.routeToComputer();
     if (routing === "handled") return { kind: "handled" };
@@ -1012,13 +742,13 @@ const kimiSdkEntry: RuntimeFormV2Entry = {
       // contract already allows creation in this state (it may still fail at
       // runtime, where the user can actually fix it); the form must not
       // hard-block it. Offer the declared managed default for missing_config
-      // and offline only — every other non-live outcome keeps its typed 409
-      // (this is the hard failure users saw as "model list unavailable" on
+      // and offline only; every other non-live outcome is `unavailable` below
+      // (a hard block here was what users saw as "model list unavailable" on
       // fresh machines).
       return managedDefault("missing_config");
     }
-    if (detected.kind !== "live" && context.sourceStatus) {
-      // Same fail-closed decision as v1, per source: no options to launch
+    if (detected.kind !== "live") {
+      // Fail closed, per source: no options to launch
       // with, the reason, and whether a retry can help.
       return {
         kind: "source",
@@ -1028,20 +758,10 @@ const kimiSdkEntry: RuntimeFormV2Entry = {
         ),
       };
     }
-    if (detected.kind !== "live") {
-      return {
-        kind: "reply",
-        status: 409,
-        body: {
-          error: "Kimi model source is unavailable",
-          issues: [{ code: `runtime_model_source_${detected.kind}`, pointer: "/optionSources/model" }],
-        },
-      };
-    }
     const live = buildKimiSdkFormOptionSource({ models: detected.value.models, defaultModel: detected.value.default });
     return {
       kind: "source",
-      source: context.sourceStatus ? { ...live, ...optionSourceStatusFields(optionSourceReasonForOutcome(detected), sourceHasOptions(live)) } : live,
+      source: { ...live, ...optionSourceStatusFields(optionSourceReasonForOutcome(detected), sourceHasOptions(live)) },
     };
   },
   runtimeConfigFromValues(values, envVars) {
@@ -1122,17 +842,6 @@ export function unavailableModelOptions(live: RuntimeModelSet): RuntimeFormV2Una
   return (sanitizeRuntimeModelUnavailable(live.unavailable) ?? [])
     .filter((model) => !usable.has(model.id))
     .map((model) => ({ value: model.id, label: model.label, ...(model.reason ? { reason: model.reason } : {}) }));
-}
-
-/**
- * A v1 option-source response never carries `unavailableOptions` (a v2
- * contract field): released mobile apps decode some v1 bodies with unknown
- * keys refused.
- */
-export function withoutV2OnlyOptionSourceFields(source: RuntimeFormV2OptionSourceBody): RuntimeFormV2OptionSourceBody {
-  if (!("unavailableOptions" in source)) return source;
-  const { unavailableOptions: _v2Only, ...rest } = source;
-  return rest as RuntimeFormV2OptionSourceBody;
 }
 
 function withUnavailableOptions<T extends object>(source: T, unavailable: readonly RuntimeFormV2UnavailableOption[] | undefined): T {
@@ -1255,6 +964,13 @@ export interface ReasoningModelFormOptions {
   /** A boolean field mapped to runtimeConfig.mode (RUNTIME_FAST_MODE_RUNTIMES). */
   fastMode: boolean;
   /**
+   * #wg-runtime-form:#27/#31 (Codex, mutually exclusive with fastMode): a `speed`
+   * select (Standard "", Fast "priority", Ultrafast "ultrafast", ...) shown for
+   * models whose Computer lists two or more fast tiers (`serviceTierChoices`);
+   * single-tier models show `fastMode`, zero-tier models hide both.
+   */
+  speed?: boolean;
+  /**
    * A reasoning effort that follows the selected model (REASONING_EFFORT_RUNTIMES),
    * with `choice.labels` for its English copy. Cursor has none.
    */
@@ -1266,6 +982,24 @@ export interface ReasoningModelFormOptions {
   customProvider?: boolean;
   /** Claude only (supportsRuntimeCommand): the executable to launch (runtimeConfig.command). */
   command?: boolean;
+  /**
+   * Antigravity (#oar-raft:#25): a stored model id that meant "the runtime
+   * chooses" before a model was required. The edit form shows no model for
+   * it, so the person picks one, and a save refuses it.
+   */
+  retiredRuntimeChoice?: string;
+  /**
+   * No bundled list, a typed model allowed: when the Computer's list cannot be
+   * read, the source is a `fallback` with no options (a typed model id still
+   * submits), not `unavailable` (which blocks a required field).
+   */
+  typedModelWhenUnlisted?: boolean;
+  /**
+   * DSH: the shape a model must have to launch (dsh routes by `provider/model`
+   * and OAR refuses a bare name only at the start); a model that does not fit
+   * is refused at the field with `message`.
+   */
+  modelFormat?: { valid: (model: string) => boolean; message: string };
   modelHint: string;
 }
 
@@ -1324,6 +1058,7 @@ function reasoningModelFieldKeys(options: ReasoningModelFormOptions): string[] {
     "model",
     ...(options.reasoning ? ["reasoningEffort"] : []),
     ...(options.fastMode ? ["fastMode"] : []),
+    ...(options.speed ? ["speed"] : []),
     ...(options.command ? ["command"] : []),
     "envVars",
   ];
@@ -1356,6 +1091,7 @@ function buildReasoningModelForm(runtimeId: string, options: ReasoningModelFormO
         model: { type: "string", title: "Model", minLength: 1 },
         ...(options.reasoning ? { reasoningEffort: { type: "string", title: "Reasoning" } } : {}),
         ...(options.fastMode ? { fastMode: { type: "boolean", title: "Fast mode" } } : {}),
+        ...(options.speed ? { speed: { type: "string", title: "Speed" } } : {}),
         ...(options.command ? { command: { type: "string", title: "Claude Command" } } : {}),
         envVars: { type: "object", title: "Environment Variables", additionalProperties: { type: "string" } },
       },
@@ -1363,13 +1099,15 @@ function buildReasoningModelForm(runtimeId: string, options: ReasoningModelFormO
     uiSchema: {
       order: reasoningModelFieldKeys(options),
       layout: { advanced: [...(options.command ? ["/command"] : []), "/envVars"] },
-      visibility: options.customProvider
-        ? [
-            { pointer: "/apiUrl", when: { pointer: "/provider", in: ["custom"] } },
-            { pointer: "/authType", when: { pointer: "/provider", in: ["custom"] } },
-            { pointer: "/apiKey", when: { pointer: "/provider", in: ["custom"] } },
-          ]
-        : [],
+      visibility: [
+        ...(options.customProvider
+          ? [
+              { pointer: "/apiUrl", when: { pointer: "/provider", in: ["custom"] } },
+              { pointer: "/authType", when: { pointer: "/provider", in: ["custom"] } },
+              { pointer: "/apiKey", when: { pointer: "/provider", in: ["custom"] } },
+            ]
+          : []),
+      ],
       localization: {
         ...(options.customProvider
           ? {
@@ -1391,6 +1129,9 @@ function buildReasoningModelForm(runtimeId: string, options: ReasoningModelFormO
           : {}),
         ...(options.fastMode
           ? { fastMode: { label: "Fast mode", hint: "Launch this runtime with higher speed at a higher cost per token." } }
+          : {}),
+        ...(options.speed
+          ? { speed: { label: "Speed", hint: "Speeds this model offers on this computer's Codex account. Faster speeds use more of your plan." } }
           : {}),
         ...(options.command
           ? {
@@ -1418,6 +1159,7 @@ function buildReasoningModelForm(runtimeId: string, options: ReasoningModelFormO
           }
         : {}),
       model: { ...ref, sourceId: "model", kind: "select", pointer: "/model" },
+      ...(options.speed ? { speed: { ...ref, sourceId: "speed", kind: "dependent_select", pointer: "/speed", dependsOn: "/model" } } : {}),
     },
   }, options.reasoning
     ? { reasoningEffort: { field: "model", attribute: "supportedReasoningEfforts", defaultAttribute: "defaultReasoningEffort" } }
@@ -1433,18 +1175,19 @@ function buildReasoningModelForm(runtimeId: string, options: ReasoningModelFormO
 /**
  * A model's effort metadata as the legacy picker resolves it
  * (reasoningEffortOptionsForModel): a live entry that declares efforts wins,
- * else the bundled entry for the same id, else the live entry. Every option
- * carries its efforts: the declared set in catalog order (unknown ids dropped),
- * or the BASE set for a model that declares none, which is what the server's
- * static rule (allowedReasoningEffortsForModel) accepts for it.
+ * even an empty set (the model takes none), else the bundled entry for the
+ * same id, else the live entry. Every option carries its efforts: the declared
+ * set in catalog order (unknown ids dropped), or the BASE set for a model that
+ * declares none, which is what the server's static rule
+ * (allowedReasoningEffortsForModel) accepts for it.
  */
 function reasoningModelOption(
   runtimeId: string,
   model: RuntimeModelInfo,
 ): AgentCreateFormOption {
   const bundled = RUNTIME_MODELS[runtimeId]?.find((candidate) => candidate.id === model.id);
-  const info = model.supportedReasoningEfforts?.length ? model : bundled ?? model;
-  const declared = info.supportedReasoningEfforts?.length ? info.supportedReasoningEfforts : null;
+  const info = Array.isArray(model.supportedReasoningEfforts) ? model : bundled ?? model;
+  const declared = Array.isArray(info.supportedReasoningEfforts) ? info.supportedReasoningEfforts : null;
   // None where the runtime applies only listed levels (runtimeOffersUndeclaredReasoningEfforts).
   const undeclared = runtimeOffersUndeclaredReasoningEfforts(runtimeId) ? defaultReasoningEffortsForRuntime(runtimeId) : [];
   const efforts = REASONING_EFFORTS
@@ -1454,11 +1197,20 @@ function reasoningModelOption(
   const defaultEffort = declared && info.defaultReasoningEffort && efforts.includes(info.defaultReasoningEffort as never)
     ? info.defaultReasoningEffort
     : undefined;
+  // Why an empty menu is empty, so the form can say so instead of hiding the
+  // field (additive; an empty menu with neither stays "not reported", e.g. an
+  // older Computer): the Computer could not read the levels, or the runtime
+  // declared that the model takes none.
+  const unreadableReason = efforts.length === 0 && !declared
+    ? sanitizeRuntimeEffortUnavailableReason(model.reasoningEffortUnavailableReason)
+    : undefined;
   return {
     value: model.id,
     label: model.label,
     supportedReasoningEfforts: efforts,
     ...(defaultEffort ? { defaultReasoningEffort: defaultEffort } : {}),
+    ...(unreadableReason ? { reasoningEffortUnavailableReason: unreadableReason } : {}),
+    ...(efforts.length === 0 && declared?.length === 0 ? { reasoningEffortNone: true } : {}),
   };
 }
 
@@ -1550,7 +1302,7 @@ function reasoningModelProjectionIssues(form: RuntimeFormV2Definition, options: 
   ) {
     return [{ code: "definition_data_schema_drift", pointer: "/dataSchema" }];
   }
-  const sources = options.customProvider ? "provider\0authType\0model" : "model";
+  const sources = [...(options.customProvider ? ["provider", "authType"] : []), "model", ...(options.speed ? ["speed"] : [])].join("\0");
   if (
     Object.keys(form.optionSources ?? {}).join("\0") !== sources
     || form.optionSources?.model?.pointer !== "/model"
@@ -1572,15 +1324,10 @@ function sameApiEndpoint(a: string, b: string): boolean {
 }
 
 /**
- * Claude's custom-provider API key: write-only in the v2 form (never in
- * `values`; a blank one on edit keeps the stored key while the API URL is
- * unchanged).
- *
- * `redactOnAgentRead: false`: the v1 agent read (GET /api/agents[/:id]) keeps
- * returning it to editors, because installed mobile apps prefill the key from
- * that read and refuse to save a Custom provider with a blank key (MembersPage
- * providerKeyInvalid); blanking it there would force every such user to retype
- * the key. Flip to true once released clients treat it as write-only.
+ * Claude's custom-provider API key: write-only on both the v2 form and the v1
+ * agent read (`GET /api/agents[/:id]` blanks it to `""`; web and mobile 1.24+
+ * edit through `GET /api/agents/:id/runtime-form`, and legacy v1 PATCHes with a
+ * blank key keep the stored one via `retainLegacyBlankWriteOnlySecrets`).
  */
 const CLAUDE_CUSTOM_PROVIDER_API_KEY: RuntimeConfigWriteOnlySecret = {
   path: ["provider", "apiKey"],
@@ -1593,7 +1340,7 @@ const CLAUDE_CUSTOM_PROVIDER_API_KEY: RuntimeConfigWriteOnlySecret = {
       && sameApiEndpoint(next.apiUrl, saved.apiUrl);
   },
   form: { field: "apiKey", keepRequiresUnchanged: ["provider", "apiUrl"] },
-  redactOnAgentRead: false,
+  redactOnAgentRead: true,
 };
 
 type ProviderBuild =
@@ -1639,6 +1386,180 @@ function customProviderFromValues(
   return formValueIssue("api_key_required", "apiKey") as ProviderBuild;
 }
 
+/**
+ * #wg-runtime-form:#31: the fast tiers a live Codex model declares, with
+ * non-fast tiers (`default`, `flex`) and malformed ids dropped.
+ */
+export function fastServiceTiersOf(model: RuntimeModelInfo | undefined): RuntimeServiceTierChoice[] {
+  return (model?.serviceTierChoices ?? []).filter(
+    (choice) => isRuntimeServiceTierId(choice.id) && !CODEX_NON_FAST_SERVICE_TIERS.has(choice.id),
+  );
+}
+
+/**
+ * #wg-runtime-form:#27/#31: the fast tiers a live model offers for the `speed`
+ * dropdown, primary first; empty unless the Computer named two or more and the
+ * first is Codex's primary tier (a model with one fast tier uses the `fastMode`
+ * checkbox; an older Computer names none and uses `fastMode`).
+ */
+export function offeredServiceTiers(model: RuntimeModelInfo | undefined): RuntimeServiceTierChoice[] {
+  const choices = fastServiceTiersOf(model);
+  return choices.length >= 2 && choices[0]!.id === CODEX_PRIMARY_FAST_SERVICE_TIER ? choices : [];
+}
+
+/**
+ * #wg-runtime-form:#31: whether a live Codex model explicitly disallows fast
+ * mode (either statically unsupported or declared `serviceTierChoices` with
+ * zero fast tiers). Both `fastMode` and `speed` stay hidden for such models.
+ */
+export function codexModelDisallowsFastMode(model: RuntimeModelInfo): boolean {
+  if (!runtimeModelSupportsFastMode("codex", model.id)) return true;
+  return Array.isArray(model.serviceTierChoices) && fastServiceTiersOf(model).length === 0;
+}
+
+/**
+ * #wg-runtime-form:#31: shape Codex's served form for one Computer's live model
+ * list so `fastMode` (checkbox) and `speed` (Standard / Fast / Ultrafast menu)
+ * are mutually exclusive per model, and neither appears for a model declaring
+ * zero fast tiers:
+ * - models with >=2 fast tiers -> `speed` SHOW rule, `fastMode` HIDE rule;
+ * - models with 1 fast tier (or unreported / custom) -> `fastMode` visible, `speed` hidden;
+ * - models declaring 0 fast tiers -> `fastMode` HIDE rule, `speed` hidden;
+ * - no multi-tier models on this Computer (or offline) -> `speed` omitted from the form.
+ */
+export function withCodexSpeedVisibility<T extends RuntimeFormV2Definition>(
+  form: T,
+  models: readonly RuntimeModelInfo[],
+): T {
+  const multiTierIds = [...new Set(models.filter((model) => offeredServiceTiers(model).length >= 2).map((model) => model.id))];
+  const noFastIds = [...new Set(models.filter((model) => codexModelDisallowsFastMode(model)).map((model) => model.id))];
+  const hideFastModeIds = [...new Set([...multiTierIds, ...noFastIds])];
+
+  const next = structuredClone(form);
+  if (multiTierIds.length === 0) {
+    delete next.dataSchema.properties.speed;
+    if (next.dataSchema.required) next.dataSchema.required = next.dataSchema.required.filter((key) => key !== "speed");
+    if (next.uiSchema) {
+      if (next.uiSchema.order) next.uiSchema.order = next.uiSchema.order.filter((key) => key !== "speed");
+      if (next.uiSchema.layout?.advanced) next.uiSchema.layout.advanced = next.uiSchema.layout.advanced.filter((pointer) => pointer !== "/speed");
+      delete next.uiSchema.localization?.speed;
+    }
+    if (next.optionSources) delete next.optionSources.speed;
+    const values = (next as { values?: Record<string, unknown> }).values;
+    if (values) delete values.speed;
+  }
+
+  const rules = (next.uiSchema?.rules ?? []).filter(
+    (rule) => rule.scope !== "#/properties/fastMode" && rule.scope !== "#/properties/speed",
+  );
+  if (hideFastModeIds.length > 0 && Object.hasOwn(next.dataSchema.properties, "fastMode")) {
+    rules.push({
+      scope: "#/properties/fastMode",
+      effect: "HIDE",
+      condition: { scope: "#/properties/model", schema: { enum: hideFastModeIds } },
+    });
+  }
+  if (multiTierIds.length > 0 && Object.hasOwn(next.dataSchema.properties, "speed")) {
+    rules.push({
+      scope: "#/properties/speed",
+      effect: "SHOW",
+      condition: { scope: "#/properties/model", schema: { enum: multiTierIds } },
+    });
+  }
+  if (rules.length > 0) {
+    next.uiSchema = { ...next.uiSchema, rules };
+  }
+  return next;
+}
+
+const titleCaseTier = (id: string) => id.charAt(0).toUpperCase() + id.slice(1).replace(/[_-]+/g, " ");
+
+const CODEX_STANDARD_SPEED_LABEL = "Standard · Default speed";
+
+/**
+ * "Fast · 2x speed, increased usage": Codex's own name and description (Option
+ * has no description field), cleaned again here: any Computer can report them.
+ */
+function serviceTierLabel(choice: RuntimeServiceTierChoice): string {
+  const name = runtimeServiceTierText(choice.name, 40) || titleCaseTier(choice.id);
+  const description = runtimeServiceTierText(choice.description, 120);
+  return description ? `${name} · ${description}` : name;
+}
+
+/**
+ * The `speed` source: a key per live model with two or more fast tiers —
+ * Standard ("", default) followed by each fast tier by its id (`priority`,
+ * `ultrafast`, ...). Models with one or zero fast tiers have no key (single-tier
+ * models use `fastMode`; zero-tier models hide both).
+ */
+export function speedOptionSource(
+  runtimeId: string,
+  models: readonly RuntimeModelInfo[],
+  reason: RuntimeFormV2OptionSourceReason | null,
+): RuntimeFormV2OptionSourceBody {
+  const optionsByValue: Record<string, AgentCreateFormOption[]> = {};
+  const defaultValueByValue: Record<string, string> = {};
+  for (const model of models) {
+    const tiers = offeredServiceTiers(model);
+    if (tiers.length === 0) continue;
+    optionsByValue[model.id] = [
+      { value: "", label: CODEX_STANDARD_SPEED_LABEL },
+      ...tiers.map((tier) => ({ value: tier.id, label: serviceTierLabel(tier) })),
+    ];
+    defaultValueByValue[model.id] = "";
+  }
+  return {
+    ...simpleFormRef(runtimeId),
+    sourceId: "speed",
+    kind: "dependent_select",
+    pointer: "/speed",
+    dependsOn: "/model",
+    optionsByValue,
+    defaultValueByValue,
+    customValueAllowedByValue: {},
+    // It follows the model probe: live, or unavailable (hidden) without a live list.
+    ...optionSourceStatusFields(reason, false),
+  } as RuntimeFormV2OptionSourceBody;
+}
+
+/**
+ * #wg-runtime-form:#27: a Codex speed tier nothing could check against the
+ * Computer (no Computer, its list unreadable, a legacy write) is kept only when
+ * it is the saved one on the same model; any other becomes the primary tier.
+ * Returns the same object when nothing changes.
+ */
+export function withoutUncheckedServiceTier(runtimeConfig: RuntimeConfig, existing: RuntimeConfig | null | undefined): RuntimeConfig {
+  const tier = runtimeConfig.mode.kind === "fast" ? runtimeConfig.mode.serviceTier : undefined;
+  if (!tier) return runtimeConfig;
+  const saved = existing?.runtime === runtimeConfig.runtime
+    && existing.mode.kind === "fast"
+    && existing.mode.serviceTier === tier
+    && runtimeConfigModelValue(existing) === runtimeConfigModelValue(runtimeConfig);
+  return saved ? runtimeConfig : { ...runtimeConfig, mode: { kind: "fast" } };
+}
+
+/**
+ * A Codex speed choice against the Computer's live list:
+ * - if the model explicitly declares zero fast tiers, fast mode falls back to default;
+ * - a named fast tier (`ultrafast`, ...) is kept when the model offers it; a saved one
+ *   the model no longer offers falls back to the primary tier; a newly chosen one is refused.
+ */
+function reconcileServiceTier(
+  runtimeConfig: RuntimeConfig,
+  live: RuntimeModelInfo | undefined,
+  storedServiceTier: string | null,
+): LiveModelReconciliation {
+  if (live && codexModelDisallowsFastMode(live) && runtimeConfig.mode.kind === "fast") {
+    return { kind: "updated", runtimeConfig: { ...runtimeConfig, mode: { kind: "default" } } };
+  }
+  const tier = runtimeConfig.mode.kind === "fast" ? runtimeConfig.mode.serviceTier : undefined;
+  if (!tier || offeredServiceTiers(live).some((choice) => choice.id === tier)) return { kind: "unchanged" };
+  if (tier !== storedServiceTier) {
+    return { kind: "rejected", issue: { code: "service_tier_not_supported", pointer: "/formValues/speed" } };
+  }
+  return { kind: "updated", runtimeConfig: { ...runtimeConfig, mode: { kind: "fast" } } };
+}
+
 function reasoningModelFormEntry(runtimeId: string, options: ReasoningModelFormOptions): RuntimeFormV2Entry {
   const bundledIds = () => new Set((RUNTIME_MODELS[runtimeId] ?? []).map((model) => model.id));
   return {
@@ -1652,27 +1573,31 @@ function reasoningModelFormEntry(runtimeId: string, options: ReasoningModelFormO
       if (options.customProvider && context.sourceId === "authType") {
         return { kind: "source", source: customProviderAuthTypeOptionSource(runtimeId) };
       }
+      if (options.speed && context.sourceId === "speed") {
+        const probe = await probeModels(context, runtimeId);
+        if (probe.kind === "handled") return { kind: "handled" };
+        return { kind: "source", source: speedOptionSource(runtimeId, probe.kind === "live" ? probe.models : [], probe.kind === "live" ? null : probe.reason) };
+      }
       if (context.sourceId !== "model") return { kind: "source", source: null };
       const probe = await probeModels(context, runtimeId);
       if (probe.kind === "handled") return { kind: "handled" };
       if (probe.kind === "live") {
-        // "The runtime chooses" (Antigravity's `default`) stays first and
-        // preselected, and a stored one stays listed on edit.
-        const runtimeChoice = runtimeChoiceModel(runtimeId);
-        if (runtimeChoice) {
-          const models = [runtimeChoice, ...probe.models.filter((model) => model.id !== runtimeChoice.id)];
-          return { kind: "source", source: reasoningModelOptionSource(runtimeId, models, runtimeChoice.id, null, options, probe.unavailable) };
-        }
         return { kind: "source", source: reasoningModelOptionSource(runtimeId, probe.models, probe.default, null, options, probe.unavailable) };
       }
+      const fallback = reasoningModelOptionSource(runtimeId, RUNTIME_MODELS[runtimeId] ?? [], undefined, probe.reason, options);
       return {
         kind: "source",
-        source: reasoningModelOptionSource(runtimeId, RUNTIME_MODELS[runtimeId] ?? [], undefined, probe.reason, options),
+        source: options.typedModelWhenUnlisted && options.customModel
+          ? { ...fallback, ...optionSourceStatusFields(probe.reason, true) }
+          : fallback,
       };
     },
     runtimeConfigFromValues(values, envVars, valueOptions) {
       const modelValue = typeof values.model === "string" ? values.model.trim() : "";
-      if (!modelValue) return formValueIssue("model_required", "model");
+      if (!modelValue || modelValue === options.retiredRuntimeChoice) return formValueIssue("model_required", "model");
+      if (options.modelFormat && modelValue !== "default" && !options.modelFormat.valid(modelValue)) {
+        return { ok: false, issue: { code: "invalid_model", pointer: "/formValues/model" }, message: options.modelFormat.message };
+      }
       // A form without a reasoning field ignores a stray value, like fastMode below.
       const effort = options.reasoning ? values.reasoningEffort : null;
       if (effort !== undefined && effort !== null && typeof effort !== "string") {
@@ -1681,6 +1606,31 @@ function reasoningModelFormEntry(runtimeId: string, options: ReasoningModelFormO
       const fastMode = values.fastMode;
       if (fastMode !== undefined && fastMode !== null && typeof fastMode !== "boolean") {
         return formValueIssue("invalid_boolean", "fastMode");
+      }
+      // #wg-runtime-form:#31: `speed` (Standard / Fast / Ultrafast) and `fastMode`
+      // (checkbox) are mutually exclusive on Codex. When `speed` is present, it
+      // decides `mode` directly (`""` = default, `"priority"` = primary fast,
+      // another id = named tier). Otherwise `fastMode` decides, keeping a saved
+      // named tier only when editing the same model while offline (`speed` absent).
+      const speed = options.speed ? values.speed : undefined;
+      if (speed !== undefined && speed !== null && speed !== "" && !isRuntimeServiceTierId(speed)) {
+        return formValueIssue("invalid_service_tier", "speed");
+      }
+      const existingMode = valueOptions?.editing && valueOptions.existing?.runtime === runtimeId ? valueOptions.existing.mode : null;
+      const sameModel = valueOptions?.editing && valueOptions.existing?.runtime === runtimeId
+        && modelValueOf(valueOptions.existing as unknown as Record<string, unknown>) === modelValue;
+      let mode: RuntimeConfig["mode"] = { kind: "default" };
+      if (options.speed && typeof speed === "string") {
+        if (speed !== "" && runtimeModelSupportsFastMode(runtimeId, modelValue)) {
+          mode = speed === CODEX_PRIMARY_FAST_SERVICE_TIER
+            ? { kind: "fast" }
+            : { kind: "fast", serviceTier: speed };
+        }
+      } else if (options.fastMode && fastMode === true && runtimeModelSupportsFastMode(runtimeId, modelValue)) {
+        const keptTier = options.speed && speed === undefined && sameModel && existingMode?.kind === "fast"
+          ? existingMode.serviceTier ?? null
+          : null;
+        mode = { kind: "fast", ...(keptTier ? { serviceTier: keptTier } : {}) };
       }
       const command = options.command ? values.command : null;
       if (command !== undefined && command !== null && typeof command !== "string") {
@@ -1716,9 +1666,7 @@ function reasoningModelFormEntry(runtimeId: string, options: ReasoningModelFormO
           runtime: runtimeId,
           ...(provider ? { provider } : {}),
           model,
-          mode: options.fastMode && fastMode === true && runtimeModelSupportsFastMode(runtimeId, modelValue)
-            ? { kind: "fast" }
-            : { kind: "default" },
+          mode,
           reasoningEffort: typeof effort === "string" && effort.trim() !== "" ? effort.trim() : null,
           envVars,
           ...(typeof command === "string" && command.trim() ? { command: command.trim() } : {}),
@@ -1741,7 +1689,7 @@ function reasoningModelFormEntry(runtimeId: string, options: ReasoningModelFormO
                 : {}),
             }
           : {}),
-        model: modelValueOf(runtimeConfig),
+        model: modelValueOf(runtimeConfig) === options.retiredRuntimeChoice ? "" : modelValueOf(runtimeConfig),
         ...(options.reasoning
           ? { reasoningEffort: typeof runtimeConfig.reasoningEffort === "string" ? runtimeConfig.reasoningEffort : "" }
           : {}),
@@ -1752,22 +1700,37 @@ function reasoningModelFormEntry(runtimeId: string, options: ReasoningModelFormO
                 && runtimeModelSupportsFastMode(runtimeId, modelValueOf(runtimeConfig)),
             }
           : {}),
+        ...(options.speed
+          ? {
+              speed: isPlainRecord(runtimeConfig.mode)
+                && runtimeConfig.mode.kind === "fast"
+                && runtimeModelSupportsFastMode(runtimeId, modelValueOf(runtimeConfig))
+                ? (isRuntimeServiceTierId(runtimeConfig.mode.serviceTier)
+                    ? runtimeConfig.mode.serviceTier
+                    : CODEX_PRIMARY_FAST_SERVICE_TIER)
+                : "",
+            }
+          : {}),
         ...(options.command ? { command: typeof runtimeConfig.command === "string" ? runtimeConfig.command : "" } : {}),
         envVars: envVarsOf(runtimeConfig),
       };
     },
     ...(options.customProvider ? { writeOnlySecrets: [CLAUDE_CUSTOM_PROVIDER_API_KEY] } : {}),
-    reconcileWithLiveModels(runtimeConfig, submittedReasoningEffort, models, storedReasoningEffort = null) {
-      const modelValue = runtimeConfig.model.kind === "custom" ? runtimeConfig.model.name : runtimeConfig.model.id;
+    reconcileWithLiveModels(submittedConfig, submittedReasoningEffort, models, storedReasoningEffort = null, storedServiceTier = null) {
+      const modelValue = submittedConfig.model.kind === "custom" ? submittedConfig.model.name : submittedConfig.model.id;
       const live = models.find((model) => model.id === modelValue);
+      const tierDecision = options.speed ? reconcileServiceTier(submittedConfig, live, storedServiceTier) : { kind: "unchanged" as const };
+      if (tierDecision.kind === "rejected") return tierDecision;
+      const runtimeConfig = tierDecision.kind === "updated" ? tierDecision.runtimeConfig : submittedConfig;
+      const changed: LiveModelReconciliation = tierDecision.kind === "updated" ? tierDecision : { kind: "unchanged" };
       // Not in the live list: a custom model, or a bundled one this Computer
       // does not report. The static rule already applied stays final.
-      if (!live) return { kind: "unchanged" };
+      if (!live) return changed;
       if (!options.reasoning) {
         // Nothing to decide but the model kind: a live-listed one is a preset.
         return runtimeConfig.model.kind === "custom"
           ? { kind: "updated", runtimeConfig: { ...runtimeConfig, model: { kind: "preset", id: modelValue } } as RuntimeConfig }
-          : { kind: "unchanged" };
+          : changed;
       }
       const efforts = reasoningModelOption(runtimeId, live).supportedReasoningEfforts ?? [];
       let effort = submittedReasoningEffort;
@@ -1796,6 +1759,7 @@ function reasoningModelFormEntry(runtimeId: string, options: ReasoningModelFormO
 const codexEntry = reasoningModelFormEntry("codex", {
   customModel: true,
   fastMode: true,
+  speed: true,
   reasoning: true,
   modelHint: "Models available from this computer's Codex CLI. You can also type a model ID.",
 });
@@ -1840,7 +1804,7 @@ const copilotEntry = reasoningModelFormEntry("copilot", {
   modelHint: "Models GitHub Copilot CLI accepts. You can also type a model ID.",
 });
 
-// Runtimes that run only on the Computer's OAR host (Qwen Code, Qoder). OAR's
+// Runtimes that run only on the Computer's OAR host (Qwen Code, Qoder; DSH below). OAR's
 // forms do not have them yet, so Raft writes them like Cursor's: the model
 // list the Computer reads through OAR, a typed id allowed, no effort.
 const qwenEntry = reasoningModelFormEntry("qwen", {
@@ -1857,17 +1821,40 @@ const qoderEntry = reasoningModelFormEntry("qoder", {
   modelHint: "Models available to this computer's Qoder login (qodercli login). You can also type a model ID.",
 });
 
+// DeepSeek Harness, OAR-only like Qwen Code and Qoder: the models the
+// Computer's dsh lists (OAR listModels, `provider/model`), a typed id allowed
+// (dsh refuses a bare model name). The effort is the model's own reasoning
+// effort, offered only for a model whose efforts the Computer listed
+// (`runtimeOffersUndeclaredReasoningEfforts`). No sign-in: its DeepSeek key
+// is configured in dsh or the agent's environment.
+const dshEntry = reasoningModelFormEntry("dsh", {
+  customModel: true,
+  fastMode: false,
+  reasoning: true,
+  // OAR's dshAgentOptions: a provider and a model on either side of the first `/`.
+  modelFormat: {
+    valid: (model) => /^[^/\s]+\/\S+$/u.test(model),
+    message: "DeepSeek Harness selects a model as provider/model, such as deepseek/deepseek-chat.",
+  },
+  modelHint: "Models DeepSeek Harness can use on this computer, as provider/model. You can also type one. Set its DeepSeek API key in dsh's own settings on the computer, or as DEEPSEEK_API_KEY under Environment Variables.",
+});
+
 // Antigravity on the OAR host: the models the Computer's `agy` login offers
-// (OAR listModels), a typed id allowed, and "AGY configured default" (`default`,
-// no model passed) kept first and preselected, so a stored default still means
-// "agy chooses". The effort is agy's thought level, offered only for a model
-// whose levels the Computer listed; OAR applies it as the session's `effort`.
-// A model id that already names its level carries none (the daemon drops it).
+// (OAR listModels), a typed id allowed (also when the list cannot be read).
+// A model is required (#oar-raft:#25): the one agy starts on (the live list's
+// default) is preselected. "AGY configured default" (`default`, no model
+// passed) is no longer offered; an agent that stored it keeps running until
+// someone edits it, and its edit form asks for a model. The effort is agy's
+// thought level, offered only for a model whose levels the Computer listed;
+// OAR applies it as the session's `effort`. A model id that already names its
+// level carries none (the daemon drops it).
 const antigravityEntry = reasoningModelFormEntry("antigravity", {
   customModel: true,
   fastMode: false,
   reasoning: true,
-  modelHint: "Models available to this computer's Antigravity login. AGY configured default lets Antigravity choose. You can also type a model ID.",
+  retiredRuntimeChoice: ANTIGRAVITY_AGY_CHOOSES_MODEL,
+  typedModelWhenUnlisted: true,
+  modelHint: "Models available to this computer's Antigravity login; the one Antigravity starts on is preselected. You can also type a model ID.",
 });
 
 /**
@@ -1880,9 +1867,7 @@ const antigravityEntry = reasoningModelFormEntry("antigravity", {
  * - Provider: "Configured" (the Computer's own Pi auth.json; runtimeConfig
  *   provider `{ kind: "default" }`) or one of the Pi built-in providers
  *   (PI_BUILTIN_PROVIDER_ENV_KEYS, today DeepSeek; `{ kind: "pi-builtin",
- *   providerId, apiKey }`). Pi has no saved provider connections: the legacy
- *   dialogs load them only for Built-in, and the parser has no `connection`
- *   provider for Pi.
+ *   providerId, apiKey }`).
  * - Configured: the model list comes from the Computer's Pi probe, and a typed
  *   custom model is allowed (supportsRuntimeCustomModelName).
  * - A built-in provider: an API key, and the provider's own model list
@@ -2046,14 +2031,10 @@ function piProjectionIssues(form: RuntimeFormV2Definition): AgentCreateFormIssue
 }
 
 /**
- * The Pi built-in provider key: write-only in the v2 form (never in `values`;
- * a blank one on edit keeps the stored key while the provider is unchanged).
- *
- * `redactOnAgentRead: false`, like Claude's key: the legacy web edit form
- * prefills the key from the v1 agent read (AgentDetailPanel,
- * runtimeConfigPiProviderApiKey) and refuses to save a blank one, and the
- * strict parser rejects a blank `pi-builtin` key, so a blanked read would not
- * even hydrate there. Flip to true once released clients treat it as write-only.
+ * The Pi built-in provider key: write-only on both the v2 form and the v1 agent
+ * read (`GET /api/agents[/:id]` blanks it to `""`; web and mobile 1.24+ edit
+ * through `GET /api/agents/:id/runtime-form`, and legacy v1 PATCHes with a
+ * blank key keep the stored one via `retainLegacyBlankWriteOnlySecrets`).
  */
 const PI_BUILTIN_PROVIDER_API_KEY: RuntimeConfigWriteOnlySecret = {
   path: ["provider", "apiKey"],
@@ -2066,7 +2047,7 @@ const PI_BUILTIN_PROVIDER_API_KEY: RuntimeConfigWriteOnlySecret = {
       && next.providerId.trim() === saved.providerId.trim();
   },
   form: { field: "apiKey", keepRequiresUnchanged: ["provider"] },
-  redactOnAgentRead: false,
+  redactOnAgentRead: true,
 };
 
 const KNOWN_REASONING_EFFORT_IDS: ReadonlySet<string> = new Set(REASONING_EFFORTS.map((effort) => effort.id));
@@ -2190,10 +2171,11 @@ const piEntry: RuntimeFormV2Entry = {
 const REGISTRY = new Map<string, RuntimeFormV2Entry>([
   [builtinEntry.runtimeId, builtinEntry],
   [kimiSdkEntry.runtimeId, kimiSdkEntry],
-  // Batch 2. Kimi CLI, Gemini CLI and Antigravity are deprecated (as is Copilot
-  // CLI, batch 3b): the admission row offers them (and so their v2 marker) only
-  // as an edited agent's current runtime, and a create with them is refused like
-  // any deprecated runtime.
+  // Batch 2. Kimi CLI and Gemini CLI are deprecated (as is Copilot CLI, batch
+  // 3b): the admission row offers them (and so their v2 marker) only as an
+  // edited agent's current runtime, and a create with them is refused like any
+  // deprecated runtime. Antigravity, deprecated then, is offered for new agents
+  // again (a create form, `antigravity.create.v1`).
   ["opencode", modelFormEntry("opencode", { live: true, hint: "Models available from this computer's OpenCode configuration." })],
   ["kimi", modelFormEntry("kimi", { live: true, hint: "Models available from this computer's Kimi CLI configuration." })],
   ["gemini", modelFormEntry("gemini", { live: false })],
@@ -2208,9 +2190,11 @@ const REGISTRY = new Map<string, RuntimeFormV2Entry>([
   [copilotEntry.runtimeId, copilotEntry],
   // Batch 4: Pi. No v1 form.
   [piEntry.runtimeId, piEntry],
-  // OAR-only runtimes; admitted per server flag (runtimeAdmissionService.ts).
+  // OAR-only runtimes: offered where a Computer reports them, no server flag
+  // (runtimeAdmissionService.ts).
   [qwenEntry.runtimeId, qwenEntry],
   [qoderEntry.runtimeId, qoderEntry],
+  [dshEntry.runtimeId, dshEntry],
 ]);
 
 export function runtimeFormV2Entry(runtimeId: unknown): RuntimeFormV2Entry | null {
@@ -2281,38 +2265,12 @@ export function buildRuntimeFormV2EditBody(runtimeId: string, runtimeConfig: unk
 }
 
 /**
- * The edit body on the per-server v2 build: same as buildRuntimeFormV2EditBody,
- * but the base form comes from buildRuntimeFormV2ForServer, so a builtin edit
- * on a server with provider connections carries the saved-connection
- * capability, the x-connectionOwned markers and the revision token.
- */
-export async function buildRuntimeFormV2EditBodyForServer(
-  runtimeId: string,
-  runtimeConfig: unknown,
-  serverId: string,
-  clientCapabilities: readonly string[] = [],
-  valuesContext: RuntimeFormValuesContext,
-): Promise<RuntimeFormV2Definition | null> {
-  const entry = runtimeFormV2Entry(runtimeId);
-  const values = runtimeFormValuesFromRuntimeConfig(runtimeConfig, valuesContext);
-  if (!entry || !values) return null;
-  const base = await buildRuntimeFormV2ForServer(runtimeId, serverId, clientCapabilities) ?? entry.buildForm();
-  const keep = runtimeFormV2WriteOnlyKeepRequiresUnchanged(runtimeId);
-  return { ...base, ...(keep ? { writeOnlyKeepRequiresUnchanged: keep } : {}), values };
-}
-
-/**
  * task #10: a stored Built-in config a newer client wrote on a preset provider
- * that takes a typed id, directly or through a saved connection to it
- * (`connectionProviderId`: that connection's provider, resolved by the
- * route): a custom model, either a typed id or a listed model saved with
- * limit overrides. Null for every other config.
+ * that takes a typed id: a custom model, either a typed id or a listed model
+ * saved with limit overrides. Null for every other config.
  */
-function storedBuiltInPresetCustomModel(runtimeConfig: unknown, connectionProviderId: string | null): {
-  /** The provider field's value: the provider, or `connection:<id>`. */
-  providerId: string;
-  viaConnection: boolean;
-  /** The preset provider the model runs on. */
+function storedBuiltInPresetCustomModel(runtimeConfig: unknown): {
+  /** The preset provider the model runs on (the provider field's value). */
   catalogProviderId: string;
   /** The Model value the edit form shows (valuesFromRuntimeConfig). */
   modelValue: string;
@@ -2324,16 +2282,13 @@ function storedBuiltInPresetCustomModel(runtimeConfig: unknown, connectionProvid
   const provider = isPlainRecord(runtimeConfig.provider) ? runtimeConfig.provider : null;
   const model = isPlainRecord(runtimeConfig.model) ? runtimeConfig.model : null;
   if (model?.kind !== "custom") return null;
-  const viaConnection = provider?.kind === "connection" && typeof provider.connectionId === "string";
   const catalogProviderId = provider?.kind === "preset" && typeof provider.providerId === "string"
     ? provider.providerId
-    : viaConnection ? connectionProviderId : null;
+    : null;
   if (!catalogProviderId || !isBuiltInRuntimeCustomModelPresetProviderId(catalogProviderId)) return null;
   const modelValue = listedModelValueOf(catalogProviderId, runtimeConfig);
   const unlisted = !(PI_BUILTIN_PROVIDER_MODELS[catalogProviderId] ?? []).some((candidate) => candidate.id === modelValue);
   return {
-    providerId: viaConnection ? `${SAVED_CONNECTION_VALUE_PREFIX}${provider!.connectionId as string}` : catalogProviderId,
-    viaConnection,
     catalogProviderId,
     modelValue,
     unlisted,
@@ -2343,32 +2298,25 @@ function storedBuiltInPresetCustomModel(runtimeConfig: unknown, connectionProvid
 
 /**
  * task #10: the preset providers a client and Computer take a typed model id
- * (and so the limits) for: directly (`presets`, the v2 limit rule) and
- * through a saved connection to one (`connections`, which v3 lists in that
- * rule; a Computer may run the first and not the second).
+ * (and so the limits) for (`presets`, the v2 limit rule).
  */
 export interface BuiltInTypedModelProviders {
   presets: readonly string[];
-  connections: readonly string[];
 }
 
 /**
  * task #10: an edit form also shows the limit fields for the agent's own
  * provider while it HAS a stored limit, whatever the client and Computer say:
  * a hidden field is left out of the submit, and a save without it would
- * silently delete the limit. Through a saved connection the provider counts
- * for both: v2 clients show a connection's fields by its underlying
- * provider, v3 lists the connection.
+ * silently delete the limit.
  */
 export function withStoredLimitProvider(
   typed: BuiltInTypedModelProviders,
   storedRuntimeConfig: unknown,
-  storedConnectionProviderId: string | null,
 ): BuiltInTypedModelProviders {
-  const stored = storedBuiltInPresetCustomModel(storedRuntimeConfig, storedConnectionProviderId);
-  if (!stored?.hasLimits) return typed;
-  const add = (ids: readonly string[]) => ids.includes(stored.catalogProviderId) ? ids : [...ids, stored.catalogProviderId];
-  return { presets: add(typed.presets), connections: stored.viaConnection ? add(typed.connections) : typed.connections };
+  const stored = storedBuiltInPresetCustomModel(storedRuntimeConfig);
+  if (!stored?.hasLimits || typed.presets.includes(stored.catalogProviderId)) return typed;
+  return { presets: [...typed.presets, stored.catalogProviderId] };
 }
 
 /**
@@ -2389,15 +2337,9 @@ export function withBuiltInEditVisibility(
   typedPresetProviderIds: readonly string[],
   clientCapabilities: readonly string[],
   storedRuntimeConfig: unknown,
-  /** The stored saved connection's provider, when it has one. */
-  storedConnectionProviderId: string | null,
 ): RuntimeFormV2Definition {
-  const stored = storedBuiltInPresetCustomModel(storedRuntimeConfig, storedConnectionProviderId);
-  const limitProviders = withStoredLimitProvider(
-    { presets: typedPresetProviderIds, connections: [] },
-    storedRuntimeConfig,
-    storedConnectionProviderId,
-  ).presets;
+  const stored = storedBuiltInPresetCustomModel(storedRuntimeConfig);
+  const limitProviders = withStoredLimitProvider({ presets: typedPresetProviderIds }, storedRuntimeConfig).presets;
   let next = withBuiltInModelLimitVisibility(form, limitProviders);
   if (stored?.unlisted && !clientRendersDependentCustomWithOptions(clientCapabilities)) {
     const providers = (buildBuiltInPiFormOptionSource("provider") as { options?: Array<{ value: string }> } | null)?.options ?? [];
@@ -2436,18 +2378,16 @@ export function guardBuiltInEditFromClient(
   values: unknown,
   storedRuntimeConfig: unknown,
   clientCapabilities: readonly string[],
-  /** The stored saved connection's provider, when it has one. */
-  storedConnectionProviderId: string | null,
 ): { ok: true; values: unknown } | { ok: false; issue: AgentCreateFormIssue; message: string } {
   if (clientRendersDependentCustomWithOptions(clientCapabilities) || !isPlainRecord(values)) return { ok: true, values };
-  const stored = storedBuiltInPresetCustomModel(storedRuntimeConfig, storedConnectionProviderId);
+  const stored = storedBuiltInPresetCustomModel(storedRuntimeConfig);
   if (!stored) return { ok: true, values };
   const refuse = (key: string) => ({
     ok: false as const,
     issue: { code: "runtime_form_client_upgrade_required", pointer: `/formValues/${key}` },
     message: RUNTIME_FORM_CLIENT_UPGRADE_REQUIRED_MESSAGE,
   });
-  if (values.providerId !== stored.providerId) return refuse("providerId");
+  if (values.providerId !== stored.catalogProviderId) return refuse("providerId");
   const model = typeof values.model === "string" ? values.model.trim() : "";
   // Filled back in only where the Model field was hidden (a typed id the old
   // list cannot show); a visible field sent blank is the usual model_required.
@@ -2540,8 +2480,12 @@ export function buildRuntimeConfigFromFormValues(
  * model is a preset, and the submitted effort is kept if the option offers it
  * and refused (400 /formValues/reasoningEffort) if not. When the probe is not
  * live, fails, or does not list the model, the static rule stands (unchanged).
- * Only asks the Computer when there is something to decide (an effort, or a
- * custom model). Legacy (non-v2) submits never come here.
+ * A Codex speed tier (#wg-runtime-form:#27) is checked the same way; one that
+ * cannot be checked is refused when newly chosen (400 /formValues/speed,
+ * `service_tier_unchecked`) and otherwise stays only as the saved tier on the
+ * same model (withoutUncheckedServiceTier). Only asks the Computer when there is
+ * something to decide (an effort, a tier, or a custom model). Legacy (non-v2)
+ * submits never come here (routes/agents.ts dropUncheckedServiceTier).
  */
 export async function reconcileRuntimeFormV2SubmissionWithLiveModels(input: {
   runtimeConfig: RuntimeConfig;
@@ -2552,20 +2496,38 @@ export async function reconcileRuntimeFormV2SubmissionWithLiveModels(input: {
   detect: (machineId: string, runtime: string) => Promise<RuntimeModelSourceOutcome>;
 }): Promise<LiveModelReconciliation> {
   const entry = runtimeFormV2Entry(input.runtimeConfig.runtime);
-  if (!entry?.reconcileWithLiveModels || !input.machineId) return { kind: "unchanged" };
+  // A tier this submit cannot check: a newly chosen one is refused, so the
+  // person hears it did not take (Tenny, #15382 review); a resent saved one
+  // stays only on the same model (withoutUncheckedServiceTier).
+  const unchecked = (): LiveModelReconciliation => {
+    const chosen = input.runtimeConfig.mode.kind === "fast" ? input.runtimeConfig.mode.serviceTier ?? null : null;
+    const saved = input.existing?.runtime === input.runtimeConfig.runtime && input.existing.mode.kind === "fast"
+      ? input.existing.mode.serviceTier ?? null
+      : null;
+    if (chosen !== null && chosen !== saved) {
+      return { kind: "rejected", issue: { code: "service_tier_unchecked", pointer: "/formValues/speed" } };
+    }
+    const kept = withoutUncheckedServiceTier(input.runtimeConfig, input.existing);
+    return kept === input.runtimeConfig ? { kind: "unchanged" } : { kind: "updated", runtimeConfig: kept };
+  };
+  if (!entry?.reconcileWithLiveModels || !input.machineId) return unchecked();
   const effort = typeof input.submittedReasoningEffort === "string" && input.submittedReasoningEffort
     ? input.submittedReasoningEffort
     : null;
-  if (effort === null && input.runtimeConfig.model.kind !== "custom") return { kind: "unchanged" };
+  const tier = input.runtimeConfig.mode.kind === "fast" ? input.runtimeConfig.mode.serviceTier ?? null : null;
+  const fastCodex = input.runtimeConfig.runtime === "codex" && input.runtimeConfig.mode.kind === "fast";
+  if (effort === null && tier === null && !fastCodex && input.runtimeConfig.model.kind !== "custom") return { kind: "unchanged" };
   let outcome: RuntimeModelSourceOutcome;
   try {
     outcome = await input.detect(input.machineId, input.runtimeConfig.runtime);
   } catch {
-    return { kind: "unchanged" };
+    return unchecked();
   }
-  if (outcome.kind !== "live" || outcome.value.models.length === 0) return { kind: "unchanged" };
-  const stored = input.existing?.runtime === input.runtimeConfig.runtime ? input.existing.reasoningEffort ?? null : null;
-  return entry.reconcileWithLiveModels(input.runtimeConfig, effort, outcome.value.models, stored);
+  if (outcome.kind !== "live" || outcome.value.models.length === 0) return unchecked();
+  const sameRuntime = input.existing?.runtime === input.runtimeConfig.runtime ? input.existing : null;
+  const stored = sameRuntime?.reasoningEffort ?? null;
+  const storedTier = sameRuntime?.mode.kind === "fast" ? sameRuntime.mode.serviceTier ?? null : null;
+  return entry.reconcileWithLiveModels(input.runtimeConfig, effort, outcome.value.models, stored, storedTier);
 }
 
 /**
@@ -2590,17 +2552,11 @@ export function formValuesPointerForRuntimeConfigPointer(runtimeId: unknown, poi
  * The inverse of buildRuntimeConfigFromFormValues, for editing: the stored
  * runtimeConfig as form values keyed by field name. writeOnly fields are never
  * included. Null when the config is not one a v2 form can edit (runtimes
- * without a v2 form, managed provider connections).
+ * without a v2 form).
  */
-export function runtimeFormValuesFromRuntimeConfig(runtimeConfig: unknown, context?: RuntimeFormValuesContext): Record<string, unknown> | null {
+export function runtimeFormValuesFromRuntimeConfig(runtimeConfig: unknown): Record<string, unknown> | null {
   if (!isPlainRecord(runtimeConfig)) return null;
-  return runtimeFormV2Entry(runtimeConfig.runtime)?.valuesFromRuntimeConfig(runtimeConfig, context) ?? null;
-}
-
-/** What the edit values of a stored config may depend on beyond the config itself. */
-export interface RuntimeFormValuesContext {
-  /** The provider of the saved connection the config is bound to (resolved by the route); null when none. */
-  connectionProviderId: string | null;
+  return runtimeFormV2Entry(runtimeConfig.runtime)?.valuesFromRuntimeConfig(runtimeConfig) ?? null;
 }
 
 function valueAt(record: Record<string, unknown>, path: readonly string[]): unknown {
@@ -2657,6 +2613,35 @@ export function retainOmittedClaudeAuthType(incoming: unknown, existing: Runtime
   if (saved?.kind !== "custom" || saved.authType !== "auth_token") return incoming;
   if (typeof provider.apiUrl !== "string" || !sameApiEndpoint(provider.apiUrl, saved.apiUrl)) return incoming;
   return { ...incoming, provider: { ...provider, authType: saved.authType } };
+}
+
+/**
+ * v1 runtimeConfig writes only: pre-1.24 mobile apps read `provider.apiKey`
+ * from `GET /api/agents[/:id]`. Once `redactOnAgentRead` blanks Claude custom
+ * and Pi built-in keys to `""`, an older app submitting an untouched edit sends
+ * `apiKey: ""`. Keep the stored key while the runtime and provider identity
+ * hold (same rule as `retainOmittedWriteOnlySecrets`), without affecting v2
+ * submits or Built-in's explicit-blank rejection.
+ */
+export function retainLegacyBlankWriteOnlySecrets(incoming: unknown, existing: RuntimeConfig): unknown {
+  if (!isPlainRecord(incoming) || typeof incoming.runtime !== "string") return incoming;
+  const runtime = incoming.runtime.trim();
+  if ((runtime !== "claude" && runtime !== "pi") || runtime !== existing.runtime) return incoming;
+  const saved = existing as unknown as Record<string, unknown>;
+  let result = incoming;
+  for (const secret of runtimeFormV2Entry(runtime)?.writeOnlySecrets ?? []) {
+    const parentPath = secret.path.slice(0, -1);
+    const key = secret.path[secret.path.length - 1]!;
+    const incomingParent = valueAt(result, parentPath);
+    if (!isPlainRecord(incomingParent) || !Object.hasOwn(incomingParent, key)) continue;
+    const rawIncoming = incomingParent[key];
+    if (typeof rawIncoming !== "string" || rawIncoming.trim() !== "") continue;
+    const kept = valueAt(saved, secret.path);
+    if (typeof kept !== "string" || !kept) continue;
+    if (!isPlainRecord(valueAt(saved, parentPath)) || !secret.keepsIdentity(result, saved)) continue;
+    result = withValueAt(result, secret.path, kept);
+  }
+  return result;
 }
 
 export function retainOmittedWriteOnlySecrets(incoming: unknown, existing: RuntimeConfig): unknown {

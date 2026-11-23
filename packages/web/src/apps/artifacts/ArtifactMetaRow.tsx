@@ -2,7 +2,9 @@ import type { ReactNode } from "react";
 import { PanelMeta } from "@botiverse/raft-ui";
 
 /**
- * The Artifact header's line under the title, in two parts (stdrc's option
+ * The Artifact header's line under the title where a head has one (a phone's,
+ * the App's toolbar; a desktop head is one line, its title opening the
+ * details: ArtifactDetailsTitle), in two parts (stdrc's option
  * A, #proj-raft-ui:7531279d):
  *
  * - `text`: where it lives and its original message, in raft-ui PanelMeta,
@@ -28,9 +30,18 @@ import { PanelMeta } from "@botiverse/raft-ui";
  * the container their count measures: under 16rem, faces alone
  * (ArtifactPresence; on a phone they are faces alone).
  */
-export function ArtifactMetaRow({ text, readers = null, testId }: { text: ReactNode; readers?: ReactNode; testId?: string }) {
+export function ArtifactMetaRow({ text, readers = null, testId, phoneOnly = false }: {
+  text: ReactNode;
+  readers?: ReactNode;
+  testId?: string;
+  /**
+   * Only under 768px (md), where a head has its two lines: a placeholder drawn before the layout is known (the boot
+   * shell, the viewer's chunk loading), as the loaded head draws it there only (a desktop head is one line).
+   */
+  phoneOnly?: boolean;
+}) {
   return (
-    <div className="grid min-h-[27px] grid-cols-[minmax(0,auto)_auto] items-center gap-2" data-artifact-meta-row="" data-testid={testId}>
+    <div className={`grid min-h-[27px] grid-cols-[minmax(0,auto)_auto] items-center gap-2 ${phoneOnly ? "md:hidden" : ""}`} data-artifact-meta-row="" data-testid={testId}>
       <PanelMeta render={<div />} className="flex min-w-0 items-center gap-2" data-testid="artifact-meta-text">
         {text}
       </PanelMeta>

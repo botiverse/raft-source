@@ -1,5 +1,12 @@
 import type { NextFunction, Request, Response } from "express";
 import { getActorServerRoleInServer } from "../lib/actorPermissions";
+import { refuse, type RefusalInput } from "../lib/refusal";
+
+/** A Guest on a server-wide management surface: this gate and `guestHiddenServerSurfaces` in routes/servers.ts answer it alike. */
+export const SERVER_MANAGEMENT_GUEST_REFUSAL: RefusalInput = {
+  code: "server_management_guest_forbidden",
+  error: "Guests can't access server management",
+};
 
 /**
  * Per-route guard for server-wide read surfaces that sit behind `requireServer`
@@ -12,7 +19,7 @@ export async function denyServerGuests<P>(req: Request<P>, res: Response, next: 
   try {
     const callerRole = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
     if (callerRole === "guest") {
-      res.status(403).json({ error: "Guests can't access server management" });
+      refuse(res, 403, SERVER_MANAGEMENT_GUEST_REFUSAL);
       return;
     }
     next();

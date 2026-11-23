@@ -18,8 +18,8 @@ it shares with it through narrow callbacks that `core.ts` wires
 (`OarAgentHostDeps`), and the legacy driver's launch preparation through
 `drivers/index` (`prepareGrokLaunch`, `prepareCodexLaunch`).
 
-Runtimes on the OAR host: **grok**, and the OAR-only **qwen** (Qwen Code) and
-**qoder** (Qoder). The OAR-only runtimes have no legacy driver: their driver
+Runtimes on the OAR host: **grok**, and the OAR-only **qwen** (Qwen Code),
+**qoder** (Qoder) and **dsh** (DeepSeek Harness). The OAR-only runtimes have no legacy driver: their driver
 shell (`drivers/oarOnly.ts`, `oarOnly: true`) gives detection, OAR model
 listing and the standing prompt, and never spawns. The router sends every
 start of them to the OAR host whatever `runtimeHost` says, and a start the OAR
@@ -27,16 +27,55 @@ host cannot run (Windows, a missing CLI, an RFC 071 refusal, an unresumable
 session) fails with `OarOnlyStartError` instead of reaching the legacy host.
 They have no server flag: whether one can be used for a new agent or a switch
 is what the Computer reports (server `runtimeAdmissionService.ts`).
+**dsh** (DeepSeek Harness, OAR `dshRuntime`, 0.2.1-rc.5 or later; detection
+reports it only for a `dsh` on PATH whose `--version` is a semver, so Debian's
+distributed shell `/usr/bin/dsh` is not taken for it; a launch then runs what
+OAR's own lookup finds, which also honours `OAR_DSH_BIN`): OAR runs one `dsh --profile acp` process per session
+with its private bridge plugin. The standing prompt is its `systemPrompt`,
+given on every open (OAR applies a given prompt on resume too, so
+`standingPromptRefreshesOnResume` is on); the model is a `provider/model`
+selector from OAR's listing (a bare name is refused); the effort is the
+model's own reasoning effort, listed per model (`keepReasoningEfforts`).
+Busy deliveries steer only into a session that has `steer` (OAR gives it one
+only where dsh's method inventory advertises it, so its capability answer
+leaves `steer` unknown): `busyDelivery: "now"`, and
+the host steers only where `session.steer` exists (`launchSteers`), holding
+the delivery for the turn end otherwise. No managed MCP: OAR takes stdio
+session MCP servers only (no HTTP, `env` or `headers`) and declares
+`mcpServerCredentials` refused. No images, no
+session names, no tool denial from Raft. DeepSeek credentials are dsh's own
+(a key saved in dsh's settings, in a mode-600 `$DSH_HOME/.credentials.yaml`,
+ranks above `DEEPSEEK_API_KEY` in the environment): Raft neither reads nor
+signs them in. Sub-agents: not in `RUNTIMES_WITH_SUBAGENTS` yet (Raft does
+not read OAR's dsh sub-agent projection). Not run with a real DeepSeek key in Raft
+yet: hence experimental.
 
 **antigravity** has an OAR launch (`oarAntigravityLaunch.ts`) behind
-`agent_runtime_oar_antigravity` (#oar-raft:#2; on a server where it is on, new
-Antigravity agents can be created again, #oar-raft:#6): `agy acp` as one session across
+`agent_runtime_oar_antigravity` (#oar-raft:#2; the flag only routes it, new
+Antigravity agents can be created whether it is on or off): `agy acp` as one session across
 turns, on the user's own `agy` login, which OAR neither signs in nor reports. It
 reuses the driver's environment and its managed MCP file in the workspace
 (`.agents/mcp_config.json`), never ACP, where `agy` would store the entry
 (see [Managed MCP](#managed-mcp)). An
-agent whose session id came from the driver falls back to the driver until the
-session is reset. Run on a real `agy` 1.5.2 with a fake model (no account):
+agent whose session id came from the driver: `agy` doesn't list it, so OAR
+refuses the resume (`ResumeCwdError` `not_listed`, OAR 0.108+) and the start
+opens a new OAR session instead (`newSessionOnResumeNotListed`;
+`daemon.agent.oar.resume_elsewhere_new_session` with `resume_cwd_reason`, an
+Activity Log `system` row `ANTIGRAVITY_SESSION_NOT_LISTED_TEXT`). A model agy
+no longer offers (OAR `ModelConfirmationError` with a catalog that does not name
+it: it left the account or was renamed) fails the start here as
+`model_unsupported`, naming the models agy's catalog offers
+(`modelConfirmationFailure`), never the driver: it would pass the same model,
+and nothing picks another one for the person. A confirmation failure without a
+catalog, or with one that still names the model, falls back as before (#oar-raft:#25, where
+the model became required; a stored `default` still leaves it to agy). Any other cwd
+refusal, or another open failure, falls back to the driver (`daemon.agent.oar.fallback`; an OAR
+`UnsupportedOptionError` adds `refused_option` and, for a cwd refusal, `resume_cwd_reason`). That fallback passes the same model (verbatim) and effort
+as agy's own `--model` / `--effort`, as this launch does (except an effort the
+Computer's last model list shows the model doesn't offer, which agy would refuse:
+`antigravityLegacyEffort`, #oar-raft:#35), with
+`--output-format stream-json`, so the start is ready at agy's `init` event
+rather than at the turn's answer. Run on a real `agy` 1.5.2 with a fake model (no account):
 opens, standing prompt in the request, workspace MCP connects, steer, resume.
 Not run with a real `agy` login yet.
 
@@ -74,7 +113,7 @@ driver's does; OAR fails the open when that directory does not exist.
 that advertises `runtime-host:oar:cursor`
 (`DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR`: Linux, not the single-file SEA
 build, Node 22.13 or newer, and `@cursor/sdk` resolves beside the daemon;
-`cursorSdkAvailable` in `oarLoader.ts`). `@cursor/sdk` (1.3.1, OAR's peer) is a
+`cursorSdkAvailable` in `oarLoader.ts`). `@cursor/sdk` (1.4.1, OAR's peer) is a
 daemon dependency, so npm and Electron installs of the Computer ship it with
 its native companion; the daemon never imports it. OAR 0.101 runs it **in a
 Node child per session** (`execution: "subprocess"`, `envBase: "clean"`), and
@@ -103,6 +142,12 @@ for Cursor.
   and gives it to the SDK as `apiKey` over IPC, so tool shells and the
   child's `/proc/<pid>/environ` never hold it.
 - Managed MCP: `mcpServers` with a bearer header ([Managed MCP](#managed-mcp)).
+- User and project settings (OAR 0.113): a session loads the Cursor settings
+  under the child's HOME and the agent's workspace (`settingSources:
+  ["project", "user"]`: rules, skills, hooks, MCP servers), as Claude Code and
+  Codex agents load theirs.
+  Raft passes no `userConfiguration`; before 0.113 the SDK silently loaded
+  none of them.
 - Model: the Cursor CLI's `default` / `auto` are the SDK's default (no model
   given); any other id passes as is, and one the SDK does not list fails the
   open (a hand-back). No effort is passed.
@@ -151,10 +196,14 @@ turns, where the driver runs `opencode run` per turn.
 
 - Version: OpenCode 1.x from 1.18.30, 2.x from 2.0.27, below 3 (what OAR's
   adapter was checked against): `supports()` reads the ready frame's version
-  (`opencode_version_unsupported`), and the launch reads `opencode --version`
-  again and declines (`OarLaunchDeclined`, the same reason, or
-  `opencode_version_unknown`). The version read goes to OAR as the
-  installation's `version`, so OAR runs no `--version` of its own.
+  (`opencode_version_unsupported`), and the launch asks OAR for OpenCode's
+  installation again (`readOpenCodeInstallation`) and declines
+  (`OarLaunchDeclined`, the same reason, or `opencode_version_unknown`; none
+  found fails the start, `runtime_not_found`). The launch runs that
+  installation's command (OAR runs a Windows command shim's target itself),
+  and its version goes to OAR as the installation's `version`, so OAR runs no
+  `--version` of its own. The runtime inventory (`OpenCodeDriver.probeAsync`
+  in the detection round) and the model listing take the same installation.
 - Standing prompt: in Raft's own injected config (`OPENCODE_CONFIG_CONTENT`,
   the `slock` agent) with `default_agent: slock`, as the driver builds it
   (`prepareOpenCodeOarEnvironment`, the driver's `buildOpenCodeLaunchEnv`).
@@ -173,16 +222,22 @@ turns, where the driver runs `opencode run` per turn.
   (`decideOpenCodeSessionResume` and the driver's record file
   `<raft home>/opencode-sessions/<agent>.json`); a session the rule refuses is
   declined (`opencode_session_refused:<reason>`) and the driver shows its
-  refusal. A session this host opens is recorded the same way before its first
+  refusal. Except on 2.x for a 1.x or unrecorded session (`major_mismatch`,
+  `unrecorded`; mostly a session from before an upgrade): it goes to OAR,
+  which resumes it only if 2.x's own `session/list` names it, and otherwise
+  refuses it (`ResumeCwdError` `not_listed`), which starts a new session as
+  below. A session this host opens is recorded the same way before its first
   input (`OarLaunch.sessionOpened`; a failed write disposes it and hands the
   start back, `open_failed:session_record`). Any open failure hands the start
   back on the same session, never a new empty session, except one: on 2.x a
-  resume OAR refuses because the session lives in another directory
-  (`UnsupportedOptionError` on `cwd`; 2.x sessions made before #14872 ran in
-  the daemon's `$PWD`) starts a new session on this host
-  (`newSessionOnResumeElsewhere`): `daemon.agent.oar.resume_elsewhere_new_session`,
-  invalidate `runtime_host_migration`, and an Activity Log `system` row
-  (`OPENCODE_SESSION_ELSEWHERE_TEXT`), as for a Cursor CLI session.
+  resume OAR refuses on `cwd` (`ResumeCwdError`, an `UnsupportedOptionError`:
+  the session lives in another directory, as 2.x sessions made before #14872
+  in the daemon's `$PWD` do, or 2.x doesn't list it) starts a new session on
+  this host (`newSessionOnResumeElsewhere`):
+  `daemon.agent.oar.resume_elsewhere_new_session`, invalidate
+  `runtime_host_migration`, and an Activity Log `system` row
+  (`OPENCODE_SESSION_NOT_LISTED_TEXT` for `not_listed`, else
+  `OPENCODE_SESSION_ELSEWHERE_TEXT`), as for a Cursor CLI session.
 - Opens: one OpenCode session open at a time per daemon process
   (`openOpencodeSerially`, `OarLaunch.openGate`), since several first opens
   on a fresh OpenCode database race on its table creation. A start stopped
@@ -194,9 +249,16 @@ turns, where the driver runs `opencode run` per turn.
   advertises `_session/steering`, OAR 0.105+), through the same path as the
   other runtimes (a steer that lands `queued` is withdrawn and held), else held
   for the turn end. Other runtimes keep the status-led delivery.
-- Kept as before: no idle process stop, cold-idle stop, warm recycle or
-  turn-end compaction for OpenCode (none of those runtime sets name it), so an
-  idle OpenCode agent keeps its process. Context use shows from OAR's `usage`
+- Fresh sessions (#raft-feature-flag:#12): while `wake_recycle_oar` is on,
+  OpenCode gets the cold-idle stop, warm recycle and the recycle at wake
+  (OAR declares `contextUsage` for every OpenCode installation,
+  `summarySuppliesResumeFacts`), its context size from ACP
+  `usage_update`. A session that ever ran a background sub-agent is never
+  stopped for it: its status stays running (OAR #777), which both stops read
+  as a turn not ended. No idle process stop for OpenCode
+  (`IDLE_PROCESS_STOP_RUNTIMES` does not name it); no turn-end compaction
+  yet: OAR declares it for OpenCode 2, but it has not run here
+  (`TURN_END_COMPACTION_OAR_ROLLOUT_RUNTIMES` does not name it). Context use shows from OAR's `usage`
   events (the session summary); per-turn token totals stay off
   (`RUNTIMES_REPORTING_TURN_TOKENS` does not name it). Sign-in and the model
   list keep their paths (`runtimeAuth/opencodeProviderSignIn.ts`, OAR's
@@ -226,11 +288,21 @@ token goes as a header. It goes again on every open, resume included.
 |---|---|---|
 | codex | `-c mcp_servers.<name>.url` and `bearer_token_env_var` as `launchArgs`; the token in the app-server's env (`RAFT_MANAGED_MCP_TOKEN`) | `mcpServers`: OAR sends `config.mcp_servers.<name>.http_headers` on `thread/start` / `thread/resume` over stdin; neither the `-c` overrides nor the env token are passed. The first input still waits for `mcpServer/startupStatus/updated` for that server |
 | grok | none (the driver sends ACP `mcpServers: []`) | `mcpServers` when the agent has managed MCP tools: ACP `mcpServers[].headers` on `session/new` / `session/resume` (grok declares `mcpCapabilities.http`) |
-| qwen | none | `mcpServers` when the agent has managed MCP tools and `qwen --version` is at least `QWEN_MIN_HTTP_MCP_VERSION` (0.26.0, OAR's Qwen baseline): the stream-json `initialize` control request. Below it, or unreadable, nothing is attached and a warning is logged: Qwen has no legacy driver, so a refused entry would fail the start |
-| qoder | none | none: OAR's channel is a 0600 `--mcp-config` file for the process's lifetime, which the agent (the same OS user) could read; a runtime that never had the token in a file doesn't start having it there (`OAR_ONLY_MANAGED_MCP`) |
+| qwen | none | `mcpServers` when the agent has managed MCP tools and OAR's answer for the installed version lists `"http"` in `mcpTransports` (OAR 0.124: Qwen 0.26.0 and later; an older or unreadable version declares none, so nothing is attached and a warning is logged): the stream-json `initialize` control request (`oarOnlyLaunchPolicy`) |
+| dsh | none | none (`oarOnlyLaunchPolicy`): OAR declares `mcpTransports: ["stdio"]` and `mcpServerCredentials` refused; Raft's entry is an HTTP proxy with the token in a header |
+| qoder | none | none, by Raft's own allow-list (`RAFT_ADMITS_MANAGED_MCP`, only qwen): OAR declares `mcpTransports: ["stdio", "http"]` and no credentials refusal, and its channel is now a 0600 FIFO removed after the read (Windows: a 0600 file removed after `initialize`). Qoder joins once OAR's audit #core:#347 confirms it (#oar-raft:#39) |
 | cursor | the workspace's `.cursor/mcp.json` with the token in the URL path, readable by the agent | `mcpServers`: the SDK's `mcpServers` record with `headers` on create and on resume (over IPC to the session's child, never its environment or argv). Whether the SDK keeps the entry on disk (its agent store, transcripts) is not audited yet |
 | opencode | `OPENCODE_CONFIG_CONTENT`'s `mcp` entry, with the token in the URL path, in the runtime's environment | `mcpServers`: ACP `mcpServers[].headers` on `session/new` / `session/resume` (stdin), always attached as the driver does; the config text no longer carries it |
 | antigravity | the workspace's `.agents/mcp_config.json` (token in the URL path, a 0600 file removed with the launch) | unchanged: OAR refuses an entry with `headers` or `env` (`mcpServerCredentials`), because `agy` stores session entries in plain text in its conversation database. Raft's entry always carries a token. Putting it in the URL would get past the check, but the token would still be stored |
+
+Every tool on that server comes from the Server's catalog (named
+`r<sha8>_<tool>`) and is forwarded to the Server, except one: with the
+Server's `continuation_tool_v0` flag on and a runtime in
+`CONTINUATIONS_PILOT_RUNTIMES` (Claude, on the legacy driver), the launch's
+server also lists the daemon-local `answer_continuation`
+(`continuationAnswerTool.ts`). It runs the launch's own `raft __continue <id>
+[choice]` (what `cont` runs) with the runtime's environment, both captured at
+registration, and is never forwarded.
 
 Grok and qwen attach the server only when the Server's snapshot lists a tool
 and the runtime's own condition holds (`prepareManagedMcpRuntimeProxy`'s
@@ -374,8 +446,16 @@ drift).
 
 Turn-end compaction (#proj-runtime:#54 phase 3, `turnEndCompaction.ts`) runs
 only while the Server's `turn_end_compaction` is on for the agent
-(`AgentConfig.turnEndCompaction`, also answered by `server:features`), for Codex
-and Grok: at a turn end with nothing running, held or queued and no
+(`AgentConfig.turnEndCompaction`, also answered by `server:features`), for a
+session whose installation OAR declares `manualCompaction` supported and a
+trustworthy `contextUsage` size and window for, on a runtime it has already
+run on (`turnEndCompactionAllowed`: `turnEndCompactionDeclared` AND
+`TURN_END_COMPACTION_OAR_ROLLOUT_RUNTIMES`, Tenny #oar-raft:#39;
+from `oarInstalledSessionCapabilities` read once per launch into
+`HostedAgent.sessionCapabilities`; absent is off; `compactionEvents` is not
+needed, `compact()`'s own outcome confirms the call): in OAR 0.123 Claude, Pi,
+Codex from 0.151.0; not Grok or Cursor (no trustworthy window); OpenCode 2
+and DSH declare it but are not rolled out yet. At a turn end with nothing running, held or queued and no
 compaction open, a session summary context past 250k on a window of at least
 400k calls OAR's `Session.compact()` (`maybeCompactAtTurnEnd`). Deliveries that
 arrive meanwhile are held in `handOff` and handed over when it settles (a
@@ -386,9 +466,16 @@ session and reason).
 
 The OAR host's cold-idle stop (#proj-runtime:#54) runs only while the Server's
 `wake_recycle_oar` is on for the agent (`AgentConfig.wakeRecycleOar`, also
-answered by `server:features`; a change restarts nothing), for the runtimes
-whose session summary supplies the facts (`WAKE_RECYCLE_SUMMARY_FACTS_RUNTIMES`:
-Codex, Grok), and never with the local `RAFT_WAKE_RECYCLE=0`. From the one
+answered by `server:features`; a change restarts nothing), for a session
+whose summary supplies the facts (`summarySuppliesResumeFacts`: a runtime RFC
+070 enables, `WAKE_RECYCLE_ENABLED_RUNTIMES`, on an installation OAR declares
+`contextUsage.tokens` for; the summary records that declaration,
+`SessionSummary.contextUsage`, so the next start's decision reads the answer
+for the installation that wrote it, and a file without it supplies nothing.
+In OAR 0.123: Claude, Codex from 0.151.0, Cursor, Grok, OpenCode, Pi, Qwen from
+0.26.0, Antigravity; Cursor without a window so never warm-marked; not Qoder,
+which OAR declares no trustworthy context size for),
+and never with the local `RAFT_WAKE_RECYCLE=0`. From the one
 reconcile entry, after the spec drift (`reconcileColdIdle`): the session
 summary's facts (`sessionSummaryResumeFacts`; unknown while a turn runs or no
 context was reported, so not cold), the same gates and thresholds
@@ -467,8 +554,9 @@ OAR's status is `running`. Stop underway: the host is ending the session, or a
 turn abort is in flight (`stop.pendingAbortIds`). Holds: the credential's
 provider limit (or its wait) and an invalid credential (the OAR host has no
 runtime-error delivery backoff). Delivery mode: a launch that steers
-(`busyDelivery: "now"`: codex, qoder) is a direct-stdin runtime; `after_turn`
-(grok, qwen) holds input for the next turn, so it is a non-stdin runtime,
+(`busyDelivery: "now"` and a session with `steer`: codex, qoder, dsh where it
+advertises steer) is a direct-stdin runtime; `after_turn` (grok, qwen), or a
+`now` launch whose session has no `steer`, holds input for the next turn, so it is a non-stdin runtime,
 alive (an exit would have released the agent): 60 minutes, and any open tool
 holds it. Open tools: the root agent's `tool_call_started` with no
 `tool_call_ended` in the running turn; OAR has no tool diagnostic snapshots or
@@ -497,7 +585,31 @@ the activity are the legacy host's, with `host: "oar"`
 `queued_messages_count`; `daemon.agent.stalled_recovery.gave_up`); model
 output (text, reasoning, a tool start), a turn end or a person's stop ends the
 streak. OAR's "No runtime output for N min" report stays the fact (C15),
-at the same threshold.
+at the same threshold, except while a tool call is open (a long command is not
+a stall; `daemon.runtime.stall.silent_tool` instead, #oar-raft:#22).
+A turn silent for 60 minutes (`SILENT_TURN_END_MS`) with no tool open, no
+sub-agent or background task running, nothing held and no delivery waiting
+(waiting deliveries are step 9's) is ended with OAR's abort where the Server's
+`silent_turn_end` is on (`AgentConfig.silentTurnEnd`, also answered by
+`server:features`): the session stays, the activity reads "The turn produced
+no output for 60 minutes and was ended", and the next message starts a fresh
+turn. Off, nothing changes. Either way `daemon.runtime.stall.silent_turn_ended`
+is recorded once per silence (`mode` `end` / `would_end`, `outcome` `ended` /
+`would_end` / `abort_rejected`), so the count is known from every Computer
+before the flag opens to everyone (task #triage:#496).
+A run the runtime starts on its own (Antigravity after a background command
+finishes past `end_turn`, OpenCode 2.x replying after a background sub-agent
+reports) is no turn since OAR 0.121: OAR's status stays idle and records the
+output as `activity`, so the silent-turn limit never applies to it. Its
+output (compactions included) is not shown as work either
+(`outsideTurnContent`: no turn end would return the agent to idle): a
+working display goes back to Idle, an error or notice shown stays, and its
+entries do not reach the activity log. A delivery is prompted at once, and
+the runtime takes it into the run it is doing (#oar-raft:bf7c6b31). "Outside"
+is decided from the host's own event order (a prompted turn, a turn the
+runtime opened with `turn_active` until its `turn_ended`, a compaction this
+host asked for), never from OAR's status at callback time, which can already
+be past the event (a coalesced reply flushed with its turn's end).
 
 What follows a process's exit is decided by one pure rule, on both hosts
 (reconciler step 10a, `planExit.ts`, no host types; the OAR host since step
@@ -727,14 +839,38 @@ never started (`processNotStarted`).
   the host withdraws it and holds it the same way. Only an input OAR will not
   give back (no `withdraw`, or a refused one) stays with OAR as delivered.
 - A launch that steers (`busyDelivery: "now"`: codex, qoder, grok,
-  antigravity) does not steer
+  antigravity; dsh only where its session has `steer`) does not steer
   into a turn that is compacting (`compaction_started` .. `compaction_ended`)
   or, for codex, in review mode (`CodexActivityReader.inReview`): the delivery
   is held (`held_while_compacting` / `held_while_reviewing`). A steer the
   runtime refuses (`runtime_refused`) is held too, never refused, and tried
   again at the next tool start, at most `STEER_REFUSALS_PER_TURN` times a turn
-  (`held_after_steer_refusals`). A held delivery is tried at each tool start
+  (`held_after_steer_refusals`). A turn silent for the stall threshold with no
+  tool open (the "No runtime output" condition) is not steered into either
+  (`held_while_silent`, task #triage:#496): held, the delivery lets reconciler
+  step 9 replace the stalled session and resume it with the delivery, where a
+  steer would be swallowed by a turn that may never speak again. A held delivery is tried at each tool start
   and compaction end, and at the latest at the turn end, as a new turn.
+- One outstanding inbox notice per session, Codex only (task #triage:#399,
+  `outstandingNoticeHold.ts` `noticeHoldAppliesTo`, both hosts; Codex keeps
+  every user input across compaction). Once a content-free notice landed
+  (prompted or steered), a busy content-free notice is held
+  (`held_notice_outstanding`, `held_count`) until the agent reads through the
+  credential proxy (`message check`, `inbox read`, history or `task read`
+  routes: `SpawnContext.agentCredentialProxyInboxRead`; the legacy host uses
+  its inbox coordinator's consume), the turn ends or a compaction ends; a new
+  session (start, restart) starts with none. A new @mention, a DM or a
+  runtime-profile message breaks through once (`notice_hold_breakthrough`),
+  telling what was held; so does a system or app notice waiting behind the
+  held run. On a read, what was held is steered once; at the turn end it goes
+  in as the next turn (`daemon.agent.notice_hold.released`,
+  `release_reason`). Notices that carry thread context, system notices and
+  control prompts are never held; every other runtime is told as before.
+  `RAFT_DAEMON_NOTICE_HOLD_DISABLED=1` turns it off on one daemon. Known
+  limit: if the daemon believes a Codex turn is still running while the
+  runtime is idle (a missed `turn_ended`), held messages wait for the stall
+  deadline (stalled with work), not the turn end; @mentions and DMs still
+  break through.
 - A prompt an idle session refuses (`runtime_refused`; codex: `turn/start`
   failed) is not handed back either: refused back, it was offered and refused
   again every few seconds for as long as the session lived (one Mac, about
@@ -762,7 +898,7 @@ never started (`processNotStarted`).
   answered as not delivered) and the agent shows Raft's own words, a
   `MessageTooLargeError` (code `message_too_large`: shorten it or split it),
   never OAR's reason; the session keeps running. A first input refused so is
-  never handed to the legacy host (the deprecated Antigravity driver would cut
+  never handed to the legacy host (the legacy Antigravity driver would cut
   it): the session starts on the first input without its messages (wake,
   catch-up, carried; `first_input` `without_messages`, no catch-up echo), and
   they follow as deliveries one at a time. Too long even without them (the
@@ -958,7 +1094,7 @@ the daemon.
 | Feature | OAR host |
 | --- | --- |
 | View Context | Same service, on the legacy host's manager: this host reports each session (`deps.contextView`), and the launch's proxy reports sends with no Local Inbox coordinator (`agentCredentialProxyMessageCommitted`). After a session ends the manager keeps its last config and session, so its messages can still be viewed; a daemon restart loses that until the next start. |
-| Skills list | **Partly.** `listSkills` doesn't read a hosted session's config: an agent with its own `CODEX_HOME` lists the default home's global skills. |
+| Skills list | **Yes, OAR only.** `listSkills` reads OAR's skills inventory for Antigravity, Claude Code, Codex, Cursor, Grok, Kimi and OpenCode (`runtimeSkills/oarSkills.ts`: cwd the agent's workspace, env its configured env vars, cached 5 min per agent, runtime and env; groups by OAR's `scope` (0.112+): `builtin` is Built-in, `project` Workspace, `user`/`managed` Global, otherwise by path). Raft reads no runtime folders itself and adds nothing to OAR's list (xxchan, #oar-raft:7e06ebc9): a failed read answers `unavailable` with its reason (the server serves the last list, stale, or unavailable with Retry); another runtime lists nothing. Kimi's read starts `kimi web` on 127.0.0.1 (no session or prompt) and registers the workspace there; a read cut off by the deadline can leave that registration. OpenCode's read starts `opencode serve` in the workspace with the launch's config isolation over the agent's env vars (`openCodeWorkspaceProcessEnv`: `OPENCODE_DISABLE_PROJECT_CONFIG=1`, the empty `OPENCODE_CONFIG_DIR`, and the agent's `OPENCODE_CONFIG_CONTENT` without its `plugin` list), so a plugin the agent wrote into its workspace does not run there; OpenCode 1.x is read with `opencode debug skill` (no server) in the agent's env. Cursor's read (OAR 0.113) reads the SDK's skill folders under the workspace and HOME (no SDK import, session, hook, MCP server or model request; it runs `git rev-parse` and, in a repository, the SDK's ripgrep to find nested roots), with a Cursor session child's environment without `CURSOR_API_KEY` (`cursorAuthEnv`); a single-file build without the SDK has no reader (unavailable). Antigravity's read runs `agy models` then `agy --print=/skills` in the workspace with the launch's environment (`ANTIGRAVITY_ENV_OVERRIDES`: no SSH variables; the agent's env vars); a non-default HOME is refused by OAR (`scope_unavailable`). OAR 0.113's Devin, DSH and Factory readers start a native process in the workspace, so they join only with their launch isolation (`defaultLaunchEnv`). Claude's read starts a short `claude -p` in the agent's workspace, so that workspace's settings (MCP servers, hooks) apply to it, with the daemon's env plus the agent's env vars, not the launch-time scrubbing. It sends control requests only (`initialize`, `get_context_usage`) and never a user message, so it starts no model turn and spends no quota: checked 11-16 against `claude` 2.1.323 with `ANTHROPIC_BASE_URL` on a logging listener, which saw only `HEAD /api/hello`. A reader change that sends a prompt breaks this. The read is reachable only through `GET /agents/:id/skills`, behind `canInspectAgentPrivateSurfaces` (the `editAgents` capability or the agent's human creator; only its owner for a personal assistant): people who can already change the agent's env and restart it, so it adds no new way to run a workspace's hooks or MCP servers. Neither reads a hosted session's config: an agent with its own `CODEX_HOME` lists the default home's skills. |
 | First input (start ladder) | Same code (`startupInput.ts`). |
 | Wake session recycling and constructed briefing | Same code. |
 | Startup MEMORY.md block | Same code. |
@@ -967,7 +1103,7 @@ the daemon.
 | Held server context (task #26) | Written ahead of the next input of each session that has not had it. |
 | Activity and turn summaries (task #17) | Same activity shapes and `TurnSummaryTracker`; heartbeat and probe replies. |
 | Tool rows | OAR's `classifyTool` names a command, a file read or edit and a search the same way on every runtime (`oarActivity.ts`); anything else keeps the runtime's own name. Codex keeps its reader for one `file_change` row per file with its kind. |
-| Stall report and recovery (row C15, reconciler step 9) | The report: OAR `observeStalls` at the stall threshold (15 min). Stalled with deliveries held: ended and started again on its session with them, the legacy rule on OAR's facts (above). |
+| Stall report and recovery (row C15, reconciler step 9) | The report: OAR `observeStalls` at the stall threshold (15 min), except while a tool call is open (the host's open calls, or OAR's last record a `tool_call_started`): a long command is not a stall, only a `daemon.runtime.stall.silent_tool` event (#oar-raft:#22). Stalled with deliveries held: ended and started again on its session with them, the legacy rule on OAR's facts (above). |
 | App-inbox notices | Same notice text, once per item, `requireIdle` honoured. |
 | Working → Idle hook (built-in apps: MEMORY.md cleaner, idle task reminder) | Yes: after a completed or interrupted turn that ended with nothing held (a held delivery opens the next turn; its end is the edge). |
 | Idle task reminder notice | Handed over as it is, only into an idle session with nothing held; never kept. Its running sub-agents count as background tasks, as they do for the OAR cold-idle stop. |
@@ -976,11 +1112,11 @@ the daemon.
 | Silent background tasks (`backgroundTaskHealth.ts`) and long idle holds (`agentIdleHold.ts`) | Legacy host only. Its 10-minute sweep presumes a background task ended after an hour with no event naming it (its lifecycle envelopes, or its sub-agent's own rows matched by task id or by the one task of their call), unless the runtime's process tree is unreadable or holds a process started since the task did (Linux /proc, elsewhere `ps lstart`; an unknown start counts as the task's) (`daemon.runtime.background_task.presumed_ended`, `removed` true or false); a runtime spec restart (gate `spec_restart`), a cold-idle stop of a process past the cold gap (gate `cold_idle`) or pi rotation held 30 minutes by the same reason is traced (`daemon.agent.idle_hold_long`). The OAR host counts no background tasks (0), so nothing is held by one; its spec restart held 30 minutes is traced the same way (`host: "oar"`). |
 | Server features (`server:features`, reconciler step 6) | Yes: the router hands every answer to both hosts. A committed session that started on values its runtime renders differently (`serverFeaturesDrift`; `agentContextView` never counts) is ended once it is idle (`reconcileSpec`, `agentNotIdleReason` from OAR's facts: the session's status is `idle`, nothing held or being handed over, no background tasks; never `queuedInputPending`, since nothing is written into a running turn behind OAR's status), with no status or activity, the way a stop that keeps the session ends it; the next delivery finds no process and the Server's next start carries the new values. Decided again at its turn end, when held deliveries are gone, and by a sweep that runs only while a session is held (`daemon.agent.spec_restart_stop`, `drift: "features"`, names the `trigger`). No "what changed" notice at the next start (the legacy host's `formatServerFeaturesNotice`), and no config is rewritten here. |
 | Runtime spec (reconciler step 7, `runtimeSpec.ts`) | Same rule as the legacy host, one entry (`reconcileSpec`, also the server features above). A rebind of a committed session replaces its request's config; a session whose launch's `runtimeConfig` differs from it on a whitelisted component (`runtime`, `model`, `runtime_config`: mode and reasoning effort, `env`, `provider`: provider and connection id and the Claude command, `execution_mode`; compared after `hydrateRuntimeConfig`, canonical JSON hashed, empty values and key order aside) is ended once idle, decided after the rebind's wake is held (so that wake's turn runs first). Anything else (prompt inputs, runtime context, credentials, a field added later) never ends a session. `daemon.agent.spec_restart_stop` carries `drift` (kinds only, never an env var's name or value), `trigger` and `host`. A session that started on another runtime, or a Codex session on another model, is not resumed by the next start on either host (`SessionSpecMemory`, shared, memory only; `daemon.agent.session_dropped_for_spec` with the `reason`). The runtime profile reports the launch's own config (`hostedSession`). |
-| Config push (`agent:config`, reconciler step 11, `DAEMON_CAPABILITY_AGENT_CONFIG_PUSH`) | Yes: the router hands it to the host that owns the agent. The core orders pushes first (`agentConfigRevisions.ts`: a push at or below the last applied revision, an `agent:start` `configRevision` included, is dropped). One rule for every config: none replaces a newer one. A start whose `configRevision` is older than the applied one still rebinds its launch, session and wake on either host, but the running config stays (an equal revision, or a start with none from an older server, replaces it as before); the latest push is kept for the next registration, so a stale start that registers a new process gets it applied. The session's request takes the config, keeping its session and runner credential, and the step 7 entry decides it: drift ends it once idle; the optional components `managed_mcp` and `provider_connection` count only when both sides carry them. A push never wakes, rebinds a launch or reports a status; a rebind with a wake keeps the session busy until that wake's turn ends, a push only waits for the current turn and held deliveries. A push that arrives before a host registered the agent is held (shared with the legacy host) and applied at registration only if newer than that start (a start with no revision drops it); one naming another runtime before the launch is planned waits for the plan and is then drift. As every spec stop here, nothing starts the agent again on this host: the next delivery finds no agent and the server's start runs on the new config; the legacy host does the same for a spec stop whose config names another runtime or host (`specChangeNeedsServerStart`): it releases the process at once (a silent stop: no restart snapshot, the next start waits for its exit), so a delivery during the stop's grace is refused to the server (a tracked mention ends `IDENTITY_UNKNOWN` and the server redelivers it untracked) and never restarts it on the legacy host. On the legacy host a config naming another runtime than the process runs does not wait for idle: the runtime binding fence refuses that process's input and output from then on (`runtime_mismatch`, its turn end included), so it is stopped at once, busy or not (a per-turn process too). A start naming another runtime is never rebound onto the running process, whichever path takes it (a start while running, a queued or deferred one, one that arrives while the old process registers): it stops the process and starts its own runtime after that exit, with its wake (`daemon.agent.start.replaces_process`). A turn the stopped process was running is lost, as at a person's stop: messages it had not read stay unread on the server; ones it had already taken are not delivered again. Neither host reports a session its config drops (a Codex model or runtime change, `reportableSessionId`). |
+| Config push (`agent:config`, reconciler step 11, `DAEMON_CAPABILITY_AGENT_CONFIG_PUSH`) | Yes: the router hands it to the host that owns the agent. The core orders pushes first (`agentConfigRevisions.ts`: a push at or below the last applied revision, an `agent:start` `configRevision` included, is dropped). One rule for every config: none replaces a newer one. A start whose `configRevision` is older than the applied one still rebinds its launch, session and wake on either host, but the running config stays (an equal revision, or a start with none from an older server, replaces it as before); the latest push is kept for the next registration, so a stale start that registers a new process gets it applied. The session's request takes the config, keeping its session and runner credential, and the step 7 entry decides it: drift ends it once idle; the optional component `managed_mcp` counts only when both sides carry it. A push never wakes, rebinds a launch or reports a status; a rebind with a wake keeps the session busy until that wake's turn ends, a push only waits for the current turn and held deliveries. A push that arrives before a host registered the agent is held (shared with the legacy host) and applied at registration only if newer than that start (a start with no revision drops it); one naming another runtime before the launch is planned waits for the plan and is then drift. As every spec stop here, nothing starts the agent again on this host: the next delivery finds no agent and the server's start runs on the new config; the legacy host does the same for a spec stop whose config names another runtime or host (`specChangeNeedsServerStart`): it releases the process at once (a silent stop: no restart snapshot, the next start waits for its exit), so a delivery during the stop's grace is refused to the server (a tracked mention ends `IDENTITY_UNKNOWN` and the server redelivers it untracked) and never restarts it on the legacy host. On the legacy host a config naming another runtime than the process runs does not wait for idle: the runtime binding fence refuses that process's input and output from then on (`runtime_mismatch`, its turn end included), so it is stopped at once, busy or not (a per-turn process too). A start naming another runtime is never rebound onto the running process, whichever path takes it (a start while running, a queued or deferred one, one that arrives while the old process registers): it stops the process and starts its own runtime after that exit, with its wake (`daemon.agent.start.replaces_process`). A turn the stopped process was running is lost, as at a person's stop: messages it had not read stay unread on the server; ones it had already taken are not delivered again. Neither host reports a session its config drops (a Codex model or runtime change, `reportableSessionId`). |
 | Third-party event delivered reports | Through the CLI transport proxy, as on the driver. |
 | Session transcripts / runtime profile reports | Read by the process manager through `setHostedSessions` (grok's own session files). Reports are sent at the commit (`session_init`) and after an explicit stop (`stop`), built by the process manager; not at turn ends (the legacy host reports there only when the session id changed). Runtime artifacts: the grok driver writes none. |
 | First-turn end report (`agent:turn:ended`) | Yes. |
-| Session summary for a fresh session's briefing (#wg-ax task #3) | OAR host only: `<raft home>/agent-session-summaries/<agentId>.json` (daemon state, never the agent's workspace, where a planted symlink could redirect the write; not carried by migration, it is a cache), folded from the session's OAR records and rewritten when a prompt is accepted (turn start), at each root turn end and at release. Rolling windows across sessions (last 25 messages, 40 actions, 14 files, each tagged with its session); context size, turn and compaction counts and the wake input reset per session; plus the latest turn's final model text, the last 2 turns' latest text (`notes`, kept past a tool call) and the latest todo / plan list (`todos`: Codex `turn/plan/updated`, ACP `plan` updates, `TodoWrite` / `update_plan` calls), both optional fields an older file lacks. No file contents, no tool output except raft reader output. Read by the fresh-session decision (`planWakeSessionRecycle`, facts from `sessionSummaryResumeFacts`; unknown while the latest turn has not ended) and the briefing (`buildConstructedPanelFromSummary`: the transcript build's sections plus the dated last note), but only for runtimes in `WAKE_RECYCLE_SUMMARY_FACTS_RUNTIMES` (Codex, Grok) and only while the Server's `wake_recycle_oar` is on for the agent (`summaryFactsRuntimesFor`); off, the summary is never read for a decision. |
+| Session summary for a fresh session's briefing (#wg-ax task #3) | OAR host only: `<raft home>/agent-session-summaries/<agentId>.json` (daemon state, never the agent's workspace, where a planted symlink could redirect the write; not carried by migration, it is a cache), folded from the session's OAR records and rewritten when a prompt is accepted (turn start), at each root turn end and at release. Rolling windows across sessions (last 25 messages, 40 actions, 14 files, each tagged with its session); context size, turn and compaction counts and the wake input reset per session; plus the latest turn's final model text, the last 2 turns' latest text (`notes`, kept past a tool call) and the latest todo / plan list (`todos`: Codex `turn/plan/updated`, ACP `plan` updates, `TodoWrite` / `update_plan` calls), both optional fields an older file lacks. No file contents, no tool output except raft reader output. Read by the fresh-session decision (`planWakeSessionRecycle`, facts from `sessionSummaryResumeFacts`; unknown while the latest turn has not ended) and the briefing (`buildConstructedPanelFromSummary`: the transcript build's sections plus the dated last note), but only when the summary records that OAR declared `contextUsage.tokens` for the installation that wrote it (`SessionSummary.contextUsage`, `summarySuppliesResumeFacts`), for a runtime RFC 070 enables, and only while the Server's `wake_recycle_oar` is on for the agent; off, the summary is never read for a decision. |
 | Daemon Local Inbox / freshness hold | Not wired: `raft message check` and sends of an OAR-hosted agent go to the server (the proxy's server path). |
 | In-daemon crash respawn, idle cold start, deferred spawn | No: the server's next start. The one restart of its own: a stall replacement (reconciler step 9). |
 | Daemon start queue (concurrency / rate limit) | No: OAR starts are not queued. |
@@ -989,6 +1125,7 @@ the daemon.
 | Codex telemetry | The Codex reader maps native `thread/tokenUsage/updated` and `account/rateLimits/updated` frames through the legacy `parseCodexTelemetryEvent`, to the same `daemon.runtime.telemetry.*` events with `host: "oar"`. Token totals stay codex's session totals, not OAR's count net of the resume baseline. A completed turn that showed text with no tool call records `daemon.runtime.turn.communication_gap`, with the legacy identity attrs. Trace only. Rates aren't fully comparable across hosts: legacy also records interrupted and failed turns, OAR counts a `sleep` item as a tool call, and its text and thinking counts are coalesced chunks. The tooling and instruction-shape traces aren't ported yet. |
 | OOM preference | On Linux the launch command becomes a script (`oarOomPreference.ts`, under `<raft home>/oar-launch`) that raises `oom_score_adj` to 500 and execs the runtime: same pid, set before the runtime starts, only ever raising. No OAR option: the host chooses the command. OAR gives the ACP terminal commands it starts for a runtime (e.g. Grok's) the same score, from 0.90. Through `/bin/sh`, inherited environment variables whose names aren't identifiers can be dropped (dash does; e.g. `BASH_FUNC_x%%`). |
 | Provider reconnect | OAR 0.89 reports a Codex reconnect as `retry` from the native `error` notification with `willRetry`, so no stderr is needed. It shows the legacy "Codex reconnecting to provider…" activity and `daemon.agent.provider_reconnect`. |
+| Context generation (RFC 072 §7.2, glimpse G0) | Same code (`contextGeneration.ts`): planned at the spawn and published by the CLI transport, bound to the session OAR opened (a different session than the one resumed gets a new id), a new id at every `compaction_started`, and a session that is recycled, replaced or failed to resume is forgotten. |
 | Bounded record memory | Every OAR launch is opened with `retainedBytes` (`OAR_RETAINED_BYTES`, 4 MiB per session): older frames keep kind, `seq`, usage and text and lose their payloads. Raft reads records live, and stored ones only for the exit code. |
 
 ## Known differences from the legacy grok driver
@@ -1011,8 +1148,8 @@ fallbacks above:
   prefers grok's `_meta["x.ai/tool"].name`.
 - Not on the OAR host: the startup watchdog, stuck-tool detection
   (task #25), provider-request status, tracked-mention "told at start"
-  bookkeeping (task #9), passive-AX context generations across a recycle
-  (glimpse G0), the runtime-error fingerprint fence and delivery backoff.
+  bookkeeping (task #9), the runtime-error fingerprint fence and delivery
+  backoff.
 
 ## Files
 
@@ -1035,7 +1172,10 @@ OAR-hosted agent loads neither.
 
 1. An `OarLaunch` builder from the legacy driver's own launch preparation
    (export it through `drivers/index`, as `prepareGrokLaunch`), with the
-   runtime's `busyDelivery`, and an entry in `OAR_LAUNCHES`.
+   runtime's `busyDelivery`, and an entry in `OAR_LAUNCHES`. OAR-only
+   runtimes take `busyDelivery` and managed MCP from OAR's capability answer
+   for the installation (`oarOnlyLaunchPolicy` over
+   `oarInstalledSessionCapabilities`), not a table keyed by runtime id.
 2. Its loader in `oarLoader.ts` (`OarLaunch.runtimeId`).
 3. For a runtime that also has a legacy driver, its flag in
    `AGENT_RUNTIME_OAR_FEATURE_FLAG_KEYS` (server) chooses the OAR host per

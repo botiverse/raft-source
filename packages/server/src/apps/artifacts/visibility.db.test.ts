@@ -37,7 +37,7 @@ import { seedJointChannel } from "../../test/integration/jointFixture";
 import type { createSeed } from "../../test/integration/seed";
 import { artifactItems, type ArtifactActorType, type ArtifactHomeKind } from "./schema";
 import { actorsWhoCanViewArtifact, canViewArtifacts, visibleArtifactsSql, type ArtifactVisibilitySubject } from "./visibility";
-import { seedBoundGuest } from "../../test/guestFixture";
+import { seedBoundGuest, seedStrayGuestChannelRow } from "../../test/guestFixture";
 import { __answerFlagForTests } from "../../services/deploymentAnsweredFlags";
 
 type PgliteLike = { query: (...args: unknown[]) => Promise<unknown> };
@@ -134,7 +134,8 @@ async function seedWorld(seed: ReturnType<typeof createSeed>) {
   await addAgent(priv.id, agentIn.id);
   const dm = (await findOrCreateDM(server.id, memberIn.id, agentIn.id))!;
   const gone = await createChannel(server.id, `art-gone-${label()}`, undefined, "private");
-  for (const id of [memberIn.id, guest.id]) await addHuman(gone.id, id);
+  await addHuman(gone.id, memberIn.id);
+  await seedStrayGuestChannelRow({ channelId: gone.id, userId: guest.id });
   await addAgent(gone.id, agentIn.id);
   const guestVisible = await createChannel(server.id, `art-guest-visible-${label()}`);
   await db.update(channels).set({ guestVisible: true }).where(eq(channels.id, guestVisible.id));
@@ -346,7 +347,8 @@ test("a hard-deleted home channel: the delete goes through, its Artifacts become
   const world = await seedWorld(seed);
   const { serverId, people } = world;
   const home = await createChannel(serverId, `art-hard-${randomUUID().slice(0, 8)}`, undefined, "private");
-  for (const id of [people.memberIn.id, people.memberOut.id, people.guest.id]) await addHuman(home.id, id);
+  for (const id of [people.memberIn.id, people.memberOut.id]) await addHuman(home.id, id);
+  await seedStrayGuestChannelRow({ channelId: home.id, userId: people.guest.id });
   await addAgent(home.id, people.agentIn.id);
   const byMember = await insertItem({ serverId, homeKind: "conversation", homeChannelId: home.id, author: { type: "user", id: people.memberOut.id } });
   const byAgent = await insertItem({ serverId, homeKind: "conversation", homeChannelId: home.id, author: { type: "agent", id: people.agentIn.id } });

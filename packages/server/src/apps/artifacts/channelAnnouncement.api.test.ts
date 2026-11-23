@@ -25,7 +25,7 @@ import {
   type ServerId,
 } from "@botiverse/raft-shared";
 import { getDb } from "../../db/index";
-import { channels, featureFlagRules, inboxNotificationFacts, inboxTargetMuteStates, messages, serverAgentMembers, thirdPartyAgentEvents } from "../../db/schema";
+import { channels, featureFlagRules, inboxNotificationFacts, inboxTargetMuteStates, jointChannelServers, messages, serverAgentMembers, thirdPartyAgentEvents } from "../../db/schema";
 import { createAgent } from "../../services/agentService";
 import { AGENT_API_KEY_HMAC_SECRET_ENV, mintAgentCredential } from "../../services/agentCredentialService";
 import { addAgent, addHuman, createChannel, findOrCreateDM } from "../../services/channelService";
@@ -225,7 +225,7 @@ test("a plain member, an agent of another channel and a plain person are refused
     const refused = await setChannelAnnouncement(app, apiKey, world.ops.id, item.id);
     assert.equal(refused.status, 403, JSON.stringify(refused.body));
     assert.equal(refused.body.code, "channel_announcement_forbidden");
-    assert.match(refused.body.error, new RegExp(`Only the owner of #${world.ops.name} \\(one of its channel admins\\) or a server owner or admin`));
+    assert.match(refused.body.error, new RegExp(`Only a channel admin of #${world.ops.name} or a server owner or admin`));
     assert.ok(refused.body.suggestedNextAction.length > 0);
   }
   const removeRefused = await setChannelAnnouncement(app, world.keys.member, world.ops.id, null);
@@ -351,6 +351,10 @@ test("a joint has an announcement only while every server sharing it has announc
   assert.equal((await inventoryEntry(app, world.keys.admin, hostProjection.id)).announcement?.artifactId, item.id);
   assert.equal((await lines()).length, 1);
   assert.deepEqual(await pushRefusalFor(peerAgent, peer.id), { channel: `#${peerProjection.name}` });
+  // #460: an actor of a server with no copy of the joint is refused as before, by no other server's channel name.
+  const outsider = await seed.server({ owner: peerOwner });
+  const outsiderAgent = await createAgent(outsider.id, `ca-out-${label()}`, { runtime: "claude", model: "sonnet" });
+  assert.deepEqual(await pushRefusalFor(outsiderAgent, outsider.id), { elsewhere: true });
   assert.ok((await channelAnnouncementAudience(item.id, joint.canonical.id)).some((entry) => entry.agentId === peerAgent.id));
 
   // The peer's flag goes off with the id still stored on both copies: the joint has no announcement.
@@ -368,6 +372,38 @@ test("a joint has an announcement only while every server sharing it has announc
   assert.equal((await setChannelAnnouncement(app, world.keys.admin, hostProjection.id, null)).status, 200);
   assert.deepEqual([await storedOf(hostProjection.id), await storedOf(peerProjection.id)], [null, null]);
   assert.equal((await lines()).length, 1, "no line for the removal");
+});
+
+test("#460: a push to the announcement of a joint the pusher's server no longer has a copy of is refused naming no channel, with a step that needs none", async ({ app, seed }) => {
+  const world = await seedWorld(seed);
+  const peerOwner = await seed.human();
+  const peer = await seed.server({ owner: peerOwner });
+  await allow(CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY, [peer.id]);
+  const joint = await seedJointChannel({ name: `ca-joint-${label()}`, serverIds: [world.server.id, peer.id], createdByUserId: world.owner.id });
+  const [hostProjection] = joint.projections as [typeof joint.canonical, typeof joint.canonical];
+  await addAgent(hostProjection.id, world.admin.id);
+  await addAgent(hostProjection.id, world.publisher.id);
+  const item = await world.make({ homeChannelId: joint.canonical.id, title: "Joint rules" });
+  assert.equal((await setChannelAnnouncement(app, world.keys.admin, hostProjection.id, item.id)).status, 200);
+  // The host leaves the joint: the peer's copy still has it as its announcement; the host's publisher (its author) still sees it.
+  await getDb().update(jointChannelServers).set({ status: "disconnected" }).where(eq(jointChannelServers.localChannelId, hostProjection.id));
+
+  const refused = await agentCall(app, "POST", "/artifacts/push", world.keys.publisher, { artifact: item.id, base: 1, files: [{ path: "index.html", content: "<h1>v2</h1>" }] });
+  assert.equal(refused.status, 403, JSON.stringify(refused.body));
+  assert.equal(refused.body.code, "CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN_ELSEWHERE");
+  assert.equal(refused.body.error, "This artifact is the announcement of a shared channel your server has no copy of, so you can't push a new version. Nothing was pushed.");
+  assert.equal(refused.body.suggestedNextAction, `Copy this folder to a new directory and push that: raft artifact push <new dir> --target "#channel-name" --title "Joint rules". Only an admin of that shared channel on a server that still has a copy can push this one; tell whoever asked for the change.`);
+  assert.deepEqual(refused.body.details, { title: "Joint rules" });
+  assert.equal(JSON.stringify(refused.body).includes(joint.projections[1]!.name), false, "no other server's copy is named");
+
+  // A person's rename on the web (the server owner, who sees the orphan): nobody on their server can change it, so no step.
+  const renamed = await webCall(app, world, "PATCH", `/artifacts/${item.id}/title`, world.tokens.owner, { title: "Hijacked" });
+  assert.equal(renamed.status, 403, JSON.stringify(renamed.body));
+  assert.equal(renamed.body.code, "CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN");
+  assert.equal(renamed.body.error, "This artifact is the announcement of a shared channel your server has no copy of, so it can't be changed from your server. Nothing was changed.");
+  assert.equal(renamed.body.suggestedNextAction ?? null, null);
+  assert.deepEqual(renamed.body.details, { title: "Joint rules" });
+  assert.equal(JSON.stringify(renamed.body).includes(joint.projections[1]!.name), false);
 });
 
 test("a new version of the announcement tells the channel's other agents, queued (it wakes no one); its publisher is not told", async ({ app, seed }) => {

@@ -51,7 +51,12 @@ test("cancel is blocked by a reminder-id seal even when the exact Inbox item is 
     async () => reminderCancelCommand.handler(ctx, { id: "12345678" }),
     /revision 7 is sealed/,
   );
-  assert.deepEqual(requests, [{ method: "GET", path: "/internal/agent-api/inbox" }]);
+  // The Reminder app gate read, once more when it gets no answer (legacy cancel then), the seal check; no cancel.
+  assert.deepEqual(requests, [
+    { method: "GET", path: "/internal/agent-api/context" },
+    { method: "GET", path: "/internal/agent-api/context" },
+    { method: "GET", path: "/internal/agent-api/inbox" },
+  ]);
 });
 
 test("cancel sends the bare id when given the id as raft inbox check prints it", async () => {

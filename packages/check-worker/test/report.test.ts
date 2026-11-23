@@ -141,12 +141,14 @@ test("a report past 64 KiB loses blocked addresses, then console errors, from th
   assert.deepEqual(fitted.consoleErrors, big.consoleErrors.slice(0, fitted.consoleErrors.length), "the first ones kept");
 });
 
-test("blank and phoneOverflow are in the report only when given", () => {
+test("blank, phoneOverflow and pageCantScroll are in the report only when given", () => {
   const findings = createFindings(TICKET_URL);
   assert.deepEqual(Object.keys(findings.report(base)).sort(), ["blockedResources", "checkId", "consoleErrors", "lease", "load"]);
-  const report = findings.report({ ...base, blank: true, phoneOverflow: null });
+  const pageCantScroll = [{ shot: "phone" as const, viewportWidth: 390, viewportHeight: 844, contentHeight: 2340, hiddenHeight: 1496, heldBy: [{ element: "div#root", style: "position: fixed" as const }] }];
+  const report = findings.report({ ...base, blank: true, phoneOverflow: null, pageCantScroll });
   assert.equal(report.blank, true);
   assert.equal(report.phoneOverflow, null);
+  assert.deepEqual(report.pageCantScroll, pageCantScroll);
 });
 
 test("error classes come from an error's kind, never its words", () => {

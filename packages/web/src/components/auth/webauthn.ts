@@ -97,6 +97,7 @@ type PublicKeyCredentialStatics = {
   parseRequestOptionsFromJSON?: (json: PasskeyRequestOptionsJSON) => PublicKeyCredentialRequestOptions;
   parseCreationOptionsFromJSON?: (json: PasskeyCreationOptionsJSON) => PublicKeyCredentialCreationOptions;
   isConditionalMediationAvailable?: () => Promise<boolean>;
+  getClientCapabilities?: () => Promise<Record<string, boolean | undefined>>;
 };
 
 function publicKeyCredential(): PublicKeyCredentialStatics | null {
@@ -231,11 +232,16 @@ export async function getPasskeyAssertion(
   } as PasskeyAssertionJSON;
 }
 
-/** Ask the browser to create a passkey for `options`. A closed prompt rejects (isPasskeyCancel). */
+/**
+ * Ask the browser to create a passkey for `options`. A closed prompt rejects
+ * (isPasskeyCancel).
+ */
 export async function createPasskey(options: PasskeyCreationOptionsJSON): Promise<PasskeyRegistrationJSON> {
   const container = credentials();
   if (!container) throw new DOMException("Passkeys are not available in this browser.", "NotSupportedError");
-  const credential = await container.create({ publicKey: creationOptions(options) }) as BrowserCredential | null;
+  const credential = await container.create({
+    publicKey: creationOptions(options),
+  }) as BrowserCredential | null;
   if (!credential) throw new DOMException("No passkey was created.", "NotAllowedError");
   const json = browserJSON(credential, "attestationObject");
   if (json) return json as unknown as PasskeyRegistrationJSON;

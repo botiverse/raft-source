@@ -10,12 +10,13 @@ import { commentMarks } from "./artifactCommentMarks";
 import { inClient, useArtifactComments } from "./ArtifactCommentsContext";
 import { pageEscaped } from "./artifactPageSignals";
 import { isModalLayerOpen } from "../../features/shortcuts";
+import { timersOf, useOwnerDocument } from "../../utils/ownerDocument";
 import type { PageCommentRequest } from "./artifactPageComments";
-import type { ArtifactCommentTarget, ArtifactFrameLayer, FrameBox } from "./ArtifactCommentsContext";
-import { placeStore, selectionPlace } from "./artifactTrackedPlaces";
+import type { ArtifactCommentTarget, ArtifactFrameLayer, FrameBox, LiveAnchorSpec } from "./ArtifactCommentsContext";
+import { composerPlace, placeStore } from "./artifactTrackedPlaces";
 import type { PlaceStore, SelectionFollow } from "./artifactTrackedPlaces";
 import { artifactErrorCode } from "./artifactApi";
-import { showToast } from "../../components/toastBridge";
+import { useToast } from "@botiverse/raft-ui";
 import { draftInputBody, newReviewClientKey } from "./artifactReviewDrafts";
 import { artifactSource } from "./artifactSource";
 import { useWorkspaceArtifactsEnabled } from "./useWorkspaceArtifactsEnabled";
@@ -74,6 +75,7 @@ export type ArtifactReviewProblem =
 export interface ArtifactDraftView {
   draftId: ArtifactCommentDraftId;
   rect: AnnotationRect;
+  liveAnchor?: LiveAnchorSpec | null;
   key: number;
   fromPage: boolean;
 }
@@ -88,9 +90,12 @@ export interface ArtifactDraftView {
 export interface ArtifactReviewSelection {
   place: Extract<ArtifactCommentAnchor, { type: "annotation" | "page" }>;
   rect: AnnotationRect | null;
+  liveAnchor?: LiveAnchorSpec | null;
   key: number;
   writing?: boolean;
   fromPage?: { draft: string | null };
+  /** Where an element was picked (Porthole `selected.pointDocument`, document px): `composerPlace` opens a huge pick's box there. */
+  point?: { x: number; y: number };
 }
 
 interface ArtifactReviewState {
@@ -118,7 +123,7 @@ interface ArtifactReviewState {
   /** The draft a marker in the page opened on its own (ArtifactDraftView); null: none. */
   draftView: ArtifactDraftView | null;
   /** A draft's marker beside a text or csv file pressed (Raft's own): its view beside it (`rect`, client px). Not in C. */
-  openDraftView: (draftId: ArtifactCommentDraftId, rect: AnnotationRect) => void;
+  openDraftView: (draftId: ArtifactCommentDraftId, rect: AnnotationRect, anchorEl?: Element | null) => void;
   closeDraftView: () => void;
   /** The open selection: its Comment button, or the comment box at it. */
   selection: ArtifactReviewSelection | null;
@@ -189,12 +194,17 @@ export function useArtifactReview(): ArtifactReviewState | null {
   return useContext(Context);
 }
 
-/** A reported anchor as Raft stores it (the same fields, copied). */
+/**
+ * A reported anchor as Raft stores it (the same fields, copied), with the section Porthole says it
+ * is in (P152 `context`: its headings and named region) when it says one, for readers of the comment.
+ */
 function storedAnchor(anchor: AnnotationReport & { type: "selected" }): ArtifactAnnotationAnchor {
+  const context = anchor.anchor.context;
   return {
     kind: anchor.anchor.kind,
     label: anchor.anchor.label,
     selectors: anchor.anchor.selectors.map((s) => ({ ...s })),
+    ...(context ? { context: { ...(context.headings ? { headings: [...context.headings] } : {}), ...(context.region !== undefined ? { region: context.region } : {}) } } : {}),
   };
 }
 
@@ -275,6 +285,8 @@ function isTransient(error: unknown): boolean {
 /** `enabled` false (the flag off, or still loading): no comment mode, nothing loaded, null for everyone below. */
 function ReviewProvider({ enabled, children }: { enabled: boolean; children: ReactNode }) {
   const { formatMessage } = useIntl();
+  const toast = useToast(); // The surface's own window's (an object window's, #337 PR3): its toasts, dialogs and timers.
+  const ownDoc = useOwnerDocument();
   const comments = useArtifactComments()!;
   const { data, shownPath } = comments;
   const id = data.card.id;
@@ -297,8 +309,8 @@ function ReviewProvider({ enabled, children }: { enabled: boolean; children: Rea
   const [draftView, setDraftView] = useState<ArtifactDraftView | null>(null);
   const closeDraftView = useCallback(() => setDraftView(null), []);
   const selectionKey = useRef(0);
-  // Whether B's box (or A's Comment box) holds the person's own words: a pick or a selection then
-  // leaves it be, and B stops asking the page for a pick while it does (`annotating`).
+  // Whether B's box (or A's Comment box) holds the person's own words: a selection then leaves it
+  // be (B asks the page for no pick while its box is open at all, `annotating`).
   const [composerHasOwnText, setComposerHasOwnText] = useState(false);
   // Porthole ends a pick with its report (a picked block, Esc in the page), and the frame asks the
   // page again only for a change of what it asks: so the ask goes once a pick ends (`pickPaused`)
@@ -308,9 +320,9 @@ function ReviewProvider({ enabled, children }: { enabled: boolean; children: Rea
   useEffect(() => {
     if (pickEnds === 0) return;
     // A timer, so the frame has been told the ask went (its effect, this commit) before it comes back.
-    const timer = window.setTimeout(() => setPickAskedAgain(pickEnds), 0);
-    return () => window.clearTimeout(timer);
-  }, [pickEnds]);
+    const timer = timersOf(ownDoc).setTimeout(() => setPickAskedAgain(pickEnds), 0);
+    return () => timersOf(ownDoc).clearTimeout(timer);
+  }, [pickEnds, ownDoc]);
   const pickPaused = pickAskedAgain !== pickEnds;
   const pickEnded = useCallback(() => setPickEnds((n) => n + 1), []);
   // The page's text selection outlives what Raft opened for it. Once the composer at it closes (a
@@ -406,6 +418,7 @@ function ReviewProvider({ enabled, children }: { enabled: boolean; children: Rea
   const commentsOpenFromPage = comments.openFromPage;
   const askPageOpen = comments.askPageOpen;
   const cardHeld = comments.cardHeld;
+  const captureAnchor = comments.frame.captureAnchor;
   const openFromPage = useCallback((request: PageCommentRequest, frameRect: AnnotationRect | null = null) => {
     // Nothing the page opens while a card is held (artifactCardHold).
     if (cardHeld) return false;
@@ -418,15 +431,17 @@ function ReviewProvider({ enabled, children }: { enabled: boolean; children: Rea
     if (!askPageOpen(false)) return false;
     selectionKey.current += 1;
     setComposerHasOwnText(false);
+    const rect = frameRect ? { x: frameRect.x + frameRect.width / 2, y: frameRect.y, width: 0, height: 0 } : null;
     setSelection({
       place: { type: "page", data: request.anchor },
-      rect: frameRect ? { x: frameRect.x + frameRect.width / 2, y: frameRect.y, width: 0, height: 0 } : null,
+      rect,
+      liveAnchor: captureAnchor?.(rect) ?? null,
       key: selectionKey.current,
       writing: true,
       fromPage: { draft: request.draft },
     });
     return true;
-  }, [status, commentsOpenFromPage, askPageOpen, canComment, selection, draftView, cardHeld]);
+  }, [status, commentsOpenFromPage, askPageOpen, canComment, selection, draftView, cardHeld, captureAnchor]);
 
   /** Every draft write: none while a submit is out, and the next submit is a new attempt. */
   const beginWrite = useCallback(() => {
@@ -484,8 +499,8 @@ function ReviewProvider({ enabled, children }: { enabled: boolean; children: Rea
     remove: writeRemove,
   }), [writeCreate, writeEdit, writeRemove]);
   const historyFailed = useCallback((direction: "undo" | "redo") => {
-    showToast({ title: formatMessage({ id: direction === "undo" ? "artifacts.review.undoFailed" : "artifacts.review.redoFailed" }), type: "error" });
-  }, [formatMessage]);
+    toast.error(formatMessage({ id: direction === "undo" ? "artifacts.review.undoFailed" : "artifacts.review.redoFailed" }), { priority: "low" });
+  }, [formatMessage, toast]);
   const history = useDraftHistory(historyWrites, historyFailed);
   const { created, edited, deleted, clear: clearHistory } = history;
 
@@ -537,7 +552,7 @@ function ReviewProvider({ enabled, children }: { enabled: boolean; children: Rea
         const code = artifactErrorCode(error);
         if (isTransient(error)) {
           // Not answered for this key: the retry sends it again, and the server answers once.
-          showToast({ title: formatMessage({ id: "artifacts.review.submitFailed" }), type: "error" });
+          toast.error(formatMessage({ id: "artifacts.review.submitFailed" }), { priority: "low" });
           return;
         }
         clientKey.current = null;
@@ -556,7 +571,7 @@ function ReviewProvider({ enabled, children }: { enabled: boolean; children: Rea
           clearHistory();
           reloadDrafts();
           reloadComments();
-          showToast({ title: formatMessage({ id: code === "NO_DRAFTS" ? "artifacts.review.noDrafts" : "artifacts.review.alreadySubmitted" }) });
+          toast.info(formatMessage({ id: code === "NO_DRAFTS" ? "artifacts.review.noDrafts" : "artifacts.review.alreadySubmitted" }));
           return;
         }
         // Refused for good (can't see it, the version gone, no permission, a body it won't take): say which, in C.
@@ -587,7 +602,7 @@ function ReviewProvider({ enabled, children }: { enabled: boolean; children: Rea
       submittingRef.current = false;
       setSubmitting(false);
     }
-  }, [id, version, inReview, openReview, added, reloadComments, reloadDrafts, setPanelOpen, clearHistory, formatMessage]);
+  }, [id, version, inReview, openReview, added, reloadComments, reloadDrafts, setPanelOpen, clearHistory, formatMessage, toast]);
 
   const { canUndo, canRedo, busy: historyBusy, undo, redo, undoStep, watch } = history;
   const historyView = useMemo(() => ({ canUndo, canRedo, busy: historyBusy, undo, redo, undoStep, watch }), [canUndo, canRedo, historyBusy, undo, redo, undoStep, watch]);
@@ -638,15 +653,16 @@ function ReviewProvider({ enabled, children }: { enabled: boolean; children: Rea
       // B on touch: a block held 500 ms is selected, or selected text; every tap stays the page's
       // (none while the box is open).
       if (touch) return selection ? null : { elements: "hold", text: true };
-      // B: pick a block, and again while the box is open and empty, so Esc in the page closes it
-      // (Porthole reports `cancelled` only while it is asked for a pick or text, P112) and another
-      // block moves it there. Not while it holds the person's words: the page's clicks are its own
-      // then. Asked anew after each pick or Esc, which end it (`pickPaused`).
-      if (pickPaused || (selection && composerHasOwnText)) return null;
+      // B: pick a block. Not while the box is open, written in or not (xxchan, #proj-workspace:#325:
+      // the block chosen stays chosen, no other one outlined or taken): the page's clicks are its
+      // own then, and a press in it closes the box as a press anywhere outside it does, its words
+      // kept as a draft (ArtifactSelectionComposer). As on touch. Asked anew after each pick or
+      // Esc, which end it (`pickPaused`).
+      if (pickPaused || selection?.writing) return null;
       return { elements: true, text: false };
     }
     return { elements: false, text: true };
-  }, [canComment, status, selection, touch, pickPaused, composerHasOwnText]);
+  }, [canComment, status, selection, touch, pickPaused]);
   // What the frame was last asked for, remembered: the page's Esc (`cancelled`) is heard only
   // while a pick or text is asked of it, and a pick's only once (it ends the pick).
   const asked = useRef<AnnotateMode | null>(null);
@@ -665,11 +681,13 @@ function ReviewProvider({ enabled, children }: { enabled: boolean; children: Rea
         if (report.anchor.kind === "element") pickEnded();
         // A box would take the focus from a held card (artifactCardHold).
         if (!canComment || status === "reviewing" || cardHeld) return;
-        // Never over words the person is writing: the box stays where it is.
-        if (selection?.writing && composerHasOwnText) return;
+        // Never over words the person is writing, nor a block's box moved by another block picked
+        // late (the pick is not asked while it is open): the box stays where it is.
+        if (selection?.writing && (composerHasOwnText || report.anchor.kind === "element")) return;
         selectionKey.current += 1;
         // Selected text offers its Comment button; a block was picked on purpose: the box at once.
-        setSelection({ place: { type: "annotation", data: storedAnchor(report) }, rect: selectionPlace(report, frameBox), key: selectionKey.current, writing: report.anchor.kind === "element" });
+        const rect = composerPlace(report, frameBox, { element: report.anchor.kind === "element", point: report.pointDocument });
+        setSelection({ place: { type: "annotation", data: storedAnchor(report) }, rect, liveAnchor: captureAnchor?.(rect) ?? null, key: selectionKey.current, writing: report.anchor.kind === "element", ...(report.pointDocument ? { point: report.pointDocument } : {}) });
         return;
       }
       case "unselected":
@@ -679,20 +697,19 @@ function ReviewProvider({ enabled, children }: { enabled: boolean; children: Rea
         setSelection((current) => (current?.writing ? current : null));
         return;
       case "cancelled": {
-        // Esc in the page while picking a block or selecting text (P112: the page keeps the key, and
-        // focus stays where the person pressed it). The page's word, and an agent wrote the page: it
-        // is taken only while Raft has a pick or text asked of it (as Porthole's own host does, so
-        // one arriving with nothing asked is nobody's key), a pick's once (it ends the pick, until
-        // it is asked again), and never under a dialog or sheet of Raft's (its confirmation's).
-        // Then: told to the one place that hears the page (artifactPageSignals), where whatever
-        // card or box is open goes first, by the rule they all share (artifactDismissLayer: never
-        // over typed words); with nothing open, as Esc in the viewer: the selection's Comment
-        // button, then out of B. Never in C.
+        // Esc in the page while picking a block or selecting text (P112: the page keeps the key, and focus stays
+        // where the person pressed it). The page's word, and an agent wrote the page: it is taken only while Raft
+        // has a pick or text asked of it (as Porthole's own host does, so one arriving with nothing asked is
+        // nobody's key), a pick's once (it ends the pick, until it is asked again), and never under a dialog or
+        // sheet of Raft's (its confirmation's) in the surface's own document. Then: told to the one place that hears
+        // the page (artifactPageSignals), where whatever card or box is open goes first, by the rule they all share
+        // (artifactDismissLayer: never over typed words); with nothing open, as Esc in the viewer: the selection's
+        // Comment button, then out of B. Never in C.
         const request = asked.current;
         if (request === null) return;
         if (request.elements === true) asked.current = request.text ? { ...request, elements: false } : null;
         pickEnded();
-        if (status === "reviewing" || isModalLayerOpen() || pageEscaped()) return;
+        if (status === "reviewing" || isModalLayerOpen(ownDoc) || pageEscaped()) return;
         handleEscape();
         return;
       }
@@ -706,9 +723,10 @@ function ReviewProvider({ enabled, children }: { enabled: boolean; children: Rea
           // Tab goes on past it into this view (artifactCardHold).
           if ((selection && composerHasOwnText) || cardHeld) return;
           const { x, y, width, height } = report.rect;
+          const rect = { x: x + (frameBox?.left ?? 0), y: y + (frameBox?.top ?? 0), width, height };
           draftViewKey.current += 1;
           setSelection(null);
-          setDraftView({ draftId: draft.id, rect: { x: x + (frameBox?.left ?? 0), y: y + (frameBox?.top ?? 0), width, height }, key: draftViewKey.current, fromPage: true });
+          setDraftView({ draftId: draft.id, rect, liveAnchor: captureAnchor?.(rect) ?? null, key: draftViewKey.current, fromPage: true });
           return;
         }
         openThreadFromFrame(report.id, inClient(report.rect, frameBox), frameBox?.focused);
@@ -732,15 +750,15 @@ function ReviewProvider({ enabled, children }: { enabled: boolean; children: Rea
       default:
         return;
     }
-  }, [canComment, status, selection, composerHasOwnText, pickEnded, handleEscape, drafts, openThreadFromFrame, commentsAnnotation, marks, cardHeld, selectionPlaces]);
+  }, [canComment, status, selection, composerHasOwnText, pickEnded, handleEscape, drafts, openThreadFromFrame, commentsAnnotation, marks, cardHeld, selectionPlaces, captureAnchor, ownDoc]);
   // One card at a time: a thread's card beside the file gives way to the draft's.
-  const openDraftView = useCallback((draftId: ArtifactCommentDraftId, rect: AnnotationRect) => {
+  const openDraftView = useCallback((draftId: ArtifactCommentDraftId, rect: AnnotationRect, anchorEl?: Element | null) => {
     if (status === "reviewing") return;
     draftViewKey.current += 1;
     setSelection(null);
     closeCommentsCard();
-    setDraftView({ draftId, rect, key: draftViewKey.current, fromPage: false });
-  }, [status, closeCommentsCard]);
+    setDraftView({ draftId, rect, liveAnchor: captureAnchor?.(rect, anchorEl) ?? null, key: draftViewKey.current, fromPage: false });
+  }, [status, closeCommentsCard, captureAnchor]);
 
   const value = useMemo<ArtifactReviewState>(() => ({
     status,

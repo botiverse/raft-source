@@ -19,7 +19,15 @@ import {
 import { setRequestTraceErrorCode } from "../middleware/requestObservability";
 
 /** The 4xx statuses a refusal may have. */
-export type RefusalStatus = 400 | 401 | 403 | 404 | 405 | 409 | 410 | 412 | 413 | 415 | 416 | 422 | 423 | 426 | 429;
+export const REFUSAL_STATUSES = [400, 401, 403, 404, 405, 409, 410, 412, 413, 415, 416, 422, 423, 426, 429] as const;
+export type RefusalStatus = typeof REFUSAL_STATUSES[number];
+
+const REFUSAL_STATUS_SET: ReadonlySet<number> = new Set(REFUSAL_STATUSES);
+
+/** Whether a status computed at run time (a service error's, a result's) is one a refusal may have. */
+export function isRefusalStatus(status: number): status is RefusalStatus {
+  return REFUSAL_STATUS_SET.has(status);
+}
 
 export interface RefusalInput {
   /** A stable code; listed in REFUSAL_CODES when a client acts on it in code. */
@@ -125,6 +133,20 @@ export function refuse(res: Response, status: RefusalStatus, input: RefusalInput
   setRequestTraceErrorCode(res, input.code);
   if (body.retryAfterSeconds !== undefined) res.setHeader("Retry-After", String(body.retryAfterSeconds));
   res.status(status).json(body);
+}
+
+/**
+ * Answer a service error that carries its own status, code and sentence
+ * (`throw new XxxError(status, code, message)`): refused when the status is a
+ * refusal's; any other (a 5xx some of these classes also throw) keeps the
+ * body it had, `{ error, code }`.
+ */
+export function refuseServiceError(res: Response, err: { status: number; code: string; message: string }): void {
+  if (isRefusalStatus(err.status)) {
+    refuse(res, err.status, { code: err.code, error: err.message });
+    return;
+  }
+  res.status(err.status).json({ error: err.message, code: err.code });
 }
 
 /**

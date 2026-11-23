@@ -20,8 +20,8 @@ const RECHECK_MS = 60_000;
  */
 export default function HostedCindyFailedBanner({ agent }: { agent: Agent }) {
   const { formatMessage } = useIntl();
-  const onboardingAgentId = useServerStore((s) => s.current?.onboardingAgentId ?? null);
-  const eligible = onboardingAgentId === agent.id && agent.external === true && !agent.machineId;
+  const officialOnboardingAgentId = useServerStore((s) => s.current?.officialOnboardingAgentId ?? null);
+  const eligible = officialOnboardingAgentId === agent.id && agent.external === true && !agent.machineId;
   const [failed, setFailed] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
 

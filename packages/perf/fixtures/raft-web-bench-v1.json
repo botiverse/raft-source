@@ -1,0 +1,13 @@
+{
+  "fixture": "bench-v1",
+  "server": "qa-perf-bench",
+  "channel": "bench-v1",
+  "other": "bench-other",
+  "expected": {
+    "topLevel": 80,
+    "threadSummaries": 12,
+    "repliesPerThread": 6,
+    "contentChars": 12256,
+    "sha256": "5395d2b0966a6dd6"
+  }
+}

@@ -1,7 +1,8 @@
 // An Artifact's original message (xxchan, #proj-workspace:2e5a5da3): the one
 // through which it entered a conversation, `items.origin_message_id`, set
 // once and never moved (save.ts: the attachment's message; webShare.ts: the
-// message a share posted while it had none). Shown to a reader only while
+// message a share posted while it had none; linkOrigin.ts: the first message
+// in its home conversation that links it while it had none). Shown to a reader only while
 // they can read that message now (platform/messages messageSource: its
 // conversation as the reader's server shows it, the plan's history window,
 // not retracted), whatever the Artifact's home: an Artifact moved out of a

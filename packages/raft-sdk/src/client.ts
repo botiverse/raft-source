@@ -1,3 +1,4 @@
+import { fetchWithoutRedirect } from "@botiverse/raft-shared/src/fetchWithoutRedirect";
 import {
   createAgentApiMessageClient,
   type AgentApiMessageClient,
@@ -196,7 +197,7 @@ export function createRaftClient(options: CreateRaftClientOptions): RaftClient {
     fetch: {
       baseUrl: serverUrl,
       // This GET acknowledges messages. Avoid browser cache reuse and implicit redirect requests.
-      fetch: (input, init) => (options.fetch ?? fetch)(input, { ...init, cache: "no-store", redirect: "error" }),
+      fetch: (input, init) => fetchWithoutRedirect(options.fetch ?? fetch, input, { ...init, cache: "no-store" }),
       // sdkRequestHeaders lowercases names, so the shared transport's authorization overlay wins.
       headers,
       retry: { attempts: 1 },

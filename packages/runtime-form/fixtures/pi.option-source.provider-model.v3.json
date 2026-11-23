@@ -1,0 +1,45 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "pi",
+  "schemaVersion": "pi.create.v1",
+  "sourceId": "providerModel",
+  "kind": "dependent_select",
+  "pointer": "/providerModel",
+  "dependsOn": "/provider",
+  "optionsByValue": {
+    "deepseek": [
+      {
+        "value": "deepseek/deepseek-v4-pro",
+        "label": "DeepSeek V4 Pro",
+        "supportedReasoningEfforts": [
+          "off",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      {
+        "value": "deepseek/deepseek-flash",
+        "label": "DeepSeek V4.1 Flash",
+        "supportedReasoningEfforts": [
+          "off",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    ]
+  },
+  "defaultValueByValue": {
+    "deepseek": "deepseek/deepseek-v4-pro"
+  },
+  "customValueAllowedByValue": {
+    "deepseek": false
+  }
+}

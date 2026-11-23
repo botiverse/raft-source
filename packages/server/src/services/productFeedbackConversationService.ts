@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { Agent, buildConnector, fetch as undiciFetch } from "undici";
 import { clearClockTimeout, currentTimeMs, setClockTimeout } from "@botiverse/raft-shared";
 import { addTraceEvent, withTraceChildSpan } from "../tracing/semanticTrace";
 import { isPrivacyModeOn } from "../config/privacyMode";
@@ -34,6 +35,14 @@ export const PRODUCT_FEEDBACK_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
 // list requests after the v1.21.32 deploy took 11-16s before failing (AndyLok).
 // The route-subject PUT before them uses 4s; a read pages more rows, so 5s.
 const HANDS_READ_TIMEOUT_MS = 5_000;
+// A read's first try gets this much of HANDS_READ_TIMEOUT_MS (60%; widen it if
+// Hands' read latency needs more); a try that times
+// out or loses its connection goes once more on a fresh connection in the rest,
+// if at least HANDS_READ_RETRY_MIN_REMAINING_MS is left. In the 11-15 incident ~5%
+// of reads never got an answer (requests lost between AWS and Cloudflare, or sent
+// on dead pooled keep-alive sockets) while the rest took their usual time.
+const HANDS_READ_FIRST_ATTEMPT_MS = 3_000;
+const HANDS_READ_RETRY_MIN_REMAINING_MS = 1_000;
 const BREAKER_WINDOW_MS = 60_000;
 const BREAKER_THRESHOLD = 3;
 const BREAKER_MAX_SAMPLES = 1_000;
@@ -912,10 +921,26 @@ type HandsRequestInput = {
   operation: OperationClass;
   init?: RequestInit;
   fetchImpl?: typeof fetch;
+  /** The fetch of a read's retry; see freshAttemptFetchOf. */
+  freshAttemptFetch?: typeof fetch;
   now?: () => number;
   signal?: AbortSignal;
   onUpstreamServerTiming?: (value: string | null) => void;
 };
+
+/**
+ * The retry goes over undici's own fetch, which takes the undici Agent of
+ * freshHandsConnection as its `dispatcher` (Node's bundled fetch may run another
+ * undici than the npm one). A caller that passes Node's fetch (the unread
+ * reconcile passes globalThis.fetch) or none gets it too. A test double passed as
+ * `fetchImpl` answers the retry as well, unless the test names `freshAttemptFetch`,
+ * so a test never reaches the network.
+ */
+function freshAttemptFetchOf(input: { fetchImpl?: typeof fetch; freshAttemptFetch?: typeof fetch }): typeof fetch {
+  if (input.freshAttemptFetch) return input.freshAttemptFetch;
+  if (input.fetchImpl && input.fetchImpl !== globalThis.fetch) return input.fetchImpl;
+  return undiciFetch as unknown as typeof fetch;
+}
 
 /**
  * Every Hands call after the route binding (list, get, comment, close,
@@ -937,6 +962,151 @@ async function handsRequest(
     throw error;
   }
 }
+
+/** A read sends no body and no method other than GET, so sending it twice is safe. */
+function isIdempotentHandsRequest(init: RequestInit | undefined): boolean {
+  const method = (init?.method ?? "GET").toUpperCase();
+  return (method === "GET" || method === "HEAD") && (init?.body === undefined || init.body === null);
+}
+
+type HandsReadRetryDecision = "retry" | "not_eligible" | "caller_aborted" | "budget_exhausted";
+
+/**
+ * Whether a failed first try of a read goes again: only for a timeout of its own
+ * share of the budget or a connection-level error (network_<code>), never for a
+ * caller's abort, and only with HANDS_READ_RETRY_MIN_REMAINING_MS of the budget left
+ * (`remainingMs` null: the caller's signal is the only bound).
+ */
+function handsReadRetryDecision(
+  error: unknown,
+  context: { callerSignal: AbortSignal | undefined; remainingMs: number | null },
+): HandsReadRetryDecision {
+  if (context.callerSignal?.aborted) return "caller_aborted";
+  const reason = handsTransportReason(error);
+  // With a caller signal there is no share of our own that could time out.
+  if (reason === "timeout" ? context.remainingMs === null : !reason.startsWith("network_")) return "not_eligible";
+  if (context.remainingMs !== null && context.remainingMs < HANDS_READ_RETRY_MIN_REMAINING_MS) return "budget_exhausted";
+  return "retry";
+}
+
+function handsTransportFailure(input: HandsRequestInput, nowMs: number): ProductFeedbackConversationError {
+  const snapshot = breakerFailure(input.config, input.operation, nowMs);
+  return new ProductFeedbackConversationError(
+    503,
+    "feedback_service_unavailable",
+    null,
+    conversationDiagnostic("upstream_transport", {
+      breakerFailures: snapshot.failures,
+      breakerOpen: snapshot.open,
+    }),
+  );
+}
+
+/**
+ * An undici dispatcher of its own with keep-alive off (pipelining 0): the request
+ * opens a new TCP/TLS connection, which closes after the response, instead of a
+ * pooled socket the first try may have died on. `connect_ms` is DNS + TCP + TLS
+ * of that connection, measured around undici's own connector.
+ */
+function freshHandsConnection(): { dispatcher: Agent; attrs: () => TraceAttributes; release: () => void } {
+  const connector = buildConnector({});
+  let connectMs: number | null = null;
+  const dispatcher = new Agent({
+    pipelining: 0,
+    connect: (options, callback) => {
+      const started = currentTimeMs();
+      connector(options, (...args) => {
+        connectMs = currentTimeMs() - started;
+        callback(...args);
+      });
+    },
+  });
+  return {
+    dispatcher,
+    attrs: () => (connectMs === null ? {} : { connect_ms: connectMs }),
+    // Graceful: a response body still being read finishes first.
+    release: () => { void dispatcher.close().catch(() => undefined); },
+  };
+}
+
+/** One try of a Hands call, in its own `server.product_feedback.hands_request` span. */
+async function sendHandsAttempt(input: {
+  url: string;
+  init: RequestInit | undefined;
+  headers: () => HeadersInit;
+  fetchImpl?: typeof fetch;
+  /** Used, with a dispatcher of its own, when `freshConnection`. */
+  freshAttemptFetch: typeof fetch;
+  signal: AbortSignal | undefined;
+  attrs: TraceAttributes;
+  attempt: 1 | 2;
+  /** Aborts this try (not the call) if no response has arrived by then. */
+  attemptTimeoutMs: number | null;
+  freshConnection: boolean;
+  firstAttempt?: { reason: string; ms: number };
+  /** Whether a failed try goes again; recorded on its span as `retry_decision`. */
+  decideRetry?: (error: unknown) => HandsReadRetryDecision;
+}): Promise<HandsAttemptResult> {
+  const attemptController = input.attemptTimeoutMs === null ? null : new AbortController();
+  const timer = attemptController && input.attemptTimeoutMs !== null
+    ? setClockTimeout(
+      () => attemptController.abort(new DOMException("The Hands request attempt timed out", "TimeoutError")),
+      input.attemptTimeoutMs,
+    )
+    : null;
+  const signal = attemptController
+    ? (input.signal ? AbortSignal.any([input.signal, attemptController.signal]) : attemptController.signal)
+    : input.signal;
+  const fresh = input.freshConnection ? freshHandsConnection() : null;
+  let failure: Extract<HandsAttemptResult, { ok: false }> | null = null;
+  const send = withTraceChildSpan(
+    "server.product_feedback.hands_request",
+    {
+      surface: "server",
+      kind: "client",
+      attrs: {
+        ...input.attrs,
+        attempt: input.attempt,
+        retry_used: input.attempt > 1,
+        fresh_connection: input.freshConnection,
+        ...(input.attemptTimeoutMs === null ? {} : { attempt_timeout_ms: input.attemptTimeoutMs }),
+        ...(input.firstAttempt
+          ? { first_attempt_reason: input.firstAttempt.reason, first_attempt_ms: input.firstAttempt.ms }
+          : {}),
+      },
+    },
+    async () => {
+      const init: RequestInit = { ...input.init, signal, headers: input.headers() };
+      try {
+        if (!fresh) return await (input.fetchImpl ?? globalThis.fetch)(input.url, init);
+        return await input.freshAttemptFetch(input.url, { ...init, dispatcher: fresh.dispatcher } as RequestInit);
+      } catch (error) {
+        failure = { ok: false, error, retryDecision: input.decideRetry?.(error) ?? "not_eligible" };
+        throw error;
+      } finally {
+        if (timer !== null) clearClockTimeout(timer);
+        fresh?.release();
+      }
+    },
+    {
+      onSuccess: (result) => ({ upstream_status: result.status, ...fresh?.attrs() }),
+      onError: (error) => ({
+        reason: handsTransportReason(error),
+        ...fresh?.attrs(),
+        ...(input.decideRetry && failure ? { retry_decision: failure.retryDecision } : {}),
+      }),
+    },
+  );
+  try {
+    return { ok: true, response: await send };
+  } catch (error) {
+    return failure ?? { ok: false, error, retryDecision: "not_eligible" };
+  }
+}
+
+type HandsAttemptResult =
+  | { ok: true; response: Response }
+  | { ok: false; error: unknown; retryDecision: HandsReadRetryDecision };
 
 async function sendHandsRequest(path: string, input: HandsRequestInput): Promise<Response> {
   const nowValue = input.now?.() ?? currentTimeMs();
@@ -983,42 +1153,60 @@ async function sendHandsRequest(path: string, input: HandsRequestInput): Promise
   }
   // A read without a caller signal is bounded from the request on (the mint has
   // its own bound), so a slow mint does not eat the read's time.
-  const signal = callerSignal ?? (
-    input.operation === "read" || input.operation === "background_read" ? AbortSignal.timeout(HANDS_READ_TIMEOUT_MS) : undefined
-  );
+  const isRead = input.operation === "read" || input.operation === "background_read";
+  const ownBudget = isRead && callerSignal === undefined;
+  const signal = callerSignal ?? (ownBudget ? AbortSignal.timeout(HANDS_READ_TIMEOUT_MS) : undefined);
+  const retryable = isRead && isIdempotentHandsRequest(input.init);
+  const attemptBase = {
+    url: `${input.config.baseUrl}${path}`,
+    init: input.init,
+    headers: () => ({
+      Authorization: `Bearer ${authorization.bearer}`,
+      "X-Hands-Reporter-Id": input.reporterId,
+      ...handsTraceHeaders(),
+      ...input.init?.headers,
+    }),
+    fetchImpl: input.fetchImpl,
+    freshAttemptFetch: freshAttemptFetchOf(input),
+    signal,
+    attrs: { operation: input.operation, hands_route: handsReporterRouteTemplate(path) },
+  };
+  const startedAt = now();
+  // Child span per Hands call attempt: the transport reason (timeout,
+  // network_<code>) or the upstream status, so a failed read is not inferred
+  // from its duration.
+  const first = await sendHandsAttempt({
+    ...attemptBase,
+    attempt: 1,
+    // The first try of a retryable read we bound ourselves gets part of the
+    // budget, so a request lost on a dead pooled socket leaves time for one more.
+    attemptTimeoutMs: retryable && ownBudget ? HANDS_READ_FIRST_ATTEMPT_MS : null,
+    freshConnection: false,
+    decideRetry: retryable
+      ? (error) => handsReadRetryDecision(error, {
+        callerSignal,
+        remainingMs: ownBudget ? HANDS_READ_TIMEOUT_MS - (now() - startedAt) : null,
+      })
+      : undefined,
+  });
   let response: Response;
-  try {
-    // Child span per Hands call: the transport reason (timeout, network_<code>)
-    // or the upstream status, so a failed read is not inferred from its duration.
-    response = await withTraceChildSpan(
-      "server.product_feedback.hands_request",
-      { surface: "server", kind: "client", attrs: { operation: input.operation, hands_route: handsReporterRouteTemplate(path) } },
-      () => (input.fetchImpl ?? globalThis.fetch)(`${input.config.baseUrl}${path}`, {
-        ...input.init,
-        signal,
-        headers: {
-          Authorization: `Bearer ${authorization.bearer}`,
-          "X-Hands-Reporter-Id": input.reporterId,
-          ...handsTraceHeaders(),
-          ...input.init?.headers,
-        },
-      }),
-      {
-        onSuccess: (result) => ({ upstream_status: result.status }),
-        onError: (error) => ({ reason: handsTransportReason(error) }),
-      },
-    );
-  } catch {
-    const snapshot = breakerFailure(input.config, input.operation, input.now?.() ?? currentTimeMs());
-    throw new ProductFeedbackConversationError(
-      503,
-      "feedback_service_unavailable",
-      null,
-      conversationDiagnostic("upstream_transport", {
-        breakerFailures: snapshot.failures,
-        breakerOpen: snapshot.open,
-      }),
-    );
+  if (first.ok) {
+    response = first.response;
+  } else {
+    if (first.retryDecision !== "retry") throw handsTransportFailure(input, now());
+    // Once, on a connection of its own (a stale keep-alive socket in the shared
+    // pool is one way the first try is lost), inside what is left of the same
+    // budget or caller signal: a retry never extends the read.
+    const second = await sendHandsAttempt({
+      ...attemptBase,
+      attempt: 2,
+      attemptTimeoutMs: null,
+      freshConnection: true,
+      firstAttempt: { reason: handsTransportReason(first.error), ms: Math.max(0, now() - startedAt) },
+    });
+    // One read, one breaker sample: a failed retry counts once.
+    if (!second.ok) throw handsTransportFailure(input, now());
+    response = second.response;
   }
   input.onUpstreamServerTiming?.(combineHandsServerTiming(
     authorization.mintServerTiming,
@@ -1080,6 +1268,8 @@ type TicketListPageInput = {
   limit: number;
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
+  /** The fetch of a read's retry on a fresh connection (tests); see freshAttemptFetchOf. */
+  freshAttemptFetch?: typeof fetch;
   now?: () => number;
   onUpstreamServerTiming?: (value: string | null) => void;
 };
@@ -1117,6 +1307,7 @@ export async function listProductFeedbackTicketsPage(
     reporterId: input.reporterId,
     operation: "read",
     fetchImpl: input.fetchImpl,
+    freshAttemptFetch: input.freshAttemptFetch,
     now: input.now,
     onUpstreamServerTiming: input.onUpstreamServerTiming,
   });
@@ -1179,6 +1370,8 @@ export async function getProductFeedbackTicket(input: {
   background?: { signal: AbortSignal };
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
+  /** The fetch of a read's retry on a fresh connection (tests); see freshAttemptFetchOf. */
+  freshAttemptFetch?: typeof fetch;
   now?: () => number;
   onUpstreamServerTiming?: (value: string | null) => void;
 }): Promise<ProductFeedbackDetail> {
@@ -1198,6 +1391,7 @@ export async function getProductFeedbackTicket(input: {
   const operation: OperationClass = input.background ? "background_read" : "read";
   const response = await handsRequest(queryPath(config, `/${input.ticketId}?${params}`), {
     config, env: input.env ?? process.env, reporterId: input.reporterId, operation, fetchImpl: input.fetchImpl, now: input.now,
+    freshAttemptFetch: input.freshAttemptFetch,
     signal: input.background?.signal,
     onUpstreamServerTiming: input.onUpstreamServerTiming,
   });

@@ -78,8 +78,6 @@ export function useNewAgentRuntimeOptions(
  * profile hides every operational control, yet this catalog would still ask the
  * CURRENT server for a FOREIGN agent's runtime options — a private subresource
  * the viewer's server has no business being asked for. (task #21)
- *
- * Mirrors `useProviderConnections(enabled)` in the same panel.
  */
 export function useExistingAgentRuntimeOptions(
   agentId: string,

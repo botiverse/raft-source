@@ -6,6 +6,8 @@ import {
 import type { AgentActivityReloadPayload } from "../src/utils/activityTrajectoryRecovery";
 
 class FakeSocket {
+  constructor(public connected = false) {}
+
   private readonly connectListeners = new Set<() => void>();
   private readonly activityListeners = new Set<(payload: AgentActivityReloadPayload) => void>();
 
@@ -68,7 +70,7 @@ test("reconnect reloads the durable trajectory log for the active agent activity
 });
 
 test("first connect is ignored so mount + initial socket connect does not double-fetch", async () => {
-  const socket = new FakeSocket();
+  const socket = new FakeSocket(false);
   const calls: string[] = [];
 
   const cleanup = registerActivityTrajectoryReconnectReload({
@@ -84,6 +86,27 @@ test("first connect is ignored so mount + initial socket connect does not double
   await new Promise((resolve) => setTimeout(resolve, 15));
 
   assert.deepEqual(calls, []);
+
+  cleanup();
+});
+
+test("subscribing on an already-connected socket treats the next connect as a reconnect", async () => {
+  const socket = new FakeSocket(true);
+  const calls: string[] = [];
+
+  const cleanup = registerActivityTrajectoryReconnectReload({
+    socket,
+    agentId: "agent-connected",
+    loadTrajectoryLog: async (agentId) => {
+      calls.push(agentId);
+    },
+    debounceMs: 5,
+  });
+
+  socket.emitConnect();
+  await new Promise((resolve) => setTimeout(resolve, 15));
+
+  assert.deepEqual(calls, ["agent-connected"]);
 
   cleanup();
 });

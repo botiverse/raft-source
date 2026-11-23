@@ -2,16 +2,18 @@ import { createContext, useCallback, useContext, useEffect, useLayoutEffect, use
 import type { KeyboardEvent, ReactNode, RefObject } from "react";
 import { useIntl } from "react-intl";
 import { Link } from "lucide-react";
-import { Button, Drawer, DrawerContent, PanelAction, PanelTitle, PanelToggleAction } from "@botiverse/raft-ui";
+import { Button, Drawer, DrawerContent, PanelAction, PanelToggleAction } from "@botiverse/raft-ui";
 import { CommentIcon } from "@botiverse/ricons";
 import { useCommentMarginFits } from "@botiverse/raft-ui/wip";
 import { artifactFileType } from "@botiverse/raft-shared";
 import type { ArtifactCommentId, ArtifactViewerData } from "@botiverse/raft-shared";
 
 import Tooltip from "../../components/ui/Tooltip";
+import { isElementNode, resizeObserverOf } from "../../utils/ownerDocument";
 import { trackArtifactViewerAction } from "./artifactAnalytics";
 import { isEscapeTakenElsewhere, isInputMethodKey } from "./artifactInputMethodKey";
 import ArtifactCommentBubble from "./ArtifactCommentBubble";
+import { ArtifactSideColumn } from "./ArtifactSideColumn";
 import ArtifactCommentsPanel from "./ArtifactCommentsPanel";
 import { ArtifactFilesPanel } from "./ArtifactFilesPanel";
 import type { ArtifactFilesJump } from "./ArtifactFilesPanel";
@@ -19,20 +21,22 @@ import { useArtifactDownload } from "./artifactDownloads";
 import { ArtifactCommentsProvider, commentCount, useArtifactComments } from "./ArtifactCommentsContext";
 import type { ArtifactCommentsReview } from "./ArtifactCommentsContext";
 import ArtifactContent from "./ArtifactContent";
+import { ArtifactBacklinksFoot } from "./ArtifactBacklinks";
+import { ArtifactBacklinksProvider } from "./ArtifactBacklinksProvider";
+import { useArtifactBacklinksHere } from "./useArtifactBacklinks";
 import { ArtifactListComposeProvider } from "./ArtifactListComposeProvider";
 import { useListComposeFocus } from "./artifactListCompose";
+import { keyboardSheetStyle, useSoftKeyboardBox } from "./artifactSoftKeyboard";
 import { useArtifactDisplayReport } from "./useArtifactDisplayReport";
+import { useCommentWritesOnArtifact } from "./artifactCommentWrites";
 import { ArtifactMarkdownMargin } from "./ArtifactMarkdownMargin";
 import { MARKDOWN_MARGIN_WIDTH_PX, useMarginEntries, useMarginOrphaned } from "./artifactMarginEntries";
 import { useArtifactFind, useArtifactFindKeyDown } from "./artifactFind";
 import { ArtifactFindAction, ArtifactFindBar, ArtifactFindProvider } from "./ArtifactFindBar";
 import { ArtifactLoadingArea } from "./ArtifactLoadingSplash";
 import { PAGE_GROUND_CLASS, useMarkdownPageGround } from "./artifactPageGround";
-import { ArtifactMetaRow } from "./ArtifactMetaRow";
-import ArtifactOriginLink from "./ArtifactOriginLink";
-import { ArtifactPresence, useArtifactPresence } from "./ArtifactPresence";
-import ArtifactScopeLabel from "./ArtifactScopeLabel";
-import { ArtifactShownFilePath } from "./ArtifactShownFilePath";
+import { useShownCutsAtClipEdge } from "./artifactShownFile";
+import { useArtifactPresence } from "./ArtifactPresence";
 import { ArtifactReviewProvider, useArtifactReview } from "./ArtifactReviewContext";
 import ArtifactReviewPanel from "./ArtifactReviewPanel";
 import { ArtifactReviewBar, ArtifactReviewHeaderActions, ArtifactReviewLayer, CommentCountNumber } from "./ArtifactReviewParts";
@@ -43,9 +47,10 @@ import { ArtifactPageForkProvider } from "./ArtifactPageForkProvider";
 import { useArtifactNewerVersion } from "./artifactSource";
 import { escapeTopCard } from "./useArtifactDismiss";
 import type { ArtifactNewerVersion } from "./artifactSource";
-import { ArtifactNewVersionNotice, ArtifactPinnedVersionNotice, ArtifactVersionHistorySheet, ArtifactVersionTag } from "./ArtifactVersionHistory";
+import { ArtifactNewVersionNotice, ArtifactPinnedVersionNotice, ArtifactVersionHistorySheet } from "./ArtifactVersionHistory";
 import type { PickVersion } from "./ArtifactVersionHistory";
-import { ArtifactViewerDialogs, ArtifactViewerMenu, useArtifactViewerActions, useCopyArtifactLink } from "./ArtifactViewerMenu";
+import { ArtifactViewerDialogs, ArtifactViewerMenu, useArtifactViewerActions } from "./ArtifactViewerMenu";
+import { useCopyArtifactLink } from "./artifactCopyLink";
 import type { ArtifactMenuFold, ArtifactViewerActions } from "./ArtifactViewerMenu";
 import type { ArtifactCommentsOpening } from "./artifactViewerStore";
 
@@ -65,26 +70,28 @@ import type { ArtifactCommentsOpening } from "./artifactViewerStore";
  *   history sheet, the content's box (Doesn't display well here measures it).
  * - ArtifactSurfaceActions: the header's actions (actions only: raft-design
  *   panel.md's order, shown buttons, then ⋯; the shell adds close): comment
- *   mode's controls, the Comments toggle (only where comment mode isn't
- *   offered: its ▾ has Show All Comments and Doesn't display well here; never
- *   for another server's reader, readsInOwnServer), Find
+ *   mode's controls (ArtifactReviewHeaderActions: on an HTML page the split
+ *   button, whose ▾ has Show All Comments and Doesn't display well here; on a
+ *   page with no block to pick one Comments button), the Comments toggle (only
+ *   where comment mode isn't offered; never for another server's reader,
+ *   readsInOwnServer), Find
  *   in page where the page may be searched (artifactFind), Copy link where the shell has room,
  *   Fork in Raft on another server's public Artifact (Send to conversation as
  *   a visible button, #proj-workspace:#140), and ⋯ (ArtifactViewerMenu: send where
  *   Fork in Raft isn't, visibility, rename, versions, download and follow (both
  *   a member of its own server's only),
- *   Doesn't display well here without comment mode (no ▾ to hold it; the
+ *   Doesn't display well here wherever there is no Comment ▾ to hold it (the
  *   list's own box, useArtifactDisplayReport), delete; in groups).
- * - ArtifactSurfaceTitle: the header's title, text only.
- * - ArtifactSurfaceMeta: the header's meta line: where it lives (the
- *   visibility chip: its options where the capabilities allow), its original
- *   message, then who's here and who read it (ArtifactPresence: the faces
- *   and the count, at every width).
+ * - The header's title, version tag and meta line: ArtifactSurfaceHead; the
+ *   details behind a desktop head's title: ArtifactDetailsTitle.
  * - The Files panel (ArtifactFilesPanel, #proj-workspace:#239): every file of
  *   the version shown, opened from ⋯'s Files (or the page's `?panel=files`),
  *   in the comment list's place (the side column, or a bottom sheet as `fit`
  *   says); one of the two at a time: opening either closes the other. A framed page's link to a
  *   file of its set that isn't a page opens it there, at that file's row (`openFile`, #256).
+ * - "Linked from" (#proj-workspace:#336 step 2; ArtifactBacklinks): what links to it, read once per
+ *   Artifact (ArtifactBacklinksProvider), as a strip at the content's foot outside a frame, or a block
+ *   under content Raft draws (ArtifactContent), and the head's chip (ArtifactSurfaceHead).
  * - ArtifactSurfaceMain: under the header: the find bar (ArtifactFindBar), a newer
  *   version's (useArtifactNewerVersion: it asks, without moving the read
  *   position, while the page is visible; useFollowLatest shows it at once
@@ -160,20 +167,21 @@ function useSurface(): ArtifactSurfaceState {
 }
 
 /**
- * For a shell's own header: the data shown (with this reader's writes), the
+ * For a shell's own header (and its parts, ArtifactSurfaceHead, ArtifactDetailsTitle): the data shown (with this
+ * reader's writes), the layout (`phone`), presence (one read), the scope chip's ref, the version pick, the
  * version list's and the Files panel's state (the page's `?panel=versions`,
  * `?panel=files` and `#panel=`, artifactPageOpening), and ⋯'s actions (the page's `?fork=1` opens Fork in
  * Raft's dialog).
  */
-export function useArtifactSurface(): Pick<ArtifactSurfaceState, "data" | "versionsOpen" | "setVersionsOpen" | "filesOpen" | "setFilesOpen" | "actions"> {
+export function useArtifactSurface(): Pick<ArtifactSurfaceState, "data" | "versionsOpen" | "setVersionsOpen" | "filesOpen" | "setFilesOpen" | "actions" | "phone" | "presence" | "chipRef" | "pickVersion"> {
   return useSurface();
 }
 
 const commentsPanelId = (kind: ArtifactSurfaceKind) => `artifact-${kind}-comments`;
 const filesPanelId = (kind: ArtifactSurfaceKind) => `artifact-${kind}-files`;
 const commentsToggleId = (kind: ArtifactSurfaceKind) => `artifact-${kind}-comments-toggle`;
-/** What opens the list: the Comments toggle, or, with comment mode, the Comment button's ▾. */
-const commentsOpener = (kind: ArtifactSurfaceKind) => `[data-testid='${commentsToggleId(kind)}'], [data-testid='artifact-review-comment-menu']`;
+/** What opens the list: the Comments toggle, or, with comment mode, the Comment button's ▾ or (no block to pick) the Comments button. */
+const commentsOpener = (kind: ArtifactSurfaceKind) => `[data-testid='${commentsToggleId(kind)}'], [data-testid='artifact-review-comment-menu'], [data-testid='artifact-review-write']`;
 
 export function ArtifactSurfaceProvider({ data, shownKey, onDeleted, kind, phone, fit, onPickVersion, onShowLatest, review = null, landOn = null, listOn = null, children }: {
   /** The viewer data loaded for the version shown. */
@@ -292,7 +300,10 @@ function SurfaceState({ data, actions, kind, phone, fit, onPickVersion, onShowLa
   return (
     <SurfaceContext.Provider value={value}>
       <ArtifactFindProvider>
-        <ArtifactPageForkProvider data={data} openFork={actions.openFork}>{children}</ArtifactPageForkProvider>
+        {/* "Linked from" (#proj-workspace:#336 step 2): one read per Artifact, for the head's chip and the content's strip or block. */}
+        <ArtifactBacklinksProvider data={data} phone={phone}>
+          <ArtifactPageForkProvider data={data} openFork={actions.openFork}>{children}</ArtifactPageForkProvider>
+        </ArtifactBacklinksProvider>
       </ArtifactFindProvider>
     </SurfaceContext.Provider>
   );
@@ -303,7 +314,8 @@ function SurfaceState({ data, actions, kind, phone, fit, onPickVersion, onShowLa
  * top of the dismissal layer, artifactDismissLayer: a thread's card, a new comment's, the comment
  * box at a selection or a picked block, a draft's view), wherever in the surface the focus is, the
  * comment list included; then, inside the comment list (nothing in it took Esc), the list, back to
- * its opener; inside the Files panel, the panel, back to ⋯; then comment mode: a selection's
+ * its opener; inside the Files panel, the panel, back to ⋯; inside "Linked from"'s open section,
+ * the section, back to its strip; then comment mode: a selection's
  * Comment button, out of B (drafts kept) or out of C, back to where it was opened. Anything else
  * is the shell's (`onUnhandled`: the viewer closes). Works outside a surface too (a shell still loading).
  * Cmd/Ctrl+F opens the find bar where the page shown may be searched; else
@@ -315,6 +327,8 @@ export function useArtifactSurfaceKeyDown(onUnhandled?: () => void): (event: Key
   const closeComments = surface?.closeComments;
   const closeFiles = surface?.filesOpen ? surface.closeFiles : null;
   const reviewEscape = useArtifactReview()?.handleEscape;
+  const backlinks = useArtifactBacklinksHere();
+  const closeBacklinks = backlinks?.open && !backlinks.phone ? backlinks : null;
   // Cmd/Ctrl+F; and, the find bar open, Esc closes it first, wherever the focus is in the surface (its buttons included).
   const findKeyDown = useArtifactFindKeyDown();
   return useCallback((event: KeyboardEvent<HTMLElement>) => {
@@ -325,14 +339,22 @@ export function useArtifactSurfaceKeyDown(onUnhandled?: () => void): (event: Key
       event.preventDefault();
       return;
     }
-    if (listOpen && closeComments && event.target instanceof Element && event.target.closest("[data-testid='artifact-comments-panel']")) {
+    // An element of any window: in an object window the key's target is another realm's (#337 PR3).
+    if (listOpen && closeComments && isElementNode(event.target) && event.target.closest("[data-testid='artifact-comments-panel']")) {
       event.preventDefault();
       closeComments(event.currentTarget);
       return;
     }
-    if (closeFiles && event.target instanceof Element && event.target.closest("[data-testid='artifact-files-panel']")) {
+    if (closeFiles && isElementNode(event.target) && event.target.closest("[data-testid='artifact-files-panel']")) {
       event.preventDefault();
       closeFiles();
+      return;
+    }
+    // Inside "Linked from"'s open section: the section, back to its strip.
+    if (closeBacklinks && isElementNode(event.target) && event.target.closest("[data-testid='artifact-backlinks-section']")) {
+      event.preventDefault();
+      closeBacklinks.setOpen(false);
+      closeBacklinks.strip()?.focus();
       return;
     }
     if (reviewEscape?.()) {
@@ -343,7 +365,7 @@ export function useArtifactSurfaceKeyDown(onUnhandled?: () => void): (event: Key
       event.preventDefault();
       onUnhandled();
     }
-  }, [findKeyDown, listOpen, closeComments, closeFiles, reviewEscape, onUnhandled]);
+  }, [findKeyDown, listOpen, closeComments, closeFiles, closeBacklinks, reviewEscape, onUnhandled]);
 }
 
 /** Opening or closing the comment list from its toggle; opening it is `comments_open`. */
@@ -381,8 +403,8 @@ function useReviewMenuFold(folded: boolean, reportDisplay: (() => void) | null):
  * The header's actions, in the shell's PanelActions (before its own: the
  * viewer's Expand and close). The shell says how much room there is:
  */
-export function ArtifactSurfaceActions({ compact, commentsInMenu, copyLinkHere, reviewInMenu = false, openInNewPageInMenu = false, findInMenuHere = false, forkInMenuHere = false, scopeInMenu = false }: {
-  /** A compact header: Find in page and Fork in Raft folded into ⋯. */
+export function ArtifactSurfaceActions({ compact, commentsInMenu, copyLinkHere, reviewInMenu = false, findInMenuHere = false, forkInMenuHere = false, scopeInMenu = false }: {
+  /** A compact header (a phone's): Find in page and Fork in Raft folded into ⋯. */
   compact: boolean;
   /** The Comments toggle in ⋯, not here. */
   commentsInMenu: boolean;
@@ -390,11 +412,9 @@ export function ArtifactSurfaceActions({ compact, commentsInMenu, copyLinkHere, 
   copyLinkHere: boolean;
   /** Comment mode's controls in ⋯, not here (a head with no room for them; #189 rule 6). */
   reviewInMenu?: boolean;
-  /** The shell's Open in New Page in ⋯ (it folded from the head). */
-  openInNewPageInMenu?: boolean;
-  /** Find in page in ⋯ also where the header isn't compact (a head with no room for it; #189 rule 6). */
+  /** Find in page in ⋯ also where the header isn't compact (a phone's head with no room for it; #189 rule 6). */
   findInMenuHere?: boolean;
-  /** Fork in Raft in ⋯ also where the header isn't compact (a head with no room for it; #189 rule 6). */
+  /** Fork in Raft in ⋯ also where the header isn't compact (a narrow column; a phone's head with no room for it). */
   forkInMenuHere?: boolean;
   /** The visibility chip folded into ⋯ (ArtifactSurfaceMeta's `scopeInMenu`). */
   scopeInMenu?: boolean;
@@ -405,6 +425,10 @@ export function ArtifactSurfaceActions({ compact, commentsInMenu, copyLinkHere, 
   const setCommentsOpen = useTrackedCommentsOpen(comments?.setPanelOpen);
   // Where comment mode is offered, Show All Comments is the Comment button's ▾, shown at every width: no Comments toggle.
   const modeOffered = useArtifactReview()?.canComment ?? false;
+  // The Comment button's ▾ (and Doesn't display well here in it) is the split's, on a page with blocks to pick; where
+  // the page has none, the head's one Comments button opens the list (useCommentWritesOnArtifact) and the report is ⋯'s.
+  const writes = useCommentWritesOnArtifact();
+  const splitShown = modeOffered && writes === null;
   // Another server's reader has no comments to read (the server answers them none): no Comments toggle, here or in ⋯;
   // the page's own comment button offers Fork in Raft instead (useArtifactPageForkAsk).
   const toggle = comments !== null && !modeOffered && readsInOwnServer(data.card);
@@ -412,12 +436,12 @@ export function ArtifactSurfaceActions({ compact, commentsInMenu, copyLinkHere, 
   // The one comment control carries the count (as the Comment button's ▾ does where comment mode is offered).
   const commentsNumber = comments ? commentCount(comments) : 0;
   const commentsLabel = comments ? formatMessage({ id: "artifacts.comments.toggle" }, { count: commentsNumber }) : "";
-  const copyLink = useCopyArtifactLink(data.card);
+  const copyLink = useCopyArtifactLink(data.card, kind);
   const copyLabel = formatMessage({ id: "artifacts.menu.copyLink" });
   const openVersions = useCallback(() => setVersionsOpen(true), [setVersionsOpen]);
   const openFiles = useCallback(() => setFilesOpen(true), [setFilesOpen]);
   const reportDisplay = useArtifactDisplayReport(pageRef);
-  const reviewFold = useReviewMenuFold(reviewInMenu && modeOffered, reportDisplay);
+  const reviewFold = useReviewMenuFold(reviewInMenu && modeOffered, splitShown ? reportDisplay : null);
   // Another server's public Artifact: Send to conversation is the header's Fork in Raft, not in ⋯ (#proj-workspace:#140).
   const fork = offersForkInRaft(data.card);
   const forkLabel = formatMessage({ id: "artifacts.fork.inRaft" });
@@ -435,10 +459,10 @@ export function ArtifactSurfaceActions({ compact, commentsInMenu, copyLinkHere, 
     const comments = toggle && commentsInMenu ? { open: commentsOpen, label: commentsLabel, onOpenChange: setCommentsOpen } : null;
     const findItem = findInMenu && openFind ? { label: findLabel, onSelect: openFind } : null;
     const forkItem = forkInMenu ? { label: forkLabel, onSelect: openFork } : null;
-    return comments || findItem || forkItem || reviewFold || openInNewPageInMenu || scopeInMenu
-      ? { comments, find: findItem, fork: forkItem, review: reviewFold, openInNewPage: openInNewPageInMenu, scope: scopeInMenu }
+    return comments || findItem || forkItem || reviewFold || scopeInMenu
+      ? { comments, find: findItem, fork: forkItem, review: reviewFold, scope: scopeInMenu }
       : null;
-  }, [toggle, commentsInMenu, commentsOpen, commentsLabel, setCommentsOpen, findInMenu, findLabel, openFind, forkInMenu, forkLabel, openFork, reviewFold, openInNewPageInMenu, scopeInMenu]);
+  }, [toggle, commentsInMenu, commentsOpen, commentsLabel, setCommentsOpen, findInMenu, findLabel, openFind, forkInMenu, forkLabel, openFork, reviewFold, scopeInMenu]);
   return (
     <>
       {reviewFold ? null : <ArtifactReviewHeaderActions onReportDisplay={reportDisplay} />}
@@ -481,71 +505,16 @@ export function ArtifactSurfaceActions({ compact, commentsInMenu, copyLinkHere, 
         onCopyLink={copyLinkHere ? null : copyLink}
         onEmbed={actions.embed}
         onRename={actions.rename?.start ?? null}
+        settle={actions.settle}
         onPickVersion={pickVersion}
         onOpenVersions={openVersions}
         onOpenFiles={openFiles}
-        onReportDisplay={modeOffered ? null : reportDisplay}
+        onReportDisplay={splitShown ? null : reportDisplay}
         fold={fold}
         triggerRef={menuRef}
         phone={phone}
       />
     </>
-  );
-}
-
-/**
- * The header's title, the same in every shell: text only (#proj-workspace:#169:
- * ⋯'s Rename renames it, in its dialog). `pageHeading`: the title is the
- * page's h1 (the Artifact's own page).
- */
-export function ArtifactSurfaceTitle({ pageHeading = false, testId }: { pageHeading?: boolean; testId: string }) {
-  const { data } = useSurface(), { title } = data.card;
-  const heading = pageHeading ? <PanelTitle render={<h1>{title}</h1>} data-testid={testId} /> : <PanelTitle data-testid={testId}>{title}</PanelTitle>;
-  return <>{heading}<ArtifactShownFilePath data={data} /></>;
-}
-
-/**
- * The header's version tag beside the title, the same in every shell: with
- * more than one version it switches versions (a menu on a desktop, the
- * version sheet on a phone), as ⋯'s Version history does.
- */
-export function ArtifactSurfaceVersionTag() {
-  const { data, phone, pickVersion, setVersionsOpen } = useSurface();
-  const openVersions = useCallback(() => setVersionsOpen(true), [setVersionsOpen]);
-  return <ArtifactVersionTag data={data} phone={phone} onPick={pickVersion} onOpenSheet={openVersions} />;
-}
-
-/**
- * The header's meta line, the same in every shell: where it lives (the
- * visibility chip, which offers its options where the capabilities allow),
- * its original message (into the server, to it), then who else is here and
- * who read it (ArtifactPresence), the same at every width (stdrc's option A,
- * #proj-raft-ui:7531279d). Laid out by ArtifactMetaRow: the text part
- * truncates, the readers sit beside it and never shrink. The shell renders
- * it under the title as it is (it holds its own PanelMeta).
- */
-export function ArtifactSurfaceMeta({ replace = false, onOpened, testId, scopeInMenu = false }: {
-  /** The visibility chip folded into ⋯ (a head with no room; #189 rule 6): not here. */
-  scopeInMenu?: boolean;
-  /** Opening the original message replaces this history entry (the viewer on a phone is a page with its own). */
-  replace?: boolean;
-  /** After the original message opened (the side card closes where it covers its channel). */
-  onOpened?: () => void;
-  testId?: string;
-}) {
-  const { data, actions, chipRef, presence, phone } = useSurface();
-  return (
-    <ArtifactMetaRow
-      testId={testId}
-      text={(
-        <>
-          {/* A narrowing dialog gives focus back to the chip. */}
-          {scopeInMenu ? null : <ArtifactScopeLabel home={data.card.home} fromAnotherServer={data.card.fromAnotherServer} visibility={actions.visibility} triggerRef={chipRef} />}
-          <ArtifactOriginLink origin={data.origin} replace={replace} onOpened={onOpened} />
-        </>
-      )}
-      readers={<ArtifactPresence presence={presence} facesOnly={phone} />}
-    />
   );
 }
 
@@ -631,8 +600,9 @@ function useNarrowerThan(element: HTMLElement | null, width: number, measure: bo
     if (!element || !measure) return;
     const update = () => setNarrow(element.getBoundingClientRect().width < width);
     update();
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(update);
+    const Observer = resizeObserverOf(element);
+    if (!Observer) return;
+    const observer = new Observer(update);
     observer.observe(element);
     return () => observer.disconnect();
   }, [element, width, measure]);
@@ -688,13 +658,18 @@ function SurfaceBody({ switching }: { switching: boolean }) {
   // registers its find target once it mounts, artifactFind `offered`), so a test reads the header and ⋯
   // once it has settled rather than racing the frame. Read nowhere else.
   const findOffered = useArtifactFind()?.offered ?? false;
+  const cut = useShownCutsAtClipEdge(data) && !switching && !column && !margin; // Alone in the body: no splash or side column.
   return (
-    <div ref={setElement} className="relative flex min-h-0 flex-1" data-comments={column ? (cover ? "cover" : "beside") : undefined} data-find-offered={findOffered} data-testid={`artifact-${kind}-layout`}>
-      <div ref={setPage} className="relative flex min-h-0 min-w-0 flex-1 flex-col" inert={(column && cover) || undefined} data-testid={`artifact-${kind}-body`}>
-        {/* Another version loading: the opening's splash (the shell's ArtifactSplashScope counts from the pick). */}
-        {switching ? <ArtifactLoadingArea kind={data.card.kind} testId={`artifact-${kind}-switching`} /> : <ArtifactContent data={data} onOpenFile={openFile} />}
-        {/* Comment mode's and the drafts' bar, floating at the content's foot. */}
-        <ArtifactReviewBar kind={data.card.kind} />
+    <div ref={setElement} className="relative flex min-h-0 flex-1" data-comments={column ? (cover ? "cover" : "beside") : undefined} data-find-offered={findOffered} data-clip-edge={cut ? "cut" : undefined} data-testid={`artifact-${kind}-layout`}>
+      {/* The content the comment list beside it takes its width from (ColumnResizeHandle MAIN_COLUMN_ATTRIBUTE), and under its box "Linked from"'s strip, outside a frame. */}
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col" inert={(column && cover) || undefined} data-main-column="">
+        <div ref={setPage} className="relative flex min-h-0 min-w-0 flex-1 flex-col" data-testid={`artifact-${kind}-body`}>
+          {/* Another version loading: the opening's splash (the shell's ArtifactSplashScope counts from the pick). */}
+          {switching ? <ArtifactLoadingArea kind={data.card.kind} testId={`artifact-${kind}-switching`} /> : <ArtifactContent data={data} onOpenFile={openFile} />}
+          {/* Comment mode's and the drafts' bar, floating at the content's foot. */}
+          <ArtifactReviewBar kind={data.card.kind} />
+        </div>
+        {switching ? null : <ArtifactBacklinksFoot />}
       </div>
       {margin ? (
         // Beside the page, in the layout: the margin's cards scroll with the passages they are about.
@@ -710,23 +685,15 @@ function SurfaceBody({ switching }: { switching: boolean }) {
       ) : null}
       {column && filesOpen ? (
         // The Files panel in the comment list's place (one of the two at a time), over comment mode's review too.
-        <aside
-          id={filesPanelId(kind)}
-          className={cover ? "absolute inset-0 z-cover flex" : "flex w-[340px] shrink-0 border-s border-line-seam"}
-          data-testid={filesPanelId(kind)}
-        >
+        <ArtifactSideColumn id={filesPanelId(kind)} cover={cover}>
           <ArtifactFilesPanel data={data} onClose={closeFiles} onDownloadAll={downloadAll} jump={filesJump} />
-        </aside>
+        </ArtifactSideColumn>
       ) : column ? (
-        // Beside the content, in the layout: a side column with its own seam (no overlay, no shadow); or over it where narrow.
-        <aside
-          id={commentsPanelId(kind)}
-          className={cover ? "absolute inset-0 z-cover flex" : "flex w-[340px] shrink-0 border-s border-line-seam"}
-          data-testid={commentsPanelId(kind)}
-        >
+        // Beside the content, its width dragged on its seam (ArtifactSideColumn); or over it where narrow.
+        <ArtifactSideColumn id={commentsPanelId(kind)} cover={cover}>
           {/* Show All Comments in C puts the list over the pending review until it is closed. */}
           {reviewing && !listOpen ? <ArtifactReviewPanel /> : <ArtifactCommentsPanel onClose={close} />}
-        </aside>
+        </ArtifactSideColumn>
       ) : null}
       {fit === "sheet" ? <CommentsSheet /> : null}
       {fit === "sheet" ? <FilesSheet downloadAll={downloadAll} /> : null}
@@ -785,10 +752,27 @@ function CommentsSheet() {
     close();
   }, [close]);
   const { sheetRef, initialFocus } = useListComposeFocus();
+  const open = comments?.panelOpen ?? false;
+  // With the on-screen keyboard up it sits on the keyboard and fits what is left, as a card's sheet
+  // does (ArtifactCardShell): its list shrinks, so its own header stays on screen and its box, at
+  // the list's foot, stays above the keyboard (Lagoon, #proj-workspace:#343). Held where it was
+  // through its way out (`shown`).
+  const [shown, setShown] = useState(false);
+  const keyboard = useSoftKeyboardBox(open || shown, !open);
+  const keyboardStyle = useMemo(() => keyboardSheetStyle(keyboard), [keyboard]);
+  const up = keyboard !== null;
   return (
-    <Drawer open={comments?.panelOpen ?? false} onOpenChange={change}>
+    <Drawer open={open} onOpenChange={change} onOpenChangeComplete={setShown}>
       {/* The list's own header (title, ×) is the sheet's: no DrawerHeader over it. */}
-      <DrawerContent aria-label={formatMessage({ id: "artifacts.comments.title" })} initialFocus={initialFocus} onKeyDown={onKeyDown} data-testid={`${commentsPanelId(kind)}-sheet`}>
+      <DrawerContent
+        aria-label={formatMessage({ id: "artifacts.comments.title" })}
+        initialFocus={initialFocus}
+        onKeyDown={onKeyDown}
+        data-testid={`${commentsPanelId(kind)}-sheet`}
+        data-above-keyboard={up || undefined}
+        style={keyboardStyle}
+      >
+        {/* 70dvh while the keyboard is down; with it up, shrunk to the sheet's capped height (min-h-0). */}
         <div ref={sheetRef} className="flex h-[70dvh] min-h-0 flex-col">
           <ArtifactCommentsPanel onClose={close} />
         </div>

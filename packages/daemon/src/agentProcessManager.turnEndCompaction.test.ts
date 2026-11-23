@@ -107,15 +107,18 @@ async function waitFor(condition: () => boolean, label: string): Promise<void> {
   assert.fail(`Timed out waiting for ${label}`);
 }
 
-async function withManager(fn: (ctx: {
-  driver: FakeClaudeDriver;
-  manager: AgentProcessManager;
-  dataDir: string;
-  events: Array<{ name: string; attrs: Record<string, unknown> }>;
-  emit: (...lines: string[]) => Promise<void>;
-  idleNotices: string[];
-  activity: Array<{ detail?: string; detailKind?: string }>;
-}) => Promise<void>): Promise<void> {
+async function withManager(
+  fn: (ctx: {
+    driver: FakeClaudeDriver;
+    manager: AgentProcessManager;
+    dataDir: string;
+    events: Array<{ name: string; attrs: Record<string, unknown> }>;
+    emit: (...lines: string[]) => Promise<void>;
+    idleNotices: string[];
+    activity: Array<{ detail?: string; detailKind?: string }>;
+  }) => Promise<void>,
+  opts: { queuedInputSettleMs?: number } = {},
+): Promise<void> {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-turn-end-compaction-"));
   const driver = new FakeClaudeDriver();
   const idleNotices: string[] = [];
@@ -128,6 +131,7 @@ async function withManager(fn: (ctx: {
     driverResolver: () => driver,
     runtimeSessionHomeDir: dataDir,
     onAgentWorkingToIdle: (agentId) => idleNotices.push(agentId),
+    ...(opts.queuedInputSettleMs !== undefined ? { queuedInputSettleMs: opts.queuedInputSettleMs } : {}),
   });
   const events: Array<{ name: string; attrs: Record<string, unknown> }> = [];
   const internal = manager as any;
@@ -271,5 +275,213 @@ test("#54 phase 3: the /compact turn shows as compacting, and its end runs no id
     driver.parsedLines.set("small-usage", [usage(40_000, 1_000_000)]);
     await emit("small-usage", "turn-end");
     await waitFor(() => idleNotices.length === 2, "the next real turn's idle hooks");
+  });
+});
+
+test("#67: the settled /compact turn records what Claude's compaction left (compact_metadata.post_tokens)", async () => {
+  await withManager(async (ctx) => {
+    const { driver, events, emit } = ctx;
+    await turnEndingWith(ctx, 300_000, 1_000_000);
+    await waitFor(() => compacts(driver).length === 1, "/compact written");
+    driver.parsedLines.set("compact-start", [{ kind: "compaction_started" }]);
+    driver.parsedLines.set("compact-finish", [{ kind: "compaction_finished", contextBeforeTokens: 301_000, contextAfterTokens: 42_000 }]);
+    await emit("compact-start", "compact-finish", "turn-end");
+    await waitFor(() => outcomes(events).includes("completed"), "the compaction settled");
+    const done = events.find((event) => event.attrs.outcome === "completed")!.attrs;
+    assert.equal(done.context_tokens, 300_000, "before: the size it fired on");
+    assert.equal(done.context_after_tokens, 42_000, "after: what the compaction left");
+  });
+  await withManager(async (ctx) => {
+    const { driver, events, emit } = ctx;
+    await turnEndingWith(ctx, 300_000, 1_000_000);
+    await waitFor(() => compacts(driver).length === 1, "/compact written");
+    driver.parsedLines.set("compact-start", [{ kind: "compaction_started" }]);
+    driver.parsedLines.set("compact-finish", [{ kind: "compaction_finished" }]);
+    await emit("compact-start", "compact-finish", "turn-end");
+    await waitFor(() => outcomes(events).includes("completed"), "the compaction settled");
+    const done = events.find((event) => event.attrs.outcome === "completed")!.attrs;
+    assert.equal("context_after_tokens" in done, false, "not reported: not recorded");
+  });
+});
+
+test("#67: a deferred app-inbox drain or a drain's hold at the turn end is a delivery waiting: no /compact, the arm kept", async () => {
+  // A deferred app-inbox drain scheduled for after this turn.
+  await withManager(async (ctx) => {
+    const { driver, manager, events, emit } = ctx;
+    const internal = manager as any;
+    const timer = setTimeout(() => undefined, 60_000);
+    try {
+      await manager.startAgent("agent-1", config());
+      internal.commitApmIdleState("agent-1", internal.agents.get("agent-1"), false);
+      internal.appInboxDeferredDrainTimers.set("agent-1", timer);
+      driver.parsedLines.set("usage", [usage(300_000, 1_000_000)]);
+      driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+      await emit("usage", "turn-end");
+      await flush();
+      assert.equal(compacts(driver).length, 0);
+      assert.ok(outcomes(events).includes("skipped:deliveries_waiting"));
+      internal.appInboxDeferredDrainTimers.delete("agent-1");
+    } finally {
+      clearTimeout(timer);
+    }
+    // The next idle turn end compacts: a block keeps the arm.
+    const ap = internal.agents.get("agent-1");
+    internal.commitApmIdleState("agent-1", ap, false);
+    internal.sendRuntimeInput("agent-1", ap, { mode: "idle", text: "next task" }, "test");
+    driver.parsedLines.set("usage-2", [usage(310_000, 1_000_000)]);
+    await emit("usage-2", "turn-end");
+    await waitFor(() => compacts(driver).length === 1, "compacted at the next idle turn end");
+  });
+  // A drain (an upgrade's or a config apply's) holding this agent's deliveries.
+  await withManager(async (ctx) => {
+    const { driver, manager, events, emit } = ctx;
+    const internal = manager as any;
+    await manager.startAgent("agent-1", config());
+    internal.commitApmIdleState("agent-1", internal.agents.get("agent-1"), false);
+    internal.drain.holds = (agentId?: string) => agentId === "agent-1";
+    driver.parsedLines.set("usage", [usage(300_000, 1_000_000)]);
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    await emit("usage", "turn-end");
+    await flush();
+    assert.equal(compacts(driver).length, 0);
+    assert.ok(outcomes(events).includes("skipped:deliveries_waiting"));
+  });
+});
+
+test("#67: a tracked @mention settled at turn_end no longer blocks /compact, and /compact keeps its status and runtime trace", async () => {
+  await withManager(async (ctx) => {
+    const { driver, manager, events, emit, activity } = ctx;
+    const internal = manager as any;
+    await manager.startAgent("agent-1", config());
+    const ap = internal.agents.get("agent-1");
+    internal.commitApmIdleState("agent-1", ap, false);
+    // Simulate a normal @mention-triggered turn whose tracked mention is settled at turn_end.
+    let settled = false;
+    internal.trackedMentionDeliveries.set("occ-1", {
+      occurrenceId: "occ-1",
+      agentId: "agent-1",
+      messageId: "msg-mention-1",
+      message: message("@claude-agent please check"),
+      state: "pending",
+      toldProcessInstanceId: ap.processInstanceId,
+      context: {
+        mentionDelivery: { occurrenceId: "occ-1" },
+        onMentionAck: () => { settled = true; },
+      },
+    });
+    driver.parsedLines.set("usage", [usage(300_000, 1_000_000)]);
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    await emit("usage", "turn-end");
+    await waitFor(() => compacts(driver).length === 1, "/compact written after mention settled");
+
+    assert.equal(settled, true, "tracked mention settled before turn-end compaction checked idle");
+    assert.equal(outcomes(events).includes("skipped:mention_in_flight"), false);
+    assert.equal(outcomes(events).includes("skipped:agent_busy"), false);
+    assert.ok(outcomes(events).includes("started"));
+
+    // Quiet status ("Idle") must have been broadcast BEFORE /compact started, not after!
+    const lastActivity = activity.at(-1);
+    assert.equal(lastActivity?.detailKind, "compacting_context", "final activity while /compact runs must stay compacting_context (not overwritten by Idle)");
+    assert.equal(lastActivity?.detail, "Compacting context");
+
+    // The /compact turn's runtime trace must still be active (not prematurely closed by the prior turn's endRuntimeTrace).
+    assert.ok(ap.runtimeTraceSpan !== null, "/compact runtime trace must remain open while /compact runs");
+  });
+});
+
+test("#67: mid-turn busy write skips as delivery_in_flight at turn_end, then compacts once queued_input_settled fires with no new turn", async () => {
+  await withManager(async (ctx) => {
+    const { driver, manager, events, emit } = ctx;
+    const internal = manager as any;
+    await manager.startAgent("agent-1", config());
+    const ap = internal.agents.get("agent-1");
+    internal.commitApmIdleState("agent-1", ap, false);
+    // Simulate an inbox write that landed mid-turn into the running Claude process.
+    ap.deliveryConsumption.recordWrite("mid-turn-1", "busy_stdin_notification", Date.now(), true, true);
+    driver.parsedLines.set("usage", [usage(300_000, 1_000_000)]);
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    await emit("usage", "turn-end");
+    await flush();
+
+    // Immediately after turn_end: held by queuedInputPending -> granular skipped:delivery_in_flight.
+    assert.equal(compacts(driver).length, 0);
+    assert.deepEqual(outcomes(events), ["skipped:delivery_in_flight"]);
+
+    // Once queuedInputSettleMs elapses with no new turn started, queued_input_settled retries and writes /compact.
+    await waitFor(() => compacts(driver).length === 1, "/compact written after queued_input_settled");
+    assert.deepEqual(outcomes(events), ["skipped:delivery_in_flight", "started"]);
+  }, { queuedInputSettleMs: 50 });
+});
+
+test("#67: queued_input_settled never compacts if a new turn started during the settle window", async () => {
+  await withManager(async (ctx) => {
+    const { driver, manager, events, emit } = ctx;
+    const internal = manager as any;
+    await manager.startAgent("agent-1", config());
+    const ap = internal.agents.get("agent-1");
+    internal.commitApmIdleState("agent-1", ap, false);
+    ap.deliveryConsumption.recordWrite("mid-turn-2", "busy_stdin_notification", Date.now(), true, true);
+    driver.parsedLines.set("usage", [usage(300_000, 1_000_000)]);
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.parsedLines.set("next-turn-text", [{ kind: "text", text: "working on the queued follow-up" }]);
+    await emit("usage", "turn-end");
+    await flush();
+    assert.deepEqual(outcomes(events), ["skipped:delivery_in_flight"]);
+
+    // Claude starts a follow-up turn on the queued mid-turn input before the settle window expires.
+    internal.commitApmIdleState("agent-1", ap, false);
+    await emit("next-turn-text");
+    await new Promise((resolve) => setTimeout(resolve, 220));
+    assert.equal(compacts(driver).length, 0, "must never write /compact while a new turn is running");
+  }, { queuedInputSettleMs: 150 });
+});
+
+test("#67: a warm-recycle yield to compaction is preserved across queued_input_settled so compaction is not starved", async () => {
+  await withManager(async (ctx) => {
+    const { driver, manager, events, emit } = ctx;
+    const internal = manager as any;
+    await manager.startAgent("agent-1", config({ wakeRecycleWarm: true }));
+    const ap = internal.agents.get("agent-1");
+    // Simulate a previous quiet warm mark that was cancelled by a delivery (arming yield for this session).
+    internal.warmRecycle.mark("agent-1", {
+      sessionId: "session-1",
+      contextTokens: 300_000,
+      windowTokens: 1_000_000,
+      band: "quiet",
+      markedAtMs: Date.now(),
+    }, null);
+    internal.warmRecycle.cancel("agent-1", { yieldNext: true });
+    // Ensure warm recycle is otherwise eligible (version floor satisfied).
+    internal.detectedRuntimeCliVersion = () => "2.1.304 (Claude Code)";
+
+    internal.commitApmIdleState("agent-1", ap, false);
+    ap.deliveryConsumption.recordWrite("mid-turn-3", "busy_stdin_notification", Date.now(), true, true);
+    driver.parsedLines.set("usage", [usage(300_000, 1_000_000)]);
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    await emit("usage", "turn-end");
+    await flush();
+    assert.deepEqual(outcomes(events), ["skipped:delivery_in_flight"]);
+
+    // When queued_input_settled fires, warm recycle must still yield so /compact runs instead of re-marking!
+    await waitFor(() => compacts(driver).length === 1, "/compact written after queued_input_settled despite wakeRecycleWarm");
+    assert.deepEqual(outcomes(events), ["skipped:delivery_in_flight", "started"]);
+    assert.equal(internal.warmRecycle.pending("agent-1"), null, "warm recycle yielded to compaction");
+  }, { queuedInputSettleMs: 50 });
+});
+
+test("#67: a running background task at turn_end reports skipped:background_tasks instead of agent_busy", async () => {
+  await withManager(async (ctx) => {
+    const { driver, manager, events, emit } = ctx;
+    const internal = manager as any;
+    await manager.startAgent("agent-1", config());
+    const ap = internal.agents.get("agent-1");
+    internal.commitApmIdleState("agent-1", ap, false);
+    ap.backgroundTasks.set("bg-1", { startedAtMs: Date.now(), lastEventAtMs: Date.now(), taskKind: "command" });
+    driver.parsedLines.set("usage", [usage(300_000, 1_000_000)]);
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    await emit("usage", "turn-end");
+    await flush();
+    assert.equal(compacts(driver).length, 0);
+    assert.deepEqual(outcomes(events), ["skipped:background_tasks"]);
   });
 });

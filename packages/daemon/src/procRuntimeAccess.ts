@@ -14,7 +14,7 @@
  */
 export const RUNTIME_FULL_ACCESS: Readonly<Record<string, string>> = {
   claude: "claudeLaunch.ts buildClaudeArgs: --dangerously-skip-permissions --permission-mode bypassPermissions",
-  codex: "codex.ts buildCodexThreadRequest: approvalPolicy never, sandbox danger-full-access",
+  codex: "@botiverse/oar runtimes/codex: approvalPolicy never, sandbox_mode danger-full-access",
   grok: "grok.ts GROK_AGENT_ARGS: --always-approve",
   copilot: "copilot.ts buildCopilotArgs: --allow-all-tools --allow-all-paths",
   cursor: "cursor.ts buildCursorArgs: --force",
@@ -22,7 +22,7 @@ export const RUNTIME_FULL_ACCESS: Readonly<Record<string, string>> = {
   kimi: "kimi.ts buildKimiArgs: --yolo",
   "kimi-sdk": "kimi-sdk.ts: the session's approval handler approves every call",
   opencode: "opencode.ts: --dangerously-skip-permissions (1.x), --auto (2.x)",
-  antigravity: "antigravity.deprecated.ts buildAntigravityArgs: --dangerously-skip-permissions",
+  antigravity: "antigravity.ts buildAntigravityArgs: --dangerously-skip-permissions",
   pi: "pi.ts / piCommandTool.ts: an in-process bash tool with no sandbox",
   builtin: "pi.ts BuiltInDriver: the pi bash tool with no sandbox",
 };

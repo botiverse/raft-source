@@ -10,6 +10,15 @@ export type InvalidAnswerCategory = "no_such_option" | "missing_input" | "unexpe
 /** What an agent can type as an option key. */
 const OPTION_KEY = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
+/**
+ * Whether `key` is something an ask may name an option (a plain word), so an
+ * answer path that checks a typed choice before running anything (the
+ * daemon's answer tool) accepts exactly what an ask can offer.
+ */
+export function isContinuationOptionKey(key: string): boolean {
+  return OPTION_KEY.test(key);
+}
+
 /** Throws on an ask no answer could satisfy or an agent could not type (a bug in the command). */
 export function assertAskSpec(askId: string, spec: AskSpec): void {
   const { options, expiresInMs } = spec;
@@ -23,7 +32,7 @@ export function assertAskSpec(askId: string, spec: AskSpec): void {
   if (spec.input !== undefined) throw new Error(`continuation ask "${askId}" takes options or input, not both`);
   const keys = Object.keys(options);
   if (keys.length === 0) throw new Error(`continuation ask "${askId}" has no options`);
-  const bad = keys.find((key) => !OPTION_KEY.test(key));
+  const bad = keys.find((key) => !isContinuationOptionKey(key));
   if (bad !== undefined) throw new Error(`continuation ask "${askId}" has option key "${bad}", which is not a plain word`);
 }
 

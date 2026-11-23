@@ -1,13 +1,33 @@
 import { useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
-import type { DesktopWebPreviewBounds } from "@botiverse/raft-shared";
+import type { DesktopWebPreviewBounds, DesktopWebPreviewHideOptions } from "@botiverse/raft-shared";
 
 import { useOverlayCovers } from "./webPreviewOverlays";
 
-/** What a placeholder needs of the shell: the single view's bridge, or the tabs' (both have these two). */
+/** What a placeholder needs of the shell: the single view's bridge, or the tabs' (both have these). */
 export interface NativeViewPlacement {
   setBounds(bounds: DesktopWebPreviewBounds): void;
-  setVisible(visible: boolean): Promise<string | null>;
+  setVisible(visible: boolean, options?: DesktopWebPreviewHideOptions): Promise<string | null>;
+  /** Absent on older shells: hiding there snapshots and hides at once. */
+  capture?(): Promise<string | null>;
+}
+
+function isStill(image: unknown): image is string {
+  return typeof image === "string" && image.startsWith("data:image/");
+}
+
+/** Resolves once the image is decoded (or failed to), so an <img> of it paints on its first frame. */
+function decoded(image: string): Promise<void> {
+  if (typeof Image === "undefined") return Promise.resolve();
+  const element = new Image();
+  element.src = image;
+  return typeof element.decode === "function" ? element.decode().catch(() => {}) : Promise.resolve();
+}
+
+/** Resolves after the next frame has been painted (the one a render committed just now shows in). */
+function painted(): Promise<void> {
+  if (typeof requestAnimationFrame === "undefined") return Promise.resolve();
+  return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
 }
 
 /**
@@ -17,7 +37,9 @@ export interface NativeViewPlacement {
  * resizes or anything scrolls, and keeps the overlay rule: the native view
  * draws above every DOM layer, so while a raft-ui overlay overlaps the
  * placeholder (webPreviewOverlays.ts) the view hides and the placeholder
- * shows the still the shell took of it. Returns whether it is covered and
+ * shows the still the shell took of it. On shells that can capture without
+ * hiding, the view hides only once that still is painted, so the placeholder
+ * is never blank in between (#proj-deskop:#15). Returns whether it is covered and
  * that still. `stillKey` names the page the still is of (the tab): a still
  * of another one is never shown.
  */
@@ -31,12 +53,17 @@ export function useNativeViewPlaceholder(
   const stillKeyRef = useRef(stillKey);
   stillKeyRef.current = stillKey;
 
-  // The placeholder's box → the view's bounds.
+  // The placeholder's box → the view's bounds. A resize (the placeholder's
+  // own or the window's) reports at once: the layout is fresh then, and
+  // waiting a frame left the native view a frame or two behind the
+  // placeholder while the window was dragged (#proj-deskop:#14). Scrolls,
+  // which can come many times a frame, still report once a frame.
   useEffect(() => {
     const element = placeholderRef.current;
     if (!element) return;
     let frame = 0;
     const send = () => {
+      if (frame) cancelAnimationFrame(frame);
       frame = 0;
       const rect = element.getBoundingClientRect();
       view.setBounds({ x: rect.left, y: rect.top, width: rect.width, height: rect.height });
@@ -45,14 +72,14 @@ export function useNativeViewPlaceholder(
       if (!frame) frame = requestAnimationFrame(send);
     };
     send();
-    const resize = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(schedule);
+    const resize = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(send);
     resize?.observe(element);
-    window.addEventListener("resize", schedule);
+    window.addEventListener("resize", send);
     // Capture: a scroll in any ancestor moves the placeholder.
     window.addEventListener("scroll", schedule, true);
     return () => {
       resize?.disconnect();
-      window.removeEventListener("resize", schedule);
+      window.removeEventListener("resize", send);
       window.removeEventListener("scroll", schedule, true);
       if (frame) cancelAnimationFrame(frame);
     };
@@ -62,9 +89,26 @@ export function useNativeViewPlaceholder(
   const covered = useOverlayCovers(placeholderRef);
   useEffect(() => {
     let current = true;
-    if (covered) {
+    if (covered && view.capture) {
+      // Still first, view after: capture (the view keeps showing), paint the still here, then hide.
+      const key = stillKeyRef.current;
+      void view.capture().catch(() => null).then(async (image) => {
+        if (!current) return;
+        if (isStill(image)) {
+          await decoded(image);
+          if (!current) return;
+          setStill({ key, image });
+          await painted();
+          if (!current) return;
+        } else {
+          setStill(null);
+        }
+        // Hidden even without a still (the capture failed): the overlay must not stay under the view.
+        await view.setVisible(false, { snapshot: false });
+      }).catch(() => {});
+    } else if (covered) {
       void view.setVisible(false).then((image) => {
-        if (current) setStill(typeof image === "string" && image.startsWith("data:image/") ? { key: stillKeyRef.current, image } : null);
+        if (current) setStill(isStill(image) ? { key: stillKeyRef.current, image } : null);
       }, () => {});
     } else {
       void view.setVisible(true).then(() => {

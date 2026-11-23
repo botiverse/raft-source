@@ -361,6 +361,13 @@ async function quotaWritableChannelIds(serverId: string, _now?: Date): Promise<S
   return new Set(allChannels.slice(0, maxChannels).map((c) => c.id));
 }
 
+/** isChannelReadOnlyByQuota for many channels of one server at once: the read-only ones (one plan read, at most one channel list). */
+export async function channelIdsReadOnlyByQuota(serverId: string, channelIds: readonly string[], _now?: Date): Promise<Set<string>> {
+  if (channelIds.length === 0) return new Set();
+  const writableIds = await quotaWritableChannelIds(serverId, _now);
+  return writableIds === null ? new Set() : new Set(channelIds.filter((id) => !writableIds.has(id)));
+}
+
 /**
  * Check if a channel is read-only due to quota.
  * When a server has more channels than the plan allows, the newest channels

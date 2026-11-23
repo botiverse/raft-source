@@ -34,3 +34,18 @@ export async function seedBoundGuest(
     .onConflictDoNothing();
   return channelId;
 }
+
+/**
+ * A Guest's channel_humans row in a channel other than its bound one: what
+ * addHuman refuses now (GUEST_OTHER_CHANNEL_MESSAGE) but older data may still
+ * hold. Inserted directly, for tests that check such a stray row grants the
+ * Guest nothing (canGuestReadChannel reads only the bound channel).
+ */
+export async function seedStrayGuestChannelRow(
+  input: { channelId: string; userId: string },
+  executor: DatabaseExecutor = getDb(),
+): Promise<void> {
+  await executor.insert(channelHumans)
+    .values({ channelId: input.channelId, userId: input.userId, role: "member" })
+    .onConflictDoNothing();
+}

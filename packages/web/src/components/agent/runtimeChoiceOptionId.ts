@@ -1,13 +1,12 @@
 /**
  * A runtime choice's id line (RuntimeChoiceCombobox) shows a real model or
  * provider id only. The v2 form's "Default" row (`__runtime_form_v2_default__`)
- * and a saved Provider connection (`connection:<id>`, the server's
- * SAVED_CONNECTION_VALUE_PREFIX) are internal values, never shown; neither is
- * an id that only repeats the label.
+ * is an internal value, never shown; neither is an id that only repeats the
+ * label.
  */
 export function shownOptionId(value: string, label: string): string | null {
   if (label === value) return null;
-  if (value.startsWith("__") || value.startsWith("connection:")) return null;
+  if (value.startsWith("__")) return null;
   return value;
 }
 

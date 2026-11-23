@@ -206,6 +206,12 @@ test("C: the owner's Upgrade on Beta's row opens the upgrade dialog on this page
   assert.ok(within(dialog).getByText("Beta's Free plan allows 1 external channel. Pro has no limit."));
   // Beta's billing, read for Beta: its seats start at its people and agents.
   await waitFor(() => assert.equal(screen.getByTestId("upgrade-dialog-seats").textContent, "5"));
+  // Why 5: what Beta's people and agents use, broken down the way Plan & billing shows it.
+  assert.equal(screen.getByTestId("upgrade-dialog-seats-in-use").textContent, "In use on this server: 4.3 seats, rounded up to 5.");
+  const breakdown = screen.getByTestId("upgrade-dialog-seats-breakdown");
+  assert.equal(within(breakdown).getByText("4 people").nextElementSibling?.textContent, "4 seats");
+  assert.equal(within(breakdown).getByText("3 agents").nextElementSibling?.textContent, "0.3 seats (1 per 10 agents)");
+  assert.equal(screen.getByTestId("upgrade-dialog-seat-remove").hasAttribute("disabled"), true, "never below what is used");
   assert.ok(gets.some((call) => call.url === "/billing/subscription" && call.serverHeader === "s-beta"));
   assert.ok(!gets.some((call) => call.url === "/billing/subscription" && call.serverHeader !== "s-beta"), "no other server's billing");
 

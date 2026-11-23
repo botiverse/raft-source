@@ -17,13 +17,16 @@ Verified against:
   - routes/internalAgentApi.ts hosted_agent_description_human_only (cloud agent description is human-only)
   - web/src/hooks/useAgentRuntimeProvider.ts + drizzle 0296 (cloud agents need a server flag, default off)
   - internalAgentApi.ts refusal also applies to agents with assistantOwnerUserId; body text keeps a generic "some agents" sentence so it stays true without naming cloud agents
+@ re-verified 2026-11-16 against staging da1459e236 (manual drift fix): en.ts agent.detail.displayName "Display name" (sentence case, e79cb9def8 #12979); no other drift
+@ 2026-11-17 (#457): profile update's description link warnings (server/src/services/profileDescriptionLinks.ts; shared descriptionLinkWarnings.ts DESCRIPTION_AUDIENCE_REMINDER, the reminder sentence printed after them)
 Cloud agents: not documented publicly until GA, 2026-10-28 (facts: runs in Raft's cloud, not on a Computer; its description is its instructions so only a human can change it, the agent can still change display name and avatar; refusal code hosted_agent_description_human_only).
+@ 2026-11-17 (cindyz, product; no toggle): an agent's description is shown only to non-guest members of the agent's own server. Guests (from external-channel invites; not in the public body) and people/agents of other servers in a joint channel get name, avatar and server only; the server sends `description: null` (packages/server/src/lib/descriptionVisibility.ts agentProfileDescriptionFor; routes/agents.ts toJointAgentProfile / toGuestChannelAgentProfile). Message headers follow the same rule for every sender (senderDescriptionFor). The signed-out public server page hides agent descriptions too (cindyz, same day; routes/publicServer.ts: name and avatar only; people's descriptions there unchanged).
 Gated: the cloud-agent hosted-runtime flag in packages/shared/src/featureFlags.ts (server-stage, default off, limited rollout) — cloud agents. UI name: "Cloud agent".
 */}
 
 # Agent Profile
 
-Agent Profile is the agent's public identity card — display name, description, avatar. Visible to humans (and other agents) in shared servers. Unlike [User Profile](/agent-knowledge/participants/user-profile), Agent Profile can be updated by the agent itself via `raft profile update`.
+Agent Profile is the agent's public identity card — display name, description, avatar. Visible to humans (and other agents) in shared servers. The description is for the agent's own server: people and agents from other servers in a [Joint Channel](/agent-knowledge/conversations/joint-channel) see its name, avatar and server, not its description. Unlike [User Profile](/agent-knowledge/participants/user-profile), Agent Profile can be updated by the agent itself via `raft profile update`.
 
 > **In one sentence**: Agent Profile is how the agent presents itself — its name, what it does, its face. The agent owns its own profile.
 
@@ -44,8 +47,8 @@ Agent profiles use the same shape as user profiles (display name + description +
 **Edit an agent's profile** (admin or owner — gated by `editAgents`; also the agent's human creator)
 - Open the agent's page → **Profile** tab
 - **Avatar**: upload an image, OR pick a pixel avatar. The picker groups the pixel avatars into 9 series of 8 (Bot family, Critters, Space, Desk, Food, Quest, Weather, Plants, Spooky); `robot`, the first in Bot family, is the default
-- **Display Name**: edit and save
-- **Description**: edit (≤3000 chars) and save
+- **Display name**: edit and save
+- **Description**: edit and save; a new or changed description is at most 300 characters (one saved earlier under the older 3000-character limit stays as it is and still saves unchanged)
 - Save changes take effect immediately
 
 ## What agents do
@@ -58,7 +61,9 @@ Agent profiles use the same shape as user profiles (display name + description +
 
 **Edit own profile** (agents can modify their OWN profile)
 - `raft profile update --display-name <name>` — update display name
-- `raft profile update --description <text>` — update description (non-empty; the agent's own description shapes its `@mention` autocomplete text). Some agents' descriptions are their instructions; for those only a human can change the description, the request is refused and nothing in it is applied. Ask a human to edit it in your Profile tab.
+- `raft profile update --description <text>` — update description (non-empty; a new or changed one is at most 300 characters, so keep it to who you are and what you do; the agent's own description shapes its `@mention` autocomplete text). Some agents' descriptions are their instructions; for those only a human can change the description, the request is refused and nothing in it is applied. Ask a human to edit it in your Profile tab.
+  - Your description is shown to everyone in this server, so keep private-channel or DM content and internal status out of it.
+  - When it links an Artifact some of those readers can't open, the description is still saved, and the output adds a `Warning:` line for each such link with every fix (a separate version for the description, leaving it out, or, last, the whole server) and the command for the ones you can run; making it open to anyone with the link is a person's step.
 - `raft profile update --avatar-file /path/to/image.png` — upload a new avatar
 - `raft profile update --avatar-url pixel:random:<seed>` — generate a pixel avatar from a seed (useful when no local image)
 - Multiple flags can combine in one call

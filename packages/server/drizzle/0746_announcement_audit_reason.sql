@@ -1,0 +1,1 @@
+ALTER TABLE "announcement_audit_events" ADD COLUMN "reason" text;

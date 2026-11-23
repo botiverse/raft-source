@@ -266,6 +266,25 @@ test("Grok (B9): an agent's own record is watched in $GROK_HOME/auth.json", asyn
   expect(ledger.hasInvalid("agent:agent-1")).toBe(false);
 });
 
+test("DeepSeek Harness: a key saved in dsh's settings ($DSH_HOME/.credentials.yaml, ~/.dsh by default) releases, shared or the agent's own DSH_HOME", async () => {
+  const shared = path.join(home, ".dsh", ".credentials.yaml");
+  write(shared, "{}\n");
+  const own = path.join(home, "dsh-home", ".credentials.yaml");
+  write(own, "{}\n");
+  const { ledger, watch, hold } = setup();
+  hold("shared:dsh");
+  hold("agent:agent-1", promptConfig({ runtime: "dsh", envVars: { DSH_HOME: path.join(home, "dsh-home") } }));
+  write(shared, "DEEPSEEK_API_KEY: saved\n");
+  bumpMtime(shared);
+  await watch.check();
+  expect(ledger.hasInvalid("shared:dsh")).toBe(false);
+  expect(ledger.hasInvalid("agent:agent-1"), "its own home did not change").toBe(true);
+  write(own, "DEEPSEEK_API_KEY: own\n");
+  bumpMtime(own);
+  await watch.check();
+  expect(ledger.hasInvalid("agent:agent-1")).toBe(false);
+});
+
 test("Kimi: the daemon's own token write is not a sign-in; the user's is", async () => {
   const credentials = path.join(home, ".kimi-code", "credentials");
   const file = path.join(credentials, "kimi-code.json");

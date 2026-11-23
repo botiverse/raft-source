@@ -7,16 +7,18 @@
 // the same through the notice outbox.
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { asServerId } from "@botiverse/raft-shared";
 
 import { createApiTest } from "../test/integration/apiTest";
 import { fixturePasswordHash } from "../test/integration/credentials";
 import { getDb } from "../db/index";
-import { servers, thirdPartyAgentEvents, users } from "../db/schema";
+import { channels, servers, thirdPartyAgentEvents, users } from "../db/schema";
 import { createServer } from "../services/serverService";
 import { createAgent } from "../services/agentService";
-import { addAgent, addHuman, createChannel } from "../services/channelService";
+import { addAgent, addHuman, createChannel, findOrCreateDM, getOrCreateThread } from "../services/channelService";
+import { createMessage } from "../services/messageService";
+import { renderRelatedTargets } from "../services/agentInboxItems";
 import { createOAuthClient, requestAgentAccess } from "../services/oauthService";
 import { appNoticeOutbox } from "../services/firstPartyAppHost";
 import { firstPartyAppOfSystemApp } from "../apps/firstPartyApps";
@@ -79,7 +81,7 @@ async function seed(app: { baseUrl: string }) {
     });
     return { status: res.status, body: await res.json() as any };
   };
-  return { server, agent, general, hidden, client, send };
+  return { owner: owner!, server, agent, general, hidden, client, send };
 }
 
 async function stored(id: string) {
@@ -143,6 +145,71 @@ test("D8: object.conversation is kept when the receiving agent can open it, and 
   }
   assert.deepEqual(hidden.body.warnings, unknown.body.warnings, "the same answer for a conversation that exists and one that does not");
   assert.deepEqual(hidden.body.warnings, ["object.conversation was not kept: the receiving agent can't open that conversation. The notice was accepted without it."]);
+});
+
+test("D8: a thread form naming a message no one has replied to is kept as that message's thread, created as message send creates it, and listed as <parent>:<msg8>", async ({ app }) => {
+  const s = await seed(app);
+  const conversationOf = async (res: { status: number; body: any }) => {
+    assert.equal(res.status, 202, JSON.stringify(res.body));
+    return (await stored(res.body.id)).relatedChannelId;
+  };
+  const threadOf = async (channelId: string | null) => {
+    assert.ok(channelId, "kept");
+    const [row] = await getDb().select({ type: channels.type, parentMessageId: channels.parentMessageId }).from(channels).where(eq(channels.id, channelId));
+    return row!;
+  };
+  const listed = async (channelId: string) => (await renderRelatedTargets(s.server.id, s.agent.id, [channelId])).get(channelId);
+
+  // A channel the agent is in, a message with no replies (no thread yet).
+  const root = await createMessage(s.general.id, "user", s.owner.id, "ship it?");
+  const inChannel = await s.send({ object: { ref: "pr-1", conversation: `#${s.general.name}:${root.id.slice(0, 8)}` } });
+  const channelThread = await conversationOf(inChannel);
+  assert.deepEqual(await threadOf(channelThread), { type: "thread", parentMessageId: root.id });
+  assert.equal(inChannel.body.warnings, undefined);
+  assert.equal(await listed(channelThread!), `#${s.general.name}:${root.id.slice(0, 8)}`, "the inbox names it as the agent wrote it");
+  // The same notice again finds the same thread.
+  assert.equal(await conversationOf(await s.send({ object: { ref: "pr-1", conversation: `#${s.general.name}:${root.id.slice(0, 8)}` } })), channelThread);
+
+  // The same in a DM.
+  const dm = await findOrCreateDM(s.server.id, s.owner.id, s.agent.id);
+  assert.ok(dm);
+  const dmRoot = await createMessage(dm.id, "user", s.owner.id, "can you look?");
+  const inDm = await s.send({ object: { ref: "pr-1", conversation: `dm:@${s.owner.name}:${dmRoot.id.slice(0, 8)}` } });
+  const dmThread = await conversationOf(inDm);
+  assert.deepEqual(await threadOf(dmThread), { type: "thread", parentMessageId: dmRoot.id });
+  assert.equal(await listed(dmThread!), `dm:@${s.owner.name}:${dmRoot.id.slice(0, 8)}`);
+
+  // An existing thread still resolves (to itself).
+  const replied = await createMessage(s.general.id, "user", s.owner.id, "already discussed");
+  const existing = await getOrCreateThread(replied.id, s.owner.id, "user");
+  assert.equal(await conversationOf(await s.send({ object: { ref: "pr-1", conversation: `#${s.general.name}:${replied.id.slice(0, 8)}` } })), existing.id);
+});
+
+test("D8: a thread form the agent may not post in, or naming no message, is dropped with the same warning and starts no thread", async ({ app }) => {
+  const s = await seed(app);
+  // A public channel the agent is not in (it could read it, not post in it), and the private one it can't see.
+  const elsewhere = await createChannel(s.server.id, `elsewhere-${randomUUID().slice(0, 8)}`);
+  await addHuman(elsewhere.id, s.owner.id);
+  const publicRoot = await createMessage(elsewhere.id, "user", s.owner.id, "not for the agent");
+  const hiddenRoot = await createMessage(s.hidden.id, "user", s.owner.id, "secret");
+  const generalRoot = await createMessage(s.general.id, "user", s.owner.id, "in general");
+  const dropped = [
+    await s.send({ object: { ref: "pr-1", conversation: `#${elsewhere.name}:${publicRoot.id.slice(0, 8)}` } }),
+    await s.send({ object: { ref: "pr-1", conversation: `#${s.hidden.name}:${hiddenRoot.id.slice(0, 8)}` } }),
+    // A message of another channel, named under one the agent is in.
+    await s.send({ object: { ref: "pr-1", conversation: `#${s.general.name}:${hiddenRoot.id.slice(0, 8)}` } }),
+    // No such message.
+    await s.send({ object: { ref: "pr-1", conversation: `#${s.general.name}:00000000` } }),
+    await s.send({ object: { ref: "pr-1", conversation: `dm:@${s.owner.name}:00000000` } }),
+  ];
+  for (const res of dropped) {
+    assert.equal(res.status, 202, JSON.stringify(res.body));
+    assert.equal((await stored(res.body.id)).relatedChannelId, null);
+    assert.deepEqual(res.body.warnings, ["object.conversation was not kept: the receiving agent can't open that conversation. The notice was accepted without it."]);
+  }
+  const started = await getDb().select({ id: channels.id }).from(channels)
+    .where(inArray(channels.parentMessageId, [publicRoot.id, hiddenRoot.id, generalRoot.id]));
+  assert.deepEqual(started, [], "no thread started");
 });
 
 test("D11: a first-party app's notice carries its object ref and related conversation through the outbox; a malformed ref is refused", async ({ app }) => {

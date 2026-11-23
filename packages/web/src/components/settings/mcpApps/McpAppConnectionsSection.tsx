@@ -22,8 +22,8 @@ function explained(error: unknown, formatMessage: Parameters<typeof mcpAppErrorM
 
 /**
  * An MCP App's Connections: the accounts (OAuth) or keys (API-key headers) Agents call it with.
- * Agents may use the server default or a Connection created by their owner; unpinned Agents
- * follow the default. An auth-less App has no Connections.
+ * Unpinned Agents follow the server default; an admin may pin an Agent to any shared Connection
+ * (RFC 087). An auth-less App has no Connections.
  */
 export function McpAppConnectionsSection({
   view,

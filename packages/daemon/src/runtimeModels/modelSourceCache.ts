@@ -4,6 +4,22 @@ import type { RuntimeModelSourceOutcome } from "@botiverse/raft-shared";
 export const RUNTIME_MODEL_CACHE_FRESH_MS = 60_000;
 
 /**
+ * Runtimes whose listing is costly to repeat. Antigravity's (OAR 0.115) opens
+ * an agy session and switches through every model to read each one's effort
+ * levels; each listing leaves an agy conversation record (~390 KB) in the
+ * person's profile. Its list therefore stays fresh for a day. Each catalog
+ * round re-detects and replaces it: on connect (a changed agy version lifts
+ * the 30-minute reconnect throttle; the agy version is read only then), on
+ * every rescan or Upgrade, and on a sign-in or sign-out of Antigravity from
+ * Raft (runtimeAuthHost). The form's refresh action (`force`) bypasses it. An
+ * agy updated or re-signed outside Raft while the Computer stays connected
+ * keeps the old list until one of those, at most a day.
+ */
+export const RUNTIME_MODEL_CACHE_FRESH_MS_BY_RUNTIME: Readonly<Record<string, number>> = {
+  antigravity: 24 * 60 * 60_000,
+};
+
+/**
  * How a cached read was answered:
  *  - `fresh`  — a live list younger than the fresh window, no detection run;
  *  - `stale`  — an older live list, returned at once while a refresh runs in the background;
@@ -29,7 +45,8 @@ export type RuntimeModelDetect = (mode: "foreground" | "background") => Promise<
  * open back into a blocking wait.
  *
  * Runtime model lists are usable-now answers (login, plan and config change
- * them), so the cache is short and a caller can always force a fresh read.
+ * them), so the cache is short (except RUNTIME_MODEL_CACHE_FRESH_MS_BY_RUNTIME)
+ * and a caller can always force a fresh read.
  */
 export class RuntimeModelSourceCache {
   private readonly entries = new Map<string, { outcome: LiveOutcome; atMs: number }>();
@@ -47,11 +64,19 @@ export class RuntimeModelSourceCache {
   ): Promise<{ outcome: RuntimeModelSourceOutcome; cache: RuntimeModelCacheRead }> {
     const entry = options.force ? undefined : this.entries.get(runtime);
     if (entry) {
-      if (this.now() - entry.atMs < this.freshMs) return { outcome: entry.outcome, cache: "fresh" };
+      if (this.now() - entry.atMs < (RUNTIME_MODEL_CACHE_FRESH_MS_BY_RUNTIME[runtime] ?? this.freshMs)) return { outcome: entry.outcome, cache: "fresh" };
       this.refreshInBackground(runtime, detect);
       return { outcome: entry.outcome, cache: "stale" };
     }
     return { outcome: await this.detectAndStore(runtime, () => detect("foreground")), cache: options.force ? "forced" : "miss" };
+  }
+
+  /**
+   * The last live list for `runtime`, whatever its age, with no detection run:
+   * for a start that only wants to know what the Computer last listed.
+   */
+  peek(runtime: string): LiveOutcome["value"] | null {
+    return this.entries.get(runtime)?.outcome.value ?? null;
   }
 
   /** Record a detection run elsewhere (the connect-time catalog push), so it warms the cache too. */

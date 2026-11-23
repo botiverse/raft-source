@@ -2344,7 +2344,7 @@ test("private shared app invites install canonical third-party clients without m
   });
   assert.equal(badTokenInviteRes.status, 404);
   const invalidInvite = await badTokenInviteRes.json();
-  assert.deepEqual(invalidInvite, { error: "This private app invite is invalid or has expired", code: "private_app_invite_invalid" });
+  assert.deepEqual(invalidInvite, { error: "This private app invite is invalid or has expired", code: "private_app_invite_invalid", errorCode: "private_app_invite_invalid" });
   const outsiderInviteBeforeRes = await fetch(`${app.baseUrl}/api/integration-invites/${share.token}`, {
     headers: { Authorization: `Bearer ${outsiderToken}` },
   });
@@ -3146,6 +3146,7 @@ test("DELETE /api/integrations/clients/:clientId removes a server-local app and 
     serverId: server.id,
     createdByUserId: owner.id,
     clientId: `delete-${suffix.slice(0, 8)}`,
+    vouchAsCreator: true, // the owner's App: every agent here is granted it
     name: "Delete App",
     description: "Delete me",
     homepageUrl: "https://delete.example.test",
@@ -3383,6 +3384,46 @@ test("server-local permission save atomically installs its source and grants ins
 // task #319 — `whenToUse`: the Web PATCH path runs the same shared validator
 // as the agent `app update` route. Pin the happy path and each rejection class
 // so the two surfaces cannot drift apart.
+test("PATCH /api/integrations/clients/:id refuses fields it does not read, naming them, and changes nothing", async ({ app }) => {
+  const suffix = randomUUID();
+  const owner = await seedUser(`patch-unknown-${suffix}@slock.test`, `Patch Unknown ${suffix}`);
+  const server = await createServer("Patch Unknown", `patch-unknown-${suffix}`, owner.id);
+  const ownerToken = await tokenForHuman(owner.email);
+  const { client } = await createOAuthClient({
+    serverId: server.id,
+    createdByUserId: owner.id,
+    clientId: `patch-unknown-${suffix.slice(0, 8)}`,
+    name: "Patch Unknown App",
+    description: "demo",
+    returnUrl: "https://example.test/callback",
+  });
+  const patch = (body: Record<string, unknown>) =>
+    fetch(`${app.baseUrl}/api/integrations/clients/${client.id}`, {
+      method: "PATCH",
+      headers: { "Authorization": `Bearer ${ownerToken}`, "X-Server-Id": server.id, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+  const disable = await patch({ enabled: false });
+  assert.equal(disable.status, 400);
+  const disableBody = await disable.json() as { code?: string; error?: string };
+  assert.equal(disableBody.code, "APP_UPDATE_UNKNOWN_FIELD");
+  assert.match(disableBody.error ?? "", /"enabled"/);
+  assert.match(disableBody.error ?? "", /delete the App/);
+
+  // A known field next to an unknown one is not applied either: the whole request is refused.
+  const mixed = await patch({ name: "Renamed", bogus: 1 });
+  assert.equal(mixed.status, 400);
+  assert.match((await mixed.json() as { error?: string }).error ?? "", /"bogus"/);
+
+  const [stored] = await getDb().select({ name: oauthClients.name, enabled: oauthClients.enabled }).from(oauthClients).where(eq(oauthClients.id, client.id));
+  assert.equal(stored?.name, "Patch Unknown App");
+  assert.equal(stored?.enabled, true);
+
+  const ok = await patch({ name: "Renamed" });
+  assert.equal(ok.status, 200, await ok.clone().text());
+});
+
 test("PATCH /api/integrations/clients/:id applies the shared whenToUse validator", async ({ app }) => {
   const suffix = randomUUID();
   const owner = await seedUser(`when-to-use-${suffix}@slock.test`, `When To Use ${suffix}`);

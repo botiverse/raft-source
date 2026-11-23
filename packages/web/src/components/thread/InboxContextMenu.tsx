@@ -1,7 +1,7 @@
-import { useCallback, useMemo } from "react";
+import { useCallback } from "react";
 import { useIntl } from "react-intl";
 import { Bell, BellOff, Check, MessageSquareCheck, MessageSquareDot } from "lucide-react";
-import { ContextMenuPopup, ScrollArea } from "@botiverse/raft-ui";
+import { ScrollArea } from "@botiverse/raft-ui";
 import { FollowThreadIcon, UnfollowThreadIcon } from "@botiverse/ricons";
 import { canToggleActivityMute } from "../../store/channelDomain";
 import { useChannelStore } from "../../store/channelStore";
@@ -13,11 +13,17 @@ import { canToggleActivityRowRead, followActivityThread, toggleActivityMuteRepor
 import type { ThreadInboxItem } from "./inboxRowActions";
 import { itemFilterChannelLabel } from "./inboxChannelFilter";
 import { loungeTitleNow } from "../agent/agentLounge";
+import { AnchoredMenuPopover } from "../ui/AnchoredMenuPopover";
 import MenuItem from "../ui/MenuItem";
-import type { InboxContextMenuPosition } from "./inboxContextMenuPosition";
+import type { PopupAnchorTarget } from "../ui/popupAnchor";
+
+export interface InboxContextMenuState {
+  anchor: PopupAnchorTarget;
+  item: InboxItem;
+}
 
 export function InboxContextMenu({ ctxMenu, onClose, onDone, onUnfollow }: {
-  ctxMenu: InboxContextMenuPosition;
+  ctxMenu: InboxContextMenuState;
   onClose: () => void;
   /** The row's Mark as Done handler (with its Undo toast), so the menu, the row's button and the swipe do the same thing. */
   onDone: (item: InboxItem) => void;
@@ -44,14 +50,6 @@ export function InboxContextMenu({ ctxMenu, onClose, onDone, onUnfollow }: {
   // Marked unread with no count is unread too: its item is Mark as Read.
   const markedUnread = useScopeMarkedUnread(inboxItemChannelId(item));
   const showsUnread = item.unreadCount > 0 || markedUnread;
-
-  const style = useMemo(() => ({
-    left: ctxMenu.x,
-    top: ctxMenu.y,
-    width: 184,
-    maxWidth: ctxMenu.maxWidth,
-    maxHeight: ctxMenu.maxHeight,
-  }), [ctxMenu.x, ctxMenu.y, ctxMenu.maxWidth, ctxMenu.maxHeight]);
 
   // The same action as a phone's right swipe (inboxRowActions). The menu
   // closes at once, as every other item's does: the row already shows the
@@ -89,9 +87,12 @@ export function InboxContextMenu({ ctxMenu, onClose, onDone, onUnfollow }: {
   }, [formatMessage, muteChannel, onClose]);
 
   return (
-    <ContextMenuPopup
-      className="fixed z-popup select-none p-0"
-      style={style}
+    <AnchoredMenuPopover
+      open
+      anchor={ctxMenu.anchor}
+      onAnchorHidden={onClose}
+      role="menu"
+      className="min-w-0 w-[184px] max-w-(--available-width) p-0"
       data-testid="activity-context-menu"
     >
       {/* The popup is the frame (max height, rounded clip); the items scroll
@@ -142,6 +143,6 @@ export function InboxContextMenu({ ctxMenu, onClose, onDone, onUnfollow }: {
         </MenuItem>
       )}
       </ScrollArea>
-    </ContextMenuPopup>
+    </AnchoredMenuPopover>
   );
 }

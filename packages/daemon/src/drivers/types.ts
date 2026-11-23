@@ -1,7 +1,7 @@
 import type { TurnEndCompactionDriverOutcome, TurnEndContextFacts } from "../turnEndCompaction";
 import type { ChildProcess } from "node:child_process";
 import type { RuntimeCompactionInterruption } from "@botiverse/raft-shared";
-import type { ActiveSpan, AgentConfig, AgentMessage, RuntimeModelSourceOutcome, SubagentLineage, Tracer, AxSurfaceText } from "@botiverse/raft-shared";
+import type { ActiveSpan, AgentConfig, AgentMessage, RuntimeModelSet, RuntimeModelSourceOutcome, SubagentLineage, Tracer, AxSurfaceText } from "@botiverse/raft-shared";
 import type { AgentProxyInboxCoordinator } from "../agentCredentialProxy";
 import type { AgentAppInboxStore } from "../agentAppInbox";
 import type { RuntimeTurnOrigin, RuntimeTurnOriginReader } from "../runtimeTurnOrigin";
@@ -146,7 +146,10 @@ export type ParsedEvent =
   // turn end has not come yet (Pi: after agent_end, before agent_settled).
   // It says nothing about whether the session takes a new prompt.
   | { kind: "compaction_started"; cycleId?: number; afterRunEnd?: true }
-  | { kind: "compaction_finished"; cycleId?: number }
+  // `contextBeforeTokens` / `contextAfterTokens`: the context the compaction
+  // started from and left, when the runtime reports them (Claude's
+  // `compact_metadata.pre_tokens` / `post_tokens`). Absent: not reported.
+  | { kind: "compaction_finished"; cycleId?: number; contextBeforeTokens?: number; contextAfterTokens?: number }
   | {
       kind: "compaction_interrupted";
       cycleId?: number;
@@ -179,14 +182,23 @@ export type ParsedEvent =
        * progress); `quota_exhausted` means the window is used up until it
        * resets, `transient_rate_limit` is a short throttle. `resetsAt` is only
        * set when the runtime reported it; it is never inferred.
+       * `rateLimitType` is the limiting window when the runtime named it
+       * (Claude Code's `rate_limit_info.rateLimitType`, e.g. `seven_day`).
        */
-      providerLimit?: { kind: "quota_exhausted" | "transient_rate_limit"; resetsAt?: string };
+      providerLimit?: { kind: "quota_exhausted" | "transient_rate_limit"; resetsAt?: string; rateLimitType?: ProviderQuotaRateLimitType };
       /**
        * The runtime's typed API error behind this one (Claude Code's `error` /
        * `api_error_code` and `api_error_status`): its codes and HTTP status,
        * never its wording. Read for the error's trace class and status.
        */
       providerError?: { codes?: string[]; httpStatus?: number };
+      /**
+       * The model declined to answer (Claude Code's `stop_reason: "refusal"`).
+       * Its message is `RUNTIME_MODEL_REFUSAL_MESSAGE`. The runtime did not
+       * fail: shown as the turn's error, but no delivery backoff and never
+       * counted toward the same-fingerprint fence.
+       */
+      modelRefusal?: true;
       compaction?: RuntimeCompactionInterruption;
       startupRequestMethod?:
         | "initialize"
@@ -213,7 +225,8 @@ export type ParsedEvent =
         | "codex_app_server_notification"
         | "claude_stream_event"
         | "claude_system_status"
-        | "grok_acp_notification";
+        | "grok_acp_notification"
+        | "antigravity_stream_event";
       itemType?: string;
       payloadBytes?: number;
       /** Category only (traceCategory): the role of a raw response message item. */
@@ -268,6 +281,17 @@ export type ParsedEvent =
     } & (
       | { severity: "warning"; source: "codex_app_server_notification" | "grok_acp_notification" }
       | { severity: "info"; source: "pi_empty_response"; itemType: "empty_response" | "whitespace_response" }
+      // OpenCode 2.x `background_wait`: the run waits for background jobs
+      // (`background_wait`), or the daemon stopped jobs still running after
+      // the bound (`background_wait_stopped`; OpenCodeDriver). `message`
+      // names the jobs' titles (command lines) and stays out of traces;
+      // `backgroundJobs` is the trace-safe part: count and bounded kinds.
+      | {
+          severity: "info";
+          source: "opencode_background_wait";
+          itemType: "background_wait" | "background_wait_stopped";
+          backgroundJobs: { count: number; kinds: string[]; capMinutes?: number };
+        }
     ))
   | {
       kind: "runtime_recovery";
@@ -367,6 +391,8 @@ export interface SpawnContext {
   slockHome?: string;
   launchId?: string | null;
   processInstanceId?: string | null;
+  /** The model list the Computer last detected for this runtime (any age, no detection run); null when none is cached. */
+  cachedRuntimeModels?: () => RuntimeModelSet | null;
   /**
    * task #1277 — cancels this start attempt. Aborted when the agent is stopped
    * or the attempt is replaced while the driver is still resolving or
@@ -386,6 +412,10 @@ export interface SpawnContext {
   agentCredentialProxyMessageCommitted?: AgentProxyInboxCoordinator["recordMessageCommitted"];
   /** A launch with no coordinator (the OAR host) still hears what the Server said about each message send. */
   agentCredentialProxySendOutcome?: AgentProxyInboxCoordinator["recordSendOutcome"];
+  /** Task #triage:#399: a launch with no coordinator (the OAR host) hears when the agent reads its inbox through the proxy. */
+  agentCredentialProxyInboxRead?: () => void;
+  /** Focus: a launch with no coordinator (the OAR host) says which seqs of a target its model was shown in full; they ride on its sends as `seenExactSeqs`. */
+  agentCredentialProxyExactSeenSeqs?: AgentProxyInboxCoordinator["getExactSeenSeqs"];
   /**
    * RFC 081: the agent's CURRENT `AgentConfig.inboxItems` (read at each call,
    * so a flag turned off later is honoured). The proxy's `inbox check`
@@ -506,6 +536,8 @@ export interface RuntimeExitInfo {
    * it is no evidence that the process is gone.
    */
   reason?: "requested" | "runtime_exit" | "error" | "timeout" | "kill_unconfirmed";
+  /** On `close` only: the exit was not followed by `close` within the grace (a child held the stdio), so the session released the process and drains the pipes. */
+  stdioHeldAfterExit?: { waitedMs: number };
 }
 
 export type RuntimeToolDiagnosticTrigger =
@@ -841,6 +873,14 @@ export interface RuntimeDriver {
    */
   probe?(): RuntimeProbeResult;
 
+  /**
+   * The same probe off the event loop, preferred by the detection round
+   * (`detectRuntimesAsync` in the `__detect-runtimes` child) where a driver
+   * has one: OAR's installation probes are asynchronous (OpenCode). The
+   * in-process synchronous round still calls `probe`.
+   */
+  probeAsync?(): Promise<RuntimeProbeResult>;
+
   /** Optional creation-time version policy for the exact launch candidate. */
   readonly launchVersionPolicy?: RuntimeLaunchVersionPolicy;
 
@@ -863,6 +903,19 @@ export interface RuntimeDriver {
    * ends through the ordinary `turn_end` path rather than by process exit.
    */
   parseStdoutEnd?(): ParsedEvent[];
+
+  /**
+   * Asked by the child-process session after every stdout line: until when
+   * the runtime's turn may go on before it is ended for it. A deadline at the
+   * same instant as the one already armed keeps running (a stray line does
+   * not restart it); another instant re-arms it; null cancels it. The driver
+   * decides which output moves or ends it. When it passes, the session emits `expire()`'s events (a `turn_end` among them,
+   * so a `terminate_on_turn_end` runtime is stopped through the ordinary turn
+   * end path) and, if no stop is in progress by then, stops the process
+   * itself. Null: no deadline. OpenCode 2.x: a finished reply followed by
+   * `background_wait` (see OpenCodeDriver).
+   */
+  quietOutputDeadline?(): RuntimeQuietOutputDeadline | null;
 
   /**
    * Current runtime-native session identity, if the driver can observe one.
@@ -923,6 +976,16 @@ export interface RuntimeDriver {
    * models. Runs on explicit model reads — not per-turn.
    */
   detectModels?(ctx?: RuntimeModelDetectionContext): Promise<RuntimeModelSourceOutcome>;
+}
+
+/** See RuntimeDriver.quietOutputDeadline. */
+export interface RuntimeQuietOutputDeadline {
+  /** Absolute time, on the Date.now() clock. */
+  atMs: number;
+  /** The events for a deadline that passed; empty when the driver no longer wants it. */
+  expire(): ParsedEvent[];
+  /** The session's own stop reason, when nothing else stopped the process on these events. */
+  stopReason: string;
 }
 
 export interface RuntimeModelDetectionContext {

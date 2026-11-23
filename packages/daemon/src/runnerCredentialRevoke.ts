@@ -1,7 +1,8 @@
 // Revoke a launch's managed runner credential when the launch ends; shared by
-// every agent host. Moved verbatim from AgentProcessManager.
+// every agent host (moved from AgentProcessManager).
 
 import type { AgentConfig } from "@botiverse/raft-shared";
+import { forgetRunnerCredentialLineage, runnerCredentialLineageIds } from "./runnerCredentialRenewal";
 
 export function revokeManagedRunnerCredential(input: {
   serverUrl: string;
@@ -13,9 +14,21 @@ export function revokeManagedRunnerCredential(input: {
   fetchImpl: (url: string, init?: RequestInit) => Promise<Response>;
   recordEvent(name: string, attrs: Record<string, unknown>, status?: "ok" | "error" | "cancelled"): void;
 }): void {
-  const { agentId, config, launchId } = input;
-  const credentialId = config.agentCredentialId;
-  if (!credentialId) return;
+  const rootId = input.config.agentCredentialId;
+  if (!rootId) return;
+  // #wg-rbac:#27: the config holds the launch's first credential; a renewal
+  // or re-mint replaced it, so revoke what it became too (the current key
+  // first matters most; the replaced ones expire within minutes anyway).
+  const credentialIds = runnerCredentialLineageIds(rootId);
+  forgetRunnerCredentialLineage(rootId);
+  for (const credentialId of credentialIds.reverse()) revokeRunnerCredentialById(input, credentialId);
+}
+
+export type RunnerCredentialRevokeTarget = Omit<Parameters<typeof revokeManagedRunnerCredential>[0], "config">;
+
+/** Revoke one runner credential by id (a renewal's key for a launch that ended meanwhile). */
+export function revokeRunnerCredentialById(input: RunnerCredentialRevokeTarget, credentialId: string): void {
+  const { agentId, launchId } = input;
   const url = new URL(
     `/internal/computer/runners/${encodeURIComponent(agentId)}/credentials/${encodeURIComponent(credentialId)}`,
     input.serverUrl,
@@ -59,14 +72,15 @@ export function carryHeldRunnerCredential(
   const incomingKey = incoming.agentCredentialKey || null;
   if (held === null) {
     if (!incomingKey) return { config: incoming, unused: null };
-    const { agentCredentialKey: _key, agentCredentialId: _id, ...rest } = incoming;
+    const { agentCredentialKey: _key, agentCredentialId: _id, agentCredentialExpiresAt: _expiresAt, ...rest } = incoming;
     return { config: rest, unused: incoming };
   }
   const heldKey = held.agentCredentialKey || null;
   // Nothing held yet: the start's own credential is the one that will run.
   if (!heldKey) return { config: incoming, unused: null };
+  const { agentCredentialExpiresAt: _incomingExpiresAt, ...incomingRest } = incoming;
   return {
-    config: { ...incoming, agentCredentialKey: heldKey, agentCredentialId: held.agentCredentialId ?? null },
+    config: { ...incomingRest, agentCredentialKey: heldKey, agentCredentialId: held.agentCredentialId ?? null, ...(held.agentCredentialExpiresAt !== undefined ? { agentCredentialExpiresAt: held.agentCredentialExpiresAt } : {}) },
     unused: incomingKey && incomingKey !== heldKey ? incoming : null,
   };
 }

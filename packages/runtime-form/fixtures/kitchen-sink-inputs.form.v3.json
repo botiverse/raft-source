@@ -1,0 +1,250 @@
+{
+  "protocolVersion": 3,
+  "runtimeId": "kitchen-sink-inputs",
+  "schemaVersion": "kitchen-sink-inputs.create.v1",
+  "dataSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "textRequired",
+      "secretRequired",
+      "urlRequired",
+      "numberRequired"
+    ],
+    "properties": {
+      "textEmpty": {
+        "type": "string",
+        "title": "Text, empty"
+      },
+      "textFilled": {
+        "type": "string",
+        "title": "Text, filled"
+      },
+      "textRequired": {
+        "type": "string",
+        "minLength": 1,
+        "title": "Text, required"
+      },
+      "textShownByRule": {
+        "type": "string",
+        "title": "Text, shown by rule"
+      },
+      "textHiddenByRule": {
+        "type": "string",
+        "title": "Text, hidden by rule"
+      },
+      "textRequiredByRule": {
+        "type": "string",
+        "title": "Text, required by rule"
+      },
+      "textAdvanced": {
+        "type": "string",
+        "title": "Text, advanced"
+      },
+      "secretEmpty": {
+        "type": "string",
+        "writeOnly": true,
+        "title": "Secret, empty"
+      },
+      "secretFilled": {
+        "type": "string",
+        "writeOnly": true,
+        "title": "Secret, filled"
+      },
+      "secretRequired": {
+        "type": "string",
+        "writeOnly": true,
+        "minLength": 1,
+        "title": "Secret, required"
+      },
+      "urlEmpty": {
+        "type": "string",
+        "format": "uri",
+        "title": "URL, empty"
+      },
+      "urlFilled": {
+        "type": "string",
+        "format": "uri",
+        "title": "URL, filled"
+      },
+      "urlInvalid": {
+        "type": "string",
+        "format": "uri",
+        "title": "URL, invalid"
+      },
+      "urlRequired": {
+        "type": "string",
+        "format": "uri",
+        "minLength": 1,
+        "title": "URL, required"
+      },
+      "booleanOff": {
+        "type": "boolean",
+        "title": "Switch, off"
+      },
+      "booleanOn": {
+        "type": "boolean",
+        "title": "Switch, on"
+      },
+      "mapEmpty": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        },
+        "title": "Key/value, empty"
+      },
+      "mapFilled": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        },
+        "title": "Key/value, filled"
+      },
+      "numberOptional": {
+        "type": "number",
+        "title": "Number, optional"
+      },
+      "numberRequired": {
+        "type": "number",
+        "title": "Number, required"
+      }
+    },
+    "allOf": [
+      {
+        "if": {
+          "properties": {
+            "booleanOn": {
+              "const": true
+            }
+          }
+        },
+        "then": {
+          "required": [
+            "textRequiredByRule"
+          ]
+        }
+      }
+    ]
+  },
+  "uiSchema": {
+    "order": [
+      "textEmpty",
+      "textFilled",
+      "textRequired",
+      "textShownByRule",
+      "textHiddenByRule",
+      "textRequiredByRule",
+      "textAdvanced",
+      "secretEmpty",
+      "secretFilled",
+      "secretRequired",
+      "urlEmpty",
+      "urlFilled",
+      "urlInvalid",
+      "urlRequired",
+      "booleanOff",
+      "booleanOn",
+      "mapEmpty",
+      "mapFilled",
+      "numberOptional",
+      "numberRequired"
+    ],
+    "layout": {
+      "advanced": [
+        "/textAdvanced",
+        "/mapEmpty",
+        "/mapFilled"
+      ]
+    },
+    "localization": {
+      "textEmpty": {
+        "label": "Text, empty",
+        "placeholder": "Placeholder text"
+      },
+      "textFilled": {
+        "label": "Text, filled",
+        "hint": "A hint with a [link](https://raft.example/docs)."
+      },
+      "textRequired": {
+        "label": "Text, required"
+      },
+      "textShownByRule": {
+        "label": "Text, shown by rule"
+      },
+      "textHiddenByRule": {
+        "label": "Text, hidden by rule"
+      },
+      "textRequiredByRule": {
+        "label": "Text, required by rule"
+      },
+      "textAdvanced": {
+        "label": "Text, advanced"
+      },
+      "secretEmpty": {
+        "label": "Secret, empty"
+      },
+      "secretFilled": {
+        "label": "Secret, filled"
+      },
+      "secretRequired": {
+        "label": "Secret, required"
+      },
+      "urlEmpty": {
+        "label": "URL, empty",
+        "placeholder": "https://"
+      },
+      "urlFilled": {
+        "label": "URL, filled"
+      },
+      "urlInvalid": {
+        "label": "URL, invalid"
+      },
+      "urlRequired": {
+        "label": "URL, required"
+      },
+      "booleanOff": {
+        "label": "Switch, off",
+        "hint": "A switch carries its hint on the option card."
+      },
+      "booleanOn": {
+        "label": "Switch, on"
+      },
+      "mapEmpty": {
+        "label": "Key/value, empty"
+      },
+      "mapFilled": {
+        "label": "Key/value, filled"
+      },
+      "numberOptional": {
+        "label": "Number, optional"
+      },
+      "numberRequired": {
+        "label": "Number, required"
+      }
+    },
+    "rules": [
+      {
+        "scope": "#/properties/textShownByRule",
+        "effect": "SHOW",
+        "condition": {
+          "scope": "#/properties/booleanOn",
+          "schema": {
+            "const": true
+          }
+        }
+      },
+      {
+        "scope": "#/properties/textHiddenByRule",
+        "effect": "HIDE",
+        "condition": {
+          "scope": "#/properties/booleanOn",
+          "schema": {
+            "const": true
+          }
+        }
+      }
+    ]
+  },
+  "optionSources": {},
+  "revision": "kitchen-sink"
+}

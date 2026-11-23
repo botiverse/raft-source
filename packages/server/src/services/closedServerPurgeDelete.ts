@@ -36,9 +36,12 @@
 // a joint channel names as canonical, and every channel under one of those:
 // other servers still see what is in them. The steps, in order:
 //  1. apps: each first-party app's purgeServer(`delete`) until nothing is
-//     left, told the kept channels (keepChannelIds): an app object homed in
-//     one stays (Artifacts: its items and, by cascade, all their parts;
-//     bytes are left to the app's own jobs).
+//     left, told the kept channels (keepChannelIds: KeptChannels.apps, the
+//     above without its copies of the joints it has left, and the storage
+//     channels of every joint the server is still in, where its joint
+//     messages stay): an app object homed in one stays
+//     (Artifacts: its items and, by cascade, all their parts; bytes are left
+//     to the app's own jobs).
 //  2. channels: channel by channel, children (threads, task conversations)
 //     before their parent, the kept ones skipped. For each channel:
 //     messages in batches by (created_at, id), each batch one transaction
@@ -92,13 +95,10 @@ import type { ServerId } from "@botiverse/raft-shared";
 import type { Database, DatabaseExecutor } from "../db/index";
 import {
   agentLounges,
-  agentMigrationReceiptChannels,
   attachments,
   channelExternalInvites,
   channels,
   channelServerConnectRequests,
-  jointChannels,
-  jointChannelServers,
   messages,
   serverMembers,
   servers,
@@ -111,6 +111,7 @@ import {
   resolveAttachmentLifecycleDatabaseNow,
 } from "./attachmentLifecycleService";
 import { removeAttachmentObjectHoldsWithExecutor } from "./attachmentObjectHoldService";
+import { keptChannelsOf, type KeptChannels } from "./closedServerKeptChannels";
 import { errorClassOf } from "../tracing/semanticTrace";
 import { channelHasBridgeRows, clearChannelBridgeRows } from "./closedServerPurgeBridgeBlockers";
 import { CLOSED_SERVER_PURGE_FINISH_STEPS, finishClosedServerPurge, type ClosedServerPurgeFinishStep } from "./closedServerPurgeFinish";
@@ -338,7 +339,7 @@ export async function purgeClosedServer(ctx: ClosedServerPurgeRunContext, server
       for (const app of ctx.apps) {
         if (!app.purgeServer) continue;
         for (;;) {
-          const answer = await batch((executor) => app.purgeServer!(serverId, { executor, limit: APP_BATCH, mode: "delete", keepChannelIds: kept.all }));
+          const answer = await batch((executor) => app.purgeServer!(serverId, { executor, limit: APP_BATCH, mode: "delete", keepChannelIds: kept.apps }));
           for (const [key, n] of Object.entries(answer.counts)) add(`app_${snake(app.id)}_${snake(key)}`, n);
           if (!answer.remaining) break;
         }
@@ -533,33 +534,6 @@ interface ChannelRow {
   id: string;
   parentChannelId: string | null;
   type: string;
-}
-
-/** The channels the purge keeps (header): roots by why, and every kept channel (roots, `joint` channels, what is under them). */
-export interface KeptChannels {
-  joint: ReadonlySet<string>;
-  receipt: ReadonlySet<string>;
-  all: string[];
-}
-
-export async function keptChannelsOf(tx: DatabaseExecutor, serverId: ServerId): Promise<KeptChannels> {
-  const joint = (await tx.select({ id: jointChannelServers.localChannelId }).from(jointChannelServers)
-    .where(eq(jointChannelServers.serverId, serverId))).map((row) => row.id);
-  const receipt = (await tx.select({ id: agentMigrationReceiptChannels.channelId }).from(agentMigrationReceiptChannels)
-    .where(eq(agentMigrationReceiptChannels.serverId, serverId))).map((row) => row.id);
-  const canonical = (await tx.select({ id: jointChannels.canonicalChannelId }).from(jointChannels)
-    .innerJoin(channels, eq(channels.id, jointChannels.canonicalChannelId))
-    .where(eq(channels.serverId, serverId))).map((row) => row.id);
-  const roots = [...new Set([...joint, ...canonical, ...receipt])];
-  // isKept's rule as one query: a `joint` channel, a root, or a channel under a root.
-  const all = (await tx.select({ id: channels.id }).from(channels)
-    .where(and(
-      eq(channels.serverId, serverId),
-      roots.length > 0
-        ? or(eq(channels.type, "joint"), inArray(channels.id, roots), inArray(channels.parentChannelId, roots))
-        : eq(channels.type, "joint"),
-    ))).map((row) => row.id);
-  return { joint: new Set([...joint, ...canonical]), receipt: new Set(receipt), all };
 }
 
 /** Step 2. True when some channel was left (blocked); false when every channel it may clear is gone. */

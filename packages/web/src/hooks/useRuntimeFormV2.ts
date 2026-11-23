@@ -8,9 +8,11 @@ import type {
 
 import api from "../api/client";
 import { runtimeFormV2ClientCapabilityParams } from "../utils/runtimeFormV2ClientCapabilities";
+import { runtimeFormV2SourceWithoutProviderConnections, runtimeFormV2WithoutProviderConnections } from "../utils/runtimeFormV2WithoutProviderConnections";
 import { useLocale } from "../i18n/LocaleProvider";
 import { htmlLangForLocale } from "../i18n/locale";
 import type { Locale } from "../i18n/locale";
+import { refreshModelLabelCatalogAfterLiveDetect } from "../store/modelLabelCatalogStore";
 import { useServerStore } from "../store/serverStore";
 
 /**
@@ -25,8 +27,10 @@ export const WEB_RUNTIME_FORM_V2_CAPABILITIES: ReadonlySet<string> = new Set<str
   "choice.labels",
   // Per-source status, retry and submit blocking (this hook + RuntimeFormV2Fields).
   "option_source.status",
-  // Saved provider connection options, connection-owned field handling and
-  // the formRevision echo (this hook + RuntimeFormV2Fields).
+  // The formRevision echo (this hook). Saved provider connections are retired
+  // on the web: their options and a leftover binding are dropped on load
+  // (runtimeFormV2WithoutProviderConnections), so a form a server still
+  // marks with this capability renders with the agent-local provider fields.
   "provider.saved_connection",
 ]);
 
@@ -104,7 +108,7 @@ async function loadRuntimeFormV2Source(
   const url = `${base}/option-sources/${encodeURIComponent(sourceId)}${suffix ? `?${suffix}` : ""}`;
   try {
     const { data } = await api.get(url, { headers, params: runtimeFormV2ClientCapabilityParams() });
-    return data as RuntimeFormV2OptionSource;
+    return runtimeFormV2SourceWithoutProviderConnections(data as RuntimeFormV2OptionSource);
   } catch (error) {
     // Per-source status is always supported: a failed source marks only its
     // own field unavailable, never the whole form. A stale revision always
@@ -112,6 +116,19 @@ async function loadRuntimeFormV2Source(
     if (isFormRevisionStale(error)) throw error;
     return unreachableSource(form, sourceId);
   }
+}
+
+/**
+ * The model list answered live: the server stored that detect in the shared
+ * model-label catalog before answering, so the web's copy is reloaded and the
+ * chat and profile name the model as this dropdown does (#triage:#548). Only
+ * the model source counts: static sources (provider, auth type) never carry a
+ * status. A model source without one is a simple form's live list (OpenCode,
+ * Kimi) or a static fallback; the extra catalog read for the latter is
+ * harmless and deduplicated.
+ */
+function answeredLiveModels(source: RuntimeFormV2OptionSource): boolean {
+  return source.pointer === "/model" && (source.status === undefined || source.status === "live");
 }
 
 /** 409 form_revision_stale: the server's form build moved on; refetch the whole form. */
@@ -127,8 +144,9 @@ async function loadRuntimeFormV2(
 ): Promise<Exclude<RuntimeFormV2State, { status: "idle" | "loading" }>> {
   // Edit reads the same form plus the agent's current values from the agent itself.
   const { data } = await api.get(agentId ? `/agents/${encodeURIComponent(agentId)}/runtime-form` : base, { headers, params: runtimeFormV2ClientCapabilityParams() });
-  const form = parseRuntimeFormV2(data);
-  if (!form) return { status: "error" };
+  const parsed = parseRuntimeFormV2(data);
+  if (!parsed) return { status: "error" };
+  const form = runtimeFormV2WithoutProviderConnections(parsed);
   const missingCapabilities = missingRuntimeFormV2Capabilities(form, WEB_RUNTIME_FORM_V2_CAPABILITIES);
   // Checked before any option source is loaded: an unavailable form is not rendered at all.
   if (missingCapabilities.length > 0) return { status: "unsupported", missingCapabilities };
@@ -212,6 +230,7 @@ export function useRuntimeFormV2(
               inFlight.delete(sourceId);
               if (cancelled || gen !== generation) return;
               updateReady((ready) => ({ ...ready, sources: { ...ready.sources, [sourceId]: source }, retryingSourceIds: [...inFlight] }));
+              if (answeredLiveModels(source)) refreshModelLabelCatalogAfterLiveDetect(serverId);
               // The parent's fresh answer is cached server-side: dependents
               // follow without asking the Computer again.
               for (const dependent of dependentsOf(sourceId)) reloadSource(dependent, false);
@@ -250,6 +269,7 @@ export function useRuntimeFormV2(
       };
       const retrySource = (sourceId: string) => reloadSource(sourceId, true);
       setState({ requestKey, value: { ...loaded, retrySource } });
+      if (Object.values(loaded.sources).some(answeredLiveModels)) refreshModelLabelCatalogAfterLiveDetect(serverId);
     };
     const reinstallError = (error: unknown): void => {
       if (cancelled) return;

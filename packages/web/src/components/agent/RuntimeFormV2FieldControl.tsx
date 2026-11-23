@@ -1,14 +1,13 @@
 import { isTypedCustomValue } from "./runtimeChoiceOptionId";
-import { Button, Card, CardDescription, CardHeader, CardLeading, CardTitle, Checkbox, Input } from "@botiverse/raft-ui";
-import { Pencil, RefreshCw } from "lucide-react";
+import { Card, CardDescription, CardHeader, CardLeading, CardTitle, Checkbox, Input } from "@botiverse/raft-ui";
+import { RefreshCw } from "lucide-react";
 import { useCallback, useId, useMemo } from "react";
 import type { ChangeEvent } from "react";
 import {
   isRuntimeFormV2FieldRequired,
   runtimeFormV2Choices,
-  runtimeFormV2SelectedConnection,
+  runtimeFormV2EffortUnavailable,
   runtimeFormV2SourceStatus,
-  runtimeFormV2UnavailableSelection,
 } from "@botiverse/raft-runtime-form";
 import type { RuntimeFormV2ChoiceOption, RuntimeFormV2Field, RuntimeFormV2Sources, RuntimeFormV2Value, RuntimeFormV2Values } from "@botiverse/raft-runtime-form";
 import { useIntl } from "react-intl";
@@ -35,9 +34,6 @@ export function RuntimeFormV2FieldControl({
   editing,
   onRetrySource,
   retryingSourceIds,
-  connectionActive = false,
-  managedPlaceholder,
-  savedConnections,
 }: {
   field: RuntimeFormV2Field;
   sources: RuntimeFormV2Sources;
@@ -47,12 +43,6 @@ export function RuntimeFormV2FieldControl({
   editing: boolean;
   onRetrySource?: (sourceId: string) => void;
   retryingSourceIds: readonly string[];
-  /** `provider.saved_connection`: some field currently holds a saved-connection selection. */
-  connectionActive?: boolean;
-  /** Placeholder for connection-owned fields ("Provided by …"); parent-computed. */
-  managedPlaceholder?: string;
-  /** Pencil action for the selected saved connection; present only for authorized operators. */
-  savedConnections?: { onEdit: (connectionId: string) => void };
 }) {
   const { formatMessage } = useIntl();
   const fieldKey = field.key;
@@ -60,36 +50,13 @@ export function RuntimeFormV2FieldControl({
   const value = values[fieldKey];
   const text = typeof value === "string" ? value : "";
   const secretKept = editing && field.kind === "secret";
-  // Saved provider connections: a field the selected connection owns is the
-  // connection's, not the user's — disabled, safe placeholder, never required
-  // (and never submitted; the shared runtimeFormV2Submission rules drop it).
-  const connectionOwnedNow = connectionActive && field.connectionOwned === true;
-  // v3 keeps a bound connection that is not selectable in unavailableOptions:
-  // its pencil still opens it (to enable it or add the credential).
-  const fieldConnection = runtimeFormV2SelectedConnection(field, sources, values)
-    ?? runtimeFormV2UnavailableSelection(field, sources, values);
-  const connectionId = typeof fieldConnection?.connectionId === "string" && fieldConnection.connectionId
-    ? fieldConnection.connectionId
-    : undefined;
-  const savedGroupLabel = formatMessage({ id: "agent.runtimeConfig.savedProviders" });
-  const directGroupLabel = formatMessage({ id: "agent.runtimeConfig.directProviders" });
   const toRuntimeOptionV2 = useCallback((option: RuntimeFormV2ChoiceOption): RuntimeOption => ({
     value: option.value,
     label: option.label,
     ...(option.description ? { description: option.description } : {}),
     ...(option.unavailable === true ? { disabled: true } : {}),
-    ...(option.group === "saved"
-      ? { group: savedGroupLabel }
-      : option.group === "direct"
-        ? { group: directGroupLabel }
-        : {}),
-  }), [savedGroupLabel, directGroupLabel]);
-  const handleEditConnection = useCallback(() => {
-    if (connectionId && savedConnections) savedConnections.onEdit(connectionId);
-  }, [connectionId, savedConnections]);
-  const pencilLabel = formatMessage({ id: "agent.runtimeConfig.editSavedProvider" });
-  // Every field bound to an option source (the Computer's models, the
-  // server's saved provider connections) gets a refresh action: it
+  }), []);
+  // Every field bound to an option source (the Computer's models) gets a refresh action: it
   // re-requests the source with `?refresh=1`; for a Computer-reported list
   // that also bypasses the Computer's model-list cache. The copy names no
   // origin, since the list may come from either. A
@@ -106,61 +73,40 @@ export function RuntimeFormV2FieldControl({
   const refreshLabel = formatMessage({ id: "agent.runtimeFormV2.refreshSourceAria" });
   // Server hint copy may carry inline Markdown links (https only).
   const fieldHint = useMemo(() => (field.hint ? <RuntimeFormV2HintText hint={field.hint} /> : undefined), [field.hint]);
-  const hint = connectionOwnedNow
-    ? managedPlaceholder
-    : secretKept ? formatMessage({ id: "agent.runtimeFormV2.secretKept" }) : fieldHint;
-  const required = isRuntimeFormV2FieldRequired(field, values) && !secretKept && !connectionOwnedNow;
+  const hint = secretKept ? formatMessage({ id: "agent.runtimeFormV2.secretKept" }) : fieldHint;
+  const required = isRuntimeFormV2FieldRequired(field, values) && !secretKept;
   const common = useMemo(
     () => ({
       label: field.label,
       hint,
       required,
       error,
-      ...((connectionId && savedConnections) || showRefresh
+      ...(showRefresh
         ? {
-            // The refresh action for a source-bound list, and the pencil action
-            // for the selected saved connection (authorized operators only);
-            // built inside the memo so their identity is stable.
+            // The refresh action for a source-bound list, built inside the
+            // memo so its identity is stable.
             labelAccessory: (
-              <>
-                {showRefresh ? (
-                  <Tooltip content={refreshTitle}>
-                    <FieldAction
-                      tone="icon"
-                      type="button"
-                      onClick={handleRefreshSource}
-                      disabled={refreshing}
-                      aria-label={refreshLabel}
-                      data-testid={`runtime-form-v2-refresh-source-${fieldKey}`}
-                    >
-                      <RefreshCw size={14} className={refreshing ? "animate-spin" : ""} aria-hidden="true" />
-                    </FieldAction>
-                  </Tooltip>
-                ) : null}
-                {connectionId && savedConnections ? (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-md"
-                    onClick={handleEditConnection}
-                    aria-label={pencilLabel}
-                    title={pencilLabel}
-                    data-testid={`runtime-form-v2-edit-provider-connection-${fieldKey}`}
-                  >
-                    <Pencil size={14} aria-hidden="true" />
-                  </Button>
-                ) : null}
-              </>
+              <Tooltip content={refreshTitle}>
+                <FieldAction
+                  tone="icon"
+                  type="button"
+                  onClick={handleRefreshSource}
+                  disabled={refreshing}
+                  aria-label={refreshLabel}
+                  data-testid={`runtime-form-v2-refresh-source-${fieldKey}`}
+                >
+                  <RefreshCw size={14} className={refreshing ? "animate-spin" : ""} aria-hidden="true" />
+                </FieldAction>
+              </Tooltip>
             ),
           }
         : {}),
     }),
-    [connectionId, savedConnections, handleEditConnection, pencilLabel, showRefresh, refreshTitle, handleRefreshSource, refreshing, refreshLabel, fieldKey, field.label, hint, required, error],
+    [showRefresh, refreshTitle, handleRefreshSource, refreshing, refreshLabel, fieldKey, field.label, hint, required, error],
   );
   // `OptionSource.unavailableOptions`: models this Computer's runtime listed as
-  // disabled (and, on v3, saved connections that are not selectable), a
-  // disabled group after the list: by `group` when the server sends one, else
-  // "Not available on this computer". The reason is plain text.
+  // disabled, a disabled group after the list ("Not available on this
+  // computer"). The reason is plain text.
   const unavailableSource = field.kind !== "derived_select" && field.optionSourceId ? sources[field.optionSourceId]?.unavailableOptions : undefined;
   const unavailableOptions = useMemo((): RuntimeOption[] => {
     if (!Array.isArray(unavailableSource)) return NO_RUNTIME_OPTIONS;
@@ -171,10 +117,10 @@ export function RuntimeFormV2FieldControl({
         value: option.value,
         label: typeof option.label === "string" && option.label ? option.label : option.value,
         disabled: true,
-        group: option.group === "saved" ? savedGroupLabel : option.group === "direct" ? directGroupLabel : group,
+        group,
         ...(typeof option.reason === "string" && option.reason ? { description: option.reason } : {}),
       }));
-  }, [unavailableSource, formatMessage, savedGroupLabel, directGroupLabel]);
+  }, [unavailableSource, formatMessage]);
   const listedOptions = useMemo(
     () => (choices?.kind === "select" ? choices.options.map(toRuntimeOptionV2) : NO_RUNTIME_OPTIONS),
     [choices, toRuntimeOptionV2],
@@ -222,13 +168,13 @@ export function RuntimeFormV2FieldControl({
       ) : null;
     case "boolean":
       // The option card carries the field's hint as its description, so the
-      // field below repeats only a different note (a connection-owned one).
+      // field below does not repeat it.
       return (
-        <Field {...common} label={undefined} hint={hint === fieldHint ? undefined : hint} adopt={false}>
+        <Field {...common} label={undefined} hint={undefined} adopt={false}>
           <Card variant="option" render={<label />}>
             <CardHeader>
               <CardLeading>
-                <Checkbox checked={value === true} disabled={connectionOwnedNow} onCheckedChange={handleCheckedChange} aria-labelledby={optionTitleId} data-testid={testId} />
+                <Checkbox checked={value === true} onCheckedChange={handleCheckedChange} aria-labelledby={optionTitleId} data-testid={testId} />
               </CardLeading>
               <CardTitle id={optionTitleId}>{field.label}</CardTitle>
               {fieldHint && <CardDescription>{fieldHint}</CardDescription>}
@@ -240,6 +186,7 @@ export function RuntimeFormV2FieldControl({
       return (
         <RuntimeFormV2StringMapField
           value={value && typeof value === "object" ? value : EMPTY_STRING_MAP}
+          label={field.label}
           hint={fieldHint}
           onChange={handleValueChange}
         />
@@ -256,8 +203,30 @@ export function RuntimeFormV2FieldControl({
         />
       ) : null;
       if (choices?.kind === "select") {
-        // A derived list with nothing to offer (e.g. a model without an effort menu) is not shown.
-        if (field.kind === "derived_select" && choices.options.length === 0) return null;
+        if (field.kind === "derived_select" && choices.options.length === 0) {
+          // An effort list with nothing to offer stays visible when the
+          // Computer says why: the model takes no effort, or its levels could
+          // not be read (the runtime's reason, plain text). The control shows
+          // the value in effect (Default) and cannot change; the hint, in
+          // readable ink, says why. Unexplained (an older Computer): hidden.
+          const effortUnavailable = runtimeFormV2EffortUnavailable(field, sources, values);
+          if (!effortUnavailable) return null;
+          const effortHint = effortUnavailable.kind === "unreadable"
+            ? formatMessage({ id: "agent.runtimeFormV2.effortUnreadable" }, { reason: effortUnavailable.reason })
+            : formatMessage({ id: "agent.runtimeFormV2.effortNotSupported" });
+          return (
+            <Field {...common} hint={effortHint}>
+              <RuntimeSelectControl
+                value={RUNTIME_FORM_V2_EMPTY_CHOICE}
+                onValueChange={handleSelectChange}
+                options={selectOptions}
+                placeholder={field.placeholder ?? field.label}
+                testId={testId}
+                disabled
+              />
+            </Field>
+          );
+        }
         // A list the Computer reports (models) can be long: search it. A custom
         // value field types into the same box. Short fixed lists stay a select.
         if (choices.allowCustom || (field.optionSourceId && field.kind !== "derived_select")) {
@@ -296,11 +265,10 @@ export function RuntimeFormV2FieldControl({
         <Field {...common}>
           <Input
             type={field.kind === "secret" ? "password" : field.kind === "url" ? "url" : "text"}
-            value={connectionOwnedNow ? "" : text}
+            value={text}
             onChange={handleInputChange}
-            placeholder={connectionOwnedNow ? managedPlaceholder : field.placeholder}
+            placeholder={field.placeholder}
             autoComplete={field.kind === "secret" ? "off" : undefined}
-            disabled={connectionOwnedNow}
             data-testid={testId}
           />
         </Field>

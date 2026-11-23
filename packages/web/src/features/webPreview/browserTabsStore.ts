@@ -2,6 +2,7 @@ import type { DesktopWebPreviewBlocked, DesktopWebPreviewMediaKind, DesktopWebPr
 import { create } from "zustand";
 
 import { webPreviewUrl } from "./webPreviewAddress";
+import { followShellInUse } from "./browserInUseStore";
 
 /**
  * The built-in browser's tabs (Raft Desktop, desktop_web_preview_view_v0, a
@@ -55,8 +56,18 @@ export interface BrowserTab {
   id: string;
   /** The address the tab shows now (the shell's report once it has one); null: an empty tab. */
   url: string | null;
-  /** The address last asked for (opened beside, or typed): a page that redirects is still found by it. */
+  /**
+   * The address last asked for (opened beside, or typed), while the tab is still on the load that asked it: a page
+   * that redirects during that load is still found by it. Null once the page went on to another address after that
+   * load (a link in it, Back / Forward, its own script): a tab shows a link only on it (`showsLink`).
+   */
   askedUrl: string | null;
+  /**
+   * Where the load asked for is (a shell that keeps no list): `asked` until the page reports it loading, `loading`
+   * until it reports it stopped once (its redirects, server or script, are reported before), then `done`: a later
+   * report at another address is the page moving on. Absent: done.
+   */
+  askedLoad?: "asked" | "loading" | "done";
   /** Bumped by each address asked for: the shell loads `url` when it is ahead of what it was sent. */
   navigation: number;
   title: string;
@@ -364,6 +375,8 @@ function ordered(conversationId: string, order: readonly string[]): Optimistic {
 }
 
 let unsubscribeShellList: (() => void) | null = null;
+/** What the kept pages do and what the sidebar can mark, followed for this mirror (browserInUseStore). */
+let shellInUse: ReturnType<typeof followShellInUse> | null = null;
 
 /**
  * The shell keeps the tab list (`webPreview.tabs.list`): this store mirrors
@@ -372,6 +385,8 @@ let unsubscribeShellList: (() => void) | null = null;
  * that were open) and follows every change. A repeat for the same account
  * does nothing; another account drops what the store held and asks again;
  * null (signed out, or no such shell) ends the mirror and empties the store.
+ * For as long, what kept pages do and what the sidebar can mark go between
+ * the shell and browserInUseStore (followShellInUse).
  */
 export function mirrorBrowserTabsList(list: DesktopWebPreviewTabListBridge | null, account: string | null): void {
   const next = list && account ? list : null;
@@ -379,6 +394,8 @@ export function mirrorBrowserTabsList(list: DesktopWebPreviewTabListBridge | nul
   const had = shellList !== null;
   unsubscribeShellList?.();
   unsubscribeShellList = null;
+  shellInUse?.end();
+  shellInUse = null;
   connection += 1;
   shellAnswer = null;
   shellRevision = -1;
@@ -392,7 +409,13 @@ export function mirrorBrowserTabsList(list: DesktopWebPreviewTabListBridge | nul
   if (!next || !account) return;
   const from = connection;
   unsubscribeShellList = next.onChange((answer) => applyShellList(answer, from));
-  void next.get(account).then((answer) => applyShellList(answer, from), () => {});
+  // Before `get`: the shell sends what the kept pages do as it answers; what the sidebar can mark goes after it.
+  const inUse = followShellInUse(next);
+  shellInUse = inUse;
+  void next.get(account).then((answer) => {
+    applyShellList(answer, from);
+    if (from === connection) inUse.listHad();
+  }, () => {});
 }
 
 let sequence = 0;
@@ -403,7 +426,7 @@ function newTabId(): string {
 }
 
 function tabFor(url: string | null): BrowserTab {
-  return { id: newTabId(), url, askedUrl: url, navigation: url ? 1 : 0, title: "", canGoBack: false, canGoForward: false, loading: url !== null, blocked: null, blockedDismissedAt: 0 };
+  return { id: newTabId(), url, askedUrl: url, askedLoad: "asked", navigation: url ? 1 : 0, title: "", canGoBack: false, canGoForward: false, loading: url !== null, blocked: null, blockedDismissedAt: 0 };
 }
 
 /** The tab's name in the strip: the page's title, else its host, else null (an empty tab: "New tab"). */
@@ -496,12 +519,20 @@ export function browserTabBlocked(value: unknown): DesktopWebPreviewBlocked | nu
   return { url, reason: reason as DesktopWebPreviewBlocked["reason"], at, ...(name ? { file: name } : {}), ...(media.length > 0 ? { media } : {}) };
 }
 
+/**
+ * Whether the tab shows the link `url` (an open goes to it, as Chrome's "Switch to this tab"): its address is the
+ * link, or it is still on the load the link asked for (redirected or not).
+ */
+function showsLink(tab: BrowserTab, url: string): boolean {
+  return tab.url === url || tab.askedUrl === url;
+}
+
 function withTab(browser: Browser, tabId: string, change: (tab: BrowserTab) => BrowserTab): Browser {
   return { ...browser, tabs: browser.tabs.map((tab) => (tab.id === tabId ? change(tab) : tab)) };
 }
 
 function loading(tab: BrowserTab, url: string): BrowserTab {
-  return { ...tab, url, askedUrl: url, navigation: tab.navigation + 1, title: "", loading: true };
+  return { ...tab, url, askedUrl: url, askedLoad: "asked", navigation: tab.navigation + 1, title: "", loading: true };
 }
 
 export const useBrowserTabsStore = create<BrowserTabsState>((set, get) => {
@@ -567,7 +598,7 @@ export const useBrowserTabsStore = create<BrowserTabsState>((set, get) => {
         put(conversationId, { tabs: [tab], activeId: tab.id, frontAt, parkedAt: 0 });
         return;
       }
-      const showing = browser.tabs.find((tab) => tab.url === url || tab.askedUrl === url);
+      const showing = browser.tabs.find((tab) => showsLink(tab, url));
       if (showing) {
         put(conversationId, { ...browser, activeId: showing.id, frontAt });
         return;
@@ -749,12 +780,18 @@ export const useBrowserTabsStore = create<BrowserTabsState>((set, get) => {
       // A shell before the speaker on a tab says nothing of what plays: none shows.
       const audible = state.audible === true;
       const muted = state.muted === true;
-      const next: BrowserTab = { ...tab, url, title, canGoBack: state.canGoBack === true, canGoForward: state.canGoForward === true, loading: mirror ? tab.loading : state.loading === true, blocked, permissionPrompt, site, media, audible, muted };
+      // The load the tab was asked for is over once its page, having started it, said it stopped (a report of the
+      // page before, sent before the load starts, is not it): a later report at another address is a navigation of
+      // the page's own, and the address asked no longer finds the tab. Its redirects are reported before it stops.
+      const was = tab.askedLoad ?? "done";
+      const askedLoad = mirror || was === "done" ? was : state.loading === true ? "loading" : was === "loading" ? "done" : "asked";
+      const askedUrl = !mirror && was === "done" && url !== tab.url ? null : tab.askedUrl;
+      const next: BrowserTab = { ...tab, url, askedUrl, askedLoad, title, canGoBack: state.canGoBack === true, canGoForward: state.canGoForward === true, loading: mirror ? tab.loading : state.loading === true, blocked, permissionPrompt, site, media, audible, muted };
       const samePermissions = (tab.permissionPrompt?.id ?? null) === (permissionPrompt?.id ?? null)
         && JSON.stringify(tab.site ?? null) === JSON.stringify(site)
         && (tab.media ?? []).join() === media.join()
         && (tab.audible === true) === audible && (tab.muted === true) === muted;
-      if (samePermissions && next.url === tab.url && next.title === tab.title && next.canGoBack === tab.canGoBack && next.canGoForward === tab.canGoForward && next.loading === tab.loading && next.blocked?.at === tab.blocked?.at && next.blocked?.url === tab.blocked?.url) return;
+      if (samePermissions && next.askedLoad === tab.askedLoad && next.url === tab.url && next.title === tab.title && next.canGoBack === tab.canGoBack && next.canGoForward === tab.canGoForward && next.loading === tab.loading && next.blocked?.at === tab.blocked?.at && next.blocked?.url === tab.blocked?.url) return;
       putTab(next);
     },
   };

@@ -43,6 +43,8 @@ export function ArtifactPageLoadingLayout({ hostShell, onGoBack, testId, childre
   const { formatMessage } = useIntl();
   const backLabel = formatMessage({ id: "artifacts.page.back" });
   const meta = <ArtifactMetaRow text={<ArtifactSplashMetaPlaceholder />} />;
+  // The page's own head: one line on a desktop (the loaded title opens the details), the meta line under it on a phone.
+  const pageMeta = <ArtifactMetaRow text={<ArtifactSplashMetaPlaceholder />} phoneOnly />;
   return (
     <main className="flex min-h-0 flex-1 flex-col bg-layer-canvas font-display safe-top safe-bottom" aria-busy="true" data-testid={testId}>
       <Panel edge="inset" aria-label={formatMessage({ id: "artifacts.viewer.regionLabel" })} className="flex min-h-0 flex-1 flex-col">
@@ -62,7 +64,7 @@ export function ArtifactPageLoadingLayout({ hostShell, onGoBack, testId, childre
             ) : null}
             <PanelHeaderContent>
               <PanelHeading><ArtifactSplashTitlePlaceholder /></PanelHeading>
-              {meta}
+              {pageMeta}
             </PanelHeaderContent>
           </PanelHeader>
         )}

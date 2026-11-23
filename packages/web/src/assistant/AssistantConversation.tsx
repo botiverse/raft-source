@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useIntl } from "react-intl";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { PanelAction, Spinner } from "@botiverse/raft-ui";
 import { ArrowLeft, Minimize2 } from "lucide-react";
 import { ChatPanel } from "../features/channel/ChatPanel";
@@ -79,7 +79,7 @@ export function AssistantSubtitle({ text }: { text: string }) {
  * Its header has Back to popover (on a desktop; on a phone the page's own
  * Back is the way back): to where it goes back to (`useReturnTo`), with the
  * popover open again there; with no conversation to go back to it is a plain
- * Back, to Home. Leaving for it by the browser's Back opens the popover there too.
+ * Back: to the page before it, or Home when there is none in this app. Leaving for it by the browser's Back opens the popover there too.
  */
 export default function AssistantConversation({
   assistant,
@@ -96,7 +96,10 @@ export default function AssistantConversation({
   const phone = useMediaQuery(PHONE_MEDIA_QUERY);
   const serverSlug = useServerStore((s) => s.current?.slug ?? null);
   const home = serverSlug ? `/s/${serverSlug}` : "/";
-  const returnTo = useReturnTo(expandOrigin, assistant.dmChannelId);
+  // Shown at its DM's URL beside the sidebar (DmRoute, desktop): the sidebar is
+  // already the way elsewhere, so a plain Back to Home would only repeat it.
+  const inPlace = !useLocation().pathname.includes("/assistant");
+  const returnTo = useReturnTo(expandOrigin, assistant.dmChannelId, inPlace);
   // On a phone the page is pushed over the one it was expanded from, so its
   // Back is already the way back there (Raft DS › Navigation: one way back on
   // a pushed page); leaving reopens the sheet (below).
@@ -116,7 +119,9 @@ export default function AssistantConversation({
   const shrink = useCallback(() => {
     const to = returnTo;
     if (!to) {
-      navigate(home, { replace: true });
+      // No conversation to go back to: plain Back, to the page before it in
+      // this app on this server; Home only when there is none (rule a).
+      onMobileBack();
       return;
     }
     const step = shrinkNavigation(to, currentHistoryIdx());
@@ -124,7 +129,7 @@ export default function AssistantConversation({
     requestAssistantReopen(step.back ? to : { ...to, historyIdx: null });
     if (step.back) navigate(-1);
     else navigate(step.path, { replace: true });
-  }, [home, navigate, returnTo]);
+  }, [navigate, onMobileBack, returnTo]);
   // The button says what it does (Tenny): Back to popover only where it
   // lands on a conversation with the popover open; Home, it is plain Back.
   const shrinkLabel = formatMessage({ id: returnTo ? "assistant.page.shrink" : "assistant.page.back" });
@@ -150,7 +155,7 @@ export default function AssistantConversation({
         containerProps={HEADER_CONTAINER_PROPS}
         actions={(
           <>
-            {!phone ? (
+            {!phone && !(inPlace && !returnTo) ? (
               <Tooltip content={shrinkTooltip} contentProps={TOOLTIP_CONTENT_PROPS}>
                 <PanelAction aria-label={shrinkLabel} onClick={shrink} data-testid="assistant-shrink">
                   {returnTo ? <Minimize2 /> : <ArrowLeft />}
@@ -178,14 +183,17 @@ export default function AssistantConversation({
  * This page's own history index is read in that first render, while the
  * browser is still on it.
  */
-function useReturnTo(expandOrigin: AssistantExpandOrigin | null, assistantDmId: string | null): AssistantExpandOrigin | null {
+function useReturnTo(expandOrigin: AssistantExpandOrigin | null, assistantDmId: string | null, inPlace: boolean): AssistantExpandOrigin | null {
   const serverId = useServerStore((s) => s.current?.id ?? null);
   const serverSlug = useServerStore((s) => s.current?.slug ?? null);
   const stack = useInAppNavigationStack();
   const [historyIdx] = useState(currentHistoryIdx);
   return useMemo(() => {
     if (expandOrigin) return expandOrigin;
-    if (!serverId || !serverSlug) return null;
+    // Opened as its DM beside the sidebar (a sidebar row, a link): never
+    // expanded from a popover, so there is none to go back to (Kate,
+    // #proj-assistant:d6de7c56). The conversation before it is not one.
+    if (inPlace || !serverId || !serverSlug) return null;
     return previousConversation(stack, {
       serverId,
       serverSlug,
@@ -193,7 +201,7 @@ function useReturnTo(expandOrigin: AssistantExpandOrigin | null, assistantDmId: 
       assistantDmId,
       historyIdx,
     });
-  }, [assistantDmId, expandOrigin, historyIdx, serverId, serverSlug, stack]);
+  }, [assistantDmId, expandOrigin, historyIdx, inPlace, serverId, serverSlug, stack]);
 }
 
 /**

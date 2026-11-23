@@ -54,6 +54,7 @@ const APP_NOT_AVAILABLE_BODY = JSON.stringify({ error: "This app isn't available
 const LOGIN_MODE_CHANGED_BODY = JSON.stringify({
   error: "This app now signs you in with your Raft account. Reload this page to continue.",
   code: "login_mode_changed",
+  errorCode: "login_mode_changed",
 });
 
 const SIGN_OFF = {

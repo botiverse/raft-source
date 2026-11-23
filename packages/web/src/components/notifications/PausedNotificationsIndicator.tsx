@@ -13,12 +13,13 @@ import Tooltip from "../ui/Tooltip";
 /** Re-renders when the pause ends (a timer at pausedUntil), so the moon leaves on time. */
 export function usePausedUntil(): string | null {
   const pausedUntil = useNotificationSettingsStore((s) => s.account?.pausedUntil ?? null);
-  const [, setTick] = useState(0);
-  const paused = isPausedNow(pausedUntil, Date.now());
+  // The time the pause is judged at: read at mount, and again when the timer below fires.
+  const [now, setNow] = useState(() => Date.now());
+  const paused = isPausedNow(pausedUntil, now);
   useEffect(() => {
     if (!pausedUntil || !paused) return;
     const wait = Math.min(Date.parse(pausedUntil) - Date.now() + 50, 2_147_000_000);
-    const timer = setTimeout(() => setTick((n) => n + 1), Math.max(0, wait));
+    const timer = setTimeout(() => setNow(Date.now()), Math.max(0, wait));
     return () => clearTimeout(timer);
   }, [pausedUntil, paused]);
   return paused ? pausedUntil : null;

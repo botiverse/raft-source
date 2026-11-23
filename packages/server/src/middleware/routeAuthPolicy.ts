@@ -311,6 +311,12 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
     note: "Agent admin — unarchive a regular public/private channel (actor = bound agent)",
   },
   {
+    method: "POST",
+    path: "/internal/agent-api/channels/member-role",
+    principal: "sk_agent",
+    note: "Agent admin — set a channel member's channel role (admin|member) on the bound agent's own changeChannelMemberRoles authority",
+  },
+  {
     method: "GET",
     path: "/internal/agent-api/events",
     principal: "sk_agent",
@@ -377,6 +383,7 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
   { method: "GET", path: "/internal/agent-api/inbox/conversations", principal: "sk_agent", note: "raft inbox check — agent-self durable unread conversation listing" },
   { method: "POST", path: "/internal/agent-api/inbox/read", principal: "sk_agent", note: "RFC 081 raft inbox read — agent-self: one page of its own inbox item, consuming what it returns" },
   { method: "POST", path: "/internal/agent-api/inbox/dismiss", principal: "sk_agent", note: "RFC 081 raft inbox dismiss — agent-self: its own inbox items marked read without reading" },
+  { method: "POST", path: "/internal/agent-api/inbox/rows", principal: "sk_agent", note: "agent-self: the raft inbox check rows of the conversations its Computer names (read-only; POST for its body)" },
   { method: "GET", path: "/internal/agent-api/assistant/owner-inbox", principal: "sk_agent", note: "RFC 074 assistant — owner's inbox, DMs unless the owner turned that off (RFC 077; assistants only)" },
   { method: "GET", path: "/internal/agent-api/assistant/owner-messages", principal: "sk_agent", note: "RFC 074 assistant — read an owner-visible conversation, DMs unless the owner turned that off (RFC 077; assistants only)" },
   { method: "GET", path: "/internal/agent-api/assistant/owner-artifact", principal: "sk_agent", note: "RFC 075 assistant — read an Artifact the owner can open, by the web's checks with the owner as reader (#proj-assistant:#31; assistants only)" },
@@ -400,6 +407,9 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
   { method: "GET", path: "/internal/agent-api/assistant/told", principal: "sk_agent", note: "RFC 077 step 1 assistant — list what the owner was already told (assistants only)" },
   { method: "POST", path: "/internal/agent-api/threads/follow", principal: "sk_agent", note: "agent-self thread follow (parity with raft task follow)" },
   { method: "POST", path: "/internal/agent-api/threads/unfollow", principal: "sk_agent", note: "RFC v0.8 — agent-self thread unfollow" },
+  { method: "POST", path: "/internal/agent-api/focus", principal: "sk_agent", note: "Focus (agent_focus_v0) — agent-self: focus a thread, DM or task conversation it can read" },
+  { method: "POST", path: "/internal/agent-api/unfocus", principal: "sk_agent", note: "Focus (agent_focus_v0) — agent-self: stop focusing a conversation" },
+  { method: "GET", path: "/internal/agent-api/focus", principal: "sk_agent", note: "Focus (agent_focus_v0) — agent-self: its focused conversations" },
   { method: "GET", path: "/internal/agent-api/profile", principal: "sk_agent", note: "RFC v0.8 — agent-self profile show" },
   { method: "POST", path: "/internal/agent-api/profile", principal: "sk_agent", note: "RFC v0.8 — agent-self profile update" },
   { method: "POST", path: "/internal/agent-api/profile/avatar", principal: "sk_agent", note: "RFC v0.8 — agent-self avatar upload" },
@@ -570,20 +580,6 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
     path: "/internal/computer/runners/:agentId/credentials/renew",
     principal: "sk_computer",
     note: "Runner credential renewal — Computer-requested, for its own runner credential",
-  },
-  {
-    method: "POST",
-    path: "/internal/computer/runners/:agentId/provider-connection",
-    principal: "sk_computer",
-    note: "Server-managed provider credential materialization for an attached Agent",
-  },
-  {
-    // Provider probe claim: the Computer fetches the probe's credentials once
-    // (internalComputer.ts). Unregistered, every daemon call failed closed.
-    method: "POST",
-    path: "/internal/computer/probes/:probeId/materialize",
-    principal: "sk_computer",
-    note: "Provider probe one-time credential materialization",
   },
   {
     method: "DELETE",

@@ -3,6 +3,7 @@ import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import type { FindDirection, FindResult } from "@botiverse/porthole";
 
 import { matchesShortcut, SHORTCUT_SCOPE_ATTRIBUTE, useShortcut } from "../../features/shortcuts";
+import { docOf, useOwnerTimers } from "../../utils/ownerDocument";
 import type { KeyboardShortcutEvent } from "../../utils/keyboardShortcuts";
 import { isEscapeTakenElsewhere } from "./artifactInputMethodKey";
 
@@ -105,12 +106,15 @@ export function useArtifactFindState(): { find: ArtifactFind; frame: ArtifactFin
   const waiting = useRef<string | null>(null);
   /** Counts the queries: only the latest one's answer is shown. */
   const asked = useRef(0);
-  const pause = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The typing pause on the surface's own window's timers: an object window's run while the main window is hidden
+  // (#337 PR3; timersOf).
+  const timers = useOwnerTimers();
+  const pause = useRef<number | null>(null);
 
   const stopPause = useCallback(() => {
-    if (pause.current !== null) clearTimeout(pause.current);
+    if (pause.current !== null) timers.clearTimeout(pause.current);
     pause.current = null;
-  }, []);
+  }, [timers]);
   /** Forget the query and its numbers; the page's highlights too where it still shows them. */
   const reset = useCallback((clearPage: boolean) => {
     stopPause();
@@ -188,8 +192,8 @@ export function useArtifactFindState(): { find: ArtifactFind; frame: ArtifactFin
   const type = useCallback((text: string) => {
     setQuery(text);
     stopPause();
-    pause.current = setTimeout(() => send(text, "none"), FIND_QUERY_PAUSE_MS);
-  }, [send, stopPause]);
+    pause.current = timers.setTimeout(() => send(text, "none"), FIND_QUERY_PAUSE_MS);
+  }, [send, stopPause, timers]);
   const step = useCallback((direction: "next" | "prev") => {
     send(query, query === sent.current ? direction : "none");
   }, [query, send]);
@@ -268,7 +272,8 @@ export function useArtifactFindBodyShortcut(surface: HTMLElement | null, { whole
     surface.setAttribute(SHORTCUT_SCOPE_ATTRIBUTE, "artifact");
     return () => surface.removeAttribute(SHORTCUT_SCOPE_ATTRIBUTE);
   }, [surface]);
-  useShortcut("artifact-find", (event) => (event.target === document.body ? (find?.shortcut(event) ?? false) : false), {
+  // The body of the document the key was typed in (an object window's own, #337 PR3).
+  useShortcut("artifact-find", (event) => (event.target === docOf(event.target).body ? (find?.shortcut(event) ?? false) : false), {
     enabled: surface !== null,
     scopeRef: surfaceRef,
     ambient: wholePage,

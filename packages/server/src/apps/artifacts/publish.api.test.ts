@@ -31,6 +31,7 @@ import { TITLE_REQUIRED_ERROR } from "./publish";
 import { deleteArtifact } from "./manage";
 import { ARTIFACT_NOTICE_TTL_MS } from "./notices";
 import { __settlePublicTextFillsForTests } from "./publicText";
+import { __setArtifactReferencesFillForTests } from "./references";
 import { __setScrollLockCheckForTests } from "./scrollLock";
 import {
   artifactBlobs,
@@ -636,6 +637,7 @@ test("missing bytes: listed by sha256, answered with what is missing, uploaded, 
       ["create", "1", "0", "missing", 200, "ok"],
     ]);
     assert.equal(spans[2]!.attrs?.kind, "html");
+    assert.deepEqual([spans[2]!.attrs?.entry, spans[2]!.attrs?.target_kind], ["default", "channel"], "the kind of place, never its name");
     assert.equal(spans[2]!.attrs?.check, "none", "the check flag is off here: no publish check recorded");
     for (const span of spans) {
       const parent = sink.getAllSpans().find((candidate) => candidate.context.spanId === span.context.parentSpanId);
@@ -1021,6 +1023,19 @@ test("limits: each with its code and limit; the JSON body may be large on this r
       details: { path: "x.png" },
     }));
     assert.deepEqual(await refused({ target, entry: "home.html", files: [text("index.html", "x")] }), entryNotFound("home.html"));
+    // No entry named and no index.html: more than one page to open at is said with the pages, none at all too (artifactDefaultEntry).
+    assert.deepEqual(await refused({ target, title: "t", files: [text("b.html", "x"), text("a.html", "y"), text("data.json", "{}")] }), refusal({
+      code: "ENTRY_NOT_FOUND",
+      error: `This push names no entry file and has no index.html, but more than one page it could open at: "a.html", "b.html".`,
+      suggestedNextAction: "Name the one it opens at (--entry on the CLI, entry in a tool call), then push again.",
+      details: { entry: null, candidates: ["a.html", "b.html"] },
+    }));
+    assert.deepEqual(await refused({ target, title: "t", files: [text("data.json", "{}"), text("notes.txt", "x")] }), refusal({
+      code: "ENTRY_NOT_FOUND",
+      error: "This push names no entry file, and it has no index.html, HTML page or Markdown file to open at.",
+      suggestedNextAction: "Push the page it should open at, or name the entry file (--entry on the CLI, entry in a tool call).",
+      details: { entry: null, candidates: [] },
+    }));
     assert.deepEqual(await refused({ target, files: [text("index.html", "x"), text("b.html", "y")], delete: ["c.html"] }), refusal({
       code: "FILE_NOT_FOUND",
       error: "A new artifact has no files to delete: leave the deletes out of its first push.",
@@ -1283,8 +1298,9 @@ async function fillCounts(): Promise<{ filled: number; fill_failed: number }> {
 
 test("a push to a public Artifact stores its signed-out text from the inline entry, no storage read; to a private one nothing; a failing fill still answers 201", async ({ app, seed }) => {
   const world = await seedWorld(seed);
-  // The scroll-lock check reads the other pages from storage too (scrollLock.api.test.ts); here only the text fill's reads count.
+  // The scroll-lock check and the links fill read the other pages from storage too (scrollLock.api.test.ts, references.api.test.ts); here only the text fill's reads count.
   __setScrollLockCheckForTests(false);
+  __setArtifactReferencesFillForTests(false);
   try {
     let reads = 0;
     let failReads = false;
@@ -1327,6 +1343,7 @@ test("a push to a public Artifact stores its signed-out text from the inline ent
   } finally {
     __setArtifactR2StoreForTests(undefined);
     __setScrollLockCheckForTests(undefined);
+    __setArtifactReferencesFillForTests(undefined);
   }
 });
 

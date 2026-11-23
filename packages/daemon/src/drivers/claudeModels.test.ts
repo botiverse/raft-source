@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 
-import { projectClaudeModels, type ListModelsResult, type ModelLister } from "@botiverse/oar";
+import type { ListModelsResult, ModelEntry, ModelLister } from "@botiverse/oar";
 import { getStaticRuntimeModelSourceSet } from "@botiverse/raft-shared";
 
 import { ClaudeDriver } from "./claude";
@@ -10,17 +10,19 @@ import { detectClaudeModelSource } from "./claudeModels";
 
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 
-/** A `list_models` control response in the shape Claude Code 2.1 answers (trimmed). */
-const CONTROL_RESPONSE = {
-  models: [
-    { value: "default", resolvedModel: "claude-opus-5-5", displayName: "Default (recommended)", supportedEffortLevels: EFFORTS, supportsFastMode: true },
-    { value: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus 5.5", supportedEffortLevels: EFFORTS, supportsFastMode: true },
-    { value: "haiku", resolvedModel: "claude-haiku-5-5", displayName: "Haiku 5.5", supportedEffortLevels: EFFORTS },
-    { value: "claude-haiku-4-5-20251001", resolvedModel: "claude-haiku-4-5-20251001", displayName: "Haiku 4.5" },
-    { value: "claude-opus-4-8", resolvedModel: "claude-opus-4-8", displayName: "Opus 4.8", supportedEffortLevels: EFFORTS, supportsFastMode: true },
-    { value: "claude-opus-9", resolvedModel: "claude-opus-9", displayName: "Opus 9", disabled: true, description: "Upgrade Claude Code" },
-  ],
-};
+/**
+ * What OAR's Claude lister returns for Claude Code 2.1's `list_models` control
+ * response (trimmed). (Turning Claude's raw answer into these entries is OAR's
+ * to test, not Raft's.)
+ */
+const MODELS: ModelEntry[] = [
+  { id: "default", resolvedId: "claude-opus-5-5", displayName: "Default (recommended)", effortLevels: EFFORTS, serviceTiers: ["fast"] },
+  { id: "opus", resolvedId: "claude-opus-5-5", displayName: "Opus 5.5", effortLevels: EFFORTS, serviceTiers: ["fast"] },
+  { id: "haiku", resolvedId: "claude-haiku-5-5", displayName: "Haiku 5.5", effortLevels: EFFORTS },
+  { id: "claude-haiku-4-5-20251001", resolvedId: "claude-haiku-4-5-20251001", displayName: "Haiku 4.5" },
+  { id: "claude-opus-4-8", resolvedId: "claude-opus-4-8", displayName: "Opus 4.8", effortLevels: EFFORTS, serviceTiers: ["fast"] },
+  { id: "claude-opus-9", resolvedId: "claude-opus-9", displayName: "Opus 9", disabled: { reason: "Upgrade Claude Code" } },
+];
 
 function lister(result: ListModelsResult | (() => Promise<ListModelsResult>)): ModelLister & { calls: number } {
   const fn = Object.assign(async () => {
@@ -36,7 +38,7 @@ const bundled = { kind: "live", value: getStaticRuntimeModelSourceSet("claude") 
 test("Claude's own model list becomes the live catalog: aliases say what they run, today's concrete IDs stay pinnable", async () => {
   const outcome = await detectClaudeModelSource({
     ...withCommand,
-    listModels: lister({ kind: "ok", models: projectClaudeModels(CONTROL_RESPONSE) }),
+    listModels: lister({ kind: "ok", models: MODELS }),
   });
   assert.deepEqual(outcome, {
     kind: "live",
@@ -62,12 +64,10 @@ test("an alias whose resolved ID Claude already lists is not pinned twice", asyn
     ...withCommand,
     listModels: lister({
       kind: "ok",
-      models: projectClaudeModels({
-        models: [
-          { value: "opus", resolvedModel: "claude-opus-4-8", displayName: "Opus 4.8" },
-          { value: "claude-opus-4-8", resolvedModel: "claude-opus-4-8", displayName: "Opus 4.8" },
-        ],
-      }),
+      models: [
+        { id: "opus", resolvedId: "claude-opus-4-8", displayName: "Opus 4.8" },
+        { id: "claude-opus-4-8", resolvedId: "claude-opus-4-8", displayName: "Opus 4.8" },
+      ],
     }),
   });
   assert.equal(outcome.kind, "live");
@@ -80,12 +80,10 @@ test("an effort the bundled list offered for a model stays offered, so an agent 
     ...withCommand,
     listModels: lister({
       kind: "ok",
-      models: projectClaudeModels({
-        models: [
-          { value: "claude-opus-4-6", resolvedModel: "claude-opus-4-6", displayName: "Opus 4.6", supportedEffortLevels: ["low", "medium", "high", "max"] },
-          { value: "claude-opus-4-1", resolvedModel: "claude-opus-4-1", displayName: "Opus 4.1", supportedEffortLevels: ["low", "high"] },
-        ],
-      }),
+      models: [
+        { id: "claude-opus-4-6", resolvedId: "claude-opus-4-6", displayName: "Opus 4.6", effortLevels: ["low", "medium", "high", "max"] },
+        { id: "claude-opus-4-1", resolvedId: "claude-opus-4-1", displayName: "Opus 4.1", effortLevels: ["low", "high"] },
+      ],
     }),
   });
   assert.equal(outcome.kind, "live");
@@ -130,7 +128,7 @@ test("without a live list Claude answers with its bundled catalog, as before det
 });
 
 test("no claude on this computer answers with the bundled catalog without listing", async () => {
-  const listModels = lister({ kind: "ok", models: projectClaudeModels(CONTROL_RESPONSE) });
+  const listModels = lister({ kind: "ok", models: MODELS });
   assert.deepEqual(await detectClaudeModelSource({ resolveCommand: async () => null, listModels }), bundled);
   assert.equal(listModels.calls, 0);
 });

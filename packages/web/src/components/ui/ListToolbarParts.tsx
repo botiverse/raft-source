@@ -24,7 +24,7 @@ import {
 import { FitToolbarGroup, FitToolbarMore, FitToolbarMoreItems, FitToolbarPicker, useFitItem } from "@botiverse/raft-ui/wip";
 import { LIST_TOOLBAR_STEP } from "./listToolbar";
 
-/** One choice of a list's scope (Mine / All, Installed / Marketplace): its name, its count when known. */
+/** One choice of a list's scope (Mine / All, Yours / Discover): its name, its count when known. */
 export interface ListScopeOption<T extends string> {
   value: T;
   label: string;
@@ -42,8 +42,8 @@ export interface ListScopeOption<T extends string> {
 const SEGMENTED_IN_LINE_CLASS = "-my-[3px]";
 
 /**
- * The scope at the start of a list's toolbar (Mine / All, Installed /
- * Marketplace / Developer): a segmented control, each segment with its count
+ * The scope at the start of a list's toolbar (Mine / All, Yours /
+ * Discover): a segmented control, each segment with its count
  * (Raft DS › Page structure), giving way to a Select at step 5 once it
  * doesn't fit, by touch and with a mouse alike.
  */

@@ -27,6 +27,7 @@ import {
   createManagedMcpServer,
   executeManagedMcpCall,
   getManagedMcpRuntimeSnapshot,
+  isMcpConnectionAuthorized,
   setManagedMcpAssignment,
   RAFT_APPS_MCP_SERVER_ID,
 } from "./managedMcpService";
@@ -141,6 +142,8 @@ async function seedOAuthApp() {
   const agent = await createAgent(server.id, `agent-${randomUUID().slice(0, 8)}`, { creatorType: "user", creatorId: user.id });
   const app = await createManagedMcpServer({
     serverId: server.id, userId: user.id, name: "Docs", authMode: "oauth", endpointUrl: ENDPOINT,
+    // As the owner's own create: vouched, so every Agent has the App.
+    vouchAsCreator: true,
   });
   await getDb().update(managedMcpCredentials)
     .set({ encryptedOAuth: encryptManagedMcpSecret(oauthStorage("default-access-token")), authStatus: "ready" })
@@ -183,7 +186,8 @@ test("⭐ a new Connection's sign-in writes a pending row, completes only that r
   assert.equal(pending.name, "Second workspace");
   const [attempt] = await getDb().select().from(managedMcpOAuthAttempts).where(eq(managedMcpOAuthAttempts.id, started.attemptId));
   assert.equal(attempt.connectionId, pending.id, "the attempt names its Connection");
-  assert.deepEqual(attempt.intent, { agentId: f.agent.id });
+  // `name`: the sign-in made this Connection (the callback audits mcp_connection.created).
+  assert.deepEqual(attempt.intent, { agentId: f.agent.id, name: "Second workspace" });
   assert.equal((await getManagedMcpOAuthAttemptStatus({ serverId: f.server.id, userId: f.user.id, attemptId: started.attemptId })).status, "pending");
   assert.equal((await connection(f.defaultConnectionId)).authStatus, "ready", "starting a sign-in elsewhere leaves the default usable");
   assert.equal((await appRow(f.appId)).oauthStatus, "connected", "and the App-level mirror of the default alone");
@@ -511,7 +515,7 @@ test("⭐ pendingGrant: the viewer's own finished sign-in for this Agent, until 
   assert.equal((await project(f.user.id)).pendingGrant, null, "⭐ once the Agent uses it, it is not offered again");
 });
 
-test("⭐ pendingGrant: a server manager's sign-in for someone else's Agent is not offered, because it could not be pinned", async () => {
+test("⭐ pendingGrant: an admin's sign-in for someone else's Agent is offered, because an admin may pin it (RFC 087)", async () => {
   const f = await seedOAuthApp();
   await getDb().update(managedMcpCredentials).set({ authStatus: "expired" }).where(eq(managedMcpCredentials.id, f.defaultConnectionId));
   const [admin] = await getDb().insert(users).values({
@@ -525,13 +529,11 @@ test("⭐ pendingGrant: a server manager's sign-in for someone else's Agent is n
   await completeManagedMcpOAuthCallback({ state: stateOf(started.authorizationUrl), authorizationCode: "admin-code" });
   const view = await projectMcpConnectionAuthorization({ serverId: f.server.id, viewerUserId: admin.id, mcpServerId: f.appId, agentId: f.agent.id });
   assert.equal(view.viewerRole, "server_manager");
-  assert.equal(view.newConnectionPinnable, false, "the admin is not this Agent's owner");
-  assert.equal(view.pendingGrant, null, "⭐ not offered as Ready to grant");
-  assert.ok(!view.candidates.some((candidate) => candidate.connectionId === started.connectionId), "nor as a candidate");
-  await assert.rejects(
-    setManagedMcpAssignment({ serverId: f.server.id, userId: admin.id, agentId: f.agent.id, mcpServerId: f.appId, enabled: true, connectionId: started.connectionId }),
-    { code: "managed_mcp_connection_not_usable" },
-  );
+  assert.equal(view.newConnectionPinnable, true, "an admin may pin any shared Connection");
+  assert.deepEqual(view.pendingGrant, { connectionId: started.connectionId, name: "Admin's Docs" }, "⭐ offered as Ready to grant");
+  assert.ok(view.candidates.some((candidate) => candidate.connectionId === started.connectionId), "and as a candidate");
+  await setManagedMcpAssignment({ serverId: f.server.id, userId: admin.id, agentId: f.agent.id, mcpServerId: f.appId, enabled: true, connectionId: started.connectionId });
+  assert.equal(await isMcpConnectionAuthorized(getDb(), f.server.id, f.agent.id, f.appId), true, "⭐ the Agent is admitted with the admin's shared Connection");
 });
 
 test("canAuthorizeNew: an App without auth needs no Connection; an API-key one is a server manager's to add", async () => {

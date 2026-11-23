@@ -9,7 +9,7 @@ import type { MessageId } from "../../i18n/messages/en";
 import type { Machine } from "../../store/machineStore";
 import { formatActivityText, formatAgentDisplayStateText } from "../../utils/activity";
 import { MemberEntryAppTag, MemberEntryAvatar, MemberEntryRoleWord } from "./MemberEntryParts";
-import { agentRuntimeFacts } from "./memberEntryFacts";
+import { agentReasoningEffortFact, agentRuntimeFacts } from "./memberEntryFacts";
 import { useRuntimeDeprecatedHere } from "../../hooks/useServerRuntimeCatalog";
 import { MemberMenuTrigger } from "./MemberMenuTrigger";
 import { MEMBER_ROW_MIN_H } from "./memberRowHeights";
@@ -22,12 +22,17 @@ import { useCanEditAgent } from "./memberTileParts";
 // The columns' tracks, shared by the heading row and every row so they line
 // up. Status is as wide as its longest short presence word in this locale
 // (StatusColumn), so none is ever cut; Model
-// has the most room, for names like "DeepSeek V4 Pro · DeepSeek". A value cut
-// short shows whole in its title. Below 760px of list width the runtime,
-// model and computer fold into one mono line under the description; Status
-// stays a column.
+// has the most room, for names like "DeepSeek V4 Pro · DeepSeek"; Reasoning
+// fits its longest level ("Extra high"). A value cut short shows whole in its
+// title. Below 760px of list width the runtime, model and computer fold into
+// one mono line under the description; Status stays a column. Reasoning needs
+// 1040px of list, as the usage view's Model: at 760px its 96px took the name's
+// last room (nothing left for name and description until ~830px, a 23-letter
+// name ran into Status until ~1010px), so below 1040px it just hides (a bare
+// level in the folded line would say nothing; the profile has it).
 const COL_RUNTIME = "hidden w-[104px] shrink-0 @[760px]/members-list:flex";
 const COL_MODEL = "hidden w-[176px] shrink-0 @[760px]/members-list:flex";
+const COL_REASONING = "hidden w-[96px] shrink-0 @[1040px]/members-list:flex";
 const COL_COMPUTER = "hidden w-[136px] shrink-0 @[760px]/members-list:flex";
 // The usage view (MembersAgentUsage) has more columns: its Model needs 1040px
 // of list, below which it folds under the name with the runtime.
@@ -79,7 +84,7 @@ function StatusColumn({ children, id, testId, role }: { children: ReactNode; id?
   );
 }
 
-function Fact({ id, value, className, testId }: { id: string; value: string | null; className: string; testId?: string }) {
+function Fact({ id, value, className, testId }: { id?: string; value: string | null; className: string; testId?: string }) {
   return (
     <span id={id} className={`${className} ${CELL}`} data-testid={testId}>
       {value ? <ListRowMeta title={value}>{value}</ListRowMeta> : <ListRowMeta>—</ListRowMeta>}
@@ -120,6 +125,7 @@ const AgentRow = memo(function AgentRow({ entry, machine, showComputer, selected
     : formatActivityText(formatMessage, state.activity, "");
   const external = Boolean(state.isExternal && !state.isOnline);
   const { runtime, model } = agentRuntimeFacts(agent, formatMessage, deprecatedHere);
+  const reasoning = agentReasoningEffortFact(agent, formatMessage);
   const folded = usage
     ? [model, runtime].filter(Boolean).join(" · ")
     : [runtime, model, showComputer ? machine?.name : null].filter(Boolean).join(" · ");
@@ -131,6 +137,7 @@ const AgentRow = memo(function AgentRow({ entry, machine, showComputer, selected
       `${id}-status`,
       `${id}-runtime`,
       `${id}-model`,
+      reasoning ? `${id}-reasoning` : null,
       showComputer ? `${id}-computer` : null,
     ]).filter(Boolean).join(" ");
   return (
@@ -188,6 +195,13 @@ const AgentRow = memo(function AgentRow({ entry, machine, showComputer, selected
       ) : null}
       {usage ? null : <Fact id={`${id}-runtime`} value={runtime} className={COL_RUNTIME} />}
       {usage ? null : <Fact id={`${id}-model`} value={model} className={COL_MODEL} />}
+      {usage ? null : (
+        <>
+          {/* The level alone ("High") says nothing read out of its column: the row's description says what it is. */}
+          {reasoning ? <span id={`${id}-reasoning`} hidden>{formatMessage({ id: "members.page.reasoningEffortDescription" }, { level: reasoning })}</span> : null}
+          <Fact value={reasoning} className={COL_REASONING} testId={`members-agent-reasoning-${agent.id}`} />
+        </>
+      )}
       {showComputer && !usage ? (
         // The computer's name with its own light; a dash for an agent on no computer.
         <span id={`${id}-computer`} className={`${COL_COMPUTER} ${CELL}`} data-testid={`members-agent-computer-${agent.id}`}>
@@ -245,8 +259,8 @@ export function AgentRowSkeleton() {
 
 /**
  * One group of the Agents tab (raft-design Members › Agents as a list): a
- * raft-ui ListRowGroup, one ListRow per agent, with Status, Runtime, Model and
- * Computer columns, or in the usage view Status, Model and the usage columns.
+ * raft-ui ListRowGroup, one ListRow per agent, with Status, Runtime, Model,
+ * Reasoning and Computer columns, or in the usage view Status, Model and the usage columns.
  * The column cells and their heading are hand-rolled: the DS has no column
  * part for ListRow yet (an upstream raft-ui candidate), and the Computers list
  * draws its own the same way (mono meta in hint).
@@ -276,6 +290,10 @@ export function MembersAgentGroup({ heading, entries, machinesById, showComputer
               <StatusColumn><span className={HEADING_LABEL}>{formatMessage({ id: "members.page.column.status" })}</span></StatusColumn>
               <span className={`${COL_RUNTIME} ${HEADING_LABEL}`}>{formatMessage({ id: "members.page.column.runtime" })}</span>
               <span className={`${COL_MODEL} ${HEADING_LABEL}`}>{formatMessage({ id: "members.page.column.model" })}</span>
+              {/* A long locale's word ("Глубина рассуждений") is cut short, whole in its title. */}
+              <span className={`${COL_REASONING} ${HEADING_LABEL}`}>
+                <span className="min-w-0 truncate" title={formatMessage({ id: "members.page.column.reasoningEffort" })}>{formatMessage({ id: "members.page.column.reasoningEffort" })}</span>
+              </span>
               {showComputer ? <span className={`${COL_COMPUTER} ${HEADING_LABEL}`}>{formatMessage({ id: "members.page.column.computer" })}</span> : null}
               <span aria-hidden className={COL_ACTIONS} />
             </>

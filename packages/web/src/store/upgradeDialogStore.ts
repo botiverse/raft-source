@@ -55,10 +55,17 @@ export type HistoryLimitContext =
  * held by an `openInvite` to it no one has accepted yet; without a channel,
  * the gate's own words. `connect`: upgrading this server so it can connect to
  * another server's `channel` (the invitee's page, the approver's page).
+ * Those two are for `external_channel_free_limit`. `freeze_upcoming`, for
+ * `external_channel_frozen` before the freeze (ExternalFreezeNotice): the
+ * server can still post in its external channels until `deadline` (ISO, the
+ * channel's externalFreezeAt; the dialog formats it in the viewer's locale and
+ * carries it through Stripe's return, UPGRADE_FREEZE_AT_PARAM), so the dialog
+ * says it won't from then.
  */
 export type ExternalLimitContext =
   | { kind: "slot"; channel?: string; openInvite?: boolean }
-  | { kind: "connect"; channel: string };
+  | { kind: "connect"; channel: string }
+  | { kind: "freeze_upcoming"; deadline: string };
 
 export type UpgradeDialogRequest = {
   gate: UpgradeGate;
@@ -76,7 +83,7 @@ export type UpgradeDialogRequest = {
   uploadContext?: UploadLimitContext;
   /** Set when a conversation's history paywall opened it (`history_30d`). */
   historyContext?: HistoryLimitContext;
-  /** Set when the external channel limit opened it (`external_channel_free_limit`). */
+  /** Set when the external channel limit opened it (`external_channel_free_limit`), or the freeze notice (`external_channel_frozen`, `freeze_upcoming`). */
   externalContext?: ExternalLimitContext;
   /** Where the paywall that opened it was met (history_30d, Save as Artifact's quota): its actions and checkout carry it. */
   surface?: PaywallSurface;
@@ -139,7 +146,7 @@ export type OpenUpgradeDialogOptions = {
   uploadContext?: UploadLimitContext;
   /** What the history window hid in the conversation it opened from. */
   historyContext?: HistoryLimitContext;
-  /** Which external channel holds the Free slot, or which one this server would connect to. */
+  /** Which external channel holds the Free slot, which one this server would connect to, or when its external channels freeze. */
   externalContext?: ExternalLimitContext;
   /** Where the paywall was met, for a gate shown in several places (history_30d, upload_monthly_quota from an Artifact). */
   surface?: PaywallSurface;

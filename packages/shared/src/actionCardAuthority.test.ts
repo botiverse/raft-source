@@ -26,3 +26,15 @@ test("agent:migrate takes what POST /api/agents/:id/migrate takes: the Agent's c
     { kind: "agent", capability: "migrateAgents", why: undefined },
   );
 });
+
+test("channel:create takes the capability of the card's visibility (POST /api/channels' rule)", () => {
+  const capabilityFor = (payload?: unknown) => {
+    const authority = actionCardTypeAuthority("channel:create", payload);
+    return authority.kind === "none" ? null : authority.capability;
+  };
+  assert.equal(capabilityFor({ type: "channel:create", name: "x", visibility: "private" }), "createPrivateChannels");
+  assert.equal(capabilityFor({ type: "channel:create", name: "x", visibility: "public" }), "createPublicChannels");
+  // The schema's default is public.
+  assert.equal(capabilityFor({ type: "channel:create", name: "x" }), "createPublicChannels");
+  assert.equal(capabilityFor(), "createPublicChannels");
+});

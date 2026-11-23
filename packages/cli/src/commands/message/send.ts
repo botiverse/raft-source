@@ -25,7 +25,7 @@ import {
   renderAgentHoldPreview,
   structuredRaftMentionStillAppears,
   TASK_TARGET_USE_TASK_COMMAND_ERROR_CODE,
-  CONTINUATIONS_DRAFT_FLOW_RUNTIMES,
+  CONTINUATIONS_PILOT_RUNTIMES,
 } from "@botiverse/raft-shared/src/agentCliSurface";
 import { detectThreadTargetMismatch, type ThreadTargetMismatch } from "@botiverse/raft-shared/src/agentOps/seenPolicy/index";
 
@@ -1717,15 +1717,17 @@ export function registerSendCommand(parent: Command, runtimeOptions: CommandRunt
 // ---- the continuation pilot (message/_sendContinuation.ts) ----
 
 /**
- * The draft flow stays for runtimes the pilot fails (codex: it read the
- * pause's exit 10 as a failure and sent again, #wg-ax:#5). The Server already
- * reports the pilot off for them; this covers a server without that check.
- * The runtime is what the daemon passes the CLI; an unknown or missing
- * runtime keeps the pilot's behaviour.
+ * The pilot reaches only the runtimes that answer it (Claude); the others
+ * keep the draft flow (codex read the pause's exit 10 as a failure and sent
+ * again; builtin, kimi-sdk and antigravity mostly left it unanswered,
+ * #wg-ax:#5). The Server already reports the pilot off for them; this covers
+ * a server without that check. The runtime is what the daemon passes the
+ * CLI; a missing or malformed one (a profile-login CLI, an older daemon)
+ * leaves the decision to the Server.
  */
 function continuationsSupportedRuntime(env: NodeJS.ProcessEnv): boolean {
   const runtime = cliTraceRuntime(env);
-  return runtime === undefined || !CONTINUATIONS_DRAFT_FLOW_RUNTIMES.has(runtime);
+  return runtime === undefined || CONTINUATIONS_PILOT_RUNTIMES.has(runtime);
 }
 
 const pilotReads = new WeakMap<CommandContext, Promise<boolean>>();

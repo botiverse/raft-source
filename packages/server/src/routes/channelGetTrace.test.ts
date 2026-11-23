@@ -9,10 +9,11 @@ import {
   channelGetTargetTraceAttrs,
   INBOX_FETCH_COALESCED_CAP,
   INBOX_FETCH_COALESCED_HEADER,
+  INBOX_FETCH_REFUSED_HEADER,
   INBOX_FETCH_TRIGGER_HEADER,
   inboxFetchTriggerTraceAttrs,
 } from "./channelGetTrace";
-import { INBOX_REFRESH_TRIGGERS } from "@botiverse/raft-shared";
+import { INBOX_REFRESH_REFUSALS, INBOX_REFRESH_TRIGGERS } from "@botiverse/raft-shared";
 
 test("records the channel type and each agreed fetch reason", () => {
   for (const reason of CHANNEL_FETCH_REASONS) {
@@ -84,4 +85,20 @@ test("#triage:#229: an absent trigger is unknown, an unlisted one other; a bad c
     assert.equal(inboxFetchTriggerTraceAttrs("dm_new", bad).fetch_coalesced, 0, bad);
   }
   assert.equal(inboxFetchTriggerTraceAttrs("dm_new", "999999999").fetch_coalesced, INBOX_FETCH_COALESCED_CAP);
+});
+
+test("#244: records each agreed refusal next to the trigger as fetch_refused", () => {
+  assert.equal(INBOX_FETCH_REFUSED_HEADER, "x-raft-fetch-refused");
+  for (const refused of INBOX_REFRESH_REFUSALS) {
+    assert.deepEqual(inboxFetchTriggerTraceAttrs("thread_reply", "2", refused), { fetch_trigger: "thread_reply", fetch_coalesced: 2, fetch_refused: refused });
+  }
+  assert.equal(inboxFetchTriggerTraceAttrs("message_new", "1", ["not_settled", "not_listed"]).fetch_refused, "not_settled");
+});
+
+test("#244: an absent refusal records nothing (older webs); an unlisted one is other", () => {
+  assert.deepEqual(inboxFetchTriggerTraceAttrs("thread_reply", "1"), { fetch_trigger: "thread_reply", fetch_coalesced: 1 });
+  assert.deepEqual(inboxFetchTriggerTraceAttrs("thread_reply", "1", ""), { fetch_trigger: "thread_reply", fetch_coalesced: 1 });
+  for (const bad of ["Not_Listed", "not_listed; drop table", "thread_reply", "unknown", "skipped"]) {
+    assert.equal(inboxFetchTriggerTraceAttrs("thread_reply", "1", bad).fetch_refused, "other", bad);
+  }
 });

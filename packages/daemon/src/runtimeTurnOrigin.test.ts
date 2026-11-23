@@ -153,7 +153,7 @@ test("⭐ wiring: every driver that builds a managed MCP call surface hands it t
   assert.deepEqual(
     sites.map((site) => site.split(":")[0]).sort(),
     [
-      "antigravity.deprecated.ts",
+      "antigravity.ts",
       "claude.ts",
       "codex.ts",
       "copilot.ts",

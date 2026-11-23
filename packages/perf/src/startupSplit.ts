@@ -323,3 +323,35 @@ export function endpointOf(url: string, openedChannelId?: string): { path: strin
   const keys = [...new Set([...u.searchParams.keys()])];
   return { path, query: keys.length ? `?${keys.join("&")}` : "" };
 }
+
+/** Two sessions disagree when their medians are this far apart, both as a ratio and in milliseconds (0.3 s: the smallest change worth chasing, Artea 2026-11-15). */
+export const SESSION_DISAGREE_RATIO = 1.5;
+export const SESSION_DISAGREE_MS = 300;
+
+export interface SessionAgreement {
+  /** Median of each session's values (null for a session with none). */
+  medians: Array<number | null>;
+  /** Largest over smallest session median; null with fewer than two sessions that have one. */
+  ratio: number | null;
+  /** False when the slowest and fastest session medians differ by more than both thresholds. */
+  agree: boolean;
+}
+
+/**
+ * Do separate browser sessions tell the same story? Measured 2026-11-16 on Browser Run: the same build read 1.24 s in one
+ * session and 2.78 s in another, so a single session's median is not evidence of a change. One session always "agrees".
+ */
+export function sessionAgreement(perSession: ReadonlyArray<ReadonlyArray<number | null | undefined>>): SessionAgreement {
+  const medians = perSession.map((values) => median(values));
+  const known = medians.filter((m): m is number => m != null);
+  // a session with no reading next to one with readings is itself a disagreement (one browser never painted)
+  if (known.length && known.length < medians.length) return { medians, ratio: null, agree: false };
+  if (known.length < 2) return { medians, ratio: null, agree: true };
+  const lo = Math.min(...known);
+  const hi = Math.max(...known);
+  // ratio is null when the fastest median is 0; then only the milliseconds decide. Rounded before it is compared, so
+  // the report never shows "1.5" beside agree: false.
+  const ratio = lo > 0 ? Math.round((hi / lo) * 100) / 100 : null;
+  const agree = !(hi - lo > SESSION_DISAGREE_MS && (ratio == null || ratio > SESSION_DISAGREE_RATIO));
+  return { medians, ratio, agree };
+}

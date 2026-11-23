@@ -17,9 +17,9 @@ import { runSeaHostProbe } from "./seaHostHarness";
  * NOBODY IS WATCHING THIS SWITCH. No hosted gate runs this suite: it sits
  * outside the default test glob on purpose (the `.sea-suite.ts` suffix), and no
  * workflow references `test:sea-host`. This is structural, not incidental:
- * `mutation-diff-gate` is the only mutation-aware check and it mutates only
- * web source with the web DOM suite as its oracle, so a daemon file is not in
- * its universe at all — and it is advisory anyway. No existing gate could ever
+ * The only mutation-aware tool (`scripts/ci/mutation-diff-gate.ts`, local and
+ * advisory; no workflow runs it) mutates only web source with the web DOM
+ * suite as its oracle, so a daemon file is not in its universe at all. No existing gate could ever
  * protect this suite. A green CI run on a change to this file therefore says
  * only "nothing else broke" — never "this harness still works". If someone edits it into a
  * permanent pass, no gate turns red and the next person to notice is whoever

@@ -41,6 +41,7 @@ import {
 import { compareRealFiles, type ResolveRealPath } from "./realFileIdentity";
 import { resolveSelfExec, selfExecHostFromProcess } from "@botiverse/raft-shared/src/selfExec";
 import { runContextViewRestoreChildEntry, runRuntimeDetectionChildEntry } from "./runtimeDetectionEntry";
+import { installSystemCaTrust } from "@botiverse/raft-shared/src/systemTrust";
 
 export { SHELL_ENV_STATE_ENV_VAR };
 
@@ -180,6 +181,7 @@ export async function bootstrapThenRun(
     await runBundledRaftCli(cliArgv);
   },
   runRuntimeDetectionChild: () => Promise<number> = runRuntimeDetectionChildEntry,
+  installTrust: () => void = installSystemCaTrust,
 ): Promise<void> {
   const legacyInvocation = parseLegacyOsSupervisorInvocation(argv);
   if (legacyInvocation) {
@@ -213,6 +215,13 @@ export async function bootstrapThenRun(
     process.exitCode = await runRuntimeDetectionChild();
     return;
   }
+  // Trust the OS certificate store (a re-signing proxy's CA the owner installed
+  // system-wide) before the CLI graph, the service or a `__run` daemon makes
+  // any TLS connection. `__cli` is skipped here because most agent calls only
+  // reach the loopback agent proxy over plain http; the agent CLI installs it
+  // itself before its first direct HTTPS request (cli/src/proxy.ts
+  // ensureSystemCaTrustFor). Reading the store costs tens of ms.
+  installTrust();
   await bootstrapSupervisedServiceEnv(argv, env, capture);
   const cli = await importCli();
   cli.runCliAsMain();

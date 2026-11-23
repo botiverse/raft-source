@@ -62,7 +62,9 @@
  * trigger), stop the agents (a manual stop persists `stopped`, which no
  * message wakes), tell the owners of the agents on a Computer revoked on
  * someone else's machine (as leaving a server tells them), schedule the subscriptions' cancellation (a separate, Server-fenced
- * mutation transaction after the deletion request committed), and send the "scheduled for deletion" email.
+ * mutation transaction after the deletion request committed), tell the admins of each server with MCP App
+ * Connections signed in as the person (managedMcpSignedInBy.ts: OAuth ones are disconnected at the
+ * deletion, not before), and send the "scheduled for deletion" email, which lists those OAuth ones.
  *
  * Cancelling marks the request `cancelled` and sends a confirmation email.
  * Nothing that was revoked or stopped comes back: the person starts their
@@ -93,6 +95,7 @@ import { sendAccountDeletionEmail, type AccountDeletionEmailEvent } from "../ema
 import { runSecurityRevokeCascade } from "../securityRevokeCascade";
 import { revokeAllUserSessionsInTransaction } from "../sessionService";
 import { removeWeChatBridgeOfDeletedAccount } from "../wechatBridgeCleanup";
+import { noticeConnectionsBeforeAccountDeletion } from "../managedMcpSignedInBy";
 import { newAuditOperationId, recordIntegrationAuditEvent } from "../integrationAuditService";
 import { findAgentsBoundToMachines, unbindAndStopAgents, type AgentOwner } from "../computerAgents";
 import { ownerNotifyTimes, readOwnerNotifiedAt, withOwnerNotifyTimes } from "./ownerNotices";
@@ -894,9 +897,16 @@ export async function runAccountDeletionRequestedEffects(effects: AccountDeletio
     });
   }
   const stillPending = await findPendingAccountDeletion(getDb(), userId);
-  if (stillPending?.id === effects.requestId) await notify(effects.email, effects.name, userId, {
+  if (stillPending?.id !== effects.requestId) return;
+  // MCP Connections signed in as the person: each server's admins are told (OAuth ones stop at the
+  // deletion, cleanup.ts revoke_managed_mcp_sign_ins), and the OAuth ones are listed in the email.
+  const mcpConnectionsEnding = await noticeConnectionsBeforeAccountDeletion({
+    requestId: effects.requestId, userId, personName: effects.name, scheduledFor: effects.scheduledFor,
+  });
+  await notify(effects.email, effects.name, userId, {
     kind: "requested", scheduledFor: effects.scheduledFor, paidServersEnding: effects.paidServersEnding,
     subscriptionCancellationUnconfirmed: hasUnconfirmedSubscriptionCancellation(stillPending), cancelToken: effects.cancelToken ?? undefined,
+    ...(mcpConnectionsEnding.length > 0 ? { mcpConnectionsEnding } : {}),
   });
 }
 

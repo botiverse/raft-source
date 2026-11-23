@@ -1,7 +1,7 @@
 import { Panel, ScrollArea, Spinner } from "@botiverse/raft-ui";
 import { useEffect, useMemo } from "react";
 import type { ReactNode } from "react";
-import { PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY, SLACK_BRIDGE_FEATURE_FLAG_KEYS } from "@botiverse/raft-shared";
+import { SLACK_BRIDGE_FEATURE_FLAG_KEYS } from "@botiverse/raft-shared";
 import { useServerStore } from "../../store/serverStore";
 import { CurrentServerNotificationsCard } from "./notifications/NotificationSettingsSection";
 import { useMobileBack } from "../../hooks/useAppNavigate";
@@ -23,7 +23,6 @@ import {
   normalizeSettingsTab,
 } from "./settingsNavigation";
 import { LazyAboutFeedbackPanel } from "./LazyAboutFeedbackDialog";
-import ProviderConnectionsSettings from "./ProviderConnectionsSettings";
 import { IntegrationsSection } from "../../features/apps/IntegrationsSection";
 import { ServerTabContent } from "../../features/settings/server/ServerTabContent";
 import { AdministrationTabContent } from "../../features/settings/administration/AdministrationTabContent";
@@ -65,19 +64,14 @@ export function SettingsPanel({
     if (!hasChatSurfaces() && settingsServerId) void useChannelStore.getState().loadChannels();
   }, [settingsServerId]);
   const requestedSettingsTab = normalizeSettingsTab(tabProp);
-  const providerConnectionsGate = useServerFeatureFlag(PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY);
-  const providerConnectionsEnabled = providerConnectionsGate.enabled;
   const slackBridgeGate = useServerFeatureFlag(SLACK_BRIDGE_FEATURE_FLAG_KEYS.master);
   const slackBridgeEnabled = isSlackBridgeSurfaceEnabled(slackBridgeGate);
   const { capabilities, role } = useServerPermissions();
   // A gated tab opened directly (a link, the App's embed) waits for its flag
-  // and the person's role instead of showing Account until they arrive and
-  // then switching (#triage:#166). Only a flag that is off, or no permission,
-  // falls back to Account.
-  const gatedTabPending = (requestedSettingsTab === "providers" && (!providerConnectionsGate.resolved || role === null))
-    || (requestedSettingsTab === "im-bridges" && !slackBridgeGate.resolved);
-  const gatedTabClosed = (requestedSettingsTab === "providers" && (!providerConnectionsEnabled || !capabilities.manageExternalAuth))
-    || (requestedSettingsTab === "im-bridges" && !slackBridgeEnabled);
+  // instead of showing Account until it arrives and then switching
+  // (#triage:#166). Only a flag that is off falls back to Account.
+  const gatedTabPending = requestedSettingsTab === "im-bridges" && !slackBridgeGate.resolved;
+  const gatedTabClosed = requestedSettingsTab === "im-bridges" && !slackBridgeEnabled;
   const settingsTab = gatedTabPending
     ? requestedSettingsTab
     : gatedTabClosed || !canOpenSettingsTab(requestedSettingsTab, capabilities)
@@ -157,7 +151,6 @@ export function SettingsPanel({
         {settingsTab === "theme" && <ServerThemeSection />}
         {settingsTab === "server-notifications" && <CurrentServerNotificationsCard />}
         {settingsTab === "server" && <ServerTabContent />}
-        {settingsTab === "providers" && !gatedTabPending && <ProviderConnectionsSettings />}
         {settingsTab === "labs" && <LabsTabContent />}
         {settingsTab === "billing" && <BillingTabContent />}
         {settingsTab === "administration" && <AdministrationTabContent />}

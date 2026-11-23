@@ -286,6 +286,23 @@ export function credentialProblemCodeOf(message: string): CredentialProblemCode 
   return match ? match[1] as CredentialProblemCode : null;
 }
 
+/**
+ * The fixed text of the error a runtime reports when the model declined to
+ * answer (Claude Code: `stop_reason: "refusal"`). Raft's own words, never the
+ * refusal notice or the model's text. The error event carries the typed
+ * `modelRefusal` marker; the daemon decides on that, never on this text.
+ */
+export const RUNTIME_MODEL_REFUSAL_MESSAGE = "The model declined to respond to this request (refusal).";
+
+/**
+ * The trace class of a model refusal (an error event with `modelRefusal`).
+ * Trace attributes only: the protocol's closed class vocabulary has no
+ * refusal class, so the activity carrier sends it as `RuntimeError`.
+ */
+export function modelRefusalTraceClassAttrs(): Record<string, unknown> {
+  return { runtime_error_class: "ModelRefusalError", turn_reason: classifyRuntimeErrorReason("ModelRefusalError") };
+}
+
 export function isRuntimeInputTooLargeErrorText(message: string): boolean {
   const rawMessage = String(message || "");
   return classifyRuntimeError(rawMessage, extractHttpStatus(rawMessage)) === "InputTooLargeError";
@@ -380,6 +397,10 @@ export function formatRuntimeLoginRequiredMessage(runtimeId: string): string {
   }
   if (runtimeId === "qoder") {
     return "Qoder is not logged in on this machine. Run `qodercli login` there, then retry starting this agent.";
+  }
+  // DeepSeek Harness has no login: it reads the API key configured in dsh itself or its environment, for whichever provider the agent's model uses.
+  if (runtimeId === "dsh") {
+    return "DeepSeek Harness's model provider rejected the request: its API key is missing or wrong. Check the key dsh uses on this machine: one saved in dsh's own settings comes first (dsh needs that credentials file readable by its owner only, mode 600), then the provider's key variable (DEEPSEEK_API_KEY for DeepSeek) in this agent's environment variables or the machine's environment. Then retry starting this agent.";
   }
   const runtimeLabel = runtimeDisplayName(runtimeId);
   return `${runtimeLabel} is not logged in on this machine. Please log in to ${runtimeLabel} locally, then retry starting this agent.`;
@@ -512,6 +533,15 @@ function extractHttpStatus(message: string): number | null {
  */
 const SOCKET_CONNECTION_ERROR = /\b(?:ECONNRESET|EPIPE|ECONNREFUSED|ENOTFOUND|EAI_AGAIN)\b|\bUnable to connect to API\b/i;
 /**
+ * A Go runtime (agy) whose HTTP request lost its connection: Go's net/http
+ * reports it as `<Method> "<url>": EOF` (url.Error around io.EOF, or
+ * `unexpected EOF`), e.g. `Post "https://.../v1:streamGenerateContent": EOF`,
+ * or JSON-escaped (`Post \"https://...\": EOF`) when it was inside a JSON
+ * line the crash reason quotes. Only that quoted-URL form counts, so other
+ * text naming an EOF does not.
+ */
+const GO_HTTP_REQUEST_EOF = /\b(?:Get|Head|Post|Put|Patch|Delete|Options)\s+\\?"https?:\/\/[^"\s\\]+\\?":\s+(?:unexpected\s+)?EOF\b/;
+/**
  * task #927: a Rust (reqwest) runtime such as Grok CLI says a request could
  * not be sent as "error sending request for url (...)", with no socket code.
  * It is diagnosed as a connection error. The process-close policy does not
@@ -520,10 +550,37 @@ const SOCKET_CONNECTION_ERROR = /\b(?:ECONNRESET|EPIPE|ECONNREFUSED|ENOTFOUND|EA
 const REQUEST_SEND_FAILURE = /\berror sending request for url\b/i;
 
 /**
+ * #proj-o11y:#42: Antigravity (agy) wording that used to end as the generic
+ * `RuntimeError` (about 80% of its runtime errors in the week to 2026-11-18),
+ * so its cause could only be read from the stored error text. Field samples:
+ * - `Antigravity error: invalid model selection (--model "gemini-4-hydrogen"
+ *   --effort ""): model gemini-4-hydrogen is not recognized as a known model
+ *   or custom model in settings`, and Raft's own `Antigravity CLI on this
+ *   Computer no longer offers the model "..."`: the agent's model setting,
+ *   which no retry fixes.
+ * - `... UNAVAILABLE (code 503): No capacity available for model
+ *   gemini-4-hydrogen-medium on the server`, `Our servers are experiencing
+ *   high traffic right now, please try again in a minute.`, `Resource
+ *   exhausted. Please try again later.`: a temporary limit on Google's side.
+ * - `There was a network issue connecting to the server, please try again.`:
+ *   the connection to the provider.
+ * - `The stream was interrupted. Please continue the task you were working
+ *   on.`, `Antigravity: the reply ended before it was complete`: a reply cut
+ *   off part-way.
+ * A used-up quota ("Individual quota reached", "usage limit") is not here: it
+ * is a provider limit with a reset time (`runtimeErrorProviderLimit`).
+ */
+const ANTIGRAVITY_MODEL_REJECTED = /\binvalid model selection\b|\bno longer offers the model\b/i;
+const ANTIGRAVITY_NO_CAPACITY = /\bno capacity available\b|\bexperiencing high traffic\b|\bresource(?: |_)exhausted\b/i;
+const ANTIGRAVITY_NETWORK_ISSUE = /\bnetwork issue connecting to the server\b/i;
+const ANTIGRAVITY_STREAM_CUT = /\bthe stream was interrupted\b|\bthe reply ended before it was complete\b/i;
+
+/**
  * The class the process-close policy decides on: the diagnostic class
  * without the request-send-failure rule, so a close is recoverable for
  * exactly the inputs it was before task #927 (an explicit
- * `ProviderConnectionError`, socket codes, "Unable to connect to API", ...).
+ * `ProviderConnectionError`, socket codes, "Unable to connect to API", ...),
+ * and for a Go HTTP request's EOF (GO_HTTP_REQUEST_EOF), retried like them.
  */
 export function runtimeErrorClassForProcessClose(message: string): string {
   const rawMessage = String(message || "");
@@ -549,6 +606,8 @@ function classifyRuntimeError(message: string, httpStatus: number | null, rules:
     /\bINPUT_TOO_LARGE\b/i.test(message) ||
     /\binput too large\b/i.test(message) ||
     /\bexceeds the maximum allowed\b/i.test(message) ||
+    // OpenCode: "Your input exceeds the context window of this model. ..."
+    /\bexceeds the context window\b/i.test(message) ||
     (
       /\bmaximum context length is [\d,]+ tokens?\b/i.test(message) &&
       /\byou requested [\d,]+ tokens?\b/i.test(message)
@@ -580,16 +639,28 @@ function classifyRuntimeError(message: string, httpStatus: number | null, rules:
   if (
     /\bmodel\b.*\bnot supported\b/i.test(message) ||
     /\bunsupported\b.*\bmodel\b/i.test(message) ||
-    /\bmodel\b.*\bnot available\b/i.test(message)
+    /\bmodel\b.*\bnot available\b/i.test(message) ||
+    ANTIGRAVITY_MODEL_REJECTED.test(message)
   ) {
     return "ModelConfigError";
   }
   if (/\b(?:ETIMEDOUT|timeout|timed out)\b/i.test(message)) return "TimeoutError";
-  if (SOCKET_CONNECTION_ERROR.test(message) || (rules.requestSendFailure !== false && REQUEST_SEND_FAILURE.test(message))) {
+  if (
+    SOCKET_CONNECTION_ERROR.test(message)
+    || GO_HTTP_REQUEST_EOF.test(message)
+    || (rules.requestSendFailure !== false && REQUEST_SEND_FAILURE.test(message))
+  ) {
     return "ProviderConnectionError";
   }
-  if (/stream closed before response\.completed|error decoding response body/i.test(message)) return "ProviderStreamError";
+  if (ANTIGRAVITY_NETWORK_ISSUE.test(message)) return "ProviderConnectionError";
+  if (
+    /stream closed before response\.completed|error decoding response body/i.test(message)
+    || ANTIGRAVITY_STREAM_CUT.test(message)
+  ) {
+    return "ProviderStreamError";
+  }
   if (/\b(?:selected\s+)?model\s+is\s+at\s+capacity\b/i.test(message)) return "RateLimitError";
+  if (ANTIGRAVITY_NO_CAPACITY.test(message)) return "RateLimitError";
   if (/\brate.?limit|too many requests\b/i.test(message)) return "RateLimitError";
   if (/\bnot found\b/i.test(message)) return "NotFoundError";
   return "RuntimeError";
@@ -666,6 +737,8 @@ function classifyRuntimeErrorReason(runtimeErrorClass: string): string {
       return "operation_aborted";
     case "BillingError":
       return "billing_exhausted";
+    case "ModelRefusalError":
+      return "model_refusal";
     default:
       return "unclassified_runtime_error";
   }

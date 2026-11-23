@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 
-import type { AuthStatus, LoginAccount, LoginUnsupportedReason, ProviderAuthFacade, ProviderLoginEvent, ProviderLoginInteraction, Runtime } from "@botiverse/oar";
+import type { AuthStatus, InstallationSnapshot, LoginAccount, LoginUnsupportedReason, ProviderAuthFacade, ProviderLoginEvent, ProviderLoginInteraction, Runtime, UpdateCheck } from "@botiverse/oar";
 import type { QwenProvider, QwenProviderAuth } from "@botiverse/oar/runtimes/qwen";
 import {
   RUNTIME_AUTH_PROVIDER_LIST_LIMIT,
@@ -22,6 +22,7 @@ import {
   runtimeAuthProvidersResultSchema,
   runtimeAuthSignsInPerProvider,
   runtimeAuthStatusSchema,
+  runtimeAuthStatusOnly,
   runtimeAuthSupports,
   type RuntimeAuthAccount,
   type RuntimeAuthLoginEvent,
@@ -37,9 +38,13 @@ import {
   type RuntimeAuthRuntime,
   type RuntimeAuthStatus,
   type RuntimeAuthStatusReport,
+  type RuntimeUpdates,
 } from "@botiverse/raft-shared";
 
 import type { OarProviderAuth } from "../oarLoader";
+import { runtimeMayBeUpgradable, runtimeUpgradable } from "../runtimeUpgrade";
+import { RuntimeUpdateChecks, updateCheckTraceOutcome } from "../runtimeUpdateCheck";
+import { runtimeInstallable, runtimeMayBeInstallable } from "../runtimeInstall";
 import { kimiSdkAuthLogin, kimiSdkAuthLogout, type KimiSdkAuth } from "./kimiSdkAuth";
 import {
   OPENCODE_LOGOUT_DEADLINE_MS,
@@ -141,12 +146,17 @@ export const RUNTIME_AUTH_LOGOUT_TIMEOUT_MS = 30_000;
 export const RUNTIME_AUTH_PROVIDER_TIMEOUT_MS = 20_000;
 
 /** Runtimes only the OAR host runs, which does not run on Windows (agentHost/oarAgentHost.ts). */
-const OAR_HOST_ONLY_RUNTIMES: ReadonlySet<RuntimeAuthRuntime> = new Set(["qoder", "qwen"]);
+const OAR_HOST_ONLY_RUNTIMES: ReadonlySet<RuntimeAuthRuntime> = new Set(["qoder", "qwen", "dsh"]);
+
+/** Whether Raft runs this runtime on a Computer of this platform (Qoder, Qwen Code and DeepSeek Harness not on Windows); Install uses it too. */
+export function runtimeAuthRunsOn(runtimeId: RuntimeAuthRuntime, platform: NodeJS.Platform): boolean {
+  return !(OAR_HOST_ONLY_RUNTIMES.has(runtimeId) && platform === "win32");
+}
 
 /**
  * The environment OAR runs a runtime's status, login and logout in, as its agents run
  * it: `agy` keeps a separate file-based sign-in when it sees an SSH session,
- * so its agents are started without one (drivers/antigravity.deprecated.ts
+ * so its agents are started without one (drivers/antigravity.ts
  * ANTIGRAVITY_ENV_OVERRIDES), and so are its status, login and logout here,
  * or the person would sign in (or out of) a store the agents never read.
  */
@@ -213,6 +223,25 @@ export interface RuntimeAuthHostDeps {
    * then no status query runs and no report is sent.
    */
   serverReads(): readonly RuntimeAuthRuntime[] | null;
+  /**
+   * Upgrade on the web: whether the connected server reads `upgradable` in a
+   * report (SERVER_CAPABILITY_RUNTIME_UPGRADE_V1); an older server's strict
+   * schema refuses a report with it. False when absent.
+   */
+  serverReadsUpgradable?(): boolean;
+  /**
+   * Install on the web: whether the connected server reads `installable` in a
+   * report (SERVER_CAPABILITY_RUNTIME_INSTALL_V1); an older server's strict
+   * schema refuses a report with it. False when absent.
+   */
+  serverReadsInstallable?(): boolean;
+  /**
+   * Upgrade on the web: whether the connected server reads `updates` in a
+   * report (SERVER_CAPABILITY_RUNTIME_UPDATE_CHECK_V1). Only then, and only
+   * with `upgradable`, does a report run OAR's update check for each
+   * upgradable runtime (runtimeUpdateCheck.ts). False when absent.
+   */
+  serverReadsUpdates?(): boolean;
   /**
    * Called once after a login, logout or provider connect that succeeded
    * (never after a failed, cancelled, busy or timed-out one), after its result
@@ -291,8 +320,31 @@ export class RuntimeAuthHost {
    * Kimi's config, so another Kimi login is busy until then.
    */
   private kimiSdkLogin: Promise<void> | null = null;
+  /** Upgrade on the web: the update checks and what they keep; a check that keeps a new answer reports again. */
+  private readonly updateChecks: RuntimeUpdateChecks;
+  /** The installation each runtime's status read in the current report, so its kept update check can be matched without probing again. */
+  private readonly installations = new Map<RuntimeAuthRuntime, InstallationSnapshot>();
 
-  constructor(private readonly deps: RuntimeAuthHostDeps) {}
+  constructor(private readonly deps: RuntimeAuthHostDeps) {
+    this.updateChecks = new RuntimeUpdateChecks({
+      now: () => deps.now(),
+      onSettled: () => void this.reportStatus("update_check").catch(() => undefined),
+    });
+  }
+
+  /**
+   * Drops the kept update checks (one runtime's, or all), so the next report
+   * asks OAR again: a person's rescan of the Computer's runtimes, and the end
+   * of an Upgrade.
+   */
+  forgetUpdateChecks(runtime?: RuntimeAuthRuntime): void {
+    this.updateChecks.forget(runtime);
+  }
+
+  /** Keeps the update check an Upgrade that found nothing newer (`current`) ran, for the installation it ran on. */
+  keepUpdateCheck(runtime: RuntimeAuthRuntime, installation: InstallationSnapshot, check: UpdateCheck): void {
+    this.updateChecks.seed(runtime, installation, check);
+  }
 
   /**
    * The status of each runtime the server reads, from OAR's status query
@@ -306,6 +358,7 @@ export class RuntimeAuthHost {
    */
   async collectStatus(runtimes: readonly RuntimeAuthRuntime[], detected?: readonly string[]): Promise<RuntimeAuthStatusReport> {
     const collectedAt = new Date(this.deps.now()).toISOString();
+    this.installations.clear();
     // Runtimes detection did not find are reported as not installed, and one
     // this Computer cannot run as unsupported, without running anything; the
     // others ask OAR's status query.
@@ -317,7 +370,81 @@ export class RuntimeAuthHost {
           ? ({ kind: "unavailable", reason: "unsupported_installation" } as const)
           : await this.statusOf(runtimeId),
     ] as const));
-    return { collectedAt, runtimes: Object.fromEntries(entries) };
+    const [upgradable, installable] = await Promise.all([
+      this.deps.serverReadsUpgradable?.() ? this.upgradableOf(entries) : undefined,
+      this.deps.serverReadsInstallable?.() ? this.installableOf(entries) : undefined,
+    ]);
+    const updates = upgradable && this.deps.serverReadsUpdates?.() ? await this.updatesOf(upgradable) : undefined;
+    return {
+      collectedAt,
+      runtimes: Object.fromEntries(entries),
+      ...(upgradable ? { upgradable } : {}),
+      ...(installable ? { installable } : {}),
+      ...(updates ? { updates } : {}),
+    };
+  }
+
+  /**
+   * Upgrade on the web: the update check kept for each upgradable runtime's
+   * installation, as this report's status read it (runtimeUpdateCheck.ts).
+   * Never waits on a check: a runtime with no fresh answer is left out (the
+   * web offers Upgrade as before) and its check starts in the background;
+   * once the checks settle, one more report carries them. Never throws.
+   */
+  private async updatesOf(upgradable: readonly RuntimeAuthRuntime[]): Promise<RuntimeUpdates> {
+    const checks = await Promise.all(upgradable.map(async (runtimeId) => {
+      try {
+        const installation = this.installations.get(runtimeId);
+        const kept = this.updateChecks.keptFor(runtimeId, installation);
+        if (!kept) this.updateChecks.start(runtimeId, await this.deps.loadRuntime(runtimeId), installation);
+        return [runtimeId, kept] as const;
+      } catch {
+        return [runtimeId, null] as const;
+      }
+    }));
+    return Object.fromEntries(checks.filter(([, check]) => check !== null));
+  }
+
+  /**
+   * Install on the web: the runtimes reported not installed here whose own
+   * installer this Computer runs (runtimeInstall.ts), and which OAR's
+   * installation probe does not find either. Never Kimi Code or Pi, nor a
+   * runtime Raft does not run on this platform, nor one with release lines
+   * none of which Raft installs (OpenCode: 2.x, INSTALL_LINES). Nothing is
+   * planned or run for this.
+   */
+  private async installableOf(entries: ReadonlyArray<readonly [RuntimeAuthRuntime, RuntimeAuthStatus]>): Promise<RuntimeAuthRuntime[]> {
+    const installable = await Promise.all(entries.map(async ([runtimeId, status]) => {
+      if (status.kind !== "unavailable" || status.reason !== "not_installed") return null;
+      if (!runtimeMayBeInstallable(runtimeId) || !this.runsHere(runtimeId)) return null;
+      try {
+        const runtime = await this.deps.loadRuntime(runtimeId);
+        if (!runtimeInstallable(runtimeId, runtime) || !runtime.installation) return null;
+        return (await runtime.installation()).kind === "not_found" ? runtimeId : null;
+      } catch {
+        return null;
+      }
+    }));
+    return installable.filter((runtimeId): runtimeId is RuntimeAuthRuntime => runtimeId !== null);
+  }
+
+  /**
+   * Upgrade on the web: the installed runtimes whose own updater this
+   * Computer runs (runtimeUpgrade.ts). A runtime reported missing or not
+   * usable here is left out; one too old to sign in is in (that is when
+   * Upgrade helps most). Loading a runtime is the same load its status used.
+   */
+  private async upgradableOf(entries: ReadonlyArray<readonly [RuntimeAuthRuntime, RuntimeAuthStatus]>): Promise<RuntimeAuthRuntime[]> {
+    const upgradable = await Promise.all(entries.map(async ([runtimeId, status]) => {
+      if (status.kind === "unavailable" && status.reason !== "version_unsupported") return null;
+      if (!runtimeMayBeUpgradable(runtimeId)) return null;
+      try {
+        return runtimeUpgradable(runtimeId, await this.deps.loadRuntime(runtimeId)) ? runtimeId : null;
+      } catch {
+        return null;
+      }
+    }));
+    return upgradable.filter((runtimeId): runtimeId is RuntimeAuthRuntime => runtimeId !== null);
   }
 
   async reportStatus(trigger: string, detected?: readonly string[]): Promise<void> {
@@ -353,6 +480,8 @@ export class RuntimeAuthHost {
             const kinds = report.runtimes[runtimeId]?.kind === "logged_in" ? this.signInKinds.get(runtimeId) : undefined;
             attrs[`${runtimeId}_sign_in_kind`] = kinds?.signIn;
             attrs[`${runtimeId}_billing_kind`] = kinds?.billing;
+            // The update check's verdict or reason only; never a version source or a path.
+            attrs[`${runtimeId}_update_check`] = updateCheckTraceOutcome(report.updates?.[runtimeId]);
           }
           this.deps.recordEvent("daemon.runtime_auth.status.reported", attrs);
           next = this.reportAgain;
@@ -524,9 +653,9 @@ export class RuntimeAuthHost {
     await this.deps.opencode?.close().catch(() => undefined);
   }
 
-  /** Qoder and Qwen Code run on the OAR host only, which does not run on Windows (agentHost/oarAgentHost.ts). */
+  /** Qoder, Qwen Code and DeepSeek Harness run on the OAR host only, which does not run on Windows (agentHost/oarAgentHost.ts). */
   private runsHere(runtimeId: RuntimeAuthRuntime): boolean {
-    return !(OAR_HOST_ONLY_RUNTIMES.has(runtimeId) && (this.deps.platform ?? process.platform) === "win32");
+    return runtimeAuthRunsOn(runtimeId, this.deps.platform ?? process.platform);
   }
 
   private async statusOf(runtimeId: RuntimeAuthRuntime): Promise<RuntimeAuthStatus> {
@@ -535,10 +664,18 @@ export class RuntimeAuthHost {
       if (runtimeId === "pi") return await this.piStatus();
       if (runtimeId === "opencode") return await this.opencodeStatus();
       const runtime = await this.deps.loadRuntime(runtimeId);
+      // A status-only runtime (DeepSeek Harness) has no status query: whether
+      // OAR finds a usable installation is all there is to say (too old:
+      // `version_unsupported`); its credentials are not Raft's to read.
+      if (runtime.installation && runtimeAuthStatusOnly(runtimeId)) {
+        const installation = await runtime.installation();
+        this.installations.set(runtimeId, installation);
+        return installation.kind === "available" ? { kind: "unknown" } : { kind: "unavailable", reason: unusableInstallationReason(installation) };
+      }
       if (!runtime.installation || !runtime.authStatus) return { kind: "unavailable", reason: "unsupported_installation" };
       const installation = await runtime.installation();
-      if (installation.kind === "not_found") return { kind: "unavailable", reason: "not_installed" };
-      if (installation.kind !== "available") return { kind: "unavailable", reason: "unsupported_installation" };
+      this.installations.set(runtimeId, installation);
+      if (installation.kind !== "available") return { kind: "unavailable", reason: unusableInstallationReason(installation) };
       const status = await runtime.authStatus(installation, { timeoutMs: RUNTIME_AUTH_STATUS_TIMEOUT_MS, ...oarEnvOption(runtimeId) });
       if (runtimeAuthSupports(runtimeId, "connect_provider")) return providerKeyStatus(status);
       if (status.kind === "logged_out") return { kind: "logged_out" };
@@ -559,8 +696,7 @@ export class RuntimeAuthHost {
     const runtime = await this.deps.loadRuntime(login.runtime);
     if (!runtime.installation || !runtime.login) return { kind: "unsupported", reason: "unsupported_installation" };
     const installation = await runtime.installation();
-    if (installation.kind === "not_found") return { kind: "unsupported", reason: "not_installed" };
-    if (installation.kind !== "available") return { kind: "unsupported", reason: "unsupported_installation" };
+    if (installation.kind !== "available") return { kind: "unsupported", reason: unusableInstallationReason(installation) };
     // The person signs in from the web, on their own device: no browser opens
     // on the Computer itself (OAR 0.69 openBrowser; Grok: a `BROWSER` that does
     // nothing, refused on Windows as browser_suppression_unavailable). Only Kimi's login takes
@@ -846,8 +982,7 @@ export class RuntimeAuthHost {
     const runtime = await this.deps.loadRuntime(runtimeId);
     if (!runtime.installation || !runtime.logout) return { kind: "unsupported", reason: "unsupported_installation" };
     const installation = await runtime.installation();
-    if (installation.kind === "not_found") return { kind: "unsupported", reason: "not_installed" };
-    if (installation.kind !== "available") return { kind: "unsupported", reason: "unsupported_installation" };
+    if (installation.kind !== "available") return { kind: "unsupported", reason: unusableInstallationReason(installation) };
     const result = await runtime.logout(installation, { timeoutMs: RUNTIME_AUTH_LOGOUT_TIMEOUT_MS, ...oarEnvOption(runtimeId) });
     const mapped: RuntimeAuthLogoutResult = result.kind === "logged_out"
       ? { kind: "logged_out" }
@@ -869,9 +1004,9 @@ export class RuntimeAuthHost {
     const runtime = await this.deps.loadRuntime(runtimeId);
     if (!runtime.installation) return { kind: "unsupported", reason: "unsupported_installation" };
     const installation = await runtime.installation();
-    if (installation.kind === "not_found") return { kind: "unsupported", reason: "not_installed" };
+    if (installation.kind !== "available") return { kind: "unsupported", reason: unusableInstallationReason(installation) };
     // OAR's facade drives an installed executable; a bundled runtime has none to start.
-    if (installation.kind !== "available" || installation.via !== "executable") return { kind: "unsupported", reason: "unsupported_installation" };
+    if (installation.via !== "executable") return { kind: "unsupported", reason: "unsupported_installation" };
     const options = { cwd: this.deps.providerSettingsCwd ?? homedir(), timeoutMs: RUNTIME_AUTH_PROVIDER_TIMEOUT_MS };
     return { kind: "ready", auth: await providerAuth.create(installation, options) };
   }
@@ -1020,9 +1155,14 @@ export class RuntimeAuthHost {
     if (this.deps.serverReads()) void this.reportStatus("login").catch(() => undefined);
   }
 
-  /** Pi's model list follows its sign-ins: re-detect it after one changed. Other runtimes' do not. */
+  /**
+   * Per-provider runtimes' (Pi, OpenCode) model lists follow their sign-ins:
+   * re-detect after one changed. Antigravity's follows the account (which
+   * models it is offered) and is cached for a day (modelSourceCache.ts), so a
+   * changed sign-in re-detects it too. Other runtimes' lists are cached briefly.
+   */
   private modelsMayHaveChanged(runtimeId: RuntimeAuthRuntime): void {
-    if (!runtimeAuthSignsInPerProvider(runtimeId)) return;
+    if (!runtimeAuthSignsInPerProvider(runtimeId) && runtimeId !== "antigravity") return;
     try {
       this.deps.rescanModels?.(runtimeId);
     } catch {
@@ -1237,4 +1377,16 @@ function safeDetail(detail: string | undefined): { detail?: string } {
   if (!detail) return {};
   const line = detail.split("\n")[0]!.trim().slice(0, 300);
   return line && !/[\u0000-\u0008\u000b-\u001f\u007f]/.test(line) ? { detail: line } : {};
+}
+
+/**
+ * Why an installation OAR did not find usable can't be used: not there, too
+ * old (OAR's structured `version_unsupported`, so the web offers the update),
+ * or otherwise unusable.
+ */
+function unusableInstallationReason(
+  installation: Exclude<InstallationSnapshot, { kind: "available" }>,
+): (typeof RUNTIME_AUTH_UNSUPPORTED_REASONS)[number] {
+  if (installation.kind === "not_found") return "not_installed";
+  return installation.code === "version_unsupported" ? "version_unsupported" : "unsupported_installation";
 }

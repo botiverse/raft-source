@@ -43,7 +43,7 @@ billingRouter.use(async (req, res, next) => {
         const err = new PrepaidActiveError();
         res.status(409).json({ code: err.code, error: err.message });
       } else {
-        res.status(409).json({ code: "PREPAID_BILLING_MANAGED", error: "This server has prepaid Pro time, not a subscription. Renew or add seats from Plan & Billing." });
+        res.status(409).json({ code: "PREPAID_BILLING_MANAGED", error: "This server has prepaid Pro time, not a subscription. Renew or add seats from Plan & billing." });
       }
       return;
     }

@@ -4,7 +4,7 @@ import { wakeForEventsMergedSinceHandover } from "../services/appItemWakeCoalesc
 import { renderAgentFacingContents } from "../services/agentFacingContent";
 import { JointChannelAccessChangedError } from "../lib/channelActorPermissions";
 import { DmPeerNotMemberError } from "../services/dmSendPolicy";
-import { AGENT_CONTEXT_READ_DEFAULT_LIMIT, AGENT_CONTEXT_SEARCH_DEFAULT_LIMIT, CONTINUATIONS_DRAFT_FLOW_RUNTIMES, CONTINUATIONS_PILOT_FEATURE_FLAG_KEY, RAFT_CLIENT_VERSION_HEADER, raftbenchFindingsQuerySchema, type AgentContextQuery } from "@botiverse/raft-shared";
+import { AGENT_CONTEXT_READ_DEFAULT_LIMIT, AGENT_CONTEXT_SEARCH_DEFAULT_LIMIT, channelSupportsRoles, CONTINUATIONS_PILOT_FEATURE_FLAG_KEY, CONTINUATIONS_PILOT_RUNTIMES, RAFT_CLIENT_VERSION_HEADER, raftbenchFindingsQuerySchema, type AgentContextQuery } from "@botiverse/raft-shared";
 import { hasRaftbenchReaderGrant, readFindings } from "../raftbench/readers";
 import { AGENT_GATED_WRITES, agentTaskWriteKey, agentWriteTaskNumber, agentTaskThreadTarget, formatAgentTaskCommandHint, type AgentGatedTaskWriteAction, formatAgentTaskRef, formatAgentTaskRefTail, formatHint, isSubConversationType, parseAgentTaskRef, RAFT_HINTS, TASK_TARGET_USE_TASK_COMMAND_ERROR_CODE, type AgentApiHistoryQuery } from "@botiverse/raft-shared";
 import { AGENT_API_ARTIFACT_MAX_REVIEW_COMMENTS, raftbenchContextQuerySchema, raftbenchReportSchema } from "@botiverse/raft-shared";
@@ -18,6 +18,7 @@ import { isDraining, recordDrainRefusal } from "../services/drainState";
 import { isReadMutationFenceRefusal } from "../services/readMutationSequencer";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import { REMINDER_MIGRATED, refuseIfRemindersMovedToApp, reminderMigratedRefusal } from "./reminderAppRollout";
+import { reminderAppActiveForServerStrict } from "../services/reminderAppGate";
 import {
   agentEventsRetryAfterMs,
   parseAgentEventsWaitAttempt,
@@ -27,7 +28,7 @@ import {
   type AgentEventsWaitPair,
   type AgentEventsWaitResult,
 } from "./agentEventsWaitFor";
-import { evaluateFeatureFlag, evaluateFeatureFlags, REMINDER_APP_FEATURE_FLAG_KEY, VAULT_APP_FEATURE_FLAG_KEY } from "../services/featureFlagService";
+import { DM_REPLY_PLACEMENT_FEATURE_FLAG_KEY, evaluateFeatureFlag, evaluateFeatureFlags, REMINDER_APP_FEATURE_FLAG_KEY, VAULT_APP_FEATURE_FLAG_KEY } from "../services/featureFlagService";
 // /internal/agent-api/* — RFC v0.8 sk_agent_* runner data-plane surface.
 // New managed-runner daemon builds use this surface for agent data-plane work
 // after successful runner credential mint. If mint fails, startup hard-fails;
@@ -86,7 +87,9 @@ import {
   RAFT_AGENT_STATUS_DETAIL_LIMIT,
   RAFT_AGENT_STATUS_VALUES,
   RAFT_CLIENT_CAPABILITIES_HEADER,
+  hasForwardedResolveCapability,
   hasInboxItemsCapability,
+  hasReminderAppCliCapability,
   buildApmFreshnessDecisionProducerFactId,
   agentApiContract,
   getAgentApiResponseKind,
@@ -116,7 +119,7 @@ import {
   asChannelId,
   asMachineId,
   canonicalizeOAuthClientCategory,
-  getServerCapabilities,
+  serverCapabilitiesWireView,
   type AgentApiTaskClaimConflict,
   type AgentMessage,
   type ApmFreshnessSideEffectAction,
@@ -254,6 +257,7 @@ import * as taskService from "../services/taskService";
 import { resolveAgentTaskSurfaces } from "../services/agentAssignedTaskSurfaces";
 import { computeIdleTaskReminder } from "../services/idleTaskReminderService";
 import { canView } from "../services/visibilityService";
+import { changedDescriptionLinkWarnings } from "../services/profileDescriptionLinks";
 import {
   getTaskRealtimeSurfaceTargets,
   resolveTaskChannelSurface,
@@ -307,7 +311,6 @@ import {
 import * as attestedSendService from "../services/attestedSendService";
 import { emitScopeReadUpdated } from "../services/readReceiptService";
 import { emitThreadFollowersUpdated } from "../services/threadFollowerRealtimeService";
-import { noteAgentChannelMuteChanged } from "../services/agentReadProgressService";
 import { listTaskConversationsByParentChannel, resolveLocalTaskConversationId } from "../services/taskConversationService";
 import { paginateHistoryProbe } from "./historyCursor";
 import {
@@ -341,7 +344,7 @@ import {
 } from "../db/schema";
 import { messageIdShortPrefixConditions, UUID_RE } from "../lib/messageId";
 import { guardUuidPathParams } from "../lib/uuidPathParams";
-import { refuse, RefusalError, sentenceQuoting, type RefusalInput, type RefusalStatus } from "../lib/refusal";
+import { refuse, RefusalError, refuseServiceError, sentenceQuoting, type RefusalInput, type RefusalStatus } from "../lib/refusal";
 import {
   AGENT_CHANNEL_NOT_FOUND_REFUSAL,
   ALL_CHANNEL_MEMBERSHIP_FIXED_REFUSAL,
@@ -403,7 +406,6 @@ import {
   APP_CARD_TARGET_REQUIRED_REFUSAL,
   APP_CATEGORY_INVALID_REFUSAL,
   APP_NAME_REQUIRED_REFUSAL,
-  APP_RETURN_URL_REQUIRED_REFUSAL,
   APP_SCOPE_UNKNOWN_REFUSAL,
   APP_UPDATE_CARD_DISABLED_REFUSAL,
   AVATAR_BAD_FORMAT_REFUSAL,
@@ -427,7 +429,7 @@ import {
   APP_TRANSFER_FIELDS_REQUIRED_REFUSAL,
   appTransferTargetNotFoundRefusal,
   APP_UPDATE_NO_FIELDS_REFUSAL,
-  APP_RETURN_URL_EMPTY_REFUSAL,
+  APP_RETURN_URL_INVALID_REFUSAL,
   shareLinkTargetNotApplicableRefusal,
   SHARE_LINK_TARGET_INVALID_REFUSAL,
   SHARE_LINK_TARGET_REQUIRED_REFUSAL,
@@ -446,18 +448,23 @@ import {
   APP_REVIEW_DESCRIPTION_REQUIRED_REFUSAL,
   ACTION_TYPE_NOT_PREPARABLE_REFUSAL,
   agentLoginNotFoundRefusal,
+  agentLoginServiceRefusal,
   appMetadataInvalidRefusal,
   appRegistrationScopeRefusal,
   MESSAGE_NOT_FOUND_REFUSAL,
   messageResolveRefusal,
+  forwardedMessageRefusal,
   serviceMessageRefusal,
   SINCE_SEQ_INVALID_REFUSAL,
   SINCE_TIME_INVALID_REFUSAL,
   taskAssignRefusal,
+  taskResourceReceiptRefusal,
   threadAnchorNotFoundRefusal,
 } from "./agentRouteRefusals";
-import { consumeReadAgentEvent, handleInboxDismiss, handleInboxRead, inboxItemsListFields, type ServeConversationReadSink, isAssistantRequest as isAssistantInboxRequest, refuseInboxItemsDisabled, reminderItemsDeclared } from "./agentInboxItemsRoutes";
+import { consumeReadAgentEvent, handleInboxDismiss, handleInboxRead, inboxItemsListFields, inboxRowsForTargets, type ServeConversationReadSink, isAssistantRequest as isAssistantInboxRequest, refuseInboxItemsDisabled, reminderItemsDeclared } from "./agentInboxItemsRoutes";
 import { inboxItemsEnabled, withinPageBudget } from "../services/agentInboxItems";
+import { handleFocus, handleFocusList, handleUnfocus, refuseAgentFocusDisabled } from "./agentFocusRoutes";
+import { agentFocusEnabled } from "../services/agentFocusService";
 import {
   isThreadTarget,
   parseAppSubjectDmTarget,
@@ -506,6 +513,7 @@ import { announceRemovedAppBots } from "./appBotRemovalBroadcast";
 import { createChannelForAgent } from "./agentChannelCreate";
 import { addChannelMemberForAgent, lastMemberRefusal, removeChannelMemberForAgent, removeUnlessLastMember } from "./agentChannelMembers";
 import { setChannelArchivedForAgent } from "./agentChannelLifecycle";
+import { setChannelMemberRoleForAgent } from "./agentChannelMemberRole";
 import { updateChannelForAgent } from "./agentChannelUpdate";
 import { resolveChannelAnnouncementsOf, withChannelAnnouncement } from "../services/channelAnnouncements";
 import { agentServerProfileAudit, assertAgentCanManageServerProfile, updateServerProfileForAgent } from "./agentServerManage";
@@ -521,6 +529,7 @@ import {
   storeServerAvatar,
 } from "../services/avatarService";
 import {
+  FILE_UPLOAD_APPSUMO_QUOTA_EXCEEDED_MESSAGE,
   FILE_UPLOAD_QUOTA_EXCEEDED_MESSAGE,
   FileUploadQuotaExceededError,
   getFileUploadQuotaSummary,
@@ -564,7 +573,7 @@ import { recordAgentApiSeen } from "../services/externalAgentPresence";
 import { agentCredentialStreamState, revokeAgentCredentialWithOutcome, SELF_REVOKED_REASON } from "../services/agentCredentialService";
 import { broadcastAgentCredentialRevocation } from "../replicaRouter";
 import { subscribeAgentCredentialRevocation } from "../services/agentCredentialRevocationBus";
-import { ManagedMcpGatewayError } from "../services/managedMcpGateway";
+import { ManagedMcpGatewayError, managedMcpFailureTraceAttrs } from "../services/managedMcpGateway";
 import { ManagedMcpOAuthError } from "../services/managedMcpOAuthService";
 import { getHostedRuntimeSummary } from "../services/agentRuntimeProvisionService";
 import { requestTraceErrorCode, setRequestTraceActionType, setRequestTraceErrorCode, setRequestTraceRateLimiter } from "../middleware/requestObservability";
@@ -1174,6 +1183,11 @@ function agentApiRequestValidators<K extends AgentApiRouteKey>(routeKey: K): Req
  * /prepare-action/operations, `raft action prepare --list`), which takes
  * action:prepare too.
  *
+ * channelMemberRole (POST /channels/member-role, `raft channel set-role`) has
+ * no legacy twin: it takes channel:update, as a channel admin's other
+ * governance of the channel (rename, archive) does; agent_scopes is being
+ * retired, so it adds no scope of its own.
+ *
  * userChannels (GET /users/:name/channels, `raft user info`) has no legacy
  * twin: it replaces serverInfo + channelMembers and requires channel:read here
  * and server:read inline.
@@ -1214,6 +1228,7 @@ export const AGENT_API_ROUTE_GRANTS: Partial<Record<AgentApiRouteKey, AgentScope
   channelUpdate: "channel:update",
   channelMemberAdd: "channel:add_member",
   channelMemberRemove: "channel:remove_member",
+  channelMemberRole: "channel:update",
   knowledgeGet: "knowledge:read",
   knowledgeSearch: "knowledge:read",
   taskList: "task:read",
@@ -1316,6 +1331,8 @@ export const AGENT_API_WRITE_BUDGET_ROUTES: Partial<Record<AgentApiRouteKey, Age
   channelMemberAdd: "channelWrites",
   attachmentUpload: "otherWrites",
   threadFollow: "otherWrites",
+  // Posts nothing, but each call may unfocus another conversation: bounded like a follow.
+  focus: "otherWrites",
   // RFC 081: posts nothing, but a loop of `--before` calls is bounded here (one unit a call).
   inboxDismiss: "otherWrites",
   actionPrepare: "otherWrites",
@@ -1333,6 +1350,8 @@ export const AGENT_API_WRITE_BUDGET_ROUTES: Partial<Record<AgentApiRouteKey, Age
   // A thread's resolve (with its note, at most one reply) and reopen: one write each, as a comment (#249).
   artifactCommentResolve: "artifactWrites",
   artifactCommentReopen: "artifactWrites",
+  artifactSettle: "artifactWrites",
+  artifactUnsettle: "artifactWrites",
   artifactCommentImageUpload: "artifactWrites",
   artifactSubscribe: "artifactWrites",
   artifactUnsubscribe: "artifactWrites",
@@ -1454,12 +1473,20 @@ export function agentApiWriteBudget(routeKind: AgentApiWriteBudgetClass, operati
 /**
  * #proj-runtime:#62: an Agent API call that changes something and succeeded
  * is progress for the repeated-wake guard (agentProgressMarks.ts): every
- * contract route but a GET and the POSTs that only read. Marked when the
- * response finishes with a 2xx, so a refused or failed call marks nothing.
- * (A read that moves the agent's read position is marked where it moves:
- * channelService.markRead, noteAgentReadAdvance, consumed app events.)
+ * contract route but a GET and the POSTs that are not the agent moving
+ * forward. Marked when the response finishes with a 2xx, so a refused or
+ * failed call marks nothing. (A read that moves the agent's read position is
+ * marked where it moves: channelService.markRead, legacy read cursor writes,
+ * consumed app events.)
+ *
+ * Not progress: the POSTs that only read (`inboxRows` is one, and the
+ * agent's Computer asks it, not the agent), and `taskIdleNudge`, which the
+ * agent's Computer asks by itself after every turn end (idle task reminder),
+ * not the agent. Counted, it cleared every looping agent's streak right after
+ * each empty turn, so the guard never tripped (AndyLok's #62 replay: 15 loops,
+ * up to 2,090 turns, none counted).
  */
-const READ_ONLY_POST_ROUTES: ReadonlySet<AgentApiRouteKey> = new Set<AgentApiRouteKey>(["inboxRead", "contextSearch", "contextRead", "resolveChannel"]);
+const NOT_PROGRESS_POST_ROUTES: ReadonlySet<AgentApiRouteKey> = new Set<AgentApiRouteKey>(["inboxRead", "contextSearch", "contextRead", "resolveChannel", "taskIdleNudge", "inboxRows"]);
 
 const markAgentProgressOnSuccess: RequestHandler = (req, res, next) => {
   const agentId = req.actingAgentId;
@@ -1485,7 +1512,7 @@ function mountAgentApiRoute(routeKey: AgentApiRouteKey, handlers: RequestHandler
     requireAgentCapability(route.capability),
     ...(grant ? [requireAgentGrant(grant)] : []),
     ...(writeBudget ? [agentApiWriteBudget(writeBudget, routeKey)] : []),
-    ...(route.method !== "GET" && !READ_ONLY_POST_ROUTES.has(routeKey) ? [markAgentProgressOnSuccess] : []),
+    ...(route.method !== "GET" && !NOT_PROGRESS_POST_ROUTES.has(routeKey) ? [markAgentProgressOnSuccess] : []),
     ...handlers,
   ];
   switch (route.method) {
@@ -3222,6 +3249,7 @@ registerAgentApiRoute(
           error_code: typeof (error as { code?: unknown } | null)?.code === "string"
             ? (error as { code: string }).code
             : "managed_mcp_internal_error",
+          ...managedMcpFailureTraceAttrs(error),
         }),
       },
     ));
@@ -3271,7 +3299,7 @@ internalAgentApiRouter.get("/", async (req, res) => {
       agentDisplayName: agent.displayName ?? null,
       serverId,
       serverRole,
-      serverCapabilities: getServerCapabilities(serverRole),
+      serverCapabilities: serverCapabilitiesWireView(serverRole),
       credentialId,
       scopes,
     });
@@ -3371,7 +3399,8 @@ internalAgentApiRouter.post("/credentials/self/revoke", async (req, res) => {
  */
 /**
  * The rollout flags a managed agent's Computer gets at start (AgentConfig
- * reminderApp / vaultApp / enabledApps), for agents that build their own
+ * reminderApp / vaultApp / enabledApps; reminderApp is the full Reminder App
+ * gate, flag or completed migration), for agents that build their own
  * prompt, and the continuation pilot, which the CLI reads here when a send is
  * held (managed and external agents alike). An evaluation failure reads as
  * off, as it does at agent start.
@@ -3406,10 +3435,35 @@ async function agentContextFeatures(
       { key: REMINDER_APP_FEATURE_FLAG_KEY, serverId },
       { key: VAULT_APP_FEATURE_FLAG_KEY, serverId },
     ]);
-    return { reminderApp: reminderApp?.enabled === true, vaultApp: vaultApp?.enabled === true, ...presentWhileOn, enabledApps };
+    // The Reminder App gate the legacy-write refusal and the Computer use (the
+    // flag, or the installation's legacy migration completed), so `raft
+    // reminder` routes to the App wherever the old writes are refused.
+    let reminderAppActive = false;
+    try {
+      reminderAppActive = await reminderAppActiveForServerStrict(serverId, reminderApp?.enabled === true);
+    } catch (error) {
+      console.warn("[agent-context] Reminder App migration check failed; reporting the flag alone", serializeErrorForLog(error));
+      reminderAppActive = reminderApp?.enabled === true;
+    }
+    return { reminderApp: reminderAppActive, vaultApp: vaultApp?.enabled === true, ...presentWhileOn, enabledApps };
   } catch (error) {
     console.warn("[agent-context] app rollout flag evaluation failed; reporting both off", serializeErrorForLog(error));
     return { reminderApp: false, vaultApp: false, ...presentWhileOn, enabledApps };
+  }
+}
+
+/**
+ * `dm_reply_placement_prompt` for an external agent's guide, the same flag
+ * agent:start sends a managed agent's Computer as
+ * `AgentConfig.dmReplyPlacement` (#triage:#540). Prompt text only, so it is
+ * not in the `features` answer. An evaluation failure reads as off.
+ */
+async function dmReplyPlacementPromptEnabled(serverId: string): Promise<boolean> {
+  try {
+    return (await evaluateFeatureFlag({ key: DM_REPLY_PLACEMENT_FEATURE_FLAG_KEY, serverId })).enabled;
+  } catch (error) {
+    console.warn("[agent-context] DM reply placement flag evaluation failed; reporting off", serializeErrorForLog(error));
+    return false;
   }
 }
 
@@ -3435,8 +3489,8 @@ registerAgentApiRoute("agentContext", async (req, res) => {
     const external = isExternalAgentRuntime(agent.runtime);
     const serverRole = await getActorServerRoleInServer(serverId, "agent", actingAgentId);
     const { continuationsPilot, ...serverFeatures } = await agentContextFeatures(serverId);
-    // The pilot stays off for a runtime it fails (codex), whatever the flag.
-    const pilot = continuationsPilot && !CONTINUATIONS_DRAFT_FLOW_RUNTIMES.has(agent.runtime)
+    // The pilot reaches only the runtimes that answer it (Claude), whatever the flag.
+    const pilot = continuationsPilot && CONTINUATIONS_PILOT_RUNTIMES.has(agent.runtime)
       ? { continuationsPilot }
       : {};
     // An assistant is told only about apps its credential can reach (its
@@ -3461,10 +3515,15 @@ registerAgentApiRoute("agentContext", async (req, res) => {
             serverRole,
           }, {
             taskConversations: features.taskConversations === true,
+            // The DM rule lives in the task-conversations Tasks section: read only where that renders.
+            dmReplyPlacement: features.taskConversations === true && await dmReplyPlacementPromptEnabled(serverId),
             enabledApps: guideApps,
             // RFC 081: entries 1 and 13 teach `raft inbox read` only where inbox
             // items are on, and only to a CLI that declares it has the command.
             inboxItems: hasInboxItemsCapability(req.header(RAFT_CLIENT_CAPABILITIES_HEADER)) && await inboxItemsEnabled(serverId),
+            // Where reminders live in the Reminder app, `raft reminder` reaches it for an
+            // external agent too, but only a CLI that declares it routes there.
+            reminderApp: features.reminderApp === true && hasReminderAppCliCapability(req.header(RAFT_CLIENT_CAPABILITIES_HEADER)),
           }),
         }
       : null;
@@ -3540,7 +3599,7 @@ registerAgentApiRoute("serverInfo", async (req, res) => {
       workspacePath: null,
     };
 
-    sendAgentApiResponse("serverInfo", res, { runtimeContext, serverRole, serverCapabilities: getServerCapabilities(serverRole), channels, archivedChannelCount, ...(archivedChannels ? { archivedChannels } : {}), agents: allAgents, humans });
+    sendAgentApiResponse("serverInfo", res, { runtimeContext, serverRole, serverCapabilities: serverCapabilitiesWireView(serverRole), channels, archivedChannelCount, ...(archivedChannels ? { archivedChannels } : {}), agents: allAgents, humans });
   } catch (err) {
     sendJsonServerError(req, res, {
       error: "Failed to get server info",
@@ -3647,6 +3706,10 @@ registerAgentApiRoute("serverUpdate", async (req, res) => {
       serverId,
       body: req.body,
     });
+    if ("refusal" in result) {
+      refuse(res, result.status, result.refusal);
+      return;
+    }
     res.status(result.status).json(result.body);
   } catch (err) {
     sendJsonServerError(req, res, {
@@ -3681,7 +3744,7 @@ internalAgentApiRouter.post("/server/avatar", requireAgentCapability("server"), 
       serverId,
     });
     if (authFailure) {
-      res.status(authFailure.status).json(authFailure.body);
+      refuse(res, authFailure.status, authFailure.refusal);
       return;
     }
 
@@ -3840,7 +3903,7 @@ async function serveAgentHistoryRead(
   req: Request,
   res: Response,
   historyQuery: AgentHistoryReadQuery,
-  taskConversationTarget: { channelId: string; ref: string } | null,
+  taskConversationTarget: { channelId: string; ref: string; earlierDiscussion?: AgentApiTaskEarlierDiscussion | null } | null,
   /**
    * RFC 081 `inbox read` of a conversation: the page goes to `sink` instead
    * of the response (refusals still answer `res`), and is cut to `maxChars`
@@ -4343,6 +4406,8 @@ async function serveAgentHistoryRead(
     }
     const peerCard = dmHistoryScope ? await step("history.peer_card", () => resolvePeerCard(serverId, actingAgentId, channel)) : null;
     const historyForNames = await step("history.names", () => messageCardForNames(shownMsgs));
+    // A cut forwarded message names `raft message resolve --forwarded` only to a CLI that has it.
+    const forwardedResolve = hasForwardedResolveCapability(req.header(RAFT_CLIENT_CAPABILITIES_HEADER));
     const historyBody: AgentApiHistoryResponse = {
       target: resolvedHistoryTarget ?? channelRef,
       ...(dmHistoryScope && channel && { consumption_scope: {
@@ -4360,6 +4425,7 @@ async function serveAgentHistoryRead(
               message.commentRef,
             ),
             message.actionMetadata,
+            { readWholeMessageId: forwardedResolve ? message.id : null },
           ),
           actingAgentId,
           historyForNames,
@@ -4382,6 +4448,7 @@ async function serveAgentHistoryRead(
       ...(cardChannel && { channel_card: channelCardOf(cardChannel) }),
       ...(peerCard && { peer_card: peerCard }),
       ...(taskCommandHint && { taskCommandHint }),
+      ...(taskConversationTarget?.earlierDiscussion && { earlierDiscussion: taskConversationTarget.earlierDiscussion }),
     };
     // Checked, then marked read, then sent (prepareAgentApiResponse).
     const consumePage = async (): Promise<void> => {
@@ -4742,8 +4809,10 @@ async function handleReaction(
     actor: { type: "agent", id: actingAgentId, alsoRequire: (channelId) => assistantConfinedToOwnerDm(req, channelId) },
   });
   if (access.kind === "no_access") {
+    // The answer is message resolve's (a channel this server holds no copy of
+    // reads as the plain not-found); the span keeps the finer reason.
     setRequestTraceErrorCode(res, access.reason === "id_invalid" ? "message_id_invalid" : access.reason === "channel_not_found" ? "channel_not_found" : "message_not_found");
-    res.status(access.status).json({ error: access.reason === "channel_not_found" ? "Channel not found" : access.error });
+    refuseKeepingTraceReason(res, access.status, messageResolveRefusal(access.error));
     return;
   }
   if (access.kind === "history_limited") {
@@ -5256,6 +5325,10 @@ registerAgentApiRoute("channelCreate", ...agentApiRequestValidators("channelCrea
       body: req.body,
       io: req.app.get("io") as SocketServer | undefined,
     });
+    if ("refusal" in result) {
+      refuse(res, result.status, result.refusal);
+      return;
+    }
     res.status(result.status).json(result.body);
   } catch (err) {
     sendJsonServerError(req, res, {
@@ -5284,6 +5357,10 @@ registerAgentApiRoute("channelUpdate", ...agentApiRequestValidators("channelUpda
       io: req.app.get("io") as SocketServer | undefined,
       agentOrchestrator: req.app.get("agentOrchestrator") as AgentOrchestrator | undefined,
     });
+    if ("refusal" in result) {
+      refuse(res, result.status, result.refusal);
+      return;
+    }
     res.status(result.status).json(result.body);
   } catch (err) {
     sendJsonServerError(req, res, {
@@ -5321,6 +5398,10 @@ function agentChannelLifecycleHandler(archived: boolean): RequestHandler {
         io: req.app.get("io") as SocketServer | undefined,
         agentOrchestrator: req.app.get("agentOrchestrator") as AgentOrchestrator | undefined,
       });
+      if ("refusal" in result) {
+        refuse(res, result.status, result.refusal);
+        return;
+      }
       res.status(result.status).json(result.body);
     } catch (err) {
       sendJsonServerError(req, res, {
@@ -5363,6 +5444,10 @@ registerAgentApiRoute("channelMemberAdd", ...agentApiRequestValidators("channelM
       io: req.app.get("io") as SocketServer | undefined,
       agentOrchestrator: req.app.get("agentOrchestrator") as AgentOrchestrator | undefined,
     });
+    if ("refusal" in result) {
+      refuse(res, result.status, result.refusal);
+      return;
+    }
     res.status(result.status).json(result.body);
   } catch (err) {
     sendJsonServerError(req, res, {
@@ -5391,11 +5476,44 @@ registerAgentApiRoute("channelMemberRemove", ...agentApiRequestValidators("chann
       io: req.app.get("io") as SocketServer | undefined,
       agentOrchestrator: req.app.get("agentOrchestrator") as AgentOrchestrator | undefined,
     });
+    if ("refusal" in result) {
+      refuse(res, result.status, result.refusal);
+      return;
+    }
     res.status(result.status).json(result.body);
   } catch (err) {
     sendJsonServerError(req, res, {
       error: "Failed to remove member",
       logPrefix: "internal.agent-api.channels.remove-member error:",
+      err,
+    });
+  }
+});
+
+registerAgentApiRoute("channelMemberRole", ...agentApiRequestValidators("channelMemberRole"), validateAgentApiResponseMiddleware("channelMemberRole"), async (req, res) => {
+  try {
+    const actingAgentId = req.actingAgentId!;
+    const serverId = req.serverId!;
+    const agent = await agentService.getAgent(actingAgentId);
+    if (!agent || agent.serverId !== serverId) {
+      refuseAgentGone(res);
+      return;
+    }
+    const result = await setChannelMemberRoleForAgent({
+      agentId: agent.id,
+      serverId,
+      body: req.body as AgentApiRequestBodyByRoute["channelMemberRole"],
+      io: req.app.get("io") as SocketServer | undefined,
+    });
+    if (!result.ok) {
+      refuse(res, result.status, result.refusal);
+      return;
+    }
+    sendAgentApiResponse("channelMemberRole", res, result.body);
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to change channel member role",
+      logPrefix: "internal.agent-api.channels.member-role error:",
       err,
     });
   }
@@ -5415,7 +5533,6 @@ registerAgentApiRoute("channelMute", ...agentApiRequestValidators("channelMute")
       sourceChannelId: channel.id,
       activityMuted: true,
     });
-    if (state.changed) noteAgentChannelMuteChanged(serverId, channel.id);
     addTraceEvent("activity_mute.agent_api.updated", {
       server_id: serverId,
       source_channel_id: channel.id,
@@ -5466,7 +5583,6 @@ registerAgentApiRoute("channelUnmute", ...agentApiRequestValidators("channelUnmu
       sourceChannelId: channel.id,
       activityMuted: false,
     });
-    if (state.changed) noteAgentChannelMuteChanged(serverId, channel.id);
     addTraceEvent("activity_mute.agent_api.updated", {
       server_id: serverId,
       source_channel_id: channel.id,
@@ -7077,7 +7193,7 @@ internalAgentApiRouter.post("/attachments/:attachmentId/comments", requireAgentC
     res.json(result);
   } catch (err) {
     if (err instanceof attachmentCommentService.AttachmentCommentError) {
-      res.status(err.status).json({ error: err.message, code: err.code });
+      refuseServiceError(res, err);
       return;
     }
     sendJsonServerError(req, res, {
@@ -7822,6 +7938,13 @@ async function handleAgentApiMessageSend(
       refuseMessageCardActions(res, err.message, err.code);
       return;
     }
+    // The channel is under a conversion fence (slock issue 15637 item 4): the
+    // same 409 the web send answers, never a 500.
+    if (err instanceof ChannelConversionInProgressError) {
+      traceSendRouteFailure("bad_request", err.status);
+      res.status(err.status).json({ error: err.message, code: err.code, conversionEpoch: err.conversionEpoch });
+      return;
+    }
     // RFC 086: the card's checks in the send's transaction found the conversation archived since the archive check above.
     if (err instanceof channelService.ChannelArchivedError) {
       traceSendRouteFailure("channel_archived", 409);
@@ -7835,7 +7958,7 @@ async function handleAgentApiMessageSend(
     }
     if (err instanceof DmPeerNotMemberError || err instanceof JointChannelAccessChangedError) {
       traceSendRouteFailure("bad_request", err.status);
-      res.status(err.status).json({ error: err.message, code: err.code });
+      refuse(res, err.status, { code: err.code, error: err.message });
       return;
     }
     if (err instanceof messageService.AgentSendIdempotencyConflictError) {
@@ -7851,14 +7974,14 @@ async function handleAgentApiMessageSend(
     }
     if (err instanceof AttachmentLinkError) {
       traceSendRouteFailure("bad_request", err.status);
-      res.status(err.status).json({ error: err.message, code: err.code });
+      refuse(res, err.status, err.toRefusal());
       return;
     }
     if (err instanceof DmTargetResolutionError) {
       // An ambiguous same-name DM peer (409) or unknown peer kind (400) is a
       // target the caller can fix, not a server fault.
       traceSendRouteFailure("bad_request", err.status);
-      res.status(err.status).json(err.toResponseBody());
+      refuse(res, err.status, err.toRefusal());
       return;
     }
     if (transientTransactionSqlState(err)) {
@@ -7982,7 +8105,7 @@ async function agentUploadSessionRefusal(
       { serverId, agentId, channelId: body.channelId, capabilities: req.header(RAFT_CLIENT_CAPABILITIES_HEADER) },
       new FileUploadQuotaExceededError(quota, body.sizeBytes),
     );
-    return { status: 403, body: { code: "UPLOAD_FORBIDDEN", message: FILE_UPLOAD_QUOTA_EXCEEDED_MESSAGE, retryable: false, ...refusal } };
+    return { status: 403, body: { code: "UPLOAD_FORBIDDEN", message: quota.appsumo ? FILE_UPLOAD_APPSUMO_QUOTA_EXCEEDED_MESSAGE : FILE_UPLOAD_QUOTA_EXCEEDED_MESSAGE, retryable: false, ...refusal } };
   }
   return null;
 }
@@ -8251,7 +8374,7 @@ registerAgentApiRoute("messageSearch", async (req, res) => {
       queryInput.senderId,
     );
     if (!senderFilter.ok) {
-      res.status(senderFilter.status).json({ error: senderFilter.error, errorCode: senderFilter.errorCode });
+      refuse(res, senderFilter.status, { code: senderFilter.errorCode, error: senderFilter.error });
       return;
     }
     const after = queryInput.after ? new Date(queryInput.after) : undefined;
@@ -8406,10 +8529,32 @@ registerAgentApiRoute("messageResolve", ...agentApiRequestValidators("messageRes
       return;
     }
 
-    const payload = await resolveAgentVisibleMessagePayload(resolved.messageId, serverId, agentId);
+    const forwardedResolve = hasForwardedResolveCapability(req.header(RAFT_CLIENT_CAPABILITIES_HEADER));
+    const payload = await resolveAgentVisibleMessagePayload(resolved.messageId, serverId, agentId, { forwardedResolve });
     if (!payload) {
       refuse(res, 404, MESSAGE_NOT_FOUND_REFUSAL);
       return;
+    }
+
+    // `forwarded=<n>`: that one forwarded message whole, from the same
+    // viewer-scoped snapshot data the message's own snapshot uses.
+    const { forwarded: forwardedQuery } = req.query as AgentApiRequestQueryByRoute["messageResolve"];
+    let forwarded: { number: number; total: number; content: string } | undefined;
+    if (forwardedQuery !== undefined) {
+      const number = Number(forwardedQuery);
+      const [scoped] = await messageService.listMessagesByIds([resolved.messageId], {
+        forwardedBundleViewerAgentId: agentId,
+        viewerServerId: serverId,
+      });
+      const item = messageService.agentFacingForwardedItem(
+        scoped && scoped.senderType !== "external_projection" ? scoped.actionMetadata : null,
+        number,
+      );
+      if (!item.ok) {
+        refuse(res, 400, forwardedMessageRefusal(item.total));
+        return;
+      }
+      forwarded = { number, total: item.total, content: item.content };
     }
 
     sendAgentApiResponse("messageResolve", res, {
@@ -8418,6 +8563,7 @@ registerAgentApiRoute("messageResolve", ...agentApiRequestValidators("messageRes
         parent_channel_type: payload.parent_channel_type ?? undefined,
         parent_channel_name: payload.parent_channel_name ?? undefined,
       },
+      ...(forwarded && { forwarded }),
     });
   } catch (err) {
     sendJsonServerError(req, res, {
@@ -8442,10 +8588,26 @@ registerAgentApiRoute("channelMembers", async (req, res) => {
 
     const members = await channelService.getChannelMembers(resolved.channelId);
     const agentRoles = await getAgentServerRolesInServer(serverId, members.agents.map((agent) => agent.id));
+    // Each member's channel role where the channel has channel roles, as the
+    // web member list shows it to a member of this server: anyone who can list
+    // the roster sees who its channel admins are. A joint channel's person or
+    // this server's agent is `admin` when they can manage it (their row's
+    // channelRole, from isManager: jointAuthorityManagesChannel); another
+    // server's agent carries one only then (its other roles stay with its
+    // organization, projectJointRosterForViewer).
+    const rosterChannel = resolved.type === "channel" || resolved.type === "private" || resolved.type === "joint"
+      ? await channelService.getChannel(resolved.channelId)
+      : null;
+    const rolesHere = rosterChannel !== null && channelSupportsRoles(rosterChannel.type, rosterChannel.name);
+    const channelRoleOf = (row: { channelRole?: "admin" | "member" | null }) => (
+      rolesHere && row.channelRole ? { channelRole: row.channelRole } : {}
+    );
     const visibleAgents = members.agents.map((agent) => ({
       name: agent.name,
       status: agent.status,
       role: agentRoles.get(agent.id) ?? null,
+      // Another server's agent: `admin` only when it manages the channel from the host, else no role.
+      ...(resolved.type === "joint" && agent.serverId !== serverId ? (agent.isManager ? channelRoleOf(agent) : {}) : channelRoleOf(agent)),
     }));
     const visibleHumans = await filterAgentVisibleHumansForHiddenDirectory(
       serverId,
@@ -8458,7 +8620,7 @@ registerAgentApiRoute("channelMembers", async (req, res) => {
       humans: visibleHumans.map((human) => {
         const servers = channelService.agentVisibleMemberServers(human, serverId);
         // Another server's person: their role stays with their organization.
-        return { name: human.name, description: human.description, ...(channelService.isViewerServerMember(human, serverId) ? { role: human.role } : {}), ...(servers ? { servers } : {}) };
+        return { name: human.name, description: human.description, ...(channelService.isViewerServerMember(human, serverId) ? { role: human.role } : {}), ...channelRoleOf(human), ...(servers ? { servers } : {}) };
       }),
     });
   } catch (err) {
@@ -8681,6 +8843,61 @@ registerAgentApiRoute("threadList", ...agentApiRequestValidators("threadList"), 
   }
 });
 /**
+ * Focus, part 1 (flag `agent_focus_v0`): `raft focus <target>`, `raft unfocus
+ * <target>` and `raft focus` (agentFocusRoutes.ts). Off for the agent's
+ * server, all three refuse AGENT_FOCUS_DISABLED.
+ */
+registerAgentApiRoute("focus", ...agentApiRequestValidators("focus"), async (req, res) => {
+  try {
+    if (!await agentFocusEnabled(req.serverId!)) {
+      refuseAgentFocusDisabled(res);
+      return;
+    }
+    await handleFocus(req, res, { answer: (body) => sendAgentApiResponse("focus", res, body) });
+  } catch (err: unknown) {
+    if (respondToDmTargetResolutionError(err, res)) return;
+    sendJsonServerError(req, res, {
+      error: "Failed to focus the conversation",
+      code: "agent_api_focus_failed",
+      logPrefix: "[AgentAPI] Failed to focus",
+      err,
+    });
+  }
+});
+registerAgentApiRoute("unfocus", ...agentApiRequestValidators("unfocus"), async (req, res) => {
+  try {
+    if (!await agentFocusEnabled(req.serverId!)) {
+      refuseAgentFocusDisabled(res);
+      return;
+    }
+    await handleUnfocus(req, res, { answer: (body) => sendAgentApiResponse("unfocus", res, body) });
+  } catch (err: unknown) {
+    if (respondToDmTargetResolutionError(err, res)) return;
+    sendJsonServerError(req, res, {
+      error: "Failed to unfocus the conversation",
+      code: "agent_api_unfocus_failed",
+      logPrefix: "[AgentAPI] Failed to unfocus",
+      err,
+    });
+  }
+});
+registerAgentApiRoute("focusList", ...agentApiRequestValidators("focusList"), async (req, res) => {
+  try {
+    if (!await agentFocusEnabled(req.serverId!)) {
+      refuseAgentFocusDisabled(res);
+      return;
+    }
+    await handleFocusList(req, res, { answer: (body) => sendAgentApiResponse("focusList", res, body) });
+  } catch (err: unknown) {
+    sendJsonServerError(req, res, {
+      error: "Failed to list focused conversations",
+      code: "agent_api_focus_list_failed",
+      logPrefix: "[AgentAPI] Failed to list focus",
+      err,
+    });
+  }
+});
+/**
  * GET /internal/agent-api/inbox/conversations?view=unread|mentions&before_seq=<n>&limit=<n>
  *
  * `raft inbox check`: the agent's durable unread conversations, newest activity
@@ -8798,6 +9015,42 @@ registerAgentApiRoute("inboxDismiss", ...agentApiRequestValidators("inboxDismiss
       error: "Failed to dismiss inbox items",
       code: "agent_api_inbox_dismiss_failed",
       logPrefix: "[AgentAPI] Failed to dismiss inbox items",
+      err,
+    });
+  }
+});
+
+/**
+ * POST /internal/agent-api/inbox/rows: the `inbox check` rows of the
+ * conversations the agent's Computer names, before it prints a wake-up notice
+ * (agentInboxItemsRoutes.ts). POST only for its body: it reads the same view
+ * as the list, moves no read position and is not the agent's progress or
+ * activity. On only where inbox items are.
+ */
+registerAgentApiRoute("inboxRows", ...agentApiRequestValidators("inboxRows"), async (req, res) => {
+  try {
+    if (!await inboxItemsEnabled(req.serverId!)) {
+      refuseInboxItemsDisabled(res);
+      return;
+    }
+    const body = req.body as AgentApiRequestBodyByRoute["inboxRows"];
+    sendAgentApiResponse("inboxRows", res, await inboxRowsForTargets({
+      agentId: req.actingAgentId!,
+      serverId: req.serverId!,
+      targets: body.targets,
+      withBehind: body.withBehind === true,
+      clientKind: agentApiClientKind(req),
+    }));
+  } catch (err) {
+    if (err instanceof channelService.AgentInboxUnavailableError) {
+      console.error("[AgentAPI] inbox rows unavailable", serializeErrorForLog(err.cause ?? err));
+      res.status(503).json({ error: "Inbox is temporarily unavailable", code: err.code });
+      return;
+    }
+    sendJsonServerError(req, res, {
+      error: "Failed to list inbox rows",
+      code: "agent_api_inbox_rows_failed",
+      logPrefix: "[AgentAPI] Failed to list inbox rows",
       err,
     });
   }
@@ -9013,6 +9266,7 @@ registerAgentApiRoute("assistantOwnerMessages", ...agentApiRequestValidators("as
           message,
           messageService.appendAgentFacingForwardedSnapshot(
             renderAgentCommentScopedContent(renderedContents[index] ?? "", message.commentRef),
+            // No read-whole line: an assistant can't resolve its owner's messages.
             message.actionMetadata,
           ),
           req.actingAgentId!,
@@ -9200,11 +9454,8 @@ registerAgentApiRoute("assistantOwnerResolve", ...agentApiRequestValidators("ass
       outcome: result.ok ? result.type : result.code,
     });
     if (!result.ok) {
-      res.status(result.code === assistantService.OWNER_RESOLVE_AMBIGUOUS_CODE ? 409 : 404).json(
-        result.code === assistantService.OWNER_RESOLVE_AMBIGUOUS_CODE
-          ? { error: "A person and an agent share that name. Add ~human or ~agent.", code: result.code }
-          : { error: "Your owner cannot see anyone or any channel by that name here.", code: result.code },
-      );
+      if (result.code === assistantService.OWNER_RESOLVE_AMBIGUOUS_CODE) refuse(res, 409, { code: result.code, error: "A person and an agent share that name. Add ~human or ~agent." });
+      else refuse(res, 404, { code: result.code, error: "Your owner cannot see anyone or any channel by that name here." });
       return;
     }
     sendAgentApiResponse("assistantOwnerResolve", res, { id: result.id, type: result.type, name: result.name });
@@ -9233,7 +9484,7 @@ async function assistantContactRoute(
     await run({ agentId: req.actingAgentId!, serverId: req.serverId!, ownerUserId });
   } catch (err: unknown) {
     if (err instanceof assistantContactRulesService.AssistantContactRuleError) {
-      res.status(err.status).json({ error: err.message, code: err.code });
+      refuseServiceError(res, err);
       return;
     }
     sendJsonServerError(req, res, {
@@ -9281,8 +9532,8 @@ registerAgentApiRoute("assistantContactSettings", ...agentApiRequestValidators("
 
 // The owner's own settings (theme in this server, UI language, time zone),
 // changed when the owner asks: the web's own checks and writes, each change
-// audited and shown to the owner (assistantOwnerSettingsService). A refusal is
-// the web route's own 400 `{ error }`.
+// audited and shown to the owner (assistantOwnerSettingsService). A refusal has
+// the web route's status and, where it is a sentence, its words.
 async function assistantOwnerSettingsRoute(
   req: Request,
   res: Response,
@@ -9295,7 +9546,7 @@ async function assistantOwnerSettingsRoute(
     await run({ agentId: req.actingAgentId!, serverId: req.serverId!, ownerUserId });
   } catch (err: unknown) {
     if (err instanceof assistantOwnerSettingsService.AssistantOwnerSettingsError) {
-      res.status(err.status).json({ error: err.message });
+      refuseServiceError(res, err);
       return;
     }
     sendJsonServerError(req, res, {
@@ -9379,7 +9630,7 @@ registerAgentApiRoute("assistantNotify", ...agentApiRequestValidators("assistant
     sendAgentApiResponse("assistantNotify", res, result);
   } catch (err: unknown) {
     if (err instanceof assistantNotifyService.AssistantNotifyError) {
-      res.status(err.status).json({ error: err.message, code: err.code });
+      refuseServiceError(res, err);
       return;
     }
     sendJsonServerError(req, res, {
@@ -9413,7 +9664,7 @@ registerAgentApiRoute("assistantSendAsOwner", ...agentApiRequestValidators("assi
     sendAgentApiResponse("assistantSendAsOwner", res, { messageId: result.messageId, channelId: result.channelId });
   } catch (err: unknown) {
     if (err instanceof assistantSendAsOwnerService.AssistantSendAsOwnerError) {
-      res.status(err.status).json({ error: err.message, code: err.code });
+      refuseServiceError(res, err);
       return;
     }
     if (err instanceof channelService.ChannelArchivedError) {
@@ -9439,7 +9690,7 @@ registerAgentApiRoute("assistantForwardAsOwner", ...agentApiRequestValidators("a
     const result = await assistantForwardAsOwnerService.forwardAsOwner({
       io: req.app.get("io"),
       orchestrator: req.app.get("agentOrchestrator") as AgentOrchestrator,
-      serverId: req.serverId!,
+      serverId: asServerId(req.serverId!),
       agentId: req.actingAgentId!,
       ownerUserId,
       messages: body.messages,
@@ -9451,11 +9702,11 @@ registerAgentApiRoute("assistantForwardAsOwner", ...agentApiRequestValidators("a
     sendAgentApiResponse("assistantForwardAsOwner", res, result);
   } catch (err: unknown) {
     if (err instanceof assistantSendAsOwnerService.AssistantSendAsOwnerError) {
-      res.status(err.status).json({ error: err.message, code: err.code });
+      refuseServiceError(res, err);
       return;
     }
     if (err instanceof ChannelConversionInProgressError) {
-      res.status(err.status).json({ error: "A source conversation is being converted right now. Retry the same request (same requestId) in a moment.", code: err.code });
+      refuse(res, err.status, { code: err.code, error: "A source conversation is being converted right now. Retry the same request (same requestId) in a moment." });
       return;
     }
     sendJsonServerError(req, res, {
@@ -9474,7 +9725,7 @@ registerAgentApiRoute("assistantSearchForwardTargets", ...agentApiRequestValidat
     if (!ownerUserId) return;
     const query = req.query as AgentApiAssistantSearchForwardTargetsQuery;
     const found = await assistantForwardAsOwnerService.searchForwardTargetsForOwner({
-      serverId: req.serverId!,
+      serverId: asServerId(req.serverId!),
       agentId: req.actingAgentId!,
       ownerUserId,
       q: query.q,
@@ -9504,7 +9755,7 @@ registerAgentApiRoute("profileShow", async (req, res) => {
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
     const resolved = await resolveProfileViewForAgent(serverId, agentId, query.target, agentOrchestrator);
     if (!resolved.ok) {
-      res.status(resolved.status).json({ error: resolved.error });
+      refuse(res, resolved.status, resolved.refusal);
       return;
     }
     sendAgentApiResponse("profileShow", res, resolved.profile);
@@ -9530,7 +9781,7 @@ registerAgentApiRoute("profileUpdate", ...agentApiRequestValidators("profileUpda
       return;
     }
 
-    const checked = agentProfileUpdateFields(body);
+    const checked = agentProfileUpdateFields(body, profileTarget?.description);
     if (!checked.ok) {
       refuse(res, 400, checked.refusal);
       return;
@@ -9557,7 +9808,10 @@ registerAgentApiRoute("profileUpdate", ...agentApiRequestValidators("profileUpda
       refuse(res, 404, AGENT_GONE_REFUSAL);
       return;
     }
-    sendAgentApiResponse("profileUpdate", res, profile);
+    // #457: links in a new description some of its readers can't open (the save stands).
+    const self = { type: "agent" as const, id: agentId, serverId: updated.serverId };
+    const warnings = await changedDescriptionLinkWarnings({ before: profileTarget?.description, after: fields.description === undefined ? undefined : updated.description, owner: self, writer: self });
+    sendAgentApiResponse("profileUpdate", res, { ...profile, ...(warnings.length > 0 ? { warnings } : {}) });
     recordRaftCliActivity(req, agentId, {
       command: "profile.update",
       summary: "Updated profile",
@@ -9822,7 +10076,7 @@ registerAgentApiRoute("integrationLogin", ...agentApiRequestValidators("integrat
     if (!resolved.ok) {
       if (resolved.status !== 404) {
         closeTrace({ outcome: "rejected", reason: "service_resolution_failed", httpStatus: resolved.status });
-        res.status(resolved.status).json({ error: resolved.error });
+        refuse(res, resolved.status, agentLoginServiceRefusal(resolved));
         return;
       }
 
@@ -9906,7 +10160,7 @@ registerAgentApiRoute("integrationLogin", ...agentApiRequestValidators("integrat
       const marketplaceResolved = await resolveAgentLoginClient(publicClients, body.service);
       if (!marketplaceResolved.ok) {
         closeTrace({ outcome: "rejected", reason: "service_resolution_failed", httpStatus: marketplaceResolved.status });
-        res.status(marketplaceResolved.status).json({ error: marketplaceResolved.error });
+        refuse(res, marketplaceResolved.status, agentLoginServiceRefusal(marketplaceResolved));
         if (marketplaceResolved.status === 404) {
           void recordIntegrationServiceRequested(getProductEventSink(req.app), {
             serverId, agentId, rawService: body.service, outcome: "not_offered", command: "login",
@@ -10081,7 +10335,7 @@ registerAgentApiRoute("integrationLogin", ...agentApiRequestValidators("integrat
   } catch (err) {
     if (err instanceof DmTargetResolutionError) {
       closeTrace({ outcome: "rejected", reason: err.code, httpStatus: err.status });
-      res.status(err.status).json(err.toResponseBody());
+      refuse(res, err.status, err.toRefusal());
       return;
     }
     // Suspended between the listing and the request.
@@ -10161,10 +10415,7 @@ registerAgentApiRoute("integrationAppPrepare", ...agentApiRequestValidators("int
       refuse(res, 400, APP_NAME_REQUIRED_REFUSAL);
       return;
     }
-    if (!returnUrl) {
-      refuse(res, 400, APP_RETURN_URL_REQUIRED_REFUSAL);
-      return;
-    }
+    // No return URL registers a token-only App: nobody can sign in to it.
     // The id is fixed here, so the card shows the exact one: the agent's, as
     // it will be stored, or the name as it is. Nothing random is added; a name
     // that makes no id, or an id another App holds, is the agent's to change
@@ -10365,15 +10616,11 @@ registerAgentApiRoute("integrationAppUpdate", ...agentApiRequestValidators("inte
       refuse(res, 400, APP_CLIENT_KEY_REQUIRED_REFUSAL);
       return;
     }
-    const updatedFields = ["name", "description", "whenToUse", "category", "homepageUrl", "returnUrl", "agentManifestUrl", "setupUrl", "setupDescription", "scopes"]
+    const updatedFields = ["name", "description", "whenToUse", "category", "homepageUrl", "returnUrl", "agentManifestUrl", "setupUrl", "setupDescription", "scopes", "agentTokenSigningAlg", "agentTokenType"]
       .filter((field) => body[field as keyof typeof body] !== undefined);
     if (body.newClientKey !== undefined) updatedFields.push("clientKey");
     if (updatedFields.length === 0) {
       refuse(res, 400, APP_UPDATE_NO_FIELDS_REFUSAL);
-      return;
-    }
-    if (body.returnUrl !== undefined && !body.returnUrl.trim()) {
-      refuse(res, 400, APP_RETURN_URL_EMPTY_REFUSAL);
       return;
     }
     const unsafeDemoUrlOverride = body.unsafeDemoUrlOverride === true;
@@ -10388,6 +10635,7 @@ registerAgentApiRoute("integrationAppUpdate", ...agentApiRequestValidators("inte
       homepageUrl: body.homepageUrl === undefined
         ? undefined
         : actionCardsService.validateIntegrationUrl(body.homepageUrl, "homepageUrl", unsafeDemoUrlOverride),
+      // An empty return URL clears it (validateIntegrationUrl answers null): a token-only App.
       returnUrl: body.returnUrl === undefined
         ? undefined
         : actionCardsService.validateIntegrationUrl(body.returnUrl, "returnUrl", unsafeDemoUrlOverride),
@@ -10397,6 +10645,9 @@ registerAgentApiRoute("integrationAppUpdate", ...agentApiRequestValidators("inte
       setupUrl: body.setupUrl === undefined ? undefined : actionCardsService.validateIntegrationUrl(body.setupUrl, "setupUrl", unsafeDemoUrlOverride),
       setupDescription: body.setupDescription,
       newClientKey: body.newClientKey,
+      agentTokenSigningAlg: body.agentTokenSigningAlg,
+      // The `typ` of its agent tokens; JWT only without a return URL (checked under the App's row lock).
+      agentTokenType: body.agentTokenType,
       allowedScopes: body.scopes === undefined
         ? undefined
         : (() => {
@@ -10413,7 +10664,7 @@ registerAgentApiRoute("integrationAppUpdate", ...agentApiRequestValidators("inte
       return;
     }
     if (updated.status === "invalid_return_url") {
-      refuse(res, 400, APP_RETURN_URL_EMPTY_REFUSAL);
+      refuse(res, 400, APP_RETURN_URL_INVALID_REFUSAL);
       return;
     }
     // Same live-follow rule as the human PATCH route: an agent-edited app
@@ -10448,7 +10699,9 @@ registerAgentApiRoute("integrationAppUpdate", ...agentApiRequestValidators("inte
         err.message.includes("required") ||
         err.message.includes("agentManifestUrl") || err.message.includes("setup") ||
         err.message.includes("scope") ||
-        err.message.includes("whenToUse")
+        err.message.includes("whenToUse") ||
+        err.message.includes("agentTokenSigningAlg") ||
+        err.message.includes("agentTokenType")
       ) {
         refuse(res, 400, appMetadataInvalidRefusal(err.message));
         return;
@@ -11214,7 +11467,7 @@ registerAgentApiRoute("taskCreate", ...agentApiRequestValidators("taskCreate"), 
       // peer left and a joint channel access change (taskCreatorSourceSendRefusal).
       if (await channelService.isAgentMigrationReceiptChannel(ctx.channelId)) {
         const err = DmTargetResolutionError.migrationReceiptReadOnly(channel);
-        res.status(err.status).json(err.toResponseBody());
+        refuse(res, err.status, err.toRefusal());
         return;
       }
       const billingReadOnly = await getChannelBillingReadOnly(ctx.channelId, serverId);
@@ -11298,6 +11551,7 @@ registerAgentApiRoute("taskCreate", ...agentApiRequestValidators("taskCreate"), 
           assignee,
           { assigneeName: assignee.name },
           {
+            localChannelId: ctx.localChannel.id,
             // Joint: the initiating local channel also gates task v2 (its server).
             ...(ctx.surface.isJoint ? { initiatingLocalChannelId: ctx.channelId } : {}),
             ...(initialStatus !== undefined && { initialStatus }),
@@ -11321,6 +11575,7 @@ registerAgentApiRoute("taskCreate", ...agentApiRequestValidators("taskCreate"), 
           createItems,
           {
             initiatingServerId: ctx.localChannel.serverId,
+            localChannelId: ctx.localChannel.id,
             ...(initialStatus !== undefined && { initialStatus }),
             ...(idempotency && {
               beforeCommit: (executor, result) => idempotentAgentApiService.recordAgentApiIdempotentResponse(executor, idempotency, {
@@ -12354,9 +12609,9 @@ registerAgentApiRoute("taskResourceReceipt", ...agentApiRequestValidators("taskR
       teardownOwnerTargetChannelId: teardownOwner.targetChannelId,
       expiryFollowups: taskResourceExpiryFollowups,
     });
-    if (typeof result === "string") {
-      const status = result.includes("must be") ? 400 : 409;
-      res.status(status).json({ error: result });
+    if ("refused" in result) {
+      const { status, refusal } = taskResourceReceiptRefusal(result, channel, task_number);
+      refuse(res, status, refusal);
       return;
     }
 
@@ -12863,6 +13118,35 @@ type AgentApiTaskConversationAddress = {
   taskRef: string;
 };
 
+type AgentApiTaskEarlierDiscussion = { target: string; replyCount: number };
+
+/**
+ * A pre-v2 task talking in its own conversation (flag on, or it already has
+ * one): its host message's thread is the earlier discussion, named by the
+ * thread's target under `channelRef` with its reply count. Null for a v2 task,
+ * a pre-v2 task still discussed in that thread (flag off), or a thread without
+ * replies. One rule for `raft task view` and `raft task read`.
+ */
+async function agentApiTaskEarlierDiscussion(
+  task: { messageId: string | null } & Parameters<typeof taskUsesOwnConversation>[0],
+  channelRef: string,
+  v2: boolean,
+): Promise<AgentApiTaskEarlierDiscussion | null> {
+  if (!task.messageId || !taskUsesOwnConversation(task, v2)) return null;
+  const [thread] = await getDb()
+    .select({ id: channels.id })
+    .from(channels)
+    .where(and(eq(channels.parentMessageId, task.messageId), eq(channels.type, "thread"), isNull(channels.deletedAt)))
+    .limit(1);
+  if (!thread) return null;
+  const [counted] = await getDb()
+    .select({ n: sql<number>`count(*)::int` })
+    .from(messages)
+    .where(and(eq(messages.channelId, thread.id), sql`${messages.messageType} <> 'system'`));
+  const replyCount = Number(counted?.n ?? 0);
+  return replyCount > 0 ? { target: `${channelRef}:${task.messageId.slice(0, 8)}`, replyCount } : null;
+}
+
 async function resolveAgentApiTaskConversationAddress(
   req: Request,
   res: Response,
@@ -12992,11 +13276,13 @@ registerAgentApiRoute("taskView", ...agentApiRequestValidators("taskView"), asyn
         serverId,
       );
       const recentForNames = await messageCardForNames(page.messages);
+      const forwardedResolve = hasForwardedResolveCapability(req.header(RAFT_CLIENT_CAPABILITIES_HEADER));
       recent = (await withAgentMessageReactions(page.messages)).map((message, index) => toAgentApiMessageEnvelope(
         message,
         messageService.appendAgentFacingForwardedSnapshot(
           renderAgentCommentScopedContent(rendered[index] ?? "", message.commentRef),
           message.actionMetadata,
+          { readWholeMessageId: forwardedResolve ? message.id : null },
         ),
         agentId,
         recentForNames,
@@ -13027,26 +13313,7 @@ registerAgentApiRoute("taskView", ...agentApiRequestValidators("taskView"), asyn
         };
       }
     }
-    let earlierDiscussion: AgentApiResponseByRoute["taskView"]["earlierDiscussion"] = null;
-    // A pre-v2 task talking in its own conversation (flag on, or it already
-    // has one): its host message's thread is the earlier discussion.
-    if (task.messageId && taskUsesOwnConversation(task, v2)) {
-      const [thread] = await getDb()
-        .select({ id: channels.id })
-        .from(channels)
-        .where(and(eq(channels.parentMessageId, task.messageId), eq(channels.type, "thread"), isNull(channels.deletedAt)))
-        .limit(1);
-      if (thread) {
-        const [counted] = await getDb()
-          .select({ n: sql<number>`count(*)::int` })
-          .from(messages)
-          .where(and(eq(messages.channelId, thread.id), sql`${messages.messageType} <> 'system'`));
-        const replyCount = Number(counted?.n ?? 0);
-        if (replyCount > 0) {
-          earlierDiscussion = { target: `${query.channel}:${task.messageId.slice(0, 8)}`, replyCount };
-        }
-      }
-    }
+    const earlierDiscussion = await agentApiTaskEarlierDiscussion(task, query.channel, v2);
     // No conversation yet (created lazily): a v2 task's creator and assignee
     // follow it from creation, so they are reported as following already
     // (one rule with --following and the web: ../services/taskV2Mode).
@@ -13088,14 +13355,19 @@ registerAgentApiRoute("taskRead", ...agentApiRequestValidators("taskRead"), asyn
     const address = await resolveAgentApiTaskConversationAddress(req, res, query.channel, query.task_number);
     if (!address) return;
     const conversationId = await agentApiLocalTaskConversation(address, { create: false });
+    const v2 = await isTaskV2ConversationsEnabled(address.ctx.localChannel.serverId);
+    // A pre-v2 task: what was said before its conversation is in its host
+    // message's thread, so the read names it (as `raft task view` does).
+    const earlierDiscussion = await agentApiTaskEarlierDiscussion(address.task, query.channel, v2);
     if (!conversationId) {
-      if (!taskUsesOwnConversation(address.task, await isTaskV2ConversationsEnabled(address.ctx.localChannel.serverId))) {
+      if (!taskUsesOwnConversation(address.task, v2)) {
         respondTaskConversationsNotEnabled(res, address);
         return;
       }
-      // Nobody has written to it yet (lazy): no discussion yet.
+      // Nobody has written to it yet (lazy): no discussion in it yet.
       sendAgentApiResponse("taskRead", res, {
         target: address.taskRef,
+        ...(earlierDiscussion && { earlierDiscussion }),
         messages: [],
         has_more: false,
         has_older: false,
@@ -13114,7 +13386,7 @@ registerAgentApiRoute("taskRead", ...agentApiRequestValidators("taskRead"), asyn
       limit: query.limit,
       consume: query.consume,
       unread: query.unread,
-    }, { channelId: conversationId, ref: address.taskRef });
+    }, { channelId: conversationId, ref: address.taskRef, earlierDiscussion });
   } catch (err) {
     if (respondToTaskWriteError(err, res)) return;
     sendJsonServerError(req, res, {
@@ -13287,7 +13559,8 @@ registerAgentApiRoute("taskUnfollow", (req, res) => handleAgentApiTaskFollow(req
  * (#wg-task-v2:#9), asked by the agent's Computer on its Working→Idle edge:
  * which open tasks assigned to the agent, or with no assignee when it created
  * them, to remind it of now, why, and the notice to deliver. Records what it returns (services/idleTaskReminderService).
- * Off unless the server's `task_v2_conversations_v0` flag is on.
+ * Without the server's `task_v2_conversations_v0` flag only the new-session
+ * listing runs (`freshSession`); every other ask is `disabled`.
  */
 registerAgentApiRoute(
   "taskIdleNudge",
@@ -13391,7 +13664,7 @@ registerAgentApiRoute("reminderCreate", refuseLegacyReminderMutation, ...agentAp
     }
     const resolved = await resolveReminderMsgIdForAgentApi(serverId, agentId, msgId);
     if (!resolved.ok) {
-      res.status(resolved.status).json({ error: resolved.error });
+      refuse(res, resolved.status, messageResolveRefusal(resolved.error));
       return;
     }
     // Agent Lounge: a reminder's receipt and firing land in its anchor's
@@ -13886,8 +14159,10 @@ mountAgentApiRoute("actionPrepare", [...agentApiRequestValidators("actionPrepare
       }
       throw err;
     }
-    // A repeat that posted nothing (plan:upgrade within a day) answers 200
-    // with the card already there, flagged `existing`.
+    // A repeat that posted nothing (plan:upgrade in the same conversation
+    // within a day) answers 200 with the card already there, flagged
+    // `existing`. (The same gate offered in another conversation is a 409
+    // refusal naming that card: the flag would point to this conversation.)
     res.status(out.existing ? 200 : 201);
     sendAgentApiResponse("actionPrepare", res, actionPrepareResponseBody(out));
     recordRaftCliActivity(req, agentId, {

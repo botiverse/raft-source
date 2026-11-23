@@ -1,0 +1,31 @@
+host: oar
+runtime: opencode
+scenario: resume-unchanged
+promptSource: resume_empty
+note: launch.options.resume: session-1
+
+## standing prompt
+= standing-prompt.md
+
+## carrier
+launch.options.systemPrompt: (absent)
+launch.options.appendSystemPrompt: (absent)
+launch.options.env.OPENCODE_CONFIG_CONTENT:
+{
+  "provider": {},
+  "agent": {
+    "slock": {
+      "description": "Slock agent runtime",
+      "prompt": "⟪STANDING_PROMPT⟫"
+    }
+  },
+  "mcp": {},
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "slock",
+  "compaction": {
+    "background": false
+  }
+}
+
+## first input (120 chars, sha256:ff860092fb9fea97, does not contain the standing prompt)
+No new messages while you were away. If you were in the middle of a task, continue it; otherwise stop (no reply needed).

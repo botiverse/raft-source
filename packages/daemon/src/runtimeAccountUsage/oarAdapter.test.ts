@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 
 import { utcInstantFromDate } from "@botiverse/oar";
 
-import { runtimeAccountUsageSnapshotSchema } from "@botiverse/raft-shared";
+import { RUNTIME_ACCOUNT_USAGE_TEMPORARILY_UNAVAILABLE_CODE, runtimeAccountUsageSnapshotSchema } from "@botiverse/raft-shared";
 
 import {
   projectOarAccountUsageFailure,
@@ -79,6 +79,28 @@ test("unsupported and reauth_required carry no windows", () => {
     assert.ok(!JSON.stringify(snapshot).includes("usedRatio"));
     assertOnWire(snapshot);
   }
+});
+
+test("unsupported carries OAR's reason when Raft knows it; an unknown or absent one reads as plain unsupported; reauth carries none", () => {
+  const known = project({ kind: "unsupported", reason: "quota_unavailable" } satisfies OarAccountUsageSnapshot);
+  assert.equal(known.accounts[0]?.unsupportedReason, "quota_unavailable");
+  assertOnWire(known);
+  const unknown = project({ kind: "unsupported", reason: "some_future_reason" } as unknown as OarAccountUsageSnapshot);
+  assert.equal("unsupportedReason" in unknown.accounts[0]!, false);
+  assertOnWire(unknown);
+  assert.equal("unsupportedReason" in project({ kind: "unsupported" } satisfies OarAccountUsageSnapshot).accounts[0]!, false);
+  assert.equal("unsupportedReason" in project({ kind: "reauth_required", reason: "credentials_rejected" } satisfies OarAccountUsageSnapshot).accounts[0]!, false);
+});
+
+// OAR 0.113: Kimi's access token expired and awaits Kimi Code's refresh.
+test("an unavailable reading is 'temporarily unavailable', neither an error nor zero usage", () => {
+  const snapshot = projectOarAccountUsageSnapshot({ provider: "kimi", snapshot: { kind: "unavailable", reason: "access_token_expired" }, ...BASE });
+  const account = snapshot.accounts[0];
+  assert.equal(account?.health, "ok");
+  assert.equal(account?.parseErrorCode, RUNTIME_ACCOUNT_USAGE_TEMPORARILY_UNAVAILABLE_CODE);
+  assert.deepEqual(account?.windows.map((window) => window.status), ["parse_unavailable"]);
+  assert.ok(!JSON.stringify(snapshot).includes("usedRatio"));
+  assertOnWire(snapshot);
 });
 
 test("an out-of-range ratio becomes parse_unavailable and is never clamped", () => {
@@ -204,6 +226,29 @@ test("OAR's count of limit resets is carried per account; detail rows and odd co
   for (const available of [-1, 1.5, 1000, Number.NaN]) {
     const odd = project({ kind: "available", rateLimited: false, windows: [], limitResets: { available } } satisfies OarAccountUsageSnapshot);
     assert.equal("limitResetsAvailable" in odd.accounts[0]!, false, `count ${available} is not carried`);
+    assertOnWire(odd);
+  }
+});
+
+test("OAR's Codex credits are carried per account; an odd balance is dropped, never the credits", () => {
+  // The reported case: weekly window used up, credits left, so OAR says not rate limited.
+  const spending = project({
+    kind: "available",
+    rateLimited: false,
+    windows: [{ label: "Weekly", usedRatio: 1 }],
+    credits: { available: true, unlimited: false, balance: "30784" },
+  } satisfies OarAccountUsageSnapshot);
+  assert.deepEqual(spending.accounts[0]?.credits, { available: true, unlimited: false, balance: "30784" });
+  assert.equal(spending.accounts[0]?.health, "ok", "credits keep the account usable");
+  assert.equal(spending.accounts[0]?.windows[0]?.status, "limit_reached", "the window itself is still full");
+  assertOnWire(spending);
+
+  const absent = project({ kind: "available", rateLimited: false, windows: [] } satisfies OarAccountUsageSnapshot);
+  assert.equal("credits" in absent.accounts[0]!, false, "unknown stays absent");
+
+  for (const balance of ["30784 credits", "", "1".repeat(40)]) {
+    const odd = project({ kind: "available", rateLimited: false, windows: [], credits: { available: true, balance } } satisfies OarAccountUsageSnapshot);
+    assert.deepEqual(odd.accounts[0]?.credits, { available: true }, `balance ${JSON.stringify(balance)}`);
     assertOnWire(odd);
   }
 });

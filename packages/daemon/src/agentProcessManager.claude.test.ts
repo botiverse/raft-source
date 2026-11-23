@@ -23,7 +23,7 @@
 import assert from "node:assert/strict";
 import { assertBodyOnlyInInboxPreview } from "./testing/inboxPreview";
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -75,6 +75,7 @@ import type {
   PredicateFixtureResult,
 } from "./apmStateMachineTrace";
 import { AgentProcessManager, providerLimitBackoffDelayMs, QUOTA_RESET_BACKOFF_MAX_MS } from "./agentProcessManager";
+import { PROVIDER_LIMIT_RESET_JITTER_MAX_MS } from "./runtimeErrorDeliveryPolicy";
 import { writeContextGeneration } from "./contextGeneration";
 import { senderLedgerPath } from "./senderLedger";
 import { buildCliTransportDir } from "./drivers/cliTransport";
@@ -250,6 +251,7 @@ async function withManager(
     sessionReadyDeliveryRetryMs?: number;
     sessionReadyDeliveryRetrySchedulerFactory?: () => RuntimeNotificationState;
     appInboxForAgent?: (agentId: string) => AgentAppInboxStore;
+    connectedServerId?: () => string | null;
   } = {},
 ): Promise<void> {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-claude-apm-test-"));
@@ -268,6 +270,7 @@ async function withManager(
       daemonInstanceId: options.daemonInstanceId,
       sessionReadyDeliveryRetryMs: options.sessionReadyDeliveryRetryMs,
       appInboxForAgent: options.appInboxForAgent,
+      connectedServerId: options.connectedServerId,
     },
   );
   setSessionReadyDeliveryRetrySchedulerFactoryForTesting(options.sessionReadyDeliveryRetrySchedulerFactory ?? null);
@@ -1782,6 +1785,7 @@ test("APM reducer seam: expected termination reason is owned by reducer transiti
     { ...persistent.nextState, outstandingToolUses: 1 },
     {
       inboxLength: 1,
+      appInboxNoticeWaiting: false,
       supportsStdinNotification: true,
       busyDeliveryMode: "direct",
       hasSession: true,
@@ -1800,6 +1804,7 @@ test("APM reducer seam: expected termination reason is owned by reducer transiti
 
   const staleRecovery = reduceApmStalledRecoveryTermination(persistent.nextState, {
     inboxLength: 1,
+    appInboxNoticeWaiting: false,
     supportsStdinNotification: true,
     busyDeliveryMode: "direct",
     hasSession: true,
@@ -1816,6 +1821,7 @@ test("APM reducer seam: expected termination reason is owned by reducer transiti
 
   const alreadyRecovering = reduceApmStalledRecoveryTermination(staleRecovery.nextState, {
     inboxLength: 2,
+    appInboxNoticeWaiting: false,
     supportsStdinNotification: true,
     busyDeliveryMode: "direct",
     hasSession: true,
@@ -2971,6 +2977,90 @@ test("Claude APM: the same text-classified error in three turns without output t
     assert.equal(traceRows(sink).filter((row) => row.name === "daemon.agent.runtime_error_fingerprint_fence.tripped").length, 1);
     assert.equal(traceRows(sink).some((row) => row.name === "daemon.agent.runtime_error_fingerprint_fence.reset" && row.attrs?.reset_source === "runtime_progress:turn_end"), false);
     assert.equal(getProcess(manager, "agent-1"), undefined, "the fence stopped the runtime");
+  }, { tracer });
+});
+
+// A finished compaction is not progress for the fences: Claude Code compacts,
+// then fails the same turn with "Prompt is too long" (RuntimeError by text, so
+// no session replacement). When compaction_finished counted, it reset the
+// count, marked the turn as having progress so its turn_end reset it again,
+// and the fence never left attempt 1.
+test("Claude APM: compaction, then 'Prompt is too long', then turn end, three times trips the fence", async () => {
+  const { sink, tracer } = makeDeterministicTracer();
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    for (let i = 0; i < 3; i += 1) {
+      driver.parsedLines.set(`compacted-turn-${i}`, [
+        { kind: "compaction_started" },
+        { kind: "compaction_finished" },
+        { kind: "error", message: "Prompt is too long" },
+        { kind: "turn_end", sessionId: "session-1" },
+      ]);
+      driver.processes[0].stdout.emit("data", Buffer.from(`compacted-turn-${i}\n`));
+      await flush();
+    }
+    const counted = traceRows(sink).filter((row) => row.name === "daemon.agent.runtime_error_fingerprint_fence");
+    assert.deepEqual(counted.map((row) => row.attrs?.attempts), [1, 2, 3]);
+    assert.equal(traceRows(sink).filter((row) => row.name === "daemon.agent.runtime_error_fingerprint_fence.tripped").length, 1);
+    const resetSources = traceRows(sink)
+      .filter((row) => row.name === "daemon.agent.runtime_error_fingerprint_fence.reset")
+      .map((row) => row.attrs?.reset_source);
+    assert.deepEqual(resetSources, ["tripped"], "neither the compaction nor the turn end after it resets the fence");
+    assert.equal(getProcess(manager, "agent-1"), undefined, "the fence stopped the runtime");
+  }, { tracer });
+});
+
+// A refusal is shown once per turn as an error, but the runtime did not fail:
+// three in a row never trip the fence, take no delivery backoff, and the agent
+// keeps running. The lines are Claude Code 2.1.322's (an API-error notice with
+// stop_reason "refusal", then an is_error result; see the fixtures in
+// drivers/claudeEventNormalizer.test.ts), through the real normalizer.
+test("Claude APM: a refused turn shows one error, is never fenced or backed off, and the agent keeps running", async () => {
+  const { sink, tracer } = makeDeterministicTracer();
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    const normalizer = new ClaudeEventNormalizer();
+    const notice = "API Error: Claude Code can't help with this. Start a new session to continue. planted refusal wording";
+    for (let i = 0; i < 3; i += 1) {
+      driver.parsedLines.set(`refused-${i}`, [
+        ...normalizer.normalizeLine(JSON.stringify({
+          type: "assistant",
+          message: { role: "assistant", model: "<synthetic>", content: [{ type: "text", text: notice }], stop_reason: "refusal", stop_details: { type: "refusal", category: null, explanation: null } },
+          parent_tool_use_id: null, session_id: "session-1", error: "invalid_request", is_api_error_message: true,
+        })),
+        ...normalizer.normalizeLine(JSON.stringify({
+          type: "result", subtype: "success", is_error: true, stop_reason: "refusal", api_error_status: null, result: notice, session_id: "session-1",
+        })),
+      ]);
+      driver.processes[0].stdout.emit("data", Buffer.from(`refused-${i}\n`));
+      await flush();
+    }
+    const ap = getProcess(manager, "agent-1");
+    assert.ok(ap, "the runtime keeps running");
+    assert.notEqual(ap.runtimeErrorDeliveryBackoff.kind, "backing_off", "a refusal takes no delivery backoff");
+    assert.equal((manager as any).lifecycleRecords.getRuntimeErrorFingerprintFence("agent-1"), undefined, "refusals are not counted");
+    assert.equal(traceRows(sink).some((row) => row.name === "daemon.agent.runtime_error_fingerprint_fence"), false);
+    // Every runtime error is published when it happens (with its typed
+    // diagnostic) and again at the turn end, where it stays the visible state
+    // (broadcastRuntimeErrorAtTurnEnd): two frames per refused turn, one error.
+    const shown = sent.filter((msg) => msg.type === "agent:activity" && (msg as { detailKind?: string }).detailKind === "runtime_error");
+    const live = shown.filter((msg) => (msg as { runtimeError?: unknown }).runtimeError !== undefined);
+    assert.equal(live.length, 3, "one error per refused turn");
+    assert.equal(shown.length - live.length, 3, "and its turn-end visible state, once per turn");
+    for (const msg of live) {
+      assert.equal((msg as { detail?: string }).detail, "The model declined to respond to this request (refusal).");
+      assert.equal((msg as { runtimeError?: { errorClass?: string } }).runtimeError?.errorClass, "RuntimeError", "the closed protocol vocabulary has no refusal class");
+    }
+    for (const msg of shown) {
+      assert.match(String((msg as { detail?: string }).detail), /The model declined to respond to this request \(refusal\)\./);
+    }
+    assert.doesNotMatch(JSON.stringify(sent), /planted refusal wording/);
+    const turnSpan = sink.getAllSpans().find((span) => span.name === "daemon.runtime.turn");
+    assert.equal(turnSpan?.attrs?.runtime_error_class, "ModelRefusalError");
+    assert.equal(turnSpan?.attrs?.turn_reason, "model_refusal");
+    assert.equal(sent.some((msg) => msg.type === "agent:runtime:outcome" && (msg as any).outcome?.kind === "terminal_failure"), false);
   }, { tracer });
 });
 
@@ -4896,12 +4986,14 @@ test("runtime rate-limit telemetry remains diagnostic without publishing account
   }, { tracer });
 });
 
+const QUOTA_AGENT_ID = "6b1e2f3a-4c5d-4e6f-8a9b-0c1d2e3f4a5b";
+
 test("a Claude quota reading reaches the manager's provider quota store, traces its change, and goes with the workspace", async () => {
   const { sink, tracer } = makeDeterministicTracer();
   const nowMs = 1_791_800_000_000;
   await withManager(async ({ driver, manager, dataDir }) => {
     (manager as unknown as { readWallClock: () => number }).readWallClock = () => nowMs;
-    await manager.startAgent("agent-1", makeConfig());
+    await manager.startAgent(QUOTA_AGENT_ID, makeConfig());
     driver.parsedLines.set("quota-warning", [{
       kind: "telemetry",
       name: "rate_limits",
@@ -4911,20 +5003,37 @@ test("a Claude quota reading reaches the manager's provider quota store, traces 
     }]);
     driver.processes[0].stdout.emit("data", Buffer.from("quota-warning\n"));
     await flush();
-    assert.deepEqual(manager.providerQuota.quotaFor("agent-1"), { state: "near_exhausted", utilization: 0.94 });
-    assert.equal(manager.providerQuota.reading("agent-1")?.observedAtMs, nowMs, "read on the manager's clock");
+    assert.deepEqual(manager.providerQuota.quotaFor(QUOTA_AGENT_ID), { state: "near_exhausted", utilization: 0.94 });
+    assert.equal(manager.providerQuota.reading(QUOTA_AGENT_ID)?.observedAtMs, nowMs, "read on the manager's clock");
     const changed = traceRows(sink).filter((row) => row.name === "daemon.provider_quota.changed");
     assert.equal(changed.length, 1);
     assert.equal(changed[0]?.attrs?.state, "near_exhausted");
     assert.equal(changed[0]?.attrs?.previous_state, "none");
     assert.equal(changed[0]?.attrs?.rate_limit_type, "seven_day");
 
-    await manager.stopAgent("agent-1");
-    assert.deepEqual(manager.providerQuota.quotaFor("agent-1"), { state: "near_exhausted", utilization: 0.94 }, "account quota outlives the process");
-    await mkdir(path.join(dataDir, "agent-1"), { recursive: true });
-    assert.equal(await manager.deleteWorkspaceDirectory("agent-1"), true);
-    assert.equal(manager.providerQuota.quotaFor("agent-1"), undefined, "forgotten with the agent's workspace");
+    await manager.stopAgent(QUOTA_AGENT_ID);
+    assert.deepEqual(manager.providerQuota.quotaFor(QUOTA_AGENT_ID), { state: "near_exhausted", utilization: 0.94 }, "account quota outlives the process");
+    await mkdir(path.join(dataDir, QUOTA_AGENT_ID), { recursive: true });
+    assert.equal(await manager.deleteWorkspaceDirectory(QUOTA_AGENT_ID), true);
+    assert.equal(manager.providerQuota.quotaFor(QUOTA_AGENT_ID), undefined, "forgotten with the agent's workspace");
   }, { tracer });
+});
+
+test("starting an agent records its server as the workspace owner, and the workspace is kept while it runs", async () => {
+  const agentId = "7c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f";
+  await withManager(async ({ manager, dataDir }) => {
+    await manager.startAgent(agentId, makeConfig({ runtimeContext: { serverId: "server-a" } }));
+    const marker = JSON.parse(await readFile(path.join(dataDir, ".agent-state", agentId, "workspace-owner.json"), "utf8"));
+    assert.equal(marker.serverId, "server-a");
+
+    assert.equal(await manager.deleteWorkspaceDirectory(agentId), false, "a running agent's workspace is kept");
+    assert.equal(await manager.deleteWorkspaceDirectory(agentId.toUpperCase()), false, "in any letter case");
+    await stat(path.join(dataDir, agentId));
+
+    await manager.stopAgent(agentId);
+    assert.equal(await manager.deleteWorkspaceDirectory(agentId), true, "its own server deletes it once it stopped");
+    await assert.rejects(stat(path.join(dataDir, agentId)));
+  }, { connectedServerId: () => "server-a" });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -6661,7 +6770,10 @@ test("task #379: tool_output, subagent progress and diagnostics do not clear a r
   });
 });
 
-test("task #379: a used-up quota with a reported future reset waits until the reset, at most 60 minutes", async () => {
+// #proj-runtime:#66: a reported reset is waited for even past the 60 minutes
+// a wait without one is capped at (a weekly limit retried every hour only hit
+// the same refusal), plus a little jitter.
+test("task #379: a used-up quota with a reported future reset waits until the reset, not just 60 minutes", async () => {
   await withManager(async ({ driver, manager }) => {
     await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
     await flush();
@@ -6672,7 +6784,9 @@ test("task #379: a used-up quota with a reported future reset waits until the re
     ]);
     const after = Date.now();
     const untilMs = getProcess(manager, "agent-1").runtimeErrorDeliveryBackoff.untilMs;
-    assert.ok(untilMs >= before + QUOTA_RESET_BACKOFF_MAX_MS && untilMs <= after + QUOTA_RESET_BACKOFF_MAX_MS, `holds for 60 minutes, not 2 hours (untilMs - now = ${untilMs - after})`);
+    const resetMs = before + 2 * 60 * 60_000;
+    assert.ok(untilMs >= resetMs && untilMs <= resetMs + PROVIDER_LIMIT_RESET_JITTER_MAX_MS, `holds until the reset 2 hours away, not 60 minutes (untilMs - reset = ${untilMs - resetMs})`);
+    assert.ok(untilMs > after + QUOTA_RESET_BACKOFF_MAX_MS, "past the cap of a wait without a reset");
   });
 });
 
@@ -6703,24 +6817,32 @@ test("task #379: restarting the agent is a manual recovery that starts with no b
   }
 });
 
-test("task #379: providerLimitBackoffDelayMs only waits for a valid future quota reset, capped at 60 minutes", () => {
+test("task #379: providerLimitBackoffDelayMs waits for a usable future quota reset; anything else is the exponential delay capped at 60 minutes", () => {
   const now = Date.parse("2026-10-20T00:00:00.000Z");
   const exp = 10_000;
   const at = (ms: number) => new Date(now + ms).toISOString();
   const quota = (resetsAt?: string) => ({ kind: "quota_exhausted" as const, ...(resetsAt !== undefined ? { resetsAt } : {}) });
-  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(5 * 60_000)), exponentialDelayMs: exp, nowMs: now }), 5 * 60_000, "future reset within the cap");
-  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(60 * 60_000)), exponentialDelayMs: exp, nowMs: now }), 60 * 60_000, "exactly at the cap");
-  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(60 * 60_000 + 1)), exponentialDelayMs: exp, nowMs: now }), QUOTA_RESET_BACKOFF_MAX_MS, "just past the cap is capped");
-  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(7 * 24 * 60 * 60_000)), exponentialDelayMs: exp, nowMs: now }), QUOTA_RESET_BACKOFF_MAX_MS, "a weekly reset is capped");
+  const day = 24 * 60 * 60_000;
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(5 * 60_000)), exponentialDelayMs: exp, nowMs: now }), 5 * 60_000, "future reset");
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(60 * 60_000 + 1)), exponentialDelayMs: exp, nowMs: now }), 60 * 60_000 + 1, "past the 60-minute cap: still the reset (#proj-runtime:#66)");
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(7 * day)), exponentialDelayMs: exp, nowMs: now }), 7 * day, "a weekly reset is waited for");
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(8 * day)), exponentialDelayMs: exp, nowMs: now }), 8 * day, "8 days ahead is the furthest believed");
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(8 * day + 1)), exponentialDelayMs: exp, nowMs: now }), exp, "further is no reset: the exponential delay");
   assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(0)), exponentialDelayMs: exp, nowMs: now }), exp, "a reset at now is not in the future");
   assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(-60_000)), exponentialDelayMs: exp, nowMs: now }), exp, "a past reset falls back");
   assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota("not-a-time"), exponentialDelayMs: exp, nowMs: now }), exp, "an invalid reset falls back");
   assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(), exponentialDelayMs: exp, nowMs: now }), exp, "a missing reset falls back");
   assert.equal(providerLimitBackoffDelayMs({ providerLimit: { kind: "transient_rate_limit", resetsAt: at(5 * 60_000) }, exponentialDelayMs: exp, nowMs: now }), exp, "a transient throttle never waits for a reset");
   assert.equal(providerLimitBackoffDelayMs({ providerLimit: undefined, exponentialDelayMs: exp, nowMs: now }), exp, "an unclassified error keeps the exponential delay");
-  // #proj-raft-computer:#46 Q3: any single provider-limit wait, with or without a reported reset.
+  // A reset wait gets up to `ratio` of itself as jitter, at most 30 s; none without a ratio.
+  const jittered = (ms: number, unit: number) => providerLimitBackoffDelayMs({ providerLimit: quota(at(ms)), exponentialDelayMs: exp, nowMs: now, resetJitter: { ratio: 0.1, random: () => unit } });
+  assert.equal(jittered(7 * day, 1), 7 * day + PROVIDER_LIMIT_RESET_JITTER_MAX_MS, "at most 30 s on a long wait");
+  assert.equal(jittered(60_000, 1), 66_000, "at most the ratio on a short one");
+  assert.equal(jittered(7 * day, 0), 7 * day, "none at unit 0");
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(at(60_000)), exponentialDelayMs: exp, nowMs: now, resetJitter: { ratio: 0, random: () => 1 } }), 60_000, "none at ratio 0");
+  // #proj-raft-computer:#46 Q3: any single provider-limit wait without a usable reset.
   const longExp = 2 * QUOTA_RESET_BACKOFF_MAX_MS;
-  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(), exponentialDelayMs: longExp, nowMs: now }), QUOTA_RESET_BACKOFF_MAX_MS, "an exponential quota wait is capped too");
+  assert.equal(providerLimitBackoffDelayMs({ providerLimit: quota(), exponentialDelayMs: longExp, nowMs: now }), QUOTA_RESET_BACKOFF_MAX_MS, "an exponential quota wait is capped");
   assert.equal(providerLimitBackoffDelayMs({ providerLimit: { kind: "transient_rate_limit" }, exponentialDelayMs: longExp, nowMs: now }), QUOTA_RESET_BACKOFF_MAX_MS, "so is a throttle's");
   assert.equal(providerLimitBackoffDelayMs({ providerLimit: undefined, exponentialDelayMs: longExp, nowMs: now }), longExp, "not a provider limit: untouched");
 });
@@ -7440,7 +7562,7 @@ test("RFC 081 inbox items: an app item's (app:<key>/<ref>) mid-turn notice is th
   const idle = await noticeTextFor("idle", deliverMessageOnce(message));
   const busy = await noticeTextFor("busy", deliverMessageOnce(message));
   assert.equal(busy, idle);
-  assert.match(idle, /\napp:stamp\/pr-13754 · 1 unread · from Stamp/);
+  assert.match(idle, /\napp:stamp\/pr-13754 · 1 unread\n/);
   assert.match(idle, /\n {2}read: raft inbox read --target "app:stamp\/pr-13754"\n/);
 });
 
@@ -7465,7 +7587,9 @@ const PARITY_REMINDER_DAEMON_SECTION_NOTICE = [
   "",
   "App items: 1",
   "",
-  `app=system.reminder · class=due · item=reminder · retention=until_explicit_ack · sourceRef=reminder:${PARITY_REMINDER_ID}:1 · action=raft reminder ack --id 1598ee1a --revision 1 · title=查看「今日待办」页面有没有新评论 · summary=Reminder due`,
+  "app:system.reminder/1598ee1a · \"查看「今日待办」页面有没有新评论\"",
+  "  \"Reminder due\" (preview)",
+  "  do: raft reminder ack --id 1598ee1a --revision 1",
   "]",
 ].join("\n");
 
@@ -7534,8 +7658,8 @@ test("RFC 081 inbox items: a mixed batch (a reminder and a local-only cleaner it
   // Launch time unknown: both are what `inbox check` prints in its daemon section (shared formatAgentInboxAppItems).
   const localSection = formatAgentInboxAppItems(pending);
   assert.match(localSection, /^App items: 2\n\n/);
-  assert.match(localSection, /app=system\.reminder · class=due/);
-  assert.match(localSection, /app=system\.cleaner · class=disk_space_hint/);
+  assert.match(localSection, /^app:system\.reminder\/1598ee1a/m);
+  assert.match(localSection, /^app:system\.cleaner\//m);
   assert.equal(idle, [
     "[Raft inbox notice:",
     "Inbox update: 2 messages pending your read across all conversations; 2 changed targets",
@@ -7565,9 +7689,10 @@ test("RFC 081 inbox items: in the notice a local-only cleaner item's row is foll
     assert.equal(await manager.notifyAgentAppInbox("agent-1", cleaner.item), true);
   });
   const lines = notice.split("\n");
-  const cleanerRow = lines.findIndex((line) => line.startsWith("app=system.cleaner · class=disk_space_hint · "));
+  const cleanerRow = lines.findIndex((line) => line.startsWith(`app:system.cleaner/${cleanerItemId.slice(0, 8)} · `));
   assert.ok(cleanerRow >= 0, notice);
-  assert.equal(lines[cleanerRow + 1], `  dismiss: raft inbox dismiss --target "app:system.cleaner/${cleanerItemId.slice(0, 8)}"`);
+  const cleanerEnd = lines.findIndex((line, index) => index > cleanerRow && !line.startsWith("  "));
+  assert.equal(lines[cleanerEnd - 1], `  dismiss: raft inbox dismiss --target "app:system.cleaner/${cleanerItemId.slice(0, 8)}"`);
   assert.equal(lines.filter((line) => line.startsWith("  dismiss: ")).length, 1, "the reminder is acked, never dismissed");
 });
 
@@ -7627,14 +7752,14 @@ test("app Inbox notice: an item removed and minted again is announced again, als
     assert.equal(await manager.notifyAgentAppInbox("agent-1", again), true);
     assert.equal(notices().length, 2, "the item that came back is announced");
     assert.equal(outcomes().at(-1), "written");
-    assert.match(notices()[1]!.text, /summary=again/);
+    assert.match(notices()[1]!.text, /^ {2}"again" \(preview\)$/m);
 
     // Withdrawn by its app (an ack) and minted again with no wake of its own: the next idle drain offers it.
     assert.equal(store.ack(first.itemId), true);
     mint("third");
     goIdle();
     await waitFor(() => notices().length === 3, "the idle drain's notice");
-    assert.match(notices()[2]!.text, /summary=third/);
+    assert.match(notices()[2]!.text, /^ {2}"third" \(preview\)$/m);
 
     goIdle();
     await flush();

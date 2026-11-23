@@ -242,7 +242,8 @@ test("a thread of a private channel the forwarder is not in is refused, and noth
   const { threadId } = await threadIn(privateRoom.id, owner.id, "private plan");
 
   const res = await forward(app.baseUrl, memberToken, server.id, threadId, [sourceMessage.id]);
-  assert.equal(res.status, 403, await res.clone().text());
+  // A conversation the forwarder can't read answers like a missing one.
+  assert.equal(res.status, 404, await res.clone().text());
   assert.equal(((await res.json()) as { code: string }).code, "destination_unavailable");
   assert.equal((await messagesIn(threadId)).length, 0);
 });
@@ -262,7 +263,8 @@ test("a guest forwards into a thread of its own channel, never into a thread of 
   const other = await threadIn(room.id, owner.id, "other thread");
 
   const refused = await forward(app.baseUrl, guestToken, server.id, other.threadId, [sourceMessage.id]);
-  assert.equal(refused.status, 403, await refused.clone().text());
+  // The Guest can't read that thread: it answers like a missing one.
+  assert.equal(refused.status, 404, await refused.clone().text());
   assert.equal((await messagesIn(other.threadId)).length, 0);
 
   const allowed = await forward(app.baseUrl, guestToken, server.id, own.threadId, [sourceMessage.id]);
@@ -529,7 +531,8 @@ test("forwarding into a DM thread: only the DM's two people may; a third member 
 
   // The server's owner sees the source but is not in the DM.
   const refused = await forward(app.baseUrl, ownerToken, server.id, threadId, [sourceMessage.id]);
-  assert.equal(refused.status, 403, await refused.clone().text());
+  // Another pair's DM thread answers like a missing one.
+  assert.equal(refused.status, 404, await refused.clone().text());
   assert.equal(((await refused.json()) as { code: string }).code, "destination_unavailable");
   assert.equal((await messagesIn(threadId)).length, 0, "nothing lands in the DM thread");
   assert.equal((await messagesIn(dm!.id)).length, 1, "nor in the DM itself");

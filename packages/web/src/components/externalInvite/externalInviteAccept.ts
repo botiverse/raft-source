@@ -395,6 +395,7 @@ const INVITEE_ERROR_IDS: Record<string, MessageId> = {
   // both
   connect_in_progress: "externalInvite.error.connectInProgress",
   channel_archived: "externalInvite.error.archived",
+  channel_name_taken: "externalInvite.error.channelNameTaken",
   channel_conversion_in_progress: "externalInvite.error.busy",
   channel_conversion_fence_conflict: "externalInvite.error.busy",
   channel_conversion_ledger_conflict: "externalInvite.error.busy",
@@ -442,6 +443,7 @@ const APPROVER_ERROR_IDS: Record<string, MessageId> = {
   guests_present: "serverConnectRequest.error.guestsPresent",
   joint_party_limit: "serverConnectRequest.error.jointPartyLimit",
   connect_in_progress: "serverConnectRequest.error.connectInProgress",
+  channel_name_taken: "externalInvite.error.channelNameTaken",
   channel_full: "serverConnectRequest.error.channelFull",
   joint_server_limit: "serverConnectRequest.error.channelFull",
   joint_channel_free_limit_reached: "serverConnectRequest.error.hostLimit",

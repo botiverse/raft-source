@@ -1,11 +1,11 @@
-import { type ServerCapability } from "@botiverse/raft-shared";
+import { type ServerCapability, type ServerRole } from "@botiverse/raft-shared";
 import { setRequestTraceErrorCode } from "../middleware/requestObservability";
 import { Router, type NextFunction, type Request, type Response, type Router as RouterType } from "express";
 import { MANAGED_MCP_OAUTH_RESULT_CHANNEL } from "@botiverse/raft-shared";
-import { and, eq, isNotNull } from "drizzle-orm";
-import { getDb } from "../db/index";
-import { agents, managedMcpServers } from "../db/schema";
-import { actorHasServerCapabilityInServer, getActorServerRoleInServer, userCanActOnAgentResource } from "../lib/actorPermissions";
+import { and, eq, inArray, isNotNull } from "drizzle-orm";
+import { getDb, type DatabaseTransaction } from "../db/index";
+import { agents, managedMcpAssignments, managedMcpServers } from "../db/schema";
+import { actorHasServerCapabilityInServer, actorRoleHasServerCapability, getActorServerRoleInServer, userCanActOnAgentResource } from "../lib/actorPermissions";
 import { FencedAuthorizationDeniedError, ServerMembershipRevokedError, withActorMembershipFence } from "../lib/actorMembershipFence";
 import {
   createManagedMcpServer,
@@ -37,17 +37,33 @@ import {
 import {
   completeManagedMcpOAuthCallback,
   createManagedMcpHeaderConnection,
-  deleteManagedMcpConnection,
   describeManagedMcpDefaultImpact,
   listManagedMcpConnections,
   setServerDefaultConnection,
   updateManagedMcpConnection,
 } from "../services/managedMcpConnectionService";
 import { projectMcpConnectionAuthorization, resolveMcpConnectionViewerRole } from "../services/managedMcpConnectionCardService";
+import {
+  assertMayEditMcpConnection,
+  auditSharedPinChanges,
+  deleteMcpConnection,
+  mcpConnectionKind,
+  signOutMcpConnection,
+  listMcpAccounts,
+  readSharedPins,
+  setMcpConnectionAgents,
+  setMembersCanConnect,
+} from "../services/managedMcpAccountsService";
+import { notifyPersonalGrants } from "../services/managedMcpAccountNotices";
+import { mcpPersonalAccountsEnabled, PERSONAL_ACCOUNT_REFUSAL_MESSAGES, personalSignInRefusal } from "../services/managedMcpPersonalAccounts";
+import { MAX_AGENTS_PER_WRITE, requireAgentsVisibleTo } from "../services/managedMcpPersonalGrants";
 import { ManagedMcpServiceError } from "../services/managedMcpService";
 import { guardUuidPathParams } from "../lib/uuidPathParams";
 import { agentIdAsFoundBy, hideUnfindableAgentsByParam } from "./unfindableAgentGate";
-import { handleLogoUploadError, runSingleLogoUpload } from "./integrations";
+import { handleLogoUploadError, isPersonsOwnSession, runSingleLogoUpload } from "./integrations";
+import { refuseUnverifiedApprover } from "./secondFactor";
+import { webSessionFamilyOf } from "../services/sessionService";
+import { refuse } from "../lib/refusal";
 import rateLimit from "express-rate-limit";
 import {
   createMcpApp,
@@ -56,6 +72,7 @@ import {
   listMcpApps,
   clearMcpAppLogo,
   refreshMcpApp,
+  setMcpAppServerVouch,
   updateMcpApp,
   updateMcpAppLogo,
   type McpAppProfileInput,
@@ -255,9 +272,10 @@ function optionalAllowedTools(value: unknown): string[] | null | undefined {
  *   absent  leave the existing binding alone -- an unrelated edit to `allowedTools` must not
  *           silently revoke someone's Connection
  *   null    unbind, explicitly
- *   string  bind to this Connection, subject to the service re-checking it AS THE CALLER
- * The route does no authorization of its own here; `resolveAssignmentBinding` owns that, inside the
- * same transaction as the write.
+ *   string  pin to this Connection
+ * Who may change it is the route's (`assertMayChangeBinding`: admins only, under the membership fence); what may be
+ * pinned (a shared Connection of this App) is `resolveAssignmentBinding`'s, inside the same
+ * transaction as the write.
  */
 function optionalConnectionVisibility(value: unknown): "private" | "server_shared" | undefined {
   if (value === undefined) return undefined;
@@ -303,6 +321,36 @@ async function optionalOAuthIntentOrigin(serverId: string, value: unknown): Prom
   };
 }
 
+/** `agentIds` of a request: 0 to MAX_AGENTS_PER_WRITE Agent ids, deduplicated. */
+function agentIdList(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.length > MAX_AGENTS_PER_WRITE) {
+    throw new ManagedMcpCredentialError(`${label} must be an array of at most ${MAX_AGENTS_PER_WRITE} agent ids`, "managed_mcp_credential_invalid");
+  }
+  return [...new Set(value.map((item) => requiredUuid(item, label)))];
+}
+
+/**
+ * RFC 087 §6: every write about whose account an Agent uses (connecting, giving, revoking, the
+ * toggle) is a person's own session, as the server vouch: never an assistant acting as its owner,
+ * a confirmed card's dispatch or an agent's credential. Answers the refusal and returns true.
+ */
+function refuseUnlessPersonsOwnSession(req: Request, res: Response): boolean {
+  if (isPersonsOwnSession(req)) return false;
+  refuse(res, 403, { code: "MCP_ACCOUNT_PERSON_ONLY", error: "Only a person signed in themselves can connect, give or remove an App account." });
+  return true;
+}
+
+/**
+ * `refuseUnlessPersonsOwnSession` as route middleware: first in the chain, so a refused request
+ * reads nothing, writes nothing and spends no rate-limit token. RFC 087 §6: a person's own session
+ * for every sign-in start and every assignment write, shared or personal (defense in depth: today no
+ * assistant owner action, card dispatch or device session reaches these routes).
+ */
+function requirePersonsOwnSession(req: Request, res: Response, next: NextFunction): void {
+  if (refuseUnlessPersonsOwnSession(req, res)) return;
+  next();
+}
+
 function requiredAssignmentUpdates(value: unknown) {
   if (!Array.isArray(value) || value.length === 0 || value.length > 100) {
     throw new ManagedMcpCredentialError("assignments must contain between 1 and 100 updates", "managed_mcp_credential_invalid");
@@ -328,11 +376,21 @@ const BAD_REQUEST_SERVICE_CODES = new Set<ManagedMcpServiceError["code"]>([
   "managed_mcp_headers_incomplete",
   "managed_mcp_app_section_not_supported",
   "managed_mcp_app_invalid",
+  "managed_mcp_personal_oauth_only",
+  "managed_mcp_connection_request_invalid",
 ]);
 
-/** Refusals of who may use what: pinning an Agent to someone else's Connection. */
+/**
+ * Refusals of who may use what: pinning to a personal Connection, or pinning without being an admin;
+ * a member's own account (RFC 087) where the App or the person does not allow it, or someone else's.
+ * (`managed_mcp_personal_accounts_off`, the Server flag, is a 409.)
+ */
 const FORBIDDEN_SERVICE_CODES = new Set<ManagedMcpServiceError["code"]>([
   "managed_mcp_connection_not_usable",
+  "managed_mcp_pin_forbidden",
+  "managed_mcp_members_cannot_connect",
+  "managed_mcp_personal_not_member",
+  "managed_mcp_connection_forbidden",
 ]);
 
 function sendManagedMcpError(error: unknown, res: Response, next: NextFunction): void {
@@ -367,6 +425,23 @@ function sendManagedMcpError(error: unknown, res: Response, next: NextFunction):
   next(error);
 }
 
+/** sendManagedMcpError for a write under the membership fence. */
+function sendFencedManagedMcpError(error: unknown, res: Response, next: NextFunction): void {
+  if (error instanceof ServerMembershipRevokedError) {
+    refuse(res, 403, { code: error.code, error: error.message });
+    return;
+  }
+  if (error instanceof FencedAuthorizationDeniedError) {
+    if (error.reason === "not_found") {
+      refuse(res, 404, { code: "managed_mcp_connection_not_found", error: "This Connection does not exist on this server, or you cannot see it." });
+    } else {
+      refuse(res, 403, { code: "managed_mcp_forbidden", error: "You are not allowed to change this Connection; ask its owner or a server admin." });
+    }
+    return;
+  }
+  sendManagedMcpError(error, res, next);
+}
+
 function requireCapability(capability: ServerCapability) {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -379,6 +454,38 @@ function requireCapability(capability: ServerCapability) {
       next(error);
     }
   };
+}
+
+/**
+ * Which shared account an Agent uses (pinned to a shared Connection, or following the default) is
+ * managing the shared account, an admin's decision (RFC 087 §6): `manageExternalAuth`, read under the
+ * caller's membership fence, for any write that CHANGES `connection_mode` / `bound_connection_id`.
+ * A write that names the current choice again (a UI sending the whole row) is not a change, so the
+ * Agent's creator may still send it; `enabled` and `allowedTools` keep their writers.
+ */
+async function assertMayChangeBinding(
+  tx: DatabaseTransaction,
+  callerRole: ServerRole | null,
+  agentId: string,
+  updates: ReadonlyArray<{ mcpServerId: string; connectionId: string | null | undefined }>,
+): Promise<void> {
+  if (actorRoleHasServerCapability(callerRole, "manageExternalAuth")) return;
+  const asked = updates.filter((update) => update.connectionId !== undefined);
+  if (asked.length === 0) return;
+  const current = new Map((await tx
+    .select({ mcpServerId: managedMcpAssignments.mcpServerId, connectionMode: managedMcpAssignments.connectionMode, boundConnectionId: managedMcpAssignments.boundConnectionId })
+    .from(managedMcpAssignments)
+    .where(and(eq(managedMcpAssignments.agentId, agentId), inArray(managedMcpAssignments.mcpServerId, asked.map((update) => update.mcpServerId)))))
+    .map((row) => [row.mcpServerId, row]));
+  const changes = asked.some(({ mcpServerId, connectionId }) => {
+    const row = current.get(mcpServerId);
+    // No row follows the default.
+    const pinned = row?.connectionMode === "pinned";
+    return connectionId === null ? pinned : !(pinned && row?.boundConnectionId === connectionId);
+  });
+  if (changes) {
+    throw new ManagedMcpServiceError("Only a server admin can change which shared Connection an agent uses", "managed_mcp_pin_forbidden");
+  }
 }
 
 function requireAgentCapabilityOrCreator(capability: ServerCapability) {
@@ -478,6 +585,8 @@ managedMcpRouter.post("/servers", requireCapability("manageIntegrations"), async
     res.status(201).json(await createManagedMcpServer({
       serverId: req.serverId!,
       userId: req.userId!,
+      // As POST /apps: a server owner or admin in their own session vouches for it.
+      vouchAsCreator: isPersonsOwnSession(req),
       name: requiredString(input.name, "name", 120),
       description: optionalString(input.description, "description"),
       provider,
@@ -552,7 +661,7 @@ managedMcpRouter.post("/servers/:mcpServerId/test", requireCapability("manageInt
   }
 });
 
-managedMcpRouter.post("/servers/:mcpServerId/oauth/start", requireCapability("manageExternalAuth"), async (req, res, next) => {
+managedMcpRouter.post("/servers/:mcpServerId/oauth/start", requirePersonsOwnSession, requireCapability("manageExternalAuth"), async (req, res, next) => {
   try {
     const redirectUrl = new URL(MANAGED_MCP_OAUTH_CALLBACK_PATH, managedMcpServerOrigin()).toString();
     sendManagedMcpOAuthStart(res, await startManagedMcpOAuthConnection({
@@ -580,32 +689,128 @@ managedMcpRouter.delete("/servers/:mcpServerId/oauth", requireCapability("manage
  * (`connectionId`, reauthorize; the row is reused). A new Connection is written as `pending` before
  * the provider is contacted and is removed again if the start fails.
  */
+/**
+ * Member-triggered account writes (RFC 087), keyed by Server + person like the other per-person
+ * limiters here (probeLimiter) and in assistantWeChat.ts: a personal sign-in start writes a pending
+ * row and contacts the provider; the agents API writes grants and notifies people. In-memory, per
+ * replica, as every limiter in this server.
+ */
+const personalStartRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `mcp-personal-start:${req.serverId ?? "none"}:${req.userId ?? "none"}`,
+  message: { error: "Too many sign-ins started; wait a minute", code: "managed_mcp_rate_limited" },
+});
+const accountWriteLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `mcp-account-agents:${req.serverId ?? "none"}:${req.userId ?? "none"}`,
+  message: { error: "Too many account changes; wait a minute", code: "managed_mcp_rate_limited" },
+});
+/** Only a personal sign-in spends the personal start budget; a shared one is the admins' as before. */
+const personalStartLimiter = (req: Request, res: Response, next: NextFunction) => {
+  if (body(req).kind === "personal") {
+    void personalStartRateLimit(req, res, next);
+    return;
+  }
+  next();
+};
+
+/**
+ * `kind: "personal"` (RFC 087 §7.1): the caller's own Connection, a member who is not a guest, in
+ * their own session, while the Server flag and the App's members_can_connect are on (OAuth Apps
+ * only); `intent.agentIds` are given it at the callback, re-checked then. Otherwise (`shared`, the
+ * default) the admins' as before; while the flag is on a shared sign-in may name `intent.agentIds`
+ * too (the Connect card's agent), pinned at the callback after the same re-check. Either way the
+ * kind is stored in the attempt's intent.
+ */
+function oauthStartKind(req: Request): "personal" | "shared" {
+  const kind = body(req).kind;
+  if (kind === undefined || kind === "shared") return "shared";
+  if (kind === "personal") return "personal";
+  throw new ManagedMcpCredentialError("kind must be personal or shared", "managed_mcp_credential_invalid");
+}
+
+function requireOAuthStartAuthority() {
+  const integrations = requireCapability("manageIntegrations");
+  const externalAuth = requireCapability("manageExternalAuth");
+  return (req: Request, res: Response, next: NextFunction) => {
+    let kind: "personal" | "shared";
+    try {
+      kind = oauthStartKind(req);
+    } catch (error) {
+      sendManagedMcpError(error, res, next);
+      return;
+    }
+    // A personal sign-in's authority is the person's own (checked in the handler).
+    if (kind === "personal") {
+      next();
+      return;
+    }
+    void integrations(req, res, (error?: unknown) => (error ? next(error) : void externalAuth(req, res, next)));
+  };
+}
+
 managedMcpRouter.post(
   "/apps/:appId/connections/oauth/start",
-  requireCapability("manageIntegrations"),
-  requireCapability("manageExternalAuth"),
+  requirePersonsOwnSession,
+  requireOAuthStartAuthority(),
+  personalStartLimiter,
   async (req, res, next) => {
     try {
       const input = body(req);
+      const kind = oauthStartKind(req);
+      const appId = pathParam(req.params.appId);
       const connectionId = input.connectionId === undefined ? undefined : requiredUuid(input.connectionId, "connectionId");
       if (input.makeDefault !== undefined && typeof input.makeDefault !== "boolean") {
         throw new ManagedMcpCredentialError("makeDefault must be a boolean", "managed_mcp_credential_invalid");
       }
+      const rawIntent = typeof input.intent === "object" && input.intent !== null && !Array.isArray(input.intent)
+        ? input.intent as Record<string, unknown>
+        : null;
+      let agentIds: string[] | undefined;
+      if (kind === "personal") {
+        const refusal = await personalSignInRefusal(getDb(), { serverId: req.serverId!, appId, userId: req.userId! });
+        if (refusal) throw new ManagedMcpServiceError(PERSONAL_ACCOUNT_REFUSAL_MESSAGES[refusal], refusal);
+        if (input.makeDefault === true) {
+          throw new ManagedMcpServiceError("A member's own account can't be the App's default Connection.", "managed_mcp_connection_request_invalid");
+        }
+        if (rawIntent?.agentIds !== undefined) {
+          agentIds = agentIdList(rawIntent.agentIds, "intent.agentIds");
+          // Checked now as the agents API would; the callback checks again.
+          await requireAgentsVisibleTo(getDb(), req.serverId!, req.userId!, agentIds);
+        }
+      } else if (rawIntent?.agentIds !== undefined) {
+        // RFC 087 §7.1: the Connect card's "connect a new shared account" for its agent. Behind the
+        // flag (off: refused as before). The starter manages external auth (requireOAuthStartAuthority);
+        // the callback pins them, asking manageExternalAuth and the agents again then.
+        if (!await mcpPersonalAccountsEnabled(req.serverId!)) {
+          throw new ManagedMcpServiceError("A shared sign-in doesn't choose agents; pin them after it.", "managed_mcp_connection_request_invalid");
+        }
+        agentIds = agentIdList(rawIntent.agentIds, "intent.agentIds");
+        await requireAgentsVisibleTo(getDb(), req.serverId!, req.userId!, agentIds);
+      }
       const intent: ManagedMcpOAuthIntent = {
+        kind,
         ...(input.makeDefault === true ? { makeDefault: true } : {}),
-        ...(await optionalOAuthIntentOrigin(req.serverId!, input.intent)),
+        ...(await optionalOAuthIntentOrigin(req.serverId!, rawIntent ? { ...rawIntent, agentIds: undefined } : input.intent)),
+        ...(agentIds && agentIds.length > 0 ? { agentIds } : {}),
       };
       const redirectUrl = new URL(MANAGED_MCP_OAUTH_CALLBACK_PATH, managedMcpServerOrigin()).toString();
       sendManagedMcpOAuthStart(res, await startManagedMcpOAuthConnection({
         serverId: req.serverId!,
         userId: req.userId!,
-        mcpServerId: pathParam(req.params.appId),
+        mcpServerId: appId,
         redirectUrl,
         oauthClient: normalizeManagedMcpOAuthClient(input.oauthClient),
         connection: connectionId !== undefined
           ? { connectionId }
           : { newConnectionName: requiredString(input.name, "name", 120) },
-        intent: Object.keys(intent).length > 0 ? intent : null,
+        intent,
       }));
     } catch (error) {
       sendManagedMcpError(error, res, next);
@@ -613,16 +818,22 @@ managedMcpRouter.post(
   },
 );
 
+/**
+ * Signs a Connection out (tokens deleted, the Connection kept): a shared one by those who manage
+ * integrations and external auth, as before; a member's own one by its owner, or by an admin (a
+ * revoke: audited, the owner told), in the person's own session (signOutMcpConnection).
+ */
 managedMcpRouter.delete(
   "/apps/:appId/connections/:connectionId/oauth",
-  requireCapability("manageIntegrations"),
-  requireCapability("manageExternalAuth"),
   async (req, res, next) => {
     try {
-      await disconnectManagedMcpOAuthConnection(req.serverId!, pathParam(req.params.appId), pathParam(req.params.connectionId));
+      const appId = pathParam(req.params.appId);
+      const connectionId = pathParam(req.params.connectionId);
+      if (await mcpConnectionKind(req.serverId!, connectionId, appId) === "personal" && refuseUnlessPersonsOwnSession(req, res)) return;
+      await signOutMcpConnection({ serverId: req.serverId!, appId, connectionId, actorUserId: req.userId! });
       res.status(204).end();
     } catch (error) {
-      sendManagedMcpError(error, res, next);
+      sendFencedManagedMcpError(error, res, next);
     }
   },
 );
@@ -704,7 +915,7 @@ function optionalProfile(value: unknown): McpAppProfileInput {
 
 managedMcpRouter.get("/apps", requireCapability("viewAgents"), async (req, res, next) => {
   try {
-    res.json({ apps: await listMcpApps(req.serverId!) });
+    res.json({ apps: await listMcpApps(req.serverId!, req.userId!) });
   } catch (error) {
     sendManagedMcpError(error, res, next);
   }
@@ -726,6 +937,8 @@ managedMcpRouter.post("/apps", requireCapability("manageIntegrations"), probeLim
     res.status(201).json(await createMcpApp({
       serverId: req.serverId!,
       userId: req.userId!,
+      // A server owner or admin creating it vouches for it; insertMcpAppRow checks the capability.
+      vouchAsCreator: isPersonsOwnSession(req),
       source: requiredAppSource(input.source),
       profile: optionalProfile(input.profile),
       ...(input.authKind !== undefined ? { authKind: optionalAuthMode(input.authKind)! } : {}),
@@ -756,6 +969,68 @@ managedMcpRouter.patch("/apps/:appId", requireCapability("manageIntegrations"), 
     sendManagedMcpError(error, res, next);
   }
 });
+
+/**
+ * Vouch for this Server's MCP App, or end the vouch: `{ vouched: boolean }`. A vouched App is
+ * granted to every agent here automatically (mcpAutoGrantCoversAgent), whatever its creator's role.
+ * manageExternalAuth, as granting an agent an App; a person's own session only (never delegable,
+ * no agent API); vouching asks the approver's second step. Ending it stops future automatic grants
+ * only: assignment rows already written stay (setMcpAppServerVouch). Answers the App view.
+ */
+managedMcpRouter.put("/apps/:appId/server-vouch", requireCapability("manageExternalAuth"), async (req, res, next) => {
+  try {
+    if (!isPersonsOwnSession(req)) {
+      refuse(res, 403, { code: "SERVER_VOUCH_PERSON_ONLY", error: "Only a server owner or admin, signed in themselves, can vouch for an App." });
+      return;
+    }
+    const vouched = body(req).vouched;
+    if (typeof vouched !== "boolean") {
+      throw new ManagedMcpCredentialError("vouched must be a boolean", "managed_mcp_credential_invalid");
+    }
+    // Vouching lets every agent here use the App: the same second step as approving one agent's access.
+    if (vouched && await refuseUnverifiedApprover(res, req.userId!, webSessionFamilyOf(req), "Confirm it's you with your second step before letting every agent use this app.")) return;
+    const appId = pathParam(req.params.appId);
+    const result = await setMcpAppServerVouch({ serverId: req.serverId!, appId, actorUserId: req.userId!, vouched });
+    if (result.status === "not_found") throw new ManagedMcpServiceError("MCP App not found", "managed_mcp_server_not_found");
+    res.json(await getMcpAppView(req.serverId!, appId, req.userId!));
+  } catch (error) {
+    sendManagedMcpError(error, res, next);
+  }
+});
+
+/**
+ * "Members can connect their own account" for this App (RFC 087 D1): `{ enabled: boolean }`.
+ * manageIntegrations + manageExternalAuth, a person's own session, while the Server flag
+ * `mcp_personal_accounts` is on (409 otherwise). Off stops new personal Connections only; existing
+ * ones and their agents stay (Q26). Audited when it changes. Answers the App view.
+ */
+managedMcpRouter.put(
+  "/apps/:appId/members-can-connect",
+  requireCapability("manageIntegrations"),
+  requireCapability("manageExternalAuth"),
+  async (req, res, next) => {
+    try {
+      if (refuseUnlessPersonsOwnSession(req, res)) return;
+      const enabled = body(req).enabled;
+      if (typeof enabled !== "boolean") {
+        throw new ManagedMcpCredentialError("enabled must be a boolean", "managed_mcp_credential_invalid");
+      }
+      if (!await mcpPersonalAccountsEnabled(req.serverId!)) {
+        throw new ManagedMcpServiceError(PERSONAL_ACCOUNT_REFUSAL_MESSAGES.managed_mcp_personal_accounts_off, "managed_mcp_personal_accounts_off");
+      }
+      const appId = pathParam(req.params.appId);
+      await withActorMembershipFence(req.serverId!, req.userId!, async (tx, lockedRole) => {
+        if (!actorRoleHasServerCapability(lockedRole, "manageIntegrations") || !actorRoleHasServerCapability(lockedRole, "manageExternalAuth")) {
+          throw new FencedAuthorizationDeniedError("forbidden");
+        }
+        await setMembersCanConnect(tx, { serverId: req.serverId!, appId, actorUserId: req.userId!, actorRole: lockedRole, enabled });
+      });
+      res.json(await getMcpAppView(req.serverId!, appId, req.userId!));
+    } catch (error) {
+      sendFencedManagedMcpError(error, res, next);
+    }
+  },
+);
 
 managedMcpRouter.post("/apps/:appId/refresh", requireCapability("manageIntegrations"), probeLimiter, async (req, res, next) => {
   try {
@@ -828,9 +1103,21 @@ managedMcpRouter.post("/apps/:appId/connections", requireCapability("manageInteg
   }
 });
 
-managedMcpRouter.patch("/apps/:appId/connections/:connectionId", requireCapability("manageIntegrations"), async (req, res, next) => {
+/**
+ * Renames a Connection or replaces its key: a shared one by those who manage integrations; a
+ * member's own one by its owner only (a name only), in their own session (RFC 087 §6).
+ */
+managedMcpRouter.patch("/apps/:appId/connections/:connectionId", async (req, res, next) => {
   try {
     const input = body(req);
+    const kind = await assertMayEditMcpConnection({
+      serverId: req.serverId!,
+      appId: pathParam(req.params.appId),
+      connectionId: pathParam(req.params.connectionId),
+      actorUserId: req.userId!,
+      replacesKey: input.headers !== undefined,
+    });
+    if (kind === "personal" && refuseUnlessPersonsOwnSession(req, res)) return;
     const closedCards: string[] = [];
     const updated = await updateManagedMcpConnection({
       serverId: req.serverId!,
@@ -848,19 +1135,122 @@ managedMcpRouter.patch("/apps/:appId/connections/:connectionId", requireCapabili
 });
 
 /**
- * Deletes a Connection. Agents pinned to it are refused from then on and do NOT fall back to the
- * server default (the dead-pin rule); if it was the default, the App has none until one is set.
+ * Deletes a Connection (the App-scoped route), the same rule as DELETE /connections/:connectionId:
+ * a shared one by those who manage integrations, a member's own by its owner or an admin (a revoke:
+ * its owner told); a person's own session; tokens go first. Agents pinned to a deleted shared one
+ * are refused from then on and do NOT fall back to the server default (the dead-pin rule); if it
+ * was the default, the App has none until one is set.
  */
-managedMcpRouter.delete("/apps/:appId/connections/:connectionId", requireCapability("manageIntegrations"), async (req, res, next) => {
+managedMcpRouter.delete("/apps/:appId/connections/:connectionId", async (req, res, next) => {
   try {
-    await deleteManagedMcpConnection({
+    if (refuseUnlessPersonsOwnSession(req, res)) return;
+    await deleteMcpConnection({
       serverId: req.serverId!,
-      mcpServerId: pathParam(req.params.appId),
+      appId: pathParam(req.params.appId),
       connectionId: pathParam(req.params.connectionId),
+      actorUserId: req.userId!,
     });
     res.status(204).end();
   } catch (error) {
+    sendFencedManagedMcpError(error, res, next);
+  }
+});
+
+/**
+ * The accounts of this Server (RFC 087 §7.2): `{ mine, shared?, members?, personalAccounts }`.
+ * Everyone who may view agents gets their own personal Connections; those who manage integrations
+ * also every shared one and every other member's (D5). Agents a viewer can't find are left out.
+ */
+managedMcpRouter.get("/accounts", requireCapability("viewAgents"), async (req, res, next) => {
+  try {
+    res.json(await listMcpAccounts(req.serverId!, req.userId!));
+  } catch (error) {
     sendManagedMcpError(error, res, next);
+  }
+});
+
+/**
+ * Which Agents use this Connection (RFC 087 §6, §7.2): `{ allAgents?: boolean, agentIds: string[] }`.
+ * A member's own Connection: its owner, while the Server flag is on (personal grants; a grant on
+ * another member's agent moves it; `allAgents` refused). A shared one: manageExternalAuth
+ * (`allAgents: true` makes it the default; `agentIds` are its pins). A person's own session, under
+ * the membership fence. Answers what changed, including the Agents moved from another account.
+ */
+managedMcpRouter.put("/connections/:connectionId/agents", accountWriteLimiter, async (req, res, next) => {
+  try {
+    if (refuseUnlessPersonsOwnSession(req, res)) return;
+    const input = body(req);
+    if (input.allAgents !== undefined && typeof input.allAgents !== "boolean") {
+      throw new ManagedMcpCredentialError("allAgents must be a boolean", "managed_mcp_credential_invalid");
+    }
+    const agentIds = input.agentIds === undefined ? [] : agentIdList(input.agentIds, "agentIds");
+    const closedCards: string[] = [];
+    const written = await withActorMembershipFence(req.serverId!, req.userId!, (tx, lockedRole) => setMcpConnectionAgents(tx, {
+      serverId: req.serverId!,
+      connectionId: pathParam(req.params.connectionId),
+      actorUserId: req.userId!,
+      actorRole: lockedRole,
+      ...(input.allAgents !== undefined ? { allAgents: input.allAgents as boolean } : {}),
+      agentIds,
+    }, closedCards));
+    await announceClosedConnectCards(req, closedCards, req.userId!);
+    if (written.personal?.notice) await notifyPersonalGrants(written.personal.notice);
+    const orchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
+    for (const agentId of written.changedAgentIds) {
+      await orchestrator?.applyAgentConfig(agentId, { fallbackRestartMode: "restart" });
+    }
+    res.json(written.result);
+  } catch (error) {
+    sendFencedManagedMcpError(error, res, next);
+  }
+});
+
+/**
+ * The Connect card's "use this account" (RFC 087 §7.1, D6): this Agent uses this Connection, and
+ * the Connection keeps its other Agents (setMcpConnectionAgents `add`). No body.
+ * A member's own Connection: its owner only, while the Server flag is on, an Agent they can find
+ * (personal grant; a grant replacing another member's moves it; the agent's owner and the admins
+ * told). A shared one: manageExternalAuth (a pin; the App's default is not touched; `enabled` is
+ * left alone). A person's own session, under the membership fence. Closes the card it satisfies.
+ * An Agent the caller can't find answers 404 (hideUnfindableAgentsByParam).
+ */
+managedMcpRouter.put("/connections/:connectionId/agents/:agentId", requirePersonsOwnSession, accountWriteLimiter, async (req, res, next) => {
+  try {
+    const closedCards: string[] = [];
+    const written = await withActorMembershipFence(req.serverId!, req.userId!, (tx, lockedRole) => setMcpConnectionAgents(tx, {
+      serverId: req.serverId!,
+      connectionId: pathParam(req.params.connectionId),
+      actorUserId: req.userId!,
+      actorRole: lockedRole,
+      agentIds: [pathParam(req.params.agentId)],
+      mode: "add",
+    }, closedCards));
+    await announceClosedConnectCards(req, closedCards, req.userId!);
+    if (written.personal?.notice) await notifyPersonalGrants(written.personal.notice);
+    const orchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
+    for (const agentId of written.changedAgentIds) await orchestrator?.applyAgentConfig(agentId, { fallbackRestartMode: "restart" });
+    res.json(written.result);
+  } catch (error) {
+    sendFencedManagedMcpError(error, res, next);
+  }
+});
+
+/**
+ * Deletes a Connection (RFC 087 §6, §7.2): a member's own by its owner or an admin (revoke; the
+ * owner is told), a shared one by those who manage integrations. A person's own session. Tokens go
+ * first, then the row; its personal grants go with it and those Agents fall back to their shared account.
+ */
+managedMcpRouter.delete("/connections/:connectionId", async (req, res, next) => {
+  try {
+    if (refuseUnlessPersonsOwnSession(req, res)) return;
+    await deleteMcpConnection({
+      serverId: req.serverId!,
+      connectionId: pathParam(req.params.connectionId),
+      actorUserId: req.userId!,
+    });
+    res.status(204).end();
+  } catch (error) {
+    sendFencedManagedMcpError(error, res, next);
   }
 });
 
@@ -887,11 +1277,15 @@ managedMcpRouter.put("/apps/:appId/default", requireCapability("manageIntegratio
     const connectionId = input.connectionId === null ? null : requiredUuid(input.connectionId, "connectionId");
     const mcpServerId = pathParam(req.params.appId);
     const closedCards: string[] = [];
+    const actorRole = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
+    // Audited by setServerDefaultConnection (`mcp_connection.agents_changed`, `allAgents`).
     const result = await getDb().transaction((tx) => setServerDefaultConnection(tx, {
       serverId: req.serverId!,
       mcpServerId,
       connectionId,
       userId: req.userId!,
+      actorRole,
+      via: "default",
     }, closedCards));
     await announceClosedConnectCards(req, closedCards, req.userId!);
     res.json({ ...result, connections: await listManagedMcpConnections(req.serverId!, mcpServerId) });
@@ -915,8 +1309,9 @@ managedMcpRouter.get("/oauth/attempts/:attemptId", async (req, res, next) => {
 
 // Granting, revoking and choosing an MCP App's Connection for one Agent: the agent's creator or
 // whoever manages external auth, exactly who may grant or revoke an ordinary App for it
-// (`canManageAgentAccess` in routes/integrations.ts).
-managedMcpRouter.put("/agents/:agentId/assignments/:mcpServerId", requireAgentCapabilityOrCreator("manageExternalAuth"), async (req, res, next) => {
+// (`canManageAgentAccess` in routes/integrations.ts). Changing which shared Connection it uses (a pin,
+// or back to the default) is the admins' alone (`assertMayChangeBinding`, RFC 087 §6).
+managedMcpRouter.put("/agents/:agentId/assignments/:mcpServerId", requirePersonsOwnSession, requireAgentCapabilityOrCreator("manageExternalAuth"), async (req, res, next) => {
   try {
     const input = body(req);
     // Every field is optional and an omitted one is left as it is, so a control that only changes the
@@ -940,6 +1335,9 @@ managedMcpRouter.put("/agents/:agentId/assignments/:mcpServerId", requireAgentCa
       if (!lockedAgent || !userCanActOnAgentResource(lockedRole, req.userId!, lockedAgent, "manageExternalAuth")) {
         throw new FencedAuthorizationDeniedError(lockedAgent ? "forbidden" : "not_found");
       }
+      await assertMayChangeBinding(tx, lockedRole, agentId, [{ mcpServerId: pathParam(req.params.mcpServerId), connectionId }]);
+      const pinsAsked = connectionId === undefined ? [] : [{ agentId, mcpServerId: pathParam(req.params.mcpServerId) }];
+      const pinsBefore = await readSharedPins(tx, req.serverId!, pinsAsked);
       const assigned = await setManagedMcpAssignment({
         serverId: req.serverId!,
         userId: req.userId!,
@@ -949,14 +1347,22 @@ managedMcpRouter.put("/agents/:agentId/assignments/:mcpServerId", requireAgentCa
         allowedTools,
         connectionId,
       }, { executor: tx, closedCards });
+      // RFC 087 §7.4: a pin changed is `mcp_connection.agents_changed` (who added the Connection, too).
+      await auditSharedPinChanges(tx, {
+        serverId: req.serverId!,
+        actorUserId: req.userId!,
+        actorRole: lockedRole,
+        before: pinsBefore,
+        after: await readSharedPins(tx, req.serverId!, pinsAsked),
+        via: "assignments",
+      });
       await bumpAgentConfigRevision(tx, [agentId]);
       return assigned;
     });
     await announceClosedConnectCards(req, closedCards, req.userId!);
-    // Reconciler step 11b: the running agent restarts on its new MCP servers
-    // once idle. A daemon that cannot take the push gets nothing, as before:
-    // every call is re-authorized live, so a narrowing holds at once anyway.
-    await (req.app.get("agentOrchestrator") as AgentOrchestrator | undefined)?.applyAgentConfig(agentId);
+    // Reconciler step 11b + #proj-runtime:#80: push to capable daemons, or run
+    // the idle-safe server fallback restart on older Computers.
+    await (req.app.get("agentOrchestrator") as AgentOrchestrator | undefined)?.applyAgentConfig(agentId, { fallbackRestartMode: "restart" });
     // task #1357 item 1: the revision moved, so a limits status is pending now.
     await (req.app.get("agentOrchestrator") as AgentOrchestrator | undefined)?.notifyModelLimitsChanged?.({ agentIds: [agentId] });
     res.json(view);
@@ -973,7 +1379,7 @@ managedMcpRouter.put("/agents/:agentId/assignments/:mcpServerId", requireAgentCa
   }
 });
 
-managedMcpRouter.put("/agents/:agentId/assignments", requireAgentCapabilityOrCreator("manageExternalAuth"), async (req, res, next) => {
+managedMcpRouter.put("/agents/:agentId/assignments", requirePersonsOwnSession, requireAgentCapabilityOrCreator("manageExternalAuth"), async (req, res, next) => {
   try {
     const agentId = pathParam(req.params.agentId);
     const assignments = requiredAssignmentUpdates(body(req).assignments);
@@ -990,22 +1396,34 @@ managedMcpRouter.put("/agents/:agentId/assignments", requireAgentCapabilityOrCre
       if (!lockedAgent || !userCanActOnAgentResource(lockedRole, req.userId!, lockedAgent, "manageExternalAuth")) {
         throw new FencedAuthorizationDeniedError(lockedAgent ? "forbidden" : "not_found");
       }
+      await assertMayChangeBinding(tx, lockedRole, agentId, assignments);
+      const pinsAsked = assignments
+        .filter((assignment) => assignment.connectionId !== undefined)
+        .map((assignment) => ({ agentId, mcpServerId: assignment.mcpServerId }));
+      const pinsBefore = await readSharedPins(tx, req.serverId!, pinsAsked);
       await writeManagedMcpAssignments({
         serverId: req.serverId!,
         userId: req.userId!,
         agentId,
         assignments,
       }, { executor: tx, closedCards });
+      await auditSharedPinChanges(tx, {
+        serverId: req.serverId!,
+        actorUserId: req.userId!,
+        actorRole: lockedRole,
+        before: pinsBefore,
+        after: await readSharedPins(tx, req.serverId!, pinsAsked),
+        via: "assignments",
+      });
       await bumpAgentConfigRevision(tx, [agentId]);
     });
     await announceClosedConnectCards(req, closedCards, req.userId!);
     const catalog = await listAgentManagedMcpCatalog(req.serverId!, agentId);
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
-    // Reconciler step 11b: a daemon that takes the new config restarts the
-    // agent once idle; otherwise it is restarted now, as before.
-    if (await agentOrchestrator.applyAgentConfig(agentId) !== "pushed") {
-      await agentOrchestrator.resetAgent(agentId, "restart", { restartIfStopped: false });
-    }
+    // Reconciler step 11b + #proj-runtime:#80: push to capable daemons, or run
+    // the idle-safe server fallback restart on older Computers (never kills a
+    // running foreground turn).
+    await agentOrchestrator.applyAgentConfig(agentId, { fallbackRestartMode: "restart" });
     await agentOrchestrator.notifyModelLimitsChanged?.({ agentIds: [agentId] });
     res.json(catalog);
   } catch (error) {
@@ -1044,6 +1462,11 @@ managedMcpOAuthCallbackRouter.get("/callback", async (req, res) => {
     const completion = await completeManagedMcpOAuthCallback({ state, authorizationCode: code }, closedCards);
     // The sign-in's starter is who satisfied the cards (the callback carries no session).
     await announceClosedConnectCards(req, closedCards, completion.userId);
+    // Agents a personal sign-in was given to take their new config automatically.
+    const orchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
+    for (const agentId of completion.changedAgentIds) {
+      await orchestrator?.applyAgentConfig(agentId, { fallbackRestartMode: "restart" });
+    }
     sendManagedMcpOAuthResultPage(res, 200, "connected", completion.attemptId);
   } catch (error) {
     // The page stays generic; the Connection's status line and this log carry the provider's reason.

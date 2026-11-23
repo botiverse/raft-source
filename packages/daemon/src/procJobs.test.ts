@@ -10,7 +10,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { PROC_CAPABILITY } from "@botiverse/raft-shared";
+import { parseProcJobLedger, PROC_CAPABILITY, PROC_MEMORY_MAX_DEFAULT_BYTES } from "@botiverse/raft-shared";
 import {
   __resetAgentCredentialProxyForTest,
   registerAgentCredentialProxy,
@@ -25,8 +25,13 @@ import {
   detectUserSystemd,
   handleProcRequest,
   moveJobIntoCgroup,
+  procJobToSnapshot,
+  procJobToWire,
+  procScopeArgv,
   procScopeUnitName,
   procStopReasonForAgentStop,
+  readProcMemoryMaxBytes,
+  sumGroupMemoryBytes,
   PROC_SCOPE_UNCONFIRMED_MESSAGE,
   procRuntimeRestrictedMessage,
   PROC_JOB_LEDGER_FILE,
@@ -575,12 +580,13 @@ test.skipIf(!posix)("start refuses an agent whose runtime isn't known to run wit
 // agent-id check and a non-hex id reaches the unit name.
 const UUID_AGENT = "6a37f503-aa11-499f-ae44-c25280e9451a";
 
-function fakeSystemd(state: string): { dir: string; record: string } {
+function fakeSystemd(state: string, version = 259): { dir: string; record: string } {
   const dir = tempDir();
   const record = path.join(dir, "systemd-run.argv");
   writeFileSync(path.join(dir, "systemctl"), `#!/bin/sh\necho ${state}\n[ "${state}" = running ]\n`);
   writeFileSync(path.join(dir, "systemd-run"), [
     "#!/bin/sh",
+    `[ "$1" = --version ] && { echo "systemd ${version} (${version})"; echo "+PAM +AUDIT"; exit 0; }`,
     // Written whole, then renamed: a reader never sees a half-written record.
     `printf '%s\\n' "$@" > '${record}.tmp' && mv '${record}.tmp' '${record}'`,
     'while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done',
@@ -641,7 +647,15 @@ test.skipIf(!posix)("start with user systemd: the job runs through systemd-run -
   // The shell creates the argv file before writing it. Once it has exec'd sleep,
   // the write is complete and the recorded pid is the command, leading its own group.
   await waitFor(() => psCommand(result.job.pid) === "sleep 60");
-  assert.deepEqual(readFileSync(fake.record, "utf8").trimEnd().split("\n"), ["--user", "--scope", "--unit", "raft-proc-6a37f503-web", "--collect", "--", "sleep", "60"]);
+  // A capped scope has a unit name of its own (the start time), so a failed one never blocks the next start.
+  assert.match(result.job.scopeUnit ?? "", /^raft-proc-6a37f503-web-[0-9a-z]+$/);
+  assert.deepEqual(readFileSync(fake.record, "utf8").trimEnd().split("\n"), [
+    "--user", "--scope", "--unit", result.job.scopeUnit,
+    "-p", `MemoryMax=${PROC_MEMORY_MAX_DEFAULT_BYTES}`, "-p", "MemorySwapMax=0", "-p", "OOMPolicy=kill",
+    "--", "sleep", "60",
+  ]);
+  // The fake runs no real scope: the cap isn't seen on the job's cgroup, so the daemon samples it.
+  assert.equal(result.job.memoryEnforcedBy, "sampler");
   const identity = await readProcessIdentity(result.job.pid);
   assert.equal(identity?.pgid, result.job.pid);
   assert.equal(result.job.pgid, result.job.pid);
@@ -690,4 +704,268 @@ test.skipIf(!posix)("without user systemd the job stays in the service's cgroup 
   assert.equal(quiet.status, 200);
   strays.push((quiet.body.job as { pid: number }).pid);
   assert.equal("stopsWithService" in quiet.body, false);
+});
+
+// #proj-raft-computer:#114 step 3: every job runs under a memory cap. RED
+// proofs (reverse-verified): stop after the first sample over the cap and the
+// "one sample alone" check fails; drop the Result read and the kernel case
+// records no memory_limit; keep --collect with a cap and the argv check fails.
+const GB = 1024 * 1024 * 1024;
+
+test("the scope argv: with a cap the kernel enforces it on the whole scope (OOMPolicy where scopes take it) and the unit is kept to read why; without one it is collected", () => {
+  assert.deepEqual(procScopeArgv("/usr/bin/systemd-run", "raft-proc-6a37f503-web", ["node", "a.js"], 4 * GB, { oomPolicy: true }), [
+    "/usr/bin/systemd-run", "--user", "--scope", "--unit", "raft-proc-6a37f503-web",
+    "-p", `MemoryMax=${4 * GB}`, "-p", "MemorySwapMax=0", "-p", "OOMPolicy=kill", "--", "node", "a.js",
+  ]);
+  assert.deepEqual(procScopeArgv("/usr/bin/systemd-run", "u", ["node"], GB), ["/usr/bin/systemd-run", "--user", "--scope", "--unit", "u", "-p", `MemoryMax=${GB}`, "-p", "MemorySwapMax=0", "--", "node"], "systemd older than 253");
+  assert.deepEqual(procScopeArgv("/usr/bin/systemd-run", "u", ["node"], null), ["/usr/bin/systemd-run", "--user", "--scope", "--unit", "u", "--collect", "--", "node"]);
+});
+
+test("the owner's cap: <Raft home>/computer/proc.json memoryMaxMb, 0 for none; no file or a bad one is the 4 GB default", () => {
+  const home = tempDir();
+  assert.equal(readProcMemoryMaxBytes(home), PROC_MEMORY_MAX_DEFAULT_BYTES);
+  assert.equal(PROC_MEMORY_MAX_DEFAULT_BYTES, 4 * GB);
+  mkdirSync(path.join(home, "computer"));
+  const file = path.join(home, "computer", "proc.json");
+  writeFileSync(file, JSON.stringify({ memoryMaxMb: 8192 }));
+  assert.equal(readProcMemoryMaxBytes(home), 8 * GB);
+  writeFileSync(file, JSON.stringify({ memoryMaxMb: 0 }));
+  assert.equal(readProcMemoryMaxBytes(home), null);
+  for (const bad of ["{", "null", JSON.stringify({ memoryMaxMb: Number.MAX_SAFE_INTEGER }), JSON.stringify({ memoryMaxMb: -1 }), JSON.stringify({ memoryMaxMb: 1.5 }), JSON.stringify({ memoryMaxMb: "8192" }), JSON.stringify({})]) {
+    writeFileSync(file, bad);
+    assert.equal(readProcMemoryMaxBytes(home), PROC_MEMORY_MAX_DEFAULT_BYTES, bad);
+  }
+});
+
+test.skipIf(!posix)("sampled jobs: stopped at once after two samples in a row over the cap, recorded memory_limit, one notice; one sample alone or an under-cap sample in between does not", async () => {
+  let used = new Map<number, number>();
+  const noticed: string[] = [];
+  const m = await manager({
+    machineDir: tempDir(),
+    memoryMaxBytes: () => GB,
+    memoryUsage: async (pgids) => new Map(pgids.filter((pgid) => used.has(pgid)).map((pgid) => [pgid, used.get(pgid)!])),
+    onMemoryLimit: (job) => noticed.push(job.name),
+  });
+  const big = await startOk(m, AGENT, ["sleep", "60"], { name: "big" });
+  const calm = await startOk(m, AGENT, ["sleep", "60"], { name: "calm" });
+  assert.equal(big.memoryMaxBytes, GB);
+  used = new Map([[big.pgid, 2 * GB], [calm.pgid, GB / 2]]);
+  await m.sampleMemory();
+  assert.equal(big.state, "running", "one sample alone");
+  used = new Map([[big.pgid, GB / 2]]);
+  await m.sampleMemory();
+  used = new Map([[big.pgid, 2 * GB]]);
+  await m.sampleMemory();
+  assert.equal(big.state, "running", "the under-cap sample reset the count");
+  await m.sampleMemory();
+  await waitFor(() => !groupAlive(big.pgid));
+  const [listedBig, listedCalm] = await m.list(AGENT);
+  assert.equal(listedBig?.state, "exited");
+  assert.equal(listedBig?.exitReason, "memory_limit");
+  assert.equal(listedCalm?.state, "running");
+  assert.deepEqual(noticed, ["big"]);
+  const wire = procJobToWire(listedBig!);
+  assert.equal(wire.exitReason, "memory_limit");
+  assert.equal(wire.memoryMaxBytes, GB);
+  await m.sampleMemory();
+  assert.deepEqual(noticed, ["big"], "an exited job is not sampled again");
+});
+
+test.skipIf(!posix)("no cap (memoryMaxMb 0): the job is never sampled", async () => {
+  const asked: number[][] = [];
+  const m = await manager({ machineDir: tempDir(), memoryMaxBytes: () => null, memoryUsage: async (pgids) => { asked.push([...pgids]); return new Map(); } });
+  const job = await startOk(m, AGENT, ["sleep", "60"], { name: "web" });
+  assert.equal(job.memoryMaxBytes, null);
+  await m.sampleMemory();
+  assert.deepEqual(asked, []);
+});
+
+const SCOPED_AT_MS = 1_000; // the unit's suffix: (1000).toString(36) = "rs"
+
+/** A job cgroup for any pid: the capped scope's own, carrying `memoryMax`. */
+function scopeCgroup(unit: string, memoryMax: string) {
+  return {
+    root: "/sys/fs/cgroup",
+    read: (file: string) => {
+      if (/^\/proc\/\d+\/cgroup$/.test(file)) return `0::/user.slice/app.slice/${unit}.scope\n`;
+      if (file === `/sys/fs/cgroup/user.slice/app.slice/${unit}.scope/memory.max`) return `${memoryMax}\n`;
+      throw new Error(`unexpected read ${file}`);
+    },
+    write: () => {},
+  };
+}
+
+test.skipIf(!posix)("a capped job in a scope of its own: the kernel holds it once its cgroup carries the cap; its unit's Result then says whether the OOM kill ended it, and the unit is reset either way", async () => {
+  for (const [result, expected] of [["oom-kill", "memory_limit"], ["success", null]] as const) {
+    const fake = fakeSystemd("running");
+    const calls: string[] = [];
+    const sampled: number[][] = [];
+    const noticed: string[] = [];
+    const m = await manager({
+      machineDir: tempDir(),
+      now: () => SCOPED_AT_MS,
+      userSystemd: { pathEnv: fake.dir },
+      cgroup: scopeCgroup("raft-proc-6a37f503-web-rs", String(GB)),
+      memoryMaxBytes: () => GB,
+      memoryUsage: async (pgids) => { sampled.push([...pgids]); return new Map(); },
+      scopeUnits: {
+        result: async (unit) => { calls.push(`result ${unit}`); return result; },
+        resetFailed: async (unit) => { calls.push(`reset ${unit}`); },
+      },
+      onMemoryLimit: (job) => noticed.push(job.name),
+    });
+    await m.settled();
+    assert.deepEqual(calls, ["reset raft-proc-*"], "the start's sweep of failed scopes");
+    calls.length = 0;
+    const started = await m.start(UUID_AGENT, { name: "web", argv: ["sleep", "60"], cwd: tmpdir(), env: env(), stableEntryDir: null, runtime: "claude", launchId: null });
+    assert.ok(started.ok, JSON.stringify(started));
+    strays.push(started.job.pid);
+    assert.equal(started.job.scopeUnit, "raft-proc-6a37f503-web-rs");
+    assert.equal(started.job.memoryEnforcedBy, "kernel");
+    await waitFor(() => psCommand(started.job.pid) === "sleep 60");
+    await m.sampleMemory();
+    assert.deepEqual(sampled, [], "a kernel-held job is not sampled");
+    process.kill(-started.job.pid, "SIGKILL");
+    await waitFor(() => started.job.state === "exited");
+    await m.settled();
+    assert.equal(started.job.exitReason, expected, result);
+    assert.deepEqual(calls, ["result raft-proc-6a37f503-web-rs", "reset raft-proc-6a37f503-web-rs"], result);
+    assert.deepEqual(noticed, expected ? ["web"] : [], result);
+  }
+});
+
+test.skipIf(!posix)("a scope that doesn't hold the cap is sampled: systemd older than 253 (no OOMPolicy on scopes), or a cgroup without the cap", async () => {
+  const older = fakeSystemd("running", 249);
+  const m = await manager({
+    machineDir: tempDir(),
+    now: () => SCOPED_AT_MS,
+    userSystemd: { pathEnv: older.dir },
+    cgroup: scopeCgroup("raft-proc-6a37f503-web-rs", String(GB)),
+    memoryMaxBytes: () => GB,
+  });
+  const started = await m.start(UUID_AGENT, { name: "web", argv: ["sleep", "60"], cwd: tmpdir(), env: env(), stableEntryDir: null, runtime: "claude", launchId: null });
+  assert.ok(started.ok, JSON.stringify(started));
+  strays.push(started.job.pid);
+  await waitFor(() => existsSync(older.record) && psCommand(started.job.pid) === "sleep 60");
+  assert.equal(readFileSync(older.record, "utf8").includes("OOMPolicy"), false);
+  assert.equal(started.job.memoryEnforcedBy, "sampler");
+
+  const uncapped = fakeSystemd("running");
+  const n = await manager({
+    machineDir: tempDir(),
+    now: () => SCOPED_AT_MS,
+    userSystemd: { pathEnv: uncapped.dir },
+    cgroup: scopeCgroup("raft-proc-6a37f503-web-rs", "max"),
+    memoryMaxBytes: () => GB,
+  });
+  const ignored = await n.start(UUID_AGENT, { name: "web", argv: ["sleep", "60"], cwd: tmpdir(), env: env(), stableEntryDir: null, runtime: "claude", launchId: null });
+  assert.ok(ignored.ok, JSON.stringify(ignored));
+  strays.push(ignored.job.pid);
+  assert.equal(ignored.job.memoryEnforcedBy, "sampler");
+});
+
+test("ps rows: resident KiB summed per wanted process group, in bytes", () => {
+  const out = "  100   2048\n  100  1024\n  200 4096\n garbage\n  300\n";
+  assert.deepEqual([...sumGroupMemoryBytes(out, [100, 300])], [[100, 3072 * 1024]]);
+});
+
+test("the ledger's memory fields: kept when well formed, dropped otherwise", () => {
+  const base = { agentId: "a", name: "web", pid: 5, pgid: 5, startIdentity: null, command: "x", startedAtMs: 1, logPath: "/l", scope: "created", state: "exited", exitCode: null, exitSignal: null, exitedAtMs: 2, adopted: false };
+  const [good, bad] = parseProcJobLedger(JSON.stringify({ version: 1, jobs: [
+    { ...base, memoryMaxBytes: GB, exitReason: "memory_limit", memoryEnforcedBy: "kernel", scopeUnit: "raft-proc-6a37f503-web-rs" },
+    { ...base, name: "bot", memoryMaxBytes: -1, exitReason: "other", memoryEnforcedBy: "x", scopeUnit: "../../etc" },
+  ] }));
+  assert.equal(good?.memoryMaxBytes, GB);
+  assert.equal(good?.exitReason, "memory_limit");
+  assert.equal(good?.memoryEnforcedBy, "kernel");
+  assert.equal(good?.scopeUnit, "raft-proc-6a37f503-web-rs");
+  for (const field of ["memoryMaxBytes", "exitReason", "memoryEnforcedBy", "scopeUnit"]) assert.equal(field in bad!, false, field);
+});
+
+test.skipIf(!posix)("a daemon start drops failed job scopes nothing reset, after the exits it found are classified", async () => {
+  const calls: string[] = [];
+  const machineDir = tempDir();
+  const fake = fakeSystemd("running");
+  const ops = {
+    result: async (unit: string) => { calls.push(`result ${unit}`); return "oom-kill"; },
+    resetFailed: async (unit: string) => { calls.push(`reset ${unit}`); },
+  };
+  const first = await manager({ machineDir, now: () => SCOPED_AT_MS, userSystemd: { pathEnv: fake.dir }, cgroup: scopeCgroup("raft-proc-6a37f503-web-rs", String(GB)), memoryMaxBytes: () => GB, scopeUnits: ops });
+  await first.settled();
+  calls.length = 0;
+  const started = await first.start(UUID_AGENT, { name: "web", argv: ["sleep", "60"], cwd: tmpdir(), env: env(), stableEntryDir: null, runtime: "claude", launchId: null });
+  assert.ok(started.ok, JSON.stringify(started));
+  strays.push(started.job.pid);
+  await waitFor(() => psCommand(started.job.pid) === "sleep 60");
+  first.close();
+  process.kill(-started.job.pid, "SIGKILL");
+  await waitFor(() => !groupAlive(started.job.pid));
+  await first.settled();
+  calls.length = 0;
+  const next = await manager({ machineDir, userSystemd: { pathEnv: fake.dir }, scopeUnits: ops });
+  await next.settled();
+  assert.deepEqual(calls, ["result raft-proc-6a37f503-web-rs", "reset raft-proc-6a37f503-web-rs", "reset raft-proc-*"]);
+  const [job] = await next.list(UUID_AGENT);
+  assert.equal(job?.exitReason, "memory_limit", "an OOM while no daemon watched is still recorded");
+});
+
+test.skipIf(!posix)("the owner's Stop: named by (agent, name), recorded owner_stop by the stopper, one notice; another agent's name, an unknown one and an exited job are told apart", async () => {
+  const owners: Array<{ name: string; stoppedBy: string | null | undefined }> = [];
+  let changes = 0;
+  const machineDir = tempDir();
+  const m = await manager({
+    machineDir,
+    onOwnerStop: (job) => owners.push({ name: job.name, stoppedBy: job.stoppedBy }),
+    onChange: () => { changes += 1; },
+  });
+  const web = await startOk(m, AGENT, ["sleep", "60"], { name: "web" });
+  assert.ok(changes > 0, "a start is a change");
+  assert.equal(await m.stopByOwner(OTHER, "web", "tygg"), "not_found");
+  assert.equal(await m.stopByOwner(AGENT, "nope", "tygg"), "not_found");
+  assert.equal(await m.stopByOwner(AGENT, "../web", "tygg"), "not_found");
+  assert.equal(groupAlive(web.pgid), true);
+  assert.equal(await m.stopByOwner(AGENT, "web", "tygg"), "stopped");
+  assert.equal(groupAlive(web.pgid), false);
+  const [listed] = await m.list(AGENT);
+  assert.equal(listed?.exitReason, "owner_stop");
+  assert.equal(listed?.stoppedBy, "tygg");
+  assert.equal(procJobToWire(listed!).stoppedBy, "tygg");
+  assert.deepEqual(owners, [{ name: "web", stoppedBy: "tygg" }]);
+  assert.equal(await m.stopByOwner(AGENT, "web", "tygg"), "already_exited");
+  assert.equal(owners.length, 1);
+  // The ledger keeps it for raft-computer and the next daemon.
+  const [recorded] = parseProcJobLedger(readFileSync(path.join(machineDir, PROC_JOB_LEDGER_FILE), "utf8"));
+  assert.equal(recorded?.stoppedBy, "tygg");
+  // A stopper that isn't a handle is not kept: "stopped by a person".
+  await startOk(m, AGENT, ["sleep", "60"], { name: "bot" });
+  assert.equal(await m.stopByOwner(AGENT, "bot", "a b; rm -rf"), "stopped");
+  const bot = (await m.list(AGENT)).find((job) => job.name === "bot");
+  assert.equal(bot?.exitReason, "owner_stop");
+  assert.equal(bot?.stoppedBy, undefined);
+});
+
+test.skipIf(!posix)("the owner's snapshot: name, state, times, exit and memory only, never the command, its arguments, directory, environment, log or pid", async () => {
+  const cwd = tempDir();
+  let used = new Map<number, number>();
+  const m = await manager({
+    machineDir: tempDir(),
+    memoryMaxBytes: () => GB,
+    memoryUsage: async (pgids) => new Map(pgids.filter((pgid) => used.has(pgid)).map((pgid) => [pgid, used.get(pgid)!])),
+  });
+  const job = await startOk(m, AGENT, ["sleep", "60", "--secret-token=hunter2"], { name: "web", cwd });
+  used = new Map([[job.pgid, 300 * 1024 * 1024]]);
+  await m.sampleMemory();
+  const [snap] = m.snapshotJobs();
+  assert.deepEqual(Object.keys(snap!).sort(), ["agentId", "exitCode", "exitReason", "exitSignal", "exitedAt", "memoryMaxBytes", "name", "rssBytes", "startedAt", "state", "stoppedBy"]);
+  assert.equal(snap?.rssBytes, 300 * 1024 * 1024);
+  assert.equal(snap?.memoryMaxBytes, GB);
+  const text = JSON.stringify(m.snapshotJobs());
+  for (const secret of ["sleep", "hunter2", cwd, job.logPath, "PATH"]) {
+    assert.ok(!text.includes(secret), `snapshot leaks ${secret}`);
+  }
+  // Shared strict schema reads it as sent.
+  const { safeParseProcJobsSnapshot } = await import("@botiverse/raft-shared");
+  assert.ok(safeParseProcJobsSnapshot({ protocolVersion: 1, reportedAt: new Date().toISOString(), jobs: m.snapshotJobs() }).success);
+  // An exited job carries no memory reading.
+  assert.equal("rssBytes" in procJobToSnapshot({ ...job, state: "exited" }, 1), false);
 });

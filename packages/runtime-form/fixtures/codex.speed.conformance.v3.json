@@ -1,0 +1,125 @@
+{
+  "$comment": "Runtime form v3 conformance cases for Codex mutually-exclusive speed controls (#wg-runtime-form:#31, Lagoon + Cindy). Uses codex.form.v3.json + codex.option-source.speed.v3.json: single-tier model (gpt-6.2-sol) shows only fastMode checkbox; multi-tier model (gpt-6.2-astra) shows only speed select (Standard / Fast / Ultrafast); zero-fast-tier model (gpt-5-mini) hides both. Switching models on edit never submits the hidden field's stale stored value.",
+  "form": "codex.form.v3.json",
+  "sources": {
+    "speed": "codex.option-source.speed.v3.json"
+  },
+  "cases": [
+    {
+      "name": "create on single-tier model with Fast mode checked submits fastMode=true and omits speed",
+      "editing": false,
+      "changes": [
+        ["model", "gpt-6.2-sol"],
+        ["fastMode", true]
+      ],
+      "expectedVisible": ["model", "fastMode", "envVars"],
+      "expectedHidden": ["speed"],
+      "expectedSubmission": {
+        "model": "gpt-6.2-sol",
+        "fastMode": true,
+        "envVars": {}
+      }
+    },
+    {
+      "name": "create on multi-tier model defaults to Standard (speed='') and hides fastMode",
+      "editing": false,
+      "changes": [
+        ["model", "gpt-6.2-astra"]
+      ],
+      "expectedVisible": ["model", "speed", "envVars"],
+      "expectedHidden": ["fastMode"],
+      "expectedSubmission": {
+        "model": "gpt-6.2-astra",
+        "speed": "",
+        "envVars": {}
+      }
+    },
+    {
+      "name": "create on multi-tier model choosing Ultrafast submits speed='ultrafast' and omits fastMode",
+      "editing": false,
+      "changes": [
+        ["model", "gpt-6.2-astra"],
+        ["speed", "ultrafast"]
+      ],
+      "expectedVisible": ["model", "speed", "envVars"],
+      "expectedHidden": ["fastMode"],
+      "expectedSubmission": {
+        "model": "gpt-6.2-astra",
+        "speed": "ultrafast",
+        "envVars": {}
+      }
+    },
+    {
+      "name": "create on zero-fast-tier model hides both fastMode and speed and submits neither",
+      "editing": false,
+      "changes": [
+        ["model", "gpt-5-mini"]
+      ],
+      "expectedVisible": ["model", "envVars"],
+      "expectedHidden": ["fastMode", "speed"],
+      "expectedSubmission": {
+        "model": "gpt-5-mini",
+        "envVars": {}
+      }
+    },
+    {
+      "name": "edit: switching from multi-tier Ultrafast to single-tier drops hidden speed from submission",
+      "editing": true,
+      "storedValues": {
+        "model": "gpt-6.2-astra",
+        "fastMode": true,
+        "speed": "ultrafast",
+        "envVars": {}
+      },
+      "changes": [
+        ["model", "gpt-6.2-sol"]
+      ],
+      "expectedVisible": ["model", "fastMode", "envVars"],
+      "expectedHidden": ["speed"],
+      "expectedSubmission": {
+        "model": "gpt-6.2-sol",
+        "fastMode": true,
+        "envVars": {}
+      }
+    },
+    {
+      "name": "edit: switching from multi-tier Ultrafast to zero-fast-tier drops both fastMode and speed",
+      "editing": true,
+      "storedValues": {
+        "model": "gpt-6.2-astra",
+        "fastMode": true,
+        "speed": "ultrafast",
+        "envVars": {}
+      },
+      "changes": [
+        ["model", "gpt-5-mini"]
+      ],
+      "expectedVisible": ["model", "envVars"],
+      "expectedHidden": ["fastMode", "speed"],
+      "expectedSubmission": {
+        "model": "gpt-5-mini",
+        "envVars": {}
+      }
+    },
+    {
+      "name": "edit: switching from single-tier Fast mode to multi-tier drops hidden fastMode and keeps Fast ('priority')",
+      "editing": true,
+      "storedValues": {
+        "model": "gpt-6.2-sol",
+        "fastMode": true,
+        "speed": "priority",
+        "envVars": {}
+      },
+      "changes": [
+        ["model", "gpt-6.2-astra"]
+      ],
+      "expectedVisible": ["model", "speed", "envVars"],
+      "expectedHidden": ["fastMode"],
+      "expectedSubmission": {
+        "model": "gpt-6.2-astra",
+        "speed": "priority",
+        "envVars": {}
+      }
+    }
+  ]
+}

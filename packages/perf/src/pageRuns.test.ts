@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { buildCohort } from "./cohort";
 import { type LoadMetrics, toPageRunRows } from "./pageRuns";
 
 const load = (arm: "on" | "off", lcp: number): LoadMetrics => ({ arm, contentMs: lcp - 10, lcp, cls: 0.01, fcp: 100, ttfb: 50, inp: null, commitSha: "abc", messagesFetched: 300, bootReads: arm === "on" ? 2 : 0, preflights: 1, status429: 0, status5xx: 0, scriptBytes: 1000 });
@@ -26,5 +27,27 @@ describe("toPageRunRows", () => {
   it("takes each row's commit from its own load", () => {
     const rows = toPageRunRows({ on: [{ ...load("on", 400), commitSha: "old" }], off: [{ ...load("off", 900), commitSha: "new" }] }, ctx);
     expect(rows.map((r) => r.commit_sha)).toEqual(["old", "new"]);
+  });
+  it("stores cohort identity and real TTFB when unintercepted (--ab none)", () => {
+    const cohort = buildCohort({
+      browserWhere: "browser-run",
+      edgeColo: "SIN",
+      hostCpuCount: 10,
+      hostBenchmarkMs: 4.2,
+      device: { browserCpuCount: 4, browserMemoryGb: 2, browserBenchmarkMs: 17.5 },
+      connectRttSamplesMs: [12],
+      fixture: "bench-v1@5395d2b0",
+    });
+    const [r] = toPageRunRows({ on: [{ ...load("on", 400), serverTimingMs: 28.4 }], off: [] }, { ...ctx, ab: "none", cohort, storeTtfb: true });
+    expect(r.ttfb_ms).toBe(50);
+    expect(r.extra).toMatchObject({
+      browser_where: "browser-run",
+      edge_colo: "SIN",
+      fixture_tag: "bench-v1@5395d2b0",
+      browser_cpu_count: 4,
+      browser_benchmark_ms: 17.5,
+      connect_rtt_ms: 12,
+      server_timing_ms: 28.4,
+    });
   });
 });

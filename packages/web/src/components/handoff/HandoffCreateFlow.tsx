@@ -279,10 +279,8 @@ export default function HandoffCreateFlow({ onClose, onStateChange }: {
     if (!agent) {
       try {
         agent = await createAgent(agentName.trim() || (dirBasename(selected.cwd) ?? "handoff"), {
-          description: formatMessage(
-            { id: "handoff.agent.description" },
-            { tool: TOOL_LABEL[selected.tool], cwd: selected.cwd ?? "-" },
-          ),
+          // The folder goes in the briefing below, not the description (#triage:#541).
+          description: formatMessage({ id: "handoff.agent.description" }, { tool: TOOL_LABEL[selected.tool] }),
           // The agent must continue on the session's own runtime — a Codex
           // session on the default (claude) runtime would mismatch its model.
           runtime: selected.tool === "codex" ? "codex" : "claude",

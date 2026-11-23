@@ -10,6 +10,7 @@ const APPROVED_SDK_ADAPTERS = new Set([
   "packages/server/src/services/productEventScopeDbWriter.ts",
   "packages/server/src/tracing/scopeDbTraceEventSink.ts",
   "packages/server/src/tracing/traceExportSummary.ts",
+  "packages/trace-upload-worker/src/external/devEvents.ts",
   "packages/trace-upload-worker/src/traces/traceEventProjector.ts",
 ]);
 

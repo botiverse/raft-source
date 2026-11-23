@@ -6,9 +6,10 @@
  * docs/observability/reading-telemetry.md says how to read it.
  *
  * Start hooks: useAppNavigate's guarded navigation and the window's popstate
- * (beginViewSwitchToPath), threadStore.openThread (beginViewSwitch). End
- * hook: useViewSwitchPaint in the channel and thread message lists. The HTTP
- * client's trace (utils/webHttpClientTrace.ts) reports the requests.
+ * (beginViewSwitchToPath), threadStore.openThread / openTaskModal /
+ * openTaskConversation (beginViewSwitch). End hook: useViewSwitchPaint in the
+ * channel, thread, and task conversation message lists. The HTTP client's
+ * trace (utils/webHttpClientTrace.ts) reports the requests.
  *
  * Attributes are closed enums and numbers only: the view keys and ids kept
  * here to match requests and lists never leave this module. Tracing never
@@ -21,7 +22,7 @@ import { webTraceSink } from "./webSpanSink";
 import { performanceNow } from "./resourceTiming";
 import type { RequestTiming } from "./resourceTiming";
 
-export type ViewSwitchTarget = "channel" | "dm" | "thread" | "message_jump";
+export type ViewSwitchTarget = "channel" | "dm" | "thread" | "task" | "message_jump";
 export type ViewSwitchCache = "hit" | "stale" | "miss";
 export type ViewSwitchEnd = "rendered" | "superseded" | "error" | "hidden";
 /** What a message list shows: a skeleton or a "Loading replies…" placeholder, its messages (or its loaded empty state), or a failure. */
@@ -105,6 +106,11 @@ export function conversationView(channelId: string): string {
 /** The internal key of a thread panel's replies, by the parent message. */
 export function threadView(parentMessageId: string): string {
   return `thread:${parentMessageId}`;
+}
+
+/** The internal key of a task conversation dialog, by the task id (or pre-v2 parent message id). */
+export function taskView(id: string): string {
+  return `task:${id}`;
 }
 
 /**
@@ -220,7 +226,7 @@ function markData(sw: ActiveSwitch): void {
 
 export interface BeginViewSwitchInput {
   target: ViewSwitchTarget;
-  /** conversationView(...) or threadView(...): the list whose data ends the switch. */
+  /** conversationView(...), threadView(...), or taskView(...): the list whose data ends the switch. */
   view: string;
   /** Ids that appear in this switch's request URLs (channel, thread or message ids). */
   matches: ReadonlyArray<string | null | undefined>;
@@ -280,12 +286,29 @@ export function viewSwitchForPath(path: string): Omit<BeginViewSwitchInput, "eve
     const kind = route[1] as "channel" | "dm";
     const channelId = decodeURIComponent(route[2]!);
     const messageId = url.searchParams.get("msg");
+    const task = url.searchParams.get("task");
+    if (task && task !== "1") {
+      const firstSep = task.indexOf(":");
+      const rest = firstSep > 0 ? task.slice(firstSep + 1) : "";
+      if (rest.startsWith("task:") && rest.length > 5) {
+        const taskId = rest.slice(5);
+        return { target: messageId ? "message_jump" : "task", view: taskView(taskId), matches: [taskId, messageId] };
+      }
+      const lastSep = task.lastIndexOf(":");
+      if (lastSep > 0) {
+        const parentMessageId = task.slice(lastSep + 1);
+        return { target: messageId ? "message_jump" : "task", view: taskView(parentMessageId), matches: [parentMessageId, messageId] };
+      }
+    }
     const thread = url.searchParams.get("thread");
     const separator = thread ? thread.lastIndexOf(":") : -1;
     if (thread && separator > 0) {
       // Not the parent channel: its requests are not the thread's. The thread
       // channel's id joins once known (addViewSwitchMatch).
       const parentMessageId = thread.slice(separator + 1);
+      if (task === "1") {
+        return { target: messageId ? "message_jump" : "task", view: taskView(parentMessageId), matches: [parentMessageId, messageId] };
+      }
       return {
         target: messageId ? "message_jump" : "thread",
         view: threadView(parentMessageId),

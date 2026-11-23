@@ -43,8 +43,7 @@ export function canOpenInDesktopApp(
  * browser tab. Not the web app installed as its own window (Chrome/Edge
  * Install, Safari Add to Dock): the person there already reads it as "the
  * app", and the offer opened a second app on the same page (huxijin,
- * #proj-deskop 197537c8). Settings › How links open still shows there
- * (canOpenInDesktopApp): it sets this browser's choice, which its tabs use.
+ * #proj-deskop 197537c8).
  */
 export function offersDesktopAppInThisWindow(
   nav: NavigatorLike = typeof navigator === "undefined" ? undefined : navigator,

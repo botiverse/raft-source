@@ -19,6 +19,7 @@ import { z } from "zod";
 import type { AgentApiClient, AgentApiClientResult } from "../agentApiClient";
 import {
   AGENT_API_ARTIFACT_ERROR_CODES,
+  AGENT_API_ARTIFACT_HELD_RANGE,
   AGENT_API_ARTIFACT_LIST_MAX_LIMIT,
   AGENT_API_ARTIFACT_SEARCH_QUERY_MAX_CHARS,
   AGENT_API_ARTIFACT_MAX_COMMENT_CHARS,
@@ -26,6 +27,7 @@ import {
   AGENT_API_ARTIFACT_MAX_REVIEW_COMMENTS,
   AGENT_API_ARTIFACT_MAX_TITLE_CHARS,
   agentApiArtifactCommentImageSchema,
+  parseArtifactHeldRange,
   type AgentApiArtifactCommentCreated,
   type AgentApiArtifactCommentImage,
   type AgentApiArtifactCommentsResponse,
@@ -38,6 +40,7 @@ import {
   type AgentApiArtifactReadResponse,
   type AgentApiArtifactReviewCreated,
   type AgentApiArtifactSaved,
+  type AgentApiArtifactSettlement,
   type AgentApiArtifactSubscriptionResponse,
   type AgentApiArtifactThreadResolution,
 } from "../agentApiArtifactsContract";
@@ -63,6 +66,7 @@ import {
   formatArtifactFileContent,
   formatArtifactList,
   formatArtifactMoved,
+  formatArtifactNotAPageHold,
   formatArtifactPublished,
   formatArtifactRead,
   formatArtifactReviewCommentImageRefusal,
@@ -70,18 +74,19 @@ import {
   formatArtifactReviewCommentRefusal,
   formatArtifactReviewed,
   formatArtifactSaved,
+  formatArtifactSettlement,
   formatArtifactSubscription,
   formatArtifactThreadResolution,
   type ArtifactErrorCode,
   type ArtifactErrorInput,
   type ArtifactReviewCommentPlace,
 } from "../agentText/artifacts";
-import { artifactFileType, artifactTitleFromHtml } from "../artifactFiles";
+import { artifactDefaultEntry, artifactFileType, artifactTitleFromHtml } from "../artifactFiles";
 import { isWellFormedArtifactFilePath } from "../artifactFilePath";
 import { isArtifactName, parseArtifactRef } from "../artifactRef";
 import { lazySchema } from "../lazySchema";
 import { ARTIFACT_CHECK_SHOTS, type ArtifactCheckShot } from "../webArtifactsContract";
-import type { RaftHintOptions, RaftHintStyle } from "./hint";
+import { shellPathWord, type RaftHintOptions, type RaftHintStyle } from "./hint";
 import { failureFromClientResult, failureOutcome, keyedWriteFailure, opError, opErrorFromClientError, refusalSentence, restyleDefaultNextAction, validateOpRequest, type RaftFailure, type RaftOpError, type RaftOutcome } from "./outcome";
 import { requestSchema } from "./requestSchema";
 
@@ -104,12 +109,13 @@ export const artifactsReadRequestSchema = lazySchema("artifactsReadRequestSchema
   files: z.boolean().optional().describe("List every file instead of the first few."),
 })));
 
-export const artifactsCommentsRequestSchema = lazySchema("artifactsCommentsRequestSchema", () => requestSchema<{ artifact: string; path?: string; all?: boolean; cursor?: string; review?: string }>()(z.object({
+export const artifactsCommentsRequestSchema = lazySchema("artifactsCommentsRequestSchema", () => requestSchema<{ artifact: string; path?: string; all?: boolean; cursor?: string; review?: string; held?: string }>()(z.object({
   artifact: artifactArg(),
   review: z.string().min(1).optional().describe("Only this review's comments (its id: review=… on its comments), all of them, in order."),
   path: z.string().min(1).optional().describe("Only comments on this file."),
   all: z.boolean().optional().describe("Every comment, not only those since you last looked."),
   cursor: z.string().min(1).optional().describe("The cursor from a More line."),
+  held: z.string().regex(AGENT_API_ARTIFACT_HELD_RANGE).optional().describe("List again the comments a held comment, resolve or push marked seen: the <from>..<to> range its last line names."),
 })));
 
 export const artifactsFileRequestSchema = lazySchema("artifactsFileRequestSchema", () => requestSchema<{ artifact: string; path: string; version?: number }>()(z.object({
@@ -302,23 +308,28 @@ export async function artifactsRead(
 
 export async function artifactsComments(
   client: Pick<AgentApiClient, "artifacts">,
-  request: { artifact: string; path?: string; all?: boolean; cursor?: string; review?: string },
+  request: { artifact: string; path?: string; all?: boolean; cursor?: string; review?: string; held?: string },
   options: RaftHintOptions = {},
 ): Promise<RaftOutcome<AgentApiArtifactCommentsResponse, "comments" | "empty">> {
   const style = options.hints ?? "cli";
   const invalid = validateOpRequest(artifactsCommentsRequestSchema, request); if (invalid) return invalid;
   const ref = resolveArtifactRef(request.artifact, style); if (!ref.ok) return ref.failure;
   if (request.path !== undefined && invalidPath(request.path)) return clientRefusal("INVALID_PATH", { artifact: ref.value, path: request.path }, style);
+  const held = request.held === undefined ? null : parseArtifactHeldRange(request.held);
   const result = await client.artifacts.comments({ artifact: ref.value }, {
     ...(request.path === undefined ? {} : { path: request.path }),
     // `review` lists all of a review's comments; `all` with it keeps a Server from before S8
     // (which ignores `review`) from listing only the unseen ones and marking them seen.
-    ...(request.all || request.review !== undefined ? { all: "1" as const } : {}),
-    ...(request.cursor === undefined ? {} : { cursor: request.cursor }),
+    // `held` (task #340) lists as `all` does; `all` and the
+    // range's start as the cursor keep a Server from before it (which
+    // ignores `held`) from marking anything seen, and start its list there.
+    ...(request.all || request.review !== undefined || held !== null ? { all: "1" as const } : {}),
+    ...(request.cursor === undefined ? held === null ? {} : { cursor: String(held.from) } : { cursor: request.cursor }),
     ...(request.review === undefined ? {} : { review: request.review }),
+    ...(request.held === undefined ? {} : { held: request.held }),
   });
   if (!result.ok) return failureFrom(result, { artifact: ref.value, path: request.path }, style);
-  return { ok: true, state: result.data.comments.length > 0 ? "comments" : "empty", data: result.data, next: null, text: formatArtifactComments(result.data, style, { review: request.review }) };
+  return { ok: true, state: result.data.comments.length > 0 ? "comments" : "empty", data: result.data, next: null, text: formatArtifactComments(result.data, style, { review: request.review, held: request.held }) };
 }
 
 /** One file as JSON: a text file's content (cut at 256 KiB), or a binary file's short-lived download URL. */
@@ -470,7 +481,7 @@ export const artifactsPublishRequestSchema = lazySchema("artifactsPublishRequest
   target: z.string().min(1).optional().describe("A new artifact's home: the conversation whose members can see it (#channel, dm:@peer)."),
   title: z.string().optional().describe("The title (up to 300 characters). Required for a new artifact unless its entry page has a <title>. For an existing one, a new title with no other change renames it without a new version."),
   description: z.string().optional().describe("What the artifact is (up to 1000 characters)."),
-  entry: z.string().optional().describe("The file it opens at. Default: the base's; index.html or the only file for a new one."),
+  entry: z.string().optional().describe("The file it opens at. Default: the base's; for a new one index.html, else the only file, else its only HTML page (with none, its only Markdown file)."),
   note: z.string().optional().describe("What changed in this version (up to 500 characters)."),
   label: z.string().optional().describe("A short name for this version (up to 60 characters)."),
   base: z.number().int().positive().optional().describe("The version number your files were made from (required for a new version: the number read returned)."),
@@ -528,24 +539,126 @@ const ENTRY_TITLE_SCAN_BYTES = 1024 * 1024;
 
 /**
  * A new artifact's title when its push gives none: its entry page's
- * `<title>`, cut to the title limit. The entry as the Server picks it for a
- * new one: `entry`, else the only file, else index.html. Null when the entry
+ * `<title>`, cut to the title limit (`entry`: newEntry's). Null when the entry
  * isn't a page whose bytes the request carries, or the page has no title.
  */
-function entryPageTitle(request: ArtifactsPublishRequest): { entry: string; title: string | null } {
+function entryPageTitle(request: ArtifactsPublishRequest, entry: string): { entry: string; title: string | null } {
   const files = request.files ?? [];
-  const entry = request.entry ?? (files.length === 1 ? files[0]!.path : "index.html");
   const file = files.find((f) => f.path === entry);
   const bytes = file && artifactFileType(entry).kind === "html" ? bytesOf(file) : null;
   const title = bytes ? artifactTitleFromHtml(new TextDecoder().decode(bytes.subarray(0, ENTRY_TITLE_SCAN_BYTES))) : null;
   return { entry, title: title === null ? null : [...title].slice(0, AGENT_API_ARTIFACT_MAX_TITLE_CHARS).join("").trim() };
 }
 
+/**
+ * A new artifact's entry: the one named, which must be among its files, else
+ * the Server's default (artifactDefaultEntry). A refusal (in the Server's
+ * ENTRY_NOT_FOUND terms) when the named one isn't there or none can be picked.
+ */
+function newEntry(named: string | undefined, paths: readonly string[]): { entry: string } | { refusal: { message: string; nextAction: string } } {
+  if (named !== undefined) {
+    if (paths.includes(named)) return { entry: named };
+    return { refusal: {
+      message: `The entry file ${JSON.stringify(named)} isn't among the files this push sends. Nothing was sent.`,
+      nextAction: paths.length === 0 ? "Push the page it should open at." : `Name one of the files it sends (--entry on the CLI, entry in a tool call): ${paths.slice(0, 10).map((path) => JSON.stringify(path)).join(", ")}${paths.length > 10 ? ", …" : ""}.`,
+    } };
+  }
+  const picked = artifactDefaultEntry(paths);
+  if ("entry" in picked) return picked;
+  if (picked.candidates.length === 0) {
+    return { refusal: {
+      message: "This push names no entry file, and it has no index.html, HTML page or Markdown file to open at. Nothing was sent.",
+      nextAction: "Add the page it should open at, or name the entry file (--entry on the CLI, entry in a tool call).",
+    } };
+  }
+  const shown = picked.candidates.slice(0, 10).map((path) => JSON.stringify(path)).join(", ") + (picked.candidates.length > 10 ? ", …" : "");
+  return { refusal: {
+    message: `This push names no entry file and has no index.html, but more than one page it could open at: ${shown}. Nothing was sent.`,
+    nextAction: `Name the one it opens at, e.g. --entry ${shellQuoted(picked.candidates[0]!)} on the CLI (entry in a tool call), or rename it to index.html, then push again.`,
+  } };
+}
+
+/** A path as it can be pasted into a shell: bare when it has only safe characters, else in single quotes. */
+const shellQuoted = shellPathWord;
+
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
   const digest = await crypto.subtle.digest("SHA-256", copy.buffer);
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ---- a new artifact with no page, held once (#345) ----------------------------
+
+/** How long a held push stays confirmed: the same push again within it goes through; after it, it is held again. */
+export const ARTIFACT_NOT_A_PAGE_HOLD_MS = 10 * 60 * 1000;
+
+/**
+ * Where a push held for having no page is remembered between runs, by its
+ * key: the CLI keeps it in the agent ledger, the SDK in the client's memory.
+ */
+export interface ArtifactPageHoldStore {
+  /** When the push with this key was held (ms since the epoch); undefined when it wasn't. */
+  heldAt(key: string): number | undefined | Promise<number | undefined>;
+  /** Remember that it was held at `at`. */
+  hold(key: string, at: number): void | Promise<void>;
+  /** Forget it: the push went through. */
+  release(key: string): void | Promise<void>;
+}
+
+/** How a push holds a new artifact with no page: without these, it never does. */
+export interface ArtifactPageHoldOptions {
+  store: ArtifactPageHoldStore;
+  /** The CLI's directory, absolute: part of the key, and where the upload line's file is. */
+  dir?: string;
+  /** The clock (tests). */
+  now?: () => number;
+}
+
+/** A hold store in memory: the SDK client's, so a held push is remembered as long as the client lives. Old records go as new ones come. */
+export function memoryArtifactPageHoldStore(): ArtifactPageHoldStore {
+  const held = new Map<string, number>();
+  return {
+    heldAt: (key) => held.get(key),
+    hold: (key, at) => {
+      for (const [old, when] of held) if (at - when > ARTIFACT_NOT_A_PAGE_HOLD_MS) held.delete(old);
+      held.set(key, at);
+    },
+    release: (key) => { held.delete(key); },
+  };
+}
+
+/** A file's size in bytes as the push lists it; null when the request can't tell (the Server refuses that file anyway). */
+function listedSize(file: ArtifactsPublishFileInput): number | null {
+  if (file.size !== undefined) return file.size;
+  if (file.content !== undefined) return new TextEncoder().encode(file.content).byteLength;
+  return bytesOf(file)?.byteLength ?? null;
+}
+
+/**
+ * A push to hold for having no page: a new artifact (a target, no artifact)
+ * none of whose files (those deleted left out) is HTML or Markdown. Its key
+ * is the directory, the target as given (trimmed), and the files' paths and
+ * sizes, sorted: the same push again has the same key, a changed file a new
+ * one. Null for any other push.
+ */
+async function notAPagePush(json: ArtifactsPublishJsonRequest, dir: string | undefined): Promise<{ key: string; paths: string[] } | null> {
+  if (json.artifact !== undefined || json.target === undefined) return null;
+  const deleted = new Set(json.delete ?? []);
+  const files = json.files.filter((f) => !deleted.has(f.path)).sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  if (files.length === 0) return null;
+  if (files.some((f) => { const { kind } = artifactFileType(f.path); return kind === "html" || kind === "markdown"; })) return null;
+  const keyed = JSON.stringify(["artifact-not-a-page/1", dir ?? null, json.target.trim(), files.map((f) => [f.path, listedSize(f)])]);
+  return { key: await sha256Hex(new TextEncoder().encode(keyed)), paths: files.map((f) => f.path) };
+}
+
+/** A hold store's answer, or undefined when it failed: the hold is a nudge, and a store that can't keep it must not stop every such push. */
+async function fromHoldStore<T>(call: () => T | Promise<T>): Promise<T | undefined> {
+  try {
+    return await call();
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -558,7 +671,7 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
 export async function artifactsPublish(
   client: Pick<AgentApiClient, "artifacts">,
   request: ArtifactsPublishRequest,
-  options: RaftHintOptions & { upload?: ArtifactUploader; dir?: string } = {},
+  options: RaftHintOptions & { upload?: ArtifactUploader; dir?: string; pageHold?: ArtifactPageHoldOptions } = {},
 ): Promise<RaftOutcome<AgentApiArtifactPublished, "pushed" | "replayed">> {
   const style = options.hints ?? "cli";
   const bytesBySha = new Map<string, Uint8Array>();
@@ -580,8 +693,11 @@ export async function artifactsPublish(
   if (title !== undefined && title.trim() === "") {
     return clientRefusal("TITLE_REQUIRED", { artifact: json.artifact?.trim(), dir: options.dir, target: json.target, publishing: true, details: { blank: true } }, style);
   }
+  // A new artifact's entry, as the Server will pick it: one that isn't in the push, or none to pick, is said before anything is sent.
+  const entry = json.artifact === undefined ? newEntry(json.entry, files.map((f) => f.path)) : null;
+  if (entry !== null && "refusal" in entry) return failureOutcome(opError("INVALID_REQUEST", { ...entry.refusal, serverCode: "ENTRY_NOT_FOUND" }));
   if (json.artifact === undefined && title === undefined) {
-    const page = entryPageTitle(request);
+    const page = entryPageTitle(request, entry!.entry);
     if (page.title === null) return clientRefusal("TITLE_REQUIRED", { dir: options.dir, target: json.target, publishing: true, details: { entry: page.entry } }, style);
     title = page.title;
   }
@@ -605,6 +721,19 @@ export async function artifactsPublish(
   }
   for (const path of [...files.map((f) => f.path), ...(json.delete ?? [])]) {
     if (invalidPath(path)) return clientRefusal("INVALID_PATH", { artifact, path, dir: options.dir, publishing: true }, style);
+  }
+  // A new artifact with no page is held once, the last check before anything is sent (#345): the same push
+  // again within ARTIFACT_NOT_A_PAGE_HOLD_MS goes through; the record is forgotten once a push has gone through.
+  const pageHold = options.pageHold;
+  const notAPage = pageHold ? await notAPagePush(json, pageHold.dir) : null;
+  if (pageHold && notAPage) {
+    const now = (pageHold.now ?? Date.now)();
+    const heldAt = await fromHoldStore(() => pageHold.store.heldAt(notAPage.key));
+    const confirmed = typeof heldAt === "number" && heldAt <= now && now - heldAt <= ARTIFACT_NOT_A_PAGE_HOLD_MS;
+    if (!confirmed && await fromHoldStore(async () => { await pageHold.store.hold(notAPage.key, now); return true; })) {
+      const text = formatArtifactNotAPageHold({ files: notAPage.paths, target: json.target!, ...(pageHold.dir === undefined ? {} : { dir: pageHold.dir }) }, style);
+      return failureOutcome(opError("CONFLICT", { message: text.message, nextAction: text.nextAction, heldOnce: true }));
+    }
   }
   const body: AgentApiArtifactPublishBody = {
     ...json,
@@ -638,6 +767,7 @@ export async function artifactsPublish(
       continue;
     }
     const published = data as AgentApiArtifactPublished;
+    if (pageHold && notAPage) await fromHoldStore(() => pageHold.store.release(notAPage.key));
     return { ok: true, state: published.replayed ? "replayed" : "pushed", data: published, next: null, text: formatArtifactPublished(published, style, { dir: options.dir, ...(json.target === undefined ? {} : { target: json.target }) }) };
   }
   return failureOutcome(opError("UNAVAILABLE"));
@@ -1207,6 +1337,49 @@ export async function artifactsReopen(
   const result = await client.artifacts.reopenComment({ artifact: ref.value, comment });
   if (!result.ok) return failureFrom(result, { artifact: ref.value, resolving: { comment, reopen: true } }, style);
   return { ok: true, state: result.data.changed ? "reopened" : "already_open", data: result.data, next: null, text: formatArtifactThreadResolution(result.data, style) };
+}
+
+// ---- settling (#334) ----------------------------------------------------------
+
+export const artifactsSettleRequestSchema = lazySchema("artifactsSettleRequestSchema", () => requestSchema<{ artifact: string }>()(z.object({
+  artifact: artifactArg(),
+})));
+
+async function setSettled(
+  client: Pick<AgentApiClient, "artifacts">,
+  request: { artifact: string },
+  settle: boolean,
+  options: RaftHintOptions,
+): Promise<RaftFailure | { ok: true; data: AgentApiArtifactSettlement; text: string }> {
+  const style = options.hints ?? "cli";
+  const invalid = validateOpRequest(artifactsSettleRequestSchema, request); if (invalid) return invalid;
+  const ref = resolveArtifactRef(request.artifact, style); if (!ref.ok) return ref.failure;
+  const result = settle ? await client.artifacts.settle({ artifact: ref.value }) : await client.artifacts.unsettle({ artifact: ref.value });
+  if (!result.ok) {
+    const input: ArtifactErrorInput = { artifact: ref.value, settling: { unsettle: !settle } };
+    const error = result.error;
+    // A Server from before Settled has no such route: say so, not "check the artifact".
+    if (error.kind === "http" && error.status === 404 && !(typeof error.errorCode === "string" && ARTIFACT_CODES.has(error.errorCode))) {
+      const text = formatArtifactError("SETTLED_NOT_AVAILABLE", input, style);
+      return failureOutcome({ ...opErrorFromClientError(error, result.status), message: text.message, nextAction: text.nextAction, serverCode: "SETTLED_NOT_AVAILABLE" });
+    }
+    return failureFrom(result, input, style);
+  }
+  return { ok: true, data: result.data, text: formatArtifactSettlement(result.data, settle, style) };
+}
+
+/** Mark an Artifact Settled (done) at its current version; one settled already changes nothing. */
+export async function artifactsSettle(client: Pick<AgentApiClient, "artifacts">, request: { artifact: string }, options: RaftHintOptions = {}): Promise<RaftOutcome<AgentApiArtifactSettlement, "settled" | "already_settled">> {
+  const outcome = await setSettled(client, request, true, options);
+  if (!outcome.ok) return outcome;
+  return { ok: true, state: outcome.data.changed ? "settled" : "already_settled", data: outcome.data, next: null, text: outcome.text };
+}
+
+/** Take a Settled Artifact back to Working; one Working already changes nothing. */
+export async function artifactsUnsettle(client: Pick<AgentApiClient, "artifacts">, request: { artifact: string }, options: RaftHintOptions = {}): Promise<RaftOutcome<AgentApiArtifactSettlement, "working" | "already_working">> {
+  const outcome = await setSettled(client, request, false, options);
+  if (!outcome.ok) return outcome;
+  return { ok: true, state: outcome.data.changed ? "working" : "already_working", data: outcome.data, next: null, text: outcome.text };
 }
 
 // ---- moving to the whole server and deleting ------------------------------------

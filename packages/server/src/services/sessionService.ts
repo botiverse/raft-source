@@ -12,6 +12,7 @@ import { getDb, type DatabaseExecutor } from "../db/index";
 import {
   accountDeletionRequests,
   appLoginRequests,
+  computerPairings,
   deviceAuthorizations,
   deviceLoginGrants,
   oauthAccessRequests,
@@ -785,10 +786,12 @@ export async function isApprovingSessionLive(
  * A one-time login code dies with the sign-in that approved it, whatever the
  * revoke (a logout too): every family revoker calls this in its transaction,
  * after it took the person's `users` row FOR UPDATE. Denies the person's
- * approved app login codes those families approved, their Login with Raft
+ * approved app login codes those families approved, the app step-ups that
+ * would mark one of them verified, their Login with Raft
  * codes not yet exchanged, and their device login codes not yet polled that
  * ask for a device session (`"all"`: every family of the person, every such
- * code). Unlike what a session approved through a device-login grant
+ * code); and voids the Add Computer pairings they created. Unlike what a
+ * session approved through a device-login grant
  * (approverSessionGrants.ts, a security revoke only), nothing has been issued
  * from these yet, so denying them takes nothing away that is in use. A device
  * code that carries a one-time grant is that grant's, and keeps its rule.
@@ -804,6 +807,15 @@ export async function denyLoginCodesApprovedBy(
     familyIds === "all"
       ? inArray(appLoginRequests.approverFamilyId, tx.select({ id: sessionFamilies.id }).from(sessionFamilies).where(eq(sessionFamilies.userId, userId)))
       : inArray(appLoginRequests.approverFamilyId, [...familyIds]),
+  ));
+  // An app step-up (appStepUpService.ts) for one of these sign-ins, open or
+  // verified but not yet redeemed: its code could only mark a revoked sign-in.
+  await tx.update(appLoginRequests).set({ status: "denied" }).where(and(
+    eq(appLoginRequests.purpose, "step_up"),
+    inArray(appLoginRequests.status, ["pending", "approved"]),
+    familyIds === "all"
+      ? eq(appLoginRequests.userId, userId)
+      : inArray(appLoginRequests.targetFamilyId, [...familyIds]),
   ));
   await tx.update(oauthAccessRequests).set({
     status: "denied", remember: false, resolvedByUserId: userId, resolvedAt: now, updatedAt: now,
@@ -823,6 +835,14 @@ export async function denyLoginCodesApprovedBy(
     familyIds === "all" ? undefined : inArray(deviceAuthorizations.approverFamilyId, [...familyIds]),
     notExists(tx.select({ id: deviceLoginGrants.id }).from(deviceLoginGrants)
       .where(eq(deviceLoginGrants.deviceAuthorizationId, deviceAuthorizations.id))),
+  ));
+  // The Add Computer window's pairings those sign-ins created
+  // (computerPairingService.ts): nothing can be approved through them any more.
+  await tx.update(computerPairings).set({ voidedAt: now, voidReason: "signed_out" }).where(and(
+    eq(computerPairings.userId, userId),
+    isNull(computerPairings.voidedAt),
+    isNull(computerPairings.consumedAt),
+    familyIds === "all" ? undefined : inArray(computerPairings.sessionFamilyId, [...familyIds]),
   ));
 }
 

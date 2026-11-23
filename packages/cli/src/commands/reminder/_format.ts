@@ -4,13 +4,14 @@
 // an AX contract, not an implementation detail. Pinned by `_format.test.ts`.
 
 import { T, sampleReminder } from "../_axExampleFixtures";
-import { foldAgentOneLineText } from "@botiverse/raft-shared/src/agentCliSurface";
+import { AGENT_BODY_CONTINUATION_PREFIX, foldAgentOneLineText, indentAgentBodyContinuationLines } from "@botiverse/raft-shared/src/agentCliSurface";
 import { axSurface } from "../../core/renderer";
 import type { ReminderEventSummary, ReminderSummary } from "@botiverse/raft-shared";
 import type { TriggerLog, TriggerResult } from "./_triggerApp";
+import type { AppReplyText } from "@botiverse/raft-shared/src/agentCliSurface";
 
 const FIRED_HINT = "[fired] is the reminder's state, not something to act on: a fire still waiting for your ack is listed in `raft inbox check`.";
-const MIGRATED_HINT = "Reminders marked [migrated] moved to the Reminder app and fire there now; change or cancel them there: find its service id with `raft integration list`, then `raft integration invoke --service <id> --list-actions`.";
+const MIGRATED_HINT = "Reminders marked [migrated] moved to the Reminder app and fire there now, under new ids.";
 
 /**
  * A scheduled row whose `next` has already passed renders identically to a
@@ -258,4 +259,104 @@ export const formatTriggerLog = axSurface(
       { title: "empty", args: ["feed_down", { key: "feed_down", entries: [], sinceLastEvent: { triggerCount: 0, firstTriggeredAt: null, lastTriggeredAt: null } }, new Date(T)] },
     ],
   },
+);
+
+/**
+ * A Reminder App answer (`raft reminder schedule|list|show|update|snooze|cancel`
+ * on a server whose reminders live in the app): the app's own reply text,
+ * printed as the command's answer. It carries titles and notes an agent set,
+ * so it is quoted like an app's text in `raft integration invoke`: every line,
+ * the first too, starts with `  │ ` (free text never starts a line). The CLI
+ * has already turned every line break into `\n`, replaced control characters
+ * and cut it at 4000 characters (appReplyText).
+ */
+export const formatReminderAppReply = axSurface(
+  "Reminder app reply text printed as the command's answer, quoted line by line, with the cut note when it was cut.",
+  // `error`: the text of a refusal or failure, where the command did not (or may not) run, so the
+  // cut note does not say it ran; the error's own lines say what changed.
+  (reply: AppReplyText, kind: "answer" | "error" = "answer"): string => {
+    const block = `${AGENT_BODY_CONTINUATION_PREFIX}${indentAgentBodyContinuationLines(reply.text)}`;
+    if (reply.cutFrom === undefined) return block;
+    const ran = kind === "answer" ? " It already ran: do not run it again to see the rest;" : "";
+    return `${block}\nText cut at 4000 of ${reply.cutFrom} characters.${ran} raft reminder show --id <id> shows one reminder in full.`;
+  },
+  {
+    examples: [
+      { args: [{ text: "Scheduled 0191c135: check deploy status, 08-31 17:00 Asia/Shanghai (09:00Z), in #general:00000000. Details: raft reminder show --id 0191c135" }] },
+      { title: "list", args: [{ text: "0191c135 active  08-31 09:00Z  once  check deploy status  #general:00000000\n7c41e2a0 active  09-01 02:00Z  daily@10:00  standup notes" }] },
+      { title: "cut", args: [{ text: "0191c135 active  08-31 09:00Z  once  check deploy status  #general…", cutFrom: 5210 }] },
+      { title: "cut error", args: [{ text: "Reminder 0191c135 is at revision 4, not 3; …", cutFrom: 5210 }, "error"] },
+    ],
+  },
+);
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function appReminderLine(value: unknown): string | null {
+  const r = record(value);
+  if (!r || typeof r.id !== "string") return null;
+  const status = typeof r.status === "string" ? ` ${foldAgentOneLineText(r.status)}` : "";
+  const next = typeof r.nextFireAt === "string" ? foldAgentOneLineText(r.nextFireAt) : "none";
+  const title = typeof r.title === "string" ? ` "${foldAgentOneLineText(r.title)}"` : "";
+  return `${foldAgentOneLineText(r.id.slice(0, 8))}${status}, next ${next}${title}`;
+}
+
+/**
+ * A Reminder App answer without reply text (an older app): a short line per
+ * reminder from its JSON fields (id, status, next fire, title), never the raw JSON.
+ */
+export const formatReminderAppAnswer = axSurface(
+  "Reminder app answer without reply text: one CLI-made line per reminder (id, status, next fire, title).",
+  (value: unknown): string => {
+    const outer = record(value);
+    const body = outer && outer.ok === true && "result" in outer ? record(outer.result) : outer;
+    const listed = Array.isArray(body?.reminders) ? body.reminders.map(appReminderLine).filter((line): line is string => line !== null) : null;
+    if (listed) return listed.length > 0 ? listed.join("\n") : "No reminders.";
+    const one = appReminderLine(body?.reminder) ?? appReminderLine(body);
+    return one ? `Reminder ${one}` : "Done; the Reminder app sent no details.";
+  },
+  {
+    examples: [
+      { args: [{ ok: true, status: 200, result: { reminder: { id: "0191c135-aaaa-bbbb-cccc-000000000000", status: "active", title: "check deploy status", nextFireAt: "2026-08-31T09:00:00.000Z" } } }] },
+      { title: "list", args: [{ ok: true, status: 200, result: { reminders: [{ id: "0191c135-aaaa-bbbb-cccc-000000000000", status: "active", title: "check deploy status", nextFireAt: null }] } }] },
+    ],
+  },
+);
+
+/**
+ * `raft reminder list` on a server whose reminders live in the Reminder app:
+ * the scheduled reminders made before the move that the import did not take
+ * (they still fire here), after the app's list. Empty when there are none.
+ */
+export const formatReminderLeftovers = axSurface(
+  "Reminders made before the move to the Reminder app that still fire, listed after the app's own list.",
+  (reminders: ReminderSummary[], now: Date, failure?: string | null): string => {
+    if (failure) return `Reminders made before the move: not listed (${foldAgentOneLineText(failure)}).`;
+    if (reminders.length === 0) return "";
+    return [
+      "Made before the move (still fire; cancel with raft reminder cancel --id <id>):",
+      ...reminders.map((r) => formatReminder(r, now)),
+    ].join("\n");
+  },
+  {
+    examples: [
+      { args: [[sampleReminder], new Date("2026-08-31T08:00:00.000Z")] },
+      { title: "none", args: [[], new Date("2026-08-31T08:00:00.000Z")] },
+      { title: "unreadable", args: [[], new Date("2026-08-31T08:00:00.000Z"), "HTTP 503"] },
+    ],
+  },
+);
+
+
+/**
+ * `raft reminder list` when whether this server's reminders moved to the
+ * Reminder app could not be read: after the legacy list, it says the app's
+ * reminders were not checked rather than implying there are none.
+ */
+export const formatReminderAppUnchecked = axSurface(
+  "List footer when the Reminder app's reminders could not be checked (the server's settings could not be read).",
+  (): string => "Reminders in the Reminder app: not checked (this server's settings could not be read); run raft reminder list again to include them.",
+  { examples: [{ args: [] }] },
 );

@@ -7,13 +7,14 @@
 //
 // Next steps go through RAFT_HINTS: CLI commands, or tool calls for cloud
 // agents. They are never cut: to fit the limit the comment's excerpt shrinks
-// first, then the title and the place, and only then the line itself.
+// first, then the place's section, then the title and the place, and only
+// then the line itself.
 
 import { formatHint, RAFT_HINTS, type RaftHintStyle } from "../agentOps/hint";
 import { foldAgentOneLineText } from "../agentMessageText";
 import type { AgentApiArtifactActor } from "../agentApiArtifactsContract";
 import type { ArtifactAgentNotice } from "../artifactAgentNotice";
-import { artifactAnchorView } from "./artifactAnchors";
+import { artifactAnchorView, DROPPED_MARK, PART_SEPARATOR } from "./artifactAnchors";
 
 /** The Server's limit for a notification summary. */
 export const ARTIFACT_NOTICE_MAX_CHARS = 500;
@@ -47,19 +48,51 @@ interface Parts {
 }
 
 /**
- * Build the line, shrinking what can shrink until it fits: the excerpt (to
- * MIN_EXCERPT_CHARS), then the title and the place, then the excerpt
- * entirely; next steps are never shortened, and a hard cut is the last resort.
+ * A place given up at its ` · ` parts only: the trailing ones go until it
+ * fits, one `…` part where they were; then the first (the path) is cut too,
+ * still before that `…` (`docs/very/long/pa… · …`). A place of one part (a
+ * path, a title) is only cut.
  */
-function fitLine(build: (p: Parts) => string, full: Parts): string {
+function clipParts(parts: readonly string[], max: number): string {
+  const whole = parts.join(PART_SEPARATOR);
+  if (parts.length <= 1) return clip(whole, max);
+  if (whole.length <= max) return whole;
+  // The first `n` parts, then the mark (once: the last step of a section may already end with it).
+  const kept = (n: number) => {
+    const head = parts.slice(0, n);
+    return (head[head.length - 1] === DROPPED_MARK ? head : [...head, DROPPED_MARK]).join(PART_SEPARATOR);
+  };
+  for (let n = parts.length - 1; n >= 1; n -= 1) {
+    if (kept(n).length <= max) return kept(n);
+  }
+  const mark = `${PART_SEPARATOR}${DROPPED_MARK}`;
+  return `${clip(parts[0]!, max - mark.length)}${mark}`;
+}
+
+/**
+ * Build the line, shrinking what can shrink until it fits: the excerpt (to
+ * MIN_EXCERPT_CHARS), then the place's section, a step at a time (`places`,
+ * the place as its ` · ` parts, fullest first: artifactAnchorView's
+ * `whereSteps`), then the title and the place (the place at a ` · `, never
+ * inside a quoted heading, a `…` part where parts were given up), then the
+ * excerpt entirely; next steps are never shortened, and a hard cut is the
+ * last resort.
+ */
+function fitLine(build: (p: Parts) => string, full: Parts, places?: readonly (readonly string[])[]): string {
   const max = ARTIFACT_NOTICE_MAX_CHARS;
-  let parts = { ...full, title: oneLine(full.title), where: oneLine(full.where), excerpt: oneLine(full.excerpt) };
-  let line = build(parts);
+  const steps = (places && places.length > 0 ? places : [[full.where]]).map((parts) => parts.map(oneLine));
+  const start = { ...full, title: oneLine(full.title), where: steps[0]!.join(PART_SEPARATOR), excerpt: oneLine(full.excerpt) };
+  let line = build(start);
   if (line.length <= max) return line;
-  parts = { ...parts, excerpt: clip(parts.excerpt, Math.max(MIN_EXCERPT_CHARS, parts.excerpt.length - (line.length - max))) };
-  line = build(parts);
-  if (line.length <= max) return line;
-  parts = { ...parts, title: clip(parts.title, SHORT_NAME_CHARS), where: clip(parts.where, SHORT_NAME_CHARS) };
+  let parts = start;
+  for (const step of steps) {
+    const at = { ...start, where: step.join(PART_SEPARATOR) };
+    const over = build(at).length - max;
+    parts = { ...at, excerpt: clip(at.excerpt, Math.max(MIN_EXCERPT_CHARS, at.excerpt.length - over)) };
+    line = build(parts);
+    if (line.length <= max) return line;
+  }
+  parts = { ...parts, title: clip(parts.title, SHORT_NAME_CHARS), where: clipParts(steps[steps.length - 1]!, SHORT_NAME_CHARS) };
   line = build(parts);
   if (line.length <= max) return line;
   const room = parts.excerpt.length - (line.length - max);
@@ -188,6 +221,25 @@ function formatChannelAnnouncementNotice(notice: ArtifactAgentNotice, channelAnn
   );
 }
 
+/**
+ * Settled or back to Working (#334): who, at which version, and what a push
+ * to it now does. A status change asks nothing of the agent: queued, never
+ * pushed, and no reply is needed. Its author is told whether it follows or
+ * not (it is about its own work); one that doesn't follow (`following` null)
+ * gets no "stop" clause, as a resolve's notice.
+ */
+function formatSettlementNotice(notice: ArtifactAgentNotice, settlement: NonNullable<ArtifactAgentNotice["settlement"]>, style: RaftHintStyle, following: string): string {
+  const read = formatHint(RAFT_HINTS.artifactRead({ artifact: notice.artifact.id }), style);
+  const why = followingClause(notice);
+  const stop = notice.following ? following : "";
+  return fitLine(
+    (p) => (settlement.settled
+      ? `${actor(settlement.by)} settled "${p.title}" at v${settlement.version}${why ? ` (${why})` : ""}: it is done, and a new version takes it back to Working. To read it: ${read}. No reply is needed.${stop}`
+      : `${actor(settlement.by)} took "${p.title}" back to Working (it was settled at v${settlement.version})${why ? `; ${why}` : ""}. To read it: ${read}. No reply is needed.${stop}`),
+    { title: notice.artifact.title, where: "", excerpt: "" },
+  );
+}
+
 /** One notice line; the Server's summary in step 1, a client's rendering of `app_event` in step 2. */
 export function formatArtifactNotice(notice: ArtifactAgentNotice, style: RaftHintStyle = "cli"): string {
   const a = notice.artifact;
@@ -208,6 +260,7 @@ export function formatArtifactNotice(notice: ArtifactAgentNotice, style: RaftHin
   if (notice.review) return formatReviewNotice(notice, notice.review, style, stop);
   if (notice.renamed) return formatRenameNotice(notice, notice.renamed, style, stop);
   if (notice.resolved) return formatResolvedNotice(notice, notice.resolved, style);
+  if (notice.settlement) return formatSettlementNotice(notice, notice.settlement, style, stop);
 
   const comments = notice.comments;
   if (!comments) return clip(`Something changed in "${oneLine(a.title)}": ${formatHint(RAFT_HINTS.artifactRead({ artifact: a.id }), style)}`, ARTIFACT_NOTICE_MAX_CHARS);
@@ -215,8 +268,10 @@ export function formatArtifactNotice(notice: ArtifactAgentNotice, style: RaftHin
   // A reply lands on its parent's file and place, so the command needs no --path.
   const answer = formatHint(RAFT_HINTS.artifactComment({ artifact: a.id, replyTo: latest.id }), style);
   // The file, then the place in it in Raft's words (`a.html · lines 3-5`, `a.html · element <h2>`); its quoted text is the comment list's.
-  const place = latest.path ? artifactAnchorView(latest.anchor, { withSelector: false })?.where : null;
-  const full = { title: a.title, where: latest.path ? (place ? `${latest.path} · ${place}` : latest.path) : "the whole artifact", excerpt: latest.excerpt };
+  const view = latest.path ? artifactAnchorView(latest.anchor, { withSelector: false }) : null;
+  // The place as its parts, then with less of its section (whereSteps), for fitLine to give up before the title.
+  const places = latest.path ? (view?.whereSteps ?? [[]]).map((parts) => [latest.path!, ...parts]) : undefined;
+  const full = { title: a.title, where: places ? places[0]!.join(PART_SEPARATOR) : "the whole artifact", excerpt: latest.excerpt };
   // Counted from the comment itself, so a text fitLine dropped still reads as text (`(+2 images)`), not as images alone.
   const images = { count: latest.imageCount, withText: oneLine(latest.excerpt).trim() !== "" };
 
@@ -224,6 +279,7 @@ export function formatArtifactNotice(notice: ArtifactAgentNotice, style: RaftHin
     return fitLine(
       (p) => `${actor(latest.author)} mentioned you in a comment on "${p.title}" (${p.where})${quoted(p.excerpt, images)}. If it asks something of you, answer in the artifact${commentOnStdin(style)}: ${answer}. If it needs nothing from you, no reply is needed.`,
       full,
+      places,
     );
   }
   const why = followingClause(notice);
@@ -231,11 +287,13 @@ export function formatArtifactNotice(notice: ArtifactAgentNotice, style: RaftHin
     return fitLine(
       (p) => `New comment by ${actor(latest.author)} on "${p.title}" (${p.where}${why ? `; ${why}` : ""})${quoted(p.excerpt, images)}. To answer${commentOnStdin(style)}: ${answer}. If it needs nothing from you, no reply is needed.${stop}`,
       full,
+      places,
     );
   }
   const readAll = formatHint(RAFT_HINTS.artifactComments({ artifact: a.id }), style);
   return fitLine(
     (p) => `${plural(comments.count, "new comment", "new comments")} on "${p.title}"${why ? ` (${why})` : ""}, the latest by ${actor(latest.author)} on ${p.where}${quoted(p.excerpt, images)}. Read them: ${readAll}. If they need nothing from you, no reply is needed.${stop}`,
     full,
+    places,
   );
 }

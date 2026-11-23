@@ -26,6 +26,13 @@ export interface StalledWithWorkFacts {
   /** Messages queued for the process and not yet consumed. */
   inboxLength: number;
   /**
+   * An app Inbox notice that may wake the agent waits for this turn: the
+   * runtime refused it mid-turn and only the turn's end offers it again.
+   * Queued work as a message is (a host that queues notices with its
+   * messages counts them in `inboxLength`).
+   */
+  appInboxNoticeWaiting: boolean;
+  /**
    * A turn is under way. An idle process with unread messages left them
    * unread itself (or was never told): not a stall.
    */
@@ -99,7 +106,7 @@ export function stalledWithWork(
   facts: StalledWithWorkFacts,
   thresholds: StalledWithWorkThresholds = STALLED_WITH_WORK_THRESHOLDS,
 ): StalledWithWorkVerdict {
-  if (facts.inboxLength === 0) return { broken: false, reason: "empty_inbox" };
+  if (facts.inboxLength === 0 && !facts.appInboxNoticeWaiting) return { broken: false, reason: "empty_inbox" };
   if (facts.recoveryUnderway) return { broken: false, reason: "recovery_underway" };
   if (facts.deliveryHold !== null) return { broken: false, reason: "delivery_held" };
   if (!facts.turnInProgress) return { broken: false, reason: "turn_not_in_progress" };

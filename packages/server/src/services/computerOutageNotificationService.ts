@@ -1,5 +1,5 @@
 import { clearClockInterval, currentDate, setClockInterval } from "@botiverse/raft-shared";
-import { and, asc, eq, inArray, isNull, lte } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, lte, sql } from "drizzle-orm";
 import { getDb, type Database, type DatabaseExecutor } from "../db/index";
 import {
   computerLifecycleOperations,
@@ -13,6 +13,13 @@ const COMPUTER_OUTAGE_DRAIN_BATCH_SIZE = 25;
 
 type ComputerOutageOccurrence = typeof computerOutageOccurrences.$inferSelect;
 type ShutdownIntent = { reason: string } | null | undefined;
+
+/**
+ * Open (pending or notified) occurrences, with the states written as literals. As bind
+ * parameters, a prepared statement's generic plan cannot match the partial index
+ * idx_computer_outage_occurrences_open_machine and walks every past outage of the machine.
+ */
+export const computerOutageIsOpen = sql`${computerOutageOccurrences.state} in ('pending', 'notified')`;
 
 function addMs(date: Date, ms: number): Date {
   return new Date(date.getTime() + ms);
@@ -202,7 +209,7 @@ export async function recordComputerOnlineTransition(input: {
       .where(and(
         eq(computerOutageOccurrences.serverId, input.serverId),
         eq(computerOutageOccurrences.machineId, input.machineId),
-        inArray(computerOutageOccurrences.state, ["pending", "notified"]),
+        computerOutageIsOpen,
       ))
       .orderBy(asc(computerOutageOccurrences.firstOfflineAt));
 

@@ -5,6 +5,7 @@ import type { AnnotationReport } from "@botiverse/porthole";
 import { NO_MARGIN_PLACES, UNPLACED_POLL_MS, isRefreshMark, marginAfterAnchored, marginAfterTracked, marginPlacesStore, nonePlaced, refreshOf, unplacedPollAfterAsk } from "./artifactMarginPlaces";
 import type { MarginPlacesStore } from "./artifactMarginPlaces";
 import type { FrameBox } from "./artifactTrackedPlaces";
+import { useOwnerTimers } from "../../utils/ownerDocument";
 
 /** The id a followed selection's report is read under (no mark has it: Raft's mark ids are its comments' and drafts'). */
 const SELECTION_FOLLOWED = "\u0000selection";
@@ -86,18 +87,20 @@ export function useArtifactMargin(markdown: boolean): { margin: ArtifactMarginLa
   }, [places]);
   const lastRefresh = useRef(Number.NEGATIVE_INFINITY);
   const timer = useRef<number | null>(null);
+  // The margin's own window's timers: an object window's run while the main window is hidden (#337 PR3).
+  const timers = useOwnerTimers();
   // At once, or once REFRESH_GAP_MS have passed since the last time (a reference leaving the frame
   // while the page scrolls fast asks often).
   const ask = useCallback(() => {
     if (timer.current !== null) return;
     const wait = Math.max(0, lastRefresh.current + REFRESH_GAP_MS - currentTimeMs());
-    timer.current = window.setTimeout(() => {
+    timer.current = timers.setTimeout(() => {
       timer.current = null;
       lastRefresh.current = currentTimeMs();
       const refresh = places.refreshed();
       if (widthWait.current === "asked") widthWait.current = refresh;
     }, wait);
-  }, [places]);
+  }, [places, timers]);
   // The unplaced poll's wait now, and how many of its ticks (UNPLACED_POLL_MS apart) to let pass
   // before it asks again (0: at the next).
   const pollGap = useRef(UNPLACED_POLL_MS);
@@ -116,18 +119,18 @@ export function useArtifactMargin(markdown: boolean): { margin: ArtifactMarginLa
   // Asked again once the page stops moving: put off by each move.
   const settle = useRef<number | null>(null);
   const settleThenRefresh = useCallback(() => {
-    if (settle.current !== null) window.clearTimeout(settle.current);
-    settle.current = window.setTimeout(() => {
+    if (settle.current !== null) timers.clearTimeout(settle.current);
+    settle.current = timers.setTimeout(() => {
       settle.current = null;
       ask();
     }, SETTLE_MS);
-  }, [ask]);
+  }, [ask, timers]);
   useEffect(() => () => {
-    if (timer.current !== null) window.clearTimeout(timer.current);
-    if (settle.current !== null) window.clearTimeout(settle.current);
+    if (timer.current !== null) timers.clearTimeout(timer.current);
+    if (settle.current !== null) timers.clearTimeout(settle.current);
     timer.current = null;
     settle.current = null;
-  }, []);
+  }, [timers]);
   // How many comments' marks the frame was last given (none: nothing to place, nothing to ask).
   const shownComments = useRef(0);
   const onReport = useCallback((reported: AnnotationReport, frameBox: FrameBox | null, shownMarks: readonly { id: string }[]) => {
@@ -184,7 +187,7 @@ export function useArtifactMargin(markdown: boolean): { margin: ArtifactMarginLa
   // the same until the content changes, which reports by itself.
   useEffect(() => {
     if (!shown) return;
-    const poll = window.setInterval(() => {
+    const poll = timers.setInterval(() => {
       const now = places.get().places;
       if (shownComments.current === 0 || now.scrollY !== null || !nonePlaced(now)) return;
       if (pollSkips.current > 0) {
@@ -196,8 +199,8 @@ export function useArtifactMargin(markdown: boolean): { margin: ArtifactMarginLa
       pollGap.current = next.gap;
       pollSkips.current = next.skips;
     }, UNPLACED_POLL_MS);
-    return () => window.clearInterval(poll);
-  }, [shown, places, ask]);
+    return () => timers.clearInterval(poll);
+  }, [shown, places, ask, timers]);
   const margin = useMemo(() => ({ shown, setShown, requestRefresh, places }), [shown, setShown, requestRefresh, places]);
   return { margin, onReport };
 }

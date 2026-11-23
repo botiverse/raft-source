@@ -79,8 +79,14 @@ export interface ExternalInviteClassification {
   alreadyPending: string[];
   /** Members of the host Server (not Guests) who are not in the channel yet: a send adds them to it (design A2). */
   alreadyMembers: string[];
-  /** People already in the channel (a member, or its own Guest): nothing to do. */
+  /** People already in the channel (a member, or its own Guest): not added again. */
   alreadyInChannel: string[];
+  /**
+   * The host Server's members (not Guests) among `alreadyInChannel`: like
+   * `alreadyMembers`, they may be sent an invite to connect a server of
+   * theirs (the review's "Invite to connect"; sendExternalInvites).
+   */
+  alreadyInChannelMembers: string[];
   /**
    * Guests of another channel of the host Server, who can't be invited (a
    * Guest belongs to one channel): the channel is named only when the
@@ -248,7 +254,7 @@ async function classifyAgainstState(
 ): Promise<{ preview: ExternalInviteClassification; memberUserIds: Map<string, string> }> {
   const { valid, duplicates, invalid } = classifyEntries(emails);
   const memberUserIds = new Map<string, string>();
-  const empty = { alreadyPending: [], alreadyMembers: [], alreadyInChannel: [], guestsElsewhere: [] };
+  const empty = { alreadyPending: [], alreadyMembers: [], alreadyInChannel: [], alreadyInChannelMembers: [], guestsElsewhere: [] };
   if (valid.length === 0) return { preview: { valid, duplicates, invalid, ...empty }, memberUserIds };
   const { channelId } = target;
   const [pendingRows, memberRows] = await Promise.all([
@@ -290,7 +296,7 @@ async function classifyAgainstState(
       visibleGuestChannels.add(guestChannelId);
     }
   }
-  const preview: ExternalInviteClassification = { valid: [], duplicates, invalid, alreadyPending: [], alreadyMembers: [], alreadyInChannel: [], guestsElsewhere: [] };
+  const preview: ExternalInviteClassification = { valid: [], duplicates, invalid, alreadyPending: [], alreadyMembers: [], alreadyInChannel: [], alreadyInChannelMembers: [], guestsElsewhere: [] };
   for (const email of valid) {
     const person = people.get(email);
     if (pending.has(email)) {
@@ -299,6 +305,7 @@ async function classifyAgainstState(
       preview.valid.push(email);
     } else if (person.inChannel || (person.role === "guest" && channelId !== null && person.guestChannelId === channelId)) {
       preview.alreadyInChannel.push(email);
+      if (person.role !== "guest") preview.alreadyInChannelMembers.push(email);
     } else if (person.role === "guest") {
       // A Guest of another channel (or a legacy Guest bound to none).
       const named = person.guestChannelId !== null && visibleGuestChannels.has(person.guestChannelId);
@@ -694,11 +701,23 @@ export async function createSelfConnectInvite(
   });
 }
 
+/**
+ * Sends the invites the entries make (classifyAgainstState: `valid`), and
+ * names the host's members among them for the caller to add to the channel
+ * (`membersToAdd`). `connectMemberEmails`: those of the host's members, to
+ * be added or already in the channel (`alreadyInChannelMembers`, not added
+ * again), who also get an ordinary emailed invite (the review's "Invite to connect", so
+ * they can connect a server of theirs), each marked sent_to_host_member: it
+ * counts toward the daily cap and turns a public channel private like any
+ * invite, but takes none of the channel's slots and no Free external channel
+ * allowance (externalChannelLimitService). An address there that is not a
+ * member of the host now is ignored (its row says why it isn't invited).
+ */
 export async function sendExternalInvites(
   channelId: string,
   actorUserId: string,
   emails: readonly string[],
-  options: { makePrivate?: boolean; onEmails?: InviteEmailObserver } = {},
+  options: { makePrivate?: boolean; connectMemberEmails?: readonly string[]; onEmails?: InviteEmailObserver } = {},
 ): Promise<SendExternalInvitesResult> {
   // Outside the transaction: the refresh may call the billing provider. The
   // channel's server is read again under the lock.
@@ -713,15 +732,22 @@ export async function sendExternalInvites(
     const now = new Date();
     await expireLapsedInvites(tx, locked.id, now);
     const { preview, memberUserIds } = await classifyAgainstState({ serverId: locked.serverId, channelId: locked.id }, actorUserId, emails, now, tx);
+    const connectMembers = new Set((options.connectMemberEmails ?? []).map((email) => normalizeEmail(email)));
+    const memberInvites = [...preview.alreadyMembers, ...preview.alreadyInChannelMembers].filter((email) => connectMembers.has(email));
+    const sending = preview.valid.length + memberInvites.length;
     // Only a send that invites someone turns the channel private.
-    const madePrivate = locked.type === "channel" && preview.valid.length > 0
+    const madePrivate = locked.type === "channel" && sending > 0
       ? await updateChannel(locked.id, { type: "private" }, tx)
       : null;
-    await assertDailyCap(tx, locked.serverId, preview.valid.length, now);
+    await assertDailyCap(tx, locked.serverId, sending, now);
     // Under the host's daily-cap lock (taken when anything is sent), so sends
-    // to two of its channels at once see each other's invites.
+    // to two of its channels at once see each other's invites. The members'
+    // invites take no slot and no Free allowance: not counted here.
     await assertCanSendExternalInvites(tx, { channel: locked, adding: preview.valid.length, now });
-    const tokens = preview.valid.map((email) => ({ email, ...newInviteToken(now) }));
+    const tokens = [
+      ...preview.valid.map((email) => ({ email, sentToHostMember: false, ...newInviteToken(now) })),
+      ...memberInvites.map((email) => ({ email, sentToHostMember: true, ...newInviteToken(now) })),
+    ];
     const rows = tokens.length === 0 ? [] : await insertExternalInvites(tx, tokens.map((invite) => ({
       channelId: locked.id,
       hostServerId: locked.serverId,
@@ -730,6 +756,7 @@ export async function sendExternalInvites(
       invitedByUserId: actorUserId,
       expiresAt: invite.expiresAt,
       origin: "external_invite",
+      sentToHostMember: invite.sentToHostMember,
     }))).returning({ id: channelExternalInvites.id, email: channelExternalInvites.email, expiresAt: channelExternalInvites.expiresAt });
     const { valid: _valid, ...skipped } = preview;
     const membersToAdd = [...memberUserIds].map(([email, userId]) => ({ userId, email }));
@@ -859,6 +886,8 @@ export async function resendExternalInvite(
       invitedByUserId: actorUserId,
       expiresAt: fresh.expiresAt,
       origin: "external_invite",
+      // As it was sent: a member's invite stays one (it holds no slot).
+      sentToHostMember: invite.sentToHostMember,
     }]).returning({ id: channelExternalInvites.id, email: channelExternalInvites.email, expiresAt: channelExternalInvites.expiresAt });
     return { row: row!, token: fresh.token, hostServerId: channel.serverId };
   });
@@ -1224,11 +1253,16 @@ export async function channelHasConnectingInvite(executor: DatabaseExecutor, cha
   return rows.some((row) => row.id !== exceptInviteId);
 }
 
-/** Whether the person is a Guest of the channel's server bound to another channel (or to none, a legacy Guest). */
-async function isGuestElsewhere(executor: DatabaseExecutor, channel: Channel, userId: string): Promise<boolean> {
+/**
+ * Whether the person's seat on the channel's server keeps them from joining it
+ * as a Guest (acceptExternalInviteAsGuest refuses them): a member of the
+ * server (already_member), or a Guest of another channel there, or a legacy
+ * Guest bound to none (guest_elsewhere).
+ */
+async function hasHostSeatOtherThanGuestHere(executor: DatabaseExecutor, channel: Channel, userId: string): Promise<boolean> {
   const [row] = await executor.select({ role: serverMembers.role, guestChannelId: serverMembers.guestChannelId }).from(serverMembers)
     .where(and(eq(serverMembers.serverId, channel.serverId), eq(serverMembers.userId, userId)));
-  return row?.role === "guest" && row.guestChannelId !== channel.id;
+  return !!row && (row.role !== "guest" || row.guestChannelId !== channel.id);
 }
 
 /** Whether a Guest is bound to the channel (with the host flag off one blocks it becoming joint: boundGuestsBlockJoint). */
@@ -1323,12 +1357,16 @@ async function inviteePageOf(invite: InviteRow, userId: string, db: ReturnType<t
   // server or the inviter (cindyz #wg-rbac:5433e81b).
   if (!invitee) return { addressedToYou: false, invitedEmailMasked: maskInviteEmail(invite.email) };
   // A Guest belongs to one channel: one of another channel here (or a legacy
-  // Guest bound to none) is not offered to join as a guest (matrix §3).
-  const guestElsewhere = pending && await isGuestElsewhere(db, channel, userId);
+  // Guest bound to none) is not offered to join as a guest (matrix §3); nor
+  // is a member of the host (the accept refuses already_member). Read now,
+  // not from the invite: one who left the host since may join as a guest.
+  const guestSeatTaken = pending && await hasHostSeatOtherThanGuestHere(db, channel, userId);
   const connectable = pending ? await listConnectableServers(channel, userId) : [];
-  // The invite is open and unexpired here, so externalInviteSlotsLeft counted it: its slot is the invitee's to fill.
+  // The invite is open and unexpired here, so externalInviteSlotsLeft counted
+  // it (unless it was sent to a member of the host, which holds no slot): its
+  // slot is the invitee's to fill.
   const connect = connectable.length > 0
-    ? { servers: connectable, slotsLeft: await externalInviteSlotsLeft(db, channel, new Date(), 1) }
+    ? { servers: connectable, slotsLeft: await externalInviteSlotsLeft(db, channel, new Date(), invite.sentToHostMember ? 0 : 1) }
     : { servers: connectable };
   return {
     ...await inviteHeader(invite, channel.name, server.name, db),
@@ -1341,7 +1379,7 @@ async function inviteePageOf(invite: InviteRow, userId: string, db: ReturnType<t
       // An approval or a connection under way holds the invite; a joint
       // channel, or one a server is connecting to, takes no Guests yet.
       guest: pending && (channel.type === "private" || (channel.type === "joint" && !await boundGuestsBlockJointEntry(db, channel)))
-        && !connectingHere && !guestElsewhere,
+        && !connectingHere && !guestSeatTaken,
       connect,
       newServer: pending && !connectingHere && !await boundGuestsBlockJoint(db, channel),
     },

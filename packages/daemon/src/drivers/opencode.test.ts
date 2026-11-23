@@ -3,14 +3,20 @@ import { ELECTRON_NODE_SCRIPT_EXEC_ARGV } from "./nodeHostLaunch";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildOpenCodeConfig, buildOpenCodeLaunchOptions, decideOpenCodeSessionResume, detectOpenCodeModelSource, detectOpenCodeModels, isOpenCodeV2Launch, isSupportedOpenCodeVersion, MIN_SUPPORTED_OPENCODE_VERSION, OPENCODE_V2_MIN_VERSION, openCodeMajor, openCodeSessionRecordPath, OpenCodeDriver, parseOpenCodeModelsOutput, readOpenCodeSessionRecord, requiresAgentCliFlag, resolveOpenCodeSpawn, runOpenCodeModelsCommand, unsupportedOpenCodeVersionMessage, writeOpenCodeSessionRecord } from "./opencode";
+import { buildOpenCodeConfig, buildOpenCodeLaunchOptions, decideOpenCodeSessionResume, OPENCODE_BACKGROUND_WAIT_OTHER_CAP_MS, OPENCODE_BACKGROUND_WAIT_SHELL_CAP_MS, detectOpenCodeModelSource, detectOpenCodeModels, isOpenCodeV2Launch, isSupportedOpenCodeVersion, MIN_SUPPORTED_OPENCODE_VERSION, OPENCODE_V2_MIN_VERSION, openCodeMajor, openCodeSessionRecordPath, OpenCodeDriver, parseOpenCodeModelsOutput, readOpenCodeSessionRecord, requiresAgentCliFlag, resolveOpenCodeSpawn, resolveOpenCodeSpawnAsync, runOpenCodeModelsCommand, unsupportedOpenCodeVersionMessage, writeOpenCodeSessionRecord } from "./opencode";
 import { RuntimeExecutableNotFoundError, RuntimeSessionRuntimeMismatchError } from "../spawnFailureErrors";
 import { classifySpawnFailure } from "../spawnFailureClassification";
 import { NON_RETRYABLE_SPAWN_FAILURE_REASONS } from "@botiverse/raft-shared";
 import { readCommandVersionAsync, readCommandVersionDetailedAsync } from "./probe";
 import { ProbeChildError } from "./probeChild";
 import { readFileSync, existsSync, readdirSync } from "node:fs";
-import type { ParsedEvent, SpawnContext } from "./types";
+import type { ParsedEvent, SpawnContext, SpawnResult } from "./types";
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { ChildProcessRuntimeSession } from "./runtimeSession";
+import type { ProcessTreeOps } from "./processTree";
+import { runtimeDiagnosticTraceAttrs } from "../runtimeEventTrace";
+import { runtimeDiagnosticTrajectoryEntry } from "../runtimeDiagnosticEntry";
 
 function withTempDir(cb: (dir: string) => void) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "slock-opencode-"));
@@ -167,9 +173,21 @@ test("resolveOpenCodeSpawn rejects a missing non-Windows binary", () => {
       execFileSyncFn: (() => {
         throw new Error("not found");
       }) as any,
+      env: { HOME: "/nonexistent-home" },
+      existsSyncFn: () => false,
     }),
     /Cannot resolve OpenCode CLI on PATH/,
   );
+});
+
+test("resolveOpenCodeSpawn finds the install script's ~/.opencode/bin/opencode off PATH on macOS and Linux (Install on the web)", async () => {
+  const notOnPath = (() => { throw Object.assign(new Error("not found"), { status: 1 }); }) as any;
+  const installed = "/home/bot/.opencode/bin/opencode";
+  for (const platform of ["linux", "darwin"] as const) {
+    const deps = { platform, env: { HOME: "/home/bot", PATH: "/usr/bin" }, execFileSyncFn: notOnPath, runProbeChildFn: (async () => { throw Object.assign(new Error("not found"), { status: 1 }); }) as any, existsSyncFn: (candidate: string) => candidate === installed };
+    assert.deepEqual(resolveOpenCodeSpawn(["acp"], deps), { command: installed, args: ["acp"], shell: false }, platform);
+    assert.deepEqual(await resolveOpenCodeSpawnAsync(["acp"], deps), { command: installed, args: ["acp"], shell: false }, `${platform} async`);
+  }
 });
 
 test("probe marks a missing non-Windows binary unavailable as not_installed", () => {
@@ -217,6 +235,34 @@ test("resolveOpenCodeSpawn bypasses Windows npm cmd shim and launches package ex
     args: ["run", "--", "line 1\nline 2"],
     shell: false,
   });
+});
+
+test("resolveOpenCodeSpawn finds OpenCode 2.x's npm package (@opencode/cli) beside a .ps1 or .cmd shim, npm itself not on PATH (#proj-runtime:#71)", () => {
+  const npmBin = "C:\\Users\\bot\\AppData\\Roaming\\npm";
+  const packageExe = `${npmBin}\\node_modules\\@opencode\\cli\\bin\\opencode.exe`;
+  for (const shim of ["opencode.ps1", "opencode.cmd"]) {
+    const spec = resolveOpenCodeSpawn(["--version"], {
+      platform: "win32",
+      execFileSyncFn: ((command: string) => {
+        if (command === "powershell.exe") return Buffer.from(`${npmBin}\\${shim}\r\n`);
+        throw new Error(`unexpected command ${command}`);
+      }) as any,
+      // npm writes opencode.cmd and opencode.ps1 together.
+      existsSyncFn: (candidate) => candidate === packageExe || candidate === `${npmBin}\\opencode.cmd` || candidate === `${npmBin}\\opencode.ps1`,
+    });
+    assert.deepEqual(spec, { command: packageExe, args: ["--version"], shell: false }, shim);
+  }
+});
+
+test("resolveOpenCodeSpawn on Windows finds the install script's ~/.opencode/bin/opencode.exe off PATH, as OAR's detection does", () => {
+  const exe = "C:\\Users\\bot\\.opencode\\bin\\opencode.exe";
+  const spec = resolveOpenCodeSpawn(["--version"], {
+    platform: "win32",
+    env: { USERPROFILE: "C:\\Users\\bot", PATH: "" },
+    execFileSyncFn: (() => Buffer.from("")) as never,
+    existsSyncFn: (candidate) => candidate === exe,
+  });
+  assert.deepEqual(spec, { command: exe, args: ["--version"], shell: false });
 });
 
 test("resolveOpenCodeSpawn enables Node mode for a packaged Electron JS entry", () => {
@@ -1643,4 +1689,324 @@ test("task #1365: the version read keeps its failure class and a structured caus
     readCommandVersionDetailedAsync("opencode", [], { ...deps(failWith({ code: "ABORT_ERR" })), signal: controller.signal }),
     (error: unknown) => error instanceof ProbeChildError && error.code === "ABORT_ERR",
   );
+});
+
+// ── OpenCode 2.3.1 background_wait: bounded wait after the reply ──
+
+/** The 2.3.1 `opencode run --format json` lines of a turn that started `sleep 90 && echo SLEPT` past its tool timeout. */
+const BG_SESSION = "ses_bgwait";
+const bgLine = (line: Record<string, unknown>) => `${JSON.stringify({ sessionID: BG_SESSION, timestamp: 1, ...line })}\n`;
+const BG = {
+  stepStart: bgLine({ type: "step_start", part: { type: "step-start" } }),
+  bash: bgLine({ type: "tool_use", part: { type: "tool", tool: "bash", id: "call_sleep", state: { status: "completed", input: { command: "sleep 90 && echo SLEPT" } } } }),
+  toolsDone: bgLine({ type: "step_finish", part: { type: "step-finish", reason: "tool-calls" } }),
+  reply: bgLine({ type: "text", part: { type: "text", text: "Started it in the background." } }),
+  stop: bgLine({ type: "step_finish", part: { type: "step-finish", reason: "stop" } }),
+  waitShell: bgLine({ type: "background_wait", jobs: [{ id: "sh_1", kind: "shell", title: "sleep 90 && echo SLEPT" }] }),
+  waitSubagent: bgLine({ type: "background_wait", jobs: [{ id: "sh_1", kind: "shell", title: "sleep 90 && echo SLEPT" }, { id: "ses_child", kind: "subagent", title: "review the diff" }] }),
+  finalReply: bgLine({ type: "text", part: { type: "text", text: "SLEPT printed; done." } }),
+};
+
+/** A 2.3.1 `opencode run` stand-in: SIGTERM ends it with 143 (and, in the real CLI, its background jobs with it). */
+class FakeOpenCodeRun extends EventEmitter {
+  stdout = new EventEmitter();
+  stderr = new EventEmitter();
+  stdin = { write: (_chunk: string) => true, end: () => {} };
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
+  pid = 4242;
+  readonly signals: Array<NodeJS.Signals | undefined> = [];
+
+  print(...lines: string[]) {
+    for (const line of lines) this.stdout.emit("data", Buffer.from(line));
+  }
+
+  exit(code: number) {
+    this.exitCode = code;
+    this.stdout.emit("end");
+    this.emit("exit", code, null);
+    this.emit("close", code, null);
+  }
+
+  kill(signal?: NodeJS.Signals) {
+    this.signals.push(signal);
+    if (this.exitCode === null) queueMicrotask(() => this.exit(143));
+    return true;
+  }
+}
+
+class FakeSpawnOpenCodeDriver extends OpenCodeDriver {
+  readonly child = new FakeOpenCodeRun();
+  override async spawn(_ctx: SpawnContext): Promise<SpawnResult> {
+    this.launchedCliVersion = "2.3.1";
+    return { process: this.child as unknown as ChildProcess };
+  }
+}
+
+const quietProcessTree: ProcessTreeOps = {
+  snapshotDescendants: async () => [],
+  snapshotTree: async () => ({ descendants: [], rootLeadsGroup: true }),
+  forceKill: () => 1,
+  killEntries: () => 0,
+};
+
+const TEST_CAPS = { shell: 1_000, other: 5_000 };
+
+async function startBackgroundWaitSession(opts: { stopOnTurnEnd?: boolean } = {}) {
+  vi.useFakeTimers();
+  onTestFinished(() => { vi.useRealTimers(); });
+  const driver = new FakeSpawnOpenCodeDriver({ backgroundWaitCapMs: TEST_CAPS });
+  const session = new ChildProcessRuntimeSession(driver, makeSpawnContext(), quietProcessTree);
+  const events: ParsedEvent[] = [];
+  const exits: Array<{ code: number | null; reason?: string }> = [];
+  session.on("runtime_event", (event) => {
+    events.push(event);
+    // What agentProcessManager does for a terminate_on_turn_end runtime.
+    if (event.kind === "turn_end" && opts.stopOnTurnEnd) void session.stop({ reason: "turn_end" });
+  });
+  session.on("exit", (info) => exits.push({ code: info.code, reason: info.reason }));
+  await session.start({ text: "hello" });
+  return { driver, child: driver.child, session, events, exits };
+}
+
+const kinds = (events: ParsedEvent[]) => events.map((event) => event.kind);
+const diagnostics = (events: ParsedEvent[]) => events.filter((event): event is Extract<ParsedEvent, { kind: "runtime_diagnostic" }> => event.kind === "runtime_diagnostic");
+
+test("2.3.1 background_wait (a): reply, wait, the job ends, second reply and exit: one normal turn end, no kill", async () => {
+  const { child, events, exits } = await startBackgroundWaitSession({ stopOnTurnEnd: true });
+  child.print(BG.stepStart, BG.bash, BG.toolsDone, BG.stepStart, BG.reply, BG.stop, BG.waitShell);
+  assert.deepEqual(diagnostics(events).map((event) => event.message), ["Waiting for 1 background job(s): sleep 90 && echo SLEPT"]);
+  await vi.advanceTimersByTimeAsync(TEST_CAPS.shell - 100);
+  // The job finished: OpenCode starts a new step and replies again, then exits.
+  child.print(BG.stepStart, BG.finalReply, BG.stop);
+  child.exit(0);
+  await vi.advanceTimersByTimeAsync(TEST_CAPS.other * 2);
+  assert.deepEqual(child.signals, [], "nothing was killed");
+  assert.equal(kinds(events).filter((kind) => kind === "turn_end").length, 1);
+  assert.equal(events.at(-1)?.kind, "turn_end");
+  assert.equal(diagnostics(events).some((event) => event.itemType === "background_wait_stopped"), false);
+  assert.deepEqual(exits, [{ code: 0, reason: "runtime_exit" }]);
+});
+
+test("2.3.1 background_wait (b): reply, wait, nothing more: after the cap the turn ends as completed and the run is stopped through the turn end", async () => {
+  const { child, events, exits } = await startBackgroundWaitSession({ stopOnTurnEnd: true });
+  child.print(BG.stepStart, BG.bash, BG.toolsDone, BG.stepStart, BG.reply, BG.stop, BG.waitShell);
+  await vi.advanceTimersByTimeAsync(TEST_CAPS.shell - 1);
+  assert.deepEqual(child.signals, []);
+  assert.equal(kinds(events).includes("turn_end"), false);
+  await vi.advanceTimersByTimeAsync(1);
+  const stopped = diagnostics(events).find((event) => event.itemType === "background_wait_stopped");
+  assert.equal(stopped?.message, "Stopped background job(s) still running after 1 s: sleep 90 && echo SLEPT");
+  assert.deepEqual(kinds(events).slice(-2), ["runtime_diagnostic", "turn_end"]);
+  assert.deepEqual(events.at(-1), { kind: "turn_end", sessionId: BG_SESSION });
+  assert.equal(events.some((event) => event.kind === "error"), false, "not a runtime failure");
+  await vi.advanceTimersByTimeAsync(0);
+  assert.deepEqual(child.signals, ["SIGTERM"], "one SIGTERM, from the turn end's stop");
+  // Our own SIGTERM's 143: a requested exit, and no second turn_end from the end of stdout.
+  assert.deepEqual(exits, [{ code: 143, reason: "requested" }]);
+  assert.equal(kinds(events).filter((kind) => kind === "turn_end").length, 1);
+});
+
+test("2.3.1 background_wait (b'): with no host stopping on turn_end, the session stops the run itself", async () => {
+  const { child, events, exits } = await startBackgroundWaitSession();
+  child.print(BG.stepStart, BG.reply, BG.stop, BG.waitShell);
+  await vi.advanceTimersByTimeAsync(TEST_CAPS.shell);
+  assert.deepEqual(kinds(events).slice(-2), ["runtime_diagnostic", "turn_end"]);
+  await vi.advanceTimersByTimeAsync(0);
+  assert.deepEqual(child.signals, ["SIGTERM"]);
+  assert.deepEqual(exits, [{ code: 143, reason: "requested" }]);
+});
+
+test("2.3.1 background_wait (c): a job of another kind (a sub-agent) takes the long cap; defaults are 10 and 30 minutes", async () => {
+  const { child, events } = await startBackgroundWaitSession({ stopOnTurnEnd: true });
+  child.print(BG.stepStart, BG.reply, BG.stop, BG.waitSubagent);
+  await vi.advanceTimersByTimeAsync(TEST_CAPS.shell * 2);
+  assert.deepEqual(child.signals, [], "the shell cap does not apply when a sub-agent runs");
+  await vi.advanceTimersByTimeAsync(TEST_CAPS.other - TEST_CAPS.shell * 2);
+  assert.deepEqual(child.signals, ["SIGTERM"]);
+  assert.match(diagnostics(events).at(-1)?.message ?? "", /^Stopped background job\(s\) still running after 5 s: sleep 90 && echo SLEPT, review the diff$/);
+
+  const defaults = (wait: string) => {
+    const driver = new OpenCodeDriver();
+    driver.launchedCliVersion = "2.3.1";
+    for (const line of [BG.stepStart, BG.reply, BG.stop, wait]) driver.parseLine(line.trim());
+    const deadline = driver.quietOutputDeadline();
+    return deadline ? deadline.atMs - Date.now() : undefined;
+  };
+  assert.equal(OPENCODE_BACKGROUND_WAIT_SHELL_CAP_MS, 10 * 60_000);
+  assert.equal(OPENCODE_BACKGROUND_WAIT_OTHER_CAP_MS, 30 * 60_000);
+  assert.equal(defaults(BG.waitShell), OPENCODE_BACKGROUND_WAIT_SHELL_CAP_MS);
+  assert.equal(defaults(BG.waitSubagent), OPENCODE_BACKGROUND_WAIT_OTHER_CAP_MS);
+  assert.equal(defaults(bgLine({ type: "background_wait", jobs: [{ id: "x", title: "no kind" }] }).trim()), OPENCODE_BACKGROUND_WAIT_OTHER_CAP_MS, "an unknown kind is not a shell job");
+});
+
+test("2.3.1 background_wait (d): a wait before the reply (mid-step) starts no cap", async () => {
+  const { child, events } = await startBackgroundWaitSession({ stopOnTurnEnd: true });
+  child.print(BG.stepStart, BG.bash, BG.waitShell);
+  assert.equal(diagnostics(events).length, 1, "still shown in Activity");
+  await vi.advanceTimersByTimeAsync(TEST_CAPS.other * 10);
+  assert.deepEqual(child.signals, []);
+  assert.equal(kinds(events).includes("turn_end"), false);
+
+  // Text followed by a tool call is not a finished reply either.
+  const driver = new OpenCodeDriver();
+  driver.launchedCliVersion = "2.3.1";
+  for (const line of [BG.stepStart, BG.reply, BG.bash, BG.waitShell]) driver.parseLine(line.trim());
+  assert.equal(driver.quietOutputDeadline(), null);
+});
+
+test("2.3.1 background_wait: only new model work cancels the cap; a later reply and wait start a fresh one", async () => {
+  const { child, events } = await startBackgroundWaitSession({ stopOnTurnEnd: true });
+  child.print(BG.stepStart, BG.reply, BG.stop, BG.waitShell);
+  await vi.advanceTimersByTimeAsync(TEST_CAPS.shell - 10);
+  child.print(BG.stepStart);
+  await vi.advanceTimersByTimeAsync(TEST_CAPS.shell * 3);
+  assert.deepEqual(child.signals, [], "the new step cancelled it");
+  child.print(BG.finalReply, BG.stop, BG.waitShell);
+  await vi.advanceTimersByTimeAsync(TEST_CAPS.shell - 1);
+  assert.deepEqual(child.signals, []);
+  await vi.advanceTimersByTimeAsync(1);
+  assert.deepEqual(child.signals, ["SIGTERM"], "a fresh full cap from the second wait");
+  assert.equal(kinds(events).filter((kind) => kind === "turn_end").length, 1);
+});
+
+test("2.3.1 background_wait: a stray non-JSON line or an unknown event during the wait neither cancels nor restarts the cap", async () => {
+  const { child, events } = await startBackgroundWaitSession({ stopOnTurnEnd: true });
+  child.print(BG.stepStart, BG.reply, BG.stop, BG.waitShell);
+  await vi.advanceTimersByTimeAsync(TEST_CAPS.shell - 300);
+  child.print("not json at all\n", bgLine({ type: "some_future_event", detail: 1 }), bgLine({ type: "step_finish", part: { type: "step-finish", reason: "stop" } }));
+  await vi.advanceTimersByTimeAsync(299);
+  assert.deepEqual(child.signals, []);
+  await vi.advanceTimersByTimeAsync(1);
+  assert.deepEqual(child.signals, ["SIGTERM"], "fired at the original deadline");
+  assert.equal(diagnostics(events).at(-1)?.itemType, "background_wait_stopped");
+});
+
+test("2.3.1 background_wait: an error event during the wait keeps the deadline (the cap is still armed)", () => {
+  const driver = new OpenCodeDriver({ backgroundWaitCapMs: TEST_CAPS });
+  driver.launchedCliVersion = "2.3.1";
+  for (const line of [BG.stepStart, BG.reply, BG.stop, BG.waitShell]) driver.parseLine(line.trim());
+  const before = driver.quietOutputDeadline()?.atMs;
+  assert.ok(before !== undefined);
+  driver.parseLine("garbage");
+  const errored = driver.parseLine(bgLine({ type: "error", error: { name: "X", data: { message: "boom" } } }).trim());
+  assert.deepEqual(kinds(errored), ["error", "turn_end"]);
+  assert.equal(driver.quietOutputDeadline()?.atMs, before);
+});
+
+test("2.3.1 background_wait: a repeated identical wait keeps the original deadline and adds no Activity row", async () => {
+  const { child, events } = await startBackgroundWaitSession({ stopOnTurnEnd: true });
+  child.print(BG.stepStart, BG.reply, BG.stop, BG.waitShell);
+  for (let i = 0; i < 9; i += 1) {
+    await vi.advanceTimersByTimeAsync(TEST_CAPS.shell / 10);
+    child.print(BG.waitShell);
+  }
+  assert.equal(diagnostics(events).filter((event) => event.itemType === "background_wait").length, 1);
+  assert.deepEqual(child.signals, []);
+  await vi.advanceTimersByTimeAsync(TEST_CAPS.shell / 10);
+  assert.deepEqual(child.signals, ["SIGTERM"], "a CLI re-printing the wait is still bounded");
+});
+
+test("2.3.1 background_wait: a changed job set adds a row, keeps the start, and a non-shell job extends to start + long cap", async () => {
+  const { child, events } = await startBackgroundWaitSession({ stopOnTurnEnd: true });
+  child.print(BG.stepStart, BG.reply, BG.stop, BG.waitShell);
+  await vi.advanceTimersByTimeAsync(300);
+  // Another shell job: a new row, same deadline.
+  child.print(bgLine({ type: "background_wait", jobs: [{ id: "sh_1", kind: "shell", title: "sleep 90 && echo SLEPT" }, { id: "sh_2", kind: "shell", title: "npm run dev" }] }));
+  await vi.advanceTimersByTimeAsync(300);
+  // A sub-agent joins: a new row, deadline moves to start + long cap.
+  child.print(BG.waitSubagent);
+  child.print(BG.waitSubagent);
+  const rows = diagnostics(events).filter((event) => event.itemType === "background_wait").map((event) => event.message);
+  assert.deepEqual(rows, [
+    "Waiting for 1 background job(s): sleep 90 && echo SLEPT",
+    "Waiting for 2 background job(s): sleep 90 && echo SLEPT, npm run dev",
+    "Waiting for 2 background job(s): sleep 90 && echo SLEPT, review the diff",
+  ]);
+  await vi.advanceTimersByTimeAsync(TEST_CAPS.other - 600 - 1);
+  assert.deepEqual(child.signals, []);
+  await vi.advanceTimersByTimeAsync(1);
+  assert.deepEqual(child.signals, ["SIGTERM"], "start + long cap");
+
+  // Never shortened: back to shell jobs only after the long cap applies.
+  const driver = new OpenCodeDriver({ backgroundWaitCapMs: TEST_CAPS });
+  driver.launchedCliVersion = "2.3.1";
+  for (const line of [BG.stepStart, BG.reply, BG.stop, BG.waitSubagent]) driver.parseLine(line.trim());
+  const long = driver.quietOutputDeadline()?.atMs;
+  driver.parseLine(BG.waitShell.trim());
+  assert.equal(driver.quietOutputDeadline()?.atMs, long);
+});
+
+test("2.3.1 background_wait: an empty or missing job list is unknown: long cap and no count in the row", () => {
+  for (const wait of [{ type: "background_wait", jobs: [] }, { type: "background_wait" }]) {
+    vi.useFakeTimers();
+    try {
+      const driver = new OpenCodeDriver({ backgroundWaitCapMs: TEST_CAPS });
+      driver.launchedCliVersion = "2.3.1";
+      for (const line of [BG.stepStart, BG.reply, BG.stop]) driver.parseLine(line.trim());
+      const parsed = driver.parseLine(bgLine(wait).trim());
+      assert.deepEqual(diagnostics(parsed).map((event) => event.message), ["Waiting for background jobs"]);
+      assert.equal((driver.quietOutputDeadline()?.atMs ?? 0) - Date.now(), TEST_CAPS.other);
+      assert.match((diagnostics(driver.quietOutputDeadline()!.expire())[0]).message, /^Stopped background job\(s\) still running after 5 s$/);
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+});
+
+test("2.3.1 background_wait: the trace part carries count and kinds, never the titles (command lines)", () => {
+  const driver = new OpenCodeDriver({ backgroundWaitCapMs: { shell: 60_000, other: 120_000 } });
+  driver.launchedCliVersion = "2.3.1";
+  for (const line of [BG.stepStart, BG.reply, BG.stop]) driver.parseLine(line.trim());
+  const secret = "curl -H 'Authorization: Bearer sk-live-SECRET' https://x";
+  const waiting = driver.parseLine(bgLine({ type: "background_wait", jobs: [{ id: "a", kind: "shell", title: secret }, { id: "b", kind: "subagent", title: "t" }, { id: "c", kind: "bad kind!", title: "u" }] }).trim());
+  const deadline = driver.quietOutputDeadline();
+  assert.ok(deadline);
+  const stopped = deadline.expire();
+  assert.deepEqual(deadline.expire(), [], "once");
+  for (const event of [...waiting, ...stopped]) {
+    if (event.kind !== "runtime_diagnostic") continue;
+    const attrs = runtimeDiagnosticTraceAttrs(event);
+    assert.equal(JSON.stringify(attrs).includes("SECRET"), false, JSON.stringify(attrs));
+    assert.equal(attrs.background_job_count, 3);
+    assert.equal(attrs.background_job_kinds, "other,shell,subagent");
+    assert.deepEqual(runtimeDiagnosticTrajectoryEntry(event), { kind: "system", title: "OpenCode background jobs", text: event.message });
+  }
+  const stoppedDiagnostic = stopped.find((event) => event.kind === "runtime_diagnostic");
+  assert.equal(stoppedDiagnostic && runtimeDiagnosticTraceAttrs(stoppedDiagnostic).background_wait_cap_minutes, 2);
+  assert.match((stoppedDiagnostic as { message: string }).message, /^Stopped background job\(s\) still running after 2 min: /);
+  // 1.x never prints background_wait; were it to, no cap.
+  const v1 = new OpenCodeDriver();
+  v1.launchedCliVersion = "1.19.5";
+  for (const line of [BG.stepStart, BG.reply, BG.waitShell]) v1.parseLine(line.trim());
+  assert.equal(v1.quietOutputDeadline(), null);
+});
+
+test("2.x launch config turns background compaction off unless the user chose; 1.x is untouched (e)", async () => {
+  await withTempDirAsync(async (root) => {
+    const configOf = async (version: string, envVars: Record<string, string> = {}) => {
+      const ctx = makeSpawnContext(root, null, envVars);
+      ctx.slockHome = process.env.SLOCK_HOME!;
+      const launch = await buildOpenCodeLaunchOptions(ctx, root, version);
+      const config = JSON.parse(String(launch.env.OPENCODE_CONFIG_CONTENT));
+      assert.deepEqual(config, launch.config);
+      return config;
+    };
+    assert.deepEqual((await configOf("2.3.1")).compaction, { background: false });
+    assert.deepEqual(
+      (await configOf("2.3.1", { OPENCODE_CONFIG_CONTENT: JSON.stringify({ compaction: { auto: true } }) })).compaction,
+      { auto: true, background: false },
+      "merged into the user's compaction object",
+    );
+    assert.deepEqual(
+      (await configOf("2.3.1", { OPENCODE_CONFIG_CONTENT: JSON.stringify({ compaction: { background: true, auto: false } }) })).compaction,
+      { background: true, auto: false },
+      "an explicit choice is kept",
+    );
+    assert.equal((await configOf("1.19.5")).compaction, undefined, "1.x does not know the key");
+    assert.deepEqual(
+      (await configOf("1.19.5", { OPENCODE_CONFIG_CONTENT: JSON.stringify({ compaction: { auto: true } }) })).compaction,
+      { auto: true },
+    );
+  });
 });

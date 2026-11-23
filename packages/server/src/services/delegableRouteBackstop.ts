@@ -46,7 +46,9 @@ export const DELEGABLE_ROUTE_BACKSTOP: readonly DelegableRouteBackstopRule[] = [
   // Credentials and keys (the structure test's rule, then the rest of the class): agent credentials and bootstrap
   // tokens, Computer and App keys and secrets, provider and runtime sign-ins, signed scope attestations; adding a
   // Computer mints its key, removing one revokes it.
-  { name: "credentials and keys", path: /credential|secret|token|(^|[/-])keys?($|[/-])|\/runtime-auth\/|(^|\/)provider-connections(\/|$)|scope-attestation/ },
+  // `/runtimes/:runtime/upgrade`: runs a runtime's own updater on the Computer (changes its software, #15117);
+  // `/runtimes/:runtime/install` and `install-plan`: its own installer, and the commands it would run there.
+  { name: "credentials and keys", path: /credential|secret|token|(^|[/-])keys?($|[/-])|\/runtime-auth\/|scope-attestation|\/runtimes\/[^/]+\/(upgrade|install|install-plan)($|\/)/ },
   { name: "credentials and keys", path: segment("api-keys?|rotate-key|revoke-computer-key|setup-reset|attach|adopt-legacy") },
   { name: "credentials and keys", method: "POST", path: /\/machines$/ },
   { name: "credentials and keys", method: "DELETE", path: /\/machines\/[^/]+$/ },
@@ -78,6 +80,8 @@ export const DELEGABLE_ROUTE_BACKSTOP: readonly DelegableRouteBackstopRule[] = [
   { name: "channel content outside the server", path: /\/channels\/[^/]+\/(external-|joint-|convert-to-joint|connect-my-servers)|(^|\/)external-|(^|\/)slack-bridge(\/|$)/ },
   // Deleting a channel or a server (archiving a channel is the card).
   { name: "deleting a channel or server", method: "DELETE", path: /\/(servers|channels)\/[^/]+$/ },
+  // Data export: copying a person's or a server's data out of Raft (#triage:#512).
+  { name: "data export", path: segment("data-exports") },
   // A card never runs another card (the dispatcher's own guard refuses it too).
   { name: "action cards", path: segment("actions") },
 ];

@@ -50,7 +50,7 @@ export const FILE_UPLOAD_APPSUMO_QUOTA_EXCEEDED_MESSAGE =
   "The AppSumo plan monthly file upload limit has been reached. The allowance resets next UTC calendar month.";
 
 export const FILE_UPLOAD_QUOTA_EXCEEDED_MESSAGE =
-  "Monthly file upload quota exceeded. Free includes 100 MB of file uploads per month; upgrade to Pro for higher file upload limits.";
+  "Monthly file upload quota exceeded. Free includes 100 MB of file uploads per month; Pro has no monthly upload limit.";
 
 /**
  * Who reads a quota refusal's next action: a person (the web app's upload
@@ -68,8 +68,8 @@ export type FileUploadQuotaRefusalReader = "human" | "agent";
  */
 function fileUploadQuotaNextAction(reader: FileUploadQuotaRefusalReader, billingUrl: string): string {
   return reader === "agent"
-    ? `Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: ${billingUrl}`
-    : `Ask a server owner to open Settings > Billing and upgrade to Pro: ${billingUrl}`;
+    ? `Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Plan & billing: ${billingUrl}`
+    : `Ask a server owner to open Settings > Plan & billing and upgrade to Pro: ${billingUrl}`;
 }
 
 export async function buildFileUploadQuotaExceededResponse(
@@ -94,7 +94,7 @@ export async function buildFileUploadQuotaExceededResponse(
     quota: err.summary,
     billingUrl,
     suggestedNextAction: Boolean(err.summary.appsumo)
-      ? `Ask the server owner to review the AppSumo plan and monthly usage in Settings > Billing: ${billingUrl}`
+      ? `Ask the server owner to review the AppSumo plan and monthly usage in Settings > Plan & billing: ${billingUrl}`
       : fileUploadQuotaNextAction(reader, billingUrl),
   };
 }

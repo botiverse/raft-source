@@ -68,6 +68,7 @@ async function fixture(seed: Seed) {
     summary?: string;
     payload?: Record<string, unknown>;
     wakeCoalescedAt?: Date;
+    delivery?: "wake" | "inbox";
   }) => {
     const createdAt = new Date(now.getTime() - opts.createdAgoMs);
     const [row] = await db.insert(thirdPartyAgentEvents).values({
@@ -86,6 +87,7 @@ async function fixture(seed: Seed) {
       createdAt,
       updatedAt: new Date(now.getTime() - (opts.updatedAgoMs ?? opts.createdAgoMs)),
       wakeCoalescedAt: opts.wakeCoalescedAt ?? null,
+      delivery: opts.delivery ?? "wake",
     }).returning();
     return row!;
   };
@@ -182,6 +184,20 @@ test("a pending event parked 2 h ago is sent again once, with the late note and 
   const again = fakeDeliverer();
   await pass(f, again, { now: new Date(f.now.getTime() + MIN) });
   assert.deepEqual(again.eventIds(), [], "re-delivered exactly once");
+});
+
+test("an App's delivery inbox event is never sent by any pass, nor expired as backlog (dm:@Remy:#1)", async ({ seed }) => {
+  const f = await fixture(seed);
+  // As POST /api/oauth/agent-events stores it: queued, marked as no wake.
+  const quiet = await f.event({ createdAgoMs: 2 * HOUR, status: "queued", delivery: "inbox", wakeCoalescedAt: new Date(f.now.getTime() - 2 * HOUR) });
+  const stale = await f.event({ createdAgoMs: 25 * HOUR, status: "queued", delivery: "inbox", wakeCoalescedAt: new Date(f.now.getTime() - 25 * HOUR) });
+  for (const trigger of ["machine_ready", "sweep", "daemon_instance_changed", "runtime_ready"] as const) {
+    const d = fakeDeliverer();
+    await pass(f, d, { trigger });
+    assert.deepEqual(d.eventIds(), [], trigger);
+  }
+  assert.equal((await f.rowOf(quiet.id)).status, "queued", "still unread in its inbox item");
+  assert.equal((await f.rowOf(stale.id)).status, "queued", "left to its own expires_at");
 });
 
 test("reconnect pass: an outage row older than 24 h is expired (expired_stale_backlog), never sent; a row just under is sent", async ({ seed }) => {

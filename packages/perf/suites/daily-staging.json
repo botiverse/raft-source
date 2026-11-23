@@ -1,0 +1,207 @@
+{
+  "suite": "daily-staging",
+  "description": "Isolated staging daily collection on frozen benchmark channel (bench-check, first-screen snapshot, unbuffered release/repeat loads, switch/scroll interact, and 4x-CPU source/commit waterfall diagnose).",
+  "defaults": {
+    "fixture": "bench-v1",
+    "browser": "local",
+    "origin": "https://raft-app-staging.botiverse.dev"
+  },
+  "steps": [
+    {
+      "id": "bench-check",
+      "command": "bench-check",
+      "args": [
+        "--fixture",
+        "{{fixture}}",
+        "--out",
+        "{{outDir}}/bench-check.json"
+      ],
+      "required": true
+    },
+    {
+      "id": "snapshot-staging",
+      "command": "snapshot",
+      "args": [
+        "--origin",
+        "{{origin}}",
+        "--out",
+        "{{outDir}}/snapshot-staging.json"
+      ]
+    },
+    {
+      "id": "measure-release",
+      "command": "measure",
+      "args": [
+        "--origin",
+        "{{origin}}",
+        "--fixture",
+        "{{fixture}}",
+        "--browser",
+        "{{browser}}",
+        "--state",
+        "release",
+        "--ab",
+        "none",
+        "--runs",
+        "5",
+        "--project",
+        "raft-web",
+        "--env",
+        "staging",
+        "--out",
+        "{{outDir}}/measure-release.json"
+      ],
+      "collectJsonl": true
+    },
+    {
+      "id": "measure-repeat",
+      "command": "measure",
+      "args": [
+        "--origin",
+        "{{origin}}",
+        "--fixture",
+        "{{fixture}}",
+        "--browser",
+        "{{browser}}",
+        "--state",
+        "repeat",
+        "--ab",
+        "none",
+        "--runs",
+        "5",
+        "--project",
+        "raft-web",
+        "--env",
+        "staging",
+        "--out",
+        "{{outDir}}/measure-repeat.json"
+      ],
+      "collectJsonl": true
+    },
+    {
+      "id": "interact",
+      "command": "interact",
+      "args": [
+        "--origin",
+        "{{origin}}",
+        "--fixture",
+        "{{fixture}}",
+        "--runs",
+        "3",
+        "--project",
+        "raft-web",
+        "--env",
+        "staging",
+        "--out",
+        "{{outDir}}/interact.json"
+      ],
+      "collectJsonl": true
+    },
+    {
+      "id": "interact-trace",
+      "command": "interact",
+      "args": [
+        "--origin",
+        "{{origin}}",
+        "--fixture",
+        "{{fixture}}",
+        "--runs",
+        "3",
+        "--trace",
+        "--project",
+        "raft-web",
+        "--env",
+        "staging",
+        "--out",
+        "{{outDir}}/interact-trace.json"
+      ],
+      "collectDiagnoseJsonl": true
+    },
+    {
+      "id": "input",
+      "command": "input",
+      "args": [
+        "--origin",
+        "{{origin}}",
+        "--fixture",
+        "{{fixture}}",
+        "--runs",
+        "3",
+        "--project",
+        "raft-web",
+        "--env",
+        "staging",
+        "--out",
+        "{{outDir}}/input.json"
+      ],
+      "collectJsonl": true
+    },
+    {
+      "id": "resize",
+      "command": "resize",
+      "args": [
+        "--origin",
+        "{{origin}}",
+        "--fixture",
+        "{{fixture}}",
+        "--runs",
+        "3",
+        "--project",
+        "raft-web",
+        "--env",
+        "staging",
+        "--out",
+        "{{outDir}}/resize.json"
+      ],
+      "collectJsonl": true
+    },
+    {
+      "id": "soak",
+      "command": "soak",
+      "args": [
+        "--origin",
+        "{{origin}}",
+        "--fixture",
+        "{{fixture}}",
+        "--rounds",
+        "8",
+        "--project",
+        "raft-web",
+        "--env",
+        "staging",
+        "--out",
+        "{{outDir}}/soak.json"
+      ],
+      "collectJsonl": true
+    },
+    {
+      "id": "diagnose-reopen",
+      "command": "diagnose",
+      "args": [
+        "--origin",
+        "{{origin}}",
+        "--scenario",
+        "startup",
+        "--mode",
+        "reopen",
+        "--fixture",
+        "{{fixture}}",
+        "--browser",
+        "local",
+        "--cpu",
+        "4",
+        "--project",
+        "raft-web",
+        "--env",
+        "staging",
+        "--save-trace-gz",
+        "{{outDir}}/diagnose-reopen.trace.json.gz",
+        "--save-profile-gz",
+        "{{outDir}}/diagnose-reopen.cpuprofile.gz",
+        "--out",
+        "{{outDir}}/diagnose-reopen.json"
+      ],
+      "collectDiagnoseJsonl": true
+    }
+  ]
+}

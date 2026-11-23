@@ -63,6 +63,11 @@ test("refusalSentenceProblem(): one line, a sentence, at most 500 characters, no
   assert.match(refusalSentenceProblem("x ".repeat(251)) ?? "", /longer than 500/);
   assert.match(refusalSentenceProblem("Add --title to name it.") ?? "", /command or a flag/);
   assert.match(refusalSentenceProblem("Run raft artifact pull first.") ?? "", /command or a flag/);
+  assert.match(refusalSentenceProblem("Run `raft artifact pull` first.") ?? "", /command or a flag/);
+  assert.match(refusalSentenceProblem("raft message send needs a target.") ?? "", /command or a flag/);
+  for (const handle of ["raft", "ops-raft", "team.raft", "my_raft", "团队raft", "Zoëraft"]) {
+    assert.equal(refusalSentenceProblem(`Mention @${handle} is bound to more than one actor. Select exactly one actor id and type.`), null, handle);
+  }
 });
 
 test("a refusal's structured next: the CLI command, the tool call in tool style, and the operation in next", () => {
@@ -86,6 +91,29 @@ test("an operation that writes its own step over the Server's hint: the hint no 
   assert.equal(failure.next?.operation, undefined);
   const tool = restyleDefaultNextAction(failure, "tool");
   assert.equal(tool.error.nextAction, own.nextAction);
+});
+
+test("a typed value that reads like a command (a title 'raft docs plan', a path with --) is the caller's, not a CLI step: tool style keeps the Server's step and sentence, and a second pass (the SDK's) leaves them alone", () => {
+  const listHint = { cli: ["artifact", "list", "--query", "'raft docs plan'"], op: { name: "artifacts.list", args: { query: "raft docs plan" } } };
+  const notVisible = "No artifact you can see has that id, link or title: it may not exist, may have been deleted, or may not be shared with you.";
+  const hidden = failureOutcome(opErrorFromClientError(httpError(404, { error: notVisible, code: "NOT_VISIBLE", next: listHint })));
+  const once = restyleDefaultNextAction(hidden, "tool");
+  assert.equal(once.error.nextAction, 'artifacts_list({ query: "raft docs plan" })');
+  const twice = restyleDefaultNextAction(once, "tool");
+  assert.equal(twice.error.nextAction, 'artifacts_list({ query: "raft docs plan" })');
+  assert.equal(twice.error.message, notVisible);
+
+  for (const path of ["raft docs/plan.md", "notes/--draft.md"]) {
+    const sentence = `${JSON.stringify(path)} is listed twice, or both sent and deleted, in this push: list each path once.`;
+    const duplicate = restyleDefaultNextAction(failureOutcome(opErrorFromClientError(httpError(400, { error: sentence, code: "DUPLICATE_PATH" }))), "tool");
+    assert.equal(duplicate.error.message, sentence, path);
+    assert.ok(duplicate.text.includes(`Error: ${sentence}\n`), duplicate.text);
+  }
+
+  // A command outside the quotes is still the CLI's: the code's own sentence and step in tool style.
+  const cli = restyleDefaultNextAction(failureOutcome(opErrorFromClientError(httpError(400, { error: 'Run `raft artifact pull` for "raft docs plan" first.', code: "BASE_MOVED", suggestedNextAction: 'raft artifact pull "raft docs plan"' }))), "tool");
+  assert.doesNotMatch(cli.error.message, /raft artifact pull/);
+  assert.doesNotMatch(cli.error.nextAction, /raft artifact pull/);
 });
 
 test("retryAfterSeconds makes any refusal retryable after the wait, whatever its code", () => {

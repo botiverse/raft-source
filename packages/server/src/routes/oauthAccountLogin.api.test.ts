@@ -66,6 +66,7 @@ const ACCESS_DENIED_BODY = JSON.stringify({ error: "access_denied" });
 const LOGIN_MODE_CHANGED_BODY = JSON.stringify({
   error: "This app now signs you in with your Raft account. Reload this page to continue.",
   code: "login_mode_changed",
+  errorCode: "login_mode_changed",
 });
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -655,7 +656,7 @@ test("returnUrl must be the registered URL: a mismatch is the continue's 400, au
   // Missing: a 400 before anything is read.
   assert.deepEqual(
     await authorizeAccount(app, f.person, accountBody(f.client.clientId, { returnUrl: undefined }).body),
-    { ...ref, body: JSON.stringify({ error: "returnUrl is required" }) },
+    { ...ref, body: JSON.stringify({ error: "returnUrl is required", code: "invalid_input", errorCode: "invalid_input" }) },
   );
 
   // Outside the audience, the mismatch is never reached.

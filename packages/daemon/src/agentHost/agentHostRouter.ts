@@ -17,8 +17,8 @@
 //   being undone (a stopped start whose grok may still be opening the same
 //   session, an ended session still disposing) waits for that first, and
 //   reads as starting meanwhile; a stop cancels it.
-// - A runtime with no legacy driver (`RuntimeDriver.oarOnly`: Qwen Code,
-//   Qoder) always asks for the OAR host, and never reaches the legacy host: a
+// - A runtime with no legacy driver (`RuntimeDriver.oarOnly`: Codex, Qwen Code,
+//   Qoder, DeepSeek Harness) always asks for the OAR host, and never reaches the legacy host: a
 //   start the OAR host cannot run fails with `OarOnlyStartError`, which the
 //   core reports as the start's failure (core.ts `reportAgentStartFailure`).
 // - Every other lifecycle call goes to whichever host owns the agent now.
@@ -31,6 +31,7 @@ import type {
   AgentMessage,
   AgentServerFeatures,
   AgentStartNotSpawnedReason,
+  AgentStartOpenTasks,
   AgentSubagentInterruptOutcome,
   TraceContext,
   Tracer,
@@ -43,7 +44,8 @@ import { logger } from "../logger";
 import { getDriver, isOarOnlyRuntimeId, OAR_ONLY_RUNTIMES } from "../drivers/index";
 import type { RecoveryGrant } from "../runtimeOutcomeOutbox";
 import { RUNTIME_OUTCOME_STORAGE_BLOCKED_TEXT } from "../runtimeOutcomeOutbox";
-import { OarOnlyStartError, spawnFailureCodeOf } from "../spawnFailureErrors";
+import { classifyRuntimeStartupConfigFailure } from "../spawnFailureClassification";
+import { OarOnlyStartError, RuntimeExecutableNotFoundError, spawnFailureCodeOf } from "../spawnFailureErrors";
 import type {
   AgentDeliveryContext,
   AgentIdleNoticeDelivery,
@@ -125,10 +127,12 @@ export class AgentHostRouter implements AgentLifecycleHost {
     catchupBatchId?: string,
     recoveryGrant: RecoveryGrant | null = null,
     claimedConnectionEpochId: string | null = null,
+    openTasks?: AgentStartOpenTasks,
   ): Promise<AgentStartOutcome> {
     const request: AgentStartRequest = {
       agentId, config, wakeMessage, unreadSummary, resumePrompt, launchId, wakeMessageTransient,
       resumeMessages, startDispatchId, traceParent, catchupBatchId, recoveryGrant, claimedConnectionEpochId,
+      ...(openTasks ? { openTasks } : {}),
     };
     const oarOnly = getDriver(config.runtime || "claude").oarOnly === true;
     const requested = config.runtimeHost === "oar" || oarOnly ? "oar" : "legacy";
@@ -167,8 +171,8 @@ export class AgentHostRouter implements AgentLifecycleHost {
     await releasedIdle;
     const outcome = await started;
     if (outcome.kind !== "fallback") return oarStartOutcome(outcome);
-    if (oarOnly) return this.failOarOnlyFallback(outcome);
     if (outcome.failHere) return this.failKeptOnOar(outcome, outcome.failHere);
+    if (oarOnly) return this.failOarOnlyFallback(outcome);
     // Nothing runs on OAR: the legacy host runs this start, as it would have.
     logger.warn(`[Agent ${agentId}] OAR host handed the start back (${outcome.reason}); starting on the legacy host`);
     this.traceSelection(outcome.request, requested, "legacy", outcome.reason, "oar_fallback");
@@ -207,7 +211,12 @@ export class AgentHostRouter implements AgentLifecycleHost {
     this.oar.reportDroppedAppEvents(request.agentId, request.launchId ?? null, "oar_kept_failed", outcome.held.flatMap((held) => held.droppedAppEventIds ?? []));
     for (const held of outcome.held) held.settle(false);
     this.releaseCredential(request);
-    throw new OarOnlyStartError({ runtimeId: request.config.runtime, hostReason: reason, userMessage });
+    throw new OarOnlyStartError({
+      runtimeId: request.config.runtime,
+      hostReason: reason,
+      userMessage,
+      ...(outcome.failHereReason ? { spawnFailureCode: outcome.failHereReason } : {}),
+    });
   }
 
   /**
@@ -246,6 +255,12 @@ export class AgentHostRouter implements AgentLifecycleHost {
     // The refusal names the variables and the fix itself (agentEnvVarPolicy.ts).
     if (code === "env_var_not_allowed" && outcome.cause instanceof Error) throw outcome.cause;
     if (code === "runtime_not_found") {
+      // task #1242 / #1358: preserve undecided lookup verdicts (e.g. Codex probe_timeout
+      // or wrapper rejection) so classifySpawnFailure keeps lookupReason and the
+      // resolver's path-free message instead of claiming the CLI is not installed.
+      if (outcome.cause instanceof RuntimeExecutableNotFoundError && outcome.cause.reason && outcome.cause.reason !== "not_on_path") {
+        throw outcome.cause;
+      }
       throw new OarOnlyStartError({
         runtimeId: runtime,
         hostReason: reason,
@@ -253,12 +268,22 @@ export class AgentHostRouter implements AgentLifecycleHost {
         userMessage: `${label} is not installed on this Computer. Install its CLI there, then restart the agent.`,
       });
     }
-    if (reason.startsWith("resume_failed:")) {
+    if (reason === "resume_failed:SessionNotFoundError") {
       throw new OarOnlyStartError({
         runtimeId: runtime,
         hostReason: reason,
         spawnFailureCode: "session_needs_reset",
         userMessage: `${label} could not resume this agent's saved session, and a new session is never started in its place. Reset the agent's session to start a new one.`,
+      });
+    }
+    const startupConfigFailure = classifyRuntimeStartupConfigFailure(outcome.cause, runtime, label);
+    if (startupConfigFailure) {
+      throw new OarOnlyStartError({
+        runtimeId: runtime,
+        hostReason: reason,
+        spawnFailureCode: startupConfigFailure.reason,
+        userMessage: startupConfigFailure.userMessage,
+        startErrorText: startupConfigFailure.errorText,
       });
     }
     // The runtime's own words say what to fix (10-29: Qoder named the model
@@ -335,6 +360,7 @@ export class AgentHostRouter implements AgentLifecycleHost {
       request.catchupBatchId,
       request.recoveryGrant,
       request.claimedConnectionEpochId,
+      request.openTasks,
     );
   }
 
@@ -408,15 +434,15 @@ export class AgentHostRouter implements AgentLifecycleHost {
     return this.hostFor(agentId).interruptTurn(agentId);
   }
 
-  /** #wg-runtime-form:#22: answered for agents on the legacy host (v0: Claude); an agent on the OAR host is not forked here. */
+  /** #wg-runtime-form:#22 / #oar-raft:#48: status now for any running agent, or one read-only fork question on Claude. */
   sideAsk(request: AgentSideAskRequest): Promise<{ outcome: AgentSideAskOutcome; text?: string }> {
-    if (this.oar.owns(request.agentId)) return Promise.resolve({ outcome: "unsupported_runtime" });
-    return this.legacy.sideAsk(request);
+    return this.hostFor(request.agentId).sideAsk(request);
   }
 
-  /** Kill the agent's side-question fork (its stop, delete or migration). */
+  /** Kill the agent's side-question fork on either host (its stop, delete or migration). */
   stopSideAsk(agentId: string): void {
     this.legacy.stopSideAsk(agentId);
+    this.oar.stopSideAsk(agentId);
   }
 
   interruptSubagent(agentId: string, subagentTaskId: string): Promise<AgentSubagentInterruptOutcome> {
@@ -496,8 +522,8 @@ export class AgentHostRouter implements AgentLifecycleHost {
    * needs another host is left to the server's next start, which this router
    * places (specChangeNeedsServerStart).
    */
-  applyConfig(agentId: string, config: AgentConfig, revision: number): void {
-    this.hostFor(agentId).applyConfig?.(agentId, config, revision);
+  applyConfig(agentId: string, config: AgentConfig, revision: number, options?: { interrupt?: boolean }): void {
+    this.hostFor(agentId).applyConfig?.(agentId, config, revision, options);
   }
 
   /**

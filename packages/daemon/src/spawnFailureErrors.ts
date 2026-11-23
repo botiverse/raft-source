@@ -225,29 +225,8 @@ export class AgentProxyBindError extends Error {
   }
 }
 
-export type ProviderConnectionMaterializationFailureKind = "http" | "invalid_payload" | "invalid_environment";
-
-/** The server could not materialize the provider connection for launch. */
-export class ProviderConnectionMaterializationError extends Error {
-  readonly code = "provider_connection_materialization_failed" as const;
-  readonly kind: ProviderConnectionMaterializationFailureKind;
-  readonly status?: number;
-
-  constructor(input: { kind: ProviderConnectionMaterializationFailureKind; status?: number; message: string }) {
-    super(input.message);
-    this.name = "ProviderConnectionMaterializationError";
-    this.kind = input.kind;
-    this.status = input.status;
-  }
-}
-
 export function isRuntimeModelNotFoundError(error: unknown): error is RuntimeModelNotFoundError {
   return error instanceof RuntimeModelNotFoundError || (error instanceof Error && (error as { code?: unknown }).code === "model_not_found");
-}
-
-export function isProviderConnectionMaterializationError(error: unknown): error is ProviderConnectionMaterializationError {
-  return error instanceof ProviderConnectionMaterializationError
-    || (error instanceof Error && (error as { code?: unknown }).code === "provider_connection_materialization_failed");
 }
 
 /**
@@ -263,6 +242,8 @@ export class OarOnlyStartError extends Error {
   readonly hostReason: string;
   readonly notSpawnedReason: AgentStartNotSpawnedReason;
   readonly userMessage: string;
+  /** Raw runtime error text for manager-only `spawnFailure.message` (scrubbed and capped by `startFailureActivity`). */
+  readonly startErrorText?: string;
 
   constructor(input: {
     runtimeId: string;
@@ -270,6 +251,7 @@ export class OarOnlyStartError extends Error {
     userMessage: string;
     spawnFailureCode?: SpawnFailureReason;
     notSpawnedReason?: AgentStartNotSpawnedReason;
+    startErrorText?: string;
   }) {
     super(`${input.runtimeId} runs only on the OAR host, which could not run this start (${input.hostReason})`);
     this.name = "OarOnlyStartError";
@@ -278,5 +260,6 @@ export class OarOnlyStartError extends Error {
     this.userMessage = input.userMessage;
     this.spawnFailureCode = input.spawnFailureCode ?? "runtime_spawn_failed";
     this.notSpawnedReason = input.notSpawnedReason ?? "start_rejected";
+    if (input.startErrorText) this.startErrorText = input.startErrorText;
   }
 }

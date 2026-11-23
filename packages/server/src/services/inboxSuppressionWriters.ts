@@ -4,6 +4,9 @@ import { inboxSuppressionStates, readCursorWidenPhase } from "../db/schema";
 
 const INT4_AUTHORITY_MAX = 2_147_483_647n;
 
+// The change_log trigger on inbox_suppression_states (migration
+// change_log_inbox_rows) names markChannelInboxDone and markThreadDone: their
+// watermark is a Done position for incremental sync. Renaming them: change it too.
 export const INBOX_SUPPRESSION_WRITE_SITES = {
   markChannelInboxDone: "channel.markChannelInboxDone",
   markThreadDone: "thread.markThreadDone",

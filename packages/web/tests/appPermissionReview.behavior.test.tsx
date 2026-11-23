@@ -141,8 +141,8 @@ test("marketplace app detail shows pending permission groups and no approve acti
   }) as typeof api.get;
 
   renderPanel("integrations");
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-marketplace"));
-  fireEvent.click(await screen.findByText("tdoc", undefined, DETAIL_WAIT));
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-discover"));
+  fireEvent.click(await screen.findByRole("button", { name: "tdoc" }, DETAIL_WAIT));
 
   // Pending badge is the permission-update variant, not the generic review copy.
   assert.ok(await screen.findByText(en["settings.connectedApps.appNotifications.permissionUpdatePending"], undefined, DETAIL_WAIT));

@@ -1,7 +1,8 @@
 import * as serverService from "../services/serverService";
 import { actorHasServerCapabilityInServer, getActorServerRoleInServer } from "../lib/actorPermissions";
 import { addTraceEvent } from "../tracing/semanticTrace";
-import { agentServerRoleRequiredBody } from "../lib/agentServerRoleRequired";
+import { AGENT_NO_LONGER_EXISTS_REFUSAL, agentServerRoleRequiredBody, type AgentRouteResult } from "../lib/agentServerRoleRequired";
+import type { RefusalInput, RefusalStatus } from "../lib/refusal";
 
 export interface AgentServerManageActor {
   id: string;
@@ -9,15 +10,15 @@ export interface AgentServerManageActor {
   serverId: string;
 }
 
-export interface AgentServerManageResult {
-  status: number;
-  body: Record<string, unknown>;
-}
+export type AgentServerManageResult = AgentRouteResult;
+
+/** A refusal of the server-profile routes, for refuse(). */
+export type AgentServerManageRefusal = { ok: false; status: RefusalStatus; refusal: RefusalInput };
 
 export async function assertAgentCanManageServerProfile(input: {
   actor: AgentServerManageActor;
   serverId: string;
-}): Promise<AgentServerManageResult | null> {
+}): Promise<AgentServerManageRefusal | null> {
   const { actor, serverId } = input;
   addTraceEvent("agent_server_profile.authorization.started", {
     actor_server_match: actor.serverId === serverId,
@@ -27,7 +28,7 @@ export async function assertAgentCanManageServerProfile(input: {
       reason: "agent_server_mismatch",
       status_code: 401,
     });
-    return { status: 401, body: { error: "Agent no longer exists" } };
+    return { ok: false, status: 401, refusal: AGENT_NO_LONGER_EXISTS_REFUSAL };
   }
 
   const hasAuthority = await actorHasServerCapabilityInServer(serverId, "agent", actor.id, "editServerSettings");
@@ -40,7 +41,7 @@ export async function assertAgentCanManageServerProfile(input: {
       reason: "capability_required",
       status_code: 403,
     });
-    return { status: 403, body: await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["editServerSettings"], action: "edit the server profile" }) };
+    return { ok: false, status: 403, refusal: await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["editServerSettings"], action: "edit the server profile" }) };
   }
   return null;
 }
@@ -59,16 +60,16 @@ export async function updateServerProfileForAgent(input: {
   if (payload.name !== undefined) {
     if (typeof payload.name !== "string") {
       addTraceEvent("agent_server_profile.validation.failed", { reason: "invalid_name_type" });
-      return { status: 400, body: { error: "Name must be a string" } };
+      return { ok: false, status: 400, refusal: { code: "server_name_invalid", error: "Name must be a string" } };
     }
     const trimmed = payload.name.trim();
     if (!trimmed) {
       addTraceEvent("agent_server_profile.validation.failed", { reason: "empty_name" });
-      return { status: 400, body: { error: "Name is required" } };
+      return { ok: false, status: 400, refusal: { code: "server_name_invalid", error: "Name is required" } };
     }
     if (trimmed.length > 100) {
       addTraceEvent("agent_server_profile.validation.failed", { reason: "name_too_long" });
-      return { status: 400, body: { error: "Name must be 100 characters or fewer" } };
+      return { ok: false, status: 400, refusal: { code: "server_name_invalid", error: "Name must be 100 characters or fewer" } };
     }
     updates.name = trimmed;
   }
@@ -76,14 +77,14 @@ export async function updateServerProfileForAgent(input: {
   if (payload.hideHumansFromMembers !== undefined) {
     if (typeof payload.hideHumansFromMembers !== "boolean") {
       addTraceEvent("agent_server_profile.validation.failed", { reason: "invalid_hide_humans_type" });
-      return { status: 400, body: { error: "hideHumansFromMembers must be a boolean" } };
+      return { ok: false, status: 400, refusal: { code: "server_hide_humans_invalid", error: "hideHumansFromMembers must be a boolean" } };
     }
     updates.hideHumansFromMembers = payload.hideHumansFromMembers;
   }
 
   if (updates.name === undefined && updates.hideHumansFromMembers === undefined) {
     addTraceEvent("agent_server_profile.validation.failed", { reason: "empty_update" });
-    return { status: 400, body: { error: "At least one field is required" } };
+    return { ok: false, status: 400, refusal: { code: "server_update_empty", error: "At least one field is required" } };
   }
 
   const updated = await serverService.updateServerProfile(input.serverId, updates, {
@@ -94,13 +95,13 @@ export async function updateServerProfileForAgent(input: {
       reason: "server_not_found",
       status_code: 404,
     });
-    return { status: 404, body: { error: "Server not found" } };
+    return { ok: false, status: 404, refusal: { code: "server_not_found", error: "Server not found" } };
   }
   addTraceEvent("agent_server_profile.updated", {
     renamed: updates.name !== undefined,
     hide_humans_changed: updates.hideHumansFromMembers !== undefined,
   });
-  return { status: 200, body: updated };
+  return { ok: true, status: 200, body: updated };
 }
 
 /** Audit context for an agent's server-profile write: the agent and its live server role. */

@@ -1,0 +1,1 @@
+ALTER TABLE "agents" ADD COLUMN "cli_inbox_items" jsonb;

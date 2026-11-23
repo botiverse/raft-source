@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import api from "../src/api/client";
 import { AssistantOtterAnchor } from "../src/assistant/AssistantOtter";
+import { AssistantContextChip } from "../src/assistant/AssistantContextChip";
 import { AssistantOtterSettingsSection } from "../src/assistant/AssistantOtterSettings";
 import { AssistantOwnerSection } from "../src/assistant/AssistantOwnerSection";
 import LocalizedToastProvider from "../src/components/LocalizedToastProvider";
@@ -20,6 +21,7 @@ export const ASSISTANT_OTTER_CASE_IDS = [
   "components.assistant.otter-hidden-toast",
   "components.assistant.owner-section",
   "components.assistant.otter-dock",
+  "components.assistant.context-chip",
 ] as const;
 
 const SERVER_ID = "visual-server";
@@ -127,7 +129,22 @@ function OtterDockFrame() {
   );
 }
 
+/** The chip above the assistant's input (#proj-assistant:0bd2ebe9): its × centred on the text line, like its icon. */
+const CONTEXT_THREAD = { kind: "channel" as const, conversation: "#proj-frontend", threadExcerpt: "我们来做一下 generative UI 可以让 agent 直接输出 UI 展示到…", token: "#proj-frontend:1a2b3c4d", readable: true };
+const CONTEXT_CHANNEL = { kind: "channel" as const, conversation: "#general", threadExcerpt: null, token: "#general", readable: true };
+const noop = () => {};
+
+function ContextChipFrame() {
+  return (
+    <div className="flex w-[420px] flex-col gap-3 p-4" data-testid="visual-context-chip">
+      <AssistantContextChip context={CONTEXT_THREAD} onRemove={noop} />
+      <AssistantContextChip context={CONTEXT_CHANNEL} onRemove={noop} />
+    </div>
+  );
+}
+
 export function AssistantOtterCase({ caseId }: { caseId: string }) {
+  if (caseId === "components.assistant.context-chip") return <ContextChipFrame />;
   if (caseId === "components.assistant.otter-dock") return <OtterDockFrame />;
   if (caseId === "components.assistant.otter-hidden-toast") return <ToastFrame />;
   if (caseId === "components.assistant.owner-section") return <OwnerSectionFrame />;

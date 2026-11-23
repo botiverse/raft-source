@@ -8,7 +8,7 @@
 // never a new foreign key from an app table to a hot core table). Actors are polymorphic
 // (type, id) pairs without a foreign key, resolved live.
 import { sql } from "drizzle-orm";
-import type { ArtifactCommentImage, ArtifactExcerptBlock, ObjectFileId, ServerId } from "@botiverse/raft-shared";
+import type { ArtifactCheckCantScroll, ArtifactCommentImage, ArtifactExcerptBlock, ObjectFileId, ServerId } from "@botiverse/raft-shared";
 import {
   bigint,
   bigserial,
@@ -44,11 +44,12 @@ export type ArtifactHomeKind = (typeof ARTIFACT_HOME_KINDS)[number];
 
 /**
  * How an Artifact entered a conversation (its original message, xxchan
- * #proj-workspace:2e5a5da3): saved from that message's attachment, or the
- * message a share posted while it had none. Links in ordinary messages come
- * later (shared ArtifactOriginVia `link`).
+ * #proj-workspace:2e5a5da3): saved from that message's attachment, the
+ * message a share posted while it had none, or the first message in its home
+ * conversation that links it while it had none (linkOrigin.ts). Shared
+ * ArtifactOriginVia.
  */
-export const ARTIFACT_ORIGIN_VIAS = ["attachment", "share"] as const;
+export const ARTIFACT_ORIGIN_VIAS = ["attachment", "share", "link"] as const;
 export type ArtifactOriginViaStored = (typeof ARTIFACT_ORIGIN_VIAS)[number];
 
 /**
@@ -127,7 +128,8 @@ export const artifactItems = appArtifacts.table("items", {
   lastPosition: bigint("last_position", { mode: "number" }).notNull().default(0),
   /**
    * The original message: the one through which it entered a conversation
-   * (saved from its attachment; else the first share's message), set once
+   * (saved from its attachment; else the first share's message, or the first
+   * message in its home conversation that links it), set once
    * with `origin_via` and never changed, so it never moves. No foreign key
    * (Tenny, review of #11613): core's message deletes never wait on or touch
    * this table, and adding one would lock `messages`. A deleted message
@@ -136,14 +138,30 @@ export const artifactItems = appArtifacts.table("items", {
    */
   originMessageId: uuid("origin_message_id"),
   originVia: text("origin_via", { enum: ARTIFACT_ORIGIN_VIAS }),
+  /**
+   * Settled (#334, settle.ts; behind artifact_settled_v0): who marked it done,
+   * when, and the version that was current then. All four or none. A new
+   * version leaves them as they are and sets `settled_lapsed_version`, so the
+   * Artifact reads as Working again with the settle it ended still known
+   * ("a new version came since it was settled"); settling again overwrites
+   * them and clears that, unsettling clears all five.
+   */
+  settledAt: timestamp("settled_at", { withTimezone: true }),
+  settledByType: text("settled_by_type", { enum: ARTIFACT_ACTOR_TYPES }),
+  settledById: uuid("settled_by_id"),
+  settledVersionNumber: integer("settled_version_number"),
+  /** The version that took a settled Artifact back to Working; null while the settle stands (or there is none). */
+  settledLapsedVersion: integer("settled_lapsed_version"),
 }, (t) => [
   check("items_home_kind", sql`${t.homeKind} IN ('conversation', 'server', 'public')`),
   // A message is an origin only with how it became one.
-  check("items_origin_via", sql`${t.originVia} IS NULL OR ${t.originVia} IN ('attachment', 'share')`),
+  check("items_origin_via", sql`${t.originVia} IS NULL OR ${t.originVia} IN ('attachment', 'share', 'link')`),
   check("items_origin_message_via", sql`${t.originMessageId} IS NULL OR ${t.originVia} IS NOT NULL`),
   // Only a conversation home names a channel; one whose channel is NULL is an orphan.
   check("items_home_channel", sql`${t.homeKind} = 'conversation' OR ${t.homeChannelId} IS NULL`),
   check("items_created_by_type", sql`${t.createdByType} IN ('user', 'agent')`),
+  check("items_settled", sql`(${t.settledAt} IS NULL AND ${t.settledByType} IS NULL AND ${t.settledById} IS NULL AND ${t.settledVersionNumber} IS NULL) OR (${t.settledAt} IS NOT NULL AND ${t.settledByType} IN ('user', 'agent') AND ${t.settledById} IS NOT NULL AND ${t.settledVersionNumber} IS NOT NULL)`),
+  check("items_settled_lapsed", sql`${t.settledLapsedVersion} IS NULL OR ${t.settledAt} IS NOT NULL`),
   index("idx_items_server_home").on(t.serverId, t.homeKind),
   index("idx_items_home_channel").on(t.homeChannelId),
   // An old name is unique among the live Artifacts of one home that have one
@@ -202,6 +220,14 @@ export const artifactVersions = appArtifacts.table("versions", {
    * before these (not backfilled), and the card draws `excerpt`.
    */
   excerptBlocks: jsonb("excerpt_blocks").$type<ArtifactExcerptBlock[]>(),
+  /**
+   * The contentLinks.ts CONTENT_LINKS_EXTRACTOR this version's links to other
+   * Artifacts were read with, written into core's `object_references` while it
+   * was the current version (references.ts). Null: never read (an older
+   * version, or one from before links were read: ensureArtifactReferences
+   * fills the current one when asked); an older number is read again.
+   */
+  referencesExtractor: smallint("references_extractor"),
 }, (t) => [
   uniqueIndex("idx_versions_item_number").on(t.itemId, t.number),
   uniqueIndex("idx_versions_item_position").on(t.itemId, t.position).where(sql`${t.position} IS NOT NULL`),
@@ -334,6 +360,12 @@ export interface ArtifactCheckFindings {
   blank: boolean;
   /** At phone width the page scrolls sideways: its content's width against the screen's. Null when it doesn't. */
   phoneOverflow: { contentWidth: number; viewportWidth: number } | null;
+  /**
+   * A soft hint for the agent (it may be intended): the viewports at which the page is taller than
+   * the window and nothing scrolls to the rest. Only when there is one; absent on a check from
+   * before it. Findings are the agent API's only: no web route serves them.
+   */
+  pageCantScroll?: ArtifactCheckCantScroll[];
 }
 
 /**
@@ -558,6 +590,26 @@ export const artifactReadPositions = appArtifacts.table("read_positions", {
   check("read_positions_actor_type", sql`${t.actorType} IN ('user', 'agent')`),
   // One actor's read positions (the dashboard's `recent` and `waiting`); the primary key leads with the item.
   index("idx_read_positions_actor").on(t.actorType, t.actorId, t.itemId),
+]);
+
+/**
+ * Who was told, by a held push, that an Artifact is Settled (#334,
+ * publish.ts): one row per Artifact and actor (the reader a push's holds are
+ * for), naming the settle it was told of by its `settled_at`. A push that
+ * would take the Artifact back to Working is held (409 SETTLED) unless the
+ * pusher's row names the settle that stands now; the hold writes the row, so
+ * the same push again goes through. A new settle has another `settled_at`,
+ * so it holds again. Goes with its item (cascade).
+ */
+export const artifactSettledHolds = appArtifacts.table("settled_holds", {
+  itemId: text("item_id").notNull().references(() => artifactItems.id, { onDelete: "cascade" }),
+  actorType: text("actor_type", { enum: ARTIFACT_ACTOR_TYPES }).notNull(),
+  actorId: uuid("actor_id").notNull(),
+  settledAt: timestamp("settled_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.itemId, t.actorType, t.actorId] }),
+  check("settled_holds_actor_type", sql`${t.actorType} IN ('user', 'agent')`),
 ]);
 
 /** How an actor came to follow an Artifact: it published, it commented, or it chose to (PUT subscription). */

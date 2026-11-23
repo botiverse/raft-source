@@ -9,6 +9,7 @@ import { AGENT_STOP_KILL_CONFIRM_MS, AGENT_STOP_KILL_GRACE_MS, agentStopTraceAtt
 import { reapRecordedOrphans, RuntimeProcessLedger, type OrphanReapDeps, type RuntimeProcessLedgerDeps } from "./drivers/runtimeProcessLedger";
 import { filterProcJobsFromRuntimeRecords } from "./procJobs";
 import type { AgentTurnInterruptOutcome } from "@botiverse/raft-shared";
+import type { RuntimeModelSet } from "@botiverse/raft-shared";
 import { hydrateRuntimeConfig as hydrateSideAskRuntimeConfig, runtimeConfigToLaunchFields as sideAskLaunchFields, type AgentSideAskOutcome, type AgentSideAskRequest } from "@botiverse/raft-shared";
 import { claudeSideQuestionArgs, SIDE_ASK_FORK_MAX_CONTEXT_TOKENS, SideQuestionRunner, sideAskStatusText, sideAskTimeoutMs, sideQuestionEnv, sideQuestionPrompt } from "./agentSideAsk";
 import { collectClaudeWorkingState } from "./wakeBriefingPanel";
@@ -48,6 +49,7 @@ import {
   type MachineToServerMessage,
   type AgentRuntimeOutcome,
   type AgentStartNotSpawnedReason,
+  type AgentStartOpenTasks,
   type ServerToMachineMessage,
   type WorkspaceDirectoryInfo,
   type TrajectoryEntry,
@@ -119,7 +121,6 @@ import { uploadFeedbackTranscriptOutcome, type FeedbackTranscriptOutcomeUploadSt
 import { startFeedbackAgentEventTail, type FeedbackAgentEventTailOutcome } from "./feedbackAgentEventTail";
 import { collectFeedbackMachineState, collectFeedbackTraceTail, redactedOrNull } from "./feedbackMachineEvidence";
 import { collectObservedFailureSummary } from "./observedFailureSummary";
-import { parseSkillFrontmatter } from "./skillFrontmatter";
 import { AgentContextViewService, type ContextViewAgentFacts } from "./agentContextView/agentContextViewService";
 import { isPiRequestLogRuntime, piRequestLogFile } from "./agentContextView/piRequestLog";
 import { codexContextSessionRoot } from "./agentContextView/contextViewSource";
@@ -154,6 +155,7 @@ import { deleteWorkspaceDirectory, scanWorkspaceDirectories } from "./workspaces
 import { initializeLaunchWorkspace, withLocalRuntimeContext } from "./agentLaunchWorkspace";
 import { appInboxItemNoticed, appInboxNoticeText, inboxItemsLaunchAtMs } from "./agentAppInboxNotice";
 import { carryHeldRunnerCredential, revokeManagedRunnerCredential } from "./runnerCredentialRevoke";
+import { parseRunnerCredentialMintBody, trackRunnerCredential, type RunnerCredential } from "./runnerCredentialRenewal";
 import { AgentStartCoordinator, type AgentStartOutcome, type AgentStartQueueItem, type PendingStartRebind } from "./agentStartCoordinator";
 import type { CapabilityWait, RecoveryGrant, StartRefusalDecision } from "./runtimeOutcomeOutbox";
 import { AgentStartDispatchProjection, type AgentStartAcceptance } from "./agentStartDispatchProjection";
@@ -214,7 +216,11 @@ import {
   formatAppInboxNoticeSuffix,
   formatConcreteMessagesRuntimeInput,
   formatInboxUpdateRuntimeInput,
+  selectFocusedBodies,
+  type FocusedBodySelection,
   inboxUpdateRenderOptions,
+  inboxNoticeConversationRows,
+  type InboxUpdateRenderOptions,
   formatRuntimeProfileControlPrompt,
   formatServerContextPrefix,
   formatSubagentsFinishedRuntimeInput,
@@ -231,6 +237,7 @@ import {
 } from "./agentRuntimeInput";
 import { deriveForegroundTurnOrigin } from "./foregroundTurnOrigin";
 import { planStartupInput } from "./startupInput";
+import { focusedBodyTraceAttrs } from "./focusBodies";
 import type { RuntimeTurnOrigin } from "./runtimeTurnOrigin";
 import {
   buildBoundedVisibleCrashDetail,
@@ -249,6 +256,7 @@ import {
   formatRuntimeLoginRequiredMessage,
   formatRuntimeStartTimeoutMessage,
   isRuntimeInputTooLargeErrorText,
+  modelRefusalTraceClassAttrs,
   formatRuntimeBillingExhaustedMessage,
   formatRuntimePlanAccessMessage,
   formatCredentialInvalidHeldNotice,
@@ -258,16 +266,20 @@ import {
   CREDENTIAL_PROBLEM_MESSAGES,
   scrubRuntimeErrorDiagnosticText,
 } from "./runtimeErrorDiagnostics";
-import { isCodexToolArgumentParseErrorChunk } from "./codexToolArgumentParseSignature";
-import { materializeProviderConnectionForSpawn } from "./providerConnectionLaunch";
-import { applyStartupMemoryBlock, buildStartupMemoryBlock, resolveStartupMemoryBlockConfig } from "./startupMemoryBlock";
+import { InterruptedTurnStore } from "./interruptedTurnStore";
+import { LastSessionStore } from "./lastSessionStore";
+import { SessionSummaryStore, sessionSummaryDir } from "./agentHost/oarSessionSummary";
 import { chooseSession, RESUME_FAILURE_THRESHOLD, type KnownResumeError } from "./chooseSession";
 import { reportedStickyFailureReason, type SessionResetCause } from "./stickyFailureRecords";
 import { crashStreakBackoffMs, crashStreakExhausted, formatCrashStreakExhaustedMessage, formatZeroEvidenceStreakMessage, planExit, type ExitFacts, type ExitPlan, type ExitStreaks, type RecoverableExitError } from "./planExit";
 import {
   COLD_IDLE_RUNTIME_VERSION_FLOORS,
   COLD_IDLE_SWEEP_MS,
+  WakeRecycleFailureMemory,
+  applyFreshConstructedInit,
+  applyInterruptedTurnNote,
   applyWakeRecycleBriefing,
+  buildFreshConstructedInit,
   coldIdleGate,
   decideColdIdle,
   describeAppliedWakeRecycle,
@@ -306,6 +318,7 @@ import {
   type DeliveryWritePath,
 } from "./deliveryConsumptionWatch";
 import { computeInboxNoticeFingerprint, RuntimeNotificationState } from "./runtimeNotificationState";
+import { breaksNoticeHold, isNoticeHoldEnabled, noticeHoldAppliesTo, type NoticeHoldReleaseReason } from "./outstandingNoticeHold";
 import {
   clearSessionReadyDeliveryRetry,
   createSessionReadyDeliveryRetryState,
@@ -313,6 +326,7 @@ import {
   flushSessionReadyDeliveryRetry as flushSessionReadyDeliveryRetryDebt,
   prepareSessionInitDeliveryDebtRetry,
   queueAgentInboxMessage,
+  samePendingDelivery,
   scheduleSessionReadyDeliveryRetry as scheduleSessionReadyDeliveryRetryDebt,
   type SessionReadyDeliveryRetryFlushSource,
   type SessionReadyDeliveryRetryState,
@@ -330,8 +344,9 @@ import {
   formatRuntimeErrorFingerprintFenceDetail,
   isProviderStreamFailureText,
   isRuntimeUsageLimitText,
+  formatProviderLimitHeldDetail,
   providerLimitBackoffDelayMs,
-  QUOTA_RESET_BACKOFF_MAX_MS,
+  providerLimitReportedResetInMs,
   RUNTIME_ERROR_DELIVERY_BACKOFF_BASE_MS,
   RUNTIME_ERROR_DELIVERY_BACKOFF_MAX_MS,
   runtimeErrorDeliveryBackoffDelayMs,
@@ -362,7 +377,6 @@ import { backgroundTaskForSubagentRow, defaultRuntimeDescendantReader, readDesce
 import { enforceRuntimeLaunchVersion } from "./runtimeLaunchVersion";
 import {
   addTurnSpanEvent,
-  codexCommunicationGapAttrs,
   createRuntimeTraceCounters,
   noteRaftMessageSendAttempt,
   noteRaftMessageSendOutcome,
@@ -405,11 +419,12 @@ import {
   type TerminalRuntimeFailureEvidence,
   type TurnOutcomeCounters,
 } from "./runtimeOutcome";
-import { hasConfiguredCodexHome, resolveCodexHomeRootFromEnv } from "./drivers/codexHome";
+import type { OarSkillCatalog, RuntimeSkillLists } from "./runtimeSkills/oarSkills";
 import { isClaudeCustomProviderConfig } from "./drivers/claudeProviderIsolation";
 import type { RuntimeAuthCredentialsChange } from "./runtimeAuth/runtimeAuthHost";
 import { thirdPartyEventIdsFromEvents } from "./thirdPartyEventDeliveryReporter";
-import { hasStableLocalMessageId, reportThirdPartyEventsDelivered, type AgentProxyFreshnessDecision, type AgentProxyInboxCoordinator, type AgentProxyVisibleMessage } from "./agentCredentialProxy";
+import { INBOX_ROWS_ASK_TIMEOUT_MS, InboxRowsAsk, type InboxRowsCallSite, type InboxRowsFetchAsAgent } from "./inboxRowsAsk";
+import { fetchAgentApiAsAgent, hasStableLocalMessageId, reportThirdPartyEventsDelivered, type AgentProxyFreshnessDecision, type AgentProxyInboxCoordinator, type AgentProxyVisibleMessage } from "./agentCredentialProxy";
 import { buildAgentProxyInboxCoordinator } from "./agentProxyInboxCoordinator";
 import { cleanupLaunchProxies } from "./launchProxyCleanup";
 import { projectAgentInboxSnapshot, projectAgentInboxWholePreviewMessages, type AgentInboxTargetRow } from "./agentInboxProjection";
@@ -473,6 +488,35 @@ const MODEL_WORK_EVENT_KINDS: ReadonlySet<ParsedEvent["kind"]> = new Set<ParsedE
 function isModelWorkEvent(kind: ParsedEvent["kind"]): boolean {
   return MODEL_WORK_EVENT_KINDS.has(kind);
 }
+
+/**
+ * A body awaiting its `agent:model-seen` report. `start`: in a process's
+ * first input, written before its session is known. `live`: written into a
+ * running session.
+ */
+type PendingModelSeenEntry =
+  | { kind: "start"; message: AgentMessage }
+  | { kind: "live"; message: AgentMessage; sessionId: string | null };
+type ModelSeenWrite = { kind: "start" } | { kind: "live"; sessionId: string | null };
+
+/** Focus: a body written into a turn in flight and not confirmed yet (AgentProcess.unconfirmedFocusBodies). */
+type UnconfirmedFocusBody = {
+  message: AgentMessage;
+  sessionId: string | null;
+  /** Its thread context was printed with it: recorded as seen only when the body is. */
+  renderedContext: boolean;
+  /** The turn it was written into has ended. */
+  turnEnded: boolean;
+};
+
+/**
+ * Focus: how long after a turn end its unconfirmed bodies wait before they
+ * count as shown. A runtime's rejection of a steer can arrive just after the
+ * turn end it raced (an SDK promise, or a response line on the runtime's
+ * output); one that arrives within this wait finds the body still
+ * unconfirmed and puts it back in the queue.
+ */
+export const FOCUS_BODY_CONFIRM_GRACE_MS = 250;
 
 function runtimeSendFailureOutcome(result: RuntimeSendResult): "encode_failed" | "send_failed" {
   return !result.ok && result.reason === "unsupported" ? "encode_failed" : "send_failed";
@@ -564,11 +608,14 @@ function launchUnresolvedCause(error: unknown): (RuntimeExecutableNotFoundError 
 
 export class RuntimeSessionStartError extends Error {
   readonly spawnFailureCode: SpawnFailureReason | null;
+  /** The start's own error text, without this wrapper's prefix (the failed start's `message`, classifySpawnFailure). */
+  readonly startErrorText: string | undefined;
 
-  constructor(message: string, cause: unknown) {
+  constructor(message: string, cause: unknown, startErrorText?: string) {
     super(message, cause === undefined ? undefined : { cause });
     this.name = "RuntimeSessionStartError";
     this.spawnFailureCode = spawnFailureCodeOf(cause);
+    this.startErrorText = startErrorText ?? (cause instanceof Error ? cause.message : undefined);
   }
 }
 
@@ -712,7 +759,11 @@ function toolStuckThresholdMs(): number {
  * starts streaming, so their start includes the model's first token, and a
  * slow model or proxy (109 s seen, #proj-runtime:#52) is not a failed start:
  * OpenCode (`step_start`, every turn), Grok (its session and progress events
- * do not count, first start only) and Antigravity (its first model line).
+ * do not count, first start only) and Antigravity on the OAR host (its
+ * readiness is the first runtime event after the turn starts: model output).
+ * The legacy Antigravity driver is ready at agy's stream-json `init` (seconds),
+ * but keeps the runtime's value: the start fence is set at dispatch, before
+ * the host is chosen, and an OAR start that fails falls back to that driver.
  */
 export function runtimeStartTimeoutMs(runtime: string): number {
   return readNonNegativeIntegerEnv(
@@ -771,7 +822,14 @@ function runtimeTier(runtime: string): string {
 export { resolveRuntimeSessionRef };
 export type { ResolveRuntimeSessionRefOptions };
 export { classifySpawnFailure } from "./spawnFailureClassification";
-import { classifySpawnFailure, startFailureActivity, startTimeoutClassification, type SpawnFailureClassification, type StartFailureActivity } from "./spawnFailureClassification";
+import {
+  classifyRuntimeStartupConfigFailure,
+  classifySpawnFailure,
+  startFailureActivity,
+  startTimeoutClassification,
+  type SpawnFailureClassification,
+  type StartFailureActivity,
+} from "./spawnFailureClassification";
 import { RuntimeExecutableNotFoundError, RuntimeSessionNeedsResetError, spawnFailureCodeOf, type SpawnFailureReason } from "./spawnFailureErrors";
 import { agentEnvVarsRefusal } from "./agentEnvVarPolicy";
 export type { SpawnFailureClassification, SpawnFailureReason } from "./spawnFailureClassification";
@@ -843,6 +901,7 @@ const MODEL_FIRST_TOKEN_START_TIMEOUT_MS = 10 * 60_000;
 const RUNTIME_START_TIMEOUT_DEFAULT_MS: Readonly<Record<string, number>> = {
   opencode: MODEL_FIRST_TOKEN_START_TIMEOUT_MS,
   grok: MODEL_FIRST_TOKEN_START_TIMEOUT_MS,
+  // For its OAR host (see runtimeStartTimeoutMs); the legacy driver is ready at agy's `init`.
   antigravity: MODEL_FIRST_TOKEN_START_TIMEOUT_MS,
 };
 /**
@@ -1099,6 +1158,13 @@ interface AgentProcess {
    * counts, reported once on the first turn end (`agent:turn:ended`).
    */
   startupUnreadShown: readonly string[];
+  /**
+   * #wg-ax:#3: prior session id retired by wake-recycle on this start, held
+   * until startup readiness (`markRuntimeStartupReady`). While set, the new
+   * session is not reported to the server and any start failure/exit before
+   * readiness falls back to resuming this prior session without re-recycling.
+   */
+  recycledFromSessionId: string | null;
   /** `agent:turn:ended` was sent for this process (at most once). */
   turnEndedReported: boolean;
   /** RFC 071: `agent:process_spawned` was sent for this process (at most once). */
@@ -1117,6 +1183,14 @@ interface AgentProcess {
    * Absent: nothing yet.
    */
   credentialInvalidVisibility?: CredentialInvalidVisibility | null;
+  /**
+   * #proj-runtime:#66: the used-up-quota error this process showed (its
+   * detail, with the reported reset, and its runtime-error diagnostic). While
+   * the credential's limit holds the process (`providerLimitHeldStatus`), its
+   * status is this frame; an agent held without an error of its own shows the
+   * fixed text built from the limit record. Absent or null: none.
+   */
+  providerLimitErrorActivity?: ProviderLimitErrorActivity | null;
   /**
    * Decision-only view of error signals, bounded by runtime liveness. Recovery /
    * RESTART classifiers read through this window so a stale error from a turn
@@ -1150,6 +1224,12 @@ interface AgentProcess {
    * after the SIGTERM still wakes the agent (isNotifiedDeferralAtColdIdleStop).
    */
   coldIdleStopToldMark?: number;
+  /**
+   * The wake-up notice's rows ask (inboxRowsAsk.ts): deliveries that arrived
+   * while the agent was idle and wait, still idle, for the Server's answer or
+   * the hold's one timer. Null when nothing is held.
+   */
+  pendingIdleInboxHold: IdleInboxHold | null;
   /**
    * Reconciler step 6: the server features this process's session runs with
    * (what it spawned on; a running session never re-reads them). Its config
@@ -1186,9 +1266,31 @@ interface AgentProcess {
    * catch-up, wake with thread context, full-body stdin), reported as
    * `agent:model-seen` on the first model-driven event of this process after
    * the input. Dropped with the process if it ends first: the next start's
-   * catch-up sends them again (a duplicate rather than a loss).
+   * catch-up sends them again (a duplicate rather than a loss). An entry is
+   * dropped, not reported, when the runtime rejects the kind of write that
+   * carried it or the process moves to another session before any model
+   * event (dropPendingModelSeen).
    */
-  pendingModelSeen?: AgentMessage[];
+  pendingModelSeen?: PendingModelSeenEntry[];
+  /**
+   * Focus: bodies written into a turn already in flight. Such a write has no
+   * accept signal on this host (a runtime queues it, or rejects it later), so
+   * the message stays in `inbox`, told to this session (it is not written
+   * again and no later notice lists it), and is neither consumed nor
+   * reported until it is confirmed (confirmFocusBodies). A tracked mention
+   * is acknowledged at the turn end, as one told by a notice is.
+   */
+  unconfirmedFocusBodies?: UnconfirmedFocusBody[];
+  /** The short wait after a turn end before its unconfirmed bodies are confirmed (a late steer rejection cancels it). */
+  focusBodyConfirmTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * Focus: bodies the runtime rejected in the turn in flight. Until that turn
+   * ends they are not written in full again (a runtime that takes busy input
+   * directly is told its debt again on every model event, and would be
+   * steered the same body at event rate); a notice may still list them, as
+   * it lists any queued message.
+   */
+  focusBodiesRejectedInTurn?: Set<AgentMessage>;
   gatedSteering: ApmGatedSteeringDecisionState;
 }
 
@@ -1246,7 +1348,7 @@ const CREDENTIAL_INVALID_CLOSED_HOLD_MS = 60 * 60_000;
 const REVOKED_RUNNER_CREDENTIAL_IDS_KEPT = 4096;
 
 function stripManagedRunnerCredential(config: AgentConfig): AgentConfig {
-  const { agentCredentialKey: _agentCredentialKey, agentCredentialId: _agentCredentialId, ...rest } = config;
+  const { agentCredentialKey: _agentCredentialKey, agentCredentialId: _agentCredentialId, agentCredentialExpiresAt: _agentCredentialExpiresAt, ...rest } = config;
   return rest;
 }
 
@@ -1521,7 +1623,6 @@ function classifyTerminalFailure(ap: AgentProcess): RuntimeErrorDeliveryFailure 
       lower.includes("model not found") ||
       lower.includes("model is not supported") ||
       lower.includes("unsupported model") ||
-      lower.includes("codex_zero_evidence_turn_completed") ||
       /\bmodel\b.*\bnot supported\b/i.test(text) ||
       (inputTooLarge && ap.driver.id !== "claude") ||
       isProviderStreamFailureText(text) ||
@@ -1562,11 +1663,6 @@ function classifyStickyFailure(ap: AgentProcess): StickyFailure | null {
   if (terminalFailure.detail === formatRuntimeInputTooLargeMessage(ap.driver.id)) return { ...terminalFailure, kind: "input_too_large" };
   if (/\b(?:model\b.*\bnot supported|unsupported\b.*\bmodel)\b/i.test(terminalFailure.detail)) return { ...terminalFailure, kind: "model_unsupported" };
   return null;
-}
-
-/** The Codex runtime completed a turn with no output, progress or token usage (C10). */
-function isCodexZeroEvidenceTurnText(text: string): boolean {
-  return /\bcodex_zero_evidence_turn_completed\b/i.test(text);
 }
 
 function formatRuntimeActionRequiredMessage(ap: AgentProcess, sourceText?: string | null): string {
@@ -1700,22 +1796,6 @@ function runtimeFailureEndTraceAttrs(ap: AgentProcess, unmatched: "runtime_start
   return { runtime_exit_reason: reason, stderr_present: ap.recentStderr.length > 0, stderr_lines_count: ap.recentStderr.length };
 }
 
-function isCodexProviderReconnectLog(text: string): boolean {
-  return /Reconnecting\.\.\.\s*\d+\s*\/\s*\d+/i.test(text);
-}
-
-/**
- * task #1127 — English fallback shown when the web has no catalog copy for
- * `model_tool_args_invalid` (older web, or a surface that renders the daemon
- * detail directly). The web substitutes its own en/zh string by reason.
- */
-const CODEX_TOOL_ARGUMENT_PARSE_USER_MESSAGE =
-  "The model produced tool-call arguments Codex could not parse, so the tool call was rejected — try a different model";
-
-function isCodexBenignTransportLog(text: string): boolean {
-  return /Falling back from WebSockets/i.test(text);
-}
-
 function isStdinClassRecoveryLine(text: string): boolean {
   return /write_stdin failed|stdin is closed|closed for this session|session.*closed/i.test(text);
 }
@@ -1818,6 +1898,8 @@ function buildRuntimeInputTraceAttrs(opts: {
   resumePrompt?: string;
   messages?: AgentMessage[];
   unreadSummary?: Record<string, number>;
+  /** How many open tasks the input names (StartupInputPlan.openTasksShown). */
+  openTasksShown?: number;
   sessionIdPresent: boolean;
   nativeStandingPrompt: boolean;
   /** The standing prompt text rides in this input (fresh session without a native layer, or a task #13 re-delivery). */
@@ -1839,6 +1921,7 @@ function buildRuntimeInputTraceAttrs(opts: {
     // Source-side too: the notice rode in this input.
     runtime_input_server_features_notice_present: opts.serverFeaturesNoticeInInput === true,
     runtime_input_unread_channels_count: opts.unreadSummary ? Object.keys(opts.unreadSummary).length : 0,
+    runtime_input_open_tasks_count: opts.openTasksShown ?? 0,
     ...attentionHintInputTraceAttrs(opts.messages),
     ...summarizeMessageInputBytes(opts.messages),
   };
@@ -1854,6 +1937,27 @@ function attentionHintInputTraceAttrs(messages?: AgentMessage[]): Record<string,
     runtime_input_attention_hint_count: hints.length,
     runtime_input_attention_hint_triggers: triggers,
   };
+}
+
+/** #proj-runtime:#66: a used-up-quota error frame as it was shown (`AgentProcess.providerLimitErrorActivity`). */
+interface ProviderLimitErrorActivity {
+  detail: string;
+  runtimeError: RuntimeErrorActivityDiagnostic;
+}
+
+/**
+ * Idle deliveries held for the rows ask. The messages stay in the inbox; one
+ * timer runs from the first arrival and later arrivals do not move it.
+ */
+interface IdleInboxHold {
+  /** The session the deliveries were held for: they are never written to another. */
+  sessionId: string;
+  messages: AgentMessage[];
+  /** Tracked mentions among them, each with the held message it is for; settled only when the write tells that message. */
+  tracked: Array<{ message: AgentMessage; context: DeliveryTraceContext }>;
+  timer: ReturnType<typeof setTimeout>;
+  /** The ask the hold waits for (the latest one a held message started or joined). */
+  waiting: Promise<void> | null;
 }
 
 interface DeliveryTraceContext {
@@ -1996,6 +2100,10 @@ export class AgentProcessManager {
   private serverReadsTurnEnded = false;
   /** SERVER_CAPABILITY_STICKY_FAILURE_REASONS_V1 on the current connection's `machine:context` (reconciler step 12). */
   private serverCountsStickyReasons = false;
+  /** SERVER_CAPABILITY_INBOX_ROWS_V1 on the current connection's `machine:context`. */
+  private serverAnswersInboxRows = false;
+  /** The wake-up notice's rows ask, per agent session (inboxRowsAsk.ts). */
+  private readonly inboxRows: InboxRowsAsk;
   /**
    * Server features: what each agent's session last ran with before they
    * changed, until its next spawn tells it what changed (formatServerFeaturesNotice).
@@ -2054,6 +2162,15 @@ export class AgentProcessManager {
    */
   private readonly startCatchupBatches = new Map<string, { launchId: string; batchId: string }>();
   /**
+   * The open tasks the agent's last spawn carried (`agent:start` `openTasks`).
+   * A restart the daemon makes on its own (after a recoverable runtime error,
+   * or when a spawn-fail cooldown ends) resumes the same session with no server
+   * start, so it carries these forward instead of falling back to the empty
+   * resume. Every spawn overwrites or clears the slot, so a later start that
+   * named none (a wake, an older Server) leaves nothing stale to repeat.
+   */
+  private readonly lastSpawnOpenTasks = new Map<string, AgentStartOpenTasks>();
+  /**
    * RFC 071: launches accepted from server starts that have no final result
    * yet, in acceptance order. A spawn settles every launch waiting here
    * (folded starts become `supersededLaunchIds`); a spawn that fails or is
@@ -2068,6 +2185,12 @@ export class AgentProcessManager {
   private standingPromptLedger: StandingPromptLedger;
   /** task #10: consecutive terminal compaction failures per Pi / Built-in session, on disk. */
   private compactionFailureLedger: SessionCompactionFailureLedger;
+  /** #proj-runtime:#80: last committed `(runtime, sessionId)` per agent on disk; shared with OAR host (core.ts). */
+  readonly lastSessions: LastSessionStore;
+  /** #proj-runtime:#80: one-shot note when an explicit config change interrupts an active turn; shared with OAR host (core.ts). */
+  readonly interruptedTurns: InterruptedTurnStore;
+  /** #proj-runtime:#80: reads/clears OAR session summaries on fresh starts and full workspace resets. */
+  private readonly sessionSummaries: SessionSummaryStore;
   private runtimeSessionHomeDir: string;
   /** Reconciler step 15: the account an agent's runtime signs in as (credentialSource.ts). */
   private readonly readCredentialAccount: CredentialAccountReader;
@@ -2111,11 +2234,14 @@ export class AgentProcessManager {
   private readonly backgroundTaskChecks = new Set<string>();
   /** RFC 070 §6.5: sessions marked for a warm recycle, and the stops the next start decides on (wakeRecycleWarm.ts). */
   private readonly warmRecycle = new WarmRecycleMarks();
+  /** #wg-ax:#3: prior sessions whose recycled replacement failed before startup readiness (shared with OarAgentHost). */
+  readonly wakeRecycleFailures = new WakeRecycleFailureMemory(() => this.clockNow());
   /** The cold-idle transcript read in flight per agent (reconcileColdIdle): at most one. */
   private readonly coldIdleChecks = new Map<string, Promise<ColdIdleOutcome>>();
   private readonly readSessionResumeFacts: SessionResumeFactsReader;
   private frozenClockMs: number | null = null;
   private driverResolver: (runtimeId: string) => RuntimeDriver;
+  private readonly oarSkills: OarSkillCatalog | null;
   private defaultAgentEnvVarsProvider: ((config: Pick<AgentConfig, "runtime" | "model" | "envVars">) => Promise<Record<string, string> | null> | Record<string, string> | null) | null;
   private tracer: Tracer;
   private stdinNotificationRetryMs: number;
@@ -2204,6 +2330,8 @@ export class AgentProcessManager {
   /** The last session each agent had on another host, past its end: View Context reads it as it reads a restart snapshot. */
   private readonly lastHostedSessions = new Map<string, HostedAgentSession>();
   private readonly serverConnected: () => boolean;
+  /** The server this daemon serves (core's authenticated machine context), or null when not known. */
+  private readonly connectedServerId: () => string | null;
   readonly #appInboxForAgent: ((agentId: string) => AgentAppInboxStore) | null;
   readonly #onAgentWorkingToIdle: ((agentId: string) => void) | null;
   readonly #onRuntimeAbsentLocalStop: ((runtime: string) => void) | null;
@@ -2211,6 +2339,7 @@ export class AgentProcessManager {
   readonly #reportThirdPartyEventsDelivered: (agentId: string, eventIds: readonly string[]) => void;
   /** The runtime CLI version the daemon last detected, by runtime id. */
   readonly #detectedRuntimeCliVersion: (runtimeId: string) => string | undefined;
+  readonly #cachedRuntimeModels: (runtimeId: string) => RuntimeModelSet | null;
   /** Per agent: the app items it was told of, by item id, each with its createdAtMs then (appInboxItemNoticed). */
   private readonly appInboxNoticedItemIds = new Map<string, Map<string, number | undefined>>();
   /**
@@ -2233,8 +2362,11 @@ export class AgentProcessManager {
    * One wait per agent: if item B fails busy while A's wait is open, B's
    * failure counts as an attempt of A's wait, and B's own wait starts only
    * after A's ends, so B's reported wait leaves out the time before that.
+   * `wakes`: one of its notices may start a stopped agent; such a wait is
+   * queued work for reconciler step 9 (appInboxNoticeWaiting): a turn that
+   * stays silent with it is stalled, and the replacement is woken for it.
    */
-  private readonly appInboxBusyDeferrals = new Map<string, { itemId: string; firstAtMs: number; attempts: number }>();
+  private readonly appInboxBusyDeferrals = new Map<string, { itemId: string; firstAtMs: number; attempts: number; wakes: boolean }>();
   private readonly appInboxIdleDrains = new Set<string>();
   // After a runtime rejects a turn/start as busy, the idle drain waits one
   // retry interval instead of re-offering at once: the rejection marks the
@@ -2290,6 +2422,10 @@ export class AgentProcessManager {
         failPointForTesting?: (args: { agentId: string; message: string }) => RuntimeErrorDeliveryBackoffFailPoint | null | undefined;
       };
       runtimeSessionHomeDir?: string;
+      /** The wake-up notice's rows ask as the agent (agentCredentialProxy.fetchAgentApiAsAgent); tests fake it. */
+      inboxRowsFetchAsAgent?: InboxRowsFetchAsAgent;
+      /** Skills from OAR's inventory (runtimeSkills/oarSkills.ts); unset: the folder scan only (tests). */
+      oarSkills?: OarSkillCatalog | null;
       /** Reconciler step 15: reads the account an agent's runtime signs in as; tests fake it. */
       credentialAccountReader?: CredentialAccountReader;
       runtimeStartScheduler?: {
@@ -2317,6 +2453,8 @@ export class AgentProcessManager {
       reportThirdPartyEventsDelivered?: (agentId: string, eventIds: readonly string[]) => void;
       /** The runtime CLI version the daemon last detected (its `ready.runtimeVersions`). */
       detectedRuntimeCliVersion?: (runtimeId: string) => string | undefined;
+      /** The model list the Computer last detected for a runtime (RuntimeModelSourceCache.peek). */
+      cachedRuntimeModels?: (runtimeId: string) => RuntimeModelSet | null;
       /** RFC 071 outbox: every spawn and rebind first durably records the process as open. */
       runtimeProcessGate?: RuntimeProcessGate;
       /** The silent background task check's process tree read (backgroundTaskHealth.ts); tests fake it. */
@@ -2348,12 +2486,17 @@ export class AgentProcessManager {
     this.#onRuntimeAbsentLocalStop = opts.onRuntimeAbsentLocalStop ?? null;
     this.#reportThirdPartyEventsDelivered = opts.reportThirdPartyEventsDelivered ?? reportThirdPartyEventsDelivered;
     this.#detectedRuntimeCliVersion = opts.detectedRuntimeCliVersion ?? (() => undefined);
+    this.#cachedRuntimeModels = opts.cachedRuntimeModels ?? (() => null);
     this.dataDir = opts.dataDir || resolveRaftHomePath("agents", this.slockHome);
     this.standingPromptLedger = new StandingPromptLedger(this.dataDir, () => this.clockNow());
     this.compactionFailureLedger = new SessionCompactionFailureLedger(this.dataDir);
+    this.lastSessions = new LastSessionStore(this.dataDir, () => this.clockNow());
+    this.interruptedTurns = new InterruptedTurnStore(this.dataDir, () => this.clockNow());
+    this.sessionSummaries = new SessionSummaryStore(sessionSummaryDir(this.slockHome));
     this.runtimeSessionHomeDir = opts.runtimeSessionHomeDir || os.homedir();
     this.readCredentialAccount = opts.credentialAccountReader ?? createCredentialAccountReader(ambientProcessEnv);
     this.driverResolver = opts.driverResolver || getDriver;
+    this.oarSkills = opts.oarSkills ?? null;
     this.defaultAgentEnvVarsProvider = opts.defaultAgentEnvVarsProvider || null;
     this.tracer = opts.tracer ?? noopTracer;
     this.daemonVersion = opts.daemonVersion?.trim() || null;
@@ -2364,9 +2507,15 @@ export class AgentProcessManager {
     this.computerVersion = opts.computerVersion?.trim() || null;
     this.workerUrl = opts.workerUrl?.trim() || null;
     this.fetchImpl = opts.fetchImpl ?? (daemonFetch as FetchLike);
+    this.inboxRows = new InboxRowsAsk({
+      host: "legacy",
+      fetchAsAgent: opts.inboxRowsFetchAsAgent ?? fetchAgentApiAsAgent,
+      recordEvent: (name, attrs, status, parentTraceparent) => this.recordDaemonEvent(name, attrs, status, parentTraceparent),
+    });
+    this.connectedServerId = opts.connectedServerId ?? (() => null);
     this.contextView = new AgentContextViewService({
       raftHome: this.slockHome,
-      connectedServerId: opts.connectedServerId ?? (() => null),
+      connectedServerId: () => this.connectedServerId(),
       serverUrl: this.serverUrl,
       apiKey: daemonApiKey,
       fetchImpl: (url, init) => this.fetchImpl(url.toString(), init),
@@ -2508,7 +2657,15 @@ export class AgentProcessManager {
       }
       if (removed === 0) return;
       if (this.mainTurnIsQuiet(ap)) this.broadcastQuietTurnStatus(agentId, ap);
-      if (ap.backgroundTasks.size === 0) this.reconcile(agentId, ap, "background_tasks_done");
+      if (ap.backgroundTasks.size === 0) {
+        const { specDrift, cold } = this.reconcileProcess(agentId, ap, "background_tasks_done");
+        if (specDrift) return;
+        if (cold.kind === "checking") {
+          const outcome = await cold.outcome;
+          if (outcome === "stopped" || outcome === "spec_drift") return;
+        }
+        this.maybeRunPostIdleMaintenance(agentId, ap);
+      }
     }));
   }
 
@@ -2916,7 +3073,7 @@ export class AgentProcessManager {
         launchId: restartSnapshot.launchId || undefined,
         pending_count: this.startingInboxes.count(agentId),
       });
-      this.startAgent(agentId, restartSnapshot.config, undefined, undefined, undefined, restartSnapshot.launchId || undefined).then(
+      this.startAgent(agentId, restartSnapshot.config, undefined, undefined, undefined, restartSnapshot.launchId || undefined, false, undefined, undefined, null, undefined, null, null, this.lastSpawnOpenTasks.get(agentId)).then(
         () => this.resetSpawnFailBackoff(agentId),
         (err) => {
           logger.error(`[Agent ${agentId}] Failed to start from pending inbox after spawn-fail cooldown`, err);
@@ -2949,10 +3106,11 @@ export class AgentProcessManager {
     attempts: number,
     delayMs: number,
   ): void {
-    const nextConfig = this.buildRestartSafeConfig(ap.config, ap.sessionId);
+    const retrySessionId = this.sessionIdAfterExit(ap);
+    const nextConfig = this.buildRestartSafeConfig(ap.config, retrySessionId);
     const cached = {
       config: nextConfig,
-      sessionId: ap.sessionId,
+      sessionId: retrySessionId,
       launchId: ap.launchId,
       processInstanceId: ap.processInstanceId,
     };
@@ -2991,7 +3149,8 @@ export class AgentProcessManager {
       if (!restartSnapshot) return;
       this.lifecycleRecords.deleteRestartSnapshot(agentId);
       this.lifecycleRecords.setPendingSpawnCause(agentId, "restart_crash");
-      const startPromise = this.startAgent(agentId, restartSnapshot.config, undefined, undefined, undefined, restartSnapshot.launchId || undefined);
+      // The same session again with no server start: the open tasks its last spawn carried come along.
+      const startPromise = this.startAgent(agentId, restartSnapshot.config, undefined, undefined, undefined, restartSnapshot.launchId || undefined, false, undefined, undefined, null, undefined, null, null, this.lastSpawnOpenTasks.get(agentId));
       startPromise.catch((err) => {
         logger.error(`[Agent ${agentId}] Failed to restart after recoverable runtime error`, err);
         this.lifecycleRecords.setRestartSnapshot(agentId, restartSnapshot);
@@ -3052,7 +3211,7 @@ export class AgentProcessManager {
     const timer = setTimeout(() => this.onSpawnFailBackoffExpired(agentId), Math.max(1, delayMs));
     timer.unref?.();
     this.lifecycleRecords.activeSpawnFailBackoffs.set(agentId, { kind: "backing_off", attempts: 1, reason, untilMs, timer });
-    this.enterSpawnFailCooldownResidency(agentId, { config: this.buildRestartSafeConfig(ap.config, ap.sessionId), launchId: ap.launchId }, untilMs, "recoverable_runtime_error_process_close", reason);
+    this.enterSpawnFailCooldownResidency(agentId, { config: this.buildRestartSafeConfig(ap.config, this.sessionIdAfterExit(ap)), launchId: ap.launchId }, untilMs, "recoverable_runtime_error_process_close", reason);
     this.recordDaemonEvent("daemon.agent.runtime_error_process_restart.scheduled", {
       agentId,
       runtime: ap.config.runtime,
@@ -3226,6 +3385,9 @@ export class AgentProcessManager {
 
   /** Reconciler step 10a: what the close path does with `planExit`'s plan. */
   private actOnExitPlan(agentId: string, ap: AgentProcess, plan: ExitPlan, exit: ExitActionContext): void {
+    if (ap.recycledFromSessionId && plan.kind !== "stopped") {
+      this.recordFailedWakeRecycleStart(agentId, ap.recycledFromSessionId, ap.config.runtime ?? "claude", plan.kind, ap.launchId);
+    }
     const closeBeforeTurnBoundary = !exit.turnBoundarySatisfied;
     const crashActivity = buildClaudeStartupCrashActivity(ap, closeBeforeTurnBoundary, summarizeCrash(exit.finalCode, exit.finalSignal), exit.finalCode);
     const crashRuntimeError = () => buildClaudeStartupCrashRuntimeError(ap, closeBeforeTurnBoundary, exit.finalCode);
@@ -3367,7 +3529,10 @@ export class AgentProcessManager {
     if (queuedWakeMessage && plan.hold === "provider_limit") {
       this.holdDeliveriesForProviderLimitBackoff(agentId, ap, pending, "clean_exit_provider_limit_backoff");
       logger.info(`[Agent ${agentId}] Turn completed; queued message held until the provider-limit backoff ends`);
-      this.broadcastActivity(agentId, "online", "Process idle", [], undefined, "idle");
+      // #proj-runtime:#66: its queued message waits for a used-up quota: that is the status, not idle.
+      const heldLimit = this.providerLimitHeldStatusFor(agentId, ap.config, ap.providerLimitErrorActivity);
+      if (heldLimit) this.broadcastProviderLimitHeldStatus(agentId, heldLimit);
+      else this.broadcastActivity(agentId, "online", "Process idle", [], undefined, "idle");
       this.notifyAgentWorkingToIdle(agentId);
       return;
     }
@@ -3593,37 +3758,6 @@ export class AgentProcessManager {
     );
   }
 
-  /**
-   * Reconciler step 12 (row C10): a Codex turn that completed having done
-   * nothing is not sticky any more. It counts like a crash (D6) into the
-   * streaks `planExit` reads; the process stays, and the delivery backoff
-   * holds the next delivery. True at CRASH_STREAK_CAP in a row (model output
-   * ends the streak), when the agent goes to the server
-   * (`handCodexZeroEvidenceStreakToServer`).
-   */
-  private noteCodexZeroEvidenceTurn(agentId: string, ap: AgentProcess): boolean {
-    const crashStreak = this.lifecycleRecords.getRuntimeErrorCloseStreak(agentId) + 1;
-    const capStreak = this.lifecycleRecords.getCrashCapStreak(agentId) + 1;
-    this.lifecycleRecords.setRuntimeErrorCloseStreak(agentId, crashStreak, capStreak);
-    const capped = crashStreakExhausted(capStreak);
-    this.recordDaemonEvent("daemon.agent.zero_evidence_turn.counted", {
-      agentId,
-      launchId: ap.launchId || undefined,
-      runtime: ap.config.runtime,
-      crash_streak: crashStreak,
-      cap_streak: capStreak,
-      hand_to_server: capped || undefined,
-    }, "error");
-    return capped;
-  }
-
-  /** C10 at the cap: as `handCrashStreakToServer`, for a process that is still running. */
-  private handCodexZeroEvidenceStreakToServer(agentId: string, ap: AgentProcess): void {
-    const detail = formatZeroEvidenceStreakMessage(runtimeDisplayName(ap.driver.id), this.lifecycleRecords.getCrashCapStreak(agentId));
-    this.releaseFailedProcess(agentId, ap, detail, terminalFailureFromRawText("sticky_runtime_error", ap.lastRuntimeError || detail));
-    this.handStickyFailureToServer(agentId, ap, { reason: "runtime_repeated_failure", detail, cause: "zero_evidence_turn" });
-  }
-
   private resetRuntimeErrorCloseStreak(agentId: string, resetSource: string, ap?: AgentProcess): void {
     const attempts = this.lifecycleRecords.getRuntimeErrorCloseStreak(agentId);
     if (!this.lifecycleRecords.deleteRuntimeErrorCloseStreak(agentId)) return;
@@ -3699,6 +3833,13 @@ export class AgentProcessManager {
    * the latest error frame still says what the user must do.
    */
   private broadcastRuntimeErrorAtTurnEnd(agentId: string, ap: AgentProcess, message: string): void {
+    // #proj-runtime:#66: a used-up quota keeps the frame it was shown with
+    // (its reported reset and diagnostic), not the raw text re-derived.
+    const heldLimit = this.providerLimitHeldStatus(agentId, ap);
+    if (heldLimit) {
+      this.broadcastProviderLimitHeldStatus(agentId, heldLimit);
+      return;
+    }
     const credentialInvalid = credentialInvalidReasonOf(message);
     if (!credentialInvalid) {
       this.broadcastActivity(agentId, "error", this.formatVisibleRuntimeErrorMessage(ap, message), [], undefined, "runtime_error");
@@ -4093,7 +4234,9 @@ export class AgentProcessManager {
    * idle with dozens of them, so treating them as work kept the cold-idle stop
    * from ever firing. */
   private hasUntoldInboxWork(ap: AgentProcess): boolean {
-    return ap.notifications.pendingCount > 0
+    // A delivery held for the rows ask is about to start a turn: the agent is not quiet.
+    return ap.pendingIdleInboxHold !== null
+      || ap.notifications.pendingCount > 0
       || ap.notifications.filterUncontributedMessages(ap.inbox, ap.sessionId).length > 0;
   }
 
@@ -4547,17 +4690,30 @@ export class AgentProcessManager {
     // Gone, or already being stopped: its successor spawns from the updated config.
     if (this.agents.get(agentId) !== ap || ap.exit.kind !== "live" || ap.gatedSteering.expectedTerminationReason !== null) return true;
     if (runtimeChanged) {
-      this.stopForSpecDrift(agentId, ap, drift.includes("runtime") ? drift : ["runtime", ...drift], trigger);
+      const effectiveDrift = drift.includes("runtime") ? drift : (["runtime", ...drift] as RuntimeSpecDriftKind[]);
+      const foregroundBusy = ap.driver.lifecycle.kind === "per_turn"
+        || this.agentNotIdle(agentId, ap, { ignoreBackgroundTasks: true, ignoreUntoldInbox: true }) !== null;
+      if (foregroundBusy) this.interruptedTurns.write(agentId, effectiveDrift);
+      this.stopForSpecDrift(agentId, ap, effectiveDrift, trigger, undefined, foregroundBusy);
       return true;
     }
     // Reconciler step 15: deliveries held for the old account wait for the
     // new process (the stop's close starts it on them), not for this one. The
-    // same when the drift drops the session (another runtime, or a Codex
-    // model): this session would never tell them, and a delivery held for the
+    // same when the drift drops the session (another runtime, or a model
+    // switch): this session would never tell them, and a delivery held for the
     // old runtime's usage limit made a switch away from it wait for that limit
     // to reset (#triage:#263).
     const nextSessionTakesInbox = drift.includes("credential_account") || sessionDropReason(ap.startedSpec, runtimeSpecOf(ap.config)) !== null;
-    const idleOptions = nextSessionTakesInbox ? { ignoreUntoldInbox: true } : {};
+    // #proj-runtime:#80: non-interrupting pushes (rebind, reconnect resend,
+    // older servers) remain idle-safe for the foreground turn while ignoring
+    // background tasks for explicit agent config drift. Immediate mid-turn
+    // interrupts arrive via `agent:config` `{ interrupt: true }` paired with
+    // server `resetAgent` (`applyConfigToProcess`).
+    const hasAgentConfigDrift = drift.some((kind) => kind !== "features" && kind !== "credential_account");
+    const idleOptions: AgentIdleOptions = {
+      ...(hasAgentConfigDrift ? { ignoreBackgroundTasks: true } : {}),
+      ...(nextSessionTakesInbox ? { ignoreUntoldInbox: true } : {}),
+    };
     if (this.observeIdleHold(agentId, ap, "spec_restart", this.agentNotIdle(agentId, ap, idleOptions)) !== null) return true;
     this.stopForSpecDrift(agentId, ap, drift, trigger);
     return true;
@@ -4578,8 +4734,17 @@ export class AgentProcessManager {
   private reconcileColdIdle(agentId: string, ap: AgentProcess, trigger: RuntimeSpecReconcileTrigger): ColdIdleStep {
     if (this.agents.get(agentId) !== ap || ap.exit.kind !== "live") return { kind: "skipped", reason: "not_idle" };
     if (ap.gatedSteering.expectedTerminationReason !== null) return { kind: "skipped", reason: "stopping" };
-    const gate = this.coldIdleGateFor(ap);
+    const gate = this.coldIdleGateFor(agentId, ap);
     if (!gate.pass) {
+      if (gate.reason === "prior_recycle_start_failed" && this.wakeRecycleFailures.noteYield(agentId, ap.sessionId ?? ap.config.sessionId, "cold_idle")) {
+        this.recordDaemonEvent("daemon.agent.wake_recycle.yielded", {
+          agentId,
+          runtime: ap.config.runtime ?? "claude",
+          gate: "cold_idle",
+          reason: "prior_recycle_start_failed",
+          host: "legacy",
+        });
+      }
       this.idleHolds.forget(agentId, "cold_idle");
       return { kind: "skipped", reason: gate.reason };
     }
@@ -4598,7 +4763,7 @@ export class AgentProcessManager {
     return { kind: "checking", outcome };
   }
 
-  private coldIdleGateFor(ap: AgentProcess) {
+  private coldIdleGateFor(agentId: string, ap: AgentProcess) {
     return coldIdleGate({
       config: ap.config,
       liveSessionId: ap.sessionId,
@@ -4606,6 +4771,7 @@ export class AgentProcessManager {
       // The version this process runs (its launch's, else the last detected,
       // latched), read only for a runtime with a floor.
       runtimeCliVersion: COLD_IDLE_RUNTIME_VERSION_FLOORS[ap.config.runtime ?? "claude"] ? this.runtimeCliVersionOf(ap) : undefined,
+      priorRecycleFailed: this.wakeRecycleFailures.hasFailed(agentId, ap.sessionId ?? ap.config.sessionId),
       nowMs: this.clockNow(),
     });
   }
@@ -4616,7 +4782,7 @@ export class AgentProcessManager {
     // Decided again from scratch: the read took time.
     if (this.agents.get(agentId) !== ap || ap.exit.kind !== "live") return "not_idle";
     if (ap.gatedSteering.expectedTerminationReason !== null) return "stopping";
-    const gate = this.coldIdleGateFor(ap);
+    const gate = this.coldIdleGateFor(agentId, ap);
     if (!gate.pass) return gate.reason;
     if (gate.sessionId !== sessionId) return "session_changed";
     if (this.observeIdleHold(agentId, ap, "cold_idle", this.agentNotIdle(agentId, ap)) !== null) return "not_idle";
@@ -4678,7 +4844,10 @@ export class AgentProcessManager {
    * config's runtime (or Codex model) is not the one its session started on.
    */
   private sessionIdAfterExit(ap: AgentProcess): string | null {
-    return sessionDropReason(ap.startedSpec, runtimeSpecOf(ap.config)) ? null : ap.sessionId;
+    if (sessionDropReason(ap.startedSpec, runtimeSpecOf(ap.config))) return null;
+    // #wg-ax:#3: keep the prior session if a wake-recycled start never became ready.
+    if (ap.recycledFromSessionId) return ap.recycledFromSessionId;
+    return ap.sessionId;
   }
 
   private stopForSpecDrift(
@@ -4688,6 +4857,8 @@ export class AgentProcessManager {
     trigger: RuntimeSpecReconcileTrigger,
     /** The cold-idle read that found the session cold, when the drift was found after it (reconcileColdIdle). */
     cold?: Extract<ColdIdleVerdict, { cold: true }>,
+    /** #proj-runtime:#80: true when an explicit config change interrupted an active foreground turn. */
+    interruptedTurn?: boolean,
   ): void {
     const featureKeys = drift.includes("features") ? changedAgentServerFeatureKeys(ap.sessionServerFeatures, pickAgentServerFeatures(ap.config)) : [];
     // The next spawn says what changed, also after a rebind that set no base.
@@ -4700,9 +4871,10 @@ export class AgentProcessManager {
       ...(featureKeys.length > 0 ? { changed_keys: featureKeys.join(",") } : {}),
       new_session: this.sessionIdAfterExit(ap) === null && ap.sessionId !== null,
       ...(this.specStopHandsBackToServer(ap) ? { hand_to_server: true } : {}),
+      ...(interruptedTurn ? { interrupted_turn: true } : {}),
       trigger,
       host: "legacy",
-      ...this.specStopColdAttrs(ap, cold),
+      ...this.specStopColdAttrs(agentId, ap, cold),
     });
     if (this.specStopHandsBackToServer(ap)) {
       // Reconciler step 11 (decision 1): another runtime or host. Released at
@@ -4718,7 +4890,7 @@ export class AgentProcessManager {
       void this.stopAgent(agentId, { silent: true });
       return;
     }
-    logger.info(`[Agent ${agentId}] Stopping idle runtime for a new runtime spec (${drift.join(", ")}; session ${ap.sessionId ?? "none"}, ${trigger}); next wake starts on it`);
+    logger.info(`[Agent ${agentId}] ${interruptedTurn ? "Interrupting active runtime" : "Stopping idle runtime"} for a new runtime spec (${drift.join(", ")}; session ${ap.sessionId ?? "none"}, ${trigger}); next wake starts on it`);
     this.beginColdIdleRecycleStop(agentId, ap, "Runtime spec", "spec_restart");
   }
 
@@ -4729,9 +4901,9 @@ export class AgentProcessManager {
    * for the context read). Either way the next start's chooseSession reads
    * the context and decides whether the session is recycled (rule 3).
    */
-  private specStopColdAttrs(ap: AgentProcess, cold: Extract<ColdIdleVerdict, { cold: true }> | undefined): Record<string, unknown> {
+  private specStopColdAttrs(agentId: string, ap: AgentProcess, cold: Extract<ColdIdleVerdict, { cold: true }> | undefined): Record<string, unknown> {
     if (cold) return { cold: true, idle_ms: cold.idleMs, prior_context_tokens: cold.priorContextTokens };
-    const gate = this.coldIdleGateFor(ap);
+    const gate = this.coldIdleGateFor(agentId, ap);
     return gate.pass ? { cold_gap: true, idle_ms: gate.sinceEventMs } : {};
   }
 
@@ -4760,7 +4932,9 @@ export class AgentProcessManager {
         this.armQueuedInputSettle(agentId, ap);
         return;
       }
-      this.reconcile(agentId, ap, "queued_input_settled");
+      if (!this.reconcile(agentId, ap, "queued_input_settled")) {
+        this.maybeRunPostIdleMaintenance(agentId, ap);
+      }
     }, delayMs);
     ap.queuedInputSettleTimer.unref?.();
   }
@@ -4823,6 +4997,125 @@ export class AgentProcessManager {
       clearTimeout(ap.runtimeErrorDeliveryBackoff.timer);
     }
     ap.runtimeErrorDeliveryBackoff = createRuntimeErrorDeliveryBackoffState();
+    ap.providerLimitErrorActivity = null;
+  }
+
+  /**
+   * #proj-runtime:#66: the status of a live agent its credential's used-up
+   * quota holds (`providerLimitHeldStatusFor`): its live backoff is that
+   * limit's (same reason, time left), and its main turn is over. Only an agent
+   * that showed the limit error itself or has messages waiting shows it: the
+   * waiting messages run at the reset, and their output clears the error the
+   * server keeps; an idle agent with nothing waiting keeps its idle status.
+   * Null otherwise: nothing changes.
+   */
+  private providerLimitHeldStatus(agentId: string, ap: AgentProcess): ProviderLimitErrorActivity | null {
+    const backoff = ap.runtimeErrorDeliveryBackoff;
+    if (backoff.kind !== "backing_off" || this.runtimeErrorDeliveryBackoffRemainingMs(ap) <= 0 || !this.isApmIdle(ap)) return null;
+    if (!ap.providerLimitErrorActivity && ap.inbox.length === 0) return null;
+    return this.providerLimitHeldStatusFor(agentId, ap.config, ap.providerLimitErrorActivity, backoff.reason);
+  }
+
+  /**
+   * #proj-runtime:#66: what an agent shows while a used-up quota on its
+   * credential holds its messages, built from the ledger record (kind, reset,
+   * window), not from a frame: the error the agent showed itself (`own`),
+   * else the fixed text (`formatProviderLimitHeldDetail`) with a
+   * RateLimitError diagnostic, so the server keeps it typed (only model
+   * output clears it). Null when no used-up quota holds the credential (or
+   * the record is not the wait `reason` names).
+   */
+  private providerLimitHeldStatusFor(
+    agentId: string,
+    config: AgentConfig,
+    own: ProviderLimitErrorActivity | null | undefined,
+    reason?: string,
+  ): ProviderLimitErrorActivity | null {
+    if (!this.lifecycleRecords.hasProviderLimits()) return null;
+    const now = this.clockNow();
+    const record = this.lifecycleRecords.getProviderLimit(providerLimitCredentialKey(agentId, config), now);
+    if (!record || record.untilMs <= now || record.providerLimitKind !== "quota_exhausted") return null;
+    if (reason !== undefined && record.reason !== reason) return null;
+    if (own) return own;
+    const usableReset = providerLimitReportedResetInMs({ kind: record.providerLimitKind, resetsAt: record.resetsAt }, now) !== undefined;
+    const detail = formatProviderLimitHeldDetail({
+      ...(usableReset ? { resetsAt: record.resetsAt } : {}),
+      ...(record.rateLimitType ? { rateLimitType: record.rateLimitType } : {}),
+    });
+    return {
+      detail,
+      runtimeError: buildRuntimeErrorActivityDiagnostic(detail, { errorClass: "RateLimitError", reasonProvenance: "daemon_fallback", nativeReasonPresent: false }),
+    };
+  }
+
+  /** Send a provider-limit held status (the agent's own error frame, or the fixed one) as an error frame. */
+  private broadcastProviderLimitHeldStatus(agentId: string, held: ProviderLimitErrorActivity): void {
+    this.broadcastActivity(agentId, "error", held.detail, [], undefined, "runtime_error", "error", undefined, held.runtimeError);
+  }
+
+  /**
+   * #proj-runtime:#66 (Tenny's condition for waiting until a reported
+   * reset): a sign-in to another account on this Computer outside Raft (a
+   * terminal `codex login` or `claude login`) ends the wait at once. A
+   * web login already does (`noteRuntimeCredentialsChanged`). Checked when a
+   * message arrives for an agent the limit holds: the account its credential
+   * signs in as now against the one the limit was hit on. Only a known,
+   * different account counts: the same account (a token refresh, a new login
+   * to it) has the same quota, and an account that cannot be read proves
+   * nothing. A live process keeps the account it started with, so one that
+   * did is restarted on its session with its held messages
+   * (`restartForCredentialAccount`); the other agents on the credential get
+   * their held messages, or start, as at any release.
+   */
+  private releaseProviderLimitOnAccountChange(agentId: string): boolean {
+    if (!this.lifecycleRecords.hasProviderLimits()) return false;
+    const ap = this.agents.get(agentId);
+    const config = ap?.config ?? this.lifecycleRecords.getRestartSnapshot(agentId)?.config;
+    if (!config) return false;
+    const now = this.clockNow();
+    const key = providerLimitCredentialKey(agentId, config);
+    const record = this.lifecycleRecords.getProviderLimit(key, now);
+    if (!record?.account || record.untilMs <= now) return false;
+    if (credentialAccountCheck(record.account, this.credentialAccountAtStart(config)).check !== "account_changed") return false;
+    const processCheck = ap ? this.credentialAccountCheckOf(ap) : null;
+    const released = this.releaseProviderLimit(key, record, "credentials_changed", processCheck?.restart ? { exceptAgentId: agentId } : {});
+    this.recordDaemonEvent("daemon.agent.runtime_error_delivery_backoff.reset", {
+      agentId,
+      runtime: config.runtime,
+      model: config.model,
+      reason: record.reason,
+      attempts: record.attempts,
+      reset_source: "credential_account_changed",
+      release_cause: "credentials_changed",
+      credential_key_kind: providerLimitCredentialKeyKind(key),
+      provider_limit_cleared: true,
+      shared_live_backoffs_ended: released.liveBackoffsEnded,
+      shared_cooldowns_ended: released.cooldownsEnded,
+      ...(processCheck ? { account_check: processCheck.check } : {}),
+    });
+    if (ap && processCheck?.restart) this.restartForCredentialAccount(agentId, ap, processCheck.check);
+    return true;
+  }
+
+  /**
+   * #proj-runtime:#66 (Tenny's condition): a person changing the agent's
+   * runtime or model may lift the limit (a per-model limit, another
+   * provider), so the wait ends as at a person's stop
+   * (`releaseProviderLimitForExplicitStop`): the limit on the credential the
+   * agent ran on is released, for every agent on it (if it is still limited,
+   * the next request records it again). This process is left to the config
+   * change (its drift restarts it once idle); its own wait ends here.
+   */
+  private releaseProviderLimitForConfigChange(agentId: string, ap: AgentProcess, before: AgentConfig): void {
+    if (!this.lifecycleRecords.hasProviderLimits()) return;
+    const after = ap.config;
+    if ((before.runtime || "claude") === (after.runtime || "claude") && (before.model ?? "") === (after.model ?? "")) return;
+    const held = ap.runtimeErrorDeliveryBackoff.kind === "backing_off" && ap.runtimeErrorDeliveryBackoff.reason === "rate_limited";
+    this.releaseProviderLimitForPersonAction(agentId, before, "config_changed");
+    if (!held) return;
+    this.clearRuntimeErrorDeliveryBackoff(ap);
+    // As for an invalid credential a rebind ends (`replaceRunningConfig`): its held messages go now.
+    if (ap.inbox.length > 0) queueMicrotask(() => this.flushRuntimeErrorDeliveryBackoff(agentId));
   }
 
   private clearPendingTrajectoryTimer(ap: AgentProcess): void {
@@ -4875,6 +5168,12 @@ export class AgentProcessManager {
     }
     this.clearReviewWatchdog(ap);
     this.clearStallDeadline(ap);
+    // A stop or an exit ends an idle hold; its messages stay in the inbox for whatever carries the inbox on.
+    this.clearIdleInboxHold(ap);
+    // Focus: a body not confirmed by now is not shown to have been seen; it stays in the inbox, unreported.
+    this.clearFocusBodyConfirmTimer(ap);
+    ap.unconfirmedFocusBodies = [];
+    ap.focusBodiesRejectedInTurn = undefined;
   }
 
   /**
@@ -4908,7 +5207,8 @@ export class AgentProcessManager {
    * Decides nothing; costs one field read per event.
    */
   private armStallDeadlineForQueuedWork(agentId: string, ap: AgentProcess): void {
-    if (ap.stallDeadlineTimer !== undefined || ap.inbox.length === 0) return;
+    if (ap.stallDeadlineTimer !== undefined) return;
+    if (ap.inbox.length === 0 && this.appInboxBusyDeferrals.get(agentId)?.wakes !== true) return;
     if (this.agents.get(agentId) !== ap || ap.exit.kind !== "live") return;
     this.armStallDeadline(agentId, ap, RUNTIME_PROGRESS_STALE_MS - ap.runtimeProgress.ageMs());
   }
@@ -5205,10 +5505,11 @@ export class AgentProcessManager {
     source: string,
     onExpired: () => void = () => this.onSpawnFailBackoffExpired(agentId),
   ): void {
-    const nextConfig = this.buildRestartSafeConfig(ap.config, ap.sessionId);
+    const retrySessionId = this.sessionIdAfterExit(ap);
+    const nextConfig = this.buildRestartSafeConfig(ap.config, retrySessionId);
     this.lifecycleRecords.setRestartSnapshot(agentId, {
       config: nextConfig,
-      sessionId: ap.sessionId,
+      sessionId: retrySessionId,
       launchId: ap.launchId,
       processInstanceId: ap.processInstanceId,
     });
@@ -5270,7 +5571,13 @@ export class AgentProcessManager {
 
     const attempts = ap.runtimeErrorDeliveryBackoff.attempts + 1;
     const exponentialDelayMs = this.computeRuntimeErrorDeliveryBackoffDelayMs(attempts);
-    const delayMs = providerLimitBackoffDelayMs({ providerLimit, exponentialDelayMs, nowMs: Date.now() });
+    const nowMs = Date.now();
+    const delayMs = providerLimitBackoffDelayMs({
+      providerLimit,
+      exponentialDelayMs,
+      nowMs,
+      resetJitter: { ratio: this.runtimeErrorDeliveryBackoffJitterRatio, random: this.runtimeErrorDeliveryBackoffJitterRandom },
+    });
     const credentialKey = providerLimitCredentialKey(agentId, ap.config);
     const credentialKeyKind = providerLimitCredentialKeyKind(credentialKey);
     // A non-limit error never shortens the shared sign-in's limit: while the
@@ -5304,6 +5611,9 @@ export class AgentProcessManager {
         untilMs: ap.runtimeErrorDeliveryBackoff.untilMs,
         providerLimitKind: providerLimit.kind,
         ...(providerLimit.resetsAt ? { resetsAt: providerLimit.resetsAt } : {}),
+        ...(providerLimit.rateLimitType ? { rateLimitType: providerLimit.rateLimitType } : {}),
+        // #proj-runtime:#66: a sign-in to another account ends the wait (`releaseProviderLimitOnAccountChange`).
+        ...(ap.credentialAccount ? { account: ap.credentialAccount } : {}),
         recordedAtMs: Date.now(),
       };
       // Announced to the OAR host too: its agents on the same sign-in wait as well.
@@ -5338,7 +5648,8 @@ export class AgentProcessManager {
         ? {
           provider_limit_kind: providerLimit.kind,
           provider_limit_source: providerLimit.source,
-          waits_for_reported_reset: delayMs !== Math.min(exponentialDelayMs, QUOTA_RESET_BACKOFF_MAX_MS),
+          waits_for_reported_reset: providerLimitReportedResetInMs(providerLimit, nowMs) !== undefined,
+          ...(providerLimit.rateLimitType ? { provider_limit_rate_limit_type: providerLimit.rateLimitType } : {}),
           credential_key_kind: credentialKeyKind,
           ...(keptLongerLimit ? { kept_longer_limit: true } : {}),
         }
@@ -5371,6 +5682,7 @@ export class AgentProcessManager {
 
     const isIdle = this.isApmIdle(ap);
     const queued = queueAgentInboxMessage(ap, message);
+    this.askInboxRowsForQueued(agentId, ap);
     if (!queued.duplicate && !isIdle && ap.driver.supportsStdinNotification && ap.sessionId) {
       ap.notifications.add();
     }
@@ -5633,6 +5945,9 @@ export class AgentProcessManager {
         // The agent read its messages: progress for the wake-loop guard.
         this.noteWakeLoopProgress(agentId);
         this.consumeVisibleMessages(agentId, input);
+        // Task #triage:#399: a read through the proxy (not its own send's
+        // echo) ends the outstanding notice; consumed rows are out by now.
+        if (input.source !== "agent_api_send_commit") this.releaseNoticeHoldOnRead(agentId);
       },
       recordHeldWriteSpan: (input) => this.agentVisibleDelivery.recordHeldWriteSpan(agentId, {
         ...input,
@@ -5887,6 +6202,13 @@ export class AgentProcessManager {
     const outstanding = ap.backgroundTasks.size;
     if (outstanding > 0) {
       this.broadcastActivity(agentId, "working", backgroundTasksWaitingDetail(outstanding), [], undefined, "subagent_activity", "working");
+      return;
+    }
+    // #proj-runtime:#66: messages wait for a used-up quota (another agent's
+    // on the shared sign-in, or one restored at start): that is the status.
+    const heldLimit = this.providerLimitHeldStatus(agentId, ap);
+    if (heldLimit) {
+      this.broadcastProviderLimitHeldStatus(agentId, heldLimit);
       return;
     }
     this.broadcastActivity(agentId, "online", "Idle", [], undefined, "idle");
@@ -6182,6 +6504,8 @@ export class AgentProcessManager {
   }
 
   private restartSafeSessionId(ap: AgentProcess): string | null {
+    // #wg-ax:#3: keep the prior session until the recycled replacement reaches readiness.
+    if (ap.recycledFromSessionId) return ap.recycledFromSessionId;
     return ap.sessionId || (ap.driver.requiresSessionInitForDelivery ? ap.config.sessionId || null : null);
   }
 
@@ -6213,6 +6537,7 @@ export class AgentProcessManager {
     const carried = this.carryRunnerCredential(agentId, item.config, start);
     if (!this.configRevisions.isStaleStart(start.config)) item.config = carried;
     item.unreadSummary = start.unreadSummary;
+    item.openTasks = start.openTasks;
     item.resumePrompt = start.resumePrompt;
     item.launchId = nextLaunchId || undefined;
     // RFC 071: a recovery grant stays with the launch it is bound to; the
@@ -6251,7 +6576,7 @@ export class AgentProcessManager {
     }
     if (this.stopProcessForStartOfAnotherRuntime(agentId, start.config, start.launchId)) {
       // Started on its own (queued behind that stop), with its wake.
-      void this.startAgent(agentId, start.config, start.wakeMessage, start.unreadSummary, start.resumePrompt, start.launchId, start.wakeMessageTransient, start.resumeMessages, start.startDispatchId, null, undefined, start.recoveryGrant ?? null, start.claimedConnectionEpochId ?? null)
+      void this.startAgent(agentId, start.config, start.wakeMessage, start.unreadSummary, start.resumePrompt, start.launchId, start.wakeMessageTransient, start.resumeMessages, start.startDispatchId, null, undefined, start.recoveryGrant ?? null, start.claimedConnectionEpochId ?? null, start.openTasks)
         .catch((err: unknown) => logger.warn(`[Agent ${agentId}] Start of another runtime failed: ${err instanceof Error ? err.message : String(err)}`));
       return false;
     }
@@ -6279,22 +6604,29 @@ export class AgentProcessManager {
     const requiresSessionInit = ap.driver.requiresSessionInitForDelivery === true;
     // Reconciler step 7: a process that has no session yet does not take one
     // that started on another runtime (or Codex model) than it runs.
-    const startSessionId = (ap.sessionId || requiresSessionInit) ? null : this.sessionIdUnlessSpecChanged(agentId, start.config.sessionId, ap.startedSpec, start.launchId, start.config);
+    // #wg-ax:#3: an unready wake-recycled process must also never adopt the
+    // server's still-stored prior session onto the fresh child process.
+    const startSessionId = (ap.sessionId || ap.recycledFromSessionId || requiresSessionInit) ? null : this.sessionIdUnlessSpecChanged(agentId, start.config.sessionId, ap.startedSpec, start.launchId, start.config);
     const nextSessionId = ap.sessionId || startSessionId;
     const nextSessionReadyForDelivery = nextSessionId
       ? (nextSessionId === ap.sessionId ? ap.sessionReadyForDelivery : this.initialSessionReadyForDelivery(ap.driver, start.config, nextSessionId))
       : false;
-    const nextConfigSessionId = nextSessionId || (
-      requiresSessionInit
-        ? start.config.sessionId || null
-        : ap.config.sessionId || start.config.sessionId || null
-    );
+    const nextConfigSessionId = ap.recycledFromSessionId
+      ? nextSessionId
+      : (nextSessionId || (
+        requiresSessionInit
+          ? start.config.sessionId || null
+          : ap.config.sessionId || start.config.sessionId || null
+      ));
     this.runtimeProcessBindingFence.rebindLaunch(agentId, ap, nextLaunchId);
     this.runtimeProcessBindingFence.rebindSession(agentId, ap, nextSessionId, "server_start_rebind");
     ap.launchId = nextLaunchId;
     ap.startDispatchId = start.startDispatchId ?? ap.startDispatchId;
+    this.dropPendingModelSeen(agentId, ap, { reason: "session_changed", nextSessionId });
+    this.releaseUnconfirmedFocusBodies(agentId, ap, "session_changed", nextSessionId);
     ap.sessionId = nextSessionId;
     this.serverContext.noteSession(agentId, ap.processInstanceId, nextSessionId);
+    this.inboxRows.noteSession(agentId, nextSessionId);
     ap.sessionReadyForDelivery = nextSessionReadyForDelivery;
     // Reconciler step 11: a start older than a config already applied rebinds
     // the launch, session and wake, but the running config stays the newer one.
@@ -6363,11 +6695,14 @@ export class AgentProcessManager {
    * entry decides it (`reconcile`): a drifted spec stops it once idle. Both
    * callers go through here, so they cannot diverge. Wakes nothing.
    */
-  private replaceRunningConfig(agentId: string, ap: AgentProcess, config: AgentConfig, sessionId: string | null): void {
-    const { agentCredentialKey, agentCredentialId } = ap.config;
+  private replaceRunningConfig(agentId: string, ap: AgentProcess, config: AgentConfig, sessionId: string | null, options?: { skipReconcile?: boolean }): void {
+    const { agentCredentialKey, agentCredentialId, agentCredentialExpiresAt } = ap.config;
     const heldBeforeRebind = Boolean(this.credentialInvalidHold(agentId, ap.config));
     const featuresBeforeRebind = pickAgentServerFeatures(ap.config);
-    ap.config = { ...stripManagedRunnerCredential(config), sessionId, agentCredentialKey, agentCredentialId };
+    const configBeforeRebind = ap.config;
+    ap.config = { ...stripManagedRunnerCredential(config), sessionId, agentCredentialKey, agentCredentialId, ...(agentCredentialExpiresAt !== undefined ? { agentCredentialExpiresAt } : {}) };
+    // #proj-runtime:#66: another runtime or model may lift a provider limit.
+    this.releaseProviderLimitForConfigChange(agentId, ap, configBeforeRebind);
     // Reconciler step 4a: a rebound start with another model (or credential)
     // may end the invalid credential's hold on this process.
     this.releaseCredentialInvalidForModelChange(agentId, ap.config);
@@ -6377,9 +6712,10 @@ export class AgentProcessManager {
     if (heldBeforeRebind && !heldAfterRebind && ap.inbox.length > 0) {
       queueMicrotask(() => this.flushRuntimeErrorDeliveryBackoff(agentId));
     }
+    const snapshotSessionId = ap.recycledFromSessionId || sessionId;
     this.lifecycleRecords.setRestartSnapshot(agentId, {
-      config: this.buildRestartSafeConfig(ap.config, sessionId),
-      sessionId,
+      config: this.buildRestartSafeConfig(ap.config, snapshotSessionId),
+      sessionId: snapshotSessionId,
       launchId: ap.launchId,
       processInstanceId: ap.processInstanceId,
     });
@@ -6394,7 +6730,9 @@ export class AgentProcessManager {
     } else if (!agentServerFeaturesEqual(featuresBeforeRebind, pickAgentServerFeatures(ap.config))) {
       ap.sessionServerFeatures = pickAgentServerFeatures(ap.config);
     }
-    this.reconcile(agentId, ap, "signal");
+    if (!options?.skipReconcile) {
+      this.reconcile(agentId, ap, "signal");
+    }
   }
 
   /**
@@ -6414,13 +6752,13 @@ export class AgentProcessManager {
    *
    * Unlike a start, it never wakes, rebinds a launch or reports a session.
    */
-  applyConfig(agentId: string, config: AgentConfig, revision: number): void {
+  applyConfig(agentId: string, config: AgentConfig, revision: number, options?: { interrupt?: boolean }): void {
     const ap = this.agents.get(agentId);
     // Kept for the next registration on either host: a start older than it
     // may still register a new process (AgentConfigRevisions).
     this.configRevisions.holdPush(agentId, { config, revision });
     if (ap) {
-      this.applyConfigToProcess(agentId, ap, config, revision, "running");
+      this.applyConfigToProcess(agentId, ap, config, revision, "running", options);
       return;
     }
     // No process: a start may be queued or spawning here, minting its
@@ -6435,9 +6773,65 @@ export class AgentProcessManager {
     this.recordDaemonEvent("daemon.agent.config_push", { agentId, revision, outcome: "held_until_registered" });
   }
 
-  private applyConfigToProcess(agentId: string, ap: AgentProcess, config: AgentConfig, revision: number, stage: "running" | "registered"): void {
+  private applyConfigToProcess(
+    agentId: string,
+    ap: AgentProcess,
+    config: AgentConfig,
+    revision: number,
+    stage: "running" | "registered",
+    options?: { interrupt?: boolean },
+  ): void {
     // As a start: this config is as new as the server features applied so far.
     this.startConfigFeaturesGeneration.set(agentId, this.serverFeaturesGeneration);
+    if (options?.interrupt === true) {
+      // #proj-runtime:#80: server is immediately following with `resetAgent`.
+      // Record the interrupted-turn handoff note before stopping (for BOTH
+      // persistent and per_turn runtimes), and release cleanly via silent stop
+      // so `actOnCleanExit` never locally restarts and steals the handoff note.
+      const runtimeChanged = this.runtimeProcessBindingFence.refusesRuntime({ ...ap, config });
+      const rawDrift = runtimeSpecDrift(ap.startedSpec, runtimeSpecOf(config));
+      const explicitDrift: RuntimeSpecDriftKind[] = runtimeChanged && !rawDrift.includes("runtime")
+        ? ["runtime", ...rawDrift]
+        : rawDrift;
+      const foregroundBusy = ap.driver.lifecycle.kind === "per_turn"
+        || this.agentNotIdle(agentId, ap, { ignoreBackgroundTasks: true, ignoreUntoldInbox: true }) !== null;
+      // Record the interrupted-turn handoff note whenever `interrupt` is true
+      // and a foreground turn is active — even if `explicitDrift` is empty —
+      // because the server is about to follow with `resetAgent` regardless.
+      if (foregroundBusy) {
+        this.interruptedTurns.write(agentId, explicitDrift);
+      }
+      this.replaceRunningConfig(agentId, ap, config, ap.sessionId || ap.config.sessionId || null, { skipReconcile: true });
+      this.recordDaemonEvent("daemon.agent.config_push", {
+        agentId,
+        revision,
+        outcome: "applied",
+        stage,
+        launchId: ap.launchId || undefined,
+        drift: explicitDrift.join(",") || undefined,
+        interrupt: true,
+      });
+      if (this.agents.get(agentId) === ap && ap.exit.kind === "live" && ap.gatedSteering.expectedTerminationReason === null) {
+        this.idleHolds.forget(agentId, "spec_restart");
+        this.recordDaemonEvent("daemon.agent.spec_restart_stop", {
+          agentId,
+          session_id: ap.sessionId,
+          drift: explicitDrift.join(","),
+          new_session: this.sessionIdAfterExit(ap) === null && ap.sessionId !== null,
+          hand_to_server: true,
+          ...(foregroundBusy ? { interrupted_turn: true } : {}),
+          trigger: "signal",
+          host: "legacy",
+        });
+        logger.info(`[Agent ${agentId}] Config revision ${revision} interrupting ${foregroundBusy ? "active" : "idle"} runtime (spec drift: ${explicitDrift.join(", ") || "none"})`);
+        this.specHandbacks.mark(agentId);
+        void this.stopAgent(agentId, { silent: true });
+      }
+      return;
+    }
+    // The config may restart the session: what was held goes out by the ordinary path instead.
+    // After the interrupt branch: a stop ends the hold with the process, with nothing to requeue.
+    this.cancelIdleInboxHold(agentId, ap, "config_applied");
     this.replaceRunningConfig(agentId, ap, config, ap.sessionId || ap.config.sessionId || null);
     const drift = this.specDrift(ap);
     this.recordDaemonEvent("daemon.agent.config_push", {
@@ -6455,7 +6849,15 @@ export class AgentProcessManager {
   private applyConfigToRestartSnapshot(agentId: string, snapshot: AgentRestartSnapshot, config: AgentConfig, revision: number): void {
     const before = runtimeSpecOf(snapshot.config);
     const after = runtimeSpecOf(config);
+    // #proj-runtime:#66 (Tenny's condition): another runtime or model may lift a provider limit.
+    const limitMayLift = this.lifecycleRecords.hasProviderLimits()
+      && ((snapshot.config.runtime || "claude") !== (config.runtime || "claude") || (snapshot.config.model ?? "") !== (config.model ?? ""));
     if (specChangeNeedsServerStart(before, after) || sessionDropReason(before, after) !== null) {
+      if (limitMayLift) {
+        // The server starts the agent: no limit, and no provider-limit cooldown, holds that start.
+        this.releaseProviderLimitForPersonAction(agentId, snapshot.config, "config_changed");
+        if (this.lifecycleRecords.getSpawnFailBackoff(agentId)?.reason === "rate_limited") this.resetSpawnFailBackoff(agentId, "suppressed");
+      }
       this.lifecycleRecords.deleteRestartSnapshot(agentId);
       this.specHandbacks.mark(agentId);
       this.recordDaemonEvent("daemon.agent.config_push", { agentId, revision, outcome: "idle_handed_to_server" });
@@ -6464,6 +6866,15 @@ export class AgentProcessManager {
     }
     this.lifecycleRecords.setRestartSnapshot(agentId, { ...snapshot, config: this.buildRestartSafeConfig(config, snapshot.sessionId) });
     this.recordDaemonEvent("daemon.agent.config_push", { agentId, revision, outcome: "idle_snapshot_updated" });
+    if (!limitMayLift) return;
+    this.releaseProviderLimitForPersonAction(agentId, snapshot.config, "config_changed");
+    // A closed agent waiting in the limit's cooldown starts on the new config
+    // now, as at the cooldown's end (its new runtime may map to another credential).
+    const cooldown = this.lifecycleRecords.getSpawnFailBackoff(agentId);
+    if (cooldown?.reason === "rate_limited" && cooldown.untilMs > this.clockNow()) {
+      if (cooldown.timer) clearTimeout(cooldown.timer);
+      this.onSpawnFailBackoffExpired(agentId);
+    }
   }
 
   /**
@@ -6492,12 +6903,16 @@ export class AgentProcessManager {
   private reportableSessionId(ap: AgentProcess | undefined, sessionId: string | null | undefined): string | null {
     if (!sessionId) return null;
     if (ap && sessionDropReason(ap.startedSpec, runtimeSpecOf(ap.config)) !== null) return null;
+    // #wg-ax:#3: hold reporting a wake-recycled replacement session until it
+    // reaches startup readiness, so the server keeps the prior session on failure.
+    if (ap?.recycledFromSessionId) return null;
     return sessionId;
   }
 
   private reportSession(agentId: string, ap: AgentProcess | undefined, sessionId: string | null | undefined): void {
     const reportable = this.reportableSessionId(ap, sessionId);
     if (!reportable) return;
+    if (ap) this.lastSessions.write(agentId, ap.startedSpec.runtime, reportable);
     this.sendToServer({ type: "agent:session", agentId, sessionId: reportable, launchId: ap?.launchId || undefined });
   }
 
@@ -6649,6 +7064,11 @@ export class AgentProcessManager {
     this.serverReadsTurnEnded = capable;
   }
 
+  /** The current server answers `POST /inbox/rows` (SERVER_CAPABILITY_INBOX_ROWS_V1); false while disconnected. */
+  setServerInboxRowsCapable(capable: boolean): void {
+    this.serverAnswersInboxRows = capable;
+  }
+
   /**
    * Reconciler step 12: the current server counts `model_unsupported` and
    * `runtime_repeated_failure` (SERVER_CAPABILITY_STICKY_FAILURE_REASONS_V1);
@@ -6724,6 +7144,9 @@ export class AgentProcessManager {
         this.runtimeProcessGate.processNotStarted(agentId, ap.processInstanceId);
       }
       this.agentStarts.clearStarting(agentId);
+      if (ap.recycledFromSessionId) {
+        this.recordFailedWakeRecycleStart(agentId, ap.recycledFromSessionId, ap.config.runtime ?? "claude", "late_spawn_error", launchId);
+      }
       const error = new RuntimeSpawnNoProcessError(ap.spawnError ?? "spawn failed", ap.spawnErrorSyscall);
       this.cleanupFailedRuntimeStart(agentId, ap, error);
       this.recordDaemonEvent("daemon.agent.spawn.late_spawn_error", { agentId, launchId: launchId ?? undefined });
@@ -6877,13 +7300,18 @@ export class AgentProcessManager {
         }
       }
       if (!result.ok && mode === "busy") {
+        const wakes = noticeOptions?.startStoppedAgent !== false;
         const deferral = this.appInboxBusyDeferrals.get(agentId);
         if (deferral) {
           deferral.attempts += 1;
+          deferral.wakes ||= wakes;
         } else {
           recordNotice("write_failed", "error", mode, { failure_reason: result.reason });
-          this.appInboxBusyDeferrals.set(agentId, { itemId: item.itemId, firstAtMs: this.clockNow(), attempts: 1 });
+          this.appInboxBusyDeferrals.set(agentId, { itemId: item.itemId, firstAtMs: this.clockNow(), attempts: 1, wakes });
         }
+        // Reconciler step 9: a notice waiting for this turn is queued work, as
+        // a message queued behind it is (reconcileHealth arms its deadline).
+        this.reconcile(agentId, ap, "delivery_arrived");
         return false;
       }
       recordNotice(
@@ -7083,7 +7511,7 @@ export class AgentProcessManager {
     return { text: formatAppInboxNoticeSuffix(notice), items: appItems, wakeItemIds: deferral.wakeItemIds };
   }
 
-  private recordAppInboxUnavailable(agentId: string, route: "turn_exit_wake" | "start_input" | "start_defer_check", error: unknown): void {
+  private recordAppInboxUnavailable(agentId: string, route: "turn_exit_wake" | "start_input" | "start_defer_check" | "stall_check", error: unknown): void {
     logger.error(`[Agent ${agentId}] App Inbox unavailable for a deferred notice (${route})`, error);
     this.recordDaemonEvent("daemon.agent.app_inbox_notice", {
       owner_agent_id_present: true,
@@ -7196,7 +7624,7 @@ export class AgentProcessManager {
    * before any process took what it carries: a caller that acknowledges a
    * delivery the start carries must not acknowledge it then.
    */
-  async startAgent(agentId: string, config: AgentConfig, wakeMessage?: AgentMessage, unreadSummary?: Record<string, number>, resumePrompt?: string, launchId?: string, wakeMessageTransient = false, resumeMessages?: AgentMessage[], startDispatchId?: string, traceParent?: TraceContext | null, catchupBatchId?: string, recoveryGrant: RecoveryGrant | null = null, claimedConnectionEpochId: string | null = null): Promise<AgentStartOutcome> {
+  async startAgent(agentId: string, config: AgentConfig, wakeMessage?: AgentMessage, unreadSummary?: Record<string, number>, resumePrompt?: string, launchId?: string, wakeMessageTransient = false, resumeMessages?: AgentMessage[], startDispatchId?: string, traceParent?: TraceContext | null, catchupBatchId?: string, recoveryGrant: RecoveryGrant | null = null, claimedConnectionEpochId: string | null = null, openTasks?: AgentStartOpenTasks): Promise<AgentStartOutcome> {
     // task #26: a server start woken by its own server context (the owner
     // facts) holds it and starts without a wake message; the facts ride the
     // start's first prompt instead of becoming an inbox row.
@@ -7251,7 +7679,7 @@ export class AgentProcessManager {
         ...this.agentStartDispatch.traceAttrs(agentId, config, wakeMessage, unreadSummary, resumePrompt, launchId, wakeMessageTransient, resumeMessages, startDispatchId),
         reason: "already_running",
       });
-      this.rebindRunningStart(agentId, { config, wakeMessage, unreadSummary, resumePrompt, launchId, wakeMessageTransient, resumeMessages, startDispatchId, recoveryGrant, claimedConnectionEpochId }, "already_running");
+      this.rebindRunningStart(agentId, { config, wakeMessage, unreadSummary, openTasks, resumePrompt, launchId, wakeMessageTransient, resumeMessages, startDispatchId, recoveryGrant, claimedConnectionEpochId }, "already_running");
       logger.info(`[Agent ${agentId}] Start rebound (already running, launchId=${launchId ?? "none"})`);
       void this.contextView.reportAvailability(agentId, "rebind", true);
       return "started";
@@ -7265,6 +7693,7 @@ export class AgentProcessManager {
         config,
         wakeMessage,
         unreadSummary,
+        openTasks,
         resumePrompt,
         launchId,
         wakeMessageTransient,
@@ -7282,7 +7711,7 @@ export class AgentProcessManager {
         ...this.agentStartDispatch.traceAttrs(agentId, config, wakeMessage, unreadSummary, resumePrompt, launchId, wakeMessageTransient, resumeMessages, startDispatchId),
         reason: "already_queued",
       });
-      this.rebindQueuedStart(agentId, { config, wakeMessage, unreadSummary, resumePrompt, launchId, wakeMessageTransient, resumeMessages, startDispatchId, recoveryGrant, claimedConnectionEpochId }, "already_queued");
+      this.rebindQueuedStart(agentId, { config, wakeMessage, unreadSummary, openTasks, resumePrompt, launchId, wakeMessageTransient, resumeMessages, startDispatchId, recoveryGrant, claimedConnectionEpochId }, "already_queued");
       logger.info(`[Agent ${agentId}] Queued start rebound (startup already queued)`);
       return "started";
     }
@@ -7297,6 +7726,7 @@ export class AgentProcessManager {
         wakeMessageTransient,
         resumeMessages,
         unreadSummary,
+        openTasks,
         resumePrompt,
         launchId,
         recoveryGrant,
@@ -7408,6 +7838,7 @@ export class AgentProcessManager {
       item.traceParent ?? null,
       item.recoveryGrant ?? null,
       item.claimedConnectionEpochId ?? null,
+      item.openTasks,
     ).then((outcome) => {
       this.releaseAgentStartSlot(item.agentId, "spawn attempted");
       item.resolve(outcome);
@@ -7472,7 +7903,7 @@ export class AgentProcessManager {
   // Wraps one spawn attempt in a short span. The spawn span is passed down
   // by value and is not made active, because the new process outlives it and
   // its later events must not attach to this span.
-  private async startAgentNow(agentId: string, config: AgentConfig, wakeMessage?: AgentMessage, unreadSummary?: Record<string, number>, resumePrompt?: string, launchId?: string, wakeMessageTransient = false, resumeMessages?: AgentMessage[], startDispatchId?: string, traceParent: TraceContext | null = null, recoveryGrant: RecoveryGrant | null = null, claimedConnectionEpochId: string | null = null): Promise<AgentStartOutcome> {
+  private async startAgentNow(agentId: string, config: AgentConfig, wakeMessage?: AgentMessage, unreadSummary?: Record<string, number>, resumePrompt?: string, launchId?: string, wakeMessageTransient = false, resumeMessages?: AgentMessage[], startDispatchId?: string, traceParent: TraceContext | null = null, recoveryGrant: RecoveryGrant | null = null, claimedConnectionEpochId: string | null = null, openTasks?: AgentStartOpenTasks): Promise<AgentStartOutcome> {
     const spawnSpan = this.tracer.startSpan("daemon.agent.spawn", {
       parent: traceParent,
       surface: "daemon",
@@ -7498,6 +7929,7 @@ export class AgentProcessManager {
         startDispatchId,
         recoveryGrant,
         claimedConnectionEpochId,
+        openTasks,
       ));
       spawnSpan.end("ok", { attrs: { outcome } });
       return outcome;
@@ -7518,13 +7950,13 @@ export class AgentProcessManager {
     }
   }
 
-  private async spawnAgentProcess(spawnTraceparent: string, agentId: string, config: AgentConfig, wakeMessage?: AgentMessage, unreadSummary?: Record<string, number>, resumePrompt?: string, launchId?: string, wakeMessageTransient = false, resumeMessages?: AgentMessage[], startDispatchId?: string, recoveryGrant: RecoveryGrant | null = null, claimedConnectionEpochId: string | null = null): Promise<AgentStartOutcome> {
+  private async spawnAgentProcess(spawnTraceparent: string, agentId: string, config: AgentConfig, wakeMessage?: AgentMessage, unreadSummary?: Record<string, number>, resumePrompt?: string, launchId?: string, wakeMessageTransient = false, resumeMessages?: AgentMessage[], startDispatchId?: string, recoveryGrant: RecoveryGrant | null = null, claimedConnectionEpochId: string | null = null, openTasks?: AgentStartOpenTasks): Promise<AgentStartOutcome> {
     if (this.agents.has(agentId)) {
       this.recordDaemonEvent("daemon.agent.spawn.skipped", {
         ...this.agentStartDispatch.traceAttrs(agentId, config, wakeMessage, unreadSummary, resumePrompt, launchId, wakeMessageTransient, resumeMessages, startDispatchId),
         reason: "already_running",
       }, "ok", spawnTraceparent);
-      this.rebindRunningStart(agentId, { config, wakeMessage, unreadSummary, resumePrompt, launchId, wakeMessageTransient, resumeMessages, startDispatchId, recoveryGrant, claimedConnectionEpochId }, "already_running");
+      this.rebindRunningStart(agentId, { config, wakeMessage, unreadSummary, openTasks, resumePrompt, launchId, wakeMessageTransient, resumeMessages, startDispatchId, recoveryGrant, claimedConnectionEpochId }, "already_running");
       logger.info(`[Agent ${agentId}] Start rebound (already running, launchId=${launchId ?? "none"})`);
       return "started";
     }
@@ -7537,6 +7969,7 @@ export class AgentProcessManager {
         config,
         wakeMessage,
         unreadSummary,
+        openTasks,
         resumePrompt,
         launchId,
         wakeMessageTransient,
@@ -7583,6 +8016,7 @@ export class AgentProcessManager {
     let spawnConfig: AgentConfig | null = null;
     let pendingStartRebind: PendingStartRebind | undefined;
     const originalLaunchId = launchId || null;
+    let recycledFromSessionId: string | null = null;
     let carriedAppNotice: { items: readonly AgentInboxAppItem[]; wakeItemIds: ReadonlySet<string> } | null = null;
     // task #925: a notice this start carried that never reached a process
     // stays owed to the next start (a waking one may start the agent again).
@@ -7603,6 +8037,9 @@ export class AgentProcessManager {
     // Reconciler step 8a: the session rules whose facts are known here (step
     // 7's spec drop, then task #10's refusal), before the start waits.
     config = this.withStartSessionChoice(agentId, config, launchId, { stuck: true });
+    // #wg-ax:#3: an explicit session reset (no prior session to resume) clears
+    // any failed-recycle hold recorded for an earlier session.
+    if (!config.sessionId) this.wakeRecycleFailures.clear(agentId);
 
     // RFC 071 outbox: the one spawn entry every start goes through (server
     // starts, crash respawn, wake / message cold start, restart on message,
@@ -7668,6 +8105,7 @@ export class AgentProcessManager {
       // this start's own credential, if it has one, is the one it runs with.
       config = this.carryRunnerCredential(agentId, config, pendingStartRebind);
       unreadSummary = pendingStartRebind.unreadSummary;
+      openTasks = pendingStartRebind.openTasks;
       resumePrompt = pendingStartRebind.resumePrompt;
       if (pendingStartRebind.launchId) claimedConnectionEpochId = pendingStartRebind.claimedConnectionEpochId ?? null;
       launchId = pendingStartRebind.launchId || launchId;
@@ -7681,6 +8119,8 @@ export class AgentProcessManager {
 
     // A deferred rebind's config may name the session again.
     if (pendingStartRebind) config = this.withStartSessionChoice(agentId, config, launchId, { stuck: false });
+    if (openTasks) this.lastSpawnOpenTasks.set(agentId, openTasks);
+    else this.lastSpawnOpenTasks.delete(agentId);
 
     // Server features: an answer applied after this start's config was taken
     // (while it was queued or waiting for a rebind) wins over it, and the
@@ -7749,7 +8189,13 @@ export class AgentProcessManager {
     // §6.5: a warm-recycle stop remembered for this agent is taken by this
     // start, whatever it decides (a resume for any other reason forgets it).
     const warmStop = this.warmRecycle.takeStopped(agentId);
-    const wakeRecycle = await planWakeSessionRecycle({ config: runtimeConfig, hasResumePrompt: Boolean(resumePrompt), homeDir: this.runtimeSessionHomeDir, warmStop });
+    const wakeRecycle = await planWakeSessionRecycle({
+      config: runtimeConfig,
+      hasResumePrompt: Boolean(resumePrompt),
+      homeDir: this.runtimeSessionHomeDir,
+      warmStop,
+      priorRecycleFailed: this.wakeRecycleFailures.hasFailed(agentId, runtimeConfig.sessionId),
+    });
     // A warm stop this start resumed anyway (a resume prompt, a runtime-profile
     // control, unknown facts): marking that session again would stop it after
     // every turn end only for the next start to resume it again.
@@ -7769,10 +8215,11 @@ export class AgentProcessManager {
     }
     // Reconciler step 8a: the last session rule, from the plan's facts.
     const wakeChoice = chooseSession({ sessionId: runtimeConfig.sessionId, wakeRecycle });
+    // #wg-ax:#3: keep the prior session id until the recycled replacement
+    // reaches startup readiness (markRuntimeStartupReady); if the recycled
+    // start fails before readiness, fall back to resuming this prior session.
     if (wakeChoice.kind === "new" && wakeChoice.reason === "wake_recycle") {
-      if (runtimeConfig.sessionId) {
-        rememberSessionContext(buildCliTransportDir(this.slockHome, agentId, launchId), runtimeConfig.sessionId, null);
-      }
+      recycledFromSessionId = runtimeConfig.sessionId || null;
       runtimeConfig = { ...runtimeConfig, sessionId: null };
       const applied = describeAppliedWakeRecycle(agentId, wakeChoice.recycle);
       const startTriggerKind = messageTurnTriggerAttrs(wakeMessage ? [wakeMessage] : undefined, this.clockNow(), () => undefined).trigger_kind;
@@ -7807,10 +8254,15 @@ export class AgentProcessManager {
       nativeStandingPrompt: Boolean(driver.supportsNativeStandingPrompt),
       resumeSessionId: runtimeConfig.sessionId ?? null,
     });
+    // Read `interruptedTurns` non-destructively here and delete only once the
+    // spawn commits (beside `serverFeaturesNoticeBase.delete`), so a pre-spawn
+    // failure, credential hold, or cancelled start never loses the handoff note.
+    const interruptedTurn = this.interruptedTurns.read(agentId);
     const startupInput = planStartupInput({
       driver,
       runtimeConfig,
       isResume,
+      nativeStandingPrompt: Boolean(driver.supportsNativeStandingPrompt),
       standingPromptReachesSession,
       standingPromptInFirstInput,
       wakeMessage,
@@ -7818,7 +8270,9 @@ export class AgentProcessManager {
       resumePrompt,
       resumeMessages,
       unreadSummary,
+      openTasks,
       startingInboxMessages: this.startingInboxes.values(agentId),
+      ...(interruptedTurn ? { continueAfterCatchup: true } : {}),
       projectThreadJoinContexts: (messages, renderContext) => this.projectThreadJoinContextsForRuntimeInput(agentId, messages, renderContext),
     });
     let { prompt, promptSource } = startupInput;
@@ -7831,6 +8285,7 @@ export class AgentProcessManager {
       resumeCatchupDeliveredAsInput,
       wakeMessageWithheldByResumePrompt,
       unreadSummaryShown,
+      openTasksShown,
       renderedStartupThreadContextMessages,
       startingInboxMessages,
       resumeCatchupMessages,
@@ -7839,6 +8294,8 @@ export class AgentProcessManager {
       resumeCatchupProjection,
       startingInboxProjection,
       startupBodyMessages,
+      focusedStartupBodies,
+      focusedStartupRows,
       firstInputMessages,
       startOrigin,
     } = startupInput;
@@ -7853,21 +8310,70 @@ export class AgentProcessManager {
       ? formatServerFeaturesNotice(serverFeaturesNoticeBase, pickAgentServerFeatures(runtimeConfig), { supportsSubagents: driver.supportsSubagents === true })
       : null;
     if (serverFeaturesNotice) prompt = composeAxSurfaces(serverFeaturesNotice, prompt);
-    ({ prompt, promptSource } = applyWakeRecycleBriefing(wakeRecycle, prompt, promptSource));
-    // Startup memory block (RFC 070 §6 follow-up): every fresh session gets
-    // the MEMORY.md head pushed instead of relying on the standing-prompt
-    // read. The recycle path injects its own copy inside the briefing (so the
-    // block lands between briefing chrome and the constructed panel); this
-    // covers the remaining fresh starts — creation, session/full reset, and
-    // runtime switches that cleared the session.
+    // Unified constructed initial context (#proj-runtime:#80): every fresh
+    // session (brand-new agent, model switch, runtime switch, migration,
+    // manual session reset) gets `<memory-index>` plus the warm constructed
+    // panel from any prior session summary / readable transcript. Brand-new
+    // agents or post-full-reset agents have no prior session state and degrade
+    // cleanly to `<memory-index>` alone (or nothing if MEMORY.md is absent).
     if (!runtimeConfig.sessionId && wakeRecycle.action !== "recycle") {
-      const memoryBlockConfig = resolveStartupMemoryBlockConfig(runtimeConfig.envVars);
-      if (memoryBlockConfig.enabled) {
-        const memoryBlock = await buildStartupMemoryBlock({ workspacePath: agentDataDir, budgetTokens: memoryBlockConfig.budgetTokens });
-        if (memoryBlock) {
-          ({ prompt, promptSource } = applyStartupMemoryBlock(memoryBlock, prompt, promptSource));
+      const constructedInit = await buildFreshConstructedInit({
+        config: runtimeConfig,
+        workspacePath: agentDataDir,
+        homeDir: this.runtimeSessionHomeDir,
+        priorSession: this.lastSessions.read(agentId),
+        readSessionSummary: () => this.sessionSummaries.read(agentId),
+      });
+      if (constructedInit.briefing || constructedInit.memoryBlock || interruptedTurn) {
+        ({ prompt, promptSource } = applyFreshConstructedInit(constructedInit, prompt, promptSource, interruptedTurn));
+        if (constructedInit.hasPanel) {
+          this.recordDaemonEvent("daemon.agent.constructed_init", {
+            agentId,
+            launchId: launchId || undefined,
+            runtime: runtimeConfig.runtime ?? "claude",
+            panel_source: constructedInit.panelSource,
+            has_memory: constructedInit.hasMemory,
+            ...(interruptedTurn ? { interrupted_turn: true } : {}),
+            prompt_source: promptSource,
+            host: "legacy",
+          });
+          logger.info(`[Agent ${agentId}] Constructed initial context injected for fresh session (panel=${constructedInit.panelSource}, memory=${constructedInit.hasMemory}, interrupted=${Boolean(interruptedTurn)}, source=${promptSource})`);
+        } else if (constructedInit.memoryBlock) {
           logger.info(`[Agent ${agentId}] Startup memory block injected for fresh session (source ${promptSource})`);
         }
+        if (interruptedTurn && !constructedInit.hasPanel) {
+          this.recordDaemonEvent("daemon.agent.interrupted_turn_resumed", {
+            agentId,
+            launchId: launchId || undefined,
+            runtime: runtimeConfig.runtime ?? "claude",
+            drift: interruptedTurn.drift.join(","),
+            fresh_session: true,
+            host: "legacy",
+          });
+        }
+      }
+    } else {
+      if (wakeRecycle.action === "recycle") {
+        const promptWithInterrupt = applyInterruptedTurnNote(interruptedTurn, prompt, {
+          continuity: "fresh_with_context",
+          promptSource,
+        });
+        ({ prompt, promptSource } = applyWakeRecycleBriefing(wakeRecycle, promptWithInterrupt, promptSource));
+      } else if (interruptedTurn) {
+        prompt = applyInterruptedTurnNote(interruptedTurn, prompt, {
+          continuity: "resumed",
+          promptSource,
+        });
+      }
+      if (interruptedTurn) {
+        this.recordDaemonEvent("daemon.agent.interrupted_turn_resumed", {
+          agentId,
+          launchId: launchId || undefined,
+          runtime: runtimeConfig.runtime ?? "claude",
+          drift: interruptedTurn.drift.join(","),
+          fresh_session: wakeRecycle.action === "recycle",
+          host: "legacy",
+        });
       }
     }
     prompt = applyFreshSessionStandingPrompt(standingPromptInFirstInput, standingPrompt, prompt);
@@ -7894,6 +8400,7 @@ export class AgentProcessManager {
             ? startingInboxProjection.messages
             : undefined,
       unreadSummary,
+      openTasksShown,
       sessionIdPresent: isResume,
       nativeStandingPrompt: Boolean(driver.supportsNativeStandingPrompt),
       standingPromptInInput: standingPromptInFirstInput || standingPromptRefresh.plan.action === "inject",
@@ -7940,9 +8447,10 @@ export class AgentProcessManager {
         return "cancelled";
       }
       this.settleAllAcceptedLaunches(agentId, "deferred");
+      const heldSessionId = recycledFromSessionId || runtimeConfig.sessionId || null;
       this.lifecycleRecords.setRestartSnapshot(agentId, {
-        config: this.buildRestartSafeConfig(runtimeConfig, runtimeConfig.sessionId || null),
-        sessionId: runtimeConfig.sessionId || null,
+        config: this.buildRestartSafeConfig(runtimeConfig, heldSessionId),
+        sessionId: heldSessionId,
         launchId: effectiveLaunchId,
       });
       this.sendAgentStatus(agentId, "active", effectiveLaunchId);
@@ -7968,6 +8476,7 @@ export class AgentProcessManager {
       !wakeMessage &&
       !resumePrompt &&
       !owesAppNotice &&
+      !interruptedTurn &&
       !runtimeConfig.runtimeProfileControl &&
       resumeCatchupInputMessages.length === 0 &&
       (!unreadSummary || Object.keys(unreadSummary).length === 0);
@@ -7990,9 +8499,10 @@ export class AgentProcessManager {
       // RFC 071: no process exists for these launches; a later message-driven
       // spawn reports itself as a respawn.
       this.settleAllAcceptedLaunches(agentId, "deferred");
+      const deferredSessionId = recycledFromSessionId || runtimeConfig.sessionId || null;
       this.lifecycleRecords.setRestartSnapshot(agentId, {
-        config: this.buildRestartSafeConfig(runtimeConfig, runtimeConfig.sessionId || null),
-        sessionId: runtimeConfig.sessionId || null,
+        config: this.buildRestartSafeConfig(runtimeConfig, deferredSessionId),
+        sessionId: deferredSessionId,
         launchId: effectiveLaunchId,
         // No live AgentProcess in this adoption branch — omit rather than
         // fabricate; the marker's processInstanceId is nullable by contract.
@@ -8057,6 +8567,7 @@ export class AgentProcessManager {
       slockHome: this.slockHome,
       launchId: effectiveLaunchId,
       processInstanceId,
+      cachedRuntimeModels: () => this.#cachedRuntimeModels(effectiveConfig.runtime || "claude"),
       agentCredentialProxyInboxCoordinator: this.createAgentProxyInboxCoordinator(agentId),
       // The live config, as the wake-up notice reads it (server:features updates it).
       agentCredentialProxyInboxItems: () => inboxUpdateRenderOptions(this.agents.get(agentId)?.config ?? effectiveConfig).inboxItems === true,
@@ -8077,9 +8588,10 @@ export class AgentProcessManager {
       serverUrl: effectiveConfig.serverUrl,
       agentCredentialKey: effectiveConfig.agentCredentialKey,
       agentCredentialId: effectiveConfig.agentCredentialId,
+      ...(effectiveConfig.agentCredentialExpiresAt !== undefined ? { agentCredentialExpiresAt: effectiveConfig.agentCredentialExpiresAt } : {}),
     };
     const initialSessionId = this.initialAgentProcessSessionId(driver, liveProcessConfig);
-    const restartSessionId = initialSessionId || (driver.requiresSessionInitForDelivery ? liveProcessConfig.sessionId || null : null);
+    const restartSessionId = recycledFromSessionId || initialSessionId || (driver.requiresSessionInitForDelivery ? liveProcessConfig.sessionId || null : null);
     this.runtimeProcessBindingFence.bind(runtime, {
       agentId,
       serverId: runtimeConfig.runtimeContext?.serverId ?? null,
@@ -8146,6 +8658,7 @@ export class AgentProcessManager {
       turnOutcome: createTurnOutcomeCounters(),
       catchupBatchEcho,
       startupUnreadShown: unreadSummaryShown ? renderedUnreadSummaryTargets(unreadSummary) : [],
+      recycledFromSessionId,
       turnEndedReported: false,
       spawnReported: false,
       runtimeTelemetryResultSeq: 0,
@@ -8169,6 +8682,7 @@ export class AgentProcessManager {
         ? runtimeProfileTurnControl(liveProcessConfig.runtimeProfileControl.kind, liveProcessConfig.runtimeProfileControl.key, "agent_config")
         : null,
       pendingTrajectory: null,
+      pendingIdleInboxHold: null,
       gatedSteering: createGatedSteeringState(),
     };
     this.startingInboxes.drainOnSpawn(agentId);
@@ -8198,21 +8712,36 @@ export class AgentProcessManager {
       "spawn",
       wakeMessage ? [wakeMessage] : resumeCatchupInputMessages.length > 0 ? resumeCatchupInputMessages : undefined,
       // Catch-up messages ride along with a restart; they did not trigger it.
-      wakeMessage ? runtimeInputTraceAttrs : { ...runtimeInputTraceAttrs, trigger_kind: "other" },
+      // Focus: how many focused bodies the first input carried and their bytes (absent when none).
+      wakeMessage
+        ? { ...runtimeInputTraceAttrs, ...focusedBodyTraceAttrs(focusedStartupBodies, focusedStartupRows) }
+        : { ...runtimeInputTraceAttrs, ...focusedBodyTraceAttrs(focusedStartupBodies, focusedStartupRows), trigger_kind: "other" },
     );
     this.agentStarts.clearStarting(agentId);
     if (runtimeConfig.runtimeProfileControl) {
       this.ackInjectedRuntimeProfileControl(agentId, runtimeConfig.runtimeProfileControl, agentProcess.launchId);
     }
+    // Focus: the focused messages that arrived during the start and that a
+    // wake's first input shows in full under (or without) the wake message.
+    // They leave the inbox as any body shown at a start does; none unless the
+    // config has `agentFocus`.
+    const focusedStartingBodies = wakeMessage ? focusedStartupBodies.filter((message) => message !== wakeMessage) : [];
     if (wakeMessageDeliveredAsInboxUpdate) {
       this.recordInboxUpdateProjection(agentId, agentProcess, agentProcess.inbox, "spawn_wake_inbox_update", "wake", prompt);
+      if (focusedStartingBodies.length > 0) {
+        this.notePushedModelBodies(agentProcess, startupBodyMessages, { kind: "start" });
+        this.consumeVisibleMessages(agentId, { messages: focusedStartingBodies, source: "spawn_starting_inbox_update" });
+      }
     } else if (wakeMessageDeliveredWithThreadContext && wakeMessage) {
-      this.notePushedModelBodies(agentProcess, startupBodyMessages);
+      this.notePushedModelBodies(agentProcess, startupBodyMessages, { kind: "start" });
       this.recordRenderedThreadJoinContextReceipts(agentId, renderedStartupThreadContextMessages);
       this.consumeVisibleMessages(agentId, { messages: [wakeMessage], source: "spawn_wake_message" });
+      if (focusedStartingBodies.length > 0) {
+        this.consumeVisibleMessages(agentId, { messages: focusedStartingBodies, source: "spawn_starting_inbox_update" });
+      }
       this.ackInjectedRuntimeProfileMessages(agentId, [wakeMessage], agentProcess.launchId);
     } else if (resumeCatchupDeliveredAsInput) {
-      this.notePushedModelBodies(agentProcess, startupBodyMessages);
+      this.notePushedModelBodies(agentProcess, startupBodyMessages, { kind: "start" });
       this.recordInboxUpdateProjection(agentId, agentProcess, resumeCatchupInputMessages, "spawn_resume_catchup_inbox", "wake", prompt);
       this.recordRenderedThreadJoinContextReceipts(agentId, renderedStartupThreadContextMessages);
       this.consumeVisibleMessages(agentId, { messages: resumeCatchupInputMessages, source: "spawn_resume_catchup_inbox" });
@@ -8227,7 +8756,7 @@ export class AgentProcessManager {
       const shownBodies = new Set(startupBodyMessages);
       const consumedStartingInboxMessages = startingInboxMessages.filter((message) =>
         shownBodies.has(message) || runtimeProfileNotificationFromMessage(message));
-      this.notePushedModelBodies(agentProcess, startupBodyMessages);
+      this.notePushedModelBodies(agentProcess, startupBodyMessages, { kind: "start" });
       this.recordInboxUpdateProjection(agentId, agentProcess, startingInboxMessages, "spawn_starting_inbox_update", "wake", prompt);
       this.recordRenderedThreadJoinContextReceipts(agentId, renderedStartupThreadContextMessages);
       if (consumedStartingInboxMessages.length > 0) {
@@ -8262,59 +8791,6 @@ export class AgentProcessManager {
       if (!text) return;
       if (!this.runtimeProcessBindingFence.acceptOutput(agentId, boundAgentProcess, runtime, "stderr")) return;
       const current = boundAgentProcess;
-      if (driver.id === "codex" && isCodexProviderReconnectLog(text)) {
-        current.recentStderr = pushRecentStderr(current.recentStderr, text);
-        current.decisionErrorWindow.recordStderr(text);
-        this.recordDaemonEvent("daemon.agent.provider_reconnect", {
-          agentId,
-          launchId: current.launchId || undefined,
-          runtime: config.runtime,
-          model: config.model,
-        });
-        this.broadcastActivity(agentId, "working", "Codex reconnecting to provider…", [
-          { kind: "text", text },
-        ], undefined, "runtime_reconnecting");
-        logger.info(`[Agent ${agentId} stderr]: ${text}`);
-        return;
-      }
-      // task #1127: Codex's tool router rejects tool-call arguments it cannot
-      // deserialize and reports it only on stderr — no app-server notification
-      // carries the fact, so without this branch the turn goes quiet and the
-      // agent looks idle. Observation only: never restart, never retry. See
-      // codexToolArgumentParseSignature.ts for why a text match is sanctioned
-      // here and nowhere else.
-      if (driver.id === "codex" && isCodexToolArgumentParseErrorChunk(text)) {
-        current.recentStderr = pushRecentStderr(current.recentStderr, text);
-        current.decisionErrorWindow.recordStderr(text);
-        this.recordDaemonEvent("daemon.agent.tool_argument_parse_failed", {
-          agentId,
-          launchId: current.launchId || undefined,
-          runtime: config.runtime,
-          // Per-model counting is the point of the trace. The rejected argument
-          // values are never recorded: they are model output and can hold
-          // anything the user typed.
-          model: config.model,
-        }, "error");
-        this.broadcastActivity(
-          agentId,
-          "error",
-          CODEX_TOOL_ARGUMENT_PARSE_USER_MESSAGE,
-          [{ kind: "text", text }],
-          undefined,
-          "runtime_error",
-          undefined,
-          undefined,
-          buildRuntimeErrorActivityDiagnostic(text, {
-            errorClass: "ToolArgumentParseError",
-            reasonProvenance: "codex_stderr_signature",
-            nativeReasonPresent: false,
-          }),
-        );
-        logger.error(`[Agent ${agentId} stderr]: ${text}`);
-        return;
-      }
-      // Codex CLI emits noisy but benign WebSocket fallback logs on stderr — suppress them.
-      if (driver.id === "codex" && isCodexBenignTransportLog(text)) return;
       current.recentStderr = pushRecentStderr(current.recentStderr, text);
       current.decisionErrorWindow.recordStderr(text);
       logger.error(`[Agent ${agentId} stderr]: ${text}`);
@@ -8418,7 +8894,16 @@ export class AgentProcessManager {
       logger.info(`[Agent ${agentId}] Process exited with code ${code}${signal ? ` (signal ${signal})` : ""}`);
     });
 
-    runtime.on("close", ({ code, signal }) => {
+    runtime.on("close", ({ code, signal, stdioHeldAfterExit }) => {
+      if (stdioHeldAfterExit) {
+        // #o11y-alerts:#5: the exit came without `close` (a child held the
+        // stdio); the session released the process and drains the pipes.
+        this.recordDaemonEvent("daemon.agent.process.stdio_held_after_exit", {
+          agentId,
+          runtime: config.runtime,
+          waited_ms_bucket: bucketMs(stdioHeldAfterExit.waitedMs),
+        }, "error");
+      }
       if (this.agents.has(agentId)) {
         const ap = this.agents.get(agentId)!;
         // Guard: if a new process was already spawned for this agent, don't touch it.
@@ -8426,6 +8911,7 @@ export class AgentProcessManager {
         // new process is added to the map, then the old process's exit handler fires.
         if (ap.runtime !== runtime) return;
         ap.notifications.clearTimer();
+        this.inboxRows.reset(agentId);
         this.sendIntents.endAll(agentId);
         this.disposeAgentProcessTimers(ap, { includeCompactionWatchdog: false });
         this.closeRuntimeReadinessTransition(ap, "terminal");
@@ -8615,6 +9101,7 @@ export class AgentProcessManager {
       throw new RuntimeSessionStartError(
         `Runtime session failed to start: ${startResult.reason}${visibleStartError ? ` (${visibleStartError})` : ""}`,
         startFailureCause,
+        visibleStartError || undefined,
       );
     }
     // RFC 071 §4.3 rule 2: the identity of the process this launch spawned.
@@ -8626,6 +9113,7 @@ export class AgentProcessManager {
     // before it was registered, or to it since) still count: the session runs
     // on what it spawned with, so it drifts from them like any other.
     this.serverFeaturesNoticeBase.delete(agentId);
+    if (interruptedTurn) this.interruptedTurns.delete(agentId);
     const waitingServerFeatures = this.serverFeaturesGeneration > serverFeaturesGenerationAtSpawn && this.lastAppliedServerFeatures
       ? this.lastAppliedServerFeatures
       : pickAgentServerFeatures(agentProcess.config);
@@ -8670,10 +9158,16 @@ export class AgentProcessManager {
       this.markAppInboxNoticeDelivered(agentId, carriedAppNotice.items);
       carriedAppNotice = null;
     }
+    // #59: a child-process runtime leads its own session and process group on
+    // POSIX (runtimeChildProcessGroupOptions in drivers/runtimeChild, which every
+    // child-process driver spawns through; keep this in step with it); an
+    // in-process runtime (Pi, Kimi SDK) has no pid of its own, and Windows has
+    // no groups. runtimeSession.test.ts "#59" pins the group behaviour itself.
+    const runtimeLeadsOwnSession = typeof runtime.pid === "number" && process.platform !== "win32";
     this.recordDaemonEvent("daemon.agent.spawn.created", {
       ...this.agentStartDispatch.traceAttrs(agentId, effectiveConfig, wakeMessage, unreadSummary, resumePrompt, agentProcess.launchId || undefined, wakeMessageTransient, undefined, startDispatchId),
-      detached: false,
-      new_session: false,
+      detached: runtimeLeadsOwnSession,
+      new_session: runtimeLeadsOwnSession,
       process_pid_present: typeof runtime.pid === "number",
     }, "ok", spawnTraceparent);
     const pendingCause = this.lifecycleRecords.getPendingSpawnCause(agentId);
@@ -8736,10 +9230,16 @@ export class AgentProcessManager {
         const late = this.lifecycleRecords.getPendingStartRebind(agentId);
         this.lifecycleRecords.deletePendingStartRebind(agentId);
         if (late) {
-          void this.startAgent(agentId, late.config, late.wakeMessage, late.unreadSummary, late.resumePrompt, late.launchId, late.wakeMessageTransient, late.resumeMessages, late.startDispatchId, null, undefined, late.recoveryGrant, late.claimedConnectionEpochId ?? null)
+          void this.startAgent(agentId, late.config, late.wakeMessage, late.unreadSummary, late.resumePrompt, late.launchId, late.wakeMessageTransient, late.resumeMessages, late.startDispatchId, null, undefined, late.recoveryGrant, late.claimedConnectionEpochId ?? null, late.openTasks)
             .catch((startErr: unknown) => logger.warn(`[Agent ${agentId}] Start after a refused stale launch failed: ${startErr instanceof Error ? startErr.message : String(startErr)}`));
         }
         throw err;
+      }
+      // Only attribute spawn failure to the recycled replacement once the
+      // runtime session was actually created (excluding credential minting or
+      // workspace setup failures that happen before `createSession`).
+      if (recycledFromSessionId && agentProcess !== null && !(err instanceof RuntimeOutcomeStorageBlockedError) && !this.lifecycleRecords.stopEpochChanged(agentId, startStopEpoch)) {
+        this.recordFailedWakeRecycleStart(agentId, recycledFromSessionId, config.runtime ?? "claude", "spawn_failed", launchId || null);
       }
       // RFC 071: every launch still waiting has no process: either no child
       // was created, or it was folded after the child was reported (then it
@@ -8885,6 +9385,7 @@ export class AgentProcessManager {
     this.lifecycleRecords.deleteRestartSnapshot(agentId);
     this.startingInboxes.cancelStart(agentId);
     ap.notifications.clearTimer();
+    this.inboxRows.reset(agentId);
     this.sendIntents.endAll(agentId);
     this.disposeAgentProcessTimers(ap);
     this.closeRuntimeReadinessTransition(ap, "terminal");
@@ -8927,6 +9428,7 @@ export class AgentProcessManager {
     if (this.agents.get(agentId) !== ap) return;
 
     ap.notifications.clearTimer();
+    this.inboxRows.reset(agentId);
     this.sendIntents.endAll(agentId);
     this.disposeAgentProcessTimers(ap);
     this.closeRuntimeReadinessTransition(ap, "terminal");
@@ -8963,9 +9465,10 @@ export class AgentProcessManager {
       if (err instanceof RuntimeOutcomeStorageBlockedError || err instanceof StaleDispatchError) {
         this.resetSpawnFailBackoff(agentId, "suppressed");
       } else {
+        const retrySessionId = this.restartSafeSessionId(ap);
         this.lifecycleRecords.setRestartSnapshot(agentId, {
-          config: this.buildRestartSafeConfig(ap.config, ap.sessionId),
-          sessionId: ap.sessionId,
+          config: this.buildRestartSafeConfig(ap.config, retrySessionId),
+          sessionId: retrySessionId,
           launchId: ap.launchId,
           processInstanceId: ap.processInstanceId,
         });
@@ -8990,6 +9493,9 @@ export class AgentProcessManager {
     failure: TerminalRuntimeFailureEvidence,
   ): void {
     if (this.agents.get(agentId) !== ap) return;
+    if (ap.recycledFromSessionId) {
+      this.recordFailedWakeRecycleStart(agentId, ap.recycledFromSessionId, ap.config.runtime ?? "claude", failure.failureKind, ap.launchId);
+    }
     this.sendRuntimeOutcome(agentId, ap, {
       kind: "terminal_failure",
       failureKind: failure.failureKind,
@@ -8998,6 +9504,7 @@ export class AgentProcessManager {
     });
 
     ap.notifications.clear();
+    this.inboxRows.reset(agentId);
     this.sendIntents.endAll(agentId);
     this.disposeAgentProcessTimers(ap);
     this.closeRuntimeReadinessTransition(ap, "terminal");
@@ -9055,6 +9562,9 @@ export class AgentProcessManager {
    *   completes is given back to the server as `session_needs_reset`.
    */
   private actOnStickyFailure(agentId: string, ap: AgentProcess, sticky: StickyFailure, evidence: TerminalRuntimeFailureEvidence): void {
+    if (ap.recycledFromSessionId) {
+      this.recordFailedWakeRecycleStart(agentId, ap.recycledFromSessionId, ap.config.runtime ?? "claude", sticky.kind, ap.launchId);
+    }
     if (this.agents.get(agentId) === ap) {
       this.releaseFailedProcess(agentId, ap, sticky.detail, evidence);
     } else {
@@ -9090,16 +9600,21 @@ export class AgentProcessManager {
    * nothing queued). What the agent had not read stays unread on the server.
    */
   private replaceSessionAfterStickyFailure(agentId: string, ap: AgentProcess, cause: SessionResetCause): void {
-    const staleSessionId = ap.driver.currentSessionId ?? ap.sessionId ?? ap.resumeSessionId ?? ap.config.sessionId ?? null;
-    this.lifecycleRecords.exitStreaks.sticky.noteSessionReset(agentId, cause);
+    const staleSessionId = ap.recycledFromSessionId
+      ? null
+      : (ap.driver.currentSessionId ?? ap.sessionId ?? ap.resumeSessionId ?? ap.config.sessionId ?? null);
+    if (!ap.recycledFromSessionId) {
+      this.lifecycleRecords.exitStreaks.sticky.noteSessionReset(agentId, cause);
+    }
     this.cancelRuntimeErrorProcessRestart(agentId);
     this.resetSpawnFailBackoff(agentId, "suppressed");
     if (staleSessionId) {
       rememberSessionContext(ap.cliTransportDir, staleSessionId, null);
       this.sendToServer({ type: "agent:session:invalidate", agentId, sessionId: staleSessionId, launchId: ap.launchId || undefined, reason: cause });
     }
-    const restartConfig = this.buildRestartSafeConfig(ap.config, null);
-    const snapshot = { config: restartConfig, sessionId: null, launchId: ap.launchId, processInstanceId: ap.processInstanceId };
+    const nextSessionId = ap.recycledFromSessionId ?? null;
+    const restartConfig = this.buildRestartSafeConfig(ap.config, nextSessionId);
+    const snapshot = { config: restartConfig, sessionId: nextSessionId, launchId: ap.launchId, processInstanceId: ap.processInstanceId };
     const carried = ap.inbox.splice(0).filter((message) => !this.isTransientDelivery(message));
     const label = runtimeDisplayName(ap.driver.id);
     const what = cause === "input_too_large" ? "no longer fits the model's input limit" : "could not be compacted";
@@ -9246,15 +9761,7 @@ export class AgentProcessManager {
     const baseConfig = config.serverUrl === this.serverUrl
       ? config
       : { ...config, serverUrl: this.serverUrl };
-    const credentialedConfig = await this.ensureManagedRunnerCredential(agentId, baseConfig);
-    let runnerConfig: AgentConfig;
-    try {
-      runnerConfig = await materializeProviderConnectionForSpawn(credentialedConfig, { serverUrl: this.serverUrl, daemonApiKey: this.daemonApiKey, agentId });
-    } catch (err) {
-      // A credential minted here for a launch that never gets its config.
-      if (credentialedConfig !== baseConfig) this.revokeManagedRunnerCredential(agentId, credentialedConfig, null);
-      throw err;
-    }
+    const runnerConfig = await this.ensureManagedRunnerCredential(agentId, baseConfig);
     let effectiveConfig = runnerConfig;
     if (this.defaultAgentEnvVarsProvider) {
       try {
@@ -9284,7 +9791,7 @@ export class AgentProcessManager {
     return effectiveConfig;
   }
 
-  private async requestManagedRunnerCredentialOnce(agentId: string, config: AgentConfig): Promise<{ apiKey: string; credentialId: string | null }> {
+  private async requestManagedRunnerCredentialOnce(agentId: string, config: AgentConfig): Promise<RunnerCredential> {
     const url = new URL(`/internal/computer/runners/${encodeURIComponent(agentId)}/credentials`, this.serverUrl);
     const res = await daemonFetch(url, {
       method: "POST",
@@ -9315,16 +9822,13 @@ export class AgentProcessManager {
       });
     }
 
-    const body = await res.json().catch(() => null) as { apiKey?: unknown; credentialId?: unknown } | null;
-    if (typeof body?.apiKey !== "string" || !body.apiKey.startsWith("sk_agent_")) {
+    const credential = parseRunnerCredentialMintBody(await res.json().catch(() => null));
+    if (!credential) {
       throw new RunnerCredentialMintError("invalid_agent_credential_payload", {
         code: "invalid_agent_credential_payload",
       });
     }
-    return {
-      apiKey: body.apiKey,
-      credentialId: typeof body.credentialId === "string" ? body.credentialId : null,
-    };
+    return credential;
   }
 
   private async ensureManagedRunnerCredential(agentId: string, config: AgentConfig): Promise<AgentConfig> {
@@ -9360,10 +9864,13 @@ export class AgentProcessManager {
     for (let attempt = 1; attempt <= RUNNER_CREDENTIAL_MINT_MAX_ATTEMPTS; attempt += 1) {
       try {
         const credential = await this.requestManagedRunnerCredentialOnce(agentId, config);
+        // #wg-rbac:#27: renewed at its half-life while a launch holds it.
+        trackRunnerCredential({ agentId, runtime: config.runtime, credential });
         return {
           ...config,
           agentCredentialKey: credential.apiKey,
           agentCredentialId: credential.credentialId,
+          ...(credential.expiresAt ? { agentCredentialExpiresAt: credential.expiresAt } : {}),
         };
       } catch (err) {
         lastError = err;
@@ -10097,9 +10604,6 @@ export class AgentProcessManager {
   private releaseProviderLimitForExplicitStop(agentId: string, config: AgentConfig | undefined): void {
     const keys = new Set<ProviderLimitCredentialKey>([ownProviderLimitCredentialKey(agentId)]);
     if (config) keys.add(providerLimitCredentialKey(agentId, config));
-    // Reconciler step 4a, Q4: the manual Retry of an invalid credential. It
-    // counts as valid again for every agent on it; if it is not, the next
-    // request records it again.
     for (const key of keys) {
       const released = this.lifecycleRecords.providerLimitLedger.releaseInvalid(key, "explicit_stop", { host: "legacy", agentId });
       if (released.length === 0) continue;
@@ -10114,6 +10618,18 @@ export class AgentProcessManager {
         host: "legacy",
       });
     }
+    this.releaseProviderLimitForPersonAction(agentId, config, "explicit_stop");
+  }
+
+  /**
+   * The provider limit on the agent's credential (and its own key) ends for a
+   * person's action: an explicit stop (and so a manual restart), or a runtime
+   * or model change (#proj-runtime:#66). Released for every agent on the
+   * credential except this one, which its stop or config change handles.
+   */
+  private releaseProviderLimitForPersonAction(agentId: string, config: AgentConfig | undefined, resetSource: "explicit_stop" | "config_changed"): void {
+    const keys = new Set<ProviderLimitCredentialKey>([ownProviderLimitCredentialKey(agentId)]);
+    if (config) keys.add(providerLimitCredentialKey(agentId, config));
     for (const key of keys) {
       const record = this.lifecycleRecords.getProviderLimit(key, this.clockNow());
       if (!record) continue;
@@ -10124,7 +10640,7 @@ export class AgentProcessManager {
         model: config?.model,
         reason: record.reason,
         attempts: record.attempts,
-        reset_source: "explicit_stop",
+        reset_source: resetSource,
         release_cause: "explicit_stop",
         credential_key_kind: providerLimitCredentialKeyKind(key),
         provider_limit_cleared: true,
@@ -10147,6 +10663,9 @@ export class AgentProcessManager {
     this.forgetWakeLoop(agentId);
     // RFC 070 §6.5: a stop ends a pending warm mark and its timer; an explicit
     // one (also how an agent leaves this computer) forgets everything kept for it.
+    // #wg-ax:#3: Retry (explicit stop + start) keeps failed-recycle memory so
+    // retrying resumes the prior session instead of looping; only reset,
+    // deletion/migration (core.ts), session change, or TTL expiry clears it.
     if (silent) this.warmRecycle.dropPending(agentId);
     else this.warmRecycle.forget(agentId);
     // Server features: an explicit stop (also how an agent leaves this
@@ -10234,6 +10753,7 @@ export class AgentProcessManager {
     // cancelled here; the attempt itself discards its result (never commits).
     ap.launchAbort?.abort();
     ap.notifications.clearTimer();
+    this.inboxRows.reset(agentId);
     this.sendIntents.endAll(agentId);
     this.disposeAgentProcessTimers(ap);
 
@@ -10543,11 +11063,12 @@ export class AgentProcessManager {
       context.onMentionTerminalError?.("INSTRUMENT_FAILED");
       return;
     }
-    if (tracked.state !== "drained") {
-      tracked.state = "drained";
-      tracked.context = context;
-      context.onMentionTransition?.("daemon_drained", "accepted");
-    }
+    // Acknowledged once, on the transition: a second settle of the same occurrence (the consume of
+    // its body, then the path that wrote it) must not send a second ack.
+    if (tracked.state === "drained") return;
+    tracked.state = "drained";
+    tracked.context = context;
+    context.onMentionTransition?.("daemon_drained", "accepted");
     context.onMentionAck?.();
   }
 
@@ -10666,6 +11187,8 @@ export class AgentProcessManager {
       this.deliveryTraceContexts.set(message, traceContext);
     }
     if (!this.deliveryReceivedAtMs.has(message)) this.deliveryReceivedAtMs.set(message, this.clockNow());
+    // #proj-runtime:#66: a sign-in to another account ends a provider-limit wait before this message is routed.
+    this.releaseProviderLimitOnAccountChange(agentId);
     const transientDelivery = this.isTransientDelivery(message);
     // Reconciler step 12: a sticky failure only the runtime's stderr named
     // (no error event acted on it) is acted on before anything is routed to
@@ -11013,6 +11536,7 @@ export class AgentProcessManager {
         }));
         return true;
       }
+      // Not asked about: this session prints no further notice (its close hands the inbox on).
       const queued = queueAgentInboxMessage(ap, message);
       if (trackedBegin === "accepted") this.markTrackedMentionPending(traceContext, queued.duplicate ? "coalesced" : "accepted");
       this.recordDaemonEvent("daemon.agent.delivery.routed", this.deliveryTraceAttrs(agentId, message, {
@@ -11030,6 +11554,7 @@ export class AgentProcessManager {
       // runs; the agent can still read it (`raft message check`), which
       // takes it out. The end of the drain flushes what is left.
       const queued = queueAgentInboxMessage(ap, message);
+      this.askInboxRowsForQueued(agentId, ap);
       if (trackedBegin === "accepted") this.markTrackedMentionPending(traceContext, queued.duplicate ? "coalesced" : "accepted");
       this.recordDaemonEvent("daemon.agent.delivery.routed", this.deliveryTraceAttrs(agentId, message, {
         outcome: "held_for_drain",
@@ -11070,6 +11595,7 @@ export class AgentProcessManager {
         // settles it. Refusing it here dropped it for good: nothing redelivers
         // a refused delivery (Bencher, under load; Tenny P1).
         const queued = queueAgentInboxMessage(ap, message);
+        this.askInboxRowsForQueued(agentId, ap);
         this.markTrackedMentionPending(traceContext, queued.duplicate ? "coalesced" : "accepted");
         const retryScheduled = this.scheduleSessionReadyDeliveryRetry(agentId, ap, "queued_before_session_ready");
         this.recordDaemonEvent("daemon.agent.delivery.routed", this.deliveryTraceAttrs(agentId, message, {
@@ -11088,6 +11614,7 @@ export class AgentProcessManager {
         return true;
       }
       const queued = queueAgentInboxMessage(ap, message);
+      this.askInboxRowsForQueued(agentId, ap);
       ap.notifications.add();
       // A busy tracked mention gets the same mid-turn notice as any message
       // (no new turn, no wait for this one to end), unless a compaction or
@@ -11158,6 +11685,7 @@ export class AgentProcessManager {
         return true;
       }
       const queued = queueAgentInboxMessage(ap, message);
+      this.askInboxRowsForQueued(agentId, ap);
       if (trackedBegin === "accepted") this.markTrackedMentionPending(traceContext, queued.duplicate ? "coalesced" : "accepted");
       this.recordDaemonEvent("daemon.agent.delivery.routed", this.deliveryTraceAttrs(agentId, message, {
         outcome: "queued_credential_invalid",
@@ -11239,6 +11767,8 @@ export class AgentProcessManager {
         logger.info(`[Agent ${agentId}] Suppressing duplicate idle stdin inbox update (unread-set unchanged since last write); pending=${ap.inbox.length}`);
         return true;
       }
+      // The notice is to print the Server's unread numbers: the delivery waits, the agent still idle, for the rows ask.
+      if (this.holdIdleInboxDelivery(agentId, ap, message, traceContext, trackedBegin === "accepted")) return true;
       ap.inbox.push(message);
       const nextMessages = [...ap.inbox];
       this.commitApmIdleState(agentId, ap, false);
@@ -11285,6 +11815,9 @@ export class AgentProcessManager {
       return true;
     }
     const queued = queueAgentInboxMessage(ap, message);
+    // Asked now, so the notice that tells this message finds the Server's rows without waiting
+    // (as at every other place a message is queued for a session that will print a notice).
+    this.askInboxRowsForQueued(agentId, ap);
 
     // Reconciler step 9: queued work makes the process's health a question
     // (stalled with work, reconcileHealth); a stop already underway keeps the
@@ -11416,7 +11949,14 @@ export class AgentProcessManager {
   }
 
   async resetWorkspace(agentId: string) {
+    this.wakeRecycleFailures.clear(agentId);
     const agentDataDir = path.join(this.dataDir, agentId);
+    // #proj-runtime:#80: full reset clears prior session continuity hints so
+    // the next start does not reconstruct state from before the full reset.
+    this.lastSessions.delete(agentId);
+    this.interruptedTurns.delete(agentId);
+    this.sessionSummaries.delete(agentId);
+    this.sessionSpecs.forget(agentId);
     try {
       await rm(agentDataDir, { recursive: true, force: true });
       logger.info(`[Agent ${agentId}] Workspace reset complete (${agentDataDir})`);
@@ -11433,12 +11973,14 @@ export class AgentProcessManager {
 
   async stopAll() {
     this.sideQuestions.stopAll();
+    this.inboxRows.resetAll();
     // Clear idle configs so no auto-restarts happen during shutdown.
     // Use silent: true so agents stay "active" in DB — on daemon reconnect,
     // the server's ready handler will auto-restart them.
     if (this.coldIdleSweepTimer) clearInterval(this.coldIdleSweepTimer);
     this.coldIdleSweepTimer = null;
     this.warmRecycle.clear();
+    this.wakeRecycleFailures.clearAll();
     this.contextView.dispose();
     this.specHandbacks.dispose();
     this.drain.dispose();
@@ -12096,8 +12638,20 @@ export class AgentProcessManager {
     return scanWorkspaceDirectories(this.dataDir);
   }
 
-  async deleteWorkspaceDirectory(directoryName: string): Promise<boolean> {
-    const deleted = await deleteWorkspaceDirectory(this.dataDir, directoryName);
+  /**
+   * Delete an agent's workspace for the server (workspaces.ts,
+   * `workspaceDeleteRefusal`): refused unless the name is an agent id, no
+   * agent of it runs or starts here, and its owner marker (if any) names
+   * this daemon's server. `isRunningElsewhere`: the core's other agent
+   * hosts (the OAR host) in this process.
+   */
+  async deleteWorkspaceDirectory(directoryName: string, isRunningElsewhere: (agentId: string) => boolean = () => false): Promise<boolean> {
+    const deleted = await deleteWorkspaceDirectory(this.dataDir, directoryName, {
+      serverId: this.connectedServerId(),
+      isAgentRunning: (agentId) => this.holdsAgentStart(agentId)
+        || this.hostedSessions?.get(agentId) != null
+        || isRunningElsewhere(agentId),
+    });
     // A workspace directory is named by its agent id: the agent is gone here.
     if (deleted) this.providerQuota.forget(directoryName);
     return deleted;
@@ -12115,20 +12669,6 @@ export class AgentProcessManager {
 
   // Skill scanning
 
-  // Per-runtime skill search paths (relative to home dir for global, workspace dir for workspace).
-  // To add a new runtime, add an entry here.
-  private static readonly SKILL_PATHS: Record<string, { global: string[]; workspace: string[] }> = {
-    claude: {
-      // Claude reads shared skills via symlinks in ~/.claude/skills/, not from ~/.agents/skills/
-      global: [".claude/skills", ".claude/commands"],
-      workspace: [".claude/skills", ".claude/commands"],
-    },
-    codex: {
-      // Codex natively scans ~/.agents/skills/ and has built-in .system skills
-      global: [".codex/skills", ".codex/skills/.system", ".agents/skills"],
-      workspace: [".codex/skills", ".agents/skills"],
-    },
-  };
 
   async getSessionTranscript(
     agentId: string,
@@ -12525,119 +13065,33 @@ export class AgentProcessManager {
     }
   }
 
-  async listSkills(agentId: string, runtimeHint?: string): Promise<{ global: SkillInfo[]; workspace: SkillInfo[] }> {
-    const agent = this.agents.get(agentId);
-    const idle = this.lifecycleRecords.getRestartSnapshot(agentId);
-    const config = agent?.config ?? idle?.config ?? null;
-    const runtime = runtimeHint || config?.runtime || "claude";
-    const workspaceDir = path.join(this.dataDir, agentId);
-    const hostHome = os.homedir();
-    const home = agent?.runtime.currentRuntimeHomeDir
-      || (config
-        ? ensureRuntimeHomeDir(config, hostHome, workspaceDir, { agentId, slockHome: this.slockHome })
-        : runtime === "codex"
-          ? resolveCodexHomeRootFromEnv(process.env, { defaultHomeDir: hostHome, cwd: workspaceDir })
-          : hostHome);
-
-    const paths = AgentProcessManager.SKILL_PATHS[runtime] || AgentProcessManager.SKILL_PATHS.claude;
-
-    const globalDirs = runtime === "codex"
-      ? [
-        path.join(home, "skills"),
-        path.join(home, "skills", ".system"),
-        path.join(home, ".agents", "skills"),
-        ...(hasConfiguredCodexHome(config) ? [] : [path.join(hostHome, ".agents", "skills")]),
-      ]
-      : paths.global.map((p) => path.join(home, p));
-    const workspaceDirs = paths.workspace.map((p) => path.join(workspaceDir, p));
-
-    const globalResults = await Promise.all(
-      globalDirs.map((dir) => this.scanSkillsDir(dir)),
-    );
-    const workspaceResults = await Promise.all(
-      workspaceDirs.map((dir) => this.scanSkillsDir(dir)),
-    );
-
-    // Deduplicate by skill name (first occurrence wins)
-    const dedup = (skills: SkillInfo[]) => {
-      const seen = new Set<string>();
-      return skills.filter((s) => {
-        if (seen.has(s.name)) return false;
-        seen.add(s.name);
-        return true;
-      });
-    };
-
-    // Shorten home directory to ~ in source paths
-    const shorten = (skills: SkillInfo[]) =>
-      skills.map((s) => ({
-        ...s,
-        sourcePath: s.sourcePath?.startsWith(home) ? "~" + s.sourcePath.slice(home.length) : s.sourcePath,
-      }));
-
-    return {
-      global: shorten(dedup(globalResults.flat())),
-      workspace: shorten(dedup(workspaceResults.flat())),
-    };
-  }
-
-  private async scanSkillsDir(dir: string): Promise<SkillInfo[]> {
-    let entries: import("node:fs").Dirent[];
+  /**
+   * The agent's skills, from OAR's skills inventory only
+   * (runtimeSkills/oarSkills.ts; xxchan, #oar-raft:7e06ebc9): Raft reads no
+   * runtime folders itself. A runtime OAR's reader does not cover lists
+   * nothing; a failed read says why (`unavailable`) with empty lists.
+   */
+  async listSkills(agentId: string, runtimeHint?: string): Promise<RuntimeSkillLists> {
+    const config = this.agents.get(agentId)?.config ?? this.lifecycleRecords.getRestartSnapshot(agentId)?.config ?? null;
+    if (!this.oarSkills) return { global: [], workspace: [] };
+    let envVars: Record<string, string> | null | undefined;
     try {
-      entries = await readdir(dir, { withFileTypes: true });
+      envVars = config ? sideAskLaunchFields(hydrateSideAskRuntimeConfig(config)).envVars : undefined;
     } catch {
-      return [];
+      envVars = undefined;
     }
-
-    const skills: SkillInfo[] = [];
-    for (const entry of entries) {
-      if (entry.isDirectory() || entry.isSymbolicLink()) {
-        // Standard skill: directory (or symlink to directory) with SKILL.md
-        const skillMd = path.join(dir, entry.name, "SKILL.md");
-        try {
-          const content = await readFile(skillMd, "utf-8");
-          const skill = this.parseSkillMd(entry.name, content);
-          skill.sourcePath = dir;
-          skills.push(skill);
-        } catch {
-          // No SKILL.md — skip
-        }
-      } else if (entry.name.endsWith(".md")) {
-        // Legacy command: bare .md file (e.g. ~/.claude/commands/foo.md)
-        const cmdName = entry.name.replace(/\.md$/, "");
-        try {
-          const content = await readFile(path.join(dir, entry.name), "utf-8");
-          const skill = this.parseSkillMd(cmdName, content);
-          skill.sourcePath = dir;
-          skills.push(skill);
-        } catch {
-          // Unreadable — skip
-        }
-      }
-    }
-    return skills;
+    const outcome = await this.oarSkills.list({
+      agentId,
+      runtime: runtimeHint || config?.runtime || "claude",
+      workspaceDir: path.join(this.dataDir, agentId),
+      homeDir: os.homedir(),
+      slockHome: this.slockHome,
+      ...(envVars && Object.keys(envVars).length > 0 ? { env: { ...envVars } } : {}),
+    });
+    if (!outcome) return { global: [], workspace: [] };
+    return outcome.kind === "ok" ? outcome.lists : { global: [], workspace: [], unavailable: { reason: outcome.reason } };
   }
 
-  private parseSkillMd(dirName: string, content: string): SkillInfo {
-    const info: SkillInfo = {
-      name: dirName,
-      displayName: dirName,
-      description: "",
-      userInvocable: false,
-    };
-
-    const frontmatter = parseSkillFrontmatter(content);
-    if (frontmatter.name !== undefined) info.displayName = frontmatter.name;
-    // Trimmed here rather than in the parser: the parser reports YAML truth,
-    // including the trailing newline that distinguishes clip from strip from
-    // keep, and SkillInfo.description is a presentation field where that
-    // newline is noise. Chomping stays observable to anyone parsing directly.
-    if (frontmatter.description !== undefined) info.description = frontmatter.description.trim();
-    if (frontmatter["user-invocable"] !== undefined) {
-      info.userInvocable = frontmatter["user-invocable"] === "true";
-    }
-    return info;
-  }
 
   // Private methods
 
@@ -12866,14 +13320,28 @@ export class AgentProcessManager {
   public respondToActivityProbe(agentId: string, probeId: string) {
     const ap = this.agents.get(agentId);
     const stickyTerminalFailure = ap ? classifyStickyFailure(ap) : null;
-    const hasPendingInjectionDebt = Boolean(ap && ap.inbox.length > 0 && !stickyTerminalFailure && !this.credentialInvalidHold(agentId, ap.config));
-    const activityKind: AgentActivityKind = hasPendingInjectionDebt ? "working" : ap?.lastActivityKind || "offline";
-    const detail = hasPendingInjectionDebt ? "Message received" : ap?.lastActivityDetail || (ap ? "" : "Agent not running");
-    const detailKind: AgentActivityDetailKind = hasPendingInjectionDebt ? "message_received" : ap?.lastActivityDetailKind ?? "runtime_unavailable";
+    // #proj-runtime:#66: held by a used-up quota, the agent is not about to
+    // take its pending messages: it shows the limit error until the reset.
+    const heldLimit = ap && !stickyTerminalFailure ? this.providerLimitHeldStatus(agentId, ap) : null;
+    const hasPendingInjectionDebt = Boolean(ap && !heldLimit && ap.inbox.length > 0 && !stickyTerminalFailure && !this.credentialInvalidHold(agentId, ap.config));
+    const activityKind: AgentActivityKind = heldLimit ? "error" : hasPendingInjectionDebt ? "working" : ap?.lastActivityKind || "offline";
+    const detail = heldLimit ? heldLimit.detail : hasPendingInjectionDebt ? "Message received" : ap?.lastActivityDetail || (ap ? "" : "Agent not running");
+    const detailKind: AgentActivityDetailKind = heldLimit ? "runtime_error" : hasPendingInjectionDebt ? "message_received" : ap?.lastActivityDetailKind ?? "runtime_unavailable";
     const launchId = ap?.launchId || undefined;
     const toolStuck = ap ? this.currentToolStuck(ap) : undefined;
     const credentialHold = ap ? this.shownCredentialHold(agentId, ap, activityKind, detailKind) : undefined;
-    this.activitySink.respondToProbe({ agentId, activityKind, detail, detailKind, launchId, ...(toolStuck ? { toolStuck } : {}), ...(credentialHold ? { credentialHold } : {}) }, probeId, this.activityProducerContext(ap));
+    // The held limit's typed diagnostic rides along: without it the server
+    // would store the error untyped (no RateLimitError: any frame clears it).
+    this.activitySink.respondToProbe({
+      agentId,
+      activityKind,
+      detail,
+      detailKind,
+      launchId,
+      ...(toolStuck ? { toolStuck } : {}),
+      ...(credentialHold ? { credentialHold } : {}),
+      ...(heldLimit ? { runtimeError: heldLimit.runtimeError } : {}),
+    }, probeId, this.activityProducerContext(ap));
     if (hasPendingInjectionDebt) {
       this.recordDaemonEvent("daemon.agent.activity_probe.pending_delivery", {
         agentId,
@@ -13077,6 +13545,7 @@ export class AgentProcessManager {
   private restoreIdleAfterIdleCompaction(agentId: string, ap: AgentProcess, options: { showQuietStatus: boolean; rotateSessionIfDue?: boolean }): void {
     // A turn-end compaction through the runtime's API is still running: its settle releases (releaseDriverCompactionHold).
     if (this.driverCompactionHolds(ap)) return;
+    this.releaseNoticeHold(agentId, ap, "compaction");
     this.recordRuntimeTraceEvent(agentId, ap, "runtime.context_compaction.idle_restored", { inboxCount: ap.inbox.length });
     const reduction = reduceApmGatedTurnEnd(ap.gatedSteering, {
       inboxLength: ap.inbox.length,
@@ -13629,6 +14098,13 @@ export class AgentProcessManager {
     ap: AgentProcess,
     event: RuntimeDeliveryErrorEvent,
   ): void {
+    // Task #triage:#399: the rejected input may have been the outstanding notice; it never reached the model.
+    this.releaseNoticeHold(agentId, ap, "delivery_rejected");
+    // Nor did a body it carried: what that kind of write carried is not reported as seen by the model.
+    const modelSeenDropped = this.dropPendingModelSeen(agentId, ap, { reason: "async_rejected", requestMethod: event.requestMethod });
+    // Focus: a body written into the turn and not confirmed is still in the inbox, told to the session.
+    // The restore below un-tells every told message, so it is queued again with notice debt, and told again.
+    const focusBodiesRequeued = this.releaseUnconfirmedFocusBodies(agentId, ap, "async_rejected");
     const pendingBefore = ap.notifications.pendingCount;
     const restoredMessages = ap.inbox.filter((message) =>
       ap.notifications.hasContributedMessage(message, ap.sessionId)
@@ -13652,6 +14128,15 @@ export class AgentProcessManager {
           this.flushAsyncRejectedIdleDelivery(agentId);
         }, this.stdinNotificationRetryMs)
       : false;
+    // Focus: a steer's rejection that arrived after its turn ended finds the agent idle, with no turn
+    // end left to tell the body it put back. The notice timer does (an idle agent's debt is flushed as
+    // an idle delivery). Mid-turn no timer is started here, but the restored debt is told as any
+    // rejected notice's is: at the turn end, or, on a runtime that takes busy input directly, on its
+    // next model event. That write lists the body as a notice row, not in full
+    // (focusBodiesRejectedInTurn), so a runtime that keeps rejecting is not steered full bodies at event rate.
+    if (focusBodiesRequeued > 0 && restoredNotificationCount > 0 && !idleRetryScheduled && this.isApmIdle(ap) && !ap.notifications.hasTimer) {
+      this.scheduleStdinNotification(agentId, ap, this.stdinNotificationRetryMs);
+    }
 
     // The rejection's text, scrubbed and bounded as on daemon.runtime.error:
     // without it the cause of a rejection loop was only in the owner's local log.
@@ -13675,6 +14160,8 @@ export class AgentProcessManager {
       restored_idle_state: event.requestMethod === "turn/start",
       idle_retry_scheduled: idleRetryScheduled,
       app_inbox_drain_deferred_ms: event.requestMethod === "turn/start" && busyRejection ? this.stdinNotificationRetryMs : 0,
+      ...(modelSeenDropped > 0 ? { model_seen_dropped_count: modelSeenDropped } : {}),
+      ...(focusBodiesRequeued > 0 ? { focus_bodies_requeued_count: focusBodiesRequeued } : {}),
     };
     this.recordRuntimeTraceEvent(agentId, ap, "runtime.delivery.async_rejected", attrs);
     this.recordDaemonEvent("daemon.agent.stdin_delivery.async_rejected", {
@@ -13710,22 +14197,43 @@ export class AgentProcessManager {
     agentId: string,
     ap: AgentProcess,
     nextState: ApmGatedSteeringDecisionState,
-  ): void {
+    options?: { deferPostIdleMaintenance?: boolean },
+  ): boolean {
     const wasIdle = this.isApmIdle(ap);
     ap.gatedSteering = commitApmGatedSteeringDecisionState(nextState);
     if (ap.gatedSteering.outstandingToolUses === 0) ap.openToolCallIds?.clear();
-    if (!wasIdle && this.isApmIdle(ap)) {
+    const becameIdle = !wasIdle && this.isApmIdle(ap);
+    if (becameIdle) {
+      // Task #triage:#399: idle, so nothing is outstanding mid-turn; held debt back to pending for the idle flush.
+      this.releaseNoticeHold(agentId, ap, "idle");
       // A restore after an unwritten notice is not the end of any work.
       // The `/compact` turn's own end is no end of the agent's work: its idle hooks already ran.
       const afterTurnEndCompaction = ap.turnEndCompaction?.skipNextIdleHooks === true;
       if (ap.turnEndCompaction) ap.turnEndCompaction.skipNextIdleHooks = false;
       if (!this.appInboxIdleDrains.has(agentId) && !afterTurnEndCompaction) this.notifyAgentWorkingToIdle(agentId);
       this.drainAppInboxAfterIdleTransition(agentId);
-      // Only one of the two acts on a turn end: warm recycle goes first when
-      // its gate passes (the session is about to be replaced; compacting it
-      // first would pay for a context nothing resumes).
-      if (!this.maybeMarkWarmRecycle(agentId, ap)) this.maybeCompactAtTurnEnd(agentId, ap);
+      if (!options?.deferPostIdleMaintenance) {
+        this.maybeRunPostIdleMaintenance(agentId, ap);
+      }
     }
+    return becameIdle;
+  }
+
+  /**
+   * Post-idle session maintenance (#proj-runtime:#54 / #67): runs after the turn
+   * end has settled tracked mentions, emitted the quiet status, closed the turn
+   * trace, and reconciled spec drift (or after `queued_input_settled` / presumed
+   * silent background tasks clear the last idle guard). Only one of the two acts
+   * on an idle edge: warm recycle goes first when its gate passes (the session
+   * is about to be replaced; compacting it first would pay for a context nothing
+   * resumes).
+   */
+  private maybeRunPostIdleMaintenance(agentId: string, ap: AgentProcess): void {
+    if (this.agents.get(agentId) !== ap || ap.exit.kind !== "live") return;
+    if (!this.isApmIdle(ap)) return;
+    if (ap.gatedSteering.expectedTerminationReason !== null || this.runtimeStopping(ap)) return;
+    if (this.coldIdleChecks.has(agentId)) return;
+    if (!this.maybeMarkWarmRecycle(agentId, ap)) this.maybeCompactAtTurnEnd(agentId, ap);
   }
 
   /**
@@ -13739,17 +14247,33 @@ export class AgentProcessManager {
     const config = resolveWarmRecycleConfig(ap.config);
     if (!config.enabled) return false;
     const sessionId = ap.sessionId || ap.driver.currentSessionId || null;
+    const state = ap.turnEndCompaction;
+    // The turn-end compaction gate's facts: the last result's context and the model's window.
+    const priorRecycleYielded = Boolean(sessionId && this.wakeRecycleFailures.hasFailed(agentId, sessionId));
+    if (priorRecycleYielded && this.wakeRecycleFailures.noteYield(agentId, sessionId, "warm_recycle")) {
+      this.recordDaemonEvent("daemon.agent.wake_recycle.yielded", {
+        agentId,
+        runtime: ap.config.runtime ?? "claude",
+        gate: "warm_recycle",
+        reason: "prior_recycle_start_failed",
+        host: "legacy",
+      });
+    }
+    const decision = state && sessionId && !state.inFlight && !state.attempting && !this.warmRecycle.declined(agentId, sessionId) && !priorRecycleYielded && this.warmRecycleStoppable(agentId, ap)
+      ? decideWarmRecycleMark(config, state.facts)
+      : null;
+    if (!sessionId || !decision?.mark) {
+      // This turn end decides again: a mark an earlier one left is not kept past it.
+      // Do not consume a compaction yield while the process isn't stoppable (e.g.
+      // queuedInputPending): the settle retry needs it so compaction isn't starved.
+      this.warmRecycle.cancel(agentId);
+      return false;
+    }
     // A mark cancelled before its stop (a delivery, another turn) skipped its
     // turn end's compaction: this turn end is compaction's, below the ceiling
     // (asked once; the turn end after it may mark again).
-    const yieldToCompaction = sessionId ? this.warmRecycle.takeYield(agentId, sessionId) : false;
-    const state = ap.turnEndCompaction;
-    // The turn-end compaction gate's facts: the last result's context and the model's window.
-    const decision = state && sessionId && !state.inFlight && !state.attempting && !this.warmRecycle.declined(agentId, sessionId) && this.warmRecycleStoppable(agentId, ap)
-      ? decideWarmRecycleMark(config, state.facts)
-      : null;
-    if (!sessionId || !decision?.mark || (yieldToCompaction && decision.band === "quiet")) {
-      // This turn end decides again: a mark an earlier one left is not kept past it.
+    const yieldToCompaction = this.warmRecycle.takeYield(agentId, sessionId);
+    if (yieldToCompaction && decision.band === "quiet") {
       this.warmRecycle.cancel(agentId);
       return false;
     }
@@ -13857,7 +14381,8 @@ export class AgentProcessManager {
       notIdleReason: this.agentNotIdle(agentId, ap),
       compacting: ap.gatedSteering.compacting || ap.compaction?.kind === "active",
       stopping: ap.gatedSteering.expectedTerminationReason !== null || this.runtimeStopping(ap),
-      untoldInbox: this.hasUntoldInboxWork(ap) || this.appInboxIdleDrains.has(agentId),
+      // A deferred app-inbox drain and a drain's hold are deliveries waiting too.
+      untoldInbox: this.hasUntoldInboxWork(ap) || this.appInboxIdleDrains.has(agentId) || this.appInboxDeferredDrainTimers.has(agentId) || this.drain.holds(agentId),
       failureState: this.runtimeErrorDeliveryBackoffRemainingMs(ap) > 0 || Boolean(classifyStickyFailure(ap)) || Boolean(ap.lastRuntimeError) || Boolean(this.credentialInvalidHold(agentId, ap.config)),
       serverContextPending: this.serverContext.pending(agentId, { processInstanceId: ap.processInstanceId, sessionId }) !== null,
       deliverable: this.canDeliverToRuntimeSession(ap) && ap.driver.supportsStdinNotification === true,
@@ -14042,11 +14567,13 @@ export class AgentProcessManager {
       outcome: inFlight.finishedAtMs !== null ? "completed" : "failed:not_compacted",
       duration_ms: nowMs - inFlight.startedAtMs,
       ...(inFlight.contextTokens !== null ? { context_tokens: inFlight.contextTokens } : {}),
+      // What Claude's compaction left (`compact_metadata.post_tokens`), when it said.
+      ...(inFlight.contextAfterTokens !== undefined ? { context_after_tokens: inFlight.contextAfterTokens } : {}),
       deliveries_held: held,
       // Deliveries queued behind the /compact turn waited at most this long.
       ...(held > 0 ? { hold_ms: nowMs - inFlight.startedAtMs } : {}),
     }, inFlight.finishedAtMs !== null ? "ok" : "error");
-    logger.info(turnEndCompactionLogLine({ agentId, host: "legacy", outcome: inFlight.finishedAtMs !== null ? "completed" : "failed:not_compacted", contextTokens: inFlight.contextTokens, durationMs: nowMs - inFlight.startedAtMs }));
+    logger.info(turnEndCompactionLogLine({ agentId, host: "legacy", outcome: inFlight.finishedAtMs !== null ? "completed" : "failed:not_compacted", contextTokens: inFlight.contextTokens, contextAfterTokens: inFlight.contextAfterTokens ?? null, durationMs: nowMs - inFlight.startedAtMs }));
   }
 
   private notifyAgentWorkingToIdle(agentId: string): void {
@@ -14059,9 +14586,14 @@ export class AgentProcessManager {
     }
   }
 
-  private commitApmIdleState(agentId: string, ap: AgentProcess, nextIsIdle: boolean): void {
+  private commitApmIdleState(
+    agentId: string,
+    ap: AgentProcess,
+    nextIsIdle: boolean,
+    options?: { deferPostIdleMaintenance?: boolean },
+  ): boolean {
     const reduction = reduceApmIdleState(ap.gatedSteering, { isIdle: nextIsIdle });
-    this.commitGatedSteeringDecisionState(agentId, ap, reduction.nextState);
+    return this.commitGatedSteeringDecisionState(agentId, ap, reduction.nextState, options);
   }
 
   private pruneAppInboxNoticeMemo(agentId: string, items: readonly AgentInboxAppItem[]): void {
@@ -14398,6 +14930,8 @@ export class AgentProcessManager {
 
   private flushCompactionBoundaryMessages(agentId: string, ap: AgentProcess): boolean {
     if (this.driverCompactionHolds(ap)) return false;
+    // Task #triage:#399: a compaction boundary ends the outstanding notice; what it held is pending again, flushed below.
+    this.releaseNoticeHold(agentId, ap, "compaction");
     const reduction = reduceApmGatedCompactionBoundaryFlush(ap.gatedSteering, {
       hasSession: Boolean(ap.sessionId),
       supportsStdinNotification: ap.driver.supportsStdinNotification,
@@ -14550,6 +15084,55 @@ export class AgentProcessManager {
     this.sendStartupReady(agentId, ap);
   }
 
+  /**
+   * #wg-ax:#3: retire a wake-recycled start's prior session only once a
+   * non-error readiness event arrives, so an immediate error event never
+   * overwrites the prior session on the server before failure handling runs.
+   */
+  private retireRecycledPriorSession(agentId: string, ap: AgentProcess): void {
+    if (ap.recycledFromSessionId) {
+      // #wg-ax:#3: if startup already timed out / failed or this process is
+      // being terminated, a late event (e.g. Claude `session_init` arriving
+      // while SIGTERM is in flight) must never undo the fallback.
+      if (
+        ap.exit.kind !== "live"
+        || ap.gatedSteering.expectedTerminationReason !== null
+        || this.wakeRecycleFailures.hasFailed(agentId, ap.recycledFromSessionId)
+      ) {
+        return;
+      }
+      const retiredSessionId = ap.recycledFromSessionId;
+      ap.recycledFromSessionId = null;
+      rememberSessionContext(ap.cliTransportDir, retiredSessionId, null);
+      this.wakeRecycleFailures.clear(agentId);
+      if (ap.sessionId) {
+        this.reportSession(agentId, ap, ap.sessionId);
+        this.sendRuntimeProfileReport(agentId, "session_init");
+      }
+    } else if (ap.sessionId && !this.wakeRecycleFailures.hasFailed(agentId, ap.sessionId)) {
+      this.wakeRecycleFailures.clear(agentId);
+    }
+  }
+
+  private recordFailedWakeRecycleStart(
+    agentId: string,
+    priorSessionId: string,
+    runtime: string,
+    reason: string,
+    launchId: string | null,
+  ): void {
+    if (this.wakeRecycleFailures.hasFailed(agentId, priorSessionId)) return;
+    this.wakeRecycleFailures.recordFailedRecycle(agentId, priorSessionId);
+    logger.warn(`[Agent ${agentId}] Recycled ${runtime} start failed before readiness (${reason}); next wake will resume prior session ${priorSessionId}`);
+    this.recordDaemonEvent("daemon.agent.wake_recycle.start_failed", {
+      agentId,
+      launchId: launchId || undefined,
+      runtime,
+      reason,
+      host: "legacy",
+    }, "error");
+  }
+
   private sendStartupReady(agentId: string, ap: AgentProcess): void {
     if (!ap.launchId) return;
     this.sendToServer({ type: "agent:runtime:ready", agentId, launchId: ap.launchId });
@@ -14614,6 +15197,9 @@ export class AgentProcessManager {
     this.broadcastActivity(agentId, "error", detail, [{ kind: "text", text: `Error: ${detail}` }], ap.launchId, "runtime_error");
     // A typed start failure (with `inactive`), so the server's wake breaker
     // counts it toward its failed-start pause.
+    if (ap.recycledFromSessionId) {
+      this.recordFailedWakeRecycleStart(agentId, ap.recycledFromSessionId, ap.config.runtime ?? "claude", "runtime_start_timeout", ap.launchId);
+    }
     this.reportStartFailure(agentId, ap.launchId, startTimeoutClassification(detail), ap.config.model);
     this.cacheStartupTimeoutRetryConfig(agentId, ap);
     this.runtimeExitTraceAttrs.set(ap.runtime, projection.processExitAttrs);
@@ -14623,6 +15209,9 @@ export class AgentProcessManager {
   private handleRuntimeStartupRequestError(agentId: string, ap: AgentProcess, event: StartupRequestErrorEvent) {
     const current = this.agents.get(agentId);
     if (current !== ap) return;
+    if (ap.recycledFromSessionId) {
+      this.recordFailedWakeRecycleStart(agentId, ap.recycledFromSessionId, ap.config.runtime ?? "claude", "startup_request_error", ap.launchId);
+    }
     this.closeRuntimeReadinessTransition(ap, "terminal");
     this.closeActivationTransition(ap, "terminal");
     this.clearRuntimeStartupTimeout(ap);
@@ -14640,9 +15229,9 @@ export class AgentProcessManager {
     ap.notifications.clearTimer();
 
     const diagnostics = buildRuntimeErrorDiagnosticEnvelope(event.message);
-    const visibleErrorMessage = diagnostics.spanAttrs.runtime_error_action_required === true
-      ? formatRuntimeActionRequiredMessage(ap, event.message)
-      : event.message;
+    const startupConfigFailure = diagnostics.spanAttrs.runtime_error_action_required === true
+      ? null
+      : classifyRuntimeStartupConfigFailure(event.message, ap.driver.id);
     const failureAttrs = {
       turn_outcome: "failed",
       turn_subtype: "runtime_start_failed",
@@ -14670,16 +15259,41 @@ export class AgentProcessManager {
     logger.warn(
       `[Agent ${agentId}] ${ap.driver.id} startup request ${event.startupRequestMethod} failed; terminating unusable runtime process`,
     );
-    // The typed carrier (as on the regular runtime error paths) lets the
-    // server see an error that needs the owner (a Codex or Grok login failing
-    // at initialize, before any output): it pauses automatic wakes and tells
-    // the owner once, and ends a start-timeout pause's self-retry when this
-    // start was its try. Daemons before this send no carrier here, so the
-    // server cannot tell; such a pause keeps retrying on its cooldown.
-    this.broadcastActivity(agentId, "error", visibleErrorMessage, [
-      { kind: "text", text: `Error: ${visibleErrorMessage}` },
-    ], ap.launchId, "runtime_error", "error", undefined, buildRuntimeErrorActivityDiagnostic(event.message));
-    this.sendAgentStatus(agentId, "inactive", ap.launchId);
+    if (diagnostics.spanAttrs.runtime_error_action_required === true) {
+      // The typed carrier (as on the regular runtime error paths) lets the
+      // server see an error that needs the owner (a Codex or Grok login failing
+      // at initialize, before any output): it pauses automatic wakes and tells
+      // the owner once, and ends a start-timeout pause's self-retry when this
+      // start was its try. Daemons before this send no carrier here, so the
+      // server cannot tell; such a pause keeps retrying on its cooldown.
+      const visibleErrorMessage = formatRuntimeActionRequiredMessage(ap, event.message);
+      this.broadcastActivity(agentId, "error", visibleErrorMessage, [
+        { kind: "text", text: `Error: ${visibleErrorMessage}` },
+      ], ap.launchId, "runtime_error", "error", undefined, buildRuntimeErrorActivityDiagnostic(event.message));
+      this.sendAgentStatus(agentId, "inactive", ap.launchId);
+    } else {
+      // #wg-ax:#3: startup request failures not owned by a typed runtime
+      // requiredAction (e.g. auth/billing) report a typed start failure ONLY
+      // (no preceding `runtime_error` activity, which would persist a
+      // non-spawn-failure `lastRuntimeError` and mask the paused
+      // `runtime_unavailable` snapshot on page reload). The public `detail`
+      // stays fixed safe copy (#wg-rbac:#57); scrubbed raw error text rides in
+      // manager-only `spawnFailure.message` (`errorText`), and daemon traces
+      // above keep the raw error fingerprint.
+      const userMessage = startupConfigFailure?.userMessage
+        ?? `${runtimeDisplayName(ap.driver.id)} failed to start on this Computer. Check the Computer logs for details and retry.`;
+      this.reportStartFailure(
+        agentId,
+        ap.launchId,
+        {
+          reason: startupConfigFailure?.reason ?? "runtime_spawn_failed",
+          detail: userMessage,
+          userMessage,
+          errorText: startupConfigFailure?.errorText ?? event.message,
+        },
+        ap.config.model,
+      );
+    }
     this.lifecycleRecords.deleteRestartSnapshot(agentId);
     this.runtimeExitTraceAttrs.set(ap.runtime, {
       stop_source: "startup_request_error",
@@ -14771,9 +15385,10 @@ export class AgentProcessManager {
     const ap = this.agents.get(agentId);
     const result = await (async (): Promise<{ outcome: AgentSideAskOutcome; text?: string }> => {
       if (!ap || ap.exit.kind !== "live") return { outcome: "agent_not_running" };
-      const transcriptPath = ap.config.runtime === "claude" && ap.sessionId
-        ? resolveRuntimeSessionRef("claude", ap.sessionId).path ?? null
+      const transcriptRef = ap.config.runtime === "claude" && ap.sessionId
+        ? resolveRuntimeSessionRef("claude", ap.sessionId)
         : null;
+      const transcriptPath = transcriptRef?.reachable ? (transcriptRef.path ?? null) : null;
       if (request.kind === "status") {
         const working = transcriptPath ? await collectClaudeWorkingState(transcriptPath) : { notes: [], todos: null };
         const openTool = ap.toolStuck?.oldestOpenCall();
@@ -14802,7 +15417,13 @@ export class AgentProcessManager {
       // No launch env: no `raft` wrapper on PATH and nothing of the agent's
       // launch; only the provider env the agent's own model call uses.
       const env = sideQuestionEnv(ambientProcessEnv(), claudeSideQuestionProviderEnv(ap.config));
-      const args = claudeSideQuestionArgs({ sessionId: ap.sessionId, model: launchFields.model || "sonnet", standingPromptFilePath });
+      const model = launchFields.model === "default" ? null : (launchFields.model?.trim() || "sonnet");
+      const args = claudeSideQuestionArgs({
+        sessionId: ap.sessionId,
+        model,
+        standingPromptFilePath,
+        customProvider: isClaudeCustomProviderConfig(ap.config),
+      });
       const cwd = path.join(this.dataDir, agentId);
       return await this.sideQuestions.run(agentId, {
         start: () => startClaudeSideQuestion(ap.config, args, env, cwd),
@@ -15026,10 +15647,10 @@ export class AgentProcessManager {
    * open tool is the remaining question (the snapshot emits a trace fact);
    * the reducer still owns the runtime-shape gates.
    */
-  private openToolHoldsNoLiveWork(agentId: string, ap: AgentProcess, staleForMs: number): boolean {
+  private openToolHoldsNoLiveWork(agentId: string, ap: AgentProcess, staleForMs: number, appInboxNoticeWaiting: boolean): boolean {
     if (
       ap.gatedSteering.outstandingToolUses === 0
-      || ap.inbox.length === 0
+      || (ap.inbox.length === 0 && !appInboxNoticeWaiting)
       || !ap.sessionId
       || ap.gatedSteering.expectedTerminationReason === "stalled_recovery"
       || (staleForMs < RUNTIME_PROGRESS_STALE_MS && !ap.runtimeProgress.isStale)
@@ -15072,6 +15693,7 @@ export class AgentProcessManager {
     const staleForMs = ap.runtimeProgress.ageMs();
     const facts = {
       inboxLength: ap.inbox.length,
+      appInboxNoticeWaiting: this.appInboxNoticeWaiting(agentId),
       turnInProgress: !this.isApmIdle(ap),
       deliveryHold: this.stalledWithWorkDeliveryHold(agentId, ap),
       supportsStdinNotification: ap.driver.supportsStdinNotification,
@@ -15087,7 +15709,7 @@ export class AgentProcessManager {
     if (reduction.blockedReason === "runtime_not_restartable" && ap.gatedSteering.outstandingToolUses > 0 && ap.driver.supportsStdinNotification) {
       reduction = reduceApmStalledRecoveryTermination(ap.gatedSteering, {
         ...facts,
-        openToolHoldsNoLiveWork: this.openToolHoldsNoLiveWork(agentId, ap, staleForMs),
+        openToolHoldsNoLiveWork: this.openToolHoldsNoLiveWork(agentId, ap, staleForMs, facts.appInboxNoticeWaiting),
       });
     }
     if (reduction.alreadyRecovering) {
@@ -15110,6 +15732,26 @@ export class AgentProcessManager {
     }
     this.replaceStalledProcess(agentId, ap, trigger, reduction.nextState, staleForMs, this.lifecycleRecords.noteStalledReplacement(agentId));
     return true;
+  }
+
+  /**
+   * stalledWithWork's `appInboxNoticeWaiting`: a busy-refused app notice that
+   * may wake the agent (appInboxBusyDeferrals) and whose item is still in the
+   * Inbox. A wait whose item left it (the agent acknowledged it in its turn)
+   * is over. The store is read only while such a wait is open.
+   */
+  private appInboxNoticeWaiting(agentId: string): boolean {
+    const deferral = this.appInboxBusyDeferrals.get(agentId);
+    if (!deferral?.wakes) return false;
+    let appItems: readonly AgentInboxAppItem[];
+    try {
+      appItems = this.#appInboxForAgent?.(agentId).list() ?? [];
+    } catch (error) {
+      // Runs inside reconcile: a store failure decides nothing.
+      this.recordAppInboxUnavailable(agentId, "stall_check", error);
+      return false;
+    }
+    return this.undeliveredAppInboxItems(agentId, appItems).some((item) => item.itemId === deferral.itemId);
   }
 
   /** Why queued messages wait on purpose (stalledWithWork's `deliveryHold`): the same holds a delivery is queued behind. */
@@ -15160,7 +15802,10 @@ export class AgentProcessManager {
   /**
    * E2 for a stall: the stalled-recovery stop (SIGTERM now, whatever the
    * turn); the close path restarts the agent with the queued messages,
-   * resuming the session (`restart_stall`).
+   * resuming the session (`restart_stall`). An app notice waiting for the
+   * turn (appInboxNoticeWaiting) becomes a waking after-turn notice: with
+   * messages it rides the restart's first input, alone the close wakes the
+   * agent for it (wakeForAppInboxNoticeAfterTurn).
    */
   private replaceStalledProcess(
     agentId: string,
@@ -15171,6 +15816,13 @@ export class AgentProcessManager {
     streak: number,
   ): void {
     this.commitGatedSteeringDecisionState(agentId, ap, nextState);
+    const waitingNotice = this.appInboxBusyDeferrals.get(agentId);
+    const appInboxNoticeWaiting = waitingNotice?.wakes === true && this.appInboxNoticeWaiting(agentId);
+    if (appInboxNoticeWaiting) {
+      const wakeItemIds = new Set(this.appInboxNoticesAfterTurn.get(agentId)?.wakeItemIds ?? []);
+      wakeItemIds.add(waitingNotice.itemId);
+      this.appInboxNoticesAfterTurn.set(agentId, { wakeItemIds });
+    }
     const staleForMinutes = Math.max(1, Math.floor(staleForMs / 60_000));
     ap.runtimeProgress.markStale();
     const diagnostic = buildRuntimeStallDiagnostic(ap, staleForMs, staleForMinutes);
@@ -15214,17 +15866,71 @@ export class AgentProcessManager {
       delay_ms_bucket: bucketMs(staleForMs),
       trigger,
       streak,
+      app_inbox_notice_waiting: appInboxNoticeWaiting,
     });
   }
 
   /** Handle a single ParsedEvent from any runtime driver */
-  private notePushedModelBodies(ap: AgentProcess, messages: readonly AgentMessage[]): void {
-    const reportable = messages.filter((message) =>
+  private notePushedModelBodies(ap: AgentProcess, messages: readonly AgentMessage[], write: ModelSeenWrite): void {
+    const reportable = this.modelSeenReportable(messages);
+    if (reportable.length === 0) return;
+    ap.pendingModelSeen = [
+      ...(ap.pendingModelSeen ?? []),
+      ...reportable.map((message): PendingModelSeenEntry => ({ ...write, message })),
+    ];
+  }
+
+  /** The messages `agent:model-seen` can name: a Server row with a seq, not a runtime-profile control message. */
+  private modelSeenReportable(messages: readonly AgentMessage[]): AgentMessage[] {
+    return messages.filter((message) =>
       typeof message.seq === "number" && message.seq > 0
       && Boolean(message.channel_id)
       && !runtimeProfileNotificationFromMessage(message));
-    if (reportable.length === 0) return;
-    ap.pendingModelSeen = [...(ap.pendingModelSeen ?? []), ...reportable];
+  }
+
+  /**
+   * Bodies noted for `agent:model-seen` that can no longer be shown to have
+   * reached the model are not reported.
+   *
+   * `async_rejected`: the runtime took a write and then rejected it. Every
+   * unreported body of a live write goes, whatever request was rejected: how
+   * a write was accepted does not say how the runtime sent it (Pi accepts an
+   * idle write as a prompt while its session is streaming and may then send
+   * it as a steer, whose rejection names `turn/steer`), and the event names
+   * no write. A start's first input goes only with a rejected `turn/start`.
+   *
+   * `session_changed`: entries of a live write to another session than
+   * `nextSessionId` go; a start's first input stays, and so does a live
+   * write whose session was not known.
+   *
+   * Under-reporting only: the messages stay unread on the Server. The local
+   * consume of such a body is not undone (the ledger has no retraction), so
+   * this Computer does not offer the message again.
+   */
+  private dropPendingModelSeen(
+    agentId: string,
+    ap: AgentProcess,
+    cause: { reason: "async_rejected"; requestMethod: RuntimeDeliveryErrorEvent["requestMethod"] } | { reason: "session_changed"; nextSessionId: string | null },
+  ): number {
+    const pending = ap.pendingModelSeen;
+    if (!pending || pending.length === 0) return 0;
+    const kept = pending.filter((entry) => {
+      if (cause.reason === "session_changed") return entry.kind === "start" || entry.sessionId === null || entry.sessionId === cause.nextSessionId;
+      return entry.kind === "start" && cause.requestMethod !== "turn/start";
+    });
+    const dropped = pending.length - kept.length;
+    if (dropped === 0) return 0;
+    ap.pendingModelSeen = kept;
+    this.recordDaemonEvent("daemon.agent.model_seen.dropped", {
+      agentId,
+      launchId: ap.launchId || undefined,
+      runtime: ap.config.runtime,
+      host: "legacy",
+      reason: cause.reason,
+      ...(cause.reason === "async_rejected" ? { request_method: cause.requestMethod } : {}),
+      messages_count: dropped,
+    });
+    return dropped;
   }
 
   /**
@@ -15236,8 +15942,14 @@ export class AgentProcessManager {
     const pending = ap.pendingModelSeen;
     if (!pending || pending.length === 0) return;
     ap.pendingModelSeen = [];
+    this.reportModelSeen(agentId, ap, pending.map((entry) => entry.message));
+  }
+
+  /** Send `agent:model-seen` for these messages (each has a seq and a channel). */
+  private reportModelSeen(agentId: string, ap: AgentProcess, messages: readonly AgentMessage[]): void {
+    if (messages.length === 0) return;
     const byChannel = new Map<string, Set<number>>();
-    for (const message of pending) {
+    for (const message of messages) {
       const seqs = byChannel.get(message.channel_id) ?? new Set<number>();
       seqs.add(message.seq!);
       byChannel.set(message.channel_id, seqs);
@@ -15255,8 +15967,150 @@ export class AgentProcessManager {
       agentId,
       launchId: ap.launchId || undefined,
       conversations_count: items.length,
-      messages_count: pending.length,
+      messages_count: messages.length,
     });
+  }
+
+  /**
+   * Focus: these bodies were written into a turn in flight. They stay in the
+   * inbox, unconfirmed; the caller records them as told to the session, which
+   * keeps them out of every later write and notice.
+   */
+  private noteUnconfirmedFocusBodies(ap: AgentProcess, bodies: readonly AgentMessage[], renderedContextMessages: readonly AgentMessage[]): void {
+    if (bodies.length === 0) return;
+    const written = new Set(bodies);
+    const withContext = new Set(renderedContextMessages);
+    ap.unconfirmedFocusBodies = [
+      ...(ap.unconfirmedFocusBodies ?? []).filter((entry) => !written.has(entry.message)),
+      ...bodies.map((message): UnconfirmedFocusBody => ({ message, sessionId: ap.sessionId, renderedContext: withContext.has(message), turnEnded: false })),
+    ];
+  }
+
+  private clearFocusBodyConfirmTimer(ap: AgentProcess): void {
+    if (!ap.focusBodyConfirmTimer) return;
+    clearTimeout(ap.focusBodyConfirmTimer);
+    ap.focusBodyConfirmTimer = undefined;
+  }
+
+  /**
+   * Focus: the turn the unconfirmed bodies were written into has ended. With
+   * no rejection so far they are confirmed after a short wait
+   * (FOCUS_BODY_CONFIRM_GRACE_MS), which a rejection that raced the turn end
+   * cancels. `decidable` false (the daemon interrupted the turn, or it ended
+   * through an error, so its end says nothing about a steer): they are
+   * released without being consumed or reported. They are not left for the
+   * next turn's first model event: that turn may be opened by an unrelated
+   * message after the runtime dropped the steer with the failed turn, and
+   * its events would then report a body the model never saw. A released body
+   * stays in the inbox, told to the session: the agent reaches it through
+   * `raft inbox check`, a read, or the next start. A
+   * body rejected in this turn may be written in full again from here on. Nothing here touches the inbox:
+   * the bodies are already told to the session, so the turn end's own flush
+   * does not write them again.
+   */
+  private noteTurnEndForFocusBodies(agentId: string, ap: AgentProcess, decidable: boolean): void {
+    ap.focusBodiesRejectedInTurn = undefined;
+    const entries = ap.unconfirmedFocusBodies;
+    if (!entries || entries.length === 0) return;
+    for (const entry of entries) entry.turnEnded = true;
+    if (!decidable) {
+      this.releaseUnconfirmedFocusBodies(agentId, ap, "turn_not_decidable");
+      return;
+    }
+    this.clearFocusBodyConfirmTimer(ap);
+    const timer = setTimeout(() => {
+      if (ap.focusBodyConfirmTimer !== timer) return;
+      ap.focusBodyConfirmTimer = undefined;
+      if (this.agents.get(agentId) === ap) this.confirmFocusBodies(agentId, ap, "turn_end");
+    }, FOCUS_BODY_CONFIRM_GRACE_MS);
+    (timer as { unref?: () => void }).unref?.();
+    ap.focusBodyConfirmTimer = timer;
+  }
+
+  /**
+   * Focus: the bodies whose turn has ended count as shown now: out of the
+   * inbox, their tracked mentions acknowledged (by the consume), and reported
+   * (`agent:model-seen`). One that is no longer waiting as it was written
+   * (read or purged meanwhile, another session, put back by a rejection) is
+   * left to whatever took it and is not reported here.
+   */
+  private confirmFocusBodies(agentId: string, ap: AgentProcess, trigger: "turn_end" | "next_turn_model_event"): void {
+    const entries = ap.unconfirmedFocusBodies;
+    if (!entries || !entries.some((entry) => entry.turnEnded)) return;
+    this.clearFocusBodyConfirmTimer(ap);
+    const ready = entries.filter((entry) => entry.turnEnded);
+    ap.unconfirmedFocusBodies = entries.filter((entry) => !entry.turnEnded);
+    const confirmed = ready.filter((entry) =>
+      entry.sessionId === ap.sessionId
+      && ap.inbox.includes(entry.message)
+      && ap.notifications.hasContributedMessage(entry.message, ap.sessionId));
+    if (confirmed.length > 0) {
+      const messages = confirmed.map((entry) => entry.message);
+      this.recordRenderedThreadJoinContextReceipts(agentId, confirmed.filter((entry) => entry.renderedContext).map((entry) => entry.message));
+      this.consumeVisibleMessages(agentId, { messages, source: "stdin_focus_body_delivery" });
+      this.reportModelSeen(agentId, ap, this.modelSeenReportable(messages));
+    }
+    this.recordDaemonEvent("daemon.agent.focus_body.confirmed", {
+      agentId,
+      launchId: ap.launchId || undefined,
+      runtime: ap.config.runtime,
+      host: "legacy",
+      trigger,
+      messages_count: confirmed.length,
+      not_waiting_count: ready.length - confirmed.length,
+    });
+  }
+
+  /**
+   * Focus: unconfirmed bodies stop being unconfirmed without having been
+   * shown (a rejected write, another session; a stop clears them with the
+   * process's timers). Nothing is consumed or reported; the messages are still in the inbox, and
+   * whatever un-tells the session's told messages (the rejection's restore,
+   * the session-scoped told record) makes them ordinary queued messages
+   * again. `nextSessionId`: only the bodies written to another session go.
+   */
+  private releaseUnconfirmedFocusBodies(agentId: string, ap: AgentProcess, reason: "async_rejected" | "session_changed" | "turn_not_decidable", nextSessionId?: string | null): number {
+    const entries = ap.unconfirmedFocusBodies;
+    if (!entries || entries.length === 0) {
+      if (reason !== "session_changed") this.clearFocusBodyConfirmTimer(ap);
+      return 0;
+    }
+    const kept = reason === "session_changed" ? entries.filter((entry) => entry.sessionId === nextSessionId) : [];
+    const released = entries.length - kept.length;
+    ap.unconfirmedFocusBodies = kept;
+    if (reason === "session_changed") {
+      // What a turn of the session that was left rejected does not bind the new session.
+      if (released > 0) ap.focusBodiesRejectedInTurn = undefined;
+    } else if (reason === "async_rejected" && !this.isApmIdle(ap)) {
+      // Rejected inside the turn in flight: not steered in full again before it ends.
+      const rejected = ap.focusBodiesRejectedInTurn ?? new Set<AgentMessage>();
+      for (const entry of entries) if (!entry.turnEnded) rejected.add(entry.message);
+      ap.focusBodiesRejectedInTurn = rejected;
+    }
+    if (kept.length === 0) this.clearFocusBodyConfirmTimer(ap);
+    if (released === 0) return 0;
+    this.recordDaemonEvent("daemon.agent.focus_body.unconfirmed_released", {
+      agentId,
+      launchId: ap.launchId || undefined,
+      runtime: ap.config.runtime,
+      host: "legacy",
+      reason,
+      messages_count: released,
+    });
+    return released;
+  }
+
+  /**
+   * The inbox messages a notice counts as waiting to be read: not the bodies
+   * `writing` puts in front of the model in the same input, and not a body
+   * written earlier that is only waiting to be confirmed.
+   */
+  private inboxCountBesideFocusBodies(ap: AgentProcess, writing: readonly AgentMessage[] = []): number {
+    const unconfirmed = ap.unconfirmedFocusBodies;
+    if (writing.length === 0 && (!unconfirmed || unconfirmed.length === 0)) return ap.inbox.length;
+    const bodies = new Set<AgentMessage>(writing);
+    for (const entry of unconfirmed ?? []) bodies.add(entry.message);
+    return ap.inbox.filter((message) => !bodies.has(message)).length;
   }
 
   private handleParsedEvent(agentId: string, event: ParsedEvent, driver: RuntimeDriver) {
@@ -15271,6 +16125,8 @@ export class AgentProcessManager {
       const association = this.deliveryConsumptionAssociation(ap, event);
       if (association === "associated") {
         ap.deliveryConsumption.recordConsumption(event.kind, Date.now());
+        // Focus: the model moves in a turn after the one a body was written into.
+        if (event.kind !== "turn_end") this.confirmFocusBodies(agentId, ap, "next_turn_model_event");
         this.flushModelSeen(agentId, ap);
       } else {
         this.recordDaemonEvent("daemon.agent.delivery.consumption.ignored", {
@@ -15376,6 +16232,7 @@ export class AgentProcessManager {
     if (ap) {
       const wasStalled = ap.runtimeProgress.isStale;
       if (this.runtimeStartupReadinessSatisfiedByEvent(ap, event)) {
+        if (event.kind !== "error") this.retireRecycledPriorSession(agentId, ap);
         this.markRuntimeStartupReady(agentId, ap);
         this.closeRuntimeReadinessTransition(ap, "advanced");
       }
@@ -15424,7 +16281,14 @@ export class AgentProcessManager {
         : event.kind === "runtime_recovery"
           ? runtimeRecoveryTraceAttrs(event)
           : runtimeTurnEventTraceAttrs(event);
-      this.recordRuntimeTraceEvent(agentId, ap, "runtime.event.received", eventAttrs);
+      // #proj-runtime:#68: only a turn's first `internal_progress` goes on the
+      // turn span as events; later ones are counted (runtime_internal_progress_count),
+      // so a busy runtime no longer spends the span budget and cuts off the turn's end.
+      const repeatInternalProgress = event.kind === "internal_progress"
+        && Boolean(ap.runtimeTraceSpan)
+        && ap.runtimeTraceCounters.internalProgress > 0;
+      if (event.kind === "internal_progress" && ap.runtimeTraceSpan) ap.runtimeTraceCounters.internalProgress++;
+      if (!repeatInternalProgress) this.recordRuntimeTraceEvent(agentId, ap, "runtime.event.received", eventAttrs);
       const recordProgressObservedAfterStall = () => {
         if (!wasStalled) return;
         this.recordRuntimeTraceEvent(agentId, ap, "runtime.progress.observed", { afterStall: true });
@@ -15435,7 +16299,7 @@ export class AgentProcessManager {
         recordProgressObservedAfterStall();
         this.invalidateRecoveryErrorView(ap);
         this.clearRuntimeErrorDeliveryBackoffAfterProgress(agentId, ap, event.kind);
-        this.recordRuntimeTraceEvent(agentId, ap, "runtime.progress.internal_observed", {
+        if (!repeatInternalProgress) this.recordRuntimeTraceEvent(agentId, ap, "runtime.progress.internal_observed", {
           turn_outcome: "held",
           turn_subtype: "runtime_progress",
           turn_reason: "internal_activity_observed",
@@ -15482,12 +16346,15 @@ export class AgentProcessManager {
       }
       this.noteRuntimeProgress(agentId, ap, event.kind);
       // A turn end resets the crash streak only when no runtime error preceded
-      // it (cursor reports a failed turn as error + turn_end). Model output
-      // resets it in the text/thinking/tool_call handlers below.
-      if (event.kind === "turn_end" && !ap.lastRuntimeError) {
+      // it (cursor reports a failed turn as error + turn_end) and the process
+      // actually produced model output (Grok ends a rejected prompt's turn
+      // bare, before the error arrives, so a bare turn_end must not reset the
+      // close streak and pin rate-limit restart backoff at attempt 1). Model
+      // output also resets it in the text/thinking/tool_call handlers below.
+      if (event.kind === "turn_end" && !ap.lastRuntimeError && ap.modelOutputObserved) {
         this.resetRuntimeErrorCloseStreak(agentId, "runtime_progress:turn_end", ap);
         // Reconciler step 12: a turn of the new session completed with output; it fits again.
-        if (ap.modelOutputObserved) this.lifecycleRecords.exitStreaks.sticky.endSessionReset(agentId);
+        this.lifecycleRecords.exitStreaks.sticky.endSessionReset(agentId);
       }
       if (event.kind === "turn_end") this.resetStalledReplacementStreak(agentId);
       // A turn end resets them only when its turn had output (Grok ends a
@@ -15524,8 +16391,11 @@ export class AgentProcessManager {
             expectedSessionId: previousSessionId ?? ap.config.sessionId ?? null,
           });
           this.runtimeProcessBindingFence.rebindSession(agentId, ap, event.sessionId, "session_init");
+          this.dropPendingModelSeen(agentId, ap, { reason: "session_changed", nextSessionId: event.sessionId });
+          this.releaseUnconfirmedFocusBodies(agentId, ap, "session_changed", event.sessionId);
           ap.sessionId = event.sessionId;
           this.serverContext.noteSession(agentId, ap.processInstanceId, event.sessionId);
+          this.inboxRows.noteSession(agentId, event.sessionId);
           if (ap.standingPrompt) {
             const reported = standingPromptRecordForReportedSession(ap.standingPrompt.binding, event.sessionId, ap.standingPrompt.hash);
             ap.standingPrompt = { hash: ap.standingPrompt.hash, binding: reported.binding };
@@ -15539,7 +16409,7 @@ export class AgentProcessManager {
         // and sessionId. This legacy `agent:session` is retained only for the
         // server adapter path.
         this.reportSession(agentId, ap, event.sessionId);
-        this.sendRuntimeProfileReport(agentId, "session_init");
+        if (!ap?.recycledFromSessionId) this.sendRuntimeProfileReport(agentId, "session_init");
         break;
 
       case "thinking": {
@@ -15669,7 +16539,10 @@ export class AgentProcessManager {
 
       case "compaction_finished": {
         this.flushPendingTrajectory(agentId);
-        if (ap?.turnEndCompaction?.inFlight && ap.turnEndCompaction.inFlight.finishedAtMs === null) ap.turnEndCompaction.inFlight.finishedAtMs = Date.now();
+        if (ap?.turnEndCompaction?.inFlight && ap.turnEndCompaction.inFlight.finishedAtMs === null) {
+          ap.turnEndCompaction.inFlight.finishedAtMs = Date.now();
+          if (event.contextAfterTokens !== undefined) ap.turnEndCompaction.inFlight.contextAfterTokens = event.contextAfterTokens;
+        }
         const finishedCycle = ap?.compaction;
         if (ap && finishedCycle?.kind !== "active" && !ap.gatedSteering.compacting && ap.gatedSteering.isIdle) {
           // No compaction is open and the agent is idle: a repeated or late
@@ -15781,6 +16654,10 @@ export class AgentProcessManager {
         this.sendIntents.endAll(agentId);
         // The turn is over: a later error no longer joins its trace.
         if (ap) ap.endedRuntimeTurnTraceContext = null;
+        // Task #triage:#399: the turn is over, so is its outstanding notice;
+        // what it held is uncontributed, so this turn end's delivery (or the
+        // settle's just below) tells it once, and may arm a fresh hold.
+        if (ap) this.releaseNoticeHold(agentId, ap, "turn_end");
         if (ap?.turnEndCompaction?.inFlight) this.settleTurnEndCompaction(agentId, ap);
         if (ap) {
           ap.lastTurnEndInterrupted = event.interrupted === true;
@@ -15793,7 +16670,6 @@ export class AgentProcessManager {
             for (const resolve of waiters) resolve(event.interrupted === true);
           }
           this.recordRuntimeTraceEvent(agentId, ap, "runtime.turn.completed");
-          this.recordCodexZeroToolZeroSendCompletion(agentId, ap);
         }
         // task #1362: a compaction held since after the run's end. Its end and
         // this turn end both release it, in whichever order they come.
@@ -15820,17 +16696,30 @@ export class AgentProcessManager {
         // turn's agent:session frame below.
         let turnCompleted: AgentRuntimeOutcome | null = null;
         let wakeLoopVerdict: WakeLoopVerdict | null = null;
+        let becameIdleAtTurnEnd = false;
         if (ap) {
           if (turnEndSessionId) {
             this.runtimeProcessBindingFence.rebindSession(agentId, ap, turnEndSessionId, "turn_end");
+            this.dropPendingModelSeen(agentId, ap, { reason: "session_changed", nextSessionId: turnEndSessionId });
+            this.releaseUnconfirmedFocusBodies(agentId, ap, "session_changed", turnEndSessionId);
             ap.sessionId = turnEndSessionId;
             this.serverContext.noteSession(agentId, ap.processInstanceId, turnEndSessionId);
+            this.inboxRows.noteSession(agentId, turnEndSessionId);
           }
           this.markSessionReadyForDelivery(ap, "turn_end");
           clearSessionReadyDeliveryRetry(ap);
           // Reconciler step 12: a sticky failure no error event acted on
           // (only the runtime's stderr named it) is acted on after this turn end.
           const stickyTerminalFailure = classifyStickyFailure(ap);
+          // Focus: bodies written into this turn are confirmed shortly after its end (not here: a
+          // steer's rejection can still arrive). Told to the session already, they are not in the
+          // flush below. Only a turn that completed is evidence: one the daemon interrupted, or one
+          // that ended through an error (a provider limit, an API error), says nothing about a steer.
+          this.noteTurnEndForFocusBodies(
+            agentId,
+            ap,
+            event.interrupted !== true && ap.turnOutcome.runtimeErrors === 0 && !stickyTerminalFailure,
+          );
           // Wake-loop guard: settled before the turn end hands queued
           // messages over, so a held or parked message is not among them.
           wakeLoopVerdict = this.settleWakeTurn(
@@ -15867,7 +16756,12 @@ export class AgentProcessManager {
             canDeliverWithoutSession: !ap.driver.requiresSessionInitForDelivery,
             terminateProcessOnTurnEnd: ap.driver.terminateProcessOnTurnEnd === true,
           });
-          this.commitGatedSteeringDecisionState(agentId, ap, holdForCompaction ? { ...reduction.nextState, isIdle: false, compacting: true } : reduction.nextState);
+          becameIdleAtTurnEnd = this.commitGatedSteeringDecisionState(
+            agentId,
+            ap,
+            holdForCompaction ? { ...reduction.nextState, isIdle: false, compacting: true } : reduction.nextState,
+            { deferPostIdleMaintenance: true },
+          );
           // Turn completed — check if there are queued messages to deliver
           const deliverStdinEffect = reduction.effects.find((effect) => effect.kind === "deliver_stdin");
           if (deliverStdinEffect) {
@@ -15876,7 +16770,7 @@ export class AgentProcessManager {
               this.completePendingTrackedMentions(agentId);
             } else {
               this.settleUndeliveredTrackedMentionsAtTurnEnd(agentId, ap);
-              this.commitApmIdleState(agentId, ap, true);
+              becameIdleAtTurnEnd = this.commitApmIdleState(agentId, ap, true, { deferPostIdleMaintenance: true }) || becameIdleAtTurnEnd;
               if (stickyTerminalFailure) {
                 this.broadcastActivity(agentId, "error", stickyTerminalFailure.detail, [], undefined, "runtime_error");
               } else if (ap.lastRuntimeError && (ap.runtimeErrorDeliveryBackoff.attempts > 0 || this.credentialInvalidHold(agentId, ap.config))) {
@@ -15942,7 +16836,13 @@ export class AgentProcessManager {
         // next compaction).
         if (ap) this.armQueuedInputSettle(agentId, ap);
         // A held compaction still runs in this session: its release reconciles and checks rotation (task #1362).
-        if (ap && !holdForCompaction && !this.reconcile(agentId, ap, "turn_end")) this.rotateRuntimeSessionIfDue(agentId, ap);
+        const specDrifted = Boolean(ap && !holdForCompaction && this.reconcile(agentId, ap, "turn_end"));
+        if (ap && !holdForCompaction && !specDrifted) {
+          this.rotateRuntimeSessionIfDue(agentId, ap);
+          // Run after tracked mentions settle, quiet status broadcasts, turn trace closes,
+          // and spec-drift reconcile passes (#proj-runtime:#67).
+          if (becameIdleAtTurnEnd) this.maybeRunPostIdleMaintenance(agentId, ap);
+        }
         break;
 
       case "error": {
@@ -15955,6 +16855,8 @@ export class AgentProcessManager {
         }
         if (ap) {
           ap.lastRuntimeError = event.message;
+          // #proj-runtime:#66: set again below when this error is a used-up quota that holds deliveries.
+          ap.providerLimitErrorActivity = null;
           ap.decisionErrorWindow.recordRuntimeError(event.message);
           if (this.deliveryConsumptionAssociation(ap, event) === "associated") {
             const errorClass = buildRuntimeErrorDiagnosticEnvelope(event.message).spanAttrs.runtime_error_class;
@@ -15963,6 +16865,8 @@ export class AgentProcessManager {
         }
         let visibleErrorMessage = event.message;
         let visibleErrorEntries: TrajectoryEntry[] | undefined;
+        // #proj-runtime:#66: this error is a used-up quota whose backoff now holds deliveries.
+        let holdsForProviderLimit = false;
         // Reconciler step 12: what a sticky failure does next, after its error is shown.
         let afterVisibleError: (() => void) | null = null;
         // The runtime's structured provider limit, or a usage limit known only
@@ -15973,7 +16877,10 @@ export class AgentProcessManager {
           // The class and HTTP status the turn span and its runtime.error
           // record carry: the runtime's typed API error when it reported one
           // (a Claude rate_limit, verification_required, ...).
-          const runtimeErrorTraceClass = runtimeErrorTraceClassAttrs(runtimeErrorDiagnostics, event.message, event.providerError);
+          // A model refusal (typed marker) has its own trace class.
+          const runtimeErrorTraceClass = event.modelRefusal
+            ? modelRefusalTraceClassAttrs()
+            : runtimeErrorTraceClassAttrs(runtimeErrorDiagnostics, event.message, event.providerError);
           const compactionDiagnosticAttrs = compaction?.failureDiagnostic
             ? {
                 runtime_error_class: compaction.failureDiagnostic.errorClass,
@@ -16039,9 +16946,6 @@ export class AgentProcessManager {
               : structuredCompactionTerminalFailure
                 ? { ...structuredCompactionTerminalFailure, kind: "compaction_failed" }
                 : classifyStickyFailure(ap);
-            // C10: a Codex turn that did nothing counts like a crash (D6), not
-            // toward the same-fingerprint fence.
-            const codexZeroEvidence = !stickyTerminalFailure && isCodexZeroEvidenceTurnText(event.message);
             // A provider limit the runtime declared (a used-up quota or a
             // throttle: its structured limit, its typed rate_limit code, or
             // usage-limit wording) is a wait the provider-limit backoff and the
@@ -16052,6 +16956,11 @@ export class AgentProcessManager {
             // class known only from the text (a 429, "model is at capacity")
             // still counts, as before: that is how a capacity crash loop stops.
             const providerLimitError = Boolean(providerLimit) || providerErrorCodeClass(event.providerError) === "RateLimitError";
+            // The model declined to answer (a Claude refusal, the event's
+            // typed marker): shown once as this turn's error, but the runtime
+            // did not fail. It never counts toward the fence (a person asking
+            // again must not stop the agent) and takes no delivery backoff.
+            const modelRefusal = event.modelRefusal === true;
             // task #379: a provider limit (used-up quota or a short throttle)
             // takes the existing rate-limit delivery backoff. That backoff
             // survives turn_end, holds deliveries until it expires, and reports
@@ -16063,7 +16972,9 @@ export class AgentProcessManager {
               ? backoffFailPoint.reason ?? null
               : providerLimit
                 ? "rate_limited"
-                : undefined;
+                : modelRefusal
+                  ? null
+                  : undefined;
             const reduction = reduceApmGatedError(ap.gatedSteering, {
               terminalWakeable: Boolean(ap.driver.supportsStdinNotification && terminalFailure && !terminalFailure.actionRequired),
             });
@@ -16072,7 +16983,7 @@ export class AgentProcessManager {
               agentId,
               ap,
               event.message,
-              codexZeroEvidence || providerLimitError ? null : runtimeErrorFingerprint,
+              providerLimitError || modelRefusal ? null : runtimeErrorFingerprint,
               terminalFailure,
               stickyTerminalFailure,
               String(runtimeErrorTraceClass.runtime_error_class),
@@ -16092,6 +17003,12 @@ export class AgentProcessManager {
             }
             visibleErrorEntries = terminalFailure?.entries;
             this.noteRuntimeErrorDeliveryBackoff(agentId, ap, event.message, terminalFailure, stickyTerminalFailure, backoffReasonOverride, providerLimit);
+            holdsForProviderLimit = providerLimit?.kind === "quota_exhausted"
+              && !fingerprintFence
+              && !classFence
+              && !stickyTerminalFailure
+              && ap.runtimeErrorDeliveryBackoff.kind === "backing_off"
+              && ap.runtimeErrorDeliveryBackoff.reason === "rate_limited";
             // The Activity overview shows a run of these turns as one wait for the reset.
             if (providerLimit?.kind === "quota_exhausted") {
               const resetsAt = providerLimit.resetsAt ? Date.parse(providerLimit.resetsAt) : Number.NaN;
@@ -16105,6 +17022,7 @@ export class AgentProcessManager {
                   provider_limit_kind: providerLimit.kind,
                   provider_limit_source: providerLimit.source,
                   provider_limit_reset_reported: Boolean(providerLimit.resetsAt),
+                  ...(providerLimit.rateLimitType ? { provider_limit_rate_limit_type: providerLimit.rateLimitType } : {}),
                 }
                 : {}),
               ...compactionDiagnosticAttrs,
@@ -16131,9 +17049,6 @@ export class AgentProcessManager {
               const evidence = terminalFailureFromRuntimeErrorEvent(event, compaction);
               const failedProcess = ap;
               afterVisibleError = () => this.actOnStickyFailure(agentId, failedProcess, stickyTerminalFailure, evidence);
-            } else if (codexZeroEvidence && this.noteCodexZeroEvidenceTurn(agentId, ap)) {
-              const failedProcess = ap;
-              afterVisibleError = () => this.handCodexZeroEvidenceStreakToServer(agentId, failedProcess);
             } else if (ap.driver.supportsStdinNotification && terminalFailure) {
               ap.notifications.clearPending();
               ap.notifications.clearTimer();
@@ -16165,6 +17080,7 @@ export class AgentProcessManager {
           undefined,
           compaction,
         );
+        if (ap && holdsForProviderLimit && !compaction) ap.providerLimitErrorActivity = { detail: visibleErrorMessage, runtimeError: activityDiagnostic };
         afterVisibleError?.();
         break;
       }
@@ -16208,16 +17124,6 @@ export class AgentProcessManager {
     const attrs = runtimeToolingObservationAttrs(event);
     this.recordRuntimeTraceEvent(agentId, ap, "runtime.tooling.exposure", attrs);
     this.recordDaemonEvent("daemon.runtime.tooling.exposure", {
-      ...this.processLifecycleIdentityAttrs(agentId, ap),
-      ...attrs,
-    });
-  }
-
-  private recordCodexZeroToolZeroSendCompletion(agentId: string, ap: AgentProcess): void {
-    const attrs = codexCommunicationGapAttrs(ap.driver.id, ap.runtimeTraceCounters);
-    if (!attrs) return;
-    this.recordRuntimeTraceEvent(agentId, ap, "runtime.turn.communication_gap", attrs);
-    this.recordDaemonEvent("daemon.runtime.turn.communication_gap", {
       ...this.processLifecycleIdentityAttrs(agentId, ap),
       ...attrs,
     });
@@ -16533,13 +17439,15 @@ export class AgentProcessManager {
       throw new RuntimeSessionNeedsResetError({ runtimeId: config.runtime, failures: choice.failures });
     }
     if (choice.kind === "new" && choice.reason === "spec_drop") {
+      const priorRuntime = this.sessionSpecs.sessionOf(agentId)?.runtime ?? config.runtime ?? "claude";
+      this.lastSessions.write(agentId, priorRuntime, config.sessionId);
       this.traceSessionDroppedForSpec(agentId, config.sessionId, choice.dropReason, launchId, config);
       return { ...config, sessionId: null };
     }
     return config;
   }
 
-  /** `sessionId`, or null (traced) when it started on another runtime or Codex model than `desired` (step 7). */
+  /** `sessionId`, or null (traced) when it started on another runtime or model than `desired` (step 7). */
   private sessionIdUnlessSpecChanged(
     agentId: string,
     sessionId: string | null | undefined,
@@ -16550,7 +17458,11 @@ export class AgentProcessManager {
     if (!sessionId) return null;
     const choice = chooseSession({ sessionId, specDrop: this.sessionSpecs.sessionToDrop(agentId, sessionId, desired) ?? runtimeHostSessionDrop(desired.runtime, sessionId, "legacy") });
     if (choice.kind === "resume") return choice.sessionId;
-    if (choice.kind === "new" && choice.reason === "spec_drop") this.traceSessionDroppedForSpec(agentId, sessionId, choice.dropReason, launchId, config);
+    if (choice.kind === "new" && choice.reason === "spec_drop") {
+      const priorRuntime = this.sessionSpecs.sessionOf(agentId)?.runtime ?? desired.runtime;
+      this.lastSessions.write(agentId, priorRuntime, sessionId);
+      this.traceSessionDroppedForSpec(agentId, sessionId, choice.dropReason, launchId, config);
+    }
     return null;
   }
 
@@ -16581,7 +17493,10 @@ export class AgentProcessManager {
 
   /** Reconciler step 7: the session a process ran, and the runtime and model it started on, for the next start's check. */
   private rememberSessionSpec(agentId: string, ap: AgentProcess): void {
+    // #wg-ax:#3: never overwrite sessionSpecs with an unready recycled session.
+    if (ap.recycledFromSessionId) return;
     this.sessionSpecs.remember(agentId, ap.sessionId, ap.startedSpec);
+    this.lastSessions.write(agentId, ap.startedSpec.runtime, ap.sessionId);
   }
 
   /**
@@ -16703,6 +17618,312 @@ export class AgentProcessManager {
     return true;
   }
 
+  /**
+   * Task #triage:#399: a pure notice landed; hold the next busy ones in this
+   * session (outstandingNoticeHold.ts). Codex only: never armed for another
+   * runtime, so its delivery is exactly as before.
+   */
+  private armNoticeHold(ap: AgentProcess): void {
+    if (isNoticeHoldEnabled() && noticeHoldAppliesTo(ap.driver.id)) ap.notifications.armNoticeHold(ap.sessionId);
+  }
+
+  /**
+   * The wake-up notice's rows ask (#wg-ax:#42, inboxRowsAsk.ts) applies to
+   * this session: the flag and inbox items are on, the Server has the route,
+   * and it has not answered this session 403 or 404. Otherwise nothing is
+   * asked and the notice is today's, byte for byte.
+   */
+  private asksInboxRows(agentId: string, ap: AgentProcess): ap is AgentProcess & { sessionId: string } {
+    return ap.config.inboxNoticeServerRows === true
+      && ap.config.inboxItems === true
+      && this.serverAnswersInboxRows
+      && Boolean(ap.sessionId)
+      && !this.inboxRows.stopped(agentId, ap.sessionId!);
+  }
+
+  /** Ask about the conversations a notice of `messages` would list; null when nothing is asked. */
+  private askInboxRows(agentId: string, ap: AgentProcess & { sessionId: string }, messages: readonly AgentMessage[], callSite: InboxRowsCallSite): Promise<void> | null {
+    // The same conversation rows the notice lists (formatInboxItemsWakeNotice). Focus: a message
+    // shown in full is in no row, so it is left out by message (its conversation is still asked
+    // about when another of its messages prints as a row).
+    // One that a size limit made a row is asked about like any other.
+    const focused = new Set(this.focusSelection(agentId, ap, messages, callSite === "idle_hold" ? "idle" : "busy").bodies);
+    const listed = focused.size > 0 ? messages.filter((message) => !focused.has(message)) : messages;
+    return this.inboxRows.ask(agentId, ap.sessionId, inboxNoticeConversationRows(listed), callSite);
+  }
+
+  /**
+   * Focus: which of `messages` one write shows in full because the Server
+   * tagged them `focused`, and which focused ones a size limit lists as rows
+   * instead (`selectFocusedBodies`); nothing unless the agent's current
+   * config has `agentFocus`. `idle`: a write that starts a turn, where a
+   * message that brings its thread context is in full anyway and the limits
+   * leave it alone. `busy`: the busy notice's write, which shows no thread
+   * context of an unfocused message, so every focused one is under the limits.
+   */
+  private focusSelection(agentId: string, ap: AgentProcess, messages: readonly AgentMessage[], mode: "idle" | "busy", rowConversations?: Iterable<string>): FocusedBodySelection<AgentMessage> {
+    const enabled = ap.config.agentFocus === true;
+    if (!enabled) return selectFocusedBodies(messages, false);
+    const shownAnyway = mode === "idle"
+      ? new Set(this.projectThreadJoinContextsForRuntimeInput(agentId, messages).renderedContextMessages)
+      : undefined;
+    return selectFocusedBodies(messages, true, shownAnyway, rowConversations);
+  }
+
+  /** A message was queued for a busy agent: ask about what its next notice would tell (one request in flight at most). */
+  private askInboxRowsForQueued(agentId: string, ap: AgentProcess): void {
+    // A runtime that takes no input into a session prints no such notice (its next start does, without the ask).
+    if (!ap.driver.supportsStdinNotification || !this.asksInboxRows(agentId, ap)) return;
+    void this.askInboxRows(agentId, ap, ap.notifications.filterUncontributedMessages(ap.inbox, ap.sessionId), "queued");
+  }
+
+  /**
+   * The render options of a notice that prints the Server's rows, and
+   * `written` to call once that notice reached the runtime; null when the
+   * rows ask does not apply (today's options, today's notice). The builder
+   * stays synchronous: it takes the answer that is here, restricted to the
+   * rows it covers, and prints the rest without a number.
+   */
+  private inboxNoticeServerRows(agentId: string, ap: AgentProcess): { options: InboxUpdateRenderOptions; written: () => void } | null {
+    if (!this.asksInboxRows(agentId, ap)) return null;
+    const sessionId = ap.sessionId;
+    let composed: { olderMessages: number | null; answerUsed: boolean; listedRows: number; numberlessRows: number } | null = null;
+    return {
+      options: {
+        ...inboxUpdateRenderOptions(ap.config),
+        serverRows: {
+          reason: "new",
+          covered: (rows) => this.inboxRows.covered(agentId, sessionId, rows),
+          previousOlderMessages: ap.notifications.previousOlderMessages(sessionId),
+          composed: (notice) => { composed = notice; },
+        },
+      },
+      written: () => {
+        if (!composed) return;
+        // A notice without the Server's older-unread numbers says nothing about them: what the last one showed stands.
+        if (composed.olderMessages !== null) ap.notifications.recordOlderMessagesWritten(composed.olderMessages, sessionId);
+        this.inboxRows.recordNotice(agentId, sessionId, composed);
+      },
+    };
+  }
+
+  /**
+   * A message arrived for an idle agent whose notice is to print the
+   * Server's rows. The delivery is held, the agent still idle and the
+   * message in its inbox, until the ask settles or the hold's one timer
+   * fires (started at the first held message, never moved by later ones);
+   * then the ordinary idle delivery runs with whatever answer is here.
+   * Returns false when there is nothing to wait for (the caller delivers at
+   * once, as before): also a message shown in full (Focus) with no hold to
+   * join, which has no row to ask about.
+   */
+  private holdIdleInboxDelivery(agentId: string, ap: AgentProcess, message: AgentMessage, traceContext: DeliveryTraceContext, tracked: boolean): boolean {
+    const held = ap.pendingIdleInboxHold;
+    const asked = this.asksInboxRows(agentId, ap)
+      ? this.askInboxRows(agentId, ap, [...(held?.messages ?? []), message], "idle_hold")
+      : null;
+    // No hold to join and nothing asked: nothing to wait for.
+    if (!held && !asked) return false;
+    const queued = queueAgentInboxMessage(ap, message);
+    // Never left `received` across the hold; acked only when the write runs.
+    if (tracked) this.markTrackedMentionPending(traceContext, queued.duplicate ? "coalesced" : "accepted");
+    const hold: IdleInboxHold = held ?? {
+      sessionId: ap.sessionId!,
+      messages: [],
+      tracked: [],
+      waiting: null,
+      // The hold's hard limit: an answer later than this is not waited for.
+      timer: setTimeout(() => this.releaseIdleInboxHold(agentId, ap, hold, "timer"), INBOX_ROWS_ASK_TIMEOUT_MS),
+    };
+    ap.pendingIdleInboxHold = hold;
+    // A copy already pending (a re-sent delivery) is the one the write tells: found as the queue found it.
+    const pending = queued.duplicate ? ap.inbox.find((candidate) => samePendingDelivery(candidate, message)) ?? message : message;
+    if (!hold.messages.includes(pending)) hold.messages.push(pending);
+    if (tracked) hold.tracked.push({ message: pending, context: traceContext });
+    if (asked) {
+      hold.waiting = asked;
+      void asked.then(() => {
+        if (hold.waiting === asked) this.releaseIdleInboxHold(agentId, ap, hold, "ask_settled");
+      }).catch((error) => {
+        logger.error(`[Agent ${agentId}] Releasing the held idle delivery failed`, error);
+      });
+    }
+    this.recordDaemonEvent("daemon.agent.delivery.routed", this.deliveryTraceAttrs(agentId, message, {
+      outcome: "held_idle_inbox_rows",
+      accepted: true,
+      process_present: true,
+      runtime: ap.config.runtime,
+      session_id_present: true,
+      launchId: ap.launchId || undefined,
+      is_idle: true,
+      inbox_count: queued.inboxCount,
+      duplicate_pending_delivery: queued.duplicate,
+      held_messages_count: hold.messages.length,
+      joined_hold: Boolean(held),
+    }));
+    return true;
+  }
+
+  /**
+   * The ask settled or the hold's timer fired. Everything is decided again:
+   * only the same process, still idle on the session the hold was taken for,
+   * with nothing else holding deliveries, gets the write. Then the turn is
+   * claimed and the whole held batch goes through the ordinary idle delivery.
+   */
+  private releaseIdleInboxHold(agentId: string, ap: AgentProcess, hold: IdleInboxHold, trigger: "ask_settled" | "timer"): void {
+    if (ap.pendingIdleInboxHold !== hold) return;
+    const deliverable = this.agents.get(agentId) === ap
+      && !this.runtimeStopping(ap)
+      && ap.sessionId === hold.sessionId
+      && this.isApmIdle(ap)
+      && this.canDeliverToRuntimeSession(ap)
+      && !this.drain.holds(agentId)
+      && !this.credentialInvalidHold(agentId, ap.config)
+      // A provider limit can reach this process during the hold (shared from another agent on the same sign-in).
+      && this.runtimeErrorDeliveryBackoffRemainingMs(ap) === 0;
+    if (!deliverable) {
+      this.cancelIdleInboxHold(agentId, ap, trigger === "timer" ? "not_deliverable_at_timer" : "not_deliverable_at_answer");
+      return;
+    }
+    this.clearIdleInboxHold(ap);
+    // Read or purged meanwhile: no longer in the inbox, nothing to tell.
+    const messages = hold.messages.filter((message) => ap.inbox.includes(message));
+    // A tracked mention whose message left the inbox during the hold is not this write's to settle.
+    for (const { message, context } of hold.tracked) {
+      if (!messages.includes(message)) this.settleTrackedMentionGoneFromHold(agentId, message, context);
+    }
+    if (messages.length === 0) return;
+    this.commitApmIdleState(agentId, ap, false);
+    this.startRuntimeTrace(agentId, ap, "stdin-idle-delivery", messages);
+    const stdinAccepted = this.deliverInboxUpdateViaStdin(agentId, ap, messages, "idle", "stdin_idle_delivery");
+    for (const message of messages) {
+      this.recordDaemonEvent("daemon.agent.delivery.routed", this.deliveryTraceAttrs(agentId, message, {
+        outcome: "stdin_idle_delivery",
+        accepted: true,
+        process_present: true,
+        runtime: ap.config.runtime,
+        session_id_present: true,
+        launchId: ap.launchId || undefined,
+        stdin_delivery_accepted: stdinAccepted,
+        delivered_messages_count: messages.length,
+        idle_inbox_hold_release: trigger,
+      }));
+    }
+    for (const { message, context } of hold.tracked) {
+      if (!messages.includes(message)) continue;
+      if (stdinAccepted) this.completeTrackedMentionDelivery(context);
+      else this.failTrackedMention(context, "DELIVERY_REJECTED");
+    }
+  }
+
+  /**
+   * A held tracked mention whose message is no longer in the inbox at the
+   * release, so no write tells it. One the agent read was acked by that read
+   * (no longer pending): left alone. One still pending ends as an untold
+   * mention does at a turn end (settleUndeliveredTrackedMentionsAtTurnEnd):
+   * acked if the model saw it, refused if it was purged; an idle agent has no
+   * turn end coming to do it.
+   */
+  private settleTrackedMentionGoneFromHold(agentId: string, message: AgentMessage, context: DeliveryTraceContext): void {
+    const occurrenceId = context.mentionDelivery?.occurrenceId;
+    const tracked = occurrenceId ? this.trackedMentionDeliveries.get(occurrenceId) : undefined;
+    if (!occurrenceId || !tracked || tracked.state !== "pending") return;
+    if (this.isVisibleMessageModelSeen(agentId, formatAgentMessageVisibleTarget(message), message)) {
+      this.completeTrackedMentionDelivery(tracked.context);
+    } else {
+      this.failTrackedMention(tracked.context, "DELIVERY_REJECTED");
+    }
+  }
+
+  /** End a hold without a write: its timer goes, its messages stay in the inbox. */
+  private clearIdleInboxHold(ap: AgentProcess): IdleInboxHold | null {
+    const hold = ap.pendingIdleInboxHold;
+    if (!hold) return null;
+    clearTimeout(hold.timer);
+    ap.pendingIdleInboxHold = null;
+    return hold;
+  }
+
+  /**
+   * A hold ends without its write while the process lives on (it became
+   * busy, its session changed, a drain or an invalid credential holds
+   * deliveries, its config was replaced). Nothing is written and the inbox is
+   * not touched: the held messages become what a message queued for a busy
+   * agent is, notice debt with the busy timer, so the ordinary delivery
+   * tells them (to the session current then).
+   */
+  private cancelIdleInboxHold(agentId: string, ap: AgentProcess, reason: string): void {
+    const hold = this.clearIdleInboxHold(ap);
+    if (!hold) return;
+    const live = this.agents.get(agentId) === ap && !this.runtimeStopping(ap);
+    const pending = hold.messages.filter((message) => ap.inbox.includes(message)).length;
+    if (live) {
+      // As at a release: a tracked mention whose message left the inbox during the hold has no
+      // write coming, and an idle agent has no turn end to settle it.
+      for (const { message, context } of hold.tracked) {
+        if (!ap.inbox.includes(message)) this.settleTrackedMentionGoneFromHold(agentId, message, context);
+      }
+    }
+    if (live && pending > 0) {
+      ap.notifications.add(pending);
+      // Under a provider-limit backoff the notice timer would write into the limited account:
+      // the backoff's own timer tells them when the limit lifts.
+      if (this.runtimeErrorDeliveryBackoffRemainingMs(ap) > 0) this.scheduleRuntimeErrorDeliveryBackoffFlush(agentId, ap);
+      else if (!ap.notifications.hasTimer) this.scheduleStdinNotification(agentId, ap, STDIN_NOTIFICATION_INITIAL_DELAY_MS);
+    }
+    this.recordDaemonEvent("daemon.agent.idle_inbox_hold.cancelled", {
+      agentId,
+      runtime: ap.config.runtime,
+      launchId: ap.launchId || undefined,
+      host: "legacy",
+      reason,
+      held_messages_count: hold.messages.length,
+      requeued_notification_count: live ? pending : 0,
+      inbox_count: ap.inbox.length,
+    });
+  }
+
+  /**
+   * Task #triage:#399: the outstanding notice no longer holds (the agent
+   * read, the turn ended, a compaction passed, the notice was rejected). Its
+   * held debt goes back to pending, so whatever flushes pending tells what
+   * is still unread, once. Returns the held debt given back.
+   */
+  private releaseNoticeHold(agentId: string, ap: AgentProcess, reason: NoticeHoldReleaseReason): number {
+    if (!ap.notifications.isNoticeHoldArmed) return 0;
+    const untold = ap.notifications.filterUncontributedMessages(ap.inbox, ap.sessionId).length;
+    const released = ap.notifications.releaseNoticeHold(untold);
+    if (!released) return 0;
+    if (released.suppressed > 0 || released.heldDebt > 0) {
+      this.recordDaemonEvent("daemon.agent.notice_hold.released", {
+        agentId,
+        runtime: ap.config.runtime,
+        launchId: ap.launchId || undefined,
+        host: "legacy",
+        release_reason: reason,
+        held_count: released.suppressed,
+        held_notice_debt: released.heldDebt,
+        pending_notification_count: ap.notifications.pendingCount,
+        inbox_count: ap.inbox.length,
+      });
+    }
+    return released.heldDebt;
+  }
+
+  /**
+   * Task #triage:#399: the agent read through the credential proxy. What was
+   * held and is still unread (the read took the rest out of the inbox) is
+   * told once, as a busy notice after the usual short delay.
+   */
+  private releaseNoticeHoldOnRead(agentId: string): void {
+    const ap = this.agents.get(agentId);
+    if (!ap) return;
+    const heldDebt = this.releaseNoticeHold(agentId, ap, "inbox_read");
+    if (heldDebt === 0 || ap.inbox.length === 0 || this.isApmIdle(ap) || ap.notifications.hasTimer) return;
+    if (this.busyNoticeHeldAtBoundary(ap)) return;
+    this.scheduleStdinNotification(agentId, ap, STDIN_NOTIFICATION_INITIAL_DELAY_MS);
+  }
+
   /** Send a batched notification to the agent via stdin about pending messages */
   private sendStdinNotification(agentId: string, options: { forceUnsupportedRetry?: boolean } = {}): boolean {
     const ap = this.agents.get(agentId);
@@ -16814,7 +18035,10 @@ export class AgentProcessManager {
     const inboxCount = ap.inbox.length;
     if (inboxCount === 0) return false;
     ap.notifications.pruneContributedToPending(ap.inbox, ap.sessionId);
-    const changedMessageCandidates = ap.inbox.slice(Math.max(0, ap.inbox.length - count));
+    // Task #triage:#399: debt held behind an outstanding notice is still owed;
+    // a notice that goes (a break-through) covers it too.
+    const heldNoticeDebt = ap.notifications.heldNoticeDebt;
+    const changedMessageCandidates = ap.inbox.slice(Math.max(0, ap.inbox.length - count - heldNoticeDebt));
     const changedMessages = ap.notifications.filterUncontributedMessages(changedMessageCandidates, ap.sessionId);
     if (changedMessages.length === 0) {
       this.recordDaemonEvent("daemon.agent.stdin_notification", {
@@ -16829,6 +18053,50 @@ export class AgentProcessManager {
         session_id_present: true,
       });
       logger.info(`[Agent ${agentId}] Suppressing stdin inbox notice because all candidate messages already contributed; pending=${ap.inbox.length}`);
+      return false;
+    }
+    // Task #triage:#399: one pure notice outstanding per session. Until the
+    // agent reads, the turn ends or a compaction passes, a busy notice waits
+    // (its messages stay uncontributed in the inbox, so the turn end tells
+    // them), unless a new @mention or DM breaks through.
+    const noticeHeld = ap.notifications.isNoticeHeld(ap.sessionId);
+    // Focus: the batch's focused messages go in full in this same write, the rest as its notice.
+    // A write that carries a body is not a pure notice, so it does not wait behind one.
+    // One the runtime rejected in this turn is not steered in full again before the turn ends: it
+    // is listed in the notice like any queued message, and the turn end writes what is still untold.
+    const rejectedInTurn = ap.focusBodiesRejectedInTurn;
+    // The size limits are spent on what this write would show: a body written and unconfirmed in an
+    // earlier write is told and not among `changedMessages`, so it takes nothing from this budget.
+    // A rejected one is a row of this write, so the later focused messages of its conversation in
+    // this write are rows too (a conversation is not shown with that hole).
+    const rejectedNow = rejectedInTurn ? changedMessages.filter((message) => rejectedInTurn.has(message)) : [];
+    const focusSelection = this.focusSelection(
+      agentId,
+      ap,
+      rejectedNow.length > 0 ? changedMessages.filter((message) => !rejectedInTurn!.has(message)) : changedMessages,
+      "busy",
+      rejectedNow.map((message) => message.channel_id),
+    );
+    const focusedBodies = focusSelection.bodies;
+    const focusedBodySet = new Set(focusedBodies);
+    const noticeMessages = focusedBodies.length > 0 ? changedMessages.filter((message) => !focusedBodySet.has(message)) : changedMessages;
+    const breakthrough = noticeHeld && (focusedBodies.length > 0 || changedMessages.some(breaksNoticeHold));
+    if (noticeHeld && !breakthrough) {
+      const heldCount = ap.notifications.holdNotice(count);
+      this.recordDaemonEvent("daemon.agent.stdin_notification", {
+        agentId,
+        runtime: ap.config.runtime,
+        model: ap.config.model,
+        launchId: ap.launchId || undefined,
+        outcome: "suppressed_notice_outstanding",
+        mode: "busy",
+        notice_held: true,
+        held_count: heldCount,
+        held_notice_debt: ap.notifications.heldNoticeDebt,
+        pending_notification_count: count,
+        inbox_count: ap.inbox.length,
+        session_id_present: true,
+      });
       return false;
     }
     // Derived dedup-key (#58): if this exact unread-set was already written in
@@ -16873,7 +18141,19 @@ export class AgentProcessManager {
       return false;
     }
     const inboxRows = projectAgentInboxSnapshot(changedMessages);
-    const notification = formatInboxUpdateRuntimeInput(changedMessages, ap.driver, inboxCount, inboxUpdateRenderOptions(ap.config));
+    const noticeRows = focusedBodies.length > 0 ? projectAgentInboxSnapshot(noticeMessages) : inboxRows;
+    const serverRows = noticeMessages.length > 0 ? this.inboxNoticeServerRows(agentId, ap) : null;
+    // A body is in front of the model, so the notice does not count it as waiting to be read.
+    const noticeText = noticeMessages.length > 0
+      ? formatInboxUpdateRuntimeInput(noticeMessages, ap.driver, this.inboxCountBesideFocusBodies(ap, focusedBodies), serverRows?.options ?? inboxUpdateRenderOptions(ap.config))
+      : undefined;
+    // A focused mention in a thread the model has no context of carries that context, as an idle delivery's does.
+    const bodyProjection = this.projectThreadJoinContextsForRuntimeInput(agentId, focusedBodies);
+    const senderElision = this.elideSeenSenders(agentId, ap, bodyProjection.messages);
+    const notification = focusedBodies.length > 0
+      ? formatConcreteMessagesRuntimeInput(senderElision.messages, ap.driver, noticeText, { focus: true })
+      : noticeText!;
+    const focusedBodyAttrs = focusedBodyTraceAttrs(focusedBodies, focusSelection.rows);
     const notificationByteCount = Buffer.byteLength(notification, "utf8");
     const projectionAttrs = inboxProjectionTraceAttrs(inboxRows, inboxCount);
     this.recordDaemonEvent("daemon.agent.inbox_projection.delta", {
@@ -16889,8 +18169,16 @@ export class AgentProcessManager {
       { mode: "busy", text: notification, sessionId: ap.sessionId },
       "busy_stdin_notification",
     );
+    senderElision.settle(sendResult.ok);
     if (sendResult.ok) {
-      this.recordWholeNoticePreviewsSeen(agentId, changedMessages);
+      serverRows?.written();
+      // Focus: nothing says the runtime took a write into a turn in flight (it queues it, or rejects it
+      // later). The bodies stay in the inbox, unconfirmed: not consumed and not reported until the
+      // turn ends without a rejection (confirmFocusBodies). A tracked mention among them is not
+      // acknowledged by this write; the turn end acknowledges it as it does a mention told by a
+      // notice (told to the session), which can be before the confirm.
+      this.noteUnconfirmedFocusBodies(ap, focusedBodies, bodyProjection.renderedContextMessages);
+      this.recordWholeNoticePreviewsSeen(agentId, noticeMessages);
       this.recordDaemonEvent("daemon.agent.inbox_update.pushed", {
         agentId,
         runtime: ap.config.runtime,
@@ -16900,6 +18188,7 @@ export class AgentProcessManager {
         source: "busy_stdin_notification",
         notification_byte_count: notificationByteCount,
         ...projectionAttrs,
+        ...focusedBodyAttrs,
       });
       this.recordDaemonEvent("daemon.agent.stdin_notification", {
         agentId,
@@ -16912,13 +18201,22 @@ export class AgentProcessManager {
         inbox_count: inboxCount,
         inbox_target_count: inboxRows.length,
         session_id_present: true,
+        // Task #triage:#399: a new @mention or DM went past an outstanding notice, telling what it held.
+        ...(breakthrough ? { notice_hold_breakthrough: true, held_count: ap.notifications.heldNoticeCount, held_notice_debt: heldNoticeDebt } : {}),
+        ...focusedBodyAttrs,
       });
-      this.recordAttentionHintsShown(agentId, inboxRows, "busy_stdin_notification");
+      this.recordAttentionHintsShown(agentId, noticeRows, "busy_stdin_notification");
       // Register the written unread-set ONLY after a successful stdin write, so
       // a failed write leaves the prior memo intact and the retry resends the
       // same set without registering a fresh notify (Cody#1). Scoped to the
       // current session (Cody#2) — see RuntimeNotificationState.
+      // Focus: the bodies are told to the session with the rest, so nothing writes or lists them again
+      // while they wait to be confirmed, and a rejection's restore queues them again like the rest.
       ap.notifications.recordNoticeWritten(noticeFingerprint, ap.sessionId, changedMessages);
+      // A write with a body is not a pure notice: it arms no hold. It told what an outstanding
+      // notice held, so that debt is settled (the outstanding notice itself still is).
+      if (focusedBodies.length === 0) this.armNoticeHold(ap);
+      else ap.notifications.settleHeldNoticeDebt();
       this.observeDeliveryWrite(agentId, ap, changedMessages.at(-1)?.message_id ?? null, "busy_stdin_notification", !this.isApmIdle(ap));
       return true;
     } else {
@@ -17039,19 +18337,37 @@ export class AgentProcessManager {
   ): boolean {
     if (messages.length === 0) return true;
     const runtimeProjection = this.projectThreadJoinContextsForRuntimeInput(agentId, messages);
+    // Focus: the messages the Server tagged `focused` are written in full too. With none (always,
+    // unless the agent's config has `agentFocus`) the bodies are the thread-context ones, as before.
+    const focusSelection = this.focusSelection(agentId, ap, messages, "idle");
+    const focusedBodies = focusSelection.bodies;
+    const focusEnabled = focusedBodies.length > 0;
     const renderedContextMessageSet = new Set(runtimeProjection.renderedContextMessages);
-    const pendingNoticeMessages = messages.filter((message) => !renderedContextMessageSet.has(message));
+    const focusedBodySet = new Set(focusedBodies);
+    const isBody = (message: AgentMessage) => renderedContextMessageSet.has(message) || focusedBodySet.has(message);
+    /** The messages written in full (as delivered), in delivery order. */
+    const bodyMessages = focusEnabled ? messages.filter(isBody) : runtimeProjection.renderedContextMessages;
+    /** What is printed for them: a thread context only where the projection chose to show it. */
+    const bodyInputs = focusEnabled
+      ? messages.flatMap((message, index) => (isBody(message) ? [runtimeProjection.messages[index]!] : []))
+      : bodyMessages;
+    const pendingNoticeMessages = messages.filter((message) => !isBody(message));
     const rows = projectAgentInboxSnapshot(messages);
-    const senderElision = this.elideSeenSenders(agentId, ap, runtimeProjection.renderedContextMessages);
-    const prompt = runtimeProjection.renderedContextMessages.length > 0
+    const senderElision = this.elideSeenSenders(agentId, ap, bodyInputs);
+    const serverRows = this.inboxNoticeServerRows(agentId, ap);
+    const noticeOptions = serverRows?.options ?? inboxUpdateRenderOptions(ap.config);
+    // A focused body is in front of the model, so the notice does not count it as waiting to be read.
+    const pendingAfterBodies = this.inboxCountBesideFocusBodies(ap, focusedBodies);
+    const prompt = bodyMessages.length > 0
       ? formatConcreteMessagesRuntimeInput(
         senderElision.messages,
         ap.driver,
         pendingNoticeMessages.length > 0
-          ? formatInboxUpdateRuntimeInput(pendingNoticeMessages, ap.driver, ap.inbox.length, inboxUpdateRenderOptions(ap.config))
+          ? formatInboxUpdateRuntimeInput(pendingNoticeMessages, ap.driver, pendingAfterBodies, noticeOptions)
           : undefined,
+        focusEnabled ? { focus: true } : undefined,
       )
-      : formatInboxUpdateRuntimeInput(messages, ap.driver, ap.inbox.length, inboxUpdateRenderOptions(ap.config));
+      : formatInboxUpdateRuntimeInput(messages, ap.driver, pendingAfterBodies, noticeOptions);
     const projectionAttrs = this.recordInboxUpdateProjection(agentId, ap, messages, source, mode, prompt, ap.inbox.length);
     const inputTraceAttrs = buildRuntimeInputTraceAttrs({
       source,
@@ -17124,6 +18440,7 @@ export class AgentProcessManager {
       return false;
     }
 
+    serverRows?.written();
     // An idle write starts a new turn; stall age counts from here, not from the
     // previous turn's last runtime event.
     if (mode === "idle") {
@@ -17138,17 +18455,19 @@ export class AgentProcessManager {
     if (this.containsOrdinaryInboxMessage(messages)) {
       ap.lastRuntimeError = null;
     }
-    if (runtimeProjection.renderedContextMessages.length > 0) {
-      this.notePushedModelBodies(ap, runtimeProjection.renderedContextMessages);
+    // Every caller starts a turn with this write (the `deliver_stdin` effect is idle only), so its
+    // bodies are shown at once. A write into a turn in flight is sendStdinNotification's.
+    if (bodyMessages.length > 0) {
+      this.notePushedModelBodies(ap, bodyMessages, { kind: "live", sessionId: ap.sessionId });
       this.recordRenderedThreadJoinContextReceipts(agentId, runtimeProjection.renderedContextMessages);
       this.consumeVisibleMessages(agentId, {
-        messages: runtimeProjection.renderedContextMessages,
-        source: "stdin_thread_context_delivery",
+        messages: bodyMessages,
+        source: focusEnabled ? "stdin_focus_body_delivery" : "stdin_thread_context_delivery",
       });
     }
     this.recordWholeNoticePreviewsSeen(
       agentId,
-      runtimeProjection.renderedContextMessages.length > 0 ? pendingNoticeMessages : messages,
+      bodyMessages.length > 0 ? pendingNoticeMessages : messages,
     );
     this.recordDaemonEvent("daemon.agent.stdin_delivery", {
       agentId,
@@ -17171,8 +18490,11 @@ export class AgentProcessManager {
       rendered_thread_context_truncated_count: runtimeProjection.renderedContextMessages
         .filter((message) => message.thread_join_context?.history_truncated).length,
       cursors_advanced: "none",
+      ...focusedBodyTraceAttrs(focusedBodies, focusSelection.rows),
     });
-    this.recordAttentionHintsShown(agentId, rows, source);
+    // Focus: with a focused body in the input, the hints of the rows it printed (a message written in
+    // full has no row). Without one, every row's, as before Focus (a thread-context body's too).
+    this.recordAttentionHintsShown(agentId, focusEnabled ? projectAgentInboxSnapshot(pendingNoticeMessages) : rows, source);
     if (pendingNoticeMessages.length > 0) {
       ap.notifications.recordNoticeWritten(
         computeInboxNoticeFingerprint(pendingNoticeMessages),
@@ -17180,6 +18502,8 @@ export class AgentProcessManager {
         pendingNoticeMessages,
       );
     }
+    // Task #triage:#399: a pure notice (no rendered body) is now outstanding.
+    if (bodyMessages.length === 0) this.armNoticeHold(ap);
     this.observeDeliveryWrite(
       agentId,
       ap,
@@ -17299,7 +18623,7 @@ export class AgentProcessManager {
     }
     if (this.containsOrdinaryInboxMessage(messages)) this.broadcastMessageReceivedActivity(agentId, mode === "idle" ? messages : undefined);
     if (!options.transient) {
-      this.notePushedModelBodies(ap, [...messages, ...runtimeProjection.renderedContextMessages]);
+      this.notePushedModelBodies(ap, [...messages, ...runtimeProjection.renderedContextMessages], { kind: "live", sessionId: ap.sessionId });
       this.recordRenderedThreadJoinContextReceipts(agentId, runtimeProjection.renderedContextMessages);
       this.consumeVisibleMessages(agentId, { messages, source: traceSource });
     }

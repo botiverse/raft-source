@@ -1,4 +1,4 @@
-import { EXAMPLE_T, exampleMessage, exampleRestartDriver, exampleStdinDriver, exampleThirdPartyEvent, exampleUnreadSummary } from "./axExampleFixtures";
+import { EXAMPLE_T, exampleMessage, exampleOpenTask, exampleOpenTasks, exampleRestartDriver, exampleStdinDriver, exampleThirdPartyEvent, exampleUnreadSummary } from "./axExampleFixtures";
 import {
   agentInboxItemRowFromPendingTarget,
   ATTENTION_HINT_COPY_VERSION,
@@ -20,11 +20,16 @@ import {
   renderThirdPartyEventPayload,
   thirdPartyEventPayloadForAgent,
   thirdPartyEventInboxItemTarget,
+  formatInboxMessageTarget,
   thirdPartyEventShortId,
   asAxSurfaceText,
   AGENT_INBOX_REMINDER_TARGET_PREFIX,
   formatAgentInboxAppItems,
+  formatAgentInboxNotice,
+  mergeAgentInboxNoticeRows,
+  foldAgentOneLineText,
   type AgentConfig,
+  type AgentStartOpenTasks,
   type AgentInboxAppItem,
   type AgentInboxItemRow,
   type AgentMessage,
@@ -42,6 +47,7 @@ import type { AgentProxyVisibleMessage } from "./agentCredentialProxy";
 import { isReminderDueInboxItem } from "./apps/reminder/inboxDefinition";
 import { formatAgentMessageVisibleTarget } from "./agentVisibleDeliveryLedger";
 import type { RuntimeDriver } from "./drivers/types";
+import { isInboxRowsConversation, type InboxRowsCovered } from "./inboxRowsAsk";
 
 const RESPONSE_TARGET_HINT =
   "Reply in the channel or create/reply in a thread as appropriate; use each message's `target` and `msg` fields to choose the exact target.";
@@ -120,16 +126,146 @@ type IncomingMessageFormatOptions = {
   /** Task v2: the task reply hints already shown in this delivery. The hint
    *  is given once per task conversation per delivery, not on every message. */
   shownTaskReplyHints?: Set<string>;
+  /**
+   * Focus (docs/contracts/agent-focus.md): print the line that says what Raft
+   * focused by itself (`AgentMessage.focus_change`) above the message that
+   * carries it. Off unless the host renders a body for an agent whose config
+   * has `agentFocus`; off, every output is as before.
+   */
+  focus?: boolean;
 };
+
+/** What a host passes to the message formatters about Focus. */
+export type RuntimeInputFocusOptions = { focus?: boolean };
+
+const FOCUS_CHANGE_REASON_TEXT: Readonly<Record<string, string>> = {
+  mentioned: "because you were @mentioned there",
+  dm: "because it is a direct message to you",
+  task_assigned: "because a task was assigned to you",
+};
+
+/**
+ * A conversation target that cannot be printed in the line as it is: a
+ * control character or a line break would break the one line, a bidi
+ * control would reorder what is shown, `]` would end
+ * its bracket early, and `$`, a backtick or a backslash would be read by a
+ * shell inside the double quotes of the undo command (targets are quoted
+ * with JSON.stringify, as the neighbouring prefix block does).
+ */
+const FOCUS_CHANGE_UNPRINTABLE_TARGET = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\]$`\\]/u;
+
+/** The targets of a `focus_change` list that are printed; one that cannot be printed safely is left out. */
+const focusChangeTargets = (value: unknown): string[] =>
+  Array.isArray(value)
+    ? value.filter((target): target is string => typeof target === "string" && target.length > 0 && !FOCUS_CHANGE_UNPRINTABLE_TARGET.test(target))
+    : [];
+
+/**
+ * The one line that tells an agent Raft focused a conversation by itself, or
+ * "" when nothing new was focused (or no focused target can be printed).
+ * Targets are printed as the Server sent them. It makes no claim about read state: the read position moves only
+ * when the Server applies the Computer's report, and only contiguously.
+ */
+export function formatFocusChangeLine(change: AgentMessage["focus_change"]): string {
+  const focused = focusChangeTargets(change?.focused);
+  if (!change || focused.length === 0) return "";
+  const unfocused = focusChangeTargets(change.unfocused);
+  const because = Object.hasOwn(FOCUS_CHANGE_REASON_TEXT, change.reason) ? ` ${FOCUS_CHANGE_REASON_TEXT[change.reason]}` : "";
+  const madeRoom = unfocused.length > 0 ? ` To make room, Raft unfocused ${unfocused.join(" and ")}.` : "";
+  const undo = focused.map((target) => `raft unfocus ${JSON.stringify(target)}`).join(" or ");
+  return `[Raft focused ${focused.join(" and ")}${because}. New messages there now arrive in full.${madeRoom} To undo: ${undo}]`;
+}
+
+/** Focus: the most content bytes (utf8) one focused message may have and still be written in full. */
+export const FOCUSED_BODY_MAX_MESSAGE_BYTES = 16 * 1024;
+/** Focus: the most content bytes (utf8) the focused bodies of one write may have together. */
+export const FOCUSED_BODY_MAX_WRITE_BYTES = 32 * 1024;
+
+/** Which limit made a focused message a notice row. */
+export type FocusedBodyLimit = "message" | "write";
+/** Why a focused message is a row: the limit that cut its conversation, or `after_row` when the caller had already made an earlier message of it a row. */
+export type FocusedBodyRowCause = FocusedBodyLimit | "after_row";
+
+/** What `selectFocusedBodies` decided for the focused messages of one write. */
+export interface FocusedBodySelection<T> {
+  /** Written in full, in delivery order. */
+  bodies: T[];
+  /** Listed as notice rows instead, in delivery order, each with the limit that cut its conversation. */
+  rows: Array<{ message: T; limit: FocusedBodyRowCause }>;
+}
+
+/** The size the Focus limits and `focused_bytes_count` measure: the content's utf8 bytes. */
+export function focusedBodyBytes(message: Pick<AgentMessage, "content">): number {
+  return Buffer.byteLength(message.content ?? "", "utf8");
+}
+
+/**
+ * Focus (docs/contracts/agent-focus.md, "Size limits"): the messages of one
+ * write that are written into the model in full because their conversation
+ * is in the agent's focus set (`focused`, set by the Server per recipient),
+ * and the focused ones that are listed as notice rows instead. `enabled` is
+ * the agent's current `AgentConfig.agentFocus === true`; otherwise the tag is
+ * ignored and nothing is selected. The one rule, for both hosts and a start:
+ *
+ * The focused messages are walked in delivery order, oldest first, spending
+ * one budget of FOCUSED_BODY_MAX_WRITE_BYTES for the write. Within each
+ * conversation, the first one that does not fit (itself over
+ * FOCUSED_BODY_MAX_MESSAGE_BYTES, or over what is left of the budget) and
+ * every later focused message of that conversation become rows, so a
+ * conversation is never shown with a hole. A cut in one conversation leaves
+ * the others alone.
+ *
+ * `shownAnyway`: messages this write shows in full whatever their tag (a
+ * thread-context body, a catch-up message). One that is also focused is
+ * always a body: demoting it would save nothing. It spends no budget and is
+ * no cut point, and a cut earlier in its conversation does not reach it.
+ *
+ * `rowConversations`: conversations (`channel_id`) of which this write
+ * already lists a focused message as a row for another reason (the older
+ * host: a body the runtime rejected in this turn). They start out cut, so a
+ * later focused message of one is a row too (`after_row`).
+ */
+export function selectFocusedBodies<T extends Pick<AgentMessage, "focused" | "content" | "channel_id">>(
+  messages: readonly T[],
+  enabled: boolean,
+  shownAnyway?: ReadonlySet<T>,
+  rowConversations?: Iterable<string>,
+): FocusedBodySelection<T> {
+  const selection: FocusedBodySelection<T> = { bodies: [], rows: [] };
+  if (!enabled) return selection;
+  let budget = FOCUSED_BODY_MAX_WRITE_BYTES;
+  const cut = new Map<string, FocusedBodyRowCause>();
+  for (const conversation of rowConversations ?? []) cut.set(conversation, "after_row");
+  for (const message of messages) {
+    if (message.focused !== true) continue;
+    if (shownAnyway?.has(message)) {
+      selection.bodies.push(message);
+      continue;
+    }
+    const size = focusedBodyBytes(message);
+    const limit: FocusedBodyRowCause | undefined = cut.get(message.channel_id)
+      ?? (size > FOCUSED_BODY_MAX_MESSAGE_BYTES ? "message" : size > budget ? "write" : undefined);
+    if (limit) {
+      cut.set(message.channel_id, limit);
+      selection.rows.push({ message, limit });
+      continue;
+    }
+    budget -= size;
+    selection.bodies.push(message);
+  }
+  return selection;
+}
 
 function getMessageShortId(messageId: string): string {
   return messageId.startsWith("thread-") ? messageId.slice(7) : messageId.slice(0, 8);
 }
 
-function formatSenderHandle(message: { sender_name: string; sender_description?: string | null; sender_timezone?: string | null }): string {
+function formatSenderHandle(message: { sender_name: string; sender_description?: string | null; sender_timezone?: string | null; sender_origin?: unknown }): string {
   // sender_name / sender_description are free text on the header line;
-  // formatSenderHandleText prefixes their continuation lines.
-  return formatSenderHandleText(message.sender_name, message.sender_description ?? null, message.sender_timezone ?? null);
+  // formatSenderHandleText prefixes their continuation lines. An outside
+  // sender's origin (`— from another server (/acme)`, `— guest`) stands where
+  // a description would, its slug validated by the shared formatter.
+  return formatSenderHandleText(message.sender_name, message.sender_description ?? null, message.sender_timezone ?? null, message.sender_origin);
 }
 
 function formatVisibleActorType(type: AgentMessage["sender_type"]): string {
@@ -210,7 +346,9 @@ function formatIncomingMessage(message: AgentMessage, options: IncomingMessageFo
     else options.shownTaskReplyHints.add(taskReplySuffix);
   }
   const body = `[target=${target} msg=${msgId} time=${time}${senderType}] ${formatSenderHandle(message)}: ${indentAgentBodyContinuationLines(message.content)}${formatThirdPartyEventPayloadSuffix(message)}${attachSuffix}${taskSuffix}${taskReplySuffix}${lineageSuffix}${formatAgentReplyAffordanceSuffix(message)}${formatAgentMessageCardBlock(message.message_card, message.content)}`;
-  const prefixes = [threadJoinPrefix, threadFollowReactivationPrefix].filter(Boolean);
+  const focusLine = options.focus === true ? formatFocusChangeLine(message.focus_change) : "";
+  const focusChangePrefix = focusLine ? `${focusLine}\n` : "";
+  const prefixes = [threadJoinPrefix, threadFollowReactivationPrefix, focusChangePrefix].filter(Boolean);
   return prefixes.length > 0 ? `${prefixes.join("\n")}\n${body}` : body;
 }
 
@@ -237,11 +375,13 @@ export const formatConcreteMessagesRuntimeInput = axSurface(
   messages: readonly AgentMessage[],
   driver: RuntimeDriver,
   pendingInboxNotice?: string,
+  focusOptions?: RuntimeInputFocusOptions,
 ): string => {
   const header = messages.length === 1 ? "New message received:" : "New messages received:";
   const shownTaskReplyHints = new Set<string>();
+  const focus = focusOptions?.focus === true ? { focus: true } : {};
   const concreteMessages = messages
-    .map((message) => formatIncomingMessage(message, { ...incomingMessageFormatOptionsForDriver(driver), shownTaskReplyHints }))
+    .map((message) => formatIncomingMessage(message, { ...incomingMessageFormatOptionsForDriver(driver), shownTaskReplyHints, ...focus }))
     .join("\n");
   return (`${header}\n\n${concreteMessages}${pendingInboxNotice ? `\n\n${pendingInboxNotice}` : ""}\n\nRespond as appropriate. Complete all your work before stopping.\n${RESPONSE_TARGET_HINT}`);
 },
@@ -277,7 +417,7 @@ export const formatInboxUpdateRuntimeInput = axSurface(
   {
     // Rows cover all four target shapes (@xxchan 8/31): channel, channel
     // thread, dm, dm thread.
-    examples: [{ args: [[{ ...exampleMessage, mentioned: true }, { ...exampleMessage, message_id: "55555555-6666-7777-8888-999999999999", seq: 101, channel_type: "dm", channel_name: "richard" }, { ...exampleMessage, message_id: "aaaabbbb-0000-0000-0000-000000000000", seq: 102, channel_type: "thread", channel_name: "thread-aaaabbbb", parent_channel_name: "general", parent_channel_type: "channel" }, { ...exampleMessage, message_id: "ccccdddd-0000-0000-0000-000000000000", seq: 103, channel_type: "thread", channel_name: "thread-55555555", parent_channel_name: "richard", parent_channel_type: "dm" }], exampleStdinDriver, 7] }, { title: "inbox items on (RFC 081 D16): rows through the shared item-row formatter, each with its inbox read command", args: [[{ ...exampleMessage, mentioned: true }, { ...exampleMessage, message_id: "55555555-6666-7777-8888-999999999999", seq: 101, channel_type: "dm", channel_name: "richard" }], exampleStdinDriver, 7, { inboxItems: true }] }, { title: "inbox items on, with the wake-up's own details: first msg, attention hint and the non-member line", args: [[{ ...exampleMessage, mentioned: true, non_member_mention: true, attention_hint: { schema: ATTENTION_HINT_SCHEMA, trigger: "M2", scope: "#general", suggested_command: "raft channel mute \"#general\"", copy: "You've received 12 updates from #general with no action taken.", copy_version: ATTENTION_HINT_COPY_VERSION, epoch_ms: 123, thresholds: { K: 12, window_ms: 604800000 } } }], exampleStdinDriver, 1, { inboxItems: true }] }, { title: "inbox items on, with grouped third-party app events (the ones not in this list)", args: [[{ ...exampleMessage, mentioned: true }, { ...exampleMessage, message_id: "eeeeeeee-0000-4000-8000-000000000000", seq: 104, channel_id: "third-party-agent-events:agent-1", channel_type: "dm", channel_name: "third-party-agent-events:agent-1", sender_type: "third_party_app", sender_name: "stamp", content: "", third_party_event: { id: "eeeeeeee-0000-4000-8000-000000000000", kind: "notification", client_id: "stamp", client_name: "stamp", payload_hash: "0".repeat(64), payload: {}, expires_at: EXAMPLE_T, source: { client_id: "stamp", client_name: "stamp", oauth_client_id: "oauth-client-1", resource: "urn:raft:example" } } }], exampleStdinDriver, 2, { inboxItems: true }] }, { title: "inbox items on, third-party events: one the Server lists as an app item (its own row) and one it does not (the grouped row)", args: [[exampleThirdPartyEvent(201, "app:stamp/pr-13754"), exampleThirdPartyEvent(202), { ...exampleMessage, mentioned: true }], exampleStdinDriver, 3, { inboxItems: true }] }],
+    examples: [{ args: [[{ ...exampleMessage, mentioned: true }, { ...exampleMessage, message_id: "55555555-6666-7777-8888-999999999999", seq: 101, channel_type: "dm", channel_name: "richard" }, { ...exampleMessage, message_id: "aaaabbbb-0000-0000-0000-000000000000", seq: 102, channel_type: "thread", channel_name: "thread-aaaabbbb", parent_channel_name: "general", parent_channel_type: "channel" }, { ...exampleMessage, message_id: "ccccdddd-0000-0000-0000-000000000000", seq: 103, channel_type: "thread", channel_name: "thread-55555555", parent_channel_name: "richard", parent_channel_type: "dm" }], exampleStdinDriver, 7] }, { title: "inbox items on (RFC 081 D16): rows through the shared item-row formatter, each with its inbox read command", args: [[{ ...exampleMessage, mentioned: true }, { ...exampleMessage, message_id: "55555555-6666-7777-8888-999999999999", seq: 101, channel_type: "dm", channel_name: "richard" }], exampleStdinDriver, 7, { inboxItems: true }] }, { title: "inbox items on, with the wake-up's own details: the attention hint line and the non-member line", args: [[{ ...exampleMessage, mentioned: true, non_member_mention: true, attention_hint: { schema: ATTENTION_HINT_SCHEMA, trigger: "M2", scope: "#general", suggested_command: "raft channel mute \"#general\"", copy: "You've received 12 updates from #general with no action taken.", copy_version: ATTENTION_HINT_COPY_VERSION, epoch_ms: 123, thresholds: { K: 12, window_ms: 604800000 } } }], exampleStdinDriver, 1, { inboxItems: true }] }, { title: "inbox items on, with grouped third-party app events (the ones not in this list)", args: [[{ ...exampleMessage, mentioned: true }, { ...exampleMessage, message_id: "eeeeeeee-0000-4000-8000-000000000000", seq: 104, channel_id: "third-party-agent-events:agent-1", channel_type: "dm", channel_name: "third-party-agent-events:agent-1", sender_type: "third_party_app", sender_name: "stamp", content: "", third_party_event: { id: "eeeeeeee-0000-4000-8000-000000000000", kind: "notification", client_id: "stamp", client_name: "stamp", payload_hash: "0".repeat(64), payload: {}, expires_at: EXAMPLE_T, source: { client_id: "stamp", client_name: "stamp", oauth_client_id: "oauth-client-1", resource: "urn:raft:example" } } }], exampleStdinDriver, 2, { inboxItems: true }] }, { title: "inbox items on, third-party events: one the Server lists as an app item (its own row) and one it does not (the grouped row)", args: [[exampleThirdPartyEvent(201, "app:stamp/pr-13754"), exampleThirdPartyEvent(202), { ...exampleMessage, mentioned: true }], exampleStdinDriver, 3, { inboxItems: true }] }],
   },
 );
 
@@ -306,6 +446,24 @@ export type InboxUpdateRenderOptions = {
   inboxItemsLaunchAtMs?: number | null;
   /** For a row's `latest … ago`; without it no row shows an age. */
   nowMs?: number;
+  /**
+   * Inbox items on, and the host asks the Server for its rows
+   * (`inbox_notice_server_rows_v0`, inboxRowsAsk.ts): the notice is the one
+   * with the Server's unread numbers (shared formatAgentInboxNotice). Absent
+   * keeps the notice above byte for byte.
+   */
+  serverRows?: InboxNoticeServerRows;
+};
+
+export type InboxNoticeServerRows = {
+  /** `new`: what arrived since the last notice. `away`: a start's notice. */
+  reason: "new" | "away";
+  /** The Server's answer cut down to the listed rows it covers (InboxRowsAsk.covered); read once, with the conversation rows about to be listed (inboxNoticeConversationRows). */
+  covered(rows: readonly AgentInboxTargetRow[]): InboxRowsCovered;
+  /** The `olderMessages` the session's last written notice returned. */
+  previousOlderMessages: number | null;
+  /** Told what was composed, so the host can keep `olderMessages` once the notice is written. Not called for the bare count. */
+  composed?(notice: { olderMessages: number | null; answerUsed: boolean; listedRows: number; numberlessRows: number }): void;
 };
 
 /** The flag a host reads from the config it renders a wake-up for. */
@@ -321,15 +479,13 @@ export function inboxUpdateRenderOptions(config: Pick<AgentConfig, "inboxItems">
  * the bracket stay as they are.
  */
 /**
- * The shared pending-target row plus what today's wake-up notice already
- * shows of the target and `inbox check` does not: the first pending message,
- * the suppressed count, the attention hint and the non-member guidance.
+ * The shared pending-target row plus what the wake-up notice shows of the
+ * target and `inbox check` does not: the attention hint and the non-member
+ * guidance.
  */
 function wakeUpItemRow(row: AgentInboxTargetRow, preview: { text: string; truncated: boolean } | undefined): AgentInboxItemRow {
   return {
     ...agentInboxItemRowFromPendingTarget(row, preview, { as: "unread" }),
-    ...(row.firstPendingMsgId ? { firstUnreadMsgId: row.firstPendingMsgId } : {}),
-    ...(row.suppressedCount ? { suppressed: row.suppressedCount } : {}),
     ...(row.attentionHint ? { attentionHint: row.attentionHint } : {}),
     ...(row.flags.includes("non_member_mention") ? { nonMemberMention: true as const } : {}),
   };
@@ -454,6 +610,30 @@ function reminderItemRows(options: InboxUpdateRenderOptions): AgentInboxItemRow[
     });
 }
 
+/**
+ * The conversation rows a notice of `messages` lists, the ones the rows ask
+ * names and may number (inboxRowsAsk.ts): not an app item's row and not the
+ * grouped third-party events row, which are the Computer's own. The one
+ * place that decides it, for the ask and for the notice.
+ */
+export function inboxNoticeConversationRows(messages: readonly AgentMessage[]): AgentInboxTargetRow[] {
+  const apps = appItemRows(messages);
+  return projectAgentInboxSnapshot(messages, undefined, { appInboxItemTargets: true })
+    .filter((row) => !apps.has(row.target) && isInboxRowsConversation(row.channelId));
+}
+
+/**
+ * The seqs of the messages a row lists: the ones projectAgentInboxSnapshot
+ * put in that row's bucket (the same target, by the same rule), so the set is
+ * exactly what the row's count stands for. A message with no seq is NaN: it
+ * counts as newer than any Server row.
+ */
+function heldSeqsOf(messages: readonly AgentMessage[], target: string): number[] {
+  return messages
+    .filter((message) => (thirdPartyEventInboxItemTarget(message)?.target ?? formatInboxMessageTarget(message)) === target)
+    .map((message) => (typeof message.seq === "number" ? message.seq : Number.NaN));
+}
+
 function formatInboxItemsWakeNotice(
   messages: readonly AgentMessage[],
   totalPendingMessages: number,
@@ -462,16 +642,51 @@ function formatInboxItemsWakeNotice(
   const rows = projectAgentInboxSnapshot(messages, undefined, { appInboxItemTargets: true });
   const previews = projectAgentInboxLatestPreviews(messages);
   const apps = appItemRows(messages);
-  const items: AgentInboxItemRow[] = [
-    ...reminderItemRows(options),
-    ...rows.map((row) => {
-      const app = apps.get(row.target);
-      return app ? wakeUpAppItemRow(row, app) : wakeUpItemRow(row, previews.get(row.target));
-    }),
-  ];
+  const reminders = reminderItemRows(options);
+  const targetItems = rows.map((row) => {
+    const app = apps.get(row.target);
+    return app ? wakeUpAppItemRow(row, app) : wakeUpItemRow(row, previews.get(row.target));
+  });
+  const items: AgentInboxItemRow[] = [...reminders, ...targetItems];
   const localItems = localOnlyAppItems(options);
   const rowOptions = { inboxRead: true, ...(options.nowMs === undefined ? {} : { nowMs: options.nowMs }) };
   const changedTargets = items.length + localItems.changed;
+  if (options.serverRows && changedTargets > 0) {
+    // A conversation row is matched to the Server's by its channel id; a
+    // reminder, an app item and the grouped third-party events row are the
+    // Computer's own and print as they are.
+    const conversations = inboxNoticeConversationRows(messages);
+    const conversationTargets = new Set(conversations.map((row) => row.target));
+    const covered = options.serverRows.covered(conversations);
+    const local = [
+      ...reminders.map((row) => ({ channelId: null, row })),
+      ...rows.map((row, index) => {
+        const channelId = conversationTargets.has(row.target) ? row.channelId ?? null : null;
+        return {
+          channelId,
+          row: targetItems[index]!,
+          // What the Computer holds for the conversation, for a Server row that is behind (`withBehind`).
+          ...(channelId === null ? {} : { heldSeqs: heldSeqsOf(messages, row.target), asked: covered.ids.has(channelId.toLowerCase()) }),
+        };
+      }),
+    ];
+    const merged = mergeAgentInboxNoticeRows(local, covered.response);
+    const notice = formatAgentInboxNotice({
+      reason: options.serverRows.reason,
+      rows: merged,
+      rowOptions,
+      ...(localItems.text ? { localSection: localItems.text, extraTargets: localItems.changed } : {}),
+      older: covered.older,
+      previousOlderMessages: options.serverRows.previousOlderMessages,
+    });
+    options.serverRows.composed?.({
+      olderMessages: notice.olderMessages,
+      answerUsed: covered.response !== null,
+      listedRows: local.filter((entry) => entry.channelId !== null).length,
+      numberlessRows: merged.filter((row) => row.unreadUnknown === true).length,
+    });
+    return notice.text;
+  }
   const listed = changedTargets === 0
     ? formatAgentInboxDelta(rows, { totalPendingMessages })
     : [
@@ -643,26 +858,144 @@ export const formatBoundedStartupUnreadSuffix = axSurface(
   },
 );
 
+/** At most this many characters of an open task's title reach a resume prompt. */
+export const RESUME_OPEN_TASK_TITLE_MAX_CHARS = 100;
+
+// C0/C1 controls (line breaks among them) become a space before the one-line
+// fold; invisible format characters (bidi marks, embeddings, overrides and
+// isolates, zero-width spaces and joiners, word joiner, BOM) are removed. None
+// may reach the prompt, where they could forge or reorder what is shown.
+const OPEN_TASK_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]+/gu;
+const OPEN_TASK_INVISIBLE_CHARS = /[\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/gu;
+
+/** A task title or ref (user text) as one bounded line. */
+function openTaskLineText(text: string, maxChars: number): string {
+  const flat = foldAgentOneLineText(text.replace(OPEN_TASK_CONTROL_CHARS, " ").replace(OPEN_TASK_INVISIBLE_CHARS, ""));
+  const chars = [...flat];
+  return chars.length > maxChars ? `${chars.slice(0, maxChars - 1).join("").trimEnd()}…` : flat;
+}
+
+/**
+ * The start named at least one open task (an older Server sends none). The
+ * value was checked where the frame entered the daemon (normalizeAgentStartOpenTasks).
+ */
+export function hasResumeOpenTasks(openTasks: AgentStartOpenTasks | undefined): openTasks is AgentStartOpenTasks {
+  return (openTasks?.tasks.length ?? 0) > 0;
+}
+
+/** `- #proj:#4 [in_progress] Title` per task, then how many more there are and where to list them. */
+function formatOpenTaskLines(openTasks: AgentStartOpenTasks): string {
+  let lines = "";
+  for (const task of openTasks.tasks) {
+    const title = openTaskLineText(task.title, RESUME_OPEN_TASK_TITLE_MAX_CHARS);
+    lines += `\n- ${openTaskLineText(task.ref, 200)} [${task.status}]${title ? ` ${title}` : ""}`;
+  }
+  if (openTasks.more > 0) lines += `\n- …and ${openTasks.more} more: \`raft task list --mine\``;
+  return lines;
+}
+
+// The CLI's own vocabulary (raftCliGuide): a finished task is set `done`; one
+// that waits on someone stays in_progress and is assigned to them.
+const RESUME_OPEN_TASKS_ACTION =
+  "Continue any unfinished one. If one is finished or waits on someone, update it the way your task guide says (`raft task update`, `raft task assign`). Stop only if none needs action from you.";
+
 export const formatResumeUnreadSummaryPrompt = axSurface(
-  "Constrained offline catch-up mode prompt (read listed channels once; act only if directly addressed).",
+  "Constrained offline catch-up mode prompt (read listed channels once; act only if directly addressed). When the start names open tasks the agent holds, or continues an interrupted turn (`continueAfterCatchup`), it drops the unconditional stop. With inbox items on it names `raft inbox check` and `raft inbox read --target <item>` (there `raft message check` is gone).",
   (
   unreadSummary: Record<string, number>,
   _driver: RuntimeDriver,
+  openTasks?: AgentStartOpenTasks,
+  options: Pick<InboxUpdateRenderOptions, "inboxItems"> & { continueAfterCatchup?: boolean } = {},
 ): string => {
-  return (`You have unread messages from while you were offline:${formatUnreadChannelLines(unreadSummary)}\n\nUse \`raft message read\` to catch up on the channels listed above, then stop. Read each listed channel at most once unless a read fails. Do NOT call \`raft message check\` in this mode. If the history reveals a direct request, assignment, @mention, review request, or task clearly addressed to you, switch into active handling instead of stopping: reply using \`raft message send --target <exact target>\` and claim the relevant task with \`raft task claim\` before starting work. Otherwise, do NOT send any message in this mode.`);
+  const tasks = hasResumeOpenTasks(openTasks) ? openTasks : null;
+  const continuesAfter = Boolean(tasks || options.continueAfterCatchup);
+  const stop = continuesAfter ? "" : ", then stop";
+  // Inbox items on: the `message check` ban goes (a removed command). "Once"
+  // stays: a fired reminder stays listed until its ack, and a long item has
+  // more pages, so "until the list is empty" would not end.
+  const catchUp = options.inboxItems === true
+    ? `Run \`raft inbox check\` once, then read each item it lists once with \`raft inbox read --target <item>\`${stop}.`
+    : `Use \`raft message read\` to catch up on the channels listed above${stop}. Read each listed channel at most once unless a read fails. Do NOT call \`raft message check\` in this mode.`;
+  const otherwise = continuesAfter
+    ? "Otherwise, do NOT reply to what you read."
+    : "Otherwise, do NOT send any message in this mode.";
+  const prompt = `You have unread messages:${formatUnreadChannelLines(unreadSummary)}\n\n${catchUp} If the history reveals a direct request, assignment, @mention, review request, or task clearly addressed to you, switch into active handling instead of stopping: reply using \`raft message send --target <exact target>\` and claim the relevant task with \`raft task claim\` before starting work. ${otherwise}`;
+  return tasks
+    ? `${prompt}\n\nOpen tasks assigned to you:${formatOpenTaskLines(tasks)}\n\nAfter catching up: ${RESUME_OPEN_TASKS_ACTION}`
+    : prompt;
 },
   {
-    examples: [{ args: [exampleUnreadSummary, exampleStdinDriver] }],
+    examples: [
+      { args: [exampleUnreadSummary, exampleStdinDriver] },
+      { title: "with open tasks", args: [exampleUnreadSummary, exampleStdinDriver, exampleOpenTasks] },
+      { title: "inbox items on", args: [exampleUnreadSummary, exampleStdinDriver, undefined, { inboxItems: true }] },
+      { title: "interrupted turn continues after catch-up", args: [exampleUnreadSummary, exampleStdinDriver, undefined, { continueAfterCatchup: true }] },
+    ],
+  },
+);
+
+export const formatResumeOpenTasksPrompt = axSurface(
+  "Startup prompt when nothing new arrived but the agent still holds open tasks (todo / in_progress): lists them (a few, then a count) and asks it to continue or update them instead of stopping.",
+  (openTasks: AgentStartOpenTasks, _driver: RuntimeDriver): string => {
+  return `No new messages. Open tasks assigned to you:${formatOpenTaskLines(openTasks)}\n\n${RESUME_OPEN_TASKS_ACTION}`;
+},
+  {
+    examples: [
+      { title: "a few tasks and more", args: [exampleOpenTasks, exampleStdinDriver] },
+      { title: "one task", args: [{ tasks: [exampleOpenTask], more: 0 }, exampleRestartDriver] },
+    ],
   },
 );
 
 export const formatResumeEmptyPrompt = axSurface(
-  "Nothing-pending resume prompt.",
+  "Nothing-pending resume prompt when the start names no open tasks (an older Server, none held, or a daemon-initiated restart that knows none): continue unfinished work, else stop without replying.",
   (_driver: RuntimeDriver): string => {
-  return "No new messages while you were away. Nothing to do — just stop.";
+  return "No new messages while you were away. If you were in the middle of a task, continue it; otherwise stop (no reply needed).";
 },
   {
     examples: [{ title: "stdin-notification driver", args: [exampleStdinDriver] }, { title: "restart driver", args: [exampleRestartDriver] }],
+  },
+);
+
+const INTERRUPTED_TURN_DRIFT_LABELS: Readonly<Record<string, string>> = {
+  runtime: "runtime",
+  model: "model",
+  runtime_config: "runtime settings",
+  env: "environment variables",
+  provider: "model provider",
+  execution_mode: "execution mode",
+  managed_mcp: "connected tools",
+};
+
+export type InterruptedTurnContinuity = "resumed" | "fresh_with_context" | "fresh_no_context";
+
+export const formatInterruptedTurnNote = axSurface(
+  "Brief one-shot note injected when an explicit runtime-config edit stopped an active foreground turn partway so the replacement session checks half-done steps and continues that work.",
+  (drift: readonly string[], continuity: InterruptedTurnContinuity, afterRestOfMessage = false): string => {
+    const labels: string[] = [];
+    for (const kind of drift) {
+      const mapped = INTERRUPTED_TURN_DRIFT_LABELS[kind];
+      if (mapped && !labels.includes(mapped)) labels.push(mapped);
+    }
+    const changed = labels.length > 0 ? labels.join(", ") : "runtime settings";
+    const order = afterRestOfMessage ? "after handling the rest of this message, " : "";
+    let body: string;
+    if (continuity === "resumed") {
+      body = `A step that was running may not have finished: check its result before repeating it, then ${order}continue that work.`;
+    } else if (continuity === "fresh_with_context") {
+      body = `This is a new session; the context above is what was kept from it. Check what was already done (messages sent, files changed) before repeating a step, then ${order}continue that work.`;
+    } else {
+      body = `This is a new session and nothing from that turn was carried over. Read MEMORY.md and your recent conversations to find what you were doing, check what was already done (messages sent, files changed) before repeating a step, then ${order}continue that work.`;
+    }
+    return `<interrupted-turn>\nYour previous turn was stopped partway to apply a settings change someone made (${changed}). ${body}\n</interrupted-turn>`;
+  },
+  {
+    examples: [
+      { title: "resumed session", args: [["runtime_config", "env"], "resumed", false] },
+      { title: "fresh session with constructed context", args: [["model"], "fresh_with_context", false] },
+      { title: "fresh session with no carried context", args: [["runtime"], "fresh_no_context", false] },
+      { title: "resumed session followed by unread catch-up", args: [["model"], "resumed", true] },
+    ],
   },
 );
 

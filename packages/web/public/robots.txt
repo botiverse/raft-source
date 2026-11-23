@@ -53,6 +53,10 @@ Disallow: /
 
 User-agent: *
 Allow: /artifacts/
+Allow: /s/
+Allow: /join/
+Allow: /external-invite/
+Allow: /brand/og-raft.png
 Allow: /android-chrome-512x512.png
 Allow: /llms.txt
 Disallow: /

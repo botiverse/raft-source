@@ -33,12 +33,13 @@ test("machine-local replay allowlist is limited to daemon-affinity routes", () =
   );
   assert.equal(isMachineLocalReplayAllowed("GET", "/api/agents/agent-1/workspace-files?dirPath=notes"), true);
   assert.equal(isMachineLocalReplayAllowed("GET", "/api/servers/server-1/machines/machine-1/runtime-models/claude"), true);
+  // The retired v1 option source answers 410 on any replica (#wg-runtime-form:#20).
   assert.equal(
     isMachineLocalReplayAllowed(
       "GET",
       "/api/servers/server-1/machines/machine-1/runtime-form-definitions/builtin/option-sources/model?schemaVersion=builtin-pi.create.v3",
     ),
-    true,
+    false,
   );
   assert.equal(
     isMachineLocalReplayAllowed("GET", "/api/servers/server-1/machines/machine-1/runtime-forms/v2/builtin/option-sources/model"),
@@ -53,6 +54,8 @@ test("machine-local replay allowlist is limited to daemon-affinity routes", () =
     "POST",
     "/api/servers/server-1/machines/machine-1/computer-lifecycle-operations",
   ), true);
+  // Revoke-and-delete (`{ delete: true }`) disconnects the machine like DELETE; the route asks only then.
+  assert.equal(isMachineLocalReplayAllowed("POST", "/api/servers/server-1/machines/machine-1/revoke-computer-key"), true);
 
   assert.equal(isMachineLocalReplayAllowed("GET", "/api/messages/sync"), false);
   assert.equal(isMachineLocalReplayAllowed("POST", "/api/agents/agent-1/skills"), false);

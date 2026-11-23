@@ -9,13 +9,19 @@ interface LongPressHandlers {
   suppressClickRef: React.MutableRefObject<boolean>;
 }
 
+export interface LongPressCoords {
+  x: number;
+  y: number;
+  target: Element | null;
+}
+
 /**
  * Long-press hook for touch devices. Fires callback after holding for `delay` ms.
  * Cancels if finger moves more than `moveThreshold` px.
  * Suppresses the subsequent click event after a successful long-press.
  */
 export function useLongPress(
-  callback: (coords: { x: number; y: number }) => void,
+  callback: (coords: LongPressCoords) => void,
   delay = 500,
   moveThreshold = 10
 ): LongPressHandlers {
@@ -36,12 +42,13 @@ export function useLongPress(
       firedRef.current = false;
       suppressClickRef.current = false;
       const touch = e.touches[0];
+      const target = e.currentTarget instanceof Element ? e.currentTarget : null;
       startPos.current = { x: touch.clientX, y: touch.clientY };
 
       timerRef.current = setTimeout(() => {
         firedRef.current = true;
         suppressClickRef.current = true;
-        callback({ x: touch.clientX, y: touch.clientY });
+        callback({ x: touch.clientX, y: touch.clientY, target });
       }, delay);
     },
     [callback, delay]

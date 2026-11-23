@@ -28,7 +28,9 @@ view (RFC 079 phase 3a, design §4.1).
 - `LoginSetupHeader.tsx`: "Login with [Raft]" (`{raft}` is the lockup, an
   image named Raft) and Back / Log Out.
 - `loginClientSummary.ts` also holds the page's Server order
-  (`marketplaceServerRank`, `firstServerByRank`) and
+  (`marketplaceServerRank`, `firstServerByRank`), the page's own pick
+  (`initialServerPick`: none when more than one Server, suspended ones not
+  counted, is there to choose from, so the person picks) and
   `withAccountInstallationsSuspended`: a 403 `installation_suspended` marks
   the page's one list of lookup answers (`foundEntries`) as a lookup would
   now return them (the Suspended badge), by functional update.
@@ -50,7 +52,13 @@ view (RFC 079 phase 3a, design §4.1).
   (`features/desktopBrowserSignIn`, flag `desktop_browser_raft_sign_in_v0`;
   rules in [apps/desktop/README.md](../../../../../apps/desktop/README.md#sign-in-with-raft-desktop_browser_raft_sign_in_v0))
   provides another: the query Raft's server answered the authorize request
-  with, the answer handed to the shell, `embedded` (only the card: no page
+  with, or, for the setup page opened directly in a tab (any of
+  `/login-with-raft/setup`, `/login-with-slock/setup`,
+  `/login-with-slock-human/setup`), a query the shell builds from that
+  address's `client_id`, `return_to` (or `redirect_uri`), `scope`, `state`
+  and `server` only, with no `flow`, so the page runs its flow for a direct
+  visit (tests: "the setup page opened directly" in
+  `desktopBrowserSignIn.behavior.test.tsx`); the answer handed to the shell, `embedded` (only the card: no page
   header, side card or in-app link), the conversation's Server picked first
   (`preferredServerId`, never over the person's own choice) and `source:
   "desktop_browser"`, sent with POST `/oauth/authorize/human` and

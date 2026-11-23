@@ -14,6 +14,7 @@ import type { Server as SocketServer } from "socket.io";
 import multer from "multer";
 import { z } from "zod";
 import * as userService from "../services/userService";
+import { changedDescriptionLinkWarnings } from "../services/profileDescriptionLinks";
 import { HumanSeatLimitError } from "../services/planService";
 import { DeploymentUserLimitError, deploymentUserLimitReached as isDeploymentUserLimitReached } from "../services/deploymentUserLimit";
 import { getDb, type DatabaseExecutor } from "../db/index";
@@ -59,6 +60,8 @@ import {
 } from "./authRefreshTrace";
 import { sendJsonServerError } from "./errorResponse";
 import {
+  PROFILE_DESCRIPTION_MAX_LENGTH,
+  profileDescriptionTooLong,
   replaceAgentLineBreaks,
   isReservedAgentName,
   isSignupRoleId,
@@ -135,12 +138,13 @@ import {
 import type { SocialAuthMode, SocialAuthProfile, SocialAuthProvider } from "../services/socialAuthService";
 import { socialLoginAllowed } from "../edition";
 import { refuse } from "../lib/refusal";
+import { serviceMessageRefusal } from "./agentRouteRefusals";
 import { parseCanonicalBrowserTimezone } from "../lib/ianaTimezone";
 import { parseDisplayLanguage, parsePreferredTimezone } from "../lib/accountPreferenceParsers";
 import { proofForMobileSocialLogin, proofForSignup, proofForSocialLogin, type SessionIssueProof } from "../services/sessionIssueGate";
 import { parseAuthChallengeToken } from "../services/secondFactor/authChallenges";
 import { PasskeySignInError, startPasskeySignIn, verifyPasskeySignIn } from "../services/secondFactor/passkeySignIn";
-import { parsePasskeyAssertionResponse } from "../services/secondFactor/webauthn";
+import { parsePasskeyAssertionResponse, parsePasskeyRpGroup } from "../services/secondFactor/webauthn";
 import { refuseWithoutRecentSecondFactor } from "./secondFactor";
 import {
   completeSecondFactorRecoverySignIn,
@@ -162,7 +166,6 @@ import {
 export const authRouter: RouterType = Router();
 /** /api/invites: what an invite's page tells the server (beside accept-invite and invite-info below). */
 export const invitesRouter: RouterType = Router();
-const MAX_USER_DESCRIPTION_LENGTH = 3000;
 const userAvatarUpload = createAvatarUpload();
 // Write-side validation accepts retired ids too (`hn_reddit`, before Hacker News and
 // Reddit were split apart): an older client is still entitled to be understood.
@@ -205,6 +208,7 @@ function formatBodyIssues(error: z.ZodError) {
 function parseEmailRegisterRequest(rawBody: unknown, res: Response): EmailRegisterRequest | null {
   const parsed = emailRegisterRequestSchema.safeParse(rawBody ?? {});
   if (!parsed.success) {
+    // refusal-ok: top-level `issues` (the body's field errors), kept as clients have had it
     res.status(400).json({
       error: "Invalid email registration body",
       code: "email_register_body_invalid",
@@ -218,6 +222,7 @@ function parseEmailRegisterRequest(rawBody: unknown, res: Response): EmailRegist
 function parseEmailLoginRequest(rawBody: unknown, res: Response): EmailLoginRequest | null {
   const parsed = emailLoginRequestSchema.safeParse(rawBody ?? {});
   if (!parsed.success) {
+    // refusal-ok: top-level `issues` (the body's field errors), kept as clients have had it
     res.status(400).json({
       error: "Invalid email login body",
       code: "email_login_body_invalid",
@@ -242,7 +247,7 @@ function parsePendingLinkToken(body: unknown, res: Response): string | undefined
   const value = (body as { pendingLinkToken?: unknown } | undefined)?.pendingLinkToken;
   if (value === undefined || value === null || value === "") return undefined;
   if (typeof value !== "string" || value.length > 256) {
-    res.status(400).json({ code: "pending_link_token_invalid", error: "pendingLinkToken must be a string" });
+    refuse(res, 400, { code: "pending_link_token_invalid", error: "pendingLinkToken must be a string" });
     return null;
   }
   return value;
@@ -250,6 +255,7 @@ function parsePendingLinkToken(body: unknown, res: Response): string | undefined
 
 async function sendAccountLinkRequired(res: Response, pending: PendingSocialLink, extra: { returnTo?: string; returnUri?: string }) {
   const methods = await userService.getUserAuthMethods(pending.userId);
+  // refusal-ok: the web reads the top-level pendingLinkToken, provider, email, expiresAt and signInMethods (pendingAccountLink.ts)
   res.status(409).json({
     code: "account_link_required",
     error: "An account with this email already exists. Sign in to it to connect this provider.",
@@ -616,11 +622,11 @@ async function startMobileOAuthResponse(req: Request, res: Response, params: {
 }) {
   const provider = getSocialAuthProvider(params.providerId);
   if (!provider) {
-    res.status(400).json({ code: "provider_invalid", error: "provider must be google, github, or apple" });
+    refuse(res, 400, { code: "provider_invalid", error: "provider must be google, github, or apple" });
     return;
   }
   if (!isSocialAuthProviderConfigured(provider.id)) {
-    res.status(404).json({ code: "provider_not_configured", error: `${provider.label} sign-in is not configured` });
+    refuse(res, 404, { code: "provider_not_configured", error: `${provider.label} sign-in is not configured` });
     return;
   }
 
@@ -629,7 +635,7 @@ async function startMobileOAuthResponse(req: Request, res: Response, params: {
   const bearer = params.mode === "link" && !params.authenticatedUserId ? await getBearerAccessSession(req.headers.authorization) : null;
   const userId = params.mode === "link" ? params.authenticatedUserId ?? bearer?.userId : undefined;
   if (params.mode === "link" && !userId) {
-    res.status(401).json({ code: "auth_required", error: "link mode requires authentication" });
+    refuse(res, 401, { code: "auth_required", error: "link mode requires authentication" });
     return;
   }
   // The complete leg is bound to this start's transaction: gating the start gates the link.
@@ -653,7 +659,7 @@ async function startMobileOAuthResponse(req: Request, res: Response, params: {
 
 function socialLinkEmailUnverifiedResponse(res: Response, err: unknown): boolean {
   if (!(err instanceof userService.SocialLinkEmailUnverifiedError)) return false;
-  res.status(403).json({ code: err.code, error: err.message });
+  refuse(res, 403, { code: err.code, error: err.message });
   return true;
 }
 
@@ -661,19 +667,19 @@ function mobileOAuthErrorResponse(res: Response, err: unknown, operation: "start
   if (socialLinkEmailUnverifiedResponse(res, err)) return true;
   const message = errorMessage(err, `mobile_oauth_${operation}_failed`);
   if (message === "return_uri_not_allowed") {
-    res.status(400).json({ code: "return_uri_not_allowed", error: "Mobile OAuth return URI is not allowed" });
+    refuse(res, 400, { code: "return_uri_not_allowed", error: "Mobile OAuth return URI is not allowed" });
     return true;
   }
   if (message === "handoff_code_consumed") {
-    res.status(410).json({ code: "handoff_code_consumed", error: "Mobile OAuth code has already been consumed" });
+    refuse(res, 410, { code: "handoff_code_consumed", error: "Mobile OAuth code has already been consumed" });
     return true;
   }
   if (message === "handoff_code_expired") {
-    res.status(410).json({ code: "handoff_code_expired", error: "Mobile OAuth code has expired" });
+    refuse(res, 410, { code: "handoff_code_expired", error: "Mobile OAuth code has expired" });
     return true;
   }
   if (message === "pkce_mismatch") {
-    res.status(400).json({ code: "pkce_mismatch", error: "PKCE verifier did not match the OAuth request" });
+    refuse(res, 400, { code: "pkce_mismatch", error: "PKCE verifier did not match the OAuth request" });
     return true;
   }
   if (message.includes("already linked to another") || message.includes("belongs to another")) {
@@ -690,23 +696,23 @@ function mobileOAuthErrorResponse(res: Response, err: unknown, operation: "start
 function nativeAppleOAuthErrorResponse(res: Response, err: unknown): boolean {
   const message = errorMessage(err, "native_apple_auth_failed");
   if (message === "native_apple_not_configured") {
-    res.status(404).json({ code: "provider_not_configured", error: "Apple sign-in is not configured" });
+    refuse(res, 404, { code: "provider_not_configured", error: "Apple sign-in is not configured" });
     return true;
   }
   if (message === "native_apple_auth_required" || message === "link mode requires authentication") {
-    res.status(401).json({ code: "auth_required", error: "Apple account linking requires authentication" });
+    refuse(res, 401, { code: "auth_required", error: "Apple account linking requires authentication" });
     return true;
   }
   if (message === "native_apple_link_user_mismatch") {
-    res.status(403).json({ code: "link_user_mismatch", error: "Apple account linking does not match the authenticated user" });
+    refuse(res, 403, { code: "link_user_mismatch", error: "Apple account linking does not match the authenticated user" });
     return true;
   }
   if (message === "native_apple_request_expired") {
-    res.status(410).json({ code: "native_apple_request_expired", error: "Apple sign-in request expired" });
+    refuse(res, 410, { code: "native_apple_request_expired", error: "Apple sign-in request expired" });
     return true;
   }
   if (message === "native_apple_request_consumed") {
-    res.status(410).json({ code: "native_apple_request_consumed", error: "Apple sign-in request was already used" });
+    refuse(res, 410, { code: "native_apple_request_consumed", error: "Apple sign-in request was already used" });
     return true;
   }
   if (message.includes("email already exists")) {
@@ -714,7 +720,7 @@ function nativeAppleOAuthErrorResponse(res: Response, err: unknown): boolean {
     return true;
   }
   if (message.includes("Registration is currently disabled")) {
-    res.status(403).json({ code: "registration_disabled", error: "New account registration is currently unavailable" });
+    refuse(res, 403, { code: "registration_disabled", error: "New account registration is currently unavailable" });
     return true;
   }
   if (
@@ -725,7 +731,7 @@ function nativeAppleOAuthErrorResponse(res: Response, err: unknown): boolean {
     message.includes("required") ||
     message.includes("too long")
   ) {
-    res.status(400).json({ code: "native_apple_invalid_credential", error: "Apple sign-in credential was invalid" });
+    refuse(res, 400, { code: "native_apple_invalid_credential", error: "Apple sign-in credential was invalid" });
     return true;
   }
   return false;
@@ -741,11 +747,11 @@ async function completeMobileOAuthResponse(req: Request, res: Response, params: 
 }) {
   const completion = await getMobileOAuthCompletion(params.code, params.codeVerifier);
   if (params.providerId && completion.provider !== params.providerId) {
-    res.status(400).json({ code: "provider_mismatch", error: "Mobile OAuth code does not match the requested provider" });
+    refuse(res, 400, { code: "provider_mismatch", error: "Mobile OAuth code does not match the requested provider" });
     return;
   }
   if (params.expectedMode && completion.mode !== params.expectedMode) {
-    res.status(400).json({ code: "mode_mismatch", error: "Mobile OAuth code does not match the requested mode" });
+    refuse(res, 400, { code: "mode_mismatch", error: "Mobile OAuth code does not match the requested mode" });
     return;
   }
 
@@ -762,11 +768,11 @@ async function completeMobileOAuthResponse(req: Request, res: Response, params: 
   if (completion.mode === "link") {
     const userId = params.authenticatedUserId ?? (await getBearerAccessUserId(req.headers.authorization));
     if (!userId) {
-      res.status(401).json({ code: "auth_required", error: "link mode requires authentication" });
+      refuse(res, 401, { code: "auth_required", error: "link mode requires authentication" });
       return;
     }
     if (!completion.userId || completion.userId !== userId) {
-      res.status(403).json({ code: "link_user_mismatch", error: "Mobile OAuth link request does not match the authenticated user" });
+      refuse(res, 403, { code: "link_user_mismatch", error: "Mobile OAuth link request does not match the authenticated user" });
       return;
     }
     const profile = socialProfileFromCompletion(getSocialAuthProvider(completion.provider)!, completion);
@@ -826,7 +832,7 @@ async function completeMobileOAuthResponse(req: Request, res: Response, params: 
 authRouter.post("/register", async (req, res) => {
   const registrationBlockedReason = getRegistrationBlockedReason();
   if (registrationBlockedReason) {
-    res.status(403).json({ error: registrationBlockedReason });
+    refuse(res, 403, { code: "registration_disabled", error: registrationBlockedReason });
     return;
   }
   try {
@@ -842,22 +848,22 @@ authRouter.post("/register", async (req, res) => {
   try {
     const { email, password, name, stagingSelfAccountCapability } = body;
     if (stagingSelfAccountCapability && (process.env.SLOCK_RELEASE_BRANCH !== "staging" || !/@mail\.build$/i.test(email))) {
-      res.status(403).json({ error: "Staging self-account registration is unavailable" });
+      refuse(res, 403, { code: "registration_disabled", error: "Staging self-account registration is unavailable" });
       return;
     }
     if (name) {
       const nameError = validateName(name, "Name", 5);
       if (nameError) {
-        res.status(400).json({ error: nameError });
+        refuse(res, 400, { code: "invalid_input", error: nameError });
         return;
       }
       if (isReservedAgentName(name)) {
-        res.status(400).json({ error: "This username is reserved. Choose another name." });
+        refuse(res, 400, { code: "invalid_input", error: "This username is reserved. Choose another name." });
         return;
       }
     }
     if (password.length < 8) {
-      res.status(400).json({ error: "Password must be at least 8 characters" });
+      refuse(res, 400, { code: "invalid_input", error: "Password must be at least 8 characters" });
       return;
     }
 
@@ -901,7 +907,7 @@ authRouter.post("/register", async (req, res) => {
     }
     const msg = err?.message || "";
     if (msg === "Username is already taken") {
-      res.status(409).json({ code: "AUTH_USERNAME_TAKEN", error: msg });
+      refuse(res, 409, { code: "AUTH_USERNAME_TAKEN", error: msg });
     } else if (msg.includes("already registered") || msg.includes("already taken")) {
       res.status(409).json({ error: msg });
     } else {
@@ -920,7 +926,7 @@ authRouter.get("/providers", async (req, res) => {
   // exactly when it is configured, matching what its start routes accept.
   const platformParam = typeof req.query.platform === "string" ? req.query.platform : "web";
   if (platformParam !== "web" && platformParam !== "mobile") {
-    res.status(400).json({ code: "platform_invalid", error: "platform must be web or mobile" });
+    refuse(res, 400, { code: "platform_invalid", error: "platform must be web or mobile" });
     return;
   }
 
@@ -963,7 +969,7 @@ authRouter.get("/identities", requireAuth, async (req, res) => {
 authRouter.delete("/identities/:provider", requireAuth, async (req, res) => {
   const provider = getSocialAuthProvider(getProviderParam(req.params.provider));
   if (!provider) {
-    res.status(404).json({ code: "AUTH_PROVIDER_NOT_FOUND", error: "Unknown sign-in provider" });
+    refuse(res, 404, { code: "AUTH_PROVIDER_NOT_FOUND", error: "Unknown sign-in provider" });
     return;
   }
 
@@ -973,7 +979,7 @@ authRouter.delete("/identities/:provider", requireAuth, async (req, res) => {
     res.json(result);
   } catch (err) {
     if (err instanceof userService.PasswordCredentialRequiredError) {
-      res.status(409).json({ code: err.code, error: err.message });
+      refuse(res, 409, { code: err.code, error: err.message });
       return;
     }
     if (err instanceof Error && err.message === "User not found") {
@@ -991,15 +997,15 @@ authRouter.delete("/identities/:provider", requireAuth, async (req, res) => {
 authRouter.post("/mobile/oauth/apple/native/start", async (req, res) => {
   try {
     if (!isNativeAppleSignInConfigured()) {
-      res.status(404).json({ code: "provider_not_configured", error: "Apple sign-in is not configured" });
+      refuse(res, 404, { code: "provider_not_configured", error: "Apple sign-in is not configured" });
       return;
     }
     if (req.body?.platform !== "ios" || typeof req.body?.appEnv !== "string" || !req.body.appEnv.trim()) {
-      res.status(400).json({ code: "invalid_request", error: "Native Apple sign-in requires the iOS platform and app environment" });
+      refuse(res, 400, { code: "invalid_request", error: "Native Apple sign-in requires the iOS platform and app environment" });
       return;
     }
     if (req.body?.codeChallengeMethod !== "S256") {
-      res.status(400).json({ code: "invalid_request", error: "Native Apple sign-in requires an S256 challenge" });
+      refuse(res, 400, { code: "invalid_request", error: "Native Apple sign-in requires an S256 challenge" });
       return;
     }
     const mode = req.body?.mode;
@@ -1033,7 +1039,7 @@ authRouter.post("/mobile/oauth/apple/native/start", async (req, res) => {
 authRouter.post("/mobile/oauth/apple/native/authorize", async (req, res) => {
   try {
     if (!isNativeAppleSignInConfigured()) {
-      res.status(404).json({ code: "provider_not_configured", error: "Apple sign-in is not configured" });
+      refuse(res, 404, { code: "provider_not_configured", error: "Apple sign-in is not configured" });
       return;
     }
     const completed = await completeNativeAppleMobileOAuthAuthorization({
@@ -1168,7 +1174,7 @@ authRouter.get("/:provider/start", async (req, res, next) => {
   }
 
   if (!isSocialAuthProviderConfigured(provider.id)) {
-    res.status(404).json({ error: `${provider.label} sign-in is not configured` });
+    refuse(res, 404, { code: "provider_not_configured", error: `${provider.label} sign-in is not configured` });
     return;
   }
 
@@ -1194,7 +1200,7 @@ authRouter.post("/:provider/link/start", requireAuth, async (req, res, next) => 
   }
 
   if (!isSocialAuthProviderConfigured(provider.id)) {
-    res.status(404).json({ error: `${provider.label} sign-in is not configured` });
+    refuse(res, 404, { code: "provider_not_configured", error: `${provider.label} sign-in is not configured` });
     return;
   }
 
@@ -1239,6 +1245,7 @@ async function handleSocialAuthCallback(req: Request, res: Response, next: NextF
         });
         res.redirect(completed.redirectUri);
       } catch {
+        // refusal-ok: plain text shown in the browser the provider sent back, not a JSON answer
         res.status(400).send("Invalid mobile OAuth request");
       }
       return;
@@ -1247,6 +1254,10 @@ async function handleSocialAuthCallback(req: Request, res: Response, next: NextF
     state = validated.state;
     returnTo = validated.returnTo;
   } catch {
+    // The callback always answers 302, so its failures are told apart on the
+    // request span by error_code (the incident of 11-16: every callback failed
+    // here for hours and nothing counted it, #raft-botiverse-deployment:#309).
+    setRequestTraceErrorCode(res, "state_invalid");
     res.setHeader("Set-Cookie", clearStateCookie(provider.id));
     res.redirect(buildSocialAuthCallbackUrl({
       provider: provider.id,
@@ -1262,6 +1273,7 @@ async function handleSocialAuthCallback(req: Request, res: Response, next: NextF
     const code = getSocialAuthCallbackParam(req, "code");
     if (!code) {
       const providerError = getSocialAuthCallbackParam(req, "error") || `${provider.label} sign-in was cancelled`;
+      setRequestTraceErrorCode(res, "provider_declined");
       res.redirect(buildSocialAuthCallbackUrl({
         provider: provider.id,
         mode: state.mode,
@@ -1336,6 +1348,7 @@ async function handleSocialAuthCallback(req: Request, res: Response, next: NextF
     }));
   } catch (err: any) {
     console.error(`${provider.label} auth callback error:`, serializeErrorForLog(err));
+    setRequestTraceErrorCode(res, "callback_failed");
     res.redirect(buildSocialAuthCallbackUrl({
       provider: provider.id,
       mode: state.mode,
@@ -1363,8 +1376,9 @@ authRouter.post("/:provider/complete", async (req, res, next) => {
   try {
     const { code } = req.body;
     if (!code) {
+      refuse(res, 400, { code: "invalid_request", error: "Sign-in completion code is required" });
+      // refuse() records its own code on the trace; this keeps the reason the trace has always had.
       setRequestTraceErrorCode(res, "completion_code_required");
-      res.status(400).json({ error: "Sign-in completion code is required" });
       return;
     }
     // Only the browser the provider answered can complete (login CSRF). Checked
@@ -1374,8 +1388,7 @@ authRouter.post("/:provider/complete", async (req, res, next) => {
     // Every client, whatever version it names (#raft-architecture:#32 retired
     // social_completion_binding with this as the permanent behaviour).
     if (typeof code !== "string" || !completionIsBound(binding, req.headers.cookie, code)) {
-      setRequestTraceErrorCode(res, "browser_mismatch");
-      res.status(400).json({ error: "This sign-in could not be finished. Refresh the page and sign in again.", code: "browser_mismatch" });
+      refuse(res, 400, { code: "browser_mismatch", error: "This sign-in could not be finished. Refresh the page and sign in again." });
       return;
     }
 
@@ -1400,13 +1413,11 @@ authRouter.post("/:provider/complete", async (req, res, next) => {
     if (pendingCompletion.mode === "link") {
       authenticatedLinkUserId = (await getBearerAccessUserId(req.headers.authorization));
       if (!authenticatedLinkUserId) {
-        setRequestTraceErrorCode(res, "auth_required");
-        res.status(401).json({ code: "auth_required", error: "Authentication is required to link an account" });
+        refuse(res, 401, { code: "auth_required", error: "Authentication is required to link an account" });
         return;
       }
       if (!pendingCompletion.userId || pendingCompletion.userId !== authenticatedLinkUserId) {
-        setRequestTraceErrorCode(res, "link_user_mismatch");
-        res.status(403).json({ code: "link_user_mismatch", error: "Social auth link does not match the authenticated user" });
+        refuse(res, 403, { code: "link_user_mismatch", error: "Social auth link does not match the authenticated user" });
         return;
       }
     }
@@ -1538,7 +1549,7 @@ authRouter.post("/login", async (req, res) => {
       if (traceId) {
         res.setHeader("X-Slock-Trace-Id", traceId);
       }
-      res.status(401).json({ code: "AUTH_INVALID_CREDENTIALS", error: err.message });
+      refuse(res, 401, { code: "AUTH_INVALID_CREDENTIALS", error: err.message });
     } else {
       sendJsonServerError(req, res, {
         error: "Login failed",
@@ -1578,7 +1589,7 @@ export async function secondFactorVerifyHandler(req: Request, res: Response): Pr
   const recovery = isSecondFactorRecoveryAnswer(req.body);
   const answer = recovery ? null : parseSecondFactorSignInAnswer(req.body);
   if (!challenge || (!answer && !recovery)) {
-    res.status(400).json({ code: "invalid_request", error: "Send the sign-in challenge with a code from your authenticator app, a backup code or a passkey." });
+    refuse(res, 400, { code: "invalid_request", error: "Send the sign-in challenge with a code from your authenticator app, a backup code or a passkey." });
     return;
   }
   const codeVerifier = typeof req.body?.codeVerifier === "string" ? req.body.codeVerifier : null;
@@ -1654,7 +1665,7 @@ export async function secondFactorVerifyHandler(req: Request, res: Response): Pr
       return;
     }
     if (err instanceof SsoSecondStepRefusedError) {
-      res.status(403).json({ error: "This single sign-on can't sign you in right now.", code: err.reason });
+      refuse(res, 403, { code: err.reason, error: "This single sign-on can't sign you in right now." });
       return;
     }
     // An edition without SSO (services/sso/ssoEdition.ts): an sso_login challenge issued before finishes nothing.
@@ -1674,8 +1685,11 @@ export async function secondFactorVerifyHandler(req: Request, res: Response): Pr
  * without a WebAuthn relying party (an expected answer to every login page's
  * autofill request, so not a 5xx).
  *
- *   POST /passkey/options {}                    -> { options, expiresAt }
+ *   POST /passkey/options { rp? }               -> { options, expiresAt, rp? }
  *   POST /passkey/verify { challenge, response } -> exactly /login's success body
+ * `rp`: "current" (default) or "legacy" (WEBAUTHN_LEGACY_RP_ID; 404
+ * `passkey_rp_unavailable` without one); `rp` in the body only while a
+ * legacy RP ID is set.
  */
 function sendPasskeySignInError(req: Request, res: Response, err: unknown, failure: string): void {
   if (err instanceof PasskeySignInError) {
@@ -1686,9 +1700,14 @@ function sendPasskeySignInError(req: Request, res: Response, err: unknown, failu
 }
 
 authRouter.post("/passkey/options", async (req, res) => {
+  const rp = parsePasskeyRpGroup(req.body?.rp);
+  if (rp === null) {
+    refuse(res, 400, { code: "invalid_request", error: "rp must be \"current\" or \"legacy\"." });
+    return;
+  }
   try {
     res.setHeader("Cache-Control", "no-store");
-    res.json(await startPasskeySignIn());
+    res.json(await startPasskeySignIn(undefined, rp));
   } catch (err) {
     sendPasskeySignInError(req, res, err, "Failed to start passkey sign-in");
   }
@@ -1698,7 +1717,7 @@ authRouter.post("/passkey/verify", async (req, res) => {
   const challenge = parseAuthChallengeToken(req.body?.challenge);
   const response = parsePasskeyAssertionResponse(req.body?.response);
   if (!challenge || !response) {
-    res.status(400).json({ code: "invalid_request", error: "Send the passkey sign-in challenge and the passkey from your browser." });
+    refuse(res, 400, { code: "invalid_request", error: "Send the passkey sign-in challenge and the passkey from your browser." });
     return;
   }
   try {
@@ -1714,7 +1733,7 @@ authRouter.post("/pending-link/cancel", async (req, res) => {
   const pendingLinkToken = parsePendingLinkToken(req.body, res);
   if (pendingLinkToken === null) return;
   if (!pendingLinkToken) {
-    res.status(400).json({ code: "pending_link_token_invalid", error: "pendingLinkToken is required" });
+    refuse(res, 400, { code: "pending_link_token_invalid", error: "pendingLinkToken is required" });
     return;
   }
   try {
@@ -1735,7 +1754,7 @@ authRouter.post("/refresh", async (req, res) => {
     const { refreshToken } = req.body;
     if (!refreshToken) {
       attachAuthTraceIdentity(req, { source: "refresh", reason: "missing_refresh_token" });
-      res.status(400).json({ error: "Refresh token is required" });
+      refuse(res, 400, { code: "invalid_input", error: "Refresh token is required" });
       return;
     }
 
@@ -1746,7 +1765,7 @@ authRouter.post("/refresh", async (req, res) => {
     const authRefreshInstallationId = authRefreshInstallationIdFromHeader(installationHeader);
     if (installationHeader !== undefined && (!authRefreshInstallationId || !authRefreshAttemptId)) {
       attachAuthTraceIdentity(req, { source: "refresh", reason: "invalid_refresh_binding" });
-      res.status(400).json({ error: "Invalid refresh replay binding" });
+      refuse(res, 400, { code: "invalid_request", error: "Invalid refresh replay binding" });
       return;
     }
 
@@ -1768,7 +1787,7 @@ authRouter.post("/refresh", async (req, res) => {
         // the client lost that rotation (task #72). Still a sign-in, but the
         // client can log why.
         attachAuthTraceIdentity(req, { source: "refresh", reason: "refresh_rotation_superseded" });
-        res.status(401).json({ error: "Refresh token was already rotated", code: "refresh_rotation_superseded" });
+        refuse(res, 401, { code: "refresh_rotation_superseded", error: "Refresh token was already rotated" });
         return;
       }
       if (await sessionService.isRevokedSessionRefreshToken(refreshToken)) {
@@ -1780,7 +1799,8 @@ authRouter.post("/refresh", async (req, res) => {
         return;
       }
       attachAuthTraceIdentity(req, { source: "refresh", reason: "invalid_or_expired_refresh" });
-      res.status(401).json({ error: "Invalid or expired refresh token" });
+      // One code for every failure (unknown, expired, used, malformed): the answer must not say which.
+      refuse(res, 401, { code: "refresh_token_invalid", error: "Invalid or expired refresh token" });
       return;
     }
     const { refreshToken: newRefreshToken } = refreshed;
@@ -1822,6 +1842,7 @@ authRouter.get("/me", requireAuth, async (req, res) => {
 authRouter.post("/me/timezone-observation", requireAuth, async (req, res) => {
   const parsed = timezoneObservationRequestSchema.safeParse(req.body ?? {});
   if (!parsed.success) {
+    // refusal-ok: top-level `issues` (the body's field errors), kept as clients have had it
     res.status(400).json({
       error: "Invalid timezone observation body",
       code: "timezone_observation_body_invalid",
@@ -1859,6 +1880,7 @@ authRouter.post("/me/timezone-observation", requireAuth, async (req, res) => {
 authRouter.post("/me/complete-profile", requireAuth, async (req, res) => {
   const parsed = completeProfileRequestSchema.safeParse(req.body ?? {});
   if (!parsed.success) {
+    // refusal-ok: top-level `issues` (the body's field errors), kept as clients have had it
     res.status(400).json({
       error: "Invalid profile setup body",
       code: "PROFILE_SETUP_BODY_INVALID",
@@ -1870,16 +1892,16 @@ authRouter.post("/me/complete-profile", requireAuth, async (req, res) => {
   const name = parsed.data.name.trim();
   const nameError = validateName(name, "Name", 5);
   if (nameError) {
-    res.status(400).json({ error: nameError, code: "PROFILE_SETUP_NAME_INVALID" });
+    refuse(res, 400, { code: "PROFILE_SETUP_NAME_INVALID", error: nameError });
     return;
   }
   if (
     name.toLowerCase().startsWith(userService.PROFILE_SETUP_PLACEHOLDER_PREFIX)
     || isReservedAgentName(name)
   ) {
-    res.status(400).json({
-      error: "This username is reserved. Choose another name.",
+    refuse(res, 400, {
       code: "PROFILE_SETUP_NAME_RESERVED",
+      error: "This username is reserved. Choose another name.",
     });
     return;
   }
@@ -2028,7 +2050,7 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
     // Password change
     if (currentPassword && newPassword) {
       if (newPassword.length < 8) {
-        res.status(400).json({ error: "New password must be at least 8 characters" });
+        refuse(res, 400, { code: "invalid_input", error: "New password must be at least 8 characters" });
         return;
       }
       // Two-step verification on: this sign-in passed it in the last 10
@@ -2066,11 +2088,21 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
     // Free text other people's agents read: a display name has no line break, a description only `\n`.
     if (displayName !== undefined) profileFields.displayName = typeof displayName === "string" ? replaceAgentLineBreaks(displayName, " ") : displayName;
     if (description !== undefined) {
-      if (description !== null && (typeof description !== "string" || description.length > MAX_USER_DESCRIPTION_LENGTH)) {
-        res.status(400).json({ error: `Description must be a string of at most ${MAX_USER_DESCRIPTION_LENGTH} characters` });
+      if (description !== null && typeof description !== "string") {
+        refuse(res, 400, { code: "profile_description_invalid", error: `Description must be a string of at most ${PROFILE_DESCRIPTION_MAX_LENGTH} characters` });
         return;
       }
-      profileFields.description = typeof description === "string" ? (replaceAgentLineBreaks(description, "\n").trim() || null) : null;
+      const nextDescription = typeof description === "string" ? (replaceAgentLineBreaks(description, "\n").trim() || null) : null;
+      // A description saved under the older, longer limit keeps saving unchanged; a new or changed one has to fit.
+      // The stored one is read only for a description over the limit.
+      if (nextDescription !== null && nextDescription.length > PROFILE_DESCRIPTION_MAX_LENGTH) {
+        const stored = (await userService.getUser(req.userId!))?.description ?? null;
+        if (profileDescriptionTooLong(nextDescription, stored)) {
+          refuse(res, 400, { code: "profile_description_invalid", error: `A new or changed description can be at most ${PROFILE_DESCRIPTION_MAX_LENGTH} characters: shorten it.` });
+          return;
+        }
+      }
+      profileFields.description = nextDescription;
     }
     if (nextAvatarUrl !== undefined) profileFields.avatarUrl = nextAvatarUrl;
     try {
@@ -2123,7 +2155,7 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
     // the other.
     if (signupRole !== undefined) {
       if (signupRole !== null && !isSignupRoleId(signupRole)) {
-        res.status(400).json({ error: "Invalid signupRole" });
+        refuse(res, 400, { code: "invalid_input", error: "Invalid signupRole" });
         return;
       }
       profileFields.signupRole = signupRole;
@@ -2132,7 +2164,7 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
 
     if (referralSource !== undefined) {
       if (referralSource !== null && (typeof referralSource !== "string" || !REFERRAL_SOURCE_OPTIONS.has(referralSource))) {
-        res.status(400).json({ error: "Invalid referralSource" });
+        refuse(res, 400, { code: "invalid_input", error: "Invalid referralSource" });
         return;
       }
       profileFields.referralSource = referralSource;
@@ -2141,12 +2173,12 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
         : null;
       profileFields.referralSourceSkippedAt = null;
     } else if (referralSourceOther !== undefined) {
-      res.status(400).json({ error: "referralSource is required when referralSourceOther is provided" });
+      refuse(res, 400, { code: "invalid_input", error: "referralSource is required when referralSourceOther is provided" });
       return;
     }
     if (referralSourceSkipped !== undefined) {
       if (typeof referralSourceSkipped !== "boolean") {
-        res.status(400).json({ error: "referralSourceSkipped must be a boolean" });
+        refuse(res, 400, { code: "invalid_input", error: "referralSourceSkipped must be a boolean" });
         return;
       }
       if (referralSourceSkipped) {
@@ -2162,6 +2194,11 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
 
     // Any avatar change (null included): the photo it replaces goes
     // (previousAvatarUrl, read when the avatar was checked).
+    // #457: the description before this save, to warn only about a new one.
+    // Best effort, as the warnings are: a failed read is no previous description, never a failed save.
+    const previousDescription = profileFields.description !== undefined
+      ? await userService.getUser(req.userId!).then((current) => current?.description ?? null, () => null)
+      : null;
     let user;
     if (Object.keys(profileFields).length > 0) {
       user = await userService.updateUser(req.userId!, profileFields);
@@ -2187,16 +2224,23 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
       const io = req.app.get("io") as SocketServer | undefined;
       const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
       const server = await serverService.getServer(signupSurveyServerId);
-      if (io && agentOrchestrator && server?.onboardingAgentId && server.ownerId === req.userId) {
+      if (io && agentOrchestrator && server?.officialOnboardingAgentId && server.ownerId === req.userId) {
         void onboardingService
-          .triggerOwnerOnboardingOnAgentActivation(io, agentOrchestrator, signupSurveyServerId, server.onboardingAgentId)
+          .triggerOwnerOnboardingOnAgentActivation(io, agentOrchestrator, signupSurveyServerId, server.officialOnboardingAgentId)
           .catch((err: unknown) => {
             console.warn("[Onboarding] Failed to brief onboarding agent after signup survey:", serializeErrorForLog(err));
           });
       }
     }
 
-    res.json(user);
+    // Links in a new description some of its readers (in any of the person's servers) can't open; the save stands.
+    const warnings = profileFields.description === undefined ? [] : await changedDescriptionLinkWarnings({
+      before: previousDescription,
+      after: user.description,
+      owner: { type: "user", id: user.id },
+      writer: { type: "user", id: user.id },
+    });
+    res.json(warnings.length > 0 ? { ...user, warnings } : user);
   } catch (err: any) {
     const msg = err?.message || "";
     if (msg.includes("Current password is incorrect")) {
@@ -2222,7 +2266,7 @@ authRouter.post("/me/avatar", requireAuth, async (req, res) => {
 
     const uploaded = await runSingleAvatarUpload(userAvatarUpload, req);
     if (!uploaded) {
-      res.status(400).json({ error: "No avatar file provided" });
+      refuse(res, 400, { code: "invalid_input", error: "No avatar file provided" });
       return;
     }
 
@@ -2237,6 +2281,7 @@ authRouter.post("/me/avatar", requireAuth, async (req, res) => {
     res.json(user);
   } catch (err: any) {
     if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
+      // refusal-ok: top-level maxBytes states the limit (as the server and agent avatar uploads answer it); refuse() writes no top-level fields
       res.status(400).json({
         error: PROFILE_AVATAR_TOO_LARGE_MESSAGE,
         errorCode: "PROFILE_AVATAR_TOO_LARGE",
@@ -2245,10 +2290,7 @@ authRouter.post("/me/avatar", requireAuth, async (req, res) => {
       return;
     }
     if (err.message?.includes(PROFILE_AVATAR_BAD_FORMAT_MESSAGE)) {
-      res.status(400).json({
-        error: err.message,
-        errorCode: "PROFILE_AVATAR_BAD_FORMAT",
-      });
+      refuse(res, 400, serviceMessageRefusal("PROFILE_AVATAR_BAD_FORMAT", err.message, PROFILE_AVATAR_BAD_FORMAT_MESSAGE));
       return;
     }
     sendJsonServerError(req, res, {
@@ -2317,13 +2359,14 @@ authRouter.post("/verify-email", async (req, res) => {
   try {
     const { token } = req.body;
     if (!token) {
-      res.status(400).json({ error: "Token is required" });
+      refuse(res, 400, { code: "invalid_input", error: "Token is required" });
       return;
     }
 
     const verified = await userService.verifyEmailToken(token);
     if (!verified) {
-      res.status(400).json({ error: "Invalid or expired verification token" });
+      // One code for every failure: the answer must not say what happened to the token.
+      refuse(res, 400, { code: "email_verification_token_invalid", error: "Invalid or expired verification token" });
       return;
     }
     if (verified.newlyVerified) recordEmailVerified(req, verified.userId);
@@ -2365,7 +2408,7 @@ authRouter.post("/forgot-password", async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) {
-      res.status(400).json({ error: "Email is required" });
+      refuse(res, 400, { code: "invalid_input", error: "Email is required" });
       return;
     }
 
@@ -2383,17 +2426,18 @@ authRouter.post("/reset-password", async (req, res) => {
   try {
     const { token, password } = req.body;
     if (!token || !password) {
-      res.status(400).json({ error: "Token and password are required" });
+      refuse(res, 400, { code: "invalid_input", error: "Token and password are required" });
       return;
     }
     if (password.length < 8) {
-      res.status(400).json({ error: "Password must be at least 8 characters" });
+      refuse(res, 400, { code: "invalid_input", error: "Password must be at least 8 characters" });
       return;
     }
 
     const result = await userService.resetPassword(token, password);
     if (!result.success) {
-      res.status(400).json({ error: "Invalid or expired reset token" });
+      // One code for every failure: the answer must not say what happened to the token.
+      refuse(res, 400, { code: "password_reset_token_invalid", error: "Invalid or expired reset token" });
       return;
     }
 
@@ -2409,7 +2453,7 @@ authRouter.post("/accept-invite", requireAuth, requireVerified, async (req, res)
   try {
     const { token, agreementId } = req.body;
     if (!token) {
-      res.status(400).json({ error: "Invite token is required" });
+      refuse(res, 400, { code: "invalid_input", error: "Invite token is required" });
       return;
     }
 
@@ -2497,13 +2541,13 @@ authRouter.get("/invite-info", async (req, res) => {
   try {
     const token = req.query.token as string;
     if (!token) {
-      res.status(400).json({ error: "Token is required" });
+      refuse(res, 400, { code: "invalid_input", error: "Token is required" });
       return;
     }
 
     const info = await inviteService.getInviteInfo(token);
     if (!info) {
-      res.status(404).json({ error: "Invalid or expired invite" });
+      refuse(res, 404, { code: "not_found", error: "Invalid or expired invite" });
       return;
     }
 
@@ -2521,12 +2565,12 @@ invitesRouter.post("/seat-blocked", requireAuth, requireProfileSetupComplete, as
   try {
     const token = typeof req.body?.token === "string" ? req.body.token : "";
     if (!token) {
-      res.status(400).json({ error: "Invite token is required" });
+      refuse(res, 400, { code: "invalid_input", error: "Invite token is required" });
       return;
     }
     const out = await seatJoinBlockService.recordSeatJoinBlock(token, req.userId!);
     if (!out) {
-      res.status(404).json({ error: "Invalid or expired invite" });
+      refuse(res, 404, { code: "not_found", error: "Invalid or expired invite" });
       return;
     }
     res.json(out);
@@ -2575,11 +2619,11 @@ authRouter.post("/staging-self-account/retire", requireRetirementAuth, async (re
     } });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : undefined;
-    if (message === "STAGING_SELF_ACCOUNT_ONLY") return res.status(404).json({ error: "Not found" });
-    if (message === "RETIREMENT_OWNER_MISMATCH") return res.status(403).json({ error: "User ownership mismatch" });
-    if (message === "RETIREMENT_USER_NOT_FOUND") return res.status(404).json({ error: "User not found" });
-    if (message === "RETIREMENT_ACCOUNT_CLASS_MISMATCH") return res.status(403).json({ error: "Unsupported account" });
-    if (message === "RETIREMENT_CAPABILITY_INVALID") return res.status(403).json({ error: "Invalid retirement capability" });
+    if (message === "STAGING_SELF_ACCOUNT_ONLY") return refuse(res, 404, { code: "not_found", error: "Not found" });
+    if (message === "RETIREMENT_OWNER_MISMATCH") return refuse(res, 403, { code: "forbidden", error: "User ownership mismatch" });
+    if (message === "RETIREMENT_USER_NOT_FOUND") return refuse(res, 404, { code: "user_not_found", error: "User not found" });
+    if (message === "RETIREMENT_ACCOUNT_CLASS_MISMATCH") return refuse(res, 403, { code: "forbidden", error: "Unsupported account" });
+    if (message === "RETIREMENT_CAPABILITY_INVALID") return refuse(res, 403, { code: "forbidden", error: "Invalid retirement capability" });
     res.status(500).json({ error: "Account retirement failed" });
   }
 });

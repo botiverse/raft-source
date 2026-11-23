@@ -88,7 +88,7 @@ export function agentContextViewForwardPath(requestId: AgentContextViewRequestId
 const FORWARD_ANSWER_HEADER = "x-raft-context-view-answer";
 const FORWARD_TOO_LARGE_CAUSE_HEADER = "x-raft-context-view-too-large-cause";
 
-/** The body of every refusal on the View Context routes: the unknown-agent 404. */
+/** The body of every refusal on the View Context routes: one codeless 404 for every reason (it predates `agent_not_found`, and moves to it with routes/agents.ts's contextViewNotFound). */
 export const AGENT_CONTEXT_VIEW_NOT_FOUND = { error: "Agent not found" } as const;
 
 /** What the viewer is answered. `body` is the result JSON (identity), its start already checked. */

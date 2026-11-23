@@ -1,3 +1,5 @@
+import { useCallback, useState } from "react";
+import type { ComponentProps, MouseEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { PanelMeta, Popover, PopoverContent, PopoverTrigger } from "@botiverse/raft-ui";
 import { PopoverBody } from "@botiverse/raft-ui/wip";
@@ -11,7 +13,10 @@ import { ArtifactActorAvatar } from "./ArtifactActorParts";
 import { actorKey } from "./artifactComments";
 import { useArtifactComments } from "./ArtifactCommentsContext";
 import { formatNameList } from "./artifactNameList";
+import { artifactShareHost } from "./artifactShareHost";
 import { artifactSource, useKeyedLoadWithError } from "./artifactSource";
+import { isSelf, presenceModel, presenceViewer, someoneElse } from "./artifactPresenceModel";
+import type { PresenceModel, PresenceRow } from "./artifactPresenceModel";
 
 const MAX_FACES = 3;
 
@@ -25,83 +30,6 @@ const MAX_FACES = 3;
  */
 export function useArtifactPresence(id: ArtifactId | null): Presence | null | undefined {
   return useKeyedLoadWithError(id ?? "", () => (id === null ? Promise.reject(new Error("no Artifact")) : artifactSource().presence(id)), id !== null);
-}
-
-type HereState = "viewing" | "reading" | "writing";
-
-/**
- * One row of the list: here now (the stack), or someone whose read position
- * is all we know. `updatedSince`: their read position is before the latest
- * version.
- */
-type PresenceRow =
-  | { actor: ArtifactActor; here: HereState; self?: true; updatedSince: boolean }
-  | { actor: ArtifactActor; here: null; at: string; updatedSince: boolean };
-
-interface PresenceModel {
-  /** The stack: who is here now, others then the viewer, every face in color. */
-  here: Array<PresenceRow & { here: HereState }>;
-  /** Here now first, then who has read it, the most recent first. */
-  rows: PresenceRow[];
-  /** How many have read the latest version, and how many stopped before it (the viewer included when known). */
-  seenLatest: number;
-  notSeenLatest: number;
-}
-
-const isSelf = (r: PresenceRow) => r.here !== null && r.self === true;
-
-/**
- * Who is here now and who has seen the Artifact, the same on every version:
- * presence is per Artifact, and "updated since" is always against the latest
- * version (membership in `readOtherVersion`), never the one on screen.
- *
- * Each person counts once, by their read position. The route leaves the
- * reader out, so the viewer is added here, here now: on the latest version
- * they have read it (opening it moves their position); on an older one only
- * `ownRead` says how far they got, and without it they are left out of the
- * counts.
- */
-export function presenceModel(
-  presence: Presence,
-  viewer: { actor: ArtifactActor; shownVersion: number; latestVersion: number } | null = null,
-): PresenceModel {
-  const own = viewer ? actorKey(viewer.actor) : null;
-  // Each person's read position: true when it is before the latest version.
-  const behind = new Map<string, { actor: ArtifactActor; at: string; updatedSince: boolean }>();
-  for (const [list, updatedSince] of [[presence.readCurrentVersion, false], [presence.readOtherVersion, true]] as const) {
-    for (const r of list) {
-      const key = actorKey(r.actor);
-      if (key !== own && !behind.has(key)) behind.set(key, { actor: r.actor, at: r.at, updatedSince });
-    }
-  }
-  const ownBehind = !viewer
-    ? null
-    : viewer.shownVersion === viewer.latestVersion
-      ? false
-      : presence.ownRead
-        ? presence.ownRead.version < viewer.latestVersion
-        : null;
-
-  const listed = new Set<string>(own ? [own] : []);
-  const here: PresenceModel["here"] = [];
-  for (const p of presence.viewing) {
-    const key = actorKey(p.actor);
-    if (listed.has(key)) continue;
-    listed.add(key);
-    here.push({ actor: p.actor, here: p.state, updatedSince: behind.get(key)?.updatedSince ?? false });
-  }
-  if (viewer) here.push({ actor: viewer.actor, here: "viewing", self: true, updatedSince: ownBehind === true });
-
-  const read = [...behind].flatMap(([key, r]) => (listed.has(key) ? [] : [{ ...r, here: null }]));
-  read.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
-  const positions = [...behind.values()].map((r) => r.updatedSince);
-  if (ownBehind !== null) positions.push(ownBehind);
-  return {
-    here,
-    rows: [...here, ...read],
-    seenLatest: positions.filter((b) => !b).length,
-    notSeenLatest: positions.filter((b) => b).length,
-  };
 }
 
 const HERE_IDS = {
@@ -118,7 +46,9 @@ const NOW_IDS = {
 
 /**
  * Who's here and who has seen it (I2, I8, I10), at the end of the header's
- * meta line under the title (ArtifactSurfaceMeta), the same at every width
+ * meta line under the title (ArtifactSurfaceMeta) where a head has one (a
+ * phone's, the App's toolbar; a desktop head has the list in the details
+ * behind its title instead, ArtifactDetailsTitle), the same at every width
  * (stdrc's option A, #proj-raft-ui:7531279d): the header itself holds only
  * actions (raft-design panel.md). Drawn like a header's member stack (the
  * thread header's followers, Working now): up to three 19px faces of who is
@@ -138,6 +68,13 @@ const NOW_IDS = {
  * behind, and the header's version badge says which version is shown; the
  * button's name still counts who has and hasn't seen the latest.
  *
+ * Each row opens that person or agent (artin: the app's rule for a person,
+ * the host's useOpenPerson: the profile panel, as a message's avatar opens
+ * it), the viewer's own "You" row too, and closes the list, as Working now's
+ * rows do. A row is a button (Tab, Enter, Space) in the popover's dialog.
+ * Nobody behind it (a deleted account or agent, Raft itself: `gone`), or a
+ * host that opens no one, leaves the row plain text.
+ *
  * `presence` is the viewer's one answer (useArtifactPresence). Shows nothing
  * while it loads, fails, or no one else is here or has read it.
  */
@@ -149,12 +86,12 @@ export function ArtifactPresence({ presence, facesOnly = false }: {
   const intl = useIntl();
   // The signed-in viewer and the version they're on, from the viewer data (null outside the viewer).
   const data = useArtifactComments()?.data;
+  const [open, setOpen] = useState(false);
+  const close = useCallback(() => setOpen(false), []);
   if (!presence) return null;
-  const viewer = data ? { actor: data.viewer, shownVersion: data.card.version, latestVersion: data.card.latestVersion } : null;
-  const model = presenceModel(presence, viewer);
+  const model = presenceModel(presence, presenceViewer(data));
   // Alone, the viewer sees no presence at all.
-  if (!model.rows.some((r) => !isSelf(r))) return null;
-  const nameOf = (r: PresenceRow) => (isSelf(r) ? intl.formatMessage({ id: "artifacts.presence.you" }) : r.actor.displayName);
+  if (!someoneElse(model)) return null;
   const separator = intl.formatMessage({ id: "artifacts.presence.summarySeparator" });
   // Who is in the stack, in words.
   const hereLine = formatNameList(
@@ -172,7 +109,7 @@ export function ArtifactPresence({ presence, facesOnly = false }: {
   const label = [visible, hereLine, ...(seen ? [seen] : [])].join(separator);
   const faces = model.here.slice(0, MAX_FACES);
   return (
-    <Popover>
+    <Popover open={open} onOpenChange={setOpen}>
       {/* Working now's stack and trigger (stdrc: the same style, nothing flickers): the shared FaceStack
           (raft-ui's AvatarGroup), still (no entrance), keyed by who each face is, so a new presence answer
           keeps the same nodes. The trigger is a plain button, 27px like the meta row it sits in. */}
@@ -197,29 +134,90 @@ export function ArtifactPresence({ presence, facesOnly = false }: {
       <PopoverContent side="bottom" align="start" sideOffset={6} className="w-[300px] max-w-[calc(100vw-2rem)]" aria-label={intl.formatMessage({ id: "artifacts.presence.listLabel" })} data-testid="artifact-presence-list">
         {/* DS Popover: the list sits 16px in (PopoverBody), not on the panel's edge. */}
         <PopoverBody>
-          <ul className="flex flex-col gap-1.5">
-            {model.rows.map((r) => (
-              <li key={actorKey(r.actor)} className="flex items-center gap-2 text-callout text-foreground" data-testid="artifact-presence-row">
-                <ArtifactActorAvatar actor={r.actor} context="compact-list" />
-                <span className="min-w-0 truncate" data-testid="artifact-presence-name">{nameOf(r)}</span>
-                {r.updatedSince ? (
-                  <span className="shrink-0 whitespace-nowrap text-footnote text-foreground-muted" data-testid="artifact-presence-updated-since">
-                    {intl.formatMessage({ id: "artifacts.presence.updatedSince" })}
-                  </span>
-                ) : null}
-                <span className="ms-auto shrink-0 whitespace-nowrap ps-4 text-footnote tabular-nums text-foreground-muted" data-testid="artifact-presence-when">
-                  {r.here !== null ? intl.formatMessage({ id: NOW_IDS[r.here] }) : (
-                    // The exact date on hover: the app's raft-ui Tooltip, not a native title.
-                    <Tooltip content={intl.formatDate(r.at, { dateStyle: "medium", timeStyle: "short" })}>
-                      <time dateTime={r.at}>{formatRelativeTime(r.at, intl.locale)}</time>
-                    </Tooltip>
-                  )}
-                </span>
-              </li>
-            ))}
-          </ul>
+          <ArtifactPresenceRows rows={model.rows} onOpened={close} />
         </PopoverBody>
       </PopoverContent>
     </Popover>
+  );
+}
+
+/**
+ * The list itself (I10): here now first, then who has read it, the most recent first, each with the time, and
+ * "updated since" on whoever stopped before the latest version. The readers' popover above draws it, and so do the
+ * details behind the head's title (ArtifactDetailsTitle). A row opens that person (the host's useOpenPerson), then
+ * `onOpened` (the popover it is in closes).
+ */
+export function ArtifactPresenceRows({ rows, onOpened }: { rows: PresenceModel["rows"]; onOpened: () => void }) {
+  const intl = useIntl();
+  const openPerson = artifactShareHost().useOpenPerson();
+  // One handler for every row: the person is on the row (its data attributes), so no row gets a closure of its own.
+  const openRow = useCallback((event: MouseEvent<HTMLButtonElement>) => {
+    const { personType, personId } = event.currentTarget.dataset;
+    if (!openPerson || !personId || (personType !== "user" && personType !== "agent")) return;
+    onOpened();
+    openPerson({ type: personType, id: personId });
+  }, [openPerson, onOpened]);
+  const nameOf = (r: PresenceRow) => (isSelf(r) ? intl.formatMessage({ id: "artifacts.presence.you" }) : r.actor.displayName);
+  return (
+    // -mx: a row's hover and focus reach past its text, which stays in line with the panel's inset.
+    <ul className="-mx-1.5 flex flex-col gap-0.5">
+      {rows.map((r) => (
+        <li key={actorKey(r.actor)} className="text-callout text-foreground" data-testid="artifact-presence-row">
+          <PresenceRowTarget actor={r.actor} onOpen={openPerson ? openRow : null}>
+            <ArtifactActorAvatar actor={r.actor} context="compact-list" />
+            <span className="min-w-0 truncate" data-testid="artifact-presence-name">{nameOf(r)}</span>
+            {r.updatedSince ? (
+              <span className="shrink-0 whitespace-nowrap text-footnote text-foreground-muted" data-testid="artifact-presence-updated-since">
+                {intl.formatMessage({ id: "artifacts.presence.updatedSince" })}
+              </span>
+            ) : null}
+            <span className="ms-auto shrink-0 whitespace-nowrap ps-4 text-footnote tabular-nums text-foreground-muted" data-testid="artifact-presence-when">
+              {r.here !== null ? intl.formatMessage({ id: NOW_IDS[r.here] }) : (
+                // The exact date on hover: the app's raft-ui Tooltip, not a native title.
+                <Tooltip content={intl.formatDate(r.at, { dateStyle: "medium", timeStyle: "short" })}>
+                  <time dateTime={r.at}>{formatRelativeTime(r.at, intl.locale)}</time>
+                </Tooltip>
+              )}
+            </span>
+          </PresenceRowTarget>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+const ROW_CLASS = "flex w-full min-w-0 items-center gap-2 rounded-chip px-1.5 py-0.5";
+
+/**
+ * A row's content in the person's button, or as plain text when nobody can be opened (`gone`, or no `onOpen`).
+ */
+function PresenceRowTarget({ actor, onOpen, children }: {
+  actor: ArtifactActor;
+  onOpen: ((event: MouseEvent<HTMLButtonElement>) => void) | null;
+  children: ReactNode;
+}) {
+  if (!onOpen || actor.gone) return <div className={ROW_CLASS}>{children}</div>;
+  return (
+    <ArtifactPopoverRowButton onClick={onOpen} data-person-type={actor.type} data-person-id={actor.id} data-testid="artifact-presence-open">
+      {children}
+    </ArtifactPopoverRowButton>
+  );
+}
+
+/**
+ * A compact clickable row in a popover (ComputerOwnerField's owner chip: the subtle wash on hover, the focus ring after
+ * keyboard input; raft-ui's ListRow is 64px): a person in the list above, and an Artifact opened lately in the details
+ * behind the head's title (ArtifactRecentRows). `current`: the row is the one shown (`aria-current`), on the wash.
+ */
+export function ArtifactPopoverRowButton({ current = false, className, children, ...props }: ComponentProps<"button"> & { current?: boolean }) {
+  return (
+    <button
+      {...props}
+      type="button"
+      aria-current={current || undefined}
+      className={`${ROW_CLASS} text-start outline-none hover:bg-fill-subtle focus-visible:shadow-focus ${current ? "bg-fill-subtle" : ""} ${className ?? ""}`}
+    >
+      {children}
+    </button>
   );
 }

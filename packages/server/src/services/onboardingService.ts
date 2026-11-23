@@ -405,6 +405,20 @@ function normalizeMemberOnboardingChannelName(userName: string): string {
   return `onboarding-${trimmed}`.slice(0, 32);
 }
 
+/**
+ * The official onboarding agent (Cindy) for the owner's own onboarding: the opener, its
+ * reminders and hints. Never the greeter. Not self-healed: the pointer stays after she is
+ * deleted (the server did have its Cindy), so a missing agent just means nobody to brief.
+ */
+async function pickOfficialOnboardingAgent(serverId: string) {
+  const deps = resolveOnboardingServiceDeps();
+  const server = await deps.getServer(serverId);
+  if (!server?.officialOnboardingAgentId) return null;
+  const agent = await deps.getAgent(server.officialOnboardingAgentId);
+  return agent && agent.serverId === serverId ? agent : null;
+}
+
+/** The joiner greeter (Settings → Onboarding), for a new member's welcome. */
 async function pickOnboardingAgent(serverId: string, fallbackAgentId?: string | null) {
   const deps = resolveOnboardingServiceDeps();
   const server = await deps.getServer(serverId);
@@ -874,7 +888,7 @@ export async function triggerOwnerOnboardingOnAgentActivation(
   // A hosted Cindy (antiproton_cindy) is never "started": she can receive once
   // the provider accepted her AND her workspace import landed (`ready`). Only
   // the server's onboarding agent.
-  const activatedAgent = server.onboardingAgentId === activatedAgentId ? await deps.getAgent(activatedAgentId) : null;
+  const activatedAgent = server.officialOnboardingAgentId === activatedAgentId ? await deps.getAgent(activatedAgentId) : null;
   const hostedState = activatedAgent && isExternalAgentRuntime(activatedAgent.runtime)
     ? await deps.getHostedOnboardingAgentState(serverId, activatedAgentId)
     : null;
@@ -903,11 +917,11 @@ export async function triggerOwnerOnboardingOnAgentActivation(
   // schedule failure.
   if (!ownerPrefs.onboardingOwnerOpenerV2SentAt && ownerPrefs.onboardingDmSentAt) return false;
 
-  // Owner onboarding is only fired when server has an explicit onboarding agent
+  // Owner onboarding is only fired when the server has its official onboarding agent (Cindy)
   // and that exact agent is currently activating.
-  if (!isOwnerOnboardingActivationEligible(server.onboardingAgentId, activatedAgentId)) return false;
+  if (!isOwnerOnboardingActivationEligible(server.officialOnboardingAgentId, activatedAgentId)) return false;
 
-  const onboardingAgent = await pickOnboardingAgent(serverId, null);
+  const onboardingAgent = await pickOfficialOnboardingAgent(serverId);
   if (!onboardingAgent) return false;
 
   // Do not brief an agent that is not running.
@@ -1056,7 +1070,7 @@ export async function triggerAllChannelUnlockOnboarding(
   const allChannel = await ensureAllChannel(serverId);
   if (!allChannel) return false;
 
-  const onboardingAgent = await pickOnboardingAgent(serverId, null);
+  const onboardingAgent = await pickOfficialOnboardingAgent(serverId);
   if (!onboardingAgent) return false;
 
   const claimedAt = new Date();
@@ -1119,7 +1133,7 @@ export async function triggerCrossChannelHint(
   const channel = channelList.find((ch) => ch.id === channelId);
   if (!channel || channel.name === "onboarding-owner") return false;
 
-  const onboardingAgent = await pickOnboardingAgent(serverId, null);
+  const onboardingAgent = await pickOfficialOnboardingAgent(serverId);
   if (!onboardingAgent) return false;
 
   await deps.updateMemberOnboardingPreferences(serverId, senderUserId, {

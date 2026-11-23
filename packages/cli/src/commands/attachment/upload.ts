@@ -10,6 +10,11 @@
 // Returns the attachment id; pass it to `raft message send --attachment-id`
 // (`raft task reply <ref> --attachment-id` for a task ref).
 //
+// An HTML or Markdown file is held once before any request, with the artifact
+// push to make instead (#347: the shared op words it, the
+// agent ledger keeps it, _artifactHold.ts); the same upload again within 10
+// minutes goes through.
+//
 // Note: v0 server's /upload endpoint still requires a channelId in the multipart
 // body. The CLI surface no longer requires --channel (per locked v0 spec), but
 // callers that omit it will hit MISSING_CHANNEL until the server accepts
@@ -25,7 +30,8 @@ import { ATTACHMENT_UPLOAD_MAX_SIZE_BYTES, setClockTimeout } from "@botiverse/ra
 
 import { defineCommand, registerCliCommand } from "../../core/command";
 import type { CommandRuntimeOptions } from "../../core/context";
-import { CliError, cliError } from "../../core/errors";
+import { CliError, cliError, heldOnceCliError } from "../../core/errors";
+import { attachmentArtifactHold } from "./_artifactHold";
 import { writeText, adoptCliReplyText } from "../../core/renderer";
 import { formatAttachmentUploaded } from "./_format";
 import { createAgentApiSurfaceClient } from "../../agentApiPath";
@@ -301,6 +307,11 @@ export const attachmentUploadCommand = defineCommand(
       const uploadMimeType = inferUploadMimeType(filename, readFilePrefix(opts.path), explicitMimeType);
 
       const agentContext = ctx.loadAgentContext();
+      // An HTML or Markdown file is held once, the last check before any request (#347).
+      const hold = await attachmentArtifactHold(ctx, agentContext.agentId, opts.path, target);
+      if (hold.held) {
+        throw heldOnceCliError(hold.held.error);
+      }
       const client = ctx.createApiClient(agentContext);
       const agentApi = createAgentApiSurfaceClient(client);
 
@@ -381,6 +392,7 @@ export const attachmentUploadCommand = defineCommand(
           if (completed.ok) {
             const attachment = completed.data!.attachment;
             writeText(ctx.io, formatAttachmentUploaded(attachment, target));
+            await hold.release();
             return;
           }
           const retryable = completed.errorCode === "UPLOAD_OBJECT_NOT_FOUND"
@@ -404,6 +416,7 @@ export const attachmentUploadCommand = defineCommand(
       if (!res.ok) throwUploadFailure(res);
       const d = res.data!;
       writeText(ctx.io, formatAttachmentUploaded(d, target));
+      await hold.release();
   },
 );
 

@@ -5,13 +5,20 @@ import { channels, messages, messageServerTimeline, servers, users } from "../db
 import {
   cdcSlotVerdict,
   readCdcSlot,
+  buildMessageServerTimelineConversationIndex,
+  formatConversationPosition,
+  parseConversationPosition,
+  MESSAGE_SERVER_TIMELINE_CONVERSATION_INDEX,
   runMessageServerTimelineBackfill,
+  runMessageServerTimelineConversationBackfill,
   runMessageServerTimelineSearchVectorBackfill,
   SLOT_PAUSE_BYTES,
   SLOT_RESUME_BYTES,
   SLOT_STOP_BYTES,
   type CdcSlotReading,
   verifyMessageServerTimeline,
+  verifyMessageServerTimelineConversation,
+  verifyMessageServerTimelineConversationAndBuildIndex,
   verifyMessageServerTimelineSearchVector,
 } from "./messageServerTimelineBackfill";
 
@@ -172,4 +179,196 @@ test("the search_vector fill waits out a slot pause and stops on the slot with a
   const left = await db.select({ id: messageServerTimeline.messageId }).from(messageServerTimeline)
     .where(sql`${messageServerTimeline.messageId} = ANY(${sql.param(ids)}::uuid[]) AND ${messageServerTimeline.searchVector} IS NULL`);
   assert.equal(left.length, 0, "the resumed run fills what the stopped one left");
+});
+
+// 0764: timeline rows written before it have no conversation_id. The fixture
+// clears the joint storage rows' copies, then checks the verifier counts them
+// (and a stray value off joint storage), the fill sets only joint storage rows,
+// a re-run changes nothing, and the index builds after a clean verify.
+test("message_server_timeline conversation_id fill sets joint storage rows only and the verifier gates on 0", async ({ db }) => {
+  const run = async (query: SQL) => (await db.execute(query)).rows as Array<Record<string, unknown>>;
+  const [owner] = await db.insert(users).values({ email: "mst-convbf@test.com", name: "mstConvBf", passwordHash: "x", emailVerified: true }).returning();
+  const [host, storage] = await db.insert(servers).values([
+    { name: "MST CONVBF HOST", slug: "mst-convbf-host", ownerId: owner!.id },
+    { name: "MST CONVBF STORAGE", slug: "mst-convbf-storage", ownerId: owner!.id, kind: "joint_storage" },
+  ]).returning();
+  const [hostChan, root] = await db.insert(channels).values([
+    { serverId: host!.id, name: "mst-convbf-host", type: "channel" },
+    { serverId: storage!.id, name: "mst-convbf-root", type: "joint" },
+  ]).returning();
+  const [parent] = await db.insert(messages).values({ channelId: root!.id, senderType: "user", senderId: owner!.id, content: "parent" }).returning();
+  const [thread] = await db.insert(channels).values({ serverId: storage!.id, name: "thread-mstconvbf", type: "thread", parentMessageId: parent!.id }).returning();
+  const storageRows = await db.insert(messages).values(
+    Array.from({ length: 5 }, (_, i) => ({ channelId: i % 2 ? thread!.id : root!.id, senderType: "user" as const, senderId: owner!.id, content: `joint ${i}` })),
+  ).returning();
+  const hostRows = await db.insert(messages).values(
+    Array.from({ length: 3 }, (_, i) => ({ channelId: hostChan!.id, senderType: "user" as const, senderId: owner!.id, content: `host ${i}` })),
+  ).returning();
+  const storageIds = [parent!.id, ...storageRows.map((row) => row.id)];
+  const conversations = async (ids: string[]) => (await db.select({ id: messageServerTimeline.messageId, c: messageServerTimeline.conversationId })
+    .from(messageServerTimeline).where(sql`${messageServerTimeline.messageId} = ANY(${sql.param(ids)}::uuid[])`));
+
+  const clean = await verifyMessageServerTimelineConversation(run, { batchSize: 3 });
+  assert.deepEqual({ missing: clean.missingRows, divergent: clean.divergentRows }, { missing: 0, divergent: 0 }, "the triggers wrote every row");
+  assert.ok(clean.scannedRows >= 9);
+
+  // Before 0764: no copies on the joint storage rows; one stale value on a host row.
+  await db.update(messageServerTimeline).set({ conversationId: null }).where(sql`${messageServerTimeline.messageId} = ANY(${sql.param(storageIds)}::uuid[])`);
+  await db.update(messageServerTimeline).set({ conversationId: root!.id }).where(eq(messageServerTimeline.messageId, hostRows[0]!.id));
+  const before = await verifyMessageServerTimelineConversation(run, { batchSize: 3 });
+  assert.deepEqual({ missing: before.missingRows, divergent: before.divergentRows }, { missing: 6, divergent: 1 });
+  assert.ok(before.sampleIds.includes(hostRows[0]!.id));
+
+  const lines: string[] = [];
+  const filled = await runMessageServerTimelineConversationBackfill(run, { batchSize: 2, sleepMs: 0, readSlot: async () => null, log: (line) => lines.push(line) });
+  assert.equal(filled.rowsFilled, 6, "the joint storage rows only");
+  assert.equal(filled.rowsScanned, 6, "keyset over the joint storage server's rows");
+  assert.ok(lines.every((line) => line.startsWith("[MESSAGE_TIMELINE_CONVERSATION_BACKFILL_BATCH]")));
+  for (const row of await conversations(storageIds)) assert.equal(row.c, root!.id, "a thread's rows carry its root");
+  const hostAfter = await conversations(hostRows.map((row) => row.id));
+  assert.deepEqual(
+    hostAfter.map((row) => row.id === hostRows[0]!.id ? row.c === root!.id : row.c === null),
+    [true, true, true],
+    "the fill leaves other servers' rows alone",
+  );
+
+  // The stray host value is the verify's to report, not the fill's to fix.
+  const stray = await verifyMessageServerTimelineConversation(run, { batchSize: 3 });
+  assert.deepEqual({ missing: stray.missingRows, divergent: stray.divergentRows, sample: stray.sampleIds }, { missing: 0, divergent: 1, sample: [hostRows[0]!.id] });
+  await db.update(messageServerTimeline).set({ conversationId: null }).where(eq(messageServerTimeline.messageId, hostRows[0]!.id));
+  const after = await verifyMessageServerTimelineConversation(run, { batchSize: 3 });
+  assert.deepEqual({ missing: after.missingRows, divergent: after.divergentRows }, { missing: 0, divergent: 0 });
+
+  const again = await runMessageServerTimelineConversationBackfill(run, { batchSize: 2, sleepMs: 0, readSlot: async () => null });
+  assert.equal(again.rowsFilled, 0, "a re-run changes nothing");
+  const resumed = await verifyMessageServerTimelineConversation(run, { batchSize: 3, afterId: after.lastId! });
+  assert.equal(resumed.scannedRows, 0);
+  await assert.rejects(() => verifyMessageServerTimelineConversation(run, { batchSize: 0 }), RangeError);
+
+  // The migration built the index on this small table; the build is a checked no-op.
+  const built: string[] = [];
+  await buildMessageServerTimelineConversationIndex(run, (line) => built.push(line));
+  assert.match(built.at(-1) ?? "", new RegExp(`${MESSAGE_SERVER_TIMELINE_CONVERSATION_INDEX} valid`));
+});
+
+// Supported depth (0764): the root is at most two levels above a message's
+// channel. A joint storage channel nested deeper is not derived; the verify
+// counts its rows as divergent whatever they hold, and the gate builds no index.
+test("message_server_timeline conversation_id verify fails a joint storage chain deeper than two levels and builds no index", async ({ db }) => {
+  const run = async (query: SQL) => (await db.execute(query)).rows as Array<Record<string, unknown>>;
+  const [owner] = await db.insert(users).values({ email: "mst-deep@test.com", name: "mstDeep", passwordHash: "x", emailVerified: true }).returning();
+  const [storage] = await db.insert(servers).values({ name: "MST DEEP STORAGE", slug: "mst-deep-storage", ownerId: owner!.id, kind: "joint_storage" }).returning();
+  const [root] = await db.insert(channels).values({ serverId: storage!.id, name: "mst-deep-root", type: "joint" }).returning();
+  // root <- thread1 <- thread2 <- thread3: thread3's grandparent (thread1) still has a parent.
+  let parentChannelId = root!.id;
+  const chain: string[] = [];
+  for (let depth = 1; depth <= 3; depth += 1) {
+    const [parent] = await db.insert(messages).values({ channelId: parentChannelId, senderType: "user", senderId: owner!.id, content: `depth ${depth - 1}` }).returning();
+    const [thread] = await db.insert(channels).values({ serverId: storage!.id, name: `thread-mstdeep${depth}`, type: "thread", parentMessageId: parent!.id }).returning();
+    chain.push(thread!.id);
+    parentChannelId = thread!.id;
+  }
+  const [deep] = await db.insert(messages).values({ channelId: chain[2]!, senderType: "user", senderId: owner!.id, content: "three levels down" }).returning();
+
+  await db.execute(sql.raw(`DROP INDEX IF EXISTS ${MESSAGE_SERVER_TIMELINE_CONVERSATION_INDEX}`));
+  const lines: string[] = [];
+  const gate = await verifyMessageServerTimelineConversationAndBuildIndex(run, { batchSize: 3, log: (line) => lines.push(line) });
+  assert.equal(gate.divergence.missingRows, 0);
+  assert.equal(gate.divergence.divergentRows, 1, "the depth-3 channel's row, whatever it holds");
+  assert.deepEqual(gate.divergence.sampleIds, [deep!.id]);
+  assert.equal(gate.indexBuilt, false);
+  const index = await db.execute(sql`SELECT 1 FROM pg_indexes WHERE indexname = ${MESSAGE_SERVER_TIMELINE_CONVERSATION_INDEX}`);
+  assert.equal(index.rows.length, 0, "no index on a failed verify");
+
+  // Without the depth-3 channel the gate passes and builds the index.
+  await db.delete(messages).where(eq(messages.id, deep!.id));
+  const passed = await verifyMessageServerTimelineConversationAndBuildIndex(run, { batchSize: 3, log: (line) => lines.push(line) });
+  assert.deepEqual({ missing: passed.divergence.missingRows, divergent: passed.divergence.divergentRows, built: passed.indexBuilt }, { missing: 0, divergent: 0, built: true });
+});
+
+// The fill walks each joint_storage server in idx_message_server_timeline_server_created's
+// order (keyset on created_at, message_id), so its resume point carries the
+// exact created_at: microseconds, and message_id for rows at the same instant.
+test("message_server_timeline conversation_id fill resumes per server from an exact (created_at, message_id) position", async ({ db }) => {
+  const run = async (query: SQL) => (await db.execute(query)).rows as Array<Record<string, unknown>>;
+  const [owner] = await db.insert(users).values({ email: "mst-convpos@test.com", name: "mstConvPos", passwordHash: "x", emailVerified: true }).returning();
+  const storages = await db.insert(servers).values([
+    { name: "MST CONVPOS A", slug: "mst-convpos-a", ownerId: owner!.id, kind: "joint_storage" },
+    { name: "MST CONVPOS B", slug: "mst-convpos-b", ownerId: owner!.id, kind: "joint_storage" },
+  ]).returning();
+  const roots = await db.insert(channels).values(storages.map((server, i) => ({ serverId: server.id, name: `mst-convpos-${i}`, type: "joint" as const }))).returning();
+  const ids: string[] = [];
+  for (const root of roots) {
+    const rows = await db.insert(messages).values(
+      Array.from({ length: 3 }, (_, i) => ({ channelId: root.id, senderType: "user" as const, senderId: owner!.id, content: `pos ${i}` })),
+    ).returning();
+    ids.push(...rows.map((row) => row.id));
+  }
+  // Every row at one instant below a millisecond: only microseconds and
+  // message_id tell the rows apart.
+  await db.execute(sql`UPDATE messages SET created_at = '2026-11-20T08:00:00.123456Z' WHERE id = ANY(${sql.param(ids)}::uuid[])`);
+  await db.update(messageServerTimeline).set({ conversationId: null }).where(sql`${messageServerTimeline.messageId} = ANY(${sql.param(ids)}::uuid[])`);
+
+  // Batch 1 (2 rows of the first server), then the slot stops the run.
+  const readings: Array<CdcSlotReading | null> = [null, { retainedWalBytes: SLOT_STOP_BYTES + 1, walStatus: "reserved" }];
+  let reads = 0;
+  const lines: string[] = [];
+  const stopped = await runMessageServerTimelineConversationBackfill(run, { batchSize: 2, sleepMs: 0, slotPollMs: 0, readSlot: async () => readings[reads++] ?? null, log: (line) => lines.push(line) });
+  assert.equal(stopped.stoppedBy, "slot");
+  assert.equal(stopped.rowsFilled, 2);
+  const position = stopped.lastPosition!;
+  assert.equal(position.createdAt, "2026-11-20T08:00:00.123456Z", "the exact stored time, not a millisecond Date");
+  assert.deepEqual(parseConversationPosition(formatConversationPosition(position)), position);
+  assert.ok(lines.some((line) => line.endsWith(`after_position=${formatConversationPosition(position)}`)));
+  assert.equal(parseConversationPosition("not,a,position"), null);
+
+  const resumed = await runMessageServerTimelineConversationBackfill(run, { batchSize: 2, sleepMs: 0, afterPosition: position, readSlot: async () => null });
+  assert.equal(resumed.rowsScanned, 4, "the first server's last row, then the second server's three");
+  assert.equal(resumed.rowsFilled, 4);
+  const left = await db.select({ id: messageServerTimeline.messageId }).from(messageServerTimeline)
+    .where(sql`${messageServerTimeline.messageId} = ANY(${sql.param(ids)}::uuid[]) AND ${messageServerTimeline.conversationId} IS NULL`);
+  assert.equal(left.length, 0, "every row filled once across the stop");
+  const verified = await verifyMessageServerTimelineConversation(run);
+  assert.deepEqual({ missing: verified.missingRows, divergent: verified.divergentRows }, { missing: 0, divergent: 0 });
+});
+
+// A cold cache can push one batch past the statement timeout (production
+// branch, 2026-11-20: 28.9-37.9 s for four of the first five 5,000-row
+// batches). That batch is retried at half its size rather than ending the run.
+test("message_server_timeline conversation_id fill retries a timed-out batch at half its size", async ({ db }) => {
+  const exec = async (query: SQL) => (await db.execute(query)).rows as Array<Record<string, unknown>>;
+  const [owner] = await db.insert(users).values({ email: "mst-convretry@test.com", name: "mstConvRetry", passwordHash: "x", emailVerified: true }).returning();
+  const [storage] = await db.insert(servers).values({ name: "MST CONVRETRY", slug: "mst-convretry", ownerId: owner!.id, kind: "joint_storage" }).returning();
+  const [root] = await db.insert(channels).values({ serverId: storage!.id, name: "mst-convretry", type: "joint" }).returning();
+  const rows = await db.insert(messages).values(
+    Array.from({ length: 5 }, (_, i) => ({ channelId: root!.id, senderType: "user" as const, senderId: owner!.id, content: `retry ${i}` })),
+  ).returning();
+  const ids = rows.map((row) => row.id);
+  await db.update(messageServerTimeline).set({ conversationId: null }).where(sql`${messageServerTimeline.messageId} = ANY(${sql.param(ids)}::uuid[])`);
+
+  const timeout = () => new Error("query failed", { cause: Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }) });
+  // Call 1 lists the joint storage servers; call 2 is the first batch.
+  let calls = 0;
+  const lines: string[] = [];
+  const filled = await runMessageServerTimelineConversationBackfill(async (query) => {
+    calls += 1;
+    if (calls === 2) throw timeout();
+    return exec(query);
+  }, { batchSize: 4, sleepMs: 0, readSlot: async () => null, log: (line) => lines.push(line) });
+  assert.equal(filled.timeoutRetries, 1);
+  assert.equal(filled.rowsFilled, 5, "every row once, across the retry");
+  assert.ok(lines.some((line) => line === "[MESSAGE_TIMELINE_CONVERSATION_BACKFILL_TIMEOUT] retrying at batch_size=2"));
+  // 2 rows at half size, then back to 4: 2 + 3 (the last, short batch ends the server).
+  assert.deepEqual(lines.filter((line) => line.includes("_BATCH]")).map((line) => /scanned=(\d+)/.exec(line)![1]), ["2", "3"]);
+  const left = await db.select({ id: messageServerTimeline.messageId }).from(messageServerTimeline)
+    .where(sql`${messageServerTimeline.messageId} = ANY(${sql.param(ids)}::uuid[]) AND ${messageServerTimeline.conversationId} IS NULL`);
+  assert.equal(left.length, 0);
+
+  // Any other failure still ends the run.
+  calls = 0;
+  await assert.rejects(() => runMessageServerTimelineConversationBackfill(async (query) => {
+    calls += 1;
+    if (calls === 2) throw Object.assign(new Error("deadlock detected"), { code: "40P01" });
+    return exec(query);
+  }, { batchSize: 4, sleepMs: 0, readSlot: async () => null }), /deadlock/);
 });

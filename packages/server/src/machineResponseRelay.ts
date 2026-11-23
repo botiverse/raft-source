@@ -6,14 +6,17 @@ export type RelayedMachineResponse = Extract<MachineToServerMessage, {
   type:
     | "machine:runtime_models:result"
     | "machine:migration:source_workspace_archive_result"
-    | "machine:provider_probe:result"
     | "machine:runtime_account_usage:snapshot"
     | "machine:runtime_account_usage:limit_reset:result"
     | "machine:runtime_account_usage:limit_resets:read:result"
     | "agent:interrupt-turn:result"
     | "agent:interrupt-subagent:result"
+    | "machine:proc_job:stop:result"
     | "agent:side-ask:result"
     | "machine:runtime_auth:logout:result"
+    | "machine:runtime:upgrade:result"
+    | "machine:runtime:install_plan:result"
+    | "machine:runtime:install:result"
     | "machine:runtime_auth:providers:result"
     | "machine:runtime_auth:connect_provider:result";
 }>;
@@ -34,8 +37,6 @@ export interface MachineReplyRequest {
   replyReplicaId: MachineReplyReplicaId;
   agentId?: string;
   migrationId?: string;
-  /** Probe correlation: results for another probe must never satisfy a wait. */
-  probeId?: string;
 }
 interface ReplyRecord extends MachineReplyRequest {
   response?: RelayedMachineResponse;
@@ -64,7 +65,6 @@ local response = cjson.decode(ARGV[2])
 if record.machineId ~= ARGV[1] or record.type ~= response.type or record.requestId ~= response.requestId then return false end
 if record.agentId and record.agentId ~= response.agentId then return false end
 if record.migrationId and record.migrationId ~= response.migrationId then return false end
-if record.probeId and record.probeId ~= response.probeId then return false end
 if not record.response then
   record.response = response
   record.responseJson = ARGV[2]
@@ -173,7 +173,6 @@ export class MachineResponseRelay {
         || record.response.type !== expected.type) return;
       if (expected.agentId && (!("agentId" in record.response) || record.response.agentId !== expected.agentId)) return;
       if (expected.migrationId && (!("migrationId" in record.response) || record.response.migrationId !== expected.migrationId)) return;
-    if (expected.probeId && (!("probeId" in record.response) || record.response.probeId !== expected.probeId)) return;
       pending.finish(undefined, record);
     } catch {
       // A transient Redis read failure may recover before the original deadline.

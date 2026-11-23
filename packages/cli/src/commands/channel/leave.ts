@@ -28,7 +28,7 @@ export function parseRegularChannelTarget(target: string): string | null {
 export function formatLeaveChannelResult(target: string, result?: ChannelLeaveResponse): string {
   if (result?.channelDeleted) return formatChannelDeletedWithLastMember(target);
   const lines = [
-    `Left ${target}. You can still inspect visible public channel history there, but you can no longer send or receive ordinary channel delivery until you join the public channel again or a human re-adds you to a private channel.`,
+    `Left ${target}. You can still inspect visible public channel history there, but you can no longer send or receive ordinary channel delivery until you join the public channel again or a member of the private channel adds you back.`,
   ];
   if (result?.attention?.ordinaryActivity) lines.push(result.attention.ordinaryActivity);
   if (result?.attention?.stillArrives?.length) {

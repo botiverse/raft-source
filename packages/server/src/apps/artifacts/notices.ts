@@ -39,8 +39,18 @@
 //   is not told twice.
 //
 // - Resolves (#249): someone else resolving a thread tells its author, an
-//   agent, at once (noticeResolved), `your_comment_resolved` with `resolved`,
-//   whether it follows or not. A reopen tells no one.
+//   agent, and only it (noticeResolved), `your_comment_resolved` with
+//   `resolved`, whether it follows or not. A resolve is a state change that
+//   asks nothing of the author (Sage, #proj-workspace:#340: what needs the
+//   recipient to act or answer wakes, a state change only goes to the
+//   inbox), so it is queued and never pushed, as a rename's. A reopen tells
+//   no one.
+//
+// - Settled (#334): someone settling an Artifact, or taking it back to
+//   Working, tells its other following agents and its author when an agent,
+//   following or not (noticeSettlement): `subscribed` with `settlement`. A
+//   status change asks nothing of anyone (Sage: status only goes to the
+//   inbox), so it is queued and never pushed, as a rename's.
 //
 // Only agents are told for now; a person's comment (the web API) tells them
 // exactly as an agent's does, and an edit tells only the agents it newly
@@ -139,7 +149,7 @@ function clipSummary(text: string): string {
  * it has a row already (following, or stopped: that sticks). True when this
  * made it a follower.
  */
-export async function autoSubscribe(executor: DatabaseExecutor, itemId: string, actor: ArtifactActorRef, reason: Exclude<ArtifactSubscriptionReason, "followed">): Promise<boolean> {
+export async function autoSubscribe(executor: DatabaseExecutor, itemId: string, actor: ArtifactActorRef, reason: ArtifactSubscriptionReason): Promise<boolean> {
   const inserted = await executor.insert(artifactSubscriptions)
     .values({ itemId, actorType: actor.type, actorId: actor.id, reason })
     .onConflictDoNothing()
@@ -590,11 +600,14 @@ export async function noticeRename(input: {
 
 /**
  * A resolve's notice (#249), in its transaction: the thread's author, an
- * agent other than the resolver, that may be told of the Artifact now, at
- * once, `your_comment_resolved` with `resolved` (who, the thread's root as
- * an excerpt, the note's start). Sent whether it follows the Artifact or
- * not: it is about its own comment, as a mention is about it. A reopen tells
- * no one. Returns what was queued and the agent told (null: none).
+ * agent other than the resolver, that may be told of the Artifact now, gets
+ * `your_comment_resolved` with `resolved` (who, the thread's root as an
+ * excerpt, the note's start). Sent whether it follows the Artifact or not:
+ * it is about its own comment, as a mention is about it. Queued only, never
+ * pushed (sendQueued is not called for it, #proj-workspace:#340): a resolve
+ * asks nothing of the author, so it wakes no agent; it is handed over with
+ * the agent's next pull, through the delivery guard. A reopen tells no one.
+ * Returns the agent told (null: none).
  */
 export async function noticeResolved(input: {
   executor: DatabaseExecutor;
@@ -606,11 +619,11 @@ export async function noticeResolved(input: {
   /** The note posted as a reply, or null. */
   note: ArtifactCommentRow | null;
   now: Date;
-}): Promise<{ queued: QueuedNotice[]; told: string | null }> {
+}): Promise<string | null> {
   const { executor, item, root, by } = input;
-  if (root.authorType !== "agent" || (by.type === "agent" && by.id === root.authorId)) return { queued: [], told: null };
+  if (root.authorType !== "agent" || (by.type === "agent" && by.id === root.authorId)) return null;
   const agentId = root.authorId;
-  if (!(await agentsWhoSee(executor, item, [agentId])).has(agentId)) return { queued: [], told: null };
+  if (!(await agentsWhoSee(executor, item, [agentId])).has(agentId)) return null;
   const [excerpt] = await excerpts(executor, [root]);
   const name = await namer([by], executor);
   const notice: ArtifactAgentNotice = {
@@ -621,7 +634,52 @@ export async function noticeResolved(input: {
     version: null,
     resolved: { by: name(by), comment: excerpt!, noteExcerpt: input.note ? excerptOf(input.note.body).excerpt : null },
   };
-  return { queued: [await queueNotice(executor, input.outbox, item, agentId, notice, input.now)], told: agentId };
+  await queueNotice(executor, input.outbox, item, agentId, notice, input.now);
+  return agentId;
+}
+
+/**
+ * A settle's or unsettle's notices (#334), in its transaction: the
+ * Artifact's following agents and its author when an agent (following or
+ * not: it is about its own work), not `by`, that may be told of it now,
+ * `subscribed` with `settlement` (who, settled or not, and the version it
+ * was settled at). Queued only, never pushed (sendQueued is not called for
+ * them): a status change wakes no agent; it is handed over with the agent's
+ * next pull, through the delivery guard. Returns the agents told.
+ */
+export async function noticeSettlement(input: {
+  executor: DatabaseExecutor;
+  outbox: ArtifactNoticeOutbox;
+  item: ArtifactItemRow;
+  by: ArtifactActorRef;
+  settled: boolean;
+  /** The version it is (or was, for an unsettle) settled at. */
+  version: number;
+  following: readonly ArtifactActorRef[];
+  now: Date;
+}): Promise<string[]> {
+  const { executor, item, by } = input;
+  const author = item.createdByType === "agent" ? [item.createdById] : [];
+  const candidates = [...new Set([...agentIdsOf(input.following), ...author])].filter((agentId) => !(by.type === "agent" && by.id === agentId));
+  const seeing = await agentsWhoSee(executor, item, candidates);
+  const recipients = candidates.filter((agentId) => seeing.has(agentId)).sort();
+  if (recipients.length === 0) return [];
+  const name = await namer([by], executor);
+  const followingNow = new Set(agentIdsOf(input.following));
+  const followingOf = await followingOfAll(executor, item.id, recipients);
+  for (const agentId of recipients) {
+    const notice: ArtifactAgentNotice = {
+      artifact: { id: item.id, title: item.title },
+      reason: "subscribed",
+      // An author that stopped following is told without "you follow it".
+      following: followingNow.has(agentId) ? followingOf(agentId) : null,
+      comments: null,
+      version: null,
+      settlement: { by: name(by), settled: input.settled, version: input.version },
+    };
+    await queueNotice(executor, input.outbox, item, agentId, notice, input.now);
+  }
+  return recipients;
 }
 
 /** path -> sha256 of one version's files. */

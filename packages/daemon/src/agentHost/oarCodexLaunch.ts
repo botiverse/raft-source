@@ -28,11 +28,11 @@
 //
 // Not passed yet: the thread name (`Raft · <agent>`). Since OAR 0.87.2 a
 // failed `thread/name/set` (older app-servers lack it) no longer fails the
-// open (OAR records a `thread/name/set/error` frame), as the driver ignores
-// it. There is no version floor: OAR needs a `serviceTier` in the open reply
-// (the tier is always explicit here) and, for a resume whose effort changed,
-// `thread/settings/updated` within OAR's 10 s; the driver needs neither. An
-// older Codex fails the open and the start falls back to the legacy host.
+// open (OAR records a `thread/name/set/error` frame). There is no version
+// floor: OAR needs a `serviceTier` in the open reply (the tier is always
+// explicit here) and, for a resume whose effort changed,
+// `thread/settings/updated` within OAR's 10 s. Codex runs only on OAR; an
+// incompatible older Codex fails the open with an error.
 
 import type { RawEvent, Session } from "@botiverse/oar";
 import { CODEX_MANAGED_MCP_TOKEN_ENV, codexCandidateTraceAttrs, codexThreadFields, prepareCodexLaunch, type CodexLaunchPreparation } from "../drivers/index";
@@ -117,7 +117,7 @@ export const CODEX_OAR_SERVICE_TIER = { fast: "priority", standard: "default" } 
 /** A prepared Codex launch as an OAR launch. */
 export function codexOarLaunch(
   ctx: SpawnContext,
-  prep: Pick<CodexLaunchPreparation, "command" | "args" | "appServerArgs" | "spawnEnv" | "appServerEnv" | "windowsShim" | "managedMcp">,
+  prep: Pick<CodexLaunchPreparation, "command" | "args" | "appServerArgs" | "spawnEnv" | "appServerEnv" | "windowsShim" | "managedMcp" | "version">,
   inherited: NodeJS.ProcessEnv = process.env,
 ): OarLaunch {
   // OAR starts `<command> app-server …` itself, so a launch whose command is
@@ -127,7 +127,7 @@ export function codexOarLaunch(
   // CODEX_BIN); OAR gets the `.cmd` shim that script came from, set only
   // when OAR runs the shim's script itself without cmd.exe (an npm or pnpm
   // shim: the shim's own node.exe, else `node` on PATH; codex.ts
-  // oarRunnableShim). With no such shim the start falls back to the driver.
+  // oarRunnableShim). With no such shim, the launch fails cleanly.
   // The node host's environment (Electron's Node mode) is not that node's,
   // so the transport env goes instead.
   const viaHost = prep.args.length !== prep.appServerArgs.length || prep.args.some((arg, i) => arg !== prep.appServerArgs[i]);
@@ -140,7 +140,10 @@ export function codexOarLaunch(
   delete appServerEnv[CODEX_MANAGED_MCP_TOKEN_ENV];
   return {
     runtimeId: "codex",
-    installation: { kind: "available", via: "executable", command },
+    // The version Raft's candidate probe read: OAR's capability answer depends
+    // on it (`contextUsage` from 0.151.0); OAR's session still reads the
+    // running binary's own version from its handshake.
+    installation: { kind: "available", via: "executable", command, ...(prep.version ? { version: prep.version } : {}) },
     options: {
       cwd: fields.cwd,
       env: launchEnvOverlay(appServerEnv, inherited),
@@ -149,7 +152,9 @@ export function codexOarLaunch(
       appendSystemPrompt: fields.developerInstructions,
       ...(fields.model ? { model: fields.model } : {}),
       ...(fields.reasoningEffort ? { effort: fields.reasoningEffort } : {}),
-      serviceTier: fields.fast ? CODEX_OAR_SERVICE_TIER.fast : CODEX_OAR_SERVICE_TIER.standard,
+      // A named tier (#wg-runtime-form:#27) is one the model listed (the server
+      // checks it against this Computer's list), passed as Codex names it.
+      serviceTier: fields.fast ? fields.serviceTier ?? CODEX_OAR_SERVICE_TIER.fast : CODEX_OAR_SERVICE_TIER.standard,
       ...(fields.resumeThreadId ? { resume: fields.resumeThreadId } : {}),
       ...managedMcpSessionOptions(managedMcp),
       // A Stop ends what the turn started, as the driver kills the turn's
@@ -169,11 +174,9 @@ export function codexOarLaunch(
 }
 
 /**
- * Records which Codex install this launch picked on the span the legacy driver
- * records it on (`daemon.runtime.node_host_launch`, #14189), with
- * `host: "oar"`: path-free, so one event name answers it on either host. An
- * install OAR cannot run (a node host without its npm shim) ends it in error;
- * the start then falls back to the legacy driver, which records its own.
+ * Records which Codex install this launch picked (`daemon.runtime.node_host_launch`,
+ * #14189), with `host: "oar"` (path-free). An install OAR cannot run (a node
+ * host without its npm shim) ends the span in error.
  */
 export async function prepareCodexOarLaunch(
   ctx: SpawnContext,

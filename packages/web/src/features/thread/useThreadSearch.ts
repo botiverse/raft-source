@@ -109,6 +109,7 @@ export function useThreadSearch({
         threadChannelId,
         coerceThreadIngress(data.messages ?? data),
       );
+      // oxlint-disable-next-line react/immutability -- `next` is this callback's own copy (sortThreadMessages copies `messages`, mergeThreadMessages returns a new array); the prop is not written.
       next = mergeThreadMessages(next, older);
       nextHasMore = older.length >= limit;
       if (older.length === 0) break;

@@ -73,7 +73,7 @@ export class RuntimeProgressState {
 
   /**
    * Whether the current turn produced progress the repeated-error fences count
-   * on their own (model output, tool use, a finished compaction or review;
+   * on their own (model output, tool use, a finished review;
    * `runtimeErrorFingerprintFenceResetEvent`) since the turn started or the
    * last turn end. Cleared by both, so a bare turn end that follows one with
    * output is still a turn without output.

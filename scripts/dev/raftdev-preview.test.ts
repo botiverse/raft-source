@@ -5,6 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  parsePreviewUnitRecord,
+  previewRegistryDir as leftoversPreviewRegistryDir,
+} from "../../packages/shared/src/agentLeftovers";
+import {
   PREVIEW_INVALID_DBUS_ADDRESS,
   buildPreviewRecord,
   cancelPreviewReminder,
@@ -120,6 +124,32 @@ test("previewRegistryDir: RAFT_PREVIEW_REGISTRY, else the cleaner env file, else
   assert.equal(previewRegistryDir({ RAFT_PREVIEW_REGISTRY: "~/p" }, "/home/u", null, "/cwd"), "/home/u/p");
   assert.equal(previewRegistryDir({ RAFT_PREVIEW_REGISTRY: "rel/p" }, "/home/u", null, "/cwd"), "/cwd/rel/p");
   assert.equal(previewRegistryDir({}, "/home/u", "RAFT_PREVIEW_REGISTRY=~/q\n", "/cwd"), "/home/u/q");
+});
+
+// `raft-computer leftovers` reads the same registry to list agents' previews
+// (packages/shared/src/agentLeftovers.ts, #raft-architecture:#34): same path
+// rule, and a record raftdev writes names its owner and unit there.
+test("the leftovers listing resolves the registry and reads a record as raftdev does", () => {
+  const cases: Array<[Record<string, string>, string | null, string]> = [
+    [{ RAFT_PREVIEW_REGISTRY: "/r", XDG_STATE_HOME: "/x" }, "RAFT_PREVIEW_REGISTRY=/srv/previews\n", "/cwd"],
+    [{ XDG_STATE_HOME: "/x" }, "# c\nRAFT_PREVIEW_REGISTRY=/srv/previews\n", "/cwd"],
+    [{ XDG_STATE_HOME: "/x" }, null, "/cwd"],
+    [{ RAFT_PREVIEW_REGISTRY: "  ", XDG_STATE_HOME: "" }, null, "/cwd"],
+    [{ RAFT_PREVIEW_REGISTRY: "~/p" }, null, "/cwd"],
+    [{ RAFT_PREVIEW_REGISTRY: "rel/p" }, null, "/cwd"],
+    [{}, 'RAFT_PREVIEW_REGISTRY="~/q"\n', "/cwd"],
+  ];
+  for (const [env, file, cwd] of cases) {
+    assert.equal(leftoversPreviewRegistryDir(env, "/home/u", file, cwd), previewRegistryDir(env, "/home/u", file, cwd), JSON.stringify([env, file]));
+  }
+  const record = buildPreviewRecord(recordInput());
+  assert.deepEqual(parsePreviewUnitRecord(JSON.stringify(record), ID), {
+    id: ID,
+    unitName: `raft-preview-${ID}.service`,
+    name: "review-x",
+    ownerAgentId: AGENT,
+  });
+  assert.equal(parsePreviewUnitRecord(JSON.stringify(record), "77777777-7777-4777-8777-777777777777"), null);
 });
 
 test("resource profiles: local-stack default 4G, frontend 2G, --memory-max recorded as override", () => {

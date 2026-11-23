@@ -59,7 +59,7 @@ test("both association paths are answered before static assets are consulted", a
     ["/.well-known/assetlinks.json", (body: unknown) => {
       assert.deepEqual(body, [
         {
-          relation: ["delegate_permission/common.handle_all_urls"],
+          relation: ["delegate_permission/common.handle_all_urls", "delegate_permission/common.get_login_creds"],
           target: {
             namespace: "android_app",
             package_name: "build.raft.app",
@@ -74,10 +74,22 @@ test("both association paths are answered before static assets are consulted", a
             ],
           },
         },
+        {
+          // Passkeys only: the alpha build must not take links from the release app.
+          relation: ["delegate_permission/common.get_login_creds"],
+          target: {
+            namespace: "android_app",
+            package_name: "build.raft.app.alpha",
+            sha256_cert_fingerprints: [
+              "B4:91:93:81:D8:F9:CE:DE:4F:8E:B8:F6:D1:32:F6:DF:E0:D6:D1:5B:F6:D1:F6:30:57:D5:EB:A0:45:16:1A:45",
+              "5F:08:BB:E8:2A:27:CC:DA:D2:6C:13:52:3A:60:B5:67:0D:3A:A7:63:3E:8E:D2:FD:71:FA:6B:57:51:F9:B0:B1",
+            ],
+          },
+        },
       ]);
     }],
     ["/.well-known/apple-app-site-association", (body: unknown) => {
-      // Pin the complete scope: download, channel/DM families, an open Artifact and the external invite.
+      // Pin the complete scope: download, channel/DM families, an open Artifact, the external invite and a server join link.
       // A broad catch-all would divert unrelated website URLs to the app.
       assert.deepEqual(body, {
         applinks: {
@@ -89,14 +101,15 @@ test("both association paths are answered before static assets are consulted", a
                 {
                   "/": "/",
                   "?": { verify: "?*", returnTo: "/login/app?request=*" },
+                  percentEncoded: false,
                   comment: "app sign-up email verification link only; iOS resumes the pending app sign-in",
                 },
                 { "/": "/s/*/channel/", exclude: true, comment: "no channel id" },
                 { "/": "/s/*/*/channel/*", exclude: true, comment: "nested route, not a channel permalink" },
-                { "/": "/s/*/channel/*/*", exclude: true, comment: "extra segment after the channel id" },
+                { "/": "/s/*/channel/*/?*", exclude: true, comment: "extra segment after the channel id (iOS matches the path with a trailing slash added)" },
                 { "/": "/s/*/dm/", exclude: true, comment: "no dm id" },
                 { "/": "/s/*/*/dm/*", exclude: true, comment: "nested route, not a dm permalink" },
-                { "/": "/s/*/dm/*/*", exclude: true, comment: "extra segment after the dm id" },
+                { "/": "/s/*/dm/*/?*", exclude: true, comment: "extra segment after the dm id (iOS matches the path with a trailing slash added)" },
                 {
                   "/": "/s/*/channel/*",
                   comment: "channel and reply permalinks; native validates identity and query anchors",
@@ -113,18 +126,23 @@ test("both association paths are answered before static assets are consulted", a
                 { "/": "/artifacts/", exclude: true, comment: "no artifact id" },
                 { "/": "/artifacts/*/*/v/*", exclude: true, comment: "extra segment before the version" },
                 { "/": "/artifacts/*/v/", exclude: true, comment: "no version number" },
-                { "/": "/artifacts/*/v/*/*", exclude: true, comment: "extra segment after the version" },
+                { "/": "/artifacts/*/v/*/?*", exclude: true, comment: "extra segment after the version (iOS matches the path with a trailing slash added)" },
                 { "/": "/artifacts/*/v/*", comment: "an Artifact's share link at a version; the app opens it in its viewer" },
-                { "/": "/artifacts/*/*", exclude: true, comment: "any other extra segment after the artifact id" },
+                { "/": "/artifacts/*/?*", exclude: true, comment: "any other extra segment after the artifact id (iOS matches the path with a trailing slash added)" },
                 { "/": "/artifacts/*", comment: "an Artifact's share link (raft artifact push, Copy link); the app opens it in its viewer" },
                 {
-                  "/": "/external-invite/*",
+                  "/": "/external-invite/?*",
                   comment: "external channel invite (app 1.24+); the app's invite page reads the rest from the server",
                 },
+                { "/": "/join/", exclude: true, comment: "no join token" },
+                { "/": "/join/*/?*", exclude: true, comment: "extra segment after the join token (iOS matches the path with a trailing slash added)" },
+                { "/": "/join/*", comment: "server join link (app 1.25+); the app's join page reads the invite from the server" },
               ],
             },
           ],
         },
+        // Passkeys bound to app.raft.build, used natively by the iOS app.
+        webcredentials: { apps: ["XDAPXFY8FZ.build.raft.app"] },
       });
     }],
   ] as const) {
@@ -223,14 +241,26 @@ test("verificationEmailPath is the server's verificationEmailUrl", () => {
   );
 });
 
+test("the sign-up link sends returnTo percent-encoded, the form iOS matches against", () => {
+  // The AASA's sign-up component sets `percentEncoded: false` for exactly this shape.
+  assert.equal(
+    verificationEmailPath("t", "/login/app?request=9b2f0c1e-6d0a-4c3b-8f7e-2a1d5c4b3e10"),
+    "/?verify=t&returnTo=%2Flogin%2Fapp%3Frequest%3D9b2f0c1e-6d0a-4c3b-8f7e-2a1d5c4b3e10",
+  );
+});
+
 // This test models the case-sensitive '*' / '?' patterns used above, not
 // Apple's device/CDN verification or the native identity/anchor parser.
 // https://developer.apple.com/documentation/bundleresources/applinks/details-swift.dictionary/components-swift.dictionary
 // '*' matches zero or more characters (including '/'), '?' exactly one. A '?'
 // dictionary requires every key it names to be present with a matching value;
 // other query items are not constrained. Without '?', the query is not constrained.
-// Apple matches query values after percent-decoding, so values are read from the
-// decoded `URLSearchParams`, never the raw query string.
+// `percentEncoded` (default true) says the patterns are written percent-encoded:
+// Apple compares them with the URL as sent, so `returnTo=%2Flogin%2Fapp%3F...`
+// does not match `/login/app?...` (measured with `swcutil verify`, botiverse/mobile
+// app-link-diagnose, 2026-11-18). Only with `percentEncoded: false` are query
+// values decoded before matching. The model reads the raw query and decodes
+// only then.
 /** Whether iOS hands `path` to the app, by the association the Worker serves (the model described above). */
 async function servedAasaMatcher(): Promise<(path: string) => boolean> {
   const { default: handler } = await import("../public/_worker");
@@ -240,6 +270,12 @@ async function servedAasaMatcher(): Promise<(path: string) => boolean> {
   );
   const body = await response.json();
   const components = body.applinks.details[0].components as Array<Record<string, unknown>>;
+  // iOS (swcd) stores a path pattern that ends in neither `/` nor `*` with a `/` appended, and
+  // matches the URL's path with a trailing `/` added (seen on a device's swcutil output and with
+  // `swcutil verify`, 2026-11-17): `/s/x/dm/id` is matched as `/s/x/dm/id/`, so an exclude like
+  // `/s/*/dm/*/*` caught every DM link. Model both, so the rules below are tested as iOS reads them.
+  const iosPathPattern = (pattern: string) => (pattern.endsWith("/") || pattern.endsWith("*") ? pattern : `${pattern}/`);
+  const iosPath = (pathname: string) => (pathname.endsWith("/") ? pathname : `${pathname}/`);
   const glob = (pattern: string) => new RegExp(`^${[...pattern].map((char) =>
     char === "*" ? ".*" : char === "?" ? "." : char.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
   ).join("")}$`);
@@ -247,22 +283,34 @@ async function servedAasaMatcher(): Promise<(path: string) => boolean> {
   const rules = components.map((component) => {
     const keys = Object.keys(component).sort();
     assert.ok(
-      ["/,comment", "/,comment,exclude", "/,?,comment"].includes(keys.join()),
+      ["/,comment", "/,comment,exclude", "/,?,comment", "/,?,comment,percentEncoded"].includes(keys.join()),
       `unexpected component keys ${keys.join()}`,
     );
     if ("exclude" in component) assert.equal(component.exclude, true);
+    if ("percentEncoded" in component) assert.equal(component.percentEncoded, false);
     const query = Object.entries((component["?"] ?? {}) as Record<string, string>);
     return {
       exclude: component.exclude === true,
-      path: glob(component["/"] as string),
+      decoded: component.percentEncoded === false,
+      path: glob(iosPathPattern(component["/"] as string)),
       query: query.map(([name, pattern]) => [name, glob(pattern)] as const),
     };
   });
   return (path: string) => {
     const url = new URL(path, "https://app.raft.build");
-    const rule = rules.find(({ path: pathRegex, query }) =>
-      pathRegex.test(url.pathname) &&
-      query.every(([name, regex]) => url.searchParams.has(name) && regex.test(url.searchParams.get(name)!)));
+    // The query items as sent (still percent-encoded), first occurrence of each name.
+    const raw = new Map<string, string>();
+    for (const item of url.search.slice(1).split("&")) {
+      if (item === "") continue;
+      const eq = item.indexOf("=");
+      const [name, value] = eq === -1 ? [item, ""] : [item.slice(0, eq), item.slice(eq + 1)];
+      if (!raw.has(name)) raw.set(name, value);
+    }
+    const value = (name: string, decoded: boolean) =>
+      decoded ? decodeURIComponent(raw.get(name)!.replace(/\+/g, " ")) : raw.get(name)!;
+    const rule = rules.find(({ path: pathRegex, query, decoded }) =>
+      pathRegex.test(iosPath(url.pathname)) &&
+      query.every(([name, regex]) => raw.has(name) && regex.test(value(name, decoded))));
     return rule !== undefined && !rule.exclude;
   };
 }
@@ -279,13 +327,21 @@ test("AASA covers conversation and message links without claiming unrelated web 
     // The sign-up email for a sign-up started in a native sign-in (its returnTo is `/login/app?request=<id>`).
     verificationEmailPath("email-token", "/login/app?request=request-id"),
     verificationEmailPath("email-token", "/login/app?request=9b2f0c1e-6d0a-4c3b-8f7e-2a1d5c4b3e10"),
+    // Exactly as the email sends it: a 64-hex token and returnTo percent-encoded by
+    // URLSearchParams. iOS matches it only because the component sets `percentEncoded: false`.
+    "/?verify=" + "ab".repeat(32) + "&returnTo=%2Flogin%2Fapp%3Frequest%3D9b2f0c1e-6d0a-4c3b-8f7e-2a1d5c4b3e10",
+    // Typed or rewritten unencoded, it is the same address after decoding.
+    "/?verify=email-token&returnTo=/login/app?request=request-id",
     "/s/qa-workspace/artifacts?artifact=pt_abc",
     "/s/qa-workspace/artifacts?artifact=pt_abc&version=2",
     "/external-invite/invite-token",
+    "/join/invite-token",
+    // iOS adds a trailing slash before matching, so a trailing slash is the same address to it.
+    "/s/qa-workspace/channel/channel-id/",
     "/artifacts/pt_abc", "/artifacts/pt_abc/v/2", "/artifacts/pt_abc?c=1",
   ]) assert.equal(matches(path), true, `must associate ${path}`);
   for (const path of [
-    "/", "/join", "/join/invite-token", "/download/extra", "/downloads",
+    "/", "/join", "/join/", "/join/invite-token/extra", "/download/extra", "/downloads",
     "/login", "/change-password", "/s/qa-workspace", "/s/qa-workspace/members",
     "/s/qa-workspace/settings", "/s/qa-workspace/channels/id",
     "/s/qa-workspace/Channel/id", "/s/qa-workspace/DM/id",
@@ -296,7 +352,7 @@ test("AASA covers conversation and message links without claiming unrelated web 
     "/s/qa-workspace/channel/", "/s/qa-workspace/dm/",
     "/s/qa-workspace/settings/channel/id", "/s/qa-workspace/settings/dm/id",
     "/s/qa-workspace/channel/id/extra", "/s/qa-workspace/dm/id/extra",
-    "/s/qa-workspace/channel/id/", "/s/a/b/channel/id",
+    "/s/a/b/channel/id",
     // Only `/` with a non-empty `verify` value: other pages and the reset link stay on web.
     // A web sign-up's link (no app sign-in to resume) keeps opening in the browser.
     verificationEmailPath("email-token"), verificationEmailPath("email-token", "/"),
@@ -312,7 +368,7 @@ test("AASA covers conversation and message links without claiming unrelated web 
     "/artifacts/pt_abc/v/", "/artifacts/pt_abc/v/2/extra", "/artifacts/pt_abc/extra",
     "/artifacts/pt_abc/extra/v/2", "/x/artifacts/pt_abc",
     "/?verify=", "/?verified=1", "/?reset=reset-token", "/login?verify=email-token",
-    "/join/invite-token?verify=email-token", "/s/qa-workspace/channel/?verify=email-token",
+    "/servers?verify=email-token", "/s/qa-workspace/channel/?verify=email-token",
   ]) assert.equal(matches(path), false, `must stay on web ${path}`);
 });
 
@@ -330,7 +386,7 @@ test("the iPhone open-in-app rule agrees with the association the Worker serves"
     ["/s/acme/dm/d1", true],
     ["/s/channel/dm/d1", true],
     ["/s/acme/channel/c1/search", false],
-    ["/s/acme/channel/c1/", false],
+    ["/s/acme/channel/c1/", true],
     ["/s/acme/channel/", false],
     ["/s/acme/dm/d1/extra", false],
     ["/s/acme/settings/channel/c1", false],
@@ -353,6 +409,10 @@ test("the iPhone open-in-app rule agrees with the association the Worker serves"
     ["/s/acme/artifacts?from=list", false],
     ["/external-invite/invite-token", true],
     ["/external-invite", false],
+    ["/join/invite-token", true],
+    ["/join", false],
+    ["/join/", false],
+    ["/join/invite-token/extra", false],
     ["/servers", false],
   ];
   for (const [path, claimed] of samples) {
@@ -360,10 +420,14 @@ test("the iPhone open-in-app rule agrees with the association the Worker serves"
     assert.equal(isAppClaimedPath(pathname, "ios", search), served(path), `the offer's rule and the served association disagree on ${path}`);
     assert.equal(served(path), claimed, `the served association on ${path}`);
   }
-  // Android's claim is in the app's manifest, not in assetlinks.json: every /s/… path, nothing else.
+  // Android's claim is in the app's manifest, not in assetlinks.json: every `/s/…` path plus Artifact share links, external invites and server join links.
   for (const [path] of samples) {
     const { pathname, search } = new URL(path, "https://app.raft.build");
-    assert.equal(isAppClaimedPath(pathname, "android", search), pathname.startsWith("/s/"), `android ${path}`);
+    const expectedAndroid = pathname.startsWith("/s/")
+      || /^\/artifacts\/[^/]+(?:\/v\/[^/]+)?\/?$/.test(pathname)
+      || /^\/external-invite\/.+/.test(pathname)
+      || /^\/join\/[^/]+\/?$/.test(pathname);
+    assert.equal(isAppClaimedPath(pathname, "android", search), expectedAndroid, `android ${path}`);
   }
 });
 

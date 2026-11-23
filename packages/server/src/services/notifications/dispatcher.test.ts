@@ -1709,6 +1709,43 @@ test("a receiver removed from a private channel before the drain is suppressed w
   assert.equal(alerts().filter((call) => call.installationId === "member-phone").length, 1);
 });
 
+for (const middle of ["thread", "task"] as const) {
+  test(`a receiver removed from the private root of a nested thread (under a ${middle}) is suppressed with no_access`, async ({ db }) => {
+    const f = await seedFixture();
+    const stays = await f.member("StaysInRoot");
+    await register({ userId: f.owner.id, serverId: f.server.id, familyId: f.family.id, installationId: "nested-removed-phone" });
+    await register({ userId: stays.user.id, serverId: f.server.id, familyId: stays.family.id, installationId: "nested-member-phone" });
+    const [root] = await db.insert(channels).values({ serverId: f.server.id, name: "nested-secret", type: "private" }).returning();
+    await db.insert(channelHumans).values([{ channelId: root!.id, userId: f.owner.id }, { channelId: root!.id, userId: stays.user.id }]);
+    const anchor = await f.post(root!.id, "root anchor");
+    let mid;
+    if (middle === "thread") {
+      [mid] = await db.insert(channels).values({ serverId: f.server.id, name: "nested-mid", type: "thread", parentMessageId: anchor.id }).returning();
+    } else {
+      const [task] = await db.insert(tasks).values({ channelId: root!.id, taskNumber: 1, title: "Nested task", status: "todo", createdByType: "user", createdById: f.sender.id, ownConversation: true, sourceMessageId: anchor.id }).returning();
+      [mid] = await db.insert(channels).values({ serverId: f.server.id, name: "nested-mid", type: "task", taskId: task!.id }).returning();
+    }
+    const midMessage = await f.post(mid!.id, "a message in the middle conversation");
+    // A thread started on a message inside a thread or task conversation (legacy rows).
+    const [nested] = await db.insert(channels).values({ serverId: f.server.id, name: "nested-leaf", type: "thread", parentMessageId: midMessage.id }).returning();
+    const reply = await f.post(nested!.id, "nested private plans");
+    const ids = await enqueueNotificationRows([
+      messageRow(f.owner.id, f.server.id, nested!.id, reply),
+      messageRow(stays.user.id, f.server.id, nested!.id, reply),
+    ]);
+    // Removed from the root between the send and the drain.
+    await db.delete(channelHumans).where(and(eq(channelHumans.channelId, root!.id), eq(channelHumans.userId, f.owner.id)));
+    await runScheduled();
+
+    const removed = await outbox(ids[0]!);
+    assert.equal(removed.status, "suppressed");
+    assert.equal(removed.decision, "suppressed:no_access");
+    assert.equal(alerts().filter((call) => call.installationId === "nested-removed-phone").length, 0, "no alert for the removed reader");
+    assert.equal((await outbox(ids[1]!)).status, "delivered");
+    assert.equal(alerts().filter((call) => call.installationId === "nested-member-phone").length, 1);
+  });
+}
+
 test("a retry after a partial send skips what already went: one alert, one mobile socket, the failed desktop emit goes on retry", async ({ db }) => {
   void db;
   __resetNotificationSendLedgerForTests();

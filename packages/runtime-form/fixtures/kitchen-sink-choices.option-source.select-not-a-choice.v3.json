@@ -1,0 +1,23 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "kitchen-sink-choices",
+  "schemaVersion": "kitchen-sink-choices.create.v1",
+  "sourceId": "selectNotAChoice",
+  "kind": "select",
+  "pointer": "/selectNotAChoice",
+  "options": [
+    {
+      "value": "alpha",
+      "label": "Alpha"
+    },
+    {
+      "value": "beta",
+      "label": "Beta"
+    },
+    {
+      "value": "gamma",
+      "label": "Gamma"
+    }
+  ],
+  "status": "live"
+}

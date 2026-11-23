@@ -76,3 +76,22 @@ test("task #1307: provider_api_key_invalid passes through as a bare reason; a mo
     { reason: "provider_api_key_invalid" },
   );
 });
+
+test("message: a daemon's start error text is scrubbed and capped at 300 again; a server read-back never carries it", () => {
+  assert.deepEqual(
+    normalizeSpawnFailureActivityDiagnostic({ reason: "runtime_spawn_failed", message: "open /home/alice/.codex/auth.json failed for alice@example.com (sk-AbCdEfGh12345678)" }),
+    { reason: "runtime_spawn_failed", message: "open [REDACTED_PATH] failed for [REDACTED_EMAIL] ([REDACTED_TOKEN])" },
+  );
+  assert.deepEqual(
+    normalizeSpawnFailureActivityDiagnostic({ reason: "model_not_found", model: "m", message: "Model m is gone" }),
+    { reason: "model_not_found", model: "m", message: "Model m is gone" },
+  );
+  const long = normalizeSpawnFailureActivityDiagnostic({ reason: "runtime_spawn_failed", message: `C:\\Users\\bob\\x ${"yyyyyyyyyy ".repeat(400)}` });
+  assert.equal(long?.message?.length, 300);
+  assert.ok(long?.message?.startsWith("[REDACTED_PATH] yyyyyyyyyy yyy"));
+  // Not a string, empty after scrubbing, or from the server's own read-back: no field.
+  for (const message of [42, { text: "x" }, "   "]) {
+    assert.deepEqual(normalizeSpawnFailureActivityDiagnostic({ reason: "runtime_spawn_failed", message }), { reason: "runtime_spawn_failed" });
+  }
+  assert.deepEqual(normalizeSpawnFailureActivityDiagnostic({ reason: "runtime_spawn_failed", message: "x" }, { source: "server" }), { reason: "runtime_spawn_failed" });
+});

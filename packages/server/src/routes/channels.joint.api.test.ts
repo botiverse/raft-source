@@ -32,7 +32,7 @@ import {
 } from "../db/schema";
 import { addMember } from "../services/serverService";
 import { createAgent } from "../services/agentService";
-import { MAX_JOINT_CHANNEL_INVITED_PEOPLE_PER_TARGET, disconnectJointChannel, resendPendingJointChannelInvites, createChannel, getOrCreateThread, addHuman, addAgent, removeHuman, isChannelHuman, resolveChannelAccess, getChannel, markRead, listJointActivityProjectionChannelIdsForAgent, recordThreadFollow } from "../services/channelService";
+import { MAX_JOINT_CHANNEL_INVITED_PEOPLE_PER_TARGET, disconnectJointChannel, resendPendingJointChannelInvites, createChannel, getOrCreateThread, addHuman, addAgent, removeHuman, isChannelHuman, resolveChannelAccess, getChannel, markRead, listJointActivityProjectionChannelIdsForAgent, recordThreadFollow, unfollowThreadForFollower, getOrCreateThreadForChannel } from "../services/channelService";
 import {
   createMessage
 } from "../services/messageService";
@@ -2219,7 +2219,7 @@ test("joint channel threads use per-server local thread projections over canonic
       headers: headers(targetMemberToken, targetServer.id),
     });
     assert.equal(deniedPermalink.status, 404, "joint permalink access for non-members should degrade to neutral not found");
-    assert.deepEqual(await deniedPermalink.json(), { error: "Message not found" });
+    assert.deepEqual(await deniedPermalink.json(), { error: "Message not found", code: "message_not_found", errorCode: "message_not_found" });
 
     const events = installFakeIo(app.app);
     const targetReaction = await fetch(`${app.baseUrl}/api/messages/${parent.id}/reactions`, {
@@ -4146,4 +4146,295 @@ test("joint-invites:changed: a pending invite's source copy disconnecting pings 
   } finally {
     setListChangedRealtimeIO((app as unknown as { app: { get(key: string): never } }).app.get("io"));
   }
+});
+
+test("joint thread: a two-projection parent author follows, and is notified on, the projection they posted from", async ({ app }) => {
+  // The canonical parent message records no origin server. The authored
+  // follow used the author's FIRST member projection (joined_at order: the
+  // host), so an author posting from the second projection was never a
+  // follower there.
+  const db = getDb();
+  const author = await seedUser("joint-authored-second@slock.test", "joint-authored-second");
+  const replier = await seedUser("joint-authored-second-replier@slock.test", "joint-authored-second-replier");
+  const hostServer = await createServer("Joint Authored Second Host", "botiverse", author.id);
+  const targetServer = await createServer("Joint Authored Second Target", "joint-authored-second-target", author.id);
+  await addMember(hostServer.id, replier.id);
+  const authorToken = await tokenForHuman(author.email);
+  const replierToken = await tokenForHuman(replier.email);
+
+  const createRes = await fetch(`${app.baseUrl}/api/channels`, {
+    method: "POST",
+    headers: headers(authorToken, hostServer.id),
+    body: JSON.stringify({
+      name: "authored-second-room",
+      visibility: "joint",
+      jointInvites: [{ targetServerSlug: targetServer.slug, invitedPeople: [`@${author.name}`], sameAdmin: true }],
+    }),
+  });
+  assert.equal(createRes.status, 200);
+  const hostProjection = await createRes.json() as { id: string; jointInvites: Array<{ id: string }> };
+  const [invite] = await db.select().from(jointChannelInvites).where(eq(jointChannelInvites.id, hostProjection.jointInvites[0]!.id));
+  const [targetProjection] = await db
+    .select({ localChannelId: jointChannelServers.localChannelId })
+    .from(jointChannelServers)
+    .where(and(eq(jointChannelServers.jointChannelId, invite!.jointChannelId), eq(jointChannelServers.serverId, targetServer.id)));
+  assert.ok(targetProjection);
+  await addHuman(hostProjection.id, replier.id);
+  assert.equal(await isChannelHuman(hostProjection.id, author.id), true, "fixture: author is in the host projection");
+  assert.equal(await isChannelHuman(targetProjection.localChannelId, author.id), true, "fixture: author is in the target projection");
+
+  // The author posts the parent from the second (target) projection.
+  const parentRes = await fetch(`${app.baseUrl}/api/messages`, {
+    method: "POST",
+    headers: headers(authorToken, targetServer.id),
+    body: JSON.stringify({ channelId: targetProjection.localChannelId, content: "parent from the target projection" }),
+  });
+  assert.equal(parentRes.status, 200);
+  const parent = await parentRes.json() as { id: string };
+
+  const threadRes = await fetch(`${app.baseUrl}/api/channels/${hostProjection.id}/threads`, {
+    method: "POST",
+    headers: headers(replierToken, hostServer.id),
+    body: JSON.stringify({ parentMessageId: parent.id, content: "first reply from the host side" }),
+  });
+  assert.equal(threadRes.status, 200);
+  const hostThreadId = (await threadRes.json() as { threadChannelId: string }).threadChannelId;
+  const [hostThreadRow] = await db
+    .select({ jointChannelId: jointChannelServers.jointChannelId })
+    .from(jointChannelServers)
+    .where(eq(jointChannelServers.localChannelId, hostThreadId));
+  assert.ok(hostThreadRow);
+  const [targetThreadRow] = await db
+    .select({ localChannelId: jointChannelServers.localChannelId })
+    .from(jointChannelServers)
+    .where(and(eq(jointChannelServers.jointChannelId, hostThreadRow.jointChannelId), eq(jointChannelServers.serverId, targetServer.id)));
+  assert.ok(targetThreadRow, "fixture: the joint thread is projected on the target server");
+  const targetThreadId = targetThreadRow.localChannelId;
+
+  const follows = await db
+    .select({ threadChannelId: threadFollows.threadChannelId, reason: threadFollows.reason })
+    .from(threadFollows)
+    .where(and(eq(threadFollows.followerType, "user"), eq(threadFollows.followerId, author.id), isNull(threadFollows.unfollowedAt)));
+  assert.deepEqual(
+    follows.filter((follow) => follow.threadChannelId === targetThreadId).map((follow) => follow.reason),
+    ["authored"],
+    "the author follows the projection they posted from",
+  );
+  assert.deepEqual(
+    follows.filter((follow) => follow.threadChannelId === hostThreadId).map((follow) => follow.reason),
+    ["authored"],
+    "the author's other member projection keeps its follow",
+  );
+  // #439: the FIRST reply (which opened the thread) already notifies on every
+  // member projection, like later replies; it used to reach the first-joined one only.
+  const [firstReply] = await db.select({ id: messages.id }).from(messages).where(eq(messages.content, "first reply from the host side"));
+  assert.ok(firstReply);
+  const firstReplyFacts = await db
+    .select({ sourceChannelId: inboxNotificationFacts.sourceChannelId })
+    .from(inboxNotificationFacts)
+    .where(and(eq(inboxNotificationFacts.receiverId, author.id), eq(inboxNotificationFacts.messageId, firstReply.id)));
+  assert.deepEqual(
+    firstReplyFacts.map((fact) => fact.sourceChannelId).sort(),
+    [hostThreadId, targetThreadId].sort(),
+    "the first reply notifies the author on the target projection they posted from too",
+  );
+
+  const replyRes = await fetch(`${app.baseUrl}/api/messages`, {
+    method: "POST",
+    headers: headers(replierToken, hostServer.id),
+    body: JSON.stringify({ channelId: hostThreadId, content: "second reply from the host side" }),
+  });
+  assert.equal(replyRes.status, 200);
+  const reply = await replyRes.json() as { id: string };
+  const facts = await db
+    .select({ sourceChannelId: inboxNotificationFacts.sourceChannelId, serverId: inboxNotificationFacts.serverId })
+    .from(inboxNotificationFacts)
+    .where(and(eq(inboxNotificationFacts.receiverId, author.id), eq(inboxNotificationFacts.messageId, reply.id)));
+  assert.ok(
+    facts.some((fact) => fact.sourceChannelId === targetThreadId && fact.serverId === targetServer.id),
+    "the reply notifies the author on the target-server thread they posted from",
+  );
+});
+
+// #439: a first reply opens the thread. The root author follows only via the
+// reply's own authored follow, so the follow must exist on the author's own
+// projection before the reply fans out (Activity facts, agent delivery); it used
+// to land 1-2 s later in the post-commit frontend emit.
+async function jointRoomWithAuthorOnSecondServer(app: { baseUrl: string }, slug: string) {
+  const db = getDb();
+  const hostOwner = await seedUser(`${slug}-host@slock.test`, `${slug}-host`);
+  const targetOwner = await seedUser(`${slug}-target@slock.test`, `${slug}-target`);
+  const hostServer = await createServer(`${slug} host`, "botiverse", hostOwner.id);
+  const targetServer = await createServer(`${slug} target`, `${slug}-target`, targetOwner.id);
+  const hostToken = await tokenForHuman(hostOwner.email);
+  const targetToken = await tokenForHuman(targetOwner.email);
+  const createRes = await fetch(`${app.baseUrl}/api/channels`, {
+    method: "POST",
+    headers: headers(hostToken, hostServer.id),
+    body: JSON.stringify({ name: `${slug}-room`, visibility: "joint", targetServerSlug: targetServer.slug, invitedPeople: [`@${targetOwner.name}`] }),
+  });
+  assert.equal(createRes.status, 200);
+  const hostProjection = await createRes.json() as { id: string; jointInvite: { id: string } };
+  const acceptRes = await fetch(`${app.baseUrl}/api/channels/joint-invites/${hostProjection.jointInvite.id}/accept`, {
+    method: "POST",
+    headers: headers(targetToken, targetServer.id),
+  });
+  assert.equal(acceptRes.status, 200);
+  const targetProjection = await acceptRes.json() as { id: string };
+  const [canonical] = await db.select({ canonicalChannelId: jointChannels.canonicalChannelId }).from(jointChannels)
+    .innerJoin(jointChannelServers, eq(jointChannelServers.jointChannelId, jointChannels.id))
+    .where(eq(jointChannelServers.localChannelId, targetProjection.id));
+  assert.ok(canonical);
+  return { db, hostOwner, targetOwner, hostServer, targetServer, hostToken, targetToken, hostProjection, targetProjection, canonicalChannelId: canonical.canonicalChannelId };
+}
+
+async function threadProjectionOnServer(threadChannelId: string, serverId: string): Promise<string> {
+  const db = getDb();
+  const [row] = await db.select({ jointChannelId: jointChannelServers.jointChannelId }).from(jointChannelServers)
+    .where(eq(jointChannelServers.localChannelId, threadChannelId));
+  assert.ok(row, "fixture: the thread is a joint thread projection");
+  const [peer] = await db.select({ localChannelId: jointChannelServers.localChannelId }).from(jointChannelServers)
+    .where(and(eq(jointChannelServers.jointChannelId, row.jointChannelId), eq(jointChannelServers.serverId, serverId)));
+  assert.ok(peer, "fixture: the thread is projected on the server");
+  return peer.localChannelId;
+}
+
+test("#439 joint thread: the first reply reaches an agent root author on the second-joined server", async ({ app }) => {
+  const f = await jointRoomWithAuthorOnSecondServer(app, "joint-first-reply-agent");
+  const authorAgent = await createAgent(f.targetServer.id, "joint-first-reply-author-agent", { runtime: "codex" });
+  await addAgent(f.targetProjection.id, authorAgent.id);
+  const parent = await createMessage(f.canonicalChannelId, "agent", authorAgent.id, "agent root on the target side");
+
+  const deliveries: Array<{ agentId: string; message: { channel_id?: string; content: string } }> = [];
+  const agentOrchestrator = app.app.get("agentOrchestrator") as {
+    deliverMessage: (agentId: string, message: { channel_id?: string; content: string }) => Promise<void>;
+  };
+  // The follow row must already exist when delivery runs: delivery happens
+  // before the post-commit frontend emit that used to write it.
+  const followSeenAtDelivery: boolean[] = [];
+  agentOrchestrator.deliverMessage = async (agentId, message) => {
+    deliveries.push({ agentId, message });
+    if (agentId === authorAgent.id) {
+      const rows = await getDb().select({ id: threadFollows.threadChannelId }).from(threadFollows)
+        .where(and(eq(threadFollows.followerType, "agent"), eq(threadFollows.followerId, authorAgent.id), isNull(threadFollows.unfollowedAt)));
+      followSeenAtDelivery.push(rows.length > 0);
+    }
+  };
+
+  const threadRes = await fetch(`${app.baseUrl}/api/channels/${f.hostProjection.id}/threads`, {
+    method: "POST",
+    headers: headers(f.hostToken, f.hostServer.id),
+    body: JSON.stringify({ parentMessageId: parent.id, content: "first reply from the host side" }),
+  });
+  assert.equal(threadRes.status, 200);
+  const hostThreadId = (await threadRes.json() as { threadChannelId: string }).threadChannelId;
+  const targetThreadId = await threadProjectionOnServer(hostThreadId, f.targetServer.id);
+
+  const [reply] = await f.db.select({ id: messages.id }).from(messages)
+    .where(eq(messages.content, "first reply from the host side"));
+  assert.ok(reply);
+  const facts = await f.db.select({ sourceChannelId: inboxNotificationFacts.sourceChannelId, serverId: inboxNotificationFacts.serverId })
+    .from(inboxNotificationFacts)
+    .where(and(eq(inboxNotificationFacts.receiverId, authorAgent.id), eq(inboxNotificationFacts.messageId, reply.id)));
+  assert.deepEqual(facts, [{ sourceChannelId: targetThreadId, serverId: f.targetServer.id }], "the first reply is an inbox fact for the agent author on its own projection");
+
+  const delivery = deliveries.find((entry) => entry.agentId === authorAgent.id && entry.message.content === "first reply from the host side");
+  assert.ok(delivery, "the agent root author gets the first reply delivered");
+  assert.deepEqual(followSeenAtDelivery, [true], "the authored follow exists before delivery");
+
+  const follows = await f.db.select({ threadChannelId: threadFollows.threadChannelId, reason: threadFollows.reason }).from(threadFollows)
+    .where(and(eq(threadFollows.followerType, "agent"), eq(threadFollows.followerId, authorAgent.id)));
+  assert.deepEqual(follows, [{ threadChannelId: targetThreadId, reason: "authored" }], "one authored follow, on the author's own projection only");
+});
+
+test("#439 joint thread: the first reply shows in a human root author's Activity on the second-joined server", async ({ app }) => {
+  const f = await jointRoomWithAuthorOnSecondServer(app, "joint-first-reply-human");
+  const parentRes = await fetch(`${app.baseUrl}/api/messages`, {
+    method: "POST",
+    headers: headers(f.targetToken, f.targetServer.id),
+    body: JSON.stringify({ channelId: f.targetProjection.id, content: "human root on the target side" }),
+  });
+  assert.equal(parentRes.status, 200);
+  const parent = await parentRes.json() as { id: string };
+
+  const threadRes = await fetch(`${app.baseUrl}/api/channels/${f.hostProjection.id}/threads`, {
+    method: "POST",
+    headers: headers(f.hostToken, f.hostServer.id),
+    body: JSON.stringify({ parentMessageId: parent.id, content: "first human-thread reply from the host side" }),
+  });
+  assert.equal(threadRes.status, 200);
+  const hostThreadId = (await threadRes.json() as { threadChannelId: string }).threadChannelId;
+  const targetThreadId = await threadProjectionOnServer(hostThreadId, f.targetServer.id);
+
+  const [reply] = await f.db.select({ id: messages.id }).from(messages)
+    .where(eq(messages.content, "first human-thread reply from the host side"));
+  assert.ok(reply);
+  const facts = await f.db.select({ sourceChannelId: inboxNotificationFacts.sourceChannelId, serverId: inboxNotificationFacts.serverId })
+    .from(inboxNotificationFacts)
+    .where(and(eq(inboxNotificationFacts.receiverId, f.targetOwner.id), eq(inboxNotificationFacts.messageId, reply.id)));
+  assert.deepEqual(facts, [{ sourceChannelId: targetThreadId, serverId: f.targetServer.id }]);
+  const items = await fetchInboxAll(app.baseUrl, f.targetToken, f.targetServer.id);
+  assert.ok(
+    items.some((item) => (item as { threadChannelId?: string }).threadChannelId === targetThreadId),
+    `the first reply shows in the author's Activity: ${JSON.stringify(items)}`,
+  );
+});
+
+test("#439 joint thread: a root author who unfollowed the opened thread is not re-followed by the first reply", async ({ app }) => {
+  const f = await jointRoomWithAuthorOnSecondServer(app, "jfr-unfollowed");
+  const authorAgent = await createAgent(f.targetServer.id, "jfr-unfollowed-agent", { runtime: "codex" });
+  await addAgent(f.targetProjection.id, authorAgent.id);
+  const parent = await createMessage(f.canonicalChannelId, "agent", authorAgent.id, "agent root, unfollowed before any reply");
+  // The thread is opened (no reply yet) and the author unfollows it there.
+  const hostThread = await getOrCreateThreadForChannel(f.hostProjection.id, parent.id, f.hostOwner.id, "user");
+  const targetThreadId = await threadProjectionOnServer(hostThread.id, f.targetServer.id);
+  await recordThreadFollow("agent", authorAgent.id, targetThreadId, parent.id, "manual");
+  assert.equal(await unfollowThreadForFollower("agent", authorAgent.id, targetThreadId), true);
+
+  const deliveries: string[] = [];
+  const agentOrchestrator = app.app.get("agentOrchestrator") as { deliverMessage: (agentId: string) => Promise<void> };
+  agentOrchestrator.deliverMessage = async (agentId) => { deliveries.push(agentId); };
+  const replyRes = await fetch(`${app.baseUrl}/api/messages`, {
+    method: "POST",
+    headers: headers(f.hostToken, f.hostServer.id),
+    body: JSON.stringify({ channelId: hostThread.id, content: "first reply after the author unfollowed" }),
+  });
+  assert.equal(replyRes.status, 200);
+  await replyRes.json();
+
+  const follows = await f.db.select({ threadChannelId: threadFollows.threadChannelId, unfollowedAt: threadFollows.unfollowedAt }).from(threadFollows)
+    .where(and(eq(threadFollows.followerType, "agent"), eq(threadFollows.followerId, authorAgent.id)));
+  assert.equal(follows.length, 1);
+  assert.equal(follows[0]!.threadChannelId, targetThreadId);
+  assert.ok(follows[0]!.unfollowedAt, "the explicit unfollow stands");
+  assert.ok(!deliveries.includes(authorAgent.id), "an unfollowed author gets no ordinary delivery");
+});
+
+test("#439 control: a non-joint first reply still reaches the agent root author once, with one authored follow", async ({ app }) => {
+  const owner = await seedUser("plain-first-reply-owner@slock.test", "plain-first-reply-owner");
+  const server = await createServer("Plain First Reply", "plain-first-reply", owner.id);
+  const token = await tokenForHuman(owner.email);
+  const authorAgent = await createAgent(server.id, "plain-first-reply-author-agent", { runtime: "codex" });
+  const channel = await createChannel(server.id, "plain-first-reply-room", undefined, "channel", { type: "user", id: owner.id });
+  await addHuman(channel.id, owner.id).catch(() => {});
+  await addAgent(channel.id, authorAgent.id);
+  const parent = await createMessage(channel.id, "agent", authorAgent.id, "plain agent root");
+
+  const deliveries: Array<{ agentId: string; content: string }> = [];
+  const agentOrchestrator = app.app.get("agentOrchestrator") as {
+    deliverMessage: (agentId: string, message: { content: string }) => Promise<void>;
+  };
+  agentOrchestrator.deliverMessage = async (agentId, message) => { deliveries.push({ agentId, content: message.content }); };
+  const threadRes = await fetch(`${app.baseUrl}/api/channels/${channel.id}/threads`, {
+    method: "POST",
+    headers: headers(token, server.id),
+    body: JSON.stringify({ parentMessageId: parent.id, content: "plain first reply" }),
+  });
+  assert.equal(threadRes.status, 200);
+  const threadId = (await threadRes.json() as { threadChannelId: string }).threadChannelId;
+
+  assert.deepEqual(deliveries.filter((entry) => entry.agentId === authorAgent.id).map((entry) => entry.content), ["plain first reply"]);
+  const follows = await getDb().select({ threadChannelId: threadFollows.threadChannelId, reason: threadFollows.reason }).from(threadFollows)
+    .where(and(eq(threadFollows.followerType, "agent"), eq(threadFollows.followerId, authorAgent.id)));
+  assert.deepEqual(follows, [{ threadChannelId: threadId, reason: "authored" }]);
 });

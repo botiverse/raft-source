@@ -6,23 +6,30 @@
  * agent is on it, so while the list shows one the dialog only says so.
  *
  * The person's own computer (#triage:d10ace06, Tenny; server #12858): a
- * Computer attached by them (`computerAttachedByCurrentUser`), the same test
- * the server's revoke uses (servers.ts computerControllerUserId). After an
- * adoption that is the adopter, not the machine row's previous owner.
- * only their own agents (ones they created, or their personal assistant) have
- * to go first, as DELETE still refuses them. Other people's agents, which only
- * their owners can move, don't: confirming revokes the Computer's key first
- * (revoke-computer-key), and while such agents are on it the server answers
- * 409 with them (its own list: another member's personal assistant isn't in
- * the viewer's). The dialog then lists them, with Notify Owner to Move It
+ * Computer attached by them now (`computerAttachedByCurrentUser`), the same
+ * test the server's revoke uses (servers.ts computerControllerUserId: the live
+ * attacher only). After an adoption that is the adopter, not the machine row's
+ * previous owner. Only their own agents (ones they created, or their personal
+ * assistant) have to go first, as the server's delete still refuses them.
+ * Other people's agents, which only their owners can move, don't: confirming
+ * sends one request, revoke-computer-key with `delete: true`, which revokes
+ * the Computer's key and removes the machine together, in one transaction on
+ * the server, authorized while it is still theirs (once the key is revoked
+ * they are no longer its controller, so a separate DELETE would be refused).
+ * While other people's agents are on it the server answers 409 with them (its
+ * own list: another member's personal assistant isn't in the viewer's) and
+ * nothing happens. The dialog then lists them, with Notify Owner to Move It
  * (once a day, shared with Delete Account) and Force Unbind and Delete, which
  * asks again (ForceUnbindAgentsDialog) and sends `forceAgentIds`, exactly the
- * agents shown. A 409 on that means more arrived and nothing happened: the
- * confirm shows the newer list and says so. Once the key is revoked the
- * computer is offline, and the same DELETE takes it off the list. Should that
- * DELETE fail, the dialog says so in our words (the key is revoked and it is
- * offline, why it is still listed, that trying again is safe); a retry finds
- * the key already revoked and goes on to the DELETE.
+ * agents shown, in the same single request. A 409 on that means more arrived
+ * and nothing happened: the confirm shows the newer list and says so. Any
+ * other refusal also changes nothing and is shown as the server says it.
+ *
+ * Only if the key ends up revoked without the machine removed (it was already
+ * revoked, or a server that predates `delete`) does the dialog fall back to
+ * DELETE; should that fail it says so in our words (the key is revoked and it
+ * is offline, why it is still listed, and when only an owner or admin can
+ * remove it now).
  */
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useIntl } from "react-intl";
@@ -35,7 +42,7 @@ import type { Machine } from "../../store/machineStore";
 import { useServerStore } from "../../store/serverStore";
 import { getApiErrorResponse } from "../../utils/apiErrorResponse";
 import { ForceUnbindAgentsDialog } from "./ForceUnbindAgentsDialog";
-import { isOwnAgent, notifyComputerAgentOwners, revokeComputerKey } from "./othersAgentsApi";
+import { isOwnAgent, notifyComputerAgentOwners, revokeKeyAndDeleteComputer } from "./othersAgentsApi";
 import type { OthersAgent } from "./othersAgentsApi";
 import { OthersAgentsOnComputerDialog } from "./OthersAgentsOnComputerDialog";
 import { useAgentOwnerNotify } from "./useAgentOwnerNotify";
@@ -45,8 +52,9 @@ type Phase =
   | { kind: "others"; agents: OthersAgent[] }
   | { kind: "force"; agents: OthersAgent[] };
 
-/** Why DELETE refused (machineService.ts MachineDeleteConflictError), for `machine.othersAgents.revokedNotRemoved`. */
-function deleteRefusalReason(err: unknown): "agents" | "migration" | "profile" | "other" {
+/** Why DELETE refused (machineService.ts MachineDeleteConflictError, or 403), for `machine.othersAgents.revokedNotRemoved`. */
+function deleteRefusalReason(err: unknown): "agents" | "migration" | "profile" | "forbidden" | "other" {
+  if (getApiErrorResponse(err)?.status === 403) return "forbidden";
   switch (getApiErrorResponse(err)?.code) {
     case "MACHINE_HAS_ASSIGNED_AGENTS": return "agents";
     case "MACHINE_HAS_ACTIVE_MIGRATION": return "migration";
@@ -68,11 +76,12 @@ export function DeleteComputerDialog({ machine, agents, onClose }: {
   const currentUserId = useAuthStore((s) => s.user?.id ?? null);
   const serverId = useServerStore((s) => s.current?.id ?? null);
   const deleteMachine = useMachineStore((s) => s.deleteMachine);
+  const forgetRemovedMachine = useMachineStore((s) => s.forgetRemovedMachine);
   const attachedByMe = machine.isComputer === true && machine.computerAttachedByCurrentUser === true;
   const holding = attachedByMe ? agents.filter((agent) => isOwnAgent(agent, currentUserId)) : agents;
   const [phase, setPhase] = useState<Phase>({ kind: "confirm" });
   const finished = useRef(false);
-  // Its key was revoked from this dialog: a failed DELETE leaves it offline but listed.
+  // Its key was revoked from this dialog without the machine removed: a failed DELETE leaves it offline but listed.
   const revoked = useRef(false);
 
   const sendNotify = useCallback((agentIds: string[]) => {
@@ -85,8 +94,12 @@ export function DeleteComputerDialog({ machine, agents, onClose }: {
   const remove = useCallback(async (forceAgentIds: readonly string[]): Promise<OthersAgent[] | null> => {
     if (attachedByMe) {
       if (!serverId) throw new Error("No server selected");
-      const result = await revokeComputerKey(serverId, machine.id, forceAgentIds);
+      const result = await revokeKeyAndDeleteComputer(serverId, machine.id, forceAgentIds);
       if (result.kind === "others_agents") return result.agents;
+      if (result.kind === "deleted") {
+        forgetRemovedMachine(machine.id);
+        return null;
+      }
       revoked.current = true;
     }
     try {
@@ -96,7 +109,7 @@ export function DeleteComputerDialog({ machine, agents, onClose }: {
       throw new Error(formatMessage({ id: "machine.othersAgents.revokedNotRemoved" }, { reason: deleteRefusalReason(err) }));
     }
     return null;
-  }, [attachedByMe, deleteMachine, formatMessage, machine.id, serverId]);
+  }, [attachedByMe, deleteMachine, forgetRemovedMachine, formatMessage, machine.id, serverId]);
 
   const finish = useCallback(() => {
     finished.current = true;

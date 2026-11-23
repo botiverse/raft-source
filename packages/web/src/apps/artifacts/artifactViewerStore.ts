@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type { ArtifactCommentId } from "@botiverse/raft-shared";
 import { focusLost } from "../../utils/focusGuard";
 import { watchFocusIntent } from "../../utils/focusRequest";
+import { isHTMLElementNode, viewOf } from "../../utils/ownerDocument";
 
 import type { ArtifactOpenSource } from "./artifactAnalytics";
 import type { ArtifactLinkTarget } from "./artifactLinks";
@@ -283,10 +284,12 @@ export function takeArtifactReturnFocus(): HTMLElement | null {
 
 /** Can focus go there: on screen, not inert, not inside something hidden (a thread that stepped behind its channel)? */
 export function canTakeFocus(element: Element): element is HTMLElement {
-  if (!(element instanceof HTMLElement) || !element.isConnected || element.closest("[inert]")) return false;
+  // An element of any window (an object window's are another realm's, #337 PR3), its styles read in that window.
+  if (!isHTMLElementNode(element) || !element.isConnected || element.closest("[inert]")) return false;
   if (typeof element.checkVisibility === "function") return element.checkVisibility();
+  const view = viewOf(element);
   for (let node: Element | null = element; node; node = node.parentElement) {
-    if (getComputedStyle(node).display === "none") return false;
+    if (view.getComputedStyle(node).display === "none") return false;
   }
   return true;
 }

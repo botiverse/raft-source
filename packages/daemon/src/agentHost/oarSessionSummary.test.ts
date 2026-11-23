@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Frame, RawEvent, RequestRecord, ResponseRecord, RuntimeEventBody } from "@botiverse/oar";
 import { SessionSummaryRecorder, SessionSummaryStore, type SessionSummary } from "./oarSessionSummary";
+import { sessionSummaryResumeFacts } from "../wakeSessionRecycle";
 
 const T0 = Date.parse("2026-11-03T09:00:00Z");
 const WORKSPACE = "/work/agent-1";
@@ -88,6 +89,35 @@ test("a turn's wake, messages, actions, files, context and note reach the file a
       ["shell", [], true],
     ]);
     assert.deepEqual(written.files.map((f) => [f.path, f.last]), [["/work/agent-1/src/x.ts", "read"], ["/work/agent-1/src/y.ts", "edited"]]);
+  });
+});
+
+test("agy's real-Gemini usage_update (1.5.12) is its current context: it grows, holds, and drops at a compaction", () => {
+  withStore((store, dir) => {
+    const r = new Records("s1");
+    const rec = recorder(store, "s1", "antigravity");
+    const read = () => (JSON.parse(readFileSync(path.join(dir, "agent-1.json"), "utf8")) as SessionSummary).context?.tokens ?? null;
+    for (const record of r.prompt("hello")) rec.observe(record);
+    rec.observe(r.frame([{ kind: "usage", usage: { context: { tokens: 401_825, contextWindow: 1_048_576, percent: 38 } } }]));
+    rec.observe(r.frame([{ kind: "usage", usage: { context: { tokens: 521_323, contextWindow: 1_048_576, percent: 50 } } }]));
+    rec.observe(r.turnEnded());
+    assert.equal(read(), 521_323);
+    for (const record of r.prompt("again")) rec.observe(record);
+    rec.observe(r.frame([{ kind: "usage", usage: { context: { tokens: 13_154, contextWindow: 1_048_576, percent: 1 } } }]));
+    rec.observe(r.turnEnded());
+    assert.equal(read(), 13_154, "after agy's compaction the smaller size, not a running total");
+  });
+});
+
+test("a usage report of 0 tokens (agy 1.5.9) records no context size", () => {
+  withStore((store, dir) => {
+    const r = new Records("s1");
+    const rec = recorder(store, "s1", "antigravity");
+    for (const record of r.prompt("hello")) rec.observe(record);
+    rec.observe(r.frame([{ kind: "usage", usage: { context: { tokens: 0, contextWindow: 1_048_576, percent: 0 } } }]));
+    rec.observe(r.turnEnded());
+    const written = JSON.parse(readFileSync(path.join(dir, "agent-1.json"), "utf8")) as SessionSummary;
+    assert.equal(written.context, null);
   });
 });
 
@@ -429,5 +459,58 @@ test("§6.5: notes and todo items are masked as they are written to the summary 
     const read = store.read("agent-1")!;
     assert.deepEqual(read.todos?.items, [{ text: "rotate ***", status: "pending" }]);
     assert.deepEqual(read.notes?.map((note) => note.text), ["Set api_key=*** in the env."]);
+  });
+});
+
+test("OAR 0.123 cacheWriteByTtl records cacheTier on the session summary and surfaces in resume facts", () => {
+  withStore((store) => {
+    const r = new Records("s1");
+    const rec = recorder(store, "s1", "claude");
+    for (const record of r.prompt("go")) rec.observe(record);
+    rec.observe(r.frame([{
+      kind: "usage",
+      usage: {
+        context: { tokens: 120_000, contextWindow: 200_000, percent: 60 },
+        cacheWriteByTtl: { "5m": 4_200 },
+      },
+    }]));
+    rec.observe(r.turnEnded());
+    let read = store.read("agent-1")!;
+    assert.equal(read.cacheTier, "5m");
+    assert.equal(sessionSummaryResumeFacts(read, "s1")?.cacheTier, "5m");
+
+    // When both 5m and 1h are positive in one report, 1h wins (matches cacheTierFromUsage).
+    for (const record of r.prompt("next")) rec.observe(record);
+    rec.observe(r.frame([{
+      kind: "usage",
+      usage: {
+        context: { tokens: 130_000, contextWindow: 200_000, percent: 65 },
+        cacheWriteByTtl: { "5m": 500, "1h": 12_000 },
+      },
+    }]));
+    rec.observe(r.turnEnded());
+    read = store.read("agent-1")!;
+    assert.equal(read.cacheTier, "1h");
+    assert.equal(sessionSummaryResumeFacts(read, "s1")?.cacheTier, "1h");
+
+    // A new session resets cacheTier rather than carrying the prior session's tier.
+    const rec2 = recorder(store, "s2", "claude");
+    assert.equal(rec2.current().cacheTier, null);
+  });
+});
+
+test("the summary records OAR's contextUsage declaration for the session's installation; the next open's installation replaces it", () => {
+  withStore((store) => {
+    const r = new Records("s1");
+    const declared = new SessionSummaryRecorder(store, "agent-1", "grok", "s1", WORKSPACE, () => T0, { tokens: true, contextWindow: false });
+    for (const record of r.prompt("go")) declared.observe(record);
+    declared.observe(r.turnEnded());
+    assert.deepEqual(store.read("agent-1")?.contextUsage, { tokens: true, contextWindow: false }, "written and read back");
+
+    // The same session reopened on an installation with no declaration: unknown, not the earlier answer.
+    const unknown = new SessionSummaryRecorder(store, "agent-1", "grok", "s1", WORKSPACE, () => T0);
+    assert.equal(unknown.current().contextUsage, undefined);
+    // A new session on a declaring installation.
+    assert.deepEqual(new SessionSummaryRecorder(store, "agent-1", "grok", "s2", WORKSPACE, () => T0, { tokens: true, contextWindow: true }).current().contextUsage, { tokens: true, contextWindow: true });
   });
 });

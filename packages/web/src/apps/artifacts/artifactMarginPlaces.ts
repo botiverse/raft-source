@@ -334,6 +334,37 @@ export function unplacedPollAfterAsk(gap: number): { gap: number; skips: number 
 /** Whether a mark is the refresh mark (it is no comment's). */
 export const isRefreshMark = (id: string) => id.startsWith("margin-refresh-");
 
+/** The room an open card keeps above and below it inside the margin, px. */
+export const MARGIN_FOOT_PX = 8;
+
+/**
+ * The CSS variable on the margin's column that holds `openCardRoom` (px), which the open thread's
+ * card takes as its greatest height (ThreadInBubble's `max-h-(--artifact-margin-card-room)`).
+ */
+export const MARGIN_CARD_ROOM_VAR = "--artifact-margin-card-room";
+
+/**
+ * The tallest an open thread's card may be in a margin `columnHeight` px tall (#triage:#531): the
+ * column less MARGIN_FOOT_PX at its top and foot, so a long thread, lifted (`openCardLift`), is whole
+ * in view and scrolls inside (its comments in a ScrollArea, the reply box under them). Null while
+ * the column has no height (not laid out, jsdom): no bound then.
+ */
+export function openCardRoom(columnHeight: number): number | null {
+  const room = columnHeight - 2 * MARGIN_FOOT_PX;
+  return room > 0 ? room : null;
+}
+
+/**
+ * How far the margin's column moves up so an open card past its foot is whole (`card` and `column`,
+ * their boxes unlifted, client px): enough for the card's foot to keep MARGIN_FOOT_PX above the
+ * column's, never the card's top above MARGIN_FOOT_PX below the column's. A card no taller than
+ * `openCardRoom` always fits; 0 when it fits where it is.
+ */
+export function openCardLift(card: { top: number; bottom: number }, column: { top: number; bottom: number }): number {
+  const over = card.bottom + MARGIN_FOOT_PX - column.bottom;
+  return over > 0 ? Math.max(0, Math.min(over, card.top - column.top - MARGIN_FOOT_PX)) : 0;
+}
+
 /** Which refresh a refresh mark's id says it is (`refreshMark`); null for any other mark. */
 export function refreshOf(id: string): number | null {
   const n = /^margin-refresh-(\d+)$/.exec(id)?.[1];

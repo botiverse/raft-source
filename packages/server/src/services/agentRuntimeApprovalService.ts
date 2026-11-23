@@ -353,9 +353,11 @@ async function hostedAgent(target: AgentRuntimeProviderTarget, raftAgentId: stri
   return row ?? null;
 }
 
+/** A live person's role: a deleted account's kept membership decides nothing (null). */
 async function memberRole(serverId: string, userId: string): Promise<"owner" | "admin" | "member" | "guest" | null> {
   const [row] = await getDb().select({ role: serverMembers.role }).from(serverMembers)
-    .where(and(eq(serverMembers.serverId, serverId), eq(serverMembers.userId, userId))).limit(1);
+    .innerJoin(users, eq(users.id, serverMembers.userId))
+    .where(and(eq(serverMembers.serverId, serverId), eq(serverMembers.userId, userId), isNull(users.retiredAt))).limit(1);
   return row?.role ?? null;
 }
 
@@ -374,7 +376,8 @@ async function approvalDeciders(agent: HostedAgent): Promise<{ decider: AgentApp
   const ownerId = await presentOwnerId(agent);
   if (ownerId) return { decider: "owner", userIds: [ownerId] };
   const admins = await getDb().select({ userId: serverMembers.userId }).from(serverMembers)
-    .where(and(eq(serverMembers.serverId, agent.serverId), inArray(serverMembers.role, ["owner", "admin"])))
+    .innerJoin(users, eq(users.id, serverMembers.userId))
+    .where(and(eq(serverMembers.serverId, agent.serverId), inArray(serverMembers.role, ["owner", "admin"]), isNull(users.retiredAt)))
     .orderBy(sql`case when ${serverMembers.role} = 'owner' then 0 else 1 end`, asc(serverMembers.userId))
     .limit(MAX_ADMIN_DECIDERS);
   return { decider: "server_admin", userIds: admins.map((row) => row.userId) };

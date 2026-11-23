@@ -7,6 +7,7 @@ import {
 } from "../services/linkCardActionService";
 import type { LinkCardMessageReader } from "../services/linkCardLiveState";
 import { linkCardReceiptHints, type LinkCardReceiptHints } from "../services/linkCardReceiptHints";
+import { LINK_CARD_CHANGED_MAX_BODY_BYTES, linkCardChangedHints, type LinkCardChangedHints } from "../services/linkCardChangedHints";
 import {
   LINK_CARD_STATUS_MAX_BODY_BYTES, lookupLinkCardOperations, parseLinkCardOperationsQuery, parseLinkCardStatusBody, readLinkCardOperationStatus,
 } from "../services/linkCardReceiptService";
@@ -22,13 +23,15 @@ import { readCardActionMessage } from "./messages";
 // never the handle's. Guests take part on the existing terms: they may act
 // only on a message they can still read (the same check as the preview GET).
 // Every answer is private and never cached. The App's terminal update,
-// `POST /api/oauth/link-preview/card-updates`, lives with the App's other
-// link-preview routes (routes/oauth.ts); its body parser is here.
+// `POST /api/oauth/link-preview/card-updates`, and its "these objects changed",
+// `POST /api/oauth/link-preview/changed`, live with the App's other
+// link-preview routes (routes/oauth.ts); their body parsers are here.
 
 export const LINK_CARD_PREPARE_PATH = "/api/link-cards/prepare";
 export const LINK_CARD_EXECUTE_PATH = "/api/link-cards/execute";
 export const LINK_CARD_STATUS_PATH = "/api/link-cards/status";
 export const LINK_CARD_UPDATES_PATH = "/api/oauth/link-preview/card-updates";
+export const LINK_CARD_CHANGED_PATH = "/api/oauth/link-preview/changed";
 // Bodies are refused above their bound before they are parsed (Tenny); these
 // parsers are registered in app.ts ahead of the global one, which then skips
 // the parsed body.
@@ -41,6 +44,8 @@ export const linkCardStatusBodyParser: RequestHandler = express.json({ limit: LI
  * (linkCardUpdateService.ts); a body over the bound is refused unread.
  */
 export const linkCardUpdatesBodyParser: RequestHandler = express.raw({ type: () => true, limit: LINK_CARD_UPDATE_MAX_BODY_BYTES });
+/** The App's changed objects, kept as raw bytes the same way (linkCardChangedHints.ts). */
+export const linkCardChangedBodyParser: RequestHandler = express.raw({ type: () => true, limit: LINK_CARD_CHANGED_MAX_BODY_BYTES });
 export const linkCardBodyErrorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
   res.setHeader("Cache-Control", "private, no-store");
   const tooLarge = (err as { type?: unknown }).type === "entity.too.large";
@@ -71,6 +76,8 @@ const messageReader = (req: Request): LinkCardMessageReader => async (messageId)
 
 /** Receipt hints through this app's Socket.IO server (RFC 076 §6.8). */
 export const requestLinkCardHints = (req: Request): LinkCardReceiptHints => linkCardReceiptHints(req.app.get("io") as SocketServer | undefined);
+/** `link_card.changed` nudges through this app's Socket.IO server. */
+export const requestLinkCardChangedHints = (req: Request): LinkCardChangedHints => linkCardChangedHints(req.app.get("io") as SocketServer | undefined);
 
 export const linkCardRouter: RouterType = Router();
 

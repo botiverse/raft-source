@@ -28,14 +28,22 @@ import {
   type AgentAppEvent,
   validateServerSlugReferenceReason,
   type AgentInstalledAppCatalogEntry,
+  type AppAgentAccess,
   marketplaceInstallBucket,
   type MarketplaceInstallBadge,
   APP_NAME_RESERVED_CODE,
   appNameReservedMessage,
   reservedAppNameBrand,
+  AGENT_TOKEN_SIGNING_ALGS,
+  isAgentTokenSigningAlg,
+  type AgentTokenSigningAlg,
+  AGENT_TOKEN_TYPES,
+  isAgentTokenType,
+  type AgentTokenType,
 } from "@botiverse/raft-shared";
 import { appNoticeKinds, firstPartyAppOfSystemApp } from "../apps/firstPartyApps";
 import { getDb, type DatabaseExecutor, type DatabaseTransaction } from "../db/index";
+import { findAgentOwner } from "./computerAgents";
 import {
   agents,
   appBotBindings,
@@ -548,6 +556,17 @@ const OAUTH_CLIENT_PUBLIC_COLUMNS = {
   promptTextPendingRevisionId: oauthClients.textPendingRevisionId,
 };
 
+/**
+ * What the App's own Server reads and edits beyond the public columns: the
+ * editor rows (GET /api/integrations/clients and the PATCH answer) and the
+ * update paths' audit diff. Not in marketplace or installer-facing reads.
+ */
+const OAUTH_CLIENT_OWNER_COLUMNS = {
+  ...OAUTH_CLIENT_PUBLIC_COLUMNS,
+  agentTokenSigningAlg: oauthClients.agentTokenSigningAlg,
+  agentTokenType: oauthClients.agentTokenType,
+};
+
 const OAUTH_CLIENT_REVIEW_REQUEST_COLUMNS = {
   ...OAUTH_CLIENT_PUBLIC_COLUMNS,
   publishRequestedAt: oauthClients.publishRequestedAt,
@@ -759,7 +778,7 @@ export function accessTokenHasScope(token: { scopes: string[] | null | undefined
 export class ThirdPartyAgentEventValidationError extends Error {
   override readonly name = "ThirdPartyAgentEventValidationError";
 
-  constructor(readonly field: "kind" | "summary" | "externalEventId" | "payload" | "ttlSeconds" | "object" | "object.ref" | "object.conversation", message: string) {
+  constructor(readonly field: "kind" | "summary" | "externalEventId" | "payload" | "ttlSeconds" | "object" | "object.ref" | "object.conversation" | "delivery", message: string) {
     super(message);
   }
 }
@@ -767,6 +786,19 @@ export class ThirdPartyAgentEventValidationError extends Error {
 function normalizeThirdPartyEventKind(value: unknown): Exclude<ThirdPartyAgentEventKind, "action_request"> {
   if (value === "event" || value === "notification") return value;
   throw new ThirdPartyAgentEventValidationError("kind", "event kind must be event or notification");
+}
+
+export type ThirdPartyAgentEventDelivery = "wake" | "inbox";
+
+/**
+ * `delivery` on POST /api/oauth/agent-events (dm:@Remy:#1): `wake` (the
+ * default) pushes the event to the agent; `inbox` only adds it to its inbox
+ * item. Absent or null is `wake`; anything else is refused.
+ */
+export function normalizeThirdPartyEventDelivery(value: unknown): ThirdPartyAgentEventDelivery {
+  if (value === undefined || value === null || value === "wake") return "wake";
+  if (value === "inbox") return "inbox";
+  throw new ThirdPartyAgentEventValidationError("delivery", "delivery must be wake or inbox");
 }
 
 function normalizeThirdPartyEventSummary(value: unknown): string {
@@ -1116,44 +1148,124 @@ function canAutoGrantAgentClient(appType: OAuthClientAppType, installed: boolean
 
 /**
  * Whether an app gets a grant for this agent with no person involved. Only
- * when whoever stands behind the app already has authority over the agent:
- * an installed published app (installing needs an owner/admin), or a
- * server-local app created by a server owner/admin or by the agent's own
- * creator, or when the agent itself asked. Never after a person revoked this
- * app's grant for this agent.
+ * when a person with authority over the agent already said so: an installed
+ * published app (installing needs an owner/admin), a server-local app its
+ * Server vouched for (`server_vouched_at`, set by an owner or admin) or
+ * created by the agent's own creator, or when the agent itself asked. Never
+ * after a person revoked this app's grant for this agent. The app creator's
+ * current role is not read: a vouch outlives their leaving or demotion.
  *
  * An installed third-party app is covered only for the scopes its installer
  * approved: a scope the developer added later waits for a person, whoever
  * asked (task #2, #proj-apps).
  */
+type AutoGrantClient = {
+  id: string;
+  appType: OAuthClientAppType;
+  createdByUserId: string;
+  installed: boolean;
+  approvedScopes: string[] | null;
+  /** `server_vouched_at` is set; read only for a server_local app. */
+  serverVouched: boolean;
+};
+
+/** mayAutoGrantAgentClient's rule over facts already read (`blocked`: null when not read yet). */
+function autoGrantAgentClientRule(
+  client: AutoGrantClient,
+  agent: { creatorType: string | null; creatorId: string | null },
+  facts: { blocked: boolean | null; initiatedByAgent: boolean; requestedScopes: string[] },
+): boolean | "read_block" {
+  if (!canAutoGrantAgentClient(client.appType, client.installed)) return false;
+  if (client.appType === "third_party_global" && !scopesCover(client.approvedScopes ?? [], facts.requestedScopes)) {
+    return false;
+  }
+  if (facts.blocked === null) return "read_block";
+  if (facts.blocked) return false;
+  if (facts.initiatedByAgent || client.appType === "third_party_global") return true;
+  if (agent.creatorType === "user" && agent.creatorId === client.createdByUserId) return true;
+  return client.serverVouched;
+}
+
 async function mayAutoGrantAgentClient(
   executor: DatabaseExecutor,
-  client: {
-    id: string;
-    appType: OAuthClientAppType;
-    createdByUserId: string;
-    installed: boolean;
-    approvedScopes: string[] | null;
-  },
+  client: AutoGrantClient,
   agent: { agentId: string; serverId: string; creatorType: string | null; creatorId: string | null },
   initiatedByAgent: boolean,
   requestedScopes: string[],
 ): Promise<boolean> {
-  if (!canAutoGrantAgentClient(client.appType, client.installed)) return false;
-  if (client.appType === "third_party_global" && !scopesCover(client.approvedScopes ?? [], requestedScopes)) {
-    return false;
+  const facts = { initiatedByAgent, requestedScopes };
+  let rule = autoGrantAgentClientRule(client, agent, { ...facts, blocked: null });
+  if (rule === "read_block") {
+    const [blocked] = await executor.select({ agentId: oauthAgentAutoGrantBlocks.agentId })
+      .from(oauthAgentAutoGrantBlocks)
+      .where(and(
+        eq(oauthAgentAutoGrantBlocks.agentId, agent.agentId),
+        eq(oauthAgentAutoGrantBlocks.clientId, client.id),
+      ))
+      .limit(1);
+    rule = autoGrantAgentClientRule(client, agent, { ...facts, blocked: blocked !== undefined });
   }
-  const [blocked] = await executor.select({ agentId: oauthAgentAutoGrantBlocks.agentId })
-    .from(oauthAgentAutoGrantBlocks)
-    .where(and(
-      eq(oauthAgentAutoGrantBlocks.agentId, agent.agentId),
-      eq(oauthAgentAutoGrantBlocks.clientId, client.id),
-    ))
-    .limit(1);
-  if (blocked) return false;
-  if (initiatedByAgent || client.appType === "third_party_global") return true;
-  if (agent.creatorType === "user" && agent.creatorId === client.createdByUserId) return true;
-  return actorHasServerCapabilityInServer(agent.serverId, "user", client.createdByUserId, "manageExternalAuth", executor);
+  return rule === true;
+}
+
+/**
+ * Which of this Server's listed agents can use each App, oldest agent first: an active grant, or
+ * the automatic grant mayAutoGrantAgentClient would make on a request no agent made itself, for
+ * the scopes the installation approved (a pending scope update alone excepts no one). An App
+ * offered here as requestAgentAccess finds it: this Server's server_local App, or an installed
+ * third-party App. A person's revoke leaves an auto-grant block, so that agent is excepted.
+ * Four reads for all the Apps together.
+ */
+export async function oauthAppAgentAccess(serverId: string, clientIds: string[]): Promise<Map<string, AppAgentAccess>> {
+  const access = new Map<string, AppAgentAccess>();
+  if (clientIds.length === 0) return access;
+  const db = getDbForService();
+  const [clients, serverAgents, grants, blocks] = await Promise.all([
+    db.select({
+      id: oauthClients.id,
+      serverId: oauthClients.serverId,
+      appType: oauthClients.appType,
+      enabled: oauthClients.enabled,
+      createdByUserId: oauthClients.createdByUserId,
+      serverVouchedAt: oauthClients.serverVouchedAt,
+      installStatus: oauthClientInstalls.status,
+    }).from(oauthClients)
+      .leftJoin(oauthClientInstalls, and(eq(oauthClientInstalls.clientId, oauthClients.id), eq(oauthClientInstalls.serverId, serverId)))
+      .where(inArray(oauthClients.id, clientIds)),
+    db.select({ id: agents.id, creatorType: agents.creatorType, creatorId: agents.creatorId })
+      .from(agents)
+      .where(and(eq(agents.serverId, serverId), isNull(agents.deletedAt), listedServerAgent()))
+      .orderBy(asc(agents.createdAt), asc(agents.id)),
+    db.select({ agentId: oauthGrants.agentId, clientId: oauthGrants.clientId })
+      .from(oauthGrants)
+      .where(and(eq(oauthGrants.serverId, serverId), inArray(oauthGrants.clientId, clientIds), isNull(oauthGrants.revokedAt))),
+    db.select({ agentId: oauthAgentAutoGrantBlocks.agentId, clientId: oauthAgentAutoGrantBlocks.clientId })
+      .from(oauthAgentAutoGrantBlocks)
+      .innerJoin(agents, eq(agents.id, oauthAgentAutoGrantBlocks.agentId))
+      .where(and(eq(agents.serverId, serverId), inArray(oauthAgentAutoGrantBlocks.clientId, clientIds))),
+  ]);
+  const pair = (agentId: string, clientId: string) => `${agentId}:${clientId}`;
+  const granted = new Set(grants.map((row) => pair(row.agentId, row.clientId)));
+  const blocked = new Set(blocks.map((row) => pair(row.agentId, row.clientId)));
+  for (const client of clients) {
+    const installed = client.appType === "third_party_global" && client.enabled && client.installStatus === "active";
+    const offered = installed || (client.appType === "server_local" && client.serverId === serverId);
+    // The installation's approved scopes, requested: they always cover themselves.
+    const rule: AutoGrantClient = { ...client, installed, approvedScopes: [], serverVouched: client.serverVouchedAt !== null };
+    const agentIds: string[] = [];
+    const exceptAgentIds: string[] = [];
+    for (const agent of serverAgents) {
+      let canUse = granted.has(pair(agent.id, client.id));
+      if (!canUse && offered) {
+        canUse = autoGrantAgentClientRule(rule, agent, {
+          blocked: blocked.has(pair(agent.id, client.id)), initiatedByAgent: false, requestedScopes: [],
+        }) === true;
+      }
+      (canUse ? agentIds : exceptAgentIds).push(agent.id);
+    }
+    access.set(client.id, { allAgents: exceptAgentIds.length === 0, agentIds, exceptAgentIds });
+  }
+  return access;
 }
 
 /** A person granted this app access to this agent again: automatic grants may resume. */
@@ -1354,6 +1466,58 @@ export function normalizeWhenToUse(raw: string | null | undefined): string | nul
   return value;
 }
 
+/**
+ * The App's agent token signing algorithm as written by its owner/admin:
+ * exactly "ES256" or "RS256"; anything else (null included) is refused.
+ */
+export function normalizeAgentTokenSigningAlg(raw: unknown): AgentTokenSigningAlg {
+  if (!isAgentTokenSigningAlg(raw)) {
+    throw new Error(`agentTokenSigningAlg must be one of ${AGENT_TOKEN_SIGNING_ALGS.join(", ")}`);
+  }
+  return raw;
+}
+
+/**
+ * The App's agent token `typ` header as written by its owner/admin: exactly
+ * "at+jwt" or "JWT" ("jwt", "at+JWT", "none" and null are refused).
+ */
+export function normalizeAgentTokenType(raw: unknown): AgentTokenType {
+  if (!isAgentTokenType(raw)) {
+    throw new Error(`agentTokenType must be exactly one of ${AGENT_TOKEN_TYPES.join(", ")}`);
+  }
+  return raw;
+}
+
+/** Setting agent token type JWT on an App that has a redirect URL. */
+export const AGENT_TOKEN_TYPE_JWT_WITH_REDIRECT_REFUSAL = {
+  code: "AGENT_TOKEN_TYPE_REDIRECT_CONFLICT",
+  error: "Agent token type JWT is only for an App without a redirect URL, and this App has one: people can sign in to it, and at+jwt is what keeps its agent tokens from passing for ID tokens. Clear the redirect URL in the same update, or keep at+jwt.",
+} as const;
+
+/** Giving a redirect URL to an App whose agent token type is JWT. */
+export const AGENT_TOKEN_TYPE_REDIRECT_ON_JWT_APP_REFUSAL = {
+  code: "AGENT_TOKEN_TYPE_REDIRECT_CONFLICT",
+  error: "This App's agent token type is JWT, so it can't have a redirect URL: a redirect URL lets people sign in to it, and at+jwt is what keeps its agent tokens from passing for ID tokens. Set the agent token type back to at+jwt in the same update, or leave the redirect URL empty.",
+} as const;
+
+/**
+ * Tenny's rule for agent token type JWT: only on an App nobody can sign in to,
+ * i.e. without a redirect URL. Checked on the App's state after the write, in
+ * the write's transaction and under its row lock (the update paths select the
+ * row FOR UPDATE), so two concurrent updates cannot end at JWT plus a redirect
+ * URL; the CHECK oauth_clients_agent_token_type_token_only holds it again. The
+ * refusal names the side this write changed.
+ */
+function assertAgentTokenTypeTokenOnly(
+  after: { agentTokenType: AgentTokenType; returnUrl: string | null },
+  changedAgentTokenType: boolean,
+): void {
+  if (after.agentTokenType !== "JWT" || !after.returnUrl) return;
+  throw new RefusalError(409, changedAgentTokenType
+    ? AGENT_TOKEN_TYPE_JWT_WITH_REDIRECT_REFUSAL
+    : AGENT_TOKEN_TYPE_REDIRECT_ON_JWT_APP_REFUSAL);
+}
+
 function hasMarketplaceListingDescription(value: string | null | undefined): boolean {
   return typeof value === "string" && value.trim().length > 0;
 }
@@ -1363,8 +1527,8 @@ function auditBoolean(value: unknown): boolean {
 }
 
 function auditClientDiff(
-  before: Partial<OAuthClientRecord>,
-  after: Partial<OAuthClientRecord>,
+  before: Partial<OAuthClientRecord> & { agentTokenSigningAlg?: AgentTokenSigningAlg; agentTokenType?: AgentTokenType },
+  after: Partial<OAuthClientRecord> & { agentTokenSigningAlg?: AgentTokenSigningAlg; agentTokenType?: AgentTokenType },
 ) {
   const diff: Record<string, { before: unknown; after: unknown }> = {};
   for (const key of ["name", "description", "whenToUse", "homepageUrl", "returnUrl", "agentManifestUrl", "allowedScopes", "category", "logoUrl"] as const) {
@@ -1375,6 +1539,12 @@ function auditClientDiff(
   if (before.setupUrl !== after.setupUrl) diff.setupUrl = { before: Boolean(before.setupUrl), after: Boolean(after.setupUrl) };
   if (before.setupDescription !== after.setupDescription) diff.setupDescription = { before: Boolean(before.setupDescription), after: Boolean(after.setupDescription) };
   if (before.setupRevision !== after.setupRevision) diff.setupRevision = { before: before.setupRevision, after: after.setupRevision };
+  if (before.agentTokenSigningAlg !== after.agentTokenSigningAlg) {
+    diff.agentTokenSigningAlg = { before: before.agentTokenSigningAlg ?? null, after: after.agentTokenSigningAlg ?? null };
+  }
+  if (before.agentTokenType !== after.agentTokenType) {
+    diff.agentTokenType = { before: before.agentTokenType ?? null, after: after.agentTokenType ?? null };
+  }
   return diff;
 }
 
@@ -1441,6 +1611,17 @@ export async function createOAuthClient(input: {
   allowedScopes?: unknown;
   category?: unknown;
   enableBot?: boolean;
+  /** How Raft signs the App's agent tokens; ES256 when omitted. */
+  agentTokenSigningAlg?: unknown;
+  /** The `typ` header of the App's agent tokens; at+jwt when omitted, JWT only without a returnUrl. */
+  agentTokenType?: unknown;
+  /**
+   * The creator is a person in their own web session (POST /api/integrations/clients): a
+   * server_local App is vouched for (`server_vouched_at`) when they hold manageExternalAuth on
+   * its Server now. Never for an App an agent registers (a confirmed card): vouching is a
+   * person's own act.
+   */
+  vouchAsCreator?: boolean;
 }, dbOrTx: ReturnType<typeof getDb> = getDbForService()) {
   const db = dbOrTx;
   const trimmedName = input.name.trim();
@@ -1458,10 +1639,16 @@ export async function createOAuthClient(input: {
   const allowedScopes = normalizeAllowedScopes(input.allowedScopes);
   const setupUrl = normalizeAppSetupUrl(input.setupUrl);
   const setupDescription = normalizeAppSetupDescription(input.setupDescription);
+  const agentTokenSigningAlg = input.agentTokenSigningAlg === undefined ? undefined : normalizeAgentTokenSigningAlg(input.agentTokenSigningAlg);
+  const agentTokenType = input.agentTokenType === undefined ? undefined : normalizeAgentTokenType(input.agentTokenType);
+  const returnUrl = normalizeReturnUrl(input.returnUrl);
+  if (agentTokenType) assertAgentTokenTypeTokenOnly({ agentTokenType, returnUrl }, true);
   createOAuthClientObserverForService?.();
 
   return db.transaction(async (tx) => {
     await claimOAuthClientKey(tx, { key: normalizedClientId, serverId: input.serverId });
+    const vouched = appType === "server_local" && input.vouchAsCreator === true
+      && await actorHasServerCapabilityInServer(input.serverId, "user", input.createdByUserId, "manageExternalAuth", tx);
     const [created] = await tx.insert(oauthClients).values({
       serverId: input.serverId,
       clientId: normalizedClientId,
@@ -1473,7 +1660,7 @@ export async function createOAuthClient(input: {
       description: input.description?.trim() || null,
       whenToUse: normalizeWhenToUse(input.whenToUse),
       homepageUrl: input.homepageUrl?.trim() || null,
-      returnUrl: normalizeReturnUrl(input.returnUrl),
+      returnUrl,
       agentManifestUrl: normalizeAgentManifestUrl(input.agentManifestUrl),
       setupUrl,
       setupDescription: setupUrl ? setupDescription : null,
@@ -1482,7 +1669,10 @@ export async function createOAuthClient(input: {
       logoUrl: null,
       createdByUserId: input.createdByUserId,
       enableBot: Boolean(input.enableBot),
-    }).returning(OAUTH_CLIENT_PUBLIC_COLUMNS);
+      ...(agentTokenSigningAlg ? { agentTokenSigningAlg } : {}),
+      ...(agentTokenType ? { agentTokenType } : {}),
+      ...(vouched ? { serverVouchedAt: sql`now()`, serverVouchedByUserId: input.createdByUserId } : {}),
+    }).returning(OAUTH_CLIENT_OWNER_COLUMNS);
     // Revision 1 of the prompt text (task #4), confirmed by the creating
     // Server: its admin wrote it.
     const { revisionId } = await ensureCurrentTextRevision(tx, created.id);
@@ -1506,6 +1696,7 @@ export async function createOAuthClient(input: {
         hasAgentManifestUrl: auditBoolean(created.agentManifestUrl),
       },
     }, tx);
+    if (vouched) await recordServerVouchEvent(tx, created, { type: "human", id: input.createdByUserId }, true, "created_by_admin");
 
     return {
       client: created,
@@ -1917,6 +2108,29 @@ async function approveSourceInstallationScopesForAdmin(
   return installation.id;
 }
 
+/**
+ * A vouched server_local App is granted to every agent of its Server for any of its allowed
+ * scopes, with no installation approval in between. An agent widening them (admin agent or
+ * owner maintainer) is not a person's review, so the vouch ends (`scope_widened`); a narrowing
+ * keeps it. A person's own save (PATCH /api/integrations/clients/:id, manageIntegrations: the
+ * same owners and admins as manageExternalAuth) keeps it.
+ */
+async function lapseServerVouchOnAgentWidening(
+  tx: DatabaseExecutor,
+  before: Pick<OAuthClientRecord, "allowedScopes">,
+  updated: Pick<OAuthClientRecord, "id" | "serverId" | "clientId" | "appType" | "allowedScopes">,
+  actorAgentId: string,
+) {
+  if (updated.appType !== "server_local") return;
+  const previous = new Set(effectiveAllowedOAuthScopes(before.allowedScopes));
+  if (effectiveAllowedOAuthScopes(updated.allowedScopes).every((scope) => previous.has(scope))) return;
+  const [lapsed] = await tx.update(oauthClients)
+    .set({ serverVouchedAt: null, serverVouchedByUserId: null })
+    .where(and(eq(oauthClients.id, updated.id), isNotNull(oauthClients.serverVouchedAt)))
+    .returning({ id: oauthClients.id });
+  if (lapsed) await recordServerVouchEvent(tx, updated, { type: "agent", id: actorAgentId }, false, "scope_widened");
+}
+
 export async function updateOAuthClientForAgent(input: {
   serverId: string;
   clientKey: string;
@@ -1931,16 +2145,21 @@ export async function updateOAuthClientForAgent(input: {
   setupUrl?: string | null;
   setupDescription?: string | null;
   allowedScopes?: unknown;
+  /** How Raft signs the App's agent tokens: ES256 or RS256. */
+  agentTokenSigningAlg?: unknown;
+  /** The `typ` header of the App's agent tokens: at+jwt, or JWT on an App without a returnUrl. */
+  agentTokenType?: unknown;
   /** A new client id, for an unpublished App (RFC 084); the App is named by `clientKey`. */
   newClientKey?: string;
-}): Promise<AgentAppMutationResult<OAuthClientRecord> | { status: "invalid_return_url" }> {
-  if (input.returnUrl !== undefined && (!input.returnUrl || !isSafeOAuthReturnUrl(input.returnUrl))) {
+}): Promise<AgentAppMutationResult<OAuthClientRecord & { agentTokenSigningAlg: AgentTokenSigningAlg; agentTokenType: AgentTokenType }> | { status: "invalid_return_url" }> {
+  // null or "" clears the redirect URL (a token-only App); anything else must be a safe URL.
+  if (input.returnUrl !== undefined && input.returnUrl !== null && input.returnUrl.trim() && !isSafeOAuthReturnUrl(input.returnUrl.trim())) {
     return { status: "invalid_return_url" };
   }
   const db = getDbForService();
   return db.transaction(async (tx) => {
     const [before] = await tx
-      .select(OAUTH_CLIENT_PUBLIC_COLUMNS)
+      .select(OAUTH_CLIENT_OWNER_COLUMNS)
       .from(oauthClients)
       .where(and(
         eq(oauthClients.serverId, input.serverId),
@@ -1977,6 +2196,13 @@ export async function updateOAuthClientForAgent(input: {
     if (input.agentManifestUrl !== undefined) updates.agentManifestUrl = normalizeAgentManifestUrl(input.agentManifestUrl);
     applyAppSetupUpdate(before, input, updates);
     if (input.allowedScopes !== undefined) updates.allowedScopes = normalizeAllowedScopes(input.allowedScopes);
+    if (input.agentTokenSigningAlg !== undefined) updates.agentTokenSigningAlg = normalizeAgentTokenSigningAlg(input.agentTokenSigningAlg);
+    if (input.agentTokenType !== undefined) updates.agentTokenType = normalizeAgentTokenType(input.agentTokenType);
+    // Under the row lock taken above.
+    assertAgentTokenTypeTokenOnly({
+      agentTokenType: updates.agentTokenType ?? before.agentTokenType,
+      returnUrl: updates.returnUrl !== undefined ? updates.returnUrl : before.returnUrl,
+    }, input.agentTokenType !== undefined);
     // First, so the update below writes on top of the new id. Authority is the check above.
     if (input.newClientKey !== undefined) {
       await renameOAuthClientKey(tx, { clientId: before.id, newKey: input.newClientKey, actor: { type: "agent", id: input.actorAgentId } });
@@ -1993,13 +2219,14 @@ export async function updateOAuthClientForAgent(input: {
       .update(oauthClients)
       .set({ ...updates, updatedAt: sql`now()` })
       .where(eq(oauthClients.id, before.id))
-      .returning(OAUTH_CLIENT_PUBLIC_COLUMNS);
+      .returning(OAUTH_CLIENT_OWNER_COLUMNS);
     if (!updated) return { status: "not_found" };
     // An agent's scope edit never approves itself for this Server's own
     // installation: it stays pending for an admin's Approve update.
     if (input.allowedScopes !== undefined) {
       await approveSourceInstallationScopesForAdmin(tx, { client: updated, actor: { type: "agent", id: input.actorAgentId } });
       await announcePermissionUpdatesForApp(tx, updated.id);
+      await lapseServerVouchOnAgentWidening(tx, before, updated, input.actorAgentId);
     }
 
     const diff = auditClientDiff(before, updated);
@@ -2074,6 +2301,79 @@ export async function regenerateClientSecretForUser(input: {
   });
 }
 
+/** This Server's own App rows: whether its Server vouched for it (server_local only; false and null otherwise). */
+function withServerVouch<T extends { appType: OAuthClientAppType; serverVouchedAt: Date | null }>(row: T) {
+  const local = row.appType === "server_local";
+  return { ...row, serverVouched: local && row.serverVouchedAt !== null, serverVouchedAt: local ? row.serverVouchedAt : null };
+}
+
+type ServerVouchReason = "created_by_admin" | "vouched" | "unvouched" | "scope_widened";
+
+/** `app.server_vouched` / `app.server_unvouched`, in the caller's transaction. */
+async function recordServerVouchEvent(
+  tx: DatabaseExecutor,
+  client: Pick<OAuthClientRecord, "id" | "serverId" | "clientId">,
+  actor: IntegrationMutationActor,
+  vouched: boolean,
+  reason: ServerVouchReason,
+) {
+  await integrationAuditService.recordIntegrationAuditEvent({
+    serverId: client.serverId,
+    clientId: client.id,
+    eventType: vouched ? "app.server_vouched" : "app.server_unvouched",
+    outcome: "success",
+    source: actor.type === "human" ? "web" : "api",
+    actor,
+    subject: { type: "app", id: client.id },
+    target: { type: "app", id: client.id },
+    metadata: { clientKey: client.clientId, reason },
+  }, tx);
+}
+
+export type ServerVouchResult =
+  | { status: "ok"; changed: boolean }
+  | { status: "not_found" }
+  | { status: "not_server_local" };
+
+/**
+ * Vouch for this Server's own server_local App, or end the vouch
+ * (PUT /api/integrations/clients/:id/server-vouch; the route checks the person's manageExternalAuth).
+ * Idempotent: no write and no audit when nothing changes. Ending it stops future automatic
+ * grants only: grants already made stay, as they did when the App's creator was demoted under
+ * the old rule; a person revokes them one by one.
+ */
+export async function setOAuthClientServerVouch(input: {
+  serverId: string;
+  clientId: string;
+  actorUserId: string;
+  vouched: boolean;
+}): Promise<ServerVouchResult> {
+  return getDbForService().transaction(async (tx) => {
+    const [client] = await tx.select({
+      id: oauthClients.id,
+      serverId: oauthClients.serverId,
+      clientId: oauthClients.clientId,
+      appType: oauthClients.appType,
+      serverVouchedAt: oauthClients.serverVouchedAt,
+    }).from(oauthClients)
+      .where(and(eq(oauthClients.id, input.clientId), eq(oauthClients.serverId, input.serverId), oauthClientIsUserManagedPredicate()))
+      .limit(1)
+      .for("update");
+    if (!client) return { status: "not_found" };
+    if (client.appType !== "server_local") return { status: "not_server_local" };
+    if ((client.serverVouchedAt !== null) === input.vouched) return { status: "ok", changed: false };
+    await tx.update(oauthClients)
+      .set({
+        serverVouchedAt: input.vouched ? sql`now()` : null,
+        serverVouchedByUserId: input.vouched ? input.actorUserId : null,
+        updatedAt: sql`now()`,
+      })
+      .where(eq(oauthClients.id, client.id));
+    await recordServerVouchEvent(tx, client, { type: "human", id: input.actorUserId }, input.vouched, input.vouched ? "vouched" : "unvouched");
+    return { status: "ok", changed: true };
+  });
+}
+
 export async function listOAuthClients(serverId: string) {
   const db = getDbForService();
   return db.select(OAUTH_CLIENT_PUBLIC_COLUMNS).from(oauthClients).where(and(
@@ -2102,7 +2402,8 @@ export async function listOAuthClients(serverId: string) {
 export async function getOAuthClientWithInstallState(serverId: string, clientId: string) {
   const db = getDbForService();
   const rows = await db.select({
-    ...OAUTH_CLIENT_PUBLIC_COLUMNS,
+    ...OAUTH_CLIENT_OWNER_COLUMNS,
+    serverVouchedAt: oauthClients.serverVouchedAt,
     installationId: oauthClientInstalls.id,
     installStatus: oauthClientInstalls.status,
     botGrant: oauthClientInstalls.botGrant,
@@ -2116,14 +2417,15 @@ export async function getOAuthClientWithInstallState(serverId: string, clientId:
       eq(oauthClients.serverId, serverId),
       oauthClientIsUserManagedPredicate(),
     ));
-  const [row] = await withAppBotOffers(db, rows);
+  const [row] = await withAppBotOffers(db, rows.map(withServerVouch));
   return row ?? null;
 }
 
 export async function listOAuthClientsWithInstallState(serverId: string) {
   const db = getDbForService();
   const rows = await db.select({
-    ...OAUTH_CLIENT_PUBLIC_COLUMNS,
+    ...OAUTH_CLIENT_OWNER_COLUMNS,
+    serverVouchedAt: oauthClients.serverVouchedAt,
     installationId: oauthClientInstalls.id,
     installStatus: oauthClientInstalls.status,
     botGrant: oauthClientInstalls.botGrant,
@@ -2142,7 +2444,7 @@ export async function listOAuthClientsWithInstallState(serverId: string) {
   ));
   // A source-owned App is installed on its own Server; its bot is added there
   // from the same installed-app detail as on every other Server.
-  return withAppBotOffers(db, rows);
+  return withAppBotOffers(db, rows.map(withServerVouch));
 }
 
 export async function listMarketplaceOAuthClients(serverId: string) {
@@ -3755,12 +4057,16 @@ export async function updateOAuthClient(input: {
   allowedScopes?: unknown;
   category?: unknown;
   enableBot?: boolean;
+  /** How Raft signs the App's agent tokens: ES256 or RS256. */
+  agentTokenSigningAlg?: unknown;
+  /** The `typ` header of the App's agent tokens: at+jwt, or JWT on an App without a returnUrl. */
+  agentTokenType?: unknown;
   /** A new client id, for an unpublished App (RFC 084). */
   newClientKey?: string;
 }, dbOrTx: ReturnType<typeof getDb> = getDbForService()) {
   const db = dbOrTx;
   return db.transaction(async (tx) => {
-    const [before] = await tx.select(OAUTH_CLIENT_PUBLIC_COLUMNS)
+    const [before] = await tx.select(OAUTH_CLIENT_OWNER_COLUMNS)
       .from(oauthClients)
       .where(and(
         eq(oauthClients.id, input.clientId),
@@ -3810,6 +4116,17 @@ export async function updateOAuthClient(input: {
     if (input.enableBot !== undefined) {
       updates.enableBot = Boolean(input.enableBot);
     }
+    if (input.agentTokenSigningAlg !== undefined) {
+      updates.agentTokenSigningAlg = normalizeAgentTokenSigningAlg(input.agentTokenSigningAlg);
+    }
+    if (input.agentTokenType !== undefined) {
+      updates.agentTokenType = normalizeAgentTokenType(input.agentTokenType);
+    }
+    // Under the row lock taken above.
+    assertAgentTokenTypeTokenOnly({
+      agentTokenType: updates.agentTokenType ?? before.agentTokenType,
+      returnUrl: updates.returnUrl !== undefined ? updates.returnUrl : before.returnUrl,
+    }, input.agentTokenType !== undefined);
 
     applyAppSetupUpdate(before, input, updates);
     if (input.newClientKey !== undefined && input.actorUserId) {
@@ -3828,7 +4145,7 @@ export async function updateOAuthClient(input: {
     const [updated] = await tx.update(oauthClients)
       .set(updates)
       .where(eq(oauthClients.id, before.id))
-      .returning(OAUTH_CLIENT_PUBLIC_COLUMNS);
+      .returning(OAUTH_CLIENT_OWNER_COLUMNS);
 
     if (updated) {
       const diff = auditClientDiff(before, updated);
@@ -4257,10 +4574,12 @@ export async function getOAuthClientLogoStorageKey(input: {
   return logoStorageKey;
 }
 
-export async function authenticateOAuthClient(clientKey: string, clientSecret: string): Promise<AuthenticatedClient | null> {
+export async function authenticateOAuthClient(clientKey: string, clientSecret: string): Promise<(AuthenticatedClient & { agentTokenType: AgentTokenType }) | null> {
   const db = getDbForService();
   const [client] = await db.select({
     ...OAUTH_CLIENT_PUBLIC_COLUMNS,
+    // The token endpoint refuses sign-in codes to a token-only (JWT) App.
+    agentTokenType: oauthClients.agentTokenType,
     clientSecretHash: oauthClients.clientSecretHash,
     enabled: oauthClients.enabled,
     publishStatus: oauthClients.publishStatus,
@@ -4338,6 +4657,7 @@ export async function requestAgentAccess(input: {
     homepageUrl: oauthClients.homepageUrl,
     allowedScopes: oauthClients.allowedScopes,
     createdByUserId: oauthClients.createdByUserId,
+    serverVouchedAt: oauthClients.serverVouchedAt,
     installId: oauthClientInstalls.id,
     installApprovedScopes: oauthClientInstalls.approvedScopes,
   }).from(oauthClients)
@@ -4467,6 +4787,7 @@ export async function requestAgentAccess(input: {
     createdByUserId: client.createdByUserId,
     installed: client.installId !== null,
     approvedScopes: client.installApprovedScopes,
+    serverVouched: client.serverVouchedAt !== null,
   }, agent, input.initiatedByAgent === true, scopes);
   if (!autoGrant) {
     const pendingRequests = await db.select().from(oauthAccessRequests).where(and(
@@ -4602,6 +4923,7 @@ export async function issueHumanAuthorizationCode(input: {
     description: oauthClients.description,
     homepageUrl: oauthClients.homepageUrl,
     returnUrl: oauthClients.returnUrl,
+    agentTokenType: oauthClients.agentTokenType,
     allowedScopes: oauthClients.allowedScopes,
     installApprovedScopes: oauthClientInstalls.approvedScopes,
   }).from(oauthClients)
@@ -4634,6 +4956,13 @@ export async function issueHumanAuthorizationCode(input: {
   const requestedScopes = input.scopes === undefined || input.scopes === null
     ? ["openid", "profile"]
     : normalizeScopes(input.scopes, client);
+
+  // A token-only App (agent token type JWT, so no redirect URL) takes no
+  // person sign-in, with or without a callback: an ID token for its client id
+  // is what its JWT-typed agent tokens could pass for.
+  if (client.agentTokenType === "JWT") {
+    throw new Error("returnUrl is not registered: this App is token-only (agent token type JWT), and people can't sign in to it");
+  }
 
   const requestedReturnUrl = normalizeReturnUrl(input.returnUrl);
   // Non-browser clients may omit a callback entirely. Any requested navigation
@@ -5124,6 +5453,17 @@ export async function refuseCodeOfDeadSession(
   }
 }
 
+/**
+ * An Agent login's `owner_sub` (#proj-apps:#75): the `sub` its owner gets at
+ * login (their Raft user id), read live. The owner is Raft's one rule
+ * (findAgentOwner): a personal assistant's person, else the person who created
+ * it; null when an agent created it, or that person is retired (deleted) or no
+ * longer a member of the Agent's Server, and then the claim is left out.
+ */
+export async function oauthAgentOwnerSub(agentId: string, executor: DatabaseExecutor = getDb()): Promise<string | null> {
+  return (await findAgentOwner(executor, agentId))?.id ?? null;
+}
+
 export async function exchangeAccessRequest(input: {
   clientId: string;
   requestId: string;
@@ -5355,6 +5695,13 @@ export async function createThirdPartyAgentEvent(input: {
   objectRef?: string | null;
   /** RFC 081 D8: the conversation `object.conversation` resolved to for the receiving agent. */
   relatedChannelId?: string | null;
+  /**
+   * `inbox`: stored only in the agent's inbox item, never pushed (it is
+   * written with `wake_coalesced_at`, which every push path skips). The
+   * caller decides it is honoured (inboxOnlyDeliveryUnavailable). A deduped
+   * repeat keeps the first event's.
+   */
+  delivery?: ThirdPartyAgentEventDelivery;
 }) {
   const db = getDbForService();
   const now = new Date();
@@ -5394,6 +5741,8 @@ export async function createThirdPartyAgentEvent(input: {
     updatedAt: now,
     objectRef: input.objectRef ?? null,
     relatedChannelId: input.relatedChannelId ?? null,
+    delivery: input.delivery ?? "wake",
+    wakeCoalescedAt: input.delivery === "inbox" ? now : null,
   }).onConflictDoNothing().returning();
 
   if (!event) {
@@ -5405,7 +5754,9 @@ export async function createThirdPartyAgentEvent(input: {
       event: existing,
       message: buildThirdPartyAgentMessage({ event: existing, clientKey: input.clientKey, clientName: input.clientName }),
       created: false,
-      shouldDeliver: existing.status === "queued",
+      // Not one that was never to wake anyone: an `inbox` event, or one
+      // merged into its item's wake (#wg-ax:#24). A repeat can't push it.
+      shouldDeliver: existing.status === "queued" && existing.wakeCoalescedAt === null,
     };
   }
 

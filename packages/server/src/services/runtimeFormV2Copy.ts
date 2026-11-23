@@ -23,8 +23,10 @@ const ZH_CN: Readonly<Record<string, string>> = Object.freeze({
     "这台电脑上 Qwen Code 设置里的模型。也可以直接填写模型 ID。Qwen Code 没有登录：在环境变量里用 OPENAI_API_KEY、OPENAI_BASE_URL 和 OPENAI_MODEL 设置它的模型服务。",
   "Models available to this computer's Qoder login (qodercli login). You can also type a model ID.":
     "这台电脑上 Qoder 登录（qodercli login）可用的模型。也可以直接填写模型 ID。",
-  "Models available to this computer's Antigravity login. AGY configured default lets Antigravity choose. You can also type a model ID.":
-    "这台电脑上 Antigravity 登录可用的模型。选择 AGY configured default 则由 Antigravity 自行决定。也可以直接填写模型 ID。",
+  "Models DeepSeek Harness can use on this computer, as provider/model. You can also type one. Set its DeepSeek API key in dsh's own settings on the computer, or as DEEPSEEK_API_KEY under Environment Variables.":
+    "这台电脑上 DeepSeek Harness 可用的模型，格式为 provider/model。也可以直接填写。DeepSeek API 密钥在这台电脑上 dsh 自己的设置里配置，或在环境变量里设置 DEEPSEEK_API_KEY。",
+  "Models available to this computer's Antigravity login; the one Antigravity starts on is preselected. You can also type a model ID.":
+    "这台电脑上 Antigravity 登录可用的模型，已预选 Antigravity 默认启动的那个。也可以直接填写模型 ID。",
   // Field labels
   "API Key": "API 密钥",
   "Authentication": "身份验证",
@@ -34,6 +36,10 @@ const ZH_CN: Readonly<Record<string, string>> = Object.freeze({
   "Effort": "推理强度",
   "Environment Variables": "环境变量",
   "Fast mode": "快速模式",
+  "Speed": "速度",
+  "Speeds this model offers on this computer's Codex account. Faster speeds use more of your plan.":
+    "这台电脑上的 Codex 账号为此模型提供的速度档位。越快的档位消耗的套餐额度越多。",
+  "Standard · Default speed": "标准 · 默认速度",
   "Fast tier": "快速档",
   "Load local Pi extensions": "加载本机 Pi 扩展",
   "Model": "模型",
@@ -101,9 +107,6 @@ const ZH_CN: Readonly<Record<string, string>> = Object.freeze({
   "Bearer token (Authorization)": "Bearer token（Authorization）",
   "Custom": "自定义",
   "Default": "默认",
-  // v3 unavailableOptions reasons for a saved connection
-  "This saved provider is disabled.": "此已保存提供方已停用。",
-  "This saved provider has no credential.": "此已保存提供方缺少凭据。",
 });
 
 const JA: Readonly<Record<string, string>> = Object.freeze({
@@ -111,8 +114,10 @@ const JA: Readonly<Record<string, string>> = Object.freeze({
     "このコンピューターの Qwen Code 設定にあるモデルです。モデル ID を直接入力することもできます。Qwen Code にはログインがありません。環境変数の OPENAI_API_KEY、OPENAI_BASE_URL、OPENAI_MODEL でプロバイダーを設定してください。",
   "Models available to this computer's Qoder login (qodercli login). You can also type a model ID.":
     "このコンピューターの Qoder ログイン（qodercli login）で使えるモデルです。モデル ID を直接入力することもできます。",
-  "Models available to this computer's Antigravity login. AGY configured default lets Antigravity choose. You can also type a model ID.":
-    "このコンピューターの Antigravity ログインで使えるモデルです。AGY configured default を選ぶと Antigravity が選びます。モデル ID を直接入力することもできます。",
+  "Models DeepSeek Harness can use on this computer, as provider/model. You can also type one. Set its DeepSeek API key in dsh's own settings on the computer, or as DEEPSEEK_API_KEY under Environment Variables.":
+    "このコンピューターの DeepSeek Harness で使えるモデルです（provider/model 形式）。直接入力することもできます。DeepSeek API キーは、このコンピューター上の dsh 自身の設定で設定するか、環境変数の DEEPSEEK_API_KEY で設定してください。",
+  "Models available to this computer's Antigravity login; the one Antigravity starts on is preselected. You can also type a model ID.":
+    "このコンピューターの Antigravity ログインで使えるモデルです。Antigravity が起動時に使うモデルが選択済みです。モデル ID を直接入力することもできます。",
   // Field labels
   "API Key": "API キー",
   "Authentication": "認証",
@@ -122,6 +127,10 @@ const JA: Readonly<Record<string, string>> = Object.freeze({
   "Effort": "推論の強度",
   "Environment Variables": "環境変数",
   "Fast mode": "高速モード",
+  "Speed": "速度",
+  "Speeds this model offers on this computer's Codex account. Faster speeds use more of your plan.":
+    "このコンピューターの Codex アカウントでこのモデルが使える速度の段階です。速いほどプランの使用量が増えます。",
+  "Standard · Default speed": "標準 · デフォルトの速度",
   "Fast tier": "高速ティア",
   "Load local Pi extensions": "ローカルの Pi 拡張機能を読み込む",
   "Model": "モデル",
@@ -188,9 +197,6 @@ const JA: Readonly<Record<string, string>> = Object.freeze({
   "Bearer token (Authorization)": "Bearer token（Authorization）",
   "Custom": "カスタム",
   "Default": "デフォルト",
-  // v3 unavailableOptions reasons for a saved connection
-  "This saved provider is disabled.": "この保存済みプロバイダーは無効になっています。",
-  "This saved provider has no credential.": "この保存済みプロバイダーには認証情報がありません。",
 });
 
 const ES: Readonly<Record<string, string>> = Object.freeze({
@@ -198,8 +204,10 @@ const ES: Readonly<Record<string, string>> = Object.freeze({
     "Modelos de la configuración de Qwen Code en este equipo. También puedes escribir un ID de modelo. Qwen Code no tiene inicio de sesión: configura su proveedor con OPENAI_API_KEY, OPENAI_BASE_URL y OPENAI_MODEL en Variables de entorno.",
   "Models available to this computer's Qoder login (qodercli login). You can also type a model ID.":
     "Modelos disponibles para el inicio de sesión de Qoder en este equipo (qodercli login). También puedes escribir un ID de modelo.",
-  "Models available to this computer's Antigravity login. AGY configured default lets Antigravity choose. You can also type a model ID.":
-    "Modelos disponibles para el inicio de sesión de Antigravity en este equipo. AGY configured default deja que Antigravity elija. También puedes escribir un ID de modelo.",
+  "Models DeepSeek Harness can use on this computer, as provider/model. You can also type one. Set its DeepSeek API key in dsh's own settings on the computer, or as DEEPSEEK_API_KEY under Environment Variables.":
+    "Modelos que DeepSeek Harness puede usar en este equipo, como proveedor/modelo. También puedes escribir uno. Configura su clave de API de DeepSeek en los ajustes de dsh en el equipo o como DEEPSEEK_API_KEY en Variables de entorno.",
+  "Models available to this computer's Antigravity login; the one Antigravity starts on is preselected. You can also type a model ID.":
+    "Modelos disponibles para el inicio de sesión de Antigravity en este equipo; ya está seleccionado el que Antigravity usa al iniciar. También puedes escribir un ID de modelo.",
   // Field labels
   "API Key": "Clave de API",
   "Authentication": "Autenticación",
@@ -209,6 +217,10 @@ const ES: Readonly<Record<string, string>> = Object.freeze({
   "Effort": "Esfuerzo de razonamiento",
   "Environment Variables": "Variables de entorno",
   "Fast mode": "Modo rápido",
+  "Speed": "Velocidad",
+  "Speeds this model offers on this computer's Codex account. Faster speeds use more of your plan.":
+    "Velocidades que este modelo ofrece en la cuenta de Codex de esta computadora. Las más rápidas consumen más de tu plan.",
+  "Standard · Default speed": "Estándar · Velocidad predeterminada",
   "Fast tier": "Nivel rápido",
   "Load local Pi extensions": "Cargar extensiones locales de Pi",
   "Model": "Modelo",
@@ -285,9 +297,6 @@ const ES: Readonly<Record<string, string>> = Object.freeze({
   "Bearer token (Authorization)": "Bearer token (Authorization)",
   "Custom": "Personalizado",
   "Default": "Predeterminado",
-  // v3 unavailableOptions reasons for a saved connection
-  "This saved provider is disabled.": "Este proveedor guardado está desactivado.",
-  "This saved provider has no credential.": "Este proveedor guardado no tiene credencial.",
 });
 
 const PT_BR: Readonly<Record<string, string>> = Object.freeze({
@@ -295,8 +304,10 @@ const PT_BR: Readonly<Record<string, string>> = Object.freeze({
     "Modelos das configurações do Qwen Code neste computador. Você também pode digitar um ID de modelo. O Qwen Code não tem login: configure o provedor com OPENAI_API_KEY, OPENAI_BASE_URL e OPENAI_MODEL em Variáveis de ambiente.",
   "Models available to this computer's Qoder login (qodercli login). You can also type a model ID.":
     "Modelos disponíveis para o login do Qoder neste computador (qodercli login). Você também pode digitar um ID de modelo.",
-  "Models available to this computer's Antigravity login. AGY configured default lets Antigravity choose. You can also type a model ID.":
-    "Modelos disponíveis para o login do Antigravity neste computador. AGY configured default deixa o Antigravity escolher. Você também pode digitar um ID de modelo.",
+  "Models DeepSeek Harness can use on this computer, as provider/model. You can also type one. Set its DeepSeek API key in dsh's own settings on the computer, or as DEEPSEEK_API_KEY under Environment Variables.":
+    "Modelos que o DeepSeek Harness pode usar neste computador, como provedor/modelo. Você também pode digitar um. Configure a chave de API da DeepSeek nas configurações do próprio dsh no computador ou como DEEPSEEK_API_KEY em Variáveis de ambiente.",
+  "Models available to this computer's Antigravity login; the one Antigravity starts on is preselected. You can also type a model ID.":
+    "Modelos disponíveis para o login do Antigravity neste computador; o que o Antigravity usa ao iniciar já vem selecionado. Você também pode digitar um ID de modelo.",
   // Field labels
   "API Key": "Chave de API",
   "Authentication": "Autenticação",
@@ -306,6 +317,10 @@ const PT_BR: Readonly<Record<string, string>> = Object.freeze({
   "Effort": "Esforço de raciocínio",
   "Environment Variables": "Variáveis de ambiente",
   "Fast mode": "Modo rápido",
+  "Speed": "Velocidade",
+  "Speeds this model offers on this computer's Codex account. Faster speeds use more of your plan.":
+    "Velocidades que este modelo oferece na conta do Codex deste computador. As mais rápidas consomem mais do seu plano.",
+  "Standard · Default speed": "Padrão · Velocidade padrão",
   "Fast tier": "Nível rápido",
   "Load local Pi extensions": "Carregar extensões locais do Pi",
   "Model": "Modelo",
@@ -383,9 +398,6 @@ const PT_BR: Readonly<Record<string, string>> = Object.freeze({
   "Bearer token (Authorization)": "Bearer token (Authorization)",
   "Custom": "Personalizado",
   "Default": "Padrão",
-  // v3 unavailableOptions reasons for a saved connection
-  "This saved provider is disabled.": "Este provedor salvo está desativado.",
-  "This saved provider has no credential.": "Este provedor salvo não tem credencial.",
 });
 
 const RU: Readonly<Record<string, string>> = Object.freeze({
@@ -393,8 +405,10 @@ const RU: Readonly<Record<string, string>> = Object.freeze({
     "Модели из настроек Qwen Code на этом компьютере. Можно также ввести ID модели. Входа в Qwen Code нет: задайте провайдера через OPENAI_API_KEY, OPENAI_BASE_URL и OPENAI_MODEL в разделе «Переменные окружения».",
   "Models available to this computer's Qoder login (qodercli login). You can also type a model ID.":
     "Модели, доступные аккаунту Qoder, под которым выполнен вход на этом компьютере (qodercli login). Можно также ввести ID модели.",
-  "Models available to this computer's Antigravity login. AGY configured default lets Antigravity choose. You can also type a model ID.":
-    "Модели, доступные аккаунту Antigravity, под которым выполнен вход на этом компьютере. AGY configured default оставляет выбор за Antigravity. Можно также ввести ID модели.",
+  "Models DeepSeek Harness can use on this computer, as provider/model. You can also type one. Set its DeepSeek API key in dsh's own settings on the computer, or as DEEPSEEK_API_KEY under Environment Variables.":
+    "Модели, которые DeepSeek Harness может использовать на этом компьютере, в формате провайдер/модель. Можно также ввести свою. Задайте ключ API DeepSeek в настройках самого dsh на компьютере или через DEEPSEEK_API_KEY в разделе «Переменные окружения».",
+  "Models available to this computer's Antigravity login; the one Antigravity starts on is preselected. You can also type a model ID.":
+    "Модели, доступные аккаунту Antigravity, под которым выполнен вход на этом компьютере; модель, с которой Antigravity запускается, уже выбрана. Можно также ввести ID модели.",
   // Field labels
   "API Key": "Ключ API",
   "Authentication": "Аутентификация",
@@ -404,6 +418,10 @@ const RU: Readonly<Record<string, string>> = Object.freeze({
   "Effort": "Глубина рассуждений",
   "Environment Variables": "Переменные окружения",
   "Fast mode": "Быстрый режим",
+  "Speed": "Скорость",
+  "Speeds this model offers on this computer's Codex account. Faster speeds use more of your plan.":
+    "Режимы скорости, которые эта модель предлагает для аккаунта Codex на этом компьютере. Чем быстрее режим, тем больше расходуется тариф.",
+  "Standard · Default speed": "Стандартный · Скорость по умолчанию",
   "Fast tier": "Быстрый уровень",
   "Load local Pi extensions": "Загружать локальные расширения Pi",
   "Model": "Модель",
@@ -480,9 +498,6 @@ const RU: Readonly<Record<string, string>> = Object.freeze({
   "Bearer token (Authorization)": "Bearer token (Authorization)",
   "Custom": "Пользовательский",
   "Default": "По умолчанию",
-  // v3 unavailableOptions reasons for a saved connection
-  "This saved provider is disabled.": "Этот сохранённый провайдер отключён.",
-  "This saved provider has no credential.": "У этого сохранённого провайдера нет учётных данных.",
 });
 
 const KO: Readonly<Record<string, string>> = Object.freeze({
@@ -490,8 +505,10 @@ const KO: Readonly<Record<string, string>> = Object.freeze({
     "이 컴퓨터의 Qwen Code 설정에 있는 모델입니다. 모델 ID를 직접 입력할 수도 있습니다. Qwen Code에는 로그인이 없습니다. 환경 변수의 OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL로 공급자를 설정하세요.",
   "Models available to this computer's Qoder login (qodercli login). You can also type a model ID.":
     "이 컴퓨터의 Qoder 로그인(qodercli login)으로 사용할 수 있는 모델입니다. 모델 ID를 직접 입력할 수도 있습니다.",
-  "Models available to this computer's Antigravity login. AGY configured default lets Antigravity choose. You can also type a model ID.":
-    "이 컴퓨터의 Antigravity 로그인으로 사용할 수 있는 모델입니다. AGY configured default를 고르면 Antigravity가 선택합니다. 모델 ID를 직접 입력할 수도 있습니다.",
+  "Models DeepSeek Harness can use on this computer, as provider/model. You can also type one. Set its DeepSeek API key in dsh's own settings on the computer, or as DEEPSEEK_API_KEY under Environment Variables.":
+    "이 컴퓨터의 DeepSeek Harness가 사용할 수 있는 모델입니다(provider/model 형식). 직접 입력할 수도 있습니다. DeepSeek API 키는 컴퓨터에서 dsh 자체 설정에 저장하거나 환경 변수의 DEEPSEEK_API_KEY로 설정하세요.",
+  "Models available to this computer's Antigravity login; the one Antigravity starts on is preselected. You can also type a model ID.":
+    "이 컴퓨터의 Antigravity 로그인으로 사용할 수 있는 모델입니다. Antigravity가 시작할 때 쓰는 모델이 미리 선택되어 있습니다. 모델 ID를 직접 입력할 수도 있습니다.",
   // Field labels
   "API Key": "API 키",
   "Authentication": "인증",
@@ -501,6 +518,10 @@ const KO: Readonly<Record<string, string>> = Object.freeze({
   "Effort": "추론 강도",
   "Environment Variables": "환경 변수",
   "Fast mode": "빠른 모드",
+  "Speed": "속도",
+  "Speeds this model offers on this computer's Codex account. Faster speeds use more of your plan.":
+    "이 컴퓨터의 Codex 계정에서 이 모델이 제공하는 속도 단계예요. 빠를수록 요금제 사용량이 더 많아요.",
+  "Standard · Default speed": "표준 · 기본 속도",
   "Fast tier": "빠른 티어",
   "Load local Pi extensions": "로컬 Pi 확장 불러오기",
   "Model": "모델",
@@ -567,9 +588,6 @@ const KO: Readonly<Record<string, string>> = Object.freeze({
   "Bearer token (Authorization)": "Bearer token (Authorization)",
   "Custom": "사용자 지정",
   "Default": "기본값",
-  // v3 unavailableOptions reasons for a saved connection
-  "This saved provider is disabled.": "이 저장된 제공업체는 비활성화되어 있어요.",
-  "This saved provider has no credential.": "이 저장된 제공업체에 자격 증명이 없어요.",
 });
 
 const ZH_TW: Readonly<Record<string, string>> = Object.freeze({
@@ -577,8 +595,10 @@ const ZH_TW: Readonly<Record<string, string>> = Object.freeze({
     "這台電腦上 Qwen Code 設定裡的模型。也可以直接填寫模型 ID。Qwen Code 沒有登入：在環境變數裡用 OPENAI_API_KEY、OPENAI_BASE_URL 和 OPENAI_MODEL 設定它的模型服務。",
   "Models available to this computer's Qoder login (qodercli login). You can also type a model ID.":
     "這台電腦上 Qoder 登入（qodercli login）可用的模型。也可以直接填寫模型 ID。",
-  "Models available to this computer's Antigravity login. AGY configured default lets Antigravity choose. You can also type a model ID.":
-    "這台電腦上 Antigravity 登入可用的模型。選擇 AGY configured default 則由 Antigravity 自行決定。也可以直接填寫模型 ID。",
+  "Models DeepSeek Harness can use on this computer, as provider/model. You can also type one. Set its DeepSeek API key in dsh's own settings on the computer, or as DEEPSEEK_API_KEY under Environment Variables.":
+    "這台電腦上 DeepSeek Harness 可用的模型，格式為 provider/model。也可以直接填寫。DeepSeek API 金鑰在這台電腦上 dsh 自己的設定裡設定，或在環境變數裡設定 DEEPSEEK_API_KEY。",
+  "Models available to this computer's Antigravity login; the one Antigravity starts on is preselected. You can also type a model ID.":
+    "這台電腦上 Antigravity 登入可用的模型，已預選 Antigravity 預設啟動的那個。也可以直接填寫模型 ID。",
   // Field labels
   "API Key": "API 金鑰",
   "Authentication": "驗證",
@@ -588,6 +608,10 @@ const ZH_TW: Readonly<Record<string, string>> = Object.freeze({
   "Effort": "推理強度",
   "Environment Variables": "環境變數",
   "Fast mode": "快速模式",
+  "Speed": "速度",
+  "Speeds this model offers on this computer's Codex account. Faster speeds use more of your plan.":
+    "這台電腦上的 Codex 帳號為此模型提供的速度檔位。越快的檔位消耗的方案額度越多。",
+  "Standard · Default speed": "標準 · 預設速度",
   "Fast tier": "快速方案",
   "Load local Pi extensions": "載入本機 Pi 擴充功能",
   "Model": "模型",
@@ -654,9 +678,6 @@ const ZH_TW: Readonly<Record<string, string>> = Object.freeze({
   "Bearer token (Authorization)": "Bearer token（Authorization）",
   "Custom": "自訂",
   "Default": "預設",
-  // v3 unavailableOptions reasons for a saved connection
-  "This saved provider is disabled.": "這個已儲存的供應商已停用。",
-  "This saved provider has no credential.": "這個已儲存的供應商缺少憑證。",
 });
 
 const TRANSLATIONS: Readonly<Record<Exclude<RuntimeFormCopyLocale, "en">, Readonly<Record<string, string>>>> = Object.freeze({
@@ -738,13 +759,6 @@ export function localizeRuntimeFormV2OptionSource<T extends { options?: unknown;
   const localized = { ...source };
   if (Array.isArray(source.options)) {
     localized.options = localizeOptions(source.options as RuntimeFormV2Option[], table);
-  }
-  // v3: a saved connection's unavailable entry carries server copy (a model's
-  // reason is the runtime's own text and stays as sent).
-  if (Array.isArray(source.unavailableOptions)) {
-    localized.unavailableOptions = (source.unavailableOptions as Array<Record<string, unknown>>).map((option) => (
-      typeof option.connectionId === "string" && typeof option.reason === "string" ? { ...option, reason: translate(option.reason, table) } : option
-    ));
   }
   if (source.optionsByValue && typeof source.optionsByValue === "object") {
     localized.optionsByValue = Object.fromEntries(

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { managedMcpAssignments, managedMcpCredentials, managedMcpServers, users } from "../db/schema";
+import { managedMcpAssignments, managedMcpCredentials, managedMcpPersonalGrants, managedMcpServers, users } from "../db/schema";
 import { createAgent } from "./agentService";
 import { addMember, createServer } from "./serverService";
 import { encryptManagedMcpHeaders } from "./managedMcpCredentialService";
@@ -56,9 +56,10 @@ async function seed() {
 }
 
 /** An API-key App with one ready default Connection, created by `createdBy`. */
-async function headersApp(serverId: string, createdBy: string | null, name: string) {
+async function headersApp(serverId: string, createdBy: string | null, name: string, vouched = false) {
   const [app] = await getDb().insert(managedMcpServers).values({
     serverId, name, endpointUrl: ENDPOINT, authMode: "headers", sourceKind: "url", createdByUserId: createdBy,
+    ...(vouched ? { serverVouchedAt: new Date() } : {}),
     toolCatalog: [{ name: "search", inputSchema: { type: "object" } }] as never,
   }).returning();
   const [connection] = await getDb().insert(managedMcpCredentials).values({
@@ -96,7 +97,9 @@ test("⭐ an Agent's catalogue and the call path agree in every admission state"
   // `pin`: how a pinned Agent reads on its Apps tab and in the App's Agents summary.
   const cases: Array<{ label: string; expect: Outcome; pin?: "pinned" | "noConnection"; arrange: () => Promise<{ id: string; configVersion: number }> }> = [
     { label: "granted automatically, ready default", expect: "ok", arrange: async () => (await headersApp(server.id, owner.id, "Auto")).app },
-    { label: "legacy NULL creator", expect: "ok", arrange: async () => (await headersApp(server.id, null, "Legacy")).app },
+    // Fail-closed: no recorded creator is no automatic grant; migration 0732 vouched the legacy ones (legacy_no_creator).
+    { label: "legacy NULL creator, not vouched", expect: "managed_mcp_app_off", arrange: async () => (await headersApp(server.id, null, "Legacy")).app },
+    { label: "legacy NULL creator, vouched", expect: "ok", arrange: async () => (await headersApp(server.id, null, "Legacy vouched", true)).app },
     {
       label: "server-disabled App", expect: "managed_mcp_server_disabled",
       arrange: async () => {
@@ -127,7 +130,8 @@ test("⭐ an Agent's catalogue and the call path agree in every admission state"
       },
     },
     {
-      label: "pinned to another person's Connection (written before the ownership rule)", pin: "noConnection", expect: "managed_mcp_login_required",
+      // RFC 087 removed the "created by the Agent's owner" rule: a shared pin is usable whoever created it.
+      label: "pinned to a shared Connection another person created", pin: "pinned", expect: "ok",
       arrange: async () => {
         const { app } = await headersApp(server.id, owner.id, "Someone else's");
         const [members] = await db.insert(managedMcpCredentials).values({
@@ -135,6 +139,33 @@ test("⭐ an Agent's catalogue and the call path agree in every admission state"
           encryptedHeaders: encryptManagedMcpHeaders({ "X-Api-Key": "members" }), headerNames: ["X-Api-Key"], authorizedEndpointUrl: ENDPOINT,
         }).returning();
         await db.insert(managedMcpAssignments).values({ serverId: server.id, agentId: agent.id, mcpServerId: app.id, connectionMode: "pinned", boundConnectionId: members.id });
+        return app;
+      },
+    },
+    {
+      label: "pinned to a member's personal Connection (no write path makes one)", pin: "noConnection", expect: "managed_mcp_login_required",
+      arrange: async () => {
+        const { app } = await headersApp(server.id, owner.id, "Personal pin");
+        const [personal] = await db.insert(managedMcpCredentials).values({
+          serverId: server.id, mcpServerId: app.id, isServerDefault: false, authKind: "headers", authStatus: "ready", name: "Member's own",
+          ownerKind: "personal", ownerUserId: member.id, createdByUserId: member.id,
+          encryptedHeaders: encryptManagedMcpHeaders({ "X-Api-Key": "own" }), headerNames: ["X-Api-Key"], authorizedEndpointUrl: ENDPOINT,
+        }).returning();
+        await db.insert(managedMcpAssignments).values({ serverId: server.id, agentId: agent.id, mcpServerId: app.id, connectionMode: "pinned", boundConnectionId: personal.id });
+        return app;
+      },
+    },
+    {
+      label: "a member's personal grant on an App not otherwise granted, default expired", expect: "ok",
+      arrange: async () => {
+        const { app, connection } = await headersApp(server.id, member.id, "Personal only");
+        await db.update(managedMcpCredentials).set({ authStatus: "expired" }).where(eq(managedMcpCredentials.id, connection.id));
+        const [personal] = await db.insert(managedMcpCredentials).values({
+          serverId: server.id, mcpServerId: app.id, isServerDefault: false, authKind: "headers", authStatus: "ready", name: "Member's own",
+          ownerKind: "personal", ownerUserId: member.id, createdByUserId: member.id,
+          encryptedHeaders: encryptManagedMcpHeaders({ "X-Api-Key": "own" }), headerNames: ["X-Api-Key"], authorizedEndpointUrl: ENDPOINT,
+        }).returning();
+        await db.insert(managedMcpPersonalGrants).values({ serverId: server.id, agentId: agent.id, mcpServerId: app.id, connectionId: personal.id, grantedByUserId: member.id });
         return app;
       },
     },

@@ -38,22 +38,48 @@ export function toastTimeout({ hasAction, type }: { hasAction: boolean; type?: s
 }
 
 let manager: ToastManager | null = null;
+/** Each open object window's own toast manager (features/objectWindows), by its document. */
+const objectWindowManagers = new Map<Document, ToastManager>();
 
 export function setToastManager(next: ToastManager | null): void {
   manager = next;
 }
 
+/**
+ * An object window's toast manager (its own viewport, in its own document):
+ * a toast shown while that window has the focus shows there, where the person
+ * is, not in the main window behind. Returns the unregister.
+ */
+export function registerObjectWindowToastManager(doc: Document, next: ToastManager): () => void {
+  objectWindowManagers.set(doc, next);
+  return () => {
+    if (objectWindowManagers.get(doc) === next) objectWindowManagers.delete(doc);
+  };
+}
+
+/** The focused object window's manager, else the app's. */
+function currentManager(): ToastManager | null {
+  for (const [doc, objectWindowManager] of objectWindowManagers) {
+    if (doc.hasFocus()) return objectWindowManager;
+  }
+  return manager;
+}
+
 /** Shows `toast`; its id (for `closeToast`), or null with no provider mounted. */
 export function showToast(toast: BridgedToast): string | null {
-  if (!manager) return null;
+  const target = currentManager();
+  if (!target) return null;
   const timeout = toast.timeout ?? toastTimeout({ hasAction: Boolean(toast.actionProps), type: toast.type });
   // An error toast's trace id is added where every toast renders (LocalizedToastProvider).
-  return manager.add(timeout === undefined ? toast : { ...toast, timeout }) ?? null;
+  return target.add(timeout === undefined ? toast : { ...toast, timeout }) ?? null;
 }
 
 /** Closes a toast `showToast` showed, before its time (its action no longer means anything); null does nothing. */
 export function closeToast(id: string | null | undefined): void {
-  if (id) manager?.close?.(id);
+  if (!id) return;
+  // Wherever it was shown: a manager closes only a toast of its own.
+  manager?.close?.(id);
+  for (const objectWindowManager of objectWindowManagers.values()) objectWindowManager.close?.(id);
 }
 
 /** True while the app's toast viewport is mounted, so a toast shown now is seen. */

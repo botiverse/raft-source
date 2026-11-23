@@ -13,8 +13,36 @@ function loadUndici(): Promise<typeof import("undici")> {
   return (undiciModule ??= import("undici"));
 }
 
+// Trust the OS certificate store (a TLS-re-signing proxy's CA installed
+// system-wide) before the first direct HTTPS request, not at startup: a
+// managed agent's ordinary `raft` call only talks plain http to the loopback
+// agent proxy, and reading the store costs tens of ms. Requests that reach a
+// TLS server from the CLI itself (an attachment's object-storage redirect,
+// self-hosted/legacy modes, `raft agent login`, integrations) pass through
+// buildFetchDispatcher or undiciFetch first.
+let systemCaTrust: Promise<void> | undefined;
+export function ensureSystemCaTrustFor(target: string | URL | Request): Promise<void> {
+  if (!isHttpsTarget(target)) return Promise.resolve();
+  return (systemCaTrust ??= import("@botiverse/raft-shared/src/systemTrust").then(
+    ({ installSystemCaTrust }) => { installSystemCaTrust(); },
+    () => undefined,
+  ));
+}
+
+function isHttpsTarget(target: string | URL | Request): boolean {
+  try {
+    const href = typeof target === "string" ? target : target instanceof URL ? target.href : target.url;
+    return new URL(href).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 /** undici's `fetch`, loading undici on the first call. */
-export const undiciFetch: typeof import("undici").fetch = async (...args) => (await loadUndici()).fetch(...args);
+export const undiciFetch: typeof import("undici").fetch = async (...args) => {
+  await ensureSystemCaTrustFor(args[0] as string | URL | Request);
+  return (await loadUndici()).fetch(...args);
+};
 
 const fetchDispatcherCache = new Map<string, Dispatcher>();
 
@@ -213,6 +241,7 @@ export async function buildFetchDispatcher(
   targetUrl: string,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<Dispatcher | undefined> {
+  await ensureSystemCaTrustFor(targetUrl);
   const proxyUrl = getProxyUrlForTarget(targetUrl, env);
   if (!proxyUrl) return undefined;
   if (shouldBypassProxy(targetUrl, env)) return undefined;

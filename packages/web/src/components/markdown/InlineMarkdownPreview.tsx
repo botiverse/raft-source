@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components, Options } from "react-markdown";
 import remarkBreaks from "remark-breaks";
@@ -60,13 +60,20 @@ interface InlineMarkdownPreviewProps {
   linkClassName?: string;
 }
 
-export default function InlineMarkdownPreview({ markdown: source, linkClassName }: InlineMarkdownPreviewProps) {
+function InlineMarkdownPreviewImpl({ markdown: source, linkClassName }: InlineMarkdownPreviewProps) {
   // A card message's preview reads its acting buttons as their labels (RFC 086; messageCardFallbackText.ts).
   const markdown = messageCardFallbackText(source);
   // The same <span> the parser renders the paragraph as (INLINE_COMPONENTS.p).
   if (isPlainPreviewText(markdown)) return <span>{markdown}</span>;
   return <ParsedMarkdownPreview markdown={markdown} linkClassName={linkClassName} />;
 }
+
+/**
+ * Memoised on its (string) props: a list row that re-renders for something
+ * else (a store patch, #532) keeps its preview without parsing it again.
+ */
+const InlineMarkdownPreview = memo(InlineMarkdownPreviewImpl);
+export default InlineMarkdownPreview;
 
 /** The preview through the markdown parser. Exported for the plain-text equivalence test. */
 export function ParsedMarkdownPreview({

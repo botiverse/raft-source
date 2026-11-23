@@ -72,6 +72,10 @@ const expectedExports = {
     types: "./src/brandedIds.ts",
     default: "./src/brandedIds.ts",
   },
+  "./src/fetchWithoutRedirect": {
+    types: "./src/fetchWithoutRedirect.ts",
+    default: "./src/fetchWithoutRedirect.ts",
+  },
   "./src/displayLocales": {
     types: "./src/displayLocales.ts",
     default: "./src/displayLocales.ts",
@@ -204,6 +208,10 @@ const expectedExports = {
     types: "./src/artifactPageTheme.ts",
     default: "./src/artifactPageTheme.ts",
   },
+  "./src/bareLinkEnd": {
+    types: "./src/bareLinkEnd.ts",
+    default: "./src/bareLinkEnd.ts",
+  },
   // And what the page's calls run under, for the same three sides.
   "./src/artifactCheckContract": {
     types: "./src/artifactCheckContract.ts",
@@ -256,6 +264,14 @@ const expectedExports = {
   "./src/noProxy": {
     types: "./src/noProxy.ts",
     default: "./src/noProxy.ts",
+  },
+  "./src/agentLeftovers": {
+    types: "./src/agentLeftovers.ts",
+    default: "./src/agentLeftovers.ts",
+  },
+  "./src/systemTrust": {
+    types: "./src/systemTrust.ts",
+    default: "./src/systemTrust.ts",
   },
   "./src/traceUploadUrl": {
     types: "./src/traceUploadUrl.ts",

@@ -32,7 +32,8 @@ export type AccountDeletionKeepAction =
   | "revoke_daemons"
   | "clear_computer_ownership"
   | "reset_member_preferences"
-  | "revoke_push_registrations";
+  | "revoke_push_registrations"
+  | "revoke_managed_mcp_sign_ins";
 
 export type UserForeignKeyClassification =
   | { onDelete: "cascade"; cleanup: "delete" }
@@ -51,6 +52,7 @@ export const USER_FOREIGN_KEY_CLASSIFICATION = {
   "user_auth_identities.user_id": del,
   "social_auth_completions.user_id": del,
   "app_login_requests.user_id": del,
+  "computer_pairings.user_id": del,
   "sessions.user_id": del,
   "session_token_predecessors.user_id": del,
   "session_refresh_rotation_receipts.user_id": del,
@@ -84,6 +86,8 @@ export const USER_FOREIGN_KEY_CLASSIFICATION = {
   "system_attention_receipts.user_id": del,
   "user_announcement_dismissals.user_id": del,
   "newsletter_audience_contacts.user_id": del,
+  // ── Data exports: delete, archives first (cleanup.ts; personal and server exports the person asked for) ──
+  "data_exports.requester_user_id": del,
   "onboarding_email_journeys.user_id": del,
   // ── Personal state in conversations: delete ──
   "user_channel_read_cursors.user_id": del,
@@ -160,7 +164,6 @@ export const USER_FOREIGN_KEY_CLASSIFICATION = {
   "agent_migrations.cancel_requested_by_user_id": setNull,
   "agent_migrations.initiated_by_user_id": setNull,
   "agent_operator_events.actor_user_id": setNull,
-  "agent_provider_connections.updated_by_user_id": setNull,
   "agent_scopes.updated_by_user_id": setNull,
   "agents.assistant_owner_user_id": setNull, // the assistants are disposed of in the first phase
   "agents.assistant_paused_by_user_id": setNull,
@@ -196,8 +199,17 @@ export const USER_FOREIGN_KEY_CLASSIFICATION = {
   "joint_membership_departures.actor_user_id": setNull,
   "managed_mcp_assignments.updated_by_user_id": setNull,
   "managed_mcp_credentials.created_by_user_id": setNull,
+  // A server's Connection is kept; one the person signed in with OAuth is disconnected (tokens
+  // deleted, needs reconnect), on every server. API-key Connections are left as they are.
+  "managed_mcp_credentials.signed_in_by_user_id": { ...setNull, action: "revoke_managed_mcp_sign_ins" },
+  // RFC 087: a member's personal Connection exists only for their own use on that Server; its tokens
+  // are revoked first through signed_in_by_user_id (revoke_managed_mcp_sign_ins), then it goes.
+  "managed_mcp_credentials.owner_user_id": del,
+  "managed_mcp_personal_grants.granted_by_user_id": setNull,
   "managed_mcp_servers.created_by_user_id": setNull,
   "managed_mcp_servers.updated_by_user_id": setNull,
+  // Only who vouched: the vouch is the Server's and stays when the person goes.
+  "managed_mcp_servers.server_vouched_by_user_id": setNull,
   "mcp_app_templates.created_by_user_id": setNull,
   "mcp_app_templates.updated_by_user_id": setNull,
   "oauth_access_requests.resolved_by_user_id": setNull,
@@ -208,16 +220,15 @@ export const USER_FOREIGN_KEY_CLASSIFICATION = {
   "oauth_client_installs.text_confirmed_by_user_id": setNull,
   "oauth_client_uninstalls.actor_user_id": setNull,
   "oauth_clients.publish_reviewed_by_user_id": setNull,
+  // Only who vouched: the vouch is the Server's and stays when the person goes.
+  "oauth_clients.server_vouched_by_user_id": setNull,
   "oauth_grants.revoked_by_user_id": setNull,
   "official_app_auto_install_transitions.actor_user_id": setNull,
   "official_app_registry.created_by_user_id": setNull,
   "official_app_registry.updated_by_user_id": setNull,
   "paid_lifecycle_payments.payer_user_id": setNull, // payment records are kept
-  "provider_connections.created_by_user_id": setNull,
-  "provider_connections.updated_by_user_id": setNull,
   "prepaid_pro_purchases.purchased_by_user_id": setNull, // a payment record: kept, only who paid is cleared
   "prepaid_pro_reminders.recipient_user_id": setNull, // a sent-email record: kept, only who got it is cleared
-  "provider_probe_intents.created_by_user_id": setNull,
   "push_registrations.user_id": { ...setNull, action: "revoke_push_registrations" },
   "seat_join_blocks.inviter_user_id": setNull,
   "server_agreements.created_by_user_id": noAction,

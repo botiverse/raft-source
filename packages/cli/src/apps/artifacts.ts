@@ -17,6 +17,7 @@ import { registerArtifactReadCommand } from "../commands/artifact/read";
 import { registerArtifactResolveCommands } from "../commands/artifact/resolve";
 import { registerArtifactReviewCommand } from "../commands/artifact/review";
 import { registerArtifactSaveCommand } from "../commands/artifact/save";
+import { registerArtifactSettleCommands } from "../commands/artifact/settle";
 import type { CommandRuntimeOptions } from "../core/context";
 
 export function registerArtifactsCommands(program: Command, runtimeOptions?: CommandRuntimeOptions): void {
@@ -39,6 +40,7 @@ export function registerArtifactsCommands(program: Command, runtimeOptions?: Com
   registerArtifactCommentCommand(artifactCmd, runtimeOptions);
   registerArtifactReviewCommand(artifactCmd, runtimeOptions);
   registerArtifactResolveCommands(artifactCmd, runtimeOptions);
+  registerArtifactSettleCommands(artifactCmd, runtimeOptions);
   registerArtifactFollowCommands(artifactCmd, runtimeOptions);
   registerArtifactManageCommands(artifactCmd, runtimeOptions);
   registerArtifactSaveCommand(artifactCmd, runtimeOptions);

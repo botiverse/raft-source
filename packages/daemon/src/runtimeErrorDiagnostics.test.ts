@@ -14,6 +14,8 @@ import {
   scrubRuntimeErrorDiagnosticText,
   runtimeErrorTraceClassAttrs,
   normalizeRuntimeErrorForFingerprint,
+  RUNTIME_MODEL_REFUSAL_MESSAGE,
+  modelRefusalTraceClassAttrs,
 } from "./runtimeErrorDiagnostics";
 import { DIAGNOSTIC_REDACTION_CREDENTIAL_SAMPLES } from "../../shared/src/test/diagnosticRedactionCredentialSamples";
 import {
@@ -22,7 +24,24 @@ import {
   MAX_VISIBLE_RUNTIME_ERROR_DETAIL_CHARS,
   scrubRuntimeErrorText,
 } from "@botiverse/raft-shared";
-import { recoverableRuntimeDeliveryBackoffReason, recoverableRuntimeProcessCloseReason } from "./runtimeErrorDeliveryPolicy";
+import {
+  recoverableRuntimeDeliveryBackoffReason,
+  recoverableRuntimeProcessCloseReason,
+  runtimeErrorFingerprintFenceResetEvent,
+} from "./runtimeErrorDeliveryPolicy";
+
+// A finished compaction is not progress for the repeated-error fences:
+// Claude Code compacts, then fails the turn with "Prompt is too long"; counted
+// as progress, it reset the fence every turn (and made that turn's end reset it).
+test("runtimeErrorFingerprintFenceResetEvent: a finished compaction is not progress; output and a finished review are", () => {
+  assert.equal(runtimeErrorFingerprintFenceResetEvent("compaction_finished", false), false);
+  assert.equal(runtimeErrorFingerprintFenceResetEvent("compaction_finished", true), false);
+  for (const kind of ["thinking", "text", "tool_call", "tool_output", "review_finished"] as const) {
+    assert.equal(runtimeErrorFingerprintFenceResetEvent(kind, false), true, kind);
+  }
+  assert.equal(runtimeErrorFingerprintFenceResetEvent("turn_end", false), false);
+  assert.equal(runtimeErrorFingerprintFenceResetEvent("turn_end", true), true);
+});
 
 test("buildRuntimeErrorDiagnosticEnvelope classifies and bounds provider errors", () => {
   const envelope = buildRuntimeErrorDiagnosticEnvelope(
@@ -239,6 +258,29 @@ test("buildRuntimeErrorDiagnosticEnvelope classifies local startup-payload and o
   assert.equal(providerRaw.spanAttrs.runtime_input_model, "claude-fable-5");
 });
 
+test("buildRuntimeErrorDiagnosticEnvelope classifies OpenCode's context-window overflow as input too large", () => {
+  const envelope = buildRuntimeErrorDiagnosticEnvelope(
+    "Your input exceeds the context window of this model. Please adjust your input and try again.",
+  );
+  assert.equal(envelope.spanAttrs.runtime_error_class, "InputTooLargeError");
+  assert.equal(envelope.spanAttrs.turn_reason, "input_too_large");
+  assert.equal(envelope.spanAttrs.runtime_error_action_required, false);
+});
+
+// A model refusal is decided on the error event's typed marker, never on its
+// text: the fixed text alone is an ordinary RuntimeError. Its trace class is
+// its own; the closed protocol vocabulary has none, so the wire says RuntimeError.
+test("a model refusal's trace class comes from the typed marker; its fixed text alone classifies as nothing special", () => {
+  assert.deepEqual(modelRefusalTraceClassAttrs(), { runtime_error_class: "ModelRefusalError", turn_reason: "model_refusal" });
+  const envelope = buildRuntimeErrorDiagnosticEnvelope(RUNTIME_MODEL_REFUSAL_MESSAGE);
+  assert.equal(envelope.spanAttrs.runtime_error_class, "RuntimeError");
+  assert.equal(envelope.spanAttrs.runtime_error_action_required, false);
+  const activity = buildRuntimeErrorActivityDiagnostic(RUNTIME_MODEL_REFUSAL_MESSAGE);
+  assert.equal(activity.errorClass, "RuntimeError");
+  assert.equal(activity.errorReason, "unclassified_runtime_error");
+  assert.equal(credentialInvalidReasonOf(RUNTIME_MODEL_REFUSAL_MESSAGE), null);
+});
+
 test("buildRuntimeErrorDiagnosticEnvelope classifies Anthropic maximum-context responses and extracts token accounting", () => {
   const providerRaw = buildRuntimeErrorDiagnosticEnvelope(
     "API Error: 400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"This model's maximum context length is 1,048,565 tokens. However, you requested 1,048,925 tokens (1,016,925 in the messages, 32,000 in the completion). Please reduce the length of the messages or completion.\"}}",
@@ -388,6 +430,48 @@ test("a reqwest request-send failure moves the delivery backoff reason but not t
   );
 });
 
+// agy (Go) reports a model request whose connection dropped as Go's url.Error
+// around io.EOF; that close was a non-recoverable crash, dropping the inbox.
+const GO_MODEL_REQUEST_EOF = 'Error: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF';
+
+test("a Go HTTP request's EOF is a retryable provider connection error, also inside a process close", () => {
+  const envelope = buildRuntimeErrorDiagnosticEnvelope(GO_MODEL_REQUEST_EOF);
+  assert.equal(envelope.spanAttrs.runtime_error_class, "ProviderConnectionError");
+  assert.equal(envelope.spanAttrs.turn_reason, "provider_connection_error");
+  assert.equal(envelope.spanAttrs.runtime_error_action ?? "none", "none");
+  assert.equal(recoverableRuntimeProcessCloseReason(GO_MODEL_REQUEST_EOF, null, null), "provider_connection_error");
+  assert.equal(recoverableRuntimeDeliveryBackoffReason(GO_MODEL_REQUEST_EOF, null, null), "provider_connection_error");
+  // The daemon's crash reason joins stderr lines with " | ".
+  assert.equal(
+    recoverableRuntimeProcessCloseReason(`exit code 1 | stderr: ${GO_MODEL_REQUEST_EOF} | retrying is up to the daemon`, null, null),
+    "provider_connection_error",
+  );
+  assert.equal(
+    recoverableRuntimeProcessCloseReason('Antigravity error: Get "https://example.test/v1/models": unexpected EOF', null, null),
+    "provider_connection_error",
+  );
+  // A raw stdout JSON line quoted in the crash reason keeps its escaped quotes.
+  const escaped = String.raw`exit code 1 | stdout: {"event":"result","result":{"status":"ERROR","error":"Post "https://example.test/v1:streamGenerateContent": EOF"}}`;
+  assert.equal(buildRuntimeErrorDiagnosticEnvelope(escaped).spanAttrs.runtime_error_class, "ProviderConnectionError");
+  assert.equal(recoverableRuntimeProcessCloseReason(escaped, null, null), "provider_connection_error");
+});
+
+test("text naming an EOF without a Go HTTP request is not a connection error", () => {
+  const cases = [
+    "Error: EOF",
+    "unexpected EOF while parsing settings.json",
+    "SyntaxError: Unexpected EOF in JSON input",
+    "Reached EOF on the heredoc: EOF",
+    'Post "not-a-url": EOF',
+    'Post "https://example.test/upload": EOFError raised by the tool',
+    String.raw`{"text":"Post "not-a-url": EOF"}`,
+  ];
+  for (const text of cases) {
+    assert.notEqual(buildRuntimeErrorDiagnosticEnvelope(text).spanAttrs.runtime_error_class, "ProviderConnectionError", text);
+    assert.equal(recoverableRuntimeProcessCloseReason(text, null, null), null, text);
+  }
+});
+
 test("buildRuntimeErrorDiagnosticEnvelope classifies provider timeout codes", () => {
   const timeout = buildRuntimeErrorDiagnosticEnvelope("API Error: model request failed with ETIMEDOUT");
   assert.equal(timeout.spanAttrs.runtime_error_class, "TimeoutError");
@@ -411,6 +495,12 @@ test("formatRuntimeLoginRequiredMessage gives action-oriented runtime copy", () 
     formatRuntimeLoginRequiredMessage("builtin"),
     "Built-in provider authentication failed. Check this agent's provider API key and region/provider selection, then retry starting this agent.",
   );
+  // DeepSeek Harness has no login: the saved key (mode 600) first, then the provider's key variable; any provider dsh routes to.
+  const dsh = formatRuntimeLoginRequiredMessage("dsh");
+  assert.match(dsh, /saved in dsh's own settings comes first/);
+  assert.match(dsh, /mode 600/);
+  assert.match(dsh, /DEEPSEEK_API_KEY for DeepSeek/);
+  assert.doesNotMatch(dsh, /not logged in|Settings/);
 });
 
 test("formatRuntimeStartTimeoutMessage names the provider as the likely cause, generic for most runtimes", () => {
@@ -700,4 +790,39 @@ test("a runtime error's trace class comes from the typed provider error, then th
   assert.equal(traceClass("Something went wrong", { codes: ["unknown"], httpStatus: 503 }).runtime_error_class, "ProviderServerError");
   // Nothing typed or recognisable: RuntimeError, no status.
   assert.deepEqual(traceClass("Execution failed"), { runtime_error_class: "RuntimeError", turn_reason: "unclassified_runtime_error" });
+});
+
+// #proj-o11y:#42: Antigravity wording that ended as the generic RuntimeError.
+// The texts are the ones agents showed in production (week to 2026-11-18).
+test("Antigravity's model, capacity, network and cut-off-reply wording gets a class instead of RuntimeError", () => {
+  const classOf = (message: string) => buildRuntimeErrorDiagnosticEnvelope(message).spanAttrs.runtime_error_class;
+
+  // The agent's model setting: no retry fixes it.
+  const notRecognized = 'Antigravity error: invalid model selection (--model "gemini-4-hydrogen" --effort ""): model gemini-4-hydrogen is not recognized as a known model or custom model in settings';
+  assert.equal(classOf(notRecognized), "ModelConfigError");
+  assert.equal(classOf('Antigravity CLI on this Computer no longer offers the model "gemini-pro-orchestrator-argon". Choose another model in the agent\'s settings.'), "ModelConfigError");
+  assert.equal(classifyRuntimeErrorCode({ message: notRecognized, errorClass: String(classOf(notRecognized)) }), "model_unavailable");
+  assert.equal(recoverableRuntimeProcessCloseReason(notRecognized, null, null), null, "a rejected model is not restarted");
+
+  // A temporary limit on the provider's side: backed off and retried.
+  const noCapacity = "Antigravity error: API error (attempt 1): UNAVAILABLE (code 503): No capacity available for model gemini-4-hydrogen-medium on the server";
+  assert.equal(classOf(noCapacity), "RateLimitError");
+  assert.equal(classOf("Antigravity error: Our servers are experiencing high traffic right now, please try again in a minute."), "RateLimitError");
+  assert.equal(classOf("Antigravity error: Resource exhausted. Please try again later."), "RateLimitError");
+  assert.equal(recoverableRuntimeDeliveryBackoffReason(noCapacity, null, null), "rate_limited");
+
+  // The connection to the provider.
+  const networkIssue = "Antigravity error: There was a network issue connecting to the server, please try again.";
+  assert.equal(classOf(networkIssue), "ProviderConnectionError");
+  assert.equal(recoverableRuntimeProcessCloseReason(networkIssue, null, null), "provider_connection_error");
+
+  // A reply cut off part-way.
+  const interrupted = "Antigravity error: The stream was interrupted. Please continue the task you were working on.";
+  assert.equal(classOf(interrupted), "ProviderStreamError");
+  assert.equal(classOf("Antigravity: the reply ended before it was complete"), "ProviderStreamError");
+  assert.equal(recoverableRuntimeProcessCloseReason(interrupted, null, null), "provider_stream_error");
+
+  // A used-up quota stays with the provider-limit path, and an account Google disabled stays unclassified.
+  assert.equal(classOf("Antigravity error: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 160h1m46s."), "RuntimeError");
+  assert.equal(classOf("Antigravity error: This service has been disabled in this account for violation of Terms of Service."), "RuntimeError");
 });

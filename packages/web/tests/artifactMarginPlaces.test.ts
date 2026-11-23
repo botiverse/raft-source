@@ -15,6 +15,7 @@ import type { ArtifactComment, ArtifactCommentDraft } from "@botiverse/raft-shar
 
 import {
   DRIFT_PX,
+  MARGIN_FOOT_PX,
   NO_MARGIN_PLACES,
   UNPLACED_POLL_CAP_MS,
   UNPLACED_POLL_MS,
@@ -26,6 +27,8 @@ import {
   marginOffsetOf,
   marginTopOf,
   nonePlaced,
+  openCardLift,
+  openCardRoom,
   refreshMark,
   refreshOf,
   unplacedPollAfterAsk,
@@ -331,4 +334,25 @@ test("which way is the report's: an older frame's (no scroll) keeps the viewport
   assert.equal(marginTopOf(newer, "b"), 380);
   // A tracked report with a scroll on viewport places (none from the document yet): as before.
   assert.equal(marginAfterTracked(viewport, "b", box(300), FRAME, { documentRect: box(1_300), scroll: scrolled(1_000) }).places.shift, -80);
+});
+
+test("a long thread's open card is never taller than the margin, and lifted it is whole in view (#triage:#531)", () => {
+  // No height yet (not laid out, jsdom): no bound.
+  assert.equal(openCardRoom(0), null);
+  assert.equal(openCardRoom(2 * MARGIN_FOOT_PX), null);
+  const column = { top: 100, bottom: 700 };
+  const room = openCardRoom(column.bottom - column.top)!;
+  assert.equal(room, 600 - 2 * MARGIN_FOOT_PX);
+  // A card that fits where it is isn't lifted.
+  assert.equal(openCardLift({ top: 200, bottom: 500 }, column), 0);
+  // One past the foot is lifted just enough to end MARGIN_FOOT_PX above it.
+  assert.equal(openCardLift({ top: 400, bottom: 750 }, column), 750 + MARGIN_FOOT_PX - 700);
+  // A long thread, anchored near the foot, capped to the room: lifted, its top and its reply box
+  // (its foot) are both inside the column, wherever its passage is.
+  for (const top of [column.top + MARGIN_FOOT_PX, 300, 650, 690]) {
+    const card = { top, bottom: top + room };
+    const lift = openCardLift(card, column);
+    assert.ok(card.top - lift >= column.top + MARGIN_FOOT_PX, `top at ${top}`);
+    assert.ok(card.bottom - lift <= column.bottom - MARGIN_FOOT_PX, `foot at ${top}`);
+  }
 });

@@ -30,7 +30,7 @@ import { useAgentStore } from "../../store/agentStore";
 import { useAuthStore } from "../../store/authStore";
 import { useChannelStore } from "../../store/channelStore";
 import { findStoredChannel } from "../../store/storedChannel";
-import { useMessageStore } from "../../store/messageStore";
+import { applyLocalMessagePatch } from "../../store/messageUpdatedApply";
 import { withSecondFactorStepUp } from "../settings/secondFactorStepUp";
 import { useServerStore } from "../../store/serverStore";
 import { useThreadStore } from "../../store/threadStore";
@@ -162,7 +162,7 @@ export function useActionCardEvents(messageId: string, metadata: Pick<ActionCard
 export function useApplyActionCardMutation(channelId: string) {
   return useCallback(
     (out: ActionCardMutationResponse): void => {
-      useMessageStore.getState().updateMessage({ id: out.messageId, channelId, actionMetadata: out.metadata });
+      applyLocalMessagePatch({ id: out.messageId, channelId, actionMetadata: out.metadata });
     },
     [channelId],
   );

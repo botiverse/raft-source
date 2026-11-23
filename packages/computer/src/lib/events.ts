@@ -33,6 +33,24 @@
 // (for example telemetry, automation, or shared app state) and then extend this
 // closed union with that consumer's contract.
 
+/**
+ * Why an approval used a device code instead of the loopback redirect
+ * (loopback login design §6, §9). Also sent as `loginFallbackReason` on the
+ * device-code authorize it starts; the Server keeps it on the row
+ * (`device_authorizations.login_fallback_reason`, audit only).
+ */
+export type LoginModeFallbackReason =
+  | "ssh"
+  | "no_display"
+  | "wsl"
+  | "no_tty"
+  | "bind_failed"
+  | "browser_open_failed"
+  | "server_unsupported"
+  | "user_chose_code"
+  | "no_grant"
+  | "flag";
+
 export type ComputerApiEvent =
   // --- login (LoginService) ---
   | {
@@ -45,9 +63,34 @@ export type ComputerApiEvent =
       // Server-provided integer seconds — kept for adapters that render a
       // human-style "expires in Xs" line (CLI's case).
       expiresInSeconds: number;
+      // Only when the authorize carried `--pair`: whether the server linked
+      // this request to the Add Computer window the command came from (it
+      // can be approved there; the code still works). Never the pairing id.
+      paired?: boolean;
     }
   | { kind: "login.polling" }
   | { kind: "login.approved"; userId: string; sessionPath: string }
+  // How this approval is completed (loopback login design §6, §9): by the
+  // browser on this machine coming back to a loopback listener, or by a code
+  // typed on the approval page, with why loopback was not used. Consumer: the
+  // CLI's trace (`computer.login.mode`) and its one-line reason.
+  | { kind: "login.mode"; mode: "loopback" }
+  | { kind: "login.mode"; mode: "device_code"; reason: LoginModeFallbackReason }
+  // Loopback: the approval page was opened in this machine's browser; the
+  // approval finishes here on its own. `canSwitchToCode`: the presenter may
+  // offer a code instead (the caller passed a switch signal).
+  | {
+      kind: "login.loopback-waiting";
+      approvalUrl: string;
+      expiresAt: string;
+      expiresInSeconds: number;
+      canSwitchToCode: boolean;
+    }
+  // Loopback outcome as the browser reported it (design §9). `state_mismatch`
+  // is a stray callback that was ignored; the wait goes on. Consumer: the
+  // CLI's trace (`computer.login.loopback.result`).
+  | { kind: "login.loopback.result"; result: "approved" | "denied" | "expired"; msToResult: number }
+  | { kind: "login.loopback.result"; result: "state_mismatch" }
 
   // --- attach (AttachService) ---
   | { kind: "attach.attaching"; serverSlug: string }

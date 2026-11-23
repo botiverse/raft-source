@@ -38,6 +38,12 @@ export interface SystemPromptOptions {
    * "Working through sub-agents" section; either one missing renders nothing.
    */
   supportsSubagents?: boolean;
+  /**
+   * This daemon runs `raft proc` jobs (it serves `proc@1`; `daemonRunsProcJobs`,
+   * set by `buildCliTransportSystemPrompt`). Renders the Background jobs entry
+   * last in the command list; absent/false renders none.
+   */
+  procJobs?: boolean;
 }
 
 // Facts, not a procedure (tygg, #proj-raft-computer:c56de9a4): when to start a
@@ -108,6 +114,10 @@ function buildPrompt(
     // Task v2 (`task_v2_conversations_v0`): absent on old Servers and flag-off
     // servers, which keeps the historical Tasks text.
     taskConversations: config.taskConversations === true,
+    // DM reply placement (`dm_reply_placement_prompt`): the DM rule in the
+    // task-conversations Tasks section, only where it is on. Absent on old
+    // Servers and flag-off servers, which keeps the text without it.
+    dmReplyPlacement: config.dmReplyPlacement === true,
     // First-party apps on for this Server (`enabledApps`, e.g. `artifacts`):
     // each one the guide knows adds its command-list entry, in the guide's
     // order. Absent on old Servers, which renders the historical text; the
@@ -120,6 +130,8 @@ function buildPrompt(
     // RFC 081 inbox items (`agent_inbox_items_v0`): entries 1 and 13 teach
     // `raft inbox read` only where it is on; absent keeps the historical text.
     inboxItems: config.inboxItems === true,
+    // `raft proc`: only where the daemon runs jobs (not Windows in v1).
+    procJobs: opts.procJobs === true,
     shell: opts.commandShell,
     // RFC 070: the MEMORY.md size target. Always on since the
     // `constructed_wake_context` flag was retired (2026-10-23).

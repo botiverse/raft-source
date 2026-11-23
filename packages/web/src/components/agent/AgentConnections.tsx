@@ -282,7 +282,7 @@ function GithubConnectionRow({
    * Starts the provider's OAuth flow and leaves for it (true: navigating away);
    * a failure closes the dialog and shows why.
    */
-  const start = useCallback(async (access: "public" | "private", target: AgentConnectionConnectorView | null = null): Promise<boolean> => {
+  const start = useCallback(async function start(access: "public" | "private", target: AgentConnectionConnectorView | null = null): Promise<boolean> {
     setError(null);
     setRevokeOnGithub(false);
     try {
@@ -307,7 +307,7 @@ function GithubConnectionRow({
 
   const handleStartContinue = useCallback((access: "public" | "private") => start(access, reconnectTarget), [start, reconnectTarget]);
 
-  const assign = useCallback(async (connectorId: string) => {
+  const assign = useCallback(async function assign(connectorId: string) {
     const connector = connectors.find((item) => item.id === connectorId);
     // Raft re-checks on the server; the UI only never offers what would be refused.
     if (!connector || !connector.canManage || connector.assignable === false || connectorId === (status.connectorId ?? attached?.id ?? null)) return;
@@ -349,7 +349,7 @@ function GithubConnectionRow({
    * `retry`: the Retry of a removal that did not take. Its warning stays up
    * (Retry disabled) until this one answers, instead of blinking away.
    */
-  const detach = useCallback(async (retry = false) => {
+  const detach = useCallback(async function detach(retry = false) {
     if (removingRef.current) return;
     removingRef.current = true;
     setRemoving(true);
@@ -412,7 +412,7 @@ function GithubConnectionRow({
     await onChanged();
   }, [agentId, onChanged]);
 
-  const runDisconnect = useCallback(async (connectorId: string, account: string | null) => {
+  const runDisconnect = useCallback(async function runDisconnect(connectorId: string, account: string | null) {
     try {
       await disconnectConnector(connectorId);
     } catch (err: unknown) {

@@ -114,6 +114,39 @@ test("web social sign-in: another browser cannot redeem someone's completion cod
   });
 });
 
+// The callback always answers 302; a failed one is counted by error_code on its
+// request span (#raft-botiverse-deployment:#309).
+test("web social sign-in: a failed provider callback names its failure on the request span", async ({ app }) => {
+  await withOAuthEnv(async () => {
+    const sink = new MemoryTraceSink();
+    app.app.set("serverTracer", new BasicTracer({ sink }));
+    const callbackCodes = () => sink.getAllSpans()
+      .filter((span) => span.name === "server.http.request" && span.attrs?.route_pattern === "/api/auth/:provider/callback")
+      .map((span) => span.attrs?.error_code ?? null);
+    const start = await fetch(`${app.baseUrl}/api/auth/google/start`, { redirect: "manual" });
+    const stateCookie = start.headers.get("set-cookie")!.split(";")[0]!;
+    const state = encodeURIComponent(new URL(start.headers.get("location")!).searchParams.get("state")!);
+
+    // The state cookie did not come back (another site, an expired start).
+    const noCookie = await fetch(`${app.baseUrl}/api/auth/google/callback?code=provider-code&state=${state}`, { redirect: "manual" });
+    assert.equal(noCookie.status, 302);
+    assert.match(new URL(noCookie.headers.get("location")!).searchParams.get("error") ?? "", /invalid or expired/u);
+    // The person declined at the provider.
+    const declined = await fetch(`${app.baseUrl}/api/auth/google/callback?error=access_denied&state=${state}`, { redirect: "manual", headers: { Cookie: stateCookie } });
+    assert.equal(declined.status, 302);
+    assert.deepEqual(callbackCodes(), ["state_invalid", "provider_declined"]);
+
+    // A callback that works carries no error_code.
+    const restore = installGoogle(ATTACKER_EMAIL);
+    try {
+      await attackerRoundTrip(app.baseUrl);
+    } finally {
+      restore();
+    }
+    assert.deepEqual(callbackCodes(), ["state_invalid", "provider_declined", null]);
+  });
+});
+
 const webBuild = (version: string, platform = "browser") => ({ "X-Raft-Client-Platform": platform, "X-Raft-Client-Version": version });
 
 // Warden's invariant for retiring social_completion_binding (#raft-architecture:#32,

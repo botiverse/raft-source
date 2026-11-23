@@ -1,4 +1,5 @@
 import { Router, type Router as ExpressRouter } from "express";
+import { agentProfileDescriptionFor } from "../lib/descriptionVisibility";
 import { createRaftStructuredUserRefRegex, extractRaftMentionHandles, normalizeTranslationLanguageCode } from "@botiverse/raft-shared";
 import { kickAppNotificationDelivery } from "../services/appNotificationDeliveryService";
 import { agentFindableBy } from "../services/agentMemberListPolicy";
@@ -464,10 +465,12 @@ async function listPublicMessages(channelId: string, serverId: string, limit: nu
         : row.senderType === "agent"
           ? publicAgentAvatarUrl(row.agentAvatarUrl, serverId)
           : null,
+      // A signed-out visitor is no member: an agent's description is not
+      // theirs to read (descriptionVisibility); a person's stays as before.
       description: row.senderType === "user"
         ? row.userDescription
         : row.senderType === "agent"
-          ? row.agentDescription
+          ? agentProfileDescriptionFor(null, { serverId, description: row.agentDescription })
           : null,
     },
     messageType: row.messageType,

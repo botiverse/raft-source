@@ -10,7 +10,7 @@ import { createMessage } from "../services/messageService";
 import { addHuman, createChannel, markThreadDone, unfollowThread } from "../services/channelService";
 import { emitTaskCreated } from "../services/taskRealtimeEvents";
 import { headers, recordTestInboxFact, seedThreadFixture, type Fixtures } from "./channels.api.fixtures";
-import { seedBoundGuest } from "../test/guestFixture";
+import { seedBoundGuest, seedStrayGuestChannelRow } from "../test/guestFixture";
 
 const requireWeb = createRequire(new URL("../../../web/package.json", import.meta.url));
 const { io: clientIo } = requireWeb("socket.io-client");
@@ -22,7 +22,7 @@ const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 async function bindGuestElsewhere(f: Fixtures, opts: { memberOfParent?: boolean } = {}) {
   const home = await createChannel(f.serverId, `guest-home-${randomUUID().slice(0, 8)}`, undefined, "private");
   await seedBoundGuest({ serverId: f.serverId, userId: f.followerId, channelId: home.id });
-  if (opts.memberOfParent !== false) await addHuman(f.parentChannelId, f.followerId);
+  if (opts.memberOfParent !== false) await seedStrayGuestChannelRow({ channelId: f.parentChannelId, userId: f.followerId });
   return home;
 }
 // "Visible": the follower is a Guest of the parent channel itself.

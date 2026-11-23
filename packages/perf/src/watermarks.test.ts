@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { checkWatermarks, parseWatermarkFile, readValues } from "./watermarks";
+import { buildCohort } from "./cohort";
+import { checkWatermarks, parseWatermarkFile, readCohort, readValues } from "./watermarks";
 
 const file = { marks: { scroll_slow_frame_pct: { max: 30 }, channel_switch_ms: { max: 800 } } };
 
@@ -41,9 +42,43 @@ describe("checkWatermarks: the page the lines were set on", () => {
   });
 });
 
-describe("readValues", () => {
-  it("a report gives its metrics and its page", () => {
-    expect(readValues({ tool: "raft-perf interact", page: { server: "qa", channel: "busy" }, metrics: { channel_switch_ms: 300 } })).toEqual({ values: { channel_switch_ms: 300 }, page: { server: "qa", channel: "busy" } });
+describe("checkWatermarks: the cohort the lines were set on", () => {
+  const cohorted = parseWatermarkFile({
+    cohort: { browserWhere: "local", fixture: "bench-v1@5395d2b0", benchmarkMs: 9.0 },
+    page: { server: "qa-perf-bench", channel: "bench-v1" },
+    marks: { channel_switch_ms: { max: 350 } },
+  });
+  const matching = buildCohort({
+    browserWhere: "local",
+    hostCpuCount: 12,
+    hostBenchmarkMs: 9.2,
+    device: { browserCpuCount: 12, browserMemoryGb: 8, browserBenchmarkMs: 9.2 },
+    fixture: "bench-v1@5395d2b0",
+  });
+  it("passes when both page and cohort match", () => {
+    expect(checkWatermarks({ channel_switch_ms: 300 }, cohorted, { server: "qa-perf-bench", channel: "bench-v1" }, matching)).toMatchObject({
+      ok: true,
+      checked: 1,
+      pageMatch: "same",
+      cohortMatch: "same",
+      cohortDiffers: [],
+    });
+  });
+  it("refuses a Browser Run report or a machine swap against local lines", () => {
+    const remote = buildCohort({ browserWhere: "browser-run", hostCpuCount: 12, hostBenchmarkMs: 9.0, device: { browserCpuCount: 4, browserMemoryGb: 2, browserBenchmarkMs: 21.0 }, fixture: "bench-v1@5395d2b0" });
+    const res = checkWatermarks({ channel_switch_ms: 150 }, cohorted, { server: "qa-perf-bench", channel: "bench-v1" }, remote);
+    expect(res.ok).toBe(false);
+    expect(res.checked).toBe(0);
+    expect(res.cohortMatch).toBe("different");
+    expect(res.cohortDiffers?.map((d) => d.field)).toEqual(["browserWhere", "benchmarkMs"]);
+  });
+});
+
+describe("readValues and readCohort", () => {
+  it("a report gives its metrics, its page, and its cohort", () => {
+    const raw = { tool: "raft-perf interact", cohort: { browserWhere: "local" }, page: { server: "qa", channel: "busy" }, metrics: { channel_switch_ms: 300 } };
+    expect(readValues(raw)).toEqual({ values: { channel_switch_ms: 300 }, page: { server: "qa", channel: "busy" } });
+    expect(readCohort(raw)).toEqual({ browserWhere: "local" });
   });
   it("a flat object of values may carry a page too, and it is compared: it cannot pass as 'no page'", () => {
     const read = readValues({ page: { server: "x", channel: "y" }, channel_switch_ms: 300 });
@@ -52,6 +87,7 @@ describe("readValues", () => {
   });
   it("no page, or a page that is not an object, is no page; values that are not an object are refused", () => {
     expect(readValues({ channel_switch_ms: 300 }).page).toBeNull();
+    expect(readCohort({ channel_switch_ms: 300 })).toBeNull();
     expect(readValues({ page: "wa-main", metrics: { a: 1 } })).toEqual({ values: { a: 1 }, page: null });
     expect(() => readValues([1])).toThrow(/not a JSON object/);
     expect(() => readValues(null)).toThrow(/not a JSON object/);
@@ -59,8 +95,11 @@ describe("readValues", () => {
 });
 
 describe("parseWatermarkFile", () => {
-  it("reads the page the lines were set on, and refuses one that names nothing", () => {
+  it("reads the page and cohort the lines were set on, and refuses malformed ones", () => {
     expect(parseWatermarkFile({ page: { server: "qa", channel: "busy" }, marks: { a: { max: 1 } } }).page).toEqual({ server: "qa", channel: "busy" });
+    expect(parseWatermarkFile({ cohort: { browserWhere: "browser-run", edgeColo: "sin" }, marks: { a: { max: 1 } } }).cohort).toEqual({ browserWhere: "browser-run", edgeColo: "SIN" });
+    expect(() => parseWatermarkFile({ cohort: {}, marks: { a: { max: 1 } } })).toThrow(/at least one constraint/);
+    expect(() => parseWatermarkFile({ cohort: { browserWhere: "cloud" }, marks: { a: { max: 1 } } })).toThrow(/browserWhere/);
     expect(() => parseWatermarkFile({ page: {}, marks: { a: { max: 1 } } })).toThrow(/"page" must be/);
     expect(() => parseWatermarkFile({ page: { channel: 7 }, marks: { a: { max: 1 } } })).toThrow(/"page" must be/);
     expect(() => parseWatermarkFile({ page: "busy", marks: { a: { max: 1 } } })).toThrow(/"page" must be/);

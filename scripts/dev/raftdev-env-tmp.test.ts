@@ -7,7 +7,29 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "vitest";
 
-import { cloudflaredLogPath, prepareServiceTmpdir, runTmuxShellCommand, serviceSpawnEnv, tmuxShellCommand } from "./raftdev";
+import {
+  cloudflaredLogPath,
+  prepareServiceTmpdir,
+  runTmuxShellCommand,
+  serviceSpawnEnv,
+  tmuxSessionAgentEnvArgs,
+  tmuxShellCommand,
+  tmuxSupportsSessionEnv,
+} from "./raftdev";
+
+// #raft-architecture:#34: panes inherit the tmux SERVER's environment; the
+// session's own SLOCK_AGENT_ID names the agent that started raftdev.
+test("the tmux session names the calling agent (tmux 3.2+, a caller with an id)", () => {
+  const agent = "5e4d3c2b-1a0f-4e9d-8c7b-6a5f4e3d2c1b";
+  assert.deepEqual(tmuxSessionAgentEnvArgs({ SLOCK_AGENT_ID: agent }, "tmux 3.4\n"), ["-e", `SLOCK_AGENT_ID=${agent}`]);
+  assert.deepEqual(tmuxSessionAgentEnvArgs({ SLOCK_AGENT_ID: agent }, "tmux 3.1c"), []);
+  assert.deepEqual(tmuxSessionAgentEnvArgs({ SLOCK_AGENT_ID: agent }, ""), []);
+  assert.deepEqual(tmuxSessionAgentEnvArgs({}, "tmux 3.4"), []);
+  assert.deepEqual(tmuxSessionAgentEnvArgs({ SLOCK_AGENT_ID: "x; rm -rf /" }, "tmux 3.4"), []);
+  assert.equal(tmuxSupportsSessionEnv("tmux next-3.5"), true);
+  assert.equal(tmuxSupportsSessionEnv("tmux 3.2a"), true);
+  assert.equal(tmuxSupportsSessionEnv("tmux master"), false);
+});
 
 test("tmux windows get the environment TMPDIR and compile cache exported", () => {
   const cmd = tmuxShellCommand("pnpm --filter @botiverse/raft-web dev", {

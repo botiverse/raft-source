@@ -63,8 +63,12 @@ function SwitchRow({
   );
 }
 
-/** Settings → Account. */
-export function UsageDataSettingsCard() {
+/**
+ * Settings → Account. With data export on, the section is Data & privacy
+ * (`label`) and Export My Data follows the switch (`children`,
+ * features/settings/account/DataExportSection.tsx).
+ */
+export function UsageDataSettingsCard({ label, children }: { label?: string; children?: ReactNode } = {}) {
   const { formatMessage } = useIntl();
   const idPrefix = useId();
   const shareUsageData = useAuthStore((s) => s.user?.shareUsageData ?? null);
@@ -87,7 +91,7 @@ export function UsageDataSettingsCard() {
       <SectionHeader
         className="mb-3"
         icon={<BarChart3 size={16} />}
-        label={formatMessage({ id: "settings.workspaceProductAnalytics.sectionLabel" })}
+        label={label ?? formatMessage({ id: "settings.workspaceProductAnalytics.sectionLabel" })}
       />
       <SwitchRow
         idPrefix={idPrefix}
@@ -110,6 +114,7 @@ export function UsageDataSettingsCard() {
           </Banner>
         )}
       />
+      {children}
     </div>
   );
 }
@@ -119,8 +124,12 @@ interface WorkspaceProductAnalyticsSettings {
   canManageProductAnalytics: boolean;
 }
 
-/** Settings → Administration (owners and admins). */
-export function WorkspaceProductAnalyticsSection() {
+/**
+ * Settings → Administration (owners and admins). With server data export on,
+ * the section is Data & privacy (`label`) and the owner's export follows the
+ * switch (`children`, features/settings/administration/ServerDataPrivacySection.tsx).
+ */
+export function WorkspaceProductAnalyticsSection({ label, children }: { label?: string; children?: ReactNode } = {}) {
   const { formatMessage } = useIntl();
   const idPrefix = useId();
   const serverId = useServerStore((s) => s.current?.id);
@@ -164,7 +173,7 @@ export function WorkspaceProductAnalyticsSection() {
       <SectionHeader
         className="mb-3"
         icon={<BarChart3 size={16} />}
-        label={formatMessage({ id: "settings.workspaceProductAnalytics.sectionLabel" })}
+        label={label ?? formatMessage({ id: "settings.workspaceProductAnalytics.sectionLabel" })}
       />
       <SwitchRow
         idPrefix={idPrefix}
@@ -179,6 +188,7 @@ export function WorkspaceProductAnalyticsSection() {
           </Banner>
         )}
       />
+      {children}
     </div>
   );
 }

@@ -1,29 +1,36 @@
+import type { ResolvedInlineQuote } from "@botiverse/raft-shared";
+
+export type QuoteReplyAuthorType = ResolvedInlineQuote["author"]["type"];
+
 /**
- * Selection-quote v0 (#proj-chat task #32).
+ * Selection-quote v0 (#proj-chat task #32) & Quote Reply v0 (#proj-chat task #34).
  *
- * When a user highlights part of a message and picks "Quote" from the
- * floating selected-text shortcut, the highlighted plain text is wrapped as a
- * markdown blockquote and appended to the composer draft of the surface the
- * message lives in (channel timeline composer, or the thread composer when the
- * message is a thread reply / thread parent rendered in ThreadPanel).
- *
- * Routing is by `channelId`: the selected-text shortcut resolves the correct
- * composer channelId from message metadata, and the live MessageInput for that
- * channelId pulls the quote in + focuses.
- *
- * v0 known limitation (tracked for v1): the quoted text is
- * `Selection.toString()` — the rendered plain text. Source markdown
- * (bold/links/code) is NOT preserved; `Hello **world**` quotes as
- * `Hello world`. v1 will do DOM→markdown roundtrip or source-offset slicing.
+ * When `quote_reply_v0` is off on the current server, quoting highlighted text
+ * wraps it as a markdown blockquote (`> ...`) and appends it to the target
+ * composer draft. When `quote_reply_v0` is on and `source` carries `messageId`,
+ * the target composer attaches a structured, jumpable pending quote that
+ * serializes as `> <excerpt>\n> msg=<shortId>` on send.
  */
 
 export const SELECTED_TEXT_QUOTE_EVENT = "slock:selected-text-quote";
 
+export interface SelectedTextQuoteSource {
+  messageId: string;
+  authorName?: string;
+  authorType?: QuoteReplyAuthorType;
+  createdAt?: string;
+  isPartial?: boolean;
+}
+
 export interface SelectedTextQuoteDetail {
   /** Composer channelId the quote should land in. */
   channelId: string;
-  /** Markdown blockquote (no surrounding blank lines). */
+  /** Markdown blockquote (no surrounding blank lines), used when quote_reply_v0 is off. */
   quote: string;
+  /** Raw selected text (or whole-message excerpt), used when quote_reply_v0 is on. */
+  rawText?: string;
+  /** Source message metadata for structured jumpable quote replies. */
+  source?: SelectedTextQuoteSource;
 }
 
 /**
@@ -48,16 +55,25 @@ export function hasQuotableSelection(text: string): boolean {
 }
 
 /**
- * Format the selection and notify the live composer for `channelId` to append
- * it + focus. Returns false (no-op) when the selection is effectively empty.
+ * Format the selection and notify the live composer for `channelId` to attach
+ * or append it + focus. Returns false (no-op) when the selection is effectively empty.
  */
-export function emitSelectedTextQuote(channelId: string, selectedText: string): boolean {
-  if (!hasQuotableSelection(selectedText)) return false;
+export function emitSelectedTextQuote(
+  channelId: string,
+  selectedText: string,
+  source?: SelectedTextQuoteSource,
+): boolean {
+  if (!hasQuotableSelection(selectedText) && !source?.messageId) return false;
   if (typeof window === "undefined") return false;
-  const quote = formatSelectedTextQuote(selectedText);
+  const quote = hasQuotableSelection(selectedText) ? formatSelectedTextQuote(selectedText) : "";
+  const CustomEventCtor = window.CustomEvent ?? CustomEvent;
   window.dispatchEvent(
-    new CustomEvent<SelectedTextQuoteDetail>(SELECTED_TEXT_QUOTE_EVENT, {
-      detail: { channelId, quote },
+    new CustomEventCtor<SelectedTextQuoteDetail>(SELECTED_TEXT_QUOTE_EVENT, {
+      detail: {
+        channelId,
+        quote,
+        ...(source ? { rawText: selectedText, source } : {}),
+      },
     }),
   );
   return true;

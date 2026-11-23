@@ -196,6 +196,26 @@ test("task read: GET /tasks/read with the window flags; the window is named by t
   assert.doesNotMatch(out, /replyTarget=/);
 });
 
+test("task read: a task from before task v2 names its earlier thread, also when its conversation is still empty", async () => {
+  const earlierDiscussion = { target: "#proj:abcd1234", replyCount: 3 };
+  const empty = harness(() => ok({ target: "#proj:#7", earlierDiscussion, messages: [], has_more: false, has_older: false, has_newer: false }));
+  await taskReadCommand.handler(empty.ctx, "#proj:#7", {});
+  assert.equal(
+    empty.out(),
+    'Earlier discussion (before task conversations): #proj:abcd1234 — 3 replies; read it with raft message read --target "#proj:abcd1234"\n\nNo messages in this target.\n',
+  );
+  const window = harness(() => ok({
+    target: "#proj:#7",
+    earlierDiscussion,
+    messages: [{ seq: 12, id: "msg12121-0000-0000-0000-000000000000", createdAt: "2026-10-20T01:02:00.000Z", senderType: "human", senderName: "rc", content: "looks good" }],
+    has_more: false,
+    has_older: false,
+    has_newer: false,
+  }));
+  await taskReadCommand.handler(window.ctx, "#proj:#7", {});
+  assert.match(window.out(), /^Earlier discussion \(before task conversations\): #proj:abcd1234 — 3 replies; [^\n]*\n\n\[1\/1 seq=12 [^\n]*@rc: looks good\n$/);
+});
+
 test("task follow / unfollow: POST and receipts naming the ref", async () => {
   const follow = harness(() => ok({ ok: true, taskRef: "#proj:#7", following: true, changed: true }));
   await taskFollowCommand.handler(follow.ctx, "#proj:#7", {});

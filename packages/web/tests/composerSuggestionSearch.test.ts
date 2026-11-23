@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { rankBasicComposerSuggestions, rankComposerSuggestions } from "../src/utils/composerSuggestionSearch";
+import { chatMentionGroups } from "../src/components/message/chatMentionGroups";
+import { buildMentionCandidateGroups } from "../src/components/message/mentionCandidates";
+import type { MentionCandidate } from "../src/components/message/mentionCandidates";
+import { COMPOSER_SUGGESTION_MAX_RESULTS, rankBasicComposerSuggestions, rankComposerSuggestions } from "../src/utils/composerSuggestionSearch";
 import type { ComposerSuggestionSearchEntry } from "../src/utils/composerSuggestionSearch";
 
 interface ChannelSuggestion {
@@ -156,4 +159,62 @@ test("an entry's tier orders comparable matches; an exact name still leads and a
   // Nor can 40 loose tier-0 matches push out an exact name in a higher tier.
   const loose = [...Array.from({ length: 40 }, (_, index) => entry(index, `d-e-s-i-g-n-${index}`)), entry(40, "design", 1)];
   assert.equal(rankComposerSuggestions("design", loose)[0], "design");
+});
+
+test("chatMentionGroups caps rendered blank-query rows at COMPOSER_SUGGESTION_MAX_RESULTS while prioritizing in-channel members and keeping auxiliary icons stable", () => {
+  const candidates: MentionCandidate[] = [
+    ...Array.from({ length: 120 }, (_, i): MentionCandidate => ({
+      id: `outsider-${i}`,
+      name: `outsider-${i}`,
+      displayName: `Outsider ${i}`,
+      type: "agent",
+      avatarUrl: null,
+    })),
+    ...Array.from({ length: 12 }, (_, i): MentionCandidate => ({
+      id: `member-${i}`,
+      name: `member-${i}`,
+      displayName: `Member ${i}`,
+      type: "user",
+      avatarUrl: null,
+    })),
+    {
+      id: "slack-1",
+      name: "slack-peer",
+      displayName: "Slack Peer",
+      type: "external",
+      avatarUrl: null,
+    },
+  ];
+  const memberIds = new Set(Array.from({ length: 12 }, (_, i) => `member-${i}`));
+  const formatMessage = (({ id }: { id: string }) => id) as never;
+
+  const groupedFirst = chatMentionGroups(
+    buildMentionCandidateGroups({ candidates, query: "", channelMemberIds: memberIds }),
+    formatMessage,
+  );
+  const groupedSecond = chatMentionGroups(
+    buildMentionCandidateGroups({ candidates, query: "", channelMemberIds: memberIds }),
+    formatMessage,
+  );
+
+  const totalItems = groupedFirst.reduce((sum, g) => sum + g.items.length, 0);
+  assert.equal(totalItems, COMPOSER_SUGGESTION_MAX_RESULTS);
+  // All 12 channel members + 1 Slack external lead, followed by 17 outsiders (12 + 1 + 17 = 30).
+  assert.equal(groupedFirst[0]?.items.length, 13);
+  assert.equal(groupedFirst[1]?.items.length, 17);
+  // Auxiliary icon elements are module-constant references so memoized rows don't bust on icon identity.
+  assert.equal(groupedFirst[0]?.items[12]?.auxiliary, groupedSecond[0]?.items[12]?.auxiliary);
+  assert.equal(groupedFirst[1]?.items[0]?.auxiliary, groupedSecond[1]?.items[0]?.auxiliary);
+});
+
+test("prepared search field cache preserves ranking across sequential keystrokes and evicts cleanly past 4096 distinct fields", () => {
+  const large = Array.from({ length: 4200 }, (_, index): ComposerSuggestionSearchEntry<string> => ({
+    index,
+    suggestion: `channel-${index}`,
+    fields: [{ raw: `频道-${index}-讨论`, priority: 0 }],
+  }));
+
+  assert.equal(rankComposerSuggestions("taolun", large).length, COMPOSER_SUGGESTION_MAX_RESULTS);
+  assert.equal(rankComposerSuggestions("pd4199", large)[0], "channel-4199");
+  assert.equal(rankComposerSuggestions("pd0tl", large)[0], "channel-0");
 });

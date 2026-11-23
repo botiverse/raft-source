@@ -126,29 +126,46 @@ export async function uploadAttachmentBuffers(
       }
     });
 
+    async function writePreview(item: PlannedUpload): Promise<string | null> {
+      let thumbnailKey: string | null = null;
+      if (input.cdnStorage && item.plannedThumbnailKey) {
+        try {
+          const thumbnail = await input.preview.generateThumbnail(item.file.buffer, item.file.mimeType);
+          if (input.preview.isSvg(item.file.mimeType)) {
+            const raster = await input.preview.generateSvgRasterPreview(item.file.buffer);
+            await input.cdnStorage.put(
+              buildSvgRasterTransferKey(item.plannedThumbnailKey),
+              raster,
+              "image/webp",
+            );
+          }
+          await input.cdnStorage.put(item.plannedThumbnailKey, thumbnail, "image/webp");
+          thumbnailKey = item.plannedThumbnailKey;
+        } catch {
+          // The original remains publishable. Every preview key was already
+          // planned, so partial writes are swept instead of becoming blobs
+          // with no durable owner.
+        }
+      }
+      return thumbnailKey;
+    }
+
     try {
       const writeResults = await Promise.allSettled(planned.map(async (item) => {
-        await input.storage.put(item.storageKey, item.file.buffer, item.file.mimeType);
-        let thumbnailKey: string | null = null;
-        if (input.cdnStorage && item.plannedThumbnailKey) {
-          try {
-            const thumbnail = await input.preview.generateThumbnail(item.file.buffer, item.file.mimeType);
-            if (input.preview.isSvg(item.file.mimeType)) {
-              const raster = await input.preview.generateSvgRasterPreview(item.file.buffer);
-              await input.cdnStorage.put(
-                buildSvgRasterTransferKey(item.plannedThumbnailKey),
-                raster,
-                "image/webp",
-              );
-            }
-            await input.cdnStorage.put(item.plannedThumbnailKey, thumbnail, "image/webp");
-            thumbnailKey = item.plannedThumbnailKey;
-          } catch {
-            // The original remains publishable. Every preview key was already
-            // planned, so partial writes are swept instead of becoming blobs
-            // with no durable owner.
-          }
-        }
+        // The original and its preview are written side by side: both keys
+        // are already in the transfer manifest, so a preview written beside
+        // an original that then fails is swept like any other planned key.
+        // Back to back they cost two storage round trips per image.
+        // Both settle before the item does: if the original fails, cleanup
+        // (which may sweep the planned preview keys for good) must not start
+        // while the preview PUT is still in flight, or that PUT lands after
+        // the sweep and leaves a public file nothing owns.
+        const [originalWrite, previewWrite] = await Promise.allSettled([
+          input.storage.put(item.storageKey, item.file.buffer, item.file.mimeType),
+          writePreview(item),
+        ]);
+        if (originalWrite.status === "rejected") throw originalWrite.reason;
+        const thumbnailKey = previewWrite.status === "fulfilled" ? previewWrite.value : null;
         return { ...item, thumbnailKey };
       }));
       const failedWrite = writeResults.find(

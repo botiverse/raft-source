@@ -33,7 +33,7 @@ export type CredentialSourcePart =
   | { kind: "keychain"; service: string };
 
 export interface CredentialSource {
-  /** The Raft runtime id (`claude`, `codex`, `kimi-sdk`, `qoder`, `qwen`, `grok`). */
+  /** The Raft runtime id (`claude`, `codex`, `kimi-sdk`, `qoder`, `qwen`, `grok`, `dsh`). */
   runtime: string;
   parts: readonly CredentialSourcePart[];
 }
@@ -58,6 +58,7 @@ const RAFT_RUNTIME_BY_AUTH_RUNTIME: Readonly<Record<RuntimeAuthRuntime, string>>
   pi: "pi",
   grok: "grok",
   opencode: "opencode",
+  dsh: "dsh",
 };
 
 export function raftRuntimeOfAuthRuntime(authRuntime: RuntimeAuthRuntime): string {
@@ -138,7 +139,26 @@ const CREDENTIAL_SOURCE_RESOLVERS: Readonly<Record<string, (ctx: CredentialLocat
     const grokHome = resolvedEnvDir(ctx, "GROK_HOME") ?? path.join(homeOf(ctx), ".grok");
     return [{ kind: "file", path: path.join(grokHome, "auth.json") }];
   },
+  // DeepSeek Harness's local credential store ($DSH_HOME/.credentials.yaml,
+  // ~/.dsh by default), where a key saved in dsh's own settings goes. It
+  // ranks above the environment, so it is watched with DEEPSEEK_API_KEY set too.
+  dsh: (ctx) => {
+    const dshHome = resolvedEnvDir(ctx, "DSH_HOME") ?? path.join(homeOf(ctx), ".dsh");
+    return [{ kind: "file", path: path.join(dshHome, ".credentials.yaml") }];
+  },
 };
+
+/**
+ * The account folder a Codex or Claude usage read signs in from under
+ * `ctx.env` (the same resolution as its credential above): CODEX_HOME /
+ * CLAUDE_CONFIG_DIR (relative to `ctx.cwd`), else `.codex` / `.claude` in the
+ * home. Normalized, so two spellings of one folder compare equal. Never
+ * traced or sent.
+ */
+export function runtimeAccountFolder(provider: "codex" | "claude", ctx: CredentialLocationContext): string {
+  const configured = resolvedEnvDir(ctx, provider === "codex" ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR");
+  return configured ?? path.resolve(ctx.cwd, homeOf(ctx), provider === "codex" ? ".codex" : ".claude");
+}
 
 export function credentialSourceFor(runtime: string, ctx: CredentialLocationContext): CredentialSource | null {
   const resolve = CREDENTIAL_SOURCE_RESOLVERS[runtime];

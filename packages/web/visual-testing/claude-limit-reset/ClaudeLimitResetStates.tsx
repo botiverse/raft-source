@@ -1,10 +1,11 @@
-import type { RuntimeAccountUsageSnapshot, RuntimeLimitResetIdempotencyKey, RuntimeLimitResetResult } from "@botiverse/raft-shared";
+import type { RuntimeAccountUsageSnapshot, RuntimeLimitResetIdempotencyKey, RuntimeLimitResetResult, RuntimeLimitResetsReadResult } from "@botiverse/raft-shared";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { RuntimeUsageSurface } from "../../src/components/machine/RuntimeUsageSurface";
 import type { SurfaceClaudeLimitReset } from "../../src/components/machine/RuntimeUsageSurface";
 import { ClaudeLimitResetConfirmDialog, ClaudeLimitResetsDialog } from "../../src/features/computer/ClaudeLimitResetsDialog";
-import { claudeLimitResetNote } from "../../src/features/computer/claudeLimitResetCopy";
+import { claudeLimitResetKeptNote, claudeLimitResetNote } from "../../src/features/computer/claudeLimitResetCopy";
+import type { MessageId } from "../../src/i18n/messages/en";
 import { RuntimeAuthClient } from "../../src/utils/runtimeAuthClient";
 import type { RuntimeAuthSocket } from "../../src/utils/runtimeAuthClient";
 
@@ -38,11 +39,12 @@ function usage(atFiveHourLimit: boolean): RuntimeAccountUsageSnapshot {
 const AT_WALL = { state: "fresh", snapshot: usage(true) } as const;
 const BELOW = { state: "fresh", snapshot: usage(false) } as const;
 
-const READ = {
+const WEEKLY = { kind: "weekly", state: "available", resetsLeft: 1, expiresText: "Nov 26, 4:59pm" } as const;
+const READ: RuntimeLimitResetsReadResult = {
   kind: "read",
   resets: [
     { kind: "five_hour", state: "available", resetsLeft: 2, expiresText: "Nov 19, 4:59pm" },
-    { kind: "weekly", state: "available", resetsLeft: 1, expiresText: "Nov 16, 4:59pm" },
+    WEEKLY,
     { kind: "fable", state: "available", resetsLeft: 3, expiresText: "Nov 22, 4:59pm" },
     { kind: "full", state: "none" },
   ],
@@ -51,22 +53,27 @@ const READ = {
 const SOCKET = { on() { return this; }, off() { return this; } } as unknown as RuntimeAuthSocket;
 const SOCKETS = { current: () => SOCKET, onReplaced: () => () => {} };
 
-function client(redeem: () => Promise<unknown>): RuntimeAuthClient {
+// `read: null`: the read never answers (the "This takes a moment" state).
+function client(redeem: () => Promise<unknown>, read: RuntimeLimitResetsReadResult | null = READ): RuntimeAuthClient {
   return new RuntimeAuthClient({
     get: async <T,>() => ({}) as T,
-    post: async <T,>(url: string) => (url.endsWith("/limit-resets/read") ? { result: READ } : await redeem()) as T,
+    post: async <T,>(url: string) => (url.endsWith("/limit-resets/read")
+      ? (read ? { result: read } : await new Promise(() => {}))
+      : await redeem()) as T,
   }, SOCKETS);
 }
 
 const OK_CLIENT = client(async () => ({ result: { kind: "reset" }, snapshot: null }));
+const READING_CLIENT = client(async () => ({ result: { kind: "reset" }, snapshot: null }), null);
 const RATE_LIMITED_CLIENT = client(async () => {
   throw Object.assign(new Error("rate_limited"), { response: { status: 429, data: { code: "rate_limited" } } });
 });
 
 function noop() {}
 
-const WALL_ACTIONS: SurfaceClaudeLimitReset = { atFiveHourLimit: true, onView: noop, onUseFiveHour: noop };
-const BELOW_ACTIONS: SurfaceClaudeLimitReset = { atFiveHourLimit: false, onView: noop, onUseFiveHour: null };
+const WALL_ACTIONS: SurfaceClaudeLimitReset = { atFiveHourLimit: true, canUse: true, onOpen: noop };
+const BELOW_ACTIONS: SurfaceClaudeLimitReset = { atFiveHourLimit: false, canUse: true, onOpen: noop };
+const VIEW_ONLY_ACTIONS: SurfaceClaudeLimitReset = { atFiveHourLimit: false, canUse: false, onOpen: noop };
 
 const NOTE_RESULTS: Record<string, RuntimeLimitResetResult> = {
   "result-success": { kind: "reset" },
@@ -74,7 +81,15 @@ const NOTE_RESULTS: Record<string, RuntimeLimitResetResult> = {
   "result-unknown": { kind: "unknown" },
 };
 
-function Card({ atWall, note }: { atWall: boolean; note: string | null }) {
+// Lines a read ends with (claudeLimitResetReadStep).
+const READ_NOTES: Record<string, MessageId> = {
+  "legacy-reset": "machine.runtimeUsage.claudeReset.legacyReset",
+  "legacy-used": "machine.runtimeUsage.claudeReset.legacyUsed",
+  "none-to-use": "machine.runtimeUsage.claudeReset.noneToUse",
+  "none-at-limit": "machine.runtimeUsage.claudeReset.noneAtLimit",
+};
+
+function Card({ atWall, note, actions }: { atWall: boolean; note: string | null; actions?: SurfaceClaudeLimitReset }) {
   return (
     <div data-shot="scene" className="w-[390px] rounded-lg border border-line-seam bg-layer-popover shadow-float">
       <RuntimeUsageSurface
@@ -90,7 +105,7 @@ function Card({ atWall, note }: { atWall: boolean; note: string | null }) {
         auth={null}
         runtimeName="Claude Code"
         limitReset={null}
-        claudeLimitReset={atWall ? WALL_ACTIONS : BELOW_ACTIONS}
+        claudeLimitReset={actions ?? (atWall ? WALL_ACTIONS : BELOW_ACTIONS)}
         note={note}
       />
     </div>
@@ -103,19 +118,24 @@ export function ClaudeLimitResetStates({ caseId }: { caseId: string }) {
   switch (caseId) {
     case "card-wall": return page(<Card atWall note={null} />);
     case "card-below": return page(<Card atWall={false} note={null} />);
-    case "consent":
-    case "list-wall":
-      return page(<ClaudeLimitResetsDialog serverId="s" machineId="m" atFiveHourLimit client={OK_CLIENT} onUse={noop} onLegacy={noop} onClose={noop} />);
-    case "list-below":
-      return page(<ClaudeLimitResetsDialog serverId="s" machineId="m" atFiveHourLimit={false} client={OK_CLIENT} onUse={noop} onLegacy={noop} onClose={noop} />);
+    case "card-view-only": return page(<Card atWall={false} note={null} actions={VIEW_ONLY_ACTIONS} />);
+    case "reading":
+      return page(<ClaudeLimitResetsDialog serverId="s" machineId="m" atFiveHourLimit={false} client={READING_CLIENT} onUse={noop} onNote={noop} onClose={noop} />);
+    case "choose":
+      // Below the limit, several kinds usable: "Which reset do you want to use?".
+      return page(<ClaudeLimitResetsDialog serverId="s" machineId="m" atFiveHourLimit={false} client={OK_CLIENT} onUse={noop} onNote={noop} onClose={noop} />);
     case "list-read-only":
       // An owner or admin who did not connect the Computer: the same read, nothing to use.
-      return page(<ClaudeLimitResetsDialog serverId="s" machineId="m" atFiveHourLimit={false} canUse={false} client={OK_CLIENT} onUse={noop} onLegacy={noop} onClose={noop} />);
+      return page(<ClaudeLimitResetsDialog serverId="s" machineId="m" atFiveHourLimit={false} canUse={false} client={OK_CLIENT} onUse={noop} onNote={noop} onClose={noop} />);
     case "confirm":
-      return page(<ClaudeLimitResetConfirmDialog serverId="s" machineId="m" kind="weekly" account={EMAIL} atFiveHourLimit={false} idempotencyKey={KEY} client={OK_CLIENT} onOutcome={noop} onClose={noop} />);
+      return page(<ClaudeLimitResetConfirmDialog serverId="s" machineId="m" kind="weekly" status={WEEKLY} account={EMAIL} atFiveHourLimit={false} idempotencyKey={KEY} client={OK_CLIENT} onOutcome={noop} onClose={noop} />);
     case "result-refused":
-      return page(<ClaudeLimitResetConfirmDialog serverId="s" machineId="m" kind="weekly" account={EMAIL} atFiveHourLimit={false} idempotencyKey={KEY} client={RATE_LIMITED_CLIENT} onOutcome={noop} onClose={noop} />);
+      return page(<ClaudeLimitResetConfirmDialog serverId="s" machineId="m" kind="weekly" status={WEEKLY} account={EMAIL} atFiveHourLimit={false} idempotencyKey={KEY} client={RATE_LIMITED_CLIENT} onOutcome={noop} onClose={noop} />);
+    case "result-kept":
+      return page(<Card atWall={false} note={claudeLimitResetKeptNote(formatMessage, "weekly", WEEKLY)} />);
     default: {
+      const readNote = READ_NOTES[caseId];
+      if (readNote) return page(<Card atWall={caseId !== "none-to-use"} note={formatMessage({ id: readNote })} />);
       const result = NOTE_RESULTS[caseId] ?? NOTE_RESULTS["result-success"]!;
       return page(<Card atWall={false} note={claudeLimitResetNote(formatMessage, "weekly", result)} />);
     }

@@ -1,24 +1,29 @@
-import { CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY, claudeFiveHourLimitOf } from "@botiverse/raft-shared";
+import { CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY, claudeFiveHourLimitOf, defaultRuntimeUsageAccount } from "@botiverse/raft-shared";
 import type { RuntimeAccountUsageProvider, RuntimeAuthStatus, RuntimeLimitResetIdempotencyKey, RuntimeLimitResetKind } from "@botiverse/raft-shared";
 import { useCallback, useMemo, useState } from "react";
+import { useIntl } from "react-intl";
 import type { ReactNode } from "react";
 import type { SurfaceClaudeLimitReset } from "../../components/machine/RuntimeUsageSurface";
 import { useServerFeatureFlag } from "../../store/serverFeatureFlags";
 import type { RuntimeAccountUsageReadResult } from "../../utils/runtimeAccountUsageClient";
 import type { RuntimeAuthClient, RuntimeAuthView } from "../../utils/runtimeAuthClient";
 import { ClaudeLimitResetConfirmDialog, ClaudeLimitResetsDialog } from "./ClaudeLimitResetsDialog";
-import { claudeLimitResetsNotSupportedHere } from "./claudeLimitResetCopy";
+import { claudeLimitResetKeptNote, claudeLimitResetsNotSupportedHere } from "./claudeLimitResetCopy";
+import type { ClaudeLimitResetAvailable } from "./claudeLimitResetCopy";
 import { claudeLimitResetOffer } from "./claudeLimitResetOffer";
 import { forgetLimitResetAttemptKey, limitResetAttemptKey } from "./limitResetAttemptKey";
 import type { RuntimeLimitResetOutcome } from "./limitResetOutcome";
 
 /**
- * Claude limit resets on the usage card (claude_limit_reset;
+ * Claude limit resets on the usage card (claude_limit_reset_v2;
  * docs/contracts/runtime-account-usage.md): what the card offers, and the
  * list and confirm dialogs. Shown only to a person who may act on the
  * Computer's runtimes, where the flag is on and the server says what this
  * Computer can do (`RuntimeAuthView.claudeLimitResets`). What this viewer is
- * offered (use, the list only, or nothing) is `claudeLimitResetOffer`.
+ * offered ("Use a limit reset", the list only, or nothing) is
+ * `claudeLimitResetOffer`. "Use a limit reset" goes as Claude Code's
+ * `/limit-reset`: read, then the confirm of the one usable kind (or the
+ * chosen one), or a line on the card.
  */
 export function useClaudeLimitResets({
   serverId,
@@ -50,60 +55,61 @@ export function useClaudeLimitResets({
   showUsageAfterReset: (outcome: RuntimeLimitResetOutcome) => void;
   onNote: (text: string) => void;
 }): { surface: SurfaceClaudeLimitReset | null; dialogs: ReactNode } {
-  // Claude limit resets (claude_limit_reset): the list, and the confirm of one kind over it or on its own.
-  const [claudeDialog, setClaudeDialog] = useState<{
-    subject: string;
-    list: boolean;
-    confirm: { kind: RuntimeLimitResetKind; key: RuntimeLimitResetIdempotencyKey; account: string | null } | null;
-  } | null>(null);
-  // The Claude account (on this server and Computer) a read or a redeem showed
-  // on the older once-a-week 5-hour program: at the 5-hour limit its card
-  // offers only "Use 5-hour reset", since opening the list there would use
-  // it. The card's own state, for as long as the card is mounted.
-  const [legacyAccount, setLegacyAccount] = useState<string | null>(null);
+  const { formatMessage } = useIntl();
+  // Claude limit resets (claude_limit_reset_v2): the read (and the choice, if any), then the confirm of one kind in its place.
+  const [claudeDialog, setClaudeDialog] = useState<
+    | { subject: string; step: "read" }
+    | { subject: string; step: "confirm"; status: ClaudeLimitResetAvailable; atLimit: boolean; key: RuntimeLimitResetIdempotencyKey; account: string | null }
+    | null
+  >(null);
   // The Computer (on this server, for this provider) answered that Claude
   // limit resets cannot run there (macOS): the card stops offering them.
   const [notSupportedSubject, setNotSupportedSubject] = useState<string | null>(null);
   const markNotSupported = useCallback(() => setNotSupportedSubject(limitResetSubject), [limitResetSubject]);
-  // Claude: only where claude_limit_reset is on and the server says what this Computer can do.
+  // Claude: only where claude_limit_reset_v2 is on and the server says what this Computer can do.
   const claudeFlagOn = useServerFeatureFlag(CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY, { serverId }).enabled;
-  const claudeAccount = provider === "claude" && result && result.snapshot !== null ? result.snapshot.accounts[0] ?? null : null;
+  // Limit resets act on the Computer's default account only, never an agent's own folder's.
+  const claudeAccount = provider === "claude" && result && result.snapshot !== null ? defaultRuntimeUsageAccount(result.snapshot) : null;
   const claudeAtFiveHourLimit = provider === "claude" && result !== null && result.snapshot !== null
     && claudeFiveHourLimitOf(result.snapshot) === "at_limit";
   const claudeAccountLabel = claudeAccount ? claudeAccount.maskedLabel ?? claudeAccount.displayName ?? null : null;
-  const legacySubject = `${limitResetSubject}\0${claudeAccount?.accountKey ?? ""}`;
-  const openClaudeList = useCallback(() => {
+  const openClaudeRead = useCallback(() => {
     onAuthDialog?.();
-    setClaudeDialog({ subject: limitResetSubject, list: true, confirm: null });
+    setClaudeDialog({ subject: limitResetSubject, step: "read" });
   }, [limitResetSubject, onAuthDialog]);
-  const openClaudeConfirm = useCallback((kind: RuntimeLimitResetKind, fromList: boolean) => {
-    onAuthDialog?.();
+  // The read's one usable kind, or the one chosen: its confirm takes the read's place.
+  const openClaudeConfirm = useCallback((status: ClaudeLimitResetAvailable, atLimit: boolean) => {
     setClaudeDialog({
       subject: limitResetSubject,
-      list: fromList,
-      confirm: { kind, key: limitResetAttemptKey(`${limitResetSubject}\0${kind}`), account: claudeAccountLabel },
+      step: "confirm",
+      status,
+      atLimit,
+      key: limitResetAttemptKey(`${limitResetSubject}\0${status.kind}`),
+      account: claudeAccountLabel,
     });
-  }, [claudeAccountLabel, limitResetSubject, onAuthDialog]);
-  const pickClaudeKindFromList = useCallback((kind: RuntimeLimitResetKind) => openClaudeConfirm(kind, true), [openClaudeConfirm]);
+  }, [claudeAccountLabel, limitResetSubject]);
   const closeClaudeDialogs = useCallback(() => setClaudeDialog(null), []);
-  // Back to the list it came from, if any.
-  const closeClaudeConfirm = useCallback(() => setClaudeDialog((current) => (current?.confirm ? { ...current, confirm: null } : current)), []);
+  const handleClaudeReadNote = useCallback((text: string, usageChanged: boolean) => {
+    onNote(text);
+    setClaudeDialog(null);
+    if (usageChanged) void refresh();
+  }, [onNote, refresh]);
+  const closeClaudeConfirm = useCallback((kept: boolean) => {
+    // "No, keep it" before anything was sent: said as Claude Code says it.
+    if (kept && claudeDialog?.step === "confirm") onNote(claudeLimitResetKeptNote(formatMessage, claudeDialog.status.kind, claudeDialog.status));
+    setClaudeDialog(null);
+  }, [claudeDialog, formatMessage, onNote]);
   const handleClaudeOutcome = useCallback((outcome: RuntimeLimitResetOutcome & { kind: RuntimeLimitResetKind; note: string | null }) => {
     // Any answer ends the attempt (the Computer remembers a key only until it
     // restarts); a request that got no answer keeps the key for a retry.
     if (outcome.result !== null) forgetLimitResetAttemptKey(`${limitResetSubject}\0${outcome.kind}`);
-    if (outcome.result?.kind === "unknown" && outcome.result.fiveHourSpent) setLegacyAccount(legacySubject);
     if (outcome.result && claudeLimitResetsNotSupportedHere(outcome.result)) setNotSupportedSubject(limitResetSubject);
     if (outcome.note !== null) {
       onNote(outcome.note);
       setClaudeDialog(null);
     }
     if (outcome.result !== null) showUsageAfterReset(outcome);
-  }, [legacySubject, limitResetSubject, onNote, showUsageAfterReset]);
-  const handleClaudeLegacy = useCallback((spent: boolean) => {
-    setLegacyAccount(legacySubject);
-    if (spent) void refresh();
-  }, [legacySubject, refresh]);
+  }, [limitResetSubject, onNote, showUsageAfterReset]);
   // What this viewer is offered: use, the list only, or nothing.
   const offer = claudeLimitResetOffer({
     provider,
@@ -114,46 +120,37 @@ export function useClaudeLimitResets({
     atFiveHourLimit: claudeAtFiveHourLimit,
     notSupportedHere: notSupportedSubject === limitResetSubject,
   });
-  const surfaceClaudeLimitReset = useMemo<SurfaceClaudeLimitReset | null>(() => {
-    if (offer === null) return null;
-    const legacyAtLimit = claudeAtFiveHourLimit && legacyAccount === legacySubject;
-    return {
-      atFiveHourLimit: claudeAtFiveHourLimit,
-      onView: legacyAtLimit ? null : openClaudeList,
-      onUseFiveHour: claudeAtFiveHourLimit && offer === "ok" ? () => openClaudeConfirm("five_hour", false) : null,
-    };
-  }, [claudeAtFiveHourLimit, legacyAccount, legacySubject, offer, openClaudeConfirm, openClaudeList]);
+  const surfaceClaudeLimitReset = useMemo<SurfaceClaudeLimitReset | null>(() => (offer === null ? null : {
+    atFiveHourLimit: claudeAtFiveHourLimit,
+    canUse: offer === "ok",
+    onOpen: openClaudeRead,
+  }), [claudeAtFiveHourLimit, offer, openClaudeRead]);
 
-  const dialogs = (
-    <>
-      {claudeDialog?.subject === limitResetSubject && claudeDialog.list && (
-        <ClaudeLimitResetsDialog
-          serverId={serverId}
-          machineId={machineId}
-          atFiveHourLimit={claudeAtFiveHourLimit}
-          canUse={authView?.claudeLimitResetAccess?.canUse ?? true}
-          client={authClient}
-          onUse={pickClaudeKindFromList}
-          onLegacy={handleClaudeLegacy}
-          onNotSupported={markNotSupported}
-          onClose={closeClaudeDialogs}
-        />
-      )}
-      {claudeDialog?.subject === limitResetSubject && claudeDialog.confirm && (
-        <ClaudeLimitResetConfirmDialog
-          serverId={serverId}
-          machineId={machineId}
-          kind={claudeDialog.confirm.kind}
-          account={claudeDialog.confirm.account}
-          atFiveHourLimit={claudeAtFiveHourLimit}
-          idempotencyKey={claudeDialog.confirm.key}
-          client={authClient}
-          layer={claudeDialog.list ? 1 : 0}
-          onOutcome={handleClaudeOutcome}
-          onClose={closeClaudeConfirm}
-        />
-      )}
-    </>
+  const dialogs = claudeDialog?.subject !== limitResetSubject ? null : claudeDialog.step === "read" ? (
+    <ClaudeLimitResetsDialog
+      serverId={serverId}
+      machineId={machineId}
+      atFiveHourLimit={claudeAtFiveHourLimit}
+      canUse={authView?.claudeLimitResetAccess?.canUse ?? true}
+      client={authClient}
+      onUse={openClaudeConfirm}
+      onNote={handleClaudeReadNote}
+      onNotSupported={markNotSupported}
+      onClose={closeClaudeDialogs}
+    />
+  ) : (
+    <ClaudeLimitResetConfirmDialog
+      serverId={serverId}
+      machineId={machineId}
+      kind={claudeDialog.status.kind}
+      status={claudeDialog.status}
+      account={claudeDialog.account}
+      atFiveHourLimit={claudeAtFiveHourLimit || claudeDialog.atLimit}
+      idempotencyKey={claudeDialog.key}
+      client={authClient}
+      onOutcome={handleClaudeOutcome}
+      onClose={closeClaudeConfirm}
+    />
   );
   return { surface: surfaceClaudeLimitReset, dialogs };
 }

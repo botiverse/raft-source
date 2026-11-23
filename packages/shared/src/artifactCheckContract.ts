@@ -71,7 +71,7 @@ export const ARTIFACT_CHECK_REPORT_MAX_BYTES = 64 * 1024;
  * What the check saw, the `report` field of the result's form (JSON).
  * `checkId` and `lease` are the lease's. Lists past their caps are cut (the
  * first ones kept), not refused. `blank` and `phoneOverflow` are optional
- * (false and null when left out).
+ * (false and null when left out); so is `pageCantScroll` (none).
  */
 export interface ArtifactCheckReport {
   checkId: string;
@@ -81,9 +81,42 @@ export interface ArtifactCheckReport {
   blockedResources: string[];
   blank?: boolean;
   phoneOverflow?: { contentWidth: number; viewportWidth: number } | null;
+  /**
+   * A soft hint, for the agent only: the viewports at which the page is taller than the window
+   * and nothing lets a reader scroll to the rest (ArtifactCheckCantScroll), at most one a shot.
+   * Empty or left out when the page scrolls or fits; left out by a Worker older than it.
+   */
+  pageCantScroll?: ArtifactCheckCantScroll[];
   /** Where the check's time went (ArtifactCheckTiming); left out by a Worker older than it. */
   timing?: ArtifactCheckTiming;
 }
+
+/** What holds a page that can't scroll to one screen, as a CSS declaration (ArtifactCheckCantScroll `heldBy`). */
+export const ARTIFACT_CHECK_HOLD_STYLES = ["overflow: hidden", "overflow: clip", "position: fixed"] as const;
+export type ArtifactCheckHoldStyle = (typeof ARTIFACT_CHECK_HOLD_STYLES)[number];
+/** An element's name in `heldBy` is cut to this many characters (`html`, `body`, `div#root`, `main.app`). */
+export const ARTIFACT_CHECK_ELEMENT_MAX_CHARS = 60;
+/** At most this many elements are named in `heldBy`: html, body and one inside them. */
+export const ARTIFACT_CHECK_MAX_HELD_BY = 3;
+
+/**
+ * The page may not scroll for readers at one viewport (a soft hint; it may be intended: a
+ * full-window app that scrolls inside its own containers is never reported). Its content reaches
+ * `contentHeight` px down a window `viewportHeight` px tall, `hiddenHeight` px of it beyond any
+ * scrolling (the document's or an inner container's). Sizes are the viewport's CSS px (a phone
+ * page zoomed out to fit is scaled to the phone's own). `heldBy` names what holds it, where found:
+ * `html` / `body` with `overflow: hidden` or `clip`, and an element inside them that cuts it
+ * (`div#root`, the page's own name, cut to ARTIFACT_CHECK_ELEMENT_MAX_CHARS).
+ */
+// A type, not an interface: the agent API's read passes it as its passthrough schema's object.
+export type ArtifactCheckCantScroll = {
+  shot: ArtifactCheckShot;
+  viewportWidth: number;
+  viewportHeight: number;
+  contentHeight: number;
+  hiddenHeight: number;
+  heldBy: Array<{ element: string; style: ArtifactCheckHoldStyle }>;
+};
 
 /**
  * Where one check's time went, whole milliseconds, for the check's own latency (the result's

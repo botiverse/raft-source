@@ -1,6 +1,8 @@
 const CHANNEL_TRACE_STATE_KEYS = [
   "channels",
   "dmChannels",
+  // Agent Lounges live in their own list: a change to one (its mute, its display prefs) touches only this.
+  "loungeChannels",
   "channelActivity",
   "channelLocalMembership",
 ] as const;

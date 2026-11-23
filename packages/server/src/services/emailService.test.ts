@@ -328,6 +328,17 @@ test("onboarding welcome email uses Richard founder voice and escapes recipient 
   assert.doesNotMatch(html, /Cindy/);
 });
 
+test("onboarding renderers omit blank or reserved placeholder names", () => {
+  for (const render of [renderOnboardingWelcomeEmailHtml, renderOnboardingDayOneCheckInEmailHtml]) {
+    for (const recipientName of [undefined, null, "", " \t ", "pending_0123456789abcdef0123", " PeNdInG_legacy "]) {
+      const html = render({ recipientName });
+      assert.match(html, /Hi there,/);
+      assert.doesNotMatch(html, /pending_/i);
+    }
+    assert.match(render({ recipientName: "  小雨 & Avery  " }), /Hi 小雨 &amp; Avery,/);
+  }
+});
+
 test("onboarding check-in email avoids behavior-surveillance wording", () => {
   const html = renderOnboardingDayOneCheckInEmailHtml({ recipientName: "Avery" });
 

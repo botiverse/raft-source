@@ -18,11 +18,62 @@ export const FLAG_READ_CACHE_TTL_MS = 30_000;
 /** Past this many answers the cache starts over (bounds memory; a miss is only a query). */
 const MAX_ANSWERS = 50_000;
 
+export interface CachedGlobalFlagAnswer {
+  enabled: boolean;
+  variant: string | null;
+}
+
 let ttlMs = process.env.NODE_ENV === "test" ? 0 : FLAG_READ_CACHE_TTL_MS;
 const answers = new Map<string, Map<string, { enabled: boolean; expiresAt: number }>>();
+const globalAnswers = new Map<string, { answer: CachedGlobalFlagAnswer; expiresAt: number }>();
+const invalidationListeners = new Map<string, Set<() => void>>();
 let size = 0;
 /** Moves on every forget: a read that started before one doesn't store its (maybe older) answers. */
 let generation = 0;
+
+/** Subscribe to invalidations for a flag key (`forgetCachedFlags` / `clearFlagReadCache`). */
+export function onCachedFlagForgotten(flag: string, listener: () => void): () => void {
+  let set = invalidationListeners.get(flag);
+  if (!set) {
+    set = new Set();
+    invalidationListeners.set(flag, set);
+  }
+  set.add(listener);
+  return () => {
+    set?.delete(listener);
+    if (set && set.size === 0) invalidationListeners.delete(flag);
+  };
+}
+
+/**
+ * Synchronous read of a cached global flag answer when fresh (within TTL), or null on cache miss / disabled cache.
+ */
+export function peekCachedGlobalFlagEvaluation(flag: string): CachedGlobalFlagAnswer | null {
+  if (ttlMs <= 0) return null;
+  const cached = globalAnswers.get(flag);
+  if (cached && cached.expiresAt > Date.now()) return cached.answer;
+  return null;
+}
+
+/**
+ * Cached global (non-server-specific) flag evaluation, sharing the same TTL and
+ * `forgetCachedFlags` invalidation as `cachedServerFlagAnswers`.
+ */
+export async function cachedGlobalFlagEvaluation(
+  flag: string,
+  read: () => Promise<CachedGlobalFlagAnswer>,
+): Promise<CachedGlobalFlagAnswer> {
+  if (ttlMs <= 0) return read();
+  const now = Date.now();
+  const cached = globalAnswers.get(flag);
+  if (cached && cached.expiresAt > now) return cached.answer;
+  const startedAt = generation;
+  const fresh = await read();
+  if (generation === startedAt) {
+    globalAnswers.set(flag, { answer: fresh, expiresAt: Date.now() + ttlMs });
+  }
+  return fresh;
+}
 
 /**
  * `flag` for each of `serverIds`, in input order: cached answers, and one
@@ -67,13 +118,22 @@ export function forgetCachedFlags(flags: Iterable<string>): void {
   for (const flag of flags) {
     size -= answers.get(flag)?.size ?? 0;
     answers.delete(flag);
+    globalAnswers.delete(flag);
+    const listeners = invalidationListeners.get(flag);
+    if (listeners) {
+      for (const listener of listeners) listener();
+    }
   }
 }
 
 export function clearFlagReadCache(): void {
   generation++;
   answers.clear();
+  globalAnswers.clear();
   size = 0;
+  for (const listeners of invalidationListeners.values()) {
+    for (const listener of listeners) listener();
+  }
 }
 
 /** Tests: the TTL (0 = off, as under NODE_ENV=test); also empties the cache. */

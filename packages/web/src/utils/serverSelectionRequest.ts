@@ -10,7 +10,7 @@ export function requestServerSelection(): void {
 }
 
 /** Check whether the current page load was explicitly sent to the picker. */
-export function isServerSelectionRequested(): boolean {
+function isServerSelectionRequested(): boolean {
   try {
     return sessionStorage.getItem(SERVER_SELECTION_REQUESTED_KEY) === "1";
   } catch {

@@ -36,6 +36,8 @@ import { secondFactorFailureOf } from "../settings/secondFactorApi";
 import Banner from "../ui/Banner";
 import { TraceIdNote } from "../errors/TraceIdNote";
 import AuthPageFrame, { AuthPageIntro } from "./AuthPageFrame";
+import { useEarlierPasskey } from "./useEarlierPasskey";
+import type { PasskeyRpGroup } from "./passkeyRpGroups";
 import { CodeField, MethodSwitch, PasskeyPrompt, useCodeEntry, useCodeFailure } from "./SecondFactorCodeEntry";
 import { FinishRecoveryScreen, RecoveryRequestScreen } from "./SecondFactorRecoveryScreens";
 import {
@@ -48,7 +50,7 @@ import {
 } from "./secondFactorSignIn";
 import type { SecondFactorChallenge, SecondFactorSignInAnswer, SignInSecondFactorMethod } from "./secondFactorSignIn";
 import { noteSignInFailure, signInFailureTraceId } from "./signInFailure";
-import { getPasskeyAssertion, isPasskeyCancel } from "./webauthn";
+import { isPasskeyCancel } from "./webauthn";
 
 export default function SecondFactorSignInStep({ challenge, email: typedEmail, codeVerifier, onSignedIn, onBack }: {
   challenge: SecondFactorChallenge;
@@ -122,11 +124,18 @@ export default function SecondFactorSignInStep({ challenge, email: typedEmail, c
     await answerWith(async () => (method === "totp" ? { code: entered } : { backupCode: entered }), method);
   }, [answerWith, busy, entered, method]);
 
-  // A fresh assertion each time: its challenge is single use.
+  // A fresh assertion each time: its challenge is single use. After a prompt
+  // with nothing to pick, "Use an earlier passkey" asks in the other RP group (useEarlierPasskey.ts).
+  const { earlier, prompt } = useEarlierPasskey();
+  const startPasskeyStep = useCallback((rp?: PasskeyRpGroup) => startSignInPasskeyStep(challenge.challenge, rp), [challenge.challenge]);
   const handleUsePasskey = useCallback(() => {
     if (busy) return;
-    void answerWith(async () => ({ webauthn: await getPasskeyAssertion(await startSignInPasskeyStep(challenge.challenge)) }), "passkey");
-  }, [answerWith, busy, challenge.challenge]);
+    void answerWith(async () => ({ webauthn: await prompt(startPasskeyStep) }), "passkey");
+  }, [answerWith, busy, prompt, startPasskeyStep]);
+  const handleUseEarlierPasskey = useCallback(() => {
+    if (busy || !earlier) return;
+    void answerWith(async () => ({ webauthn: await prompt(startPasskeyStep, earlier) }), "passkey");
+  }, [answerWith, busy, earlier, prompt, startPasskeyStep]);
 
   // Drop this challenge (Back to Sign In) and sign in with the passkey in the browser.
   const handlePasskeyInBrowser = useCallback(() => {
@@ -283,7 +292,7 @@ export default function SecondFactorSignInStep({ challenge, email: typedEmail, c
             </Button>
           </div>
         ) : method === "passkey" ? (
-          <PasskeyPrompt busy={busy} onUse={handleUsePasskey} />
+          <PasskeyPrompt busy={busy} onUse={handleUsePasskey} onUseEarlier={earlier ? handleUseEarlierPasskey : undefined} />
         ) : (
           <form onSubmit={submit} className="stack-y-4 md:pointer-fine:stack-y-3" noValidate>
             <CodeField method={method} value={entry.value} onChange={entry.change} error={entry.fieldError} disabled={busy} />

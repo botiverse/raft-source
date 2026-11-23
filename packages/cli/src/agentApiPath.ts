@@ -368,8 +368,10 @@ export function createAgentApiClient(client: CliAgentApiHttpClient, agentId: str
         requestClientAsApiResponse(agentApi.messages.send(body)),
       sendV2: (body: AgentApiRequestBodyByRoute["messageSendV2"]) =>
         requestClientAsApiResponse(agentApi.messages.sendV2(body)),
-      resolve: (params: AgentApiRequestParamsByRoute["messageResolve"]) =>
-        requestClientAsApiResponse(agentApi.messages.resolve(params)),
+      resolve: (
+        params: AgentApiRequestParamsByRoute["messageResolve"],
+        query?: AgentApiRequestQueryByRoute["messageResolve"],
+      ) => requestClientAsApiResponse(agentApi.messages.resolve(params, query)),
       addReaction: (
         params: AgentApiRequestParamsByRoute["messageReactionAdd"],
         body: AgentApiRequestBodyByRoute["messageReactionAdd"],
@@ -513,8 +515,10 @@ export function createAgentApiSurfaceClient(client: CliAgentApiHttpClient, optio
         requestClientAsApiResponse(agentApi.messages.send(body)),
       sendV2: (body: AgentApiRequestBodyByRoute["messageSendV2"]) =>
         requestClientAsApiResponse(agentApi.messages.sendV2(body)),
-      resolve: (params: AgentApiRequestParamsByRoute["messageResolve"]) =>
-        requestClientAsApiResponse(agentApi.messages.resolve(params)),
+      resolve: (
+        params: AgentApiRequestParamsByRoute["messageResolve"],
+        query?: AgentApiRequestQueryByRoute["messageResolve"],
+      ) => requestClientAsApiResponse(agentApi.messages.resolve(params, query)),
       search: (query: AgentApiRequestQueryByRoute["messageSearch"]) =>
         requestClientAsApiResponse(agentApi.messages.search(query)),
       addReaction: (
@@ -554,6 +558,8 @@ export function createAgentApiSurfaceClient(client: CliAgentApiHttpClient, optio
         requestClientAsApiResponse(agentApi.channels.addMember(params, body)),
       removeMember: (params: AgentApiRequestParamsByRoute["channelMemberRemove"], body: AgentApiRequestBodyByRoute["channelMemberRemove"]) =>
         requestClientAsApiResponse(agentApi.channels.removeMember(params, body)),
+      setMemberRole: (body: AgentApiRequestBodyByRoute["channelMemberRole"]) =>
+        requestClientAsApiResponse(agentApi.channels.setMemberRole(body)),
       members: (query: AgentApiRequestQueryByRoute["channelMembers"]) =>
         requestClientAsApiResponse(agentApi.channels.members(query)),
       resolve: (body: AgentApiRequestBodyByRoute["resolveChannel"]) =>
@@ -575,6 +581,15 @@ export function createAgentApiSurfaceClient(client: CliAgentApiHttpClient, optio
         requestClientAsApiResponse(agentApi.threads.follow(body)),
       unfollow: (body: AgentApiRequestBodyByRoute["threadUnfollow"]) =>
         requestClientAsApiResponse(agentApi.threads.unfollow(body)),
+    },
+    // Focus (flag agent_focus_v0): the conversations the agent keeps in focus.
+    focus: {
+      list: () =>
+        requestClientAsApiResponse(agentApi.focus.list()),
+      add: (body: AgentApiRequestBodyByRoute["focus"]) =>
+        requestClientAsApiResponse(agentApi.focus.add(body)),
+      remove: (body: AgentApiRequestBodyByRoute["unfocus"]) =>
+        requestClientAsApiResponse(agentApi.focus.remove(body)),
     },
     profile: {
       show: (query: AgentApiRequestQueryByRoute["profileShow"]) =>

@@ -121,4 +121,88 @@ describe("raft-perf claim", () => {
   it("warns at open when the prediction is too small to tell from noise", () => {
     expect(open(["--predicted-delta=-40"]).stderr).toMatch(/could not be told from noise: if no move shows, the verdict will be inconclusive/);
   });
+
+  it("verify refuses cross-cohort rows (different machine, Browser Run vs local, or another fixture) unless --allow-cohort-change", () => {
+    const bPath = join(dir, "before-cohort.jsonl");
+    const aPath = join(dir, "after-cohort.jsonl");
+    writeFileSync(
+      bPath,
+      [900, 950, 1000]
+        .map((v) => JSON.stringify({ commit_sha: OLD, net: "fast", extra: { ready_ms: v, browser_where: "local", fixture_tag: "bench-v1@5395d2b0", browser_benchmark_ms: 20.0 } }))
+        .join("\n") + "\n",
+    );
+    writeFileSync(
+      aPath,
+      [600, 620, 630]
+        .map((v) => JSON.stringify({ commit_sha: NEW, net: "fast", extra: { ready_ms: v, browser_where: "local", fixture_tag: "bench-v1@5395d2b0", browser_benchmark_ms: 8.8 } }))
+        .join("\n") + "\n",
+    );
+    expect(open([], bPath).code).toBe(0);
+    expect(run("ship", "--claims", claims, "--id", "c-1", "--commit", NEW).code).toBe(0);
+    const refused = run("verify", "--claims", claims, "--id", "c-1", "--before", bPath, "--after", aPath);
+    expect(refused.code).toBe(2);
+    expect(refused.stderr).toMatch(/not measured in the same cohort.*CPU benchmark stepped/);
+    expect(lines()).toHaveLength(2);
+    const forced = run("verify", "--claims", claims, "--id", "c-1", "--before", bPath, "--after", aPath, "--allow-cohort-change");
+    expect(forced.code).toBe(0);
+    expect(lines()[2]?.event).toBe("verified");
+  });
+
+  it("verify refuses comparing pre-0.26 buffered measure rows against 0.26 unbuffered --ab none rows", () => {
+    const bPath = join(dir, "before-025.jsonl");
+    const aPath = join(dir, "after-026.jsonl");
+    writeFileSync(
+      bPath,
+      [1400, 1420, 1450]
+        .map((v) => JSON.stringify({ commit_sha: OLD, state: "release", net: "fast", extra: { content_ms: v, host_cpu_count: 12, host_benchmark_ms: 9.0 } }))
+        .join("\n") + "\n",
+    );
+    writeFileSync(
+      aPath,
+      [1080, 1100, 1090]
+        .map((v) =>
+          JSON.stringify({
+            commit_sha: NEW,
+            state: "release",
+            net: "fast",
+            extra: { content_ms: v, host_cpu_count: 12, host_benchmark_ms: 9.0, browser_where: "local", document_intercepted: 0, browser_benchmark_ms: 9.0 },
+          }),
+        )
+        .join("\n") + "\n",
+    );
+    expect(
+      run(
+        "open",
+        "--claims",
+        claims,
+        "--id",
+        "c-doc",
+        "--project",
+        "raft-web",
+        "--env",
+        "staging",
+        "--title",
+        "t",
+        "--ref",
+        "r",
+        "--author",
+        "a",
+        "--scenario",
+        "measure/release",
+        "--metric",
+        "content_ms",
+        "--predicted-delta=-300",
+        "--before",
+        bPath,
+        "--runner",
+        "lab",
+        "--verify-command",
+        "v",
+      ).code,
+    ).toBe(0);
+    expect(run("ship", "--claims", claims, "--id", "c-doc", "--commit", NEW).code).toBe(0);
+    const refused = run("verify", "--claims", claims, "--id", "c-doc", "--before", bPath, "--after", aPath);
+    expect(refused.code).toBe(2);
+    expect(refused.stderr).toMatch(/document interception is false, expected true/);
+  });
 });

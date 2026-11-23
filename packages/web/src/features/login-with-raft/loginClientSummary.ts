@@ -75,6 +75,20 @@ export function firstServerByRank(entries: AvailableServerClient[]): string {
 }
 
 /**
+ * The Server the page picks by itself. With more than one Server to choose
+ * from (not counting suspended installations, which can never be continued),
+ * none: the person picks. An App adding another Server (Stamp's "add a
+ * server") would otherwise land on the one already signed in, and one more
+ * press signs in there again. With one Server to choose from it is picked, as
+ * before; a `server` hint (`/oidc/<slug>/...`) already narrows the lookups to
+ * that one Server.
+ */
+export function initialServerPick(entries: AvailableServerClient[]): string {
+  const choices = entries.filter((entry) => entry.client.availability !== "suspended");
+  return choices.length <= 1 ? firstServerByRank(entries) : "";
+}
+
+/**
  * Login with Raft answered installation_suspended (every installation went
  * suspended after the lookup): these entries as a lookup would now return them.
  */

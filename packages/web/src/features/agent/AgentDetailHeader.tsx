@@ -19,13 +19,15 @@ import { useRowExpand, useRowPlanned } from "../../components/layout/rowPlanStor
 
 // Isolated header component — only re-renders on activity changes for this agent,
 // without triggering re-render of ChatPanel / tabs below.
-export function AgentDetailHeader({ agent, canControlAgentRuntime, canStopAgent, canMessageAgent, onMessage, onOpenLounge, onClose, onBack, onShowResetDialog, onShowStopConfirm, onPauseAssistant, onStartSettled, computerOffline }: {   agent: Agent;
+export function AgentDetailHeader({ agent, canControlAgentRuntime, canStopAgent, canMessageAgent, onMessage, onOpenLounge, onCall, onClose, onBack, onShowResetDialog, onShowStopConfirm, onPauseAssistant, onStartSettled, computerOffline }: {   agent: Agent;
   canControlAgentRuntime: boolean;
   canStopAgent: boolean;
   canMessageAgent: boolean;
   onMessage: () => void;
   /** Agent Lounge v0: open this agent's Lounge; omitted while the flag is off or for a Guest. */
   onOpenLounge?: () => void;
+  /** Raft voice calls: call this agent; omitted where there is no Call button (agentVoiceCallEntry). */
+  onCall?: () => void;
   onClose?: () => void;
   onBack?: () => void;
   onShowResetDialog: () => void;
@@ -111,6 +113,7 @@ export function AgentDetailHeader({ agent, canControlAgentRuntime, canStopAgent,
       onRestartReset={onShowResetDialog}
       onPauseAssistant={onPauseAssistant}
       onOpenLounge={onOpenLounge}
+      onCall={onCall}
       messageInMenu={messageInMenu}
     />
   ) : null;

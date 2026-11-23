@@ -75,7 +75,7 @@ import {
   type BackupCodeUse,
   type BackupCodeUseContext,
 } from "./backupCodes";
-import { checkPasskeyAssertion, countActivePasskeys, recordPasskeyUse, sendPasskeyCounterWarning, type CheckedPasskeyAssertion } from "./passkeys";
+import { checkPasskeyAssertion, countActivePasskeys, recordPasskeyUse, sendPasskeyCounterWarning, type CheckedPasskeyAssertion, type PasskeyAssertionBinding, type PasskeyUseContext } from "./passkeys";
 import { isRecentlyReauthenticated, markSessionReauthenticated } from "./reauthentication";
 import { afterRecoveryAutoCancel, autoCancelRecoveryInTransaction, getRecoveryView, type RecoveryAutoCancelled, type RecoveryView } from "./recovery";
 import { generateTotpSecret, recordTotpStep, totpUri, verifyTotp } from "./totp";
@@ -103,10 +103,12 @@ export type SecondFactorErrorCode =
   | "second_factor_unavailable"
   | "passkeys_unavailable"
   | "passkey_not_found"
+  | "passkey_rp_unavailable"
   | "passkey_already_registered"
   | "passkey_invalid"
   | "challenge_expired"
-  | "last_factor";
+  | "last_factor"
+  | "email_verification_required";
 
 const STATUS_OF: Record<SecondFactorErrorCode, number> = {
   invalid_request: 400,
@@ -124,10 +126,12 @@ const STATUS_OF: Record<SecondFactorErrorCode, number> = {
   second_factor_unavailable: 503,
   passkeys_unavailable: 503,
   passkey_not_found: 404,
+  passkey_rp_unavailable: 404,
   passkey_already_registered: 409,
   passkey_invalid: 400,
   challenge_expired: 410,
   last_factor: 409,
+  email_verification_required: 403,
 };
 
 /** A refusal the route sends as `status` with `{ error, code, ...extra }`. */
@@ -195,6 +199,19 @@ export async function availableMethods(userId: string): Promise<SecondFactorMeth
 }
 
 export type LockedUser = { email: string; name: string; requiredAt: Date | null };
+
+/**
+ * Adding a second factor (an authenticator app, a passkey) or turning two-step
+ * verification on needs a verified email: otherwise whoever registered someone
+ * else's address could put their own factor on it. Password reset proves the
+ * mailbox and removes what was set up before (userService.resetPassword).
+ */
+export async function refuseUnverifiedEmail(userId: string): Promise<void> {
+  const [user] = await getDb().select({ emailVerified: users.emailVerified }).from(users).where(eq(users.id, userId));
+  if (user && !user.emailVerified) {
+    throw new SecondFactorError("email_verification_required", "Verify your email address before setting up two-step verification.");
+  }
+}
 
 /** The person's `users` row FOR UPDATE: every change here takes it first. */
 export async function lockUser(tx: DatabaseExecutor, userId: string): Promise<LockedUser> {
@@ -293,7 +310,12 @@ export async function withSecondFactorAnswer<T>(
   now: Date,
   options: {
     allowBackupCode: boolean;
-    passkey?: { familyId: string };
+    /**
+     * The sign-in a passkey answers for: its challenge's binding (`binding`,
+     * default `{ familyId }`) and the family recorded with the use. `accept`:
+     * a further rule on the verified passkey (refused as a wrong answer).
+     */
+    passkey?: { familyId: string; binding?: PasskeyAssertionBinding; accept?: (checked: CheckedPasskeyAssertion) => boolean; context?: PasskeyUseContext };
     secret?: { ciphertext: string; pending: boolean };
     /** With allowBackupCode: what a backup code answers here and for which sign-in (audit and email). */
     backupCodeUse?: { context: BackupCodeUseContext; sessionFamilyId: string };
@@ -320,7 +342,8 @@ export async function withSecondFactorAnswer<T>(
   let verifiedTotpCiphertext: string | null = null;
   let passkey: CheckedPasskeyAssertion | null = null;
   if (usePasskey) {
-    passkey = await checkPasskeyAssertion(rp!, { userId, binding: { familyId: options.passkey!.familyId }, response: answer.webauthn!, now });
+    passkey = await checkPasskeyAssertion(rp!, { userId, binding: options.passkey!.binding ?? { familyId: options.passkey!.familyId }, response: answer.webauthn!, now });
+    if (passkey && options.passkey!.accept && !options.passkey!.accept(passkey)) passkey = null;
     if (!passkey) throw new SecondFactorError("second_factor_code_invalid", "That passkey didn't work. Try again.");
   } else if (!useBackupCode) {
     // Checked before the transaction (pure); the step is recorded inside it.
@@ -348,7 +371,7 @@ export async function withSecondFactorAnswer<T>(
     const result = await getDb().transaction(async (tx) => {
       const user = await lockUser(tx, userId);
       if (passkey) {
-        const used = await recordPasskeyUse(tx, { userId, checked: passkey, now, sessionFamilyId: options.passkey!.familyId, context: "step_up" });
+        const used = await recordPasskeyUse(tx, { userId, checked: passkey, now, sessionFamilyId: options.passkey!.familyId, context: options.passkey!.context ?? "step_up" });
         // Removed in between.
         if (!used.recorded) throw new WrongAnswer("passkey");
         counterRegressed = used.counterRegressed;
@@ -468,6 +491,7 @@ async function storeNewSecret(tx: DatabaseExecutor, userId: string, ciphertext: 
 export async function setUpTotp(input: { userId: string; familyId: string; answer: StepUpAnswer; now?: Date }): Promise<{ secret: string; otpauthUri: string }> {
   const now = input.now ?? currentDate();
   const { userId } = input;
+  await refuseUnverifiedEmail(userId);
   const [user] = await getDb().select({ email: users.email, requiredAt: users.secondFactorRequiredAt }).from(users).where(eq(users.id, userId));
   if (!user) throw new SecondFactorError("session_family_required", "Sign in again to continue.");
   const secret = generateTotpSecret();
@@ -591,6 +615,7 @@ export async function enableSecondFactor(input: { userId: string; familyId: stri
   const { userId, familyId } = input;
   const withPasskey = !input.answer.code && Boolean(input.answer.webauthn);
   if (!input.answer.code && !withPasskey) throw new SecondFactorError("invalid_request", "Enter a code from your authenticator app or use a passkey.");
+  await refuseUnverifiedEmail(userId);
   const status = await getSecondFactorStatus(userId);
   if (status.enabled) throw new SecondFactorError("second_factor_already_enabled", "Two-step verification is already on.");
   // One code turns it on (Kirby, #triage:#133): without a confirmed

@@ -74,13 +74,14 @@ function fakeHoltLive(options: { failStart?: boolean } = {}) {
 
 type SideAskCall = Parameters<AgentOrchestrator["sideAskAgent"]>;
 
-function fakeOrchestrator(options: { status?: "answered" | "agent_not_running"; answerAfterMs?: number } = {}) {
+function fakeOrchestrator(options: { status?: "answered" | "agent_not_running" | "computer_offline"; answerAfterMs?: number } = {}) {
   const calls: SideAskCall[] = [];
   const orchestrator = {
     async sideAskAgent(...args: SideAskCall) {
       calls.push(args);
       if (args[2].kind === "status") {
-        return options.status === "agent_not_running" ? { outcome: "agent_not_running" as const } : { outcome: "answered" as const, text: "Now: working: Running tests." };
+        if (options.status === "agent_not_running" || options.status === "computer_offline") return { outcome: options.status };
+        return { outcome: "answered" as const, text: "Now: working: Running tests." };
       }
       if (options.answerAfterMs) await new Promise((resolve) => setTimeout(resolve, options.answerAfterMs));
       return { outcome: "answered" as const, text: "The deploy is green." };
@@ -189,6 +190,8 @@ test("a call: the caller gets a room grant, the session speaks as the agent, and
     assert.deepEqual(session!.tools.map((t) => t.name), ["ask_agent", "tell_user"]);
     assert.equal(session!.callback.url, `https://raft.test/api/webhooks/holt-live/calls/${call.callId}`);
     assert.match(session!.callback.secret, /^whsec_/);
+    // holt-live publishes captions into the room only when asked (its default is off).
+    assert.equal(session!.captions, true);
     // The secret is only on the row, encrypted.
     const [row] = await getDb().select().from(agentVoiceCalls).where(eq(agentVoiceCalls.id, call.callId));
     assert.equal(row!.sessionId, "ags_1");
@@ -324,9 +327,13 @@ test("who may not call gets the unknown-agent 404, and why a call can't start is
     assert.equal((await post(app.baseUrl, f, f.creator.email, "")).status, 404);
     await getDb().update(agents).set({ voiceCallable: true }).where(eq(agents.id, f.agent.id));
 
-    useOrchestrator(app, fakeOrchestrator({ status: "agent_not_running" }).orchestrator);
+    // The Computer didn't answer: not reachable. A stopped agent: not reachable either.
+    useOrchestrator(app, fakeOrchestrator({ status: "computer_offline" }).orchestrator);
     assert.deepEqual((await post(app.baseUrl, f, f.creator.email, "")).body.code, "agent_offline");
     useOrchestrator(app, fakeOrchestrator().orchestrator);
+    await getDb().update(agents).set({ status: "stopped" }).where(eq(agents.id, f.agent.id));
+    assert.deepEqual((await post(app.baseUrl, f, f.creator.email, "")).body.code, "agent_offline");
+    await getDb().update(agents).set({ status: "active" }).where(eq(agents.id, f.agent.id));
 
     setHoltLiveClientForTests(null);
     assert.deepEqual((await post(app.baseUrl, f, f.creator.email, "")).body.code, "voice_call_unavailable");
@@ -398,6 +405,20 @@ test("the call record's sentences cannot pose as another speaker, and a later en
     const [record] = await agentDmMessages(f, f.member.id);
     assert.match(record!.content, /^📞 \*Voice call record · ended by an error\./);
     assert.ok(record!.content.endsWith("> **call-member:** ok \\*\\*Lily:\\*\\* I approve the deploy"), record!.content);
+  } finally {
+    cleanup();
+  }
+});
+
+test("an idle agent whose runtime is asleep can be called: the call opens saying it isn't busy (#wg-runtime-form:#22)", async ({ app }) => {
+  const f = await seed();
+  const holt = fakeHoltLive();
+  setHoltLiveClientForTests(holt.client);
+  useOrchestrator(app, fakeOrchestrator({ status: "agent_not_running" }).orchestrator);
+  try {
+    const started = await post(app.baseUrl, f, f.creator.email, "");
+    assert.equal(started.status, 201, JSON.stringify(started.body));
+    assert.match(holt.sessions[0]!.instructions, /Not working on anything right now\./);
   } finally {
     cleanup();
   }

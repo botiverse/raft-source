@@ -22,6 +22,12 @@ import { pathToFileURL } from "node:url";
 
 const resolveSyntheticRealPath = (file: string): string => path.resolve(file);
 
+// bootstrapThenRun's default installTrust reads the OS certificate store and
+// replaces the process-wide TLS default CA list; keep these tests off both.
+vi.mock("@botiverse/raft-shared/src/systemTrust", () => ({
+  installSystemCaTrust: () => ({ status: "unsupported", durationMs: 0 }),
+}));
+
 // ---------------------------------------------------------------------------
 // Frame protocol (review SF1/SF2): nonce + NUL framing, strict parse.
 // ---------------------------------------------------------------------------
@@ -343,6 +349,29 @@ test("bootstrapThenRun: `__cli` runs only the bundled agent CLI, never the Compu
   // graph (and through it the daemon core) — that doubled its memory.
   assert.equal(cliGraphImported, false);
   assert.equal(captured, false);
+});
+
+test("bootstrapThenRun: system CA trust is installed before the CLI graph loads, and not for `__cli`", async () => {
+  const order: string[] = [];
+  const run = (argv: string[]) => bootstrapThenRun(
+    argv,
+    {},
+    async () => ({ kind: "inherited" }) as never,
+    async () => {
+      order.push("importCli");
+      return { runCliAsMain: () => {} };
+    },
+    () => {},
+    () => false,
+    async () => { order.push("bundledCli"); },
+    async () => 0,
+    () => { order.push("installTrust"); },
+  );
+  await run(["node", "x", "status"]);
+  assert.deepEqual(order, ["installTrust", "importCli"]);
+  order.length = 0;
+  await run(["/exec", "/slots/stable/artifact.bin", "__cli", "task", "list"]);
+  assert.deepEqual(order, ["bundledCli"]);
 });
 
 test("bootstrapThenRun: foreground path never captures and the CLI graph sees inherited env", async () => {

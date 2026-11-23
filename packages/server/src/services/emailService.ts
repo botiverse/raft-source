@@ -393,7 +393,11 @@ function onboardingBookingUrl(): string | null {
 
 function onboardingGreeting(recipientName?: string | null): string {
   const trimmed = recipientName?.trim();
-  return trimmed ? `Hi ${escapeHtmlText(trimmed)},` : "Hi there,";
+  // Profile setup reserves pending_* handles; never greet a recipient with one,
+  // even if older/imported data copied that handle into the display-name field.
+  return trimmed && !trimmed.toLowerCase().startsWith("pending_")
+    ? `Hi ${escapeHtmlText(trimmed)},`
+    : "Hi there,";
 }
 
 function onboardingBookingLink(): string {
@@ -1273,7 +1277,8 @@ export function accountDeletionCancelUrl(token: string): string {
 
 export type AccountDeletionEmailEvent =
   /** `cancelToken`: the raw one-time token of the link that cancels this request without signing in (services/accountDeletion/requests.ts). */
-  | { kind: "requested"; scheduledFor: Date; paidServersEnding?: { name: string; periodEnd: Date | null }[]; subscriptionCancellationUnconfirmed?: boolean; cancelToken?: string }
+  /** `mcpConnectionsEnding`: per server, the MCP App Connections signed in with the person's own account (OAuth), disconnected at deletion. */
+  | { kind: "requested"; scheduledFor: Date; paidServersEnding?: { name: string; periodEnd: Date | null }[]; subscriptionCancellationUnconfirmed?: boolean; cancelToken?: string; mcpConnectionsEnding?: { serverName: string; connections: string[] }[] }
   | { kind: "cancelled"; subscriptionsToTurnBackOn?: string[]; subscriptionNotResumed?: boolean; subscriptionRestorationUnknown?: boolean; anotherDeletionPending?: boolean }
   | { kind: "email_code"; code: string; expiresInMinutes: number }
   | { kind: "deleted" };
@@ -1292,6 +1297,10 @@ function accountDeletionEmailCopy(event: AccountDeletionEmailEvent): { subject: 
           ...(event.paidServersEnding ?? []).map((server) => event.subscriptionCancellationUnconfirmed
             ? `You pay for ${server.name}: check this subscription in Plan & Billing after cancelling account deletion.`
             : `You pay for ${server.name}: its subscription was scheduled to end with the current period. Its new owner can subscribe again.`),
+          ...(event.mcpConnectionsEnding ?? []).map((server) =>
+            `On ${server.serverName}, these Apps are signed in with your own account and stay connected until then: ${server.connections.join(", ")}. They will be disconnected on ${formatAccountDeletionDate(event.scheduledFor)}; an admin there can reconnect them with their own account.`),
+          ...((event.mcpConnectionsEnding ?? []).length > 0
+            ? ["You can also revoke that access now in each service's own settings, where it lists the apps connected to your account."] : []),
         ],
         advice: "If this wasn't you, sign in now and cancel the deletion, then change your password.",
       };
@@ -1368,6 +1377,92 @@ export function renderAccountDeletionEmail(rawName: string, event: AccountDeleti
 export async function sendAccountDeletionEmail(to: string, name: string, event: AccountDeletionEmailEvent): Promise<void> {
   const { subject, html, text } = renderAccountDeletionEmail(name, event);
   await sendEmail(to, subject, html, { text });
+}
+
+// ── Data export (services/dataExport/) ──
+
+/**
+ * The page an export email opens (`?data_export=`, and for a server export
+ * `&data_export_server=<server id>`, so the web opens that server's
+ * settings): the signed-in download page. Never a link to the archive
+ * itself, so a forwarded email gives no one the data (design §6).
+ */
+export function dataExportPageUrl(exportId: string, serverId?: string): string {
+  return `${appUrl()}/?${new URLSearchParams({ data_export: exportId, ...(serverId ? { data_export_server: serverId } : {}) }).toString()}`;
+}
+
+export type DataExportEmailEvent =
+  | { kind: "email_code"; code: string; expiresInMinutes: number }
+  /** `serverName`, `serverId`: a server export's server; absent for a personal export. */
+  | { kind: "ready"; exportId: string; serverName?: string; serverId?: string; expiresAt: Date }
+  | { kind: "failed"; exportId: string; serverName?: string; serverId?: string };
+
+function dataExportEmailCopy(event: DataExportEmailEvent): { subject: string; heading: string; lines: string[]; advice: string } {
+  const what = (serverName: string | undefined) => serverName ? `The export of ${serverName}` : "Your data export";
+  switch (event.kind) {
+    case "email_code":
+      return {
+        subject: `Confirm your ${BRAND_NAME} data export`,
+        heading: "Someone asked to export your data",
+        lines: [
+          "Someone signed in to your account asked to export data from Raft. To confirm the export, enter this code:",
+          event.code,
+          `The code works once and expires in ${event.expiresInMinutes} minutes.`,
+        ],
+        advice: "If this wasn't you, don't share this code with anyone and change your password: without the code nothing is exported.",
+      };
+    case "ready":
+      return {
+        subject: `${what(event.serverName)} is ready — ${BRAND_NAME}`,
+        heading: `${what(event.serverName)} is ready`,
+        lines: [
+          `${what(event.serverName)} is ready to download. Sign in to Raft to download it: this email holds no link to the files.`,
+          `It is deleted on ${formatAccountDeletionDate(event.expiresAt)}.`,
+        ],
+        advice: "If you didn't ask for this export, change your password now and delete the export.",
+      };
+    case "failed":
+      return {
+        subject: `${what(event.serverName)} could not be made — ${BRAND_NAME}`,
+        heading: `${what(event.serverName)} could not be made`,
+        lines: [
+          `${what(event.serverName)} stopped before it was finished, so there is nothing to download. It does not count against your export limit: you can ask for a new one.`,
+        ],
+        advice: "If you didn't ask for this export, change your password now.",
+      };
+  }
+}
+
+export function renderDataExportEmail(rawName: string, event: DataExportEmailEvent): { subject: string; html: string; text: string } {
+  const copy = dataExportEmailCopy(event);
+  const name = escapeHtmlText(rawName);
+  const pageUrl = event.kind === "email_code" ? null : dataExportPageUrl(event.exportId, event.serverId);
+  const paragraph = (inner: string, margin = "0 0 12px 0") =>
+    `<p style="margin: ${margin}; color: ${SLOCK_INK}; font-size: 16px; line-height: 1.5;">${inner}</p>`;
+  const body = copy.lines.map((line) => event.kind === "email_code" && line === event.code
+    ? `<p style="margin: 0 0 12px 0; color: ${SLOCK_INK}; font-size: 28px; font-weight: bold; letter-spacing: 4px;">${escapeHtmlText(line)}</p>`
+    : paragraph(escapeHtmlText(line))).join("");
+  const html = renderEmailLayout(`
+    <h1 style="margin: 0 0 16px 0; color: ${SLOCK_INK}; font-size: 22px; font-weight: bold;">${escapeHtmlText(copy.heading)}</h1>
+    ${paragraph(`Hey ${name},`, "0 0 8px 0")}
+    ${body}
+    ${pageUrl ? renderEmailButton(pageUrl, event.kind === "ready" ? "Sign in to download" : "Open data exports") : ""}
+    ${paragraph(escapeHtmlText(copy.advice), "0")}
+  `);
+  const text = [
+    `Hey ${rawName},`,
+    "",
+    ...copy.lines.flatMap((line) => [line, ""]),
+    ...(pageUrl ? [`${event.kind === "ready" ? "Sign in to download" : "Open data exports"}: ${pageUrl}`, ""] : []),
+    copy.advice,
+  ].join("\n");
+  return { subject: copy.subject, html, text };
+}
+
+/** `idempotencyKey`: one per export and outcome, so a retried run's email is not delivered twice. */
+export async function sendDataExportEmail(to: string, name: string, event: DataExportEmailEvent, options: Pick<SendEmailOptions, "idempotencyKey"> = {}): Promise<void> {
+  const { subject, html, text } = renderDataExportEmail(name, event);
+  await sendEmail(to, subject, html, { text, ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}) });
 }
 
 // ── Two-step verification recovery (services/secondFactor/recovery.ts) ──
@@ -1581,6 +1676,104 @@ export async function sendLegacyMachineMovedEmail(to: string, name: string, inpu
   await sendEmail(to, subject, html, { text });
 }
 
+type LimitResetUsedByOtherCopyInput = { actorName: string; runtimeName: string; computerName: string; serverName: string };
+type LimitResetUsedByOtherCopy = {
+  /** Also the body's first line, with a full stop. */
+  subject: (input: LimitResetUsedByOtherCopyInput) => string;
+  rule: (input: LimitResetUsedByOtherCopyInput) => string;
+  greeting: (name: string) => string;
+  button: string;
+};
+
+const LIMIT_RESET_USED_BY_OTHER_COPY = {
+  en: {
+    subject: (i) => `${i.actorName} used a ${i.runtimeName} limit reset on your Computer ${i.computerName}`,
+    rule: (i) => `Owners and admins of ${i.serverName} can use the limit resets of the Computers connected to it. If you did not expect this, ask an owner of ${i.serverName}.`,
+    greeting: (name) => `Hey ${name},`,
+    button: "Open Computers",
+  },
+  es: {
+    subject: (i) => `${i.actorName} usó un restablecimiento del límite de ${i.runtimeName} en tu computadora ${i.computerName}`,
+    rule: (i) => `Los propietarios y administradores de ${i.serverName} pueden usar los restablecimientos de límite de las computadoras conectadas a él. Si no lo esperabas, pregunta a un propietario de ${i.serverName}.`,
+    greeting: (name) => `Hola, ${name}:`,
+    button: "Abrir computadoras",
+  },
+  "pt-br": {
+    subject: (i) => `${i.actorName} usou uma redefinição de limite do ${i.runtimeName} no seu computador ${i.computerName}`,
+    rule: (i) => `Proprietários e administradores de ${i.serverName} podem usar as redefinições de limite dos computadores conectados a ele. Se você não esperava por isso, fale com um proprietário de ${i.serverName}.`,
+    greeting: (name) => `Olá, ${name},`,
+    button: "Abrir computadores",
+  },
+  ru: {
+    subject: (i) => `${i.actorName} использовал(а) сброс лимита ${i.runtimeName} на вашем компьютере ${i.computerName}`,
+    rule: (i) => `Владельцы и администраторы сервера ${i.serverName} могут использовать сбросы лимитов подключённых к нему компьютеров. Если вы этого не ожидали, обратитесь к владельцу сервера ${i.serverName}.`,
+    greeting: (name) => `Здравствуйте, ${name}!`,
+    button: "Открыть компьютеры",
+  },
+  ko: {
+    subject: (i) => `${i.actorName} 님이 내 컴퓨터 ${i.computerName}에서 ${i.runtimeName} 한도 초기화를 사용했어요`,
+    rule: (i) => `${i.serverName}의 소유자와 관리자는 이 서버에 연결된 컴퓨터의 한도 초기화를 사용할 수 있어요. 예상하지 못한 일이라면 ${i.serverName}의 소유자에게 문의하세요.`,
+    greeting: (name) => `${name} 님, 안녕하세요.`,
+    button: "컴퓨터 열기",
+  },
+  ja: {
+    subject: (i) => `${i.actorName} さんがあなたのコンピューター ${i.computerName} で ${i.runtimeName} の上限リセットを使用しました`,
+    rule: (i) => `${i.serverName} のオーナーと管理者は、このサーバーに接続されたコンピューターの上限リセットを使用できます。心当たりがない場合は、${i.serverName} のオーナーに確認してください。`,
+    greeting: (name) => `${name} さん`,
+    button: "コンピューターを開く",
+  },
+  "zh-cn": {
+    subject: (i) => `${i.actorName} 在你的 Computer ${i.computerName} 上使用了一次 ${i.runtimeName} 额度重置`,
+    rule: (i) => `${i.serverName} 的所有者和管理员可以使用连接到该服务器的 Computer 的额度重置。如果这不在你的预期之中，请联系 ${i.serverName} 的所有者。`,
+    greeting: (name) => `${name}，你好：`,
+    button: "打开 Computer",
+  },
+  "zh-tw": {
+    subject: (i) => `${i.actorName} 在你的電腦 ${i.computerName} 上使用了一次 ${i.runtimeName} 額度重設`,
+    rule: (i) => `${i.serverName} 的擁有者和管理員可以使用連接到該伺服器的電腦的額度重設。如果這不在你的預期之中，請聯絡 ${i.serverName} 的擁有者。`,
+    greeting: (name) => `${name}，你好：`,
+    button: "開啟電腦",
+  },
+} satisfies Record<DisplayLocale, LimitResetUsedByOtherCopy>;
+
+export type LimitResetUsedByOtherEmailInput = {
+  /** The recipient's display language; English when unset or unknown. */
+  locale?: string | null;
+  usedByName: string;
+  /** The runtime account's product name ("Claude Code", "Codex", ...). */
+  runtimeName: string;
+  computerName: string;
+  server: { name: string; slug: string };
+};
+
+/**
+ * A server owner or admin who did not connect a Computer used one of its
+ * runtime account's limit resets (routes/runtimeAuthRoutes.ts,
+ * `computer.limit_reset_used_by_other`): told to the person who connected it,
+ * in their display language.
+ */
+export function renderLimitResetUsedByOtherEmail(rawName: string, input: LimitResetUsedByOtherEmailInput): { subject: string; html: string; text: string } {
+  const copy: LimitResetUsedByOtherCopy = LIMIT_RESET_USED_BY_OTHER_COPY[normalizeDisplayLocale(input.locale) ?? "en"];
+  const params = { actorName: input.usedByName, runtimeName: input.runtimeName, computerName: input.computerName, serverName: input.server.name };
+  const subject = copy.subject(params);
+  const lines = [`${subject}.`, copy.rule(params)];
+  const url = `${appUrl()}/s/${encodeURIComponent(input.server.slug)}/computers`;
+  const paragraph = (inner: string) => `<p style="margin: 0 0 12px 0; color: ${SLOCK_INK}; font-size: 16px; line-height: 1.5;">${inner}</p>`;
+  const html = renderEmailLayout(`
+    <h1 style="margin: 0 0 16px 0; color: ${SLOCK_INK}; font-size: 22px; font-weight: bold;">${escapeHtmlText(subject)}</h1>
+    ${paragraph(escapeHtmlText(copy.greeting(rawName)))}
+    ${lines.map((line) => paragraph(escapeHtmlText(line))).join("")}
+    ${renderEmailButton(url, copy.button)}
+  `);
+  const text = [copy.greeting(rawName), "", ...lines.flatMap((line) => [line, ""]), `${copy.button}: ${url}`].join("\n");
+  return { subject, html, text };
+}
+
+export async function sendLimitResetUsedByOtherEmail(to: string, name: string, input: LimitResetUsedByOtherEmailInput): Promise<void> {
+  const { subject, html, text } = renderLimitResetUsedByOtherEmail(name, input);
+  await sendEmail(to, subject, html, { text });
+}
+
 /** A payer deleted their account. Cached cancellation state is not a current
  * provider confirmation: ask the owner to check billing before changing it. */
 export function renderSubscriptionEndingAfterDeletionEmail(rawName: string, input: { deletedName: string; server: { name: string; slug: string } }): { subject: string; html: string; text: string } {
@@ -1604,6 +1797,36 @@ export function renderSubscriptionEndingAfterDeletionEmail(rawName: string, inpu
 export async function sendSubscriptionEndingAfterDeletionEmail(to: string, name: string, input: { deletedName: string; server: { name: string; slug: string } }): Promise<void> {
   const { subject, html, text } = renderSubscriptionEndingAfterDeletionEmail(name, input);
   await sendEmail(to, subject, html, { text });
+}
+
+/**
+ * The person left a server where MCP App Connections still act as their own
+ * account, signed in with OAuth (services/managedMcpSignedInBy.ts). API-key
+ * Connections are not listed: a key need not be personal. `connections`: one
+ * label each, e.g. "Notion (Acme workspace)".
+ */
+export function renderMcpConnectionsAfterLeavingEmail(rawName: string, input: { serverName: string; connections: readonly string[] }): { subject: string; html: string; text: string } {
+  const subject = `Your sign-ins are still connected to ${input.serverName} on ${BRAND_NAME}`;
+  const lines = [
+    `You are no longer a member of ${input.serverName}. These Apps there are still signed in with your own account, and its agents can still use them as you:`,
+    ...input.connections,
+    `An admin of ${input.serverName} can reconnect them with their own account.`,
+    "You can also revoke the access yourself in each service's own settings, where it lists the apps connected to your account.",
+  ];
+  const paragraph = (inner: string) => `<p style="margin: 0 0 12px 0; color: ${SLOCK_INK}; font-size: 16px; line-height: 1.5;">${inner}</p>`;
+  const html = renderEmailLayout(`
+    <h1 style="margin: 0 0 16px 0; color: ${SLOCK_INK}; font-size: 22px; font-weight: bold;">${escapeHtmlText(subject)}</h1>
+    ${paragraph(`Hey ${escapeHtmlText(rawName)},`)}
+    ${lines.map((line) => paragraph(escapeHtmlText(line))).join("")}
+  `);
+  const text = [`Hey ${rawName},`, "", ...lines.flatMap((line) => [line, ""])].join("\n").trimEnd();
+  return { subject, html, text };
+}
+
+/** `idempotencyKey`: one per departure, so a retried send is not delivered twice. */
+export async function sendMcpConnectionsAfterLeavingEmail(to: string, name: string, input: { serverName: string; connections: readonly string[] }, idempotencyKey: string): Promise<void> {
+  const { subject, html, text } = renderMcpConnectionsAfterLeavingEmail(name, input);
+  await sendEmail(to, subject, html, { text, idempotencyKey });
 }
 
 /** Mirrors the `prepaid_pro_reminders.kind` enum (schema.ts); inserting a kind there checks they agree. */

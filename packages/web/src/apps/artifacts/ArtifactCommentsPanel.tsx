@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useEffectEvent, useId, useMemo, useRef, useState } from "react";
-// oxlint-disable-next-line react-doctor/no-flush-sync -- Reply and Edit draw and focus their box within the tap: iOS Safari opens the keyboard only for a focus made during the tap event itself (focus plan rule 5 decision).
-import { flushSync } from "react-dom";
+import type { KeyboardEvent } from "react";
 import { useIntl } from "react-intl";
-import { ChevronDown, ChevronRight, EllipsisVertical, MapPinOff, Pencil, Reply, Trash2, X } from "lucide-react";
+import { ArrowDownUp, ChevronDown, ChevronRight, PanelRightClose } from "lucide-react";
 import {
   Button,
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuItem,
+  DropdownMenuItemLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuTrigger,
   PanelAction,
   PanelActions,
@@ -21,56 +22,54 @@ import {
   Text,
   ScrollArea,
 } from "@botiverse/raft-ui";
-import { CommentIcon } from "@botiverse/ricons";
-import {
-  CommentCard,
-  CommentCardMeta,
-  CommentEntry,
-  CommentEntryAuthor,
-  CommentEntryBody,
-  CommentEntryHeader,
-  CommentEntryTime,
-} from "@botiverse/raft-ui/wip";
-import type { ArtifactComment, ArtifactCommentDraft, ArtifactCommentDraftId, ArtifactCommentId } from "@botiverse/raft-shared";
+import type { ArtifactComment, ArtifactCommentDraft, ArtifactCommentDraftId, ArtifactCommentId, ArtifactFile } from "@botiverse/raft-shared";
 
 import type { ArtifactCommentBoxMode } from "./ArtifactCommentBox";
-import type { ArtifactCardListWay } from "./artifactCardHold";
 
 import ConfirmDialog from "../../components/ConfirmDialog";
 import { ContentLoading } from "../../components/ui/ContentLoading";
 import Tooltip from "../../components/ui/Tooltip";
-import { formatRelativeTime } from "../../utils/relativeTime";
 import { requestFocus, watchFocusIntent } from "../../utils/focusRequest";
-import { AgentTag, AnchorMeta, ArtifactActorAvatar } from "./ArtifactActorParts";
-import { ArtifactCommentText } from "./ArtifactCommentText";
-import { ArtifactCommentGallery } from "./ArtifactCommentGallery";
+import { animationFramesOf, isElementNode } from "../../utils/ownerDocument";
+import { isTextEditableElement } from "../../utils/keyboardShortcuts";
 import ArtifactCommentBox from "./ArtifactCommentBox";
-import { ArtifactDismissableBox } from "./ArtifactDismissableBox";
-import { actorKey, anchorOf, buildThreads, groupThreads, isOwnComment, isResolvedThread } from "./artifactComments";
-import type { ArtifactCommentGroup, ArtifactCommentThread } from "./artifactComments";
+import { ArtifactCommentSearchField } from "./ArtifactCommentSearchField";
+import { buildThreads, groupThreads } from "./artifactComments";
+import type { ArtifactCommentThread } from "./artifactComments";
+import { ARTIFACT_COMMENT_SORTS, NO_READ_MARK, isSingleThread, neighbourAfterResolve } from "./artifactCommentListOrder";
+import type { ArtifactCommentSort } from "./artifactCommentListOrder";
+import { ThreadCard } from "./ArtifactCommentThreadCard";
 import { useArtifactComments } from "./ArtifactCommentsContext";
 import { LIST_ON_ARTIFACT, useArtifactListCompose } from "./artifactListCompose";
-import { useAnchorFound } from "./artifactAnchorStatus";
-import { ArtifactVersionBadge } from "./ArtifactMessageCard";
-import { PendingReplyDraft, usePendingReplies } from "./ArtifactPendingReplies";
 import { useDeleteDraft } from "./artifactDraftDelete";
+import { focusListOnOpen } from "./artifactListOpenFocus";
 import { draftFocusRestorations } from "./artifactRestoredFocus";
+import { isEscapeTakenElsewhere } from "./artifactInputMethodKey";
 import { artifactSource } from "./artifactSource";
 import { useArtifactReview } from "./ArtifactReviewContext";
 import { DraftCard } from "./ArtifactReviewPanel";
 import { useArmed } from "./useArmed";
-import { useDraftOptionAt, useReplyDraftOption } from "./useDraftOption";
-import { artifactActorName } from "./artifactFacts";
-import { ResolveButton, ResolvedBy } from "./ArtifactThreadResolution";
-import { useThreadResolution } from "./useThreadResolution";
+import { useArtifactCommentList } from "./useArtifactCommentList";
+import { useArtifactCommentSearch } from "./useArtifactCommentSearch";
+import { useDraftOptionAt } from "./useDraftOption";
 import { ReviewFilter, ReviewSummary } from "./ArtifactCommentsReviewParts";
+
+const NO_FILES: ArtifactFile[] = [];
+const noPlaces = () => null;
+const SORT_LABELS = { updated: "artifacts.comments.sortUpdated", page: "artifacts.comments.sortPage" } as const satisfies Record<ArtifactCommentSort, string>;
 
 /**
  * The comment list (co-design S8, "Show All Comments"): every posted comment, nothing else. Beside
  * the content where the viewer is wide (pushing it aside), over it where narrow, a bottom sheet on
- * a phone (ArtifactViewer, ArtifactSurface `fit`). Every version's
- * comments, oldest first (E12), grouped by what they are on: the whole Artifact, then each file
- * (comments on the whole file before anchored ones). A reply sits under its thread; Reply opens a
+ * a phone (ArtifactViewer, ArtifactSurface `fit`). Every version's comments (E12), in the sort
+ * the header's Sort menu picks, kept on the device (useArtifactCommentList): Last updated (the
+ * default; by each thread's last comment, newest first, no groups: each card's anchor line says
+ * where) or Page order (grouped by what they are on: the whole Artifact, then each file in order,
+ * comments on the whole file first, then by where they are in the page; artifactCommentListOrder).
+ * The order and which threads are open or folded are made as the list opens and when a sort is
+ * picked, and never move while it is open but by the reader's own Resolve and Reopen. A thread
+ * of two comments or more is collapsed (its seen comments on one line, its new ones in full after
+ * a "New replies" divider) until the reader expands it (ArtifactCommentThreadCard). A reply sits under its thread; Reply opens a
  * box in that thread's card (A: posted at once; B: Send or Save Draft, a reply draft; C: no Reply). New
  * comments start elsewhere: a selection's Comment, a marker's bubble; one on the whole Artifact
  * starts in the box at the list's foot (A only, where the viewer may comment; xxchan,
@@ -84,9 +83,25 @@ import { ReviewFilter, ReviewSummary } from "./ArtifactCommentsReviewParts";
  * them, reply drafts too (after the others, each saying whom and what it answers), are first in
  * the list under "Your drafts", so the list holds every draft the bar counts.
  *
- * Resolved threads (#249) are folded below the open ones under "Resolved (N)", in the same
- * groups; each card says who resolved it and when. Resolve (an open thread) and Reopen (a resolved
- * one) sit beside Reply for whoever may (mayResolveThread); a reply reopens a thread.
+ * Resolved threads (#249) are folded below the open ones under "Resolved (N)", in the same order
+ * (and groups), but for those with comments new to the reader, which stay open until the list
+ * opens again; an expanded card says who resolved it and when. Resolve (an open thread) and Reopen
+ * (a resolved one) sit beside Reply for whoever may (mayResolveThread): resolved, the thread
+ * collapses into the folded section, focus to the card after it; reopened, it comes back. A reply
+ * reopens a thread where it is.
+ *
+ * Search (#proj-workspace:#341, useArtifactCommentSearch): the field in the head's second row shows
+ * only the threads with a comment, its root or a reply, whose words or author's name hold every word
+ * typed (any case, inside a run of Chinese, Japanese or Korean too), in the list's order and areas,
+ * resolved ones too (the Resolved section open while searching unless folded), with the words marked
+ * in the comments that match. A collapsed thread whose match is on one of its one-line comments
+ * shows whole. It changes nothing of the list's own state: nothing moves, nothing is seen, the
+ * Resolved section's own fold stays; Esc (in the field, or in the results where nothing else took it)
+ * or the field's × gives the list back as it was, the focus in the field. A thread picked that the
+ * search doesn't show (a marker in the page, a comment sent) ends the search, so the list shows it.
+ * A thread resolved from the results stays collapsed. No match: "No comments match", announced (a
+ * live region kept while the field is). Drafts and a review's summary wait while it searches. It
+ * finds in the comments loaded (Load earlier stays).
  *
  * Opened at a review (its Activity row, S8), the list shows that review's
  * comments alone, its summary first as its author's entry; the header's
@@ -95,7 +110,9 @@ import { ReviewFilter, ReviewSummary } from "./ArtifactCommentsReviewParts";
  * #250). A review that failed to load or isn't here says so in a strip,
  * with Show All Comments.
  *
- * Esc: the @ picker first (a reply box), then reply or edit mode, then the
+ * Esc: the @ picker first (a reply box), then reply or edit mode, then an
+ * expanded thread (it collapses), then the search's words (from the field or
+ * the results, but a text box; the focus goes to the field), then the
  * panel (the viewer's key handler, which closes the viewer only after it).
  *
  * Opened by a marker in the page while it was closed, or with the list open
@@ -138,7 +155,7 @@ export default function ArtifactCommentsPanel({ onClose }: { onClose: () => void
   // of a list an answer opened (a review posted, a landing): not from a text field or dialog the person is in.
   const openedFrom = useRef({ activeThreadId });
   useEffect(() => {
-    if (!openedFrom.current.activeThreadId) requestFocus(() => regionRef.current, { reason: "mount" });
+    if (!openedFrom.current.activeThreadId) focusListOnOpen(() => regionRef.current);
   }, []);
 
   // A thread picked: bring it into view, and focus it unless the page's marker picked it (a view
@@ -161,8 +178,9 @@ export default function ArtifactCommentsPanel({ onClose }: { onClose: () => void
     // Focus already in it (its reply box) stays there; so does focus still in the box a comment was
     // just sent from (the list's foot, which stays to write the next one). A box that went with
     // its send (a selection's, a card's) left focus nowhere: it moves to the comment sent.
-    const stillWriting = sentId !== null && document.activeElement instanceof HTMLTextAreaElement;
-    if (threadFromFrame === null && !stillWriting && card && !card.contains(document.activeElement)) requestFocus(() => card, { reason: pickReason(card) });
+    const active = card?.ownerDocument.activeElement ?? null;
+    const stillWriting = sentId !== null && active?.localName === "textarea";
+    if (threadFromFrame === null && !stillWriting && card && !card.contains(active)) requestFocus(() => card, { reason: pickReason(card) });
   }, [activeThreadId, threadFromFrame, sentId]);
 
   const reviewShown = comments?.reviewShown ?? null;
@@ -177,30 +195,60 @@ export default function ArtifactCommentsPanel({ onClose }: { onClose: () => void
     },
     [comments?.comments, reviewShown, shownReview],
   );
-  // Open threads in their groups; resolved ones (#249) folded below them, in the same groups.
-  const { groups, resolvedGroups, resolvedCount } = useMemo(() => {
+  // The threads (#249: resolved ones folded below the open), in the list's order and areas (useArtifactCommentList).
+  const threads = useMemo(
     // One review's comments have no thread around them to wait for: each is a root or a reply to one of them.
-    const threads = listed ? buildThreads(listed, { parentsMayBeOlder: reviewShown !== null || (comments?.hasEarlier ?? false) }) : [];
-    const files = comments?.data.files ?? [];
-    const resolved = threads.filter(isResolvedThread);
-    return { groups: groupThreads(threads.filter((t) => !isResolvedThread(t)), files), resolvedGroups: groupThreads(resolved, files), resolvedCount: resolved.length };
-  }, [listed, reviewShown, comments?.hasEarlier, comments?.data.files]);
+    () => (listed ? buildThreads(listed, { parentsMayBeOlder: reviewShown !== null || (comments?.hasEarlier ?? false) }) : null),
+    [listed, reviewShown, comments?.hasEarlier],
+  );
+  const files = comments?.data.files ?? NO_FILES;
+  const list = useArtifactCommentList({
+    threads,
+    files,
+    readMark: comments?.readMark ?? NO_READ_MARK,
+    viewer: comments?.viewer ?? null,
+    markPlaces: comments?.markPlaces ?? noPlaces,
+    placesKnown: comments?.placesKnown ?? false,
+  });
+  // The search: the threads it finds, in the list's order and areas; all of them without words.
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const search = useArtifactCommentSearch(threads, listRef);
+  const found = search.found;
+  const searching = found !== null;
+  const shownOpen = found ? list.open.filter((t) => found.threads.has(t.id)) : list.open;
+  const shownRest = found ? list.rest.filter((t) => found.threads.has(t.id)) : list.rest;
+  const resolvedCount = shownRest.length;
   // Folded until opened; a thread picked there (a landing, a marker, the bubble's way to the list) opens it.
   const resolvedHeadingId = useId();
   const resolvedPanelId = useId();
   const [resolvedOpen, setResolvedOpen] = useState(false);
   const toggleResolved = useCallback(() => setResolvedOpen((open) => !open), []);
+  // While searching, the search's own (open, unless the reader folds it): the list's is as it was once the words go.
+  const resolvedShownOpen = searching ? search.resolvedOpen : resolvedOpen;
   // The thread being read when the list last looked (once loaded): one picked while resolved opens
   // the section; one resolved while being read (its card's Resolve) leaves it folded.
+  // While searching, the list's fold stays as it was: one the search shows opens the search's section; one it
+  // doesn't show (a marker in the page, a comment sent) ends the search, so the list shows it.
   const [seenActive, setSeenActive] = useState<ArtifactCommentId | null>(null);
-  if (listed && seenActive !== activeThreadId) {
+  if (list.layout && seenActive !== activeThreadId) {
     setSeenActive(activeThreadId);
-    if (activeThreadId && resolvedGroups.some((g) => g.threads.some((t) => t.id === activeThreadId))) setResolvedOpen(true);
+    const resolvedPick = activeThreadId !== null && list.rest.some((t) => t.id === activeThreadId);
+    if (found && activeThreadId !== null && !found.threads.has(activeThreadId)) {
+      search.clear();
+      if (resolvedPick) setResolvedOpen(true);
+    } else if (resolvedPick) {
+      if (found) search.showResolved();
+      else setResolvedOpen(true);
+    }
   }
 
+  // Reply opens a box in an expanded card, which stays expanded once the reply is in (a thread of one comment too).
+  const { keepExpanded } = list;
   const startReply = useCallback((threadId: ArtifactCommentId, comment: ArtifactComment) => {
     setReplying((current) => ({ threadId, replyTo: comment, key: (current?.key ?? 0) + 1 }));
-  }, []);
+    const thread = threads?.find((t) => t.id === threadId);
+    if (thread) keepExpanded(thread);
+  }, [threads, keepExpanded]);
   const stopReplying = useCallback(() => setReplying(null), []);
   // Where focus goes once an edit or a delete is over (the menu that started it is gone or moved).
   // `restorations`: draftFocusRestorations() when a deletion planned it; a made-again draft that
@@ -241,16 +289,50 @@ export default function ArtifactCommentsPanel({ onClose }: { onClose: () => void
     }
     planRefocus({ selector: `[data-comment-id="${CSS.escape(id)}"] [data-testid="artifact-comment-menu"]`, wanted });
   }, [planRefocus]);
-  // Resolved or reopened from its card (#249): the card moved to the other part of the list. Focus
-  // follows it while it can be seen: reopened, to its card; resolved, to the folded section's heading.
-  // Made once the server answered: `wanted`, watched from the press (useThreadResolution).
+  // Resolved or reopened from its card (#249), the reader's own act: the card moves at once (useArtifactCommentList
+  // `moved`; a resolve's Undo reopens it so too). Resolved from the open area, focus to the card that was after it (or
+  // before it; none left, the folded section's heading); reopened, to its card. Made once the server answered: `wanted`,
+  // watched from the press (useThreadResolution); gone by then (Undo reopened it), nothing.
+  // While searching, the card after it among those shown; resolved there, it stays collapsed (the search doesn't open it again).
+  const { moved, layout: listLayout } = list;
+  const { fold } = search;
+  const layout = useMemo(() => (listLayout && found
+    ? { open: listLayout.open.filter((id) => found.threads.has(id)), rest: listLayout.rest.filter((id) => found.threads.has(id)) }
+    : listLayout), [listLayout, found]);
   const resolvedHere = useCallback((threadId: ArtifactCommentId, resolved: boolean, wanted: () => boolean) => {
-    // As the thread stands when the focus moves: resolved, its folded section's heading (or its card
-    // in the open section); reopened, its card. Gone by then (Undo reopened it), nothing.
-    const card = `[data-thread-id="${CSS.escape(threadId)}"]`;
-    const selector = !resolved ? card : resolvedOpen ? `[data-testid='artifact-comments-resolved'] ${card}` : "[data-testid='artifact-comments-resolved-toggle']";
+    const thread = threads?.find((t) => t.id === threadId);
+    if (thread) moved(thread, !resolved);
+    if (thread && resolved && searching) fold(thread);
+    const card = (id: ArtifactCommentId) => `[data-thread-id="${CSS.escape(id)}"]`;
+    const next = layout ? neighbourAfterResolve(layout, threadId) : null;
+    const fromOpen = layout?.open.includes(threadId) ?? false;
+    const selector = !resolved || !fromOpen ? card(threadId) : next ? card(next) : "[data-testid='artifact-comments-resolved-toggle']";
     planRefocus({ selector, exact: true, wanted });
-  }, [resolvedOpen, planRefocus]);
+  }, [threads, moved, searching, fold, layout, planRefocus]);
+  // Expanded from its collapsed card: the card keeps the focus (its trigger goes), and it is the thread being read.
+  // Collapsed (its Collapse, Esc): focus back on the card's trigger, the card where it was. One the search opened
+  // folds back for this search, still not read; one the reader expanded is collapsed (all it showed is seen).
+  const { expand, collapse, isExpanded } = list;
+  const setActiveThread = comments?.setActiveThreadId;
+  const expandThread = useCallback((thread: ArtifactCommentThread) => {
+    expand(thread);
+    setActiveThread?.(thread.id);
+    planRefocus({ selector: `[data-thread-id="${CSS.escape(thread.id)}"]`, exact: true });
+  }, [expand, setActiveThread, planRefocus]);
+  const collapseThread = useCallback((thread: ArtifactCommentThread) => {
+    if (isExpanded(thread)) collapse(thread);
+    if (searching) fold(thread);
+    setReplying((current) => (current?.threadId === thread.id ? null : current));
+    setEditing((current) => (current !== null && [thread.root, ...thread.replies].some((c) => c?.id === current) ? null : current));
+    planRefocus({ selector: `[data-thread-id="${CSS.escape(thread.id)}"] [data-slot='comment-card-trigger']`, exact: true });
+  }, [isExpanded, collapse, searching, fold, planRefocus]);
+  // A sort picked: the list's order again (its areas and what is expanded kept), from its top.
+  const { pickSort } = list;
+  const chooseSort = useCallback((value: unknown) => {
+    if (!ARTIFACT_COMMENT_SORTS.includes(value as ArtifactCommentSort)) return;
+    pickSort(value as ArtifactCommentSort);
+    listRef.current?.scrollTo?.({ top: 0 });
+  }, [pickSort]);
   const cancelDelete = useCallback(() => {
     if (deleting) planRefocus({ selector: `[data-comment-id="${CSS.escape(deleting.id)}"] [data-testid="artifact-comment-menu"]` });
     setDeleting(null);
@@ -287,8 +369,9 @@ export default function ArtifactCommentsPanel({ onClose }: { onClose: () => void
   }, [ownDrafts, deleteDraft, planRefocus]);
   useEffect(() => {
     if (!refocus || editing || deleting) return;
-    // After the dialog has given focus back, so this wins.
-    const frame = requestAnimationFrame(() => {
+    // After the dialog has given focus back, so this wins. The list's own window's frame (an object window's, #337 PR3).
+    const frames = animationFramesOf(regionRef.current?.ownerDocument);
+    const frame = frames.requestAnimationFrame(() => {
       setRefocus(null);
       // Asked in every case, so it stops watching.
       const wanted = refocus.wanted?.() ?? true;
@@ -297,7 +380,7 @@ export default function ArtifactCommentsPanel({ onClose }: { onClose: () => void
       const target = regionRef.current?.querySelector<HTMLElement>(refocus.selector) ?? (refocus.exact ? null : regionRef.current?.querySelector<HTMLElement>("[data-testid='artifact-comments-list']"));
       if (target) requestFocus(() => target, { reason: refocus.wanted ? "async" : "user" });
     });
-    return () => cancelAnimationFrame(frame);
+    return () => frames.cancelAnimationFrame(frame);
   }, [refocus, editing, deleting]);
 
   // Load earlier: when the last page arrives the button goes; focus moves to the earliest comment, unless the person
@@ -322,33 +405,66 @@ export default function ArtifactCommentsPanel({ onClose }: { onClose: () => void
     if (target) requestFocus(() => target, { reason: "async", onFocused: (el) => el.scrollIntoView?.({ block: "nearest" }) });
   }, [hasEarlier, earlierFailed]);
 
-  // A group of threads under its heading (`h4` in the Resolved section, under its own heading).
-  const renderGroup = (group: ArtifactCommentGroup, Heading: "h3" | "h4") => (
+  // Esc in the results that nothing took (a result card, a button in one; not a text box, a menu's or a dialog's, nor an
+  // input method's): the search's words go first and the focus goes to the field; the next Esc is the panel's.
+  const fieldRef = useRef<HTMLInputElement | null>(null);
+  const { clear: clearSearch, query: searchQuery } = search;
+  const searchEscape = useCallback((event: KeyboardEvent<HTMLElement>) => {
+    if (event.key !== "Escape" || searchQuery === "" || isEscapeTakenElsewhere(event)) return;
+    const target = event.target;
+    if (!isElementNode(target) || !event.currentTarget.contains(target) || isTextEditableElement(target)) return;
+    event.preventDefault();
+    clearSearch();
+    fieldRef.current?.focus();
+  }, [searchQuery, clearSearch]);
+
+  const renderThread = (thread: ArtifactCommentThread) => {
+    const newIds = list.newIn(thread);
+    return (
+      <ThreadCard
+        key={thread.id}
+        thread={thread}
+        sort={list.sort}
+        manyFiles={files.length > 1}
+        // The search opens a collapsed thread to show a match on one of its one-line comments (not read for it).
+        expanded={isExpanded(thread) || search.opens(thread, newIds)}
+        single={isSingleThread(thread)}
+        newIds={newIds}
+        editing={editing}
+        replying={replyOffered && replying?.threadId === thread.id ? replying : null}
+        replyOffered={replyOffered}
+        onReply={startReply}
+        onStopReplying={stopReplying}
+        onEdit={setEditing}
+        onStopEditing={stopEditing}
+        onDelete={setDeleting}
+        onResolved={resolvedHere}
+        onExpand={expandThread}
+        onCollapse={collapseThread}
+        highlight={search.terms}
+        matching={found?.comments ?? null}
+      />
+    );
+  };
+  // An area's threads: in Page order in their groups, each under its heading (`h4` in the Resolved section, under its
+  // own heading); in Last updated one column, each card's anchor line saying where.
+  const renderArea = (area: ArtifactCommentThread[], Heading: "h3" | "h4") => (list.sort === "updated" ? (
+    <div className="flex flex-col gap-2" data-testid="artifact-comment-column">{area.map(renderThread)}</div>
+  ) : groupThreads(area, files).map((group) => (
     <section key={group.kind === "artifact" ? "artifact" : `file:${group.path}`} className="flex flex-col gap-2" data-testid="artifact-comment-group" data-group={group.kind === "artifact" ? "artifact" : group.path}>
       <Text.Sans
         size="group"
         className="px-1"
         render={<Heading>{group.kind === "artifact" ? formatMessage({ id: "artifacts.comments.groupArtifact" }) : <span className="font-mono">{group.path}</span>}</Heading>}
       />
-      {group.threads.map((thread) => (
-        <ThreadCard
-          key={thread.id}
-          thread={thread}
-          editing={editing}
-          replying={replyOffered && replying?.threadId === thread.id ? replying : null}
-          replyOffered={replyOffered}
-          onReply={startReply}
-          onStopReplying={stopReplying}
-          onEdit={setEditing}
-          onStopEditing={stopEditing}
-          onDelete={setDeleting}
-          onResolved={resolvedHere}
-        />
-      ))}
+      {group.threads.map(renderThread)}
     </section>
-  );
+  )));
+  const sortLabel = formatMessage({ id: "artifacts.comments.sort" });
 
   if (!comments) return null;
+  const searchOffered = comments.comments !== null && ((threads?.length ?? 0) > 0 || search.query !== "");
+  const noneFound = searching && shownOpen.length === 0 && resolvedCount === 0;
   return (
     <section
       ref={regionRef}
@@ -368,13 +484,34 @@ export default function ArtifactCommentsPanel({ onClose }: { onClose: () => void
         </PanelHeaderContent>
         <PanelActions>
           <ReviewFilter />
-          <Tooltip content={formatMessage({ id: "artifacts.comments.close" })}>
-            <PanelAction aria-label={formatMessage({ id: "artifacts.comments.close" })} onClick={onClose} data-testid="artifact-comments-close">
-              <X />
+          <DropdownMenu>
+            <Tooltip content={sortLabel}>
+              <DropdownMenuTrigger
+                render={(
+                  <PanelAction aria-label={sortLabel} className="data-popup-open:bg-fill-medium" data-testid="artifact-comments-sort">
+                    <ArrowDownUp />
+                  </PanelAction>
+                )}
+              />
+            </Tooltip>
+            <DropdownMenuContent side="bottom" align="end" aria-label={sortLabel} className="min-w-44" data-testid="artifact-comments-sort-menu">
+              <DropdownMenuRadioGroup value={list.sort} onValueChange={chooseSort}>
+                {ARTIFACT_COMMENT_SORTS.map((value) => (
+                  <DropdownMenuRadioItem key={value} value={value} data-testid={`artifact-comments-sort-${value}`}>
+                    <DropdownMenuItemLabel>{formatMessage({ id: SORT_LABELS[value] })}</DropdownMenuItemLabel>
+                  </DropdownMenuRadioItem>
+                ))}
+              </DropdownMenuRadioGroup>
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <Tooltip content={formatMessage({ id: "artifacts.comments.hide" })}>
+            <PanelAction aria-label={formatMessage({ id: "artifacts.comments.hide" })} onClick={onClose} data-testid="artifact-comments-close">
+              <PanelRightClose />
             </PanelAction>
           </Tooltip>
         </PanelActions>
       </PanelHeader>
+      {searchOffered ? <ArtifactCommentSearchField query={search.query} onQuery={search.type} onClear={search.clear} fieldRef={fieldRef} /> : null}
       {reviewShown && comments.comments !== null && shownReview && shownReview.status !== "ok" ? (
         <PanelNotice status="warning" data-testid="artifact-comments-review-only" data-review={shownReview.status}>
           <PanelNoticeContent>
@@ -396,7 +533,7 @@ export default function ArtifactCommentsPanel({ onClose }: { onClose: () => void
       ) : null}
       {/* The thread scrolls in a raft-ui ScrollArea, its padding on the
           content; no tab stop, as before (its cards and buttons take focus). */}
-      <ScrollArea tabIndex={-1} aria-busy={comments.loadingEarlier || undefined} className="min-h-0 flex-1 outline-none" contentClassName="px-3 py-3" data-testid="artifact-comments-list">
+      <ScrollArea ref={listRef} tabIndex={-1} onKeyDown={searchEscape} aria-busy={comments.loadingEarlier || undefined} className="min-h-0 flex-1 outline-none" contentClassName="px-3 py-3" data-testid="artifact-comments-list">
         {comments.hasEarlier && !reviewShown ? (
           <div className="mb-3 flex flex-col items-center gap-1">
             {comments.earlierFailed ? (
@@ -409,7 +546,13 @@ export default function ArtifactCommentsPanel({ onClose }: { onClose: () => void
             </Button>
           </div>
         ) : null}
-        {!reviewShown && (ownDrafts.length > 0 || draftsEmptied) ? (
+        {/* Kept while the field is, its words changed, so a screen reader says when nothing matches. */}
+        {searchOffered ? (
+          <p role="status" className="px-1 text-footnote text-foreground-muted" data-testid="artifact-comments-search-empty">
+            {noneFound ? formatMessage({ id: "artifacts.comments.searchEmpty" }) : ""}
+          </p>
+        ) : null}
+        {!reviewShown && !searching && (ownDrafts.length > 0 || draftsEmptied) ? (
           <section className="mb-4 flex flex-col gap-2" data-testid="artifact-comments-drafts" aria-labelledby={draftsHeadingId}>
             <Text.Sans
               size="group"
@@ -430,14 +573,14 @@ export default function ArtifactCommentsPanel({ onClose }: { onClose: () => void
           ) : (
             <ContentLoading>{formatMessage({ id: "artifacts.comments.loading" })}</ContentLoading>
           )
-        ) : reviewShown && shownReview?.status !== "ok" ? null : groups.length === 0 && resolvedCount === 0 && !(shownReview?.status === "ok" && shownReview.review.body) ? (
+        ) : (reviewShown && shownReview?.status !== "ok") || noneFound ? null : list.open.length === 0 && resolvedCount === 0 && !(shownReview?.status === "ok" && shownReview.review.body) ? (
           <p className="px-1 text-footnote text-foreground-muted" data-testid="artifact-comments-empty">{formatMessage({ id: "artifacts.comments.empty" })}</p>
         ) : (
           <div className="flex flex-col gap-4">
-            {shownReview?.status === "ok" && shownReview.review.body ? (
+            {shownReview?.status === "ok" && shownReview.review.body && !searching ? (
               <ReviewSummary review={shownReview.review} body={shownReview.review.body} />
             ) : null}
-            {groups.map((group) => renderGroup(group, "h3"))}
+            {shownOpen.length > 0 ? renderArea(shownOpen, "h3") : null}
             {resolvedCount > 0 ? (
               <section className="flex flex-col gap-2" aria-labelledby={resolvedHeadingId} data-testid="artifact-comments-resolved">
                 <h3>
@@ -446,18 +589,18 @@ export default function ArtifactCommentsPanel({ onClose }: { onClose: () => void
                     variant="ghost"
                     size="md"
                     id={resolvedHeadingId}
-                    onClick={toggleResolved}
-                    aria-expanded={resolvedOpen}
-                    aria-controls={resolvedOpen ? resolvedPanelId : undefined}
+                    onClick={searching ? search.toggleResolved : toggleResolved}
+                    aria-expanded={resolvedShownOpen}
+                    aria-controls={resolvedShownOpen ? resolvedPanelId : undefined}
                     data-testid="artifact-comments-resolved-toggle"
                   >
-                    {resolvedOpen ? <ChevronDown aria-hidden /> : <ChevronRight aria-hidden />}
+                    {resolvedShownOpen ? <ChevronDown aria-hidden /> : <ChevronRight aria-hidden />}
                     {formatMessage({ id: "artifacts.comments.resolvedGroup" }, { count: resolvedCount })}
                   </Button>
                 </h3>
-                {resolvedOpen ? (
+                {resolvedShownOpen ? (
                   <div id={resolvedPanelId} className="flex flex-col gap-4">
-                    {resolvedGroups.map((group) => renderGroup(group, "h4"))}
+                    {renderArea(shownRest, "h4")}
                   </div>
                 ) : null}
               </section>
@@ -511,216 +654,5 @@ function ListComposer() {
         insert={compose?.compose ?? null}
       />
     </div>
-  );
-}
-
-function ThreadCard({
-  thread,
-  editing,
-  replying,
-  replyOffered,
-  onReply,
-  onStopReplying,
-  onEdit,
-  onStopEditing,
-  onDelete,
-  onResolved,
-}: {
-  thread: ArtifactCommentThread;
-  editing: ArtifactCommentId | null;
-  /** This card's reply box, when Reply opened it. */
-  replying: { replyTo: ArtifactComment; key: number } | null;
-  /** Whether Reply is offered (A, posted at once; B, Send or Save Draft). */
-  replyOffered: boolean;
-  onReply: (threadId: ArtifactCommentId, comment: ArtifactComment) => void;
-  onStopReplying: () => void;
-  onEdit: (id: ArtifactCommentId) => void;
-  onStopEditing: (id: ArtifactCommentId, wanted?: () => boolean) => void;
-  onDelete: (comment: ArtifactComment) => void;
-  /** Resolve or Reopen changed it (#249): resolved now, or open. */
-  onResolved: (threadId: ArtifactCommentId, resolved: boolean, wanted: () => boolean) => void;
-}) {
-  const intl = useIntl();
-  const { formatMessage } = intl;
-  const comments = useArtifactComments();
-  const resolution = useThreadResolution(thread, onResolved);
-  const anchor = anchorOf(thread.first);
-  const pending = usePendingReplies(thread);
-  const found = useAnchorFound(thread.first);
-  const active = comments?.activeThreadId === thread.id;
-  const setActive = comments?.setActiveThreadId;
-  const activate = useCallback(() => setActive?.(thread.id), [setActive, thread.id]);
-  // Under a placeholder (the comment it answers is on an earlier page), a reply answers the first reply. Drawn and
-  // focused within the press (flushSync): iOS Safari opens the keyboard only for a focus made during the tap itself, and
-  // a Reply is the person asking to type, on touch too.
-  const reply = useCallback(() => flushSync(() => onReply(thread.id, thread.root ?? thread.first)), [onReply, thread.id, thread.root, thread.first]);
-  const replyTo = replying?.replyTo ?? null;
-  const replyMode = useMemo(() => (replyTo ? { kind: "new" as const, target: replyTo.target, replyTo } : null), [replyTo]);
-  const { draftOption } = useReplyDraftOption(replyTo);
-  return (
-    <CommentCard
-      active={active}
-      aria-current={active || undefined}
-      tabIndex={-1}
-      onClick={activate}
-      onFocus={activate}
-      data-thread-id={thread.id}
-      data-testid="artifact-comment-thread"
-      className="outline-none"
-    >
-      {anchor ? (
-        // A button: from the keyboard too, it makes this the thread being read (its passage takes the active highlight).
-        // raft-ui's CommentCardMeta draws a button render as clickable text: the hover underline and the focus ring.
-        <CommentCardMeta
-          render={<button type="button" />}
-          onClick={activate}
-          data-testid="artifact-comment-anchor"
-          data-found={found ? "true" : "false"}
-        >
-          {found ? null : <MapPinOff aria-hidden />}
-          <span className="min-w-0 truncate"><AnchorMeta anchor={anchor} found={found} /></span>
-        </CommentCardMeta>
-      ) : null}
-      {thread.root ? (
-        <CommentItem comment={thread.root} editing={editing === thread.root.id} onEdit={onEdit} onStopEditing={onStopEditing} onDelete={onDelete} />
-      ) : (
-        <p className="text-callout text-foreground-hint italic" data-testid="artifact-comment-earlier-placeholder">
-          {formatMessage({ id: "artifacts.comments.replyToEarlier" })}
-        </p>
-      )}
-      {/* DS Comment: each reply is one more CommentEntry in the card's column, straight after the one before. */}
-      {thread.replies.map((replyComment) => (
-        <CommentItem key={replyComment.id} comment={replyComment} editing={editing === replyComment.id} onEdit={onEdit} onStopEditing={onStopEditing} onDelete={onDelete} />
-      ))}
-      {pending.map((draft) => <PendingReplyDraft key={draft.id} draft={draft} thread={thread} />)}
-      {resolution.resolved ? <ResolvedBy root={thread.root!} /> : null}
-      {replyMode && replying ? (
-        <ArtifactDismissableBox onDismiss={onStopReplying}>
-          <ArtifactCommentBox key={replying.key} mode={replyMode} draftOption={draftOption} onCancel={onStopReplying} onDone={onStopReplying} autoFocusKey={replying.key} />
-        </ArtifactDismissableBox>
-      ) : (replyOffered && comments?.data.capabilities.comment) || resolution.may ? (
-        <div className="flex items-center gap-1">
-          {replyOffered && comments?.data.capabilities.comment ? (
-            <Button variant="ghost" size="md" onClick={reply} data-testid="artifact-comment-reply">
-              <Reply />
-              {formatMessage({ id: "artifacts.comments.reply" })}
-            </Button>
-          ) : null}
-          <ResolveButton resolution={resolution} />
-        </div>
-      ) : null}
-    </CommentCard>
-  );
-}
-
-export function CommentItem({
-  comment,
-  editing,
-  onEdit,
-  onStopEditing,
-  onDelete,
-  listWay = null,
-  inCard = false,
-}: {
-  comment: ArtifactComment;
-  editing: boolean;
-  onEdit: (id: ArtifactCommentId) => void;
-  onStopEditing: (id: ArtifactCommentId, wanted?: () => boolean, pressed?: boolean) => void;
-  onDelete: (comment: ArtifactComment) => void;
-  /** First in this comment's ⋯, which it brings to a comment that has none: anyone's, or one being edited. */
-  listWay?: ArtifactCardListWay | null;
-  /** In the open thread's card (its edit box keeps the card while it holds words). */
-  inCard?: boolean;
-}) {
-  const intl = useIntl();
-  const { formatMessage, locale } = intl;
-  const comments = useArtifactComments();
-  const viewer = comments?.viewer ?? null;
-  const own = isOwnComment(comment, viewer);
-  const shownVersion = comments?.data.card.version;
-  // Drawn and focused within the press (flushSync), as Reply: iOS Safari opens the keyboard only for a focus made during
-  // the tap itself, and an Edit is the person asking to type, on touch too.
-  const edit = useCallback(() => flushSync(() => onEdit(comment.id)), [onEdit, comment.id]);
-  const remove = useCallback(() => onDelete(comment), [onDelete, comment]);
-  const editMode = useMemo(() => ({ kind: "edit" as const, comment }), [comment]);
-  const stop = useCallback(() => onStopEditing(comment.id), [onStopEditing, comment.id]);
-  const saved = useCallback((wanted?: () => boolean) => onStopEditing(comment.id, wanted), [onStopEditing, comment.id]);
-  // The ⋯ menu stays while it is open (its items go): Edit's box takes focus within the tap, then the menu closes with
-  // focus already out of it, so it gives none back (gone in the same commit, it would hand focus to an earlier element
-  // after the tap).
-  const [menuOpen, setMenuOpen] = useState(false);
-  const pressedOutside = useCallback(() => onStopEditing(comment.id, undefined, true), [onStopEditing, comment.id]);
-  if (comment.deletedAt) {
-    // Kept for its replies (contract #10877): no author, no text.
-    return (
-      <CommentEntry data-testid="artifact-comment-deleted" data-comment-id={comment.id}>
-        <CommentEntryBody className="text-foreground-hint italic">{formatMessage({ id: "artifacts.comments.deleted" })}</CommentEntryBody>
-      </CommentEntry>
-    );
-  }
-  const authorName = artifactActorName(comment.author, formatMessage);
-  const moreLabel = formatMessage({ id: "artifacts.comments.more" }, { name: authorName });
-  const writable = own && !editing;
-  return (
-    <CommentEntry data-testid="artifact-comment" data-comment-id={comment.id} data-author={actorKey(comment.author)}>
-      <CommentEntryHeader>
-        <ArtifactActorAvatar actor={comment.author} context="comment-entry" />
-        <CommentEntryAuthor>{authorName}</CommentEntryAuthor>
-        {comment.author.type === "agent" ? <AgentTag /> : null}
-        <CommentEntryTime dateTime={comment.createdAt}>{formatRelativeTime(comment.createdAt, locale) ?? ""}</CommentEntryTime>
-        {comment.editedAt ? (
-          <span className="shrink-0 text-caption text-foreground-hint" data-testid="artifact-comment-edited">
-            {formatMessage({ id: "artifacts.comments.edited" })}
-          </span>
-        ) : null}
-        {shownVersion !== undefined && comment.version !== shownVersion ? (
-          <span className="shrink-0" data-testid="artifact-comment-version"><ArtifactVersionBadge version={comment.version} /></span>
-        ) : null}
-        {writable || listWay || menuOpen ? (
-          <DropdownMenu onOpenChange={setMenuOpen}>
-            <DropdownMenuTrigger
-              render={(
-                <Button variant="ghost" size="icon-md" className="ms-auto" aria-label={moreLabel} data-testid="artifact-comment-menu">
-                  <EllipsisVertical />
-                </Button>
-              )}
-            />
-            <DropdownMenuContent side="bottom" align="end" aria-label={moreLabel}>
-              {listWay ? (
-                <DropdownMenuItem onClick={listWay.open} disabled={listWay.off} data-testid="artifact-comment-open-in-list">
-                  <CommentIcon />
-                  {formatMessage({ id: "artifacts.comments.openInList" })}
-                </DropdownMenuItem>
-              ) : null}
-              {writable ? (
-                <>
-                  {/* Relies on Base UI calling this onClick before its own close: flushSync commits the box while the menu is still open (menuOpen above). */}
-                  <DropdownMenuItem onClick={edit} data-testid="artifact-comment-edit">
-                    <Pencil />
-                    {formatMessage({ id: "artifacts.comments.edit" })}
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onClick={remove} data-testid="artifact-comment-delete">
-                    <Trash2 />
-                    {formatMessage({ id: "artifacts.comments.delete" })}
-                  </DropdownMenuItem>
-                </>
-              ) : null}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        ) : null}
-      </CommentEntryHeader>
-      {editing ? (
-        <ArtifactDismissableBox onDismiss={pressedOutside}>
-          <ArtifactCommentBox mode={editMode} onDone={saved} onCancel={stop} autoFocusKey={1} inCard={inCard} />
-        </ArtifactDismissableBox>
-      ) : (
-        <>
-          <CommentEntryBody data-testid="artifact-comment-body">
-            <ArtifactCommentText body={comment.body} viewer={viewer} />
-          </CommentEntryBody>
-          <ArtifactCommentGallery artifactId={comments?.data.card.id ?? null} images={comment.images} />
-        </>
-      )}
-    </CommentEntry>
   );
 }

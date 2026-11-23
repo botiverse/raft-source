@@ -1,11 +1,11 @@
-import { useCallback, useId, useMemo } from "react";
+import { memo, useCallback, useId, useMemo } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
 import Tooltip from "../../components/ui/Tooltip";
 import { AtSign, Check } from "lucide-react";
 import type { InboxFilter, InboxItem, ObjectActivityItem } from "../../store/inboxStore";
-import { artifactActivityExcerpt, artifactActivityImagesOnly, artifactActivityRowParts, artifactActivityTarget, useArtifactOpenIntent } from "../../apps/artifacts";
+import { artifactActivityExcerpt, artifactActivityImagesOnly, artifactActivityRowParts, artifactActivityTarget, openActivityRowInAnotherWindow, useArtifactMiniWindows, useArtifactOpenIntent } from "../../apps/artifacts";
 import type { ArtifactActivityRowParts } from "../../apps/artifacts";
 import { IconTile, InboxItemBody, InboxItemContent, InboxItemHeading, InboxItemHoverTarget, InboxItemLeading, InboxItemMarks, InboxItemSender, InboxItemTitle, InboxItemTrigger, InboxItem as RaftInboxItem, SidebarItemCount, SidebarItemIndicator } from "@botiverse/raft-ui";
 import { InboxItemLine } from "@botiverse/raft-ui/wip";
@@ -13,10 +13,12 @@ import { useAgentStore } from "../../store/agentStore";
 import { useAuthStore } from "../../store/authStore";
 import { useServerStore } from "../../store/serverStore";
 import { resolveMessageSenderMemberFromList } from "../../utils/messageSenderMember";
+import { useActorFallback } from "../../store/localTables/useActorFallback";
 import InlineMarkdownPreview from "../../components/markdown/InlineMarkdownPreview";
 import AvatarSlot from "../../components/ui/AvatarSlot";
 import { dismissLayerProps } from "../../components/ui/dismissLayer";
 import { useLongPress } from "../../hooks/useLongPress";
+import type { LongPressCoords } from "../../hooks/useLongPress";
 import { useOverflowTitle } from "../../hooks/useOverflowTitle";
 import { ROW_SWIPE_ACTION_ATTR, ROW_SWIPE_BUTTON_WIDTH, useRowSwipe } from "../../hooks/useRowSwipe";
 import { ActivityRowTime } from "./ActivityRowTime";
@@ -71,14 +73,14 @@ function objectRowHome(item: ObjectActivityItem): string | null {
  * marks its second, as a conversation row's. Opening it goes to the object; Done takes it out (a phone: the left swipe, with Undo), and
  * the menu reads it while it is unread.
  */
-export function ObjectInboxRow({ item, filter, onOpen, onDone, swipe: rowSwipe, onContextMenu, onLongPress, focused, active, located, focusRef }: {
+function ObjectInboxRowImpl({ item, filter, onOpen, onDone, swipe: rowSwipe, onContextMenu, onLongPress, focused, active, located, focusRef }: {
   item: ObjectActivityItem;
   filter: InboxFilter;
   onOpen: (e: React.MouseEvent | ReactKeyboardEvent, item: InboxItem) => void;
   onDone: (item: InboxItem) => void;
   swipe?: RowSwipeProps;
   onContextMenu: (e: React.MouseEvent, item: InboxItem) => void;
-  onLongPress: (coords: { x: number; y: number }, item: InboxItem) => void;
+  onLongPress: (coords: LongPressCoords, item: InboxItem) => void;
   focused?: boolean;
   /** Open in the main area: raft-ui's active look, for as long as it is open (a conversation row's). */
   active?: boolean;
@@ -87,7 +89,6 @@ export function ObjectInboxRow({ item, filter, onOpen, onDone, swipe: rowSwipe, 
 }) {
   const intl = useIntl();
   const { formatMessage } = intl;
-  const agents = useAgentStore((s) => s.agents);
   const members = useServerStore((s) => s.members);
   const currentUser = useAuthStore((s) => s.user);
   // A comment's text is its author's, who may not be the newest event's actor.
@@ -95,22 +96,31 @@ export function ObjectInboxRow({ item, filter, onOpen, onDone, swipe: rowSwipe, 
   // A comment of images alone: "Image" / "3 images" where its text would be.
   const imagesOnly = excerpt ? artifactActivityImagesOnly(excerpt, intl) : null;
   const actor = excerpt?.author ?? item.latestEvent.actor;
-  const actorAgent = actor.type === "agent" ? agents.find((a) => a.id === actor.id) : undefined;
+  // The actor alone, not the agent list: another agent's change keeps this row (#532).
+  const actorAgent = useAgentStore((s) => (actor.type === "agent" ? s.agents.find((a) => a.id === actor.id) : undefined));
   const actorMember = actor.type === "user"
     ? resolveMessageSenderMemberFromList({ senderType: "user", senderId: actor.id }, members, currentUser)
     : undefined;
-  const actorName = actorAgent?.displayName ?? actorAgent?.name ?? actorMember?.displayName ?? actorMember?.name ?? actor.name;
+  // Not in this server's rosters (a joint channel's other server, e.g. another server's agent publishing there): the
+  // actors table, filled by `/actors/resolve` as a message row's sender is, gives the name and the face.
+  const actorFallback = useActorFallback(
+    actor.id && (actor.type === "agent" ? !actorAgent : !actorMember)
+      ? { kind: actor.type === "agent" ? "agent" : "human", id: actor.id }
+      : null,
+  );
+  const actorName = actorAgent?.displayName ?? actorAgent?.name ?? actorMember?.displayName ?? actorMember?.name
+    ?? actorFallback?.displayName ?? actorFallback?.name ?? actor.name;
   const parts = objectRowParts(item, actorName, intl);
   const home = objectRowHome(item);
   const target = useMemo(() => artifactActivityTarget(item), [item]);
   const intent = useArtifactOpenIntent(target, item.summary);
   const actorAvatar = actor.type === "agent" ? (
-    <AvatarSlot context="sidebar-list" type="agent" agentAvatarUrl={actorAgent?.avatarUrl ?? null} />
+    <AvatarSlot context="sidebar-list" type="agent" agentAvatarUrl={actorAgent ? actorAgent.avatarUrl ?? null : actorFallback?.avatarUrl ?? null} />
   ) : (
     <AvatarSlot
       context="sidebar-list"
       type="human"
-      humanAvatarUrl={actorMember?.avatarUrl ?? null}
+      humanAvatarUrl={actorMember ? actorMember.avatarUrl ?? null : actorFallback?.avatarUrl ?? null}
     />
   );
   const unreadCount = item.unreadCount;
@@ -119,17 +129,20 @@ export function ObjectInboxRow({ item, filter, onOpen, onDone, swipe: rowSwipe, 
   const titleId = useId();
   const bodyId = useId();
   const timeId = useId();
-  const handleLongPress = useCallback((coords: { x: number; y: number }) => onLongPress(coords, item), [item, onLongPress]);
+  const handleLongPress = useCallback((coords: LongPressCoords) => onLongPress(coords, item), [item, onLongPress]);
   const longPress = useLongPress(handleLongPress);
   const longPressSuppressClickRef = longPress.suppressClickRef;
   const { onTouchStart: handleTouchStart, onTouchMove: handleTouchMove, onTouchEnd: handleTouchEnd, onTouchCancel: handleTouchCancel } = longPress;
+  const miniWindows = useArtifactMiniWindows();
   const handleOpen = useCallback((event: React.MouseEvent | ReactKeyboardEvent) => {
     if (longPressSuppressClickRef.current) {
       longPressSuppressClickRef.current = false;
       return;
     }
+    // Raft Desktop's Artifact windows (#337 PR3): a Cmd/Ctrl-click opens it in another window; the row stays as it is.
+    if ("button" in event && openActivityRowInAnotherWindow(event, item, miniWindows)) return;
     onOpen(event, item);
-  }, [item, longPressSuppressClickRef, onOpen]);
+  }, [item, longPressSuppressClickRef, onOpen, miniWindows]);
   const handleKeyDown = useCallback((event: ReactKeyboardEvent) => {
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
@@ -283,3 +296,6 @@ export function ObjectInboxRow({ item, filter, onOpen, onDone, swipe: rowSwipe, 
     </RaftInboxItem>
   );
 }
+
+/** Memoised as InboxRow is: a store change elsewhere does not re-render an unchanged row. */
+export const ObjectInboxRow = memo(ObjectInboxRowImpl);

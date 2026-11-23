@@ -161,7 +161,7 @@ test("prompts and answers need an enabled App installed on this Server with a li
     for (const choice of ['link-preview-consent', 'link-preview-decline'] as const) {
       const response = await answer(app.baseUrl, ownerHeaders, clientId, choice);
       assert.equal(response.status, 404, `${label} ${choice}`);
-      assert.deepEqual(await response.json(), { error: 'App not found', code: 'LINK_PREVIEW_APP_NOT_FOUND' }, `${label} ${choice}`);
+      assert.deepEqual(await response.json(), { error: 'App not found', code: 'LINK_PREVIEW_APP_NOT_FOUND', errorCode: 'LINK_PREVIEW_APP_NOT_FOUND' }, `${label} ${choice}`);
     }
   }
   assert.equal((await answer(app.baseUrl, ownerHeaders, 'not-a-uuid', 'link-preview-consent')).status, 404);

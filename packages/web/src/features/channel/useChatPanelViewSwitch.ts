@@ -9,14 +9,13 @@ export interface ChatPanelListShown {
   held: boolean;
   loading: boolean;
   hasMessages: boolean;
-  forumMode: boolean;
 }
 
-/** What the channel's list shows, for `web.view.switch`: a page fetched for it (or its forum activity), not a skeleton or only live rows. */
+/** What the channel's list shows, for `web.view.switch`: a page fetched for it, not a skeleton or only live rows. */
 export function chatPanelListState(shown: ChatPanelListShown, historyFetched: boolean): ViewListState {
   if (shown.unavailable) return "error";
   if (shown.held || (shown.loading && !shown.hasMessages)) return "pending";
-  return historyFetched || (shown.forumMode && !shown.loading) ? "data" : "pending";
+  return historyFetched ? "data" : "pending";
 }
 
 /** End hook of `web.view.switch` for a channel's or DM's message list (observability/viewSwitchSpan.ts). */

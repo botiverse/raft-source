@@ -14,6 +14,8 @@ import { heldKeyboard } from "./artifactCardHold";
 import { anchorOf, buildThreads, reopenedBy } from "./artifactComments";
 import { commentMarks } from "./artifactCommentMarks";
 import { useArtifactActivityRefresh } from "./useArtifactActivityRefresh";
+import { useArtifactCommentReading } from "./useArtifactCommentReading";
+import type { ArtifactCommentReadMark, ArtifactMarkPlaces } from "./artifactCommentListOrder";
 import type { CommentBoxState } from "./useCommentBoxes";
 import { useUnsentCommentOffer } from "./useUnsentCommentOffer";
 import { followedPlace, inClient, sameRect, trackedPlaces } from "./artifactTrackedPlaces";
@@ -25,10 +27,12 @@ import type { ArtifactCommentsOpening } from "./artifactViewerStore";
 
 export type { TrackedPlace } from "./artifactTrackedPlaces";
 
-export type { ArtifactCommentBubble, ArtifactCommentsReview, ArtifactCommentTarget, ArtifactFrameLayer, SentFrom, ShownReview } from "./artifactCommentsShapes";
+export type { ArtifactCommentBubble, ArtifactCommentsReview, ArtifactCommentTarget, ArtifactFrameLayer, LiveAnchorSpec, SentFrom, ShownReview } from "./artifactCommentsShapes";
+import { captureLiveAnchor } from "./artifactCommentsShapes";
 import type { ArtifactCommentBubble, ArtifactCommentsReview, ArtifactCommentTarget, ArtifactFrameLayer, SentFrom, ShownReview } from "./artifactCommentsShapes";
 import { useReviewFilter } from "./artifactReviewFilter";
 import type { ArtifactReviewFilter } from "./artifactReviewFilter";
+import { useOwnerTimers } from "../../utils/ownerDocument";
 
 export { followedPlace, inClient };
 export type { FrameBox };
@@ -110,11 +114,11 @@ export interface ArtifactCommentsState {
    */
   bubble: ArtifactCommentBubble | null;
   /** Raft's own marker (a text or csv file's) clicked: the thread's bubble beside it. */
-  openThreadBubble: (id: ArtifactCommentId, rect: AnnotationRect) => void;
+  openThreadBubble: (id: ArtifactCommentId, rect: AnnotationRect, anchorEl?: Element | null) => void;
   /** The held card's way on (artifactCardHold): the list, with the focus on this thread's card, which answers no key. */
   openThreadInList: (id: ArtifactCommentId) => void;
   /** A selection's Comment (Raft's own button): a new comment's bubble at the selection, focused. */
-  composeAt: (target: ArtifactCommentTarget, rect: AnnotationRect | null) => void;
+  composeAt: (target: ArtifactCommentTarget, rect: AnnotationRect | null, anchorEl?: Element | null) => void;
   closeBubble: () => void;
   /** The person pressed in the bubble: from now on it stays where it is (the page can't move it), and it is no longer held. */
   pinBubble: () => void;
@@ -127,7 +131,7 @@ export interface ArtifactCommentsState {
   /** A landed thread on a text or csv file, whose bubble waits for its marker (ArtifactShellComments). */
   shellLanding: ArtifactCommentId | null;
   /** The landed thread's marker is here (client px; null: none drawn, the list opens on it instead). */
-  landBubble: (rect: AnnotationRect | null) => void;
+  landBubble: (rect: AnnotationRect | null, anchorEl?: Element | null) => void;
   /**
    * The framed page failed or fell back (ArtifactFrame's error or fallback view: a real failure,
    * not a slow page) while `failed`, and is back (a retry) once it isn't. A landing waiting for the
@@ -164,7 +168,7 @@ export interface ArtifactCommentsState {
    * not found, it goes to the list's foot). Null: none waiting (useUnsentCommentOffer).
    */
   unsentAt: ArtifactCommentTarget | null;
-  reopenUnsent: (rect: AnnotationRect | null) => void;
+  reopenUnsent: (rect: AnnotationRect | null, anchorEl?: Element | null) => void;
   /** An unsent comment's draft key the list's foot box takes the words of (made again on it), or null. */
   unsentForList: string | null;
   /**
@@ -194,6 +198,12 @@ export interface ArtifactCommentsState {
   sentId: ArtifactCommentId | null;
   replaced: (comment: ArtifactComment) => void;
   removed: (id: ArtifactCommentId) => void;
+  /** Where the reader had read the comments to, for the list's "new" as it opens (useArtifactCommentReading). */
+  readMark: ArtifactCommentReadMark;
+  /** Where the frame last said each posted thread's mark is in the file shown, for Page order; null before it said. */
+  markPlaces: () => ArtifactMarkPlaces | null;
+  /** The frame has said where marks are in the file and version shown. */
+  placesKnown: boolean;
 }
 
 const Context = createContext<ArtifactCommentsState | null>(null);
@@ -421,6 +431,7 @@ export function ArtifactCommentsProvider({ data, review = null, landOn: landOnRo
   }
   const landedOn = landOn !== null && landing?.asked === landOn && landing.landed ? landOn : null;
   const viewer = data.viewer;
+  const { readMark, markPlaces, placesKnown, notePlaces } = useArtifactCommentReading({ id, version: data.card.version, atOpen: data.unseenAtOpen, comments, viewer, panelOpen, shownPath, listAt: listOn?.at ?? null });
 
   // The newest page first (contract #10877); earlier pages on request; again on `reload` (withNewest).
   // A list on screen stays as it is when a read again fails.
@@ -480,6 +491,7 @@ export function ArtifactCommentsProvider({ data, review = null, landOn: landOnRo
     [comments, shownPath, olderCursor, marginShown],
   );
   const frameActivations = useRef(0);
+  const frameHost = useRef<HTMLDivElement | null>(null);
   const openThreadFromFrame = useCallback((reported: string, rect: AnnotationRect | null, focusedFrame: HTMLIFrameElement | null = null) => {
     // The page's word: only a thread it was given a mark for (its root, loaded), else nothing.
     const root = marks.some((m) => m.id === reported) ? comments?.find((c) => c.id === reported) : undefined;
@@ -497,17 +509,17 @@ export function ArtifactCommentsProvider({ data, review = null, landOn: landOnRo
     // A margin's card takes no focus. Held, a report finding the focus in the card itself carries the
     // hold on, to any thread; else a card keeps what it was opened with.
     setBubble((current) => ({
-      kind: "thread", threadId: root.id, rect, key, fromFrame: true, pinned: false,
+      kind: "thread", threadId: root.id, rect, liveAnchor: captureLiveAnchor(rect, frameHost.current), key, fromFrame: true, pinned: false,
       keyboard: focusedFrame && !marginShown ? { frame: focusedFrame, at: key, held: true } : heldKeyboard(current) ?? (current?.kind === "thread" && current.threadId === root.id ? current.keyboard : null),
     }));
     return true;
   }, [marks, comments, panelOpen, marginShown]);
   const bubbleKeys = useRef(0);
-  const openThreadBubble = useCallback((threadId: ArtifactCommentId, rect: AnnotationRect) => {
+  const openThreadBubble = useCallback((threadId: ArtifactCommentId, rect: AnnotationRect, anchorEl?: Element | null) => {
     bubbleKeys.current += 1;
     setLandingBubble(null);
     setActiveThread({ id: threadId, fromFrame: null });
-    setBubble({ kind: "thread", threadId, rect, key: -bubbleKeys.current, fromFrame: false, pinned: true });
+    setBubble({ kind: "thread", threadId, rect, liveAnchor: captureLiveAnchor(rect, anchorEl ?? frameHost.current), key: -bubbleKeys.current, fromFrame: false, pinned: true });
   }, []);
   const openThreadInList = useCallback((threadId: ArtifactCommentId) => {
     setLandingBubble(null);
@@ -516,11 +528,11 @@ export function ArtifactCommentsProvider({ data, review = null, landOn: landOnRo
     setPanelOpenState(true);
     if (reviewShown !== null) onShowAll?.();
   }, [reviewShown, onShowAll]);
-  const composeAt = useCallback((target: ArtifactCommentTarget, rect: AnnotationRect | null) => {
+  const composeAt = useCallback((target: ArtifactCommentTarget, rect: AnnotationRect | null, anchorEl?: Element | null) => {
     bubbleKeys.current += 1;
     setLandingBubble(null);
     setActiveThread(null);
-    setBubble({ kind: "compose", target, rect, key: -bubbleKeys.current, fromPage: null });
+    setBubble({ kind: "compose", target, rect, liveAnchor: captureLiveAnchor(rect, anchorEl ?? frameHost.current), key: -bubbleKeys.current, fromPage: null });
   }, []);
   const closeBubble = useCallback(() => {
     setBubble((current) => {
@@ -538,7 +550,8 @@ export function ArtifactCommentsProvider({ data, review = null, landOn: landOnRo
     const keyboard = pressed && current.keyboard?.held ? { ...current.keyboard, held: false } : current.keyboard;
     if (current.pinned && keyboard === current.keyboard) return current;
     const moved = places.get();
-    return { ...current, keyboard, pinned: true, rect: moved?.threadId === current.threadId && moved.key > current.key ? moved.rect : current.rect };
+    const useMoved = moved?.threadId === current.threadId && moved.key > current.key;
+    return { ...current, keyboard, pinned: true, rect: useMoved ? moved.rect : current.rect, liveAnchor: useMoved ? moved.liveAnchor : current.liveAnchor };
   }), [places]);
   const pinBubble = useCallback(() => pin(true), [pin]);
   const keepBubble = useCallback(() => pin(false), [pin]);
@@ -547,9 +560,9 @@ export function ArtifactCommentsProvider({ data, review = null, landOn: landOnRo
   const setComposerHasOwnText = useCallback((own: boolean) => { composerHasOwnText.current = own; }, []);
   const { reportBox, holdsOwnWords, boxEngaged, cardBoxBusy, askPageOpen } = useCommentBoxesAndPageOpens();
   const canComment = data.capabilities.comment;
-  const openUnsentCard = useCallback((target: ArtifactCommentTarget, rect: AnnotationRect) => {
+  const openUnsentCard = useCallback((target: ArtifactCommentTarget, rect: AnnotationRect, anchorEl?: Element | null) => {
     const key = -(bubbleKeys.current += 1);
-    setBubble((current) => current ?? { kind: "compose", target, rect, key, fromPage: null, restored: true }); // never over another card
+    setBubble((current) => current ?? { kind: "compose", target, rect, liveAnchor: captureLiveAnchor(rect, anchorEl ?? frameHost.current), key, fromPage: null, restored: true }); // never over another card
   }, []);
   const { unsentAt, reopenUnsent, unsentForList } = useUnsentCommentOffer({
     id, kind: data.card.kind, shownPath, canComment, held: landOn !== null || reviewShown !== null, openCard: openUnsentCard, openList: setPanelOpenState,
@@ -567,7 +580,7 @@ export function ArtifactCommentsProvider({ data, review = null, landOn: landOnRo
     // Beside the frame's top (Porthole: beside the frame rather than over the page's place).
     const rect = frameRect ? { x: frameRect.x + frameRect.width / 2, y: frameRect.y, width: 0, height: 0 } : null;
     setActiveThread(null);
-    setBubble({ kind: "compose", target, rect, key: frameActivations.current, fromPage: { draft: request.draft } });
+    setBubble({ kind: "compose", target, rect, liveAnchor: captureLiveAnchor(rect, frameHost.current), key: frameActivations.current, fromPage: { draft: request.draft } });
     return true;
   }, [canComment, shownPath, placeChosen, cardHeld, pageBoxOpen, askPageOpen]);
   const added = useCallback((comment: ArtifactComment) => {
@@ -594,7 +607,7 @@ export function ArtifactCommentsProvider({ data, review = null, landOn: landOnRo
     if (from?.rect && place && place !== "page" && inPlace && !now.panelOpen) {
       bubbleKeys.current += 1;
       setSentId(null);
-      setBubble({ kind: "thread", threadId: thread, rect: from.rect, key: -bubbleKeys.current, fromFrame: false, pinned: true, sent: comment.id });
+      setBubble({ kind: "thread", threadId: thread, rect: from.rect, liveAnchor: from.liveAnchor ?? null, key: -bubbleKeys.current, fromFrame: false, pinned: true, sent: comment.id });
       return;
     }
     if (from?.bubbleKey != null) setBubble((current) => (current?.kind === "compose" && current.key === from.bubbleKey ? null : current));
@@ -638,7 +651,7 @@ export function ArtifactCommentsProvider({ data, review = null, landOn: landOnRo
   // a frame-opened one. Only while the person is still on that thread, and never over a list they
   // opened; late, after the list stood in for it (a failed frame back), that list closes (one at a
   // time, as a marker's press while the list is open).
-  const landBubble = useCallback((rect: AnnotationRect | null) => {
+  const landBubble = useCallback((rect: AnnotationRect | null, anchorEl?: Element | null) => {
     if (!landingBubble) return;
     setLandingBubble(null);
     if (!rect) {
@@ -652,7 +665,7 @@ export function ArtifactCommentsProvider({ data, review = null, landOn: landOnRo
     }
     frameActivations.current += 1;
     const key = frameActivations.current;
-    setBubble((current) => ({ kind: "thread", threadId: landingBubble.id, rect, key, fromFrame: true, pinned: false, keyboard: heldKeyboard(current) }));
+    setBubble((current) => ({ kind: "thread", threadId: landingBubble.id, rect, liveAnchor: captureLiveAnchor(rect, anchorEl ?? frameHost.current), key, fromFrame: true, pinned: false, keyboard: heldKeyboard(current) }));
   }, [landingBubble, activeThreadId, panelOpen]);
   const bubbleThread = bubble?.kind === "thread" && !bubble.pinned ? bubble.threadId : null;
   const bubbleRect = bubble?.kind === "thread" ? bubble.rect : null;
@@ -669,6 +682,7 @@ export function ArtifactCommentsProvider({ data, review = null, landOn: landOnRo
     following.current = null;
   }, [places, trackedMark]);
   const onAnnotation = useCallback((report: AnnotationReport, frameBox: FrameBox | null, shownMarks: readonly { id: string }[] = marks) => {
+    notePlaces(report);
     if (report.type === "activated") {
       openThreadFromFrame(report.id, inClient(report.rect, frameBox));
       return;
@@ -695,7 +709,7 @@ export function ArtifactCommentsProvider({ data, review = null, landOn: landOnRo
       const last = placed && placed.key > bubbleKey ? placed.rect : bubbleRect;
       if (sameRect(last, rect)) return;
       frameActivations.current += 1;
-      places.set({ threadId: bubbleThread, rect, key: frameActivations.current });
+      places.set({ threadId: bubbleThread, rect, liveAnchor: captureLiveAnchor(rect, frameHost.current), key: frameActivations.current });
       return;
     }
     if (report.type !== "anchored") return;
@@ -715,86 +729,39 @@ export function ArtifactCommentsProvider({ data, review = null, landOn: landOnRo
       const result = report.results.find((r) => r.id === bubbleThread);
       if (result && (result.state !== "attached" || !result.rect) && !cardBoxBusy && !cardHeld) closeBubble();
     }
-  }, [openThreadFromFrame, trackedMark, bubbleKey, places, landingBubble, landBubble, bubbleThread, bubbleRect, closeBubble, cardBoxBusy, cardHeld, marginReport, marks]);
+  }, [openThreadFromFrame, trackedMark, bubbleKey, places, landingBubble, landBubble, bubbleThread, bubbleRect, closeBubble, cardBoxBusy, cardHeld, marginReport, marks, notePlaces]);
   // A frame that never says where, however slow (a failed one shows the list at once, above): the
   // landed comment in the list instead, once LANDING_FRAME_CAP_MS is up.
   const waitsForFrame = landingBubble?.where === "frame";
   const landBubbleRef = useRef(landBubble);
   landBubbleRef.current = landBubble;
+  const timers = useOwnerTimers();
   useEffect(() => {
     if (!waitsForFrame) return;
-    const timer = window.setTimeout(() => landBubbleRef.current(null), LANDING_FRAME_CAP_MS);
-    return () => window.clearTimeout(timer);
-  }, [waitsForFrame]);
+    const timer = timers.setTimeout(() => landBubbleRef.current(null), LANDING_FRAME_CAP_MS);
+    return () => timers.clearTimeout(timer);
+  }, [waitsForFrame, timers]);
   // Without comment mode the person points at nothing in the page: only the markers are live.
   const frameHandle = useRef<PortholeFrameHandle | null>(null);
-  const frameBox = useRef<HTMLDivElement | null>(null);
   const focusMark = useCallback((markId: ArtifactCommentId) => {
     if (!frameHandle.current) return false;
     frameHandle.current.focusMark(markId);
     return true;
   }, []);
-  const frame = useMemo<ArtifactFrameLayer>(() => ({ marks, focusedMark, trackedMark, trackedSelection: false, annotating: () => null, onAnnotation, handle: frameHandle, box: frameBox }), [marks, focusedMark, trackedMark, onAnnotation]);
+  const captureAnchor = useCallback((rect: AnnotationRect | null, anchorEl?: Element | null) => captureLiveAnchor(rect, anchorEl ?? frameHost.current), []);
+  const frame = useMemo<ArtifactFrameLayer>(() => ({ marks, focusedMark, trackedMark, trackedSelection: false, annotating: () => null, onAnnotation, handle: frameHandle, box: frameHost, captureAnchor }), [marks, focusedMark, trackedMark, onAnnotation, captureAnchor]);
   const shellLanding = landingBubble?.where === "shell" ? landingBubble.id : null;
   const sentId = listSentId ?? (bubble?.kind === "thread" ? bubble.sent ?? null : null);
 
   const value = useMemo<ArtifactCommentsState>(() => ({
-    data,
-    shownPath,
-    viewer,
-    comments,
-    failed,
-    hasEarlier: olderCursor !== null,
-    loadingEarlier,
-    earlierFailed,
-    loadEarlier,
-    reload,
-    reviewShown,
-    shownReview,
-    showAllComments,
-    reviewFilter,
-    panelOpen,
-    setPanelOpen,
-    landedOn,
-    activeThreadId,
-    setActiveThreadId,
-    threadFromFrame,
-    openThreadFromFrame,
-    hoveredThreadId,
-    setHoveredThreadId,
-    bubble,
-    openThreadBubble,
-    openThreadInList,
-    composeAt,
-    closeBubble,
-    pinBubble,
-    keepBubble,
-    cardHeld,
-    focusMark,
-    shellLanding,
-    landBubble,
-    frameFailed,
-    pageShown,
-    pageLoaded,
-    openFromPage,
-    askPageOpen,
-    setComposerHasOwnText,
-    holdsOwnWords,
-    boxEngaged,
-    reportBox,
-    unsentAt,
-    reopenUnsent,
-    unsentForList,
-    frame,
-    trackedPlaces: places,
-    margin,
-    shellUnits,
-    setShellUnits,
-    added,
-    revealSent,
-    sentId,
-    replaced,
-    removed,
-  }), [data, shownPath, viewer, comments, failed, olderCursor, loadingEarlier, earlierFailed, loadEarlier, reload, reviewShown, shownReview, showAllComments, reviewFilter, panelOpen, setPanelOpen, landedOn, activeThreadId, setActiveThreadId, threadFromFrame, openThreadFromFrame, hoveredThreadId, bubble, openThreadBubble, openThreadInList, composeAt, closeBubble, pinBubble, keepBubble, cardHeld, focusMark, shellLanding, landBubble, frameFailed, pageShown, pageLoaded, openFromPage, askPageOpen, setComposerHasOwnText, frame, places, margin, shellUnits, added, revealSent, sentId, replaced, removed, holdsOwnWords, boxEngaged, reportBox, unsentAt, reopenUnsent, unsentForList]);
+    data, shownPath, viewer, comments, failed,
+    hasEarlier: olderCursor !== null, loadingEarlier, earlierFailed, loadEarlier, reload,
+    reviewShown, shownReview, showAllComments, reviewFilter, panelOpen, setPanelOpen, landedOn,
+    activeThreadId, setActiveThreadId, threadFromFrame, openThreadFromFrame, hoveredThreadId, setHoveredThreadId,
+    bubble, openThreadBubble, openThreadInList, composeAt, closeBubble, pinBubble, keepBubble, cardHeld,
+    focusMark, shellLanding, landBubble, frameFailed, pageShown, pageLoaded, openFromPage, askPageOpen,
+    setComposerHasOwnText, holdsOwnWords, boxEngaged, reportBox, unsentAt, reopenUnsent, unsentForList,
+    frame, trackedPlaces: places, margin, shellUnits, setShellUnits, added, revealSent, sentId, replaced, removed, readMark, markPlaces, placesKnown,
+  }), [readMark, markPlaces, placesKnown, data, shownPath, viewer, comments, failed, olderCursor, loadingEarlier, earlierFailed, loadEarlier, reload, reviewShown, shownReview, showAllComments, reviewFilter, panelOpen, setPanelOpen, landedOn, activeThreadId, setActiveThreadId, threadFromFrame, openThreadFromFrame, hoveredThreadId, bubble, openThreadBubble, openThreadInList, composeAt, closeBubble, pinBubble, keepBubble, cardHeld, focusMark, shellLanding, landBubble, frameFailed, pageShown, pageLoaded, openFromPage, askPageOpen, setComposerHasOwnText, frame, places, margin, shellUnits, added, revealSent, sentId, replaced, removed, holdsOwnWords, boxEngaged, reportBox, unsentAt, reopenUnsent, unsentForList]);
   return <Context.Provider value={value}>{children}</Context.Provider>;
 }

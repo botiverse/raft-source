@@ -1,4 +1,5 @@
 import type { ParsedEvent } from "./drivers/index";
+import type { ProviderQuotaRateLimitType } from "./drivers/types";
 import { buildRuntimeErrorDiagnosticEnvelope, runtimeErrorClassForProcessClose } from "./runtimeErrorDiagnostics";
 
 export interface RuntimeErrorFingerprintFenceSummary {
@@ -14,7 +15,10 @@ export interface RuntimeErrorDeliveryFailureSummary {
 /**
  * Whether a runtime event is progress that resets the same-fingerprint and
  * error-class fences (task #917): model output, tool use, a finished
- * compaction or review. A `turn_end` counts only when its turn had such
+ * review. A finished compaction is not: Claude Code compacts, then fails the
+ * same turn with "Prompt is too long" (a text it does not class as input too
+ * large); when compaction counted, that cycle reset the count every turn and
+ * the fence never tripped. A `turn_end` counts only when its turn had such
  * progress (`turnHadProgress`): a turn that ended without any output did not
  * get anywhere. Grok's ACP server answers a rejected `session/prompt` (a
  * provider rate limit, say) by ending the turn bare and sending the error a
@@ -29,7 +33,6 @@ export function runtimeErrorFingerprintFenceResetEvent(eventKind: ParsedEvent["k
     case "text":
     case "tool_call":
     case "tool_output":
-    case "compaction_finished":
     case "review_finished":
       return true;
     case "turn_end":
@@ -52,6 +55,8 @@ export function formatRuntimeErrorFingerprintFenceDetail(state: RuntimeErrorFing
 export interface RuntimeProviderLimit {
   kind: "quota_exhausted" | "transient_rate_limit";
   resetsAt?: string;
+  /** The limiting window, when the runtime named one (Claude Code's `rateLimitType`, e.g. `seven_day`). */
+  rateLimitType?: ProviderQuotaRateLimitType;
 }
 
 /**
@@ -59,7 +64,7 @@ export interface RuntimeProviderLimit {
  * structured declaration, or the usage-limit wording of an error from a
  * runtime that declares none (design row C5).
  */
-export type RuntimeErrorProviderLimit = RuntimeProviderLimit & { source: "structured" | "text" };
+export type RuntimeErrorProviderLimit = RuntimeProviderLimit & { source: "structured" | "text" | "account_usage" };
 
 /**
  * Wording that says the account's usage quota or budget is used up. Exactly
@@ -118,27 +123,87 @@ export function runtimeErrorDeliveryBackoffDelayMs(
   return Math.min(policy.maxMs, cappedDelayMs + jitterMs);
 }
 
-/** Longest single provider-limit wait (task #379, Huaihuai; #proj-raft-computer:#46 Q3). */
+/**
+ * Longest single provider-limit wait when the runtime reported no usable
+ * reset (task #379, Huaihuai; #proj-raft-computer:#46 Q3). A wait for a
+ * reported reset is not capped by it (#proj-runtime:#66).
+ */
 export const QUOTA_RESET_BACKOFF_MAX_MS = 60 * 60_000;
 
 /**
+ * The furthest ahead a reported quota reset is believed (#proj-runtime:#66).
+ * Claude's longest window is seven days; a reset later than this (or a value
+ * in milliseconds read as seconds) is no reset, and the limit waits as if
+ * none was reported. Also keeps every wait well under setTimeout's 24.8-day limit.
+ */
+export const PROVIDER_LIMIT_RESET_MAX_AHEAD_MS = 8 * 24 * 60 * 60_000;
+
+/** Most jitter added to a wait for a reported reset, so agents on one sign-in do not all start at the same instant. */
+export const PROVIDER_LIMIT_RESET_JITTER_MAX_MS = 30_000;
+
+/**
+ * How long until a used-up quota's reported reset, when it is one to wait
+ * for: a `quota_exhausted` limit whose `resetsAt` parses, is in the future
+ * and at most PROVIDER_LIMIT_RESET_MAX_AHEAD_MS away. Undefined otherwise (a
+ * missing, unparseable, past or implausibly far reset, and every transient
+ * throttle).
+ */
+export function providerLimitReportedResetInMs(limit: RuntimeProviderLimit | undefined, nowMs: number): number | undefined {
+  if (!limit || limit.kind !== "quota_exhausted" || !limit.resetsAt) return undefined;
+  const resetMs = Date.parse(limit.resetsAt);
+  if (!Number.isFinite(resetMs)) return undefined;
+  const inMs = resetMs - nowMs;
+  return inMs > 0 && inMs <= PROVIDER_LIMIT_RESET_MAX_AHEAD_MS ? inMs : undefined;
+}
+
+/**
  * Delay for a provider-limit backoff (task #379). A used-up quota whose
- * runtime reported a valid future reset waits until that reset. A missing,
- * unparseable or past reset (a usage limit known only from its wording
- * included), and every transient throttle, keep the existing exponential
- * delay. Any single provider-limit wait is at most QUOTA_RESET_BACKOFF_MAX_MS
- * (hitting the limit again starts another wait).
+ * runtime reported a usable reset (`providerLimitReportedResetInMs`) waits
+ * until that reset, plus up to `resetJitter.ratio` of the wait (at most
+ * PROVIDER_LIMIT_RESET_JITTER_MAX_MS): a weekly limit waits the days until
+ * it resets instead of retrying every hour into the same refusal
+ * (#proj-runtime:#66). Model output, a credential change or a manual stop
+ * still end it early. Anything else (no reset, an unusable one, a usage
+ * limit known only from its wording, every transient throttle) keeps the
+ * exponential delay, at most QUOTA_RESET_BACKOFF_MAX_MS (hitting the limit
+ * again starts another wait).
  */
 export function providerLimitBackoffDelayMs(input: {
   providerLimit: RuntimeProviderLimit | undefined;
   exponentialDelayMs: number;
   nowMs: number;
+  resetJitter?: { ratio: number; random: () => number };
 }): number {
   const limit = input.providerLimit;
   if (!limit) return input.exponentialDelayMs;
-  const resetMs = limit.kind === "quota_exhausted" && limit.resetsAt ? Date.parse(limit.resetsAt) : Number.NaN;
-  const delayMs = Number.isFinite(resetMs) && resetMs > input.nowMs ? resetMs - input.nowMs : input.exponentialDelayMs;
-  return Math.min(delayMs, QUOTA_RESET_BACKOFF_MAX_MS);
+  const untilResetMs = providerLimitReportedResetInMs(limit, input.nowMs);
+  if (untilResetMs === undefined) return Math.min(input.exponentialDelayMs, QUOTA_RESET_BACKOFF_MAX_MS);
+  if (!input.resetJitter || !(input.resetJitter.ratio > 0)) return untilResetMs;
+  const unit = input.resetJitter.random();
+  const boundedUnit = Number.isFinite(unit) ? Math.max(0, Math.min(1, unit)) : 0;
+  const jitterWindowMs = Math.min(PROVIDER_LIMIT_RESET_JITTER_MAX_MS, untilResetMs * Math.min(1, input.resetJitter.ratio));
+  return untilResetMs + Math.floor(jitterWindowMs * boundedUnit);
+}
+
+const RATE_LIMIT_WINDOW_LABELS: Readonly<Record<ProviderQuotaRateLimitType, string>> = {
+  five_hour: "5-hour",
+  seven_day: "weekly",
+  seven_day_opus: "weekly Opus",
+  seven_day_sonnet: "weekly Sonnet",
+  seven_day_overage_included: "weekly",
+  overage: "extra usage",
+};
+
+/**
+ * #proj-runtime:#66: what an agent shows while a used-up quota on its
+ * credential holds its messages and it has no error of its own to show (an
+ * agent on the same shared sign-in, a process restored into the wait): fixed
+ * text with the window and the reported reset, as the error path appends it.
+ */
+export function formatProviderLimitHeldDetail(limit: { resetsAt?: string; rateLimitType?: ProviderQuotaRateLimitType }): string {
+  const window = limit.rateLimitType ? `${RATE_LIMIT_WINDOW_LABELS[limit.rateLimitType]} ` : "";
+  const base = `The ${window}usage limit of this agent's provider account is used up; its messages wait until it resets`;
+  return limit.resetsAt ? `${base} (limit resets at ${limit.resetsAt})` : base;
 }
 
 export function recoverableRuntimeDeliveryBackoffReason(

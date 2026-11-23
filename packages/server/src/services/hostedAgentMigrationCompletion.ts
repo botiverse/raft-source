@@ -14,6 +14,9 @@
  */
 import { lockMachineIfTakesAgents } from "./computerAgents";
 import { agentConfigValues, recordAgentConfigChange } from "./agentConfigChangeEvents";
+import { openAgentEnvVars, openAgentRuntimeConfig, sealAgentEnvVars, sealAgentRuntimeConfig } from "./agentSecretCrypto";
+import { isAgentSecretWriteEncryptionEnabled } from "./agentSecretFlags";
+import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import { and, asc, eq, gt, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { currentDate, type RuntimeConfig, type LegacyColumnReasoningEffort } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
@@ -207,20 +210,23 @@ export async function revertHostedAgentMigration(input: { agentId: string; now?:
       runtimeConfig: RuntimeConfig | null;
       envVars: Record<string, string> | null;
     };
+    const openedRuntimeConfig = openAgentRuntimeConfig(row.migration.agentId, secret.runtimeConfig);
+    const openedEnvVars = openAgentEnvVars(row.migration.agentId, secret.envVars);
     const [before] = await tx.select({ serverId: agents.serverId, runtime: agents.runtime, model: agents.model, reasoningEffort: agents.reasoningEffort })
       .from(agents).where(eq(agents.id, row.migration.agentId)).limit(1).for("update");
     // Back onto the source Computer only while it still takes agents: one whose
     // key was revoked (or that was removed) since leaves the agent unbound and
     // stopped, for its owner to move (computerAgents.ts).
     const backOnSource = snapshot.machineId !== null && await lockMachineIfTakesAgents(tx, snapshot.machineId);
+    const encryptOnWrite = await isAgentSecretWriteEncryptionEnabled(before?.serverId ?? null, tx);
     const [restored] = await tx.update(agents)
       .set({
         runtime: snapshot.runtime,
         model: snapshot.model,
-        runtimeConfig: secret.runtimeConfig,
+        runtimeConfig: encryptOnWrite ? sealAgentRuntimeConfig(row.migration.agentId, openedRuntimeConfig) : openedRuntimeConfig,
         // The snapshot copied this legacy column, so it holds a legacy value.
         reasoningEffort: snapshot.reasoningEffort as LegacyColumnReasoningEffort | null,
-        envVars: secret.envVars,
+        envVars: encryptOnWrite ? sealAgentEnvVars(row.migration.agentId, openedEnvVars) : openedEnvVars,
         machineId: backOnSource ? snapshot.machineId : null,
         ...(backOnSource ? { machineReleaseReason: null, machineReleasedAt: null } : {}),
         ...(backOnSource ? {} : { status: "stopped" as const }),
@@ -356,7 +362,7 @@ async function sweepHostedArrivals(
         updated = await markHostedAgentMigrationNeedsAttention({ agentId: migration.agentId, reason: HOSTED_MIGRATION_IMPORT_STALLED_REASON, now });
       }
     } catch (error) {
-      console.error(`[HostedMigration] Sweep failed for ${migration.supportRef}:`, error instanceof Error ? error.message : error);
+      console.error(`[HostedMigration] Sweep failed for ${migration.supportRef}:`, serializeErrorForLog(error));
     }
     if (updated) {
       changed += 1;

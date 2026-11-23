@@ -556,7 +556,7 @@ const inSourceSnapshot = existsSync(new URL("../../../../RELEASE_SOURCE", import
 
 test.skipIf(inSourceSnapshot)("staging integration CI pins the attachment lifecycle real-PostgreSQL lock contract", async () => {
   const workflow = await readFile(new URL("../../../../.github/workflows/test.yml", import.meta.url), "utf8");
-  const integrationJob = workflow.match(/\n  integration-contracts:\n(?<body>[\s\S]*?)(?=\n  [a-z][a-z0-9-]+:\n)/)?.groups?.body;
+  const integrationJob = workflow.match(/\n  integration-contracts-checks:\n(?<body>[\s\S]*?)(?=\n  [a-z][a-z0-9-]+:\n)/)?.groups?.body;
   assert.ok(integrationJob, "integration job must remain present");
   assert.match(integrationJob, /services:\s*\n\s+postgres:\s*\n\s+image: postgres:17-alpine/);
   assert.match(integrationJob, /--health-cmd "pg_isready -U read_mutation_ci -d postgres"/);

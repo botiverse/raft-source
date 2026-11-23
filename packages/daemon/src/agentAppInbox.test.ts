@@ -686,8 +686,8 @@ test("formatter shows structured sourceRef and exact actionCli, no msg fields", 
     formatMessageRows: formatAgentInboxSnapshot,
   });
   assert.match(text, /App items: 1/);
-  assert.match(text, /sourceRef=fixture:aaaaaaaa-0000-4000-8000-000000000001:1/);
-  assert.match(text, /action=raft fixture log --id aaaaaaaa/);
+  assert.match(text, /^app:test\.fixture\//m);
+  assert.match(text, /^ {2}do: raft fixture log --id aaaaaaaa$/m);
   assert.doesNotMatch(text, /msg=|sender|seq=/);
 });
 

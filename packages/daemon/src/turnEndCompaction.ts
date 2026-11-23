@@ -14,6 +14,7 @@
 // automatic compaction). After a compaction it does not fire again until the
 // context has dropped below the threshold and grown past it again, so a
 // compaction that leaves the context large can't loop.
+import type { SessionCapabilityDeclaration } from "@botiverse/oar";
 import type { AgentConfig } from "@botiverse/raft-shared";
 
 export const DEFAULT_TURN_END_COMPACTION_MIN_CONTEXT_TOKENS = 250_000;
@@ -26,9 +27,46 @@ export const DEFAULT_TURN_END_COMPACTION_MIN_WINDOW_TOKENS = 400_000;
  */
 export const DEFAULT_TURN_END_COMPACTION_DRIVER_TIMEOUT_MS = 10 * 60_000;
 
-/** Runtimes whose native compaction a host can ask for at a turn end in this version (Pi and Kimi: next). */
+/** Legacy-host runtimes whose native compaction the host can ask for at a turn end in this version. */
 export const TURN_END_COMPACTION_LEGACY_RUNTIMES: ReadonlySet<string> = new Set(["claude", "pi", "builtin", "kimi-sdk"]);
-export const TURN_END_COMPACTION_OAR_RUNTIMES: ReadonlySet<string> = new Set(["codex", "grok"]);
+
+/**
+ * Whether the OAR host may compact a session at a turn end, from what OAR
+ * declares for the installation the session runs on
+ * (`oarInstalledSessionCapabilities`), never from the runtime id.
+ *
+ * The decision reads two things and does one: the session summary's
+ * `context.tokens` and `context.window` (from the runtime's usage reports,
+ * what `Session.contextUsage()` reports), then `Session.compact()`. So both
+ * halves of `contextUsage` must be declared trustworthy (without a window the
+ * decision can only skip `window_unknown`; an untrustworthy size could fire on
+ * a wrong reading), and `manualCompaction` must be `supported`. Its
+ * `activeTurn` does not matter: the host asks only with nothing running.
+ * `compactionEvents` is not needed: it describes the runtime's own automatic
+ * compaction, while the host's call is confirmed by `compact()`'s own outcome,
+ * and re-arming waits for the next usage report below the threshold.
+ * Absent (unmeasured) is off.
+ */
+export function turnEndCompactionDeclared(capabilities: Pick<SessionCapabilityDeclaration, "manualCompaction" | "contextUsage"> | null | undefined): boolean {
+  return capabilities?.manualCompaction?.kind === "supported"
+    && capabilities.contextUsage?.tokens === true
+    && capabilities.contextUsage.contextWindow === true;
+}
+
+/**
+ * The rollout: OAR-host runtimes on which turn-end compaction has actually
+ * run in Raft. A runtime whose declaration turns true is not compacted until
+ * it has been exercised and added here (Tenny, #oar-raft:#39 047b8ce2;
+ * OpenCode 2.x and DSH declare it but have not run it). Grok stays listed:
+ * OAR declares no trustworthy window for it, so it is off by declaration,
+ * which it was in effect before (no window, `window_unknown`).
+ */
+export const TURN_END_COMPACTION_OAR_ROLLOUT_RUNTIMES: ReadonlySet<string> = new Set(["claude", "codex", "grok", "pi"]);
+
+/** OAR declares it for the installation AND the runtime is rolled out. */
+export function turnEndCompactionAllowed(runtimeId: string, capabilities: Pick<SessionCapabilityDeclaration, "manualCompaction" | "contextUsage"> | null | undefined): boolean {
+  return TURN_END_COMPACTION_OAR_ROLLOUT_RUNTIMES.has(runtimeId) && turnEndCompactionDeclared(capabilities);
+}
 
 export interface TurnEndCompactionConfig {
   enabled: boolean;

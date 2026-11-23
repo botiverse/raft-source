@@ -10,8 +10,13 @@ import { detectModelSourceViaOar } from "../runtimeModels/oarListModels";
 import { ANTIGRAVITY_ENV_OVERRIDES, resolveAntigravitySpawn } from "./index";
 import { resolveCommandOnPathAsync } from "./probe";
 
-// OAR opens a temporary `agy` ACP session (no prompt) and reads its model
-// picker; keep below the server's 20 s per-detection budget.
+// OAR opens a temporary `agy` ACP session (no prompt), reads its model picker
+// and, from OAR 0.115, selects each model to read its own effort menu, then
+// restores the original model and effort (a listing that cannot confirm the
+// restore throws: a transient failure that keeps the cached list). About 2 s on
+// agy 1.5.10; keep below the server's 20 s per-detection budget. Each listing
+// leaves an agy conversation record, so the form cache keeps the list for a
+// day (RUNTIME_MODEL_CACHE_FRESH_MS_BY_RUNTIME).
 const ANTIGRAVITY_MODEL_DETECTION_DEADLINE_MS = 18_000;
 
 /**
@@ -40,6 +45,24 @@ export function withoutEmbeddedEffortLevels(entries: readonly ModelEntry[]): Mod
 }
 
 /**
+ * OAR >= 0.111's agy lister gives an entry no `effortLevels` and no
+ * `effortUnavailableReason` only when agy has no effort menu for that model
+ * (it lists the model bare, or exposes no levels at all); one it could not
+ * read carries the reason. So such an entry takes no effort: mark it with an
+ * explicit `[]`, which the projection reports as "none"
+ * (`keepEmptyEffortLevels`). An entry whose id names its level keeps no menu
+ * and stays unmarked: the model picker holds that choice.
+ */
+export function withAntigravityEffortLevels(entries: readonly ModelEntry[]): ModelEntry[] {
+  return entries.map((entry) => {
+    const [stripped] = withoutEmbeddedEffortLevels([entry]);
+    if (stripped !== entry) return stripped!;
+    if (entry.effortLevels !== undefined || entry.effortUnavailableReason) return entry;
+    return { ...entry, effortLevels: [] };
+  });
+}
+
+/**
  * `agy` reads workspace configuration (`.agents/`) from its cwd, so each
  * listing runs in a fresh private directory rather than the daemon's cwd, and
  * removes it afterwards (as Claude's listing does).
@@ -54,7 +77,7 @@ function privateDirLister(listModels: ModelLister): ModelLister {
     }
     try {
       const result = await listModels(installation, { ...options, env: { ...options?.env, ...listingEnv() }, ...(cwd ? { cwd } : {}) });
-      return result.kind === "ok" ? { ...result, models: withoutEmbeddedEffortLevels(result.models) } : result;
+      return result.kind === "ok" ? { ...result, models: withAntigravityEffortLevels(result.models) } : result;
     } finally {
       if (cwd) rmSync(cwd, { recursive: true, force: true });
     }
@@ -74,9 +97,11 @@ async function antigravityModelLister(): Promise<ModelLister> {
 
 /**
  * The models this machine's `agy` login offers, through OAR's `listModels`.
- * agy reports a thinking-level menu only for the model a new session starts
- * on (OAR `projectAntigravityModels`), so only that entry carries efforts; it
- * is also reported as the set's default. The OAR launch passes the chosen
+ * agy's session reports a thinking-level menu for the model it starts on;
+ * OAR (>= 0.111) reads the other models' menus from agy's catalog, and says
+ * why when it cannot (`reasoningEffortUnavailableReason`). A model with no
+ * menu is reported with an empty one (withAntigravityEffortLevels). The
+ * session's model is also reported as the set's default. The OAR launch passes the chosen
  * model and effort (agentHost/oarAntigravityLaunch.ts).
  */
 export async function detectAntigravityModelSource(
@@ -101,6 +126,7 @@ export async function detectAntigravityModelSource(
     deadlineMs: deps.deadlineMs ?? ANTIGRAVITY_MODEL_DETECTION_DEADLINE_MS,
     label: (entry: ModelEntry) => entry.displayName ?? entry.id,
     keepReasoningEfforts: true,
+    keepEmptyEffortLevels: true,
     reportDefault: true,
     // An agy build whose session/new has no model option: the form keeps
     // its configured-default entry.

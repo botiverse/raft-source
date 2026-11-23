@@ -191,7 +191,7 @@ test("the owner sets up, attaches a Computer, makes someone else owner and leave
   assert.equal(
     told[0]!.content,
     "@founders-box-agent and @founders-box-helper are offline: the computer \"founders-box\" they run on was disconnected because the person who set it up is no longer in this server. "
-      + "Someone in this server can set up that machine again (the agents come back as they were), or move the agents to another computer.",
+      + "Move the agents to another computer to get them running again; they keep their settings.",
   );
 });
 
@@ -213,7 +213,7 @@ test("a member leaves: an agent whose creator stays tells its creator; the leave
   const toColleague = told.find((notice) => notice.peerKey.includes(colleague.id))!;
   assert.match(
     toColleague.content,
-    /^@colleagues-agent is offline: the computer "shared-laptop" it runs on was disconnected because the person who set it up is no longer in this server\. Someone in this server can set up that machine again \(the agent comes back as it was\), or move the agent to another computer\.\nAgent page: /,
+    /^@colleagues-agent is offline: the computer "shared-laptop" it runs on was disconnected because the person who set it up is no longer in this server\. Move the agent to another computer to get it running again; it keeps its settings\.\nAgent page: /,
   );
   const toOwner = told.find((notice) => notice.peerKey.includes(owner.id))!;
   assert.match(toOwner.content, /^@shared-laptop-agent is offline: the computer "shared-laptop" it runs on was disconnected because/);

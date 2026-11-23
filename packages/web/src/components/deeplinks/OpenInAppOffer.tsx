@@ -108,16 +108,16 @@ interface Landing {
   search: string;
 }
 
-export default function OpenInAppOffer() {
+export default function OpenInAppOffer({ signedOutHint = false }: { signedOutHint?: boolean } = {}) {
   // The address as it landed, while its page is on screen: the app may later
   // drop `msg` or the marker from it, and the offer is still about it.
   const landing = usePageLanding();
   if (!landing || !isPhoneBrowser()) return null;
   if (!isAppClaimedPath(landing.pathname, isIosUserAgent(navigator.userAgent) ? "ios" : "android", landing.search)) return null;
-  return <OpenInAppOfferGate landing={landing} />;
+  return <OpenInAppOfferGate landing={landing} signedOutHint={signedOutHint} />;
 }
 
-function OpenInAppOfferGate({ landing }: { landing: Landing }) {
+function OpenInAppOfferGate({ landing, signedOutHint }: { landing: Landing; signedOutHint: boolean }) {
   const enabled = useOpenInAppOfferFlag();
   const location = useLocation();
   const navigate = useNavigate();
@@ -184,6 +184,7 @@ function OpenInAppOfferGate({ landing }: { landing: Landing }) {
     <OpenInAppBar
       href={href}
       message={parseMessageLink(landing.pathname, landing.search) !== null}
+      signedOutHint={signedOutHint && !signedIn}
       aboveComposer={slot !== null}
       onOpen={openApp}
       onDismiss={dismissBar}
@@ -213,10 +214,12 @@ const BAR_CLASS = "flex shrink-0 items-center gap-3 border-t border-line-seam bg
  */
 const BAR_LAST_IN_WINDOW_CLASS = "[&:not(:has(~[data-slot=mobile-nav-root]))]:pb-[calc(--spacing(2)+env(safe-area-inset-bottom,0px))] md:pb-[calc(--spacing(2)+env(safe-area-inset-bottom,0px))]";
 
-function OpenInAppBar({ href, message, aboveComposer, onOpen, onDismiss }: {
+function OpenInAppBar({ href, message, signedOutHint, aboveComposer, onOpen, onDismiss }: {
   href: string;
-  /** The landed address is a message link: the second line says so. Any other page has the title alone. */
+  /** The landed address is a message link: the second line says so. Any other page has the title alone (or the generic signed-out hint on SignInPage). */
   message: boolean;
+  /** Shown on SignInPage for non-message landings: generic hint that the app may already be signed in (never reveals link/server existence). */
+  signedOutHint: boolean;
   /** Drawn in a composer's footer; otherwise in the shell's bottom strip. */
   aboveComposer: boolean;
   /** Open was tapped: the row stays where it is (the system takes the link, or it comes back as "not installed"). */
@@ -225,6 +228,11 @@ function OpenInAppBar({ href, message, aboveComposer, onOpen, onDismiss }: {
 }) {
   const { formatMessage } = useIntl();
   const title = formatMessage({ id: "openInApp.bar.title" });
+  const description = message
+    ? formatMessage({ id: "openInApp.bar.description" })
+    : signedOutHint
+      ? formatMessage({ id: "openInApp.bar.signedOutHint" })
+      : null;
   // Above the tab bar a toast sits above the row, not over it (toastViewportBottom.ts).
   const noticeRef = useToastViewportFlowNotice();
   return (
@@ -240,9 +248,9 @@ function OpenInAppBar({ href, message, aboveComposer, onOpen, onDismiss }: {
         <p className="truncate text-callout font-semibold text-foreground">
           {title}
         </p>
-        {message ? (
+        {description ? (
           <p className="truncate text-caption text-foreground-muted">
-            {formatMessage({ id: "openInApp.bar.description" })}
+            {description}
           </p>
         ) : null}
       </div>

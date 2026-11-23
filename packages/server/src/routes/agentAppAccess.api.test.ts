@@ -55,13 +55,14 @@ async function seedServer() {
   return { suffix, owner, creator, member, server, creatorAgent, ownerAgent };
 }
 
-async function createApp(serverId: string, createdByUserId: string, key: string) {
+async function createApp(serverId: string, createdByUserId: string, key: string, vouchAsCreator = false) {
   return createOAuthClient({
     serverId,
     createdByUserId,
     clientId: key,
     name: `App ${key}`,
     allowedScopes: ["openid", "profile", "agent:event:write", "agent:notification:write"],
+    vouchAsCreator,
   });
 }
 
@@ -123,8 +124,8 @@ test("automatic agent grants need authority over the agent, and a person's revok
   assert.ok(grant);
   assert.equal(grant.grantSource, "app_request");
 
-  // An owner/admin's app is granted automatically for any agent.
-  const ownerApp = await createApp(s.server.id, s.owner.id, `aaa-o-${s.suffix.slice(0, 6)}`);
+  // An app the Server vouched for (an owner/admin created it as themselves) is granted automatically for any agent.
+  const ownerApp = await createApp(s.server.id, s.owner.id, `aaa-o-${s.suffix.slice(0, 6)}`, true);
   const byOwner = await requestAgent(app.baseUrl, {
     clientKey: ownerApp.client.clientId,
     clientSecret: ownerApp.clientSecret,
@@ -132,6 +133,14 @@ test("automatic agent grants need authority over the agent, and a person's revok
     agentName: s.creatorAgent.name,
   });
   assert.equal(byOwner.status, "approved");
+  // The owner's role alone is not a vouch.
+  const unvouched = await createApp(s.server.id, s.owner.id, `aaa-u-${s.suffix.slice(0, 6)}`);
+  assert.equal((await requestAgent(app.baseUrl, {
+    clientKey: unvouched.client.clientId,
+    clientSecret: unvouched.clientSecret,
+    serverSlug: s.server.slug,
+    agentName: s.creatorAgent.name,
+  })).status, "pending");
 
   // The agent's creator revokes; the app's next request waits for a person.
   const creatorApi = api(app.baseUrl, await tokenForHuman(s.creator.email), s.server.id);
@@ -344,7 +353,7 @@ test("an agent's own login still gets an automatic grant, but not after a person
 
 test("requests/agent accepts the agent id instead of its name", async ({ app }) => {
   const s = await seedServer();
-  const ownerApp = await createApp(s.server.id, s.owner.id, `aaf-o-${s.suffix.slice(0, 6)}`);
+  const ownerApp = await createApp(s.server.id, s.owner.id, `aaf-o-${s.suffix.slice(0, 6)}`, true);
   const post = (body: Record<string, unknown>) => fetch(`${app.baseUrl}/api/oauth/requests/agent`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

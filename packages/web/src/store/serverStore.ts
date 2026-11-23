@@ -54,7 +54,10 @@ export interface Server {
   avatarUrl: string | null;
   slug: string;
   ownerId: string;
+  /** The joiner greeter (Settings → Onboarding); any agent, not Cindy's marker. */
   onboardingAgentId: string | null;
+  /** The server's official onboarding agent (Cindy), from GET /servers. */
+  officialOnboardingAgentId?: string | null;
   hideHumansFromMembers: boolean;
   plan: string;
   planDowngradedAt: string | null;
@@ -107,7 +110,7 @@ export interface ServerMember extends GuestChannelField {
     serverId?: string | null;
     serverName?: string | null;
     serverSlug?: string | null;
-    servers?: Array<{ id: string; name: string; slug: string }> | null;
+    servers?: Array<{ id: string; name: string; slug: string; avatarUrl?: string | null }> | null;
     inViewerServer?: boolean;
   };
   email: string | null;

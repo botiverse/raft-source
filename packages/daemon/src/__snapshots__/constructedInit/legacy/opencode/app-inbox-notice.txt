@@ -1,0 +1,18 @@
+host: legacy
+runtime: opencode
+scenario: app-inbox-notice
+promptSource: resume_empty
+note: driver: supportsNativeStandingPrompt=true standingPromptRefreshesOnResume=true deferSpawnUntilMessage=true
+
+## standing prompt
+= standing-prompt.md
+
+## carrier
+SpawnContext.standingPrompt: = standing prompt
+
+## first input (203 chars, sha256:4aad1ffbb4475841, does not contain the standing prompt)
+No new messages while you were away. If you were in the middle of a task, continue it; otherwise stop (no reply needed).
+
+[Raft Inbox notice:
+App items pending: 1
+Run `raft inbox check` to inspect them.]

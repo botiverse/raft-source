@@ -1,39 +1,30 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import { useIntl } from "react-intl";
 import { Check, Minus, Plus } from "lucide-react";
 import { Badge, Button, RadioGroup, RadioGroupItem, ScrollArea, Skeleton, TextLink } from "@botiverse/raft-ui";
 import {
   DEFAULT_BILLING_INTERVAL,
-  FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES,
-  FREE_SINGLE_FILE_UPLOAD_LIMIT_BYTES,
-  PLAN_CONFIG,
   PRO_AGENT_SEAT_BLOCK_SIZE,
   PRO_PACK_ANNUAL_DISCOUNT_PERCENT,
   PRO_SEAT_ANNUAL_USD,
   PRO_SEAT_MONTHLY_USD,
-  PRO_SINGLE_FILE_UPLOAD_LIMIT_BYTES,
+  currentTimeMs,
 } from "@botiverse/raft-shared";
 import type { BillingInterval, PrepaidOffer, PrepaidOfferPeriod, ProPrepaidMonths } from "@botiverse/raft-shared";
-import type { MessageId } from "../../i18n/messages";
+import { subscribeLiveTime } from "../../hooks/liveTimeClock";
 import { useServerStore } from "../../store/serverStore";
 import type { BillingInfo } from "../../store/serverStore";
 import { getBillingSelectedTotalLabels } from "../../utils/billingPricedTotals";
+import { HIGHLIGHT_VALUES, PRO_HIGHLIGHTS } from "./proHighlights";
+import type { ProHighlightKey } from "./proHighlights";
 import Banner from "../ui/Banner";
+import { SeatsBreakdown } from "./SeatsBreakdown";
 import { SETUP_PAPER, SETUP_PAPER_DOT_GRID, SETUP_STICKER_CARD } from "../onboarding/setupPaper";
 
 /**
  * The Pro offer and its checkout choices, shared by the onboarding Pro step and the
  * upgrade dialog every paywall opens: one offer, so the two never quote Pro differently.
  */
-
-const PRO_HIGHLIGHTS = [
-  { key: "history", pro: "layout.onboarding.proUnlimitedMessageHistory", free: "layout.onboarding.freeMessageHistory" },
-  { key: "files", pro: "layout.onboarding.proFileUploads", free: "layout.onboarding.freeFileUploads" },
-  { key: "joint", pro: "layout.onboarding.proUnlimitedJointChannels", free: "layout.onboarding.freeJointChannelHosts" },
-  { key: "migration", pro: "layout.onboarding.proAgentMigration", free: "layout.onboarding.freeNotIncluded" },
-] as const satisfies ReadonlyArray<{ key: string; pro: MessageId; free: MessageId }>;
-
-export type ProHighlightKey = (typeof PRO_HIGHLIGHTS)[number]["key"];
 
 const INTERVALS: BillingInterval[] = ["annual", "monthly"];
 /** Pro is for a team: never fewer than two seats, whatever the server holds today. */
@@ -54,11 +45,6 @@ function formatUsd(value: number): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(2);
 }
 
-/** Keep a limit's number and MB unit together in every locale and viewport. */
-function formatMegabytes(bytes: number): string {
-  return `${bytes / (1024 * 1024)} MB`;
-}
-
 /** The price of one seat for one month, on this interval. */
 function monthlySeatUsd(interval: BillingInterval): string {
   return interval === "annual" ? (PRO_SEAT_ANNUAL_USD / 12).toFixed(2) : formatUsd(PRO_SEAT_MONTHLY_USD);
@@ -74,13 +60,6 @@ function prepaidSeatMonthUsd(offer: PrepaidOffer, interval: BillingInterval): st
   const period = offer.periods.find((candidate) => candidate.months === prepaidMonthsFor(interval));
   return period ? periodSeatMonthUsd(period) : monthlySeatUsd(interval);
 }
-
-const HIGHLIGHT_VALUES = {
-  historyDays: PLAN_CONFIG.free.limits.messageHistoryDays,
-  freeMonthlyFileLimit: formatMegabytes(FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES),
-  freeSingleFileLimit: formatMegabytes(FREE_SINGLE_FILE_UPLOAD_LIMIT_BYTES),
-  proSingleFileLimit: formatMegabytes(PRO_SINGLE_FILE_UPLOAD_LIMIT_BYTES),
-};
 
 /**
  * How the owner pays: a card subscription that renews, or Alipay paid once (task #19).
@@ -139,8 +118,20 @@ export function useProCheckoutDraft(
   // A renewal pays with Alipay only: without the offer there is no price to show or pay.
   const offerState: "ready" | "loading" | "unavailable" = offer ? "ready" : prepaid.offer || prepaid.failed ? "unavailable" : "loading";
   const payment: CheckoutPayment = prepaid.only || (offer && paymentChoice === "alipay") ? "alipay" : "card";
-  const usageMinimum = Math.ceil(billing?.usage.universalSeats ?? 0);
-  const minimumSeats = Math.max(MIN_PRO_SEATS, usageMinimum, payment === "alipay" ? offer?.minimumSeatQuantity ?? 0 : 0);
+  const usage = billing?.usage;
+  const usageMinimum = Math.ceil(usage?.universalSeats ?? 0);
+  const alipayMinimum = payment === "alipay" ? offer?.minimumSeatQuantity ?? 0 : 0;
+  const minimumSeats = Math.max(MIN_PRO_SEATS, usageMinimum, alipayMinimum);
+  // Why the seats can't go lower, said beside them so the minimum never reads as Pro's
+  // price: the seats the server's people and agents already use (from two up), broken
+  // down as Plan & billing shows them; else Pro's floor of two. The Alipay offer's
+  // minimum is that same count read by the server; above what this page has read, it
+  // is said without the older breakdown.
+  const seatsInUse = usage && usageMinimum === minimumSeats
+    ? { used: usage.universalSeats, breakdown: { humans: usage.humans, agents: usage.agents } }
+    : alipayMinimum === minimumSeats && alipayMinimum > MIN_PRO_SEATS
+      ? { used: alipayMinimum, breakdown: null }
+      : null;
   // A renewal starts at the seats it has (more than the minimum when some are free).
   const startSeats = Math.max(minimumSeats, prepaid.only ? offer?.defaultSeatQuantity ?? 0 : 0);
   const seats = Math.max(minimumSeats, startSeats + seatDelta);
@@ -166,7 +157,7 @@ export function useProCheckoutDraft(
   const onAddSeat = useCallback(() => setSeatDelta((delta) => delta + 1), []);
 
   return {
-    billingInterval, onIntervalChange, minimumSeats, extraSeats, seats, total, onAddSeat, onRemoveSeat,
+    billingInterval, onIntervalChange, minimumSeats, seatsInUse, extraSeats, seats, total, onAddSeat, onRemoveSeat,
     payment, onTogglePayment, months, prepaidOffer: offer, prepaidOnly: prepaid.only, period,
     // Seats the choices started at (the analytics' default), and whether there is something to pay.
     defaultSeats: startSeats, offerState, ready: payment === "card" || period !== null,
@@ -199,64 +190,68 @@ export function ProOfferPanel({
     ? [...PRO_HIGHLIGHTS.filter((highlight) => highlight.key === first), ...PRO_HIGHLIGHTS.filter((highlight) => highlight.key !== first)]
     : PRO_HIGHLIGHTS;
   return (
-    <div className={`${SETUP_PAPER} flex flex-col justify-start gap-3 border-b border-line-seam px-6 py-4 sm:px-7 md:border-b-0 md:border-r`}>
+    // Like the right column, it scrolls on its own from md when its list outgrows the
+    // dialog's fixed height (longer locales); the paper's dots stay put behind it.
+    <div className={`${SETUP_PAPER} flex flex-col border-b border-line-seam md:min-h-0 md:border-b-0 md:border-r`}>
       <div className={SETUP_PAPER_DOT_GRID} aria-hidden="true" />
-      {/* A fixed width, so the sticker doesn't resize when the price changes with the interval. */}
-      <div className={`${SETUP_STICKER_CARD} w-36 rotate-[-1.5deg] self-start px-5 py-2`}>
-        <Badge appearance="solid" variant="accent" className="absolute -right-3 -top-3 rotate-[6deg]">
-          {formatMessage({ id: "billing.pro" })}
-        </Badge>
-        {pricePending ? (
-          <Skeleton variant="block" className="my-2 h-9 w-20" data-testid={`${testIdPrefix}-seat-price-pending`} />
-        ) : (
-          <p className="text-display tabular-nums text-foreground" data-testid={`${testIdPrefix}-seat-price`}>
-            {formatMessage({ id: "layout.onboarding.proAmount" }, {
-              // Paid once, quoted per month like the subscription, so the sticker never outgrows its width.
-              amount: prepaidPeriod ? periodSeatMonthUsd(prepaidPeriod) : monthlySeatUsd(billingInterval),
-            })}
-          </p>
-        )}
-        <p className="text-footnote text-foreground-muted">
-          {formatMessage({ id: "layout.onboarding.proPerSeatPerMonth" })}
-        </p>
-        {pricePending ? null : (
-          <p className="text-footnote text-foreground-muted">
-            {prepaidPeriod
-              ? formatMessage({ id: "prepaidPro.paidOnceFor" }, { months: prepaidPeriod.months })
-              : formatMessage({
-                id: billingInterval === "annual" ? "layout.onboarding.proBilledYearly" : "layout.onboarding.proBilledMonthly",
+      <ScrollArea className="md:min-h-0" contentClassName="relative flex flex-col justify-start gap-3 px-6 py-4 sm:px-7">
+        {/* A fixed width, so the sticker doesn't resize when the price changes with the interval. */}
+        <div className={`${SETUP_STICKER_CARD} w-36 rotate-[-1.5deg] self-start px-5 py-2`}>
+          <Badge appearance="solid" variant="accent" className="absolute -right-3 -top-3 rotate-[6deg]">
+            {formatMessage({ id: "billing.pro" })}
+          </Badge>
+          {pricePending ? (
+            <Skeleton variant="block" className="my-2 h-9 w-20" data-testid={`${testIdPrefix}-seat-price-pending`} />
+          ) : (
+            <p className="text-display tabular-nums text-foreground" data-testid={`${testIdPrefix}-seat-price`}>
+              {formatMessage({ id: "layout.onboarding.proAmount" }, {
+                // Paid once, quoted per month like the subscription, so the sticker never outgrows its width.
+                amount: prepaidPeriod ? periodSeatMonthUsd(prepaidPeriod) : monthlySeatUsd(billingInterval),
               })}
+            </p>
+          )}
+          <p className="text-footnote text-foreground-muted">
+            {formatMessage({ id: "layout.onboarding.proPerSeatPerMonth" })}
           </p>
-        )}
-      </div>
-      <ul className="relative grid gap-2.5">
-        {highlights.map((highlight) => {
-          const hit = highlight.key === first;
-          return (
-            <li
-              key={highlight.key}
-              className={hit
-                ? "-mx-2 flex items-start gap-2.5 rounded-control bg-attention-soft px-2 py-1 text-callout font-bold text-foreground"
-                : "flex items-start gap-2.5 text-callout font-medium text-foreground"}
-              data-hit={hit ? "true" : undefined}
-              data-testid={`${testIdPrefix}-benefit-${highlight.key}`}
-            >
-              <Check size={16} strokeWidth={2.5} className="mt-0.5 shrink-0" aria-hidden="true" />
-              <span className="grid min-w-0 gap-0">
-                <span data-testid={`${testIdPrefix}-benefit-${highlight.key}-pro`}>
-                  {formatMessage({ id: highlight.pro }, HIGHLIGHT_VALUES)}
+          {pricePending ? null : (
+            <p className="text-footnote text-foreground-muted">
+              {prepaidPeriod
+                ? formatMessage({ id: "prepaidPro.paidOnceFor" }, { months: prepaidPeriod.months })
+                : formatMessage({
+                  id: billingInterval === "annual" ? "layout.onboarding.proBilledYearly" : "layout.onboarding.proBilledMonthly",
+                })}
+            </p>
+          )}
+        </div>
+        <ul className="relative grid gap-2">
+          {highlights.map((highlight) => {
+            const hit = highlight.key === first;
+            return (
+              <li
+                key={highlight.key}
+                className={hit
+                  ? "-mx-2 flex items-start gap-2.5 rounded-control bg-attention-soft px-2 py-1 text-callout font-bold text-foreground"
+                  : "flex items-start gap-2.5 text-callout font-medium text-foreground"}
+                data-hit={hit ? "true" : undefined}
+                data-testid={`${testIdPrefix}-benefit-${highlight.key}`}
+              >
+                <Check size={16} strokeWidth={2.5} className="mt-0.5 shrink-0" aria-hidden="true" />
+                <span className="grid min-w-0 gap-0">
+                  <span data-testid={`${testIdPrefix}-benefit-${highlight.key}-pro`}>
+                    {formatMessage({ id: highlight.pro }, HIGHLIGHT_VALUES)}
+                  </span>
+                  <del
+                    className="relative mt-0.5 w-fit max-w-full text-footnote font-normal leading-tight text-foreground-hint no-underline after:pointer-events-none after:absolute after:-left-0.5 after:-right-0.5 after:top-1/2 after:h-[1.5px] after:-translate-y-1/2 after:-rotate-1 after:rounded-full after:bg-line-seam after:content-['']"
+                    data-testid={`${testIdPrefix}-benefit-${highlight.key}-free`}
+                  >
+                    {formatMessage({ id: highlight.free }, HIGHLIGHT_VALUES)}
+                  </del>
                 </span>
-                <del
-                  className="relative mt-0.5 w-fit max-w-full text-footnote font-normal leading-tight text-foreground-hint no-underline after:pointer-events-none after:absolute after:-left-0.5 after:-right-0.5 after:top-1/2 after:h-[1.5px] after:-translate-y-1/2 after:-rotate-1 after:rounded-full after:bg-line-seam after:content-['']"
-                  data-testid={`${testIdPrefix}-benefit-${highlight.key}-free`}
-                >
-                  {formatMessage({ id: highlight.free }, HIGHLIGHT_VALUES)}
-                </del>
-              </span>
-            </li>
-          );
-        })}
-      </ul>
+              </li>
+            );
+          })}
+        </ul>
+      </ScrollArea>
     </div>
   );
 }
@@ -273,9 +268,14 @@ export function ProCheckoutChoices({
   error?: string;
   testIdPrefix: string;
 }) {
-  const { formatMessage, formatDate } = useIntl();
-  const { billingInterval, onIntervalChange, minimumSeats, extraSeats, seats, total, onAddSeat, onRemoveSeat, payment, prepaidOffer } = draft;
+  const { formatMessage, formatDate, formatNumber } = useIntl();
+  const formatSeats = (value: number) => formatNumber(value, { maximumFractionDigits: 1 });
+  const { billingInterval, onIntervalChange, minimumSeats, seatsInUse, extraSeats, seats, total, onAddSeat, onRemoveSeat, payment, prepaidOffer } = draft;
   const alipay = payment === "alipay";
+  // Whether a renewal's start has passed, from the live clock: the note changes when it does, on a page left open.
+  const renewalStartsAt = prepaidOffer?.renewalStartsAt;
+  const readRenewalStarted = () => (renewalStartsAt ? Date.parse(renewalStartsAt) < currentTimeMs() : false);
+  const renewalStarted = useSyncExternalStore(subscribeLiveTime, readRenewalStarted, readRenewalStarted);
   const annualDiscount = alipay && prepaidOffer ? prepaidAnnualDiscountPercent(prepaidOffer) : PRO_PACK_ANNUAL_DISCOUNT_PERCENT;
   // Renewing before the offer is there (or when it can't be had): no price to choose or pay.
   if (alipay && !prepaidOffer) {
@@ -330,12 +330,22 @@ export function ProCheckoutChoices({
       <div className="flex items-center gap-4">
         <div className="min-w-0 flex-1">
           <p className="text-subhead font-bold text-foreground">{formatMessage({ id: "billing.seats" })}</p>
-          <p className="text-footnote text-foreground-muted">
-            {formatMessage({ id: "layout.onboarding.proSeatsHint" }, { min: minimumSeats })}
-          </p>
-          <p className="text-footnote text-foreground-hint">
-            {formatMessage({ id: "layout.onboarding.proSeatNote" }, { agentBlock: PRO_AGENT_SEAT_BLOCK_SIZE })}
-          </p>
+          {seatsInUse ? (
+            <p className="text-footnote text-foreground-muted" data-testid={`${testIdPrefix}-seats-in-use`}>
+              {seatsInUse.used === minimumSeats
+                ? formatMessage({ id: "upgradeDialog.seatMinimum.inUse" }, { used: minimumSeats })
+                : formatMessage({ id: "upgradeDialog.seatMinimum.inUseRounded" }, { used: formatSeats(seatsInUse.used), min: minimumSeats })}
+            </p>
+          ) : (
+            <>
+              <p className="text-footnote text-foreground-muted">
+                {formatMessage({ id: "layout.onboarding.proSeatsHint" }, { min: minimumSeats })}
+              </p>
+              <p className="text-footnote text-foreground-hint">
+                {formatMessage({ id: "layout.onboarding.proSeatNote" }, { agentBlock: PRO_AGENT_SEAT_BLOCK_SIZE })}
+              </p>
+            </>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <Button
@@ -369,12 +379,16 @@ export function ProCheckoutChoices({
           </Button>
         </div>
       </div>
+      {/* What the seats in use are made of, under the whole row (cindyz, option 2). */}
+      {seatsInUse?.breakdown ? (
+        <SeatsBreakdown humans={seatsInUse.breakdown.humans} agents={seatsInUse.breakdown.agents} className="-mt-1" testId={`${testIdPrefix}-seats-breakdown`} />
+      ) : null}
 
       {/* A renewal says where it starts; a first purchase's "paid once" is in its choice and its total. */}
       {alipay && prepaidOffer?.renewalStartsAt ? (
         <p className="text-footnote text-foreground-muted" data-testid={`${testIdPrefix}-prepaid-note`}>
           {/* In the grace days the new time still counts from the last end, already past. */}
-          {formatMessage({ id: Date.parse(prepaidOffer.renewalStartsAt) < Date.now() ? "prepaidPro.renewalNoteGrace" : "prepaidPro.renewalNote" }, { date: formatDate(prepaidOffer.renewalStartsAt, { dateStyle: "medium" }) })}
+          {formatMessage({ id: renewalStarted ? "prepaidPro.renewalNoteGrace" : "prepaidPro.renewalNote" }, { date: formatDate(prepaidOffer.renewalStartsAt, { dateStyle: "medium" }) })}
         </p>
       ) : null}
 

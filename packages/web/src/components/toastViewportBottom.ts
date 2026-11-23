@@ -1,6 +1,6 @@
 import { useCallback, useLayoutEffect, useRef, useState } from "react";
 import { PHONE_MEDIA_QUERY } from "./ui/NarrowDialog";
-import { readSoftKeyboardOpen, subscribeSoftKeyboard } from "../utils/visualViewport";
+import { readSoftKeyboardBox, readSoftKeyboardOpen, subscribeSoftKeyboard } from "../utils/visualViewport";
 
 /**
  * Where a toast sits, at every width (Raft DS › Toast › Where it appears,
@@ -177,9 +177,7 @@ function pageBottomEdge(): number {
 
 /** The keyboard's height over the layout viewport's bottom while #root is pinned above it, else 0. */
 function keyboardInset(): number {
-  const vv = window.visualViewport;
-  if (!vv || !readSoftKeyboardOpen()) return 0;
-  return Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+  return readSoftKeyboardBox()?.inset ?? 0;
 }
 
 /** Marks the toast viewport, which `covered` sees through. */

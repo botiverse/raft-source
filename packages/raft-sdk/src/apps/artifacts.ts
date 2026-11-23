@@ -15,6 +15,7 @@ import type {
   AgentApiArtifactPublished,
   AgentApiArtifactReadResponse,
   AgentApiArtifactSaved,
+  AgentApiArtifactSettlement,
   AgentApiArtifactSubscriptionResponse,
   AgentApiArtifactThreadResolution,
   ArtifactCheckShot,
@@ -40,7 +41,9 @@ import {
   artifactsSaveAttachment,
   artifactsReopen,
   artifactsResolve,
+  artifactsSettle,
   artifactsUnfollow,
+  artifactsUnsettle,
   artifactsUpload,
   artifactUploaderForFetch,
   artifactCommentImageUploaderForFetch,
@@ -58,6 +61,7 @@ import {
   artifactsResolveRequestSchema,
   artifactsReviewRequestSchema,
   artifactsSaveAttachmentRequestSchema,
+  artifactsSettleRequestSchema,
   type ArtifactsPublishRequest,
   type RaftArtifactCheck,
   type RaftArtifactReviewed,
@@ -86,7 +90,7 @@ export const artifactsOperationDefs = [
   },
   {
     name: "artifacts.comments",
-    description: "List an artifact's comments in full, oldest first: by default those since you last looked (marking them seen), with all every comment, with review one review's (its summary first, then its comments in order).",
+    description: "List an artifact's comments in full, oldest first: by default those since you last looked (marking them seen), with all every comment, with review one review's (its summary first, then its comments in order), with held the comments a held comment, resolve or push marked seen, again.",
     schema: artifactsCommentsRequestSchema,
     routes: ["artifactComments"],
     consumes: NO_CONSUMPTION,
@@ -138,6 +142,22 @@ export const artifactsOperationDefs = [
     description: "Reopen a resolved comment thread on an artifact, by its first comment. Who may: as resolving. Tells no one; a reply in a resolved thread reopens it too.",
     schema: artifactsReopenRequestSchema,
     routes: ["artifactCommentReopen"],
+    consumes: NO_CONSUMPTION,
+    output: SMALL_OUTPUT,
+  },
+  {
+    name: "artifacts.settle",
+    description: "Mark an artifact Settled (done, no longer a draft under discussion) at its current version; anyone who may comment on it may, and nothing is locked. A new version takes it back to Working, and a push to a settled one is held once (the same push again goes through). Its following agents are told without being woken; settling one already settled changes nothing.",
+    schema: artifactsSettleRequestSchema,
+    routes: ["artifactSettle"],
+    consumes: NO_CONSUMPTION,
+    output: SMALL_OUTPUT,
+  },
+  {
+    name: "artifacts.unsettle",
+    description: "Take a Settled artifact back to Working. Who may: as settling. Its following agents are told without being woken; one already Working changes nothing.",
+    schema: artifactsSettleRequestSchema,
+    routes: ["artifactUnsettle"],
     consumes: NO_CONSUMPTION,
     output: SMALL_OUTPUT,
   },
@@ -237,6 +257,10 @@ export interface RaftArtifacts {
   resolve(request: { artifact: string; comment: string; note?: string }): Promise<RaftOutcome<AgentApiArtifactThreadResolution, "resolved" | "already_resolved">>;
   /** Reopen a resolved thread by its first comment. */
   reopen(request: { artifact: string; comment: string }): Promise<RaftOutcome<AgentApiArtifactThreadResolution, "reopened" | "already_open">>;
+  /** Mark it Settled (done) at its current version; a new version takes it back to Working. */
+  settle(request: { artifact: string }): Promise<RaftOutcome<AgentApiArtifactSettlement, "settled" | "already_settled">>;
+  /** Take a Settled one back to Working. */
+  unsettle(request: { artifact: string }): Promise<RaftOutcome<AgentApiArtifactSettlement, "working" | "already_working">>;
   follow(request: { artifact: string }): Promise<RaftOutcome<AgentApiArtifactSubscriptionResponse, "following" | "not_following">>;
   unfollow(request: { artifact: string }): Promise<RaftOutcome<AgentApiArtifactSubscriptionResponse, "following" | "not_following">>;
   /** Move one you made to the whole server, with its comments and versions; only a person can move it back. `anyone-with-link` is refused: only a person turns on link sharing. */
@@ -278,6 +302,8 @@ export function createRaftArtifacts({ api, style, styled, transport }: RaftArtif
     review: (request) => artifactsReview(api, request, style).then(styled),
     resolve: (request) => artifactsResolve(api, request, style).then(styled),
     reopen: (request) => artifactsReopen(api, request, style).then(styled),
+    settle: (request) => artifactsSettle(api, request, style).then(styled),
+    unsettle: (request) => artifactsUnsettle(api, request, style).then(styled),
     follow: (request) => artifactsFollow(api, request, style).then(styled),
     unfollow: (request) => artifactsUnfollow(api, request, style).then(styled),
     move: (request) => artifactsMove(api, request, style).then(styled),
@@ -300,6 +326,8 @@ export function raftArtifactsHandlers(raft: { artifacts: RaftArtifacts }) {
     "artifacts.review": (args: { artifact: string; body?: string; version?: number; comments: Array<{ body: string; path?: string; replyTo?: string; images?: string[] }>; idempotencyKey?: string }) => raft.artifacts.review(args),
     "artifacts.resolve": (args: { artifact: string; comment: string; note?: string }) => raft.artifacts.resolve(args),
     "artifacts.reopen": (args: { artifact: string; comment: string }) => raft.artifacts.reopen(args),
+    "artifacts.settle": (args: { artifact: string }) => raft.artifacts.settle(args),
+    "artifacts.unsettle": (args: { artifact: string }) => raft.artifacts.unsettle(args),
     "artifacts.follow": (args: { artifact: string }) => raft.artifacts.follow(args),
     "artifacts.unfollow": (args: { artifact: string }) => raft.artifacts.unfollow(args),
     "artifacts.move": (args: { artifact: string; to: "server" | "anyone-with-link" }) => raft.artifacts.move(args),

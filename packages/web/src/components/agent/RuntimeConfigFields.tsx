@@ -4,9 +4,6 @@ import { Fragment, useCallback, useMemo, useState } from "react";
 import {
   isRuntimeFormV2FieldVisible,
   runtimeFormV2AdvancedStartsOpen,
-  runtimeFormV2ConnectionActive,
-  runtimeFormV2SelectedConnection,
-  runtimeFormV2UnavailableSelection,
   validateRuntimeFormV2,
 } from "@botiverse/raft-runtime-form";
 import type {
@@ -18,9 +15,7 @@ import type {
 } from "@botiverse/raft-runtime-form";
 import type { RuntimeFormV2State } from "../../hooks/useRuntimeFormV2";
 import { useIntl } from "react-intl";
-import ExperimentalBadge from "../ui/ExperimentalBadge";
-import type { ProviderConnectionSummary } from "@botiverse/raft-shared";
-import { Button, Select, SelectActionItem, SelectContent, SelectGroup, SelectGroupLabel, SelectIcon, SelectItem, SelectItemDescription, SelectItemIndicator, SelectItemText, SelectList, SelectSeparator, SelectTrigger, SelectValue, TextLink } from "@botiverse/raft-ui";
+import { Badge, Button, Select, SelectActionItem, SelectContent, SelectGroup, SelectGroupLabel, SelectIcon, SelectItem, SelectItemDescription, SelectItemIndicator, SelectItemText, SelectList, SelectSeparator, SelectTrigger, SelectValue, TextLink } from "@botiverse/raft-ui";
 import StableField from "./StableField";
 import Banner from "../ui/Banner";
 import SectionEyebrow from "../ui/SectionEyebrow";
@@ -28,10 +23,11 @@ import { KeyValueAddButton } from "../ui/KeyValueInput";
 import Tooltip from "../ui/Tooltip";
 import { RuntimeEnvVarRow } from "./RuntimeEnvVarRow";
 import { RuntimeFormV2FieldControl } from "./RuntimeFormV2FieldControl";
+import { RuntimeUpgradeTargetContext } from "../../features/computer/runtimeUpgradeTarget";
+import type { RuntimeUpgradeTarget } from "../../features/computer/runtimeUpgradeTarget";
 
 /** Stable fallbacks for optional props, so a defaulted prop keeps one identity
  *  across renders instead of a fresh `[]` each time. */
-const NO_PROVIDER_CONNECTIONS: readonly ProviderConnectionSummary[] = [];
 const NO_SOURCE_IDS: readonly string[] = [];
 
 /**
@@ -62,8 +58,16 @@ export interface RuntimeOption {
   group?: string;
   /** Optional secondary line (e.g. per-effort reasoning-level description). */
   description?: string;
-  /** raft-ui's Experimental badge after the label, in the list and in the trigger. */
-  experimental?: boolean;
+  /** A Recommended badge after the label, in the list only: it helps pick, and the
+   *  closed field has already been picked. */
+  recommended?: boolean;
+  /** A Limited badge in the same place and style: the runtime can't take new
+   *  messages while it is working (isLimitedRuntime). Never with `recommended`. */
+  limited?: boolean;
+  /** What the runtime lacks in Raft (runtimeCapabilityHint.ts): the field's
+   *  description once it is the chosen value, never in the list, which shows
+   *  the names alone (cindyz, #triage:#524). */
+  hint?: string;
   /** What this computer lacks for it (" (not installed)"), after the label and
    *  any badge. Always in the closed field; in the list unless
    *  `availabilitySuffixInList` is false (its group heading says it). */
@@ -93,17 +97,28 @@ function addsToLabel(label: string, description: string | undefined): descriptio
   return Boolean(description) && description!.toLowerCase() !== label.toLowerCase();
 }
 
-/** An option's label: the name, the Experimental badge when it has one, then
- *  what this computer lacks for it. The space keeps "Qoder Experimental" two
- *  words in the accessible name and is the gap you see; one inline span holds
- *  them, because the closed field's trigger is a flex row, which drops a
- *  whitespace-only text node between its items (the name and badge touched).
- *  `inList` drops a suffix the group heading already says; the closed field
- *  has no heading, so it keeps it. */
+/** An option's label: the name, in the list the Recommended or Limited badge
+ *  when it has one, then what this computer lacks for it. The space keeps
+ *  "Codex Recommended" two words in the accessible name and is the gap you
+ *  see. `inList` drops a suffix the group heading already says; the closed
+ *  field has no heading, so it keeps it. */
 function runtimeOptionLabel(option: RuntimeOption, inList: boolean): ReactNode {
   const suffix = inList && option.availabilitySuffixInList === false ? "" : option.availabilitySuffix ?? "";
-  if (!option.experimental) return option.label + suffix;
-  return <span data-slot="runtime-option-label">{option.label}{" "}<ExperimentalBadge />{suffix}</span>;
+  const badge = !inList ? null : option.recommended ? <RecommendedBadge /> : option.limited ? <LimitedBadge /> : null;
+  if (!badge) return option.label + suffix;
+  return <span data-slot="runtime-option-label">{option.label}{" "}{badge}{suffix}</span>;
+}
+
+/** Raft DS Badge: "Recommended" after an option's name, a hairline label in the default color. */
+function RecommendedBadge() {
+  const { formatMessage } = useIntl();
+  return <Badge appearance="outline">{formatMessage({ id: "onboarding.computerRuntime.recommended" })}</Badge>;
+}
+
+/** Raft DS Badge: "Limited" in Recommended's place, the same hairline label (cindyz: one badge style for both). */
+function LimitedBadge() {
+  const { formatMessage } = useIntl();
+  return <Badge appearance="outline">{formatMessage({ id: "runtime.picker.limited" })}</Badge>;
 }
 
 function renderSelectOption(option: RuntimeOption) {
@@ -183,6 +198,7 @@ export function RuntimeSelectControl({
   placeholder,
   testId,
   listAction,
+  disabled = false,
   "data-invalid": dataInvalid,
   "aria-describedby": ariaDescribedBy,
   "aria-required": ariaRequired,
@@ -194,6 +210,8 @@ export function RuntimeSelectControl({
   testId?: string;
   /** A row after the options that changes what the list shows; see RuntimeSelectListActionRow. */
   listAction?: RuntimeSelectListAction;
+  /** Shown but not changeable (Raft DS States: disabled); the field's hint says why. */
+  disabled?: boolean;
   /** Set by StableField when this select is the field's adopted control and the
    *  field is in error. Accepted EXPLICITLY and forwarded to the trigger: a
    *  component silently swallows unknown props, so without this the mark reached
@@ -215,10 +233,9 @@ export function RuntimeSelectControl({
     (nextValue: string | null) => commitRuntimeSelectValue(options, nextValue, onValueChange),
     [options, onValueChange],
   );
-  // The trigger says Experimental and what the computer lacks too; `items`
-  // labels stay the plain name for type-to-search, so both are drawn here
-  // rather than through them.
-  const hasDecoratedLabel = options.some((option) => option.experimental || option.availabilitySuffix);
+  // The trigger says what the computer lacks too; `items` labels stay the
+  // plain name for type-to-search, so it is drawn here rather than through them.
+  const hasDecoratedLabel = options.some((option) => option.availabilitySuffix);
   const renderValue = useCallback((selected: unknown) => {
     const option = options.find((candidate) => candidate.value === selected);
     return option ? runtimeOptionLabel(option, false) : placeholder;
@@ -232,6 +249,7 @@ export function RuntimeSelectControl({
       value={value}
       onValueChange={handleValueChange}
       items={options}
+      disabled={disabled}
     >
       <SelectTrigger className="w-full" data-testid={testId} data-invalid={dataInvalid} aria-describedby={ariaDescribedBy} aria-required={ariaRequired}>
         <SelectValue placeholder={placeholder}>{hasDecoratedLabel ? renderValue : undefined}</SelectValue>
@@ -329,11 +347,14 @@ export function RuntimeEnvVarsField({
   onChange,
   optional,
   hint,
+  label,
 }: {
   entries: EnvVarEntry[];
   onChange: (entries: EnvVarEntry[]) => void;
   optional?: boolean;
   hint?: ReactNode;
+  /** The form's title for the field. */
+  label: string;
 }) {
   const { formatMessage } = useIntl();
   const handleKeyChange = useCallback((index: number, key: string) => {
@@ -353,7 +374,7 @@ export function RuntimeEnvVarsField({
     onChange([...entries, { key: "", value: "" }]);
   }, [entries, onChange]);
   return (
-    <Field label={formatMessage({ id: "agent.runtimeConfig.envVars" })} optional={optional} adopt={false}>
+    <Field label={label} optional={optional} adopt={false}>
       {hint && <p className="mb-2 -mt-1 text-caption text-foreground-hint">{hint}</p>}
       <div className="stack-y-2">
         {entries.map((entry, index) => (
@@ -405,9 +426,6 @@ interface RuntimeConfigFieldsProps {
     /** Edit: blank writeOnly fields keep the stored value. */
     editing?: boolean;
   };
-  /** Saved Provider connections, for the v2 form's pencil action on the selected one. */
-  providerConnections?: readonly ProviderConnectionSummary[];
-  onEditProviderConnection?: (connection: ProviderConnectionSummary) => void;
   /**
    * Whether field-level validation errors are allowed to be VISIBLE yet.
    *
@@ -423,6 +441,13 @@ interface RuntimeConfigFieldsProps {
    * have no way to turn them back on.
    */
   showValidationErrors?: boolean;
+  /**
+   * The server and Computer the runtime runs on, for Upgrade on a model
+   * source whose CLI is too old (`runtime_outdated`), where it is offered.
+   * Omit where no Computer is chosen.
+   */
+  upgradeServerId?: string | null;
+  upgradeMachineId?: string | null;
 }
 
 export default function RuntimeConfigFields({
@@ -436,28 +461,25 @@ export default function RuntimeConfigFields({
   onRescanRuntimes,
   runtimesRescanning = false,
   runtimeFormV2,
-  providerConnections = NO_PROVIDER_CONNECTIONS,
-  onEditProviderConnection,
   showValidationErrors = true,
+  upgradeServerId = null,
+  upgradeMachineId = null,
 }: RuntimeConfigFieldsProps) {
-  // `provider.saved_connection` (v2 forms): the pencil action bridge, memoized
-  // so the object identity is stable across renders (react-doctor).
-  const savedConnectionsForV2 = useMemo(() => (onEditProviderConnection
-    ? {
-        onEdit: (connectionId: string) => {
-          const connection = providerConnections.find((candidate) => candidate.id === connectionId);
-          if (connection) onEditProviderConnection(connection);
-        },
-      }
-    : undefined), [onEditProviderConnection, providerConnections]);
+  const upgradeContext = useMemo<RuntimeUpgradeTarget | null>(() => (upgradeServerId && upgradeMachineId && runtime
+    ? { serverId: upgradeServerId, machineId: upgradeMachineId, runtimeId: runtime }
+    : null), [runtime, upgradeMachineId, upgradeServerId]);
   const { formatMessage } = useIntl();
   const effectiveRuntimeLabel = runtimeLabel ?? formatMessage({ id: "agent.runtimeConfig.runtime" });
+  // The chosen runtime's hint is the field's description, which the trigger's
+  // aria-describedby already names (StableField).
+  const runtimeHint = runtimeOptions.find((option) => option.value === runtime)?.hint;
 
   return (
     <>
       <Field
         label={effectiveRuntimeLabel}
         required
+        hint={runtimeHint}
         reserveMessage={reserveRuntimeMessage}
         belowDescription={runtimeBelowDescription}
         labelAccessory={onRescanRuntimes ? (
@@ -485,6 +507,7 @@ export default function RuntimeConfigFields({
 
       {runtimeFormV2 && (
         runtimeFormV2.state.status === "ready" && runtimeFormV2.values ? (
+          <RuntimeUpgradeTargetContext.Provider value={upgradeContext}>
           <RuntimeFormV2Fields
             form={runtimeFormV2.state.form}
             sources={runtimeFormV2.state.sources}
@@ -495,8 +518,8 @@ export default function RuntimeConfigFields({
             editing={runtimeFormV2.editing}
             onRetrySource={runtimeFormV2.state.retrySource}
             retryingSourceIds={runtimeFormV2.state.retryingSourceIds}
-            savedConnections={savedConnectionsForV2}
           />
+          </RuntimeUpgradeTargetContext.Provider>
         ) : (
           // "unsupported" (a form this build cannot render, or a runtime with no
           // v2 form) is neither loading nor a failed load: the plain
@@ -530,7 +553,6 @@ export function RuntimeFormV2Fields({
   editing = false,
   onRetrySource,
   retryingSourceIds = NO_SOURCE_IDS,
-  savedConnections,
 }: {
   form: ParsedRuntimeFormV2;
   sources: RuntimeFormV2Sources;
@@ -544,12 +566,6 @@ export function RuntimeFormV2Fields({
   /** `option_source.status`: re-request a source (`?refresh=1`). */
   onRetrySource?: (sourceId: string) => void;
   retryingSourceIds?: readonly string[];
-  /**
-   * `provider.saved_connection`: pencil action for the selected saved
-   * connection. Present only for callers whose operator may edit provider
-   * connections (manageExternalAuth).
-   */
-  savedConnections?: { onEdit: (connectionId: string) => void };
 }) {
   const { formatMessage } = useIntl();
   // Renderer convention: Advanced opens whenever a visible field in it has a
@@ -571,37 +587,19 @@ export function RuntimeFormV2Fields({
     switch (errors[key]) {
       case "invalid_url": return formatMessage({ id: "agent.runtimeConfig.baseUrlInvalid" });
       case "not_a_choice": return formatMessage({ id: "agent.runtimeFormV2.notAChoice" });
-      case "unsupported_required": return formatMessage({ id: "agent.runtimeFormV2.updateToEdit" });
+      // The field itself says "Update Raft to edit this setting." and Save stays off (v2MissingRequired, v2EditBlocked): not twice.
+      case "unsupported_required": return undefined;
       // The field's source status line already says why, with its retry.
       case "source_unavailable": return undefined;
-      // A bound-but-unavailable saved connection: visible, never silently rewritten.
-      case "connection_unavailable": return formatMessage({ id: "agent.runtimeConfig.savedProviderUnavailable" });
-      // v3: the value is an unavailable entry (a saved connection, or a model
-      // on a list-only source): shown selected, pick another to save.
-      case "option_unavailable": {
-        const field = form.fields.find((candidate) => candidate.key === key);
-        const entry = field ? runtimeFormV2UnavailableSelection(field, sources, values) : undefined;
-        return formatMessage({ id: entry?.connectionId ? "agent.runtimeConfig.savedProviderUnavailable" : "agent.runtimeFormV2.notAChoice" });
-      }
+      // v3: the value is an unavailable entry (a model on a list-only
+      // source): shown selected, pick another to save. Saved provider
+      // connections are gone from this client (useRuntimeFormV2 drops them),
+      // so a connection code never reaches here; it reads as not a choice.
+      case "connection_unavailable":
+      case "option_unavailable": return formatMessage({ id: "agent.runtimeFormV2.notAChoice" });
       default: return formatMessage({ id: "agent.runtimeFormV2.required" });
     }
   };
-
-  // Saved provider connections (`provider.saved_connection`): while any field
-  // holds a connection selection, the fields it owns are the connection's, not
-  // the user's — disabled, placeholder, never submitted (the shared
-  // runtimeFormV2Submission rules). Per-field rendering lives in
-  // RuntimeFormV2FieldControl; the parent computes the form-wide state once.
-  const connectionActive = runtimeFormV2ConnectionActive(form, sources, values);
-  const selectedConnectionOption = connectionActive
-    ? form.fields
-        .map((candidate) => runtimeFormV2SelectedConnection(candidate, sources, values))
-        .find((option): option is NonNullable<typeof option> => option !== undefined)
-    : undefined;
-  const managedPlaceholder = formatMessage(
-    { id: "agent.runtimeConfig.credentialFromSavedProvider" },
-    { connection: selectedConnectionOption?.label ?? formatMessage({ id: "agent.runtimeConfig.savedProviderUnavailable" }) },
-  );
 
   const renderField = (field: RuntimeFormV2Field) => (
     // An optional field whose source is unavailable is hidden (option_source.status).
@@ -618,9 +616,6 @@ export function RuntimeFormV2Fields({
         editing={editing && errors[field.key] !== "secret_reentry_required"}
         onRetrySource={onRetrySource}
         retryingSourceIds={retryingSourceIds}
-        connectionActive={connectionActive}
-        managedPlaceholder={connectionActive ? managedPlaceholder : undefined}
-        savedConnections={savedConnections}
       />
     ) : null
   );
@@ -649,10 +644,13 @@ export function RuntimeFormV2Fields({
 /** Key/value editor over a string map; keeps half-typed rows locally until they have a key. */
 export function RuntimeFormV2StringMapField({
   value,
+  label,
   hint,
   onChange,
 }: {
   value: Record<string, string>;
+  /** The form's title for the field. */
+  label: string;
   hint?: ReactNode;
   onChange: (next: Record<string, string>) => void;
 }) {
@@ -666,6 +664,7 @@ export function RuntimeFormV2StringMapField({
   return (
     <RuntimeEnvVarsField
       entries={entries}
+      label={label}
       hint={hint}
       onChange={handleChange}
     />

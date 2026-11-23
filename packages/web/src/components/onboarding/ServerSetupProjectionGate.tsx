@@ -7,6 +7,7 @@ import { Button, Card, Dialog, ScrollArea } from "@botiverse/raft-ui";
 import type { DialogProps } from "@botiverse/raft-ui";
 import { useMachineStore } from "../../store/machineStore";
 import { useComputerConnectionWatch } from "../../hooks/useComputerConnectionWatch";
+import { useAppNavigate } from "../../hooks/useAppNavigate";
 import { FramedDialogContent } from "../ui/NarrowDialog";
 import type { DialogNarrow } from "../ui/NarrowDialog";
 import ConfirmDialog from "../ConfirmDialog";
@@ -30,6 +31,7 @@ import { emitHostEvent, hasRaftHostEventBridge, readRaftHostOnboardingContext } 
 import { NATIVE_ONBOARDING_CONTRACT_VERSION } from "../../embed/nativeOnboarding";
 import { serverSetupCopyAction, trackServerSetupAction, trackServerSetupBlocked, trackServerSetupStepShown } from "../../analytics/serverSetup";
 import type { ServerSetupStep } from "../../analytics/serverSetup";
+import { useStartOverConfirm } from "./useStartOverConfirm";
 import type { CopyTarget } from "../machine/ComputerCommandGuide";
 import {
   useOnboardingAnnouncementGateStore,
@@ -206,6 +208,7 @@ export default function ServerSetupProjectionGate({
   dedicatedSurface = false,
 }: ServerSetupProjectionGateProps) {
   const { formatMessage } = useIntl();
+  const nav = useAppNavigate();
   const displayStylePending = useOnboardingDisplayStylePending();
   const { pathname } = useLocation();
   const machines = useMachineStore((state) => state.machines);
@@ -243,7 +246,6 @@ export default function ServerSetupProjectionGate({
   // only ever owed before the handoff.
   const upgradePending = !dedicatedSurface && (projection?.postSetup?.upgradePending ?? false);
   const [loading, setLoading] = useState(false);
-  const [confirmStartOver, setConfirmStartOver] = useState(false);
   const [error, setError] = useState("");
   // On a phone a setup step is a sheet (SetupStepDialog). It is blocking, so
   // it gets no × (it never had a way out); each step keeps its own head and
@@ -269,6 +271,7 @@ export default function ServerSetupProjectionGate({
       setProjectionAuthoritative(true);
       setProjectionLoadFailed(false);
       setError("");
+      return true;
     } catch {
       // Keep the last-good projection on a refetch failure. A transient error mid-setup (a
       // machine-change re-read that fails, a socket event during a redeploy, a tab waking
@@ -280,6 +283,7 @@ export default function ServerSetupProjectionGate({
       // null-projection guard below renders as nothing.
       setProjection(projectionAfterRefreshFailure);
       setProjectionLoadFailed(true);
+      return false;
     } finally {
       setProjectionResolved(true);
     }
@@ -428,9 +432,11 @@ export default function ServerSetupProjectionGate({
     trackServerSetupAction(serverId, "display_style", "continue");
     completeOnboardingDisplayStyle();
   }, [serverId]);
+  const openAgent = useCallback((agentId: string) => nav.toAgent(agentId), [nav]);
+  // Resolves false when the re-read fails: the step stays up, and its button must work again.
   const handoffDone = useCallback(() => {
     trackServerSetupAction(serverId, "handoff", "lets_go");
-    void refreshProjection();
+    return refreshProjection();
   }, [refreshProjection, serverId]);
 
   const handleResume = useCallback(async () => {
@@ -452,27 +458,21 @@ export default function ServerSetupProjectionGate({
   // Read on every render now, including the completed-setup surfaces, which may omit
   // `allowedExits` entirely.
   const canResetSetup = projection?.allowedExits?.includes("reset") ?? false;
+  const { open: confirmStartOver, close: closeStartOverConfirm, fromComputer: startOverFromComputer, fromCreateAgent: startOverFromCreateAgent } =
+    useStartOverConfirm(serverId);
   const handleStartOver = useCallback(async () => {
     if (!canResetSetup || loading) return;
     setLoading(true);
     setError("");
     try {
       setProjection(await resetServerSetup(serverId));
-      setConfirmStartOver(false);
+      closeStartOverConfirm();
     } catch (nextError) {
       setError(responseErrorMessage(nextError, formatMessage));
     } finally {
       setLoading(false);
     }
-  }, [canResetSetup, formatMessage, loading, serverId]);
-  const startOverFromComputer = useCallback(() => {
-    trackServerSetupAction(serverId, "computer_runtime", "start_over");
-    setConfirmStartOver(true);
-  }, [serverId]);
-  const startOverFromCreateAgent = useCallback(() => {
-    trackServerSetupAction(serverId, "create_agent", "start_over");
-    setConfirmStartOver(true);
-  }, [serverId]);
+  }, [canResetSetup, closeStartOverConfirm, formatMessage, loading, serverId]);
   const trackCopiedCommand = useCallback((target: CopyTarget) => {
     const { action, os } = serverSetupCopyAction(target);
     trackServerSetupAction(serverId, "computer_runtime", action, os);
@@ -491,7 +491,6 @@ export default function ServerSetupProjectionGate({
     trackServerSetupAction(serverId, "computer_runtime", "copy_runtime_install_command");
     copyInstallCommand(runtimeId, command);
   }, [serverId]);
-  const closeStartOverConfirm = useCallback(() => setConfirmStartOver(false), []);
 
   const handleComputerRuntimeNext = useCallback(() => {
     trackServerSetupAction(serverId, "computer_runtime", "next");
@@ -623,13 +622,8 @@ export default function ServerSetupProjectionGate({
     return presentStep(step);
   }
   if (setupComplete && handoffPending) {
-    const step = (
-      <ServerSetupHandoffStep
-        serverId={serverId}
-        onDone={handoffDone}
-      />
-    );
-    return presentStep(step, true);
+    // The dedicated (native) page never opens the app, so not the agent's profile either.
+    return presentStep(<ServerSetupHandoffStep serverId={serverId} onDone={handoffDone} onOpenAgent={dedicatedSurface ? undefined : openAgent} pollAgent={dedicatedSurface} />, true);
   }
   if (!projection.blocksChat) {
     if (dedicatedSurface && !effectiveWakeGeneration) {
@@ -768,6 +762,7 @@ export default function ServerSetupProjectionGate({
         hasConnectedComputer={authoritative.hasConnectedComputer ?? false}
         offlineComputers={authoritative.offlineComputers ?? NO_OFFLINE_COMPUTERS}
         serverSlug={serverSlug}
+        serverId={serverId}
         showOwnApiKey={false}
         loading={loading}
         error={error || gateMessage(projection.gateReason, formatMessage)}

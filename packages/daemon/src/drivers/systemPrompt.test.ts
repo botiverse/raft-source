@@ -1,4 +1,5 @@
 import { buildCliSystemPrompt, SUBAGENT_DELEGATION_SECTION, type SystemPromptOptions } from "./systemPrompt";
+import { buildRaftCliGuideMarkdown, buildRaftCliOverviewMdx } from "./raftCliGuide";
 import { ClaudeDriver } from "./claude";
 import { CodexDriver } from "./codex";
 import { promptConfig } from "../testing/promptFixture";
@@ -140,8 +141,16 @@ test("the reminder and vault app flags each change only their own text; off rend
   expect(buildCliSystemPrompt(promptConfig({ reminderApp: false, vaultApp: false }), options)).toBe(baseline);
 
   const reminder = buildCliSystemPrompt(promptConfig({ reminderApp: true }), options);
-  expect(reminder).toContain("Reminders on this Server live in the Reminder app.");
-  expect(reminder).toContain("9. **Reminders** — moved to the Reminder app on this Server");
+  expect(reminder).toContain("Reminders on this Server live in the Reminder app; `raft reminder` works with it.");
+  expect(reminder).toContain("9. **Reminders** — `raft reminder schedule`, `raft reminder list`, `raft reminder show`");
+  // The app is reached through `raft reminder` itself, not `raft integration invoke`.
+  expect(reminder).toContain("anchored to the message it is about with `--message-id`");
+  expect(reminder).not.toContain("--list-actions");
+  expect(reminder).not.toContain("reminders_moved_to_app");
+  // Fired reminders come from the app; system.reminder only for those made before the move.
+  expect(reminder).toContain("fired reminders come from the Reminder app as events in your inbox");
+  expect(reminder).not.toContain("`system.reminder` delivers due reminders;");
+  expect(baseline).toContain("`system.reminder` delivers due reminders;");
   expect(reminder).not.toContain("Use `raft reminder schedule` rather than runtime-native wake");
   // Triggers live in the Reminder app (#wg-ax:#24), so only its prompt names them.
   expect(reminder).toContain("run `raft reminder trigger --key <condition> --title <one line>`");
@@ -154,6 +163,47 @@ test("the reminder and vault app flags each change only their own text; off rend
   expect(vault).toContain("if you choose the value (e.g. a signing secret), create it in the Vault yourself (`create-vault`, then `generate`); if a human holds it (e.g. a third-party API key), ask them to add it in the Vault web page");
   const vaultLine = vault.split("\n").find((line) => line.includes("through the Vault app"))!;
   expect(vault.replace(`\n${vaultLine}`, "")).toBe(baseline);
+});
+
+// #triage:#540, `dm_reply_placement_prompt` (AgentConfig.dmReplyPlacement): prompt text only, inside the
+// task-conversations Tasks section. Off, absent or without task conversations, the prompt is byte-identical.
+test("DM reply placement: the flag adds the DM rule to the task-conversations prompt; off or without task conversations the prompt is unchanged", () => {
+  const bullet = "\n- In a DM with one person there is no one else to tell, and they read the DM itself: confirm that you are taking the work, ask what you need and send the result on the DM's own timeline (`raft message send --target dm:@peer`), not in a thread under their message and not in the task's conversation. Use a thread or the task's conversation only when they wrote there.";
+  const takingWork = " In a DM with one person, confirm on the DM's own timeline instead (see **Answer people where they spoke**).";
+
+  const baseline = buildCliSystemPrompt(promptConfig({ taskConversations: true }), options);
+  expect(baseline).not.toContain("In a DM with one person");
+  expect(buildCliSystemPrompt(promptConfig({ taskConversations: true, dmReplyPlacement: false }), options)).toBe(baseline);
+
+  const on = buildCliSystemPrompt(promptConfig({ taskConversations: true, dmReplyPlacement: true }), options);
+  expect(on).toContain(`gets the answer in the task's conversation.${bullet}\n- \`raft task view\` shows who created the task`);
+  expect(on).toContain(`leave the work to them.${takingWork}\n- A task on the board that nobody holds`);
+  expect(on.split("In a DM with one person")).toHaveLength(3);
+  expect(on.replace(bullet, "").replace(takingWork, "")).toBe(baseline);
+
+  // The sentences live in the task-conversations section: without it the flag renders nothing.
+  const withoutTaskConversations = buildCliSystemPrompt(promptConfig(), options);
+  expect(buildCliSystemPrompt(promptConfig({ dmReplyPlacement: true }), options)).toBe(withoutTaskConversations);
+  expect(buildCliSystemPrompt(promptConfig({ taskConversations: false, dmReplyPlacement: true }), options)).toBe(withoutTaskConversations);
+  expect(withoutTaskConversations).not.toContain("In a DM with one person");
+});
+
+// The external agent's guide (`GET /context`, the raft-cli-overview manual) takes the same option.
+test("DM reply placement: the self-hosted guide is gated the same way", () => {
+  const baseline = buildRaftCliGuideMarkdown(undefined, { taskConversations: true });
+  expect(buildRaftCliGuideMarkdown(undefined, { taskConversations: true, dmReplyPlacement: false })).toBe(baseline);
+  expect(baseline).not.toContain("In a DM with one person");
+  // The generated manual topic is the flag-off guide.
+  expect(buildRaftCliOverviewMdx()).not.toContain("In a DM with one person");
+
+  const on = buildRaftCliGuideMarkdown(undefined, { taskConversations: true, dmReplyPlacement: true });
+  const bullet = on.split("\n").find((line) => line.startsWith("- In a DM with one person there is no one else to tell, and they read the DM itself: confirm"))!;
+  const takingWork = " In a DM with one person, confirm on the DM's own timeline instead.";
+  expect(on).toContain(`the thread then shows the task's ref.${takingWork} A task on the board that nobody holds`);
+  expect(on.split("In a DM with one person")).toHaveLength(3);
+  expect(on.replace(`\n${bullet}`, "").replace(takingWork, "")).toBe(baseline);
+
+  expect(buildRaftCliGuideMarkdown(undefined, { dmReplyPlacement: true })).toBe(buildRaftCliGuideMarkdown());
 });
 
 test("task v2: the task conversations flag teaches raft task reply/read/view; off renders the historical prompt", () => {
@@ -170,6 +220,8 @@ test("task v2: the task conversations flag teaches raft task reply/read/view; of
   // asked, answer people where they spoke, hand the task to whoever it waits on.
   expect(on).toContain("first reply in that message's thread to confirm it, in a line or two: what you understood the ask to be and what you will do");
   expect(on).toContain("**Answer people where they spoke.**");
+  // The DM rule (#triage:#540) is behind its own flag: task conversations alone do not render it.
+  expect(on).not.toContain("In a DM with one person");
   // Same work asked about in several places: result once, a link in each other place (Hands fdab1018).
   expect(on).toContain("Say each thing in one place per person.");
   expect(on).toContain("If you are doing the work or handed it to someone, and it was also asked about");

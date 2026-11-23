@@ -23,6 +23,7 @@ import {
 } from "./hostedAgentMigrationService";
 import { markTestAgentMigrationReady } from "../test/agentMigrationFixture";
 import { ANTIPROTON_PROVISIONING_TOKEN_ENV, __setAgentRuntimeProviderTransportForTests, decryptProviderSecret } from "./agentRuntimeProviderService";
+import { openAgentRowSecrets } from "./agentSecretCrypto";
 import { probeProviderAgent } from "./agentRuntimeProvisionService";
 import { mintAgentCredential, RUNNER_MACHINE_CHANGED_REVOKE_REASON } from "./agentCredentialService";
 import {
@@ -367,7 +368,7 @@ test("a create the provider refused and never had puts the agent back on its Com
   assert.equal(restored.machineId, source.id);
   assert.equal(restored.runtime, "codex");
   assert.equal(restored.model, "gpt-5.3-codex");
-  assert.deepEqual(restored.envVars, { OPENAI_API_KEY: "sk-very-secret-value" });
+  assert.deepEqual(openAgentRowSecrets(restored).envVars, { OPENAI_API_KEY: "sk-very-secret-value" });
   // The switch and the revert each recorded one change; the revert is the system's.
   const configEvents = await db.select().from(agentConfigChangeEvents).where(eq(agentConfigChangeEvents.agentId, agent.id));
   assert.deepEqual(configEvents.map((event) => event.source).sort(), ["hosted_migration", "hosted_migration_revert"]);

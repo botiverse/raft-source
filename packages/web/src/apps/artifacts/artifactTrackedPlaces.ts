@@ -1,5 +1,6 @@
 import type { ArtifactCommentId } from "@botiverse/raft-shared";
 import type { AnnotationRect, AnnotationReport, AnnotationScroll } from "@botiverse/porthole";
+import type { LiveAnchorSpec } from "./artifactCommentsShapes";
 
 /**
  * Where the open thread card goes now (client px), as the frame follows its mark (`tracked`, up to
@@ -9,6 +10,7 @@ import type { AnnotationRect, AnnotationReport, AnnotationScroll } from "@botive
 export interface TrackedPlace {
   threadId: ArtifactCommentId;
   rect: AnnotationRect;
+  liveAnchor?: LiveAnchorSpec | null;
   key: number;
 }
 
@@ -108,6 +110,48 @@ export function selectionPlace(
   const top = clipped(line.y - scroll.y, frameBox.height);
   const bottom = clipped(line.y + line.height - scroll.y, frameBox.height);
   return inClient({ x: left, y: top, width: right - left, height: bottom - top }, frameBox);
+}
+
+/** How far in from a huge picked element's visible top left its composer opens (`composerPlace`), px. */
+export const INSIDE_INSET_PX = 16;
+
+/**
+ * Where the composer at a selection opens (client px): beside it (`selectionPlace`), or, for a
+ * picked element taller than half the frame, inside it, at a point (#proj-workspace:#315, Kirby).
+ * Beside such an element there is no room for the box below it nor above it, so the popover's
+ * collision handling pushed it somewhere odd (over the viewer's header, squeezed). The test is the
+ * element's whole height against half the frame's, not the room left around it: it holds for the
+ * whole pick (scrolling through a huge element never flips the box between inside and beside),
+ * and needs no measure of the box, whose height changes as the person types. A normal-size pick
+ * and every text selection are placed exactly as before.
+ *
+ * The point: where the person pressed, once the frame says (`point`, document coordinates, made
+ * viewport ones with the report's `scroll`; Porthole's `selected.pointDocument`, kept on the selection: absent from a keyboard pick and an older shell),
+ * else the visible part's top left, `INSIDE_INSET_PX` in. Either is clamped into the element's
+ * visible part, clipped to the frame as `selectionPlace` clips it, so nothing is drawn from the
+ * page's numbers outside the frame (THREAT_MODEL §6); the height the test reads is the page's word
+ * too, and decides only which of those two clipped places is used. As the page scrolls the point
+ * moves with the element, and while any of it is in view the point is in view: the fallback stays
+ * at the top left of what shows.
+ */
+export function composerPlace(
+  selection: { rect: AnnotationRect; lastLineDocumentRect?: AnnotationRect; scroll?: AnnotationScroll },
+  frameBox: FrameBox | null,
+  pick: { element: boolean; point?: { x: number; y: number } | null },
+): AnnotationRect {
+  const place = selectionPlace(selection, frameBox);
+  if (!pick.element || !frameBox) return place;
+  // An element's last line is its whole box (Porthole P133); an older frame's `rect` is its visible part.
+  const height = selection.lastLineDocumentRect?.height ?? selection.rect.height;
+  if (!(height > frameBox.height / 2) || place.width <= 0 || place.height <= 0) return place;
+  const { point } = pick;
+  const { scroll } = selection;
+  const pressed = point && scroll && Number.isFinite(point.x) && Number.isFinite(point.y)
+    ? { x: frameBox.left + point.x - scroll.x, y: frameBox.top + point.y - scroll.y }
+    : null;
+  const at = pressed ?? { x: place.x + INSIDE_INSET_PX, y: place.y + INSIDE_INSET_PX };
+  const within = (value: number, start: number, size: number) => Math.max(start, Math.min(value, start + size));
+  return { x: within(at.x, place.x, place.width), y: within(at.y, place.y, place.height), width: 0, height: 0 };
 }
 
 /** The frame's word on the selection a composer follows (Porthole P138 `selectionTracked`). */

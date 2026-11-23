@@ -14,9 +14,10 @@
 // One rule for both hosts. This module owns the knobs, the mark decision, the
 // per-agent marks (with the quiet timer) and the trace/log text; the hosts
 // own "is it idle" and the stop.
+import type { ContextUsageCapability } from "@botiverse/oar";
 import type { AgentConfig } from "@botiverse/raft-shared";
 import type { TurnEndContextFacts } from "./turnEndCompaction";
-import { parsePositiveInteger, resolveWakeRecycleConfig, runtimeSessionTranscriptReadable, summaryFactsRuntimesFor, type WarmRecycleStop } from "./wakeSessionRecycle";
+import { parsePositiveInteger, resolveWakeRecycleConfig, runtimeSessionTranscriptReadable, summarySuppliesResumeFacts, type WarmRecycleStop } from "./wakeSessionRecycle";
 
 /** The turn-end compaction gate's sizes (turnEndCompaction.ts): the same sessions, one of the two acts. */
 export const DEFAULT_WARM_RECYCLE_MIN_CONTEXT_TOKENS = 250_000;
@@ -64,12 +65,19 @@ export type WarmRecycleHost = "legacy" | "oar";
 /**
  * Whether the next start can read this runtime's resume facts on this host,
  * so the stop is answered by a recycle: Claude through its transcript (legacy
- * host); on the OAR host the runtimes whose session summary supplies them,
- * while `wake_recycle_oar` is on (`summaryFactsRuntimesFor`). Every other
- * runtime (Pi, Kimi, Built-in, ...) is never marked.
+ * host); on the OAR host a session whose summary supplies them, by OAR's
+ * `contextUsage` declaration for its installation, while `wake_recycle_oar` is
+ * on (`summarySuppliesResumeFacts`; `contextUsage` is read only there). Every
+ * other session (Built-in, Kimi, Pi on its legacy driver, an installation OAR
+ * declares no context size for, such as Qoder's) is never marked.
  */
-export function warmRecycleCoversRuntime(host: WarmRecycleHost, runtime: string, config: Pick<AgentConfig, "wakeRecycleOar">): boolean {
-  return host === "legacy" ? runtimeSessionTranscriptReadable(runtime) : summaryFactsRuntimesFor(config).has(runtime);
+export function warmRecycleCoversRuntime(
+  host: WarmRecycleHost,
+  runtime: string,
+  config: Pick<AgentConfig, "wakeRecycleOar">,
+  contextUsage?: ContextUsageCapability | null,
+): boolean {
+  return host === "legacy" ? runtimeSessionTranscriptReadable(runtime) : summarySuppliesResumeFacts(config, runtime, contextUsage);
 }
 
 /** `quiet`: stopped after the quiet period with no delivery; `ceiling`: stopped at once. */

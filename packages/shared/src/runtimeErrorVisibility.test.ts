@@ -3,10 +3,12 @@ import assert from "node:assert/strict";
 import {
   GENERIC_RUNTIME_ERROR_MESSAGE,
   MAX_SCRUBBED_RUNTIME_ERROR_INPUT_CHARS,
+  MAX_START_FAILURE_MESSAGE_CHARS,
   MAX_VISIBLE_RUNTIME_ERROR_DETAIL_CHARS,
   RUNTIME_ERROR_CODES,
   RUNTIME_ERROR_CODE_SENTENCES,
   boundedRuntimeErrorDetail,
+  boundedStartFailureMessage,
   classifyRuntimeErrorCode,
   isRuntimeErrorCode,
   isRuntimeErrorDetailActivity,
@@ -322,4 +324,63 @@ test("a runtime error detail is an error activity, or a runtime-error / crash de
   assert.equal(isRuntimeErrorDetailActivity({ activity: "online", detailKind: "runtime_error" }), true);
   assert.equal(isRuntimeErrorDetailActivity({ activity: "offline", detailKind: "stopped" }), false);
   assert.equal(isRuntimeErrorDetailActivity({ activity: "working", detailKind: null }), false);
+});
+
+// A failed start's own error text (SpawnFailureActivityDiagnostic.message):
+// what a thrown start error typically names, each shape redacted.
+test("a failed start's message has home paths, API keys and emails redacted", () => {
+  const cases: Array<{ raw: string; secret: string; marker: string }> = [
+    { raw: "spawn failed: C:\\Users\\alice\\AppData\\Roaming\\npm\\claude.cmd not found", secret: "alice", marker: "[REDACTED_PATH]" },
+    { raw: "ENOENT: no such file or directory, open '/home/bob/.kimi-code/config.toml'", secret: "bob", marker: "[REDACTED_PATH]" },
+    { raw: "cannot read /Users/carol/Library/Application Support/x", secret: "carol", marker: "[REDACTED_PATH]" },
+    { raw: "401 Unauthorized: invalid key sk-proj-AbCdEfGh12345678ZyXw", secret: "AbCdEfGh12345678", marker: "[REDACTED_TOKEN]" },
+    { raw: "401: key sk-AbCdEfGh12345678ZyXw rejected", secret: "AbCdEfGh12345678", marker: "[REDACTED_TOKEN]" },
+    { raw: "account dave.smith@example.org is not signed in", secret: "dave.smith@example.org", marker: "[REDACTED_EMAIL]" },
+  ];
+  for (const { raw, secret, marker } of cases) {
+    const message = boundedStartFailureMessage(raw);
+    assert.ok(!message.includes(secret), `${secret} must be gone: ${message}`);
+    assert.ok(message.includes(marker), `${marker} expected: ${message}`);
+  }
+});
+
+test("a failed start's message is capped at 300 characters after scrubbing", () => {
+  assert.equal(MAX_START_FAILURE_MESSAGE_CHARS, 300);
+  // Long home paths shrink to a marker each: the error's words after them are
+  // within the cap once scrubbed, though far past 300 raw characters.
+  const longPath = `/home/erin/${"deep/".repeat(80)}file.ts`;
+  const raw = `failed at ${longPath} with key sk-ant-api03-SECRETSECRET1234 and tail words`;
+  assert.ok(raw.length > 400);
+  const message = boundedStartFailureMessage(raw);
+  assert.equal(message, "failed at [REDACTED_PATH] with key [REDACTED_TOKEN] and tail words");
+  // Over the cap after scrubbing: cut to 300, never showing a secret near the cut.
+  const filler = "x ".repeat(146);
+  const overCap = `${filler}jane.doe@example.com sk-AbCdEfGh12345678ZyXw ${"y".repeat(400)}`;
+  const capped = boundedStartFailureMessage(overCap);
+  assert.equal(capped.length, MAX_START_FAILURE_MESSAGE_CHARS);
+  assert.equal(capped, boundedRuntimeErrorDetail(overCap).slice(0, MAX_START_FAILURE_MESSAGE_CHARS));
+  for (const secret of ["jane", "doe@example", "AbCdEfGh"]) assert.ok(!capped.includes(secret), `${secret} must be gone: ${capped}`);
+  assert.equal(boundedStartFailureMessage(capped), capped, "idempotent");
+  assert.equal(boundedStartFailureMessage("   "), "");
+});
+
+test("Windows profile paths are redacted in any case, with either separator, and through a user name with spaces", () => {
+  const cases: Array<[string, string]> = [
+    ["open c:\\users\\alice\\AppData\\x.json failed", "open [REDACTED_PATH] failed"],
+    ["open C:/Users/alice/AppData/x.json failed", "open [REDACTED_PATH] failed"],
+    ["open D:\\USERS\\bob failed", "open [REDACTED_PATH] failed"],
+    ["open C:\\Users\\John Smith\\AppData\\Roaming\\npm\\codex.cmd failed", "open [REDACTED_PATH] failed"],
+    ["open C:/Users/Mary Ann Lee/.codex/auth.json failed", "open [REDACTED_PATH] failed"],
+  ];
+  for (const [raw, expected] of cases) {
+    assert.equal(scrubRuntimeErrorText(raw), expected, raw);
+    assert.equal(scrubRuntimeErrorText(expected), expected, "idempotent");
+  }
+  for (const secret of ["alice", "bob", "John", "Smith", "Mary", "Lee"]) {
+    assert.ok(!cases.map(([raw]) => scrubRuntimeErrorText(raw)).join(" ").includes(secret), secret);
+  }
+  const started = performance.now();
+  scrubRuntimeErrorText(`C:\\Users\\${"a ".repeat(60_000)}`);
+  scrubRuntimeErrorText("c:/users/".repeat(20_000));
+  assert.ok(performance.now() - started < 1_000);
 });

@@ -26,7 +26,6 @@ export type RuntimeProviderMode = "default" | "custom";
 export type RuntimeConfigBuildErrorCode =
   | "optionSourcesInvalid"
   | "selectValidProvider"
-  | "selectValidProviderConnection"
   | "selectValidProviderModel"
   | "apiKeyRequired"
   | "modelRequired"
@@ -40,7 +39,6 @@ export class RuntimeConfigBuildError extends Error {
     const known =
       codeOrMessage === "optionSourcesInvalid"
       || codeOrMessage === "selectValidProvider"
-      || codeOrMessage === "selectValidProviderConnection"
       || codeOrMessage === "selectValidProviderModel"
       || codeOrMessage === "apiKeyRequired"
       || codeOrMessage === "modelRequired"
@@ -126,6 +124,8 @@ export function buildRuntimeConfig(input: {
   piProviderMode?: PiProviderMode;
   piProviderApiKey?: string;
   fastMode?: boolean;
+  /** #wg-runtime-form:#27: a saved Codex speed tier to keep with fast mode (the server re-checks it). */
+  serviceTier?: string;
   reasoningEffort?: ReasoningEffort | null;
   envVars?: Record<string, string> | null;
   command?: string | null;
@@ -149,7 +149,7 @@ export function buildRuntimeConfig(input: {
     ? customModelName || getDefaultModel(runtime)
     : input.model || getDefaultModel(runtime);
   const mode: RuntimeModeConfig = input.fastMode && runtimeModelSupportsFastMode(runtime, modelId)
-    ? { kind: "fast" }
+    ? { kind: "fast", ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}) }
     : { kind: "default" };
   const runtimeConfig = {
     version: RUNTIME_CONFIG_VERSION,

@@ -37,6 +37,7 @@ import { JointChannelAccessChangedError, lockJointPostingAuthority } from "../li
 import { isMessageShortId, messageIdShortPrefixConditions, UUID_RE } from "../lib/messageId";
 import { createFixedWindowCounter } from "./fixedWindowRateLimit";
 import { logMessageChanged } from "./messageChangeLog";
+import { recordMessageReferences } from "./messageReferences";
 import { buildSearchText } from "./searchTokenizer";
 import type { RaftAuthoredMention } from "./messageService";
 import { recordSlackCardEditIntent } from "./slackCardEditSync";
@@ -493,7 +494,11 @@ export async function applyMessageCardUpdate(input: {
   now?: Date;
 }): Promise<MessageCardUpdateOutcome> {
   const now = input.now ?? currentDate();
-  return getDb().transaction(async (tx) => {
+  // The text this update replaced, for the message's object_references after
+  // the commit (services/messageReferences.ts; typed by assertion: the
+  // transaction's callback sets it, which narrowing doesn't see).
+  let previousContent = null as string | null;
+  const outcome = await getDb().transaction(async (tx): Promise<MessageCardUpdateOutcome> => {
     // Lock order: the Joint posting authority first (the local channel row
     // FOR SHARE, the server and the agent's server membership FOR SHARE, the
     // joint membership lock when that mode is on), then the message row FOR
@@ -523,6 +528,7 @@ export async function applyMessageCardUpdate(input: {
       senderType: messages.senderType,
       senderId: messages.senderId,
       actionMetadata: messages.actionMetadata,
+      content: messages.content,
       deletedAt: messages.deletedAt,
       createdAt: messages.createdAt,
       updatedAt: messages.updatedAt,
@@ -562,6 +568,7 @@ export async function applyMessageCardUpdate(input: {
       .where(and(eq(messages.id, row.id), sql`(${messages.actionMetadata}->>'revision')::int = ${current.revision}`))
       .returning({ id: messages.id });
     if (swapped.length === 0) throw new Error("message card revision moved under its row lock");
+    previousContent = row.content;
     await insertMessageCardRevision(tx, {
       messageId: row.id,
       revision: next.revision,
@@ -581,6 +588,13 @@ export async function applyMessageCardUpdate(input: {
       answer: messageCardUpdateAnswer({ messageId: row.id, revision: next.revision, updatedAt: now, content: input.content }),
     };
   });
+  // The card's text's links to first-party objects (#proj-workspace:#336):
+  // after the commit, never awaited; nothing for text (old and new) without an
+  // address on Raft's hosts.
+  if (outcome.kind === "updated" && !outcome.replayed && previousContent !== null) {
+    recordMessageReferences({ messageId: input.messageId, content: input.content, previousContent });
+  }
+  return outcome;
 }
 
 // ---------------------------------------------------------------------------

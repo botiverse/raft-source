@@ -30,7 +30,9 @@ export interface ArtifactActivityRowParts {
  * its verb from the newest event's kind and why it reached the person: a
  * comment that mentions them, a comment, an edited comment, a new version, a
  * review (S8: several comments at once, counted; one that mentions them says
- * so).
+ * so), a settle or an unsettle (#334: recorded read, it adds no unread), and a
+ * new version that took a settled Artifact back to Working, which says so
+ * (`target.wasSettled`).
  * `actorName` is the actor as core's rosters name them (null: gone, or
  * unknown); `renderName` draws it inside the sentence, so the name can read
  * as a sender and the rest as the message.
@@ -58,7 +60,10 @@ export function artifactActivityRowParts(
     // A review a server doesn't name on the row (before it did) reads as its comments.
     if (latestEvent.eventKind === "comment" || latestEvent.eventKind === "review") return formatMessage({ id: "artifacts.activity.commented" }, { name });
     if (latestEvent.eventKind === "comment_edited") return formatMessage({ id: "artifacts.activity.editedComment" }, { name });
+    if (latestEvent.eventKind === "settled") return formatMessage({ id: "artifacts.activity.settled" }, { name });
+    if (latestEvent.eventKind === "unsettled") return formatMessage({ id: "artifacts.activity.unsettled" }, { name });
     if (latestEvent.eventKind === "version") {
+      if (version !== null && typeof target?.wasSettled === "number") return formatMessage({ id: "artifacts.activity.publishedVersionSinceSettled" }, { name, version });
       return version === null
         ? formatMessage({ id: "artifacts.activity.published" }, { name })
         : formatMessage({ id: "artifacts.activity.publishedVersion" }, { name, version });
@@ -144,17 +149,6 @@ export function artifactActivityNews(item: ObjectInboxItem<"artifact">): Array<{
 }
 
 /**
- * The version an Artifact's Activity row opens at: the one it is about
- * (`target`) when that is not the latest, else null (the latest). The comment
- * it names has no address yet: the viewer opens at the version's top. Core
- * opens it in Activity's main area beside the list (ArtifactActivityViewer).
- */
-export function artifactActivityPinnedVersion(item: ObjectInboxItem<"artifact">): number | null {
-  const { summary, target } = item;
-  return target && summary && target.version !== summary.latestVersion ? target.version : null;
-}
-
-/**
  * The review (S8) the row's newest event posted, as its target names it (`{ id, comments }`):
  * opening the row shows that review's comments. Null for any other event, and for a target
  * without a usable one (the inbox passes targets through as served).
@@ -178,8 +172,13 @@ export function artifactActivityComment(item: ObjectInboxItem<"artifact">): Arti
   return typeof comment === "string" && comment !== "" ? comment : null;
 }
 
-/** What an Artifact's Activity row opens (its id, at artifactActivityPinnedVersion), or null for an id that isn't an Artifact's. */
+/**
+ * What an Artifact's Activity row opens: its latest version, or null for an id that isn't an
+ * Artifact's. Never the version the row's comment was written on (xxchan, #proj-workspace:#329: a
+ * row with a new version and new comments opened at the older version the comment is on); the
+ * comment is found in the list, where one on an earlier version says so.
+ */
 export function artifactActivityTarget(item: ObjectInboxItem<"artifact">): ArtifactLinkTarget | null {
   const parsed = parseArtifactRef(item.objectId);
-  return parsed.kind === "id" && parsed.id === item.objectId ? { id: parsed.id, version: artifactActivityPinnedVersion(item) } : null;
+  return parsed.kind === "id" && parsed.id === item.objectId ? { id: parsed.id, version: null } : null;
 }

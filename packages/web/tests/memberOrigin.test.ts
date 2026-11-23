@@ -6,8 +6,12 @@ import {
   hoverCardRoleLabelId,
   isViewerServerGuest,
   memberOrigin,
+  originServerLogo,
   originServerNames,
 } from "../src/utils/memberOrigin";
+import { jointMemberOrigin } from "../src/features/channel/jointMemberGroups";
+import { channelAgentMentionCandidate, channelHumanMentionCandidate } from "../src/components/message/mentionCandidates";
+import type { ChannelAgent, ChannelHuman } from "../src/hooks/useChannelMembers";
 
 const BOTIVERSE = "server-botiverse";
 const ACME = { id: "server-acme", name: "Acme Corp", slug: "acme" };
@@ -71,6 +75,56 @@ test("a bare server id is named from the conversation's connected servers, else 
 test("a server without a name falls back to its slug", () => {
   const origin = memberOrigin({ serverId: ACME.id, serverName: null, serverSlug: "acme" }, BOTIVERSE);
   assert.equal(originServerNames(origin), "acme");
+});
+
+// Origin logos (#15809): a joint roster person's `servers[].avatarUrl` and a
+// joint channel's `jointServers[].serverAvatarUrl` give the server's logo; the
+// viewer's own joined servers are the fallback; with none it is a plain dot.
+const ACME_LOGO = "/api/avatars/server-acme/logo.webp";
+const JOINED_ACME_LOGO = "/api/avatars/server-acme/joined.webp";
+
+test("origin logo: a roster person's servers[].avatarUrl rides on their origin server", () => {
+  const origin = memberOrigin({ servers: [{ ...ACME, avatarUrl: ACME_LOGO }, { ...LUMEN, avatarUrl: null }], inViewerServer: false }, BOTIVERSE);
+  assert.deepEqual(origin.servers, [{ id: ACME.id, name: ACME.name, avatarUrl: ACME_LOGO }, { id: LUMEN.id, name: LUMEN.name }]);
+  // The same under `roster` (a hover card's member built from a roster row).
+  const card = memberOrigin({ roster: { servers: [{ ...ACME, avatarUrl: ACME_LOGO }], inViewerServer: false } }, BOTIVERSE);
+  assert.equal(card.servers[0]?.avatarUrl, ACME_LOGO);
+});
+
+test("origin logo: a bare home server id takes the joint channel's serverAvatarUrl", () => {
+  const origin = memberOrigin({ serverId: ACME.id }, BOTIVERSE, [{ serverId: ACME.id, serverName: ACME.name, serverAvatarUrl: ACME_LOGO }]);
+  assert.deepEqual(origin.servers, [{ id: ACME.id, name: ACME.name, avatarUrl: ACME_LOGO }]);
+  const pending = memberOrigin({ serverId: ACME.id }, BOTIVERSE, [{ serverId: ACME.id, serverName: ACME.name, serverAvatarUrl: null }]);
+  assert.deepEqual(pending.servers, [{ id: ACME.id, name: ACME.name }], "null sends no logo");
+});
+
+test("origin logo: the row's own logo wins over the channel's", () => {
+  const origin = memberOrigin(
+    { servers: [{ ...ACME, avatarUrl: ACME_LOGO }], inViewerServer: false },
+    BOTIVERSE,
+    [{ serverId: ACME.id, serverName: ACME.name, serverAvatarUrl: "/other.webp" }],
+  );
+  assert.equal(origin.servers[0]?.avatarUrl, ACME_LOGO);
+});
+
+test("originServerLogo: the sent logo wins, null falls back to the viewer's joined servers, unknown is null (a dot)", () => {
+  const joined = [{ id: ACME.id, avatarUrl: JOINED_ACME_LOGO }];
+  assert.equal(originServerLogo({ id: ACME.id, name: ACME.name, avatarUrl: ACME_LOGO }, joined), ACME_LOGO);
+  assert.equal(originServerLogo({ id: ACME.id, name: ACME.name }, joined), JOINED_ACME_LOGO);
+  assert.equal(originServerLogo({ id: ACME.id, name: ACME.name }, [{ id: ACME.id, avatarUrl: null }]), null);
+  assert.equal(originServerLogo({ id: LUMEN.id, name: LUMEN.name }, joined), null);
+  assert.equal(originServerLogo(undefined, joined), null);
+});
+
+test("origin logo: roster rows and @ candidates read the joint channel's servers", () => {
+  const jointServers = [{ serverId: ACME.id, serverName: ACME.name, serverAvatarUrl: ACME_LOGO }];
+  const channel = { type: "joint", serverId: BOTIVERSE, jointServers };
+  assert.equal(jointMemberOrigin({ serverId: ACME.id }, channel).servers[0]?.avatarUrl, ACME_LOGO);
+  const agent = { id: "agent-1", name: "a", displayName: null, avatarUrl: null, serverId: ACME.id, serverName: ACME.name } as ChannelAgent;
+  assert.equal(channelAgentMentionCandidate(agent, BOTIVERSE, channel).origin?.servers[0]?.avatarUrl, ACME_LOGO);
+  const human = { id: "user-1", name: "h", displayName: null, avatarUrl: null, serverId: ACME.id, serverName: ACME.name } as ChannelHuman;
+  assert.equal(channelHumanMentionCandidate(human, BOTIVERSE, channel).origin?.servers[0]?.avatarUrl, ACME_LOGO);
+  assert.equal(channelHumanMentionCandidate(human, BOTIVERSE).origin?.servers[0]?.avatarUrl, undefined);
 });
 
 test("hover card role: people write Owner, Admin and Guest; Member is not written", () => {

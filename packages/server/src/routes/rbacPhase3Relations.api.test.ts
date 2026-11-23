@@ -9,7 +9,7 @@ import { once } from "node:events";
 import WebSocket from "ws";
 import { and, eq } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { agents, machines, serverMembers, servers, users } from "../db/schema";
+import { agents, computers, machines, serverMembers, servers, users } from "../db/schema";
 import { createAgent } from "../services/agentService";
 import { createChannel } from "../services/channelService";
 import { registerMachine } from "../services/machineService";
@@ -164,34 +164,44 @@ for (const how of ["removed", "left"] as const) {
 }
 
 // R03 (Member half): demotion keeps the exact Machine bundle without widening to the collection.
-test("R03: a Machine registrant demoted from Admin to Member keeps managing that exact Machine and gains no other Machine", async ({ app }) => {
+// The one controller rule: only the live attacher keeps personal authority; a raw daemon's registrant has none.
+test("R03: an Admin demoted to Member keeps managing the Computer they attach live, not a raw daemon they registered, and gains no other Machine", async ({ app }) => {
   const ctx = await seedRelation("p3-r03", "admin");
   const own = (await registerMachine(ctx.server.id, ctx.related.id, "p3-r03-own")).machine;
+  const rawDaemon = (await registerMachine(ctx.server.id, ctx.related.id, "p3-r03-raw")).machine;
   const other = (await registerMachine(ctx.server.id, ctx.owner.id, "p3-r03-other")).machine;
+  await attachLive(ctx.server.id, own.id, ctx.related.id);
   await setServerRole(ctx.server.id, ctx.related.id, "member");
   const headers = authHeaders(ctx.relatedToken, ctx.server.id);
   const machinePath = (id: string, suffix = "") => `${app.baseUrl}/api/servers/${ctx.server.id}/machines/${id}${suffix}`;
 
   const patchOwn = await fetch(machinePath(own.id), { method: "PATCH", headers, body: JSON.stringify({ description: "still mine" }) });
-  assert.equal(patchOwn.status, 200, "machine.update via exact registrant relation");
-  const rotated = await fetch(machinePath(own.id, "/rotate-key"), { method: "POST", headers, body: JSON.stringify({}) });
-  assert.equal(rotated.status, 200, "machineKey.rotate on own Machine");
-  assert.ok((await rotated.json() as { apiKey?: string }).apiKey, "rotation returns the new key to the registrant");
+  assert.equal(patchOwn.status, 200, "machine.update as the live attacher");
+
+  assert.equal((await fetch(machinePath(rawDaemon.id), { method: "PATCH", headers, body: JSON.stringify({ description: "registrant only" }) })).status, 403);
+  assert.equal((await fetch(machinePath(rawDaemon.id, "/rotate-key"), { method: "POST", headers, body: JSON.stringify({}) })).status, 403);
+  assert.equal((await fetch(machinePath(rawDaemon.id), { method: "DELETE", headers })).status, 403);
 
   assert.equal((await fetch(machinePath(other.id), { method: "PATCH", headers, body: JSON.stringify({ description: "must not widen" }) })).status, 403);
   assert.equal((await fetch(machinePath(other.id, "/rotate-key"), { method: "POST", headers, body: JSON.stringify({}) })).status, 403);
   assert.equal((await fetch(machinePath(other.id), { method: "DELETE", headers })).status, 403);
   const [otherAfter] = await getDb().select().from(machines).where(eq(machines.id, other.id));
   assert.ok(otherAfter && otherAfter.description !== "must not widen", "denied writes changed nothing");
-
-  assert.equal((await fetch(machinePath(own.id), { method: "DELETE", headers })).status, 200, "machine.remove on own Machine");
 });
+
+async function attachLive(serverId: string, machineId: string, attachedByUserId: string) {
+  await getDb().insert(computers).values({
+    serverId, machineId, name: `live-${machineId.slice(0, 8)}`, apiKeyHash: `unused-${randomUUID()}`,
+    apiKeyPrefix: "sk_computer_test", attachedByUserId,
+  });
+}
 
 // R04 + S11: departure revokes every exact Machine authority; an authorized actor is unaffected.
 for (const how of ["removed", "left"] as const) {
   test(`R04: a Machine registrant who ${how === "removed" ? "is removed from" : "leaves"} the Server loses every exact Machine authority`, async ({ app }) => {
     const ctx = await seedRelation(`p3-r04-${how}`, "member");
     const machine = (await registerMachine(ctx.server.id, ctx.related.id, `p3-r04-${how}`)).machine;
+    await attachLive(ctx.server.id, machine.id, ctx.related.id);
     const staleHeaders = authHeaders(ctx.relatedToken, ctx.server.id);
     const machinePath = (suffix = "") => `${app.baseUrl}/api/servers/${ctx.server.id}/machines/${machine.id}${suffix}`;
 

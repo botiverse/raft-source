@@ -85,3 +85,20 @@ test("a push refused while it is the announcement: the Server's sentence and a c
   });
   assert.equal(formatArtifactError("CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN", { publishing: true, details: { channel: "#ops" } }, "tool").nextAction, "Ask one of them to push it, or push your change as a new artifact homed in #ops.");
 });
+
+test("#460: a push refused as the announcement of a shared channel the pusher's server has no copy of names no channel and no --target", async () => {
+  const { formatArtifactError } = await import("./artifacts");
+  const message = "This artifact is the announcement of a shared channel your server has no copy of, so you can't push a new version. Nothing was pushed.";
+  assert.deepEqual(formatArtifactError("CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN_ELSEWHERE", { publishing: true, details: { title: "Ops rules" } }), {
+    message,
+    nextAction: `Copy this folder to a new directory and push that: raft artifact push <new dir> --target "#channel-name" --title "Ops rules". Only an admin of that shared channel on a server that still has a copy can push this one; tell whoever asked for the change.`,
+  });
+  assert.deepEqual(formatArtifactError("CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN_ELSEWHERE", { publishing: true, details: { title: "Ops rules" } }, "tool"), {
+    message,
+    nextAction: "Push your change as a new artifact homed in a conversation on your server. Only an admin of that shared channel on a server that still has a copy can push this one; tell whoever asked for the change.",
+  });
+  // A title a command can't quote as it is, or none: the placeholder.
+  for (const details of [{ title: 'Say "hi"' }, { title: "$HOME" }, {}]) {
+    assert.match(formatArtifactError("CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN_ELSEWHERE", { publishing: true, details })!.nextAction, /--title "<title>"\./);
+  }
+});

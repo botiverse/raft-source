@@ -81,9 +81,35 @@ export class IdleTaskReminderRuntime {
    * with `freshSession` was delivered, or the Server said there is nothing to
    * list. Until then every ask of a new session says `freshSession` (a capped
    * or undelivered one records nothing for it). Process-local: after a daemon
-   * restart the agent's session is resumed, which is never fresh.
+   * restart the agent's session is resumed, which is never fresh by itself
+   * (a later compaction is: `freshContextDone`).
    */
   private readonly freshSessionDone = new Map<string, string>();
+  /**
+   * Per agent, the model context (`contextId`, RFC 072) that needs no first
+   * full listing: the one an ask with `freshSession` settled in (recorded
+   * under the same conditions as `freshSessionDone`), or, for a session not
+   * owed a listing, the first context this process saw it in. A compaction
+   * gives the session a new id and drops what the model held of earlier
+   * reminders, so the first edge in a context other than this one asks with
+   * `freshSession` too, even in a resumed session.
+   *
+   * Only a CHANGE of context seen within this process counts. After a daemon
+   * restart this map is empty, and a resumed session reuses its context id
+   * (the agent-level sessions table), so taking an unknown id as "new" would
+   * list every agent's tasks on every daemon restart. Its first observed id is
+   * the baseline instead. The cost: a compaction that happened while no daemon
+   * watched goes unlisted until the next one, as before this map existed.
+   * The baseline is the first idle edge's context, not the spawn's (this
+   * runtime only sees idle edges), so a compaction inside a resumed launch's
+   * first turn is missed the same way. A null id (a runtime that does not
+   * report compaction) never counts.
+   *
+   * The Server is only told `freshSession`, so it labels the listing's items
+   * `new session` after a compaction too: loose wording, but the model's
+   * context is new either way.
+   */
+  private readonly freshContextDone = new Map<string, string>();
   /**
    * Per agent, the model context that got a notice with the rule blocks
    * (#wg-ax:#32). Asks in that context say `rulesShown`; a new session,
@@ -128,10 +154,16 @@ export class IdleTaskReminderRuntime {
       return;
     }
     const sessionKey = facts.sessionId ?? `launch:${facts.launchId ?? ""}`;
-    const freshSession = !facts.resumed && this.freshSessionDone.get(agentId) !== sessionKey;
+    const contextId = facts.contextId ?? null;
+    const sessionFresh = !facts.resumed && this.freshSessionDone.get(agentId) !== sessionKey;
+    const settledContext = this.freshContextDone.get(agentId);
+    // The baseline (see freshContextDone): a session not owed a listing is
+    // listed again only once its context changes from the one first seen here.
+    if (contextId !== null && settledContext === undefined && !sessionFresh) this.freshContextDone.set(agentId, contextId);
+    const contextFresh = contextId !== null && settledContext !== undefined && settledContext !== contextId;
+    const freshSession = sessionFresh || contextFresh;
     const backgroundTasks = Math.max(0, Math.min(BACKGROUND_TASKS_MAX, Math.floor(facts.backgroundTasks) || 0));
     this.inFlight.add(agentId);
-    const contextId = facts.contextId ?? null;
     const rulesShown = contextId !== null && this.rulesShownIn.get(agentId) === contextId;
     const run = this.run(agentId, facts, sessionKey, freshSession, backgroundTasks, contextId, rulesShown)
       .catch(() => {
@@ -161,6 +193,7 @@ export class IdleTaskReminderRuntime {
   clear(): void {
     this.capable = false;
     this.freshSessionDone.clear();
+    this.freshContextDone.clear();
     this.rulesShownIn.clear();
   }
 
@@ -203,6 +236,7 @@ export class IdleTaskReminderRuntime {
     }
     if (freshSession && (delivered === "written" || FRESH_SESSION_SETTLED_SKIP_REASONS.has(response.reason ?? ""))) {
       this.freshSessionDone.set(agentId, sessionKey);
+      if (contextId !== null) this.freshContextDone.set(agentId, contextId);
     }
     // Only a written notice that carried the rules puts them into the context.
     if (delivered === "written" && response.rules === true && contextId !== null) this.rulesShownIn.set(agentId, contextId);

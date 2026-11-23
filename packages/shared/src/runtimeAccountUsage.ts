@@ -41,6 +41,74 @@ export function runtimeAccountUsageReadableWith(provider: RuntimeAccountUsagePro
   return false;
 }
 
+/**
+ * The providers whose usage a Computer also reads per agent account folder
+ * (`accountHomes` on a refresh), and the env var that names that folder. An
+ * agent's `HOME` moves the folder too (`~/.codex`, `~/.claude`).
+ */
+export const RUNTIME_ACCOUNT_USAGE_FOLDER_ENV = {
+  codex: "CODEX_HOME",
+  claude: "CLAUDE_CONFIG_DIR",
+} as const satisfies Partial<Record<RuntimeAccountUsageProvider, string>>;
+export type RuntimeAccountUsageFolderProvider = keyof typeof RUNTIME_ACCOUNT_USAGE_FOLDER_ENV;
+export function isRuntimeAccountUsageFolderProvider(value: unknown): value is RuntimeAccountUsageFolderProvider {
+  return value === "codex" || value === "claude";
+}
+
+/** The env var that gives such an agent a key instead of a signed-in account: it has no account folder to read. */
+export const RUNTIME_ACCOUNT_USAGE_API_KEY_ENV = {
+  codex: "OPENAI_API_KEY",
+  claude: "ANTHROPIC_AUTH_TOKEN",
+} as const satisfies Record<RuntimeAccountUsageFolderProvider, string>;
+
+/** The env var names an `accountHomes` entry may carry for a provider: `HOME` and its folder key, nothing else. */
+export function runtimeAccountUsageFolderEnvNames(provider: RuntimeAccountUsageFolderProvider): readonly [string, string] {
+  return ["HOME", RUNTIME_ACCOUNT_USAGE_FOLDER_ENV[provider]];
+}
+
+/** The most `accountHomes` entries one refresh carries (agents with the same folder env share one). */
+export const RUNTIME_ACCOUNT_USAGE_ACCOUNT_HOMES_MAX = 64;
+const ACCOUNT_HOME_ENV_VALUE_MAX = 4096;
+
+/**
+ * One account folder the server asks a Computer to read on a refresh: the
+ * agents (on that Computer, on this provider, on its default provider and
+ * without an API key) whose env vars set `HOME` or the folder key, and those
+ * env vars as the agents set them (only those two names).
+ */
+export type RuntimeAccountUsageAccountHome = {
+  agentIds: string[];
+  env: Record<string, string>;
+};
+
+/**
+ * A refresh's `accountHomes` as the Computer may use it: only for a folder
+ * provider, entries with valid agent ids and at least one allowed env var
+ * (anything else dropped), at most RUNTIME_ACCOUNT_USAGE_ACCOUNT_HOMES_MAX.
+ * Undefined when the message carries none (an older server), so the read
+ * stays exactly as before.
+ */
+export function parseRuntimeAccountUsageAccountHomes(provider: RuntimeAccountUsageProvider, value: unknown): RuntimeAccountUsageAccountHome[] | undefined {
+  if (!isRuntimeAccountUsageFolderProvider(provider) || !Array.isArray(value)) return undefined;
+  const names = runtimeAccountUsageFolderEnvNames(provider);
+  const homes: RuntimeAccountUsageAccountHome[] = [];
+  for (const entry of value.slice(0, RUNTIME_ACCOUNT_USAGE_ACCOUNT_HOMES_MAX)) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const { agentIds, env } = entry as { agentIds?: unknown; env?: unknown };
+    if (!Array.isArray(agentIds) || typeof env !== "object" || env === null) continue;
+    const ids = [...new Set(agentIds.filter((id): id is string => runtimeAccountUsageAgentIdSchema.safeParse(id).success))].slice(0, RUNTIME_ACCOUNT_USAGE_AGENT_IDS_MAX);
+    if (ids.length === 0) continue;
+    const kept: Record<string, string> = {};
+    for (const name of names) {
+      const raw = (env as Record<string, unknown>)[name];
+      if (typeof raw === "string" && raw.trim().length > 0 && raw.length <= ACCOUNT_HOME_ENV_VALUE_MAX && !raw.includes("\u0000")) kept[name] = raw;
+    }
+    if (Object.keys(kept).length === 0) continue;
+    homes.push({ agentIds: ids, env: kept });
+  }
+  return homes;
+}
+
 export const RUNTIME_ACCOUNT_USAGE_HEALTHS = [
   "ok",
   "rate_limited",
@@ -49,6 +117,40 @@ export const RUNTIME_ACCOUNT_USAGE_HEALTHS = [
   "error",
 ] as const;
 export type RuntimeAccountUsageHealth = (typeof RUNTIME_ACCOUNT_USAGE_HEALTHS)[number];
+
+/**
+ * Why an `unsupported` account has no usage reading: OAR's
+ * `AccountUsageUnsupportedReason` (its docs/spec/account-usage.md), the codes
+ * Raft knows. `quota_unavailable`: the account reports no usage limits (a
+ * Claude API key, a Kimi account with no quota data); `version_unsupported`:
+ * the CLI is too old to report it; the rest say why this installation or
+ * sign-in cannot be read. A code Raft does not know is left out, which reads
+ * as a plain `unsupported`.
+ */
+export const RUNTIME_ACCOUNT_USAGE_UNSUPPORTED_REASONS = [
+  "version_unsupported",
+  "capability_unavailable",
+  "unsupported_installation",
+  "unsupported_auth_mode",
+  "unsupported_auth_storage",
+  "auth_configuration_unavailable",
+  "endpoint_unavailable",
+  "quota_unavailable",
+] as const;
+export type RuntimeAccountUsageUnsupportedReason = (typeof RUNTIME_ACCOUNT_USAGE_UNSUPPORTED_REASONS)[number];
+
+export function isRuntimeAccountUsageUnsupportedReason(value: unknown): value is RuntimeAccountUsageUnsupportedReason {
+  return typeof value === "string" && (RUNTIME_ACCOUNT_USAGE_UNSUPPORTED_REASONS as readonly string[]).includes(value);
+}
+
+/**
+ * `parseErrorCode` of an account whose usage could not be read this time but
+ * will be on a later read (OAR `{ kind: "unavailable" }`: Kimi's access token
+ * expired and waits for Kimi Code to refresh it). Carried as one
+ * `parse_unavailable` window under `ok` health, a shape every server already
+ * accepts; the web says "temporarily unavailable" instead of an error.
+ */
+export const RUNTIME_ACCOUNT_USAGE_TEMPORARILY_UNAVAILABLE_CODE = "usage_temporarily_unavailable";
 
 export const RUNTIME_ACCOUNT_USAGE_WINDOW_STATUSES = [
   "ok",
@@ -171,6 +273,20 @@ export const runtimeAccountUsageWindowSchema = lazySchema("runtimeAccountUsageWi
   }
 }));
 
+/** The most agent ids one account of a snapshot lists (`agentIds`). */
+export const RUNTIME_ACCOUNT_USAGE_AGENT_IDS_MAX = 500;
+/** The most accounts one snapshot carries: the default account and up to seven agents' own folders. */
+export const RUNTIME_ACCOUNT_USAGE_ACCOUNTS_MAX = 8;
+const runtimeAccountUsageAgentIdSchema = lazySchema("runtimeAccountUsageAgentIdSchema", () => z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/));
+
+/** A credits balance as the runtime prints it: digits with `.` or `,`, an optional leading `-`. */
+export const RUNTIME_ACCOUNT_USAGE_CREDITS_BALANCE_PATTERN = /^-?[0-9][0-9.,]{0,31}$/;
+export const runtimeAccountUsageCreditsSchema = lazySchema("runtimeAccountUsageCreditsSchema", () => z.strictObject({
+  available: z.boolean(),
+  unlimited: z.boolean().optional(),
+  balance: z.string().regex(RUNTIME_ACCOUNT_USAGE_CREDITS_BALANCE_PATTERN).optional(),
+}));
+
 export const runtimeAccountUsageAccountSchema = lazySchema("runtimeAccountUsageAccountSchema", () => z.strictObject({
   accountKey: z.string().regex(/^[a-f0-9]{64}$/),
   maskedLabel: maskedLabelSchema.optional(),
@@ -181,6 +297,16 @@ export const runtimeAccountUsageAccountSchema = lazySchema("runtimeAccountUsageA
   displayName: safeLabelSchema.optional(),
   health: z.enum(RUNTIME_ACCOUNT_USAGE_HEALTHS),
   /**
+   * Why an `unsupported` account has no reading
+   * (RUNTIME_ACCOUNT_USAGE_UNSUPPORTED_REASONS); only with that health. Absent:
+   * the runtime gave no reason, or the Computer predates it. A Computer sends
+   * it only to a server that advertises
+   * SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_UNSUPPORTED_REASON_V1; the server
+   * serves it only to a web request declaring
+   * RUNTIME_USAGE_UNSUPPORTED_REASON_CLIENT_CAPABILITY.
+   */
+  unsupportedReason: z.enum(RUNTIME_ACCOUNT_USAGE_UNSUPPORTED_REASONS).optional(),
+  /**
    * How many limit resets the account holds (Codex: OAR's
    * `limitResets.available`); absent when the runtime reports none or the
    * Computer predates it. A Computer sends it only to a server that
@@ -188,11 +314,34 @@ export const runtimeAccountUsageAccountSchema = lazySchema("runtimeAccountUsageA
    * older server's strict parse would refuse the whole snapshot.
    */
   limitResetsAvailable: z.number().int().min(0).max(RUNTIME_LIMIT_RESETS_AVAILABLE_MAX).optional(),
+  /**
+   * Extra usage credits (Codex: OAR's `credits`), which keep the account
+   * running after a window is used up. `balance` is the runtime's own string,
+   * with no unit or currency. Absent: unknown (the runtime did not say, or
+   * the Computer predates it). A Computer sends it only to a server that
+   * advertises SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_CREDITS_V1; the
+   * server serves it only to a web request declaring
+   * RUNTIME_USAGE_CREDITS_CLIENT_CAPABILITY.
+   */
+  credits: runtimeAccountUsageCreditsSchema.optional(),
   parseErrorCode: z.string().regex(/^[a-z0-9][a-z0-9_.-]{0,63}$/).optional(),
   windows: z.array(runtimeAccountUsageWindowSchema).max(12),
+  /**
+   * The agents whose own account folder (an agent env var setting `HOME` or
+   * the runtime's folder key: `CODEX_HOME`, `CLAUDE_CONFIG_DIR`) this account
+   * was read from. Absent: the Computer's default account, read in the
+   * daemon's own environment. A Computer sends it only in answer to a refresh
+   * that carried `accountHomes` (a server that knows the field); the server
+   * serves it only to a web request declaring
+   * RUNTIME_USAGE_ACCOUNT_FOLDERS_CLIENT_CAPABILITY.
+   */
+  agentIds: z.array(runtimeAccountUsageAgentIdSchema).min(1).max(RUNTIME_ACCOUNT_USAGE_AGENT_IDS_MAX).optional(),
 }).superRefine((account, ctx) => {
   if (account.health === "unsupported" && account.windows.length > 0) {
     ctx.addIssue({ code: "custom", message: "unsupported accounts cannot include usage windows" });
+  }
+  if (account.unsupportedReason !== undefined && account.health !== "unsupported") {
+    ctx.addIssue({ code: "custom", message: "unsupportedReason requires unsupported health" });
   }
   if (account.parseErrorCode && !account.windows.some((window) => window.status === "parse_unavailable")) {
     ctx.addIssue({ code: "custom", message: "parseErrorCode requires a parse_unavailable window" });
@@ -206,7 +355,7 @@ export const runtimeAccountUsageSnapshotSchema = lazySchema("runtimeAccountUsage
   staleAfter: isoInstantSchema,
   collectorVersion: z.string().trim().min(1).max(40),
   sourceVersion: z.string().trim().min(1).max(80).optional(),
-  accounts: z.array(runtimeAccountUsageAccountSchema).min(1).max(8),
+  accounts: z.array(runtimeAccountUsageAccountSchema).min(1).max(RUNTIME_ACCOUNT_USAGE_ACCOUNTS_MAX),
 }).superRefine((snapshot, ctx) => {
   const collectedAtMs = Date.parse(snapshot.collectedAt);
   const staleAfterMs = Date.parse(snapshot.staleAfter);
@@ -253,6 +402,33 @@ export function withoutLimitResets(snapshot: RuntimeAccountUsageSnapshot): Runti
   return {
     ...snapshot,
     accounts: snapshot.accounts.map(({ limitResetsAvailable: _dropped, ...account }) => account),
+  };
+}
+
+/**
+ * Drops every account's `credits`, for a reader that predates them (a server
+ * without SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_CREDITS_V1, a web client
+ * without RUNTIME_USAGE_CREDITS_CLIENT_CAPABILITY).
+ */
+export function withoutCredits(snapshot: RuntimeAccountUsageSnapshot): RuntimeAccountUsageSnapshot {
+  if (!snapshot.accounts.some((account) => account.credits !== undefined)) return snapshot;
+  return {
+    ...snapshot,
+    accounts: snapshot.accounts.map(({ credits: _dropped, ...account }) => account),
+  };
+}
+
+/**
+ * Drops every account's `unsupportedReason`, for a reader that predates it (a
+ * server without SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_UNSUPPORTED_REASON_V1,
+ * a web client without RUNTIME_USAGE_UNSUPPORTED_REASON_CLIENT_CAPABILITY).
+ * The account then reads as a plain `unsupported`, as before.
+ */
+export function withoutUnsupportedReasons(snapshot: RuntimeAccountUsageSnapshot): RuntimeAccountUsageSnapshot {
+  if (!snapshot.accounts.some((account) => account.unsupportedReason !== undefined)) return snapshot;
+  return {
+    ...snapshot,
+    accounts: snapshot.accounts.map(({ unsupportedReason: _dropped, ...account }) => account),
   };
 }
 
@@ -312,14 +488,103 @@ export function runtimeUsageWindowScopeClientVersion(raw: unknown): number {
 }
 
 /**
+ * A web client's declaration, in its `X-Raft-Client-Capabilities` request
+ * header, that its snapshot parser reads an account's `agentIds` (an agent's
+ * own account folder). Older bundles parse snapshots strictly, so the server
+ * drops `agentIds` for a request without it (`runtimeAccountUsageSnapshotForClient`);
+ * such a bundle then shows every account as before.
+ */
+export const RUNTIME_USAGE_ACCOUNT_FOLDERS_CLIENT_CAPABILITY = "runtime-usage-account-folders@1";
+
+/**
+ * A web client's declaration, in its `X-Raft-Client-Capabilities` request
+ * header, that its snapshot parser reads an account's `credits`. Older
+ * bundles parse snapshots strictly, so the server drops `credits` for a
+ * request without it (`runtimeAccountUsageSnapshotForClient`).
+ */
+export const RUNTIME_USAGE_CREDITS_CLIENT_CAPABILITY = "runtime-usage-credits@1";
+
+/**
+ * A web client's declaration, in its `X-Raft-Client-Capabilities` request
+ * header, that its snapshot parser reads an account's `unsupportedReason`.
+ * Older bundles parse snapshots strictly, so the server drops it for a
+ * request without it (`runtimeAccountUsageSnapshotForClient`).
+ */
+export const RUNTIME_USAGE_UNSUPPORTED_REASON_CLIENT_CAPABILITY = "runtime-usage-unsupported-reason@1";
+
+function declaresClientCapability(raw: unknown, token: string): boolean {
+  return typeof raw === "string" && raw.split(",").some((value) => value.trim() === token);
+}
+
+/** Drops every account's `agentIds`, for a reader that predates them. */
+export function withoutAccountAgentIds(snapshot: RuntimeAccountUsageSnapshot): RuntimeAccountUsageSnapshot {
+  if (!snapshot.accounts.some((account) => account.agentIds !== undefined)) return snapshot;
+  return {
+    ...snapshot,
+    accounts: snapshot.accounts.map(({ agentIds: _dropped, ...account }) => account),
+  };
+}
+
+/**
+ * A snapshot without the agents a viewer may not find (a personal assistant
+ * is found only by its owner): their ids leave every account's `agentIds`,
+ * and an account left with none is dropped rather than kept without
+ * `agentIds`, which would read as the Computer's default account. The
+ * default account (no `agentIds`) always stays, so a snapshot keeps at least
+ * one account.
+ */
+export function withoutHiddenAccountAgentIds(snapshot: RuntimeAccountUsageSnapshot, hidden: ReadonlySet<string>): RuntimeAccountUsageSnapshot {
+  if (hidden.size === 0 || !snapshot.accounts.some((account) => account.agentIds?.some((id) => hidden.has(id)))) return snapshot;
+  const accounts = snapshot.accounts.flatMap((account): RuntimeAccountUsageAccount[] => {
+    if (!account.agentIds) return [account];
+    const agentIds = account.agentIds.filter((id) => !hidden.has(id));
+    return agentIds.length > 0 ? [{ ...account, agentIds }] : [];
+  });
+  return { ...snapshot, accounts };
+}
+
+/**
  * A snapshot in the shape this client reads: no window scopes unless its
  * request declared it reads them, and no `models` scope for a client that
- * declared only `@1`.
+ * declared only `@1`; no account `agentIds` unless it declared
+ * RUNTIME_USAGE_ACCOUNT_FOLDERS_CLIENT_CAPABILITY; no `credits` unless it
+ * declared RUNTIME_USAGE_CREDITS_CLIENT_CAPABILITY; no `unsupportedReason`
+ * unless it declared RUNTIME_USAGE_UNSUPPORTED_REASON_CLIENT_CAPABILITY.
  */
 export function runtimeAccountUsageSnapshotForClient(snapshot: RuntimeAccountUsageSnapshot, capabilitiesHeader: unknown): RuntimeAccountUsageSnapshot {
+  const withReasons = declaresClientCapability(capabilitiesHeader, RUNTIME_USAGE_UNSUPPORTED_REASON_CLIENT_CAPABILITY) ? snapshot : withoutUnsupportedReasons(snapshot);
+  const withCredits = declaresClientCapability(capabilitiesHeader, RUNTIME_USAGE_CREDITS_CLIENT_CAPABILITY) ? withReasons : withoutCredits(withReasons);
+  const withFolders = declaresClientCapability(capabilitiesHeader, RUNTIME_USAGE_ACCOUNT_FOLDERS_CLIENT_CAPABILITY) ? withCredits : withoutAccountAgentIds(withCredits);
   const version = runtimeUsageWindowScopeClientVersion(capabilitiesHeader);
-  if (version >= 2) return snapshot;
-  return version === 1 ? withoutModelsScopes(snapshot) : withoutWindowScopes(snapshot);
+  if (version >= 2) return withFolders;
+  return version === 1 ? withoutModelsScopes(withFolders) : withoutWindowScopes(withFolders);
+}
+
+/**
+ * The Computer's default account in a snapshot: the one read in the daemon's
+ * own environment (the first account without `agentIds`), else the first
+ * account. What every Computer-level single-account reading uses (plan line,
+ * limit resets, the 5-hour limit).
+ */
+export function defaultRuntimeUsageAccount(snapshot: RuntimeAccountUsageSnapshot | null | undefined): RuntimeAccountUsageAccount | null {
+  if (!snapshot) return null;
+  return snapshot.accounts.find((account) => account.agentIds === undefined) ?? snapshot.accounts[0] ?? null;
+}
+
+/**
+ * The accounts an agent's usage reads from a snapshot of its Computer: the
+ * account read from the agent's own folder (its id in `agentIds`), else the
+ * default accounts (those without `agentIds`). An agent with its own folder
+ * never sees the default account's numbers, nor another folder's. A snapshot
+ * where no account lists agents (an older Computer, or no agent with its own
+ * folder) reads as before: every account.
+ */
+export function runtimeUsageAccountsForAgent(snapshot: RuntimeAccountUsageSnapshot | null | undefined, agentId: string | null | undefined): RuntimeAccountUsageAccount[] {
+  if (!snapshot) return [];
+  if (!snapshot.accounts.some((account) => account.agentIds !== undefined)) return snapshot.accounts;
+  const own = agentId ? snapshot.accounts.find((account) => account.agentIds?.includes(agentId)) : undefined;
+  if (own) return [own];
+  return snapshot.accounts.filter((account) => account.agentIds === undefined);
 }
 
 /**
@@ -532,6 +797,13 @@ export const RUNTIME_LIMIT_RESET_REAUTH_REASONS = ["not_authenticated", "credent
  * was busy with other requests or ran out of time before confirming; the same
  * click may be tried again. A Computer sends those only in answer to a request
  * that named a `kind` (or a read), which an older server never sends.
+ * `onboarding_required`: Claude Code stopped at a first-run page OAR does not
+ * complete on its own (OAR 0.114 completes Claude Code 2.1.322's theme and
+ * Security notes pages; any other is this), so nothing was spent; opening
+ * Claude Code once on that Computer finishes it. A Computer sends it only to
+ * a request that carries `onboardingRequiredReason`, which the server sets
+ * only for a web page that said it reads this (an older server or page reads
+ * only `not_attempted` there).
  */
 export const RUNTIME_LIMIT_RESET_UNSUPPORTED_REASONS = [
   "capability_unavailable",
@@ -545,6 +817,7 @@ export const RUNTIME_LIMIT_RESET_UNSUPPORTED_REASONS = [
   "unsupported_version",
   "unsupported_platform",
   "not_attempted",
+  "onboarding_required",
 ] as const;
 
 /**
@@ -629,7 +902,8 @@ export type ClaudeFiveHourLimit = "at_limit" | "not_at_limit" | "unknown";
 export const CLAUDE_FIVE_HOUR_WINDOW_LABEL = "Current session";
 
 /**
- * The 5-hour limit from a Claude usage snapshot. Only one account with
+ * The 5-hour limit from a Claude usage snapshot. Only one default account (no
+ * `agentIds`) with
  * measured windows (health `ok`, or `rate_limited`, which is how OAR reports
  * an account at one of its limits) and one readable "Current session" window
  * counts as an answer; anything else is `unknown`. Read by
@@ -638,8 +912,11 @@ export const CLAUDE_FIVE_HOUR_WINDOW_LABEL = "Current session";
  * before a Claude limit-reset command, decides what is typed.
  */
 export function claudeFiveHourLimitOf(snapshot: RuntimeAccountUsageSnapshot | null | undefined): ClaudeFiveHourLimit {
-  if (snapshot?.provider !== "claude" || snapshot.accounts.length !== 1) return "unknown";
-  const account = snapshot.accounts[0]!;
+  if (snapshot?.provider !== "claude") return "unknown";
+  // Limit resets act on the default account only: agents' own folders (`agentIds`) are not it.
+  const defaults = snapshot.accounts.filter((candidate) => candidate.agentIds === undefined);
+  if (defaults.length !== 1) return "unknown";
+  const account = defaults[0]!;
   if (account.health !== "ok" && account.health !== "rate_limited") return "unknown";
   const windows = account.windows.filter((window) => window.label === CLAUDE_FIVE_HOUR_WINDOW_LABEL);
   if (windows.length !== 1) return "unknown";

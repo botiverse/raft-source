@@ -29,7 +29,7 @@ import type { SignInSecondFactorMethod } from "../auth/secondFactorSignIn";
 import { secondFactorFailureOf } from "./secondFactorApi";
 
 /** What the dialog says the step-up is for (its description). */
-export type StepUpReason = "signInMethod" | "agentKey" | "appAccess" | "agentAccess" | "secret" | "actionCard" | "signOutDevice" | "other";
+export type StepUpReason = "signInMethod" | "agentKey" | "appAccess" | "agentAccess" | "secret" | "actionCard" | "signOutDevice" | "dataExport" | "other";
 
 export class SecondFactorStepUpCancelled extends Error {
   constructor() {

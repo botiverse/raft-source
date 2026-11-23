@@ -1,6 +1,9 @@
 import {
   inferClaudeUsageWindowScopes,
   RAFT_CLIENT_CAPABILITIES_HEADER,
+  RUNTIME_USAGE_ACCOUNT_FOLDERS_CLIENT_CAPABILITY,
+  RUNTIME_USAGE_CREDITS_CLIENT_CAPABILITY,
+  RUNTIME_USAGE_UNSUPPORTED_REASON_CLIENT_CAPABILITY,
   RUNTIME_USAGE_WINDOW_SCOPE_CLIENT_CAPABILITY,
   safeParseRuntimeAccountUsageSnapshot,
 } from "@botiverse/raft-shared";
@@ -14,12 +17,13 @@ export const RUNTIME_ACCOUNT_USAGE_CLIENT_CACHE_MS = 60_000;
 
 /**
  * What this build declares on the requests that answer with a usage
- * snapshot (read, refresh, limit reset): its parser reads a window's `scope`.
- * The server strips `scope` for a request without it, so an older bundle's
+ * snapshot (read, refresh, limit reset): its parser reads a window's `scope`,
+ * an account's `agentIds` (agents' own account folders) and its `credits`.
+ * The server strips each for a request without it, so an older bundle's
  * strict parse never drops the snapshot.
  */
 export const RUNTIME_USAGE_REQUEST_HEADERS: Readonly<Record<string, string>> = {
-  [RAFT_CLIENT_CAPABILITIES_HEADER]: RUNTIME_USAGE_WINDOW_SCOPE_CLIENT_CAPABILITY,
+  [RAFT_CLIENT_CAPABILITIES_HEADER]: `${RUNTIME_USAGE_WINDOW_SCOPE_CLIENT_CAPABILITY},${RUNTIME_USAGE_ACCOUNT_FOLDERS_CLIENT_CAPABILITY},${RUNTIME_USAGE_CREDITS_CLIENT_CAPABILITY},${RUNTIME_USAGE_UNSUPPORTED_REASON_CLIENT_CAPABILITY}`,
 };
 export const RUNTIME_ACCOUNT_USAGE_CLIENT_REFRESH_COOLDOWN_MS = 120_000;
 

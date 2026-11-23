@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { BasicTracer, KIMI_SDK_FORM_DEFINITION_REF, MemoryTraceSink, type RuntimeModelSourceOutcome } from "@botiverse/raft-shared";
+import { BasicTracer, MemoryTraceSink, type RuntimeModelSourceOutcome } from "@botiverse/raft-shared";
 import { afterAll, vi } from "vitest";
 
 import { getDb } from "../db/index";
@@ -260,15 +260,6 @@ test("front replica: a failed replay answers these reads from the shared cache, 
     const v2 = await v2Res.json() as Record<string, unknown> & { options: Array<{ value: string }> };
     assert.deepEqual([v2.status, v2.reason, v2.state], ["fallback", "probe_timeout", "stale"]);
     assert.deepEqual(v2.options.map((option) => option.value), ["gpt-5.4"]);
-
-    // v1 clients get a usable list: here nothing is cached, so Kimi's managed default.
-    const v1Res = await fetch(
-      `${base}/runtime-form-definitions/kimi-sdk/option-sources/model?schemaVersion=${KIMI_SDK_FORM_DEFINITION_REF.schemaVersion}`,
-      { headers },
-    );
-    assert.equal(v1Res.status, 200);
-    const v1 = await v1Res.json() as Record<string, unknown>;
-    assert.equal("status" in v1 || "state" in v1, false, "v1 bodies keep their shape");
 
     const skillsRes = await fetch(`${app.baseUrl}/api/agents/${agent.id}/skills`, { headers });
     assert.equal(skillsRes.status, 200);

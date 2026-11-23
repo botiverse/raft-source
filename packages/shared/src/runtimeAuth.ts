@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { lazySchema } from "./lazySchema";
+import { runtimeUpdateCheckSchema, type RuntimeUpdateCheck } from "./runtimeUpgrade";
 
 /**
  * Runtime account login and logout from the web (task #17, contract in
@@ -16,13 +17,15 @@ import { lazySchema } from "./lazySchema";
  * Runtimes whose sign-in Raft shows and drives from the web: the OAR runtimes
  * with a login, and Qwen Code, which has a provider key instead. These are
  * OAR's ids, not Raft's runtime ids (`runtimeAuthRuntimeFor` maps one to the
- * other). Antigravity is offered only where the server revives it
- * (`RUNTIME_AUTH_SERVER_GATED_RUNTIMES`). Pi signs in per model provider
- * (`RUNTIME_AUTH_PER_PROVIDER_RUNTIMES`). Grok Build signs in with its own
- * device code (OAR 0.99 `grok login --device-auth`). OpenCode 2 signs in per
- * provider too, through its own server (OAR 0.100 `createOpencodeProviderAuth`).
+ * other). Pi signs in per model provider (`RUNTIME_AUTH_PER_PROVIDER_RUNTIMES`).
+ * Grok Build signs in with its own device code (OAR 0.99 `grok login
+ * --device-auth`). OpenCode 2 signs in per provider too, through its own
+ * server (OAR 0.100 `createOpencodeProviderAuth`). DeepSeek Harness (`dsh`)
+ * has no sign-in at all (OAR has none for it: its DeepSeek key is configured
+ * in dsh itself): it is here for its card's status (installed, too old) and
+ * Install, with no action (`runtimeAuthStatusOnly`).
  */
-export const RUNTIME_AUTH_RUNTIMES = ["claude", "codex", "kimi", "qoder", "qwen", "antigravity", "pi", "grok", "opencode"] as const;
+export const RUNTIME_AUTH_RUNTIMES = ["claude", "codex", "kimi", "qoder", "qwen", "antigravity", "pi", "grok", "opencode", "dsh"] as const;
 export type RuntimeAuthRuntime = (typeof RUNTIME_AUTH_RUNTIMES)[number];
 
 export function isRuntimeAuthRuntime(value: unknown): value is RuntimeAuthRuntime {
@@ -44,21 +47,6 @@ export const RUNTIME_AUTH_V1_RUNTIMES = ["claude", "codex"] as const satisfies r
 export const RUNTIME_AUTH_V2_RUNTIMES = ["claude", "codex", "kimi", "qoder"] as const satisfies readonly RuntimeAuthRuntime[];
 
 /**
- * Runtimes the server offers sign-in for only where it runs them: Antigravity
- * is a deprecated runtime a server revives with its flag
- * (`agent_runtime_oar_antigravity`). The server leaves such a runtime out of
- * the Computer's `runtimes` and its stored status where the flag is off, and
- * refuses its login there; the web shows it no card at all unless `runtimes`
- * names it (no upgrade caption either: the web cannot tell a server that does
- * not offer it from a Computer too old to sign it in).
- */
-export const RUNTIME_AUTH_SERVER_GATED_RUNTIMES = ["antigravity"] as const satisfies readonly RuntimeAuthRuntime[];
-
-export function isRuntimeAuthServerGated(runtime: RuntimeAuthRuntime): boolean {
-  return (RUNTIME_AUTH_SERVER_GATED_RUNTIMES as readonly RuntimeAuthRuntime[]).includes(runtime);
-}
-
-/**
  * `connect_provider`: save a model provider's API key in the runtime's own
  * settings on the Computer (Qwen Code: OAR's `createQwenProviderAuth`; Pi:
  * `createPiProviderAuth().setApiKey`). Qwen has no sign-in to run and nothing
@@ -75,6 +63,7 @@ export type RuntimeAuthAction = "login" | "logout" | "connect_provider";
  * (OAR 0.99) came together, on one capability
  * (`DAEMON_CAPABILITY_RUNTIME_AUTH_GROK`); so did OpenCode's per-provider
  * sign-in, sign-out and keys (OAR 0.100, `DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE`).
+ * DeepSeek Harness has none: OAR has no sign-in, status or provider facade for it.
  */
 export const RUNTIME_AUTH_ACTIONS: Readonly<Record<RuntimeAuthRuntime, readonly RuntimeAuthAction[]>> = {
   claude: ["login", "logout"],
@@ -86,10 +75,22 @@ export const RUNTIME_AUTH_ACTIONS: Readonly<Record<RuntimeAuthRuntime, readonly 
   pi: ["login", "logout", "connect_provider"],
   grok: ["login", "logout"],
   opencode: ["login", "logout", "connect_provider"],
+  dsh: [],
 };
 
 export function runtimeAuthSupports(runtime: RuntimeAuthRuntime, action: RuntimeAuthAction): boolean {
   return RUNTIME_AUTH_ACTIONS[runtime].includes(action);
+}
+
+/**
+ * A runtime Raft neither signs in nor connects to a provider (DeepSeek
+ * Harness): its card shows whether it is installed and usable here, and
+ * Install, and says how its credentials are configured outside Raft. Its
+ * status is never `logged_in` or `logged_out`: the Computer reports
+ * `unknown` for one it can run.
+ */
+export function runtimeAuthStatusOnly(runtime: RuntimeAuthRuntime): boolean {
+  return RUNTIME_AUTH_ACTIONS[runtime].length === 0;
 }
 
 /** Where a Kimi Code account lives, as the Kimi Code SDK's login takes it (`region`). */
@@ -112,6 +113,7 @@ export const RUNTIME_AUTH_LOGIN_REGION_CHOICES: Readonly<Record<RuntimeAuthRunti
   pi: [],
   grok: [],
   opencode: [],
+  dsh: [],
 };
 
 /**
@@ -152,6 +154,10 @@ const AUTH_RUNTIME_BY_RAFT_RUNTIME = new Map<string, RuntimeAuthRuntime>([
   // through `opencode serve` in the daemon's environment), which its agents
   // read unless their env moves OpenCode's data dir (XDG_DATA_HOME).
   ["opencode", "opencode"],
+  // DeepSeek Harness, OAR-only: no sign-in, only its card's status and Install
+  // (`runtimeAuthStatusOnly`). Its agents start the same `dsh` in the daemon's
+  // environment, on the DeepSeek key dsh resolves there.
+  ["dsh", "dsh"],
 ]);
 
 export function runtimeAuthRuntimeFor(raftRuntimeId: string): RuntimeAuthRuntime | null {
@@ -341,6 +347,26 @@ export const runtimeAuthStatusSchema = lazySchema("runtimeAuthStatusSchema", () 
 export type RuntimeAuthStatus = z.infer<typeof runtimeAuthStatusSchema>;
 
 /**
+ * Upgrade on the web: each upgradable runtime's update check
+ * (`runtimeUpdateCheckSchema`), by OAR runtime id. A runtime this build does
+ * not know is dropped, as in a report's `runtimes`, and so is an entry that
+ * does not parse (a newer Computer's kind, an odd version): one entry never
+ * costs the report. Also what the server keeps per Computer and sends the
+ * web (`runtimeUpdates`).
+ */
+export const runtimeUpdatesSchema = lazySchema("runtimeUpdatesSchema", () => z.record(z.string().max(64), z.unknown())
+  .transform((entries) => {
+    const updates: Partial<Record<RuntimeAuthRuntime, RuntimeUpdateCheck>> = {};
+    for (const [runtime, entry] of Object.entries(entries)) {
+      if (!isRuntimeAuthRuntime(runtime)) continue;
+      const parsed = runtimeUpdateCheckSchema.safeParse(entry);
+      if (parsed.success) updates[runtime] = parsed.data;
+    }
+    return updates;
+  }));
+export type RuntimeUpdates = z.infer<typeof runtimeUpdatesSchema>;
+
+/**
  * One Computer's report. `runtimes` drops a runtime it does not know rather
  * than refusing the report, so a newer Computer's extra runtime never costs
  * the others their status. (Servers before SERVER_CAPABILITY_RUNTIME_AUTH_V2
@@ -359,7 +385,34 @@ export const runtimeAuthStatusReportSchema = lazySchema("runtimeAuthStatusReport
     pi: runtimeAuthStatusSchema.optional(),
     grok: runtimeAuthStatusSchema.optional(),
     opencode: runtimeAuthStatusSchema.optional(),
+    dsh: runtimeAuthStatusSchema.optional(),
   } satisfies Record<RuntimeAuthRuntime, z.ZodType>),
+  /**
+   * Upgrade on the web (SERVER_CAPABILITY_RUNTIME_UPGRADE_V1 only): the
+   * installed runtimes whose own updater this Computer runs from the web
+   * (OAR's runtime has `upgrade`). A runtime this build does not know is
+   * dropped, as in `runtimes`. Absent: the Computer says nothing.
+   */
+  upgradable: z.array(z.string().max(64)).max(64)
+    .transform((ids) => ids.filter(isRuntimeAuthRuntime))
+    .optional(),
+  /**
+   * Install on the web (SERVER_CAPABILITY_RUNTIME_INSTALL_V1 only): the
+   * runtimes not installed on this Computer whose own installer it runs from
+   * the web (OAR's runtime has `install` and finds no installation). A
+   * runtime this build does not know is dropped. Absent: the Computer says nothing.
+   */
+  installable: z.array(z.string().max(64)).max(64)
+    .transform((ids) => ids.filter(isRuntimeAuthRuntime))
+    .optional(),
+  /**
+   * Upgrade on the web (SERVER_CAPABILITY_RUNTIME_UPDATE_CHECK_V1 only): OAR's
+   * read-only update check for runtimes in `upgradable` whose OAR runtime has
+   * one (`runtimeUpdatesSchema`). A runtime absent here has no answer (not
+   * checked yet: the Computer reports again once it is): the web offers
+   * Upgrade as before. Absent: the Computer says nothing.
+   */
+  updates: runtimeUpdatesSchema.optional(),
 }));
 export type RuntimeAuthStatusReport = z.infer<typeof runtimeAuthStatusReportSchema>;
 

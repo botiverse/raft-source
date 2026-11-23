@@ -128,13 +128,26 @@ test.describe("thread view-in-channel profile close", () => {
 
     await page.getByTestId("thread-overflow-trigger").click();
     await page.getByTestId("thread-overflow-view-in-channel").click();
-    await expect(page).toHaveURL(new RegExp(`msg=${parentMessage.id}`));
+    // Beside its own channel on a desktop, View in channel locates the parent in place and the thread stays
+    // open (raft-design conversation.md, Threads; #proj-chat:#31): no `?msg=` route.
+    await expect(page.getByTestId("message-scroller").locator(`#message-${parentMessage.id}`)).toHaveAttribute(
+      "data-highlighted",
+      "true",
+    );
+    await expect(page).toHaveURL(new RegExp(`\\?thread=${seedState.channel.id}%3A${parentMessage.id}$`));
+    await expect(page.getByTestId("thread-message-scroller")).toBeVisible();
+
+    // The URL this test guards (#1065) still happens: the `?msg=<parent>` route (a narrow or covered desktop, a
+    // permalink), then Reply in thread, gives `?msg=<parent>&thread=…`; the parent must not become the thread's focus.
+    await page.goto(`/s/${seedState.server.slug}/channel/${seedState.channel.id}?msg=${parentMessage.id}`);
     await expect(page.getByTestId("thread-message-scroller")).toHaveCount(0);
+    await expect(parentMessageCard).toBeVisible();
 
     await parentMessageCard.hover();
     await parentMessageCard.getByLabel("Reply in thread").click();
     const threadParent = page.locator('[data-testid="thread-panel-parent"]');
     await expect(threadParent).toBeVisible();
+    await expect(page).toHaveURL(new RegExp(`msg=${parentMessage.id}.*thread=|thread=.*msg=${parentMessage.id}`));
 
     // With Channel + Thread both open, a profile opened from a Channel avatar
     // is a column of the row (#189). At this test's 1280px window the row

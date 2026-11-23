@@ -20,6 +20,9 @@ const CASES = [
   ["menu-pinned-tab", "width=760&pinned=2&own=3&front=t2", "p2"],
   ["narrow-overflow", "width=420&pinned=2&own=6&front=t5", null],
   ["pinned-only", "width=760&pinned=2&own=0&front=p2", null],
+  // The address row with the site settings button before the address (#proj-workspace:#316), https and http.
+  ["address-site", "width=760&pinned=0&own=3&front=t1&site=1", null],
+  ["address-site-insecure", "width=760&pinned=0&own=3&front=t2&site=1", null],
 ];
 const round = (box) => (box ? Object.fromEntries(Object.entries(box).map(([key, value]) => [key, Math.round(value * 10) / 10])) : null);
 const inside = (inner, outer, slack = 0.5) => inner.x >= outer.x - slack && inner.y >= outer.y - slack
@@ -72,6 +75,29 @@ try {
         if (slot.pinned && Math.abs((slot.icon.x + slot.icon.width / 2) - (slot.tab.x + slot.tab.width / 2)) > 0.6) problems.push(`${slot.id}: icon not centred`);
         if (!slot.pinned && slot.close && !inside(slot.close, slot.box)) problems.push(`${slot.id}: close button outside its tab`);
       }
+      // The address row: a button embedded at either end of the field sits 6px inside it, and the address (or the
+      // Not secure badge) starts 8px after the site settings button.
+      const address = await page.evaluate(() => {
+        const box = (element) => { if (!element) return null; const r = element.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height }; };
+        const settings = document.querySelector('[data-testid="web-preview-site-settings"]');
+        return {
+          field: box(settings?.closest('[data-slot="input-group"]') ?? document.querySelector('[data-testid="web-preview-open-tab"]')?.closest('[data-slot="input-group"]')),
+          settings: box(settings),
+          badge: box(document.querySelector('[data-testid="web-preview-not-secure"]')),
+          host: box(document.querySelector('[data-testid="web-preview-host"]')),
+          open: box(document.querySelector('[data-testid="web-preview-open-tab"]')),
+        };
+      });
+      if (address.settings) {
+        const startGap = address.settings.x - address.field.x;
+        const next = address.badge ?? address.host;
+        const afterGap = next.x - (address.settings.x + address.settings.width);
+        address.startGap = Math.round(startGap * 10) / 10;
+        address.afterGap = Math.round(afterGap * 10) / 10;
+        if (Math.abs(startGap - 6) > 0.6) problems.push(`site settings ${address.startGap}px from the field's start, not 6`);
+        if (Math.abs(afterGap - 8) > 0.6) problems.push(`${address.badge ? "badge" : "address"} ${address.afterGap}px after site settings, not 8`);
+        if (address.badge && Math.abs(address.host.x - (address.badge.x + address.badge.width) - 8) > 0.6) problems.push("address not 8px after the badge");
+      }
       const firstOwn = boxes.slots.findIndex((slot) => !slot.pinned);
       if (boxes.slots.some((slot, index) => slot.pinned && firstOwn >= 0 && index > firstOwn)) problems.push("a pinned tab stands after an own tab");
       let menu = null;
@@ -94,7 +120,7 @@ try {
       if (problems.length > 0) failed = true;
       const file = `${name}-${mode}`;
       await page.screenshot({ path: `${outDir}/${file}.png` });
-      results.push({ name: file, ok: problems.length === 0, problems, head: round(head), grip: round(boxes.grip), slots: boxes.slots.map((slot) => ({ id: slot.id, pinned: slot.pinned, box: round(slot.box), icon: round(slot.icon), close: round(slot.close) })), controls: boxes.controls.map(round), menu });
+      results.push({ name: file, ok: problems.length === 0, problems, address, head: round(head), grip: round(boxes.grip), slots: boxes.slots.map((slot) => ({ id: slot.id, pinned: slot.pinned, box: round(slot.box), icon: round(slot.icon), close: round(slot.close) })), controls: boxes.controls.map(round), menu });
       console.log(problems.length === 0 ? "ok  " : "FAIL", file, boxes.slots.map((slot) => `${slot.pinned ? "*" : ""}${slot.id}:${Math.round(slot.box.width)}`).join(" "), problems.join("; "), menu ? menu.items.join(" | ") : "");
       await page.close();
     }

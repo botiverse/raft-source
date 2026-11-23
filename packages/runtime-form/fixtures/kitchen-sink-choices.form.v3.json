@@ -1,0 +1,342 @@
+{
+  "protocolVersion": 3,
+  "runtimeId": "kitchen-sink-choices",
+  "schemaVersion": "kitchen-sink-choices.create.v1",
+  "dataSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "selectRequired",
+      "selectUnavailable",
+      "selectRetrying",
+      "selectOptionUnavailable",
+      "dependentRequired"
+    ],
+    "properties": {
+      "selectFilled": {
+        "type": "string",
+        "title": "Select, filled",
+        "x-optionSource": "selectFilled"
+      },
+      "selectEmpty": {
+        "type": "string",
+        "title": "Select, empty",
+        "x-optionSource": "selectEmpty"
+      },
+      "selectRequired": {
+        "type": "string",
+        "minLength": 1,
+        "title": "Select, required",
+        "x-optionSource": "selectRequired"
+      },
+      "selectNotAChoice": {
+        "type": "string",
+        "title": "Select, value not listed",
+        "x-optionSource": "selectNotAChoice"
+      },
+      "selectFallback": {
+        "type": "string",
+        "title": "Select, fallback list",
+        "x-optionSource": "selectFallback"
+      },
+      "selectStale": {
+        "type": "string",
+        "title": "Select, last known list",
+        "x-optionSource": "selectStale"
+      },
+      "selectUnavailable": {
+        "type": "string",
+        "minLength": 1,
+        "title": "Select, unavailable",
+        "x-optionSource": "selectUnavailable"
+      },
+      "selectRetrying": {
+        "type": "string",
+        "minLength": 1,
+        "title": "Select, loading",
+        "x-optionSource": "selectRetrying"
+      },
+      "selectUnavailableOptional": {
+        "type": "string",
+        "title": "Select, unavailable and optional",
+        "x-optionSource": "selectUnavailableOptional"
+      },
+      "selectOptionUnavailable": {
+        "type": "string",
+        "minLength": 1,
+        "title": "Select, value no longer available",
+        "x-optionSource": "selectOptionUnavailable"
+      },
+      "selectCustomValue": {
+        "type": "string",
+        "title": "Select, typed value",
+        "x-optionSource": "selectCustomValue"
+      },
+      "dependentListOnly": {
+        "type": "string",
+        "title": "Dependent select, list only",
+        "x-optionSource": "dependentListOnly"
+      },
+      "dependentCombobox": {
+        "type": "string",
+        "title": "Dependent select, list or typed",
+        "x-optionSource": "dependentCombobox"
+      },
+      "dependentFreeText": {
+        "type": "string",
+        "title": "Dependent select, typed only",
+        "x-optionSource": "dependentFreeText"
+      },
+      "dependentEmpty": {
+        "type": "string",
+        "title": "Dependent select, empty",
+        "x-optionSource": "dependentEmpty"
+      },
+      "dependentRequired": {
+        "type": "string",
+        "minLength": 1,
+        "title": "Dependent select, required",
+        "x-optionSource": "dependentRequired"
+      },
+      "dependentNoKey": {
+        "type": "string",
+        "title": "Dependent select, no list for this value",
+        "x-optionSource": "dependentNoKey"
+      }
+    }
+  },
+  "uiSchema": {
+    "order": [
+      "selectFilled",
+      "selectEmpty",
+      "selectRequired",
+      "selectNotAChoice",
+      "selectFallback",
+      "selectStale",
+      "selectUnavailable",
+      "selectRetrying",
+      "selectUnavailableOptional",
+      "selectOptionUnavailable",
+      "selectCustomValue",
+      "dependentListOnly",
+      "dependentCombobox",
+      "dependentFreeText",
+      "dependentEmpty",
+      "dependentRequired",
+      "dependentNoKey"
+    ],
+    "layout": {
+      "advanced": []
+    },
+    "localization": {
+      "selectFilled": {
+        "label": "Select, filled",
+        "hint": "Choice labels and descriptions come from the form copy.",
+        "choices": {
+          "alpha": {
+            "label": "Alpha",
+            "description": "The first choice"
+          },
+          "beta": {
+            "label": "Beta",
+            "description": "The second choice, picked"
+          }
+        }
+      },
+      "selectEmpty": {
+        "label": "Select, empty"
+      },
+      "selectRequired": {
+        "label": "Select, required"
+      },
+      "selectNotAChoice": {
+        "label": "Select, value not listed"
+      },
+      "selectFallback": {
+        "label": "Select, fallback list"
+      },
+      "selectStale": {
+        "label": "Select, last known list"
+      },
+      "selectUnavailable": {
+        "label": "Select, unavailable"
+      },
+      "selectRetrying": {
+        "label": "Select, loading"
+      },
+      "selectUnavailableOptional": {
+        "label": "Select, unavailable and optional"
+      },
+      "selectOptionUnavailable": {
+        "label": "Select, value no longer available"
+      },
+      "selectCustomValue": {
+        "label": "Select, typed value"
+      },
+      "dependentListOnly": {
+        "label": "Dependent select, list only"
+      },
+      "dependentCombobox": {
+        "label": "Dependent select, list or typed"
+      },
+      "dependentFreeText": {
+        "label": "Dependent select, typed only"
+      },
+      "dependentEmpty": {
+        "label": "Dependent select, empty"
+      },
+      "dependentRequired": {
+        "label": "Dependent select, required"
+      },
+      "dependentNoKey": {
+        "label": "Dependent select, no list for this value"
+      }
+    },
+    "rules": []
+  },
+  "optionSources": {
+    "selectFilled": {
+      "protocolVersion": 1,
+      "runtimeId": "kitchen-sink-choices",
+      "schemaVersion": "kitchen-sink-choices.create.v1",
+      "sourceId": "selectFilled",
+      "kind": "select",
+      "pointer": "/selectFilled"
+    },
+    "selectEmpty": {
+      "protocolVersion": 1,
+      "runtimeId": "kitchen-sink-choices",
+      "schemaVersion": "kitchen-sink-choices.create.v1",
+      "sourceId": "selectEmpty",
+      "kind": "select",
+      "pointer": "/selectEmpty"
+    },
+    "selectRequired": {
+      "protocolVersion": 1,
+      "runtimeId": "kitchen-sink-choices",
+      "schemaVersion": "kitchen-sink-choices.create.v1",
+      "sourceId": "selectRequired",
+      "kind": "select",
+      "pointer": "/selectRequired"
+    },
+    "selectNotAChoice": {
+      "protocolVersion": 1,
+      "runtimeId": "kitchen-sink-choices",
+      "schemaVersion": "kitchen-sink-choices.create.v1",
+      "sourceId": "selectNotAChoice",
+      "kind": "select",
+      "pointer": "/selectNotAChoice"
+    },
+    "selectFallback": {
+      "protocolVersion": 1,
+      "runtimeId": "kitchen-sink-choices",
+      "schemaVersion": "kitchen-sink-choices.create.v1",
+      "sourceId": "selectFallback",
+      "kind": "select",
+      "pointer": "/selectFallback"
+    },
+    "selectStale": {
+      "protocolVersion": 1,
+      "runtimeId": "kitchen-sink-choices",
+      "schemaVersion": "kitchen-sink-choices.create.v1",
+      "sourceId": "selectStale",
+      "kind": "select",
+      "pointer": "/selectStale"
+    },
+    "selectUnavailable": {
+      "protocolVersion": 1,
+      "runtimeId": "kitchen-sink-choices",
+      "schemaVersion": "kitchen-sink-choices.create.v1",
+      "sourceId": "selectUnavailable",
+      "kind": "select",
+      "pointer": "/selectUnavailable"
+    },
+    "selectRetrying": {
+      "protocolVersion": 1,
+      "runtimeId": "kitchen-sink-choices",
+      "schemaVersion": "kitchen-sink-choices.create.v1",
+      "sourceId": "selectRetrying",
+      "kind": "select",
+      "pointer": "/selectRetrying"
+    },
+    "selectUnavailableOptional": {
+      "protocolVersion": 1,
+      "runtimeId": "kitchen-sink-choices",
+      "schemaVersion": "kitchen-sink-choices.create.v1",
+      "sourceId": "selectUnavailableOptional",
+      "kind": "select",
+      "pointer": "/selectUnavailableOptional"
+    },
+    "selectOptionUnavailable": {
+      "protocolVersion": 1,
+      "runtimeId": "kitchen-sink-choices",
+      "schemaVersion": "kitchen-sink-choices.create.v1",
+      "sourceId": "selectOptionUnavailable",
+      "kind": "select",
+      "pointer": "/selectOptionUnavailable"
+    },
+    "selectCustomValue": {
+      "protocolVersion": 1,
+      "runtimeId": "kitchen-sink-choices",
+      "schemaVersion": "kitchen-sink-choices.create.v1",
+      "sourceId": "selectCustomValue",
+      "kind": "select",
+      "pointer": "/selectCustomValue"
+    },
+    "dependentListOnly": {
+      "protocolVersion": 1,
+      "runtimeId": "kitchen-sink-choices",
+      "schemaVersion": "kitchen-sink-choices.create.v1",
+      "sourceId": "dependentListOnly",
+      "kind": "dependent_select",
+      "pointer": "/dependentListOnly",
+      "dependsOn": "/selectFilled"
+    },
+    "dependentCombobox": {
+      "protocolVersion": 1,
+      "runtimeId": "kitchen-sink-choices",
+      "schemaVersion": "kitchen-sink-choices.create.v1",
+      "sourceId": "dependentCombobox",
+      "kind": "dependent_select",
+      "pointer": "/dependentCombobox",
+      "dependsOn": "/selectFilled"
+    },
+    "dependentFreeText": {
+      "protocolVersion": 1,
+      "runtimeId": "kitchen-sink-choices",
+      "schemaVersion": "kitchen-sink-choices.create.v1",
+      "sourceId": "dependentFreeText",
+      "kind": "dependent_select",
+      "pointer": "/dependentFreeText",
+      "dependsOn": "/selectFilled"
+    },
+    "dependentEmpty": {
+      "protocolVersion": 1,
+      "runtimeId": "kitchen-sink-choices",
+      "schemaVersion": "kitchen-sink-choices.create.v1",
+      "sourceId": "dependentEmpty",
+      "kind": "dependent_select",
+      "pointer": "/dependentEmpty",
+      "dependsOn": "/selectFilled"
+    },
+    "dependentRequired": {
+      "protocolVersion": 1,
+      "runtimeId": "kitchen-sink-choices",
+      "schemaVersion": "kitchen-sink-choices.create.v1",
+      "sourceId": "dependentRequired",
+      "kind": "dependent_select",
+      "pointer": "/dependentRequired",
+      "dependsOn": "/selectFilled"
+    },
+    "dependentNoKey": {
+      "protocolVersion": 1,
+      "runtimeId": "kitchen-sink-choices",
+      "schemaVersion": "kitchen-sink-choices.create.v1",
+      "sourceId": "dependentNoKey",
+      "kind": "dependent_select",
+      "pointer": "/dependentNoKey",
+      "dependsOn": "/selectFilled"
+    }
+  },
+  "revision": "kitchen-sink"
+}

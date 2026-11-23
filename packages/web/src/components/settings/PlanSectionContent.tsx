@@ -16,27 +16,28 @@ import {
   TextLink,
 } from "@botiverse/raft-ui";
 import { Meter, MeterHeader, MeterIndicator, MeterLabel, MeterTrack, MeterValue } from "@botiverse/raft-ui/wip";
-import { Check } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
-import { FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES, PLAN_CONFIG, PRO_AGENT_SEAT_FRACTION, PRO_SEAT_ANNUAL_USD, PRO_SEAT_MONTHLY_USD, formatProAgentSeatFraction } from "@botiverse/raft-shared";
+import { FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES, FREE_SINGLE_FILE_UPLOAD_LIMIT_BYTES, PLAN_CONFIG, PRO_SEAT_ANNUAL_USD, PRO_SEAT_MONTHLY_USD, currentTimeMs, formatProAgentSeatFraction } from "@botiverse/raft-shared";
 import type { BillingPortalFrom } from "@botiverse/raft-shared";
 import { trackPlanBillingDialogClosed, trackPlanBillingDialogOpened } from "../../analytics/planBilling";
-import type { MessageId } from "../../i18n/messages";
 import type { BillingInfo, Server, ServerUsage } from "../../store/serverStore";
 import api from "../../api/client";
 import ConfirmDialog from "../ConfirmDialog";
 import Banner from "../ui/Banner";
 import LeavingRaftMark, { opensInNewTabAriaLabel } from "../ui/LeavingRaftMark";
 import { shareableWebUrl } from "../../utils/desktopShell";
+import { subscribeLiveTime } from "../../hooks/liveTimeClock";
 import { useBillingReturnRefresh } from "../../hooks/useBillingReturnRefresh";
 import { getBillingControlsState, getSettingsBillingPlanPresentation } from "../../utils/billingControls";
 import { monthlyUploadResetsAt } from "../../utils/monthlyUploadQuota";
 import { openUpgradeDialog } from "../../store/upgradeDialogStore";
 import { PRO_PREPAID_FEATURE_FLAG_KEY, useServerFeatureFlag } from "../../store/serverFeatureFlags";
 import type { AddSeatsNeed } from "../billing/AddSeatsDialog";
+import { SeatsBreakdown } from "../billing/SeatsBreakdown";
+import { ProBenefitList } from "./ProBenefitList";
 import {
   BILLING_OVERVIEW_CLASS,
   BILLING_PLAN_SUMMARY_CLASS,
@@ -59,13 +60,6 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const PRICING_URL = "https://raft.build/pricing";
 const MIB = 1024 * 1024;
 const GIB = 1024 * MIB;
-/** What Pro adds over Free: the Pro plan's own list (billingControls), less "everything in Free" and "coming soon". */
-const PRO_ADDS: MessageId[] = [
-  "billing.unlimitedMessageHistory",
-  "billing.higherFileUploadLimits",
-  "billing.agentMigration",
-  "billing.unlimitedJointChannels",
-];
 
 /**
  * Settings › Plan & Billing (task #13, #proj-commercial; option B, cindyz
@@ -127,6 +121,7 @@ export function PlanSectionContent({
   const agents = billing?.usage?.agents ?? usage?.agents ?? 0;
   const freeHistoryDays = PLAN_CONFIG.free.limits.messageHistoryDays;
   const freeUpload = formatBytes(FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES);
+  const freePerFile = formatBytes(FREE_SINGLE_FILE_UPLOAD_LIMIT_BYTES);
   // Why buttons that change billing are off: not an owner, or no Stripe here.
   const disabledReason = !owner
     ? formatMessage({ id: "billing.onlyServerOwnersCanChangeBilling" })
@@ -140,7 +135,9 @@ export function PlanSectionContent({
   const prepaidEndLabel = prepaid ? formatDate(prepaid.endsAt, { month: "short", day: "numeric", year: "numeric" }) : null;
   const prepaidGraceLabel = prepaid ? formatDate(prepaid.graceEndsAt, { month: "short", day: "numeric", year: "numeric" }) : null;
   // The last week before the end: a reminder on the page (the email and the bell come later).
-  const prepaidEndingSoon = Boolean(prepaid && !prepaid.inGrace && Date.parse(prepaid.endsAt) - Date.now() <= PREPAID_REMINDER_DAYS * DAY_MS);
+  // Read from the live clock, so a page left open starts the reminder when the week begins.
+  const readPrepaidEndingSoon = () => Boolean(prepaid && !prepaid.inGrace && Date.parse(prepaid.endsAt) - currentTimeMs() <= PREPAID_REMINDER_DAYS * DAY_MS);
+  const prepaidEndingSoon = useSyncExternalStore(subscribeLiveTime, readPrepaidEndingSoon, readPrepaidEndingSoon);
   const canRenew = owner && Boolean(prepaid) && prepaidEnabled;
   // Seats are added to prepaid time for the days left, until it ends; in grace, with a renewal.
   const canAddPrepaidSeats = canRenew && !prepaid?.inGrace;
@@ -314,7 +311,7 @@ export function PlanSectionContent({
       { price, seats, renewal: formatMessage({ id: ending ? "planBilling.endsOn" : "planBilling.pro.renews" }, { date: periodEndLabel }) },
     );
   } else if (isFree) {
-    planDescription = formatMessage({ id: "planBilling.free.summary" }, { days: freeHistoryDays, upload: freeUpload });
+    planDescription = formatMessage({ id: "planBilling.free.summary" }, { days: freeHistoryDays, upload: freeUpload, perFile: freePerFile });
   } else {
     planDescription = formatMessage({ id: presentation.description }, presentation.descriptionValues);
   }
@@ -413,7 +410,7 @@ export function PlanSectionContent({
           ) : undefined}
           data-testid="billing-ending"
         >
-          {formatMessage({ id: "planBilling.ending.body" }, { days: freeHistoryDays, upload: freeUpload })}
+          {formatMessage({ id: "planBilling.ending.body" }, { days: freeHistoryDays, upload: freeUpload, perFile: freePerFile })}
         </Banner>
       )}
 
@@ -499,16 +496,7 @@ export function PlanSectionContent({
               </Meter>
               {/* Under "n of m used", outside the meter: a meter's contents aren't controls (role="meter"). */}
               <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2">
-                <DescriptionList direction="inline">
-                  <DescriptionItem>
-                    <DescriptionTerm>{formatMessage({ id: "planBilling.usage.people" })}</DescriptionTerm>
-                    <DescriptionDetails>{formatMessage({ id: "planBilling.usage.countSeats" }, { count: humans, seats: formatSeats(humans), seatCount: humans })}</DescriptionDetails>
-                  </DescriptionItem>
-                  <DescriptionItem>
-                    <DescriptionTerm>{formatMessage({ id: "billing.agents" })}</DescriptionTerm>
-                    <DescriptionDetails>{formatMessage({ id: "planBilling.usage.countSeats" }, { count: agents, seats: formatSeats(agents * PRO_AGENT_SEAT_FRACTION), seatCount: agents * PRO_AGENT_SEAT_FRACTION })}</DescriptionDetails>
-                  </DescriptionItem>
-                </DescriptionList>
+                <SeatsBreakdown humans={humans} agents={agents} className="min-w-0 flex-1" testId="billing-seats-breakdown" />
                 {canRemoveSeats && (
                   <TextLink className="text-footnote" onClick={openRemoveSeats} data-testid="billing-manage-seats">
                     {formatMessage({ id: "planBilling.manageSeats" })}
@@ -525,25 +513,29 @@ export function PlanSectionContent({
             </>
           )}
           {(isFree || appsumo) && uploadQuota && (
-            <Meter
-              used={uploadUsed}
-              max={uploadQuota.limitBytes}
-              valueText={uploadResets
-                ? formatMessage(
-                  { id: uploadQuota.remainingBytes <= 0 ? "planBilling.usage.uploadsUsedUp" : "planBilling.usage.uploadsUsed" },
-                  { used: formatBytes(uploadUsed), limit: formatBytes(uploadQuota.limitBytes), date: uploadResets },
-                )
-                : formatMessage({ id: "planBilling.usage.used" }, { used: formatBytes(uploadUsed), total: formatBytes(uploadQuota.limitBytes) })}
-              data-testid="billing-upload-meter"
-            >
-              <MeterHeader>
-                <MeterLabel>{formatMessage({ id: "planBilling.usage.uploads" })}</MeterLabel>
-                <MeterValue />
-              </MeterHeader>
-              <MeterTrack>
-                <MeterIndicator />
-              </MeterTrack>
-            </Meter>
+            <div className="grid gap-1.5">
+              <Meter
+                used={uploadUsed}
+                max={uploadQuota.limitBytes}
+                valueText={uploadResets
+                  ? formatMessage(
+                    { id: uploadQuota.remainingBytes <= 0 ? "planBilling.usage.uploadsUsedUp" : "planBilling.usage.uploadsUsed" },
+                    { used: formatBytes(uploadUsed), limit: formatBytes(uploadQuota.limitBytes), date: uploadResets },
+                  )
+                  : formatMessage({ id: "planBilling.usage.used" }, { used: formatBytes(uploadUsed), total: formatBytes(uploadQuota.limitBytes) })}
+                data-testid="billing-upload-meter"
+              >
+                <MeterHeader>
+                  <MeterLabel>{formatMessage({ id: "planBilling.usage.uploads" })}</MeterLabel>
+                  <MeterValue />
+                </MeterHeader>
+                <MeterTrack>
+                  <MeterIndicator />
+                </MeterTrack>
+              </Meter>
+              {/* What counts, Artifacts too: an agent's Artifact can use up the month (#proj-commercial:#28). */}
+              <p className="m-0 text-footnote text-foreground-muted">{formatMessage({ id: "planBilling.usage.uploadsIncludes" })}</p>
+            </div>
           )}
           {/* Free, and any plan without a seat count (founder, partner, or billing that came back partial). */}
           {!universalSeats && !appsumo && (plan === "free" || billing) && (
@@ -582,14 +574,7 @@ export function PlanSectionContent({
                 { monthly: usd(PRO_SEAT_MONTHLY_USD), annual: usd(Math.round((PRO_SEAT_ANNUAL_USD / 12) * 100) / 100), seats: neededSeats },
               )}
             </p>
-            <ul className="grid gap-x-6 gap-y-2 text-callout text-foreground sm:grid-cols-2">
-              {PRO_ADDS.map((id) => (
-                <li key={id} className="flex items-start gap-2">
-                  <Check size={16} className="mt-0.5 shrink-0 text-success-strong" aria-hidden="true" />
-                  {formatMessage({ id })}
-                </li>
-              ))}
-            </ul>
+            <ProBenefitList />
             <div className="flex flex-wrap items-center gap-2">
               <Button
                 variant="accent"
@@ -655,7 +640,7 @@ export function PlanSectionContent({
           <CardHeader>
             <CardTitle render={<h2>{formatMessage({ id: "planBilling.cancel.title" })}</h2>} />
             <CardDescription>
-              {formatMessage({ id: "planBilling.cancel.body" }, { date: periodEndLabel, days: freeHistoryDays, upload: freeUpload })}
+              {formatMessage({ id: "planBilling.cancel.body" }, { date: periodEndLabel, days: freeHistoryDays, upload: freeUpload, perFile: freePerFile })}
             </CardDescription>
           </CardHeader>
           <CardContent className="flex justify-end">

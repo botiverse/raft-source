@@ -5,6 +5,7 @@ import type { KeyboardEvent } from "react";
 import { currentTimeMs } from "@botiverse/raft-shared";
 
 import { PAGE_COMMENT_ARM_MS } from "./artifactPageComments";
+import { useOwnerTimers } from "../../utils/ownerDocument";
 
 /**
  * Armed once the page opened it (P108; the panel mounts a box per open): until `armedUntil`,
@@ -16,10 +17,12 @@ export function useCommentBoxArming(fromPage: boolean) {
   if (armedUntil.current === null) armedUntil.current = fromPage ? currentTimeMs() + PAGE_COMMENT_ARM_MS : 0;
   const pressBeganArming = useRef(fromPage);
   const [arming, setArming] = useState(fromPage);
+  // The box's own window's timer (an object window's runs while the main window is hidden, #337 PR3).
+  const timers = useOwnerTimers();
   useEffect(() => {
-    const timer = window.setTimeout(() => setArming(false), Math.max(0, (armedUntil.current ?? 0) - currentTimeMs()));
-    return () => window.clearTimeout(timer);
-  }, []);
+    const timer = timers.setTimeout(() => setArming(false), Math.max(0, (armedUntil.current ?? 0) - currentTimeMs()));
+    return () => timers.clearTimeout(timer);
+  }, [timers]);
   const stillArming = useCallback(() => currentTimeMs() < (armedUntil.current ?? 0), []);
   const notePress = useCallback(() => { pressBeganArming.current = stillArming(); }, [stillArming]);
   const noteKey = useCallback((event: KeyboardEvent<HTMLElement>) => {

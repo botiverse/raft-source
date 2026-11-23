@@ -1,10 +1,17 @@
 import assert from "node:assert/strict";
+import { vi } from "vitest";
 
 import {
+  ATTACHMENT_TRANSFER_IDLE_TIMEOUT_MS,
+  ATTACHMENT_UPLOAD_COMPLETE_TIMEOUT_MS,
+  ATTACHMENT_UPLOAD_CONTROL_TIMEOUT_MS,
+  ATTACHMENT_UPLOAD_RESPONSE_TIMEOUT_MS,
   AttachmentUploadClientError,
+  AttachmentUploadTimeoutError,
   cancelAttachmentUploadSession,
   uploadAttachmentFile,
 } from "../src/utils/directAttachmentUpload";
+import { __setUploadFallbackEmitterForTest } from "../src/utils/attachmentUploadFallbackTrace";
 import {
   __setDirectPutFailureEmitterForTest,
   directPutClientScheme,
@@ -815,4 +822,346 @@ test("direct PUT trace buckets stay coarse", () => {
   assert.equal(directPutClientScheme("app:"), "app");
   assert.equal(directPutClientScheme("file:"), "other");
   assert.equal(directPutClientScheme(undefined), "other");
+});
+
+
+// ---------------------------------------------------------------------------
+// #triage:#545: every request in the upload path is bounded. A request that
+// never answers is aborted and ends in a retryable timeout naming its step,
+// instead of a spinner forever.
+// ---------------------------------------------------------------------------
+
+type HangingRequest = Readonly<{ url: string; signal: AbortSignal | undefined }>;
+
+/** A request that answers only by rejecting once its signal aborts. */
+function hangUntilAbort(signal: AbortSignal | undefined): Promise<never> {
+  return new Promise((_resolve, reject) => {
+    signal?.addEventListener("abort", () => reject(Object.assign(new Error("canceled"), {
+      name: "CanceledError",
+      code: "ERR_CANCELED",
+    })), { once: true });
+  });
+}
+
+/** makeApi, except the request matching `hangs` never answers. */
+function makeHangingApi(
+  hangs: (method: string, url: string) => boolean,
+  options: Parameters<typeof makeApi>[0],
+) {
+  const inner = makeApi(options);
+  const hung: HangingRequest[] = [];
+  const api: AttachmentUploadApi = {
+    get(url, config) {
+      if (hangs("GET", url)) {
+        hung.push({ url, signal: config?.signal });
+        return hangUntilAbort(config?.signal);
+      }
+      return inner.api.get(url, config);
+    },
+    post(url, body, config) {
+      if (hangs("POST", url)) {
+        hung.push({ url, signal: config?.signal });
+        return hangUntilAbort(config?.signal);
+      }
+      return inner.api.post(url, body, config);
+    },
+    delete: inner.api.delete,
+  };
+  return { api, calls: inner.calls, hung };
+}
+
+function isTimeout(code: string, phase: string) {
+  return (error: unknown) => error instanceof AttachmentUploadTimeoutError
+    && error.code === code
+    && error.phase === phase
+    && error.retryable;
+}
+
+describe("upload request deadlines", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    __setUploadFallbackEmitterForTest(null);
+    __setDirectPutFailureEmitterForTest(null);
+  });
+
+  test("a capability probe that never answers falls back to the legacy upload as capability_timeout", async () => {
+    const reasons: unknown[] = [];
+    __setUploadFallbackEmitterForTest((_name, attrs) => { reasons.push(attrs.reason); });
+    const { api, hung } = makeHangingApi((method, url) => url === "/attachments/upload-capabilities", { capabilities });
+    const result = uploadAttachmentFile({
+      api,
+      file: fileOf(8),
+      channelId: "channel-1",
+      clientRequestId: "request-1",
+      legacyUpload: async () => "legacy-attachment",
+    });
+
+    await vi.advanceTimersByTimeAsync(ATTACHMENT_UPLOAD_CONTROL_TIMEOUT_MS - 1);
+    assert.equal(hung[0]?.signal?.aborted, false, "not before the deadline");
+    await vi.advanceTimersByTimeAsync(1);
+    assert.equal(await result, "legacy-attachment");
+    assert.equal(hung[0]?.signal?.aborted, true, "the probe is aborted");
+    assert.deepEqual(reasons, ["capability_timeout"]);
+  });
+
+  test("creating a session that never answers ends in a retryable create timeout", async () => {
+    const { api, hung } = makeHangingApi(
+      (method, url) => method === "POST" && url === "/attachments/upload-sessions",
+      { capabilities },
+    );
+    const result = uploadAttachmentFile({
+      api,
+      file: fileOf(8),
+      channelId: "channel-1",
+      clientRequestId: "request-1",
+      legacyUpload: async () => "must-not-run",
+    });
+    const settled = assert.rejects(result, isTimeout("UPLOAD_STALLED", "create"));
+    await vi.advanceTimersByTimeAsync(ATTACHMENT_UPLOAD_CONTROL_TIMEOUT_MS);
+    await settled;
+    assert.equal(hung[0]?.signal?.aborted, true);
+  });
+
+  test("checking a previous session that never answers ends in a retryable status timeout", async () => {
+    const { api } = makeHangingApi((method, url) => method === "GET" && url.endsWith("/upload-1"), { capabilities });
+    const result = uploadAttachmentFile({
+      api,
+      file: fileOf(8),
+      channelId: "channel-1",
+      clientRequestId: "request-1",
+      previousSession: { uploadId: "upload-1" },
+      legacyUpload: async () => "must-not-run",
+    });
+    const settled = assert.rejects(result, isTimeout("UPLOAD_STALLED", "status"));
+    await vi.advanceTimersByTimeAsync(ATTACHMENT_UPLOAD_CONTROL_TIMEOUT_MS);
+    await settled;
+  });
+
+  test("complete waits past the server's own storage timeout, then ends in a retryable complete timeout", async () => {
+    const { api, hung } = makeHangingApi((method, url) => method === "POST" && url.endsWith("/complete"), {
+      capabilities,
+      create: [created],
+    });
+    let rejected = false;
+    const result = uploadAttachmentFile({
+      api,
+      file: fileOf(8),
+      channelId: "channel-1",
+      clientRequestId: "request-1",
+      legacyUpload: async () => "must-not-run",
+      requestImpl: async () => ({ status: 200 }),
+    });
+    const settled = assert.rejects(result, isTimeout("UPLOAD_STALLED", "complete")).then(() => { rejected = true; });
+    await vi.advanceTimersByTimeAsync(ATTACHMENT_UPLOAD_CONTROL_TIMEOUT_MS);
+    assert.equal(rejected, false, "complete gets longer than a control call");
+    await vi.advanceTimersByTimeAsync(ATTACHMENT_UPLOAD_COMPLETE_TIMEOUT_MS - ATTACHMENT_UPLOAD_CONTROL_TIMEOUT_MS);
+    await settled;
+    assert.equal(hung.length, 1, "a timed-out complete is not replayed");
+    assert.equal(hung[0]?.signal?.aborted, true);
+  });
+
+  test("a direct PUT with no progress for the idle window is aborted and checked against the session before asking for a retry", async () => {
+    const emitted: EmittedEvent[] = [];
+    __setDirectPutFailureEmitterForTest((name, attrs) => { emitted.push({ name, attrs }); });
+    const missing = responseError(404, {
+      code: "UPLOAD_OBJECT_NOT_FOUND",
+      message: "Uploaded object is not visible yet.",
+      retryable: true,
+      retryAfterMs: 1,
+    });
+    const { api, calls } = makeApi({
+      capabilities,
+      create: [created],
+      status: [pendingSession],
+      complete: [missing, missing, missing],
+    });
+    let putSignal: AbortSignal | undefined;
+    let progress: ((event: { loaded: number }) => void) | undefined;
+    const result = uploadAttachmentFile({
+      api,
+      file: fileOf(8),
+      channelId: "channel-1",
+      clientRequestId: "request-1",
+      legacyUpload: async () => "must-not-run",
+      requestImpl: (config) => {
+        putSignal = config.signal as AbortSignal;
+        progress = config.onUploadProgress as unknown as (event: { loaded: number }) => void;
+        return hangUntilAbort(putSignal);
+      },
+      sleep: async () => undefined,
+    });
+    const settled = assert.rejects(result, isTimeout("UPLOAD_OBJECT_PUT_UNCERTAIN", "transfer"));
+
+    await vi.advanceTimersByTimeAsync(ATTACHMENT_TRANSFER_IDLE_TIMEOUT_MS - 1);
+    progress?.({ loaded: 4 });
+    await vi.advanceTimersByTimeAsync(ATTACHMENT_TRANSFER_IDLE_TIMEOUT_MS - 1);
+    assert.equal(putSignal?.aborted, false, "progress renews the idle window");
+    await vi.advanceTimersByTimeAsync(1);
+    await settled;
+
+    assert.equal(putSignal?.aborted, true);
+    assert.ok(calls.some((call) => call.method === "GET" && call.url.endsWith("/upload-1")), "recovery checked the session");
+    assert.equal(calls.some((call) => call.method === "DELETE"), false, "the session is kept for a safe retry");
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0]!.attrs.reason, "idle_timeout");
+    assert.equal(emitted[0]!.attrs.recovery, "not_found");
+  });
+
+  test("once the browser reports the last byte, a direct PUT waits the response deadline, not the idle window", async () => {
+    const missing = responseError(404, {
+      code: "UPLOAD_OBJECT_NOT_FOUND",
+      message: "Uploaded object is not visible yet.",
+      retryable: true,
+      retryAfterMs: 1,
+    });
+    const { api } = makeApi({
+      capabilities,
+      create: [created],
+      status: [pendingSession],
+      complete: [missing, missing, missing],
+    });
+    let putSignal: AbortSignal | undefined;
+    let progress: ((event: { loaded: number; total?: number }) => void) | undefined;
+    const result = uploadAttachmentFile({
+      api,
+      file: fileOf(8),
+      channelId: "channel-1",
+      clientRequestId: "request-1",
+      legacyUpload: async () => "must-not-run",
+      requestImpl: (config) => {
+        putSignal = config.signal as AbortSignal;
+        progress = config.onUploadProgress as unknown as (event: { loaded: number; total?: number }) => void;
+        return hangUntilAbort(putSignal);
+      },
+      sleep: async () => undefined,
+    });
+    const settled = assert.rejects(result, isTimeout("UPLOAD_OBJECT_PUT_UNCERTAIN", "transfer"));
+
+    await vi.advanceTimersByTimeAsync(1);
+    progress?.({ loaded: 8, total: 8 });
+    await vi.advanceTimersByTimeAsync(ATTACHMENT_TRANSFER_IDLE_TIMEOUT_MS);
+    assert.equal(putSignal?.aborted, false, "a draining send buffer is not cut off at the idle window");
+    await vi.advanceTimersByTimeAsync(ATTACHMENT_UPLOAD_RESPONSE_TIMEOUT_MS - ATTACHMENT_TRANSFER_IDLE_TIMEOUT_MS);
+    await settled;
+    assert.equal(putSignal?.aborted, true);
+  });
+
+  test("a caller cancel during a hanging request stays a cancel, not a timeout", async () => {
+    const { api } = makeHangingApi((method, url) => method === "POST" && url === "/attachments/upload-sessions", { capabilities });
+    const controller = new AbortController();
+    const result = uploadAttachmentFile({
+      api,
+      file: fileOf(8),
+      channelId: "channel-1",
+      clientRequestId: "request-1",
+      legacyUpload: async () => "must-not-run",
+      signal: controller.signal,
+    });
+    const settled = assert.rejects(result, (error: unknown) => !(error instanceof AttachmentUploadTimeoutError));
+    await vi.advanceTimersByTimeAsync(1);
+    controller.abort();
+    await settled;
+    assert.equal(vi.getTimerCount(), 0, "the deadline is cleared");
+  });
+});
+
+test("the shared upload prepares (resizes) the file first, and the prepared file decides the route and is what is sent", async () => {
+  // threshold 4: the 8-byte original would go direct; its 3-byte resize goes legacy.
+  const { api, calls } = makeApi({ capabilities });
+  const original = fileOf(8, "image/jpeg", "photo.jpg");
+  const resized = fileOf(3, "image/jpeg", "photo.jpg");
+  const prepareCalls: File[] = [];
+  const preparedSeen: File[] = [];
+  const legacyFiles: File[] = [];
+  const attachmentId = await uploadAttachmentFile({
+    api,
+    file: original,
+    channelId: "channel-1",
+    clientRequestId: "request-resize",
+    prepareFile: async (file) => {
+      prepareCalls.push(file);
+      return { file: resized, outcome: "resized", originalBytes: file.size, width: 2560, height: 1920 };
+    },
+    onPreparedFile: (prepared) => preparedSeen.push(prepared.file),
+    legacyUpload: async (file) => {
+      legacyFiles.push(file);
+      return "legacy-resized";
+    },
+    requestImpl: async () => {
+      throw new Error("the resized photo must not take the direct path");
+    },
+  });
+
+  assert.equal(attachmentId, "legacy-resized");
+  assert.equal(prepareCalls.length, 1);
+  assert.equal(prepareCalls[0], original);
+  assert.equal(preparedSeen[0], resized);
+  assert.equal(legacyFiles[0], resized);
+  assert.deepEqual(calls, [{ method: "GET", url: "/attachments/upload-capabilities" }]);
+});
+
+test("a direct upload creates its session for, and PUTs, the prepared file", async () => {
+  const { api, calls } = makeApi({ capabilities, create: [created], complete: [completed] });
+  const resized = fileOf(6, "image/webp", "shot.jpg");
+  const sent: unknown[] = [];
+  await uploadAttachmentFile({
+    api,
+    file: fileOf(18, "image/webp", "shot.webp"),
+    channelId: "channel-1",
+    clientRequestId: "request-resize-direct",
+    prepareFile: async (file) => ({ file: resized, outcome: "resized", originalBytes: file.size }),
+    legacyUpload: async () => "must-not-run",
+    requestImpl: async (config) => {
+      sent.push(config.data);
+      return { status: 200 };
+    },
+  });
+  assert.equal(sent[0], resized);
+  const createBody = calls[1]?.body as { filename: string; sizeBytes: number };
+  assert.equal(createBody.filename, "shot.jpg");
+  assert.equal(createBody.sizeBytes, 6);
+});
+
+test("a failing prepare never blocks the upload: the original is sent", async () => {
+  const { api } = makeApi({ capabilities });
+  const original = fileOf(3, "image/jpeg", "photo.jpg");
+  const legacyFiles: File[] = [];
+  const attachmentId = await uploadAttachmentFile({
+    api,
+    file: original,
+    channelId: "channel-1",
+    clientRequestId: "request-prepare-throws",
+    prepareFile: async () => {
+      throw new Error("resize crashed");
+    },
+    legacyUpload: async (file) => {
+      legacyFiles.push(file);
+      return "legacy-original";
+    },
+  });
+  assert.equal(attachmentId, "legacy-original");
+  assert.equal(legacyFiles[0], original);
+});
+
+test("by default the shared upload leaves files outside the resize rule unchanged", async () => {
+  const { api } = makeApi({ capabilities });
+  const original = fileOf(3, "image/png", "small.png");
+  const prepared: string[] = [];
+  const legacyFiles: File[] = [];
+  await uploadAttachmentFile({
+    api,
+    file: original,
+    channelId: "channel-1",
+    clientRequestId: "request-default-prepare",
+    onPreparedFile: (result) => prepared.push(result.outcome),
+    legacyUpload: async (file) => {
+      legacyFiles.push(file);
+      return "legacy";
+    },
+  });
+  assert.deepEqual(prepared, ["not_eligible"]);
+  assert.equal(legacyFiles[0], original);
 });

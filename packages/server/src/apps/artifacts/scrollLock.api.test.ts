@@ -4,7 +4,8 @@
 // links found by its path; a normal page has no `warnings`; a version past the
 // check's byte budget isn't checked. A page's own frames are warned too
 // (`nested-frame`): in its markup (Porthole's rule) and created by its own
-// scripts; the word in its text or in a comment isn't. A pushed copy of a
+// scripts; the word in its text or in a comment isn't. A page with a `<form>`
+// is warned (`form`): it never submits in Raft's frame; one in a comment isn't. A pushed copy of a
 // common library is warned (`bundled-library`, bundledLibraries.ts) with the
 // pinned jsDelivr address to load instead: by its name, or by its banner read
 // from the request or, for bytes the server already has, its first bytes from
@@ -116,6 +117,23 @@ test("a page that embeds a frame of its own is pushed with a nested-frame warnin
   assert.match(warning.message, /<iframe>/);
 });
 
+test("a page with a form is pushed with a form warning (no allow-forms in Raft's frame); a form in a comment isn't", async ({ app, seed }) => {
+  const world = await seedWorld(seed);
+  const form = '<form id="invite"><input name="email"><button>Invite</button></form>';
+  const withForm = await publish(app, world.key, { target: `#${world.channel.name}`, title: "Form", files: [text("index.html", `<!doctype html>\n<html>\n<body>${form}</body>\n</html>\n`)] });
+  assert.equal(withForm.status, 201, JSON.stringify(withForm.body));
+  assert.equal(withForm.body.version.number, 1, "published all the same");
+  assert.equal(withForm.body.warnings?.length, 1, JSON.stringify(withForm.body.warnings));
+  const [warning] = withForm.body.warnings;
+  assert.equal(warning.rule, "form");
+  assert.equal(warning.path, "index.html");
+  assert.equal(warning.line, 3);
+  assert.match(warning.message, /type="button"/);
+  const commented = await publish(app, world.key, { target: `#${world.channel.name}`, title: "Commented", files: [text("index.html", page(`<!-- ${form} -->`))] });
+  assert.equal(commented.status, 201, JSON.stringify(commented.body));
+  assert.equal("warnings" in commented.body, false, JSON.stringify(commented.body.warnings));
+});
+
 test("a page's own script that creates a frame is pushed with a nested-frame warning naming the call", async ({ app, seed }) => {
   const world = await seedWorld(seed);
   const created = await publish(app, world.key, {
@@ -176,7 +194,9 @@ test("a stylesheet the page links, read from storage when the page carries over,
   assert.equal(v2.body.warnings?.length, 1, JSON.stringify(v2.body.warnings));
   assert.equal(v2.body.warnings[0].path, "assets/app.css");
   assert.equal(v2.body.warnings[0].line, 2);
-  assert.equal(world.reads.length, 1, "the page alone from storage; never notes.txt");
+  // Distinct objects: the links in content (references.ts, beside the check) read the carried-over page too, in
+  // parallel; what this guards is that nothing else is read (never notes.txt).
+  assert.equal(new Set(world.reads).size, 1, "the page alone from storage; never notes.txt");
 });
 
 test("a version past the check's byte budget isn't checked: published, no warning", async ({ app, seed }) => {
@@ -225,5 +245,6 @@ test("a copy the server already has is read from storage by its first bytes; one
   const v2 = await publish(app, world.key, { artifact: v1.body.artifact.id, base: 1, files: [{ path: "lib/b.js", sha256, size: Buffer.byteLength(chart) }] });
   assert.equal(v2.status, 201, JSON.stringify(v2.body));
   assert.deepEqual(v2.body.warnings?.map((warning: { rule: string; path: string }) => [warning.rule, warning.path]), [["bundled-library", "lib/b.js"]], "lib/a.js carried over: not again");
-  assert.equal(world.reads.length, 2, "the page for its checks, and lib/b.js's start");
+  // Distinct objects, as above: the links in content read the carried-over page again beside the check.
+  assert.equal(new Set(world.reads).size, 2, "the page for its checks, and lib/b.js's start");
 });

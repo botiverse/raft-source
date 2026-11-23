@@ -1,4 +1,4 @@
-export { verifyBundledPiOAuth } from "./bundledPiOAuth";
+export { verifyBundledPiBedrock, verifyBundledPiOAuth } from "./bundledPiOAuth";
 export { verifyBundledKimiSdk } from "./drivers/index";
 export { verifyBundledOarHost } from "./oarLoader";
 import { applyDaemonConnectAttemptTimeout } from "./connectAttemptTimeout";
@@ -9,6 +9,7 @@ import {
   writeRuntimeCliVersionState,
 } from "./runtimeCliVersionTracker";
 import path from "node:path";
+import { ComputerChecksService } from "./computerChecks/service";
 import { resolveWorkspaceDirectoryPath } from "./workspaces";
 import { readVolumeCapacity } from "./volumeCapacity";
 import os from "node:os";
@@ -39,6 +40,8 @@ import {
   type AgentConfig,
   type ComputerLastUpgradeReceipt,
   type ComputerInstallerRepairHint,
+  type ComputerUpgradeScopeUnavailable,
+  parseComputerUpgradeScope,
   type ComputerMigratedFrom,
   isComputerMigratedFrom,
   type LegacyCredentialExposureReport,
@@ -66,6 +69,8 @@ import {
   DAEMON_CAPABILITY_RUNTIME_AUTH_QWEN_PROVIDER,
   DAEMON_CAPABILITY_RUNTIME_AUTH_ANTIGRAVITY,
   DAEMON_CAPABILITY_RUNTIME_AUTH_ANTIGRAVITY_LOGOUT,
+  DAEMON_CAPABILITY_RUNTIME_UPGRADE,
+  DAEMON_CAPABILITY_RUNTIME_INSTALL,
   DAEMON_CAPABILITY_RUNTIME_AUTH_PI,
   DAEMON_CAPABILITY_RUNTIME_AUTH_GROK,
   DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE,
@@ -74,16 +79,20 @@ import {
   DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET_CLAUDE_KINDS,
   DAEMON_CAPABILITY_STARTUP_READINESS,
   SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_LIMIT_RESETS_V1,
+  SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_CREDITS_V1,
+  SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_UNSUPPORTED_REASON_V1,
   SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_WINDOW_SCOPE_V1,
   SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_WINDOW_SCOPE_V2,
   isRuntimeAccountUsageProvider,
+  parseRuntimeAccountUsageAccountHomes,
   isRuntimeLimitResetIdempotencyKey,
   isRuntimeLimitResetKind,
   type RuntimeLimitResetIdempotencyKey,
-  type RuntimeLimitResetKind,
   type RuntimeLimitResetsReadResult,
   withoutLimitResets,
   withoutModelsScopes,
+  withoutCredits,
+  withoutUnsupportedReasons,
   withoutWindowScopes,
   claudeFiveHourLimitOf,
   type RuntimeLimitResetResult,
@@ -99,25 +108,44 @@ import {
   isValidMachineDiskStatus,
   DAEMON_CAPABILITY_RUNTIME_OUTCOME_V1,
   DAEMON_CAPABILITY_TASK_CREATE_FRESHNESS,
+  FORWARDED_RESOLVE_CAPABILITY,
   DAEMON_CAPABILITY_RUNTIME_HOST_OAR,
   DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX,
   DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR,
   DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK,
   DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR_PI,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CLAUDE,
   DAEMON_CAPABILITY_AGENT_CONTEXT_VIEW_V0,
   DAEMON_CAPABILITY_AGENT_CONTEXT_SEARCH_V0,
   DAEMON_CAPABILITY_AGENT_CONTEXT_VIEW_CODEX_ROOT_V1,
   DAEMON_CAPABILITY_RUNNER_CREDENTIAL_RECONCILE_V1,
+  DAEMON_CAPABILITY_RUNNER_CREDENTIAL_RENEW_V1,
   DAEMON_CAPABILITY_AGENT_CONFIG_PUSH,
+  DAEMON_CAPABILITY_AGENT_CONFIG_INTERRUPT,
+  DAEMON_CAPABILITY_AGENT_FOCUS_V1,
+  DAEMON_CAPABILITY_CODEX_SERVICE_TIER_V1,
   DAEMON_CAPABILITY_CONTROL_START_CATCHUP_V1,
   DAEMON_CAPABILITY_MODEL_LIMITS_REPORT_V1,
+  DAEMON_CAPABILITY_TURN_END_COMPACTION_V2,
+  DAEMON_CAPABILITY_CONSTRUCTED_INIT_V1,
+  DAEMON_CAPABILITY_PROC_STOP,
+  DAEMON_CAPABILITY_COMPUTER_CHECKS,
+  isValidProcName,
+  type ProcJobStopOutcome,
+  PROC_JOBS_SNAPSHOT_PROTOCOL_VERSION,
   SERVER_CAPABILITY_RUNTIME_OUTCOME_ACK_V1,
   SERVER_CAPABILITY_AGENT_SEND_INTENT_V1,
   SERVER_CAPABILITY_TURN_ENDED_V1,
+  SERVER_CAPABILITY_INBOX_ROWS_V1,
   SERVER_CAPABILITY_STICKY_FAILURE_REASONS_V1,
   SERVER_CAPABILITY_RUNTIME_CREDENTIALS_CHANGED_V1,
+  SERVER_CAPABILITY_RUNTIME_UPGRADE_V1,
+  SERVER_CAPABILITY_RUNTIME_UPDATE_CHECK_V1,
+  SERVER_CAPABILITY_RUNTIME_INSTALL_V1,
   SERVER_CAPABILITY_RUNTIME_READINESS_V1,
   runtimeAuthRuntimeFor,
+  runtimeAuthStatusOnly,
   SERVER_CAPABILITY_TASK_WRITE_LANDING_V1,
   SERVER_CAPABILITY_IDLE_TASK_REMINDER_V1,
   SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1,
@@ -126,6 +154,7 @@ import {
   SERVER_CAPABILITY_SERVER_FEATURES_V1,
   SERVER_CAPABILITY_MIGRATION_BACKUP_IGNORE_SOURCES_V1,
   SERVER_CAPABILITY_MIGRATION_IGNORED_PARTIAL_V1,
+  SERVER_CAPABILITY_MIGRATION_SKIPPED_UNREADABLE_V1,
   SERVER_CAPABILITY_MIGRATION_USER_IGNORE_RECEIPT_V1,
   SERVER_CAPABILITY_MIGRATION_SOURCE_DRAIN_PROGRESS_V1,
   type AgentMigrationSourceDrainWaitingFor,
@@ -148,8 +177,18 @@ import {
   APP_SNAPSHOT_TRACE_IDENTITY_KEYS,
   APP_SOURCE_TRACE_IDENTITY_KEYS,
 } from "@botiverse/raft-shared/src/appRuntimeTrace";
+import { systemCaTrustTraceAttrs } from "@botiverse/raft-shared/src/systemTrust";
 import { setAgentProcJobManager, setAgentProxyServerChecksTaskWriteLanding } from "./agentCredentialProxy";
-import { ProcJobManager, procStopReasonForAgentStop, type ProcStopReason } from "./procJobs";
+import {
+  expiringRunnerCredentialCount,
+  heldRunnerCredentialIdsWithRenewals,
+  installRunnerCredentialRenewer,
+  parseRunnerCredentialMintBody,
+  trackRunnerCredential,
+  type RunnerCredential,
+} from "./runnerCredentialRenewal";
+import { revokeRunnerCredentialById } from "./runnerCredentialRevoke";
+import { daemonRunsProcJobs, ProcJobManager, procStopReasonForAgentStop, readProcMemoryMaxBytes, type ProcStopReason } from "./procJobs";
 import { AgentProcessManager, classifySpawnFailure, StaleDispatchError, type RuntimeProcessGate } from "./agentProcessManager";
 import { AgentEnvVarsNotAllowedError, OarOnlyStartError } from "./spawnFailureErrors";
 import { AgentConfigRevisions } from "./agentConfigRevisions";
@@ -158,10 +197,10 @@ import { ComputerUpgradeDrainChannel, type ComputerUpgradeDrainPaths } from "./c
 import { clampAgentDrainDeadlineMs, type AgentDrainSummary } from "./agentDrain";
 import type { AgentNotIdleReason } from "./agentIdle";
 import type { AgentLifecycleHost } from "./agentHost/agentLifecycleHost";
-import { isOarHostEnabled, OAR_HOST_DISABLED_ENV, OarAgentHost, type OpenOarSession } from "./agentHost/oarAgentHost";
+import { isOarHostEnabled, isOarRuntimeSupportedOnPlatform, OAR_HOST_DISABLED_ENV, OarAgentHost, type OpenOarSession } from "./agentHost/oarAgentHost";
 import { ExitStreaks } from "./planExit";
 import { getDriver, resolveKimiHome, runtimeIdsShippedWithComputer } from "./drivers/index";
-import type { RuntimeProbeUnavailableReason } from "./drivers/types";
+import type { RuntimeDriver, RuntimeProbeResult, RuntimeProbeUnavailableReason } from "./drivers/types";
 import { readCommandVersion, resolveCommandOnPath } from "./drivers/probe";
 import {
   DaemonConnection,
@@ -171,6 +210,7 @@ import {
 } from "./connection";
 import { createAgentAppInboxStore, type AgentAppInboxStore } from "./agentAppInbox";
 import { isServerContextMessage } from "./agentRuntimeInput";
+import { normalizeAgentStartOpenTasks } from "./startOpenTasks";
 import {
   createScopedAppStorageFactory,
   type ScopedAppStorageFactory,
@@ -203,31 +243,26 @@ import {
   type TraceJitter,
 } from "@botiverse/raft-trace-client";
 import { DaemonTraceBundleUploader } from "./traceBundleUpload";
+import { flushWithinBound, isStartFailureFrame, StartFailureFlushScheduler, stopFlushBudgetMs } from "./telemetryFlush";
 import { acceptServerTraceUploadUrl, resolveMachineTraceUploadUrl, resolveTraceUploadUrl, type ServerTraceUploadUrlRejection } from "./traceUploadUrl";
 import { ProbeGate } from "./probeGate";
 import { ServerFeaturesRefresh, type ServerFeaturesRefreshOptions } from "./serverFeaturesRefresh";
-import { cursorSdkAvailable, loadOarOpencodeProviderAuth, loadOarPiProviderAuth, loadOarQwenProviderAuth, loadOarRuntime } from "./oarLoader";
+import { cursorSdkAvailable, loadOarOpencodeProviderAuth, loadOarPiProviderAuth, loadOarQwenProviderAuth, loadOarRuntime, piRpcAvailable } from "./oarLoader";
 import { OPENCODE_LOGIN_TIMEOUT_MS, OPENCODE_SIGN_IN_IDLE_MS, OPENCODE_SIGN_IN_TIMEOUT_MS, OpencodeSignIn } from "./runtimeAuth/opencodeProviderSignIn";
 import { piSignInDeviceId, piSignInPaths } from "./runtimeAuth/piSignInStore";
-import { RuntimeAuthHost, runtimeAuthRuntimesReadBy } from "./runtimeAuth/runtimeAuthHost";
+import { RuntimeAuthHost, runtimeAuthRunsOn, runtimeAuthRuntimesReadBy } from "./runtimeAuth/runtimeAuthHost";
+import { RuntimeUpgradeHost } from "./runtimeUpgrade";
+import { RuntimeInstallHost } from "./runtimeInstall";
 import { loadKimiSdkAuth, readKimiCodeSignInStatus } from "./runtimeAuth/kimiSdkAuth";
 import { readKimiSdkUsage } from "./runtimeAccountUsage/kimiSdkUsage";
 import { RuntimeModelSourceCache, type RuntimeModelCacheRead } from "./runtimeModels/modelSourceCache";
+import { OarSkillCatalog } from "./runtimeSkills/oarSkills";
 import { RAFT_HOME_ENV, SLOCK_HOME_ENV, listLegacyRaftStatePaths, resolveRaftHome, resolveRaftHomePath } from "./raftHome";
 import { regenerateExistingOpencliWrappers, removeStaleAgentTokenFiles } from "./drivers/cliTransport";
 import { migrateAllLegacyBridgeArtifacts } from "./legacyBridgeArtifacts";
 import { isLegacyMachineKey, legacyCredentialExposureForReady, recordLegacyCredentialExposure } from "./legacyCredentialExposure";
 import { daemonFetch } from "./daemonFetch";
-import {
-  buildProviderProbeResultMessage,
-  buildUnclaimedProviderProbeResult,
-  claimProbeMaterialization,
-  runProviderProbeCanary,
-  type ProbeMaterialization,
-} from "./providerProbe";
-import { computerUpgradeInstallerReportOfError, isProviderProbeRuntime, parseComputerUpgradeInstallerReport } from "@botiverse/raft-shared";
-import { VERSION as PI_SDK_VERSION } from "@earendil-works/pi-coding-agent";
-import { asProviderProbeId } from "@botiverse/raft-shared";
+import { computerUpgradeInstallerReportOfError, parseComputerUpgradeInstallerReport } from "@botiverse/raft-shared";
 import { assertLegacyDaemonKeyNotAdoptedByComputer } from "./computerMigrationGuard";
 import { PROCESS_MEMORY_TRACE_ATTRS, serviceMemoryAttrs, startProcessMemoryReporter } from "./processMemory";
 import { readMachineMemoryStatus } from "./machineMemory";
@@ -284,8 +319,10 @@ import {
   claudeLimitResetsDrivable,
   createRuntimeLimitResetRedeemer,
   createRuntimeLimitResetsReader,
+  type RuntimeLimitResetRedeemInput,
   type RuntimeLimitResetRedeemer,
   type RuntimeLimitResetReport,
+  type RuntimeLimitResetsReadInput,
   type RuntimeLimitResetsReader,
 } from "./runtimeAccountUsage/limitReset";
 
@@ -353,9 +390,25 @@ function isRetryableChunkBodyError(error: unknown): boolean {
 const DISK_STATUS_FIRST_REPORT_DELAY_MS = 60_000;
 /** Reconciler step 15 (B13): how long after a missing-runtime local stop the daemon re-detects runtimes. */
 export const RUNTIME_ABSENT_REDETECT_DELAY_MS = 10_000;
+/**
+ * How long after the last `ready` the daemon checks, in a detection child of
+ * its own and without telling the server, whether a runtime CLI was upgraded
+ * (or installed, or removed) outside Raft while it stayed connected. Only a
+ * change re-announces: the same re-emit a web rescan does, so the server's
+ * runtime versions and model catalog (Claude's alias labels name the version
+ * they resolve to) follow the CLI that now runs (#proj-raft-computer:#120).
+ */
+export const RUNTIME_VERSION_RECHECK_INTERVAL_MS = 60 * 60_000;
 const DISK_STATUS_REPORT_INTERVAL_MS = 60 * 60 * 1_000;
 // Memory moves faster than disk; the machine picker reads the latest report.
 const MEMORY_STATUS_REPORT_INTERVAL_MS = 5 * 60 * 1_000;
+/**
+ * `machine:proc_jobs:snapshot` (docs/contracts/proc-jobs.md): this long after
+ * a (re)connect or a job's change (a burst of changes sends one), then every
+ * 5 minutes; the server keeps one for 15.
+ */
+export const PROC_JOBS_SNAPSHOT_DEBOUNCE_MS = 2_000;
+export const PROC_JOBS_SNAPSHOT_INTERVAL_MS = 5 * 60 * 1_000;
 const STUCK_TOOL_V0_IDENTITY_ATTRS = [
   "schema_version",
   "server_id",
@@ -376,6 +429,30 @@ const STUCK_TOOL_V0_IDENTITY_ATTRS = [
   "runtime_version",
   "tool_class",
 ] as const;
+
+/**
+ * One local log line per limit-reset answer, so the Computer's own log says
+ * what OAR answered and how long it took without waiting for trace upload.
+ * Kinds, reasons and screen words only: no account or screen text.
+ */
+function logLimitResetAnswer(
+  operation: "read" | "redeem",
+  requestId: string,
+  provider: RuntimeAccountUsageProvider,
+  result: { kind: string; reason?: string },
+  report: RuntimeLimitResetReport,
+  durationMs: number,
+): void {
+  const parts = [
+    `outcome=${result.kind}${result.reason ? `:${result.reason}` : ""}`,
+    ...(report.oarOutcome ? [`oar=${report.oarOutcome}`] : []),
+    ...(report.startupScreen ? [`startup_screen=${report.startupScreen}`] : []),
+    ...(report.onboardingCompleted ? ["onboarding_completed=true"] : []),
+    ...(report.claudeVersion ? [`claude=${report.claudeVersion}`] : []),
+    `duration_ms=${durationMs}`,
+  ];
+  logger.info(`[Daemon] Answered limit_resets ${operation} for ${provider} (request ${requestId.slice(0, 8)}): ${parts.join(" ")}`);
+}
 
 /** The most limit resets any account in a usage snapshot reports (Codex); absent when none reports a count. */
 function limitResetsAvailableAttr(snapshot: RuntimeAccountUsageSnapshot): { limit_resets_available?: number } {
@@ -423,7 +500,7 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
   // closed sets only, never the account). These four were emitted since #11069
   // but missing here, so the filter dropped them (#oar-raft:eea998ea).
   "daemon.runtime_auth.status.reported": {
-    spanAttrs: ["trigger", ...(["claude", "codex", "kimi", "qoder", "qwen", "antigravity", "pi", "grok", "opencode"] as const).flatMap((runtime) => [
+    spanAttrs: ["trigger", ...(["claude", "codex", "kimi", "qoder", "qwen", "antigravity", "pi", "grok", "opencode", "dsh"] as const).flatMap((runtime) => [
       runtime,
       `${runtime}_method`,
       `${runtime}_plan`,
@@ -441,6 +518,16 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
   "daemon.runtime_auth.login.result": { spanAttrs: ["runtime", "provider_id", "outcome", "reason", "error_kind", "code_prompts", "duration_ms"] },
   "daemon.runtime_auth.logout.result": { spanAttrs: ["runtime", "provider_id", "outcome", "reason", "error_kind", "duration_ms"] },
   "daemon.runtime_auth.rescan_models.failed": { spanAttrs: ["runtime"] },
+  // Upgrade on the web (runtimeUpgrade.ts): the outcome's kind, versions and
+  // the updater output's length only. Never the output, a path or a detail.
+  "daemon.runtime.upgrade": { spanAttrs: ["runtime", "outcome", "from_version", "to_version", "version", "exit_code", "reason", "code", "duration_ms", "output_length"] },
+  "daemon.runtime.upgrade.message_dropped": { spanAttrs: ["type"] },
+  // Install on the web (runtimeInstall.ts): the plan's kind, reason and step
+  // count, the outcome's kind, version and the installer output's length only.
+  // Never a step, the output, a path or OAR's detail.
+  "daemon.runtime.install.plan": { spanAttrs: ["runtime", "outcome", "reason", "step_count", "duration_ms"] },
+  "daemon.runtime.install": { spanAttrs: ["runtime", "outcome", "version", "exit_code", "reason", "code", "duration_ms", "output_length"] },
+  "daemon.runtime.install.message_dropped": { spanAttrs: ["type"] },
   // Qwen Code's provider list and connect: the provider id (Qwen's menu id),
   // the outcome and OAR's error kind. Never the key, an endpoint or a model.
   "daemon.runtime_auth.providers.result": { spanAttrs: ["runtime", "outcome", "reason", "error_kind", "provider_count", "duration_ms"] },
@@ -480,6 +567,10 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
       // #oar-raft:#3: the most limit resets any account reports (Codex), when one reports a count.
       "limit_resets_available",
       "error_class",
+      // Agents' own account folders read beside the default account (a refresh with
+      // `accountHomes`), and those past the cap left unread. Counts only, never a path.
+      "account_folder_count",
+      "account_folders_dropped",
     ],
   },
   // A limit-reset redeem from the web: the provider, the wire outcome and its
@@ -490,10 +581,12 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
   // the resets held, with Claude Code's version and counts of kinds by state.
   // A failed Claude Code start adds OAR's word for its last screen
   // (`startup_screen`, e.g. `prompt_with_text`). Never screen text.
+  // `onboarding_completed`: OAR completed Claude Code's first-run onboarding
+  // on the way (OAR 0.114).
   "daemon.runtime_account_usage.limit_reset": {
     spanAttrs: [
       "outcome", "provider", "reason", "snapshot_sent", "limit_resets_available", "duration_ms",
-      "operation", "reset_kind", "claude_version", "oar_outcome", "startup_screen", "program", "five_hour_spent", "available_kinds", "unknown_kinds",
+      "operation", "reset_kind", "claude_version", "oar_outcome", "startup_screen", "onboarding_completed", "program", "five_hour_spent", "available_kinds", "unknown_kinds", "kind_states",
     ],
   },
   "daemon.app_config.receive": {
@@ -663,6 +756,16 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
     endAttrs: ["error_class"],
     eventAttrs: {
       "daemon.machine_lock.acquired": ["machine_dir_present"],
+      // How the process entry extended TLS trust with the OS store
+      // (installSystemCaTrust): status and counts only, never cert contents.
+      "daemon.system_ca_trust": [
+        "system_ca_status",
+        "system_ca_count",
+        "system_ca_added_count",
+        "system_ca_unparsable_count",
+        "duration_ms",
+        "error_class",
+      ],
     },
   },
   "daemon.lifecycle.stop": {
@@ -985,6 +1088,15 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
   "pi.session.rotation_failed": {
     spanAttrs: ["agentId", "launchId", "runtime", "stage", "outcome", "error_class", "error_code"],
   },
+  // task #triage:#431: Pi continued (or, a second time in the turn, surfaced) an empty
+  // `finish_reason: error` stop after tool results. Closed outcomes and error classes; the
+  // session id is hashed by the sink; never message or error text.
+  "daemon.pi.provider_finish_error.continued": {
+    spanAttrs: [
+      "agentId", "launchId", "runtime", "provider_id", "model_id", "session_id", "session_id_present",
+      "outcome", "error_class",
+    ],
+  },
   // Task #1310: one row per Pi provider call (drivers/piProviderCallTracker.ts).
   // Closed sets and bucketed durations only; never a URL, header, body or error text.
   "daemon.pi.provider_call.ended": {
@@ -1195,6 +1307,27 @@ export const DAEMON_CLI_USAGE = "Usage: slock-daemon --server-url <url> --api-ke
 export interface ParsedDaemonCliArgs {
   serverUrl: string;
   apiKey: string;
+}
+
+function runtimeDetectionSignature(detection: { ids: readonly string[]; versions: Readonly<Record<string, string>> }): string {
+  return JSON.stringify([...detection.ids].sort().map((id) => [id, detection.versions[id] ?? null]));
+}
+
+/**
+ * The runtimes whose presence or CLI version differs between the last
+ * announced inventory and a fresh detection, sorted (#proj-raft-computer:#120).
+ */
+export function changedRuntimeVersions(
+  announced: { ids: readonly string[]; versions: Readonly<Record<string, string>> },
+  detected: { ids: readonly string[]; versions: Readonly<Record<string, string>> },
+): string[] {
+  const before = new Set(announced.ids);
+  const after = new Set(detected.ids);
+  const changed = new Set<string>();
+  for (const id of new Set([...before, ...after])) {
+    if (before.has(id) !== after.has(id) || (announced.versions[id] ?? null) !== (detected.versions[id] ?? null)) changed.add(id);
+  }
+  return [...changed].sort();
 }
 
 /**
@@ -1483,6 +1616,8 @@ const RESUMABLE_MIGRATION_SPECIFIC_ERROR_CODES = new Set([
   "MIGRATION_CONTROL_MANIFEST_INVALID",
   "MIGRATION_CONTROL_MANIFEST_TOO_LARGE",
   "MIGRATION_TRANSFER_SUMMARY_CONFLICT",
+  // MEMORY.md, notes/ or the workspace could not be read; the message names the path.
+  "MIGRATION_WORKSPACE_KEY_PATH_UNREADABLE",
 ]);
 
 function normalizeResumableMigrationSpecificErrorCode(value: string): string | null {
@@ -1794,6 +1929,8 @@ export interface DaemonCoreOptions {
   turnActivitySnapshotPath?: string | null;
   /** Reconciler step 15: RUNTIME_ABSENT_REDETECT_DELAY_MS (tests shorten it). */
   runtimeAbsentRedetectDelayMs?: number;
+  /** Test seam for RUNTIME_VERSION_RECHECK_INTERVAL_MS. */
+  runtimeVersionRecheckIntervalMs?: number;
   /**
    * Reconciler step 13: the Computer service's drain files for this runner
    * (computerUpgradeDrain.ts). Set only by a Computer runner; with it the
@@ -1829,6 +1966,13 @@ export interface DaemonCoreOptions {
    * when it changed.
    */
   getComputerInstallerRepairHint?: () => Promise<ComputerInstallerRepairHint | null>;
+  /**
+   * The Computer's systemd scope probe for a web upgrade's installer, run once
+   * per runner start (so again after every upgrade): an explicit refusal, or
+   * null when allowed or unknown. Carried on every `ready` as `upgradeScope`
+   * (absent when null), which replaces what the server held.
+   */
+  getComputerUpgradeScope?: () => Promise<ComputerUpgradeScopeUnavailable | null>;
   /**
    * Raft Desktop moved this Computer from its embedded one (RAFT_HOME's
    * one-shot `computer/migrated-from.json`): what this server's next ready
@@ -1920,6 +2064,10 @@ export interface DaemonCoreOptions {
   platform?: NodeJS.Platform;
   /** task #17: web login / logout through OAR (injectable for tests). */
   runtimeAuthHost?: RuntimeAuthHost;
+  /** A runtime's own updater, run when a person presses Upgrade on the web (injectable for tests). */
+  runtimeUpgradeHost?: RuntimeUpgradeHost;
+  /** A runtime's own installer, run when a person presses Install on the web and confirms (injectable for tests). */
+  runtimeInstallHost?: RuntimeInstallHost;
   /** Test seam: one runtime's model detection; production asks the runtime's driver or its static list. */
   runtimeModelDetector?: (runtime: string) => Promise<RuntimeModelSourceOutcome>;
   /** Test seam: where the credential disk watch reads (a temp home, a fake timer); production uses the user's home. */
@@ -2042,6 +2190,11 @@ export interface MigrationTargetImportView {
   manifestSha256: string | null;
   canDriveTargetImport: true;
 }
+
+/** A `system.proc` Inbox notice waiting for, or sent through, the agents' Inboxes (apps/proc/definition.ts). */
+type ProcNotice =
+  | { kind: "memory_limit"; agentId: string; name: string; memoryMaxBytes: number }
+  | { kind: "owner_stop"; agentId: string; name: string; stoppedBy: string | null };
 
 type AgentMigrationCancelMessage = Extract<ServerToMachineMessage, { type: "machine:migration:cancel" }>;
 
@@ -2175,7 +2328,14 @@ export interface RuntimeDetectionHooks {
   onRuntimeChecked?: (checked: RuntimeDetectionCheckedRuntime) => void;
 }
 
-export function detectRuntimes(tracer: Tracer = noopTracer, hooks: RuntimeDetectionHooks = {}): RuntimeDetection {
+/**
+ * One detection round's bookkeeping: what each runtime's probe found (or the
+ * PATH fallback when a driver has no probe or its probe threw), streamed
+ * through `hooks` and the `daemon.runtime.detect` span as the round goes.
+ * Shared by the synchronous round and the asynchronous one, which differ only
+ * in how a driver is probed.
+ */
+function startRuntimeDetection(tracer: Tracer, hooks: RuntimeDetectionHooks) {
   const ids: string[] = [];
   const versions: Record<string, string> = {};
   const diagnostics: Record<string, string> = {};
@@ -2189,75 +2349,69 @@ export function detectRuntimes(tracer: Tracer = noopTracer, hooks: RuntimeDetect
   });
 
   // A runtime that runs only on the OAR host is offered only where that host
-  // runs: not on Windows, not with the OAR host disabled (oarAgentHost.ts).
-  const oarOnlyRunnable = process.platform !== "win32" && isOarHostEnabled();
-  for (const runtime of RUNTIMES) {
-    const driver = getDriver(runtime.id);
-    if (driver.oarOnly && !oarOnlyRunnable) {
-      hooks.onRuntimeChecked?.({ runtime: runtime.id, available: false });
-      span.addEvent("daemon.runtime.detect.checked", { runtime: runtime.id, outcome: "unavailable", reason: "oar_host_unavailable" });
-      continue;
-    }
-    let probeErrorPresent = false;
-    try {
-      if (driver.probe) {
-        const probe = driver.probe();
-        if (!probe.available) {
-          if (probe.version) versions[runtime.id] = probe.version;
-          if (probe.diagnostic) diagnostics[runtime.id] = probe.diagnostic;
-          if (probe.unavailableReason) unavailableReasons[runtime.id] = probe.unavailableReason;
-          hooks.onRuntimeChecked?.({
-            runtime: runtime.id,
-            available: false,
-            ...(probe.version ? { version: probe.version } : {}),
-            ...(probe.diagnostic ? { diagnostic: probe.diagnostic } : {}),
-            ...(probe.unavailableReason ? { unavailableReason: probe.unavailableReason } : {}),
-          });
-          span.addEvent("daemon.runtime.detect.checked", {
-            runtime: runtime.id,
-            outcome: "unavailable",
-            version_present: Boolean(probe.version),
-            diagnostic_present: Boolean(probe.diagnostic),
-            ...(probe.diagnostic ? { diagnostic: probe.diagnostic } : {}),
-            // task #1240: lookup phase/ms/budget/outcome, never values or paths.
-            ...(probe.lookupTiming ? { lookup_timing: probe.lookupTiming } : {}),
-            binary_path_present: false,
-          });
-          continue;
-        }
-        ids.push(runtime.id);
-        if (probe.version) versions[runtime.id] = probe.version;
-        if (probe.diagnostic) diagnostics[runtime.id] = probe.diagnostic;
-        hooks.onRuntimeChecked?.({
-          runtime: runtime.id,
-          available: true,
-          ...(probe.version ? { version: probe.version } : {}),
-          ...(probe.diagnostic ? { diagnostic: probe.diagnostic } : {}),
-        });
-        span.addEvent("daemon.runtime.detect.checked", {
-          runtime: runtime.id,
-          outcome: "available",
-          version_present: Boolean(probe.version),
-          diagnostic_present: Boolean(probe.diagnostic),
-          ...(probe.diagnostic ? { diagnostic: probe.diagnostic } : {}),
-          ...(probe.lookupTiming ? { lookup_timing: probe.lookupTiming } : {}),
-          binary_path_present: false,
-        });
-        continue;
-      }
-    } catch {
-      // Fall through to legacy PATH probing. Detection should be best-effort.
-      probeErrorPresent = true;
-    }
+  // runs it: OAR host enabled and supported on this platform (oarAgentHost.ts).
+  const oarHostEnabled = isOarHostEnabled();
 
+  /** False when the runtime is not probed at all here (an OAR-only runtime the OAR host cannot run). */
+  const shouldProbe = (runtimeId: string, driver: RuntimeDriver): boolean => {
+    if (!driver.oarOnly || (oarHostEnabled && isOarRuntimeSupportedOnPlatform(runtimeId))) return true;
+    hooks.onRuntimeChecked?.({ runtime: runtimeId, available: false });
+    span.addEvent("daemon.runtime.detect.checked", { runtime: runtimeId, outcome: "unavailable", reason: "oar_host_unavailable" });
+    return false;
+  };
+
+  const recordProbe = (runtimeId: string, probe: RuntimeProbeResult): void => {
+    if (!probe.available) {
+      if (probe.version) versions[runtimeId] = probe.version;
+      if (probe.diagnostic) diagnostics[runtimeId] = probe.diagnostic;
+      if (probe.unavailableReason) unavailableReasons[runtimeId] = probe.unavailableReason;
+      hooks.onRuntimeChecked?.({
+        runtime: runtimeId,
+        available: false,
+        ...(probe.version ? { version: probe.version } : {}),
+        ...(probe.diagnostic ? { diagnostic: probe.diagnostic } : {}),
+        ...(probe.unavailableReason ? { unavailableReason: probe.unavailableReason } : {}),
+      });
+      span.addEvent("daemon.runtime.detect.checked", {
+        runtime: runtimeId,
+        outcome: "unavailable",
+        version_present: Boolean(probe.version),
+        diagnostic_present: Boolean(probe.diagnostic),
+        ...(probe.diagnostic ? { diagnostic: probe.diagnostic } : {}),
+        // task #1240: lookup phase/ms/budget/outcome, never values or paths.
+        ...(probe.lookupTiming ? { lookup_timing: probe.lookupTiming } : {}),
+        binary_path_present: false,
+      });
+      return;
+    }
+    ids.push(runtimeId);
+    if (probe.version) versions[runtimeId] = probe.version;
+    if (probe.diagnostic) diagnostics[runtimeId] = probe.diagnostic;
+    hooks.onRuntimeChecked?.({
+      runtime: runtimeId,
+      available: true,
+      ...(probe.version ? { version: probe.version } : {}),
+      ...(probe.diagnostic ? { diagnostic: probe.diagnostic } : {}),
+    });
+    span.addEvent("daemon.runtime.detect.checked", {
+      runtime: runtimeId,
+      outcome: "available",
+      version_present: Boolean(probe.version),
+      diagnostic_present: Boolean(probe.diagnostic),
+      ...(probe.diagnostic ? { diagnostic: probe.diagnostic } : {}),
+      ...(probe.lookupTiming ? { lookup_timing: probe.lookupTiming } : {}),
+      binary_path_present: false,
+    });
+  };
+
+  /** Legacy PATH probing, for a driver with no probe or one whose probe threw. Detection should be best-effort. */
+  const recordPathLookup = (runtime: (typeof RUNTIMES)[number], probeErrorPresent: boolean): void => {
     const detectionBinaries = [runtime.binary];
-    let detectedByPath = false;
     for (const binary of detectionBinaries) {
       const resolved = resolveCommandOnPath(binary);
       if (!resolved) continue;
 
       ids.push(runtime.id);
-      detectedByPath = true;
       const version = readCommandVersion(binary);
       if (version) {
         versions[runtime.id] = version;
@@ -2270,31 +2424,74 @@ export function detectRuntimes(tracer: Tracer = noopTracer, hooks: RuntimeDetect
         binary_path_present: true,
         probe_error_present: probeErrorPresent,
       });
-      break;
+      return;
     }
-    if (!detectedByPath) {
-      hooks.onRuntimeChecked?.({ runtime: runtime.id, available: false });
-      span.addEvent("daemon.runtime.detect.checked", {
-        runtime: runtime.id,
-        outcome: "unavailable",
-        version_present: false,
-        binary_path_present: false,
-        probe_error_present: probeErrorPresent,
-      });
-    }
-  }
-
-  span.end("ok", {
-    attrs: {
-      detected_runtime_count: ids.length,
-    },
-  });
-  return {
-    ids,
-    versions,
-    ...(Object.keys(diagnostics).length > 0 ? { diagnostics } : {}),
-    ...(Object.keys(unavailableReasons).length > 0 ? { unavailableReasons } : {}),
+    hooks.onRuntimeChecked?.({ runtime: runtime.id, available: false });
+    span.addEvent("daemon.runtime.detect.checked", {
+      runtime: runtime.id,
+      outcome: "unavailable",
+      version_present: false,
+      binary_path_present: false,
+      probe_error_present: probeErrorPresent,
+    });
   };
+
+  const finish = (): RuntimeDetection => {
+    span.end("ok", {
+      attrs: {
+        detected_runtime_count: ids.length,
+      },
+    });
+    return {
+      ids,
+      versions,
+      ...(Object.keys(diagnostics).length > 0 ? { diagnostics } : {}),
+      ...(Object.keys(unavailableReasons).length > 0 ? { unavailableReasons } : {}),
+    };
+  };
+
+  return { shouldProbe, recordProbe, recordPathLookup, finish };
+}
+
+export function detectRuntimes(tracer: Tracer = noopTracer, hooks: RuntimeDetectionHooks = {}): RuntimeDetection {
+  const round = startRuntimeDetection(tracer, hooks);
+  for (const runtime of RUNTIMES) {
+    const driver = getDriver(runtime.id);
+    if (!round.shouldProbe(runtime.id, driver)) continue;
+    let probe: RuntimeProbeResult | null = null;
+    let probeErrorPresent = false;
+    try {
+      probe = driver.probe ? driver.probe() : null;
+    } catch {
+      probeErrorPresent = true;
+    }
+    if (probe) round.recordProbe(runtime.id, probe);
+    else round.recordPathLookup(runtime, probeErrorPresent);
+  }
+  return round.finish();
+}
+
+/**
+ * The detection round as the `__detect-runtimes` child runs it: a driver's
+ * asynchronous probe where it has one (`probeAsync`: OpenCode, from OAR's
+ * installation), else its synchronous probe, one runtime after another.
+ */
+export async function detectRuntimesAsync(tracer: Tracer = noopTracer, hooks: RuntimeDetectionHooks = {}): Promise<RuntimeDetection> {
+  const round = startRuntimeDetection(tracer, hooks);
+  for (const runtime of RUNTIMES) {
+    const driver = getDriver(runtime.id);
+    if (!round.shouldProbe(runtime.id, driver)) continue;
+    let probe: RuntimeProbeResult | null = null;
+    let probeErrorPresent = false;
+    try {
+      probe = driver.probeAsync ? await driver.probeAsync() : driver.probe ? driver.probe() : null;
+    } catch {
+      probeErrorPresent = true;
+    }
+    if (probe) round.recordProbe(runtime.id, probe);
+    else round.recordPathLookup(runtime, probeErrorPresent);
+  }
+  return round.finish();
 }
 
 function readPositiveIntegerEnv(name: string, fallback: number): number {
@@ -2369,6 +2566,11 @@ function summarizeIncomingMessage(msg: ServerToMachineMessage): string {
       return "";
     case "machine:runtimes:rescan":
       return "(rescan runtimes)";
+    case "machine:runtime:upgrade":
+    case "machine:runtime:install_plan":
+    case "machine:runtime:install":
+      // Type only: the fields are checked after this line.
+      return "";
     case "machine:runtime_auth:login:start":
     case "machine:runtime_auth:login:code":
     case "machine:runtime_auth:login:cancel":
@@ -2469,6 +2671,20 @@ export function migrationSummaryMayReportIgnoredPartial(
 }
 
 /**
+ * Whether a migration source may name the paths it could not read
+ * (`skippedUnreadable`). Both ends must accept it, as with
+ * migrationSummaryMayReportIgnoreSources: the Server (capability
+ * `migration:skipped-unreadable-v1`) and the target (the source lease's
+ * `targetAcceptsSkippedUnreadable`). The paths are skipped either way.
+ */
+export function migrationSummaryMayReportSkippedUnreadable(
+  serverAccepts: boolean,
+  lease: Pick<AgentMigrationTransportLeaseMessage, "targetAcceptsSkippedUnreadable">,
+): boolean {
+  return serverAccepts && lease.targetAcceptsSkippedUnreadable === true;
+}
+
+/**
  * A feedback request's `sessionLookup`, read as untrusted JSON: null unless
  * it names a runtime and a model; a session id that is not a string, and any
  * env var the runtime's session directory does not depend on, is dropped.
@@ -2528,6 +2744,7 @@ export class DaemonCore {
    * process manager.
    */
   private readonly agentHosts: AgentLifecycleHost;
+  private uninstallRunnerCredentialRenewer: (() => void) | null = null;
   /** Reconciler step 13: a Computer runner's half of a drained web upgrade. */
   private readonly upgradeDrain: ComputerUpgradeDrainChannel | null;
   /** RFC 060: this daemon runs OAR launches and advertises `runtime-host:oar`. */
@@ -2590,6 +2807,10 @@ export class DaemonCore {
   private machineContextConflict = false;
   private localTraceSink: LocalRotatingTraceSink | null = null;
   private traceBundleUploader: DaemonTraceBundleUploader | null = null;
+  /** Flushes telemetry shortly after an agent start fails (see `routeAgentManagerFrame`). */
+  private readonly startFailureFlush = new StartFailureFlushScheduler({
+    flush: () => this.traceBundleUploader?.flushNow("agent_start_failure") ?? Promise.resolve(),
+  });
   /**
    * The trace upload URL the attached server named in `machine:context`, when
    * it passed the allowlist (traceUploadUrl.ts); null otherwise. One daemon
@@ -2608,6 +2829,80 @@ export class DaemonCore {
   /** The server reads `machine:runtime_readiness` (SERVER_CAPABILITY_RUNTIME_READINESS_V1). */
   private serverReadsRuntimeReadiness = false;
   private processMemoryReporter: { stop(): void } | null = null;
+  /**
+   * `system.proc` notices (memory limit, a person's stop) found before the
+   * agents' Inboxes exist (adoption at startup, before the machine context):
+   * sent once it is bound.
+   */
+  private procNoticesWaiting: ProcNotice[] = [];
+
+  private noticeProcJob(input: ProcNotice): void {
+    if (!this.scopedAppStorageFactory) {
+      if (this.procNoticesWaiting.length < 64) this.procNoticesWaiting.push(input);
+      return;
+    }
+    const sent = input.kind === "memory_limit"
+      ? this.localScheduleRuntime.notifyProcMemoryLimit({ agentId: input.agentId, name: input.name, memoryMaxBytes: input.memoryMaxBytes })
+      : this.localScheduleRuntime.notifyProcOwnerStop({ agentId: input.agentId, name: input.name, stoppedBy: input.stoppedBy });
+    void sent
+      .catch(() => false)
+      .then((notified) => {
+        this.recordDaemonEvent(`daemon.proc.${input.kind}_notice`, { agentId: input.agentId, notified }, notified ? "ok" : "error");
+      });
+  }
+
+  private procJobsSnapshotTimer: ReturnType<typeof setTimeout> | null = null;
+  private procJobsSnapshotDueAtMs = 0;
+
+  /**
+   * Send `machine:proc_jobs:snapshot` in `delayMs`, unless one is already due
+   * sooner (a burst of job changes sends one); each send schedules the next
+   * in PROC_JOBS_SNAPSHOT_INTERVAL_MS.
+   */
+  private scheduleProcJobsSnapshot(delayMs: number): void {
+    if (!this.machineStatusReportsEnabled) return;
+    const dueAtMs = Date.now() + delayMs;
+    if (this.procJobsSnapshotTimer !== null) {
+      if (this.procJobsSnapshotDueAtMs <= dueAtMs) return;
+      clearTimeout(this.procJobsSnapshotTimer);
+    }
+    this.procJobsSnapshotDueAtMs = dueAtMs;
+    this.procJobsSnapshotTimer = setTimeout(() => {
+      this.procJobsSnapshotTimer = null;
+      void this.sendProcJobsSnapshot().finally(() => this.scheduleProcJobsSnapshot(PROC_JOBS_SNAPSHOT_INTERVAL_MS));
+    }, delayMs);
+    this.procJobsSnapshotTimer.unref?.();
+  }
+
+  /** Every job of every agent, without commands, directories, environments or log paths (procJobToSnapshot). */
+  private async sendProcJobsSnapshot(): Promise<void> {
+    const manager = this.procJobManager;
+    if (!manager || !this.connection.connected) return;
+    await manager.ready;
+    if (this.procJobManager !== manager || !this.connection.connected) return;
+    const jobs = manager.snapshotJobs();
+    this.connection.send({
+      type: "machine:proc_jobs:snapshot",
+      snapshot: { protocolVersion: PROC_JOBS_SNAPSHOT_PROTOCOL_VERSION, reportedAt: new Date().toISOString(), jobs },
+    });
+    this.recordDaemonEvent("daemon.proc.snapshot_sent", { job_count: jobs.length, running_count: jobs.filter((job) => job.state === "running").length });
+  }
+
+  /** A person's Stop of one job from the Computer page (`machine:proc_job:stop`); never rejects. */
+  private async stopProcJobForOwner(msg: { requestId: string; agentId: string; name: string; stoppedBy: string | null }): Promise<void> {
+    const manager = this.procJobManager;
+    let outcome: ProcJobStopOutcome = "failed";
+    try {
+      outcome = manager ? await manager.stopByOwner(msg.agentId, msg.name, msg.stoppedBy) : "failed";
+    } catch (error) {
+      logger.warn(`[Agent ${msg.agentId}] Stopping a raft proc job for its owner failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    this.connection.send({ type: "machine:proc_job:stop:result", requestId: msg.requestId, agentId: msg.agentId, name: msg.name, outcome });
+    this.recordDaemonEvent("daemon.proc.owner_stop", { agentId: msg.agentId, outcome }, outcome === "failed" ? "error" : "ok");
+    // The Computer page reads the job's end at once, not at the next change.
+    if (outcome === "stopped" || outcome === "already_exited") this.scheduleProcJobsSnapshot(0);
+  }
+
   /** `raft proc` jobs of this runner's agents (procJobs.ts); null on Windows (v1) or before the lock. */
   private procJobManager: ProcJobManager | null = null;
 
@@ -2645,6 +2940,12 @@ export class DaemonCore {
   /** Reconciler step 15: one pending re-detection after a local restart found a runtime missing. */
   private runtimeRedetectTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly runtimeAbsentRedetectDelayMs: number;
+  /** The quiet runtime version check (RUNTIME_VERSION_RECHECK_INTERVAL_MS): its timer, and its detection child while one runs. */
+  private runtimeVersionRecheckTimer: ReturnType<typeof setTimeout> | null = null;
+  private runtimeVersionRecheckHandle: RuntimeDetectionRoundHandle | null = null;
+  private readonly runtimeVersionRecheckIntervalMs: number;
+  /** The detection a quiet check last rescanned for: the same one again does not rescan again. */
+  private runtimeVersionRecheckTriggerSignature: string | null = null;
   private readonly coreStartingAgentIds = new Set<string>();
   /** Reconciler step 11: the order of the configs the server sends each agent (shared with both hosts). */
   private readonly configRevisions: AgentConfigRevisions;
@@ -2671,6 +2972,10 @@ export class DaemonCore {
   private readonly runtimeLimitResetsReader: RuntimeLimitResetsReader;
   private readonly platform: NodeJS.Platform;
   private readonly runtimeAuth: RuntimeAuthHost;
+  /** Upgrade on the web: the runtime's own updater through OAR, one per runtime at a time (runtimeUpgrade.ts). */
+  private readonly runtimeUpgrade: RuntimeUpgradeHost;
+  /** Install on the web: the runtime's own installer through OAR, one per runtime at a time (runtimeInstall.ts). */
+  private readonly runtimeInstall: RuntimeInstallHost;
   /**
    * task #17: the runtimes whose auth status the server reads
    * (SERVER_CAPABILITY_RUNTIME_AUTH_V1: Claude Code and Codex; _V2: all), or
@@ -2681,10 +2986,18 @@ export class DaemonCore {
   private serverFeaturesCapable = false;
   /** Asks the server for its current flag-derived agent config fields (serverFeaturesRefresh.ts). */
   private readonly serverFeaturesRefresh: ServerFeaturesRefresh;
+  /** "On this computer" checks for this runner's server (computerChecks/README.md). */
+  private readonly computerChecks: ComputerChecksService;
   /** The last ready inventory's runtime ids, for a status report once the server says it reads one. */
   private runtimeAuthInventory: string[] | null = null;
   /** Reconciler step 15: the server reads `machine:runtime_credentials:changed` (SERVER_CAPABILITY_RUNTIME_CREDENTIALS_CHANGED_V1). */
   private serverReadsRuntimeCredentialsChanged = false;
+  /** Upgrade on the web: the server reads `upgradable` in a status report (SERVER_CAPABILITY_RUNTIME_UPGRADE_V1). */
+  private serverReadsRuntimeUpgradable = false;
+  /** Install on the web: the server reads `installable` in a status report (SERVER_CAPABILITY_RUNTIME_INSTALL_V1). */
+  private serverReadsRuntimeInstallable = false;
+  /** Upgrade on the web: the server reads `updates` in a status report (SERVER_CAPABILITY_RUNTIME_UPDATE_CHECK_V1). */
+  private serverReadsRuntimeUpdates = false;
   /** Overlapping model / usage probes for the same key join one run instead of each spawning a CLI (probeGate.ts). Uncapped across keys so no probe waits past the server's request budget. */
   private readonly probeGate = new ProbeGate();
   private readonly runtimeModelCache = new RuntimeModelSourceCache(currentTimeMs);
@@ -2692,6 +3005,7 @@ export class DaemonCore {
 
   constructor(options: DaemonCoreOptions) {
     this.runtimeAbsentRedetectDelayMs = options.runtimeAbsentRedetectDelayMs ?? RUNTIME_ABSENT_REDETECT_DELAY_MS;
+    this.runtimeVersionRecheckIntervalMs = options.runtimeVersionRecheckIntervalMs ?? RUNTIME_VERSION_RECHECK_INTERVAL_MS;
     this.options = options;
     this.daemonVersion = options.daemonVersion ?? readDaemonVersion();
     this.computerVersion = options.computerVersion?.trim() || null;
@@ -2748,6 +3062,14 @@ export class DaemonCore {
       },
     });
     this.runtimeLimitResetsReader = options.runtimeLimitResetsReader ?? createRuntimeLimitResetsReader();
+    this.computerChecks = new ComputerChecksService({
+      raftHome: this.slockHome,
+      runnerKey: () => this.authenticatedMachineContext?.machineId ?? this.observedMachineId,
+      send: (report) => {
+        if (this.connection.connected) this.connection.send({ type: "computer:checks:report", report });
+      },
+      trace: (name, attrs) => this.recordDaemonEvent(name, attrs),
+    });
     this.serverFeaturesRefresh = new ServerFeaturesRefresh({
       ...options.serverFeaturesRefresh,
       send: (requestId) => {
@@ -2781,19 +3103,46 @@ export class DaemonCore {
         }),
         now: currentTimeMs,
       }),
-      // Pi's models are those of the providers it can sign in to: the picker follows a change.
-      // Authoritative for Pi: signing out its last provider clears the server's model list.
+      // Pi's (and OpenCode's) models are those of the providers it can sign in to, and
+      // Antigravity's are the account's: the picker follows a sign-in change (runtimeAuthHost).
+      // Authoritative: for per-provider runtimes, signing out the last provider clears the
+      // server's model list (the server ignores it for Antigravity).
       rescanModels: (runtime) => this.rescanRuntimes(runtime),
       send: (message) => this.connection.send(message),
       recordEvent: (name, attrs) => this.recordDaemonEvent(name, attrs),
       now: currentTimeMs,
       // A report runs only while a server that reads it is connected.
       serverReads: () => (this.connection.connected ? this.serverRuntimeAuthRuntimes : null),
+      serverReadsUpgradable: () => this.serverReadsRuntimeUpgradable,
+      serverReadsInstallable: () => this.serverReadsRuntimeInstallable,
+      serverReadsUpdates: () => this.serverReadsRuntimeUpdates,
       // #proj-raft-computer:#46 stop-gap: agents on the machine-shared login
       // stop waiting on the old account. The legacy host releases the
       // sign-in's provider limit in the ledger both hosts share, which ends
       // the OAR host's waits too; the OAR host keeps no auth state.
       onCredentialsChanged: (runtime, reason) => this.agentManager.noteRuntimeCredentialsChanged(runtime, reason),
+    });
+    this.runtimeUpgrade = options.runtimeUpgradeHost ?? new RuntimeUpgradeHost({
+      // The same OAR runtimes the sign-ins load; Pi has none (it answers unsupported before loading).
+      loadRuntime: (id) => (id === "pi" ? Promise.reject(new Error("Pi has no OAR runtime")) : loadOarRuntime(id)),
+      send: (message) => this.connection.send(message),
+      // The same work as the server's `machine:runtimes:rescan`: versions, sign-in status and models re-reported.
+      rescan: () => this.rescanRuntimes(),
+      // The update check kept for this runtime is stale after an updater ran; `current` keeps the check it ran (the rescan that follows reports it).
+      forgetUpdateCheck: (runtime) => this.runtimeAuth.forgetUpdateChecks(runtime),
+      keepUpdateCheck: (runtime, installation, check) => this.runtimeAuth.keepUpdateCheck(runtime, installation, check),
+      recordEvent: (name, attrs) => this.recordDaemonEvent(name, attrs),
+      now: currentTimeMs,
+    });
+    this.runtimeInstall = options.runtimeInstallHost ?? new RuntimeInstallHost({
+      // The same OAR runtimes the sign-ins and Upgrade load; Kimi Code and Pi answer unsupported before loading.
+      loadRuntime: (id) => (id === "pi" ? Promise.reject(new Error("Pi has no OAR runtime")) : loadOarRuntime(id)),
+      send: (message) => this.connection.send(message),
+      // Installed: re-detected and re-reported, so the card leaves "not installed" (sign-in stays the person's).
+      rescan: () => this.rescanRuntimes(),
+      recordEvent: (name, attrs) => this.recordDaemonEvent(name, attrs),
+      now: currentTimeMs,
+      runsHere: (id) => runtimeAuthRunsOn(id, this.platform),
     });
     this.appScheduleClock = options.reminderClock ?? systemClock;
     this.lifecycleOriginClock = options.connectionOptions?.clock ?? systemClock;
@@ -2840,9 +3189,11 @@ export class DaemonCore {
       onAgentWorkingToIdle: (agentId: string) => this.localScheduleRuntime?.onAgentWorkingToIdle(agentId),
       onRuntimeAbsentLocalStop: (runtime: string) => this.scheduleRuntimeRedetectAfterAbsent(runtime),
       detectedRuntimeCliVersion: (runtimeId: string) => this.lastReadyRuntimeVersions[runtimeId],
+      cachedRuntimeModels: (runtimeId: string) => this.runtimeModelCache.peek(runtimeId),
       // RFC 071 outbox: every spawn/rebind first durably records the process as open.
       runtimeProcessGate,
       activitySnapshotPath: options.turnActivitySnapshotPath ?? null,
+      oarSkills: new OarSkillCatalog(),
     };
 
     this.runtimeOutcomeOutbox = new RuntimeOutcomeOutbox({
@@ -2905,6 +3256,11 @@ export class DaemonCore {
         providerLimits: agentManager.providerLimitLedger,
         // Reconciler step 7: one memory of the runtime each session started on, for both hosts.
         sessionSpecs: agentManager.sessionSpecs,
+        // #wg-ax:#3: one failed-recycle memory across hosts so a fallback or retry resumes the prior session.
+        wakeRecycleFailures: agentManager.wakeRecycleFailures,
+        // #proj-runtime:#80: shared last-session hint and interrupted-turn handoff on disk.
+        lastSessions: agentManager.lastSessions,
+        interruptedTurns: agentManager.interruptedTurns,
         // Reconciler step 11: one order of pushed configs (and held pushes), for both hosts.
         configRevisions: this.configRevisions,
         // Reconciler step 11c: an OAR spec stop's handback, read by the legacy host's refusal.
@@ -2927,6 +3283,24 @@ export class DaemonCore {
     } else {
       this.agentHosts = agentManager;
     }
+    // #wg-rbac:#27: renews the runner credentials both hosts' launches hold
+    // (runnerCredentialRenewal.ts); a refused renewal mints as a start does.
+    this.uninstallRunnerCredentialRenewer = installRunnerCredentialRenewer({
+      serverUrl: options.serverUrl,
+      computerKey: () => this.options.apiKey,
+      fetch: (url, init) => daemonFetch(url, init),
+      freshMint: (agentId, runtime) => this.requestRunnerCredentialOnce(agentId, { runtime }),
+      revoke: (agentId, credentialId) => revokeRunnerCredentialById({
+        serverUrl: options.serverUrl,
+        daemonApiKey: this.options.apiKey,
+        agentId,
+        launchId: null,
+        fetchImpl: (url, init) => daemonFetch(url, init),
+        recordEvent: (name, attrs, status) => this.recordDaemonEvent(name, attrs, status),
+      }, credentialId),
+      isHeld: (rootId) => this.agentHosts.getHeldRunnerCredentialIds().includes(rootId),
+      recordEvent: (name, attrs, status) => this.recordDaemonEvent(name, attrs, status),
+    });
     // Reconciler step 15: a terminal sign-in releases a held credential as a
     // web login does (B7 / B8 / B9). Runs only while a credential is held.
     if (agentManager.providerLimitLedger) {
@@ -3127,6 +3501,7 @@ export class DaemonCore {
       privacyMode: () => this.privacyModeOn(),
       tracer: this.tracer,
       currentFileProvider: () => this.localTraceSink?.getCurrentFile() ?? null,
+      rotateCurrentFile: () => this.localTraceSink?.rotateNow() ?? null,
       sinkReportProvider: {
         drain: () => this.localTraceSink?.drainSinkReport() ?? null,
         noteUndelivered: () => this.localTraceSink?.noteAttrDropReportUndelivered(),
@@ -3284,11 +3659,19 @@ export class DaemonCore {
       // `raft proc` (#proj-raft-computer:#59): the jobs' ledger sits next to
       // the runtime ledger; jobs a previous daemon left running are adopted
       // (the sweep above skips them). Not on Windows in v1.
-      if (process.platform !== "win32" && !this.procJobManager) {
+      if (daemonRunsProcJobs() && !this.procJobManager) {
         this.procJobManager = ProcJobManager.start({
           machineDir: this.machineLock.machineDir,
           trace: (name, attrs, status) => this.recordDaemonEvent(name, attrs, status),
           runtimeRoots: (agentId) => this.agentManager.runtimeProcessesForAgent?.(agentId) ?? [],
+          // The owner's cap (`<Raft home>/computer/proc.json`), read at each start.
+          memoryMaxBytes: () => readProcMemoryMaxBytes(this.slockHome),
+          onMemoryLimit: (job) => {
+            if (job.memoryMaxBytes) this.noticeProcJob({ kind: "memory_limit", agentId: job.agentId, name: job.name, memoryMaxBytes: job.memoryMaxBytes });
+          },
+          onOwnerStop: (job) => this.noticeProcJob({ kind: "owner_stop", agentId: job.agentId, name: job.name, stoppedBy: job.stoppedBy ?? null }),
+          // The Computer page's list (machine:proc_jobs:snapshot) follows every change.
+          onChange: () => this.scheduleProcJobsSnapshot(PROC_JOBS_SNAPSHOT_DEBOUNCE_MS),
         });
         this.agentManager.setProcJobPidFilter?.((pid) => this.procJobManager?.ownsPid(pid) ?? false);
         setAgentProcJobManager(this.procJobManager);
@@ -3320,6 +3703,7 @@ export class DaemonCore {
         },
       });
       lifecycleSpan.addEvent("daemon.machine_lock.acquired", { machine_dir_present: true });
+      lifecycleSpan.addEvent("daemon.system_ca_trust", systemCaTrustTraceAttrs());
       const reclaimed = this.machineLock.reclaimed;
       if (reclaimed) {
         this.recordDaemonEvent("daemon.machine_lock.reclaimed", {
@@ -3347,6 +3731,7 @@ export class DaemonCore {
   }
 
   async stop(options: DaemonStopOptions = {}) {
+    const stopStartedAtMs = currentTimeMs();
     // Every login stopped, and OpenCode's sign-in server with them (its own watchdog is the backstop).
     await this.runtimeAuth.close();
     this.serverFeaturesRefresh.reset();
@@ -3372,8 +3757,9 @@ export class DaemonCore {
     this.invalidateLifecycleOriginReconcile();
     this.scopedAppStorageObserver?.stop();
     this.scopedAppStorageObserver = null;
-    this.traceBundleUploader?.stop();
-    this.traceBundleUploader = null;
+    this.startFailureFlush.cancel();
+    // No more periodic passes; the shutdown flush runs once the agents stopped.
+    this.traceBundleUploader?.stopScheduling();
     this.processMemoryReporter?.stop();
     this.processMemoryReporter = null;
     this.diskJanitor?.stop();
@@ -3387,8 +3773,11 @@ export class DaemonCore {
     this.diskStatusTimer = null;
     if (this.runtimeRedetectTimer !== null) clearTimeout(this.runtimeRedetectTimer);
     this.runtimeRedetectTimer = null;
+    this.cancelRuntimeVersionRecheck();
     if (this.memoryStatusTimer !== null) clearTimeout(this.memoryStatusTimer);
     this.memoryStatusTimer = null;
+    if (this.procJobsSnapshotTimer !== null) clearTimeout(this.procJobsSnapshotTimer);
+    this.procJobsSnapshotTimer = null;
     for (const timer of this.deviceSessionRetireFlushTimers) clearTimeout(timer);
     this.deviceSessionRetireFlushTimers.clear();
     try {
@@ -3422,10 +3811,39 @@ export class DaemonCore {
       // updates land before the stop resolves and the lock is released.
       await this.agentManager.settleRuntimeProcessLedger?.();
       await this.closeProcJobs();
+      this.uninstallRunnerCredentialRenewer?.();
+      this.uninstallRunnerCredentialRenewer = null;
+      // In the machine dir like the ledger: before the lock goes.
+      await this.flushTelemetryOnStop(options.source, stopStartedAtMs);
       this.machineLock?.release();
       if (this.machineLock) span.addEvent("daemon.machine_lock.released");
       this.machineLock = null;
       span.end("ok");
+    }
+  }
+
+  /**
+   * Best effort, bounded: what this run recorded, including its agents' stop,
+   * leaves now rather than at the next start. Runs after the agents stopped,
+   * so a slow upload never delays their SIGTERM, and within what is left of
+   * the stop budget (`stopFlushBudgetMs`), so the runner still exits before
+   * the Computer's SIGKILL. Not on a revoked machine key: that key cannot
+   * authorize an upload. Always stops the uploader.
+   */
+  private async flushTelemetryOnStop(source: DaemonStopSource | undefined, stopStartedAtMs: number): Promise<void> {
+    const uploader = this.traceBundleUploader;
+    this.traceBundleUploader = null;
+    if (!uploader) return;
+    this.startFailureFlush.cancel();
+    try {
+      if (source === "machine_key_revoked") return;
+      const budgetMs = stopFlushBudgetMs(currentTimeMs() - stopStartedAtMs);
+      const flush = budgetMs > 0
+        ? await flushWithinBound(() => uploader.flushNow("daemon_stop"), budgetMs)
+        : "no_time";
+      if (flush !== "done") this.recordDaemonEvent("daemon.bundle.flush.stop_incomplete", { flush_outcome: flush }, "error");
+    } finally {
+      uploader.stop();
     }
   }
 
@@ -3705,53 +4123,6 @@ export class DaemonCore {
       capabilities,
       observedAt: currentDate().toISOString(),
     };
-  }
-
-  /**
-   * Computer-scoped provider probe. The command carries no credential: the
-   * daemon claims a one-time materialization with its own machine auth, runs
-   * the bounded canary through the real provider adapter, and returns a
-   * closed-category result. A claim failure still produces a failure result so
-   * the Server never waits out the budget for a decidable carrier error.
-   */
-  private async handleProviderProbe(
-    msg: Extract<ServerToMachineMessage, { type: "machine:provider_probe:request" }>,
-  ): Promise<void> {
-    const probeId = asProviderProbeId(msg.probeId);
-    // Wave 1 only knows the Built-in canary adapter; a different runtime label
-    // is a protocol violation and must never produce a Built-in receipt (F3).
-    if (!isProviderProbeRuntime(msg.runtime)) {
-      this.connection.send(await buildUnclaimedProviderProbeResult({
-        requestId: msg.requestId,
-        probeId,
-      }));
-      return;
-    }
-    let materialization: ProbeMaterialization;
-    try {
-      materialization = await claimProbeMaterialization({
-        serverUrl: this.options.serverUrl,
-        daemonApiKey: this.options.apiKey,
-        probeId,
-        claimRequestId: msg.requestId,
-      });
-    } catch {
-      this.connection.send(await buildUnclaimedProviderProbeResult({
-        requestId: msg.requestId,
-        probeId,
-      }));
-      return;
-    }
-    const execution = await runProviderProbeCanary({ materialization, model: msg.model });
-    this.connection.send(await buildProviderProbeResultMessage({
-      requestId: msg.requestId,
-      probeId,
-      execution,
-      authority: materialization.authority,
-      daemonVersion: this.daemonVersion,
-      computerVersion: this.computerVersion,
-      runtimeVersion: PI_SDK_VERSION,
-    }));
   }
 
   private getActiveMigrationTransferLease(): AgentMigrationTransportLeaseMessage | null {
@@ -4118,6 +4489,7 @@ export class DaemonCore {
       onProgress: this.createMigrationSourceProgressReporter(lease, signal, userIgnoreReceipt),
       reportIgnoredBySource: () => migrationSummaryMayReportIgnoreSources(this.serverAcceptsMigrationIgnoreSources(), lease),
       reportIgnoredPartial: () => migrationSummaryMayReportIgnoredPartial(this.serverAcceptsMigrationIgnoredPartial(), lease),
+      reportSkippedUnreadable: () => migrationSummaryMayReportSkippedUnreadable(this.serverAcceptsMigrationSkippedUnreadable(), lease),
       uploadChunk: (chunk, bytes) => this.uploadStreamedMigrationChunk(lease, chunk, bytes, signal),
     });
     if (streamed.resizedEntryCount > 0) {
@@ -5420,13 +5792,14 @@ export class DaemonCore {
       },
     });
     this.localScheduleRuntime.bindScopedStorage(this.scopedAppStorageFactory);
+    for (const notice of this.procNoticesWaiting.splice(0)) this.noticeProcJob(notice);
     this.recordDaemonEvent("daemon.machine_context.bound", {
       machine_id_present: true,
       server_id_present: true,
     });
   }
 
-  private async requestRunnerCredentialOnce(agentId: string, config: AgentConfig): Promise<{ apiKey: string; credentialId: string | null }> {
+  private async requestRunnerCredentialOnce(agentId: string, config: Pick<AgentConfig, "runtime">): Promise<RunnerCredential> {
     const url = new URL(`/internal/computer/runners/${encodeURIComponent(agentId)}/credentials`, this.options.serverUrl);
     const res = await daemonFetch(url, {
       method: "POST",
@@ -5458,25 +5831,22 @@ export class DaemonCore {
       });
     }
 
-    const body = await res.json().catch(() => null) as { apiKey?: unknown; credentialId?: unknown } | null;
-    if (typeof body?.apiKey !== "string" || !body.apiKey.startsWith("sk_agent_")) {
+    const credential = parseRunnerCredentialMintBody(await res.json().catch(() => null));
+    if (!credential) {
       throw new RunnerCredentialMintError("invalid_agent_credential_payload", {
         code: "invalid_agent_credential_payload",
       });
     }
-    return {
-      apiKey: body.apiKey,
-      credentialId: typeof body.credentialId === "string" ? body.credentialId : null,
-    };
+    return credential;
   }
 
   private async mintRunnerCredential(
     agentId: string,
     config: AgentConfig,
     parent: TraceContext | null,
-  ): Promise<{ apiKey: string; credentialId: string | null }> {
+  ): Promise<RunnerCredential> {
     if (config.agentCredentialKey) {
-      return { apiKey: config.agentCredentialKey, credentialId: config.agentCredentialId ?? null };
+      return { apiKey: config.agentCredentialKey, credentialId: config.agentCredentialId ?? null, expiresAt: config.agentCredentialExpiresAt ?? null };
     }
     const span = this.tracer.startSpan("daemon.runner_credential_mint", {
       parent,
@@ -5486,7 +5856,9 @@ export class DaemonCore {
     });
     try {
       const credential = await this.mintRunnerCredentialWithRetry(agentId, config, span.context);
-      span.end("ok");
+      span.end("ok", { attrs: { expires: credential.expiresAt !== null } });
+      // #wg-rbac:#27: renewed at its half-life while a launch holds it.
+      trackRunnerCredential({ agentId, runtime: config.runtime, credential });
       return credential;
     } catch (err) {
       span.end("error", { attrs: { error_class: errorClassOf(err) } });
@@ -5498,7 +5870,7 @@ export class DaemonCore {
     agentId: string,
     config: AgentConfig,
     mintSpan: TraceContext,
-  ): Promise<{ apiKey: string; credentialId: string | null }> {
+  ): Promise<RunnerCredential> {
     if (process.env.SLOCK_AGENT_RUNNER_CREDENTIALS_DISABLED === "1") {
       throw new RunnerCredentialMintError("runner credential mint is disabled by SLOCK_AGENT_RUNNER_CREDENTIALS_DISABLED", {
         code: "runner_credentials_disabled",
@@ -5652,6 +6024,10 @@ export class DaemonCore {
    * storage cannot be stored either, so it is sent best effort.
    */
   private routeAgentManagerFrame(msg: MachineToServerMessage, connection: DaemonConnection): void {
+    // Both hosts' start failures reach the server through here, after the
+    // failure's own trace records: flush them now rather than at the next
+    // rotation, which a short session never reaches.
+    if (isStartFailureFrame(msg)) this.startFailureFlush.request();
     if (!isOutboxFrame(msg)) {
       connection.send(msg);
       return;
@@ -5768,7 +6144,12 @@ export class DaemonCore {
       this.recordDaemonEvent("daemon.agent.config_push", { agentId, revision, current_revision: current, outcome: "stale_dropped" });
       return;
     }
-    this.agentHosts.applyConfig?.(agentId, withConfigRevision(msg.config, revision), revision);
+    this.agentHosts.applyConfig?.(
+      agentId,
+      withConfigRevision(msg.config, revision),
+      revision,
+      msg.interrupt === true ? { interrupt: true } : undefined,
+    );
     this.localScheduleRuntime.noteMigrationReadiness(agentId, msg.config.migrationReadiness);
   }
 
@@ -5928,7 +6309,12 @@ export class DaemonCore {
       // so a Pi session reports the revision it was built from.
       const startConfig = withConfigRevision(msg.config, msg.type === "agent:start" ? msg.configRevision : undefined);
       const config = agentCredential
-        ? { ...startConfig, agentCredentialKey: agentCredential.apiKey, agentCredentialId: agentCredential.credentialId }
+        ? {
+          ...startConfig,
+          agentCredentialKey: agentCredential.apiKey,
+          agentCredentialId: agentCredential.credentialId,
+          ...(agentCredential.expiresAt ? { agentCredentialExpiresAt: agentCredential.expiresAt } : {}),
+        }
         : startConfig;
 
       const pendingDeliveries = this.coreStartPendingDeliveries.get(msg.agentId) || [];
@@ -5968,6 +6354,7 @@ export class DaemonCore {
         msg.catchupBatchId,
         recoveryGrant,
         claimedEpoch ?? null,
+        normalizeAgentStartOpenTasks(msg.openTasks),
       );
       if (msg.startDispatchId) {
         const acceptance = this.agentHosts.getAgentStartAcceptance(msg.agentId);
@@ -6041,6 +6428,9 @@ export class DaemonCore {
         // Agent typing line: send intents only to a server that reads them.
         this.agentManager.setServerSendIntentCapable?.(!this.machineContextConflict
           && (msg.capabilities ?? []).includes(SERVER_CAPABILITY_AGENT_SEND_INTENT_V1));
+        // Wake-up notice rows: asked only of a server that has the route.
+        this.agentManager.setServerInboxRowsCapable?.(!this.machineContextConflict
+          && (msg.capabilities ?? []).includes(SERVER_CAPABILITY_INBOX_ROWS_V1));
         // Task writes attest by landing only to a server that checks by landing.
         setAgentProxyServerChecksTaskWriteLanding(!this.machineContextConflict
           && (msg.capabilities ?? []).includes(SERVER_CAPABILITY_TASK_WRITE_LANDING_V1));
@@ -6058,6 +6448,12 @@ export class DaemonCore {
           // report, and only for the runtimes it reads (an older server
           // refuses a report naming any other).
           const reads = runtimeAuthRuntimesReadBy(this.machineContextConflict ? [] : (msg.capabilities ?? []));
+          this.serverReadsRuntimeUpgradable = !this.machineContextConflict
+            && (msg.capabilities ?? []).includes(SERVER_CAPABILITY_RUNTIME_UPGRADE_V1);
+          this.serverReadsRuntimeInstallable = !this.machineContextConflict
+            && (msg.capabilities ?? []).includes(SERVER_CAPABILITY_RUNTIME_INSTALL_V1);
+          this.serverReadsRuntimeUpdates = !this.machineContextConflict
+            && (msg.capabilities ?? []).includes(SERVER_CAPABILITY_RUNTIME_UPDATE_CHECK_V1);
           const newlyReads = reads !== null && reads !== this.serverRuntimeAuthRuntimes;
           this.serverRuntimeAuthRuntimes = reads;
           if (newlyReads && this.runtimeAuthInventory) this.reportRuntimeAuthStatus("context", this.runtimeAuthInventory);
@@ -6140,8 +6536,15 @@ export class DaemonCore {
       case "agent:stop": {
         // `reason` is additive (a server that predates it sends none); read
         // it as an optional string, so any other value reads as `lifecycle`.
-        const stopReason = procStopReasonForAgentStop((msg as { reason?: unknown }).reason);
+        const rawReason = (msg as { reason?: unknown }).reason;
+        const stopReason = procStopReasonForAgentStop(rawReason);
         logger.info(`[Agent ${msg.agentId}] Stop requested${stopReason ? ` (${stopReason})` : ""}`);
+        if (rawReason === "deleted" || rawReason === "migrated") {
+          this.agentManager.wakeRecycleFailures?.clear(msg.agentId);
+        }
+        if (rawReason === "owner_stop" || rawReason === "deleted" || rawReason === "migrated") {
+          this.agentManager.interruptedTurns?.delete(msg.agentId);
+        }
         this.agentHosts.stopAgent(msg.agentId);
         // `raft proc`: the owner's Stop, a delete or a migration ends the
         // agent's jobs; a lifecycle stop (or no reason) leaves them running.
@@ -6173,6 +6576,32 @@ export class DaemonCore {
             this.connection.send({ type: "agent:side-ask:result", agentId, requestId, outcome: "failed" });
           },
         );
+        break;
+      }
+
+      case "computer:checks:config":
+        // This server's switch per check (computerChecks/README.md); runs nothing by itself.
+        void this.computerChecks.setConfig(msg.enabled);
+        break;
+
+      case "computer:checks:refresh":
+        // One round (shared with this Computer's other runners within 30 s); nothing before a config.
+        void this.computerChecks.refresh();
+        break;
+
+      case "machine:proc_job:stop": {
+        // A person stopped one job from the Computer page; the server checked who may.
+        const { requestId, agentId, name } = msg;
+        if (typeof requestId !== "string" || !requestId || typeof agentId !== "string" || !agentId) {
+          this.recordDaemonEvent("daemon.proc.owner_stop", { outcome: "message_dropped" }, "error");
+          break;
+        }
+        if (!isValidProcName(name)) {
+          this.connection.send({ type: "machine:proc_job:stop:result", requestId, agentId, name: String(name).slice(0, 64), outcome: "not_found" });
+          break;
+        }
+        const stoppedBy = typeof msg.stoppedBy === "string" ? msg.stoppedBy : null;
+        void this.stopProcJobForOwner({ requestId, agentId, name, stoppedBy });
         break;
       }
 
@@ -6394,13 +6823,16 @@ export class DaemonCore {
             ...(msg.requestId ? { request_id: msg.requestId } : {}),
           },
         });
-        this.agentManager.listSkills(msg.agentId, msg.runtime).then(({ global, workspace }) => {
-          this.connection.send({ type: "agent:skills:list_result", agentId: msg.agentId, requestId: msg.requestId, global, workspace });
-          span.end("ok", {
+        this.agentManager.listSkills(msg.agentId, msg.runtime).then(({ global, workspace, builtin, unavailable }) => {
+          this.connection.send({ type: "agent:skills:list_result", agentId: msg.agentId, requestId: msg.requestId, global, workspace, ...(builtin ? { builtin } : {}), ...(unavailable ? { unavailable } : {}) });
+          span.end(unavailable ? "error" : "ok", {
             attrs: {
-              outcome: "skills_returned",
+              outcome: unavailable ? "skills_unavailable" : "skills_returned",
+              ...(unavailable ? { unavailable_reason: unavailable.reason } : {}),
               global_count: global.length,
               workspace_count: workspace.length,
+              // Present only when the list came from OAR's skills inventory.
+              ...(builtin ? { builtin_count: builtin.length } : {}),
             },
           });
         }).catch((err: unknown) => {
@@ -6515,7 +6947,12 @@ export class DaemonCore {
 
       case "machine:workspace:delete":
         logger.info(`[Daemon] Deleting workspace directory: ${msg.directoryName}`);
-        this.agentManager.deleteWorkspaceDirectory(msg.directoryName).then((success) => {
+        // Every agent host of this process: the router's OAR starts and sessions too.
+        this.agentManager.deleteWorkspaceDirectory(
+          msg.directoryName,
+          (agentId) => this.agentHosts.holdsAgentStart(agentId)
+            || this.agentHosts.getRunningAgentIds().some((running) => running.toLowerCase() === agentId.toLowerCase()),
+        ).then((success) => {
           if (success) {
             this.localScheduleRuntime.onAgentWorkspaceDeleted(msg.directoryName);
             // A workspace directory is named by its agent id: the agent is gone.
@@ -6531,7 +6968,36 @@ export class DaemonCore {
       // as `machine:capabilities` — so re-emitting IS the answer, no bespoke
       // result message needed.
       case "machine:runtimes:rescan":
+        // A person's rescan: the update checks the report carries run fresh, not from what was kept.
+        this.runtimeAuth.forgetUpdateChecks();
         this.rescanRuntimes();
+        break;
+
+      // A person pressed Upgrade on the web: the runtime's own updater, then a rescan (runtimeUpgrade.ts).
+      case "machine:runtime:upgrade":
+        if (!isRuntimeAuthRequestId(msg.requestId) || !isRuntimeAuthRuntime(msg.runtime)) {
+          this.recordDaemonEvent("daemon.runtime.upgrade.message_dropped", { type: msg.type });
+          break;
+        }
+        void this.runtimeUpgrade.upgrade(msg.requestId, msg.runtime);
+        break;
+
+      // A person pressed Install on the web: what the runtime's own installer would run, read only (runtimeInstall.ts).
+      case "machine:runtime:install_plan":
+        if (!isRuntimeAuthRequestId(msg.requestId) || !isRuntimeAuthRuntime(msg.runtime)) {
+          this.recordDaemonEvent("daemon.runtime.install.message_dropped", { type: msg.type });
+          break;
+        }
+        void this.runtimeInstall.plan(msg.requestId, msg.runtime);
+        break;
+
+      // The person confirmed that plan: the runtime's own installer, then a rescan (runtimeInstall.ts).
+      case "machine:runtime:install":
+        if (!isRuntimeAuthRequestId(msg.requestId) || !isRuntimeAuthRuntime(msg.runtime)) {
+          this.recordDaemonEvent("daemon.runtime.install.message_dropped", { type: msg.type });
+          break;
+        }
+        void this.runtimeInstall.install(msg.requestId, msg.runtime);
         break;
 
       case "machine:migration:source_workspace_archive": {
@@ -6558,11 +7024,6 @@ export class DaemonCore {
             });
           },
         );
-        break;
-      }
-
-      case "machine:provider_probe:request": {
-        void this.handleProviderProbe(msg);
         break;
       }
 
@@ -6689,7 +7150,26 @@ export class DaemonCore {
 
       case "machine:runtime_account_usage:refresh": {
         const provider: RuntimeAccountUsageProvider = msg.provider;
-        void this.probeGate.run(`runtime_account_usage:${provider}`, () => this.runtimeAccountUsageCollector(provider)).then((snapshot: RuntimeAccountUsageSnapshot) => {
+        // A server that knows agents' own account folders sends them (Codex, Claude);
+        // without them the read is the default account's, exactly as before.
+        const accountHomes = parseRuntimeAccountUsageAccountHomes(provider, (msg as { accountHomes?: unknown }).accountHomes);
+        let folderCounts: { folders: number; dropped: number } | null = null;
+        const read = accountHomes
+          ? () => this.runtimeAccountUsageCollector(provider, {
+            accountHomes,
+            onFolders: (counts) => {
+              folderCounts = counts;
+              if (counts.dropped > 0) {
+                logger.warn(`[Daemon] Runtime account usage (${provider}): ${counts.folders} agent account folder(s) read, ${counts.dropped} past the cap left unread`);
+              }
+            },
+          })
+          : () => this.runtimeAccountUsageCollector(provider);
+        // A read for other folders never joins one already running for the default account only.
+        const gateKey = accountHomes
+          ? `runtime_account_usage:${provider}:${createHash("sha256").update(JSON.stringify(accountHomes)).digest("hex").slice(0, 16)}`
+          : `runtime_account_usage:${provider}`;
+        void this.probeGate.run(gateKey, read).then((snapshot: RuntimeAccountUsageSnapshot) => {
           this.connection.send({
             type: "machine:runtime_account_usage:snapshot",
             requestId: msg.requestId,
@@ -6707,6 +7187,7 @@ export class DaemonCore {
               0,
             ),
             ...limitResetsAvailableAttr(snapshot),
+            ...(folderCounts ? { account_folder_count: folderCounts.folders, account_folders_dropped: folderCounts.dropped } : {}),
           });
         }).catch((err: unknown) => {
           logger.warn(`[Daemon] Runtime account usage refresh failed (${provider}): ${err instanceof Error ? err.message : String(err)}`);
@@ -6726,7 +7207,10 @@ export class DaemonCore {
           this.recordDaemonEvent("daemon.runtime_account_usage.limit_reset", { outcome: "message_dropped" });
           break;
         }
-        void this.redeemRuntimeLimitReset(msg.requestId, msg.provider, msg.idempotencyKey, msg.kind);
+        void this.redeemRuntimeLimitReset(msg.requestId, msg.provider, msg.idempotencyKey, {
+          ...(msg.kind ? { kind: msg.kind } : {}),
+          ...(msg.onboardingRequiredReason === true ? { onboardingRequiredReason: true } : {}),
+        });
         break;
 
       case "machine:runtime_account_usage:limit_resets:read":
@@ -6739,6 +7223,7 @@ export class DaemonCore {
           atFiveHourLimit: msg.atFiveHourLimit !== false,
           atFiveHourLimitConsent: msg.atFiveHourLimitConsent === true,
           includeFiveHour: msg.includeFiveHour === true,
+          ...(msg.onboardingRequiredReason === true ? { onboardingRequiredReason: true } : {}),
         });
         break;
 
@@ -6936,9 +7421,10 @@ export class DaemonCore {
    */
   /**
    * Re-detects the installed runtimes and their models, and pushes both: the
-   * server's `machine:runtimes:rescan`, and a Pi sign-in change from the web
-   * (Pi lists the models of the providers it can authenticate). Only while
-   * connected: the next connect detects anyway.
+   * server's `machine:runtimes:rescan`, and a sign-in change from the web for a
+   * runtime whose models follow it (Pi and OpenCode list their signed-in
+   * providers' models; Antigravity the account's). Only while connected: the
+   * next connect detects anyway.
    */
   private rescanRuntimes(authoritativeFor?: string): void {
     if (!this.connection.connected) return;
@@ -7049,6 +7535,13 @@ export class DaemonCore {
     return capabilities.has(SERVER_CAPABILITY_MIGRATION_IGNORED_PARTIAL_V1);
   }
 
+  /** The server's migration summary accepts `skippedUnreadable`. Context wins over the handshake header. */
+  private serverAcceptsMigrationSkippedUnreadable(): boolean {
+    if (this.machineContextConflict) return false;
+    const capabilities = this.serverContextCapabilities ?? new Set(this.connection.handshakeServerCapabilities);
+    return capabilities.has(SERVER_CAPABILITY_MIGRATION_SKIPPED_UNREADABLE_V1);
+  }
+
   /** The server's source-progress report accepts `userIgnoreAdditions`. Context wins over the handshake header. */
   private serverAcceptsMigrationUserIgnoreReceipt(): boolean {
     if (this.machineContextConflict) return false;
@@ -7070,6 +7563,20 @@ export class DaemonCore {
     return capabilities.has(SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_LIMIT_RESETS_V1);
   }
 
+  /** Whether the server's usage snapshot schema reads `accounts[].credits`. Context wins over the handshake header. */
+  private serverReadsCredits(): boolean {
+    if (this.machineContextConflict) return false;
+    const capabilities = this.serverContextCapabilities ?? new Set(this.connection.handshakeServerCapabilities);
+    return capabilities.has(SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_CREDITS_V1);
+  }
+
+  /** Whether the server's usage snapshot schema reads `accounts[].unsupportedReason`. Context wins over the handshake header. */
+  private serverReadsUnsupportedReasons(): boolean {
+    if (this.machineContextConflict) return false;
+    const capabilities = this.serverContextCapabilities ?? new Set(this.connection.handshakeServerCapabilities);
+    return capabilities.has(SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_UNSUPPORTED_REASON_V1);
+  }
+
   /**
    * Which window scopes the server's usage snapshot schema reads: every kind
    * (V2, `models` included), `account` and `model` only (V1), or none.
@@ -7089,7 +7596,9 @@ export class DaemonCore {
    * refused.
    */
   private snapshotForServer(snapshot: RuntimeAccountUsageSnapshot): RuntimeAccountUsageSnapshot {
-    const withResets = this.serverReadsLimitResets() ? snapshot : withoutLimitResets(snapshot);
+    const withReasons = this.serverReadsUnsupportedReasons() ? snapshot : withoutUnsupportedReasons(snapshot);
+    const withCredits = this.serverReadsCredits() ? withReasons : withoutCredits(withReasons);
+    const withResets = this.serverReadsLimitResets() ? withCredits : withoutLimitResets(withCredits);
     switch (this.serverWindowScopes()) {
       case "all": return withResets;
       case "account_and_model": return withoutModelsScopes(withResets);
@@ -7104,11 +7613,17 @@ export class DaemonCore {
    * key carries the request id, so it never joins a read that started before
    * this redeem landed, a scheduled one or another person's redeem.
    */
-  private async redeemRuntimeLimitReset(requestId: string, provider: RuntimeAccountUsageProvider, idempotencyKey: RuntimeLimitResetIdempotencyKey, kind?: RuntimeLimitResetKind): Promise<void> {
+  private async redeemRuntimeLimitReset(
+    requestId: string,
+    provider: RuntimeAccountUsageProvider,
+    idempotencyKey: RuntimeLimitResetIdempotencyKey,
+    input: RuntimeLimitResetRedeemInput,
+  ): Promise<void> {
+    const { kind } = input;
     const startedAt = currentTimeMs();
     let report: RuntimeLimitResetReport = {};
     // The redeemer never throws (a rejection is `unknown`); this guards a test seam that does.
-    const result: RuntimeLimitResetResult = await this.runtimeLimitResetRedeemer(provider, idempotencyKey, kind, (seen) => { report = seen; })
+    const result: RuntimeLimitResetResult = await this.runtimeLimitResetRedeemer(provider, idempotencyKey, input, (seen) => { report = seen; })
       .catch((): RuntimeLimitResetResult => ({ kind: "unknown" }));
     const snapshot = await this.probeGate
       .run(`runtime_account_usage_after_limit_reset:${provider}:${requestId}`, () => this.runtimeAccountUsageCollector(provider))
@@ -7119,6 +7634,7 @@ export class DaemonCore {
       result,
       ...(snapshot ? { snapshot: this.snapshotForServer(snapshot) } : {}),
     });
+    const durationMs = currentTimeMs() - startedAt;
     this.recordDaemonEvent("daemon.runtime_account_usage.limit_reset", {
       outcome: result.kind,
       provider,
@@ -7130,8 +7646,10 @@ export class DaemonCore {
       ...(report.claudeVersion ? { claude_version: report.claudeVersion } : {}),
       ...(report.oarOutcome ? { oar_outcome: report.oarOutcome } : {}),
       ...(report.startupScreen ? { startup_screen: report.startupScreen } : {}),
-      duration_ms: currentTimeMs() - startedAt,
+      ...(report.onboardingCompleted ? { onboarding_completed: true } : {}),
+      duration_ms: durationMs,
     });
+    logLimitResetAnswer("redeem", requestId, provider, result, report, durationMs);
   }
 
   /**
@@ -7143,7 +7661,7 @@ export class DaemonCore {
   private async readRuntimeLimitResets(
     requestId: string,
     provider: RuntimeAccountUsageProvider,
-    input: { atFiveHourLimit: boolean; atFiveHourLimitConsent: boolean; includeFiveHour: boolean },
+    input: RuntimeLimitResetsReadInput,
   ): Promise<void> {
     const startedAt = currentTimeMs();
     let report: RuntimeLimitResetReport = {};
@@ -7151,6 +7669,7 @@ export class DaemonCore {
     const result: RuntimeLimitResetsReadResult = await this.runtimeLimitResetsReader(provider, input, (seen) => { report = seen; })
       .catch((): RuntimeLimitResetsReadResult => ({ kind: "unknown" }));
     this.connection.send({ type: "machine:runtime_account_usage:limit_resets:read:result", requestId, result });
+    const durationMs = currentTimeMs() - startedAt;
     this.recordDaemonEvent("daemon.runtime_account_usage.limit_reset", {
       operation: "read",
       outcome: result.kind,
@@ -7161,12 +7680,16 @@ export class DaemonCore {
         ...(result.fiveHourSpent ? { five_hour_spent: true } : {}),
         available_kinds: result.resets.filter((reset) => reset.state === "available").length,
         unknown_kinds: result.resets.filter((reset) => reset.state === "unknown").length,
+        // Each kind's state ("weekly:unknown,fable:none,…"): which kind a screen OAR couldn't read belongs to. Fixed ids and states only.
+        kind_states: result.resets.map((reset) => `${reset.kind}:${reset.state}`).join(","),
       } : {}),
       ...(report.claudeVersion ? { claude_version: report.claudeVersion } : {}),
       ...(report.oarOutcome ? { oar_outcome: report.oarOutcome } : {}),
       ...(report.startupScreen ? { startup_screen: report.startupScreen } : {}),
-      duration_ms: currentTimeMs() - startedAt,
+      ...(report.onboardingCompleted ? { onboarding_completed: true } : {}),
+      duration_ms: durationMs,
     });
+    logLimitResetAnswer("read", requestId, provider, result, report, durationMs);
   }
 
   private observeServerContextCapabilities(capabilities: readonly string[]): void {
@@ -7289,6 +7812,7 @@ export class DaemonCore {
     // still in flight (its result would be older than what is sent now), so a
     // capability downgrade followed by a rescan can never be overwritten later.
     this.abandonDetectionRound("superseded_by_sync");
+    this.cancelRuntimeVersionRecheckInFlight();
     const ticket = ++this.readyPublicationSeq;
     const inventory = this.applyDetectionInventory(this.runtimeDetector());
     return this.sendReadyFrame({ inventory }, expectedLifecycleGeneration, ticket);
@@ -7316,6 +7840,8 @@ export class DaemonCore {
     // the pending frame is in flight must coalesce, not start a second child.
     const round: DetectionRoundRecord = { handle: null, generation, roundId: ++this.detectionRoundSeq, publishCatalogForce, abandoned: false };
     this.detectionRound = round;
+    // One detection child at a time: this round's ready restarts the quiet check's wait.
+    this.cancelRuntimeVersionRecheckInFlight();
     this.recordDaemonEvent("daemon.runtime.detect.round_reserved", { round_id: round.roundId, connection_generation: generation });
     const ticket = ++this.readyPublicationSeq;
     const sent = await this.sendReadyFrame({ inventory: null, runtimeDetection: { status: "pending" } }, expectedLifecycleGeneration, ticket);
@@ -7431,6 +7957,10 @@ export class DaemonCore {
     }
     // Awaited only with a Computer seam: a plain daemon's ready keeps its timing.
     const installerRepairHint = this.options.getComputerInstallerRepairHint ? await this.readComputerInstallerRepairHint() : null;
+    // A failed read is unknown, never a refusal.
+    const upgradeScope = this.options.getComputerUpgradeScope
+      ? parseComputerUpgradeScope(await this.options.getComputerUpgradeScope().catch(() => null))
+      : null;
     // Once per server after Raft Desktop's move: the first ready that goes out carries it.
     const migratedFrom = this.options.getComputerMigratedFrom && !this.migratedFromSent
       ? await this.options.getComputerMigratedFrom().catch(() => null)
@@ -7469,7 +7999,9 @@ export class DaemonCore {
     // #wg-rbac:#27: read here, after the last await and in the same tick as the
     // send, so a credential minted while this frame was prepared is listed
     // once its process or start holds it. One minted later is not listed.
-    const runnerCredentialIds = this.agentHosts.getHeldRunnerCredentialIds();
+    // The hosts hold each launch's first id; a renewed launch is reported by
+    // its current id (and the replaced one during its overlap).
+    const runnerCredentialIds = heldRunnerCredentialIdsWithRenewals(this.agentHosts.getHeldRunnerCredentialIds());
     this.connection.send({
       type: "ready",
       capabilities: [
@@ -7482,6 +8014,10 @@ export class DaemonCore {
         DAEMON_CAPABILITY_INTERRUPT_SUBAGENT,
         // #wg-runtime-form:#22: status now and side questions (agentSideAsk.ts).
         DAEMON_CAPABILITY_AGENT_SIDE_ASK,
+        // A person's Stop of one `raft proc` job from the Computer page (machine:proc_job:stop); not on Windows (v1).
+        ...(daemonRunsProcJobs() ? [DAEMON_CAPABILITY_PROC_STOP] : []),
+        // "On this computer" checks: computer:checks:config / refresh, answered by computer:checks:report.
+        DAEMON_CAPABILITY_COMPUTER_CHECKS,
         DAEMON_CAPABILITY_RUNTIME_AUTH,
         // Kimi and Qoder sign in and out too (RUNTIME_AUTH_RUNTIMES).
         DAEMON_CAPABILITY_RUNTIME_AUTH_V2,
@@ -7490,6 +8026,10 @@ export class DaemonCore {
         // Antigravity's status and login (OAR 0.97), and its logout (OAR 0.98).
         DAEMON_CAPABILITY_RUNTIME_AUTH_ANTIGRAVITY,
         DAEMON_CAPABILITY_RUNTIME_AUTH_ANTIGRAVITY_LOGOUT,
+        // A runtime's own updater when a person presses Upgrade (OAR `Runtime.upgrade`), then a rescan.
+        DAEMON_CAPABILITY_RUNTIME_UPGRADE,
+        // A runtime's own installer when a person presses Install and confirms its plan (OAR `Runtime.installPlan` / `install`), then a rescan.
+        DAEMON_CAPABILITY_RUNTIME_INSTALL,
         // Pi's sign-ins per provider: status, OAuth login, logout, API key (OAR's createPiProviderAuth).
         DAEMON_CAPABILITY_RUNTIME_AUTH_PI,
         // Grok Build's status, device-code login and logout (OAR 0.99).
@@ -7521,6 +8061,10 @@ export class DaemonCore {
         ...(this.oarHostEnabled && cursorSdkAvailable() ? [DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR] : []),
         // OpenCode on the OAR host: Linux and macOS (the OAR host runs only Codex on Windows).
         ...(this.oarHostEnabled && this.platform !== "win32" ? [DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE] : []),
+        // #oar-raft:#48: Pi via OAR subprocess RPC, Linux and macOS outside SEA builds.
+        ...(this.oarHostEnabled && piRpcAvailable({ platform: this.platform }) ? [DAEMON_CAPABILITY_RUNTIME_HOST_OAR_PI] : []),
+        // #oar-raft:#48: Claude Code via OAR generic launch path, Linux and macOS.
+        ...(this.oarHostEnabled && this.platform !== "win32" ? [DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CLAUDE] : []),
         // View Context v0: answers `agent:context_view_request` with one result
         // POST and sends `agent:context_view_availability` (agentContextView/),
         // for agents whose config has `agentContextView` on.
@@ -7532,9 +8076,15 @@ export class DaemonCore {
         // #wg-rbac:#27: `runnerCredentialIds` below lists every runner
         // credential held here; the server revokes this machine's others.
         DAEMON_CAPABILITY_RUNNER_CREDENTIAL_RECONCILE_V1,
+        // #wg-rbac:#27: runner credentials minted for it expire (7 days); the
+        // daemon renews them at half-life and on a 401 agent_credential_expired
+        // (runnerCredentialRenewal.ts).
+        DAEMON_CAPABILITY_RUNNER_CREDENTIAL_RENEW_V1,
         // Reconciler step 11: takes `agent:config` (a new config for a
         // running agent, applied at idle) instead of a restart.
         DAEMON_CAPABILITY_AGENT_CONFIG_PUSH,
+        // #wg-runtime-form:#27: reads and launches `runtimeConfig.mode.serviceTier`.
+        DAEMON_CAPABILITY_CODEX_SERVICE_TIER_V1,
         // RFC 071 F9: a runtime-profile control start also renders its
         // resume catch-up (startupInput.ts), so the server may count it as
         // the start that carried the owed catch-up.
@@ -7542,6 +8092,25 @@ export class DaemonCore {
         // task #1357 item 1: `agent:model_limits` for every Pi session built,
         // each live session's last one sent again after a reconnect.
         DAEMON_CAPABILITY_MODEL_LIMITS_REPORT_V1,
+        // #proj-runtime:#67: turn-end compaction resets its context facts after
+        // a compaction boundary and waits for a deferred or held inbox drain,
+        // so the server may send `turnEndCompaction` here.
+        DAEMON_CAPABILITY_TURN_END_COMPACTION_V2,
+        // #proj-runtime:#80: every non-resume fresh start builds unified
+        // constructed initial context from prior session state, so the server
+        // may clear the session on model switches across all runtimes.
+        DAEMON_CAPABILITY_CONSTRUCTED_INIT_V1,
+        // #proj-runtime:#80: `agent:config` `{ interrupt: true }` writes a
+        // one-shot interrupted-turn handoff note so the server may interrupt
+        // and immediately restart busy turns on explicit config edits.
+        DAEMON_CAPABILITY_AGENT_CONFIG_INTERRUPT,
+        // Focus (docs/contracts/agent-focus.md): both hosts and a start's
+        // first input write a message tagged `focused` in full and report it
+        // read, so the Server may send `AgentConfig.agentFocus` and the tag.
+        DAEMON_CAPABILITY_AGENT_FOCUS_V1,
+        // The CLI this daemon ships has `raft message resolve --forwarded`, so
+        // a forward delivered here may name it for a cut forwarded message.
+        FORWARDED_RESOLVE_CAPABILITY,
         ...BUILT_IN_READY_CAPABILITIES,
         ...(this.options.computerControlViaSupervisor
           ? [COMPUTER_CAPABILITY_SUPERVISOR_MUTATIONS]
@@ -7581,6 +8150,7 @@ export class DaemonCore {
       ...(lastUpgradeReceipt ? { lastUpgradeReceipt } : {}),
       ...(legacyCredentialExposure ? { legacyCredentialExposure } : {}),
       ...(installerRepairHint ? { installerRepairHint } : {}),
+      ...(upgradeScope ? { upgradeScope } : {}),
       ...(isComputerMigratedFrom(migratedFrom) ? { migratedFrom } : {}),
     });
     if (isComputerMigratedFrom(migratedFrom) && this.connection.connected) {
@@ -7595,6 +8165,9 @@ export class DaemonCore {
     // hourly (disk) and every 5 minutes (memory).
     this.scheduleDiskStatusReport(DISK_STATUS_FIRST_REPORT_DELAY_MS);
     this.scheduleMemoryStatusReport(DISK_STATUS_FIRST_REPORT_DELAY_MS);
+    this.scheduleProcJobsSnapshot(PROC_JOBS_SNAPSHOT_DEBOUNCE_MS);
+    // A ready with an inventory has just detected: the quiet check counts from it.
+    if (frame.inventory) this.scheduleRuntimeVersionRecheck();
     this.recordDaemonEvent("daemon.ready.sent", {
       runtimes_count: frame.inventory ? frame.inventory.runtimes.length : -1,
       runtime_detection_status: frame.runtimeDetection?.status ?? "complete",
@@ -7602,6 +8175,7 @@ export class DaemonCore {
       idle_agents_count: idleAgentSessions.length,
       runtime_profile_reports_count: runtimeProfileReports.length,
       runner_credentials_count: runnerCredentialIds.length,
+      runner_credentials_expiring_count: expiringRunnerCredentialCount(),
       ...(isComputerMigratedFrom(migratedFrom) ? { migrated_from: migratedFrom } : {}),
     });
     // View Context: the Server keeps the latest availability per agent; a new
@@ -7671,7 +8245,10 @@ export class DaemonCore {
    * (the Computer card), and only when that fresh query reads it signed in
    * does the server hear `machine:runtime_credentials:changed`, which lifts
    * the sign-in pauses of the runtime's agents on the shared sign-in. A plain
-   * status report never lifts anything.
+   * status report never lifts anything. A status-only runtime (DeepSeek
+   * Harness: no sign-in, so never `logged_in`) needs only the change, unless
+   * the fresh status says it cannot run here at all (`unavailable`): its
+   * credentials file changing is the sign-in.
    */
   private async reportSharedCredentialsChanged(runtime: RuntimeAuthRuntime): Promise<void> {
     let status: Awaited<ReturnType<RuntimeAuthHost["reportFreshStatus"]>> = null;
@@ -7680,7 +8257,8 @@ export class DaemonCore {
     } catch (error) {
       logger.warn(`[Daemon] Runtime auth status after a credential change failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-    const sent = status?.kind === "logged_in" && this.connection.connected && this.serverReadsRuntimeCredentialsChanged;
+    const signedIn = runtimeAuthStatusOnly(runtime) ? status?.kind !== "unavailable" : status?.kind === "logged_in";
+    const sent = signedIn && this.connection.connected && this.serverReadsRuntimeCredentialsChanged;
     if (sent) this.connection.send({ type: "machine:runtime_credentials:changed", runtime });
     this.recordDaemonEvent("daemon.runtime_credentials.changed", {
       runtime,
@@ -7715,6 +8293,92 @@ export class DaemonCore {
       });
     }, this.runtimeAbsentRedetectDelayMs);
     this.runtimeRedetectTimer.unref?.();
+  }
+
+  private scheduleRuntimeVersionRecheck(): void {
+    // Cleared only by stop(), before it cancels the check: no re-arming after.
+    if (!this.machineStatusReportsEnabled) return;
+    if (this.runtimeVersionRecheckTimer !== null) clearTimeout(this.runtimeVersionRecheckTimer);
+    this.runtimeVersionRecheckTimer = setTimeout(() => {
+      this.runtimeVersionRecheckTimer = null;
+      void this.recheckRuntimeVersions();
+    }, this.runtimeVersionRecheckIntervalMs);
+    this.runtimeVersionRecheckTimer.unref?.();
+  }
+
+  private cancelRuntimeVersionRecheck(): void {
+    if (this.runtimeVersionRecheckTimer !== null) clearTimeout(this.runtimeVersionRecheckTimer);
+    this.runtimeVersionRecheckTimer = null;
+    this.cancelRuntimeVersionRecheckInFlight();
+  }
+
+  private cancelRuntimeVersionRecheckInFlight(): void {
+    this.runtimeVersionRecheckHandle?.cancel();
+    this.runtimeVersionRecheckHandle = null;
+  }
+
+  /**
+   * RUNTIME_VERSION_RECHECK_INTERVAL_MS: detect in a child, compare with what
+   * the last ready announced, and re-announce (`rescanRuntimes`) only when a
+   * runtime's presence or CLI version differs. Nothing goes to the server
+   * otherwise. Skipped while disconnected (the next connect detects anyway) or
+   * while a detection round runs (its ready restarts the wait); an incomplete
+   * check decides nothing, since it may simply have missed a runtime.
+   *
+   * Only where detection itself runs in the same child (async detection): an
+   * older server's ready comes from the in-process `probe()`s, which can see
+   * less than the child's `probeAsync` (OpenCode's npm shim on Windows), so the
+   * two would differ for good and every check would rescan. For the same
+   * reason a detection the check already rescanned for does not rescan again.
+   */
+  private async recheckRuntimeVersions(): Promise<void> {
+    if (!this.connection.connected || this.runtimeVersionRecheckHandle) return;
+    if (this.detectionRound || !this.asyncDetectionAllowed()) {
+      this.scheduleRuntimeVersionRecheck();
+      return;
+    }
+    const generation = this.lifecycleOriginConnectionGeneration;
+    const run = this.options.runtimeDetectionRound ?? runRuntimeDetectionRound;
+    const handle = run({
+      knownRuntimeIds: RUNTIMES.map((runtime) => runtime.id),
+      ...(this.options.runtimeDetectionDeadlineMs !== undefined ? { deadlineMs: this.options.runtimeDetectionDeadlineMs } : {}),
+    });
+    this.runtimeVersionRecheckHandle = handle;
+    let result: RuntimeDetectionRoundResult | null = null;
+    try {
+      result = await handle.result;
+    } catch {
+      result = null;
+    }
+    if (this.runtimeVersionRecheckHandle !== handle) return; // cancelled (stop or disconnect)
+    this.runtimeVersionRecheckHandle = null;
+    if (!this.connection.connected || generation !== this.lifecycleOriginConnectionGeneration) return;
+    if (!result || result.status !== "complete") {
+      this.recordDaemonEvent("daemon.runtime.version_recheck", { outcome: "incomplete" });
+      this.scheduleRuntimeVersionRecheck();
+      return;
+    }
+    const changed = changedRuntimeVersions(
+      { ids: this.lastReadyRuntimes, versions: this.lastReadyRuntimeVersions },
+      result.detection,
+    );
+    const signature = runtimeDetectionSignature(result.detection);
+    const repeated = changed.length > 0 && signature === this.runtimeVersionRecheckTriggerSignature;
+    this.recordDaemonEvent("daemon.runtime.version_recheck", {
+      outcome: changed.length === 0 ? "unchanged" : repeated ? "changed_already_rescanned" : "changed",
+      ...(changed.length > 0 ? { changed_runtimes: changed.join(",") } : {}),
+    });
+    // Unchanged: the last rescan converged, so a later return to that same
+    // detection is a real change again.
+    if (changed.length === 0) this.runtimeVersionRecheckTriggerSignature = null;
+    if (changed.length === 0 || repeated) {
+      this.scheduleRuntimeVersionRecheck();
+      return;
+    }
+    this.runtimeVersionRecheckTriggerSignature = signature;
+    logger.info(`[Daemon] Runtime CLI changed while connected (${changed.join(", ")}); re-detecting runtimes and models`);
+    // Its ready schedules the next check.
+    this.rescanRuntimes();
   }
 
   private scheduleDiskStatusReport(delayMs: number): void {
@@ -8048,6 +8712,7 @@ export class DaemonCore {
   private handleDisconnect() {
     this.serverAcksRuntimeOutcomes = false;
     this.agentManager.setServerSendIntentCapable?.(false);
+    this.agentManager.setServerInboxRowsCapable?.(false);
     this.agentHosts.setServerTurnEndedCapable?.(false);
     this.agentHosts.setServerStickyFailureReasonsCapable?.(false);
     this.localScheduleRuntime.setServerIdleTaskReminderCapable(false);
@@ -8056,6 +8721,8 @@ export class DaemonCore {
     this.serverFeaturesCapable = false;
     this.serverFeaturesRefresh.reset();
     this.agentManager.setServerFeaturesCapable?.(false);
+    // The next connection's server sends its own check switches first.
+    this.computerChecks.reset();
     // task #17: a login's link, code and result cannot cross a dropped
     // connection, so stop it rather than leave it holding the runtime.
     this.serverRuntimeAuthRuntimes = null;
@@ -8064,9 +8731,13 @@ export class DaemonCore {
     this.runtimeAuth.cancelAll();
     // The shared homes keep their last state; checks resume with the next context and ready.
     this.serverReadsRuntimeCredentialsChanged = false;
+    this.serverReadsRuntimeUpgradable = false;
+    this.serverReadsRuntimeInstallable = false;
+    this.serverReadsRuntimeUpdates = false;
     this.credentialDiskWatch?.setSharedHomesActive(false);
     this.serverContextCapabilities = null;
     this.abandonDetectionRound("disconnect");
+    this.cancelRuntimeVersionRecheck();
     this.runtimeOutcomeOutbox.onDisconnected();
     this.invalidateLifecycleOriginReconcile();
     logger.warn("[Daemon] Lost connection — agents continue running locally");

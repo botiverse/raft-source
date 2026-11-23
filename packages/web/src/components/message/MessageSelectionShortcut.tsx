@@ -1,24 +1,23 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { createPortal } from "react-dom";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Copy, TextQuote } from "lucide-react";
 import {
+  Popover,
+  PopoverContent,
   TextSelectionToolbar,
   TextSelectionToolbarButton,
   TextSelectionToolbarSeparator,
 } from "@botiverse/raft-ui";
 import { useIntl } from "react-intl";
 import { useSelectionStore } from "../../store/selectionStore";
+import { dismissLayerProps } from "../ui/dismissLayer";
 import { emitSelectedTextQuote } from "./selectedTextQuote";
-import {
-  getMessageSelectionShortcutTarget,
-  placeMessageSelectionShortcut,
-} from "./messageSelectionShortcutUtils";
-import type {
-  MessageSelectionShortcutTarget,
-} from "./messageSelectionShortcutUtils";
+import type { SelectedTextQuoteSource } from "./selectedTextQuote";
+import { getMessageSelectionShortcutTarget, selectionRectHasArea } from "./messageSelectionShortcutUtils";
+import type { MessageSelectionShortcutTarget } from "./messageSelectionShortcutUtils";
 import { useShortcutLayer } from "../../features/shortcuts/useShortcutLayer";
 
-const SHORTCUT_ESTIMATED_SIZE = { width: 140, height: 32 };
+const COLLISION_AVOIDANCE = { side: "flip", align: "shift", fallbackAxisSide: "none" } as const;
+
 const MESSAGE_ACTION_SELECTOR = [
   "button",
   "a",
@@ -30,19 +29,6 @@ const MESSAGE_ACTION_SELECTOR = [
   "[role='menuitem']",
   "[role='toolbar']",
 ].join(",");
-
-function viewport() {
-  const visualViewport = window.visualViewport;
-  if (visualViewport && visualViewport.width > 0 && visualViewport.height > 0) {
-    return {
-      width: visualViewport.width,
-      height: visualViewport.height,
-      offsetLeft: visualViewport.offsetLeft,
-      offsetTop: visualViewport.offsetTop,
-    };
-  }
-  return { width: window.innerWidth, height: window.innerHeight };
-}
 
 function isShortcutTarget(target: EventTarget | null): boolean {
   return target instanceof Element && Boolean(target.closest("[data-message-selection-shortcut='true']"));
@@ -102,11 +88,9 @@ function matchesSelectionSnapshot(selection: Selection | null, snapshot: Selecti
 export default function MessageSelectionShortcut() {
   const { formatMessage } = useIntl();
   const selectModeActive = useSelectionStore((s) => s.isActive);
-  const shortcutRef = useRef<HTMLDivElement | null>(null);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dismissedSelectionRef = useRef<SelectionSnapshot | null>(null);
   const [target, setTarget] = useState<MessageSelectionShortcutTarget | null>(null);
-  const [position, setPosition] = useState(() => ({ x: -9999, y: -9999 }));
 
   const close = useCallback(() => {
     if (debounceTimerRef.current) {
@@ -133,11 +117,6 @@ export default function MessageSelectionShortcut() {
       return;
     }
     setTarget(nextTarget);
-    setPosition(placeMessageSelectionShortcut({
-      anchorRect: nextTarget.anchorRect,
-      floatingSize: SHORTCUT_ESTIMATED_SIZE,
-      viewport: viewport(),
-    }));
   }, [close, selectModeActive]);
 
   const dismissCurrentSelection = useCallback(() => {
@@ -205,47 +184,62 @@ export default function MessageSelectionShortcut() {
     };
   }, [scheduleUpdate, updateFromSelection]);
 
+  // While the toolbar is open:
+  // 1. Hide immediately on outside primary pointerdown so starting a new drag
+  //    selection or clicking a control that stops click propagation doesn't
+  //    leave the previous toolbar lingering. Preserve right-click so the
+  //    browser/message context menu can open over the active selection.
+  // 2. Close immediately if the message row unmounts (e.g. virtualizer recycle)
+  //    or the live range collapses to zero area so the popup never teleports to (0, 0).
   useEffect(() => {
     if (!target) return;
-
     const handlePointerDown = (event: PointerEvent) => {
       if (event.button === 2) return;
       if (isShortcutTarget(event.target)) return;
       close();
     };
-    const handleViewportChange = () => close();
-
+    const checkAnchorAlive = () => {
+      if (!target.messageBody.isConnected || !selectionRectHasArea(target.anchor.getBoundingClientRect())) {
+        close();
+      }
+    };
+    const root = target.messageBody.closest(
+      '[data-virtual-timeline], [data-testid="message-scroller"], [data-testid="thread-message-scroller"]',
+    ) ?? target.messageBody.ownerDocument.body;
+    const mutations = typeof MutationObserver === "undefined" || !root
+      ? null
+      : new MutationObserver(checkAnchorAlive);
+    if (root) mutations?.observe(root, { childList: true, subtree: true });
     document.addEventListener("pointerdown", handlePointerDown, true);
-    window.addEventListener("scroll", handleViewportChange, { capture: true, passive: true });
-    window.addEventListener("resize", handleViewportChange);
-    window.visualViewport?.addEventListener("resize", handleViewportChange);
-    window.visualViewport?.addEventListener("scroll", handleViewportChange, { passive: true });
+    window.addEventListener("scroll", checkAnchorAlive, { capture: true, passive: true });
+    window.addEventListener("resize", checkAnchorAlive);
     return () => {
+      mutations?.disconnect();
       document.removeEventListener("pointerdown", handlePointerDown, true);
-      window.removeEventListener("scroll", handleViewportChange, true);
-      window.removeEventListener("resize", handleViewportChange);
-      window.visualViewport?.removeEventListener("resize", handleViewportChange);
-      window.visualViewport?.removeEventListener("scroll", handleViewportChange);
+      window.removeEventListener("scroll", checkAnchorAlive, true);
+      window.removeEventListener("resize", checkAnchorAlive);
     };
   }, [close, target]);
+
+  const handleOpenChange = useCallback((next: boolean) => {
+    if (!next) close();
+  }, [close]);
+
   // Esc closes the non-modal selection shortcut: a layer heard in the capture phase, before the thread's own Esc.
   useShortcutLayer("selection", !!target, { onEscape: () => { close(); }, phase: "capture", ignoreDefaultPrevented: true });
 
-  useLayoutEffect(() => {
-    if (!target) return;
-    const floating = shortcutRef.current;
-    if (!floating) return;
-    const rect = floating.getBoundingClientRect();
-    setPosition(placeMessageSelectionShortcut({
-      anchorRect: target.anchorRect,
-      floatingSize: { width: rect.width, height: rect.height },
-      viewport: viewport(),
-    }));
-  }, [target]);
-
   const handleQuote = useCallback(() => {
     if (!target) return;
-    emitSelectedTextQuote(target.quoteChannelId, target.text);
+    const source: SelectedTextQuoteSource | undefined = target.messageId
+      ? {
+          messageId: target.messageId,
+          authorName: target.authorName,
+          authorType: target.authorType,
+          createdAt: target.createdAt,
+          isPartial: true,
+        }
+      : undefined;
+    emitSelectedTextQuote(target.quoteChannelId, target.text, source);
     dismissCurrentSelection();
   }, [dismissCurrentSelection, target]);
 
@@ -256,28 +250,34 @@ export default function MessageSelectionShortcut() {
     window.getSelection()?.removeAllRanges();
   }, [dismissCurrentSelection, target]);
 
-  const positionStyle = useMemo(() => ({ left: position.x, top: position.y }), [position]);
-
-  if (!target) return null;
-
-  return createPortal(
-    <TextSelectionToolbar
-      ref={shortcutRef}
-      aria-label={formatMessage({ id: "message.selectionShortcut.actionsAria" })}
-      data-message-selection-shortcut="true"
-      className="fixed z-popup w-max"
-      style={positionStyle}
-    >
-      <TextSelectionToolbarButton onClick={handleQuote}>
-        <TextQuote />
-        {formatMessage({ id: "message.selectionShortcut.quote" })}
-      </TextSelectionToolbarButton>
-      <TextSelectionToolbarSeparator />
-      <TextSelectionToolbarButton onClick={handleCopy}>
-        <Copy />
-        {formatMessage({ id: "message.selectionShortcut.copy" })}
-      </TextSelectionToolbarButton>
-    </TextSelectionToolbar>,
-    document.body,
+  return (
+    <Popover open={Boolean(target)} onOpenChange={handleOpenChange}>
+      <PopoverContent
+        {...dismissLayerProps}
+        align="center"
+        anchor={target?.anchor}
+        collisionAvoidance={COLLISION_AVOIDANCE}
+        initialFocus={false}
+        finalFocus={false}
+        side="top"
+        sideOffset={8}
+        className="min-w-0 overflow-visible rounded-none bg-transparent p-0 shadow-none ring-0 [[data-anchor-hidden]_&]:invisible [[data-anchor-hidden]_&]:pointer-events-none"
+      >
+        <TextSelectionToolbar
+          aria-label={formatMessage({ id: "message.selectionShortcut.actionsAria" })}
+          data-message-selection-shortcut="true"
+        >
+          <TextSelectionToolbarButton onClick={handleQuote}>
+            <TextQuote />
+            {formatMessage({ id: "message.selectionShortcut.quote" })}
+          </TextSelectionToolbarButton>
+          <TextSelectionToolbarSeparator />
+          <TextSelectionToolbarButton onClick={handleCopy}>
+            <Copy />
+            {formatMessage({ id: "message.selectionShortcut.copy" })}
+          </TextSelectionToolbarButton>
+        </TextSelectionToolbar>
+      </PopoverContent>
+    </Popover>
   );
 }

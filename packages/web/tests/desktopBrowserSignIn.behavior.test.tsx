@@ -27,6 +27,8 @@
  * - An App that would first be installed is held to the same return address.
  * - Whoever is signed in is named to the shell, flag on or off: an account
  *   that follows another without a sign-out is told apart there.
+ * - The App's card shows its registered logo in every layout: ready on a
+ *   Server, installed first from the Marketplace, signed in with the account.
  */
 import assert from "node:assert/strict";
 import "./helpers/domSetup";
@@ -800,6 +802,126 @@ test("an App that would first be installed is held to the same return address: a
   const offered = await findSheet();
   await within(offered).findByRole("button", { name: en["pages.humanLogin.installAndContinue"] }, { timeout: 5000 });
   assert.deepEqual(posts, []);
+});
+
+// The setup page opened directly in a tab (no authorize request): the query Raft Desktop's main builds from its
+// allow-list (apps/desktop webPreviewRaftSignInRules.ts raftSetupEntryRequest): no `flow`, no nonce, no challenge.
+const DIRECT_SETUP_SEARCH = `?client_id=orbital-notes&return_to=${encodeURIComponent(RETURN_URL)}&scope=openid+profile&state=state-1`;
+
+/** The lookup answers `answer(serverId)` for the App on each Server (null: the API's ready answer). */
+function lookupAnswers(answer: (serverId: string) => Record<string, unknown> | null) {
+  const ready = api.get;
+  api.get = (async (url: string, config?: { params?: { server_id?: string } }) => {
+    const data = url === "/oauth/clients/lookup" ? answer(config?.params?.server_id ?? "") : null;
+    return data ? { data } : ready(url, config as never);
+  }) as typeof api.get;
+}
+
+const ORBITAL = {
+  id: "app-1",
+  clientId: "orbital-notes",
+  appType: "third_party_global",
+  name: "Orbital Notes",
+  description: "Review launch notes from Raft.",
+  homepageUrl: null,
+  returnUrl: RETURN_URL,
+  logoUrl: null,
+};
+
+test("the setup page opened directly (no authorize request): an account-mode App shows what it shows after an authorize, and signs in without OIDC", async () => {
+  const { posts } = stubApi({ "/oauth/authorize/account": [() => ({ returnUrl: RETURN_URL, code: "code-1" })] });
+  lookupAnswers(() => ({ ...ORBITAL, loginMode: "account", availability: "ready" }));
+  const shell = fakeShell();
+  renderHost();
+  flagOn();
+  const seen: string[] = [];
+  for (const [requestId, setupSearch] of [["req-authorize", SETUP_SEARCH], ["req-direct", DIRECT_SETUP_SEARCH]] as const) {
+    await shell.raise({ requestId, setupSearch });
+    const sheet = await findSheet();
+    const approve = await within(sheet).findByRole("button", { name: "Login with Raft" }, { timeout: 5000 });
+    // The account card: no Server is offered or named (an account-mode App signs in with no Server).
+    await waitFor(() => assert.ok((sheet.textContent ?? "").includes("Orbital Notes")));
+    assert.ok(within(sheet).queryByRole("combobox") === null, "no Server picker");
+    assert.equal(/Launch Server|Alpha Server/.test(sheet.textContent ?? ""), false, "no Server named");
+    await clickWhenEnabled(approve);
+    await waitFor(() => assert.deepEqual(shell.calls.at(-1), ["complete", requestId, `${RETURN_URL}?code=code-1&state=state-1`]));
+    seen.push(sheet.textContent ?? "");
+    await waitFor(() => assert.ok(screen.queryByTestId("desktop-browser-sign-in") === null));
+  }
+  assert.equal(seen[1], seen[0], "the sheet said the same thing for both");
+  assert.deepEqual(posts.map((post) => post.url), ["/oauth/authorize/account", "/oauth/authorize/account"]);
+  assert.deepEqual(posts[0]!.body, {
+    clientId: "orbital-notes", returnUrl: RETURN_URL, scopes: ["openid", "profile"], oidc: true, nonce: "nonce-1",
+    codeChallenge: undefined, codeChallengeMethod: undefined, source: "desktop_browser",
+  });
+  assert.deepEqual(posts[1]!.body, { clientId: "orbital-notes", returnUrl: RETURN_URL, scopes: ["openid", "profile"], source: "desktop_browser" }, "the page's own flow for a direct visit");
+});
+
+test("the setup page opened directly (no authorize request): a Marketplace App that would first be installed is offered for install as after an authorize", async () => {
+  const { posts } = stubApi();
+  lookupAnswers(() => ({ ...ORBITAL, marketplace: true, availability: "install_required", installation: { serverId: "server-1", canInstall: true } }));
+  const shell = fakeShell();
+  renderHost();
+  flagOn();
+  const seen: string[] = [];
+  for (const [requestId, setupSearch] of [["req-authorize", SETUP_SEARCH], ["req-direct", DIRECT_SETUP_SEARCH]] as const) {
+    await shell.raise({ requestId, setupSearch });
+    const sheet = await findSheet();
+    await within(sheet).findByRole("button", { name: en["pages.humanLogin.installAndContinue"] }, { timeout: 5000 });
+    seen.push(sheet.textContent ?? "");
+    await shell.close(requestId);
+    await waitFor(() => assert.ok(screen.queryByTestId("desktop-browser-sign-in") === null));
+  }
+  assert.equal(seen[1], seen[0], "the sheet said the same thing for both");
+  assert.equal(shell.calls.some((call) => call[0] === "refuse"), false);
+  assert.deepEqual(posts, [], "nothing installed or authorized without a press");
+});
+
+/** The layouts the sheet can show an App in, each with the lookup's fields that pick it and its approving button. */
+const LOGO_LAYOUTS: [string, Record<string, unknown>, string][] = [
+  ["ready on a Server", { availability: "ready" }, "Login with Raft"],
+  [
+    "installed first from the Marketplace",
+    { marketplace: true, availability: "install_required", installation: { canInstall: true } },
+    en["pages.humanLogin.installAndContinue"],
+  ],
+  ["signed in with the Raft account", { availability: "ready", loginMode: "account" }, "Login with Raft"],
+];
+
+test.each(LOGO_LAYOUTS)("the App's card shows the logo its lookup returns: %s", async (_layout, fields, approve) => {
+  const LOGO = "/api/integration-logos/app-1/logo.webp";
+  stubApi();
+  // Only the client lookup is answered here; any other GET still meets stubApi's guard.
+  const others = api.get;
+  api.get = (async (url: string, config?: { params?: { server_id?: string } }) => {
+    if (url !== "/oauth/clients/lookup") return others(url, config as never);
+    const installation = "installation" in fields ? { ...(fields.installation as object), serverId: config?.params?.server_id } : undefined;
+    return {
+      data: {
+        id: "app-1",
+        clientId: "orbital-notes",
+        appType: "third_party_global",
+        name: "Orbital Notes",
+        description: "Review launch notes from Raft.",
+        homepageUrl: null,
+        returnUrl: RETURN_URL,
+        logoUrl: LOGO,
+        ...fields,
+        ...(installation ? { installation } : null),
+      },
+    };
+  }) as typeof api.get;
+  const shell = fakeShell();
+  renderHost();
+  flagOn();
+  await shell.raise(REQUEST);
+  const sheet = await findSheet();
+  await within(sheet).findByRole("button", { name: approve }, { timeout: 5000 });
+  const body = within(sheet).getByTestId("login-setup-sheet-body");
+  const logos = [...body.querySelectorAll("img")].filter((image) => image.getAttribute("src") === LOGO);
+  assert.equal(logos.length, 1, "the App's logo, once");
+  // In the App's card, beside its name.
+  assert.ok(logos[0]!.closest("[data-slot='card']")?.textContent?.includes("Orbital Notes"), "in the App's card");
 });
 
 test("another account right after the first, with no sign-out between and the flag off for it: the shell is told who is signed in", async () => {

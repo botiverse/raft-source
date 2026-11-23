@@ -30,7 +30,8 @@ function useHostDesktop(): boolean {
 export function ArtifactHostMenuItems() {
   if (isChromeless()) return null;
   const items = hostMenuItems();
-  if (items.length === 0) return null;
+  // `copy-link` is Copy link's own route (useCopyArtifactLink), not an item here.
+  if (!items.some((item) => item !== "copy-link")) return null;
   return <HostMenuGroup items={items} />;
 }
 

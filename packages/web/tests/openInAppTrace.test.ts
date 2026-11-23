@@ -62,8 +62,8 @@ test("the platform, coarse, by user agent", () => {
 
 test("Open sends open at once with an attempt; losing focus sends handed_over at once with the same attempt, only once", () => {
   const seen = watch();
-  reportOpenInAppOpen(BANNER, true);
-  assert.deepEqual([seen[0]!.step, seen[0]!.urgent, seen[0]!.remembered, typeof seen[0]!.attempt], ["open", true, true, "string"]);
+  reportOpenInAppOpen(BANNER);
+  assert.deepEqual([seen[0]!.step, seen[0]!.urgent, seen[0]!.remembered, typeof seen[0]!.attempt], ["open", true, false, "string"]);
   window.dispatchEvent(new window.Event("blur"));
   window.dispatchEvent(new window.Event("blur"));
   assert.deepEqual(seen.map((each) => [each.step, each.urgent]), [["open", true], ["handed_over", true]]);

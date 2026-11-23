@@ -4,10 +4,10 @@ import { useServerStore } from "./serverStore";
 import { useMessageStore } from "./messageStore";
 import type { Message } from "./messageStore";
 import { clearChannelAccessLost } from "./channelAccessLoss";
-import type { InboxRefreshTrigger } from "@botiverse/raft-shared";
+import type { InboxRefreshRefusal, InboxRefreshTrigger } from "@botiverse/raft-shared";
 
-/** Asks for a throttled Activity re-read, naming the event that asked (#triage:#229). */
-export type ScheduleInboxRefresh = (trigger: InboxRefreshTrigger) => void;
+/** Asks for a throttled Activity re-read, naming the event that asked (#triage:#229) and, for a live message, why it was not patched in place (#244). */
+export type ScheduleInboxRefresh = (trigger: InboxRefreshTrigger, refused?: InboxRefreshRefusal) => void;
 
 export interface ChannelRealtimeSocket {
   emit(event: string, ...args: unknown[]): unknown;

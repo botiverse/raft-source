@@ -30,7 +30,7 @@
 // visible (canUserAccessChannel has always answered true for it); whether a
 // surface lists archived conversations is that surface's product choice and
 // stays at the call site. Deleted conversations are never visible.
-import { and, eq, inArray, isNull, or, sql, type SQL, type SQLWrapper } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, or, sql, type SQL, type SQLWrapper } from "drizzle-orm";
 import { isAdminOrOwner, isGuestRole, type ServerId, type ServerRole } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import { agents, channelAgents, channelHumans, channels, jointChannels, jointChannelServers, serverMembers, servers } from "../db/schema";
@@ -42,6 +42,7 @@ import {
   isLiveAgentOfServer,
 } from "./channelService";
 import { resolveActorContext } from "../lib/actorPermissions";
+import { onlineMoveCanonicalsForRoots } from "./channelConversionReadScope";
 import { dmScopeOf, readableOwnerDmPolicy } from "./assistantDmScope";
 
 /**
@@ -269,6 +270,35 @@ export async function jointHomeProjections(
 ): Promise<JointHomeProjection[]> {
   const rows = await jointRecords(serverIds, { ...opts, activeOnly: true });
   return rows.map(({ canonicalChannelId, serverId, localChannelId }) => ({ canonicalChannelId, serverId, localChannelId }));
+}
+
+/**
+ * Homes (conversation ids an object names) as conversations of `serverId`:
+ * the server's own conversations as they are, a joint's canonical channel,
+ * or another server's projection of a joint (a home named before publish
+ * stored the canonical channel, or a channel converted since), as the
+ * server's active projection of it (jointHomeProjections); absent for
+ * anything else. In one query, plus two when some id is not the server's.
+ */
+export async function localConversationIds(serverId: ServerId, homeChannelIds: readonly string[]): Promise<Map<string, string>> {
+  const ids = [...new Set(homeChannelIds)];
+  if (ids.length === 0) return new Map();
+  // Never a joint's storage channel as it is, whatever `serverId` is: it is named only by a server's projection.
+  const own = await getDb().select({ id: channels.id }).from(channels).innerJoin(servers, eq(servers.id, channels.serverId))
+    .where(and(inArray(channels.id, ids), eq(channels.serverId, serverId), ne(servers.kind, "joint_storage")));
+  const local = new Map(own.map((row) => [row.id, row.id]));
+  const others = ids.filter((id) => !local.has(id));
+  if (others.length > 0) {
+    // Another server's projection names the joint's canonical channel.
+    const canonicalOf = new Map((await jointHomeRecords("any", { localChannelIds: others })).map((record) => [record.localChannelId, record.canonicalChannelId]));
+    const canonicalIds = [...new Set(others.map((id) => canonicalOf.get(id) ?? id))];
+    const projectionOf = new Map((await jointHomeProjections([serverId], { canonicalChannelIds: canonicalIds })).map((projection) => [projection.canonicalChannelId, projection.localChannelId]));
+    for (const id of others) {
+      const projection = projectionOf.get(canonicalOf.get(id) ?? id);
+      if (projection) local.set(id, projection);
+    }
+  }
+  return local;
 }
 
 /**
@@ -868,6 +898,12 @@ export async function visibleRootChannelIds(
       ));
     for (const row of rows) jointStorageByLocalId.set(row.localChannelId, row.canonicalChannelId);
   }
+  // An ordinary root in an online move (channel_conversion_online_move_v1)
+  // keeps its id; its new and moved messages are in its canonical channel.
+  if (includeThreads) {
+    const ordinaryRootIds = roots.filter((root) => root.type === "channel" || root.type === "private").map((root) => root.id);
+    for (const [localId, canonicalId] of await onlineMoveCanonicalsForRoots(db, ordinaryRootIds)) jointStorageByLocalId.set(localId, canonicalId);
+  }
   return { serverId: actor.serverId, roots, parentlessThreadIds, jointStorageByLocalId };
 }
 
@@ -899,7 +935,8 @@ export function visibleConversationRootIds(roots: VisibleRoots): string[] {
   const ids = new Set<string>();
   for (const root of roots.roots) {
     ids.add(root.id);
-    const storage = root.type === "joint" ? roots.jointStorageByLocalId.get(root.id) : undefined;
+    // A joint root's canonical channel, or an online move's (both mapped).
+    const storage = roots.jointStorageByLocalId.get(root.id);
     if (storage) ids.add(storage);
   }
   for (const id of roots.parentlessThreadIds) ids.add(id);

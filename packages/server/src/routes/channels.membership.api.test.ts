@@ -20,7 +20,7 @@ import {
   channelAgents,
   messages, attachments, inboxNotificationFacts
 } from "../db/schema";
-import { addMember, removeMember, updateServerOnboardingAgent } from "../services/serverService";
+import { addMember, removeMember, linkOfficialOnboardingAgent } from "../services/serverService";
 import { createAgent } from "../services/agentService";
 import { createChannel, addHuman, addAgent, removeHuman, removeAgent, findOrCreateDM, findOrCreateAgentDM, findOrCreateUserDM, canAgentAccessChannel, canAgentPostToChannel, canUserPostToChannel, isChannelHuman, listDMChannels, resolveChannelByName } from "../services/channelService";
 import {
@@ -585,7 +585,7 @@ test("POST /api/channels rejects each present invalid visibility without persist
       body: JSON.stringify({ name: channelName, visibility: invalidVisibility.value }),
     });
     assert.equal(invalidRes.status, 400, `${invalidVisibility.label} visibility must fail closed`);
-    assert.deepEqual(await invalidRes.json(), { error: "visibility must be one of: public, private, joint" });
+    assert.deepEqual(await invalidRes.json(), { error: "visibility must be one of: public, private, joint", code: "channel_visibility_invalid", errorCode: "channel_visibility_invalid" });
 
     const persistedChannels = await db
       .select({ id: channels.id })
@@ -755,7 +755,8 @@ test("private channels are visible/readable only to invited members", async ({ a
     headers: headers(outsiderToken, server.id),
     body: JSON.stringify({ channelId: privateChannel.id, content: "should not send" }),
   });
-  assert.equal(outsiderPost.status, 403);
+  // The send refuses an outsider the way the read does: the same 404.
+  assert.equal(outsiderPost.status, 404);
 
   const invitedSync = await fetch(`${app.baseUrl}/api/messages/sync?since_seq=0`, {
     headers: headers(invitedToken, server.id),
@@ -1098,7 +1099,7 @@ test("manually hidden #all does not auto-reveal from onboarding unlock after mem
     assert.equal(hide.status, 200, "admin manual hide should succeed");
 
     const oaAgent = await createAgent(server.id, "manual-hidden-all-oa", { runtime: "codex" });
-    await updateServerOnboardingAgent(server.id, oaAgent.id);
+    await linkOfficialOnboardingAgent(server.id, oaAgent.id);
     await addMember(server.id, teammate.id);
 
     const fired = await triggerAllChannelUnlockOnboarding(app.io, app.app.get("agentOrchestrator"), server.id);
@@ -1140,7 +1141,7 @@ test("opener-world hidden #all auto-reveals when a 3rd member is a human", async
     assert.equal(allChannel.type, "private", "opener-world #all is born hidden");
 
     const oaAgent = await createAgent(server.id, "opener-human-unlock-oa", { runtime: "codex" });
-    await updateServerOnboardingAgent(server.id, oaAgent.id);
+    await linkOfficialOnboardingAgent(server.id, oaAgent.id);
     const agentOrchestrator = app.app.get("agentOrchestrator");
 
     // Baseline: owner (1 human) + OA (1 agent) = 2 members → still hidden.

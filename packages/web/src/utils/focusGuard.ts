@@ -1,6 +1,9 @@
 // Deferred focus (a composer that mounts late, a failed send restoring its
 // draft) must not take focus the user already put somewhere else: the top
 // search box, another text field, or an open dialog (#triage:#278).
+//
+// Each check reads the focus of the target's own document (an object window's,
+// features/objectWindows), not the main window's, unless given one.
 
 import { isTextEditableElement } from "./keyboardShortcuts";
 
@@ -8,7 +11,7 @@ import { isTextEditableElement } from "./keyboardShortcuts";
 export const OVERLAY = "[role='dialog'], [role='alertdialog'], [aria-modal='true']";
 
 /** Whether `target` may take focus now without stealing it from the user. */
-export function mayTakeFocus(target: Element | null | undefined, doc: Document = document): boolean {
+export function mayTakeFocus(target: Element | null | undefined, doc: Document = target?.ownerDocument ?? document): boolean {
   if (!target) return false;
   const active = doc.activeElement;
   if (!active || active === doc.body || active === target || target.contains(active)) return true;
@@ -25,7 +28,7 @@ const POPUP = "[role='dialog'], [role='alertdialog']";
  * for a target inside that dialog: focus never leaves an open dialog for the page behind it (rule 1). Focus anywhere
  * else is somewhere the person put it.
  */
-export function focusLost(target?: Element | null, doc: Document = document): boolean {
+export function focusLost(target?: Element | null, doc: Document = target?.ownerDocument ?? document): boolean {
   const active = doc.activeElement;
   if (!active || active === doc.body || !active.isConnected) return true;
   return active.matches(POPUP) && !!target && active.contains(target);
@@ -38,7 +41,7 @@ export function focusLost(target?: Element | null, doc: Document = document): bo
  * a context menu, or a combobox list driven from an input outside it, is open; focus is not put there either, as
  * nothing hidden from assistive tech should take it. A popover or dropdown menu hides nothing.
  */
-export function behindModalLayer(target: Element, doc: Document = document): boolean {
+export function behindModalLayer(target: Element, doc: Document = target.ownerDocument ?? document): boolean {
   if (target.closest("[inert], [aria-hidden='true']")) return true;
   const layer = doc.activeElement?.closest("[aria-modal='true']");
   return !!layer && !layer.contains(target);

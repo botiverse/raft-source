@@ -4,8 +4,12 @@
 // A pulled directory pushes a new version on its recorded base, sending only
 // the files that changed. A directory without `.raft-artifact.json` creates a
 // new artifact, homed in --target. Files missing locally are not deleted unless
-// named with --delete. Once the Server has taken the push, the base moves to the new
-// version whatever happens next: the directory is then brought in line with it
+// named with --delete. A new artifact none of whose files is a page (HTML or
+// Markdown) is held once before anything is sent, with the attachment to send
+// instead; the same command again within 10 minutes goes through (#345: the
+// shared push op holds it, the agent ledger keeps the hold). Once the Server
+// has taken the push, the base moves to the new version whatever happens
+// next: the directory is then brought in line with it
 // (others' merged files fetched or removed, deleted files removed), and a file
 // that can't be fetched is reported with how to refresh, never as a failed
 // push.
@@ -20,6 +24,7 @@
 // command that sets it later.
 
 import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
+import { resolve } from "node:path";
 
 import type { Command } from "commander";
 import {
@@ -41,6 +46,7 @@ import { defineCommand, registerCliCommand } from "../../core/command";
 import type { CommandRuntimeOptions } from "../../core/context";
 import { CliError } from "../../core/errors";
 import { adoptCliReplyText, writeText } from "../../core/renderer";
+import { heldOnceStore } from "./_heldOnceStore";
 import { fileTarget, readDirState, scanDir, sha256Of, writeDirState, writeFileUnder } from "./_dir";
 import { formatArtifactNothingToPublish, formatArtifactPublished } from "./_format";
 import { artifactCliError, splitArgs } from "./_shared";
@@ -79,12 +85,12 @@ export const artifactPublishCommand = defineCommand(
       { flags: "--target <target>", description: "A new artifact's home: the conversation whose members can see it ('#channel', 'dm:@peer')" },
       { flags: "--title <title>", description: "Title (required for a new artifact unless its entry page has a <title>; for a pulled one with no file changed, renames it without a new version)" },
       { flags: "--description <text>", description: "What the artifact is (up to 1000 characters)" },
-      { flags: "--entry <file>", description: "The file it opens at (default: the base's; index.html or the only file for a new one)" },
+      { flags: "--entry <file>", description: "The file it opens at (default: the base's; for a new one index.html, else the only file, else its only HTML page (with none, its only Markdown file))" },
       { flags: "--note <text>", description: "What changed in this version (up to 500 characters)" },
       { flags: "--label <text>", description: "A short name for this version (up to 60 characters)" },
       { flags: "--delete <path>", description: "Remove this file from the artifact and the directory (repeat for each file); files missing locally are kept otherwise", parse: collect },
       { flags: "--include-hidden", description: "Also push new hidden files (.name); they are left out by default" },
-      { flags: "--announcement", description: "Also make the new artifact the announcement of the --target channel, replacing any other (the channel's owner or a server owner/admin only)" },
+      { flags: "--announcement", description: "Also make the new artifact the announcement of the --target channel, replacing any other (a channel admin of it or a server owner/admin only; on a joint channel, the host server's)" },
     ],
     helpAfter: "\nAn HTML page can ask Raft to open its comment box with an answer filled in (decision buttons), copy text and open links; what it can call and what the sandbox blocks:\n"
       + `  ${artifactPageManualHint()}\n`,
@@ -172,7 +178,16 @@ export const artifactPublishCommand = defineCommand(
       ...(opts.label === undefined ? {} : { label: opts.label }),
       files: sent,
       ...(deletes.length === 0 ? {} : { delete: deletes }),
-    }, { upload, dir });
+    }, {
+      upload,
+      dir,
+      // A new artifact with no page is held once; the hold is kept in this agent's ledger, keyed with the absolute directory.
+      ...(state ? {} : { pageHold: {
+        store: heldOnceStore(agentContext.agentId, "artifact_push_no_page", ctx.env),
+        dir: resolve(dir),
+        ...(ctx.now ? { now: ctx.now } : {}),
+      } }),
+    });
     if (!outcome.ok) throw artifactCliError(outcome, commandLineOf(args), PUBLISH_RATE_LIMITED_LEFT_BEHIND);
 
     // Pushed. From here on nothing throws: the base moves to the new version and the directory follows it.
@@ -261,7 +276,7 @@ async function channelAnnouncementChannelFor(client: Parameters<typeof createAge
   if (capabilities?.editChannelMetadata !== true) {
     throw new CliError({
       code: "CHANNEL_ANNOUNCEMENT_FORBIDDEN",
-      message: `Only the owner of #${name} (one of its channel admins) or a server owner or admin can set its announcement. Nothing was pushed.`,
+      message: `Only a channel admin of #${name} or a server owner or admin can set its announcement. Nothing was pushed.`,
       suggestedNextAction: `Push it without --announcement and ask one of them to set it: raft channel update --target "#${name}" --announcement <artifact>`,
     });
   }

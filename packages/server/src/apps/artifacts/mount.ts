@@ -6,7 +6,7 @@
 //
 // - Agent API, `/internal/agent-api/artifacts/*` (contract: packages/shared
 //   agentApiArtifactsContract.ts): the operations of routes.ts, publish.ts,
-//   comments.ts, reviews.ts, manage.ts, import.ts, save.ts and checkRead.ts. A publish's JSON body (files inline, up to
+//   comments.ts, reviews.ts, manage.ts, import.ts, save.ts, settleRoutes.ts and checkRead.ts. A publish's JSON body (files inline, up to
 //   AGENT_API_ARTIFACT_PUBLISH_MAX_BODY_BYTES as base64, far over the global
 //   100 KB) is parsed by a route-scoped parser after agent auth and the flag
 //   check: a server with the flag off answers 403 ARTIFACTS_NOT_ENABLED
@@ -34,12 +34,14 @@
 //   Artifacts (its Files panel, reads only) by `dashboard`; S5's
 //   reads by `attachmentSaves` and `shareAudience`; a version's files in one
 //   zip (`download.zip`, a read) by `downloadZip`; where a canonical link
-//   opens (`locate`, which of the reader's servers) by `locate`. Message links' cards are
+//   opens (`locate`, which of the reader's servers) by `locate`; a version's
+//   links to other Artifacts (`links`, linkTargets.ts) by `links`; what links to an Artifact
+//   (`backlinks`, backlinks.ts) by `backlinks`. Message links' cards are
 //   core's object summaries (`POST /api/objects/summaries`), not a route here.
 // - Signed-out web API, `/api/public/artifacts/*` (contract: packages/shared
 //   publicArtifactsContract.ts), with no auth: the operations of
 //   publicRoutes.ts, each limited per client address (`view`, `frame`,
-//   `markdown`, `meta`, `file`, `downloadZip`).
+//   `markdown`, `meta`, `links`, `file`, `downloadZip`).
 // - Content Worker, `/internal/artifacts-content/*` (S2,
 //   docs/development/workspace-artifacts-content-origin.md): authorize,
 //   manifest and embeds (contentRoutes.ts) behind the Worker's token and rate limit.
@@ -98,6 +100,9 @@ export function mountArtifactAgentApi(mount: AgentApiMount): void {
   // #249: a thread's resolve (an optional note, a reply) and reopen (resolutions.ts).
   mount.json("artifactCommentResolve", "Failed to resolve comment thread", (call) => api.resolve(call.agent, call.params, call.body, call.noticeOutbox));
   mount.json("artifactCommentReopen", "Failed to reopen comment thread", (call) => api.reopen(call.agent, call.params, call.noticeOutbox));
+  // #334: settling and unsettling (settle.ts).
+  mount.json("artifactSettle", "Failed to settle artifact", (call) => api.settle(call.agent, call.params, call.noticeOutbox));
+  mount.json("artifactUnsettle", "Failed to unsettle artifact", (call) => api.unsettle(call.agent, call.params, call.noticeOutbox));
   mount.json("artifactSubscribe", "Failed to follow artifact", (call) => api.subscribe(call.agent, call.params));
   mount.json("artifactUnsubscribe", "Failed to unfollow artifact", (call) => api.unsubscribe(call.agent, call.params));
   mount.json("artifactMove", "Failed to move artifact", (call) => api.move(call.agent, call.params, call.body));
@@ -144,6 +149,12 @@ export function mountArtifactWebApi(mount: WebApiMount): void {
   // A whole version in one zip (a read: up to 100 MiB of storage reads per request, so far fewer than files): 20 a
   // minute, far above a person downloading; a few at once per process besides (zipSlots.ts `web`, 429 BUSY).
   const downloadZip = mount.rateLimit("downloadZip", { perMinute: 20, message: "Too many artifact downloads in a minute: wait a minute, then download it again." });
+  // A version's links and their targets (#336): asked once per page the viewer shows; an older version's are read
+  // from storage (up to 8 MiB), a current one's may be filled first.
+  const links = mount.rateLimit("links", { perMinute: 120, message: "Too many artifact link lookups in a minute: wait a minute, then reload." });
+  // What links to an Artifact (#336 step 2, "Linked from"): asked once per viewer opened, two counts and two pages
+  // over the Artifact's reference rows.
+  const backlinks = mount.rateLimit("backlinks", { perMinute: 120, message: "Too many lookups of what links to an artifact in a minute: wait a minute, then reload." });
 
   // S5, saving an attachment and what attachments were saved as. Before `/:id`, which would take them as ids.
   mount.route("post", "/save-attachment", "saveAttachment", (call) => api.saveAttachment(call.reader, call.body), { rateLimit: write });
@@ -166,6 +177,8 @@ export function mountArtifactWebApi(mount: WebApiMount): void {
   // The same answer without `frame` and without moving the read position (the App's own bar): no ticket, so not in that budget.
   mount.route("get", "/:id/details", "details", (call) => api.details(call.reader, id(call), call.query));
   mount.route("get", "/:id/locate", "locate", (call) => api.locate(call.reader, id(call)), { rateLimit: locate });
+  mount.route("get", "/:id/links", "links", (call) => api.links(call.reader, id(call), call.query), { rateLimit: links });
+  mount.route("get", "/:id/backlinks", "backlinks", (call) => api.backlinks(call.reader, id(call)), { rateLimit: backlinks });
   // The standalone page's one call (webOpen.ts): no server scoping (core's account route), and its answer signs a
   // ticket as the viewer's does: in the frame route's budget. A segment that doesn't decode names no Artifact.
   mount.accountRoute("/:id/open", "open", (call) => api.open(call.reader, id(call), call.query), { rateLimit: frame, undecodable: webNotVisible });
@@ -193,6 +206,9 @@ export function mountArtifactWebApi(mount: WebApiMount): void {
   mount.route("get", "/:id/mention-candidates", "mentionCandidates", (call) => api.mentionCandidates(call.reader, id(call), call.query), { rateLimit: mentionCandidates });
   mount.route("get", "/:id/presence", "presence", (call) => api.presence(call.reader, id(call)));
   mount.route("put", "/:id/subscription", "follow", (call) => api.follow(call.reader, id(call)), { rateLimit: write });
+  // Settled (#334, settle.ts): writes.
+  mount.route("post", "/:id/settle", "settle", (call) => api.settle(call.reader, id(call), call.noticeOutbox), { rateLimit: write });
+  mount.route("delete", "/:id/settle", "unsettle", (call) => api.unsettle(call.reader, id(call), call.noticeOutbox), { rateLimit: write });
   mount.route("delete", "/:id/subscription", "unfollow", (call) => api.unfollow(call.reader, id(call)), { rateLimit: write });
   // Moving to a larger home and deleting share the writes' budget.
   mount.route("post", "/:id/home", "changeHome", (call) => api.home(call.reader, id(call), call.body), { rateLimit: write });
@@ -241,13 +257,19 @@ export function mountArtifactPublicWebApi(mount: PublicWebApiMount): void {
   const markdown = mount.rateLimit("markdown", { perMinute: 60, message: "Too many artifact reads from this address in a minute: wait a minute, then read it again." });
   // For link previews: the web's edge asks, from few addresses, on every page view (never cached: `private, no-store`).
   const meta = mount.rateLimit("meta", { perMinute: 300, message: "Too many artifact previews from this address in a minute: wait a minute, then try again." });
+  // Rendered 1200x630 OG card PNG for public Artifacts (matching meta's 300/min limit for shared unfurler egress IPs).
+  const ogImage = mount.rateLimit("ogImage", { perMinute: 300, message: "Too many artifact preview images from this address in a minute: wait a minute, then try again." });
   // Files (index.md lists them), as an agent fetching an Artifact's files does.
   const file = mount.rateLimit("file", { perMinute: 120, message: "Too many artifact files fetched from this address in a minute: wait a minute, then fetch the file again." });
   const downloadZip = mount.rateLimit("downloadZip", { perMinute: 10, message: "Too many artifact downloads from this address in a minute: wait a minute, then download it again." });
+  // The page's links to other Artifacts (#336): asked once per page view, as the view.
+  const links = mount.rateLimit("links", { perMinute: 60, message: "Too many artifact link lookups from this address in a minute: wait a minute, then reload." });
   mount.route("get", "/:id", "view", (call) => api.view(id(call)), { rateLimit: view });
   // Markdown, never HTML; `private, no-store` like every answer here (the web's edge asks it beside meta on every page view).
   mount.route("get", "/:id/index.md", "markdown", (call) => api.markdown(id(call)), { rateLimit: markdown });
   mount.route("get", "/:id/meta", "meta", (call) => api.meta(id(call)), { rateLimit: meta });
+  mount.route("get", "/:id/og-image.png", "ogImage", (call) => api.ogImage(id(call)), { rateLimit: ogImage });
+  mount.route("get", "/:id/links", "links", (call) => api.links(id(call)), { rateLimit: links });
   // One file of the current version to download (index.md lists them): an attachment, never rendered here.
   mount.route("get", "/:id/files/*path", "file", (call) => api.file(id(call), call.params.path!), { rateLimit: file });
   // Every file in one zip: a whole version's bytes per request, so fewer than files.

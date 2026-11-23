@@ -36,7 +36,8 @@
 //   closedServerPurgeFinish.ts ownAppNeverSharedSql) and own_apps_kept (the
 //   rest: published or shared); and channels_bridged, the channels the
 //   purge clears whose bridge rows it deletes first;
-// - each first-party app's own count (FirstPartyApp.purgeServer, `count`).
+// - each first-party app's own count (FirstPartyApp.purgeServer, `count`),
+//   told the kept channels as the delete tells them (KeptChannels.apps).
 //
 // `delete`: on the primary, servers not yet purged, each claimed with a lease
 // (purge_lease_until / purge_lease_token on servers) and resumed at its
@@ -93,7 +94,6 @@ import {
   isPurgeTimeout,
   closedServerPurgeEligibleSql,
   closedServerPurgeOpenSql,
-  keptChannelsOf,
   LOCK_TIMEOUT,
   MESSAGE_BATCH_START,
   purgeClosedServer,
@@ -104,6 +104,7 @@ import {
   type ClosedServerPurgeRunContext,
   type ClosedServerPurgeServerResult,
 } from "./closedServerPurgeDelete";
+import { keptChannelsOf } from "./closedServerKeptChannels";
 import { closedServerPurgeRowScope, ownAppNeverSharedSql, type ClosedServerPurgeFinishStep } from "./closedServerPurgeFinish";
 import { closedServerPurgeRowDeletes } from "./closedServerPurgeClassification";
 import type { ClosedServerPurgeRevokers } from "./closedServerPurgeRevoke";
@@ -679,12 +680,16 @@ export async function countServer(
     counts[key] = 0;
   }
 
+  // What the purge keeps (keptChannelsOf): the apps are told, as the delete tells them, so their counts leave the kept objects out.
+  checkTime();
+  const kept = await readOnly(reader, (tx) => keptChannelsOf(tx, serverId));
+
   // Apps first, as the purge will (design: before the channel pass).
   for (const app of apps) {
     if (!app.purgeServer) continue;
     checkTime();
     try {
-      const answer = await readOnly(reader, (executor) => app.purgeServer!(serverId, { executor, limit: 0, mode: "count" }));
+      const answer = await readOnly(reader, (executor) => app.purgeServer!(serverId, { executor, limit: 0, mode: "count", keepChannelIds: kept.apps }));
       for (const [key, n] of Object.entries(answer.counts)) counts[`app_${snake(app.id)}_${snake(key)}`] = n;
     } catch (error) {
       const code = sqlstateOf(error);
@@ -758,8 +763,6 @@ export async function countServer(
   }
 
   // The finish's server_rows tables, with the delete's own scope (header).
-  checkTime();
-  const kept = await readOnly(reader, (tx) => keptChannelsOf(tx, serverId));
   for (const entry of closedServerPurgeRowDeletes()) {
     checkTime();
     const [row] = rowsOf(await readOnly(reader, (tx) => tx.execute(sql`

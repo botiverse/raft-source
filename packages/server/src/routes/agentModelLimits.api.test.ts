@@ -15,20 +15,18 @@ import { and, eq } from "drizzle-orm";
 import {
   DAEMON_CAPABILITY_AGENT_CONFIG_PUSH,
   DAEMON_CAPABILITY_MODEL_LIMITS_REPORT_V1,
-  PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY,
   RUNTIME_CONFIG_VERSION,
   type AgentModelLimitsFrame,
   type MachineToServerMessage,
   type ModelLimits,
 } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
-import { agentModelLimitsReports, agentProviderConnections, agents, featureFlagRules, machines, managedMcpServers, providerConnections, users } from "../db/schema";
+import { agentModelLimitsReports, agents, machines, managedMcpServers, users } from "../db/schema";
 import { createManagedMcpServer } from "../services/managedMcpService";
 import { recordAgentModelLimitsReport } from "../services/agentModelLimitsService";
 import { AgentOrchestrator, type ResetAgentOptions } from "../services/agentOrchestrator";
 import { bumpAgentConfigRevision } from "../services/agentConfigRevision";
 import { createServer } from "../services/serverService";
-import { createProviderConnection } from "../services/providerConnectionService";
 
 const test = createApiTest();
 
@@ -245,31 +243,6 @@ test("another revision (PATCH to another model): the old session's default row n
   }
 });
 
-test("a shared connection's endpoint edit moves the revision: no longer shown; a connection without an endpoint gets no modelLimits", async ({ app }) => {
-  const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
-  process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 9).toString("base64");
-  const { owner, server, machine, agent, orchestrator, headers } = await seed(app);
-  try {
-    await getDb().insert(featureFlagRules).values({ id: randomUUID(), flagKey: PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY, stage: "server", priority: -100, decision: "allow", values: [server.id] });
-    const connection = await createProviderConnection({ serverId: server.id, userId: owner.id, name: "Gateway", providerId: "openai-compatible", endpointUrl: "https://gateway.example.test/v1", apiKey: "k" });
-    await getDb().update(agents).set({ runtimeConfig: { ...GATEWAY_CONFIG, provider: { kind: "connection", connectionId: connection.id } } as any }).where(eq(agents.id, agent.id));
-    await getDb().insert(agentProviderConnections).values({ serverId: server.id, agentId: agent.id, connectionId: connection.id, expectedConfigVersion: 1, expectedCredentialVersion: 1 });
-    await orchestrator.handleMachineMessage(machine.id, frame(agent.id, { modelLimits: DEFAULTS }));
-    assert.deepEqual(await limitsOf(app, headers, agent.id), SHOWN, "a gateway connection counts");
-    orchestrator.updates.length = 0;
-    const res = await fetch(`${app.baseUrl}/api/provider-connections/${connection.id}`, { method: "PATCH", headers, body: JSON.stringify({ endpointUrl: "https://other-gateway.example.test/v1" }) });
-    assert.equal(res.status, 200, await res.clone().text());
-    assert.deepEqual(await limitsOf(app, headers, agent.id), NOT_SHOWN);
-    assert.ok(orchestrator.updates.includes(agent.id), "agent:updated for the revision bump");
-    await getDb().update(providerConnections).set({ endpointUrl: null }).where(eq(providerConnections.id, connection.id));
-    assert.equal(await limitsOf(app, headers, agent.id), undefined);
-  } finally {
-    await orchestrator.shutdown();
-    if (originalKey === undefined) delete process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
-    else process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = originalKey;
-  }
-});
-
 test("another Computer (after migration): the old Computer's default rows never count; its later frames are refused; the new Computer's report does count", async ({ app }) => {
   const { server, machine, otherMachine, agent, orchestrator, headers } = await seed(app);
   try {
@@ -394,7 +367,7 @@ test("frames the server does not know, and malformed limits frames, are dropped 
 
 // agent:updated where the signal can change: a stored report (above), a new
 // session (a move to another Computer starts one), a revision bump (managed
-// MCP, provider connection: above). Only agents with the signal are told.
+// MCP: above). Only agents with the signal are told.
 async function until(check: () => boolean, label: string): Promise<void> {
   for (let i = 0; i < 100 && !check(); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.ok(check(), label);

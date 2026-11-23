@@ -9,6 +9,8 @@ import {
   resolvedConversionReadChannelPredicate,
 } from "./channelConversionReadScope";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
+import { announceMessageObjectLinks } from "./firstPartyAppMessageLinks";
+import { recordMessageReferences } from "./messageReferences";
 import { randomUUID } from "node:crypto";
 import { legacyAgentProvenance } from "./externalAgentProvenance";
 import { eq, asc, desc, gt, gte, lt, lte, and, inArray, isNull, isNotNull, not, sql, or, getTableColumns, type SQL } from "drizzle-orm";
@@ -44,6 +46,7 @@ import { DEPRECATED_GRAVATAR_HASH,
   resolveRaftMentionHandle,
   structuredRaftMentionStillAppears,
   failpoints,
+  FORWARDED_RESOLVE_CAPABILITY,
   messageRef,
   messageRepliesDiscussion,
   renderThirdPartyInertText,
@@ -54,9 +57,7 @@ import { DEPRECATED_GRAVATAR_HASH,
   type ServerId,
   type RaftTargetString,
   type TraceAttributes,
-  encodeChannelActivityCursor,
   notificationPlainText,
-  type ChannelActivityCursor,
   type ForwardedBundleTargetSnapshot,
 } from "@botiverse/raft-shared";
 import { sqlUuidOrNull } from "../db/sqlUuid";
@@ -79,7 +80,7 @@ import {
   resolveAttachmentMimeType,
 } from "../routes/attachments";
 import { updateMaxSeqRedis, getMaxSeqRedis } from "../replicaRouter";
-import { redisSyncDuration } from "../metrics";
+import { oncePushLagObserver, redisSyncDuration } from "../metrics";
 import { buildSearchText } from "./searchTokenizer";
 import * as agentPermalinkRenderService from "./agentPermalinkRenderService";
 import * as agentService from "./agentService";
@@ -91,8 +92,10 @@ import {
   actorHasServerCapabilityInServer,
   actorRoleHasServerCapability,
   getActorServerRoleInServer,
+  type ActorContextType,
 } from "../lib/actorPermissions";
 import { actorHasChannelCapability } from "../lib/channelActorPermissions";
+import { agentDescriptionViewer, humanDescriptionViewer, humanOriginSubjectInServer, humanSubjectInServer, jointOriginConversation, LOCAL_ORIGIN_CONVERSATION, senderDescriptionFor, senderOriginFor, senderOriginRowField, senderOriginWireField, type AttributedDescription, type DescriptionViewer, type OriginConversation, type OriginServer, type OriginSubject, type SenderOrigin } from "../lib/descriptionVisibility";
 import {
   assertChannelWritableInTransaction,
   withChannelWriterFence,
@@ -109,7 +112,7 @@ import {
   linkAttachmentsToMessageWithExecutor as linkAttachmentRowsToMessageWithExecutor,
 } from "./attachmentLinkingService";
 import { emitTaskCreated } from "./taskRealtimeEvents";
-import { projectRichMessageSocketPayload } from "./messageRealtimeEvents";
+import { projectRichMessageSocketPayload, type StorageOnlyMessageSocketKey } from "./messageRealtimeEvents";
 import {
   recordInboxNotificationFacts,
   type InboxNotificationFactInput,
@@ -277,6 +280,24 @@ async function traceMessageDbPhase<T>(
 
 function getMentionHandles(content: string): string[] {
   return extractRaftMentionHandles(content).map((handle) => `@${handle}`);
+}
+
+/**
+ * A DM's room may not hold its members' sockets yet (a just-created DM, or one
+ * a socket has not opened). Join every human member's sockets on the DM's
+ * server to the room before a message:new for it; returns those members' ids.
+ */
+export async function joinDmHumanSocketsToRoom(
+  io: SocketServer,
+  channel: { id: string; serverId: string },
+  getChannelHumans: (channelId: string) => Promise<Array<{ id: string }>> = channelService.getChannelHumans,
+): Promise<string[]> {
+  const channelRoom = `channel:${channel.id}`;
+  const humans = await getChannelHumans(channel.id);
+  for (const h of humans) {
+    io.in(socketUserServerRoom(h.id, channel.serverId)).socketsJoin(channelRoom);
+  }
+  return humans.map((h) => h.id);
 }
 
 export async function getHumanThreadFollowerIds(
@@ -487,6 +508,7 @@ type MessageServiceDeps = {
   getActiveJointChannelProjectionsByLocalChannel: typeof channelService.getActiveJointChannelProjectionsByLocalChannel;
   getActiveJointThreadProjectionsByCanonicalThread: typeof channelService.getActiveJointThreadProjectionsByCanonicalThread;
   getJointThreadProjectionForMember: typeof channelService.getJointThreadProjectionForMember;
+  getJointThreadProjectionsForMember: typeof channelService.getJointThreadProjectionsForMember;
   renderAgentReadablePermalinks: typeof agentPermalinkRenderService.renderAgentReadablePermalinks;
   listAgents: typeof agentService.listAgents;
   getServerIdentity: (serverId: string) => Promise<{ slug: string } | null>;
@@ -497,6 +519,7 @@ type MessageServiceDeps = {
   getHumanIdsVisibleThroughJointChannels: typeof channelService.getHumanIdsVisibleThroughJointChannels;
   getActorServerRoleInServer: typeof getActorServerRoleInServer;
   getSenderIdentity: typeof getSenderIdentity;
+  getOriginJointServers: typeof getOriginJointServers;
   insertMentionRows: typeof insertMentionRows;
   getMentionFactsForMessages: typeof getMentionFactsForMessages;
   recordInboxNotificationFacts: typeof recordInboxNotificationFacts;
@@ -507,7 +530,14 @@ type MessageServiceDeps = {
   persistMentionDeliveryOccurrences: typeof mentionDeliveryOccurrenceService.ensureMentionDeliveryOccurrences;
   /** Agent handles by id, for the sender's "Delivered to N agents" receipt line. */
   getAgentNamesByIds: (agentIds: readonly string[]) => Promise<Map<string, string>>;
+  /** The Computer an agent runs on, or null: whether a delivery may name a command its CLI has. */
+  getAgentMachineId: (agentId: string) => Promise<string | null>;
 };
+
+async function getAgentMachineId(agentId: string): Promise<string | null> {
+  const [row] = await getDb().select({ machineId: agents.machineId }).from(agents).where(eq(agents.id, agentId)).limit(1);
+  return row?.machineId ?? null;
+}
 
 async function getAgentNamesByIds(agentIds: readonly string[]): Promise<Map<string, string>> {
   const ids = [...new Set(agentIds)];
@@ -628,6 +658,7 @@ const defaultMessageServiceDeps: MessageServiceDeps = {
   getActiveJointChannelProjectionsByLocalChannel: channelService.getActiveJointChannelProjectionsByLocalChannel,
   getActiveJointThreadProjectionsByCanonicalThread: channelService.getActiveJointThreadProjectionsByCanonicalThread,
   getJointThreadProjectionForMember: channelService.getJointThreadProjectionForMember,
+  getJointThreadProjectionsForMember: channelService.getJointThreadProjectionsForMember,
   renderAgentReadablePermalinks: agentPermalinkRenderService.renderAgentReadablePermalinks,
   listAgents: agentService.listAgents,
   getServerIdentity: async (serverId) => {
@@ -641,6 +672,7 @@ const defaultMessageServiceDeps: MessageServiceDeps = {
   getHumanIdsVisibleThroughJointChannels: channelService.getHumanIdsVisibleThroughJointChannels,
   getActorServerRoleInServer,
   getSenderIdentity,
+  getOriginJointServers,
   insertMentionRows,
   getMentionFactsForMessages,
   recordInboxNotificationFacts,
@@ -650,6 +682,7 @@ const defaultMessageServiceDeps: MessageServiceDeps = {
   listExplicitThreadUnfollows,
   persistMentionDeliveryOccurrences: mentionDeliveryOccurrenceService.ensureMentionDeliveryOccurrences,
   getAgentNamesByIds,
+  getAgentMachineId,
 };
 
 let messageServiceDepsOverride: Partial<MessageServiceDeps> | null = null;
@@ -1047,13 +1080,13 @@ function withFrontendConversationContext<T extends Record<string, unknown>>(
 
 function projectFrontendMessagePayload<T extends Record<string, unknown>>(
   payload: T,
-): Omit<T, "agentSendKey" | "searchText" | "searchVector" | "senderHandle" | "serverId" | "senderTimezone"> {
+): Omit<T, StorageOnlyMessageSocketKey> {
   return projectRichMessageSocketPayload(payload);
 }
 
 function projectThreadLatestReplyPayload<T extends Record<string, unknown>>(
   payload: T,
-): Omit<T, "agentSendKey" | "searchText" | "searchVector" | "senderHandle" | "serverId" | "senderTimezone"> & {
+): Omit<T, StorageOnlyMessageSocketKey> & {
   senderDisplayName: string;
   senderAvatarUrl: string | null;
 } {
@@ -1311,6 +1344,58 @@ async function buildInboxFactNotificationContext(input: {
   };
 }
 
+/**
+ * A joint-thread reply makes the parent's author a follower ('authored') on
+ * every projection of the thread they are a member of, before the reply fans
+ * out. Agent delivery of a joint thread (handleJointThreadPostBroadcastSideEffects)
+ * and the follower audience of the facts read these rows; written only by the
+ * post-commit frontend emit, the FIRST reply (which opens the thread) reached
+ * no one who was not yet following (#439). Runs on the send's executor, so in
+ * its transaction when there is one. Idempotent (one row per projection; the
+ * emit's later write re-upserts it), and like every automatic follow it does not undo an explicit
+ * unfollow. Only projections whose parent channel the author belongs to: a
+ * server the author is not in gets no row.
+ */
+async function recordJointThreadAuthoredFollowsForReply(input: {
+  deps: MessageServiceDeps;
+  canonicalThreadChannelId: string;
+  parentMessageId: string | null;
+  message: Pick<typeof messages.$inferSelect, "seq" | "messageType">;
+  senderType: StoredMessageSenderType | "system";
+  senderId: string;
+  executor?: DatabaseExecutor;
+}): Promise<void> {
+  if (!input.parentMessageId || input.message.messageType !== "chat") return;
+  if (input.senderType !== "user" && input.senderType !== "agent") return;
+  const [parentMsg] = await (input.executor ?? getDb())
+    .select({ senderType: messages.senderType, senderId: messages.senderId, messageType: messages.messageType })
+    .from(messages)
+    .where(eq(messages.id, input.parentMessageId))
+    .limit(1);
+  if (
+    !parentMsg
+    || !isFollowableThreadAuthor(parentMsg)
+    || (parentMsg.senderType !== "user" && parentMsg.senderType !== "agent")
+    || parentMsg.senderId === input.senderId
+  ) return;
+  const authorProjections = await input.deps.getJointThreadProjectionsForMember(
+    input.canonicalThreadChannelId,
+    parentMsg.senderType,
+    parentMsg.senderId,
+    input.executor,
+  );
+  for (const authorProjection of authorProjections) {
+    await channelService.recordThreadFollow(
+      parentMsg.senderType,
+      parentMsg.senderId,
+      authorProjection.localThreadChannelId,
+      input.parentMessageId,
+      "authored",
+      { joinedThroughSeq: input.message.seq - 1, executor: input.executor },
+    );
+  }
+}
+
 async function recordInboxFactsForPersistedMessage(opts: {
   channel: typeof channels.$inferSelect;
   message: typeof messages.$inferSelect;
@@ -1490,6 +1575,15 @@ async function recordInboxFactsForPersistedMessage(opts: {
         opts.message.channelId,
         executor,
       );
+      await recordJointThreadAuthoredFollowsForReply({
+        deps: opts.deps,
+        canonicalThreadChannelId: opts.message.channelId,
+        parentMessageId: opts.channel.parentMessageId,
+        message: opts.message,
+        senderType: opts.senderType,
+        senderId: opts.senderId,
+        executor,
+      });
       for (const projection of projections) {
         const { humanFollowerIds, agentFollowers } = await getPostPersistThreadFollowerCandidates(
           opts.deps,
@@ -2262,27 +2356,147 @@ export async function getLatestSenderTimezone(
   return latest?.senderTimezone ?? null;
 }
 
-async function getSenderIdentity(senderType: "user" | "agent", senderId: string, fallbackName: string): Promise<{ uniqueName: string; description: string | null }> {
+/**
+ * The sender's handle and description, the description attributed to the
+ * sender (their server, or a human's non-guest servers) so each recipient
+ * reads it through senderDescriptionFor: one lookup serves every recipient
+ * server of a send, the joint fan-out included. The same row says where the
+ * sender is from (`origin`, read per recipient through senderOriginFor): an
+ * agent's server, a human's member and guest servers; and the server they
+ * post from with its slug (`postingServer`: an agent's own server, a human's
+ * when the caller names it, `postingServerId` of a joint send).
+ */
+export type SenderIdentity = {
+  uniqueName: string;
+  description: AttributedDescription | null;
+  /** Absent for a system or external sender (no origin). */
+  origin?: OriginSubject | null;
+  postingServer?: OriginServer | null;
+};
+
+async function getSenderIdentity(
+  senderType: "user" | "agent",
+  senderId: string,
+  fallbackName: string,
+  postingServerId: string | null = null,
+): Promise<SenderIdentity> {
   const db = getDb();
   if (senderType === "user") {
     const [user] = await db
-      .select({ name: users.name, description: users.description })
+      .select({
+        name: users.name,
+        description: users.description,
+        nonGuestServerIds: sql<string[]>`COALESCE((
+          SELECT array_agg(${serverMembers.serverId}::text) FROM ${serverMembers}
+          WHERE ${serverMembers.userId} = ${users.id} AND ${serverMembers.role} <> 'guest'
+        ), '{}'::text[])`,
+        guestServerIds: sql<string[]>`COALESCE((
+          SELECT array_agg(${serverMembers.serverId}::text) FROM ${serverMembers}
+          WHERE ${serverMembers.userId} = ${users.id} AND ${serverMembers.role} = 'guest'
+        ), '{}'::text[])`,
+        postingServerSlug: postingServerId
+          ? sql<string | null>`(SELECT ${servers.slug} FROM ${servers} WHERE ${servers.id} = ${postingServerId})`
+          : sql<string | null>`NULL::text`,
+      })
       .from(users)
       .where(eq(users.id, senderId));
     return {
       uniqueName: user?.name || fallbackName,
-      description: user?.description || null,
+      description: user?.description
+        ? { text: user.description, subject: { kind: "human", nonGuestServerIds: user.nonGuestServerIds } }
+        : null,
+      origin: user ? { kind: "human", nonGuestServerIds: user.nonGuestServerIds, guestServerIds: user.guestServerIds } : null,
+      postingServer: user && postingServerId ? { id: postingServerId, slug: user.postingServerSlug } : null,
     };
   }
 
   const [agent] = await db
-    .select({ name: agents.name, description: agents.description })
+    .select({ name: agents.name, description: agents.description, serverId: agents.serverId, serverSlug: servers.slug })
     .from(agents)
+    .leftJoin(servers, eq(servers.id, agents.serverId))
     .where(eq(agents.id, senderId));
   return {
     uniqueName: agent?.name || fallbackName,
-    description: agent?.description || null,
+    description: agent?.description
+      ? { text: agent.description, subject: { kind: "agent", serverId: agent.serverId } }
+      : null,
+    origin: agent ? { kind: "agent", serverId: agent.serverId } : null,
+    postingServer: agent ? { id: agent.serverId, slug: agent.serverSlug ?? null } : null,
   };
+}
+
+/**
+ * The active servers of the joint conversation `channelId` is a local face or
+ * the shared store of (a thread's included), with their slugs; null when it is
+ * none. Two lookups on unique indexes (idx_joint_channel_servers_local_channel,
+ * then idx_joint_channels_canonical), then the joint's servers by primary key.
+ */
+export async function getOriginJointServers(channelId: string, db: DatabaseExecutor = getDb()): Promise<Map<string, string> | null> {
+  const [face] = await db
+    .select({ jointChannelId: jointChannelServers.jointChannelId })
+    .from(jointChannelServers)
+    .where(and(eq(jointChannelServers.localChannelId, channelId), eq(jointChannelServers.status, "active")))
+    .limit(1);
+  const jointChannelId = face?.jointChannelId ?? (await db
+    .select({ id: jointChannels.id })
+    .from(jointChannels)
+    .where(eq(jointChannels.canonicalChannelId, channelId))
+    .limit(1))[0]?.id;
+  if (!jointChannelId) return null;
+  const rows = await db
+    .select({ serverId: jointChannelServers.serverId, slug: servers.slug })
+    .from(jointChannelServers)
+    .innerJoin(jointChannels, and(eq(jointChannels.id, jointChannelServers.jointChannelId), eq(jointChannels.status, "active")))
+    .innerJoin(servers, eq(servers.id, jointChannelServers.serverId))
+    .where(and(eq(jointChannelServers.jointChannelId, jointChannelId), eq(jointChannelServers.status, "active")));
+  return rows.length === 0 ? null : new Map(rows.map((row) => [row.serverId, row.slug] as const));
+}
+
+/**
+ * Whether a delivery channel row can be in a joint conversation, from the row
+ * alone: a joint channel's local face (type `joint`), its shared store (a
+ * `channel` row named `joint-storage-…`, createJointStorageChannelWithExecutor
+ * and channel conversion; a person may give a channel such a name too, so this
+ * only admits the lookup, which decides), or a sub-conversation under one
+ * (`parentIsJoint`; a joint thread's local face carries no parent message).
+ * Anything else is local, with no query.
+ */
+function mayBeInJointConversation(channel: { type: string; name?: string; parentMessageId?: string | null }, parentIsJoint: boolean): boolean {
+  if (channel.type === "joint") return true;
+  if (channel.type === "channel" && channel.name?.startsWith("joint-storage-")) return true;
+  if (!isSubConversationType(channel.type as typeof channels.$inferSelect["type"])) return false;
+  return parentIsJoint || (channel.type === "thread" && !channel.parentMessageId);
+}
+
+/** Whether a sub-conversation's parent (resolveThreadParentFields) is a joint face or store, by mayBeInJointConversation's row rule. */
+function parentFieldsMayBeJoint(fields: AgentThreadParentFields): boolean {
+  return fields.parent_channel_type === "joint"
+    || (fields.parent_channel_type === "channel" && Boolean(fields.parent_channel_name?.startsWith("joint-storage-")));
+}
+
+/**
+ * The conversation a redelivery's sender origin reads (senderOriginFor),
+ * looked up only where it can change the answer: a sender from outside the
+ * reader's server (not a non-guest member nor a guest there) in a channel that
+ * can be joint. Every other sender's origin is the same either way, so a
+ * local channel or a same-server sender costs no query.
+ *
+ * A stored message records no posting server (it lives on the shared store),
+ * so the sender's is the first by slug of the joint's servers they belong to
+ * (jointOriginConversation): a fallback that names a true server of theirs,
+ * not always the one they posted through. Live sends name that one.
+ */
+async function originConversationForDelivery(
+  deps: MessageServiceDeps,
+  input: { channel: { id: string; type: string; name?: string; parentMessageId?: string | null }; parentIsJoint: boolean; readerServerId: string; subject: OriginSubject | null | undefined },
+): Promise<OriginConversation> {
+  const { channel, subject } = input;
+  if (!subject || !mayBeInJointConversation(channel, input.parentIsJoint)) return LOCAL_ORIGIN_CONVERSATION;
+  if (senderOriginFor(agentDescriptionViewer(input.readerServerId), subject, LOCAL_ORIGIN_CONVERSATION)?.kind !== "other_server") {
+    return LOCAL_ORIGIN_CONVERSATION;
+  }
+  const serverSlugs = await deps.getOriginJointServers(channel.id);
+  return serverSlugs ? jointOriginConversation(serverSlugs, subject) : LOCAL_ORIGIN_CONVERSATION;
 }
 
 export async function createMessage(
@@ -2962,6 +3176,119 @@ async function createOrReplayUserRandomSend(opts: {
   return getDb().transaction(run);
 }
 
+/**
+ * `thread:updated` for a reply in a plain (non-joint) thread: the parent
+ * message's reply summary. The summary is as private as the parent: a private
+ * or DM parent goes to each parent-channel human's user room, otherwise to the
+ * parent channel room. Shared by the ordinary send path and system replies.
+ */
+async function emitPlainThreadUpdated(
+  io: SocketServer,
+  deps: MessageServiceDeps,
+  input: {
+    threadChannelId: string;
+    serverId: string;
+    parentMessageId: string;
+    parentChannelId: string;
+    reply: Record<string, unknown>;
+    emit: (work: () => unknown) => unknown;
+  },
+): Promise<void> {
+  const threadInfo = await deps.getThreadInfo(input.parentMessageId);
+  const parentChannel = await deps.getChannel(input.parentChannelId);
+  const payload = {
+    parentMessageId: input.parentMessageId,
+    threadChannelId: input.threadChannelId,
+    ...threadInfo,
+    syncCoreReplyWindow: buildThreadRepliesSyncWindow({
+      serverId: input.serverId,
+      parentMessageId: input.parentMessageId,
+      parentScopeKind: parentChannel?.type ?? "channel",
+      parentScopeId: input.parentChannelId,
+    }),
+    latestReply: projectThreadLatestReplyPayload(withFrontendConversationContext(
+      input.reply,
+      buildFrontendConversationContext({
+        channelType: "thread",
+        parentMessageId: input.parentMessageId,
+        parentChannel,
+      }),
+    )),
+  };
+  // A thread nested in another sub-conversation (from before creation refused
+  // it): route by the root, not by the middle conversation's room, which a
+  // member removed from the root is never evicted from. Unresolvable: drop.
+  const nested = parentChannel?.type === "thread" || parentChannel?.type === "task";
+  const route = nested ? await channelService.resolveConversationRoot(input.parentChannelId) : parentChannel;
+  if (nested && !route) return;
+  if (route?.type === "private" || route?.type === "dm") {
+    const parentHumans = await deps.getChannelHumans(route.id);
+    for (const human of parentHumans) {
+      await input.emit(() => io.to(`user:${human.id}`).emit("thread:updated", payload));
+    }
+  } else if (nested && route?.type === "joint") {
+    // Removal from a Joint evicts sockets from the root's room.
+    await input.emit(() => io.to(`channel:${route.id}`).emit("thread:updated", payload));
+  } else {
+    await input.emit(
+      () => io.to(`channel:${input.parentChannelId}`).emit("thread:updated", payload),
+    );
+  }
+}
+
+/**
+ * Run a system reply's thread summary (`thread:updated`) as best-effort work:
+ * the reply is already durable and its `message:new` sent, and a reload
+ * recovers the summary, so a failed read or emit must never reject the system
+ * broadcast or skip its agent delivery. Fixed, value-free trace only.
+ */
+async function runSystemThreadSummaryBestEffort(
+  topology: SystemThreadSummaryTopology,
+  work: () => Promise<void> | void,
+): Promise<void> {
+  try {
+    await work();
+  } catch (error) {
+    traceSystemThreadSummaryDegraded(topology, error);
+  }
+}
+
+type SystemThreadSummaryTopology = "thread" | "joint_thread";
+
+function traceSystemThreadSummaryDegraded(topology: SystemThreadSummaryTopology, error: unknown): void {
+  addTraceEvent("message_pipeline.system_thread_summary.degraded", {
+    topology,
+    persistence_state: "durable",
+    failure_policy: "continue_from_persisted_state",
+    ...getMessageDbErrorTraceAttrs(error),
+  });
+}
+
+/**
+ * `thread:updated` payload for one joint thread projection: the canonical
+ * parent's summary under this server's local thread id and parent scope. The
+ * caller emits it to `channel:<projection.localParentChannelId>`.
+ */
+function buildJointThreadUpdatedPayload<TThreadInfo extends object, TLatestReply>(
+  projection: Pick<channelService.JointThreadProjection, "localThreadChannelId" | "localServerId" | "localParentChannelId">,
+  parentMessageId: string,
+  threadInfo: TThreadInfo,
+  latestReply: TLatestReply,
+) {
+  return {
+    parentMessageId,
+    ...threadInfo,
+    threadChannelId: projection.localThreadChannelId,
+    syncCoreReplyWindow: buildThreadRepliesSyncWindow({
+      serverId: projection.localServerId,
+      parentMessageId,
+      parentScopeKind: "joint",
+      parentScopeId: projection.localParentChannelId,
+    }),
+    latestReply,
+  };
+}
+
 async function emitFrontendSocketBestEffort(input: {
   topology: SlackBridgeOutboundPipelineTopology;
   work: () => unknown;
@@ -3002,8 +3329,8 @@ async function emitFrontendSocketBestEffort(input: {
  * mobile accepts a realtime frame as a full canonical fact only when every
  * such key is present. Values match what REST enrichment
  * (enrichWithSenderNames) returns for the same brand-new row:
- * - senderDescription: the sender's user/agent description, `null` when unset
- *   (callers resolve it via getSenderIdentity, the same `description || null`).
+ * - senderDescription: viewer-scoped (lib/descriptionVisibility.ts), so a
+ *   shared broadcast passes `null`, as enrichment with no viewer returns.
  * - reactions: a just-created message has none → `[]`.
  * - externalAuthor: only external_projection senders have one; ordinary
  *   user/agent/system sends → `null`.
@@ -3119,6 +3446,8 @@ async function emitPersistedMessageToFrontend(
     work,
     onSocketEmitFailure,
   });
+  // slock_message_push_lag_seconds{receiver="web"}: once, at this message's first message:new emit.
+  const notePushedToWeb = oncePushLagObserver("web", message.createdAt);
 
   // For DMs and threads, ensure participants' sockets are in the channel room before broadcasting.
   // New DMs/threads have no room members yet — without this, messages would be lost.
@@ -3162,7 +3491,7 @@ async function emitPersistedMessageToFrontend(
         );
         // message-realtime-producer: message-service.persisted.joint-channel-projection
         await emitSocketBestEffort(
-          () => io.to(`channel:${projection.localChannelId}`).emit("message:new", payload),
+          () => { io.to(`channel:${projection.localChannelId}`).emit("message:new", payload); notePushedToWeb(); },
         );
       }
       return channel;
@@ -3214,12 +3543,20 @@ async function emitPersistedMessageToFrontend(
         && (parentMsg.senderType === "user" || parentMsg.senderType === "agent")
         && parentMsg.senderId !== senderId
       ) {
-        const authorProjection = await deps.getJointThreadProjectionForMember(
-          channelId,
-          parentMsg.senderType,
-          parentMsg.senderId,
-        );
-        if (authorProjection && parentMessageId) {
+        // Every projection the parent author belongs to, like the mention
+        // follow: the canonical parent message records no origin server, so
+        // the first-joined projection may not be the surface they posted in.
+        // Already written with the send's inbox facts
+        // (recordJointThreadAuthoredFollowsForReply, #439); this idempotent
+        // re-write only backs up a caller that recorded no facts.
+        const authorProjections = parentMessageId
+          ? await deps.getJointThreadProjectionsForMember(
+            channelId,
+            parentMsg.senderType,
+            parentMsg.senderId,
+          )
+          : [];
+        for (const authorProjection of authorProjections) {
           await channelService.recordThreadFollow(
             parentMsg.senderType,
             parentMsg.senderId,
@@ -3262,7 +3599,7 @@ async function emitPersistedMessageToFrontend(
           io.in(userServerRoom).socketsJoin(`channel:${projection.localThreadChannelId}`);
           // message-realtime-producer: message-service.persisted.joint-thread-follower
           await emitSocketBestEffort(
-            () => io.to(userServerRoom).emit("message:new", messagePayload),
+            () => { io.to(userServerRoom).emit("message:new", messagePayload); notePushedToWeb(); },
           );
         }
         if (!parentMessageId || !threadInfo) continue;
@@ -3275,18 +3612,10 @@ async function emitPersistedMessageToFrontend(
           { topology },
         );
         await emitSocketBestEffort(
-          () => io.to(`channel:${projection.localParentChannelId}`).emit("thread:updated", {
-            parentMessageId,
-            ...threadInfo,
-            threadChannelId: projection.localThreadChannelId,
-            syncCoreReplyWindow: buildThreadRepliesSyncWindow({
-              serverId: projection.localServerId,
-              parentMessageId,
-              parentScopeKind: "joint",
-              parentScopeId: projection.localParentChannelId,
-            }),
-            latestReply,
-          }),
+          () => io.to(`channel:${projection.localParentChannelId}`).emit(
+            "thread:updated",
+            buildJointThreadUpdatedPayload(projection, parentMessageId, threadInfo, latestReply),
+          ),
         );
       }
       return channel;
@@ -3357,12 +3686,7 @@ async function emitPersistedMessageToFrontend(
   let threadFollowerIdsForFrontend: string[] | null = null;
   let dmHumanIdsForFrontend: string[] | null = null;
   if (channel?.type === "dm") {
-    const channelRoom = `channel:${channelId}`;
-    const humans = await deps.getChannelHumans(channelId);
-    dmHumanIdsForFrontend = humans.map((h) => h.id);
-    for (const h of humans) {
-      io.in(socketUserServerRoom(h.id, channel.serverId)).socketsJoin(channelRoom);
-    }
+    dmHumanIdsForFrontend = await joinDmHumanSocketsToRoom(io, channel, deps.getChannelHumans);
   } else if (isSubConversationType(channel?.type)) {
     const channelRoom = `channel:${channelId}`;
     const followerIds = await getHumanThreadFollowerIds(channelId);
@@ -3400,13 +3724,13 @@ async function emitPersistedMessageToFrontend(
     if (parentChannel?.type === "channel") {
       // message-realtime-producer: message-service.persisted.thread-public
       await emitSocketBestEffort(
-        () => io.to(`channel:${channelId}`).emit("message:new", payload),
+        () => { io.to(`channel:${channelId}`).emit("message:new", payload); notePushedToWeb(); },
       );
     } else {
       for (const userId of threadFollowerIdsForFrontend ?? []) {
         // message-realtime-producer: message-service.persisted.thread-private-follower
         await emitSocketBestEffort(
-          () => io.to(`user:${userId}`).emit("message:new", payload),
+          () => { io.to(`user:${userId}`).emit("message:new", payload); notePushedToWeb(); },
         );
       }
     }
@@ -3421,7 +3745,7 @@ async function emitPersistedMessageToFrontend(
     );
     // message-realtime-producer: message-service.persisted.channel
     await emitSocketBestEffort(
-      () => io.to(`channel:${channelId}`).emit("message:new", payload),
+      () => { io.to(`channel:${channelId}`).emit("message:new", payload); notePushedToWeb(); },
     );
   }
 
@@ -3451,37 +3775,14 @@ async function emitPersistedMessageToFrontend(
 
   if (channel?.type === "thread" && channel.parentMessageId) {
     if (parentMsgForThread) {
-      const threadInfo = await deps.getThreadInfo(channel.parentMessageId);
-      const parentChannel = await deps.getChannel(parentMsgForThread.channelId);
-      const payload = {
-        parentMessageId: channel.parentMessageId,
+      await emitPlainThreadUpdated(io, deps, {
         threadChannelId: channelId,
-        ...threadInfo,
-        syncCoreReplyWindow: buildThreadRepliesSyncWindow({
-          serverId: channel.serverId,
-          parentMessageId: channel.parentMessageId,
-          parentScopeKind: parentChannel?.type ?? "channel",
-          parentScopeId: parentMsgForThread.channelId,
-        }),
-        latestReply: projectThreadLatestReplyPayload(withFrontendConversationContext(
-          broadcastEnriched,
-          buildFrontendConversationContext({
-            channelType: "thread",
-            parentMessageId: channel.parentMessageId,
-            parentChannel,
-          }),
-        )),
-      };
-      if (parentChannel?.type === "private" || parentChannel?.type === "dm") {
-        const parentHumans = await deps.getChannelHumans(parentMsgForThread.channelId);
-        for (const human of parentHumans) {
-          await emitSocketBestEffort(() => io.to(`user:${human.id}`).emit("thread:updated", payload));
-        }
-      } else {
-        await emitSocketBestEffort(
-          () => io.to(`channel:${parentMsgForThread.channelId}`).emit("thread:updated", payload),
-        );
-      }
+        serverId: channel.serverId,
+        parentMessageId: channel.parentMessageId,
+        parentChannelId: parentMsgForThread.channelId,
+        reply: broadcastEnriched,
+        emit: emitSocketBestEffort,
+      });
     }
   }
 
@@ -3786,6 +4087,8 @@ export async function broadcastSystemMessage(
   let threadFollowerIdsForFrontend: string[] | null = null;
   let dmHumanIdsForFrontend: string[] | null = null;
   const traceAttrs = traceChannelAudienceAttrs(channel);
+  // slock_message_push_lag_seconds{receiver="web"}: once, at this message's first message:new emit.
+  const notePushedToWeb = oncePushLagObserver("web", message.createdAt);
 
   addTraceEvent("message_pipeline.system_message.persisted", {
     ...traceAttrs,
@@ -3848,11 +4151,7 @@ export async function broadcastSystemMessage(
   // New DMs/threads may have no sockets in room yet. Join participants first so
   // system messages (e.g. onboarding) are visible without requiring manual DM open.
   if (channel?.type === "dm") {
-    const humans = await deps.getChannelHumans(channelId);
-    dmHumanIdsForFrontend = humans.map((h) => h.id);
-    for (const h of humans) {
-      io.in(socketUserServerRoom(h.id, channel.serverId)).socketsJoin(channelRoom);
-    }
+    dmHumanIdsForFrontend = await joinDmHumanSocketsToRoom(io, channel, deps.getChannelHumans);
   } else if (isSubConversationType(channel?.type)) {
     const followerIds = await getHumanThreadFollowerIds(channelId);
     threadFollowerIdsForFrontend = followerIds;
@@ -3862,6 +4161,7 @@ export async function broadcastSystemMessage(
   }
 
   // Broadcast to frontend
+  let threadSummaryTarget: { parentMessageId: string; parentChannelId: string } | null = null;
   if (channel && isSubConversationType(channel.type)) {
     const [parentMsg] = channel.parentMessageId
       ? await getDb()
@@ -3883,11 +4183,16 @@ export async function broadcastSystemMessage(
     if (parentChannel?.type === "channel") {
       // message-realtime-producer: message-service.system.thread-public
       io.to(channelRoom).emit("message:new", payload);
+      notePushedToWeb();
     } else {
       for (const userId of threadFollowerIdsForFrontend ?? []) {
         // message-realtime-producer: message-service.system.thread-private-follower
         io.to(`user:${userId}`).emit("message:new", payload);
+        notePushedToWeb();
       }
+    }
+    if (channel.type === "thread" && channel.parentMessageId && parentMsg) {
+      threadSummaryTarget = { parentMessageId: channel.parentMessageId, parentChannelId: parentMsg.channelId };
     }
   } else {
     // message-realtime-producer: message-service.system.channel
@@ -3895,6 +4200,7 @@ export async function broadcastSystemMessage(
       "message:new",
       projectFrontendMessagePayload(withFrontendConversationContext(enriched, buildFrontendConversationContext({ channelType: channel?.type ?? "channel" }))),
     );
+    notePushedToWeb();
   }
 
   if (channel?.type === "dm") {
@@ -3999,14 +4305,39 @@ export async function broadcastSystemMessage(
     });
   }
   const sysResults = agentOrchestrator.deliverMessagesOnChannel(channelId, deliveries);
+  // A system reply in a thread changes the parent's reply summary exactly as
+  // an ordinary reply does, so open pages need the same `thread:updated`. It
+  // starts once agent delivery is dispatched and is best-effort (never
+  // rejects), so its extra reads can neither block nor reject the delivery.
+  // The delivery promises get their handlers before anything is awaited.
+  const target = threadSummaryTarget;
+  const threadSummary = target
+    ? runSystemThreadSummaryBestEffort("thread", async () => {
+      // A canonical joint thread is recognised as on the ordinary send path
+      // (it has active projections; its storage server need not be the
+      // joint-storage namespace). `broadcastSystemMessageToLocalSurfaces`
+      // emits each projection's copy; a canonical-scoped one would carry the
+      // canonical thread id and, for a non-public parent, reach user rooms.
+      if ((await deps.getActiveJointThreadProjectionsByCanonicalThread(channelId)).length > 0) return;
+      await emitPlainThreadUpdated(io, deps, {
+        threadChannelId: channelId,
+        serverId: channel.serverId,
+        parentMessageId: target.parentMessageId,
+        parentChannelId: target.parentChannelId,
+        reply: enriched,
+        emit: (work) => work(),
+      });
+    })
+    : Promise.resolve();
   if (opts.awaitAgentDelivery) {
-    const results = await Promise.all(sysResults);
+    const [results] = await Promise.all([Promise.all(sysResults), threadSummary]);
     const dropped = results.find((result) => result.status !== "queued");
     if (dropped) {
       throw new Error(`SYSTEM_MESSAGE_AGENT_DELIVERY_DROPPED:${dropped.reason}`);
     }
   } else {
     void settleDeliveries(sysResults, deliveries.map((delivery) => delivery.agentId), "system message");
+    await threadSummary;
   }
 
   return enriched;
@@ -4078,10 +4409,22 @@ export async function broadcastSystemMessageToLocalSurfaces(
 
   if (jointThreadProjection) {
     const projections = await deps.getActiveJointThreadProjectionsByCanonicalThread(storageChannelId);
+    // Thread summaries live under the parent message (thread-only), as on the
+    // ordinary joint send path: one canonical summary, re-keyed per projection.
+    // Best-effort (see runSystemThreadSummaryBestEffort) and not awaited
+    // here: the read neither delays nor, failing, drops the projections'
+    // message:new or delivery; it only drops the summary.
+    const parentMessageId = jointThreadProjection.canonicalParentMessageId;
+    const threadInfoRead = parentMessageId
+      ? Promise.resolve().then(() => deps.getThreadInfo(parentMessageId)).catch((error: unknown) => {
+        traceSystemThreadSummaryDegraded("joint_thread", error);
+        return null;
+      })
+      : Promise.resolve(null);
     await Promise.all(projections.map(async (projection) => {
       updateMaxSeq(projection.localServerId, message.seq);
       const followerIds = await getHumanThreadFollowerIds(projection.localThreadChannelId);
-      const payload = projectFrontendMessagePayload(withFrontendConversationContext({
+      const localReply = withFrontendConversationContext({
         ...enriched,
         channelId: projection.localThreadChannelId,
       }, buildFrontendConversationContext({
@@ -4089,7 +4432,8 @@ export async function broadcastSystemMessageToLocalSurfaces(
         parentMessageId: projection.canonicalParentMessageId,
         parentChannel: { id: projection.localParentChannelId, type: "joint" },
         taskId: projection.canonicalParentTaskId,
-      })));
+      }));
+      const payload = projectFrontendMessagePayload(localReply);
       for (const userId of followerIds) {
         // Per-projection payload: only this server's sockets of the user.
         const userServerRoom = socketUserServerRoom(userId, projection.localServerId);
@@ -4103,6 +4447,20 @@ export async function broadcastSystemMessageToLocalSurfaces(
         "System",
         { personalAttentionTargets: opts.personalAttentionTargets },
       );
+      const summaryInfo = await threadInfoRead;
+      if (parentMessageId && summaryInfo) {
+        await runSystemThreadSummaryBestEffort("joint_thread", () => {
+          io.to(`channel:${projection.localParentChannelId}`).emit(
+            "thread:updated",
+            buildJointThreadUpdatedPayload(
+              projection,
+              parentMessageId,
+              summaryInfo,
+              projectThreadLatestReplyPayload(localReply),
+            ),
+          );
+        });
+      }
     }));
     return enriched;
   }
@@ -4292,7 +4650,7 @@ export async function deliverMessagesToAgents(
     && firstMessage.senderId === "system";
   const isExternalProjectionMessage = firstMessage.senderType === "external_projection";
   const effectiveSenderName = firstMessage.externalAuthor?.displayName ?? senderName;
-  let senderIdentity: { uniqueName: string; description: string | null };
+  let senderIdentity: SenderIdentity;
   if (firstMessage.senderType === "external_projection") {
     senderIdentity = { uniqueName: effectiveSenderName, description: null };
   } else if (isPersistedSystemMessage) {
@@ -4304,6 +4662,14 @@ export async function deliverMessagesToAgents(
       effectiveSenderName,
     );
   }
+  // Where the sender is from (senderOriginFor): one sender per batch, so at
+  // most one joint lookup, and none for a local channel or a same-server sender.
+  const originConversation = await originConversationForDelivery(deps, {
+    channel,
+    parentIsJoint: parentFieldsMayBeJoint(parentFields as AgentThreadParentFields),
+    readerServerId: channel.serverId,
+    subject: senderIdentity.origin,
+  });
   const deliveryOptions = isPersistedSystemMessage || firstMessage.senderType === "external_projection"
     ? {}
     : await getAgentDeliveryOptionsForSender(
@@ -4349,7 +4715,8 @@ export async function deliverMessagesToAgents(
         ...recipientNames.get(agent.id),
         sender_id: message.senderId,
         sender_name: message.externalAuthor?.displayName ?? senderIdentity.uniqueName,
-        sender_description: senderIdentity.description,
+        sender_description: senderDescriptionFor(agentDescriptionViewer(channel.serverId), senderIdentity.description),
+        ...senderOriginWireField(senderOriginFor(agentDescriptionViewer(channel.serverId), senderIdentity.origin ?? null, originConversation)),
         sender_timezone: message.senderTimezone ?? null,
         ...(await agentAuthorshipFields(message as AgentAuthorshipRow)),
         // RFC 082: a card message reads `card=r<revision>` in the header; its content is the fallback.
@@ -4606,10 +4973,10 @@ export async function deliverMessageToAgent(
   ) return { status: "dropped", reason: "channel_unavailable" };
 
   const renderedContent = await deps.renderAgentReadablePermalinks(message.content, channel.serverId);
-  const senderIdentity = message.senderType === "external_projection"
+  const senderIdentity: SenderIdentity = message.senderType === "external_projection"
     ? { uniqueName: message.externalAuthor!.displayName, description: null }
     : await deps.getSenderIdentity(message.senderType, message.senderId, "Unknown");
-  const { uniqueName: senderName, description: senderDescription } = senderIdentity;
+  const senderName = senderIdentity.uniqueName;
   const deliveryOptions = message.senderType === "external_projection"
     ? {}
     : await getAgentDeliveryOptionsForSender(
@@ -4620,8 +4987,10 @@ export async function deliverMessageToAgent(
       );
 
   let parentFields: AgentThreadParentFields = {};
+  let parentIsJoint = false;
   if (channel.type === "task") {
     parentFields = await resolveThreadParentFields(channel.id);
+    parentIsJoint = parentFieldsMayBeJoint(parentFields);
   } else if (channel.type === "thread" && channel.parentMessageId) {
     const [parentMessage] = await db
       .select({ channelId: messages.channelId })
@@ -4630,6 +4999,7 @@ export async function deliverMessageToAgent(
       .limit(1);
     const parentChannel = parentMessage ? await deps.getChannel(parentMessage.channelId) : null;
     if (parentChannel) {
+      parentIsJoint = mayBeInJointConversation(parentChannel, false);
       const parentChannelType = toAgentVisibleChannelType(parentChannel.type);
       parentFields = {
         parent_channel_name: parentChannel.name,
@@ -4639,12 +5009,27 @@ export async function deliverMessageToAgent(
     }
   }
 
+  // The reader is the recipient agent on its server: the channel's, unless the
+  // channel is a joint conversation's shared store (not one of its servers).
+  const originConversation = await originConversationForDelivery(deps, {
+    channel,
+    parentIsJoint,
+    readerServerId: channel.serverId,
+    subject: senderIdentity.origin,
+  });
+  const readerServerId = originConversation.kind === "joint" && !originConversation.serverIds.has(channel.serverId)
+    ? (await db.select({ serverId: agents.serverId }).from(agents).where(eq(agents.id, agentId)).limit(1))[0]?.serverId ?? channel.serverId
+    : channel.serverId;
+  const senderDescription = senderDescriptionFor(agentDescriptionViewer(readerServerId), senderIdentity.description);
+  const senderOrigin = senderOriginFor(agentDescriptionViewer(readerServerId), senderIdentity.origin ?? null, originConversation);
+
   const deliveryPayload: AgentMessage = {
       channel_id: channel.id,
       channel_type: toAgentVisibleChannelType(channel.type),
       sender_id: message.senderId,
       sender_name: senderName,
       sender_description: senderDescription,
+      ...senderOriginWireField(senderOrigin),
       sender_timezone: message.senderTimezone ?? null,
       ...(await agentAuthorshipFields(message as AgentAuthorshipRow)),
       // RFC 082: a card message reads `card=r<revision>` in the header; its content is the fallback.
@@ -5234,7 +5619,7 @@ async function buildResumeCatchupBatch(
     // filters drop are not deliverable by rule and are left out; rows never
     // evaluated (the total cap) are kept, so they end the covered prefix.
     const fetchedSeqs: number[] = [];
-    const rows = await enrichWithSenderNames(eligibleRows.slice(0, rowLimit), { includeSenderTimezone: true });
+    const rows = await enrichWithSenderNames(eligibleRows.slice(0, rowLimit), { includeSenderTimezone: true, descriptionViewer: agentDescriptionViewer(candidate.serverId) });
     // The same `mentioned` flag live delivery sets: the agent was @-mentioned in
     // the message (a notifiable mention row), so a recovered message reads the
     // same as the live one would have.
@@ -5281,7 +5666,7 @@ async function buildResumeCatchupBatch(
       if (mutedAgentDeliveryIds.has(agentId)) continue;
 
       const identity = isSystemMessageIdentity(row.messageType, row.senderId)
-        ? { uniqueName: "system", description: null as string | null }
+        ? { uniqueName: "system", description: null as AttributedDescription | null }
         : row.senderType === "external_projection"
         ? { uniqueName: row.externalAuthor?.displayName ?? "External user", description: null }
         : await deps.getSenderIdentity(
@@ -5295,7 +5680,9 @@ async function buildResumeCatchupBatch(
         channel_type: toAgentVisibleChannelType(candidate.channelType),
         sender_id: row.senderId,
         sender_name: identity.uniqueName,
-        sender_description: identity.description,
+        // The row was enriched for this server's agents (descriptionViewer above).
+        sender_description: row.senderDescription ?? null,
+        ...senderOriginWireField(row.senderOrigin),
         sender_timezone: row.senderTimezone ?? null,
         ...(await agentAuthorshipFields(row as AgentAuthorshipRow)),
         // RFC 082: a card message reads `card=r<revision>` in the header; its content is the fallback.
@@ -5763,6 +6150,15 @@ type MessageQueryTraceOptions = {
    *  comment back-links both resolve against it. */
   viewerServerId?: string | null;
   /**
+   * Who reads `senderDescription` (descriptionVisibility), for a read with no
+   * single viewer id (thread join context: every agent of one server). When
+   * absent it is the forwarded-bundle viewer on `viewerServerId`; with no
+   * viewer at all (a shared broadcast) every description is null. When the
+   * viewer is `forwardedBundleViewerAgentId`, that agent's own messages
+   * carry no description.
+   */
+  descriptionViewer?: DescriptionViewer;
+  /**
    * Keep `senderTimezone` on enriched rows. Set only by agent-facing reads:
    * a human sender's browser zone is exposed to agents, never to other
    * humans' clients, so every other read drops the key.
@@ -6057,52 +6453,177 @@ function truncateAgentForwardedText(value: string, limit: number, marker: string
   return `${value.slice(0, limit)}\n[${marker}: ${value.length - limit} chars omitted]`;
 }
 
-function formatForwardedBundleForAgent(actionMetadata: unknown): string | null {
+/**
+ * How an agent-facing forwarded snapshot is written. `readWholeMessageId` is
+ * the forward message's own id, set only for a client that declared
+ * FORWARDED_RESOLVE_CAPABILITY: each cut forwarded message then names
+ * `raft message resolve <id> --forwarded <n>`. Unset, the cut notes name no
+ * command (an older CLI refuses `--forwarded`).
+ */
+export interface AgentForwardedSnapshotOptions {
+  readWholeMessageId?: string | null;
+}
+
+function forwardedReadWholeLine(messageId: string, number: number): string {
+  return `Read it whole: raft message resolve ${messageId} --forwarded ${number}`;
+}
+
+/** One forwarded message as the agent reads it: `contentEnd` is where its content (and any cut note) ends in `text`. */
+function formatForwardedItemForAgent(
+  rawItem: Record<string, unknown>,
+  number: number,
+  content: string,
+): { text: string; contentEnd: number } {
+  const attachmentSnapshots = Array.isArray(rawItem.attachmentSnapshots)
+    ? rawItem.attachmentSnapshots.filter(isRecord)
+    : [];
+  const lines = [
+    `Forwarded message ${number}:`,
+    `From: ${forwardedAuthorLabelForAgent(rawItem.sourceAuthorSnapshot)}`,
+  ];
+  const sourceLabel = forwardedSourceLabelForAgent(rawItem.sourceTargetSnapshot);
+  if (sourceLabel) lines.push(`Source: ${sourceLabel}`);
+  if (typeof rawItem.sourceCreatedAt === "string" && rawItem.sourceCreatedAt.trim()) {
+    lines.push(`Sent: ${rawItem.sourceCreatedAt.trim()}`);
+  }
+  lines.push("");
+  lines.push(content || "[empty message]");
+  const contentEnd = lines.join("\n").length;
+  if (attachmentSnapshots.length > 0) {
+    const attachmentLabels = attachmentSnapshots.map((attachment) => {
+      const filename = typeof attachment.filename === "string" && attachment.filename.trim()
+        ? normalizeAttachmentFilename(attachment.filename)
+        : "attachment";
+      const mimeType = typeof attachment.mimeType === "string" && attachment.mimeType.trim()
+        ? attachment.mimeType.trim()
+        : null;
+      return mimeType ? `${filename} (${mimeType})` : filename;
+    });
+    lines.push("");
+    lines.push(`Attachments: ${attachmentLabels.join(", ")}`);
+  }
+  return { text: lines.join("\n"), contentEnd };
+}
+
+function formatForwardedBundleForAgent(
+  actionMetadata: unknown,
+  options: AgentForwardedSnapshotOptions = {},
+): string | null {
+  return renderForwardedBundleForAgent(actionMetadata, options)?.text ?? null;
+}
+
+/** The agent's forwarded snapshot, and whether a limit cut anything in it. */
+function renderForwardedBundleForAgent(
+  actionMetadata: unknown,
+  options: AgentForwardedSnapshotOptions,
+): { text: string; cut: boolean } | null {
   if (!isRecord(actionMetadata) || actionMetadata.kind !== "forwarded-bundle") return null;
   if (!Array.isArray(actionMetadata.forwardedItems) || actionMetadata.forwardedItems.length === 0) return null;
+  const readWholeMessageId = options.readWholeMessageId || null;
 
-  const sections: string[] = [];
+  const header = "Forwarded content snapshot:\n\n";
+  const separator = "\n\n---\n\n";
+  // Each section's place in the whole snapshot, and where its own cut note
+  // (with its read-whole line) ends, to tell what the bundle cap cut.
+  const sections: Array<{ number: number; text: string; end: number; pointerEnd: number | null }> = [];
+  let offset = header.length;
+  let itemCut = false;
   for (const [index, rawItem] of actionMetadata.forwardedItems.entries()) {
     if (!isRecord(rawItem)) continue;
-    const contentSnapshot = typeof rawItem.contentSnapshot === "string"
-      ? truncateAgentForwardedText(rawItem.contentSnapshot, AGENT_FORWARDED_ITEM_CONTENT_CHAR_LIMIT, "forwarded content truncated")
-      : "";
-    const attachmentSnapshots = Array.isArray(rawItem.attachmentSnapshots)
-      ? rawItem.attachmentSnapshots.filter(isRecord)
-      : [];
-    const lines = [
-      `Forwarded message ${index + 1}:`,
-      `From: ${forwardedAuthorLabelForAgent(rawItem.sourceAuthorSnapshot)}`,
-    ];
-    const sourceLabel = forwardedSourceLabelForAgent(rawItem.sourceTargetSnapshot);
-    if (sourceLabel) lines.push(`Source: ${sourceLabel}`);
-    if (typeof rawItem.sourceCreatedAt === "string" && rawItem.sourceCreatedAt.trim()) {
-      lines.push(`Sent: ${rawItem.sourceCreatedAt.trim()}`);
+    const number = index + 1;
+    const contentSnapshot = typeof rawItem.contentSnapshot === "string" ? rawItem.contentSnapshot : "";
+    let content = contentSnapshot;
+    const cut = contentSnapshot.length > AGENT_FORWARDED_ITEM_CONTENT_CHAR_LIMIT;
+    itemCut ||= cut;
+    if (cut && readWholeMessageId) {
+      const omitted = contentSnapshot.length - AGENT_FORWARDED_ITEM_CONTENT_CHAR_LIMIT;
+      content = [
+        contentSnapshot.slice(0, AGENT_FORWARDED_ITEM_CONTENT_CHAR_LIMIT),
+        `[forwarded message ${number} cut: ${omitted.toLocaleString("en-US")} chars omitted]`,
+        forwardedReadWholeLine(readWholeMessageId, number),
+      ].join("\n");
+    } else if (cut) {
+      content = truncateAgentForwardedText(contentSnapshot, AGENT_FORWARDED_ITEM_CONTENT_CHAR_LIMIT, "forwarded content truncated");
     }
-    lines.push("");
-    lines.push(contentSnapshot || "[empty message]");
-    if (attachmentSnapshots.length > 0) {
-      const attachmentLabels = attachmentSnapshots.map((attachment) => {
-        const filename = typeof attachment.filename === "string" && attachment.filename.trim()
-          ? normalizeAttachmentFilename(attachment.filename)
-          : "attachment";
-        const mimeType = typeof attachment.mimeType === "string" && attachment.mimeType.trim()
-          ? attachment.mimeType.trim()
-          : null;
-        return mimeType ? `${filename} (${mimeType})` : filename;
-      });
-      lines.push("");
-      lines.push(`Attachments: ${attachmentLabels.join(", ")}`);
-    }
-    sections.push(lines.join("\n"));
+    if (sections.length > 0) offset += separator.length;
+    const item = formatForwardedItemForAgent(rawItem, number, content);
+    sections.push({
+      number,
+      text: item.text,
+      end: offset + item.text.length,
+      pointerEnd: cut && readWholeMessageId ? offset + item.contentEnd : null,
+    });
+    offset += item.text.length;
   }
 
   if (sections.length === 0) return null;
-  return truncateAgentForwardedText(
-    `Forwarded content snapshot:\n\n${sections.join("\n\n---\n\n")}`,
-    AGENT_FORWARDED_BUNDLE_CHAR_LIMIT,
-    "forwarded snapshot truncated",
-  );
+  const snapshot = `${header}${sections.map((section) => section.text).join(separator)}`;
+  const cut = itemCut || snapshot.length > AGENT_FORWARDED_BUNDLE_CHAR_LIMIT;
+  if (!readWholeMessageId || snapshot.length <= AGENT_FORWARDED_BUNDLE_CHAR_LIMIT) {
+    return { text: truncateAgentForwardedText(snapshot, AGENT_FORWARDED_BUNDLE_CHAR_LIMIT, "forwarded snapshot truncated"), cut };
+  }
+  // Past the bundle cap: one read-whole line for each forwarded message the
+  // cap cut or dropped, unless its own cut note (with its line) still shows.
+  const limit = AGENT_FORWARDED_BUNDLE_CHAR_LIMIT;
+  const notShown = sections.filter((section) =>
+    section.end > limit && !(section.pointerEnd !== null && section.pointerEnd <= limit));
+  const text = [
+    snapshot.slice(0, limit),
+    `[forwarded snapshot cut: ${(snapshot.length - limit).toLocaleString("en-US")} chars omitted]`,
+    ...notShown.map((section) => forwardedReadWholeLine(readWholeMessageId, section.number)),
+  ].join("\n");
+  return { text, cut };
+}
+
+/**
+ * The forwarded snapshot a delivery carries to one agent. A cut one names the
+ * read-whole command only when the agent's Computer declared
+ * FORWARDED_RESOLVE_CAPABILITY on its connection (the daemon ships the CLI
+ * its agents run); unknown counts as not declared.
+ */
+async function deliveredForwardedSnapshot(
+  agentOrchestrator: AgentOrchestrator,
+  deps: Pick<MessageServiceDeps, "getAgentMachineId">,
+  viewerScopedActionMetadata: unknown,
+  agentId: string,
+  messageId: string,
+): Promise<string | null> {
+  const plain = renderForwardedBundleForAgent(viewerScopedActionMetadata, {});
+  if (!plain?.cut) return plain?.text ?? null;
+  let declared = false;
+  try {
+    const machineId = await deps.getAgentMachineId(agentId);
+    declared = machineId !== null
+      && await agentOrchestrator.machineAdvertisesCapability(machineId, FORWARDED_RESOLVE_CAPABILITY);
+  } catch {
+    declared = false;
+  }
+  return declared
+    ? formatForwardedBundleForAgent(viewerScopedActionMetadata, { readWholeMessageId: messageId })
+    : plain.text;
+}
+
+/**
+ * One forwarded message of a forward, for `raft message resolve <id>
+ * --forwarded <n>` (`n` 1-based, as "Forwarded message n" in the snapshot):
+ * the lines the snapshot has for it, its content not cut. Callers pass the
+ * same viewer-scoped action metadata as for the snapshot, so it shows nothing
+ * the snapshot doesn't (never a source pointer). `total` is 0 for a message
+ * that is no forward.
+ */
+export function agentFacingForwardedItem(
+  viewerScopedActionMetadata: unknown,
+  number: number,
+): { ok: true; total: number; content: string } | { ok: false; total: number } {
+  const items = isRecord(viewerScopedActionMetadata)
+    && viewerScopedActionMetadata.kind === "forwarded-bundle"
+    && Array.isArray(viewerScopedActionMetadata.forwardedItems)
+    ? viewerScopedActionMetadata.forwardedItems
+    : [];
+  const rawItem = Number.isInteger(number) && number >= 1 ? items[number - 1] : undefined;
+  if (!isRecord(rawItem)) return { ok: false, total: items.length };
+  const content = typeof rawItem.contentSnapshot === "string" ? rawItem.contentSnapshot : "";
+  return { ok: true, total: items.length, content: formatForwardedItemForAgent(rawItem, number, content).text };
 }
 
 function buildAgentFacingBaseContent(content: string, agentContentPrefix: string | undefined): string {
@@ -6122,10 +6643,11 @@ function appendAgentForwardedSnapshot(content: string, forwardedSnapshot: string
 export function appendAgentFacingForwardedSnapshot(
   content: string,
   viewerScopedActionMetadata: unknown,
+  options?: AgentForwardedSnapshotOptions,
 ): string {
   return appendAgentForwardedSnapshot(
     markRetractedDelegatedReceipt(content, viewerScopedActionMetadata),
-    formatForwardedBundleForAgent(viewerScopedActionMetadata),
+    formatForwardedBundleForAgent(viewerScopedActionMetadata, options),
   );
 }
 
@@ -6652,6 +7174,16 @@ async function enrichWithSenderNames<T extends MessageRowForEnrichment>(
   const parentMessages = alias(messages, "joint_thread_parent_messages");
   const parentJointChannels = alias(jointChannels, "parent_joint_channels");
   const parentJointChannelServers = alias(jointChannelServers, "parent_joint_channel_servers");
+  // The description reader (descriptionVisibility): the explicit viewer, an
+  // agent reading from its server, or a person whose role there is read with
+  // the senders' roles below; none (a shared broadcast) shows no description.
+  const descriptionViewerServerId = opts.descriptionViewer?.serverId ?? opts.viewerServerId ?? null;
+  const descriptionViewerUserId = !opts.descriptionViewer && !opts.forwardedBundleViewerAgentId
+    ? opts.forwardedBundleViewerUserId ?? null
+    : null;
+  const viewerServerRoleUserIds = descriptionViewerServerId
+    ? [...new Set([...userIds, ...(descriptionViewerUserId ? [descriptionViewerUserId] : [])])]
+    : [];
   const [
     userRows,
     agentRows,
@@ -6659,6 +7191,7 @@ async function enrichWithSenderNames<T extends MessageRowForEnrichment>(
     departureRows,
     jointMemberRows,
     jointThreadMemberRows,
+    viewerServerRoleRows,
   ] = await Promise.all([
     userIds.length === 0 ? [] : limit(() => traceQuery(
       "messages.senders.user_profiles",
@@ -6671,7 +7204,7 @@ async function enrichWithSenderNames<T extends MessageRowForEnrichment>(
     agentIds.length === 0 ? [] : limit(() => traceQuery(
       "messages.senders.agent_profiles",
       () => db
-        .select({ id: agents.id, name: agents.name, displayName: agents.displayName, description: agents.description, avatarUrl: agents.avatarUrl, deletedAt: agents.deletedAt })
+        .select({ id: agents.id, serverId: agents.serverId, name: agents.name, displayName: agents.displayName, description: agents.description, avatarUrl: agents.avatarUrl, deletedAt: agents.deletedAt })
         .from(agents)
         .where(inArray(agents.id, agentIds)),
       () => ({ input_count: agentIds.length }),
@@ -6708,6 +7241,7 @@ async function enrichWithSenderNames<T extends MessageRowForEnrichment>(
         .select({
           canonicalChannelId: jointChannels.canonicalChannelId,
           localChannelId: jointChannelServers.localChannelId,
+          serverId: jointChannelServers.serverId,
           userId: users.id,
         })
         .from(jointChannels)
@@ -6729,6 +7263,7 @@ async function enrichWithSenderNames<T extends MessageRowForEnrichment>(
         .select({
           canonicalThreadChannelId: jointChannels.canonicalChannelId,
           localParentChannelId: parentJointChannelServers.localChannelId,
+          serverId: parentJointChannelServers.serverId,
           userId: users.id,
         })
         .from(jointChannels)
@@ -6755,17 +7290,40 @@ async function enrichWithSenderNames<T extends MessageRowForEnrichment>(
         )),
       () => ({ input_count: userIds.length, thread_channel_count: threadChannelIds.length }),
     )),
+    viewerServerRoleUserIds.length === 0 ? [] : limit(() => traceQuery(
+      "messages.senders.viewer_server_roles",
+      () => db
+        .select({ userId: serverMembers.userId, role: serverMembers.role })
+        .from(serverMembers)
+        .where(and(
+          eq(serverMembers.serverId, descriptionViewerServerId!),
+          inArray(serverMembers.userId, viewerServerRoleUserIds),
+        )),
+      () => ({ input_count: viewerServerRoleUserIds.length }),
+    )),
   ]);
+  const viewerServerRoleOf = new Map(viewerServerRoleRows.map((row) => [row.userId, row.role] as const));
+  const descriptionViewer: DescriptionViewer | null = opts.descriptionViewer
+    ?? (!descriptionViewerServerId ? null
+      : opts.forwardedBundleViewerAgentId ? agentDescriptionViewer(descriptionViewerServerId)
+        : descriptionViewerUserId ? humanDescriptionViewer(descriptionViewerServerId, viewerServerRoleOf.get(descriptionViewerUserId))
+          : null);
   for (const u of userRows) {
     nameMap.set(u.id, u.displayName || u.name || "User");
     handleMap.set(u.id, u.name || "User");
-    descriptionMap.set(u.id, u.description || null);
+    descriptionMap.set(u.id, senderDescriptionFor(descriptionViewer, u.description && descriptionViewerServerId ? {
+      text: u.description,
+      subject: humanSubjectInServer(descriptionViewerServerId, viewerServerRoleOf.get(u.id)),
+    } : null));
   }
   const delegatedByMap = new Map<string, DelegatedByLabel>();
   for (const a of agentRows) {
     nameMap.set(a.id, a.displayName || a.name);
     handleMap.set(a.id, a.name);
-    descriptionMap.set(a.id, a.description || null);
+    // An agent reading its own message gets no description: it wrote that
+    // text about itself, and it would be repeated to it in every context.
+    const ownMessage = !opts.descriptionViewer && opts.forwardedBundleViewerAgentId === a.id;
+    descriptionMap.set(a.id, ownMessage ? null : senderDescriptionFor(descriptionViewer, a.description ? { text: a.description, subject: { kind: "agent", serverId: a.serverId } } : null));
     delegatedByMap.set(a.id, { id: a.id, name: a.name, displayName: a.displayName || a.name, avatarUrl: a.avatarUrl ?? null, deleted: a.deletedAt !== null });
   }
   for (const membership of membershipRows) {
@@ -6788,6 +7346,46 @@ async function enrichWithSenderNames<T extends MessageRowForEnrichment>(
     activeJointMemberKeys.add(`${membership.canonicalThreadChannelId}:${membership.userId}`);
     activeJointMemberKeys.add(`${membership.localParentChannelId}:${membership.userId}`);
   }
+
+  // Where an outside sender is from (descriptionVisibility senderOriginFor),
+  // for an agent reader only. A person posts into a joint conversation from
+  // the server their joint membership comes through (the rows above); the
+  // servers of each joint conversation and their slugs are one batched read,
+  // made only when the page has a sender from outside the reader's server.
+  const originViewer = descriptionViewer?.reader === "agent" ? descriptionViewer : null;
+  const agentServerOf = new Map(agentRows.map((agent) => [agent.id, agent.serverId] as const));
+  const humanPostingServerIds = new Map<string, Set<string>>();
+  const addPostingServer = (channelId: string, userId: string, serverId: string) => {
+    const key = `${channelId}:${userId}`;
+    const ids = humanPostingServerIds.get(key) ?? new Set<string>();
+    ids.add(serverId);
+    humanPostingServerIds.set(key, ids);
+  };
+  for (const membership of jointMemberRows) addPostingServer(membership.canonicalChannelId, membership.userId, membership.serverId);
+  for (const membership of jointThreadMemberRows) addPostingServer(membership.canonicalThreadChannelId, membership.userId, membership.serverId);
+  const originChannelIds = originViewer
+    ? [...new Set(rows.filter((row) => (
+      row.senderType === "agent"
+        ? agentServerOf.has(row.senderId) && agentServerOf.get(row.senderId) !== originViewer.serverId
+        : row.senderType === "user" && row.messageType !== "system" && !viewerServerRoleOf.has(row.senderId)
+    )).map((row) => row.channelId))]
+    : [];
+  const originJointServerRowsPending = originChannelIds.length === 0 ? null : limit(() => traceQuery(
+    "messages.senders.origin_joint_servers",
+    () => db
+      .select({ canonicalChannelId: jointChannels.canonicalChannelId, serverId: jointChannelServers.serverId, slug: servers.slug })
+      .from(jointChannels)
+      .innerJoin(jointChannelServers, and(
+        eq(jointChannelServers.jointChannelId, jointChannels.id),
+        eq(jointChannelServers.status, "active"),
+      ))
+      .innerJoin(servers, eq(servers.id, jointChannelServers.serverId))
+      .where(and(
+        inArray(jointChannels.canonicalChannelId, originChannelIds),
+        eq(jointChannels.status, "active"),
+      )),
+    () => ({ input_count: originChannelIds.length }),
+  ));
 
   // Attachment-comment enrichment (attachment-comments MVP spec §5): per-
   // Attachment comment counts power the chip badges, and a per-message ref
@@ -6894,11 +7492,37 @@ async function enrichWithSenderNames<T extends MessageRowForEnrichment>(
     rows.map((msg) => ("actionMetadata" in msg ? msg.actionMetadata : undefined)),
     resolveForwardedBundleViewer(opts),
   );
-  const [countRows, refRows, canReadForwardedSource] = await Promise.all([
+  const [countRows, refRows, canReadForwardedSource, originJointServerRows] = await Promise.all([
     countRowsPending ?? [],
     refRowsPending ?? [],
     canReadForwardedSourcePending,
+    originJointServerRowsPending ?? [],
   ]);
+  const originJointServerSlugsOf = new Map<string, Map<string, string>>();
+  for (const row of originJointServerRows) {
+    const slugs = originJointServerSlugsOf.get(row.canonicalChannelId) ?? new Map<string, string>();
+    slugs.set(row.serverId, row.slug);
+    originJointServerSlugsOf.set(row.canonicalChannelId, slugs);
+  }
+  const senderOriginOf = (msg: (typeof rows)[number]): SenderOrigin | null => {
+    if (!originViewer) return null;
+    const jointServerSlugs = originJointServerSlugsOf.get(msg.channelId);
+    if (msg.senderType === "agent") {
+      const serverId = agentServerOf.get(msg.senderId);
+      if (!serverId) return null;
+      const subject: OriginSubject = { kind: "agent", serverId };
+      return senderOriginFor(originViewer, subject, jointServerSlugs ? jointOriginConversation(jointServerSlugs, subject) : LOCAL_ORIGIN_CONVERSATION);
+    }
+    if (msg.senderType !== "user" || msg.messageType === "system") return null;
+    // A person posts from a server their joint membership comes through. A
+    // stored message records no posting server, so this is a fallback: the
+    // first by slug of those (the same on every read), a true server of theirs
+    // but not always the one they posted through; live sends name that one.
+    const subject = humanOriginSubjectInServer(originViewer.serverId, viewerServerRoleOf.get(msg.senderId));
+    return senderOriginFor(originViewer, subject, jointServerSlugs
+      ? jointOriginConversation(jointServerSlugs, subject, humanPostingServerIds.get(`${msg.channelId}:${msg.senderId}`) ?? [])
+      : LOCAL_ORIGIN_CONVERSATION);
+  };
   for (const row of countRows) commentCountMap.set(row.attachmentId, row.count);
   // A joint thread routes through the reader's own server: its projection of
   // the parent joint channel and of the thread, with the canonical parent
@@ -7004,6 +7628,8 @@ async function enrichWithSenderNames<T extends MessageRowForEnrichment>(
       ?? nameMap.get(msg.senderId)
       ?? "Unknown",
     senderDescription: externalAuthor ? null : descriptionMap.get(msg.senderId) || null,
+    // Agent readers only, and only for an outside sender: every other row has no key.
+    ...senderOriginRowField(externalAuthor ? null : senderOriginOf(msg)),
     externalAuthor,
     taskAssigneeName: msg.taskAssigneeId ? handleMap.get(msg.taskAssigneeId) || null : null,
     senderMembershipStatus:
@@ -7230,6 +7856,7 @@ function toThreadContextMessage(message: EnrichedMessageRow): AgentThreadContext
     message_id: message.id,
     sender_name: message.senderHandle ?? message.senderName,
     sender_description: message.senderDescription || null,
+    ...senderOriginWireField(message.senderOrigin),
     sender_timezone: message.senderTimezone ?? null,
         ...((message as { delegatedBy?: { name: string } | null }).delegatedBy ? { delegated_by: { name: (message as { delegatedBy: { name: string } }).delegatedBy.name } } : {}),
     ...((message as { voiceCallId?: string | null }).voiceCallId ? { posted_by: "voice_call" as const } : {}),
@@ -7247,13 +7874,16 @@ async function buildThreadJoinContextBase(
   beforeSeq: number,
   /** The receiving server's plan history cutoff (services/historyWindow.ts): no context from behind it. */
   historyCutoff: Date | undefined,
+  /** The receiving agents' server: sender descriptions are read as its agents may (descriptionVisibility). */
+  receivingServerId: string,
 ): Promise<ThreadJoinContextBase | undefined> {
+  const readAs = { descriptionViewer: agentDescriptionViewer(receivingServerId), includeSenderTimezone: true };
   // First-time thread entrants miss the semantic anchor completely if we only
   // deliver the triggering @mention, so we always include the parent/root message.
   // A parent behind the plan's history window is not the agent's to read:
   // no join context then, as when the parent is gone; reading the thread
   // says why.
-  const parentContext = await getMessageContext(parentMessageId, 0, 0, historyCutoff, { includeSenderTimezone: true });
+  const parentContext = await getMessageContext(parentMessageId, 0, 0, historyCutoff, readAs);
   const parentMessage = parentContext?.messages[0];
   if (!parentMessage) return undefined;
 
@@ -7265,7 +7895,7 @@ async function buildThreadJoinContextBase(
     beforeSeq,
     undefined,
     historyCutoff,
-    { includeSenderTimezone: true },
+    readAs,
   );
   const historyTruncated = recentWindow.length > THREAD_JOIN_CONTEXT_WINDOW;
   const recentMessages = historyTruncated
@@ -8007,116 +8637,6 @@ export async function listMessagesWithCoverage(
   };
 }
 
-/**
- * Forum-style channels (#proj-chat:#24): one page of a channel's top-level
- * messages ordered by latest activity, the later of the message's own time
- * and its thread's latest reply (any message in the thread channel, the same
- * fact the thread summary's `lastReplyAt` reports), ties by seq. Pages walk
- * from the newest activity back; `before` is the keyset cursor
- * `(activityAt, seq)` of the oldest row already shown, exclusive.
- *
- * No stored activity column: the exact top `limit` under the cursor is the
- * union of (1) the newest messages by their own time whose activity is under
- * the cursor (an index walk on (channel_id, created_at) that stops after
- * `limit` rows) and (2) the channel's threads with the newest last reply under
- * the cursor (one probe per live thread). Any row of the true top `limit` is
- * in (1) when its activity is its own time and in (2) when a reply set it.
- * `activityAt` is Postgres text at microsecond precision so the cursor never
- * rounds between ties.
- *
- * Rows come back oldest activity first (display order, newest at the bottom),
- * each with its `activityAt`. `hasMore` is true when older rows remain.
- *
- * Cost (review of #13074, finding 3): leg (2) is not bounded by `limit`; every
- * page reads every live thread of the channel. Accepted for the /raft pilot
- * only. Follow-up before rolling out beyond /raft: store the thread's
- * last_reply_at with an index on (parent_channel_id, last_reply_at) so leg (2)
- * becomes a bounded index walk.
- */
-export async function listTopLevelMessagesByActivity(
-  channelId: string,
-  limit: number,
-  before: ChannelActivityCursor | null,
-  historyCutoff?: Date,
-  opts: MessageQueryTraceOptions = {},
-) {
-  const traceQuery = opts.traceQuery ?? untracedDbQuery;
-  const ordered = await getDb().transaction(async (tx) => {
-    const readChannelIds = await resolveConversionReadChannelIds(tx, channelId);
-    if (readChannelIds.length === 0) return [];
-    const ids = sql.join(readChannelIds.map((id) => sql`${id}::uuid`), sql`, `);
-    const cutoff = historyCutoff ? sql`AND m.created_at > ${historyCutoff.toISOString()}::timestamptz` : sql``;
-    const underCursor = (activity: SQL) => before
-      ? sql`AND (${activity}, m.seq) < (${before.activityAt}::timestamptz, ${before.seq}::bigint)`
-      : sql``;
-    const ownUnderCursor = before
-      ? sql`AND (m.created_at, m.seq) < (${before.activityAt}::timestamptz, ${before.seq}::bigint)`
-      : sql``;
-    const take = limit + 1;
-    const result = await traceQuery(
-      "messages.channel.activity_page",
-      () => tx.execute(sql`
-        WITH by_own_time AS (
-          SELECT m.id, m.seq, GREATEST(m.created_at, COALESCE(lr.last_reply_at, m.created_at)) AS activity_at
-          FROM messages m
-          LEFT JOIN LATERAL (
-            SELECT max(r.created_at) AS last_reply_at
-            FROM channels t
-            JOIN messages r ON r.channel_id = t.id
-            WHERE t.parent_message_id = m.id AND t.type = 'thread' AND t.deleted_at IS NULL
-          ) lr ON TRUE
-          WHERE m.channel_id IN (${ids}) ${cutoff} ${ownUnderCursor}
-            ${underCursor(sql`GREATEST(m.created_at, COALESCE(lr.last_reply_at, m.created_at))`)}
-          ORDER BY m.created_at DESC, m.seq DESC
-          LIMIT ${take}
-        ),
-        by_reply AS (
-          SELECT m.id, m.seq, GREATEST(m.created_at, lr.last_reply_at) AS activity_at
-          FROM channels t
-          CROSS JOIN LATERAL (
-            SELECT r.created_at AS last_reply_at
-            FROM messages r
-            WHERE r.channel_id = t.id
-            ORDER BY r.created_at DESC
-            LIMIT 1
-          ) lr
-          JOIN messages m ON m.id = t.parent_message_id
-          WHERE t.parent_channel_id IN (${ids}) AND t.type = 'thread' AND t.deleted_at IS NULL
-            AND m.channel_id IN (${ids}) ${cutoff}
-            ${underCursor(sql`GREATEST(m.created_at, lr.last_reply_at)`)}
-          ORDER BY activity_at DESC, m.seq DESC
-          LIMIT ${take}
-        )
-        SELECT id::text AS id, seq::text AS seq,
-          to_char(activity_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS activity_at
-        FROM (SELECT * FROM by_own_time UNION SELECT * FROM by_reply) candidates
-        ORDER BY candidates.activity_at DESC, candidates.seq DESC
-        LIMIT ${take}
-      `),
-      () => ({ limit, cursor_present: Boolean(before), history_cutoff_present: Boolean(historyCutoff) }),
-    );
-    return (result.rows as Array<{ id: string; seq: string; activity_at: string }>).map((row) => ({
-      id: row.id,
-      seq: Number(row.seq),
-      activityAt: row.activity_at,
-    }));
-  }, {
-    isolationLevel: "repeatable read",
-    accessMode: "read only",
-  });
-
-  const hasMore = ordered.length > limit;
-  const pageRows = (hasMore ? ordered.slice(0, limit) : ordered).reverse();
-  const activityById = new Map(pageRows.map((row) => [row.id, row.activityAt]));
-  const loaded = await listMessagesByIds(pageRows.map((row) => row.id), opts);
-  const oldest = pageRows[0];
-  return {
-    messages: loaded.map((message) => ({ ...message, activityAt: activityById.get(message.id)! })),
-    hasMore,
-    nextCursor: hasMore && oldest ? encodeChannelActivityCursor({ activityAt: oldest.activityAt, seq: oldest.seq }) : null,
-  };
-}
-
 export async function listMessagesByIds(
   messageIds: readonly string[],
   opts: MessageQueryTraceOptions = {},
@@ -8803,6 +9323,9 @@ const syncMessageReadSelectList = sql.join(
  * from (see ./syncHorizon). `from` and `filters` are shared by both arms, so
  * late rows pass the same visibility and history-cutoff filters as the page.
  * `filters` starts with AND (or is empty).
+ * `heldIds` (messages the client already got live) are marked in the late arm
+ * ("syncHeld") so the caller can leave them out and count them; the late
+ * LIMIT grows by their number, so held rows never hide a row over the cap.
  */
 function syncMessagesStatement(input: {
   selectList: SQL;
@@ -8812,8 +9335,14 @@ function syncMessagesStatement(input: {
   limit: number;
   sinceHorizon: SyncHorizon | null;
   lateCap: number;
+  heldIds: readonly string[];
 }): SQL {
   const { selectList, from, filters, sinceSeq, limit, sinceHorizon } = input;
+  const heldIds = sinceHorizon ? input.heldIds : [];
+  const heldColumn = heldIds.length > 0
+    ? sql`, (${messages.id} IN (${sql.join(heldIds.map((id) => sql`${id}::uuid`), sql`, `)})) AS "syncHeld"`
+    : sql``;
+  const pageHeldColumn = heldIds.length > 0 ? sql`, FALSE AS "syncHeld"` : sql``;
   // Only a client that sent a since-horizon gets the finished-transaction
   // filter: requests without one return exactly what they did before.
   const finishedOnly = sinceHorizon
@@ -8822,14 +9351,14 @@ function syncMessagesStatement(input: {
   const lateArm = sinceHorizon
     ? sql`,
     sync_late AS (
-      SELECT ${selectList}, TRUE AS "syncLate"
+      SELECT ${selectList}, TRUE AS "syncLate"${heldColumn}
       ${from}
       WHERE ${messages.seq} <= ${sinceSeq}
         AND ${messagesInsertXid} >= ${sinceHorizon}::xid8
         AND ${messagesInsertXid} < (SELECT xmin FROM sync_horizon)
         ${filters}
       ORDER BY ${messages.seq}
-      LIMIT ${input.lateCap + 1}
+      LIMIT ${input.lateCap + 1 + heldIds.length}
     )`
     : sql``;
   const lateRows = sinceHorizon ? sql`UNION ALL SELECT * FROM sync_late` : sql``;
@@ -8839,7 +9368,7 @@ function syncMessagesStatement(input: {
       FROM (SELECT pg_current_snapshot() AS snap) s
     ),
     sync_page AS (
-      SELECT ${selectList}, FALSE AS "syncLate"
+      SELECT ${selectList}, FALSE AS "syncLate"${pageHeldColumn}
       ${from}
       WHERE ${messages.seq} > ${sinceSeq}
         ${filters}
@@ -8859,10 +9388,12 @@ type SyncStatementRow = Record<string, unknown> & {
   syncHorizon?: unknown;
   syncSnapshotXmax?: unknown;
   syncLate?: unknown;
+  syncHeld?: unknown;
 };
 
 /**
- * Split the statement's rows into the horizon and the messages: late rows
+ * Split the statement's rows into the horizon and the messages: held late
+ * rows (the client already has them) are left out and counted, late rows
  * above the cap are dropped (reset), the rest are merged with the page,
  * deduplicated by id and ordered by seq.
  */
@@ -8872,10 +9403,16 @@ function splitSyncStatementRows(rows: readonly SyncStatementRow[], lateCap: numb
   const span = snapshotXidSpan(horizon, head?.syncSnapshotXmax);
   const page: Record<string, unknown>[] = [];
   const late: Record<string, unknown>[] = [];
+  let held = 0;
   for (const row of rows) {
     if (row.id === null || row.id === undefined) continue; // the horizon row of an empty read
-    const { syncHorizon: _horizon, syncSnapshotXmax: _xmax, syncLate, ...message } = row;
-    (syncLate === true || syncLate === "t" ? late : page).push(normalizeRawSyncMessageRow(message));
+    const { syncHorizon: _horizon, syncSnapshotXmax: _xmax, syncLate, syncHeld, ...message } = row;
+    const isLate = syncLate === true || syncLate === "t";
+    if (isLate && (syncHeld === true || syncHeld === "t")) {
+      held += 1;
+      continue;
+    }
+    (isLate ? late : page).push(normalizeRawSyncMessageRow(message));
   }
   const horizonReset = late.length > lateCap;
   const seen = new Set<unknown>();
@@ -8887,6 +9424,7 @@ function splitSyncStatementRows(rows: readonly SyncStatementRow[], lateCap: numb
     horizon,
     horizonReset,
     lateCount: horizonReset ? 0 : late.length,
+    heldSkipped: horizonReset ? 0 : held,
     snapshotXidSpan: span,
   };
 }
@@ -8898,6 +9436,12 @@ export type SyncMessagesHorizonOptions = {
    * transaction filter and the late arm. Omitted = the pre-horizon behaviour.
    */
   sinceHorizon?: SyncHorizon | null;
+  /**
+   * Ids of messages the client already received live since that horizon
+   * (validated, at most SYNC_HELD_IDS_CAP): the late arm leaves them out.
+   * Ignored without sinceHorizon; the page is unaffected.
+   */
+  heldIds?: readonly string[] | null;
 };
 
 export type SyncMessagesWithHorizonResult<T> = {
@@ -8908,6 +9452,8 @@ export type SyncMessagesWithHorizonResult<T> = {
   horizonReset: boolean;
   /** Late rows returned (0 without a since-horizon, or on reset). */
   lateCount: number;
+  /** Late rows left out because the client held them (0 without held ids, or on reset). */
+  heldSkipped: number;
   /** xmax - xmin of the read's snapshot (tracing lag proxy). */
   snapshotXidSpan: number | null;
 };
@@ -8957,6 +9503,7 @@ export async function syncMessagesWithHorizon(
     viewerServerId: viewerServerId ?? null,
   };
   const sinceHorizon = options.sinceHorizon ?? null;
+  const heldIds = sinceHorizon ? options.heldIds ?? [] : [];
   const lateCap = syncLateCap();
   const emptyRead = async () => {
     const snapshot = await readSyncHorizon();
@@ -8965,6 +9512,7 @@ export async function syncMessagesWithHorizon(
       horizon: snapshot.horizon,
       horizonReset: false,
       lateCount: 0,
+      heldSkipped: 0,
       snapshotXidSpan: snapshot.snapshotXidSpan,
     };
   };
@@ -9108,6 +9656,7 @@ export async function syncMessagesWithHorizon(
       limit,
       sinceHorizon,
       lateCap,
+      heldIds,
     }));
     const { rows: syncRows, ...horizonFields } = splitSyncStatementRows(rows.rows as SyncStatementRow[], lateCap);
 
@@ -9125,6 +9674,7 @@ export async function syncMessagesWithHorizon(
     limit,
     sinceHorizon,
     lateCap,
+    heldIds,
   }));
   const { rows: syncRows, ...horizonFields } = splitSyncStatementRows(rows.rows as SyncStatementRow[], lateCap);
 
@@ -9303,7 +9853,10 @@ async function handleJointThreadPostBroadcastSideEffects(input: {
   senderType: "user" | "agent";
   senderId: string;
   senderUniqueName: string;
-  senderDescription: string | null;
+  senderDescription: AttributedDescription | null;
+  /** Where the sender is from, read per receiving server (senderOriginFor), and the server they post from. */
+  senderOrigin?: OriginSubject | null;
+  senderPostingServer?: OriginServer | null;
   content: string;
   message: typeof messages.$inferSelect;
   attachments: {
@@ -9325,6 +9878,8 @@ async function handleJointThreadPostBroadcastSideEffects(input: {
     senderId,
     senderUniqueName,
     senderDescription,
+    senderOrigin = null,
+    senderPostingServer = null,
     content,
     message,
     attachments,
@@ -9333,6 +9888,12 @@ async function handleJointThreadPostBroadcastSideEffects(input: {
   } = input;
   const threadProjections = await channelService.getActiveJointThreadProjectionsByCanonicalThread(canonicalThreadChannelId);
   if (threadProjections.length === 0) return;
+  // Every server of this joint thread: each reader already sees their tags.
+  const originConversation: OriginConversation = {
+    kind: "joint",
+    serverIds: new Set(threadProjections.map((projection) => projection.localServerId)),
+    postingServer: senderPostingServer,
+  };
 
   const db = getDb();
   const mentionedAgentIds = new Set(resolvedMentions.filter((mention) => mention.type === "agent").map((mention) => mention.id));
@@ -9445,6 +10006,7 @@ async function handleJointThreadPostBroadcastSideEffects(input: {
         canonicalParentMessageId,
         message.seq,
         getHistoryCutoff(await getServerPlan(projection.localServerId)),
+        projection.localServerId,
       ));
     }
     const threadJoinContextBase = threadJoinContextBaseByServer.get(projection.localServerId);
@@ -9484,7 +10046,8 @@ async function handleJointThreadPostBroadcastSideEffects(input: {
           channel_type: "thread",
           sender_id: senderId,
           sender_name: senderUniqueName,
-          sender_description: senderDescription,
+          sender_description: senderDescriptionFor(agentDescriptionViewer(projection.localServerId), senderDescription),
+          ...senderOriginWireField(senderOriginFor(agentDescriptionViewer(projection.localServerId), senderOrigin, originConversation)),
           sender_timezone: message.senderTimezone ?? null,
           ...(await agentAuthorshipFields(message as AgentAuthorshipRow)),
           // RFC 082: a card message reads `card=r<revision>` in the header; its content is the fallback.
@@ -10416,6 +10979,35 @@ async function writeMentionFacts(
 }
 
 /**
+ * Mentioned humans who are Guests and can't be added here: a Guest joins only
+ * its one bound channel (channelService.addHuman refuses the rest), so Add is
+ * not offered for it anywhere else, a thread or task under a channel included.
+ * Fails closed: if the read fails, every mentioned human loses Add.
+ */
+async function mentionedGuestsOutsideTheirChannel(
+  rows: InsertedMentionRow[],
+  serverId: string,
+  channelId: string,
+  executor?: DatabaseExecutor,
+): Promise<Set<string>> {
+  const userIds = [...new Set(rows.filter((row) => row.targetType === "user").map((row) => row.targetId))];
+  if (userIds.length === 0) return new Set();
+  try {
+    const guests = await readInSavepoint(() => (executor ?? getDb())
+      .select({ userId: serverMembers.userId, guestChannelId: serverMembers.guestChannelId })
+      .from(serverMembers)
+      .where(and(
+        eq(serverMembers.serverId, serverId),
+        inArray(serverMembers.userId, userIds),
+        eq(serverMembers.role, "guest"),
+      )));
+    return new Set(guests.filter((guest) => guest.guestChannelId !== channelId).map((guest) => guest.userId));
+  } catch {
+    return new Set(userIds);
+  }
+}
+
+/**
  * Sender-side pending actions (mention-AX M-4): one entry per outsider
  * mention written on this send. Replays insert no rows and surface none —
  * the durable pending query remains the cross-turn discovery surface.
@@ -10440,6 +11032,9 @@ async function buildPendingMentionActions(
   const pendingRows = unnotified;
 
   const availableActions = await pendingMentionAvailableActions(serverId, channelId, senderType, senderId, deps, executor);
+  const guestsWhoCannotJoin = availableActions.includes("add")
+    ? await mentionedGuestsOutsideTheirChannel(pendingRows, serverId, channelId, executor)
+    : new Set<string>();
   const handleByTarget = new Map(
     targets.map((target) => [`${target.targetType}:${target.targetId}`, target.rawHandle]),
   );
@@ -10454,7 +11049,9 @@ async function buildPendingMentionActions(
       targetHandle: handleByTarget.get(`${row.targetType}:${row.targetId}`) ?? "",
       targetAvatarUrl: avatarUrlByTarget.get(`${row.targetType}:${row.targetId}`) ?? null,
       reason: "not_member" as const,
-      availableActions,
+      availableActions: row.targetType === "user" && guestsWhoCannotJoin.has(row.targetId)
+        ? availableActions.filter((action) => action !== "add")
+        : availableActions,
       expiresAt: new Date(currentTimeMs() + PENDING_MENTION_TTL_MS).toISOString(),
     }));
 }
@@ -10536,6 +11133,34 @@ export async function delegatedByLabelOf(agentId: string): Promise<DelegatedByLa
   const [agent] = await getDb().select({ id: agents.id, name: agents.name, displayName: agents.displayName, avatarUrl: agents.avatarUrl, deletedAt: agents.deletedAt })
     .from(agents).where(eq(agents.id, agentId)).limit(1);
   return agent ? { id: agent.id, name: agent.name, displayName: agent.displayName || agent.name, avatarUrl: agent.avatarUrl ?? null, deleted: agent.deletedAt !== null } : null;
+}
+
+/**
+ * A send's first row locks, right after its conversion fence, and the storage
+ * id its insert uses. For a Joint post: the Joint posting authority first
+ * (lockJointPostingAuthority: the local joint row FOR NO KEY UPDATE, then J),
+ * then the requested row FOR KEY SHARE and storage resolved under it
+ * (lockAndResolveMessageStorage). Otherwise only the latter.
+ *
+ * Parent before thread: for a Joint thread the authority row is the thread's
+ * local parent P and the requested row is the thread T. A forward into the
+ * same thread locks P before T too (lockForwardAuthorityChannels). With T
+ * first here, a forward holding P and waiting for T deadlocked against a send
+ * holding T and waiting for P (40P01). lockAndResolveMessageStorage's
+ * guarantee needs its lock only before the resolve and the insert, not as the
+ * first row lock. Pinned by jointThreadSendForwardLockOrder.realPg.test.ts.
+ */
+export async function lockSendRouteAndResolveStorage(tx: DatabaseExecutor, input: {
+  requestedChannelId: string;
+  /** The channel whose Joint membership admits the post; null when not a Joint post. */
+  jointPostingAuthorityChannelId: string | null;
+  senderType: ActorContextType;
+  senderId: string;
+}): Promise<string> {
+  if (input.jointPostingAuthorityChannelId) {
+    await lockJointPostingAuthority(input.jointPostingAuthorityChannelId, input.senderType, input.senderId, tx, { forSend: true });
+  }
+  return channelService.lockAndResolveMessageStorage(tx, input.requestedChannelId);
 }
 
 export async function broadcastAndDeliver(
@@ -10627,6 +11252,13 @@ export async function broadcastAndDeliver(
      * the caller answers it.
      */
     checkAgentInsertInTransaction?: (executor: DatabaseExecutor) => Promise<void>;
+    /**
+     * The first-party app posting this as the person
+     * (services/firstPartyAppMessages): told to the apps a message's object
+     * links go to (firstPartyAppMessageLinks), so an app can leave its own
+     * message to its own record (an Artifact's share).
+     */
+    postedByApp?: string;
   }
 ) {
   const deps = resolveMessageServiceDeps();
@@ -10910,9 +11542,19 @@ export async function broadcastAndDeliver(
     if (senderType === "agent" && agentSendKey
       && (useAtomicMessageTransaction || __hasAgentSendReplayDbOverrideForTests())) {
       const runAgentReplay = async (tx?: DatabaseExecutor) => {
-        if (tx && archiveScope?.rootType === "joint") await lockJointPostingAuthority(jointPostingAuthorityChannelId, senderType, senderId, tx, { forSend: true });
+        // The storage id this insert uses, resolved under the requested row's
+        // lock (lockAndResolveMessageStorage). Only the replay test seam runs
+        // without a transaction; it keeps the id resolved above.
+        const insertStorageChannelId = tx
+          ? await lockSendRouteAndResolveStorage(tx, {
+            requestedChannelId: channelId,
+            jointPostingAuthorityChannelId: archiveScope?.rootType === "joint" ? jointPostingAuthorityChannelId : null,
+            senderType,
+            senderId,
+          })
+          : storageChannelId;
         const result = await createOrReplayAgentSend({
-          channelId: storageChannelId,
+          channelId: insertStorageChannelId,
           senderId,
           content,
           agentSendKey,
@@ -10926,13 +11568,13 @@ export async function broadcastAndDeliver(
               executor,
               authorityChannelId: externalDeliveryAuthorityChannelId,
               requestedChannelId: channelId,
-              canonicalConversationId: storageChannelId,
+              canonicalConversationId: insertStorageChannelId,
               decision: ordinaryExternalProjectionDecision,
             })
             : undefined,
           onInserted: tx && useAtomicMessageTransaction
             ? async ({ executor, message: insertedMessage }: AgentSendInsertedTransactionInput) => {
-              if (isDmSend) await assertDmHumanPeersAreMembers(executor, storageChannelId, "agent", senderId);
+              if (isDmSend) await assertDmHumanPeersAreMembers(executor, insertStorageChannelId, "agent", senderId);
               if (idempotentMentionResolutionError) throw idempotentMentionResolutionError;
               const facts = await finalizeNewChatMessageInTransaction({
                 executor,
@@ -10959,7 +11601,7 @@ export async function broadcastAndDeliver(
             : undefined,
         }, tx);
         if (asTask && tx) createdTask = await ensureTaskForMessage(result.message.id, senderType, senderId, tx, requestedChannel?.serverId);
-        return result;
+        return { ...result, insertStorageChannelId };
       };
       const replayResult = await traceMessageDbPhase({
         phase: "message_pipeline.persist",
@@ -10993,6 +11635,7 @@ export async function broadcastAndDeliver(
         targetVisibleMentions: transactionFacts?.targetVisibleMentions ?? targetVisibleMentions,
         mentionAndInboxFinalizedInPersistence: transactionFacts !== null,
         threadAgentDeliveryCandidates: transactionFacts?.threadAgentDeliveryCandidates,
+        insertStorageChannelId: replayResult.insertStorageChannelId,
       };
     }
     if (useAtomicMessageTransaction && senderType === "user" && randomId) {
@@ -11001,14 +11644,19 @@ export async function broadcastAndDeliver(
         queryName: "messages.user_random_send_transaction",
         dbOperation: "transaction",
       }, () => withTransientTransactionRetry(() => withChannelWriterFence(channelId, async (tx) => {
-        if (archiveScope?.rootType === "joint") await lockJointPostingAuthority(jointPostingAuthorityChannelId, senderType, senderId, tx, { forSend: true });
+        const insertStorageChannelId = await lockSendRouteAndResolveStorage(tx, {
+          requestedChannelId: channelId,
+          jointPostingAuthorityChannelId: archiveScope?.rootType === "joint" ? jointPostingAuthorityChannelId : null,
+          senderType,
+          senderId,
+        });
         if (delegatedByAgentId && requestedChannel) {
           await lockAssistantDelegatedMessageAuthority(tx, {
             serverId: requestedChannel.serverId, ownerUserId: senderId, agentId: delegatedByAgentId,
           });
         }
         const result = await createOrReplayUserRandomSend({
-        channelId: storageChannelId,
+        channelId: insertStorageChannelId,
         isDmSend,
         authorityChannelId: externalDeliveryAuthorityChannelId,
         requestedChannelId: channelId,
@@ -11034,7 +11682,7 @@ export async function broadcastAndDeliver(
         deps,
       }, tx);
         if (asTask) createdTask = await ensureTaskForMessage(result.message.id, senderType, senderId, tx, requestedChannel?.serverId);
-        return result;
+        return { ...result, insertStorageChannelId };
       }), { onRetry: traceSendTransactionRetry("user") }));
       return {
         replayed: replayResult.replayed,
@@ -11045,17 +11693,21 @@ export async function broadcastAndDeliver(
         targetVisibleMentions: replayResult.targetVisibleMentions,
         mentionAndInboxFinalizedInPersistence: true,
         threadAgentDeliveryCandidates: replayResult.threadAgentDeliveryCandidates,
+        insertStorageChannelId: replayResult.insertStorageChannelId,
       };
     }
-    const persistDirectSend = async (executor?: DatabaseExecutor) => {
+    // `insertStorageChannelId`: the transaction's own resolution
+    // (lockAndResolveMessageStorage); the fixture path without one keeps the
+    // id resolved above.
+    const persistDirectSend = async (executor?: DatabaseExecutor, insertStorageChannelId = storageChannelId) => {
       if (executor && delegatedByAgentId && requestedChannel) {
         await lockAssistantDelegatedMessageAuthority(executor, {
           serverId: requestedChannel.serverId, ownerUserId: senderId, agentId: delegatedByAgentId,
         });
       }
-      if (isDmSend && executor) await assertDmHumanPeersAreMembers(executor, storageChannelId, senderType, senderId);
+      if (isDmSend && executor) await assertDmHumanPeersAreMembers(executor, insertStorageChannelId, senderType, senderId);
       const createdMessage = await deps.createMessage(
-        storageChannelId,
+        insertStorageChannelId,
         senderType,
         senderId,
         content,
@@ -11116,6 +11768,7 @@ export async function broadcastAndDeliver(
         attachments: linked.map(toLinkedMessageAttachment),
         ...facts,
         mentionAndInboxFinalizedInPersistence: executor != null && useAtomicMessageTransaction,
+        insertStorageChannelId,
       };
     };
 
@@ -11125,18 +11778,25 @@ export async function broadcastAndDeliver(
         queryName: "messages.direct_send_transaction",
         dbOperation: "transaction",
       }, () => withChannelWriterFence(channelId, async (tx) => {
-        // Joint authority (its row, then J) before admission's channel rows,
-        // as on the agent and random-id paths: admission first took the
-        // canonical row before J here, the reverse of those paths.
-        if (archiveScope?.rootType === "joint") await lockJointPostingAuthority(jointPostingAuthorityChannelId, senderType, senderId, tx, { forSend: true });
+        // First, right after the fence: Joint authority (its row, then J),
+        // then the requested row FOR KEY SHARE and the storage id this insert
+        // uses (lockSendRouteAndResolveStorage), all before admission's
+        // channel rows, as on the agent and random-id paths: admission first
+        // took the canonical row before J here, the reverse of those paths.
+        const insertStorageChannelId = await lockSendRouteAndResolveStorage(tx, {
+          requestedChannelId: channelId,
+          jointPostingAuthorityChannelId: archiveScope?.rootType === "joint" ? jointPostingAuthorityChannelId : null,
+          senderType,
+          senderId,
+        });
         await lockOrdinaryMessageExternalDeliveryAdmission({
           executor: tx,
           authorityChannelId: externalDeliveryAuthorityChannelId,
           requestedChannelId: channelId,
-          canonicalConversationId: storageChannelId,
+          canonicalConversationId: insertStorageChannelId,
           decision: ordinaryExternalProjectionDecision,
         });
-        return persistDirectSend(tx);
+        return persistDirectSend(tx, insertStorageChannelId);
       }));
     }
     return traceMessageDbPhase({
@@ -11153,6 +11813,19 @@ export async function broadcastAndDeliver(
   targetVisibleMentions = persistence.targetVisibleMentions;
   mentionAndInboxFinalizedInPersistence = persistence.mentionAndInboxFinalizedInPersistence;
   threadAgentDeliveryCandidatesFromFacts = persistence.threadAgentDeliveryCandidates;
+  // Where the insert stored the message: the id its transaction resolved
+  // under the requested row's lock (lockAndResolveMessageStorage), which the
+  // post-commit fan-out must use, not `storageChannelId` (resolved before the
+  // transaction: a conversion start or cancel can change the route between
+  // the two). A replayed or pre-persisted message (a forward, stored by
+  // persistForwardBundle under its own lock) is where its row is.
+  const persistedStorageChannelId = replayed || opts.prePersisted
+    ? message.channelId
+    : ("insertStorageChannelId" in persistence ? persistence.insertStorageChannelId : undefined) ?? storageChannelId;
+  // An ordinary root in an online move stores in its canonical channel, but
+  // its people only know the root: label the message with the root.
+  const routedToOnlineMoveCanonical = !jointThreadProjection && !jointProjection && persistedStorageChannelId !== storageChannelId
+    && persistedStorageChannelId === message.channelId && !isSubConversationType(requestedChannel?.type);
   addTraceEvent("message_pipeline.message.persisted", {
     duration_ms: currentTimeMs() - persistStart,
     sender_type: senderType,
@@ -11173,6 +11846,27 @@ export async function broadcastAndDeliver(
     void touchTaskConversationActivity(taskId).catch((err: unknown) => {
       console.warn("[MessageService] task conversation activity stamp failed", { taskId, error: serializeErrorForLog(err) });
     });
+  }
+
+  // 1a'. Links to first-party objects in a new chat message (an Artifact's
+  // original message, `link`: AppObjectKind.linkedInMessage). After the
+  // commit, never awaited: the apps are told on a later tick, and nothing
+  // they do slows or fails the send.
+  if (useAtomicMessageTransaction && !replayed && message.messageType === "chat") {
+    const linkServerId = requestedChannel?.serverId ?? channel?.serverId;
+    if (linkServerId) {
+      announceMessageObjectLinks({
+        id: message.id,
+        author: { type: senderType, id: senderId },
+        serverId: asServerId(linkServerId),
+        postedByApp: opts.postedByApp ?? null,
+      }, message.content);
+    }
+    // Its links to first-party objects as object_references (the message a
+    // source, #proj-workspace:#336): after the commit, never awaited, and
+    // nothing at all (no work, no query) for text without an address on
+    // Raft's hosts (services/messageReferences.ts).
+    recordMessageReferences({ messageId: message.id, content: message.content, previousContent: null });
   }
 
   // 1b. Create the canonical task fact for `asTask` sends. Runs after persist so
@@ -11287,18 +11981,28 @@ export async function broadcastAndDeliver(
   };
   await recordInboxFactsForSend();
 
-  // One sender lookup per send: feeds the frontend payload's
-  // senderDescription (REST parity) and the agent-visible sender metadata below.
-  const { uniqueName: senderUniqueName, description: senderDescription } = await deps.getSenderIdentity(senderType, senderId, senderName);
+  // One sender lookup per send: the agent-visible sender metadata below,
+  // the description and origin read per recipient server (senderDescriptionFor,
+  // senderOriginFor). A joint post names the server it comes through, so the
+  // same row carries that server's slug.
+  const senderPostingServerId = jointThreadProjection?.localServerId ?? jointProjection?.serverId ?? null;
+  const {
+    uniqueName: senderUniqueName,
+    description: senderDescription,
+    origin: senderOrigin = null,
+    postingServer: senderPostingServer = null,
+  } = await deps.getSenderIdentity(senderType, senderId, senderName, senderPostingServerId);
 
   // The sender response and frontend broadcast are human-facing: keep the
   // agent-only sender zone off them (agent payloads read it from `message`).
   const enriched = buildPersistedMessageFrontendPayload(message, {
     channelId: jointThreadProjection?.localThreadChannelId
       ?? jointProjection?.localChannelId
-      ?? message.channelId,
+      ?? (routedToOnlineMoveCanonical ? channelId : message.channelId),
     senderName,
-    senderDescription,
+    // Viewer-scoped (descriptionVisibility): a shared broadcast has no one
+    // viewer, so it carries none; each viewer's read carries theirs.
+    senderDescription: null,
     senderMembershipStatus: senderType === "user" && message.messageType !== "system" ? "active" : null,
     attachments: msgAttachments,
     mentions: targetVisibleMentions,
@@ -11330,13 +12034,15 @@ export async function broadcastAndDeliver(
     await handleJointThreadPostBroadcastSideEffects({
       agentOrchestrator,
       deps,
-      canonicalThreadChannelId: storageChannelId,
+      canonicalThreadChannelId: persistedStorageChannelId,
       canonicalParentMessageId: channel.parentMessageId,
       parentTaskId: channel.type === "task" ? channel.taskId : null,
       senderType,
       senderId,
       senderUniqueName,
       senderDescription,
+      senderOrigin,
+      senderPostingServer,
       content,
       message,
       attachments: msgAttachments,
@@ -11356,7 +12062,7 @@ export async function broadcastAndDeliver(
   await runSlackBridgeOutboundPipelineStage(
     "frontend_emit",
     () => emitPersistedMessageToFrontend(io, {
-      channelId: storageChannelId,
+      channelId: persistedStorageChannelId,
       senderType,
       senderId,
       message,
@@ -11396,7 +12102,7 @@ export async function broadcastAndDeliver(
   const senderReadMutation = senderType === "user"
     ? deps.markRead(senderId, channelId, message.seq)
     : deps.markAgentOwnSendRead
-      ? deps.markAgentOwnSendRead(senderId, channelId, message.seq, storageChannelId)
+      ? deps.markAgentOwnSendRead(senderId, channelId, message.seq, persistedStorageChannelId)
       : deps.markAgentLegacyRead(senderId, channelId, message.seq);
   const sourceServerId = requestedChannel?.serverId ?? channel?.serverId;
   if (sourceServerId) {
@@ -11433,6 +12139,12 @@ export async function broadcastAndDeliver(
     const jointDeliveryScheduleStart = currentTimeMs();
     const senderAuthorityServerId = jointProjection?.serverId ?? channel.serverId;
     const agentDeliveryOptions = await getAgentDeliveryOptionsForSender(deps, senderAuthorityServerId, senderType, senderId);
+    // Every server of this joint channel: each reader already sees their tags.
+    const originConversation: OriginConversation = {
+      kind: "joint",
+      serverIds: new Set(jointProjections.map((projection) => projection.serverId)),
+      postingServer: senderPostingServer,
+    };
     // Bounded: each projection runs ~8 queries plus per-agent delivery. With up
     // to 30 servers per joint, starting them all at once could exhaust the
     // connection pool for the whole server (contract v0.3 §18.10.1).
@@ -11454,12 +12166,16 @@ export async function broadcastAndDeliver(
       const projectionDeliveries: Array<{ agentId: string; message: AgentMessage; options?: DeliverMessageOptions }> = [];
       for (const agent of projectionAgents) {
         if ((senderType === "agent" && agent.id === senderId) || mutedAgentIds.has(agent.id)) continue;
-        const recipientForwardedSnapshot = formatForwardedBundleForAgent(
+        const recipientForwardedSnapshot = await deliveredForwardedSnapshot(
+          agentOrchestrator,
+          deps,
           await scrubForwardedBundleMetadataForViewer(actionMetadata, {
             type: "agent",
             id: agent.id,
             serverId: projection.serverId,
           }, deps.canViewerReadForwardedSource),
+          agent.id,
+          message.id,
         );
         projectionDeliveries.push({
           agentId: agent.id,
@@ -11470,7 +12186,8 @@ export async function broadcastAndDeliver(
             sender_id: senderId,
             sender_name: senderUniqueName,
             sender_type: toAgentVisibleSenderType(senderType),
-            sender_description: senderDescription,
+            sender_description: senderDescriptionFor(agentDescriptionViewer(projection.serverId), senderDescription),
+            ...senderOriginWireField(senderOriginFor(agentDescriptionViewer(projection.serverId), senderOrigin, originConversation)),
             sender_timezone: message.senderTimezone ?? null,
             ...(await agentAuthorshipFields(message as AgentAuthorshipRow)),
             // RFC 082: a card message reads `card=r<revision>` in the header; its content is the fallback.
@@ -11649,6 +12366,7 @@ export async function broadcastAndDeliver(
           channel.parentMessageId,
           message.seq,
           getHistoryCutoff(await getServerPlan(channel.serverId)),
+          channel.serverId,
         );
       }
     }
@@ -11690,12 +12408,16 @@ export async function broadcastAndDeliver(
   for (const agent of deliveryAgents) {
     if (senderType === "agent" && agent.id === senderId) continue;
     if (mutedAgentDeliveryIds.has(agent.id)) continue;
-    const recipientForwardedSnapshot = formatForwardedBundleForAgent(
+    const recipientForwardedSnapshot = await deliveredForwardedSnapshot(
+      agentOrchestrator,
+      deps,
       await scrubForwardedBundleMetadataForViewer(actionMetadata, {
         type: "agent",
         id: agent.id,
         serverId: channel.serverId,
       }, deps.canViewerReadForwardedSource),
+      agent.id,
+      message.id,
     );
     const renderedContent = appendAgentForwardedSnapshot(renderedBaseContent, recipientForwardedSnapshot);
 
@@ -11732,7 +12454,8 @@ export async function broadcastAndDeliver(
         channel_type: isThread ? "thread" : isDM ? "dm" : channel?.type === "joint" ? "joint" : channel?.type === "private" ? "private" : "channel",
         sender_id: senderId,
         sender_name: senderUniqueName,
-        sender_description: senderDescription,
+        sender_description: senderDescriptionFor(agentDescriptionViewer(channel.serverId), senderDescription),
+        ...senderOriginWireField(senderOriginFor(agentDescriptionViewer(channel.serverId), senderOrigin, LOCAL_ORIGIN_CONVERSATION)),
         sender_timezone: message.senderTimezone ?? null,
         ...(await agentAuthorshipFields(message as AgentAuthorshipRow)),
         // RFC 082: a card message reads `card=r<revision>` in the header; its content is the fallback.

@@ -34,13 +34,17 @@
 //    Artifact (unless it stopped), and the notices are queued; the author's
 //    read position moves over its own comment when nothing unseen lies
 //    before it;
-// 5. after the commit, the notices are pushed (sendQueued) and people's
-//    Activity is told (announceObjectEvents).
+// 5. after the commit, the notices are pushed (sendQueued), people's
+//    Activity is told (announceObjectEvents) and open pages of the Artifact
+//    are pinged (live.ts announceArtifactChanged).
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import {
   AGENT_API_ARTIFACT_MAX_ANCHOR_BYTES,
   AGENT_API_ARTIFACT_MAX_COMMENT_CHARS,
+  artifactAnchorJsonBytes,
+  fitArtifactAnchorContext,
+  keepArtifactAnchorContext,
   AGENT_API_ARTIFACT_MAX_MENTIONS,
   AGENT_API_ARTIFACT_READ_UNSEEN_SHOWN,
   AGENT_API_ARTIFACT_READ_VERSIONS_SHOWN,
@@ -96,6 +100,7 @@ import {
   resolveVisibleItem,
   shownInFull,
   shownThrough,
+  keepsOwnStateOn,
   takesPartIn,
   unseenChangesError,
   versionNotFound,
@@ -104,6 +109,7 @@ import {
   viewActor,
 } from "./apiCommon";
 import { announceObjectEvents } from "../../platform/activity";
+import { announceArtifactChanged } from "./live";
 import { followerRecipients, recordArtifactEvent } from "./events";
 import { actorsWhoCanViewArtifact } from "./visibility";
 import { claimCommentImages, commentImagesPart } from "./commentImages";
@@ -315,7 +321,11 @@ export async function checkCommentFields(
       details: { field: "body", limit: AGENT_API_ARTIFACT_MAX_COMMENT_CHARS },
     });
   }
-  if (fields.anchor !== undefined && Buffer.byteLength(JSON.stringify(fields.anchor), "utf8") > AGENT_API_ARTIFACT_MAX_ANCHOR_BYTES) {
+  // An annotation anchor's context (Porthole P152) is kept as the web's is, cleaned and within Porthole's
+  // limits, and left out when malformed: never refused for it. Over the size limit it gives way first (the
+  // region, then the outermost headings), so only the place itself is refused (shared fitArtifactAnchorContext).
+  const sentAnchor = fields.anchor === undefined ? undefined : fitArtifactAnchorContext(keepArtifactAnchorContext(fields.anchor), AGENT_API_ARTIFACT_MAX_ANCHOR_BYTES);
+  if (sentAnchor !== undefined && artifactAnchorJsonBytes(sentAnchor) > AGENT_API_ARTIFACT_MAX_ANCHOR_BYTES) {
     refuse(400, {
       code: "FIELD_TOO_LONG",
       error: `A comment's anchor can be at most ${AGENT_API_ARTIFACT_MAX_ANCHOR_BYTES} bytes as JSON: anchor it to a shorter quote or a smaller range, or leave the anchor out.`,
@@ -324,7 +334,7 @@ export async function checkCommentFields(
   }
   if (fields.path !== undefined && !isWellFormedArtifactFilePath(fields.path)) throw new ArtifactApiFailure(invalidPath(fields.path));
   let path = fields.path ?? null;
-  let anchor: ArtifactCommentAnchor | null = fields.anchor ?? null;
+  let anchor: ArtifactCommentAnchor | null = sentAnchor ?? null;
   if (fields.replyTo !== undefined) {
     const [parent] = await getDb().select().from(artifactComments)
       .where(and(liveComment(item.id), eq(artifactComments.id, fields.replyTo))).limit(1);
@@ -332,7 +342,7 @@ export async function checkCommentFields(
     // A reply is a comment at the same place (technical design §6b).
     if (fields.path === undefined) {
       path = parent!.path;
-      anchor = fields.anchor ?? parent!.anchor ?? null;
+      anchor = sentAnchor ?? parent!.anchor ?? null;
     }
   }
   if (anchor !== null && path === null) {
@@ -517,6 +527,10 @@ export async function held(item: ArtifactItemRow, hold: CommentHold, what: "comm
       versions: await versionSummaries(item, hold.versions, name, false),
       versionCount: hold.versionCount,
     },
+    // Where the read position stood before the hold moved it to `seen`: the
+    // range that lists the comments it marked seen again (artifactComments `held`,
+    // #proj-workspace:#340).
+    seenFrom: hold.after,
     seen: hold.through,
     skipped: hold.skipped,
     },
@@ -544,7 +558,7 @@ async function agentResolution(
   outbox: ArtifactNoticeOutbox,
   opts: { resolve: boolean; note: string | null },
 ): Promise<ArtifactApiResult<AgentApiArtifactThreadResolution>> {
-  const item = await resolveVisibleItem(agent, params.artifact);
+  const item = await resolveVisibleItem(agent, params.artifact, "write");
   if (!(await takesPartIn(viewActor(agent), item))) return mayNotTakePart("resolve or reopen its threads");
   const thread = await resolvableThread(viewActor(agent), item, params.comment);
   switch (thread.kind) {
@@ -617,7 +631,7 @@ async function agentResolution(
   if (outcome.kind === "held") return held(item, outcome.hold, "comment");
 
   const rows = [outcome.root, ...(outcome.note ? [outcome.note.comment] : [])];
-  const name = await namer([...commentActors(rows), ...(outcome.toldAgent ? [{ type: "agent" as const, id: outcome.toldAgent }] : [])]);
+  const name = await namer([...commentActors(rows), ...(outcome.toldAuthor ? [outcome.toldAuthor] : [])]);
   const numbers = await versionNumbers(rows.map((row) => row.versionId));
   const written = outcome.note;
   return json<AgentApiArtifactThreadResolution>({
@@ -625,9 +639,12 @@ async function agentResolution(
     comment: agentComment(outcome.root, numbers.get(outcome.root.versionId) ?? 0, name),
     note: written ? agentComment(written.comment, written.version.number, name) : null,
     changed: outcome.changed,
+    // With how each was told (`delivery`, #proj-workspace:#340): the thread's
+    // author, an agent, in its inbox (queued, not pushed), or a person in
+    // their Activity (no unread); a note's mentions and followers, pushed.
     notified: [
-      ...(outcome.toldAgent ? [{ actor: name({ type: "agent", id: outcome.toldAgent }), reason: "resolved" as const }] : []),
-      ...(written?.notified ?? []),
+      ...(outcome.toldAuthor ? [{ actor: name(outcome.toldAuthor), reason: "resolved" as const, delivery: outcome.toldAuthor.type === "agent" ? "inbox" as const : "activity" as const }] : []),
+      ...(written?.notified ?? []).map((entry) => ({ ...entry, delivery: "wake" as const })),
     ],
     notNotified: written && note ? [
       ...note.mentions.notNotified,
@@ -646,7 +663,7 @@ export function createCommentOperations() {
     ): Promise<ArtifactApiResult<AgentApiArtifactCommentCreated>> => answer(async () => {
       // Step 1.
       // resolveVisibleItem checks the caller's flag first.
-      const item = await resolveVisibleItem(agent, params.artifact);
+      const item = await resolveVisibleItem(agent, params.artifact, "write");
       if (!(await takesPartIn(viewActor(agent), item))) return mayNotTakePart("comment on it");
 
       // Step 2.
@@ -707,6 +724,7 @@ export function createCommentOperations() {
       // Step 5.
       await sendQueued(outbox, outcome.queued);
       await announceObjectEvents([outcome.eventId]);
+      announceArtifactChanged(item.id, "comments");
       const { comment } = outcome;
       const name = await namer(commentActors([comment]));
       return json<AgentApiArtifactCommentCreated>({
@@ -739,7 +757,7 @@ export function createCommentOperations() {
     /** Follow: a new row, or the stop cleared. Only an agent of the Artifact's server or of its joint channel follows it (takesPartIn). */
     subscribe: (agent: ArtifactAgent, params: AgentApiArtifactParams): Promise<ArtifactApiResult<AgentApiArtifactSubscriptionResponse>> => answer(async () => {
       // resolveVisibleItem checks the caller's flag first.
-      const item = await resolveVisibleItem(agent, params.artifact);
+      const item = await resolveVisibleItem(agent, params.artifact, "write");
       if (!(await takesPartIn(viewActor(agent), item))) return mayNotTakePart("follow it");
       await follow(item.id, agentActor(agent));
       return json({ artifact: await artifactRef(item), following: true });
@@ -752,8 +770,9 @@ export function createCommentOperations() {
      */
     unsubscribe: (agent: ArtifactAgent, params: AgentApiArtifactParams): Promise<ArtifactApiResult<AgentApiArtifactSubscriptionResponse>> => answer(async () => {
       // resolveVisibleItem checks the caller's flag first.
-      const item = await resolveVisibleItem(agent, params.artifact);
-      if (await takesPartIn(viewActor(agent), item)) await unfollow(item.id, agentActor(agent));
+      // The agent's own state, resolved as a read: a closed server's Artifact (read-only) is unfollowed too.
+      const item = await resolveVisibleItem(agent, params.artifact, "read");
+      if (await keepsOwnStateOn(viewActor(agent), item)) await unfollow(item.id, agentActor(agent));
       return json({ artifact: await artifactRef(item), following: false });
     }),
   };

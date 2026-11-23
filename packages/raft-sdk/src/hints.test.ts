@@ -18,6 +18,7 @@ import { createRaft, type Raft, type RaftNextOperation } from "./index";
 /** Typed methods outside the manifest (binary results) that a hint may point at as a code call. */
 const TYPED_ONLY: Record<string, (raft: Raft) => unknown> = {
   "attachments.download": (raft) => raft.attachments.download,
+  "attachments.upload": (raft) => raft.attachments.upload,
   "artifacts.commentImage": (raft) => raft.artifacts.commentImage,
 };
 

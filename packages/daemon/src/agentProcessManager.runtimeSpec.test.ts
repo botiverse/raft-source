@@ -201,23 +201,23 @@ test("a busy process rebound on another model runs its turn out, is stopped at t
       agentId: "agent-busy",
       session_id: "session-agent-busy",
       drift: "model",
-      new_session: false,
+      new_session: true,
       trigger: "turn_end",
       host: "legacy",
     }]);
     await flush();
     const snapshot = restartSnapshot(ctx.manager, "agent-busy")!;
     assert.equal(snapshot.config.model, "opus");
-    assert.equal(snapshot.sessionId, "session-agent-busy", "another Claude model resumes the session");
+    assert.equal(snapshot.sessionId, null, "switching model opens a fresh session on every runtime");
 
-    // The next wake starts on the new model, resuming; its process has no drift.
+    // The next wake starts on the new model with a fresh session; its process has no drift.
     await ctx.manager.startAgent("agent-busy", { ...snapshot.config, agentCredentialKey: "sk_agent_test" });
     assert.equal(ctx.driver.spawnCalls.length, 2);
     assert.equal(ctx.driver.spawnCalls[1]!.config.model, "opus");
-    assert.equal(ctx.driver.spawnCalls[1]!.config.sessionId, "session-agent-busy");
+    assert.equal(ctx.driver.spawnCalls[1]!.config.sessionId, null);
     assert.equal(ctx.manager.getAgentRuntimeProfileReport("agent-busy")?.facts.model, "opus");
     const next = (ctx.manager as any).agents.get("agent-busy");
-    next.sessionId = "session-agent-busy";
+    next.sessionId = "session-agent-busy-2";
     (ctx.manager as any).commitApmIdleState("agent-busy", next, true);
     await sweep(ctx);
     assert.equal(ctx.driver.processes[1]!.killed, false, "started on the new config: no second stop");
@@ -225,11 +225,11 @@ test("a busy process rebound on another model runs its turn out, is stopped at t
   });
 });
 
-test("untold inbox work holds the stop", async () => {
+test("untold inbox work holds a session-keeping stop", async () => {
   await withManager(async (ctx) => {
     const ap = await startIdle(ctx, "agent-inbox");
     ap.inbox.push(message(1));
-    await rebind(ctx, "agent-inbox", { model: "opus" });
+    await rebind(ctx, "agent-inbox", { reasoningEffort: "high" });
     await sweep(ctx);
     assert.equal(ctx.driver.processes[0]!.killed, false);
     assert.deepEqual(specStops(ctx), []);
@@ -261,13 +261,13 @@ test("a delivery held for a provider limit does not hold the stop, even when the
     const ap = await startIdle(ctx, "agent-limited", { model: "opus" });
     ap.inbox.push(message(1));
     ap.runtimeErrorDeliveryBackoff = { kind: "backing_off", attempts: 1, untilMs: Date.now() + 60 * 60_000, timer: null, reason: "rate_limited" };
-    await rebind(ctx, "agent-limited", { model: "sonnet" });
+    await rebind(ctx, "agent-limited", { model: "opus", reasoningEffort: "high" });
     assert.equal(ctx.driver.processes[0]!.kills, 1, "stopped for its spec while the delivery waits on the limit");
 
-    // The same inbox with no hold still holds the stop ("untold inbox work holds the stop").
+    // The same inbox with no hold still holds a session-keeping stop ("untold inbox work holds a session-keeping stop").
     const free = await startIdle(ctx, "agent-free", { model: "opus" });
     free.inbox.push(message(2));
-    await rebind(ctx, "agent-free", { model: "sonnet" });
+    await rebind(ctx, "agent-free", { model: "opus", reasoningEffort: "high" });
     assert.equal(ctx.driver.processes.at(-1)!.killed, false);
   }); } finally {
     restoreFetch();
@@ -342,7 +342,7 @@ test("another Codex model: the next start opens a new session, and a later start
     await ctx.manager.startAgent("agent-codex", makeConfig({ runtime: "codex", model: "gpt-5.4", sessionId: "session-agent-codex" }));
     assert.equal(ctx.driver.spawnCalls.length, 2);
     assert.equal(ctx.driver.spawnCalls[1]!.config.sessionId, null, "a new session");
-    assert.deepEqual(sessionDrops(ctx), [{ agentId: "agent-codex", launchId: undefined, reason: "codex_model_changed", host: "legacy" }]);
+    assert.deepEqual(sessionDrops(ctx), [{ agentId: "agent-codex", launchId: undefined, reason: "model_changed", host: "legacy" }]);
     assert.equal(JSON.stringify(sessionDrops(ctx)).includes("gpt-5"), false, "no model names");
   });
 });

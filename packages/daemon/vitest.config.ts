@@ -11,6 +11,12 @@ import {
 import { holdTestSlotForThisRun } from "../../scripts/vitest/testSlot";
 import { useDevRunEnv } from "../../scripts/dev/raftdev-cache";
 
+// Dev trace (scripts/vitest/devTraceReporter.ts): loaded lazily so that a
+// problem in it can never stop this config from loading.
+const devTrace = await import("../../scripts/vitest/devTraceReporter")
+  .then((module) => [module.devTracePlugin("@botiverse/raft-daemon")])
+  .catch(() => []);
+
 // Local runs: 1 worker (RAFT_TEST_MAX_WORKERS raises it; a CLI --maxWorkers
 // above it is clamped), 4096 MiB fork heap, run record (scripts/vitest).
 // CI sizing is unchanged (two workers, no heap flag; see below).
@@ -28,8 +34,9 @@ const localWorkers = localMaxWorkers(process.env, SHARED_HOST_MAX_WORKERS);
 
 export default defineConfig({
   plugins: ci
-    ? []
+    ? devTrace
     : [
+        ...devTrace,
         runRecordPlugin({ packageName: "@botiverse/raft-daemon", dom: false, worktree }),
         localWorkerCapPlugin({ label: "daemon", cap: localWorkers }),
       ],

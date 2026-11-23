@@ -2,9 +2,9 @@ import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import type { InboxFilter, InboxItem, ObjectActivityItem } from "../../store/inboxStore";
 import { getInboxItemKey } from "../../store/inboxItem";
 import { isTaskConversationItem } from "../../utils/taskConversation";
-import { artifactActivityComment, artifactActivityPinnedVersion, artifactActivityReview } from "../../apps/artifacts";
+import { artifactActivityComment, artifactActivityReview } from "../../apps/artifacts";
 import type { SearchContentSlot } from "../../store/searchContentStore";
-import type { InboxContextMenuPosition } from "../../components/thread/inboxContextMenuPosition";
+import type { InboxContextMenuState } from "../../components/thread/InboxContextMenu";
 
 
 /**
@@ -81,7 +81,7 @@ export function activityReadFilter(filter: InboxFilter): ActivityReadFilter {
   return filter === "unread" || filter === "unread_mentions" ? "unread" : "all";
 }
 
-export type CtxMenu = InboxContextMenuPosition;
+export type CtxMenu = InboxContextMenuState;
 
 // An unread row's excerpt reads in full foreground, as its title does.
 // raft-ui's InboxItemBody stays foreground-muted under data-unread.
@@ -105,18 +105,16 @@ export const PHONE_ACTIVITY_RAIL_INSET = { top: PHONE_TOOLBAR_HEIGHT + 8 + DAY_H
 /**
  * What opening an object row shows in Activity's detail slot, beside the list
  * as a conversation row's conversation (xxchan, Remy): its app's viewer, at
- * the version the row is about when that is not the latest, showing the
+ * its latest version (#proj-workspace:#329), showing the
  * review's comments when the row is about a review, landing on the comment
  * when it is about one (#proj-workspace:#82).
  */
 export function objectRowSlot(item: ObjectActivityItem): SearchContentSlot {
-  const version = artifactActivityPinnedVersion(item);
   const review = artifactActivityReview(item);
   const comment = artifactActivityComment(item);
   return {
     kind: "artifact",
     id: item.objectId,
-    ...(version === null ? {} : { version }),
     ...(review === null ? {} : { review: review.id }),
     ...(comment === null ? {} : { comment }),
   };

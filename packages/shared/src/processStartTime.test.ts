@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "vitest";
 
 import {
+  linuxPidShowsExited,
   parsePsLstartMs,
   parseWindowsCreationTimeUtcMicros,
   PID_REUSE_TOLERANCE_MS,
@@ -44,4 +45,20 @@ test("startedAfterRecord: only a process that started later than the record plus
   assert.equal(startedAfterRecord(recordedAtMs, undefined), false, "a start that cannot be read");
   assert.equal(startedAfterRecord(recordedAtMs, Number.NaN), false);
   assert.equal(startedAfterRecord(Number.NaN, recordedAtMs), false, "a record without a readable time");
+});
+
+test("linuxPidShowsExited: zombie/dead state after the last ')' of comm, or /proc/<pid> gone; unknown otherwise", () => {
+  const base = { readSelfStat: () => "42 (node) R 1", selfPid: 42 };
+  const stat = (text: string) => ({ ...base, readProcStat: () => text });
+  const thrown = (code: string) => ({ ...base, readProcStat: () => { throw Object.assign(new Error(code), { code }); } });
+  assert.equal(linuxPidShowsExited(7, stat("7 (sleep) Z 1 7 7 0 -1")), true);
+  assert.equal(linuxPidShowsExited(7, stat("7 (sleep) X 1 7 7 0 -1")), true);
+  assert.equal(linuxPidShowsExited(7, stat("7 (a) Z (b) S 1 7 7 0 -1")), false, "comm `a) Z (b` is not the state");
+  assert.equal(linuxPidShowsExited(7, stat("7 (a) S (b) Z 1 7 7 0 -1")), true);
+  assert.equal(linuxPidShowsExited(7, stat("7 (sleep) S 1 7 7 0 -1")), false);
+  assert.equal(linuxPidShowsExited(7, stat("junk")), false);
+  assert.equal(linuxPidShowsExited(7, thrown("ENOENT")), true);
+  assert.equal(linuxPidShowsExited(7, thrown("ESRCH")), true);
+  assert.equal(linuxPidShowsExited(7, thrown("EACCES")), false);
+  assert.equal(linuxPidShowsExited(7, { ...stat("7 (sleep) Z 1"), selfPid: 43 }), false, "/proc of another pid namespace");
 });

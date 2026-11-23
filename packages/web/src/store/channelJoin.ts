@@ -4,7 +4,7 @@ import { whenIdle } from "../utils/whenIdle";
 import { holdJoinDeferred, releaseJoinDeferred } from "./joinDeferred";
 
 /** Where a join started: low-cardinality, recorded on the span. */
-export type ChannelJoinSource = "channel_panel" | "thread_panel" | "forward";
+export type ChannelJoinSource = "channel_panel" | "thread_panel" | "forward" | "search";
 
 export interface ChannelJoinSteps {
   /** POST the join. */

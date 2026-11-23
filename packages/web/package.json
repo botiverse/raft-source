@@ -1,6 +1,6 @@
 {
   "name": "@botiverse/raft-web",
-  "version": "1.29.3",
+  "version": "1.33.1",
   "license": "LicenseRef-Raft-License",
   "private": true,
   "type": "module",
@@ -12,9 +12,10 @@
     "preview": "vite preview",
     "typecheck": "tsrs --noEmit",
     "typecheck:tsc": "tsc --noEmit",
-    "lint": "node --import @oxc-node/core/register scripts/check-source-extensions.ts && oxlint --react-plugin --max-warnings=0 src visual-testing && oxlint -c scripts/oxlint-tests.json --disable-nested-config --max-warnings=0 tests src/features/*/tests && node --import @oxc-node/core/register scripts/check-color-tokens.ts && node --import @oxc-node/core/register scripts/check-resize-handle-touch-action.ts && node --import @oxc-node/core/register scripts/check-embed-wiring.ts && node --import @oxc-node/core/register scripts/check-host-bridge-callers.ts && node --import @oxc-node/core/register scripts/check-orphan-animations.ts && node --import @oxc-node/core/register scripts/check-banner-inline-action.ts && node --import @oxc-node/core/register scripts/check-banner-margin.ts && node --import @oxc-node/core/register scripts/check-hand-rolled-text-links.ts && node --import @oxc-node/core/register scripts/check-module-shape.ts && node --import @oxc-node/core/register scripts/check-scroll-area-debt.ts && node node_modules/@botiverse/raft-ui/checks/native-scroll-css.mjs src && pnpm run lint:i18n-literals",
+    "lint": "node --import @oxc-node/core/register scripts/check-source-extensions.ts && node --import @oxc-node/core/register scripts/lint-app.ts && oxlint -c scripts/oxlint-tests.json --disable-nested-config --max-warnings=0 tests src/features/*/tests && node --import @oxc-node/core/register scripts/check-color-tokens.ts && node --import @oxc-node/core/register scripts/check-resize-handle-touch-action.ts && node --import @oxc-node/core/register scripts/check-embed-wiring.ts && node --import @oxc-node/core/register scripts/check-host-bridge-callers.ts && node --import @oxc-node/core/register scripts/check-orphan-animations.ts && node --import @oxc-node/core/register scripts/check-banner-inline-action.ts && node --import @oxc-node/core/register scripts/check-banner-margin.ts && node --import @oxc-node/core/register scripts/check-hand-rolled-text-links.ts && node --import @oxc-node/core/register scripts/check-popup-portals.ts && node --import @oxc-node/core/register scripts/check-module-shape.ts && node --import @oxc-node/core/register scripts/check-scroll-area-debt.ts && node node_modules/@botiverse/raft-ui/checks/native-scroll-css.mjs src && pnpm run lint:i18n-literals",
     "lint:i18n-literals": "node --import @oxc-node/core/register scripts/check-i18n-literals.ts",
-    "lint:fix": "oxlint --react-plugin --fix src visual-testing && oxlint -c scripts/oxlint-tests.json --disable-nested-config --fix tests src/features/*/tests",
+    "lint:refs-baseline": "node --import @oxc-node/core/register scripts/lint-app.ts --write",
+    "lint:fix": "oxlint --react-plugin --fix --quiet src visual-testing && oxlint -c scripts/oxlint-tests.json --disable-nested-config --fix tests src/features/*/tests",
     "test": "node --import @oxc-node/core/register scripts/run-vitest-tests.ts",
     "test:dom": "node --import @oxc-node/core/register scripts/run-vitest-tests.ts --dom",
     "test:e2e": "playwright test",
@@ -26,9 +27,9 @@
     "test:feedback-entry": "pnpm run build:feedback && node --import @oxc-node/core/register scripts/check-native-feedback-entry.ts"
   },
   "dependencies": {
-    "@botiverse/hands-feedback-react": "0.5.5",
-    "@botiverse/oar": "0.107.0",
-    "@botiverse/porthole": "0.16.0",
+    "@botiverse/hands-feedback-react": "0.5.6",
+    "@botiverse/oar": "0.124.0",
+    "@botiverse/porthole": "0.17.2",
     "@botiverse/raft-runtime-form": "workspace:*",
     "@botiverse/raft-shared": "workspace:*",
     "@botiverse/raft-sync-core": "workspace:*",
@@ -36,6 +37,7 @@
     "@dnd-kit/modifiers": "^9.0.0",
     "@dnd-kit/sortable": "^10.0.0",
     "@dnd-kit/utilities": "^3.2.2",
+    "@holtjs/live-client": "0.1.0",
     "@json-render/core": "0.21.1",
     "@json-render/react": "0.21.1",
     "@tanstack/react-virtual": "^3.14.14",
@@ -48,9 +50,8 @@
     "lucide-react": "^1.72.0",
     "mdast-util-math": "3.0.0",
     "mermaid": "11.17.2",
-    "@botiverse/raft-ui": "0.101.0",
+    "@botiverse/raft-ui": "0.102.11",
     "@botiverse/ricons": "^0.1.1",
-    "raft-ui": "npm:@botiverse/raft-ui@0.101.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "react-intl": "^7.1.11",
@@ -67,9 +68,12 @@
     "zod": "^4.6.6"
   },
   "devDependencies": {
+    "@babel/core": "7.29.13",
+    "@botiverse/lint": "^0.1.0",
     "@formatjs/icu-messageformat-parser": "2.11.4",
     "@oxc-node/core": "^0.1.6",
     "@playwright/test": "^1.64.0",
+    "@rolldown/plugin-babel": "0.2.4",
     "@tailwindcss/vite": "4.3.3",
     "@testing-library/dom": "^10.4.2",
     "@testing-library/react": "^16.3.3",
@@ -80,6 +84,7 @@
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.2",
     "ajv": "8.20.0",
+    "babel-plugin-react-compiler": "1.0.0",
     "bippy": "^0.7.3",
     "es-module-lexer": "2.3.0",
     "esbuild": "^0.28.2",
@@ -96,7 +101,7 @@
     "tailwindcss": "^4.3.3",
     "typescript": "^6.0.3",
     "vfile": "^6.0.3",
-    "vite": "^8.3.4",
+    "vite": "^8.3.8",
     "vitest": "^5.0.3"
   }
 }

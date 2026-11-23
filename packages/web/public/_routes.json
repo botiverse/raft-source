@@ -6,6 +6,9 @@
     "/feedback/assets/*",
     "/desktop-manifest.json",
     "/artifacts/*",
+    "/s/*",
+    "/join/*",
+    "/external-invite/*",
     "/sitemap.xml"
   ],
   "exclude": []

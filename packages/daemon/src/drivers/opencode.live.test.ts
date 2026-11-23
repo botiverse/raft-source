@@ -343,6 +343,68 @@ liveTest("live 2.x (2.3+): through a RuntimeSession, a turn that starts a backgr
   }
 }, STEP_TIMEOUT_MS * 2);
 
+liveTest("live 2.x (2.3.1+): a reply followed by background_wait for a never-ending shell job ends after the cap, and the job is gone", async () => {
+  const env = enterLiveEnv();
+  const capMs = 15_000;
+  try {
+    const ctx = liveContext(
+      env,
+      "Use the bash tool exactly once to run the command 'sleep 600 && echo SLEPT' with the bash tool's timeout parameter set to 5000 (milliseconds). "
+        + "When the tool returns, do not run anything else and do not wait for it: reply with exactly RAFT-BG-STARTED and end your turn.",
+      null,
+    );
+    const session = new ChildProcessRuntimeSession(new OpenCodeDriver({ backgroundWaitCapMs: { shell: capMs, other: capMs } }), ctx);
+    const events: ParsedEvent[] = [];
+    let waitStartedAt: number | null = null;
+    session.on("runtime_event", (event) => {
+      events.push(event);
+      if (event.kind === "runtime_diagnostic" && event.itemType === "background_wait" && waitStartedAt === null) waitStartedAt = Date.now();
+      // What the daemon does at a turn end for this runtime (terminate_on_turn_end).
+      if (event.kind === "turn_end") void session.stop({ reason: "turn_end" });
+    });
+    const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => session.on("close", (info) => resolve(info)));
+    await session.start({ text: ctx.prompt });
+    const tree = new Set<number>(session.pid ? [session.pid] : []);
+    const treeWatcher = setInterval(() => {
+      if (!session.pid || session.closed) return;
+      try {
+        for (const pid of descendantsOf(session.pid, processParents())) tree.add(pid);
+      } catch {
+        // The next poll tries again; assertTreeGone needs only what was seen.
+      }
+    }, 100);
+    let close: Awaited<typeof closed> | null;
+    try {
+      close = await Promise.race([closed, settle(STEP_TIMEOUT_MS * 2).then(() => null)]);
+    } finally {
+      clearInterval(treeWatcher);
+    }
+    assert.ok(close, `no close: ${JSON.stringify(events)}`);
+    assert.ok(waitStartedAt !== null, `no background_wait: ${JSON.stringify(events)}`);
+    const stopped = events.find((event) => event.kind === "runtime_diagnostic" && event.itemType === "background_wait_stopped");
+    assert.ok(stopped, `the cap did not fire: ${JSON.stringify(events)}`);
+    assert.match((stopped as { message: string }).message, /^Stopped background job\(s\) still running after 15 s: .*sleep 600/);
+    assert.ok(Date.now() - waitStartedAt >= capMs, "not before the cap");
+    assert.equal(events.filter((event) => event.kind === "turn_end").length, 1, JSON.stringify(events));
+    assert.equal(events.some((event) => event.kind === "error"), false, JSON.stringify(events));
+    assert.ok(close.code !== 0 || close.signal !== null, `stopped, not a clean exit: ${JSON.stringify(close)}`);
+    await settle(3_000);
+    assertTreeGone({ tree: [...tree] }, "background wait cap");
+    // The job itself (its shell and the sleep, not OpenCode processes) is gone too.
+    const survivors = [...tree].filter((pid) => {
+      try {
+        process.kill(pid, 0);
+      } catch {
+        return false;
+      }
+      return /sleep 600/.test(execFileSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" }));
+    });
+    assert.deepEqual(survivors, [], "the background job survived");
+  } finally {
+    env.restore();
+  }
+}, STEP_TIMEOUT_MS * 3);
+
 liveTest("live 2.x: a cancelled turn (SIGTERM) leaves no OpenCode process behind", async () => {
   const env = enterLiveEnv();
   try {

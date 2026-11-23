@@ -19,6 +19,8 @@ import {
   type ReadinessCode,
   type RuntimeAuthRuntime,
 } from "@botiverse/raft-shared";
+import type { CredentialAccount } from "./credentialSource";
+import type { ProviderQuotaRateLimitType } from "./drivers/types";
 import { logger } from "./logger";
 
 /**
@@ -136,8 +138,8 @@ export function providerLimitCredentialKeyKind(key: ProviderLimitCredentialKey):
 
 /**
  * How long a provider limit whose wait is over is remembered for its attempts:
- * the longest single wait, so the store stays bounded and a limit quiet for
- * that long starts fresh.
+ * the longest single wait without a reported reset, so the store stays
+ * bounded and a limit quiet for that long starts fresh.
  */
 export const PROVIDER_LIMIT_ATTEMPT_MEMORY_MS = 60 * 60_000;
 
@@ -147,6 +149,14 @@ export interface ProviderLimitBackoffRecord {
   untilMs: number;
   providerLimitKind: "quota_exhausted" | "transient_rate_limit";
   resetsAt?: string;
+  /** #proj-runtime:#66: the limiting window the runtime named (e.g. `seven_day`), for the held status. */
+  rateLimitType?: ProviderQuotaRateLimitType;
+  /**
+   * #proj-runtime:#66: the account the limit was hit on, when read. A sign-in
+   * to another account on this Computer ends the wait (Tenny's condition for
+   * waiting until a reported reset). In memory only, never traced.
+   */
+  account?: CredentialAccount;
   /**
    * When the limit was recorded. Model output clears a shared credential's
    * limit only from a turn that started at or after this: output streamed by
@@ -272,6 +282,8 @@ export class ProviderLimitLedger {
           untilMs: current.untilMs,
           providerLimitKind: current.providerLimitKind,
           ...(current.resetsAt ? { resetsAt: current.resetsAt } : {}),
+          ...(current.rateLimitType ? { rateLimitType: current.rateLimitType } : {}),
+          ...(current.account ?? record.account ? { account: current.account ?? record.account } : {}),
           recordedAtMs: record.recordedAtMs,
         }
         : { ...record, attempts };

@@ -210,3 +210,86 @@ test("message resolve command does not pick an ambiguous short id", async () => 
     },
   );
 });
+
+test("message resolve --forwarded asks for that forwarded message and prints it whole under the forward's header", async () => {
+  const { io, stdout, stderr } = memoryIo();
+  const requests: string[] = [];
+  const whole = ["Forwarded message 2:", "From: @alice", "Source: #design", "", `long body ${"z".repeat(3_000)} end`].join("\n");
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (_method: string, path: string): Promise<ApiResponse<unknown>> => {
+        requests.push(path);
+        return {
+          ok: true,
+          status: 200,
+          error: null,
+          data: {
+            message: {
+              message_id: "facefeed-0000-0000-0000-000000000000",
+              channel_type: "channel",
+              channel_name: "proj-dx",
+              timestamp: "2026-05-28T00:00:02.000Z",
+              sender_type: "human",
+              sender_name: "cindyz",
+              content: "Forwarded 2 messages\n\nForwarded content snapshot: (cut)",
+            },
+            forwarded: { number: 2, total: 2, content: whole },
+          },
+        };
+      },
+    }) as any,
+  });
+
+  await messageResolveCommand.handler(ctx, "facefeed", { forwarded: "2" });
+
+  assert.deepEqual(requests, ["/internal/agent-api/messages/facefeed/resolve?forwarded=2"]);
+  assert.deepEqual(stderr, []);
+  const output = stdout.join("");
+  assert.match(output, /\[target=#proj-dx msg=facefeed /);
+  assert.match(output, /@cindyz: Forwarded message 2:\n  │ From: @alice\n  │ Source: #design/);
+  assert.ok(output.includes(`long body ${"z".repeat(3_000)} end`));
+  assert.doesNotMatch(output, /Forwarded content snapshot/);
+});
+
+test("message resolve --forwarded refuses a non-number locally and shows the Server's range", async () => {
+  const { io } = memoryIo();
+  let requested = false;
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (): Promise<ApiResponse<unknown>> => {
+        requested = true;
+        return {
+          ok: false,
+          status: 400,
+          data: null,
+          error: "This message forwards 4 messages; ask for forwarded message 1 to 4.",
+          errorCode: "FORWARDED_OUT_OF_RANGE",
+          suggestedNextAction: "Use --forwarded 1 to 4.",
+        };
+      },
+    }) as any,
+  });
+
+  for (const bad of ["0", "two", "-1"]) {
+    await assert.rejects(
+      async () => { await messageResolveCommand.handler(ctx, "facefeed", { forwarded: bad }); },
+      (err: unknown) => err instanceof CliError && err.code === "INVALID_ARG",
+    );
+  }
+  assert.equal(requested, false);
+
+  await assert.rejects(
+    async () => { await messageResolveCommand.handler(ctx, "facefeed", { forwarded: "5" }); },
+    (err: unknown) => {
+      assert.ok(err instanceof CliError);
+      assert.equal(err.code, "INVALID_ARG");
+      assert.equal(err.message, "This message forwards 4 messages; ask for forwarded message 1 to 4.");
+      assert.equal(err.suggestedNextAction, "Use --forwarded 1 to 4.");
+      return true;
+    },
+  );
+});

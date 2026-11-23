@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useIntl } from "react-intl";
 import { RefreshCw, ScanText } from "lucide-react";
 import { Spinner } from "@botiverse/raft-ui";
@@ -38,7 +38,7 @@ function menuStatus(entry: AgentContextViewStatusEntry | undefined): ContextView
 export function ViewContextMenuGroup({ agentId, onOpen }: { agentId: string; onOpen: () => void }) {
   const { formatMessage } = useIntl();
   const entry = useAgentContextViewStatus(agentId);
-  const openedAt = useRef(Date.now());
+  const [openedAt] = useState(() => Date.now());
   const reported = useRef(false);
   const latest = useRef<ContextViewMenuStatus>("pending");
   latest.current = menuStatus(entry);
@@ -50,12 +50,12 @@ export function ViewContextMenuGroup({ agentId, onOpen }: { agentId: string; onO
   useEffect(() => {
     if (reported.current || latest.current === "pending") return;
     reported.current = true;
-    reportContextViewMenuOpened(latest.current, Date.now() - openedAt.current);
+    reportContextViewMenuOpened(latest.current, Date.now() - openedAt);
   });
 
   useEffect(() => () => {
-    if (!reported.current) reportContextViewMenuOpened("pending", Date.now() - openedAt.current);
-  }, []);
+    if (!reported.current) reportContextViewMenuOpened("pending", Date.now() - openedAt);
+  }, [openedAt]);
 
   const handleOpen = useCallback(() => {
     reportContextViewClicked();

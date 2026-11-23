@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -11,6 +11,8 @@ import { CliExit } from "./output";
 
 const SERVER_ID = "11111111-1111-4111-8111-111111111111";
 const ATTACH_TOKEN = "dvat_cliAttachToken0123456789";
+/** Every device authorize body the fake servers received (cleared per test that reads it). */
+const authorizeBodies: Array<Record<string, unknown>> = [];
 
 /**
  * The device-code half of a one-time approval: authorize records the grant's
@@ -24,10 +26,12 @@ async function answerDeviceApproval(
 ): Promise<boolean> {
   if (req.method === "POST" && req.url === "/api/auth/device/authorize") {
     const body = await readBody(req);
+    authorizeBodies.push(body);
     const grant = body.grant as { machineName?: unknown } | undefined;
     seenGrantNames.push(String(grant?.machineName ?? ""));
     res.writeHead(201, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ deviceCode: "dvc_cli", userCode: "ABCD-1234", verificationUri: "https://app.raft.build/login/device", expiresIn: 30, interval: 1 }));
+    // A current server links a --pair request to its window.
+    res.end(JSON.stringify({ ...(body.pairingId !== undefined ? { paired: true } : {}), deviceCode: "dvc_cli", userCode: "ABCD-1234", verificationUri: "https://app.raft.build/login/device", expiresIn: 30, interval: 1 }));
     return true;
   }
   if (req.method === "POST" && req.url === "/api/auth/device/token") {
@@ -320,5 +324,64 @@ test("attach --attach-token-stdin without --server-id fails before reading anyth
     assert.ok(threw instanceof CliExit);
     assert.match(cap.text(), /--attach-token-stdin needs --server-id and --server-url/);
     assert.doesNotMatch(cap.text(), /dvat_/);
+  });
+});
+
+async function filesContaining(dir: string, needle: string): Promise<string[]> {
+  const hits: string[] = [];
+  for (const entry of await readdir(dir, { withFileTypes: true, recursive: true })) {
+    if (!entry.isFile()) continue;
+    const path = join(entry.parentPath, entry.name);
+    if ((await readFile(path, "utf8")).includes(needle)) hits.push(path);
+  }
+  return hits;
+}
+
+test("attach --pair: authorize carries pairingId + serverSlug; paired puts the window first, keeps link and code, and the id is never printed or written", async () => {
+  const pairingId = "pAiR_0123456789abcdefghijklmnopqrstuvwxyzAB";
+  await withHome(async (home) => {
+    await withAttachServer(async (baseUrl) => {
+      authorizeBodies.length = 0;
+      const cap = captureOut();
+      const opened: string[] = [];
+      try {
+        await runAttach({ serverSlug: "/alpha", serverUrl: baseUrl, start: false, pairingId, openUrl: (url) => opened.push(url) });
+      } finally {
+        cap.restore();
+      }
+      assert.equal(authorizeBodies.length, 1);
+      assert.equal(authorizeBodies[0]?.pairingId, pairingId);
+      assert.equal(authorizeBodies[0]?.serverSlug, "alpha");
+      const out = cap.text();
+      assert.match(
+        out,
+        /Approve this machine in the Raft window you copied this command from\.\nOr enter this code at https:\/\/app\.raft\.build\/login\/device: ABCD-1234\n/,
+      );
+      assert.match(out, /If the page asks which server, choose \/alpha\.\n/);
+      assert.match(out, /Keep this command running/);
+      assert.doesNotMatch(out, /Then enter this code on the page/);
+      // The window is where to approve: the device page is not opened on its own.
+      assert.deepEqual(opened, []);
+      assert.ok(!out.includes(pairingId));
+      assert.deepEqual(await filesContaining(home, pairingId), []);
+    });
+  });
+});
+
+test("attach without --pair: authorize carries neither field and the prompt is unchanged", async () => {
+  await withHome(async () => {
+    await withAttachServer(async (baseUrl) => {
+      authorizeBodies.length = 0;
+      const cap = captureOut();
+      try {
+        await runAttach({ serverSlug: "/alpha", serverUrl: baseUrl, start: false, openUrl: () => {} });
+      } finally {
+        cap.restore();
+      }
+      assert.equal("pairingId" in authorizeBodies[0]!, false);
+      assert.equal("serverSlug" in authorizeBodies[0]!, false);
+      assert.match(cap.text(), /Then enter this code on the page: ABCD-1234\n/);
+      assert.doesNotMatch(cap.text(), /Raft window you copied/);
+    });
   });
 });

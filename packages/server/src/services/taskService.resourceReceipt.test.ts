@@ -101,7 +101,7 @@ test("resource-creating tasks cannot complete until an atomic owner-anchored rec
     runbook: "runbooks/staging-resource.md",
     tracking: `task #${marked.taskNumber}`,
   };
-  assert.equal(
+  assert.deepEqual(
     await taskService.recordTaskResourceReceipt({
       taskId: marked.id,
       receipt: { ...receipt, runbook: "   " },
@@ -112,7 +112,7 @@ test("resource-creating tasks cannot complete until an atomic owner-anchored rec
       teardownOwnerTargetChannelId: channel.id,
       expiryFollowups: taskResourceExpiryFollowups,
     }),
-    "resource receipt field runbook must be nonblank",
+    { refused: "invalid", code: "task_resource_receipt_invalid", reason: "resource receipt field runbook must be nonblank" },
   );
   assert.equal((await getDb().select().from(reminders)).length, 0, "invalid receipt must create no reminder");
 
@@ -184,7 +184,7 @@ test("resource-creating tasks cannot complete until an atomic owner-anchored rec
   assert.equal((retry as taskService.TaskResourceReceiptResult).expiryFollowup.id, first.expiryFollowup.id);
   assert.equal((await getDb().select().from(reminders)).length, 1, "retry must not duplicate reminder");
 
-  assert.equal(
+  assert.deepEqual(
     await taskService.recordTaskResourceReceipt({
       taskId: marked.id,
       receipt: { ...receipt, purpose: "different purpose" },
@@ -195,7 +195,7 @@ test("resource-creating tasks cannot complete until an atomic owner-anchored rec
       teardownOwnerTargetChannelId: channel.id,
       expiryFollowups: taskResourceExpiryFollowups,
     }),
-    "resource receipt is already recorded",
+    { refused: "conflict", code: "task_resource_receipt_already_recorded", reason: "resource receipt is already recorded" },
   );
 
   assert.equal(unwrap(await taskService.updateTaskStatus(marked.id, "done", user.id, "user")).status, "done");

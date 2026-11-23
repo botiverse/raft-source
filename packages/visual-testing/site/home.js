@@ -22,6 +22,7 @@
 
   var tree = document.getElementById("vt-tree");
   var searchInput = document.getElementById("vt-search");
+  var sortSelect = document.getElementById("vt-sort");
   var overview = document.getElementById("vt-overview");
   var stageWrap = document.getElementById("vt-stage-wrap");
   var stage = document.getElementById("vt-stage");
@@ -378,10 +379,18 @@
     if (p) row.appendChild(el("span", "sb-pct", p));
     row.appendChild(el("span", "sb-dot " + statusKind(entry.status)));
   }
+  // Similarity and status belong to the selected pair, so a pair change
+  // re-sorts the tree when it is sorted by them (and re-runs the search,
+  // which also matches status words).
   function updateTreeRows() {
+    if (treeSort !== "name") {
+      buildTree();
+      return;
+    }
     Object.keys(rowById).forEach(function (id) {
       decorateTreeRow(rowById[id], caseById[id]);
     });
+    applyTreeFilter();
   }
 
   function makeLeafRow(item, leafName) {
@@ -465,8 +474,52 @@
     return nodes;
   }
 
-  groupKeys.forEach(function (key) {
-    var group = el("div", "sb-group");
+  // ----- tree sort -----
+  // "name": surface groups with Storybook-style folders (the default).
+  // "similarity": flat list per surface, lowest similarity first.
+  // "status": flat list per surface, different → missing → pass, then
+  // lowest similarity. Cases without a similarity (missing) sort first.
+  // The overview grid and the matrix follow the same order (orderedCases).
+  var SORT_STORE_KEY = "vt-tree-sort";
+  var SORTS = ["name", "similarity", "status"];
+  var treeSort = "name";
+  try {
+    var storedSort = localStorage.getItem(SORT_STORE_KEY);
+    if (SORTS.indexOf(storedSort) !== -1) treeSort = storedSort;
+  } catch (error) { /* storage disabled */ }
+  var STATUS_RANK = { different: 0, missing: 1, other: 2, pass: 3 };
+  function similarityOf(item) {
+    var value = (casePairEntry(item) || {}).similarity;
+    return typeof value === "number" ? value : -1;
+  }
+  function statusRankOf(item) {
+    return STATUS_RANK[statusKind((casePairEntry(item) || {}).status)];
+  }
+  function compareCases(a, b) {
+    if (treeSort === "status") {
+      var byStatus = statusRankOf(a) - statusRankOf(b);
+      if (byStatus) return byStatus;
+    }
+    return (similarityOf(a) - similarityOf(b)) || caseLabel(a).localeCompare(caseLabel(b));
+  }
+
+  function buildTree() {
+    var closedSurfaces = {};
+    Array.prototype.forEach.call(tree.querySelectorAll(".sb-group.closed"), function (group) {
+      closedSurfaces[group.dataset.surface] = true;
+    });
+    Object.keys(rowById).forEach(function (id) { delete rowById[id]; });
+    orderedCases.length = 0;
+    Array.prototype.slice.call(tree.querySelectorAll(".sb-group")).forEach(function (group) {
+      tree.removeChild(group);
+    });
+    groupKeys.forEach(function (key) { buildGroup(key, closedSurfaces[key]); });
+    if (selectedId && rowById[selectedId]) rowById[selectedId].classList.add("active");
+    applyTreeFilter();
+  }
+
+  function buildGroup(key, closed) {
+    var group = el("div", "sb-group" + (closed ? " closed" : ""));
     group.dataset.surface = key;
     var head = el("button", "sb-group-head");
     head.type = "button";
@@ -476,6 +529,13 @@
     head.appendChild(el("span", "count", String(groups[key].length)));
     head.addEventListener("click", function () { group.classList.toggle("closed"); });
     group.appendChild(head);
+    if (treeSort !== "name") {
+      groups[key].slice().sort(compareCases).forEach(function (item) {
+        group.appendChild(makeLeafRow(item, caseLabel(item)));
+      });
+      tree.appendChild(group);
+      return;
+    }
     groups[key].sort(function (a, b) { return caseLabel(a).localeCompare(caseLabel(b)); });
     foldGroupItems(groups[key]).forEach(function (node) {
       if (node.type === "leaf") {
@@ -496,14 +556,20 @@
       group.appendChild(folder);
     });
     tree.appendChild(group);
-  });
+  }
 
   // ----- search filter -----
+  // Every word must match somewhere in the case id, title, category, surface
+  // or its status for the selected pair, so "settings dark" or
+  // "channel different" narrow the tree (and the matrix) together.
   function caseMatchesQuery(item, query) {
     if (!query) return true;
-    return (item.id + " " + item.title + " " + item.category + " " + item.surface).toLowerCase().indexOf(query) !== -1;
+    var entry = casePairEntry(item) || {};
+    var haystack = [item.id, item.title, item.category, item.surface, entry.status, statusKind(entry.status)]
+      .join(" ").toLowerCase();
+    return query.split(/\s+/).every(function (word) { return haystack.indexOf(word) !== -1; });
   }
-  searchInput.addEventListener("input", function () {
+  function applyTreeFilter() {
     var query = searchInput.value.trim().toLowerCase();
     Array.prototype.forEach.call(tree.querySelectorAll(".sb-group"), function (group) {
       var groupVisible = 0;
@@ -524,7 +590,20 @@
       if (query) group.classList.remove("closed");
     });
     applyMatrixFilter();
-  });
+  }
+  searchInput.addEventListener("input", applyTreeFilter);
+
+  if (sortSelect) {
+    sortSelect.value = treeSort;
+    sortSelect.addEventListener("change", function () {
+      treeSort = SORTS.indexOf(sortSelect.value) !== -1 ? sortSelect.value : "name";
+      try { localStorage.setItem(SORT_STORE_KEY, treeSort); } catch (error) { /* storage disabled */ }
+      buildTree();
+      if (!overview.hidden) renderOverviewBody();
+    });
+  }
+  groupKeys.forEach(function (key) { buildGroup(key, false); });
+
   document.addEventListener("keydown", function (event) {
     if (event.key === "/" && document.activeElement !== searchInput) {
       event.preventDefault();

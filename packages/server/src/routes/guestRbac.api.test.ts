@@ -15,7 +15,7 @@ import { addAgent, addHuman, archiveChannel, createChannel, findOrCreateDM, find
 import { createMessage } from "../services/messageService";
 import { createOAuthClient } from "../services/oauthService";
 import { ServerMemberRoleTransitionError, createServer, removeMemberInTransaction, transitionMemberRole } from "../services/serverService";
-import { seedBoundGuest } from "../test/guestFixture";
+import { seedBoundGuest, seedStrayGuestChannelRow } from "../test/guestFixture";
 import { enableExternalChannelsFlag, sha256 } from "../test/externalInviteFixture";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import { __setStorageForTests, resetStorageForTests } from "../services/storageService";
@@ -118,7 +118,7 @@ test("Guest channel access is its one bound channel, membership-aware, and denie
   const hiddenPublicChannel = await createChannel(server.id, "guest-hidden-public", undefined, "channel");
   // A private channel the guest is a member of, but not its bound channel.
   const privateChannel = await createChannel(server.id, "guest-private", undefined, "private");
-  await addHuman(privateChannel.id, guest.id);
+  await seedStrayGuestChannelRow({ channelId: privateChannel.id, userId: guest.id });
   const ownerToken = await login(app.baseUrl, owner.email);
   const guestToken = await login(app.baseUrl, guest.email);
   const peerToken = await login(app.baseUrl, peer.email);
@@ -134,6 +134,14 @@ test("Guest channel access is its one bound channel, membership-aware, and denie
   ]) {
     const hiddenSurface = await fetch(`${app.baseUrl}${serverWidePath}`, { headers: guestHeaders });
     assert.equal(hiddenSurface.status, 403, `${serverWidePath} must stay hidden from Guests`);
+    // The Guest gate (guestHiddenServerSurfaces) and the members read answer one refusal.
+    if (serverWidePath.endsWith("/settings") || serverWidePath.endsWith("/members")) {
+      assert.deepEqual(await hiddenSurface.json(), {
+        error: "Guests can't access server management",
+        code: "server_management_guest_forbidden",
+        errorCode: "server_management_guest_forbidden",
+      }, serverWidePath);
+    }
   }
   // The visitor-visibility marker (guestVisible) grants Guests nothing
   // (#wg-rbac:#15); a channel admin may no longer set it (#wg-rbac:#51).
@@ -214,7 +222,9 @@ test("Guest channel access is its one bound channel, membership-aware, and denie
   assert.equal(visibleAgentSummary.status, 200);
   const summary = await visibleAgentSummary.json() as Record<string, unknown>;
   assert.equal(summary.profileProjection, "channel_summary");
-  assert.equal(summary.description, "Objective channel-visible role description");
+  // An agent's description stays with its server's non-guest members
+  // (descriptionVisibility, cindyz 2026-11-17): the key stays, null.
+  assert.equal(summary.description, null);
   for (const privateKey of ["envVars", "runtimeConfig", "runtime", "model", "machineId", "creatorId", "creatorType"]) {
     assert.equal(privateKey in summary, false, `Guest Agent summary must omit ${privateKey}`);
   }
@@ -343,7 +353,9 @@ test("Guest channel access is its one bound channel, membership-aware, and denie
       headers: guestHeaders,
       body: JSON.stringify({ channelId: other.id, content: "must not send" }),
     });
-    assert.equal(send.status, 403, `${other.name}: no post`);
+    // Refused the way the read is (this fixture's Guest never read these: 404).
+    assert.equal(send.status, read.status, `${other.name}: no post`);
+    assert.equal(send.status, 404, `${other.name}: no post`);
     const taskCreate = await fetch(`${app.baseUrl}/api/tasks/channel/${other.id}`, {
       method: "POST",
       headers: guestHeaders,
@@ -376,7 +388,9 @@ test("Guest channel access is its one bound channel, membership-aware, and denie
     headers: guestHeaders,
     body: JSON.stringify({ channelId: existing.id, content: "must not send" }),
   });
-  assert.equal(existingDmSend.status, 403, "an existing Guest DM is not writable");
+  // Refused the way the read is (no read cursor in this fixture: 404).
+  assert.equal(existingDmSend.status, existingDmRead.status, "an existing Guest DM is not writable");
+  assert.ok([403, 404].includes(existingDmSend.status));
 
   // Removed from its channel: access ends.
   await db.delete(channelHumans).where(and(eq(channelHumans.channelId, guestChannel.id), eq(channelHumans.userId, guest.id)));
@@ -425,12 +439,12 @@ test("a Guest's action cards are decided by its own permissions, in its own chan
   assert.equal(rows.some((row) => row.id === card.messageId), true, "Guest should read the card summary carrier");
 
   // In its own channel the Guest passes the channel gate, and is then judged by
-  // the card type's authority row (channel:create takes createChannels).
+  // the card type's authority row (a public channel:create takes createPublicChannels).
   await assert.rejects(
     assertActionCardWritableByUser({
       messageId: card.messageId, channelId: carrier.id, serverId: asServerId(server.id), userId: guest.id, executor: db,
     }),
-    (error: unknown) => (error as { code?: string }).code === "MISSING_CREATE_CHANNELS_CAPABILITY",
+    (error: unknown) => (error as { code?: string }).code === "MISSING_CREATE_PUBLIC_CHANNELS_CAPABILITY",
     "refused by its own permission, not by the channel",
   );
   await assert.rejects(
@@ -441,14 +455,14 @@ test("a Guest's action cards are decided by its own permissions, in its own chan
     "never in another channel",
   );
 
-  // The card's action takes the Guest's own permission, which it lacks here (createChannels).
+  // The card's action takes the Guest's own permission, which it lacks here (createPublicChannels).
   const execute = await fetch(`${app.baseUrl}/api/actions/${card.messageId}/execute`, {
     method: "POST",
     headers,
     body: JSON.stringify({ expectedState: "prepared" }),
   });
   assert.equal(execute.status, 403, await execute.clone().text());
-  assert.equal((await execute.json() as { errorCode?: string }).errorCode, "MISSING_CREATE_CHANNELS_CAPABILITY");
+  assert.equal((await execute.json() as { errorCode?: string }).errorCode, "MISSING_CREATE_PUBLIC_CHANNELS_CAPABILITY");
   const mark = await fetch(`${app.baseUrl}/api/actions/${card.messageId}/mark-executed`, {
     method: "POST",
     headers,
@@ -529,7 +543,10 @@ test("Guest access ends when its channel is archived, and deletion cloaks every 
       headers: archivedHeaders,
       body: JSON.stringify({ channelId: archivedChannel.id, content: "must stay read-only" }),
     });
-    assert.equal(archivedPost.status, 403);
+    // Refused the way the read is: 403 for a Guest with a read cursor (a real
+    // join leaves one), 404 for this fixture's Guest, which never read it.
+    assert.equal(archivedPost.status, archivedRead.status);
+    assert.ok([403, 404].includes(archivedPost.status));
 
     const attachmentBeforeDelete = await fetch(`${app.baseUrl}/api/attachments/${attachment.id}/url`, { headers });
     assert.equal(attachmentBeforeDelete.status, 200, "fixture attachment must be readable before deletion");
@@ -563,7 +580,7 @@ test("channel detail and rosters apply guest visibility", async ({ app }) => {
   // Another channel, guest-visible and with the guest in it: still not its channel.
   const channel = await createChannel(server.id, "hidden-metadata", undefined, "channel");
   await getDb().update(channels).set({ guestVisible: true }).where(eq(channels.id, channel.id));
-  await addHuman(channel.id, guest.id);
+  await seedStrayGuestChannelRow({ channelId: channel.id, userId: guest.id });
   const headers = authHeaders(await login(app.baseUrl, guest.email), server.id);
   for (const [target, visible] of [[channel, false], [own, true]] as const) {
     for (const suffix of ["", "/members", "/agents"]) {
@@ -656,7 +673,7 @@ test("Guests cannot read server-wide App catalogues; members still can (B18)", a
     assert.equal(memberRead.status, 200, `${path} member control: ${await memberRead.text()}`);
     const guestRead = await fetch(`${app.baseUrl}${path}`, { headers: guestHeaders });
     assert.equal(guestRead.status, 403, `${path} must be hidden from Guests`);
-    assert.deepEqual(await guestRead.json(), { error: "Guests can't access server management" });
+    assert.deepEqual(await guestRead.json(), { error: "Guests can't access server management", code: "server_management_guest_forbidden", errorCode: "server_management_guest_forbidden" });
   }
 });
 
@@ -1105,4 +1122,62 @@ test("every action card type is gated by its authority row, on execute and mark-
       assert.deepEqual({ channels: await channelCount(), agents: await agentCount() }, before, `${type}: nothing was created`);
     }
   }
+});
+
+test("no member-add path puts a Guest in a channel other than its bound one; its bound channel still takes it (#wg-rbac:#15)", async ({ app }) => {
+  const db = getDb();
+  const suffix = randomUUID().slice(0, 8);
+  const owner = await seedUser(`guest-add-other-owner-${suffix}@slock.test`, `guest-add-other-owner-${suffix}`);
+  const guest = await seedUser(`guest-add-other-guest-${suffix}@slock.test`, `guest-add-other-guest-${suffix}`);
+  const server = await createServer("Guest add elsewhere", `guest-add-other-${suffix}`, owner.id);
+  const home = await createChannel(server.id, `guest-add-home-${suffix}`, undefined, "private");
+  await seedBoundGuest({ serverId: server.id, userId: guest.id, channelId: home.id, member: false });
+  const publicChannel = await createChannel(server.id, `guest-add-public-${suffix}`, undefined, "channel");
+  const privateChannel = await createChannel(server.id, `guest-add-private-${suffix}`, undefined, "private");
+  for (const channel of [publicChannel, privateChannel]) await addHuman(channel.id, owner.id);
+  const headers = authHeaders(await login(app.baseUrl, owner.email), server.id);
+  const refusal = {
+    error: "Guests can only be in the channel they were invited to: make them a member of the server first to add them here.",
+    code: "guest_other_channel",
+  };
+  const rowsIn = async (channelId: string) => (await db.select({ userId: channelHumans.userId }).from(channelHumans)
+    .where(and(eq(channelHumans.channelId, channelId), eq(channelHumans.userId, guest.id)))).length;
+  const noticesIn = async (channelId: string) => (await db.select({ id: messages.id }).from(messages)
+    .where(and(eq(messages.channelId, channelId), sql`${messages.content} LIKE ${`%@${guest.name} was added%`}`))).length;
+
+  for (const channel of [publicChannel, privateChannel]) {
+    const single = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members`, {
+      method: "POST", headers, body: JSON.stringify({ userId: guest.id }),
+    });
+    assert.equal(single.status, 403, await single.clone().text());
+    assert.deepEqual(await single.json(), { ...refusal, errorCode: refusal.code });
+    const batch = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members/batch`, {
+      method: "POST", headers, body: JSON.stringify({ userIds: [guest.id], agentIds: [] }),
+    });
+    assert.equal(batch.status, 403, await batch.clone().text());
+    assert.deepEqual(await batch.json(), { ...refusal, errorCode: refusal.code });
+    assert.equal(await rowsIn(channel.id), 0, `#${channel.name}: the Guest gets no channel_humans row`);
+    assert.equal(await noticesIn(channel.id), 0, `#${channel.name}: no "was added" notice`);
+  }
+
+  // The agent path (`channel add-member`): an agent in the channel holding addChannelMembers.
+  const agent = await createAgent(server.id, `guest-add-other-bot-${suffix}`, { runtime: "codex" });
+  await addAgent(publicChannel.id, agent.id);
+  const { apiKey } = await mintAgentCredential({ agentId: agent.id, scopes: ["channels", "read"], name: "guest-add-other", issuedVia: "computer", createdByUserId: null });
+  const agentAdd = await fetch(`${app.baseUrl}/internal/agent-api/channels/${publicChannel.id}/members`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ userId: guest.id }),
+  });
+  assert.equal(agentAdd.status, 403, await agentAdd.clone().text());
+  const agentBody = await agentAdd.json() as { error?: string; code?: string };
+  assert.deepEqual({ error: agentBody.error, code: agentBody.code }, refusal);
+  assert.equal(await rowsIn(publicChannel.id), 0, "the agent path adds no row either");
+  assert.equal(await noticesIn(publicChannel.id), 0);
+
+  // The service itself refuses, for every caller.
+  await assert.rejects(addHuman(publicChannel.id, guest.id), { message: refusal.error });
+  // The bound channel still takes the Guest (what external invite acceptance does after binding it).
+  assert.equal(await addHuman(home.id, guest.id), true);
+  assert.equal(await rowsIn(home.id), 1);
 });

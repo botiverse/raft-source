@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,6 +34,9 @@ const SERVER_B = "22222222-2222-4222-8222-222222222222";
 const MACHINE_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const MACHINE_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const FP_A = "1234567890abcdef";
+/** A corrupted session's content, which doctor must never print. Not "abc": that also occurs in fixture fingerprints
+ * (FP_A) and random temp paths, and the host-wide checks (Raft home conflict, machine key holders) can print those. */
+const CORRUPT_SESSION_MARKER = "corrupt-session-user-q7zx";
 
 async function withHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
   const home = await mkdtemp(join(tmpdir(), "raft-computer-doctor-"));
@@ -343,7 +346,7 @@ test("doctor: corrupted user-session.json with nothing attached fails with attac
   await withHome(async (home) => {
     const p = userSessionPath(home);
     await mkdir(join(p, ".."), { recursive: true });
-    await writeFile(p, '{"kind":"user-session","userId":"abc","acce');
+    await writeFile(p, `{"kind":"user-session","userId":"${CORRUPT_SESSION_MARKER}","acce`);
 
     const checks = await runDoctorChecks(home);
     const userSession = checks.find((c) => c.name === "user session");
@@ -359,7 +362,7 @@ test("doctor: corrupted user-session.json with nothing attached fails with attac
       cap.restore();
       assert.match(out, /invalid user session file/);
       assert.match(out, /raft-computer attach/);
-      assert.ok(!out.includes("abc"), "doctor must not echo corrupted session content");
+      assert.ok(!out.includes(CORRUPT_SESSION_MARKER), "doctor must not echo corrupted session content");
     } finally {
       cap.restore();
     }
@@ -371,7 +374,7 @@ for (const [caseName, writeSession] of [
   ["corrupted user session", async (home: string) => {
     const p = userSessionPath(home);
     await mkdir(join(p, ".."), { recursive: true });
-    await writeFile(p, '{"kind":"user-session","userId":"abc","acce');
+    await writeFile(p, `{"kind":"user-session","userId":"${CORRUPT_SESSION_MARKER}","acce`);
   }],
 ] as const) {
   test(`doctor: attached machine with ${caseName} reports the session as not needed and skips session-only checks with one note`, async () => {
@@ -1191,6 +1194,33 @@ test("doctor: a server tying the key to another machine is red; an older server 
   });
 });
 
+test("doctor: a missing machineId is backfilled from the self answer, so the machineId self-check runs", async () => {
+  await withHome(async (home) => {
+    await writeAttach(home, SERVER_A, SECRET_KEY, { serverSlug: "alpha", serverUrl: "https://api.example.test" });
+    const answer = (computerId: string, machineId: string) => async () => ({
+      status: "success" as const,
+      computer: { computerId, computerName: "laptop", serverId: SERVER_A, machineId, machineName: "laptop", agentCount: 1 },
+    });
+    // Another computer's answer is not trusted: nothing is written.
+    await runDoctorChecks(home, { readComputerSelf: answer("cm-other", MACHINE_A) });
+    let saved = JSON.parse(await readFile(serverAttachmentPath(home, SERVER_A), "utf8")) as Record<string, unknown>;
+    assert.equal(saved.machineId, undefined);
+
+    const first = await runDoctorChecks(home, { readComputerSelf: answer(`cm-${SERVER_A}`, MACHINE_A) });
+    assert.equal(first.find((c) => c.name === "computer /alpha")?.ok, true);
+    saved = JSON.parse(await readFile(serverAttachmentPath(home, SERVER_A), "utf8")) as Record<string, unknown>;
+    assert.equal(saved.machineId, MACHINE_A);
+    assert.equal(saved.apiKey, SECRET_KEY);
+    assert.equal(saved.serverMachineId, `cm-${SERVER_A}`);
+
+    // Now that the file names its machine, the self-check compares against it.
+    const second = await runDoctorChecks(home, { readComputerSelf: answer(`cm-${SERVER_A}`, MACHINE_B) });
+    const self = second.find((c) => c.name === "computer /alpha");
+    assert.equal(self?.ok, false);
+    assert.match(self?.detail ?? "", new RegExp(`local attachment says ${MACHINE_A}`));
+  });
+});
+
 test("doctor: the regret check takes this Computer's own row from its key", async () => {
   await withHome(async (home) => {
     await writeUserSessionForServer(home, "tok", "https://api.example.test");
@@ -1220,7 +1250,7 @@ test("doctor --json: one JSON line with redacted details; it ran, so the outcome
   await withHome(async (home) => {
     const p = userSessionPath(home);
     await mkdir(join(p, ".."), { recursive: true });
-    await writeFile(p, '{"kind":"user-session","userId":"abc","acce');
+    await writeFile(p, `{"kind":"user-session","userId":"${CORRUPT_SESSION_MARKER}","acce`);
     const cap = captureOut();
     try {
       await runDoctorJson({});
@@ -1234,6 +1264,6 @@ test("doctor --json: one JSON line with redacted details; it ran, so the outcome
     assert.ok(!Number.isNaN(Date.parse(report.ranAt)));
     const userSession = report.checks.find((c) => c.name === "user session");
     assert.equal(userSession?.ok, false);
-    assert.ok(!cap.text().includes("abc"), "never echoes the corrupted session");
+    assert.ok(!cap.text().includes(CORRUPT_SESSION_MARKER), "never echoes the corrupted session");
   });
 });

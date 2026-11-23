@@ -1,4 +1,4 @@
-import { AppSetupFields, AppSetupPanel, AppSetupRequirement } from "../../components/integrations/AppSetup";
+import { AppSetupFields, AppSetupPanel } from "../../components/integrations/AppSetup";
 import { AppWhenToUseField } from "../../components/settings/AppWhenToUseField";
 import { ConnectedAppShareLinks } from "../../components/settings/ConnectedAppShareLinks";
 import {
@@ -17,7 +17,7 @@ import {
   TextLink,
 } from "@botiverse/raft-ui";
 import Tooltip from "../../components/ui/Tooltip";
-import { useCallback, useState, useEffect, useEffectEvent, useId, useMemo, useRef } from "react";
+import { useCallback, useState, useEffect, useEffectEvent, useMemo, useRef } from "react";
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import { useLocation } from "react-router-dom";
 import { notifyAppPermissionUpdatesChanged } from "../../components/layout/useAppPermissionUpdates";
@@ -28,6 +28,7 @@ import {
   Trash2,
   Upload,
   Blocks,
+  Pencil,
   RefreshCw,
   AppWindow,
 } from "lucide-react";
@@ -52,7 +53,6 @@ import { FormDialog } from "../../components/ui/FormDialog";
 import { DialogCommit } from "../../components/ui/NarrowDialog";
 import api from "../../api/client";
 import { appPermissionsChangedCurrentSet, expectedAppPermissionsBody, isAppPermissionsChangedError, isExpectedPermissionsRequiredError } from "../../lib/appPermissionExpectation";
-import { AppPermissionSetList } from "../../components/integrations/AppPermissionSetList";
 import { useIntl } from "react-intl";
 import PanelHeader from "../../components/ui/PanelHeader";
 import SectionEyebrow from "../../components/ui/SectionEyebrow";
@@ -73,9 +73,8 @@ import {
 } from "../../lib/appPromptText";
 import type { AppPromptTextFields } from "../../lib/appPromptText";
 import { readMarketplaceRecords } from "../../lib/marketplaceRecords";
-import { AppPromptTextBlock } from "../../components/integrations/AppPromptText";
 import { LinkPreviewAppChoice, LinkPreviewConsentsRow } from "../../components/settings/LinkPreviewConsents";
-import { DeveloperPromptTextPanel, MarketplacePromptTextReview } from "../../components/settings/AppPromptTextPanels";
+import { DeveloperPromptTextPanel } from "../../components/settings/AppPromptTextPanels";
 import type { ConnectedAppsTab } from "../../components/settings/SettingsSegmentedControls";
 import {
   ConnectedAppsErrorBanner,
@@ -85,9 +84,7 @@ import {
   getConnectedAppsErrorSurface,
 } from "../../components/settings/connectedAppsErrorSurface";
 import { isSecondFactorStepUpCancelled, withSecondFactorStepUp } from "../../components/settings/secondFactorStepUp";
-import { InstalledConnectedAppItem } from "../../components/settings/InstalledConnectedAppItem";
 import {
-  ConnectedAppBotInstallOption,
   ConnectedAppBotLinkNotInstalledNotice,
   ConnectedAppBotPendingBanner,
   ConnectedAppBotRemoveDialog,
@@ -96,25 +93,21 @@ import {
 } from "../../components/settings/ConnectedAppBot";
 import type { AppBotOffer } from "../../components/settings/ConnectedAppBot";
 import { useProfileStore } from "../../store/profileStore";
-import { RegisteredConnectedAppItem } from "../../components/settings/RegisteredConnectedAppItem";
 import { McpAppEditor } from "../../components/settings/mcpApps/McpAppEditor";
 import { RegisterAppMenu } from "../../components/settings/mcpApps/RegisterAppMenu";
 import { mcpAppErrorMessage, profilePayload } from "../../components/settings/mcpApps/mcpAppApi";
 import type { McpAppView } from "../../components/settings/mcpApps/mcpAppApi";
 import { AppsToolbar } from "../../components/apps/AppsToolbar";
-import { AppsNoMatchState, AppsSectionHeading } from "../../components/apps/AppsListParts";
-import { MarketplaceListingsTab } from "../../components/apps/MarketplaceListingsTab";
+import { AppsNoMatchState } from "../../components/apps/AppsListParts";
 import { AppsRecommendedSection } from "../../components/apps/AppsRecommendedSection";
 import { appRecommendations } from "../../components/apps/appsRecommendations";
-import { DEFAULT_APPS_FILTERS, hasActiveAppsFilters, matchesAppsType } from "../../components/apps/appsFilters";
+import { DEFAULT_APPS_FILTERS, hasActiveAppsFilters } from "../../components/apps/appsFilters";
 import { useDebouncedValue } from "../../hooks/useDebouncedValue";
 import type { AppsFilters } from "../../components/apps/appsFilters";
 import EmptyState from "../../components/ui/EmptyState";
-import { ListRowSkeletonList } from "../../components/ui/Skeleton";
 import { PagePullToRefreshIndicator } from "../../components/ui/PagePullToRefreshIndicator";
 import { usePagePullToRefresh } from "../../hooks/usePagePullToRefresh";
 import {
-  AppNotificationRequestSummary,
   DeveloperAppNotifications,
   DeveloperAppPermissions,
   InstalledAppNotifications,
@@ -125,7 +118,7 @@ import type {
 } from "../../components/settings/AppNotificationsControls";
 import { renderSelectItems } from "../settings/shared/renderSelectItems";
 import type { IntegrationOverviewItem, MarketplaceOAuthClientRecord, OAuthClientRecord } from "./connected-apps/oauthClientRecords";
-import type { ConnectedAppCategory, ConnectedAppListing, ConnectedAppsViewMode, InstalledConnectedApp, ServerRegisteredApp } from "./connected-apps/connectedAppTypes";
+import type { ConnectedAppCategory, ConnectedAppListing, InstalledConnectedApp, ServerRegisteredApp } from "./connected-apps/connectedAppTypes";
 import {
   canDeleteSourceOwnedConnectedApp,
   canEditSourceOwnedConnectedApp,
@@ -133,8 +126,7 @@ import {
   connectedAppDistributionStatus,
   sourceOwnedConnectedAppStatusHint,
 } from "./connected-apps/connectedAppStatus";
-import { CONNECTED_APPS_VIEW_MODE_STORAGE_KEY, connectedAppsCollectionClassName, getInitialConnectedAppsViewMode } from "./connected-apps/connectedAppsViewMode";
-import { CONNECTED_APP_CATEGORY_LABEL_ID, CONNECTED_APP_PUBLISH_CATEGORY_OPTIONS, matchesConnectedAppFilter } from "./connected-apps/connectedAppCatalog";
+import { CONNECTED_APP_CATEGORY_LABEL_ID, CONNECTED_APP_PUBLISH_CATEGORY_OPTIONS } from "./connected-apps/connectedAppCatalog";
 import { getDomainFromUrl } from "./connected-apps/getDomainFromUrl";
 import {
   isMarketplaceTabClient,
@@ -144,17 +136,14 @@ import {
   renderMarketplaceText,
 } from "./connected-apps/connectedAppMapping";
 import { emptyAppNotificationState } from "./connected-apps/emptyAppNotificationState";
-import { ConnectedAppsViewToggle } from "./connected-apps/ConnectedAppsViewToggle";
 import { AppNotificationsLabel } from "./connected-apps/AppNotificationsLabel";
 import { ConnectedAppEditorSection } from "./connected-apps/ConnectedAppEditorSection";
 import { ConnectedAppLinkPreviewReadOnlyBanner } from "./connected-apps/ConnectedAppLinkPreviewReadOnlyBanner";
 import { ConnectedAppEditorActionRow } from "./connected-apps/ConnectedAppEditorActionRow";
 import { ConnectedAppCardButtonsSection, InstalledAppCardButtons } from "./connected-apps/ConnectedAppCardButtonsSection";
-import { ConnectedAppMarketplaceInstallBadge } from "./connected-apps/ConnectedAppMarketplaceInstallBadge";
 import { ConnectedAppUrlLink } from "./connected-apps/ConnectedAppUrlLink";
 import { OAuthScopeSummaryPanel } from "./connected-apps/OAuthScopeSummaryPanel";
 import { ConnectedAppDetailSection } from "./connected-apps/ConnectedAppDetailSection";
-import { ConnectedAppDetailRow } from "./connected-apps/ConnectedAppDetailRow";
 import { DeclaredScopesPicker } from "./connected-apps/DeclaredScopesPicker";
 import { ConnectedAppDetailModal } from "./connected-apps/ConnectedAppDetailModal";
 import { useMarketplaceListingsTotal } from "./useMarketplaceListingsTotal";
@@ -162,11 +151,24 @@ import { useAppBotLink } from "./useAppBotLink";
 import { useInstalledAppBot } from "./useInstalledAppBot";
 import { useMarketplaceBotHint } from "./useMarketplaceBotHint";
 import { useOwnServerCardButtons } from "./useOwnServerCardButtons";
+import { AppServerVouchSwitch } from "./AppServerVouchSwitch";
 import { InstalledAppsSkeleton } from "./InstalledAppsSkeleton";
+import { APPS_SCOPE_PARAM, appsScopeFromTab } from "./appsScope";
+import { useAppsScopeLink } from "./useAppsScopeLink";
+import { appMakerNames, buildYoursApps, filterYoursApps } from "./yoursApps";
+import { YoursAppsList } from "./YoursAppsList";
+import { DiscoverAppsList } from "./DiscoverAppsList";
+import { DiscoverServiceDetail } from "./DiscoverServiceDetail";
+import { MarketplaceInstallConfirm } from "./MarketplaceInstallConfirm";
+import { MarketplaceListingDetail } from "./MarketplaceListingDetail";
+import { useDiscoverDetail } from "./useDiscoverDetail";
+import type { ListingDialogKind } from "./useDiscoverDetail";
 
 /**
- * The server's Apps: Installed, Marketplace and My Apps (#proj-apps task #22).
- * `page` is the Apps page (/apps): its own head, the tabs and their toolbar
+ * The server's Apps in two scopes: Yours (every App this Server has: Raft
+ * Apps installed here, connected services, and Apps built here) and Discover
+ * (the Marketplace's listings).
+ * `page` is the Apps page (/apps): its own head, the scope and its toolbar
  * with Add App at its end, and a scrolling list with pull to refresh on a phone.
  * `settings` is the same content inside Settings › Applications, which only
  * the native host shell's embedded settings page and a direct render still
@@ -185,17 +187,25 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
   const connectedAppsLabel = formatMessage({ id: "settings.connectedApps.label" });
 
   const location = useLocation();
-  // Installed first: the rows that wait for an owner or admin are there.
-  const [activeTab, setActiveTab] = useState<ConnectedAppsTab>("installed");
+  // Yours first: the Apps that wait for an owner or admin are there. A link
+  // may name the scope (`?tab=`), by its name or an old tab's: read here for
+  // the first paint, then used once and removed (`useAppsScopeLink`).
+  const [chosenTab, setActiveTab] = useState<ConnectedAppsTab>(() => appsScopeFromTab(new URLSearchParams(location.search).get(APPS_SCOPE_PARAM)) ?? "yours");
+  // Members have no Discover (R15): their page is Yours alone, read-only,
+  // whatever a link (`?tab=discover`) or an earlier choice named.
+  const activeTab: ConnectedAppsTab = canManage ? chosenTab : "yours";
   const [filters, setFilters] = useState<AppsFilters>(DEFAULT_APPS_FILTERS);
-  // Grid or list, on every tab, remembered on the device (as Settings had it).
-  const [connectedAppsViewMode, setConnectedAppsViewMode] = useState<ConnectedAppsViewMode>(getInitialConnectedAppsViewMode);
   const marketplaceQuery = useDebouncedValue(filters.search.trim(), 300);
   // Bumped after an install, so the Marketplace's rows say Installed.
   const [marketplaceReloadKey, setMarketplaceReloadKey] = useState(0);
   // The first load of this server's Apps failed: a Retry, not an empty list.
   const [loadFailed, setLoadFailed] = useState(false);
-  const [selectedListing, setSelectedListing] = useState<ConnectedAppListing | null>(null);
+  // The Raft App listing that is open, and as what: its details, or the
+  // install confirmation a card's Add opened. One state, so every open and
+  // close sets both, and a later open (a link's ?marketplace_app=) is never
+  // shown as an earlier confirmation.
+  const [listingDialog, setListingDialog] = useState<{ kind: ListingDialogKind; listing: ConnectedAppListing } | null>(null);
+  const selectedListing = listingDialog?.listing ?? null;
   // The installed App whose detail is open, and whether the bot add link
   // (?app_bot=) opened it: one state, so every open and close sets both.
   const [installedDetail, setInstalledDetail] = useState<{ app: InstalledConnectedApp; fromLink: boolean } | null>(null);
@@ -266,17 +276,17 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
           .filter((app) => isMarketplaceTabClient(app, serverId))
           .map((client) => mapClientToMarketplaceApp(client, formatMessage))
           .find((app) => app.id === requestedMarketplaceId || app.clientId === requestedMarketplaceId);
-        if (requestedListing) setSelectedListing(requestedListing);
+        if (requestedListing) setListingDialog({ kind: "detail", listing: requestedListing });
       }
       // Keep an open detail modal in sync with the reloaded rows — e.g. a
       // permission-update approve must drop the pending badge instead of
       // showing a stale snapshot of the pre-review listing.
-      setSelectedListing((currentListing) => {
-        if (!currentListing) return currentListing;
+      setListingDialog((open) => {
+        if (!open) return open;
         const fresh = nextMarketplaceClients
           .map((client) => mapClientToMarketplaceApp(client, formatMessage))
-          .find((app) => app.id === currentListing.id || app.clientId === currentListing.clientId);
-        return fresh ?? null;
+          .find((app) => app.id === open.listing.id || app.clientId === open.listing.clientId);
+        return fresh ? { ...open, listing: fresh } : null;
       });
       setIntegrationOverview(overviewRes.data);
       // An install, an uninstall or an approval changes the Marketplace's rows too.
@@ -307,11 +317,13 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
     void loadMcpAppsForServer();
   }, [serverId]);
 
-  // The installed list's "Needs confirmation" mark. Marketplace apps read it
+  useAppsScopeLink(setActiveTab);
+
+  // Yours' "Needs confirmation" mark. Marketplace apps read it
   // from their GET /integrations/marketplace row; editable (self-built) apps,
   // which that list doesn't carry, from their own prompt-text state.
   useEffect(() => {
-    if (!promptTextConsent || activeTab !== "installed") return;
+    if (!promptTextConsent || activeTab !== "yours") return;
     let cancelled = false;
     const editableIds = clients
       .filter((client) => client.appType === "server_local" || (client.appType === "third_party_global" && canEditSourceOwnedConnectedApp(client.publishStatus)))
@@ -447,6 +459,8 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
       // Only GET /integrations/clients carries it, and no edit here changes it.
       linkPreviewReadOnly: previous.linkPreviewReadOnly,
       official: previous.official,
+      // A response without the vouch (logo, share links) changed nothing about it.
+      ...(client.serverVouched === undefined ? { serverVouched: previous.serverVouched, serverVouchedAt: previous.serverVouchedAt } : {}),
     });
     setClients((items) => items.map((item) => item.id === client.id ? mergeInstallState(item) : item));
     setEditingClient((currentClient) => currentClient?.id === client.id ? mergeInstallState(currentClient) : currentClient);
@@ -550,7 +564,7 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
         }
         resetForm();
         setShowRegisterDrawer(false);
-        setActiveTab("myapps");
+        setActiveTab("yours");
         await load();
       }
     } catch (err: any) {
@@ -758,7 +772,8 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
           ...(listing.bot ? { bot: installWithBot(listing.id) } : {}),
         },
       ), "appAccess");
-      setSelectedListing(listing.setupUrl ? { ...listing, installed: true } : null);
+      // Its setup step is in its details; with none, it closes.
+      setListingDialog(listing.setupUrl ? { kind: "detail", listing: { ...listing, installed: true } } : null);
       await load();
       // The install went through; only the bot didn't join (its handle is taken).
       if (listing.bot && data?.warnings?.includes(APP_BOT_HANDLE_CONFLICT)) {
@@ -782,7 +797,9 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
             ...(text?.fields ? { ...text.fields, promptTextRevisionId: text.revisionId } : {}),
           };
           setMarketplaceClients((items) => items.map((client) => (client.id === next.id ? next : client)));
-          setSelectedListing((open) => (open?.id === next.id ? { ...mapClientToMarketplaceApp(next, formatMessage), installed: open.installed } : open));
+          setListingDialog((open) => (open?.listing.id === next.id
+            ? { ...open, listing: { ...mapClientToMarketplaceApp(next, formatMessage), installed: open.listing.installed } }
+            : open));
         } else {
           await load();
         }
@@ -804,7 +821,9 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
     setError("");
     try {
       await api.delete(`/integrations/marketplace/${app.id}/install`);
-      setSelectedListing(null);
+      setListingDialog(null);
+      // Asked from the installed detail: it closes with the App gone.
+      setInstalledDetail((open) => (open?.app.id === app.id ? null : open));
       setMarketplaceUninstallTarget(null);
       await load();
     } catch (err: any) {
@@ -889,37 +908,43 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
       bot: app.bot,
     })),
   ];
-  // Installed lists only what is installed here (Apps v4 D3): another Server's
-  // App, or one built here once this Server has installed it. Every Raft App
-  // this Server builds is under Developer.
+  // What is installed here (Apps v4 D3): another Server's App, or one built
+  // here once this Server has installed it. These open the installed detail.
   const installedApps = connectedAppEntries.filter((app) => !app.editable || app.installedHere === true);
   const permissionUpdatesCount = installedApps.filter((app) => app.permissionApprovalRequired).length;
-  const normalizedSearch = filters.search.trim().toLowerCase();
-  const matchesFilters = (app: Parameters<typeof matchesConnectedAppFilter>[0], mcp: boolean) => (
-    matchesAppsType(filters.type, mcp) && matchesConnectedAppFilter(app, normalizedSearch, filters.category)
-  );
-  const filteredInstalledApps = installedApps.filter((app) => matchesFilters(app, false));
-  const filteredRegisteredApps = registeredApps.filter((app) => matchesFilters(app, false));
-  // MCP Apps are server-local Apps, installed here the moment they are added:
-  // they are listed under Installed only, not under Developer (its Raft Apps).
-  const mcpAppRows = mcpApps.map((app) => mcpAppAsConnectedApp(app, formatMessage));
-  const filteredMcpApps = mcpAppRows.filter((app) => matchesFilters(app, true));
-  const installedCount = installedApps.length + mcpApps.length;
-  // Every segment of the scope carries its count (Raft DS › Page structure): the Marketplace's is its listings' total, read on the Apps page only.
-  const marketplaceTotal = useMarketplaceListingsTotal(marketplaceReloadKey, variant === "page");
-  // "Recommended for you": on the page's Installed tab (the Marketplace lists them), unfiltered, once loaded.
-  const showRecommendations = variant === "page" && activeTab === "installed" && !hasActiveAppsFilters(filters) && loaded && !loadFailed;
+  // Yours: every App this Server has, once each (today's Installed and
+  // Developer lists merged), those that need someone first.
+  const appViewContext = useMemo(() => ({ serverId, canManage, promptTextConsent }), [canManage, promptTextConsent, serverId]);
+  const yoursApps = buildYoursApps({
+    installedApps,
+    appEntries: connectedAppEntries,
+    serviceItems: mcpApps,
+    serviceRow: (app) => mcpAppAsConnectedApp(app, formatMessage),
+    registeredApps,
+    clients,
+    marketplaceClients,
+    context: appViewContext,
+  });
+  const filteredYoursApps = filterYoursApps(yoursApps, filters.search, filters.origin);
+  // "Internal · made by": from the Server's people already read, no request of its own.
+  const members = useServerStore((s) => s.members);
+  const makerNames = useMemo(() => appMakerNames(members), [members]);
+  const yoursCount = yoursApps.length;
+  // Every segment of the scope carries its count (Raft DS › Page structure): Discover's is its listings' total, read on the Apps page only, for the people who have Discover.
+  const marketplaceTotal = useMarketplaceListingsTotal(marketplaceReloadKey, variant === "page" && canManage);
+  // "Recommended for {server}": at the top of the page's Discover (members have none), unfiltered, once loaded.
+  const showRecommendations = variant === "page" && activeTab === "discover" && !hasActiveAppsFilters(filters, "discover") && loaded && !loadFailed;
   const recommendations = useMemo(
     () => (showRecommendations ? appRecommendations(marketplaceClients, serverId) : []),
     [marketplaceClients, serverId, showRecommendations],
   );
-  const installedHeadingId = useId();
-  const registeredCount = registeredApps.length;
+  // A member's page has Yours alone: the toolbar then draws no scope switch.
   const connectedAppsTabOptions = useMemo(() => [
-    { value: "installed" as const, label: formatMessage({ id: "settings.connectedApps.installed" }), count: installedCount, testId: "connected-apps-tab-installed", countTestId: "connected-apps-tab-installed-count" },
-    { value: "marketplace" as const, label: formatMessage({ id: "settings.connectedApps.tabMarketplace" }), count: marketplaceTotal, testId: "connected-apps-tab-marketplace", countTestId: "connected-apps-tab-marketplace-count" },
-    { value: "myapps" as const, label: formatMessage({ id: "settings.connectedApps.tabMyApps" }), count: registeredCount, testId: "connected-apps-tab-my-apps", countTestId: "connected-apps-tab-my-apps-count" },
-  ], [formatMessage, installedCount, marketplaceTotal, registeredCount]);
+    { value: "yours" as const, label: formatMessage({ id: "apps.scope.yours" }), count: yoursCount, testId: "connected-apps-tab-yours", countTestId: "connected-apps-tab-yours-count" },
+    ...(canManage
+      ? [{ value: "discover" as const, label: formatMessage({ id: "apps.scope.discover" }), count: marketplaceTotal, testId: "connected-apps-tab-discover", countTestId: "connected-apps-tab-discover-count" }]
+      : []),
+  ], [canManage, formatMessage, marketplaceTotal, yoursCount]);
   const publishCategoryItems = useMemo(() => CONNECTED_APP_PUBLISH_CATEGORY_OPTIONS.map((option) => ({
     value: option.value,
     label: formatMessage({ id: CONNECTED_APP_CATEGORY_LABEL_ID[option.value] }),
@@ -994,20 +1019,11 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
       ]
       : []),
   ], [cardButtonsShown, editingClient, formatMessage]);
-  const updateConnectedAppsViewMode = useCallback((viewMode: ConnectedAppsViewMode) => {
-    setConnectedAppsViewMode(viewMode);
-    try {
-      window.localStorage.setItem(CONNECTED_APPS_VIEW_MODE_STORAGE_KEY, viewMode);
-    } catch {
-      // The preference is optional; the view switch must keep working when storage is unavailable.
-    }
-  }, []);
   const handleFiltersChange = useCallback((patch: Partial<AppsFilters>) => setFilters((current) => ({ ...current, ...patch })), []);
-  // Clear All empties what narrows the list; the Marketplace's order stays.
-  const clearFilters = useCallback(() => setFilters((current) => ({ ...DEFAULT_APPS_FILTERS, sort: current.sort })), []);
+  const clearFilters = useCallback(() => setFilters(DEFAULT_APPS_FILTERS), []);
   // The bot add link (?app_bot=) opens the same detail, marked as opened from the link.
   const showAppBotLinkTarget = useCallback((app: InstalledConnectedApp | undefined) => {
-    setActiveTab("installed");
+    setActiveTab("yours");
     clearFilters();
     setError("");
     setInstalledDetail(app ? { app, fromLink: true } : null);
@@ -1017,22 +1033,22 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
     setError("");
     setInstalledDetail({ app, fromLink: false });
   }, []);
-  // A bot profile's App name (?installed_app=) opens the same detail as the card, on the Installed tab.
+  // A bot profile's App name (?installed_app=) opens the same detail as the card, on Yours.
   const showInstalledAppLinkTarget = useCallback((app: InstalledConnectedApp) => {
-    setActiveTab("installed");
+    setActiveTab("yours");
     clearFilters();
     handleOpenInstalledApp(app);
   }, [clearFilters, handleOpenInstalledApp]);
   const botLink = useAppBotLink({ loaded, installedApps, show: showAppBotLinkTarget, openInstalled: showInstalledAppLinkTarget, closeDetail: handleCloseInstalledApp });
-  // And the first waiting app's review, as its card's button: switching to Installed alone did nothing there (#triage:#156).
+  // And the first waiting app's review, as its card's button: switching to the list alone did nothing there (#triage:#156).
   const handleShowPermissionUpdates = useCallback(() => {
-    setActiveTab("installed");
+    setActiveTab("yours");
     clearFilters();
     const waiting = installedApps.find((app) => app.permissionApprovalRequired);
     if (waiting) handleOpenInstalledApp(waiting);
   }, [clearFilters, installedApps, handleOpenInstalledApp]);
   const handleBrowseMarketplace = useCallback(() => {
-    setActiveTab("marketplace");
+    setActiveTab("discover");
     clearFilters();
   }, [clearFilters]);
   const handleTabChange = useCallback((value: ConnectedAppsTab) => setActiveTab(value), []);
@@ -1050,10 +1066,27 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
     const match = clients.find((client) => client.id === (app.sourceClientId ?? app.id));
     if (match) beginEditClient(match);
   }, [beginEditClient, clients]);
+  // A card's Review: today's review of what waits. A permission update, and
+  // another Server's App's agent text, are approved in the installed detail;
+  // the agent text of an App built here is confirmed in its editor.
+  const handleReviewInstalledApp = useCallback((app: InstalledConnectedApp) => {
+    if (app.editable && !app.permissionApprovalRequired && app.promptTextConfirmationRequired) handleEditInstalledApp(app);
+    else handleOpenInstalledApp(app);
+  }, [handleEditInstalledApp, handleOpenInstalledApp]);
+  // Edit left the card: the installed detail of an App built here offers it.
+  const handleEditSelectedInstalledApp = useCallback(() => {
+    if (!selectedInstalledApp) return;
+    setInstalledDetail(null);
+    handleEditInstalledApp(selectedInstalledApp);
+  }, [handleEditInstalledApp, selectedInstalledApp]);
   const handleRequestMarketplaceUninstall = useCallback((app: InstalledConnectedApp | ConnectedAppListing) => {
     setError("");
     setMarketplaceUninstallTarget(app);
   }, []);
+  // Uninstall left the card: the installed detail of another Server's App offers it.
+  const handleRequestUninstallSelectedInstalledApp = useCallback(() => {
+    if (selectedInstalledApp) handleRequestMarketplaceUninstall(selectedInstalledApp);
+  }, [handleRequestMarketplaceUninstall, selectedInstalledApp]);
   // The open installed App's bot, read live from the lists (not the snapshot
   // taken when the modal opened), so the banner and the section move together.
   const selectedInstalledAppId = selectedInstalledApp?.id ?? null;
@@ -1078,7 +1111,7 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
   }, [handleCloseInstalledApp, openProfile]);
   // f5: the editor's hint goes to where every Server adds the bot: this App's
   // installed detail (also for an App built here and not yet installed, which
-  // adding the bot installs), or the Installed tab when it has no entry.
+  // adding the bot installs), or Yours when it has no entry.
   // The entries are rebuilt every render; the click reads the latest ones.
   const installedAppsRef = useRef<InstalledConnectedApp[]>([]);
   useEffect(() => {
@@ -1088,7 +1121,7 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
   const handleOpenBotFromEditor = useCallback(() => {
     const entry = editingClientRowId ? installedAppsRef.current.find((app) => app.id === editingClientRowId) : undefined;
     closeRegisterDrawer();
-    setActiveTab("installed");
+    setActiveTab("yours");
     clearFilters();
     if (entry) setInstalledDetail({ app: entry, fromLink: false });
   }, [clearFilters, closeRegisterDrawer, editingClientRowId]);
@@ -1105,21 +1138,23 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
     setError("");
     setMcpEditor({ appId: app.id });
   }, [canManage]);
+  // A card's Sign in or View: the service's accounts, in the same editor.
+  const handleOpenMcpAppAccounts = useCallback((app: { id: string }) => {
+    if (!canManage) return;
+    setError("");
+    setMcpEditor({ appId: app.id, initialSection: "connections" });
+  }, [canManage]);
   const handleRegisterMcpServer = useCallback(() => {
     setError("");
     setMcpEditor({ appId: null });
   }, []);
-  // A Marketplace MCP row's Install, in one step: the App is made from the
-  // Raft template (its profile is the listing's), then its editor opens on
-  // Connections, where a template's sign-in is added.
-  // One install at a time: its row says Installing… and the others wait.
-  const [installingTemplateKey, setInstallingTemplateKey] = useState<string | null>(null);
-  const installingTemplateKeyRef = useRef<string | null>(null);
-  const handleInstallMcpTemplate = useCallback(async (listing: MarketplaceMcpListing) => {
-    if (!canManage || installingTemplateKeyRef.current) return;
-    installingTemplateKeyRef.current = listing.templateKey;
-    setInstallingTemplateKey(listing.templateKey);
-    setError("");
+  // A connected service's Add in Discover, in one step: the App is made from
+  // the Raft template (its profile is the listing's), then its editor opens
+  // on Connections, where a template's sign-in is added.
+  // One add at a time, and its failure where its Add was pressed
+  // (`useDiscoverDetail`): null once made, else what failed, never the page's
+  // banner.
+  const handleInstallMcpTemplate = useCallback(async (listing: MarketplaceMcpListing): Promise<string | null> => {
     try {
       const { data } = await api.post<McpAppView>("/mcp/apps", {
         source: { kind: "template", templateKey: listing.templateKey },
@@ -1142,29 +1177,36 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
       void loadMcpApps();
       setMarketplaceReloadKey((key) => key + 1);
       setMcpEditor({ appId: data.id, initialSection: "connections" });
+      return null;
     } catch (installError) {
-      setError(mcpAppErrorMessage(installError, formatMessage));
-    } finally {
-      installingTemplateKeyRef.current = null;
-      setInstallingTemplateKey(null);
+      return mcpAppErrorMessage(installError, formatMessage);
     }
-  }, [canManage, formatMessage, loadMcpApps]);
-  // Custom MCP App ▸ Browse Marketplace: the MCP Apps Raft maintains.
+  }, [formatMessage, loadMcpApps]);
+  // Custom MCP App ▸ Browse Marketplace: Discover, which lists the services Raft keeps among its Apps.
   const handleBrowseMcpMarketplace = useCallback(() => {
     setMcpEditor(null);
-    setActiveTab("marketplace");
-    setFilters((current) => ({ ...DEFAULT_APPS_FILTERS, sort: current.sort, type: "mcp" }));
+    setActiveTab("discover");
+    setFilters(DEFAULT_APPS_FILTERS);
   }, []);
-  const handleOpenMarketplaceListing = useCallback((listing: ConnectedAppListing) => {
+  const handleOpenMarketplaceListing = useCallback((listing: ConnectedAppListing, kind: ListingDialogKind) => {
     setError("");
-    setSelectedListing(listing);
+    setListingDialog({ kind, listing });
   }, []);
+  const toMarketplaceListing = useCallback((record: MarketplaceOAuthClientRecord) => mapClientToMarketplaceApp(record, formatMessage), [formatMessage]);
+  const discover = useDiscoverDetail({
+    canManage,
+    serviceItems: mcpApps,
+    toListing: toMarketplaceListing,
+    openListing: handleOpenMarketplaceListing,
+    openService: handleOpenMcpApp,
+    addService: handleInstallMcpTemplate,
+  });
   const handleCloseMcpEditor = useCallback(() => setMcpEditor(null), []);
   const handleMcpAppChanged = useCallback(() => {
     void loadMcpApps();
     setMarketplaceReloadKey((key) => key + 1);
   }, [loadMcpApps]);
-  const handleCloseListing = useCallback(() => setSelectedListing(null), []);
+  const handleCloseListing = useCallback(() => setListingDialog(null), []);
   const handleRequestUninstallSelectedListing = useCallback(() => {
     if (selectedListing) handleRequestMarketplaceUninstall(selectedListing);
   }, [handleRequestMarketplaceUninstall, selectedListing]);
@@ -1283,12 +1325,8 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
       tabs={connectedAppsTabOptions}
       onTabChange={handleTabChange}
       filters={filters}
-      showSort={activeTab === "marketplace"}
       onChange={handleFiltersChange}
       onClearAll={clearFilters}
-      view={connectedAppsViewMode}
-      onViewChange={updateConnectedAppsViewMode}
-      viewSwitch={<ConnectedAppsViewToggle value={connectedAppsViewMode} onValueChange={updateConnectedAppsViewMode} />}
       // The page's Add App ends its toolbar; Settings keeps it in the section header.
       addApp={variant === "page" ? addAppMenu : undefined}
       variant={variant}
@@ -1311,127 +1349,48 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
       {formatMessage({ id: "settings.connectedApps.failedLoad" })}
     </Banner>
   );
-  // Rows stand in only once the wait passes a second (ListRowSkeletonList).
-  const loadingRows = (
-    <div aria-busy="true" data-testid="apps-loading">
-      <ListRowSkeletonList count={4} description />
-    </div>
-  );
-  const installedTotal = installedApps.length + mcpApps.length;
-  const installedList = (
-    <div className="stack-y-2" data-testid="connected-apps-installed-tab">
-      {recommendations.length > 0 ? (
-        <AppsSectionHeading id={installedHeadingId}>{formatMessage({ id: "settings.connectedApps.installed" })}</AppsSectionHeading>
-      ) : null}
+  const yoursList = (
+    <div className="stack-y-2" data-testid="connected-apps-yours-tab">
       {loadFailed ? loadFailedBanner
-        : !loaded ? <InstalledAppsSkeleton viewMode={connectedAppsViewMode} canManage={canManage} />
-        : installedTotal === 0 ? (
+        : !loaded ? <InstalledAppsSkeleton />
+        : yoursCount === 0 ? (
           <EmptyState
             className="py-10"
             icon={<Blocks size={36} />}
-            title={formatMessage({ id: "apps.installed.emptyTitle" })}
-            description={formatMessage({ id: canManage ? "apps.installed.emptyDescription" : "apps.installed.emptyDescriptionMember" })}
+            title={formatMessage({ id: "apps.yours.emptyTitle" })}
+            description={formatMessage({ id: canManage ? "apps.yours.emptyDescription" : "apps.yours.emptyDescriptionMember" })}
             action={canManage ? (
-              <Button type="button" variant="default" size="md" onClick={handleBrowseMarketplace} data-testid="apps-browse-marketplace">
-                {formatMessage({ id: "apps.installed.browseMarketplace" })}
+              <Button type="button" variant="default" size="md" onClick={handleBrowseMarketplace} data-testid="apps-browse-discover">
+                {formatMessage({ id: "apps.yours.browseDiscover" })}
               </Button>
             ) : undefined}
-            data-testid="apps-installed-empty"
+            data-testid="apps-yours-empty"
           />
         )
-        : filteredInstalledApps.length === 0 && filteredMcpApps.length === 0 ? (
-          <AppsNoMatchState title={formatMessage({ id: "settings.connectedApps.noInstalledAppsMatch" })} filters={filters} onClearAll={clearFilters} />
+        : filteredYoursApps.length === 0 ? (
+          <AppsNoMatchState title={formatMessage({ id: "apps.yours.noMatch" })} scope="yours" filters={filters} onClearAll={clearFilters} />
         ) : (
-          <div
-            className={connectedAppsCollectionClassName(connectedAppsViewMode)}
-            data-testid="connected-apps-installed-collection"
-            data-view={connectedAppsViewMode}
-          >
-            {filteredInstalledApps.map((app) => (
-              <InstalledConnectedAppItem
-                key={`${app.origin}-${app.id}`}
-                testId={`connected-app-item-${app.id}`}
-                app={app}
-                botAvailable={canManage && app.bot?.grant === "pending"}
-                viewMode={connectedAppsViewMode}
-                canManage={canManage}
-                uninstalling={savingClientId === app.id}
-                onOpen={handleOpenInstalledApp}
-                onEdit={handleEditInstalledApp}
-                onRequestUninstall={handleRequestMarketplaceUninstall}
-              />
-            ))}
-            {filteredMcpApps.map((app) => (
-              <InstalledConnectedAppItem
-                key={`mcp-${app.id}`}
-                testId={`connected-app-item-${app.id}`}
-                app={app}
-                mcp
-                viewMode={connectedAppsViewMode}
-                canManage={canManage}
-                uninstalling={false}
-                onOpen={handleOpenMcpApp}
-                onEdit={handleOpenMcpApp}
-                onRequestUninstall={handleOpenMcpApp}
-              />
-            ))}
-          </div>
+          <YoursAppsList
+            apps={filteredYoursApps}
+            canManage={canManage}
+            makerNames={makerNames}
+            onOpenInstalled={handleOpenInstalledApp}
+            onReviewInstalled={handleReviewInstalledApp}
+            onOpenService={handleOpenMcpApp}
+            onOpenServiceAccounts={handleOpenMcpAppAccounts}
+            onEditBuilt={beginEditClient}
+          />
         )}
       {mcpAppsError ? <Banner intent="warning" density="sm">{formatMessage({ id: "settings.connectedApps.mcp.loadFailed" })}</Banner> : null}
       {/* Each person's own link-preview answers, one row at the bottom of
-          Installed (#proj-apps task #22), as at the end of Settings ›
+          Yours (#proj-apps task #22), as at the end of Settings ›
           Applications. */}
       {variant === "page" ? <div className="pt-4" data-testid="apps-link-previews"><LinkPreviewConsentsRow /></div> : null}
     </div>
   );
-  const installedTab = (
-    <AppsRecommendedSection recommendations={recommendations} viewMode={connectedAppsViewMode} canManage={canManage} onOpenApp={handleOpenMarketplaceListing}>
-      {installedList}
-    </AppsRecommendedSection>
-  );
-  const myAppsTab = (
-    <div className="stack-y-3" data-testid="connected-apps-my-apps-tab">
-      <div className="text-footnote text-foreground-muted">
-        {canManage
-          ? formatMessage({ id: "settings.connectedApps.myAppsIntro" })
-          : formatMessage({ id: "settings.connectedApps.myAppsReadOnlyIntro" })}
-      </div>
-      {loadFailed ? loadFailedBanner
-        : !loaded ? loadingRows
-        : registeredApps.length === 0 ? (
-          <EmptyState
-            className="py-10"
-            icon={<Blocks size={36} />}
-            title={formatMessage({ id: "settings.connectedApps.noRegisteredApps" })}
-            description={formatMessage({ id: canManage ? "apps.myApps.emptyDescription" : "apps.myApps.emptyDescriptionMember" })}
-            data-testid="apps-my-apps-empty"
-          />
-        )
-        : filteredRegisteredApps.length === 0 ? (
-          <AppsNoMatchState title={formatMessage({ id: "settings.connectedApps.noRegisteredAppsMatch" })} filters={filters} onClearAll={clearFilters} />
-        ) : (
-          <div
-            className={connectedAppsCollectionClassName(connectedAppsViewMode)}
-            data-testid="connected-apps-my-apps-collection"
-            data-view={connectedAppsViewMode}
-          >
-            {filteredRegisteredApps.map((app) => (
-              <RegisteredConnectedAppItem
-                key={app.id}
-                testId={`connected-app-item-${app.id}`}
-                app={app}
-                viewMode={connectedAppsViewMode}
-                canManage={canManage}
-                onEdit={beginEditClient}
-              />
-            ))}
-          </div>
-        )}
-    </div>
-  );
   const body = (
     <>
-      {/* Each tab says what it holds; members also read who can change them. */}
+      {/* Members read who can change the Apps. */}
       {!canManage ? (
         <div className="text-footnote text-foreground-muted" data-testid="apps-admin-only-note">
           {formatMessage({ id: "settings.connectedApps.adminOnlyNote" })}
@@ -1458,28 +1417,28 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
 
       {canManage && !showRegisterDrawer && renderClientSecretReveal()}
 
-      {activeTab === "installed" ? installedTab : null}
-      {activeTab === "marketplace" ? (
+      {activeTab === "yours" ? yoursList : null}
+      {activeTab === "discover" ? (
         <div data-testid="connected-apps-marketplace-tab">
-          <MarketplaceListingsTab
-            filters={filters}
-            viewMode={connectedAppsViewMode}
-            query={marketplaceQuery}
-            canManage={canManage}
-            reloadKey={marketplaceReloadKey}
-            onOpenApp={handleOpenMarketplaceListing}
-            onInstallMcp={handleInstallMcpTemplate}
-            installingTemplateKey={installingTemplateKey}
-            onClearFilters={clearFilters}
-            botHint={renderUndecidedBotHint}
-          />
+          <AppsRecommendedSection recommendations={recommendations} context={appViewContext} serverName={current.name} onOpen={discover.openRecord} onAdd={discover.addRecord} addDisabled={discover.addingId !== null}>
+            <DiscoverAppsList
+              filters={filters}
+              query={marketplaceQuery}
+              context={appViewContext}
+              reloadKey={marketplaceReloadKey}
+              onOpen={discover.open}
+              onAdd={canManage ? discover.add : undefined}
+              addingId={discover.addingId}
+              addError={discover.cardError}
+              onClearFilters={clearFilters}
+            />
+          </AppsRecommendedSection>
           {/* Under the Marketplace whatever it shows, as in Settings. */}
           <div className="mt-3 text-center text-footnote text-foreground-muted">
             {formatMessage({ id: "settings.connectedApps.reviewNote" })}
           </div>
         </div>
       ) : null}
-      {activeTab === "myapps" ? myAppsTab : null}
     </>
   );
   const dialogs = (
@@ -1496,13 +1455,22 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
                   <SectionEyebrow as="div">{formatMessage({ id: "settings.connectedApps.installedAppEyebrow" })}</SectionEyebrow>
                   <div id="connected-app-installed-title" className="mt-1 break-words text-headline text-foreground">{selectedInstalledApp.name}</div>
                   <div className="mt-0.5 text-footnote text-foreground-muted">{selectedInstalledApp.developer}</div>
+                  {/* The card shows no address: the App's homepage is here. */}
+                  <ConnectedAppUrlLink url={selectedInstalledApp.homepageUrl} label={selectedInstalledApp.homepageDomain} className="mt-1" />
                 </div>
               </div>
           )}
           footer={(
             <div>
               <Separator className="mb-4" />
-              <div className="flex justify-end">
+              <div className="flex items-center justify-end gap-2">
+                {/* An App built here: its editor (share links, publishing, its secret, delete). */}
+                {canManage && selectedInstalledApp.editable ? (
+                  <Button type="button" variant="outline" onClick={handleEditSelectedInstalledApp} size="lg" data-testid="connected-app-installed-edit">
+                    <Pencil size={16} />
+                    {formatMessage({ id: "settings.connectedApps.edit" })}
+                  </Button>
+                ) : null}
                 <Button
                   type="button" variant="outline" onClick={handleCloseInstalledApp} size="lg">{formatMessage({ id: "settings.common.close" })}</Button>
               </div>
@@ -1548,154 +1516,8 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
             <LinkPreviewAppChoice appId={selectedInstalledApp.id} />
             <InstalledAppCardButtons appId={canManage ? selectedInstalledApp.id : null} appName={selectedInstalledApp.name} serverName={current.name} />
             {!selectedInstalledApp.permissionApprovalRequired ? installedPermissions : null}
-        </ConnectedAppDetailModal>
-      )}
-
-      {selectedListing && (
-        <ConnectedAppDetailModal
-          labelledBy="connected-app-detail-title"
-          onClose={handleCloseListing}
-          closeLabel={formatMessage({ id: "settings.connectedApps.closeAppDetail" })}
-          identity={(
-              <div className="flex items-start gap-3">
-                <ConnectedAppLogo name={selectedListing.name} logoUrl={selectedListing.logoUrl} seed={selectedListing.defaultLogoSeed} size="lg" />
-                <div>
-                  <SectionEyebrow as="div">{formatMessage({ id: "settings.connectedApps.appDetail" })}</SectionEyebrow>
-                  <div className="mt-1 flex flex-wrap items-center gap-2">
-                    <h2 id="connected-app-detail-title" className="text-headline text-foreground">{selectedListing.name}</h2>
-                    <ConnectedAppMarketplaceInstallBadge badge={selectedListing.marketplaceInstallBadge} />
-                  </div>
-                  <div className="mt-0.5 text-footnote text-foreground-muted">{formatMessage({ id: "settings.connectedApps.byLine" }, { category: formatMessage({ id: CONNECTED_APP_CATEGORY_LABEL_ID[selectedListing.category] ?? "settings.connectedApps.categoryOther" }), developer: selectedListing.developer })}</div>
-                </div>
-              </div>
-          )}
-          footer={(
-            <div>
-              <Separator className="mb-4" />
-              <div className="flex items-center justify-end gap-2">
-                <Button
-                  type="button" variant={canManage && !selectedListing.installed ? "ghost" : "outline"} onClick={handleCloseListing} size="lg">
-                  {canManage ? formatMessage({ id: "settings.common.cancel" }) : formatMessage({ id: "settings.common.close" })}
-                </Button>
-                {canManage && !selectedListing.installed && (
-                  <Button
-                    type="button"
-                    disabled={savingClientId === selectedListing.id}
-                    onClick={handleInstallSelectedListing}
-                    variant="accent"
-                    size="lg"
-                  >
-                    {savingClientId === selectedListing.id ? formatMessage({ id: "settings.connectedApps.installing" }) : formatMessage({ id: "settings.connectedApps.installToServer" })}
-                  </Button>
-                )}
-              </div>
-            </div>
-          )}
-        >
-            <ConnectedAppsErrorBanner surface={connectedAppsErrorSurface} target={CONNECTED_APPS_ERROR_LISTING} error={error} />
-            <ConnectedAppDetailSection title={formatMessage({ id: "settings.connectedApps.section.profile" })}>
-              <p className="mb-2 text-callout text-foreground-muted">{selectedListing.description}</p>
-              <div className="text-callout">
-                <ConnectedAppDetailRow label={formatMessage({ id: "settings.connectedApps.publisher" })}>
-                  {selectedListing.developer}
-                </ConnectedAppDetailRow>
-                <Separator />
-                <ConnectedAppDetailRow label={formatMessage({ id: "settings.connectedApps.homepageUrlLabel" })}>
-                  {selectedListing.homepageUrl ? (
-                    <ConnectedAppUrlLink url={selectedListing.homepageUrl} />
-                  ) : (
-                    <span className="break-all font-mono text-mono-meta text-foreground">{selectedListing.homepageDomain}</span>
-                  )}
-                </ConnectedAppDetailRow>
-                <Separator />
-                {/* f4: a fact about the App, shown to everyone before the
-                    install; not a Login with Raft scope (Kirby). */}
-                {selectedListing.bot ? (
-                  <>
-                    <ConnectedAppDetailRow label={formatMessage({ id: "settings.connectedApps.appIdentity.title" })}>
-                      <span className="break-all font-mono text-mono-meta text-foreground" data-testid="connected-app-listing-bot">{formatMessage({ id: "common.handle" }, { name: selectedListing.bot.handle })}</span>
-                      {/* Installed here with the bot undecided: its Add, or who can add it. */}
-                      {selectedListingBotHint ? <div className="mt-2" data-testid="connected-app-listing-bot-hint">{selectedListingBotHint}</div> : null}
-                    </ConnectedAppDetailRow>
-                    <Separator />
-                  </>
-                ) : null}
-                <ConnectedAppDetailRow label={formatMessage({ id: "settings.connectedApps.redirectCallback" })}>
-                  <span className="break-all font-mono text-mono-meta text-foreground">{selectedListing.callbackDomain}</span>
-                </ConnectedAppDetailRow>
-              </div>
-            </ConnectedAppDetailSection>
-            <ConnectedAppDetailSection
-              title={formatMessage({ id: "settings.connectedApps.section.loginWithRaft" })}
-              description={formatMessage({ id: "settings.connectedApps.detail.loginDescription" })}
-              tone="cream"
-            >
-              <OAuthScopeSummaryPanel
-                title={formatMessage({ id: "settings.connectedApps.detail.requestableDeclared" })}
-                scopes={selectedListing.allowedScopes}
-              />
-            </ConnectedAppDetailSection>
-            {selectedListing.setupUrl ? selectedListing.installed && serverId
-              ? <AppSetupPanel clientId={selectedListing.id} serverId={serverId} />
-              : <AppSetupRequirement url={selectedListing.setupUrl} description={selectedListing.setupDescription} /> : null}
-            <ConnectedAppDetailSection title={formatMessage({ id: "settings.connectedApps.section.appPermissions" })} tone="cream">
-              <AppNotificationRequestSummary
-                groups={selectedListing.appNotificationGroups}
-                events={selectedListing.appNotificationEvents}
-                pendingGroups={selectedListing.appNotificationPendingGroups}
-                pendingEvents={selectedListing.appNotificationPendingEvents}
-                reviewPending={selectedListing.appNotificationReviewPending}
-              />
-            </ConnectedAppDetailSection>
-            {promptTextConsent ? (
-              <MarketplacePromptTextReview
-                key={selectedListing.id}
-                clientId={selectedListing.id}
-                service={selectedListing.clientId}
-                frame={renderPromptTextReviewFrame}
-                onReviewed={load}
-              />
-            ) : null}
-            <ConnectedAppDetailSection title={formatMessage({ id: "settings.connectedApps.section.distribution" })} tone="cream">
-              <div className="text-footnote text-foreground-muted">
-                {formatMessage({ id: "settings.connectedApps.listingReviewNote" })}
-              </div>
-            </ConnectedAppDetailSection>
-            {canManage && !selectedListing.installed && (
-              // Exactly what Install sends as expected_scopes / expected_groups:
-              // the effective login scopes and the current data
-              // groups, unfiltered — not the pending revision shown above.
-              <ConnectedAppDetailSection
-                title={formatMessage({ id: "settings.connectedApps.section.installApproves" })}
-                description={formatMessage({ id: "settings.connectedApps.detail.installApprovesDescription" })}
-              >
-                <AppPermissionSetList
-                  scopes={effectiveAllowedOAuthScopes(selectedListing.allowedScopes)}
-                  groups={selectedListing.appNotificationGroups}
-                />
-                {selectedListing.bot ? (
-                  <ConnectedAppBotInstallOption
-                    appName={selectedListing.name}
-                    bot={selectedListing.bot}
-                    serverName={current.name}
-                    checked={installWithBot(selectedListing.id)}
-                    disabled={savingClientId === selectedListing.id}
-                    onCheckedChange={handleInstallBotCheckedChange}
-                  />
-                ) : null}
-              </ConnectedAppDetailSection>
-            )}
-            {canManage && !selectedListing.installed && promptTextConsent && selectedListing.promptTextRevisionId ? (
-              // Exactly what Install sends as expected_text_revision_id: the
-              // app's live text, as agents on this Server would get it.
-              <ConnectedAppDetailSection
-                title={formatMessage({ id: "appPromptText.title" })}
-                description={formatMessage({ id: "appPromptText.installNote" })}
-              >
-                <AppPromptTextBlock fields={selectedListing.promptTextFields} service={selectedListing.clientId} />
-              </ConnectedAppDetailSection>
-            ) : null}
-            {canManage && selectedListing.installed && (
+            {/* Another Server's App: Uninstall, as its row had it (an App built here is deleted from its editor). */}
+            {canManage && !selectedInstalledApp.editable ? (
               <ConnectedAppDetailSection title={formatMessage({ id: "settings.connectedApps.section.dangerZone" })}>
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div className="text-footnote text-foreground-muted">
@@ -1703,18 +1525,61 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
                   </div>
                   <Button
                     type="button"
-                    disabled={savingClientId === selectedListing.id}
-                    onClick={handleRequestUninstallSelectedListing}
+                    disabled={savingClientId === selectedInstalledApp.id}
+                    onClick={handleRequestUninstallSelectedInstalledApp}
                     variant="danger"
                     size="md"
+                    data-testid="connected-app-installed-uninstall"
                   >
-                    {savingClientId === selectedListing.id ? formatMessage({ id: "settings.connectedApps.uninstalling" }) : formatMessage({ id: "settings.connectedApps.uninstallFromServer" })}
+                    {savingClientId === selectedInstalledApp.id ? formatMessage({ id: "settings.connectedApps.uninstalling" }) : formatMessage({ id: "settings.connectedApps.uninstallFromServer" })}
                   </Button>
                 </div>
               </ConnectedAppDetailSection>
-            )}
+            ) : null}
         </ConnectedAppDetailModal>
       )}
+
+      {selectedListing && listingDialog?.kind === "confirm" && canManage && !selectedListing.installed ? (
+        <MarketplaceInstallConfirm
+          listing={selectedListing}
+          serverName={current.name}
+          promptTextConsent={promptTextConsent}
+          saving={savingClientId === selectedListing.id}
+          errorBanner={<ConnectedAppsErrorBanner surface={connectedAppsErrorSurface} target={CONNECTED_APPS_ERROR_LISTING} error={error} />}
+          installWithBot={installWithBot(selectedListing.id)}
+          onBotCheckedChange={handleInstallBotCheckedChange}
+          onCancel={handleCloseListing}
+          onConfirm={handleInstallSelectedListing}
+        />
+      ) : selectedListing && (
+        <MarketplaceListingDetail
+          listing={selectedListing}
+          canManage={canManage}
+          serverId={serverId}
+          serverName={current.name}
+          promptTextConsent={promptTextConsent}
+          saving={savingClientId === selectedListing.id}
+          errorBanner={<ConnectedAppsErrorBanner surface={connectedAppsErrorSurface} target={CONNECTED_APPS_ERROR_LISTING} error={error} />}
+          botHint={selectedListingBotHint}
+          installWithBot={installWithBot(selectedListing.id)}
+          onClose={handleCloseListing}
+          onAdd={handleInstallSelectedListing}
+          onRequestUninstall={handleRequestUninstallSelectedListing}
+          onBotCheckedChange={handleInstallBotCheckedChange}
+          onReviewed={load}
+          renderPromptTextReviewFrame={renderPromptTextReviewFrame}
+        />
+      )}
+      {discover.service ? (
+        <DiscoverServiceDetail
+          listing={discover.service}
+          context={appViewContext}
+          adding={discover.addingId === discover.service.id}
+          error={discover.detailError}
+          onAdd={canManage ? discover.addOpenService : undefined}
+          onClose={discover.closeService}
+        />
+      ) : null}
 
       {mcpEditor && canManage ? (
         <McpAppEditor
@@ -1982,6 +1847,7 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
               description={formatMessage({ id: "settings.connectedApps.editor.distributionDescription" })}
               status={distributionStatus}
             >
+            <AppServerVouchSwitch client={editingClient} onUpdated={applyUpdatedClient} onError={setError} />
             {sourceOwnedConnectedAppStatusHint(editingClient.publishStatus) ? (
               <Banner live={false} intent="warning" density="sm">
                 {formatMessage({ id: sourceOwnedConnectedAppStatusHint(editingClient.publishStatus)! })}
@@ -2191,7 +2057,7 @@ export function IntegrationsSection({ variant = "settings" }: { variant?: "page"
           loadingLabel={formatMessage({ id: "settings.connectedApps.uninstallingConfirm" })}
           confirmIcon={<Trash2 size={14} />}
           confirmTestId="connected-app-uninstall-confirm-button"
-          layer={selectedListing?.id === marketplaceUninstallTarget.id ? 1 : undefined}
+          layer={selectedListing?.id === marketplaceUninstallTarget.id || selectedInstalledApp?.id === marketplaceUninstallTarget.id ? 1 : undefined}
           onClose={handleCloseMarketplaceUninstall}
           onConfirm={handleConfirmMarketplaceUninstall}
         />

@@ -76,6 +76,27 @@ test("Antigravity's usage is read without the SSH variables, so agy reads the si
   assert.equal(snapshot.accounts[0]?.health, "reauth_required", "not signed in to agy");
 });
 
+// task #1282 (Tenny, #oar-raft:e385094a): OAR 0.113 would read through
+// `kimi web` and let Kimi write its credentials; the read stays read-only.
+test("Kimi's usage is read with Kimi's lock off for the read, so OAR never starts kimi web nor writes credentials", async () => {
+  const given: unknown[] = [];
+  const runtime = defineRuntime({
+    id: "recording",
+    session: (() => {
+      throw new Error("session must not be started by an account-usage read");
+    }) as unknown as Runtime["session"],
+    installation: async () => ({ kind: "available", via: "executable", command: "/usr/local/bin/kimi", version: "2.6.2" }),
+    accountUsage: async (_installation: AvailableInstallation, options) => {
+      given.push(options);
+      return { kind: "unavailable", reason: "access_token_expired" } as const;
+    },
+  });
+  const snapshot = await readOarAccountUsage({ ...BASE, provider: "kimi", deps: { runtime, timeoutMs: 1234 } });
+  assert.deepEqual(given, [{ env: { KIMI_DISABLE_OAUTH_LOCK: "1" }, timeoutMs: 1234, limitResetDetails: false }]);
+  assert.equal(snapshot.accounts[0]?.health, "ok");
+  assert.deepEqual(snapshot.accounts[0]?.windows.map((window) => window.status), ["parse_unavailable"]);
+});
+
 test("installation is probed exactly once per read", async () => {
   const available: InstallationSnapshot = { kind: "available", via: "bundled" };
   const { runtime, seen } = recordingRuntime(available);

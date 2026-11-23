@@ -36,7 +36,6 @@
  */
 import {
   AGENT_CONTEXT_VIEW_FEATURE_FLAG_KEY,
-  AGENT_READ_PROGRESS_FEATURE_FLAG_KEY,
   AGENT_USAGE_FEATURE_FLAG_KEY,
   AGENT_VOICE_FEATURE_FLAG_KEY,
   PRO_SEAT_ADD_FEATURE_FLAG_KEY,
@@ -45,13 +44,12 @@ import {
   APP_PROMPT_TEXT_CONSENT_FEATURE_FLAG_KEY,
   INTERACTIVE_LINK_CARDS_FEATURE_FLAG_KEY,
   ANTIPROTON_HOSTED_RUNTIME_FEATURE_FLAG_KEY,
-  CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY,
   CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY,
   CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY,
   EXTERNAL_CHANNELS_FEATURE_FLAG_KEY,
   HUMAN_AVATAR_BUILDER_FEATURE_FLAG_KEY,
-  PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY,
   PUBLIC_SERVER_FEATURE_FLAG_KEY,
+  QUOTE_REPLY_FEATURE_FLAG_KEY,
   REFERRAL_SOURCE_PROMPT_FEATURE_FLAG_KEY,
   SERVER_LABS_UI_FEATURE_FLAG_KEY,
   SLACK_BRIDGE_FEATURE_FLAG_KEYS,
@@ -89,7 +87,7 @@ export const TASK_V2_CONVERSATIONS_FLAG_KEY = "task_v2_conversations_v0";
 
 /**
  * Deep links v1 (#proj-mobile): the in-app browser guide, the desktop-browser
- * "Open in Raft Desktop" banner, Settings › General › How links open, and the
+ * "Open in Raft Desktop" banner, and the
  * shared "Message not found" landing for a message link. Default off: none of
  * it shows. Also answerable before login (the guide on a signed-out page in
  * WeChat reads it through useDeepLinksFlag's public read).
@@ -124,6 +122,17 @@ export const WEB_PREVIEW_FLAG_KEY = "web_preview_v0";
  * browser: the frame, as before.
  */
 export const DESKTOP_WEB_PREVIEW_VIEW_FLAG_KEY = "desktop_web_preview_view_v0";
+/**
+ * Artifact mini window (#337): in Raft Desktop (a shell with
+ * facts.objectWindows), an Artifact opened from the Artifacts home or "Open in
+ * new window" opens in an object window of its own (features/objectWindows: a
+ * native window the main window's web app renders into) instead of the viewer
+ * over the page. Web (desktop renderer) only: the server stores and evaluates
+ * it and reads it nowhere. Server-scoped, default off, no rules (migration
+ * artifact_mini_window_flag; on in staging by the default-on policy). Off, or
+ * in a browser: the viewer, as before.
+ */
+export const ARTIFACT_MINI_WINDOW_FLAG_KEY = "artifact_mini_window_v0";
 /**
  * Sign in with Raft in Raft Desktop's built-in browser (security design B,
  * Tenny 2026-11-13): a page there that sends the person to Raft's authorize
@@ -184,7 +193,7 @@ export const INBOX_MESSAGE_INPLACE_FLAG_KEY = "inbox_message_inplace_v1";
  */
 export const INBOX_ROW_POSITION_FLAG_KEY = "inbox_row_position_v1";
 
-export { HUMAN_AVATAR_BUILDER_FEATURE_FLAG_KEY, AGENT_READ_PROGRESS_FEATURE_FLAG_KEY, PRO_SEAT_ADD_FEATURE_FLAG_KEY, PRO_PREPAID_FEATURE_FLAG_KEY, APP_PROMPT_TEXT_CONSENT_FEATURE_FLAG_KEY, INTERACTIVE_LINK_CARDS_FEATURE_FLAG_KEY, REFERRAL_SOURCE_PROMPT_FEATURE_FLAG_KEY };
+export { HUMAN_AVATAR_BUILDER_FEATURE_FLAG_KEY, PRO_SEAT_ADD_FEATURE_FLAG_KEY, PRO_PREPAID_FEATURE_FLAG_KEY, APP_PROMPT_TEXT_CONSENT_FEATURE_FLAG_KEY, INTERACTIVE_LINK_CARDS_FEATURE_FLAG_KEY, QUOTE_REPLY_FEATURE_FLAG_KEY, REFERRAL_SOURCE_PROMPT_FEATURE_FLAG_KEY };
 
 const SERVER_FEATURE_FLAG_REGISTRY = {
   // View Context (shared agentContextView.ts). The web reads it for
@@ -193,31 +202,23 @@ const SERVER_FEATURE_FLAG_REGISTRY = {
   agentContextView: AGENT_CONTEXT_VIEW_FEATURE_FLAG_KEY,
   agentLounge: AGENT_LOUNGE_FLAG_KEY,
   agentMigrationHosted: AGENT_MIGRATION_HOSTED_FEATURE_FLAG_KEY,
-  // Agent read progress (shared agentReadProgress.ts): each agent's face on
-  // the last message it read in the open conversation, moved live, and the
-  // agent read line under your latest message (its starting positions are the
-  // read receipts hydrate). Off: no watch, no column.
-  agentReadProgress: AGENT_READ_PROGRESS_FEATURE_FLAG_KEY,
   // Agent token usage (#proj-o11y:#36): the agent panel's Usage tab, for
   // whoever sees Activity. Off: no tab, and GET /agent-usage answers 404.
   agentUsage: AGENT_USAGE_FEATURE_FLAG_KEY,
   // Raft voice (shared agentSideAsk.ts): the agent panel's Voice section, for
-  // whoever may edit the agent (ask / call switches and who asked). Off: no
-  // section, and the voice routes answer 404.
+  // whoever may edit the agent (ask / call switches and who asked), and the
+  // Call buttons (an agent DM's head, the agent's profile). Off: neither, and
+  // the voice routes answer 404.
   agentVoice: AGENT_VOICE_FEATURE_FLAG_KEY,
   antiprotonHostedRuntime: ANTIPROTON_HOSTED_RUNTIME_FEATURE_FLAG_KEY,
   appPromptTextConsent: APP_PROMPT_TEXT_CONSENT_FEATURE_FLAG_KEY,
-  // Forum-style channels (#proj-chat:#24): the channel settings switch and the
-  // activity-ordered timeline of a channel set to `threadSort: "activity"`.
-  // Off: every channel shows in post order and the switch is hidden.
-  channelThreadSort: CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY,
   // Channel announcements (#proj-chat:#29): the strip under the channel header
   // and the Announcement row in channel details (components/channel/
   // ChannelAnnouncement*). Off: neither, and no announcement is read.
   channelAnnouncement: CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY,
   // Claude limit resets on the Computer usage card (RuntimeAccountUsageChip,
-  // features/computer/ClaudeLimitResetsDialog): View available resets and Use
-  // per kind, where the Computer also advertises the Claude driver. Off:
+  // features/computer/ClaudeLimitResetsDialog): Use a limit reset (read, then
+  // use one kind), where the Computer also advertises the Claude driver. Off:
   // nothing new on the card; the server refuses Claude resets too.
   claudeLimitReset: CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY,
   deepLinks: DEEP_LINKS_FLAG_KEY,
@@ -237,13 +238,15 @@ const SERVER_FEATURE_FLAG_REGISTRY = {
   // Interactive link cards (RFC 076): App links read in one batched v2 read
   // per message (components/message/useAppLinkPreviews.ts). Off: the GET.
   interactiveLinkCards: INTERACTIVE_LINK_CARDS_FEATURE_FLAG_KEY,
-  providerConnections: PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY,
   raftbenchOverview: RAFTBENCH_OVERVIEW_FLAG_KEY,
   personalAssistant: PERSONAL_ASSISTANT_FLAG_KEY,
   // Adding Pro seats in place from Create Agent, Invite and Guest → member.
   proSeatAdd: PRO_SEAT_ADD_FEATURE_FLAG_KEY,
   // Prepaid Pro paid once with Alipay (task #19): its choice in the upgrade dialog.
   proPrepaid: PRO_PREPAID_FEATURE_FLAG_KEY,
+  // Quote Reply v0 (#proj-chat:#34): structured jumpable quote replies.
+  // Off: selection quote inserts plain Markdown `> ...` as before.
+  quoteReply: QUOTE_REPLY_FEATURE_FLAG_KEY,
   // "How did you hear about Raft?" asked once of a new account outside the
   // owner setup survey (components/onboarding/ReferralSourcePrompt). Off: no card.
   referralSourcePrompt: REFERRAL_SOURCE_PROMPT_FEATURE_FLAG_KEY,
@@ -253,6 +256,8 @@ const SERVER_FEATURE_FLAG_REGISTRY = {
   slackBridge: SLACK_BRIDGE_FEATURE_FLAG_KEYS.master,
   webPreview: WEB_PREVIEW_FLAG_KEY,
   desktopWebPreviewView: DESKTOP_WEB_PREVIEW_VIEW_FLAG_KEY,
+  // An Artifact in an object window of its own in Raft Desktop (#337).
+  artifactMiniWindow: ARTIFACT_MINI_WINDOW_FLAG_KEY,
   desktopBrowserRaftSignIn: DESKTOP_BROWSER_RAFT_SIGN_IN_FLAG_KEY,
   workspaceArtifacts: WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY,
 } as const;

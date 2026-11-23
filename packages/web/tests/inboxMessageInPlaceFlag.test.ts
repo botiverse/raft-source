@@ -116,6 +116,8 @@ const GROUPS = [
 
 let served: InboxItem[] = [];
 let reads: Array<{ reason: unknown; trigger: unknown }> = [];
+/** X-Raft-Fetch-Refused of each read, in order (#244). */
+let refusals: unknown[] = [];
 let hold: Promise<void> | null = null;
 type Trace = { outcome: string; detail: string; attrs: Record<string, unknown> };
 let traces: Trace[] = [];
@@ -124,6 +126,7 @@ function serve() {
   api.get = (async (url: string, config?: { headers?: Record<string, string> }) => {
     if (url !== "/channels/inbox") return { data: {}, headers: {} };
     reads.push({ reason: config?.headers?.["X-Raft-Fetch-Reason"], trigger: config?.headers?.["X-Raft-Fetch-Trigger"] });
+    refusals.push(config?.headers?.["X-Raft-Fetch-Refused"]);
     if (hold) await hold;
     return {
       headers: {},
@@ -166,6 +169,7 @@ function reset(items: InboxItem[], flagOn: boolean) {
   });
   served = [];
   reads = [];
+  refusals = [];
   hold = null;
   traces = [];
   __setStateTransitionEmitterForTest((name, attrs) => {
@@ -463,5 +467,53 @@ test("read_persisted is unchanged: with only the message flag on, a persisted re
     notifyChannelReadPersistedLocally({ channelId: "channel-244", serverId: SERVER, serverEpoch: 1, principalId: getCurrentPrincipalId() });
     await vi.advanceTimersByTimeAsync(0);
     assert.deepEqual(reads, [{ reason: "realtime_fallback", trigger: "read_persisted" }]);
+  } finally { restore(); }
+});
+
+test("#244: a thread reply whose row is not listed re-reads with X-Raft-Fetch-Refused: not_listed", async () => {
+  reset([otherRow(), channelRow()], true);
+  try {
+    threadUpdated(reply());
+    await vi.advanceTimersByTimeAsync(0);
+    assert.deepEqual(reads, [{ reason: "realtime_fallback", trigger: "thread_reply" }]);
+    assert.deepEqual(refusals, ["not_listed"]);
+  } finally { restore(); }
+});
+
+test("#244: a thread reply on a listed row of a list not settled re-reads with not_settled", async () => {
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["Unread filter", { filter: "unread" }],
+    ["a read in flight", { loading: true }],
+    ["its facet group not loaded", { groups: [GROUPS[1]] }],
+  ];
+  for (const [name, state] of cases) {
+    reset([threadRow(), otherRow()], true);
+    useInboxStore.setState(state as never);
+    try {
+      threadUpdated(reply());
+      await vi.advanceTimersByTimeAsync(0);
+      if (name === "a read in flight") useInboxStore.setState({ loading: false });
+      await vi.advanceTimersByTimeAsync(INBOX_BACKGROUND_REFRESH_INTERVAL_MS);
+      // Its answer may bring more reads (a catch-up): the first is the reply's.
+      assert.equal(reads[0]?.trigger, "thread_reply", name);
+      assert.equal(refusals[0], "not_settled", name);
+    } finally { restore(); }
+  }
+});
+
+test("#244: a complete patch with the flag off re-reads with flag_off; a message with no seq with no_seq", async () => {
+  reset([otherRow(), channelRow()], false);
+  try {
+    socketHandler("message:new")(message());
+    await vi.advanceTimersByTimeAsync(0);
+    assert.deepEqual(reads, [{ reason: "realtime_fallback", trigger: "message_new" }]);
+    assert.deepEqual(refusals, ["flag_off"]);
+  } finally { restore(); }
+  reset([otherRow(), channelRow()], true);
+  try {
+    socketHandler("message:new")(message({ seq: undefined }));
+    await vi.advanceTimersByTimeAsync(0);
+    assert.deepEqual(reads, [{ reason: "realtime_fallback", trigger: "message_new" }]);
+    assert.deepEqual(refusals, ["no_seq"]);
   } finally { restore(); }
 });

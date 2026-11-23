@@ -21,6 +21,7 @@
     "test:ax-book": "vitest run scripts/visualize/ax-surfaces/book.test.ts"
   },
   "devDependencies": {
+    "@botiverse/lint": "^0.1.0",
     "@oxc-node/core": "^0.1.6",
     "libpg-query": "17.8.2",
     "marked": "^18.0.7",

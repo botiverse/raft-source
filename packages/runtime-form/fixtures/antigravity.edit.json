@@ -1,7 +1,7 @@
 {
   "protocolVersion": 2,
   "runtimeId": "antigravity",
-  "schemaVersion": "antigravity.edit.v1",
+  "schemaVersion": "antigravity.create.v1",
   "requiredClientCapabilities": [
     "select.custom_value"
   ],
@@ -51,7 +51,7 @@
     "localization": {
       "model": {
         "label": "Model",
-        "hint": "Models available to this computer's Antigravity login. AGY configured default lets Antigravity choose. You can also type a model ID."
+        "hint": "Models available to this computer's Antigravity login; the one Antigravity starts on is preselected. You can also type a model ID."
       },
       "reasoningEffort": {
         "label": "Reasoning",
@@ -108,14 +108,14 @@
     "model": {
       "protocolVersion": 1,
       "runtimeId": "antigravity",
-      "schemaVersion": "antigravity.edit.v1",
+      "schemaVersion": "antigravity.create.v1",
       "sourceId": "model",
       "kind": "select",
       "pointer": "/model"
     }
   },
   "values": {
-    "model": "default",
+    "model": "",
     "reasoningEffort": "",
     "envVars": {
       "EXAMPLE_FLAG": "1"

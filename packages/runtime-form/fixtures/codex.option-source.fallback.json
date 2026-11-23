@@ -7,6 +7,32 @@
   "pointer": "/model",
   "options": [
     {
+      "value": "gpt-6.2-sol",
+      "label": "GPT-6.2 Sol",
+      "supportedReasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoningEffort": "low"
+    },
+    {
+      "value": "gpt-6.2-astra",
+      "label": "GPT-6.2 Astra",
+      "supportedReasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoningEffort": "low"
+    },
+    {
       "value": "gpt-6.1-sol",
       "label": "GPT-6.1 Sol",
       "supportedReasoningEfforts": [
@@ -196,7 +222,7 @@
       ]
     }
   ],
-  "defaultValue": "gpt-6.1-sol",
+  "defaultValue": "gpt-6.2-sol",
   "customValueAllowed": true,
   "status": "fallback",
   "reason": "missing_config",

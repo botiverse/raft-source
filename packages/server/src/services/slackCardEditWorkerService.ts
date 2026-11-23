@@ -221,7 +221,13 @@ async function claimDueSync(db: Database, input: { registrationId: string; lease
       sql`EXISTS (SELECT 1 FROM ${externalChannelBindings}
         WHERE ${externalChannelBindings.id}::text = ${externalCardEditSyncs.bindingId}
           AND ${externalChannelBindings.registrationId} = ${input.registrationId}::uuid)`,
-    )).orderBy(asc(sql`coalesce(${externalCardEditSyncs.leaseExpiresAt}, ${externalCardEditSyncs.nextAttemptAt})`))
+    )).orderBy(
+      asc(sql`coalesce(${externalCardEditSyncs.leaseExpiresAt}, ${externalCardEditSyncs.nextAttemptAt})`),
+      // Syncs due at the same moment are taken oldest first, then by id, so the
+      // order never depends on where the rows happen to sit in the table.
+      asc(externalCardEditSyncs.createdAt),
+      asc(externalCardEditSyncs.id),
+    )
       .for("update", { skipLocked: true }).limit(1);
     if (!candidate) return { kind: "empty" as const };
     // Any attempt still `sending` while nobody holds a live lease is unknown.

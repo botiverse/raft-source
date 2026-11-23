@@ -8,17 +8,20 @@ import { useAuthStore } from "../../store/authStore";
 import { getApiErrorResponse } from "../../utils/apiErrorResponse";
 import type { Task } from "../../store/taskStore";
 import { useTaskStore } from "../../store/taskStore";
+import { useCanWriteTaskChannel } from "./taskChannelWrite";
 import { TaskDeleteConfirmDialog } from "./TaskDeleteConfirmDialog";
 
 /**
  * Who may delete a task, as the server's DELETE /tasks/:id decides it: the
  * person who created it, or someone holding deleteAnyTask (admins, owners).
- * A historical joint task is read-only from a participant workspace.
+ * A historical joint task is read-only from a participant workspace, and so
+ * is any task to someone who may not write in its channel (taskChannelWrite).
  */
 export function useCanDeleteTask(task: Task): boolean {
   const currentUserId = useAuthStore((s) => s.user?.id ?? null);
   const { capabilities } = useServerPermissions();
-  if (task.readOnlyReason) return false;
+  const canWriteChannel = useCanWriteTaskChannel(task.channelId);
+  if (task.readOnlyReason || !canWriteChannel) return false;
   const isCreator = task.createdByType === "user" && currentUserId !== null && task.createdById === currentUserId;
   return isCreator || capabilities.deleteAnyTask;
 }

@@ -1,0 +1,24 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "kitchen-sink-choices",
+  "schemaVersion": "kitchen-sink-choices.create.v1",
+  "sourceId": "selectFilled",
+  "kind": "select",
+  "pointer": "/selectFilled",
+  "options": [
+    {
+      "value": "alpha",
+      "label": "Alpha"
+    },
+    {
+      "value": "beta",
+      "label": "Beta"
+    },
+    {
+      "value": "gamma",
+      "label": "Gamma"
+    }
+  ],
+  "defaultValue": "beta",
+  "status": "live"
+}

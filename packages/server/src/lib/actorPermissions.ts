@@ -239,7 +239,8 @@ export function decideAgentConnectorAuthority(
  * Whether an agent may be bound to a connector: a connection carries the identity of whoever signed
  * it in, so only its creator's own agent may act with it. Being a server admin doesn't change that;
  * admins can still disconnect one. An agent with no owner, or a connector with no recorded creator,
- * can't be bound. Same rule as MCP Apps' mcpConnectionUsableByAgent, which also has a shared default.
+ * can't be bound. (MCP Apps had the same rule until RFC 087 replaced it with shared and personal
+ * Connections.)
  */
 export function connectorAssignableToAgent(connectorCreatorId: string | null, agentOwnerUserId: string | null): boolean {
   return agentOwnerUserId !== null && connectorCreatorId !== null && connectorCreatorId === agentOwnerUserId;

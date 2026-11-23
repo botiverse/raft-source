@@ -1,13 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, ne, or, sql, type AnyColumn } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import { getDb, type DatabaseExecutor } from "../db";
 import { agents, integrationAuditEvents, oauthClients, oauthClientInstalls, oauthAppLinkPreviews, oauthLinkPreviewDeclines, oauthUserConsents, servers, serverMembers, users, type AppLinkPreviewSuspendReason } from "../db/schema";
 import { isOwnServerOfLocalApp } from "./linkCardExecuteEligibility";
 import { isApprovedOfficialAppClient } from "./officialAppAutoInstallService";
 import { appHosts } from "../platform/links";
-import { appLinkPreviewRegistrationSchema, appLinkPreviewResponseSchema, appLinkReadUrls, matchesAppPreview, DEFAULT_APP_LINK_PREVIEW_VERSIONS, type AppLinkPreview, type AppLinkPreviewPrompt, type AppLinkPreviewRevision, type AppLinkPreviewVersion } from "@botiverse/raft-shared/src/appLinkPreview";
+import { appLinkPreviewRegistrationSchema, appLinkPreviewResponseSchema, appLinkReadUrls, matchesAppPreview, takeLinkCardObjectRef, DEFAULT_APP_LINK_PREVIEW_VERSIONS, type AppLinkPreview, type AppLinkPreviewPrompt, type AppLinkPreviewRevision, type AppLinkPreviewVersion, type LinkCardObjectKeySha256 } from "@botiverse/raft-shared/src/appLinkPreview";
+import { linkCardObjectKeySha256, recordLinkCardReaders } from "./linkCardReaders";
 import { previewHttp, type PreviewHttp } from "./appLinkPreviewHttp";
 import { validateOAuthScopesForClient } from "./oauthService";
+import { isAccountLoginEnabledFor } from "./oauthAccountLogin";
 import { marketplaceReviewApplies, nextActionEndpointState } from "./appActionEndpointPolicy";
 import { hasOfficialAppRegistryEntry } from "./officialAppAutoInstallService";
 import { oidcIssuer, signAppLinkPreviewAssertion } from "./oidcService";
@@ -663,6 +666,33 @@ export async function readAppLinkPreview(clientId: string): Promise<RegisteredAp
 /** What a link preview tells an App about its viewer, and so what the viewer's consent must cover. */
 export const LINK_PREVIEW_SCOPES = ["openid", "profile"] as const;
 
+/** A consent row covers what a link preview tells the App (jsonb containment, as every preview check reads it). */
+export const coversLinkPreviewScopes = (scopes: AnyColumn) => sql`${scopes}::jsonb @> ${JSON.stringify(LINK_PREVIEW_SCOPES)}::jsonb`;
+
+/**
+ * RFC 079 D17: a consent or decline row (its `server_id` column) that counts
+ * on this Server: the Server's own, or one with no Server, which only an
+ * account-mode App holds (oauth_login_row_mode_guard) and which counts on
+ * every Server. For reads that find the row by id or with the App's mode in
+ * hand; registeredApps reads the two separately.
+ */
+export const onServerOrEveryServer = (serverIdColumn: AnyColumn, serverId: string) => or(eq(serverIdColumn, serverId), isNull(serverIdColumn));
+
+/**
+ * RFC 079 D7: a guest cannot use an account-mode App on that Server (check 2
+ * of §5.5), so an account-mode App neither previews nor prompts for a guest
+ * viewer there, and a guest cannot answer its prompt: the App never gets a
+ * guest's identity for that Server. Server-mode Apps are as before. Reads
+ * oauthClients and serverMembers (the viewer's membership of this Server) as
+ * joined by the caller.
+ */
+export const notGuestOfAccountModeApp = () => or(ne(oauthClients.loginMode, "account"), ne(serverMembers.role, "guest"));
+
+// RFC 079 D17: an account-mode App's consent and decline with no Server (one
+// per viewer and App) count on every Server. Read beside the per-Server rows.
+const accountConsents = alias(oauthUserConsents, "account_consents");
+const accountDeclines = alias(oauthLinkPreviewDeclines, "account_declines");
+
 /**
  * The link-preview Apps for these origins that the viewer could see on this
  * Server: enabled, actively installed there, the viewer a member, the App
@@ -675,14 +705,21 @@ export type RegisteredApp = {
   /** `serverId` and `appType`: the App's own Server and distribution (RFC 076 §17), not the viewer's. */
   app: {
     id: OAuthClientRow["id"]; name: OAuthClientRow["name"]; key: OAuthClientRow["clientId"]; icon: OAuthClientRow["logoUrl"]; allowedScopes: OAuthClientRow["allowedScopes"];
-    serverId: OAuthClientRow["serverId"]; appType: OAuthClientRow["appType"];
+    serverId: OAuthClientRow["serverId"]; appType: OAuthClientRow["appType"]; loginMode: OAuthClientRow["loginMode"];
   };
   installationId: (typeof oauthClientInstalls.$inferSelect)["id"];
   /** The installation's card-button state on this Server (RFC 076 §17; unreviewedActionsBasis). */
   installation: Pick<typeof oauthClientInstalls.$inferSelect, "allowedActionEndpoint" | "actionsOffAt">;
   serverSlug: (typeof servers.$inferSelect)["slug"];
   serverRole: (typeof serverMembers.$inferSelect)["role"];
+  /**
+   * The consent that lets previews run here: an account-mode App's consent
+   * with no Server (only while the kill switch is on for the viewer), else
+   * the consent on this Server (for an account-mode App, one given before it
+   * switched, which keeps counting here only).
+   */
   consentId: (typeof oauthUserConsents.$inferSelect)["id"] | null;
+  /** The decline that stops them: an account-mode App's decline with no Server, else the one on this Server. */
   declineId: (typeof oauthLinkPreviewDeclines.$inferSelect)["id"] | null;
 };
 type OAuthClientRow = typeof oauthClients.$inferSelect;
@@ -691,28 +728,47 @@ export async function registeredApps(serverId: string, userId: string, origins: 
   const rows = await getDb().select({
     config: oauthAppLinkPreviews,
     app: { id: oauthClients.id, name: oauthClients.name, key: oauthClients.clientId, icon: oauthClients.logoUrl, allowedScopes: oauthClients.allowedScopes,
-      serverId: oauthClients.serverId, appType: oauthClients.appType },
+      serverId: oauthClients.serverId, appType: oauthClients.appType, loginMode: oauthClients.loginMode },
     installationId: oauthClientInstalls.id,
     installation: { allowedActionEndpoint: oauthClientInstalls.allowedActionEndpoint, actionsOffAt: oauthClientInstalls.actionsOffAt },
     serverSlug: servers.slug, serverRole: serverMembers.role,
-    consentId: oauthUserConsents.id, declineId: oauthLinkPreviewDeclines.id,
+    serverConsentId: oauthUserConsents.id, accountConsentId: accountConsents.id,
+    serverDeclineId: oauthLinkPreviewDeclines.id, accountDeclineId: accountDeclines.id,
   }).from(oauthAppLinkPreviews)
     .innerJoin(oauthClients, and(eq(oauthClients.id, oauthAppLinkPreviews.clientId), eq(oauthClients.enabled, true)))
     .innerJoin(oauthClientInstalls, and(eq(oauthClientInstalls.clientId, oauthClients.id), eq(oauthClientInstalls.serverId, serverId), eq(oauthClientInstalls.status, "active")))
     .innerJoin(servers, and(eq(servers.id, serverId), isNull(servers.deletedAt)))
     .innerJoin(serverMembers, and(eq(serverMembers.serverId, serverId), eq(serverMembers.userId, userId)))
     .leftJoin(oauthUserConsents, and(eq(oauthUserConsents.userId, userId), eq(oauthUserConsents.serverId, serverId), eq(oauthUserConsents.clientId, oauthClients.id),
-      isNull(oauthUserConsents.revokedAt), sql`${oauthUserConsents.scopes}::jsonb @> ${JSON.stringify(LINK_PREVIEW_SCOPES)}::jsonb`))
+      isNull(oauthUserConsents.revokedAt), coversLinkPreviewScopes(oauthUserConsents.scopes)))
+    .leftJoin(accountConsents, and(eq(oauthClients.loginMode, "account"), eq(accountConsents.userId, userId), isNull(accountConsents.serverId),
+      eq(accountConsents.clientId, oauthClients.id), isNull(accountConsents.revokedAt), coversLinkPreviewScopes(accountConsents.scopes)))
     .leftJoin(oauthLinkPreviewDeclines, and(eq(oauthLinkPreviewDeclines.userId, userId), eq(oauthLinkPreviewDeclines.serverId, serverId),
       eq(oauthLinkPreviewDeclines.clientId, oauthClients.id)))
-    .where(and(inArray(oauthAppLinkPreviews.origin, origins), isNull(oauthAppLinkPreviews.suspendedAt)));
-  return rows.filter((row) => validateOAuthScopesForClient(LINK_PREVIEW_SCOPES, { clientId: row.app.key, allowedScopes: row.app.allowedScopes }).allowed);
+    .leftJoin(accountDeclines, and(eq(oauthClients.loginMode, "account"), eq(accountDeclines.userId, userId), isNull(accountDeclines.serverId),
+      eq(accountDeclines.clientId, oauthClients.id)))
+    .where(and(inArray(oauthAppLinkPreviews.origin, origins), isNull(oauthAppLinkPreviews.suspendedAt), notGuestOfAccountModeApp()));
+  const allowed = rows.filter((row) => validateOAuthScopesForClient(LINK_PREVIEW_SCOPES, { clientId: row.app.key, allowedScopes: row.app.allowedScopes }).allowed);
+  // The kill switch, read once per call and only when an account-mode App is among the rows.
+  const accountLoginOn = allowed.some((row) => row.app.loginMode === "account") && await isAccountLoginEnabledFor(userId);
+  return allowed.flatMap(({ serverConsentId, accountConsentId, serverDeclineId, accountDeclineId, ...row }): RegisteredApp[] => {
+    if (row.app.loginMode !== "account" || accountLoginOn) {
+      return [{ ...row, consentId: accountConsentId ?? serverConsentId, declineId: accountDeclineId ?? serverDeclineId }];
+    }
+    // Kill switch off for the viewer: the account consent does not exist,
+    // and the App gets no prompt (it could not be answered). Only a consent
+    // or decline given on this Server before the switch keeps the App here,
+    // as before; a decline for every Server still stops it.
+    if (serverConsentId === null && serverDeclineId === null) return [];
+    return [{ ...row, consentId: serverConsentId, declineId: accountDeclineId ?? serverDeclineId }];
+  });
 }
 
-// The human must have consented to this App on this Server (Login with Raft or
-// the preview prompt), not since revoked, and not declined previews from it.
-// Token expiry does not matter: human tokens live an hour. Viewing a message
-// never creates consent or sends identity to an unconnected App.
+// The human must have consented to this App (Login with Raft or the preview
+// prompt) on this Server, or once for every Server when the App is in
+// account mode (RFC 079 D17) and the kill switch oauth_account_login is on
+// for them, not since revoked, and not declined previews from it. Token expiry does not matter: human tokens live an hour. Viewing a
+// message never creates consent or sends identity to an unconnected App.
 export const previewable = (row: RegisteredApp) => row.consentId !== null && row.declineId === null;
 // A decline hides the prompt as well as the preview.
 const promptable = (row: RegisteredApp) => row.consentId === null && row.declineId === null;
@@ -759,12 +815,15 @@ export async function withCallbackSlot<T>(userId: string, run: () => Promise<T>)
  * that rendered it (its `logoUrl`, as in the App listings), or null. Never an
  * image the App sends in the preview. It is a top-level field, not one on each
  * preview, because deployed clients parse each preview strictly and would drop
- * them all over an unknown field.
+ * them all over an unknown field. So is `objectKeys`: each preview `url` whose
+ * App named its object (`object_ref`) -> that object's key, the
+ * `object_key_sha256` a batched read item carries; the viewer is recorded as a
+ * recent reader of those objects in the background (linkCardReaders.ts).
  */
-export async function resolveAppLinkPreviews(input: { serverId: string; userId: string; content: string; stillVisible: () => Promise<boolean> }): Promise<{ previews: AppLinkPreview[]; prompts: AppLinkPreviewPrompt[]; appIcons: Record<string, string | null> }> {
+export async function resolveAppLinkPreviews(input: { serverId: string; userId: string; content: string; stillVisible: () => Promise<boolean> }): Promise<{ previews: AppLinkPreview[]; prompts: AppLinkPreviewPrompt[]; appIcons: Record<string, string | null>; objectKeys: Record<string, LinkCardObjectKeySha256> }> {
   // Raft's own objects' links (an Artifact's) are not counted toward the three.
   const urls = appLinkReadUrls(input.content, appHosts());
-  if (!urls.length) return { previews: [], prompts: [], appIcons: {} };
+  if (!urls.length) return { previews: [], prompts: [], appIcons: {}, objectKeys: {} };
   const now = currentDate();
   const apps = await registeredApps(input.serverId, input.userId, [...new Set(urls.map((url) => new URL(url).origin))]);
   const found = apps.filter(previewable);
@@ -778,7 +837,7 @@ export async function resolveAppLinkPreviews(input: { serverId: string; userId: 
   const available = found.filter(proven);
   const prompts = linkPreviewPrompts(urls, apps, now);
   // fanout-ok: appLinkReadUrls caps this list at three URLs; each has one callback and bounded authority reads.
-  const results = await Promise.all(urls.map(async (url): Promise<{ preview: AppLinkPreview; icon: string | null } | null> => {
+  const results = await Promise.all(urls.map(async (url): Promise<{ preview: AppLinkPreview; icon: string | null; objectKey: LinkCardObjectKeySha256 | null } | null> => {
     const matched = available.filter((entry) => matchesAppPreview(url, entry.config));
     if (matched.length !== 1) return null;
     const entry = matched[0];
@@ -787,7 +846,9 @@ export async function resolveAppLinkPreviews(input: { serverId: string; userId: 
       const assertion = signAppLinkPreviewAssertion({ issuer: oidcIssuer(undefined, entry.serverSlug), clientKey: linkPreviewAudienceKey(entry),
         userId: input.userId, serverId: input.serverId, serverRole: entry.serverRole, installationId: entry.installationId, url, requestId, now: currentDate() });
       const result = await withCallbackSlot(input.userId, () => http(entry.config.endpoint, JSON.stringify({ version: 1, url, request_id: requestId }), assertion, { response: "preview" }));
-      const parsed = appLinkPreviewResponseSchema.safeParse(result);
+      // The App's object_ref is taken out before the strict schema reads the answer.
+      const { answer, objectRef } = takeLinkCardObjectRef(result);
+      const parsed = appLinkPreviewResponseSchema.safeParse(answer);
       if (!parsed.success) return null;
       // A slow callback must not revive disabled/uninstalled/revoked/declined
       // authority or return an old message's preview after an edit/delete/access change.
@@ -795,13 +856,16 @@ export async function resolveAppLinkPreviews(input: { serverId: string; userId: 
       if (!current.some((v) => v.app.id === entry.app.id && v.installationId === entry.installationId && v.config.revision === entry.config.revision
         && provenWithin(v.config.verifiedAt, LINK_PREVIEW_PROOF_HARD_TTL_MS, currentDate()))
         || !await input.stillVisible()) return null;
-      return { preview: { ...parsed.data, url, appName: entry.app.name }, icon: entry.app.icon };
+      return { preview: { ...parsed.data, url, appName: entry.app.name }, icon: entry.app.icon, objectKey: objectRef ? linkCardObjectKeySha256(entry.app.id, objectRef) : null };
     } catch { return null; } // Never log callback URL, assertion, body or private response.
   }));
   const rendered = results.filter((value) => value !== null);
+  const objectKeys = Object.fromEntries(rendered.flatMap((value) => value.objectKey ? [[value.preview.url, value.objectKey]] : []));
+  recordLinkCardReaders({ serverId: input.serverId, viewerId: input.userId, objectKeys: Object.values(objectKeys) });
   return {
     previews: rendered.map((value) => value.preview),
     prompts,
     appIcons: Object.fromEntries(rendered.map((value) => [value.preview.url, value.icon])),
+    objectKeys,
   };
 }

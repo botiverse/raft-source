@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { RefObject } from "react";
+import { useOwnerDocument } from "../../utils/ownerDocument";
 import { registerShortcutHandler } from "./dispatcher";
 import type { ShortcutHandler } from "./dispatcher";
 
@@ -32,9 +33,12 @@ export function useShortcut(id: string, handler: ShortcutHandler, { enabled = tr
     handlerRef.current = handler;
     enabledRef.current = enabled;
   });
+  // Keys typed in the document this component is drawn in (an object window's, features/objectWindows).
+  const doc = useOwnerDocument();
   useEffect(() => registerShortcutHandler(id, () => handlerRef.current, {
     enabled: () => enabledRef.current,
     node: scopeRef ? () => scopeRef.current : undefined,
     ambient,
-  }), [id, scopeRef, ambient]);
+    doc,
+  }), [id, scopeRef, ambient, doc]);
 }

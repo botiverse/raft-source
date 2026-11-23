@@ -203,7 +203,7 @@ test("the theme leaves the page's CSP, sandbox, permissions and capabilities as 
     egress: LIBRARY_CDNS,
     runtime: "1",
     // As the Worker's own.
-    capabilities: { annotate: {}, comments: {}, copyText: {}, find: {}, openLink: {} },
+    capabilities: { annotate: {}, comments: {}, copyText: {}, find: {}, linkLabels: {}, openLink: {} },
     layout: { kind: "fill" },
     errors: "host",
   } as const;

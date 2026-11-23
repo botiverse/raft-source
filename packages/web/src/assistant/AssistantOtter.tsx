@@ -45,8 +45,9 @@ import { useMyAssistant } from "./assistantClient";
 import type { AssistantOwnerSettings, AssistantRecord } from "./assistantClient";
 import { useAssistantPause } from "./AssistantPaused";
 import { activateOtterHost, otterHostOrder, useAssistantOtterMood, useOtterHost, useOtterShown } from "./assistantOtterState";
-import { composerFrameOf, composerNoticesOf, composerTopEdge, contentBand, findDockPane, placeDock, readPaneBoxes, setOtterDock, snapOtter, useOtterDock, viewportBox } from "./assistantOtterDock";
+import { composerFrameOf, composerNoticesOf, composerTopEdge, contentBand, placeDock, readPaneBoxes, setOtterDock, snapOtter, useOtterDock, viewportBox } from "./assistantOtterDock";
 import type { DockPlacement, OtterDock, OtterSize, SnapTarget } from "./assistantOtterDock";
+import { useDockPlacement } from "./useOtterDockPlacement";
 import type { OtterMood } from "./assistantOtterState";
 import type { AssistantOrigin } from "./AssistantContextChip";
 import { carryAssistantOpen, currentHistoryIdx, rememberAssistantExpandOrigin, takeAssistantCarry, takeAssistantReopen } from "./assistantExpand";
@@ -533,8 +534,7 @@ function OtterZzz({ right, bottom }: { right: number; bottom: number }) {
  * Its moves, played on its layer (whose origin is the edge point): a new
  * place (dropped, back to the composer when its pane closes, back to its
  * edge when it opens again, another composer) is reached along an arc from
- * where it was, or from the hand after a drop, then a squash on landing.
- * Nothing with reduced motion.
+ * where it was, or from the hand after a drop, then a squash on landing. Nothing with reduced motion.
  */
 function useOtterMotion({ layerRef, anchorRef, dock, placement, dropAt, facing, entering }: {
   layerRef: RefObject<HTMLSpanElement | null>;
@@ -556,44 +556,11 @@ function useOtterMotion({ layerRef, anchorRef, dock, placement, dropAt, facing, 
     const prev = last.current;
     const moved = prev !== null && (prev.dock !== dock || prev.docked !== (placement !== null) || prev.anchor !== anchorEl);
     const from = dropAt.current ?? (moved ? prev : null);
+    // oxlint-disable-next-line react/immutability -- `dropAt` is a ref object passed in by the caller; taking the drop point out of it in the layout effect is what a ref is for.
     dropAt.current = null;
     last.current = { ...point, dock, docked: placement !== null, anchor: anchorEl };
     if (from && !entering) playOtterFlight(layerRef.current, from.x - point.x, from.y - point.y, facing);
   });
-}
-
-/**
- * Where a dock puts the otter now: null while its pane is not on screen (it
- * then lies on its composer). Measured again when the pane or the window
- * changes size, and after a layout transition (a sidebar sliding).
- */
-function useDockPlacement(dock: OtterDock | null, size: OtterSize, anchorRef: RefObject<HTMLSpanElement | null>): DockPlacement | null {
-  const [placement, setPlacement] = useState<DockPlacement | null>(null);
-  useLayoutEffect(() => {
-    let pane = dock ? findDockPane(dock.pane) : null;
-    const place = (): DockPlacement | null => {
-      if (!dock) return null;
-      if (!pane || !pane.isConnected) pane = findDockPane(dock.pane);
-      return pane ? placeDock(dock, pane.getBoundingClientRect(), size, contentBand(anchorRef.current)) : null;
-    };
-    const measure = () => {
-      const next = place();
-      setPlacement((prev) => (prev === next || (prev && next && prev.x === next.x && prev.y === next.y && prev.facing === next.facing) ? prev : next));
-    };
-    measure();
-    if (!dock) return;
-    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
-    if (pane) observer?.observe(pane);
-    observer?.observe(document.documentElement);
-    window.addEventListener("resize", measure);
-    document.addEventListener("transitionend", measure, true);
-    return () => {
-      observer?.disconnect();
-      window.removeEventListener("resize", measure);
-      document.removeEventListener("transitionend", measure, true);
-    };
-  }, [dock, size, anchorRef]);
-  return placement;
 }
 
 /** Under the pointer now, the edge a drop there lands on, and where on it the otter would lie. */

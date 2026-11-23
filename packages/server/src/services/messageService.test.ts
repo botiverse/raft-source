@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { BasicTracer, CANONICAL_MESSAGE_FIELD_DESCRIPTORS, MemoryTraceSink, MESSAGE_REPLIES_SYNC_WINDOW_PRODUCER } from "@botiverse/raft-shared";
 import { enrichedMessagePayloadKeys } from "./messageRealtimeProducerRegistry";
-import { broadcastAndDeliver, broadcastSystemMessage, createMessage, recordInboxFactsForPersistedMessages, deliverExternalInboundCommittedMessageToAgents, deliverMessageToAgent, deliverMessageToAgents, emitExternalProjectionMessageToFrontend, runExternalInboundCommitSideEffects, emitExternalLinkedMessageUpdateToFrontend, getAgentResumeCatchupMessages, type AgentResumeCatchupResult, getSenderPendingMentionActions, getSenderReadReceiptInFlightCountForTests, planDirectMentionThreadFollow, registerSenderReadReceiptForTests, __resetMessageServiceDepsForTests, __setMessageServiceDepsForTests } from "./messageService";
+import { broadcastAndDeliver, broadcastSystemMessage, broadcastSystemMessageToLocalSurfaces, createMessage, recordInboxFactsForPersistedMessages, deliverExternalInboundCommittedMessageToAgents, deliverMessageToAgent, deliverMessageToAgents, emitExternalProjectionMessageToFrontend, runExternalInboundCommitSideEffects, emitExternalLinkedMessageUpdateToFrontend, getAgentResumeCatchupMessages, type AgentResumeCatchupResult, getSenderPendingMentionActions, getSenderReadReceiptInFlightCountForTests, planDirectMentionThreadFollow, registerSenderReadReceiptForTests, __resetMessageServiceDepsForTests, __setMessageServiceDepsForTests } from "./messageService";
 import { __resetAgentSendReplayDbForTests, __setAgentSendReplayDbForTests } from "./agentSendReplayService";
 import { CompatibilityReadMutationPendingError } from "./readMutationSequencer";
 import { recordInboxNotificationFacts } from "./inboxNotificationService";
@@ -1007,7 +1007,7 @@ test("broadcastAndDeliver message:new and send response carry every manifest mes
     renderAgentReadablePermalinks: async (content: string) => content,
     getSenderIdentity: async (_senderType, senderId, fallbackName) => {
       senderIdentityCalls.push(senderId);
-      return { uniqueName: fallbackName, description: "Reviews pull requests" };
+      return { uniqueName: fallbackName, description: { text: "Reviews pull requests", subject: { kind: "agent", serverId: "server-1" } } };
     },
     getMentionFactsForMessages: async () => new Map(),
     insertMentionRows: async () => [],
@@ -1025,9 +1025,11 @@ test("broadcastAndDeliver message:new and send response carry every manifest mes
   const emitted = events.find((event) => event.room === "channel:channel-1" && event.event === "message:new")?.payload;
   assert.ok(emitted, "expected realtime message:new payload");
   assertManifestCompleteMessageNew(emitted, "persisted.channel");
-  // REST parity (enrichWithSenderNames): description || null; a brand-new
-  // row has no reactions; user/agent senders have no external author.
-  assert.equal(emitted.senderDescription, "Reviews pull requests");
+  // The description is viewer-scoped (descriptionVisibility): a shared
+  // broadcast has no one viewer, so it carries null, as a REST read with no
+  // viewer does; a brand-new row has no reactions; user/agent senders have no
+  // external author.
+  assert.equal(emitted.senderDescription, null);
   assert.deepEqual(emitted.reactions, []);
   assert.equal(emitted.externalAuthor, null);
   assert.equal(emitted.commentRef, null);
@@ -1038,7 +1040,7 @@ test("broadcastAndDeliver message:new and send response carry every manifest mes
     .filter((key) => key !== "conversationContext")
     .filter((key) => !(key in response));
   assert.deepEqual(responseMissing, [], "send response must carry the manifest-complete body");
-  assert.equal(response.senderDescription, "Reviews pull requests");
+  assert.equal(response.senderDescription, null);
   assert.deepEqual(response.reactions, []);
   // One sender lookup per send, shared by the frontend payload and agent delivery.
   assert.deepEqual(senderIdentityCalls, ["agent-1"]);
@@ -3380,6 +3382,206 @@ test("broadcastAndDeliver emits replies sync window producer envelope for normal
   }
 });
 
+test("a reply in a thread nested in another thread routes thread:updated by the root, not the middle thread's room", async ({ db }) => {
+  const [owner] = await db.insert(users).values({ email: "nested-thread-owner@test.com", name: "NestedThreadOwner", passwordHash: "x", emailVerified: true }).returning();
+  const [server] = await db.insert(servers).values({ name: "Nested Thread", slug: "nested-thread", ownerId: owner.id }).returning();
+  await db.insert(serverMembers).values({ serverId: server.id, userId: owner.id, role: "owner" });
+  __setMessageServiceDepsForTests({ renderAgentReadablePermalinks: async (content: string) => content });
+
+  for (const rootType of ["channel", "private"] as const) {
+    const [root] = await db.insert(channels).values({ serverId: server.id, name: `nested-root-${rootType}`, type: rootType }).returning();
+    await db.insert(channelHumans).values({ channelId: root.id, userId: owner.id });
+    const rootMessage = await createMessage(root.id, "user", owner.id, `${rootType} root`);
+    const middle = await getOrCreateThread(rootMessage.id, owner.id, "user");
+    const middleMessage = await createMessage(middle.id, "user", owner.id, `${rootType} middle`);
+    // A thread nested in the middle thread (legacy rows; creation refuses it later).
+    const [nested] = await db.insert(channels).values({ serverId: server.id, name: `nested-leaf-${rootType}`, type: "thread", parentMessageId: middleMessage.id }).returning();
+
+    const { io, events } = createIoRecorder();
+    await broadcastSystemMessage(io, withChannelDelivery({ deliverMessage: async () => undefined }) as any, nested.id, `${rootType} nested reply`, {
+      inboxFactPolicy: { mode: "skip", producer: "test.system.nested_thread_reply", reason: "test nested thread reply" },
+    });
+    const rooms = events.filter((entry) => entry.event === "thread:updated").map((entry) => entry.room);
+    // A private root: only its people's user rooms, never channel:<middle>,
+    // which someone removed from the root is never evicted from. A public
+    // root: unchanged (the middle conversation's room).
+    assert.deepEqual(rooms, rootType === "private" ? [`user:${owner.id}`] : [`channel:${middle.id}`], `${rootType} root`);
+  }
+});
+
+test("a system reply in a thread emits thread:updated with the parent's privacy routing", async ({ db }) => {
+  const [owner] = await db.insert(users).values({
+    email: "system-thread-owner@test.com",
+    name: "SystemThreadOwner",
+    passwordHash: "x",
+    emailVerified: true,
+  }).returning();
+  const [outsider] = await db.insert(users).values({
+    email: "system-thread-outsider@test.com",
+    name: "SystemThreadOutsider",
+    passwordHash: "x",
+    emailVerified: true,
+  }).returning();
+  const [server] = await db.insert(servers).values({
+    name: "System Thread",
+    slug: "system-thread",
+    ownerId: owner.id,
+  }).returning();
+  await db.insert(serverMembers).values([
+    { serverId: server.id, userId: owner.id, role: "owner" },
+    { serverId: server.id, userId: outsider.id, role: "member" },
+  ]);
+  __setMessageServiceDepsForTests({
+    renderAgentReadablePermalinks: async (content: string) => content,
+  });
+
+  const [dmPeer] = await db.insert(users).values({
+    email: "system-thread-dm-peer@test.com",
+    name: "SystemThreadDmPeer",
+    passwordHash: "x",
+    emailVerified: true,
+  }).returning();
+  await db.insert(serverMembers).values({ serverId: server.id, userId: dmPeer.id, role: "member" });
+
+  for (const parentType of ["channel", "private", "dm"] as const) {
+    const [parentChannel] = await db.insert(channels).values({
+      serverId: server.id,
+      name: `system-thread-${parentType}`,
+      type: parentType,
+    }).returning();
+    await db.insert(channelHumans).values(
+      parentType === "dm"
+        ? [
+            { channelId: parentChannel.id, userId: owner.id },
+            { channelId: parentChannel.id, userId: dmPeer.id },
+          ]
+        : [{ channelId: parentChannel.id, userId: owner.id }],
+    );
+    const parent = await createMessage(parentChannel.id, "user", owner.id, `${parentType} parent`);
+    const thread = await getOrCreateThread(parent.id, owner.id, "user");
+
+    const { io, events } = createIoRecorder();
+    const reply = await broadcastSystemMessage(io, withChannelDelivery({ deliverMessage: async () => undefined }) as any, thread.id, `${parentType} system reply`, {
+      inboxFactPolicy: { mode: "skip", producer: "test.system.thread_reply", reason: "test system thread reply" },
+    });
+
+    const updates = events.filter((entry) => entry.event === "thread:updated");
+    const expectedRooms = parentType === "channel"
+      ? [`channel:${parentChannel.id}`]
+      : parentType === "dm"
+        ? [`user:${owner.id}`, `user:${dmPeer.id}`]
+        : [`user:${owner.id}`];
+    assert.deepEqual(updates.map((entry) => entry.room).sort(), expectedRooms.sort(), `${parentType} parent thread:updated routing`);
+    const payload = updates[0]!.payload;
+    assert.equal(payload.parentMessageId, parent.id);
+    assert.equal(payload.threadChannelId, thread.id);
+    assert.equal(payload.replyCount, 1);
+    assert.equal(payload.latestReply.id, reply.id);
+    assert.equal(payload.latestReply.senderDisplayName, "System");
+    assertThreadRepliesSyncWindow(payload, {
+      serverId: server.id,
+      parentMessageId: parent.id,
+      parentScopeKind: parentType,
+      parentScopeId: parentChannel.id,
+    });
+  }
+});
+
+test("a failing thread summary read does not reject a system reply or skip its agent delivery", async ({ db }) => {
+  const [owner] = await db.insert(users).values({
+    email: "system-thread-degraded-owner@test.com",
+    name: "SystemThreadDegradedOwner",
+    passwordHash: "x",
+    emailVerified: true,
+  }).returning();
+  const [server] = await db.insert(servers).values({
+    name: "System Thread Degraded",
+    slug: "system-thread-degraded",
+    ownerId: owner.id,
+  }).returning();
+  await db.insert(serverMembers).values({ serverId: server.id, userId: owner.id, role: "owner" });
+  const [agent] = await db.insert(agents).values({
+    serverId: server.id,
+    name: "system-thread-degraded-agent",
+    status: "active",
+  }).returning();
+  const [parentChannel] = await db.insert(channels).values({
+    serverId: server.id,
+    name: "system-thread-degraded",
+    type: "channel",
+  }).returning();
+  await db.insert(channelHumans).values({ channelId: parentChannel.id, userId: owner.id });
+  const parent = await createMessage(parentChannel.id, "user", owner.id, "degraded parent");
+  const thread = await getOrCreateThread(parent.id, owner.id, "user");
+  await db.insert(threadFollows).values({
+    threadChannelId: thread.id,
+    followerType: "agent",
+    followerId: agent.id,
+    parentMessageId: parent.id,
+    reason: "manual",
+  });
+  __setMessageServiceDepsForTests({
+    renderAgentReadablePermalinks: async (content: string) => content,
+    getThreadInfo: async () => {
+      throw new Error("thread info read failed");
+    },
+  });
+
+  const { io, events } = createIoRecorder();
+  const deliveries: { agentId: string; payload: any }[] = [];
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink });
+  const reply = await withTraceRoot(tracer, "server.http.request", { surface: "server", kind: "server" }, () =>
+    broadcastSystemMessage(io, withChannelDelivery({
+      deliverMessage: async (agentId: string, payload: any) => {
+        deliveries.push({ agentId, payload });
+        return { status: "queued" };
+      },
+    }) as any, thread.id, "degraded system reply", {
+      inboxFactPolicy: { mode: "skip", producer: "test.system.thread_reply_degraded", reason: "test degraded thread summary" },
+      awaitAgentDelivery: true,
+    }));
+
+  assert.ok(events.some((entry) => entry.event === "message:new" && entry.payload.id === reply.id));
+  assert.equal(events.some((entry) => entry.event === "thread:updated"), false);
+  assert.ok(
+    deliveries.some((delivery) => delivery.agentId === agent.id && delivery.payload.message_id === reply.id),
+    "the thread-following agent still receives the system reply",
+  );
+  const degraded = sink.getAllSpans()
+    .flatMap((span) => span.events)
+    .find((event) => event.name === "message_pipeline.system_thread_summary.degraded");
+  assert.equal(degraded?.attrs?.topology, "thread");
+  assert.equal(degraded?.attrs?.failure_policy, "continue_from_persisted_state");
+
+  // A delivery that rejects while the (slow) summary runs is already handled:
+  // no unhandled rejection in the window before the summary settles.
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    __setMessageServiceDepsForTests({
+      renderAgentReadablePermalinks: async (content: string) => content,
+      getThreadInfo: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return null;
+      },
+    });
+    const rejectingOrchestrator = {
+      deliverMessagesOnChannel: (_channelId: string, batch: readonly unknown[]) =>
+        batch.map(() => Promise.reject(new Error("delivery gate read failed"))),
+      loadDeliveryGates: async () => null,
+    };
+    await broadcastSystemMessage(io, rejectingOrchestrator as any, thread.id, "system reply with rejecting delivery", {
+      inboxFactPolicy: { mode: "skip", producer: "test.system.thread_reply_rejecting_delivery", reason: "test rejecting delivery" },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+  assert.deepEqual(unhandled, [], "a rejecting delivery must not surface as an unhandled rejection");
+});
+
 test("broadcastAndDeliver lets tests stub the archive gate without initializing the real DB", async () => {
   let archiveChecks = 0;
   let createCalls = 0;
@@ -4786,6 +4988,86 @@ test("broadcastAndDeliver keeps followed joint-thread agent delivery independent
     assert.notEqual(hostThreadUpdate.syncCoreReplyWindow.discussion.parentScopeKey.scopeId, canonicalParent.id);
     assert.notEqual(peerThreadUpdate.syncCoreReplyWindow.discussion.parentScopeKey.scopeId, canonicalParent.id);
     assert.notEqual(peerThreadUpdate.syncCoreReplyWindow.discussion.root.serverId, serverA.id);
+
+    // A system reply into the joint thread (e.g. an action card result reply)
+    // updates each projection's local parent summary the same way.
+    const { io: systemIo, events: systemEvents } = createIoRecorder();
+    const systemReply = await broadcastSystemMessageToLocalSurfaces(systemIo, agentOrchestrator, localThreadA.id, "joint system reply", {
+      inboxFactPolicy: { mode: "skip", producer: "test.system.joint_thread_reply", reason: "test joint system thread reply" },
+    });
+    const systemThreadUpdates = systemEvents.filter((event) => event.event === "thread:updated");
+    assert.deepEqual(
+      systemThreadUpdates.map((event) => [event.room, event.payload.threadChannelId]).sort(),
+      [
+        [`channel:${localParentA.id}`, localThreadA.id],
+        [`channel:${localParentB.id}`, localThreadB.id],
+      ].sort(),
+      "exactly one system-reply thread:updated per local joint parent, each with its own local thread",
+    );
+    for (const [localParent, localThread, localServer] of [
+      [localParentA, localThreadA, serverA],
+      [localParentB, localThreadB, serverB],
+    ] as const) {
+      const update = systemThreadUpdates.find((event) => event.room === `channel:${localParent.id}`)?.payload;
+      assert.ok(update, "expected a system-reply thread:updated on each local joint parent");
+      assert.equal(update.parentMessageId, canonicalParentMessage.id);
+      assert.equal(update.threadChannelId, localThread.id);
+      assert.equal(update.latestReply.id, systemReply.id);
+      assert.equal(update.latestReply.channelId, localThread.id);
+      assertThreadRepliesSyncWindow(update, {
+        serverId: localServer.id,
+        parentMessageId: canonicalParentMessage.id,
+        parentScopeKind: "joint",
+        parentScopeId: localParent.id,
+      });
+    }
+
+    // A failing thread-info read drops only the summary: the joint system
+    // reply still resolves, reaches its followers and is delivered.
+    __setMessageServiceDepsForTests({
+      markRead: async () => undefined,
+      markAgentLegacyRead: async () => undefined,
+      renderAgentReadablePermalinks: async (content: string) => content,
+      recordInboxNotificationFacts,
+      getActiveJointThreadProjectionsByCanonicalThread,
+      getJointThreadProjectionForMember,
+      getSenderIdentity: async (_senderType, _senderId, fallbackName) => ({
+        uniqueName: fallbackName,
+        description: null,
+      }),
+      getThreadInfo: async () => {
+        throw new Error("thread info read failed");
+      },
+    });
+    const { io: degradedIo, events: degradedEvents } = createIoRecorder();
+    const degradedSink = new MemoryTraceSink();
+    const degradedReply = await withTraceRoot(
+      new BasicTracer({ sink: degradedSink }),
+      "server.http.request",
+      { surface: "server", kind: "server" },
+      () => broadcastSystemMessageToLocalSurfaces(degradedIo, agentOrchestrator, localThreadA.id, "joint degraded system reply", {
+        inboxFactPolicy: { mode: "skip", producer: "test.system.joint_thread_reply_degraded", reason: "test joint degraded summary" },
+      }),
+    );
+    assert.equal(degradedEvents.some((event) => event.event === "thread:updated"), false);
+    assert.ok(
+      degradedEvents.some((event) => event.event === "message:new" && event.payload.id === degradedReply.id),
+      "the joint system reply still reaches thread followers",
+    );
+    assert.ok(
+      agentDeliveries.some((delivery) =>
+        delivery.agentId === agentA.id
+        && delivery.payload.message_id === degradedReply.id
+        && delivery.payload.channel_id === localThreadA.id
+      ),
+      "the following agent still receives the joint system reply",
+    );
+    assert.equal(
+      degradedSink.getAllSpans()
+        .flatMap((span) => span.events)
+        .find((event) => event.name === "message_pipeline.system_thread_summary.degraded")?.attrs?.topology,
+      "joint_thread",
+    );
   } finally {
     await closeTestDatabase();
   }

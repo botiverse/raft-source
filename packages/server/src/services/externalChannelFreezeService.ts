@@ -7,9 +7,15 @@
  * and it is in more than one external channel. Over: it has a
  * server_external_freezes row whose freeze_at is set once, when first seen
  * over (now: a downgrade or a new external channel gets no grace), and never
- * moved later or earlier. Not over: no row, so the server can write again at
- * once. The servers already over at launch get their grace from a one-off
- * backfill (scripts/external-freeze-launch-backfill.ts); until it has run,
+ * moved later or earlier. Not over (flag on, and paid or in at most one
+ * external channel; or the server deleted): no row, so the server can write
+ * again at once. Flag off: the rule does not apply and its row, if any, is
+ * left exactly as it is (the read side ignores it while the flag is off), so
+ * a staged rollout or a deny rule never throws away a backfilled grace: once
+ * the flag is on the server keeps its original freeze_at, or loses the row
+ * then if it is no longer over. The servers already over at launch get
+ * their grace from a one-off backfill
+ * (scripts/external-freeze-launch-backfill.ts); until it has run,
  * nothing here creates a row (rows are still deleted), so a launch cannot
  * freeze them before the backfill gives them their 14 days.
  *
@@ -38,6 +44,7 @@ import {
 import { freeServerIds } from "./jointChannelLimitService";
 import { acquireServerAdmissionLocks } from "./planService";
 import { isInTransaction } from "../db/ambientTransaction";
+import { safeAddTraceEvent } from "../tracing/semanticTrace";
 
 /** The grace the servers already over at launch get (from the launch time). */
 export const EXTERNAL_FREEZE_LAUNCH_GRACE_MS = 14 * 24 * 60 * 60 * 1000;
@@ -66,21 +73,33 @@ export function __resetExternalFreezeBackfillLogForTests(): void {
 type CountAdjustment = { exceptChannelId?: string | null; plus?: number };
 
 /**
- * The servers among these the rule applies to: not deleted, flag on (unless
- * `ignoreFlag`: the launch backfill, which counts the servers over before the
- * flag is on) and free. In server-id order.
+ * What the rule says of a server, before its count:
+ * - "inapplicable": the flag is off for it. Its row is neither created nor
+ *   deleted (the read side ignores the row while the flag is off).
+ * - "exempt": deleted (or gone), or flag on and paid. Its row goes.
+ * - "eligible": flag on (or `ignoreFlag`: the launch backfill, which counts
+ *   the servers over before the flag is on) and free; over once in more than
+ *   one external channel.
  */
-async function eligibleServerIds(
+type FreezeApplicability = "inapplicable" | "exempt" | "eligible";
+
+/** Each server's applicability (absent servers are "exempt"); one flag evaluation and one plan read for all of them. */
+async function freezeApplicability(
   executor: DatabaseExecutor,
   serverIds: readonly string[],
   now: Date,
   options: { ignoreFlag?: boolean } = {},
-): Promise<string[]> {
-  const ids = serverIds.length === 0 ? [] : (await executor.select({ id: servers.id }).from(servers)
-    .where(and(inArray(servers.id, [...new Set(serverIds)]), isNull(servers.deletedAt)))).map((row) => row.id).sort();
+): Promise<Map<string, FreezeApplicability>> {
+  const requested = [...new Set(serverIds)].sort();
+  const ids = requested.length === 0 ? [] : (await executor.select({ id: servers.id }).from(servers)
+    .where(and(inArray(servers.id, requested), isNull(servers.deletedAt)))).map((row) => row.id).sort();
   const flagOn = options.ignoreFlag ? new Set(ids) : await externalChannelsFlagOnFor(executor, ids);
   const free = await freeServerIds(executor, ids.filter((id) => flagOn.has(id)), now);
-  return ids.filter((id) => flagOn.has(id) && free.has(id));
+  const live = new Set(ids);
+  return new Map(requested.map((id): [string, FreezeApplicability] => [
+    id,
+    !live.has(id) ? "exempt" : !flagOn.has(id) ? "inapplicable" : free.has(id) ? "eligible" : "exempt",
+  ]));
 }
 
 async function isOver(executor: DatabaseExecutor, serverId: string, adjust: CountAdjustment | undefined): Promise<boolean> {
@@ -88,18 +107,25 @@ async function isOver(executor: DatabaseExecutor, serverId: string, adjust: Coun
   return count > 1;
 }
 
-/** Which of `serverIds` are over (see the module comment); unlocked, for the sweep's pre-filter and the backfill. */
-async function overServerIds(
+/**
+ * Over, not over, or not applicable (flag off: leave the row alone).
+ * Not over includes a deleted or gone server.
+ */
+type FreezeDecision = "over" | "not_over" | "not_applicable";
+
+/** Each of `serverIds`' decision (see the module comment); unlocked, for the sweep's pre-filter and the backfill. */
+async function freezeDecisions(
   executor: DatabaseExecutor,
   serverIds: readonly string[],
   now: Date,
   options: { ignoreFlag?: boolean } = {},
-): Promise<Set<string>> {
-  const over = new Set<string>();
-  for (const serverId of await eligibleServerIds(executor, serverIds, now, options)) {
-    if (await isOver(executor, serverId, undefined)) over.add(serverId);
+): Promise<Map<string, FreezeDecision>> {
+  const decisions = new Map<string, FreezeDecision>();
+  for (const [serverId, applicability] of await freezeApplicability(executor, serverIds, now, options)) {
+    decisions.set(serverId, applicability === "inapplicable" ? "not_applicable"
+      : applicability === "eligible" && await isOver(executor, serverId, undefined) ? "over" : "not_over");
   }
-  return over;
+  return decisions;
 }
 
 export type ExternalFreezeWrite = "frozen" | "kept" | "cleared" | "none";
@@ -116,7 +142,8 @@ export function __setExternalFreezeProbeForTests(probe: ExternalFreezeProbe | nu
 /**
  * One server: its freeze row locked first (by key; the version seen, if
  * any), then everything that decides it read under that lock (deleted or
- * not, the flag, free or paid, the count), then written. Nothing read
+ * not, the flag, free or paid, the count), then written; flag off, nothing
+ * is written (the row, if any, is kept as it is). Nothing read
  * before the lock decides a write: a reconcile that waited for the lock
  * sees what it waited for (a downgrade that wrote a row, an accept that made
  * the server over). A delete removes only the row version this locked, so a
@@ -133,9 +160,11 @@ async function reconcileOne(
     SELECT xmin::text AS version FROM server_external_freezes WHERE server_id = ${serverId}::uuid FOR UPDATE
   `);
   const version = locked.rows[0]?.version ?? null;
-  const eligible = (await eligibleServerIds(executor, [serverId], now)).length === 1;
-  const over = eligible && await isOver(executor, serverId, options.adjust);
+  const applicability = (await freezeApplicability(executor, [serverId], now)).get(serverId);
+  const over = applicability === "eligible" && await isOver(executor, serverId, options.adjust);
   await externalFreezeProbeForTests?.({ serverId, phase: "counted", over });
+  // Flag off: the rule does not apply; neither create nor delete (a backfilled grace survives a staged rollout).
+  if (applicability === "inapplicable") return "none";
   if (!over) {
     if (version === null) return "none";
     const deleted = await executor.execute<{ server_id: string }>(sql`
@@ -170,7 +199,8 @@ export async function reconcileServerExternalFreezes(
     adjust?: ReadonlyMap<string, CountAdjustment>;
     /**
      * The change can only take external channels away (a Guest removed, a
-     * disconnection, an archive, a delete): delete rows, never create one.
+     * disconnection, an archive, a delete): delete rows (never of a server
+     * the flag is off for), never create one.
      * These paths hold no admission lock, and creating a row is left to the
      * paths that hold the server's (an admission, the sweep, the billing
      * hook), whose count cannot go stale before their write.
@@ -268,7 +298,15 @@ async function reconcileExternalFreezeUnderAdmissionLock(serverId: string, now: 
   });
 }
 
-export type ExternalFreezeSweepResult = { scanned: number; over: number; frozen: number; cleared: number; backfillDone: boolean };
+export type ExternalFreezeSweepResult = {
+  scanned: number;
+  over: number;
+  /** Servers the sweep left alone because the external channels flag is off for them (an off rule, or not yet rolled out). */
+  notApplicable: number;
+  frozen: number;
+  cleared: number;
+  backfillDone: boolean;
+};
 
 /**
  * Candidates: every server with a freeze row (it may have to go) and every
@@ -296,26 +334,54 @@ async function candidatePage(afterId: string | null): Promise<string[]> {
  * Periodic backstop: re-evaluates every candidate server, the flag and the
  * plan evaluated per page. Creates missing rows (freeze_at = now) and deletes
  * rows of servers no longer over; never moves a stored freeze_at. Creates
- * nothing before the launch backfill has run.
+ * nothing before the launch backfill has run. Servers the flag is off for
+ * are skipped: their rows are neither created nor deleted.
+ *
+ * Records `external_channel_freeze.sweep.finished` on
+ * the current span with its counts, also for a run that throws (then with
+ * what it counted before, and `outcome = error`).
  */
 export async function sweepExternalChannelFreezes(now: Date = new Date()): Promise<ExternalFreezeSweepResult> {
+  const result: ExternalFreezeSweepResult = { scanned: 0, over: 0, notApplicable: 0, frozen: 0, cleared: 0, backfillDone: false };
+  let outcome: "ok" | "error" = "error";
+  try {
+    await runFreezeSweep(result, now);
+    outcome = "ok";
+    return result;
+  } finally {
+    safeAddTraceEvent("external_channel_freeze.sweep.finished", () => ({
+      outcome,
+      backfill_done: result.backfillDone,
+      scanned_count: result.scanned,
+      over_count: result.over,
+      not_applicable_count: result.notApplicable,
+      frozen_count: result.frozen,
+      cleared_count: result.cleared,
+    }));
+  }
+}
+
+async function runFreezeSweep(result: ExternalFreezeSweepResult, now: Date): Promise<void> {
   const db = getDb();
   const backfillDone = await externalFreezeLaunchBackfillDone(db);
-  const result: ExternalFreezeSweepResult = { scanned: 0, over: 0, frozen: 0, cleared: 0, backfillDone };
+  result.backfillDone = backfillDone;
   let afterId: string | null = null;
   for (;;) {
     const page = await candidatePage(afterId);
     if (page.length === 0) break;
     afterId = page[page.length - 1]!;
     result.scanned += page.length;
-    const over = await overServerIds(db, page, now);
+    const decisions = await freezeDecisions(db, page, now);
+    const over = new Set([...decisions].filter(([, decision]) => decision === "over").map(([serverId]) => serverId));
     result.over += over.size;
+    result.notApplicable += [...decisions.values()].filter((decision) => decision === "not_applicable").length;
     const stored = new Set((await db.select({ serverId: serverExternalFreezes.serverId }).from(serverExternalFreezes)
       .where(inArray(serverExternalFreezes.serverId, page))).map((row) => row.serverId));
     // Each write re-decides in a short transaction of its own, under the
     // server's admission lock, so a change committed since this page was
     // counted is not overwritten with a stale answer.
     for (const serverId of page) {
+      if (decisions.get(serverId) === "not_applicable") continue;
       if (over.has(serverId) === stored.has(serverId)) continue;
       if (over.has(serverId) && !backfillDone) continue;
       const write = await reconcileExternalFreezeUnderAdmissionLock(serverId, now);
@@ -324,7 +390,6 @@ export async function sweepExternalChannelFreezes(now: Date = new Date()): Promi
     }
     if (page.length < SWEEP_PAGE_SIZE) break;
   }
-  return result;
 }
 
 export type ExternalFreezeLaunchBackfillResult = {
@@ -349,7 +414,9 @@ async function allOverServerIgnoringFlag(now: Date): Promise<string[]> {
     const page = await candidatePage(afterId);
     if (page.length === 0) break;
     afterId = page[page.length - 1]!;
-    over.push(...await overServerIds(getDb(), page, now, { ignoreFlag: true }));
+    for (const [serverId, decision] of await freezeDecisions(getDb(), page, now, { ignoreFlag: true })) {
+      if (decision === "over") over.push(serverId);
+    }
     if (page.length < SWEEP_PAGE_SIZE) break;
   }
   return over.sort();

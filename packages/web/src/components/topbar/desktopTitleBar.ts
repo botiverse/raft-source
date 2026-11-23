@@ -15,15 +15,17 @@ import type { DesktopTitleBarOverlay, RaftDesktopBridge } from "@botiverse/raft-
 import { hexFromRgb, onRootThemeChange } from "../../theme/systemBarColor";
 import { overlayTitleBarSource } from "./layerGuard";
 import { HOST_TITLE_BAR_COMPACT_QUERY, HOST_TITLE_BAR_HEIGHT_PX, HOST_TITLE_BAR_HEIGHT_TOUCH_PX } from "./overlayTitleBar";
-import { installWindowControlsOverlayAttributes } from "./windowControlsOverlayGeometry";
+import { installSteadyMacTitleBarArea, installWindowControlsOverlayAttributes } from "./windowControlsOverlayGeometry";
 
-type DesktopTitleBarBridge = Pick<RaftDesktopBridge, "titleBar" | "isFullScreen" | "onFullScreenChange" | "window">;
+type DesktopTitleBarBridge = Pick<RaftDesktopBridge, "titleBar" | "platform" | "isFullScreen" | "onFullScreenChange" | "window">;
 
 /**
  * Mirrors the window's chrome onto <html> for titleBar.css:
  * - under the overlay, `data-title-bar="overlay"` (+ `data-title-bar-start`
  *   while the controls take the bar's left end: the macOS traffic lights),
- *   exactly as the installed web app does;
+ *   exactly as the installed web app does; on macOS the traffic lights'
+ *   corner is held steady while the window is resized
+ *   (installSteadyMacTitleBarArea);
  * - `data-title-bar="native"` when the window manager draws a frame instead
  *   (the Linux opt-out): nothing is laid over the bar;
  * - `data-fullscreen` while the window is full screen (macOS hides the traffic
@@ -32,6 +34,7 @@ type DesktopTitleBarBridge = Pick<RaftDesktopBridge, "titleBar" | "isFullScreen"
  */
 export function installDesktopWindowChrome(root: HTMLElement, bridge: DesktopTitleBarBridge, win: Window = window): () => void {
   const removeOverlay = bridge.titleBar === "overlay" ? installWindowControlsOverlayAttributes(root, win) : null;
+  const removeSteady = bridge.titleBar === "overlay" && bridge.platform === "darwin" ? installSteadyMacTitleBarArea(root, win) : null;
   if (bridge.titleBar === "native") root.dataset.titleBar = "native";
   const apply = (fullScreen: boolean) => root.toggleAttribute("data-fullscreen", fullScreen);
   let disposed = false;
@@ -43,6 +46,7 @@ export function installDesktopWindowChrome(root: HTMLElement, bridge: DesktopTit
   return () => {
     disposed = true;
     unsubscribe?.();
+    removeSteady?.();
     removeOverlay?.();
     if (root.dataset.titleBar === "native") delete root.dataset.titleBar;
     root.removeAttribute("data-fullscreen");
@@ -71,7 +75,8 @@ function cssColorToHex(css: string, doc: Document): string | null {
   return hexFromRgb(red, green, blue);
 }
 
-function colorsOf(el: HTMLElement): TitleBarColors | null {
+/** A title-bar row's background and text colours as "#rrggbb" (null when either is unavailable or transparent). */
+export function titleBarRowColors(el: HTMLElement): TitleBarColors | null {
   const style = el.ownerDocument.defaultView?.getComputedStyle(el);
   if (!style) return null;
   const color = cssColorToHex(style.backgroundColor, el.ownerDocument);
@@ -88,13 +93,13 @@ function colorsOf(el: HTMLElement): TitleBarColors | null {
  */
 function readTitleBarColors(doc: Document): TitleBarColors | null {
   const header = overlayTitleBarSource(doc);
-  if (header) return colorsOf(header);
+  if (header) return titleBarRowColors(header);
   const probe = doc.createElement("span");
   probe.setAttribute("aria-hidden", "true");
   probe.style.cssText = "position:fixed;width:0;height:0;visibility:hidden;pointer-events:none;background-color:var(--layer-frame);color:var(--foreground-on-frame)";
   doc.documentElement.appendChild(probe);
   try {
-    return colorsOf(probe);
+    return titleBarRowColors(probe);
   } finally {
     probe.remove();
   }

@@ -1,6 +1,7 @@
 import type { MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
 import {
+  Badge,
   SearchEntityResult,
   SearchEntityResultContent,
   SearchEntityResultDescription,
@@ -36,6 +37,8 @@ export function ArtifactSearchHit({ hit, highlight, selected, onOpen }: Artifact
   const homeText = useArtifactHomeText();
   const { card } = hit;
   const when = formatRelativeTime(card.updatedAt, intl.locale);
+  // Its home conversation is archived (`home.conversation.archived`; absent: not archived, and from older servers).
+  const homeArchived = card.home.kind === "conversation" && card.home.conversation.archived === true;
   const line = [homeText(card.home, card.fromAnotherServer), artifactActorName(card.author, intl.formatMessage), when].filter((part): part is string => !!part).join(" · ");
   // The row is the button itself, a direct child of the section's list, with
   // the test id and the keyboard marker; a list cell draws no line between
@@ -55,6 +58,9 @@ export function ArtifactSearchHit({ hit, highlight, selected, onOpen }: Artifact
       <SearchEntityResultContent>
         <SearchEntityResultHeader>
           <SearchEntityResultTitle className="truncate">{highlight(card.title)}</SearchEntityResultTitle>
+          {homeArchived ? (
+            <Badge appearance="soft" variant="muted" data-testid="search-app-hit-archived">{intl.formatMessage({ id: "search.archived" })}</Badge>
+          ) : null}
         </SearchEntityResultHeader>
         <SearchEntityResultDescription>{line}</SearchEntityResultDescription>
       </SearchEntityResultContent>

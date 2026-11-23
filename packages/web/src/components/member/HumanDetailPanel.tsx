@@ -8,9 +8,10 @@ import {
   X,
   Pencil,
 } from "lucide-react";
-import { HUMAN_SEAT_LIMIT_REACHED_CODE, PRO_AGENT_SEAT_BLOCK_SIZE, seatTenths, seatsFromTenths } from "@botiverse/raft-shared";
+import { HUMAN_SEAT_LIMIT_REACHED_CODE, PRO_AGENT_SEAT_BLOCK_SIZE, PROFILE_DESCRIPTION_MAX_LENGTH, profileDescriptionTooLong, seatTenths, seatsFromTenths } from "@botiverse/raft-shared";
 import type {
   CapacityLimitDetail,
+  DescriptionLinkWarning,
   GuestChannelField,
   ProfileVisibilityMembershipStatus,
   ServerRole,
@@ -44,6 +45,7 @@ import type {
   AgentCreatedSummary,
 } from "../../store/agentStore";
 import Tooltip from "../ui/Tooltip";
+import { DescriptionLinkWarnings } from "../message/DescriptionLinkWarnings";
 import RolePermissionHelpDialog from "./RolePermissionHelpDialog";
 import { getHumanDepartureLabel } from "./humanMembershipStatus";
 import {
@@ -99,7 +101,6 @@ const EDITABLE_ROLE_OPTIONS: { id: ServerRole; labelId: MessageId }[] = [
   { id: "admin", labelId: "member.detail.roleAdmin" },
   { id: "member", labelId: "member.detail.roleMember" },
 ];
-const MAX_HUMAN_DESCRIPTION_LENGTH = 3000;
 
 export interface HumanProfile extends GuestChannelField {
   userId: string;
@@ -202,6 +203,9 @@ export default function HumanDetailPanel({
   /** Guest → member with the Pro seats full: an owner adds one, then the role is saved again. */
   const [seatNeed, setSeatNeed] = useState<AddSeatsNeed | null>(null);
   const [editingDescription, setEditingDescription] = useState(false);
+  // #457: the saved description's links some of its readers can't open, shown under it until dismissed.
+  const [descriptionLinkWarnings, setDescriptionLinkWarnings] = useState<DescriptionLinkWarning[]>([]);
+  const dismissDescriptionLinkWarnings = useCallback(() => setDescriptionLinkWarnings([]), []);
   const [descriptionValue, setDescriptionValue] = useState(
     human.description || "",
   );
@@ -375,13 +379,12 @@ export default function HumanDetailPanel({
 
   const handleSaveDescription = useCallback(async () => {
     const nextDescription = descriptionValue.trim();
-    if (
-      nextDescription.length > MAX_HUMAN_DESCRIPTION_LENGTH
-    ) {
+    // One saved under the older, longer limit saves unchanged; once edited, the limit applies.
+    if (profileDescriptionTooLong(nextDescription, human.description)) {
       setDescriptionError(
         formatMessage(
           { id: "member.detail.descriptionMaxLength" },
-          { count: MAX_HUMAN_DESCRIPTION_LENGTH },
+          { count: PROFILE_DESCRIPTION_MAX_LENGTH },
         ),
       );
       return;
@@ -389,9 +392,10 @@ export default function HumanDetailPanel({
     setDescriptionSaving(true);
     setDescriptionError("");
     try {
-      await updateProfile({
+      const { warnings } = await updateProfile({
         description: nextDescription || null,
       });
+      setDescriptionLinkWarnings(warnings);
       await loadMembers();
       setEditingDescription(false);
     } catch (err: any) {
@@ -404,7 +408,7 @@ export default function HumanDetailPanel({
     } finally {
       setDescriptionSaving(false);
     }
-  }, [descriptionValue, formatMessage, updateProfile, loadMembers]);
+  }, [descriptionValue, formatMessage, human.description, updateProfile, loadMembers]);
 
   const handleDescriptionChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setDescriptionError((current) => (current ? "" : current));
@@ -744,7 +748,9 @@ export default function HumanDetailPanel({
                   value={descriptionValue}
                   onChange={handleDescriptionChange}
                   rows={3}
-                  maxLength={MAX_HUMAN_DESCRIPTION_LENGTH}
+                  // Typing stops at the limit, unless the saved one is already over it (saved under the
+                  // older limit): then the counter and the save's error say how much to cut.
+                  maxLength={(human.description?.length ?? 0) > PROFILE_DESCRIPTION_MAX_LENGTH ? undefined : PROFILE_DESCRIPTION_MAX_LENGTH}
                   placeholder={formatMessage({
                     id: "member.detail.descriptionPlaceholder",
                   })}
@@ -779,18 +785,21 @@ export default function HumanDetailPanel({
                   )}
                   <span className="shrink-0 font-mono text-mono-meta text-foreground-hint">
                     {descriptionValue.trim().length}/
-                    {MAX_HUMAN_DESCRIPTION_LENGTH}
+                    {PROFILE_DESCRIPTION_MAX_LENGTH}
                   </span>
                 </div>
               </div>
             ) : (
-              <p className="text-callout text-foreground-muted">
-                {human.description || (
-                  <span className="text-foreground-hint">
-                    {formatMessage({ id: "member.detail.noDescription" })}
-                  </span>
-                )}
-              </p>
+              <div className="stack-y-3">
+                <p className="text-callout text-foreground-muted">
+                  {human.description || (
+                    <span className="text-foreground-hint">
+                      {formatMessage({ id: "member.detail.noDescription" })}
+                    </span>
+                  )}
+                </p>
+                <DescriptionLinkWarnings owner="person" warnings={descriptionLinkWarnings} onDismiss={dismissDescriptionLinkWarnings} />
+              </div>
             )
           ) : (
             <div className="text-callout text-foreground-muted">

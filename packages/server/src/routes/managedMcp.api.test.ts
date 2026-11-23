@@ -13,6 +13,7 @@ import { createAgent } from "../services/agentService";
 import { addMember, createServer } from "../services/serverService";
 import { findMcpAppTemplate } from "../services/mcpAppTemplates";
 import { setPrivacyModeForTest } from "../config/privacyMode";
+import { admittedMcpConnectionId, MCP_CONNECTION_NOT_PINNABLE_MESSAGE } from "../services/managedMcpService";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
@@ -252,12 +253,13 @@ test("managed MCP control plane is capability-gated and never returns credential
       new URL("/api/mcp/oauth/callback", clientId.origin).toString(),
     ]);
 
-    const resetCalls: Array<{ agentId: string; mode: string; options: unknown }> = [];
+    const applyConfigCalls: Array<{ agentId: string; options: unknown }> = [];
     const orchestrator = app.app.get("agentOrchestrator") as {
-      resetAgent: (agentId: string, mode: string, options: unknown) => Promise<void>;
+      applyAgentConfig: (agentId: string, options?: unknown) => Promise<string>;
     };
-    orchestrator.resetAgent = async (agentId, mode, options) => {
-      resetCalls.push({ agentId, mode, options });
+    orchestrator.applyAgentConfig = async (agentId, options) => {
+      applyConfigCalls.push({ agentId, options });
+      return "fallback_restarted";
     };
     const apply = await fetch(`${app.baseUrl}/api/mcp/agents/${agent.id}/assignments`, {
       method: "PUT",
@@ -267,7 +269,7 @@ test("managed MCP control plane is capability-gated and never returns credential
       }),
     });
     assert.equal(apply.status, 200, await apply.text());
-    assert.deepEqual(resetCalls, [{ agentId: agent.id, mode: "restart", options: { restartIfStopped: false } }]);
+    assert.deepEqual(applyConfigCalls, [{ agentId: agent.id, options: { fallbackRestartMode: "restart" } }]);
 
     // Task #91: the single-assignment route runs its whole write inside the membership fence; exercise its success path.
     const single = await fetch(`${app.baseUrl}/api/mcp/agents/${agent.id}/assignments/${created.id}`, {
@@ -277,6 +279,10 @@ test("managed MCP control plane is capability-gated and never returns credential
     });
     assert.equal(single.status, 200, await single.clone().text());
     assert.equal((await single.json() as { assignment: { enabled: boolean } | null }).assignment?.enabled, false);
+    assert.deepEqual(applyConfigCalls, [
+      { agentId: agent.id, options: { fallbackRestartMode: "restart" } },
+      { agentId: agent.id, options: { fallbackRestartMode: "restart" } },
+    ]);
 
     const unsafeDraftTest = await fetch(`${app.baseUrl}/api/mcp/servers/test-configuration`, {
       method: "POST",
@@ -314,6 +320,8 @@ test("connection authorization is scoped by viewer role, and a pin cannot cross 
     const agent = await createAgent(server.id, "scoped-agent", { creatorType: "user", creatorId: manager.id });
 
     const insertApp = async (serverId: string, name: string) => (await db.insert(managedMcpServers).values({
+      // No recorded creator: vouched, as migration 0732 does for legacy Apps (fail-closed rule).
+      serverVouchedAt: new Date(),
       serverId, name, endpointUrl: `https://${name.toLowerCase()}.example.test/mcp`, authMode: "headers", sourceKind: "url",
       toolCatalog: [{ name: "search", inputSchema: { type: "object" } }] as never,
     }).returning())[0];
@@ -356,10 +364,14 @@ test("connection authorization is scoped by viewer role, and a pin cannot cross 
       "⭐ an observer sees the state but not which Connection");
 
     // ③ Pinning to another App's Connection, another server's, or a made-up id: same refusal, no write.
+    // Pinning is an admin's (RFC 087 §6), so the server owner tries; the Agent's manager is refused first.
     const pinUrl = `${app.baseUrl}/api/mcp/agents/${agent.id}/assignments/${mine.id}`;
+    const ownerToken = await login(app.baseUrl, owner.email);
     const answers = [];
     for (const connectionId of [otherAppConnection.id, foreignConnection.id, randomUUID()]) {
-      const res = await fetch(pinUrl, { method: "PUT", headers: headers(managerToken, server.id), body: JSON.stringify({ connectionId }) });
+      const asManagerPin = await fetch(pinUrl, { method: "PUT", headers: headers(managerToken, server.id), body: JSON.stringify({ connectionId }) });
+      assert.equal(asManagerPin.status, 403, "the Agent's manager may not pin, whatever the id");
+      const res = await fetch(pinUrl, { method: "PUT", headers: headers(ownerToken, server.id), body: JSON.stringify({ connectionId }) });
       answers.push({ status: res.status, code: (await res.json() as { code?: string }).code });
     }
     assert.deepEqual(answers, Array(3).fill({ status: 404, code: "managed_mcp_connection_not_found" }),
@@ -374,69 +386,99 @@ test("connection authorization is scoped by viewer role, and a pin cannot cross 
 });
 
 /**
- * WHOSE Connection an Agent may use, over HTTP: the App's default, or one the Agent's owner created.
- * Managing an Agent (or the whole server) never lets someone pin it to another person's Connection.
+ * Who may choose an Agent's shared account, over HTTP (RFC 087 §6): an admin (`manageExternalAuth`)
+ * may pin any Agent to any shared Connection of the App, whoever created it (the Agent is then
+ * admitted with it), or switch it back to the default; an Agent's creator who is not an admin can do
+ * neither, but still grants, revokes, restricts tools and may resend the current choice. A member's
+ * personal Connection is never pinned.
  */
-test("⭐ a pin to another person's Connection is refused 403 managed_mcp_connection_not_usable; own and default pins work", async () => {
+test("⭐ changing an Agent's shared Connection is admin-only; an admin's pin to anyone's shared Connection is admitted", async () => {
   const originalCredentialKey = process.env.SLOCK_MCP_CREDENTIAL_KEY;
   process.env.SLOCK_MCP_CREDENTIAL_KEY = Buffer.alloc(32, 7).toString("base64");
   const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
-    const owner = await seedUser(`mcp-own-owner-${randomUUID()}@slock.test`);
-    const member = await seedUser(`mcp-own-member-${randomUUID()}@slock.test`);
-    const server = await createServer("Ownership", `ownership-${randomUUID()}`, owner.id);
+    const owner = await seedUser(`mcp-pin-owner-${randomUUID()}@slock.test`);
+    const admin = await seedUser(`mcp-pin-admin-${randomUUID()}@slock.test`);
+    const member = await seedUser(`mcp-pin-member-${randomUUID()}@slock.test`);
+    const server = await createServer("Pins", `pins-${randomUUID()}`, owner.id);
+    await addMember(server.id, admin.id, "admin");
     await addMember(server.id, member.id, "member");
     const agent = await createAgent(server.id, "members-agent", { creatorType: "user", creatorId: member.id });
     const [mcp] = await db.insert(managedMcpServers).values({
       serverId: server.id, name: "Docs", endpointUrl: "https://docs.example.test/mcp", authMode: "headers", sourceKind: "url", createdByUserId: owner.id,
+      serverVouchedAt: new Date(),
       toolCatalog: [{ name: "search", inputSchema: { type: "object" } }] as never,
     }).returning();
-    const insertConnection = async (name: string, createdByUserId: string, isServerDefault = false) => (await db.insert(managedMcpCredentials).values({
-      serverId: server.id, mcpServerId: mcp.id, headerNames: ["X-Api-Key"], isServerDefault, authKind: "headers", authStatus: "ready", name, createdByUserId,
+    const insertConnection = async (name: string, values: Partial<typeof managedMcpCredentials.$inferInsert> = {}) => (await db.insert(managedMcpCredentials).values({
+      serverId: server.id, mcpServerId: mcp.id, headerNames: ["X-Api-Key"], isServerDefault: false, authKind: "headers", authStatus: "ready", name,
+      authorizedEndpointUrl: "https://docs.example.test/mcp", ...values,
     }).returning())[0];
-    const teamDefault = await insertConnection("Team", owner.id, true);
-    const ownersPersonal = await insertConnection("Owner's own", owner.id);
-    const membersOwn = await insertConnection("Member's own", member.id);
-    const ownerToken = await login(app.baseUrl, owner.email);
+    const teamDefault = await insertConnection("Team", { isServerDefault: true, createdByUserId: owner.id });
+    // Created by the server owner: under the old rule only the owner's own Agents could use it.
+    const ownersShared = await insertConnection("Owner's shared", { createdByUserId: owner.id });
+    const membersPersonal = await insertConnection("Member's own", { createdByUserId: member.id, ownerKind: "personal", ownerUserId: member.id });
+    const adminToken = await login(app.baseUrl, admin.email);
     const memberToken = await login(app.baseUrl, member.email);
-    const pin = async (token: string, connectionId: string | null) => {
+    const put = async (token: string, body: Record<string, unknown>) => {
       const res = await fetch(`${app.baseUrl}/api/mcp/agents/${agent.id}/assignments/${mcp.id}`, {
-        method: "PUT", headers: headers(token, server.id), body: JSON.stringify({ connectionId }),
+        method: "PUT", headers: headers(token, server.id), body: JSON.stringify(body),
       });
       return { status: res.status, body: await res.json() as { code?: string; error?: string } };
     };
-    const bound = async () => (await db.select().from(managedMcpAssignments).where(eq(managedMcpAssignments.agentId, agent.id)))[0]?.boundConnectionId ?? null;
-    const refusal = {
-      status: 403,
-      body: { code: "managed_mcp_connection_not_usable", error: "This Connection belongs to someone else. An agent can use the App's default Connection or one its owner created." },
-    };
+    const assignment = async () => (await db.select().from(managedMcpAssignments).where(eq(managedMcpAssignments.agentId, agent.id)))[0] ?? null;
+    const forbidden = { status: 403, body: { code: "managed_mcp_pin_forbidden", error: "Only a server admin can change which shared Connection an agent uses" } };
 
-    // The member pins their own Agent to their own Connection.
-    assert.equal((await pin(memberToken, membersOwn.id)).status, 200);
-    assert.equal(await bound(), membersOwn.id);
-    // ⭐ ... but not to the server owner's personal one; nor may the server owner put it there.
-    assert.deepEqual(await pin(memberToken, ownersPersonal.id), refusal);
-    assert.deepEqual(await pin(ownerToken, ownersPersonal.id), refusal, "⭐ managing the server does not make it the Agent's owner's");
+    // ⭐ The Agent's creator, a member: no pin, single or bulk, not even to the default by id; nothing written.
+    assert.deepEqual(await put(memberToken, { connectionId: ownersShared.id }), forbidden);
+    assert.deepEqual(await put(memberToken, { connectionId: teamDefault.id }), forbidden);
     const bulk = await fetch(`${app.baseUrl}/api/mcp/agents/${agent.id}/assignments`, {
-      method: "PUT", headers: headers(memberToken, server.id), body: JSON.stringify({ assignments: [{ mcpServerId: mcp.id, connectionId: ownersPersonal.id }] }),
+      method: "PUT", headers: headers(memberToken, server.id), body: JSON.stringify({ assignments: [{ mcpServerId: mcp.id, connectionId: ownersShared.id }] }),
     });
-    assert.deepEqual({ status: bulk.status, body: await bulk.json() }, refusal, "the bulk route refuses it the same way");
-    assert.equal(await bound(), membersOwn.id, "nothing was written");
-    // The default, pinned or followed: allowed.
-    assert.equal((await pin(memberToken, teamDefault.id)).status, 200);
-    assert.equal((await pin(memberToken, null)).status, 200);
-    assert.equal(await bound(), null);
+    assert.deepEqual({ status: bulk.status, body: await bulk.json() }, forbidden, "the bulk route refuses it the same way");
+    assert.equal(await assignment(), null, "nothing was written");
+    // ... but keeps the writes it had: revoke, grant again, restrict tools, and resend "follow the default"
+    // while the Agent already follows it (a no-op, as a UI sending the whole row does).
+    assert.equal((await put(memberToken, { enabled: false })).status, 200);
+    assert.equal((await put(memberToken, { enabled: true, allowedTools: ["search"] })).status, 200);
+    assert.equal((await put(memberToken, { connectionId: null })).status, 200);
+    assert.deepEqual(
+      { enabled: (await assignment())?.enabled, allowedTools: (await assignment())?.allowedTools, mode: (await assignment())?.connectionMode },
+      { enabled: true, allowedTools: ["search"], mode: "default" },
+    );
 
-    // The picker offers only what this Agent may use, to the Agent's manager and a server manager alike.
+    // ⭐ An admin pins the member's Agent to the owner's shared Connection: written and admitted with it.
+    assert.equal((await put(adminToken, { connectionId: ownersShared.id })).status, 200);
+    assert.equal((await assignment())?.boundConnectionId, ownersShared.id);
+    assert.equal(await admittedMcpConnectionId(db, server.id, agent.id, mcp.id), ownersShared.id);
+    // A personal Connection is not pinned, even by an admin.
+    assert.deepEqual(await put(adminToken, { connectionId: membersPersonal.id }), {
+      status: 403, body: { code: "managed_mcp_connection_not_usable", error: MCP_CONNECTION_NOT_PINNABLE_MESSAGE },
+    });
+    assert.equal((await assignment())?.boundConnectionId, ownersShared.id, "the pin is unchanged");
+
+    // ⭐ Unpinning is managing the shared account too: the creator can't switch it back to the default.
+    assert.deepEqual(await put(memberToken, { connectionId: null }), forbidden);
+    const bulkUnpin = await fetch(`${app.baseUrl}/api/mcp/agents/${agent.id}/assignments`, {
+      method: "PUT", headers: headers(memberToken, server.id), body: JSON.stringify({ assignments: [{ mcpServerId: mcp.id, connectionId: null }] }),
+    });
+    assert.deepEqual({ status: bulkUnpin.status, body: await bulkUnpin.json() }, forbidden);
+    assert.deepEqual({ mode: (await assignment())?.connectionMode, bound: (await assignment())?.boundConnectionId }, { mode: "pinned", bound: ownersShared.id }, "nothing written");
+    // Resending the current pin, with other fields, is not a change.
+    assert.equal((await put(memberToken, { connectionId: ownersShared.id, enabled: true })).status, 200);
+    // An admin switches it back to the default.
+    assert.equal((await put(adminToken, { connectionId: null })).status, 200);
+    assert.deepEqual({ mode: (await assignment())?.connectionMode, bound: (await assignment())?.boundConnectionId }, { mode: "default", bound: null });
+    assert.equal((await put(adminToken, { connectionId: ownersShared.id })).status, 200);
+
+    // The picker offers what each viewer may give: the default to the creator, every shared Connection to an admin.
     const candidatesAs = async (token: string) => {
       const res = await fetch(`${app.baseUrl}/api/mcp/servers/${mcp.id}/connection-authorization?agentId=${agent.id}`, { headers: headers(token, server.id) });
       const body = await res.json() as { candidates: Array<{ connectionId: string }>; newConnectionPinnable: boolean };
       return { ids: body.candidates.map((candidate) => candidate.connectionId).sort(), newConnectionPinnable: body.newConnectionPinnable };
     };
-    const usable = [teamDefault.id, membersOwn.id].sort();
-    assert.deepEqual(await candidatesAs(memberToken), { ids: usable, newConnectionPinnable: true });
-    assert.deepEqual(await candidatesAs(ownerToken), { ids: usable, newConnectionPinnable: false }, "⭐ not the owner's personal Connection");
+    assert.deepEqual(await candidatesAs(memberToken), { ids: [teamDefault.id], newConnectionPinnable: false });
+    assert.deepEqual(await candidatesAs(adminToken), { ids: [teamDefault.id, ownersShared.id].sort(), newConnectionPinnable: true }, "⭐ never a personal Connection");
   } finally {
     await app.close();
     if (originalCredentialKey === undefined) delete process.env.SLOCK_MCP_CREDENTIAL_KEY;
@@ -471,6 +513,8 @@ test("OAuth per Connection: start is gated, and an attempt's status is visible o
     await addMember(server.id, admin.id, "admin");
     await addMember(server.id, member.id, "member");
     const [mcp] = await getDb().insert(managedMcpServers).values({
+      // No recorded creator: vouched, as migration 0732 does for legacy Apps (fail-closed rule).
+      serverVouchedAt: new Date(),
       serverId: server.id, name: "Docs", endpointUrl: "https://docs.example.test/mcp", authMode: "oauth", sourceKind: "url",
     }).returning();
     const ownerToken = await login(app.baseUrl, owner.email);
@@ -556,6 +600,8 @@ test("Connections and the server default are managed by integration managers onl
     await addMember(server.id, member.id, "member");
     await createAgent(server.id, "default-follower", { creatorType: "user", creatorId: member.id });
     const [mcp] = await getDb().insert(managedMcpServers).values({
+      // No recorded creator: vouched, as migration 0732 does for legacy Apps (fail-closed rule).
+      serverVouchedAt: new Date(),
       serverId: server.id, name: "Docs", endpointUrl: "https://docs.example.test/mcp", authMode: "headers", sourceKind: "url",
       requiredHeaderNames: ["X-Api-Key"],
     }).returning();
@@ -628,9 +674,10 @@ test("MCP Apps over HTTP: templates, probe and App writes are manager-only; PATC
       .where(eq(mcpAppTemplates.key, "atlassian"));
     const templates = await api(ownerToken, "/app-templates");
     assert.equal(templates.status, 200);
-    const templateBody = await templates.json() as { templates: Array<{ key: string; endpointUrl: string; maintainedByRaft: boolean; installed: boolean }> };
+    const templateBody = await templates.json() as { templates: Array<{ key: string; endpointUrl: string; maintainedByRaft: boolean; installed: boolean; publisherName: string | null }> };
     assert.deepEqual(templateBody.templates.map((template) => template.key), (await listMcpAppTemplates()).map((template) => template.key));
     assert.ok(templateBody.templates.every((template) => template.maintainedByRaft));
+    assert.equal(templateBody.templates.find((template) => template.key === "gmail")?.publisherName, "Google");
     assert.ok(templateBody.templates.every((template) => template.installed === false), "nothing installed yet");
     assert.equal(templateBody.templates.some((template) => template.key === "atlassian"), false, "an unusable endpoint is not offered");
     assert.equal((await api(memberToken, "/app-templates")).status, 403);
@@ -659,6 +706,15 @@ test("MCP Apps over HTTP: templates, probe and App writes are manager-only; PATC
     assert.equal(listed.status, 200);
     assert.deepEqual((await listed.json() as { apps: Array<{ id: string; kind: string }> }).apps.map((item) => [item.id, item.kind]), [[view.id, "mcp"]]);
     assert.equal((await api(memberToken, `/apps/${view.id}`)).status, 200);
+    // The default Connection's status is for managers only; the publisher is for everyone.
+    await getDb().insert(managedMcpCredentials).values({
+      serverId: server.id, mcpServerId: view.id, isServerDefault: true, name: "Team", authKind: "oauth", authStatus: "expired", createdByUserId: owner.id,
+    });
+    type ListedApp = { source: { publisherName: string | null }; status: { connectionCount: number; defaultConnectionStatus: string | null } };
+    const listedAs = async (token: string) => (await (await api(token, "/apps")).json() as { apps: ListedApp[] }).apps[0];
+    assert.deepEqual(await listedAs(ownerToken).then((item) => [item?.source.publisherName, item?.status.defaultConnectionStatus]), ["Linear", "expired"]);
+    assert.deepEqual(await listedAs(memberToken).then((item) => [item?.source.publisherName, item?.status.connectionCount, item?.status.defaultConnectionStatus]), ["Linear", 1, null]);
+    await getDb().delete(managedMcpCredentials).where(eq(managedMcpCredentials.mcpServerId, view.id));
 
     // RAFT_PRIVACY_MODE: a Raft template's logo is the web's own /app-logos/ copy, never
     // app.raft.build; off: the stored URL as is.

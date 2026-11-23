@@ -24,7 +24,7 @@ import {
 } from "../reviewerIsolation";
 import { formatClaimResults } from "./_format";
 import { NO_TASK_NAMED_MESSAGE, resolveTaskAddress, TASK_REF_ARGUMENT } from "./_taskAddress";
-import { writeHeldTaskWrite } from "../freshness/_taskHold";
+import { exitIfHeldTaskWrite } from "../freshness/_taskHold";
 
 interface ClaimOpts extends TargetAliasOpts, ReviewerIsolationOpts {
   number?: string[];
@@ -148,7 +148,7 @@ export const taskClaimCommand = defineCommand(
       if (!res.data) {
         throw cliError("INVALID_JSON_RESPONSE", "Agent API taskClaim returned an empty response body");
       }
-      if (writeHeldTaskWrite(ctx, agentContext.agentId, "task_claim", body, res.data, { reviewerIsolation })) return;
+      exitIfHeldTaskWrite(ctx, agentContext.agentId, "task_claim", body, res.data, { reviewerIsolation });
       if (!isTaskClaimSuccessResponse(res.data)) {
         throw cliError("INVALID_JSON_RESPONSE", "Agent API taskClaim returned an unexpected response body");
       }

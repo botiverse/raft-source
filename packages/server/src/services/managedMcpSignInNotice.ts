@@ -68,13 +68,13 @@ export function __resetMcpSignInNoticeMemoForTests(): void {
 }
 
 /** Signing a Connection in again takes both (`POST /apps/:appId/connections/oauth/start`). */
-function rolesThatCanSignIn(): ServerRole[] {
+export function rolesThatCanSignIn(): ServerRole[] {
   const external = new Set(serverRolesWithCapability("manageExternalAuth"));
   return serverRolesWithCapability("manageIntegrations").filter((role) => external.has(role));
 }
 
 /** One line, at most `max` characters: names come from whoever set the App up. */
-function oneLine(text: string, max: number): string {
+export function oneLine(text: string, max: number): string {
   const flat = text.replace(/\s+/gu, " ").trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }

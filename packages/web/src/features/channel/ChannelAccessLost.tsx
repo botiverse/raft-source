@@ -6,7 +6,6 @@ import { MessageIcon } from "@botiverse/ricons";
 import AppEmptyState from "../../components/ui/EmptyState";
 import { useIsDesktopShell } from "../../components/layout/ShellFrame";
 import { useServerPermissions } from "../../hooks/useServerPermissions";
-import { tabHomeFor, useMobileNavStore } from "../../store/mobileNavStore";
 import { useServerStore } from "../../store/serverStore";
 
 /**
@@ -21,7 +20,7 @@ import { useServerStore } from "../../store/serverStore";
  * `unavailable`: a link or URL to a conversation the server won't show (it
  * doesn't exist, was deleted, or this person can't read it: one answer for
  * all, so one sentence that tells none of them apart). On a phone its button
- * says and goes to the conversation list (Home's root, as Home left it).
+ * says and goes to the conversation list (Home's root).
  */
 export function ChannelAccessLost({ unavailable = false }: { unavailable?: boolean }) {
   const { formatMessage } = useIntl();
@@ -36,9 +35,8 @@ export function ChannelAccessLost({ unavailable = false }: { unavailable?: boole
   const goBack = useCallback(() => {
     if (!slug) return;
     if (guest) navigate(`/s/${slug}/settings`);
-    else if (phoneList) navigate(useMobileNavStore.getState().roots.chat ?? tabHomeFor("chat", `/s/${slug}`), { replace: true });
     else navigate(`/s/${slug}`, { replace: true });
-  }, [guest, navigate, phoneList, slug]);
+  }, [guest, navigate, slug]);
   const backLabel = guest
     ? "layout.main.guestNoChannelSettings"
     : phoneList ? "layout.main.conversationUnavailableBackPhone" : "layout.main.channelAccessLostBack";

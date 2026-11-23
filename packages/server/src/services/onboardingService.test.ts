@@ -135,6 +135,7 @@ function makeServer(overrides: Record<string, unknown> = {}) {
     id: "server-1",
     ownerId: "owner-1",
     onboardingAgentId: "agent-1",
+    officialOnboardingAgentId: "agent-1",
     ...overrides,
   };
 }
@@ -328,6 +329,20 @@ test("a briefing is not sent, or marked sent, while the onboarding agent is not 
   assert.equal(fired, false);
   assert.deepEqual(agentNotices, [], "a dead agent must not be briefed into the void");
   assert.deepEqual(marked, [], "the one-shot sent flag must not be burned on a lost briefing");
+});
+
+test("the owner briefing goes only to the official onboarding agent, never to a greeter someone picked", async () => {
+  let claimed = 0;
+  __setOnboardingServiceDepsForTests(makeDeps({
+    getServer: async () => makeServer({ onboardingAgentId: "helper-1", officialOnboardingAgentId: null }),
+    getMemberOnboardingPreferences: async () => ({ onboardingDmSentAt: null }),
+    getAgent: async () => makeAgent({ id: "helper-1", name: "Helper", status: "active" }),
+    getUser: async () => ({ id: "owner-1", name: "Owner", signupSurveyCompletedAt: new Date() }),
+    claimOwnerOpener: async () => { claimed += 1; return new Date(); },
+  }) as any);
+
+  assert.equal(await triggerOwnerOnboardingOnAgentActivation(makeIo(), makeReminderSyncOrchestrator(), "server-1", "helper-1"), false);
+  assert.equal(claimed, 0, "a greeter is not Cindy: no opener is claimed for it");
 });
 
 // A transient wake to an agent that is not able to receive it is DROPPED, not queued.

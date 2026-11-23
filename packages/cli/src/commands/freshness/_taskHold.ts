@@ -1,12 +1,15 @@
 // A task write the Server (or the Computer) held for freshness: nothing was
 // applied; print what the agent had not seen of the conversation the write
-// lands in, and how to go on (../../../../shared/src/agentWriteLanding.ts).
+// lands in, and how to go on (../../../../shared/src/agentWriteLanding.ts),
+// then fail with TASK_WRITE_HELD (exit 1) so `raft task claim … && next`
+// does not run `next`.
 
 import type { AgentApiHeldFreshnessResponse, AgentApiTaskWriteUnseen, AgentGatedTaskWriteAction } from "@botiverse/raft-shared";
 import { agentWriteLandingTarget, formatAgentTaskWriteUnseen } from "@botiverse/raft-shared/src/agentCliSurface";
 
 import { countRendered } from "../../ax/renderCounts";
 import type { CommandContext } from "../../core/context";
+import { cliError } from "../../core/errors";
 import { adoptCliReplyText, writeText } from "../../core/renderer";
 import { formatFreshnessHoldOutput, isFreshnessHeldResponse } from "./_format";
 
@@ -39,16 +42,23 @@ const HELD: Record<AgentGatedTaskWriteAction, { heldAction: string; rerun: strin
 
 const ISOLATED_RERUN = "Retry remains held while reviewer isolation is active. Use a clean review target, or leave the seat and read only with explicit review authority.\n";
 
-/** Prints the hold and returns true when `data` is a held response; false otherwise. */
-export function writeHeldTaskWrite(
+/**
+ * When `data` is a held response: prints the hold (stdout, once) and throws
+ * TASK_WRITE_HELD, exit 1, as a held `raft message send` throws SEND_HELD.
+ * The stderr envelope keeps only its classification lines
+ * (`omit_restated_lines`): the hold above already says nothing was applied
+ * and what to do, and a reader that keeps only stderr on a non-zero exit
+ * still learns why (task #60). Otherwise returns.
+ */
+export function exitIfHeldTaskWrite<T>(
   ctx: Pick<CommandContext, "io">,
   agentId: string,
   action: AgentGatedTaskWriteAction,
   body: Record<string, unknown>,
-  data: unknown,
+  data: T,
   options: { reviewerIsolation?: boolean } = {},
-): data is AgentApiHeldFreshnessResponse {
-  if (!isFreshnessHeldResponse(data)) return false;
+): asserts data is Exclude<T, AgentApiHeldFreshnessResponse> {
+  if (!isFreshnessHeldResponse(data)) return;
   const withheld = options.reviewerIsolation === true || data.freshnessContextMode === "withheld";
   const text = formatFreshnessHoldOutput(agentWriteLandingTarget(action, body) ?? String(body.channel), data, {
     heldAction: HELD[action].heldAction,
@@ -57,7 +67,13 @@ export function writeHeldTaskWrite(
   });
   writeText(ctx.io, text);
   countRendered(agentId, "freshness_hold", text);
-  return true;
+  throw cliError("TASK_WRITE_HELD", `Held for unseen messages. ${HELD[action].heldAction}`, {
+    effect: "not_executed",
+    // Under reviewer isolation the rerun is held again.
+    retryable: !withheld,
+    textDetailMode: "omit_restated_lines",
+    suggestedNextAction: withheld ? ISOLATED_RERUN.trim() : HELD[action].rerun.trim(),
+  });
 }
 
 /**

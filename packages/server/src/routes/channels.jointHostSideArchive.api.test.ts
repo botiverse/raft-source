@@ -518,8 +518,10 @@ test("an attempt failing after the archive ended a Guest: the retry finishes the
  * archived AND its host side is empty may they see it and unarchive it, and the
  * unarchive rejoins them. Everyone else keeps today's refusals.
  */
-const NOT_FOUND = { status: 404, body: { error: "Channel not found" } };
-const NOT_ADMIN = { status: 403, body: { error: "Only admins can unarchive channels" } };
+const NOT_FOUND = { status: 404, body: { error: "Channel not found", code: "channel_not_found", errorCode: "channel_not_found" } };
+/** Unarchive's own refusals (refuse(): code and errorCode beside the sentence). */
+const UNARCHIVE_NOT_FOUND = { status: 404, body: { error: "Channel not found", code: "channel_not_found", errorCode: "channel_not_found" } };
+const NOT_ADMIN = { status: 403, body: { error: "Only admins can unarchive channels", code: "channel_unarchive_forbidden", errorCode: "channel_unarchive_forbidden" } };
 
 async function refusedUnarchive(baseUrl: string, token: string, serverId: string, channelId: string, expected: { status: number; body: unknown }) {
   const response = await fetch(`${baseUrl}/api/channels/${channelId}/unarchive`, { method: "POST", headers: headers(token, serverId) });
@@ -560,7 +562,7 @@ test("a joint archived by hand with host members still in it stays hidden from a
   assert.equal(archived.status, 200, await archived.text());
   assert.deepEqual(await archivedAt(f), { host: true, peer: true });
   assert.equal(await inArchivedList(app.baseUrl, f.token.hostAdmin, f.hostServer.id, f.hostProjection.id), undefined);
-  await refusedUnarchive(app.baseUrl, f.token.hostAdmin, f.hostServer.id, f.hostProjection.id, NOT_FOUND);
+  await refusedUnarchive(app.baseUrl, f.token.hostAdmin, f.hostServer.id, f.hostProjection.id, UNARCHIVE_NOT_FOUND);
   assert.deepEqual(await archivedAt(f), { host: true, peer: true });
 });
 
@@ -584,7 +586,7 @@ test("a host admin outside an emptied joint unarchives it and is back in, in one
 
 test("an emptied joint: a plain host member, a partner's owner, a Guest and an agent keep today's refusals", async ({ app }) => {
   const f = await autoArchived(app.baseUrl);
-  await refusedUnarchive(app.baseUrl, f.token.hostMember, f.hostServer.id, f.hostProjection.id, NOT_FOUND);
+  await refusedUnarchive(app.baseUrl, f.token.hostMember, f.hostServer.id, f.hostProjection.id, UNARCHIVE_NOT_FOUND);
   await refusedUnarchive(app.baseUrl, f.token.peerOwner, f.peerServer.id, f.peerProjection.id, NOT_ADMIN);
   // The archive ended any bound Guest, so the rule itself: the admin's context
   // as a Guest or as an agent grants nothing.
@@ -617,7 +619,7 @@ test("someone from the host is back in the archived joint before the admin acts:
   // A partner's member, still in the joint, joins the host server: the host side is no longer empty.
   await addMember(f.hostServer.id, f.peerMember.id, "member");
   assert.equal(await inArchivedList(app.baseUrl, f.token.hostAdmin, f.hostServer.id, f.hostProjection.id), undefined);
-  await refusedUnarchive(app.baseUrl, f.token.hostAdmin, f.hostServer.id, f.hostProjection.id, NOT_FOUND);
+  await refusedUnarchive(app.baseUrl, f.token.hostAdmin, f.hostServer.id, f.hostProjection.id, UNARCHIVE_NOT_FOUND);
   assert.deepEqual(await archivedAt(f), { host: true, peer: true });
 });
 

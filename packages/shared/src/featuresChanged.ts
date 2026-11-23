@@ -70,6 +70,10 @@ export type ServerFeaturesChangedMachineMessage = {
  * The `AgentConfig` fields the Server evaluates per Server id, the same for
  * every agent of that Server, and sets on every `agent:start` (agentOrchestrator
  * `agentServerFeatures`). `server:features` carries exactly these.
+ * `turnEndCompaction` also depends on the machine: it is on only for a
+ * connection that advertised DAEMON_CAPABILITY_TURN_END_COMPACTION_V2, in
+ * `agent:start` and in the `server:features` answer to that connection alike.
+ * `agentFocus` likewise, with DAEMON_CAPABILITY_AGENT_FOCUS_V1.
  *
  * Not included: `runtimeHost` (RFC 060 OAR) also depends on the machine's
  * capability and the agent's runtime; `runtimeProfileControl` is per agent;
@@ -91,7 +95,12 @@ export const AGENT_SERVER_FEATURE_KEYS = [
   "wakeRecycleTierGate",
   "turnEndCompaction",
   "wakeRecycleWarm",
+  "silentTurnEnd",
   "taskConversations",
+  "dmReplyPlacement",
+  "continuationTool",
+  "agentFocus",
+  "inboxNoticeServerRows",
   "inboxItems",
   "inboxItemsLaunchAt",
   "enabledApps",
@@ -190,7 +199,8 @@ export type ServerFeaturesRequestMessage = {
 
 /**
  * Server → Computer (daemon): the answer to `server:features:request`, the
- * same values an `agent:start` sent now would carry. `serverId` is the Server
+ * same values an `agent:start` sent now to this machine would carry
+ * (`turnEndCompaction` only to a daemon that declared its capability). `serverId` is the Server
  * of the machine connection the request came on. A daemon drops (and logs) a
  * reply whose `serverId` is not its connection's Server, or whose `requestId`
  * is not its latest outstanding request. A Server that cannot evaluate the

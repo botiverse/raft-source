@@ -11,7 +11,6 @@
 //   authorityTransition — the member removal / role change that fenced writes linearize against
 //   channelLane         — channel-scoped authority with its own channel row locks
 //   integrationLane     — external-auth routes: confirmed races fixed by #proj-backend-general #165, the rest audited by #167
-//   providerConnectionResidual — provider-connection routes (manageExternalAuth; credentials/rotate under rotateServerSecrets); fix #proj-backend-general #165 (unified), audit #167, owner Ark
 //   nonHuman            — caller is not a human session (agent, Computer, machine key, OAuth client, webhook)
 //   notAgentMachine     — not membership or relationship authority over an Agent / Machine / Computer
 //
@@ -40,7 +39,6 @@ export type RouteAuthorityBucket =
   | "lineG"
   | "nonHuman"
   | "notAgentMachine"
-  | "providerConnectionResidual"
   | "pure"
   | "readState93";
 
@@ -60,21 +58,37 @@ export type RouteClassification = { route: string; bucket: RouteAuthorityBucket;
  */
 export const DELEGABLE_NEVER_ROWS: Readonly<Record<HumanSessionBucket, number>> = {
   authorityTransition: 3,
-  cat1: 17,
+  // +1: POST /api/servers/:id/machines/:machineId/revoke-computer-key (from pure, #15305; removeMachines or live
+  // attacher under the membership fence; with `delete: true` also deleteMachine and the disconnect after commit, as DELETE).
+  cat1: 18,
   // -1: POST /api/agents/:id/migrate is `assistant` (the owner-action table's move_agent, confirm tier).
   // -1: POST /api/agents/:id/start is `card` (RFC 085 Phase 1, agent:start).
   cat2: 1,
   // -1: POST /api/agents/:id/stop is `card` (agent:stop).
-  cat3: 27,
+  // +1: POST .../runtimes/:runtime/upgrade (changes the Computer's software: never delegable).
+  // +2: POST .../runtimes/:runtime/install-plan and …/install (installs software on the Computer: never delegable).
+  // +1: POST .../proc-jobs/stop (stops a process on the Computer: never delegable).
+  // +1: POST .../computer-checks/refresh (runs the Computer's checks: never delegable).
+  cat3: 32,
   // -1: PATCH /api/channels/:id/members/:targetType/:memberId/role is `card`, its body held to role member (channel:remove_admin).
   channelLane: 6,
-  integrationLane: 35,
+  // +1: PUT /api/integrations/clients/:clientId/server-vouch (every agent may use the App: never delegable).
+  // +1: PUT /api/mcp/apps/:appId/server-vouch (the same for an MCP App).
+  // +3: PUT /api/mcp/apps/:appId/members-can-connect, PUT /api/mcp/connections/:connectionId/agents,
+  // DELETE /api/mcp/connections/:connectionId (RFC 087: whose account an agent acts as; never delegable).
+  // +1: PUT /api/mcp/connections/:connectionId/agents/:agentId (RFC 087 §7.1: the Connect card's account choice).
+  integrationLane: 41,
   lineG: 5,
   // -4: `assistant`: conversation mute, notification level, sidebar order (move, pin, arrange), save a message.
   // +2: DELETE /api/me/sessions/:familyId, POST /api/me/sessions/revoke-others (signing out one's own sign-ins: never delegable).
-  notAgentMachine: 281,
-  providerConnectionResidual: 7,
-  pure: 14,
+  // +8: the data export writes under /api/me/data-exports and /api/servers/:id/data-exports (copying data out: never delegable).
+  // +1: PATCH /api/servers/:id/data-export-settings (the owner's switch letting members export context: never delegable).
+  // +5: the app step-up routes under /api/auth/app-login/step-up (verifying a sign-in: never delegable).
+  // +5: the Add Computer window's computer pairing: create, renew, cancel, status, approve (an approval of one's
+  // own: never delegable).
+  notAgentMachine: 302,
+  // -1: POST .../revoke-computer-key moved to cat1 (#15305: with `delete: true` it has DELETE's delete + disconnect effect).
+  pure: 13,
   readState93: 1,
 };
 
@@ -83,8 +97,6 @@ export const PINNED_BUCKET_COUNTS: Readonly<Record<string, number>> = {
   // +1: POST /api/agents/:id/hosted-runtime/retry (fenced editAgents/creator provisioning-row write).
   // +1: POST /api/agents/:id/migration/confirm-hosted (migrateAgents/creator re-checked under the
   // actor fence inside the switch transaction; task #16).
-  // +1: POST /api/servers/:id/machines/:machineId/revoke-computer-key (removeMachines or registrant
-  // re-checked under the membership fence; revokes one Computer key and its machine's runner keys).
   // +1: PUT /api/servers/:id/machines/:machineId/owner (Computer owner v1, #wg-rbac:#32: owner/admin, the
   // current owner, or the connector claiming a Public Computer, re-checked under the actor's and new owner's
   // membership row locks; one machine-row write and its audit row).
@@ -92,7 +104,8 @@ export const PINNED_BUCKET_COUNTS: Readonly<Record<string, number>> = {
   // external agent's page shows first, one column, no credential or connection change; #wg-external-agent-ux:#2).
   // +1: PUT /api/agents/:id/voice-settings (Raft voice: editAgents/creator, never guest, under the fence;
   // two columns, whether people may ask or call the agent).
-  pure: 14,
+  // -1: POST .../revoke-computer-key moved to cat1 (#15305, Tenny).
+  pure: 13,
   // +1: POST /api/agents/:id/archive/workspace (agent archive; fenced deleteAgents/creator write on the
   // archived agent).
   // +3: PUT /api/raftbench and the dedicated RaftBench agent create/assignment routes use
@@ -100,7 +113,10 @@ export const PINNED_BUCKET_COUNTS: Readonly<Record<string, number>> = {
   // +2: PATCH/DELETE /api/servers/:id/assistant (RFC 075 v4 my assistant; the caller is the creator,
   // rename and archive fenced like PATCH/DELETE /api/agents/:id).
   // -1: POST /api/agents/:id/assign-machine retired (reconciler step 14; /migrate is the only Computer change).
-  cat1: 17,
+  // +1: POST /api/servers/:id/machines/:machineId/revoke-computer-key (from pure, #15305, Tenny: a route goes in the
+  // bucket of its strongest effect; with `delete: true` it runs deleteMachine in the fenced transaction and
+  // disconnects the machine after commit, as DELETE does).
+  cat1: 18,
   cat2: 3,
   // +3: POST/DELETE /api/agents/:id/connections/:provider and POST …/confirm (editAgents or creator, never
   // guest; no route-level DB write besides the audit row; the effect is a provider call).
@@ -113,7 +129,7 @@ export const PINNED_BUCKET_COUNTS: Readonly<Record<string, number>> = {
   // +4: Computer runtime login/code/cancel/logout dispatch (#10487); no authority-row write.
   // +1: Qwen Code provider connect (runtime-auth connect-provider): same authority as the login,
   // relays the key to the Computer once, no authority-row write.
-  // +1: POST /api/servers/:id/machines/:machineId/notify-agent-owners (removeMachines or registrant;
+  // +1: POST /api/servers/:id/machines/:machineId/notify-agent-owners (removeMachines or live attacher;
   // posts a fixed system notice to other people's agents' owners; no authority-row write).
   // +1: POST /api/servers/:id/machines/:machineId/runtime-account-usage/:provider/limit-reset (Codex:
   // same authority as the logout; Claude: the attaching human only, since its account is usually theirs;
@@ -125,7 +141,17 @@ export const PINNED_BUCKET_COUNTS: Readonly<Record<string, number>> = {
   // +3: POST /api/agents/:id/voice/calls, …/:callId/token, …/:callId/hang-up (Raft voice calls: flag, may DM
   // the agent and read its status, voice_callable; token and hang-up the caller only; the effect is a holt-live
   // call, the only write the call's own row).
-  cat3: 28,
+  // +1: POST /api/servers/:id/machines/:machineId/runtimes/:runtime/upgrade (behind runtime_upgrade_button;
+  // same authority as the sign-in, attaching human or owner/admin; runs the runtime's own updater on the
+  // Computer when a person asks, no DB write).
+  // +2: POST .../runtimes/:runtime/install-plan and …/install (behind runtime_install_button; same authority as
+  // Upgrade, attaching human or owner/admin; read the plan, then run the runtime's own installer on the Computer
+  // when a person confirms; the install's only write is its audit row).
+  // +1: POST /api/servers/:id/machines/:machineId/proc-jobs/stop (controlComputers or the live attacher, and an
+  // agent the person may find; stops one raft proc job on the Computer, the only write its audit row).
+  // +1: POST /api/servers/:id/machines/:machineId/computer-checks/refresh (the attaching human or editMachines, behind
+  // computer_checks_v0; asks the Computer for one round of its fixed checks, 30 s per Computer; no DB write).
+  cat3: 33,
   // +1: POST /api/servers/:id/assistant (RFC 075 v4; any member creates their own assistant, no
   // capability; the removal race is line G like POST /api/agents).
   // +1: staging-only owner creates hosted Cindy (#10495); same create admission as POST /api/agents.
@@ -159,6 +185,8 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "DELETE /oidc/:server/api/oauth/link-preview/encryption-key", bucket: "nonHuman", reason: "registered by the server-scoped OAuth mount but refused there (not in OIDC_SCOPED_ROUTES, 404); the unscoped route sets or removes an App's own card encryption key; no Agent/Machine authority" },
   { route: "POST /api/oauth/link-preview/card-updates", bucket: "nonHuman", reason: "RFC 076 §6.5: an App's client credentials (enabled, re-read FOR SHARE) record one terminal update of its own interactive link card operation on the update token's bindings alone; writes only link_card_* rows; no Agent/Machine authority" },
   { route: "POST /oidc/:server/api/oauth/link-preview/card-updates", bucket: "nonHuman", reason: "registered by the server-scoped OAuth mount but refused there (not in OIDC_SCOPED_ROUTES, 404); the unscoped route records an App's terminal update; no Agent/Machine authority" },
+  { route: "POST /api/oauth/link-preview/changed", bucket: "nonHuman", reason: "link_card.changed: an App's client credentials (enabled) name changed objects of its own; writes only Redis coalescing windows and sends content-free nudges to that App's recent readers; no Agent/Machine authority" },
+  { route: "POST /oidc/:server/api/oauth/link-preview/changed", bucket: "nonHuman", reason: "registered by the server-scoped OAuth mount but refused there (not in OIDC_SCOPED_ROUTES, 404); the unscoped route takes an App's changed objects; no Agent/Machine authority" },
   { route: "PUT /api/raftbench/readers/:agentId", bucket: "cat1", reason: "human server owner/admin fenced at commit; explicit agent finding reader grant, append-only audit" },
   { route: "PUT /api/raftbench", bucket: "cat1", reason: "human owner/admin locked at commit; dedicated member-agent creation uses createAgent actor fence; no Computer binding or model tools" },
   { route: "POST /api/raftbench/agents", bucket: "cat1", reason: "human owner/admin locked at commit; dedicated agent creation uses createAgent actor fence; provider provisioning runs asynchronously" },
@@ -182,19 +210,18 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "DELETE /api/integrations/marketplace/:clientId/install", bucket: "integrationLane", reason: "confirmed membership race, fix #proj-backend-general task #168 (owner Ark), audit #167. Predicate: server capability manageIntegrations; no Agent-relation authority" },
   { route: "DELETE /api/mcp/apps/:appId", bucket: "notAgentMachine", reason: "manageIntegrations capability; deletes an MCP App (Server-level config; its Connections and assignments cascade)" },
   { route: "DELETE /api/mcp/apps/:appId/logo", bucket: "notAgentMachine", reason: "manageIntegrations capability; clears an MCP App's logo (Server-level App profile), no Agent/Machine relationship" },
-  { route: "DELETE /api/mcp/apps/:appId/connections/:connectionId", bucket: "notAgentMachine", reason: "manageIntegrations capability; deletes one MCP App Connection (Server-level config); Agents pinned to it are refused (dead-pin rule), no Agent/Machine authority write" },
-  { route: "DELETE /api/mcp/apps/:appId/connections/:connectionId/oauth", bucket: "integrationLane", reason: "Managed MCP per-Connection OAuth disconnect; same lane as DELETE /api/mcp/servers/:mcpServerId/oauth. Predicate: server capabilities manageIntegrations and manageExternalAuth (owner/admin); no Agent-relation authority" },
+  { route: "DELETE /api/mcp/apps/:appId/connections/:connectionId", bucket: "notAgentMachine", reason: "same rule as DELETE /api/mcp/connections/:connectionId: a shared MCP Connection by manageIntegrations, a member's own by its owner or manageExternalAuth (revoke, the owner told), authorized under the membership fence before its OAuth tokens go; a person's own session; audited; Agents pinned to a deleted shared one are refused (dead-pin rule), no Agent/Machine authority write" },
+  { route: "DELETE /api/mcp/connections/:connectionId", bucket: "integrationLane", reason: "RFC 087 revoke: a member's own MCP Connection by its owner or manageExternalAuth, a shared one by manageIntegrations, re-checked under the caller's membership row lock; a person's own session only (refuses an assistant acting as its owner and a card dispatch); OAuth tokens deleted first (Disconnect's helper), then the row, its personal grants cascade; audited; no Agent-relation authority" },
+  { route: "DELETE /api/mcp/apps/:appId/connections/:connectionId/oauth", bucket: "integrationLane", reason: "Managed MCP per-Connection OAuth disconnect; same lane as DELETE /api/mcp/servers/:mcpServerId/oauth. Predicate, under the membership fence: a shared Connection, server capabilities manageIntegrations and manageExternalAuth (owner/admin); a member's own (RFC 087), its owner or manageExternalAuth (revoke: audited, the owner told), a person's own session; no Agent-relation authority" },
   { route: "DELETE /api/mcp/servers/:mcpServerId", bucket: "notAgentMachine", reason: "manageIntegrations capability; Server-level MCP server config" },
   { route: "DELETE /api/mcp/servers/:mcpServerId/oauth", bucket: "integrationLane", reason: "Managed MCP OAuth disconnect: confirmed removal/demotion race, fix #proj-backend-general task #165, audit task #164. Predicate: server capability manageExternalAuth (owner/admin); no Agent-relation authority" },
   { route: "DELETE /api/messages/:messageId/reactions", bucket: "notAgentMachine", reason: "message content" },
-  { route: "DELETE /api/provider-connections/:connectionId", bucket: "providerConnectionResidual", reason: "confirmed removal/demotion race, fix #proj-backend-general task #165 (unified, owner Ark), audit #167. Predicate: server capability manageExternalAuth; provider connection config, no Agent-relation authority" },
-  { route: "DELETE /api/provider-connections/:connectionId/agents/:agentId", bucket: "providerConnectionResidual", reason: "confirmed removal/demotion race, fix #proj-backend-general task #165 (unified, owner Ark), audit #167. Predicate: server capability manageExternalAuth; detaches a deleted Agent's assignment, no Agent-relation authority" },
   { route: "DELETE /api/push/registrations/:installationId", bucket: "notAgentMachine", reason: "caller's own push / notification device registration" },
   { route: "DELETE /api/push/subscribe", bucket: "notAgentMachine", reason: "caller's own push / notification device registration" },
   { route: "DELETE /api/servers/:id", bucket: "notAgentMachine", reason: "owner soft-deletes the Server; no Agent/Machine/Computer rows written" },
   { route: "DELETE /api/servers/:id/invites/:inviteId", bucket: "notAgentMachine", reason: "Server settings, invites, join links, ordering" },
   { route: "DELETE /api/servers/:id/join-links/:linkId", bucket: "notAgentMachine", reason: "Server settings, invites, join links, ordering" },
-  { route: "DELETE /api/servers/:id/machines/:machineId", bucket: "cat1", reason: "editMachines or registrant; deleteMachine fenced; Computer disconnect effect open in #93" },
+  { route: "DELETE /api/servers/:id/machines/:machineId", bucket: "cat1", reason: "removeMachines or live attacher; deleteMachine fenced; Computer disconnect effect open in #93" },
   { route: "DELETE /api/servers/:id/machines/:machineId/workspaces/:directoryName", bucket: "cat3", reason: "orchestrator workspace delete only; #93 runtime command chain" },
   { route: "DELETE /api/servers/:id/members/:memberId", bucket: "authorityTransition", reason: "member removal: the DELETE on server_members that fenced writes linearize against" },
   { route: "DELETE /api/slack-bridge/provisioning/channel-pairs", bucket: "notAgentMachine", reason: "Slack bridge configuration / ingress" },
@@ -225,12 +252,11 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "PATCH /api/channels/:id/notification-settings", bucket: "notAgentMachine", delegable: "assistant", reason: "channel / thread / inbox state" },
   { route: "PATCH /api/integrations/clients/:clientId", bucket: "integrationLane", reason: "confirmed membership race, fix #proj-backend-general task #168 (owner Ark), audit #167. Predicate: server capability manageIntegrations; no Agent-relation authority" },
   { route: "PATCH /api/mcp/apps/:appId", bucket: "notAgentMachine", reason: "manageIntegrations capability; MCP App profile, endpoint and on/off (Server-level config)" },
-  { route: "PATCH /api/mcp/apps/:appId/connections/:connectionId", bucket: "notAgentMachine", reason: "manageIntegrations capability; renames or re-keys one MCP App Connection; Server-level config" },
+  { route: "PATCH /api/mcp/apps/:appId/connections/:connectionId", bucket: "notAgentMachine", reason: "a shared MCP App Connection: manageIntegrations capability, renames or re-keys it; a member's own (RFC 087): its owner only, rename only, a person's own session; Server-level config" },
   { route: "PATCH /api/mcp/servers/:mcpServerId", bucket: "notAgentMachine", reason: "manageIntegrations capability; Server-level MCP server config" },
-  { route: "PATCH /api/provider-connections/:connectionId", bucket: "providerConnectionResidual", reason: "confirmed removal/demotion race, fix #proj-backend-general task #165 (unified, owner Ark), audit #167. Predicate: server capability manageExternalAuth; provider connection config, no Agent-relation authority" },
   { route: "PATCH /api/servers/:id", bucket: "notAgentMachine", reason: "Server settings, invites, join links, ordering" },
   { route: "PATCH /api/servers/:id/labs/access", bucket: "notAgentMachine", reason: "Server settings, invites, join links, ordering" },
-  { route: "PATCH /api/servers/:id/machines/:machineId", bucket: "pure", reason: "editMachines or registrant; machine row update" },
+  { route: "PATCH /api/servers/:id/machines/:machineId", bucket: "pure", reason: "editMachines or live attacher; machine row update" },
   { route: "PATCH /api/servers/:id/members/:memberId", bucket: "authorityTransition", reason: "role transition: the FOR UPDATE + UPDATE on server_members that fenced writes linearize against" },
   { route: "PATCH /api/me/notification-settings", bucket: "notAgentMachine", reason: "caller's own account notification settings" },
   { route: "POST /api/me/account/deletion", bucket: "notAgentMachine", reason: "caller's own account: schedules its deletion after re-authentication; revokes the caller's own sessions and keys and stops the agents the caller created or owns as assistants (no membership or relationship authority over someone else's Agent / Machine)" },
@@ -240,6 +266,14 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "DELETE /api/me/app-logins/:clientId", bucket: "notAgentMachine", reason: "caller's own account (RFC 079 phase 3a per-app revoke): denies the caller's own open Login with Raft requests and revokes the caller's own tokens and consents for one App, on every Server and none; only removes access; no membership or relationship authority over an Agent / Machine" },
   { route: "POST /api/me/sessions/revoke-others", bucket: "notAgentMachine", reason: "caller's own account: signs out every other full sign-in of the caller (device sign-ins kept), after re-authentication and two-step step-up; reason lost_device also revokes what the caller's revoked sign-ins approved or issued through the security-revoke cascade; no membership or relationship authority over someone else's Agent / Machine" },
   { route: "POST /api/me/account/deletion/email-code", bucket: "notAgentMachine", reason: "caller's own account: emails the code that confirms its deletion" },
+  { route: "POST /api/me/data-exports", bucket: "notAgentMachine", reason: "caller's own data: queues a personal export of it after re-authentication on a web sign-in at least a day old (no agent key, CLI or device session); no membership or relationship authority over an Agent / Machine" },
+  { route: "POST /api/me/data-exports/email-code", bucket: "notAgentMachine", reason: "caller's own account: emails the code that confirms a data export" },
+  { route: "DELETE /api/me/data-exports/:exportId", bucket: "notAgentMachine", reason: "caller's own data export: deletes it and its archive (a running one stops)" },
+  { route: "POST /api/me/data-exports/:exportId/download", bucket: "notAgentMachine", reason: "caller's own data export: a 5-minute download link (or the bytes) for its archive, identity re-checked; writes only the download time" },
+  { route: "POST /api/servers/:id/data-exports", bucket: "notAgentMachine", reason: "exportServerData (owner only): queues an export of the server's public channels after re-authentication on a web sign-in at least a day old; no Agent / Machine authority" },
+  { route: "POST /api/servers/:id/data-exports/email-code", bucket: "notAgentMachine", reason: "caller's own account: emails the code that confirms a server data export (exportServerData)" },
+  { route: "DELETE /api/servers/:id/data-exports/:exportId", bucket: "notAgentMachine", reason: "the caller's own server data export: deletes it and its archive (a running one stops)" },
+  { route: "POST /api/servers/:id/data-exports/:exportId/download", bucket: "notAgentMachine", reason: "the caller's own server data export: a 5-minute download link (or the bytes), exportServerData re-checked; writes only the download time" },
   { route: "POST /api/me/account/deletion/notify-agent-owners", bucket: "notAgentMachine", reason: "caller's own account: posts a fixed system notice to the owners of other people's agents bound to the caller's own live Computers, asking them to move those agents; changes no agent, machine or binding (no membership or relationship authority over someone else's Agent / Machine)" },
   { route: "PATCH /api/push/registrations/:installationId", bucket: "notAgentMachine", reason: "caller's own push / notification device registration" },
   { route: "PUT /api/notification-levels", bucket: "notAgentMachine", delegable: "assistant", reason: "caller's own notification level (server / channel / thread follow); membership and read access re-checked" },
@@ -249,6 +283,7 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "PATCH /api/servers/:id/public-search", bucket: "notAgentMachine", reason: "Server settings, invites, join links, ordering" },
   { route: "PATCH /api/servers/:id/public-visibility", bucket: "notAgentMachine", reason: "Server settings, invites, join links, ordering" },
   { route: "PATCH /api/servers/:id/sidebar-order", bucket: "notAgentMachine", delegable: "assistant", reason: "Server settings, invites, join links, ordering" },
+  { route: "PATCH /api/servers/:id/data-export-settings", bucket: "notAgentMachine", reason: "exportServerData (owner only): the server's switch letting members' personal data exports include other people's messages; no Agent / Machine authority" },
   { route: "PATCH /api/servers/:id/product-analytics-settings", bucket: "notAgentMachine", reason: "Server settings, invites, join links, ordering" },
   { route: "PATCH /api/servers/:id/translation-settings", bucket: "notAgentMachine", reason: "Server settings, invites, join links, ordering" },
   { route: "PUT /api/servers/:id/sso/connection", bucket: "notAgentMachine", reason: "SSO settings (RFC 083): manageSso / editServerSettings, no Agent or Machine authority" },
@@ -327,7 +362,17 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /api/auth/app-login/requests/:id/approve", bucket: "notAgentMachine", reason: "caller's own account, session or device login" },
   { route: "POST /api/auth/app-login/requests/:id/deny", bucket: "notAgentMachine", reason: "caller's own account, session or device login" },
   { route: "POST /api/auth/app-login/start", bucket: "notAgentMachine", reason: "caller's own account, session or device login" },
+  { route: "POST /api/auth/app-login/step-up/start", bucket: "notAgentMachine", reason: "caller's own app sign-in asks to be verified on the web (appStepUpService.ts); binds the request to that sign-in and person" },
+  { route: "POST /api/auth/app-login/step-up/complete", bucket: "notAgentMachine", reason: "caller's own app sign-in redeems its step-up code (same sign-in and person, PKCE); marks only that sign-in verified" },
+  { route: "POST /api/auth/app-login/step-up/requests/:id/options", bucket: "notAgentMachine", reason: "public, keyed by the step-up request: passkey options for the request's person only" },
+  { route: "POST /api/auth/app-login/step-up/requests/:id/verify", bucket: "notAgentMachine", reason: "public, keyed by the step-up request: a passkey of the request's person approves it; issues a code only to the app's return URI" },
+  { route: "POST /api/auth/app-login/step-up/requests/:id/cancel", bucket: "notAgentMachine", reason: "public, keyed by the step-up request: cancels it; grants nothing" },
   { route: "POST /api/auth/device/approve", bucket: "notAgentMachine", reason: "caller's own account, session or device login" },
+  { route: "POST /api/servers/:id/computer-pairings", bucket: "notAgentMachine", reason: "caller's own sign-in: the Add Computer window's one-time pairing with a device authorization (computerPairingService.ts); only the creating session family, 404 to anyone else; approving runs the device approve path (step-up, ticket, the pairing's server re-checked by registerMachines), so no Agent/Machine authority beyond it" },
+  { route: "POST /api/computer-pairings/renew", bucket: "notAgentMachine", reason: "caller's own sign-in: the Add Computer window's one-time pairing with a device authorization (computerPairingService.ts); only the creating session family, 404 to anyone else; approving runs the device approve path (step-up, ticket, the pairing's server re-checked by registerMachines), so no Agent/Machine authority beyond it" },
+  { route: "POST /api/computer-pairings/cancel", bucket: "notAgentMachine", reason: "caller's own sign-in: the Add Computer window's one-time pairing with a device authorization (computerPairingService.ts); only the creating session family, 404 to anyone else; approving runs the device approve path (step-up, ticket, the pairing's server re-checked by registerMachines), so no Agent/Machine authority beyond it" },
+  { route: "POST /api/computer-pairings/status", bucket: "notAgentMachine", reason: "caller's own sign-in: the Add Computer window's one-time pairing with a device authorization (computerPairingService.ts); only the creating session family, 404 to anyone else; approving runs the device approve path (step-up, ticket, the pairing's server re-checked by registerMachines), so no Agent/Machine authority beyond it" },
+  { route: "POST /api/computer-pairings/approve", bucket: "notAgentMachine", reason: "caller's own sign-in: the Add Computer window's one-time pairing with a device authorization (computerPairingService.ts); only the creating session family, 404 to anyone else; approving runs the device approve path (step-up, ticket, the pairing's server re-checked by registerMachines), so no Agent/Machine authority beyond it" },
   { route: "POST /api/auth/device/authorize", bucket: "notAgentMachine", reason: "caller's own account, session or device login" },
   { route: "POST /api/auth/device/describe", bucket: "notAgentMachine", reason: "caller's own account, session or device login" },
   { route: "POST /api/auth/device/revoke", bucket: "notAgentMachine", reason: "caller's own account, session or device login" },
@@ -435,6 +480,7 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /api/integrations/clients/:clientId/link-preview-decline", bucket: "integrationLane", reason: "the caller's own link-preview decline on the request's Server; membership and the active installation are re-read FOR SHARE (App row FOR KEY SHARE first) in the write transaction, so a concurrent removal or uninstall runs before it (404) or after it (clears the row); no Agent-relation authority" },
   { route: "PUT /api/integrations/clients/:clientId/action-endpoint/own-server-actions", bucket: "integrationLane", reason: "RFC 076 §17: server capability manageIntegrations, checked before the transaction like the other App settings writes (the #167 membership race applies); confirms only a server_local App owned by the request's Server, under its link-preview registration row FOR UPDATE, and audits; no Agent-relation authority" },
   { route: "DELETE /api/integrations/clients/:clientId/action-endpoint/own-server-actions", bucket: "integrationLane", reason: "RFC 076 §17: withdraws what the PUT above confirmed; same predicate, same row lock, audited; narrows what the App's card buttons may do" },
+  { route: "PUT /api/integrations/clients/:clientId/server-vouch", bucket: "integrationLane", reason: "server capability manageExternalAuth (as an agent's App access approval), checked before the transaction like the other App settings writes (the #167 membership race applies); a person's own session only (refuses an assistant acting as its owner and a card dispatch); vouches for or un-vouches only a server_local App of the request's Server under its row lock, audited; no Agent-relation authority" },
   { route: "PUT /api/integrations/clients/:clientId/prompt-text/confirm", bucket: "integrationLane", reason: "server capability manageIntegrations; confirms only an app owned by the request's Server (checked under the app row lock); no Agent-relation authority (task #4 #proj-apps)" },
   { route: "POST /api/integrations/clients/:clientId/app-notifications/webhook/rotate-secret", bucket: "integrationLane", reason: "confirmed membership race, fix #proj-backend-general task #168 (owner Ark), audit #167. Predicate: server capability rotateServerSecrets; no Agent-relation authority" },
   { route: "POST /api/integrations/clients/:clientId/logo", bucket: "integrationLane", reason: "confirmed membership race, fix #proj-backend-general task #168 (owner Ark), audit #167. Predicate: server capability manageIntegrations; no Agent-relation authority" },
@@ -462,10 +508,14 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /api/mcp/apps/:appId/connections", bucket: "notAgentMachine", reason: "manageIntegrations capability; adds an API-key MCP App Connection after a handshake; Server-level config, no Agent/Machine relationship" },
   { route: "POST /api/mcp/apps/:appId/logo", bucket: "notAgentMachine", reason: "manageIntegrations capability; uploads an MCP App's logo (Server-level App profile, same storage as an ordinary App logo), no Agent/Machine relationship" },
   { route: "POST /api/mcp/apps/:appId/refresh", bucket: "notAgentMachine", reason: "manageIntegrations capability; re-reads the MCP App tool catalogue through its default Connection, writes no Agent/Machine rows" },
-  { route: "POST /api/mcp/apps/:appId/connections/oauth/start", bucket: "integrationLane", reason: "Managed MCP per-Connection OAuth start (may write a pending Connection row); same lane as POST /api/mcp/servers/:mcpServerId/oauth/start. Predicate: server capabilities manageIntegrations and manageExternalAuth (owner/admin); no Agent-relation authority" },
+  { route: "POST /api/mcp/apps/:appId/connections/oauth/start", bucket: "integrationLane", reason: "Managed MCP per-Connection OAuth start (may write a pending Connection row); same lane as POST /api/mcp/servers/:mcpServerId/oauth/start. Predicate: a person's own session (refuses an assistant acting as its owner and a card dispatch); shared: server capabilities manageIntegrations and manageExternalAuth (owner/admin); personal (RFC 087): the caller's own Connection, a member not a guest, the flag and the App's members_can_connect on; no Agent-relation authority" },
   { route: "POST /api/mcp/probe", bucket: "notAgentMachine", reason: "manageIntegrations capability, rate-limited; probes a pasted MCP server URL and persists nothing" },
   { route: "POST /api/mcp/servers", bucket: "notAgentMachine", reason: "manageIntegrations capability; Server-level MCP server config, no Agent/Machine relationship" },
-  { route: "POST /api/mcp/servers/:mcpServerId/oauth/start", bucket: "integrationLane", reason: "Managed MCP OAuth start: confirmed removal/demotion race, fix #proj-backend-general task #165, audit task #164. Predicate: server capability manageExternalAuth (owner/admin); no Agent-relation authority" },
+  { route: "PUT /api/mcp/apps/:appId/members-can-connect", bucket: "integrationLane", reason: "RFC 087 D1: server capabilities manageIntegrations and manageExternalAuth, re-checked under the caller's membership fence, while the Server flag mcp_personal_accounts is on; a person's own session only (refuses an assistant acting as its owner and a card dispatch); one column of an MCP App of the request's Server under its row lock, audited; no Agent-relation authority" },
+  { route: "PUT /api/mcp/connections/:connectionId/agents", bucket: "integrationLane", reason: "RFC 087 grants: a member's own MCP Connection by its owner only (flag on, a member not a guest; personal grants, a move replaces another member's in the same transaction), a shared one by manageExternalAuth (pins, the default), under the caller's membership fence; a person's own session only (refuses an assistant acting as its owner and a card dispatch); audited and the agents' owners and admins told; no Agent-relation authority" },
+  { route: "PUT /api/mcp/connections/:connectionId/agents/:agentId", bucket: "integrationLane", reason: "RFC 087 §7.1 the Connect card's account choice: this agent uses this MCP Connection, its other agents kept (setMcpConnectionAgents add); a member's own by its owner only (flag on, a member not a guest, an agent they can find; a personal grant, a move replaces another member's), a shared one by manageExternalAuth (a pin; the default and enabled untouched), under the caller's membership fence; a person's own session only (refuses an assistant acting as its owner and a card dispatch); audited and the agent's owner and admins told; no Agent-relation authority" },
+  { route: "PUT /api/mcp/apps/:appId/server-vouch", bucket: "integrationLane", reason: "server capability manageExternalAuth (as granting an agent an MCP App), checked before the transaction like the other MCP App settings writes (the #167 membership race applies); a person's own session only (refuses an assistant acting as its owner and a card dispatch); vouches for or un-vouches only an MCP App of the request's Server under its row lock, audited; no Agent-relation authority" },
+  { route: "POST /api/mcp/servers/:mcpServerId/oauth/start", bucket: "integrationLane", reason: "Managed MCP OAuth start: confirmed removal/demotion race, fix #proj-backend-general task #165, audit task #164. Predicate: a person's own session (refuses an assistant acting as its owner and a card dispatch), server capability manageExternalAuth (owner/admin); no Agent-relation authority" },
   { route: "POST /api/mcp/servers/:mcpServerId/test", bucket: "notAgentMachine", reason: "manageIntegrations capability; connectivity test, writes no Agent/Machine rows" },
   { route: "POST /api/mcp/servers/test-configuration", bucket: "notAgentMachine", reason: "manageIntegrations capability; configuration probe, writes no Agent/Machine rows" },
   { route: "POST /api/messages", bucket: "notAgentMachine", reason: "message content" },
@@ -491,10 +541,6 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /api/product-feedback", bucket: "notAgentMachine", reason: "product telemetry / feedback" },
   { route: "POST /api/product-feedback/tickets/:ticketId/close", bucket: "notAgentMachine", reason: "product telemetry / feedback" },
   { route: "POST /api/product-feedback/tickets/:ticketId/comments", bucket: "notAgentMachine", reason: "product telemetry / feedback" },
-  { route: "POST /api/provider-connections", bucket: "providerConnectionResidual", reason: "confirmed removal/demotion race, fix #proj-backend-general task #165 (unified, owner Ark), audit #167. Predicate: server capability manageExternalAuth; provider connection config, no Agent-relation authority" },
-  { route: "POST /api/provider-connections/:connectionId/credentials/rotate", bucket: "providerConnectionResidual", reason: "listed separately under rotateServerSecrets: removal/demotion race, fix #proj-backend-general task #165 (unified), audit task #167, owner Ark; no Agent-relation authority" },
-  { route: "POST /api/provider-connections/:connectionId/probes", bucket: "providerConnectionResidual", reason: "confirmed removal/demotion race, fix #proj-backend-general task #165 (unified, owner Ark), audit #167. Predicate: server capability manageExternalAuth; provider connection config, no Agent-relation authority; the probe dispatch's final effect is a task #93 line A residual" },
-  { route: "POST /api/provider-connections/:connectionId/test", bucket: "providerConnectionResidual", reason: "confirmed removal/demotion race, fix #proj-backend-general task #165 (unified, owner Ark), audit #167. Predicate: server capability manageExternalAuth; provider connection config, no Agent-relation authority; the legacy test's final effect is a task #93 line A residual" },
   { route: "POST /^\\/api\\/public\\/servers\\/[^/]+\\/message-translations:batch$/", bucket: "notAgentMachine", reason: "public message translation rate limiter; no Agent/Machine relationship authority" },
   { route: "POST /api/public-visits/:slug", bucket: "notAgentMachine", reason: "public page visit counts; unauthenticated, count-only telemetry, no Agent/Machine authority" },
   { route: "POST /api/public/servers/:slug/message-translations:batch", bucket: "notAgentMachine", reason: "public message translation generation/cache write; no Agent/Machine relationship authority" },
@@ -512,21 +558,26 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /api/servers/:id/machines", bucket: "lineG", reason: "registerMachines capability only; removal/demotion race is #93 line G" },
   { route: "POST /api/servers/:id/machines/:machineId/agents/:agentId/diagnostic/mention-delivery/:messageId/redrive", bucket: "cat3", reason: "editAgents or creator; orchestrator redrive only; #93 runtime command chain" },
   { route: "POST /api/servers/:id/machines/:machineId/agents/:agentId/feedback/:reportId/transcript", bucket: "cat3", reason: "editAgents or creator; daemon transcript request only; #93 runtime command chain" },
-  { route: "POST /api/servers/:id/machines/:machineId/computer-lifecycle-operations", bucket: "cat1", reason: "controlComputers or registrant; operation/target admission fenced; dispatch effect open in #93" },
-  { route: "POST /api/servers/:id/machines/:machineId/computer/:action", bucket: "cat1", reason: "controlComputers or registrant; operation/dispatch admission fenced; send effect open in #93" },
+  { route: "POST /api/servers/:id/machines/:machineId/computer-lifecycle-operations", bucket: "cat1", reason: "controlComputers or live attacher; operation/target admission fenced; dispatch effect open in #93" },
+  { route: "POST /api/servers/:id/machines/:machineId/computer/:action", bucket: "cat1", reason: "controlComputers or live attacher; operation/dispatch admission fenced; send effect open in #93" },
   { route: "PUT /api/servers/:id/machines/:machineId/owner", bucket: "pure", reason: "editMachines (owner/admin), the current owner, or the connector claiming a Public Computer; actor's and new owner's member rows FOR SHARE, then the machine row FOR UPDATE; owner column write + audit; no rights change (Computer owner v1)" },
-  { route: "POST /api/servers/:id/machines/:machineId/rotate-key", bucket: "pure", reason: "rotateMachineKeys or registrant; machine key rotation" },
-  { route: "POST /api/servers/:id/machines/:machineId/revoke-computer-key", bucket: "pure", reason: "removeMachines or registrant re-checked under the membership fence; under the machine row lock, refused (409) while other people's agents are on it unless every one is named in forceAgentIds (then unbound and stopped); revokes one Computer key and its machine's runner keys" },
-  { route: "POST /api/servers/:id/machines/:machineId/notify-agent-owners", bucket: "cat3", reason: "removeMachines or registrant; posts a fixed system notice to the owners of other people's agents on the machine asking them to move them (once per caller and agent per 24 hours); no Agent/Machine authority-row write" },
+  { route: "POST /api/servers/:id/machines/:machineId/rotate-key", bucket: "pure", reason: "rotateMachineKeys only in effect (a raw daemon has no live attacher); machine key rotation" },
+  { route: "POST /api/servers/:id/machines/:machineId/revoke-computer-key", bucket: "cat1", reason: "removeMachines or live attacher re-checked under the membership fence; under the machine row lock, refused (409) while other people's agents are on it unless every one is named in forceAgentIds (then unbound and stopped); revokes one Computer key and its machine's runner keys; with `delete: true` also deleteMachine and its computer.removed audit in the same fenced transaction (authorized once, before the revoke), the machine disconnect after commit as DELETE does" },
+  { route: "POST /api/servers/:id/machines/:machineId/notify-agent-owners", bucket: "cat3", reason: "removeMachines or live attacher; posts a fixed system notice to the owners of other people's agents on the machine asking them to move them (once per caller and agent per 24 hours); no Agent/Machine authority-row write" },
   { route: "POST /api/servers/:id/hosted-cindy", bucket: "lineG", reason: "staging-only owner creates the onboarding Agent through ensureHostedCindy/createAgent; creation admission is #93 line G, not a fenced existing-Agent write" },
   { route: "POST /api/servers/:id/machines/:machineId/runtime-auth/:runtime/login", bucket: "cat3", reason: "attaching human or owner/admin; ephemeral requester/connection-bound login state and Computer runtime dispatch only; #93 runtime command chain" },
   { route: "POST /api/servers/:id/machines/:machineId/runtime-auth/:runtime/login/:loginId/code", bucket: "cat3", reason: "attaching human or owner/admin plus matching login initiator; relay code to the bound Computer runtime, no authority-row write; #93 runtime command chain" },
   { route: "POST /api/servers/:id/machines/:machineId/runtime-auth/:runtime/login/:loginId/cancel", bucket: "cat3", reason: "attaching human or owner/admin plus matching login initiator; cancel Computer runtime login and ephemeral state only; #93 runtime command chain" },
   { route: "POST /api/servers/:id/machines/:machineId/runtime-auth/:runtime/connect-provider", bucket: "cat3", reason: "attaching human or owner/admin; relays a provider API key to the Computer runtime once, stores nothing, no authority-row write; #93 runtime command chain" },
   { route: "POST /api/servers/:id/machines/:machineId/runtime-auth/:runtime/logout", bucket: "cat3", reason: "attaching human or owner/admin; Computer runtime logout dispatch only, no authority-row write; #93 runtime command chain" },
-  { route: "POST /api/servers/:id/machines/:machineId/runtime-account-usage/:provider/limit-reset", bucket: "cat3", reason: "Codex: attaching human or owner/admin (same as logout); Claude: attaching human only (claude_limit_reset_owner_only), its account is usually their own; Computer runtime limit-reset dispatch with a client idempotency key, usage cache write only, no authority-row write; #93 runtime command chain" },
-  { route: "POST /api/servers/:id/machines/:machineId/runtime-account-usage/:provider/limit-resets/read", bucket: "cat3", reason: "attaching human or owner/admin; a consent read (can spend the 5-hour reset) attaching human only (claude_limit_reset_owner_only); Computer runtime read of the account's Claude limit resets behind claude_limit_reset, per-user/Computer rate limit, no DB write; #93 runtime command chain" },
+  { route: "POST /api/servers/:id/machines/:machineId/runtime-account-usage/:provider/limit-reset", bucket: "cat3", reason: "attaching human or owner/admin (same as logout), Claude and Codex alike; a reset used by an owner/admin who did not attach it writes computer.limit_reset_used_by_other and emails the attacher; Computer runtime limit-reset dispatch with a client idempotency key, usage cache write and that audit row only, no authority-row write; #93 runtime command chain" },
+  { route: "POST /api/servers/:id/machines/:machineId/runtime-account-usage/:provider/limit-resets/read", bucket: "cat3", reason: "attaching human or owner/admin, a consent read (can spend the 5-hour reset) included; Computer runtime read of the account's Claude limit resets behind claude_limit_reset_v2, per-user/Computer rate limit, no DB write but the computer.limit_reset_used_by_other audit row when an owner/admin who did not attach it gets a read that spent the 5-hour reset; #93 runtime command chain" },
   { route: "POST /api/servers/:id/machines/:machineId/runtime-account-usage/:provider/refresh", bucket: "cat3", reason: "attaching human or editMachines; cooldown cache key + runtime request; #93 runtime command chain" },
+  { route: "POST /api/servers/:id/machines/:machineId/computer-checks/refresh", bucket: "cat3", reason: "attaching human or editMachines (canSeeComputerRuntimeAccounts, as runtime account usage), behind computer_checks_v0; Computer dispatch of computer:checks:config and computer:checks:refresh (no parameters), 30 s claim per Computer in the cache, no DB write; #93 runtime command chain" },
+  { route: "POST /api/servers/:id/machines/:machineId/proc-jobs/stop", bucket: "cat3", reason: "controlComputers or the live attacher (canManageComputer control), and the agent must be one the person may find (404 otherwise); Computer command dispatch (stop one raft proc job by agent and name, the stopper's handle from the session), computer.proc_job_stopped audit row only; #93 runtime command chain" },
+  { route: "POST /api/servers/:id/machines/:machineId/runtimes/:runtime/install", bucket: "cat3", reason: "attaching human or owner/admin (same as Upgrade and the runtime sign-in), behind runtime_install_button; Computer runtime installer dispatch on a person's confirmation only (the runtime id alone; the command is OAR's on the Computer), computer.runtime_install audit row only; #93 runtime command chain" },
+  { route: "POST /api/servers/:id/machines/:machineId/runtimes/:runtime/install-plan", bucket: "cat3", reason: "attaching human or owner/admin (same as Upgrade), behind runtime_install_button; Computer read of what the runtime's installer would run, nothing run, per-user/Computer rate limit, no DB write; #93 runtime command chain" },
+  { route: "POST /api/servers/:id/machines/:machineId/runtimes/:runtime/upgrade", bucket: "cat3", reason: "attaching human or owner/admin (same as the runtime sign-in), behind runtime_upgrade_button; Computer runtime updater dispatch on a person's request only, no DB write; #93 runtime command chain" },
   { route: "POST /api/servers/:id/machines/:machineId/runtimes/rescan", bucket: "cat3", reason: "orchestrator runtime rescan only; #93 runtime command chain" },
   { route: "POST /api/servers/:id/scope-attestation", bucket: "notAgentMachine", reason: "signs a scope attestation; no DB write" },
   { route: "POST /api/servers/:id/setup-handoff", bucket: "notAgentMachine", reason: "owner acknowledges setup; best-effort onboarding message delivery, no Agent/Machine authority write" },
@@ -579,6 +630,8 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /api/artifacts/:id/review/submit", bucket: "notAgentMachine", reason: "Workspace Artifacts review by a person (S8): the reader's own drafts posted as comments on an Artifact they still see (reviews.ts submitReview), app_artifacts rows and notices to agents that can see it; no Server authority" },
   { route: "PUT /api/artifacts/:id/subscription", bucket: "notAgentMachine", reason: "Workspace Artifacts follow: the reader's own subscription row on an Artifact they can see" },
   { route: "DELETE /api/artifacts/:id/subscription", bucket: "notAgentMachine", reason: "Workspace Artifacts unfollow: the reader's own subscription row" },
+  { route: "POST /api/artifacts/:id/settle", bucket: "notAgentMachine", reason: "Workspace Artifacts settle (#334): whoever may comment on it marks it Settled; app_artifacts rows, the reader's follow, the object event read for its people and queued notices to its agents" },
+  { route: "DELETE /api/artifacts/:id/settle", bucket: "notAgentMachine", reason: "Workspace Artifacts unsettle (#334): the same rule as settle; app_artifacts rows, the object event read for its people and queued notices to its agents" },
   { route: "POST /api/objects/activity/done", bucket: "notAgentMachine", reason: "Activity Done for an object row (S6): the reader's own object_inbox_states row, after core's by-id visibility of the object; the app moves the reader's own read position (markRead); no Server authority" },
   { route: "POST /api/objects/activity/undone", bucket: "notAgentMachine", reason: "Activity undo Done for an object row (S6): the reader's own object_inbox_states row, after core's by-id visibility of the object; no Server authority" },
   { route: "POST /api/objects/activity/read", bucket: "notAgentMachine", reason: "Activity mark read for an object row (S6): the app moves the reader's own read position (markRead), after core's by-id visibility of the object; no Server authority" },
@@ -602,6 +655,7 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /internal/agent-api/channels/:channelId/mute", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent-api/channels/:channelId/unmute", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent-api/channels/archive", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
+  { route: "POST /internal/agent-api/channels/member-role", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); the agent's own changeChannelMemberRoles in that channel (channelActorHasCapability: a channel admin there, or a server owner/admin with access; joint: host entry owner/admin only) under the channel and membership row locks, same writer as the web route; no human Server authority" },
   { route: "POST /internal/agent-api/channels/unarchive", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent-api/feedback-locators", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent-api/integrations/app/logo", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
@@ -645,8 +699,11 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /internal/agent-api/third-party-events/delivered", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent-api/inbox/read", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); consumes only the agent's own inbox items; no human Server authority" },
   { route: "POST /internal/agent-api/inbox/dismiss", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); dismisses only the agent's own inbox items; no human Server authority" },
+  { route: "POST /internal/agent-api/inbox/rows", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); reads only the agent's own inbox rows (agent_id-scoped view read), writes nothing; no human Server authority" },
   { route: "POST /internal/agent-api/threads/follow", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent-api/threads/unfollow", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
+  { route: "POST /internal/agent-api/focus", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
+  { route: "POST /internal/agent-api/unfocus", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent-api/upload", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent-api/v2/send", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent/:id/channels", bucket: "nonHuman", reason: "legacy machine-key principal acting for its Agent; no human Server authority" },
@@ -688,10 +745,8 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /internal/computer/preflight", bucket: "nonHuman", reason: "Computer principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/computer/lifecycle-operations", bucket: "nonHuman", reason: "Computer principal: records its own machine's local start/stop/restart (machine from the key's live computers row, FOR SHARE in the write); no human Server authority" },
   { route: "POST /internal/computer/detach", bucket: "nonHuman", reason: "Computer principal: revokes its own key and its machine's runner keys (computerKeyRevocation, via detach); no human Server authority" },
-  { route: "POST /internal/computer/probes/:probeId/materialize", bucket: "nonHuman", reason: "Computer principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/computer/runners/:agentId/credentials", bucket: "nonHuman", reason: "Computer principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/computer/runners/:agentId/credentials/renew", bucket: "nonHuman", reason: "Computer principal renews its own runner key (routeAuthPolicy registry); no human Server authority" },
-  { route: "POST /internal/computer/runners/:agentId/provider-connection", bucket: "nonHuman", reason: "Computer principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/computer/runners/:agentId/stop", bucket: "nonHuman", reason: "Computer principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/machine/agents/:id/start", bucket: "nonHuman", reason: "legacy machine-key principal; no human Server authority" },
   { route: "POST /internal/machine/agents/:id/stop", bucket: "nonHuman", reason: "legacy machine-key principal; no human Server authority" },
@@ -716,8 +771,8 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "PUT /api/integrations/clients/:clientId/app-notifications/webhook", bucket: "integrationLane", reason: "confirmed membership race, fix #proj-backend-general task #168 (owner Ark), audit #167. Predicate: server capability manageIntegrations; no Agent-relation authority" },
   { route: "PUT /api/integrations/marketplace/:clientId/install/app-notifications/grant", bucket: "integrationLane", reason: "confirmed membership race, fix #proj-backend-general task #168 (owner Ark), audit #167. Predicate: server capability manageIntegrations; no Agent-relation authority" },
   { route: "PUT /api/mcp/apps/:appId/default", bucket: "notAgentMachine", reason: "manageIntegrations capability; sets the App's server-default Connection (Server-level config, App row locked); closes Connect cards it satisfies; no per-Agent authority write" },
-  { route: "PUT /api/mcp/agents/:agentId/assignments", bucket: "cat1", reason: "manageExternalAuth or creator (the ordinary App grant rule); bulk managed MCP grant/revoke/Connection write fenced; resetAgent effect open in #93" },
-  { route: "PUT /api/mcp/agents/:agentId/assignments/:mcpServerId", bucket: "pure", reason: "manageExternalAuth or creator (the ordinary App grant rule); single managed MCP grant/revoke/Connection upsert, fenced" },
+  { route: "PUT /api/mcp/agents/:agentId/assignments", bucket: "cat1", reason: "a person's own session (refuses an assistant acting as its owner and a card dispatch); manageExternalAuth or creator (the ordinary App grant rule); bulk managed MCP grant/revoke/Connection write fenced; resetAgent effect open in #93" },
+  { route: "PUT /api/mcp/agents/:agentId/assignments/:mcpServerId", bucket: "pure", reason: "a person's own session (refuses an assistant acting as its owner and a card dispatch); manageExternalAuth or creator (the ordinary App grant rule); single managed MCP grant/revoke/Connection upsert, fenced" },
   { route: "PUT /api/oauth/installations/:installationId/setup", bucket: "nonHuman", reason: "App client credential authenticates own active installation; setup progress is not an Agent/Machine authority grant" },
   { route: "PUT /api/oauth/installations/:installationId/subscriptions", bucket: "nonHuman", reason: "OAuth protocol endpoint (client credentials, bearer token or integration consent); no Agent/Machine relationship authority" },
   { route: "POST /api/oauth/installations/lookup", bucket: "nonHuman", reason: "App client credentials resolve only that App's active installation on an exact Server" },

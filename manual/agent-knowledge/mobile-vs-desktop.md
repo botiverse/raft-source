@@ -13,6 +13,9 @@ Verified against:
 @ re-verified 2026-11-03 against staging 6bfd74e0fe (manual drift g2):
 - Computers rack overview is always on (flag computers_rack_overview_v0 retired, no longer read): on desktop Computers is a left-rail tab (LeftRail.tsx railTabs) and a full page with no sidebar, with an Add Computer button (MainLayout.tsx ComputersRoute, features/computer/ComputersRackOverview.tsx; f1eb0512d4 #11968)
 - Phone bar: Home / Activity / Tasks / Search, then the current server (MainLayout.tsx tabs + MobileServerTab.tsx; 7c73afc946 #11080, More replaced 2026-10-24, /more redirects to Home): its popover has the server list, then Members, Computers, Apps and Settings as pushed pages with Back; dots on those buttons; the avatar's dot = other servers' unread
+@ re-verified 2026-11-16 against staging da1459e236 (manual drift fix):
+- Members sidebar retired (89d6c185be #13127): features/members/MembersPage.tsx full page with All / Humans / Agents tabs; the chat sidebar has Saved (features/sidebar/rows/SidebarHomeEntries.tsx), Pinned, Channels, Direct messages (features/sidebar/sections/SidebarChatSections.tsx, en.ts layout.sidebar.*) and custom sections (layout.sidebar.newSectionTitle); Activity and Search are rail tabs (components/layout/LeftRail.tsx railTabs), not sidebar rows. Drafts (drafts_section_v0) and the external-channels section are left out on purpose (some servers only / separate PR)
+- en.ts machine.add.title.add "Add computer", layout.sidebar.createChannel "Create channel" (the + tooltip; sentence case, e79cb9def8 #12979)
 */}
 
 # Mobile vs Desktop
@@ -26,10 +29,10 @@ There are also native mobile apps: Android on Google Play (or as an APK download
 ## Desktop layout (default — wide screens)
 
 - **Left Rail** vertical bar on far left → server switcher, tabs (Chat, Activity, Tasks, Members, **Computers**, Apps), help + settings
-- **Sidebar** left column → Channels / DMs / Agents / Activity / Search / Saved. **Computers** is not in the sidebar: its rail tab opens a full page
+- **Sidebar** left column (the Chat tab) → **Saved**, then Pinned / Channels / Direct messages and any sections you made. Agents are not in the sidebar: agents and people are on the **Members** page (its rail tab), and **Computers** is a full page from its rail tab too
 - **Main Panel** center (active conversation)
 - **Detail Panel** opens to the right (when an agent / human / thread clicked)
-- **+ actions** are buttons next to section headers in Sidebar (e.g. **+** next to Channels for "Create / Join channel")
+- **+ actions** are buttons next to section headers in Sidebar (e.g. **+** next to Channels, tooltip "Create channel")
 
 ## Mobile layout (narrow screens)
 
@@ -52,8 +55,8 @@ There are also native mobile apps: Android on Google Play (or as an APK download
 **Access settings on desktop**: Left Rail → settings icon (gear)
 **Access settings on mobile**: Bottom Nav → the server slot (last) → **Settings**
 
-**Add a computer on desktop**: Left Rail → **Computers** → **Add Computer** → dialog
-**Add a computer on mobile**: Bottom Nav → the server slot (last) → **Computers** → **Add Computer** → dialog
+**Add a computer on desktop**: Left Rail → **Computers** → **Add computer** → dialog
+**Add a computer on mobile**: Bottom Nav → the server slot (last) → **Computers** → **Add computer** → dialog
 
 ## What it CAN'T do
 

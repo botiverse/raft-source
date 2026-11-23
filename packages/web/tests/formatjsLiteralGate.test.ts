@@ -2358,7 +2358,7 @@ test("real corpus: structural, catalog-id, and template-glue filters remove audi
   // `{group} · {provider}`, Qwen's own group and provider names: a `·` between
   // two dynamic values, structural punctuation: 91 -> 92.
   // The runtime field's label (RuntimeConfigFields) holds name, `{" "}` and
-  // the Experimental badge in one span, so the closed Select's flex trigger
+  // a badge (now Recommended) in one span, so the closed Select's flex trigger
   // keeps the space: layout glue between a name and a badge: 92 -> 93.
   // Plan & Billing became an overview (task #13): the seat form's `/` between
   // used and bought and the confirm dialog's `label: value` rows went, and its
@@ -2438,7 +2438,19 @@ test("real corpus: structural, catalog-id, and template-glue filters remove audi
   // parts with an aria-hidden `·`: structural punctuation, not copy: 97 -> 98.
   // The Computers list usage cell's model line (RackRuntimeUsage, OAR 0.102 window scope) puts a `{" · "}` between
   // the model name and its value ("Opus · 40%"): structural punctuation, not copy: 98 -> 99.
-  assert.equal(filteredKeys, 99, `audited structural key count; got ${filteredKeys}`);
+  // Agent read progress was removed (agent_read_progress_v0, #raft-feature-flag:#9), and with its agent read line
+  // MessageReadStatusLine's aria-hidden `·` between the line and its hint: 99 -> 98.
+  // Provider connections were removed (provider_connections_v0, #raft-feature-flag:#11), and with Settings › AI
+  // Providers (ProviderConnectionsSettings) its `{" · "}` separators and the `{" "}` spacer before a verified chip:
+  // 98 -> 96.
+  // The runtime usage card's facts line (RuntimeUsageSurface, #oar-raft 3a3f8fc1, Kirby's review) separates resets
+  // left and credits with an aria-hidden `·` between `{" "}` spacers: structural punctuation, not copy: 96 -> 97.
+  // The Apps page's card/list switch was removed (#wg-apps-ux D11), and with its List view the row's aria-hidden
+  // ` · ` separators in MarketplaceListingsTab's row variant and InstalledConnectedAppItem: 97 -> 95.
+  // The device login confirm facts moved into a shared DeviceLoginRequestDetails (its "ip · location" and
+  // "hostname · os" joins), and the Add Computer window's code entry and review put `{" "}` spacers before
+  // their TextLinks (#proj-raft-computer:#110 §11 A): layout glue in new files: 95 -> 97.
+  assert.equal(filteredKeys, 97, `audited structural key count; got ${filteredKeys}`);
   assert.ok(filteredHits > 100, `hits must exceed prior 100; got ${filteredHits}`);
   // HandoffCreateFlow's `· ${session.model}` suffix is dynamic metadata glue, the
   // same shape as EditChannelDialog's `· ${…}` suffixes.
@@ -2473,14 +2485,17 @@ test("real corpus: structural, catalog-id, and template-glue filters remove audi
   // 14 -> 12 keys and hits: Plan & Billing became an overview (task #13); its
   // upload row `` `${used} / ${limit} ${thisMonth}` `` and the Free upload
   // label `` `${limit}/${month}` `` are planBilling.* messages now.
+  // 12 -> 11 keys and hits: Settings › AI Providers went with provider
+  // connections (provider_connections_v0), and with it VerifiedOnRow's chip
+  // title `` `${runtime} · ${model} · ${verifiedAt}` ``.
   assert.equal(
     glueFilteredOut.length,
-    12,
+    11,
     `audited dynamic/translated template-glue key count; got ${JSON.stringify(glueFilteredOut)}`,
   );
   assert.equal(
     glueFilteredOut.reduce((n, e) => n + e.count, 0),
-    12,
+    11,
     "each audited glue key currently occurs once",
   );
   // Structural drops 75 (including the two compatibility source paths);

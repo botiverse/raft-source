@@ -8,7 +8,7 @@ const { agentServerRoleRequiredBody, AGENT_SERVER_ROLE_REQUIRED_CODE } = await i
 describe("agentServerRoleRequiredBody", () => {
   beforeEach(() => getActorServerRoleInServer.mockReset());
 
-  it("names both roles when a higher server role is needed", async () => {
+  it("names both roles when a higher server role is needed, in the step only", async () => {
     getActorServerRoleInServer.mockResolvedValue("member");
     const body = await agentServerRoleRequiredBody({
       serverId: "s1",
@@ -22,9 +22,6 @@ describe("agentServerRoleRequiredBody", () => {
       code: AGENT_SERVER_ROLE_REQUIRED_CODE,
       suggestedNextAction:
         "To edit the server profile you need the admin role on this server; your role is member. Ask a server owner or admin to do it, or to change your role.",
-      requiredCapabilities: ["editServerSettings"],
-      requiredRole: "admin",
-      currentRole: "member",
     });
   });
 
@@ -33,11 +30,12 @@ describe("agentServerRoleRequiredBody", () => {
     const body = await agentServerRoleRequiredBody({
       serverId: "s1",
       agentId: "a1",
-      capabilities: ["editChannelMetadata", "createChannels"],
+      capabilities: ["editChannelMetadata", "createPublicChannels"],
       action: "update channels",
     });
-    expect(body.requiredRole).toBe("member");
-    expect(body.suggestedNextAction).toContain("you need the member role");
+    expect(body.suggestedNextAction).toBe(
+      "To update channels you need the member role on this server; your role is guest. Ask a server owner or admin to do it, or to change your role.",
+    );
   });
 
   it("does not ask for a role change when the server role is already high enough", async () => {
@@ -49,7 +47,6 @@ describe("agentServerRoleRequiredBody", () => {
       capabilities: ["addChannelMembers"],
       action: "add channel members",
     });
-    expect(body.requiredRole).toBe("member");
     expect(body.suggestedNextAction).toBe(
       "Your role on this server or channel does not allow you to add channel members here (your role is member). Ask a server owner or admin to do it.",
     );
@@ -60,10 +57,28 @@ describe("agentServerRoleRequiredBody", () => {
     const body = await agentServerRoleRequiredBody({
       serverId: "s1",
       agentId: "a1",
-      capabilities: ["createChannels"],
+      capabilities: ["createPublicChannels"],
       action: "create channels",
     });
-    expect(body.currentRole).toBeNull();
     expect(body.suggestedNextAction).toContain("you are not a member of this server");
+  });
+
+  it("on a joint channel names the host server's managers, whatever the role here", async () => {
+    // No role on another server allows archive/edit/remove on a joint channel,
+    // so "ask a server owner or admin" would point at the wrong server.
+    for (const role of ["admin", "member"] as const) {
+      getActorServerRoleInServer.mockResolvedValue(role);
+      const body = await agentServerRoleRequiredBody({
+        serverId: "s1",
+        agentId: "a1",
+        capabilities: ["archiveChannels"],
+        action: "archive channels",
+        jointChannel: "shared-ops",
+      });
+      expect(body.code).toBe(AGENT_SERVER_ROLE_REQUIRED_CODE);
+      expect(body.suggestedNextAction).toBe(
+        "On a joint channel only its host server's owners, admins and channel managers can archive channels; ask one of them to do it in #shared-ops.",
+      );
+    }
   });
 });

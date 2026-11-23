@@ -19,6 +19,7 @@ import { draftDrawn } from "./artifactRestoredFocus";
 import { useArtifactReview } from "./ArtifactReviewContext";
 import { OVERLAY } from "../../utils/focusGuard";
 import { requestFocus, watchFocusIntent } from "../../utils/focusRequest";
+import { animationFramesOf } from "../../utils/ownerDocument";
 
 /**
  * The person's reply drafts in a thread (Save Draft in a reply box, `replyTo`; useReplyDraftOption): shown
@@ -46,8 +47,10 @@ const LAYER_CLOSE_FRAMES = 60;
  * focus in it is not yet where the person left it.
  */
 function afterLayerOver(card: HTMLElement | null, then: () => void, frames = LAYER_CLOSE_FRAMES): void {
-  requestAnimationFrame(() => {
-    const layer = document.activeElement?.closest(OVERLAY);
+  // The card's own document and frames (an object window's draws while the main window is hidden, #337 PR3).
+  const doc = card?.ownerDocument ?? document;
+  animationFramesOf(doc).requestAnimationFrame(() => {
+    const layer = doc.activeElement?.closest(OVERLAY);
     if (frames > 0 && layer && !(card && layer.contains(card))) afterLayerOver(card, then, frames - 1);
     else then();
   });

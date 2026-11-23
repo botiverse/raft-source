@@ -113,7 +113,8 @@ export function classifyLinkTarget(url: unknown, raftHostnames: readonly string[
  * Whether `url` is Raft's own sign-in for another site (Login with Raft): the
  * API's OAuth authorize endpoint (also under a Server's own issuer,
  * `/oidc/<server>/api/oauth/authorize`) or the app's consent page it
- * redirects to. The path is read as the server's router reads it (Express:
+ * redirects to (`/login-with-raft/...`, also under its older names
+ * `/login-with-slock/...` and `/login-with-slock-human/...`). The path is read as the server's router reads it (Express:
  * letters in either case, one trailing slash or none), so another spelling
  * of the same endpoint is the same refusal; the Server segment is not
  * interpreted. This only names the refusal: what the desktop takes as a
@@ -130,5 +131,7 @@ export function isRaftAuthorizeUrl(url: unknown, raftHostnames: readonly string[
   // One trailing slash is the same route; a second is not (Express answers 404).
   const pathname = new URL(url as string).pathname.replace(/(?<=[^/])\/$/, "").toLowerCase();
   if (/^\/oidc\/[^/]+\/api\/oauth\/authorize$/.test(pathname)) return true;
-  return pathname === "/api/oauth/authorize" || pathname === "/oauth/authorize" || pathname === "/login-with-raft" || pathname.startsWith("/login-with-raft/");
+  if (pathname === "/api/oauth/authorize" || pathname === "/oauth/authorize") return true;
+  // The consent page and its two older names (packages/web App.tsx routes all three to it).
+  return /^\/login-with-(?:raft|slock|slock-human)(?:\/|$)/.test(pathname);
 }

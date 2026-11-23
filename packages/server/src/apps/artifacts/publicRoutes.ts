@@ -12,7 +12,8 @@
 //    (canViewArtifactsAnonymously: a conversation or server home never);
 // 3. it has a current version (a published one);
 // 4. its own server isn't deleted and has workspace_artifacts_v0 on
-//    (apiCommon itemServerEnabled).
+//    (apiCommon itemReadable: a closed server's Artifact is read only in a
+//    joint it is still in, never public).
 // Then:
 // - `GET /:id` answers ArtifactPublicView, exactly its fields: the current
 //   version only, no comments, history, home, server, presence or author.
@@ -47,6 +48,13 @@
 //   process's cap on archives built at once (zipSlots.ts) 429 BUSY with
 //   `Retry-After: 5`. Counted in `slock_app_operations_total`
 //   (operation `public_zip`: started, busy, failed).
+// - `GET /:id/links` (the page's links to other Artifacts, #336) answers
+//   ArtifactPublicLinks: the current version's links (linkTargets.ts), a
+//   target `ok` (its title and kind) only when it passes these same checks
+//   itself, else `unavailable`, never `deleted`, each with `authorSees` true
+//   (what a visitor is shown is public); 503 CONTENT_UNAVAILABLE when
+//   the links can't be read now. A current version without stored links has
+//   them read and stored by this ask (references.ts, as publicText.ts fills).
 // - `GET /:id/meta` (for link previews; the web's edge writes it into the
 //   page) answers ArtifactPublicMeta: the title, the start of the same text
 //   as a description (less a first heading repeating the title), the
@@ -57,9 +65,11 @@
 // server, a conversation or a viewer, and nothing is cached (`private,
 // no-store`), the stored text included: visibility is checked first on
 // every request, so unpublishing, deleting or a takedown stops them at once.
+import { Readable } from "node:stream";
 import { asc, eq } from "drizzle-orm";
 import {
   ARTIFACT_PUBLIC_MARKDOWN_MAX_BYTES,
+  artifactDownloadFileName,
   artifactFileType,
   artifactPublicPaths,
   asArtifactId,
@@ -67,6 +77,7 @@ import {
   isWellFormedArtifactFilePath,
   type ArtifactKind,
   type ArtifactPublicFrame,
+  type ArtifactPublicLinks,
   type ArtifactPublicMeta,
   type ArtifactPublicView,
   type ArtifactWebFrame,
@@ -75,11 +86,13 @@ import type { AppBytes, AppError, AppPublicMarkdown } from "../../platform/apps"
 import { getDb } from "../../platform/db";
 import { apiUrl } from "../../platform/links";
 import { refusalBody, type RefusalInput } from "../../platform/refusals";
-import { ARTIFACT_CURSOR_ID, artifactAppUrl, byteSize, currentVersionOf, itemServerEnabled, json, versionFileOf, type ArtifactApiJson } from "./apiCommon";
+import { ARTIFACT_CURSOR_ID, artifactAppUrl, byteSize, currentVersionOf, itemReadable, json, versionFileOf, type ArtifactApiJson } from "./apiCommon";
 import { attachmentDisposition } from "./blobStore";
+import { linksAnswer, linksUnavailable, versionLinksOf } from "./linkTargets";
 import { ANONYMOUS_CONTENT_VIEWER, anonymousContentSubject, signContentFrame } from "./contentWorker";
 import { PUBLIC_TEXT_KINDS, publicTextOf, utf8Prefix, type PublicText } from "./publicText";
 import { artifactItems, artifactVersionFiles, type ArtifactItemRow, type ArtifactVersionRow } from "./schema";
+import { renderArtifactOgImagePngCached } from "./ogImage";
 import { ARTIFACT_ZIP_MAX_BYTES, versionZipOf, zipBaseName } from "./versionZip";
 import { canViewArtifactsAnonymously } from "./visibility";
 import { notFramed, webContentUnavailable, webFail, webNotVisible as notVisible, type ArtifactWebApiError } from "./webCommon";
@@ -106,7 +119,7 @@ export async function publicItemOf(id: string): Promise<{ item: ArtifactItemRow;
   const [item] = await getDb().select().from(artifactItems).where(eq(artifactItems.id, id)).limit(1);
   if (!item || !canViewArtifactsAnonymously([item])[0]) return null;
   // Checks 3 and 4 at once: both only read; either failing is the one null.
-  const [version, enabled] = await Promise.all([currentVersionOf(item), itemServerEnabled(item)]);
+  const [version, enabled] = await Promise.all([currentVersionOf(item), itemReadable(item)]);
   if (!version || !enabled) return null;
   return { item, version };
 }
@@ -144,6 +157,22 @@ export function createArtifactPublicApi() {
       return { kind: "markdown", body: markdownDocument(item, version, files, content) };
     },
 
+    /**
+     * The current version's links to other Artifacts (linkTargets.ts), each
+     * target `ok` only when it is itself one a visitor may view, else
+     * `unavailable`, and `authorSees` true for each (what a visitor is shown
+     * of a target is public); 503 CONTENT_UNAVAILABLE when they can't be read
+     * now.
+     */
+    links: async (id: string): Promise<ArtifactApiJson<ArtifactPublicLinks> | ArtifactWebApiError> => {
+      const found = await publicItemOf(id);
+      if (!found) return notVisible();
+      const { item, version } = found;
+      const links = await versionLinksOf(item, version);
+      if (!links) return linksUnavailable();
+      return json<ArtifactPublicLinks>(await linksAnswer(null, item, version, links));
+    },
+
     meta: async (id: string): Promise<ArtifactApiJson<ArtifactPublicMeta> | ArtifactWebApiError> => {
       const found = await publicItemOf(id);
       if (!found) return notVisible();
@@ -153,10 +182,35 @@ export function createArtifactPublicApi() {
     },
 
     /**
+     * 1200x630 Open Graph preview image for a public Artifact: title and
+     * description only, never author, server, conversation or viewer. Same
+     * visibility check as `view` and `meta` (404 NOT_VISIBLE for anything not
+     * public; `private, no-store` and `noindex` set by core's public mount).
+     */
+    ogImage: async (id: string): Promise<AppBytes | ArtifactWebApiError> => {
+      const found = await publicItemOf(id);
+      if (!found) return notVisible();
+      const { item, version } = found;
+      const content = await publicTextOf(item, version);
+      const description = content.description || stubLine(content.kind);
+      // Cached strictly AFTER `publicItemOf` succeeds so unpublishing/deletion stops serving immediately.
+      const cacheKey = `${item.id}:${version.id}:${item.title}:${description}`;
+      const png = await renderArtifactOgImagePngCached({ cacheKey, title: item.title, description });
+      return {
+        kind: "bytes",
+        stream: Readable.from(png),
+        size: png.byteLength,
+        contentType: "image/png",
+        contentDisposition: 'inline; filename="og-image.png"',
+      };
+    },
+
+    /**
      * One file of the current version, as published: only a well-formed path
      * matched exactly against the version's files (never `..`, never a path
      * outside it; storage reached through the matched row's blob only),
-     * else the one 404. An attachment, `text/plain` or octet-stream (core
+     * else the one 404. An attachment (a version of one file named by the
+     * title: artifactDownloadFileName), `text/plain` or octet-stream (core
      * adds nosniff and the sandboxing CSP), so nothing renders or runs here.
      */
     file: async (id: string, path: string): Promise<AppBytes | ArtifactWebApiError> => {
@@ -173,7 +227,7 @@ export function createArtifactPublicApi() {
         stream: bytes.stream,
         size: bytes.size,
         contentType: artifactFileType(file.file.path).text ? "text/plain; charset=utf-8" : "application/octet-stream",
-        contentDisposition: attachmentDisposition(file.file.path),
+        contentDisposition: attachmentDisposition(artifactDownloadFileName({ title: item.title, fileCount: version.fileCount, path: file.file.path })),
       };
     },
 

@@ -10,6 +10,7 @@ import {
   agents,
   channels,
   externalAppRegistrations,
+  featureFlags,
   oauthAccessTokens,
   notificationDeliveries,
   notificationEvents,
@@ -32,6 +33,7 @@ import {
   emitAppInstallationNotificationEvent,
 } from "./appNotificationDeliveryService";
 import { deriveAppBotHandle } from "./appBotIdentityService";
+import { OAUTH_ACCOUNT_LOGIN_FEATURE_FLAG_KEY } from "./featureFlagService";
 import { __setAppMemberRefKeyForTests, deriveAppMemberRef } from "./appOutboundProjectionService";
 import {
   __resetOAuthServiceDbForTests,
@@ -544,6 +546,122 @@ test("member removal events name members by member_ref and add sub only for prin
     assert.deepEqual(subjects.get(ref(SIGNED_IN_AGENT_ID).member_ref), {
       type: "member", principal_type: "agent", ...ref(SIGNED_IN_AGENT_ID), sub: SIGNED_IN_AGENT_ID,
     });
+  } finally {
+    __resetOAuthServiceDbForTests();
+    __setAppWebhookEncryptionKeyForTests(null);
+    __setAppMemberRefKeyForTests(null);
+    await client.close();
+  }
+});
+
+const ACCOUNT_USER_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+const OTHER_INSTALLATION_ID = "56565656-5656-4656-8656-565656565656";
+const UNINSTALLED_SERVER_ID = "57575757-5757-4757-8757-575757575757";
+const MEMBER_EVENT_TYPES = ["server.member_added", "server.member_removed", "server.member_role_changed"];
+
+test("RFC 079 D18: an account-mode App gets the sub of a person who signed in to it in account mode on every Server it is installed on, never with an event that shows them only as a guest nor while the kill switch is off for them; Server-bound logins stay on their Server", async () => {
+  const { client, db } = await createTestDb();
+  __setAppWebhookEncryptionKeyForTests(Buffer.alloc(32, 9));
+  __setAppMemberRefKeyForTests(Buffer.alloc(32, 7));
+  __setOAuthServiceDbForTests(() => db);
+  try {
+    await configureAppWebhook({ clientId: CLIENT_ID, actorUserId: USER_ID, endpointUrl: "https://hooks.example.com/raft" }, db);
+    // Before the switch: SIGNED_IN_USER_ID's server-mode login on SERVER_ID, OTHER_SERVER_USER_ID's on OTHER_SERVER_ID.
+    await seedSignIns(db);
+    await db.insert(users).values({ id: ACCOUNT_USER_ID, email: "member-event-account@example.com", name: "member-event-account", passwordHash: "test" });
+    await db.insert(servers).values({ id: UNINSTALLED_SERVER_ID, name: "Uninstalled", slug: "member-event-uninstalled", ownerId: USER_ID });
+    await db.update(oauthClients).set({ outboundCurrentGroups: ["server", "channel"], outboundCurrentEvents: MEMBER_EVENT_TYPES }).where(eq(oauthClients.id, CLIENT_ID));
+    await db.update(oauthClientInstalls).set({ approvedGroups: ["server"], subscribedEvents: MEMBER_EVENT_TYPES, subscriptionRevision: 2 })
+      .where(eq(oauthClientInstalls.id, INSTALLATION_ID));
+    await db.insert(oauthClientInstalls).values({
+      id: OTHER_INSTALLATION_ID, serverId: OTHER_SERVER_ID, clientId: CLIENT_ID, installedByUserId: USER_ID, approvedRequestRevisionId: REVISION_ID,
+      approvedGroups: ["server"], subscribedEvents: MEMBER_EVENT_TYPES, grantRevision: 1, subscriptionRevision: 1,
+    });
+    await db.update(oauthClients).set({ loginMode: "account" }).where(eq(oauthClients.id, CLIENT_ID));
+    // The kill switch oauth_account_login, on for everyone.
+    await db.insert(featureFlags).values({ key: OAUTH_ACCOUNT_LOGIN_FEATURE_FLAG_KEY, randomizationUnit: "user", salt: "d18", enabled: true, killSwitch: false, defaultEnabled: true });
+    // ACCOUNT_USER_ID's account-mode login (no Server). Revoked still counts, as for server mode.
+    const createdAt = new Date();
+    await db.insert(oauthAccessTokens).values({
+      serverId: null, principalType: "human", userId: ACCOUNT_USER_ID, clientId: CLIENT_ID, tokenHash: "h-account", scopes: ["openid"],
+      createdAt, expiresAt: new Date(createdAt.getTime() + 60 * 60 * 1000), revokedAt: createdAt,
+    });
+
+    const emit = (serverId: string, eventType: "server.member_added" | "server.member_removed" | "server.member_role_changed", principalId: string, role: string, previousRole?: string) =>
+      emitAppFacingMemberEvents({
+        serverId, eventType, members: [{ principalType: "human", principalId, role }],
+        provenance: { source: "server_service", actor_type: "human", ...(previousRole ? { previous_role: previousRole } : {}) },
+      }, db);
+    const cases: Array<[label: string, serverId: string, type: "server.member_added" | "server.member_removed" | "server.member_role_changed", principalId: string, role: string, previousRole?: string]> = [
+      ["account login, removed as a member", SERVER_ID, "server.member_removed", ACCOUNT_USER_ID, "member"],
+      ["account login, another Server it is installed on", OTHER_SERVER_ID, "server.member_added", ACCOUNT_USER_ID, "admin"],
+      ["account login, joined as a guest", SERVER_ID, "server.member_added", ACCOUNT_USER_ID, "guest"],
+      ["account login, removed as a guest", OTHER_SERVER_ID, "server.member_removed", ACCOUNT_USER_ID, "guest"],
+      ["account login, demoted to guest", SERVER_ID, "server.member_role_changed", ACCOUNT_USER_ID, "guest", "member"],
+      ["account login, promoted from guest", OTHER_SERVER_ID, "server.member_role_changed", ACCOUNT_USER_ID, "member", "guest"],
+      ["server-mode login on its own Server", SERVER_ID, "server.member_removed", SIGNED_IN_USER_ID, "admin"],
+      ["server-mode login, another Server", OTHER_SERVER_ID, "server.member_removed", SIGNED_IN_USER_ID, "member"],
+      ["server-mode login on another Server", SERVER_ID, "server.member_removed", OTHER_SERVER_USER_ID, "member"],
+      ["never signed in", OTHER_SERVER_ID, "server.member_removed", NEVER_SIGNED_IN_USER_ID, "member"],
+    ];
+    for (const [label, serverId, type, principalId, role, previousRole] of cases) {
+      assert.deepEqual(await emit(serverId, type, principalId, role, previousRole), { eventCount: 1, recipientCount: 1 }, label);
+    }
+    // Not in the App's audience: no installation, so no recipient and nothing to render.
+    assert.deepEqual(await emit(UNINSTALLED_SERVER_ID, "server.member_removed", ACCOUNT_USER_ID, "member"), { eventCount: 0, recipientCount: 0 });
+
+    const posts: Array<{ installation_id: string; event: { type: string; server_id: string; subject: Record<string, unknown>; provenance: Record<string, unknown> } }> = [];
+    assert.deepEqual(await drainAppNotificationDeliveries({
+      executor: db,
+      post: async ({ body }) => { posts.push(JSON.parse(body)); return { status: 204 }; },
+    }), { claimed: cases.length, delivered: cases.length, retried: 0, suppressed: 0, deadLettered: 0 });
+    const subOf = (serverId: string, type: string, principalId: string, role: string) => {
+      const installationId = serverId === SERVER_ID ? INSTALLATION_ID : OTHER_INSTALLATION_ID;
+      const { member_ref } = deriveAppMemberRef({ clientId: CLIENT_ID, installationId, principalId });
+      const post = posts.find((candidate) => candidate.installation_id === installationId && candidate.event.type === type
+        && candidate.event.subject.member_ref === member_ref && candidate.event.provenance.role === role);
+      assert.ok(post, `${type} ${principalId} ${role} on ${serverId} delivered`);
+      return post.event.subject.sub ?? null;
+    };
+    assert.deepEqual(cases.map(([label, serverId, type, principalId, role]) => [label, subOf(serverId, type, principalId, role)]), [
+      ["account login, removed as a member", ACCOUNT_USER_ID],
+      ["account login, another Server it is installed on", ACCOUNT_USER_ID],
+      ["account login, joined as a guest", null],
+      ["account login, removed as a guest", null],
+      ["account login, demoted to guest", ACCOUNT_USER_ID],
+      ["account login, promoted from guest", ACCOUNT_USER_ID],
+      ["server-mode login on its own Server", SIGNED_IN_USER_ID],
+      ["server-mode login, another Server", null],
+      ["server-mode login on another Server", null],
+      ["never signed in", null],
+    ]);
+
+    // The kill switch off: the account-mode login gives no sub, read at send
+    // time; a Server-bound login still does. Back on, it does again.
+    const drainOne = async () => {
+      posts.length = 0;
+      await drainAppNotificationDeliveries({ executor: db, post: async ({ body }) => { posts.push(JSON.parse(body)); return { status: 204 }; } });
+    };
+    await emit(SERVER_ID, "server.member_removed", ACCOUNT_USER_ID, "member");
+    await emit(SERVER_ID, "server.member_removed", SIGNED_IN_USER_ID, "member");
+    await db.update(featureFlags).set({ killSwitch: true }).where(eq(featureFlags.key, OAUTH_ACCOUNT_LOGIN_FEATURE_FLAG_KEY));
+    await drainOne();
+    assert.deepEqual([subOf(SERVER_ID, "server.member_removed", ACCOUNT_USER_ID, "member"), subOf(SERVER_ID, "server.member_removed", SIGNED_IN_USER_ID, "member")],
+      [null, SIGNED_IN_USER_ID], "kill switch off");
+    await emit(OTHER_SERVER_ID, "server.member_removed", ACCOUNT_USER_ID, "member");
+    await db.update(featureFlags).set({ killSwitch: false }).where(eq(featureFlags.key, OAUTH_ACCOUNT_LOGIN_FEATURE_FLAG_KEY));
+    await drainOne();
+    assert.equal(subOf(OTHER_SERVER_ID, "server.member_removed", ACCOUNT_USER_ID, "member"), ACCOUNT_USER_ID, "back on");
+
+    // A server-local App's audience is its own Server only: an installation
+    // row elsewhere gets no account-mode sub.
+    await db.update(oauthClients).set({ appType: "server_local" }).where(eq(oauthClients.id, CLIENT_ID));
+    posts.length = 0;
+    await emit(SERVER_ID, "server.member_removed", ACCOUNT_USER_ID, "owner");
+    await emit(OTHER_SERVER_ID, "server.member_removed", ACCOUNT_USER_ID, "owner");
+    await drainAppNotificationDeliveries({ executor: db, post: async ({ body }) => { posts.push(JSON.parse(body)); return { status: 204 }; } });
+    assert.deepEqual([subOf(SERVER_ID, "server.member_removed", ACCOUNT_USER_ID, "owner"), subOf(OTHER_SERVER_ID, "server.member_removed", ACCOUNT_USER_ID, "owner")],
+      [ACCOUNT_USER_ID, null]);
   } finally {
     __resetOAuthServiceDbForTests();
     __setAppWebhookEncryptionKeyForTests(null);

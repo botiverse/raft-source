@@ -1,6 +1,6 @@
 import { registerAppLinkPreview, readAppLinkPreview, deleteAppLinkPreview, AppLinkPreviewConfigError } from "../services/appLinkPreviewService";
 import { setAppCardEncryptionKey, removeAppCardEncryptionKey, AppCardEncryptionKeyError } from "../services/appCardEncryptionKeyService";
-import { coalesceWakeIntoUnreadItem } from "../services/appItemWakeCoalescing";
+import { coalesceWakeIntoUnreadItem, inboxOnlyDeliveryUnavailable } from "../services/appItemWakeCoalescing";
 import { getAppInstallationSetup, updateAppInstallationSetup, AppSetupConflictError } from "../services/appSetupService";
 import {
   appInstalledPageUrl,
@@ -60,6 +60,7 @@ import { sendJsonServerError } from "./errorResponse";
 import { refuseUnverifiedApprover } from "./secondFactor";
 import { webSessionFamilyOf } from "../services/sessionService";
 import { acceptLinkCardUpdate, LINK_CARD_UPDATE_INVALID_CLIENT, parseLinkCardUpdateBody } from "../services/linkCardUpdateService";
+import { acceptLinkCardChanged, LINK_CARD_CHANGED_INVALID_CLIENT, parseLinkCardChangedBody } from "../services/linkCardChangedHints";
 import {
   checkAccountAppServerAccess,
   getAccountIdentityByAccessToken,
@@ -74,12 +75,13 @@ import {
   OAuthRootIssuerRequiredError,
   type OAuthAccountAccessTokenIdentity,
 } from "../services/oauthAccountLogin";
-import { requestLinkCardHints, sendLinkCardResponse } from "./linkCards";
+import { requestLinkCardChangedHints, requestLinkCardHints, sendLinkCardResponse } from "./linkCards";
 import { resolveOAuthClientByKey } from "../services/oauthClientKeys";
 import { resolveRelatedConversationForAgent } from "../services/agentInboxItems";
 import { mayStillAskAgent, prepareVoiceAsk } from "../services/agentVoiceService";
 import { readMachineOperation, startMachineOperation } from "../services/machineOperations";
 import { refuse } from "../lib/refusal";
+import { serializeErrorForLog } from "../tracing/safeErrorLog";
 
 // mergeParams: the OIDC endpoints are additionally mounted under
 // /oidc/:server/api/oauth, and the handlers read that segment as the
@@ -268,11 +270,13 @@ async function recordOAuthLifecycle(input: {
 async function requireOAuthClient(req: Request, res: Response) {
   const creds = parseClientCredentials(req);
   if (!creds) {
+    // refusal-ok: shared with the OAuth token endpoint, which keeps its own error envelope.
     res.status(401).json({ error: "Client credentials are required" });
     return null;
   }
   const client = await oauthService.authenticateOAuthClient(creds.clientId, creds.clientSecret);
   if (!client) {
+    // refusal-ok: shared with the OAuth token endpoint, which keeps its own error envelope.
     res.status(401).json({ error: "Invalid client credentials" });
     return null;
   }
@@ -281,6 +285,7 @@ async function requireOAuthClient(req: Request, res: Response) {
 
 /** The answer for a token with no live identity: revoked, expired, a lost membership, a suspended installation. */
 function sendInvalidAccessToken(res: Response) {
+  // refusal-ok: the OAuth identity endpoints' own wire format (userinfo and the other Bearer endpoints).
   res.status(401).json({ error: "Invalid or expired access token" });
 }
 
@@ -298,6 +303,7 @@ function bearerAccessToken(req: Pick<Request, "headers">): string | null {
 async function requireBearerIdentity(req: Request, res: Response) {
   const accessToken = bearerAccessToken(req);
   if (accessToken === null) {
+    // refusal-ok: the OAuth identity endpoints' own wire format (userinfo and the other Bearer endpoints).
     res.status(401).json({ error: "Missing bearer token" });
     return null;
   }
@@ -312,6 +318,7 @@ async function requireBearerIdentity(req: Request, res: Response) {
   // D21: an account-mode token has no Server, so a Server-scoped issuer's path
   // never matches it: the 401 bearerTokenMatchesPathScope's callers send.
   if (isAccountIdentity(token) && pathServerScope(req) !== undefined) {
+    // refusal-ok: the OAuth identity endpoints' own wire format, as on /agents, /apps and /serverinfo.
     res.status(401).json({ error: "Access token was issued for a different Server than this issuer" });
     return null;
   }
@@ -336,6 +343,7 @@ const SERVER_ACCESS_DENIED = Object.freeze({
 });
 
 function sendServerAccessDenied(res: Response) {
+  // refusal-ok: OAuth error envelope (error is a code, with error_description), the same bytes for every cause.
   res.status(403).set("Cache-Control", "no-store").json(SERVER_ACCESS_DENIED);
 }
 
@@ -468,6 +476,7 @@ export function oidcScopedMountGuard(req: Request, res: Response, next: () => vo
     return;
   }
   if (!OIDC_SCOPED_ROUTES.has(mountRouteKey(req))) {
+    // refusal-ok: OIDC mount guard answers in the OIDC wire format (error is a code).
     res.status(404).json({ error: "not_found" });
     return;
   }
@@ -526,6 +535,7 @@ function bearerTokenMatchesPathScope(
 export function oidcDiscoveryHandler(req: Request, res: Response) {
   const serverSegment = pathServerScope(req);
   if (serverSegment !== undefined && !OIDC_SERVER_SEGMENT_PATTERN.test(serverSegment)) {
+    // refusal-ok: OIDC discovery keeps the OAuth error envelope (error is a code).
     res.status(400).json({ error: "invalid_request", error_description: "server must be a Server ID or slug" });
     return;
   }
@@ -702,7 +712,7 @@ oauthRouter.post("/link-preview/card-updates", async (req, res) => {
   const client = creds ? await oauthService.authenticateOAuthClient(creds.clientId, creds.clientSecret) : null;
   if (!client) { sendLinkCardResponse(res, LINK_CARD_UPDATE_INVALID_CLIENT); return; }
   const request = parseLinkCardUpdateBody(req.body);
-  if (!request) { res.status(400).json({ error: "Invalid card update", code: "INVALID_REQUEST" }); return; }
+  if (!request) { refuse(res, 400, { code: "INVALID_REQUEST", error: "Invalid card update" }); return; }
   try {
     sendLinkCardResponse(res, await acceptLinkCardUpdate({ client: { id: client.id, clientId: client.clientId }, request, hints: requestLinkCardHints(req) }));
   } catch (error) {
@@ -710,6 +720,35 @@ oauthRouter.post("/link-preview/card-updates", async (req, res) => {
     console.error("[LinkCardUpdate] failed", error instanceof Error ? error.name : "unknown");
     res.status(500).json({ error: "Couldn't record this update. Retry with the same update_id.", code: "INTERNAL" });
   }
+});
+// The App says its objects changed (services/linkCardChangedHints.ts): Raft
+// nudges their recent readers to read the cards again. Basic client
+// credentials only, as card-updates (the body is raw bytes, ≤ 16 KiB, parsed
+// strictly); 401 before the body is read as JSON. Never says who reads what.
+oauthRouter.post("/link-preview/changed", async (req, res) => {
+  res.setHeader("Cache-Control", "private, no-store");
+  const creds = parseClientCredentials(req);
+  const client = creds ? await oauthService.authenticateOAuthClient(creds.clientId, creds.clientSecret) : null;
+  if (!client) { sendLinkCardResponse(res, LINK_CARD_CHANGED_INVALID_CLIENT); return; }
+  const body = parseLinkCardChangedBody(req.body);
+  if ("error" in body) { refuse(res, 400, { code: "INVALID_REQUEST", error: body.error }); return; }
+  try {
+    sendLinkCardResponse(res, await acceptLinkCardChanged({ app: { id: client.id, key: client.clientId, hints: requestLinkCardChangedHints(req) }, objects: body.objects }));
+  } catch (error) {
+    // Never log the body or its objects.
+    console.error("[LinkCardChanged] failed", { app_key: client.clientId, error: serializeErrorForLog(error) });
+    res.status(500).json({ error: "Couldn't take these changes. Log it and carry on: cards update on their next display.", code: "INTERNAL" });
+  }
+});
+
+/**
+ * An installation the App's client credentials do not reach: the same status,
+ * sentence and code whether the id is malformed, unknown, another App's or
+ * suspended.
+ */
+const ACTIVE_INSTALLATION_NOT_FOUND = Object.freeze({
+  code: "installation_not_found",
+  error: "Active installation not found",
 });
 
 // RFC 051: client-authenticated mint for a distinct installation credential.
@@ -725,7 +764,7 @@ oauthRouter.post("/installation-token", async (req, res) => {
         ? req.body.installationId
         : "";
     if (!installationId) {
-      res.status(400).json({ error: "installation_id is required" });
+      refuse(res, 400, { code: "invalid_input", error: "installation_id is required" });
       return;
     }
     const credential = await mintAppInstallationCredential({
@@ -735,7 +774,7 @@ oauthRouter.post("/installation-token", async (req, res) => {
       audience: APP_INSTALLATION_TOKEN_AUDIENCE,
     });
     if (!credential) {
-      res.status(404).json({ error: "Active installation not found" });
+      refuse(res, 404, ACTIVE_INSTALLATION_NOT_FOUND);
       return;
     }
     res.json({
@@ -750,7 +789,7 @@ oauthRouter.post("/installation-token", async (req, res) => {
     });
   } catch (error) {
     if (error instanceof AppOutboundPermissionError) {
-      res.status(400).json({ error: error.message });
+      refuse(res, 400, { code: "invalid_input", error: error.message });
       return;
     }
     sendJsonServerError(req, res, {
@@ -775,11 +814,11 @@ oauthRouter.post("/installations/lookup", async (req, res) => {
         ? req.body.serverId.trim()
         : "";
     if (!serverId) {
-      res.status(400).json({ error: "server_id is required" });
+      refuse(res, 400, { code: "invalid_input", error: "server_id is required" });
       return;
     }
     if (!UUID_RE.test(serverId)) {
-      res.status(400).json({ error: "server_id must be a Server ID" });
+      refuse(res, 400, { code: "invalid_input", error: "server_id must be a Server ID" });
       return;
     }
 
@@ -788,7 +827,7 @@ oauthRouter.post("/installations/lookup", async (req, res) => {
       serverId,
     });
     if (!installation) {
-      res.status(404).json({ error: "Active installation not found" });
+      refuse(res, 404, ACTIVE_INSTALLATION_NOT_FOUND);
       return;
     }
     res.json({
@@ -815,8 +854,7 @@ oauthRouter.post("/installations/lookup", async (req, res) => {
   }
 });
 
-const BOT_TOKEN_REFUSALS: Record<ManagedAppBotCredentialRefusal, { status: number; error: string }> = {
-  installation_not_found: { status: 404, error: "Active installation not found" },
+const BOT_TOKEN_REFUSALS: Record<Exclude<ManagedAppBotCredentialRefusal, "installation_not_found">, { status: number; error: string }> = {
   bot_not_granted: { status: 403, error: "Bot grant not active for this installation" },
   bot_not_active: { status: 404, error: "No active bot for this installation" },
   credential_exists: { status: 409, error: "The bot already has a live key; send rotate: true to replace it" },
@@ -834,7 +872,7 @@ oauthRouter.post("/installations/:installationId/bot-token", async (req, res) =>
     if (!client) return;
     const installationId = req.params.installationId;
     if (!UUID_RE.test(installationId)) {
-      res.status(404).json({ error: BOT_TOKEN_REFUSALS.installation_not_found.error, code: "installation_not_found" });
+      refuse(res, 404, ACTIVE_INSTALLATION_NOT_FOUND);
       return;
     }
     const result = await issueManagedAppBotCredential({
@@ -843,6 +881,8 @@ oauthRouter.post("/installations/:installationId/bot-token", async (req, res) =>
       rotate: req.body?.rotate === true || req.body?.rotate === "true",
     });
     if (!result.ok) {
+      // The same answer as a malformed id above, in status, sentence and code.
+      if (result.reason === "installation_not_found") { refuse(res, 404, ACTIVE_INSTALLATION_NOT_FOUND); return; }
       const refusal = BOT_TOKEN_REFUSALS[result.reason];
       // bot_not_granted adds `state` (not_added, declined, installation_suspended) and `add_url`.
       res.status(refusal.status).json({ error: refusal.error, code: result.reason, ...("bot" in result ? result.bot : {}) });
@@ -875,12 +915,12 @@ oauthRouter.put("/installations/:installationId/bot-status", async (req, res) =>
     if (!client) return;
     const installationId = req.params.installationId;
     if (!UUID_RE.test(installationId)) {
-      res.status(404).json({ error: "Active installation not found" });
+      refuse(res, 404, ACTIVE_INSTALLATION_NOT_FOUND);
       return;
     }
     const { text } = req.body ?? {};
     if (text !== null && text !== undefined && (typeof text !== "string" || text.trim().length === 0 || text.length > BOT_STATUS_MAX_LENGTH)) {
-      res.status(400).json({ error: "text must be null or a non-empty string up to 160 characters" });
+      refuse(res, 400, { code: "invalid_input", error: "text must be null or a non-empty string up to 160 characters" });
       return;
     }
     const updated = await setManagedAppBotStatus({
@@ -890,9 +930,10 @@ oauthRouter.put("/installations/:installationId/bot-status", async (req, res) =>
     });
     if (!updated.ok) {
       if (updated.reason === "installation_not_found") {
-        res.status(404).json({ error: "Active installation not found", code: updated.reason });
+        refuse(res, 404, ACTIVE_INSTALLATION_NOT_FOUND);
         return;
       }
+      // refusal-ok: top-level `state` and `add_url` the App reads, as on bot-token.
       res.status(403).json({ error: "Bot grant not active for this installation", code: updated.reason, ...updated.bot });
       return;
     }
@@ -918,14 +959,14 @@ oauthRouter.put("/installations/:installationId/setup", async (req, res) => {
     const { revision, status } = req.body ?? {};
     if (!Number.isSafeInteger(revision) || revision < 1 || revision > 2147483647
       || (status !== "pending" && status !== "complete")) {
-      res.status(400).json({ error: "revision and status (pending or complete) are required" }); return;
+      refuse(res, 400, { code: "invalid_input", error: "revision and status (pending or complete) are required" }); return;
     }
     const setup = await updateAppInstallationSetup({ clientId: client.id, installationId, revision, status });
-    if (!setup) { res.status(404).json({ error: "Active installation not found" }); return; }
+    if (!setup) { refuse(res, 404, ACTIVE_INSTALLATION_NOT_FOUND); return; }
     res.json(setup);
   } catch (err) {
-    if (err instanceof AppSetupValidationError) { res.status(400).json({ error: err.message }); return; }
-    if (err instanceof AppSetupConflictError) { res.status(409).json({ error: err.message }); return; }
+    if (err instanceof AppSetupValidationError) { refuse(res, 400, { code: "invalid_input", error: err.message }); return; }
+    if (err instanceof AppSetupConflictError) { refuse(res, 409, { code: "app_setup_conflict", error: err.message }); return; }
     sendJsonServerError(req, res, { error: "Failed to update App setup", logPrefix: "Update App setup error:", err });
   }
 });
@@ -941,7 +982,7 @@ oauthRouter.put("/installations/:installationId/subscriptions", async (req, res)
       actor: { type: "app", id: client.id },
     });
     if (!updated) {
-      res.status(404).json({ error: "Active installation not found" });
+      refuse(res, 404, ACTIVE_INSTALLATION_NOT_FOUND);
       return;
     }
     res.json({
@@ -951,7 +992,7 @@ oauthRouter.put("/installations/:installationId/subscriptions", async (req, res)
     });
   } catch (error) {
     if (error instanceof AppOutboundPermissionError) {
-      res.status(400).json({ error: error.message });
+      refuse(res, 400, { code: "invalid_input", error: error.message });
       return;
     }
     sendJsonServerError(req, res, {
@@ -1054,11 +1095,11 @@ oauthRouter.get("/clients/lookup", requireAuth, async (req, res) => {
     : [];
 
   if (!clientId.trim()) {
-    res.status(400).json({ error: "clientId is required" });
+    refuse(res, 400, { code: "invalid_input", error: "clientId is required" });
     return;
   }
   if (!serverId.trim()) {
-    res.status(400).json({ error: "serverId is required" });
+    refuse(res, 400, { code: "invalid_input", error: "serverId is required" });
     return;
   }
 
@@ -1069,6 +1110,7 @@ oauthRouter.get("/clients/lookup", requireAuth, async (req, res) => {
       userId: req.userId!,
     });
     if (availability.kind === "refused") {
+      // refusal-ok: frozen contract: RFC 079 D4 requires these exact bytes for every case (pinned by the oauthServerModeFrozen fixture).
       res.status(403).json(APP_NOT_AVAILABLE_BODY);
       return;
     }
@@ -1084,6 +1126,7 @@ oauthRouter.get("/clients/lookup", requireAuth, async (req, res) => {
         inAudience: false,
       });
       if (loginMode === "refused") {
+        // refusal-ok: frozen contract: RFC 079 D4 requires these exact bytes for every case (pinned by the oauthServerModeFrozen fixture).
         res.status(403).json(APP_NOT_AVAILABLE_BODY);
         return;
       }
@@ -1112,6 +1155,7 @@ oauthRouter.get("/clients/lookup", requireAuth, async (req, res) => {
       // Outside the audience: only a public Marketplace app gets an answer
       // other than the refusal (install inline, D5).
       if (!marketplaceClient) {
+        // refusal-ok: frozen contract: RFC 079 D4 requires these exact bytes for every case (pinned by the oauthServerModeFrozen fixture).
         res.status(403).json(APP_NOT_AVAILABLE_BODY);
         return;
       }
@@ -1123,6 +1167,7 @@ oauthRouter.get("/clients/lookup", requireAuth, async (req, res) => {
         inAudience: false,
       });
       if (loginMode === "refused") {
+        // refusal-ok: frozen contract: RFC 079 D4 requires these exact bytes for every case (pinned by the oauthServerModeFrozen fixture).
         res.status(403).json(APP_NOT_AVAILABLE_BODY);
         return;
       }
@@ -1173,6 +1218,7 @@ oauthRouter.get("/clients/lookup", requireAuth, async (req, res) => {
       inAudience: true,
     });
     if (loginMode === "refused") {
+      // refusal-ok: frozen contract: RFC 079 D4 requires these exact bytes for every case (pinned by the oauthServerModeFrozen fixture).
       res.status(403).json(APP_NOT_AVAILABLE_BODY);
       return;
     }
@@ -1288,6 +1334,7 @@ oauthRouter.post("/requests/agent", async (req, res) => {
     });
     if (err instanceof oauthService.OAuthInstallationSuspendedError) {
       finishOAuthSpan(span, "ok", { outcome: "installation_suspended", http_status: 403, error_class: errorClass(err) });
+      // refusal-ok: OAuth error envelope (error is a code, with error_description), as the token endpoint answers it.
       res.status(403).json({
         error: "installation_suspended",
         error_description: "This App's installation on the agent's Server is suspended. A Server owner or admin must restore it first.",
@@ -1324,6 +1371,7 @@ function sendOAuthScopeNotAllowed(res: Response, err: oauthService.OAuthScopeNot
     : reason === "not_allowed"
       ? `This OAuth client is not allowed to request: ${scopeList}. Update the client's allowed scopes and try again.`
       : `Some requested OAuth scopes are unsupported or not allowed for this client: ${scopeList}. Update the requested scopes or client permissions and try again.`;
+  // refusal-ok: OAuth error envelope (error is the invalid_scope code), with top-level disallowedScopes the setup page reads.
   res.status(400).json({
     error: "invalid_scope",
     errorCode,
@@ -1355,7 +1403,7 @@ oauthRouter.post("/authorize/human", requireAuth, async (req, res) => {
     server: serverHint,
   } = req.body ?? {};
   if (typeof clientId !== "string" || !clientId.trim()) {
-    res.status(400).json({ error: "clientId is required" });
+    refuse(res, 400, { code: "invalid_input", error: "clientId is required" });
     return;
   }
   if (typeof serverId !== "string" || !serverId.trim()) {
@@ -1367,16 +1415,16 @@ oauthRouter.post("/authorize/human", requireAuth, async (req, res) => {
       grantType: "authorization_code",
       principalType: "human",
     });
-    res.status(400).json({ error: "serverId is required" });
+    refuse(res, 400, { code: "invalid_input", error: "serverId is required" });
     return;
   }
   if (oidc === true) {
     if (typeof returnUrl !== "string" || !returnUrl.trim()) {
-      res.status(400).json({ error: "returnUrl is required for OIDC authorization" });
+      refuse(res, 400, { code: "invalid_input", error: "returnUrl is required for OIDC authorization" });
       return;
     }
     if (nonce !== undefined && (typeof nonce !== "string" || nonce.length > 512)) {
-      res.status(400).json({ error: "nonce must be a string no longer than 512 characters" });
+      refuse(res, 400, { code: "invalid_input", error: "nonce must be a string no longer than 512 characters" });
       return;
     }
     if (codeChallenge !== undefined && (
@@ -1384,11 +1432,11 @@ oauthRouter.post("/authorize/human", requireAuth, async (req, res) => {
       || !/^[A-Za-z0-9_-]{43}$/.test(codeChallenge)
       || codeChallengeMethod !== "S256"
     )) {
-      res.status(400).json({ error: "OIDC PKCE requires a valid S256 code challenge" });
+      refuse(res, 400, { code: "invalid_input", error: "OIDC PKCE requires a valid S256 code challenge" });
       return;
     }
     if (codeChallenge === undefined && codeChallengeMethod !== undefined) {
-      res.status(400).json({ error: "codeChallenge is required when codeChallengeMethod is set" });
+      refuse(res, 400, { code: "invalid_input", error: "codeChallenge is required when codeChallengeMethod is set" });
       return;
     }
   }
@@ -1485,14 +1533,16 @@ oauthRouter.post("/authorize/human", requireAuth, async (req, res) => {
       principalType: "human",
     });
     if (err instanceof oauthService.OAuthAppNotAvailableError) {
+      // refusal-ok: frozen contract: RFC 079 D4 requires these exact bytes for every case (pinned by the oauthServerModeFrozen fixture).
       res.status(403).json(APP_NOT_AVAILABLE_BODY);
       return;
     }
     if (err instanceof OAuthLoginModeChangedError) {
-      res.status(409).json(LOGIN_MODE_CHANGED_BODY);
+      refuse(res, 409, LOGIN_MODE_CHANGED_BODY);
       return;
     }
     if (err instanceof oauthService.OAuthInstallationSuspendedError) {
+      // refusal-ok: OAuth error envelope (error is a code, with error_description), as the token endpoint answers it.
       res.status(403).json({
         error: "installation_suspended",
         errorCode: "OAUTH_INSTALLATION_SUSPENDED",
@@ -1505,6 +1555,7 @@ oauthRouter.post("/authorize/human", requireAuth, async (req, res) => {
       // setup page redirects to `returnUrl`, the registered URL that
       // issueHumanAuthorizationCode already matched, with error and state.
       const scopeList = err.unapprovedScopes.join(", ");
+      // refusal-ok: OAuth error envelope (error is the invalid_scope code), with top-level unapprovedScopes and returnUrl the setup page reads.
       res.status(400).json({
         error: "invalid_scope",
         errorCode: "OAUTH_SCOPE_NOT_APPROVED",
@@ -1568,16 +1619,16 @@ oauthRouter.post("/authorize/account", requireAuth, async (req, res) => {
   // Sent at all, whatever its value: only a Server-scoped issuer's page sends it.
   const serverHinted = req.body?.server !== undefined;
   if (typeof clientId !== "string" || !clientId.trim()) {
-    res.status(400).json({ error: "clientId is required" });
+    refuse(res, 400, { code: "invalid_input", error: "clientId is required" });
     return;
   }
   if (typeof returnUrl !== "string" || !returnUrl.trim()) {
-    res.status(400).json({ error: "returnUrl is required" });
+    refuse(res, 400, { code: "invalid_input", error: "returnUrl is required" });
     return;
   }
   if (oidc === true) {
     if (nonce !== undefined && (typeof nonce !== "string" || nonce.length > 512)) {
-      res.status(400).json({ error: "nonce must be a string no longer than 512 characters" });
+      refuse(res, 400, { code: "invalid_input", error: "nonce must be a string no longer than 512 characters" });
       return;
     }
     if (codeChallenge !== undefined && (
@@ -1585,11 +1636,11 @@ oauthRouter.post("/authorize/account", requireAuth, async (req, res) => {
       || !/^[A-Za-z0-9_-]{43}$/.test(codeChallenge)
       || codeChallengeMethod !== "S256"
     )) {
-      res.status(400).json({ error: "OIDC PKCE requires a valid S256 code challenge" });
+      refuse(res, 400, { code: "invalid_input", error: "OIDC PKCE requires a valid S256 code challenge" });
       return;
     }
     if (codeChallenge === undefined && codeChallengeMethod !== undefined) {
-      res.status(400).json({ error: "codeChallenge is required when codeChallengeMethod is set" });
+      refuse(res, 400, { code: "invalid_input", error: "codeChallenge is required when codeChallengeMethod is set" });
       return;
     }
   }
@@ -1635,14 +1686,17 @@ oauthRouter.post("/authorize/account", requireAuth, async (req, res) => {
       principalType: "human",
     });
     if (err instanceof oauthService.OAuthAppNotAvailableError) {
+      // refusal-ok: frozen contract: RFC 079 D4 requires these exact bytes for every case (pinned by the oauthServerModeFrozen fixture).
       res.status(403).json(APP_NOT_AVAILABLE_BODY);
       return;
     }
     if (err instanceof oauthService.OAuthInstallationSuspendedError) {
+      // refusal-ok: OAuth error envelope (error is a code, with error_description), as the token endpoint answers it.
       res.status(403).json(ACCOUNT_INSTALLATION_SUSPENDED_BODY);
       return;
     }
     if (err instanceof OAuthRootIssuerRequiredError) {
+      // refusal-ok: OAuth error envelope (error is the invalid_request code); the body already carries its own code.
       res.status(400).json(ROOT_ISSUER_REQUIRED_BODY);
       return;
     }
@@ -1650,6 +1704,7 @@ oauthRouter.post("/authorize/account", requireAuth, async (req, res) => {
       // Sent back to the app at its registered URL, as /authorize/human's;
       // the account-mode wording names no Server.
       const scopeList = err.unapprovedScopes.join(", ");
+      // refusal-ok: OAuth error envelope (error is the invalid_scope code), with top-level unapprovedScopes and returnUrl the setup page reads.
       res.status(400).json({
         error: "invalid_scope",
         errorCode: "OAUTH_SCOPE_NOT_APPROVED",
@@ -1717,7 +1772,26 @@ oauthRouter.post("/token", async (req, res) => {
       grantType: grantTypeAttr(requestedGrantType),
     });
     finishOAuthSpan(span, "ok", { outcome: "unsupported_grant_type", http_status: 400 });
+    // refusal-ok: OAuth token endpoint keeps its OAuth error envelope.
     res.status(400).json({ error: "Unsupported grant type" });
+    return;
+  }
+
+  // A token-only App (agent token type JWT) gets no ID token, for a person or
+  // an agent: its agent tokens carry the same aud and, being JWT-typed, could
+  // pass for one. It takes agent tokens only. Before the code is read, so an
+  // outstanding code from before the switch is not consumed.
+  if (client.agentTokenType === "JWT") {
+    await recordOAuthLifecycle({
+      stage: "token_exchange",
+      result: "invalid_request",
+      outcome: "failure",
+      clientId: client.id,
+      clientKey: client.clientId,
+      grantType: grantTypeAttr(requestedGrantType),
+    });
+    finishOAuthSpan(span, "ok", { outcome: "unauthorized_client", http_status: 400, grant_type: grantTypeAttr(requestedGrantType) });
+    oidcJsonError(res, "unauthorized_client", "This App is token-only (its agent token type is JWT), so it can't exchange sign-in codes or agent login requests");
     return;
   }
 
@@ -1735,6 +1809,7 @@ oauthRouter.post("/token", async (req, res) => {
       grantType: grantTypeAttr(grantType),
     });
     finishOAuthSpan(span, "ok", { outcome: "missing_request", http_status: 400, grant_type: grantType });
+    // refusal-ok: OAuth token endpoint keeps its OAuth error envelope.
     res.status(400).json({ error: grantType === "authorization_code" ? "code is required" : "requestId is required" });
     return;
   }
@@ -1879,6 +1954,7 @@ oauthRouter.post("/token", async (req, res) => {
         return;
       }
     }
+    const ownerSub = identity?.principalType === "agent" ? await oauthService.oauthAgentOwnerSub(identity.agentId!) : null;
     const idToken = identity
       ? signOidcIdToken({
           // `iss` must equal the issuer of the discovery document this client
@@ -1904,6 +1980,7 @@ oauthRouter.post("/token", async (req, res) => {
               : userinfoAgentPictureUrl(identity.agentAvatarUrl, req),
             email: identity.principalType === "human" ? identity.humanEmail : null,
             emailVerified: identity.principalType === "human" ? identity.humanEmailVerified : null,
+            ownerSub,
           },
           nonce: oidcContext?.nonce,
           expiresInSeconds: expiresIn,
@@ -2013,16 +2090,19 @@ oauthRouter.post("/token", async (req, res) => {
     }
     if (message === "authorization_pending") {
       finishOAuthSpan(span, "ok", { outcome: "authorization_pending", http_status: 400, grant_type: grantType });
+      // refusal-ok: OAuth token endpoint keeps its OAuth error envelope.
       res.status(400).json({ error: "authorization_pending" });
       return;
     }
     if (message === "access_denied") {
       finishOAuthSpan(span, "ok", { outcome: "access_denied", http_status: 403, grant_type: grantType });
+      // refusal-ok: OAuth token endpoint keeps its OAuth error envelope.
       res.status(403).json({ error: "access_denied" });
       return;
     }
     if (message === "request_already_consumed") {
       finishOAuthSpan(span, "ok", { outcome: "request_already_consumed", http_status: 409, grant_type: grantType });
+      // refusal-ok: OAuth token endpoint keeps its OAuth error envelope.
       res.status(409).json({
         error: message,
         error_description:
@@ -2043,6 +2123,7 @@ oauthRouter.post("/token", async (req, res) => {
     }
     if (message === oauthService.AUTHORIZATION_CODE_EXPIRED_ERROR) {
       finishOAuthSpan(span, "ok", { outcome: "authorization_code_expired", http_status: 400, grant_type: grantType });
+      // refusal-ok: OAuth token endpoint keeps its OAuth error envelope.
       res.status(400).json({
         error: message,
         error_description:
@@ -2081,6 +2162,15 @@ function thirdPartyEventObjectRefWarning(clientKey: string): string {
   return `object.ref is missing: this notice goes into the app's catch-all item app:${clientKey}. Send object.ref (the thing it is about, e.g. a PR) so notices about one object are read together.`;
 }
 
+/** dm:@Remy:#1: told to an app whose `delivery: "inbox"` could not be honoured, so the agent was woken as usual. */
+const THIRD_PARTY_EVENT_INBOX_DELIVERY_UNAVAILABLE_WARNING = "delivery inbox is not available for this agent yet (its inbox has no app items): the event was delivered as wake.";
+
+/** #proj-apps:#88: the same, because the agent's `raft` CLI said it can't list app inbox items. */
+const THIRD_PARTY_EVENT_INBOX_DELIVERY_OLD_CLI_WARNING = "delivery inbox is not available for this agent yet: its raft CLI is too old to list app items in its inbox, so the agent was woken instead. This stops once its Computer is upgraded; nothing to change on your side.";
+
+/** #proj-apps:#88: the same, because Raft has no answer yet from the agent's CLI on its current Computer. */
+const THIRD_PARTY_EVENT_INBOX_DELIVERY_UNKNOWN_CLI_WARNING = "delivery inbox is not available for this agent yet: Raft has no recent answer from its raft CLI where it runs now (a new agent, one just moved or upgraded, or one not on a Computer that has run no command in the last day), so the agent was woken instead. This stops after the agent's next command; nothing to change on your side.";
+
 /** RFC 081 D8: told to an app whose `object.conversation` the receiving agent can't open (or that does not exist: the same words). */
 const THIRD_PARTY_EVENT_CONVERSATION_DROPPED_WARNING = "object.conversation was not kept: the receiving agent can't open that conversation. The notice was accepted without it.";
 
@@ -2092,6 +2182,7 @@ oauthRouter.post("/agent-events", async (req, res) => {
     external_event_id_present: Boolean(req.body?.externalEventId || req.body?.external_event_id),
     ttl_present: req.body?.ttlSeconds !== undefined || req.body?.ttl_seconds !== undefined,
     payload_present: req.body?.payload !== undefined,
+    delivery_present: req.body?.delivery !== undefined,
   });
   try {
     const token = await requireBearerIdentity(req, res);
@@ -2106,7 +2197,7 @@ oauthRouter.post("/agent-events", async (req, res) => {
         http_status: 403,
         principal_type: token.principalType,
       });
-      res.status(403).json({ error: "agent token required" });
+      refuse(res, 403, { code: "forbidden", error: "agent token required" });
       return;
     }
 
@@ -2118,6 +2209,7 @@ oauthRouter.post("/agent-events", async (req, res) => {
         principal_type: token.principalType,
         resource_bound: Boolean(token.resource),
       });
+      // refusal-ok: top-level `resource` the App reads to request a resource-bound token.
       res.status(403).json({ error: "resource-bound token required", resource: expectedResource });
       return;
     }
@@ -2131,7 +2223,7 @@ oauthRouter.post("/agent-events", async (req, res) => {
         principal_type: token.principalType,
         resource_bound: true,
       });
-      res.status(400).json({ error: "kind must be event or notification" });
+      refuse(res, 400, { code: "invalid_input", error: "kind must be event or notification" });
       return;
     }
     if (!oauthService.accessTokenHasScope(token, requiredScope)) {
@@ -2142,6 +2234,7 @@ oauthRouter.post("/agent-events", async (req, res) => {
         resource_bound: true,
         required_scope: requiredScope,
       });
+      // refusal-ok: OAuth bearer error code (insufficient_scope) with top-level required_scope.
       res.status(403).json({ error: "insufficient_scope", required_scope: requiredScope });
       return;
     }
@@ -2159,7 +2252,7 @@ oauthRouter.post("/agent-events", async (req, res) => {
         resource_bound: true,
         required_scope: requiredScope,
       });
-      res.status(403).json({ error: "token cannot target a different agent" });
+      refuse(res, 403, { code: "forbidden", error: "token cannot target a different agent" });
       return;
     }
 
@@ -2189,8 +2282,17 @@ oauthRouter.post("/agent-events", async (req, res) => {
     // (400); a conversation the agent can't open is dropped with a warning,
     // never refused, so the answer says nothing about other conversations.
     const object = oauthService.normalizeThirdPartyEventObject(req.body?.object);
+    // dm:@Remy:#1: `inbox` adds the event to its inbox item and wakes no one.
+    // Only where the agent lists app items; elsewhere a notice never pushed
+    // would never be seen, so it wakes as usual and the answer says so.
+    const requestedDelivery = oauthService.normalizeThirdPartyEventDelivery(req.body?.delivery);
+    // #proj-apps:#88: and only where the agent's CLI lists them.
+    const inboxDeliveryUnavailable = requestedDelivery === "inbox"
+      ? await inboxOnlyDeliveryUnavailable(token.serverId, token.agentId, token.clientKey, object.objectRef)
+      : null;
+    const delivery = inboxDeliveryUnavailable ? "wake" : requestedDelivery;
     const relatedChannelId = object.conversation
-      ? await resolveRelatedConversationForAgent(token.serverId, token.agentId, object.conversation)
+      ? await resolveRelatedConversationForAgent(token.serverId, token.agentId, object.conversation, { createThread: true })
       : null;
     const created = await oauthService.createThirdPartyAgentEvent({
       serverId: token.serverId,
@@ -2207,13 +2309,15 @@ oauthRouter.post("/agent-events", async (req, res) => {
       resource: expectedResource,
       objectRef: object.objectRef,
       relatedChannelId,
+      delivery,
     });
+    const inboxOnly = created.event.delivery === "inbox";
 
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
     let deliveryClaimed = false;
     // An event on an inbox item that is already unread joins it without a new wake (#wg-ax:#24).
-    const wakeCoalesced = created.created && await coalesceWakeIntoUnreadItem(created.event, token.clientKey);
-    if ((created.created || created.shouldDeliver) && !wakeCoalesced) {
+    const wakeCoalesced = created.created && !inboxOnly && await coalesceWakeIntoUnreadItem(created.event, token.clientKey);
+    if ((created.created || created.shouldDeliver) && !wakeCoalesced && !inboxOnly) {
       deliveryClaimed = Boolean(await oauthService.claimQueuedThirdPartyAgentEventForDelivery(created.event.id));
     }
     if (deliveryClaimed) {
@@ -2224,7 +2328,7 @@ oauthRouter.post("/agent-events", async (req, res) => {
         throw err;
       }
     }
-    const responseStatus = deliveryClaimed || wakeCoalesced
+    const responseStatus = deliveryClaimed || wakeCoalesced || (inboxOnly && created.created)
       ? "queued"
       : "duplicate";
     const warnings = [
@@ -2233,6 +2337,9 @@ oauthRouter.post("/agent-events", async (req, res) => {
       ...(oauthService.thirdPartyEventHasPayload(created.event.payload) ? [THIRD_PARTY_EVENT_PAYLOAD_WARNING] : []),
       ...(created.event.objectRef ? [] : [thirdPartyEventObjectRefWarning(token.clientKey)]),
       ...(object.conversation && !relatedChannelId ? [THIRD_PARTY_EVENT_CONVERSATION_DROPPED_WARNING] : []),
+      ...(created.created && inboxDeliveryUnavailable === "server" ? [THIRD_PARTY_EVENT_INBOX_DELIVERY_UNAVAILABLE_WARNING] : []),
+      ...(created.created && inboxDeliveryUnavailable === "agent_cli_old" ? [THIRD_PARTY_EVENT_INBOX_DELIVERY_OLD_CLI_WARNING] : []),
+      ...(created.created && inboxDeliveryUnavailable === "agent_cli_unknown" ? [THIRD_PARTY_EVENT_INBOX_DELIVERY_UNKNOWN_CLI_WARNING] : []),
     ];
 
     res.status(created.created ? 202 : 200).json({
@@ -2242,6 +2349,8 @@ oauthRouter.post("/agent-events", async (req, res) => {
       expiresAt: created.event.expiresAt.toISOString(),
       payloadHash: created.event.payloadHash,
       ...(created.event.objectRef ? { objectRef: created.event.objectRef } : {}),
+      // How the agent hears of it (the stored event's, for a deduped repeat).
+      delivery: created.event.delivery,
       // Added to its inbox item, which is unread: the agent was not woken again for it.
       ...(wakeCoalesced ? { wake: "merged" } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
@@ -2257,6 +2366,9 @@ oauthRouter.post("/agent-events", async (req, res) => {
       delivered: false,
       enqueued: deliveryClaimed,
       wake_coalesced: wakeCoalesced,
+      delivery: created.event.delivery,
+      inbox_delivery_unavailable: inboxDeliveryUnavailable !== null,
+      ...(inboxDeliveryUnavailable ? { inbox_delivery_unavailable_reason: inboxDeliveryUnavailable } : {}),
       payload_present_nonempty: oauthService.thirdPartyEventHasPayload(created.event.payload),
       external_event_id_present: Boolean(created.event.externalEventId),
       object_ref_present: Boolean(created.event.objectRef),
@@ -2268,7 +2380,7 @@ oauthRouter.post("/agent-events", async (req, res) => {
     // fix (400); anything else is Raft's (500), whatever its message says.
     if (err instanceof oauthService.ThirdPartyAgentEventValidationError) {
       finishOAuthSpan(span, "ok", { outcome: "invalid_request", http_status: 400, error_class: errorClass(err), invalid_field: err.field });
-      res.status(400).json({ error: err.message });
+      refuse(res, 400, { code: "invalid_input", error: err.message });
       return;
     }
     console.error("Third-party agent event error:", err);
@@ -2301,6 +2413,7 @@ oauthRouter.get("/userinfo", async (req, res) => {
       return;
     }
     if (!bearerTokenMatchesPathScope(req, token)) {
+      // refusal-ok: the OAuth identity endpoints' own wire format, as on /agents, /apps and /serverinfo.
       res.status(401).json({ error: "Access token was issued for a different Server than this issuer" });
       return;
     }
@@ -2337,6 +2450,8 @@ oauthRouter.get("/userinfo", async (req, res) => {
     }
 
     const picture = userinfoAgentPictureUrl(token.agentAvatarUrl, req);
+    // #proj-apps:#75: as the ID token, read live; absent without an owner.
+    const ownerSub = await oauthService.oauthAgentOwnerSub(token.agentId!);
     res.json({
       ...common,
       sub: token.agentId,
@@ -2347,6 +2462,7 @@ oauthRouter.get("/userinfo", async (req, res) => {
       avatar_url: token.agentAvatarUrl,
       picture,
       description: token.agentDescription,
+      ...(ownerSub ? { owner_sub: ownerSub } : {}),
     });
   } catch (err) {
     sendJsonServerError(req, res, {
@@ -2375,6 +2491,7 @@ oauthRouter.get("/agents", async (req, res) => {
       access = named;
     } else {
       if (!bearerTokenMatchesPathScope(req, token)) {
+        // refusal-ok: the OAuth identity endpoints' own wire format, as on /agents, /apps and /serverinfo.
         res.status(401).json({ error: "Access token was issued for a different Server than this issuer" });
         return;
       }
@@ -2600,6 +2717,7 @@ oauthRouter.get("/serverinfo", async (req, res) => {
       access = named;
     } else {
       if (!bearerTokenMatchesPathScope(req, token)) {
+        // refusal-ok: the OAuth identity endpoints' own wire format, as on /agents, /apps and /serverinfo.
         res.status(401).json({ error: "Access token was issued for a different Server than this issuer" });
         return;
       }

@@ -15,6 +15,7 @@ const page = {
 const {
   useInboxStore,
   requestInboxBackgroundRefresh,
+  requestInboxResumeRefresh,
   cancelInboxBackgroundRefresh,
   INBOX_BACKGROUND_REFRESH_INTERVAL_MS,
 } = await import("../src/store/inboxStore");
@@ -152,4 +153,37 @@ test("a reconnect reset held with a realtime re-read owed: one read, reason visi
       assert.deepEqual(seen.slice(1), [{ reason: "reconnect", trigger: undefined }], order);
     } finally { restore(); }
   }
+});
+
+// #triage:#244: a frozen page owed nothing (no socket events reached it); coming back reads once anyway.
+test("a resume re-read reads once with reason visibility, and not again inside the throttle window an owed read started", async () => {
+  reset();
+  serve();
+  vi.useFakeTimers();
+  try {
+    await vi.advanceTimersByTimeAsync(INBOX_BACKGROUND_REFRESH_INTERVAL_MS * 2);
+    assert.equal(requestInboxResumeRefresh(), true);
+    await vi.advanceTimersByTimeAsync(0);
+    assert.deepEqual(seen, [{ reason: "visibility", trigger: undefined }]);
+    assert.equal(requestInboxResumeRefresh(), false, "a reset read started inside the window stands for it");
+
+    // An owed read paid by the show holds the resume re-read back too.
+    await vi.advanceTimersByTimeAsync(INBOX_BACKGROUND_REFRESH_INTERVAL_MS * 2);
+    page.hide();
+    requestInboxBackgroundRefresh("message_new");
+    page.show();
+    assert.equal(requestInboxResumeRefresh(), false);
+    await vi.advanceTimersByTimeAsync(10);
+    assert.equal(seen.length, 2);
+  } finally { restore(); }
+});
+
+test("a resume re-read reads nothing for an Activity list never loaded", () => {
+  reset();
+  serve();
+  useInboxStore.setState({ loaded: false, loading: false });
+  try {
+    assert.equal(requestInboxResumeRefresh(), false);
+    assert.deepEqual(seen, []);
+  } finally { restore(); }
 });

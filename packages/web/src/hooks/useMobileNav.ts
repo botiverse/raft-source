@@ -1,11 +1,9 @@
 import { useCallback, useEffect, useMemo } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useServerStore } from "../store/serverStore";
-import {
-  useMobileNavStore,
-  tabHomeFor,
-  mobileTabForPath,
-} from "../store/mobileNavStore";
+import { useMobileNavStore } from "../store/mobileNavStore";
+import { mobileTabForPath } from "../navigation/surfaces";
+import { placeFor } from "./placeMemory";
 import type {
   MobileTabId,
 } from "../store/mobileNavStore";
@@ -20,7 +18,8 @@ function isMobileViewport(): boolean {
 // Used by the phone tab bar: which tab the URL belongs to, and `selectTab`,
 // which lands on a tab's root as the user left it (design lead 2026-10-21:
 // each tab root keeps its filters and scroll position; pushed pages are not
-// kept). Tapping the selected tab is not a navigation at all: MobileTabBar
+// kept): its place, the same one the desktop rail lands on (placeMemory),
+// with Home always on its conversation list. Tapping the selected tab is not a navigation at all: MobileTabBar
 // scrolls that root to the top, Activity to its next unread item
 // (useTabRootScroll).
 //
@@ -34,7 +33,6 @@ function isMobileViewport(): boolean {
 // browser history first, then the caller's fallbackPath (stdrc msg=3e59ad5d,
 // 2026-05-01).
 //
-// Desktop is unchanged: nothing is recorded on >=md screens.
 export function useMobileNav() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -44,24 +42,12 @@ export function useMobileNav() {
     () => mobileTabForPath(location.pathname, pathBase),
     [location.pathname, pathBase],
   );
-  const rememberRoot = useMobileNavStore((s) => s.rememberRoot);
 
-  // A different server has different roots. Declared first, so a server
-  // switch clears the old roots before the new URL is recorded.
+  // A different server's bar has no page to come back from.
   useEffect(() => {
     if (!serverSlug) return;
     useMobileNavStore.getState().reset();
   }, [serverSlug]);
-
-  // Record a tab root, with its query (its filters), each time the URL shows
-  // one. Search keeps its own state (raft:search-state), so its tab lands on
-  // bare /search and the page restores the rest.
-  useEffect(() => {
-    if (!serverSlug || !isMobileViewport() || mobileTab === null || mobileTab === "search") return;
-    const pathname = location.pathname.replace(/\/+$/, "") || "/";
-    if (pathname !== tabHomeFor(mobileTab, pathBase)) return;
-    rememberRoot(mobileTab, `${pathname}${location.search}`);
-  }, [serverSlug, pathBase, mobileTab, location.pathname, location.search, rememberRoot]);
 
   const selectTab = useCallback((mode: MobileTabId) => {
     if (!serverSlug) return;
@@ -69,8 +55,8 @@ export function useMobileNav() {
     // the tab's root, never on a pushed page left open in it (pushed pages
     // hide the bar, so that would leave no way back to the root). Browser
     // history is left intact (no `replace`).
-    navigate(useMobileNavStore.getState().roots[mode] ?? tabHomeFor(mode, pathBase));
-  }, [serverSlug, pathBase, navigate]);
+    navigate(placeFor(serverSlug, mode, { phone: true }));
+  }, [serverSlug, navigate]);
 
   return { selectTab, mobileTab, isMobile: isMobileViewport() };
 }

@@ -12,7 +12,7 @@ import {
   type RuntimeAuthStatus,
 } from "@botiverse/raft-shared";
 
-import { kimiSdkAuthLogin, loadKimiSdkAuth, readKimiCodeSignInStatus, type KimiSdkAuth } from "./kimiSdkAuth";
+import { kimiCodeStartNeedsSignIn, kimiSdkAuthLogin, loadKimiSdkAuth, readKimiCodeSignInStatus, type KimiSdkAuth } from "./kimiSdkAuth";
 import { RuntimeAuthHost, type RuntimeAuthCredentialsChange, type RuntimeAuthHostMessage } from "./runtimeAuthHost";
 
 type LoginOptions = NonNullable<Parameters<KimiSdkAuth["login"]>[1]>;
@@ -328,4 +328,44 @@ test("SDK upgrade check: the bundled SDK's hasToken and the token-file status ag
     await assert.rejects(readFile(credential), "the logout removed the token agents would use");
     assert.deepEqual(await readKimiCodeSignInStatus(home), { kind: "logged_out" });
   });
+});
+
+test("a Kimi Code start needs the sign-in only when no token and nothing else to run on is stored", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "kimi-start-sign-in-"));
+  try {
+    // No token, no config: nothing to run on.
+    assert.equal(await kimiCodeStartNeedsSignIn(home), true);
+    // A config with only the managed (signed-in) provider.
+    const managed = [
+      '[providers."managed:kimi-code"]',
+      'type = "kimi"',
+      'base_url = "https://api.kimi.com/coding/v1"',
+      '',
+      '[models."kimi-code/kimi-for-coding"]',
+      'provider = "managed:kimi-code"',
+      'model = "kimi-for-coding"',
+    ].join("\n");
+    await writeFile(path.join(home, "config.toml"), managed);
+    assert.equal(await kimiCodeStartNeedsSignIn(home), true);
+    // A model from the environment (KIMI_MODEL_NAME + KIMI_MODEL_API_KEY) runs without the sign-in.
+    assert.equal(await kimiCodeStartNeedsSignIn(home, { env: [{}, { KIMI_MODEL_NAME: "kimi-k2", KIMI_MODEL_API_KEY: "k" }] }), false);
+    assert.equal(await kimiCodeStartNeedsSignIn(home, { env: [{ KIMI_MODEL_NAME: "  " }] }), true, "an empty value is unset");
+    // Another provider, or any API key, may run without the sign-in: no claim.
+    await writeFile(path.join(home, "config.toml"), `${managed}\n\n[providers.moonshot]\ntype = "kimi"\n`);
+    assert.equal(await kimiCodeStartNeedsSignIn(home), false);
+    await writeFile(path.join(home, "config.toml"), `${managed}\napi_key_env = "MY_KEY"\n`);
+    assert.equal(await kimiCodeStartNeedsSignIn(home), false);
+    await writeFile(path.join(home, "config.toml"), "default_model = \"x\"\n");
+    assert.equal(await kimiCodeStartNeedsSignIn(home), false, "no provider named: no claim");
+    // Signed in, or a status that cannot tell: never blocks.
+    await writeFile(path.join(home, "config.toml"), managed);
+    assert.equal(await kimiCodeStartNeedsSignIn(home, { readStatus: async () => ({ kind: "logged_in" }) }), false);
+    assert.equal(await kimiCodeStartNeedsSignIn(home, { readStatus: async () => ({ kind: "unknown" }) }), false);
+    assert.equal(await kimiCodeStartNeedsSignIn(home, { readStatus: async () => { throw new Error("EIO"); } }), false);
+    await mkdir(path.join(home, "credentials"), { recursive: true });
+    await writeFile(path.join(home, "credentials", "kimi-code.json"), JSON.stringify({ access_token: "t" }));
+    assert.equal(await kimiCodeStartNeedsSignIn(home), false);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
 });

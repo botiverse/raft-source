@@ -154,6 +154,27 @@ test("step 14: a session signal from a Computer the agent left keeps sessionId",
   assert.equal((await getAgent(agent.id))?.sessionId, "session-on-b");
 });
 
+test("setAgentLastRuntimeError: a failed start replaces only no error or another failed start", async ({ app }) => {
+  const agent = await seedAgent("start-failure-store");
+  const at = () => new Date().toISOString();
+  const startFailure = { message: "bootstrap exploded", at: at(), actionRequired: true, spawnFailureReason: "runtime_spawn_failed" as const };
+  assert.deepEqual(await setAgentLastRuntimeError(agent.id, startFailure), startFailure, "over no error");
+  const next = { ...startFailure, message: "spawn codex ENOENT", spawnFailureReason: "runtime_not_found" as const, at: at() };
+  assert.deepEqual(await setAgentLastRuntimeError(agent.id, next), next, "over another failed start");
+  // The same failed start again, within the rewrite window: the stored one is returned, nothing written.
+  assert.deepEqual(await setAgentLastRuntimeError(agent.id, { ...next, at: at() }), next);
+  // A runtime error replaces a failed start; a failed start never replaces it, whatever the cache thought.
+  for (const kept of [
+    { message: "limit", at: at(), actionRequired: true, errorClass: "RateLimitError" as const, errorReason: "rate_limited" as const },
+    { message: "sign in", at: at(), actionRequired: true, errorClass: "AuthError" as const, errorReason: "auth_failed" as const, requiredAction: "user_reauth" as const },
+    { message: "Codex exited", at: at(), actionRequired: true },
+  ]) {
+    assert.deepEqual(await setAgentLastRuntimeError(agent.id, kept), kept);
+    assert.deepEqual(await setAgentLastRuntimeError(agent.id, { ...startFailure, at: at() }), kept, kept.message);
+    assert.deepEqual(await getAgentLastRuntimeError(agent.id), kept);
+  }
+});
+
 test("clearAgentLastRuntimeErrorUnlessBilling writes only when a non-billing error is set", async ({ app }) => {
   const agent = await seedAgent("runtime-error-clear-noop");
   const db = getDb();

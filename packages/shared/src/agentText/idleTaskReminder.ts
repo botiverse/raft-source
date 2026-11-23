@@ -24,7 +24,8 @@ export type IdleTaskReminderItemReason = (typeof IDLE_TASK_REMINDER_ITEM_REASONS
 
 /**
  * Why nothing is sent: `disabled` (the server's `task_v2_conversations_v0` flag
- * is off), `no_open_tasks` (nothing open is assigned to the agent, and no task
+ * is off and the ask is not `freshSession`: without task v2 only the
+ * new-session listing runs), `no_open_tasks` (nothing open is assigned to the agent, and no task
  * it created with no assignee has waited past its threshold),
  * `no_change` (open tasks, none with news since the last reminder),
  * `hourly_cap` (the agent was already reminded the most times an hour allows;
@@ -106,6 +107,14 @@ export interface IdleTaskReminderNoticeBacklogItem {
 
 export interface IdleTaskReminderNoticeInput {
   items: readonly IdleTaskReminderNoticeItem[];
+  /** Open tasks assigned to the agent past those listed (a server without task v2 names a few and counts the rest). */
+  moreAssigned?: number;
+  /**
+   * The server has task conversations (task v2): the rules say to write in
+   * "its conversation". False: in "its thread", where a task is discussed
+   * without them. Default true.
+   */
+  taskConversations?: boolean;
   /** Tasks with no assignee past the limit of one notice: how many, and their boards (`#channel` / `dm:@peer`). */
   moreNoAssignee?: { count: number; boards: readonly string[] };
   /** Parked tasks (status `backlog`), listed compactly at the end; never a reason to send. */
@@ -158,6 +167,11 @@ export function formatIdleTaskReminderNotice(input: IdleTaskReminderNoticeInput)
     `[Raft task notice: ${count} ${count === 1 ? "task is" : "tasks are"} waiting on you.`,
     ...input.items.map(formatIdleTaskReminderLine),
   ];
+  const moreAssigned = input.moreAssigned ?? 0;
+  if (moreAssigned > 0) {
+    lines.push(`…and ${moreAssigned} more assigned to you. To see them: ${formatHint(RAFT_HINTS.taskListMine())}.`);
+  }
+  const where = input.taskConversations === false ? "its thread" : "its conversation";
   if (input.moreNoAssignee) {
     const { count, boards } = input.moreNoAssignee;
     lines.push(`…and ${count} more with no assignee that you created, in later notices. To see them now: ${formatHint(RAFT_HINTS.taskListName())} (${boards.join(", ")}).`);
@@ -173,7 +187,7 @@ export function formatIdleTaskReminderNotice(input: IdleTaskReminderNoticeInput)
   }
   // Every reminder has an exit (tygg, #wg-task-v2:4804a9c2).
   const backlogRule = input.backlogActive
-    ? ["- Not now: set it to backlog and say in its conversation what would bring it back."]
+    ? [`- Not now: set it to backlog and say in ${where} what would bring it back.`]
     : [];
   const hasNoAssignee = input.items.some((item) => item.noAssignee);
   if (hasNoAssignee) {
@@ -181,7 +195,7 @@ export function formatIdleTaskReminderNotice(input: IdleTaskReminderNoticeInput)
       "For a task with no assignee that you created, nobody is on it until you do one of these:",
       `- Yours to do: claim it (${formatHint(RAFT_HINTS.taskClaimName())}).`,
       `- For someone else: assign it to them with why as the reason (${formatHint(RAFT_HINTS.taskHandoff())}); they see it in their notification, so no separate message.`,
-      `- Won't be done: set it closed (${formatHint(RAFT_HINTS.taskUpdateName())}) and say why in its conversation.`,
+      `- Won't be done: set it closed (${formatHint(RAFT_HINTS.taskUpdateName())}) and say why in ${where}.`,
       ...backlogRule,
     );
   }
@@ -193,7 +207,7 @@ export function formatIdleTaskReminderNotice(input: IdleTaskReminderNoticeInput)
       `- Waiting on someone (a decision, their input, another task): assign it to them with what you need as the reason (${formatHint(RAFT_HINTS.taskHandoff())}); they see it in their notification and in the task, so no separate message.`,
       "- Better done by someone else: assign it to them with why as the reason.",
       "- Finished: set it done and send the result to whoever asked.",
-      "- Won't be done: set it closed and say why in its conversation.",
+      `- Won't be done: set it closed and say why in ${where}.`,
       ...backlogRule,
     );
   }

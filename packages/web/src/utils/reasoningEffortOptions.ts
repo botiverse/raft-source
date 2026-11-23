@@ -1,5 +1,6 @@
 import {
   REASONING_EFFORTS,
+  REASONING_EFFORT_RUNTIMES,
   defaultReasoningEffortsForRuntime,
   isReasoningEffortOfferedOnRuntime,
   runtimeOffersUndeclaredReasoningEfforts,
@@ -9,6 +10,7 @@ import type {
   ReasoningEffort,
   RuntimeModelInfo,
 } from "@botiverse/raft-shared";
+import type { IntlShape } from "react-intl";
 import type { MessageId } from "../i18n/messages";
 
 /**
@@ -27,7 +29,27 @@ import type { MessageId } from "../i18n/messages";
  */
 /** Map an effort value to its catalog id (null when unknown — keep raw). */
 export function reasoningEffortLabelId(effort: string): MessageId | null {
-  return effort in REASONING_EFFORT_LABEL_ID ? REASONING_EFFORT_LABEL_ID[effort as ReasoningEffort] : null;
+  return Object.hasOwn(REASONING_EFFORT_LABEL_ID, effort) ? REASONING_EFFORT_LABEL_ID[effort as ReasoningEffort] : null;
+}
+
+/**
+ * How an agent's reasoning effort reads wherever it is shown (the profile's
+ * Reasoning row, the Members list column, the hover card), from its hydrated
+ * runtime config: null when the runtime takes no effort (no row, a dash);
+ * "Default" when no level is set; a shared level's label ("Extra high");
+ * otherwise the level as the runtime reported it. Kimi Code's levels are the
+ * model's own strings, and its picker (a v2 derived select) lists them as-is,
+ * so they read the same here rather than as "Default" when one is set.
+ */
+export function reasoningEffortDisplayLabel(
+  config: { runtime: string; reasoningEffort?: string | null },
+  formatMessage: IntlShape["formatMessage"],
+): string | null {
+  if (!REASONING_EFFORT_RUNTIMES.has(config.runtime)) return null;
+  const effort = config.reasoningEffort;
+  if (!effort) return formatMessage({ id: "agent.runtimeConfig.default" });
+  const labelId = reasoningEffortLabelId(effort);
+  return labelId ? formatMessage({ id: labelId }) : effort;
 }
 
 export const REASONING_EFFORT_LABEL_ID: Record<ReasoningEffort, MessageId> = {
@@ -61,8 +83,10 @@ export interface ReasoningEffortOption {
 /**
  * Resolve a model's declared reasoning metadata, preferring a live
  * host-reported entry (which may carry richer per-machine data) and falling
- * back to the static shared `RUNTIME_MODELS` catalog. Returns undefined when
- * the model is unknown to both.
+ * back to the static shared `RUNTIME_MODELS` catalog. A live entry that lists
+ * its efforts wins even when the list is empty: `[]` is the host saying the
+ * model takes no effort, not that it did not say. Returns undefined when the
+ * model is unknown to both.
  */
 function resolveModelInfo(
   runtime: string,
@@ -70,7 +94,7 @@ function resolveModelInfo(
   liveModels?: readonly RuntimeModelInfo[],
 ): RuntimeModelInfo | undefined {
   const live = liveModels?.find((m) => m.id === modelId);
-  if (live?.supportedReasoningEfforts?.length) return live;
+  if (Array.isArray(live?.supportedReasoningEfforts)) return live;
   const stat = RUNTIME_MODELS[runtime]?.find((m) => m.id === modelId);
   return stat ?? live;
 }
@@ -88,8 +112,9 @@ export function reasoningEffortOptionsForModel(
   const supported = resolveModelInfo(runtime, modelId, liveModels)?.supportedReasoningEfforts;
   // Never fall back to the full catalog: models without a declared set get the
   // BASE efforts only, so max/ultra can't leak to e.g. Claude (task #496), or
-  // none where the runtime applies only listed levels (Antigravity).
-  const allowed = supported && supported.length > 0
+  // none where the runtime applies only listed levels (Antigravity). A declared
+  // empty set offers none.
+  const allowed = Array.isArray(supported)
     ? REASONING_EFFORTS.filter((effort) => supported.includes(effort.id) && isReasoningEffortOfferedOnRuntime(runtime, effort.id))
     : runtimeOffersUndeclaredReasoningEfforts(runtime)
       ? REASONING_EFFORTS.filter((effort) => defaultReasoningEffortsForRuntime(runtime).includes(effort.id))
@@ -119,7 +144,9 @@ export function reconcileReasoningEffort(
   const info = resolveModelInfo(runtime, modelId, liveModels);
   const supported = info?.supportedReasoningEfforts;
   // A model with no listed levels on a runtime that offers none for it: Default.
-  if (!supported || supported.length === 0) return runtimeOffersUndeclaredReasoningEfforts(runtime) ? current : null;
+  if (!Array.isArray(supported)) return runtimeOffersUndeclaredReasoningEfforts(runtime) ? current : null;
+  // A model that declares it takes no effort: Default, even over a stale selection.
+  if (supported.length === 0) return null;
   if (current && supported.includes(current)) return current;
   const fallback = info?.defaultReasoningEffort;
   return fallback && supported.includes(fallback) ? (fallback as ReasoningEffort) : null;

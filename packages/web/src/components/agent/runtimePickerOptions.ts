@@ -10,8 +10,12 @@ export interface RuntimePickerRow {
   /** What this computer lacks for it, as text after the name: " (not installed)",
    *  " · Update required". Said wherever the row's group does not say it already. */
   availabilitySuffix?: string;
-  /** Drawn with raft-ui's Experimental badge after the name. */
-  experimental?: boolean;
+  /** Claude Code and Codex: a Recommended badge after the name, in the list. */
+  recommended?: boolean;
+  /** Can't take new messages while working (isLimitedRuntime): a Limited badge after the name, in the list. */
+  limited?: boolean;
+  /** What the runtime lacks in Raft (runtimePickerGuidance): the field's description once chosen. */
+  hint?: string;
   disabled: boolean;
   capabilityStatus: RuntimeCapabilityStatus;
   /** The server lets the person pick it here at all (`canSelectInThisContext`).
@@ -70,7 +74,9 @@ export function groupRuntimePickerRows(
       value: row.value,
       label: row.label,
       disabled: row.disabled,
-      ...(row.experimental ? { experimental: true } : {}),
+      ...(row.recommended ? { recommended: true } : {}),
+      ...(row.limited ? { limited: true } : {}),
+      ...(row.hint ? { hint: row.hint } : {}),
       ...(row.availabilitySuffix ? { availabilitySuffix: row.availabilitySuffix } : {}),
     };
     // The heading says it in the list; the closed field still does.
@@ -101,7 +107,9 @@ export function flatRuntimePickerOptions(rows: readonly RuntimePickerRow[]): Run
     value: row.value,
     label: row.label,
     disabled: row.disabled,
-    ...(row.experimental ? { experimental: true } : {}),
+    ...(row.recommended ? { recommended: true } : {}),
+    ...(row.limited ? { limited: true } : {}),
+    ...(row.hint ? { hint: row.hint } : {}),
     ...(row.availabilitySuffix ? { availabilitySuffix: row.availabilitySuffix } : {}),
   }));
 }

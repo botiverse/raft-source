@@ -12,7 +12,7 @@ import {
   SelectionToolbarMore,
   SelectionToolbarMoreItems,
 } from "@botiverse/raft-ui/wip";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useIntl } from "react-intl";
 import { Check, Play, Plus, Square, RotateCcw, ArrowLeftRight } from "lucide-react";
@@ -39,12 +39,20 @@ import { BulkResetOptionCard } from "../../components/machine/BulkResetOptionCar
 import { MachineAgentRow } from "../../components/machine/MachineAgentRow";
 import { DETAIL_EMPTY_NOTE_CLASS_NAME } from "./machineDetailClassNames";
 import type { BulkAgentAction, BulkResetMode, BulkResetOption } from "./machineDetailTypes";
+import { isAxiosError } from "axios";
+import type { ProcJobStopResponse, ProcJobsSnapshotJob } from "@botiverse/raft-shared";
+import api from "../../api/client";
+import { useServerStore } from "../../store/serverStore";
+import { MachineAgentProcJobs } from "./MachineAgentProcJobs";
+import { useMachineProcJobs } from "./useMachineProcJobs";
 
 // Isolated component — subscribes to current display-state projections only for agents on this machine,
 // preventing activity changes from re-rendering the entire MachineDetailPanel.
-export function MachineAgentList({ machine, canManageMachines, canViewRuntimeAccountUsage, selectionDock, onSelectingChange }: {
+export function MachineAgentList({ machine, canManageMachines, canControl, canViewRuntimeAccountUsage, selectionDock, onSelectingChange }: {
   machine: Machine;
   canManageMachines: boolean;
+  /** May send this Computer a command (canControlComputer): offers Stop on an agent's jobs. */
+  canControl: boolean;
   canViewRuntimeAccountUsage: boolean;
   /** Where the toolbar for selected agents floats: an element at the bottom of the page's column, outside its scroller (MachineDetailPanel). */
   selectionDock: HTMLElement | null;
@@ -242,6 +250,34 @@ export function MachineAgentList({ machine, canManageMachines, canViewRuntimeAcc
   const stopSelectedAgents = useCallback(() => runBulkAction("stop"), [runBulkAction]);
   const resetSelectedAgents = useCallback(() => runBulkAction(bulkResetMode), [bulkResetMode, runBulkAction]);
   const openAgent = useCallback((agentId: string) => nav.toAgent(agentId), [nav]);
+
+  // Each agent's `raft proc` jobs (docs/contracts/proc-jobs.md), read while the Computer is online.
+  const serverId = useServerStore((s) => s.current?.id ?? null);
+  const procJobs = useMachineProcJobs(serverId, machine.id, machine.status === "online");
+  const refreshProcJobs = procJobs.refresh;
+  const markProcJobStopped = procJobs.markStopped;
+  const stopProcJob = useCallback(async (job: ProcJobsSnapshotJob) => {
+    if (!serverId) return;
+    try {
+      const { data } = await api.post<ProcJobStopResponse>(`/servers/${serverId}/machines/${machine.id}/proc-jobs/stop`, { agentId: job.agentId, name: job.name });
+      if (data?.outcome === "stopped") {
+        markProcJobStopped(job);
+      } else if (data?.outcome === "already_exited" || data?.outcome === "not_found") {
+        showToast({ title: formatMessage({ id: "machine.procJobs.toast.alreadyEnded" }, { name: job.name }) });
+      } else {
+        showToast({ title: formatMessage({ id: "machine.procJobs.toast.failed" }, { name: job.name }), type: "warning" });
+      }
+    } catch (error) {
+      const code = isAxiosError(error) ? (error.response?.data as { code?: unknown } | undefined)?.code : undefined;
+      showToast({
+        title: code === "computer_upgrade_required"
+          ? formatMessage({ id: "machine.procJobs.toast.upgradeRequired" })
+          : formatMessage({ id: "machine.procJobs.toast.failed" }, { name: job.name }),
+        type: "warning",
+      });
+    }
+    await refreshProcJobs();
+  }, [formatMessage, machine.id, markProcJobStopped, refreshProcJobs, serverId]);
   const enterSelectionMode = useCallback(() => {
     setSelectionMode(true);
     onSelectingChange(true);
@@ -404,19 +440,32 @@ export function MachineAgentList({ machine, canManageMachines, canViewRuntimeAcc
             {/* DS ListRow › `rf-list--inset`: the agents are one card with
                 hairlines between rows (AvatarListRow is a raft-ui ListRow). */}
             <ListRowGroup>
-              {machineAgents.map((agent) => (
-                <MachineAgentRow
-                  key={agent.id}
-                  agent={agent}
-                  displayState={displayStateFor(agent)}
-                  selectionMode={selectionMode}
-                  selected={selectedAgentIds.has(agent.id)}
-                  canManageMachines={canManageMachines}
-                  onToggleSelection={toggleAgentSelection}
-                  onOpenAgent={openAgent}
-                  located={bulkLocated && !!locatedBulk?.agentIds.includes(agent.id)}
-                />
-              ))}
+              {machineAgents.map((agent) => {
+                const jobs = selectionMode ? undefined : procJobs.jobsByAgent.get(agent.id);
+                return (
+                  <Fragment key={agent.id}>
+                    <MachineAgentRow
+                      agent={agent}
+                      displayState={displayStateFor(agent)}
+                      selectionMode={selectionMode}
+                      selected={selectedAgentIds.has(agent.id)}
+                      canManageMachines={canManageMachines}
+                      onToggleSelection={toggleAgentSelection}
+                      onOpenAgent={openAgent}
+                      located={bulkLocated && !!locatedBulk?.agentIds.includes(agent.id)}
+                    />
+                    {/* Only an agent with jobs gets the line; an unknown answer shows nothing (never "no jobs"). */}
+                    {jobs && jobs.length > 0 ? (
+                      <MachineAgentProcJobs
+                        agentName={agent.displayName || agent.name}
+                        jobs={jobs}
+                        canStop={canControl && machine.status === "online"}
+                        onStop={stopProcJob}
+                      />
+                    ) : null}
+                  </Fragment>
+                );
+              })}
             </ListRowGroup>
           </div>
         )}

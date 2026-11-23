@@ -1,5 +1,5 @@
 import { useThreadStore } from "../../store/threadStore";
-import { threadView, useViewSwitchPaint } from "../../observability/viewSwitchSpan";
+import { taskView, threadView, useViewSwitchPaint } from "../../observability/viewSwitchSpan";
 import type { ViewListState } from "../../observability/viewSwitchSpan";
 
 export interface ThreadRepliesShown {
@@ -13,6 +13,12 @@ export interface ThreadRepliesShown {
   resolveFailed: boolean;
 }
 
+export interface ThreadViewSwitchTarget {
+  parentMessageId: string | null;
+  parentTaskId: string | null;
+  isTaskModalSurface: boolean;
+}
+
 /** What the replies show, for `web.view.switch`: "Loading replies…" and the lookup shell are pending; no thread channel (no replies yet) is data. */
 export function threadRepliesState(shown: ThreadRepliesShown): ViewListState {
   if (shown.failed || shown.resolveFailed) return "error";
@@ -21,18 +27,29 @@ export function threadRepliesState(shown: ThreadRepliesShown): ViewListState {
   return shown.loading || shown.repliesFor !== shown.threadChannelId ? "pending" : "data";
 }
 
-/** End hook of `web.view.switch` for a side thread's replies (observability/viewSwitchSpan.ts); a task's conversation is not timed. */
+/** View key for a side thread or task conversation panel (null when unkeyed). */
+export function threadSurfaceViewKey(target: ThreadViewSwitchTarget): string | null {
+  if (target.parentTaskId) return taskView(target.parentTaskId);
+  if (target.isTaskModalSurface) return target.parentMessageId ? taskView(target.parentMessageId) : null;
+  return target.parentMessageId ? threadView(target.parentMessageId) : null;
+}
+
+/** End hook of `web.view.switch` for a side thread's or task conversation's replies (observability/viewSwitchSpan.ts). */
 export function useThreadViewSwitch(
-  parentMessageId: string | null,
-  enabled: boolean,
+  target: ThreadViewSwitchTarget,
   shown: Omit<ThreadRepliesShown, "resolving" | "resolveFailed">,
 ): void {
-  const resolving = useThreadStore((s) => s.openThreadLoading);
-  const resolveFailed = useThreadStore((s) => s.openThreadError !== null);
+  const isTaskSurface = target.parentTaskId !== null || target.isTaskModalSurface;
+  const resolving = useThreadStore((s) => (isTaskSurface ? (s.taskModal?.loading ?? false) : s.openThreadLoading));
+  const resolveFailed = useThreadStore((s) => (
+    isTaskSurface
+      ? s.taskModal?.error !== null && s.taskModal?.error !== undefined
+      : s.openThreadError !== null
+  ));
   useViewSwitchPaint(
-    enabled && parentMessageId ? threadView(parentMessageId) : null,
+    threadSurfaceViewKey(target),
     threadRepliesState({ ...shown, resolving, resolveFailed }),
-    // The replies are fetched by the thread channel's id, often not known at the click.
+    // The replies are fetched by the thread/task conversation's channel id, often not known at the click.
     shown.threadChannelId,
   );
 }

@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import { currentTimeMs } from "@botiverse/raft-shared";
 import type { ArtifactKind } from "@botiverse/raft-shared";
+import { useOwnerTimers } from "../../utils/ownerDocument";
 
 /**
  * The Artifact loading splash's parameters, icons and clock (the components: ArtifactLoadingSplash.tsx).
@@ -129,6 +130,8 @@ function rememberShownIcon(startedAt: number, icon: ArtifactSplashIcon): void {
  * (artifactSplashUntilNextCycle); otherwise (still, reduced motion, the ending, not yet appeared) it is at once.
  */
 export function useArtifactSplashShownIcon(wanted: ArtifactSplashIcon, startedAt: number, moving: boolean): ArtifactSplashIcon {
+  // The splash's own window's timer (an object window's runs while the main window is hidden, #337 PR3).
+  const timers = useOwnerTimers();
   const [shown, setShown] = useState<ArtifactSplashIcon>(() => {
     const held = shownIcons.get(startedAt);
     return moving && held !== undefined && artifactSplashUntilNextCycle(startedAt, currentTimeMs()) > 0 ? held : wanted;
@@ -146,9 +149,9 @@ export function useArtifactSplashShownIcon(wanted: ArtifactSplashIcon, startedAt
       setShown(wanted);
       return;
     }
-    const timer = window.setTimeout(() => setShown(wanted), wait);
-    return () => window.clearTimeout(timer);
-  }, [moving, shown, startedAt, wanted]);
+    const timer = timers.setTimeout(() => setShown(wanted), wait);
+    return () => timers.clearTimeout(timer);
+  }, [moving, shown, startedAt, wanted, timers]);
   // Not moving: the wanted icon at once, in this very render (an ending never settles the old one first).
   return moving ? shown : wanted;
 }
@@ -187,11 +190,12 @@ export const ARTIFACT_SPLASH_REDUCED_MOTION_QUERY = "(prefers-reduced-motion: re
 export function useArtifactSplashAppearedAt(startedAt: number, stopped: boolean): boolean {
   const [appearedFor, setAppearedFor] = useState<number | null>(() => (currentTimeMs() - startedAt >= ARTIFACT_SPLASH_APPEAR_AFTER_MS ? startedAt : null));
   const appeared = appearedFor === startedAt;
+  const timers = useOwnerTimers();
   useEffect(() => {
     if (appeared || stopped) return;
-    const timer = window.setTimeout(() => setAppearedFor(startedAt), Math.max(0, startedAt + ARTIFACT_SPLASH_APPEAR_AFTER_MS - currentTimeMs()));
-    return () => window.clearTimeout(timer);
-  }, [appeared, stopped, startedAt]);
+    const timer = timers.setTimeout(() => setAppearedFor(startedAt), Math.max(0, startedAt + ARTIFACT_SPLASH_APPEAR_AFTER_MS - currentTimeMs()));
+    return () => timers.clearTimeout(timer);
+  }, [appeared, stopped, startedAt, timers]);
   return appeared;
 }
 

@@ -14,6 +14,8 @@ import { agentEventRoom } from "../socket/platformScope";
 import { and, eq, inArray, isNotNull, isNull, or } from "drizzle-orm";
 import multer from "multer";
 import {
+  PROFILE_DESCRIPTION_MAX_LENGTH,
+  profileDescriptionTooLong,
   AGENT_ARCHIVE_WORKSPACE_CHOICES,
   AGENT_CONTEXT_VIEW_FEATURE_FLAG_KEY,
   type AgentContextViewRecordList,
@@ -30,6 +32,7 @@ import { respondInvalidOrExpiredToken } from "../middleware/auth";
 import { DeviceSessionRevokedError, lockLiveSessionFamily, webSessionFamilyOf } from "../services/sessionService";
 import { refuseWithoutRecentSecondFactor } from "./secondFactor";
 import * as agentService from "../services/agentService";
+import { changedDescriptionLinkWarnings } from "../services/profileDescriptionLinks";
 import { assertActionCardWritable, isActionCardConversionError } from "../services/actionCardConversionService";
 import * as agentActivityLogService from "../services/agentActivityLogService";
 import * as assistantService from "../services/assistantService";
@@ -51,6 +54,7 @@ import { convertFailedHostedCindyToComputer, HostedCindyConversionError, resolve
 import {
   AgentOrchestrator,
   KimiReasoningEffortUpgradeRequiredError,
+  BuiltInProviderMissingStartError,
 } from "../services/agentOrchestrator";
 import { emitAgentMigrationUpdated } from "../services/agentMigrationRealtime";
 import {
@@ -82,7 +86,10 @@ import {
   isExternalAgentRuntime,
   getRuntimeDisplayName,
   isOarOnlyRuntime,
+  BUILTIN_RUNTIME_GATEWAY_PROVIDER_ENV_KEYS,
+  BUILTIN_RUNTIME_PROVIDER_ENV_KEYS,
   parseRuntimeConfig,
+  PI_BUILTIN_PROVIDER_ENV_KEYS,
   runtimeConfigModelValue,
   stripControlledRuntimeEnvVars,
   newlyWrittenDisallowedAgentEnvVarNames,
@@ -98,6 +105,7 @@ import {
   type RuntimeConfig,
   type ServerCapability,
   type ServerRole,
+  DAEMON_CAPABILITY_CONSTRUCTED_INIT_V1,
   asMachineId,
 } from "@botiverse/raft-shared";
 import { parseBrandedUuidFromBody } from "../lib/brandedParse";
@@ -147,7 +155,6 @@ import { broadcastAgentCredentialRevocation } from "../replicaRouter";
 import { evaluateFeatureFlag } from "../services/featureFlagService";
 import {
   isRuntimeAdmittedForNewUse,
-  isRuntimeDeprecatedForServer,
   projectExistingAgentRuntimeOptions,
   resolveRuntimeAdmissionPolicy,
   runtimeOptionProjectionFromHeaders,
@@ -179,20 +186,21 @@ import {
 } from "../services/runtimeFormDefinitionService";
 import {
   buildRuntimeConfigFromFormValues,
-  buildRuntimeFormV2EditBodyForServer,
+  buildRuntimeFormV2EditBody,
   guardBuiltInEditFromClient,
   withBuiltInEditVisibility,
-  withStoredLimitProvider,
   formValuesPointerForRuntimeConfigPointer,
-  SAVED_CONNECTION_VALUE_PREFIX,
   reconcileRuntimeFormV2SubmissionWithLiveModels,
   redactWriteOnlyRuntimeConfig,
+  retainLegacyBlankWriteOnlySecrets,
   retainOmittedClaudeAuthType,
   retainOmittedWriteOnlySecrets,
 
   isRuntimeFormV2SubmitProtocol,
   validateRuntimeFormV2SubmitRef,
   type RuntimeFormValuesOptions,
+  withCodexSpeedVisibility,
+  withoutUncheckedServiceTier,
 } from "../services/runtimeFormV2Registry";
 import { localizeRuntimeFormV2, runtimeFormCopyLocale, setRuntimeFormCopyHeaders } from "../services/runtimeFormV2Copy";
 import { isRuntimeFormV3Request, serveRuntimeFormV3 } from "../services/runtimeFormV3";
@@ -208,18 +216,11 @@ import {
   type AgentArchiveRow,
 } from "../services/agentArchiveService";
 import { APP_BOT_LIFECYCLE_MANAGED } from "../services/appBotIdentityService";
-import {
-  assertProviderConnectionModelCompatible,
-  providerConnectionProviderId,
-  ProviderConnectionError,
-  SAVED_CONNECTION_ID_SHAPE,
-  resolveProviderConnectionSelection,
-} from "../services/providerConnectionService";
-import { isProviderConnectionsEnabled } from "../services/providerConnectionFeature";
 import { builtInTypedModelProvidersFor } from "../services/builtInTypedModelProviders";
+import { codexSpeedModelsFor } from "../services/codexSpeedModels";
 import { type AgentOperatorEventStoredKind } from "@botiverse/raft-shared";
 import { listAgentOperatorEvents, recordAgentOperatorEvent, type AgentOperatorEventDetailsInput } from "../services/agentOperatorEvents";
-import { AGENT_LOUNGE_FEATURE_FLAG_KEY, coarseAgentActivityState, AGENT_MIGRATION_HOSTED_FEATURE_FLAG_KEY, HOSTED_DEFAULT_MODEL, isAgentRuntimeProviderKind, SUBAGENT_TASK_ID_MAX_LENGTH } from "@botiverse/raft-shared";
+import { AGENT_LOUNGE_FEATURE_FLAG_KEY, coarseAgentActivityState, AGENT_MIGRATION_HOSTED_FEATURE_FLAG_KEY, HOSTED_DEFAULT_MODEL, isAgentRuntimeProviderKind, isRuntimeDeprecated, SUBAGENT_TASK_ID_MAX_LENGTH } from "@botiverse/raft-shared";
 import { AgentRuntimeProviderError, resolveProviderConfig } from "../services/agentRuntimeProviderService";
 import { fetchProvisionImportLimits } from "../services/agentRuntimeProvisionImport";
 import { confirmHostedAgentMigration, getHostedMigrationReview, HostedMigrationConfirmError } from "../services/hostedAgentMigrationService";
@@ -255,6 +256,14 @@ import {
 } from "../services/hostedAgentModelService";
 import { getExternalAgentDiagnostics } from "../services/externalAgentDiagnosticsService";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
+import {
+  AgentSecretDecryptionError,
+  assertNoEncryptedAgentSecrets,
+  findReservedAgentSecretPrefixInInput,
+  getAgentSecretDecryptFailure,
+  MAX_AGENT_SECRET_BYTES,
+  openAgentRowSecretsIsolated,
+} from "../services/agentSecretCrypto";
 import { sendAgentRuntimeProviderError } from "./agentRuntimeProviders";
 import {
   assignAgentConnectionConnector,
@@ -275,7 +284,8 @@ import { projectRuntimeErrorActivityDetail, projectRuntimeErrorState, type Runti
 import { AGENT_CONNECTION_CONNECTOR_ID_RE, type AgentBlockedReason, isAgentConnectionProvider, refusalSentenceProblem, type AgentConnectionProvider, type AgentConnectionRemovedView, type ServerId, type TraceAttributes } from "@botiverse/raft-shared";
 import { agentVoiceSettings, listAgentVoiceQuestions } from "../services/agentVoiceService";
 import { hangUpAgentVoiceCall, renewAgentVoiceCallToken, startAgentVoiceCall } from "../services/agentVoiceCallService";
-import { refuse } from "../lib/refusal";
+import { refuse, sentenceQuoting, type RefusalInput } from "../lib/refusal";
+import { serviceMessageRefusal } from "./agentRouteRefusals";
 import { isAgentRuntimeProviderKillSwitched } from "../services/agentRuntimeProviderFeature";
 
 // The provider kind stays out of the message: people see "cloud agent", not the provider name.
@@ -342,6 +352,7 @@ import { MachineCatalogStaleError } from "../services/machineCatalogAuthority";
 import { projectAssistantPause, resumeAssistant, stopAssistant } from "../services/assistantLifecycleService";
 import { guardUuidPathParams } from "../lib/uuidPathParams";
 import { hideUnfindableAgentsInPath } from "./unfindableAgentGate";
+import { agentProfileDescriptionFor, humanDescriptionViewer, type DescriptionViewer } from "../lib/descriptionVisibility";
 
 export const agentRouter: RouterType = Router();
 
@@ -370,7 +381,7 @@ agentRouter.use(async (req, res, next) => {
     && (pathSegments.length === 0 || pathSegments.length === 1);
   const isContextViewRead = req.method === "GET" && CONTEXT_VIEW_READ_PATH.test(req.path);
   if (callerRole === "guest" && !isGuestPublicProfileRead && !isContextViewRead) {
-    res.status(403).json({ error: "Guests can't open the server's agent directory" });
+    refuse(res, 403, { code: "agent_directory_guest_forbidden", error: "Guests can't open the server's agent directory" });
     return;
   }
   next();
@@ -380,6 +391,18 @@ const ASSISTANT_OWNER_ONLY_ERROR = {
   error: "Only this assistant's owner can manage it; an owner or admin of the server can only stop it",
   code: "assistant_owner_only",
 } as const;
+
+// An agent the caller can't find by id: none has it, it is another server's,
+// or it is another person's assistant (hideUnfindableAgentsInPath rewrites
+// that one to an id no agent has). Every case is this one body on each route
+// that uses it; the param guard, View Context and the bootstrap token route's
+// first check (codeless), the migration routes (`AGENT_NOT_FOUND`) and that
+// route's fence (`agent_missing`) don't send it.
+const AGENT_NOT_FOUND_REFUSAL: RefusalInput = { code: "agent_not_found", error: "Agent not found" };
+const EDIT_AGENTS_FORBIDDEN_REFUSAL: RefusalInput = {
+  code: "insufficient_role",
+  error: "The `editAgents` capability or human creator authority is required to edit agents",
+};
 
 // A personal assistant's lifecycle is its owner's alone. Since
 // hideUnfindableAgentsInPath nobody else reaches this with an assistant's id
@@ -415,7 +438,7 @@ agentRouter.use(async (req, res, next) => {
     const deletion = (req.method === "DELETE" && subPath === "/") || subPath.startsWith("/archive");
     const subject = deletion ? await withAssistantOwnerMembership(req.serverId!, agent) : agent;
     if (decideAgentResourceAuthority(callerRole, req.userId!, subject, deletion ? "deleteAgents" : "controlAgentRuntime", { stop }) === "assistant_owner_only") {
-      res.status(403).json(ASSISTANT_OWNER_ONLY_ERROR);
+      refuse(res, 403, ASSISTANT_OWNER_ONLY_ERROR);
       return;
     }
     next();
@@ -424,7 +447,6 @@ agentRouter.use(async (req, res, next) => {
   }
 });
 export const agentAvatarRouter: RouterType = Router();
-const MAX_AGENT_DESCRIPTION_LENGTH = 3000;
 // The legacy column (and the agent API built from it) never carries Pi's
 // `off`/`minimal`: older CLIs validate that field against the older set.
 const KNOWN_REASONING_EFFORT_IDS = new Set<string>(LEGACY_COLUMN_REASONING_EFFORTS);
@@ -442,6 +464,7 @@ function sendKimiReasoningEffortUpgradeRequired(
   pointer: "/formDefinitionRef" | "/runtimeConfig/reasoningEffort",
   error = "Update Raft on this device before changing Kimi reasoning settings",
 ): void {
+  // refusal-ok: top-level issues points the runtime form at the field (CreateAgentDialog reads issues[].pointer); refuse() writes no top-level fields
   res.status(409).json({
     error,
     code: "upgrade_required",
@@ -468,43 +491,6 @@ type AgentSkillsListFailureReason =
   | "daemon_error"
   | "orchestrator_unavailable"
   | "unknown";
-
-/**
- * Binding a saved Provider connection hands an agent the team's key, so it
- * needs `manageExternalAuth`: the form lists connections only to those who
- * hold it, and a connection id is visible in other agents' runtimeConfig.
- * Keeping the connection an agent already has needs nothing more. Sends the
- * 403 and returns false when the caller may not bind `connectionId`.
- */
-async function mayBindProviderConnection(
-  req: Request,
-  res: Response,
-  connectionId: string,
-  storedRuntimeConfig: { runtime: string; provider?: { kind: string; connectionId?: string } } | null,
-): Promise<boolean> {
-  const stored = storedRuntimeConfig?.runtime === "builtin" && storedRuntimeConfig.provider?.kind === "connection"
-    ? storedRuntimeConfig.provider.connectionId
-    : undefined;
-  if (stored === connectionId) return true;
-  if (await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "manageExternalAuth")) return true;
-  refuse(res, 403, {
-    code: "provider_connection_manage_auth_required",
-    error: "Choosing a saved Provider connection needs the `manageExternalAuth` capability.",
-  });
-  return false;
-}
-
-function sendProviderConnectionsDisabled(res: Response): void {
-  res.status(404).json({
-    error: "Provider connections are not enabled for this server",
-    code: "provider_connections_disabled",
-  });
-}
-
-
-
-
-
 
 function getErrorClass(error: unknown): string {
   return errorClassOf(error);
@@ -541,19 +527,16 @@ function agentSkillsListErrorExcerpt(reason: AgentSkillsListFailureReason): stri
 
 
 function sendRuntimeCapabilityUnavailable(res: Response, runtime: string): void {
-  res.status(409).json({
+  refuse(res, 409, {
+    code: "runtime_capability_unavailable",
     error: isOarOnlyRuntime(runtime)
       ? `${getRuntimeDisplayName(runtime)} is not available on this computer: install its CLI there, and update the Computer if it does not list ${getRuntimeDisplayName(runtime)} yet`
       : `${getRuntimeDisplayName(runtime)} is not available on this computer`,
-    code: "runtime_capability_unavailable",
   });
 }
 
 function sendRuntimeDisabled(res: Response, runtime: string): void {
-  res.status(403).json({
-    error: `${getRuntimeDisplayName(runtime)} is not enabled on this server`,
-    code: "runtime_disabled",
-  });
+  refuse(res, 403, { code: "runtime_disabled", error: `${getRuntimeDisplayName(runtime)} is not enabled on this server` });
 }
 
 /** Runtimes an agent can be created on or switched to only with a Computer that reports them. */
@@ -831,6 +814,9 @@ function parseEnvVars(envVars: unknown): ParseEnvVarsResult {
     if (k.includes("\0") || v.includes("\0")) {
       return { ok: false, reason: "envVars keys and values must not contain null bytes" };
     }
+    if (Buffer.byteLength(v, "utf8") > MAX_AGENT_SECRET_BYTES) {
+      return { ok: false, reason: `Env var "${k}" exceeds the maximum length of ${MAX_AGENT_SECRET_BYTES} bytes` };
+    }
     // TODO(typed-boundary): split provider-controlled/reserved env keys
     // (provider/model launch mirrors) out of the user env map at this boundary
     // — that is a behavior change, kept out of the parse-don't-validate refactor.
@@ -977,17 +963,60 @@ function broadcastAgentCreated<T extends Record<string, unknown> & { serverId: s
   io?.to(agentEventRoom(agent.serverId, agent.assistantOwnerUserId)).emit("agent:created", { agent: stripEnvVars(agent) });
 }
 
+function redactMirroredProviderSecretEnvVars(
+  runtimeConfig: RuntimeConfig,
+  envVars: Record<string, string> | null | undefined,
+): Record<string, string> | null | undefined {
+  if (!envVars) return envVars;
+  const secretKeys = new Set<string>();
+  if (runtimeConfig.runtime === "claude" && runtimeConfig.provider?.kind === "custom") {
+    secretKeys.add("ANTHROPIC_API_KEY");
+    secretKeys.add("ANTHROPIC_AUTH_TOKEN");
+  } else if (runtimeConfig.runtime === "pi" && runtimeConfig.provider?.kind === "pi-builtin") {
+    const envKey = PI_BUILTIN_PROVIDER_ENV_KEYS[runtimeConfig.provider.providerId];
+    if (envKey) secretKeys.add(envKey.toUpperCase());
+  } else if (runtimeConfig.runtime === "builtin") {
+    if (runtimeConfig.provider?.kind === "preset") {
+      const envKey = BUILTIN_RUNTIME_PROVIDER_ENV_KEYS[runtimeConfig.provider.providerId];
+      if (envKey) secretKeys.add(envKey.toUpperCase());
+    } else if (runtimeConfig.provider?.kind === "gateway") {
+      const envKey = BUILTIN_RUNTIME_GATEWAY_PROVIDER_ENV_KEYS[runtimeConfig.provider.providerId];
+      if (envKey) secretKeys.add(envKey.toUpperCase());
+    }
+  }
+  if (secretKeys.size === 0) return envVars;
+  let changed = false;
+  const next: Record<string, string> = {};
+  for (const [key, value] of Object.entries(envVars)) {
+    if (secretKeys.has(key.toUpperCase())) {
+      changed = true;
+      continue;
+    }
+    next[key] = value;
+  }
+  if (!changed) return envVars;
+  return Object.keys(next).length > 0 ? next : null;
+}
+
 function withAgentProjection<T extends {
+  id?: string;
   runtime: string;
   model: string;
   runtimeConfig?: unknown;
   reasoningEffort?: ReasoningEffort | null;
   envVars?: Record<string, string> | null;
 }>(agent: T): T & { runtimeConfig: RuntimeConfig; external: boolean } {
-  const projected = withHydratedRuntimeConfig(agent);
+  const opened = typeof agent.id === "string"
+    ? openAgentRowSecretsIsolated(agent as T & { id: string })
+    : agent;
+  const projected = withHydratedRuntimeConfig(opened);
+  const redactedRuntimeConfig = redactWriteOnlyRuntimeConfig(projected.runtimeConfig);
+  const redactedEnvVars = redactMirroredProviderSecretEnvVars(projected.runtimeConfig, projected.envVars);
+  assertNoEncryptedAgentSecrets(redactedRuntimeConfig, redactedEnvVars);
   return withExternalProjection({
     ...projected,
-    runtimeConfig: redactWriteOnlyRuntimeConfig(projected.runtimeConfig),
+    ...(projected.envVars !== undefined ? { envVars: redactedEnvVars } : {}),
+    runtimeConfig: redactedRuntimeConfig,
   });
 }
 
@@ -1037,6 +1066,7 @@ function refuseNewlyWrittenRiskyEnvVars(
   const pathHint = names.some((name) => name.toUpperCase() === "PATH")
     ? " Agents already get PATH from their computer: on macOS and Linux add the directory to your login shell's startup file and restart the Computer service; on Windows add it to your user PATH, then sign out and back in."
     : "";
+  // refusal-ok: top-level names lists the refused variables (agents.api.test.ts reads it); refuse() writes no top-level fields
   res.status(400).json({
     error: `Environment variables ${names.join(", ")} can make the agent's computer run other programs, so they can't be added or changed in an agent's settings. Remove them and save again.${pathHint}`,
     code: "env_var_not_allowed",
@@ -1167,7 +1197,7 @@ function isManagedRuntimeFieldTouched(body: Record<string, unknown>): boolean {
  * start, or stop because Raft does not own their external process.
  */
 function respondExternalManagedLifecycleUnsupported(res: Response): void {
-  res.status(400).json({ error: "External agents do not use Raft-managed runtime lifecycle" });
+  refuse(res, 400, { code: "external_agent_lifecycle_unsupported", error: "External agents do not use Raft-managed runtime lifecycle" });
 }
 
 /** Detect failed before mutation: keep explicit effort and let the caller retry. */
@@ -1182,6 +1212,7 @@ function sendKimiModelDetectUnavailable(
   traceRouteFailure(`agent.${action}.failed`, error, {
     route_action: action, http_status: 409, response_code: code, server_id: serverId,
   });
+  // refusal-ok: top-level issues points the runtime form at the model field; refuse() writes no top-level fields
   res.status(409).json({
     error: timedOut
       ? "Kimi model validation timed out. Your settings were not saved; try again."
@@ -1192,18 +1223,27 @@ function sendKimiModelDetectUnavailable(
 }
 
 /**
- * `{ global, workspace, state, fetchedAt? }`: the Computer's list (ok), its last
- * list after the wait budget (stale), or empty lists (unavailable).
+ * `{ global, workspace, builtin?, state, fetchedAt? }`: the Computer's list (ok), its last
+ * list after the wait budget (stale), or empty lists (unavailable). `builtin`
+ * only when the Computer sent one (older daemons and folder scans do not).
  */
 function sendAgentSkillsAnswer(res: Response, answer: ComputerProbeAnswer<AgentSkillsList>): void {
   setRequestTraceComputerProbeState(res, answer.state);
-  const skills = answer.state === "unavailable" ? { global: [], workspace: [] } : answer.value;
-  res.json({ global: skills.global, workspace: skills.workspace, ...computerProbeFreshness(answer) });
+  const skills: AgentSkillsList = answer.state === "unavailable" ? { global: [], workspace: [] } : answer.value;
+  res.json({
+    global: skills.global,
+    workspace: skills.workspace,
+    ...(skills.builtin ? { builtin: skills.builtin } : {}),
+    ...computerProbeFreshness(answer),
+  });
 }
 
 function responseForAgentRouteFailure(err: unknown): { status: number; code: string } {
   if (err instanceof KimiReasoningEffortUpgradeRequiredError) {
     return { status: 409, code: err.code };
+  }
+  if (err instanceof BuiltInProviderMissingStartError) {
+    return { status: 422, code: err.code };
   }
   const subkind = resolveRouteFailureSubkind(err);
   switch (subkind) {
@@ -1221,9 +1261,10 @@ function responseForAgentRouteFailure(err: unknown): { status: number; code: str
 /**
  * Joint-channel visibility grants only conversation/profile/status context for
  * peer-server agents. It must not inherit the viewer's local admin role into
- * the remote server or expose runtime/control-plane details.
+ * the remote server or expose runtime/control-plane details, nor the agent's
+ * description (lib/descriptionVisibility.ts: name, avatar and server only).
  */
-function toJointAgentProfile(agent: Record<string, unknown>): Record<string, unknown> {
+function toJointAgentProfile(agent: Record<string, unknown>, viewer: DescriptionViewer): Record<string, unknown> {
   return {
     id: agent.id,
     serverId: agent.serverId,
@@ -1232,7 +1273,9 @@ function toJointAgentProfile(agent: Record<string, unknown>): Record<string, unk
     name: agent.name,
     displayName: agent.displayName ?? null,
     avatarUrl: agent.avatarUrl ?? null,
-    description: agent.description ?? null,
+    // Name, avatar and server only: the description stays with the agent's
+    // own server's non-guest members (descriptionVisibility).
+    description: agentProfileDescriptionFor(viewer, { serverId: String(agent.serverId), description: typeof agent.description === "string" ? agent.description : null }),
     raftbenchService: agent.raftbenchService === true,
     status: agent.status,
     external: typeof agent.runtime === "string" ? isExternalAgentRuntime(agent.runtime) : false,
@@ -1243,14 +1286,16 @@ function toJointAgentProfile(agent: Record<string, unknown>): Record<string, unk
   };
 }
 
-function toGuestChannelAgentProfile(agent: Record<string, unknown>): Record<string, unknown> {
+function toGuestChannelAgentProfile(agent: Record<string, unknown>, viewer: DescriptionViewer): Record<string, unknown> {
   return {
     id: agent.id,
     serverId: agent.serverId,
     name: agent.name,
     displayName: agent.displayName ?? null,
     avatarUrl: agent.avatarUrl ?? null,
-    description: agent.description ?? null,
+    // Name, avatar and server only: the description stays with the agent's
+    // own server's non-guest members (descriptionVisibility).
+    description: agentProfileDescriptionFor(viewer, { serverId: String(agent.serverId), description: typeof agent.description === "string" ? agent.description : null }),
     raftbenchService: agent.raftbenchService === true,
     status: agent.status,
     deletedAt: agent.deletedAt ?? null,
@@ -1301,47 +1346,6 @@ export async function canInspectAgentPrivateSurfaces(
 }
 
 /**
- * Protocol v2 submit (create and edit alike): the client sends field values and
- * the server assembles the runtimeConfig, which then goes through the same
- * validation as any request. The envelope is checked against the v2 registry
- * (runtimeFormV2Registry), never the v1 refs: a runtime may have a v2 form and
- * no v1 form. Issues from the later validation point at /runtimeConfig/...; a v2
- * client only has field values, so they are rewritten to /formValues/<field>.
- * Returns undefined for a non-v2 request, "handled" when a 400 was sent.
- */
-/**
- * v2 saved-connection submits (capability `provider.saved_connection`): the
- * connection's provider is resolved server-side BEFORE the field mapping, so
- * the model kind follows the connection (a gateway connection always stores a
- * custom model even when the typed name collides with a built-in preset id),
- * never the client's value. An unavailable connection throws
- * ProviderConnectionError, which each route's catch maps exactly like the
- * direct flow. Flag off or not a connection submit: undefined, and the static
- * fallback in the registry applies.
- */
-/** The provider of the saved connection a stored Built-in config is bound to; null for any other config. */
-async function storedConnectionProviderId(serverId: string, runtimeConfig: unknown): Promise<string | null> {
-  const config = runtimeConfig !== null && typeof runtimeConfig === "object"
-    ? (runtimeConfig as { runtime?: unknown; provider?: { kind?: unknown; connectionId?: unknown } })
-    : null;
-  const provider = config?.runtime === "builtin" ? config.provider : undefined;
-  if (provider?.kind !== "connection" || typeof provider.connectionId !== "string") return null;
-  return providerConnectionProviderId(serverId, provider.connectionId);
-}
-
-async function savedConnectionProviderIdForSubmit(req: Request): Promise<string | undefined> {
-  const ref = req.body?.formDefinitionRef as { protocolVersion?: unknown; runtimeId?: unknown } | undefined;
-  if (!isRuntimeFormV2SubmitProtocol(ref?.protocolVersion) || ref?.runtimeId !== "builtin") return undefined;
-  const providerId = (req.body?.formValues as { providerId?: unknown } | undefined)?.providerId;
-  if (typeof providerId !== "string" || !providerId.startsWith(SAVED_CONNECTION_VALUE_PREFIX)) return undefined;
-  const connectionId = providerId.slice(SAVED_CONNECTION_VALUE_PREFIX.length).trim();
-  if (!connectionId || !SAVED_CONNECTION_ID_SHAPE.test(connectionId)) return undefined;
-  if (!await isProviderConnectionsEnabled(req.serverId!)) return undefined;
-  const resolved = await resolveProviderConnectionSelection(req.serverId!, connectionId);
-  return resolved.providerId;
-}
-
-/**
  * #proj-runtime:#50: a non-v2 edit whose runtimeConfig keeps the same Built-in
  * custom model but sends neither limit (a client that predates them) keeps the
  * stored `contextWindow` / `maxOutputTokens`, as a write-only secret is kept.
@@ -1372,37 +1376,28 @@ function keepStoredCustomModelLimits(runtimeConfig: unknown, existing: Parameter
   };
 }
 
+/**
+ * Protocol v2 submit (create and edit alike): the client sends field values and
+ * the server assembles the runtimeConfig, which then goes through the same
+ * validation as any request. The envelope is checked against the v2 registry
+ * (runtimeFormV2Registry), never the v1 refs: a runtime may have a v2 form and
+ * no v1 form. Issues from the later validation point at /runtimeConfig/...; a v2
+ * client only has field values, so they are rewritten to /formValues/<field>.
+ * Returns undefined for a non-v2 request, "handled" when a 400 was sent.
+ */
 function adoptRuntimeFormV2Submission(
   req: Request,
   res: Response,
-  options: RuntimeFormValuesOptions & { editing: boolean; storedConnectionProviderId: string | null },
+  options: RuntimeFormValuesOptions & { editing: boolean },
 ): { runtimeConfig: Record<string, unknown>; formDefinitionRef: RuntimeFormV2SubmitRef } | "handled" | undefined {
   const ref = req.body?.formDefinitionRef as { protocolVersion?: unknown; runtimeId?: unknown } | undefined;
   // protocolVersion 2 or 3: the same formValues semantics (v3 only changes the form's shape).
   if (!isRuntimeFormV2SubmitProtocol(ref?.protocolVersion)) return undefined;
   const refIssues = validateRuntimeFormV2SubmitRef(ref);
   if (refIssues.length > 0) {
+    // refusal-ok: top-level issues points the runtime form at the field (CreateAgentDialog reads issues[].pointer); refuse() writes no top-level fields
     res.status(400).json({ error: "This runtime has no v2 runtime form", issues: refIssues });
     return "handled";
-  }
-  // An untrusted saved-connection id is a field-level 400 here — before any
-  // resolution or DB lookup (a well-formed but absent id stays a 409 from the
-  // route's connection resolution; the service also fail-closes on shape).
-  if (ref.runtimeId === "builtin") {
-    const submittedProviderId = (req.body?.formValues as { providerId?: unknown } | undefined)?.providerId;
-    if (typeof submittedProviderId === "string" && submittedProviderId.startsWith(SAVED_CONNECTION_VALUE_PREFIX)) {
-      const submittedConnectionId = submittedProviderId.slice(SAVED_CONNECTION_VALUE_PREFIX.length).trim();
-      if (!submittedConnectionId || !SAVED_CONNECTION_ID_SHAPE.test(submittedConnectionId)) {
-        res.status(400).json({
-          error: "Runtime form values are invalid",
-          issues: [{
-            code: submittedConnectionId ? "connection_id_malformed" : "select_valid_provider",
-            pointer: "/formValues/providerId",
-          }],
-        });
-        return "handled";
-      }
-    }
   }
   let formValues: unknown = req.body?.formValues;
   // task #10: an edit save from a client that cannot show a typed model on a
@@ -1414,7 +1409,6 @@ function adoptRuntimeFormV2Submission(
       formValues,
       options.existing,
       clientCapabilities,
-      options.storedConnectionProviderId,
     );
     if (!guard.ok) {
       refuse(res, 409, { code: guard.issue.code, error: guard.message, details: { issues: [guard.issue] } });
@@ -1424,6 +1418,7 @@ function adoptRuntimeFormV2Submission(
   }
   const built = buildRuntimeConfigFromFormValues(ref.runtimeId, formValues, options);
   if (!built.ok) {
+    // refusal-ok: top-level issues points the runtime form at the field (CreateAgentDialog reads issues[].pointer); refuse() writes no top-level fields
     res.status(400).json({ error: built.message ?? "Runtime form values are invalid", issues: [built.issue] });
     return "handled";
   }
@@ -1445,10 +1440,27 @@ function adoptRuntimeFormV2Submission(
 /**
  * v2 submit: let the Computer's live model list decide what the static
  * validation could not (reconcileRuntimeFormV2SubmissionWithLiveModels): keep a
- * reasoning effort the live option offers, refuse one it does not, and store a
- * live-listed model as a preset. Updates `normalized` in place; returns the 400
+ * reasoning effort or Codex speed tier the live option offers, refuse one it
+ * does not, and store a live-listed model as a preset. Updates `normalized` in place; returns the 400
  * body when the selection is refused.
  */
+/**
+ * #wg-runtime-form:#27: a write that is not a runtime form submit (a legacy
+ * runtimeConfig PATCH) keeps a Codex speed tier only when it is the agent's
+ * saved one on the same model; any other tier becomes the primary one, since
+ * nothing checked it against the Computer.
+ */
+function dropUncheckedServiceTier(
+  normalized: { runtimeConfig: RuntimeConfig | null; launch: LaunchPlan | null },
+  existing: RuntimeConfig | null,
+): void {
+  if (!normalized.runtimeConfig) return;
+  const kept = withoutUncheckedServiceTier(normalized.runtimeConfig, existing);
+  if (kept === normalized.runtimeConfig) return;
+  normalized.runtimeConfig = kept;
+  normalized.launch = buildLaunchPlan(kept);
+}
+
 async function applyRuntimeFormV2LiveModels(
   req: Request,
   normalized: { runtimeConfig: RuntimeConfig | null; launch: LaunchPlan | null },
@@ -1466,7 +1478,12 @@ async function applyRuntimeFormV2LiveModels(
     detect: (id, runtime) => agentOrchestrator.detectMachineRuntimeModels(id, runtime),
   });
   if (result.kind === "rejected") {
-    return { error: "This reasoning effort is not available for the selected model on this computer", issues: [result.issue] };
+    const error = result.issue.code === "service_tier_not_supported"
+      ? "This speed is not available for the selected model on this computer"
+      : result.issue.code === "service_tier_unchecked"
+        ? "This speed can't be checked right now: the computer is offline or its model list couldn't be read. Try again when it's online, or choose Fast"
+        : "This reasoning effort is not available for the selected model on this computer";
+    return { error, issues: [result.issue] };
   }
   if (result.kind === "updated") {
     normalized.runtimeConfig = result.runtimeConfig;
@@ -1548,7 +1565,7 @@ export async function buildAgentListItems(input: {
     const guestActivities = await agentOrchestrator.getActivities(scopedList, { parent: getCurrentTraceContext() });
     const publicProfiles = scopedList.map((agent, index) => {
       const { activity, activityDetail } = guestActivities[index]!;
-      return toGuestChannelAgentProfile(withMemberListing({ ...agent, activity, activityDetail, raftbenchService: serviceIds.has(agent.id) }));
+      return toGuestChannelAgentProfile(withMemberListing({ ...agent, activity, activityDetail, raftbenchService: serviceIds.has(agent.id) }), humanDescriptionViewer(serverId, callerRole));
     });
     return {
       agents: publicProfiles,
@@ -1732,11 +1749,17 @@ agentRouter.get("/", async (req, res) => {
   }
 });
 
+/** Creating an agent without `createAgents`, before the create or under its membership fence. */
+const AGENT_CREATE_FORBIDDEN_REFUSAL: RefusalInput = { code: "agent_create_forbidden", error: "The `createAgents` capability is required to create agents" };
+/** Fallbacks for a pass-through parse message that doesn't read as a sentence (it quotes the request). */
+const ENV_VARS_INVALID_FALLBACK = "envVars must be an object of string names and values: check the names and values.";
+const RUNTIME_CONFIG_INVALID_FALLBACK = "Runtime configuration is invalid";
+
 // Create agent — accepts machineId and program, auto-starts after creation
 agentRouter.post("/", async (req, res) => {
   try {
     if (!await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "createAgents")) {
-      res.status(403).json({ error: "The `createAgents` capability is required to create agents" });
+      refuse(res, 403, AGENT_CREATE_FORBIDDEN_REFUSAL);
       return;
     }
     // Optimistic setup-state token for the create-vs-reset race. Both operations serialize
@@ -1758,11 +1781,7 @@ agentRouter.post("/", async (req, res) => {
     let v2Submitted = false;
     let v2SubmittedReasoningEffort: unknown = null;
     if (!external) {
-      const v2 = adoptRuntimeFormV2Submission(req, res, {
-        editing: false,
-        savedConnectionProviderId: await savedConnectionProviderIdForSubmit(req),
-        storedConnectionProviderId: null,
-      });
+      const v2 = adoptRuntimeFormV2Submission(req, res, { editing: false });
       if (v2 === "handled") return;
       if (v2) ({ runtimeConfig, formDefinitionRef } = v2);
       v2Submitted = v2 !== undefined;
@@ -1770,7 +1789,7 @@ agentRouter.post("/", async (req, res) => {
     }
     const onboarding = req.body?.onboarding === true;
     if (external && onboarding) {
-      res.status(400).json({ error: "Onboarding agent cannot be external" });
+      refuse(res, 400, { code: "onboarding_agent_external_unsupported", error: "Onboarding agent cannot be external" });
       return;
     }
     const createName = onboarding ? OFFICIAL_ONBOARDING_AGENT_IDENTITY.name : name;
@@ -1779,21 +1798,21 @@ agentRouter.post("/", async (req, res) => {
     // A missing or non-string name is refused like an empty one (validateAgentName trims it).
     const nameError = validateAgentName(typeof createName === "string" ? createName : "", "Agent name");
     if (nameError) {
-      res.status(400).json({ error: nameError });
+      refuse(res, 400, { code: "agent_name_invalid", error: nameError });
       return;
     }
-    if (createDescription && (typeof createDescription !== "string" || createDescription.length > MAX_AGENT_DESCRIPTION_LENGTH)) {
-      res.status(400).json({ error: `Description must be a string of at most ${MAX_AGENT_DESCRIPTION_LENGTH} characters` });
+    if (createDescription && (typeof createDescription !== "string" || profileDescriptionTooLong(createDescription, null))) {
+      refuse(res, 400, { code: "profile_description_invalid", error: `Description must be a string of at most ${PROFILE_DESCRIPTION_MAX_LENGTH} characters` });
       return;
     }
     if (createAvatarUrl !== undefined && createAvatarUrl !== null) {
       if (typeof createAvatarUrl !== "string" || !createAvatarUrl.startsWith("pixel:")) {
-        res.status(400).json({ error: "avatarUrl must be a pixel: URL at creation time" });
+        refuse(res, 400, { code: "agent_avatar_url_invalid", error: "avatarUrl must be a pixel: URL at creation time" });
         return;
       }
       // Only the server sets the assistant avatar, and only on an assistant.
       if (assistantService.isReservedAssistantAvatarUrl(createAvatarUrl)) {
-        res.status(400).json({ error: assistantService.AVATAR_RESERVED_ERROR, code: assistantService.AVATAR_RESERVED_CODE });
+        refuse(res, 400, { code: assistantService.AVATAR_RESERVED_CODE, error: assistantService.AVATAR_RESERVED_ERROR });
         return;
       }
     }
@@ -1802,7 +1821,7 @@ agentRouter.post("/", async (req, res) => {
     // re-checks it inside the create transaction.
     if (typeof actionCardMessageId === "string") {
       if (!isUuid(actionCardMessageId)) {
-        res.status(400).json({ error: "actionCardMessageId must be a UUID" });
+        refuse(res, 400, { code: "action_card_message_id_invalid", error: "actionCardMessageId must be a UUID" });
         return;
       }
       await assertActionCardWritable(
@@ -1812,6 +1831,7 @@ agentRouter.post("/", async (req, res) => {
       );
     }
     if (external && formDefinitionRef !== undefined) {
+      // refusal-ok: top-level issues points the runtime form at the field (CreateAgentDialog reads issues[].pointer); refuse() writes no top-level fields
       res.status(400).json({
         error: "External agents cannot use runtime form definitions",
         issues: [{ code: "external_form_definition_forbidden", pointer: "/formDefinitionRef" }],
@@ -1828,6 +1848,7 @@ agentRouter.post("/", async (req, res) => {
       ? rawRuntimeConfigRuntime.trim()
       : rawRuntimeConfigRuntime;
     if (!external && runtimeConfigRuntime === "builtin" && formDefinitionRef === undefined) {
+      // refusal-ok: top-level issues points the runtime form at the field (CreateAgentDialog reads issues[].pointer); refuse() writes no top-level fields
       res.status(409).json({
         error: "This runtime requires a runtime form definition reference",
         issues: [{ code: "form_definition_ref_required", pointer: "/formDefinitionRef" }],
@@ -1841,12 +1862,14 @@ agentRouter.post("/", async (req, res) => {
       // A v2 envelope was already checked against the v2 registry.
       const refIssues = v2Submitted ? [] : validateRuntimeFormDefinitionRef(formDefinitionRef);
       if (refIssues.length > 0) {
+        // refusal-ok: top-level issues points the runtime form at the field (CreateAgentDialog reads issues[].pointer); refuse() writes no top-level fields
         res.status(409).json({ error: "Runtime form definition is stale or invalid", issues: refIssues });
         return;
       }
       const schemaParsed = parseRuntimeConfig({ runtimeConfig });
       if (!schemaParsed.ok) {
         addTraceEvent("server.runtime_config.parse", { ...schemaParsed.trace });
+        // refusal-ok: top-level issues points the runtime form at the field (CreateAgentDialog reads issues[].pointer); refuse() writes no top-level fields
         res.status(400).json({
           error: "Runtime configuration is invalid",
           issues: [runtimeConfigIssue(schemaParsed.error)],
@@ -1855,6 +1878,7 @@ agentRouter.post("/", async (req, res) => {
       }
       const refRuntimeId = (formDefinitionRef as { runtimeId?: unknown }).runtimeId;
       if (schemaParsed.config.runtime !== refRuntimeId) {
+        // refusal-ok: top-level issues points the runtime form at the field (CreateAgentDialog reads issues[].pointer); refuse() writes no top-level fields
         res.status(400).json({
           error: "Runtime configuration does not match form definition",
           issues: [{ code: "form_runtime_mismatch", pointer: "/runtimeConfig/runtime" }],
@@ -1866,11 +1890,12 @@ agentRouter.post("/", async (req, res) => {
     const rawProvider = req.body?.provider;
     if (rawProvider !== undefined && rawProvider !== null) {
       if (!external) {
-        res.status(400).json({ error: "provider is only valid for external agents", code: "agent_runtime_provider_invalid" });
+        refuse(res, 400, { code: "agent_runtime_provider_invalid", error: "provider is only valid for external agents" });
         return;
       }
       if (!isAgentRuntimeProviderKind(rawProvider)) {
-        res.status(400).json({ error: `Unknown runtime provider: ${String(rawProvider).slice(0, 40)}`, code: "agent_runtime_provider_invalid" });
+        const shown = String(rawProvider).slice(0, 40);
+        refuse(res, 400, { code: "agent_runtime_provider_invalid", error: sentenceQuoting([shown], `Unknown runtime provider: ${shown}`, "Unknown runtime provider: choose one this server offers") });
         return;
       }
     }
@@ -1878,12 +1903,12 @@ agentRouter.post("/", async (req, res) => {
     // The model a hosted agent starts on: an offered id, or absent/null for the provider's default.
     const rawHostedModel = req.body?.hostedModel;
     if (rawHostedModel !== undefined && rawHostedModel !== null && !hostedProvider) {
-      res.status(400).json({ error: "hostedModel is only valid for a cloud agent", code: "hosted_runtime_model_invalid" });
+      refuse(res, 400, { code: "hosted_runtime_model_invalid", error: "hostedModel is only valid for a cloud agent" });
       return;
     }
     const hostedModel = parseHostedModelChoice(rawHostedModel);
     if (hostedModel === undefined) {
-      res.status(400).json({ error: "`hostedModel` must be a model id or null", code: "hosted_runtime_model_invalid" });
+      refuse(res, 400, { code: "hosted_runtime_model_invalid", error: "`hostedModel` must be a model id or null" });
       return;
     }
     if (hostedProvider) {
@@ -1903,7 +1928,7 @@ agentRouter.post("/", async (req, res) => {
         envVars,
       });
       if (externalInput.error) {
-        res.status(400).json({ error: externalInput.error });
+        refuse(res, 400, { code: "external_agent_computer_unsupported", error: externalInput.error });
         return;
       }
       const agent = await agentService.createAgent(req.serverId!, createName.trim(), {
@@ -1950,14 +1975,14 @@ agentRouter.post("/", async (req, res) => {
     // Validate reasoningEffort
     const validEffortIds = new Set<string>(REASONING_EFFORTS.map((r) => r.id));
     if (reasoningEffort && runtimeConfigRuntime !== "kimi-sdk" && !validEffortIds.has(reasoningEffort)) {
-      res.status(400).json({ error: `Invalid reasoning effort: ${reasoningEffort}` });
+      refuse(res, 400, { code: "invalid_reasoning_effort", error: sentenceQuoting([String(reasoningEffort)], `Invalid reasoning effort: ${reasoningEffort}`, "Invalid reasoning effort: choose one the runtime offers") });
       return;
     }
     // Parse envVars into a typed map at this boundary; downstream flows the
     // parsed value rather than the raw request bag.
     const parsedEnvVars = parseEnvVars(envVars);
     if (!parsedEnvVars.ok) {
-      res.status(400).json({ error: parsedEnvVars.reason });
+      refuse(res, 400, serviceMessageRefusal("invalid_env_vars", parsedEnvVars.reason, ENV_VARS_INVALID_FALLBACK));
       return;
     }
     // Validate machineId belongs to this server. req.body is `any`, so parse the
@@ -1968,7 +1993,7 @@ agentRouter.post("/", async (req, res) => {
       if (!parsedMachineId) return;
       assignedMachine = await machineService.getMachine(parsedMachineId);
       if (!assignedMachine || assignedMachine.serverId !== req.serverId) {
-        res.status(400).json({ error: "Machine not found in this server" });
+        refuse(res, 400, { code: "machine_not_found", error: "Machine not found in this server" });
         return;
       }
       // Checked again under the machine row lock when the agent is written (computerAgents.ts).
@@ -1983,11 +2008,13 @@ agentRouter.post("/", async (req, res) => {
     let convertHostedCindyId: string | null = null;
     if (isCindyOnboardingAgent) {
       const server = await serverService.getServer(req.serverId!);
-      if (server?.onboardingAgentId) {
-        const existingOnboardingAgent = await agentService.getAgent(server.onboardingAgentId);
+      // The official Cindy only: a greeter someone picked in Settings is not her.
+      if (server?.officialOnboardingAgentId) {
+        const existingOnboardingAgent = await agentService.getAgent(server.officialOnboardingAgentId);
         if (existingOnboardingAgent && existingOnboardingAgent.serverId === req.serverId) {
           const hostedState = await resolveHostedCindySetupState({ serverId: req.serverId!, agentId: existingOnboardingAgent.id });
           if (hostedState !== "failed") {
+            // refusal-ok: top-level onboardingAgentId names the existing agent (as servers.ts's onboarding_agent_exists does); refuse() writes no top-level fields
             res.status(409).json({
               error: "Onboarding agent already exists in this server",
               onboardingAgentId: existingOnboardingAgent.id,
@@ -2000,7 +2027,7 @@ agentRouter.post("/", async (req, res) => {
     }
     const existingAgents = isCindyOnboardingAgent && !convertHostedCindyId ? await agentService.listAgents(req.serverId!) : [];
     if (isCindyOnboardingAgent && existingAgents.some(isActiveCindyAgent)) {
-      res.status(409).json({ error: "Cindy agent already exists in this server" });
+      refuse(res, 409, { code: "onboarding_agent_name_taken", error: "Cindy agent already exists in this server" });
       return;
     }
     const normalizedConfig = normalizeRequestRuntimeConfig({
@@ -2013,16 +2040,33 @@ agentRouter.post("/", async (req, res) => {
       extraEnvVars: isCindyOnboardingAgent ? { [ONBOARDING_MEMORY_SEED_ENV]: "first-cindy" } : undefined,
     });
     if (normalizedConfig.error || !normalizedConfig.launch || !normalizedConfig.runtimeConfig) {
-      res.status(400).json({ error: normalizedConfig.error });
+      // normalizeRequestRuntimeConfig sets `error` whenever it has no launch; the fallback only guards the type.
+      refuse(res, 400, serviceMessageRefusal("invalid_runtime_config", normalizedConfig.error ?? "", RUNTIME_CONFIG_INVALID_FALLBACK));
       return;
     }
     if (refuseNewlyWrittenRiskyEnvVars(res, null, normalizedConfig.runtimeConfig.envVars)) return;
+    const reservedCreateField = findReservedAgentSecretPrefixInInput({
+      runtimeConfig: normalizedConfig.runtimeConfig,
+      envVars: normalizedConfig.persistedEnvVars,
+    });
+    if (reservedCreateField) {
+      refuse(res, 400, serviceMessageRefusal(
+        "invalid_runtime_config",
+        `${reservedCreateField} uses a reserved internal prefix`,
+        RUNTIME_CONFIG_INVALID_FALLBACK,
+      ));
+      return;
+    }
     if (v2Submitted) {
       const live = await applyRuntimeFormV2LiveModels(req, normalizedConfig, v2SubmittedReasoningEffort, assignedMachine?.id);
       if (live) {
+        // refusal-ok: top-level issues points the runtime form at the field (CreateAgentDialog reads issues[].pointer); refuse() writes no top-level fields
         res.status(400).json(live);
         return;
       }
+    } else {
+      // A tier only the form checks against the Computer (#wg-runtime-form:#27).
+      dropUncheckedServiceTier(normalizedConfig, null);
     }
     if (
       normalizedConfig.runtimeConfig.runtime === "kimi-sdk"
@@ -2033,8 +2077,8 @@ agentRouter.post("/", async (req, res) => {
       return;
     }
     const createAdmissionPolicy = await resolveRuntimeAdmissionPolicy({ userId: req.userId!, serverId: req.serverId! });
-    if (isRuntimeDeprecatedForServer(normalizedConfig.launch.runtime, createAdmissionPolicy)) {
-      res.status(400).json({ error: deprecatedRuntimeSelectionError(normalizedConfig.launch.runtime) });
+    if (isRuntimeDeprecated(normalizedConfig.launch.runtime)) {
+      refuse(res, 400, { code: "runtime_deprecated", error: deprecatedRuntimeSelectionError(normalizedConfig.launch.runtime) });
       return;
     }
     if (!isRuntimeAdmittedForNewUse(normalizedConfig.launch.runtime, createAdmissionPolicy)) {
@@ -2044,6 +2088,7 @@ agentRouter.post("/", async (req, res) => {
     let agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
     if (normalizedConfig.runtimeConfig.runtime === "kimi-sdk") {
       if (!assignedMachine) {
+        // refusal-ok: top-level issues points the runtime form at the field (CreateAgentDialog reads issues[].pointer); refuse() writes no top-level fields
         res.status(409).json({
           error: "Kimi model validation requires an assigned computer",
           issues: [{ code: "runtime_model_source_unavailable", pointer: "/machineId" }],
@@ -2075,6 +2120,7 @@ agentRouter.post("/", async (req, res) => {
       // the failure at runtime. ⛔ Do not re-narrow this without asking him.
       if (detected && detected.kind !== "live") {
         if (normalizedConfig.launch.reasoningEffort !== null || detected.kind === "unsupported") {
+          // refusal-ok: top-level issues points the runtime form at the field (CreateAgentDialog reads issues[].pointer); refuse() writes no top-level fields
           res.status(409).json({
             error: "Kimi model source is unavailable",
             issues: [{ code: `runtime_model_source_${detected.kind}`, pointer: "/runtimeConfig/model" }],
@@ -2106,6 +2152,7 @@ agentRouter.post("/", async (req, res) => {
           })
         : [];
       if (selectionIssues.length > 0) {
+        // refusal-ok: top-level issues points the runtime form at the field (CreateAgentDialog reads issues[].pointer); refuse() writes no top-level fields
         res.status(400).json({ error: "Kimi runtime selection is invalid", issues: selectionIssues });
         return;
       }
@@ -2121,30 +2168,10 @@ agentRouter.post("/", async (req, res) => {
       return;
     }
 
-    let providerConnection = null;
-    if (
-      normalizedConfig.runtimeConfig.runtime === "builtin"
-      && normalizedConfig.runtimeConfig.provider.kind === "connection"
-    ) {
-      if (!await isProviderConnectionsEnabled(req.serverId!)) {
-        sendProviderConnectionsDisabled(res);
-        return;
-      }
-      if (!await mayBindProviderConnection(req, res, normalizedConfig.runtimeConfig.provider.connectionId, null)) return;
-      providerConnection = await resolveProviderConnectionSelection(
-        req.serverId!,
-        normalizedConfig.runtimeConfig.provider.connectionId,
-      );
-    }
-    if (providerConnection && normalizedConfig.runtimeConfig.runtime === "builtin") {
-      assertProviderConnectionModelCompatible(providerConnection.providerId, normalizedConfig.runtimeConfig.model);
-    }
-
     let releaseCatalogAuthority: () => void = () => undefined;
-    if (
-      isBuiltInCatalogCheckedSelection(normalizedConfig.runtimeConfig, providerConnection?.providerId ?? null)
-    ) {
+    if (isBuiltInCatalogCheckedSelection(normalizedConfig.runtimeConfig)) {
       if (!assignedMachine) {
+        // refusal-ok: top-level recovery (select_computer) names the way out, like the edit route's same refusal; refuse() writes no top-level fields
         res.status(409).json({
           error:
             "A target Computer is required to validate this Built-in model",
@@ -2169,7 +2196,6 @@ agentRouter.post("/", async (req, res) => {
           agentOrchestrator,
           assignedMachine.id,
           normalizedConfig.runtimeConfig,
-          providerConnection?.providerId ?? null,
         );
       if (validation) {
         releaseCatalogAuthority =
@@ -2195,7 +2221,7 @@ agentRouter.post("/", async (req, res) => {
           machineId: assignedMachine?.id ?? null,
         });
         const [converted] = await getDb().select().from(agents).where(eq(agents.id, convertHostedCindyId));
-        agent = converted!;
+        agent = openAgentRowSecretsIsolated(converted!);
       } else agent = await agentService.createAgent(req.serverId!, createName.trim(), {
         description: createDescription,
         model: normalizedConfig.launch.model,
@@ -2219,12 +2245,6 @@ agentRouter.post("/", async (req, res) => {
         expectedSetupStatus,
         actionCardMessageId: typeof actionCardMessageId === "string" ? actionCardMessageId : undefined,
         actionCardConfirmationVersion: typeof actionCardConfirmationVersion === "number" ? actionCardConfirmationVersion : undefined,
-        ...(providerConnection ? {
-          providerConnection: {
-            ...providerConnection,
-            updatedByUserId: req.userId!,
-          },
-        } : {}),
       });
     } finally {
       releaseCatalogAuthority();
@@ -2246,8 +2266,8 @@ agentRouter.post("/", async (req, res) => {
     if (agent.machineId) {
       try {
         await agentOrchestrator.startAgent(agent.id);
-      } catch (startErr: any) {
-        console.warn(`[Agent ${agent.id}] Auto-start failed: ${startErr.message}`);
+      } catch (startErr: unknown) {
+        console.warn(`[Agent ${agent.id}] Auto-start failed:`, serializeErrorForLog(startErr));
       }
     }
 
@@ -2256,8 +2276,7 @@ agentRouter.post("/", async (req, res) => {
       void onboardingService
         .triggerOwnerOnboardingOnAgentActivation(io, agentOrchestrator, req.serverId!, agent.id)
         .catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.warn(`[Onboarding] Failed to trigger owner onboarding for agent ${agent.id}: ${msg}`);
+          console.warn(`[Onboarding] Failed to trigger owner onboarding for agent ${agent.id}:`, serializeErrorForLog(err));
         });
     }
 
@@ -2269,21 +2288,25 @@ agentRouter.post("/", async (req, res) => {
         try {
           await onboardingService.triggerAllChannelUnlockOnboarding(io, agentOrchestrator, req.serverId!);
         } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.warn(`[Onboarding] Failed to trigger #all unlock for server ${req.serverId}: ${msg}`);
+          console.warn(`[Onboarding] Failed to trigger #all unlock for server ${req.serverId}:`, serializeErrorForLog(err));
         }
         try {
           await onboardingService.triggerNewAgentAllChannelGreeting(io, agentOrchestrator, req.serverId!, agent.id);
         } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.warn(`[Onboarding] Failed to trigger #all greeting for agent ${agent.id}: ${msg}`);
+          console.warn(`[Onboarding] Failed to trigger #all greeting for agent ${agent.id}:`, serializeErrorForLog(err));
         }
       })();
     }
 
     const oaServerRole = isCindyOnboardingAgent ? "admin" : "member";
-    // Notify all clients in this server
-    const result = await agentService.enrichAgentWithCreatorProfile(withServerRoleProjection(withAgentProjection(agent), oaServerRole));
+    // Notify all clients in this server. #wg-rbac:#57: as a member reads it;
+    // a converted hosted Cindy keeps her stored runtime error (a failed start
+    // included), whose text is for her managers only, and this goes to every
+    // member's room. A new agent has none.
+    const result = withRuntimeErrorProjection(
+      await agentService.enrichAgentWithCreatorProfile(withServerRoleProjection(withAgentProjection(agent), oaServerRole)),
+      "member",
+    );
 
     broadcastAgentCreated(io, result);
 
@@ -2292,23 +2315,22 @@ agentRouter.post("/", async (req, res) => {
     const msg = err?.message || "";
     if (err instanceof ServerMembershipRevokedError) {
       // Task #93 line G: the creator's removal committed after the request-level check; nothing was created.
-      res.status(403).json({ error: err.message });
+      refuse(res, 403, { code: err.code, error: err.message });
     } else if (err instanceof FencedAuthorizationDeniedError) {
       // Task #93 line G: the creator lost `createAgents` (demotion) before the create committed; nothing was created.
-      res.status(403).json({ error: "The `createAgents` capability is required to create agents" });
+      refuse(res, 403, AGENT_CREATE_FORBIDDEN_REFUSAL);
     } else if (
       err instanceof BuiltInModelCatalogError ||
       err instanceof MachineCatalogStaleError
     ) {
       sendBuiltInCatalogError(res, err);
     } else if (err instanceof agentService.ServerSetupChangedRetryError) {
+      // refusal-ok: `error` is the code itself (SERVER_SETUP_CHANGED_RETRY), not a sentence, which refuse() refuses; it moves with a sentence change
       res.status(409).json({ error: err.code });
     } else if (err instanceof MachineKeyRevokedError) {
       sendMachineKeyRevoked(res);
     } else if (err instanceof AssistantCannotUseComputerError) {
       sendAssistantCannotUseComputer(res);
-    } else if (err instanceof ProviderConnectionError) {
-      res.status(err.code === "provider_connection_invalid" ? 400 : 409).json({ error: err.message, code: err.code });
     } else if (err instanceof AgentRuntimeProviderError) {
       sendAgentRuntimeProviderError(res, err);
     } else if (err instanceof HostedCindyConversionError) {
@@ -2316,20 +2338,22 @@ agentRouter.post("/", async (req, res) => {
       res.status(503).json({ error: err.message, code: "hosted_cindy_delete_unconfirmed" });
     } else if (err instanceof AssistantReservedHandleError) {
       // Refused by the name alone, whether or not such an assistant exists.
-      res.status(400).json({ error: msg, code: err.code });
+      refuse(res, 400, { code: err.code, error: msg });
     } else if (isActionCardConversionError(err)) {
       // The source action card is frozen by a channel conversion or needs
       // reconfirmation: an expected 409 the dialog shows, not a server fault.
       res.status(err.status).json({ error: err.message, code: err.code });
     } else if (isPrincipalHandleConflictError(err) || msg.includes("already taken")) {
-      res.status(409).json({ error: msg });
+      refuse(res, 409, serviceMessageRefusal("agent_name_taken", msg, "That agent name is already taken: choose another name."));
     } else if (err instanceof CapacityLimitError) {
       notePaywallHit(req, "seat_limit_agent_create");
       // The code and the numbers, so the client can offer to add seats (or ask the owner).
+      // refusal-ok: top-level capacityLimit carries the seat numbers CreateAgentDialog opens Add seats with; refuse() writes no top-level fields
       res.status(400).json({ error: msg, code: err.code, capacityLimit: err.detail });
     } else if (msg.includes("limit reached")) {
       notePaywallHit(req, "seat_limit_agent_create");
-      res.status(400).json({ error: msg });
+      // The fallback keeps "limit reached": the web's isCapacityLimitError matches that phrase.
+      refuse(res, 400, serviceMessageRefusal("agent_create_limit_reached", msg, "Agent limit reached for this server's plan: upgrade the plan to add more."));
     } else {
       // A silent 500 here hid a ReferenceError for a whole release: the response
       // is identical whether the daemon failed or this handler did. traceRouteFailure
@@ -2350,6 +2374,9 @@ agentRouter.post("/", async (req, res) => {
   }
 });
 
+const NOT_ONBOARDING_AGENT_REFUSAL: RefusalInput = { code: "agent_not_onboarding", error: "Agent is not this server's onboarding agent" };
+const AGENT_NAME_TAKEN_ERROR = "Agent name is already taken";
+
 agentRouter.get("/:id/onboarding-identity-adoption", async (req, res) => {
   try {
     const [server, agent] = await Promise.all([
@@ -2357,15 +2384,15 @@ agentRouter.get("/:id/onboarding-identity-adoption", async (req, res) => {
       agentService.getAgent(req.params.id),
     ]);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await currentUserCanActOnAgent(req.serverId!, req.userId!, agent, "editAgents")) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to edit agents" });
+      refuse(res, 403, EDIT_AGENTS_FORBIDDEN_REFUSAL);
       return;
     }
-    if (server?.onboardingAgentId !== agent.id) {
-      res.status(400).json({ error: "Agent is not this server's onboarding agent" });
+    if (server?.officialOnboardingAgentId !== agent.id) {
+      refuse(res, 400, NOT_ONBOARDING_AGENT_REFUSAL);
       return;
     }
 
@@ -2383,20 +2410,20 @@ agentRouter.post("/:id/onboarding-identity-adoption", async (req, res) => {
       agentService.getAgent(req.params.id),
     ]);
     if (!existing || existing.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await currentUserCanActOnAgent(req.serverId!, req.userId!, existing, "editAgents")) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to edit agents" });
+      refuse(res, 403, EDIT_AGENTS_FORBIDDEN_REFUSAL);
       return;
     }
-    if (server?.onboardingAgentId !== existing.id) {
-      res.status(400).json({ error: "Agent is not this server's onboarding agent" });
+    if (server?.officialOnboardingAgentId !== existing.id) {
+      refuse(res, 400, NOT_ONBOARDING_AGENT_REFUSAL);
       return;
     }
     // A personal assistant keeps Ottie's name and avatar.
     if (existing.assistantOwnerUserId) {
-      res.status(403).json({ error: assistantService.ASSISTANT_PROFILE_FIXED_ERROR, code: assistantService.ASSISTANT_PROFILE_FIXED_CODE });
+      refuse(res, 403, { code: assistantService.ASSISTANT_PROFILE_FIXED_CODE, error: assistantService.ASSISTANT_PROFILE_FIXED_ERROR });
       return;
     }
 
@@ -2407,7 +2434,7 @@ agentRouter.post("/:id/onboarding-identity-adoption", async (req, res) => {
         agentService.adoptOfficialOnboardingAgentIdentity(req.serverId!, existing.id, OFFICIAL_ONBOARDING_AGENT_IDENTITY, { executor: tx }))
       : existing;
     if (!updated) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     // Adoption rewrites the name, display name, description and avatar: other open clients must re-read.
@@ -2425,19 +2452,19 @@ agentRouter.post("/:id/onboarding-identity-adoption", async (req, res) => {
     });
   } catch (err: unknown) {
     if (err instanceof ServerMembershipRevokedError) {
-      res.status(403).json({ error: err.message });
+      refuse(res, 403, { code: err.code, error: err.message });
       return;
     }
     if (err instanceof FencedAuthorizationDeniedError) {
       if (err.reason === "not_found") {
-        res.status(404).json({ error: "Agent not found" });
+        refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       } else {
-        res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to edit agents" });
+        refuse(res, 403, EDIT_AGENTS_FORBIDDEN_REFUSAL);
       }
       return;
     }
     if (isPrincipalHandleConflictError(err)) {
-      res.status(409).json({ error: err instanceof Error ? err.message : "Agent name is already taken" });
+      refuse(res, 409, serviceMessageRefusal("agent_name_taken", err instanceof Error ? err.message : AGENT_NAME_TAKEN_ERROR, AGENT_NAME_TAKEN_ERROR));
       return;
     }
     res.status(500).json({ error: "Failed to adopt onboarding identity" });
@@ -2452,7 +2479,7 @@ agentRouter.get("/archived", async (req, res) => {
     // Guests see only agents of channels they are in; the archive list is for members.
     const callerRole = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
     if (!callerRole || callerRole === "guest") {
-      res.status(403).json({ error: "Archived agents are visible to server members only" });
+      refuse(res, 403, { code: "archived_agents_guest_forbidden", error: "Archived agents are visible to server members only" });
       return;
     }
     res.json({ agents: await listArchivedAgents(req.serverId!, req.userId!) });
@@ -2470,7 +2497,7 @@ agentRouter.get("/:id", async (req, res) => {
     // Another person's personal assistant reads as missing, to every role
     // (agentFindableBy), as it does in the list.
     if (!agent || (agent.serverId !== req.serverId && !canViewViaJoint) || !isAgentFindableBy({ userId: req.userId! }, agent)) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     const callerRole = agent.serverId === req.serverId
@@ -2480,7 +2507,7 @@ agentRouter.get("/:id", async (req, res) => {
       callerRole === "guest"
       && !await channelService.canUserSeeAgentThroughLocalChannel(req.serverId!, req.userId!, agent.id)
     ) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     const canManage = agent.serverId === req.serverId
@@ -2501,7 +2528,9 @@ agentRouter.get("/:id", async (req, res) => {
         activity,
         activityDetail,
         raftbenchService,
-      }));
+        // The viewer reads from their own server, never the agent's: callerRole
+        // is null here, and the servers differ either way.
+      }, humanDescriptionViewer(req.serverId!, callerRole)));
       return;
     }
     // As in the list: a fetched profile must not put a removed Bot or an
@@ -2512,7 +2541,7 @@ agentRouter.get("/:id", async (req, res) => {
         ? { inMemberLists: (await agentService.filterAgentIdsInMemberLists([agent.id])).has(agent.id) }
         : {};
     if (callerRole === "guest") {
-      res.json(toGuestChannelAgentProfile({ ...agent, ...memberListing, activity, activityDetail, raftbenchService }));
+      res.json(toGuestChannelAgentProfile({ ...agent, ...memberListing, activity, activityDetail, raftbenchService }, humanDescriptionViewer(req.serverId!, callerRole)));
       return;
     }
     const runtimeProfile = await agentRuntimeProfileService.getAgentRuntimeProfileSummary(agent.id);
@@ -2577,12 +2606,12 @@ agentRouter.get("/:id", async (req, res) => {
 agentRouter.get("/:id/runtime-options", async (req, res) => {
   try {
     if (!await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "viewAgents")) {
-      res.status(403).json({ error: "The `viewAgents` capability is required to inspect runtime options" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `viewAgents` capability is required to inspect runtime options" });
       return;
     }
     const agent = await agentService.getAgent(req.params.id);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     const machine = agent.machineId
@@ -2603,21 +2632,23 @@ agentRouter.get("/:id/runtime-options", async (req, res) => {
   }
 });
 
+const AGENT_NOT_EXTERNAL_REFUSAL: RefusalInput = { code: "agent_not_external", error: "Agent is not external" };
+
 // External setup status is derived from active credential state. It is an
 // identity/setup signal, not runtime liveness for an external process.
 agentRouter.get("/:id/external-status", async (req, res) => {
   try {
     const agent = await agentService.getAgent(req.params.id);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!isExternalAgentRuntime(agent.runtime)) {
-      res.status(400).json({ error: "Agent is not external" });
+      refuse(res, 400, AGENT_NOT_EXTERNAL_REFUSAL);
       return;
     }
     if (!await canInspectAgentPrivateSurfaces(req.serverId!, req.userId!, agent)) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to view external setup status" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `editAgents` capability or human creator authority is required to view external setup status" });
       return;
     }
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
@@ -2689,16 +2720,16 @@ agentRouter.get("/:id/external-diagnostics", async (req, res) => {
   try {
     const agent = await agentService.getAgent(req.params.id);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!isExternalAgentRuntime(agent.runtime)) {
-      res.status(400).json({ error: "Agent is not external", code: "agent_not_external" });
+      refuse(res, 400, AGENT_NOT_EXTERNAL_REFUSAL);
       return;
     }
     const callerRole = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
     if (!roleCanInspectAgentPrivateSurfaces(callerRole, req.userId!, agent)) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to view external agent diagnostics" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `editAgents` capability or human creator authority is required to view external agent diagnostics" });
       return;
     }
     const diagnostics = await getExternalAgentDiagnostics({
@@ -2727,6 +2758,7 @@ async function findContextViewableAgent(req: Request) {
   return await canViewAgentContext(req.serverId!, req.userId!, agent) ? agent : null;
 }
 
+// refusal-ok: byte-identical to the relay's own refusal (AGENT_CONTEXT_VIEW_NOT_FOUND, agentContextViewRelay.ts), so every View Context reason (flag off, missing, other server, not allowed) gets one codeless 404; they move to AGENT_NOT_FOUND_REFUSAL together
 const contextViewNotFound = (res: Response) => res.status(404).json(AGENT_CONTEXT_VIEW_NOT_FOUND);
 
 // Whether the context behind the agent's messages can be opened now, and why not.
@@ -2953,22 +2985,25 @@ agentRouter.get("/:id/voice-questions", async (req, res) => {
   }
 });
 
+const HOSTED_RUNTIME_MISSING_REFUSAL: RefusalInput = { code: "hosted_runtime_missing", error: "Agent is not a cloud agent" };
+const HOSTED_RUNTIME_MODEL_INVALID_REFUSAL: RefusalInput = { code: "hosted_runtime_model_invalid", error: "`model` must be a model id or null" };
+
 // Hosted runtime provisioning (raft-agent-provider.v1): our record plus, when
 // provisioned, the provider's own view (push status) as a passthrough.
 agentRouter.get("/:id/hosted-runtime", async (req, res) => {
   try {
     const agent = await agentService.getAgent(req.params.id);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canInspectAgentPrivateSurfaces(req.serverId!, req.userId!, agent)) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to view cloud agent status" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `editAgents` capability or human creator authority is required to view cloud agent status" });
       return;
     }
     const hostedRuntime = await getHostedRuntimeSummary(agent.id);
     if (!hostedRuntime) {
-      res.status(404).json({ error: "Agent is not a cloud agent", code: "hosted_runtime_missing" });
+      refuse(res, 404, HOSTED_RUNTIME_MISSING_REFUSAL);
       return;
     }
     if (await isAgentRuntimeProviderKillSwitched(hostedRuntime.provider)) {
@@ -2998,16 +3033,16 @@ agentRouter.get("/:id/hosted-runtime/usage", async (req, res) => {
   try {
     const agent = await agentService.getAgent(req.params.id);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canInspectAgentPrivateSurfaces(req.serverId!, req.userId!, agent)) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to view cloud agent usage" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `editAgents` capability or human creator authority is required to view cloud agent usage" });
       return;
     }
     const hostedRuntime = await getHostedRuntimeSummary(agent.id);
     if (!hostedRuntime) {
-      res.status(404).json({ error: "Agent is not a cloud agent", code: "hosted_runtime_missing" });
+      refuse(res, 404, HOSTED_RUNTIME_MISSING_REFUSAL);
       return;
     }
     if (await isAgentRuntimeProviderKillSwitched(hostedRuntime.provider)) {
@@ -3016,7 +3051,7 @@ agentRouter.get("/:id/hosted-runtime/usage", async (req, res) => {
     }
     const query = parseHostedUsageQuery(req.query, new Date());
     if (!query.ok) {
-      res.status(400).json({ error: query.error, code: "hosted_runtime_usage_invalid_query" });
+      refuse(res, 400, { code: "hosted_runtime_usage_invalid_query", error: query.error });
       return;
     }
     const result = await fetchHostedAgentUsage(agent.id, { from: query.from, to: query.to, bucket: query.bucket });
@@ -3097,19 +3132,19 @@ async function hostedModelAgentGuard(
 ): Promise<{ id: string } | null> {
   const agent = await agentService.getAgent(String(req.params.id));
   if (!agent || agent.serverId !== req.serverId) {
-    res.status(404).json({ error: "Agent not found" });
+    refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
     return null;
   }
   const allowed = action === "view"
     ? await canInspectAgentPrivateSurfaces(req.serverId!, req.userId!, agent)
     : await currentUserCanActOnAgent(req.serverId!, req.userId!, agent, "editAgents");
   if (!allowed) {
-    res.status(403).json({ error: `The \`editAgents\` capability or human creator authority is required to ${action} a cloud agent's model` });
+    refuse(res, 403, { code: "insufficient_role", error: `The \`editAgents\` capability or human creator authority is required to ${action} a cloud agent's model` });
     return null;
   }
   const hostedRuntime = await getHostedRuntimeSummary(agent.id);
   if (!hostedRuntime) {
-    res.status(404).json({ error: "Agent is not a cloud agent", code: "hosted_runtime_missing" });
+    refuse(res, 404, HOSTED_RUNTIME_MISSING_REFUSAL);
     return null;
   }
   if (await isAgentRuntimeProviderKillSwitched(hostedRuntime.provider)) {
@@ -3148,7 +3183,7 @@ agentRouter.put("/:id/hosted-runtime/model", async (req, res) => {
     if (!agent) return;
     const raw = (req.body as { model?: unknown } | undefined)?.model;
     if (!(raw === null || (typeof raw === "string" && raw.trim().length > 0 && raw.length <= 200))) {
-      res.status(400).json({ error: "`model` must be a model id or null", code: "hosted_runtime_model_invalid" });
+      refuse(res, 400, HOSTED_RUNTIME_MODEL_INVALID_REFUSAL);
       return;
     }
     // Where the server may not pick, only Raft's model (or the default) is accepted.
@@ -3157,7 +3192,7 @@ agentRouter.put("/:id/hosted-runtime/model", async (req, res) => {
         route_action: "hosted_runtime_model_change", outcome: "error",
         reason: "picker_disabled", http_status: 403, response_code: "model_picker_disabled",
       });
-      res.status(403).json({ error: "This server does not pick a cloud agent model", code: "model_picker_disabled" });
+      refuse(res, 403, { code: "model_picker_disabled", error: "This server does not pick a cloud agent model" });
       return;
     }
     // Without the picker, "DeepSeek Flash" means "what we decide": follow the provider's default.
@@ -3195,17 +3230,17 @@ agentRouter.post("/:id/lounge", async (req, res) => {
   try {
     const flag = await evaluateFeatureFlag({ key: AGENT_LOUNGE_FEATURE_FLAG_KEY, serverId: req.serverId!, userId: req.userId! });
     if (!flag.enabled) {
-      res.status(404).json({ error: "Not found" });
+      refuse(res, 404, { code: "not_found", error: "Not found" });
       return;
     }
     const role = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
     if (role === null || role === "guest") {
-      res.status(403).json({ error: "Guests can't open an agent's lounge", code: "agent_lounge_guest" });
+      refuse(res, 403, { code: "agent_lounge_guest", error: "Guests can't open an agent's lounge" });
       return;
     }
     const agent = await agentService.getAgent(req.params.id);
     if (!agent || agent.serverId !== req.serverId || agent.assistantOwnerUserId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     const { channel, created } = await openOrCreateAgentLounge(req.serverId!, agent.id);
@@ -3218,22 +3253,27 @@ agentRouter.post("/:id/lounge", async (req, res) => {
     });
   } catch (err) {
     if (err instanceof AgentLoungeAgentNotFoundError) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     res.status(500).json({ error: "Failed to open agent lounge" });
   }
 });
 
+const RETRY_PROVISIONING_FORBIDDEN_REFUSAL: RefusalInput = {
+  code: "insufficient_role",
+  error: "The `editAgents` capability or human creator authority is required to retry provisioning",
+};
+
 agentRouter.post("/:id/hosted-runtime/retry", async (req, res) => {
   try {
     const agent = await agentService.getAgent(req.params.id);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await currentUserCanActOnAgent(req.serverId!, req.userId!, agent, "editAgents")) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to retry provisioning" });
+      refuse(res, 403, RETRY_PROVISIONING_FORBIDDEN_REFUSAL);
       return;
     }
     const existingHostedRuntime = await getHostedRuntimeSummary(agent.id);
@@ -3247,7 +3287,7 @@ agentRouter.post("/:id/hosted-runtime/retry", async (req, res) => {
     if (rawModel !== undefined) {
       model = parseHostedModelChoice(rawModel);
       if (model === undefined) {
-        res.status(400).json({ error: "`model` must be a model id or null", code: "hosted_runtime_model_invalid" });
+        refuse(res, 400, HOSTED_RUNTIME_MODEL_INVALID_REFUSAL);
         return;
       }
       if (existingHostedRuntime?.retryNeedsModel) {
@@ -3258,17 +3298,17 @@ agentRouter.post("/:id/hosted-runtime/retry", async (req, res) => {
     const outcome = await withFencedAgentAuthority(req.serverId!, req.userId!, agent.id, "editAgents", (tx) =>
       retryAgentProvisioning(tx, agent.id, { model }));
     if (outcome === "not_found") {
-      res.status(404).json({ error: "Agent is not a cloud agent", code: "hosted_runtime_missing" });
+      refuse(res, 404, HOSTED_RUNTIME_MISSING_REFUSAL);
       return;
     }
     if (outcome === "nothing_to_retry") {
-      res.status(409).json({ error: "Nothing to retry", code: "hosted_runtime_nothing_to_retry" });
+      refuse(res, 409, { code: "hosted_runtime_nothing_to_retry", error: "Nothing to retry" });
       return;
     }
     if (outcome === "model_required") {
-      res.status(409).json({
-        error: "The provider refused the picked model; retry with `model` set to an offered id, or null for the default",
+      refuse(res, 409, {
         code: "hosted_runtime_model_required",
+        error: "The provider refused the picked model; retry with `model` set to an offered id, or null for the default",
       });
       return;
     }
@@ -3276,12 +3316,12 @@ agentRouter.post("/:id/hosted-runtime/retry", async (req, res) => {
     res.json({ hostedRuntime: await getHostedRuntimeSummary(agent.id) });
   } catch (err) {
     if (err instanceof ServerMembershipRevokedError) {
-      res.status(403).json({ error: err.message });
+      refuse(res, 403, { code: err.code, error: err.message });
       return;
     }
     if (err instanceof FencedAuthorizationDeniedError) {
-      if (err.reason === "not_found") res.status(404).json({ error: "Agent not found" });
-      else res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to retry provisioning" });
+      if (err.reason === "not_found") refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
+      else refuse(res, 403, RETRY_PROVISIONING_FORBIDDEN_REFUSAL);
       return;
     }
     res.status(500).json({ error: "Failed to retry provisioning" });
@@ -3323,7 +3363,7 @@ async function loadAgentForConnection(req: Request, res: Response): Promise<{ ag
   }
   const agent = await agentService.getAgent(String(req.params.id));
   if (!agent || agent.serverId !== req.serverId) {
-    res.status(404).json({ error: "Agent not found" });
+    refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
     return null;
   }
   const callerRole = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
@@ -3774,17 +3814,22 @@ agentRouter.delete("/:id/connections/:provider", async (req, res) => {
  * list as the page had before it.
  */
 const AGENT_ACTIVITY_LOG_MAX_LIMIT = 500;
+// The activity log's and the activity overview's 403: one body.
+const VIEW_AGENT_ACTIVITY_FORBIDDEN_REFUSAL: RefusalInput = {
+  code: "insufficient_role",
+  error: "The `editAgents` capability or human creator authority is required to view agent activity",
+};
 
 agentRouter.get("/:id/activity-log", async (req, res) => {
   try {
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
     const agent = await agentService.getAgent(req.params.id, true);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canInspectAgentPrivateSurfaces(req.serverId!, req.userId!, agent)) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to view agent activity" });
+      refuse(res, 403, VIEW_AGENT_ACTIVITY_FORBIDDEN_REFUSAL);
       return;
     }
 
@@ -3865,11 +3910,11 @@ agentRouter.get("/:id/activity-summaries", async (req, res) => {
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
     const agent = await agentService.getAgent(req.params.id, true);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canInspectAgentPrivateSurfaces(req.serverId!, req.userId!, agent)) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to view agent activity" });
+      refuse(res, 403, VIEW_AGENT_ACTIVITY_FORBIDDEN_REFUSAL);
       return;
     }
     const rawLimit = Number(req.query.limit);
@@ -3946,11 +3991,11 @@ agentRouter.get("/:id/agent-dms", async (req, res) => {
   try {
     const agent = await agentService.getAgent(req.params.id, true);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canInspectAgentPrivateSurfaces(req.serverId!, req.userId!, agent)) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to view agent DMs" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `editAgents` capability or human creator authority is required to view agent DMs" });
       return;
     }
 
@@ -3965,11 +4010,11 @@ agentRouter.get("/:id/channels", async (req, res) => {
   try {
     const agent = await agentService.getAgent(req.params.id, true);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canInspectAgentPrivateSurfaces(req.serverId!, req.userId!, agent)) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to view agent channels" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `editAgents` capability or human creator authority is required to view agent channels" });
       return;
     }
 
@@ -3987,25 +4032,20 @@ agentRouter.get("/:id/runtime-form", async (req, res) => {
   try {
     const existing = await agentService.getAgent(req.params.id);
     if (!existing || existing.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await currentUserCanActOnAgent(req.serverId!, req.userId!, existing, "editAgents")) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to edit agents" });
+      refuse(res, 403, EDIT_AGENTS_FORBIDDEN_REFUSAL);
       return;
     }
     // The hydrated config, as the agent read, launch and the PATCH's `existing`
     // see it: older rows keep a Claude custom provider only in the envVars
     // launch mirrors, and the raw column would show it with a blank URL that
     // the save then cannot match.
-    // Per-server build: a builtin edit on a server with provider connections
-    // carries the saved-connection capability, x-connectionOwned markers and the
-    // revision token (services/runtimeFormV2Registry).
     const clientCapabilities = parseRuntimeFormV2ClientCapabilities(req.query[RUNTIME_FORM_V2_CLIENT_CAPABILITIES_QUERY]);
     const hydrated = hydrateRuntimeConfig(existing);
-    const connectionProviderId = await storedConnectionProviderId(req.serverId!, hydrated);
-    let body = await buildRuntimeFormV2EditBodyForServer(existing.runtime, hydrated, req.serverId!, clientCapabilities, { connectionProviderId });
-    let typedConnectionProviderIds: readonly string[] = [];
+    let body = buildRuntimeFormV2EditBody(existing.runtime, hydrated);
     if (body && existing.runtime === "builtin") {
       // task #10: the same client + Computer gate as the create form, plus
       // the agent's own stored limits / typed model (withBuiltInEditVisibility).
@@ -4013,15 +4053,28 @@ agentRouter.get("/:id/runtime-form", async (req, res) => {
       const typed = await builtInTypedModelProvidersFor({
         req,
         res,
-        serverId: req.serverId!,
         machine: machine && machine.serverId === req.serverId ? machine : null,
         clientCapabilities,
       });
       if (typed === "handled") return;
-      body = withBuiltInEditVisibility(body, typed.presets, clientCapabilities, hydrated, connectionProviderId);
-      typedConnectionProviderIds = withStoredLimitProvider(typed, hydrated, connectionProviderId).connections;
+      body = withBuiltInEditVisibility(body, typed.presets, clientCapabilities, hydrated);
+    }
+    if (body && existing.runtime === "codex") {
+      if (isRuntimeFormV3Request(clientCapabilities)) {
+        const machine = existing.machineId ? await machineService.getMachine(asMachineId(existing.machineId)) : null;
+        const models = await codexSpeedModelsFor({
+          req,
+          res,
+          machine: machine && machine.serverId === req.serverId ? machine : null,
+        });
+        if (models === "handled") return;
+        body = withCodexSpeedVisibility(body, models);
+      } else {
+        body = withCodexSpeedVisibility(body, []);
+      }
     }
     if (!body) {
+      // refusal-ok: top-level issues carries the reason (no_runtime_form at /runtimeConfig), the runtime form protocol's issue shape; refuse() writes no top-level fields
       res.status(404).json({
         error: "This agent's runtime configuration has no editable runtime form",
         issues: [{ code: "no_runtime_form", pointer: "/runtimeConfig" }],
@@ -4032,10 +4085,7 @@ agentRouter.get("/:id/runtime-form", async (req, res) => {
     if (isRuntimeFormV3Request(clientCapabilities)) {
       body = await serveRuntimeFormV3(body, {
         runtimeId: existing.runtime,
-        serverId: req.serverId!,
         clientCapabilities,
-        typedConnectionProviderIds,
-        connectionsVisible: await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "manageExternalAuth"),
       });
     }
     const locale = runtimeFormCopyLocale(req.get("accept-language"));
@@ -4046,23 +4096,29 @@ agentRouter.get("/:id/runtime-form", async (req, res) => {
   }
 });
 
+// The JSON write's and the upload's refusal of a managed bot's avatar: one body.
+const MANAGED_BOT_AVATAR_FIXED_REFUSAL: RefusalInput = {
+  code: "app_bot_avatar_managed",
+  error: "A managed bot's avatar follows its app's logo and cannot be changed here",
+};
+
 // Update agent profile
 agentRouter.patch("/:id", async (req, res) => {
   try {
     const existing = await agentService.getAgent(req.params.id);
     if (!existing || existing.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await currentUserCanActOnAgent(req.serverId!, req.userId!, existing, "editAgents")) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to edit agents" });
+      refuse(res, 403, EDIT_AGENTS_FORBIDDEN_REFUSAL);
       return;
     }
     const { displayName, description, avatarUrl, model, runtime, reasoningEffort, envVars, restartMode, serverRole: requestedServerRole } = req.body;
     // Same fence as the upload route: a managed bot's avatar follows the app
     // logo; JSON writes must not shadow it either.
     if (avatarUrl !== undefined && existing.managedByAppInstallId) {
-      res.status(403).json({ error: "A managed bot's avatar follows its app's logo and cannot be changed here", code: "app_bot_avatar_managed" });
+      refuse(res, 403, MANAGED_BOT_AVATAR_FIXED_REFUSAL);
       return;
     }
     // A personal assistant is always Ottie (name and avatar); its avatar is reserved for assistants.
@@ -4080,8 +4136,6 @@ agentRouter.patch("/:id", async (req, res) => {
         editing: true,
         // Fields a v2 form does not show keep their stored value.
         existing: hydratedExisting,
-        savedConnectionProviderId: await savedConnectionProviderIdForSubmit(req),
-        storedConnectionProviderId: await storedConnectionProviderId(req.serverId!, hydratedExisting),
       });
       if (v2 === "handled") return;
       if (v2) ({ runtimeConfig, formDefinitionRef } = v2);
@@ -4093,21 +4147,22 @@ agentRouter.patch("/:id", async (req, res) => {
     // submit says what it means: its blank field clears them.
     if (!v2Submitted) runtimeConfig = keepStoredCustomModelLimits(runtimeConfig, existing);
     if (isExternalAgentRuntime(existing.runtime) && isManagedRuntimeFieldTouched(req.body ?? {})) {
-      res.status(400).json({ error: "External agent runtime fields are immutable" });
+      refuse(res, 400, { code: "external_agent_runtime_immutable", error: "External agent runtime fields are immutable" });
       return;
     }
-    if (description !== undefined && description !== null && (typeof description !== "string" || description.length > MAX_AGENT_DESCRIPTION_LENGTH)) {
-      res.status(400).json({ error: `Description must be a string of at most ${MAX_AGENT_DESCRIPTION_LENGTH} characters` });
+    // A description saved under the older, longer limit keeps saving unchanged; a new or changed one has to fit.
+    if (description !== undefined && description !== null && (typeof description !== "string" || profileDescriptionTooLong(description, existing.description))) {
+      refuse(res, 400, { code: "profile_description_invalid", error: `A new or changed description must be a string of at most ${PROFILE_DESCRIPTION_MAX_LENGTH} characters` });
       return;
     }
     if (runtime !== undefined && typeof runtime !== "string") {
-      res.status(400).json({ error: "Runtime must be a string" });
+      refuse(res, 400, { code: "invalid_runtime", error: "Runtime must be a string" });
       return;
     }
     if (runtime !== undefined) {
       const validRuntimeIds = new Set(RUNTIMES.filter((r) => r.supported).map((r) => r.id));
       if (!validRuntimeIds.has(runtime)) {
-        res.status(400).json({ error: `Invalid runtime: ${runtime}` });
+        refuse(res, 400, { code: "invalid_runtime", error: sentenceQuoting([runtime], `Invalid runtime: ${runtime}`, "Invalid runtime: choose one this server supports") });
         return;
       }
     }
@@ -4116,33 +4171,33 @@ agentRouter.patch("/:id", async (req, res) => {
       const validEffortIds = new Set<string>(REASONING_EFFORTS.map((r) => r.id));
       const targetRuntime = runtime ?? existing.runtime;
       if (targetRuntime !== "kimi-sdk" && !validEffortIds.has(reasoningEffort)) {
-        res.status(400).json({ error: `Invalid reasoning effort: ${reasoningEffort}` });
+        refuse(res, 400, { code: "invalid_reasoning_effort", error: sentenceQuoting([String(reasoningEffort)], `Invalid reasoning effort: ${reasoningEffort}`, "Invalid reasoning effort: choose one the runtime offers") });
         return;
       }
     }
     if (restartMode !== undefined && restartMode !== "restart" && restartMode !== "session") {
-      res.status(400).json({ error: `Invalid restart mode: ${restartMode}` });
+      refuse(res, 400, { code: "invalid_restart_mode", error: sentenceQuoting([String(restartMode)], `Invalid restart mode: ${restartMode}`, "Invalid restart mode: use restart or session") });
       return;
     }
     let nextServerRole: ManageableAgentServerRole | undefined;
     if (requestedServerRole !== undefined) {
       if (requestedServerRole !== "admin" && requestedServerRole !== "member") {
-        res.status(400).json({ error: "Role must be admin or member" });
+        refuse(res, 400, { code: "agent_server_role_invalid", error: "Role must be admin or member" });
         return;
       }
       nextServerRole = requestedServerRole;
       const callerRole = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
       if (!actorRoleHasServerCapability(callerRole, "changeMemberRoles")) {
-        res.status(403).json({ error: "The `changeMemberRoles` capability is required to change agent roles" });
+        refuse(res, 403, { code: "insufficient_role", error: "The `changeMemberRoles` capability is required to change agent roles" });
         return;
       }
       const targetRole = await getActorServerRoleInServer(req.serverId!, "agent", existing.id);
       if (!targetRole) {
-        res.status(404).json({ error: "Agent server membership not found" });
+        refuse(res, 404, { code: "agent_not_in_server", error: "Agent server membership not found" });
         return;
       }
       if (!actorCanChangeAgentServerMemberRole(callerRole, targetRole, requestedServerRole)) {
-        res.status(403).json({ error: "You are not allowed to make that role change" });
+        refuse(res, 403, { code: "insufficient_role", error: "You are not allowed to make that role change" });
         return;
       }
     }
@@ -4153,7 +4208,7 @@ agentRouter.patch("/:id", async (req, res) => {
       const cdnBase = cdnPublicBaseUrl();
       const isCdnUrl = cdnBase !== null && avatarUrl.startsWith(cdnBase);
       if (!isPixel && !isRelativeAvatar && !isCdnUrl) {
-        res.status(400).json({ error: "Invalid avatar URL" });
+        refuse(res, 400, { code: "agent_avatar_url_invalid", error: "Invalid avatar URL" });
         return;
       }
     }
@@ -4164,7 +4219,7 @@ agentRouter.patch("/:id", async (req, res) => {
     if (envVars !== undefined && envVars !== null) {
       const result = parseEnvVars(envVars);
       if (!result.ok) {
-        res.status(400).json({ error: result.reason });
+        refuse(res, 400, serviceMessageRefusal("invalid_env_vars", result.reason, ENV_VARS_INVALID_FALLBACK));
         return;
       }
       parsedUpdateEnvVars = result.value;
@@ -4214,10 +4269,12 @@ agentRouter.patch("/:id", async (req, res) => {
       // A v2 envelope was already checked against the v2 registry.
       const refIssues = v2Submitted ? [] : validateRuntimeFormDefinitionRef(formDefinitionRef);
       if (refIssues.length > 0) {
+        // refusal-ok: keeps the runtime form protocol's top-level issues (the edit form reads /formValues/ pointers, as CreateAgentDialog does on create); refuse() writes no top-level fields
         res.status(409).json({ error: "Runtime form definition is stale or invalid", issues: refIssues });
         return;
       }
       if ((formDefinitionRef as { runtimeId?: unknown }).runtimeId !== updatedRuntime) {
+        // refusal-ok: keeps the runtime form protocol's top-level issues (the edit form reads /formValues/ pointers, as CreateAgentDialog does on create); refuse() writes no top-level fields
         res.status(400).json({
           error: "Runtime configuration does not match form definition",
           issues: [{ code: "form_runtime_mismatch", pointer: "/runtimeConfig/runtime" }],
@@ -4225,11 +4282,22 @@ agentRouter.patch("/:id", async (req, res) => {
         return;
       }
     }
+    if (runtimeConfigTouched) {
+      const decryptFailure = getAgentSecretDecryptFailure(existing);
+      if (decryptFailure) {
+        throw new AgentSecretDecryptionError(decryptFailure.agentId, decryptFailure.failedFields.join(","));
+      }
+    }
     const normalizedConfig = runtimeConfigTouched
       ? normalizeRequestRuntimeConfig({
           runtimeConfig: requestRuntimeConfig !== undefined
             ? retainOmittedWriteOnlySecrets(
-                v2Submitted ? requestRuntimeConfig : retainOmittedClaudeAuthType(requestRuntimeConfig, existingRuntimeConfig),
+                v2Submitted
+                  ? requestRuntimeConfig
+                  : retainLegacyBlankWriteOnlySecrets(
+                      retainOmittedClaudeAuthType(requestRuntimeConfig, existingRuntimeConfig),
+                      existingRuntimeConfig,
+                    ),
                 existingRuntimeConfig,
               )
             : existing.runtimeConfig,
@@ -4242,23 +4310,40 @@ agentRouter.patch("/:id", async (req, res) => {
         })
       : null;
     if (normalizedConfig?.error || (normalizedConfig && (!normalizedConfig.launch || !normalizedConfig.runtimeConfig))) {
-      res.status(400).json({ error: normalizedConfig.error });
+      refuse(res, 400, serviceMessageRefusal("invalid_runtime_config", normalizedConfig.error ?? "", RUNTIME_CONFIG_INVALID_FALLBACK));
       return;
     }
     if (normalizedConfig?.runtimeConfig && refuseNewlyWrittenRiskyEnvVars(res, existingRuntimeConfig.envVars, normalizedConfig.runtimeConfig.envVars)) return;
+    const reservedPatchField = normalizedConfig
+      ? findReservedAgentSecretPrefixInInput({
+          runtimeConfig: normalizedConfig.runtimeConfig,
+          envVars: normalizedConfig.persistedEnvVars,
+        })
+      : null;
+    if (reservedPatchField) {
+      refuse(res, 400, serviceMessageRefusal(
+        "invalid_runtime_config",
+        `${reservedPatchField} uses a reserved internal prefix`,
+        RUNTIME_CONFIG_INVALID_FALLBACK,
+      ));
+      return;
+    }
     if (v2Submitted && normalizedConfig) {
       const live = await applyRuntimeFormV2LiveModels(req, normalizedConfig, v2SubmittedReasoningEffort, existing.machineId, existingRuntimeConfig);
       if (live) {
+        // refusal-ok: keeps the runtime form protocol's top-level issues (the edit form reads /formValues/ pointers, as CreateAgentDialog does on create); refuse() writes no top-level fields
         res.status(400).json(live);
         return;
       }
+    } else if (normalizedConfig) {
+      dropUncheckedServiceTier(normalizedConfig, existingRuntimeConfig);
     }
     const normalizedLaunch = normalizedConfig?.launch ?? null;
     const switchAdmissionPolicy = normalizedLaunch && normalizedLaunch.runtime !== existing.runtime
       ? await resolveRuntimeAdmissionPolicy({ userId: req.userId!, serverId: req.serverId! })
       : null;
-    if (normalizedLaunch && switchAdmissionPolicy && isRuntimeDeprecatedForServer(normalizedLaunch.runtime, switchAdmissionPolicy)) {
-      res.status(400).json({ error: deprecatedRuntimeSelectionError(normalizedLaunch.runtime) });
+    if (normalizedLaunch && switchAdmissionPolicy && isRuntimeDeprecated(normalizedLaunch.runtime)) {
+      refuse(res, 400, { code: "runtime_deprecated", error: deprecatedRuntimeSelectionError(normalizedLaunch.runtime) });
       return;
     }
     if (normalizedLaunch && switchAdmissionPolicy && !isRuntimeAdmittedForNewUse(normalizedLaunch.runtime, switchAdmissionPolicy)) {
@@ -4277,6 +4362,7 @@ agentRouter.patch("/:id", async (req, res) => {
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
     if (normalizedConfig?.runtimeConfig?.runtime === "kimi-sdk") {
       if (!existing.machineId) {
+        // refusal-ok: keeps the runtime form protocol's top-level issues (the edit form reads /formValues/ pointers, as CreateAgentDialog does on create); refuse() writes no top-level fields
         res.status(409).json({
           error: "Kimi model validation requires an assigned computer",
           issues: [{ code: "runtime_model_source_unavailable", pointer: "/machineId" }],
@@ -4305,6 +4391,7 @@ agentRouter.patch("/:id", async (req, res) => {
       // the failure at runtime. ⛔ Do not re-narrow this without asking him.
       if (detected && detected.kind !== "live") {
         if (normalizedConfig.launch!.reasoningEffort !== null || detected.kind === "unsupported") {
+          // refusal-ok: keeps the runtime form protocol's top-level issues (the edit form reads /formValues/ pointers, as CreateAgentDialog does on create); refuse() writes no top-level fields
           res.status(409).json({
             error: "Kimi model source is unavailable",
             issues: [{ code: `runtime_model_source_${detected.kind}`, pointer: "/runtimeConfig/model" }],
@@ -4334,6 +4421,7 @@ agentRouter.patch("/:id", async (req, res) => {
           reasoningEffort: normalizedConfig.launch!.reasoningEffort,
         });
         if (selectionIssues.length > 0) {
+          // refusal-ok: keeps the runtime form protocol's top-level issues (the edit form reads /formValues/ pointers, as CreateAgentDialog does on create); refuse() writes no top-level fields
           res.status(400).json({ error: "Kimi runtime selection is invalid", issues: selectionIssues });
           return;
         }
@@ -4341,35 +4429,14 @@ agentRouter.patch("/:id", async (req, res) => {
     }
 
     const normalizedRuntimeConfig = normalizedConfig?.runtimeConfig ?? null;
-    let providerConnection = null;
-    if (
-      normalizedRuntimeConfig?.runtime === "builtin"
-      && normalizedRuntimeConfig.provider.kind === "connection"
-    ) {
-      if (!await isProviderConnectionsEnabled(req.serverId!)) {
-        sendProviderConnectionsDisabled(res);
-        return;
-      }
-      if (!await mayBindProviderConnection(req, res, normalizedRuntimeConfig.provider.connectionId, existingRuntimeConfig)) return;
-      providerConnection = await resolveProviderConnectionSelection(
-        req.serverId!,
-        normalizedRuntimeConfig.provider.connectionId,
-      );
-    }
-    if (providerConnection && normalizedRuntimeConfig?.runtime === "builtin") {
-      assertProviderConnectionModelCompatible(providerConnection.providerId, normalizedRuntimeConfig.model);
-    }
     let releaseCatalogAuthority: () => void = () => undefined;
     if (
       normalizedRuntimeConfig &&
-      isBuiltInCatalogCheckedSelection(normalizedRuntimeConfig, providerConnection?.providerId ?? null) &&
-      builtInPresetSelectionChanged(
-        existingRuntimeConfig,
-        normalizedRuntimeConfig,
-        providerConnection?.providerId ?? null,
-      )
+      isBuiltInCatalogCheckedSelection(normalizedRuntimeConfig) &&
+      builtInPresetSelectionChanged(existingRuntimeConfig, normalizedRuntimeConfig)
     ) {
       if (!existing.machineId) {
+        // refusal-ok: top-level recovery (select_computer) names the way out, like the create route's same refusal; refuse() writes no top-level fields
         res.status(409).json({
           error:
             "A target Computer is required to validate this Built-in model",
@@ -4394,7 +4461,6 @@ agentRouter.patch("/:id", async (req, res) => {
           agentOrchestrator,
           existing.machineId,
           normalizedRuntimeConfig,
-          providerConnection?.providerId ?? null,
         );
       if (validation) {
         releaseCatalogAuthority =
@@ -4405,16 +4471,29 @@ agentRouter.patch("/:id", async (req, res) => {
       }
     }
     const runtimeChanged = normalizedLaunch !== null && normalizedLaunch.runtime !== existing.runtime;
-    // Codex `thread/resume` pins the resumed thread's model (see restartMode
-    // below), so a Codex model switch needs a fresh thread just as a runtime
-    // switch does. The stored session is cleared with or without restartMode:
-    // a stopped agent's next start would otherwise resume the old thread on
-    // the old model.
-    const codexModelChanged =
-      (normalizedLaunch?.runtime ?? existing.runtime) === "codex"
-      && normalizedLaunch !== null
-      && normalizedLaunch.model !== existing.model;
+    // #proj-runtime:#80: Codex always drops its session on model switch
+    // (`thread/resume` pins the model). Other runtimes drop their session on
+    // model switch only when the agent's Computer advertises
+    // `DAEMON_CAPABILITY_CONSTRUCTED_INIT_V1` (so the fresh session gets
+    // constructed initial context); older Computers without that capability
+    // keep resuming so switching models does not drop working context.
+    // Reasoning effort is treated as cache-preserving and keeps resuming.
+    const modelChanged = normalizedLaunch !== null && normalizedLaunch.model !== existing.model;
+    const targetRuntime = normalizedLaunch?.runtime ?? existing.runtime;
+    const machineSupportsConstructedInit = modelChanged
+      && targetRuntime !== "codex"
+      && Boolean(existing.machineId)
+      && typeof agentOrchestrator.machineAdvertisesCapability === "function"
+      ? await agentOrchestrator.machineAdvertisesCapability(existing.machineId!, DAEMON_CAPABILITY_CONSTRUCTED_INIT_V1).catch(() => false)
+      : false;
+    const modelDropsSession = modelChanged && (targetRuntime === "codex" || machineSupportsConstructedInit);
+    const configApplyNewSession = runtimeChanged || modelDropsSession;
     const profileFieldsTouched = displayName !== undefined || description !== undefined || avatarUrl !== undefined;
+    const profileTextChanged = !isExternalAgentRuntime(existing.runtime)
+      && (
+        (displayName !== undefined && displayName !== existing.displayName)
+        || (description !== undefined && description !== existing.description)
+      );
     const updateAgentRow = profileFieldsTouched || runtimeChanged || normalizedConfig !== null;
     const runtimeConfigChanged = normalizedRuntimeConfig !== null
       && JSON.stringify(normalizedRuntimeConfig) !== JSON.stringify(existingRuntimeConfig);
@@ -4473,7 +4552,7 @@ agentRouter.patch("/:id", async (req, res) => {
             displayName,
             description,
             avatarUrl,
-            ...(runtimeChanged || codexModelChanged ? { sessionId: null } : {}),
+            ...(configApplyNewSession ? { sessionId: null } : {}),
             ...(normalizedLaunch && normalizedRuntimeConfig
               ? {
                   model: normalizedLaunch.model,
@@ -4484,9 +4563,6 @@ agentRouter.patch("/:id", async (req, res) => {
                     normalizedLaunch.reasoningEffort,
                   ),
                   envVars: normalizedConfig!.persistedEnvVars,
-                  providerConnection: providerConnection
-                    ? { ...providerConnection, updatedByUserId: req.userId! }
-                    : null,
                 }
               : {}),
           }, { executor: tx, configChange: { source: "agents_route_update", actor: { kind: "user", id: req.userId! } } })
@@ -4494,8 +4570,10 @@ agentRouter.patch("/:id", async (req, res) => {
         if (row && restartMode && runtimeProfileIdentityChanged) {
           await agentRuntimeProfileService.queueRuntimeProfileMigrationForAgentSettings(req.params.id, { executor: tx, afterCommit });
         }
-        // Reconciler step 11b: the config the daemon runs on changed; its revision moves with this write.
-        if (row && runtimeValuesChanged) await bumpAgentConfigRevision(tx, [req.params.id]);
+        // Reconciler step 11b + #proj-runtime:#80: the config (or BYOC
+        // standing-prompt displayName/description) the daemon runs on changed;
+        // its revision moves with this write.
+        if (row && (runtimeValuesChanged || profileTextChanged)) await bumpAgentConfigRevision(tx, [req.params.id]);
         // Hosted runtime: name/instructions edits reach the provider as an ordered PATCH.
         if (row && (displayName !== undefined || description !== undefined)
           && await noteProvisionedAgentProfileEdit(tx, req.params.id)) {
@@ -4508,7 +4586,7 @@ agentRouter.patch("/:id", async (req, res) => {
     }
     for (const effect of afterCommit) effect();
     if (!updated) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     agentOrchestrator.evictCache(req.params.id);
@@ -4524,7 +4602,7 @@ agentRouter.patch("/:id", async (req, res) => {
         actorUserId: req.userId!,
         ...roleChange,
       }).catch((err: unknown) => {
-        console.error("agents: failed to post server role change notice:", err);
+        console.error("agents: failed to post server role change notice:", serializeErrorForLog(err));
       });
     }
     // task #1221: a runtime-config/model change may fix what blocked automatic
@@ -4536,31 +4614,35 @@ agentRouter.patch("/:id", async (req, res) => {
       });
     }
     if (restartMode) {
-      // Runtime switches intentionally reset the native runtime session. So does
-      // a Codex MODEL switch (tygg/Tenny 2026-07-10): Codex `thread/resume` pins
-      // the model of the resumed thread, so a plain restart keeps launching the
-      // old model (root of the 5.5→5.6 switch-not-applying report). Clearing the
-      // session (mode "session" → fresh `thread/start`) makes the new model take
-      // effect 100%. A reasoning-effort-only change stays on the caller-selected
-      // mode (restart is reliable: `thread/resume` + fresh `model_reasoning_effort`
-      // applies per request). Codex-scoped; other runtimes keep the caller mode.
-      // model+effort changing together still resets exactly once (session).
-      // Server enforces this regardless of the client-sent mode — the client
-      // warning is UX, the invariant lives here (source-of-truth, not the caller).
-      const effectiveRestartMode = runtimeChanged || codexModelChanged ? "session" : restartMode;
+      // #proj-runtime:#80: runtime switches, Codex model switches, and model
+      // switches on Computers with `constructed-init:v1` reset to a fresh
+      // session (`mode: "session"`) seeded with constructed initial context.
+      // Older Computers without `constructed-init:v1` and reasoning-effort-only
+      // edits keep the caller-selected mode so working context is preserved.
+      const effectiveRestartMode = configApplyNewSession ? "session" : restartMode;
       await agentOrchestrator.resetAgent(req.params.id, effectiveRestartMode, {
         restartIfStopped: false,
         ...(runtimeValuesChanged ? { terminalControl: "runtime_config_changed" as const } : {}),
       });
     }
-    // Reconciler step 11b: without restartMode a running agent is not
-    // interrupted. Its daemon gets the new config and restarts it once idle
-    // (`when_idle`); a daemon that cannot take it (or an agent that is not
-    // running) keeps today's behaviour: the change is saved and the next
-    // start uses it (`saved`).
-    let configApply: "when_idle" | "restarted" | "saved" = restartMode ? "restarted" : "saved";
-    if (!restartMode && runtimeValuesChanged && await agentOrchestrator.applyAgentConfig(req.params.id) === "pushed") {
-      configApply = "when_idle";
+    // Reconciler step 11b + #proj-runtime:#80: without restartMode a running
+    // agent applies the change automatically — immediately when idle (daemon
+    // spec_restart on capable Computers, server-side restart fallback on older
+    // Computers), or right after the current foreground turn finishes when busy
+    // (`when_idle`). Stopped/offline agents take the saved config on next start.
+    let configApply: "applied" | "when_idle" | "restarted" | "saved" = restartMode ? "restarted" : "saved";
+    if (!restartMode && runtimeValuesChanged) {
+      const effectiveRestartMode = configApplyNewSession ? "session" : "restart";
+      const applyOutcome = await agentOrchestrator.applyAgentConfig(req.params.id, {
+        fallbackRestartMode: effectiveRestartMode,
+        terminalControl: "runtime_config_changed",
+      });
+      if (applyOutcome === "pushed") configApply = "applied";
+      else if (applyOutcome === "pushed_busy" || applyOutcome === "fallback_when_idle") configApply = "when_idle";
+      else if (applyOutcome === "pushed_restarted" || applyOutcome === "fallback_restarted") configApply = "restarted";
+    } else if (!restartMode && profileTextChanged) {
+      const applyOutcome = await agentOrchestrator.applyAgentConfig(req.params.id);
+      if (applyOutcome === "pushed" || applyOutcome === "pushed_busy") configApply = "applied";
     }
     const runtimeProfile = await agentRuntimeProfileService.getAgentRuntimeProfileSummary(req.params.id);
     const refreshed = await agentService.getAgent(req.params.id) ?? updated;
@@ -4576,6 +4658,13 @@ agentRouter.patch("/:id", async (req, res) => {
       addTraceEvent("agent.model_limits.failed", { error_class: errorClassOf(error) });
       return null;
     });
+    // #457: links in a new description some of its readers can't open (the save stands).
+    const warnings = description === undefined ? [] : await changedDescriptionLinkWarnings({
+      before: existing.description,
+      after: refreshed.description,
+      owner: { type: "agent", id: refreshed.id, serverId: refreshed.serverId },
+      writer: { type: "user", id: req.userId!, serverId: req.serverId! },
+    });
     res.json({
       ...await agentService.enrichAgentWithCreatorProfile({
         ...withServerRoleProjection(withAgentProjection(refreshed), projectedServerRole),
@@ -4584,17 +4673,19 @@ agentRouter.patch("/:id", async (req, res) => {
         modelLimits,
       }),
       configApply,
+      configApplyNewSession,
+      ...(warnings.length > 0 ? { warnings } : {}),
     });
   } catch (error) {
     if (error instanceof ServerMembershipRevokedError) {
-      res.status(403).json({ error: error.message });
+      refuse(res, 403, { code: error.code, error: error.message });
       return;
     }
     if (error instanceof FencedAuthorizationDeniedError) {
       if (error.reason === "not_found") {
-        res.status(404).json({ error: "Agent not found" });
+        refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       } else {
-        res.status(403).json({ error: "Not authorized to update this agent" });
+        refuse(res, 403, { code: "insufficient_role", error: "Not authorized to update this agent" });
       }
       return;
     }
@@ -4602,10 +4693,6 @@ agentRouter.patch("/:id", async (req, res) => {
       error instanceof MachineCatalogStaleError
     ) {
       sendBuiltInCatalogError(res, error);
-      return;
-    }
-    if (error instanceof ProviderConnectionError) {
-      res.status(error.code === "provider_connection_invalid" ? 400 : 409).json({ error: error.message, code: error.code });
       return;
     }
     traceRouteFailure("agent.update.failed", error, {
@@ -4631,28 +4718,28 @@ agentRouter.post("/:id/avatar", async (req, res) => {
     const agentId = req.params.id as string;
     const agent = await agentService.getAgent(agentId);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await currentUserCanActOnAgent(req.serverId!, req.userId!, agent, "editAgents")) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to edit agents" });
+      refuse(res, 403, EDIT_AGENTS_FORBIDDEN_REFUSAL);
       return;
     }
     // A managed bot's avatar IS its app's logo (Slack model): it changes via
     // the app's settings, never through agent profile writes — otherwise an
     // old upload would shadow the logo the identity is supposed to follow.
     if (agent.managedByAppInstallId) {
-      res.status(403).json({ error: "A managed bot's avatar follows its app's logo and cannot be changed here", code: "app_bot_avatar_managed" });
+      refuse(res, 403, MANAGED_BOT_AVATAR_FIXED_REFUSAL);
       return;
     }
     // A personal assistant's avatar is always Ottie's.
     if (agent.assistantOwnerUserId) {
-      res.status(403).json({ error: assistantService.ASSISTANT_PROFILE_FIXED_ERROR, code: assistantService.ASSISTANT_PROFILE_FIXED_CODE });
+      refuse(res, 403, { code: assistantService.ASSISTANT_PROFILE_FIXED_CODE, error: assistantService.ASSISTANT_PROFILE_FIXED_ERROR });
       return;
     }
     const file = await runSingleAvatarUpload(avatarUpload, req);
     if (!file) {
-      res.status(400).json({ error: "No file provided" });
+      refuse(res, 400, { code: "avatar_file_required", error: "No file provided" });
       return;
     }
     const avatarUrl = await storeAgentAvatar(req.serverId!, agent.avatarUrl, file.buffer);
@@ -4667,18 +4754,19 @@ agentRouter.post("/:id/avatar", async (req, res) => {
     res.json(updated);
   } catch (err: any) {
     if (err instanceof ServerMembershipRevokedError) {
-      res.status(403).json({ error: err.message });
+      refuse(res, 403, { code: err.code, error: err.message });
       return;
     }
     if (err instanceof FencedAuthorizationDeniedError) {
       if (err.reason === "not_found") {
-        res.status(404).json({ error: "Agent not found" });
+        refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       } else {
-        res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to edit agents" });
+        refuse(res, 403, EDIT_AGENTS_FORBIDDEN_REFUSAL);
       }
       return;
     }
     if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
+      // refusal-ok: top-level maxBytes states the limit (as the user and server avatar uploads in auth.ts and servers.ts answer it); refuse() writes no top-level fields
       res.status(400).json({
         error: PROFILE_AVATAR_TOO_LARGE_MESSAGE,
         errorCode: "PROFILE_AVATAR_TOO_LARGE",
@@ -4687,10 +4775,7 @@ agentRouter.post("/:id/avatar", async (req, res) => {
       return;
     }
     if (err.message?.includes(PROFILE_AVATAR_BAD_FORMAT_MESSAGE)) {
-      res.status(400).json({
-        error: err.message,
-        errorCode: "PROFILE_AVATAR_BAD_FORMAT",
-      });
+      refuse(res, 400, serviceMessageRefusal("PROFILE_AVATAR_BAD_FORMAT", err.message, PROFILE_AVATAR_BAD_FORMAT_MESSAGE));
       return;
     }
     sendJsonServerError(req, res, {
@@ -4707,7 +4792,7 @@ agentRouter.post("/:id/avatar", async (req, res) => {
 agentAvatarRouter.get("/pixel/:encodedKey.svg", (req, res) => {
   const key = decodePixelAvatarKey(req.params.encodedKey);
   if (!key) {
-    res.status(400).json({ error: "Invalid pixel avatar key" });
+    refuse(res, 400, { code: "pixel_avatar_key_invalid", error: "Invalid pixel avatar key" });
     return;
   }
 
@@ -4735,7 +4820,7 @@ agentAvatarRouter.get("/:namespace/:filename", async (req, res) => {
   try {
     const { namespace, filename } = req.params;
     if (!/^[0-9a-f]+\.webp$/.test(filename)) {
-      res.status(400).json({ error: "Invalid filename" });
+      refuse(res, 400, { code: "avatar_filename_invalid", error: "Invalid filename" });
       return;
     }
     // The namespaces avatarService writes (an agent's server id, `server-<id>`,
@@ -4804,12 +4889,12 @@ agentRouter.get("/:id/migration", async (req, res) => {
         : null,
     });
   } catch (err) {
-    console.error("[agents] migration status error:", err);
+    console.error("[agents] migration status error:", serializeErrorForLog(err));
     sendMigrationError(
       res,
       500,
       "MIGRATION_STATUS_FAILED",
-      err instanceof Error ? err.message : "Failed to get migration status",
+      "Failed to get migration status",
     );
   }
 });
@@ -4931,7 +5016,7 @@ agentRouter.post("/:id/migration/cancel", async (req, res) => {
       sendMigrationError(res, 409, "MIGRATION_NOT_CANCELABLE", "The agent already moved to the cloud; this migration can no longer be canceled");
       return;
     }
-    console.error("[agents] migration cancel error:", err);
+    console.error("[agents] migration cancel error:", serializeErrorForLog(err));
     sendMigrationError(res, 500, "MIGRATION_CANCEL_FAILED", "Failed to request migration cancellation");
   }
 });
@@ -4987,7 +5072,7 @@ agentRouter.post("/:id/migration/confirm-hosted", async (req, res) => {
       sendMigrationError(res, status, code, err.message);
       return;
     }
-    console.error("[agents] hosted migration confirm error:", err);
+    console.error("[agents] hosted migration confirm error:", serializeErrorForLog(err));
     sendMigrationError(res, 500, "MIGRATION_START_FAILED", "Failed to confirm the move to the cloud");
   }
 });
@@ -5119,12 +5204,12 @@ agentRouter.post("/:id/migrate", async (req, res) => {
       }
       return;
     }
-    console.error("[agents] migrate error:", err);
+    console.error("[agents] migrate error:", serializeErrorForLog(err));
     sendMigrationError(
       res,
       500,
       "MIGRATION_START_FAILED",
-      err instanceof Error ? err.message : "Failed to start migration",
+      "Failed to start migration",
     );
   }
 });
@@ -5418,15 +5503,28 @@ function recordOperatorAction(req: Request, agent: { id: string; serverId: strin
   return recordAgentOperatorEvent({ serverId: agent.serverId, agentId: agent.id, kind, actorUserId: req.userId ?? null, details });
 }
 
+/** 403 for a runtime control (start, Stop turn, a sub-agent's stop, restart or session reset) without the authority. */
+const CONTROL_AGENTS_FORBIDDEN_REFUSAL: RefusalInput = {
+  code: "insufficient_role",
+  error: "The `controlAgentRuntime` capability or human creator authority is required to control agents",
+};
+/** 409: the agent has no Computer to start on or read a workspace from. */
+const MACHINE_UNASSIGNED_REFUSAL: RefusalInput = {
+  code: "machine_unassigned",
+  error: "No machine assigned. Please assign a machine to this agent first.",
+};
+/** 409: the agent's Computer didn't take a Stop turn or a sub-agent's stop because it is offline. */
+const COMPUTER_OFFLINE_REFUSAL: RefusalInput = { code: "computer_offline", error: "This agent's computer is offline." };
+
 agentRouter.post("/:id/start", async (req, res) => {
   try {
     const agent = await agentService.getAgent(req.params.id);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await currentUserCanActOnAgent(req.serverId!, req.userId!, agent, "controlAgentRuntime")) {
-      res.status(403).json({ error: "The `controlAgentRuntime` capability or human creator authority is required to control agents" });
+      refuse(res, 403, CONTROL_AGENTS_FORBIDDEN_REFUSAL);
       return;
     }
     // A personal assistant an admin paused: its owner's Start lifts the pause
@@ -5452,7 +5550,7 @@ agentRouter.post("/:id/start", async (req, res) => {
         reason: "machine_unassigned",
         http_status: 409,
       });
-      res.status(409).json({ error: "No machine assigned. Please assign a machine to this agent first.", code: "machine_unassigned" });
+      refuse(res, 409, MACHINE_UNASSIGNED_REFUSAL);
       return;
     }
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
@@ -5482,9 +5580,9 @@ agentRouter.post("/:id/start", async (req, res) => {
       return;
     }
     if (startResult.outcome === "skipped" && startResult.reason === "computer_version_unsupported") {
-      res.status(409).json({
-        error: "This agent's Computer is too old to run agents. Reinstall Raft Computer on that machine, then start the agent again.",
+      refuse(res, 409, {
         code: "computer_version_unsupported",
+        error: "This agent's Computer is too old to run agents. Reinstall Raft Computer on that machine, then start the agent again.",
       });
       return;
     }
@@ -5508,14 +5606,14 @@ agentRouter.post("/:id/start", async (req, res) => {
       void onboardingService
         .triggerOwnerOnboardingOnAgentActivation(io, agentOrchestrator, req.serverId!, req.params.id)
         .catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.warn(`[Onboarding] Failed to trigger owner onboarding for started agent ${req.params.id}: ${msg}`);
+          console.warn(`[Onboarding] Failed to trigger owner onboarding for started agent ${req.params.id}:`, serializeErrorForLog(err));
         });
     }
     res.json({ ok: true });
   } catch (err: any) {
     if (err instanceof FencedAuthorizationDeniedError) {
-      res.status(err.reason === "not_found" ? 404 : 403).json(err.reason === "not_found" ? { error: "Agent not found" } : ASSISTANT_OWNER_ONLY_ERROR);
+      if (err.reason === "not_found") refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
+      else refuse(res, 403, ASSISTANT_OWNER_ONLY_ERROR);
       return;
     }
     if (
@@ -5526,14 +5624,14 @@ agentRouter.post("/:id/start", async (req, res) => {
       return;
     }
     if (err instanceof ServerMembershipRevokedError) {
-      res.status(403).json({ error: err.message });
+      refuse(res, 403, { code: err.code, error: err.message });
       return;
     }
     if (err instanceof FencedAuthorizationDeniedError) {
       if (err.reason === "not_found") {
-        res.status(404).json({ error: "Agent not found" });
+        refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       } else {
-        res.status(403).json({ error: "The `controlAgentRuntime` capability or human creator authority is required to control agents" });
+        refuse(res, 403, CONTROL_AGENTS_FORBIDDEN_REFUSAL);
       }
       return;
     }
@@ -5557,13 +5655,13 @@ agentRouter.post("/:id/stop", async (req, res) => {
   try {
     const agent = await agentService.getAgent(req.params.id);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     // Stopping an agent is a server owner/admin's (or its creator's) call;
     // members keep restart, reset session and Stop turn (cindyz, 2026-10-29).
     if (!await currentUserCanActOnAgent(req.serverId!, req.userId!, agent, "stopAgents", { stop: true })) {
-      res.status(403).json({ error: "The `stopAgents` capability or human creator authority is required to stop agents" });
+      refuse(res, 403, { code: "insufficient_role", error: "The `stopAgents` capability or human creator authority is required to stop agents" });
       return;
     }
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
@@ -5610,7 +5708,8 @@ agentRouter.post("/:id/stop", async (req, res) => {
     res.json(stopped?.delivered === false ? { ok: true, appliesOnReconnect: true } : { ok: true });
   } catch (err) {
     if (err instanceof FencedAuthorizationDeniedError) {
-      res.status(err.reason === "not_found" ? 404 : 403).json(err.reason === "not_found" ? { error: "Agent not found" } : ASSISTANT_OWNER_ONLY_ERROR);
+      if (err.reason === "not_found") refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
+      else refuse(res, 403, ASSISTANT_OWNER_ONLY_ERROR);
       return;
     }
     res.status(500).json({ error: "Failed to stop agent" });
@@ -5627,7 +5726,7 @@ agentRouter.post("/:id/stop", async (req, res) => {
 agentRouter.post("/:id/interrupt-turn", async (req, res) => {
   const agent = await agentService.getAgent(req.params.id).catch(() => null);
   if (!agent || agent.serverId !== req.serverId) {
-    res.status(404).json({ error: "Agent not found" });
+    refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
     return;
   }
   const trace = (outcome: string, extra: Record<string, unknown> = {}) => addTraceEvent("agent.turn_interrupt", {
@@ -5657,7 +5756,7 @@ agentRouter.post("/:id/interrupt-turn", async (req, res) => {
       return;
     }
     if (!await currentUserCanActOnAgent(req.serverId!, req.userId!, agent, "controlAgentRuntime")) {
-      res.status(403).json({ error: "The `controlAgentRuntime` capability or human creator authority is required to control agents" });
+      refuse(res, 403, CONTROL_AGENTS_FORBIDDEN_REFUSAL);
       return;
     }
     if (isExternalAgentRuntime(agent.runtime)) {
@@ -5678,14 +5777,14 @@ agentRouter.post("/:id/interrupt-turn", async (req, res) => {
     const result = await agentOrchestrator.interruptAgentTurn(agent.id, agent.machineId ?? null);
     if (result.outcome === "computer_offline") {
       trace(result.outcome);
-      res.status(409).json({ error: "This agent's computer is offline.", code: "computer_offline" });
+      refuse(res, 409, COMPUTER_OFFLINE_REFUSAL);
       return;
     }
     if (result.outcome === "computer_upgrade_required") {
       trace(result.outcome);
-      res.status(409).json({
-        error: "This agent's computer needs an upgrade before a single turn can be stopped. You can stop the whole agent instead.",
+      refuse(res, 409, {
         code: "computer_upgrade_required",
+        error: "This agent's computer needs an upgrade before a single turn can be stopped. You can stop the whole agent instead.",
       });
       return;
     }
@@ -5708,7 +5807,8 @@ agentRouter.post("/:id/interrupt-turn", async (req, res) => {
     }
     if (error instanceof FencedAuthorizationDeniedError) {
       trace("forbidden");
-      res.status(error.reason === "not_found" ? 404 : 403).json(error.reason === "not_found" ? { error: "Agent not found" } : ASSISTANT_OWNER_ONLY_ERROR);
+      if (error.reason === "not_found") refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
+      else refuse(res, 403, ASSISTANT_OWNER_ONLY_ERROR);
       return;
     }
     trace("error");
@@ -5721,12 +5821,12 @@ agentRouter.post("/:id/interrupt-turn", async (req, res) => {
 agentRouter.post("/:id/subagents/:taskId/interrupt", async (req, res) => {
   const agent = await agentService.getAgent(req.params.id).catch(() => null);
   if (!agent || agent.serverId !== req.serverId) {
-    res.status(404).json({ error: "Agent not found" });
+    refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
     return;
   }
   const taskId = req.params.taskId;
   if (!taskId || taskId.length > SUBAGENT_TASK_ID_MAX_LENGTH) {
-    res.status(400).json({ error: "Invalid sub-agent id" });
+    refuse(res, 400, { code: "subagent_id_invalid", error: "Invalid sub-agent id" });
     return;
   }
   const trace = (outcome: string) => addTraceEvent("agent.subagent_interrupt", {
@@ -5740,12 +5840,12 @@ agentRouter.post("/:id/subagents/:taskId/interrupt", async (req, res) => {
     // Someone else's assistant: its owner only, as for its other controls.
     if (agent.assistantOwnerUserId && agent.assistantOwnerUserId !== req.userId) {
       trace("forbidden");
-      res.status(403).json(ASSISTANT_OWNER_ONLY_ERROR);
+      refuse(res, 403, ASSISTANT_OWNER_ONLY_ERROR);
       return;
     }
     if (!await currentUserCanActOnAgent(req.serverId!, req.userId!, agent, "controlAgentRuntime")) {
       trace("forbidden");
-      res.status(403).json({ error: "The `controlAgentRuntime` capability or human creator authority is required to control agents" });
+      refuse(res, 403, CONTROL_AGENTS_FORBIDDEN_REFUSAL);
       return;
     }
     if (isExternalAgentRuntime(agent.runtime)) {
@@ -5757,11 +5857,11 @@ agentRouter.post("/:id/subagents/:taskId/interrupt", async (req, res) => {
     const result = await agentOrchestrator.interruptAgentSubagent(agent.id, agent.machineId ?? null, taskId);
     trace(result.outcome);
     if (result.outcome === "computer_offline") {
-      res.status(409).json({ error: "This agent's computer is offline.", code: "computer_offline" });
+      refuse(res, 409, COMPUTER_OFFLINE_REFUSAL);
       return;
     }
     if (result.outcome === "computer_upgrade_required") {
-      res.status(409).json({ error: "This agent's computer needs an upgrade before a sub-agent can be stopped.", code: "computer_upgrade_required" });
+      refuse(res, 409, { code: "computer_upgrade_required", error: "This agent's computer needs an upgrade before a sub-agent can be stopped." });
       return;
     }
     res.json(result);
@@ -5776,7 +5876,8 @@ agentRouter.post("/:id/subagents/:taskId/interrupt", async (req, res) => {
     }
     if (error instanceof FencedAuthorizationDeniedError) {
       trace("forbidden");
-      res.status(error.reason === "not_found" ? 404 : 403).json(error.reason === "not_found" ? { error: "Agent not found" } : ASSISTANT_OWNER_ONLY_ERROR);
+      if (error.reason === "not_found") refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
+      else refuse(res, 403, ASSISTANT_OWNER_ONLY_ERROR);
       return;
     }
     trace("error");
@@ -5789,7 +5890,7 @@ agentRouter.post("/:id/reset", async (req, res) => {
   try {
     const agent = await agentService.getAgent(req.params.id);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     // Support new mode param, fall back to legacy clearWorkspace for backwards compat
@@ -5801,11 +5902,9 @@ agentRouter.post("/:id/reset", async (req, res) => {
     }
     const requiredCapability = mode === "full" ? "resetAgentWorkspace" : "controlAgentRuntime";
     if (!await currentUserCanActOnAgent(req.serverId!, req.userId!, agent, requiredCapability)) {
-      res.status(403).json({
-        error: mode === "full"
-          ? "The `resetAgentWorkspace` capability or human creator authority is required to reset agent workspaces"
-          : "The `controlAgentRuntime` capability or human creator authority is required to control agents",
-      });
+      refuse(res, 403, mode === "full"
+        ? { code: "insufficient_role", error: "The `resetAgentWorkspace` capability or human creator authority is required to reset agent workspaces" }
+        : CONTROL_AGENTS_FORBIDDEN_REFUSAL);
       return;
     }
     if (isExternalAgentRuntime(agent.runtime)) {
@@ -5819,16 +5918,21 @@ agentRouter.post("/:id/reset", async (req, res) => {
     // eventual lifecycle/activity updates over the normal realtime channel.
     // Keep the authorization/external-runtime checks above synchronous so
     // invalid requests still fail before acknowledging the command.
-    // RFC 071 §5: a human reset (restart / session / full) is E3.
-    void agentOrchestrator.resetAgent(req.params.id, mode, { terminalControl: "human_reset" }).catch((err: unknown) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[Agents] Background reset failed for ${req.params.id}: ${msg}`);
+    // RFC 071 §5: a human reset (restart / session / full) is E3. It also
+    // revokes the agent's earlier launches' runner keys once the Computer
+    // reports the stopped launch gone, without holding up the start
+    // (revokeAgentRunnerCredentialsForReset).
+    void agentOrchestrator.resetAgent(req.params.id, mode, {
+      terminalControl: "human_reset",
+      revokeRunnerCredentials: { actorUserId: req.userId! },
+    }).catch((err: unknown) => {
+      console.warn(`[Agents] Background reset failed for ${req.params.id}:`, serializeErrorForLog(err));
     });
     await recordOperatorAction(req, agent, mode === "restart" ? "restart" : mode === "session" ? "reset_session" : "reset_full");
     res.status(202).json({ ok: true, status: "accepted" });
   } catch (err: any) {
     if (err instanceof KimiReasoningEffortUpgradeRequiredError) {
-      res.status(409).json({ error: err.message, code: err.code });
+      refuse(res, 409, serviceMessageRefusal(err.code, err.message, new KimiReasoningEffortUpgradeRequiredError().message));
       return;
     }
     sendJsonServerError(req, res, {
@@ -5888,36 +5992,41 @@ async function archiveAgentAsUser(req: Request, agentId: string, workspaceChoice
   await emitAgentApprovalCards(io, agentId).catch(() => {});
 }
 
+const DELETE_AGENTS_FORBIDDEN_REFUSAL: RefusalInput = {
+  code: "insufficient_role",
+  error: "The `deleteAgents` capability or human creator authority is required to delete agents",
+};
+
 agentRouter.delete("/:id", async (req, res) => {
   try {
     const agent = await agentService.getAgent(req.params.id);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await currentUserCanActOnAgent(req.serverId!, req.userId!, agent, "deleteAgents")) {
-      res.status(403).json({ error: "The `deleteAgents` capability or human creator authority is required to delete agents" });
+      refuse(res, 403, DELETE_AGENTS_FORBIDDEN_REFUSAL);
       return;
     }
     // Before stopping anything; archiveAgentAsUser re-checks under the row lock.
     if (agent.managedByAppInstallId) {
-      res.status(409).json({ error: APP_BOT_LIFECYCLE_MANAGED.message, code: APP_BOT_LIFECYCLE_MANAGED.code });
+      refuse(res, 409, { code: APP_BOT_LIFECYCLE_MANAGED.code, error: APP_BOT_LIFECYCLE_MANAGED.message });
       return;
     }
     const requestedWorkspace = (req.body as { workspace?: unknown } | undefined)?.workspace ?? "keep";
     if (!(AGENT_ARCHIVE_WORKSPACE_CHOICES as readonly unknown[]).includes(requestedWorkspace)) {
-      res.status(400).json({ error: "workspace must be keep or delete", code: "archive_workspace_choice_invalid" });
+      refuse(res, 400, { code: "archive_workspace_choice_invalid", error: "workspace must be keep or delete" });
       return;
     }
     const workspaceChoice = requestedWorkspace as AgentArchiveWorkspaceChoice;
     if (workspaceChoice !== "keep" && (!agent.machineId || isExternalAgentRuntime(agent.runtime) || agent.executionMode === "cloud")) {
-      res.status(409).json({ error: "This agent has no workspace on a Computer.", code: "archive_workspace_unavailable" });
+      refuse(res, 409, { code: "archive_workspace_unavailable", error: "This agent has no workspace on a Computer." });
       return;
     }
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
     // An agent that is moving between Computers cannot be archived until the move ends.
     if (await agentMigrationService.getActiveAgentMigration(req.params.id)) {
-      res.status(409).json({ error: "This agent is being migrated. Wait for the migration to finish or cancel it first.", code: "archive_migration_active" });
+      refuse(res, 409, { code: "archive_migration_active", error: "This agent is being migrated. Wait for the migration to finish or cancel it first." });
       return;
     }
     if (!isExternalAgentRuntime(agent.runtime)) {
@@ -5931,14 +6040,14 @@ agentRouter.delete("/:id", async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     if (err instanceof ServerMembershipRevokedError) {
-      res.status(403).json({ error: err.message });
+      refuse(res, 403, { code: err.code, error: err.message });
       return;
     }
     if (err instanceof FencedAuthorizationDeniedError) {
       if (err.reason === "not_found") {
-        res.status(404).json({ error: "Agent not found" });
+        refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       } else {
-        res.status(403).json({ error: "The `deleteAgents` capability or human creator authority is required to delete agents" });
+        refuse(res, 403, DELETE_AGENTS_FORBIDDEN_REFUSAL);
       }
       return;
     }
@@ -5950,17 +6059,22 @@ agentRouter.delete("/:id", async (req, res) => {
   }
 });
 
+// The archive routes' two refusals, the same body from the first check
+// (loadArchivedAgentForRoute) and under the write fence (sendAgentArchiveRouteError).
+const ARCHIVED_AGENT_NOT_FOUND_REFUSAL: RefusalInput = { code: "agent_not_archived", error: "Archived agent not found" };
+const ARCHIVED_AGENT_FORBIDDEN_REFUSAL: RefusalInput = { code: "insufficient_role", error: "You cannot manage this archived agent's workspace" };
+
 async function loadArchivedAgentForRoute(req: Request, res: Response, capability: "deleteAgents" | "inspect") {
   const agent = await agentService.getAgent(String(req.params.id), true);
   if (!agent || agent.serverId !== req.serverId || !agent.deletedAt || !isAgentFindableBy({ userId: req.userId! }, agent)) {
-    res.status(404).json({ error: "Archived agent not found", code: "agent_not_archived" });
+    refuse(res, 404, ARCHIVED_AGENT_NOT_FOUND_REFUSAL);
     return null;
   }
   const allowed = capability === "inspect"
     ? await canInspectAgentPrivateSurfaces(req.serverId!, req.userId!, agent)
     : await currentUserCanActOnAgent(req.serverId!, req.userId!, agent, "deleteAgents");
   if (!allowed) {
-    res.status(403).json({ error: "You cannot manage this archived agent's workspace" });
+    refuse(res, 403, ARCHIVED_AGENT_FORBIDDEN_REFUSAL);
     return null;
   }
   return agent;
@@ -5968,9 +6082,8 @@ async function loadArchivedAgentForRoute(req: Request, res: Response, capability
 
 function sendAgentArchiveRouteError(req: Request, res: Response, err: unknown, logPrefix: string): void {
   if (err instanceof FencedAuthorizationDeniedError) {
-    res.status(err.reason === "not_found" ? 404 : 403).json({
-      error: err.reason === "not_found" ? "Archived agent not found" : "You cannot manage this archived agent's workspace",
-    });
+    if (err.reason === "not_found") refuse(res, 404, ARCHIVED_AGENT_NOT_FOUND_REFUSAL);
+    else refuse(res, 403, ARCHIVED_AGENT_FORBIDDEN_REFUSAL);
     return;
   }
   if (err instanceof AgentArchiveError) {
@@ -6000,7 +6113,7 @@ agentRouter.post("/:id/archive/workspace", async (req, res) => {
     if (!agent) return;
     const action = (req.body as { action?: unknown } | undefined)?.action;
     if (action !== "delete") {
-      res.status(400).json({ error: "action must be delete", code: "archive_workspace_action_invalid" });
+      refuse(res, 400, { code: "archive_workspace_action_invalid", error: "action must be delete" });
       return;
     }
     const archive = await withFencedArchivedAgentAuthority(req.serverId!, req.userId!, agent.id, (tx) =>
@@ -6045,7 +6158,7 @@ function sendWorkspaceComputerAccessRevoked(res: Response): void {
 /** 409: the chosen machine's Computer key was revoked (detached); it takes no agents until attached again. */
 function sendMachineKeyRevoked(res: Response): void {
   const err = new MachineKeyRevokedError();
-  res.status(409).json({ error: err.message, code: err.code });
+  refuse(res, 409, { code: err.code, error: err.message });
 }
 
 /**
@@ -6088,13 +6201,13 @@ async function sendArchivedWorkspace(
       const routing = await handleMachineLocalRouting(req, res, machineId, () => orchestrator.hasMachineLocally(machineId));
       if (routing === "handled") return;
       if (routing !== "confirmed_local") {
-        res.status(409).json({ error: "The Computer that holds this workspace is offline.", code: "machine_offline" });
+        refuse(res, 409, { code: "machine_offline", error: "The Computer that holds this workspace is offline." });
         return;
       }
       res.json({ ...await readFromComputer(orchestrator, machineId), source: "computer" });
       return;
     }
-    res.status(409).json({ error: "This archived agent's workspace cannot be browsed.", code: "archive_workspace_unavailable" });
+    refuse(res, 409, { code: "archive_workspace_unavailable", error: "This archived agent's workspace cannot be browsed." });
   } catch (err) {
     const failure = responseForAgentRouteFailure(err);
     if (failure.code !== "internal_error") {
@@ -6105,15 +6218,20 @@ async function sendArchivedWorkspace(
   }
 }
 
+const VIEW_AGENT_WORKSPACE_FORBIDDEN_REFUSAL: RefusalInput = {
+  code: "insufficient_role",
+  error: "The `editAgents` capability or human creator authority is required to view agent workspace",
+};
+
 agentRouter.get("/:id/workspace-files", async (req, res) => {
   try {
     const agent = await agentService.getAgent(req.params.id, true);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canInspectAgentPrivateSurfaces(req.serverId!, req.userId!, agent)) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to view agent workspace" });
+      refuse(res, 403, VIEW_AGENT_WORKSPACE_FORBIDDEN_REFUSAL);
       return;
     }
     if (agent.deletedAt) {
@@ -6155,10 +6273,7 @@ agentRouter.get("/:id/workspace-files", async (req, res) => {
         http_status: 409,
         response_code: "machine_unassigned",
       });
-      res.status(409).json({
-        error: "No machine assigned. Please assign a machine to this agent first.",
-        code: "machine_unassigned",
-      });
+      refuse(res, 409, MACHINE_UNASSIGNED_REFUSAL);
       return;
     }
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
@@ -6224,16 +6339,16 @@ agentRouter.get("/:id/workspace-files/read", async (req, res) => {
   try {
     const agent = await agentService.getAgent(req.params.id, true);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canInspectAgentPrivateSurfaces(req.serverId!, req.userId!, agent)) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to view agent workspace" });
+      refuse(res, 403, VIEW_AGENT_WORKSPACE_FORBIDDEN_REFUSAL);
       return;
     }
     const filePath = req.query.path as string;
     if (!filePath) {
-      res.status(400).json({ error: "path query parameter is required" });
+      refuse(res, 400, { code: "workspace_file_path_required", error: "path query parameter is required" });
       return;
     }
     if (agent.deletedAt) {
@@ -6282,10 +6397,7 @@ agentRouter.get("/:id/workspace-files/read", async (req, res) => {
         http_status: 409,
         response_code: "machine_unassigned",
       });
-      res.status(409).json({
-        error: "No machine assigned. Please assign a machine to this agent first.",
-        code: "machine_unassigned",
-      });
+      refuse(res, 409, MACHINE_UNASSIGNED_REFUSAL);
       return;
     }
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
@@ -6359,11 +6471,11 @@ agentRouter.get("/:id/skills", async (req, res) => {
   try {
     const agent = await agentService.getAgent(req.params.id);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canInspectAgentPrivateSurfaces(req.serverId!, req.userId!, agent)) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to view agent workspace" });
+      refuse(res, 403, VIEW_AGENT_WORKSPACE_FORBIDDEN_REFUSAL);
       return;
     }
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
@@ -6433,22 +6545,31 @@ agentRouter.get("/:id/skills", async (req, res) => {
 // #proj-permission:10bdc2c9). The post-write set is broadcast over the
 // `agent:scope-updated` ws event by Noel's hot-swap layer.
 
+const READ_AGENT_SCOPES_FORBIDDEN_REFUSAL: RefusalInput = {
+  code: "insufficient_role",
+  error: "The `editAgents` capability or human creator authority is required to read agent scopes",
+};
+const UPDATE_AGENT_SCOPES_FORBIDDEN_REFUSAL: RefusalInput = {
+  code: "insufficient_role",
+  error: "The `editAgents` capability or human creator authority is required to update agent scopes",
+};
+
 agentRouter.get("/:id/scopes", async (req, res) => {
   try {
     const agent = await agentService.getAgent(req.params.id);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canInspectAgentPrivateSurfaces(req.serverId!, req.userId!, agent)) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to read agent scopes" });
+      refuse(res, 403, READ_AGENT_SCOPES_FORBIDDEN_REFUSAL);
       return;
     }
     const set = await agentScopesService.loadAgentScopes(req.params.id);
     res.json(set);
   } catch (err) {
     if (err instanceof agentScopesService.AgentScopesNotFoundError) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     sendJsonServerError(req, res, {
@@ -6463,11 +6584,11 @@ agentRouter.put("/:id/scopes", async (req, res) => {
   try {
     const agent = await agentService.getAgent(req.params.id);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (!await canInspectAgentPrivateSurfaces(req.serverId!, req.userId!, agent)) {
-      res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to update agent scopes" });
+      refuse(res, 403, UPDATE_AGENT_SCOPES_FORBIDDEN_REFUSAL);
       return;
     }
     const body = (req.body ?? {}) as { scopes?: unknown; mode?: unknown };
@@ -6481,7 +6602,7 @@ agentRouter.put("/:id/scopes", async (req, res) => {
       return;
     }
     if (!Array.isArray(body.scopes)) {
-      res.status(400).json({ error: "scopes must be an array of scope literals" });
+      refuse(res, 400, { code: "scopes_invalid", error: "scopes must be an array of scope literals" });
       return;
     }
     const set = await withFencedAgentAuthority(req.serverId!, req.userId!, req.params.id, "editAgents", (tx) =>
@@ -6496,23 +6617,23 @@ agentRouter.put("/:id/scopes", async (req, res) => {
     res.json(set);
   } catch (err) {
     if (err instanceof ServerMembershipRevokedError) {
-      res.status(403).json({ error: err.message });
+      refuse(res, 403, { code: err.code, error: err.message });
       return;
     }
     if (err instanceof FencedAuthorizationDeniedError) {
       if (err.reason === "not_found") {
-        res.status(404).json({ error: "Agent not found" });
+        refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       } else {
-        res.status(403).json({ error: "The `editAgents` capability or human creator authority is required to update agent scopes" });
+        refuse(res, 403, UPDATE_AGENT_SCOPES_FORBIDDEN_REFUSAL);
       }
       return;
     }
     if (err instanceof agentScopesService.AgentScopesNotFoundError) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (err instanceof agentScopesService.DedicatedAgentScopeError) {
-      res.status(422).json({ error: err.message, code: "raftbench_service_scope_invalid" });
+      refuse(res, 422, { code: "raftbench_service_scope_invalid", error: err.message });
       return;
     }
     sendJsonServerError(req, res, {
@@ -6577,6 +6698,19 @@ async function withFencedAgentAuthority<T>(
   });
 }
 
+const ISSUE_BOOTSTRAP_TOKENS_FORBIDDEN_REFUSAL: RefusalInput = {
+  code: "insufficient_role",
+  error: "The `issueAgentCredentials` capability or human creator authority is required to issue agent bootstrap tokens",
+};
+const BOOTSTRAP_AGENT_NOT_EXTERNAL_REFUSAL: RefusalInput = {
+  code: "agent_not_external",
+  error: "Bootstrap tokens can only be issued for external agents; a managed agent's credentials come from its computer",
+};
+// The fence's and the service's unknown agent keep `agent_missing`, the code
+// the credential mint (agentCredentials.ts) answers it with; the first check
+// keeps the param guard's codeless body.
+const BOOTSTRAP_AGENT_MISSING_REFUSAL: RefusalInput = { code: "agent_missing", error: "Agent not found" };
+
 // Issue a one-time bootstrap token for an agent (web-session mint).
 //
 // `rfcs/034-slock-credential-rfc.zh.html#section-credential-model`
@@ -6596,10 +6730,7 @@ async function withFencedAgentAuthority<T>(
 //   - ttlMs: optional override (default 30 minutes via service layer).
 agentRouter.post("/:id/bootstrap-tokens", async (req, res) => {
   if (!isAgentBootstrapSurfaceEnabled()) {
-    res.status(404).json({
-      error: "Self-hosted runner bootstrap is not enabled",
-      code: "self_hosted_runner_bootstrap_disabled",
-    });
+    refuse(res, 404, { code: "self_hosted_runner_bootstrap_disabled", error: "Self-hosted runner bootstrap is not enabled" });
     return;
   }
 
@@ -6607,6 +6738,7 @@ agentRouter.post("/:id/bootstrap-tokens", async (req, res) => {
     // A non-UUID id names no agent: the same 404, not the uuid cast's error.
     const agent = isUuid(req.params.id) ? await agentService.getAgent(req.params.id, true) : null;
     if (!agent || agent.serverId !== req.serverId) {
+      // refusal-ok: byte-identical to the param guard's codeless 404 for a non-UUID id (guardUuidPathParams; agentCredentialMintLimits.api.test.ts pins the two equal); they move to AGENT_NOT_FOUND_REFUSAL together
       res.status(404).json({ error: "Agent not found" });
       return;
     }
@@ -6617,20 +6749,14 @@ agentRouter.post("/:id/bootstrap-tokens", async (req, res) => {
       "issueAgentCredentials",
     );
     if (!canManage) {
-      res.status(403).json({
-        error: "The `issueAgentCredentials` capability or human creator authority is required to issue agent bootstrap tokens",
-        code: "insufficient_role",
-      });
+      refuse(res, 403, ISSUE_BOOTSTRAP_TOKENS_FORBIDDEN_REFUSAL);
       return;
     }
 
     // The token exchanges for an `sk_agent_*`: external agents only (a
     // managed agent's credentials come from its Computer).
     if (!isExternalAgentRuntime(agent.runtime)) {
-      res.status(400).json({
-        error: "Bootstrap tokens can only be issued for external agents; a managed agent's credentials come from its computer",
-        code: "agent_not_external",
-      });
+      refuse(res, 400, BOOTSTRAP_AGENT_NOT_EXTERNAL_REFUSAL);
       return;
     }
 
@@ -6640,7 +6766,7 @@ agentRouter.post("/:id/bootstrap-tokens", async (req, res) => {
     // scopes (`server`, `mcp`) must be named explicitly.
     const requested = resolveRequestedAgentCapabilities(body.scopes, DEFAULT_EXTERNAL_AGENT_CAPABILITIES);
     if (!requested.ok) {
-      res.status(400).json({ error: requested.error, code: requested.code });
+      refuse(res, 400, { code: requested.code, error: requested.error });
       return;
     }
     const scopes = requested.scopes;
@@ -6648,19 +6774,13 @@ agentRouter.post("/:id/bootstrap-tokens", async (req, res) => {
     let ttlMs: number | undefined;
     if (body.ttlMs !== undefined) {
       if (typeof body.ttlMs !== "number" || !Number.isFinite(body.ttlMs) || body.ttlMs <= 0) {
-        res.status(400).json({
-          error: "ttlMs must be a positive number of milliseconds",
-          code: "ttl_invalid",
-        });
+        refuse(res, 400, { code: "ttl_invalid", error: "ttlMs must be a positive number of milliseconds" });
         return;
       }
       // Cap at 24h to bound blast radius of accidental long-lived tokens.
       const MAX_TTL_MS = 24 * 60 * 60 * 1000;
       if (body.ttlMs > MAX_TTL_MS) {
-        res.status(400).json({
-          error: "ttlMs cannot exceed 24 hours",
-          code: "ttl_too_long",
-        });
+        refuse(res, 400, { code: "ttl_too_long", error: "ttlMs cannot exceed 24 hours" });
         return;
       }
       ttlMs = body.ttlMs;
@@ -6726,35 +6846,29 @@ agentRouter.post("/:id/bootstrap-tokens", async (req, res) => {
       return;
     }
     if (err instanceof ServerMembershipRevokedError) {
-      res.status(403).json({ error: err.message });
+      refuse(res, 403, { code: err.code, error: err.message });
       return;
     }
     if (err instanceof FencedAuthorizationDeniedError) {
       if (err.reason === "not_found") {
-        res.status(404).json({ error: "Agent not found", code: "agent_missing" });
+        refuse(res, 404, BOOTSTRAP_AGENT_MISSING_REFUSAL);
       } else {
-        res.status(403).json({
-          error: "The `issueAgentCredentials` capability or human creator authority is required to issue agent bootstrap tokens",
-          code: "insufficient_role",
-        });
+        refuse(res, 403, ISSUE_BOOTSTRAP_TOKENS_FORBIDDEN_REFUSAL);
       }
       return;
     }
     if (err instanceof Error) {
       if (err.message === "agent_missing") {
-        res.status(404).json({ error: "Agent not found", code: "agent_missing" });
+        refuse(res, 404, BOOTSTRAP_AGENT_MISSING_REFUSAL);
         return;
       }
       if (err.message === "agent_not_external") {
-        res.status(400).json({
-          error: "Bootstrap tokens can only be issued for external agents; a managed agent's credentials come from its computer",
-          code: "agent_not_external",
-        });
+        refuse(res, 400, BOOTSTRAP_AGENT_NOT_EXTERNAL_REFUSAL);
         return;
       }
       if (err.message === "agent_server_mismatch") {
         // Defense-in-depth — should already be caught by the 404 above.
-        res.status(404).json({ error: "Agent not found", code: "agent_missing" });
+        refuse(res, 404, BOOTSTRAP_AGENT_MISSING_REFUSAL);
         return;
       }
     }
@@ -6794,8 +6908,14 @@ myAssistantRouter.use(async (req, res, next) => {
     res.json({ enabled: false, assistant: null });
     return;
   }
-  res.status(403).json({ error: "Guests can't have a personal assistant.", code: assistantService.ASSISTANT_NOT_ENABLED_CODE });
+  refuse(res, 403, { code: assistantService.ASSISTANT_NOT_ENABLED_CODE, error: "Guests can't have a personal assistant." });
 });
+
+const ASSISTANT_NOT_ENABLED_REFUSAL: RefusalInput = {
+  code: assistantService.ASSISTANT_NOT_ENABLED_CODE,
+  error: "Personal assistants are not enabled on this server.",
+};
+const MY_ASSISTANT_NOT_FOUND_REFUSAL: RefusalInput = { code: "assistant_not_found", error: "You have no assistant in this server." };
 
 async function myAssistantView(serverId: string, userId: string) {
   return {
@@ -6808,7 +6928,7 @@ myAssistantRouter.get("/", async (req, res) => {
   try {
     res.json(await myAssistantView(req.serverId!, req.userId!));
   } catch (err) {
-    console.error("my-assistant: get failed:", err);
+    console.error("my-assistant: get failed:", serializeErrorForLog(err));
     res.status(500).json({ error: "Failed to load your assistant" });
   }
 });
@@ -6818,13 +6938,13 @@ myAssistantRouter.post("/", async (req, res) => {
     const serverId = req.serverId!;
     const userId = req.userId!;
     if (!await assistantService.isMyAssistantAvailable(serverId)) {
-      res.status(403).json({ error: "Personal assistants are not enabled on this server.", code: assistantService.ASSISTANT_NOT_ENABLED_CODE });
+      refuse(res, 403, ASSISTANT_NOT_ENABLED_REFUSAL);
       return;
     }
     // Every assistant is Ottie: a `name` in the body (older clients send one) is ignored.
     const [owner] = await getDb().select({ name: users.name }).from(users).where(eq(users.id, userId)).limit(1);
     if (!owner) {
-      res.status(404).json({ error: "User not found" });
+      refuse(res, 404, { code: "user_not_found", error: "User not found" });
       return;
     }
     try {
@@ -6842,22 +6962,23 @@ myAssistantRouter.post("/", async (req, res) => {
       res.status(201).json(await myAssistantView(serverId, userId));
     } catch (err) {
       if (err instanceof assistantService.AssistantExistsError) {
+        // refusal-ok: top-level enabled and assistant carry the existing assistant (assistantClient.ts adopts body.assistant on 409 assistant_exists); refuse() writes no top-level fields
         res.status(409).json({ error: err.message, code: "assistant_exists", ...await myAssistantView(serverId, userId) });
         return;
       }
       if (err instanceof AgentRuntimeProviderError) {
-        res.status(403).json({ error: "Personal assistants are not enabled on this server.", code: assistantService.ASSISTANT_NOT_ENABLED_CODE });
+        refuse(res, 403, ASSISTANT_NOT_ENABLED_REFUSAL);
         return;
       }
       // An assistant takes no agent seat, so no capacity answer here.
       if (err instanceof ServerMembershipRevokedError) {
-        res.status(403).json({ error: err.message });
+        refuse(res, 403, { code: err.code, error: err.message });
         return;
       }
       throw err;
     }
   } catch (err) {
-    console.error("my-assistant: create failed:", err);
+    console.error("my-assistant: create failed:", serializeErrorForLog(err));
     res.status(500).json({ error: "Failed to create your assistant" });
   }
 });
@@ -6868,31 +6989,31 @@ myAssistantRouter.patch("/", async (req, res) => {
     const userId = req.userId!;
     const mine = await assistantService.getMyAssistant(serverId, userId);
     if (!mine) {
-      res.status(404).json({ error: "You have no assistant in this server.", code: "assistant_not_found" });
+      refuse(res, 404, MY_ASSISTANT_NOT_FOUND_REFUSAL);
       return;
     }
     const body = (req.body ?? {}) as { name?: unknown; readsDms?: unknown; sendAsOwner?: unknown; ownerNotes?: unknown };
     // Every assistant is Ottie: its name is fixed, so a rename is refused and nothing changes.
     if (body.name !== undefined) {
-      res.status(400).json({ error: `An assistant's name is fixed: ${assistantService.ASSISTANT_DISPLAY_NAME}.`, code: "assistant_name_fixed" });
+      refuse(res, 400, { code: "assistant_name_fixed", error: `An assistant's name is fixed: ${assistantService.ASSISTANT_DISPLAY_NAME}.` });
       return;
     }
     if (body.readsDms === undefined && body.sendAsOwner === undefined && body.ownerNotes === undefined) {
-      res.status(400).json({ error: "Send readsDms, sendAsOwner or ownerNotes.", code: "invalid_request" });
+      refuse(res, 400, { code: "invalid_request", error: "Send readsDms, sendAsOwner or ownerNotes." });
       return;
     }
     const ownerNotes = body.ownerNotes === undefined ? null : assistantService.normalizeAssistantOwnerNotes(body.ownerNotes);
     if (ownerNotes && !ownerNotes.ok) {
-      res.status(400).json({ error: ownerNotes.reason, code: "invalid_owner_notes" });
+      refuse(res, 400, { code: "invalid_owner_notes", error: ownerNotes.reason });
       return;
     }
     if (body.sendAsOwner !== undefined && typeof body.sendAsOwner !== "boolean") {
-      res.status(400).json({ error: "sendAsOwner must be true or false.", code: "invalid_send_as_owner" });
+      refuse(res, 400, { code: "invalid_send_as_owner", error: "sendAsOwner must be true or false." });
       return;
     }
     const sendAsOwner = body.sendAsOwner as boolean | undefined;
     if (body.readsDms !== undefined && typeof body.readsDms !== "boolean") {
-      res.status(400).json({ error: "readsDms must be true or false.", code: "invalid_reads_dms" });
+      refuse(res, 400, { code: "invalid_reads_dms", error: "readsDms must be true or false." });
       return;
     }
     const readsDms = body.readsDms as boolean | undefined;
@@ -6914,7 +7035,7 @@ myAssistantRouter.patch("/", async (req, res) => {
       res.status(err.reason === "not_found" ? 404 : 403).json({ error: "You cannot change this assistant.", code: err.reason === "not_found" ? "assistant_not_found" : "forbidden" });
       return;
     }
-    console.error("my-assistant: update failed:", err);
+    console.error("my-assistant: update failed:", serializeErrorForLog(err));
     res.status(500).json({ error: "Failed to update your assistant" });
   }
 });
@@ -6935,7 +7056,7 @@ myAssistantRouter.get("/setting-changes", async (req, res) => {
     const changes = [...settings, ...actions].sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
     res.json({ changes });
   } catch (err) {
-    console.error("my-assistant: setting changes failed:", err);
+    console.error("my-assistant: setting changes failed:", serializeErrorForLog(err));
     res.status(500).json({ error: "Failed to load what your assistant changed" });
   }
 });
@@ -6947,6 +7068,7 @@ myAssistantRouter.delete("/delegated/:messageId", async (req, res) => {
   try {
     const messageId = String(req.params.messageId);
     if (!/^[0-9a-f-]{36}$/i.test(messageId)) {
+      // refusal-ok: byte-identical to retractDelegatedMessage's 404 (AssistantSendAsOwnerError, written below with a computed status), so a malformed id reads as a missing message or someone else's; they move together
       res.status(404).json({ error: "No message your assistant sent for you has this id.", code: "message_not_found" });
       return;
     }
@@ -6956,7 +7078,7 @@ myAssistantRouter.delete("/delegated/:messageId", async (req, res) => {
       res.status(err.status).json({ error: err.message, code: err.code });
       return;
     }
-    console.error("my-assistant: retract failed:", err);
+    console.error("my-assistant: retract failed:", serializeErrorForLog(err));
     res.status(500).json({ error: "Failed to retract the message" });
   }
 });
@@ -6967,7 +7089,7 @@ myAssistantRouter.delete("/", async (req, res) => {
     const userId = req.userId!;
     const mine = await assistantService.getMyAssistant(serverId, userId);
     if (!mine) {
-      res.status(404).json({ error: "You have no assistant in this server.", code: "assistant_not_found" });
+      refuse(res, 404, MY_ASSISTANT_NOT_FOUND_REFUSAL);
       return;
     }
     // A cloud agent: no Computer to stop and no workspace to choose about.
@@ -6982,7 +7104,7 @@ myAssistantRouter.delete("/", async (req, res) => {
       res.status(err.status).json({ error: err.message, code: err.code });
       return;
     }
-    console.error("my-assistant: delete failed:", err);
+    console.error("my-assistant: delete failed:", serializeErrorForLog(err));
     res.status(500).json({ error: "Failed to delete your assistant" });
   }
 });

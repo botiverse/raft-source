@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { BasicTracer, MemoryTraceSink } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
-import { channelExternalInvites, serverMembers, servers, userAnalyticsIds } from "../db/schema";
+import { channelExternalInvites, jointChannelServers, serverMembers, servers, userAnalyticsIds } from "../db/schema";
 import { acceptJointChannelInvite, addHuman, createChannel, createJointChannel } from "../services/channelService";
 import { runChannelConversionJob, startChannelToJointConversion } from "../services/channelConversionService";
 import { runChannelConversionWorkerPass } from "../services/channelConversionWorker";
@@ -306,6 +306,62 @@ test("Your servers (host_direct): rows under the host server, the worker's after
   assert.deepEqual((await events.next(2, "the host side's refusals")).map((row) => [row.properties.refusal_code, row.server]), [
     ["make_private_required", host.server.id],
     ["forbidden", host.server.id],
+  ]);
+});
+
+// #wg-rbac:#94: the same Your servers choice sent again (a retry, a double
+// send) was refused invalid_server for servers it had just connected.
+test("Your servers (host_direct) sent again: a server already connected is answered connected, recorded already_connected, nothing done; anything else is still refused", async ({ app }) => {
+  const events = captureConnectFinished(app);
+  const host = await seedHost(app.baseUrl, "pro");
+  const room = await host.room();
+  await convertToJoint(host, room.id);
+  const otherOwner = await person(app.baseUrl, "cf-again-other");
+  const owned = await seedTarget(host.owner);
+  const administered = await seedTarget(otherOwner, [[host.owner, "admin"]]);
+  const nowGuest = await seedTarget(otherOwner, [[host.owner, "admin"]]);
+  const left = await seedTarget(otherOwner, [[host.owner, "admin"]]);
+  const notTheirs = await seedTarget(otherOwner);
+  const connectOwn = (serverIds: unknown) => call(app.baseUrl, host.owner, "POST", `channels/${room.id}/external-connect-servers`, { serverIds }, host.server.id);
+  const multi = { async: false, multi: true, host_plan: "paid" };
+  const projections = async () => (await getDb().select().from(jointChannelServers).where(eq(jointChannelServers.status, "active")))
+    .filter((row) => [owned.id, administered.id, nowGuest.id, left.id].includes(row.serverId));
+  const outcomes = (body: Record<string, unknown>) => body.servers as Array<Record<string, unknown>>;
+
+  const first = await expectStatus(await connectOwn([owned.id, administered.id, nowGuest.id, left.id]), 200);
+  assert.deepEqual(outcomes(first).map((server) => server.state), ["connected", "connected", "connected", "connected"]);
+  await events.next(4, "the first send");
+  const before = await projections();
+  assert.equal(before.length, 4);
+  const localOf = new Map(before.map((row) => [row.serverId, row.localChannelId]));
+  const invitesBefore = await getDb().select({ id: channelExternalInvites.id, status: channelExternalInvites.status }).from(channelExternalInvites).where(eq(channelExternalInvites.channelId, room.id));
+
+  // The same choice again: connected, its own channel, no alreadyConnected in the answer.
+  const again = await expectStatus(await connectOwn([owned.id, administered.id]), 200);
+  assert.deepEqual(outcomes(again), [
+    { serverId: owned.id, state: "connected", channelId: localOf.get(owned.id) },
+    { serverId: administered.id, state: "connected", channelId: localOf.get(administered.id) },
+  ]);
+  assert.deepEqual((await events.next(2, "the repeat")).map((row) => [row.properties, row.server]), [
+    [{ path: "host_direct", result: "already_connected", ...multi }, host.server.id],
+    [{ path: "host_direct", result: "already_connected", ...multi }, host.server.id],
+  ]);
+  assert.deepEqual(await projections(), before, "nothing connected again");
+  const invitesAfter = await getDb().select({ id: channelExternalInvites.id, status: channelExternalInvites.status }).from(channelExternalInvites).where(eq(channelExternalInvites.channelId, room.id));
+  assert.deepEqual(invitesAfter.filter((row) => !invitesBefore.some((was) => was.id === row.id)).map((row) => row.status), ["revoked"], "the repeat's own invite is withdrawn unused");
+  assert.deepEqual(invitesAfter.filter((row) => invitesBefore.some((was) => was.id === row.id)), invitesBefore, "the first send's invite is untouched");
+
+  // Still refused invalid_server: a connected server they are now only a Guest of or no longer belong to, and one never theirs.
+  await seedBoundGuest({ serverId: nowGuest.id, userId: host.owner.id });
+  await getDb().delete(serverMembers).where(and(eq(serverMembers.serverId, left.id), eq(serverMembers.userId, host.owner.id)));
+  const refused = await expectStatus(await connectOwn([nowGuest.id, left.id, notTheirs.id]), 200);
+  assert.deepEqual(outcomes(refused).map((server) => [server.serverId, server.state, server.code]), [
+    [nowGuest.id, "refused", "invalid_server"],
+    [left.id, "refused", "invalid_server"],
+    [notTheirs.id, "refused", "invalid_server"],
+  ]);
+  assert.deepEqual((await events.next(3, "the refusals")).map((row) => [row.properties.result, row.properties.refusal_code]), [
+    ["refused", "invalid_server"], ["refused", "invalid_server"], ["refused", "invalid_server"],
   ]);
 });
 

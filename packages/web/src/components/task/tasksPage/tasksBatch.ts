@@ -26,6 +26,8 @@ export interface BatchViewer {
   canAssign: boolean;
   /** Server capability `deleteAnyTask`. */
   canDeleteAny: boolean;
+  /** Whether the viewer may change tasks in a channel (taskChannelWrite): not in a public channel they only read. */
+  canWriteChannel: (channelId: string) => boolean;
 }
 
 export interface BatchOutcome {
@@ -47,13 +49,14 @@ export interface BatchOutcome {
  *   the task's own Assignee field).
  * - Delete: its creator, or `deleteAnyTask`.
  * - Follow: anyone who sees it.
+ * Status, assignee and delete all need write access to the task's channel (the server's gate on every task write).
  * Never a legacy task.
  */
 export function canApplyBatchAction(action: BatchAction, task: Task, viewer: BatchViewer): boolean {
   if (task.isLegacy) return false;
+  if (action.kind === "follow") return true;
+  if (!viewer.canWriteChannel(task.channelId)) return false;
   switch (action.kind) {
-    case "follow":
-      return true;
     case "status":
       if (action.status === "in_progress" && task.status === "todo" && !task.claimedById) return false;
       return canEditTaskStatus(task, viewer.userId ?? undefined, false);

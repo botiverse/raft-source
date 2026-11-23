@@ -3,20 +3,19 @@ import type { RuntimeAuthView } from "../../utils/runtimeAuthClient";
 
 /**
  * What the usage card offers this viewer about Claude limit resets
- * (claude_limit_reset; docs/contracts/runtime-account-usage.md). Null: the
+ * (claude_limit_reset_v2; docs/contracts/runtime-account-usage.md). Null: the
  * card shows nothing about them.
  *
- * Only the person who connected the Computer can use its Claude resets
- * (`claudeLimitResetAccess.canUse`). An owner or admin who did not connect it
- * may still read the list where the server lets them, so they get
- * `view_only`: "View available resets" and a list with nothing to press.
- * At the 5-hour limit the read needs a consent that can spend the 5-hour
- * reset, which is the connecting person's alone to give: there they get no
- * entry, rather than a button beside a sentence explaining why it leads
- * nowhere. `canUse` alone decides it; `canConsent` is never read, so a
- * person who cannot use a reset is never offered the consent step. An older
- * server does not send the field: offered as usable, and its routes still
- * decide (a refused attempt answers `claude_limit_reset_owner_only`).
+ * Whoever may act on the Computer's runtimes (the person who connected it, or
+ * a server owner or admin) can use its Claude resets, as its Codex resets:
+ * the server sends `claudeLimitResetAccess.canUse` true to all of them. An
+ * older server sent it false to an owner or admin who did not connect the
+ * Computer; for that viewer the card still answers `view_only` ("View
+ * available resets" and a list with nothing to press) below the 5-hour
+ * limit, and no entry at it, where the read needs a consent that can spend
+ * the 5-hour reset. `canUse` alone decides it; `canConsent` is never read, so
+ * a person who cannot use a reset never sends a read with consent. A server
+ * that does not send the field: offered as usable, and its routes decide.
  *
  * A Computer whose daemon lacks the capability (`computer_upgrade_required`)
  * is offered to no one: the card has nothing to draw for it.
@@ -37,7 +36,7 @@ export function claudeLimitResetOffer({
   canActOnRuntimes: boolean;
   authStatus: Pick<RuntimeAuthStatus, "kind"> | null;
   authView: Pick<RuntimeAuthView, "claudeLimitResets" | "claudeLimitResetAccess"> | null;
-  /** The card's usage shows the account at its 5-hour limit: a read there needs the connecting person's consent. */
+  /** The card's usage shows the account at its 5-hour limit: a read there needs the viewer's consent. */
   atFiveHourLimit: boolean;
   /** This Computer answered that Claude limit resets cannot run there (macOS). */
   notSupportedHere: boolean;

@@ -11,17 +11,16 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 
 import { eq } from "drizzle-orm";
-import { DAEMON_CAPABILITY_AGENT_CONFIG_PUSH, PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY, type AgentConfig } from "@botiverse/raft-shared";
+import { DAEMON_CAPABILITY_AGENT_CONFIG_INTERRUPT, DAEMON_CAPABILITY_AGENT_CONFIG_PUSH, DAEMON_CAPABILITY_CONSTRUCTED_INIT_V1, RUNTIME_CONFIG_VERSION, type AgentConfig } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
-import { agentProviderConnections, agents, featureFlagRules, machines, managedMcpServers, users } from "../db/schema";
+import { agents, machines, managedMcpServers, users } from "../db/schema";
 import { AgentOrchestrator, type ResetAgentOptions } from "../services/agentOrchestrator";
 import { createServer } from "../services/serverService";
 import { createManagedMcpServer, executeManagedMcpCall } from "../services/managedMcpService";
-import { createProviderConnection } from "../services/providerConnectionService";
 
 const test = createApiTest();
 
-type ConfigFrame = { type: "agent:config"; agentId: string; config: AgentConfig; revision: number };
+type ConfigFrame = { type: "agent:config"; agentId: string; config: AgentConfig; revision: number; interrupt?: boolean };
 
 class RouteOrchestrator extends AgentOrchestrator {
   readonly resets: Array<{ agentId: string; mode: string; options: ResetAgentOptions }> = [];
@@ -53,7 +52,7 @@ class RouteOrchestrator extends AgentOrchestrator {
   }
 }
 
-async function seed(app: { app: { set: (key: string, value: unknown) => void } }, options: { capable: boolean; agents?: number }) {
+async function seed(app: { app: { set: (key: string, value: unknown) => void } }, options: { capable: boolean; interruptCapable?: boolean; agents?: number }) {
   const slug = `push-${randomUUID().slice(0, 8)}`;
   const [owner] = await getDb().insert(users).values({
     email: `${slug}@slock.test`,
@@ -86,7 +85,17 @@ async function seed(app: { app: { set: (key: string, value: unknown) => void } }
     rows.push(agent!);
   }
   const orchestrator = new RouteOrchestrator();
-  orchestrator.bind(machine!.id, server.id, options.capable ? [DAEMON_CAPABILITY_AGENT_CONFIG_PUSH] : []);
+  orchestrator.bind(
+    machine!.id,
+    server.id,
+    options.capable
+      ? [
+          DAEMON_CAPABILITY_AGENT_CONFIG_PUSH,
+          DAEMON_CAPABILITY_CONSTRUCTED_INIT_V1,
+          ...(options.interruptCapable ? [DAEMON_CAPABILITY_AGENT_CONFIG_INTERRUPT] : []),
+        ]
+      : [],
+  );
   app.app.set("agentOrchestrator", orchestrator);
   const token = await tokenForHuman(owner!.email);
   const headers = { Authorization: `Bearer ${token}`, "X-Server-Id": server.id, "Content-Type": "application/json" };
@@ -97,37 +106,102 @@ async function revisionOf(agentId: string): Promise<number> {
   return (await getDb().select({ revision: agents.configRevision }).from(agents).where(eq(agents.id, agentId)))[0]!.revision;
 }
 
-test("PATCH without restartMode, capable daemon: agent:config with revision n+1, no reset, configApply when_idle", async ({ app }) => {
-  const { agent, orchestrator, headers } = await seed(app, { capable: true });
+test("PATCH without restartMode, interrupt-capable daemon: idle -> applied, busy -> pushed + immediate restart; description pushes without reset", async ({ app }) => {
+  const { agent, orchestrator, headers } = await seed(app, { capable: true, interruptCapable: true });
   try {
     const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}`, { method: "PATCH", headers, body: JSON.stringify({ model: "opus" }) });
     assert.equal(res.status, 200, await res.clone().text());
-    assert.equal((await res.json() as { configApply: string }).configApply, "when_idle");
+    assert.equal((await res.json() as { configApply: string }).configApply, "applied");
     assert.equal(await revisionOf(agent.id), 1);
     assert.equal(orchestrator.frames.length, 1);
     assert.equal(orchestrator.frames[0]!.revision, 1);
     assert.equal(orchestrator.frames[0]!.config.model, "opus");
+    assert.equal(orchestrator.frames[0]!.interrupt, undefined, "idle push does not set interrupt");
     assert.deepEqual(orchestrator.resets, []);
 
-    // A description edit changes no runtime value: no revision, no push.
+    // #proj-runtime:#80: while running a foreground turn on a Computer with
+    // `agent:config-interrupt-v1`, server pushes agent:config with interrupt: true
+    // (so the daemon captures the interrupted-turn handoff note) and immediately restarts.
+    (orchestrator as any).broadcastActivity(agent.id, "working", "Running tool", "tool_use");
+    const haikuConfig = { version: RUNTIME_CONFIG_VERSION, runtime: "claude", model: { kind: "preset", id: "haiku" }, mode: { kind: "default" } };
+    const whileBusy = await fetch(`${app.baseUrl}/api/agents/${agent.id}`, { method: "PATCH", headers, body: JSON.stringify({ model: "haiku", runtimeConfig: haikuConfig }) });
+    assert.equal(whileBusy.status, 200, await whileBusy.clone().text());
+    assert.equal((await whileBusy.json() as { configApply: string }).configApply, "restarted");
+    assert.equal(await revisionOf(agent.id), 2);
+    assert.equal(orchestrator.frames.length, 2);
+    assert.equal(orchestrator.frames[1]!.config.model, "haiku");
+    assert.equal(orchestrator.frames[1]!.interrupt, true, "busy push sets interrupt: true");
+    assert.deepEqual(orchestrator.resets, [{
+      agentId: agent.id,
+      mode: "session",
+      options: { restartIfStopped: false, restartEvenIfInactive: true, terminalControl: "runtime_config_changed" },
+    }]);
+
+    // #proj-runtime:#80: a BYOC description edit bumps configRevision and pushes agent:config for standing-prompt refresh without interrupting even while busy.
     const described = await fetch(`${app.baseUrl}/api/agents/${agent.id}`, { method: "PATCH", headers, body: JSON.stringify({ description: "notes" }) });
-    assert.equal((await described.json() as { configApply: string }).configApply, "saved");
-    assert.equal(await revisionOf(agent.id), 1);
-    assert.equal(orchestrator.frames.length, 1);
+    assert.equal((await described.json() as { configApply: string }).configApply, "applied");
+    assert.equal(await revisionOf(agent.id), 3);
+    assert.equal(orchestrator.frames.length, 3);
+    assert.equal(orchestrator.frames[2]!.config.description, "notes");
+    assert.equal(orchestrator.frames[2]!.interrupt, undefined, "description edit never interrupts");
+    assert.equal(orchestrator.resets.length, 1);
   } finally {
     await orchestrator.shutdown();
   }
 });
 
-test("PATCH without restartMode, old daemon: no frame, no reset, configApply saved", async ({ app }) => {
+test("PATCH without restartMode, push-capable daemon WITHOUT agent:config-interrupt-v1: busy does not resetAgent and returns when_idle (#proj-runtime:#80)", async ({ app }) => {
+  const { agent, orchestrator, headers } = await seed(app, { capable: true, interruptCapable: false });
+  try {
+    (orchestrator as any).broadcastActivity(agent.id, "working", "Running tool", "tool_use");
+    const haikuConfig = { version: RUNTIME_CONFIG_VERSION, runtime: "claude", model: { kind: "preset", id: "haiku" }, mode: { kind: "default" } };
+    const whileBusy = await fetch(`${app.baseUrl}/api/agents/${agent.id}`, { method: "PATCH", headers, body: JSON.stringify({ model: "haiku", runtimeConfig: haikuConfig }) });
+    assert.equal(whileBusy.status, 200, await whileBusy.clone().text());
+    assert.equal((await whileBusy.json() as { configApply: string }).configApply, "when_idle");
+    assert.equal(orchestrator.frames.length, 1);
+    assert.equal(orchestrator.frames[0]!.interrupt, undefined, "no interrupt flag without capability");
+    assert.deepEqual(orchestrator.resets, [], "older Computer without agent:config-interrupt-v1 is not reset mid-turn");
+  } finally {
+    await orchestrator.shutdown();
+  }
+});
+
+test("PATCH without restartMode, old daemon without push: idle restarts immediately; busy waits until observed idle (#proj-runtime:#80)", async ({ app }) => {
   const { agent, orchestrator, headers } = await seed(app, { capable: false });
   try {
+    // Idle agent: server triggers fallback restart right away.
     const res = await fetch(`${app.baseUrl}/api/agents/${agent.id}`, { method: "PATCH", headers, body: JSON.stringify({ model: "opus" }) });
     assert.equal(res.status, 200, await res.clone().text());
-    assert.equal((await res.json() as { configApply: string }).configApply, "saved");
+    const body = await res.json() as { configApply: string; configApplyNewSession?: boolean };
+    assert.equal(body.configApply, "restarted");
+    assert.equal(body.configApplyNewSession, false, "old daemon without constructed-init:v1 keeps session on non-Codex model switch");
     assert.equal(await revisionOf(agent.id), 1, "the revision moves with the change whatever the daemon");
     assert.deepEqual(orchestrator.frames, []);
-    assert.deepEqual(orchestrator.resets, []);
+    assert.deepEqual(orchestrator.resets, [{
+      agentId: agent.id,
+      mode: "restart",
+      options: { restartIfStopped: false, restartEvenIfInactive: false, terminalControl: "runtime_config_changed" },
+    }]);
+
+    // Busy agent (foreground turn running): does NOT kill mid-turn on older Computer; returns when_idle and restarts once online arrives.
+    (orchestrator as any).broadcastActivity(agent.id, "working", "Thinking", "other");
+    const haikuConfig = { version: RUNTIME_CONFIG_VERSION, runtime: "claude", model: { kind: "preset", id: "haiku" }, mode: { kind: "default" } };
+    const busyRes = await fetch(`${app.baseUrl}/api/agents/${agent.id}`, { method: "PATCH", headers, body: JSON.stringify({ model: "haiku", runtimeConfig: haikuConfig }) });
+    assert.equal(busyRes.status, 200, await busyRes.clone().text());
+    const busyBody = await busyRes.json() as { configApply: string; configApplyNewSession?: boolean };
+    assert.equal(busyBody.configApply, "when_idle");
+    assert.equal(busyBody.configApplyNewSession, false);
+    assert.equal(orchestrator.resets.length, 1, "did not interrupt the running foreground turn");
+
+    // Foreground turn ends -> online activity triggers the queued fallback restart once.
+    (orchestrator as any).broadcastActivity(agent.id, "online", "", "none");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(orchestrator.resets.length, 2, "queued fallback fired when agent went idle");
+    assert.deepEqual(orchestrator.resets[1], {
+      agentId: agent.id,
+      mode: "restart",
+      options: { restartIfStopped: false, restartEvenIfInactive: false, terminalControl: "runtime_config_changed" },
+    });
   } finally {
     await orchestrator.shutdown();
   }
@@ -146,7 +220,7 @@ test("PATCH with restartMode resets as before, also on a capable daemon", async 
     assert.deepEqual(orchestrator.frames, []);
     assert.deepEqual(orchestrator.resets, [{
       agentId: agent.id,
-      mode: "restart",
+      mode: "session",
       options: { restartIfStopped: false, terminalControl: "runtime_config_changed" },
     }]);
   } finally {
@@ -164,7 +238,7 @@ async function mcpApp(serverId: string, userId: string) {
 }
 
 for (const capable of [true, false]) {
-  test(`managed MCP, ${capable ? "capable" : "old"} daemon: bulk ${capable ? "pushes" : "resets"}, single ${capable ? "pushes" : "sends nothing"}`, async ({ app }) => {
+  test(`managed MCP, ${capable ? "capable" : "old"} daemon: both bulk and single ${capable ? "push" : "use idle-safe fallback restart"}`, async ({ app }) => {
     const originalKey = process.env.SLOCK_MCP_CREDENTIAL_KEY;
     process.env.SLOCK_MCP_CREDENTIAL_KEY = Buffer.alloc(32, 7).toString("base64");
     const { owner, server, agent, orchestrator, headers } = await seed(app, { capable });
@@ -178,7 +252,7 @@ for (const capable of [true, false]) {
       assert.equal(bulk.status, 200, await bulk.clone().text());
       assert.equal(await revisionOf(agent.id), 1);
       assert.deepEqual(orchestrator.frames.map((frame) => frame.revision), capable ? [1] : []);
-      assert.deepEqual(orchestrator.resets, capable ? [] : [{ agentId: agent.id, mode: "restart", options: { restartIfStopped: false } }]);
+      assert.deepEqual(orchestrator.resets, capable ? [] : [{ agentId: agent.id, mode: "restart", options: { restartIfStopped: false, restartEvenIfInactive: false } }]);
 
       const single = await fetch(`${app.baseUrl}/api/mcp/agents/${agent.id}/assignments/${created.id}`, {
         method: "PUT",
@@ -189,7 +263,7 @@ for (const capable of [true, false]) {
       assert.equal(await revisionOf(agent.id), 2);
       assert.deepEqual(orchestrator.frames.map((frame) => frame.revision), capable ? [1, 2] : []);
       if (capable) assert.notEqual(orchestrator.frames[1]!.config.managedMcpFingerprint, orchestrator.frames[0]!.config.managedMcpFingerprint);
-      assert.equal(orchestrator.resets.length, capable ? 0 : 1, "the single route never resets");
+      assert.equal(orchestrator.resets.length, capable ? 0 : 2, "both bulk and single fallback-restart idle agents on old daemons");
     } finally {
       await orchestrator.shutdown();
       if (originalKey === undefined) delete process.env.SLOCK_MCP_CREDENTIAL_KEY;
@@ -229,51 +303,3 @@ test("managed MCP narrowing waits for idle safely: the running agent's next call
     else process.env.SLOCK_MCP_CREDENTIAL_KEY = originalKey;
   }
 });
-
-for (const capable of [true, false]) {
-  test(`provider connection key edit, ${capable ? "capable" : "old"} daemon: ${capable ? "pushes to each assigned running agent" : "pushes nothing"}`, async ({ app }) => {
-    const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
-    process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 8).toString("base64");
-    const { owner, server, agents: rows, orchestrator, headers } = await seed(app, { capable, agents: 3 });
-    try {
-      await getDb().insert(featureFlagRules).values({
-        id: randomUUID(),
-        flagKey: PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY,
-        stage: "server",
-        priority: -100,
-        decision: "allow",
-        values: [server.id],
-      });
-      const connection = await createProviderConnection({ serverId: server.id, userId: owner.id, name: "Team", providerId: "deepseek", apiKey: "old-key" });
-      // Two agents launch through the connection; the third does not, and one of the two is not running.
-      for (const agent of rows.slice(0, 2)) {
-        await getDb().insert(agentProviderConnections).values({
-          serverId: server.id,
-          agentId: agent.id,
-          connectionId: connection.id,
-          expectedConfigVersion: 1,
-          expectedCredentialVersion: 1,
-        });
-      }
-      await getDb().update(agents).set({ status: "inactive" }).where(eq(agents.id, rows[1]!.id));
-
-      const res = await fetch(`${app.baseUrl}/api/provider-connections/${connection.id}`, {
-        method: "PATCH",
-        headers,
-        body: JSON.stringify({ apiKey: "new-key" }),
-      });
-      assert.equal(res.status, 200, await res.clone().text());
-      assert.deepEqual(await Promise.all(rows.map((agent) => revisionOf(agent.id))), [1, 1, 0]);
-      assert.deepEqual(orchestrator.frames.map((frame) => [frame.agentId, frame.revision]), capable ? [[rows[0]!.id, 1]] : []);
-      if (capable) {
-        assert.match(String(orchestrator.frames[0]!.config.providerConnectionRevision), new RegExp(`^${connection.id}:\\d+:2$`));
-        assert.equal(JSON.stringify(orchestrator.frames[0]).includes("new-key"), false, "the key never rides the config");
-      }
-      assert.deepEqual(orchestrator.resets, []);
-    } finally {
-      await orchestrator.shutdown();
-      if (originalKey === undefined) delete process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
-      else process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = originalKey;
-    }
-  });
-}

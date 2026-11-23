@@ -6,7 +6,7 @@ import { useSyncExternalStore } from "react";
  * features/webPreview/WebLinkChoiceDialog). Only where the desktop web
  * preview view is on (desktop_web_preview_view_v0 and a shell with
  * raftDesktop.webPreview); a browser tab never reads it. Kept on this device
- * only, like the Raft-link choice beside it (linkOpenPreference.ts).
+ * only.
  *
  * - `beside`: in Raft, in the web preview beside the conversation.
  * - `browser`: in the system browser, as before.

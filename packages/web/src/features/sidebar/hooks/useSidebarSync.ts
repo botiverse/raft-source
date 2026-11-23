@@ -10,6 +10,8 @@ import { hasOtherServerActivityUnread } from "../../../utils/serverUnreadSummary
 import { isSidebarDisclosureRestoreState } from "../../../components/layout/sidebarChannelFocus";
 import { writeSidebarCollapsedSection, writeSidebarCustomSectionCollapsed } from "../../../components/layout/sidebarCollapsedSections";
 import type { SidebarCollapsedSection } from "../../../components/layout/sidebarCollapsedSections";
+import { capturePointAnchor } from "../../../components/ui/popupAnchor";
+import type { LongPressCoords } from "../../../hooks/useLongPress";
 import type { CtxMenu } from "../sidebarContextMenu";
 import { arraysEqual, reconcileOrderIds } from "../sidebarOrderIds";
 import { expandSidebarSections } from "../expandSidebarSections";
@@ -33,7 +35,7 @@ export function useSidebarSync(data: SidebarData, view: SidebarViewState) {
   const {
     dmChannels, channels, channelRowsDisplayOnlyRef, userId, serverId, serversCount, sidebarOrder,
     updateSidebarOrder, hasLocalUnread, loadInbox, navigate, location, loadServerUnreadSummary, ctxMenu,
-    setCtxMenu, setMoveToSectionMenuOpen, setMoveToSectionMenuPosition,
+    setCtxMenu, setMoveToSectionMenuOpen,
   } = data;
   const {
     setSectionCtxMenu, sectionCtxMenu, setSidebarSurfaceCtxMenu, sidebarSurfaceCtxMenu,
@@ -229,7 +231,6 @@ export function useSidebarSync(data: SidebarData, view: SidebarViewState) {
   const closeCtx = useCallback(() => {
     setCtxMenu(null);
     setMoveToSectionMenuOpen(false);
-    setMoveToSectionMenuPosition(null);
   }, []);
   // Each menu below is a layer on the registry's stack while open: Esc closes the innermost one (focus stays on
   // its trigger).
@@ -266,9 +267,9 @@ export function useSidebarSync(data: SidebarData, view: SidebarViewState) {
   // Ref tracking which item is being long-pressed (set on touchstart).
   const longPressTargetRef = useRef<{ type: CtxMenu["type"]; id: string } | null>(null);
 
-  const openCtxMenuAt = useCallback((x: number, y: number, type: CtxMenu["type"], id: string) => {
+  const openCtxMenuAt = useCallback((x: number, y: number, target: Element | null, type: CtxMenu["type"], id: string) => {
     if (type === "channel" && channelRowsDisplayOnlyRef.current) return;
-    setCtxMenu({ x, y, type, id });
+    setCtxMenu({ anchor: capturePointAnchor(x, y, target), type, id });
     // Shield against the phantom click that fires after the long-press
     // touchend on iOS PWA standalone mode. Without this, the synthetic
     // click lands on the overlay (or the first menu button, if the finger
@@ -286,9 +287,9 @@ export function useSidebarSync(data: SidebarData, view: SidebarViewState) {
   // callbacks stable, which is what lets the memo'd row leaves skip re-render when
   // the parent re-renders (every message:new churns channels/dmChannels).
   // Stryker disable all: pre-existing long-press dispatch is outside the workspace mutation corpus.
-  const onLongPress = useCallback((coords: { x: number; y: number }) => {
+  const onLongPress = useCallback((coords: LongPressCoords) => {
     if (longPressTargetRef.current) {
-      openCtxMenuAt(coords.x, coords.y, longPressTargetRef.current.type, longPressTargetRef.current.id);
+      openCtxMenuAt(coords.x, coords.y, coords.target, longPressTargetRef.current.type, longPressTargetRef.current.id);
     }
   }, [openCtxMenuAt]);
   // Stryker restore all

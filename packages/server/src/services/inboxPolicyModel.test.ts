@@ -11,6 +11,7 @@ import {
   channels,
   featureFlags,
   inboxNotificationFacts,
+  inboxSuppressionStates,
   inboxTargetMuteStates,
   jointChannels,
   jointChannelServers,
@@ -1261,6 +1262,267 @@ test("PGlite differential: muted ordinary traffic has no Inbox fact while channe
   }
 });
 
+test("PGlite: a mention past the mute lights a muted row with a pre-mute message without moving it; a mention-only muted row shows its mention", async () => {
+  await initCurrentPolicyDatabase();
+  try {
+    const db = getDb();
+    const [owner] = await db.insert(users).values({
+      email: "muted-latest-owner@test.com",
+      name: "MutedLatestOwner",
+      passwordHash: "x",
+      emailVerified: true,
+    }).returning();
+    const [other] = await db.insert(users).values({
+      email: "muted-latest-other@test.com",
+      name: "MutedLatestOther",
+      passwordHash: "x",
+      emailVerified: true,
+    }).returning();
+    const [server] = await db.insert(servers).values({
+      name: "Muted Latest",
+      slug: "muted-latest",
+      ownerId: owner.id,
+      plan: "pro",
+    }).returning();
+    await db.insert(serverMembers).values([
+      { serverId: server.id, userId: owner.id, role: "owner" },
+      { serverId: server.id, userId: other.id, role: "member" },
+    ]);
+    const [prefixed, mentionOnly, unmuted] = await db.insert(channels).values([
+      { serverId: server.id, name: "prefixed", type: "channel" },
+      { serverId: server.id, name: "mention-only", type: "channel" },
+      { serverId: server.id, name: "unmuted", type: "channel" },
+    ]).returning();
+    await db.insert(channelHumans).values([prefixed, mentionOnly, unmuted].flatMap((channel) => [
+      { channelId: channel!.id, userId: owner.id },
+      { channelId: channel!.id, userId: other.id },
+    ]));
+    const send = async (channelId: string, content: string, at: number) => {
+      const [row] = await db.insert(messages).values({
+        channelId,
+        senderType: "user",
+        senderId: other.id,
+        content,
+        createdAt: new Date(BASE_TIME + at),
+      }).returning();
+      return row!;
+    };
+    const mention = (row: typeof messages.$inferSelect) => db.insert(messageMentions).values({
+      messageId: row.id,
+      messageSeq: row.seq,
+      serverId: server.id,
+      channelId: row.channelId,
+      targetType: "user",
+      targetId: owner.id,
+      handleAtSendTime: "MutedLatestOwner",
+      notifiableAtSend: true,
+    });
+
+    // prefixed: one message before the mute, then an @mention past it.
+    const preMute = await send(prefixed!.id, "before the mute", 1_000);
+    const prefixedMention = await send(prefixed!.id, "@MutedLatestOwner past the mute", 5_000);
+    await mention(prefixedMention);
+    // mention-only: muted from its first message, an @mention only.
+    const onlyMention = await send(mentionOnly!.id, "@MutedLatestOwner in a muted channel", 3_000);
+    await mention(onlyMention);
+    // unmuted: an ordinary message between the two, its row unaffected.
+    const ordinary = await send(unmuted!.id, "ordinary", 4_000);
+    await db.insert(inboxTargetMuteStates).values([
+      { receiverType: "user", receiverId: owner.id, serverId: server.id, sourceChannelId: prefixed!.id, muteFromSeq: prefixedMention.seq },
+      { receiverType: "user", receiverId: owner.id, serverId: server.id, sourceChannelId: mentionOnly!.id, muteFromSeq: onlyMention.seq },
+    ]);
+
+    for (const filter of ["all", "mentions"] as const) {
+      const result = await getInboxItems(server.id, owner.id, { filter });
+      const row = (channelId: string) => {
+        const item = result.items.find((candidate) => candidate.kind === "channel" && candidate.channelId === channelId);
+        if (item?.kind !== "channel") throw new Error(`${filter}: row ${channelId} is not listed`);
+        return item;
+      };
+      const prefixedRow = row(prefixed!.id);
+      assert.equal(prefixedRow.hasMention, true, `${filter}: the mention past the mute lights the muted row`);
+      assert.equal(prefixedRow.lastMessageId, preMute.id, `${filter}: the muted row keeps its latest pre-mute message`);
+      assert.equal(prefixedRow.lastMessagePreview, "before the mute", `${filter}: preview stays pre-mute`);
+      assert.equal(String(prefixedRow.latestActivitySeq), String(preMute.seq), `${filter}: latestActivitySeq stays pre-mute`);
+      const onlyRow = row(mentionOnly!.id);
+      assert.equal(onlyRow.hasMention, true, `${filter}: the mention-only muted row is lit`);
+      assert.equal(onlyRow.lastMessageId, onlyMention.id, `${filter}: a muted row with no pre-mute message shows its mention`);
+      assert.equal(String(onlyRow.latestActivitySeq), String(onlyMention.seq), `${filter}: mention-only row is at its mention`);
+      if (filter === "all") {
+        assert.equal(row(unmuted!.id).lastMessageId, ordinary.id, "an unmuted row shows its latest message");
+        assert.deepEqual(
+          result.items.map((item) => (item.kind === "channel" ? item.channelId : null)),
+          [unmuted!.id, mentionOnly!.id, prefixed!.id],
+          "ordering: the muted row sits at its pre-mute message, the mention-only row at its mention",
+        );
+      } else {
+        assert.deepEqual(
+          result.items.map((item) => (item.kind === "channel" ? item.channelId : null)),
+          [mentionOnly!.id, prefixed!.id],
+          "Mentions ordering follows the same latest message",
+        );
+      }
+    }
+  } finally {
+    await closeTestDatabase();
+  }
+});
+
+test("PGlite: Done on a muted row holds past post-mute traffic; only an unread mention past the Done frontiers relights it, at its pre-mute position", async () => {
+  await initCurrentPolicyDatabase();
+  try {
+    const db = getDb();
+    const [owner] = await db.insert(users).values({
+      email: "muted-done-owner@test.com",
+      name: "MutedDoneOwner",
+      passwordHash: "x",
+      emailVerified: true,
+    }).returning();
+    const [other] = await db.insert(users).values({
+      email: "muted-done-other@test.com",
+      name: "MutedDoneOther",
+      passwordHash: "x",
+      emailVerified: true,
+    }).returning();
+    const [server] = await db.insert(servers).values({
+      name: "Muted Done",
+      slug: "muted-done",
+      ownerId: owner.id,
+      plan: "pro",
+    }).returning();
+    await db.insert(serverMembers).values([
+      { serverId: server.id, userId: owner.id, role: "owner" },
+      { serverId: server.id, userId: other.id, role: "member" },
+    ]);
+    const [donePlain, doneMention, doneMentionOnly, atFrontier, unmuted, unmutedDone] = await db.insert(channels).values([
+      { serverId: server.id, name: "done-plain", type: "channel" },
+      { serverId: server.id, name: "done-mention", type: "channel" },
+      { serverId: server.id, name: "done-mention-only", type: "channel" },
+      { serverId: server.id, name: "at-frontier", type: "channel" },
+      { serverId: server.id, name: "unmuted", type: "channel" },
+      { serverId: server.id, name: "unmuted-done", type: "channel" },
+    ]).returning();
+    await db.insert(channelHumans).values([donePlain, doneMention, doneMentionOnly, atFrontier, unmuted, unmutedDone].flatMap((channel) => [
+      { channelId: channel!.id, userId: owner.id },
+      { channelId: channel!.id, userId: other.id },
+    ]));
+    const send = async (channelId: string, content: string, at: number) => {
+      const [row] = await db.insert(messages).values({
+        channelId,
+        senderType: "user",
+        senderId: other.id,
+        content,
+        createdAt: new Date(BASE_TIME + at),
+      }).returning();
+      return row!;
+    };
+    const mention = (row: typeof messages.$inferSelect) => db.insert(messageMentions).values({
+      messageId: row.id,
+      messageSeq: row.seq,
+      serverId: server.id,
+      channelId: row.channelId,
+      targetType: "user",
+      targetId: owner.id,
+      handleAtSendTime: "MutedDoneOwner",
+      notifiableAtSend: true,
+    });
+    const mute = (channelId: string, muteFromSeq: number) => db.insert(inboxTargetMuteStates).values({
+      receiverType: "user", receiverId: owner.id, serverId: server.id, sourceChannelId: channelId, muteFromSeq,
+    });
+    // Done as the sequencer writes it: the member row and, for a public
+    // channel, the mention row at the frontier, the cursor at the frontier
+    // (unless the case needs an unread mention below it), and the broad
+    // done_at that the next message insert clears for everyone.
+    const markDone = async (channelId: string, frontier: number, opts: { moveCursor?: boolean } = {}) => {
+      await db.insert(inboxSuppressionStates).values((["channel", "public_channel_mention"] as const).map((targetKind) => ({
+        receiverType: "user" as const,
+        receiverId: owner.id,
+        serverId: server.id,
+        targetKind,
+        targetChannelId: channelId,
+        sourceChannelId: channelId,
+        doneThroughSeq: frontier,
+        doneAt: new Date(BASE_TIME + 4_500),
+        writeSite: "test",
+      })));
+      await db.insert(userChannelInboxStates).values({ userId: owner.id, channelId, doneAt: null });
+      if (opts.moveCursor ?? true) {
+        await db.insert(userChannelReadCursors).values({ userId: owner.id, channelId, lastReadSeq: frontier });
+      }
+    };
+
+    // (a) muted + Done, then a plain message past the mute: stays hidden (its
+    // pre-mute message is a read mention, so Mentions would list it too).
+    const plainPreMute = await send(donePlain!.id, "@MutedDoneOwner before the mute", 1_000);
+    await mention(plainPreMute);
+    const plainPastMute = await send(donePlain!.id, "plain past the mute", 6_000);
+    await mute(donePlain!.id, plainPastMute.seq);
+    await markDone(donePlain!.id, plainPreMute.seq);
+
+    // (b) muted + Done, then a personal mention past the mute: listed at its
+    // pre-mute message.
+    const preMute = await send(doneMention!.id, "before the mute", 2_000);
+    const mentionPastDone = await send(doneMention!.id, "@MutedDoneOwner past the mute and Done", 7_000);
+    await mention(mentionPastDone);
+    await mute(doneMention!.id, mentionPastDone.seq);
+    await markDone(doneMention!.id, preMute.seq);
+
+    // (c) muted with no pre-mute message, Done through a plain post-mute
+    // message, then a mention: a mention-only row at its mention.
+    const onlyPlain = await send(doneMentionOnly!.id, "plain in a muted channel", 3_000);
+    const onlyMention = await send(doneMentionOnly!.id, "@MutedDoneOwner after Done", 8_000);
+    await mention(onlyMention);
+    await mute(doneMentionOnly!.id, onlyPlain.seq);
+    await markDone(doneMentionOnly!.id, onlyPlain.seq);
+
+    // (d) an unread mention at the mention frontier does not relight the row.
+    const frontierMention = await send(atFrontier!.id, "@MutedDoneOwner at the frontier", 3_500);
+    await mention(frontierMention);
+    await mute(atFrontier!.id, frontierMention.seq);
+    await markDone(atFrontier!.id, frontierMention.seq, { moveCursor: false });
+
+    const ordinary = await send(unmuted!.id, "ordinary", 4_000);
+    // (e) unmuted + Done with nothing after it: absent (the eligible_chats prefilter).
+    const unmutedDoneLast = await send(unmutedDone!.id, "unmuted then Done", 3_000);
+    await markDone(unmutedDone!.id, unmutedDoneLast.seq);
+
+    for (const filter of ["all", "mentions"] as const) {
+      const result = await getInboxItems(server.id, owner.id, { filter });
+      const channelIds = result.items.map((item) => (item.kind === "channel" ? item.channelId : null));
+      const row = (channelId: string) => {
+        const item = result.items.find((candidate) => candidate.kind === "channel" && candidate.channelId === channelId);
+        if (item?.kind !== "channel") throw new Error(`${filter}: row ${channelId} is not listed`);
+        return item;
+      };
+      assert.equal(channelIds.includes(donePlain!.id), false, `${filter}: a plain message past the mute does not reopen a Done muted row`);
+      assert.equal(channelIds.includes(atFrontier!.id), false, `${filter}: a mention at the mention frontier stays Done`);
+      assert.equal(channelIds.includes(unmutedDone!.id), false, `${filter}: an unmuted Done row stays Done`);
+      const relit = row(doneMention!.id);
+      assert.equal(relit.hasMention, true, `${filter}: the mention past Done lights the row`);
+      assert.equal(relit.lastMessageId, preMute.id, `${filter}: the relit row keeps its pre-mute message`);
+      assert.equal(relit.lastMessagePreview, "before the mute", `${filter}: preview stays pre-mute`);
+      assert.equal(String(relit.latestActivitySeq), String(preMute.seq), `${filter}: latestActivitySeq stays pre-mute`);
+      const only = row(doneMentionOnly!.id);
+      assert.equal(only.hasMention, true, `${filter}: the mention-only row is lit`);
+      assert.equal(only.unreadCount, 0, `${filter}: a mention-only row counts nothing`);
+      assert.equal(only.lastMessageId, onlyMention.id, `${filter}: the mention-only row shows its mention`);
+      if (filter === "all") {
+        assert.equal(row(unmuted!.id).lastMessageId, ordinary.id);
+        assert.deepEqual(
+          channelIds,
+          [doneMentionOnly!.id, unmuted!.id, doneMention!.id],
+          "ordering: the relit muted row sits at its pre-mute message, behind a newer unmuted row",
+        );
+        assert.equal(result.totalCount, 3);
+      } else {
+        assert.deepEqual(channelIds, [doneMentionOnly!.id, doneMention!.id]);
+      }
+    }
+  } finally {
+    await closeTestDatabase();
+  }
+});
+
 test("parent channel mute leaves followed-thread ordinary replies independent while unfollow hides the row", () => {
   const followedModel = baseModel({
     channels: [
@@ -1510,7 +1772,7 @@ test("mute boundary preserves pre-mute activity history and hides post-mute ordi
 
   const piercedRow = projectCurrentInboxPolicy(piercedMentionModel, "all").rows[0]!;
   if (piercedRow.kind !== "channel") assert.fail(`expected channel row, got ${piercedRow.kind}`);
-  assert.equal(piercedRow.latestMessageId, "c-general-m3");
+  assert.equal(piercedRow.latestMessageId, "c-general-m2", "the mention past the mute does not move the row");
   assert.equal(piercedRow.firstUnreadMessageId, "c-general-m2");
   assert.equal(piercedRow.unreadCount, 1, "the mention past the mute lights the @ and does not count");
   assert.equal(piercedRow.hasMention, true);
@@ -1715,14 +1977,6 @@ test("contract: member mute freezes channel while followed threads stay independ
   });
   assert.deepEqual(rowSummary(mentionedAfterMute), [
     {
-      key: "channel:c-main",
-      latestMessageId: "c-main-m4",
-      // Past the mute: the @ lights, nothing counts.
-      firstUnreadMessageId: null,
-      unreadCount: 0,
-      hasMention: true,
-    },
-    {
       key: "thread:t-main-1",
       latestMessageId: "t-main-1-m4",
       firstUnreadMessageId: "t-main-1-m4",
@@ -1735,6 +1989,15 @@ test("contract: member mute freezes channel while followed threads stay independ
       firstUnreadMessageId: "c-other-m1",
       unreadCount: 2,
       hasMention: false,
+    },
+    {
+      key: "channel:c-main",
+      // Past the mute: the @ lights, nothing counts, and the row stays at its
+      // latest pre-mute message (and its place in the order).
+      latestMessageId: "c-main-m2",
+      firstUnreadMessageId: null,
+      unreadCount: 0,
+      hasMention: true,
     },
   ]);
 
@@ -2033,8 +2296,9 @@ test("property: serving rows use notification facts with latest_notified_seq as 
                 messageId,
                 activityAt: eventIndex + 1,
                 personalMention,
-                // A mention that pierces the mute lights the @ and does not count (#244).
-                ...(mutedTargets[receiver].has(channelId) ? { unreadEligible: false } : {}),
+                // A mention that pierces the mute lights the @, does not count,
+                // and does not move the row off its latest pre-mute fact (#244).
+                ...(mutedTargets[receiver].has(channelId) ? { unreadEligible: false, pastMute: true } : {}),
               });
             }
           }
@@ -2322,13 +2586,14 @@ test("property: inbox order and pagination respect mid-conversation mute boundar
 
         const expectedAllRows = channelSpecs.flatMap((spec, index) => {
           const channelId = `c-order-${index}`;
-          const includedSeqs = [1, 2, 3].filter((seq) =>
-            spec.muteFromSeq === 0 || seq < spec.muteFromSeq || seq === spec.mentionSeq
-          );
-          const latestSeq = includedSeqs[includedSeqs.length - 1];
+          const preMuteSeqs = [1, 2, 3].filter((seq) => spec.muteFromSeq === 0 || seq < spec.muteFromSeq);
+          // A muted row stays at its latest pre-mute message; only a row with
+          // none is listed at its personal mention past the mute (#244).
+          const latestSeq = preMuteSeqs[preMuteSeqs.length - 1]
+            ?? (spec.mentionSeq > 0 && spec.mentionSeq >= spec.muteFromSeq ? spec.mentionSeq : undefined);
           if (latestSeq == null) return [];
-          // Past the mute only a mention is listed, and it does not count (#244).
-          const unreadSeqs = includedSeqs.filter((seq) => seq > spec.lastReadSeq && (spec.muteFromSeq === 0 || seq < spec.muteFromSeq));
+          // Past the mute nothing counts (#244).
+          const unreadSeqs = preMuteSeqs.filter((seq) => seq > spec.lastReadSeq);
           const mentionTargetsReceiver = spec.mentionSeq > 0;
           return [{
             key: `channel:${channelId}`,
@@ -2538,12 +2803,13 @@ test("trace: Inbox event path pins receiver-specific state transitions", () => {
     {
       event: "user checks mentions after personal mention pierces mute",
       view: {
-        // The mention past the mute lights the @ and does not count (#244).
+        // The mention past the mute lights the @, does not count, and keeps
+        // the row at its latest pre-mute message (#244).
         totalCount: 1,
         totalUnreadCount: 1,
         rows: [{
           key: "channel:c-trace",
-          latestMessageId: "c-trace-m3",
+          latestMessageId: "c-trace-m1",
           firstUnreadMessageId: "c-trace-m1",
           unreadCount: 1,
           hasMention: true,
@@ -2558,7 +2824,7 @@ test("trace: Inbox event path pins receiver-specific state transitions", () => {
         totalUnreadCount: 0,
         rows: [{
           key: "channel:c-trace",
-          latestMessageId: "c-trace-m3",
+          latestMessageId: "c-trace-m1",
           firstUnreadMessageId: null,
           unreadCount: 0,
           hasMention: false,
@@ -2660,15 +2926,18 @@ test("property: Inbox view checks observe the event-state-machine projection", (
                 .map((mention) => mention.messageSeq),
             );
             const muteFromSeq = muteByReceiver[receiver][channelId];
-            const included = messagesForChannel.filter((msg) =>
-              muteFromSeq == null || msg.seq < muteFromSeq || visibleMentionSeqs.has(msg.seq)
-            );
-            const latest = included[included.length - 1];
+            const preMute = messagesForChannel.filter((msg) => muteFromSeq == null || msg.seq < muteFromSeq);
+            // A muted row stays at its latest pre-mute message; only a row with
+            // none is listed at its latest personal mention past the mute (#244).
+            const anchorCandidates = preMute.length > 0
+              ? preMute
+              : messagesForChannel.filter((msg) => visibleMentionSeqs.has(msg.seq));
+            const latest = anchorCandidates[anchorCandidates.length - 1];
             if (!latest) return [];
 
             const readSeq = readByReceiver[receiver][channelId] ?? 0;
-            // A mention past the mute is listed and lights the @, and does not count (#244).
-            const unread = included.filter((msg) => msg.seq > readSeq && (muteFromSeq == null || msg.seq < muteFromSeq));
+            // A mention past the mute lights the @ and does not count (#244).
+            const unread = preMute.filter((msg) => msg.seq > readSeq);
             return [{
               key: `channel:${channelId}`,
               activityAt: latest.createdAt,

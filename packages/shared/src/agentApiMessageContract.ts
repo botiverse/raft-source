@@ -243,6 +243,17 @@ export const agentApiMessageReactionSchema = lazySchema("agentApiMessageReaction
   })).optional(),
 }));
 
+/**
+ * Where an outside sender is from (AgentSenderOrigin in agentMessageText.ts),
+ * set only for an agent reader and only when the sender is not a non-guest
+ * member of the reader's server; the description is withheld then. `kind` is
+ * a string so a later kind still parses (renderers show nothing for one they
+ * do not know).
+ */
+const agentApiSenderOriginDescription = "Where an outside sender is from, set only when the sender is not a non-guest member of the reading agent's server: { kind: \"other_server\", serverSlug? } (the slug only when the reader already sees that server in a joint conversation) or { kind: \"guest\" } (a guest of the reader's server). Absent for every other sender.";
+const agentApiSenderOriginSchema = lazySchema("agentApiSenderOriginSchema", () => z.object({ kind: z.string(), serverSlug: z.string().optional() }).passthrough());
+const agentApiSnakeSenderOriginSchema = lazySchema("agentApiSnakeSenderOriginSchema", () => z.object({ kind: z.string(), server_slug: z.string().optional() }).passthrough());
+
 export const agentApiMessageEnvelopeSchema = lazySchema("agentApiMessageEnvelopeSchema", () => passthroughObject({
   seq: optionalNumberSchema,
   id: optionalStringSchema,
@@ -255,6 +266,8 @@ export const agentApiMessageEnvelopeSchema = lazySchema("agentApiMessageEnvelope
   sender_name: optionalStringSchema,
   senderDescription: z.string().nullable().optional(),
   sender_description: z.string().nullable().optional(),
+  senderOrigin: agentApiSenderOriginSchema.nullable().optional().describe(agentApiSenderOriginDescription),
+  sender_origin: agentApiSnakeSenderOriginSchema.nullable().optional().describe(agentApiSenderOriginDescription.replace("serverSlug", "server_slug")),
   senderTimezone: z.string().nullable().optional(),
   sender_timezone: z.string().nullable().optional(),
   delegated_by: z.object({ name: z.string() }).passthrough().nullable().optional(),
@@ -536,6 +549,9 @@ export interface AgentApiMessageEnvelope {
   sender_name?: string;
   senderDescription?: string | null;
   sender_description?: string | null;
+  /** Where an outside sender is from (AgentSenderOrigin; agentApiSenderOriginDescription). */
+  senderOrigin?: { kind: string; serverSlug?: string; [key: string]: unknown } | null;
+  sender_origin?: { kind: string; server_slug?: string; [key: string]: unknown } | null;
   senderTimezone?: string | null;
   sender_timezone?: string | null;
   /** RFC 077: the personal assistant that sent this as its owner (the sender). */

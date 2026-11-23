@@ -14,14 +14,14 @@
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { isGuestRole, type ServerId, type ServerRole } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
-import { channelHumans, channels, serverMembers } from "../db/schema";
+import { channelHumans, channels, serverMembers, servers } from "../db/schema";
 import { UUID_RE } from "../lib/messageId";
 import * as channelService from "../services/channelService";
 import { isLoungeOutsiderAgent } from "../services/agentLoungeService";
 import { DmTargetResolutionError } from "../services/dmTargetResolutionError";
 import { renderRelatedTargets } from "../services/agentInboxItems";
 import { isChannelReadOnlyByBillingFeature, isChannelReadOnlyByQuota } from "../services/planService";
-import { canView, jointHomeProjections, jointHomeRecords, type VisibleRootType } from "../services/visibilityService";
+import { canView, localConversationIds, type VisibleRootType } from "../services/visibilityService";
 
 /** The top-level conversation types an object may be homed in. */
 export type ConversationType = VisibleRootType;
@@ -96,30 +96,36 @@ export async function resolveConversationTarget(agent: ConversationAgent, target
 
 /**
  * Homes (conversation ids an object names) as conversations of `serverId`:
- * the server's own conversations as they are, a joint's canonical channel,
- * or another server's projection of a joint (a home named before publish
- * stored the canonical channel, or a channel converted since), as the
- * server's active projection of it (jointHomeProjections); absent for
- * anything else. In one query, plus two when some id is not the server's.
+ * a joint's canonical channel (or another server's projection) by the
+ * server's active projection (visibilityService localConversationIds, beside
+ * jointHomeProjections, so core's agent inbox maps a notice's conversation by
+ * the same rule).
  */
-export async function localConversationIds(serverId: ServerId, homeChannelIds: readonly string[]): Promise<Map<string, string>> {
-  const ids = [...new Set(homeChannelIds)];
-  if (ids.length === 0) return new Map();
-  const own = await getDb().select({ id: channels.id }).from(channels).where(and(inArray(channels.id, ids), eq(channels.serverId, serverId)));
-  const local = new Map(own.map((row) => [row.id, row.id]));
-  const others = ids.filter((id) => !local.has(id));
-  if (others.length > 0) {
-    // Another server's projection names the joint's canonical channel.
-    const canonicalOf = new Map((await jointHomeRecords("any", { localChannelIds: others })).map((record) => [record.localChannelId, record.canonicalChannelId]));
-    const canonicalIds = [...new Set(others.map((id) => canonicalOf.get(id) ?? id))];
-    const projectionOf = new Map((await jointHomeProjections([serverId], { canonicalChannelIds: canonicalIds })).map((projection) => [projection.canonicalChannelId, projection.localChannelId]));
-    for (const id of others) {
-      const projection = projectionOf.get(canonicalOf.get(id) ?? id);
-      if (projection) local.set(id, projection);
-    }
-  }
-  return local;
+export { localConversationIds };
+
+/**
+ * Of these homes, the ones a resolver left unnamed (absent from `resolved`,
+ * as agentConversationRefs and conversationNames leave them) that are a
+ * joint's storage channel: a joint the reader's server has no active
+ * projection of. Such a home is shown as UNRESOLVED_JOINT_HOME, never by the
+ * storage channel's id or name (`joint-storage-…`). No query when every home
+ * resolved.
+ */
+export async function unresolvedJointHomes(homeChannelIds: readonly string[], resolved: ReadonlyMap<string, unknown>): Promise<Set<string>> {
+  const unresolved = [...new Set(homeChannelIds.filter((id) => !resolved.has(id) && UUID_RE.test(id)))];
+  if (unresolved.length === 0) return new Set();
+  const rows = await getDb().select({ id: channels.id }).from(channels).innerJoin(servers, eq(servers.id, channels.serverId))
+    .where(and(inArray(channels.id, unresolved), eq(servers.kind, "joint_storage")));
+  return new Set(rows.map((row) => row.id));
 }
+
+/**
+ * A joint home no projection of the reader's server names
+ * (unresolvedJointHomes): no id to open, no name (a person's client says
+ * "Shared channel" in the reader's language), a joint; for an agent, no
+ * target either.
+ */
+export const UNRESOLVED_JOINT_HOME = { id: null, name: "", type: "joint", target: null } as const;
 
 /**
  * Id, type and agent-facing target of homes as conversations of the agent's
@@ -176,7 +182,7 @@ function homeRefs<T>(local: ReadonlyMap<string, string>, byId: ReadonlyMap<strin
 }
 
 /** A home as the reader names it; a DM also carries its peer's display name, as the sidebar labels it, and who the peer is. */
-export type ConversationName = { id: string; name: string; type: ConversationType; peerDisplayName?: string; peer?: { type: "user" | "agent"; id: string } };
+export type ConversationName = { id: string; name: string; type: ConversationType; peerDisplayName?: string; peer?: { type: "user" | "agent"; id: string }; archived: boolean };
 
 /**
  * Id, name and type of homes as conversations of the reader's server
@@ -190,7 +196,7 @@ export async function conversationNames(
   homeChannelIds: readonly string[],
 ): Promise<Map<string, ConversationName>> {
   const local = await localConversationIds(reader.serverId, homeChannelIds);
-  const rows = local.size === 0 ? [] : await getDb().select({ id: channels.id, name: channels.name, type: channels.type }).from(channels)
+  const rows = local.size === 0 ? [] : await getDb().select({ id: channels.id, name: channels.name, type: channels.type, archivedAt: channels.archivedAt }).from(channels)
     .where(and(inArray(channels.id, [...new Set(local.values())]), eq(channels.serverId, reader.serverId)));
   const peers = await channelService.getReadableDMPeersForUser(rows.filter((row) => row.type === "dm").map((row) => row.id), reader.userId);
   const byId = new Map<string, ConversationName>();
@@ -198,7 +204,7 @@ export async function conversationNames(
     if (!CONVERSATION_TYPES.has(row.type)) continue;
     const type = row.type as ConversationType;
     const peer = type === "dm" ? peers.get(row.id) : undefined;
-    byId.set(row.id, { id: row.id, name: peer?.name ?? row.name, type, ...(peer?.displayName ? { peerDisplayName: peer.displayName } : {}), ...(peer ? { peer: { type: peer.type, id: peer.id } } : {}) });
+    byId.set(row.id, { id: row.id, name: peer?.name ?? row.name, type, ...(peer?.displayName ? { peerDisplayName: peer.displayName } : {}), ...(peer ? { peer: { type: peer.type, id: peer.id } } : {}), archived: row.archivedAt !== null });
   }
   return homeRefs(local, byId);
 }
@@ -227,6 +233,24 @@ export async function topLevelConversationOf(
   }
   if (!conversation || !CONVERSATION_TYPES.has(conversation.type)) return null;
   return { conversationId: conversation.id, type: conversation.type as ConversationType };
+}
+
+/**
+ * The home an object put in this top-level conversation of `serverId` names
+ * (as readableOf has it, for any reader): the conversation itself, or for a
+ * joint projection the joint's canonical channel. Null when it isn't a live
+ * top-level conversation of that server (a thread's or task's id included),
+ * or a joint projection has no active joint. Says nothing about who may see
+ * it: the caller has checked that (an app that found a message there with
+ * platform/messages messageSource).
+ */
+export async function conversationHome(serverId: ServerId, conversationId: string): Promise<string | null> {
+  if (!UUID_RE.test(conversationId)) return null;
+  const conversation = await topLevelConversationOf(serverId, conversationId);
+  if (!conversation || conversation.conversationId !== conversationId) return null;
+  if (conversation.type !== "joint") return conversationId;
+  const joint = (await channelService.resolveChannelAccessMany({ serverId, channelIds: [conversationId] })).get(conversationId);
+  return joint?.kind === "joint" ? joint.canonicalChannelId : null;
 }
 
 /** A conversation a person can see now, and the home an object put there names. */

@@ -149,7 +149,7 @@ async function readState(db: Database, userId: string) {
   };
 }
 
-const NOT_FOUND = JSON.stringify({ error: "Channel not found" });
+const NOT_FOUND = JSON.stringify({ error: "Channel not found", code: "channel_not_found", errorCode: "channel_not_found" });
 
 // ── The basic path ──
 
@@ -414,7 +414,9 @@ test("replays: the same request again connects nothing more and writes no second
   const sgLocal = (await projection(db, w.J, w.sg.id))!.localChannelId;
   const again = await connect(app.baseUrl, w.g, w.sg, sgLocal, [w.sg.id]);
   assert.equal(again.status, 200, again.text);
-  assert.equal(outcomes(again.body)[w.sg.id]?.state, "refused");
+  // Already connected, and G is SG's member: answered as connected with nothing done (#wg-rbac:#94), not refused.
+  assert.equal(outcomes(again.body)[w.sg.id]?.state, "connected", again.text);
+  assert.equal("alreadyConnected" in (outcomes(again.body)[w.sg.id] ?? {}), false, again.text);
   // No longer a member of the host at all: refused by the server gate before the route.
   const fromHost = await connect(app.baseUrl, w.g, w.h, w.hLocal, [w.sg.id]);
   assert.equal(fromHost.status, 403, fromHost.text);

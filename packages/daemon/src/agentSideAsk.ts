@@ -26,7 +26,7 @@ import {
   type AgentSideAskAsker,
   type AgentSideAskOutcome,
 } from "@botiverse/raft-shared";
-import type { PanelNote, PanelTodos } from "./wakeBriefingPanel";
+import { maskSecrets, type PanelNote, type PanelTodos } from "./wakeBriefingPanel";
 
 /** Past this many tokens of context a fork is refused: each question would read it all again. */
 export const SIDE_ASK_FORK_MAX_CONTEXT_TOKENS = 600_000;
@@ -76,10 +76,10 @@ export function sideAskStatusText(facts: SideAskStatusFacts): string {
     lines.push(`Running ${facts.openTool.name}${since}.`);
   }
   if (facts.todos && facts.todos.open.length > 0) {
-    const shown = facts.todos.open.slice(0, TODO_MAX_ITEMS).map((item) => `${item.status === "in_progress" ? "[doing] " : ""}${clip(item.text, 120)}`);
+    const shown = facts.todos.open.slice(0, TODO_MAX_ITEMS).map((item) => `${item.status === "in_progress" ? "[doing] " : ""}${clip(maskSecrets(item.text), 120)}`);
     lines.push(`Open todos (${facts.todos.open.length} of ${facts.todos.total}): ${shown.join("; ")}.`);
   }
-  if (facts.lastNote?.text) lines.push(`Latest note: ${clip(facts.lastNote.text, NOTE_MAX_CHARS)}`);
+  if (facts.lastNote?.text) lines.push(`Latest note: ${clip(maskSecrets(facts.lastNote.text), NOTE_MAX_CHARS)}`);
   return lines.join("\n");
 }
 
@@ -126,8 +126,9 @@ export function sideQuestionPrompt(question: string, asker: AgentSideAskAsker): 
 /** The fork's arguments; the prompt goes on stdin. */
 export function claudeSideQuestionArgs(input: {
   sessionId: string;
-  model: string;
+  model?: string | null;
   standingPromptFilePath: string;
+  customProvider?: boolean;
 }): string[] {
   return [
     "-p",
@@ -136,7 +137,14 @@ export function claudeSideQuestionArgs(input: {
     // The fork's own session is never written: nothing piles up beside the
     // agent's sessions, or is found later as its latest one.
     "--no-session-persistence",
-    "--model", input.model,
+    ...(input.model ? ["--model", input.model] : []),
+    ...(input.customProvider ? ["--setting-sources", "project,local"] : []),
+    // Disable user/project hooks and MCP servers on the read-only fork
+    // (Claude 2.1.326 runs configured prompt hooks even with restricted tools
+    // unless hooks are explicitly disabled and MCP is strict-empty).
+    "--settings", "{\"disableAllHooks\":true}",
+    "--strict-mcp-config",
+    "--mcp-config", "{\"mcpServers\":{}}",
     "--tools", SIDE_ASK_FORK_TOOLS,
     "--permission-mode", "dontAsk",
     "--allowedTools", ...SIDE_ASK_FORK_ALLOWED_TOOLS,

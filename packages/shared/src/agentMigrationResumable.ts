@@ -32,6 +32,13 @@ export const AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY = "migration:targe
  */
 export const AGENT_MIGRATION_TARGET_IGNORED_PARTIAL_CAPABILITY = "migration:target-ignored-partial-v1" as const;
 /**
+ * Advertised in `ready.migrationTransport.capabilities` by a Computer whose
+ * control-manifest schema accepts `skippedUnreadable` in the transfer summary
+ * when it is a migration target. The Server sets the source lease's
+ * `targetAcceptsSkippedUnreadable` only when the target advertises it.
+ */
+export const AGENT_MIGRATION_TARGET_SKIPPED_UNREADABLE_CAPABILITY = "migration:target-skipped-unreadable-v1" as const;
+/**
  * Advertised in `ready.migrationTransport.capabilities` by a Computer that, as a
  * migration source, writes the source lease's `userIgnoreAdditions` into the
  * agent's `.raftbackupignore.user` before it packs (./agentMigrationUserIgnore).

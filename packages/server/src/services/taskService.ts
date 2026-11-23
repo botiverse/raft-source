@@ -1,4 +1,5 @@
 import { lockJointTaskWriteAuthority, type JointTaskWriteActor } from "./jointTaskWriteAuthority";
+import { recordMessageReferences } from "./messageReferences";
 import { resolveJointHumanEntrySql, jointHumanConnectedIdentitySql, jointMembershipRemovalPendingSql, acquireJointSourceExitFlagReadLock, jointHumanHasLiveSourceSql, resolveJointSourceExitJointIds, resolveJointGuestEntryJointIds } from "./jointHumanMembershipAccess";
 import { conversionReadChannelIdsQuery, conversionReadChannelPredicate } from "./channelConversionReadScope";
 import { withChannelWriterFence, assertChannelWritableInTransaction } from "./channelConversionFenceService";
@@ -6,6 +7,7 @@ import { recordAssistantOwnerTaskAction } from "./assistantService";
 import { randomUUID } from "node:crypto";
 import { eq, and, inArray, sql, asc, isNotNull, isNull, lte, or, type SQL } from "drizzle-orm";
 import { getDb, type DatabaseExecutor } from "../db/index";
+import { withLockOrderRecording } from "../db/lockOrderRecorder";
 import {
   messages,
   users,
@@ -49,6 +51,7 @@ import { buildSearchText } from "./searchTokenizer";
 import {
   filterUserAccessibleChannelIds,
   getActiveJointChannelProjectionsByLocalChannel,
+  lockAndResolveMessageStorage,
   resolveAgentFacingChannelRef,
   type JointChannelProjection,
 } from "./channelService";
@@ -76,12 +79,36 @@ async function withTaskWriter<T>(observed: TaskRow, work: (tx: DatabaseExecutor)
   });
 }
 
-async function withTaskChannelWriter<T>(channelId: string, work: (tx: DatabaseExecutor) => Promise<T>, executor?: DatabaseExecutor): Promise<T> {
+async function withTaskChannelWriter<T>(
+  channelId: string,
+  work: (tx: DatabaseExecutor) => Promise<T>,
+  executor?: DatabaseExecutor,
+  // Task creation records its lock order like the send path, so a 40P01 or a
+  // >1 s attempt names both sides (#proj-o11y:#39).
+  lockOrder?: Parameters<typeof withLockOrderRecording>[0],
+): Promise<T> {
   if (executor) {
     await assertChannelWritableInTransaction(executor, channelId);
     return work(executor);
   }
+  if (lockOrder) return withLockOrderRecording(lockOrder, () => withChannelWriterFence(channelId, work));
   return withChannelWriterFence(channelId, work);
+}
+
+/**
+ * Task creation's storage check, first in its transaction (right after the
+ * conversion fence): the channel the request came through
+ * (`localChannelId`; the storage channel itself when the caller has no other)
+ * locked FOR KEY SHARE and its storage resolved under that lock
+ * (lockAndResolveMessageStorage). The caller resolved the storage channel
+ * before the transaction and keyed everything it checked on it (the task
+ * surface, source messages, assignee routing), so a different answer here is
+ * refused as a changed channel (409 task_channel_changed; a retry resolves
+ * again) rather than written to with those stale checks.
+ */
+async function assertTaskStorageUnderLock(tx: DatabaseExecutor, storageChannelId: string, localChannelId: string | undefined): Promise<void> {
+  const resolved = await lockAndResolveMessageStorage(tx, localChannelId ?? storageChannelId);
+  if (localChannelId !== undefined && resolved !== storageChannelId) throw new TaskMutationConflictError();
 }
 
 /**
@@ -567,15 +594,19 @@ async function lockTaskCreationAssigneeIdentity(
         eq(agents.serverId, serverId),
         isNull(agents.deletedAt),
       ))
-      .for("update");
+      .for("no key update");
     return Boolean(identity);
   }
 
+  // A person counts only as a member of this server: whether a user id exists
+  // on some other server is not this server's to say, so an outsider reads
+  // like an id that doesn't exist ("assignee not found").
   const [identity] = await tx
     .select({ id: users.id })
     .from(users)
+    .innerJoin(serverMembers, and(eq(serverMembers.userId, users.id), eq(serverMembers.serverId, serverId)))
     .where(eq(users.id, assignee.id))
-    .for("update");
+    .for("no key update", { of: users });
   return Boolean(identity);
 }
 
@@ -960,12 +991,20 @@ export async function listTasksAssignedToAgent(
   return enriched.map(task => ({ ...task, channelId: surfaceByTask.get(task.id)! }));
 }
 
+/** The unfinished statuses a bounded assigned-task read may be narrowed to. */
+export type UnfinishedTaskStatus = typeof UNFINISHED_TASK_STATUSES[number];
+
 /**
  * The unfinished tasks assigned to one agent in already-authorized channel
  * ids (as listTasksAssignedToAgent), one row per task with the requested id it
- * was read through: a subquery for the bounded reads below.
+ * was read through: a subquery for the bounded reads below. `statuses`
+ * narrows the unfinished statuses (default: all of them).
  */
-function assignedOpenTaskRowsSubquery(visibleChannelIds: readonly string[], agentId: string) {
+function assignedOpenTaskRowsSubquery(
+  visibleChannelIds: readonly string[],
+  agentId: string,
+  statuses: readonly UnfinishedTaskStatus[] = UNFINISHED_TASK_STATUSES,
+) {
   const db = getDb();
   const readSurface = authorizedTaskSurface(visibleChannelIds);
   return db
@@ -973,6 +1012,7 @@ function assignedOpenTaskRowsSubquery(visibleChannelIds: readonly string[], agen
       id: tasks.id,
       taskNumber: tasks.taskNumber,
       title: tasks.title,
+      status: tasks.status,
       updatedAt: tasks.updatedAt,
       channelId: readSurface.channelId,
     })
@@ -981,7 +1021,7 @@ function assignedOpenTaskRowsSubquery(visibleChannelIds: readonly string[], agen
     .where(and(
       eq(tasks.claimedByType, "agent"),
       eq(tasks.claimedById, agentId),
-      inArray(tasks.status, [...UNFINISHED_TASK_STATUSES]),
+      inArray(tasks.status, [...statuses]),
     ))
     .orderBy(asc(tasks.id), asc(readSurface.position))
     .as("assigned_open_task");
@@ -991,32 +1031,38 @@ function assignedOpenTaskRowsSubquery(visibleChannelIds: readonly string[], agen
  * At most `limit` unfinished tasks assigned to the agent in these
  * already-authorized channel ids, most recently updated first (then task
  * number), with the total: the bounded read behind a summary that names a
- * few and counts the rest. No enrichment.
+ * few and counts the rest. No enrichment. `options.statuses` narrows both the
+ * rows and the total to those unfinished statuses (default: all of them).
  */
 export async function listRecentTasksAssignedToAgent(
   visibleChannelIds: readonly string[],
   agentId: string,
   limit: number,
-): Promise<{ rows: Array<{ id: string; taskNumber: number; title: string; channelId: string }>; total: number }> {
+  options: { statuses?: readonly UnfinishedTaskStatus[] } = {},
+): Promise<{ rows: Array<{ id: string; taskNumber: number; title: string; status: TaskStatus; channelId: string }>; total: number }> {
   if (visibleChannelIds.length === 0) return { rows: [], total: 0 };
-  const assigned = assignedOpenTaskRowsSubquery(visibleChannelIds, agentId);
+  const assigned = assignedOpenTaskRowsSubquery(visibleChannelIds, agentId, options.statuses);
   const [rows, total] = await Promise.all([
     limit > 0
       ? getDb()
-        .select({ id: assigned.id, taskNumber: assigned.taskNumber, title: assigned.title, channelId: assigned.channelId })
+        .select({ id: assigned.id, taskNumber: assigned.taskNumber, title: assigned.title, status: assigned.status, channelId: assigned.channelId })
         .from(assigned)
         .orderBy(sql`${assigned.updatedAt} desc`, asc(assigned.taskNumber), asc(assigned.id))
         .limit(limit)
       : Promise.resolve([]),
-    countTasksAssignedToAgent(visibleChannelIds, agentId),
+    countTasksAssignedToAgent(visibleChannelIds, agentId, options),
   ]);
   return { rows, total };
 }
 
-/** How many unfinished tasks are assigned to the agent in these already-authorized channel ids. */
-export async function countTasksAssignedToAgent(visibleChannelIds: readonly string[], agentId: string): Promise<number> {
+/** How many unfinished tasks (of `options.statuses`, default all) are assigned to the agent in these already-authorized channel ids. */
+export async function countTasksAssignedToAgent(
+  visibleChannelIds: readonly string[],
+  agentId: string,
+  options: { statuses?: readonly UnfinishedTaskStatus[] } = {},
+): Promise<number> {
   if (visibleChannelIds.length === 0) return 0;
-  const assigned = assignedOpenTaskRowsSubquery(visibleChannelIds, agentId);
+  const assigned = assignedOpenTaskRowsSubquery(visibleChannelIds, agentId, options.statuses);
   const [row] = await getDb().select({ total: sql<number>`count(*)::int` }).from(assigned);
   return Number(row?.total ?? 0);
 }
@@ -2758,6 +2804,12 @@ export async function createTasks(
      */
     initiatingServerId?: string;
     /**
+     * The local channel the request came through, whose storage `channelId`
+     * was resolved from before the transaction; re-resolved under its row
+     * lock in the creating transaction (assertTaskStorageUnderLock).
+     */
+    localChannelId?: string;
+    /**
      * The status every task starts in (`TASK_CREATE_STATUSES`); default todo.
      * An unassigned in_progress task has no claimant, so claimedAt stays null.
      */
@@ -2771,6 +2823,7 @@ export async function createTasks(
 
   // Use a transaction with advisory lock on channel to prevent task number collisions
   const created = await withTaskChannelWriter(channelId, async (tx) => {
+    await assertTaskStorageUnderLock(tx, channelId, opts.localChannelId);
     await lockJointTaskWriteAuthority(tx, channelId, { type: createdByType, id: createdById, serverId: opts.initiatingServerId });
     // Advisory lock keyed on channel UUID to serialize task number allocation
     await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${channelId}))`);
@@ -2788,7 +2841,7 @@ export async function createTasks(
         isNull(channels.deletedAt),
         isNull(channels.archivedAt),
       ))
-      .for("update");
+      .for("no key update");
     if (!channel) throw new Error("Task channel is unavailable");
     // Numbers past every message, task and deleted task (never reused).
     let nextNum = await reserveTaskNumbers(tx, channelId, items.length);
@@ -2847,9 +2900,13 @@ export async function createTasks(
       return { hostMessages, taskRows, enrichedInTransaction, conversations };
     }
     return { hostMessages, taskRows, enrichedInTransaction: null, conversations };
-  });
+  }, undefined, { transaction: "tasks.create_transaction", rowRoles: { stored: channelId, creator: createdById } });
 
   if (!created.conversations) {
+    // A pre-v2 host message's title is its text: its links to first-party
+    // objects (#proj-workspace:#336), after the commit, never awaited; nothing
+    // for text without an address on Raft's hosts.
+    for (const host of created.hostMessages) recordMessageReferences({ messageId: host.id, content: host.content, previousContent: null });
     // Pre-v2 visible host messages are channel activity.
     const { recordInboxFactsForPersistedMessages } = await import("./messageService");
     await recordInboxFactsForPersistedMessages(created.hostMessages, {
@@ -2894,6 +2951,8 @@ export async function createTasksWithAssignmentReceipt(
   receiptRequest: TaskAssignmentReceiptRequest,
   opts: {
     initiatingLocalChannelId?: string;
+    /** As createTasks' `localChannelId`; defaults to `initiatingLocalChannelId`. */
+    localChannelId?: string;
     /**
      * The status every task starts in (`TASK_CREATE_STATUSES`). Omitted: the
      * behaviour from before statuses could be chosen — assigning yourself
@@ -2935,7 +2994,8 @@ export async function createTasksWithAssignmentReceipt(
   assertTaskCreateStatus(opts.initialStatus);
   const db = getDb();
 
-  return withTaskChannelWriter(channelId, async (tx) => {
+  const assigned = await withTaskChannelWriter(channelId, async (tx) => {
+    await assertTaskStorageUnderLock(tx, channelId, opts.localChannelId ?? opts.initiatingLocalChannelId);
     const entryServer = opts.initiatingLocalChannelId
       ? (await tx.select({ serverId: channels.serverId }).from(channels).where(eq(channels.id,opts.initiatingLocalChannelId)))[0]?.serverId
       : undefined;
@@ -2979,7 +3039,7 @@ export async function createTasksWithAssignmentReceipt(
         isNull(channels.deletedAt),
         isNull(channels.archivedAt),
       ))
-      .for("update");
+      .for("no key update");
     if (!channel) throw new Error("Task channel is unavailable");
     let jointRouting: JointAssignmentRouting | null = null;
     if (jointRequest) {
@@ -3191,7 +3251,11 @@ export async function createTasksWithAssignmentReceipt(
     };
     if (opts.beforeCommit) await opts.beforeCommit(tx, result);
     return result;
-  });
+  }, undefined, { transaction: "tasks.assigned_create_transaction", rowRoles: { stored: channelId, request: opts.initiatingLocalChannelId, creator: createdById, assignee: assignee.id } });
+  // Pre-v2 host messages' titles (createTasks): their links to first-party
+  // objects, after the commit, never awaited.
+  for (const host of assigned.hostMessages) recordMessageReferences({ messageId: host.id, content: host.content, previousContent: null });
+  return assigned;
 }
 
 /** Claim a task (set assignee). Does not require specific status. If status is todo or backlog, auto-advances to in_progress. */
@@ -4459,6 +4523,27 @@ export interface TaskResourceReceiptResult {
 }
 
 /**
+ * Why a resource receipt was refused: the receipt isn't valid (`invalid`), no
+ * such task (`not_found`), or the task's state takes no receipt now
+ * (`conflict`). `reason` is the fixed sentence; `code` names the case.
+ */
+export interface TaskResourceReceiptRefusal {
+  refused: "invalid" | "not_found" | "conflict";
+  code: string;
+  reason: string;
+}
+
+const RECEIPT_TASK_NOT_FOUND: TaskResourceReceiptRefusal = { refused: "not_found", code: "task_not_found", reason: "task not found" };
+
+function receiptConflict(code: string, reason: string): TaskResourceReceiptRefusal {
+  return { refused: "conflict", code, reason };
+}
+
+function receiptInvalid(reason: string): TaskResourceReceiptRefusal {
+  return { refused: "invalid", code: "task_resource_receipt_invalid", reason };
+}
+
+/**
  * Atomically records the authoritative task receipt and its owner-anchored
  * expiry follow-up. A byte-equivalent retry returns the same durable follow-up;
  * a different second receipt is rejected instead of silently rewriting audit
@@ -4466,20 +4551,20 @@ export interface TaskResourceReceiptResult {
  */
 export async function recordTaskResourceReceipt(
   input: RecordTaskResourceReceiptInput,
-): Promise<TaskResourceReceiptResult | string> {
+): Promise<TaskResourceReceiptResult | TaskResourceReceiptRefusal> {
   const normalized = normalizeTaskResourceReceipt(input.receipt);
-  if (typeof normalized === "string") return normalized;
+  if (typeof normalized === "string") return receiptInvalid(normalized);
 
   const owner = await resolveTaskById(input.taskId);
-  if (!owner) return "task not found";
-  return withTaskWriter(owner.row, async (tx) => {
+  if (!owner) return RECEIPT_TASK_NOT_FOUND;
+  return withTaskWriter<TaskResourceReceiptResult | TaskResourceReceiptRefusal>(owner.row, async (tx) => {
     const [observed] = await tx
       .select()
       .from(tasks)
       .where(eq(tasks.id, input.taskId))
       .for("update");
-    if (!observed) return "task not found";
-    if (!observed.requiresResourceReceipt) return "task is not marked as creating a resource";
+    if (!observed) return RECEIPT_TASK_NOT_FOUND;
+    if (!observed.requiresResourceReceipt) return receiptConflict("task_resource_receipt_not_required", "task is not marked as creating a resource");
     // Task v2 tasks have no host message; their source message (if any) is
     // the conversational anchor of the expiry follow-up. A v2 task without a
     // source message anchors it on a "resource receipt recorded" line in its
@@ -4492,25 +4577,25 @@ export async function recordTaskResourceReceipt(
       const sameReceipt = typeof existing !== "string"
         && JSON.stringify(existing) === JSON.stringify(normalized)
         && observed.resourceTeardownOwnerAgentId === input.teardownOwnerAgentId;
-      if (!sameReceipt) return "resource receipt is already recorded";
+      if (!sameReceipt) return receiptConflict("task_resource_receipt_already_recorded", "resource receipt is already recorded");
       if (!hasCompleteTaskResourceReceipt(observed) || !observed.resourceExpiryFollowupId) {
-        return "resource receipt state is incomplete";
+        return receiptConflict("task_resource_receipt_incomplete", "resource receipt state is incomplete");
       }
       const expiryFollowup = await input.expiryFollowups.get(observed.resourceExpiryFollowupId, tx);
-      if (!expiryFollowup) return "resource expiry follow-up is missing";
+      if (!expiryFollowup) return receiptConflict("task_resource_expiry_followup_missing", "resource expiry follow-up is missing");
       return { task: observed, expiryFollowup, receipt: existing, idempotent: true };
     }
 
     const fireAt = new Date(normalized.expiry);
     if (fireAt.getTime() <= currentDate().getTime()) {
-      return "resource receipt expiry must be in the future";
+      return receiptInvalid("resource receipt expiry must be in the future");
     }
     // Lazy conversation: created only once the receipt is valid and new, so
     // a refused receipt creates nothing.
     const anchorConversation = anchorMessageId
       ? null
       : await ensureTaskConversation(observed.id, { initiatingServerId: input.teardownOwnerServerId, executor: tx });
-    if (!anchorMessageId && !anchorConversation) return "resource receipt requires a task message anchor";
+    if (!anchorMessageId && !anchorConversation) return receiptConflict("task_resource_receipt_anchor_missing", "resource receipt requires a task message anchor");
 
     const followupId = randomUUID();
     const recordedAt = currentDate();

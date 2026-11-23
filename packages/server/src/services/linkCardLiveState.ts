@@ -1,11 +1,11 @@
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, isNull, notExists, or, sql } from "drizzle-orm";
 import type { MessageCardExecuteAction } from "@botiverse/raft-shared";
 import { appLinkReadUrls, matchesAppPreview, UNREVIEWED_APP_CAPABILITY, type LinkCardCapability } from "@botiverse/raft-shared/src/appLinkPreview";
 import { getDb, type DatabaseExecutor } from "../db";
 import { appHosts } from "../platform/links";
 import { linkCardOperations, linkCardViews, oauthAppLinkPreviews, oauthClientInstalls, oauthClients, oauthLinkPreviewDeclines, oauthUserConsents, serverMembers } from "../db/schema";
 import { lockLinkPreviewChoice } from "./appLinkPreviewConsentService";
-import { LINK_PREVIEW_PROOF_HARD_TTL_MS, LINK_PREVIEW_SCOPES, previewable, provenWithin, registeredApps, type RegisteredApp } from "./appLinkPreviewService";
+import { coversLinkPreviewScopes, LINK_PREVIEW_PROOF_HARD_TTL_MS, notGuestOfAccountModeApp, onServerOrEveryServer, previewable, provenWithin, registeredApps, type RegisteredApp } from "./appLinkPreviewService";
 import { LINK_CARD_READ_MAX_URLS } from "./linkCardReadService";
 import { linkCardActionEndpointSha256, linkCardMessageContentSha256, linkCardUrlSha256, type LinkCardHandleClaims } from "./linkCardTokens";
 import { isApprovedOfficialAppClient } from "./officialAppAutoInstallService";
@@ -15,6 +15,7 @@ import {
   type MessageCardOnRead,
 } from "./messageCardLiveState";
 import { oauthClientHasKey } from "./oauthClientKeys";
+import { isAccountLoginEnabledFor } from "./oauthAccountLogin";
 
 // Interactive link cards: the ONE place an action compares a handle with live
 // state (RFC 076 §3.4, §5.1; protocol v3.2.3 §3.4; Tenny, PR B review). Prepare
@@ -206,9 +207,10 @@ export async function lockLinkCardActionEligibility(
  *   row (the viewer leaving the Server, an uninstall, an offline review, a new
  *   login), so one that committed first fails the re-read and one that starts
  *   later waits for this commit.
- * - decline: a missing row can't be locked, so the viewer's choice lock is
- *   taken shared (declining takes it exclusively, appLinkPreviewConsentService)
- *   and the decline is read again after it.
+ * - decline: a missing row can't be locked, so the viewer's choice locks
+ *   (this Server's and, for an account-mode App, every Server's) are taken
+ *   shared (declining takes its own exclusively, appLinkPreviewConsentService)
+ *   and the decline is read again after them.
  * - message: read again through the same reader, which runs inside this
  *   transaction (the ambient transaction: its connection, a fresh snapshot per
  *   statement): still readable by the viewer (removal from a private channel
@@ -229,15 +231,21 @@ export async function recheckLinkCardViewerInTransaction(tx: DatabaseExecutor, i
   const { entry } = input.live;
   const choice = { userId: input.viewerId, serverId: input.serverId, clientId: entry.app.id };
   if (entry.consentId === null) return "consent";
-  const [consent] = await tx.select({ id: oauthUserConsents.id }).from(oauthUserConsents)
-    .where(and(eq(oauthUserConsents.id, entry.consentId), eq(oauthUserConsents.userId, choice.userId), eq(oauthUserConsents.serverId, choice.serverId),
-      eq(oauthUserConsents.clientId, choice.clientId), isNull(oauthUserConsents.revokedAt),
-      sql`${oauthUserConsents.scopes}::jsonb @> ${JSON.stringify(LINK_PREVIEW_SCOPES)}::jsonb`))
+  // The consent on this Server, or an account-mode App's for every Server
+  // (RFC 079 D17), which counts only while the kill switch is on for the
+  // viewer, read again here as the read did.
+  const [consent] = await tx.select({ id: oauthUserConsents.id, serverId: oauthUserConsents.serverId }).from(oauthUserConsents)
+    .where(and(eq(oauthUserConsents.id, entry.consentId), eq(oauthUserConsents.userId, choice.userId), onServerOrEveryServer(oauthUserConsents.serverId, choice.serverId),
+      eq(oauthUserConsents.clientId, choice.clientId), isNull(oauthUserConsents.revokedAt), coversLinkPreviewScopes(oauthUserConsents.scopes)))
     .for("share");
   if (!consent) return "consent";
+  if (consent.serverId === null && !await isAccountLoginEnabledFor(choice.userId, tx)) return "consent";
+  // Both choices that can stop it: this Server's, and the one for every
+  // Server, whatever the App's mode was when the handle was issued.
   await lockLinkPreviewChoice(tx, choice, "shared");
+  await lockLinkPreviewChoice(tx, { ...choice, serverId: null }, "shared");
   const [decline] = await tx.select({ id: oauthLinkPreviewDeclines.id }).from(oauthLinkPreviewDeclines)
-    .where(and(eq(oauthLinkPreviewDeclines.userId, choice.userId), eq(oauthLinkPreviewDeclines.serverId, choice.serverId),
+    .where(and(eq(oauthLinkPreviewDeclines.userId, choice.userId), onServerOrEveryServer(oauthLinkPreviewDeclines.serverId, choice.serverId),
       eq(oauthLinkPreviewDeclines.clientId, choice.clientId)))
     .limit(1);
   if (decline) return "decline";
@@ -329,17 +337,26 @@ export async function linkCardReceiptAccess(op: LinkCardReceiptSubject, readMess
   // Native providers are not registered yet: nothing native is readable.
   // An operation on a card message's acting button (RFC 086) is read on the same terms.
   if (op.providerKind !== "app") return null;
-  const [row] = await getDb().select({ clientId: oauthClients.id, declineId: oauthLinkPreviewDeclines.id, serverRole: serverMembers.role }).from(oauthClients)
+  // The consent and decline on this Server, or an account-mode App's for
+  // every Server (RFC 079 D17): its consent only while the kill switch is on
+  // for the viewer, its decline always.
+  const everyServerOfAccountApp = (serverIdColumn: typeof oauthUserConsents.serverId | typeof oauthLinkPreviewDeclines.serverId) => or(
+    eq(serverIdColumn, op.serverId), and(isNull(serverIdColumn), eq(oauthClients.loginMode, "account")));
+  const rows = await getDb().select({ serverRole: serverMembers.role, consentServerId: oauthUserConsents.serverId }).from(oauthClients)
     .innerJoin(oauthClientInstalls, and(eq(oauthClientInstalls.id, op.installationKey), eq(oauthClientInstalls.clientId, oauthClients.id),
       eq(oauthClientInstalls.serverId, op.serverId), eq(oauthClientInstalls.status, "active")))
-    .innerJoin(oauthUserConsents, and(eq(oauthUserConsents.userId, op.viewerId), eq(oauthUserConsents.serverId, op.serverId), eq(oauthUserConsents.clientId, oauthClients.id),
-      isNull(oauthUserConsents.revokedAt), sql`${oauthUserConsents.scopes}::jsonb @> ${JSON.stringify(LINK_PREVIEW_SCOPES)}::jsonb`))
+    .innerJoin(oauthUserConsents, and(eq(oauthUserConsents.userId, op.viewerId), everyServerOfAccountApp(oauthUserConsents.serverId), eq(oauthUserConsents.clientId, oauthClients.id),
+      isNull(oauthUserConsents.revokedAt), coversLinkPreviewScopes(oauthUserConsents.scopes)))
     .innerJoin(serverMembers, and(eq(serverMembers.serverId, op.serverId), eq(serverMembers.userId, op.viewerId)))
-    .leftJoin(oauthLinkPreviewDeclines, and(eq(oauthLinkPreviewDeclines.userId, op.viewerId), eq(oauthLinkPreviewDeclines.serverId, op.serverId),
-      eq(oauthLinkPreviewDeclines.clientId, oauthClients.id)))
-    .where(and(oauthClientHasKey(op.providerKey), eq(oauthClients.enabled, true)))
+    .where(and(oauthClientHasKey(op.providerKey), eq(oauthClients.enabled, true), notGuestOfAccountModeApp(),
+      notExists(getDb().select({ one: sql`1` }).from(oauthLinkPreviewDeclines).where(and(eq(oauthLinkPreviewDeclines.userId, op.viewerId),
+        everyServerOfAccountApp(oauthLinkPreviewDeclines.serverId), eq(oauthLinkPreviewDeclines.clientId, oauthClients.id))))))
+    // This Server's consent first: it needs no kill switch read.
+    .orderBy(sql`${oauthUserConsents.serverId} ASC NULLS LAST`)
     .limit(1);
-  if (!row || row.declineId !== null) return null;
+  const [row] = rows;
+  if (!row) return null;
+  if (row.consentServerId === null && !await isAccountLoginEnabledFor(op.viewerId)) return null;
   return (await readMessage(op.messageId)) !== null ? { serverRole: row.serverRole } : null;
 }
 

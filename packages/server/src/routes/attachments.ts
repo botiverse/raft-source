@@ -1,7 +1,7 @@
 import { DmPeerNotMemberError } from "../services/dmSendPolicy";
 import { Router, type NextFunction, type Request, type Response, type Router as RouterType } from "express";
 import { UUID_RE } from "../lib/messageId";
-import { refuse } from "../lib/refusal";
+import { refuse, type RefusalInput } from "../lib/refusal";
 import {
   createAttachmentPreviewBridgeTransform,
 } from "../services/attachmentPreviewBridge";
@@ -289,6 +289,15 @@ export function attachmentTooLargeRefusal(limitBytes: number): { code: "ATTACHME
   };
 }
 
+/**
+ * An attachment that isn't there, and one the caller can't read (another
+ * server's, a channel they can't see, behind the history window, an object
+ * storage has lost): one answer for all of them, so an id is no existence
+ * oracle. The code is the agent routes' and the comment service's for the
+ * same sentence (internalAgentApi.ts, attachmentCommentService.ts).
+ */
+const ATTACHMENT_NOT_FOUND_REFUSAL: RefusalInput = { code: "attachment_not_found", error: "Attachment not found" };
+
 export function buildAttachmentTooLargeResponse(limitBytes = MAX_ATTACHMENT_FILE_SIZE_BYTES): {
   error: string;
   errorCode: "ATTACHMENT_TOO_LARGE";
@@ -362,6 +371,7 @@ function runAttachmentUpload(req: Request, res: Response, next: NextFunction): v
     createAttachmentUpload(limitBytes).array("files", MAX_ATTACHMENT_UPLOAD_FILES)(req, res, (err: unknown) => {
       if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
         void noteFreePlanPaywallHit(req, "upload_file_size");
+        // refusal-ok: top-level maxBytes beside error and errorCode (buildAttachmentTooLargeResponse; attachments.api.test.ts pins the body); refuse() writes no top-level fields
         res.status(413).json(buildAttachmentTooLargeResponse(limitBytes));
         return;
       }
@@ -912,47 +922,49 @@ attachmentRouter.post(
     try {
       const files = req.files as Express.Multer.File[];
       if (!files || files.length === 0) {
-        res.status(400).json({ error: "No files provided" });
+        refuse(res, 400, { code: "invalid_input", error: "No files provided" });
         return;
       }
       if (files.some(isEmptyUploadedFile)) {
-        res.status(400).json({ error: "Empty files are not allowed" });
+        refuse(res, 400, { code: "invalid_input", error: "Empty files are not allowed" });
         return;
       }
       const tooLargeResponse = await getRequestAttachmentTooLargeResponse(req);
       if (files.some((file) => isOversizedUploadedFile(file, tooLargeResponse.maxBytes))) {
         void noteFreePlanPaywallHit(req, "upload_file_size");
+        // refusal-ok: top-level maxBytes beside error and errorCode (buildAttachmentTooLargeResponse; attachments.api.test.ts pins the body); refuse() writes no top-level fields
         res.status(413).json(tooLargeResponse);
         return;
       }
 
       const channelId = req.body.channelId;
       if (!channelId) {
-        res.status(400).json({ error: "channelId is required" });
+        refuse(res, 400, { code: "channel_id_required", error: "channelId is required" });
         return;
       }
 
       // Verify channel access
       const canAccess = await channelService.canUserAccessChannel(channelId, req.userId!, req.serverId!);
       if (!canAccess || !await channelService.canUserPostToChannel(channelId, req.userId!)) {
-        res.status(403).json({ error: "You do not have access to this channel" });
+        refuse(res, 403, { code: "forbidden", error: "You do not have access to this channel" });
         return;
       }
 
       // Archive gate: no new attachments on an archived channel.
       if (await channelService.isChannelArchived(channelId)) {
-        res.status(409).json({ error: "This channel is archived", code: "channel_archived" });
+        refuse(res, 409, { code: "channel_archived", error: "This channel is archived" });
         return;
       }
       const billingReadOnly = await getChannelBillingReadOnly(channelId, req.serverId!);
       if (billingReadOnly) {
         if (billingReadOnly.reason === "joint_over_limit") notePaywallHit(req, "joint_channel_read_only");
+        // refusal-ok: top-level externalFreezeAt, as POST /messages answers (planService channelBillingReadOnlyBody); refuse() writes no top-level fields
         res.status(403).json(channelBillingReadOnlyBody(billingReadOnly));
         return;
       }
 
       if (await isChannelReadOnlyByQuota(channelId, req.serverId!)) {
-        res.status(403).json({ error: "This channel is read-only because its quota was exceeded" });
+        refuse(res, 403, { code: "channel_read_only", error: "This channel is read-only because its quota was exceeded" });
         return;
       }
 
@@ -1018,7 +1030,7 @@ attachmentRouter.get("/comments/counts", async (req, res) => {
     const idsParam = typeof req.query.ids === "string" ? req.query.ids : "";
     const ids = idsParam.split(",").map((s) => s.trim()).filter(Boolean);
     if (ids.length === 0 || ids.length > 100) {
-      res.status(400).json({ error: "ids must contain 1-100 attachment ids" });
+      refuse(res, 400, { code: "invalid_input", error: "ids must contain 1-100 attachment ids" });
       return;
     }
     const db = getDb();
@@ -1049,7 +1061,7 @@ attachmentRouter.get("/:id/comments", async (req, res) => {
       ? await resolveReadableAttachmentForRequest(projection, req)
       : null;
     if (!attachment) {
-      res.status(404).json({ error: "Attachment not found" });
+      refuse(res, 404, ATTACHMENT_NOT_FOUND_REFUSAL);
       return;
     }
     const limit = typeof req.query.limit === "string" ? Number(req.query.limit) : undefined;
@@ -1093,13 +1105,13 @@ attachmentRouter.post("/:id/comments", async (req, res) => {
       ? await resolveReadableAttachmentForRequest(projection, req)
       : null;
     if (!attachment) {
-      res.status(404).json({ error: "Attachment not found" });
+      refuse(res, 404, ATTACHMENT_NOT_FOUND_REFUSAL);
       return;
     }
     const content = req.body?.content;
     const mentions = parseStructuredMentions(req.body?.mentions);
     if (mentions === "invalid") {
-      res.status(400).json({ error: "Invalid mentions payload", code: "mentions_invalid" });
+      refuse(res, 400, { code: "mentions_invalid", error: "Invalid mentions payload" });
       return;
     }
     const userId = req.userId!;
@@ -1165,10 +1177,7 @@ const ATTACHMENT_UUID_RE = UUID_RE;
 function rejectMalformedAttachmentId(req: Request, res: Response): boolean {
   const id = req.params.id;
   if (typeof id === "string" && ATTACHMENT_UUID_RE.test(id)) return false;
-  res.status(400).json({
-    error: "A valid attachment id is required",
-    code: "invalid_attachment_id",
-  });
+  refuse(res, 400, { code: "invalid_attachment_id", error: "A valid attachment id is required" });
   return true;
 }
 
@@ -1187,12 +1196,12 @@ attachmentPublicRouter.post("/urls", async (req, res) => {
   try {
     const rawIds = (req.body as { attachmentIds?: unknown })?.attachmentIds;
     if (!Array.isArray(rawIds) || rawIds.length === 0) {
-      res.status(400).json({ error: "attachmentIds is required" });
+      refuse(res, 400, { code: "invalid_input", error: "attachmentIds is required" });
       return;
     }
     const ids = [...new Set(rawIds.filter((id): id is string => typeof id === "string" && ATTACHMENT_UUID_RE.test(id)))];
     if (ids.length === 0 || ids.length > MAX_ATTACHMENT_URL_BATCH) {
-      res.status(400).json({ error: `attachmentIds must hold 1..${MAX_ATTACHMENT_URL_BATCH} valid ids` });
+      refuse(res, 400, { code: "invalid_input", error: `attachmentIds must hold 1..${MAX_ATTACHMENT_URL_BATCH} valid ids` });
       return;
     }
 
@@ -1248,12 +1257,12 @@ attachmentPublicRouter.get("/:id/url", async (req, res) => {
       .limit(1);
 
     if (!projection) {
-      res.status(404).json({ error: "Attachment not found" });
+      refuse(res, 404, ATTACHMENT_NOT_FOUND_REFUSAL);
       return;
     }
     const attachment = await resolveReadableAttachmentForRequest(projection, req);
     if (!attachment) {
-      res.status(404).json({ error: "Attachment not found" });
+      refuse(res, 404, ATTACHMENT_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -1333,12 +1342,12 @@ attachmentPublicRouter.get("/:id/preview", async (req, res) => {
       .limit(1);
 
     if (!projection) {
-      res.status(404).json({ error: "Attachment not found" });
+      refuse(res, 404, ATTACHMENT_NOT_FOUND_REFUSAL);
       return;
     }
     const attachment = await resolveReadableAttachmentForRequest(projection, req);
     if (!attachment) {
-      res.status(404).json({ error: "Attachment not found" });
+      refuse(res, 404, ATTACHMENT_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -1367,7 +1376,7 @@ attachmentPublicRouter.get("/:id/preview", async (req, res) => {
     // row outlived its object (lifecycle sweep, manual bucket edit, staging
     // residue). Mirrors the "Attachment not found" branches above.
     if (isStorageNotFoundError(err)) {
-      res.status(404).json({ error: "Attachment not found" });
+      refuse(res, 404, ATTACHMENT_NOT_FOUND_REFUSAL);
       return;
     }
     sendJsonServerError(req, res, { error: "Failed to build attachment preview", logPrefix: "[Attachments] Failed to preview attachment", err });
@@ -1391,12 +1400,12 @@ attachmentPublicRouter.get("/:id/html-preview-url", async (req, res) => {
       .limit(1);
 
     if (!projection) {
-      res.status(404).json({ error: "Attachment not found" });
+      refuse(res, 404, ATTACHMENT_NOT_FOUND_REFUSAL);
       return;
     }
     const attachment = await resolveReadableAttachmentForRequest(projection, req);
     if (!attachment) {
-      res.status(404).json({ error: "Attachment not found" });
+      refuse(res, 404, ATTACHMENT_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -1429,7 +1438,7 @@ attachmentPublicRouter.get("/:id/html-preview", async (req, res) => {
     attachmentForLog = projection ?? null;
 
     if (!projection) {
-      res.status(404).json({ error: "Attachment not found" });
+      refuse(res, 404, ATTACHMENT_NOT_FOUND_REFUSAL);
       return;
     }
 
@@ -1444,7 +1453,7 @@ attachmentPublicRouter.get("/:id/html-preview", async (req, res) => {
       tokenClaims ? { type: tokenClaims.actorType, id: tokenClaims.actorId } : undefined,
     );
     if (!attachment) {
-      res.status(404).json({ error: "Attachment not found" });
+      refuse(res, 404, ATTACHMENT_NOT_FOUND_REFUSAL);
       return;
     }
     attachmentForLog = attachment;
@@ -1454,12 +1463,12 @@ attachmentPublicRouter.get("/:id/html-preview", async (req, res) => {
     // query token) and distinguish an existing inaccessible UUID from a
     // nonexistent UUID by 403 versus 404.
     if (previewToken && !tokenClaims) {
-      res.status(403).json({ error: "Invalid attachment preview token" });
+      refuse(res, 403, { code: "forbidden", error: "Invalid attachment preview token" });
       return;
     }
 
     if (!previewToken && typeof req.query.token === "string") {
-      res.status(403).json({ error: "User bearer query tokens cannot authorize HTML preview" });
+      refuse(res, 403, { code: "forbidden", error: "User bearer query tokens cannot authorize HTML preview" });
       return;
     }
 
@@ -1508,7 +1517,7 @@ attachmentPublicRouter.get("/:id/html-preview", async (req, res) => {
     }
     if (res.destroyed || res.headersSent) return;
     if (isStorageNotFoundError(err)) {
-      res.status(404).json({ error: "Attachment not found" });
+      refuse(res, 404, ATTACHMENT_NOT_FOUND_REFUSAL);
       return;
     }
     res.status(500).json({ error: "Failed to serve HTML preview" });
@@ -1529,12 +1538,12 @@ attachmentPublicRouter.get("/:id", async (req, res) => {
     attachmentForLog = projection ?? null;
 
     if (!projection) {
-      res.status(404).json({ error: "Attachment not found" });
+      refuse(res, 404, ATTACHMENT_NOT_FOUND_REFUSAL);
       return;
     }
     const attachment = await resolveReadableAttachmentForRequest(projection, req);
     if (!attachment) {
-      res.status(404).json({ error: "Attachment not found" });
+      refuse(res, 404, ATTACHMENT_NOT_FOUND_REFUSAL);
       return;
     }
     attachmentForLog = attachment;
@@ -1570,6 +1579,7 @@ attachmentPublicRouter.get("/:id", async (req, res) => {
       if (contentLength) {
         res.setHeader("Content-Range", `bytes */${contentLength}`);
       }
+      // refusal-ok: HTTP's own range answer (Content-Range above, no body), read by browsers and media players, not a refusal sentence
       res.status(416).end();
       return;
     }
@@ -1614,7 +1624,7 @@ attachmentPublicRouter.get("/:id", async (req, res) => {
     if (res.destroyed || res.headersSent) return;
     logAttachmentAccessError("serve", req.params.id, err, attachmentForLog);
     if (isStorageNotFoundError(err)) {
-      res.status(404).json({ error: "Attachment not found" });
+      refuse(res, 404, ATTACHMENT_NOT_FOUND_REFUSAL);
       return;
     }
     res.status(500).json({ error: "Failed to serve attachment" });

@@ -101,11 +101,12 @@ test("Redis activity snapshot is one hash write carrying detail and carriers tog
     carriers: { deliveryConsumption: carrier },
     updatedAtMs: 10,
   });
-  assert.deepEqual(Object.keys(withCarrier).sort(), ["activity", "carriers", "detail", "detailKind", "observedAtMs", "updatedAt"]);
+  assert.deepEqual(Object.keys(withCarrier).sort(), ["activity", "carriers", "detail", "detailKind", "livenessAtMs", "observedAtMs", "updatedAt"]);
   assert.deepEqual(JSON.parse(withCarrier.carriers!), { deliveryConsumption: carrier });
   const plain = buildAgentActivityHashFields({ activity: "working", detail: "Running tests", detailKind: "running_command", updatedAtMs: 11 });
   assert.equal(plain.carriers, "", "a write without a carrier clears the field in the same command");
   assert.equal(plain.observedAtMs, "", "a write without observedAtMs clears it in the same command");
+  assert.equal(plain.livenessAtMs, "", "a write without a heartbeat liveness stamp clears it in the same command");
   assert.deepEqual(Object.keys(plain).sort(), Object.keys(withCarrier).sort(), "every write names every field: no stale field survives a write");
 });
 
@@ -125,6 +126,33 @@ test("Redis activity cache preserves observedAtMs separately from write clock", 
     observedAtMs: 12345,
     updatedAt: 67890,
   });
+});
+
+// #oar-raft:#22: the owner mirrors a same-content heartbeat's server receive
+// time so a non-owner replica ages the snapshot by it too.
+test("Redis activity cache round-trips the heartbeat liveness stamp beside observedAtMs", () => {
+  const fields = buildAgentActivityHashFields({
+    activity: "working",
+    detail: "Running tests",
+    detailKind: "running_command",
+    observedAtMs: 1_000,
+    livenessAtMs: 61_000,
+    updatedAtMs: 61_000,
+  });
+  assert.equal(fields.livenessAtMs, "61000");
+  assert.deepEqual(projectAgentActivityFromRedisHash(fields), {
+    activity: "working",
+    detail: "Running tests",
+    detailKind: "running_command",
+    observedAtMs: 1_000,
+    updatedAt: 61_000,
+    livenessAtMs: 61_000,
+  });
+  assert.equal(
+    "livenessAtMs" in (projectAgentActivityFromRedisHash({ activity: "working", detail: "x", detailKind: "running_command", updatedAt: "1" }) ?? {}),
+    false,
+    "a hash written before the stamp existed decodes without it",
+  );
 });
 
 test("Redis runtime-error mirror preserves the authority fingerprint and payload", () => {

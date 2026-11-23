@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 import { dbTest } from "../test/integration/dbTest";
-import { applyAgentModelSeen } from "./agentModelSeen";
+import { applyAgentModelSeen, applyAgentModelSeenWithReplay, pendingAgentModelSeenReplayCount, type AgentModelSeenReplayEvent } from "./agentModelSeen";
 import { createAgent } from "./agentService";
 import { addAgent, getAgentLegacyReadCursor, markAgentLegacyRead } from "./channelService";
 import { createMessage } from "./messageService";
@@ -62,8 +62,50 @@ dbTest("agent:model-seen does not move the read position over rows newer than th
   const fresh = await createMessage(channel.id, "user", owner.id, "just committed");
 
   const result = await applyAgentModelSeen({ agentId: agent.id, serverId: server.id, channelId: channel.id, seqs: [fresh.seq] });
-  assert.deepEqual(result, { outcome: "unchanged", reason: "gap" }, "a lower seq could still be committing behind a fresh row");
+  assert.deepEqual(result, { outcome: "unchanged", reason: "gap", unsettledSeqs: [fresh.seq] }, "a lower seq could still be committing behind a fresh row");
   assert.equal(await getAgentLegacyReadCursor(agent.id, channel.id), 0);
+});
+
+dbTest("a report inside the settle window moves the read position at the second look; a report stopped by a message that was not shown does not wait", async ({ seed }) => {
+  const owner = await seed.human();
+  const server = await seed.server({ owner });
+  const channel = await seed.channel({ server, members: [owner] });
+  const other = await seed.channel({ server, members: [owner] });
+  const agent = await createAgent(server.id, "replay-agent", { runtime: "codex", creatorType: "user", creatorId: owner.id });
+  await addAgent(channel.id, agent.id);
+  await addAgent(other.id, agent.id);
+  const events: AgentModelSeenReplayEvent[] = [];
+  // The second look runs after 20 ms here, reading the rows as settled by then.
+  let settled = false;
+  const deps = {
+    apply: (input: Parameters<typeof applyAgentModelSeen>[0]) => applyAgentModelSeen(input, settled ? settledNow : {}),
+    record: (event: AgentModelSeenReplayEvent) => { events.push(event); },
+    delayMs: 20,
+  };
+  const waitFor = async (count: number) => {
+    for (let i = 0; i < 200 && events.length < count; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(events.length, count);
+  };
+
+  const fresh = await createMessage(channel.id, "user", owner.id, "shown within the window");
+  const first = await applyAgentModelSeenWithReplay({ agentId: agent.id, serverId: server.id, channelId: channel.id, seqs: [fresh.seq] }, deps);
+  assert.equal(first.outcome, "unchanged");
+  settled = true;
+  await waitFor(1);
+  assert.equal(events[0]!.outcome, "advanced");
+  assert.equal(events[0]!.trigger, "timer");
+  assert.equal(await getAgentLegacyReadCursor(agent.id, channel.id), fresh.seq);
+
+  // A message that was not shown sits below the reported one: that is not the window's doing, so nothing waits.
+  settled = false;
+  const notShown = await createMessage(other.id, "user", owner.id, "not shown");
+  const shown = await createMessage(other.id, "user", owner.id, "shown within the window");
+  const sparse = await applyAgentModelSeenWithReplay({ agentId: agent.id, serverId: server.id, channelId: other.id, seqs: [shown.seq] }, deps);
+  assert.deepEqual(sparse, { outcome: "unchanged", reason: "gap" });
+  assert.ok(notShown.seq < shown.seq);
+  assert.equal(pendingAgentModelSeenReplayCount(), 0);
+  assert.equal(events.length, 1);
+  assert.equal(await getAgentLegacyReadCursor(agent.id, other.id), 0);
 });
 
 dbTest("agent:model-seen ignores a conversation on another server, even a public one", async ({ seed }) => {

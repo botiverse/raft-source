@@ -252,9 +252,23 @@ export interface McpAppListItem {
   homepageUrl: string | null;
   category: string | null;
   distribution: "server_local";
-  /** Where the App came from; a Raft template (Notion, Linear) is maintained by Raft. */
-  source: { kind: "url" | "template"; templateKey: string | null; maintainedByRaft: boolean };
-  status: { health: "reachable" | "unreachable" | "unknown"; toolCount: number; connectionCount: number; actionNeeded: number };
+  /**
+   * Where the App came from; a Raft template (Notion, Linear) is maintained by Raft.
+   * `publisherName`: who builds and hosts the template's server ("Notion"); null for a URL App or
+   * a template that does not name one.
+   */
+  source: { kind: "url" | "template"; templateKey: string | null; maintainedByRaft: boolean; publisherName: string | null };
+  /**
+   * `defaultConnectionStatus`: the auth status of the App's default Connection, null when it has none.
+   * Always null for a viewer who does not manage integrations.
+   */
+  status: {
+    health: "reachable" | "unreachable" | "unknown";
+    toolCount: number;
+    connectionCount: number;
+    actionNeeded: number;
+    defaultConnectionStatus: "ready" | "pending" | "needs_auth" | "expired" | "error" | null;
+  };
 }
 
 export interface McpAppListResponse {

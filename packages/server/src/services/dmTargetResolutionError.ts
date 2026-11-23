@@ -1,5 +1,6 @@
 import { formatDmPeerRef } from "@botiverse/raft-shared";
 
+import { sentenceQuoting, type RefusalInput } from "../lib/refusal";
 import { AGENT_REMINDERS_NOT_SENDABLE_MESSAGE } from "./agentPrivateSurfaces";
 
 export type DmTargetResolutionErrorCode =
@@ -12,8 +13,8 @@ export type DmTargetResolutionErrorCode =
  * A DM target that cannot be resolved to one conversation for a reason the
  * caller can fix, as opposed to "no such DM". Thrown by
  * channelService.resolveChannelByName so every agent-facing entry reports it
- * instead of collapsing it to not-found; globalJsonServerErrorHandler renders
- * it as `{ error, code }` with its 4xx status.
+ * instead of collapsing it to not-found; every writer (respondToDmTargetResolutionError,
+ * the global handler) refuses it with its 4xx status (toRefusal).
  */
 export class DmTargetResolutionError extends Error {
   readonly status: 400 | 403 | 409;
@@ -29,9 +30,9 @@ export class DmTargetResolutionError extends Error {
     this.status = code === "DM_TARGET_AMBIGUOUS" || code === "MIGRATION_RECEIPT_READ_ONLY" ? 409 : code === "DM_TARGET_NOT_SENDABLE" ? 403 : 400;
   }
 
-  /** The JSON body every route answers with. */
-  toResponseBody(): { error: string; code: DmTargetResolutionErrorCode; suggestedNextAction: string } {
-    return { error: this.message, code: this.code, suggestedNextAction: this.suggestedNextAction };
+  /** The refusal every route answers with (refuse(res, err.status, err.toRefusal())). */
+  toRefusal(): RefusalInput {
+    return { code: this.code, error: this.message, suggestedNextAction: this.suggestedNextAction };
   }
 
   static ambiguous(peerName: string): DmTargetResolutionError {
@@ -39,9 +40,9 @@ export class DmTargetResolutionError extends Error {
     const humanRef = `dm:@${formatDmPeerRef(peerName, "human")}`;
     return new DmTargetResolutionError(
       "DM_TARGET_AMBIGUOUS",
+      // A human and an agent both hold the name, so it is a real member name, not raw request text.
       `dm:@${peerName} matches both a human and an agent named ${peerName}. `
-        + `Name the one you mean: ${agentRef} for the agent, or ${humanRef} for the human `
-        + `(for example: raft message read --target "${agentRef}").`,
+        + `Name the one you mean: ${agentRef} for the agent, or ${humanRef} for the human.`,
       `retry with ${agentRef} for the agent or ${humanRef} for the human`,
     );
   }
@@ -57,6 +58,7 @@ export class DmTargetResolutionError extends Error {
 
   /** A migration receipt is a one-way notice: read it, but there is no one there to reply to. */
   static migrationReceiptReadOnly(target: string): DmTargetResolutionError {
+    // `target` already resolved to the receipt DM (an existing peer name or the conversation's id), not raw request text.
     return new DmTargetResolutionError(
       "MIGRATION_RECEIPT_READ_ONLY",
       `${target} is a migration receipt: a one-way notice from Raft about your move, with no one on the other side. `
@@ -68,8 +70,11 @@ export class DmTargetResolutionError extends Error {
   static invalidPeerKind(rawPeer: string, suffix: string | undefined): DmTargetResolutionError {
     return new DmTargetResolutionError(
       "DM_TARGET_INVALID_PEER_KIND",
-      `dm:@${rawPeer} has an unknown peer kind${suffix !== undefined ? ` "${suffix}"` : ""}. `
-        + "Use dm:@<name>, dm:@<name>~agent or dm:@<name>~human.",
+      sentenceQuoting(
+        [rawPeer],
+        `dm:@${rawPeer} has an unknown peer kind${suffix !== undefined ? ` "${suffix}"` : ""}. Use dm:@<name>, dm:@<name>~agent or dm:@<name>~human.`,
+        "That DM target has an unknown peer kind. Use dm:@<name>, dm:@<name>~agent or dm:@<name>~human.",
+      ),
       "retry with dm:@<name>, dm:@<name>~agent or dm:@<name>~human",
     );
   }

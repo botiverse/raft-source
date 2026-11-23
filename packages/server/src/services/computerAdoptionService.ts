@@ -29,13 +29,14 @@
 // Raw key hygiene (§3.3.1): the raw `sk_machine_*` is read into memory once
 // for argon2.verify and discarded. NEVER persisted, NEVER logged.
 
-import { and, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import argon2 from "argon2";
 import { getDb, type DatabaseExecutor, type DatabaseTransaction } from "../db/index";
-import { computers, deviceLoginGrants, machines, servers, sessionFamilies, users } from "../db/schema";
+import { computers, deviceLoginGrants, machines, servers, sessionFamilies } from "../db/schema";
 import { clearAuthCache, extractApiKeyPrefix } from "./machineService";
 import { DeviceSessionRevokedError, lockLiveSessionFamily } from "./sessionService";
 import { generateComputerApiKeyMaterial } from "./computerCredentialService";
+import { computerControllerUserId } from "./computerControlAuthorization";
 import { isMember } from "./serverService";
 import { actorHasServerCapabilityInServer, actorRoleHasServerCapability, getActorServerRoleInServer } from "../lib/actorPermissions";
 import { FencedAuthorizationDeniedError, ServerMembershipRevokedError, withActorMembershipFence } from "../lib/actorMembershipFence";
@@ -44,6 +45,7 @@ import type { ServerRole } from "@botiverse/raft-shared";
 import { recordIntegrationAuditEvent, serverAuditContextMetadata } from "./integrationAuditService";
 import { sanitizeClientName } from "./deviceAuthService";
 import { sendComputerKeyReplacedByOtherEmail, sendLegacyMachineMovedEmail } from "./emailService";
+import { computerNoticeRecipient } from "./computerNoticeRecipient";
 
 export type AdoptLegacyResult =
   | {
@@ -683,14 +685,15 @@ async function adoptMatchedLegacyMachine(input: {
 
 /**
  * Selection-based adoption by the machine's registrant without `registerMachines`. A machine not yet migrated
- * qualifies only if it never had a Computer (revoked or not): a Computer attached through /api/computer/attach
- * also leaves `legacyKeyMigratedAt` NULL, and once revoked it reconnects only through a new attach. A migrated
- * machine qualifies for resume only when its most recent attach record (the live one first) was attached by the
- * caller, or names no one and is revoked; none at all qualifies too.
+ * qualifies only if it never had a Computer (revoked or not): moving one's own old daemon over is what makes the
+ * registrant its first live attacher. A Computer attached through /api/computer/attach also leaves
+ * `legacyKeyMigratedAt` NULL, and once revoked it reconnects only through a new attach. A migrated machine
+ * qualifies for resume only when the caller is its controller (computerControllerUserId: the live attach record's
+ * attacher, no fallback), the same rule every Computer route uses.
  */
 async function registrantMayAdoptBySelection(
   q: DatabaseExecutor,
-  machine: Pick<MatchedLegacyMachine, "id" | "legacyKeyMigratedAt">,
+  machine: Pick<MatchedLegacyMachine, "id" | "serverId" | "legacyKeyMigratedAt">,
   userId: string,
 ): Promise<boolean> {
   if (!machine.legacyKeyMigratedAt) {
@@ -701,22 +704,10 @@ async function registrantMayAdoptBySelection(
       .limit(1);
     return !anyComputer;
   }
-  // The live attach record, else the most recent revoked one (computerControllerUserId's order): once someone
-  // else adopted it, their revoke does not hand the machine back to its registrant.
-  // Deliberately not computerControllerUserId itself: they differ in one case. A LIVE attach record that names
-  // no one (attached_by_user_id null) refuses the registrant here, where computerControllerUserId falls back to
-  // machines.userId (the registrant). Resuming hands the live Computer's key to the caller (rotated in place).
-  // Without `registerMachines`, only the Computer's own attacher may take it; with no attacher on record, nobody
-  // qualifies. The row's controller does not reach that far. Keep the two separate.
-  const [latest] = await q
-    .select({ attachedByUserId: computers.attachedByUserId, revokedAt: computers.revokedAt })
-    .from(computers)
-    .where(eq(computers.machineId, machine.id))
-    .orderBy(sql`${computers.revokedAt} IS NULL DESC`, desc(computers.createdAt))
-    .limit(1);
-  if (!latest) return true;
-  if (!latest.revokedAt) return latest.attachedByUserId === userId;
-  return latest.attachedByUserId === null || latest.attachedByUserId === userId;
+  // Resuming hands the live Computer's key to the caller (rotated in place). Without `registerMachines`, only
+  // its controller may take it: a revoked record's attacher, a live record naming no one, or the registrant of
+  // a machine nobody attaches now does not (requires_admin).
+  return (await computerControllerUserId(q, machine.serverId, machine)) === userId;
 }
 
 /**
@@ -746,23 +737,6 @@ async function recordAdoptionResumeRotation(
   }, tx);
 }
 
-/** Who a notice about `userId`'s machine or Computer on `serverId` may go to: still in the server, account not retired. */
-async function noticeRecipient(serverId: string, userId: string, actorUserId: string) {
-  if (!(await isMember(serverId, userId))) return null;
-  const db = getDb();
-  const [person] = await db.select({ email: users.email, name: users.name, displayName: users.displayName, retiredAt: users.retiredAt }).from(users).where(eq(users.id, userId));
-  const [actor] = await db.select({ name: users.name, displayName: users.displayName }).from(users).where(eq(users.id, actorUserId));
-  const [server] = await db.select({ name: servers.name, slug: servers.slug }).from(servers).where(eq(servers.id, serverId));
-  if (!person?.email || person.retiredAt || !actor || !server) return null;
-  return {
-    email: person.email,
-    name: person.displayName || person.name,
-    // A member-chosen name: no control or bidi characters in a mail from Raft.
-    actorName: sanitizeClientName(actor.displayName || actor.name) ?? "An admin",
-    server,
-  };
-}
-
 /**
  * Tells the member who had added a machine that an owner or admin moved it
  * over to a Computer (`AdoptLegacyResult.movedMachineAddedByUserId`). One
@@ -777,7 +751,7 @@ export async function notifyLegacyMachineMovedByOther(input: {
   movedByUserId: string;
 }): Promise<void> {
   try {
-    const to = await noticeRecipient(input.serverId, input.machineAddedByUserId, input.movedByUserId);
+    const to = await computerNoticeRecipient(input.serverId, input.machineAddedByUserId, input.movedByUserId);
     const [machine] = await getDb().select({ name: machines.name }).from(machines).where(eq(machines.id, input.machineId));
     if (!to || !machine) return;
     await sendLegacyMachineMovedEmail(to.email, to.name, {
@@ -805,7 +779,7 @@ export async function notifyComputerKeyReplacedByOther(input: {
   replacedByUserId: string;
 }): Promise<void> {
   try {
-    const to = await noticeRecipient(input.serverId, input.keyHolderUserId, input.replacedByUserId);
+    const to = await computerNoticeRecipient(input.serverId, input.keyHolderUserId, input.replacedByUserId);
     if (!to) return;
     await sendComputerKeyReplacedByOtherEmail(to.email, to.name, {
       computerName: sanitizeClientName(input.computerName) ?? "(unnamed)",

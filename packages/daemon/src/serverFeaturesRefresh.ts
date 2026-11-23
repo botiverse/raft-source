@@ -23,8 +23,11 @@ import { axSurface } from "./agentRuntimeInput";
  * changed (`server:features-changed`), and once after every (re)connect
  * (changes are not replayed), the daemon asks for the current values over the
  * machine WebSocket (`server:features:request` → `server:features`), never
- * through the agent API: the daemon host must not call `/internal/agent-api/*`
- * with an agent credential. The answer goes to both agent hosts
+ * through the agent API. The rule: server- or Computer-level data (flags,
+ * config) goes over the Computer's own WebSocket; data that one agent itself
+ * may see (its unread, its tasks) is fetched with that agent's credential
+ * through the agent API, only via `fetchAgentApiAsAgent`, read-only, the
+ * Server deciding visibility by the agent's own rules. The answer goes to both agent hosts
  * (`applyServerFeatures`, through the host router): every agent's config is
  * updated, a running agent whose session drifted from it is stopped once it is
  * idle (`serverFeaturesDrift`, reconciler step 6; one kind of runtime spec
@@ -167,13 +170,18 @@ export interface ServerFeaturesRuntimeFacts {
  * (against what it started with). `subagentDelegation` changes only the
  * prompt of a runtime that can start sub-agents, `piSessionRotation` only a
  * session that rotates; every other key changes the standing prompt
- * (`enabledApps`, `taskConversations`, `reminderApp`, `vaultApp`) or what the
+ * (`enabledApps`, `taskConversations`, `dmReplyPlacement`, `reminderApp`,
+ * `vaultApp`) or what the
  * spawn publishes to the CLI (`passiveAx`) for every runtime; `agentContextView`
  * changes only what the daemon keeps and answers, never the session, and
  * `wakeRecycleOar` only what the OAR host decides when the session is idle
  * and at the next start, `wakeRecycleTierGate` likewise for both hosts, and
  * `turnEndCompaction` and `wakeRecycleWarm` only what a turn end (and, for
- * the second, the next start) decides. A key that does not need a restart
+ * the second, the next start) decides, `silentTurnEnd` only what the OAR
+ * host decides at a turn's long silence, and `continuationTool` only what the
+ * next launch offers (the answer tool, fixed for a launch with its token),
+ * `agentFocus` only how a later delivery is shown, and
+ * `inboxNoticeServerRows` only how the daemon builds the next wake-up notice. A key that does not need a restart
  * still updates the config the next spawn reads.
  */
 export function serverFeatureChangeNeedsRestart(
@@ -193,6 +201,14 @@ export function serverFeatureChangeNeedsRestart(
     if (key === "turnEndCompaction") return false;
     // Read at each turn end and at the next start's recycle decision (both hosts), never by a running session.
     if (key === "wakeRecycleWarm") return false;
+    // Read by the OAR host when a turn's 60-minute silence is reached, never baked into a running session.
+    if (key === "silentTurnEnd") return false;
+    // Read when a launch registers its managed MCP endpoint (the answer tool and its env var): the next start.
+    if (key === "continuationTool") return false;
+    // Read when a delivery is shown, never baked into a running session.
+    if (key === "agentFocus") return false;
+    // Read by the daemon each time it builds a wake-up notice (whether it asks the Server for its rows), never by the session.
+    if (key === "inboxNoticeServerRows") return false;
     return true;
   });
 }
@@ -240,11 +256,11 @@ const NAMED_BOOLEAN_FEATURES: readonly {
     on: "Task conversations turned on (a task has its own conversation: `raft task reply`)",
     off: "Task conversations turned off for new tasks (a task that already has a conversation keeps it)",
   },
-  // `raft reminder schedule` is what stops working: the Reminder app is reached
-  // through `raft integration invoke`, not through `raft reminder`.
+  // The bundled CLI's `raft reminder` follows the flag (features.reminderApp):
+  // the same commands now call the Reminder app.
   {
     key: "reminderApp",
-    on: "reminders moved to the Reminder app (`raft reminder schedule`, `update` and `snooze` are refused here now)",
+    on: "reminders moved to the Reminder app (`raft reminder` commands now work with it)",
     off: "new reminders use `raft reminder schedule` again (the ones made in the Reminder app stay there)",
   },
   // The Vault line of "Credential handling" (shared raftCliGuide.ts): only the
@@ -261,6 +277,13 @@ const NAMED_BOOLEAN_FEATURES: readonly {
     on: "your instructions now cover working through sub-agents",
     off: "your instructions no longer cover working through sub-agents",
     appliesTo: (runtime) => runtime.supportsSubagents,
+  },
+  // The DM rule in the Tasks section (shared raftCliGuide.ts,
+  // `dm_reply_placement_prompt`): only the instructions change.
+  {
+    key: "dmReplyPlacement",
+    on: "your instructions now cover where to confirm and report work asked for in a DM with one person",
+    off: "your instructions no longer cover where to confirm and report work asked for in a DM with one person",
   },
 ];
 

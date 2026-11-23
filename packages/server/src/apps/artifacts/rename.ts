@@ -108,7 +108,7 @@ export async function renameArtifact(
   itemId: string,
   title: string,
   outbox: ArtifactNoticeOutbox,
-): Promise<{ kind: "done"; item: ArtifactItemRow; changed: boolean } | { kind: "channel_announcement"; channel: string; title: string } | ArtifactManageRefusal> {
+): Promise<{ kind: "done"; item: ArtifactItemRow; changed: boolean } | { kind: "channel_announcement"; channel: string | null; title: string } | ArtifactManageRefusal> {
   const result = await getDb().transaction(async (tx) => {
     const [locked] = await tx.select().from(artifactItems).where(eq(artifactItems.id, itemId)).for("update");
     if (!locked || !(await canViewArtifacts(actor, [locked], { executor: tx }))[0]) return { kind: "not_visible" as const };
@@ -118,7 +118,7 @@ export async function renameArtifact(
     const announcement = locked.homeKind === "conversation"
       ? await channelAnnouncementPushRefusal(locked.id, locked.homeChannelId, { type: actor.type, id: actor.id, serverId: actor.serverId }, tx)
       : null;
-    if (announcement) return { kind: "channel_announcement" as const, channel: announcement.channel, title: locked.title };
+    if (announcement) return { kind: "channel_announcement" as const, channel: "elsewhere" in announcement ? null : announcement.channel, title: locked.title };
     const renamed = await retitleItem(tx, { locked, title, actor: { type: actor.type, id: actor.id }, outbox });
     return { kind: "done" as const, changed: true, ...renamed };
   });

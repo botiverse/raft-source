@@ -21,6 +21,25 @@ import { isElectronDesktopShell } from "../utils/desktopShell";
 let socket: Socket | null = null;
 let listenersAttached = false;
 let refreshingForSocket = false;
+/**
+ * The server the auth named when `connect()` was last called
+ * (connectWithAuth; connectedSocketServerId). Not `socket.auth`'s own:
+ * updateSocketAuthFromStorage and the token refreshes rewrite that from the
+ * current server while the socket stays connected to the one it connected
+ * for. Noted where connect is called, never by a `connect` listener.
+ */
+let connectServerId: string | null = null;
+
+function authServerId(auth: Socket["auth"]): string | null {
+  const serverId = typeof auth === "object" ? (auth as { serverId?: unknown }).serverId : undefined;
+  return typeof serverId === "string" ? serverId : null;
+}
+
+/** `s.connect()` with its auth as it is now, noting the server it names. */
+function connectWithAuth(s: Socket): void {
+  connectServerId = authServerId(s.auth);
+  s.connect();
+}
 
 function freshAuth() {
   return {
@@ -91,6 +110,8 @@ export function connectSocket() {
       });
 
       if (recoveryResult === "retried-with-latest-token") {
+        // It set the fresh auth and called connect() just now.
+        connectServerId = authServerId(s.auth);
         return;
       }
 
@@ -112,7 +133,7 @@ export function connectSocket() {
           });
           if (outcome === "retry") {
             s.auth = freshAuth();
-            s.connect();
+            connectWithAuth(s);
           } else if (outcome === "keep-session") {
             // Keep session and let subsequent attempts retry naturally.
             console.warn("[Socket.io] Refresh not completed; keeping session for retry");
@@ -127,6 +148,9 @@ export function connectSocket() {
     });
     s.on("connect", () => {
       console.log("[Socket.io] Connected, id:", s.id);
+      // socket.io's own reconnects don't go through connectWithAuth: their
+      // handshake carried the auth as it was then, so note it again here.
+      connectServerId = authServerId(s.auth);
       // Stryker disable next-line all: lifecycle wiring is pinned by a source contract; batching behavior is covered in serverFeatureFlags.test.ts.
       void prefetchServerFeatureFlags(useServerStore.getState().current?.id);
     });
@@ -165,7 +189,7 @@ export function connectSocket() {
     s.auth = freshAuth();
     // Stryker disable next-line all: lifecycle wiring is pinned by a source contract; batching behavior is covered in serverFeatureFlags.test.ts.
     void prefetchServerFeatureFlags(useServerStore.getState().current?.id);
-    s.connect();
+    connectWithAuth(s);
   }
 }
 
@@ -224,7 +248,7 @@ function scheduleServerDisconnectReconnect(s: Socket): void {
     serverDisconnectReconnectTimer = null;
     if (socket !== s || s.connected || !localStorage.getItem("slock_access_token")) return;
     s.auth = freshAuth();
-    s.connect();
+    connectWithAuth(s);
   }, delayMs);
 }
 
@@ -272,7 +296,7 @@ export function ensureSocketConnected() {
       s.auth = freshAuth();
       // Stryker disable next-line all: lifecycle wiring is pinned by a source contract; batching behavior is covered in serverFeatureFlags.test.ts.
       void prefetchServerFeatureFlags(useServerStore.getState().current?.id);
-      s.connect();
+      connectWithAuth(s);
     } else {
       connectSocket();
     }
@@ -281,4 +305,31 @@ export function ensureSocketConnected() {
 
 export function isSocketConnected() {
   return !!socket?.connected;
+}
+
+/**
+ * The server the connected socket connected for: the one its auth named when
+ * `connect()` was called (null: none), not what `socket.auth` names now (a
+ * token refresh after a server switch rewrites that to the new server while
+ * the socket is still on the old one). Undefined while no socket is connected.
+ */
+export function connectedSocketServerId(): string | null | undefined {
+  if (!socket?.connected) return undefined;
+  return connectServerId;
+}
+
+/**
+ * Outside the main layout (whose bridge owns the socket), a page that needs
+ * the socket for `serverId` (the current server): connected for another
+ * server, it is made again for this one; not connected, it connects (with
+ * the current server's auth). Never call it under the main layout: its
+ * bridge reconnects on a server switch itself.
+ */
+export function ensureSocketForServer(serverId: string | null) {
+  const current = connectedSocketServerId();
+  if (current !== undefined && current !== serverId) {
+    reconnectSocket();
+    return;
+  }
+  ensureSocketConnected();
 }

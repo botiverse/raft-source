@@ -3,12 +3,9 @@ import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { AgentConfig } from "@botiverse/raft-shared";
 import { getDb, isDatabaseInitialized, type DatabaseExecutor } from "../db/index";
 import {
-  agentProviderConnections,
   agents,
   managedMcpAssignments,
   managedMcpServers,
-  providerConnectionCredentials,
-  providerConnections,
 } from "../db/schema";
 
 /**
@@ -28,23 +25,6 @@ export async function bumpAgentConfigRevision(
     .where(inArray(agents.id, [...agentIds]))
     .returning({ id: agents.id, configRevision: agents.configRevision });
   return new Map(rows.map((row) => [row.id, row.configRevision]));
-}
-
-/** The agents launched through a provider connection get its new key or endpoint: one increment each. */
-export async function bumpProviderConnectionAgentsConfigRevision(
-  executor: DatabaseExecutor,
-  serverId: string,
-  connectionId: string,
-): Promise<string[]> {
-  const assigned = await executor.select({ agentId: agentProviderConnections.agentId })
-    .from(agentProviderConnections)
-    .where(and(
-      eq(agentProviderConnections.serverId, serverId),
-      eq(agentProviderConnections.connectionId, connectionId),
-    ));
-  const agentIds = assigned.map((row) => row.agentId);
-  await bumpAgentConfigRevision(executor, agentIds);
-  return agentIds;
 }
 
 /**
@@ -82,47 +62,11 @@ export async function agentManagedMcpFingerprint(
   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
-/**
- * `AgentConfig.providerConnectionRevision`: the agent's provider connection
- * id with its config and credential versions (both grow on every endpoint or
- * key edit; never derived from the key). Null without a connection.
- */
-export async function agentProviderConnectionRevision(
-  serverId: string,
-  agentId: string,
-  db: DatabaseExecutor = getDb(),
-): Promise<string | null> {
-  const [row] = await db.select({
-    connectionId: providerConnections.id,
-    configVersion: providerConnections.configVersion,
-    credentialVersion: providerConnectionCredentials.credentialVersion,
-  })
-    .from(agentProviderConnections)
-    .innerJoin(providerConnections, and(
-      eq(providerConnections.serverId, agentProviderConnections.serverId),
-      eq(providerConnections.id, agentProviderConnections.connectionId),
-    ))
-    .innerJoin(providerConnectionCredentials, and(
-      eq(providerConnectionCredentials.serverId, agentProviderConnections.serverId),
-      eq(providerConnectionCredentials.connectionId, agentProviderConnections.connectionId),
-    ))
-    .where(and(
-      eq(agentProviderConnections.serverId, serverId),
-      eq(agentProviderConnections.agentId, agentId),
-    ))
-    .limit(1);
-  return row ? `${row.connectionId}:${row.configVersion}:${row.credentialVersion}` : null;
-}
-
-/** Both fields as `buildAgentConfig` adds them; nothing without a database (in-memory tests). */
+/** The field as `buildAgentConfig` adds it; nothing without a database (in-memory tests). */
 export async function agentConfigRevisionInputs(
   serverId: string,
   agentId: string,
-): Promise<Pick<AgentConfig, "managedMcpFingerprint" | "providerConnectionRevision">> {
+): Promise<Pick<AgentConfig, "managedMcpFingerprint">> {
   if (!isDatabaseInitialized()) return {};
-  const providerConnectionRevision = await agentProviderConnectionRevision(serverId, agentId);
-  return {
-    managedMcpFingerprint: await agentManagedMcpFingerprint(serverId, agentId),
-    ...(providerConnectionRevision ? { providerConnectionRevision } : {}),
-  };
+  return { managedMcpFingerprint: await agentManagedMcpFingerprint(serverId, agentId) };
 }

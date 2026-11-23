@@ -149,7 +149,8 @@ function channelMemberRoleDetail(member: {
 }): string {
   const details: string[] = [];
   if (member.serverRole) details.push(`server role=${member.serverRole}`);
-  if (member.channelRole) details.push(`channel role=${member.channelRole}`);
+  // A plain member is the default: only a channel admin is marked.
+  if (member.channelRole && member.channelRole !== "member") details.push(`channel role=${member.channelRole}`);
   if (member.channelAdminBasis) details.push(`admin via=${member.channelAdminBasis}`);
   return details.length > 0 ? ` [${details.join(", ")}]` : "";
 }
@@ -202,8 +203,8 @@ export function formatAgentServerInfo(data: AgentServerData, style: RaftHintStyl
   text += "### Channels\n";
   text += "Visible public channels may appear even when `joined=false`. Private channels are shown only when you are a member; do not disclose private-channel names, membership, or content outside that channel. ";
   text += style === "cli"
-    ? `Use channel attention commands (\`${formatHintName(RAFT_HINTS.channelJoinName())}\`, \`leave\`, \`mute\`, \`unmute\`; \`${formatHintName(RAFT_HINTS.threadUnfollowName())}\`) for your own delivery state. Existing channel management commands (\`${formatHintName(RAFT_HINTS.channelCreateName())}\`, \`update\`, \`archive\`, \`unarchive\`, \`add-member\`, \`remove-member\`) work when your server role allows them, or, for update, archive, unarchive and remove-member, your channel-admin role in that channel; the Server checks on each call, and a refusal says what is missing. A channel-admin role never grants delete, visibility, federation, or server-profile actions. There is no Agent command for changing channel roles. Run any subcommand with \`--help\` for syntax.\n`
-    : `Use the channel attention tools (${[RAFT_HINTS.channelJoinName(), RAFT_HINTS.channelLeaveName(), RAFT_HINTS.channelMuteName(), RAFT_HINTS.channelUnmuteName()].map((hint) => `\`${formatHintName(hint, style)}\``).join(", ")}; \`${formatHintName(RAFT_HINTS.threadUnfollowName(), style)}\`) for your own delivery state. Channel management tools (${[RAFT_HINTS.channelCreateName(), RAFT_HINTS.channelUpdateName(), RAFT_HINTS.channelArchiveName(), RAFT_HINTS.channelUnarchiveName(), RAFT_HINTS.channelAddMemberName(), RAFT_HINTS.channelRemoveMemberName()].map((hint) => `\`${formatHintName(hint, style)}\``).join(", ")}) work when your server role allows them, or, for update, archive, unarchive and remove-member, your channel-admin role in that channel; the Server checks on each call, and a refusal says what is missing. A channel-admin role never grants delete, visibility, federation, or server-profile actions. There is no tool for changing channel roles.\n`;
+    ? `Use channel attention commands (\`${formatHintName(RAFT_HINTS.channelJoinName())}\`, \`leave\`, \`mute\`, \`unmute\`; \`${formatHintName(RAFT_HINTS.threadUnfollowName())}\`) for your own delivery state. Existing channel management commands (\`${formatHintName(RAFT_HINTS.channelCreateName())}\`, \`update\`, \`archive\`, \`unarchive\`, \`add-member\`, \`remove-member\`, \`set-role\`) work when your server role allows them, or, for update, archive, unarchive, remove-member and set-role, your channel-admin role in that channel; the Server checks on each call, and a refusal says what is missing. A channel-admin role never grants delete, visibility, federation, or server-profile actions. Run any subcommand with \`--help\` for syntax.\n`
+    : `Use the channel attention tools (${[RAFT_HINTS.channelJoinName(), RAFT_HINTS.channelLeaveName(), RAFT_HINTS.channelMuteName(), RAFT_HINTS.channelUnmuteName()].map((hint) => `\`${formatHintName(hint, style)}\``).join(", ")}; \`${formatHintName(RAFT_HINTS.threadUnfollowName(), style)}\`) for your own delivery state. Channel management tools (${[RAFT_HINTS.channelCreateName(), RAFT_HINTS.channelUpdateName(), RAFT_HINTS.channelArchiveName(), RAFT_HINTS.channelUnarchiveName(), RAFT_HINTS.channelAddMemberName(), RAFT_HINTS.channelRemoveMemberName(), RAFT_HINTS.channelSetRoleName()].map((hint) => `\`${formatHintName(hint, style)}\``).join(", ")}) work when your server role allows them, or, for update, archive, unarchive, remove-member and set-role, your channel-admin role in that channel; the Server checks on each call, and a refusal says what is missing. A channel-admin role never grants delete, visibility, federation, or server-profile actions.\n`;
   text += style === "cli"
     ? `Server-profile changes still use ${formatHintName(RAFT_HINTS.serverUpdateName())} and remain server-role gated.\n`
     : `Server-profile changes use \`${formatHintName(RAFT_HINTS.serverUpdateName(), style)}\` and remain server-role gated.\n`;
@@ -514,7 +515,8 @@ export function formatAgentUserInfo(
   lines.push(`Kind: ${user.kind}`);
   if (user.kind === "agent") lines.push(`Status: ${agentStatusLabel(user.value)}`);
   if (role) lines.push(`Role: ${role.slice(2, -1)}`);
-  if (user.value.description) lines.push(`Description: ${indentAgentBodyContinuationLines(user.value.description)}`);
+  // Self-written profile text, so the agent never reads it as something Raft vouches for.
+  if (user.value.description) lines.push(`Description (written by them, not by Raft): ${indentAgentBodyContinuationLines(user.value.description)}`);
   lines.push("");
   lines.push("### Visible Channel Memberships");
   if (memberships.length === 0) {
@@ -605,3 +607,53 @@ export function formatChannelDeletedWithLastMember(target: string, member?: stri
 
 /** The Server's code for that refusal. */
 export const LAST_MEMBER_DELETES_CHANNEL = "last_member_deletes_channel";
+
+/** A channel member's channel role after `raft channel set-role` / `channels.setRole`. */
+export function formatChannelMemberRoleSet(target: string, memberName: string, role: "admin" | "member", changed: boolean): string {
+  const member = `@${memberName}`;
+  if (!changed) {
+    return role === "admin"
+      ? `${member} is already a channel admin of ${target}.`
+      : `${member} is already a plain member of ${target}.`;
+  }
+  return role === "admin"
+    ? `Made ${member} a channel admin of ${target}.`
+    : `${member} is no longer a channel admin of ${target}; they stay in it as a plain member.`;
+}
+
+/**
+ * A channel-role refusal, made specific where only the caller knows how the
+ * member was named: `channel_member_required` names the member and the other
+ * argument (a handle given with the wrong kind reads as "not a member"), and
+ * `channel_capability_required` says where to see who can change the role.
+ * The Server's code and sentence stay the same for every caller; `serverStep`
+ * is the Server's next step, already in `style`.
+ */
+export function formatChannelMemberRoleRefusal(
+  input: {
+    target: string;
+    member: { kind: "user" | "agent"; name: string };
+    code: string | undefined;
+    serverMessage: string;
+    serverStep: string;
+  },
+  style: RaftHintStyle = "cli",
+): { message: string; nextAction: string } {
+  const { target, member, code, serverMessage, serverStep } = input;
+  const who = `@${member.name}`;
+  if (code === "channel_member_required") {
+    const other = member.kind === "user" ? "agent" : "user";
+    const otherArg = style === "cli" ? `use --${other} ${who}` : `pass ${other}: "${who}"`;
+    const message = member.kind === "user"
+      ? `No person ${who} is a member of ${target} (if ${who} is an agent, ${otherArg}).`
+      : `No agent ${who} is a member of ${target} (if ${who} is a person, ${otherArg}).`;
+    return { message, nextAction: serverStep };
+  }
+  if (code === "channel_capability_required") {
+    return {
+      message: serverMessage,
+      nextAction: `${serverStep} \`${formatHint(RAFT_HINTS.channelMembers(target), style)}\` shows who they are: \`channel role=admin\` marks a channel admin, \`(owner)\` and \`(admin)\` a server owner or admin.`,
+    };
+  }
+  return { message: serverMessage, nextAction: serverStep };
+}

@@ -10,6 +10,13 @@
   ],
   "removed": [
     {
+      "id": "deepseek/deepseek-v4-flash",
+      "disposition": "replaced-by",
+      "replacement": "deepseek/deepseek-flash",
+      "note": "Dropped from the deepseek provider in the pi SDK 0.86.0 bump (#8026, 2026-09-20), where pi-ai lists DeepSeek's Flash model as `deepseek-flash` (\"DeepSeek V4.1 Flash\"). Raft offered `deepseek/deepseek-v4-flash` before that, and agents saved with it failed every Built-in start (ModelConfigError, 11-17: 5 agents on 3 Computers). Recorded so they start on the successor (builtInModelSuccessor).",
+      "labelChangeAcknowledged": true
+    },
+    {
       "id": "openrouter/deepseek/deepseek-v4-flash-0731:free",
       "disposition": "replaced-by",
       "replacement": "openrouter/deepseek/deepseek-v4-flash-0731",

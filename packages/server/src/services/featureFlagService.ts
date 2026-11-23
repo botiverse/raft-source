@@ -16,12 +16,12 @@ import {
 } from "../db/schema";
 import { getServerBillingEntitlements, type ServerBillingEntitlement } from "./planService";
 import {
-  AGENT_READ_PROGRESS_FEATURE_FLAG_KEY as SHARED_AGENT_READ_PROGRESS_FEATURE_FLAG_KEY,
+  AGENT_FOCUS_FEATURE_FLAG_KEY as SHARED_AGENT_FOCUS_FEATURE_FLAG_KEY,
   AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY as SHARED_AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY,
   APP_PROMPT_TEXT_CONSENT_FEATURE_FLAG_KEY as SHARED_APP_PROMPT_TEXT_CONSENT_FEATURE_FLAG_KEY,
   CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY as SHARED_CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY,
   WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY as SHARED_WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY,
-  PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY as SHARED_PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY,
+  DATA_EXPORT_FEATURE_FLAG_KEY as SHARED_DATA_EXPORT_FEATURE_FLAG_KEY,
   PUBLIC_SERVER_FEATURE_FLAG_KEY as SHARED_PUBLIC_SERVER_FEATURE_FLAG_KEY,
   SERVER_LABS_UI_FEATURE_FLAG_KEY as SHARED_SERVER_LABS_UI_FEATURE_FLAG_KEY,
   clientRuleShapeError,
@@ -58,14 +58,24 @@ export const CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY = SHARED_CLAUDE_LIMIT_RESET_FEA
  */
 export const SYNC_CHANGES_API_FEATURE_FLAG_KEY = "sync_changes_api";
 /**
- * #raft-architecture:#29: the text match of a search reads only the searched
- * server's matches (plus the joint storage server's, for visible joint
- * conversations) through idx_message_server_timeline_server_search instead of
- * every server's through idx_messages_search_vector_gin. Absent = off; turn on
- * only after the 0658 vector backfill verified 0 and that index is valid;
- * kill_switch reverts to the corpus-wide match without a deploy.
+ * #triage:#244 (sync inbox rows, PR1): GET /api/sync/changes also sends
+ * `inbox_row` changes and `inboxReset` to a request naming the `inbox_row`
+ * capability (services/syncInboxRows.ts). Server-scoped; absent = off. Off, or
+ * no capability: the response is exactly as before. Read through the per-process
+ * flag cache like SYNC_CHANGES_API_FEATURE_FLAG_KEY.
  */
-export const SEARCH_SERVER_GIN_FEATURE_FLAG_KEY = "search_server_gin_v0";
+export const SYNC_INBOX_ROWS_FEATURE_FLAG_KEY = "sync_inbox_rows_v0";
+/**
+ * Staging only, a testing aid for client teams (#proj-mobile:#163): on for a
+ * server (a server rule naming it), its capable sync pulls hold every
+ * inbox_row (retryAfterMs, then inboxReset held_too_long after
+ * SYNC_INBOX_HOLD_MS), as while RisingWave lags. Read only where
+ * DEPLOYMENT_ENV=staging: on any other deployment the flag is never read,
+ * whatever its rules. Server-scoped; absent = off; a failed read is off. In
+ * FEATURE_FLAG_DEFAULT_ON_EXCEPTIONS, so staging's default-on does not turn it
+ * on for every server.
+ */
+export const SYNC_INBOX_STAGING_HELD_FEATURE_FLAG_KEY = "sync_inbox_staging_held_v0";
 /**
  * Closed-server purge (services/closedServerPurge.ts), randomization unit
  * `server`, evaluated per closed server by the hourly job. On with no variant
@@ -79,13 +89,21 @@ export const SEARCH_SERVER_GIN_FEATURE_FLAG_KEY = "search_server_gin_v0";
 export const CLOSED_SERVER_PURGE_FEATURE_FLAG_KEY = "closed_server_purge";
 export const ATTACHMENT_PREVIEW_UNIFIED_FEATURE_FLAG_KEY = "attachment_preview_unified_v0";
 export const ONBOARDING_OWNER_WIZARD_FEATURE_FLAG_KEY = "onboarding_owner_wizard_v0";
+/**
+ * Data export (#triage:#512, services/dataExport/): see DATA_EXPORT_FEATURE_FLAG_KEY
+ * in packages/shared. Evaluated with the requester and, for a server export,
+ * the server; default OFF, not seeded, and a FEATURE_FLAG_DEFAULT_ON_EXCEPTIONS
+ * entry, so only allow rules turn it on. While off every data export route
+ * answers 404 and a running export stops at its next batch (failed,
+ * `export_disabled`). A failed read is off.
+ */
+export const DATA_EXPORT_FEATURE_FLAG_KEY = SHARED_DATA_EXPORT_FEATURE_FLAG_KEY;
 /** Workspace Artifacts: see WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY in packages/shared. */
 export const WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY = SHARED_WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY;
-/** Agent read progress pushed to a conversation's viewers: see AGENT_READ_PROGRESS_FEATURE_FLAG_KEY in packages/shared. */
-export const AGENT_READ_PROGRESS_FEATURE_FLAG_KEY = SHARED_AGENT_READ_PROGRESS_FEATURE_FLAG_KEY;
 /** RFC 081 inbox items: see AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY in packages/shared. */
 export const AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY = SHARED_AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY;
-export const PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY = SHARED_PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY;
+/** Focus: see AGENT_FOCUS_FEATURE_FLAG_KEY in packages/shared. */
+export const AGENT_FOCUS_FEATURE_FLAG_KEY = SHARED_AGENT_FOCUS_FEATURE_FLAG_KEY;
 export const PUBLIC_SERVER_FEATURE_FLAG_KEY = SHARED_PUBLIC_SERVER_FEATURE_FLAG_KEY;
 export const SERVER_LABS_UI_FEATURE_FLAG_KEY = SHARED_SERVER_LABS_UI_FEATURE_FLAG_KEY;
 /**
@@ -96,6 +114,33 @@ export const SERVER_LABS_UI_FEATURE_FLAG_KEY = SHARED_SERVER_LABS_UI_FEATURE_FLA
  * missing flag or any evaluation failure leaves the prompt unchanged.
  */
 export const SUBAGENT_DELEGATION_FEATURE_FLAG_KEY = "subagent_delegation_prompt";
+
+/**
+ * DM reply placement prompt (#triage:#540): on a server with task
+ * conversations, agents are told that in a DM with one person they confirm
+ * taking work, ask what they need and send the result on the DM's own
+ * timeline, not in a thread or the task's conversation. Prompt text only.
+ * Server-scoped, default OFF: evaluated at each agent start and sent to the
+ * daemon as `AgentConfig.dmReplyPlacement`, and read by `GET /context` for an
+ * external agent's guide; a missing flag or any evaluation failure leaves the
+ * prompt unchanged.
+ */
+export const DM_REPLY_PLACEMENT_FEATURE_FLAG_KEY = "dm_reply_placement_prompt";
+
+/**
+ * Recent search's server timeline walk also walks the viewer's visible joint
+ * conversations (message_server_timeline.conversation_id, 0764), whose
+ * messages live in the joint storage server. Server-scoped (the searched
+ * server), default off, seeded by 0764 with no rules; a failed read is off.
+ * Turn on only after `db:backfill-message-server-timeline --conversation-id`
+ * reported 0 missing / 0 divergent over the whole timeline AND
+ * idx_message_server_timeline_conversation_created is valid; with the index
+ * missing the joint lane is an unbudgeted scan. Rollout: staging, then
+ * production backfill+verify, on for our own servers, default on, then the
+ * flag and the off path are removed in the following release. The row's
+ * description (0764) says the same for the flag admin.
+ */
+export const SEARCH_JOINT_CONVERSATION_WALK_FEATURE_FLAG_KEY = "search_joint_conversation_walk_v0";
 
 /**
  * RFC 072 §7 passive AX ("peripheral vision": command-guidance holds and
@@ -122,12 +167,25 @@ export const PI_SESSION_ROTATION_FEATURE_FLAG_KEY = "pi_session_rotation";
  * Wake recycle on the OAR host (#proj-runtime:#54). Server-scoped, default
  * OFF: evaluated at each agent start and sent to the daemon as
  * `AgentConfig.wakeRecycleOar` (also answered by `server:features`). One
- * switch for both halves: the OAR host reads Codex and Grok sessions' resume
- * facts from its session summary, and stops a cold idle session so the next
+ * switch for both halves: the OAR host reads Codex, Grok, OpenCode, Cursor, Qwen
+ * and Antigravity sessions' resume facts from its session summary, and stops a cold idle session so the next
  * wake can start fresh. The daemon's `RAFT_WAKE_RECYCLE=0` stays a local off
  * switch.
  */
 export const WAKE_RECYCLE_OAR_FEATURE_FLAG_KEY = "wake_recycle_oar";
+
+/**
+ * Channel-to-joint conversion's online move (step 3 of the online move
+ * redesign). Server-scoped (the source channel's server), default OFF, not
+ * seeded, and a FEATURE_FLAG_DEFAULT_ON_EXCEPTIONS entry, so only allow rules
+ * turn it on. On: a conversion start prepares the canonical channel, every
+ * thread and task conversation and the task numbering in its own bounded
+ * transaction and leaves the job in phase `online_move` with no fence, so
+ * the channel keeps taking writes (new root messages are stored in the
+ * canonical channel). Off, or a failed read: today's fenced conversion. Read
+ * once per start, before the conversion lock.
+ */
+export const CHANNEL_CONVERSION_ONLINE_MOVE_FEATURE_FLAG_KEY = "channel_conversion_online_move_v1";
 
 /**
  * Wake recycle gated on the cache tier (#proj-runtime:#54 phase 2).
@@ -148,9 +206,24 @@ export const WAKE_RECYCLE_TIER_GATE_FEATURE_FLAG_KEY = "wake_recycle_tier_gate";
  * more than 250k tokens, on a model with a window of at least 400k, compacts
  * with the runtime's own compaction at a turn end where nothing is running,
  * held or queued. Rolled out per server and checked against the bench chain
- * before it becomes the default.
+ * before it becomes the default. Sent only to a daemon that advertised
+ * `turn-end-compaction:v2` (#proj-runtime:#67, agentOrchestrator
+ * `gateMachineServerFeatures`): Computers from 1.0.69 obey the flag without
+ * the compaction fixes that capability names, so they stay off.
  */
 export const TURN_END_COMPACTION_FEATURE_FLAG_KEY = "turn_end_compaction";
+
+/**
+ * Ending a silent turn (task #triage:#496). Server-scoped, default OFF:
+ * evaluated at each agent start and sent as `AgentConfig.silentTurnEnd` (also
+ * answered by `server:features`). With it on, the OAR host ends a turn that
+ * has produced no record for 60 minutes with no tool open, no sub-agent
+ * running, nothing held and no delivery waiting, and shows why. Every
+ * Computer records `daemon.runtime.stall.silent_turn_ended` either way
+ * (`mode = would_end` with it off), so the count is known before it opens
+ * to every server.
+ */
+export const SILENT_TURN_END_FEATURE_FLAG_KEY = "silent_turn_end";
 
 /**
  * Warm wake recycle (#proj-runtime:#54, RFC 070 §6.5). Server-scoped, default
@@ -166,35 +239,60 @@ export const TURN_END_COMPACTION_FEATURE_FLAG_KEY = "turn_end_compaction";
 export const WAKE_RECYCLE_WARM_FEATURE_FLAG_KEY = "wake_recycle_warm";
 
 /**
+ * Encryption at rest on writes to `agents.runtime_config` and `agents.env_vars`
+ * (#proj-runtime:#79). Global default OFF (and in FEATURE_FLAG_DEFAULT_ON_EXCEPTIONS):
+ * decrypt-on-read ships first so rolling deploys and rollbacks stay safe while
+ * older replicas cannot decrypt ciphertext. Once the build is stable past the
+ * rollback window, operators flip `defaultEnabled: true` in FFA (audit-logged,
+ * `randomizationUnit: "server"`) before running the backfill script.
+ */
+export const AGENT_SECRET_ENCRYPTION_WRITE_FEATURE_FLAG_KEY = "agent_secret_encryption_write_v1";
+
+/**
+ * Staged cross-replica Redis sealing for `agent:start` and `agent:config`
+ * (#proj-runtime:#79). Global default OFF (and in FEATURE_FLAG_DEFAULT_ON_EXCEPTIONS):
+ *   - off / missing: receive-only (opens sealed frames if received, still accepts
+ *     legacy unsealed frames, sends unsealed)
+ *   - on (defaultVariant unset or "seal"): seals on send, accepts both on receive
+ *   - on (defaultVariant = "strict"): seals on send AND refuses unsealed on receive
+ * Flipped in FFA (`randomizationUnit: "server"`) without redeploying once all
+ * replicas understand sealed frames.
+ */
+export const REPLICA_SEAL_AGENT_CONFIG_FEATURE_FLAG_KEY = "replica_seal_agent_config_v1";
+
+/**
  * RFC 060 OAR host, one flag per runtime that also has a legacy driver
- * (antigravity, grok, cursor, opencode), so each runtime rolls out on its own. Codex no longer
- * has one (retired, #raft-architecture:#32): it runs on the OAR host wherever
- * the Computer advertises `runtime-host:oar:codex`. Server-scoped,
- * default OFF: a missing flag or any evaluation failure leaves it off.
- * Evaluated at each agent start for the agent's runtime and sent as
- * `AgentConfig.runtimeHost = "oar"`, and only to a daemon that advertised
+ * (grok, cursor, pi), so each runtime rolls out on its own. Codex
+ * (#raft-architecture:#32), Antigravity (#oar-raft:#46), and OpenCode
+ * (#oar-raft:#46) no longer have code-side flags: Codex runs on the OAR host
+ * wherever the Computer advertises `runtime-host:oar:codex`, Antigravity
+ * wherever it advertises `runtime-host:oar` (older Computers without
+ * Antigravity OAR hand it back), and OpenCode wherever it advertises
+ * `runtime-host:oar:opencode` (Windows and older CLIs stay on the legacy
+ * driver). Server-scoped, default OFF: a missing flag or any evaluation failure
+ * leaves it off. Evaluated at each agent start for the agent's runtime and sent
+ * as `AgentConfig.runtimeHost = "oar"`, and only to a daemon that advertised
  * `runtime-host:oar` (an older Computer keeps its drivers); the daemon still
  * runs a start it cannot host on its drivers. A flag change takes effect at
  * the agent's next start, never on a running session.
  * `RAFT_AGENT_RUNTIME_OAR_DISABLED` turns every runtime off on this server.
  */
 export const AGENT_RUNTIME_OAR_FEATURE_FLAG_KEYS = {
-  antigravity: "agent_runtime_oar_antigravity",
   grok: "agent_runtime_oar_grok",
   // #oar-raft:#10: Cursor through the Cursor SDK, only from a Computer that
   // advertises `runtime-host:oar:cursor` (Linux, non-SEA, SDK present). Keep
   // it off until OAR runs Cursor in a per-session child process that takes
   // the launch environment (daemon/src/agentHost/README.md, "Cursor").
   cursor: "agent_runtime_oar_cursor",
-  // OpenCode (`opencode acp`), only from a Computer that advertises
-  // `runtime-host:oar:opencode` (Linux and macOS, OpenCode 1.18.30+ / 2.0.27+).
-  opencode: "agent_runtime_oar_opencode",
-  // A flag on a DEPRECATED runtime (antigravity) also reopens creating and
-  // switching to it where it is on (runtimeAdmissionService.ts
-  // FLAG_REVIVED_RUNTIME_IDS, tygg #oar-raft:e9798673). Adding a flag for
-  // Kimi CLI, Copilot or Gemini would do the same for them.
+  // #oar-raft:#48: Pi via OAR subprocess RPC (`projectTrusted: false`), only
+  // from a Computer that advertises `runtime-host:oar:pi` (Linux/macOS, non-SEA).
+  pi: "agent_runtime_oar_pi",
+  // #oar-raft:#48: Claude Code via OAR generic launch path (OAR 0.123+), only
+  // from a Computer that advertises `runtime-host:oar:claude` (Linux/macOS).
+  // Default off for internal allowlist testing; prod rollout requires explicit approval.
+  claude: "agent_runtime_oar_claude",
   // No flag for the runtimes that run only on the OAR host (Qwen Code,
-  // Qoder): whether one can be used is what the agent's Computer reports, not
+  // Qoder, DeepSeek Harness): whether one can be used is what the agent's Computer reports, not
   // a server switch (xxchan, #proj-runtime:a5762001).
 } as const;
 export type AgentRuntimeOarFeatureFlagKey = (typeof AGENT_RUNTIME_OAR_FEATURE_FLAG_KEYS)[keyof typeof AGENT_RUNTIME_OAR_FEATURE_FLAG_KEYS];
@@ -338,6 +436,16 @@ export const OAUTH_ACCOUNT_LOGIN_FEATURE_FLAG_KEY = "oauth_account_login";
 export const SERVER_SSO_FEATURE_FLAG_KEY = "server_sso_v1";
 
 /**
+ * MCP App accounts (rfcs/087-mcp-app-accounts.md §10): members' own (personal) Connections.
+ * Server-randomized, default OFF, not seeded: a missing flag or any evaluation failure reads as off
+ * (services/managedMcpPersonalAccounts.ts). While off for a Server, writing an App's
+ * `members_can_connect`, starting or completing a personal sign-in and writing personal grants
+ * through the agents API are refused; reads, revoking (DELETE) and the audit events are not
+ * flagged, and with no personal Connections admission is unchanged.
+ */
+export const MCP_PERSONAL_ACCOUNTS_FEATURE_FLAG_KEY = "mcp_personal_accounts";
+
+/**
  * "Require SSO" reviewed by the platform (RFC 083 §6.2): requiring SSO manages
  * the whole account of everyone on the Server's verified domains, so it is
  * open only to an organization a human at Raft has checked owns those people
@@ -362,6 +470,23 @@ export const SERVER_SSO_REQUIRED_FEATURE_FLAG_KEY = "server_sso_required_v1";
  * broken flag store never adds wakes.
  */
 export const READY_WAKE_LOST_DELIVERIES_FEATURE_FLAG_KEY = "ready_wake_lost_deliveries";
+/** RaftBench overview enrollment switch (server-scoped, default off; paired with web RAFTBENCH_OVERVIEW_FLAG_KEY). */
+export const RAFTBENCH_OVERVIEW_FEATURE_FLAG_KEY = "raftbench_overview_v0";
+/** RaftBench first-pass triage runner switch (raftbench/triageRunner.ts). */
+export const RAFTBENCH_TRIAGE_FEATURE_FLAG_KEY = "raftbench_triage_v0";
+/** Host-scoped computed joint-channel source-exit mode (services/jointHumanMembershipAccess.ts). */
+export const JOINT_SOURCE_EXIT_FEATURE_FLAG_KEY = "joint_source_exit_v1";
+/**
+ * App step-up with a legacy passkey on the web (services/appStepUpService.ts,
+ * docs/contracts/app-web-step-up.md). By person (randomization unit `user`),
+ * default OFF, not seeded: a missing flag or any evaluation failure reads as
+ * off. While off for a person, POST /api/auth/app-login/step-up/start answers
+ * 404 `not_enabled` (the app falls back to "Open on the web") and every other
+ * step-up route answers as for an unknown request or code.
+ */
+export const APP_WEB_STEP_UP_FEATURE_FLAG_KEY = "app_web_step_up_v1";
+/** Global platform gate requiring legacy 1.14.x mobile OAuth clients to upgrade (services/legacyMobileOAuthUpgrade.ts). */
+export const LEGACY_MOBILE_OAUTH_UPGRADE_REQUIRED_FEATURE_FLAG_KEY = "legacy_mobile_oauth_upgrade_required_v0";
 
 const FEATURE_FLAG_LOCK_NAMESPACE = 0x46464c47; // "FFLG"
 const FEATURE_FLAG_CONFIG_VERSION_LOCK_NAMESPACE = 0x46464356; // "FFCV"

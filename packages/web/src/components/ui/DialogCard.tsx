@@ -51,9 +51,8 @@ type DialogCardProps = {
  * bigger form (wrap the button row in DialogActions and the commit in
  * DialogCommit). Desktop is the same card either way.
  *
- * A card opened from another dialog (Edit provider connection from Create
- * Agent or the runtime editor) is rendered inside that dialog's tree, so
- * raft-ui stacks it: its own lighter scrim, and Esc closes only the top one.
+ * A card opened from another dialog is rendered inside that dialog's tree,
+ * so raft-ui stacks it: its own lighter scrim, and Esc closes only the top one.
  */
 export default function DialogCard({
   title,

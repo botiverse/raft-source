@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { and, eq } from "drizzle-orm";
-import { asServerId, CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
+import { ARTIFACT_SETTLED_FEATURE_FLAG_KEY, asServerId, CHANNEL_ANNOUNCEMENT_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import { getDb } from "../../db/index";
 import { channels, featureFlagRules, objectEventRecipients, objectEvents, objectInboxStates, serverMembers, thirdPartyAgentEvents } from "../../db/schema";
 import { createAgent } from "../../services/agentService";
@@ -30,6 +30,7 @@ import { createPublishOperations } from "./publish";
 import { publishArtifactAs, type ArtifactPublishAsInput, type ArtifactPublishAsResult, type ArtifactPublishedAs } from "./publishAs";
 import { artifactsApp } from "./register";
 import { artifactComments, artifactItems, artifactSubscriptions, artifactVersions } from "./schema";
+import { changeSettlement } from "./settle";
 import { createWebCommentOperations } from "./webComments";
 
 afterEach(() => {
@@ -332,4 +333,28 @@ test("a file listed by sha256 whose bytes the server lacks is refused for the ow
   const refused = await publishArtifactAs(world.asOwner({ home: world.closed.id, request: { title: "Listed", files: [{ path: "index.md", sha256: absent, size: 14 }] } }));
   assert.deepEqual(refusal(refused), [400, "FILES_NOT_INLINE"]);
   assert.equal(await itemCount(world), before);
+});
+
+test("a Settled Artifact, pushed to as the owner: held once (409 SETTLED) without naming who settled it, as UNSEEN_CHANGES withholds its comments; the same push again goes through", async ({ seed }) => {
+  const world = await seedWorld(seed);
+  await getDb().insert(featureFlagRules).values({ flagKey: ARTIFACT_SETTLED_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [world.server.id] });
+  const made = await published(world.asOwner({ home: world.shared.id, request: { title: "Owner's plan", files: page("# Plan") } }));
+  const id = made.body.itemId;
+  const settled = await changeSettlement({ outbox: world.outbox, item: await itemRow(id), by: { type: "user", id: world.member.id }, settle: true });
+  assert.equal(settled.kind, "done");
+
+  const push = () => publishArtifactAs(world.asOwner({ request: { artifact: id, base: 1, files: page("# Plan v2") } }));
+  const held = await push();
+  assert.deepEqual(refusal(held), [409, "SETTLED"]);
+  if (held.kind !== "error") return;
+  const details = (held.body as { details?: { settled?: Record<string, unknown>; next?: number } }).details!;
+  assert.deepEqual(Object.keys(details.settled!).sort(), ["at", "version"], "no settler named");
+  assert.equal(details.next, 2);
+  assert.equal(JSON.stringify(held.body).includes(world.member.id), false);
+  assert.equal((await versionRows(id)).length, 1, "nothing published");
+
+  const again = await push();
+  assert.equal(again.kind, "json", JSON.stringify(again));
+  assert.equal((await versionRows(id)).length, 2);
+  assert.equal((await itemRow(id)).settledLapsedVersion, 2, "Working again");
 });

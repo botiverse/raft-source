@@ -25,8 +25,10 @@
  * and badged in each of the person's servers it sees the object from through
  * the joint (jointRowsSeen: platform/visibility seenThroughJoint, the rule an
  * app's writes by such a person ask too, so leaving the joint takes the row,
- * the badge and the writes away at once). A row is one per person and
- * object, so reading it in one server reads it in all.
+ * the badge and the writes away at once). Its rows ask it for `read`: an
+ * object of a closed server still in the joint stays listed, read-only
+ * (objectServersAnswer). A row is one per person and object, so reading it
+ * in one server reads it in all.
  *
  * The badge (objectActivityUnreadBatch) is the number of unread rows per
  * server: one query over the rows and one for those homed in a joint, then,
@@ -167,7 +169,7 @@ async function jointRowsSeen(userId: string, serverId: string, kinds: readonly A
       const home = homes.get(id);
       return home ? [{ id, serverId: home.serverId, homeKind: home.homeKind, homeChannelId: home.homeChannelId, author: home.author }] : [];
     });
-    const through = await seenThroughJoint(viewer, located, kind.app.flag);
+    const through = await seenThroughJoint(viewer, located, kind.app.flag, { access: "read" });
     return ids.filter((id) => through.has(id)).map((objectId) => ({ objectKind: kind.objectKind.kind, objectId }));
   }));
   return seen.flat();
@@ -479,10 +481,12 @@ const zeroParts = (parts: ObjectActivityUnread): ObjectActivityUnread =>
 
 /** The homes of these rows as the reader sees them: one query for the conversations, one for DM peers (handle and display name, as the sidebar). */
 async function homeLabels(reader: AppWebReader, rows: readonly ObjectActivityRow[]): Promise<(row: ObjectActivityRow) => ObjectInboxHome> {
-  // Another server's joint home as the reader's server has it: its projection there (a joint message's row is the reader's channel).
-  const foreign = [...new Set(rows.flatMap((row) => (row.serverId !== reader.serverId && row.homeKind === "conversation" && row.homeChannelId ? [row.homeChannelId] : [])))];
-  const localOf = foreign.length > 0 ? await localConversationIds(reader.serverId as ServerId, foreign) : new Map<string, string>();
-  const shownHome = (row: ObjectActivityRow): string | null => (row.serverId !== reader.serverId && row.homeChannelId ? localOf.get(row.homeChannelId) ?? null : row.homeChannelId);
+  // Every home as the reader's server has it (localConversationIds): its own conversation as it is, and a joint's
+  // canonical channel (named by its own server's object as well as by another server's) by the reader's projection,
+  // never the canonical channel itself, whose name is the internal `joint-storage-<uuid>`.
+  const homeIds = [...new Set(rows.flatMap((row) => (row.homeKind === "conversation" && row.homeChannelId ? [row.homeChannelId] : [])))];
+  const localOf = homeIds.length > 0 ? await localConversationIds(reader.serverId as ServerId, homeIds) : new Map<string, string>();
+  const shownHome = (row: ObjectActivityRow): string | null => (row.homeChannelId ? localOf.get(row.homeChannelId) ?? null : null);
   const channelIds = [...new Set(rows.flatMap((row) => {
     const shown = row.homeKind === "conversation" ? shownHome(row) : null;
     return shown ? [shown] : [];

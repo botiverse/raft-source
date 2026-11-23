@@ -56,7 +56,7 @@ import {
   byteSize,
   fail,
   fileUploadQuotaRefusal,
-  itemServerEnabled,
+  itemReadable,
   json,
   requireEnabled,
   summarize,
@@ -70,6 +70,7 @@ import { artifactR2Store } from "./blobStore";
 import { recordArtifactEvent } from "./events";
 import { entryExcerpt } from "./excerpt";
 import { autoSubscribe } from "./notices";
+import { fillArtifactReferences } from "./references";
 import { artifactAttachmentSaves, artifactBlobs, artifactItems, artifactVersionFiles, artifactVersions, type ArtifactItemRow } from "./schema";
 import { indexArtifactSearch } from "./search";
 import { canViewArtifacts } from "./visibility";
@@ -241,6 +242,8 @@ export async function saveAttachment(saver: ServerViewActor, attachmentId: strin
 
   const made = await createSaved(saver, read, source.conversationId, bytes, sha256);
   if (made.kind === "gone") return { kind: "not_found" };
+  // Its links to other Artifacts, from the bytes in hand: bounded, never failing the save (references.ts).
+  if (made.kind === "created") await fillArtifactReferences(made.item, { inline: new Map([[savedFilePath(read.name), bytes]]) });
   return { kind: made.kind === "created" ? "created" : "earlier", item: made.item, attachment: attachmentOf(read) };
 }
 
@@ -279,7 +282,7 @@ export function createSaveOperations() {
         case "file_upload_quota_exceeded": return fileUploadQuotaRefusal(agent.serverId, outcome.error, "artifact_save_attachment", { agentId: agent.agentId, channelId: source?.channelId ?? null, subject: "saved_file" });
         case "earlier": {
           const [visible] = await canViewArtifacts(viewActor(agent), [outcome.item]);
-          if (!visible || !(await itemServerEnabled(outcome.item))) return fail(409, { code: "ALREADY_SAVED", error: ALREADY_SAVED_ERROR, details: { attachmentId } });
+          if (!visible || !(await itemReadable(outcome.item))) return fail(409, { code: "ALREADY_SAVED", error: ALREADY_SAVED_ERROR, details: { attachmentId } });
           break;
         }
         case "created": break;

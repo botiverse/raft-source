@@ -22,7 +22,18 @@ type VisualCase = {
   id: string;
   baselineStatus?: string;
   skip?: boolean | { enabled?: boolean };
-  viewport?: { width: number; height: number; density: number };
+  viewport?: {
+    width: number;
+    height: number;
+    density: number;
+    /**
+     * The input the case is drawn for: "coarse" (a touch screen) or "fine" (a mouse). Unset:
+     * coarse up to PHONE_MAX_WIDTH, fine above it (slock #12743). A wide case with "coarse" is a
+     * tablet by touch. Such a case is captured at its own `density` in the `visual-2x` project
+     * (playwright.visual-testing.config.ts) so its pixels match the Android wide lane's.
+     */
+    pointer?: "coarse" | "fine";
+  };
   theme?: "light" | "dark";
   capture?: {
     selector?: string;
@@ -143,6 +154,10 @@ const selectedCases = requestedIds.length > 0
   ? manifest.cases.filter((item) => requestedIds.includes(item.id))
   : manifest.cases.filter((item) => includePending || item.baselineStatus !== "pending");
 const cases = selectedCases.filter((item) => includeSkipped || !isSkippedCase(item));
+// A case that declares its pointer at density 2 is captured in the `visual-2x` project (its
+// pixels match the Android wide lane's); every other case in the default project at 3x. Each
+// project skips the other's cases before a page is opened.
+const twoXCase = (visualCase: VisualCase) => Boolean(visualCase.viewport?.pointer) && visualCase.viewport?.density === 2;
 {
   const excluded = manifest.cases.length - cases.length;
   if (excluded > 0) {
@@ -445,6 +460,9 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
       });
       return;
     }
+    // A Guest's Saved cases (web visual-testing/GuestSavedCases.tsx, #triage:#551):
+    // the fixture server read as a Guest, which lists only its bound channel and no DMs.
+    const guestCase = caseId.startsWith("screens.guest.");
     if (pathname === "/api/servers") {
       route.fulfill({
         status: 200,
@@ -459,10 +477,39 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
             hideHumansFromMembers: false,
             plan: fxServer.plan,
             planDowngradedAt: null,
-            role: "owner",
+            role: guestCase ? "guest" : "owner",
             createdAt: fxTimes.entityCreatedAtIso,
           },
         ]),
+      });
+      return;
+    }
+    if (guestCase && pathname === "/api/channels") {
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify([{
+          id: "channel-home",
+          serverId: fxServer.id,
+          name: "首页专修",
+          description: "Home shell, server badge, and bottom dock polish",
+          type: "channel",
+          createdAt: fxTimes.entityCreatedAtIso,
+          joined: true,
+        }]),
+      });
+      return;
+    }
+    if (guestCase && pathname === "/api/channels/dm") {
+      route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+      return;
+    }
+    // A Guest's empty Saved page: nothing saved, as its primed store has it.
+    if (guestCase && caseId.endsWith(".empty") && pathname === "/api/channels/saved") {
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ...savedMessagesFixture, saved: [], hasMore: false, total: 0 }),
       });
       return;
     }
@@ -913,7 +960,7 @@ async function quietApi(page: any, caseId: string): Promise<VisualFontRouteState
       // activityResultsFixture.json) so ThreadsInbox's mount-time loadInbox()
       // cannot swap in rows the Android fixture never shows. Scoped to the
       // activity case: other cases keep an empty inbox (task #351).
-      if (caseId === "components.home.activity.results") {
+      if (caseId === "components.home.activity.results" || caseId.startsWith("screens.wide.")) {
         route.fulfill({
           status: 200,
           contentType: "application/json",
@@ -1829,16 +1876,44 @@ const PHONE_MAX_WIDTH = 743;
 function touchContextFor(visualCase: VisualCase) {
   const viewport = visualCase.viewport || { width: 390, height: 844, density: 1 };
   const phone = viewport.width <= PHONE_MAX_WIDTH;
+  // A wide case may ask for touch (a tablet): touch emulation, without the phone's mobile
+  // viewport handling, at its own density.
+  const coarse = viewport.pointer ? viewport.pointer === "coarse" : phone;
   return {
-    hasTouch: phone,
-    isMobile: phone,
-    ...(phone && viewport.density ? { deviceScaleFactor: viewport.density } : {}),
+    hasTouch: coarse,
+    isMobile: phone && coarse,
+    ...((phone || viewport.pointer) && viewport.density ? { deviceScaleFactor: viewport.density } : {}),
   };
+}
+
+/**
+ * What the page's media queries say about the input, recorded with the capture. A case that
+ * declares its pointer fails when the browser disagrees: Playwright starts Chromium with a fine
+ * primary pointer (`--blink-settings=primaryPointerType=…`), and only touch emulation turns it
+ * coarse, so a wide "coarse" case must prove it was drawn by touch.
+ */
+async function pointerMediaFor(page: any, visualCase: VisualCase) {
+  const media = await page.evaluate(() => ({
+    coarse: window.matchMedia("(pointer: coarse)").matches,
+    fine: window.matchMedia("(pointer: fine)").matches,
+    hoverNone: window.matchMedia("(hover: none)").matches,
+    desktopDensity: window.matchMedia("(width >= 48rem) and (pointer: fine)").matches,
+    devicePixelRatio: window.devicePixelRatio,
+  }));
+  const declared = visualCase.viewport?.pointer;
+  if (declared && media[declared] !== true) {
+    throw new Error(`${visualCase.id} declares pointer ${declared}, but the page matched ${JSON.stringify(media)}`);
+  }
+  return media;
 }
 
 for (const visualCase of cases) {
   test.describe(() => {
   test.use(touchContextFor(visualCase));
+  // eslint-disable-next-line no-empty-pattern -- Playwright fixtures: none wanted, testInfo only
+  test.beforeEach(async ({}, testInfo) => {
+    testInfo.skip(twoXCase(visualCase) !== (testInfo.project.name === "visual-2x"), "captured in the other scale project");
+  });
     test(`react visual provider ${visualCase.id}`, async ({ page }) => {
       page.on("console", (message: any) => {
         if (message.type() === "error") {
@@ -1874,6 +1949,7 @@ for (const visualCase of cases) {
           `render host does not recognize case id '${visualCase.id}' (reported '${reported}'); register it in VisualTestingCases.tsx before capturing`,
         );
       }
+      const pointerMedia = await pointerMediaFor(page, visualCase);
       await seedVisualCase(page, visualCase);
       await applyInteractions(page, visualCase);
       await applyCaseFixtureState(page, visualCase);
@@ -1982,6 +2058,7 @@ for (const visualCase of cases) {
               outset: null,
             },
             fullLength,
+            pointerMedia,
             capturedAt: new Date().toISOString(),
           },
           null,

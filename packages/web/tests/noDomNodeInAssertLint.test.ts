@@ -1,8 +1,8 @@
 // Fixture snippets for the raft-test/no-dom-node-in-assert lint rule
-// (scripts/oxlint-plugins/raft-test). The rule replaces the old regex ratchet
+// (@botiverse/lint/test). The rule replaces the old regex ratchet
 // tests/assertionNullCompareGuard.test.ts; the repo-wide run is a lint step.
+import { noDomNodeInAssert as rule } from "@botiverse/lint/test";
 import { RuleTester } from "oxlint/plugins-dev";
-import rule from "../scripts/oxlint-plugins/raft-test/no-dom-node-in-assert";
 
 RuleTester.describe = describe;
 RuleTester.it = it;

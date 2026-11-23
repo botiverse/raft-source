@@ -52,6 +52,16 @@ html[data-title-bar="overlay"]:not([data-fullscreen]) {
 html[data-title-bar-start="overlay"]:not([data-fullscreen]) {
   --raft-frame-inset-start: env(titlebar-area-x, 0px);
 }
+/* Raft Desktop on macOS: the traffic lights' corner from the last reading that
+ * spans the page, not the live env(), which is 9px off on some frames while
+ * the window is resized (installSteadyMacTitleBarArea,
+ * windowControlsOverlayGeometry.ts). Nothing is drawn over the right end
+ * there, so no end inset. Set only once such a reading arrived, and only
+ * while the lights take the left end. */
+html[data-title-bar-steady][data-title-bar-start="overlay"]:not([data-fullscreen]) {
+  --raft-frame-inset-start: var(--raft-desktop-titlebar-start);
+  --raft-frame-inset-end: 0px;
+}
 /* The title bar reserves those corners with padding. --raft-titlebar-inset-*
  * are the same amounts, set only on a row that reserves them: they tell the
  * web top bar about the corners, so it keeps its search field on the window

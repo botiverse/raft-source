@@ -6,7 +6,7 @@
 // people's Activity rows (activity.ts),
 // `system.artifacts` and its notices' schema and delivery guard, its search
 // (webSearch.ts), where its routes are mounted (mount.ts), its object storage
-// (blobStore.ts), and its jobs.
+// (blobStore.ts), its jobs, and who may watch an open Artifact live (live.ts).
 //
 // Only functions core calls later, and constants from shared and the leaf
 // kinds.ts: nothing below reads another module of this app while it is
@@ -19,7 +19,9 @@ import { pruneUnreferencedArtifactBlobs } from "./blobs";
 import { receiveArtifactObjectStorage } from "./blobStore";
 import { checkShotReadable } from "./checks";
 import { expireStaleChecks } from "./checkTask";
-import { ARTIFACT_OBJECT_EVENTS, ARTIFACT_OBJECT_KIND, ARTIFACT_OBJECT_TABLES, ARTIFACTS_SYSTEM_APP } from "./kinds";
+import { ARTIFACT_OBJECT_EVENTS, ARTIFACT_OBJECT_KIND, ARTIFACT_OBJECT_TABLES, ARTIFACTS_APP_ID, ARTIFACTS_SYSTEM_APP } from "./kinds";
+import { recordLinkOrigins } from "./linkOrigin";
+import { watchArtifact } from "./live";
 import { mountArtifactAgentApi, mountArtifactInternals, mountArtifactPublicWebApi, mountArtifactWebApi } from "./mount";
 import { mountArtifactPublicPage } from "./publicPage";
 import { artifactNoticeDeliveryVerdicts, flushDueArtifactNotices } from "./notices";
@@ -27,7 +29,7 @@ import { purgeArtifactsOfServer } from "./purge";
 import { publishArtifactAsForCore } from "./publishAs";
 import { readArtifactAsUserForCore } from "./readAsUser";
 import { artifactHomes, deletedArtifactHomes } from "./visibility";
-import { parseArtifactObjectRef, summarizeArtifacts, summarizeDeletedArtifacts } from "./webCards";
+import { ARTIFACT_LINK_ID_HOSTS, artifactIdOfLink, parseArtifactObjectRef, summarizeArtifacts, summarizeDeletedArtifacts } from "./webCards";
 import { purgeExpiredArtifactDrafts } from "./webReviews";
 import { searchArtifactsForCore } from "./webSearch";
 
@@ -38,7 +40,7 @@ export const ARTIFACT_CHECK_EXPIRY_INTERVAL_MS = 60_000;
 
 // Layer 2 of the mechanism, not registered yet: prompt (§七).
 export const artifactsApp: FirstPartyApp = {
-  id: "artifacts",
+  id: ARTIFACTS_APP_ID,
   flag: WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY,
   objectKinds: [{
     kind: ARTIFACT_OBJECT_KIND,
@@ -46,6 +48,12 @@ export const artifactsApp: FirstPartyApp = {
     objectTables: ARTIFACT_OBJECT_TABLES,
     // Core decides who sees which Artifact from these (live items only), then asks for the cards of the visible ones.
     homes: (ids) => artifactHomes(ids),
+    // A link names an Artifact by its id (any version of it): core's check of a saved profile description's links.
+    linkId: (url) => artifactIdOfLink(url),
+    // Where else linkId names one: a message naming none of these (nor an app host) isn't read for references.
+    linkHosts: ARTIFACT_LINK_ID_HOSTS,
+    // A new message linking an Artifact in its home conversation is its original message (`link`) while it has none.
+    linkedInMessage: (message, ids) => recordLinkOrigins(message, ids),
     // A reference is `{ id, version? }`; core reads its id, the version is ours.
     parseRef: (value) => parseArtifactObjectRef(value),
     // Core hands back the references parseRef made, so they are ArtifactObjectRefs.
@@ -64,6 +72,8 @@ export const artifactsApp: FirstPartyApp = {
     fileReadable: async (_objectId, parent) => checkShotReadable(parent),
     // A channel's announcement (channel_announcement_v0): one Artifact homed in the channel; core shows its title, version and last change.
     channelAnnouncement: { headlines: (ids, reader) => artifactHeadlines(ids, reader) },
+    // An open page's live pings (core's `object:watch`): the viewer's read rule, and the parts the reader reads (live.ts).
+    watch: (reader, ref) => watchArtifact(reader, ref),
   }],
   systemApp: ARTIFACTS_SYSTEM_APP,
   agentNotice: {

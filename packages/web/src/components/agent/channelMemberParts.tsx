@@ -4,6 +4,7 @@ import { useAgentDisplayState, useAppBotAgent } from "../../store/agentStore";
 import type { Agent } from "../../store/agentStore";
 import { formatAgentDisplayStateText } from "../../utils/activity";
 import Tooltip from "../ui/Tooltip";
+import { useAgentRuntimeSignInNeeded } from "./useAgentRuntimeSignInNeeded";
 
 /**
  * Member-row parts the channel member list (ChannelMembers, loaded when the
@@ -25,7 +26,21 @@ export function AgentActivityInfo({ agentId, fallbackStatus }: { agentId: string
   // carries the App badge after the name instead (ChannelMemberRow).
   const isAppBot = useAppBotAgent(agentId) !== null;
   const activityText = formatAgentDisplayStateText(intl, displayState);
+  // #triage:#494: a start waiting for the runtime's sign-in reads as that, with
+  // the sentence on a second line in place of the daemon's (its full text on
+  // hover). The row's Sign in is `AgentRuntimeSignInRowAction`, in its trailing slot.
+  const signIn = useAgentRuntimeSignInNeeded(agentId, displayState);
   if (isAppBot) return null;
+  if (signIn) {
+    return (
+      <div className="min-w-0" data-testid="member-row-sign-in-needed">
+        <div className="truncate text-caption text-foreground-muted">{signIn.fullText}</div>
+        <Tooltip content={signIn.detail}>
+          <div className="truncate text-caption text-foreground-hint" data-testid="member-row-sign-in-detail">{signIn.detail}</div>
+        </Tooltip>
+      </div>
+    );
+  }
   return (
     <div className="truncate text-caption text-foreground-hint">
       {activityText}

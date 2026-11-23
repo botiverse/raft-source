@@ -340,15 +340,17 @@
             "missing_config",
             "no_models",
             "unsupported",
-            "machine_offline"
+            "machine_offline",
+            "not_signed_in",
+            "runtime_outdated"
           ],
           "optional": true,
-          "doc": "capability `option_source.status`. Why the status is not live; absent when status is live. probe_timeout and probe_failed stay distinct. Server mapping from the Computer's probe outcome: missing_config -> missing_config; no_models (or a live list with no models) -> no_models; unsupported -> unsupported; probe error with code detect_timeout, or the server's own wait timing out -> probe_timeout; probe error with code computer_offline, or the Computer offline/unrouted -> machine_offline; any other probe error or failure -> probe_failed. Clients must accept an unknown reason (show a generic message)."
+          "doc": "capability `option_source.status`. Why the status is not live; absent when status is live. probe_timeout and probe_failed stay distinct. Server mapping from the Computer's probe outcome: missing_config -> missing_config; no_models (or a live list with no models) -> no_models; unsupported -> unsupported; probe error with code detect_timeout, or the server's own wait timing out -> probe_timeout; probe error with code computer_offline, or the Computer offline/unrouted -> machine_offline; probe error with code runtime_not_authenticated (the runtime's CLI is signed out on the Computer) -> not_signed_in; probe error with code protocol_unsupported (the runtime's CLI is too old to list) -> runtime_outdated; any other probe error or failure -> probe_failed. Clients must accept an unknown reason (show a generic message)."
         },
         "retryable": {
           "type": "bool",
           "optional": true,
-          "doc": "capability `option_source.status`. Whether retrying may change the answer: true for probe_timeout, probe_failed, machine_offline and no_models (the user may add models); false for missing_config and unsupported. Absent or false when status is live."
+          "doc": "capability `option_source.status`. Whether retrying may change the answer: true for probe_timeout, probe_failed, machine_offline, no_models (the user may add models), not_signed_in and runtime_outdated (after signing in or updating on the Computer); false for missing_config and unsupported. Absent or false when status is live."
         },
         "state": {
           "type": "string",
@@ -390,6 +392,16 @@
         "defaultReasoningEffort": {
           "type": "string",
           "optional": true
+        },
+        "reasoningEffortUnavailableReason": {
+          "type": "string",
+          "optional": true,
+          "doc": "Additive; no requiredClientCapabilities entry. Sent only with an empty `supportedReasoningEfforts`: the Computer could not read this model's effort levels, and this short line (from the runtime, not localized) says why. Plain text: never render it as markup. A client shows the derived effort field as not adjustable with this reason instead of hiding it."
+        },
+        "reasoningEffortNone": {
+          "type": "bool",
+          "optional": true,
+          "doc": "Additive; no requiredClientCapabilities entry. true only with an empty `supportedReasoningEfforts`: the runtime declared that this model takes no effort. A client shows the derived effort field as not adjustable instead of hiding it. An empty list with neither this nor `reasoningEffortUnavailableReason` is not reported (e.g. an older Computer): hide the field, as before."
         },
         "connectionId": {
           "type": "string",

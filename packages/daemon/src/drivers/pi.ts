@@ -38,6 +38,7 @@ import {
 } from "@earendil-works/pi-ai";
 import {
   buildLaunchPlan,
+  builtInModelSuccessor,
   errorClassOf,
   RUNTIME_ERROR_CLASSES,
   BUILTIN_RUNTIME_GATEWAY_PROVIDER_ENV_KEYS,
@@ -50,7 +51,6 @@ import {
   isBuiltInRuntimeCustomModelPresetProviderId,
   builtInPresetTypedModelReasons,
   PI_BUILTIN_PROVIDER_CONNECTION_PROBES,
-  isBuiltInRuntimeGatewayProviderId,
   isBuiltInRuntimeProviderId,
   PI_BUILTIN_PROVIDER_ENV_KEYS,
   RUNTIME_MODELS,
@@ -65,7 +65,6 @@ import {
   type RuntimeModelSourceOutcome,
   type RuntimeConfig,
   type ProviderRequestActivity,
-  type ProviderConnectionLaunchProjection,
   PI_RESPONSE_NOTICE_TEXT,
   currentDate,
   currentTimeMs,
@@ -226,6 +225,18 @@ export interface PiSdkEventMappingState {
   responseCancelled: boolean;
   pendingTurnEnd: boolean;
   pendingProviderError: string | null;
+  /** The buffered error is an empty `finish_reason: error` stop right after committed tool results (task #triage:#431). */
+  pendingProviderErrorContinuable: boolean;
+  /** Role of the last message Pi ended, and so persisted, in this session. */
+  lastEndedMessageRole: string | null;
+  /** This daemon turn already continued once past such a stop; a second one surfaces. */
+  providerFinishErrorContinued: boolean;
+  /** Set at agent_settled when the session should continue past such a stop; the driver takes it. */
+  providerFinishErrorContinueRequested: boolean;
+  /** That continuation was requested and its run has not started (no agent_start yet). */
+  providerFinishErrorContinuationAwaitingStart: boolean;
+  /** Set at agent_settled when a second such stop in the turn is surfaced; the driver takes it (trace only). */
+  providerFinishErrorSurfacedSecond: boolean;
   providerErrorOwnedByCompaction: boolean;
   compactionTerminal: boolean;
   /** Counts this session's compactions; pi runs one at a time, so a start's id is its end's. */
@@ -250,6 +261,12 @@ export function createPiSdkEventMappingState(sessionId: string | null = null): P
     responseCancelled: false,
     pendingTurnEnd: false,
     pendingProviderError: null,
+    pendingProviderErrorContinuable: false,
+    lastEndedMessageRole: null,
+    providerFinishErrorContinued: false,
+    providerFinishErrorContinueRequested: false,
+    providerFinishErrorContinuationAwaitingStart: false,
+    providerFinishErrorSurfacedSecond: false,
     providerErrorOwnedByCompaction: false,
     compactionTerminal: false,
     compactionCycle: 0,
@@ -488,8 +505,6 @@ async function setHeaderSafeRuntimeApiKey(
 export async function seedPiSessionModelRuntime(
   modelRuntime: Pick<ModelRuntime, "setRuntimeApiKey">,
   runtimeConfig: RuntimeConfig,
-  providerConnection: ProviderConnectionLaunchProjection | null = null,
-  launchEnvVars: Record<string, string> | null = null,
 ): Promise<void> {
   // ModelRuntime.create() is intentionally offline here, and credential seeding must not
   // reach the network. Under pi 0.84.3 that guarantee moved INTO the library: credential
@@ -507,20 +522,10 @@ export async function seedPiSessionModelRuntime(
     return;
   }
   if (runtimeConfig.runtime !== "builtin") return;
+  // Saved provider connections are removed: an older Server may still send a
+  // config bound to one, and it has no key to seed.
   if (runtimeConfig.provider.kind === "connection") {
-    if (!providerConnection) throw new Error("Provider connection launch metadata is missing");
-    const apiKeyEnv = isBuiltInRuntimeProviderId(providerConnection.providerId)
-      ? BUILTIN_RUNTIME_PROVIDER_ENV_KEYS[providerConnection.providerId]
-      : BUILTIN_RUNTIME_GATEWAY_PROVIDER_ENV_KEYS[providerConnection.providerId];
-    const apiKey = launchEnvVars?.[apiKeyEnv];
-    if (!apiKey) throw new Error("Provider connection launch credential is missing");
-    const runtimeProviderId = providerConnection.providerId === "openai-compatible"
-      ? "openai"
-      : providerConnection.providerId === "anthropic-compatible"
-        ? "anthropic"
-        : providerConnection.providerId;
-    await setHeaderSafeRuntimeApiKey(modelRuntime, runtimeProviderId, apiKey, apiKeyEnv);
-    return;
+    throw new Error("Saved provider connections were removed; choose a provider and its API key");
   }
   if (runtimeConfig.provider.kind === "preset") {
     await setHeaderSafeRuntimeApiKey(
@@ -575,17 +580,15 @@ export function resolvePiModelFromRegistry(
   modelId: string | null | undefined,
   modelRegistry: ModelRegistry,
   runtimeConfig: RuntimeConfig,
-  providerConnection: ProviderConnectionLaunchProjection | null = null,
 ) {
   if (!modelId || modelId === "default") return undefined;
-  // A built-in custom model reached through a gateway — configured directly or
-  // through a managed provider connection — is registered under exactly one
+  // A built-in custom model reached through a gateway is registered under exactly one
   // provider (configureBuiltInGatewayCustomModel). Select only that entry: the
   // bare name can also exist in the SDK catalog under another provider (e.g.
   // github-copilot/kimi-k3), and a custom name may itself contain "/". A missing
   // entry must stay missing so the launch fails as RuntimeModelNotFoundError
   // instead of silently running a different provider's model.
-  const gateway = resolveBuiltInGatewayLaunch(runtimeConfig, providerConnection);
+  const gateway = resolveBuiltInGatewayLaunch(runtimeConfig);
   if (gateway && runtimeConfig.runtime === "builtin" && runtimeConfig.model.kind === "custom") {
     return modelRegistry.find(builtInGatewayRegistryProvider(gateway.providerId).id, runtimeConfig.model.name);
   }
@@ -593,7 +596,7 @@ export function resolvePiModelFromRegistry(
   // the provider's own id (it may contain "/"), registered under exactly that
   // provider by configureBuiltInPresetCustomModel. Same rule as above: no
   // fallback, so an unregistered name fails as RuntimeModelNotFoundError.
-  const presetCustom = resolveBuiltInPresetCustomModel(runtimeConfig, providerConnection);
+  const presetCustom = resolveBuiltInPresetCustomModel(runtimeConfig);
   if (presetCustom) return modelRegistry.find(presetCustom.providerId, presetCustom.modelId);
   const [provider, ...modelParts] = modelId.split("/");
   if (provider && modelParts.length > 0) {
@@ -750,7 +753,6 @@ export function resolveBuiltInGatewayModelInput(
 
 export function resolveBuiltInGatewayLaunch(
   runtimeConfig: RuntimeConfig,
-  providerConnection: ProviderConnectionLaunchProjection | null = null,
 ): {
   providerId: "openai-compatible" | "anthropic-compatible";
   baseUrl: string;
@@ -759,18 +761,6 @@ export function resolveBuiltInGatewayLaunch(
   if (runtimeConfig.runtime !== "builtin") return null;
   if (runtimeConfig.model.kind !== "custom") return null;
   if (runtimeConfig.provider.kind === "gateway") return runtimeConfig.provider;
-  if (
-    runtimeConfig.provider.kind === "connection"
-    && providerConnection
-    && isBuiltInRuntimeGatewayProviderId(providerConnection.providerId)
-    && providerConnection.endpointUrl
-  ) {
-    return {
-      providerId: providerConnection.providerId,
-      baseUrl: providerConnection.endpointUrl,
-      supportsImageInput: providerConnection.supportsImageInput,
-    };
-  }
   return null;
 }
 
@@ -782,11 +772,10 @@ export function resolveBuiltInGatewayLaunch(
  */
 export function builtInModelTransportOrigins(
   runtimeConfig: RuntimeConfig,
-  providerConnection: ProviderConnectionLaunchProjection | null,
   model: { provider: string },
 ): ReadonlySet<string> | null {
   if (runtimeConfig.runtime !== "builtin") return null;
-  const gateway = resolveBuiltInGatewayLaunch(runtimeConfig, providerConnection);
+  const gateway = resolveBuiltInGatewayLaunch(runtimeConfig);
   if (gateway) {
     const origin = piBaseUrlOrigin(gateway.baseUrl);
     return new Set(origin ? [origin] : []);
@@ -877,20 +866,9 @@ function effectiveModelLimits(
  * The key a Built-in gateway custom model sends, from where the session's own
  * seeding takes it (`seedPiSessionModelRuntime`); null when there is none.
  */
-function builtInGatewayApiKey(
-  runtimeConfig: RuntimeConfig,
-  providerConnection: ProviderConnectionLaunchProjection | null,
-  launchEnvVars: Record<string, string> | null,
-): string | null {
+function builtInGatewayApiKey(runtimeConfig: RuntimeConfig): string | null {
   if (runtimeConfig.runtime !== "builtin") return null;
   if (runtimeConfig.provider.kind === "gateway") return runtimeConfig.provider.apiKey || null;
-  if (
-    runtimeConfig.provider.kind === "connection"
-    && providerConnection
-    && isBuiltInRuntimeGatewayProviderId(providerConnection.providerId)
-  ) {
-    return launchEnvVars?.[BUILTIN_RUNTIME_GATEWAY_PROVIDER_ENV_KEYS[providerConnection.providerId]] || null;
-  }
   return null;
 }
 
@@ -902,18 +880,16 @@ function builtInGatewayApiKey(
  */
 export async function readBuiltInGatewayModelLimits(
   runtimeConfig: RuntimeConfig,
-  providerConnection: ProviderConnectionLaunchProjection | null,
-  launchEnvVars: Record<string, string> | null,
   fetchImpl: typeof globalThis.fetch,
 ): Promise<GatewayModelLimitsResult> {
-  const gateway = resolveBuiltInGatewayLaunch(runtimeConfig, providerConnection);
+  const gateway = resolveBuiltInGatewayLaunch(runtimeConfig);
   if (!gateway || runtimeConfig.runtime !== "builtin" || runtimeConfig.model.kind !== "custom") {
     return { limits: null, outcome: "skipped", cached: false };
   }
   if (typeof runtimeConfig.model.contextWindow === "number" && typeof runtimeConfig.model.maxOutputTokens === "number") {
     return { limits: null, outcome: "skipped", cached: false };
   }
-  const apiKey = builtInGatewayApiKey(runtimeConfig, providerConnection, launchEnvVars);
+  const apiKey = builtInGatewayApiKey(runtimeConfig);
   if (!apiKey) return { limits: null, outcome: "skipped", cached: false };
   return readGatewayModelLimits({
     kind: gateway.providerId,
@@ -951,8 +927,7 @@ export function builtInPresetModelListBaseUrl(providerId: string): string | null
  * #proj-runtime:#53 follow-up to task #10: read a preset provider's model list
  * (OpenRouter's only, PRESET_MODEL_LIST_PROVIDER_IDS) for a typed model whose
  * agent config lacks a limit, at the provider's own catalog base URL with the
- * agent's own key for that provider (the config's, or its saved connection's)
- * and the gateway reader's rules (5 s, 2 MB, no redirects, an hour's cache
+ * agent's own key for that provider and the gateway reader's rules (5 s, 2 MB, no redirects, an hour's cache
  * per URL and key). The model is looked up by the API id the config stores
  * (normalizeBuiltInPresetCustomModel). Never throws and never blocks a start;
  * skipped for every other provider.
@@ -960,19 +935,15 @@ export function builtInPresetModelListBaseUrl(providerId: string): string | null
 export async function readBuiltInPresetCustomModelLimits(
   runtimeConfig: RuntimeConfig,
   fetchImpl: typeof globalThis.fetch,
-  providerConnection: ProviderConnectionLaunchProjection | null = null,
-  launchEnvVars: Record<string, string> | null = null,
 ): Promise<GatewayModelLimitsResult & { baseUrl: string | null }> {
   const skipped = { limits: null, outcome: "skipped" as const, cached: false, baseUrl: null };
-  const presetCustom = resolveBuiltInPresetCustomModel(runtimeConfig, providerConnection);
+  const presetCustom = resolveBuiltInPresetCustomModel(runtimeConfig);
   if (!presetCustom || runtimeConfig.runtime !== "builtin") return skipped;
   const { model } = presetCustom;
   if (typeof model.contextWindow === "number" && typeof model.maxOutputTokens === "number") return skipped;
   const baseUrl = builtInPresetModelListBaseUrl(presetCustom.providerId);
   // The key the session itself is seeded with (seedPiSessionModelRuntime).
-  const apiKey = runtimeConfig.provider.kind === "preset"
-    ? runtimeConfig.provider.apiKey
-    : launchEnvVars?.[BUILTIN_RUNTIME_PROVIDER_ENV_KEYS[presetCustom.providerId]];
+  const apiKey = runtimeConfig.provider.kind === "preset" ? runtimeConfig.provider.apiKey : undefined;
   if (!baseUrl || !apiKey) return skipped;
   const result = await readGatewayModelLimits({
     kind: "openai-compatible",
@@ -987,21 +958,13 @@ export async function readBuiltInPresetCustomModelLimits(
 /**
  * task #10: a Built-in agent on a preset provider that accepts a typed model id
  * (BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS) whose model
- * is that typed id; null for every other config. The provider is the
- * config's own, or a saved preset connection's (resolved for this launch):
- * the connection supplies only the key, so the typed id runs exactly as on
- * the direct provider.
+ * is that typed id; null for every other config.
  */
 export function resolveBuiltInPresetCustomModel(
   runtimeConfig: RuntimeConfig,
-  providerConnection: ProviderConnectionLaunchProjection | null = null,
 ): { providerId: BuiltInRuntimeProviderId; modelId: string; model: Extract<RuntimeModelConfig, { kind: "custom" }> } | null {
   if (runtimeConfig.runtime !== "builtin" || runtimeConfig.model.kind !== "custom") return null;
-  const providerId = runtimeConfig.provider.kind === "preset"
-    ? runtimeConfig.provider.providerId
-    : runtimeConfig.provider.kind === "connection" && providerConnection && isBuiltInRuntimeProviderId(providerConnection.providerId)
-      ? providerConnection.providerId
-      : null;
+  const providerId = runtimeConfig.provider.kind === "preset" ? runtimeConfig.provider.providerId : null;
   if (!providerId || !isBuiltInRuntimeCustomModelPresetProviderId(providerId)) return null;
   return { providerId, modelId: runtimeConfig.model.name, model: runtimeConfig.model };
 }
@@ -1033,10 +996,8 @@ export function configureBuiltInPresetCustomModel(
   // from the host this registration's model calls go to.
   reportedLimits: GatewayModelLimits | null = null,
   reportedFromBaseUrl: string | null = null,
-  // A saved preset connection's provider (resolveBuiltInPresetCustomModel).
-  providerConnection: ProviderConnectionLaunchProjection | null = null,
 ): { modelLimits: ModelLimits | null } {
-  const presetCustom = resolveBuiltInPresetCustomModel(runtimeConfig, providerConnection);
+  const presetCustom = resolveBuiltInPresetCustomModel(runtimeConfig);
   if (!presetCustom) return { modelLimits: null };
   const { providerId, modelId, model } = presetCustom;
   const exact = modelRegistry.find(providerId, modelId);
@@ -1112,11 +1073,10 @@ function sharedCompat(models: readonly Model<Api>[]): Model<Api>["compat"] {
 export function configureBuiltInGatewayCustomModel(
   modelRegistry: ModelRegistry,
   runtimeConfig: RuntimeConfig,
-  providerConnection: ProviderConnectionLaunchProjection | null,
   deps: AnthropicGatewayContractDeps = {},
   gatewayLimits: GatewayModelLimits | null = null,
 ): BuiltInGatewayRegistration {
-  const gateway = resolveBuiltInGatewayLaunch(runtimeConfig, providerConnection);
+  const gateway = resolveBuiltInGatewayLaunch(runtimeConfig);
   if (!gateway || runtimeConfig.runtime !== "builtin" || runtimeConfig.model.kind !== "custom") return { thinkingContract: null, modelLimits: null };
 
   const provider = builtInGatewayRegistryProvider(gateway.providerId);
@@ -1367,7 +1327,6 @@ const DIAGNOSTIC_ERROR_CLASSES: ReadonlySet<string> = new Set<string>([
   "RuntimeExecutableNotFoundError",
   "RuntimeSessionStartError",
   "RuntimeVersionTooOldError",
-  "ProviderConnectionMaterializationError",
   "RunnerCredentialMintError",
   "Error",
   "TypeError",
@@ -1717,9 +1676,13 @@ function mapPiMessageEndEvent(
   // Pi dispatches the finalized message object to its listeners once, then persists it.
   // Replaying that SDK event must not create another notice; no content/timestamp hash.
   if (message?.role === "assistant" && state.endedResponses.has(message)) return events;
+  const previousEndedRole = state.lastEndedMessageRole;
+  state.lastEndedMessageRole = typeof message?.role === "string" ? message.role : null;
+  let streamedOutput = false;
   if (message?.role === "assistant") {
     const observation = state.responseObservation ?? newPiResponseObservation();
     state.responseObservation = null;
+    streamedOutput = observation.text || observation.thinkingOrTool;
     state.endedResponses.add(message);
     if (message.stopReason === "stop" && !state.responseCancelled) {
       observePiResponseContent(observation, message.content);
@@ -1746,6 +1709,7 @@ function mapPiMessageEndEvent(
     // then wait for compaction_end as the authoritative recovery outcome.
     if (isContextOverflow(message as Parameters<typeof isContextOverflow>[0])) {
       state.pendingProviderError = null;
+      state.pendingProviderErrorContinuable = false;
       state.providerErrorOwnedByCompaction = true;
       return events;
     }
@@ -1753,9 +1717,75 @@ function mapPiMessageEndEvent(
     state.pendingProviderError = typeof message.errorMessage === "string" && message.errorMessage.trim()
       ? message.errorMessage.trim()
       : "Pi SDK assistant turn ended with an unknown provider error";
+    state.pendingProviderErrorContinuable = state.pendingProviderError === PI_PROVIDER_FINISH_REASON_ERROR
+      && previousEndedRole === "toolResult"
+      && !streamedOutput
+      && piResponseContentIsEmpty(message.content);
   }
 
   return events;
+}
+
+/**
+ * pi-ai's text for an OpenAI-compatible `finish_reason: "error"` (pi-ai 1.5.2
+ * `api/openai-completions.js` mapStopReason). Pi does not retry it, so a run that just committed
+ * tool results stopped there with the work unfinished (task #triage:#431).
+ *
+ * REMOVE this continuation (shouldContinuePastProviderFinishError, continuePastProviderFinishError
+ * and their state) once pi-ai retries this stop itself (`finish_reason: error` matched by its
+ * RETRYABLE_PROVIDER_ERROR_PATTERN, `isRetryableAssistantError`) or Pi offers a public retry API
+ * for it: Pi's own retry then omits the failed attempt and continues without the hidden note.
+ */
+const PI_PROVIDER_FINISH_REASON_ERROR = "Provider finish_reason: error";
+
+/** `error_class` of the provider stop in the continuation trace (start failures carry their own class). */
+const PI_PROVIDER_FINISH_ERROR_CLASS = "provider_finish_reason_error";
+
+/** What the continuation adds to the model context: a hidden note, not a user turn in the transcript UI. */
+export const PI_PROVIDER_FINISH_ERROR_CONTINUE_MESSAGE = {
+  customType: "raft_provider_finish_error_continue",
+  content: "The previous response ended with a provider error before producing any output. Continue from the tool results above.",
+  display: false,
+};
+
+/** No text, thinking or tool call: the failed response had no effect to lose by continuing. */
+function piResponseContentIsEmpty(content: unknown): boolean {
+  const observation = newPiResponseObservation();
+  observePiResponseContent(observation, content);
+  return !observation.indeterminate && !observation.text && !observation.thinkingOrTool;
+}
+
+/**
+ * agent_settled: continue past an empty `finish_reason: error` stop that came right after committed
+ * tool results, once per daemon turn. The tool results stay in context and the failed empty
+ * response is skipped by pi-ai's replay, so continuing re-runs no tool. The held turn_end comes
+ * with the continuation's own settle; a second such stop in the turn surfaces as before.
+ */
+function shouldContinuePastProviderFinishError(
+  event: Extract<AgentSessionEvent, { type: "agent_settled" }>,
+  state: PiSdkEventMappingState,
+): boolean {
+  return state.pendingProviderError === PI_PROVIDER_FINISH_REASON_ERROR
+    && state.pendingProviderErrorContinuable
+    && !state.providerFinishErrorContinued
+    && !event.aborted
+    && !state.responseCancelled;
+}
+
+/**
+ * The continuation never started (the settled run's prompt rejected first, e.g. `_prepareRun`
+ * found no model or key). Returns null when no continuation was waiting to start; otherwise the
+ * held turn_end, which the caller emits after the start failure itself (its own message and
+ * delivery_error/error kind, not the provider error it was continuing past).
+ */
+function takeUnstartedPiProviderFinishErrorContinuation(state: PiSdkEventMappingState): ParsedEvent[] | null {
+  if (!state.providerFinishErrorContinuationAwaitingStart) return null;
+  state.providerFinishErrorContinuationAwaitingStart = false;
+  state.providerFinishErrorContinueRequested = false;
+  state.providerFinishErrorContinued = false;
+  if (!state.pendingTurnEnd) return [];
+  state.pendingTurnEnd = false;
+  return [{ kind: "turn_end", sessionId: state.sessionId || undefined }];
 }
 
 function piTerminalCausePhaseForSdkEvent(event: AgentSessionEvent): RuntimeTerminalCausePhase {
@@ -1802,6 +1832,7 @@ export function mapPiSdkEventToParsedEvents(
     case "agent_start":
       state.responseObservation = null;
       state.responseCancelled = false;
+      state.providerFinishErrorContinuationAwaitingStart = false;
       return events;
     case "turn_start":
     case "turn_end":
@@ -1838,6 +1869,21 @@ export function mapPiSdkEventToParsedEvents(
     case "agent_settled":
       state.responseObservation = null;
       if (event.aborted) state.responseCancelled = true;
+      if (shouldContinuePastProviderFinishError(event, state)) {
+        state.pendingProviderError = null;
+        state.pendingProviderErrorContinuable = false;
+        state.providerErrorOwnedByCompaction = false;
+        state.providerFinishErrorContinued = true;
+        state.providerFinishErrorContinueRequested = true;
+        state.providerFinishErrorContinuationAwaitingStart = true;
+        // turn_end stays pending for the continuation's settle.
+        return events;
+      }
+      if (state.providerFinishErrorContinued && state.pendingProviderError === PI_PROVIDER_FINISH_REASON_ERROR) {
+        state.providerFinishErrorSurfacedSecond = true;
+      }
+      state.providerFinishErrorContinued = false;
+      state.pendingProviderErrorContinuable = false;
       if (state.pendingProviderError) {
         events.push({ kind: "error", message: state.pendingProviderError });
         state.pendingProviderError = null;
@@ -2107,36 +2153,16 @@ export async function openPiAgentSessionForContext(
     ...(ctx.config.envVars ?? {}),
   };
   if (Object.keys(launchRuntimeFields.envVars).length === 0) launchRuntimeFields.envVars = null;
-  const managedProviderConnection = runtimeConfig.runtime === "builtin"
-    && runtimeConfig.provider.kind === "connection"
-    ? ctx.config.providerConnection ?? null
-    : null;
-  const managedProviderApiKeyEnv = managedProviderConnection
-    && isBuiltInRuntimeProviderId(managedProviderConnection.providerId)
-    ? BUILTIN_RUNTIME_PROVIDER_ENV_KEYS[managedProviderConnection.providerId]
-    : managedProviderConnection
-      && isBuiltInRuntimeGatewayProviderId(managedProviderConnection.providerId)
-      ? BUILTIN_RUNTIME_GATEWAY_PROVIDER_ENV_KEYS[managedProviderConnection.providerId]
-      : null;
-  const managedProviderKeyPresent = Boolean(
-    managedProviderApiKeyEnv && launchRuntimeFields.envVars?.[managedProviderApiKeyEnv],
-  );
   const launchTraceEvidenceAttrs = opts.exposeLaunchTraceEvidence ? {
     config_source: launchTrace.config_source,
     ...(runtimeConfig.runtime === "builtin" ? { host_user_state: runtimeConfig.hostUserState } : {}),
-    ...(launchTrace.provider_id || managedProviderConnection
-      ? { provider_id: launchTrace.provider_id ?? managedProviderConnection?.providerId }
-      : {}),
+    ...(launchTrace.provider_id ? { provider_id: launchTrace.provider_id } : {}),
     ...(launchTrace.model_kind ? { model_kind: launchTrace.model_kind } : {}),
     ...(launchTrace.model_id ? { model_id: launchTrace.model_id } : {}),
-    ...(launchTrace.base_url_present !== undefined || managedProviderConnection
-      ? { base_url_present: launchTrace.base_url_present ?? Boolean(managedProviderConnection?.endpointUrl) }
-      : {}),
+    ...(launchTrace.base_url_present !== undefined ? { base_url_present: launchTrace.base_url_present } : {}),
     ...(launchTrace.base_url_host_class ? { base_url_host_class: launchTrace.base_url_host_class } : {}),
-    provider_key_present: launchTrace.provider_key_present || managedProviderKeyPresent,
-    ...(launchTrace.provider_key_source || managedProviderKeyPresent
-      ? { provider_key_source: launchTrace.provider_key_source ?? "server_managed_connection" }
-      : {}),
+    provider_key_present: launchTrace.provider_key_present,
+    ...(launchTrace.provider_key_source ? { provider_key_source: launchTrace.provider_key_source } : {}),
   } : {};
   const requestedModel = launchRuntimeFields.model || "default";
   const traceSpan = ctx.tracer?.startSpan(opts.traceName ?? "daemon.pi.session.create", {
@@ -2196,7 +2222,7 @@ export async function openPiAgentSessionForContext(
     const transportOrigins = new Map<string, ReadonlySet<string> | null>();
     const assertModelTransport = (model: { provider: string; id: string; baseUrl: string }): void => {
       if (!transportOrigins.has(model.provider)) {
-        transportOrigins.set(model.provider, builtInModelTransportOrigins(runtimeConfig, managedProviderConnection, model));
+        transportOrigins.set(model.provider, builtInModelTransportOrigins(runtimeConfig, model));
       }
       const allowed = transportOrigins.get(model.provider);
       if (allowed) assertBuiltInModelTransport(model, allowed);
@@ -2210,8 +2236,8 @@ export async function openPiAgentSessionForContext(
     // preset provider's id (`openrouter`, as it has always been traced).
     type ModelListRead = GatewayModelLimitsResult & { providerKind: "gateway" | BuiltInRuntimeProviderId; baseUrl: string | null };
     const gatewayLimitsRead = ((): Promise<ModelListRead> => {
-      const gateway = Boolean(resolveBuiltInGatewayLaunch(runtimeConfig, managedProviderConnection));
-      const presetCustom = gateway ? null : resolveBuiltInPresetCustomModel(runtimeConfig, managedProviderConnection);
+      const gateway = Boolean(resolveBuiltInGatewayLaunch(runtimeConfig));
+      const presetCustom = gateway ? null : resolveBuiltInPresetCustomModel(runtimeConfig);
       // A preset provider whose list Raft does not read gets no client either
       // (nothing to trace, not even a client that failed to start).
       if (!gateway && (!presetCustom || !builtInPresetModelListBaseUrl(presetCustom.providerId))) {
@@ -2226,9 +2252,9 @@ export async function openPiAgentSessionForContext(
       }
       // Never rejects; the client goes as soon as the read is done, whatever the session does.
       const read: Promise<ModelListRead> = gateway
-        ? readBuiltInGatewayModelLimits(runtimeConfig, managedProviderConnection, launchRuntimeFields.envVars, client.fetch)
+        ? readBuiltInGatewayModelLimits(runtimeConfig, client.fetch)
           .then((result) => ({ ...result, providerKind, baseUrl: null }))
-        : readBuiltInPresetCustomModelLimits(runtimeConfig, client.fetch, managedProviderConnection, launchRuntimeFields.envVars)
+        : readBuiltInPresetCustomModelLimits(runtimeConfig, client.fetch)
           .then((result) => ({ ...result, providerKind }));
       return read.finally(() => client.dispose());
     })();
@@ -2251,8 +2277,7 @@ export async function openPiAgentSessionForContext(
           allowModelNetwork: false,
         });
         installProviderHttpClient(modelRuntime, sessionProviderHttpClient,
-          runtimeConfig.runtime === "builtin" && (runtimeConfig.provider.kind === "gateway"
-            || (runtimeConfig.provider.kind === "connection" && Boolean(managedProviderConnection?.endpointUrl))),
+          runtimeConfig.runtime === "builtin" && runtimeConfig.provider.kind === "gateway",
           providerCallTracker,
           ctx.contextViewRequestLogDir ? {
             log: new PiRequestLog(ctx.contextViewRequestLogDir, (reason, error) => {
@@ -2267,12 +2292,7 @@ export async function openPiAgentSessionForContext(
         // Pi agent in this runner. The short create-time scope also keeps
         // ModelRuntime's initial refresh from snapshotting forbidden host
         // provider credentials for Built-in.
-        await seedPiSessionModelRuntime(
-          modelRuntime,
-          runtimeConfig,
-          managedProviderConnection,
-          launchRuntimeFields.envVars,
-        );
+        await seedPiSessionModelRuntime(modelRuntime, runtimeConfig);
         const services = await createAgentSessionServices({
           cwd: ctx.workingDirectory,
           agentDir,
@@ -2312,7 +2332,6 @@ export async function openPiAgentSessionForContext(
     const gatewayRegistration = configureBuiltInGatewayCustomModel(
       modelRegistry,
       runtimeConfig,
-      managedProviderConnection,
       contractDeps,
       gatewayLimits.providerKind === "gateway" ? gatewayLimits.limits : null,
     );
@@ -2322,7 +2341,6 @@ export async function openPiAgentSessionForContext(
       runtimeConfig,
       gatewayLimits.providerKind !== "gateway" ? gatewayLimits.limits : null,
       gatewayLimits.baseUrl,
-      managedProviderConnection,
     );
     const registeredModelLimits = gatewayRegistration.modelLimits ?? presetCustomRegistration.modelLimits;
     applyPiDaemonSettingsOverrides(services.settingsManager);
@@ -2331,12 +2349,25 @@ export async function openPiAgentSessionForContext(
       agent_dir_source: opts.agentDirSource ?? (spawnEnv.PI_CODING_AGENT_DIR ? "spawn_env" : "default"),
       ...launchTraceEvidenceAttrs,
     });
-    const model = resolvePiModelFromRegistry(
+    const savedModel = resolvePiModelFromRegistry(
       launchRuntimeFields.model,
       modelRegistry,
       runtimeConfig,
-      managedProviderConnection,
     );
+    // Built-in: a saved preset model pi-ai has since retired starts on its
+    // recorded successor (piBuiltinModels.removals.json), not a failed start.
+    const savedModelId = launchRuntimeFields.model;
+    const successorModelId = !savedModel && builtIn && savedModelId ? builtInModelSuccessor(savedModelId) : null;
+    const model = savedModel
+      ?? (successorModelId ? resolvePiModelFromRegistry(successorModelId, modelRegistry, runtimeConfig) : undefined);
+    if (successorModelId && model) {
+      console.warn("[%s] create_session retired_model requested=%s successor=%s", logPrefix, requestedModel, successorModelId);
+      traceSpan?.addEvent(`${traceEventPrefix}.retired_model_successor`, {
+        requested_model: requestedModel,
+        successor_model: successorModelId,
+        ...launchTraceEvidenceAttrs,
+      });
+    }
     const resolvedModel = formatPiModelLogId(model);
     writePiLifecycleDiagnostic(ctx, sessionId, {
       kind: "model_resolved",
@@ -2806,6 +2837,14 @@ export class PiSdkRuntimeSession implements RuntimeSession {
           this.reportProviderRequestFailure(parsed.message);
         }
         this.emitRuntimeEvent(parsed, piTerminalCausePhaseForSdkEvent(event));
+      }
+      if (this.mappingState.providerFinishErrorContinueRequested) {
+        this.mappingState.providerFinishErrorContinueRequested = false;
+        this.continuePastProviderFinishError(session);
+      }
+      if (this.mappingState.providerFinishErrorSurfacedSecond) {
+        this.mappingState.providerFinishErrorSurfacedSecond = false;
+        this.emitProviderFinishErrorContinuationEvent("surfaced_second", PI_PROVIDER_FINISH_ERROR_CLASS);
       }
     });
     // task #1357 item 1: every session opened here (a start, a rotation's
@@ -3348,6 +3387,16 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     delivery?: PiDeliveryRequest,
   ): void {
     const message = piErrorMessage(error);
+    // The settled run's prompt rejected before its continuation started: the failure is the
+    // continuation's. It surfaces with its own reason, then the turn it held ends. Never as a
+    // delivery_error: the input was delivered and its run (tools included) finished, and APM
+    // restores and redelivers an input on delivery_error, which would replay that work.
+    const heldTurnEnd = this.takeUnstartedProviderFinishErrorContinuation(error);
+    if (heldTurnEnd) {
+      this.emitRuntimeEvent({ kind: "error", message } satisfies ParsedEvent, phase);
+      for (const event of heldTurnEnd) this.emitRuntimeEvent(event);
+      return;
+    }
     if (delivery) {
       this.emitRuntimeEvent({
         kind: "delivery_error",
@@ -3363,6 +3412,68 @@ export class PiSdkRuntimeSession implements RuntimeSession {
       kind: "error",
       message,
     } satisfies ParsedEvent, phase);
+  }
+
+  /**
+   * Continue past an empty `finish_reason: error` stop (task #triage:#431). Called inside Pi's
+   * agent_settled emission, so Pi defers the new run until its listeners return and runs it before
+   * the settled prompt resolves: the daemon prompt stays in flight across the continuation.
+   */
+  private continuePastProviderFinishError(session: AgentSession): void {
+    // Removal point: see PI_PROVIDER_FINISH_REASON_ERROR (an upstream pi-ai retry for this stop, or
+    // a public Pi retry API, makes this whole continuation unnecessary).
+    this.emitProviderFinishErrorContinuationEvent("requested", PI_PROVIDER_FINISH_ERROR_CLASS);
+    void session.sendCustomMessage(PI_PROVIDER_FINISH_ERROR_CONTINUE_MESSAGE, { triggerTurn: true })
+      .catch((error: unknown) => {
+        // Only reached when Pi ran it at once instead of deferring it; a deferred failure rejects the
+        // settled prompt and reaches emitDeferredSdkCallFailure.
+        const heldTurnEnd = this.takeUnstartedProviderFinishErrorContinuation(error);
+        if (!heldTurnEnd || this.didClose) return;
+        this.emitRuntimeEvent({ kind: "error", message: piErrorMessage(error) });
+        for (const event of heldTurnEnd) this.emitRuntimeEvent(event);
+      });
+  }
+
+  /** The held turn_end of a continuation that never started (null when none was waiting), traced with the start failure's class. */
+  private takeUnstartedProviderFinishErrorContinuation(error: unknown): ParsedEvent[] | null {
+    const heldTurnEnd = takeUnstartedPiProviderFinishErrorContinuation(this.mappingState);
+    if (heldTurnEnd) this.emitProviderFinishErrorContinuationEvent("start_failed", safeDiagnosticErrorClass(error));
+    return heldTurnEnd;
+  }
+
+  private emitProviderFinishErrorContinuationEvent(
+    outcome: "requested" | "surfaced_second" | "start_failed",
+    errorClass: string,
+  ): void {
+    const sessionId = this.mappingState.sessionId || this.ctx.config.sessionId;
+    this.ctx.tracer?.emitEvent("daemon.pi.provider_finish_error.continued", {
+      surface: "daemon",
+      attrs: {
+        agentId: this.ctx.agentId,
+        launchId: this.ctx.launchId || undefined,
+        runtime: this.ctx.config.runtime,
+        ...this.providerModelTraceAttrs(),
+        // Written as a machine-scoped `session_id_hash` by the daemon's trace sink, never in the clear.
+        session_id: sessionId || undefined,
+        session_id_present: Boolean(sessionId),
+        outcome,
+        error_class: errorClass,
+      },
+    });
+  }
+
+  /**
+   * The launch plan's trace provider and model: closed sets only (`model_id` exists for a preset
+   * model, never a custom model's name), as the trace sink admits them. Empty when the config
+   * cannot be read.
+   */
+  private providerModelTraceAttrs(): { provider_id?: string; model_id?: string } {
+    try {
+      const { provider_id: providerId, model_id: modelId } = buildLaunchPlan(hydrateRuntimeConfig(this.ctx.config)).trace;
+      return { ...(providerId ? { provider_id: providerId } : {}), ...(modelId ? { model_id: modelId } : {}) };
+    } catch {
+      return {};
+    }
   }
 
   private markProviderResponseStarted(): void {
@@ -3597,10 +3708,8 @@ export class BuiltInDriver extends PiDriver {
           protocolVersion: 1,
           runtime: "builtin",
           runtimeVersion: PI_SDK_VERSION,
-          // task #10: this Computer runs a typed model id on these preset providers,
-          // directly and through a saved connection to one.
+          // task #10: this Computer runs a typed model id on these preset providers.
           customModelProviderIds: [...BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS],
-          customModelConnectionProviderIds: [...BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS],
         },
       },
     };

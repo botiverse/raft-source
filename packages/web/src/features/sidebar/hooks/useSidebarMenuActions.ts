@@ -1,11 +1,13 @@
 import { useCallback, useMemo } from "react";
 import { canToggleActivityMute } from "../../../store/channelDomain";
 import { useServerStore } from "../../../store/serverStore";
+import type { MessageId } from "../../../i18n/messages";
 import type { NotificationLevelTarget } from "../../../components/notifications/NotificationLevelMenu";
 import type { SidebarSortMode } from "../../../components/layout/sidebarSort";
 import { sidebarChannelHomeSectionKey } from "../../../components/layout/sidebarChannelVisibility";
 import type { SidebarSectionCandidate, SidebarSectionConversationChange } from "../../../components/layout/SidebarSectionAddConversationsDialog";
-import { sidebarSectionItemKey } from "../../../store/sidebarSections";
+import { sidebarItemSectionKey, sidebarSectionItemKey } from "../../../store/sidebarSections";
+import { hasSidebarPinnedRef } from "../../../utils/sidebarPinnedRefs";
 import { sidebarSectionOrderKey } from "../sections/sidebarSortSections";
 import { toMovableChange } from "../sidebarDisplayItems";
 import type { SidebarMovableItem } from "../sidebarDisplayItems";
@@ -26,7 +28,7 @@ export function useSidebarMenuActions(data: SidebarData, view: SidebarViewState,
   const {
     dmChannels, channels, deleteChannel, archiveChannel, leaveChannel, agents, customSections,
     sectionPlacements, updateSidebarOrder, setShowCreateChannel, setShowCreateJointChannel, ctxMenu,
-    setCtxMenu, moveToSectionTriggerRef, setMoveToSectionMenuOpen, moveToSectionMenuPosition,
+    setCtxMenu, moveToSectionTriggerRef, setMoveToSectionMenuOpen,
   } = data;
   const {
     sectionCtxMenu, setSectionDialog, sectionDialog, setDeleteSectionConfirm, deleteSectionConfirm,
@@ -36,12 +38,12 @@ export function useSidebarMenuActions(data: SidebarData, view: SidebarViewState,
   } = view;
   const { closedDmIds, closeDm, closeCtx, closeSectionCtx, closeSidebarSurfaceCtx } = sync;
   const {
-    pinnedChannelIds, pinnedAgentIds, customPlacedAgentIds, visibleRegularChannels, orderedJointChannels,
-    agentDmChannelId, agentDmChannelByAgentId, agentById, loungeEntryById,
+    pinnedRefs, pinnedAgentIds, customPlacedAgentIds, visibleRegularChannels, orderedJointChannels,
+    agentDmChannelId, agentDmChannelByAgentId, agentById, loungeEntryById, jointSectionLabelId,
   } = items;
   const {
-    togglePinnedRef, moveItemToPinned, moveItemToCustomSection, placementsForSectionChange,
-    removeItemFromCustomSection, createCustomSection, deleteCustomSection, togglePinChannel,
+    togglePinnedRef, pinnedRefForMovableItem, moveItemToPinned, moveItemToHome, moveItemToCustomSection, placementsForSectionChange,
+    createCustomSection, deleteCustomSection, togglePinChannel,
     toggleChannelActivityMute, togglePinAgent, togglePinDm,
   } = dnd;
 
@@ -65,19 +67,35 @@ export function useSidebarMenuActions(data: SidebarData, view: SidebarViewState,
   const contextPlacement = contextMovableItem
     ? sectionPlacements.find((placement) => sidebarSectionItemKey(placement.kind, placement.id) === sidebarSectionItemKey(contextMovableItem.kind, contextMovableItem.id)) ?? null
     : null;
-  const contextItemPinned = contextMovableItem?.kind === "channel"
-    ? pinnedChannelIds.includes(contextMovableItem.id)
-    : contextMovableItem?.kind === "agent" && pinnedAgentIds.includes(contextMovableItem.id);
-  // The section the right-clicked row is shown in, as a sectionOrder key.
-  const contextItemSectionKey: string | null = (() => {
+  // Pinned as the sidebar shows it: by the item's own pin (a DM's is its
+  // peer's), never a DM's legacy `channel:<dm id>` pin.
+  const contextPinnedRef = contextMovableItem ? pinnedRefForMovableItem(contextMovableItem) : null;
+  const contextItemPinned = !!contextPinnedRef && hasSidebarPinnedRef(pinnedRefs, contextPinnedRef);
+  // Move to Section ▸'s rows, as channel settings' select (cindyz, #triage:#518):
+  // the home section, Pinned and the custom sections, the one the row is shown
+  // in checked (a sectionOrder key; also where New section goes). Pinned wins
+  // over a placement; a placement in a deleted section is home.
+  const contextHomeSectionKey: string | null = (() => {
     if (!contextMovableItem) return null;
-    if (contextPlacement) return contextPlacement.sectionId;
-    if (contextItemPinned) return "system:pinned";
     if (contextMovableItem.kind === "agent") return "system:dms";
     const channel = channels.find((candidate) => candidate.id === contextMovableItem.id);
     if (channel) return sidebarChannelHomeSectionKey(channel);
     return dmChannels.some((dm) => dm.id === contextMovableItem.id) ? "system:dms" : null;
   })();
+  const contextHomeLabelId: MessageId | null = contextHomeSectionKey === "system:dms"
+    ? "layout.sidebar.directMessages"
+    : contextHomeSectionKey === "system:joint" ? jointSectionLabelId
+    : contextHomeSectionKey === "system:channels" ? "layout.sidebar.channels" : null;
+  const contextShownSectionKey = contextHomeSectionKey === null ? null : sidebarItemSectionKey({
+    pinned: contextItemPinned,
+    placementSectionId: contextPlacement?.sectionId ?? null,
+    customSections,
+    homeKey: contextHomeSectionKey,
+  });
+  const contextItemHome = contextShownSectionKey !== null && contextShownSectionKey === contextHomeSectionKey;
+  const contextCurrentSectionId = contextShownSectionKey !== null && contextShownSectionKey !== contextHomeSectionKey && contextShownSectionKey !== "system:pinned"
+    ? contextShownSectionKey
+    : null;
   // Dialog handlers. Each dialog only mounts while its state is set, so the
   // null guards below never fire in practice; they keep the callbacks total.
   const closeCreateChannelDialog = useCallback(() => setShowCreateChannel(false), []);
@@ -247,6 +265,7 @@ export function useSidebarMenuActions(data: SidebarData, view: SidebarViewState,
     }
   }, []);
   const openMoveToSectionMenu = useCallback(() => setMoveToSectionMenuOpen(true), []);
+  const closeMoveToSectionMenu = useCallback(() => setMoveToSectionMenuOpen(false), []);
   // What a row menu's Mute / Unmute acts on: the channel, or the DM of a
   // person, agent or DM row (only a DM with an App bot can be muted).
   const ctxMuteTarget = ctxChannel ?? ctxHumanDmChannel ?? ctxDmChannel ?? ctxLounge?.channel
@@ -321,11 +340,6 @@ export function useSidebarMenuActions(data: SidebarData, view: SidebarViewState,
     setCtxMenu(null);
   }, [closeDm, ctxLounge]);
   // Move-to-section submenu actions.
-  const moveToSectionMenuStyle = useMemo<React.CSSProperties>(() => ({
-    left: moveToSectionMenuPosition?.x ?? 0,
-    top: moveToSectionMenuPosition?.y ?? 0,
-    visibility: moveToSectionMenuPosition ? "visible" : "hidden",
-  }), [moveToSectionMenuPosition]);
   const moveContextItemToPinned = useCallback(() => {
     if (!contextMovableItem) return;
     moveItemToPinned(contextMovableItem);
@@ -336,16 +350,16 @@ export function useSidebarMenuActions(data: SidebarData, view: SidebarViewState,
     moveItemToCustomSection(contextMovableItem, sectionId);
     closeCtx();
   }, [closeCtx, contextMovableItem, moveItemToCustomSection]);
+  const moveContextItemToHome = useCallback(() => {
+    if (!contextMovableItem) return;
+    moveItemToHome(contextMovableItem);
+    closeCtx();
+  }, [closeCtx, contextMovableItem, moveItemToHome]);
   const createSectionWithContextItem = useCallback(() => {
     if (!contextMovableItem) return;
-    setSectionDialog({ mode: "create", moveItem: contextMovableItem, insertBefore: contextItemSectionKey ?? undefined });
+    setSectionDialog({ mode: "create", moveItem: contextMovableItem, insertBefore: contextShownSectionKey ?? undefined });
     closeCtx();
-  }, [closeCtx, contextItemSectionKey, contextMovableItem]);
-  const removeContextItemFromSection = useCallback(() => {
-    if (!contextMovableItem) return;
-    removeItemFromCustomSection(contextMovableItem);
-    closeCtx();
-  }, [closeCtx, contextMovableItem, removeItemFromCustomSection]);
+  }, [closeCtx, contextShownSectionKey, contextMovableItem]);
   return {
     contextCustomSection, contextMovableItem, contextPlacement, contextItemPinned, closeCreateChannelDialog,
     closeCreateJointChannelDialog, closeDeleteConfirm, confirmDelete, closeArchiveConfirm, confirmArchive,
@@ -356,12 +370,12 @@ export function useSidebarMenuActions(data: SidebarData, view: SidebarViewState,
     deleteContextSection, createChannelFromSurfaceMenu, createJointChannelFromSurfaceMenu,
     createSectionFromSurfaceMenu, ctxChannel, ctxHumanDmChannel, ctxDmChannel, ctxAgent,
     ctxAgentDmChannelId, closeMoveToSectionMenuFromHover, closeMoveToSectionMenuFromFocus,
-    openMoveToSectionMenu, ctxMuteTarget, toggleContextActivityMute, contextNotificationLevelTarget,
+    openMoveToSectionMenu, closeMoveToSectionMenu, ctxMuteTarget, toggleContextActivityMute, contextNotificationLevelTarget,
     toggleContextChannelPin, archiveContextChannel, leaveContextChannel, toggleContextHumanPin,
     toggleContextDmPin, toggleContextAgentPin, closeContextDm, ctxLounge, toggleContextLoungePin,
-    closeContextLounge, moveToSectionMenuStyle,
-    moveContextItemToPinned, moveContextItemToSection, createSectionWithContextItem,
-    removeContextItemFromSection,
+    closeContextLounge,
+    moveContextItemToPinned, moveContextItemToSection, moveContextItemToHome, createSectionWithContextItem,
+    contextHomeLabelId, contextItemHome, contextCurrentSectionId,
   };
 }
 

@@ -28,6 +28,7 @@ import {
   configureAppWebhook,
 } from "./appWebhookConfigService";
 import {
+  computerOutageIsOpen,
   drainDueComputerOutageNotifications,
   recordComputerOfflineTransition,
   recordComputerOnlineTransition,
@@ -137,6 +138,17 @@ async function alignFixtureOutboxClock(db: Database, now: Date) {
     updatedAt: now,
   });
 }
+
+test("open-outage predicate inlines its states so the partial open-machine index stays usable", async () => {
+  const fixture = await createFixture();
+  try {
+    const query = fixture.db.select({ id: computerOutageOccurrences.id }).from(computerOutageOccurrences).where(computerOutageIsOpen).toSQL();
+    assert.match(query.sql, /"state" in \('pending', 'notified'\)/);
+    assert.deepEqual(query.params, []);
+  } finally {
+    await closeFixture(fixture);
+  }
+});
 
 test("unexpected managed Computer outage emits one offline and one correlated online receipt", async () => {
   const fixture = await createFixture();

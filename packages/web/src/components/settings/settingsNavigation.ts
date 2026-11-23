@@ -5,7 +5,6 @@ import {
   CreditCard,
   FlaskConical,
   Languages,
-  KeyRound,
   ArrowLeftRight,
   Palette,
   Shield,
@@ -41,7 +40,6 @@ export const SETTINGS_TABS = [
   { id: "im-bridges", label: IM_BRIDGES_LABEL, title: IM_BRIDGES_LABEL, icon: ArrowLeftRight },
   { id: "integrations", label: "Applications", title: "Applications", icon: AppWindow },
   { id: "labs", label: "Labs", title: "Labs", icon: FlaskConical },
-  { id: "providers", label: "AI Providers", title: "AI Providers", icon: KeyRound },
   { id: "about", label: "About", title: "About", icon: BadgeInfo },
   { id: "feedback", label: "Feedback", title: "My Feedback", icon: FeedbackIcon },
 ] as const satisfies ReadonlyArray<{
@@ -100,7 +98,6 @@ export const SETTINGS_TAB_TITLE_ID: Record<SettingsTabId, MessageId> = {
   theme: "settings.tabs.theme",
   "server-notifications": "settings.tabs.notifications",
   server: "settings.tabs.server",
-  providers: "settings.tabs.providers",
   labs: "settings.tabs.labs",
   billing: "settings.tabs.billingHeader",
   administration: "settings.tabs.administration",

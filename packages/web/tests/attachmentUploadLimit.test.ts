@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { vi } from "vitest";
+import { ATTACHMENT_UPLOAD_CONTROL_TIMEOUT_MS } from "../src/utils/directAttachmentUpload";
 import {
   resetAttachmentUploadLimitForTests,
   resolveAttachmentUploadLimits,
@@ -136,5 +138,30 @@ test("no monthly quota (Pro), or a server too old to say, is none", async () => 
     resetAttachmentUploadLimitForTests();
     assert.deepEqual(await resolveAttachmentUploadLimits(source([{ data }])), { maxBytes: 4096, monthlyUpload: null }, JSON.stringify(data));
     assert.equal(useMonthlyUploadQuotaStore.getState().quota, null);
+  }
+});
+
+// #triage:#545: a probe that never answered kept the selection "validating"
+// forever and queued every later pick behind it.
+test("a capability probe that never answers is aborted and resolves as an unknown ceiling", async () => {
+  vi.useFakeTimers();
+  try {
+    let probeSignal: AbortSignal | undefined;
+    const hanging: AttachmentUploadLimitSource = {
+      get: (_path, config) => {
+        probeSignal = config?.signal;
+        return new Promise(() => undefined);
+      },
+    };
+    const limits = resolveAttachmentUploadLimits(hanging);
+    await vi.advanceTimersByTimeAsync(ATTACHMENT_UPLOAD_CONTROL_TIMEOUT_MS);
+    assert.equal(await limits, null);
+    assert.equal(probeSignal?.aborted, true);
+
+    // The timed-out request is not shared with the next selection.
+    const next = source([{ data: { maxBytes: 12 } }]);
+    assert.equal(await resolveAttachmentUploadLimitBytes(next), 12);
+  } finally {
+    vi.useRealTimers();
   }
 });

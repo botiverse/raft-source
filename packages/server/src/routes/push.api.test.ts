@@ -778,7 +778,7 @@ test("the deprecated POST /push/test answers as before when Web Push is off or t
     __setWebPushRuntimeForTests({ enabled: true });
     const none = await send();
     assert.equal(none.status, 409);
-    assert.deepEqual(await none.json(), { error: "No push subscription found for this user on this server" });
+    assert.deepEqual(await none.json(), { error: "No push subscription found for this user on this server", code: "push_subscription_missing", errorCode: "push_subscription_missing" });
   } finally {
     __resetWebPushRuntimeForTests();
     await close();

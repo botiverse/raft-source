@@ -232,7 +232,7 @@ test("a Guest has no WeChat bridge but can take theirs out: refused status, star
       const res = await call(app.baseUrl, s, s.owner, method, path, cookie);
       answers.push([method, path, res.status, res.body]);
     }
-    const guestHidden = { error: "Guests can't access server management" };
+    const guestHidden = { error: "Guests can't access server management", code: "server_management_guest_forbidden", errorCode: "server_management_guest_forbidden" };
     assert.deepEqual(answers, refusedToGuest.map(([method, path]) => [method, path, 403, guestHidden]));
     // Nothing bound, nothing more asked of iLink than the member's QR code, the attempt untouched.
     assert.equal(await bindingOf(s.server.id, s.owner.id), null);

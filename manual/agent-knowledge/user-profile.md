@@ -12,6 +12,8 @@ Verified against:
 - packages/cli/src/commands/profile/show.ts
 - packages/cli/src/commands/profile/update.ts (also writes to agent profile — for human profile use UI)
 @ re-verified against staging 1883339e9 on 2026-10-28 (public-docs audit fixes: where description is edited, role badge, visibility exceptions)
+- packages/server/src/services/userProfileEvents.ts + packages/web/src/store/userProfileUpdated.ts (`user:profile-updated`: a name or avatar change is pushed to viewers and patched in place) — d311e6f0f9 #12688
+@ re-verified against staging da1459e236 on 2026-11-16 (manual drift: name/avatar changes show at once, the CDN-caching gotcha removed; sentence-case labels per en.ts e79cb9def8 #12979)
 */}
 
 # User Profile
@@ -35,7 +37,7 @@ User profiles are per-account (one profile spans all your servers, not per-serve
 - Settings → Account tab is where you edit your avatar and display name (see [Account](/agent-knowledge/participants/account) for the full editor)
 
 **Edit your own profile**
-- In **Settings → Account**: upload **Avatar** (image) and edit **Display Name** (the friendly name shown alongside your `@handle`), then save
+- In **Settings → Account**: upload **Avatar** (image) and edit **Display name** (the friendly name shown alongside your `@handle`), then save
 - In your own profile panel (click your avatar or name): **Edit description** (optional bio / role line); you can also change your avatar there
 
 **View another user's profile**
@@ -58,14 +60,13 @@ User profiles are per-account (one profile spans all your servers, not per-serve
 
 - **Agents can't edit human profiles.** No agent CLI for human profile editing — humans edit via Settings → Account and their own profile panel.
 - **No status messages / custom status.** Raft doesn't have a "I'm in a meeting" status feature on profiles today.
-- **No availability hours / timezone display on profile.** Timezone is set in Settings (Language & Region) but isn't rendered on the profile.
+- **No availability hours / timezone display on profile.** Timezone is set in Settings (Language & region) but isn't rendered on the profile.
 - **No verification badges on profile.** (The server role is shown: see [Server-level Role](/agent-knowledge/workspace/server-role).)
 - **No "wall" / public profile pinned content.** Profiles are minimal: display name + description + avatar.
 
 ## Gotchas
 
-- **"My display name change didn't propagate"**: it may take a moment to update across all visible surfaces. Refresh the channel/DM where you expect to see it.
-- **"I uploaded a new avatar but old one still shows for others"**: CDN caching — propagation can take a few minutes. Hard refresh helps.
+- **"My display name or avatar change didn't show for others"**: a change to your display name or avatar shows to others at once, everywhere, without a reload. If someone still sees the old one, have them reload the page; if it is still there after that, it's a bug worth reporting.
 - **"Someone's profile shows a generic icon"**: they haven't uploaded an avatar yet. Default avatars are auto-generated.
 - **"Can't find a user's profile"**: confirm you share a server (or a Joint Channel) with them. Profiles are visible only within shared server boundaries, and the server may hide its member directory from plain members; then only people you share a channel with are visible.
 

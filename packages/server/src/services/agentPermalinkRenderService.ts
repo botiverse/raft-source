@@ -1,8 +1,9 @@
 import { parseRaftPermalink, replaceOutsideMarkdownCode } from "@botiverse/raft-shared";
 import { alias } from "drizzle-orm/pg-core";
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull, or } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { channels, messages } from "../db/schema";
+import * as channelService from "./channelService";
 import * as serverService from "./serverService";
 import { isMessageShortId, messageIdShortPrefixConditions } from "../lib/messageId";
 import { getAppPermalinkHostnames } from "../config/appUrl";
@@ -206,6 +207,63 @@ async function loadResolvedMessageRefs(serverId: string, matches: ParsedMatch[])
   return resolved;
 }
 
+/**
+ * Permalinks into the server's own projection of a joint channel: the joint's
+ * messages are stored once, in its canonical channel (a reply in one of its
+ * threads), outside every server, so loadResolvedMessageRefs (pinned to the
+ * server's channels) never finds them. Resolved through the server's active
+ * projection (channelService resolveChannelAccessMany) and named by it, as
+ * the agent addresses that conversation (`#name msg=…`, a reply
+ * `#name:<parent> msg=…`), the same rule as the server's other channels; a
+ * projection the server no longer has (or another server's) is left raw.
+ */
+async function loadJointMessageRefs(serverId: string, matches: ParsedMatch[]): Promise<Map<string, string>> {
+  const channelIds = [...new Set(matches.map((match) => match.parsed.channelId).filter((id) => FULL_UUID_PATTERN.test(id)))];
+  if (channelIds.length === 0) return new Map();
+  const access = await channelService.resolveChannelAccessMany({ serverId, channelIds });
+  const joints = new Map<string, { canonicalChannelId: string; name: string }>();
+  for (const [localId, resolution] of access) {
+    if (resolution.kind === "joint") joints.set(localId, { canonicalChannelId: resolution.canonicalChannelId, name: resolution.channel.name });
+  }
+  if (joints.size === 0) return new Map();
+
+  const db = getDb();
+  const threadChannels = alias(channels, "thread_channels");
+  const parentMessages = alias(messages, "parent_messages");
+  const resolved = new Map<string, string>();
+  const uniqueMatches = new Map(matches.map((match) => [parsedMatchKey(match), match]));
+  for (const [key, match] of uniqueMatches) {
+    const joint = joints.get(match.parsed.channelId);
+    if (!joint) continue;
+    const rawMessageId = match.parsed.messageId.toLowerCase();
+    const full = FULL_UUID_PATTERN.test(rawMessageId);
+    // As for the server's own channels: a short id only without a thread parameter.
+    if (!full && (!isMessageShortId(rawMessageId) || match.parsed.threadParentMessageId)) continue;
+    const rows = await db
+      .select({ messageId: messages.id, channelId: messages.channelId, parentMessageId: threadChannels.parentMessageId })
+      .from(messages)
+      .leftJoin(threadChannels, and(eq(threadChannels.id, messages.channelId), eq(threadChannels.type, "thread"), isNull(threadChannels.deletedAt)))
+      .leftJoin(parentMessages, eq(parentMessages.id, threadChannels.parentMessageId))
+      .where(and(
+        full ? eq(messages.id, rawMessageId) : and(...messageIdShortPrefixConditions(rawMessageId)),
+        or(eq(messages.channelId, joint.canonicalChannelId), eq(parentMessages.channelId, joint.canonicalChannelId)),
+      ))
+      .limit(2);
+    if (rows.length !== 1) continue;
+    const [row] = rows;
+    const msgShort = row!.messageId.slice(0, 8);
+    if (row!.channelId === joint.canonicalChannelId) resolved.set(key, `#${joint.name} msg=${msgShort}`);
+    else if (row!.parentMessageId) resolved.set(key, `#${joint.name}:${row!.parentMessageId.slice(0, 8)} msg=${msgShort}`);
+  }
+  return resolved;
+}
+
+/** Each permalink's agent-facing ref: the server's own channels' messages, and its joint projections'. */
+async function loadMessageRefs(serverId: string, matches: ParsedMatch[]): Promise<Map<string, string>> {
+  if (matches.length === 0) return new Map();
+  return new Map([...await loadJointMessageRefs(serverId, matches), ...await loadResolvedMessageRefs(serverId, matches)]);
+}
+
 async function loadReplacementMap(serverId: string, text: string): Promise<Map<string, string>> {
   const server = await serverService.getServer(serverId);
   if (!server?.slug) return new Map();
@@ -213,7 +271,7 @@ async function loadReplacementMap(serverId: string, text: string): Promise<Map<s
   const parsedMatches = collectParsedMatches(text, server.slug);
   if (parsedMatches.length === 0) return new Map();
 
-  const resolvedRefs = await loadResolvedMessageRefs(serverId, parsedMatches);
+  const resolvedRefs = await loadMessageRefs(serverId, parsedMatches);
 
   const replacements = new Map<string, string>();
   for (const match of parsedMatches) {
@@ -259,7 +317,7 @@ export async function renderAgentReadablePermalinksInTexts(
     if (!server?.slug) return texts;
 
     const parsedMatchesByText = texts.map((text) => collectParsedMatches(text, server.slug));
-    const resolvedRefs = await loadResolvedMessageRefs(serverId, parsedMatchesByText.flat());
+    const resolvedRefs = await loadMessageRefs(serverId, parsedMatchesByText.flat());
 
     return texts.map((text, index) => {
       const matches = parsedMatchesByText[index];

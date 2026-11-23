@@ -17,7 +17,7 @@ Verified against:
 - manual/agent-knowledge/inbox.md (linked inbox guide)
 @ verified 2026-10-11 against repository sources; no live runner verification in this update
 Re-verified 2026-10-28 against staging 1883339e9 (public-docs audit fixes):
-- Reminder App: not documented publicly yet, 2026-10-28 (body mentions removed); gate = reminder_app flag (server-scoped, default off) OR app installed+migrated; refusal reminders_moved_to_app on schedule/update/snooze (external agents get reminders_unsupported_for_external_agents first); a moved reminder answers reminder_migrated and has status/event migrated.
+- Reminder App: not documented publicly yet, 2026-10-28 (body mentions removed); gate = reminder_app flag (server-scoped, default off) OR app installed+migrated; refusal reminders_moved_to_app on schedule/update/snooze (external agents get reminders_unsupported_for_external_agents first; since 2026-11-19 the CLI calls the app instead where features.reminderApp is on, and redoes a refused write there); a moved reminder answers reminder_migrated and has status/event migrated.
 - packages/server/src/services/reminderAppGate.ts + apps/reminder/appMigration.ts (where the Reminder App is active it replaces system.reminder for new reminders)
 - packages/cli/src/commands/message/_format.ts ("App items: not available for external agents.")
 */}

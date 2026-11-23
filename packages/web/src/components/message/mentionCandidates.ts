@@ -4,7 +4,7 @@ import type { ComposerSuggestionSearchEntry } from "../../utils/composerSuggesti
 import type { ChannelAgent, ChannelHuman } from "../../hooks/useChannelMembers";
 import { memberServerBadgeLabels } from "../../utils/channelLocalMembership";
 import { isViewerServerGuest, memberOrigin } from "../../utils/memberOrigin";
-import type { MemberOrigin } from "../../utils/memberOrigin";
+import type { KnownServer, MemberOrigin } from "../../utils/memberOrigin";
 
 export interface MentionCandidate {
   id: string;
@@ -59,6 +59,11 @@ interface MentionScopeChannel {
   type?: string | null;
 }
 
+/** The composer's channel, for the servers a joint one connects (each with its logo). */
+interface MentionOriginChannel extends MentionScopeChannel {
+  jointServers?: readonly KnownServer[] | null;
+}
+
 export function isMemberScopedMentionChannel(channel: MentionScopeChannel | null | undefined): boolean {
   if (!channel) return false;
   return channel.type === "private" || channel.type === "joint";
@@ -69,11 +74,17 @@ export function isMemberScopedMentionChannel(channel: MentionScopeChannel | null
  * avatar's tile and the server's name) and whether they are a Guest of the
  * viewed server, read as the member list reads it (rosterRoleTag): the
  * roster sends a guest viewer no `role`, only `effectiveChannelRole`.
+ * `channel`'s `jointServers` (a joint channel's) give the server's logo
+ * where the roster row carries none.
  */
-export function channelHumanMentionCandidate(human: ChannelHuman, viewerServerId: string | null | undefined): MentionCandidate {
+export function channelHumanMentionCandidate(
+  human: ChannelHuman,
+  viewerServerId: string | null | undefined,
+  channel?: MentionOriginChannel | null,
+): MentionCandidate {
   const isRemoteHuman = Boolean(viewerServerId && human.serverId && human.serverId !== viewerServerId);
   const serverLabels = memberServerBadgeLabels(human, viewerServerId);
-  const origin = memberOrigin(human, viewerServerId);
+  const origin = memberOrigin(human, viewerServerId, channel?.jointServers);
   return {
     origin,
     guest: isViewerServerGuest(human.effectiveChannelRole ?? human.role, origin),
@@ -90,11 +101,15 @@ export function channelHumanMentionCandidate(human: ChannelHuman, viewerServerId
   };
 }
 
-/** A channel roster's agent as an @ candidate, with where it is from. */
-export function channelAgentMentionCandidate(agent: ChannelAgent, viewerServerId: string | null | undefined): MentionCandidate {
+/** A channel roster's agent as an @ candidate, with where it is from (see channelHumanMentionCandidate). */
+export function channelAgentMentionCandidate(
+  agent: ChannelAgent,
+  viewerServerId: string | null | undefined,
+  channel?: MentionOriginChannel | null,
+): MentionCandidate {
   const isRemoteAgent = Boolean(viewerServerId && agent.serverId && agent.serverId !== viewerServerId);
   return {
-    origin: memberOrigin(agent, viewerServerId),
+    origin: memberOrigin(agent, viewerServerId, channel?.jointServers),
     id: agent.id,
     serverId: isRemoteAgent ? agent.serverId : undefined,
     serverName: isRemoteAgent ? agent.serverName : undefined,

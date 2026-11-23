@@ -1,6 +1,7 @@
 import { ARTIFACT_PAGE_CARD_MIN_WIDTH_PX, ARTIFACT_PAGE_COLORS, ARTIFACT_PAGE_THEME_VARIABLES, artifactPageVariable } from "@botiverse/raft-shared/src/artifactPageTheme";
 import type { ArtifactPageToken } from "@botiverse/raft-shared/src/artifactPageTheme";
-import { marked, type Tokens } from "marked";
+import { bareLinkBeforeFullWidthPunctuation } from "@botiverse/raft-shared/src/bareLinkEnd";
+import { marked, Tokenizer, type Tokens } from "marked";
 
 /**
  * Markdown → a whole HTML page, served on the artifact's own content origin
@@ -807,6 +808,23 @@ const IMAGE_VIEWER_SCRIPT = `
 </script>`;
 
 /**
+ * marked's tokenizer with GFM's literal links (an address written bare in the text: not
+ * `[words](url)`, not `<url>`) ended before the first full-width punctuation, as the server reads
+ * them (shared bareLinkEnd.ts; contentLinks.ts): "见 https://…/artifacts/H6Xq（v10，第 6 轮）" links
+ * `https://…/artifacts/H6Xq`, and `（v10，第 6 轮）` is text after it. marked's own literal link
+ * is read again from the cut address, so its rules (trailing punctuation, `www.`) apply to the cut
+ * one; the lexer goes on from the link's shorter `raw`, reading the rest as text.
+ */
+class PageTokenizer extends Tokenizer {
+  override url(src: string): Tokens.Link | undefined {
+    const link = super.url(src);
+    if (!link) return link;
+    const cut = bareLinkBeforeFullWidthPunctuation(link.raw);
+    return cut === link.raw ? link : super.url(cut);
+  }
+}
+
+/**
  * The page for `markdown`, served at `<entry>.html` beside its source (`entry`, the version's
  * Markdown file: its directory decides the fonts' relative address).
  */
@@ -826,7 +844,7 @@ export function renderMarkdownToHtml(markdown: string, title: string, entry = ""
   };
 
   // As written: raw HTML is kept (the content origin is the boundary, not a sanitizer).
-  const html = marked.parse(markdown, { async: false, gfm: true, breaks: true, renderer });
+  const html = marked.parse(markdown, { async: false, gfm: true, breaks: true, renderer, tokenizer: new PageTokenizer() });
 
   const outlineNav = outline.length > 0
     ? `<aside class="outline-col"><nav class="outline" aria-label="Outline"><div class="outline-title">Outline</div><ol>${outline
@@ -909,6 +927,14 @@ ${FONT_VARIABLES}
   .doc h4, .doc h5, .doc h6 { margin: .75rem 0 .25rem; line-height: 1.25; }
   .doc hr { margin: 1rem 0; border: 0; border-top: 1px solid ${HAIRLINE}; }
   .doc a { color: ${LINK}; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  /* A link to another Artifact, which the web labels with its live title (Porthole's link labels, P151;
+     the web's artifactLinkLabels.ts): a chip. Muted where the reader can't open it, struck through
+     where it was deleted. */
+  .doc a[data-porthole-label^="artifact-"] { padding: 0 .375rem; border-radius: 6px; background: ${FILL_MUTED}; text-decoration: none;
+    -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+  .doc a[data-porthole-label^="artifact-"]:hover { background: ${FILL_MEDIUM}; }
+  .doc a[data-porthole-label="artifact-unavailable"] { color: ${HINT}; }
+  .doc a[data-porthole-label="artifact-deleted"] { color: ${HINT}; text-decoration: line-through; text-decoration-thickness: 1px; }
   .doc input[type="checkbox"] { margin-right: .35rem; accent-color: ${INK}; }
   .mermaid-diagram { position: relative; margin: 1rem 0; border: 1px solid ${HAIRLINE}; border-radius: 10px; overflow: hidden; background: ${CODE_LAYER}; }
   .mermaid-toolbar { position: sticky; top: 0; z-index: 20; display: flex; align-items: center; justify-content: flex-end;

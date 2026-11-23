@@ -1,0 +1,20 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "claude",
+  "schemaVersion": "claude.create.v1",
+  "sourceId": "provider",
+  "kind": "select",
+  "pointer": "/provider",
+  "options": [
+    {
+      "value": "default",
+      "label": "Default"
+    },
+    {
+      "value": "custom",
+      "label": "Custom"
+    }
+  ],
+  "defaultValue": "default",
+  "customValueAllowed": false
+}

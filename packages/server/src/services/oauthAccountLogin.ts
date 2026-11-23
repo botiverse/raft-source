@@ -26,7 +26,7 @@ import {
   RAFT_OAUTH_SCOPE_CATALOG,
   RAFT_OAUTH_SCOPES_SUPPORTED,
 } from "@botiverse/raft-shared";
-import { and, asc, desc, eq, isNotNull, isNull, ne, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, exists, isNotNull, isNull, ne, or, sql, type SQL } from "drizzle-orm";
 import { getDb, type DatabaseExecutor, type DatabaseTransaction } from "../db/index";
 import {
   oauthAccessRequests,
@@ -793,12 +793,25 @@ export interface AccountAppLogin {
 }
 
 /**
- * The person's active account-mode consents (no Server), newest first. Only an
- * App in account mode holds one, and it never leaves account mode (migration
- * 0560's guard and forward-only triggers), so this is every account-mode App
- * the person is signed in to, and nothing else.
+ * The person's active account-mode consents (no Server), newest first, of the
+ * Apps they signed in to: an account-mode token of theirs for the App that is
+ * not revoked (it may have expired). Only an App in account mode holds such a
+ * consent or token, and it never leaves account mode (migration 0560's guard
+ * and forward-only triggers), so this is every account-mode App the person is
+ * signed in to, and nothing else. A consent that only allowed the App's link
+ * previews (RFC 079 D17, written by the prompt) is not a sign-in and is not
+ * listed: the Link previews settings list it. Only a per-app revoke (below)
+ * and the account's deletion revoke an account-mode token, and both revoke
+ * the consent with it.
  */
 export async function listAccountAppLogins(userId: string, executor: DatabaseExecutor = getDb()): Promise<AccountAppLogin[]> {
+  const signedIn = executor.select({ one: sql`1` }).from(oauthAccessTokens).where(and(
+    eq(oauthAccessTokens.userId, oauthUserConsents.userId),
+    eq(oauthAccessTokens.clientId, oauthUserConsents.clientId),
+    isNull(oauthAccessTokens.serverId),
+    eq(oauthAccessTokens.principalType, "human"),
+    isNull(oauthAccessTokens.revokedAt),
+  ));
   return executor.select({
     id: oauthUserConsents.id,
     clientId: oauthClients.clientId,
@@ -812,6 +825,7 @@ export async function listAccountAppLogins(userId: string, executor: DatabaseExe
       eq(oauthUserConsents.userId, userId),
       isNull(oauthUserConsents.serverId),
       isNull(oauthUserConsents.revokedAt),
+      exists(signedIn),
     ))
     .orderBy(desc(oauthUserConsents.grantedAt), desc(oauthUserConsents.id));
 }

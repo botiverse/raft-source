@@ -60,7 +60,7 @@ export const CLOSED_SERVER_PURGE_ROW_STEPS = ["server_rows", "credential_revoke"
 export type ClosedServerPurgeRowStep = (typeof CLOSED_SERVER_PURGE_ROW_STEPS)[number];
 
 /** Steps before server_rows that delete a key's rows. */
-export type ClosedServerPurgeEarlierStep = "apps" | "channels" | "object_events" | "agents" | "wechat_bridge" | "object_files_sweep";
+export type ClosedServerPurgeEarlierStep = "apps" | "channels" | "object_events" | "agents" | "wechat_bridge" | "data_exports" | "object_files_sweep";
 
 export type ClosedServerPurgeKeyClassification =
   | { onDelete: ClosedServerPurgeOnDelete; purge: "delete"; by: ClosedServerPurgeEarlierStep }
@@ -105,6 +105,8 @@ export const CLOSED_SERVER_PURGE_CLASSIFICATION = {
   "wechat_bridge_attempts.server_id": by("wechat_bridge"),
   "wechat_bridge_bindings.server_id": by("wechat_bridge"),
   "wechat_bridge_bindings.agent_id": via("wechat_bridge_bindings.server_id"),
+  // The server's server exports, archives first (closedServerPurgeFinish.ts data_exports).
+  "data_exports.server_id": by("data_exports"),
 
   // ── server_rows, in order: the agents' rows ──
   "agent_activity_events.agent_id": rows(),
@@ -114,6 +116,7 @@ export const CLOSED_SERVER_PURGE_CLASSIFICATION = {
   "agent_bootstrap_tokens.server_id": rows(),
   "agent_bootstrap_tokens.target_agent_id": via("agent_bootstrap_tokens.server_id"),
   "agent_channel_read_cursors.agent_id": rows(cascade, { channels: ["channel_id"] }),
+  "agent_focus_targets.agent_id": rows(cascade, { channels: ["channel_id"] }),
   "agent_config_change_events.server_id": rows(),
   "agent_config_change_events.agent_id": via("agent_config_change_events.server_id"),
   "agent_usage_daily.server_id": rows(),
@@ -137,9 +140,6 @@ export const CLOSED_SERVER_PURGE_CLASSIFICATION = {
   "agent_operator_events.agent_id": via("agent_operator_events.server_id"),
   "agent_private_surfaces.agent_id": rows(cascade, { channels: ["channel_id"] }),
   "agent_private_surfaces.server_id": via("agent_private_surfaces.agent_id"),
-  // Before provider_connections (RESTRICT).
-  "agent_provider_connections.server_id": rows(),
-  "agent_provider_connections.agent_id": via("agent_provider_connections.server_id"),
   "agent_runtime_approvals.server_id": rows(),
   "agent_runtime_approvals.agent_id": via("agent_runtime_approvals.server_id"),
   "agent_runtime_profiles.server_id": rows(),
@@ -187,17 +187,21 @@ export const CLOSED_SERVER_PURGE_CLASSIFICATION = {
   // ── server_rows: the server's own settings, credentials and state ──
   "activity_sync_principal_authorities.server_id": rows(),
   "activity_sync_scopes.server_id": rows(),
+  // The Add Computer window's pairings (computerPairingService.ts): short-lived, nothing names them.
+  "computer_pairings.server_id": rows(),
   "hosted_runtime_server_plans.server_id": rows(),
   "inbox_target_mute_states.server_id": rows(cascade, { channels: ["source_channel_id"] }),
   "managed_mcp_assignments.server_id": rows(),
   "managed_mcp_assignments.agent_id": via("managed_mcp_assignments.server_id"),
+  "managed_mcp_personal_grants.server_id": rows(),
+  "managed_mcp_personal_grants.agent_id": via("managed_mcp_personal_grants.server_id"),
   "managed_mcp_oauth_attempts.server_id": rows(),
   "notification_recipients.server_id": rows(),
   "notification_events.server_id": rows(),
+  // What the server's objects name (services/objectReferences.ts), a kept channel's Artifact's included: its links go unlisted (backlinks), the Artifact itself stays.
+  "object_references.server_id": rows(),
   "product_feedback_locators.server_id": rows(),
   "product_feedback_locators.producer_agent_id": via("product_feedback_locators.server_id"),
-  "provider_probe_receipts.server_id": rows(cascade, { scan: SMALL }),
-  "provider_probe_intents.server_id": rows(),
   "read_mutations.server_id": rows(),
   "read_mutation_authorities.server_id": rows(),
   "reminder_app_migrations.server_id": rows(),
@@ -236,6 +240,7 @@ export const CLOSED_SERVER_PURGE_CLASSIFICATION = {
 
   // ── Kept: audit ──
   "channel_membership_role_events.server_id": by("channels"),
+  "channel_membership_role_events.requester_agent_id": by("channels", restrict),
   "integration_audit_events.server_id": keep("audit", setNull),
   "server_lab_audit_events.server_id": keep("audit"),
   "server_member_role_audit_events.server_id": keep("audit"),
@@ -298,8 +303,6 @@ export const CLOSED_SERVER_PURGE_CLASSIFICATION = {
   // ── credential_revoke: revoked at the provider where it can be, then deleted (Tenny #55) ──
   "managed_mcp_credentials.server_id": stepRows("credential_revoke"),
   "managed_mcp_servers.server_id": stepRows("credential_revoke"),
-  "provider_connection_credentials.server_id": stepRows("credential_revoke"),
-  "provider_connections.server_id": stepRows("credential_revoke"),
 
   // ── app_installs: every install uninstalled by the system, then the rest of the server's app rows (Tenny #55 (2)) ──
   "oauth_client_installs.server_id": ownedBy("app_installs"),
@@ -374,6 +377,7 @@ export const CLOSED_SERVER_PURGE_STEP_TABLES: Record<ClosedServerPurgeEarlierSte
   object_events: ["object_events", "object_inbox_states"],
   agents: ["agent_activity_summary_v2"],
   wechat_bridge: ["wechat_bridge_bindings", "wechat_bridge_attempts"],
+  data_exports: ["data_exports"],
   object_files_sweep: ["object_files"],
   get server_rows() {
     return closedServerPurgeRowDeletes("server_rows").map((entry) => entry.table);
@@ -416,6 +420,7 @@ export const CLOSED_SERVER_PURGE_CASCADES: Record<string, string> = {
   "app_artifacts.version_files": ARTIFACTS,
   "app_artifacts.version_texts": ARTIFACTS,
   "app_artifacts.version_checks": ARTIFACTS,
+  "app_artifacts.settled_holds": ARTIFACTS,
   // who reads or follows a cleared channel, with the channel
   "channel_humans": CHANNEL_PEOPLE,
   "user_channel_read_cursors": CHANNEL_PEOPLE,

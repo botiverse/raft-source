@@ -558,6 +558,37 @@ test("adopt-legacy A3: after an admin adopted a member's machine and revoked it,
   });
 });
 
+// The resume follows the one controller rule (computerControllerUserId): only the live attacher, no revoked-record fallback.
+test("adopt-legacy A3: a member registrant resumes only while they are the live attacher (not after their record is revoked, not when it names no one)", async () => {
+  await withEnv(true, async (app) => {
+    const owner = await seedUser("owner");
+    const registrant = await seedUser("registrant");
+    const slug = `adopt-daemon-${randomUUID()}`;
+    const server = await createServer("Adopt Co", slug, owner.id);
+    await addMember(server.id, registrant.id, "member");
+    const db = getDb();
+
+    // A live record naming no one.
+    const { machine: unattributed } = await registerMachine(server.id, registrant.id, "unattributed-daemon");
+    assert.equal((await adoptByDaemonId(app, registrant.bearer, slug, unattributed.id)).status, 201);
+    await db.update(computers).set({ attachedByUserId: null }).where(eq(computers.machineId, unattributed.id));
+    const noOne = await adoptByDaemonId(app, registrant.bearer, slug, unattributed.id);
+    assert.equal(noOne.status, 403);
+    assert.equal(noOne.body.code, "requires_admin");
+
+    // Their own adoption, revoked.
+    const { machine } = await registerMachine(server.id, registrant.id, "member-daemon");
+    assert.equal((await adoptByDaemonId(app, registrant.bearer, slug, machine.id)).status, 201);
+    await db.update(computers).set({ revokedAt: new Date() }).where(eq(computers.machineId, machine.id));
+    const revoked = await adoptByDaemonId(app, registrant.bearer, slug, machine.id);
+    assert.equal(revoked.status, 403);
+    assert.equal(revoked.body.code, "requires_admin");
+    const rows = await db.select({ revokedAt: computers.revokedAt }).from(computers).where(eq(computers.machineId, machine.id));
+    assert.equal(rows.length, 1, "no new Computer row");
+    assert.notEqual(rows[0]!.revokedAt, null);
+  });
+});
+
 test("adopt-legacy A3: manager gets typed legacy_machine_not_found for missing or wrong-server row", async () => {
   await withEnv(true, async (app) => {
     const manager = await seedUser("manager");

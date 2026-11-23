@@ -1,7 +1,16 @@
 export const CHINESE_COMMUNITY_QR_CONFIG_URL = "https://static.raft.build/community/chinese-qr.json";
 export const CHINESE_COMMUNITY_QR_FALLBACK_CONFIG_PATH = "/community/chinese-qr.json";
 
+export interface ChineseCommunityQrCrop {
+  sourceWidth: number;
+  sourceHeight: number;
+  x: number;
+  y: number;
+  size: number;
+}
+
 export interface ChineseCommunityQrConfig {
+  crop?: ChineseCommunityQrCrop;
   imageUrl: string;
   updatedAt?: string;
   expiresAt?: string;
@@ -19,11 +28,35 @@ export function getChineseCommunityQrConfigUrl() {
   return window.__RAFT_CHINESE_COMMUNITY_QR_CONFIG_URL__ || CHINESE_COMMUNITY_QR_CONFIG_URL;
 }
 
+function normalizeCrop(value: unknown): ChineseCommunityQrCrop | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const { sourceWidth, sourceHeight, x, y, size } = value as Record<string, unknown>;
+  if (![sourceWidth, sourceHeight, x, y, size].every((n) => typeof n === "number" && Number.isSafeInteger(n))) return undefined;
+  const crop = { sourceWidth, sourceHeight, x, y, size } as ChineseCommunityQrCrop;
+  if (crop.sourceWidth <= 0 || crop.sourceHeight <= 0 || crop.size <= 0 || crop.x < 0 || crop.y < 0
+    || crop.x + crop.size > crop.sourceWidth || crop.y + crop.size > crop.sourceHeight) return undefined;
+  return crop;
+}
+
+export function chineseCommunityQrCropStyle(crop: ChineseCommunityQrCrop | undefined) {
+  if (!crop) return undefined;
+  return {
+    width: `${crop.sourceWidth / crop.size * 100}%`,
+    height: `${crop.sourceHeight / crop.size * 100}%`,
+    left: `${-crop.x / crop.size * 100}%`,
+    top: `${-crop.y / crop.size * 100}%`,
+    maxWidth: "none",
+    objectFit: "fill" as const,
+  };
+}
+
 export function normalizeChineseCommunityQrConfig(value: unknown): ChineseCommunityQrConfig | null {
   if (!value || typeof value !== "object") return null;
   const record = value as Record<string, unknown>;
   if (typeof record.imageUrl !== "string" || !record.imageUrl.trim()) return null;
+  const crop = normalizeCrop(record.crop);
   return {
+    ...(crop ? { crop } : {}),
     imageUrl: record.imageUrl.trim(),
     updatedAt: typeof record.updatedAt === "string" && record.updatedAt.trim()
       ? record.updatedAt.trim()

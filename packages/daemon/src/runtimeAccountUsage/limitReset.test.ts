@@ -90,11 +90,11 @@ test("a reason this Raft does not know keeps its kind; an unknown kind is unknow
 test("Claude redeems through OAR with the kind as resetId; without a kind it is unsupported and nothing runs", async () => {
   const { runtime, calls } = runtimeWith({});
   const redeem = createRuntimeLimitResetRedeemer({ runtime });
-  assert.deepEqual(await redeem("claude", KEY), { kind: "unsupported", reason: "capability_unavailable" }, "the Computer never picks a kind");
+  assert.deepEqual(await redeem("claude", KEY, {}), { kind: "unsupported", reason: "capability_unavailable" }, "the Computer never picks a kind");
   assert.equal(calls.length, 0);
 
   const seen: unknown[] = [];
-  assert.deepEqual(await redeem("claude", KEY, "weekly", (report) => seen.push(report)), { kind: "reset" });
+  assert.deepEqual(await redeem("claude", KEY, { kind: "weekly" }, (report) => seen.push(report)), { kind: "reset" });
   assert.deepEqual(calls[0]!.options, { idempotencyKey: KEY, resetId: "weekly", timeoutMs: 75_000 });
   assert.ok(!("fiveHourLimitConsent" in calls[0]!.options), "a redeem never carries consent: the web offers only the 5-hour reset at the limit");
   assert.deepEqual(seen, [{ oarOutcome: "reset" }]);
@@ -103,8 +103,8 @@ test("Claude redeems through OAR with the kind as resetId; without a kind it is 
 test("Codex is unchanged by a kind: no resetId, Codex's own timeout", async () => {
   const { runtime, calls } = runtimeWith({});
   const redeem = createRuntimeLimitResetRedeemer({ runtime });
-  assert.deepEqual(await redeem("codex", KEY), { kind: "reset" });
-  assert.deepEqual(await redeem("codex", KEY, "weekly"), { kind: "reset" });
+  assert.deepEqual(await redeem("codex", KEY, {}), { kind: "reset" });
+  assert.deepEqual(await redeem("codex", KEY, { kind: "weekly" }), { kind: "reset" });
   assert.equal(calls.length, 2);
   assert.deepEqual(calls[1]!.options, { idempotencyKey: KEY, timeoutMs: 20_000 });
 });
@@ -121,6 +121,8 @@ test("OAR 0.102's new redeem answers map onto the wire Raft already speaks", () 
     [{ kind: "unsupported", reason: "unsupported_platform" }, { kind: "unsupported", reason: "unsupported_platform" }],
     [{ kind: "unsupported", reason: "endpoint_unavailable" }, { kind: "unsupported", reason: "endpoint_unavailable" }],
     [{ kind: "unsupported", reason: "unsupported_version" }, { kind: "unsupported", reason: "unsupported_version" }],
+    // OAR 0.110: the CLI predates the capability; the wire's existing "this version can't".
+    [{ kind: "unsupported", reason: "version_unsupported" }, { kind: "unsupported", reason: "unsupported_version" }],
     [{ kind: "unsupported", reason: "reset_id_required" }, { kind: "unsupported", reason: "capability_unavailable" }],
     [{ kind: "unknown" }, { kind: "unknown" }],
     [{ kind: "unknown", fiveHourSpent: true }, { kind: "unknown", fiveHourSpent: true }],
@@ -185,6 +187,8 @@ test("a failed Claude Code start reaches telemetry as OAR's word for the screen 
   const cases: Array<[LimitResetInspection & LimitResetResult, unknown]> = [
     [startupFailed({ screen: "prompt_with_text", version: "2.1.323" }), { oarOutcome: "not_attempted:startup_failed", startupScreen: "prompt_with_text", claudeVersion: "2.1.323" }],
     [startupFailed({ screen: "blank" }), { oarOutcome: "not_attempted:startup_failed", startupScreen: "blank" }],
+    // OAR 0.114: a first-run page it does not complete.
+    [startupFailed({ screen: "onboarding", version: "2.1.322" }), { oarOutcome: "not_attempted:startup_failed", startupScreen: "onboarding", claudeVersion: "2.1.322" }],
     // A word a newer OAR adds reads as unknown; a version that is not a short label is left out.
     [startupFailed({ screen: "upsell_banner", version: "line one\nline two" }), { oarOutcome: "not_attempted:startup_failed", startupScreen: "unknown" }],
     [startupFailed(), { oarOutcome: "not_attempted:startup_failed" }],
@@ -202,6 +206,59 @@ test("a failed Claude Code start reaches telemetry as OAR's word for the screen 
     );
     assert.deepEqual(seen, [expected, expected], JSON.stringify(given));
   }
+});
+
+test("a start stopped at a first-run page is onboarding_required only for a server that reads it; otherwise not_attempted, as before", async () => {
+  const atOnboarding = { kind: "not_attempted", reason: "startup_failed", startup: { screen: "onboarding", version: "2.1.330" } } as LimitResetInspection & LimitResetResult;
+  const otherStart = { kind: "not_attempted", reason: "startup_failed", startup: { screen: "prompt_with_text" } } as LimitResetInspection & LimitResetResult;
+  const ONBOARDING = { kind: "unsupported", reason: "onboarding_required" };
+  const NOT_ATTEMPTED = { kind: "unsupported", reason: "not_attempted" };
+  const read = { atFiveHourLimit: false, atFiveHourLimitConsent: false, includeFiveHour: false };
+  const cases: Array<[LimitResetInspection & LimitResetResult, boolean | undefined, unknown]> = [
+    [atOnboarding, true, ONBOARDING],
+    [atOnboarding, false, NOT_ATTEMPTED],
+    [atOnboarding, undefined, NOT_ATTEMPTED],
+    // Any other start, or another reason nothing was attempted, keeps "nothing was used, try again".
+    [otherStart, true, NOT_ATTEMPTED],
+    [{ kind: "not_attempted", reason: "busy" } as LimitResetInspection & LimitResetResult, true, NOT_ATTEMPTED],
+  ];
+  for (const [given, onboardingRequiredReason, expected] of cases) {
+    const label = `${JSON.stringify(given)} onboardingRequiredReason=${onboardingRequiredReason}`;
+    const flag = onboardingRequiredReason === undefined ? {} : { onboardingRequiredReason };
+    const { runtime } = runtimeWith({ inspect: async () => given, redeem: async () => given });
+    assert.deepEqual(await readOarLimitResets({ provider: "claude", read: { ...read, ...flag }, deps: { runtime } }), expected, `read ${label}`);
+    assert.deepEqual(await redeemOarLimitReset({ provider: "claude", idempotencyKey: KEY, kind: "weekly", ...flag, deps: { runtime } }), expected, `redeem ${label}`);
+    assert.deepEqual(await createRuntimeLimitResetRedeemer({ runtime })("claude", KEY, { kind: "weekly", ...flag }), expected, `redeemer ${label}`);
+    assert.deepEqual(projectOarLimitResetResult(given, flag), expected, `projected redeem ${label}`);
+    assert.deepEqual(projectOarLimitResetInspection(given, flag), expected, `projected read ${label}`);
+  }
+});
+
+test("OAR completing Claude Code's first-run onboarding on the way reaches telemetry, whatever the answer", async () => {
+  const cases: Array<[LimitResetInspection, LimitResetResult, unknown, unknown]> = [
+    [
+      { kind: "inspected", version: "2.1.322", onboardingCompleted: true, resets: [{ id: "weekly", state: "none" }] },
+      { kind: "reset", onboardingCompleted: true },
+      { oarOutcome: "inspected", claudeVersion: "2.1.322", onboardingCompleted: true },
+      { oarOutcome: "reset", onboardingCompleted: true },
+    ],
+    // Onboarding done, then another screen stopped the start.
+    [
+      { kind: "not_attempted", reason: "startup_failed", startup: { screen: "trust_unrecognised" }, onboardingCompleted: true },
+      { kind: "not_attempted", reason: "startup_failed", startup: { screen: "trust_unrecognised" }, onboardingCompleted: true },
+      { oarOutcome: "not_attempted:startup_failed", startupScreen: "trust_unrecognised", onboardingCompleted: true },
+      { oarOutcome: "not_attempted:startup_failed", startupScreen: "trust_unrecognised", onboardingCompleted: true },
+    ],
+  ];
+  for (const [inspection, redeemed, readReport, redeemReport] of cases) {
+    const { runtime } = runtimeWith({ inspect: async () => inspection, redeem: async () => redeemed });
+    const seen: unknown[] = [];
+    await readOarLimitResets({ provider: "claude", read: { atFiveHourLimit: false, atFiveHourLimitConsent: false, includeFiveHour: false }, deps: { runtime }, observe: (report) => seen.push(report) });
+    await redeemOarLimitReset({ provider: "claude", idempotencyKey: KEY, kind: "weekly", deps: { runtime }, observe: (report) => seen.push(report) });
+    assert.deepEqual(seen, [readReport, redeemReport], JSON.stringify(inspection));
+  }
+  // Not on the wire: the answer is the same as without it.
+  assert.deepEqual(projectOarLimitResetResult({ kind: "reset", onboardingCompleted: true }), { kind: "reset" });
 });
 
 test("a read at the 5-hour limit without consent is refused before Claude Code starts; clear of it, OAR checks again itself", async () => {
@@ -227,6 +284,7 @@ test("a read's other answers: legacy program, not attempted, unsupported platfor
     [{ kind: "not_attempted", reason: "startup_failed" }, { kind: "unsupported", reason: "not_attempted" }],
     [{ kind: "unsupported", reason: "unsupported_platform" }, { kind: "unsupported", reason: "unsupported_platform" }],
     [{ kind: "unsupported", reason: "endpoint_unavailable" }, { kind: "unsupported", reason: "endpoint_unavailable" }],
+    [{ kind: "unsupported", reason: "version_unsupported" }, { kind: "unsupported", reason: "unsupported_version" }],
     [{ kind: "reauth_required", reason: "not_authenticated" }, { kind: "reauth_required", reason: "not_authenticated" }],
     [{ kind: "unknown" }, { kind: "unknown" }],
   ];

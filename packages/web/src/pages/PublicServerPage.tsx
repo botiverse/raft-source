@@ -13,6 +13,7 @@ import ColumnResizeHandle from "../components/ui/ColumnResizeHandle";
 import EmptyState from "../components/ui/EmptyState";
 import { useLocation } from "react-router-dom";
 import MessageLinkUnavailable from "../components/deeplinks/MessageLinkUnavailable";
+import { OpenInAppOffers } from "../components/deeplinks/OpenInAppOffers";
 import { conversationPathOf, usePublicDeepLinksFlag } from "../components/deeplinks/deepLinksFlag";
 import { isMessageLinkLanding, isThreadMismatch, parseMessageLink } from "../utils/messageLinkLanding";
 import type { ReadOnlySenderProjection } from "../components/message/MessageItem";
@@ -291,6 +292,7 @@ export default function PublicServerPage({
   const [phoneView, setPhoneView] = useState<"list" | "channel">(initialChannelId ? "channel" : "list");
   const phoneShowsList = !isSmUp && phoneView === "list";
   const phoneShowsChannel = !isSmUp && phoneView === "channel";
+  const [openThread, setOpenThread] = useState<OpenPublicThread | null>(null);
   const showPhoneChannelList = useCallback(() => {
     setPhoneView("list");
     setOpenThread(null);
@@ -304,7 +306,6 @@ export default function PublicServerPage({
   // the one left sidebar, and the thread is the one thread column, wherever they are shown.
   const sidebarWidth = useColumnWidth("sidebar");
   const threadPanelWidth = useColumnWidth("thread");
-  const [openThread, setOpenThread] = useState<OpenPublicThread | null>(null);
   const [threadMessages, setThreadMessages] = useState<PublicMessage[]>([]);
   const [threadLoading, setThreadLoading] = useState(false);
   const [threadError, setThreadError] = useState("");
@@ -732,6 +733,7 @@ export default function PublicServerPage({
     // bottom banner's "Join as Guest" off screen.
     <ReadOnlyAttachmentUrlContext.Provider value={attachmentUrls}>
     <AppShellRoot className="h-dvh flex-col overflow-hidden font-display" data-testid="public-server-page">
+      <OpenInAppOffers slot="top" />
       <div className="relative flex min-h-0 flex-1" data-testid="public-server-app-shell">
         {publicProjection ? (
           <AppShellRailSlot>
@@ -911,6 +913,7 @@ export default function PublicServerPage({
         </div>
       </div>
 
+      <OpenInAppOffers slot="bottom" />
       {serverSelectionNotice ? (
         <Banner intent="info" density="sm" className={FLOATING_NOTICE_CLASS_TOP} data-testid="public-server-selection-notice" actions={<Button size="md" variant="outline" onClick={onSignIn} {...SIGN_IN_WARMUP}>{formatMessage({ id: "pages.publicServer.signIn" })}</Button>}>
           {formatMessage({ id: "pages.publicServer.banner" })}

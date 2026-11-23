@@ -167,6 +167,7 @@ const MEMBER_REFUSAL_IDS: Record<string, MessageId> = {
   server_membership_required: "externalInvite.error.serverMembershipRequired",
   invalid_server: "externalInvite.error.invalidServer",
   channel_archived: "externalInvite.error.archived",
+  channel_name_taken: "externalInvite.error.channelNameTaken",
   channel_full: "serverConnectRequest.error.channelFull",
   joint_server_limit: "serverConnectRequest.error.channelFull",
 };

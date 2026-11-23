@@ -125,7 +125,6 @@ function seedStores() {
       return { data: { items: [], hasMore: false, totalCount: 0, totalUnreadCount: 0 } };
     }
     if (url === "/servers/unread-summary") return { data: [] };
-    if (url === "/provider-connections") return { data: { connections: [], providerOptions: [] } };
     if (url.includes("/runtime-account-usage/")) return { data: { state: "missing", snapshot: null } };
     return { data: [] };
   }) as typeof api.get;

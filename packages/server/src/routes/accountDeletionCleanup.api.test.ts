@@ -18,6 +18,8 @@ import {
   inboxNotificationFacts,
   integrationAuditEvents,
   machines,
+  managedMcpAssignments,
+  managedMcpCredentials,
   newsletterAudienceContacts,
   notificationOutbox,
   objectInboxStates,
@@ -52,6 +54,9 @@ import { deleteStoredUserAvatarIfUnused, isUserAvatarHashStillShown } from "../s
 import { agentHandedOverNoticeText } from "../services/agentActionRequiredNoticeService";
 import { __setEmailDeliveryObserverForTests, type EmailDelivery } from "../services/emailService";
 import { listMessages } from "../services/messageService";
+import { decryptManagedMcpSecret, encryptManagedMcpSecret } from "../services/managedMcpCredentialService";
+import { createManagedMcpServer, setManagedMcpAssignment } from "../services/managedMcpService";
+import type { ManagedMcpOAuthStorage } from "../services/managedMcpOAuthProvider";
 import { addMember } from "../services/serverService";
 import { createUser } from "../services/userService";
 import { signInForTest, signInThroughSecondStepForTest } from "../test/integration/credentials";
@@ -744,4 +749,56 @@ test("the scheduled onboarding email's send time goes to the cancel, so a Resend
   await runUntilCompleted(human.id, { deps });
   assert.deepEqual(seen, [{ emailId: `email-${human.id}`, scheduledAt }]);
   assert.equal((await getDb().select().from(onboardingEmailJourneys).where(eq(onboardingEmailJourneys.userId, human.id))).length, 0);
+});
+
+test("MCP Connections signed in as the person: admins told with the date at the request; at the deletion the OAuth one is disconnected, the API-key one kept", async ({ seed }) => {
+  const previousKey = process.env.SLOCK_MCP_CREDENTIAL_KEY;
+  process.env.SLOCK_MCP_CREDENTIAL_KEY = Buffer.alloc(32, 31).toString("base64");
+  const emails = captureEmails();
+  try {
+    const human = await seed.human({ displayName: "Ada" });
+    const owner = await seed.human();
+    const server = await seed.server({ owner, members: [human] });
+    const db = getDb();
+    const notion = await createManagedMcpServer({ serverId: server.id, userId: owner.id, name: "Notion", authMode: "oauth", endpointUrl: "https://mcp.example.test/notion" });
+    const storage: ManagedMcpOAuthStorage = { redirectUrl: "https://raft.example.test/api/mcp/oauth/callback", tokens: { access_token: "ada-access", token_type: "Bearer", refresh_token: "ada-refresh" } };
+    const [oauth] = await db.update(managedMcpCredentials)
+      .set({ encryptedOAuth: encryptManagedMcpSecret(storage), authStatus: "ready", accountLabel: "Acme", signedInByUserId: human.id })
+      .where(eq(managedMcpCredentials.mcpServerId, notion.id)).returning();
+    const agent = await createAgent(server.id, "notion-user", { creatorType: "user", creatorId: owner.id });
+    await setManagedMcpAssignment({ serverId: server.id, userId: owner.id, agentId: agent.id, mcpServerId: notion.id, connectionId: oauth!.id });
+    const docs = await createManagedMcpServer({ serverId: server.id, userId: human.id, name: "Docs", authMode: "headers", endpointUrl: "https://mcp.example.test/docs", headers: { "X-Api-Key": "ada-key" } });
+    const [header] = await db.select().from(managedMcpCredentials).where(eq(managedMcpCredentials.mcpServerId, docs.id));
+    assert.equal(header!.signedInByUserId, human.id);
+
+    await dueRequest(human);
+    const [notice] = await db.select().from(notificationOutbox).where(and(eq(notificationOutbox.receiverId, owner.id), sql`${notificationOutbox.eventKey} like 'mcp_connections_account_deletion:%'`));
+    const body = (notice!.payload as { body: string }).body;
+    assert.match(body, /Notion \(Acme\), signed in by Ada: this stops on /);
+    assert.match(body, /Docs, added by Ada[;.]/);
+    assert.doesNotMatch(body, /Docs, added by Ada: this stops/, "an API key does not stop");
+    const requested = emails.deliveries.find((delivery) => delivery.to === human.email && /will be deleted/.test(delivery.subject));
+    assert.match(requested!.text!, /these Apps are signed in with your own account and stay connected until then: Notion \(Acme\)\. They will be disconnected on /);
+    assert.doesNotMatch(requested!.text!, /Docs/);
+    assert.equal((await db.select().from(managedMcpCredentials).where(eq(managedMcpCredentials.id, oauth!.id)))[0]!.authStatus, "ready", "nothing is revoked during the grace period");
+
+    await runAccountDeletionCleanup({ deps: externalCalls().deps });
+    const [revoked] = await db.select().from(managedMcpCredentials).where(eq(managedMcpCredentials.id, oauth!.id));
+    assert.equal(revoked!.authStatus, "needs_auth");
+    assert.equal((decryptManagedMcpSecret(revoked!.encryptedOAuth!) as ManagedMcpOAuthStorage).tokens, undefined, "the tokens are deleted");
+    assert.equal(revoked!.signedInByUserId, null);
+    assert.equal(revoked!.isServerDefault, true, "the Connection, its default flag and its pins stay");
+    const [pin] = await db.select().from(managedMcpAssignments).where(eq(managedMcpAssignments.agentId, agent.id));
+    assert.deepEqual({ mode: pin!.connectionMode, bound: pin!.boundConnectionId }, { mode: "pinned", bound: oauth!.id });
+    const [kept] = await db.select().from(managedMcpCredentials).where(eq(managedMcpCredentials.id, header!.id));
+    assert.deepEqual(
+      { status: kept!.authStatus, headers: kept!.encryptedHeaders, signedInBy: kept!.signedInByUserId },
+      { status: "ready", headers: header!.encryptedHeaders, signedInBy: human.id },
+      "an API key is not revoked",
+    );
+  } finally {
+    emails.stop();
+    if (previousKey === undefined) delete process.env.SLOCK_MCP_CREDENTIAL_KEY;
+    else process.env.SLOCK_MCP_CREDENTIAL_KEY = previousKey;
+  }
 });

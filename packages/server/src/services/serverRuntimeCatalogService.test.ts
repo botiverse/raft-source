@@ -40,6 +40,19 @@ test("deprecated, experimental and OAR-only runtimes are flagged, not dropped", 
   assert.deepEqual(byId.get("qwen")?.models, []);
 });
 
+test("DeepSeek Harness is listed (experimental, OAR-only, live models, v2 form), with no server switch", () => {
+  const byId = new Map(projectServerRuntimeCatalog(ALL_ON).runtimes.map((runtime) => [runtime.id, runtime]));
+  const dsh = byId.get("dsh");
+  assert.equal(dsh?.displayName, "DeepSeek Harness");
+  assert.equal(dsh?.binary, "dsh");
+  assert.equal(dsh?.experimental, true);
+  assert.equal(dsh?.oarOnly, true);
+  assert.equal(dsh?.modelsSource, "fallback");
+  assert.deepEqual(dsh?.forms, [{ kind: "generic" }, { kind: "v2" }]);
+  // No switch: the fail-closed default (a flag store error) still lists it.
+  assert.equal(projectServerRuntimeCatalog(DEFAULT_RUNTIME_ADMISSION_POLICY).runtimes.some((runtime) => runtime.id === "dsh"), true);
+});
+
 test("a runtime with a v1 form lists that form instead of the generic one", () => {
   const byId = new Map(projectServerRuntimeCatalog(ALL_ON).runtimes.map((runtime) => [runtime.id, runtime]));
   assert.deepEqual(byId.get("kimi-sdk")?.forms, [
@@ -78,10 +91,17 @@ test("a failing flag store leaves the runtimes without a switch listed", async (
   assert.ok(ids.includes("claude"));
 });
 
-test("a deprecated runtime revived by its OAR flag is listed as not deprecated", () => {
-  const revived = { disabledRuntimeIds: new Set<string>(), revivedRuntimeIds: new Set(["antigravity"]) };
-  const byId = new Map(projectServerRuntimeCatalog(revived).runtimes.map((runtime) => [runtime.id, runtime]));
-  assert.equal(byId.get("antigravity")?.deprecated, false);
-  assert.equal(byId.get("gemini")?.deprecated, true);
-  assert.equal(new Map(projectServerRuntimeCatalog(ALL_ON).runtimes.map((runtime) => [runtime.id, runtime])).get("antigravity")?.deprecated, true);
-});
+for (const flag of [true, false]) {
+  test(`Antigravity is listed as not deprecated, still experimental, with agent_runtime_oar_antigravity ${flag ? "on" : "off"}`, async () => {
+    const policy = await resolveRuntimeAdmissionPolicy(
+      { serverId: "server-a", userId: "user-a" },
+      (async (requests: Array<{ key: string }>) =>
+        requests.map((request) => ({ key: request.key, enabled: flag && request.key === "agent_runtime_oar_antigravity" }))) as never,
+    );
+    const byId = new Map(projectServerRuntimeCatalog(policy).runtimes.map((runtime) => [runtime.id, runtime]));
+    assert.equal(byId.get("antigravity")?.deprecated, false);
+    // Labelled Experimental until it has enough users and few problems.
+    assert.equal(byId.get("antigravity")?.experimental, true);
+    assert.equal(byId.get("gemini")?.deprecated, true);
+  });
+}

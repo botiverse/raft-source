@@ -95,13 +95,32 @@ function tokenCounts(tokens: OarTokenTotals): TurnTokenCounts {
 export const OAR_TURN_EXIT_WAIT_MS = 5_000;
 
 /**
- * A runtime's refusal on a trace: its class, fingerprint and HTTP status,
+ * A runtime's refusal on a trace span: its class, fingerprint and HTTP status,
  * never its text. Nothing when there is no reason to classify.
  */
 export function refusalTraceAttrs(reason: string | null | undefined): Record<string, unknown> {
   if (!reason) return {};
   const { runtime_error_class, runtime_error_fingerprint, runtime_error_http_status } = buildRuntimeErrorDiagnosticEnvelope(reason).spanAttrs;
   return { refusal_class: runtime_error_class, refusal_fingerprint: runtime_error_fingerprint, refusal_http_status: runtime_error_http_status };
+}
+
+/**
+ * A runtime's refusal on a log event (`daemon.agent.oar.delivery`): class,
+ * fingerprint, HTTP status, plus the bounded, scrubbed error excerpt (same
+ * redaction as `daemon.runtime.error`). Nothing when there is no reason.
+ */
+export function refusalEventAttrs(reason: string | null | undefined): Record<string, unknown> {
+  if (!reason) return {};
+  const envelope = buildRuntimeErrorDiagnosticEnvelope(reason);
+  const { runtime_error_class, runtime_error_fingerprint, runtime_error_http_status, runtime_error_message_truncated } = envelope.spanAttrs;
+  const excerpt = envelope.eventAttrs.runtime_error_message_excerpt;
+  return {
+    refusal_class: runtime_error_class,
+    refusal_fingerprint: runtime_error_fingerprint,
+    ...(runtime_error_http_status !== undefined ? { refusal_http_status: runtime_error_http_status } : {}),
+    ...(typeof excerpt === "string" && excerpt.length > 0 ? { runtime_error_message_excerpt: excerpt } : {}),
+    ...(runtime_error_message_truncated ? { runtime_error_message_truncated: true } : {}),
+  };
 }
 
 export class OarTurnTrace {

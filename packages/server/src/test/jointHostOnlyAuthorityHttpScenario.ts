@@ -77,7 +77,7 @@ export async function jointHostOnlyAuthorityHttpScenario(
   await changeChannelMembershipRole({
     serverId: h.id,
     channelId: made.channel.id,
-    requesterUserId: owner.id,
+    requester: { type: "user", id: owner.id },
     targetType: "user",
     targetId: manager.id,
     nextRole: "admin",

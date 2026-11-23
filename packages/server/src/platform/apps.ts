@@ -27,6 +27,7 @@ import type {
   AgentApiRouteKey,
   ObjectActivityTarget,
   ObjectActivityUnread,
+  ObjectChangedPart,
   ObjectDeletedOf,
   ObjectSummary,
   PaywallHitVia,
@@ -601,10 +602,11 @@ export interface AppPurgeServerOptions {
   limit: number;
   mode: "count" | "delete";
   /**
-   * The server's channels the purge keeps (joint channels and projections,
-   * migration receipt channels, and what is under them): other servers still
-   * see what is in them, so the app keeps every object homed in one, in both
-   * modes, and `remaining` doesn't count them. Absent: none kept.
+   * The channels the purge keeps (the server's joint channels and
+   * projections, migration receipt channels, the storage channels of every
+   * joint the server is still in, and what is under them): other servers
+   * still see what is in them, so the app keeps every object homed in one, in
+   * both modes, and `remaining` doesn't count them. Absent: none kept.
    */
   keepChannelIds?: readonly string[];
 }
@@ -719,6 +721,44 @@ export interface AppObjectKind {
    */
   fileReadable?(objectId: string, parent: string): Promise<boolean>;
   /**
+   * Links (core's services/profileDescriptionLinks.ts: what a saved profile
+   * description links that some of its readers can't open): the id of the
+   * object this one link names, or null when it names none of this kind's
+   * (another app's link, any other address, or one of this kind's that names
+   * no id: by an old name, say). Only reads the link: synchronous, no
+   * database, any host it accepts is the app's to know (platform/links
+   * appHosts). Whether the object exists and who sees it are core's, from
+   * `homes`.
+   */
+  linkId?(url: string): string | null;
+  /**
+   * The hosts, besides Raft's own app hosts (platform/links appHosts), on
+   * which `linkId` can name an object: lowercased, each matched as text in a
+   * message's lowercased content, so a parent domain (`raftusercontent.com`)
+   * stands for its subdomains. Core reads a message's links for its
+   * object_references (services/messageReferences.ts, #proj-workspace:#336)
+   * only when its text names one of these or an app host: a message without
+   * one costs no work and no query. A link `linkId` accepts on any other host
+   * is not recorded as a reference. Only with `linkId`.
+   */
+  linkHosts?: readonly string[];
+  /**
+   * Messages that link these objects (core's
+   * services/firstPartyAppMessageLinks.ts, called from messageService
+   * broadcastAndDeliver): once for each new ordinary message a person or an
+   * agent posts (never an idempotent replay, an edit, a system message), with
+   * the ids `linkId` reads from the message's visible links (shared
+   * messageVisibleLinks: the links the web reads object cards from), each
+   * once, in message order, among the first MESSAGE_OBJECT_LINK_LIMIT
+   * object links of the message (as the web reads cards). Only a kind that
+   * declares `linkId`. After the send committed, outside any transaction,
+   * not awaited by the send: it can neither slow nor fail the send, and a
+   * throw is logged and lost. Whether the author or anyone else may see an
+   * object is the app's to check; core has checked nothing beyond the send's
+   * own checks.
+   */
+  linkedInMessage?(message: AppLinkingMessage, ids: readonly string[]): Promise<void>;
+  /**
    * Channel announcements (channel_announcement_v0; core's
    * services/channelAnnouncements.ts): this kind's objects may be a channel's
    * announcement, one object homed in that channel. At most one registered
@@ -732,6 +772,32 @@ export interface AppObjectKind {
   channelAnnouncement?: {
     headlines(ids: readonly string[], reader?: AppActor): Promise<ReadonlyMap<string, AppObjectHeadline>>;
   };
+  /**
+   * Live pings (core's `object:watch`, socket/objectWatch.ts; shared
+   * objectWatch.ts): whether the socket's person, in the socket's server
+   * (`reader`), reads the object `ref` names now, by the app's own read rule
+   * (the one its page's reads answer by), and which parts of it they read.
+   * The answer is the object's own id (the one the app's pings name,
+   * platform/objectWatch announceObjectChanged) and those parts; null when
+   * they can't read it (no such object, not theirs, the app off): core then
+   * joins nothing. Only reads. Without it, the kind's objects can't be watched.
+   */
+  watch?(reader: AppWebReader, ref: string): Promise<{ id: string; parts: readonly ObjectChangedPart[] } | null>;
+}
+
+/** A new message that links objects of a kind (AppObjectKind.linkedInMessage). */
+export interface AppLinkingMessage {
+  id: string;
+  /** Who posted it: a person (an assistant sending as its owner included: the owner) or an agent. */
+  author: AppActor;
+  /**
+   * The server it was posted through: the conversation's own, a joint's as
+   * the author's server has it (platform/messages messageSource with the
+   * author in this server finds where it is).
+   */
+  serverId: ServerId;
+  /** The first-party app that posted it as the author (services/firstPartyAppMessages, an Artifact's share), else null. */
+  postedByApp: string | null;
 }
 
 /** What a channel's announcement shows of its object (AppObjectKind.channelAnnouncement). */

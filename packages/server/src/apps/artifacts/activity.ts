@@ -13,12 +13,13 @@
 // otherwise only live comments by others after it that mention the person.
 //
 // Each function is one query however many Artifacts (two for details).
-import { sql } from "drizzle-orm";
-import { asArtifactCommentId, asArtifactReviewId, type ArtifactActivityTarget } from "@botiverse/raft-shared";
+import { inArray, sql } from "drizzle-orm";
+import { asArtifactCommentId, asArtifactReviewId, type ArtifactActivityTarget, type ServerId } from "@botiverse/raft-shared";
 import { forgetObjectActivity, objectActivityPeople, type ForgottenActivityRow } from "../../platform/activity";
 import { getDb, type DatabaseExecutor } from "../../platform/db";
 import type { AppObjectActivityDetail, AppObjectActivityRow, AppObjectUnread, AppWebReader } from "../../platform/apps";
 import { excerptOf, reportRead } from "./apiCommon";
+import { settledServers } from "./settledState";
 import { ARTIFACT_OBJECT_KIND } from "./kinds";
 import { artifactComments, artifactItems, artifactReadPositions, artifactSubscriptions, artifactVersions, type ArtifactActorType } from "./schema";
 
@@ -73,8 +74,11 @@ export async function artifactUnreadFor(reader: AppWebReader, ids: readonly stri
  * absent when none). The row reached the reader only while they
  * can see the Artifact (core's check), so they can see its comments. The target: the row's newest
  * event, its comment (on that comment's version) while live, else the
- * version it names; a review's also its id and how many comments it posted.
- * Two queries.
+ * version it names; a review's also its id and how many comments it posted;
+ * a version that took a settled Artifact back to Working (#334) also the
+ * version it had been settled at (`wasSettled`, while Settled is on for its
+ * server: one more query, only for such rows). A `settled` or `unsettled`
+ * event (recorded read: settle.ts) opens at the version it names. Two queries.
  */
 export async function artifactActivityDetails(reader: AppWebReader, rows: readonly AppObjectActivityRow[]): Promise<ReadonlyMap<string, AppObjectActivityDetail>> {
   if (rows.length === 0) return new Map();
@@ -103,6 +107,14 @@ export async function artifactActivityDetails(reader: AppWebReader, rows: readon
       FROM ${artifactComments} c LEFT JOIN ${artifactVersions} cv ON cv.id = c.version_id
       WHERE c.id IN (${textList(latestComments)}) AND c.deleted_at IS NULL`)).rows as Array<Record<string, unknown>>
     : [];
+  // A version that ended a settle says so only while Settled is on for its Artifact's server (#334): one query, only when there are such rows.
+  const endedSettle = (row: AppObjectActivityRow) => row.latest.eventKind === "version" && typeof row.latest.data.wasSettled === "number";
+  const ending = [...new Set(rows.filter(endedSettle).map((row) => row.id))];
+  const endingServers = ending.length > 0
+    ? new Map((await db.select({ id: artifactItems.id, serverId: artifactItems.serverId }).from(artifactItems).where(inArray(artifactItems.id, ending))).map((item) => [item.id, item.serverId]))
+    : new Map<string, ServerId>();
+  const settledOn = await settledServers([...endingServers.values()]);
+  const showsWasSettled = (row: AppObjectActivityRow) => endedSettle(row) && settledOn.has(endingServers.get(row.id)!);
   const unreadOf = new Map(unread.map((row) => [String(row.item_id), row]));
   const latestOf = new Map(latest.map((row) => [String(row.id), row]));
   const details = new Map<string, AppObjectActivityDetail>();
@@ -133,9 +145,11 @@ export async function artifactActivityDetails(reader: AppWebReader, rows: readon
       : typeof version === "number" ? { version } : null;
     // A review (reviews.ts writeReview's event data) also names itself and its size.
     const { review, comments } = row.latest.data;
-    const target = base && row.latest.eventKind === "review" && typeof review === "string" && typeof comments === "number"
+    const reviewed = base && row.latest.eventKind === "review" && typeof review === "string" && typeof comments === "number"
       ? { ...base, review: { id: asArtifactReviewId(review), comments } }
       : base;
+    // A version that took a settled Artifact back to Working (#334, publish.ts's event data) says which settle it ended.
+    const target = reviewed && showsWasSettled(row) ? { ...reviewed, wasSettled: row.latest.data.wasSettled as number } : reviewed;
     details.set(row.id, { preview, target });
   }
   return details;

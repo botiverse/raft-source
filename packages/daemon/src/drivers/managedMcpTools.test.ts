@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { MCP_OUTCOME_UNKNOWN_TEXT } from "@botiverse/raft-shared";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import { createManagedMcpPiTools } from "./managedMcpTools";
 import { afterEach, test } from "vitest";
 import { RuntimeTurnOriginHolder } from "../runtimeTurnOrigin";
@@ -53,6 +54,119 @@ test("managed MCP Pi tools freeze the snapshot and proxy calls through agent-api
     expectedConfigVersion: 3,
     expectedAssignmentVersion: 4,
   });
+});
+
+async function singleManagedTool(inputSchema: Record<string, unknown>) {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    calls.push({ url, init });
+    if (url.endsWith("/mcp/tools")) {
+      return new Response(JSON.stringify({
+        catalogVersion: 1,
+        tools: [{
+          mcpServerId: "11111111-1111-4111-8111-111111111111",
+          serverName: "Notion",
+          toolName: "move-pages",
+          runtimeName: "mcp_11111111_move-pages_deadbeef",
+          inputSchema,
+          configVersion: 3,
+          assignmentVersion: 4,
+        }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ content: [{ type: "text", text: "moved" }], isError: false }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+  const [tool] = await createManagedMcpPiTools({ serverUrl: "https://raft.test", agentCredentialKey: "sk_agent_test" });
+  assert.ok(tool?.prepareArguments);
+  return { tool, prepare: tool.prepareArguments, calls };
+}
+
+test("⭐ managed MCP Pi tools decode a JSON-string object argument where the schema wants an object (task #triage:#431)", async () => {
+  const { tool, prepare, calls } = await singleManagedTool({
+    type: "object",
+    properties: {
+      new_parent: {
+        anyOf: [
+          { type: "object", properties: { page_id: { type: "string" } }, required: ["page_id"] },
+          { type: "object", properties: { database_id: { type: "string" } }, required: ["database_id"] },
+        ],
+      },
+      title: { type: "string" },
+    },
+    required: ["new_parent"],
+  });
+  const raw = { new_parent: JSON.stringify({ page_id: "page-1" }), title: "{\"stays\":\"a string\"}" };
+  const toolCall = { type: "toolCall" as const, id: "call-1", name: tool.name, arguments: raw };
+
+  // Pi's own validation coerces scalars but never JSON-parses: without the repair the call fails.
+  assert.throws(() => validateToolArguments(tool, toolCall), /new_parent/u);
+
+  const prepared = prepare(raw) as Record<string, unknown>;
+  assert.deepEqual(prepared, { new_parent: { page_id: "page-1" }, title: "{\"stays\":\"a string\"}" });
+  assert.equal(raw.new_parent, "{\"page_id\":\"page-1\"}", "the transcript's arguments are not mutated");
+  const validated = validateToolArguments(tool, { ...toolCall, arguments: prepared });
+  await tool.execute("call-1", validated, undefined, undefined, {} as never);
+  assert.deepEqual(JSON.parse(String(calls[1].init?.body)).arguments, prepared);
+});
+
+test("managed MCP argument repair leaves string-accepting unions, malformed JSON and mismatched kinds alone", async () => {
+  const { prepare } = await singleManagedTool({
+    type: "object",
+    properties: {
+      string_or_object: { anyOf: [{ type: "string" }, { type: "object" }] },
+      nullable_string: { type: ["string", "null"] },
+      unconstrained: { description: "anything" },
+      object_only: { type: "object" },
+      malformed: { type: "object" },
+      object_but_got_array: { type: "object" },
+    },
+  });
+  const raw = {
+    string_or_object: "{\"a\":1}",
+    nullable_string: "{\"a\":1}",
+    unconstrained: "{\"a\":1}",
+    object_only: { already: "an object" },
+    malformed: "{not-json",
+    object_but_got_array: "[1,2]",
+  };
+  assert.equal(prepare(raw), raw, "nothing to repair returns the same arguments object");
+});
+
+test("managed MCP argument repair decodes JSON-string arrays only where the schema wants an array", async () => {
+  const { prepare } = await singleManagedTool({
+    type: "object",
+    properties: {
+      ids: { type: "array", items: { type: "string" } },
+      ref_ids: { $ref: "#/$defs/idList" },
+      array_but_got_object: { type: "array" },
+      single_id: { type: "array", items: { type: "string" } },
+    },
+    $defs: { idList: { type: "array", items: { type: "number" } } },
+  });
+  assert.deepEqual(prepare({
+    ids: "[\"a\",\"b\"]",
+    ref_ids: "[1,2]",
+    array_but_got_object: "{\"a\":1}",
+    single_id: "a",
+  }), {
+    ids: ["a", "b"],
+    ref_ids: [1, 2],
+    array_but_got_object: "{\"a\":1}",
+    single_id: "a",
+  });
+});
+
+test("managed MCP argument repair decodes a whole-arguments JSON string, then its properties", async () => {
+  const { prepare } = await singleManagedTool({
+    type: "object",
+    properties: { filter: { type: "object" } },
+  });
+  assert.deepEqual(prepare(JSON.stringify({ filter: "{\"status\":\"open\"}" })), { filter: { status: "open" } });
+  assert.equal(prepare("not json"), "not json");
 });
 
 test("managed MCP snapshot failures are non-fatal and bounded", async () => {

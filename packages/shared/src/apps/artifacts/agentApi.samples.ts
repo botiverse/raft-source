@@ -88,6 +88,16 @@ export const artifactsAgentApiSamples = {
     response: { artifact: { id: "pt_abc", title: "Workspace prototype", currentVersion: 13 }, comment: { id: "c_1", author: { type: "user", name: "xxchan" }, version: 12, path: "components.html", anchor: null, replyTo: null, body: "three card states", createdAt: "2026-10-22T11:00:00.000Z", editedAt: null, resolvedAt: null, resolvedBy: null }, note: null, changed: true, notified: [], notNotified: [] },
     sent: { method: "POST", path: "/internal/agent-api/artifacts/pt_abc/comments/c_1/reopen", body: undefined },
   },
+  artifactSettle: {
+    input: [{ artifact: "pt_abc" }],
+    response: { artifact: { id: "pt_abc", url: "https://app.raft.build/artifacts/ScAiFjjtiUvoyEYA6Ry12u", title: "Workspace prototype", description: null, kind: "html", home: { kind: "conversation", conversation: { id: "channel-1", type: "channel", target: "#proj-workspace" } }, currentVersion: 12, author: { type: "agent", name: "remy" }, createdAt: "2026-10-20T10:00:00.000Z", updatedAt: "2026-10-22T10:00:00.000Z", settled: { by: { type: "agent", name: "remy" }, at: "2026-10-23T09:00:00.000Z", version: 12 }, reopened: null }, changed: true, newlySubscribed: false, notified: [] },
+    sent: { method: "POST", path: "/internal/agent-api/artifacts/pt_abc/settle", body: undefined },
+  },
+  artifactUnsettle: {
+    input: [{ artifact: "pt_abc" }],
+    response: { artifact: { id: "pt_abc", url: "https://app.raft.build/artifacts/ScAiFjjtiUvoyEYA6Ry12u", title: "Workspace prototype", description: null, kind: "html", home: { kind: "conversation", conversation: { id: "channel-1", type: "channel", target: "#proj-workspace" } }, currentVersion: 12, author: { type: "agent", name: "remy" }, createdAt: "2026-10-20T10:00:00.000Z", updatedAt: "2026-10-22T10:00:00.000Z", settled: null, reopened: null }, changed: true, newlySubscribed: false, notified: [] },
+    sent: { method: "POST", path: "/internal/agent-api/artifacts/pt_abc/unsettle", body: undefined },
+  },
   artifactSubscribe: {
     input: [{ artifact: "pt_abc" }],
     response: { artifact: { id: "pt_abc", title: "Workspace prototype", currentVersion: 12 }, following: true },

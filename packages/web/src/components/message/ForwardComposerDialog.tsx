@@ -4,6 +4,7 @@ import { createPortal } from "react-dom";
 import { useIntl } from "react-intl";
 import type { Channel } from "../../store/channelStore";
 import { useChannelStore } from "../../store/channelStore";
+import { useForwardActivity } from "./useForwardActivity";
 import { findStoredChannel } from "../../store/storedChannel";
 import type { Message } from "../../store/messageStore";
 import { useMessageStore } from "../../store/messageStore";
@@ -88,7 +89,7 @@ export default function ForwardComposerDialog({
   sourceChannel,
   sourceLabel,
   sourceParentChannelId,
-  channelActivity = NO_ACTIVITY,
+  orderByChannelActivity = false,
   skippedCount = 0,
   nestedForwardCount = 0,
   onClose,
@@ -98,13 +99,15 @@ export default function ForwardComposerDialog({
   sourceChannel: Channel;
   sourceLabel?: string;
   sourceParentChannelId?: string | null;
-  channelActivity?: Record<string, string | null>;
+  /** Destinations in order of each conversation's latest activity as it was when the dialog opened. */
+  orderByChannelActivity?: boolean;
   skippedCount?: number;
   nestedForwardCount?: number;
   onClose: () => void;
   onSent: (deliveries: ForwardDelivery[]) => void;
 }) {
   const destinations = useForwardDestinations();
+  const channelActivity = useForwardActivity(orderByChannelActivity);
   const source = useMessageForwardSource({ sourceMessages, sourceChannel, sourceLabel, sourceParentChannelId, skippedCount, nestedForwardCount, onSent });
   // Messages can go into a thread or a task discussion: the picker offers recent ones, the one it was opened from first.
   const conversations = useMemo(() => ({ currentChannelId: sourceChannel.type === "thread" ? sourceChannel.id : null }), [sourceChannel.type, sourceChannel.id]);

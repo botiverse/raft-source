@@ -14,8 +14,8 @@ import { signInForTest } from "../test/integration/credentials";
 import type { createSeed } from "../test/integration/seed";
 
 // Computer owner v1 (#wg-rbac:#32): PUT /api/servers/:id/machines/:machineId/owner. Public (no owner) by
-// default; owner/admin assign, transfer and clear; the current owner transfers or clears; the connector may
-// only claim a Public Computer they connected; the new owner is a non-Guest person in the server. Audited,
+// default; owner/admin assign, transfer and clear; the current owner transfers or clears; the connector (the
+// live attacher, computerControllerUserId) may only claim a Public Computer they connected; the new owner is a non-Guest person in the server. Audited,
 // the new owner notified; leaving the server makes their Computers Public; a re-adoption keeps the owner.
 
 const test = createApiTest();
@@ -182,6 +182,41 @@ test("the connector may only claim a Public Computer they connected; a plain mem
   await seedComputer(server.id, member.id, "member-box");
   const notTheirs = await call(app.baseUrl, memberToken, "PUT", ownerPath(server.id, box.id), { ownerUserId: member.id });
   assert.equal(notTheirs.status, 403);
+});
+
+// "Make it mine" follows the one controller rule (computerControllerUserId): the live attach record's attacher only.
+test("claiming a Public Computer needs the live attacher: not a revoked record's attacher, a raw daemon's registrant, or anyone when the live record names no one", async ({ app, seed }) => {
+  const { admin, connector, member, server, box, token } = await seedServer(seed);
+  const claim = async (userId: string, machineId: string) =>
+    call(app.baseUrl, await token(userId), "PUT", ownerPath(server.id, machineId), { ownerUserId: userId });
+
+  // Revoked: the former attacher no longer claims it.
+  await getDb().update(computers).set({ revokedAt: new Date() }).where(eq(computers.machineId, box.id));
+  const revoked = await claim(connector.id, box.id);
+  assert.equal(revoked.status, 403, JSON.stringify(revoked.body));
+  assert.equal(revoked.body.code, "computer_owner_forbidden");
+
+  // A raw daemon its member registrant registered: no controller.
+  const { machine: rawDaemon } = await registerMachine(server.id, member.id, "members-raw-daemon");
+  const raw = await claim(member.id, rawDaemon.id);
+  assert.equal(raw.status, 403);
+  assert.equal(raw.body.code, "computer_owner_forbidden");
+
+  // A live record naming no one: neither the registrant nor anyone else.
+  const [unattributed] = await getDb().insert(machines).values({ serverId: server.id, userId: member.id, name: "unattributed", apiKeyHash: `hash-${randomUUID()}`, runtimes: [] }).returning();
+  await getDb().insert(computers).values({
+    serverId: server.id, name: "unattributed", machineId: unattributed!.id, apiKeyHash: "h", apiKeyPrefix: `sk_computer_${randomUUID().slice(0, 8)}`, attachedByUserId: null,
+  });
+  const none = await claim(member.id, unattributed!.id);
+  assert.equal(none.status, 403);
+  assert.equal(none.body.code, "computer_owner_forbidden");
+
+  for (const machineId of [box.id, rawDaemon.id, unattributed!.id]) assert.equal(await ownerOf(machineId), null);
+  // Owner/admin still assign each of them.
+  for (const machineId of [box.id, rawDaemon.id, unattributed!.id]) {
+    const assigned = await call(app.baseUrl, await token(admin.id), "PUT", ownerPath(server.id, machineId), { ownerUserId: member.id });
+    assert.equal(assigned.status, 200, JSON.stringify(assigned.body));
+  }
 });
 
 test("the new owner is a non-Guest person in this server: agents, assistants, Guests, outsiders and retired accounts are refused", async ({ app, seed }) => {

@@ -12,13 +12,19 @@ import "../../src/index.css";
 
 // Raft Desktop's "Sign in with Raft" sheet (desktop_browser_raft_sign_in_v0)
 // drawn with the real component and no server, for local screenshots
-// (desktop-browser-sign-in.shot.mjs): ?mode=light|dark&servers=1|2|8. The
-// App's lookup is answered here; `servers` is how many Servers it is ready on
+// (desktop-browser-sign-in.shot.mjs):
+// ?mode=light|dark&servers=1|2|8&layout=server|install|account&logo=0|1. The
+// App's lookup is answered here; `servers` is how many Servers it is on
 // (1: the Server is a line; 2: the picker; 8: a long list of scopes too, so
-// the body has to scroll).
+// the body has to scroll). `layout`: server, ready on each Server (the
+// default); install, a Marketplace App the person installs first (Install and
+// continue); account, an App that signs in with the Raft account, no Server.
+// `logo=1`: the App has a registered logo (app-logo.svg here), else initials.
 const params = new URLSearchParams(window.location.search);
 const mode = params.get("mode") === "dark" ? "dark" : "light";
 const count = Math.max(1, Number(params.get("servers")) || 2);
+const layout = params.get("layout") === "install" ? "install" : params.get("layout") === "account" ? "account" : "server";
+const logoUrl = params.get("logo") === "1" ? "/visual-testing/desktop-browser-sign-in/app-logo.svg" : null;
 const RETURN_URL = "https://thumbs-separation-similarly-dsc.trycloudflare.com/callback";
 const scope = count >= 8 ? "openid profile agent:read app:read" : "openid profile";
 const setupSearch = `?flow=oidc&client_id=qa-walk&return_to=${encodeURIComponent(RETURN_URL)}&scope=${encodeURIComponent(scope)}&state=s`;
@@ -44,7 +50,7 @@ useAuthStore.setState({
   initialized: true,
 } as never);
 useServerStore.setState({ servers, current: servers[0], members: [], loading: false } as never);
-api.get = (async () => ({
+api.get = (async (_url: string, config?: { params?: { server_id?: string } }) => ({
   data: {
     id: "app-1",
     clientId: "qa-walk",
@@ -53,8 +59,13 @@ api.get = (async () => ({
     description: "Throwaway client for the #285 staging walk. Delete after use.",
     homepageUrl: "https://example.com/",
     returnUrl: RETURN_URL,
-    logoUrl: null,
-    availability: "ready",
+    logoUrl,
+    ...(layout === "install" ? {
+      marketplace: true,
+      availability: "install_required",
+      installation: { serverId: config?.params?.server_id ?? "server-1", canInstall: true },
+    } : { availability: "ready" }),
+    ...(layout === "account" ? { loginMode: "account" } : {}),
   },
 })) as unknown as typeof api.get;
 api.post = (async () => ({ data: { evaluations: [] } })) as unknown as typeof api.post;

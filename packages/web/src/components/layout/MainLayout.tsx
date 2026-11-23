@@ -14,8 +14,8 @@ import { useOtherServerMessageLink } from "../deeplinks/otherServerMessageLink";
 import { useDeepLinksFlag, useLandingHoldsAnnouncements, useMessageLinkLandingLifetime } from "../deeplinks/deepLinksFlag";
 import { isMessageLinkLanding, isThreadMismatch, parseMessageLink } from "../../utils/messageLinkLanding";
 import { movePageLanding } from "../../utils/pageLanding";
-import { useContext, useState, useEffect, useEffectEvent, useCallback, useMemo, useRef, Suspense } from "react";
-import type { ReactNode } from "react";
+import { memo, useContext, useState, useEffect, useEffectEvent, useCallback, useMemo, useRef, Suspense } from "react";
+import type { ComponentProps, ReactNode } from "react";
 import {
   AppShellSidebarSlot,
   DialogSurface,
@@ -26,11 +26,9 @@ import {
   MobileNavLabel,
   MobileNavRoot,
   Skeleton,
-  ProfilePanel as ProfilePanelFrame,
   toast,
 } from "@botiverse/raft-ui";
 import { ThreadIcon, MessageIcon } from "@botiverse/ricons";
-import { PROFILE_PANEL_OVERLAY_CLASS, profilePanelDesktopStyle } from "../profile/profilePanelGeometry";
 import { LEGACY_TASK_SIDE_PANEL_CLASS, legacyTaskSidePanelDesktopStyle } from "../task/legacyTaskPanelGeometry";
 import { COLUMN_BOUNDS } from "../../lib/panelBounds";
 import { useColumnWidth } from "../../store/columnWidthStore";
@@ -78,7 +76,7 @@ import { ShellFrame, useIsDesktopShell, useShowsTopBar } from "./ShellFrame";
 import { useThreadRowState } from "./threadRowState";
 import { isGuestHomePath, isTasksPagePath, shellRouteLayout } from "./shellRouteLayout";
 import { useGuestHome, useGuestUnreadableRedirect, useIsGuest } from "./guestShell";
-import { useTabRouteMemory } from "../../hooks/useTabRouteMemory";
+import { usePlaceMemory } from "../../hooks/placeMemory";
 import { useRailLegacyRedirect } from "../../hooks/useRailLegacyRedirect";
 import { useMobileNav } from "../../hooks/useMobileNav";
 import { ChatPanel } from "../../features/channel/ChatPanel";
@@ -114,6 +112,7 @@ import { SIDEBAR_REGION_ID, setSidebarSlotHidden, toggleSidebarFromKeyboard, use
 import { LegacyMemberGraphRedirect, LegacyThreadsRedirect, LegacyWorkspaceGridRedirect } from "./LegacyRedirects";
 import { ShortcutHelpColumn } from "../../features/keyboard-shortcuts/ShortcutHelpColumn";
 import { WebLinkRouter } from "../../features/webPreview/WebLinkRouter";
+import { ObjectWindowsHost } from "../../features/objectWindows";
 import "../../features/shortcuts/shortcutAccountBridge";
 import { ShortcutHelpPage } from "../../features/keyboard-shortcuts/ShortcutHelpPage";
 import { useShortcutHelpStore } from "../../features/keyboard-shortcuts/shortcutHelpStore";
@@ -127,13 +126,14 @@ import api from "../../api/client";
 import type { HumanProfile } from "../member/HumanDetailPanel";
 import { resolveHumanProfile } from "../member/resolveHumanProfile";
 import { canRenderAgentDetail } from "../agent/agentDetailAvailability";
-import { getCachedAgentProfile } from "../profile/profileFallbackCache";
+import { useCachedAgentProfile } from "../profile/profileFallbackCache";
+import { ProfilePanelFallback } from "../profile/ProfilePanelSkeleton";
 import type { ProfilePanelProps } from "../profile/ProfilePanel";
 import { recordSynchronousMobileBackNavigation, useAppNavigate, useMobileBack } from "../../hooks/useAppNavigate";
 import { useTaskConversationRedirect } from "../../hooks/useTaskConversationRedirect";
 import { useOwnAssistantDmId, useOwnAssistantPageForDm } from "../../assistant/assistantClient";
 import { AssistantOtterLayer } from "../../assistant/AssistantOtterShortcut";
-import { loadArtifactActivityViewer, loadArtifactsDashboard } from "../../apps/artifacts";
+import { ArtifactObjectWindows, loadArtifactActivityViewer, loadArtifactsDashboard } from "../../apps/artifacts";
 import { artifactAddressTidying, artifactOpenEntryOf, artifactSlotInAddress, liveArtifactAddressEntry, readArtifactAddress, useArtifactOpenAddress, withArtifactAddress, writeArtifactAddress, writeArtifactSlotAddress } from "./artifactOpenAddress";
 import { useArtifactViewerAddress } from "./artifactViewerAddress";
 import { useBesideMemory } from "./useBesideMemory";
@@ -168,9 +168,9 @@ const LG_VIEWPORT_QUERY = "(min-width: 1024px)";
 const THREAD_SPLIT_VIEWPORT_QUERY = "(orientation: landscape), (min-width: 1280px)";
 
 // Lazy-loaded route panels (code splitting), each with Try again in place of a
-// failed download (lazyPanel). The detail panels the workspace opens first
-// (agent, computer, member) are also fetched in the background after the first
-// screen (deferredPanel); ChatPanel is in the entry, ThreadPanel deferred too.
+// failed download (lazyPanel). The detail panels the workspace opens first (agent, computer,
+// member, and the profile panel that holds their skeleton) are also fetched in the background
+// after the first screen (deferredPanel); ChatPanel is in the entry, ThreadPanel deferred too.
 const AgentDetailPanel = deferredPanel(() => observeProfileOpenE2eImport(
   "agent-detail",
   () => import("../../features/agent/AgentDetailPanel").then((module) => ({ default: module.AgentDetailPanel })),
@@ -197,7 +197,7 @@ const ThreadsInbox = lazyPanel(() => import("../../features/thread/ThreadsInbox"
 const SavedPanel = lazyPanel(() => import("../saved/SavedPanel"));
 const DraftsPanel = lazyPanel(() => import("../drafts/DraftsPanel"));
 const ArtifactsDashboard = lazyPanel(loadArtifactsDashboard);
-const ProfilePanel = lazyPanel<ProfilePanelProps>(() => observeProfileOpenE2eImport(
+const ProfilePanel = deferredPanel<ProfilePanelProps>(() => observeProfileOpenE2eImport(
   "profile-panel",
   () => import("../profile/ProfilePanel"),
 ));
@@ -569,13 +569,13 @@ export function DmById({ dmId }: { dmId: string }) {
   return channel ? <ChatPanel channel={channel} /> : <NoConversation unavailable={unavailable} />;
 }
 
-/** Route: /dm/:dmId. The viewer's own assistant's DM is its page (replace, not a push). */
+/** Route: /dm/:dmId. The viewer's own assistant's DM is its page: in place beside the sidebar on a desktop, else /assistant (replace). */
 function DmRoute() {
   const { dmId } = useParams<{ dmId: string }>();
   const assistantPage = useOwnAssistantPageForDm(dmId);
-  if (assistantPage) return <Navigate to={assistantPage} replace />;
-  if (!dmId) return <ChatPanel channel={null} />;
-  return <DmById dmId={dmId} />;
+  const isDesktop = useIsDesktopShell();
+  if (!assistantPage) return dmId ? <DmById dmId={dmId} /> : <ChatPanel channel={null} />;
+  return isDesktop ? <Suspense fallback={<PanelFallback />}><AssistantRoute /></Suspense> : <Navigate to={assistantPage} replace />;
 }
 
 /** A conversation's own search (its header's Search button on a phone): a
@@ -619,30 +619,6 @@ function OverlayPanelFallback({ testId }: { testId?: string } = {}) {
   );
 }
 
-/** While the profile panel's code loads: the panel's own box (raft-ui
- *  ProfilePanel, the same classes and remembered width), holding a spinner.
- *  It used to fill the rest of the row and then snap to the saved width when
- *  the panel arrived (task #157; Raft DS › Responsive layout, "The first frame
- *  is the settled one"). index.css folds the row around it as around the panel
- *  (`[data-profile-panel-fallback]`). */
-function ProfilePanelFallback({ testId }: { testId?: string } = {}) {
-  const { formatMessage } = useIntl();
-  const width = useColumnWidth("detail");
-  const isLg = useMediaQuery(LG_VIEWPORT_QUERY);
-  const style = useMemo(() => (isLg ? profilePanelDesktopStyle(width) : undefined), [isLg, width]);
-  return (
-    <ProfilePanelFrame
-      data-profile-panel-fallback=""
-      data-testid={testId}
-      edge="attached"
-      className={PROFILE_PANEL_OVERLAY_CLASS}
-      style={style}
-    >
-      <PanelLoading label={formatMessage({ id: "layout.main.loading" })} />
-    </ProfilePanelFrame>
-  );
-}
-
 /** While the legacy task side panel's code loads: its own box at the
  *  remembered width, as for the profile panel above (task #157). */
 function LegacyTaskSidePanelFallback() {
@@ -681,7 +657,8 @@ function AgentById({ agentId, onBack, activityOnly }: { agentId: string; onBack?
     useCallback((s) => s.agents.find((a) => a.id === agentId), [agentId])
   );
   const currentServerId = useServerStore((s) => s.current?.id);
-  const projectedAgent = agent ?? getCachedAgentProfile(currentServerId, agentId);
+  const cachedAgent = useCachedAgentProfile(currentServerId, agentId); // filled after this rendered, too
+  const projectedAgent = agent ?? cachedAgent;
   if (!canRenderAgentDetail(projectedAgent, currentServerId)) {
     return <Suspense fallback={<PanelFallback />}><AgentUnavailablePanel /></Suspense>;
   }
@@ -1581,6 +1558,10 @@ function SideThreadColumn() {
   const side = useThreadColumnSide(columnElement);
   // Standing in the row, the thread's head moves it among the side columns (its grip on its own head, not the column's: a section can stand above it).
   const head = useStackEndHead("thread", useSideSectionHead("thread", side.inRow));
+  // Folded over the chat, its Back closes the thread in place and shows this channel's chat under it (#189,
+  // responsive.md), never a step back in the browser's history: a thread the channel's memory restored on entry
+  // has no history entry of its own, so a step back left for the channel before it (#proj-workspace:#331).
+  const closeThread = useThreadStore((s) => s.closeThread);
   return (
     <div
       ref={setColumnElement}
@@ -1605,6 +1586,7 @@ function SideThreadColumn() {
       <ThreadPanel
         presentation="side"
         allowExpand
+        onClose={side.covers ? closeThread : undefined}
         headerLeading={side.stacked ? <ThreadCollapseChevron side={side} /> : undefined}
         headerDrag={head}
       />
@@ -2201,6 +2183,57 @@ function useSearchContentUrlSync() {
 }
 
 
+/**
+ * The main column's routes, rendered again only for another location (task #441; mainColumnRoutesMemo.test.tsx).
+ * A Routes given a location makes a new route and location context value on every render, and everything under
+ * it that reads the router (a message row's `useAppNavigate`, a route's `useParams`) renders again for it,
+ * through `memo` too: inline here, each store update the layout reads rendered every message row.
+ */
+const MainColumnRoutes = memo(function MainColumnRoutes({ location }: { location: ComponentProps<typeof Routes>["location"] }) {
+  return (
+    <Routes location={location}>
+      <Route path="channel/:channelId" element={<ChannelRoute />} />
+      <Route path="channel/:channelId/search" element={<ConversationSearchRoute kind="channel" />} />
+      <Route path="dm/:dmId" element={<DmRoute />} />
+      <Route path="dm/:dmId/search" element={<ConversationSearchRoute kind="dm" />} />
+      <Route path="agent/:agentId" element={<AgentRoute />} />
+      <Route path="agent/:agentId/activity" element={<AgentActivityRoute />} />
+      <Route path="computer/:machineId" element={<MachineRoute />} />
+      {/* Legacy /machine/:id — kept so external links and bookmarks
+          still work; redirected to /computer/:id by RailNavCompat. */}
+      <Route path="machine/:machineId" element={<MachineRoute />} />
+      <Route path="human/:userId" element={<HumanRoute />} />
+      {/* Retired member graph: old links and bundles land on Members. */}
+      <Route path="members/graph" element={<LegacyMemberGraphRedirect />} />
+      <Route path="migrations" element={<MigrationLogRoute />} />
+      <Route path="members" element={<MembersEmptyRoute />} />
+      <Route path="computers" element={<ComputersRoute />} />
+      <Route path="computers/this-device" element={<Suspense fallback={<PanelFallback />}><ThisDevicePanel /></Suspense>} />
+      <Route path="apps" element={<AppsRoute />} />
+      <Route path="more" element={<MoreRoute />} />
+      <Route path="search" element={<SearchContentRoute />} />
+      <Route path="raftbench" element={<Suspense fallback={<PanelFallback />}><RaftBenchPage /></Suspense>} />
+      <Route path="assistant" element={<Suspense fallback={<PanelFallback />}><AssistantRoute /></Suspense>} />
+      <Route path="settings/:tab?/*" element={<SettingsRoute />} />
+      <Route path="activity" element={<InboxContentRoute />} />
+      {/* Legacy /inbox + /threads → /activity (stdrc renamed the route
+          #proj-activity:171042a3 2026-06-23). Keep redirects so old
+          links/bookmarks resolve. */}
+      <Route path="inbox" element={<LegacyThreadsRedirect />} />
+      <Route path="threads" element={<LegacyThreadsRedirect />} />
+      <Route path="tasks" element={<TasksRoute />} />
+      <Route path="saved" element={<SavedRoute />} />
+      <Route path="drafts" element={<DraftsRoute />} />
+      <Route path="artifacts" element={<ArtifactsRoute />} />
+      <Route path="release-notes" element={<ReleaseNotesRoute />} />
+      <Route path="keyboard-shortcuts" element={<ShortcutHelpPage />} />
+      {/* Legacy /workspace from the removed Workspace grid layout. */}
+      <Route path="workspace" element={<LegacyWorkspaceGridRedirect />} />
+      <Route path="*" element={<DefaultRoute />} />
+    </Routes>
+  );
+});
+
 export default function MainLayout() {
   const [announcementHost, setAnnouncementHost] = useState<HTMLDivElement | null>(null);
   // Shared model-label catalog (task #700): the shell owns the load trigger
@@ -2216,7 +2249,7 @@ export default function MainLayout() {
   useBesideMemory();
   useSearchHitMarkLifetime();
   useRailLegacyRedirect();
-  useTabRouteMemory(useOwnAssistantDmId());
+  usePlaceMemory(useOwnAssistantDmId());
 
   const channels = useChannelStore((s) => s.channels);
   const dmChannels = useChannelStore((s) => s.dmChannels);
@@ -2561,46 +2594,7 @@ export default function MainLayout() {
             data-otter-dock="conversation"
           >
             <RowColumnSlotContext.Provider value={rowColumnSlot}>
-            <Routes location={backgroundLocation ?? location}>
-              <Route path="channel/:channelId" element={<ChannelRoute />} />
-              <Route path="channel/:channelId/search" element={<ConversationSearchRoute kind="channel" />} />
-              <Route path="dm/:dmId" element={<DmRoute />} />
-              <Route path="dm/:dmId/search" element={<ConversationSearchRoute kind="dm" />} />
-              <Route path="agent/:agentId" element={<AgentRoute />} />
-              <Route path="agent/:agentId/activity" element={<AgentActivityRoute />} />
-              <Route path="computer/:machineId" element={<MachineRoute />} />
-              {/* Legacy /machine/:id — kept so external links and bookmarks
-                  still work; redirected to /computer/:id by RailNavCompat. */}
-              <Route path="machine/:machineId" element={<MachineRoute />} />
-              <Route path="human/:userId" element={<HumanRoute />} />
-              {/* Retired member graph: old links and bundles land on Members. */}
-              <Route path="members/graph" element={<LegacyMemberGraphRedirect />} />
-              <Route path="migrations" element={<MigrationLogRoute />} />
-              <Route path="members" element={<MembersEmptyRoute />} />
-              <Route path="computers" element={<ComputersRoute />} />
-              <Route path="computers/this-device" element={<Suspense fallback={<PanelFallback />}><ThisDevicePanel /></Suspense>} />
-              <Route path="apps" element={<AppsRoute />} />
-              <Route path="more" element={<MoreRoute />} />
-              <Route path="search" element={<SearchContentRoute />} />
-              <Route path="raftbench" element={<Suspense fallback={<PanelFallback />}><RaftBenchPage /></Suspense>} />
-              <Route path="assistant" element={<Suspense fallback={<PanelFallback />}><AssistantRoute /></Suspense>} />
-              <Route path="settings/:tab?/*" element={<SettingsRoute />} />
-              <Route path="activity" element={<InboxContentRoute />} />
-              {/* Legacy /inbox + /threads → /activity (stdrc renamed the route
-                  #proj-activity:171042a3 2026-06-23). Keep redirects so old
-                  links/bookmarks resolve. */}
-              <Route path="inbox" element={<LegacyThreadsRedirect />} />
-              <Route path="threads" element={<LegacyThreadsRedirect />} />
-              <Route path="tasks" element={<TasksRoute />} />
-              <Route path="saved" element={<SavedRoute />} />
-              <Route path="drafts" element={<DraftsRoute />} />
-              <Route path="artifacts" element={<ArtifactsRoute />} />
-              <Route path="release-notes" element={<ReleaseNotesRoute />} />
-              <Route path="keyboard-shortcuts" element={<ShortcutHelpPage />} />
-              {/* Legacy /workspace from the removed Workspace grid layout. */}
-              <Route path="workspace" element={<LegacyWorkspaceGridRedirect />} />
-              <Route path="*" element={<DefaultRoute />} />
-            </Routes>
+            <MainColumnRoutes location={backgroundLocation ?? location} />
             </RowColumnSlotContext.Provider>
             {/* Workspace Artifacts: where one clicked outside a channel panel opens (the opening rule). */}
             <ShellArtifactHost />
@@ -2613,6 +2607,10 @@ export default function MainLayout() {
           <ShortcutHelpColumn />
           {/* Where every content link is decided (the link router; Raft Desktop's built-in browser). */}
           <WebLinkRouter />
+          {/* Raft Desktop's object windows: each one's object drawn into its own window (features/objectWindows). */}
+          <ObjectWindowsHost />
+          {/* Artifacts' kind of object window (its viewer; Window › Open in Main Window). */}
+          <ArtifactObjectWindows />
           {/* Task v2's Tasks and Files columns, at the row's level beside the
               thread when the row fits them (ChannelSideArea; task #165).
               `contents`: each column is the row's flex item. */}
@@ -2671,6 +2669,7 @@ export const __testInternals = {
   DefaultRoute,
   InboxContentRoute,
   MachineRoute,
+  MainColumnRoutes,
   SearchContentRoute,
   SettingsRoute,
   renderContentSlot,

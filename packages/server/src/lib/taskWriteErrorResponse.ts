@@ -1,5 +1,6 @@
 import { JointTaskWriteDeniedError } from "../services/jointTaskWriteAuthority";
 import type { Response } from "express";
+import { refuse } from "./refusal";
 import { ChannelConversionInProgressError } from "../services/channelConversionFenceService";
 import { DmTargetResolutionError } from "../services/dmTargetResolutionError";
 import { TaskCreateStatusError, TaskMutationConflictError, TaskSourceMessageError, TaskStatusNotAvailableError } from "../services/taskService";
@@ -13,7 +14,7 @@ export function respondToTaskWriteError(error: unknown, res: Response): boolean 
   }
   // A task target like dm:@Twin that names both a human and an agent.
   if (error instanceof DmTargetResolutionError) {
-    res.status(error.status).json(error.toResponseBody());
+    refuse(res, error.status, error.toRefusal());
     return true;
   }
   if (error instanceof JointTaskWriteDeniedError || error instanceof TaskMutationConflictError) {

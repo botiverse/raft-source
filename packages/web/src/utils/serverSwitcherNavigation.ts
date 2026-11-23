@@ -1,4 +1,4 @@
-import { readServerSurfaceMemory } from "../hooks/useTabRouteMemory";
+import { placeFor } from "../hooks/placeMemory";
 
 export interface ServerSwitcherAuxClickEvent {
   button: number;
@@ -6,25 +6,26 @@ export interface ServerSwitcherAuxClickEvent {
   stopPropagation: () => void;
 }
 
-export type ReadServerSurface = (serverSlug: string) => string | null;
+export type ReadServerPlace = (serverSlug: string) => string;
 export type OpenNewTab = (url: string, target: "_blank", features: "noopener,noreferrer") => unknown;
 
+/** A server switch lands on that server's place (placeMemory): its last tab's page, without a pane. */
 export function getServerSwitcherTarget(
   serverSlug: string,
-  readSurface: ReadServerSurface = readServerSurfaceMemory,
+  readPlace: ReadServerPlace = placeFor,
 ): string {
-  return readSurface(serverSlug) ?? `/s/${serverSlug}`;
+  return readPlace(serverSlug);
 }
 
 export function openServerSwitcherAuxClickTarget(
   event: ServerSwitcherAuxClickEvent,
   serverSlug: string,
   {
-    readSurface = readServerSurfaceMemory,
+    readPlace = placeFor,
     openNewTab = window.open,
     targetHref,
   }: {
-    readSurface?: ReadServerSurface;
+    readPlace?: ReadServerPlace;
     openNewTab?: OpenNewTab;
     targetHref?: string;
   } = {},
@@ -32,6 +33,6 @@ export function openServerSwitcherAuxClickTarget(
   if (event.button !== 1) return false;
   event.preventDefault();
   event.stopPropagation();
-  openNewTab(targetHref ?? getServerSwitcherTarget(serverSlug, readSurface), "_blank", "noopener,noreferrer");
+  openNewTab(targetHref ?? getServerSwitcherTarget(serverSlug, readPlace), "_blank", "noopener,noreferrer");
   return true;
 }

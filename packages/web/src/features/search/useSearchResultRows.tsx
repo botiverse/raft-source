@@ -136,9 +136,10 @@ export function useSearchResultRows({
         selected={selectedResultKey === result.key || hasOpenChannelContextMenu}
         returnedFrom={locatedResultKey === result.key}
         agentAvatarUrl={result.agentId
-          ? agents.find((entry) => entry.id === result.agentId)?.avatarUrl ?? null
+          ? (result.avatarUrl ?? agents.find((entry) => entry.id === result.agentId)?.avatarUrl ?? null)
           : null}
         humanMember={resolveUserMember(result.userId)}
+        humanAvatarUrl={result.avatarUrl}
         onResultContextMenu={handleChannelResultContextMenu}
         onResultClick={handleEntityResultClick}
       />

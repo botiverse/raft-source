@@ -2,7 +2,7 @@ import { fixturePasswordHash } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { refusalBody } from "../lib/refusal";
-import { AGENT_CHANNEL_NOT_FOUND_REFUSAL } from "./agentRouteRefusals";
+import { AGENT_CHANNEL_NOT_FOUND_REFUSAL, MESSAGE_NOT_FOUND_REFUSAL } from "./agentRouteRefusals";
 
 import { getDb } from "../db/index";
 import { eq } from "drizzle-orm";
@@ -685,8 +685,8 @@ test("agent-api reminder create cloaks anchors the bound agent cannot read", asy
       body: JSON.stringify({ title: `hidden-${msgId.length}`, delaySeconds: 120, msgId }),
     });
     assert.equal(res.status, 404, `expected hidden anchor ${msgId} to be cloaked`);
-    const body = (await res.json()) as { error?: string };
-    assert.equal(body.error, "message not found");
+    // The plain message not-found, the same as for an id nobody has.
+    assert.deepEqual(await res.json(), refusalBody(MESSAGE_NOT_FOUND_REFUSAL));
   }
   assert.equal(events.filter((e) => e.event === "reminder:scheduled").length, 0);
 

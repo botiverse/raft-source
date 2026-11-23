@@ -2,50 +2,66 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
 
 import { useShortcutLayer } from "../../features/shortcuts";
+import { useOwnerDocument, viewOf } from "../../utils/ownerDocument";
 import { createDismissLayer } from "./artifactDismissLayer";
 import type { Dismissable, DismissBy } from "./artifactDismissLayer";
-import { handFocusBack, onPageSignal } from "./artifactPageSignals";
+import { guessPagePresses, handFocusBack, onPageSignal } from "./artifactPageSignals";
 
 /**
- * The document's dismissal layer (artifactDismissLayer: the rule and who is open) and what it
- * hears, wired while anything is open: a click anywhere in Raft's document (for what is drawn in
- * the page's flow), and the Artifact's page (artifactPageSignals). One for the document: cards of
- * Raft's are one at a time across it, and the page's signals are the document's too.
+ * The dismissal layer (artifactDismissLayer: the rule and who is open) and what it hears, wired while
+ * anything is open: a click anywhere in the document a card is open in (for what is drawn in the
+ * page's flow), and the Artifact's page (artifactPageSignals). One for the app: cards of Raft's are
+ * one at a time across it, and the page's signals are heard once. Each document with a card open is
+ * wired on its own: the main window's, or an object window's (#337 PR3), whose clicks and blur never
+ * reach the main window's.
  */
 export const artifactDismissLayer = createDismissLayer();
 
-let wired = 0;
-let unwire: (() => void) | null = null;
+/** The documents wired, each with how many open things are in it. */
+const wiredDocuments = new Map<Document, { count: number; unwire: () => void }>();
+let open = 0;
+let offPage: (() => void) | null = null;
 
-function wire(): () => void {
+function wireDocument(doc: Document): () => void {
   const pressed = (event: MouseEvent) => artifactDismissLayer.press(event);
   // A click, not the pointer going down: closing a card moves what is under the pointer (the
   // margin's cards re-place), and the press would then end on something else and click nothing.
-  document.addEventListener("click", pressed, true);
-  const offPage = onPageSignal((signal) => {
+  doc.addEventListener("click", pressed, true);
+  const stopGuessing = guessPagePresses(viewOf(doc));
+  return () => {
+    doc.removeEventListener("click", pressed, true);
+    stopGuessing();
+  };
+}
+
+function addDismissable(entry: DismissableOptions, doc: Document): () => void {
+  // Today's way to hear the next press in the page (artifactPageSignals): the focus back from its frame.
+  const left = entry.handsFocusBack ? handFocusBack(doc) : null;
+  if (left && entry.leftFrame) entry.leftFrame.current = left;
+  const remove = artifactDismissLayer.add(entry);
+  const wired = wiredDocuments.get(doc);
+  if (wired) wired.count += 1;
+  else wiredDocuments.set(doc, { count: 1, unwire: wireDocument(doc) });
+  open += 1;
+  offPage ??= onPageSignal((signal) => {
     if (signal === "escape") return artifactDismissLayer.pageEscape();
     artifactDismissLayer.pagePress();
     return true;
   });
   return () => {
-    document.removeEventListener("click", pressed, true);
-    offPage();
-  };
-}
-
-function addDismissable(entry: DismissableOptions): () => void {
-  // Today's way to hear the next press in the page (artifactPageSignals): the focus back from its frame.
-  const left = entry.handsFocusBack ? handFocusBack() : null;
-  if (left && entry.leftFrame) entry.leftFrame.current = left;
-  const remove = artifactDismissLayer.add(entry);
-  if (wired === 0) unwire = wire();
-  wired += 1;
-  return () => {
     remove();
-    wired -= 1;
-    if (wired > 0) return;
-    unwire?.();
-    unwire = null;
+    const own = wiredDocuments.get(doc);
+    if (own) {
+      own.count -= 1;
+      if (own.count === 0) {
+        own.unwire();
+        wiredDocuments.delete(doc);
+      }
+    }
+    open -= 1;
+    if (open > 0) return;
+    offPage?.();
+    offPage = null;
   };
 }
 
@@ -79,7 +95,7 @@ export interface DismissableHandle {
  * The component keeps what it alone knows: how to close (`close`, told what closed it), and where
  * it is drawn (`element`). It never listens for a press outside or reads the page itself.
  */
-export function useDismissable(open: boolean, options: DismissableOptions): DismissableHandle {
+export function useDismissable(isOpen: boolean, options: DismissableOptions): DismissableHandle {
   const latest = useRef(options);
   useEffect(() => {
     latest.current = options;
@@ -97,12 +113,13 @@ export function useDismissable(open: boolean, options: DismissableOptions): Dism
     get leftFrame() { return latest.current.leftFrame; },
   }));
   const { card = false, inFlow = false } = options;
+  const doc = useOwnerDocument();
   // After the effect above (in order), so the entry, and a card the layer closes as this one opens,
   // read the latest options.
   useEffect(() => {
-    if (!open) return;
-    return addDismissable(entry);
-  }, [entry, open]);
+    if (!isOpen) return;
+    return addDismissable(entry, doc);
+  }, [entry, isOpen, doc]);
   const signal = useCallback((by: DismissBy, event: Event | null = null) => artifactDismissLayer.signal(entry, by, event), [entry]);
   const change = useCallback((next: boolean, details?: { reason?: string; event?: Event }) => {
     if (next) return;
@@ -114,10 +131,11 @@ export function useDismissable(open: boolean, options: DismissableOptions): Dism
   // A card in the page's flow has no Popover to hear Esc with the focus nowhere (handed back from
   // the frame, or dropped by a press on blank ground): Esc closes it then too. With the focus on
   // something, the key is that thing's, or the surface's (`escapeTopCard`).
-  useShortcutLayer("commentCard", open && inFlow && card, {
+  useShortcutLayer("commentCard", isOpen && inFlow && card, {
     onEscape: (event) => {
-      const active = document.activeElement;
-      if (active !== null && active !== document.body) return false;
+      // The focus in the card's own document (an object window's has its own).
+      const active = doc.activeElement;
+      if (active !== null && active !== doc.body) return false;
       return signal("escape", event);
     },
   });

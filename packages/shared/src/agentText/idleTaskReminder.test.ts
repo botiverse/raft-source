@@ -147,3 +147,16 @@ test("#wg-ax:#32: rules: false leaves out the rules for held tasks and keeps the
   assert.doesNotMatch(mixed, /For each (other )?task:/);
   assert.ok(formatIdleTaskReminderNotice({ items: [held] }).includes("For each task:"), "default keeps the rules");
 });
+
+test("notice: tasks past those listed are counted with where to see them; without task conversations the rules point at the thread", () => {
+  const text = formatIdleTaskReminderNotice({
+    items: [{ ref: "#proj:#4", status: "todo", title: "Rollout", why: "new session" }],
+    moreAssigned: 3,
+    taskConversations: false,
+  });
+  const lines = text.split("\n");
+  assert.equal(lines[2], "…and 3 more assigned to you. To see them: raft task list --mine.");
+  assert.ok(lines.includes("- Won't be done: set it closed and say why in its thread."));
+  assert.ok(!text.includes("its conversation"));
+  assert.ok(!formatIdleTaskReminderNotice({ items: [{ ref: "#proj:#4", status: "todo", title: "Rollout", why: "new session" }], moreAssigned: 0 }).includes("more assigned"));
+});

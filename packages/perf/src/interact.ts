@@ -20,6 +20,10 @@ import process from "node:process";
 import { parseArgs } from "node:util";
 import { type Locator, type Page, type Request, chromium } from "playwright";
 import { cliArgs } from "./args";
+import { fetchAndVerifyFixture } from "./benchCheck";
+import { loadBenchFixture, resolveFixtureTargets } from "./benchFixture";
+import { type BrowserDeviceProbe, buildCohort, cohortExtra, dominantString, parseConnectRttMs, parseEdgeColo, probeBrowserDevice } from "./cohort";
+import { interactTraceReportToRows } from "./diagnoseRuns";
 import { type FrameStats, frameStats, median } from "./frames";
 import { type HostSample, busyRuns, hostBenchmark, hostExtra, readPressure, stallShares, worseSample } from "./hostHealth";
 import { isProductionHost } from "./page";
@@ -39,17 +43,20 @@ Required env: RAFT_PERF_EMAIL, RAFT_PERF_PASSWORD (a test account; never a real 
 Options:
   --origin <url>      web origin (default https://raft-app-staging.botiverse.dev)
   --api <url>         API origin (default: --origin)
-  --server <slug>     server slug (required)
-  --channel <name>    a channel with a long history, the one scrolled (required); its last
+  --fixture <name>    frozen benchmark fixture (e.g. bench-v1, or path to JSON): sets --server/--channel/--other
+                      and verifies the channel's message/thread digest before measuring
+  --server <slug>     server slug (required unless --fixture sets it)
+  --channel <name>    a channel with a long history, the one scrolled (required unless --fixture sets it); its last
                       message with replies is the thread that gets opened, if it has one
-  --other <name>      a second channel to switch to and back (default all)
+  --other <name>      a second channel to switch to and back (default all, or the fixture's secondary channel)
   --runs <n>          repetitions (default 3)
   --keep-busy         keep runs taken while the host was busy in the medians (they are still reported)
   --trace             record a Chrome trace of each switch and report what the main thread did in the
                       ${TRACE_WINDOW_MS / 1000} s after the click: script, style, layout, large style passes (not with --jsonl)
+  --diagnose-jsonl <f> with --trace: write one ScopeDB perf.diagnose_runs row per traced switch kind; needs --project
   --out <file>        also write the JSON here
   --jsonl <file>      also write one row per run (ScopeDB perf.page_runs, metrics in extra); needs --project
-  --project <name>    with --jsonl: the product this web belongs to (e.g. raft-web)
+  --project <name>    with --jsonl or --diagnose-jsonl: the product this web belongs to (e.g. raft-web)
   --env <env>         with --jsonl: overrides the environment read from the page
   --run-id <id>       with --jsonl: shared by every row of one collection (default: a new UUID)
   --chromium-arg <a>  extra Chromium switch (repeatable)
@@ -95,12 +102,14 @@ async function main(): Promise<number> {
     options: {
       origin: { type: "string", default: "https://raft-app-staging.botiverse.dev" },
       api: { type: "string" },
+      fixture: { type: "string" },
       server: { type: "string" },
       channel: { type: "string" },
-      other: { type: "string", default: "all" },
+      other: { type: "string" },
       runs: { type: "string", default: "3" },
       "keep-busy": { type: "boolean", default: false },
       trace: { type: "boolean", default: false },
+      "diagnose-jsonl": { type: "string" },
       out: { type: "string" },
       jsonl: { type: "string" },
       project: { type: "string" },
@@ -118,12 +127,27 @@ async function main(): Promise<number> {
   const origin = args.origin!.replace(/\/$/, "");
   const api = (args.api ?? origin).replace(/\/$/, "");
   const runs = Number(args.runs);
-  if (!args.server) fail("--server <slug> is required");
-  if (!args.channel) fail("--channel <name> is required (a channel with a long history)");
+  const fixtureSpec = (() => {
+    try {
+      return args.fixture ? loadBenchFixture(args.fixture) : null;
+    } catch (error) {
+      return fail((error as Error).message);
+    }
+  })();
+  const resolved = (() => {
+    try {
+      return resolveFixtureTargets(fixtureSpec, { server: args.server, channel: args.channel, other: args.other }, { channel: "", other: "all" });
+    } catch (error) {
+      return fail((error as Error).message);
+    }
+  })();
+  if (!resolved.server) fail("--server <slug> (or --fixture <name>) is required");
+  if (!resolved.channel) fail("--channel <name> (or --fixture <name>) is required (a channel with a long history)");
   if (!Number.isInteger(runs) || runs < 1) fail("--runs must be an integer of at least 1");
   // recording a trace can slow the page: its timings are for reading beside the split, not for the ledger
   if (args.trace && args.jsonl) fail("--trace and --jsonl do not go together: rows are for untraced runs");
-  if (args.jsonl && !args.project) fail("--jsonl needs --project (which product this web belongs to)");
+  if (args["diagnose-jsonl"] && !args.trace) fail("--diagnose-jsonl requires --trace");
+  if ((args.jsonl || args["diagnose-jsonl"]) && !args.project) fail("--jsonl / --diagnose-jsonl needs --project (which product this web belongs to)");
   let production: boolean;
   try {
     production = isProductionHost(origin) || isProductionHost(api);
@@ -145,12 +169,18 @@ async function main(): Promise<number> {
   const auth = { authorization: `Bearer ${session.accessToken}` };
   type Named = { id: string; name: string };
   const servers = (await json(`${api}/api/servers`, { headers: auth })) as Array<{ id: string; slug: string }> | { servers: Array<{ id: string; slug: string }> };
-  const server = (Array.isArray(servers) ? servers : servers.servers).find((s) => s.slug === args.server) ?? fail(`the account is not a member of server ${args.server}`);
+  const server = (Array.isArray(servers) ? servers : servers.servers).find((s) => s.slug === resolved.server) ?? fail(`the account is not a member of server ${resolved.server}`);
   const channels = (await json(`${api}/api/channels`, { headers: { ...auth, "x-server-id": server.id } })) as Named[] | { channels: Named[] };
   const list = Array.isArray(channels) ? channels : channels.channels;
-  const busy = list.find((c) => c.name === args.channel) ?? fail(`no channel ${args.channel} in ${args.server}`);
-  const other = list.find((c) => c.name === args.other) ?? fail(`no channel ${args.other} in ${args.server}`);
+  const busy = list.find((c) => c.name === resolved.channel) ?? fail(`no channel ${resolved.channel} in ${resolved.server}`);
+  const other = list.find((c) => c.name === resolved.other) ?? fail(`no channel ${resolved.other} in ${resolved.server}`);
   if (busy.id === other.id) fail("--channel and --other must differ");
+  let verifiedFixtureTag: string | null = null;
+  if (fixtureSpec) {
+    const check = await fetchAndVerifyFixture(api, session.accessToken!, server.id, busy.id, fixtureSpec).catch((error: Error) => fail(error.message));
+    if (!check.ok) fail(`fixture ${fixtureSpec.fixture} drifted (${check.mismatches.join("; ")}): refusing to measure`);
+    verifiedFixtureTag = check.tag;
+  }
 
   const browser = await chromium.launch({ args: args["chromium-arg"] });
   const results: InteractRun[] = [];
@@ -158,8 +188,12 @@ async function main(): Promise<number> {
   const warnings: string[] = [];
   /** Per run, what was seen of the host beside it: the worse of its two parts. */
   const hostSamples: HostSample[] = [];
+  const edgeColos: string[] = [];
+  const connectRtts: number[] = [];
+  let deviceProbe: BrowserDeviceProbe | null = null;
   let hasThread = false;
   try {
+    deviceProbe = await probeBrowserDevice(browser);
     /** A signed-in tab on one channel, settled, with long tasks recorded from the start. */
     const openTab = async (channel: Named): Promise<Page> => {
       const context = await browser.newContext({
@@ -168,6 +202,16 @@ async function main(): Promise<number> {
         storageState: { cookies: [], origins: [{ origin, localStorage: [{ name: "slock_access_token", value: session.accessToken! }, { name: "slock_refresh_token", value: session.refreshToken! }] }] },
       });
       const tab = await context.newPage();
+      const cdp = await context.newCDPSession(tab);
+      await cdp.send("Network.enable");
+      cdp.on("Network.responseReceived", (e) => {
+        if (e.type === "Document" || e.response.url.startsWith(`${api}/api/`)) {
+          const colo = parseEdgeColo(e.response.headers);
+          if (colo) edgeColos.push(colo);
+          const rtt = parseConnectRttMs(e.response.timing, e.response.protocol);
+          if (rtt != null) connectRtts.push(rtt);
+        }
+      });
       await tab.addInitScript(() => {
         const w = window as unknown as { __perfLongTasks: { start: number; duration: number }[] };
         w.__perfLongTasks = [];
@@ -179,6 +223,9 @@ async function main(): Promise<number> {
         }).observe({ type: "longtask", buffered: true });
       });
       await tab.goto(`${origin}/s/${server.slug}/channel/${channel.id}`, { waitUntil: "load", timeout: 120_000 });
+      // Detach Network domain before any scroll or view-switch timing window so CDP event traffic adds zero overhead.
+      await cdp.send("Network.disable").catch(() => {});
+      await cdp.detach().catch(() => {});
       await tab.locator("[data-testid=message-scroller]").first().waitFor({ state: "visible", timeout: 60_000 }).catch(() => fail("the message list did not appear"));
       await tab.waitForTimeout(6000);
       return tab;
@@ -472,13 +519,25 @@ async function main(): Promise<number> {
   if (hostSeen.allBusy) warnings.push(`every run was taken on a busy host (by ${hostSeen.by}): the numbers say more about the machine than about the page`);
   else if (busyRunNumbers.length) notes.push(`run(s) ${busyRunNumbers.join(", ")} ${args["keep-busy"] ? "taken on a busy host (kept: --keep-busy)" : `left out of the medians: the host was busy (by ${hostSeen.by})`}`);
   const measuredAt = new Date().toISOString();
-  const report = { tool: "raft-perf interact", measuredAt, origin, page: { server: server.slug, channel: busy.name, other: other.name }, commitSha: release.commitSha ?? null, requestedRuns: runs, metrics, ...(metricsAllRuns ? { metricsAllRuns } : {}), ...(work ? { work } : {}), switchCache: cacheCounts, warnings, notes, host: { by: hostSeen.by, cpus: availableParallelism(), benchmarkMedianMs: hostSeen.benchmarkMedianMs, runs: hostSamples, busyRuns: busyRunNumbers, leftOut: hostSeen.leftOut.map((i) => i + 1) }, runs: results };
+  const cpus = availableParallelism();
+  const cohort = buildCohort({
+    browserWhere: "local",
+    edgeColo: dominantString(edgeColos),
+    hostCpuCount: cpus,
+    hostBenchmarkMs: hostSeen.benchmarkMedianMs,
+    device: deviceProbe,
+    connectRttSamplesMs: connectRtts,
+    net: "fast",
+    fixture: verifiedFixtureTag,
+  });
+  const report = { tool: "raft-perf interact", measuredAt, origin, page: { server: server.slug, channel: busy.name, other: other.name }, cohort, commitSha: release.commitSha ?? null, requestedRuns: runs, metrics, ...(metricsAllRuns ? { metricsAllRuns } : {}), ...(work ? { work } : {}), switchCache: cacheCounts, warnings, notes, host: { by: hostSeen.by, cpus, benchmarkMedianMs: hostSeen.benchmarkMedianMs, runs: hostSamples, busyRuns: busyRunNumbers, leftOut: hostSeen.leftOut.map((i) => i + 1) }, runs: results };
   const text = JSON.stringify(report, null, 2);
   process.stdout.write(`${text}\n`);
   if (args.out) writeFileSync(args.out, `${text}\n`);
   if (args.jsonl) {
     const toolVersion: string = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
     const runId = args["run-id"] ?? randomUUID();
+    const cohortFields = cohortExtra(cohort);
     const rows: PageRunRow[] = results.map((r, i) => ({
       project: args.project!,
       env: args.env ?? release.deploymentEnvironment!,
@@ -518,10 +577,22 @@ async function main(): Promise<number> {
         // 1 when this run was taken on a busy host; 1 when it was left out of the report's medians for it (readers of the rows skip those: claims.ts metricRuns)
         host_busy: hostSeen.busy[i] ? 1 : 0,
         host_left_out: hostSeen.leftOut.includes(i) ? 1 : 0,
-        ...hostExtra(availableParallelism(), hostSeen.benchmarkMedianMs),
+        ...hostExtra(cpus, hostSeen.benchmarkMedianMs),
+        ...cohortFields,
       },
     }));
     writeFileSync(args.jsonl, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  }
+  if (args["diagnose-jsonl"] && work) {
+    const toolVersion: string = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+    const diagRows = interactTraceReportToRows(report, {
+      project: args.project!,
+      env: args.env ?? release.deploymentEnvironment ?? (production ? "production" : "staging"),
+      runId: args["run-id"] ?? randomUUID(),
+      toolVersion,
+      backfilled: false,
+    });
+    writeFileSync(args["diagnose-jsonl"], diagRows.map((r) => JSON.stringify(r)).join("\n") + (diagRows.length ? "\n" : ""));
   }
   process.stderr.write(
     `raft-perf interact ${busy.name}: slow frames ${metrics.scroll_slow_frame_pct}% (p95 ${metrics.scroll_frame_p95_ms} ms), channel switch ${metrics.channel_switch_ms} ms (first visit ${metrics.channel_first_visit_ms}, current after ${metrics.channel_first_visit_settled_ms}; thread ${metrics.thread_open_ms}; main thread ${metrics.switch_main_thread_pct}% of a switch, messages asked for ${metrics.switch_request_delay_ms} ms after the click (${metrics.switch_input_delay_ms} ms of it input delay); cache hit/stale/miss ${cacheCounts.hit}/${cacheCounts.stale}/${cacheCounts.miss})` + (warnings.length ? `; ${warnings.length} warning(s)` : "") + "\n",

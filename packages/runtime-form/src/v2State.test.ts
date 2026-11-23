@@ -71,6 +71,17 @@ test("changing a parent resets what depends on it, and visibility follows", () =
   assert.deepEqual(runtimeFormV2Choices(field(kimi, "reasoningEffort"), kimiSources, kimiValues), { kind: "select", options: [], allowEmpty: true, allowCustom: false });
 });
 
+test("a required field this build cannot render blocks the save as unsupported_required; an optional one does not", () => {
+  const form = parseRuntimeFormV2({
+    protocolVersion: 3,
+    dataSchema: { type: "object", properties: { maxTurns: { type: "integer" }, budget: { type: "number" } }, required: ["maxTurns"] },
+    uiSchema: {},
+  });
+  assert.ok(form);
+  assert.deepEqual(form.fields.map((field) => field.kind), ["unsupported", "unsupported"]);
+  assert.deepEqual(validateRuntimeFormV2(form, {}, {}), { maxTurns: "unsupported_required" });
+});
+
 test("validation covers required, URL and choice membership on visible fields only", () => {
   let values = initialRuntimeFormV2Values(pi, piSources);
   assert.deepEqual(validateRuntimeFormV2(pi, piSources, values), { apiKey: "required" });
@@ -100,7 +111,7 @@ test("edit starts from the agent's stored values, and dependents follow the stor
   assert.equal(values.apiKey, "", "writeOnly fields start blank (blank on edit keeps the stored secret)");
 });
 
-test("edit: a stored null or absent derived effort stays Default; the model's default applies on create and after a model change", () => {
+test("edit: a stored null or absent derived effort stays Default, also across a model change; the model's default applies on create", () => {
   const efforts: RuntimeFormV2Sources = {
     model: {
       sourceId: "model", kind: "select", pointer: "/model",
@@ -118,10 +129,39 @@ test("edit: a stored null or absent derived effort stays Default; the model's de
     assert.equal(values.reasoningEffort, "", "Default (the runtime's), not the model's default");
     assert.deepEqual(validateRuntimeFormV2(edit, efforts, values, { editing: true }), {});
     assert.equal(runtimeFormV2Submission(edit, values, efforts).reasoningEffort, null, "saved untouched: still Default");
-    assert.equal(applyRuntimeFormV2Change(edit, efforts, values, "model", "k3").reasoningEffort, "high", "a model change takes the new model's default");
+    assert.equal(applyRuntimeFormV2Change(edit, efforts, values, "model", "k3").reasoningEffort, "", "a model change keeps Default");
   }
   const explicit = { ...kimi, values: { model: "k2", reasoningEffort: "low", envVars: {} } };
   assert.equal(initialRuntimeFormV2Values(explicit, efforts).reasoningEffort, "low", "a stored effort is kept");
+});
+
+test("a model change keeps the chosen derived effort while the new model lists it, else takes the new model's default", () => {
+  const efforts: RuntimeFormV2Sources = {
+    model: {
+      sourceId: "model", kind: "select", pointer: "/model",
+      options: [
+        { value: "k2", label: "K2", supportedReasoningEfforts: ["low", "medium", "high"], defaultReasoningEffort: "low" },
+        { value: "k3", label: "K3", supportedReasoningEfforts: ["low", "high"], defaultReasoningEffort: "low" },
+        { value: "k4", label: "K4", supportedReasoningEfforts: ["medium"], defaultReasoningEffort: "medium" },
+      ],
+      defaultValue: "k2",
+    },
+  };
+  let values = initialRuntimeFormV2Values(kimi, efforts);
+  values = applyRuntimeFormV2Change(kimi, efforts, values, "reasoningEffort", "high");
+  values = applyRuntimeFormV2Change(kimi, efforts, values, "model", "k3");
+  assert.equal(values.reasoningEffort, "high", "still offered: kept, not reset to the new model's low");
+  values = applyRuntimeFormV2Change(kimi, efforts, values, "model", "k4");
+  assert.equal(values.reasoningEffort, "medium", "not offered: the new model's default");
+});
+
+test("a Default left over from a model without levels is not kept: the next model with levels starts at its default", () => {
+  let values = initialRuntimeFormV2Values(kimi, kimiSources);
+  assert.equal(values.reasoningEffort, "high");
+  values = applyRuntimeFormV2Change(kimi, kimiSources, values, "model", "k1");
+  assert.equal(values.reasoningEffort, "");
+  values = applyRuntimeFormV2Change(kimi, kimiSources, values, "model", "k2");
+  assert.equal(values.reasoningEffort, "high", "back to K2's default, not the leftover Default");
 });
 
 test("on edit a blank secret is valid (it keeps the stored value); on create it is required", () => {

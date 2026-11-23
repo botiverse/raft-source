@@ -538,8 +538,14 @@ test("re-baseline accepts a lower serverSeq from the new epoch", () => {
 test("late old-epoch trajectory hydrate is dropped after re-baseline", async () => {
   resetStores();
   const response = deferred<{ data: Array<{ timestamp: number; serverSeq: number; entry: TrajectoryEntry }> }>();
+  let calls = 0;
   api.get = (async (url: string) => {
     assert.equal(url, "/agents/agent-1/activity-log");
+    calls += 1;
+    // The retry for the new generation reads the server's new-epoch log.
+    if (calls > 1) {
+      return { data: [{ timestamp: 200, serverSeq: 1, entry: { kind: "status", activity: "thinking", detail: "New epoch" } }] };
+    }
     return response.promise;
   }) as typeof api.get;
 
@@ -578,6 +584,48 @@ test("late old-epoch trajectory hydrate is dropped after re-baseline", async () 
       entry: { kind: "status", activity: "thinking", detail: "New epoch" },
     },
   ]);
+});
+
+test("a trajectory load dropped by a mid-flight generation bump loads again and fills the idle log", async () => {
+  resetStores();
+  const first = deferred<{ data: Array<{ timestamp: number; serverSeq: number; entry: TrajectoryEntry }> }>();
+  const entry = { timestamp: 100, serverSeq: 3, entry: { kind: "status", activity: "online", detail: "Idle" } as TrajectoryEntry };
+  let calls = 0;
+  api.get = (async (url: string) => {
+    assert.equal(url, "/agents/agent-1/activity-log");
+    calls += 1;
+    return calls === 1 ? first.promise : { data: [entry] };
+  }) as typeof api.get;
+
+  const loadPromise = useAgentStore.getState().loadTrajectoryLog("agent-1");
+  // Bootstrap re-baselines (loadAgents / resetActivitySeq) while the load is in flight.
+  useAgentStore.getState().resetActivitySeq();
+  first.resolve({ data: [entry] });
+  await loadPromise;
+
+  assert.equal(calls, 2);
+  assert.deepEqual(useAgentStore.getState().getTrajectoryLog("agent-1"), [entry]);
+
+  // Without another bump, a later load is a single request.
+  await useAgentStore.getState().loadTrajectoryLog("agent-1");
+  assert.equal(calls, 3);
+});
+
+test("concurrent trajectory loads share one run and coalesce into one follow-up request", async () => {
+  resetStores();
+  const first = deferred<{ data: Array<{ timestamp: number; serverSeq: number; entry: TrajectoryEntry }> }>();
+  let calls = 0;
+  api.get = (async () => {
+    calls += 1;
+    return calls === 1 ? first.promise : { data: [] };
+  }) as typeof api.get;
+
+  const loads = [1, 2, 3].map(() => useAgentStore.getState().loadTrajectoryLog("agent-1"));
+  assert.equal(calls, 1);
+  first.resolve({ data: [] });
+  await Promise.all(loads);
+
+  assert.equal(calls, 2);
 });
 
 test("producer seq conflict emits state violation with arrival-sensitive fields in meta", async () => {

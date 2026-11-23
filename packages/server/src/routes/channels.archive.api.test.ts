@@ -1,4 +1,4 @@
-import { fixturePasswordHash } from "../test/integration/credentials";
+import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 
@@ -484,4 +484,36 @@ test("search can be scoped to an archived channel (channelId filter still works)
   assert.equal(body.results.length, 1, "scoped search must return the archived channel's hit");
   assert.equal(body.results[0].channelId, f.channelId);
   assert.ok(body.results[0].channelArchivedAt);
+});
+
+test("a thread the caller can't see answers archive, unarchive and both settings reads like a missing id; a visible one keeps its 400", async ({ app }) => {
+  const f = await seedArchiveFixture(app.baseUrl);
+  // A private channel the other member is not in, with a thread under it.
+  const hidden = await createChannel(f.serverId, "archive-hidden-room", undefined, "private");
+  await addHuman(hidden.id, f.ownerId);
+  const parent = await createMessage(hidden.id, "user", f.ownerId, "hidden parent");
+  const thread = await getOrCreateThread(parent.id, f.ownerId, "user");
+  const otherToken = await tokenForHuman("archive-other@slock.test");
+  const missingId = "00000000-0000-4000-8000-000000000000";
+
+  const probes = [
+    { label: "archive", method: "POST", path: (id: string) => `/api/channels/${id}/archive` },
+    { label: "unarchive", method: "POST", path: (id: string) => `/api/channels/${id}/unarchive` },
+    { label: "notification settings", method: "GET", path: (id: string) => `/api/channels/${id}/notification-settings` },
+    { label: "message display settings", method: "GET", path: (id: string) => `/api/channels/${id}/message-display-settings` },
+  ] as const;
+  const call = async (token: string, method: string, path: string) => {
+    const res = await fetch(`${app.baseUrl}${path}`, { method, headers: userHeaders(token, f.serverId) });
+    return { status: res.status, body: await res.json() as unknown };
+  };
+
+  for (const probe of probes) {
+    const missing = await call(otherToken, probe.method, probe.path(missingId));
+    const hiddenThread = await call(otherToken, probe.method, probe.path(thread.id));
+    assert.equal(missing.status, 404, `${probe.label}: a missing id is a 404`);
+    assert.deepEqual(hiddenThread, missing, `${probe.label}: a hidden thread must read exactly like a missing id`);
+    // The owner can see the thread, so it is still told why it can't use it.
+    const visible = await call(f.ownerToken, probe.method, probe.path(thread.id));
+    assert.equal(visible.status, 400, `${probe.label}: a visible thread keeps its 400`);
+  }
 });

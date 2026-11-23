@@ -1,0 +1,44 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "grok",
+  "schemaVersion": "grok.create.v1",
+  "sourceId": "model",
+  "kind": "select",
+  "pointer": "/model",
+  "options": [
+    {
+      "value": "grok-4.5",
+      "label": "Grok 4.5",
+      "supportedReasoningEfforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoningEffort": "high"
+    },
+    {
+      "value": "grok-4.6",
+      "label": "Grok 4.6",
+      "supportedReasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ]
+    },
+    {
+      "value": "grok-composer-2.5-fast",
+      "label": "Composer 2.5",
+      "supportedReasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ]
+    }
+  ],
+  "defaultValue": "grok-4.5",
+  "status": "fallback",
+  "reason": "missing_config",
+  "retryable": false
+}

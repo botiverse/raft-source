@@ -51,9 +51,11 @@ export type UpgradeGate = (typeof UPGRADE_GATES)[number];
  * actually run into, plus `general`. Not `pro_theme` (choosing a theme is a
  * person's action in the web app) or `plan_downgraded` (a state people see
  * after a downgrade); those stay with the web's upgrade dialog only (Tenny).
- * Nor the external channel gates (`external_channel_free_limit`,
- * `external_channel_frozen`), not yet: only the web's own Upgrades open them,
- * and naming one here adds it to the agent API's gate list.
+ * The external channel gates are here since the external channel rules apply
+ * to every server (external_channels_v1 on since 2026-11-18). The four
+ * `joint_channel_*` gates stay accepted, so a CLI with an older bundled schema
+ * is not refused, but the manual no longer lists them and their card says what
+ * the external channel gates say (Tenny, Warden, #proj-commercial:#28).
  */
 export const AGENT_UPGRADE_CARD_GATES = [
   "history_30d",
@@ -64,6 +66,8 @@ export const AGENT_UPGRADE_CARD_GATES = [
   "joint_channel_over_limit",
   "joint_channel_read_only",
   "agent_migration",
+  "external_channel_free_limit",
+  "external_channel_frozen",
   GENERAL_UPGRADE_GATE,
 ] as const satisfies readonly UpgradeGate[];
 export type AgentUpgradeCardGate = (typeof AGENT_UPGRADE_CARD_GATES)[number];

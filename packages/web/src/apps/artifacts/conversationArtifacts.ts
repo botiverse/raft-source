@@ -1,9 +1,12 @@
-import { useCallback, useEffect, useState } from "react";
-import type { ArtifactCard, ArtifactId, ChannelId } from "@botiverse/raft-shared";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import type { ArtifactCard, ArtifactId, ArtifactKind, ChannelId } from "@botiverse/raft-shared";
 
+import { objectRefKey } from "../../objects/objectSummaryLoader";
+import { artifactObjectRefOf } from "./apiArtifactSource";
 import { artifactErrorCode } from "./artifactApi";
+import type { ArtifactLinkTarget } from "./artifactLinks";
 import { rememberArtifactCard } from "./artifactOpenIntent";
-import { artifactSource } from "./artifactSource";
+import { artifactSource, useArtifactLinkSummaries } from "./artifactSource";
 import { useArtifactViewerStore } from "./artifactViewerStore";
 import { openArtifactInPlace } from "./openArtifactInPlace";
 import { useWorkspaceArtifactsEnabled } from "./useWorkspaceArtifactsEnabled";
@@ -100,6 +103,19 @@ export function openConversationArtifact(card: ArtifactCard, from: HTMLElement, 
  */
 export function openChannelAnnouncement(id: ArtifactId, from: HTMLElement, conversationId: string): boolean {
   return openArtifactInPlace({ id, version: null }, from, "other", conversationId);
+}
+
+/**
+ * The kind of a channel's pinned Artifact (Markdown, HTML, ...), for its row's icon in channel details: the
+ * announcement payload doesn't carry it, so it comes from core's object summaries (one batched, cached read, the
+ * one an Artifact link's chip makes). Null until it is read, or when it can't be.
+ */
+export function useChannelAnnouncementKind(id: ArtifactId | null): ArtifactKind | null {
+  const targets = useMemo<ArtifactLinkTarget[]>(() => (id ? [{ id, version: null }] : []), [id]);
+  const summaries = useArtifactLinkSummaries(targets, targets.length > 0);
+  const target = targets[0];
+  const answer = target ? summaries?.get(objectRefKey(artifactObjectRefOf(target))) : undefined;
+  return answer?.status === "ok" ? answer.summary.kind : null;
 }
 
 /** Whether the Artifact column beside `conversationId` shows this Artifact now (the announcement strip keeps its open look). */

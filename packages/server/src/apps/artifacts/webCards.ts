@@ -19,6 +19,11 @@
 // is the same split: core decides who could see it, by the same rule on the
 // home it had (visibility.ts deletedArtifactHomes, never a revoked one), and
 // only then is it built here, of the few things that say what it was.
+//
+// Settled (#334): every card carries the Artifact's current state
+// (`settled`, `reopened`: settledState.ts), whichever version it shows, where
+// the Artifact's server has artifact_settled_v0 on and the reader isn't an
+// outsider to it; absent otherwise, so a client offers nothing of it.
 import { and, desc, eq, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
 import {
   artifactFileType,
@@ -31,11 +36,15 @@ import {
   type ArtifactHome,
   type ArtifactObjectRef,
   type ArtifactPreview,
+  type ArtifactSettled,
+  parseArtifactRef,
 } from "@botiverse/raft-shared";
-import { conversationNames, type ConversationName, type ConversationType } from "../../platform/conversations";
+import { appHosts } from "../../platform/links";
+import { conversationNames, UNRESOLVED_JOINT_HOME, unresolvedJointHomes, type ConversationName, type ConversationType } from "../../platform/conversations";
 import { getDb } from "../../platform/db";
-import { accessOf, artifactAppUrl, readsAsOutsider, type ArtifactActorRef } from "./apiCommon";
+import { accessOf, artifactAppUrl, readsAsOutsider, reportRead, type ArtifactActorRef } from "./apiCommon";
 import { cardCheckShots, cardShotKey, type CardCheckShots, type CardShotAsk } from "./checks";
+import { reopenedOf, settledOf, settledServers, type SettledState } from "./settledState";
 import { profiler, shownActorOf, type ArtifactWebReader } from "./webCommon";
 import { artifactAudit, artifactComments, artifactItems, artifactReadPositions, artifactVersions, type ArtifactItemRow, type ArtifactVersionRow } from "./schema";
 
@@ -110,7 +119,13 @@ export async function artifactCards(
 export interface ArtifactCardFacts {
   commentCounts: ReadonlyMap<string, number>;
   conversations: ReadonlyMap<string, ConversationName>;
+  /** Homes in a joint the reader's server has no projection of (unresolvedJointHomes): shown as UNRESOLVED_JOINT_HOME. */
+  unresolvedJoints: ReadonlySet<string>;
   screenshots: ReadonlyMap<string, CardCheckShots>;
+  /** Items whose cards say whether they are Settled (settledOn): the flag on for its server, the reader not an outsider. */
+  settledShown: ReadonlySet<string>;
+  /** Who settled them (one profile lookup), for `settled` and `reopened`. */
+  settlerOf: (actor: ArtifactActorRef) => ArtifactActor;
 }
 
 /**
@@ -125,7 +140,9 @@ export interface ArtifactCardFacts {
 export async function artifactCardFacts(reader: ArtifactWebReader, items: readonly ArtifactItemRow[], showing: readonly CardShotAsk[]): Promise<ArtifactCardFacts> {
   const counted = [...new Set(items.filter((item) => accessOf(reader, item).comments).map((item) => item.id))];
   const channelIds = [...new Set(items.flatMap((item) => (item.homeKind === "conversation" && item.homeChannelId ? [item.homeChannelId] : [])))];
-  const [counts, conversations, screenshots] = await Promise.all([
+  // Settled (#334): only items with a settle, standing or lapsed, need the flag and a name.
+  const settling = items.filter((item) => item.settledAt !== null && !readsAsOutsider(reader.serverId, item));
+  const [counts, conversations, screenshots, settledOn] = await Promise.all([
     counted.length > 0
       ? getDb().select({ itemId: artifactComments.itemId, count: sql<number>`count(*)::int` }).from(artifactComments)
         .where(and(inArray(artifactComments.itemId, counted), isNull(artifactComments.deletedAt)))
@@ -133,8 +150,30 @@ export async function artifactCardFacts(reader: ArtifactWebReader, items: readon
       : [],
     channelIds.length > 0 ? conversationNames(reader, channelIds) : new Map<string, ConversationName>(),
     cardCheckShots(reader.serverId, showing),
+    settledServers(items.filter((item) => !readsAsOutsider(reader.serverId, item)).map((item) => item.serverId)),
   ]);
-  return { commentCounts: new Map(counts.map((row) => [row.itemId, row.count])), conversations, screenshots };
+  const settledShown = new Set(items.filter((item) => settledOn.has(item.serverId) && !readsAsOutsider(reader.serverId, item)).map((item) => item.id));
+  const settlers = settling.filter((item) => settledShown.has(item.id)).flatMap((item) => {
+    const settle = settledOf(item) ?? reopenedOf(item)?.was;
+    return settle ? [settle.by] : [];
+  });
+  const [unresolvedJoints, settlerOf] = await Promise.all([
+    unresolvedJointHomes(channelIds, conversations),
+    profiler(settlers),
+  ]);
+  return { commentCounts: new Map(counts.map((row) => [row.itemId, row.count])), conversations, unresolvedJoints, screenshots, settledShown, settlerOf };
+}
+
+/** A card's `settled` and `reopened` (#334): the Artifact's current state, or nothing where the card says nothing of it. */
+function settledFieldsOf(reader: ArtifactWebReader, facts: ArtifactCardFacts, item: ArtifactItemRow): Pick<ArtifactCard, "settled" | "reopened"> {
+  if (!facts.settledShown.has(item.id)) return {};
+  const shown = (settle: SettledState): ArtifactSettled => ({ by: shownActorOf(reader, item, facts.settlerOf(settle.by)), at: settle.at.toISOString(), version: settle.version });
+  const settled = settledOf(item);
+  const reopened = reopenedOf(item);
+  return {
+    settled: settled ? shown(settled) : null,
+    reopened: reopened ? { version: reopened.version, was: shown(reopened.was) } : null,
+  };
 }
 
 /**
@@ -160,15 +199,16 @@ export function cardsOf(
   actorOf: (actor: ArtifactActorRef) => ArtifactActor,
   facts: ArtifactCardFacts,
 ): ArtifactCard[] {
-  const { commentCounts, conversations } = facts;
+  const { commentCounts, conversations, unresolvedJoints } = facts;
   // The reader's view of the home: a conversation by its id and name as the
   // reader sees it (a joint by the reader's server's projection; none for an
   // orphan, and no id once its channel row is gone).
   const homeOf = (item: ArtifactItemRow): ArtifactHome => {
     if (item.homeKind !== "conversation") return { kind: item.homeKind };
     const channelId = item.homeChannelId;
+    if (channelId && unresolvedJoints.has(channelId)) return { kind: "conversation", conversation: { id: UNRESOLVED_JOINT_HOME.id, name: UNRESOLVED_JOINT_HOME.name, type: UNRESOLVED_JOINT_HOME.type } };
     const conversation = channelId ? conversations.get(channelId) : undefined;
-    return { kind: "conversation", conversation: { id: conversation?.id ?? channelId, name: conversation?.name ?? "", type: conversation?.type ?? "channel", ...(conversation?.peerDisplayName ? { peerDisplayName: conversation.peerDisplayName } : {}) } };
+    return { kind: "conversation", conversation: { id: conversation?.id ?? channelId, name: conversation?.name ?? "", type: conversation?.type ?? "channel", ...(conversation?.peerDisplayName ? { peerDisplayName: conversation.peerDisplayName } : {}), ...(conversation?.archived ? { archived: true as const } : {}) } };
   };
   return shown.map(({ item, version, current, pinned }) => ({
     id: asArtifactId(item.id),
@@ -187,6 +227,7 @@ export function cardsOf(
     commentCount: commentCounts.get(item.id) ?? 0,
     home: homeOf(item),
     ...(readsAsOutsider(reader.serverId, item) ? { fromAnotherServer: true as const } : {}),
+    ...settledFieldsOf(reader, facts, item),
   }));
 }
 
@@ -241,6 +282,56 @@ export async function artifactCardUnseen(reader: ArtifactWebReader, items: reado
     newComments: Number(row.new_comments),
     firstNewComment: row.first_new_comment == null ? null : asArtifactCommentId(String(row.first_new_comment)),
   }]));
+}
+
+/**
+ * ArtifactViewerData `unseenAtOpen`: what was new to the reader on `item` as
+ * the viewer opened it, from where they had read to before the open. The
+ * same counts as a card's `unseen` (artifactCardUnseen), but a reader with no
+ * read position yet (never opened it, nor read it in Activity) is past
+ * nothing: every live comment and published version by someone else is new
+ * to them. `moveTo`: the open also moves their read position there
+ * (apiCommon advanceReadPosition's move, never back, and its report to
+ * Activity), the old position read in the same statement as the move (one
+ * snapshot: what it moved from), so no statement is added to the viewer's
+ * first screen. Not for a reader who reads it as an outsider (they keep none).
+ * A person's only: the move writes a `user` read position and never consumes
+ * notices, so an agent's read position moves through advanceReadPosition
+ * (which consumes its notices about the Artifact once it has seen it to the end).
+ */
+export async function viewerUnseenOf(reader: ArtifactWebReader, item: ArtifactItemRow, moveTo: number | null = null): Promise<ArtifactCardUnseen> {
+  const me = sql`${reader.userId}::uuid`;
+  const from = sql`COALESCE((SELECT position FROM before), 0)`;
+  const newComments = sql`FROM ${artifactComments} c
+    WHERE c.item_id = ${item.id} AND c.deleted_at IS NULL AND c.position > ${from}
+      AND NOT (c.author_type = 'user' AND c.author_id = ${me})`;
+  const move = moveTo === null ? sql`` : sql`, moved AS (
+      INSERT INTO ${artifactReadPositions} AS rp (item_id, actor_type, actor_id, position)
+      VALUES (${item.id}, 'user', ${me}, ${moveTo})
+      ON CONFLICT (item_id, actor_type, actor_id) DO UPDATE SET position = GREATEST(rp.position, excluded.position), updated_at = now()
+      RETURNING 1
+    )`;
+  const db = getDb();
+  const [row] = (await db.execute(sql`
+    WITH before AS (
+      SELECT rp.position FROM ${artifactReadPositions} rp
+      WHERE rp.item_id = ${item.id} AND rp.actor_type = 'user' AND rp.actor_id = ${me}
+    )${move}
+    SELECT
+      EXISTS (
+        SELECT 1 FROM ${artifactVersions} v
+        WHERE v.item_id = ${item.id} AND v.revoked_at IS NULL AND v.position IS NOT NULL AND v.position > ${from}
+          AND NOT (v.publisher_type = 'user' AND v.publisher_id = ${me})
+      ) AS newer_version,
+      (SELECT count(*)::int ${newComments}) AS new_comments,
+      (SELECT c.id ${newComments} ORDER BY c.position LIMIT 1) AS first_new_comment`)).rows as Array<Record<string, unknown>>;
+  // A person's Activity row knows what they have read (core's unread and badge), as advanceReadPosition reports it.
+  if (moveTo !== null) await reportRead(db, reader.userId, [{ itemId: item.id, position: moveTo }]);
+  return {
+    newerVersion: row?.newer_version === true,
+    newComments: Number(row?.new_comments ?? 0),
+    firstNewComment: row?.first_new_comment == null ? null : asArtifactCommentId(String(row.first_new_comment)),
+  };
 }
 
 /**
@@ -319,6 +410,30 @@ export function parseArtifactObjectRef(value: { id: string } & Record<string, un
   if (version === undefined) return { id: asArtifactId(id) };
   if (typeof version !== "number" || !Number.isInteger(version) || version < 1 || version > MAX_REF_VERSION) return null;
   return { id: asArtifactId(id), version };
+}
+
+/**
+ * The registration's linkHosts (AppObjectKind.linkHosts): besides Raft's app
+ * hosts, where artifactIdOfLink names an Artifact by its id: the redirect
+ * host and the content origin (`a-pt-<uuid>.raftusercontent.com`, by its
+ * parent domain). The standalone app's hosts name Artifacts by name only, so
+ * artifactIdOfLink reads none there.
+ */
+export const ARTIFACT_LINK_ID_HOSTS: readonly string[] = ["artifacts.raft.build", "raftusercontent.com"];
+
+/**
+ * The registration's linkId (AppObjectKind.linkId): the Artifact a link
+ * names by its id (`pt_…` or the short id of every link Raft builds), on
+ * this deployment's app hosts (appHosts, as message cards read links), the
+ * redirect host or the content origin; its `/v/<n>` is dropped (the link
+ * names the Artifact). A link by a name (the standalone app's
+ * `raft-artifacts.com/p/<server>/<name>`), an old per-version link or any
+ * other address names none here: null.
+ */
+export function artifactIdOfLink(url: string): string | null {
+  if (!/^https?:\/\//i.test(url.trim())) return null;
+  const parsed = parseArtifactRef(url, { appHosts: appHosts() });
+  return parsed.kind === "id" ? parsed.id : null;
 }
 
 /**

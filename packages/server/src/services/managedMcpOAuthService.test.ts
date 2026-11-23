@@ -82,6 +82,8 @@ async function seedOAuthConnection(kind: "linear" | "custom" = "linear") {
     provider: kind,
     authMode: "oauth",
     endpointUrl: kind === "linear" ? "https://mcp.linear.app/mcp" : "https://connection-a.example.test/mcp",
+    // As the owner's own create: vouched, so every Agent has the App.
+    vouchAsCreator: true,
   });
   const storage = {
     redirectUrl: "https://raft.example.test/api/mcp/oauth/callback",

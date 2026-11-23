@@ -48,8 +48,8 @@ import { dismissLayerProps } from "./dismissLayer";
  * Rules:
  *  - The current workspace's row hides its own unread count: you are already
  *    there.
- *  - Selecting another workspace navigates to its last remembered surface,
- *    falling back to `/s/${slug}`; ServerResolver flips `current` once the
+ *  - Selecting another workspace navigates to its place (hooks/placeMemory.ts:
+ *    its last tab's page, without a pane), else `/s/${slug}`; ServerResolver flips `current` once the
  *    route lands. The URL is the source of truth, the store is not updated
  *    directly.
  *

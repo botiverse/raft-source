@@ -1,25 +1,21 @@
-import { useCallback, useMemo, useRef, useState } from "react";
-import type { MouseEvent, RefObject } from "react";
+import { useCallback, useId, useMemo, useRef, useState } from "react";
+import type { RefObject } from "react";
 import { useIntl } from "react-intl";
-import { ChevronRight, Ellipsis, Megaphone, Replace, X } from "lucide-react";
-import {
-  Button,
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-  ListRow, ListRowBody, ListRowChevron, ListRowDescription, ListRowGroup, ListRowIcon, ListRowMeta, ListRowTitle } from "@botiverse/raft-ui";
+import { Pin } from "lucide-react";
+import { Button, ListRowGroup } from "@botiverse/raft-ui";
 import { ChoiceList } from "@botiverse/raft-ui/wip";
 import type { ChoiceListItem } from "@botiverse/raft-ui/wip";
 import { asChannelId } from "@botiverse/raft-shared";
-import type { ArtifactCard, ChannelAnnouncementForPerson } from "@botiverse/raft-shared";
+import type { ArtifactCard } from "@botiverse/raft-shared";
 
-import { artifactKindIcon, artifactUrl, openChannelAnnouncement, useConversationArtifacts } from "../../apps/artifacts";
+import { artifactKindIcon, useConversationArtifacts } from "../../apps/artifacts";
 import { useTimeFormatter } from "../../hooks/useTimeFormatter";
 import { setChannelAnnouncement, useChannelAnnouncement } from "../../store/channelAnnouncementStore";
-import { formatRelativeTime } from "../../utils/relativeTime";
 import ConfirmDialog from "../ConfirmDialog";
-import { CHANNEL_ANNOUNCEMENT_ROW_ID, useAnnouncementAuthor } from "./channelAnnouncementParts";
+import SectionHeader from "../ui/SectionHeader";
+import { CHANNEL_ANNOUNCEMENT_ROW_ID } from "./channelAnnouncementParts";
+import { PinnedArtifactRow, PinnedEmptyRow } from "./PinnedArtifactRow";
+import type { PinnedArtifactActions } from "./PinnedArtifactRow";
 
 type Step =
   | { kind: "idle" }
@@ -28,31 +24,27 @@ type Step =
   | { kind: "remove" };
 
 /**
- * Channel details › Announcement (#proj-chat:#29, flag channel_announcement_v0;
- * raft-design channel.md "Setting, replacing and removing"), after the
- * description:
- * - with an announcement: the Artifact itself, a row that opens it beside the
- *   channel (with a chevron); for who may change it (editChannelMetadata: the
- *   channel's owner, a server owner or admin), a ⋯ button in the chevron's
- *   place instead, on top of the row's end and never inside its link, whose
- *   menu offers Replace and Remove (not coloured: the confirmation carries
- *   the consequence); while the menu is open the row keeps its hover fill;
- * - without: for who may change it, a line on what it is for and Set
- *   announcement; nothing at all for everyone else.
- * Set and Replace choose among the channel's own Artifacts (a Dialog md with
- * a ChoiceList); Replace and Remove then confirm in a Dialog sm whose confirm
- * is `primary`, not `danger`: nothing is deleted, the Artifact stays in the
- * channel and can be set again.
+ * Channel details › Pinned content (the channel announcement, #proj-chat:#29, flag channel_announcement_v0; named
+ * "Pinned content" / 「置顶内容」 in the UI since cindyz's review, #proj-chat:#35; raft-design channel.md "Setting,
+ * replacing and removing"), under the members. A section heading with the pin, as Channel settings has, over one box:
+ * - with pinned content: the Artifact as one row (PinnedArtifactRow) that opens it beside the channel; for who may
+ *   change it (editChannelMetadata: the channel's owner, a server owner or admin), a ⋯ before the chevron whose
+ *   menu offers Replace pin and Unpin (not coloured: the confirmation carries the consequence);
+ * - without: for who may change it, a muted "Nothing pinned" and Pin an Artifact; no section at all for anyone else.
+ * Pin and Replace choose among the channel's own Artifacts (a Dialog md with a ChoiceList); Replace and Unpin then
+ * confirm in a Dialog sm whose confirm is `primary`, not `danger`: nothing is deleted, the Artifact stays in the
+ * channel and can be pinned again.
  */
 export function ChannelAnnouncementField({ channelId, channelName, channelType, canEdit, onOpened }: {
   channelId: string;
   channelName: string;
   channelType: string | undefined;
   canEdit: boolean;
-  /** After the row opened the announcement beside the channel: the drawer closes. */
+  /** After the row opened the pinned Artifact beside the channel (on a phone the details page closes, to show it). */
   onOpened?: () => void;
 }) {
   const { formatMessage } = useIntl();
+  const headingId = useId();
   const announcement = useChannelAnnouncement(channelId, channelType);
   const [step, setStep] = useState<Step>({ kind: "idle" });
   const close = useCallback(() => setStep({ kind: "idle" }), []);
@@ -68,37 +60,25 @@ export function ChannelAnnouncementField({ channelId, channelName, channelType, 
   const confirmRemove = useCallback(() => setChannelAnnouncement(channelId, null), [channelId]);
   // The menu item that opened a dialog is gone once the menu closes, so the dialogs give focus back to ⋯.
   const actionsRef = useRef<HTMLButtonElement | null>(null);
-  const actions = useMemo(
+  const actions = useMemo<PinnedArtifactActions | undefined>(
     () => (canEdit ? { onReplace: startReplace, onRemove: startRemove, triggerRef: actionsRef } : undefined),
     [canEdit, startReplace, startRemove],
   );
 
-  // Not read yet, the flag off, or a channel that can't have one; and nothing to show someone who can't set one.
+  // Not read yet, the flag off, or a channel that can't have one; and nothing to show someone who can't pin one.
   if (announcement === undefined || (announcement === null && !canEdit)) return null;
 
-  // One card of its own in the channel details (raft-design channel.md): the announcement as a row that opens it,
-  // and for who may change it a ⋯ menu with Replace and Remove at the row's end.
   return (
-    <section id={CHANNEL_ANNOUNCEMENT_ROW_ID} data-testid="channel-settings-announcement" aria-label={formatMessage({ id: "channel.announcement.label" })}>
+    <section id={CHANNEL_ANNOUNCEMENT_ROW_ID} className="stack-y-3" data-testid="channel-settings-announcement" aria-labelledby={headingId}>
+      <SectionHeader
+        icon={<Pin size={16} aria-hidden="true" />}
+        label={<span id={headingId}>{formatMessage({ id: "channel.announcement.label" })}</span>}
+      />
       <ListRowGroup>
         {announcement ? (
-          <AnnouncementItem
-            channelId={channelId}
-            announcement={announcement}
-            onOpened={onOpened}
-            actions={actions}
-          />
+          <PinnedArtifactRow channelId={channelId} announcement={announcement} onOpened={onOpened} actions={actions} />
         ) : (
-          <ListRow variant="plain" interactive={false} data-testid="channel-settings-announcement-empty">
-            <ListRowIcon><Megaphone aria-hidden="true" /></ListRowIcon>
-            <ListRowBody>
-              <ListRowTitle>{formatMessage({ id: "channel.announcement.details.emptyTitle" })}</ListRowTitle>
-              <ListRowDescription wrap>{formatMessage({ id: "channel.announcement.details.emptyBody" })}</ListRowDescription>
-            </ListRowBody>
-            <Button type="button" size="md" variant="outline" className="shrink-0" onClick={startSet} data-testid="channel-settings-announcement-set">
-              {formatMessage({ id: "channel.announcement.details.set" })}
-            </Button>
-          </ListRow>
+          <PinnedEmptyRow onPin={startSet} />
         )}
       </ListRowGroup>
 
@@ -143,93 +123,7 @@ export function ChannelAnnouncementField({ channelId, channelName, channelType, 
   );
 }
 
-/**
- * The current announcement as a row of its own: the whole row opens it beside the channel. With `actions`
- * (who may change it), ⋯ takes the chevron's place, on top of the row's end as the link's sibling (raft-ui
- * InboxItem's pattern): the row keeps room for it, and shows its hover fill while the pointer is on ⋯ or its menu is
- * open (ListRow draws `data-popup-open` as hover).
- */
-type AnnouncementActions = { onReplace: () => void; onRemove: () => void; triggerRef: RefObject<HTMLButtonElement | null> };
-
-function AnnouncementItem({ channelId, announcement, onOpened, actions }: {
-  channelId: string;
-  announcement: ChannelAnnouncementForPerson;
-  onOpened?: () => void;
-  /** For who may change it: ⋯ with Replace and Remove. */
-  actions?: AnnouncementActions;
-}) {
-  const { formatMessage, locale } = useIntl();
-  const [menuOpen, setMenuOpen] = useState(false);
-  const editable = actions !== undefined;
-  const author = useAnnouncementAuthor(announcement.updatedBy);
-  const handleOpen = useCallback((event: MouseEvent<HTMLAnchorElement>) => {
-    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey) return;
-    if (openChannelAnnouncement(announcement.artifactId, event.currentTarget, channelId)) {
-      event.preventDefault();
-      onOpened?.();
-    }
-  }, [announcement.artifactId, channelId, onOpened]);
-  const meta = formatMessage({ id: "channel.announcement.details.meta" }, {
-    version: announcement.version,
-    name: author.name ?? formatMessage({ id: "channel.announcement.someone" }),
-    time: formatRelativeTime(announcement.updatedAt, locale) ?? "",
-  });
-  const row = (
-    <ListRow
-      variant="plain"
-      // The row's title is the link's text (the anchor gets it through ListRow's children).
-      render={<a href={artifactUrl(announcement.artifactId)} onClick={handleOpen} aria-label={announcement.title} />}
-      // Room for ⋯ (end-2, 32 to 34px wide) so the text never runs under it.
-      className={editable ? "pe-14 group-hover/announcement-row:overlay-subtle" : undefined}
-      data-popup-open={menuOpen ? "" : undefined}
-      data-testid="channel-settings-announcement-item"
-    >
-      <ListRowIcon><Megaphone aria-hidden="true" /></ListRowIcon>
-      <ListRowBody>
-        <ListRowTitle>{announcement.title}</ListRowTitle>
-        <ListRowMeta className="block">{meta}</ListRowMeta>
-      </ListRowBody>
-      {editable ? null : <ListRowChevron><ChevronRight aria-hidden="true" /></ListRowChevron>}
-    </ListRow>
-  );
-  if (!actions) return row;
-
-  const actionsLabel = formatMessage({ id: "channel.announcement.details.actions" });
-  return (
-    <div className="group/announcement-row relative">
-      {row}
-      <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
-        <DropdownMenuTrigger
-          render={(
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-md"
-              ref={actions.triggerRef}
-              aria-label={actionsLabel}
-              className="absolute end-2 top-1/2 z-raised -translate-y-1/2"
-              data-testid="channel-settings-announcement-actions"
-            />
-          )}
-        >
-          <Ellipsis aria-hidden="true" />
-        </DropdownMenuTrigger>
-        <DropdownMenuContent side="bottom" align="end" sideOffset={4} aria-label={actionsLabel} data-testid="channel-settings-announcement-menu">
-          <DropdownMenuItem onClick={actions.onReplace} data-testid="channel-settings-announcement-replace">
-            <Replace />
-            {formatMessage({ id: "channel.announcement.details.replace" })}
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={actions.onRemove} data-testid="channel-settings-announcement-remove">
-            <X />
-            {formatMessage({ id: "channel.announcement.details.remove" })}
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
-    </div>
-  );
-}
-
-/** Set / Replace: one of the channel's own Artifacts (the Files list), the current announcement left out. */
+/** Pin / Replace pin: one of the channel's own Artifacts (the Files list), the one pinned now left out. */
 function AnnouncementPicker({ channelId, channelName, mode, currentId, onClose, onPicked, finalFocus }: {
   channelId: string;
   channelName: string;
@@ -237,7 +131,7 @@ function AnnouncementPicker({ channelId, channelName, mode, currentId, onClose, 
   currentId: string | null;
   onClose: () => void;
   onPicked: (card: ArtifactCard) => Promise<void> | void;
-  /** Where focus goes when it closes: ⋯, which opened it (Set has none: the dialog's own default). */
+  /** Where focus goes when it closes: ⋯, which opened it (Pin has none: the dialog's own default). */
   finalFocus?: RefObject<HTMLElement | null>;
 }) {
   const { formatMessage } = useIntl();

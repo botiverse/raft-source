@@ -4,10 +4,23 @@ Released runtime form definitions and the rules for changing them.
 
 ## Runtime form contract versioning
 
-The server sends agent create/edit forms (Built-in Pi, Kimi SDK) as a
-versioned definition: `GET /api/servers/:id/machines/:machineId/runtime-form-definitions/:runtimeId`,
-identified by `schemaVersion` (for example `builtin-pi.create.v3`). Installed
-mobile builds parse that definition by version and refuse to render the whole
+**v1 is retired (2026-11-18, #wg-runtime-form:#20).** Both v1 routes,
+`GET .../runtime-form-definitions/:runtimeId` and
+`GET .../runtime-form-definitions/:runtimeId/option-sources/:sourceId`, stay
+registered and answer HTTP 410 with
+`{ error: "This version of the app no longer supports creating or editing agents. Please update the app.", code: "runtime_form_v1_retired" }`
+for every runtime, so the old app builds that still call them (no version
+header; about 2,000 requests a week against 55,000 on v2 when retired) show an
+update message instead of a generic 404. Clients use the v2 form
+(`.../runtime-forms/v2/:runtimeId`). The v1 description below is kept as the
+history of the frozen samples; the samples stay as fixtures for the v2
+conversion and the server's contract tests, and the runtime-options row still
+carries the v1 `formDefinitionRef` for Built-in Pi and Kimi SDK.
+
+The server sent agent create/edit forms (Built-in Pi, Kimi SDK) as a
+versioned definition: `GET /api/servers/:id/machines/:machineId/runtime-form-definitions/:runtimeId`
+(retired, see above), identified by `schemaVersion` (for example
+`builtin-pi.create.v3`). Installed mobile builds parse that definition by version and refuse to render the whole
 form when it differs from what they expect. Released mobile builds stay on
 phones for a long time, so a released `schemaVersion` must never change shape.
 
@@ -44,12 +57,13 @@ agents and installed clients carry it; lists may grow.
 - Content: the response body the released server sent, plus a `provenance`
   header recording `schemaVersion`, the release branch, the server commit and the
   capture date. A sample must trace to a released server.
-- Serving: the server answers `GET runtime-form-definitions/:runtimeId` for a
-  released version from this sample (`releasedRuntimeFormDefinition`), not from
-  code, so later code changes cannot reach installed clients.
+- Serving: until v1 was retired (2026-11-18), the server answered
+  `GET runtime-form-definitions/:runtimeId` for a released version from this
+  sample (`releasedRuntimeFormDefinition`), not from code, so later code changes
+  could not reach installed clients. That route now answers 410.
 - Guards: `src/released.test.ts` checks every sample is registered with
   provenance; `packages/server/src/services/runtimeFormContract.test.ts` requires
-  every version the server serves to have a sample and, until a new version is
+  every released version (still used for submit validation) to have a sample and, until a new version is
   introduced, keeps the code builder equal to it so server-side validation stays
   aligned with the form clients render.
 
@@ -108,7 +122,7 @@ Which runtimes have a v2 form: the server's v2 registry
 (`packages/server/src/services/runtimeFormV2Registry.ts`), one entry per
 runtime with its definition, option sources, form values ↔ runtimeConfig
 mapping and write-only runtimeConfig secrets. Today: Built-in Pi, Kimi Code,
-OpenCode, Codex, Grok, Claude, Cursor, Pi, and the deprecated Kimi CLI, Gemini CLI, Antigravity CLI and Copilot CLI (edit
+OpenCode, Codex, Grok, Claude, Cursor, Pi, Antigravity CLI, and the deprecated Kimi CLI, Gemini CLI and Copilot CLI (edit
 only: the admission row offers a deprecated runtime only as an agent's current
 runtime, and a create with one is refused like any deprecated create). OpenCode
 and Kimi CLI take their model list from the Computer's probe; when the probe is
@@ -129,10 +143,10 @@ Copilot have a reasoning effort, Cursor none; Claude also has fast mode, a
 Default/Custom provider select (a static `provider` source, no `status`) whose
 Custom choice shows an API URL and a write-only API key, and an advanced Claude
 Command. On edit a blank API key keeps the stored one while the API URL is
-unchanged. The Claude key is write-only in the v2 form only: the v1 agent read
-(`GET /api/agents/:id`) still returns it to editors, because installed mobile
-apps prefill it from there and refuse to save a blank one
-(`redactOnAgentRead: false` in the registry). Pi (batch 4, the Pi CLI
+unchanged. The Claude key is write-only on both the v2 form and the v1 agent
+read (`GET /api/agents[/:id]` blanks it to `""`; web and mobile 1.24+ edit
+through `GET /api/agents/:id/runtime-form`, and legacy v1 PATCHes with a blank
+key keep the stored one while the API URL is unchanged). Pi (batch 4, the Pi CLI
 runtime, not Built-in Pi) has a provider select: Configured (the Computer's own
 Pi auth.json) or a Pi built-in provider (today DeepSeek) with a write-only API
 key. Configured takes its model list from the Computer's Pi probe and accepts a
@@ -142,16 +156,16 @@ value, so these are two fields, `model` (select) and `providerModel`
 (dependent_select on `provider`), each shown for its provider and each with
 its own reasoning effort field; both fill runtimeConfig.reasoningEffort. On
 edit a blank key keeps the stored one while the provider is unchanged, and the
-v1 agent read keeps returning the key, as for Claude. Pi has no saved provider
-connections (the legacy form loads them only for Built-in Pi). Every runtime in
+v1 agent read blanks the key as for Claude. Every runtime in
 the catalog now has a v2 form. The runtime admission row
 (`GET .../runtime-options`) carries `runtimeFormV2: { protocolVersion: 2 }` for
 every registered runtime; web opens v2 by that marker and has no v1 form any
 more (a row without it shows the form as unavailable). The marker is
 independent of the row's v1 `formDefinitionRef`: a runtime can have a v2 form
-and no v1 form, and then v1 clients never see it (the v1 routes 404 and the row
-has no `formDefinitionRef`). Mobile asks the v2 endpoint directly and falls back
-to v1 on 404.
+and no v1 form, and then the row has no `formDefinitionRef`. Mobile asks the v2
+endpoint directly and fell back to v1 on 404; the v1 routes are retired and
+answer 410 `runtime_form_v1_retired` for every runtime (see the top of this
+section).
 
 Client obligations:
 
@@ -168,10 +182,15 @@ Client obligations:
    inline Markdown links `[text](https://…)`: render them as links opening
    outside the app; nothing else is Markdown, and a non-https or malformed
    link stays plain text.
-4. Unknown field kind: optional → skip it and keep its stored value; required →
+4. Changing a field: a field that depends on it (`dependsOn` / `derivedFrom`)
+   keeps its value while the new parent still lists it (switching models keeps
+   the chosen effort), and otherwise takes its default. "" (Default) is kept
+   only when the old parent listed choices too
+   (`applyRuntimeFormV2Change`; #wg-runtime-form:2b064209).
+5. Unknown field kind: optional → skip it and keep its stored value; required →
    show the form, ask the user to update, and disable saving
    (`blockingFieldKeys`). Never drop the whole form.
-5. Submit field values, not a runtimeConfig: `POST /api/agents` with
+6. Submit field values, not a runtimeConfig: `POST /api/agents` with
    `formDefinitionRef: { protocolVersion: 2, runtimeId }` and `formValues`
    keyed by `dataSchema` property name. The server assembles the runtimeConfig
    (`buildRuntimeConfigFromFormValues`) and validates it like a v1 request;
@@ -179,7 +198,7 @@ Client obligations:
    (the server rewrites `/runtimeConfig/...` pointers). On create the server
    ignores keys it does not assemble, so "send back unrendered values" only
    matters for edit.
-6. Edit is the same form: `GET /api/agents/:id/runtime-form` returns the v2
+7. Edit is the same form: `GET /api/agents/:id/runtime-form` returns the v2
    form plus `values`, the agent's current field values. writeOnly fields are
    never included; the client shows them blank and, on edit, a blank writeOnly
    field means "keep the stored value" (a changed provider with a blank secret
@@ -197,7 +216,7 @@ Client obligations:
    `packages/server/src/services/runtimeFormV2WriteOnlyKeep.test.ts` keeps equal
    to what its `keepsIdentity` checks.
 
-7. Required client capabilities: the form may list
+8. Required client capabilities: the form may list
    `requiredClientCapabilities: string[]`, capabilities the client must
    implement beyond the base renderer. Absent or `null` means `[]`. If the list
    contains a name the client does not implement, or the value is not an array,
@@ -218,9 +237,10 @@ Client obligations:
      `choices`; keys matching no option are ignored.
    - `option_source.status`: `OptionSource.status` (`live` | `fallback` |
      `unavailable`), `reason` (`probe_timeout`, `probe_failed`,
-     `missing_config`, `no_models`, `unsupported`, `machine_offline`; absent
-     when live) and `retryable` (absent/false when live). One status per source,
-     worst wins (unavailable > fallback > live), dependent_select included.
+     `missing_config`, `no_models`, `unsupported`, `machine_offline`,
+     `not_signed_in`, `runtime_outdated`; absent when live) and `retryable`
+     (absent/false when live). One status per source, worst wins
+     (unavailable > fallback > live), dependent_select included.
      `unavailable` has no options. A required field whose source is unavailable
      shows the status (and a retry when `retryable`) and blocks submit; an
      optional one is hidden. Retry re-requests the same source with
@@ -237,8 +257,10 @@ Client obligations:
      these reads never answer 504
      (`packages/server/src/services/computerProbeCacheService.ts`).
 
-   - `provider.saved_connection`: saved provider connections inside the form
-     (today Built-in Pi). `Option.connectionId` (with the hard constraint
+   - `provider.saved_connection`: saved provider connections inside the form.
+     Retired: the Raft server removed saved provider connections
+     (`provider_connections_v0`) and no form lists this capability any more;
+     clients may keep parsing it. As it was specified (Built-in Pi): `Option.connectionId` (with the hard constraint
      `value === "connection:" + connectionId`), `underlyingProviderId`,
      `group` (`saved` first, then `direct`), and `unavailable`/
      `unavailableReason` for an edit whose bound connection is not selectable
@@ -266,11 +288,11 @@ Client obligations:
    known to every client, but no form lists them any more: every client that
    renders v2 (web, mobile >= 1.15) implements both, so a failed source marks
    only its own field unavailable on any form. Today Codex, Claude, Cursor,
-   Copilot and Pi list `select.custom_value`, and Built-in Pi lists
-   `provider.saved_connection` only on servers with provider connections
-   enabled. Web implements all four (`WEB_RUNTIME_FORM_V2_CAPABILITIES`);
-   mobile does not implement `provider.saved_connection` yet and falls back to
-   v1 for a form that requires it.
+   Copilot and Pi list `select.custom_value`; no form lists
+   `provider.saved_connection` any more (saved provider connections are
+   removed). A v2 option-source request that still carries `?formRevision=`
+   (from a form served before that) gets the 409 `form_revision_stale` and
+   refetches the form.
 
    How the server maps the Computer's model probe
    (`packages/server/src/services/runtimeFormV2SourceStatus.ts`):
@@ -283,6 +305,8 @@ Client obligations:
    | unsupported | unsupported | false |
    | error `detect_timeout`, or the server's wait timed out | probe_timeout | true |
    | error `computer_offline`, Computer not routed / socket not ready | machine_offline | true |
+   | error `runtime_not_authenticated` (the CLI is signed out there) | not_signed_in | true |
+   | error `protocol_unsupported` (the CLI is too old to list) | runtime_outdated | true |
    | any other error or thrown failure | probe_failed | true |
 
    Codex, Grok, Claude, Cursor, Copilot and Pi serve the bundled model list as
@@ -371,10 +395,13 @@ What differs from v2 (contract docs carry the details):
   escape, lazy, possessive or stacked quantifiers, a bare `]` `{` `}`. Matching
   follows ECMAScript: `$` matches only at the very end (a JVM evaluator uses
   `\z`, not `$`), and `.` excludes only `\n`, `\r`, U+2028 and U+2029 (a JVM
-  `.` also excludes U+0085, so use `[^\n\r\u2028\u2029]`). The server only
-  emits `^connection:` today.
-- Saved connections: no `x-connectionOwned`. An owned field without its own
-  visibility HIDEs while the provider matches `^connection:`; one with
+  `.` also excludes U+0085, so use `[^\n\r\u2028\u2029]`). The server emits
+  no pattern condition today: `^connection:` was the only one, for the
+  retired saved provider connections.
+- Saved connections (retired: the server no longer sends them; the fixtures
+  `builtin.*saved-connections*` and `builtin.edit.connection-unavailable`
+  keep the shapes for client conformance): no `x-connectionOwned`. An owned
+  field without its own visibility HIDEs while the provider matches `^connection:`; one with
   visibility (a gateway URL) is simply not listed for connections. A required
   owned field moves to `allOf[{ if: provider matches ^connection:, else:
   { required } }]`. Fields a provider shows that a connection does not own
@@ -401,6 +428,16 @@ What differs from v2 (contract docs carry the details):
   the model source's status. A model without a key (a typed model) hides the
   optional field and keeps its value (an edit submits the stored one).
   Refreshing a source re-requests its dependents.
+- Codex speed (`speed`, #wg-runtime-form:#27/#31), v3 only: mutually exclusive
+  with `fastMode` per model via `uiSchema.rules` (a v2 body omits `speed`).
+  Models whose Computer lists two or more fast tiers (`serviceTierChoices`)
+  hide `fastMode` (`HIDE`) and show `speed` (`SHOW`), an `x-optionSource`
+  dependent_select on `/model` with Standard (`""`, default) first followed by
+  each fast tier by id (`priority`, `ultrafast`, …) with Codex's own labels;
+  single-tier models hide `speed` and show only the `fastMode` checkbox;
+  models explicitly declaring zero fast tiers hide both. Stored in
+  `runtimeConfig.mode` (`kind: "default"` / `"fast"`, optional `serviceTier`)
+  and checked against the Computer's live list.
 - Unavailable options only in `OptionSource.unavailableOptions` (never
   `Option.unavailable`); entries may carry `connectionId`,
   `underlyingProviderId`, `group`, `providerKind`, and `reason` as plain text.
@@ -411,8 +448,53 @@ What differs from v2 (contract docs carry the details):
 - Submit: `formDefinitionRef.protocolVersion` 2 or 3, same `formValues`.
 
 Fixtures: `fixtures/*.v3.json` (server-produced, byte-locked by
-`packages/server/src/services/runtimeFormV3Fixtures.test.ts`) and the
+`packages/server/src/services/runtimeFormV3Fixtures.test.ts`, except the
+retired saved-connection ones, which the server no longer produces) and the
 conformance table.
+
+## Kitchen sink and visual cases
+
+`fixtures/kitchen-sink-<page>.*` is a generated set of v3 create forms with a row for every
+field kind the protocol has (`RUNTIME_FORM_V2_FIELD_KINDS`) in each state a
+client draws: empty, filled, required-missing, invalid, shown / hidden /
+required by a v3 rule, the Advanced group, choice labels, option sources that
+are live, fallback, stale, unavailable (with Retry), being retried (the only
+per-source loading state: sources load with the form) and unavailable while
+optional (hidden), a value no longer available, a value not listed, typed
+values, dependent selects that are list-only, a combobox, typed-only or have no
+list for the parent's value, and the unsupported kind (a `number` field: the
+protocol has no number kind; optional is skipped, required blocks saving). It is
+cut into pages (`KITCHEN_SINK_PAGES`: `inputs` and `choices`, each kind on one
+page), because a full-length capture stops at 2700 dp on every provider; a page
+over `KITCHEN_SINK_MAX_ROWS_PER_PAGE` rows fails the test. Each page has
+`kitchen-sink-<page>.form.v3.json`, one
+`kitchen-sink-<page>.option-source.<id>.v3.json` per source and
+`kitchen-sink-<page>.state.v3.json` (values a case sets over
+`initialRuntimeFormV2Values`, the sources shown as being retried, and the row
+table). `derived_select` has no row: it is v2 only (`x-optionsFrom`).
+
+`fixtures/visual-cases.v3.json` lists every runtime form visual case: the
+kitchen sink pages (`components.runtime-form.kitchen-sink.<page>`) and each server-produced `<runtime>.form.v3.json` with its
+`<runtime>.option-source.<source-id>.v3.json` fixtures (all produced by
+`packages/server/src/services/runtimeFormV3Fixtures.test.ts`). A real form's
+case starts at its initial values; `REAL_FORM_VISUAL_VALUES` sets values for
+the forms whose fields only appear after a choice (written to
+`<runtime>.visual-state.v3.json`), and a field still not drawn must be listed
+in `REAL_FORM_HIDDEN_FIELDS` with a reason. Web
+(`packages/web/visual-testing/RuntimeFormCases.tsx`) and mobile render the
+cases from these files with their production field renderers, so a capture
+difference is a renderer difference.
+
+Rows live in `src/kitchenSink.ts`, keyed by field kind. Regenerate with
+`pnpm --filter @botiverse/raft-runtime-form kitchen-sink:generate`;
+`src/kitchenSink.test.ts` fails when a generated file is stale, when a kind has
+no rows (or no exemption with a reason), when the kind x state matrix
+(`KITCHEN_SINK_KIND_STATES`: each state required for a kind, or not applicable
+with a reason) is incomplete or a kind's own rows miss a state it requires,
+when a row is not in the state it claims under the reference state rules (visibility, validation error, source
+status), when a state, a source status or an error code a v3 create form can
+show is uncovered, when a create form names a source without a fixture, or when
+a case is missing from `packages/visual-testing/shared/sharedCases.json`.
 
 ## Shared v2 fixtures
 

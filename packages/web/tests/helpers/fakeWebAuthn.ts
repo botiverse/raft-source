@@ -46,7 +46,8 @@ export function closedPrompt(): DOMException {
 
 /**
  * Installs the fake. `get` / `create` answer each call (throw to refuse);
- * `autofill`: whether conditional mediation is available. A conditional
+ * `autofill`: whether conditional mediation is available; `capabilities`:
+ * what getClientCapabilities() answers (absent: a browser without it). A conditional
  * request with no answer of its own (`pendingAutofill`) stays pending until
  * aborted, like a real browser's autofill that nobody picks from.
  */
@@ -55,11 +56,13 @@ export function installFakeWebAuthn({
   create,
   autofill = false,
   pendingAutofill = true,
+  capabilities,
 }: {
   get?: Answer;
   create?: Answer;
   autofill?: boolean;
   pendingAutofill?: boolean;
+  capabilities?: Record<string, boolean>;
 } = {}): FakeWebAuthn {
   const gets: CredentialRequestOptions[] = [];
   const creates: CredentialCreationOptions[] = [];
@@ -67,6 +70,9 @@ export function installFakeWebAuthn({
     static async isConditionalMediationAvailable() {
       return autofill;
     }
+  }
+  if (capabilities) {
+    Object.assign(FakePublicKeyCredential, { getClientCapabilities: async () => capabilities });
   }
   const globals = globalThis as { PublicKeyCredential?: unknown };
   const previousCtor = globals.PublicKeyCredential;

@@ -36,6 +36,7 @@ export function useRetryableLazy<P extends object>(
   // After a failure the slot gets a fresh lazy component (not rendered now),
   // so the next open asks the network again instead of the kept failure.
   const forgetFailed = useCallback(() => {
+    // oxlint-disable-next-line react/immutability -- the slot is a module-level `{ current }` holder the caller passes in, written from the callback (never while rendering): a ref in all but name.
     slot.current = lazy(factory);
   }, [slot, factory]);
   return { Chunk, attempt, retry, forgetFailed };

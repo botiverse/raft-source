@@ -38,7 +38,7 @@ export async function issueAgentAudienceJwt(input: { serverId: string; agentId: 
       }
       // Serialize first-use grant creation and client disable/scope contraction.
       // App and installation changes take the same row locks before commit.
-      const [client] = await tx.select({ id: oauthClients.id, serverId: oauthClients.serverId, appType: oauthClients.appType, clientId: oauthClients.clientId, allowedScopes: oauthClients.allowedScopes, createdByUserId: oauthClients.createdByUserId }).from(oauthClients).where(and(
+      const [client] = await tx.select({ id: oauthClients.id, serverId: oauthClients.serverId, appType: oauthClients.appType, clientId: oauthClients.clientId, allowedScopes: oauthClients.allowedScopes, createdByUserId: oauthClients.createdByUserId, agentTokenSigningAlg: oauthClients.agentTokenSigningAlg, agentTokenType: oauthClients.agentTokenType }).from(oauthClients).where(and(
         oauthClientHasKey(input.service), oauthClientIsUserManagedPredicate(), eq(oauthClients.enabled, true),
       )).for("update");
       if (!client || !scopes.every((scope) => client.allowedScopes?.includes(scope))) {
@@ -95,6 +95,10 @@ export async function issueAgentAudienceJwt(input: { serverId: string; agentId: 
         serverSlug: server.slug, serverRole: membership.role,
         agentName: agent.name, displayName: agent.displayName ?? agent.name,
         jti, now,
+        // The App's own setting (ES256 by default); the request has no say.
+        alg: client.agentTokenSigningAlg,
+        // The App's own `typ` (at+jwt by default; JWT only on a token-only App).
+        typ: client.agentTokenType,
       });
       const expiresAt = new Date((Math.floor(now.getTime() / 1000) + 300) * 1000).toISOString();
       // The ambient transaction keeps the audit and first-use grant atomic.

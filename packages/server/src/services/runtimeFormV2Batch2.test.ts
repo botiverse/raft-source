@@ -7,7 +7,7 @@
  * is the oracle here, called with the arguments the legacy create/edit dialogs
  * pass for these runtimes.
  *
- * Antigravity (revived on the OAR host) is here too, as it was a batch-2 form:
+ * Antigravity is here too, as it was a batch-2 form:
  * it now has the live-list model form with a reasoning effort (the OAR
  * `listModels` of the Computer's `agy`), and a stored model or effort is kept
  * on edit.
@@ -109,8 +109,8 @@ test("antigravity: a model select (typed ids allowed) and a reasoning effort tha
   });
   assert.deepEqual(Object.keys(antigravity.optionSources), ["model"]);
   assert.deepEqual(antigravity.requiredClientCapabilities, ["select.custom_value"]);
-  // Still labelled edit-only in the catalog; the OAR flag admits creation.
-  assert.equal(form.schemaVersion, "antigravity.edit.v1");
+  // No longer deprecated: a create form.
+  assert.equal(form.schemaVersion, "antigravity.create.v1");
   assert.deepEqual(runtimeFormV2Entry("antigravity")!.validateProjection(), []);
 });
 
@@ -161,14 +161,13 @@ test("a blank model is a clear field error, not a crash", () => {
   }
 });
 
-test("antigravity: edit keeps the stored model and effort, a stored default stays agy's choice and a stored null effort stays Default", () => {
+test("antigravity: edit keeps the stored model and effort and a stored null effort stays Default", () => {
   const stored: RuntimeConfig[] = [
-    legacyRuntimeConfig("antigravity", "default", { OLD: "1" }),
     legacyRuntimeConfig("antigravity", "some-agy-model", null, true),
     // What an offline save of a typed or live-listed model with an effort stores.
     { ...legacyRuntimeConfig("antigravity", "gemini-3.8-flash", null, true), reasoningEffort: "high" } as RuntimeConfig,
   ];
-  assert.deepEqual(stored[1]!.model, { kind: "custom", name: "some-agy-model" });
+  assert.deepEqual(stored[0]!.model, { kind: "custom", name: "some-agy-model" });
   for (const config of stored) {
     const values = runtimeFormValuesFromRuntimeConfig(config);
     assert.deepEqual(values, {
@@ -180,19 +179,23 @@ test("antigravity: edit keeps the stored model and effort, a stored default stay
     assert.deepEqual(next, config, JSON.stringify(config.model));
     assert.ok(parseRuntimeConfig({ runtimeConfig: next }).ok);
   }
-  // A new agent left at the preselected entry keeps agy's own choice and thought level.
-  assert.deepEqual(submitted("antigravity", { model: "default", reasoningEffort: "" }), {
-    version: RUNTIME_CONFIG_VERSION,
-    runtime: "antigravity",
-    model: { kind: "preset", id: "default" },
-    mode: { kind: "default" },
-    reasoningEffort: null,
-    envVars: null,
-  });
   assert.deepEqual(
     buildRuntimeConfigFromFormValues("antigravity", { model: "" }),
     { ok: false, issue: { code: "model_required", pointer: "/formValues/model" } },
   );
+});
+
+// #oar-raft:#25: a model is required; "AGY configured default" (`default`) is retired.
+test("antigravity: a stored 'AGY configured default' shows no model on edit, and saving it is refused", () => {
+  const legacy = legacyRuntimeConfig("antigravity", "default", { OLD: "1" });
+  assert.deepEqual(runtimeFormValuesFromRuntimeConfig(legacy), { model: "", reasoningEffort: "", envVars: { OLD: "1" } });
+  assert.deepEqual(
+    buildRuntimeConfigFromFormValues("antigravity", { model: "default", reasoningEffort: "" }),
+    { ok: false, issue: { code: "model_required", pointer: "/formValues/model" } },
+  );
+  // A model picked on edit is stored as usual.
+  const values = { model: "gemini-3.8-flash", reasoningEffort: "", envVars: { OLD: "1" } };
+  assert.deepEqual((submitted("antigravity", values, { editing: true, existing: legacy }) as unknown as RuntimeConfig).model, { kind: "custom", name: "gemini-3.8-flash" });
 });
 
 const AGY_LIVE: RuntimeModelSourceOutcome = {
@@ -206,30 +209,29 @@ const AGY_LIVE: RuntimeModelSourceOutcome = {
   },
 };
 
-test("antigravity: the Computer's agy models follow the configured default, with efforts only where agy lists them", async () => {
+test("antigravity: the Computer's agy models, the one agy starts on preselected, with efforts only where agy lists them", async () => {
   const entry = runtimeFormV2Entry("antigravity")!;
   const live = optionSourceContext(async () => AGY_LIVE);
-  const resolution = await entry.resolveOptionSource({ ...live.context, sourceStatus: true } as RuntimeFormOptionSourceContext);
+  const resolution = await entry.resolveOptionSource(live.context as RuntimeFormOptionSourceContext);
   assert.deepEqual(live.calls, ["antigravity"]);
   assert.equal(resolution.kind, "source");
   const source = (resolution as unknown as { source: Record<string, unknown> }).source;
   assert.equal(source.status, "live");
   assert.equal(source.customValueAllowed, true);
-  // "default" stays first and preselected: a new agent lets agy choose unless the user picks.
-  assert.equal(source.defaultValue, "default");
+  // #oar-raft:#25: no "AGY configured default"; agy's own default model is preselected.
+  assert.equal(source.defaultValue, "gemini-3.8-flash");
   assert.deepEqual(source.options, [
-    { value: "default", label: RUNTIME_MODELS.antigravity![0]!.label, supportedReasoningEfforts: [] },
     { value: "gemini-3.8-flash", label: "Gemini 3.8 Flash", supportedReasoningEfforts: ["low", "medium", "high"], defaultReasoningEffort: "medium" },
     // A model agy lists no levels for (or whose id names its level) offers no effort.
     { value: "gemini-4-carbon-medium", label: "Gemini 4 Carbon (Medium)", supportedReasoningEfforts: [] },
   ]);
 
-  // Not live: the configured default alone, no effort.
+  // Not live: no list, a typed model id still allowed; a fallback, so the required field takes it (unavailable would block).
   const offline = optionSourceContext(async () => { throw new Error("must not probe"); }, "not_routed");
-  const fallback = await entry.resolveOptionSource({ ...offline.context, sourceStatus: true } as RuntimeFormOptionSourceContext);
+  const fallback = await entry.resolveOptionSource(offline.context as RuntimeFormOptionSourceContext);
   const fallbackSource = (fallback as unknown as { source: Record<string, unknown> }).source;
-  assert.deepEqual(fallbackSource.options, [{ value: "default", label: RUNTIME_MODELS.antigravity![0]!.label, supportedReasoningEfforts: [] }]);
-  assert.equal(fallbackSource.defaultValue, "default");
+  assert.deepEqual(fallbackSource.options, []);
+  assert.equal(fallbackSource.customValueAllowed, true);
   assert.equal(fallbackSource.status, "fallback");
 });
 
@@ -249,8 +251,59 @@ test("antigravity: a submit checks the effort against the live model", () => {
     kind: "rejected",
     issue: { code: "reasoning_effort_not_supported", pointer: "/formValues/reasoningEffort" },
   });
-  // The configured default is not in the live list: unchanged.
-  assert.deepEqual(entry.reconcileWithLiveModels!(submitted("antigravity", { model: "default" }) as unknown as RuntimeConfig, null, models), { kind: "unchanged" });
+});
+
+// DeepSeek Harness lists each model's own reasoning efforts (OAR's projection of
+// dsh's catalog), none for a model without reasoning; ids are provider/model.
+const DSH_LIVE: RuntimeModelSourceOutcome = {
+  kind: "live",
+  value: {
+    models: [
+      { id: "deepseek/deepseek-v4", label: "DeepSeek V4", supportedReasoningEfforts: ["low", "medium", "high"], defaultReasoningEffort: "high", verified: "launchable" },
+      { id: "deepseek/deepseek-chat", label: "DeepSeek Chat", verified: "launchable" },
+    ],
+  },
+};
+
+test("dsh: the Computer's DeepSeek Harness models, a typed provider/model allowed, efforts only where dsh lists them", async () => {
+  const entry = runtimeFormV2Entry("dsh")!;
+  assert.equal(buildRuntimeFormV2("dsh").schemaVersion, "dsh.create.v1");
+  const live = optionSourceContext(async () => DSH_LIVE);
+  const resolution = await entry.resolveOptionSource({ ...live.context, sourceStatus: true } as RuntimeFormOptionSourceContext);
+  assert.deepEqual(live.calls, ["dsh"]);
+  const source = (resolution as unknown as { source: Record<string, unknown> }).source;
+  assert.equal(source.status, "live");
+  assert.equal(source.customValueAllowed, true);
+  assert.deepEqual(source.options, [
+    { value: "deepseek/deepseek-v4", label: "DeepSeek V4", supportedReasoningEfforts: ["low", "medium", "high"], defaultReasoningEffort: "high" },
+    // No efforts listed: none offered, never the base set (dsh would refuse it).
+    { value: "deepseek/deepseek-chat", label: "DeepSeek Chat", supportedReasoningEfforts: [] },
+  ]);
+
+  const models = (DSH_LIVE as { value: { models: RuntimeModelInfo[] } }).value.models;
+  const picked = submitted("dsh", { model: "deepseek/deepseek-v4", reasoningEffort: "medium" }) as unknown as RuntimeConfig;
+  assert.ok(parseRuntimeConfig({ runtimeConfig: picked }).ok, "the shared parser takes a DSH effort");
+  assert.deepEqual(entry.reconcileWithLiveModels!(picked, "medium", models), {
+    kind: "updated",
+    runtimeConfig: { ...picked, model: { kind: "preset", id: "deepseek/deepseek-v4" }, reasoningEffort: "medium" },
+  });
+  const chat = submitted("dsh", { model: "deepseek/deepseek-chat", reasoningEffort: "high" }) as unknown as RuntimeConfig;
+  assert.deepEqual(entry.reconcileWithLiveModels!(chat, "high", models), {
+    kind: "rejected",
+    issue: { code: "reasoning_effort_not_supported", pointer: "/formValues/reasoningEffort" },
+  });
+});
+
+test("dsh: a typed model must be provider/model (OAR refuses a bare name only at the start); the field says so", () => {
+  const bare = buildRuntimeConfigFromFormValues("dsh", { model: "deepseek-chat" });
+  assert.equal(bare.ok, false);
+  assert.deepEqual(!bare.ok && bare.issue, { code: "invalid_model", pointer: "/formValues/model" });
+  assert.match(!bare.ok ? bare.message ?? "" : "", /provider\/model/);
+  for (const model of ["/deepseek-chat", "deepseek/", "deep seek/chat"]) {
+    assert.equal(buildRuntimeConfigFromFormValues("dsh", { model }).ok, false, model);
+  }
+  assert.deepEqual(submitted("dsh", { model: "openai/gpt-5.5" }).model, { kind: "custom", name: "openai/gpt-5.5" });
+  assert.ok(buildRuntimeConfigFromFormValues("qoder", { model: "qwen-bare" }).ok, "no other runtime is held to it");
 });
 
 test("post-assembly issues point back at the field", () => {

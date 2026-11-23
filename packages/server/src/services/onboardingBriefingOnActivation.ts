@@ -50,14 +50,15 @@ export function startOnboardingBriefingOnActivation(deps: {
   const listener = (event: { machineId: string; serverId: string }) => {
     void (async () => {
       try {
-        // Only this server's onboarding agent is owed a briefing. Read it fresh from the row:
+        // Only this server's official onboarding agent (Cindy, not the greeter) is owed a
+        // briefing. Read it fresh from the row:
         // this runs on reconnect, which is precisely when a cache is least likely to have
         // caught up with reality.
         const [server] = await getDb()
-          .select({ onboardingAgentId: servers.onboardingAgentId })
+          .select({ officialOnboardingAgentId: servers.officialOnboardingAgentId })
           .from(servers)
           .where(and(eq(servers.id, event.serverId), isNull(servers.deletedAt)));
-        if (!server?.onboardingAgentId) return;
+        if (!server?.officialOnboardingAgentId) return;
 
         // Who she is working for, EVERY time she comes back. Not once.
         //
@@ -73,10 +74,10 @@ export function startOnboardingBriefingOnActivation(deps: {
         await deliverOwnerFacts(
           deps.orchestrator,
           event.serverId,
-          server.onboardingAgentId,
+          server.officialOnboardingAgentId,
         );
 
-        await trigger(deps.io, deps.orchestrator, event.serverId, server.onboardingAgentId);
+        await trigger(deps.io, deps.orchestrator, event.serverId, server.officialOnboardingAgentId);
       } catch (error) {
         // This runs on every machine reconnect in the system. It must never be the reason one
         // fails to come back.

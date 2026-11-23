@@ -1,11 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef } from "react";
 
-import { distanceFromBottom } from "./messageTimelineShared";
+import type { TimelineTopAnchor } from "./timelineTopRow";
 
-export interface TimelineTopAnchor {
-  id: string;
-  offset: number;
-}
+export type { TimelineTopAnchor } from "./timelineTopRow";
 
 /** A reading: the message first in view and its offset, and whether the view was at the end of content taller than it. */
 interface TimelineWidthReading {
@@ -15,22 +12,17 @@ interface TimelineWidthReading {
 
 /**
  * A width change of the timeline's scroller (a seam dragged, the window resized, the sidebar toggled, the thread
- * folding over the conversation or standing beside it; #189) rewraps every row. Where `enabled` (the thread), the
- * message first in view stays at its offset across it, rather than the list following its end: a thread whose
- * replies just filled its view keeps its parent under the head, not under it. A view at the end of content taller
- * than it stays at its end (`atEnd`): a thread at its last reply before a region expanded in its row is there again
- * when the row is restored (#189 rule 5), however the content fitted in between. `note` reads that message a frame
- * after the reader scrolls or the list adjusts (the width it was read at, the first time); content that fits its view
- * (at its top and its end at once) leaves the reading before it as it was, the first one aside; one taken while the
- * list follows its end (`following`) is at its end, though a reflow has the view short of it for a frame or two (a
- * column narrowed to 160 rewraps the replies before the list re-pins them); and none is taken while a width change
- * waits for `take` (the browser's scroll anchoring scrolls the rewrapped rows before the list hears of the resize, and
- * would have the reading say the view left its end). `take` gives back,
- * once the scroller's width changed, "end" where the view was at its end and may follow it (`canEnd`: the list holds
- * its live end), else the message; null where the width didn't change.
+ * folding over the conversation or standing beside it; #189) rewraps every row. Across it, a reader scrolled away from
+ * the end keeps the message first in view at its offset, on every surface (channel, DM and thread). Where
+ * `keepTopWhenShort` (the thread), a list whose content fitted its view before narrowing also keeps its top message
+ * (the parent under the head) rather than following its end; a channel (`!keepTopWhenShort`) following its tail stays
+ * at its end whether short or overflowing (`atEnd`). `note` reads that message a frame after the reader scrolls or the
+ * list adjusts (the width it was read at, the first time); content that fits its view leaves a prior thread reading as
+ * it was; and none is taken while a width change waits for `take`. `take` gives back, once the scroller's width
+ * changed, "end" where the view was at its end and may follow it (`canEnd`), else the message; null where unchanged.
  */
 export function useTimelineWidthAnchor(
-  enabled: boolean,
+  keepTopWhenShort: boolean,
   listEl: () => HTMLElement | null,
   topOf: (el: HTMLElement) => TimelineTopAnchor | null,
   following: { readonly current: boolean },
@@ -39,7 +31,7 @@ export function useTimelineWidthAnchor(
   const width = useRef<number | null>(null);
   const frame = useRef<number | null>(null);
   const note = useCallback(() => {
-    if (!enabled || frame.current !== null) return;
+    if (frame.current !== null) return;
     frame.current = requestAnimationFrame(() => {
       frame.current = null;
       const el = listEl();
@@ -50,10 +42,14 @@ export function useTimelineWidthAnchor(
       width.current ??= now;
       if (Math.abs(now - width.current) >= 0.5) return;
       const overflows = el.scrollHeight - el.clientHeight > 1;
-      if (!overflows && reading.current) return;
-      reading.current = { anchor: topOf(el), atEnd: overflows && (following.current || distanceFromBottom(el) <= 1) };
+      if (!overflows && reading.current) {
+        if (!keepTopWhenShort && following.current) reading.current = { anchor: topOf(el), atEnd: true };
+        return;
+      }
+      const atEnd = keepTopWhenShort ? overflows && following.current : following.current;
+      reading.current = { anchor: topOf(el), atEnd };
     });
-  }, [enabled, following, listEl, topOf]);
+  }, [following, keepTopWhenShort, listEl, topOf]);
   // Read once as it mounts too: a list that never scrolls nor resizes its content before its width changes.
   useEffect(() => {
     note();
@@ -63,12 +59,11 @@ export function useTimelineWidthAnchor(
     };
   }, [note]);
   const take = useCallback((el: HTMLElement, canEnd: boolean): TimelineTopAnchor | "end" | null => {
-    if (!enabled) return null;
     const next = el.getBoundingClientRect().width;
     const was = width.current;
     width.current = next;
     if (was === null || Math.abs(next - was) < 0.5 || !reading.current) return null;
     return reading.current.atEnd && canEnd ? "end" : reading.current.anchor;
-  }, [enabled]);
+  }, []);
   return useMemo(() => ({ note, take }), [note, take]);
 }

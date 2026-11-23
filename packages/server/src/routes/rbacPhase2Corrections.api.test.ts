@@ -94,6 +94,7 @@ test("Server details give Owner/Admin/Member the member profile and Guest only t
     "ownerId",
     "kind",
     "onboardingAgentId",
+    "officialOnboardingAgentId",
     "agentAllChannelGreetingEnabled",
     "hideHumansFromMembers",
     "publiclyVisible",
@@ -136,7 +137,7 @@ test("Server settings require Owner/Admin while member self-state routes stay re
   assert.equal(memberLegacyPreferences.status, 200, "Member onboarding self-state remains separate from Server settings");
 });
 
-test("Machine list requires machine.read while a Guest registrant keeps exact-object management", async ({ app }) => {
+test("Machine list requires machine.read; a Guest registrant of a raw daemon gets no machine management (no live attacher)", async ({ app }) => {
   const { owner, guest, server, tokens } = await seedRoles("phase2-machine-profile");
   await getDb().update(servers).set({ plan: "founder" }).where(eq(servers.id, server.id));
   const guestMachine = (await registerMachine(server.id, guest.id, "Guest-owned machine")).machine;
@@ -159,11 +160,7 @@ test("Machine list requires machine.read while a Guest registrant keeps exact-ob
     headers: authHeaders(tokens.guest, server.id),
     body: JSON.stringify({ description: "still managed by its exact registrant" }),
   });
-  assert.equal(ownPatch.status, 200, "Guest registrant retains exact-object machine.update");
-  assert.equal(
-    (await ownPatch.json() as { description: string | null }).description,
-    "still managed by its exact registrant",
-  );
+  assert.equal(ownPatch.status, 403, "the registrant is no controller: only the live attacher or editMachines");
 
   const foreignPatch = await fetch(`${app.baseUrl}/api/servers/${server.id}/machines/${ownerMachine.id}`, {
     method: "PATCH",

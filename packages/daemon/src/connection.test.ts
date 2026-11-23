@@ -220,6 +220,44 @@ test("DaemonConnection bounds a hung websocket handshake and reconnects on the p
   conn.disconnect();
 });
 
+test("a timed-out CONNECTING socket whose terminate() throws still reconnects, once (#6248)", () => {
+  const clock = new FakeClock();
+  const traceEvents: string[] = [];
+  const disconnects: number[] = [];
+  const { conn, getWs, getAllWs } = makeConnection({
+    clock,
+    autoOpen: false,
+    connectTimeoutMs: 30,
+    minReconnectDelayMs: 10,
+    onDisconnect: () => disconnects.push(clock.now()),
+    onTraceEvent: (name) => traceEvents.push(name),
+  });
+
+  conn.connect();
+  const hungWs = getWs();
+  hungWs.readyState = WebSocket.CONNECTING;
+  hungWs.terminate = () => {
+    throw new Error("terminate failed");
+  };
+
+  clock.advanceBy(30);
+  assert.equal(traceEvents.filter((name) => name === "daemon.connection.reconnect_scheduled").length, 1, "the failed terminate must schedule a reconnect");
+  assert.deepEqual(disconnects, [30], "the failed terminate reports the disconnect the close handler would have");
+
+  // A late 'close' from the dead socket must not schedule a second reconnect.
+  hungWs.readyState = WebSocket.CLOSED;
+  hungWs.emit("close", 1006, Buffer.from(""));
+  assert.equal(traceEvents.filter((name) => name === "daemon.connection.reconnect_scheduled").length, 1, "a late close must not schedule again");
+  assert.deepEqual(disconnects, [30], "a late close must not report a second disconnect");
+
+  clock.advanceBy(10);
+  assert.equal(getAllWs().length, 2, "the reconnect opens a new socket after the backoff");
+  clock.advanceBy(1_000);
+  assert.equal(getAllWs().length, 2, "exactly one replacement socket");
+
+  conn.disconnect();
+});
+
 test("DaemonConnection connect timeout is cleared on open and disconnect", () => {
   const clock = new FakeClock();
   const { conn: openedConn, getWs: getOpenedWs, getAllWs: getOpenedSockets } = makeConnection({

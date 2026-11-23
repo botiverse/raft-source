@@ -103,3 +103,15 @@ test("an unknown senderType degrades to user rather than admitting a bad union v
   assert.ok(frame);
   assert.equal(frame.reply.senderType, "user");
 });
+
+test("a system line (stored senderType user, messageType system) projects as a system reply, so previews leave it out", () => {
+  const frame = projectThreadReplyFrame({
+    parentMessageId: "parent-1",
+    replyCount: 2,
+    latestReply: { ...validLatestReply, senderId: "system", senderType: "user", messageType: "system", senderName: "System", senderDisplayName: "System", content: "📌 Scout created #triage:#527 \"…\" from this message" },
+  });
+
+  assert.ok(frame);
+  assert.equal(frame.reply.senderType, "system");
+  assert.equal(frame.replyCount, 2);
+});

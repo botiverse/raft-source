@@ -1,0 +1,48 @@
+{
+  "suite": "daily-stamp",
+  "description": "Signed-in Stamp multi-milestone (shell + ready) collection across all 5 canonical pages (cold and repeat).",
+  "defaults": {
+    "fixture": "bench-v1",
+    "browser": "local"
+  },
+  "steps": [
+    {
+      "id": "stamp-staging-cold",
+      "command": "load",
+      "args": [
+        "--project",
+        "stamp",
+        "--env",
+        "staging",
+        "--browser",
+        "{{browser}}",
+        "--state",
+        "cold",
+        "--runs",
+        "3",
+        "--out",
+        "{{outDir}}/stamp-staging-cold.json"
+      ],
+      "collectJsonl": true
+    },
+    {
+      "id": "stamp-staging-repeat",
+      "command": "load",
+      "args": [
+        "--project",
+        "stamp",
+        "--env",
+        "staging",
+        "--browser",
+        "{{browser}}",
+        "--state",
+        "repeat",
+        "--runs",
+        "3",
+        "--out",
+        "{{outDir}}/stamp-staging-repeat.json"
+      ],
+      "collectJsonl": true
+    }
+  ]
+}

@@ -427,6 +427,97 @@ writeFileSync(process.env.SLOCK_TEST_OUT, JSON.stringify({
   }
 });
 
+test("a POSIX wrapper refuses a caller that is another agent and runs for its own agent or none", { skip: process.platform === "win32" }, async () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-cli-test-"));
+  try {
+    const cliPath = path.join(tmp, "fake-cli.cjs");
+    const outPath = path.join(tmp, "ran.json");
+    writeFileSync(cliPath, `
+const { writeFileSync } = require("node:fs");
+writeFileSync(process.env.SLOCK_TEST_OUT, JSON.stringify({ agent: process.env.SLOCK_AGENT_ID }), "utf8");
+`, "utf8");
+    const ctx = makeCtx(tmp);
+    ctx.slockCliPath = cliPath;
+    const result = await prepareCliTransport(ctx, {}, "linux");
+    const pwned = path.join(tmp, "pwned");
+    const run = (wrapper: string, callerAgentId: string | undefined) => {
+      rmSync(outPath, { force: true });
+      const env: Record<string, string | undefined> = { ...process.env, SLOCK_TEST_OUT: outPath };
+      if (callerAgentId === undefined) delete env.SLOCK_AGENT_ID;
+      else env.SLOCK_AGENT_ID = callerAgentId;
+      return spawnSync(wrapper, ["message", "check"], { env, encoding: "utf8" });
+    };
+
+    for (const name of ["raft", "slock"]) {
+      const wrapper = path.join(result.slockDir, name);
+      const foreign = run(wrapper, "other-agent-id");
+      assert.equal(foreign.status, 1, `${name}: a foreign caller is refused`);
+      assert.equal(
+        foreign.stderr,
+        "raft: this CLI belongs to agent test-agent-id; the calling process is agent other-agent-id. Use your own raft command.\n",
+      );
+      assert.equal(existsSync(outPath), false, `${name}: the CLI never ran for a foreign caller`);
+
+      // The caller's value is only compared and printed, never evaluated.
+      const hostile = run(wrapper, `$(touch ${pwned})'; touch ${pwned}; '\`touch ${pwned}\``);
+      assert.equal(hostile.status, 1);
+      assert.equal(existsSync(pwned), false, "the caller's value is never run");
+      assert.equal(existsSync(outPath), false);
+
+      for (const caller of ["test-agent-id", undefined, ""]) {
+        const ok = run(wrapper, caller);
+        assert.equal(ok.status, 0, `${name} caller=${String(caller)}: ${ok.stderr}`);
+        assert.deepEqual(JSON.parse(readFileSync(outPath, "utf8")), { agent: "test-agent-id" });
+      }
+    }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("win32 .cmd and .ps1 wrappers refuse a caller that is another agent before setting their own identity", async () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-cli-test-"));
+  try {
+    const result = await prepareCliTransport(makeCtx(tmp), {}, "win32");
+    const message = "raft: this CLI belongs to agent !SLOCK_WRAPPER_AGENT_ID!; the calling process is agent !SLOCK_AGENT_ID!. Use your own raft command.";
+    for (const name of ["raft.cmd", "slock.cmd"]) {
+      const lines = readFileSync(path.join(result.slockDir, name), "utf8").split("\r\n");
+      const guard = [
+        "setlocal DisableDelayedExpansion",
+        'set "SLOCK_WRAPPER_AGENT_ID=test-agent-id"',
+        "setlocal EnableDelayedExpansion",
+        'if defined SLOCK_AGENT_ID if /I not "!SLOCK_AGENT_ID!"=="!SLOCK_WRAPPER_AGENT_ID!" (',
+        `  >&2 echo ${message}`,
+        "  exit /b 1",
+        ")",
+        "endlocal",
+        "endlocal",
+      ];
+      assert.equal(lines[0], "@echo off");
+      assert.deepEqual(lines.slice(1, 1 + guard.length), guard, name);
+      assert.ok(lines.indexOf('set "SLOCK_AGENT_ID=test-agent-id"') > guard.length, `${name}: the guard runs before the wrapper sets its agent`);
+      assert.ok(lines.findIndex((line) => line.includes("SLOCK_AGENT_LAUNCH_DIR")) > guard.length, `${name}: before launch forwarding`);
+      // The caller's value is only ever read through delayed expansion.
+      assert.equal(lines.filter((line) => line.includes("%SLOCK_AGENT_ID%")).length, 0, name);
+    }
+    for (const name of ["raft.ps1", "slock.ps1"]) {
+      const body = readFileSync(path.join(result.slockDir, name), "utf8");
+      const lines = body.split("\r\n");
+      assert.deepEqual(lines.slice(0, 5), [
+        "$SlockWrapperAgentId = 'test-agent-id'",
+        "if ($env:SLOCK_AGENT_ID -and ($env:SLOCK_AGENT_ID -cne $SlockWrapperAgentId)) {",
+        '  [Console]::Error.WriteLine("raft: this CLI belongs to agent $SlockWrapperAgentId; the calling process is agent $($env:SLOCK_AGENT_ID). Use your own raft command.")',
+        "  exit 1",
+        "}",
+      ], name);
+      assert.ok(lines.findIndex((line) => line.includes("$env:SLOCK_AGENT_ID='test-agent-id'")) > 5, `${name}: before the wrapper sets its agent`);
+      assert.ok(lines.findIndex((line) => line.includes("SLOCK_AGENT_LAUNCH_DIR")) > 5, `${name}: before launch forwarding`);
+    }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("prepareCliTransport: win32 PowerShell wrapper forwards pipeline input as UTF-8", { skip: process.platform !== "win32" }, async () => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-cli-test-"));
   try {
@@ -1644,7 +1735,9 @@ test("prepareCliTransport: win32 .cmd wrapper embeds launch forwarding guard aft
     assert.match(body, /SLOCK_AGENT_LAUNCH_DIR/);
     const lines = body.split(/\r?\n/);
     assert.equal(lines[0], "@echo off");
-    assert.ok(lines[1].includes("slock-daemon-generated"), "guard should immediately follow @echo off");
+    // Only the foreign-caller refusal (9 lines, its own test) comes before it.
+    assert.equal(lines[1], "setlocal DisableDelayedExpansion");
+    assert.ok(lines[10].includes("slock-daemon-generated"), "guard should immediately follow @echo off and the foreign-caller refusal");
     // Backslash separators and special sequences must survive TypeScript string
     // literal generation without being interpreted as escapes or newlines.
     assert.match(body, /!SLOCK_AGENT_ROOT!\\!SLOCK_SEL!/);
@@ -1663,7 +1756,7 @@ test("prepareCliTransport: win32 .cmd wrapper embeds launch forwarding guard aft
     assert.match(body.trimEnd().split(/\r?\n/).at(-1) ?? "", /"%SLOCK_CLI%" %\*$/);
     assert.doesNotMatch(body, /"!SLOCK_FORWARD_WRAPPER!" %\*/);
     assert.doesNotMatch(body, /call "!SLOCK_FORWARD_WRAPPER!" %\*/);
-    assert.doesNotMatch(body, /exit \/b/i);
+    assert.equal(body.match(/exit \/b/gi)?.length, 1, "only the foreign-caller refusal exits early");
     assert.match(body, /launch-forwarding skipped reason=!SLOCK_LAUNCH_FORWARD_SKIP_REASON!/);
     assert.doesNotMatch(body, /(?<!\r)\n/);
   } finally {
@@ -1681,7 +1774,9 @@ test("prepareCliTransport: win32 .ps1 wrapper embeds launch forwarding guard at 
     assert.match(body, /\$SlockOwnLaunchDir = /);
     assert.match(body, /\$env:SLOCK_AGENT_LAUNCH_DIR/);
     const lines = body.split(/\r?\n/);
-    assert.ok(lines[0].includes("slock-daemon-generated"), "guard should be the first line of the ps1 wrapper");
+    // Only the foreign-caller refusal (5 lines, its own test) comes before it.
+    assert.ok(lines[0].startsWith("$SlockWrapperAgentId = "));
+    assert.ok(lines[5].includes("slock-daemon-generated"), "guard should follow the foreign-caller refusal at the top of the ps1 wrapper");
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -1864,6 +1959,35 @@ test("launch forwarding guard: W2 selector executing W1 absolute wrapper forward
     const result = runWrapper(w1Wrapper, { SLOCK_AGENT_LAUNCH_DIR: "w2" });
     assert.equal(result.status, 0, result.stderr || result.stdout);
     assert.equal(result.stdout.trim(), "W2", "W1 wrapper with W2 selector must forward to W2");
+  } finally {
+    if (oldSlockHome === undefined) delete process.env.SLOCK_HOME;
+    else process.env.SLOCK_HOME = oldSlockHome;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("launch forwarding guard: the agent's own processes still forward; another agent's are refused", { skip: process.platform === "win32" }, async () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "slock-cli-forward-"));
+  const oldSlockHome = process.env.SLOCK_HOME;
+  try {
+    const { w1Wrapper, w2Wrapper } = await setupForwardedLaunchFixture(tmp);
+
+    const own = runWrapper(w1Wrapper, { SLOCK_AGENT_ID: "agent-a", SLOCK_AGENT_LAUNCH_DIR: "w2" });
+    assert.equal(own.status, 0, own.stderr || own.stdout);
+    assert.equal(own.stdout.trim(), "W2", "same-agent forwarding is unaffected");
+
+    // The pre-guard W1 forwards; the current launch's wrapper then refuses.
+    for (const wrapper of [w1Wrapper, w2Wrapper]) {
+      const foreign = runWrapper(wrapper, { SLOCK_AGENT_ID: "agent-b", SLOCK_AGENT_LAUNCH_DIR: "w2" });
+      assert.equal(foreign.status, 1);
+      assert.equal(foreign.stdout, "", "the CLI never ran");
+      assert.match(foreign.stderr, /^raft: this CLI belongs to agent agent-a; the calling process is agent agent-b\. Use your own raft command\.$/m);
+    }
+    // Another agent's launch selector does not get it through either.
+    const foreignSelector = runWrapper(w2Wrapper, { SLOCK_AGENT_ID: "agent-b", SLOCK_AGENT_LAUNCH_DIR: "b-launch" });
+    assert.equal(foreignSelector.status, 1);
+    assert.equal(foreignSelector.stdout, "");
+    assert.doesNotMatch(foreignSelector.stderr, /launch-forwarding skipped/, "refused before launch forwarding");
   } finally {
     if (oldSlockHome === undefined) delete process.env.SLOCK_HOME;
     else process.env.SLOCK_HOME = oldSlockHome;

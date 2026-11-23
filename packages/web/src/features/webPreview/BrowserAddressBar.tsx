@@ -59,6 +59,7 @@ export function BrowserAddressBar({ bridge, conversationId, tab }: { bridge: Des
     inputRef.current?.focus();
     inputRef.current?.select();
   }, [field, addressFocus]);
+  const insecure = tab.url?.startsWith("http:") ?? false;
   const { host, rest } = useMemo(() => {
     const parsed = webPreviewUrl(tab.url);
     if (!parsed) return { host: tab.url ?? "", rest: "" };
@@ -156,12 +157,12 @@ export function BrowserAddressBar({ bridge, conversationId, tab }: { bridge: Des
                   <BrowserSiteSettings bridge={bridge} tab={tab} />
                 </InputGroupAddon>
               ) : null}
-              {tab.url?.startsWith("http:") ? (
-                <Badge appearance="soft" variant="warning" className="ml-2 shrink-0 self-center" data-testid="web-preview-not-secure">
+              {insecure ? (
+                <Badge appearance="soft" variant="warning" className={`${tab.site ? "" : "ml-2"} shrink-0 self-center`} data-testid="web-preview-not-secure">
                   {formatMessage({ id: "webPreview.notSecure" })}
                 </Badge>
               ) : null}
-              {/* The address as text, host bold (raft-ui has no read-only address field); pressing it makes it the field. */}
+              {/* The address as text, host bold (raft-ui has no read-only address field); pressing it makes it the field. After the site settings addon or the Not secure badge it starts 8px on, the gap a start addon leaves before an input. */}
               <div
                 role="button"
                 tabIndex={0}
@@ -169,7 +170,7 @@ export function BrowserAddressBar({ bridge, conversationId, tab }: { bridge: Des
                 title={tab.url ?? undefined}
                 onClick={edit}
                 onKeyDown={handleAddressKey}
-                className="min-w-0 flex-1 cursor-text truncate px-3 font-sans text-callout outline-none keyboard:focus-visible:shadow-focus"
+                className={`min-w-0 flex-1 cursor-text truncate pr-3 ${insecure ? "pl-2" : tab.site ? "pl-0" : "pl-3"} font-sans text-callout outline-none keyboard:focus-visible:shadow-focus`}
                 data-testid="web-preview-address"
               >
                 <span className="font-bold text-foreground" data-testid="web-preview-host">{host}</span>

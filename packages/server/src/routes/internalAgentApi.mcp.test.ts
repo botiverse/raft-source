@@ -11,7 +11,6 @@ import { __setMcpConnectionCardProducerForTests, ensureMcpConnectionCard, resolv
 import { sendManagedMcpAgentApiError } from "./internalAgentApi";
 import { ManagedMcpGatewayError } from "../services/managedMcpGateway";
 import { ManagedMcpServiceError } from "../services/managedMcpService";
-import { MCP_CONNECTION_NOT_USABLE_CALL_MESSAGE } from "../services/managedMcpConnectionOwnership";
 import { createServer } from "../services/serverService";
 import { setPrivacyModeForTest } from "../config/privacyMode";
 
@@ -29,6 +28,8 @@ async function seed() {
   const server = await createServer("MCP Agent API", `mcp-agent-api-${suffix}`, user.id);
   const agent = await createAgent(server.id, `McpAgent${suffix.slice(0, 6)}`);
   const [mcpServer] = await getDb().insert(managedMcpServers).values({
+    // No recorded creator: vouched, as migration 0732 does for legacy Apps (fail-closed rule).
+    serverVouchedAt: new Date(),
     serverId: server.id,
     name: "Docs",
     endpointUrl: "https://example.com/mcp",
@@ -122,6 +123,8 @@ async function registrySeed() {
   }).returning();
   // Registry-managed, enabled, catalogued — so the ONLY thing missing is an authorized Connection.
   const [mcp] = await db.insert(managedMcpServers).values({
+    // No recorded creator: vouched, as migration 0732 does for legacy Apps (fail-closed rule).
+    serverVouchedAt: new Date(),
     serverId: server.id,
     name: "Registry Docs",
     endpointUrl: "https://registry-docs.example.test/mcp",
@@ -432,6 +435,8 @@ test("⭐ an App with no usable Connection is offered to the Agent, and the firs
   const db = getDb();
   // OAuth, never signed in, so its tools were never read.
   const [fresh] = await db.insert(managedMcpServers).values({
+    // No recorded creator: vouched, as migration 0732 does for legacy Apps (fail-closed rule).
+    serverVouchedAt: new Date(),
     serverId: f.serverId,
     name: "Fresh Notes",
     endpointUrl: "https://fresh-notes.example.test/mcp",
@@ -444,6 +449,8 @@ test("⭐ an App with no usable Connection is offered to the Agent, and the firs
   }).returning();
   // OAuth with a known tool list whose default Connection's sign-in expired.
   const [expired] = await db.insert(managedMcpServers).values({
+    // No recorded creator: vouched, as migration 0732 does for legacy Apps (fail-closed rule).
+    serverVouchedAt: new Date(),
     serverId: f.serverId,
     name: "Expired Notes",
     endpointUrl: "https://expired-notes.example.test/mcp",
@@ -523,10 +530,14 @@ test("the per-App list_tools / call_tool of an earlier snapshot are refused for 
   const f = await registrySeed();
   const db = getDb();
   const [open] = await db.insert(managedMcpServers).values({
+    // No recorded creator: vouched, as migration 0732 does for legacy Apps (fail-closed rule).
+    serverVouchedAt: new Date(),
     serverId: f.serverId, name: "Open", endpointUrl: "https://open.example.test/mcp", enabled: true,
     sourceKind: "url", authMode: "none", toolCatalog: [], catalogVersion: 0,
   }).returning();
   const [limited] = await db.insert(managedMcpServers).values({
+    // No recorded creator: vouched, as migration 0732 does for legacy Apps (fail-closed rule).
+    serverVouchedAt: new Date(),
     serverId: f.serverId, name: "Limited", endpointUrl: "https://limited.example.test/mcp", enabled: true,
     sourceKind: "url", authMode: "oauth", oauthStatus: "disconnected", toolCatalog: [], catalogVersion: 0,
   }).returning();
@@ -570,32 +581,13 @@ test("⭐ an unreachable MCP server is a 503 that keeps its code, never a 502", 
   });
 });
 
-test("⭐ a call refused because the pinned Connection is someone else's tells the agent what fixes it, and stays login_required", () => {
-  let status = 0;
-  let body: unknown = null;
-  const res = {
-    status(code: number) { status = code; return this; },
-    json(payload: unknown) { body = payload; return this; },
-  } as unknown as Parameters<typeof sendManagedMcpAgentApiError>[1];
-
-  // As `executeManagedMcpCall` throws it for an unusable pin (`connectionRefusal`).
-  sendManagedMcpAgentApiError(new ManagedMcpServiceError(MCP_CONNECTION_NOT_USABLE_CALL_MESSAGE, "managed_mcp_login_required", true), res, { serverName: "Docs", isCall: true });
-
-  assert.equal(status, 409);
-  // Same code, so the runtime and the Connect card behave as for any login_required; its own words.
-  assert.deepEqual(body, {
-    error: MCP_CONNECTION_NOT_USABLE_CALL_MESSAGE,
-    code: "managed_mcp_login_required",
-    suggestedNextAction: MCP_CONNECTION_NOT_USABLE_CALL_MESSAGE,
-    connectionRequested: false,
-  });
-});
-
 test("agent-api managed MCP: a disconnected connector is listed as unavailable, and a stale call reads as an agent can act on", async ({ app }) => {
   const fixture = await seed();
   const headers = { Authorization: `Bearer ${fixture.mcpKey}`, "X-Slock-Agent-Active-Capabilities": "mcp", "Content-Type": "application/json" };
   const [docs] = await getDb().select().from(managedMcpServers).where(eq(managedMcpServers.id, fixture.mcpServerId));
   const [notion] = await getDb().insert(managedMcpServers).values({
+    // No recorded creator: vouched, as migration 0732 does for legacy Apps (fail-closed rule).
+    serverVouchedAt: new Date(),
     serverId: docs!.serverId,
     name: "Notion",
     provider: "notion",
@@ -636,6 +628,8 @@ test("⭐ Raft Apps tools reach an App created after the session's snapshot, and
 
   // Created after that snapshot, never signed in.
   const [late] = await db.insert(managedMcpServers).values({
+    // No recorded creator: vouched, as migration 0732 does for legacy Apps (fail-closed rule).
+    serverVouchedAt: new Date(),
     serverId: f.serverId, name: "Late Notion", endpointUrl: "https://late-notion.example.test/mcp", enabled: true,
     sourceKind: "url", authMode: "oauth", oauthStatus: "disconnected", toolCatalog: [], catalogVersion: 0,
   }).returning();

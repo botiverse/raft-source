@@ -21,10 +21,15 @@ const HEADER_CONTAINER_PROPS = { "data-testid": "machine-panel-header" };
 export default function MachinePanelHeader({
   machine,
   onClose,
+  backAlways = false,
 }: {
   machine: ComputerDeviceInput & { name: string };
   /** The side panel's close: the head ends with ×, and Back closes it too. */
   onClose?: () => void;
+  /** A page of its own at every width (This device's standalone page, which
+   *  no side panel hosts): Back on desktop too, not only on a phone, so the
+   *  page is no dead end (Raft DS › Navigation: a full page has only Back). */
+  backAlways?: boolean;
 }) {
   const { formatMessage } = useIntl();
   const serverSlug = useServerStore((s) => s.current?.slug);
@@ -44,6 +49,7 @@ export default function MachinePanelHeader({
       iconAlwaysVisible
       onMobileBack={onMobileBack}
       mobileBackProps={mobileBackProps}
+      backButtonVisibility={backAlways ? "always" : "responsive"}
       containerProps={HEADER_CONTAINER_PROPS}
       // Raft DS › Panel: shown buttons, then ⋯, then Close. A computer's head
       // has only Close; its actions are in the body. Named by `title`, as on

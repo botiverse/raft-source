@@ -74,8 +74,11 @@ test("owners and admins can configure pre-join agreement; edits insert a new act
     body: JSON.stringify({ enabled: true, title: "Rules", bodyMarkdown: "Be kind." }),
   });
   assert.equal(denied.status, 403, "members cannot configure v0 agreement");
-  const deniedBody = await denied.json() as { error: string };
-  assert.equal(deniedBody.error, "Only server owners and admins can manage the pre-join agreement");
+  assert.deepEqual(await denied.json(), {
+    error: "Only server owners and admins can manage the pre-join agreement",
+    code: "insufficient_role",
+    errorCode: "insufficient_role",
+  });
 
   const first = await fetch(`${app.baseUrl}/api/servers/${server.id}/agreement`, {
     method: "PUT",

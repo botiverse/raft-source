@@ -60,6 +60,8 @@ test("createSystemAppAgentEvent writes the queued system row inside the caller's
     consumedVia: null,
     // #wg-ax:#24: not added to an unread item without a wake.
     wakeCoalescedAt: null,
+    // #15643: system app events always wake; only POST /api/oauth/agent-events can ask for inbox delivery.
+    delivery: "wake",
   });
   assert.deepEqual(event, row);
 });

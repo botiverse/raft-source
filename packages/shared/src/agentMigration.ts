@@ -24,6 +24,8 @@ export const MAX_AGENT_MIGRATION_TRANSPORT_BYTES = 10 * 1024 * 1024 * 1024;
 export const MAX_AGENT_MIGRATION_TRANSFER_FILE_COUNT = 1_000_000;
 export const MAX_AGENT_MIGRATION_TRANSFER_BYTES = MAX_AGENT_MIGRATION_TRANSPORT_BYTES;
 export const MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT = 1_000_000;
+/** How many unreadable paths a transfer summary names (`skippedUnreadable.paths`); the count covers the rest. */
+export const MAX_AGENT_MIGRATION_SKIPPED_UNREADABLE_PATHS = 20;
 
 const boundedTransferCountSchema = lazySchema("boundedTransferCountSchema", () => z.number().int().nonnegative().max(MAX_AGENT_MIGRATION_TRANSFER_FILE_COUNT));
 const boundedExcludedCountSchema = lazySchema("boundedExcludedCountSchema", () => z.number().int().nonnegative().max(MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT));
@@ -83,6 +85,17 @@ export const agentMigrationTransferSummarySchema = lazySchema("agentMigrationTra
   // SERVER_CAPABILITY_MIGRATION_IGNORED_PARTIAL_V1, for a target that
   // advertises AGENT_MIGRATION_TARGET_IGNORED_PARTIAL_CAPABILITY, sends it.
   excludedIgnoredPartial: z.literal(true).optional(),
+  // Workspace files and directories the source had no permission to read
+  // (EACCES/EPERM), so they were left behind; `paths` names the first few
+  // (a directory ends in `/`). `MEMORY.md` and `notes/` are never skipped: an
+  // unreadable one fails the move. Only a Computer that saw the Server
+  // advertise SERVER_CAPABILITY_MIGRATION_SKIPPED_UNREADABLE_V1, for a target
+  // that advertises AGENT_MIGRATION_TARGET_SKIPPED_UNREADABLE_CAPABILITY,
+  // sends it.
+  skippedUnreadable: z.object({
+    count: z.number().int().min(1).max(MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT),
+    paths: z.array(z.string().min(1).max(4096)).min(1).max(MAX_AGENT_MIGRATION_SKIPPED_UNREADABLE_PATHS),
+  }).strict().optional(),
 }).strict().superRefine((summary, ctx) => {
   const categorized = Object.values(summary.excludedRegenerableByCategory)
     .reduce((total, count) => total + count, 0);
@@ -91,6 +104,13 @@ export const agentMigrationTransferSummarySchema = lazySchema("agentMigrationTra
       code: "custom",
       path: ["excludedRegenerableByCategory"],
       message: "excluded regenerable category counts must sum to excludedRegenerableCount",
+    });
+  }
+  if (summary.skippedUnreadable && summary.skippedUnreadable.paths.length > summary.skippedUnreadable.count) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["skippedUnreadable", "paths"],
+      message: "skippedUnreadable.paths must not exceed skippedUnreadable.count",
     });
   }
   if (summary.excludedIgnoredPartial && !summary.excludedIgnored) {

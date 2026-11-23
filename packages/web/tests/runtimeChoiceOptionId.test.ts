@@ -5,7 +5,6 @@ import { isTypedCustomValue, shownOptionId } from "../src/components/agent/runti
 test("a runtime choice shows a real model id under its name, never an internal value", () => {
   assert.equal(shownOptionId("qwen-token-plan/qwen3.8-max", "Qwen3.8 Max"), "qwen-token-plan/qwen3.8-max");
   assert.equal(shownOptionId("__runtime_form_v2_default__", "Default"), null, "the Default row's placeholder");
-  assert.equal(shownOptionId("connection:3f2a", "My gateway"), null, "a saved Provider connection");
   assert.equal(shownOptionId("claude", "claude"), null, "an id that only repeats the label");
 });
 

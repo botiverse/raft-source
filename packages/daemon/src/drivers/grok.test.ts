@@ -1081,7 +1081,7 @@ test("task #1242: a Grok launch whose PATH lookup timed out reaches the start ca
     // The real start path wraps the resolver error; the classifier reads the cause.
     const wrapped = Object.assign(new Error(`Runtime session failed to start: runtime_error (${thrown.message})`), { code: "runtime_not_found", cause: thrown });
     const activity = startFailureActivity(classifySpawnFailure(wrapped), "grok-4");
-    assert.deepEqual(activity.spawnFailure, { reason: "runtime_not_found", lookupReason: "lookup_timed_out" });
+    assert.deepEqual(activity.spawnFailure, { reason: "runtime_not_found", lookupReason: "lookup_timed_out", message: `Runtime session failed to start: runtime_error (${thrown.message})` });
     assert.equal(activity.detail, thrown.message);
     assert.doesNotMatch(activity.detail, /Install/);
   } finally {

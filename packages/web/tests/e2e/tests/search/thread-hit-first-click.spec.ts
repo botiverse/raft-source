@@ -213,7 +213,7 @@ test.describe("Thread search hit master/detail", () => {
     await expect(page.getByRole("option", { name: channel.name, exact: true })).toBeVisible();
     await page.getByPlaceholder("Search…").press("Escape");
     await expect(channelFilter).toHaveAttribute("aria-expanded", "false");
-    await expect(page.getByText("Server entities", { exact: true })).toHaveCount(0);
+    await expect(page.getByTestId("search-entity-group")).toHaveCount(0);
     await expect(page.getByRole("button", { name: new RegExp(content) })).toHaveCount(1);
 
     const searchInput = page.getByPlaceholder("Search channels, DMs, messages…");

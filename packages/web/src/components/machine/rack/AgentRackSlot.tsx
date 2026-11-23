@@ -79,7 +79,7 @@ export function AgentRackSlot({
           badge={<AgentActivityDot agentId={agent.id} size="sm" />}
         />
       </PreviewCardTrigger>
-      <PreviewCardContent sideOffset={6} collisionPadding={6}>
+      <PreviewCardContent sideOffset={6}>
         <ProfilePreviewCardContent
           mentionType="agent"
           mentionId={agent.id}

@@ -4,7 +4,7 @@
 // kept from a failed read or from a read a change overtook.
 import assert from "node:assert/strict";
 import { createFeatureFlagChangeNotifier, type FeaturesChangedTransport } from "./featureFlagChangeNotifier";
-import { __setFlagReadCacheTtlForTests, cachedServerFlagAnswers, forgetCachedFlags, FLAG_READ_CACHE_TTL_MS } from "./featureFlagReadCache";
+import { __setFlagReadCacheTtlForTests, cachedGlobalFlagEvaluation, cachedServerFlagAnswers, forgetCachedFlags, FLAG_READ_CACHE_TTL_MS } from "./featureFlagReadCache";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -110,4 +110,22 @@ test("this replica's change notifier forgets a changed flag's answers, from a se
   } finally {
     notifier.stop();
   }
+});
+
+test("cachedGlobalFlagEvaluation caches enabled+variant within TTL and forgets on forgetCachedFlags", async () => {
+  __setFlagReadCacheTtlForTests(FLAG_READ_CACHE_TTL_MS);
+  let reads = 0;
+  let current = { enabled: true, variant: "seal" as string | null };
+  const read = async () => {
+    reads++;
+    return { ...current };
+  };
+  assert.deepEqual(await cachedGlobalFlagEvaluation("global_flag", read), { enabled: true, variant: "seal" });
+  assert.deepEqual(await cachedGlobalFlagEvaluation("global_flag", read), { enabled: true, variant: "seal" });
+  assert.equal(reads, 1);
+
+  current = { enabled: true, variant: "strict" };
+  forgetCachedFlags(["global_flag"]);
+  assert.deepEqual(await cachedGlobalFlagEvaluation("global_flag", read), { enabled: true, variant: "strict" });
+  assert.equal(reads, 2);
 });

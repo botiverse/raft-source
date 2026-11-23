@@ -14,9 +14,23 @@ import { isTaskV2Task } from "../../utils/taskConversation";
 import { buildThreadParentContextRequest } from "../../components/message/messageContextRequest";
 import { resolveMessageSenderMember } from "../../utils/messageSenderMember";
 import { mergeParentTaskMetadata } from "../../utils/taskMetadata";
-import { findCachedThreadParentMessage, findThreadParentMessage, pickFreshThreadParentMessage, syncThreadParentMessageFromStore } from "./threadMessages";
+import { readHistoryLimitedError } from "../../store/hiddenHistoryStore";
+import type { HiddenHistoryMessage } from "../../store/hiddenHistoryStore";
+import { subscribeMessageUpdated } from "../../store/messageUpdatedApply";
+import { applyThreadParentMessagePatch, findCachedThreadParentMessage, findThreadParentMessage, pickFreshThreadParentMessage, syncThreadParentMessageFromStore } from "./threadMessages";
 
 const EMPTY_PARENT_SOURCE_TASKS: Task[] = [];
+
+/**
+ * A parent behind the plan's history window, as far as it is known: the context route's `history_limited` glimpse
+ * or the followed thread's preview. Every field may be unknown (null), and the thread is still the parent's.
+ */
+export interface ThreadParentGlimpse {
+  senderType: Message["senderType"] | null;
+  senderId: string | null;
+  senderName: string | null;
+  preview: string | null;
+}
 
 /**
  * The message the thread hangs under and its task: the loaded parent (or a
@@ -56,6 +70,11 @@ export function useThreadParent({
 }) {
   const [parentMessage, setParentMessage] = useState<Message | null>(null);
   const [parentTask, setParentTask] = useState<Task | null>(null);
+  // The parent's read was refused (403) or found nothing (404): its place is one the person can't open.
+  const [parentUnavailableFor, setParentUnavailableFor] = useState<string | null>(null);
+  // The parent is behind the plan's history window (a 404 with code `history_limited`): not out of reach, only
+  // not shown; the answer's glimpse of it (sender, first 80 characters), when it has one.
+  const [parentBehindWindow, setParentBehindWindow] = useState<{ parentMessageId: string; glimpse: HiddenHistoryMessage | null } | null>(null);
   const loadTasks = useTaskStore((s) => s.loadTasks);
   const fallbackParentMessage = useMemo<Message | null>(() => {
     if (!parentMessageId || !parentChannelId) return null;
@@ -197,8 +216,17 @@ export function useThreadParent({
           const cachedParent = findCachedThreadParentMessage(useMessageStore.getState().channelMessages, parentChannelId, parentMessageId);
           setParentMessage(pickFreshThreadParentMessage(parent, cachedParent));
         })
-        .catch(() => {
-          if (!cancelled) setParentMessage(null);
+        .catch((error: unknown) => {
+          if (cancelled) return;
+          setParentMessage(null);
+          const limited = readHistoryLimitedError(error);
+          if (limited) {
+            const target = limited.hiddenTarget?.target;
+            setParentBehindWindow({ parentMessageId, glimpse: target && target.id === parentMessageId ? target : null });
+            return;
+          }
+          const status = (error as { response?: { status?: number } } | null)?.response?.status;
+          if (status === 403 || status === 404) setParentUnavailableFor(parentMessageId);
         });
     }
 
@@ -257,10 +285,37 @@ export function useThreadParent({
   useEffect(() => {
     syncThreadParentMessageFromStore(storeParentMessage, setParentMessage);
   }, [storeParentMessage]);
+  useEffect(() => {
+    if (!parentMessageId) return;
+    return subscribeMessageUpdated((msg) => {
+      applyThreadParentMessagePatch(parentMessageId, msg, setParentMessage);
+    });
+  }, [parentMessageId]);
   // Stryker restore all
+
+  // Behind the window: what the paywall's answer or the followed thread says about the parent, for the head's title.
+  const parentHistoryGlimpse = useMemo<ThreadParentGlimpse | null>(() => {
+    if (!parentMessageId || parentMessage || fallbackParentMessage) return null;
+    const followed = followedThreads.find((thread) => thread.parentMessageId === parentMessageId);
+    const answered = parentBehindWindow?.parentMessageId === parentMessageId;
+    if (!answered && followed?.parentInHistory !== false) return null;
+    const glimpse = answered ? parentBehindWindow.glimpse : null;
+    if (glimpse) return { senderType: glimpse.senderType, senderId: glimpse.senderId, senderName: glimpse.senderName, preview: glimpse.preview };
+    if (followed?.parentMessageSenderId) {
+      return {
+        senderType: followed.parentMessageSenderType as Message["senderType"],
+        senderId: followed.parentMessageSenderId,
+        senderName: null,
+        preview: followed.parentMessagePreview || null,
+      };
+    }
+    return { senderType: null, senderId: null, senderName: null, preview: null };
+  }, [fallbackParentMessage, followedThreads, parentBehindWindow, parentMessage, parentMessageId]);
 
   return {
     parentMessage,
+    parentHistoryGlimpse,
+    parentUnavailable: parentUnavailableFor !== null && parentUnavailableFor === parentMessageId && !parentMessage && !fallbackParentMessage,
     displayedParentMessageWithThreadId,
     displayedParentTask,
     displayedParentThreadSummary,

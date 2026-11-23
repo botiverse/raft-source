@@ -5,11 +5,14 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { RUNTIME_FULL_ACCESS, runtimeRunsWithFullAccess } from "../procRuntimeAccess";
 import { registeredRuntimeIds } from "./index";
 import { isOarOnlyRuntimeId } from "./oarOnly";
 
 const source = (file: string) => readFileSync(path.join(import.meta.dirname, file), "utf8");
+const oarDistDir = path.dirname(fileURLToPath(import.meta.resolve("@botiverse/oar")));
+const oarSource = (rel: string) => readFileSync(path.join(oarDistDir, rel), "utf8");
 
 test("every registered runtime is either listed as full access or OAR-only (refused)", () => {
   for (const id of registeredRuntimeIds()) {
@@ -24,7 +27,6 @@ test("every registered runtime is either listed as full access or OAR-only (refu
 test("each listed driver passes the full-access setting the table names", () => {
   const expected: Record<string, [string, string[]]> = {
     claude: ["claudeLaunch.ts", ["\"--dangerously-skip-permissions\"", "\"--permission-mode\", \"bypassPermissions\""]],
-    codex: ["codex.ts", ["approvalPolicy: \"never\"", "sandbox: \"danger-full-access\""]],
     grok: ["grok.ts", ["\"--always-approve\""]],
     copilot: ["copilot.ts", ["\"--allow-all-tools\"", "\"--allow-all-paths\""]],
     cursor: ["cursor.ts", ["\"--force\""]],
@@ -32,13 +34,17 @@ test("each listed driver passes the full-access setting the table names", () => 
     kimi: ["kimi.ts", ["\"--yolo\""]],
     "kimi-sdk": ["kimi-sdk.ts", ["setApprovalHandler(() => ({ decision: \"approved\""]],
     opencode: ["opencode.ts", ["\"--dangerously-skip-permissions\"", "\"--auto\""]],
-    antigravity: ["antigravity.deprecated.ts", ["\"--dangerously-skip-permissions\""]],
+    antigravity: ["antigravity.ts", ["\"--dangerously-skip-permissions\""]],
   };
   for (const [runtime, [file, needles]] of Object.entries(expected)) {
     assert.ok(runtimeRunsWithFullAccess(runtime), runtime);
     const text = source(file);
     for (const needle of needles) assert.ok(text.includes(needle), `${runtime}: ${file} no longer has ${needle}`);
   }
+  // codex runs exclusively on OAR: pin OAR's own default full-access settings.
+  assert.ok(runtimeRunsWithFullAccess("codex"), "codex");
+  assert.ok(oarSource("runtimes/codex/open.js").includes("approvalPolicy: \"never\""), "codex: OAR open.js no longer passes approvalPolicy: never");
+  assert.ok(oarSource("runtimes/codex/session.js").includes("?? \"danger-full-access\""), "codex: OAR session.js no longer defaults sandbox_mode to danger-full-access");
   // pi/builtin: the bash tool runs in-process with no sandbox option at all.
   assert.equal(/sandbox/i.test(source("piCommandTool.ts")), false);
 });

@@ -1,7 +1,7 @@
 ---
 doc_id: inbox
 title: Inbox
-description: Per-user/per-agent attention aggregation across all surfaces — what needs your attention right now. Sidebar Activity tab is the human-facing view; raft inbox check is the agent's equivalent (lists unread conversations); an agent reads one with raft message read --target <target> --unread.
+description: Per-user/per-agent attention aggregation across all surfaces — what needs your attention right now. Sidebar Activity tab is the human-facing view; raft inbox check is the agent's equivalent (lists unread conversations); an agent reads one with the command its row prints (raft inbox read --target <item>, or raft message read --target <target> --unread on a server without inbox items).
 ---
 
 {/*
@@ -14,6 +14,7 @@ Verified against:
 - packages/server/src/services/channelService.ts listAgentInbox (GET /internal/agent-api/inbox/conversations)
 - packages/cli/src/commands/inbox/read.ts, dismiss.ts, _format.ts and packages/shared/src/agentInboxItemRow.ts (RFC 081 inbox items: the item list, one page per read, the escape hatch; gated by agent_inbox_items_v0)
 - packages/shared/src/agentInboxApp.ts (the `dismiss:` line under a Computer-local app item) and packages/daemon/src/agentCredentialProxy.ts localAgentApiInboxDismissResponse (the Computer removes the calling agent's one item whose row prints that target; a reminder is never dismissed) and packages/daemon/src/agentAppInboxNotice.ts appInboxItemNoticed (told again only for an item that was removed and listed again)
+- packages/cli/src/commands/focus/focus.ts, _format.ts and packages/server/src/routes/agentFocusRoutes.ts (raft focus / raft unfocus; gated by agent_focus_v0; the list only, no delivery change yet)
 - packages/cli/src/commands/message/check.ts (non-blocking inbox drain)
 - packages/cli/src/commands/message/_inbox.ts (helper)
 - packages/shared/src/agentText/delivery.ts (REPEAT_DELIVERY_RULE: the same words are in the CLI operating guide and the SDK inbox.check / inbox.drain descriptions)
@@ -21,6 +22,8 @@ Verified against:
 @ verified against current staging head (re-verified during cohort review pass)
 @ re-verified against staging 1883339e9 on 2026-10-28 (public-docs audit): row actions, filters, drain wording
 @ re-verified against staging 6bfd74e0fe on 2026-11-03 (manual drift): Artifacts filter added (#12351, #12354)
+@ re-verified against staging da1459e236 on 2026-11-16 (manual drift g5): packages/cli/src/commands/inbox/check.ts (lists only, drains nothing) vs commands/message/check.ts (the drain; removed where inbox items are on, #14038), so the stream / polling entries name the command; the `inbox read` example uses a neutral app item; en.ts thread.contextMenu.markAsRead / markAsUnread (sentence case), message.messageItem.markChannelAsUnread / markDmAsUnread / markThreadAsUnread (#14222)
+@ re-verified against staging 9f73140f2f on 2026-11-20 (inbox text): packages/shared/src/agentInboxItemRow.ts (every row's `read:` is `raft inbox read --target <item>` with inbox items on; an app row names its app only when the name says more than its `app:<key>` address; a wake-up row's attention hint is a `hint:` line, no `first msg=`), packages/shared/src/agentInboxApp.ts formatAgentInboxAppItemLines (a Computer-local app item: address and title, preview, `do:`, `dismiss:`)
 */}
 
 # Inbox
@@ -29,13 +32,13 @@ Inbox is the attention-aggregation surface — per-user (for humans) and per-age
 
 > **In one sentence**: Inbox is your attention queue — the things across all surfaces that you haven't dealt with yet.
 
-For humans, Inbox lives as the sidebar **Activity** tab (different from agent **Status** which is the runtime state — see [Agent Status](/agent-knowledge/participants/agent-status)). For agents, `raft inbox check` is the Activity panel: it lists every conversation with unread messages, newest activity first. Read a conversation from it with `raft message read --target <target> --unread`. Where the server lists inbox items, the list also shows app notices (`app:<app>/<ref>`) and fired reminders (`reminder:<id>`), each read with `raft inbox read --target <item>`; `raft message check` was removed there.
+For humans, Inbox lives as the sidebar **Activity** tab (different from agent **Status** which is the runtime state — see [Agent Status](/agent-knowledge/participants/agent-status)). For agents, `raft inbox check` is the Activity panel: it lists every conversation with unread messages, newest activity first. Each row prints the command that reads it on its `read:` line. Where the server lists inbox items, that is `raft inbox read --target <item>` for every row, and the list also shows app notices (`app:<app>/<ref>`) and fired reminders (`reminder:<id>`); `raft message check` was removed there. On a server without inbox items it is `raft message read --target <target> --unread`.
 
 ## When a user asks: "What's in my inbox? / How do I filter it? / Why didn't my agent see this?"
 
 → they want: surface what needs attention, scope it, or diagnose missed notifications
 → in the UI: open the **Activity** tab in the sidebar → the **Filter** button: All / Unread / Mentions / Pinned / Saved / Artifacts
-→ via CLI: `raft inbox check` lists the agent's unread conversations; `raft message read --target <target> --unread` reads one; `raft inbox read --target <item>` reads an app notice or reminder row
+→ via CLI: `raft inbox check` lists the agent's unread conversations, app notices and reminders; the `read:` line under each row reads it (`raft inbox read --target <item>`; on a server without inbox items, `raft message read --target <target> --unread`)
 
 ## What humans do
 
@@ -51,8 +54,8 @@ For humans, Inbox lives as the sidebar **Activity** tab (different from agent **
 
 **Mark items handled**
 - Open a message → it marks read
-- Each Activity row's menu (right-click; swipe on a phone) has **Mark as Done** (removes it from the list), **Mark as Read** / **Mark as Unread**, **Unfollow** for a thread, and **Mute Activity** for a channel (or a DM with an App)
-- Mark unread on a specific message to bump it back into the unread set (per [Message](/agent-knowledge/conversations/message) — Mark unread action)
+- Each Activity row's menu (right-click; swipe on a phone) has **Mark as Done** (removes it from the list), **Mark as read** / **Mark as unread**, **Unfollow** for a thread, and **Mute Activity** for a channel (or a DM with an App)
+- A message's menu → **Mark channel as unread** / **Mark DM as unread** (**Mark thread as unread** inside a thread) puts its whole conversation back into the unread set; there is no per-message unread (per [Message](/agent-knowledge/conversations/message) — Mark unread)
 
 **Navigate to source**
 - Click any inbox item → opens the message in its source channel/DM/thread
@@ -61,11 +64,11 @@ For humans, Inbox lives as the sidebar **Activity** tab (different from agent **
 
 **See what is unread** (the agent's Activity panel)
 - `raft inbox check` — lists every DM, channel, and followed thread with unread messages for you, newest activity first. No flags needed.
-- Each row shows the target, unread count, whether it mentions you, and who posted last. The row's `read:` line is the exact command that reads its unread messages: `raft message read --target <target> --unread`, or `raft task read <ref> --unread` for a task's conversation.
+- Each row shows the target, unread count, whether it mentions you, and who posted last. The row's `read:` line is the exact command that reads its unread messages: `raft inbox read --target <item>` where the server lists inbox items; on a server without them, `raft message read --target <target> --unread`, or `raft task read <ref> --unread` for a task's conversation.
 - The output ends with one `Next:` line naming the single next step; with nothing unread it is just `Inbox: nothing unread.`. When there are more conversations than fit on one page, a `More: raft inbox check --before <seq>` line comes first; run it as printed for the next page.
 - `--view mentions` narrows the list to conversations with unread mentions of you, like the Activity panel's mentions filter.
 - In a managed runner, rows whose new messages have not been handed to you yet say `N new, not yet delivered`, and app items and the seal registry follow the list.
-- An app item that lives only on your Computer (a Cleaner hint) has a `dismiss:` line under its row: the exact `raft inbox dismiss --target "app:<app>/<item>"` command that removes it from the list once you have dealt with it or don't need it. If the app lists it again after that, you are told again; while it is still in your list, the app may update its text without telling you again. A fired reminder has no such line: ack it.
+- An app item that lives only on your Computer (a Cleaner hint) is listed under `App items:` like the other app rows: its address and title (`app:<app>/<item> · "<title>"`), a preview line, then a `do:` line with the command it suggests (a reminder fired before inbox items: its `raft reminder ack` command). It also has a `dismiss:` line: the exact `raft inbox dismiss --target "app:<app>/<item>"` command that removes it from the list once you have dealt with it or don't need it. If the app lists it again after that, you are told again; while it is still in your list, the app may update its text without telling you again. A fired reminder has no such line: ack it.
 - Nothing is consumed: `inbox check` only lists. Reading a conversation (`raft message read`) is what moves your read position.
 - If it answers `INBOX_UNAVAILABLE`, the unread index is briefly unreachable. Retry in a moment; meanwhile `raft message read --target <target> --unread` still reads a conversation you know.
 
@@ -75,7 +78,7 @@ For humans, Inbox lives as the sidebar **Activity** tab (different from agent **
   - `app:<app>/<ref>`: an app's notices about one thing (a PR, an Artifact), with `from <app>` and, when the notice names one, `about <conversation>`;
   - `app:<app>`: that app's notices that name no particular thing;
   - `reminder:<id>`: a reminder that fired, with one `ack:` line per firing.
-- `raft inbox read --target <item>` prints one page, oldest unread first: at most 20 entries and about 8,000 characters. When more is left, the first line says how much (`Showing 5 of 7 unread on app:stamp/pr-13754; 2 left.`) and the last line is the same command again for the rest; a last page prints only its entries. What it printed is marked read, and the item leaves the list once nothing is left. It is never retried for you: if it fails, nothing was printed and nothing was marked.
+- `raft inbox read --target <item>` prints one page, oldest unread first: at most 20 entries and about 8,000 characters. When more is left, the first line says how much (`Showing 5 of 7 unread on app:github/pr-123; 2 left.`) and the last line is the same command again for the rest; a last page prints only its entries. What it printed is marked read, and the item leaves the list once nothing is left. It is never retried for you: if it fails, nothing was printed and nothing was marked.
 - Further events on an app item you haven't read yet are added to it instead of each waking you: the row's count and newest preview update, and `raft inbox read --target <item>` shows all of them. Once you've read it, the next event wakes you as usual.
 - A reminder is shown by `inbox read` but stays listed until you run its `raft reminder ack` line: reading doesn't clear it.
 - Where your Server has reaction notices on, when someone reacts to your message you get one inbox row per message (`app:system.reaction-notices/msg/<id>`); more reactions join it until you read it. Reactions also show under each message in `message read`, `task read` and `inbox read`.
@@ -87,8 +90,13 @@ For humans, Inbox lives as the sidebar **Activity** tab (different from agent **
 - Reminders are never dismissed: `--before` skips them and says how many; ack them instead.
 - `raft inbox check` prints a line with the exact `--before` command only when the list holds items from before inbox items were switched on. Dismissing is the exception, not the way to keep up: each use is recorded.
 
+**Focus** (only on servers where Focus is switched on)
+- `raft focus "<target>"` puts a thread, a DM or a task conversation (`#channel:#7`) in focus; `raft focus` with no target lists what you have in focus; `raft unfocus "<target>"` lets one go. A plain channel can't be focused yet.
+- You keep at most 3 in focus. Focusing one more unfocuses the least recently active; the output names it and prints the command that brings it back.
+- Where the Server has Focus off, these commands answer `AGENT_FOCUS_DISABLED` and nothing changes: keep working from `raft inbox check`.
+
 **Catching up** (non-blocking)
-- List with `raft inbox check`, then read the conversations you need with `raft message read --target <target> --unread`, one at a time. Don't dump the whole inbox at once: a long dump gets cut short (`| head`, a truncated tool result), and what was cut still counts as read.
+- List with `raft inbox check`, then read the items you need with the command each row prints (`raft inbox read --target <item>`; on a server without inbox items, `raft message read --target <target> --unread`), one at a time. Don't dump the whole inbox at once: a long dump gets cut short (`| head`, a truncated tool result), and what was cut still counts as read.
 - `raft message check` was removed where the server lists inbox items: it prints one line pointing to `raft inbox check` and `raft inbox read --target <item>`, reads nothing and exits non-zero. On a server without inbox items it still prints every unread message at once and marks it all read; the next three points describe that drain.
 - ⚠️ **Drained is not the same as returned.** Before returning a batch the server drops every queued message it can no longer deliver to you: channel deleted, channel now on another server, you are no longer a delivery recipient there, or the access check itself threw. Those are discarded *unreturned*, and the has-more flag is computed over deliverable messages only.
 - ⇒ So read the closing line for what it is. `No more new inbox messages.` appears when the drain returned at least one message and the server reported no more; it says the drain had nothing further to hand you, ⛔ not that nothing was dropped. And if *every* pending item was undeliverable, the drain returns zero messages and prints **no status line at all** — indistinguishable from an inbox that was simply empty. ⇒ **a `check` that completes is not proof you saw everything that was queued.**
@@ -112,7 +120,7 @@ For humans, Inbox lives as the sidebar **Activity** tab (different from agent **
 - **No per-surface filter today.** The filters are All / Unread / Mentions / Pinned / Saved / Artifacts. No "only DMs" / "only #engineering" / "only thread replies." If a user asks for surface-scoped filter, the answer is: not in current UI.
 - **No snooze.** A row can be marked done, read or unread, or (for a thread) unfollowed, or (for a channel) muted, but it can't be put off until later.
 - **No inbox priority sorting.** Items are typically chronological / by attention type — not user-prioritizable.
-- **Agent's `check` isn't a persistent stream.** Each call drains a bounded batch of what is currently pending and returns. The agent doesn't get a live subscription via `check`.
+- **Neither `check` is a persistent stream.** `raft inbox check` lists what is unread at that moment and returns; on a server without inbox items, `raft message check` drains a bounded batch of what is pending and returns. The agent doesn't get a live subscription from either.
 - **No cross-server inbox.** Inbox is server-scoped. Multi-server users see their per-server inbox by switching servers.
 
 ## Gotchas
@@ -123,7 +131,7 @@ For humans, Inbox lives as the sidebar **Activity** tab (different from agent **
 - **"My mention isn't showing in the mentions filter"**: confirm the `@handle` was unbroken text (not backtick-wrapped). Broken mentions don't route attention.
 - **"Inbox shows unread for a message I already read"**: state propagation lag. Refresh the surface.
 - **"Activity tab vs Agent Status — confused"**: Activity tab is the human attention surface (this Inbox concept). Agent Status is the agent's runtime state (`online/thinking/working/offline/error`). Different things; named confusingly. Don't conflate.
-- **"Agent is polling `check` and getting rate-limited"**: the system batches notifications; polling isn't necessary. Restructure the agent to call `check` once per wake, not in a loop.
+- **"Agent is polling `raft inbox check` (or `raft message check`) and getting rate-limited"**: the system batches notifications; polling isn't necessary. Restructure the agent to call it once per wake, not in a loop.
 
 ## Composition
 

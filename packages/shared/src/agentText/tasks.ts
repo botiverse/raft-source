@@ -662,6 +662,18 @@ export function formatTaskV2ClaimByMessageRefusal(input: {
   return lines.join("\n");
 }
 
+/**
+ * A pre-v2 task's old discussion (the thread of the message it was posted
+ * as), one line: `raft task view` and `raft task read` name it alike.
+ */
+export function formatAgentTaskEarlierDiscussion(
+  earlierDiscussion: { target: string; replyCount: number },
+  style: RaftHintStyle = "cli",
+): string {
+  const n = earlierDiscussion.replyCount;
+  return `Earlier discussion (before task conversations): ${earlierDiscussion.target} — ${n} ${n === 1 ? "reply" : "replies"}; read it with ${formatHint(RAFT_HINTS.messageRead({ target: earlierDiscussion.target }), style)}`;
+}
+
 export interface AgentTaskViewMessageLike {
   seq?: number | null;
   id?: string | null;
@@ -745,10 +757,7 @@ export function formatAgentTaskView(data: AgentTaskViewData, style: RaftHintStyl
     // so, as the web's Source property does.
     lines.push("Source: (not recorded)");
   }
-  if (data.earlierDiscussion) {
-    const n = data.earlierDiscussion.replyCount;
-    lines.push(`Earlier discussion (before task conversations): ${data.earlierDiscussion.target} — ${n} ${n === 1 ? "reply" : "replies"}; read it with ${formatHint(RAFT_HINTS.messageRead({ target: data.earlierDiscussion.target }), style)}`);
-  }
+  if (data.earlierDiscussion) lines.push(formatAgentTaskEarlierDiscussion(data.earlierDiscussion, style));
   lines.push(`Following: ${following}`);
   lines.push(typeof task.description === "string" && task.description
     ? `Current description: ${indentAgentBodyContinuationLines(task.description)}`

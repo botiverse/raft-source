@@ -42,6 +42,8 @@ export type CliErrorCode =
   | "SEND_HELD_AS_DRAFT"
   | "ATTACHMENT_ID_INVALID"
   | "SEND_HELD"
+  // A task write (create/claim/assign/unassign/unclaim/update/amend) held for unseen messages: nothing was applied (commands/freshness/_taskHold.ts).
+  | "TASK_WRITE_HELD"
   | "GUIDANCE_DELIVERED"
   // A continuation's answer was refused, or its store failed (commands/continuation).
   | "CONTINUATION_REFUSED"
@@ -68,6 +70,11 @@ export type CliErrorCode =
   | "INTEGRATION_NOT_FOUND"
   // `raft reminder trigger` / `raft reminder log --key`: the Reminder app is not on this server.
   | "REMINDER_APP_NOT_INSTALLED"
+  // `raft reminder` on a server whose reminders live in the Reminder app: the app refused (4xx; its own code in details.app_code),
+  // failed or gave no answer; or whether the reminders moved there could not be read.
+  | "REMINDER_APP_REFUSED"
+  | "REMINDER_APP_FAILED"
+  | "REMINDER_APP_UNKNOWN"
   | "HISTORY_FAILED"
   | "HISTORY_LIMITED"
   | "UNSUPPORTED_BY_SERVER"
@@ -110,8 +117,14 @@ export type CliErrorCode =
   | "BASE_REQUIRED"
   | "BASE_MOVED"
   | "UNSEEN_CHANGES"
+  | "SETTLED"
+  | "SETTLED_NOT_AVAILABLE"
   | "DUPLICATE_PATH"
   | "ENTRY_NOT_FOUND"
+  // The command held itself once before anything was sent, and the same command again goes through (a new artifact with no page;
+  // an HTML or Markdown file uploaded as an attachment). One code for every such hold, and text mode does not print it
+  // (`informative`): no program acts on which hold it was, the sentence and the next step are the whole answer.
+  | "HELD_ONCE"
   | "INVALID_CONTENT"
   | "SIZE_MISMATCH"
   | "SHA256_MISMATCH"
@@ -172,6 +185,8 @@ export type CliErrorCode =
   | "DELETE_FAILED"
   | "CONVERT_FAILED"
   | "UPDATE_FAILED"
+  // `raft channel set-role`: a refusal without a code of its own from the Server; any other code is shown as the Server sent it.
+  | "SET_ROLE_FAILED"
   // Channel announcements (`raft artifact push --announcement`): refused before the push, or the set after it.
   | "CHANNEL_ANNOUNCEMENT_DISABLED"
   | "CHANNEL_ANNOUNCEMENT_FORBIDDEN"
@@ -202,6 +217,9 @@ export type CliErrorCode =
   | "task_v2_use_create"
   | "task_target_use_task_command"
   | "FOLLOW_FAILED"
+  // `raft focus` / `raft unfocus`: a refusal without a code from the Server; its codes (AGENT_FOCUS_DISABLED, FOCUS_CHANNEL_UNAVAILABLE, …) are shown as it sent them.
+  | "FOCUS_FAILED"
+  | "UNFOCUS_FAILED"
   | "REPLY_FAILED"
   // `raft proc`: this Computer's daemon runs no jobs (older, Windows, not daemon-managed), and the daemon's refusals.
   | "PROC_UNSUPPORTED"
@@ -263,6 +281,13 @@ export interface CliErrorOptions {
   proxyUpstreamStatus?: number;
   proxyResponseStarted?: boolean | null;
   proxyResponseComplete?: boolean | null;
+  /**
+   * The message and the next step are the whole answer, and no program acts on
+   * the code: text mode prints no `Code:` line (JSON mode still carries the
+   * code, as every error does). For a hold or refusal an agent only has to
+   * read; a failure a script or a client branches on keeps its code line.
+   */
+  informative?: true;
   retryable?: boolean | null;
   faultDomain?: string;
   effectState?: FileWriteEffectState;
@@ -286,6 +311,7 @@ export class CliError extends Error {
   readonly proxyUpstreamStatus?: number;
   readonly proxyResponseStarted?: boolean | null;
   readonly proxyResponseComplete?: boolean | null;
+  readonly informative?: true;
   readonly retryable?: boolean | null;
   readonly fault_domain?: string;
   readonly effect_state?: FileWriteEffectState;
@@ -312,6 +338,7 @@ export class CliError extends Error {
     this.proxyUpstreamStatus = options.proxyUpstreamStatus;
     this.proxyResponseStarted = options.proxyResponseStarted;
     this.proxyResponseComplete = options.proxyResponseComplete;
+    this.informative = options.informative;
     this.retryable = options.retryable;
     this.fault_domain = options.faultDomain ?? options.layer;
     this.effect_state = options.effectState;
@@ -394,4 +421,12 @@ export function cliError(
 export function toCliError(err: unknown): CliError {
   if (err instanceof CliError) return err;
   return new InternalBugError(err);
+}
+
+/**
+ * The answer for a command that held itself once (`RaftOpError.heldOnce`):
+ * its sentence and its next step, with no code line in text mode.
+ */
+export function heldOnceCliError(error: { message: string; nextAction: string }): CliError {
+  return new CliError({ code: "HELD_ONCE", informative: true, message: error.message, suggestedNextAction: error.nextAction });
 }

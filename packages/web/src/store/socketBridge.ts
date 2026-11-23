@@ -18,6 +18,7 @@ import { useNavigate } from "react-router-dom";
 import type { NavigateFunction } from "react-router-dom";
 import { ACTIVITY_CHANGED_EVENT, LIST_CHANGED_EVENTS, PRODUCT_FEEDBACK_APP_UNREAD_EVENT, PRODUCT_FEEDBACK_UNREAD_EVENT, SERVER_FEATURES_CHANGED_SOCKET_EVENT, failpoints, isNotificationLevel, isRaftThemeId, SOCKET_NOT_SERVER_MEMBER_ERROR, SOCKET_SSO_REQUIRED_ERROR } from "@botiverse/raft-shared";
 import api from "../api/client";
+import { isPageVisible, onPageVisibilityChange } from "../utils/visiblePoll";
 import type { ActivityChangedEvent, AgentActivityStatePayload, AgentSeenEvent, ComputerVersionGate, CredentialHoldActivityDiagnostic, DeliveryConsumptionActivityDiagnostic, RuntimeErrorCode, SpawnFailureActivityDiagnostic, ToolStuckActivityDiagnostic, WakeCrashLoopActivityDiagnostic } from "@botiverse/raft-shared";
 import {
   getLiveSessionRecoveryPlan,
@@ -33,32 +34,28 @@ import { applyActorUpdatedEvent } from "./localTables/actorResolve";
 import { applyUserProfileUpdatedEvent } from "./userProfileUpdated";
 import { normalizeActivityMuteState, normalizeMessageDisplayPrefs } from "./channelDomain";
 import type { MessageDisplayPrefsState } from "./channelDomain";
-import {
-  applyMessageChannelActivity,
-  createChannelRealtimeBindings,
-  isMessageActivitySuppressedByMute,
-  isMessageInMutedActivityRange,
-} from "./channelRealtimeSync";
+import { applyMessageChannelActivity, createChannelRealtimeBindings, isMessageActivitySuppressedByMute, isMessageInMutedActivityRange } from "./channelRealtimeSync";
 import type { ScheduleInboxRefresh } from "./channelRealtimeSync";
 import { useChannelStore } from "./channelStore";
 import { dispatchServerNotificationPrefsUpdated } from "./events/notificationPrefsEvents";
 import { cancelInboxBackgroundRefresh, compareActivitySeq, requestInboxBackgroundRefresh, useInboxStore } from "./inboxStore";
-import { liveActivityUnread } from "./inboxInPlaceUnread";
+import { installResumeActivityReread } from "./resumeActivityReread";
+import { holdLoadedWindowsForResume, settleLoadedWindowsAfterResume } from "./resumeWindowContinuity";
+import { receiveLiveByPosition } from "./inboxRowPosition";
+import { receiveUnlistedThreadReply } from "./inboxThreadInsert";
+import { skipUnfollowedThreadReread } from "./inboxUnfollowedThreadReply";
+import { LIVE_ROW_SKIPPED, liveActivityUnread, liveMessageReceipt, liveRowRefused } from "./inboxInPlaceUnread";
 import { echoTakenByPosition, isThreadReplyGap, rereadThreadRowOnGap, requestResumeGapReread, storedMessageLive } from "./inboxLiveCatchUp";
-import type { InboxLiveUnread } from "./inboxInPlaceUnread";
+import type { InboxLiveUnread, LiveRowReceipt } from "./inboxInPlaceUnread";
 import { useLiveAgentActivityStore } from "./liveAgentActivityStore";
 import { isAgentActivitySubscribed, resubscribeAgentActivity, setAgentActivitySubscriptionSocket } from "./agentActivitySubscriptions";
-import { AGENT_READ_PROGRESS_SOCKET_EVENTS, agentReadProgressSocketBindings, refreshWatchedFollowState, rewatchAgentReadProgress, setAgentReadProgressWatchSocket } from "./agentReadProgressWatch";
 import { mintAgentActivityClientEventId } from "./agentActivityClientEventId";
 import { clearAgentTypingForMessage, readAgentTypingEvent, useAgentTypingStore } from "./agentTypingStore";
 import { useMachineStore } from "./machineStore";
 import { useNotificationSettingsStore } from "./notificationSettingsStore";
-import {
-  consumeNotificationPrefsUpdateWithSyncCore,
-} from "./notificationPrefsSyncDomain";
-import type {
-  NotificationPrefsUpdate,
-} from "./notificationPrefsSyncDomain";
+import { reportLiveMessageReceive, reportSyncResumeGap } from "../utils/messageDeliveryTrace";
+import { consumeNotificationPrefsUpdateWithSyncCore } from "./notificationPrefsSyncDomain";
+import type { NotificationPrefsUpdate } from "./notificationPrefsSyncDomain";
 import {
   getAcceptedReadState,
   normalizeReadStateUpdated,
@@ -71,6 +68,7 @@ import {
   isReceiverPrivateIngressContextCurrent,
   useMessageStore,
 } from "./messageStore";
+import { syncResumePayload } from "./syncResumeHeldIds";
 import type {
   Message,
 } from "./messageStore";
@@ -92,7 +90,6 @@ import {
 } from "./threadRepliesSyncDomain";
 import { requestThreadAgentFollowers } from "./threadAgentFollowerStore";
 import { useThreadStore } from "./threadStore";
-import { noteForumThreadUpdated } from "./forumThreadReplySocket";
 import { applyMessageUpdated, applyThreadReplyUpdate } from "./messageUpdatedApply";
 import { liveReplyUnread } from "./visibleConversations";
 import { refreshServerUnreadSummaryAfterRead } from "./serverUnreadSummaryRefresh";
@@ -173,7 +170,6 @@ export const MAIN_LAYOUT_SOCKET_EVENT_NAMES = [
   "message:new",
   "message:updated",
   "scope_read:updated",
-  ...AGENT_READ_PROGRESS_SOCKET_EVENTS, // agentReadProgressWatch.ts
   "read_state:updated",
   "read_state:updated_bulk",
   "agent:activity",
@@ -847,14 +843,16 @@ export function buildMainLayoutSocketBindings(
     ) {
       useServerStore.getState().reopenDmAfterOwnReply(msg.channelId);
     }
-    if (accepted) applyTaskConversationReply(msg);
-    if (accepted) applyLiveMessageActivity(msg, scheduleInboxRefresh);
-    else {
+    if (accepted) {
+      reportLiveMessageReceive(msg, "message:new");
+      applyTaskConversationReply(msg);
+      applyLiveMessageActivity(msg, scheduleInboxRefresh);
+    } else {
       // My own send can land from its HTTP answer first, another from a catch-up: the row still
       // needs it, and (#244) its first live patch counts unless its row already counted it.
       const live = storedMessageLive(msg);
-      const threadTaken = !!live && useInboxStore.getState().receiveThreadReply(msg, live);
-      const taken = echoTakenByPosition(patchActivityChannelRow(msg, live) || threadTaken); // #244 step 2: flag on, its rows took it
+      const threadTaken = !!live && useInboxStore.getState().receiveThreadReply(msg, live).skipped;
+      const taken = echoTakenByPosition(patchActivityChannelRow(msg, live).skipped || threadTaken); // #244 step 2: flag on, its rows took it
       applyMessageChannelActivity(msg, taken ? () => {} : scheduleInboxRefresh, "message_echo");
     }
   };
@@ -1183,7 +1181,6 @@ export function buildMainLayoutSocketBindings(
     syncCoreReplyWindow?: unknown;
   }) => {
     if (!isReceiverPrivateIngressContextCurrent(bindingReceiverPrivateIngressContext)) return;
-    noteForumThreadUpdated(data); // forum-style channels (forumThreadReplySocket)
     // The channel view may not hold the thread's room: its reply lands here.
     if (data.latestReply?.senderType === "agent" && typeof data.parentMessageId === "string") {
       useAgentTypingStore.getState().clearForThreadReply(data.latestReply.senderId, data.parentMessageId);
@@ -1311,9 +1308,10 @@ export function buildMainLayoutSocketBindings(
     }
 
     const threadState = useThreadStore.getState();
+    const existingSummary = threadState.summaries[data.parentMessageId];
+    if (data.latestReply && existingSummary?.lastReplyAt !== data.lastReplyAt) reportLiveMessageReceive(data.latestReply, "thread:updated");
     const replyUnread = liveReplyUnread(data.threadChannelId, data.latestReply);
     const counts = replyUnread === "unread";
-    const existingSummary = threadState.summaries[data.parentMessageId];
     const followed = threadState.followedThreads.find(
       (t) => t.threadChannelId === data.threadChannelId,
     );
@@ -1358,20 +1356,24 @@ export function buildMainLayoutSocketBindings(
     if (!suppressActivity) {
       const replyGap = isThreadReplyGap(data.threadChannelId, effectiveReplyCount);
       // #244 step 3b (inbox_message_inplace_v1): a listed row patched in full on a settled list needs no re-read; a reply gap still does.
-      const skipsReread = !!data.latestReply && useInboxStore.getState().receiveThreadReply(data.latestReply, liveActivityUnread(data.latestReply, "thread_reply", "thread:updated"));
+      const live = data.latestReply ? liveActivityUnread(data.latestReply, "thread_reply", "thread:updated") : undefined;
+      // #244 (inbox_row_position_v1): a followed thread not listed is inserted from the frame when it carries the row.
+      const receipt = data.latestReply ? receiveUnlistedThreadReply({ ...data, replyCount: effectiveReplyCount }, followed, live, replyGap, useInboxStore.getState().receiveThreadReply(data.latestReply, live), bindingReceiverPrivateIngressContext.serverId ?? null) : liveRowRefused("no_reply");
       useInboxStore.getState().updateThreadActivityMeta(
         data.threadChannelId,
         effectiveReplyCount,
         data.lastReplyAt,
       );
-      if (replyGap ? !rereadThreadRowOnGap(data.threadChannelId) : !skipsReread) scheduleInboxRefresh(replyGap ? "reply_gap" : "thread_reply");
+      // #244 (inbox_row_position_v1): a thread not followed that this reply cannot list re-reads nothing.
+      if (replyGap) {
+        if (!rereadThreadRowOnGap(data.threadChannelId)) scheduleInboxRefresh("reply_gap");
+      } else if (!receipt.skipped && !skipUnfollowedThreadReread(data, receipt, bindingReceiverPrivateIngressContext.serverId ?? null)) scheduleInboxRefresh("thread_reply", receipt.refused);
     }
   };
 
   const threadFollowersUpdated = (data: { threadChannelId?: unknown } | null | undefined) => {
     if (typeof data?.threadChannelId !== "string") return;
     requestThreadAgentFollowers(data.threadChannelId, true);
-    refreshWatchedFollowState(data.threadChannelId);
   };
 
   // The first catch-up of a page has no horizon yet: ask for one as soon as
@@ -1402,6 +1404,7 @@ export function buildMainLayoutSocketBindings(
 
   const reconnectSnapshot = () => {
     recordConnect();
+    holdLoadedWindowsForResume(); // #244: missed messages leave holes until sync:resume answers
     if (typeof window !== "undefined") {
       (window as Window & { __slockRoomsJoined?: boolean }).__slockRoomsJoined =
         false;
@@ -1493,12 +1496,9 @@ export function buildMainLayoutSocketBindings(
     }
     // The server forgot this socket's agent activity rooms with the old connection.
     resubscribeAgentActivity();
-    // And its read-progress watches (agent_read_progress_v0).
-    rewatchAgentReadProgress();
-    const { lastSeq, syncHorizon } = useMessageStore.getState();
-    if (lastSeq > 0) {
-      socket.emit("sync:resume", syncHorizon === null ? { lastSeq } : { lastSeq, sinceHorizon: syncHorizon });
-    }
+    // heldIds: what message:new already brought; the late arm skips it (#triage:#553).
+    const resume = syncResumePayload(useMessageStore.getState());
+    if (resume) socket.emit("sync:resume", resume);
     void syncVisibleScopes();
     // Pings sent while away are lost (listChangedSocket.ts); not on the first join.
     if (listsJoinedBefore) requestListsAfterReconnect(useServerStore.getState().current?.id);
@@ -1544,7 +1544,8 @@ export function buildMainLayoutSocketBindings(
     horizon?: string;
     horizonReset?: boolean;
   }) => {
-    useMessageStore.getState().batchAddMessages(messages);
+    reportSyncResumeGap(useMessageStore.getState().batchAddMessages(messages), hasMore, horizonReset);
+    settleLoadedWindowsAfterResume(!(hasMore || horizonReset)); // #244: before the re-reads below
     requestResumeGapReread(messages, scheduleInboxRefresh);
     useMessageStore.setState((s) => ({
       lastSeq: Math.max(s.lastSeq, currentSeq),
@@ -1552,9 +1553,7 @@ export function buildMainLayoutSocketBindings(
       // per-channel gap syncs below) never move it: they are scoped.
       syncHorizon: typeof horizon === "string" ? horizon : s.syncHorizon,
     }));
-    // Too many missed messages, or too many that committed late to send
-    // (horizonReset): re-read the visible scopes instead.
-    if (hasMore || horizonReset) {
+    if (hasMore || horizonReset) { // too many missed (or late-committed: horizonReset): re-read the visible scopes
       useMessageStore.getState().loadUnreadCounts();
       void syncVisibleScopes();
     }
@@ -1599,7 +1598,6 @@ export function buildMainLayoutSocketBindings(
       event: "scope_read:updated",
       handler: (payload) => useReadReceiptStore.getState().consumeScopeUpdated(payload),
     },
-    ...agentReadProgressSocketBindings(),
     { event: "read_state:updated", handler: readStateUpdated },
     { event: PRODUCT_FEEDBACK_UNREAD_EVENT, handler: acceptFeedbackUnreadPush },
     { event: PRODUCT_FEEDBACK_APP_UNREAD_EVENT, handler: acceptFeedbackAppUnreadPush },
@@ -1722,13 +1720,13 @@ function applyLiveMessageActivity(
   if (isMessageActivitySuppressedByMute(msg)) return;
   // #244: its existing row's unread too, in place; step 3b (inbox_message_inplace_v1): a listed row patched in full on a settled list needs no re-read.
   const live = liveActivityUnread(msg, "message_new", "message:new");
-  const skipsReread = useInboxStore.getState().receiveThreadReply(msg, live);
-  applyMessageChannelActivity(msg, patchActivityChannelRow(msg, live) || skipsReread ? () => {} : scheduleInboxRefresh, "message_new");
+  const receipt = liveMessageReceipt(useInboxStore.getState().receiveThreadReply(msg, live), patchActivityChannelRow(msg, live));
+  applyMessageChannelActivity(msg, receipt.skipped ? () => {} : (trigger) => scheduleInboxRefresh(trigger, receipt.refused), "message_new");
 }
 
-/** Seq-guarded, so a repeat delivery is a no-op. Not past a mute: the served row stops there. True: its re-read can be skipped. */
-function patchActivityChannelRow(msg: Message, live?: InboxLiveUnread): boolean {
-  if (isMessageInMutedActivityRange(msg)) return false;
+/** Seq-guarded, so a repeat delivery is a no-op. Past a mute the served row stops there: only the per-row rule judges it (flag on). `skipped`: its re-read can be skipped. */
+function patchActivityChannelRow(msg: Message, live?: InboxLiveUnread): LiveRowReceipt {
+  if (isMessageInMutedActivityRange(msg)) return receiveLiveByPosition(msg, live, "channel") ? LIVE_ROW_SKIPPED : liveRowRefused("muted");
   return useInboxStore.getState().receiveChannelMessage(msg, live);
 }
 
@@ -1777,7 +1775,6 @@ function attachMainLayoutSocketBridge(
   const cleanupMainLayoutBridge = installSocketBridge(socket, "main-layout", bindings);
   socket.onAny(markServerActivity);
   setAgentActivitySubscriptionSocket(() => socket);
-  setAgentReadProgressWatchSocket(() => socket);
 
   // Task board real-time updates.
   const cleanupTaskRealtimeHandlers = registerTaskRealtimeHandlers(socket);
@@ -1804,7 +1801,6 @@ function attachMainLayoutSocketBridge(
 
   return () => {
     setAgentActivitySubscriptionSocket(null);
-    setAgentReadProgressWatchSocket(null);
     cleanupMainLayoutBridge();
     cancelReconnectReload();
     disposeMainLayoutSync();
@@ -1834,10 +1830,10 @@ function attachMainLayoutRecoveryBridge(
   };
 
   const recoverLiveSession = (event?: Event) => {
-    // A followed-thread reload asked for while the page was hidden runs now.
-    if (document.visibilityState === "visible") followedThreadsRefresh.flushIfPending();
+    // A followed-thread reload asked for while the page was hidden runs now (visible: the main or an object window).
+    if (isPageVisible()) followedThreadsRefresh.flushIfPending();
     const plan = getLiveSessionRecoveryPlan({
-      visible: document.visibilityState === "visible",
+      visible: isPageVisible(),
       online: navigator.onLine,
       hasStoredSession: hasStoredAuthSession(),
       socketConnected: transport.isSocketConnected(),
@@ -1867,26 +1863,28 @@ function attachMainLayoutRecoveryBridge(
       useAgentStore.getState().loadAgents();
       if (chat) void useAnnouncementStore.getState().load();
     }
+    resumeReread.recovered(event); // #244: back from hidden/frozen: Activity once (resumeActivityReread)
   };
+  const resumeReread = installResumeActivityReread(recoverLiveSession);
 
   const recoverFromBfcache = (e: PageTransitionEvent) => {
     if (e.persisted) recoverLiveSession(e);
   };
 
-  // Raft Desktop wake / unlock: reconnect a dropped socket, then re-read the
-  // conversations on screen (a hidden page owes them instead).
+  // Raft Desktop wake / unlock: reconnect a dropped socket (its rooms:joined reads Activity), re-read the conversations on
+  // screen (a hidden page owes them instead); connected, Activity once (#244: resume throttle, a following focus reads nothing).
   const uninstallSystemResume = installSystemResumeRecovery(() => {
     if (!hasStoredAuthSession()) return;
-    if (!transport.isSocketConnected()) transport.ensureSocketConnected();
+    const connected = transport.isSocketConnected();
+    if (!connected) transport.ensureSocketConnected();
     if (hasChatSurfaces()) recoveryScopeSync.request();
+    if (connected) resumeReread.woke();
   });
 
   const statusReconcileInterval = setInterval(() => {
-    const visible = document.visibilityState === "visible";
-    const online = navigator.onLine;
     const { reconcile } = planStatusReconcile({
-      visible,
-      online,
+      visible: isPageVisible(),
+      online: navigator.onLine,
       hasStoredSession: hasStoredAuthSession(),
       socketConnected: transport.isSocketConnected(),
     });
@@ -1894,14 +1892,15 @@ function attachMainLayoutRecoveryBridge(
   }, STATUS_RECONCILE_INTERVAL_MS);
 
   window.addEventListener("pagehide", handlePageHide);
-  document.addEventListener("visibilitychange", recoverLiveSession);
+  const stopVisibility = onPageVisibilityChange(recoverLiveSession); // the main document's, and an object window's
   window.addEventListener("focus", recoverLiveSession);
   window.addEventListener("online", recoverLiveSession);
   window.addEventListener("pageshow", recoverFromBfcache);
 
   return () => {
+    resumeReread.dispose();
     window.removeEventListener("pagehide", handlePageHide);
-    document.removeEventListener("visibilitychange", recoverLiveSession);
+    stopVisibility();
     window.removeEventListener("focus", recoverLiveSession);
     window.removeEventListener("online", recoverLiveSession);
     window.removeEventListener("pageshow", recoverFromBfcache);

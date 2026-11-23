@@ -297,7 +297,7 @@ test("addChannelMemberForAgent born-reads the acting agent's own membership noti
     io,
     agentOrchestrator: agentOrchestratorStub,
   });
-  assert.equal(result.status, 200, `member add should succeed, got ${result.status}: ${JSON.stringify(result.body)}`);
+  assert.equal(result.status, 200, `member add should succeed, got ${result.status}: ${JSON.stringify(result)}`);
 
   // Find the membership system message row's facts.
   const facts = await getDb()

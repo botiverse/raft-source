@@ -11,6 +11,12 @@ import {
 import { holdTestSlotForThisRun } from "../../scripts/vitest/testSlot";
 import { useDevRunEnv } from "../../scripts/dev/raftdev-cache";
 
+// Dev trace (scripts/vitest/devTraceReporter.ts): loaded lazily so that a
+// problem in it can never stop this config from loading.
+const devTrace = await import("../../scripts/vitest/devTraceReporter")
+  .then((module) => [module.devTracePlugin("@botiverse/raft-server")])
+  .catch(() => []);
+
 // Local runs: 1 worker (RAFT_TEST_MAX_WORKERS raises it; a CLI --maxWorkers
 // above it is clamped), 4096 MiB fork heap, run record (scripts/vitest).
 // CI sizing is unchanged (CPU-derived workers, no heap flag).
@@ -28,8 +34,9 @@ const localWorkers = localMaxWorkers(process.env, SHARED_HOST_MAX_WORKERS);
 
 export default defineConfig({
   plugins: ci
-    ? []
+    ? devTrace
     : [
+        ...devTrace,
         runRecordPlugin({ packageName: "@botiverse/raft-server", dom: false, worktree }),
         localWorkerCapPlugin({ label: "server", cap: localWorkers }),
       ],
@@ -44,8 +51,10 @@ export default defineConfig({
     // test-only Postgres references of the RisingWave-served reads.
     // Every test runs as the edition src/test/edition.ts names ("cloud"
     // unless it says otherwise), in this tree and in the source-available
-    // snapshot alike (src/test/setup/edition.ts).
-    setupFiles: ["src/test/setup/risingWaveReadReference.ts", "src/test/setup/readPositionSettle.ts", "src/test/setup/artifactsDeployment.ts", "src/test/setup/edition.ts"],
+    // snapshot alike (src/test/setup/edition.ts). Under the shard runner, each
+    // file first records its worker process for the per-file time limit
+    // (src/test/setup/shardFileWorker.ts).
+    setupFiles: ["src/test/setup/shardFileWorker.ts", "src/test/setup/risingWaveReadReference.ts", "src/test/setup/readPositionSettle.ts", "src/test/setup/artifactsDeployment.ts", "src/test/setup/edition.ts"],
     pool: "forks",
     ...(ci ? {} : { maxWorkers: localWorkers, execArgv: forkHeapExecArgv() }),
     // The previous Node runner imposed no per-test or per-hook timeout. Keep

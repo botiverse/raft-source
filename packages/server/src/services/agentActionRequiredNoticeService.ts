@@ -308,14 +308,14 @@ function agentComputerMemberLeftNoticeText(input: {
   if (names.length <= 1) {
     return [
       `${names[0] ?? "The agent"} is offline: the computer "${input.computerName}" it runs on was disconnected because ${why} `
-        + "Someone in this server can set up that machine again (the agent comes back as it was), or move the agent to another computer.",
+        + "Move the agent to another computer to get it running again; it keeps its settings.",
       ...(input.agentUrl ? [`Agent page: ${input.agentUrl}`] : []),
     ].join("\n");
   }
   // Two: "@a and @b"; three or more: "@a, @b and @c" (Warden).
   const list = `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
   return `${list} are offline: the computer "${input.computerName}" they run on was disconnected because ${why} `
-    + "Someone in this server can set up that machine again (the agents come back as they were), or move the agents to another computer.";
+    + "Move the agents to another computer to get them running again; they keep their settings.";
 }
 
 export function agentComputerOwnerLeavingNoticeText(input: {

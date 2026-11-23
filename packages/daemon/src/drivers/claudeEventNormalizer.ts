@@ -1,5 +1,6 @@
 import type { SubagentLineage } from "@botiverse/raft-shared";
-import { CREDENTIAL_PROBLEM_MESSAGES, type CredentialProblemCode } from "../runtimeErrorDiagnostics";
+import { PROVIDER_LIMIT_RESET_MAX_AHEAD_MS } from "../runtimeErrorDeliveryPolicy";
+import { CREDENTIAL_PROBLEM_MESSAGES, RUNTIME_MODEL_REFUSAL_MESSAGE, type CredentialProblemCode } from "../runtimeErrorDiagnostics";
 import { SendIntentArgumentScanner } from "./sendIntentScanner";
 import type { ParsedEvent, ProviderQuotaObservation, ProviderQuotaRateLimitType } from "./types";
 
@@ -98,7 +99,7 @@ const CLAUDE_QUOTA_EXHAUSTED_TEXT = [
   /\bused your included\b[^.\n]{0,60}\busage\b/i,
 ];
 
-type ClaudeRateLimitObservation = { status: string; resetsAtSec?: number };
+type ClaudeRateLimitObservation = { status: string; resetsAtSec?: number; rateLimitType?: ProviderQuotaRateLimitType };
 
 /**
  * #proj-raft-computer:#68: Claude Code's typed API error on an assistant or
@@ -134,29 +135,101 @@ function classifyClaudeAccountProblem(codes: readonly string[]): CredentialProbl
   return codes.includes("verification_required") ? "verification_required" : null;
 }
 
+type ClaudeProviderLimit = { kind: "quota_exhausted" | "transient_rate_limit"; resetsAt?: string; rateLimitType?: ProviderQuotaRateLimitType };
+
+/**
+ * #proj-runtime:#66: Claude Code's typed kind for a request its account's
+ * own usage limit refused (a session, weekly or per-model plan limit, or a
+ * spend cap): `api_error` on the live stream-json assistant and result
+ * lines, `apiError` in the session JSONL. Its `api_error_params.rate_limit_info`
+ * says which limit and when it resets.
+ */
+const CLAUDE_USAGE_LIMIT_API_ERROR = "usage_limit_reached";
+
+/** What a Claude API-error line itself says about the account limit that refused it. */
+type ClaudeApiErrorLimit = { usageLimitReached: boolean; resetsAtSec?: number; rateLimitType?: ProviderQuotaRateLimitType };
+
+function knownRateLimitType(value: unknown): ProviderQuotaRateLimitType | undefined {
+  return typeof value === "string" && PROVIDER_QUOTA_RATE_LIMIT_TYPES.has(value) ? value as ProviderQuotaRateLimitType : undefined;
+}
+
+/**
+ * #proj-runtime:#66: the limit a Claude API-error line carries. Live
+ * stream-json (2.1.3xx) is snake_case on the line (`api_error`,
+ * `api_error_code`, `api_error_params`); the session JSONL is camelCase
+ * (`apiError`, `apiErrorCode`, `apiErrorParams`). Inside the params,
+ * `rate_limit_info` keeps the shape `rate_limit_event` carries (camelCase
+ * `status`, `resetsAt` in epoch seconds, `rateLimitType`). Undefined when the
+ * line names no usage limit and carries no limit info.
+ */
+function claudeApiErrorLimit(event: Record<string, unknown>): ClaudeApiErrorLimit | undefined {
+  const usageLimitReached = [event.api_error, event.apiError, event.api_error_code, event.apiErrorCode].includes(CLAUDE_USAGE_LIMIT_API_ERROR);
+  const params = event.api_error_params ?? event.apiErrorParams;
+  const paramFields = params && typeof params === "object" && !Array.isArray(params) ? params as Record<string, unknown> : undefined;
+  const info = paramFields?.rate_limit_info ?? paramFields?.rateLimitInfo;
+  const infoFields = info && typeof info === "object" && !Array.isArray(info) ? info as Record<string, unknown> : undefined;
+  const resetsAtSec = finiteNumber(infoFields?.resetsAt ?? infoFields?.resets_at);
+  const rateLimitType = knownRateLimitType(infoFields?.rateLimitType ?? infoFields?.rate_limit_type);
+  if (!usageLimitReached && resetsAtSec === undefined && !rateLimitType) return undefined;
+  return {
+    usageLimitReached,
+    ...(resetsAtSec !== undefined ? { resetsAtSec } : {}),
+    ...(rateLimitType ? { rateLimitType } : {}),
+  };
+}
+
+/**
+ * A reported reset (epoch seconds) as the ISO time a provider limit carries,
+ * when it is one to believe: in the future and at most
+ * PROVIDER_LIMIT_RESET_MAX_AHEAD_MS away (#proj-runtime:#66). Anything else
+ * is no reset: the limit is kept, without one.
+ */
+function plausibleResetIso(resetsAtSec: number | undefined, nowMs: number): string | undefined {
+  if (resetsAtSec === undefined) return undefined;
+  const resetMs = resetsAtSec * 1000;
+  return resetMs > nowMs && resetMs - nowMs <= PROVIDER_LIMIT_RESET_MAX_AHEAD_MS ? new Date(resetMs).toISOString() : undefined;
+}
+
+function quotaExhausted(resetsAt: string | undefined, rateLimitType: ProviderQuotaRateLimitType | undefined): ClaudeProviderLimit {
+  return { kind: "quota_exhausted", ...(resetsAt ? { resetsAt } : {}), ...(rateLimitType ? { rateLimitType } : {}) };
+}
+
 function classifyClaudeProviderLimit(
   sdkError: string,
   text: string,
   lastRateLimit: ClaudeRateLimitObservation | null,
   nowMs: number,
-): { kind: "quota_exhausted" | "transient_rate_limit"; resetsAt?: string } | undefined {
+  apiErrorLimit?: ClaudeApiErrorLimit,
+): ClaudeProviderLimit | undefined {
   if (sdkError === "billing_error") return { kind: "quota_exhausted" };
-  if (sdkError !== "rate_limit") return undefined;
   // A rejected window is evidence only until its reported reset: after that
   // the same session can hit an ordinary throttle, which must stay transient.
   const rejectedWindowCurrent = lastRateLimit?.status === "rejected"
     && (lastRateLimit.resetsAtSec === undefined || lastRateLimit.resetsAtSec * 1000 > nowMs);
-  if (lastRateLimit && rejectedWindowCurrent) {
-    return lastRateLimit.resetsAtSec !== undefined
-      ? { kind: "quota_exhausted", resetsAt: new Date(lastRateLimit.resetsAtSec * 1000).toISOString() }
-      : { kind: "quota_exhausted" };
+  // #proj-runtime:#66: the line's own limit info (the refused response's)
+  // comes before the last `rate_limit_event` the session saw.
+  const reportedResetsAt = plausibleResetIso(apiErrorLimit?.resetsAtSec, nowMs);
+  if (apiErrorLimit?.usageLimitReached) {
+    // Without its own info, a rate_limit_event fills in only if it is the
+    // refusal (rejected, its window not reset): an allowed or warning reading
+    // describes another window than the one that refused.
+    const event = lastRateLimit && rejectedWindowCurrent ? lastRateLimit : null;
+    return quotaExhausted(reportedResetsAt ?? plausibleResetIso(event?.resetsAtSec, nowMs), apiErrorLimit.rateLimitType ?? event?.rateLimitType);
   }
-  if (CLAUDE_QUOTA_EXHAUSTED_TEXT.some((pattern) => pattern.test(text))) return { kind: "quota_exhausted" };
+  if (sdkError !== "rate_limit") return undefined;
+  if (lastRateLimit && rejectedWindowCurrent) {
+    return quotaExhausted(reportedResetsAt ?? plausibleResetIso(lastRateLimit.resetsAtSec, nowMs), apiErrorLimit?.rateLimitType ?? lastRateLimit.rateLimitType);
+  }
+  if (CLAUDE_QUOTA_EXHAUSTED_TEXT.some((pattern) => pattern.test(text))) return quotaExhausted(reportedResetsAt, apiErrorLimit?.rateLimitType);
   return { kind: "transient_rate_limit" };
 }
 
 function finiteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function nonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
 /** The fields of a Claude `stream_event` row the send-intent scan reads; everything is checked before use. */
@@ -353,6 +426,31 @@ function parseClaudeResultUsageTelemetry(
   };
 }
 
+/**
+ * A refusal (`stop_reason: "refusal"`) as the turn's one error: Raft's fixed
+ * words, never the CLI's notice or the model's text, with the typed marker the
+ * daemon decides on (no fence, no delivery backoff).
+ *
+ * Claude Code 2.1.322 (bundled bin/claude.exe): on a refusal it appends a
+ * synthetic API-error assistant message (`isApiErrorMessage: true`,
+ * `error: "invalid_request"`, `message.stop_reason: "refusal"`,
+ * `message.stop_details: { type: "refusal", category, explanation, ... }`,
+ * text "API Error: ... can't respond to this message ..."), then a `result`
+ * with `subtype: "success"`, `is_error: true` (the last assistant message was
+ * an API error), `stop_reason: "refusal"`, the notice as `result`, and no
+ * `stop_details`. It may first retry on a fallback model, which shows no
+ * refusal at all.
+ */
+function modelRefusalError(): Extract<ParsedEvent, { kind: "error" }> {
+  return {
+    kind: "error",
+    message: RUNTIME_MODEL_REFUSAL_MESSAGE,
+    nativeReasonPresent: true,
+    reasonProvenance: "runtime_error_event",
+    modelRefusal: true,
+  };
+}
+
 export class ClaudeEventNormalizer {
   constructor(private readonly nowMs: () => number = () => Date.now()) {}
 
@@ -414,7 +512,18 @@ export class ClaudeEventNormalizer {
 
     const pushResultError = (message: Record<string, any>, fallback: string) => {
       const providerError = message.is_error === true ? claudeProviderError(message) : undefined;
-      events.push({ kind: "error", message: collectResultErrorDetail(message, fallback), ...(providerError ? { providerError } : {}) });
+      // #proj-runtime:#66: a result that ends on the account's usage limit
+      // with no assistant line before it (the result repeats `api_error`).
+      const apiErrorLimit = message.is_error === true ? claudeApiErrorLimit(message) : undefined;
+      const providerLimit = apiErrorLimit?.usageLimitReached
+        ? classifyClaudeProviderLimit("rate_limit", "", this.lastRateLimit, this.nowMs(), apiErrorLimit)
+        : undefined;
+      events.push({
+        kind: "error",
+        message: collectResultErrorDetail(message, fallback),
+        ...(providerLimit ? { providerLimit } : {}),
+        ...(providerError ? { providerError } : {}),
+      });
     };
 
     switch (event.type) {
@@ -423,7 +532,7 @@ export class ClaudeEventNormalizer {
           ? event.rate_limit_info
           : {};
         const status = finiteString(info.status);
-        if (status) this.lastRateLimit = { status, resetsAtSec: finiteNumber(info.resetsAt) };
+        if (status) this.lastRateLimit = { status, resetsAtSec: finiteNumber(info.resetsAt), rateLimitType: knownRateLimitType(info.rateLimitType) };
         const providerQuota = parseClaudeRateLimitInfo(event.rate_limit_info, this.nowMs());
         events.push({
           kind: "telemetry",
@@ -463,7 +572,18 @@ export class ClaudeEventNormalizer {
           });
         }
         if (event.subtype === "compact_boundary") {
-          events.push({ kind: "compaction_finished" });
+          // `compact_metadata` (2.1.x): `{ trigger, pre_tokens, post_tokens?, duration_ms? }`.
+          const metadata = event.compact_metadata && typeof event.compact_metadata === "object" ? event.compact_metadata as Record<string, unknown> : null;
+          const before = nonNegativeInteger(metadata?.pre_tokens);
+          const after = nonNegativeInteger(metadata?.post_tokens);
+          // #proj-runtime:#67: the last request's context is gone with the
+          // compaction; what it left (when reported) is the context now.
+          if (!extractSubagentLineage(event)) this.lastRequestContextTokens = after ?? null;
+          events.push({
+            kind: "compaction_finished",
+            ...(before !== undefined ? { contextBeforeTokens: before } : {}),
+            ...(after !== undefined ? { contextAfterTokens: after } : {}),
+          });
         }
         // Subagent (Claude `Agent` tool) lifecycle envelopes. These carry no
         // content rows of their own — the inner subagent assistant/user rows
@@ -537,10 +657,16 @@ export class ClaudeEventNormalizer {
             : null;
           const accountProblem = sdkError ? classifyClaudeAccountProblem(claudeApiErrorCodes(event)) : null;
           const providerError = sdkError ? claudeProviderError(event) : undefined;
+          // A refusal (see `modelRefusalError`): the CLI's notice is not
+          // shown; the turn's one error is the fixed refusal error. A main
+          // agent's message only: a sub-agent's refusal reaches it as a tool result.
+          const refusal = !subagent && event.message?.stop_reason === "refusal";
+          const refusalNotice = refusal && (sdkError !== null || event.is_api_error_message === true);
           for (const block of content) {
             if (block.type === "thinking" && block.thinking) {
               events.push({ kind: "thinking", text: block.thinking, ...withLineage });
             } else if (block.type === "text" && block.text) {
+              if (refusalNotice) continue;
               if (accountProblem) {
                 if (this.turnApiErrorReported) continue;
                 this.turnApiErrorReported = true;
@@ -552,7 +678,7 @@ export class ClaudeEventNormalizer {
                   ...(providerError ? { providerError } : {}),
                 });
               } else if (sdkError) {
-                const providerLimit = classifyClaudeProviderLimit(sdkError, block.text, this.lastRateLimit, this.nowMs());
+                const providerLimit = classifyClaudeProviderLimit(sdkError, block.text, this.lastRateLimit, this.nowMs(), claudeApiErrorLimit(event));
                 this.turnApiErrorReported = true;
                 events.push({
                   kind: "error",
@@ -576,6 +702,10 @@ export class ClaudeEventNormalizer {
                 ...withLineage,
               });
             }
+          }
+          if (refusal && !this.turnApiErrorReported) {
+            this.turnApiErrorReported = true;
+            events.push(modelRefusalError());
           }
         }
         break;
@@ -629,38 +759,48 @@ export class ClaudeEventNormalizer {
           ? classifyClaudeAccountProblem(claudeApiErrorCodes(event))
           : null;
         const resultProviderError = resultAccountProblem ? claudeProviderError(event) : undefined;
-        switch (subtype) {
-          case "success":
-            if (resultAccountProblem) {
-              events.push({
-                kind: "error",
-                message: CREDENTIAL_PROBLEM_MESSAGES[resultAccountProblem],
-                nativeReasonPresent: true,
-                reasonProvenance: "runtime_error_event",
-                ...(resultProviderError ? { providerError: resultProviderError } : {}),
-              });
-            } else if (event.is_error && !apiErrorAlreadyReported) {
-              pushResultError(event, "Execution failed");
-            }
-            break;
+        // A refusal, whatever `is_error` says (the CLI sets it for its
+        // refusal notice): the fixed refusal error, never the generic result
+        // error, and once per turn (see `modelRefusalError`). Only a `success`
+        // result: the result's stop_reason is the last one the stream saw, so
+        // an execution, budget or max-turns stop after a refusal keeps its own
+        // error (with its fence and backoff).
+        if (stopReason === "refusal" && subtype === "success") {
+          if (!apiErrorAlreadyReported) events.push(modelRefusalError());
+        } else {
+          switch (subtype) {
+            case "success":
+              if (resultAccountProblem) {
+                events.push({
+                  kind: "error",
+                  message: CREDENTIAL_PROBLEM_MESSAGES[resultAccountProblem],
+                  nativeReasonPresent: true,
+                  reasonProvenance: "runtime_error_event",
+                  ...(resultProviderError ? { providerError: resultProviderError } : {}),
+                });
+              } else if (event.is_error && !apiErrorAlreadyReported) {
+                pushResultError(event, "Execution failed");
+              }
+              break;
 
-          case "error_during_execution":
-            if ((stopReason !== "max_tokens" || isMaxTokenError) && !apiErrorAlreadyReported) {
-              pushResultError(event, "Execution failed");
-            }
-            break;
+            case "error_during_execution":
+              if ((stopReason !== "max_tokens" || isMaxTokenError) && !apiErrorAlreadyReported) {
+                pushResultError(event, "Execution failed");
+              }
+              break;
 
-          case "error_max_budget_usd":
-            pushResultError(event, "Budget limit exceeded");
-            break;
+            case "error_max_budget_usd":
+              pushResultError(event, "Budget limit exceeded");
+              break;
 
-          case "error_max_turns":
-            pushResultError(event, "Max turns exceeded");
-            break;
+            case "error_max_turns":
+              pushResultError(event, "Max turns exceeded");
+              break;
 
-          case "error_max_structured_output_retries":
-            pushResultError(event, "Structured output retries exceeded");
-            break;
+            case "error_max_structured_output_retries":
+              pushResultError(event, "Structured output retries exceeded");
+              break;
+          }
         }
         if (usageTelemetry) events.push(usageTelemetry);
         events.push({ kind: "turn_end", sessionId: resultSessionId || undefined });

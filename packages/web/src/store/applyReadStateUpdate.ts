@@ -4,6 +4,7 @@ import { useThreadStore } from "./threadStore";
 import { useInboxStore } from "./inboxStore";
 import { compareActivitySeq } from "./activitySeq";
 import { noteInPlaceReadState } from "./inboxInPlaceUnread";
+import { foldLedgerReadByPosition } from "./inboxRowPosition";
 import { inboxItemChannelId } from "./inboxItem";
 import { consumeReadStateUpdate } from "./readStateSync";
 import type { ReadStateUpdate } from "./readStateSync";
@@ -13,6 +14,8 @@ export function applyReadStateUpdate(update: ReadStateUpdate) {
   if (update.serverId !== currentServerId) return;
   if (consumeReadStateUpdate(update) !== "accepted") return;
   if (!update.markedUnread) noteInPlaceReadState(update.scopeId);
+  // #244 (flag on): the Activity row's read seq, which an answer computed before this read must not get past.
+  foldLedgerReadByPosition(update.scopeId);
   const projection = useMessageStore.getState().applyReadStateProjection(update.scopeId);
   if (!projection.complete) {
     // This tab cannot count the thread's unread from loaded replies (read in
@@ -54,5 +57,7 @@ function clearActivityRowReadThrough(update: ReadStateUpdate): void {
   if (!covered(row.readStateLatestActivitySeq) || !covered(row.latestActivitySeq)) return;
   useInboxStore.getState().applyReadStateProjection(update.scopeId, {
     unreadCount: 0, hasMention: false, firstUnreadMessageId: null, firstMentionMessageId: null, complete: true,
+    // Covered above: the read is through the row's activity, so its zero is proven through the read.
+    readSeq: update.maxReadSeq,
   });
 }

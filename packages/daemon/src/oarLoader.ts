@@ -1,4 +1,5 @@
 import type { ExecutableInstallation, ProviderAuthFacade, Runtime } from "@botiverse/oar";
+import { installedSessionCapabilities } from "@botiverse/oar/capabilities";
 import type { OpencodeProviderAuth, OpencodeProviderAuthOptions } from "@botiverse/oar/runtimes/opencode";
 import type { QwenProviderAuth, QwenProviderAuthOptions } from "@botiverse/oar/runtimes/qwen";
 import type { RuntimeAccountUsageProvider } from "@botiverse/raft-shared";
@@ -11,19 +12,20 @@ import { seaDetected } from "./drivers/nodeHostLaunch";
  * session or listing models for an ACP runtime, reading Grok's usage). The
  * daemon uses OAR for account-usage reads and the opencode and claude model listings, so
  * a machine only pays for the runtimes it reads. Import OAR's values only
- * through this module; type imports are free. The one exception is
- * `@botiverse/oar/runtimes/codex/installation-candidates` (OAR 0.101), a
- * synchronous list of Codex install locations that loads no runtime, which
- * drivers/codex.ts imports statically (oarLoader.test.ts source guard).
+ * through this module; type imports are free. The two static subpath exceptions
+ * are `@botiverse/oar/capabilities` (OAR 0.123, lightweight capability merger)
+ * and `@botiverse/oar/runtimes/codex/installation-candidates` (OAR 0.101,
+ * synchronous list of Codex install locations for drivers/codex.ts), neither of
+ * which loads any runtime adapter or native SDK (oarLoader.test.ts source guard).
  */
 /** The runtimes with no legacy driver, which only the OAR host runs (drivers/oarOnly.ts). */
-export type OarOnlyRuntimeId = "qwen" | "qoder";
+export type OarOnlyRuntimeId = "qwen" | "qoder" | "dsh";
 
-type OarRuntimeId = RuntimeAccountUsageProvider | "antigravity" | "cursor" | "opencode" | OarOnlyRuntimeId;
+type OarRuntimeId = RuntimeAccountUsageProvider | "antigravity" | "cursor" | "opencode" | "pi" | OarOnlyRuntimeId;
 
 /**
  * The Cursor SDK (`@cursor/sdk`, OAR's optional peer, pinned by OAR to
- * 1.3.1): a daemon dependency, so npm and Electron installs of the Computer
+ * 1.4.1): a daemon dependency, so npm and Electron installs of the Computer
  * ship it with its native companion (`@cursor/sdk-<platform>-<arch>`). The
  * daemon never imports it: OAR runs it in a Node child per session
  * (`execution: "subprocess"`), which imports it from the file URL resolved
@@ -38,7 +40,7 @@ export function cursorSdkModule(): string {
   return import.meta.resolve(CURSOR_SDK_PACKAGE);
 }
 
-/** The oldest Node the Cursor SDK supports (`@cursor/sdk` 1.3.1 `engines.node`); its child runs on the daemon's own Node. */
+/** The oldest Node the Cursor SDK supports (`@cursor/sdk` 1.4.1 `engines.node`); its child runs on the daemon's own Node. */
 const CURSOR_SDK_MIN_NODE: readonly [number, number] = [22, 13];
 
 /**
@@ -67,6 +69,33 @@ export function cursorSdkAvailable(input: {
   }
 }
 
+const PI_RPC_ENTRY = "@earendil-works/pi-coding-agent/rpc-entry";
+
+/**
+ * Whether this daemon can run Pi through OAR's subprocess RPC runtime
+ * (#oar-raft:#48, `runtime-host:oar:pi`): Linux/macOS only, never the
+ * single-file (SEA) build (OAR cannot resolve Pi's rpc-entry without
+ * node_modules), never packaged Electron (OAR spawns `process.execPath`
+ * without `ELECTRON_RUN_AS_NODE=1`), and where Pi's rpc-entry resolves.
+ * Synchronous, for `ready`.
+ */
+export function piRpcAvailable(input: {
+  platform?: NodeJS.Platform;
+  sea?: boolean | undefined;
+  electron?: boolean;
+  resolve?: (specifier: string) => string;
+} = {}): boolean {
+  if ((input.platform ?? process.platform) === "win32") return false;
+  if (("sea" in input ? input.sea : seaDetected()) !== false) return false;
+  if ("electron" in input ? input.electron : Boolean(process.versions.electron)) return false;
+  const resolve = input.resolve ?? ((specifier: string) => import.meta.resolve(specifier));
+  try {
+    return Boolean(resolve(PI_RPC_ENTRY));
+  } catch {
+    return false;
+  }
+}
+
 const LOADERS = {
   antigravity: async () => (await import("@botiverse/oar/runtimes/antigravity")).antigravityRuntime,
   claude: async () => (await import("@botiverse/oar/runtimes/claude")).claudeRuntime,
@@ -79,8 +108,17 @@ const LOADERS = {
   kimi: async () => (await import("@botiverse/oar/runtimes/kimi")).kimiRuntime,
   grok: async () => (await import("@botiverse/oar/runtimes/grok")).grokRuntime,
   opencode: async () => (await import("@botiverse/oar/runtimes/opencode")).opencodeRuntime,
+  // #oar-raft:#48: Pi in a subprocess per session with workspace code execution
+  // disabled (#14773) so per-agent PI_CODING_AGENT_DIR and HTTP proxies stay
+  // isolated without mutating the daemon's global undici dispatcher.
+  pi: async () => (await import("@botiverse/oar/runtimes/pi")).createPiRuntime({
+    execution: "subprocess",
+    projectTrusted: false,
+    allowProjectPackageInstall: false,
+  }),
   qwen: async () => (await import("@botiverse/oar/runtimes/qwen")).qwenRuntime,
   qoder: async () => (await import("@botiverse/oar/runtimes/qoder")).qoderRuntime,
+  dsh: async () => (await import("@botiverse/oar/runtimes/dsh")).dshRuntime,
 } as const satisfies Record<OarRuntimeId, () => Promise<Runtime>>;
 
 const loading = new Map<OarRuntimeId, Promise<Runtime>>();
@@ -118,6 +156,15 @@ export function loadOarSessionRuntime(id: OarRuntimeId): Promise<Runtime> {
   }
   return runtime;
 }
+
+/**
+ * OAR 0.123.0's `installedSessionCapabilities(runtime, installation)` via the
+ * lightweight `@botiverse/oar/capabilities` subpath (no runtime adapters or
+ * native SDKs loaded). Merges the runtime's static `refusedSessionOptions` and
+ * `manualCompaction` under what `runtime.sessionCapabilities(installation)`
+ * declares for this installation.
+ */
+export { installedSessionCapabilities as oarInstalledSessionCapabilities };
 
 /**
  * A runtime's provider settings facade (Qwen Code's `createQwenProviderAuth`:
@@ -181,7 +228,7 @@ export function loadOarObserve(): Promise<OarObserve> {
 
 /**
  * The OAR host's modules as a launch reaches them, for every runtime the host
- * runs (antigravity, codex, grok, and the OAR-only qwen and qoder): the runtime entry, the observe
+ * runs (antigravity, codex, grok, and the OAR-only qwen, qoder and dsh): the runtime entry, the observe
  * entry, and the session path (opened on an executable that does not exist,
  * so it fails at the spawn, after every module it needs was loaded),
  * Grok's sign-in module (OAR 0.99, loaded apart from its session), and
@@ -191,18 +238,22 @@ export function loadOarObserve(): Promise<OarObserve> {
  * rather than a user's first OAR-hosted agent.
  */
 export async function verifyBundledOarHost(): Promise<void> {
+  if (typeof installedSessionCapabilities !== "function") throw new Error("bundled OAR capabilities entry has no installedSessionCapabilities");
   const observe = await loadOarObserve();
   for (const name of ["observeStalls", "classifyTool"] as const) {
     if (typeof observe[name] !== "function") throw new Error(`bundled OAR observe entry has no ${name}`);
   }
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
-  for (const id of ["antigravity", "codex", "grok", "qwen", "qoder"] as const) {
+  for (const id of ["antigravity", "claude", "codex", "grok", "qwen", "qoder", "dsh"] as const) {
     const runtime = await loadOarSessionRuntime(id);
     if (runtime.id !== id) throw new Error(`bundled OAR ${id} runtime reports id ${runtime.id}`);
     const missing = join(tmpdir(), `raft-oar-verify-${process.pid}-no-such-${id}`);
+    // DSH checks its version floor before it spawns: given one at the floor
+    // (no `--version` run), the session path goes on to the spawn.
+    const version = id === "dsh" ? { version: runtime.minVersion ?? "0.2.1-rc.5" } : {};
     try {
-      const session = await runtime.session({ kind: "available", via: "executable", command: missing }, { cwd: tmpdir() });
+      const session = await runtime.session({ kind: "available", via: "executable", command: missing, ...version }, { cwd: tmpdir() });
       await session.dispose();
       throw new Error(`an OAR ${id} session opened on an executable that does not exist`);
     } catch (error) {

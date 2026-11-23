@@ -159,7 +159,7 @@ test("reviewer-isolation task amend requests withheld freshness context", async 
     }) as any,
   });
 
-  await taskAmendCommand.handler(ctx, undefined, { target: "#proj-raft-cli", number: "99", title: "new" });
+  await assert.rejects(async () => { await taskAmendCommand.handler(ctx, undefined, { target: "#proj-raft-cli", number: "99", title: "new" }); }, (err: unknown) => err instanceof CliError && err.code === "TASK_WRITE_HELD" && err.exitCode === 1);
   assert.deepEqual(bodies, [{
     channel: "#proj-raft-cli",
     task_number: 99,
@@ -182,7 +182,7 @@ test("a held task amend is counted for the daemon's turn report while passive AX
         }),
       }) as any,
     });
-    await taskAmendCommand.handler(ctx, undefined, { target: "#proj-raft-cli", number: "99", title: "new" });
+    await assert.rejects(async () => { await taskAmendCommand.handler(ctx, undefined, { target: "#proj-raft-cli", number: "99", title: "new" }); }, (err: unknown) => err instanceof CliError && err.code === "TASK_WRITE_HELD" && err.exitCode === 1);
     const held = stdout.join("");
     assert.match(held, /Your task amendment was not applied/);
     assert.deepEqual(readPassiveRenderCountsForTest(agentContext.agentId), [

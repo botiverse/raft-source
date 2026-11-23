@@ -13,7 +13,7 @@ import { writeText, NL } from "../../core/renderer";
 import { PEER_KIND_OPTION, type TargetAliasOpts } from "../_target";
 import { resolveTaskWriteAddress, TASK_REF_ARGUMENT } from "./_taskAddress";
 import { formatTaskUnclaimed } from "./_format";
-import { writeAttachedUnseen, writeHeldTaskWrite } from "../freshness/_taskHold";
+import { writeAttachedUnseen, exitIfHeldTaskWrite } from "../freshness/_taskHold";
 
 interface UnclaimOpts extends TargetAliasOpts {
   number: string;
@@ -53,7 +53,7 @@ export const taskUnclaimCommand = defineCommand(
         message: "Agent API taskUnclaim returned an empty response body",
       });
     }
-    if (writeHeldTaskWrite(ctx, agentContext.agentId, "task_unclaim", body, res.data)) return;
+    exitIfHeldTaskWrite(ctx, agentContext.agentId, "task_unclaim", body, res.data);
     writeText(ctx.io, formatTaskUnclaimed(taskNumber, res.data.taskRef), NL);
     writeAttachedUnseen(ctx, agentContext.agentId, res.data);
   },

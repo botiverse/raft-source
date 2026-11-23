@@ -166,7 +166,7 @@ test("--no-announcement (through the parser) sends null and says the channel has
 test("--announcement refusals: a title, a DM or thread target (before any request), and the Server's reason with its next step", async () => {
   const { ctx, patches } = announcementCtx(() => ({
     ok: false, status: 403, data: null,
-    error: "Only the owner of #engineering (one of its channel admins) or a server owner or admin can set or remove its announcement.",
+    error: "Only a channel admin of #engineering or a server owner or admin can set or remove its announcement.",
     errorCode: "channel_announcement_forbidden",
     suggestedNextAction: "Ask one of them to set it, or post what you wanted to announce as a message in #engineering.",
   }));
@@ -177,7 +177,7 @@ test("--announcement refusals: a title, a DM or thread target (before any reques
   await assert.rejects(async () => { await channelUpdateCommand.handler(ctx, { target: "#engineering", announcement: ID }); }, (err: unknown) => {
     assert.ok(err instanceof CliError);
     assert.equal(err.code, "UPDATE_FAILED");
-    assert.match(err.message, /^Only the owner of #engineering/);
+    assert.match(err.message, /^Only a channel admin of #engineering/);
     assert.equal(err.suggestedNextAction, "Ask one of them to set it, or post what you wanted to announce as a message in #engineering.");
     return true;
   });

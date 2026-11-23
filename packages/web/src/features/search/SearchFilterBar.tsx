@@ -1,4 +1,3 @@
-import type { RefObject } from "react";
 import { useIntl } from "react-intl";
 import { ArrowDownUp, AtSign, CalendarRange, Hash, UserCircle2, X } from "lucide-react";
 import { Badge, Combobox, ComboboxClear, ComboboxContent, ComboboxEmpty, ComboboxHeader, ComboboxInput, ComboboxInputGroup, ComboboxItem, ComboboxItemIndicator, ComboboxLabel, ComboboxList, ComboboxSeparator, ComboboxTrigger, SearchShellFilters, Select, SelectContent, SelectGroup, SelectGroupLabel, SelectItem, SelectItemIndicator, SelectItemText, SelectList, SelectSeparator, SelectTrigger } from "@botiverse/raft-ui";
@@ -34,7 +33,6 @@ const CHIP_MAX_WIDTH_CLASS = "max-w-60 **:data-[slot=fit-toolbar-button-label]:m
  * sort pinned at the line's end.
  */
 export function SearchFilterBar({
-  filtersPortalRef,
   overlayChrome,
   filters,
   senderIdParam,
@@ -49,7 +47,6 @@ export function SearchFilterBar({
   query,
   hasActiveFilters,
 }: {
-  filtersPortalRef: RefObject<HTMLDivElement | null>;
   overlayChrome: boolean;
   filters: SearchFilterControls;
   senderIdParam: string;
@@ -78,7 +75,6 @@ export function SearchFilterBar({
     filteredSenderOptions,
     selectedSender,
     setScopeFilters,
-    filtersPortalProps,
     handleFromMenuOpenChange,
     handleScopeMenuOpenChange,
     handleChannelMenuOpenChange,
@@ -104,7 +100,7 @@ export function SearchFilterBar({
 
   return (
     // 49px by touch (8px air, the 32px controls, 8px air, the seam); SearchShellFilters keeps 44px with a mouse.
-    <SearchShellFilters ref={filtersPortalRef} className={overlayChrome ? "px-3 py-2" : "py-2"}>
+    <SearchShellFilters className={overlayChrome ? "px-3 py-2" : "py-2"}>
       <FitToolbar aria-label={formatMessage({ id: "search.filtersAria" })} className="gap-2">
         <FitToolbarGroup
           firstLine
@@ -150,7 +146,6 @@ export function SearchFilterBar({
             align="start"
             finalFocus={false}
             initialFocus={false}
-            portalProps={filtersPortalProps}
           >
             <ComboboxHeader>
               <ComboboxLabel>{formatMessage({ id: "search.from" })}</ComboboxLabel>
@@ -207,7 +202,7 @@ export function SearchFilterBar({
           >
             {getScopeChipLabel(scopes, formatMessage)}
           </FitToolbarPicker>
-          <SelectContent align="start" portalProps={filtersPortalProps}>
+          <SelectContent align="start">
             <SelectList>
               <SelectGroup>
                 <SelectGroupLabel>{formatMessage({ id: "search.scope" })}</SelectGroupLabel>
@@ -271,7 +266,6 @@ export function SearchFilterBar({
               align="start"
               finalFocus={false}
               initialFocus={false}
-              portalProps={filtersPortalProps}
             >
               <ComboboxHeader>
                 <ComboboxLabel>{formatMessage({ id: "search.channels" })}</ComboboxLabel>
@@ -321,7 +315,7 @@ export function SearchFilterBar({
           >
             {formatMessage({ id: getTimeRangeLabelId(timeRange) })}
           </FitToolbarPicker>
-          <SelectContent align="start" portalProps={filtersPortalProps}>
+          <SelectContent align="start">
             <SelectList>
               <SelectGroup>
                 <SelectGroupLabel>{formatMessage({ id: "search.time" })}</SelectGroupLabel>
@@ -366,7 +360,7 @@ export function SearchFilterBar({
           >
             {sort === "recent" ? formatMessage({ id: "search.sortRecent" }) : formatMessage({ id: "search.sortRelevant" })}
           </FitToolbarPicker>
-          <SelectContent align="end" portalProps={filtersPortalProps}>
+          <SelectContent align="end">
             <SelectList>
               <SelectGroup>
                 <SelectGroupLabel>{formatMessage({ id: "search.sort" })}</SelectGroupLabel>

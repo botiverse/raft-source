@@ -12,16 +12,15 @@ import { useMachineStore } from "../../store/machineStore";
 import { orderMachinesLikeSidebar } from "../../components/layout/sidebarMachineOrder";
 import { useServerStore } from "../../store/serverStore";
 import api from "../../api/client";
-import { suggestAgentName, validateAgentNameReason, getRuntimeInfo, runtimeAvailabilitySuffix, PLAN_CONFIG, getBillingCapacityLimitLabel, getBillingCapacityLimitState, getBillingUsage, getEffectiveLimits, AGENT_LIMIT_REACHED_CODE, PRO_AGENT_SEAT_BLOCK_SIZE, seatTenths, seatsFromTenths } from "@botiverse/raft-shared";
-import type { CapacityLimitDetail, ProviderConnectionSummary, RuntimeSelectionOption, ServerPlan } from "@botiverse/raft-shared";
+import { suggestAgentName, validateAgentNameReason, getRuntimeInfo, runtimeAvailabilitySuffix, PLAN_CONFIG, getBillingCapacityLimitLabel, getBillingCapacityLimitState, getBillingUsage, getEffectiveLimits, AGENT_LIMIT_REACHED_CODE, PRO_AGENT_SEAT_BLOCK_SIZE, PROFILE_DESCRIPTION_MAX_LENGTH, seatTenths, seatsFromTenths } from "@botiverse/raft-shared";
+import type { CapacityLimitDetail, RuntimeSelectionOption, ServerPlan } from "@botiverse/raft-shared";
 import { formatAgentNameValidationError } from "../../i18n/nameValidation";
-import { formatRuntimeAvailabilitySuffix, formatRuntimeLabelBesideBadge, runtimeShowsExperimentalBadge } from "../../utils/runtimeAvailabilityLabel";
+import { formatRuntimeAvailabilitySuffix, formatRuntimeLabelWithStatus } from "../../utils/runtimeAvailabilityLabel";
 import { useNewAgentRuntimeOptions } from "../../hooks/useRuntimeSelectionCatalog";
 import { RUNTIME_FORM_V2_UNAVAILABLE, useRuntimeFormV2 } from "../../hooks/useRuntimeFormV2";
 import { PRO_SEAT_ADD_FEATURE_FLAG_KEY, useServerFeatureFlag } from "../../store/serverFeatureFlags";
 import { applyRuntimeFormV2Change, initialRuntimeFormV2Values, runtimeFormV2Submission, validateRuntimeFormV2 } from "@botiverse/raft-runtime-form";
 import type { RuntimeFormV2Value, RuntimeFormV2Values } from "@botiverse/raft-runtime-form";
-import { useProviderConnections } from "../../hooks/useProviderConnections";
 import { useAgentRuntimeProvider } from "../../hooks/useAgentRuntimeProvider";
 import { HostedModelChoice, hostedModelPickerShown, initialHostedModel, useHostedRuntimeModels } from "../../components/agent/HostedModelChoice";
 import { useServerPermissions } from "../../hooks/useServerPermissions";
@@ -35,10 +34,11 @@ import RuntimeConfigFields from "../../components/agent/RuntimeConfigFields";
 import { useRuntimeShowAllAction } from "../../components/agent/useRuntimeShowAllAction";
 import { flatRuntimePickerOptions, groupRuntimePickerRows } from "../../components/agent/runtimePickerOptions";
 import type { RuntimePickerRow } from "../../components/agent/runtimePickerOptions";
+import { runtimePickerGuidance } from "../../utils/runtimeCapabilityHint";
 import RuntimeSignInNotice from "../../components/machine/RuntimeSignInNotice";
+import { useCreateCindySignInState } from "./useCreateCindySignInState";
 import { canViewMachineRuntimeAccountUsage } from "../../utils/machineRuntimeUsageVisibility";
 import { useAuthStore } from "../../store/authStore";
-import EditProviderConnectionModal from "../../components/settings/EditProviderConnectionModal";
 import StableField, { FieldSelectTrigger } from "../../components/agent/StableField";
 import SetupSessionFooter from "../../components/onboarding/SetupSessionFooter";
 import { SETUP_PAPER, SETUP_PAPER_DOT_GRID, SETUP_STICKER_CARD } from "../../components/onboarding/setupPaper";
@@ -53,7 +53,7 @@ import { useLocalComputerMachineId } from "../../components/machine/localCompute
 import { useAddThisComputer } from "../../components/machine/localComputer/useAddThisComputer";
 import { useNeedsComputerCopy } from "./useNeedsComputerCopy";
 import { machineMeetsDaemonRequirement, pickFallbackMachine } from "./pickFallbackMachine";
-import { pickCreateAgentRuntime, suggestedRuntimeUnavailable } from "./pickCreateAgentRuntime";
+import { onboardingRuntimeCandidates, pickCreateAgentRuntime, reconcileCreateAgentRuntime, suggestedRuntimeUnavailable } from "./pickCreateAgentRuntime";
 import { SuggestedRuntimeNotice } from "./SuggestedRuntimeNotice";
 import { showCreatedAgentToast } from "./createdAgentToast";
 
@@ -66,7 +66,6 @@ function takenAgentNames(): string[] {
 }
 
 
-const MAX_AGENT_DESCRIPTION_LENGTH = 3000;
 /** The computer picker's value for "hosted by Raft": no computer, the agent runs on the provider. */
 const HOSTED_COMPUTER_CHOICE = "__hosted_runtime__";
 
@@ -360,16 +359,26 @@ export function CreateAgentDialog({
   const supportedSet = useMemo(() => new Set(runtimeAdmissionOptions
     .filter((option) => getRuntimeInfo(option.runtimeId)?.supported)
     .map((option) => option.runtimeId)), [runtimeAdmissionOptions]);
+  const { capabilities } = useServerPermissions();
+  const runtimeAuthVisible = canViewMachineRuntimeAccountUsage(selectedMachine, currentUserId, capabilities);
+  // Create Cindy starts on a runtime the Computer reports signed in.
+  const signInStateOf = useCreateCindySignInState(currentServer?.id, selectedMachineId, onboarding && !previewOnly && runtimeAuthVisible);
   const defaultRuntime = pickCreateAgentRuntime(
     availableRuntimes,
     supportedSet,
     onboarding,
     rememberedConfig,
     prefilledRuntime,
+    signInStateOf,
   );
   const [runtime, setRuntime] = useState(defaultRuntime);
+  // Until the person picks one, Create Cindy's runtime follows the sign-in read.
+  const [onboardingRuntimeChosen, setOnboardingRuntimeChosen] = useState(false);
+  const chooseOnboardingRuntime = useCallback((value: string) => {
+    setOnboardingRuntimeChosen(true);
+    setRuntime(value);
+  }, []);
   const selectedRuntimeAdmission = runtimeAdmissionOptions.find((option) => option.runtimeId === runtime);
-  const [editingProviderConnection, setEditingProviderConnection] = useState<ProviderConnectionSummary | null>(null);
   const [error, setError] = useState("");
   const [createdOnboardingAgent, setCreatedOnboardingAgent] = useState<{ id: string; name: string } | null>(null);
 
@@ -386,13 +395,10 @@ export function CreateAgentDialog({
     () => !onboarding && !!prefilledName && validateAgentNameReason(prefilledName) !== null,
   );
   const createAgent = useAgentStore((s) => s.createAgent);
-  const { capabilities } = useServerPermissions();
   const channels = useChannelStore((s) => s.channels);
   const allAgents = useAgentStore((s) => s.agents);
   const agents = allAgents.filter((a) => !a.deletedAt);
   const nav = useAppNavigate();
-  // Saved Provider connections, for the v2 form's pencil (edit) action.
-  const providerConnectionCatalog = useProviderConnections(!previewOnly && runtime === "builtin");
   // Protocol v2 (server-described form, rendered by field kind, submitted as
   // field values) is the only runtime form. Onboarding uses the same form as a
   // normal create (task #8: its technical fields sit in the collapsed Advanced
@@ -417,9 +423,11 @@ export function CreateAgentDialog({
   const v2Errors = runtimeFormV2.status === "ready" && v2Values
     ? validateRuntimeFormV2(runtimeFormV2.form, runtimeFormV2.sources, v2Values)
     : {};
-  // A required field whose option source is unavailable blocks like an empty one (option_source.status).
-  const v2MissingRequired = Object.values(v2Errors).some((code) => code === "required" || code === "source_unavailable");
-  const v2Malformed = Object.values(v2Errors).some((code) => code !== "required" && code !== "source_unavailable");
+  // A required field whose option source is unavailable blocks like an empty one (option_source.status),
+  // and so does a required field this build cannot render: typing cannot fix it, and the field says to update Raft.
+  const v2Blocking = (code: string) => code === "required" || code === "source_unavailable" || code === "unsupported_required";
+  const v2MissingRequired = Object.values(v2Errors).some(v2Blocking);
+  const v2Malformed = Object.values(v2Errors).some((code) => !v2Blocking(code));
   const changeV2Value = useCallback((key: string, value: RuntimeFormV2Value) => {
     if (runtimeFormV2.status !== "ready" || !v2Values) return;
     setV2ServerErrors({});
@@ -441,9 +449,9 @@ export function CreateAgentDialog({
     return runtimeInfo?.supported
       ? [{
           value: runtimeInfo.id,
-          label: formatRuntimeLabelBesideBadge(runtimeInfo.id, formatMessage, option.admissionReason === "deprecated"),
+          label: formatRuntimeLabelWithStatus(runtimeInfo.id, formatMessage, option.admissionReason === "deprecated"),
           availabilitySuffix: formatRuntimeAvailabilitySuffix(runtimeAvailabilitySuffix(runtimeInfo, machineRuntimeIds), formatMessage),
-          experimental: runtimeShowsExperimentalBadge(runtimeInfo.id, option.admissionReason === "deprecated"),
+          ...runtimePickerGuidance(runtimeInfo.id, option.admissionReason === "deprecated", formatMessage),
           disabled: !option.canSelectInThisContext,
           capabilityStatus: option.capabilityStatus,
           selectable: option.canSelectInThisContext,
@@ -490,10 +498,13 @@ export function CreateAgentDialog({
         machineId={selectedMachineId}
         machineName={runtimeComputerName}
         runtimeId={runtime}
-        enabled={canViewMachineRuntimeAccountUsage(selectedMachine, currentUserId, capabilities)}
+        enabled={runtimeAuthVisible}
       />
     </>
   );
+  // Create Cindy: the picked runtime's notice, or with none picked (all signed out) the recommended one's Sign In.
+  const onboardingNoticeRuntime = runtime || onboardingRuntimeCandidates(availableRuntimes, supportedSet)[0] || "";
+  const onboardingRuntimeNotice = onboardingNoticeRuntime ? <RuntimeSignInNotice serverId={currentServer?.id} machineId={selectedMachineId} machineName={runtimeComputerName} runtimeId={onboardingNoticeRuntime} enabled={runtimeAuthVisible} unknownNotice agentName={name.trim() || formatMessage({ id: "agent.create.cindyName" })} /> : null;
 
   const handleUpgradeToBilling = useCallback(() => {
     onClose();
@@ -530,6 +541,8 @@ export function CreateAgentDialog({
     if (val === HOSTED_COMPUTER_CHOICE) return;
     setSelectedMachineId(val);
     setRuntime("");
+    // Another Computer, another sign-in read: the pick follows it again.
+    setOnboardingRuntimeChosen(false);
   }, [setSelectedMachineId]);
 
   const reloadHostedModels = hostedModels.reload;
@@ -548,15 +561,6 @@ export function CreateAgentDialog({
   const handleDescriptionChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setDescription(e.target.value);
   }, []);
-
-  const handleCloseEditProviderConnection = useCallback(() => {
-    setEditingProviderConnection(null);
-  }, []);
-
-  const handleCompletedEditProviderConnection = useCallback(async () => {
-    setEditingProviderConnection(null);
-    await providerConnectionCatalog.refresh();
-  }, [providerConnectionCatalog]);
 
   // One-shot prefill waiter: when the dialog opens with a `prefilledMachineId`
   // for an action-card-driven flow, the target machine may briefly be reported
@@ -615,22 +619,22 @@ export function CreateAgentDialog({
   // oxlint-disable-next-line react-doctor/no-effect-chain, react-doctor/no-cascading-set-state, react-doctor/no-pass-live-state-to-parent
   useEffect(() => {
     // oxlint-disable-next-line react-doctor/no-pass-live-state-to-parent -- local async-list reconciliation; this component owns both the catalog and editable draft
-    if (!selectedMachineId || availableRuntimes.length === 0 || availableRuntimes.includes(runtime)) return;
+    if (!selectedMachineId) return;
+    // Create Cindy, before the person picks: the pick follows the sign-in read too.
+    const picked = reconcileCreateAgentRuntime(runtime, availableRuntimes, onboarding && !onboardingRuntimeChosen,
+      () => pickCreateAgentRuntime(availableRuntimes, supportedSet, onboarding, rememberedConfig, prefilledRuntime, signInStateOf));
+    if (picked === runtime) return;
     // oxlint-disable-next-line react-doctor/no-derived-state, react-doctor/no-chain-state-updates
-    setRuntime(pickCreateAgentRuntime(
-      availableRuntimes,
-      supportedSet,
-      onboarding,
-      rememberedConfig,
-      prefilledRuntime,
-    ));
+    setRuntime(picked);
   }, [
     availableRuntimes,
     onboarding,
+    onboardingRuntimeChosen,
     prefilledRuntime,
     rememberedConfig,
     runtime,
     selectedMachineId,
+    signInStateOf,
     supportedSet,
   ]);
 
@@ -722,7 +726,11 @@ export function CreateAgentDialog({
    */
   const fieldValidationBlocked = Boolean(nameValidationError) || (!skipsComputer && v2Malformed);
 
+  // An action card can prefill a description over the limit (its own cap is
+  // longer): the counter and the error say so, and Create waits for it to fit.
+  const descriptionTooLong = !descriptionLocked && description.trim().length > PROFILE_DESCRIPTION_MAX_LENGTH;
   const createDisabled =
+    descriptionTooLong ||
     (atLimit && !addsSeatsInPlace) ||
     // An unavailable list still allows the default (no model is sent, nothing to check).
     (isHostedMode && (hostedModels.state.kind === "loading" || !name.trim())) ||
@@ -804,6 +812,7 @@ export function CreateAgentDialog({
     // flow is by construction first-agent territory too.
     const wasFirstAgent = onboarding || agents.length === 0;
     try {
+      // oxlint-disable-next-line react/purity -- runs in the submit handler, never while rendering: the rule reads this un-memoized handler as render code.
       const avatarKey = onboarding ? "mug" : AVATAR_KEYS[Math.floor(Math.random() * AVATAR_KEYS.length)];
       const reusedCreatedOnboardingAgent = Boolean(createdOnboardingAgent);
       const agent = createdOnboardingAgent ?? (isHostedMode
@@ -866,6 +875,8 @@ export function CreateAgentDialog({
             setSubmitting(false);
             return;
           }
+          // The server linked her as its official onboarding agent; the setup's last step reads it to watch her start.
+          useServerStore.getState().applyServerPatch({ id: currentServer.id, officialOnboardingAgentId: agent.id });
           onOnboardingComplete?.();
         } catch (completeError: unknown) {
           setError(onboardingCompleteErrorMessage(formatMessage, completeError));
@@ -1088,7 +1099,8 @@ export function CreateAgentDialog({
                   // in the collapsed Advanced section (task #8).
                   runtimeFormV2={runtimeFormV2Prop}
                   runtime={runtime}
-                  onRuntimeChange={setRuntime}
+                  onRuntimeChange={chooseOnboardingRuntime}
+                  runtimeBelowDescription={onboardingRuntimeNotice}
                   // Show every runtime, greying out the ones we did not detect (they
                   // carry a "(not installed)" suffix). Hiding them meant a user who
                   // simply forgot to install their tool saw no trace of it — and when
@@ -1399,7 +1411,11 @@ export function CreateAgentDialog({
             // field 36px where every other gap is 16px; in the helper slot it
             // occupies the same row a hint or error would, so the field's
             // footprint matches any other hinted field.
-            counter={descriptionLocked ? undefined : `${description.length}/${MAX_AGENT_DESCRIPTION_LENGTH}`}
+            counter={descriptionLocked ? undefined : `${description.length}/${PROFILE_DESCRIPTION_MAX_LENGTH}`}
+            hint={descriptionLocked ? undefined : formatMessage({ id: "agent.create.descriptionHint" })}
+            error={descriptionTooLong
+              ? formatMessage({ id: "agent.detail.descriptionMaxLength" }, { count: PROFILE_DESCRIPTION_MAX_LENGTH })
+              : undefined}
           >
             <Textarea
               value={description}
@@ -1407,7 +1423,7 @@ export function CreateAgentDialog({
               className={`w-full ${descriptionLocked ? lockedFieldClass : ""}`}
               placeholder={formatMessage({ id: "agent.create.descriptionPlaceholder" })}
               rows={3}
-              maxLength={MAX_AGENT_DESCRIPTION_LENGTH}
+              maxLength={PROFILE_DESCRIPTION_MAX_LENGTH}
               readOnly={descriptionLocked}
             />
             {descriptionLocked ? (
@@ -1439,8 +1455,8 @@ export function CreateAgentDialog({
               runtimeOptions={runtimeOptions}
               runtimeBelowDescription={runtimeBelowDescription}
               runtimeListAction={runtimeListAction}
-              providerConnections={providerConnectionCatalog.connections}
-              onEditProviderConnection={capabilities.manageExternalAuth ? setEditingProviderConnection : undefined}
+              upgradeServerId={currentServer?.id}
+              upgradeMachineId={selectedMachineId}
             />
             </>
           )}
@@ -1468,17 +1484,6 @@ export function CreateAgentDialog({
             </DialogCommit>
           </DialogCardFooter>
         </form>
-        {/* Opened from the runtime fields' provider picker: inside this dialog's tree (outside the form, so its submit
-            doesn't reach this one), so raft-ui stacks it over the card and Esc closes only it. */}
-        {editingProviderConnection && (
-          <EditProviderConnectionModal
-            key={editingProviderConnection.id}
-            connection={editingProviderConnection}
-            providerOptions={providerConnectionCatalog.providerOptions}
-            onClose={handleCloseEditProviderConnection}
-            onCompleted={handleCompletedEditProviderConnection}
-          />
-        )}
       </DialogCard>
       {seatNeed ? (
         <AddSeatsDialog

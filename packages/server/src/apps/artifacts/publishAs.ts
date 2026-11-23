@@ -184,7 +184,7 @@ async function publishAsPerson(input: ArtifactPublishAsInput, userId: string): P
   if (input.request.artifact !== undefined) {
     // A person who no longer stands in the server sees nothing of it here (a public Artifact included).
     if (!(await standsInOwnServer(viewer))) return notVisible();
-    const existing = await resolveVisibleItemById(viewer, input.request.artifact);
+    const existing = await resolveVisibleItemById(viewer, input.request.artifact, "write");
     if (input.requireHome !== undefined && (existing.homeKind !== "conversation" || existing.homeChannelId !== input.requireHome)) return notVisible();
     if (existing.publishedByAssistantAgentId !== assistantAgentId) return notPublishedByAssistant(existing);
     if (!(await mayRename(viewer, existing))) return fail(403, { code: "FORBIDDEN", error: MAY_NOT_PUSH_AS_PERSON });
@@ -206,6 +206,8 @@ async function publishAsPerson(input: ArtifactPublishAsInput, userId: string): P
     // The caller doesn't show a hold's comments (the assistant's route strips them): a hold moves no read position,
     // so the same request again is held again until it carries `seen` (Tenny, #33).
     holdMovesReadPosition: false,
+    // Likewise a Settled hold names no settler (Tenny, #15649): when and at which version only; the same request again goes through.
+    holdNamesSettler: false,
     summaryOf: (items) => summarizeForPerson({ userId, serverId: input.serverId }, items),
     locate: async () => located,
   }));
@@ -221,7 +223,7 @@ export function publishArtifactAs(input: ArtifactPublishAsInput): Promise<Artifa
     if (input.request.artifact !== undefined) {
       // What the author can't see answers as the agent API does (403 ARTIFACTS_NOT_ENABLED, the one 404 NOT_VISIBLE),
       // before anything is said about whose it is.
-      const existing = await resolveVisibleItem(agent, input.request.artifact);
+      const existing = await resolveVisibleItem(agent, input.request.artifact, "write");
       if (input.requireHome !== undefined && (existing.homeKind !== "conversation" || existing.homeChannelId !== input.requireHome)) return notVisible();
       if (existing.publishedByAssistantAgentId !== as.assistantAgentId) return notPublishedByAssistant(existing);
       // By id from here: the publish resolves the same Artifact, not another one of the same title.

@@ -1,6 +1,13 @@
 // `raft integration invoke --service <service> --action <action>` — invoke a manifest-backed HTTP API action.
 
-import { findIntegrationService, findListedIntegrationService, foldAgentOneLineText } from "@botiverse/raft-shared/src/agentCliSurface";
+import {
+  appReplyText,
+  findIntegrationService,
+  findListedIntegrationService,
+  foldAgentOneLineText,
+  formatAppReplyTextBlock,
+  type AppReplyText,
+} from "@botiverse/raft-shared/src/agentCliSurface";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -14,7 +21,7 @@ import { createAgentApiSurfaceClient } from "../../agentApiPath";
 import { defineCommand, registerCliCommand } from "../../core/command";
 import type { CommandContext, CommandRuntimeOptions } from "../../core/context";
 import type { AgentContext } from "../../auth/env";
-import { cliError, CliError, type FileWriteEffectState } from "../../core/errors";
+import { cliError, CliError, type CliErrorCode, type CliErrorOptions, type FileWriteEffectState } from "../../core/errors";
 import { writeJson, writeText, NL, adoptCliReplyText } from "../../core/renderer";
 import { CanonicalFetchTransportError, fetchWithCanonicalProxy } from "../../proxy";
 import { apiFailureError } from "../_apiFailure";
@@ -277,6 +284,8 @@ function appAnsweredMessage(status: number, body: unknown): string | null {
  * reads as the App's answer, with no login step.
  */
 function actionFailureError(status: number, body: unknown, responseBody: string, serviceClientId: string) {
+  const reply = appReplyText(redactActionErrorValue(body));
+  if (reply) return appReplyTextFailureError(status, body, reply, responseBody, serviceClientId);
   const answered = appAnsweredMessage(status, body);
   if (status === 401 || (status === 403 && answered === null)) {
     return cliError(
@@ -288,6 +297,74 @@ function actionFailureError(status: number, body: unknown, responseBody: string,
     );
   }
   return cliError("INTEGRATION_INVOKE_FAILED", answered ?? actionFailureMessage(status, responseBody));
+}
+
+/**
+ * A non-2xx answer with the App's reply text: that text (one sentence and the
+ * next step) is the message, quoted as a block; the rest of the body is not
+ * printed, and `--json` keeps it (redacted, capped) as `details.response_body`.
+ * A 401 is still the refused session with its login step; any other status,
+ * a 403 too, is the App's own answer, like a typed `{ error: { code, message } }`.
+ */
+function appReplyTextFailureError(
+  status: number,
+  body: unknown,
+  reply: AppReplyText,
+  responseBody: string,
+  serviceClientId: string,
+) {
+  const error = body && typeof body === "object" ? (body as { error?: unknown }).error : undefined;
+  const rawCode = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+  const code = typeof rawCode === "string" ? foldAgentOneLineText(redactCredentialText(rawCode)) : "";
+  // The action did not run: the cut note says only where the text was cut.
+  const block = formatAppReplyTextBlock(reply, "").join("\n");
+  const details = { response_body: responseBody };
+  if (status === 401) {
+    return cliError("INTEGRATION_INVOKE_FAILED", `service session was rejected or expired (HTTP ${status}):\n${block}`, {
+      details,
+      suggestedNextAction: `Run \`raft integration login --service ${serviceClientId}\` and retry the action.`,
+    });
+  }
+  return new AppReplyTextError(
+    { code: "INTEGRATION_INVOKE_FAILED" as CliErrorCode, message: `service action answered HTTP ${status}${code ? ` ${code}` : ""}:\n${block}`, details },
+    { httpStatus: status, appCode: code, reply },
+  );
+}
+
+/**
+ * How an app action failed, for a command built on an App that must tell a
+ * write that may have run from one that did not: the HTTP status the App
+ * answered with (from AppReplyTextError, or the status line of
+ * actionFailureMessage / appAnsweredMessage), "transport" when no answer
+ * came back, else null (not an action failure).
+ */
+export function appActionFailureStatus(error: unknown): number | "transport" | null {
+  if (error instanceof AppReplyTextError) return error.httpStatus;
+  if (!(error instanceof CliError) || (error.code as string) !== "INTEGRATION_INVOKE_FAILED") return null;
+  if (error.layer === "integration_action_transport") return "transport";
+  const status = /^service action (?:failed \(HTTP|answered HTTP) (\d{3})\b/.exec(error.message)?.[1];
+  return status ? Number(status) : null;
+}
+
+/**
+ * The App answered an action with an error status and its reply text (not a
+ * refused session). Printed like any CliError; a command built on an App
+ * (`raft reminder`) reads the status, the App's own code and the text to
+ * answer in its own words.
+ */
+export class AppReplyTextError extends CliError {
+  readonly httpStatus: number;
+  /** The App's `error.code`, one line; "" when it sent none. */
+  readonly appCode: string;
+  readonly reply: AppReplyText;
+
+  constructor(options: CliErrorOptions, answer: { httpStatus: number; appCode: string; reply: AppReplyText }) {
+    super(options);
+    this.name = "AppReplyTextError";
+    this.httpStatus = answer.httpStatus;
+    this.appCode = answer.appCode;
+    this.reply = answer.reply;
+  }
 }
 
 function parsedJsonBody(rawBody: string): unknown {
@@ -353,14 +430,145 @@ function parseJsonObject(raw: string, label: string): Record<string, unknown> {
 type DeclaredParamTypeLookup = (name: string) => string | readonly string[] | undefined;
 type DeclaredParamType = ReturnType<DeclaredParamTypeLookup>;
 
+/** What the action declares about the parameters `--param` may set. */
+type DeclaredParams = {
+  /** The service id as `--service` takes it, for the next step of a refusal. */
+  service: string;
+  action: string;
+  typeOf: DeclaredParamTypeLookup;
+  /** The keys the action takes; undefined when it does not say (any key goes). */
+  names?: readonly string[];
+  /**
+   * Whether a body key outside `names` still reaches the service through
+   * --data-json (v0: nothing checks it locally) or is refused there too (v1
+   * `additionalProperties: false`).
+   */
+  othersViaDataJson?: boolean;
+  /**
+   * The JSON types a `--param` literal may be sent as (v1, whose input schema
+   * is checked here); absent, every value is text (v0).
+   */
+  literalTypesOf?: (name: string) => readonly string[] | undefined;
+};
+
+function declaredTypeList(declaredType: DeclaredParamType): string[] {
+  return (Array.isArray(declaredType) ? declaredType : [declaredType])
+    .filter((value): value is string => typeof value === "string")
+    .map((value) => value.trim().toLowerCase());
+}
+
 function structuredParamTypeLabel(
   declaredType: DeclaredParamType,
 ): string | null {
-  const types = (Array.isArray(declaredType) ? declaredType : [declaredType])
-    .filter((value): value is string => typeof value === "string")
-    .map((value) => value.trim().toLowerCase());
+  const types = declaredTypeList(declaredType);
   const structured = ["array", "object"].filter((value) => types.includes(value));
   return structured.length > 0 ? structured.join(" or ") : null;
+}
+
+const JSON_NUMBER_LITERAL = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
+
+/**
+ * A `--param` literal for a number/integer/boolean parameter (alone or in a
+ * union without string), as the JSON value the schema expects. A string
+ * among the declared types keeps the text as it is.
+ */
+function coerceScalarParam(key: string, value: string, types: readonly string[]): unknown {
+  if (types.includes("string")) return value;
+  if (!types.some((type) => type === "number" || type === "integer" || type === "boolean")) return value;
+  if (types.includes("boolean") && (value === "true" || value === "false")) return value === "true";
+  if ((types.includes("number") || types.includes("integer")) && JSON_NUMBER_LITERAL.test(value)) {
+    const number = Number(value);
+    if (Number.isSafeInteger(number)) return number;
+    if (Number.isFinite(number) && types.includes("number")) return number;
+    // Past 2^53 an integer is not held exactly (9007199254740993 would go out
+    // as …992), and a JSON number in --data-json is read the same way.
+    if (Number.isInteger(number)) {
+      throw cliError(
+        "INVALID_ARG",
+        `--param ${key} is declared ${types.join(" or ")}, but ${value} is past the largest exact integer (2^53 - 1), so it would not be sent as written; if the action also takes it as a string, send it as one with --data-json`,
+      );
+    }
+  }
+  if (types.includes("null") && value === "null") return null;
+  const label = types.join(" or ");
+  throw cliError(
+    "INVALID_ARG",
+    `--param ${key} is declared ${label}, but its value is ${JSON.stringify(value)}; pass a valid ${label} value, or use --data-json for typed JSON`,
+  );
+}
+
+function undeclaredParamError(key: string, declared: DeclaredParams & { names: readonly string[] }): CliError {
+  const { service, action, names } = declared;
+  const listActions = `raft integration invoke --service ${service} --list-actions --action ${action}`;
+  if (names.length === 0) {
+    return cliError("INVALID_ARG", `--param ${key} is not a parameter of ${action}; it takes no parameters`, {
+      suggestedNextAction: `Drop --param ${key}; this action takes no input (${listActions} shows it).`,
+    });
+  }
+  return cliError(
+    "INVALID_ARG",
+    `--param ${key} is not a parameter of ${action}; declared: ${foldAgentOneLineText(names.join(", "))}`,
+    {
+      suggestedNextAction: declared.othersViaDataJson
+        ? `Run ${listActions} to see its parameters; to send a field it does not declare, put it in --data-json.`
+        : `Run ${listActions} to see its parameters; it accepts no others. Typed or structured values go in --data-json.`,
+    },
+  );
+}
+
+/**
+ * The JSON types a v1 property may hold: its `type`, or each branch's `type`
+ * of an `anyOf` / `oneOf` whose branches all name one (the manifest's only
+ * way to write a union, `{ anyOf: [{ type: "integer" }, { type: "null" }] }`).
+ */
+function declaredV1LiteralTypes(action: AgentManifestActionV1, name: string): string[] | undefined {
+  const properties = action.input_schema.properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) return undefined;
+  const property = (properties as Record<string, unknown>)[name];
+  if (!property || typeof property !== "object" || Array.isArray(property)) return undefined;
+  const schema = property as Record<string, unknown>;
+  if (typeof schema.type === "string") return [schema.type];
+  const branches = Array.isArray(schema.anyOf) ? schema.anyOf : Array.isArray(schema.oneOf) ? schema.oneOf : undefined;
+  if (!branches || branches.length === 0) return undefined;
+  const types = branches.map((branch) =>
+    branch && typeof branch === "object" && typeof (branch as Record<string, unknown>).type === "string"
+      ? (branch as { type: string }).type
+      : undefined
+  );
+  return types.every((type): type is string => type !== undefined) ? types : undefined;
+}
+
+/**
+ * The keys a v1 action's input schema allows, or undefined when it allows
+ * others too: no `properties`, `additionalProperties` absent (JSON Schema
+ * reads that as true, and so does the input check), true or a schema, or a
+ * top-level combinator or `$ref` that may declare more.
+ */
+function declaredV1ParamNames(action: AgentManifestActionV1): string[] | undefined {
+  const schema = action.input_schema;
+  const properties = schema.properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) return undefined;
+  if (schema.additionalProperties !== false) return undefined;
+  if (["allOf", "anyOf", "oneOf", "$ref"].some((keyword) => schema[keyword] !== undefined)) return undefined;
+  return Object.keys(properties);
+}
+
+/** A v0 action's declared parameters and its endpoint path placeholders; undefined when it declares none. */
+function declaredV0ParamNames(action: AgentManifestActionV0): string[] | undefined {
+  if (!action.parameters) return undefined;
+  return Array.from(new Set([...Object.keys(action.parameters), ...endpointPathParameterNames(action.endpoint.path)]));
+}
+
+function declaredV1ParamSummary(action: AgentManifestActionV1): string {
+  const properties = action.input_schema.properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) return "see input_schema (--json)";
+  const required = new Set(Array.isArray(action.input_schema.required) ? action.input_schema.required : []);
+  const names = Object.keys(properties);
+  if (names.length === 0) return "none";
+  return names.map((name) => {
+    const type = (declaredV1LiteralTypes(action, name) ?? []).join(" or ");
+    return `${name} (${type ? `${type}, ` : ""}${required.has(name) ? "required" : "optional"})`;
+  }).join(", ");
 }
 
 function declaredV1ParamType(
@@ -381,7 +589,7 @@ function declaredV1ParamType(
 
 function parseActionPayload(
   opts: InvokeOptions,
-  declaredParamType?: DeclaredParamTypeLookup,
+  declared: DeclaredParams,
 ): Record<string, unknown> {
   if (opts.dataJson && opts.dataFile) {
     throw cliError("INVALID_ARG", "use only one of --data-json or --data-file");
@@ -403,14 +611,26 @@ function parseActionPayload(
     }
     const key = rawParam.slice(0, separator).trim();
     if (!key) throw cliError("INVALID_ARG", "--param keys must not be empty");
-    const structuredType = structuredParamTypeLabel(declaredParamType?.(key));
+    // Only --param keys: --data-json / --data-file bodies are left to the schema and the service.
+    if (declared.names && !declared.names.includes(key)) {
+      throw undeclaredParamError(key, { ...declared, names: declared.names });
+    }
+    const declaredType = declared.typeOf(key);
+    const structuredType = structuredParamTypeLabel(declaredType);
     if (structuredType) {
       throw cliError(
         "INVALID_ARG",
         `--param ${key} is text-only, but the manifest declares ${structuredType}; use --data-json or --data-file for typed JSON`,
       );
     }
-    payload[key] = readTextReference(rawParam.slice(separator + 1));
+    const rawValue = rawParam.slice(separator + 1);
+    // Only an inline literal is typed. `key=@file` / `key=@-` stays text, as
+    // before: a reference carries long text (a patch, a note), and its
+    // contents (a trailing newline, say) are not a literal to guess at.
+    const literalTypes = declared.literalTypesOf?.(key);
+    payload[key] = literalTypes && !rawValue.startsWith("@")
+      ? coerceScalarParam(key, rawValue, literalTypes)
+      : readTextReference(rawValue);
   }
 
   return payload;
@@ -1464,6 +1684,7 @@ function formatV1Actions(input: {
     lines.push(`- ${action.name}`);
     lines.push(`  endpoint: ${action.endpoint.method} ${action.endpoint.path}`);
     if (action.description) lines.push(`  description: ${foldAgentOneLineText(action.description)}`);
+    lines.push(`  params: ${foldAgentOneLineText(declaredV1ParamSummary(action))}`);
     lines.push(`  effect: ${action.effect}`);
     lines.push(`  idempotency: ${action.idempotency.mode}`);
     lines.push(`  readback: ${action.readback.mode}`);
@@ -1504,6 +1725,17 @@ function formatActionResult(input: {
   action: AgentManifestActionV0;
   result: ActionResult;
 }): string {
+  const reply = input.result.kind === "json" ? appReplyText(input.result.value) : null;
+  if (reply && input.result.kind === "json") {
+    // The App said what happened in its own words: those, not its JSON (`--json` has it all).
+    const lines = [
+      `Action invoked: ${input.action.name} (${input.service.clientId}, HTTP ${input.result.status})`,
+      ...formatAppReplyTextBlock(reply),
+    ];
+    const viewerUrl = pickViewerUrl(input.result.value);
+    if (viewerUrl) lines.push(`viewer URL: ${foldAgentOneLineText(viewerUrl)}`);
+    return lines.join("\n");
+  }
   const lines = [
     `Action invoked: ${input.action.name}`,
     `service: ${input.service.clientId}`,
@@ -2065,7 +2297,7 @@ export const integrationInvokeCommand = defineCommand(
       },
       {
         flags: "--param <key=value>",
-        description: "Text action parameter; repeatable. Use key=@file or key=@- to read text. Use --data-json/--data-file for array or object fields. For non-GET actions, id is also sent as query ?id= when the manifest path has no {id}",
+        description: "Action parameter; repeatable; a key the action does not declare is refused when it takes no others. A v1 number, integer or boolean parameter is sent typed (count=3, done=true). Use key=@file or key=@- to read text. Use --data-json/--data-file for array or object fields. For non-GET actions, id is also sent as query ?id= when the manifest path has no {id}",
         parse: (value, previous: string[] = []) => {
           previous.push(value);
           return previous;
@@ -2087,7 +2319,7 @@ export const integrationInvokeCommand = defineCommand(
         description: "Retry one prior manifest v1 logical invocation with the same actor, target, contract, and request binding",
       },
       { flags: "--output <path>", description: "Write a file-response action to this path instead of a temporary file" },
-      { flags: "--json", description: "Emit machine-readable JSON" },
+      { flags: "--json", description: "Emit machine-readable JSON with the App's whole answer; without it, an answer carrying a reply text prints only that text" },
     ],
   },
   async (
@@ -2220,7 +2452,13 @@ export const integrationInvokeCommand = defineCommand(
         writeText(cmdCtx.io, adoptCliReplyText(formatActionPreflightV1(data)), NL);
         return;
       }
-      const payload = parseActionPayload(opts, (name) => declaredV1ParamType(action, name));
+      const payload = parseActionPayload(opts, {
+        service: service.clientId,
+        action: action.name,
+        typeOf: (name) => declaredV1ParamType(action, name),
+        names: declaredV1ParamNames(action),
+        literalTypesOf: (name) => declaredV1LiteralTypes(action, name),
+      });
       const result = await invokeResolvedV1Action({
         cmdCtx,
         agentContext,
@@ -2290,7 +2528,13 @@ export const integrationInvokeCommand = defineCommand(
       throw cliError("INVALID_ARG", "--output is only available for file-response actions");
     }
 
-    const payload = parseActionPayload(opts, (name) => action.parameters?.[name]?.type);
+    const payload = parseActionPayload(opts, {
+      service: service.clientId,
+      action: action.name,
+      typeOf: (name) => action.parameters?.[name]?.type,
+      names: declaredV0ParamNames(action),
+      othersViaDataJson: true,
+    });
     const result = await invokeResolvedV0Action({
       cmdCtx,
       agentContext,

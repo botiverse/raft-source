@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { errorClassOf, errorCodeOf } from "@botiverse/raft-shared";
+import { currentTimeMs, errorClassOf, errorCodeOf } from "@botiverse/raft-shared";
 import type { Tracer } from "@botiverse/raft-shared";
 import { DirectUploadTargetOriginError, uploadWithSignedCapability } from "./directUploadCapability";
 import { logger } from "./logger";
@@ -11,6 +11,8 @@ import { bucketDelayMs, computeTraceJitter, NO_JITTER, traceFileFamily, type Tra
 const TRACE_UPLOAD_SCOPE = "daemon-trace-bundle:create";
 const DEFAULT_UPLOAD_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_MIN_FILE_AGE_MS = 60 * 1000;
+/** At most one telemetry flush (rotate + upload) per window; see `flushNow`. */
+const DEFAULT_FLUSH_MIN_INTERVAL_MS = 5 * 60 * 1000;
 
 /**
  * What the uploader knows about itself across restarts.
@@ -209,6 +211,18 @@ export function selectFilesForPass(sortedFiles: readonly string[], maxFiles: num
   return selected;
 }
 
+/** `selectFilesForPass`, with a flush's forced files first (still within the cap). */
+function selectFilesForFlushOrPass(
+  sortedFiles: readonly string[],
+  maxFiles: number,
+  forcedFiles: ReadonlySet<string> | undefined,
+): string[] {
+  if (!forcedFiles || forcedFiles.size === 0) return selectFilesForPass(sortedFiles, maxFiles);
+  const forced = sortedFiles.filter((file) => forcedFiles.has(path.resolve(file))).slice(0, maxFiles);
+  const rest = sortedFiles.filter((file) => !forcedFiles.has(path.resolve(file)));
+  return [...forced, ...selectFilesForPass(rest, maxFiles - forced.length)];
+}
+
 /**
  * Closed-set of `deployment.environment` values this daemon may self-declare
  * to the upload server. The server applies its own consistency check:
@@ -236,7 +250,23 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 type TickFn = "setTimeout" | "setInterval" | "clearTimeout" | "clearInterval";
 type Timers = Pick<typeof globalThis, TickFn>;
 
-export type UploadTrigger = "initial" | "interval" | "manual" | "catchup";
+export type UploadTrigger = "initial" | "interval" | "manual" | "catchup" | "flush";
+
+/** Why the daemon asked to flush its telemetry now. Closed set: it is a span attr. */
+export type TelemetryFlushReason = "agent_start_failure" | "daemon_stop";
+
+/** Why a flush did nothing. Closed set: it is a span attr. */
+export type TelemetryFlushSkipReason =
+  | "rate_limited"
+  | "stopped"
+  | "privacy_mode"
+  | "no_credentials"
+  | "no_receiver";
+
+export type TelemetryFlushResult =
+  | { outcome: "flushed"; rotated: boolean; uploaded: number }
+  | { outcome: "skipped"; skippedReason: TelemetryFlushSkipReason }
+  | { outcome: "failed" };
 
 export interface DaemonTraceBundleUploaderOptions {
   machineDir: string;
@@ -268,6 +298,15 @@ export interface DaemonTraceBundleUploaderOptions {
   /** Catch-up passes allowed between two interval ticks (task #364). */
   maxCatchupPassesPerInterval?: number;
   currentFileProvider?: () => string | null;
+  /**
+   * Close the sink's current file now; returns its path, or null when nothing
+   * was closed (no file, or an empty one). Used by `flushNow` only.
+   */
+  rotateCurrentFile?: () => string | null;
+  /** Minimum time between two flushes (`flushNow`); default 5 minutes. */
+  flushMinIntervalMs?: number;
+  /** Clock for the flush rate limit (tests). */
+  nowMsProvider?: () => number;
   /**
    * Write-failure counters from the local sink.
    *
@@ -316,9 +355,18 @@ export class DaemonTraceBundleUploader {
   private intervalTimer: ReturnType<typeof setTimeout> | null = null;
   private catchupTimer: ReturnType<typeof setTimeout> | null = null;
   private catchupPassesThisInterval = 0;
-  /** A scheduled pass still uploading; at most one runs at a time. */
-  private scheduledPassInFlight = false;
+  /**
+   * A pass still uploading (scheduled or a flush); at most one runs at a time.
+   * Held as the promise so a flush can wait for a scheduled pass to finish.
+   */
+  private passInFlight: Promise<unknown> | null = null;
+  /** The flush in progress; concurrent `flushNow` calls join it. */
+  private flushInFlight: Promise<TelemetryFlushResult> | null = null;
+  /** When the last flush that got past its guards started (rate limit). */
+  private lastFlushStartedAtMs: number | null = null;
   private stopped = false;
+  /** Timers stopped (`stopScheduling`); a flush may still run until `stop()`. */
+  private schedulingStopped = false;
   private warnedTargetOrigin = false;
 
   constructor(options: DaemonTraceBundleUploaderOptions) {
@@ -334,20 +382,39 @@ export class DaemonTraceBundleUploader {
   }
 
   start(): void {
-    if (this.stopped) return;
+    if (this.halted) return;
     if (this.initialDelayTimer || this.intervalTimer) return;
 
     const initialDelayMs = this.jitter.initialUploadDelayMs;
     this.initialDelayTimer = this.timers.setTimeout(() => {
       this.initialDelayTimer = null;
-      if (this.stopped) return;
+      if (this.halted) return;
       void this.runScheduledPass("initial");
       this.scheduleNextTick();
     }, initialDelayMs);
   }
 
+  /** Scheduled passes no longer start. */
+  private get halted(): boolean {
+    return this.stopped || this.schedulingStopped;
+  }
+
+  /**
+   * Stop the periodic passes but still allow `flushNow`: a stopping daemon
+   * ends the schedule early and flushes once its agents have stopped, so the
+   * shutdown's own records go too. `stop()` then ends everything.
+   */
+  stopScheduling(): void {
+    this.schedulingStopped = true;
+    this.clearTimers();
+  }
+
   stop(): void {
     this.stopped = true;
+    this.clearTimers();
+  }
+
+  private clearTimers(): void {
     if (this.initialDelayTimer) {
       this.timers.clearTimeout(this.initialDelayTimer);
       this.initialDelayTimer = null;
@@ -374,7 +441,7 @@ export class DaemonTraceBundleUploader {
     // slow, backlogged machine a catch-up chain can still be running when the
     // next interval tick fires; that tick is skipped and the chain carries on
     // (review of #9105, HaoHao).
-    if (this.scheduledPassInFlight) return;
+    if (this.passInFlight) return;
     if (trigger !== "catchup") {
       this.catchupPassesThisInterval = 0;
       if (this.catchupTimer) {
@@ -383,30 +450,120 @@ export class DaemonTraceBundleUploader {
       }
     }
     let result: { uploaded: number; deferred: number };
-    this.scheduledPassInFlight = true;
+    const pass = this.uploadOnce(trigger);
+    this.passInFlight = pass;
     try {
-      result = await this.uploadOnce(trigger);
+      result = await pass;
     } catch {
       return;
     } finally {
-      this.scheduledPassInFlight = false;
+      if (this.passInFlight === pass) this.passInFlight = null;
     }
     const maxCatchup = this.options.maxCatchupPassesPerInterval ?? DEFAULT_MAX_CATCHUP_PASSES_PER_INTERVAL;
-    if (this.stopped || result.deferred === 0 || result.uploaded === 0) return;
+    if (this.halted || result.deferred === 0 || result.uploaded === 0) return;
     if (this.catchupPassesThisInterval >= maxCatchup || this.catchupTimer) return;
     this.catchupPassesThisInterval += 1;
     this.catchupTimer = this.timers.setTimeout(() => {
       this.catchupTimer = null;
-      if (this.stopped) return;
+      if (this.halted) return;
       void this.runScheduledPass("catchup");
     }, this.options.catchupDelayMs ?? DEFAULT_CATCHUP_DELAY_MS);
   }
 
   /**
+   * Flush telemetry now: close the sink's current file and upload, taking the
+   * file just closed regardless of the minimum file age (every other file
+   * keeps that rule: another process may still be writing it).
+   *
+   * Never uploads where a normal pass would not: nothing after `stop()`, in
+   * privacy mode, without a machine credential, or without a receiver; the
+   * per-file receiver choice, receipts and the per-pass file cap are the
+   * normal pass's own. At most one flush per `flushMinIntervalMs` (a call
+   * inside the window does nothing and says so), except `daemon_stop`, which
+   * happens once per process and is bounded by its caller; a call while one
+   * runs joins it. Every call that is not a join records a `daemon.bundle.flush` span.
+   * Never throws.
+   */
+  flushNow(reason: TelemetryFlushReason): Promise<TelemetryFlushResult> {
+    if (this.flushInFlight) return this.flushInFlight;
+    const flight = this.runFlush(reason).finally(() => {
+      if (this.flushInFlight === flight) this.flushInFlight = null;
+    });
+    this.flushInFlight = flight;
+    return flight;
+  }
+
+  private flushSkipReason(reason: TelemetryFlushReason, nowMs: number): TelemetryFlushSkipReason | null {
+    if (this.stopped) return "stopped";
+    if (this.options.privacyMode?.()) return "privacy_mode";
+    if (!this.options.apiKey) return "no_credentials";
+    // The receivers `workerTargetFor` would choose between: this runner's own,
+    // else the machine-level one. With neither, no file could go anywhere.
+    if (!this.options.runnerWorkerUrl?.()?.url && !this.options.workerUrl) return "no_receiver";
+    // Shutdown happens once per process and its caller bounds it, so it is
+    // not rate limited: a start failure flushed a minute earlier must not keep
+    // what was recorded since from leaving on stop.
+    if (reason === "daemon_stop") return null;
+    const minIntervalMs = this.options.flushMinIntervalMs ?? DEFAULT_FLUSH_MIN_INTERVAL_MS;
+    if (this.lastFlushStartedAtMs !== null && nowMs - this.lastFlushStartedAtMs < minIntervalMs) return "rate_limited";
+    return null;
+  }
+
+  private async runFlush(reason: TelemetryFlushReason): Promise<TelemetryFlushResult> {
+    const span = this.options.tracer?.startSpan("daemon.bundle.flush", {
+      surface: "daemon",
+      kind: "internal",
+      attrs: { flush_reason: reason },
+    });
+    try {
+      const nowMs = (this.options.nowMsProvider ?? currentTimeMs)();
+      const skippedReason = this.flushSkipReason(reason, nowMs);
+      if (skippedReason) {
+        span?.end("ok", { attrs: { outcome: "skipped", skipped_reason: skippedReason, uploaded: 0 } });
+        return { outcome: "skipped", skippedReason };
+      }
+      this.lastFlushStartedAtMs = nowMs;
+      // One pass at a time (see `runScheduledPass`): two overlapping passes
+      // would pick the same files and upload them twice. Scheduled ticks that
+      // fire while this flush runs are skipped, as they are behind each other.
+      while (this.passInFlight) await this.passInFlight.catch(() => undefined);
+      // A caller that stopped waiting (the shutdown bound) may have stopped
+      // the uploader meanwhile: nothing is rotated or uploaded after that.
+      if (this.stopped) {
+        span?.end("ok", { attrs: { outcome: "skipped", skipped_reason: "stopped", uploaded: 0 } });
+        return { outcome: "skipped", skippedReason: "stopped" };
+      }
+      const run = (async () => {
+        const rotated = this.options.rotateCurrentFile?.() ?? null;
+        const result = await this.uploadOnce("flush", rotated ? new Set([path.resolve(rotated)]) : undefined);
+        return { rotated: rotated !== null, uploaded: result.uploaded };
+      })();
+      this.passInFlight = run;
+      let outcome: { rotated: boolean; uploaded: number };
+      try {
+        outcome = await run;
+      } finally {
+        if (this.passInFlight === run) this.passInFlight = null;
+      }
+      span?.end("ok", { attrs: { outcome: "flushed", rotated: outcome.rotated, uploaded: outcome.uploaded } });
+      return { outcome: "flushed", ...outcome };
+    } catch (err) {
+      span?.end("error", { attrs: { outcome: "failed", error_class: errorClassOf(err) } });
+      return { outcome: "failed" };
+    }
+  }
+
+  /**
    * Drive a single upload pass. `trigger` is surfaced as a span attribute so
    * we can distinguish startup drain vs steady-state ticks in ScopeDB.
+   *
+   * `forcedFiles` (absolute paths; `flushNow` only) skip the minimum file age
+   * and are taken first, within the per-pass cap.
    */
-  async uploadOnce(trigger: UploadTrigger = "manual"): Promise<{ attempted: number; uploaded: number; deferred: number }> {
+  async uploadOnce(
+    trigger: UploadTrigger = "manual",
+    forcedFiles?: ReadonlySet<string>,
+  ): Promise<{ attempted: number; uploaded: number; deferred: number }> {
     // A span for the PASS, not just for each file. Today a pass that finds
     // nothing emits no span at all, so "scanned and found zero" and "never ran"
     // are the same absence — and #408 is a machine that quietly stopped
@@ -426,8 +583,8 @@ export class DaemonTraceBundleUploader {
     let delivered = false;
     try {
       report = this.options.sinkReportProvider?.drain() ?? null;
-      const { files, readdirFailed } = await this.findUploadCandidates();
-      const considered = selectFilesForPass(files, this.options.maxFilesPerRun ?? DEFAULT_MAX_FILES_PER_RUN);
+      const { files, readdirFailed } = await this.findUploadCandidates(forcedFiles);
+      const considered = selectFilesForFlushOrPass(files, this.options.maxFilesPerRun ?? DEFAULT_MAX_FILES_PER_RUN, forcedFiles);
       const prunedWithoutReceipt = report
         ? await this.countPrunedWithoutReceipt(report.attrDrops.prunedNames ?? [])
         : 0;
@@ -493,19 +650,19 @@ export class DaemonTraceBundleUploader {
   }
 
   private scheduleNextTick(): void {
-    if (this.stopped) return;
+    if (this.halted) return;
     const baseIntervalMs = this.options.intervalMs
       ?? readPositiveIntegerEnv("SLOCK_DAEMON_TRACE_UPLOAD_INTERVAL_MS", DEFAULT_UPLOAD_INTERVAL_MS);
     const nextMs = baseIntervalMs + this.jitter.uploadIntervalJitterMs;
     this.intervalTimer = this.timers.setTimeout(() => {
       this.intervalTimer = null;
-      if (this.stopped) return;
+      if (this.halted) return;
       void this.runScheduledPass("interval");
       this.scheduleNextTick();
     }, nextMs);
   }
 
-  private async findUploadCandidates(): Promise<{ files: string[]; readdirFailed: boolean }> {
+  private async findUploadCandidates(forcedFiles?: ReadonlySet<string>): Promise<{ files: string[]; readdirFailed: boolean }> {
     const traceDir = path.join(this.options.machineDir, "traces");
     let names: string[];
     try {
@@ -533,7 +690,7 @@ export class DaemonTraceBundleUploader {
         // `minAgeMs: 0` means no age check: `Date.now()` is whole
         // milliseconds and `mtimeMs` is not, so a file written in the same
         // millisecond reads as slightly in the future.
-        if (minAgeMs > 0 && now - info.mtimeMs < minAgeMs) continue;
+        if (minAgeMs > 0 && now - info.mtimeMs < minAgeMs && !forcedFiles?.has(path.resolve(file))) continue;
         candidates.push(file);
       } catch {
         // Trace upload must stay fail-open.

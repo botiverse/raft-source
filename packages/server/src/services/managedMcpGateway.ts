@@ -83,6 +83,8 @@ function isManagedMcpLookupBlocked(error: unknown): boolean {
  */
 export type ManagedMcpAuthKind = "none" | "headers" | "oauth";
 
+const MANAGED_MCP_TIMED_OUT_MESSAGE = "MCP request timed out";
+
 export function normalizeManagedMcpClientError(error: unknown, timedOut: boolean, authKind: ManagedMcpAuthKind = "none"): ManagedMcpGatewayError {
   if (error instanceof ManagedMcpGatewayError) return error;
   const endpointRejected = error instanceof StreamableHTTPError && (error.code === 401 || error.code === 403);
@@ -103,7 +105,7 @@ export function normalizeManagedMcpClientError(error: unknown, timedOut: boolean
     );
   }
   return new ManagedMcpGatewayError(
-    timedOut ? "MCP request timed out" : "MCP server could not be reached",
+    timedOut ? MANAGED_MCP_TIMED_OUT_MESSAGE : "MCP server could not be reached",
     "managed_mcp_unreachable",
     { cause: error },
   );
@@ -373,6 +375,67 @@ export function managedMcpOAuthFailureCategory(error: unknown): string | null {
   if (root instanceof OAuthError) return STANDARD_OAUTH_ERROR_CODES.has(root.errorCode) ? root.errorCode : "oauth_error";
   if (root instanceof StreamableHTTPError && Number.isInteger(root.code) && root.code! >= 100 && root.code! <= 599) return `HTTP ${root.code}`;
   return null;
+}
+
+const NETWORK_ERROR_CODE = /^(?:E[A-Z0-9_]{2,31}|UND_ERR_[A-Z0-9_]{1,40})$/u;
+const ERROR_CLASS_NAME = /^[A-Za-z][A-Za-z0-9_]{0,63}$/u;
+const LEADING_HTTP_STATUS = /^HTTP (\d{3})\b/u;
+
+function errorClassName(error: unknown): string {
+  if (!(error instanceof Error)) return "non_error";
+  const ctor = (error as { constructor?: { name?: unknown } }).constructor?.name;
+  if (typeof ctor === "string" && ctor !== "Error" && ERROR_CLASS_NAME.test(ctor)) return ctor;
+  return ERROR_CLASS_NAME.test(error.name) ? error.name : "Error";
+}
+
+function httpStatusOf(error: unknown): number | null {
+  if (error instanceof StreamableHTTPError) {
+    return Number.isInteger(error.code) && error.code! >= 100 && error.code! <= 599 ? error.code! : null;
+  }
+  // The SDK reports OAuth/metadata HTTP failures as `HTTP <status>: ...` / `HTTP <status> trying to ...`;
+  // only the status digits are read, never the rest of the message. A parsed OAuth error other than
+  // the SDK's fallback `ServerError` carries the provider's own description, so it is not read.
+  if (error instanceof OAuthError && !(error instanceof ServerError)) return null;
+  if (error instanceof Error) {
+    const status = Number(LEADING_HTTP_STATUS.exec(error.message)?.[1]);
+    return status >= 100 && status <= 599 ? status : null;
+  }
+  return null;
+}
+
+function networkErrorCode(error: unknown): string | null {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current instanceof Error; depth += 1) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string" && NETWORK_ERROR_CODE.test(code)) return code;
+    current = current.cause;
+  }
+  return null;
+}
+
+/**
+ * Why a managed MCP request failed, as trace attributes from a fixed vocabulary only: the class of
+ * the underlying error, its HTTP status, the standard OAuth error code (a failed token refresh lands
+ * here) and the Node/undici network error code. `managed_mcp_unreachable` alone covers connect
+ * failures, 5xx/429 answers, OAuth refresh failures and timeouts; these tell them apart. Never message
+ * text, URLs or bodies.
+ */
+export function managedMcpFailureTraceAttrs(error: unknown): Record<string, string | number | boolean> {
+  if (!(error instanceof ManagedMcpGatewayError)) return {};
+  const attrs: Record<string, string | number | boolean> = {};
+  if (error.code === "managed_mcp_unreachable") attrs.mcp_timed_out = error.message === MANAGED_MCP_TIMED_OUT_MESSAGE;
+  let root: unknown = error;
+  for (let depth = 0; depth < 5 && root instanceof ManagedMcpGatewayError && root.cause !== undefined; depth += 1) root = root.cause;
+  if (root === error) return attrs;
+  attrs.mcp_cause_class = errorClassName(root);
+  const status = httpStatusOf(root);
+  if (status !== null) attrs.mcp_cause_http_status = status;
+  if (root instanceof OAuthError) {
+    attrs.mcp_cause_oauth_error = STANDARD_OAUTH_ERROR_CODES.has(root.errorCode) ? root.errorCode : "oauth_error";
+  }
+  const network = networkErrorCode(root);
+  if (network) attrs.mcp_cause_network_code = network;
+  return attrs;
 }
 
 async function withClient<T>(

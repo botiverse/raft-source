@@ -1,17 +1,15 @@
 import { ambientProcessEnv } from "../processEnvPatch";
 import { RuntimeExecutableNotFoundError } from "../spawnFailureErrors";
 import { spawn, execFileSync } from "node:child_process";
-import { spawnRuntimeChild } from "./runtimeChild";
 import { codexInstalledExecutableCandidates } from "@botiverse/oar/runtimes/codex/installation-candidates";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ChildProcess } from "node:child_process";
-import { hydrateRuntimeConfig, runtimeConfigToLaunchFields, runtimeModelSourceOutcomeFromSet, type AgentConfig, type RuntimeModelInfo, type RuntimeModelSet, type RuntimeModelSourceOutcome, type Tracer , type AxSurfaceText } from "@botiverse/raft-shared";
+import { CODEX_NON_FAST_SERVICE_TIERS, CODEX_PRIMARY_FAST_SERVICE_TIER, hydrateRuntimeConfig, isRuntimeServiceTierId, runtimeServiceTierText, runtimeConfigToLaunchFields, type RuntimeServiceTierChoice, runtimeModelSourceOutcomeFromSet, type AgentConfig, type RuntimeModelInfo, type RuntimeModelSet, type RuntimeModelSourceOutcome, type AxSurfaceText } from "@botiverse/raft-shared";
 import type { RuntimeDriver, SpawnContext, SpawnResult, ParsedEvent, RuntimeProbeResult, RuntimeProbeUnavailableReason } from "./types";
 import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
 import { codexStateRootCandidates, resolveCodexHomeRootFromEnv } from "./codexHome";
-import { detectNodeHostKind, NodeHostUnavailableError, resolveNodeHostLaunch } from "./nodeHostLaunch";
+import { NodeHostUnavailableError, resolveNodeHostLaunch } from "./nodeHostLaunch";
 import {
   firstExistingPath,
   lookupCommandOnPath,
@@ -24,20 +22,8 @@ import {
 } from "./probe";
 import { killProbeTreeAndSettle, ProbeChildError, runProbeChild } from "./probeChild";
 import { isWindowsBatchFile, resolveWindowsDirectLaunch, resolveWindowsDirectLaunchAsync } from "./windowsLaunch";
-import {
-  CodexEventNormalizer,
-  parseCodexJsonRpcLine,
-  type JsonRpcMessage,
-  type JsonRpcId,
-} from "./codexEventNormalizer";
+import { parseCodexJsonRpcLine, type JsonRpcId, type JsonRpcMessage } from "./codexEventNormalizer";
 import { prepareManagedMcpRuntimeProxy, type ManagedMcpRuntimeEndpoint } from "../managedMcpRuntimeProxy";
-import {
-  buildCodexInstructionShapeAttrs,
-  buildCodexInstructionShapeStaticAttrs,
-  type CodexInstructionObservationPhase,
-  type CodexInstructionShapeStaticAttrs,
-  type CodexThreadRequestMethod,
-} from "./codexInstructionShape";
 
 export { codexBlankFinalAnswerDiagnostic, codexMcpToolName, codexNotificationDiagnostics, parseCodexJsonRpcLine } from "./codexEventNormalizer";
 export { parseCodexTelemetryEvent } from "./codexTelemetrySidecar";
@@ -197,21 +183,6 @@ function codexProbeTimeoutError(explicitOverride: boolean): RuntimeExecutableNot
       `This is not evidence that Codex is missing; Raft checks it again on a start after ${CODEX_PROBE_FAILURE_TTL_MS / 1000} seconds. ` +
       "If it keeps happening, check that `codex app-server --help` runs in a new terminal, then restart Raft Computer.",
   });
-}
-
-function hasNonEmptyCodexTextInput(input: unknown): boolean {
-  return Array.isArray(input) && input.some((item) =>
-    item &&
-    typeof item === "object" &&
-    (item as { type?: unknown }).type === "text" &&
-    typeof (item as { text?: unknown }).text === "string" &&
-    (item as { text: string }).text.length > 0
-  );
-}
-
-function resultTurnId(message: JsonRpcMessage): string | null {
-  const turn = message.result?.turn;
-  return turn && typeof turn.id === "string" ? turn.id : null;
 }
 
 interface CodexSpawnCandidate {
@@ -867,8 +838,10 @@ export function resolveCodexSpawn(commandArgs: string[], deps: ProbeDeps = {}): 
   /** Candidates rejected before this one was picked (automatic discovery). */
   rejectedCandidateCount?: number;
   rejectionKind?: string;
+  /** The picked candidate's `--version` output (first line, e.g. `codex-cli 0.166.0`), when it read. */
+  version?: string;
 } {
-  const { candidate, rejected, explicitOverrideFailed, allRejectionsTimedOut } = resolveCompatibleCodexCandidate(deps);
+  const { candidate, rejected, explicitOverrideFailed, allRejectionsTimedOut, version } = resolveCompatibleCodexCandidate(deps);
   if (candidate) {
     return {
       command: candidate.command,
@@ -878,6 +851,7 @@ export function resolveCodexSpawn(commandArgs: string[], deps: ProbeDeps = {}): 
       ...(candidate.env ? { env: candidate.env } : {}),
       ...(candidate.windowsShim ? { windowsShim: candidate.windowsShim } : {}),
       ...codexRejectionSummary(rejected),
+      ...(version ? { version } : {}),
     };
   }
 
@@ -940,129 +914,6 @@ export function buildCodexAppServerArgs(managedMcp?: { name: string; endpointUrl
   return ["app-server", ...codexManagedMcpConfigArgs(managedMcp), "--listen", "stdio://"];
 }
 
-function isCodexMissingRolloutError(message: string): boolean {
-  return /\bno\s+rollout\s+found\b/i.test(message)
-    || /\bmissing\s+rollout\b/i.test(message)
-    || /\brollout\b.*\b(not found|missing)\b/i.test(message)
-    || /\bthread\b.*\b(not found|missing)\b/i.test(message)
-    || /\bmissing\s+thread\b/i.test(message);
-}
-
-function isCodexThreadWriterBusyError(message: string): boolean {
-  return /\bthread\b.*\balready\s+has\s+an\s+active\s+writer\b/i.test(message)
-    || /\balready\s+has\s+an\s+active\s+writer\b/i.test(message);
-}
-
-// task #14: a thread the user archived in the Codex app refuses resume with
-// "session <id> is archived. Run `codex unarchive <id>` ...".
-function isCodexThreadArchivedError(message: string): boolean {
-  return /\bis\s+archived\b/i.test(message);
-}
-
-type CodexRecoverableResumeErrorKind = "missing_rollout" | "thread_writer_busy" | "archived";
-type CodexResumeRecoverySource =
-  | "codex_resume_missing_rollout"
-  | "codex_resume_thread_writer_busy"
-  | "codex_resume_archived";
-
-export type CodexResumeErrorClassification =
-  | {
-      kind: CodexRecoverableResumeErrorKind;
-      resumeErrorClass: CodexRecoverableResumeErrorKind;
-      recoveryAction: "fallback_fresh_thread";
-      telemetry: Extract<ParsedEvent, { kind: "telemetry" }>;
-      recovery: Extract<ParsedEvent, { kind: "runtime_recovery" }>;
-    }
-  | {
-      kind: "terminal_error";
-      resumeErrorClass: "permission_denied" | "unknown";
-      recoveryAction?: undefined;
-    };
-
-function codexResumeRecoverySource(kind: CodexRecoverableResumeErrorKind): CodexResumeRecoverySource {
-  if (kind === "missing_rollout") return "codex_resume_missing_rollout";
-  if (kind === "archived") return "codex_resume_archived";
-  return "codex_resume_thread_writer_busy";
-}
-
-function codexResumeRecoveryMessage(kind: CodexRecoverableResumeErrorKind): string {
-  if (kind === "thread_writer_busy") {
-    return "Codex could not resume its previous thread because another writer is active; Raft started a fresh Codex thread.";
-  }
-  if (kind === "archived") {
-    return "Codex could not resume its previous thread because it is archived and could not be unarchived; Raft started a fresh Codex thread.";
-  }
-  return "Codex could not resume its previous thread; Raft started a fresh Codex thread.";
-}
-
-function codexResumeRecoveryDetails(): string {
-  return "Use Raft conversation history and local MEMORY.md/notes as the recovery point; do not assume prior Codex thread context is loaded.";
-}
-
-function prependCodexRecoveryNotice(prompt: string, recovery: Extract<ParsedEvent, { kind: "runtime_recovery" }>): string {
-  return `${recovery.message}\n\n${recovery.details}\n\n${prompt}`;
-}
-
-function buildCodexResumeRecovery(
-  kind: CodexRecoverableResumeErrorKind,
-  requestedSessionId?: string,
-): Extract<CodexResumeErrorClassification, { recoveryAction: "fallback_fresh_thread" }> {
-  const source = codexResumeRecoverySource(kind);
-  return {
-    kind,
-    resumeErrorClass: kind,
-    recoveryAction: "fallback_fresh_thread",
-    telemetry: {
-      kind: "telemetry",
-      name: "recovery",
-      source,
-      attrs: {
-        resume_error_class: kind,
-        recovery_action: "fallback_fresh_thread",
-      },
-    },
-    recovery: {
-      kind: "runtime_recovery",
-      source,
-      resumeErrorClass: kind,
-      recoveryAction: "fallback_fresh_thread",
-      message: codexResumeRecoveryMessage(kind),
-      details: codexResumeRecoveryDetails(),
-      ...(requestedSessionId ? { requestedSessionId } : {}),
-    },
-  };
-}
-
-export function classifyCodexResumeError(message: string, requestedSessionId?: string): CodexResumeErrorClassification {
-  if (isCodexThreadArchivedError(message)) {
-    return buildCodexResumeRecovery("archived", requestedSessionId);
-  }
-
-  if (isCodexMissingRolloutError(message)) {
-    return buildCodexResumeRecovery("missing_rollout", requestedSessionId);
-  }
-
-  if (isCodexThreadWriterBusyError(message)) {
-    return buildCodexResumeRecovery("thread_writer_busy", requestedSessionId);
-  }
-
-  if (/\b(no\s+permission|permission\s+denied|forbidden|unauthorized)\b/i.test(message)) {
-    return {
-      kind: "terminal_error",
-      resumeErrorClass: "permission_denied",
-    };
-  }
-
-  return {
-    kind: "terminal_error",
-    resumeErrorClass: "unknown",
-  };
-}
-
-export function codexThreadName(agentName: string | null | undefined): string | null {
-  const trimmed = agentName?.trim();
-  return trimmed ? `Raft · ${trimmed}` : null;
-}
 
 function hasJsonRpcField(message: JsonRpcMessage, field: "result" | "error"): boolean {
   return Object.prototype.hasOwnProperty.call(message, field);
@@ -1072,42 +923,17 @@ function isJsonRpcResponse(message: JsonRpcMessage): boolean {
   return message.id !== undefined && (hasJsonRpcField(message, "result") || hasJsonRpcField(message, "error"));
 }
 
-function isCodexServerRequest(message: JsonRpcMessage): message is JsonRpcMessage & { id: JsonRpcId; method: string } {
-  return message.id !== undefined && typeof message.method === "string" && !isJsonRpcResponse(message);
-}
-
-function payloadBytes(value: unknown): number | undefined {
-  try {
-    return Buffer.byteLength(JSON.stringify(value), "utf8");
-  } catch {
-    return undefined;
-  }
-}
-
-function extractCodexHome(result: unknown): string | null {
-  if (!result || typeof result !== "object") return null;
-  const candidate = (result as { codexHome?: unknown }).codexHome;
-  return typeof candidate === "string" && candidate.trim().length > 0 ? candidate : null;
-}
-
 function isCompatibleInitializeResult(result: unknown): boolean {
   if (!result || typeof result !== "object" || Array.isArray(result)) return false;
   const userAgent = (result as { userAgent?: unknown }).userAgent;
   return typeof userAgent === "string" && userAgent.trim().length > 0;
 }
 
-function unsupportedInitializeResultMessage(): string {
-  return "Codex app-server initialize response is missing the expected userAgent handshake field; upgrade Codex CLI to a compatible app-server build.";
-}
-
-export type CodexThreadRequest = { method: "thread/start" | "thread/resume"; params: Record<string, any> };
-
 /**
  * What a Codex app-server launch needs before its child exists: the CLI
  * transport env, the managed MCP endpoint (its URL in argv, its token in the
  * env only), the resolved command, and the env the app-server itself gets.
- * The legacy driver spawns from it; the OAR host's Codex launch reuses it, so
- * both hosts start the same app-server (#wg-ax:#3).
+ * Prepared for the OAR host's Codex launch (`agentHost/oarCodexLaunch.ts`).
  */
 export interface CodexLaunchPreparation {
   /** The CLI transport env (discovery probes run with it, without the MCP token). */
@@ -1126,6 +952,8 @@ export interface CodexLaunchPreparation {
   candidateEnv: NodeJS.ProcessEnv | undefined;
   /** Windows: the `.cmd` shim the command was resolved from, if any (the OAR host launches it). */
   windowsShim: string | undefined;
+  /** The picked Codex's `--version` output, when it read: the OAR installation's version (its capability answer depends on it). */
+  version?: string;
   /** The env the app-server child gets: the candidate's (or the transport's) plus the managed MCP token. */
   appServerEnv: NodeJS.ProcessEnv;
   codexHomeRoot: string | null;
@@ -1164,7 +992,7 @@ export async function prepareCodexLaunch(ctx: SpawnContext): Promise<CodexLaunch
   // task #1277: candidate discovery and the app-server probes run as bounded
   // probe children under this start attempt's signal; a cancelled lookup is
   // rethrown, never a verdict, and nothing is written to the probe cache.
-  const { command, args, shell, source, env, windowsShim, rejectedCandidateCount, rejectionKind } = await resolveCodexSpawnAsync(appServerArgs, { env: spawnEnv, signal: ctx.launchSignal });
+  const { command, args, shell, source, env, windowsShim, rejectedCandidateCount, rejectionKind, version } = await resolveCodexSpawnAsync(appServerArgs, { env: spawnEnv, signal: ctx.launchSignal });
   return {
     spawnEnv,
     managedMcp,
@@ -1177,6 +1005,7 @@ export async function prepareCodexLaunch(ctx: SpawnContext): Promise<CodexLaunch
     rejectionKind,
     candidateEnv: env,
     windowsShim,
+    ...(version ? { version } : {}),
     // Only the app-server itself needs the token, not the discovery probes.
     appServerEnv: withCodexManagedMcpToken(env ?? spawnEnv, managedMcp),
     codexHomeRoot,
@@ -1185,8 +1014,7 @@ export async function prepareCodexLaunch(ctx: SpawnContext): Promise<CodexLaunch
 
 /**
  * What Raft decides about a Codex thread, before any wire shape: the OAR
- * host's Codex launch maps these to OAR's session options, the legacy driver
- * to its JSON-RPC params (buildCodexThreadRequest).
+ * host's Codex launch (`agentHost/oarCodexLaunch.ts`) maps these to OAR's session options.
  */
 export interface CodexThreadFields {
   cwd: string;
@@ -1196,6 +1024,11 @@ export interface CodexThreadFields {
   reasoningEffort?: string;
   /** Raft's mode decides the tier on start and resume alike (#11175). */
   fast: boolean;
+  /**
+   * #wg-runtime-form:#27: the fast tier the person chose when the model lists
+   * more than one (`ultrafast`); absent for the primary fast tier.
+   */
+  serviceTier?: string;
   /** The thread to resume; absent for a fresh thread. */
   resumeThreadId?: string;
 }
@@ -1208,58 +1041,22 @@ export function codexThreadFields(ctx: Pick<SpawnContext, "workingDirectory" | "
     ...(launchRuntimeFields.model ? { model: launchRuntimeFields.model } : {}),
     ...(launchRuntimeFields.reasoningEffort ? { reasoningEffort: launchRuntimeFields.reasoningEffort } : {}),
     fast: launchRuntimeFields.mode.kind === "fast",
+    ...(launchRuntimeFields.mode.kind === "fast" && launchRuntimeFields.mode.serviceTier
+      ? { serviceTier: launchRuntimeFields.mode.serviceTier }
+      : {}),
     ...(ctx.config.sessionId ? { resumeThreadId: ctx.config.sessionId } : {}),
   };
 }
 
-export function buildCodexThreadRequest(ctx: Pick<SpawnContext, "workingDirectory" | "standingPrompt" | "config">): CodexThreadRequest {
-  // We pass the standing prompt as `developerInstructions` (additive, injected
-  // as a developer-role message per turn) rather than `baseInstructions`
-  // (replaces Codex's default base). Resume works because we always re-send
-  // on start/resume. Compaction/session-level persistence is less certain
-  // than `baseInstructions` and needs follow-up validation.
-  const fields = codexThreadFields(ctx);
-  const threadParams: Record<string, any> = {
-    cwd: fields.cwd,
-    approvalPolicy: "never",
-    sandbox: "danger-full-access",
-    sandbox_mode: "danger-full-access",
-    developerInstructions: fields.developerInstructions,
-    // Raw response items are used only as payload-free liveness signals in
-    // the daemon. They replace the previous transcript-mtime heuristic.
-    experimentalRawEvents: true,
-  };
-  if (fields.model) {
-    threadParams.model = fields.model;
-  }
-  if (fields.reasoningEffort) {
-    threadParams.config = { model_reasoning_effort: fields.reasoningEffort };
-  }
-  // Codex 0.164+ resumes with the tier saved in the session when none is sent
-  // (a session started fast stayed fast after fast mode was turned off), and a
-  // fresh start would follow a tier set in the Codex config. `null` clears it
-  // to the default tier (an explicit clear in the 0.163 and 0.164 protocol).
-  threadParams.serviceTier = fields.fast ? "fast" : null;
 
-  if (fields.resumeThreadId) {
-    return {
-      method: "thread/resume",
-      params: {
-        threadId: fields.resumeThreadId,
-        ...threadParams,
-        // Resume model context without returning history the daemon does not consume.
-        excludeTurns: true,
-      },
-    };
-  }
-
-  return {
-    method: "thread/start",
-    params: threadParams,
-  };
-}
-
+/**
+ * Codex runs exclusively on the OAR host (`agentHost/oarCodexLaunch.ts`).
+ * This driver shell provides installation probing, model detection, and the
+ * standing prompt while `oarOnly = true` ensures the router never sends a
+ * Codex start to the legacy host.
+ */
 export class CodexDriver implements RuntimeDriver {
+  readonly oarOnly = true as const;
   readonly id = "codex";
   readonly lifecycle = {
     kind: "persistent",
@@ -1273,18 +1070,15 @@ export class CodexDriver implements RuntimeDriver {
   readonly stdoutChannel = "structured_protocol" as const;
   readonly session = {
     recovery: "resume_or_fresh",
-    // CodexEventNormalizer emits the compaction events.
     compaction: "reported",
     compactionFailure: "does_not_stick",
   } as const;
   readonly model = {
     detectedModelsVerifiedAs: "launchable",
-    toLaunchSpec: (modelId: string) => ({ params: { model: modelId } }),
   } as const;
   readonly startupReadiness = "initial_turn" as const;
-  readonly requiresSessionInitForDelivery = true as const;
-  readonly supportsStdinNotification = true;
-  readonly busyDeliveryMode = "direct" as const;
+  readonly supportsStdinNotification = false;
+  readonly busyDeliveryMode = "none" as const;
   readonly supportsNativeStandingPrompt = true;
   // A sub-agent that finishes after the turn ended is queued for the next turn, never woken.
   readonly needsWakeAfterSubagents = true;
@@ -1297,665 +1091,23 @@ export class CodexDriver implements RuntimeDriver {
     return probeCodex();
   }
 
-  buildThreadRequest(ctx: SpawnContext): CodexThreadRequest {
-    return buildCodexThreadRequest(ctx);
+  spawn(_ctx: SpawnContext): SpawnResult {
+    throw new Error("Codex runs only on the OAR host; the legacy host must never start it");
   }
 
-  private process: ChildProcess | null = null;
-  private requestId = 0;
-  private pendingInitialPrompt: string | null = null;
-  private initializeRequestId: JsonRpcId | null = null;
-  private pendingThreadRequest: CodexThreadRequest | null = null;
-  private pendingThreadRequestId: JsonRpcId | null = null;
-  private pendingThreadRequestMethod: "thread/start" | "thread/resume" | null = null;
-  private lastThreadRequestMethod: "thread/start" | "thread/resume" | null = null;
-  private pendingResumeFallbackParams: Record<string, any> | null = null;
-  private pendingResumeThreadId: string | null = null;
-  private pendingResumeParams: Record<string, unknown> | null = null;
-  // task #14: one unarchive attempt per spawn; the retried resume (or the
-  // fresh-thread fallback when unarchive fails) waits on this request.
-  private archivedUnarchiveAttempted = false;
-  private pendingUnarchive: {
-    requestId: JsonRpcId;
-    resumeParams: Record<string, unknown>;
-    freshParams: Record<string, unknown>;
-    classification: Extract<CodexResumeErrorClassification, { recoveryAction: "fallback_fresh_thread" }>;
-  } | null = null;
-  // task #14: "Raft · <agent>" so Raft threads are recognisable in the Codex
-  // app sidebar; responses are ignored (older app-servers lack the method).
-  private threadName: string | null = null;
-  private threadNameRequestIds = new Set<JsonRpcId>();
-  private pendingInitialTurnRequestId: JsonRpcId | null = null;
-  private pendingInitialTurnInput: unknown = null;
-  private pendingDeliveryRequests = new Map<JsonRpcId, { method: "turn/start" | "turn/steer"; input: unknown; turnId: string | null }>();
-  private initialTurnStarted = false;
-  private normalizer = new CodexEventNormalizer();
-  private codexHomeRoot: string | null = null;
-  private spawnWorkingDirectory: string | null = null;
-  private managedMcpServerName: string | null = null;
-  private managedMcpReady = true;
-  private managedMcpStatus: Extract<ParsedEvent, { kind: "runtime_tooling" }>["managedMcpStatus"] = "not_configured";
-  private instructionShapeTracer: Tracer | null = null;
-  private instructionShapeIdentityAttrs: Record<string, unknown> = {};
-  private instructionShapeConfiguredSessionId: string | null = null;
-  private instructionShapeStandingInstructions: unknown = undefined;
-  private instructionShapeStaticAttrs: CodexInstructionShapeStaticAttrs | null = null;
-  private instructionShapeRequestAttrs: Record<string, string | number | boolean> | null = null;
-  private instructionShapeCompactionStarts = 0;
-  private instructionShapeCompactionFinishes = 0;
-  private instructionShapePostCompactionRequestPending = false;
-
-  get currentRuntimeHomeDir(): string | null {
-    return this.codexHomeRoot;
+  parseLine(_line: string): ParsedEvent[] {
+    return [];
   }
 
-  async spawn(ctx: SpawnContext): Promise<SpawnResult> {
-    const launch = await prepareCodexLaunch(ctx);
-    const { managedMcp } = launch;
-
-    this.process = null;
-    this.requestId = 0;
-    this.pendingInitialPrompt = ctx.prompt;
-    this.initializeRequestId = null;
-    this.pendingThreadRequest = null;
-    this.pendingThreadRequestId = null;
-    this.pendingThreadRequestMethod = null;
-    this.lastThreadRequestMethod = null;
-    this.pendingResumeFallbackParams = null;
-    this.pendingResumeThreadId = null;
-    this.pendingResumeParams = null;
-    this.archivedUnarchiveAttempted = false;
-    this.pendingUnarchive = null;
-    this.threadName = codexThreadName(ctx.config.displayName || ctx.config.name);
-    this.threadNameRequestIds.clear();
-    this.pendingInitialTurnRequestId = null;
-    this.pendingInitialTurnInput = null;
-    this.pendingDeliveryRequests.clear();
-    this.initialTurnStarted = false;
-    this.normalizer.reset();
-    this.spawnWorkingDirectory = ctx.workingDirectory;
-    this.managedMcpServerName = managedMcp?.name ?? null;
-    this.managedMcpReady = !managedMcp;
-    this.managedMcpStatus = managedMcp ? "pending" : "not_configured";
-    this.instructionShapeTracer = ctx.tracer ?? null;
-    this.instructionShapeIdentityAttrs = {
-      agent_id: ctx.agentId,
-      server_id: ctx.config.runtimeContext?.serverId,
-      machine_id: ctx.config.runtimeContext?.machineId,
-      launch_id: ctx.launchId || undefined,
-      process_instance_id: ctx.processInstanceId || undefined,
-      runtime: ctx.config.runtime,
-      runtime_version: ctx.config.runtimeContext?.daemonVersion,
-    };
-    this.instructionShapeConfiguredSessionId = ctx.config.sessionId || null;
-    this.instructionShapeStandingInstructions = this.instructionShapeTracer
-      ? ctx.standingPrompt
-      : undefined;
-    this.instructionShapeStaticAttrs = null;
-    this.instructionShapeRequestAttrs = null;
-    this.instructionShapeCompactionStarts = 0;
-    this.instructionShapeCompactionFinishes = 0;
-    this.instructionShapePostCompactionRequestPending = false;
-    this.codexHomeRoot = launch.codexHomeRoot;
-    const { command, args: spawnArgs, shell, candidateEnv, appServerEnv } = launch;
-    const launchSpan = ctx.tracer?.startSpan("daemon.runtime.node_host_launch", {
-      surface: "daemon",
-      kind: "internal",
-      attrs: {
-        agentId: ctx.agentId,
-        launchId: ctx.launchId || undefined,
-        runtime: this.id,
-        ...codexCandidateTraceAttrs(launch),
-        // Reports the host we actually detected. The previous attribute was
-        // `exec_path_is_node: !versions.electron`, which inferred "is node"
-        // from "is not Electron" — so on the official SEA installs, where
-        // execPath is the bundled app and cannot run a JS entry, it reported
-        // that the exec path WAS node. The one shape most likely to be broken
-        // was the one it called healthy.
-        host_kind: detectNodeHostKind(),
-        electron_run_as_node: candidateEnv?.ELECTRON_RUN_AS_NODE === "1",
-      },
-    });
-    // task #365: after the last await, right before the child exists.
-    ctx.assertLaunchCurrent?.();
-    // A start stopped while the candidate search ran must not create a child.
-    if (ctx.launchSignal?.aborted) throw new ProbeChildError("codex launch cancelled before the child was created", { code: "ABORT_ERR" });
-    let proc: ChildProcess;
-    try {
-      proc = spawnRuntimeChild(command, spawnArgs, {
-        cwd: ctx.workingDirectory,
-        stdio: ["pipe", "pipe", "pipe"],
-        env: appServerEnv,
-        shell,
-      });
-      launchSpan?.end("ok");
-    } catch (error) {
-      launchSpan?.end("error", {
-        attrs: { error_class: error instanceof Error ? error.name : "Error" },
-      });
-      throw error;
-    }
-
-    this.process = proc;
-
-    queueMicrotask(() => {
-      this.initializeRequestId = this.sendRequest("initialize", {
-        clientInfo: { name: "slock-daemon", version: "1.0.0" },
-        capabilities: { experimentalApi: true },
-      });
-
-      this.pendingThreadRequest = this.buildThreadRequest(ctx);
-    });
-
-    return { process: proc };
+  encodeStdinMessage(_message: string): string | null {
+    return null;
   }
-
-  parseLine(line: string): ParsedEvent[] {
-    const message = parseCodexJsonRpcLine(line);
-    if (!message) {
-      return [];
-    }
-
-    const events: ParsedEvent[] = [];
-    if (isCodexServerRequest(message)) {
-      this.sendErrorResponse(
-        message.id,
-        `Codex app-server request "${message.method}" is not supported by the non-interactive Raft daemon`,
-      );
-      return events;
-    }
-
-    const isResponse = isJsonRpcResponse(message);
-    if (isResponse && hasJsonRpcField(message, "result")) {
-      if (message.id === this.initializeRequestId) {
-        if (!isCompatibleInitializeResult(message.result)) {
-          this.initializeRequestId = null;
-          this.pendingThreadRequest = null;
-          this.pendingThreadRequestId = null;
-          this.pendingThreadRequestMethod = null;
-          this.pendingResumeFallbackParams = null;
-          this.pendingResumeThreadId = null;
-          this.instructionShapeStandingInstructions = undefined;
-          events.push({
-            kind: "error",
-            message: unsupportedInitializeResultMessage(),
-            startupRequestMethod: "initialize",
-          });
-          return events;
-        }
-        const codexHome = extractCodexHome(message.result);
-        if (codexHome) {
-          this.codexHomeRoot = path.resolve(this.spawnWorkingDirectory ?? process.cwd(), codexHome);
-        }
-        this.initializeRequestId = null;
-        this.sendNotification("initialized", {});
-        if (this.pendingThreadRequest) {
-          const appServerUserAgent = (message.result as { userAgent?: unknown }).userAgent;
-          this.sendThreadRequest(
-            this.pendingThreadRequest.method,
-            this.pendingThreadRequest.params,
-            appServerUserAgent,
-          );
-          this.pendingThreadRequest = null;
-        }
-        return events;
-      }
-    }
-
-    if (isResponse && hasJsonRpcField(message, "error") && message.id === this.initializeRequestId) {
-      this.initializeRequestId = null;
-      this.pendingThreadRequest = null;
-      this.pendingThreadRequestId = null;
-      this.pendingThreadRequestMethod = null;
-      this.pendingResumeFallbackParams = null;
-      this.pendingResumeThreadId = null;
-      this.instructionShapeStandingInstructions = undefined;
-      events.push({
-        kind: "error",
-        message: message.error?.message || "Codex app-server request failed",
-        startupRequestMethod: "initialize",
-      });
-      return events;
-    }
-
-    if (isResponse && message.id !== undefined && this.threadNameRequestIds.delete(message.id)) {
-      return events;
-    }
-
-    if (isResponse && this.pendingUnarchive && message.id === this.pendingUnarchive.requestId) {
-      const { resumeParams, freshParams, classification } = this.pendingUnarchive;
-      this.pendingUnarchive = null;
-      if (hasJsonRpcField(message, "error")) {
-        events.push(classification.telemetry);
-        events.push(classification.recovery);
-        if (this.pendingInitialPrompt) {
-          this.pendingInitialPrompt = prependCodexRecoveryNotice(this.pendingInitialPrompt, classification.recovery);
-        }
-        this.sendThreadRequest("thread/start", freshParams);
-        return events;
-      }
-      events.push({
-        kind: "telemetry",
-        name: "recovery",
-        source: "codex_resume_unarchived",
-        attrs: {
-          resume_error_class: "archived",
-          recovery_action: "unarchive_resume",
-        },
-      });
-      this.sendThreadRequest("thread/resume", resumeParams);
-      return events;
-    }
-
-    if (isResponse && message.id === this.pendingThreadRequestId) {
-      if (hasJsonRpcField(message, "error")) {
-        const errorMessage = message.error?.message || "Codex app-server request failed";
-        const requestMethod = this.pendingThreadRequestMethod;
-        const resumeErrorClassification = requestMethod === "thread/resume"
-          ? classifyCodexResumeError(errorMessage, this.pendingResumeThreadId || undefined)
-          : null;
-        if (
-          resumeErrorClassification?.kind === "archived"
-          && resumeErrorClassification.recoveryAction === "fallback_fresh_thread"
-          && !this.archivedUnarchiveAttempted
-          && this.pendingResumeThreadId
-          && this.pendingResumeParams
-          && this.pendingResumeFallbackParams
-        ) {
-          // task #14: the user archived this thread in the Codex app. Unarchive
-          // and resume it so the agent keeps its context (the thread reappears
-          // in the sidebar); start fresh only if unarchive fails.
-          this.archivedUnarchiveAttempted = true;
-          this.pendingUnarchive = {
-            requestId: this.sendRequest("thread/unarchive", { threadId: this.pendingResumeThreadId }),
-            resumeParams: this.pendingResumeParams,
-            freshParams: this.pendingResumeFallbackParams,
-            classification: resumeErrorClassification,
-          };
-          this.pendingThreadRequestId = null;
-          return events;
-        }
-        if (
-          this.pendingResumeFallbackParams &&
-          resumeErrorClassification?.recoveryAction === "fallback_fresh_thread"
-        ) {
-          events.push(resumeErrorClassification.telemetry);
-          events.push(resumeErrorClassification.recovery);
-          if (this.pendingInitialPrompt) {
-            this.pendingInitialPrompt = prependCodexRecoveryNotice(
-              this.pendingInitialPrompt,
-              resumeErrorClassification.recovery,
-            );
-          }
-          this.sendThreadRequest("thread/start", this.pendingResumeFallbackParams);
-          this.pendingResumeFallbackParams = null;
-          return events;
-        }
-
-        this.pendingThreadRequestId = null;
-        this.pendingThreadRequestMethod = null;
-        this.pendingResumeFallbackParams = null;
-        this.pendingResumeThreadId = null;
-        events.push(requestMethod
-          ? { kind: "error", message: errorMessage, startupRequestMethod: requestMethod }
-          : { kind: "error", message: errorMessage });
-        return events;
-      }
-
-      const requestMethod = this.pendingThreadRequestMethod;
-      this.pendingThreadRequestId = null;
-      this.pendingThreadRequestMethod = null;
-      this.pendingResumeFallbackParams = null;
-      this.pendingResumeThreadId = null;
-      this.pendingResumeParams = null;
-      if (requestMethod) {
-        events.push(this.runtimeToolingObservation(requestMethod));
-      }
-      this.nameThreadIfUnnamed(message.result);
-    }
-
-    if (isResponse && message.id === this.pendingInitialTurnRequestId) {
-      this.pendingInitialTurnRequestId = null;
-      if (hasJsonRpcField(message, "error")) {
-        events.push({
-          kind: "error",
-          message: message.error?.message || "Codex app-server request failed",
-          startupRequestMethod: "turn/start",
-        });
-      } else {
-        if (hasNonEmptyCodexTextInput(this.pendingInitialTurnInput)) {
-          this.normalizer.markNonEmptyTurnInput(resultTurnId(message));
-        }
-        this.pendingInitialPrompt = null;
-      }
-      this.pendingInitialTurnInput = null;
-      return events;
-    }
-
-    if (isResponse && message.id !== undefined && this.pendingSubagentInterruptRequests.delete(message.id)) {
-      // A refused sub-agent stop leaves that sub-agent running; nothing else to do.
-      return events;
-    }
-
-    if (isResponse && message.id !== undefined && this.pendingInterruptRequests.delete(message.id)) {
-      // A refused interrupt leaves the turn running: the daemon's interrupt
-      // timeout restarts the runtime (daemon.agent.turn_interrupt.native_fallback).
-      return events;
-    }
-
-    if (isResponse && message.id !== undefined && this.pendingDeliveryRequests.has(message.id)) {
-      const deliveryRequest = this.pendingDeliveryRequests.get(message.id)!;
-      this.pendingDeliveryRequests.delete(message.id);
-      if (hasJsonRpcField(message, "error")) {
-        const params = message.error ?? {};
-        events.push({
-          kind: "delivery_error",
-          message: message.error?.message || "Codex app-server request failed",
-          requestMethod: deliveryRequest.method,
-          source: "codex_app_server_response",
-          payloadBytes: payloadBytes(params),
-        });
-      } else if (hasNonEmptyCodexTextInput(deliveryRequest.input)) {
-        this.normalizer.markNonEmptyTurnInput(deliveryRequest.turnId ?? resultTurnId(message));
-      }
-      return events;
-    }
-
-    if (
-      message.method === "mcpServer/startupStatus/updated"
-      && message.params?.name === this.managedMcpServerName
-    ) {
-      const status = message.params?.status;
-      if (status === "ready") {
-        this.managedMcpReady = true;
-        this.managedMcpStatus = "ready";
-        if (this.lastThreadRequestMethod) {
-          events.push(this.runtimeToolingObservation(this.lastThreadRequestMethod));
-        }
-        this.startInitialTurn();
-      } else if (status === "failed" || status === "cancelled") {
-        this.managedMcpReady = true;
-        this.managedMcpStatus = "failed";
-        if (this.lastThreadRequestMethod) {
-          events.push(this.runtimeToolingObservation(this.lastThreadRequestMethod));
-        }
-        this.startInitialTurn();
-      }
-      return events;
-    }
-
-    const result = this.normalizer.normalizeMessage(message);
-    if (result.turnStarted) {
-      this.pendingInitialPrompt = null;
-    }
-    if (result.threadReady) {
-      this.startInitialTurn();
-    }
-    this.observeInstructionShapeCompactionEvents(result.events);
-    return [...events, ...result.events];
-  }
-
-  get currentSessionId(): string | null {
-    return this.normalizer.threadId;
-  }
-
-  get hasLiveTurn(): boolean {
-    return this.normalizer.hasLiveTurn;
-  }
-
-  encodeStdinMessage(
-    text: string,
-    _sessionId: string | null,
-    opts?: { mode?: "idle" | "busy" },
-  ): string | null {
-    if (!this.normalizer.threadId) return null;
-
-    const mode = opts?.mode || "busy";
-    if (mode === "busy") {
-      if (!this.normalizer.canSteerBusy) return null;
-      const id = this.nextRequestId();
-      const input = [{ type: "text", text }];
-      const turnId = this.normalizer.activeTurnId;
-      this.pendingDeliveryRequests.set(id, { method: "turn/steer", input, turnId });
-      return JSON.stringify({
-        jsonrpc: "2.0",
-        id,
-        method: "turn/steer",
-        params: {
-          threadId: this.normalizer.threadId,
-          expectedTurnId: this.normalizer.activeTurnId,
-          input,
-        },
-      });
-    }
-
-    const id = this.nextRequestId();
-    const input = [{ type: "text", text }];
-    this.pendingDeliveryRequests.set(id, { method: "turn/start", input, turnId: null });
-    const encoded = JSON.stringify({
-      jsonrpc: "2.0",
-      id,
-      method: "turn/start",
-      params: {
-        threadId: this.normalizer.threadId,
-        input,
-      },
-    });
-    this.observePostCompactionFirstRequest("turn/start");
-    return encoded;
-  }
-
-  /**
-   * Codex's native `turn/interrupt` for the running turn. Codex answers with
-   * `turn/completed` status `interrupted`; the daemon falls back to a restart
-   * when no turn has started yet or the turn does not end in time.
-   */
-  encodeInterruptRequest(): string | null {
-    // Codex leaves the interrupted command running and the daemon cannot kill a
-    // turn's processes on Windows, so a Stop there keeps restarting the runtime.
-    if (process.platform === "win32") return null;
-    const threadId = this.normalizer.threadId;
-    const turnId = this.normalizer.activeTurnId;
-    if (!threadId || !turnId) return null;
-    this.normalizer.noteInterruptRequested();
-    const id = this.nextRequestId();
-    this.pendingInterruptRequests.add(id);
-    return JSON.stringify({ jsonrpc: "2.0", id, method: "turn/interrupt", params: { threadId, turnId } });
-  }
-
-  private readonly pendingInterruptRequests = new Set<JsonRpcId>();
-
-  /**
-   * #proj-runtime:#41: `turn/interrupt` for one sub-agent's running turn.
-   * Verified on Codex 0.166: that thread's turn ends `interrupted`; the
-   * agent's turn and its other sub-agents carry on. Its answer is ignored.
-   */
-  encodeSubagentInterruptRequest(subagentTaskId: string): string | null {
-    const turn = this.normalizer.runningSubagentTurn(subagentTaskId);
-    if (!turn) return null;
-    const id = this.nextRequestId();
-    this.pendingSubagentInterruptRequests.add(id);
-    return JSON.stringify({ jsonrpc: "2.0", id, method: "turn/interrupt", params: turn });
-  }
-
-  private readonly pendingSubagentInterruptRequests = new Set<JsonRpcId>();
 
   buildSystemPrompt(config: AgentConfig, _agentId: string): AxSurfaceText {
     return buildCliTransportSystemPrompt(config, {
       extraCriticalRules: [],
       supportsSubagents: this.supportsSubagents,
     });
-  }
-
-  private nextRequestId(): number {
-    this.requestId += 1;
-    return this.requestId;
-  }
-
-  private startInitialTurn() {
-    if (!this.managedMcpReady || this.initialTurnStarted || this.pendingInitialTurnRequestId !== null || !this.pendingInitialPrompt || !this.normalizer.threadId) return;
-    this.initialTurnStarted = true;
-    const prompt = this.pendingInitialPrompt;
-    const input = [{ type: "text", text: prompt }];
-    this.pendingInitialTurnInput = input;
-    this.pendingInitialTurnRequestId = this.sendRequest("turn/start", {
-      threadId: this.normalizer.threadId,
-      input,
-    });
-  }
-
-  private sendRequest(method: string, params: Record<string, any>): JsonRpcId {
-    const id = this.nextRequestId();
-    this.process?.stdin?.write(JSON.stringify({
-      jsonrpc: "2.0",
-      id,
-      method,
-      params,
-    }) + "\n");
-    this.observePostCompactionFirstRequest(method);
-    return id;
-  }
-
-  /** Names the thread unless it already has a name (the user's rename wins). */
-  private nameThreadIfUnnamed(result: unknown): void {
-    if (!this.threadName) return;
-    const thread = (result as { thread?: { id?: unknown; name?: unknown } } | null)?.thread;
-    const threadId = typeof thread?.id === "string" ? thread.id : null;
-    if (!threadId) return;
-    if (typeof thread?.name === "string" && thread.name.trim()) return;
-    this.threadNameRequestIds.add(this.sendRequest("thread/name/set", { threadId, name: this.threadName }));
-  }
-
-  private sendErrorResponse(id: JsonRpcId, message: string) {
-    this.process?.stdin?.write(JSON.stringify({
-      jsonrpc: "2.0",
-      id,
-      error: {
-        code: -32601,
-        message,
-      },
-    }) + "\n");
-  }
-
-  private sendThreadRequest(
-    method: CodexThreadRequestMethod,
-    params: Record<string, any>,
-    appServerUserAgent?: unknown,
-  ): JsonRpcId {
-    const id = this.sendRequest(method, params);
-    this.recordInstructionShape(
-      "thread_request_sent",
-      method,
-      { params, appServerUserAgent },
-    );
-    this.pendingThreadRequestId = id;
-    this.pendingThreadRequestMethod = method;
-    this.lastThreadRequestMethod = method;
-    this.pendingResumeFallbackParams = null;
-    this.pendingResumeThreadId = null;
-    this.pendingResumeParams = null;
-    if (method === "thread/resume") {
-      this.pendingResumeParams = params;
-      // excludeTurns only applies to resume; do not forward it to thread/start.
-      const { threadId: _threadId, excludeTurns: _excludeTurns, ...freshParams } = params;
-      this.pendingResumeFallbackParams = freshParams;
-      this.pendingResumeThreadId = typeof _threadId === "string" && _threadId.trim()
-        ? _threadId.trim()
-        : null;
-    }
-    return id;
-  }
-
-  private recordInstructionShape(
-    observationPhase: CodexInstructionObservationPhase,
-    requestMethod: CodexThreadRequestMethod,
-    fresh?: { params: Record<string, unknown>; appServerUserAgent?: unknown },
-  ): void {
-    if (!this.instructionShapeTracer) return;
-
-    if (fresh) {
-      if (!this.instructionShapeStaticAttrs) {
-        this.instructionShapeStaticAttrs = buildCodexInstructionShapeStaticAttrs({
-          standingInstructions: this.instructionShapeStandingInstructions,
-          appServerUserAgent: fresh.appServerUserAgent,
-        });
-        this.instructionShapeStandingInstructions = undefined;
-      }
-      this.instructionShapeRequestAttrs = buildCodexInstructionShapeAttrs({
-        staticAttrs: this.instructionShapeStaticAttrs,
-        requestParams: fresh.params,
-        requestMethod,
-        observationPhase,
-        compactionStarts: this.instructionShapeCompactionStarts,
-        compactionFinishes: this.instructionShapeCompactionFinishes,
-      });
-    }
-    if (!this.instructionShapeRequestAttrs) return;
-
-    const sessionId = this.normalizer.threadId || this.instructionShapeConfiguredSessionId;
-    this.instructionShapeTracer.emitEvent("daemon.codex.request_instruction_shape", {
-      surface: "daemon",
-      attrs: {
-        ...this.instructionShapeIdentityAttrs,
-        session_id: sessionId || undefined,
-        session_id_present: Boolean(sessionId),
-        ...this.instructionShapeRequestAttrs,
-        observation_phase: observationPhase,
-        session_request_method: requestMethod,
-        compaction_starts_count: this.instructionShapeCompactionStarts,
-        compaction_finishes_count: this.instructionShapeCompactionFinishes,
-        status: "ok",
-      },
-    });
-  }
-
-  private observeInstructionShapeCompactionEvents(events: ParsedEvent[]): void {
-    if (!this.lastThreadRequestMethod) return;
-    for (const event of events) {
-      if (event.kind === "compaction_started") {
-        this.instructionShapeCompactionStarts += 1;
-        this.recordInstructionShape("compaction_started", this.lastThreadRequestMethod);
-      } else if (event.kind === "compaction_finished") {
-        this.instructionShapeCompactionFinishes += 1;
-        this.instructionShapePostCompactionRequestPending = true;
-        this.recordInstructionShape("compaction_finished", this.lastThreadRequestMethod);
-      }
-    }
-  }
-
-  private observePostCompactionFirstRequest(method: string): void {
-    if (
-      method !== "turn/start"
-      || !this.instructionShapePostCompactionRequestPending
-      || !this.lastThreadRequestMethod
-    ) return;
-    this.instructionShapePostCompactionRequestPending = false;
-    this.recordInstructionShape("post_compaction_first_request", this.lastThreadRequestMethod);
-  }
-
-  private runtimeToolingObservation(
-    sessionRequestMethod: "thread/start" | "thread/resume",
-  ): Extract<ParsedEvent, { kind: "runtime_tooling" }> {
-    return {
-      kind: "runtime_tooling",
-      source: "codex_app_server",
-      sessionRequestMethod,
-      // The current app-server handshake does not report the built-in tool
-      // inventory. Preserve that negative fact instead of inferring exposure
-      // from a successful resume or from later model behavior.
-      nativeToolInventoryObservation: "unreported_by_app_server",
-      cliTransportConfigured: true,
-      managedMcpConfigured: this.managedMcpServerName !== null,
-      managedMcpStatus: this.managedMcpStatus,
-    };
-  }
-
-  private sendNotification(method: string, params: Record<string, any>) {
-    this.process?.stdin?.write(JSON.stringify({
-      jsonrpc: "2.0",
-      method,
-      params,
-    }) + "\n");
   }
 
   async detectModels(): Promise<RuntimeModelSourceOutcome> {
@@ -2028,6 +1180,27 @@ function codexServiceTierIds(value: unknown): string[] {
   });
 }
 
+/**
+ * #wg-runtime-form:#27: the fast tiers this model offers, by name, from
+ * Codex's `serviceTiers` objects (`{ id, name, description }`; the `default`
+ * opt-out and the slower `flex` are not fast tiers). Reported because this Computer launches the
+ * chosen one (`mode.serviceTier`); the primary tier (`priority`) first.
+ */
+function codexServiceTierChoices(value: unknown): RuntimeServiceTierChoice[] {
+  if (!Array.isArray(value)) return [];
+  const choices: RuntimeServiceTierChoice[] = [];
+  for (const entry of value) {
+    const object = typeof entry === "string" ? { id: entry } : entry && typeof entry === "object" ? entry as Record<string, unknown> : null;
+    const id = object?.id;
+    if (!isRuntimeServiceTierId(id) || CODEX_NON_FAST_SERVICE_TIERS.has(id) || choices.some((choice) => choice.id === id)) continue;
+    // Codex's own copy: everyone who opens the form reads it.
+    const name = runtimeServiceTierText(object!.name, 40);
+    const description = runtimeServiceTierText(object!.description, 120);
+    choices.push({ id, ...(name ? { name } : {}), ...(description ? { description } : {}) });
+  }
+  return choices.sort((a, b) => Number(b.id === CODEX_PRIMARY_FAST_SERVICE_TIER) - Number(a.id === CODEX_PRIMARY_FAST_SERVICE_TIER));
+}
+
 function codexModelInfoFromAppServer(entry: unknown): RuntimeModelInfo | null {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
   const object = entry as Record<string, unknown>;
@@ -2043,19 +1216,36 @@ function codexModelInfoFromAppServer(entry: unknown): RuntimeModelInfo | null {
     ?? asNonEmptyString(object.label)
     ?? id;
   const supportedReasoningEfforts = codexReasoningEfforts(object.supportedReasoningEfforts);
+  // An explicit `[]` is the model saying it takes no effort, and is reported as such (the form then
+  // offers none instead of falling back to the static catalog). A non-empty list none of whose
+  // entries parse is malformed, not empty: it stays unreported, as an absent one does.
+  const reasoningEffortsDeclared = Array.isArray(object.supportedReasoningEfforts)
+    && (object.supportedReasoningEfforts.length === 0 || supportedReasoningEfforts.length > 0);
   const serviceTiers = codexServiceTierIds(object.serviceTiers);
   const additionalSpeedTiers = codexServiceTierIds(object.additionalSpeedTiers);
   const runtimeServiceTiers = serviceTiers.length > 0 ? serviceTiers : additionalSpeedTiers;
-  const defaultReasoningEffort = asNonEmptyString(object.defaultReasoningEffort);
+  const serviceTierChoices = codexServiceTierChoices(object.serviceTiers);
+  // An explicit `[]` (or only valid non-fast tiers like `default` / `flex`) means
+  // the model declares zero fast tiers, distinct from older Codex omitting the field
+  // or a malformed list with no valid tier ids.
+  const serviceTiersDeclared = Array.isArray(object.serviceTiers)
+    && (object.serviceTiers.length === 0 || serviceTiers.some((id) => isRuntimeServiceTierId(id)));
+  const reportedDefaultReasoningEffort = asNonEmptyString(object.defaultReasoningEffort);
+  // A default outside the declared set would be launched as an effort the model does not take.
+  const defaultReasoningEffort = reasoningEffortsDeclared
+    && !supportedReasoningEfforts.includes(reportedDefaultReasoningEffort ?? "")
+    ? null
+    : reportedDefaultReasoningEffort;
   const defaultServiceTier = asNonEmptyString(object.defaultServiceTier);
 
   return {
     id,
     label,
     verified: "launchable",
-    ...(supportedReasoningEfforts.length > 0 ? { supportedReasoningEfforts } : {}),
+    ...(reasoningEffortsDeclared ? { supportedReasoningEfforts } : {}),
     ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
     ...(runtimeServiceTiers.length > 0 ? { serviceTiers: runtimeServiceTiers } : {}),
+    ...(serviceTiersDeclared ? { serviceTierChoices } : {}),
     ...(defaultServiceTier ? { defaultServiceTier } : {}),
   };
 }
@@ -2389,7 +1579,7 @@ async function resolveCompatibleCodexCandidateAsync(deps: ProbeDeps = {}): Promi
 
 /** task #1277 — {@link resolveCodexSpawn} off the event loop; same selection and the same error texts. */
 export async function resolveCodexSpawnAsync(commandArgs: string[], deps: ProbeDeps = {}): Promise<ReturnType<typeof resolveCodexSpawn>> {
-  const { candidate, rejected, explicitOverrideFailed, allRejectionsTimedOut } = await resolveCompatibleCodexCandidateAsync(deps);
+  const { candidate, rejected, explicitOverrideFailed, allRejectionsTimedOut, version } = await resolveCompatibleCodexCandidateAsync(deps);
   if (candidate) {
     return {
       command: candidate.command,
@@ -2399,6 +1589,7 @@ export async function resolveCodexSpawnAsync(commandArgs: string[], deps: ProbeD
       ...(candidate.env ? { env: candidate.env } : {}),
       ...(candidate.windowsShim ? { windowsShim: candidate.windowsShim } : {}),
       ...codexRejectionSummary(rejected),
+      ...(version ? { version } : {}),
     };
   }
 

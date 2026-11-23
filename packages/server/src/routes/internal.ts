@@ -1,3 +1,4 @@
+import { senderOriginWireField } from "../lib/descriptionVisibility";
 import { JointChannelAccessChangedError } from "../lib/channelActorPermissions";
 import { projectRuntimeErrorActivityDetail, projectRuntimeErrorState } from "../services/agentRuntimeErrorVisibility";
 import { DmPeerNotMemberError } from "../services/dmSendPolicy";
@@ -30,6 +31,7 @@ import * as messageService from "../services/messageService";
 import { agentMessageCardFieldNamed } from "../services/messageCardService";
 import * as channelService from "../services/channelService";
 import * as agentService from "../services/agentService";
+import { changedDescriptionLinkWarnings } from "../services/profileDescriptionLinks";
 import * as machineService from "../services/machineService";
 import * as serverService from "../services/serverService";
 import * as taskService from "../services/taskService";
@@ -80,7 +82,7 @@ import {
   buildApmFreshnessDecisionProducerFactId,
   projectApmHeldFreshnessActivity,
   projectApmHeldFreshnessEnvelope,
-  getServerCapabilities,
+  serverCapabilitiesWireView,
   renderThirdPartyInertText,
   isSlackBridgedExternalProvider,
   isReminderStatus,
@@ -113,6 +115,7 @@ import {
   AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT,
   AGENT_API_MESSAGE_SEARCH_MAX_LIMIT,
   RAFT_CLIENT_CAPABILITIES_HEADER,
+  hasForwardedResolveCapability,
   type ServerRole,
 } from "@botiverse/raft-shared";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
@@ -198,7 +201,6 @@ import {
   APP_CARD_MODE_INVALID_REFUSAL,
   APP_CARD_TARGET_REQUIRED_REFUSAL,
   APP_NAME_REQUIRED_REFUSAL,
-  APP_RETURN_URL_REQUIRED_REFUSAL,
   APP_UPDATE_CARD_DISABLED_REFUSAL,
   installationSuspendedRefusal,
   targetNotFoundRefusal,
@@ -271,6 +273,9 @@ import {
   messageResolveRefusal,
   serviceMessageRefusal,
   TARGET_REQUIRED_REFUSAL,
+  profileHandleAmbiguousRefusal,
+  profileNotFoundRefusal,
+  profileTargetInvalidRefusal,
 } from "./agentRouteRefusals";
 
 export const internalRouter: RouterType = Router();
@@ -513,22 +518,28 @@ function historyAnchorErrorPayload(
   };
 }
 
+/** `forwardedResolve`: the client declared FORWARDED_RESOLVE_CAPABILITY, so a cut forwarded message names its read-whole command. */
+export interface AgentResolvedMessageOptions {
+  forwardedResolve?: boolean;
+}
+
 export async function buildAgentResolvedMessagePayload(
   resolvedMessage: messageService.EnrichedMessageRow,
   channel: NonNullable<Awaited<ReturnType<typeof channelService.getChannel>>>,
   serverId: string,
   requestingAgentId: string,
+  options: AgentResolvedMessageOptions = {},
 ) {
   // v1.4: task facts live in `tasks`; project them onto the host message so the
   // agent-facing `[task #N status=...]` suffix survives the storage move.
   const [message] = await withAgentSourceTasks(await withProjectedTaskFacts([resolvedMessage]), undefined, serverId);
   const external = message.senderType === "external_projection";
   const sender = message.messageType === "system"
-    ? { name: "system", description: null }
+    ? { name: "system" }
     : message.senderType === "user"
-      ? await getDb().select({ name: users.name, description: users.description }).from(users).where(eq(users.id, message.senderId)).then((rows) => rows[0] ?? null)
+      ? await getDb().select({ name: users.name }).from(users).where(eq(users.id, message.senderId)).then((rows) => rows[0] ?? null)
       : message.senderType === "external_projection"
-        ? { name: message.externalAuthor?.displayName ?? "External user", description: null }
+        ? { name: message.externalAuthor?.displayName ?? "External user" }
         : await agentService.getAgent(message.senderId);
   let parentChannel: Awaited<ReturnType<typeof channelService.getChannel>> | null = null;
   let threadParentMessageId: string | null = null;
@@ -591,7 +602,10 @@ export async function buildAgentResolvedMessagePayload(
     timestamp: message.createdAt.toISOString(),
     sender_type: message.messageType === "system" ? "system" : toAgentFacingActorType(message.senderType),
     sender_name: sender?.name ?? "unknown",
-    sender_description: sender?.description ?? null,
+    // The enriched read's, as this agent may read it (descriptionVisibility).
+    sender_description: message.messageType === "system" || external ? null : resolvedMessage.senderDescription ?? null,
+    // Where an outside sender is from, read for this agent too (senderOriginFor); absent otherwise.
+    ...senderOriginWireField(message.messageType === "system" || external ? null : resolvedMessage.senderOrigin),
     sender_timezone: external ? null : message.senderTimezone ?? null,
     // RFC 077: resolve reads "sent by an assistant for its owner" like every other read.
     ...(await messageService.agentAuthorshipFields(message as messageService.AgentAuthorshipRow)),
@@ -605,6 +619,7 @@ export async function buildAgentResolvedMessagePayload(
     content: messageService.appendAgentFacingForwardedSnapshot(
       messageService.renderAgentVisibleMessageContent(message, renderedContent),
       external ? null : "actionMetadata" in message ? message.actionMetadata : null,
+      { readWholeMessageId: options.forwardedResolve ? message.id : null },
     ),
     attachments: resolvedAttachments.map((attachment) => ({
       id: attachment.id,
@@ -645,6 +660,7 @@ export async function resolveAgentVisibleMessagePayload(
   messageId: string,
   serverId: string,
   requestingAgentId: string,
+  options: AgentResolvedMessageOptions = {},
 ) {
   const message = await messageService.getMessage(messageId);
   if (!message) return null;
@@ -670,6 +686,7 @@ export async function resolveAgentVisibleMessagePayload(
       localChannel,
       serverId,
       requestingAgentId,
+      options,
     );
   }
 
@@ -682,7 +699,7 @@ export async function resolveAgentVisibleMessagePayload(
     includeSenderTimezone: true,
   });
   if (!viewerScopedMessage) return null;
-  return buildAgentResolvedMessagePayload(viewerScopedMessage, storageChannel, serverId, requestingAgentId);
+  return buildAgentResolvedMessagePayload(viewerScopedMessage, storageChannel, serverId, requestingAgentId, options);
 }
 
 async function serializeOAuthClientForAgent(
@@ -946,19 +963,21 @@ export async function resolveProfileViewForAgent(
   agentOrchestrator: AgentOrchestrator | undefined,
 ): Promise<
   | { ok: true; profile: ProfileView }
-  | { ok: false; status: 400 | 404 | 409; error: string }
+  // `error` is the legacy route's body; `refusal` the agent API's.
+  | { ok: false; status: 400 | 404 | 409; error: string; refusal: RefusalInput }
 > {
   let targetHandle: string | null;
   try {
     targetHandle = normalizeProfileTarget(rawTarget);
   } catch (err) {
-    return { ok: false, status: 400, error: err instanceof Error ? err.message : "Invalid target" };
+    const error = err instanceof Error ? err.message : "Invalid target";
+    return { ok: false, status: 400, error, refusal: profileTargetInvalidRefusal(error) };
   }
 
   if (!targetHandle) {
     const selfProfile = await buildAgentProfileView(selfAgentId, selfAgentId, agentOrchestrator);
     if (!selfProfile) {
-      return { ok: false, status: 404, error: "Agent not found" };
+      return { ok: false, status: 404, error: "Agent not found", refusal: AGENT_GONE_REFUSAL };
     }
     return { ok: true, profile: selfProfile };
   }
@@ -973,24 +992,29 @@ export async function resolveProfileViewForAgent(
   const humanId = human?.userId ?? null;
 
   if (humanId && targetAgentId) {
-    return { ok: false, status: 409, error: `Profile handle @${targetHandle} is ambiguous` };
+    return { ok: false, status: 409, error: `Profile handle @${targetHandle} is ambiguous`, refusal: profileHandleAmbiguousRefusal(targetHandle) };
   }
 
   if (targetAgentId) {
     const profile = await buildAgentProfileView(targetAgentId, selfAgentId, agentOrchestrator);
     return profile
       ? { ok: true, profile }
-      : { ok: false, status: 404, error: `Profile @${targetHandle} not found` };
+      : profileNotFound(targetHandle);
   }
 
   if (humanId) {
     const profile = await buildHumanProfileView(serverId, humanId, selfAgentId);
     return profile
       ? { ok: true, profile }
-      : { ok: false, status: 404, error: `Profile @${targetHandle} not found` };
+      : profileNotFound(targetHandle);
   }
 
-  return { ok: false, status: 404, error: `Profile @${targetHandle} not found` };
+  return profileNotFound(targetHandle);
+}
+
+/** One not-found for every profile this agent can't see, so a hidden person reads as nobody. */
+function profileNotFound(handle: string): { ok: false; status: 404; error: string; refusal: RefusalInput } {
+  return { ok: false, status: 404, error: `Profile @${handle} not found`, refusal: profileNotFoundRefusal(handle) };
 }
 
 const DAEMON_CAPABILITY_TTL_MS = 2 * 60 * 1000;
@@ -1883,10 +1907,7 @@ internalRouter.post("/agent/:id/integrations/app/prepare", async (req, res) => {
       refuse(res, 400, APP_NAME_REQUIRED_REFUSAL);
       return;
     }
-    if (!returnUrl) {
-      refuse(res, 400, APP_RETURN_URL_REQUIRED_REFUSAL);
-      return;
-    }
+    // No return URL is a token-only App: nobody signs in to it.
     const action: ActionCardAction = {
       type: "integration:register_app",
       name,
@@ -2839,7 +2860,7 @@ internalRouter.post("/agent/:id/send", validateLegacyAgentSendBody, requireAgent
       return;
     }
     if (err instanceof AttachmentLinkError) {
-      res.status(err.status).json({ error: err.message, code: err.code });
+      refuse(res, err.status, err.toRefusal());
       return;
     }
     if (transientTransactionSqlState(err)) {
@@ -3312,7 +3333,9 @@ internalRouter.get("/agent/:id/messages/:messageId/resolve", requireAgentScope("
       return;
     }
 
-    const payload = await resolveAgentVisibleMessagePayload(resolved.messageId, agent.serverId, agentId);
+    const payload = await resolveAgentVisibleMessagePayload(resolved.messageId, agent.serverId, agentId, {
+      forwardedResolve: hasForwardedResolveCapability(req.header(RAFT_CLIENT_CAPABILITIES_HEADER)),
+    });
     if (!payload) {
       refuse(res, 404, MESSAGE_NOT_FOUND_REFUSAL);
       return;
@@ -3518,6 +3541,7 @@ internalRouter.get("/agent/:id/history", requireAgentScope("message:read"), asyn
       agent.serverId,
     );
     const enrichedMsgs = applyHistoryThreadMetadata(pageMsgs, threadSummaries);
+    const forwardedResolve = hasForwardedResolveCapability(req.header(RAFT_CLIENT_CAPABILITIES_HEADER));
     res.json({
       messages: enrichedMsgs.map((message: any, index: number) => {
         const external = message.senderType === "external_projection";
@@ -3545,6 +3569,7 @@ internalRouter.get("/agent/:id/history", requireAgentScope("message:read"), asyn
           content: messageService.appendAgentFacingForwardedSnapshot(
             messageService.renderAgentVisibleMessageContent(message, renderedHistoryContents[index] ?? ""),
             external ? null : actionMetadata,
+            { readWholeMessageId: forwardedResolve ? message.id : null },
           ),
           ...messageService.toAgentVisibleExternalMessage(message),
           ...(external && {
@@ -3889,8 +3914,12 @@ internalRouter.post("/agent/:id/channels", requireAgentScope("channel:create"), 
       body: req.body,
       io: req.app.get("io") as SocketServer | undefined,
     });
+    if ("refusal" in created) {
+      refuse(res, created.status, created.refusal);
+      return;
+    }
     res.status(created.status).json(created.body);
-    if (created.status >= 200 && created.status < 300) {
+    if (created.ok) {
       const channelName = typeof created.body.name === "string" ? created.body.name : undefined;
       recordRaftCliActivity(req, result.agent.id, {
         command: "channel.create",
@@ -3922,8 +3951,12 @@ internalRouter.patch("/agent/:id/channels/:channelId", requireAgentScope("channe
       body: req.body,
       io: req.app.get("io") as SocketServer | undefined,
     });
+    if ("refusal" in updated) {
+      refuse(res, updated.status, updated.refusal);
+      return;
+    }
     res.status(updated.status).json(updated.body);
-    if (updated.status >= 200 && updated.status < 300) {
+    if (updated.ok) {
       const channelName = typeof updated.body.name === "string" ? updated.body.name : undefined;
       recordRaftCliActivity(req, result.agent.id, {
         command: "channel.update",
@@ -3956,8 +3989,12 @@ internalRouter.post("/agent/:id/channels/:channelId/members", requireAgentScope(
       io: req.app.get("io") as SocketServer | undefined,
       agentOrchestrator: req.app.get("agentOrchestrator") as AgentOrchestrator | undefined,
     });
+    if ("refusal" in added) {
+      refuse(res, added.status, added.refusal);
+      return;
+    }
     res.status(added.status).json(added.body);
-    if (added.status >= 200 && added.status < 300) {
+    if (added.ok) {
       const member = added.body.member as { type?: string; name?: string } | undefined;
       recordRaftCliActivity(req, result.agent.id, {
         command: "channel.add_member",
@@ -3990,8 +4027,12 @@ internalRouter.delete("/agent/:id/channels/:channelId/members", requireAgentScop
       io: req.app.get("io") as SocketServer | undefined,
       agentOrchestrator: req.app.get("agentOrchestrator") as AgentOrchestrator | undefined,
     });
+    if ("refusal" in removed) {
+      refuse(res, removed.status, removed.refusal);
+      return;
+    }
     res.status(removed.status).json(removed.body);
-    if (removed.status >= 200 && removed.status < 300) {
+    if (removed.ok) {
       const member = removed.body.member as { type?: string; name?: string } | undefined;
       recordRaftCliActivity(req, result.agent.id, {
         command: "channel.remove_member",
@@ -4185,7 +4226,7 @@ internalRouter.get("/agent/:id/server", requireAgentScope("server:read"), async 
     res.json({
       runtimeContext,
       serverRole,
-      serverCapabilities: getServerCapabilities(serverRole),
+      serverCapabilities: serverCapabilitiesWireView(serverRole),
       channels,
       agents: allAgents,
       humans,
@@ -4212,8 +4253,12 @@ internalRouter.patch("/agent/:id/server", requireAgentScope("server:update"), as
       serverId: result.agent.serverId,
       body: req.body,
     });
+    if ("refusal" in updated) {
+      refuse(res, updated.status, updated.refusal);
+      return;
+    }
     res.status(updated.status).json(updated.body);
-    if (updated.status >= 200 && updated.status < 300) {
+    if (updated.ok) {
       recordRaftCliActivity(req, result.agent.id, {
         command: "server.update",
         summary: "Updated server profile",
@@ -4242,7 +4287,7 @@ internalRouter.post("/agent/:id/server/avatar", requireAgentScope("server:update
       serverId: result.agent.serverId,
     });
     if (authFailure) {
-      res.status(authFailure.status).json(authFailure.body);
+      refuse(res, authFailure.status, authFailure.refusal);
       return;
     }
 
@@ -4414,7 +4459,7 @@ internalRouter.post("/agent/:id/profile", async (req, res) => {
       refuse(res, 403, fenced);
       return;
     }
-    const checked = agentProfileUpdateFields(body);
+    const checked = agentProfileUpdateFields(body, result.agent.description);
     if (!checked.ok) {
       refuse(res, 400, checked.refusal);
       return;
@@ -4445,7 +4490,10 @@ internalRouter.post("/agent/:id/profile", async (req, res) => {
       return;
     }
 
-    res.json(profile);
+    // #457: links in a new description some of its readers can't open (the save stands).
+    const self = { type: "agent" as const, id: result.agent.id, serverId: result.agent.serverId };
+    const warnings = await changedDescriptionLinkWarnings({ before: result.agent.description, after: fields.description === undefined ? undefined : updated.description, owner: self, writer: self });
+    res.json({ ...profile, ...(warnings.length > 0 ? { warnings } : {}) });
     recordRaftCliActivity(req, result.agent.id, {
       command: "profile.update",
       summary: "Updated profile",
@@ -4625,7 +4673,7 @@ internalRouter.post("/agent/:id/tasks", requireAgentScope("task:write"), async (
       "agent",
       req.params.id,
       createItems,
-      { initiatingServerId: ctx.localChannel.serverId },
+      { initiatingServerId: ctx.localChannel.serverId, localChannelId: ctx.localChannel.id },
     );
 
     const io: SocketServer = req.app.get("io");

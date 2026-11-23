@@ -3,8 +3,9 @@
   "package": "@botiverse/raft",
   "runner": "vitest run",
   "testFileGlob": "src/**/*.test.ts",
-  "fileCount": 160,
-  "total": 1676,
+  "fileCount": 165,
+  "fileCount": 166,
+  "total": 1770,
   "files": [
     {
       "file": "src/agentApiNoBypass.test.ts",
@@ -1085,7 +1086,7 @@
     },
     {
       "file": "src/commands/artifact/publish.test.ts",
-      "count": 29,
+      "count": 34,
       "cases": [
         {
           "name": "pull: writes every file, records the base and each file's sha256, says how to push"
@@ -1142,6 +1143,21 @@
           "name": "push a new directory needs a title: --title, else its page's <title>; neither is refused before any request"
         },
         {
+          "name": "push a new directory with no page: held once before any request (exit 1, no code line), with the attachment to send instead; the same command again pushes it"
+        },
+        {
+          "name": "push a new directory with no page: held again once its files change, or when run again more than 10 minutes later"
+        },
+        {
+          "name": "push with no page is never held for a pulled directory's new version, nor for a new directory with an HTML or Markdown page"
+        },
+        {
+          "name": "push with no page counts the files the push sends: a hidden page is left out (held) unless --include-hidden sends it"
+        },
+        {
+          "name": "push with no page, several files in a directory with a space: three named and how many more; the first file's path quoted as one argument"
+        },
+        {
           "name": "push --title with no file changed renames the artifact: no new version, the base stays"
         },
         {
@@ -1178,10 +1194,16 @@
     },
     {
       "file": "src/commands/artifact/resolve.test.ts",
-      "count": 4,
+      "count": 6,
       "cases": [
         {
           "name": "resolve --note: the thread and the note reach the request; the answer says what was posted, who heard, and how to reopen"
+        },
+        {
+          "name": "#proj-workspace:#340: resolve says how its author hears of it, by the Server's delivery: a person in Activity without an unread, nothing for your own thread, an agent that can't see it gets nothing, an older Server's line as it was"
+        },
+        {
+          "name": "comments --held: the range reaches the request (with all and its start as the cursor, for older Servers); the list says what it is and pages with it"
         },
         {
           "name": "resolve again: already resolved, nothing changed and no note; reopen without a body"
@@ -1276,6 +1298,24 @@
       ]
     },
     {
+      "file": "src/commands/artifact/settle.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "settle: the artifact reaches the request; the answer says it is settled at which version, or was already"
+        },
+        {
+          "name": "unsettle: Working again, or already"
+        },
+        {
+          "name": "a server without Settled: the flag off, or no route at all, both say so with its code"
+        },
+        {
+          "name": "one artifact only: no request for a missing or an extra argument"
+        }
+      ]
+    },
+    {
       "file": "src/commands/attachment/_format.test.ts",
       "count": 3,
       "cases": [
@@ -1292,7 +1332,7 @@
     },
     {
       "file": "src/commands/attachment/upload.test.ts",
-      "count": 17,
+      "count": 23,
       "cases": [
         {
           "name": "inferUploadMimeType detects images from magic bytes without an extension"
@@ -1344,6 +1384,24 @@
         },
         {
           "name": "attachment upload sends a declared over-limit file through the session the server took"
+        },
+        {
+          "name": "attachment upload of a Markdown file: held once before any request (exit 1, no code line), copied into a directory of its own and pushed; the same command again uploads it"
+        },
+        {
+          "name": "attachment upload of an HTML file alone in its directory: push its directory; with its own <title> no --title; a taken name gets -artifact"
+        },
+        {
+          "name": "attachment upload of an HTML or Markdown file is held again once its content or target changes, or when run again more than 10 minutes later"
+        },
+        {
+          "name": "attachment upload never holds a file that is not HTML or Markdown, nor any file when the ledger can't keep the hold"
+        },
+        {
+          "name": "attachment upload holds only where Artifacts is known to be on: off, or unknown (no RAFT_ENABLED_APPS), uploads at once"
+        },
+        {
+          "name": "attachment upload into a thread pushes into that thread's target; into a task, pushes into the task's conversation and posts the link in the task; a target push can't name is never held"
         }
       ]
     },
@@ -1585,6 +1643,24 @@
       ]
     },
     {
+      "file": "src/commands/channel/set-role.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "set-role sends one request by handle and prints the result"
+        },
+        {
+          "name": "set-role keeps the Server's capability refusal and points to the channel's members for who can change the role"
+        },
+        {
+          "name": "set-role names a non-member and the other flag, keeping the Server's code and next step"
+        },
+        {
+          "name": "set-role refuses bad arguments before any request, each with a next step"
+        }
+      ]
+    },
+    {
       "file": "src/commands/channel/update.test.ts",
       "count": 6,
       "cases": [
@@ -1649,13 +1725,22 @@
     },
     {
       "file": "src/commands/continuation/continue.test.ts",
-      "count": 22,
+      "count": 25,
       "cases": [
         {
           "name": "a command that pauses prints its question and every answer, exits 10, and keeps the continuation in the agent's ledger"
         },
         {
           "name": "cont answers it: the command carries on from its question, finishes, and exits 0"
+        },
+        {
+          "name": "with the answer tool offered, the pause lists the options once and names the tool, `cont` the shell fallback"
+        },
+        {
+          "name": "with the answer tool offered, an ask for text alone names the tool too"
+        },
+        {
+          "name": "spans say how the answer came in: via tool when the daemon's tool ran it, else via cont"
         },
         {
           "name": "an option that takes text reads it from stdin; cancel runs nothing further"
@@ -1716,6 +1801,54 @@
         },
         {
           "name": "the paused output and the refusals are registered AX surfaces"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/focus/focus.test.ts",
+      "count": 14,
+      "cases": [
+        {
+          "name": "a task conversation is labelled as the inbox labels it; the commands keep the bare target"
+        },
+        {
+          "name": "focus: the receipt, the list, and the command that unfocuses it"
+        },
+        {
+          "name": "focus past the limit: one line per unfocused conversation, with the command that brings it back"
+        },
+        {
+          "name": "focus a task conversation: labelled `task`, unfocused by its bare ref"
+        },
+        {
+          "name": "focus something already focused: said so, then the list, and nothing else"
+        },
+        {
+          "name": "list: the entries and how to unfocus one; empty: how to focus"
+        },
+        {
+          "name": "unfocus: the receipt, then what is still focused, or that nothing is; not focused: one line"
+        },
+        {
+          "name": "no output promises anything about delivery or read state yet"
+        },
+        {
+          "name": "raft focus <target> POSTs /focus and writes the receipt"
+        },
+        {
+          "name": "raft focus with no target GETs /focus and lists"
+        },
+        {
+          "name": "raft unfocus <target> POSTs /unfocus; --peer-kind names which DM"
+        },
+        {
+          "name": "raft unfocus with no target sends nothing and ends with the command that lists the focus"
+        },
+        {
+          "name": "a Server refusal is shown as sent, and ends with its next step: Focus off, a plain channel"
+        },
+        {
+          "name": "a refusal that came without a next step still ends with one"
         }
       ]
     },
@@ -1832,7 +1965,7 @@
           "name": "inbox check reports revision drift and detached id-only seals without projecting them onto items"
         },
         {
-          "name": "inbox check command renders structured sourceRef and exact actionCli from OS mint"
+          "name": "inbox check command renders the item's address and exact actionCli from OS mint"
         },
         {
           "name": "formatter: a sender name or task title with a line break stays on its row"
@@ -1967,13 +2100,16 @@
     },
     {
       "file": "src/commands/integration/_format.test.ts",
-      "count": 9,
+      "count": 10,
       "cases": [
         {
           "name": "formatIntegrationLogin makes agent login completion explicit"
         },
         {
           "name": "formatIntegrationLogin omits agent manifest line when service has none"
+        },
+        {
+          "name": "formatIntegrationLogin on a token-only App says there is no sign-in to hand off and points at its agent tokens"
         },
         {
           "name": "formatIntegrationLogin explains human approval requirement"
@@ -2054,7 +2190,7 @@
     },
     {
       "file": "src/commands/integration/app.test.ts",
-      "count": 26,
+      "count": 29,
       "cases": [
         {
           "name": "integration app list/status reconstruct pending and committed state without secret-shaped fields"
@@ -2064,6 +2200,9 @@
         },
         {
           "name": "integration app prepare register posts sanitized action-card request"
+        },
+        {
+          "name": "integration app prepare register without --redirect-url prepares a token-only App"
         },
         {
           "name": "integration app prepare register allows server-generated client key"
@@ -2115,6 +2254,12 @@
         },
         {
           "name": "integration app update --client-key sends the new client id next to the App it names"
+        },
+        {
+          "name": "integration app update --agent-token-signing-alg sends the App's signing algorithm and refuses others locally"
+        },
+        {
+          "name": "integration app update --agent-token-type sends the App's agent token typ exactly, and --redirect-url \"\" clears the redirect URL"
         },
         {
           "name": "integration app transfer-owner JSON emits a fixed audited no-op receipt"
@@ -2216,7 +2361,7 @@
     },
     {
       "file": "src/commands/integration/invoke.test.ts",
-      "count": 110,
+      "count": 124,
       "cases": [
         {
           "name": "integration invoke sends feedback-admin id in URL and param content in POST JSON body"
@@ -2468,6 +2613,27 @@
           "name": "integration invoke tells an App's own 403 refusal apart from a refused service session"
         },
         {
+          "name": "integration invoke prints an App's reply text instead of its JSON, every line quoted"
+        },
+        {
+          "name": "integration invoke keeps an App's reply text from forging a line: header-looking lines, any line break, controls"
+        },
+        {
+          "name": "integration invoke cuts an absurdly long reply text and says so"
+        },
+        {
+          "name": "integration invoke: a refusal's cut reply text is not said to have run"
+        },
+        {
+          "name": "integration invoke without a reply text prints the JSON as before; blank or non-string text counts as none"
+        },
+        {
+          "name": "integration invoke --json keeps the App's whole answer, reply text included"
+        },
+        {
+          "name": "integration invoke error: an App's reply text is the message; --json keeps the redacted body as details"
+        },
+        {
           "name": "integration invoke recursively redacts structured error fields even when Content-Type is text/plain"
         },
         {
@@ -2525,6 +2691,27 @@
           "name": "integration v1 validates input before Agent Login or action dispatch"
         },
         {
+          "name": "integration v1 --param sends number, integer and boolean literals typed; a string type keeps the text"
+        },
+        {
+          "name": "integration v1 --param refuses a literal its declared type cannot take, before login or dispatch"
+        },
+        {
+          "name": "integration v1 --param reads an @file reference as text, untyped"
+        },
+        {
+          "name": "integration invoke refuses a --param the action does not declare, listing the declared ones"
+        },
+        {
+          "name": "integration v1 --param accepts a key the input schema does not list when it does not refuse extra keys"
+        },
+        {
+          "name": "integration v1 list-actions text lists each action's parameters, required and optional"
+        },
+        {
+          "name": "integration v0 --param keeps text values and accepts any key when the action declares no parameters"
+        },
+        {
           "name": "integration v1 read action emits a typed verified receipt without secrets"
         },
         {
@@ -2552,10 +2739,13 @@
     },
     {
       "file": "src/commands/integration/invokeV1.test.ts",
-      "count": 19,
+      "count": 20,
       "cases": [
         {
           "name": "v1 mutation receipt is verified only after an independent readback receipt"
+        },
+        {
+          "name": "a v1 action sent with the global fetch installs OS trust before connecting"
         },
         {
           "name": "receipt target uses the durable canonical server binding"
@@ -3077,7 +3267,7 @@
     },
     {
       "file": "src/commands/message/_format.test.ts",
-      "count": 79,
+      "count": 81,
       "cases": [
         {
           "name": "formatInboxHint: points at raft inbox check with the conversation count"
@@ -3123,6 +3313,9 @@
         },
         {
           "name": "formatHistory: the whole conversation on screen prints no window lines (no Read window, cursor or End of window)"
+        },
+        {
+          "name": "formatHistory (message read): an outside sender reads as from another server or a guest; a forged slug is dropped"
         },
         {
           "name": "formatHistory (message read, task read): a message's reactions print on one line under it; one without prints nothing"
@@ -3315,6 +3508,9 @@
         },
         {
           "name": "formatHistory: rows list their tasks by ref (task v2 source_tasks)"
+        },
+        {
+          "name": "formatHistory and formatMessages preserve inline `> msg=<id>` quote blocks verbatim in body"
         }
       ]
     },
@@ -3632,7 +3828,7 @@
     },
     {
       "file": "src/commands/message/resolve.test.ts",
-      "count": 6,
+      "count": 8,
       "cases": [
         {
           "name": "buildResolvePath: encodes message id on the id-less surface"
@@ -3651,6 +3847,12 @@
         },
         {
           "name": "message resolve command does not pick an ambiguous short id"
+        },
+        {
+          "name": "message resolve --forwarded asks for that forwarded message and prints it whole under the forward's header"
+        },
+        {
+          "name": "message resolve --forwarded refuses a non-number locally and shows the Server's range"
         }
       ]
     },
@@ -4148,7 +4350,7 @@
     },
     {
       "file": "src/commands/message/sendContinuation.test.ts",
-      "count": 15,
+      "count": 16,
       "cases": [
         {
           "name": "pilot off, unknown or unreadable: a held send keeps today's draft flow, its held text byte for byte"
@@ -4190,7 +4392,10 @@
           "name": "JSON, reviewer isolation and --send-draft keep the draft flow with the pilot on"
         },
         {
-          "name": "a codex agent keeps the draft flow with the pilot on: it reads exit 10 as a failure (#wg-ax:#5)"
+          "name": "a codex agent keeps the draft flow with the pilot on: only Claude answers the pause reliably (#wg-ax:#5)"
+        },
+        {
+          "name": "a builtin agent keeps the draft flow with the pilot on: only Claude answers the pause reliably (#wg-ax:#5)"
         },
         {
           "name": "held for a channel description alone: the question says so, the description is the preview, and anyway is never offered"
@@ -4382,7 +4587,7 @@
     },
     {
       "file": "src/commands/proc/proc.test.ts",
-      "count": 11,
+      "count": 13,
       "cases": [
         {
           "name": "start: the command after -- goes to the daemon with an absolute cwd, the env and the CLI's pid; the reply names the job, pid, log and next commands"
@@ -4404,6 +4609,12 @@
         },
         {
           "name": "list: one row per job and the next commands; an empty list says how to start one"
+        },
+        {
+          "name": "list: a job the Computer stopped at its memory cap reads exited: memory_limit (<cap>), the words of the Inbox notice and the Manual"
+        },
+        {
+          "name": "list: a job a person stopped from the Computer page reads exited: stopped by @<handle>, or by a person when the handle is unknown"
         },
         {
           "name": "stop: SIGTERM exit, a kill after the grace, --force, an exited job, an unknown name"
@@ -4451,13 +4662,19 @@
     },
     {
       "file": "src/commands/profile/update.test.ts",
-      "count": 2,
+      "count": 4,
       "cases": [
         {
           "name": "readAvatarFile accepts an avatar at the Server's 5 MB limit"
         },
         {
           "name": "readAvatarFile rejects an avatar over the limit"
+        },
+        {
+          "name": "raft profile update prints the description's link warnings on stdout after the profile, with every fix"
+        },
+        {
+          "name": "raft profile update --json carries the warnings; without any nothing is added"
         }
       ]
     },
@@ -4508,7 +4725,7 @@
     },
     {
       "file": "src/commands/registryPin/registryPin.test.ts",
-      "count": 22,
+      "count": 23,
       "cases": [
         {
           "name": "message read"
@@ -4539,6 +4756,9 @@
         },
         {
           "name": "thread unfollow"
+        },
+        {
+          "name": "focus / unfocus"
         },
         {
           "name": "channel join / leave / members"
@@ -4686,6 +4906,81 @@
         },
         {
           "name": "ack takes the id as raft inbox check prints it: reminder:<id>:<rev> also gives the revision"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/reminder/appRouting.test.ts",
+      "count": 17,
+      "cases": [
+        {
+          "name": "gate on: schedule maps the flags to create-reminder's flat parameters and prints the app's text quoted"
+        },
+        {
+          "name": "gate on: the anchor is where the message is, from the resolve route (a thread reply anchors to its thread)"
+        },
+        {
+          "name": "gate on: --channel naming another conversation than the message's is refused, saying where the message is"
+        },
+        {
+          "name": "gate on: schedule keeps the legacy checks before any request"
+        },
+        {
+          "name": "gate off (and unreadable): schedule, snooze and list keep the legacy API and its output"
+        },
+        {
+          "name": "a legacy write refused with reminders_moved_to_app (nothing changed) is redone through the app"
+        },
+        {
+          "name": "gate on: update sends several fields, --in as given, --cadence with this host's zone, --notes and --tz"
+        },
+        {
+          "name": "an app error becomes the command's error: a fixed code, the app's code in details, its text quoted, 'Nothing was changed.' only for a refused write"
+        },
+        {
+          "name": "a create that failed on the app's side says it may have been applied, and is not retryable"
+        },
+        {
+          "name": "gate on: cancel goes to the app; an id it does not know is canceled as a reminder from before the move"
+        },
+        {
+          "name": "gate on: a short id the app does not know never cancels a reminder from before the move by prefix"
+        },
+        {
+          "name": "gate unreadable: an id the legacy API does not know is asked of the app with the same id"
+        },
+        {
+          "name": "gate unreadable: show says it could not tell, with the next step, and asks nothing of the app"
+        },
+        {
+          "name": "gate on: list prints the app's list, then the scheduled reminders from before the move under their heading"
+        },
+        {
+          "name": "appListWidenedNote: only for several different statuses, none of them all or migrated"
+        },
+        {
+          "name": "gate off: show says the reminders are not in the app and points at raft reminder list"
+        },
+        {
+          "name": "an app answer without text prints a short line from its fields, never the JSON"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/reminder/appRoutingHttp.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "real app path: schedule sends create-reminder's flat parameters and prints the app's text quoted"
+        },
+        {
+          "name": "real app path: an error answer's text is the error, quoted, so it cannot forge Code:/Retryable: lines"
+        },
+        {
+          "name": "real app path: a refusal's text cut at 4000 characters is not said to have run"
+        },
+        {
+          "name": "real app path: create is sent once more with the same requestId after a 503; a 5xx then says it may have been applied, not retryable"
         }
       ]
     },
@@ -4859,7 +5154,7 @@
     },
     {
       "file": "src/commands/server/_format.test.ts",
-      "count": 5,
+      "count": 6,
       "cases": [
         {
           "name": "formatServerInfo: full server with channels, agents, humans"
@@ -4869,6 +5164,9 @@
         },
         {
           "name": "formatChannelMembers: joint roster lists every server a person takes part through"
+        },
+        {
+          "name": "formatChannelMembers: the channel role the Server sends marks channel admins, agents and people alike"
         },
         {
           "name": "formatChannelMembers: empty members"
@@ -5066,7 +5364,7 @@
     },
     {
       "file": "src/commands/task/assign.test.ts",
-      "count": 13,
+      "count": 14,
       "cases": [
         {
           "name": "task assign sends the handle and writes canonical text"
@@ -5106,6 +5404,9 @@
         },
         {
           "name": "a ref the shell cut off (unquoted #) is named as the likely cause, before auth bootstrap"
+        },
+        {
+          "name": "a held task assign prints the hold once, exits 1 and names TASK_WRITE_HELD on stderr"
         }
       ]
     },
@@ -5153,7 +5454,7 @@
     },
     {
       "file": "src/commands/task/conversation.test.ts",
-      "count": 12,
+      "count": 13,
       "cases": [
         {
           "name": "resolveTaskAddress: a ref, or --target + --number, never both disagreeing"
@@ -5181,6 +5482,9 @@
         },
         {
           "name": "task read: GET /tasks/read with the window flags; the window is named by the ref"
+        },
+        {
+          "name": "task read: a task from before task v2 names its earlier thread, also when its conversation is still empty"
         },
         {
           "name": "task follow / unfollow: POST and receipts naming the ref"
@@ -5216,7 +5520,7 @@
     },
     {
       "file": "src/commands/task/create.test.ts",
-      "count": 12,
+      "count": 13,
       "cases": [
         {
           "name": "task create command uses injected ApiClient and writes canonical text"
@@ -5253,6 +5557,9 @@
         },
         {
           "name": "task create sends --status for every title and refuses a status a task can't start in"
+        },
+        {
+          "name": "a held task create prints the hold once, exits 1 and names TASK_WRITE_HELD on stderr"
         }
       ]
     },
@@ -5751,6 +6058,18 @@
         },
         {
           "name": "byte-neutral positive control: writeText with NL reproduces the old template bytes"
+        }
+      ]
+    },
+    {
+      "file": "src/proxy.systemTrust.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "system CA trust is installed before the first direct HTTPS request, and never for loopback http"
+        },
+        {
+          "name": "a direct undici fetch to an HTTPS server installs trust before connecting"
         }
       ]
     },

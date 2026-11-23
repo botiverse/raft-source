@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { projectOpencodeModels, type ListModelsResult, type ModelEntry, type ModelLister } from "@botiverse/oar";
+import type { InstallationSnapshot, ListModelsResult, ModelEntry, ModelLister } from "@botiverse/oar";
 import { formatRuntimeProviderModelLabel, type RuntimeModelSourceOutcome } from "@botiverse/raft-shared";
 
 import { detectOpenCodeModelSourceViaOar, parseOpenCodeModelsOutput } from "../drivers/opencode";
@@ -99,6 +99,17 @@ test("unauthenticated maps to a retryable runtime_not_authenticated error", asyn
   );
 });
 
+test("a CLI OAR finds too old (version_unsupported) is protocol_unsupported, whatever the caller does with other unsupported answers", async () => {
+  let asked = false;
+  const outcome = await detectModelSourceViaOar({
+    ...BASE,
+    lister: listerReturning({ kind: "unsupported", code: "version_unsupported", reason: "needs 1.5.0", installedVersion: "1.4.2", requiredVersion: "1.5.0" }),
+    onUnsupported: () => { asked = true; return { kind: "unsupported" }; },
+  });
+  assert.deepEqual(outcome, { kind: "error", retryable: true, code: "protocol_unsupported" });
+  assert.equal(asked, false);
+});
+
 test("unsupported is the caller's decision, with OAR's reason", async () => {
   const reasons: string[] = [];
   const outcome = await detectModelSourceViaOar({
@@ -155,28 +166,74 @@ test("projection drops efforts when the runtime cannot apply them, and de-duplic
   );
 });
 
-test("opencode: the installation listed is the bare opencode command sessions launch", async () => {
+test("projection: an unreadable menu carries OAR's reason; an empty menu is \"none\" only where the lister marks it", () => {
+  const entries: ModelEntry[] = [
+    { id: "unread", effortUnavailableReason: "  Native catalog did not\nexpose this menu. " },
+    { id: "empty", effortLevels: [] },
+    { id: "listed", effortLevels: ["high"], effortUnavailableReason: "ignored next to a menu" },
+  ];
+  const label = (entry: ModelEntry) => entry.id;
+  assert.deepEqual(projectOarModelEntries(entries, { label, keepReasoningEfforts: true, keepEmptyEffortLevels: true }), [
+    { id: "unread", label: "unread", reasoningEffortUnavailableReason: "Native catalog did not expose this menu.", verified: "launchable" },
+    { id: "empty", label: "empty", supportedReasoningEfforts: [], verified: "launchable" },
+    { id: "listed", label: "listed", supportedReasoningEfforts: ["high"], verified: "launchable" },
+  ]);
+  // Other listers (Claude): an empty menu stays not reported, as before.
+  assert.deepEqual(projectOarModelEntries([{ id: "empty", effortLevels: [] }], { label, keepReasoningEfforts: true }), [
+    { id: "empty", label: "empty", verified: "launchable" },
+  ]);
+});
+
+test("projection: an unreadable-menu reason is scrubbed like a start failure before it is bounded", () => {
+  const [model] = projectOarModelEntries(
+    [{ id: "unread", effortUnavailableReason: "Could not read /Users/alice/.agy/catalog.json with Authorization: Bearer sk-live-abcdefghijklmnopqrstuvwxyz0123456789" }],
+    { label: (entry) => entry.id, keepReasoningEfforts: true },
+  );
+  const reason = model?.reasoningEffortUnavailableReason ?? "";
+  assert.match(reason, /\[REDACTED_PATH\]/);
+  assert.match(reason, /Bearer \[REDACTED_TOKEN\]/);
+  assert.ok(!reason.includes("/Users/alice"), reason);
+  assert.ok(!reason.includes("sk-live-"), reason);
+});
+
+/** OAR's OpenCode installation as `readOpenCodeInstallation` would report it. */
+const OPENCODE_INSTALLED = async (): Promise<InstallationSnapshot> => ({ kind: "available", via: "executable", command: "/usr/local/bin/opencode", version: "opencode v2.3.0" });
+
+test("opencode: the installation listed is OAR's own, a Windows npm shim included (OAR runs its target), with its version", async () => {
+  const shim: InstallationSnapshot = { kind: "available", via: "executable", command: "C:\\Users\\tester\\AppData\\Roaming\\npm\\opencode.cmd", version: "opencode v2.3.0" };
   const seen: unknown[] = [];
-  await detectOpenCodeModelSourceViaOar(async (installation) => {
+  const outcome = await detectOpenCodeModelSourceViaOar(async (installation) => {
     seen.push(installation);
     return { kind: "ok", models: [{ id: "opencode/gpt-5-nano" }] };
-  });
-  assert.deepEqual(seen, [{ kind: "available", via: "executable", command: "opencode" }]);
+  }, 1_000, async () => shim);
+  assert.deepEqual(seen, [shim]);
+  assert.equal(outcome.kind, "live");
+});
+
+test("opencode: no installation is runtime_not_found and a failed installation probe is detect_failed, both retryable, nothing listed", async () => {
+  let listed = 0;
+  const lister: ModelLister = async () => { listed += 1; return { kind: "ok", models: [] }; };
+  assert.deepEqual(await detectOpenCodeModelSourceViaOar(lister, 1_000, async () => ({ kind: "not_found" })), { kind: "error", retryable: true, code: "runtime_not_found" });
+  assert.deepEqual(
+    await detectOpenCodeModelSourceViaOar(lister, 1_000, async () => { throw new Error("Failed to run opencode --version"); }),
+    { kind: "error", retryable: true, code: "detect_failed" },
+  );
+  assert.equal(listed, 0);
 });
 
 test("opencode: an empty 2.x listing (OAR unsupported) is a retryable failure, not no_models", async () => {
   assert.deepEqual(
-    await detectOpenCodeModelSourceViaOar(listerReturning({ kind: "unsupported", reason: "cold catalog" })),
+    await detectOpenCodeModelSourceViaOar(listerReturning({ kind: "unsupported", reason: "cold catalog" }), undefined, OPENCODE_INSTALLED),
     { kind: "error", retryable: true, code: "detect_failed" },
   );
 });
 
 test("opencode: ids and labels match the daemon's own parser for the same CLI output; OAR's efforts are dropped", async () => {
   const ids = ["opencode/gpt-5-nano", "fusecode/opus[1m]", "openrouter/anthropic/claude-opus-4.5"];
-  // `opencode models --verbose` (1.x): id line, then the model JSON closed by `}`. OAR's display name omits the
-  // provider, so the daemon's provider-qualified label must win over it.
-  const verbose = ids.flatMap((id) => [id, "{", `  "name": "Bare ${id}",`, `  "variants": { "high": {} }`, "}"]).join("\n");
-  const viaOar = await detectOpenCodeModelSourceViaOar(listerReturning({ kind: "ok", models: projectOpencodeModels(verbose) }));
+  // What OAR lists for `opencode models --verbose` (1.x): its display name omits the provider, and it carries
+  // efforts, so the daemon's provider-qualified label must win and the efforts must be dropped.
+  const models: ModelEntry[] = ids.map((id) => ({ id, displayName: `Bare ${id}`, effortLevels: ["high"] }));
+  const viaOar = await detectOpenCodeModelSourceViaOar(listerReturning({ kind: "ok", models }), undefined, OPENCODE_INSTALLED);
   const daemonOwn = parseOpenCodeModelsOutput(ids.join("\n"));
   assert.ok(daemonOwn);
   assert.deepEqual(viaOar, { kind: "live", value: daemonOwn });

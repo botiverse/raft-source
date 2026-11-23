@@ -1,4 +1,4 @@
-import { spawnRuntimeChild } from "./runtimeChild";
+import { spawnRuntimeChild, takeEarlyChildEvents } from "./runtimeChild";
 import { hydrateRuntimeConfig, runtimeConfigToLaunchFields, type AgentConfig, type AxSurfaceText, type RuntimeModelSourceOutcome } from "@botiverse/raft-shared";
 import type { RuntimeDriver, SpawnContext, SpawnResult, ParsedEvent, RuntimeProbeResult } from "./types";
 import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
@@ -19,6 +19,9 @@ import {
   prepareManagedMcpRuntimeProxy,
   writeManagedMcpRuntimeConfigFile,
 } from "../managedMcpRuntimeProxy";
+import { continuationAnswerRunnerForLaunch } from "../continuationAnswerTool";
+import { CONTINUATION_ANSWER_TOOL_NAME, RAFT_CONTINUATION_TOOL_ENV } from "@botiverse/raft-shared/src/continuations/index";
+import path from "node:path";
 
 export {
   buildClaudeArgs,
@@ -30,8 +33,23 @@ export {
   readClaudeInstallationAsync,
   resolveClaudeCommand,
   resolveClaudeLaunchCommand,
+  resolveClaudeLaunchCommandAsync,
 } from "./claudeLaunch";
-export { buildClaudeProviderIsolationEnv } from "./claudeProviderIsolation";
+export { assertClaudeStartupPayloadWithinBudget } from "./claudeInputBudget";
+export {
+  buildClaudeProviderIsolationEnv,
+  CLAUDE_CUSTOM_PROVIDER_HOST_ENV_KEYS,
+  isClaudeCustomProviderConfig,
+  LEGACY_CLAUDE_PROVIDER_CONFIG_DIR,
+  shouldWarnLegacyClaudeProviderConfigDir,
+} from "./claudeProviderIsolation";
+
+export function prepareClaudeCliTransport(
+  ctx: SpawnContext,
+  extraEnv: Record<string, string | undefined>,
+): ReturnType<typeof prepareCliTransport> {
+  return prepareCliTransport(ctx, extraEnv);
+}
 
 export const CLAUDE_CODE_ENTRYPOINT = "raft";
 
@@ -119,6 +137,15 @@ export class ClaudeDriver implements RuntimeDriver {
       );
     }
     const systemPromptPath = writeClaudeSystemPromptFile(ctx.standingPrompt, slockDir);
+    // The answer tool (continuation_tool_v0): it runs this launch's own `raft`
+    // wrapper with the environment this runtime gets, both fixed here, before
+    // the proxy hands out the launch's token. Null when the launch does not offer it.
+    const continuationRunner = continuationAnswerRunnerForLaunch({
+      config: ctx.config,
+      raftBin: path.join(slockDir, "raft"),
+      env: spawnEnv,
+      cwd: ctx.workingDirectory,
+    });
     const managedMcp = await prepareManagedMcpRuntimeProxy({
       agentId: ctx.agentId,
       launchId: ctx.launchId,
@@ -126,7 +153,10 @@ export class ClaudeDriver implements RuntimeDriver {
       readTurnOrigin: ctx.readTurnOrigin,
       serverUrl: ctx.config.serverUrl,
       agentCredentialKey: ctx.config.agentCredentialKey,
+      continuationRunner,
     });
+    // Only once the tool is really on this launch's MCP server: its pause text then names it.
+    if (managedMcp && continuationRunner) spawnEnv[RAFT_CONTINUATION_TOOL_ENV] = CONTINUATION_ANSWER_TOOL_NAME;
     const managedMcpConfigPath = managedMcp
       ? writeManagedMcpRuntimeConfigFile({
           agentId: ctx.agentId,
@@ -271,8 +301,10 @@ export function claudeSideQuestionProviderEnv(config: AgentConfig): Record<strin
   };
 }
 
-/** Start the fork as a runtime child (guarded like the agent's own) in the agent's workspace. */
+/** Start the fork as a runtime child in the agent's workspace (disarms the 10s RuntimeSession orphan guard since SideQuestionRunner owns its lifecycle synchronously). */
 export function startClaudeSideQuestion(config: AgentConfig, args: string[], env: NodeJS.ProcessEnv, cwd: string): import("node:child_process").ChildProcess {
   const spec = buildClaudeSpawnSpec(resolveClaudeLaunchCommand(config, { env }), args, { env });
-  return spawnRuntimeChild(spec.command, spec.args, { cwd, env: (spec.env ?? env) as NodeJS.ProcessEnv, stdio: ["pipe", "pipe", "pipe"], shell: false });
+  const child = spawnRuntimeChild(spec.command, spec.args, { cwd, env: (spec.env ?? env) as NodeJS.ProcessEnv, stdio: ["pipe", "pipe", "pipe"], shell: false });
+  takeEarlyChildEvents(child);
+  return child;
 }

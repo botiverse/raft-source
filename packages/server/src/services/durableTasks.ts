@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { and, eq, inArray, lt, sql } from "drizzle-orm";
+import type { PgUpdateSetSource } from "drizzle-orm/pg-core";
 import { currentDate, noopTracer, setClockInterval, type Tracer } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import { durableTasks } from "../db/schema";
@@ -29,6 +30,19 @@ export class DurableTaskPermanentError extends Error {
   constructor(readonly code: string) {
     super(code);
     this.name = "DurableTaskPermanentError";
+  }
+}
+
+/**
+ * Not a failure: the handler can't start yet (no free slot on this replica)
+ * and hands the task back to run after `delayMs`. The attempt is given back
+ * (max_attempts raised by one: attempts keeps counting claims and stays
+ * >= 1), so waiting never spends the attempt budget.
+ */
+export class DurableTaskDeferral extends Error {
+  constructor(readonly delayMs: number, readonly reason: string) {
+    super(reason);
+    this.name = "DurableTaskDeferral";
   }
 }
 
@@ -140,17 +154,32 @@ export function durableTaskBackoffMs(attempts: number): number {
   return Math.round(Math.exp(Math.min(Math.max(attempts, 1), 10)) * 1_000);
 }
 
-export type DurableTaskOutcome = "succeeded" | "retry" | "needs_attention" | "fenced";
+export type DurableTaskOutcome = "succeeded" | "retry" | "deferred" | "needs_attention" | "fenced";
+
+export type DurableTaskResult =
+  | { ok: true }
+  | { ok: false; retryable: boolean; errorCode: string }
+  /** DurableTaskDeferral: back after `delayMs`, the attempt not counted. */
+  | { ok: false; deferredMs: number; errorCode: string };
 
 export async function finishDurableTask(
   claim: DurableTaskClaim,
-  result: { ok: true } | { ok: false; retryable: boolean; errorCode: string },
+  result: DurableTaskResult,
   now: Date = currentDate(),
   backoffMs: (attempt: number) => number = durableTaskBackoffMs,
 ): Promise<DurableTaskOutcome> {
   let outcome: Exclude<DurableTaskOutcome, "fenced">;
-  let set: Partial<typeof durableTasks.$inferInsert>;
-  if (result.ok) {
+  let set: PgUpdateSetSource<typeof durableTasks>;
+  if (!result.ok && "deferredMs" in result) {
+    // The claim counted an attempt; one more allowed keeps the budget for real tries.
+    outcome = "deferred";
+    set = {
+      claimedBy: null,
+      maxAttempts: sql`${durableTasks.maxAttempts} + 1`,
+      leaseUntil: new Date(now.getTime() + result.deferredMs),
+      lastError: result.errorCode,
+    };
+  } else if (result.ok) {
     outcome = "succeeded";
     set = { state: "succeeded", finishedAt: now, claimedBy: null, lastError: null };
   } else if (result.retryable && claim.attempt < claim.task.maxAttempts) {
@@ -186,7 +215,7 @@ export async function runDurableTask(
     kind: "internal",
     attrs: { task_kind: kind, attempt: claim.attempt },
   });
-  let result: { ok: true } | { ok: false; retryable: boolean; errorCode: string };
+  let result: DurableTaskResult;
   try {
     if (!definition) throw new DurableTaskPermanentError("DURABLE_TASK_KIND_UNKNOWN");
     const payload = definition.decode(claim.task.payload, claim.task.payloadVersion);
@@ -198,7 +227,8 @@ export async function runDurableTask(
     result = { ok: true };
   } catch (error) {
     const permanent = error instanceof DurableTaskPermanentError;
-    result = {
+    if (error instanceof DurableTaskDeferral) result = { ok: false, deferredMs: Math.max(0, error.delayMs), errorCode: error.reason };
+    else result = {
       ok: false,
       retryable: !permanent && (definition?.retryable?.(error) ?? true),
       errorCode: permanent ? error.code : definition?.errorCode?.(error) ?? `ERROR_${errorClassOf(error)}`,
@@ -206,7 +236,7 @@ export async function runDurableTask(
   }
   const outcome = await finishDurableTask(claim, result, clock(), definition?.backoffMs ?? durableTaskBackoffMs);
   durableTasksTotal.inc({ kind, outcome });
-  span.end(outcome === "succeeded" ? "ok" : "error", {
+  span.end(outcome === "succeeded" || outcome === "deferred" ? "ok" : "error", {
     attrs: { outcome, ...(result.ok ? {} : { error_code: result.errorCode }) },
   });
   return outcome;

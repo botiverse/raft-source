@@ -6,6 +6,7 @@ import { useIntl } from "react-intl";
 
 import { useTaskStore } from "../../store/taskStore";
 import type { Task, TaskStatus } from "../../store/taskStore";
+import { useTaskChannelWriteCheck } from "./taskChannelWrite";
 import { TASK_STATUS_UI, canEditTaskStatus, getTaskStatusOptions } from "./taskStatusUi";
 
 /** Focuses a board card by task id; false while it isn't mounted. */
@@ -46,14 +47,15 @@ export function useTaskBoardDrag({ tasks, taskV2, currentUserId, canManageServer
 }) {
   const { formatMessage } = useIntl();
   const updateTaskStatus = useTaskStore((s) => s.updateTaskStatus);
+  const canWriteChannel = useTaskChannelWriteCheck();
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [moveAnnouncement, setMoveAnnouncement] = useState("");
   const activeTask = activeTaskId == null ? undefined : tasks.find((task) => task.id === activeTaskId);
   // Each status the dragged card may move to; its own column takes it back.
   const allowedDropStatuses = useCallback((task: Task): Set<TaskStatus> => {
-    if (!canEditTaskStatus(task, currentUserId, canManageServer)) return new Set();
+    if (!canEditTaskStatus(task, currentUserId, canManageServer, canWriteChannel(task.channelId))) return new Set();
     return new Set([task.status, ...getTaskStatusOptions(task, currentUserId, canManageServer, taskV2).map((o) => o.id)]);
-  }, [currentUserId, canManageServer, taskV2]);
+  }, [currentUserId, canManageServer, taskV2, canWriteChannel]);
   // A card that can't move somewhere can still be picked up, so each column
   // it won't take can say why: a historical joint task, or a status this task
   // doesn't have (Backlog on a pre-v2 task).

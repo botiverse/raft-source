@@ -48,7 +48,6 @@ const ANCHOR_FILE: Readonly<Record<string, string>> = {
   "invite-links": "features/settings/administration/JoinLinksSection.tsx",
   "single-sign-on": "features/settings/sso/ServerSsoSection.tsx",
   "member-permissions": "features/settings/administration/MemberPermissionsSection.tsx",
-  "ai-providers": "components/settings/ProviderConnectionsSettings.tsx",
   "desktop-app": "features/settings/about/AboutSection.tsx",
 };
 

@@ -33,7 +33,7 @@ import type { ArtifactCheckLease, ArtifactCheckLoad, ArtifactCheckReport, Artifa
 import type { CheckBrowser, CheckContext, CheckPage } from "./checkPage";
 import type { Logger, LogFields } from "./log";
 import { createNavigationGuard } from "./navigation";
-import { isBlank, phoneOverflowOf, type PageMeasure } from "./pageChecks";
+import { cantScrollOf, isBlank, phoneOverflowOf, type PageMeasure } from "./pageChecks";
 import { isPng, uniformShare } from "./png";
 import type { CheckShot } from "./raftClient";
 import { createFindings, errorClass, errorClassOf } from "./report";
@@ -189,7 +189,7 @@ export async function runCheck(browser: CheckBrowser, lease: ArtifactCheckLease,
       return { kind: "not_started", errorClass: errorClassOf(error, "browser_page") };
     }
 
-    const report = (load: ArtifactCheckLoad, extra: Pick<ArtifactCheckReport, "blank" | "phoneOverflow"> = {}) =>
+    const report = (load: ArtifactCheckLoad, extra: Pick<ArtifactCheckReport, "blank" | "phoneOverflow" | "pageCantScroll"> = {}) =>
       findings.report({ checkId: lease.checkId, lease: lease.lease, load, ...extra, timing: { ...spent } });
 
     const started = deps.now();
@@ -215,6 +215,8 @@ export async function runCheck(browser: CheckBrowser, lease: ArtifactCheckLease,
     const shots: Partial<Record<CheckShot, Uint8Array>> = {};
     let blank: boolean | undefined;
     let phoneOverflow: ArtifactCheckReport["phoneOverflow"] | undefined;
+    // A soft hint, at every viewport measured: the page may not scroll for readers there.
+    let pageCantScroll: NonNullable<ArtifactCheckReport["pageCantScroll"]> | undefined;
     for (const viewport of [first, ...others]) {
       if (viewport !== first) {
         try {
@@ -242,10 +244,14 @@ export async function runCheck(browser: CheckBrowser, lease: ArtifactCheckLease,
       if (viewport === first && measure !== null) {
         blank = isBlank(measure.textLength, measure.textLength === 0 && shot !== null ? await uniformShare(shot) : null);
       }
-      if (viewport.mobile && measure !== null) phoneOverflow = phoneOverflowOf(measure);
+      if (viewport.mobile && measure !== null) phoneOverflow = phoneOverflowOf(measure, viewport.width);
+      if (measure?.scroll !== undefined) {
+        const cantScroll = cantScrollOf(measure, viewport);
+        pageCantScroll = [...(pageCantScroll ?? []), ...(cantScroll === null ? [] : [cantScroll])];
+      }
     }
     spent.shotsMs = wholeMs(deps.now() - settled);
-    return { kind: "ran", report: report({ outcome: "ok" }, { blank, phoneOverflow }), shots };
+    return { kind: "ran", report: report({ outcome: "ok" }, { blank, phoneOverflow, pageCantScroll }), shots };
   } finally {
     await withTimeout(context.close(), timing.stepTimeoutMs).catch((error: unknown) => {
       deps.log("warn", "context.close_failed", { ...ids, errorClass: errorClassOf(error, "context_close") });

@@ -5,6 +5,13 @@ import { forkHeapExecArgv, isCi, localMaxWorkers, runRecordPlugin } from "../../
 import { holdTestSlotForThisRun } from "../../scripts/vitest/testSlot";
 import { useDevRunEnv } from "../../scripts/dev/raftdev-cache";
 import { defaultTestIncludes } from "./scripts/testLocations";
+import { reactCompilerPlugins } from "./scripts/reactCompilerSwitch";
+
+// Dev trace (scripts/vitest/devTraceReporter.ts): loaded lazily so that a
+// problem in it can never stop this config from loading.
+const devTrace = await import("../../scripts/vitest/devTraceReporter")
+  .then((module) => [module.devTracePlugin("@botiverse/raft-web")])
+  .catch(() => []);
 
 const webRoot = fileURLToPath(new URL(".", import.meta.url));
 const dom = process.env.RAFT_WEB_TEST_DOM === "1";
@@ -65,7 +72,9 @@ const assertAliases = [
 
 export default defineConfig({
   root: webRoot,
-  plugins: ci ? [] : [runRecord],
+  // RAFT_WEB_REACT_COMPILER=1 runs the tests against compiled components, as the
+  // staging web build ships them (scripts/reactCompilerSwitch.ts); nothing otherwise.
+  plugins: [...devTrace, ...(ci ? [] : [runRecord]), reactCompilerPlugins(process.env, webRoot, { everyEnvironment: true })],
   resolve: {
     alias: [{ find: /^\.\/fakeArtifactSourceSlot$/, replacement: testFakeArtifactSourceSlot }, ...assertAliases],
   },

@@ -1,0 +1,43 @@
+host: oar
+runtime: opencode
+scenario: cold-fresh
+promptSource: cold_start_with_memory
+
+## standing prompt
+= standing-prompt.md
+
+## carrier
+launch.options.systemPrompt: (absent)
+launch.options.appendSystemPrompt: (absent)
+launch.options.env.OPENCODE_CONFIG_CONTENT:
+{
+  "provider": {},
+  "agent": {
+    "slock": {
+      "description": "Slock agent runtime",
+      "prompt": "⟪STANDING_PROMPT⟫"
+    }
+  },
+  "mcp": {},
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "slock",
+  "compaction": {
+    "background": false
+  }
+}
+
+## first input (253 chars, sha256:5316b5a003713f70, does not contain the standing prompt)
+<memory-index file="MEMORY.md" size="0.1 KB" complete="true" note="no need to re-read MEMORY.md unless you change it">
+# Alice
+
+## Role
+Keeps the release notes
+
+## Key Knowledge
+- No notes yet.
+
+## Active Context
+- First startup.
+</memory-index>
+
+Start.

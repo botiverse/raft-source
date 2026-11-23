@@ -2,6 +2,7 @@
 // formatter share (rows of `inbox check`, `inbox read`, `inbox dismiss`).
 import { describe, expect, it } from "vitest";
 import {
+  AGENT_API_INBOX_ROWS_MAX_TARGETS,
   AGENT_INBOX_OBJECT_REF_PATTERN,
   AGENT_INBOX_READ_MAX_ENTRIES,
   agentApiContract,
@@ -13,6 +14,8 @@ import {
   agentApiInboxListResponseSchema,
   agentApiInboxReadBodySchema,
   agentApiInboxReadResponseSchema,
+  agentApiInboxRowsBodySchema,
+  agentApiInboxRowsResponseSchema,
   agentApiMessageEnvelopeSchema,
   type AgentApiInboxItemRow,
 } from "./agentApiContract";
@@ -255,5 +258,29 @@ describe("RFC 081 inbox routes", () => {
   it("delegates neither to an assistant", () => {
     expect(assistantDelegationCategory("inboxRead")).toBeNull();
     expect(assistantDelegationCategory("inboxDismiss")).toBeNull();
+  });
+
+  it("declares rows as a POST that only reads: the named conversations by channel id and newest seq, at most the cap", () => {
+    expect(agentApiContract.inboxRows).toMatchObject({ method: "POST", fullPath: "/internal/agent-api/inbox/rows", capability: "read", client: { resource: "inbox", method: "rows" } });
+    expect(AGENT_API_ROUTE_META.inboxRows).toEqual({ sideEffect: "read", idempotency: "natural", destructive: false, audience: "both" });
+    const target = { channelId: "11111111-1111-4111-8111-111111111111", newestSeq: 1203 };
+    const body = (targets: unknown) => agentApiInboxRowsBodySchema.safeParse({ targets }).success;
+    expect(body([target])).toBe(true);
+    expect(body(Array.from({ length: AGENT_API_INBOX_ROWS_MAX_TARGETS }, () => target))).toBe(true);
+    expect(body(Array.from({ length: AGENT_API_INBOX_ROWS_MAX_TARGETS + 1 }, () => target))).toBe(false);
+    expect(body([])).toBe(false);
+    expect(agentApiInboxRowsBodySchema.safeParse({}).success).toBe(false);
+    for (const bad of [{ ...target, channelId: "#general" }, { ...target, newestSeq: 0 }, { ...target, newestSeq: 1.5 }, { ...target, newestSeq: "1203" }, { channelId: target.channelId }]) {
+      expect(body([bad])).toBe(false);
+    }
+    const response = { rows: [], behind: 0, otherUnread: { conversations: 0, messages: 0, mentions: 0, dms: 0 } };
+    expect(agentApiInboxRowsResponseSchema.parse(response)).toEqual(response);
+    expect(agentApiInboxRowsResponseSchema.safeParse({ ...response, otherUnread: { conversations: 0 } }).success).toBe(false);
+    expect(agentApiInboxRowsResponseSchema.safeParse({ rows: [], behind: 0 }).success).toBe(false);
+    // Each row names the conversation it answers; a row of `inbox check` has no id and is not a row here.
+    const row = { target: "#general", kind: "conversation", unread: 1, latestSender: null, preview: null, previewTruncated: false, firstUnreadAt: null, latestAt: null, preLaunch: false };
+    expect(agentApiInboxItemRowSchema.safeParse(row).success).toBe(true);
+    expect(agentApiInboxRowsResponseSchema.safeParse({ ...response, rows: [{ ...row, channelId: target.channelId }] }).success).toBe(true);
+    expect(agentApiInboxRowsResponseSchema.safeParse({ ...response, rows: [row] }).success).toBe(false);
   });
 });

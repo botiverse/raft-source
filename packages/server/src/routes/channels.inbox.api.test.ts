@@ -29,7 +29,7 @@ import {
 } from "../db/schema";
 import { addMember, createServer as createServerService } from "../services/serverService";
 import { createAgent } from "../services/agentService";
-import { RESIDUE_ONLY_READ_ALL_RECEIPT_FIELDS, __testReadStateAuthority, createChannel, getOrCreateThread, addHuman, addAgent, removeHuman, removeAgent, findOrCreateDM, findOrCreateUserDM, isChannelHuman, deleteChannel, markRead, markReadLatest, getInboxItems } from "../services/channelService";
+import { RESIDUE_ONLY_READ_ALL_RECEIPT_FIELDS, __testReadStateAuthority, createChannel, getOrCreateThread, addHuman, addAgent, removeHuman, removeAgent, findOrCreateDM, findOrCreateUserDM, isChannelHuman, deleteChannel, markRead, markReadLatest, getInboxItems, __testUnfollowedOverlayCap } from "../services/channelService";
 import {
   __resetMessageServiceDepsForTests,
   __setMessageServiceDepsForTests,
@@ -427,6 +427,8 @@ test("GET /api/channels/inbox records inbox phases and query shape", async ({ ap
       // The unfollowed-active thread list (getFollowedThreads, legacy path:
       // state "unfollowed_active").
       "followed_threads.source_selected",
+      // The overlay's cap / main-list dedup outcome (capped-rate measure).
+      "inbox.unfollowed_overlay.loaded",
       "inbox.loaded",
       "response.ready",
       "inbox.backpressure.released",
@@ -532,9 +534,13 @@ test("GET /api/channels/inbox records inbox phases and query shape", async ({ ap
     assert.equal(triggeredAttrs?.fetch_reason, "realtime_fallback");
     assert.equal(triggeredAttrs?.fetch_trigger, "thread_reply");
     assert.equal(triggeredAttrs?.fetch_coalesced, 4);
-    const unknownAttrs = await fetchAttrsFor({ "X-Raft-Fetch-Trigger": "socket:anything", "X-Raft-Fetch-Coalesced": "lots" });
+    assert.equal(triggeredAttrs?.fetch_refused, undefined, "an older web sends no refusal");
+    const refusedAttrs = await fetchAttrsFor({ "X-Raft-Fetch-Trigger": "thread_reply", "X-Raft-Fetch-Coalesced": "1", "X-Raft-Fetch-Refused": "not_listed" });
+    assert.equal(refusedAttrs?.fetch_refused, "not_listed");
+    const unknownAttrs = await fetchAttrsFor({ "X-Raft-Fetch-Trigger": "socket:anything", "X-Raft-Fetch-Coalesced": "lots", "X-Raft-Fetch-Refused": "because" });
     assert.equal(unknownAttrs?.fetch_trigger, "other");
     assert.equal(unknownAttrs?.fetch_coalesced, 0);
+    assert.equal(unknownAttrs?.fetch_refused, "other");
   } finally {
     if (previousRfc056ServingMode === undefined) {
       delete process.env.RISINGWAVE_INBOX_RFC056_SERVING_MODE;
@@ -1395,6 +1401,68 @@ test("GET /channels/inbox mixes channels and followed threads with unread as a f
     ),
     "new channel activity should clear the channel done marker",
   );
+});
+
+
+test("GET /channels/inbox keeps a muted Done channel hidden past plain sends that clear done_at; a mention relights it at its pre-mute message", async ({ app }) => {
+  const f = await seedThreadFixture(app.baseUrl);
+  const db = getDb();
+  const memberBToken = await tokenForHuman("member-b@slock.test");
+  const send = async (content: string) => {
+    const res = await fetch(`${app.baseUrl}/api/messages`, {
+      method: "POST",
+      headers: headers(memberBToken, f.serverId),
+      body: JSON.stringify({ channelId: f.parentChannelId, content }),
+    });
+    assert.equal(res.status, 200);
+    return await res.json() as { id: string; seq: number };
+  };
+  const channelRow = async (filter: "all" | "mentions") => {
+    const res = await fetch(`${app.baseUrl}/api/channels/inbox?filter=${filter}`, {
+      headers: headers(f.ownerToken, f.serverId),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { items: Array<{ kind: string; channelId?: string; hasMention?: boolean; lastMessageId?: string; lastMessagePreview?: string }> };
+    return body.items.find((item) => item.kind === "channel" && item.channelId === f.parentChannelId);
+  };
+
+  const preMute = await send("before the owner mutes");
+  const muteRes = await fetch(`${app.baseUrl}/api/channels/${f.parentChannelId}/notification-settings`, {
+    method: "PATCH",
+    headers: headers(f.ownerToken, f.serverId),
+    body: JSON.stringify({ activityMuted: true }),
+  });
+  assert.equal(muteRes.status, 200);
+  const doneRes = await fetch(`${app.baseUrl}/api/channels/inbox/done`, {
+    method: "POST",
+    headers: headers(f.ownerToken, f.serverId),
+    body: JSON.stringify(await channelDoneBody(f.parentChannelId)),
+  });
+  assert.equal(doneRes.status, 200);
+  assert.equal(await channelRow("all"), undefined, "Done hides the muted channel");
+
+  await send("plain traffic past the mute");
+  const [state] = await db.select({ doneAt: userChannelInboxStates.doneAt }).from(userChannelInboxStates).where(and(
+    eq(userChannelInboxStates.userId, f.ownerId),
+    eq(userChannelInboxStates.channelId, f.parentChannelId),
+  ));
+  assert.equal(state?.doneAt ?? null, null, "the send path clears the broad done_at");
+  assert.equal(await channelRow("all"), undefined, "a plain post-mute message does not reopen the Done muted channel");
+  assert.equal(await channelRow("mentions"), undefined, "nor in Mentions");
+
+  const mention = await send("@owner past the mute and Done");
+  const [mentionRow] = await db.select({ messageId: messageMentions.messageId }).from(messageMentions).where(and(
+    eq(messageMentions.messageId, mention.id),
+    eq(messageMentions.targetId, f.ownerId),
+  ));
+  assert.ok(mentionRow, "the send path records the personal mention");
+  for (const filter of ["all", "mentions"] as const) {
+    const row = await channelRow(filter);
+    assert.ok(row, `${filter}: a personal mention past the mute relights the Done muted channel`);
+    assert.equal(row.hasMention, true, `${filter}: the relit row carries the mention`);
+    assert.equal(row.lastMessageId, preMute.id, `${filter}: the relit row stays at its pre-mute message`);
+    assert.equal(row.lastMessagePreview, "before the owner mutes", `${filter}: preview is the pre-mute message`);
+  }
 });
 
 
@@ -3304,3 +3372,168 @@ test("task #48 U6: the residue path emits no socket event carrying the live fron
 // This first tooth drives the error path through an injected failing executor so it
 // runs on PGlite too (CI has no real PG). The second tooth below proves the same
 // contract under a REAL statement_timeout, which PGlite does not enforce.
+
+
+// ---------------------------------------------------------------------------
+// Activity All: the unfollowed-active overlay is capped (maxRows, floored at the
+// Done/Unfollowed history default) and deduped against the whole main list.
+
+async function seedUnfollowedOverlayFixture(slug: string, unfollowedCount: number) {
+  const db = getDb();
+  const owner = await seedUser(`${slug}-owner@slock.test`, `${slug}-owner`);
+  const peer = await seedUser(`${slug}-peer@slock.test`, `${slug}-peer`);
+  const server = await createServer(`${slug} Server`, slug, owner.id);
+  await addMember(server.id, peer.id);
+  const room = await createChannel(server.id, `${slug}-room`);
+  await addHuman(room.id, owner.id);
+  await addHuman(room.id, peer.id);
+  const unfollowed: Array<{ threadId: string; parentId: string }> = [];
+  for (let index = 0; index < unfollowedCount; index += 1) {
+    const parent = await createMessage(room.id, "user", peer.id, `${slug} unfollowed start ${index}`);
+    const thread = await getOrCreateThread(parent.id, peer.id, "user");
+    await createMessage(thread.id, "user", peer.id, `${slug} unfollowed reply ${index}`);
+    await db.insert(threadFollows).values({
+      threadChannelId: thread.id, followerType: "user", followerId: owner.id, parentMessageId: parent.id, reason: "manual", unfollowedAt: new Date(),
+    });
+    unfollowed.push({ threadId: thread.id, parentId: parent.id });
+  }
+  return { owner, peer, server, room, unfollowed };
+}
+
+async function readActivityAllTraced(serverId: string, userId: string, limit: number, offset: number) {
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink });
+  const root = tracer.startSpan("server.http.request", { surface: "server", kind: "server" });
+  const result = await runWithTraceSpan(root, () => getInboxItems(serverId, userId, {
+    filter: "all",
+    limit,
+    offset,
+    includeUnfollowedThreads: true,
+  }), tracer);
+  root.end();
+  const span = sink.getAllSpans().find((candidate) => candidate.name === "server.http.request");
+  assert.ok(span);
+  const overlayEvents = span.events.filter((event) => event.name === "inbox.unfollowed_overlay.loaded");
+  assert.equal(overlayEvents.length, 1, "one overlay trace event per Activity All read");
+  return { result, overlay: overlayEvents[0]!.attrs ?? {} };
+}
+
+function activityPageShape(result: Awaited<ReturnType<typeof getInboxItems>>) {
+  return {
+    items: result.items.map((item) => ({ ...item })),
+    groups: result.groups,
+    hasMore: result.hasMore,
+    totalCount: result.totalCount,
+  };
+}
+
+test("Activity All below the unfollowed overlay cap: pages, hasMore, totals and groups match the uncapped read", async ({ app }) => {
+  void app;
+  const f = await seedUnfollowedOverlayFixture("overlay-below-cap", 3);
+  const control = await createChannel(f.server.id, "overlay-below-cap-control");
+  await addHuman(control.id, f.owner.id);
+  await createMessage(control.id, "user", f.peer.id, "control activity");
+  try {
+    for (const [limit, offset] of [[2, 0], [2, 2], [1, 3], [30, 0]] as const) {
+      __testUnfollowedOverlayCap.set(null);
+      const uncapped = await readActivityAllTraced(f.server.id, f.owner.id, limit, offset);
+      __testUnfollowedOverlayCap.reset();
+      const capped = await readActivityAllTraced(f.server.id, f.owner.id, limit, offset);
+      assert.deepEqual(activityPageShape(capped.result), activityPageShape(uncapped.result), `page limit=${limit} offset=${offset}`);
+      assert.equal(capped.overlay["inbox.unfollowed_overlay.capped"], false);
+      assert.equal(capped.overlay["inbox.unfollowed_overlay.loaded_count"], 3);
+      assert.equal(capped.overlay["inbox.unfollowed_overlay.max_rows"], Math.max(101, offset + limit + 1));
+    }
+  } finally {
+    __testUnfollowedOverlayCap.reset();
+  }
+});
+
+test("Activity All past the unfollowed overlay cap loads at most the cap, most recent first, and traces the cap hit", async ({ app }) => {
+  void app;
+  const f = await seedUnfollowedOverlayFixture("overlay-past-cap", 5);
+  try {
+    __testUnfollowedOverlayCap.set(null);
+    const uncapped = await readActivityAllTraced(f.server.id, f.owner.id, 1, 0);
+    assert.equal(uncapped.overlay["inbox.unfollowed_overlay.loaded_count"], 5);
+    // limit 1, offset 0: the page window is 2 rows, the cap floor 2.
+    __testUnfollowedOverlayCap.set(2);
+    const capped = await readActivityAllTraced(f.server.id, f.owner.id, 1, 0);
+    assert.equal(capped.overlay["inbox.unfollowed_overlay.capped"], true);
+    assert.equal(capped.overlay["inbox.unfollowed_overlay.max_rows"], 2);
+    const loaded = Number(capped.overlay["inbox.unfollowed_overlay.loaded_count"]);
+    assert.ok(loaded <= 2, `overlay rows loaded (${loaded}) must not exceed the cap`);
+    // The newest unfollowed thread (latest reply) survives the SQL cap, so the
+    // first page is the same row as uncapped.
+    assert.deepEqual(capped.result.items.map(inboxItemIdentityForTest), uncapped.result.items.map(inboxItemIdentityForTest));
+    assert.equal(
+      capped.result.items.some((item) => item.kind === "thread" && item.threadChannelId === f.unfollowed[4]!.threadId),
+      true,
+    );
+    // Past the cap totals are lower bounds, computed from what was loaded.
+    assert.ok(capped.result.totalCount <= uncapped.result.totalCount);
+    assert.equal(capped.result.hasMore, true);
+  } finally {
+    __testUnfollowedOverlayCap.reset();
+  }
+});
+
+test("Activity All does not double count an unfollowed thread that is also a main row past the loaded window", async ({ app }) => {
+  void app;
+  const db = getDb();
+  const f = await seedUnfollowedOverlayFixture("overlay-dedup", 1);
+  const unfollowedThreadId = f.unfollowed[0]!.threadId;
+  // A newer mention in the unfollowed thread: it is a main Activity row too.
+  const mention = await createMessage(unfollowedThreadId, "user", f.peer.id, "@overlay-dedup-owner after unfollow");
+  await db.insert(messageMentions).values({
+    messageId: mention.id,
+    messageSeq: mention.seq,
+    serverId: f.server.id,
+    channelId: unfollowedThreadId,
+    targetType: "user",
+    targetId: f.owner.id,
+    handleAtSendTime: f.owner.name,
+    notifiedAt: new Date(),
+  });
+  await recordTestInboxFact({
+    serverId: f.server.id,
+    receiverId: f.owner.id,
+    kind: "thread",
+    sourceChannelId: unfollowedThreadId,
+    message: mention,
+    personalMention: true,
+  });
+  // Newer main rows push the thread's main row past a small page window.
+  for (let index = 0; index < 3; index += 1) {
+    const channel = await createChannel(f.server.id, `overlay-dedup-newer-${index}`);
+    await addHuman(channel.id, f.owner.id);
+    const message = await createMessage(channel.id, "user", f.peer.id, `newer activity ${index}`);
+    await recordTestInboxFact({ serverId: f.server.id, receiverId: f.owner.id, kind: "channel", sourceChannelId: channel.id, message });
+  }
+
+  const mainOnly = await getInboxItems(f.server.id, f.owner.id, { filter: "all", limit: 100 });
+  assert.equal(
+    mainOnly.items.some((item) => item.kind === "thread" && item.threadChannelId === unfollowedThreadId),
+    true,
+    "fixture: the unfollowed thread must also be a main Activity row",
+  );
+  // The whole list in one window: every main row is loaded, so the dedup is exact.
+  const whole = await readActivityAllTraced(f.server.id, f.owner.id, 100, 0);
+  const distinct = new Set(whole.result.items.map(inboxItemIdentityForTest));
+  assert.equal(distinct.size, whole.result.items.length);
+  assert.equal(whole.result.totalCount, distinct.size);
+
+  const seen: string[] = [];
+  for (let offset = 0; offset < distinct.size; offset += 1) {
+    const page = await readActivityAllTraced(f.server.id, f.owner.id, 1, offset);
+    assert.equal(page.result.totalCount, distinct.size, `deep page offset=${offset} totalCount`);
+    assert.deepEqual(page.result.groups, whole.result.groups, `deep page offset=${offset} groups`);
+    seen.push(...page.result.items.map(inboxItemIdentityForTest));
+  }
+  assert.equal(new Set(seen).size, seen.length, "no row listed twice across pages");
+  assert.deepEqual(seen, whole.result.items.map(inboxItemIdentityForTest));
+});
+
+function inboxItemIdentityForTest(item: { kind: string; threadChannelId?: string; channelId?: string }): string {
+  return `${item.kind}:${item.kind === "thread" || item.kind === "task" ? item.threadChannelId : item.channelId}`;
+}

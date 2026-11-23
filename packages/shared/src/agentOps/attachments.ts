@@ -4,7 +4,10 @@
 // Agent API; it goes through `fetch` + `FormData` (Workers-safe) rather than
 // the JSON transport. The Server still requires a `channelId`, so the target
 // is resolved first through `POST /resolve-channel`, exactly as the CLI does.
+// An upload can be held before any request by a hold the caller passes
+// (#347: an HTML or Markdown file, agentOps/attachmentArtifactHold.ts).
 
+import { fetchWithoutRedirect } from "../fetchWithoutRedirect";
 import { foldAgentOneLineText } from "../agentMessageText";
 import { z } from "zod";
 import { lazySchema } from "../lazySchema";
@@ -14,7 +17,7 @@ import type { AgentApiAttachmentCommentsResponse, AgentApiAttachmentDownloadUrlR
 import { agentApiContract } from "../agentApiContract";
 import { formatAgentAttachmentComments, formatAgentAttachmentUploaded, type AgentAttachmentCommentRow } from "../agentText/attachments";
 import { formatHint, hintStep, RAFT_HINTS, type RaftHintOptions } from "./hint";
-import { failureFromClientResult, failureOutcome, opError, opErrorFromClientError, validateOpRequest, type RaftNextStep, type RaftOutcome } from "./outcome";
+import { failureFromClientResult, failureOutcome, opError, opErrorFromClientError, validateOpRequest, type RaftFailure, type RaftNextStep, type RaftOutcome } from "./outcome";
 import { requestSchema } from "./requestSchema";
 
 export const attachmentCommentsRequestSchema = lazySchema("attachmentCommentsRequestSchema", () => requestSchema<{ attachmentId: string; limit?: number }>()(z.object({
@@ -85,6 +88,14 @@ export interface AttachmentTransport {
 export type RaftAttachmentUploaded = AgentApiAttachmentUploadResponse & { target: string; mimeType: string | null };
 
 /**
+ * A hold an upload passes before any request (#347: an HTML or Markdown file
+ * held once, agentOps/attachmentArtifactHold.ts makes it): `held` stops the
+ * upload with its failure; else `release` runs once the upload went through.
+ * Injected, so this module (the SDK's) carries none of the hold's code.
+ */
+export type AttachmentUploadHold = (upload: { filename: string; target: string; bytes: Uint8Array }) => Promise<{ held: RaftFailure; release?: undefined } | { held?: undefined; release: () => Promise<void> }>;
+
+/**
  * Upload bytes into a conversation, choosing the path the CLI would: multipart
  * `POST /upload` below the Server's direct-upload threshold, an upload session
  * (create → PUT to a presigned URL → complete) at or above it.
@@ -93,7 +104,7 @@ export async function uploadAttachment(
   client: Pick<AgentApiClient, "channels" | "attachments">,
   transport: AttachmentTransport,
   request: UploadAttachmentRequest,
-  options: RaftHintOptions = {},
+  options: RaftHintOptions & { hold?: AttachmentUploadHold } = {},
 ): Promise<RaftOutcome<RaftAttachmentUploaded, "uploaded">> {
   if (!request.target?.trim() || !request.filename?.trim()) {
     return failureOutcome(opError("INVALID_REQUEST", { message: "A target and a filename are required to upload." }));
@@ -104,7 +115,20 @@ export async function uploadAttachment(
   if (request.mimeType !== undefined && !MIME_TYPE_RE.test(request.mimeType.trim())) {
     return failureOutcome(opError("INVALID_REQUEST", { message: `mimeType must look like type/subtype, got: ${request.mimeType}` }));
   }
+  // The caller's hold (#347), the last check before any request.
+  const hold = options.hold ? await options.hold({ filename: request.filename, target: request.target, bytes: request.bytes }) : null;
+  if (hold?.held) return hold.held;
+  const outcome = await sendAttachment(client, transport, request, options);
+  if (outcome.ok) await hold?.release();
+  return outcome;
+}
 
+async function sendAttachment(
+  client: Pick<AgentApiClient, "channels" | "attachments">,
+  transport: AttachmentTransport,
+  request: UploadAttachmentRequest,
+  options: RaftHintOptions,
+): Promise<RaftOutcome<RaftAttachmentUploaded, "uploaded">> {
   const capability = await client.attachments.uploadCapabilities();
   const maxBytes = capability.ok ? capability.data.maxBytes : AGENT_ATTACHMENT_UPLOAD_FALLBACK_MAX_BYTES;
   const threshold = capability.ok && capability.data.directUploadEnabled ? capability.data.directUploadThresholdBytes : null;
@@ -204,7 +228,7 @@ async function uploadThroughSession(
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let response: Response;
     try {
-      response = await transport.fetch(upload.url, { method: upload.method ?? "PUT", headers: { ...upload.headers }, body: body.buffer, redirect: "error" });
+      response = await fetchWithoutRedirect(transport.fetch, upload.url, { method: upload.method ?? "PUT", headers: { ...upload.headers }, body: body.buffer });
     } catch {
       if (attempt === 0) continue;
       break; // outcome unknown: let completion verify whether the write exists

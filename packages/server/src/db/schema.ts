@@ -2,6 +2,7 @@ import type { SlackLifecycleClock, SlackChannelLifecycleObservation } from "../s
 import type { SlackIngressReleaseRecord } from "../services/slackVerifiedIngressRolloutContracts";
 import type { SlackReconciliationScan } from "../services/slackReconciliationScan";
 import type { AgentRuntimeApprovalItem } from "../services/agentRuntimeApprovalItem";
+import type { AgentCliInboxItemsObservation } from "../services/agentCliInboxItems";
 import type { ILinkBotId, ILinkQrcodeHandle, ILinkUserId, WeChatContextToken } from "../services/wechatILinkClient";
 import type { SyncHorizon } from "../services/syncHorizon";
 import { createAppSumoClaimId, type AppSumoClaimId, type AppSumoLicenseKey } from "../services/appSumoContracts";
@@ -12,6 +13,7 @@ import { DISPLAY_LOCALES } from "@botiverse/raft-shared/src/displayLocales";
 import type { DisplayLocale } from "@botiverse/raft-shared/src/displayLocales";
 import type { AgentCallApprovalDecidedBy, AgentContextViewGrantId, AgentVoiceCallId, ChannelSideLayout, ReadinessFact, ServerRole, StoredShortcutOverrides } from "@botiverse/raft-shared";
 import type { ActivityTurnSummary, AnnouncementAudience, AnnouncementAudienceSnapshot, AnnouncementContent, MentionDeliveryTerminalDecision } from "@botiverse/raft-shared";
+import type { DataExportScope, JsonValue } from "@botiverse/raft-shared";
 import { pgTable, pgSequence, text, timestamp, integer, bigint, bigserial, uuid, primaryKey, unique, uniqueIndex, index, json, jsonb, boolean, customType, check, date, foreignKey, smallint, type AnyPgColumn } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
@@ -31,7 +33,6 @@ import type {
   RuntimeConfig,
   TrajectoryEntry,
   ManagedMcpToolCatalogEntry,
-  ProviderConnectionProviderId,
   TaskResourceReceipt,
 } from "@botiverse/raft-shared";
 
@@ -311,6 +312,11 @@ export const oauthTransactions = socialAuthCompletions;
  * login, the signed-in web user confirms, and the app exchanges a one-time
  * code plus its PKCE verifier for a normal user session. Not an OAuth
  * transaction: no provider, no provider callback.
+ *
+ * `purpose = 'step_up'` (services/appStepUpService.ts): the same handoff
+ * verifies an app's own sign-in (`target_family_id`) with a legacy passkey
+ * on the web, for `user_id` (set at start from the app's bearer). Its code
+ * only marks that sign-in verified; the login routes never read such a row.
  */
 export const appLoginRequests = pgTable("app_login_requests", {
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
@@ -330,11 +336,24 @@ export const appLoginRequests = pgTable("app_login_requests", {
   approverFamilyId: uuid("approver_family_id").references((): AnyPgColumn => sessionFamilies.id, { onDelete: "set null" }),
   consumedAt: timestamp("consumed_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  // `login`: the handoff above. `step_up`: an app's sign-in verified on the web.
+  purpose: text("purpose", { enum: ["login", "step_up"] }).notNull().default("login"),
+  // step_up only: the app's sign-in the code marks verified. Set at start;
+  // SET NULL like the other family pointers (and the QA seed purge of
+  // session_families): a step_up row whose sign-in is gone matches no
+  // family, so it can never be verified or redeemed.
+  targetFamilyId: uuid("target_family_id").references((): AnyPgColumn => sessionFamilies.id, { onDelete: "set null" }),
+  // step_up only: the StepUpAction the app asked for (stepUpGate.ts), shown on the page.
+  stepUpAction: text("step_up_action"),
 }, (table) => [
   uniqueIndex("idx_app_login_requests_code_hash").on(table.codeHash),
   index("idx_app_login_requests_approver_family").on(table.approverFamilyId),
   index("idx_app_login_requests_expires_at").on(table.expiresAt),
+  // At most one open step-up per app sign-in: a new start ends the previous one.
+  uniqueIndex("idx_app_login_requests_step_up_pending").on(table.targetFamilyId).where(sql`purpose = 'step_up' AND status = 'pending'`),
   check("app_login_requests_status_check", sql`${table.status} IN ('pending', 'approved', 'denied', 'completed')`),
+  check("app_login_requests_purpose_check", sql`${table.purpose} IN ('login', 'step_up')`),
+  check("app_login_requests_step_up_target_check", sql`${table.purpose} = 'step_up' OR ${table.targetFamilyId} IS NULL`),
 ]);
 
 export const userLegalAcceptances = pgTable("user_legal_acceptances", {
@@ -362,7 +381,14 @@ export const servers = pgTable("servers", {
   slug: text("slug").notNull().unique(),
   kind: text("kind", { enum: ["normal", "joint_storage"] }).notNull().default("normal"),
   ownerId: uuid("owner_id").notNull().references(() => users.id),
+  // The joiner greeter (Settings → Onboarding): any agent an owner/admin picks, or
+  // none. Never a setup signal.
   onboardingAgentId: uuid("onboarding_agent_id"),
+  // The official onboarding agent (Cindy) the server created for its owner's setup
+  // (serverService.linkOfficialOnboardingAgent). Setup state, Create Cindy's "already
+  // exists" and the owner briefing read this, never the greeter. Kept after she is
+  // deleted: the server did have its Cindy.
+  officialOnboardingAgentId: uuid("official_onboarding_agent_id"),
   agentAllChannelGreetingEnabled: boolean("agent_all_channel_greeting_enabled").notNull().default(true),
   hideHumansFromMembers: boolean("hide_humans_from_members").notNull().default(false),
   // Task #70. When true, logged-out visitors may READ this server's guest-visible ordinary
@@ -384,6 +410,11 @@ export const servers = pgTable("servers", {
   // RFC-067 §3.6: the owner's workspace-wide product-analytics switch. When
   // false, nobody's activity in this server is linked to an analytics_id.
   productAnalyticsEnabled: boolean("product_analytics_enabled").notNull().default(true),
+  // Data export (#triage:#512 design §4 "Owner 的开关"): whether members'
+  // personal exports may include the other people's messages of this
+  // server's conversations they see (context). Off by default; only an owner
+  // (exportServerData) switches it. Members' own messages are theirs either way.
+  memberContextExportEnabled: boolean("member_context_export_enabled").notNull().default(false),
   planDowngradedAt: timestamp("plan_downgraded_at", { withTimezone: true }),
   // Task v2 (#wg-task-v2:#24): when this server was first seen with
   // task_v2_conversations_v0 on, written once (only while NULL) by the idle
@@ -999,6 +1030,10 @@ export const webauthnCredentials = pgTable("webauthn_credentials", {
   backupEligible: boolean("backup_eligible").notNull().default(false),
   backupState: boolean("backup_state").notNull().default(false),
   transports: text("transports").array(),
+  // The WebAuthn RP ID it was registered under (services/secondFactor/webauthn.ts).
+  // NULL: registered before this column, under the RP ID then configured, now
+  // WEBAUTHN_LEGACY_RP_ID when that is set (effectivePasskeyRpId). Never backfilled.
+  rpId: text("rp_id"),
   // The person's own label for it.
   name: text("name").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -1040,7 +1075,7 @@ export const userBackupCodes = pgTable("user_backup_codes", {
 ]);
 
 /** What an auth challenge is for: see `authChallenges.kind`. */
-export type AuthChallengeKind = "webauthn_registration" | "webauthn_assertion" | "second_factor_login" | "account_deletion_email_code";
+export type AuthChallengeKind = "webauthn_registration" | "webauthn_assertion" | "webauthn_app_step_up" | "second_factor_login" | "account_deletion_email_code" | "data_export_email_code";
 /**
  * Context bound to a challenge when it is created (a pending sign-in's token
  * hash, a client binding, the WebAuthn user handle, ...): flat JSON scalars,
@@ -1048,10 +1083,13 @@ export type AuthChallengeKind = "webauthn_registration" | "webauthn_assertion" |
  */
 export type AuthChallengePayload = Readonly<Record<string, string | number | boolean | null>>;
 
-// Short-lived, single-use challenges: WebAuthn registration and assertion,
-// the second-factor step of a sign-in, and the emailed code that confirms an
-// account deletion request (services/accountDeletion/emailCode.ts; its
-// payload binds the session family and holds a keyed digest of the code).
+// Short-lived, single-use challenges: WebAuthn registration and assertion
+// (`webauthn_app_step_up`: an assertion for one app step-up request, its own
+// kind so no other ceremony ever consumes it, services/appStepUpService.ts),
+// the second-factor step of a sign-in, and the emailed codes that confirm an
+// account deletion request or a data export (services/accountDeletion/emailCode.ts,
+// one kind per flow so a code never crosses flows; its payload binds the
+// session family and holds a keyed digest of the code).
 // Only a SHA-256 hash of the challenge is stored; it is consumed once by
 // compare-and-set.
 export const authChallenges = pgTable("auth_challenges", {
@@ -1070,7 +1108,7 @@ export const authChallenges = pgTable("auth_challenges", {
 }, (t) => [
   index("idx_auth_challenges_user_kind").on(t.userId, t.kind),
   index("idx_auth_challenges_expires_at").on(t.expiresAt),
-  check("auth_challenges_kind_check", sql`${t.kind} IN ('webauthn_registration', 'webauthn_assertion', 'second_factor_login', 'account_deletion_email_code')`),
+  check("auth_challenges_kind_check", sql`${t.kind} IN ('webauthn_registration', 'webauthn_assertion', 'webauthn_app_step_up', 'second_factor_login', 'account_deletion_email_code', 'data_export_email_code')`),
 ]);
 
 // Per-person limit on second-step attempts after a first factor: a rolling
@@ -1223,6 +1261,14 @@ export const agents = pgTable("agents", {
   creatorType: text("creator_type", { enum: ["user", "agent"] }),
   creatorId: uuid("creator_id"),
   machineId: uuid("daemon_id").references(() => machines.id, { onDelete: "set null" }),
+  // Whether the agent's `raft` CLI lists app items in its inbox
+  // (`inbox-items@1`), as its last CLI request declared, and on which
+  // Computer and daemon version (#proj-apps:#88), with when it was last seen
+  // (`seenAt`, refreshed at most hourly). Null: never seen. Read only while
+  // that Computer and version are still the agent's; for an agent on no
+  // Computer, only within 24 hours of `seenAt`
+  // (services/agentCliInboxItems.ts).
+  cliInboxItems: jsonb("cli_inbox_items").$type<AgentCliInboxItemsObservation>(),
   // Why the agent was taken off its Computer and must stay off until someone
   // binds it on purpose (services/computerAgents.ts): `forced_by_computer_owner`
   // when the person removing that Computer (or deleting their account) forced
@@ -1636,6 +1682,19 @@ export const oauthClients = pgTable("oauth_clients", {
   // Platform-owned Agent Login handoff contract. Existing and new Apps stay
   // legacy unless a separately reviewed migration opts an App into v1.
   agentHandoffProtocol: text("agent_handoff_protocol", { enum: ["legacy", "v1"] }).default("legacy").notNull(),
+  // How Raft signs this App's agent tokens (agent audience JWTs): ES256 by
+  // default, RS256 for relying parties that accept only RSA keys. Set by the
+  // App's owner/admin, never by the token request. ID tokens and Raft's
+  // callback assertions are ES256 whatever this says. Values mirror
+  // AGENT_TOKEN_SIGNING_ALGS in @botiverse/raft-shared.
+  agentTokenSigningAlg: text("agent_token_signing_alg", { enum: ["ES256", "RS256"] }).default("ES256").notNull(),
+  // The JOSE `typ` header of this App's agent tokens: at+jwt by default, JWT
+  // for relying parties that refuse any other type (Alibaba Cloud STS). Set by
+  // the App's owner/admin, never by the token request. JWT only while the App
+  // has no redirect URL (no person sign-in), so an agent token can't pass for
+  // an ID token: oauth_clients_agent_token_type_token_only below. Values
+  // mirror AGENT_TOKEN_TYPES in @botiverse/raft-shared.
+  agentTokenType: text("agent_token_type", { enum: ["at+jwt", "JWT"] }).default("at+jwt").notNull(),
   name: text("name").notNull(),
   description: text("description"),
   homepageUrl: text("homepage_url"),
@@ -1702,6 +1761,13 @@ export const oauthClients = pgTable("oauth_clients", {
   // registration; set once by a database trigger and never cleared, because
   // those rows can go. A used App's id stays reserved (RFC 084 §4).
   firstUsedAt: timestamp("first_used_at", { withTimezone: true }),
+  // A server_local App its Server's owner or admin vouched for: every agent there is granted
+  // it automatically (autoGrantAgentClientRule), whoever created it and whatever their role
+  // now. Set when such a person creates it in their own session, or through
+  // PUT /api/integrations/clients/:id/server-vouch; cleared there or when an agent widens its
+  // scopes. Ignored for other App types. The voucher is kept for audit only.
+  serverVouchedAt: timestamp("server_vouched_at", { withTimezone: true }),
+  serverVouchedByUserId: uuid("server_vouched_by_user_id").references(() => users.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
@@ -1722,6 +1788,9 @@ export const oauthClients = pgTable("oauth_clients", {
     sql`${t.publishStatus} IN ('private', 'publish_requested', 'in_review', 'published', 'rejected', 'unpublish_requested')`,
   ),
   check("oauth_clients_login_mode_valid", sql`${t.loginMode} IN ('server', 'account')`),
+  check("oauth_clients_agent_token_signing_alg_valid", sql`${t.agentTokenSigningAlg} IN ('ES256', 'RS256')`),
+  check("oauth_clients_agent_token_type_valid", sql`${t.agentTokenType} IN ('at+jwt', 'JWT')`),
+  check("oauth_clients_agent_token_type_token_only", sql`${t.agentTokenType} = 'at+jwt' OR ${t.returnUrl} IS NULL`),
   check(
     "oauth_clients_when_to_use_valid",
     sql`${t.whenToUse} IS NULL OR (length(${t.whenToUse}) <= 160 AND ${t.whenToUse} !~ '[\\x00-\\x1F\\x7F]')`,
@@ -2732,12 +2801,16 @@ export const oauthUserConsents = pgTable("oauth_user_consents", {
 
 // A person answered an App's first-view link-preview prompt with "no" on one
 // Server: the prompt stays hidden for that (person, Server, App) until they
-// allow it or log in to the App with Raft. Removed with the installation
-// (uninstall, marketplace removal) and with the person's membership.
+// allow it. Removed with the installation (uninstall, marketplace removal)
+// and with the person's membership.
 export const oauthLinkPreviewDeclines = pgTable("oauth_link_preview_declines", {
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
   userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
-  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  // NULL: the person's decline of an account-mode App, on every Server at
+  // once (RFC 079 D17), one per (user, App); only an account-mode App may hold
+  // one (oauth_login_row_mode_guard). Neither an uninstall nor leaving a
+  // Server removes it; only allowing the App's previews again does.
+  serverId: uuid("server_id").references(() => servers.id, { onDelete: "cascade" }),
   clientId: uuid("client_id").notNull().references(() => oauthClients.id, { onDelete: "cascade" }),
   declinedAt: timestamp("declined_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
@@ -2746,6 +2819,9 @@ export const oauthLinkPreviewDeclines = pgTable("oauth_link_preview_declines", {
   index("idx_oauth_link_preview_declines_server").on(t.serverId),
   // Serves the prompt lookup (viewer, Server, App) and member departure.
   uniqueIndex("idx_oauth_link_preview_declines_user_server_client").on(t.userId, t.serverId, t.clientId),
+  // The account-mode decline's upsert target and lookup: the index above
+  // treats NULL server_ids as distinct, so it cannot keep these to one row.
+  uniqueIndex("idx_oauth_link_preview_declines_user_client_account").on(t.userId, t.clientId).where(sql`${t.serverId} IS NULL`),
   // Uninstall and offline review remove by App and Server.
   index("idx_oauth_link_preview_declines_client_server").on(t.clientId, t.serverId),
 ]);
@@ -2819,6 +2895,15 @@ export const thirdPartyAgentEvents = pgTable("third_party_agent_events", {
    * on a re-delivery (selectPendingThirdPartyAgentEvents leaves it out).
    */
   wakeCoalescedAt: timestamp("wake_coalesced_at", { withTimezone: true }),
+  /**
+   * What the App asked for (`delivery` on POST /api/oauth/agent-events):
+   * `wake` (default) pushes it to the agent; `inbox` only adds it to its inbox
+   * item, waking no one. An `inbox` row is stored with `wake_coalesced_at`
+   * set, so no push or re-delivery takes it; this column keeps it apart from
+   * an event merged into a wake, which a handover may still push
+   * (wakeForEventsMergedSinceHandover).
+   */
+  delivery: text("delivery", { enum: ["wake", "inbox"] }).notNull().default("wake"),
 }, (t) => [
   index("idx_third_party_agent_events_agent_status").on(t.agentId, t.status),
   // RFC 081 inbox items: one agent's unconsumed events by app and object, oldest first.
@@ -3048,6 +3133,40 @@ export const objectFiles = pgTable("object_files", {
   check("object_files_content_type", sql`${t.contentType} IN ('image/png', 'image/jpeg', 'image/webp', 'image/gif')`),
   check("object_files_size", sql`${t.sizeBytes} > 0`),
   check("object_files_dimensions", sql`(${t.width} IS NULL) = (${t.height} IS NULL) AND (${t.width} IS NULL OR (${t.width} > 0 AND ${t.height} > 0))`),
+]);
+
+// What first-party objects name in their content (#proj-workspace:#336;
+// services/objectReferences.ts, which apps reach through platform/references):
+// one row per object a source names (`source_kind`, `source_id`) as
+// object_events names objects, and the object it names (`target_kind`,
+// `target_id`), in the source's order (`position`, from 0). Only the source's
+// latest content: the app replaces all of a source's rows at once
+// (replaceReferences) and deletes them with the source. `target_detail` is
+// the target kind's own small facts about the reference (for an Artifact:
+// the version it pins, the normalised link, whether the link's text is the
+// link itself, the file it is in), never text of the source. Generic: which
+// kinds exist is the registry's, so no CHECK lists them. `server_id` is the
+// source's own server (its closed-server purge deletes by it). Who may see a
+// reference is not stored: a reader checks the source's and the target's
+// visibility, as for any object.
+/** A reference's facts as its target kind defines them (ids, numbers, a link); at most 4 KiB stored. */
+export type ObjectReferenceDetail = Readonly<Record<string, string | number | boolean | null>>;
+export const objectReferences = pgTable("object_references", {
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  sourceKind: text("source_kind").notNull(),
+  sourceId: text("source_id").notNull(),
+  position: integer("position").notNull(),
+  targetKind: text("target_kind").notNull(),
+  targetId: text("target_id").notNull(),
+  targetDetail: jsonb("target_detail").$type<ObjectReferenceDetail>().notNull().default(sql`'{}'::jsonb`),
+}, (t) => [
+  primaryKey({ columns: [t.sourceKind, t.sourceId, t.position] }),
+  // What names an object (backlinks).
+  index("idx_object_references_target").on(t.targetKind, t.targetId),
+  // The closed-server purge deletes a server's rows; a server's delete cascades to them.
+  index("idx_object_references_server").on(t.serverId),
+  check("object_references_position", sql`${t.position} >= 0`),
+  check("object_references_detail_small", sql`pg_column_size(${t.targetDetail}) <= 4096`),
 ]);
 
 // RFC 074 §2 assistant doorbell: at most one pending "owner inbox changed" per
@@ -3517,13 +3636,10 @@ export const channels = pgTable("channels", {
   guestVisible: boolean("guest_visible").notNull().default(false),
   // guest_joinable (Guest self-join) is retired (#wg-rbac:#47) and dropped
   // (migrations 0653-0654, guest_join_public_column_drop, channels_guest_joinable_drop).
-  // Forum-style channels (#proj-chat:#24, flag channel_thread_sort_v0): how
-  // the channel orders its top-level messages, the same for every member.
-  // 'time' = post order (default); 'activity' = latest activity, the
-  // message's own time or its latest thread reply. Regular channels only
-  // (channel/private); the API refuses it elsewhere. No DB CHECK: adding one
-  // would scan channels; the API validates the value.
-  threadSort: text("thread_sort", { enum: ["time", "activity"] }).notNull().default("time"),
+  // thread_sort (forum-style channels, flag channel_thread_sort_v0) is retired
+  // and no longer declared (migration channel_thread_sort_undeclared): every
+  // channel is in post order. The column stays (NOT NULL DEFAULT 'time', so
+  // inserts that omit it still work) until a later release drops it.
   // Channel announcements (#proj-chat:#29, flag channel_announcement_v0): the
   // id (`pt_…`) of the Artifact this channel has as its announcement, or
   // NULL. Written only by services/channelAnnouncements.ts, on every
@@ -3571,6 +3687,11 @@ export const channels = pgTable("channels", {
   // Live threads by parent channel: "threads under these visible channels" as an index-only scan.
   // Built with CREATE INDEX CONCURRENTLY by db:create-channels-thread-parent-channel-index; migration 0298 is a no-op.
   index("idx_channels_thread_parent_channel").on(t.parentChannelId, t.id).where(sql`type = 'thread' AND deleted_at IS NULL`),
+  // Live threads by name ("thread-<short id>"): resolveThreadByShortId looks a
+  // thread up by its parent message's short id. Without it the lookup read
+  // every channel row of the server. Not unique: short ids can collide.
+  // Built CONCURRENTLY on large tables by db:create-device-session-key-indexes.
+  index("idx_channels_thread_server_name").on(t.serverId, t.name).where(sql`type = 'thread' AND deleted_at IS NULL`),
   index("idx_channels_archived").on(t.serverId, t.archivedAt),
   // Task v2: one live task conversation per task per parent channel (the
   // canonical one under the task's storage channel, one local projection under
@@ -3989,6 +4110,16 @@ export const channelExternalInvites = pgTable("channel_external_invites", {
   // server of the same operation, a retry or a replay never releases (or
   // credits) a seat again.
   selfGuestReleasedAt: timestamp("self_guest_released_at", { withTimezone: true }),
+  // An emailed invite the host's owner/admin sent to someone who was a
+  // member of the host server at send time (the review's "Invite to connect"
+  // on a member row, who is also added to the channel directly): they connect
+  // a server of theirs with it. Recorded once at send time (a resend keeps
+  // it) and never re-checked: one who left the host since uses it as any
+  // other invite. It holds none of the channel's slots and no Free external
+  // channel allowance while open (externalChannelLimitService); the
+  // connection's own checks still apply. Never an authorization input.
+  // false: any other invite, and every row from before this column.
+  sentToHostMember: boolean("sent_to_host_member").notNull().default(false),
 }, (t) => [
   // Only this release's nodes write source_*: older ones never do, so the CHECK cannot refuse them.
   check("channel_external_invites_source_state_known", sql`${t.sourceState} IS NULL OR ${t.sourceState} IN ('awaiting_joint_creation', 'awaiting_first_join', 'joined', 'member_at_start', 'no_sources')`),
@@ -4083,6 +4214,8 @@ export const channelConversionJobs = pgTable("channel_conversion_jobs", {
       "residual_cleanup",
       "finalize",
       "done",
+      // channel_conversion_online_move_v1: prepared, writers admitted, moving.
+      "online_move",
     ],
   }).notNull().default("prepare"),
   canonicalChannelId: uuid("canonical_channel_id").references(() => channels.id, { onDelete: "set null" }),
@@ -4229,7 +4362,10 @@ export const channelMembershipRoleEvents = pgTable("channel_membership_role_even
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
   channelId: uuid("channel_id").notNull().references(() => channels.id, { onDelete: "cascade" }),
   serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
-  requesterUserId: uuid("requester_user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+  // Who asked: a person (the web route) or an agent on its own authority (the
+  // Agent API); exactly one is set (..._requester_check).
+  requesterUserId: uuid("requester_user_id").references(() => users.id, { onDelete: "restrict" }),
+  requesterAgentId: uuid("requester_agent_id").references(() => agents.id, { onDelete: "restrict" }),
   targetType: text("target_type", { enum: ["user", "agent"] }).notNull(),
   targetId: uuid("target_id").notNull(),
   previousRole: text("previous_role", { enum: ["member", "admin"] }).notNull(),
@@ -4243,6 +4379,7 @@ export const channelMembershipRoleEvents = pgTable("channel_membership_role_even
 }, (t) => [
   index("idx_channel_membership_role_events_pending").on(t.deliveryStatus, t.createdAt),
   index("idx_channel_membership_role_events_channel").on(t.channelId, t.createdAt),
+  check("channel_membership_role_events_requester_check", sql`num_nonnulls(${t.requesterUserId}, ${t.requesterAgentId}) = 1`),
   check("channel_membership_role_events_target_type_check", sql`${t.targetType} IN ('user', 'agent')`),
   check("channel_membership_role_events_previous_role_check", sql`${t.previousRole} IN ('member', 'admin')`),
   check("channel_membership_role_events_next_role_check", sql`${t.nextRole} IN ('member', 'admin')`),
@@ -4420,6 +4557,14 @@ export const messageServerTimeline = pgTable("message_server_timeline", {
   // GIN (idx_message_server_timeline_server_search) is built by that backfill
   // after it verifies, so it is not declared here.
   searchVector: tsvector("search_vector"),
+  // The joint conversation root (two levels up: COALESCE(parent's
+  // parent_channel_id, parent_channel_id, id) of the channel, as nested
+  // threads exist) on rows whose channel is on a joint_storage server, NULL on every
+  // other row; kept by the same triggers (0764), so the search's server
+  // timeline walk can also read the visible joint conversations. The partial
+  // btree (idx_message_server_timeline_conversation_created) is built by the
+  // operator backfill after it verifies, so it is not declared here.
+  conversationId: uuid("conversation_id"),
 }, (t) => [
   index("idx_message_server_timeline_server_created").on(t.serverId, t.createdAt, t.messageId),
 ]);
@@ -7260,6 +7405,91 @@ export const accountDeletionRequests = pgTable("account_deletion_requests", {
   check("account_deletion_requests_state_times", sql`(${t.state} = 'pending' AND ${t.cancelledAt} IS NULL AND ${t.completedAt} IS NULL) OR (${t.state} = 'cancelled' AND ${t.cancelledAt} IS NOT NULL AND ${t.completedAt} IS NULL) OR (${t.state} = 'completed' AND ${t.completedAt} IS NOT NULL AND ${t.cancelledAt} IS NULL)`),
 ]);
 
+/** Where a running export is (services/dataExport/runner.ts): enough to restart its current volume. */
+export interface DataExportProgress {
+  /** The run that owns the job: every runner write is fenced on it, and its volumes' keys carry it. */
+  runToken: string | null;
+  /** The volume being written, from 1. */
+  volume: number;
+  /** The producer's cursor when this volume began: a lost run restarts the volume from it. */
+  cursorAtVolumeStart: JsonValue | null;
+  /**
+   * The paths of that batch's ops the previous volume already holds (a volume can end mid-batch);
+   * the batch read again skips them, however its ops shifted. Absent on rows written before.
+   */
+  writtenPathsAtVolumeStart?: string[];
+  /** A JSONL entry still open when the previous volume closed: it continues under a new name in this one. */
+  openPathAtVolumeStart: string | null;
+  /** This volume's object key and multipart upload, recorded before any part: a lost run's upload is aborted. */
+  key: string | null;
+  uploadId: string | null;
+  /** Rows written so far, by what the producer counts. */
+  counts: Record<string, number>;
+  /** `file` ops skipped so far because storage no longer had the object (manifest.json `missingFiles`); absent on rows written before. */
+  missingFiles?: string[];
+}
+
+/** One finished volume (its sha256 is also in the last volume's manifest.json). */
+export interface DataExportVolume {
+  index: number;
+  key: string;
+  sizeBytes: number;
+  sha256: string;
+  entries: number;
+}
+
+// Data export jobs (services/dataExport/, docs/development/data-export.md;
+// #triage:#512 design v7). One row per export a person asked for: who
+// (requester and the sign-in that asked), what (kind, scope), and how it went.
+// created_at is also the moment the archive's visibility is computed for. A
+// ready archive is kept DATA_EXPORT_RETENTION_MS, then its objects are
+// deleted and the row stays `expired`; `deleted` is the requester's (or an
+// account or server deletion's) delete. The row itself is the audit of the
+// export (design §8: no audit category in v1): requested, started, finished,
+// first and last download. At most one export in flight per person, and per
+// server for server exports (partial unique indexes).
+export const dataExports = pgTable("data_exports", {
+  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+  kind: text("kind", { enum: ["personal", "server"] }).notNull(),
+  requesterUserId: uuid("requester_user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  // A plain id, no foreign key: a sign-in may be gone long before its export row.
+  requesterSessionFamilyId: uuid("requester_session_family_id").notNull(),
+  // Server exports only (CHECK).
+  serverId: uuid("server_id").references(() => servers.id, { onDelete: "cascade" }),
+  scope: jsonb("scope").$type<DataExportScope>().notNull(),
+  scopeVersion: integer("scope_version").notNull(),
+  status: text("status", { enum: ["queued", "running", "ready", "failed", "expired", "deleted"] }).notNull(),
+  // The data_export.generate task that writes it (no foreign key: durable tasks are pruned).
+  durableTaskId: bigint("durable_task_id", { mode: "number" }),
+  progress: jsonb("progress").$type<DataExportProgress>(),
+  volumes: jsonb("volumes").$type<DataExportVolume[]>().notNull().default(sql`'[]'::jsonb`),
+  sizeBytes: bigint("size_bytes", { mode: "number" }),
+  errorCode: text("error_code"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  startedAt: timestamp("started_at", { withTimezone: true }),
+  finishedAt: timestamp("finished_at", { withTimezone: true }),
+  expiresAt: timestamp("expires_at", { withTimezone: true }),
+  downloadedAt: timestamp("downloaded_at", { withTimezone: true }),
+  lastDownloadedAt: timestamp("last_downloaded_at", { withTimezone: true }),
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
+}, (t) => [
+  // One export in flight per person (any kind) and per server (server kind).
+  uniqueIndex("idx_data_exports_requester_in_flight").on(t.requesterUserId).where(sql`status IN ('queued', 'running')`),
+  uniqueIndex("idx_data_exports_server_in_flight").on(t.serverId).where(sql`kind = 'server' AND status IN ('queued', 'running')`),
+  // The requester's list and the per-person limit; the server's list, limit and purge step.
+  index("idx_data_exports_requester_created").on(t.requesterUserId, t.createdAt),
+  index("idx_data_exports_server_created").on(t.serverId, t.createdAt),
+  // Maintenance: archives past retention, and jobs that may be stuck.
+  index("idx_data_exports_ready_expires").on(t.expiresAt).where(sql`status = 'ready'`),
+  index("idx_data_exports_in_flight_updated").on(t.updatedAt).where(sql`status IN ('queued', 'running')`),
+  check("data_exports_kind_valid", sql`${t.kind} IN ('personal', 'server')`),
+  check("data_exports_status_valid", sql`${t.status} IN ('queued', 'running', 'ready', 'failed', 'expired', 'deleted')`),
+  check("data_exports_server_kind", sql`(${t.kind} = 'server') = (${t.serverId} IS NOT NULL)`),
+  check("data_exports_ready_expires", sql`${t.status} <> 'ready' OR (${t.expiresAt} IS NOT NULL AND ${t.finishedAt} IS NOT NULL)`),
+  check("data_exports_deleted_at", sql`(${t.status} = 'deleted') = (${t.deletedAt} IS NOT NULL)`),
+]);
+
 // One serialized ordering frontier per authenticated human/agent authority. The row
 // itself is locked FOR UPDATE by admission, workers, frontier reads and
 // compaction so every path shares the same cross-replica linearization point.
@@ -9146,6 +9376,7 @@ export const agentVoiceCalls = pgTable("agent_voice_calls", {
  *     - POST /api/messages            (user send)
  *     - /internal/agent/:id/send      (agent send, incl. `#channel:shortid`
  *                                      target resolution in
+ *                                      agentThreadTarget
  *                                      resolveOrCreateThreadTarget)
  *     - /internal/agent/:id/upload    (agent upload)
  *   The legacy thread member-mutation routes (join/leave/add/remove) all
@@ -9241,6 +9472,34 @@ export const threadFollows = pgTable("thread_follows", {
   index("idx_thread_follows_parent_task_id").on(t.parentTaskId).where(sql`parent_task_id IS NOT NULL`),
   check("thread_follows_parent_present", sql`${t.parentMessageId} IS NOT NULL OR ${t.parentTaskId} IS NOT NULL`),
   check("thread_follows_notification_level_check", sql`${t.notificationLevel} IS NULL OR ${t.notificationLevel} IN ('default', 'all', 'mentions', 'none')`),
+]);
+
+// Focus (flag `agent_focus_v0`, services/agentFocusService.ts): the
+// conversations an agent keeps in focus, at most AGENT_FOCUS_LIMIT per agent
+// (kept by the service under a per-agent lock, not by a constraint).
+// `channel_id` is the conversation's own channel row, as in
+// agent_channel_read_cursors and thread_follows.thread_channel_id: a thread,
+// a DM or a task conversation. No server column, like those two tables: the
+// agent names its server.
+export const agentFocusTargets = pgTable("agent_focus_targets", {
+  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+  channelId: uuid("channel_id").notNull().references(() => channels.id, { onDelete: "cascade" }),
+  // `manual`: the agent focused it. `auto`: Raft did; evicted before any manual one.
+  source: text("source", { enum: ["auto", "manual"] }).notNull(),
+  focusedAt: timestamp("focused_at", { withTimezone: true }).notNull().defaultNow(),
+  // Refreshed when the agent focuses it again; eviction takes the least recent.
+  lastActiveAt: timestamp("last_active_at", { withTimezone: true }).notNull().defaultNow(),
+  // Set when the agent unfocused it: the row is then no entry (not listed, not counted, not tagged),
+  // only the reason Raft does not focus the conversation by itself again. NULL on every entry.
+  unfocusedAt: timestamp("unfocused_at", { withTimezone: true }),
+}, (t) => [
+  uniqueIndex("agent_focus_targets_agent_channel_unique").on(t.agentId, t.channelId),
+  // The agent's list, most recently active first.
+  index("idx_agent_focus_targets_agent_active").on(t.agentId, t.lastActiveAt),
+  // Deleting a channel checks its foreign key here.
+  index("idx_agent_focus_targets_channel").on(t.channelId),
+  check("agent_focus_targets_source_check", sql`${t.source} IN ('auto', 'manual')`),
 ]);
 
 export const pushRegistrations = pgTable("push_registrations", {
@@ -9565,6 +9824,8 @@ export const announcementAuditEvents = pgTable("announcement_audit_events", {
   newPriority: integer("new_priority"),
   audienceSnapshot: jsonb("audience_snapshot").$type<AnnouncementAudienceSnapshot>(),
   reachCount: integer("reach_count"),
+  // Why it was done, when the actor gave one (an agent ending a live announcement must).
+  reason: text("reason"),
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
   announcementId: uuid("announcement_id").notNull().references(() => announcements.id, { onDelete: "cascade" }),
   actorUserId: uuid("actor_user_id").references(() => users.id, { onDelete: "set null" }),
@@ -10807,27 +11068,60 @@ export const agentBootstrapTokens = pgTable("agent_bootstrap_tokens", {
 //                                       issues the user session, single-consume
 // These `/api/*` routes are OUT of `routeAuthPolicy` BY DESIGN (pre-credential
 // `/api/*`, not claimed `/internal/*`) — documented intentional, not an omission.
+/** How a device authorization completes (device_authorizations.mode). */
+export type DeviceAuthorizationMode = "device" | "loopback";
+
 export const deviceAuthorizations = pgTable("device_authorizations", {
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+  // How the login completes: `device` (the device code is polled; the person
+  // types the user code) or `loopback` (RFC 8252: the approval page sends the
+  // browser back to the client's own 127.0.0.1 listener with a one-time code,
+  // redeemed with its PKCE verifier). A loopback row has no device code and no
+  // user code: it can't be polled, and the page finds it by request_id.
+  mode: text("mode").$type<DeviceAuthorizationMode>().notNull().default("device"),
   // HMAC-SHA-256(server_pepper, raw_device_code) as raw bytes. Deterministic
   // + unique — the row is located by this at poll time. Pepper reuses the
-  // existing bootstrap-token pepper env (same lifecycle model).
+  // existing bootstrap-token pepper env (same lifecycle model). NULL for a
+  // loopback row (no device code).
   deviceCodeLookupHash: customType<{ data: Buffer; driverData: Buffer }>({
     dataType: () => "bytea",
-  })("device_code_lookup_hash").notNull().unique(),
+  })("device_code_lookup_hash").unique(),
   // argon2id of the raw device_code. Constant-time verifier; only used AFTER
-  // the row is located by deviceCodeLookupHash.
-  deviceCodeHash: text("device_code_hash").notNull(),
+  // the row is located by deviceCodeLookupHash. NULL for a loopback row.
+  deviceCodeHash: text("device_code_hash"),
   // Short human-entered/-displayed code (e.g. "WXYZ-1234"). Unique so the
   // user-authenticated approve phase can locate the pending grant. Never a
   // secret verifier — the device_code is. Shown to the user exactly once.
-  userCode: text("user_code").notNull().unique(),
+  // NULL for a loopback row.
+  userCode: text("user_code").unique(),
+  // Loopback only: the opaque id in the approval link
+  // (`/login/device?request=<id>`), 32 random bytes (base64url). It plays the
+  // user code's part (describe/approve find the row by it), so it is
+  // unguessable; on its own it completes nothing (the code goes only to the
+  // return URI, and redeeming it needs the PKCE verifier).
+  requestId: text("request_id").unique(),
+  // Loopback only: where approve sends the browser
+  // (`http://127.0.0.1|[::1]:<port>/callback`, optionally `?state=...`), and
+  // the PKCE S256 challenge the token phase checks the verifier against.
+  returnUri: text("return_uri"),
+  codeChallenge: text("code_challenge"),
+  // Loopback only: sha256 (hex) of the one-time code approve put in the
+  // redirect, and when it stops being redeemable (2 minutes after approval,
+  // never past expires_at). Single use: redeeming it consumes the row.
+  callbackCodeHash: text("callback_code_hash"),
+  callbackCodeExpiresAt: timestamp("callback_code_expires_at", { withTimezone: true }),
   // pending | approved | denied | expired | consumed. Soft state; row is
   // NEVER deleted (audit). Hot-path poll rejects any non-approved/consumed.
   status: text("status").notNull().default("pending"),
   // Optional requesting-client label for audit ("raft-computer"/"slock-cli").
   // Not identity, not used for any decision.
   clientName: text("client_name"),
+  // Why a Computer asked for a device code after trying (or skipping) the
+  // loopback redirect login (its LoginModeFallbackReason: "bind_failed",
+  // "browser_open_failed", "ssh", ...). NULL when loopback was not involved,
+  // for older Computers, and for a malformed value (the authorize is never
+  // refused for it). The caller's claim, for audit only; not used for any decision.
+  loginFallbackReason: text("login_fallback_reason"),
   // Set ONLY at the user-authenticated approve phase — the established user
   // identity the later session is issued for. NULL until approved.
   approvedByUserId: uuid("approved_by_user_id").references(() => users.id, { onDelete: "set null" }),
@@ -10983,6 +11277,57 @@ export const deviceLoginGrants = pgTable("device_login_grants", {
   index("idx_device_login_grants_approver_session_family").on(t.approverSessionFamilyId),
   index("idx_device_login_grants_server").on(t.serverId),
   index("idx_device_login_grants_agent").on(t.agentId),
+]);
+
+// Computer pairings (design "one-click Computer login", §11 B; contract
+// docs/contracts/computer-pairing.md): the Add Computer window a person has
+// open creates one, its raw id goes into the copied setup command
+// (`--pair <id>`), and the device authorization that Computer starts with it
+// is linked here, so the same window can show it and approve it. The id only
+// routes: it grants nothing, and approval is the device authorization's own.
+//   waiting → requested (one authorization linked) → consumed (approved or
+//   denied through the pairing); or voided: cancelled (the window closed),
+//   conflict (a second authorization brought the same id: neither is
+//   approvable through it), signed_out (the creating sign-in ended); or
+//   expired (10 minutes, renewed while the window is open).
+/** Why a computer pairing was voided (computer_pairings.void_reason). */
+export type ComputerPairingVoidReason = "cancelled" | "conflict" | "signed_out";
+
+export const computerPairings = pgTable("computer_pairings", {
+  // The handle the window, events and traces use (`pairingRef`). Never the raw id.
+  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+  // sha256 (hex) of the raw pairing id (32 random bytes, base64url), which is
+  // returned once by create and never stored or logged.
+  pairingHash: text("pairing_hash").notNull().unique(),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  // The sign-in that created it (a person's own full session family): the
+  // only one that may read, renew, cancel or approve through it. Revoking
+  // that family voids it (sessionService.denyLoginCodesApprovedBy).
+  sessionFamilyId: uuid("session_family_id").notNull().references(() => sessionFamilies.id, { onDelete: "cascade" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  // The one device authorization linked to it (compare-and-swap at authorize).
+  // Device authorizations are never deleted.
+  linkedDeviceAuthorizationId: uuid("linked_device_authorization_id").references(() => deviceAuthorizations.id, { onDelete: "set null" }),
+  // When a second authorization arrived with the same id (voided with it).
+  conflictAt: timestamp("conflict_at", { withTimezone: true }),
+  voidedAt: timestamp("voided_at", { withTimezone: true }),
+  voidReason: text("void_reason").$type<ComputerPairingVoidReason>(),
+  // When the window approved or denied the linked authorization through it
+  // (claimed in the approval's transaction). A linked authorization resolved
+  // elsewhere (the device page, the code field) ends the pairing too: its
+  // state reads the authorization's status.
+  consumedAt: timestamp("consumed_at", { withTimezone: true }),
+}, (t) => [
+  // Active pairings per person (the create limit) and the account-deletion cleanup.
+  index("idx_computer_pairings_user").on(t.userId, t.expiresAt),
+  // The closed-server purge and the FK's ON DELETE.
+  index("idx_computer_pairings_server").on(t.serverId),
+  // Voiding a revoked sign-in's pairings, and the FK's ON DELETE.
+  index("idx_computer_pairings_session_family").on(t.sessionFamilyId),
+  index("idx_computer_pairings_linked_authorization").on(t.linkedDeviceAuthorizationId),
+  check("computer_pairings_void_reason_valid", sql`(${t.voidedAt} IS NULL AND ${t.voidReason} IS NULL) OR (${t.voidedAt} IS NOT NULL AND ${t.voidReason} IN ('cancelled', 'conflict', 'signed_out'))`),
 ]);
 
 // Computer host attachments — `sk_computer_*` runtime principals
@@ -11362,6 +11707,8 @@ export const mcpAppTemplates = pgTable("mcp_app_templates", {
   // How an OAuth Connection gets its client: "automatic" registration only, a user-"registered"
   // client only, or "either" (the default, and the behavior before this column existed).
   oauthClientMode: text("oauth_client_mode", { enum: ["automatic", "registered", "either"] }).notNull().default("either"),
+  // Who builds and hosts the MCP server ("Notion"), shown as "By <publisher>"; null when not recorded.
+  publisherName: text("publisher_name"),
   status: text("status", { enum: ["active", "retired"] }).notNull().default("active"),
   revision: integer("revision").notNull().default(1),
   createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
@@ -11380,6 +11727,7 @@ export const mcpAppTemplates = pgTable("mcp_app_templates", {
   check("mcp_app_templates_homepage_https", sql`${t.homepageUrl} ~ '^https://'`),
   check("mcp_app_templates_endpoint_https", sql`${t.endpointUrl} ~ '^https://'`),
   check("mcp_app_templates_logo_https_or_null", sql`${t.logoUrl} IS NULL OR ${t.logoUrl} ~ '^https://'`),
+  check("mcp_app_templates_publisher_name_valid", sql`${t.publisherName} IS NULL OR length(btrim(${t.publisherName})) BETWEEN 1 AND 120`),
 ]);
 
 export const managedMcpServers = pgTable("managed_mcp_servers", {
@@ -11422,6 +11770,15 @@ export const managedMcpServers = pgTable("managed_mcp_servers", {
   authProbe: jsonb("auth_probe").$type<{ issuer: string | null; registration: "dcr" | "cimd" | "manual_required" | null; scopes: string[] }>(),
   serverInfo: jsonb("server_info").$type<{ protocolVersion: string; name?: string; version?: string }>(),
   lastLatencyMs: integer("last_latency_ms"),
+  // An MCP App its Server's owner or admin vouched for: every agent there is granted it
+  // automatically (mcpAutoGrantCoversAgent), whoever created it and whatever their role now. Set
+  // when such a person creates it in their own session, or through
+  // PUT /api/mcp/apps/:appId/server-vouch; cleared there. The voucher is kept for audit only.
+  serverVouchedAt: timestamp("server_vouched_at", { withTimezone: true }),
+  serverVouchedByUserId: uuid("server_vouched_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  // RFC 087 D1: members may connect their own (personal) account for this App. Turning it off stops
+  // new personal Connections only; existing ones stay (Q26).
+  membersCanConnect: boolean("members_can_connect").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
@@ -11458,6 +11815,11 @@ export const managedMcpCredentials = pgTable("managed_mcp_credentials", {
   lastError: text("last_error"),
   lastCheckedAt: timestamp("last_checked_at", { withTimezone: true }),
   createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  // Whose account the stored secret acts as: who last completed its OAuth sign-in or saved its API
+  // key. Cleared when the secret is removed. Read with membership to mark a Connection signed in by
+  // someone who has left (managedMcpSignedInBy.ts). Rows older than the column were backfilled from
+  // created_by_user_id, a best guess (migration managed_mcp_credentials_signed_in_by).
+  signedInByUserId: uuid("signed_in_by_user_id").references(() => users.id, { onDelete: "set null" }),
   credentialVersion: integer("credential_version").notNull().default(1),
   // The App endpoint this Connection's secret was authorized (OAuth) or validated (API key) against
   // (0412). A fence, checked by admission and before any OAuth refresh: an OAuth Connection is usable
@@ -11467,6 +11829,13 @@ export const managedMcpCredentials = pgTable("managed_mcp_credentials", {
   authorizedEndpointUrl: text("authorized_endpoint_url"),
   leaseOwner: text("lease_owner"),
   leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  // RFC 087 §4: who manages this Connection. `shared`: the Server's admins (the default, or pinned to
+  // chosen agents). `personal`: the member `owner_user_id`, who gives it to agents through
+  // managed_mcp_personal_grants; never the server default and never pinned. `created_by_user_id` and
+  // `signed_in_by_user_id` keep their meaning and decide neither. Fixed at insert (trigger
+  // managed_mcp_credentials_owner_immutable).
+  ownerKind: text("owner_kind", { enum: ["shared", "personal"] }).notNull().default("shared"),
+  ownerUserId: uuid("owner_user_id").references(() => users.id, { onDelete: "cascade" }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
@@ -11477,6 +11846,11 @@ export const managedMcpCredentials = pgTable("managed_mcp_credentials", {
     .where(sql`${t.isServerDefault}`),
   index("idx_managed_mcp_credentials_mcp_server").on(t.mcpServerId),
   index("idx_managed_mcp_credentials_scope").on(t.serverId),
+  index("idx_managed_mcp_credentials_owner").on(t.mcpServerId, t.ownerUserId),
+  check(
+    "managed_mcp_credentials_owner_kind_valid",
+    sql`(${t.ownerKind} = 'shared' AND ${t.ownerUserId} IS NULL) OR (${t.ownerKind} = 'personal' AND ${t.ownerUserId} IS NOT NULL AND NOT ${t.isServerDefault})`,
+  ),
 ]);
 
 export const managedMcpOAuthAttempts = pgTable("managed_mcp_oauth_attempts", {
@@ -11494,7 +11868,17 @@ export const managedMcpOAuthAttempts = pgTable("managed_mcp_oauth_attempts", {
   connectionId: uuid("connection_id").references(() => managedMcpCredentials.id, { onDelete: "cascade" }),
   // Secret-free context to apply after a successful sign-in, e.g. the Agent or action card it came
   // from and whether to make the Connection the server default.
-  intent: jsonb("intent").$type<{ agentId?: string; actionCardMessageId?: string; makeDefault?: boolean; name?: string }>(),
+  // RFC 087 §7.1: `kind` is the Connection's owner kind (absent on older rows: shared); a personal
+  // sign-in's Connection belongs to `user_id`. `agentIds`: Agents a personal sign-in gives the new
+  // account to, re-checked at the callback. `name`: set when the sign-in created the Connection.
+  intent: jsonb("intent").$type<{
+    agentId?: string;
+    actionCardMessageId?: string;
+    makeDefault?: boolean;
+    name?: string;
+    kind?: "personal" | "shared";
+    agentIds?: string[];
+  }>(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   // The closed-server purge deletes the rows this key names (migration
@@ -11534,56 +11918,24 @@ export const managedMcpAssignments = pgTable("managed_mcp_assignments", {
   ),
 ]);
 
-// Reusable, server-scoped AI provider connections. Public reads come only
-// from providerConnections; the API key remains isolated in the credential
-// table and is materialized only for an exact Agent launch.
-export const providerConnections = pgTable("provider_connections", {
-  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+// RFC 087 §4: a member's personal Connection given to an Agent; at most one per Agent and App, so
+// the Agent lands on exactly one account (D3). It sits on top of the admin layer
+// (managed_mcp_assignments): used while its Connection is ready and its owner a member, otherwise the
+// Agent falls back to its shared account (admitManagedMcpCall). The trigger
+// managed_mcp_personal_grants_connection_guard keeps `connection_id` a personal Connection of the
+// same App and Server; admission checks it again.
+export const managedMcpPersonalGrants = pgTable("managed_mcp_personal_grants", {
   serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
-  name: text("name").notNull(),
-  providerId: text("provider_id").$type<ProviderConnectionProviderId>().notNull(),
-  authMethod: text("auth_method", { enum: ["api_key", "oauth"] }).notNull().default("api_key"),
-  endpointUrl: text("endpoint_url"),
-  supportsImageInput: boolean("supports_image_input").notNull().default(false),
-  enabled: boolean("enabled").notNull().default(true),
-  status: text("status", { enum: ["unchecked", "ready", "error", "pending_auth", "expired"] }).notNull().default("unchecked"),
-  configVersion: integer("config_version").notNull().default(1),
-  lastCheckedAt: timestamp("last_checked_at", { withTimezone: true }),
-  lastErrorCategory: text("last_error_category"),
-  createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
-  updatedByUserId: uuid("updated_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+  mcpServerId: uuid("mcp_server_id").notNull().references(() => managedMcpServers.id, { onDelete: "cascade" }),
+  connectionId: uuid("connection_id").notNull().references(() => managedMcpCredentials.id, { onDelete: "cascade" }),
+  grantedByUserId: uuid("granted_by_user_id").references(() => users.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
-  uniqueIndex("idx_provider_connections_server_name").on(t.serverId, t.name),
-  index("idx_provider_connections_server").on(t.serverId),
-]);
-
-export const providerConnectionCredentials = pgTable("provider_connection_credentials", {
-  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
-  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
-  connectionId: uuid("connection_id").notNull().references(() => providerConnections.id, { onDelete: "cascade" }),
-  encryptedApiKey: text("encrypted_api_key").notNull(),
-  credentialVersion: integer("credential_version").notNull().default(1),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-}, (t) => [
-  uniqueIndex("idx_provider_connection_credentials_connection").on(t.connectionId),
-  index("idx_provider_connection_credentials_scope").on(t.serverId),
-]);
-
-export const agentProviderConnections = pgTable("agent_provider_connections", {
-  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
-  agentId: uuid("agent_id").primaryKey().references(() => agents.id, { onDelete: "cascade" }),
-  connectionId: uuid("connection_id").notNull().references(() => providerConnections.id, { onDelete: "restrict" }),
-  expectedConfigVersion: integer("expected_config_version").notNull(),
-  expectedCredentialVersion: integer("expected_credential_version").notNull(),
-  updatedByUserId: uuid("updated_by_user_id").references(() => users.id, { onDelete: "set null" }),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-}, (t) => [
-  index("idx_agent_provider_connections_server").on(t.serverId),
-  index("idx_agent_provider_connections_connection").on(t.connectionId),
+  primaryKey({ columns: [t.agentId, t.mcpServerId] }),
+  index("idx_managed_mcp_personal_grants_server_agent").on(t.serverId, t.agentId),
+  index("idx_managed_mcp_personal_grants_mcp_server").on(t.mcpServerId),
+  index("idx_managed_mcp_personal_grants_connection").on(t.connectionId),
 ]);
 
 // One provisioning record per Agent created on a hosted runtime provider.
@@ -11788,100 +12140,6 @@ export const hostedRuntimeServerPlans = pgTable("hosted_runtime_server_plans", {
   modelPickerLastErrorCode: text("model_picker_last_error_code"),
 }, (t) => [
   primaryKey({ columns: [t.serverId, t.provider] }),
-]);
-
-// Computer-scoped provider probes (Phase 2A foundation). An intent is the
-// client-idempotent, at-most-once dispatch record; its claim column group is
-// the one-time materialization lease (atomic CAS, no third table). A receipt is
-// insert-once per probe and never mutates a terminal state.
-export const providerProbeIntents = pgTable("provider_probe_intents", {
-  id: uuid("id").primaryKey(),
-  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
-  connectionId: uuid("connection_id").notNull().references(() => providerConnections.id, { onDelete: "cascade" }),
-  configVersion: integer("config_version").notNull(),
-  credentialVersion: integer("credential_version").notNull(),
-  computerId: uuid("computer_id").notNull().references(() => machines.id, { onDelete: "cascade" }),
-  runtime: text("runtime").notNull(),
-  model: text("model").notNull(),
-  probeKind: text("probe_kind").notNull(),
-  probeRequestId: text("probe_request_id").notNull(),
-  requestDigest: text("request_digest").notNull(),
-  intentDigest: text("intent_digest").notNull(),
-  createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
-  // null -> set exactly once: the at-most-one-dispatch guard.
-  dispatchedAt: timestamp("dispatched_at", { withTimezone: true }),
-  closeReason: text("close_reason"),
-  closedAt: timestamp("closed_at", { withTimezone: true }),
-  // Dispatch-time carrier fact, frozen at the dispatch CAS (F1/F7).
-  dispatchRequestId: text("dispatch_request_id"),
-  dispatchEpochId: text("dispatch_epoch_id"),
-  dispatchGeneration: text("dispatch_generation"),
-  capabilityObserved: boolean("capability_observed"),
-  dispatchDaemonVersion: text("dispatch_daemon_version"),
-  dispatchComputerVersion: text("dispatch_computer_version"),
-  dispatchRuntimeVersion: text("dispatch_runtime_version"),
-  dispatchRuntimes: jsonb("dispatch_runtimes").$type<string[]>(),
-  // One-time materialization claim column group. First valid claim wins; the
-  // same claimant may retry inside the lease, everyone else is rejected.
-  claimMachineId: uuid("claim_machine_id").references(() => machines.id, { onDelete: "cascade" }),
-  claimRequestId: text("claim_request_id"),
-  claimEpochId: text("claim_epoch_id"),
-  claimGeneration: text("claim_generation"),
-  claimLeasedAt: timestamp("claim_leased_at", { withTimezone: true }),
-  materializationDigest: text("materialization_digest"),
-}, (t) => [
-  // The closed-server purge deletes the rows this key names (migration
-  // closed_server_purge_step_fk_indexes; CONCURRENTLY on a large table).
-  index("idx_provider_probe_intents_connection").on(t.connectionId),
-  uniqueIndex("idx_provider_probe_intents_server_request").on(t.serverId, t.probeRequestId),
-  index("idx_provider_probe_intents_server_connection").on(t.serverId, t.connectionId),
-  // Wave-3 exact query: latest valid success for one authority coordinate.
-  index("idx_provider_probe_intents_authority_match").on(
-    t.serverId, t.connectionId, t.configVersion, t.credentialVersion, t.computerId, t.runtime, t.model, t.probeKind,
-  ),
-  check("provider_probe_intents_kind_known", sql`${t.probeKind} in ('canary')`),
-  check(
-    "provider_probe_intents_close_reason_known",
-    sql`${t.closeReason} is null or ${t.closeReason} in ('receipt', 'carrier_offline', 'carrier_timeout', 'unsupported_carrier', 'provider_timeout', 'stale_authority', 'intent_expired', 'invalid_carrier_result')`,
-  ),
-]);
-
-export const providerProbeReceipts = pgTable("provider_probe_receipts", {
-  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
-  probeId: uuid("probe_id").notNull().unique().references(() => providerProbeIntents.id, { onDelete: "cascade" }),
-  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
-  outcome: text("outcome").notNull(),
-  category: text("category"),
-  latencyMs: integer("latency_ms"),
-  responseSha256: text("response_sha256"),
-  responseBytes: integer("response_bytes"),
-  resultDigest: text("result_digest").notNull(),
-  intentDigest: text("intent_digest").notNull(),
-  materializationDigest: text("materialization_digest"),
-  // Null for closures that never had a dispatch authority (pre-dispatch).
-  authorityIdentity: text("authority_identity"),
-  daemonVersion: text("daemon_version"),
-  computerVersion: text("computer_version"),
-  runtimeVersion: text("runtime_version"),
-  dispatchEpochId: text("dispatch_epoch_id"),
-  dispatchGeneration: text("dispatch_generation"),
-  verifiedAt: timestamp("verified_at", { withTimezone: true }).notNull().defaultNow(),
-}, (t) => [
-  check("provider_probe_receipts_outcome_known", sql`${t.outcome} in ('success', 'failure')`),
-  check(
-    "provider_probe_receipts_category_known",
-    sql`${t.category} is null or ${t.category} in ('auth', 'model', 'network', 'dns_tls', 'rate_quota', 'invalid_response', 'carrier_offline', 'carrier_timeout', 'unsupported_carrier', 'provider_timeout', 'stale_authority', 'intent_expired', 'invalid_carrier_result')`,
-  ),
-  check(
-    "provider_probe_receipts_bytes_nonneg",
-    sql`${t.responseBytes} is null or ${t.responseBytes} >= 0`,
-  ),
-  check(
-    "provider_probe_receipts_success_needs_response",
-    sql`${t.outcome} <> 'success' or (${t.responseSha256} is not null and ${t.responseBytes} is not null and ${t.authorityIdentity} is not null)`,
-  ),
 ]);
 
 // Locator-only product feedback ingestion. The payload is kept solely because

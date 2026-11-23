@@ -1,0 +1,30 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "codex",
+  "schemaVersion": "codex.create.v1",
+  "sourceId": "speed",
+  "kind": "dependent_select",
+  "pointer": "/speed",
+  "dependsOn": "/model",
+  "optionsByValue": {
+    "gpt-6.2-astra": [
+      {
+        "value": "",
+        "label": "Standard · Default speed"
+      },
+      {
+        "value": "priority",
+        "label": "Fast · 2x speed, increased usage"
+      },
+      {
+        "value": "ultrafast",
+        "label": "Ultrafast · Up to 4.5x speed, uses more of your plan"
+      }
+    ]
+  },
+  "defaultValueByValue": {
+    "gpt-6.2-astra": ""
+  },
+  "customValueAllowedByValue": {},
+  "status": "live"
+}

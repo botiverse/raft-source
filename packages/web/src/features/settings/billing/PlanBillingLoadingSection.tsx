@@ -55,10 +55,15 @@ export function PlanBillingLoadingSection() {
               </MeterHeader>
               <MeterTrack />
             </Meter>
-            <DescriptionList direction="inline">
+            {/* As SeatsBreakdown: people, then agents, label beside value. */}
+            <DescriptionList direction="horizontal">
               <DescriptionItem>
-                <DescriptionTerm><SkeletonTextBar className="w-12" /></DescriptionTerm>
+                <DescriptionTerm><SkeletonTextBar className="w-14" /></DescriptionTerm>
                 <DescriptionDetails><SkeletonTextBar className="w-16" /></DescriptionDetails>
+              </DescriptionItem>
+              <DescriptionItem>
+                <DescriptionTerm><SkeletonTextBar className="w-16" /></DescriptionTerm>
+                <DescriptionDetails><SkeletonTextBar className="w-36" /></DescriptionDetails>
               </DescriptionItem>
             </DescriptionList>
           </div>

@@ -1,15 +1,15 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { ReactNode, RefObject } from "react";
 import { useIntl } from "react-intl";
 import { useSearchParams } from "react-router-dom";
-import { ArrowRight, Bot, Copy, ListFilter as ListFilterIcon, Info, ArrowRightFromLine, ArrowRightToLine, Monitor, EllipsisVertical, Repeat, SearchX, TriangleAlert, User, UserMinus } from "lucide-react";
+import { ArrowRight, Bot, ChartPie, Copy, Table2, ListFilter as ListFilterIcon, Info, ArrowRightFromLine, ArrowRightToLine, Monitor, EllipsisVertical, Repeat, SearchX, TriangleAlert, User, UserMinus } from "lucide-react";
 import {
   Badge, Button, ContextMenu, ContextMenuContent,
   ContextMenuItem, ContextMenuLabel, ContextMenuSeparator, ContextMenuTrigger, DescriptionDetails, DescriptionItem, DescriptionList,
   DescriptionTerm, Drawer, DrawerBody, DrawerContent, DrawerHeader, DrawerTitle, DropdownMenu, DropdownMenuContent, DropdownMenuItem,
   DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger, EmptyState, EmptyStateActions, EmptyStateContent, EmptyStateDescription,
   EmptyStateIcon, EmptyStateTitle, ListRow, ListRowBody, ListRowBottom, ListRowDescription, ListRowGroup, ListRowMeta, ListRowTitle,
-  ListRowTop, Popover, PopoverContent, ScrollArea, Skeleton, toast,
+  ListRowTop, Popover, PopoverContent, ScrollArea, SegmentedControl, SegmentedControlItem, SegmentedControlLabel, Skeleton, toast,
 } from "@botiverse/raft-ui";
 import type { PopoverProps } from "@botiverse/raft-ui";
 import { FilterChip, FilterChipLabel, FilterChipRemove } from "@botiverse/raft-ui/wip";
@@ -26,11 +26,12 @@ import { dismissLayerProps, notDismissLayerProps } from "../../ui/dismissLayer";
 import { MigrationChord, routeKey } from "./MigrationChord";
 import type { ChordEvent, ChordTarget, ChordView } from "./MigrationChord";
 import {
-  CLOUD_NODE, EMPTY_FILTERS, OUTCOME_LABEL, buildNodes, filterEntries, filtersFromSearch, isFiltered, journey, routeCells, searchFromFilters, stats, targetNode,
-  initiatedBy,
-  withInitiator,
+  CLOUD_NODE, EMPTY_FILTERS, buildNodes, durationSec, filterEntries, filtersFromSearch, isFiltered, journey, routeCells, searchEntries, searchFromFilters, stats,
+  targetNode, viewFromSearch, initiatedBy, withInitiator,
 } from "./model";
 import type { Initiator, LogFilters, LogNode, NodeId } from "./model";
+import { MigrationLogSearch, MigrationLogTable } from "./MigrationLogTable";
+import { OutcomeBadge } from "./OutcomeBadge";
 import { ProfileNameLink } from "./ProfileNameLink";
 import { ListFilter, OutcomeFilter, TimeFilter } from "./MigrationLogFilters";
 import { FADE_MASK, useCoarsePointer, useIsDesktop, useScrollOverflow, useWindowWidth } from "./viewport";
@@ -57,7 +58,6 @@ const REASON_LABEL = {
 } as const;
 
 const median = (xs: number[]) => { if (!xs.length) return null; const s = [...xs].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
-const durationSec = (e: AgentMigrationLogEntry) => (e.endedAt ? Math.max(0, Math.round((Date.parse(e.endedAt) - Date.parse(e.startedAt)) / 1000)) : null);
 
 /**
  * The server's migration log (owners and admins): every move of an agent
@@ -73,12 +73,15 @@ export function MigrationLogPage() {
   const navigate = useAppNavigate();
   const [params, setParams] = useSearchParams();
   const filters = useMemo(() => filtersFromSearch(params), [params]);
+  // Chart or table, kept in the URL with the filters; the table's search stays on the page.
+  const logView = viewFromSearch(params);
+  const [query, setQuery] = useState("");
   // Hover (desktop), the item opened by a tap or click, the item a menu acts on.
   const [hover, setHover] = useState<Anchor | null>(null);
   const [opened, setOpened] = useState<Anchor | null>(null);
   const [menuTarget, setMenuTarget] = useState<ChordTarget | null>(null);
-  // The menu opened by press and hold (touch) or the ContextMenu key, at that point on the screen.
-  const [actions, setActions] = useState<{ target: ChordTarget; x: number; y: number; keyboard?: boolean } | null>(null);
+  // The menu opened by press and hold (touch) or the ContextMenu key, at that point on the chart (with client fallback).
+  const [actions, setActions] = useState<{ target: ChordTarget; x: number; y: number; dx: number | null; dy: number | null; chart: Element | null; keyboard?: boolean } | null>(null);
   const coarse = useCoarsePointer();
   const chartAreaRef = useRef<HTMLDivElement>(null);
   const [hoverAgent, setHoverAgent] = useState<string | null>(null);
@@ -86,8 +89,17 @@ export function MigrationLogPage() {
   const setFilters = useCallback((next: LogFilters) => {
     setOpened(null);
     setHover(null);
-    setParams(searchFromFilters(next), { replace: true });
-  }, [setParams]);
+    setParams(searchFromFilters(next, logView), { replace: true });
+  }, [setParams, logView]);
+  const onViewChange = useCallback((next: string) => {
+    setOpened(null);
+    setHover(null);
+    setParams(searchFromFilters(filters, next === "table" ? "table" : "chart"), { replace: true });
+  }, [setParams, filters]);
+  // The search filters a deferred copy of the query, so typing stays quick over 2,000 rows; clearing it focuses the field.
+  const searchQuery = useDeferredValue(query);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const clearSearch = useCallback(() => { setQuery(""); searchRef.current?.focus(); }, []);
 
   const agents = useAgentStore((s) => s.agents);
   const machines = useMachineStore((s) => s.machines);
@@ -162,7 +174,15 @@ export function MigrationLogPage() {
     if (e.type === "hover") { if (desktop) setHover(target ? { target, at } : null); return; }
     // A right-click opens the ContextMenu around the chart; a touch opens ours on press and hold instead.
     if (e.type === "down" || e.type === "menu") { setMenuTarget(e.pointerType === "touch" ? null : target); return; }
-    if (e.type === "actions") { if (target) setActions({ target, x: e.clientX ?? 0, y: e.clientY ?? 0, keyboard: e.keyboard }); return; }
+    if (e.type === "actions") {
+      if (target) {
+        const x = e.clientX ?? 0, y = e.clientY ?? 0;
+        const chart = chartAreaRef.current?.querySelector("svg.migration-chord") ?? chartAreaRef.current;
+        const box = chart?.getBoundingClientRect();
+        setActions({ target, x, y, dx: box ? x - box.left : null, dy: box ? y - box.top : null, chart, keyboard: e.keyboard });
+      }
+      return;
+    }
     if (!target) { setOpened(null); return; }
     const next = { target, at, keyboard: e.keyboard };
     if (e.keyboard) { setOpened(next); return; }
@@ -203,7 +223,19 @@ export function MigrationLogPage() {
     // Opened from the keyboard: focus goes back to the chart, on the same item.
     if (actionsFromKeyboard) window.requestAnimationFrame(() => chartAreaRef.current?.querySelector<SVGSVGElement>("svg.migration-chord")?.focus());
   }, [actionsFromKeyboard]);
-  const actionsAnchor = useMemo(() => (actions ? { getBoundingClientRect: () => DOMRect.fromRect({ x: actions.x, y: actions.y, width: 0, height: 0 }) } : null), [actions]);
+  const actionsAnchor = useMemo(() => {
+    if (!actions) return null;
+    const chart = actions.chart;
+    return {
+      getBoundingClientRect: () => {
+        const box = chart?.isConnected ? chart.getBoundingClientRect() : null;
+        const x = box && actions.dx !== null ? box.left + actions.dx : actions.x;
+        const y = box && actions.dy !== null ? box.top + actions.dy : actions.y;
+        return DOMRect.fromRect({ x, y, width: 0, height: 0 });
+      },
+      contextElement: chart ?? undefined,
+    };
+  }, [actions]);
 
   const openDetails = useCallback((target: ChordTarget) => setOpened((cur) => ({ target, at: cur && sameTarget(cur.target, target) ? cur.at : { x: 0, y: 0 } })), []);
   const act = useMenuActions({ filters, setFilters, nodeById, nodeName, agentName, open: openDetails, navigate });
@@ -247,7 +279,11 @@ export function MigrationLogPage() {
       </span>
     );
   }, [nodeById, nodeName]);
-  const filterRow = useScrollOverflow(!desktop, JSON.stringify(filters));
+  const searched = useMemo(() => (logView === "table" ? searchEntries(shown, searchQuery, (e) => [
+    agentName(e.agentId), e.sourceMachineName, e.targetMachineName,
+    ...[nodeById.get(e.sourceMachineId), nodeById.get(targetNode(e))].flatMap((n) => (n ? [n.code, nodeName(n)] : [])),
+  ]) : shown), [logView, shown, searchQuery, agentName, nodeById, nodeName]);
+  const filterRow = useScrollOverflow(!desktop, JSON.stringify(filters) + logView);
   // Nothing drawn, though there are moves: canceled ones aren't drawn (only successes and failures are).
   const nothingDrawn = shown.length > 0 && cells.length === 0;
   const skeletonStyle = useMemo(() => ({ width: chartSize, height: chartSize }), [chartSize]);
@@ -255,6 +291,7 @@ export function MigrationLogPage() {
   const filterMaskStyle = useMemo(() => ({ maskImage: filterMask, WebkitMaskImage: filterMask }), [filterMask]);
   const filterControls = (
     <>
+      {logView === "table" ? <MigrationLogSearch value={query} onChange={setQuery} onClear={clearSearch} inputRef={searchRef} className={desktop ? "w-64" : "w-48 shrink-0"} /> : null}
       <ListFilter
         icon={<Bot aria-hidden />}
         name={t({ id: "agent.migrationLog.filter.agents" })}
@@ -285,6 +322,10 @@ export function MigrationLogPage() {
       <OutcomeFilter value={filters.outcomes} onChange={onOutcomesChange} />
       <TimeFilter value={filters.days} onChange={onDaysChange} />
       {isFiltered(filters) ? <Button variant="ghost" size="md" className="shrink-0" onClick={clearFilters}>{t({ id: "agent.migrationLog.filter.clearAll" })}</Button> : null}
+      <SegmentedControl aria-label={t({ id: "agent.migrationLog.view.label" })} value={logView} onValueChange={onViewChange} iconsOnlyBelow="auto" className="ms-auto" data-testid="migration-log-view">
+        <SegmentedControlItem value="chart"><ChartPie /><SegmentedControlLabel>{t({ id: "agent.migrationLog.view.chart" })}</SegmentedControlLabel></SegmentedControlItem>
+        <SegmentedControlItem value="table"><Table2 /><SegmentedControlLabel>{t({ id: "agent.migrationLog.view.table" })}</SegmentedControlLabel></SegmentedControlItem>
+      </SegmentedControl>
     </>
   );
 
@@ -362,6 +403,19 @@ export function MigrationLogPage() {
               <EmptyStateContent><EmptyStateTitle>{t({ id: "agent.migrationLog.empty.filteredTitle" })}</EmptyStateTitle><EmptyStateDescription>{t({ id: "agent.migrationLog.empty.filteredBody" })}</EmptyStateDescription></EmptyStateContent>
               <EmptyStateActions><Button variant="outline" size="md" onClick={clearFilters}>{t({ id: "agent.migrationLog.filter.clearAll" })}</Button></EmptyStateActions>
             </EmptyState>
+          ) : logView === "table" ? (
+            <MigrationLogTable
+              key={JSON.stringify(filters)}
+              entries={searched}
+              query={searchQuery}
+              onClearSearch={clearSearch}
+              nodeById={nodeById}
+              nodeName={nodeName}
+              agentLink={agentLink}
+              avatarOf={avatarOf}
+              formatTime={formatShortDateTime}
+              formatDuration={formatDuration}
+            />
           ) : (
             <div className={desktop ? "grid items-start gap-6" : "stack-y-4"} style={desktop ? { gridTemplateColumns: `${chartSize}px minmax(0, 1fr)` } : undefined}>
               <div ref={chartAreaRef} className="relative flex flex-col items-center">
@@ -424,7 +478,7 @@ export function MigrationLogPage() {
           )}
         </div>
 
-        {entries.length ? <Legend /> : null}
+        {entries.length && logView === "chart" ? <Legend /> : null}
       </ScrollArea>
 
       {/* A tap on a phone: the details in a bottom sheet; ⋯ opens the same menu as press and hold. */}
@@ -888,11 +942,4 @@ function RouteDetails({ src, dst, entries, agentLink, avatarOf, formatTime, form
 function FormattedRoute({ from, to }: { from: string | undefined; to: string | undefined }) {
   const { formatMessage: t } = useIntl();
   return <>{t({ id: "agent.migrationLog.fmt.route" }, { from, to })}</>;
-}
-
-function OutcomeBadge({ outcome }: { outcome: AgentMigrationLogEntry["outcome"] }) {
-  const { formatMessage: t } = useIntl();
-  if (outcome === "failed") return <Badge appearance="soft" variant="warning"><TriangleAlert aria-hidden />{t({ id: OUTCOME_LABEL.failed })}</Badge>;
-  if (outcome === "canceled") return <Badge appearance="soft" variant="muted">{t({ id: OUTCOME_LABEL.canceled })}</Badge>;
-  return null;
 }

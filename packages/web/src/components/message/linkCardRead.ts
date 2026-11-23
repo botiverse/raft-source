@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { MESSAGE_CARD_EXECUTE_CAPABILITY, MESSAGE_CARD_FORM_CAPABILITY, MESSAGE_CARD_LIMITS, MESSAGE_CARD_SECRET_INPUT_CAPABILITY } from "@botiverse/raft-shared";
 import type { MessageCardCapability, MessageCardReadAnswer } from "@botiverse/raft-shared";
-import { appCardEncryptionKeySchema, LINK_CARD_ACTION_ID, parseLinkCardReadAnswer, publicPreviewUrl } from "@botiverse/raft-shared/src/appLinkPreview";
+import { appCardEncryptionKeySchema, LINK_CARD_ACTION_ID, LINK_CARD_CHANGED_CAPABILITY, parseLinkCardReadAnswer, publicPreviewUrl } from "@botiverse/raft-shared/src/appLinkPreview";
 import type { LinkCardCapability, LinkCardReadAnswerItem, LinkCardReadAnswerTicket } from "@botiverse/raft-shared/src/appLinkPreview";
 import api from "../../api/client";
 
@@ -38,6 +38,9 @@ import api from "../../api/client";
  * `card.form.secret.v1` (RFC 086 §5.3): a SecretInput's value is sealed on
  * this device to the App's key from this read (linkCardSeal.ts) and sent
  * only in execute's `sealed_inputs`.
+ * `card.changed.v1` (link_card.changed): Raft puts `object_key_sha256` on a
+ * card whose App named its object, and a `link_card.changed` nudge with the
+ * same digest reads that card again (linkCardChangedRereads.ts).
  *
  * Every device declares the same list, a touch-only one too (RFC 076 §13,
  * AppFather): a block card's buttons work by keyboard and touch, on desktop
@@ -46,7 +49,7 @@ import api from "../../api/client";
  */
 export const LINK_CARD_READ_CAPABILITIES: readonly (LinkCardCapability | MessageCardCapability)[] = [
   "card.v2", "inline.v1", "inline.tone.v2", "button.v1", "confirm.v1", "undo.v1", "block.v1", "preview.v3", "unreviewed_app.v1", "badge.color.v1", "execute.toast.v1",
-  MESSAGE_CARD_EXECUTE_CAPABILITY, MESSAGE_CARD_FORM_CAPABILITY, MESSAGE_CARD_SECRET_INPUT_CAPABILITY,
+  LINK_CARD_CHANGED_CAPABILITY, MESSAGE_CARD_EXECUTE_CAPABILITY, MESSAGE_CARD_FORM_CAPABILITY, MESSAGE_CARD_SECRET_INPUT_CAPABILITY,
 ];
 
 /**

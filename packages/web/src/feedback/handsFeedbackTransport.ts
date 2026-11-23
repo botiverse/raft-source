@@ -21,7 +21,8 @@ export const handsFeedbackTransport = createHandsFeedbackTransport(api, {
 
 /**
  * The Raft client this page runs as (FeedbackProvider `currentClient`): a
- * ticket filed on any other names that client on its first message. Raft
+ * ticket filed on any other names that client on its list row and on its
+ * first message. Raft
  * Desktop is told apart as desktopFeedbackMetadata does.
  */
 export function feedbackCurrentClient(): FeedbackClient {

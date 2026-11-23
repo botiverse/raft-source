@@ -11,17 +11,22 @@ const base = process.argv[2] ?? "http://127.0.0.1:5199";
 const outDir = process.argv[3] ?? "/var/tmp/raft-ubuntu/limit-reset-shots";
 // [file, case, button to press first (by accessible name), what to wait for]
 const CASES = [
-  ["01-card-at-5-hour-limit", "card-wall", null, "scene"],
-  ["02-card-below-limit", "card-below", null, "scene"],
-  ["03-consent-warning", "consent", null, "dialog"],
-  ["04a-list-below-limit", "list-below", null, "radio"],
-  ["04b-list-at-5-hour-limit", "list-wall", "Continue", "radio"],
-  ["04c-list-read-only", "list-read-only", null, "listitem"],
-  ["05-confirm", "confirm", null, "dialog"],
-  ["06a-result-success", "result-success", null, "scene"],
-  ["06b-result-refused-nothing-used", "result-refused", "Use weekly reset", "No reset was used"],
-  ["06c-result-five-hour-spent", "result-five-hour-spent", null, "scene"],
-  ["06d-result-unknown", "result-unknown", null, "scene"],
+  ["01a-card-at-5-hour-limit", "card-wall", null, "scene"],
+  ["01b-card-below-limit", "card-below", null, "scene"],
+  ["01c-card-view-only", "card-view-only", null, "scene"],
+  ["02-reading", "reading", null, "This takes a moment"],
+  ["03a-choose", "choose", null, "radio"],
+  ["03b-list-read-only", "list-read-only", null, "listitem"],
+  ["04-confirm", "confirm", null, "dialog"],
+  ["05a-result-success", "result-success", null, "scene"],
+  ["05b-result-refused-nothing-used", "result-refused", "Yes, use my weekly reset", "No reset was used"],
+  ["05c-result-kept", "result-kept", null, "scene"],
+  ["05d-result-five-hour-spent", "result-five-hour-spent", null, "scene"],
+  ["05e-result-unknown", "result-unknown", null, "scene"],
+  ["06a-legacy-reset", "legacy-reset", null, "scene"],
+  ["06b-legacy-used", "legacy-used", null, "scene"],
+  ["06c-none-to-use", "none-to-use", null, "scene"],
+  ["06d-none-at-limit", "none-at-limit", null, "scene"],
 ];
 
 await mkdir(outDir, { recursive: true });

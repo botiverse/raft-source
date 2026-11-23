@@ -133,6 +133,7 @@ async function createAgentEventAccessToken(app: Awaited<ReturnType<typeof openTe
   const { client, clientSecret } = await createOAuthClient({
     serverId: server.id,
     createdByUserId: owner.id,
+    vouchAsCreator: true, // the owner's App: every agent here is granted it
     clientId: `oauth-event-${opts.suffix.slice(0, 8)}`,
     name: "OAuth Event Client",
     allowedScopes: ["openid", "profile", "identity", "agent:event:write", "agent:notification:write"],
@@ -837,7 +838,7 @@ test("App client credentials discover only their active installation on an exact
     serverId: otherServer.id,
   });
   assert.equal(crossServer.status, 404);
-  assert.deepEqual(await crossServer.json(), { error: "Active installation not found" });
+  assert.deepEqual(await crossServer.json(), { error: "Active installation not found", code: "installation_not_found", errorCode: "installation_not_found" });
 
   const crossClient = await lookup({
     clientKey: otherClient.clientId,
@@ -847,7 +848,7 @@ test("App client credentials discover only their active installation on an exact
   });
   assert.equal(crossClient.status, 404, "an untrusted client_id must not override the authenticated App");
   // Another App learns nothing of a Server it isn't installed on: no name, slug or link.
-  assert.deepEqual(await crossClient.json(), { error: "Active installation not found" });
+  assert.deepEqual(await crossClient.json(), { error: "Active installation not found", code: "installation_not_found", errorCode: "installation_not_found" });
 
   await getDb().update(oauthClientInstalls).set({ status: "suspended" })
     .where(eq(oauthClientInstalls.id, installation.id));
@@ -1286,6 +1287,7 @@ test("agent OAuth serverinfo uses the same server-scoped bearer token and null a
   const { client, clientSecret } = await createOAuthClient({
     serverId: server.id,
     createdByUserId: owner.id,
+    vouchAsCreator: true, // the owner's App: every agent here is granted it
     clientId: `oauth-as-${suffix.slice(0, 8)}`,
     name: "OAuth Agent Serverinfo Client",
     returnUrl: "https://example.test/login/callback",
@@ -1936,6 +1938,7 @@ test("agent OAuth request grants immediately without human approval", async ({ a
   const { client, clientSecret } = await createOAuthClient({
     serverId: server.id,
     createdByUserId: owner.id,
+    vouchAsCreator: true, // the owner's App: every agent here is granted it
     clientId: `oauth-agent-${suffix.slice(0, 8)}`,
     name: "OAuth Agent Client",
     returnUrl: "https://example.test/login/callback",
@@ -2266,6 +2269,7 @@ test("agent inbound token exchange requires RFC 8707 resource but identity token
   const { client, clientSecret } = await createOAuthClient({
     serverId: server.id,
     createdByUserId: owner.id,
+    vouchAsCreator: true, // the owner's App: every agent here is granted it
     clientId: `oauth-resource-${suffix.slice(0, 8)}`,
     name: "OAuth Resource Client",
     allowedScopes: ["openid", "profile", "identity", "agent:event:write"],
@@ -2374,7 +2378,7 @@ test("a third-party event summary is folded to one line across every line separa
 test("a third-party event summary over the limit is the app's error, not a server failure", async ({ app }) => {
   const { accessToken } = await createAgentEventAccessToken(app, { suffix: randomUUID() });
   const posted = await postAgentEvent(app.baseUrl, accessToken, { kind: "event", summary: "x".repeat(2001) });
-  assert.deepEqual([posted.status, await posted.json()], [400, { error: "summary is too long" }]);
+  assert.deepEqual([posted.status, await posted.json()], [400, { error: "summary is too long", code: "invalid_input", errorCode: "invalid_input" }]);
 });
 
 test("third-party agent event endpoint preserves source provenance without warning prose", async ({ app }) => {
@@ -2846,6 +2850,7 @@ test("third-party agent event endpoint rejects unbound identity token", async ({
   const { client, clientSecret } = await createOAuthClient({
     serverId: server.id,
     createdByUserId: owner.id,
+    vouchAsCreator: true, // the owner's App: every agent here is granted it
     clientId: `oauth-event-r-${suffix.slice(0, 8)}`,
     name: "OAuth Event Reject Client",
   });

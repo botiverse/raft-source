@@ -6,6 +6,7 @@ import StatusDot from "../ui/StatusDot";
 import type { StatusDotProps } from "../ui/StatusDot";
 import { traceAgentActivityStatusDotApplied } from "../../utils/webAgentActivityTrace";
 import { formatAgentDisplayStateText } from "../../utils/activity";
+import { useAgentRuntimeSignInNeeded } from "./useAgentRuntimeSignInNeeded";
 
 /**
  * Isolated component that subscribes to a single agent's activity and renders
@@ -27,7 +28,10 @@ export default function AgentActivityDot({
   const fallbackStatus = fallbackActivity === "offline" ? "stopped" : "active";
   const displayState = useAgentDisplayState(agentId, { status: fallbackStatus });
   const traceJoin = useAgentActivityTraceJoin(agentId);
-  const title = rest.title ?? formatAgentDisplayStateText(intl, displayState);
+  // #triage:#494: a start waiting for the runtime's sign-in is something a
+  // person must do: the error light, and the sentence in place of the daemon's.
+  const signIn = useAgentRuntimeSignInNeeded(agentId, displayState);
+  const title = rest.title ?? signIn?.detail ?? formatAgentDisplayStateText(intl, displayState);
   // Traced when what the dot shows changes, with the join of the push that
   // changed it; a new push that leaves the dot as it was (a new join id
   // alone) is not a new dot state (#proj-frontend:#8).
@@ -37,5 +41,5 @@ export default function AgentActivityDot({
   useEffect(() => {
     traceApplied(displayState.activity, displayState.isOnline, displayState.isExternal);
   }, [agentId, displayState.activity, displayState.isOnline, displayState.isExternal]);
-  return <StatusDot activity={displayState.activity} external={displayState.isExternal && !displayState.isOnline} size={size} className={className} {...rest} title={title} />;
+  return <StatusDot presence={signIn ? "error" : undefined} activity={displayState.activity} external={displayState.isExternal && !displayState.isOnline} size={size} className={className} {...rest} title={title} />;
 }

@@ -25,13 +25,14 @@ Object.defineProperty(globalThis, "sessionStorage", { value: new MemoryStorage()
 const { useInboxStore, requestInboxBackgroundRefresh, cancelInboxBackgroundRefresh, INBOX_BACKGROUND_REFRESH_INTERVAL_MS } = await import("../src/store/inboxStore");
 const { resetInPlaceDriftForTests } = await import("../src/store/inboxInPlaceUnread");
 const { AUDIT_FOLLOWUP_DELAY_MS, POSITION_AUDIT_EVERY, ROW_REREAD_DELAY_MS, resetInboxRowPositionForTests } = await import("../src/store/inboxRowPosition");
-const { consumeReadStateUpdate, notifyChannelReadLocally, notifyChannelReadPersistedLocally } = await import("../src/store/readStateSync");
+const { consumeReadStateSnapshot, consumeReadStateUpdate, notifyChannelReadLocally, notifyChannelReadPersistedLocally } = await import("../src/store/readStateSync");
 const { applyReadStateUpdate } = await import("../src/store/applyReadStateUpdate");
 const { getCurrentPrincipalId, setCurrentPrincipalId } = await import("../src/store/principalRuntime");
 const { triggerServerReset } = await import("../src/store/serverResetRegistry");
 const { useServerStore } = await import("../src/store/serverStore");
 const { acceptActivityReadAllAck } = await import("../src/store/activityReadState");
 const { useMessageStore } = await import("../src/store/messageStore");
+const { useChannelStore } = await import("../src/store/channelStore");
 const { buildMainLayoutSocketBindings } = await import("../src/store/socketBridge");
 const { INBOX_ROW_POSITION_FLAG_KEY, resetServerFeatureFlagsForTests, setServerFeatureFlagForTests } = await import("../src/store/serverFeatureFlags");
 const { __setStateTransitionEmitterForTest } = await import("../src/utils/stateTransitionTrace");
@@ -87,10 +88,11 @@ let hold: Promise<void> | null = null;
 let traces: Array<{ outcome: string; detail: string; attrs: Record<string, unknown> }> = [];
 
 /** The read state every served row carries (a test sets it to answer at the ledger's read). */
-let servedRead = { readStateVersion: 1, maxReadSeq: "0" };
+let servedRead: { readStateVersion: number; maxReadSeq: string } | null = { readStateVersion: 1, maxReadSeq: "0" };
 
 function wire(item: InboxItem) {
   const row = item as ChannelItem;
+  if (!servedRead) return row;
   return {
     ...row,
     readState: {
@@ -377,6 +379,59 @@ test("flag on: my own send's echo (the store had it) re-reads nothing", async ()
     assert.equal(rowA().latestActivitySeq, "101");
     assert.equal(rowA().unreadCount, 0);
   } finally { restore(); }
+});
+
+/** Channel A muted for Activity from seq 101 on. */
+function muteA() {
+  useChannelStore.setState({ channels: [{ id: "channel-a", activityMuted: true, muteFromSeq: 101 }], dmChannels: [] } as never);
+}
+
+test("flag on: past a mute, a message without a mention of me leaves the row as it is and re-reads nothing (muted_message_leaves_row)", async () => {
+  reset([channelRow(), rowB()], true);
+  muteA();
+  try {
+    socketHandler("message:new")(message(101));
+    await settle();
+    assert.deepEqual(reads, [], "no list read, no row read");
+    const row = rowA();
+    assert.equal(row.unreadCount, 2);
+    assert.equal(row.hasMention, false);
+    assert.equal(row.latestActivitySeq, "100", "the row stays at its last message before the mute");
+    assert.equal(row.lastMessagePreview, channelRow().lastMessagePreview);
+  } finally { restore(); useChannelStore.setState({ channels: [], dmChannels: [] } as never); }
+});
+
+test("flag on: past a mute, a mention of me lights the row's @ without counting or moving it, re-reading nothing (muted_mention_lights_without_moving)", async () => {
+  reset([channelRow(), rowB()], true);
+  muteA();
+  try {
+    socketHandler("message:new")(message(101, { mentions: [{ type: "user", id: ME }] } as Partial<Message>));
+    await settle();
+    assert.deepEqual(reads, [], "no list read, no row read");
+    const row = rowA();
+    assert.equal(row.unreadCount, 2, "a muted mention does not count");
+    assert.equal(row.hasMention, true);
+    assert.equal(row.latestActivitySeq, "100", "the row stays at its last message before the mute");
+    assert.equal(row.lastMessagePreview, "m100");
+
+    // An answer at the row's position sent before the mention reached the server keeps the @.
+    served = [channelRow(), rowB()];
+    requestInboxBackgroundRefresh("activity_changed");
+    await settle();
+    assert.equal(rowA().hasMention, true);
+    assert.equal(rowA().latestActivitySeq, "100");
+  } finally { restore(); useChannelStore.setState({ channels: [], dmChannels: [] } as never); }
+});
+
+test("flag off: past a mute, a mention of me re-reads the list, as before", async () => {
+  reset([channelRow(), rowB()], false);
+  muteA();
+  try {
+    served = [channelRow({ hasMention: true }), rowB()];
+    socketHandler("message:new")(message(101, { mentions: [{ type: "user", id: ME }] } as Partial<Message>));
+    await settle();
+    assert.deepEqual(reads, [listRead("message_new")]);
+  } finally { restore(); useChannelStore.setState({ channels: [], dmChannels: [] } as never); }
 });
 
 test("flag on: a row the row re-read does not return (no longer listed for the viewer) re-reads the list (row_missing)", async () => {
@@ -970,3 +1025,109 @@ for (const flagOn of [true, false]) {
     } finally { restore(); }
   });
 }
+
+// #15301 (answer_before_read_lands_no_live, mark_unread_then_late_read_ack): the row
+// keeps the reducer's read seq across events. No store correction covers these
+// answers: the read came from another device (no read hold here), and the answer's
+// read state is as new as the ledger's (no ledger adjudication, not read-behind).
+test("flag on: an answer at or below a read that landed does not bring the unread back (the row's read seq)", async () => {
+  reset([servedA(100, 2), rowB()], true);
+  try {
+    applyReadStateUpdate({ serverId: SERVER, scopeId: "channel-a", maxReadSeq: 100, readStateVersion: 9 });
+    assert.equal(rowA().unreadCount, 0, "the read clears the row");
+    // Its counts computed before the read reached them: 99 and 100 still counted.
+    served = [servedA(100, 2), rowB()];
+    servedRead = { readStateVersion: 9, maxReadSeq: "100" };
+    requestInboxBackgroundRefresh("activity_changed");
+    await settle();
+    assert.equal(rowA().unreadCount, 0, "the answer at the read counted read messages only");
+    // A message past the read still counts, and an answer with it is taken.
+    served = [servedA(101, 1), rowB()];
+    requestInboxBackgroundRefresh("activity_changed");
+    await settle();
+    assert.equal(rowA().unreadCount, 1);
+  } finally { restore(); }
+});
+
+test("flag on: Mark as Unread, then a late ack of the read before it, then an answer: the unread stays", async () => {
+  reset([servedA(100, 0), rowB()], true);
+  try {
+    setCurrentPrincipalId(ME);
+    applyReadStateUpdate({ serverId: SERVER, scopeId: "channel-a", maxReadSeq: 100, readStateVersion: 9 });
+    let answerUnread!: () => void;
+    const unreadAnswered = new Promise<void>((resolve) => { answerUnread = resolve; });
+    api.post = (async (url: string) => {
+      if (url !== "/channels/channel-a/unread") return { data: {}, headers: {} };
+      await unreadAnswered;
+      return { data: { unreadCount: 1, readStateVersion: 10, maxReadSeq: 99 }, headers: {} };
+    }) as typeof api.post;
+    const marked = useInboxStore.getState().markUnread(rowA());
+    assert.equal(rowA().unreadCount, 1, "unread at once");
+    // The read from before the mark, its persisted notice late (the ledger still at it).
+    notifyChannelReadPersistedLocally({ channelId: "channel-a", serverId: SERVER, serverEpoch: 1, principalId: ME });
+    // An answer with no read state (an exit that does not carry it): only the mark here tells.
+    served = [servedA(100, 1), rowB()];
+    servedRead = null;
+    answerUnread();
+    await marked;
+    await settle();
+    assert.equal(rowA().unreadCount, 1, "the late ack did not raise the read seq past the mark");
+  } finally { setCurrentPrincipalId(null); restore(); }
+});
+
+test("flag on: a Mark as Unread made on another device, carried only by an answer's read state, keeps the answer's unread", async () => {
+  reset([servedA(100, 2), rowB()], true);
+  try {
+    applyReadStateUpdate({ serverId: SERVER, scopeId: "channel-a", maxReadSeq: 100, readStateVersion: 9 });
+    assert.equal(rowA().unreadCount, 0, "read through 100");
+    // Marked unread elsewhere (the cursor rewound to 99 at v10, no flag: something counts); no socket event here.
+    served = [servedA(100, 1), rowB()];
+    servedRead = { readStateVersion: 10, maxReadSeq: "99" };
+    requestInboxBackgroundRefresh("activity_changed");
+    await settle();
+    assert.equal(rowA().unreadCount, 1, "the rewound cursor is a Mark as Unread: the read seq no longer holds");
+  } finally { restore(); }
+});
+
+test("flag on: a Mark as Unread elsewhere below a read seq my send raised (its version never folded here) keeps the answer's unread", async () => {
+  reset([servedA(100, 0), rowB()], true);
+  try {
+    applyReadStateUpdate({ serverId: SERVER, scopeId: "channel-a", maxReadSeq: 100, readStateVersion: 9 });
+    socketHandler("message:new")(message(101));
+    socketHandler("message:new")(message(102, { senderId: ME }));
+    await settle();
+    assert.equal(rowA().unreadCount, 0, "my send read the conversation through 102");
+    // Marked unread on the phone: the cursor back to 101 (above the folded 100), no flag.
+    served = [servedA(102, 1), rowB()];
+    servedRead = { readStateVersion: 11, maxReadSeq: "101" };
+    requestInboxBackgroundRefresh("activity_changed");
+    await settle();
+    assert.equal(rowA().unreadCount, 1, "below the read seq: a Mark as Unread");
+  } finally { restore(); }
+});
+
+test("flag on: a Mark as Unread elsewhere delivered by its read-state event keeps the answer's unread", async () => {
+  reset([servedA(100, 2), rowB()], true);
+  try {
+    applyReadStateUpdate({ serverId: SERVER, scopeId: "channel-a", maxReadSeq: 100, readStateVersion: 9 });
+    applyReadStateUpdate({ serverId: SERVER, scopeId: "channel-a", maxReadSeq: 99, readStateVersion: 10 });
+    served = [servedA(100, 1), rowB()];
+    servedRead = { readStateVersion: 10, maxReadSeq: "99" };
+    requestInboxBackgroundRefresh("activity_changed");
+    await settle();
+    assert.equal(rowA().unreadCount, 1);
+  } finally { restore(); }
+});
+
+test("flag on: a cursor begun again (its row deleted, a new version 1) drops the read seq rather than being ignored", async () => {
+  reset([servedA(100, 2), rowB()], true);
+  try {
+    applyReadStateUpdate({ serverId: SERVER, scopeId: "channel-a", maxReadSeq: 100, readStateVersion: 9 });
+    consumeReadStateSnapshot(SERVER, "channel-a", { kind: "absent" } as never);
+    served = [servedA(100, 1), rowB()];
+    servedRead = { readStateVersion: 1, maxReadSeq: "0" };
+    requestInboxBackgroundRefresh("activity_changed");
+    await settle();
+    assert.equal(rowA().unreadCount, 1);
+  } finally { restore(); }
+});

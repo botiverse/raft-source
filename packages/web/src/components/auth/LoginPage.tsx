@@ -262,6 +262,13 @@ function LoginPageForm({ onSwitchToRegister, onForgotPassword, accountLink, purp
             </TextLink>
           </div>
         )}
+        {passkey.legacyShown && (
+          <div className="mt-2 text-center">
+            <TextLink className="text-footnote" onClick={passkey.signInWithLegacy} disabled={passkey.busy}>
+              {formatMessage({ id: "auth.passkey.useEarlier" })}
+            </TextLink>
+          </div>
+        )}
         {desktopPasskeyShown && (
           <div className="mt-4 text-center">
             <TextLink className="text-footnote" onClick={handleDesktopPasskey}>

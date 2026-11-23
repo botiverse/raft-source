@@ -39,13 +39,29 @@
  * requires the explicit pick, and token returns an attach token
  * (computer_attach), a migrate token (computer_migrate) or the `sk_agent_*`
  * itself (agent_key), once, and no session.
+ *
+ * With `loopback` too (RFC 8252, loopbackRedirect.ts) the same request
+ * completes without a code to type: authorize returns `requestId` and
+ * `approvalUrl` (`/login/device?request=<requestId>`) and no device or user
+ * code; describe and approve take `requestId` instead of `userCode`; approve
+ * answers `redirectUrl` (the client's 127.0.0.1 return URI with a one-time
+ * `code`, or `error=access_denied`); and token takes `{requestId, code,
+ * codeVerifier}` instead of polling. Everything else (step-up, approval
+ * ticket, the pick, the grant, its notice) is the device code's.
  */
 import { Router, type Request, type Response, type Router as RouterType } from "express";
 import {
   createDeviceAuthorization,
+  createLoopbackDeviceAuthorization,
+  parseLoginFallbackReason,
   describeDeviceAuthorization,
   approveDeviceAuthorization,
   consumeDeviceAuthorization,
+  type ApproveDeviceAuthorizationResult,
+  consumeLoopbackDeviceAuthorization,
+  parseDeviceLoopbackRequest,
+  type DeviceAuthorizationLocator,
+  type DeviceLoopbackRequest,
   isDeviceAuthSurfaceEnabled,
   recordDeviceLoginSession,
   revokeDeviceLoginByLink,
@@ -63,6 +79,7 @@ import {
 import { listAttachableServers, listKeyableAgents } from "../services/deviceLoginGrantChoices";
 import { looksLikeComputerRevokeToken, revokeComputerByLink } from "../services/computerKeyRevocation";
 import { noticeOwnersOfDetachedComputer } from "../services/computerDetachedNotices";
+import { linkComputerPairing, type ComputerPairingLinkOutcome } from "../services/computerPairingService";
 import type { Server as SocketServer } from "socket.io";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
 import { addTraceEvent } from "../tracing/semanticTrace";
@@ -73,6 +90,7 @@ import { trustedViewerIp } from "../lib/clientIpForRateLimit";
 import { visitorOrigin } from "../lib/visitorOrigin";
 import { recordAuthSessionIssuedTrace } from "./authRefreshTrace";
 import { sendJsonServerError } from "./errorResponse";
+import { refuse } from "../lib/refusal";
 import { refuseUnverifiedApprover } from "./secondFactor";
 
 export const deviceAuthRouter: RouterType = Router();
@@ -93,7 +111,21 @@ function buildVerificationUri(): { verificationUri: string } | null {
   return { verificationUri: `${base}${DEVICE_LOGIN_PATH}` };
 }
 
-function surfaceDisabled(res: import("express").Response): boolean {
+/**
+ * Tells the pairing's owner (their own realtime connections only) that its
+ * window has a request to show, or that the pairing was voided by a second
+ * one. Carries the pairing's row id, never the raw id.
+ */
+function emitComputerPairingOutcome(io: SocketServer | undefined, outcome: ComputerPairingLinkOutcome): void {
+  if (!io || outcome.outcome === "ignored") return;
+  if (outcome.outcome === "linked") {
+    io.to(`user:${outcome.userId}`).emit("computer_pairing:requested", { pairingRef: outcome.pairingRef });
+  } else {
+    io.to(`user:${outcome.userId}`).emit("computer_pairing:voided", { pairingRef: outcome.pairingRef, reason: "conflict" });
+  }
+}
+
+export function surfaceDisabled(res: import("express").Response): boolean {
   if (isDeviceAuthSurfaceEnabled()) return false;
   // Defense-in-depth: even though app.ts mounts this behind the same gate,
   // re-check so a misconfigured mount cannot expose the surface.
@@ -108,7 +140,7 @@ function surfaceDisabled(res: import("express").Response): boolean {
 deviceAuthRouter.post("/authorize", async (req, res) => {
   if (surfaceDisabled(res)) return;
   try {
-    const body = (req.body ?? {}) as { clientName?: unknown; grant?: unknown };
+    const body = (req.body ?? {}) as { clientName?: unknown; grant?: unknown; loopback?: unknown; pairingId?: unknown; serverSlug?: unknown; loginFallbackReason?: unknown };
     let grantRequest: DeviceLoginGrantRequest | null = null;
     if (body.grant !== undefined && body.grant !== null) {
       const parsed = parseDeviceLoginGrantRequest(body.grant);
@@ -126,6 +158,20 @@ deviceAuthRouter.post("/authorize", async (req, res) => {
       }
       clientName = body.clientName;
     }
+    let loopback: DeviceLoopbackRequest | null = null;
+    if (body.loopback !== undefined && body.loopback !== null) {
+      const parsed = parseDeviceLoopbackRequest(body.loopback);
+      if (!parsed.ok) {
+        refuse(res, 400, { code: parsed.code, error: parsed.error });
+        return;
+      }
+      // Loopback completes a one-time grant (what raft-computer asks for), never a device session.
+      if (!grantRequest) {
+        refuse(res, 400, { code: "loopback_grant_required", error: "A loopback login completes a one-time grant only. Send a grant with it, or start a device-code login." });
+        return;
+      }
+      loopback = parsed.loopback;
+    }
     const verification = buildVerificationUri();
     if (!verification) {
       res.status(503).json({
@@ -135,13 +181,45 @@ deviceAuthRouter.post("/authorize", async (req, res) => {
       return;
     }
     const origin = visitorOrigin(req);
+    if (loopback) {
+      const created = await createLoopbackDeviceAuthorization({
+        clientName,
+        requester: origin,
+        requesterUserAgent: req.get("user-agent") ?? null,
+        ...(grantRequest ? { grant: grantRequest } : {}),
+        loopback,
+      });
+      res.status(201).json({
+        requestId: created.requestId,
+        // The approval page for this request; the client opens it in the browser on its own machine.
+        approvalUrl: `${verification.verificationUri}?request=${encodeURIComponent(created.requestId)}`,
+        expiresIn: created.expiresInSeconds,
+      });
+      return;
+    }
     const grant = await createDeviceAuthorization({
       clientName,
       requester: origin,
       requesterUserAgent: req.get("user-agent") ?? null,
+      // Audit only: a malformed value is stored as null, never refused.
+      loginFallbackReason: parseLoginFallbackReason(body.loginFallbackReason),
       ...(grantRequest ? { grant: grantRequest } : {}),
     });
+    // A Computer started from an Add Computer window's command
+    // (computerPairingService.ts): link this request to that window. Never
+    // fails the request; older Computers never send it.
+    const pairing = body.pairingId === undefined || body.pairingId === null
+      ? null
+      : await linkComputerPairing({
+          rawPairingId: body.pairingId,
+          serverSlug: body.serverSlug,
+          authorizationId: grant.authorizationId,
+          grantKind: grant.grant?.kind ?? null,
+          grantId: grant.grant?.id ?? null,
+        });
+    if (pairing) emitComputerPairingOutcome(req.app.get("io") as SocketServer | undefined, pairing);
     res.status(201).json({
+      ...(pairing ? { paired: pairing.outcome === "linked" } : {}),
       deviceCode: grant.deviceCode,
       userCode: grant.userCode,
       // Human approval happens on the web origin, not the API/server origin.
@@ -158,25 +236,47 @@ deviceAuthRouter.post("/authorize", async (req, res) => {
   }
 });
 
-function userCodeFailureStatus(error: "user_code_invalid" | "already_resolved" | "expired"): number {
+function userCodeFailureStatus(error: "user_code_invalid" | "request_invalid" | "already_resolved" | "expired"): number {
   return error === "expired" ? 410 : error === "already_resolved" ? 409 : 404;
+}
+
+/**
+ * describe and approve name the request by exactly one of `userCode` (the code
+ * the person typed) or `requestId` (the loopback approval link's id). Without
+ * `requestId` the answers are the device code's, as before.
+ */
+function requestLocator(res: Response, body: { userCode?: unknown; requestId?: unknown }): DeviceAuthorizationLocator | null {
+  if (body.requestId !== undefined) {
+    if (body.userCode !== undefined) {
+      refuse(res, 400, { code: "user_code_or_request_id", error: "Name the login by userCode or by requestId, not both." });
+      return null;
+    }
+    if (typeof body.requestId !== "string" || body.requestId.length === 0) {
+      refuse(res, 400, { code: "request_id_required", error: "The requestId is missing. Open the approval link again." });
+      return null;
+    }
+    return { requestId: body.requestId };
+  }
+  if (typeof body.userCode !== "string" || body.userCode.trim().length === 0) {
+    res.status(400).json({ error: "userCode is required", code: "user_code_required" });
+    return null;
+  }
+  return { userCode: body.userCode };
 }
 
 // --- describe: USER-authenticated, read only ---
 deviceAuthRouter.post("/describe", requireAuth, async (req, res) => {
   if (surfaceDisabled(res)) return;
   try {
-    const body = (req.body ?? {}) as { userCode?: unknown };
-    if (typeof body.userCode !== "string" || body.userCode.trim().length === 0) {
-      res.status(400).json({ error: "userCode is required", code: "user_code_required" });
-      return;
-    }
+    const body = (req.body ?? {}) as { userCode?: unknown; requestId?: unknown };
+    const locator = requestLocator(res, body);
+    if (!locator) return;
     const userId = req.userId;
     if (!userId) {
       res.status(401).json({ error: "Authentication required", code: "auth_required" });
       return;
     }
-    const result = await describeDeviceAuthorization({ userCode: body.userCode, userId });
+    const result = await describeDeviceAuthorization({ ...locator, userId });
     if (!result.ok) {
       res.status(userCodeFailureStatus(result.error)).json({ error: "Device authorization can't be approved", code: result.error });
       return;
@@ -197,7 +297,8 @@ deviceAuthRouter.post("/describe", requireAuth, async (req, res) => {
         }
       : null;
     res.status(200).json({
-      userCode: result.userCode,
+      // Loopback: the approval link's id and mode, in place of a typed code.
+      ...(result.mode === "loopback" ? { mode: result.mode, requestId: result.requestId } : { userCode: result.userCode }),
       clientName: result.clientName,
       requestedAt: result.requestedAt.toISOString(),
       requester: result.requester,
@@ -217,11 +318,9 @@ deviceAuthRouter.post("/describe", requireAuth, async (req, res) => {
 deviceAuthRouter.post("/approve", requireAuth, async (req, res) => {
   if (surfaceDisabled(res)) return;
   try {
-    const body = (req.body ?? {}) as { userCode?: unknown; approve?: unknown; approvalTicket?: unknown; serverId?: unknown; agentId?: unknown };
-    if (typeof body.userCode !== "string" || body.userCode.trim().length === 0) {
-      res.status(400).json({ error: "userCode is required", code: "user_code_required" });
-      return;
-    }
+    const body = (req.body ?? {}) as { userCode?: unknown; requestId?: unknown; approve?: unknown; approvalTicket?: unknown; serverId?: unknown; agentId?: unknown };
+    const locator = requestLocator(res, body);
+    if (!locator) return;
     const approve = body.approve === undefined ? true : body.approve === true;
     const userId = req.userId;
     if (!userId) {
@@ -234,55 +333,14 @@ deviceAuthRouter.post("/approve", requireAuth, async (req, res) => {
     const approverSessionFamilyId = req.sessionScope === "full" ? req.sessionFamilyId ?? null : null;
     if (approve && await refuseUnverifiedApprover(res, userId, approverSessionFamilyId)) return;
     const result = await approveDeviceAuthorization({
-      userCode: body.userCode,
+      ...locator,
       userId,
       approve,
       approvalTicket: body.approvalTicket,
       selection: { serverId: body.serverId, agentId: body.agentId },
       approverSessionFamilyId,
     });
-    if (!result.ok) {
-      const { error } = result;
-      if (error === "approval_ticket_required") {
-        // Older approval pages show `error` as is.
-        res.status(400).json({ error: "Reload this page and type the code again.", code: error });
-        return;
-      }
-      if (error === "grant_selection_required") {
-        // An approval page from before one-time grants never sends a pick.
-        res.status(400).json({ error: "Choose where this is for: reload this page and type the code again.", code: error });
-        return;
-      }
-      if (error === "grant_selection_not_allowed") {
-        res.status(403).json({ error: "You can't approve this for that choice.", code: error });
-        return;
-      }
-      if (error === "approver_session_revoked") {
-        respondInvalidOrExpiredToken(res);
-        return;
-      }
-      if (error === "grant_kind_unsupported") {
-        res.status(400).json({ error: "This kind of device login isn't supported.", code: error });
-        return;
-      }
-      res.status(userCodeFailureStatus(error)).json({ error: "Device authorization could not be updated", code: error });
-      return;
-    }
-    if (result.oneTime) {
-      addTraceEvent(approve ? "auth.device.grant.approved" : "auth.device.grant.denied", {
-        grant_id: result.oneTime.id,
-        kind: result.oneTime.kind,
-        user_id: userId,
-        ...(result.oneTime.serverId ? { server_id: result.oneTime.serverId } : {}),
-        ...(result.oneTime.agentId ? { agent_id: result.oneTime.agentId } : {}),
-      });
-    } else if (approve) {
-      // A one-time grant mails when it is used (what it added), not here: the
-      // device-session notice says the program can act for the person, which
-      // a one-time grant never can.
-      await sendDeviceLoginNotice({ userId, grant: result.grant, event: "approved" });
-    }
-    res.status(200).json({ ok: true, action: approve ? "approved" : "denied" });
+    await answerApproval(res, { userId, approve, result });
   } catch (err) {
     sendJsonServerError(req, res, {
       error: "Failed to update device authorization",
@@ -292,20 +350,88 @@ deviceAuthRouter.post("/approve", requireAuth, async (req, res) => {
   }
 });
 
+/**
+ * What approve answers, and what it records, for an approval's result: the
+ * device route's, and the same for one approved through a computer pairing
+ * (computerPairings.ts, whose traces also name the pairing).
+ */
+export async function answerApproval(
+  res: Response,
+  input: { userId: string; approve: boolean; result: ApproveDeviceAuthorizationResult; traceAttrs?: Record<string, string> },
+): Promise<void> {
+  const { userId, approve, result } = input;
+  if (!result.ok) {
+    const { error } = result;
+    if (error === "approval_ticket_required") {
+      // Older approval pages show `error` as is.
+      res.status(400).json({ error: "Reload this page and type the code again.", code: error });
+      return;
+    }
+    if (error === "grant_selection_required") {
+      // An approval page from before one-time grants never sends a pick.
+      res.status(400).json({ error: "Choose where this is for: reload this page and type the code again.", code: error });
+      return;
+    }
+    if (error === "grant_selection_not_allowed") {
+      res.status(403).json({ error: "You can't approve this for that choice.", code: error });
+      return;
+    }
+    if (error === "approver_session_revoked") {
+      respondInvalidOrExpiredToken(res);
+      return;
+    }
+    if (error === "grant_kind_unsupported") {
+      res.status(400).json({ error: "This kind of device login isn't supported.", code: error });
+      return;
+    }
+    if (error === "pairing_unavailable") {
+      refuse(res, 409, { code: "computer_pairing_unavailable", error: "This request can no longer be approved from this window. Make a new setup command, or enter the code the terminal shows." });
+      return;
+    }
+    res.status(userCodeFailureStatus(error)).json({ error: "Device authorization could not be updated", code: error });
+    return;
+  }
+  if (result.oneTime) {
+    addTraceEvent(approve ? "auth.device.grant.approved" : "auth.device.grant.denied", {
+      grant_id: result.oneTime.id,
+      kind: result.oneTime.kind,
+      mode: result.mode,
+      user_id: userId,
+      ...input.traceAttrs,
+      ...(result.oneTime.serverId ? { server_id: result.oneTime.serverId } : {}),
+      ...(result.oneTime.agentId ? { agent_id: result.oneTime.agentId } : {}),
+    });
+  } else if (approve) {
+    // A one-time grant mails when it is used (what it added), not here: the
+    // device-session notice says the program can act for the person, which
+    // a one-time grant never can.
+    await sendDeviceLoginNotice({ userId, grant: result.grant, event: "approved" });
+  }
+  res.status(200).json({
+    ok: true,
+    action: approve ? "approved" : "denied",
+    // Loopback: the page sends the browser here, back to the client's listener.
+    ...(result.redirectUrl ? { redirectUrl: result.redirectUrl } : {}),
+  });
+}
+
 // --- token: unauthenticated public poll → issues user session on success ---
 deviceAuthRouter.post("/token", async (req, res) => {
   if (surfaceDisabled(res)) return;
   try {
-    const body = (req.body ?? {}) as { deviceCode?: unknown };
-    if (typeof body.deviceCode !== "string" || body.deviceCode.length === 0) {
+    const body = (req.body ?? {}) as { deviceCode?: unknown; requestId?: unknown; code?: unknown; codeVerifier?: unknown };
+    // The visitor's address or nothing, never the edge's (lib/visitorOrigin.ts).
+    const observe = { ip: trustedViewerIp(req), userAgent: req.get("user-agent") ?? null };
+    let result: Awaited<ReturnType<typeof consumeDeviceAuthorization>>;
+    if (typeof body.deviceCode === "string" && body.deviceCode.length > 0) {
+      result = await consumeDeviceAuthorization(body.deviceCode, observe);
+    } else if (body.requestId !== undefined) {
+      // Loopback: the code the redirect carried, with the PKCE verifier.
+      result = await consumeLoopbackDeviceAuthorization({ requestId: body.requestId, code: body.code, codeVerifier: body.codeVerifier }, observe);
+    } else {
       res.status(400).json({ error: "deviceCode is required", code: "device_code_required" });
       return;
     }
-    const result = await consumeDeviceAuthorization(body.deviceCode, {
-      // The visitor's address or nothing, never the edge's (lib/visitorOrigin.ts).
-      ip: trustedViewerIp(req),
-      userAgent: req.get("user-agent") ?? null,
-    });
     if (!result.ok) {
       // RFC-8628-ish: pending/slow_down are 400; terminal failures map to
       // their own status. All are stable codes, zero enumeration.
@@ -313,7 +439,7 @@ deviceAuthRouter.post("/token", async (req, res) => {
         : result.error === "expired_token" ? 410
         : result.error === "access_denied" ? 403
         : result.error === "device_code_consumed" ? 410
-        : 400; // device_code_invalid
+        : 400; // device_code_invalid, code_invalid, pkce_mismatch
       res.status(status).json({ error: "Device authorization not ready", code: result.error });
       return;
     }

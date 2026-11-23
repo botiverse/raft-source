@@ -83,10 +83,6 @@ function summarizeError(err: unknown): string {
   return err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500);
 }
 
-function displayNameForUser(user: Pick<OnboardingUser, "name" | "displayName">) {
-  return user.displayName?.trim() || user.name;
-}
-
 function isAllowlisted(email: string, allowlist: string[]): boolean {
   return allowlist.includes(normalizeEmail(email));
 }
@@ -212,7 +208,9 @@ export async function enqueueOnboardingEmailJourneyForUser(user: OnboardingUser)
   });
   if (!inserted) return { status: "already_started" };
 
-  const recipientName = displayNameForUser(user);
+  // A username may be an internal signup reservation, not a salutation.
+  // The renderer uses a neutral greeting when no usable display name exists.
+  const recipientName = user.displayName;
   let day0Status: "sent" | "failed" = "sent";
   let day0EmailId: string | null = null;
   let day0SentAt: Date | null = qualifiedAt;

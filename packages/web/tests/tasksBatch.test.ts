@@ -28,14 +28,26 @@ function task(overrides: Partial<Task> & Pick<Task, "id">): Task {
   };
 }
 
-const member: BatchViewer = { userId: ME, canAssign: true, canDeleteAny: false };
-const admin: BatchViewer = { userId: ME, canAssign: true, canDeleteAny: true };
+const member: BatchViewer = { userId: ME, canAssign: true, canDeleteAny: false, canWriteChannel: () => true };
+const admin: BatchViewer = { userId: ME, canAssign: true, canDeleteAny: true, canWriteChannel: () => true };
 
 const created = task({ id: "created", createdById: ME });
 const assigned = task({ id: "assigned", claimedByType: "user", claimedById: ME });
 const others = task({ id: "others" });
 const readOnly = task({ id: "read-only", createdById: ME, readOnlyReason: "historical_joint_task" });
 const legacy = task({ id: "legacy", createdById: ME, isLegacy: true });
+
+test("a task in a channel the viewer only reads (a public channel not joined): no status, assignee or delete, whatever their role; follow stays", () => {
+  // The server gates every task write on channel write access before the per-action rule (403).
+  const reader: BatchViewer = { ...admin, canWriteChannel: (channelId) => channelId !== "ch-read-only" };
+  const elsewhere = task({ id: "elsewhere", channelId: "ch-read-only", createdById: ME, claimedByType: "user", claimedById: ME });
+  assert.equal(canApplyBatchAction({ kind: "status", status: "done" }, elsewhere, reader), false);
+  assert.equal(canApplyBatchAction({ kind: "assignee", assignee: null }, elsewhere, reader), false);
+  assert.equal(canApplyBatchAction({ kind: "delete" }, elsewhere, reader), false);
+  assert.equal(canApplyBatchAction({ kind: "follow" }, elsewhere, reader), true);
+  // The same viewer's own channel is unaffected.
+  assert.equal(canApplyBatchAction({ kind: "status", status: "done" }, task({ id: "here", createdById: ME }), reader), true);
+});
 
 test("per action, the single task's rule: status any member, assign the capability, delete the creator or deleteAnyTask, follow anyone", () => {
   const status: BatchAction = { kind: "status", status: "done" };

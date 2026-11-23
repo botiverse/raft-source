@@ -1,5 +1,6 @@
 import {
   Button,
+  Checkbox,
   Field,
   FieldDescription,
   FieldLabel,
@@ -18,6 +19,7 @@ import type { ChoiceListItem } from "@botiverse/raft-ui/wip";
 import { useCallback, useId, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
+import { externalInviteSendFailureCode } from "../../analytics/externalInvites";
 import type { ExternalInviteTracker } from "../../analytics/externalInvites";
 import type { MessageId } from "../../i18n/messages";
 import { openUpgradeDialog } from "../../store/upgradeDialogStore";
@@ -146,14 +148,15 @@ export function ExternalInviteEmailsField({
   const { formatMessage } = useIntl();
   const textareaId = useId();
   const handleChange = useCallback((event: ChangeEvent<HTMLTextAreaElement>) => onChange(event.target.value), [onChange]);
-  const emailsHint = formatMessage({ id: "channel.externalInvite.dialog.emailsHint" }, { max: EXTERNAL_INVITE_MAX_EMAILS });
   return (
     <FormField
       label={formatMessage({ id: "channel.externalInvite.dialog.emailsLabel" })}
       htmlFor={textareaId}
-      hint={slotsHint || historyHint ? (
+      hint={(
         <>
-          {emailsHint}
+          <span className="block" data-testid="external-invite-emails-join-by-link">
+            {formatMessage({ id: "channel.externalInvite.dialog.emailsJoinByLink" })}
+          </span>
           {historyHint ? (
             <span className="block" data-testid="external-invite-emails-history">
               {formatMessage({ id: "channel.externalInvite.dialog.emailsSeeHistory" })}
@@ -161,7 +164,7 @@ export function ExternalInviteEmailsField({
           ) : null}
           {slotsHint ? <span className="block" data-testid="external-invite-slots-left">{slotsHint}</span> : null}
         </>
-      ) : emailsHint}
+      )}
       error={overBy > 0
         ? formatMessage({ id: "channel.externalInvite.dialog.tooMany" }, { max: EXTERNAL_INVITE_MAX_EMAILS, count: overBy })
         : undefined}
@@ -274,8 +277,13 @@ function toastServerOutcomes(
   }
 }
 
-/** `hint`: why the row can't be invited, as its status's tooltip. */
-type ReviewRow = { key: string; email: string; status: MessageId; values?: Record<string, string>; hint?: MessageId; invites: boolean };
+/**
+ * `hint`: why the row can't be invited, as its status's tooltip.
+ * `connectInvite`: a member of the Server, added directly or already in the
+ * channel, who may also be sent an invite to connect a server of theirs
+ * ("Invite to connect their server").
+ */
+type ReviewRow = { key: string; email: string; status: MessageId; values?: Record<string, string>; hint?: MessageId; invites: boolean; connectInvite?: boolean };
 
 /**
  * One row per address in the order people read the result: who gets an
@@ -289,7 +297,7 @@ function reviewRows(preview: ExternalInvitePreview): ReviewRow[] {
     rows.push({ key: `valid:${email}`, email, status: "channel.externalInvite.dialog.status.willInvite", invites: true });
   }
   for (const email of preview.alreadyMembers) {
-    rows.push({ key: `member:${email}`, email, status: "channel.externalInvite.dialog.status.willAdd", invites: true });
+    rows.push({ key: `member:${email}`, email, status: "channel.externalInvite.dialog.status.willAdd", invites: true, connectInvite: true });
   }
   for (const email of preview.duplicates) {
     // Three copies of one address read as one note, not two.
@@ -300,8 +308,13 @@ function reviewRows(preview: ExternalInvitePreview): ReviewRow[] {
   for (const email of preview.alreadyPending) {
     rows.push({ key: `pending:${email}`, email, status: "channel.externalInvite.dialog.status.alreadyInvited", invites: false });
   }
+  // A member of the Server already here may still be invited to connect: the
+  // checkbox, not the status, says whether they are; the channel's own Guest is not.
+  const inChannelMembers = new Set(preview.alreadyInChannelMembers ?? []);
   for (const email of preview.alreadyInChannel ?? []) {
-    rows.push({ key: `in-channel:${email}`, email, status: "channel.externalInvite.dialog.status.alreadyInChannel", invites: false });
+    rows.push(inChannelMembers.has(email)
+      ? { key: `in-channel:${email}`, email, status: "channel.externalInvite.dialog.status.memberInChannel", invites: false, connectInvite: true }
+      : { key: `in-channel:${email}`, email, status: "channel.externalInvite.dialog.status.alreadyInChannel", invites: false });
   }
   // A Guest belongs to one channel: blocked, naming it only when the server did (the inviter can see it).
   for (const { email, channelName } of preview.guestsElsewhere ?? []) {
@@ -313,6 +326,28 @@ function reviewRows(preview: ExternalInvitePreview): ReviewRow[] {
     rows.push({ key: `invalid:${index}:${entry}`, email: entry, status: "channel.externalInvite.dialog.status.invalid", invites: false });
   });
   return rows;
+}
+
+/**
+ * "Invite to connect their server" on a member's review row (checked by
+ * default): the member is added to the channel either way (or already in
+ * it); checked, they are also sent an ordinary invite, so they can connect a
+ * server of theirs from it.
+ */
+function ConnectInviteCheckbox({ email, checked, disabled, onChange }: {
+  email: string;
+  checked: boolean;
+  disabled: boolean;
+  onChange: (email: string, checked: boolean) => void;
+}) {
+  const { formatMessage } = useIntl();
+  const handleChange = useCallback((next: boolean) => onChange(email, next), [email, onChange]);
+  return (
+    <label className="flex min-h-8 select-none items-center gap-2 has-[[data-disabled]]:text-foreground-disabled">
+      <Checkbox checked={checked} disabled={disabled} onCheckedChange={handleChange} data-testid="external-invite-connect-member" />
+      <span className="text-callout font-semibold">{formatMessage({ id: "channel.externalInvite.dialog.inviteToConnect" })}</span>
+    </label>
+  );
 }
 
 /**
@@ -362,8 +397,12 @@ export function ExternalInviteSteps({
   initialPreview?: ExternalInvitePreview | null;
   initialError?: ExternalInviteFailure | null;
   notice?: ReactNode;
-  /** What the review's button does with the addresses; default: send them to `channelId`. */
-  commit?: (addresses: string[], serverIds: string[]) => Promise<SendExternalInvitesResult>;
+  /**
+   * What the review's button does with the addresses; default: send them to
+   * `channelId`. `connectMemberEmails`: the Server's members among them who
+   * are also sent an invite to connect ("Invite to connect").
+   */
+  commit?: (addresses: string[], serverIds: string[], connectMemberEmails: string[]) => Promise<SendExternalInvitesResult>;
   commitLabel?: MessageId;
   onBackFromReview?: () => void;
   /** "Your servers" offered beside the emails (useOwnConnectableServers); none: the section isn't drawn. */
@@ -380,6 +419,16 @@ export function ExternalInviteSteps({
   const { formatMessage } = useIntl();
   const [text, setText] = useState(initialText);
   const [preview, setPreview] = useState<ExternalInvitePreview | null>(initialPreview);
+  // Members whose "Invite to connect" is unchecked (every one is checked when the review opens).
+  const [noConnectInvite, setNoConnectInvite] = useState<ReadonlySet<string>>(() => new Set());
+  const handleConnectInviteChange = useCallback((email: string, checked: boolean) => {
+    setNoConnectInvite((current) => {
+      const next = new Set(current);
+      if (checked) next.delete(email);
+      else next.add(email);
+      return next;
+    });
+  }, []);
   const [serverIds, setServerIds] = useState<string[]>(initialServerIds);
   // The checked servers still offered, in the list's order: what the confirm connects.
   const chosenServers = useMemo(() => servers.filter((server) => serverIds.includes(server.id)), [servers, serverIds]);
@@ -389,8 +438,14 @@ export function ExternalInviteSteps({
   const { entries, overBy } = useExternalInviteEntries(text);
   const rows = useMemo(() => (preview ? reviewRows(preview) : []), [preview]);
   const inviteCount = preview?.valid.length ?? 0;
-  // Invited, added to the channel as members of the Server, or servers connected: what the button does.
-  const actionCount = inviteCount + (preview?.alreadyMembers.length ?? 0) + chosenServers.length;
+  // The Server's members already in the channel whose "Invite to connect" is checked: only an invite to send.
+  const inChannelInvites = useMemo(
+    () => (preview?.alreadyInChannelMembers ?? []).filter((email) => !noConnectInvite.has(email)),
+    [preview, noConnectInvite],
+  );
+  // Invited, added to the channel as members of the Server, members here
+  // invited to connect, or servers connected: what the button does.
+  const actionCount = inviteCount + (preview?.alreadyMembers.length ?? 0) + inChannelInvites.length + chosenServers.length;
   const reviewsEmails = rows.length > 0;
   // The channel's 30 slots, open invites counted (an older server sends no
   // slotsLeft); each invite and each server checked takes one, members added
@@ -423,6 +478,7 @@ export function ExternalInviteSteps({
     if (busy || (entries.length === 0 && chosenServers.length === 0) || overBy > 0) return;
     const review = (checked: ExternalInvitePreview) => {
       setPreview(checked);
+      setNoConnectInvite(new Set());
       tracker.reviewed({
         emails: checked.valid.length + checked.alreadyMembers.length,
         servers: chosenServers.length,
@@ -459,12 +515,14 @@ export function ExternalInviteSteps({
     let answered = false;
     try {
       // The previewed addresses, so what is sent is what was reviewed: the
-      // invites, and the Server's members the server adds to the channel.
-      const addresses = [...preview.valid, ...preview.alreadyMembers];
+      // invites, the Server's members the server adds to the channel, and
+      // those already in it who are invited to connect (not added again).
+      const addresses = [...preview.valid, ...preview.alreadyMembers, ...inChannelInvites];
+      const connectMemberEmails = [...preview.alreadyMembers.filter((email) => !noConnectInvite.has(email)), ...inChannelInvites];
       const chosenIds = chosenServers.map((server) => server.id);
       const result = commit
-        ? await commit(addresses, chosenIds)
-        : await sendInvitesAndConnectServers(channelId as string, addresses, chosenIds, willBecomePrivate);
+        ? await commit(addresses, chosenIds, connectMemberEmails)
+        : await sendInvitesAndConnectServers(channelId as string, addresses, chosenIds, willBecomePrivate, connectMemberEmails);
       answered = true;
       tracker.sendSucceeded(result);
       if (result.sent.length > 0) {
@@ -483,11 +541,11 @@ export function ExternalInviteSteps({
     } catch (err) {
       sendInFlightRef.current = false;
       const failure = externalInviteFailure(err);
-      if (!answered) tracker.sendFailed(externalInviteErrorCode(err), failure.upgrade);
+      if (!answered) tracker.sendFailed(externalInviteSendFailureCode(err, externalInviteErrorCode(err)), failure.upgrade);
       setError(failure);
       setBusy(false);
     }
-  }, [actionCount, busy, channelId, channelName, chosenServers, commit, formatMessage, onSent, overSlots, preview, servers, serverName, tracker, willBecomePrivate]);
+  }, [actionCount, busy, channelId, channelName, chosenServers, commit, formatMessage, inChannelInvites, noConnectInvite, onSent, overSlots, preview, servers, serverName, tracker, willBecomePrivate]);
 
   const handleBack = useCallback(() => {
     if (onBackFromReview) {
@@ -568,6 +626,9 @@ export function ExternalInviteSteps({
                     </Tooltip>
                   ) : formatMessage({ id: row.status }, { server: serverName, ...row.values })}
                 </ListRowDescription>
+                {row.connectInvite ? (
+                  <ConnectInviteCheckbox email={row.email} checked={!noConnectInvite.has(row.email)} disabled={busy} onChange={handleConnectInviteChange} />
+                ) : null}
               </ListRowBody>
             </ListRow>
           ))}

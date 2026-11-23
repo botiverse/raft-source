@@ -219,8 +219,8 @@ export function normalizeBuiltAssetResponse(request, response) {
  * every address the app can open (all Raft links, #proj-mobile:#128): `/download`,
  * channel/DM permalinks (they also carry reply/message anchors in their query),
  * an open Artifact's `/s/<slug>/artifacts?artifact=<id>`, an Artifact's share
- * link `/artifacts/<id>[/v/<n>]` and the external invite link. Android claims
- * the same through its manifest (`/s/`, `/artifacts/`, `/external-invite/`). Until 1.24, App Store builds shipped without the
+ * link `/artifacts/<id>[/v/<n>]`, the external invite link and a server join
+ * link `/join/<token>`. Android claims the same through its manifest (`/s/`, `/artifacts/`, `/external-invite/`, `/join/`). Until 1.24, App Store builds shipped without the
  * associated-domains entitlement, so widening this list reaches no older app. The native parser validates identities
  * and anchors after delivery; this association is not an authorization check.
  */
@@ -229,7 +229,8 @@ const WELL_KNOWN_AASA_PATH = "/.well-known/apple-app-site-association";
 
 const ANDROID_ASSETLINKS = [
   {
-    relation: ["delegate_permission/common.handle_all_urls"],
+    // get_login_creds lets the app use passkeys bound to app.raft.build natively (#proj-mobile:#188).
+    relation: ["delegate_permission/common.handle_all_urls", "delegate_permission/common.get_login_creds"],
     target: {
       namespace: "android_app",
       package_name: "build.raft.app",
@@ -238,6 +239,18 @@ const ANDROID_ASSETLINKS = [
         "5F:08:BB:E8:2A:27:CC:DA:D2:6C:13:52:3A:60:B5:67:0D:3A:A7:63:3E:8E:D2:FD:71:FA:6B:57:51:F9:B0:B1",
         // Play App Signing: what Google signs the Play Store build with (Play Console › App integrity).
         "D7:70:71:84:A6:BE:7F:0C:EC:D6:2E:3F:F9:E0:89:D4:58:A8:4F:AF:A3:BD:8E:2F:AE:4B:3B:60:D8:C5:6A:D6",
+      ],
+    },
+  },
+  {
+    // The alpha build shares passkeys only; links keep opening in the release app.
+    relation: ["delegate_permission/common.get_login_creds"],
+    target: {
+      namespace: "android_app",
+      package_name: "build.raft.app.alpha",
+      sha256_cert_fingerprints: [
+        "B4:91:93:81:D8:F9:CE:DE:4F:8E:B8:F6:D1:32:F6:DF:E0:D6:D1:5B:F6:D1:F6:30:57:D5:EB:A0:45:16:1A:45",
+        "5F:08:BB:E8:2A:27:CC:DA:D2:6C:13:52:3A:60:B5:67:0D:3A:A7:63:3E:8E:D2:FD:71:FA:6B:57:51:F9:B0:B1",
       ],
     },
   },
@@ -256,19 +269,25 @@ const APPLE_APP_SITE_ASSOCIATION = {
           {
             "/": "/",
             // Only links from a sign-up started in a native sign-in: returnTo is its pending
-            // request, `/login/app?request=<id>` (appLoginService). Apple matches the decoded query
-            // value; the `?` in the pattern is its one-character wildcard, standing for the literal
-            // `?`. Web sign-ups keep opening in the browser. iOS reopens the link only when the id
-            // is the request it is waiting for (a Raft Desktop sign-up has the same shape).
+            // request, `/login/app?request=<id>` (appLoginService). The email sends it
+            // percent-encoded (`returnTo=%2Flogin%2Fapp%3Frequest%3D<id>`, URLSearchParams), and
+            // Apple compares patterns with the URL as sent unless `percentEncoded` is false
+            // (default true; applinks components docs). Measured with `swcutil verify`
+            // (botiverse/mobile app-link-diagnose, 2026-11-18): without it the encoded link stayed
+            // on web and only an unencoded one matched. With it, Apple decodes before matching; the
+            // `?` in the pattern is its one-character wildcard, standing for the literal `?`. Web
+            // sign-ups keep opening in the browser. iOS reopens the link only when the id is the
+            // request it is waiting for (a Raft Desktop sign-up has the same shape).
             "?": { verify: "?*", returnTo: "/login/app?request=*" },
+            percentEncoded: false,
             comment: "app sign-up email verification link only; iOS resumes the pending app sign-in",
           },
           { "/": "/s/*/channel/", exclude: true, comment: "no channel id" },
           { "/": "/s/*/*/channel/*", exclude: true, comment: "nested route, not a channel permalink" },
-          { "/": "/s/*/channel/*/*", exclude: true, comment: "extra segment after the channel id" },
+          { "/": "/s/*/channel/*/?*", exclude: true, comment: "extra segment after the channel id (iOS matches the path with a trailing slash added)" },
           { "/": "/s/*/dm/", exclude: true, comment: "no dm id" },
           { "/": "/s/*/*/dm/*", exclude: true, comment: "nested route, not a dm permalink" },
-          { "/": "/s/*/dm/*/*", exclude: true, comment: "extra segment after the dm id" },
+          { "/": "/s/*/dm/*/?*", exclude: true, comment: "extra segment after the dm id (iOS matches the path with a trailing slash added)" },
           {
             "/": "/s/*/channel/*",
             comment: "channel and reply permalinks; native validates identity and query anchors",
@@ -285,18 +304,23 @@ const APPLE_APP_SITE_ASSOCIATION = {
           { "/": "/artifacts/", exclude: true, comment: "no artifact id" },
           { "/": "/artifacts/*/*/v/*", exclude: true, comment: "extra segment before the version" },
           { "/": "/artifacts/*/v/", exclude: true, comment: "no version number" },
-          { "/": "/artifacts/*/v/*/*", exclude: true, comment: "extra segment after the version" },
+          { "/": "/artifacts/*/v/*/?*", exclude: true, comment: "extra segment after the version (iOS matches the path with a trailing slash added)" },
           { "/": "/artifacts/*/v/*", comment: "an Artifact's share link at a version; the app opens it in its viewer" },
-          { "/": "/artifacts/*/*", exclude: true, comment: "any other extra segment after the artifact id" },
+          { "/": "/artifacts/*/?*", exclude: true, comment: "any other extra segment after the artifact id (iOS matches the path with a trailing slash added)" },
           { "/": "/artifacts/*", comment: "an Artifact's share link (raft artifact push, Copy link); the app opens it in its viewer" },
           {
-            "/": "/external-invite/*",
+            "/": "/external-invite/?*",
             comment: "external channel invite (app 1.24+); the app's invite page reads the rest from the server",
           },
+          { "/": "/join/", exclude: true, comment: "no join token" },
+          { "/": "/join/*/?*", exclude: true, comment: "extra segment after the join token (iOS matches the path with a trailing slash added)" },
+          { "/": "/join/*", comment: "server join link (app 1.25+); the app's join page reads the invite from the server" },
         ],
       },
     ],
   },
+  // Lets the iOS app use passkeys bound to app.raft.build natively (#proj-mobile:#188).
+  webcredentials: { apps: ["XDAPXFY8FZ.build.raft.app"] },
 };
 
 function associationResponse(body) {
@@ -413,8 +437,13 @@ const ARTIFACT_MARKDOWN_TIMEOUT_MS = 5_000;
 // How much of index.md the page's article holds (UTF-8 bytes, cut at a character): the rest is in the Markdown version.
 const ARTIFACT_ARTICLE_TEXT_MAX_BYTES = 50 * 1024;
 const ARTIFACT_META_STRINGS = ["title", "description", "updatedAt", "kind", "entry"];
-// The square app icon: the one brand image here a preview card can show (SVGs aren't; the wordmark PNG is 324×80).
-const ARTIFACT_PREVIEW_IMAGE_PATH = "/android-chrome-512x512.png";
+// The 1200x630 static brand preview card (generic fallback, public servers, invites).
+const ARTIFACT_PREVIEW_IMAGE_PATH = "/brand/og-raft.png";
+const PUBLIC_SERVER_PAGE_PATH = /^\/s\/([^/]+)\/?$/;
+const PUBLIC_CHANNEL_PAGE_PATH = /^\/s\/([^/]+)\/channel\/([0-9a-f-]{36})\/?$/i;
+const SERVER_JOIN_PAGE_PATH = /^\/join\/([^/]+)\/?$/;
+const EXTERNAL_INVITE_PAGE_PATH = /^\/external-invite\/([^/]+)\/?$/;
+const LINK_PREVIEW_USER_AGENT = "RaftLinkPreview/1.0";
 // Visually hidden (it is replaced when the app mounts), still text to a fetcher that reads the HTML.
 const ARTIFACT_ARTICLE_STYLE = "position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0";
 const SITEMAP_PATH = "/sitemap.xml";
@@ -443,6 +472,7 @@ const artifactApi = (apiOrigin, id) => {
   return {
     meta: `${base}/meta`,
     markdown: `${base}/index.md`,
+    ogImage: `${base}/og-image.png`,
     zip: `${base}/download.zip`,
     file: (path) => `${base}/files/${encodePath(path)}`,
   };
@@ -468,9 +498,10 @@ function validArtifactMeta(value) {
  * `error`: the Workers runtime rejects it outright ("must be one of follow or
  * manual"), which made every ask fail before reaching the API.
  */
-async function askApi(fetchApi, url, accept, timeoutMs) {
+async function askApi(fetchApi, url, accept, timeoutMs, extraHeaders = null) {
   try {
-    return { response: await fetchApi(url, { method: "GET", headers: { Accept: accept }, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) }) };
+    const headers = extraHeaders ? { Accept: accept, ...extraHeaders } : { Accept: accept };
+    return { response: await fetchApi(url, { method: "GET", headers, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) }) };
   } catch (error) {
     const name = error && typeof error.name === "string" ? error.name : "Error";
     return { failure: name === "TimeoutError" || name === "AbortError" ? "timeout" : `error_${name.replace(/[^A-Za-z0-9_]/g, "")}` };
@@ -618,6 +649,8 @@ export function artifactHeadTags({ meta, id, pageOrigin, apiOrigin }) {
   const canonical = `${pageOrigin}/artifacts/${id}`;
   const api = artifactApi(apiOrigin, id);
   const description = meta.description || `${meta.title}, shared from Raft.`;
+  // Bust third-party unfurler caches (Slack, X, iMessage) whenever the Artifact is updated.
+  const imageUrl = meta.updatedAt ? `${api.ogImage}?v=${encodeURIComponent(meta.updatedAt)}` : api.ogImage;
   const entryType = entryAlternateType(meta.entry);
   const metaTag = (attr, name, content) => `<meta ${attr}="${escapeHtml(name)}" content="${escapeHtml(content)}">`;
   const link = (attrs) => `<link ${Object.entries(attrs).map(([name, value]) => `${name}="${escapeHtml(value)}"`).join(" ")}>`;
@@ -629,12 +662,14 @@ export function artifactHeadTags({ meta, id, pageOrigin, apiOrigin }) {
     metaTag("property", "og:title", meta.title),
     metaTag("property", "og:description", description),
     metaTag("property", "og:url", canonical),
-    metaTag("property", "og:image", `${pageOrigin}${ARTIFACT_PREVIEW_IMAGE_PATH}`),
-    metaTag("property", "og:image:alt", "Raft"),
-    // The image is the square 512 px app icon: a small card, not a large image one.
-    metaTag("name", "twitter:card", "summary"),
+    metaTag("property", "og:image", imageUrl),
+    metaTag("property", "og:image:width", "1200"),
+    metaTag("property", "og:image:height", "630"),
+    metaTag("property", "og:image:alt", meta.title),
+    metaTag("name", "twitter:card", "summary_large_image"),
     metaTag("name", "twitter:title", meta.title),
     metaTag("name", "twitter:description", description),
+    metaTag("name", "twitter:image", imageUrl),
     link({ rel: "canonical", href: canonical }),
     link({ rel: "alternate", type: "text/markdown", href: api.markdown }),
     entryType ? link({ rel: "alternate", type: entryType, title: "Source", href: api.file(meta.entry) }) : "",
@@ -766,6 +801,7 @@ export async function artifactPageResponse(request, response, deps, started = st
   const article = artifactArticle({ meta, id, apiOrigin, text });
   const title = `${meta.title} | Raft`;
   const rewritten = new Rewriter()
+    .on("meta[data-raft-default-og]", { element(element) { element.remove(); } })
     .on("title", { element(element) { element.setInnerContent(escapeHtml(title), { html: true }); } })
     .on("head", { element(element) { element.append(tags, { html: true }); } })
     .on("#root", { element(element) { element.prepend(article, { html: true }); } })
@@ -781,6 +817,183 @@ export async function artifactPageResponse(request, response, deps, started = st
   // The same address answers Markdown to an Accept that prefers it.
   headers.append("Vary", "Accept");
   // The length changed with the head.
+  headers.delete("content-length");
+  return new Response(rewritten.body, { status: rewritten.status, statusText: rewritten.statusText, headers });
+}
+
+/**
+ * Real interactive browser navigations (Chrome, Safari, Firefox, Edge) send
+ * `Sec-Fetch-Mode: navigate` and do not read OG meta tags from the initial HTML.
+ * Skipping the preview API lookup for them keeps normal workspace loads at 0 ms
+ * extra latency. Chat in-app webviews (WeChat/QQ/Feishu/DingTalk) and link-preview
+ * unfurlers either omit Sec-Fetch-Mode or carry an in-app UA so they still receive
+ * live OG tags when forwarding links.
+ */
+export function isInteractiveBrowserNavigation(request) {
+  const mode = (request.headers.get("sec-fetch-mode") ?? "").toLowerCase();
+  if (mode !== "navigate") return false;
+  const ua = request.headers.get("user-agent") ?? "";
+  return !/MicroMessenger|WeChat|QQ\/|Lark|Feishu|DingTalk/i.test(ua);
+}
+
+function formatInviteCountsDescription(info) {
+  if (info.insideCountsHidden === true) return "Join this workspace on Raft.";
+  const humans = Number.isSafeInteger(info.memberCount) && info.memberCount > 0 ? info.memberCount : 0;
+  const agents = Number.isSafeInteger(info.agentCount) && info.agentCount > 0 ? info.agentCount : 0;
+  const parts = [];
+  if (humans > 0) parts.push(`${humans} ${humans === 1 ? "member" : "members"}`);
+  if (agents > 0) parts.push(`${agents} ${agents === 1 ? "agent" : "agents"}`);
+  return parts.length > 0 ? `${parts.join(", ")} on Raft.` : "Join this workspace on Raft.";
+}
+
+function decodePathSegment(segment) {
+  try {
+    const decoded = decodeURIComponent(segment);
+    if (!decoded || decoded.includes("/") || decoded.includes("\\") || decoded === "." || decoded === "..") return null;
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+function socialTargetOf(pathname) {
+  let match = PUBLIC_CHANNEL_PAGE_PATH.exec(pathname);
+  if (match) {
+    const slug = decodePathSegment(match[1]);
+    return slug ? { kind: "public_channel", slug, channelId: match[2] } : null;
+  }
+  match = PUBLIC_SERVER_PAGE_PATH.exec(pathname);
+  if (match) {
+    const slug = decodePathSegment(match[1]);
+    return slug ? { kind: "public_server", slug } : null;
+  }
+  match = SERVER_JOIN_PAGE_PATH.exec(pathname);
+  if (match) {
+    const token = decodePathSegment(match[1]);
+    return token ? { kind: "server_join", token } : null;
+  }
+  match = EXTERNAL_INVITE_PAGE_PATH.exec(pathname);
+  if (match) {
+    const token = decodePathSegment(match[1]);
+    return token ? { kind: "external_invite", token } : null;
+  }
+  return null;
+}
+
+async function fetchSocialPreviewMeta(target, { apiOrigin, fetch: fetchApi, timeoutMs = ARTIFACT_META_TIMEOUT_MS }) {
+  if (target.kind === "public_server" || target.kind === "public_channel") {
+    const { response } = await askApi(fetchApi, `${apiOrigin}/api/public/servers/${encodeURIComponent(target.slug)}`, "application/json", timeoutMs);
+    if (!response || response.status !== 200 || !isJsonResponse(response)) return null;
+    let body;
+    try { body = await response.json(); } catch { return null; }
+    const serverName = typeof body?.server?.name === "string" ? body.server.name.trim() : "";
+    const serverDesc = typeof body?.server?.description === "string" ? body.server.description.trim() : "";
+    if (!serverName) return null;
+    if (target.kind === "public_channel") {
+      const channels = Array.isArray(body?.channels) ? body.channels : [];
+      const found = channels.find((ch) => ch && typeof ch.id === "string" && ch.id.toLowerCase() === target.channelId.toLowerCase());
+      // Private, deleted, or unknown channel on a public server: fall back to the byte-identical generic card (zero probing oracle).
+      if (!found || typeof found.name !== "string" || !found.name.trim()) return null;
+      const channelDesc = typeof found.description === "string" ? found.description.trim() : "";
+      return {
+        title: `#${found.name.trim()} · ${serverName}`,
+        description: channelDesc || serverDesc || `Public channel in ${serverName} on Raft.`,
+      };
+    }
+    return {
+      title: serverName,
+      description: serverDesc || `${serverName} on Raft.`,
+    };
+  }
+  if (target.kind === "server_join") {
+    const { response } = await askApi(fetchApi, `${apiOrigin}/api/auth/invite-info?token=${encodeURIComponent(target.token)}`, "application/json", timeoutMs);
+    if (!response || response.status !== 200 || !isJsonResponse(response)) return null;
+    let body;
+    try { body = await response.json(); } catch { return null; }
+    const serverName = typeof body?.serverName === "string" ? body.serverName.trim() : "";
+    if (!serverName) return null;
+    return {
+      title: `Join ${serverName} on Raft`,
+      description: formatInviteCountsDescription(body),
+    };
+  }
+  if (target.kind === "external_invite") {
+    const { response } = await askApi(
+      fetchApi,
+      `${apiOrigin}/api/external-invites/${encodeURIComponent(target.token)}/preview`,
+      "application/json",
+      timeoutMs,
+      { "User-Agent": LINK_PREVIEW_USER_AGENT },
+    );
+    if (!response || response.status !== 200 || !isJsonResponse(response)) return null;
+    // Never reveal channel, server, inviter or email in an external preview card.
+    return {
+      title: "Channel invitation",
+      description: "Sign in to Raft to accept this external channel invitation.",
+    };
+  }
+  return null;
+}
+
+export function socialHeadTags({ title, description, pageOrigin, pageUrl }) {
+  const imageUrl = `${pageOrigin}${ARTIFACT_PREVIEW_IMAGE_PATH}`;
+  const metaTag = (attr, name, content) => `<meta ${attr}="${escapeHtml(name)}" content="${escapeHtml(content)}">`;
+  return [
+    metaTag("name", "robots", "noindex, nofollow"),
+    metaTag("name", "description", description),
+    metaTag("property", "og:type", "website"),
+    metaTag("property", "og:site_name", "Raft"),
+    metaTag("property", "og:title", title),
+    metaTag("property", "og:description", description),
+    metaTag("property", "og:url", pageUrl),
+    metaTag("property", "og:image", imageUrl),
+    metaTag("property", "og:image:width", "1200"),
+    metaTag("property", "og:image:height", "630"),
+    metaTag("property", "og:image:alt", "Raft"),
+    metaTag("name", "twitter:card", "summary_large_image"),
+    metaTag("name", "twitter:title", title),
+    metaTag("name", "twitter:description", description),
+    metaTag("name", "twitter:image", imageUrl),
+  ].join("\n");
+}
+
+export function startSocialPreview(request, deps) {
+  if (request.method !== "GET" || !deps.apiOrigin || typeof deps.HTMLRewriter !== "function") return null;
+  if (isInteractiveBrowserNavigation(request)) return null;
+  const target = socialTargetOf(new URL(request.url).pathname);
+  if (!target) return null;
+  return { target, meta: fetchSocialPreviewMeta(target, deps) };
+}
+
+export async function socialPreviewResponse(request, response, deps, started = startSocialPreview(request, deps)) {
+  if (!started) return response;
+  if (response.status !== 200 || !isHtmlResponse(response)) return response;
+  const meta = await started.meta;
+  if (!meta) {
+    // Keep fallback headers consistent with dynamic previews (no caching of live visibility decisions, never indexed).
+    const headers = new Headers(response.headers);
+    headers.set("X-Robots-Tag", "noindex, nofollow");
+    headers.set("Cache-Control", "no-store");
+    headers.delete("etag");
+    headers.delete("last-modified");
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+  }
+  const url = new URL(request.url);
+  const pageUrl = `${url.origin}${url.pathname}`;
+  const tags = socialHeadTags({ title: meta.title, description: meta.description, pageOrigin: url.origin, pageUrl });
+  const pageTitle = `${meta.title} | Raft`;
+  const Rewriter = deps.HTMLRewriter;
+  const rewritten = new Rewriter()
+    .on("meta[data-raft-default-og]", { element(element) { element.remove(); } })
+    .on("title", { element(element) { element.setInnerContent(escapeHtml(pageTitle), { html: true }); } })
+    .on("head", { element(element) { element.append(tags, { html: true }); } })
+    .transform(response);
+  const headers = new Headers(rewritten.headers);
+  headers.set("X-Robots-Tag", "noindex, nofollow");
+  headers.set(ARTIFACT_PREVIEW_HEADER, "1");
+  headers.set("Cache-Control", "no-store");
+  headers.delete("etag");
+  headers.delete("last-modified");
   headers.delete("content-length");
   return new Response(rewritten.body, { status: rewritten.status, statusText: rewritten.statusText, headers });
 }
@@ -881,11 +1094,13 @@ export async function handleRequest(request, env, artifactDeps) {
   const markdown = await artifactMarkdownOutcome(request, artifactDeps);
   if (markdown.response) return markdown.response;
 
-  // An Artifact page's meta is asked before the shell, and awaited only once the shell is the 200 HTML.
+  // An Artifact page's meta (or a public server/invite preview) is asked before the shell, and awaited only once the shell is the 200 HTML.
   const started = startArtifactPage(request, artifactDeps, { askText: !markdown.reason });
-  const response = await env.ASSETS.fetch(started ? withoutValidators(request) : request);
+  const socialStarted = started ? null : startSocialPreview(request, artifactDeps);
+  const response = await env.ASSETS.fetch(started || socialStarted ? withoutValidators(request) : request);
   const manifestResponse = await normalizeDesktopManifestResponse(request, response);
   let page = await artifactPageResponse(request, normalizeBuiltAssetResponse(request, manifestResponse), artifactDeps, started);
+  if (socialStarted) page = await socialPreviewResponse(request, page, artifactDeps, socialStarted);
   if (markdown.reason) {
     const diagnostic = page.headers.get(ARTIFACT_DIAGNOSTIC_HEADER);
     page = withArtifactDiagnostic(page, `${diagnostic ? `${diagnostic}; ` : ""}markdown=${markdown.reason}`);

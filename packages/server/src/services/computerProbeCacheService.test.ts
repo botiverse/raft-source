@@ -3,6 +3,7 @@ import type { RuntimeModelSourceOutcome } from "@botiverse/raft-shared";
 
 import { RouteFailureError } from "../tracing/routeFailure";
 import {
+  ComputerReadUnavailableError,
   COMPUTER_PROBE_CACHE_TTL_SECONDS,
   COMPUTER_PROBE_WAIT_MS,
   ComputerProbeCacheService,
@@ -209,6 +210,38 @@ test("skills: same budget and cache, per agent on one Computer and runtime", asy
   const slowUnassigned = service.probeSkills(unassigned, () => new Promise(() => {}));
   await clock.advance(6_000);
   assert.deepEqual(await slowUnassigned, { state: "unavailable" });
+});
+
+test("skills: a read the Computer says it could not make (OAR) answers from the cache, stale or unavailable, never an error, and is not cached", async () => {
+  const clock = manualClock();
+  const backend = memoryBackend();
+  const service = new ComputerProbeCacheService(backend, { clock });
+  const here = { machineId: "machine-1", runtime: "antigravity", agentId: "agent-1" };
+  const refused = async () => { throw new ComputerReadUnavailableError("deadline"); };
+  assert.deepEqual(await service.probeSkills(here, refused), { state: "unavailable" });
+  assert.equal(backend.values.size, 0);
+  const skills = { global: [], workspace: [], builtin: [{ name: "review", displayName: "review", description: "", userInvocable: true }] };
+  await service.probeSkills(here, async () => skills);
+  assert.deepEqual(await service.probeSkills(here, refused), { state: "stale", value: skills, fetchedAt: "2026-10-21T08:00:00.000Z" });
+});
+
+test("skills: a built-in list is cached with the rest; a list without one (older daemon) still caches", async () => {
+  const clock = manualClock();
+  const backend = memoryBackend();
+  const service = new ComputerProbeCacheService(backend, { clock });
+  const review = { name: "review", displayName: "Review", description: "Review a diff", userInvocable: true, sourcePath: "~/.claude/skills" };
+  const simplify = { name: "simplify", displayName: "simplify", description: "", userInvocable: true };
+  const withBuiltin = { global: [review], workspace: [], builtin: [simplify] };
+  const here = { machineId: "machine-1", runtime: "claude", agentId: "agent-1" };
+  assert.deepEqual(await service.probeSkills(here, async () => withBuiltin), { state: "ok", value: withBuiltin });
+  assert.deepEqual(await service.cachedSkills(here), { state: "stale", value: withBuiltin, fetchedAt: "2026-10-21T08:00:00.000Z" });
+
+  const older = { ...here, agentId: "agent-2" };
+  const withoutBuiltin = { global: [review], workspace: [] };
+  assert.deepEqual(await service.probeSkills(older, async () => withoutBuiltin), { state: "ok", value: withoutBuiltin });
+  const cached = await service.cachedSkills(older);
+  assert.deepEqual(cached, { state: "stale", value: withoutBuiltin, fetchedAt: "2026-10-21T08:00:00.000Z" });
+  assert.equal(cached.state === "stale" && "builtin" in cached.value, false);
 });
 
 test("malformed or unreadable cache records are treated as missing", async () => {

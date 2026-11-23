@@ -36,7 +36,7 @@ export interface AgentIdleFacts {
  */
 export type AgentNotIdleReason = "agent_busy" | "background_tasks" | "delivery_in_flight" | "mention_in_flight";
 
-/** The one option of the idle definition. */
+/** Options for the idle definition. */
 export interface AgentIdleOptions {
   /**
    * Reconciler step 13 (decision Q-H): a drain (agentDrain.ts) holds new
@@ -48,12 +48,18 @@ export interface AgentIdleOptions {
    * input and a told mention keep a process busy.
    */
   ignoreUntoldInbox?: boolean;
+  /**
+   * #proj-runtime:#80: a config-change spec restart waits only for the current
+   * foreground turn, not background tasks (which can run indefinitely and
+   * would leave the agent stuck on its old config).
+   */
+  ignoreBackgroundTasks?: boolean;
 }
 
 export function agentNotIdleReason(facts: AgentIdleFacts, options: AgentIdleOptions = {}): AgentNotIdleReason | null {
   if (!facts.turnEnded) return "agent_busy";
   // task #1260: the turn ends while its background tasks still run.
-  if (facts.backgroundTasks > 0) return "background_tasks";
+  if (facts.backgroundTasks > 0 && !options.ignoreBackgroundTasks) return "background_tasks";
   // A delivery written near the turn end can still sit unread in stdin.
   if ((facts.untoldInbox && !options.ignoreUntoldInbox) || facts.unconsumedStdin > 0 || facts.queuedInputPending) return "delivery_in_flight";
   if (facts.trackedMentionOpen) return "mention_in_flight";

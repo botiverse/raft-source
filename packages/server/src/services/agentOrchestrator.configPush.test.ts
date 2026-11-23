@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 
 import { eq } from "drizzle-orm";
-import { AGENT_MIGRATION_MAX_ARCHIVE_ENTRIES, DAEMON_CAPABILITY_AGENT_CONFIG_PUSH, MAX_AGENT_MIGRATION_TRANSPORT_BYTES, type AgentConfig, type ServerToMachineMessage } from "@botiverse/raft-shared";
+import { AGENT_MIGRATION_MAX_ARCHIVE_ENTRIES, DAEMON_CAPABILITY_AGENT_CONFIG_INTERRUPT, DAEMON_CAPABILITY_AGENT_CONFIG_PUSH, DAEMON_CAPABILITY_CODEX_SERVICE_TIER_V1, MAX_AGENT_MIGRATION_TRANSPORT_BYTES, RUNTIME_CONFIG_VERSION, type AgentConfig, type ServerToMachineMessage } from "@botiverse/raft-shared";
 
 import { getDb } from "../db/index";
 import { agentRuntimeProfiles, agents, machines, managedMcpAssignments, managedMcpServers, serverMembers, servers, users } from "../db/schema";
@@ -382,5 +382,73 @@ test("ready: nothing is re-sent to a daemon already current or ahead, one that r
     assert.deepEqual(configFrames(sent), []);
   } finally {
     await orchestrator.shutdown();
+  }
+});
+
+test("buildAgentConfig: a Codex speed tier goes only to a Computer that reads it; an older one gets the primary fast tier", async ({ db: _db }) => {
+  const { server, machine, agent } = await seed({ status: "inactive" });
+  const ultra = { version: RUNTIME_CONFIG_VERSION, runtime: "codex", model: { kind: "preset", id: "gpt-6.2-astra" }, mode: { kind: "fast", serviceTier: "ultrafast" } };
+  await getDb().update(agents).set({ runtime: "codex", model: "gpt-6.2-astra", runtimeConfig: ultra as never }).where(eq(agents.id, agent.id));
+  const row = async (orchestrator: CapturingOrchestrator) => (await orchestrator.load(agent.id))!;
+  const reads = new CapturingOrchestrator();
+  try {
+    bindMachine(reads, machine.id, server.id, [DAEMON_CAPABILITY_AGENT_CONFIG_PUSH, DAEMON_CAPABILITY_CODEX_SERVICE_TIER_V1]);
+    assert.deepEqual((await reads.build(await row(reads))).runtimeConfig?.mode, { kind: "fast", serviceTier: "ultrafast" });
+  } finally {
+    await reads.shutdown();
+  }
+  const older = new CapturingOrchestrator();
+  try {
+    bindMachine(older, machine.id, server.id, [DAEMON_CAPABILITY_AGENT_CONFIG_PUSH]);
+    assert.deepEqual((await older.build(await row(older))).runtimeConfig?.mode, { kind: "fast" }, "an older Computer's strict parse stays readable");
+  } finally {
+    await older.shutdown();
+  }
+});
+
+test("owner routing (#proj-runtime:#80): gates immediate mid-turn interrupt on agent:config-interrupt-v1 and keeps older Computers idle-safe", async ({ db: _db }) => {
+  const { server, machine, agent } = await seed();
+  await bumpAgentConfigRevision(getDb(), [agent.id]);
+  const owner = new CapturingOrchestrator();
+  const resets: Array<{ agentId: string; mode: string; options: unknown }> = [];
+  owner.resetAgent = async (agentId, mode, options) => { resets.push({ agentId, mode, options }); };
+  const requester = new RequesterOrchestrator((request) => owner.handleStartIntent(request));
+  try {
+    // Push-capable daemon WITHOUT agent:config-interrupt-v1 while busy -> pushed_busy (no immediate kill).
+    bindMachine(owner, machine.id, server.id, [DAEMON_CAPABILITY_AGENT_CONFIG_PUSH]);
+    (owner as any).broadcastActivity(agent.id, "working", "Editing", "tool_use");
+    assert.equal(await requester.applyAgentConfig(agent.id, { fallbackRestartMode: "restart" }), "pushed_busy");
+    assert.deepEqual(resets, []);
+
+    // Interrupt-capable daemon while busy -> pushed_restarted (pushes agent:config { interrupt: true } then restarts immediately).
+    bindMachine(owner, machine.id, server.id, [DAEMON_CAPABILITY_AGENT_CONFIG_PUSH, DAEMON_CAPABILITY_AGENT_CONFIG_INTERRUPT]);
+    assert.equal(await requester.applyAgentConfig(agent.id, { fallbackRestartMode: "restart" }), "pushed_restarted");
+    assert.deepEqual(resets, [{
+      agentId: agent.id,
+      mode: "restart",
+      options: { restartIfStopped: false, restartEvenIfInactive: true },
+    }]);
+
+    // Older daemon without push while busy -> fallback_when_idle (no immediate kill).
+    bindMachine(owner, machine.id, server.id, []);
+    assert.equal(await requester.applyAgentConfig(agent.id, { fallbackRestartMode: "session", terminalControl: "runtime_config_changed" }), "fallback_when_idle");
+    assert.equal(resets.length, 1);
+
+    // Older daemon transitions to idle -> queued session fallback fires once.
+    (owner as any).broadcastActivity(agent.id, "online", "", "none");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(resets.length, 2);
+    assert.deepEqual(resets[1], {
+      agentId: agent.id,
+      mode: "session",
+      options: { restartIfStopped: false, restartEvenIfInactive: false, terminalControl: "runtime_config_changed" },
+    });
+
+    // Older daemon while idle -> fallback_restarted immediately.
+    assert.equal(await requester.applyAgentConfig(agent.id, { fallbackRestartMode: "restart" }), "fallback_restarted");
+    assert.equal(resets.length, 3);
+  } finally {
+    await owner.shutdown();
+    await requester.shutdown();
   }
 });

@@ -1,4 +1,5 @@
 import { useLayoutEffect, useState } from "react";
+import { resizeObserverOf } from "../../utils/ownerDocument";
 
 /** The meta line's readers (ArtifactPresence's button). */
 const READERS = "[data-artifact-meta-row] [data-testid='artifact-presence']";
@@ -40,7 +41,9 @@ export function useHeadReadersWidth(head: HTMLElement | null): number {
       if (readers) resize?.observe(readers);
       observed = readers;
     };
-    const resize = typeof ResizeObserver !== "undefined" ? new ResizeObserver(measure) : null;
+    // The head's own window's observer (an object window's, #337 PR3).
+    const Observer = resizeObserverOf(head);
+    const resize = Observer ? new Observer(measure) : null;
     const added = typeof MutationObserver !== "undefined" ? new MutationObserver(measure) : null;
     added?.observe(head, { childList: true, subtree: true });
     measure();

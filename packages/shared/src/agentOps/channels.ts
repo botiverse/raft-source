@@ -126,7 +126,7 @@ export async function leaveChannel(
     return { ok: true, state: "left", data: { target: request.target, channelId: channel.id, channelDeleted: true }, next: null, text: formatChannelDeletedWithLastMember(request.target) };
   }
   const lines = [
-    `Left ${request.target}. You can still inspect visible public channel history there, but you can no longer send or receive ordinary channel delivery until you join the public channel again or a human re-adds you to a private channel.`,
+    `Left ${request.target}. You can still inspect visible public channel history there, but you can no longer send or receive ordinary channel delivery until you join the public channel again or a member of the private channel adds you back.`,
   ];
   const attention = (result.data as { attention?: { ordinaryActivity?: string } }).attention;
   if (attention?.ordinaryActivity) lines.push(attention.ordinaryActivity);

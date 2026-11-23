@@ -4,7 +4,12 @@ import {
   RUNTIME_AUTH_V1_RUNTIMES,
   RUNTIME_LIMIT_RESET_CLAUDE_RELAY_BUDGET_MS,
   RUNTIME_LIMIT_RESET_RELAY_BUDGET_MS,
+  RUNTIME_UPGRADE_RELAY_BUDGET_MS,
+  RUNTIME_UPDATE_CHECK_MAX_AGE_MS,
+  RUNTIME_INSTALL_PLAN_RELAY_BUDGET_MS,
+  RUNTIME_INSTALL_RELAY_BUDGET_MS,
   asMachineOperationId,
+  currentTimeMs,
   asRuntimeAuthLoginId,
   isRuntimeAuthRuntime,
   runtimeAuthLoginEventSchema,
@@ -15,6 +20,9 @@ import {
   runtimeAuthSupports,
   runtimeLimitResetResultSchema,
   runtimeLimitResetsReadResultSchema,
+  runtimeUpgradeResultSchema,
+  runtimeInstallPlanSchema,
+  runtimeInstallResultSchema,
 } from "@botiverse/raft-shared";
 import type {
   MachineOperationView,
@@ -35,6 +43,11 @@ import type {
   RuntimeLimitResetIdempotencyKey,
   RuntimeLimitResetKind,
   RuntimeLimitResetsReadResult,
+  RuntimeUpgradeResult,
+  RuntimeUpdateCheck,
+  RuntimeUpdates,
+  RuntimeInstallPlan,
+  RuntimeInstallResult,
 } from "@botiverse/raft-shared";
 import type { Socket } from "socket.io-client";
 import api from "../api/client";
@@ -75,21 +88,81 @@ export interface RuntimeAuthView {
   logoutRuntimes?: readonly RuntimeAuthRuntime[];
   canAct: boolean;
   /**
-   * Claude limit resets on this Computer (behind claude_limit_reset, for a
+   * Claude limit resets on this Computer (behind claude_limit_reset_v2, for a
    * person who may act): `ok`, or `computer_upgrade_required` when its daemon
    * lacks the capability (an older Computer, or one not on Linux). Absent:
    * nothing to show.
    */
   claudeLimitResets?: "ok" | "computer_upgrade_required";
   /**
-   * What this viewer may do with those resets, beside `claudeLimitResets`.
-   * Only the person who connected the Computer spends its Claude resets
+   * What this viewer may do with those resets, beside `claudeLimitResets`
    * (`canUse`: a redeem; `canConsent`: a read with consent at the 5-hour
-   * limit); an owner or admin may only view them, where the read needs no
-   * consent (`claudeLimitResetOffer`). Absent from an older server: both allowed
-   * (the server enforces either way).
+   * limit). The current server sends both true: everyone it sends the resets
+   * to (the person who connected the Computer, an owner or admin) may use
+   * them. An older server sent both false to an owner or admin who did not
+   * connect it, who may then only view them where the read needs no consent
+   * (`claudeLimitResetOffer`). Absent: both allowed (the server enforces either way).
    */
   claudeLimitResetAccess?: { canUse: boolean; canConsent: boolean };
+  /**
+   * Upgrade a runtime's command-line tool from here (behind
+   * runtime_upgrade_button): present only when the server offers it, the
+   * viewer may act and the Computer runs a runtime's updater. Absent: no button.
+   */
+  runtimeUpgrade?: true;
+  /**
+   * With `runtimeUpgrade`: the runtimes this Computer last reported it can
+   * upgrade (their OAR runtime has an updater). Upgrade is offered for these.
+   */
+  upgradableRuntimes?: readonly RuntimeAuthRuntime[];
+  /**
+   * With `runtimeUpgrade`: the Computer's read-only update check for those of
+   * `upgradableRuntimes` it checked (a Computer and server with
+   * SERVER_CAPABILITY_RUNTIME_UPDATE_CHECK_V1). The card offers Upgrade only
+   * where it found a newer version (`runtimeUpdateOf`). Absent, or no entry
+   * for the runtime: an older Computer or server; Upgrade as before.
+   */
+  runtimeUpdates?: RuntimeUpdates;
+  /**
+   * Install a runtime that is not on this Computer from here (behind
+   * runtime_install_button): present only when the server offers it, the
+   * viewer may act (the same people as Upgrade) and the Computer runs a
+   * runtime's installer. Absent: no Install.
+   */
+  runtimeInstall?: true;
+  /**
+   * With `runtimeInstall`: the runtimes this Computer last reported it can
+   * install (not installed, and their OAR runtime has an installer). Install
+   * is offered for these.
+   */
+  installableRuntimes?: readonly RuntimeAuthRuntime[];
+}
+
+/** Whether Upgrade is offered for this runtime here: the server's say-so, a viewer who may act, and a runtime the Computer can upgrade. */
+export function runtimeUpgradeOffered(view: RuntimeAuthView | null, runtime: RuntimeAuthRuntime | null): boolean {
+  return Boolean(view?.runtimeUpgrade && view.canAct && runtime && view.upgradableRuntimes?.includes(runtime));
+}
+
+/**
+ * The Computer's update check for a runtime Upgrade is offered for, or null
+ * when it reported none (an older Computer or server, a runtime OAR has no
+ * check for). Only the card reads it: the agent form's `runtime_outdated`
+ * line and the sign-in notice's `version_unsupported` offer Upgrade for a CLI
+ * known to be too old. A check older than RUNTIME_UPDATE_CHECK_MAX_AGE_MS
+ * counts as none.
+ */
+export function runtimeUpdateOf(view: RuntimeAuthView | null, runtime: RuntimeAuthRuntime | null, nowMs = currentTimeMs()): RuntimeUpdateCheck | null {
+  if (!runtime || !runtimeUpgradeOffered(view, runtime)) return null;
+  const update = view?.runtimeUpdates?.[runtime];
+  if (!update) return null;
+  // Older than the Computer keeps an answer (a stored report the server kept renewing): no answer, Upgrade as before.
+  const checkedAtMs = Date.parse(update.checkedAt);
+  return Number.isFinite(checkedAtMs) && nowMs - checkedAtMs <= RUNTIME_UPDATE_CHECK_MAX_AGE_MS ? update : null;
+}
+
+/** Whether Install is offered for this runtime here: the server's say-so, a viewer who may act, and a runtime the Computer can install. */
+export function runtimeInstallOffered(view: RuntimeAuthView | null, runtime: RuntimeAuthRuntime | null): boolean {
+  return Boolean(view?.runtimeInstall && view.canAct && runtime && view.installableRuntimes?.includes(runtime));
 }
 
 /** Whether this Computer signs the runtime in and out from here, or needs upgrading first. */
@@ -309,6 +382,45 @@ export class RuntimeAuthClient {
   }
 
   /**
+   * Runs the runtime's own updater on the Computer (a person pressed Upgrade)
+   * and answers its outcome, checked here. The Computer re-detects its
+   * runtimes afterwards and reports the new status on its own.
+   */
+  async upgradeRuntime(serverId: string, machineId: string, runtime: RuntimeAuthRuntime): Promise<RuntimeUpgradeResult> {
+    const url = `/servers/${encodeURIComponent(serverId)}/machines/${encodeURIComponent(machineId)}/runtimes/${runtime}/upgrade`;
+    const answer = await this.postWaitingOnComputer<{ result?: unknown } | null>(serverId, url, {}, RUNTIME_UPGRADE_RELAY_BUDGET_MS);
+    const parsed = runtimeUpgradeResultSchema.safeParse(answer?.result);
+    if (!parsed.success) throw new RuntimeAuthMalformedResponseError();
+    return parsed.data;
+  }
+
+  /**
+   * What installing the runtime on the Computer would run (a person pressed
+   * Install), read there without running anything, checked here. Only the
+   * runtime is sent: the commands are the Computer's to say.
+   */
+  async runtimeInstallPlan(serverId: string, machineId: string, runtime: RuntimeAuthRuntime): Promise<RuntimeInstallPlan> {
+    const url = `/servers/${encodeURIComponent(serverId)}/machines/${encodeURIComponent(machineId)}/runtimes/${runtime}/install-plan`;
+    const answer = await this.postWaitingOnComputer<{ plan?: unknown } | null>(serverId, url, {}, RUNTIME_INSTALL_PLAN_RELAY_BUDGET_MS);
+    const parsed = runtimeInstallPlanSchema.safeParse(answer?.plan);
+    if (!parsed.success) throw new RuntimeAuthMalformedResponseError();
+    return parsed.data;
+  }
+
+  /**
+   * Runs the runtime's own installer on the Computer (the person confirmed
+   * its plan) and answers its outcome, checked here. Only the runtime is
+   * sent. The Computer re-detects its runtimes afterwards on its own.
+   */
+  async installRuntime(serverId: string, machineId: string, runtime: RuntimeAuthRuntime): Promise<RuntimeInstallResult> {
+    const url = `/servers/${encodeURIComponent(serverId)}/machines/${encodeURIComponent(machineId)}/runtimes/${runtime}/install`;
+    const answer = await this.postWaitingOnComputer<{ result?: unknown } | null>(serverId, url, {}, RUNTIME_INSTALL_RELAY_BUDGET_MS);
+    const parsed = runtimeInstallResultSchema.safeParse(answer?.result);
+    if (!parsed.success) throw new RuntimeAuthMalformedResponseError();
+    return parsed.data;
+  }
+
+  /**
    * Spends one of the runtime account's limit resets on the Computer (Codex).
    * `idempotencyKey` names one confirmed click: pass the same key to retry an
    * attempt whose outcome was never learned (a timeout, `unknown`), so the
@@ -327,7 +439,8 @@ export class RuntimeAuthClient {
     const answer = await this.postWaitingOnComputer<{ result?: unknown; snapshot?: unknown } | null>(
       serverId,
       url,
-      kind ? { idempotencyKey, kind } : { idempotencyKey },
+      // onboardingRequiredReason: this page reads `unsupported: onboarding_required`.
+      kind ? { idempotencyKey, kind, onboardingRequiredReason: true } : { idempotencyKey },
       kind ? RUNTIME_LIMIT_RESET_CLAUDE_RELAY_BUDGET_MS : RUNTIME_LIMIT_RESET_RELAY_BUDGET_MS,
     );
     const result = runtimeLimitResetResultSchema.safeParse(answer?.result);
@@ -343,7 +456,13 @@ export class RuntimeAuthClient {
    */
   async readLimitResets(serverId: string, machineId: string, consent: boolean): Promise<RuntimeLimitResetsReadResult> {
     const url = `/servers/${encodeURIComponent(serverId)}/machines/${encodeURIComponent(machineId)}/runtime-account-usage/claude/limit-resets/read`;
-    const answer = await this.postWaitingOnComputer<{ result?: unknown } | null>(serverId, url, consent ? { consent: true } : {}, RUNTIME_LIMIT_RESET_CLAUDE_RELAY_BUDGET_MS);
+    const answer = await this.postWaitingOnComputer<{ result?: unknown } | null>(
+      serverId,
+      url,
+      // onboardingRequiredReason: this page reads `unsupported: onboarding_required`.
+      consent ? { consent: true, onboardingRequiredReason: true } : { onboardingRequiredReason: true },
+      RUNTIME_LIMIT_RESET_CLAUDE_RELAY_BUDGET_MS,
+    );
     const parsed = runtimeLimitResetsReadResultSchema.safeParse(answer?.result);
     if (!parsed.success) throw new RuntimeAuthMalformedResponseError();
     return parsed.data;

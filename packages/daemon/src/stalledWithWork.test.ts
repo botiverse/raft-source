@@ -8,6 +8,7 @@ const MIN = 60_000;
 function facts(overrides: Partial<StalledWithWorkFacts> = {}): StalledWithWorkFacts {
   return {
     inboxLength: 1,
+    appInboxNoticeWaiting: false,
     turnInProgress: true,
     recoveryUnderway: false,
     deliveryHold: null,
@@ -40,6 +41,16 @@ test("a stall the host latched counts as past the threshold", () => {
 
 test("stalled without queued work is only a fact (C15)", () => {
   expect(stalledWithWork(facts({ inboxLength: 0, staleForMs: 10 * 60 * MIN }))).toEqual({ broken: false, reason: "empty_inbox" });
+});
+
+test("an app Inbox notice waiting for the turn is queued work as a message is (C14); with neither, C15", () => {
+  const noticeOnly = { inboxLength: 0, appInboxNoticeWaiting: true };
+  expect(stalledWithWork(facts(noticeOnly))).toEqual({ broken: true, reason: "stalled_with_work", thresholdMs: 15 * MIN });
+  expect(stalledWithWork(facts({ ...noticeOnly, staleForMs: 4 * MIN }))).toEqual({ broken: false, reason: "runtime_progress_recent", deadlineInMs: 11 * MIN });
+  expect(stalledWithWork(facts({ ...noticeOnly, deliveryHold: "drain" })).reason).toBe("delivery_held");
+  expect(stalledWithWork(facts({ ...noticeOnly, turnInProgress: false })).reason).toBe("turn_not_in_progress");
+  expect(stalledWithWork(facts({ ...noticeOnly, outstandingToolUses: 1 })).reason).toBe("runtime_not_restartable");
+  expect(stalledWithWork(facts({ inboxLength: 0, appInboxNoticeWaiting: false })).reason).toBe("empty_inbox");
 });
 
 test("an idle process with unread messages, or one already being stopped, is not stalled", () => {

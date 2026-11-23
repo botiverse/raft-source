@@ -8,6 +8,7 @@ import type {
   ParsedEvent,
   RuntimeDriver,
   RuntimeExitInfo,
+  RuntimeQuietOutputDeadline,
   RuntimeSendResult,
   RuntimeSession,
   RuntimeSessionDescriptor,
@@ -57,6 +58,9 @@ type RuntimeSessionEvents = {
 
 type RuntimeSessionEventName = keyof RuntimeSessionEvents;
 
+/** How long a runtime's exit may go without `close` (a child still holds its stdio) before the session releases the process and drains the pipes. */
+export const CLOSE_AFTER_EXIT_GRACE_MS = 5_000;
+
 export class ChildProcessRuntimeSession implements RuntimeSession {
   readonly descriptor: RuntimeSessionDescriptor;
   private readonly events = new EventEmitter();
@@ -70,6 +74,11 @@ export class ChildProcessRuntimeSession implements RuntimeSession {
   private stopRequest: { done: Promise<void>; escalateNow(): void } | null = null;
   private exitEmitted = false;
   private closeEmitted = false;
+  /** Set when the exit was not followed by `close` in time (#o11y-alerts:#5); carried on `close`. */
+  private stdioHeldAfterExit: { waitedMs: number } | null = null;
+  private closeAfterExitArmed = false;
+  /** RuntimeDriver.quietOutputDeadline as armed: its instant, its timer, and the driver's latest view of it. */
+  private quietDeadline: { atMs: number; timer: ReturnType<typeof setTimeout>; deadline: RuntimeQuietOutputDeadline } | null = null;
 
   constructor(
     private readonly driver: RuntimeDriver,
@@ -83,7 +92,10 @@ export class ChildProcessRuntimeSession implements RuntimeSession {
     this.events.on("runtime_event", (event: ParsedEvent) => {
       if (event.kind === "turn_end") this.turnOrigin.endTurn();
     });
-    this.events.on("exit", () => this.turnOrigin.close());
+    this.events.on("exit", () => {
+      this.clearQuietDeadline();
+      this.turnOrigin.close();
+    });
   }
 
   get pid(): number | undefined {
@@ -221,6 +233,7 @@ export class ChildProcessRuntimeSession implements RuntimeSession {
   }
 
   stop(opts: RuntimeStopOptions = {}): Promise<void> {
+    this.clearQuietDeadline();
     // A stopping process may still issue calls until it exits; none of them belong to a live turn.
     this.turnOrigin.close();
     const proc = this.process;
@@ -298,6 +311,43 @@ export class ChildProcessRuntimeSession implements RuntimeSession {
     await handle.done;
   }
 
+  private clearQuietDeadline(): void {
+    if (!this.quietDeadline) return;
+    clearTimeout(this.quietDeadline.timer);
+    this.quietDeadline = null;
+  }
+
+  /**
+   * RuntimeDriver.quietOutputDeadline, asked after each stdout line: the same
+   * instant keeps the armed timer, another re-arms it, none clears it. When
+   * it passes, the driver's events go out (its turn_end makes a
+   * terminate_on_turn_end host stop the process through the usual turn end
+   * path) and, should nothing have started a stop by then, the session stops
+   * the process itself (SIGTERM, then the tree).
+   */
+  private syncQuietDeadline(): void {
+    const next = this.exitEmitted || this.stopRequest ? null : this.driver.quietOutputDeadline?.() ?? null;
+    if (!next) {
+      this.clearQuietDeadline();
+      return;
+    }
+    if (this.quietDeadline && this.quietDeadline.atMs === next.atMs) {
+      this.quietDeadline.deadline = next;
+      return;
+    }
+    this.clearQuietDeadline();
+    const timer = setTimeout(() => {
+      const armed = this.quietDeadline;
+      this.quietDeadline = null;
+      if (!armed || this.stopRequest || this.exitEmitted || this.closed) return;
+      const events = armed.deadline.expire();
+      if (events.length === 0) return;
+      for (const event of events) this.events.emit("runtime_event", event);
+      if (!this.stopRequest && !this.exitEmitted && !this.closed) void this.stop({ reason: armed.deadline.stopReason });
+    }, Math.max(0, next.atMs - Date.now()));
+    this.quietDeadline = { atMs: next.atMs, timer, deadline: next };
+  }
+
   private emitExitOnce(info: RuntimeExitInfo, beforeExit?: () => void): void {
     if (this.exitEmitted) return;
     this.exitEmitted = true;
@@ -306,10 +356,50 @@ export class ChildProcessRuntimeSession implements RuntimeSession {
     this.events.emit("exit", info);
   }
 
+  /**
+   * #o11y-alerts:#5: Node's `close` waits for the child's stdio to close, and
+   * a runtime's own children (an MCP server, a command a tool started)
+   * inherit those pipes. A runtime that exits (on the stop's SIGTERM, or on
+   * its own) leaves those children holding the pipes, and the agent's process
+   * entry, released on `close`, stayed for hours: a new start was answered
+   * "already running", a reminder took the busy path. After
+   * `CLOSE_AFTER_EXIT_GRACE_MS` with no `close`, the session closes as the
+   * child's `close` would (the stdout tail, end-of-stdout events), stops
+   * reading their output and keeps draining the pipes into nothing. The
+   * children are left alone, as a routine stop leaves what the agent started
+   * (task #25): the pipes are never destroyed, which would kill a child that
+   * still writes to them (SIGPIPE). The cost: the two pipe fds stay open
+   * until that child exits.
+   */
+  private armCloseAfterExit(
+    proc: import("node:child_process").ChildProcess,
+    exitedAtMs: number,
+    detachOutput: () => void,
+    close: (code: number | null, signal: NodeJS.Signals | null) => void,
+  ): void {
+    if (this.closeAfterExitArmed) return;
+    this.closeAfterExitArmed = true;
+    const timer = setTimeout(() => {
+      if (this.closeEmitted) return;
+      const held = { waitedMs: Math.max(0, Date.now() - exitedAtMs) };
+      this.stdioHeldAfterExit = held;
+      logger.warn(`[RuntimeSession ${this.ctx.agentId}] runtime pid=${proc.pid ?? "none"} exited ${held.waitedMs}ms ago but its stdio is still open (a child holds it); releasing the process, still draining the pipes`);
+      // Never destroyed: a child still writing to a pipe with no reader dies
+      // of SIGPIPE. Their output is drained into nothing until they exit.
+      detachOutput();
+      for (const stream of [proc.stdout, proc.stderr]) {
+        stream?.on?.("data", () => {});
+        stream?.resume?.();
+      }
+      close(proc.exitCode, proc.signalCode);
+    }, CLOSE_AFTER_EXIT_GRACE_MS);
+    timer.unref?.();
+  }
+
   private emitCloseOnce(info: RuntimeExitInfo): void {
     if (this.closeEmitted) return;
     this.closeEmitted = true;
-    this.events.emit("close", info);
+    this.events.emit("close", this.stdioHeldAfterExit ? { ...info, stdioHeldAfterExit: this.stdioHeldAfterExit } : info);
   }
 
   /** Returns the abandonment message when the child was given up before the hand-off. */
@@ -325,6 +415,7 @@ export class ChildProcessRuntimeSession implements RuntimeSession {
         for (const event of this.driver.parseLine(line)) {
           this.events.emit("runtime_event", event);
         }
+        this.syncQuietDeadline();
       }
     };
     const onStderr = (chunk: Buffer) => {
@@ -386,6 +477,11 @@ export class ChildProcessRuntimeSession implements RuntimeSession {
         exited = { code, signal };
         emitEndEvents();
       });
+      this.armCloseAfterExit(process, Date.now(), () => {
+        process.stdout?.off?.("data", onStdout);
+        process.stdout?.off?.("end", onStdoutEnd);
+        process.stderr?.off?.("data", onStderr);
+      }, (code, signal) => onClose(code, signal));
     };
     const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
       // A failed spawn (EACCES, ENOENT) gets `error` and `close`, never

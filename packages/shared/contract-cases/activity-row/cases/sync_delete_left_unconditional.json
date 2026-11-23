@@ -1,0 +1,18 @@
+{
+  "formatVersion": 1,
+  "id": "sync_delete_left_unconditional",
+  "rule": "sync_inbox_row",
+  "title": "A left delete (position null) removes the row whatever it shows",
+  "why": "The viewer lost the conversation: no newer message can bring the row back for them. The server sends it only after re-reading the row in the same pull (a leave and a re-join send an upsert instead), so it carries no position.",
+  "status": "agreed",
+  "sources": {
+    "web": ["packages/shared/src/activityRowPosition.ts (applySyncInboxRowChange)"],
+    "server": ["packages/server/src/services/syncInboxRows.ts (scope_removed: re-read, then delete reason left)"]
+  },
+  "given": { "row": { "unreadCount": 3, "hasMention": true, "position": "200", "mentionOnly": false } },
+  "steps": [
+    { "act": "liveMessage", "seq": "201", "counts": true, "mentionsViewer": false },
+    { "act": "syncDelete", "position": null, "reason": "left" }
+  ],
+  "expect": { "removed": true, "reread": false }
+}

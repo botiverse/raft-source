@@ -136,6 +136,7 @@ import {
 } from "@botiverse/raft-shared";
 import { buildCliTransportSystemPrompt, prepareCliTransport, SLOCK_AGENT_LAUNCH_DIR_ENV, SLOCK_CLI_TRANSPORT_DIR_ENV } from "./cliTransport";
 import { kimiSdkHomeFromEnv } from "./kimiCodeHome";
+import { kimiCodeStartNeedsSignIn } from "../runtimeAuth/kimiSdkAuth";
 import { prepareManagedMcpRuntimeProxy } from "../managedMcpRuntimeProxy";
 import { RuntimeTurnOriginHolder, type RuntimeTurnOrigin } from "../runtimeTurnOrigin";
 import {
@@ -678,6 +679,8 @@ export function composeStandingRoleAdditional(
 export interface KimiSessionFactoryDeps {
   createHarness?: typeof createKimiHarness;
   prepareTransport?: typeof prepareCliTransport;
+  /** Whether the start clearly needs Kimi Code's sign-in first (default: {@link kimiCodeStartNeedsSignIn}). */
+  startNeedsSignIn?: (homeDir: string, env: ReadonlyArray<Record<string, string | undefined>>) => Promise<boolean>;
 }
 
 /**
@@ -714,8 +717,6 @@ export async function createKimiAgentSessionForContext(
   sessionId: string,
   deps: KimiSessionFactoryDeps = {},
 ): Promise<{ harness: KimiHarness; session: KimiSession; wrapperPath: string }> {
-  const sdk = deps.createHarness ? null : await loadKimiSdk();
-  const createHarnessImpl = deps.createHarness ?? sdk!.createKimiHarness;
   const prepareTransportImpl = deps.prepareTransport ?? prepareCliTransport;
   const sessionDir = buildKimiSessionDir(ctx.workingDirectory);
   mkdirSync(sessionDir, { recursive: true });
@@ -736,7 +737,25 @@ export async function createKimiAgentSessionForContext(
   // prepared per-agent override into it; per-agent env is not installed into
   // the daemon process-wide environment.
   const homeDir = resolveKimiHome(spawnEnv);
+  // Not signed in to Kimi Code, and nothing else configured to run on: fail
+  // the start as a login it needs (`runtime_login_required`, which stops
+  // automatic relaunches) instead of the SDK's later, untyped failure. Read
+  // from the stored tokens and config only (no SDK, no network); a read that
+  // cannot tell lets the start go on as before.
+  // The SDK reads its env model from the daemon's process env; the agent's
+  // spawn env is checked too (an agent may set it there).
+  const signInEnv = [spawnEnv, ambientProcessEnv()];
+  const startNeedsSignIn = deps.startNeedsSignIn
+    ?? ((home: string, env: ReadonlyArray<Record<string, string | undefined>>) => kimiCodeStartNeedsSignIn(home, { env }));
+  if (await startNeedsSignIn(homeDir, signInEnv).catch(() => false)) {
+    throw new RuntimeLoginRequiredError({
+      runtimeId: "kimi-sdk",
+      message: "Kimi Code is not signed in on this computer. Sign in to Kimi Code there, then restart the agent.",
+    });
+  }
   mkdirSync(homeDir, { recursive: true });
+  const sdk = deps.createHarness ? null : await loadKimiSdk();
+  const createHarnessImpl = deps.createHarness ?? sdk!.createKimiHarness;
 
   // The standing prompt rides the harness's `roleAdditional` (botiverse
   // mirror): rendered into the main agent's `${role_additional}` slot of the

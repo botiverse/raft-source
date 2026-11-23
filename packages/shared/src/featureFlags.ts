@@ -6,11 +6,8 @@ import { SLACK_BRIDGE_PRODUCT_FEATURE_FLAG_KEYS as SHARED_SLACK_BRIDGE_PRODUCT_F
  * opens per server once the whole flow (completion included) has shipped.
  */
 export const AGENT_MIGRATION_HOSTED_FEATURE_FLAG_KEY = "agent_migration_hosted_v0";
-export const PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY = "provider_connections_v0";
 /** Hosted agent runtime on antiproton (raft-agent-provider.v1). Server-stage, default off. */
 export const ANTIPROTON_HOSTED_RUNTIME_FEATURE_FLAG_KEY = "antiproton_hosted_runtime";
-/** Computer-scoped provider probes (Phase 2A). Server-stage, default off. */
-/** Wave 3: launch enforcement on matching fresh Computer receipts + legacy probe retirement. */
 export const SERVER_LABS_UI_FEATURE_FLAG_KEY = "server_labs_ui_v0";
 /**
  * External channel invites (#wg-rbac:#16): a Server owner or admin invites
@@ -20,6 +17,8 @@ export const SERVER_LABS_UI_FEATURE_FLAG_KEY = "server_labs_ui_v0";
  * §2a: an open invite is never stranded); existing relations stay.
  */
 export const EXTERNAL_CHANNELS_FEATURE_FLAG_KEY = "external_channels_v1";
+/** Data export (#triage:#512, dataExport.ts). Off by default everywhere (FEATURE_FLAG_DEFAULT_ON_EXCEPTIONS): every route and every runner batch reads it. */
+export const DATA_EXPORT_FEATURE_FLAG_KEY = "data_export_v0";
 /**
  * Agent Lounge v0 (#proj-chat:#15): one public conversation per agent where
  * every non-guest human of the Server talks with that agent. Other agents may
@@ -103,6 +102,15 @@ export function isDeploymentAnsweredFeatureFlagKey(key: string): boolean {
   return (DEPLOYMENT_ANSWERED_FEATURE_FLAG_KEYS as readonly string[]).includes(key);
 }
 /**
+ * Settled Artifacts (#334): anyone who can comment on an Artifact may mark it
+ * Settled (done, no longer a draft under discussion) and take that back; a
+ * new version takes it back to Working, and a push to a settled one is held
+ * once. Evaluated on the Artifact's own server. Server-scoped, default off,
+ * no rules (migration artifact_settled). While off: no settle routes (404
+ * SETTLED_NOT_AVAILABLE), no settled state in any answer, no push hold.
+ */
+export const ARTIFACT_SETTLED_FEATURE_FLAG_KEY = "artifact_settled_v0";
+/**
  * Interactive link cards (RFC 076 §9). Retired on the server
  * (#raft-architecture:#32): the batched read always sends version 2 to a
  * card.v2 client whose App declared it, and prepare and execute are never
@@ -110,6 +118,17 @@ export function isDeploymentAnsweredFeatureFlagKey(key: string): boolean {
  * the GET; its Feature Flag Admin row stays on until the web stops reading it.
  */
 export const INTERACTIVE_LINK_CARDS_FEATURE_FLAG_KEY = "interactive_link_cards";
+/**
+ * Link cards that update themselves (services/linkCardChangedHints.ts;
+ * docs/development/app-link-previews.md, "Telling Raft a card changed").
+ * Server-randomized, default off, not seeded: a missing flag or any evaluation
+ * failure reads as off. Evaluated on the reader's Server, when a read records
+ * its reader and again when a nudge would go to them: while off there, no
+ * reader is recorded and no `link_card.changed` is sent there. The App's
+ * `POST /api/oauth/link-preview/changed` is not gated (an App has no one
+ * Server): it answers as usual and its changes reach only Servers with it on.
+ */
+export const LINK_CARD_CHANGED_HINTS_FEATURE_FLAG_KEY = "link_card_changed_hints";
 /**
  * Adding Pro seats in place (task #10, #proj-commercial). Server-scoped,
  * default off; a missing flag or an evaluation failure reads as off. On: when
@@ -201,36 +220,27 @@ export const TASK_V2_CONVERSATIONS_FEATURE_FLAG_KEY = "task_v2_conversations_v0"
  */
 export const CONTINUATIONS_PILOT_FEATURE_FLAG_KEY = "continuations_pilot_v0";
 /**
- * Runtimes the continuation pilot leaves on the draft flow, wherever the flag
- * is on. Codex gets a command's exit code and output as one tool result and
- * reads the pause's exit 10 as a failure: on the pilot's first day it mostly
- * sent the message again (a new pause each time), and an unanswered pause
- * keeps neither a sent message nor a draft (#wg-ax:#5). The Server reports
- * the pilot off for them, which also covers a CLI from before its own check.
+ * The only runtimes the continuation pilot reaches, wherever the flag is on;
+ * every other runtime keeps the draft flow. An unanswered pause keeps neither
+ * a sent message nor a draft, and in the pilot's first week (#wg-ax:#5) only
+ * Claude answered reliably (95% answered, median 6 s). Codex read the pause's
+ * exit 10 as a failure and sent again (74% unanswered); builtin, kimi-sdk and
+ * antigravity left 43-71% unanswered. The Server reports the pilot off for
+ * the rest, which also covers a CLI from before its own check.
  */
-export const CONTINUATIONS_DRAFT_FLOW_RUNTIMES: ReadonlySet<string> = new Set(["codex"]);
+export const CONTINUATIONS_PILOT_RUNTIMES: ReadonlySet<string> = new Set(["claude"]);
 /**
- * Agent read progress: in a channel, DM or thread, the web shows each agent's
- * avatar on the last message it has read and moves it live as the agent
- * reads (agentReadProgress.ts). Server-scoped, default off, no rules; a
- * missing flag or an evaluation failure reads as off. While off a
- * `read_progress:watch` is refused and no `read_progress:updated` is sent.
- * The initial positions come from the channel detail's `peerReadStates`
- * (read receipts, always on).
+ * The continuation answer tool (#wg-ax:#5; owner Sage): the daemon adds a
+ * local `answer_continuation` tool to a launch's managed MCP server, which
+ * runs the agent's own `raft __continue <id> [choice]` (what `cont` runs) and
+ * returns its output, and the CLI's pause text names the tool. Only for a
+ * runtime in CONTINUATIONS_PILOT_RUNTIMES. Server-scoped, default off, no
+ * rules; a missing flag or an evaluation failure reads as off. The Server
+ * sends it on `agent:start` (`AgentConfig.continuationTool`) and the daemon
+ * decides at each launch, so a change reaches an agent at its next start.
+ * Off: no tool, no env var, `cont` alone, as before.
  */
-export const AGENT_READ_PROGRESS_FEATURE_FLAG_KEY = "agent_read_progress_v0";
-/**
- * Forum-style channels (#proj-chat:#24): a channel admin can set a regular
- * channel (public or private; not joint, DM, thread or task) to order its
- * top-level messages by latest activity, the message's own time or its latest
- * thread reply, newest at the bottom next to the composer, the same for every
- * member (`channels.thread_sort = 'activity'`). Server-scoped, default off, no
- * rules; a missing flag or an evaluation failure reads as off. Off: PATCH
- * `/channels/:id` refuses `threadSort` with 404, the activity page returns
- * 404, and the web shows every channel in post order whatever its stored
- * setting.
- */
-export const CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY = "channel_thread_sort_v0";
+export const CONTINUATION_TOOL_FEATURE_FLAG_KEY = "continuation_tool_v0";
 /**
  * RFC 081 inbox items (#wg-ax:#17): `GET /inbox/conversations?items=true`
  * lists app items, app fallback items and reminder items beside
@@ -243,6 +253,33 @@ export const CHANNEL_THREAD_SORT_FEATURE_FLAG_KEY = "channel_thread_sort_v0";
  * the flag's.
  */
 export const AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY = "agent_inbox_items_v0";
+/**
+ * The wake-up notice with the Server's unread numbers (#wg-ax:#42): before it
+ * prints a notice, the agent's Computer asks the Server for the `inbox check`
+ * rows of the conversations it is about to list (`POST /inbox/rows`) and
+ * prints those, so the notice and `inbox check` count from one source.
+ * Server-scoped, default off, no rules; a missing flag or an evaluation
+ * failure reads as off. The Server sends it on `agent:start` and
+ * `server:features` (`AgentConfig.inboxNoticeServerRows`); the Computer reads
+ * it at each notice, and asks only beside `inboxItems` and of a Server that
+ * advertises SERVER_CAPABILITY_INBOX_ROWS_V1. Off: no request, and the notice
+ * is the one printed today, byte for byte.
+ */
+export const INBOX_NOTICE_SERVER_ROWS_FEATURE_FLAG_KEY = "inbox_notice_server_rows_v0";
+/**
+ * Focus (part 1 of the feature): an agent marks up to AGENT_FOCUS_LIMIT
+ * conversations (a thread, a DM or a task conversation) as focused with
+ * `POST /focus`, `POST /unfocus` and `GET /focus` (`raft focus`,
+ * `raft unfocus`). Server-scoped, default off, no rules; a missing flag or an
+ * evaluation failure reads as off. Off: the three routes answer 404
+ * `AGENT_FOCUS_DISABLED`. On, the server also tags deliveries of a focused
+ * conversation (`AgentMessage.focused`) and sends `AgentConfig.agentFocus`,
+ * both only to a Computer that advertised DAEMON_CAPABILITY_AGENT_FOCUS_V1.
+ * No Computer advertises it yet: full text and read state for a focused
+ * conversation come with the daemon half, so the key is a default-on
+ * exception (featureFlagDefaultPolicy.ts).
+ */
+export const AGENT_FOCUS_FEATURE_FLAG_KEY = "agent_focus_v0";
 /**
  * Reaction notices for agents (#wg-ax:#26): an agent is told when someone else
  * reacts to a message it sent, as one inbox item per message
@@ -315,8 +352,51 @@ export const HUMAN_AVATAR_BUILDER_FEATURE_FLAG_KEY = "human_avatar_builder_v0";
  * limit-reset routes refuse Claude (404 `claude_limit_reset_disabled`).
  * Codex limit resets are not gated by it. On, it still needs a Computer
  * advertising DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET_CLAUDE_KINDS.
+ * `_v2`: the first key, `claude_limit_reset`, was turned off and retired before
+ * the real-account check (artin, #proj-raft-computer:4e327d5c), so a leftover
+ * "on" for it never brings the feature back; nothing reads it any more.
  */
-export const CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY = "claude_limit_reset";
+export const CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY = "claude_limit_reset_v2";
+/**
+ * Upgrade a runtime's command-line tool on a Computer from the web
+ * (docs/contracts/runtime-auth.md §6d): an Upgrade button on the runtime's
+ * card on the Computer page for each runtime the Computer reports it can
+ * upgrade, on the agent form's `runtime_outdated` model-source line, and on
+ * the runtime picker's too-old notice. Server-scoped, default off, no rules;
+ * missing = off, and an evaluation failure reads as off. Off: the
+ * runtime-auth read carries no `runtimeUpgrade` (no button) and
+ * POST …/runtimes/:runtime/upgrade answers 404 `runtime_upgrade_disabled`.
+ * On, it still needs a person who may sign the Computer's runtimes in and a
+ * Computer advertising DAEMON_CAPABILITY_RUNTIME_UPGRADE. Raft never upgrades
+ * a runtime on its own.
+ */
+export const RUNTIME_UPGRADE_FEATURE_FLAG_KEY = "runtime_upgrade_button";
+/**
+ * Install a runtime that is not on a Computer from the web
+ * (docs/contracts/runtime-auth.md §6e): an Install action on the Computer
+ * page's "not installed" runtime chip for each runtime the Computer reports
+ * it can install. Server-scoped, default off, no rules; missing = off, and an
+ * evaluation failure reads as off. Off: the runtime-auth read carries no
+ * `runtimeInstall` (no action) and POST …/runtimes/:runtime/install-plan and
+ * …/install answer 404 `runtime_install_disabled`. On, it still needs a
+ * person who may sign the Computer's runtimes in (the same people as
+ * Upgrade) and a Computer advertising DAEMON_CAPABILITY_RUNTIME_INSTALL.
+ * Raft never installs a runtime on its own.
+ */
+export const RUNTIME_INSTALL_FEATURE_FLAG_KEY = "runtime_install_button";
+/**
+ * "On this computer" checks (docs/contracts/computer-checks.md): which
+ * developer tools a Computer has and who is signed in to them locally, read
+ * by checks shipped with the Computer. Server-scoped, default off, no rules;
+ * missing = off, and an evaluation failure reads as off. Off: the server
+ * sends no `computer:checks:config` / `computer:checks:refresh` and
+ * GET/POST …/computer-checks answer 404 `computer_checks_disabled`. On, every
+ * check is enabled for the server (per-check switches per server need a
+ * settings home and come later), and it still needs a viewer who may see the
+ * Computer's runtime accounts and a Computer advertising
+ * DAEMON_CAPABILITY_COMPUTER_CHECKS.
+ */
+export const COMPUTER_CHECKS_FEATURE_FLAG_KEY = "computer_checks_v0";
 /**
  * The account notification switch "Replies in threads I follow"
  * (`followedThreadReplies`, docs/contracts/notifications.md §1.2, §2.1), not
@@ -345,3 +425,11 @@ export const NOTIFICATION_FOLLOWED_THREAD_REPLIES_SWITCH_FEATURE_FLAG_KEY = "not
  * setup survey, as before.
  */
 export const REFERRAL_SOURCE_PROMPT_FEATURE_FLAG_KEY = "referral_source_prompt_v0";
+/**
+ * Quote Reply v0 (#proj-chat:#34): same-conversation clickable/jumpable quote
+ * replies stored inline as Markdown blockquotes ending in `> msg=<8-char-id>`.
+ * Server-scoped, default off in production (auto-on in staging via
+ * FEATURE_FLAGS_DEFAULT_ON=true). While off, the server omits `resolvedQuotes`
+ * and web text-selection Quote keeps its legacy plain `> ...` insertion.
+ */
+export const QUOTE_REPLY_FEATURE_FLAG_KEY = "quote_reply_v0";

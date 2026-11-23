@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 
 import {
+  computerInstallChannel,
   computerInstallCommand,
   COMPUTER_CDN_BASE_PROD,
   DEFAULT_COMPUTER_SERVER_URL,
@@ -377,4 +378,11 @@ test("staging isolated installs use the production entry script on the alpha cha
       assert.doesNotMatch(command, /cdn-staging|computer\/staging/);
     }
   }
+});
+
+test("the install channel Add Computer's pairing names is the channel its one-paste command installs from", () => {
+  assert.equal(computerInstallChannel("staging"), "alpha");
+  for (const env of ["production", "slockdev", undefined]) assert.equal(computerInstallChannel(env), "main");
+  const prod = getComputerCommands("acme", "production", undefined, { pairingId: "x" })!.installAndSetup!;
+  assert.ok(prod.includes("--pair=x") && !prod.includes("--channel"));
 });

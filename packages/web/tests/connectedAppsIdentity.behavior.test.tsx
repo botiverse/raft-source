@@ -4,12 +4,15 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 // SettingsPanel → ConnectedApps mounts the react-intl-migrated ConfirmDialog
 // (client-secret regen confirm), which needs an <IntlProvider> ancestor.
+import { openOwnAppEditor, yoursCard } from "./helpers/appsYours";
 import { TestIntlProvider, renderWithIntl } from "./helpers/intl";
 import { chooseRegisterAppMenuItem } from "./helpers/registerAppMenu";
 import { OAUTH_CLIENT_CATEGORIES } from "@botiverse/raft-shared";
 import api from "../src/api/client";
 import RequestedScopeConsent from "../src/components/oauth/RequestedScopeConsent";
 import { SettingsPanel } from "../src/components/settings/SettingsPanel";
+import { McpAppEditor } from "../src/components/settings/mcpApps/McpAppEditor";
+import type { McpAppView } from "../src/components/settings/mcpApps/mcpAppApi";
 import { CONNECTED_APP_CATEGORY_LABEL_ID, matchesConnectedAppFilter } from "../src/features/apps/connected-apps/connectedAppCatalog";
 import {
   toggleAppNotificationEvent,
@@ -106,7 +109,6 @@ afterEach(() => {
   api.patch = originalApiPatch;
   api.delete = originalApiDelete;
   window.open = originalOpen;
-  window.localStorage.removeItem("raft:connected-apps:view-mode");
   window.history.pushState({}, "", "/");
   resetStores();
 });
@@ -589,41 +591,75 @@ test("Connected Apps loads registered surfaces without depending on the retired 
     </TestIntlProvider>,
   );
 
-  // Installed is the tab the page opens on, in the grid view by default; the
-  // switch at the toolbar's end turns every tab into a list, remembered.
-  const installedTab = await screen.findByTestId("connected-apps-installed-tab");
+  // Yours is the scope the page opens on, as cards.
+  const yoursTab = await screen.findByTestId("connected-apps-yours-tab");
   assert.ok(screen.queryByTestId("connected-apps-built-in-band") === null);
   assert.equal(getCalls.includes("/integrations/built-in"), false);
-  const viewToggle = screen.getByTestId("connected-apps-view-toggle");
-  const gridViewButton = within(viewToggle).getByRole("radio", { name: "Grid view" });
-  const listViewButton = within(viewToggle).getByRole("radio", { name: "List view" });
-  assert.equal(gridViewButton.getAttribute("aria-checked"), "true");
-  assert.ok(await within(installedTab).findByText("Marketplace Notes"));
-  assert.equal(within(installedTab).getByTestId("connected-apps-installed-collection").getAttribute("data-view"), "grid");
-  assert.ok(within(installedTab).queryByText("Reviewed shared notes.") === null, "a grid card has no description");
-  fireEvent.click(listViewButton);
-  assert.equal(listViewButton.getAttribute("aria-checked"), "true");
-  assert.equal(window.localStorage.getItem("raft:connected-apps:view-mode"), "list");
-  assert.equal(within(installedTab).getByTestId("connected-apps-installed-collection").getAttribute("data-view"), "list");
-  assert.ok(within(installedTab).queryByText("Experimental") === null);
-  assert.ok(within(installedTab).getByText("Reviewed shared notes."), "a row shows its description");
-  assert.ok(within(installedTab).getByText("Private Reports"));
-  assert.equal(within(installedTab).getAllByText("Published Reports").length, 1);
-  // Apps v4 D3: an App built here and not installed here is under Developer only.
-  assert.ok(within(installedTab).queryByText("Reviewing Reports") === null, "the uninstalled own App is not in Installed");
-  assert.equal(within(installedTab).getAllByRole("button", { name: "Edit" }).length, 2);
-  assert.equal(within(installedTab).getAllByRole("button", { name: "Uninstall" }).length, 1);
-  fireEvent.click(within(installedTab).getByRole("button", { name: "Uninstall" }));
-  const uninstallDialog = await screen.findByRole("dialog");
-  assert.ok(uninstallDialog.textContent?.includes(enMessages["settings.connectedApps.uninstallOfficialOptOut"]));
-  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-  assert.ok(within(installedTab).getAllByText("This server").length >= 1);
-  assert.ok(within(installedTab).getByText("Infrastructure"));
+  assert.ok(await within(yoursTab).findByText("Marketplace Notes"));
+  const collection = within(yoursTab).getByTestId("connected-apps-yours-collection");
+  // Every App this Server has, once each: what is installed here (today's
+  // Installed list), then the Apps built here that aren't (the rest of
+  // Developer). Two scopes, each with its count.
+  assert.deepEqual(
+    Array.from(collection.children).map((card) => card.getAttribute("data-testid")),
+    ["market-client", "private-client", "published-client", "pending-client", "offline-client"].map((id) => `connected-app-item-${id}`),
+  );
+  assert.deepEqual(
+    within(screen.getByTestId("connected-apps-tabs")).getAllByRole("radio").map((segment) => segment.textContent),
+    ["Yours5", "Discover"],
+  );
+  // A card: the description, where it came from, no Edit or Uninstall, no
+  // address and no App type.
+  assert.ok(within(yoursTab).getByText("Reviewed shared notes."));
+  assert.ok(within(collection).getByText("By Notes Workspace · 100+ servers"));
+  assert.ok(within(collection).queryByRole("button", { name: "Edit" }) === null);
+  assert.ok(within(collection).queryByRole("button", { name: "Uninstall" }) === null);
+  assert.ok(within(collection).queryByRole("link") === null);
+  assert.ok(!/MCP|Raft App/u.test(collection.textContent ?? ""), collection.textContent ?? "");
+  // The card opens what the App's row opened. An App that offered nothing
+  // (awaiting offline review: no Edit) is a card that opens nothing.
+  assert.ok(yoursCard(yoursTab, "Marketplace Notes"));
+  assert.ok(within(collection).queryByRole("button", { name: "Offline Reports" }) === null);
 
-  // The toolbar: search, then Type and Category; Sort orders only the Marketplace.
+  // Uninstall left the card: it is in the installed detail the card opens,
+  // beside the App's homepage.
+  fireEvent.click(yoursCard(yoursTab, "Marketplace Notes"));
+  const installedDetail = (await screen.findByTestId("connected-app-installed-uninstall")).closest('[role="dialog"]') as HTMLElement;
+  assert.equal(within(installedDetail).getByRole("link").getAttribute("href"), "https://notes.example.com/app");
+  assert.ok(within(installedDetail).queryByTestId("connected-app-installed-edit") === null, "another Server's App has no editor");
+  fireEvent.click(within(installedDetail).getByRole("button", { name: "Uninstall from this server" }));
+  assert.ok(await screen.findByText("Uninstall Marketplace Notes?"));
+  assert.ok(document.body.textContent?.includes(enMessages["settings.connectedApps.uninstallOfficialOptOut"]));
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  fireEvent.click(screen.getByRole("button", { name: "Close installed app details" }));
+  await waitFor(() => assert.ok(screen.queryByTestId("connected-app-installed-uninstall") === null));
+
+  // Apps are cards only: no view switch, nothing that brings the old rows back.
+  assert.ok(screen.queryByTestId("connected-apps-view-toggle") === null);
+  assert.ok(screen.queryByRole("radio", { name: "List view" }) === null);
+
+  // Yours' toolbar: search and one filter, where the App came from, as a
+  // button that shows its value. No Type, no Category, no Sort.
   assert.ok(screen.getByTestId("connected-apps-search"));
-  assert.ok(screen.getByRole("combobox", { name: "All types" }));
+  const originFilter = screen.getByRole("combobox", { name: "Source: All" });
+  assert.equal(originFilter.textContent, "All");
+  assert.ok(screen.queryByTestId("apps-filter-type") === null);
+  assert.ok(screen.queryByTestId("connected-apps-category-filter") === null);
   assert.ok(screen.queryByTestId("apps-filter-sort") === null);
+  fireEvent.click(originFilter);
+  assert.deepEqual(
+    (await screen.findAllByRole("option")).map((option) => option.textContent),
+    ["All", "Internal", "Shared with you", "From marketplace"],
+  );
+  fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+
+  // Discover: the same cards, and one filter, its Category; no Type, no Sort.
+  fireEvent.click(screen.getByTestId("connected-apps-tab-discover"));
+  const marketplaceCollection = await screen.findByTestId("connected-apps-marketplace-collection");
+  assert.ok(within(marketplaceCollection).getByText("By Notes Workspace · 100+ servers"));
+  assert.ok(screen.queryByTestId("apps-filter-sort") === null);
+  assert.ok(screen.queryByTestId("apps-filter-type") === null);
+  assert.ok(screen.queryByTestId("apps-filter-origin") === null);
   fireEvent.click(screen.getByRole("combobox", { name: "All categories" }));
   assert.ok(await screen.findByRole("option", { name: "All categories" }));
   for (const category of OAUTH_CLIENT_CATEGORIES) {
@@ -632,30 +668,9 @@ test("Connected Apps loads registered surfaces without depending on the retired 
   }
   fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
 
-  fireEvent.click(screen.getByTestId("connected-apps-tab-marketplace"));
-  const marketplaceCollection = await screen.findByTestId("connected-apps-marketplace-collection");
-  assert.ok(within(marketplaceCollection).getByText("100+ installs"));
-  assert.ok(within(marketplaceCollection).getByText("New"));
-  assert.ok(within(marketplaceCollection).getByText("Reviewed shared notes."));
-  assert.ok(screen.getByTestId("apps-filter-sort"), "the Marketplace has a Sort");
-
-  fireEvent.click(screen.getByTestId("connected-apps-tab-my-apps"));
-  const myAppsTab = await screen.findByTestId("connected-apps-my-apps-tab");
-  assert.ok(within(myAppsTab).getByText("Private Reports"));
-  assert.ok(within(myAppsTab).getByText("Infrastructure"));
-  assert.ok(within(myAppsTab).getByText("Shared private reporting workflows."));
-  assert.ok(within(myAppsTab).getByText("Reviewing Reports"));
-  assert.ok(within(myAppsTab).getByText("Source-owned app waiting on marketplace review."));
-  assert.ok(within(myAppsTab).getByText("Published Reports"));
-  assert.ok(within(myAppsTab).getByText("Source-owned published marketplace listing."));
-  assert.ok(within(myAppsTab).getByText("Offline Reports"));
-  assert.ok(within(myAppsTab).getByText("Offline requested"));
-  assert.ok(within(myAppsTab).getByText("Private"));
-  assert.equal(within(myAppsTab).getAllByRole("button", { name: "Edit" }).length, 3);
-  assert.ok(within(myAppsTab).queryByRole("button", { name: "Delete" }) === null);
-  assert.ok(within(myAppsTab).queryByRole("button", { name: "Request Offline" }) === null);
-
-  fireEvent.click(within(myAppsTab).getAllByRole("button", { name: "Edit" })[0]);
+  // Edit left the card too: an App built and installed here opens its
+  // installed detail, whose Edit opens the editor.
+  await openOwnAppEditor("Private Reports");
   const editor = await screen.findByTestId("connected-app-editor");
   // An existing App's logo field is its picture and Upload: no hint line (HelperText step 1, as an MCP App's).
   assert.ok(!editor.textContent?.includes("Upload a square logo"), "no logo hint once the App exists");
@@ -730,8 +745,8 @@ test("Connected Apps loads registered surfaces without depending on the retired 
   assert.ok(screen.getByTestId("connected-app-editor"));
   fireEvent.click(within(editor).getByRole("button", { name: "Close app form" }));
 
-  fireEvent.click(screen.getByTestId("connected-apps-tab-marketplace"));
-  fireEvent.click(await screen.findByText("Marketplace Notes"));
+  fireEvent.click(screen.getByTestId("connected-apps-tab-discover"));
+  fireEvent.click(await screen.findByRole("button", { name: "Marketplace Notes" }));
   const privateDetail = await screen.findByText("Requestable (declared)");
   const privateModal = privateDetail.closest('[role="dialog"]');
   assert.ok(privateModal, "marketplace app detail should open in a modal card");
@@ -760,14 +775,11 @@ test("Connected Apps loads registered surfaces without depending on the retired 
 
   const search = screen.getByRole("searchbox", { name: "Search connected apps" });
   fireEvent.change(search, { target: { value: "Private Reports" } });
-  fireEvent.click(screen.getByTestId("connected-apps-tab-installed"));
-  const filteredInstalledTab = await screen.findByTestId("connected-apps-installed-tab");
-  assert.ok(within(filteredInstalledTab).getByText("Private Reports"));
-  assert.ok(within(filteredInstalledTab).queryByText("Marketplace Notes") === null);
-  fireEvent.click(screen.getByTestId("connected-apps-tab-my-apps"));
-  const filteredMyAppsTab = await screen.findByTestId("connected-apps-my-apps-tab");
-  assert.ok(within(filteredMyAppsTab).getByText("Private Reports"));
-  assert.ok(within(filteredMyAppsTab).queryByText("Published Reports") === null);
+  fireEvent.click(screen.getByTestId("connected-apps-tab-yours"));
+  const filteredYoursTab = await screen.findByTestId("connected-apps-yours-tab");
+  assert.ok(within(filteredYoursTab).getByText("Private Reports"));
+  assert.ok(within(filteredYoursTab).queryByText("Marketplace Notes") === null);
+  assert.ok(within(filteredYoursTab).queryByText("Published Reports") === null);
 });
 
 test("Connected Apps detail modal renders cataloged zh-cn headings and App Notifications authority copy", async () => {
@@ -832,14 +844,14 @@ test("Connected Apps detail modal renders cataloged zh-cn headings and App Notif
     </TestIntlProvider>,
   );
 
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-marketplace"));
-  fireEvent.click(await screen.findByText("Approved Notes"));
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-discover"));
+  fireEvent.click(await screen.findByRole("button", { name: "Approved Notes" }));
   const approvedModal = (await screen.findByText("可请求（已声明）")).closest('[role="dialog"]') as HTMLElement;
   assert.ok(approvedModal, "approved marketplace app detail should open in a modal card");
   assert.ok(within(approvedModal).queryByText("Permissions this app receives when installed.") === null);
   fireEvent.click(within(approvedModal).getByRole("button", { name: "关闭应用详情" }));
 
-  fireEvent.click(await screen.findByText("Pending Notes"));
+  fireEvent.click(await screen.findByRole("button", { name: "Pending Notes" }));
   const pendingModal = (await screen.findByText("新增的应用权限正在等待审核，原有已批准的访问保持可用。")).closest('[role="dialog"]') as HTMLElement;
   assert.ok(pendingModal, "pending marketplace app detail should open in a modal card");
 });
@@ -925,46 +937,35 @@ test("Connected Apps gives members the full read surface without management acti
 
   // A member reads the same page: the note says who can change it.
   assert.ok(await screen.findByTestId("apps-admin-only-note"));
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-marketplace"));
-  await screen.findByText("Marketplace Notes");
-  const marketplaceTab = screen.getByTestId("connected-apps-marketplace-tab");
-  assert.deepEqual(new Set(getCalls), new Set([
+  // A member has no Discover (R15): Yours alone, with no scope to switch, and no listings read.
+  await screen.findByText("Server Reports");
+  assert.ok(screen.queryByTestId("connected-apps-tab-discover") === null);
+  assert.ok(screen.queryByTestId("connected-apps-tabs") === null);
+  assert.ok(screen.queryByTestId("connected-apps-marketplace-tab") === null);
+  await waitFor(() => assert.deepEqual(new Set(getCalls), new Set([
     "/integrations/clients",
     "/integrations/link-preview-consents",
     "/integrations/marketplace",
-    "/integrations/marketplace/listings",
     "/integrations/overview",
     "/mcp/apps",
-  ]));
-  assert.ok(within(marketplaceTab).queryByText("Raft Survey") === null);
-  assert.ok(within(marketplaceTab).queryByTestId("connected-apps-built-in-band") === null);
-  assert.ok(within(marketplaceTab).getByText("Marketplace Notes"));
-  assert.ok(within(marketplaceTab).getByText("Available"));
+  ])));
+  assert.ok(screen.queryByTestId("connected-apps-built-in-band") === null);
+
+  // Yours, read-only: the same cards, no Add, and nothing that changes an App.
+  const yoursTab = await screen.findByTestId("connected-apps-yours-tab");
+  assert.ok(within(yoursTab).getByText("Server Reports"));
   assert.ok(screen.queryByRole("button", { name: "Add app" }) === null);
-  assert.ok(within(marketplaceTab).queryByText("Install", { exact: true }) === null);
-
-  fireEvent.click(within(marketplaceTab).getByText("Marketplace Notes"));
-  const detail = (await screen.findByText("Profile")).closest('[role="dialog"]');
-  assert.ok(detail);
-  assert.ok(within(detail as HTMLElement).getByText("Login with Raft"));
-  assert.ok(within(detail as HTMLElement).getByText("Distribution"));
-  assert.ok(within(detail as HTMLElement).getByRole("button", { name: "Close" }));
-  assert.ok(within(detail as HTMLElement).queryByRole("button", { name: "Install to this server" }) === null);
-
-  fireEvent.click(within(detail as HTMLElement).getByRole("button", { name: "Close" }));
-  fireEvent.click(screen.getByTestId("connected-apps-tab-installed"));
-  const installedTab = await screen.findByTestId("connected-apps-installed-tab");
-  assert.ok(within(installedTab).getByText("Server Reports"));
-  assert.ok(within(installedTab).queryByRole("button", { name: "Edit" }) === null);
-  assert.ok(within(installedTab).queryByRole("button", { name: "Uninstall" }) === null);
-
-  fireEvent.click(screen.getByTestId("connected-apps-tab-my-apps"));
-  const myAppsTab = await screen.findByTestId("connected-apps-my-apps-tab");
-  assert.ok(within(myAppsTab).getByText("Server Reports"));
-  assert.ok(within(myAppsTab).getByText("Raft Apps this server builds. Only server owners and admins can change them."));
-  assert.ok(within(myAppsTab).queryByRole("button", { name: "Edit" }) === null);
-  assert.ok(within(myAppsTab).queryByRole("button", { name: "Request Offline" }) === null);
-  assert.ok(within(myAppsTab).queryByRole("button", { name: "Delete" }) === null);
+  assert.ok(screen.queryByTestId("register-app-menu-trigger") === null);
+  assert.ok(within(yoursTab).queryByTestId("app-card-action") === null);
+  for (const name of ["Edit", "Uninstall", "Request Offline", "Delete"]) {
+    assert.ok(within(yoursTab).queryByRole("button", { name }) === null, name);
+  }
+  // A member reads an installed App's detail, as before; it offers no Edit and no Uninstall.
+  fireEvent.click(yoursCard(yoursTab, "Server Reports"));
+  await screen.findByText("Login with Raft access");
+  assert.ok(screen.queryByTestId("connected-app-installed-edit") === null);
+  assert.ok(screen.queryByTestId("connected-app-installed-uninstall") === null);
+  assert.ok(screen.queryByTestId("connected-app-editor") === null);
 });
 
 test("Connected Apps edit drawer regenerates a client secret and reveals it once", async () => {
@@ -1027,9 +1028,7 @@ test("Connected Apps edit drawer regenerates a client secret and reveals it once
     </TestIntlProvider>,
   );
 
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-my-apps"));
-  const myAppsTab = await screen.findByTestId("connected-apps-my-apps-tab");
-  fireEvent.click(within(myAppsTab).getByRole("button", { name: "Edit" }));
+  await openOwnAppEditor();
 
   const regenerateButton = await screen.findByTestId("connected-app-regenerate-secret-button");
   assert.equal(regenerateButton.textContent, "Regenerate client secret");
@@ -1186,16 +1185,15 @@ test("Connected Apps renders reviewed App Notifications state for developers and
     </TestIntlProvider>,
   );
 
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-marketplace"));
-  fireEvent.click(await screen.findByRole("button", { name: /Installed Alerts/ }));
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-discover"));
+  fireEvent.click(await screen.findByRole("button", { name: "Installed Alerts" }));
   const installSummary = await screen.findByTestId("app-notifications-request-summary");
   assert.ok(within(installSummary).getByText("Server · read"));
   assert.ok(within(installSummary).getByText("Plan status changed"));
   assert.ok(within(installSummary).queryByRole("checkbox") === null);
   fireEvent.click(screen.getByRole("button", { name: "Close app detail" }));
 
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-my-apps"));
-  fireEvent.click(within(await screen.findByTestId("connected-apps-my-apps-tab")).getByRole("button", { name: "Edit" }));
+  await openOwnAppEditor("Developer Alerts");
   const editor = await screen.findByTestId("connected-app-editor");
   const notificationsSection = within(editor).getByTestId("connected-app-editor-section-notifications");
   // The Webhook section's status tag (beside its heading).
@@ -1259,18 +1257,19 @@ test("Connected Apps renders reviewed App Notifications state for developers and
   assert.ok(within(notificationsSection).getByText("Off", { exact: true }));
   fireEvent.click(screen.getByRole("button", { name: "Close app form" }));
 
-  fireEvent.click(screen.getByTestId("connected-apps-tab-installed"));
-  const installedTab = await screen.findByTestId("connected-apps-installed-tab");
+  fireEvent.click(screen.getByTestId("connected-apps-tab-yours"));
+  const installedTab = await screen.findByTestId("connected-apps-yours-tab");
   assert.ok(within(installedTab).queryByRole("button", { name: /App notifications/ }) === null);
-  const installedDetailsTrigger = within(installedTab).getByRole("button", { name: "Installed Alerts" });
-  assert.equal(installedDetailsTrigger.getAttribute("tabindex"), "0");
+  // The card is a real button named after the App (Enter and Space are the browser's).
+  const installedDetailsTrigger = yoursCard(installedTab, "Installed Alerts");
+  assert.equal(installedDetailsTrigger.tagName, "BUTTON");
   installedDetailsTrigger.focus();
   assert.ok(document.activeElement === installedDetailsTrigger);
-  fireEvent.keyDown(installedDetailsTrigger, { key: "Enter" });
+  fireEvent.click(installedDetailsTrigger);
   let installedPanel = await screen.findByTestId("installed-app-notifications");
   assert.ok(within(installedPanel).getByText("Approved data"));
   fireEvent.click(screen.getByRole("button", { name: "Close installed app details" }));
-  fireEvent.keyDown(installedDetailsTrigger, { key: " " });
+  fireEvent.click(installedDetailsTrigger);
   installedPanel = await screen.findByTestId("installed-app-notifications");
   assert.ok(within(installedPanel).getByText("Approved data"));
   assert.ok(within(installedPanel).getByText("Developer subscriptions"));
@@ -1297,10 +1296,10 @@ test("Connected Apps renders reviewed App Notifications state for developers and
   assert.ok(approvalSet.querySelector('[data-app-permission-kind="scope"][data-app-permission-value="profile"]') !== null);
   fireEvent.click(within(installedPanel).getByRole("button", { name: "Approve update" }));
   await waitFor(() => assert.ok(within(installedPanel).queryByRole("button", { name: "Approve update" }) === null));
-  fireEvent.click(screen.getByRole("button", { name: "Close installed app details" }));
-  fireEvent.click(within(installedTab).getByRole("button", { name: "Uninstall" }));
+  // Uninstall is in the same detail (the card has no Uninstall button).
+  assert.ok(within(installedTab).queryByRole("button", { name: "Uninstall", hidden: true }) === null);
+  fireEvent.click(screen.getByTestId("connected-app-installed-uninstall"));
   assert.ok(await screen.findByText("Uninstall Installed Alerts?"));
-  assert.ok(screen.queryByTestId("installed-app-notifications") === null);
 });
 
 test("Connected Apps saves category and declared scopes before requesting marketplace review", async () => {
@@ -1355,8 +1354,7 @@ test("Connected Apps saves category and declared scopes before requesting market
     </TestIntlProvider>,
   );
 
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-my-apps"));
-  fireEvent.click(within(await screen.findByTestId("connected-apps-my-apps-tab")).getByRole("button", { name: "Edit" }));
+  await openOwnAppEditor();
   assert.ok(screen.queryByText("Declared data access") === null);
   assert.ok(screen.queryByText("Legacy free-text that must not be rendered or resubmitted.") === null);
   assert.ok(screen.getByText("Category and data access come from the app metadata and declared scopes above. Requesting review saves those changes first."));
@@ -1418,8 +1416,7 @@ test("Connected Apps withdraws a publish request still waiting for review, keepi
     </TestIntlProvider>,
   );
 
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-my-apps"));
-  fireEvent.click(within(await screen.findByTestId("connected-apps-my-apps-tab")).getByRole("button", { name: "Edit" }));
+  await openOwnAppEditor();
   const card = await screen.findByTestId("connected-app-withdraw-publish-card");
   assert.ok(within(card).getByText("Withdrawing returns the app to private. Its registration, credentials and installations stay, and you can request review again later."));
 
@@ -1427,6 +1424,131 @@ test("Connected Apps withdraws a publish request still waiting for review, keepi
   await waitFor(() => assert.deepEqual(postCalls, ["/integrations/clients/pending-client/withdraw-publish"]));
   await waitFor(() => assert.ok(screen.queryByTestId("connected-app-withdraw-publish-card") === null));
   assert.ok(screen.getByRole("button", { name: "Request publish" }), "the app can request review again");
+});
+
+test("Connected Apps editor: an owner switches the server vouch at once; a failure leaves it as it was", async () => {
+  resetStores();
+  const client = {
+    id: "local-client",
+    clientId: "local-client",
+    appType: "server_local",
+    name: "Local Tool",
+    description: "Built on this server.",
+    homepageUrl: "https://local.example.com",
+    returnUrl: "https://local.example.com/callback",
+    logoUrl: null,
+    publishStatus: "private",
+    category: "Infrastructure",
+    dataAccessSummary: null,
+    agentManifestUrl: null,
+    allowedScopes: ["openid", "profile"],
+    serverVouched: false,
+    serverVouchedAt: null,
+    createdAt: "2026-10-20T00:00:00.000Z",
+    updatedAt: "2026-10-20T00:00:00.000Z",
+  };
+  const putCalls: Array<{ url: string; body: unknown }> = [];
+  let failNext = false;
+  api.get = (async (url: string) => {
+    if (url === "/integrations/clients") return { data: [client] };
+    if (url === "/integrations/built-in") return { data: [] };
+    if (url === "/integrations/marketplace") return { data: [] };
+    if (url === "/integrations/overview") return { data: [] };
+    throw { response: { status: 404, data: { error: "not found" } } };
+  }) as typeof api.get;
+  api.post = (async (url: string) => {
+    if (url === "/feature-flags/evaluate") return { data: { evaluations: [] } };
+    throw { response: { status: 404, data: { error: "not found" } } };
+  }) as typeof api.post;
+  api.put = (async (url: string, body: { vouched: boolean }) => {
+    putCalls.push({ url, body });
+    if (failNext) throw { response: { status: 403, data: { error: "Only server owners and admins can vouch for an App." } } };
+    return { data: { ...client, serverVouched: body.vouched, serverVouchedAt: body.vouched ? "2026-11-16T00:00:00.000Z" : null } };
+  }) as unknown as typeof api.put;
+
+  render(
+    <TestIntlProvider>
+      <MemoryRouter>
+        <SettingsPanel tab="integrations" />
+      </MemoryRouter>
+    </TestIntlProvider>,
+  );
+
+  // Not installed here: its card opens the editor.
+  await openOwnAppEditor("Local Tool");
+  const row = await screen.findByTestId("connected-app-server-vouch");
+  assert.ok(within(row).getByText("All agents on this server can use it"));
+  const vouchSwitch = () => screen.getByTestId("connected-app-server-vouch-switch");
+  assert.equal(vouchSwitch().getAttribute("aria-checked"), "false");
+
+  fireEvent.click(vouchSwitch());
+  await waitFor(() => assert.equal(vouchSwitch().getAttribute("aria-checked"), "true"));
+  assert.deepEqual(putCalls, [{ url: "/integrations/clients/local-client/server-vouch", body: { vouched: true } }]);
+
+  failNext = true;
+  fireEvent.click(vouchSwitch());
+  await waitFor(() => assert.ok(screen.queryByText("Only server owners and admins can vouch for an App.") !== null, "the failure is shown"));
+  assert.equal(vouchSwitch().getAttribute("aria-checked"), "true", "still on");
+  assert.deepEqual(putCalls.at(-1), { url: "/integrations/clients/local-client/server-vouch", body: { vouched: false } });
+});
+
+test("MCP App editor: an owner switches the server vouch at once (the Raft App switch, on the MCP endpoint); a failure leaves it as it was", async () => {
+  resetStores();
+  const view: McpAppView = {
+    id: "mcp-app-1",
+    rootAppId: null,
+    kind: "mcp",
+    sections: ["profile", "mcp_server", "connections", "agents", "distribution", "danger"],
+    profile: { name: "Docs", description: null, homepageUrl: null, logoUrl: null, category: null, whenToUse: null },
+    source: { kind: "url", templateKey: null, maintainedByRaft: false },
+    server: {
+      endpointUrl: "https://docs.example.test/mcp", transport: "streamable_http", authKind: "none", requiredHeaderNames: [],
+      serverInfo: null, authProbe: null, health: { status: "reachable", checkedAt: null, error: null, latencyMs: null },
+      toolCount: 0, tools: [], enabled: true,
+    },
+    connections: [],
+    defaultConnectionId: null,
+    agentsSummary: { total: 2, usingDefault: 1, pinned: 0, noConnection: 0, off: 1, actionNeeded: 0 },
+    agentAccess: { allAgents: false, agentIds: ["agent-1"], exceptAgentIds: ["agent-2"] },
+    serverVouched: false,
+    serverVouchedAt: null,
+    distribution: { kind: "server_local", publishStatus: "private" },
+    viewer: { canManage: true },
+  };
+  const putCalls: Array<{ url: string; body: unknown }> = [];
+  let failNext = false;
+  api.get = (async (url: string) => {
+    if (url === "/mcp/apps/mcp-app-1") return { data: view };
+    throw { response: { status: 404, data: { error: "not found" } } };
+  }) as typeof api.get;
+  api.put = (async (url: string, body: { vouched: boolean }) => {
+    putCalls.push({ url, body });
+    if (failNext) throw { response: { status: 403, data: { error: "manageExternalAuth capability required" } } };
+    return { data: { ...view, serverVouched: body.vouched, serverVouchedAt: body.vouched ? "2026-11-16T00:00:00.000Z" : null } };
+  }) as unknown as typeof api.put;
+
+  render(
+    <TestIntlProvider>
+      <MemoryRouter>
+        <McpAppEditor appId="mcp-app-1" onBrowseMarketplace={() => {}} canManage onClose={() => {}} onChanged={() => {}} />
+      </MemoryRouter>
+    </TestIntlProvider>,
+  );
+
+  const row = await screen.findByTestId("connected-app-server-vouch");
+  assert.ok(within(row).getByText("All agents on this server can use it"));
+  const vouchSwitch = () => screen.getByTestId("connected-app-server-vouch-switch");
+  assert.equal(vouchSwitch().getAttribute("aria-checked"), "false");
+
+  fireEvent.click(vouchSwitch());
+  await waitFor(() => assert.equal(vouchSwitch().getAttribute("aria-checked"), "true"));
+  assert.deepEqual(putCalls, [{ url: "/mcp/apps/mcp-app-1/server-vouch", body: { vouched: true } }]);
+
+  failNext = true;
+  fireEvent.click(vouchSwitch());
+  await waitFor(() => assert.ok(screen.queryByText("manageExternalAuth capability required") !== null, "the failure is shown"));
+  assert.equal(vouchSwitch().getAttribute("aria-checked"), "true", "still on");
+  assert.deepEqual(putCalls.at(-1), { url: "/mcp/apps/mcp-app-1/server-vouch", body: { vouched: false } });
 });
 
 test("Connected Apps register form locks identity scopes and toggles agent messaging declarations", async () => {
@@ -1844,7 +1966,7 @@ test("Login with Raft shows a suspended installation as unavailable with its rea
   render(<TestIntlProvider><HumanLoginSetupPage /></TestIntlProvider>);
   assert.ok((await screen.findAllByText("Orbital Notes")).length >= 2);
   const ready = screen.getByTestId("login-server-status-server-1");
-  assert.equal(ready.hasAttribute("data-selected"), true, "the ready Server ranks first");
+  assert.equal(ready.hasAttribute("data-selected"), true, "a suspended installation is no choice: the one ready Server is picked");
   const suspended = screen.getByTestId("login-server-status-server-2");
   assert.ok(within(suspended).getByText("Suspended"));
   fireEvent.click(suspended);
@@ -1986,6 +2108,10 @@ test("public Marketplace setup always lists installed and uninstalled Servers to
   assert.ok(installed.hasAttribute("data-base-ui-tooltip-trigger"), "status hint now rides the RUI tooltip trigger");
   assert.ok(within(installed).queryByText("Installed") === null);
   assert.equal(installed.getAttribute("aria-label"), "Use this server: Launch Server");
+  // Several Servers and no server hint: none is picked until the person picks one.
+  assert.equal(installed.hasAttribute("data-selected"), false);
+  assert.match(screen.getByTestId("marketplace-login-commit-zone").textContent ?? "", /Choose a Raft Server where this app is available\./);
+  fireEvent.click(installed);
   // The picked server is the raft-ui ListRow selection (cyan-soft).
   assert.equal(installed.hasAttribute("data-selected"), true);
   assert.match(screen.getByTestId("marketplace-login-commit-zone").textContent ?? "", /Selected Launch Server\./);
@@ -2605,8 +2731,7 @@ test("editor mutations returning bare rows keep the bot grant state", async () =
     </TestIntlProvider>,
   );
 
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-my-apps"));
-  fireEvent.click(within(await screen.findByTestId("connected-apps-my-apps-tab")).getByRole("button", { name: "Edit" }));
+  await openOwnAppEditor();
 
   // The editor's bot hint reads the install-joined `bot`; a bare-row mutation
   // (withdraw publish) must not erase it.
@@ -2705,8 +2830,7 @@ test("Connected Apps editor toggles enableBot; the bot is added from the install
     </TestIntlProvider>,
   );
 
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-my-apps"));
-  fireEvent.click(within(await screen.findByTestId("connected-apps-my-apps-tab")).getByRole("button", { name: "Edit" }));
+  await openOwnAppEditor();
 
   // The Bot checkbox exists and starts unchecked; there is no hint yet.
   const botToggle = await screen.findByTestId("connected-app-enable-bot");
@@ -2724,7 +2848,7 @@ test("Connected Apps editor toggles enableBot; the bot is added from the install
 
   // Save closes the editor; reopened, the saved and checked box shows the hint,
   // and the editor has no Enable / Disable bot buttons any more.
-  fireEvent.click(within(await screen.findByTestId("connected-apps-my-apps-tab")).getByRole("button", { name: "Edit" }));
+  await openOwnAppEditor();
   const hint = await screen.findByTestId("connected-app-bot-editor-hint");
   assert.ok(screen.queryByRole("button", { name: /enable bot|disable bot/i }) === null);
   assert.ok(screen.queryByText("Bot enabled") === null);
@@ -2738,8 +2862,7 @@ test("Connected Apps editor toggles enableBot; the bot is added from the install
   fireEvent.click(screen.getByRole("button", { name: "Close" }));
 
   // Turning the capability off cascades on the server.
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-my-apps"));
-  fireEvent.click(within(await screen.findByTestId("connected-apps-my-apps-tab")).getByRole("button", { name: "Edit" }));
+  await openOwnAppEditor();
   const botToggleAgain = await screen.findByTestId("connected-app-enable-bot");
   fireEvent.click(botToggleAgain);
   await waitFor(() => assert.ok(screen.queryByTestId("connected-app-bot-editor-hint") === null, "unchecked: no hint"));
@@ -2801,14 +2924,18 @@ for (const locale of ["en", "zh-cn"] as const) {
     // (it used to switch to Installed, where the notice already is: nothing happened).
     fireEvent.click(within(notice).getByRole("button"));
     const permissionPanel = await screen.findByTestId("installed-app-notifications");
+    // The card says what waits, with Review as its step (the notice opened the same review).
     const item = await screen.findByTestId("connected-app-item-permission-update-app");
-    assert.ok(within(item).getByTestId("app-permission-approval-required"));
+    assert.equal(item.getAttribute("data-state"), "updateNeedsApproval");
+    assert.ok(within(item).getByTestId("app-card-status").textContent);
+    assert.ok(within(item).getByTestId("app-card-action"));
     assert.equal(probe.writes(), 0, "opening the pending-permission review must not grant anything");
     const banner = within(permissionPanel).getByTestId("app-notifications-approval-required");
     fireEvent.click(within(banner).getByRole("button", { name: locale === "en" ? "Approve update" : "批准更新" }));
     await waitFor(() => assert.ok(screen.queryByTestId("connected-apps-permission-updates") === null));
     assert.equal(probe.writes(), 1);
-    assert.ok(within(item).queryByTestId("app-permission-approval-required") === null, "successful approval refreshes the list immediately");
+    assert.ok(within(item).queryByTestId("app-card-status") === null, "successful approval refreshes the list immediately");
+    assert.ok(within(item).queryByTestId("app-card-action") === null);
   });
 }
 
@@ -2831,7 +2958,9 @@ test("failed permission approval keeps the installed notice; members get no appr
   fireEvent.click(within(await screen.findByTestId("connected-apps-permission-updates")).getByRole("button"));
   await screen.findByText("Login with Raft access");
   const item = await screen.findByTestId("connected-app-item-permission-update-app");
-  assert.equal(within(item).queryByRole("button", { name: "Review permissions" }) === null, true);
+  // A member's card has no state button (and no state: it is a manager's to handle).
+  assert.equal(within(item).queryByTestId("app-card-action") === null, true);
+  assert.equal(within(item).queryByRole("button", { name: /Review/u, hidden: true }) === null, true);
   assert.ok(screen.queryByTestId("installed-app-notifications") === null, "no App Notifications review for a member");
   assert.deepEqual(probe.reads().slice(readsBefore).filter((url) => url.includes("/app-notifications")), []);
   assert.ok(screen.queryByRole("button", { name: "Approve update" }) === null);
@@ -2908,7 +3037,7 @@ test("this Server's own non-public installed App opens its detail with the Revie
   render(<TestIntlProvider><MemoryRouter><SettingsPanel tab="integrations" /></MemoryRouter></TestIntlProvider>);
 
   // The server leaves them off the Marketplace's listings (the test helper does as it does).
-  fireEvent.click(await screen.findByTestId("connected-apps-tab-marketplace"));
+  fireEvent.click(await screen.findByTestId("connected-apps-tab-discover"));
   const marketplaceTab = await screen.findByTestId("connected-apps-marketplace-tab");
   await within(marketplaceTab).findByText("Public App");
   for (const hidden of ["Own Tool", "Own Unlisted", "Shared To Us"]) {
@@ -2917,11 +3046,13 @@ test("this Server's own non-public installed App opens its detail with the Revie
 
   fireEvent.click(within(await screen.findByTestId("connected-apps-permission-updates")).getByRole("button"));
   const item = await screen.findByTestId("connected-app-item-own-app");
-  assert.ok(within(item).getByTestId("app-permission-approval-required"));
+  assert.ok(within(item).getByTestId("app-card-status"));
   // The review opened the update's detail, a modal dialog: the list under it is hidden from assistive tech meanwhile.
-  assert.ok(within(item).getByRole("button", { name: "Edit", hidden: true }), "still edited from its row");
-  // Not installed here (server-local): under Developer only, not in Installed (Apps v4 D3).
-  assert.ok(screen.queryByTestId("connected-app-item-own-local") === null);
+  // The card has no Edit button; the detail of an App built here offers it.
+  assert.ok(within(item).queryByRole("button", { name: "Edit", hidden: true }) === null);
+  assert.ok(screen.getByTestId("connected-app-installed-edit"), "still edited, from its detail");
+  // Built here and not installed here (server-local): under Yours too, after the installed ones.
+  assert.ok(screen.getByTestId("connected-app-item-own-local"));
   assert.ok(within(await screen.findByTestId("connected-app-item-own-unlisted")).getByRole("button", { name: "Own Unlisted", hidden: true }));
 
   fireEvent.click(within(item).getByRole("button", { name: "Own Tool", hidden: true }));
@@ -2934,14 +3065,14 @@ test("this Server's own non-public installed App opens its detail with the Revie
     url: "/integrations/marketplace/own-app/install/app-notifications/grant",
     body: { expected_scopes: ["openid", "profile", "email"], expected_groups: [] },
   }]);
-  assert.ok(within(item).queryByTestId("app-permission-approval-required") === null);
+  assert.ok(within(item).queryByTestId("app-card-status") === null);
 });
 
 test("notification review link opens installed Apps without another tab selection", async () => {
   resetStores(); mockPendingInstalledPermissionUpdate();
   render(<TestIntlProvider><MemoryRouter initialEntries={["/s/launch/settings/applications?permission_updates=1"]}><SettingsPanel tab="integrations" /></MemoryRouter></TestIntlProvider>);
   assert.ok(await screen.findByTestId("connected-app-item-permission-update-app"));
-  assert.ok(screen.getByTestId("connected-apps-installed-tab"));
+  assert.ok(screen.getByTestId("connected-apps-yours-tab"));
   // Arriving from elsewhere, the review opens once the apps have loaded (#triage:#156).
   await waitFor(() => assert.equal(screen.queryByTestId("installed-app-notifications") !== null, true));
 });

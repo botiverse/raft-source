@@ -166,6 +166,8 @@ export async function harness(options: {
       sessions.push(wrapped);
       return wrapped;
     }),
+    // No runtime's real account reader in tests (#proj-runtime:#75).
+    readAccountUsage: async () => ({ kind: "unsupported" }),
     ...options.deps,
   };
   const host = new OarAgentHost(deps);
@@ -227,6 +229,8 @@ export async function limitHarness(failure: FailureClass, options: {
   extra?: Record<string, unknown>;
   ledger?: ProviderLimitLedger;
   backoff?: OarAgentHostDeps["providerLimitBackoff"];
+  /** What the account-usage read after a used-up quota returns (#proj-runtime:#75). */
+  readAccountUsage?: OarAgentHostDeps["readAccountUsage"];
 } = {}): Promise<{ h: Harness; ledger: ProviderLimitLedger; turnInputs: Map<string, string[]> }> {
   const failing = new Set(options.failing ?? ["agent-1"]);
   const ledger = options.ledger ?? new ProviderLimitLedger();
@@ -240,7 +244,11 @@ export async function limitHarness(failure: FailureClass, options: {
       turn.say("ok");
     },
     wrapSession: (session) => withFailure(session, failure, options.extra),
-    deps: { providerLimits: ledger, providerLimitBackoff: options.backoff ?? { baseMs: 300, jitterRatio: 0 } },
+    deps: {
+      providerLimits: ledger,
+      providerLimitBackoff: options.backoff ?? { baseMs: 300, jitterRatio: 0 },
+      ...(options.readAccountUsage ? { readAccountUsage: options.readAccountUsage } : {}),
+    },
   });
   return { h, ledger, turnInputs };
 }

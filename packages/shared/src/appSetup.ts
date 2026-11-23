@@ -9,6 +9,16 @@ export type AppSetupState = {
   completedAt: string | null;
 };
 
+/**
+ * Which of a Server's agents can use an App (Raft App or MCP App): the agents member lists show,
+ * oldest first. `allAgents` when none is excepted. Ids only: no Connection, account or creator.
+ */
+export type AppAgentAccess = {
+  allAgents: boolean;
+  agentIds: string[];
+  exceptAgentIds: string[];
+};
+
 export class AppSetupValidationError extends Error {}
 
 export function normalizeAppSetupUrl(raw: unknown): string | null {

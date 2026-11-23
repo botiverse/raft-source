@@ -224,6 +224,7 @@ async function mcpListings(serverId: string): Promise<MarketplaceMcpListing[]> {
     installed: usage.get(template.key)?.installedHere ?? false,
     templateKey: template.key,
     homepageUrl: template.homepageUrl,
+    publisherName: template.publisherName,
   }));
 }
 

@@ -455,6 +455,61 @@ test("thread unfollow", async () => {
   await pin(["thread", "unfollow", "--target", "#general:aaaabbbb"], [{ path: /unfollow/, data: { ok: true } }]);
 });
 
+test("focus / unfocus", async () => {
+  const at = { focusedAt: "2026-10-03T11:00:00.000Z", lastActiveAt: "2026-10-03T11:30:00.000Z" };
+  const thread = { target: "#general:aaaabbbb", kind: "thread", source: "manual", ...at };
+  const task = { target: "#general:#7", kind: "task", source: "manual", ...at };
+  const other = { target: "#general:ccccdddd", kind: "thread", source: "auto", ...at };
+  const dm = { target: "dm:@richard", kind: "dm", source: "auto", ...at };
+  await pin(["focus", "#general:aaaabbbb"], [{
+    method: "POST",
+    path: /agent-api\/focus$/,
+    data: { ok: true, focused: thread, alreadyFocused: false, evicted: [dm], entries: [thread, task, other], limit: 3 },
+  }], undefined, "a fourth: one unfocused");
+  await pin(["focus", "#general:aaaabbbb"], [{
+    method: "POST",
+    path: /agent-api\/focus$/,
+    data: { ok: true, focused: thread, alreadyFocused: true, evicted: [], entries: [thread, task], limit: 3 },
+  }], undefined, "already focused");
+  await pin(["focus"], [{ method: "GET", path: /agent-api\/focus$/, data: { entries: [thread, task], limit: 3 } }]);
+  await pin(["focus"], [{ method: "GET", path: /agent-api\/focus$/, data: { entries: [], limit: 3 } }], undefined, "nothing focused");
+  await pin(["unfocus", "#general:#7"], [{
+    method: "POST",
+    path: /agent-api\/unfocus$/,
+    data: { ok: true, target: "#general:#7", wasFocused: true, entries: [thread], limit: 3 },
+  }]);
+  await pin(["unfocus", "dm:@richard"], [{
+    method: "POST",
+    path: /agent-api\/unfocus$/,
+    data: { ok: true, target: "dm:@richard", wasFocused: false, entries: [thread], limit: 3 },
+  }], undefined, "not focused");
+  await pin(["unfocus"], [], undefined, "no target");
+  await pin(["focus", "#general"], [{
+    method: "POST",
+    path: /agent-api\/focus$/,
+    response: {
+      ok: false,
+      status: 400,
+      error: "Channel focus is deliberately not available yet: focus a thread, a DM or a task conversation instead, as your inbox names them.",
+      errorCode: "FOCUS_CHANNEL_UNAVAILABLE",
+      suggestedNextAction: "raft inbox check",
+      data: null,
+    },
+  }], undefined, "a plain channel");
+  await pin(["focus", "#general:aaaabbbb"], [{
+    method: "POST",
+    path: /agent-api\/focus$/,
+    response: {
+      ok: false,
+      status: 404,
+      error: "Focus is not switched on for this server yet: nothing was focused, and every conversation reaches your inbox as before.",
+      errorCode: "AGENT_FOCUS_DISABLED",
+      suggestedNextAction: "raft inbox check",
+      data: null,
+    },
+  }], undefined, "Focus off");
+});
+
 test("channel join / leave / members", async () => {
   await pin(["channel", "join", "--target", "#general"], [
     { method: "GET", path: /\/server$/, data: SERVER_INFO_NOT_JOINED },

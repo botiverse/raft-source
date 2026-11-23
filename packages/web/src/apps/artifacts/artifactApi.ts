@@ -28,14 +28,17 @@ import type {
   ArtifactWebFrameInput,
   ArtifactWebHomeChange,
   ArtifactWebHomeInput,
+  ArtifactWebLinks,
   ArtifactWebLocation,
   ArtifactWebOpen,
   ArtifactWebMentionCandidates,
   ArtifactWebReviewDrafts,
   ArtifactWebReviewDraftSaved,
   ArtifactWebAttachmentSaves,
+  ArtifactWebBacklinks,
   ArtifactWebSaved,
   ArtifactWebSaveInput,
+  ArtifactWebSettlement,
   ArtifactWebShareAudience,
   ArtifactWebShared,
   ArtifactWebShareInput,
@@ -151,8 +154,30 @@ export interface ArtifactSource {
    * FILE_NOT_FOUND, CONTENT_UNAVAILABLE, INVALID_REQUEST, RATE_LIMITED.
    */
   frame(id: ArtifactId, input: ArtifactWebFrameInput): Promise<ArtifactWebFrame>;
+  /**
+   * GET `artifactWebPaths.links(id, version)` → the version's links to other Artifacts, each with
+   * what its target is for this reader (`ok` with its live title, `deleted`, `unavailable`), for
+   * the frame's bare links' titles (useArtifactLinkLabels, #proj-workspace:#336). NOT_VISIBLE,
+   * VERSION_NOT_FOUND, CONTENT_UNAVAILABLE, RATE_LIMITED. Optional: a source without it labels no
+   * link (the fake source).
+   */
+  links?(id: ArtifactId, version: number): Promise<ArtifactWebLinks>;
+  /**
+   * GET `artifactWebPaths.backlinks(id)` → what links to the Artifact, for this reader ("Linked from",
+   * #proj-workspace:#336 step 2): other Artifacts (`documents`, as cards) and chat messages
+   * (`discussions`), each the newest page with how many there are (useArtifactBacklinks). NOT_VISIBLE,
+   * RATE_LIMITED. Optional: a source without it shows nothing links it (the fake source).
+   */
+  backlinks?(id: ArtifactId): Promise<ArtifactWebBacklinks>;
   /** PUT / DELETE /api/artifacts/:id/subscription → {following}. */
   setFollowing(id: ArtifactId, following: boolean): Promise<{ following: boolean }>;
+  /**
+   * Settled (#334): POST `artifactWebPaths.settle(id)` settles it at its current version, DELETE takes it back to
+   * Working → ArtifactWebSettlement (`changed: false` when it already stood so). FORBIDDEN (the reader may not comment
+   * on it), NOT_VISIBLE, SETTLED_NOT_AVAILABLE (its server has `artifact_settled_v0` off), RATE_LIMITED. Optional: a
+   * source without it offers no Settle (the fake source, whose cards say nothing of Settled).
+   */
+  setSettled?(id: ArtifactId, settled: boolean): Promise<ArtifactWebSettlement>;
   /**
    * POST /api/artifacts/:id/home (ArtifactWebHomeInput) → the new viewer data:
    * a larger home, or a smaller one (`capabilities.narrowHome`; with the

@@ -265,6 +265,26 @@ What the page did:
   with no text). Unknown is never blank.
 - `phoneOverflow`: at the mobile viewport, `document.scrollingElement.scrollWidth` wider than
   `innerWidth` by more than a pixel: `{ contentWidth, viewportWidth }`, else null.
+- `pageCantScroll`, a soft hint for the agent alone (no person's view shows findings), at every
+  viewport: the page's content goes more than 24 px (`CANT_SCROLL_SLACK`) beyond where a reader can
+  scroll, and no container covering at least half the window scrolls (a full-window app that
+  scrolls inside its own containers is never reported). A Vite + raft-ui prototype's
+  `html, body { overflow: hidden }` was the case: in the frame nothing scrolled and nothing said
+  so. Measured in the page in the same one call as the rest (`src/measurePage.ts`, a walk of at
+  most 8000 elements, each one's computed style and box read once): the lowest visible content
+  (elements with text of their own, or images, canvases, svgs, media, frames, form controls) that
+  no scrolling inner container holds; a box that clips and ends clearly above or below the
+  window's bottom (a card, a collapsed panel) counts its content only down to its own bottom, one
+  that ends at the window's bottom (an app shell) doesn't; hidden content and a fixed sheet below
+  the window aren't counted. Where a reader can scroll (`src/pageChecks.ts` `cantScrollOf`): the
+  window, plus as far as the document scrolls where the overflow the window takes (html's, else
+  body's) lets it. Each entry: `{ shot, viewportWidth, viewportHeight, contentHeight,
+  hiddenHeight, heldBy }`, sizes in the viewport's CSS px (a phone page zoomed out to fit scaled to
+  the phone's), `heldBy` html and body where their overflow-y is `hidden` or `clip`, and the box
+  inside them that cuts it (`position: fixed`, or clipping at the window's bottom), named by its tag
+  and id or first class (selector characters only, 60 at most: never a URL). The function runs as
+  its own text in the page, so it has no named function inside it: wrangler's bundle keeps names
+  with a `__name` helper the page doesn't have (`test/measure-page.test.ts` runs it alone).
 
 A screenshot that isn't a PNG or is over 5 MiB is left out (the contract allows a missing part),
 and a report over 64 KiB loses blocked addresses, then console errors, from the end.
@@ -348,7 +368,10 @@ Build locally (bundles, deploys nothing): `pnpm run build`.
 and result calls with fetch mocked: the bearer, 204, 401, 5xx, a bad lease, the form's parts, the
 retry within the lease), `test/report.test.ts` (the caps, cutting, the ticket out of the report,
 the 64 KiB fit, error classes), `test/navigation.test.ts` (the guard's decisions),
-`test/page-checks.test.ts` (blank, overflow, the PNG reader over every row filter),
+`test/page-checks.test.ts` (blank, overflow, the can't-scroll hint's decision, the PNG reader over
+every row filter), `test/measure-page.test.ts` (the page's own measuring over a fake DOM: an app
+shell held by html and body, a full-window app scrolling inside, hidden and decorative content not
+counted, a fixed root named; its text run alone, as puppeteer sends it),
 `test/cdp-page.test.ts` (each viewport emulated and shot with `Page.captureScreenshot` on the one
 CDP session, after its emulation; where a `pageerror` was thrown),
 `test/uncaught.test.ts` (`goto` throwing with the ticket URL in its message, stack and cause:

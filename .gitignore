@@ -20,6 +20,8 @@ release/
 /uploads/
 **/.wrangler/
 **/.flow/
+**/.gradle/
+**/.kotlin/
 artifacts/perf/
 packages/web/.playwright/
 packages/cli/test-results/

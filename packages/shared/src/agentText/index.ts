@@ -14,5 +14,6 @@ export * from "./threadTarget";
 export * from "./taskRef";
 export * from "./delivery";
 export * from "./idleTaskReminder";
+export * from "./inboxNotice";
 export * from "./messageCards";
 export * from "./raftDeliveryParse";

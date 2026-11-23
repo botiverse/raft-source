@@ -3,9 +3,13 @@ import { createHash } from "node:crypto";
 import type { AccountUsageSnapshot, AccountUsageWindow } from "@botiverse/oar";
 
 import {
+  RUNTIME_ACCOUNT_USAGE_CREDITS_BALANCE_PATTERN,
   RUNTIME_ACCOUNT_USAGE_PROTOCOL_VERSION,
+  RUNTIME_ACCOUNT_USAGE_TEMPORARILY_UNAVAILABLE_CODE,
   RUNTIME_LIMIT_RESETS_AVAILABLE_MAX,
+  isRuntimeAccountUsageUnsupportedReason,
   maskRuntimeAccountEmail,
+  type RuntimeAccountUsageAccount,
   type RuntimeAccountUsageHealth,
   type RuntimeAccountUsageProvider,
   type RuntimeAccountUsageSnapshot,
@@ -46,6 +50,23 @@ function limitResetsAvailableOf(snapshot: Extract<OarAccountUsageSnapshot, { kin
   return typeof available === "number" && Number.isInteger(available) && available >= 0 && available <= RUNTIME_LIMIT_RESETS_AVAILABLE_MAX
     ? available
     : undefined;
+}
+
+/**
+ * OAR's extra usage credits (Codex), forwarded: `available` and `unlimited`
+ * as read, `balance` only when it is a number string the wire carries (it is
+ * dropped otherwise, never the credits). Sent to a server that reads it only
+ * (the daemon strips it otherwise, SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_CREDITS_V1).
+ */
+function creditsOf(snapshot: Extract<OarAccountUsageSnapshot, { kind: "available" }>): RuntimeAccountUsageAccount["credits"] {
+  const credits = snapshot.credits;
+  if (!credits || typeof credits.available !== "boolean") return undefined;
+  const balance = typeof credits.balance === "string" ? credits.balance.trim() : undefined;
+  return {
+    available: credits.available,
+    ...(typeof credits.unlimited === "boolean" ? { unlimited: credits.unlimited } : {}),
+    ...(balance !== undefined && RUNTIME_ACCOUNT_USAGE_CREDITS_BALANCE_PATTERN.test(balance) ? { balance } : {}),
+  };
 }
 
 /**
@@ -93,12 +114,32 @@ export function projectOarAccountUsageSnapshot(input: {
     collectorVersion: input.collectorVersion,
   };
 
-  if (snapshot.kind === "unsupported" || snapshot.kind === "reauth_required") {
-    const health = snapshot.kind;
-    // No windows. The schema forbids them for `unsupported`, and for
-    // `reauth_required` an empty list is the only honest reading: we hold no
-    // usage measurement at all.
-    return { ...base, accounts: [{ accountKey, health, windows: [] }] };
+  if (snapshot.kind === "unsupported") {
+    // No windows: the schema forbids them. The reason says why (OAR's code;
+    // one Raft does not know reads as a plain `unsupported`).
+    const unsupportedReason = isRuntimeAccountUsageUnsupportedReason(snapshot.reason) ? snapshot.reason : undefined;
+    return { ...base, accounts: [{ accountKey, health: "unsupported", ...(unsupportedReason ? { unsupportedReason } : {}), windows: [] }] };
+  }
+
+  if (snapshot.kind === "reauth_required") {
+    // An empty list is the only honest reading: we hold no usage measurement at all.
+    return { ...base, accounts: [{ accountKey, health: "reauth_required", windows: [] }] };
+  }
+
+  if (snapshot.kind === "unavailable") {
+    // Not read this time, read again later (Kimi: an expired access token
+    // Kimi Code has not refreshed yet). Neither a failure nor zero usage:
+    // one unreadable window with the code the web words as "temporarily
+    // unavailable".
+    return {
+      ...base,
+      accounts: [{
+        accountKey,
+        health: "ok",
+        parseErrorCode: RUNTIME_ACCOUNT_USAGE_TEMPORARILY_UNAVAILABLE_CODE,
+        windows: [{ id: windowId("Usage limit", 0), label: "Usage limit", status: "parse_unavailable" }],
+      }],
+    };
   }
 
   const maskedLabel = maskRuntimeAccountEmail(snapshot.email);
@@ -110,6 +151,7 @@ export function projectOarAccountUsageSnapshot(input: {
   // Sent to a server that reads it only (the daemon strips it otherwise,
   // SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_LIMIT_RESETS_V1).
   const limitResetsAvailable = limitResetsAvailableOf(snapshot);
+  const credits = creditsOf(snapshot);
   let sawUnreadableRatio = false;
 
   const windows = snapshot.windows.map((window, index) => {
@@ -159,6 +201,7 @@ export function projectOarAccountUsageSnapshot(input: {
       ...(displayName ? { displayName } : {}),
       health,
       ...(limitResetsAvailable !== undefined ? { limitResetsAvailable } : {}),
+      ...(credits ? { credits } : {}),
       ...(sawUnreadableRatio ? { parseErrorCode: "oar_window_ratio_unreadable" } : {}),
       windows,
     }],

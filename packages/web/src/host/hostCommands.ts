@@ -23,6 +23,7 @@ import { useMachineStore } from "../store/machineStore";
 import { getLocalComputerSnapshot } from "../components/machine/localComputer/localComputerStore";
 import { correlateSelfMachine } from "../components/machine/localComputer/localComputerLogic";
 import { thisDevicePath } from "../components/machine/localComputer/thisDeviceRoute";
+import { openObjectWindowInMain, reloadObjectWindow } from "../features/objectWindows/objectWindowStore";
 
 export interface HostCommandDeps {
   navigate: (to: string) => void;
@@ -83,6 +84,14 @@ export function executeHostCommand(command: HostCommand, deps: HostCommandDeps):
       const machineId = correlateSelfMachine(useMachineStore.getState().machines, { machineIds, hostname })?.id ?? null;
       const section = command.section === "troubleshoot" ? command.section : null;
       deps.navigate(thisDevicePath(slug, machineId, section));
+      return;
+    }
+    case "object-window": {
+      // About one object window (features/objectWindows), always sent to this, the main window's app: Window › Open
+      // in Main Window, and View › Reload with that window focused (its object remounts; this page does not reload).
+      if (typeof command.frameName !== "string") return;
+      if (command.action === "open-in-main") openObjectWindowInMain(command.frameName);
+      else if (command.action === "reload") reloadObjectWindow(command.frameName);
       return;
     }
     default:

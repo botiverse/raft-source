@@ -1,0 +1,26 @@
+{
+  "formatVersion": 1,
+  "id": "answer_before_read_lands_no_live",
+  "rule": "position",
+  "title": "A row read at its position, then an answer at the same position from before the read: the row stays read; a later message past the read counts",
+  "why": "Opening a row reads it through its position (readSeq 101). A refresh the server computed before that read lands with the same position and the old unread: everything it counted is at or below the read, so it is dropped. An answer at 102 has a message past the read, so its unread stands (read_covers_only_its_activity).",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow, applyRead, mergeAnswer: readSeq)"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/data/ActivityRowPosition.kt (reduceActivityRow: readSeq)"
+    ]
+  },
+  "given": { "row": { "unreadCount": 2, "hasMention": true, "position": "101", "mentionOnly": false } },
+  "steps": [
+    { "act": "read", "seq": "101" },
+    { "act": "answer", "row": { "unreadCount": 2, "hasMention": true, "position": "101", "mentionOnly": false } },
+    { "act": "answer", "row": { "unreadCount": 1, "hasMention": false, "position": "102", "mentionOnly": false } }
+  ],
+  "checkpoints": [
+    { "afterStep": 2, "row": { "unreadCount": 0, "hasMention": false, "position": "101" }, "reread": false }
+  ],
+  "expect": { "row": { "unreadCount": 1, "hasMention": false, "position": "102" }, "reread": false }
+}

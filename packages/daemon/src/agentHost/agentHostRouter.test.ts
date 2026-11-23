@@ -4,7 +4,7 @@ import { exampleMessage } from "../axExampleFixtures";
 import type { AgentStartAcceptance } from "../agentStartDispatchProjection";
 import { getDriver, registeredRuntimeIds } from "../drivers/index";
 import { OarOnlyStartError, RuntimeExecutableNotFoundError } from "../spawnFailureErrors";
-import { classifySpawnFailure } from "../spawnFailureClassification";
+import { classifySpawnFailure, startFailureActivity } from "../spawnFailureClassification";
 import { AgentHostRouter, oarOpenFailureDetail } from "./agentHostRouter";
 import type { AgentStartRequest, LegacyAgentHost } from "./agentLifecycleHost";
 import { OAR_HOSTED_RUNTIMES, type HeldDelivery, type OarAgentHost, type OarHostSupport, type OarStartOutcome } from "./oarAgentHost";
@@ -34,6 +34,11 @@ class FakeLegacy {
   purgeInboxMessagesForChannels() { return { removedCount: 0 }; }
   respondToActivityProbe() {}
   async interruptTurn() { return { outcome: "not_running" as const }; }
+  readonly sideAskCalls: Array<{ agentId: string; kind: string }> = [];
+  readonly stoppedSideAsks: string[] = [];
+  sideAskResult: { outcome: "answered" | "unsupported_runtime" | "agent_not_running"; text?: string } = { outcome: "answered", text: "legacy" };
+  async sideAsk(request: { agentId: string; kind: string }) { this.sideAskCalls.push({ agentId: request.agentId, kind: request.kind }); return this.sideAskResult; }
+  stopSideAsk(agentId: string) { this.stoppedSideAsks.push(agentId); }
   async notifyAgentAppInbox() { return true; }
   deliverRuntimeProfileNotification() { return true; }
   getRunningAgentIds() { return []; }
@@ -76,6 +81,11 @@ class FakeOar {
   readonly features: unknown[] = [];
   applyServerFeatures(features: unknown): void { this.features.push(features); }
   readonly droppedReports: Array<{ agentId: string; launchId: string | null; reason: string; eventIds: readonly string[] }> = [];
+  readonly sideAskCalls: Array<{ agentId: string; kind: string }> = [];
+  readonly stoppedSideAsks: string[] = [];
+  sideAskResult: { outcome: "answered" | "unsupported_runtime" | "agent_not_running"; text?: string } = { outcome: "answered", text: "oar" };
+  async sideAsk(request: { agentId: string; kind: string }) { this.sideAskCalls.push({ agentId: request.agentId, kind: request.kind }); return this.sideAskResult; }
+  stopSideAsk(agentId: string) { this.stoppedSideAsks.push(agentId); }
   reportDroppedAppEvents(agentId: string, launchId: string | null, reason: string, eventIds: readonly string[]): void {
     this.droppedReports.push({ agentId, launchId, reason, eventIds });
   }
@@ -213,6 +223,13 @@ test("lifecycle calls follow the agent's current host", async () => {
   assert.equal(hosts.getAgentStartAcceptance("agent-1").queueState, "starting");
   assert.equal(hosts.getAgentStartAcceptance("agent-2").queueState, "queued");
   assert.deepEqual(hosts.getRunningAgentIds(), ["agent-1"]);
+  assert.deepEqual(await hosts.sideAsk({ type: "agent:side-ask", requestId: "req-1", agentId: "agent-1", kind: "status" }), { outcome: "answered", text: "oar" });
+  assert.deepEqual(await hosts.sideAsk({ type: "agent:side-ask", requestId: "req-2", agentId: "agent-2", kind: "status" }), { outcome: "answered", text: "legacy" });
+  assert.deepEqual(oar.sideAskCalls, [{ agentId: "agent-1", kind: "status" }]);
+  assert.deepEqual(legacy.sideAskCalls, [{ agentId: "agent-2", kind: "status" }]);
+  hosts.stopSideAsk("agent-1");
+  assert.deepEqual(oar.stoppedSideAsks, ["agent-1"]);
+  assert.deepEqual(legacy.stoppedSideAsks, ["agent-1"]);
   await hosts.stopAgent("agent-1");
   assert.equal(oar.owns("agent-1"), false);
   assert.deepEqual(legacy.calls, [], "the legacy host held nothing for it");
@@ -248,7 +265,7 @@ async function rejectsOarOnly(promise: Promise<unknown>): Promise<OarOnlyStartEr
 
 test("structure: every OAR-only driver has an OAR launch, and its spawn is never a way to run it", () => {
   const oarOnly = registeredRuntimeIds().filter((id) => getDriver(id).oarOnly);
-  assert.deepEqual(oarOnly.sort(), ["qoder", "qwen"]);
+  assert.deepEqual(oarOnly.sort(), ["codex", "dsh", "qoder", "qwen"]);
   for (const id of oarOnly) {
     assert.ok(OAR_HOSTED_RUNTIMES.has(id), `${id} is launched by the OAR host`);
     assert.throws(() => getDriver(id).spawn({} as never), /runs only on the OAR host/);
@@ -352,6 +369,58 @@ test("an OAR-only session that cannot be resumed asks for a session reset, never
   assert.match(classified.userMessage, /Reset the agent's session/);
 });
 
+test("an OAR-only transient resume error stays retryable instead of demanding a session reset", async () => {
+  const { oar, hosts } = router();
+  oar.outcome = oarOnlyFallback("resume_failed:TimeoutError", {
+    cause: new Error("thread/resume timed out after 30000ms"),
+  }).outcome;
+  const error = await rejectsOarOnly(hosts.startAgent("agent-1", oarOnlyConfig({ runtime: "codex" }), undefined, undefined, undefined, "launch-1"));
+  const classified = classifySpawnFailure(error);
+  assert.equal(classified.reason, "runtime_spawn_failed");
+  assert.match(classified.userMessage, /thread\/resume timed out/);
+  assert.doesNotMatch(classified.userMessage, /Reset the agent's session/);
+});
+
+test("an OAR-only fallback carrying failHere preserves its message and spawnFailureCode even on resume", async () => {
+  const { oar, hosts, legacy } = router();
+  oar.outcome = oarOnlyFallback("resume_failed:SettingsConfirmationError", {
+    failHere: "Codex could not change speed to fast on this account.",
+  }).outcome;
+  const tierError = await rejectsOarOnly(hosts.startAgent("agent-1", oarOnlyConfig({ runtime: "codex" }), undefined, undefined, undefined, "launch-1"));
+  assert.deepEqual(legacy.calls, []);
+  const tierClassified = classifySpawnFailure(tierError);
+  assert.equal(tierClassified.reason, "runtime_spawn_failed");
+  assert.equal(tierClassified.userMessage, "Codex could not change speed to fast on this account.");
+
+  oar.outcome = oarOnlyFallback("open_failed:SettingsConfirmationError", {
+    failHere: "Codex rejected model gpt-9.",
+    failHereReason: "model_unsupported",
+  }).outcome;
+  const modelError = await rejectsOarOnly(hosts.startAgent("agent-1", oarOnlyConfig({ runtime: "codex" }), undefined, undefined, undefined, "launch-2"));
+  const modelClassified = classifySpawnFailure(modelError);
+  assert.equal(modelClassified.reason, "model_unsupported");
+  assert.equal(modelClassified.userMessage, "Codex rejected model gpt-9.");
+});
+
+test("an OAR-only undecided runtime_not_found verdict (probe_timeout) preserves lookupReason and timeout copy", async () => {
+  const { oar, hosts } = router();
+  const timeoutErr = new RuntimeExecutableNotFoundError({
+    runtimeId: "codex",
+    reason: "probe_timeout",
+    message: "Codex was found on this Computer, but its `app-server` check did not finish within 5000 ms.",
+  });
+  oar.outcome = oarOnlyFallback("error:RuntimeExecutableNotFoundError", { cause: timeoutErr }).outcome;
+  let thrown: unknown;
+  await hosts.startAgent("agent-1", oarOnlyConfig({ runtime: "codex" }), undefined, undefined, undefined, "launch-1")
+    .catch((error: unknown) => { thrown = error; });
+  assert.equal(thrown, timeoutErr);
+  const classified = classifySpawnFailure(thrown);
+  assert.equal(classified.reason, "runtime_not_found");
+  assert.equal(classified.lookupReason, "lookup_timed_out");
+  assert.match(classified.userMessage, /did not finish within 5000 ms/);
+  assert.doesNotMatch(classified.userMessage, /is not installed/);
+});
+
 // #wg-rbac:#27: an OAR-only start no host runs drops its config; the runner
 // credential the core minted for it is released (revoked) once, not left valid.
 // Teeth: drop releaseCredential in failOarOnly / failOarOnlyFallback -> RED.
@@ -448,4 +517,68 @@ test("beginDrain: both hosts drain with the clamped deadline; the summary is the
   });
   hosts.endDrain();
   assert.deepEqual(ended.sort(), ["legacy", "oar"]);
+});
+
+test("a stuck Pi session kept on OAR (failHereReason: session_needs_reset) throws OarOnlyStartError without calling legacy", async () => {
+  const { legacy, oar, hosts } = router();
+  const piCfg = config({ runtime: "pi", sessionId: "pi-sess-stuck" });
+  oar.outcome = {
+    kind: "fallback",
+    reason: "session_needs_reset",
+    request: { agentId: "agent-1", config: piCfg, launchId: "launch-1", wakeMessageTransient: false, recoveryGrant: null, claimedConnectionEpochId: null },
+    held: [],
+    failHere: "The pi session failed context compaction 3 times in a row and cannot be resumed. Use Reset Session to start fresh.",
+    failHereReason: "session_needs_reset",
+  };
+  const err = await rejectsOarOnly(hosts.startAgent("agent-1", piCfg, undefined, undefined, undefined, "launch-1"));
+  assert.equal(err.spawnFailureCode, "session_needs_reset");
+  assert.equal(classifySpawnFailure(err).reason, "session_needs_reset");
+  assert.deepEqual(legacy.calls, []);
+});
+
+test("OAR-only Codex startup config failures map managed preferences to runtime_spawn_failed (5-try) and TOML parse errors to runtime_config_invalid (1-try)", async () => {
+  const { legacy, oar, hosts } = router();
+  const codexCfg = config({ runtime: "codex" });
+
+  // Multiline OAR processFailure stderr on open_failed: manager-only spawnFailure.message
+  // carries the matched raw line (scrubbed), not internal OAR routing text.
+  oar.outcome = {
+    kind: "fallback",
+    reason: "open_failed:Error",
+    cause: new Error("Codex app-server open failed", {
+      cause: new Error(`app-server exited: exit code 1; signal none\nstderr (tail):\n${"noise\n".repeat(40)}failed to load configuration: Failed to synchronize managed preferences`),
+    }),
+    request: { agentId: "agent-1", config: codexCfg, launchId: "launch-1", wakeMessageTransient: false, recoveryGrant: null, claimedConnectionEpochId: null },
+    held: [],
+  };
+  const managedErr = await rejectsOarOnly(hosts.startAgent("agent-1", codexCfg, undefined, undefined, undefined, "launch-1"));
+  const managedClassified = classifySpawnFailure(managedErr);
+  assert.equal(managedErr.spawnFailureCode, "runtime_spawn_failed");
+  assert.equal(managedClassified.reason, "runtime_spawn_failed");
+  assert.match(managedClassified.userMessage, /macOS managed preferences/i);
+  assert.match(managedClassified.userMessage, /@openai\/codex@0\.156\.1/);
+  const managedActivity = startFailureActivity(managedClassified, "gpt-6.2-sol");
+  assert.equal(managedActivity.spawnFailure.reason, "runtime_spawn_failed");
+  assert.equal(managedActivity.spawnFailure.message, "failed to load configuration: Failed to synchronize managed preferences");
+  assert.doesNotMatch(managedActivity.spawnFailure.message ?? "", /runs only on the OAR host/);
+  assert.deepEqual(legacy.calls, []);
+
+  // Deterministic TOML parse error on resume_failed:Error pauses on attempt 1 and scrubs user home paths.
+  oar.outcome = {
+    kind: "fallback",
+    reason: "resume_failed:Error",
+    cause: new Error("failed to load configuration: TOML parse error in /Users/alice/.codex/config.toml at line 2, column 1: expected `=`, found `bar`"),
+    request: { agentId: "agent-1", config: codexCfg, launchId: "launch-2", wakeMessageTransient: false, recoveryGrant: null, claimedConnectionEpochId: null },
+    held: [],
+  };
+  const tomlErr = await rejectsOarOnly(hosts.startAgent("agent-1", codexCfg, undefined, undefined, undefined, "launch-2"));
+  const tomlClassified = classifySpawnFailure(tomlErr);
+  assert.equal(tomlErr.spawnFailureCode, "runtime_config_invalid");
+  assert.equal(tomlClassified.reason, "runtime_config_invalid");
+  assert.match(tomlClassified.userMessage, /~\/\.codex\/config\.toml/);
+  const tomlActivity = startFailureActivity(tomlClassified, "gpt-6.2-sol");
+  assert.equal(tomlActivity.spawnFailure.reason, "runtime_config_invalid");
+  assert.match(tomlActivity.spawnFailure.message ?? "", /TOML parse error in \[REDACTED_PATH\] at line 2, column 1/);
+  assert.doesNotMatch(tomlActivity.spawnFailure.message ?? "", /alice|runs only on the OAR host/);
+  assert.deepEqual(legacy.calls, []);
 });

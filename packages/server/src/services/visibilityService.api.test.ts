@@ -25,7 +25,7 @@ import {
   type ViewActor,
   type VisibleRoots,
 } from "./visibilityService";
-import { seedBoundGuest } from "../test/guestFixture";
+import { seedBoundGuest, seedStrayGuestChannelRow } from "../test/guestFixture";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
@@ -59,7 +59,8 @@ async function seedMatrix(seed: ReturnType<typeof createSeed>) {
   for (const userId of [owner.id, member.id]) await addHuman(privMember.id, userId);
   await seedBoundGuest({ serverId: server.id, userId: guest.id, channelId: privMember.id });
   const deleted = await createChannel(server.id, `matrix-deleted-${label()}`, undefined, "private");
-  for (const userId of [owner.id, member.id, guest.id]) await addHuman(deleted.id, userId);
+  for (const userId of [owner.id, member.id]) await addHuman(deleted.id, userId);
+  await seedStrayGuestChannelRow({ channelId: deleted.id, userId: guest.id });
   for (const id of [agent.id, deletedAgent.id]) {
     await addAgent(privMember.id, id);
     await addAgent(deleted.id, id);

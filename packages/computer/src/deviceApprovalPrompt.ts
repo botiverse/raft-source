@@ -27,6 +27,7 @@ export function presentDeviceCode(
 ): (() => void) | undefined {
   const input = opts.input ?? process.stdin;
   const openUrl = opts.openUrl ?? openUrlInBrowser;
+  if (event.paired === true) return presentPairedDeviceCode(event, opts, input, openUrl);
   let browserOpenRequested = false;
   try {
     openUrl(event.verifyUrl);
@@ -70,6 +71,33 @@ export function presentDeviceCode(
       ? `Keep this command running — it finishes here automatically once you approve (expires in ${event.expiresInSeconds}s).`
       : `Keep this command running — sign-in completes here automatically (expires in ${event.expiresInSeconds}s).`,
   );
+  return enterOpensBrowser ? installEnterToOpenUrl({ input, url: event.verifyUrl, openUrl }) : undefined;
+}
+
+/**
+ * `--pair` and the server linked this request to the Add Computer window the
+ * command was copied from: approving there comes first. The approval page
+ * and the code stay (the window may be closed, or on another device), but
+ * the page is not opened on its own, so it does not compete with the window.
+ */
+function presentPairedDeviceCode(
+  event: Extract<ComputerApiEvent, { kind: "login.device-code" }>,
+  opts: DeviceCodePromptOptions,
+  input: NodeJS.ReadableStream,
+  openUrl: (url: string) => void,
+): (() => void) | undefined {
+  const enterOpensBrowser = canInstallEnterToOpenUrl(input);
+  info("Approve this machine in the Raft window you copied this command from.");
+  info(`Or enter this code at ${event.verifyUrl}: ${event.userCode}`);
+  info(
+    enterOpensBrowser
+      ? "  (press Enter to open that page, or open it on any device including your phone)"
+      : "  (open that page on any device, including your phone)",
+  );
+  if (opts.serverSlug) {
+    info(`If the page asks which server, choose ${formatServerSlugDisplay(opts.serverSlug)}.`);
+  }
+  info(`Keep this command running — it finishes here automatically once you approve (expires in ${event.expiresInSeconds}s).`);
   return enterOpensBrowser ? installEnterToOpenUrl({ input, url: event.verifyUrl, openUrl }) : undefined;
 }
 

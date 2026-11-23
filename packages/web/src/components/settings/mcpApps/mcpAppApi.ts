@@ -6,7 +6,7 @@
  * the server's own interfaces move to shared (follow-up): the list item already did (S5).
  */
 import type { IntlShape } from "react-intl";
-import type { ManagedMcpAuthMode, ManagedMcpOAuthClientMode } from "@botiverse/raft-shared";
+import type { AppAgentAccess, ManagedMcpAuthMode, ManagedMcpOAuthClientMode, ManagedMcpToolCatalogEntry } from "@botiverse/raft-shared";
 import type { MessageId } from "../../../i18n/messages";
 
 export type McpAppSectionId = "profile" | "mcp_server" | "connections" | "agents" | "distribution" | "danger";
@@ -42,6 +42,8 @@ export interface McpConnectionView {
   lastCheckedAt: string | null;
   lastError: string | null;
   createdAt: string;
+  /** Who the stored sign-in or key acts as, and whether they have left the server (absent from older servers). */
+  signedInBy?: { userId: string; departed: boolean } | null;
 }
 
 export interface McpAppView {
@@ -57,7 +59,8 @@ export interface McpAppView {
     category: string | null;
     whenToUse: string | null;
   };
-  source: { kind: "url" | "template"; templateKey: string | null; maintainedByRaft: boolean };
+  /** `publisherName`: who hosts a template's server (absent from older servers). */
+  source: { kind: "url" | "template"; templateKey: string | null; maintainedByRaft: boolean; publisherName?: string | null };
   server: {
     endpointUrl: string;
     transport: "streamable_http";
@@ -71,7 +74,8 @@ export interface McpAppView {
     oauthClientMode?: ManagedMcpOAuthClientMode | null;
     health: { status: "reachable" | "unreachable" | "unknown"; checkedAt: string | null; error: string | null; latencyMs: number | null };
     toolCount: number;
-    tools: Array<{ name: string; title?: string; description?: string }>;
+    /** `annotations`: the tool's boolean hints; absent when it declared none (or from older servers). */
+    tools: Array<{ name: string; title?: string; description?: string; annotations?: ManagedMcpToolCatalogEntry["annotations"] }>;
     enabled: boolean;
   };
   /** Only for a viewer who manages integrations; empty otherwise. */
@@ -79,6 +83,14 @@ export interface McpAppView {
   defaultConnectionId: string | null;
   /** `noConnection`: pinned to a Connection that was deleted or can't be used (absent from an older server). */
   agentsSummary: { total: number; usingDefault: number; pinned: number; noConnection?: number; off: number; actionNeeded: number };
+  /** Which agents have the App ("off" ones excepted); absent from older servers. */
+  agentAccess?: AppAgentAccess;
+  /**
+   * This Server's owner or admin vouched for the App: every agent here can use it with no one's
+   * approval, whoever made it (`PUT /mcp/apps/:id/server-vouch`). Absent from older servers: reads as false.
+   */
+  serverVouched?: boolean;
+  serverVouchedAt?: string | null;
   distribution: { kind: "server_local"; publishStatus: "private" };
   viewer: { canManage: boolean };
 }

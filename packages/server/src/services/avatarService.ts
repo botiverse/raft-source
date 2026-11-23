@@ -13,10 +13,11 @@ import { isHumanAvatarUrl } from "@botiverse/raft-shared/src/humanAvatar";
 import { and, isNull, sql } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { agents, users } from "../db/schema";
+import { PROFILE_AVATAR_MAX_SIZE_LABEL } from "./avatarLimits";
 
 export { MAX_PROFILE_AVATAR_BYTES };
 
-export const PROFILE_AVATAR_MAX_SIZE_LABEL = "5 MB";
+export { PROFILE_AVATAR_MAX_SIZE_LABEL };
 export const PROFILE_AVATAR_MIME_TYPES = new Set([
   "image/jpeg",
   "image/png",

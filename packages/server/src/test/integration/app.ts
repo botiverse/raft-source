@@ -1,4 +1,5 @@
 import { setActivityRealtimeIO } from "../../services/activityRealtime";
+import { setObjectWatchRealtimeIO } from "../../services/objectWatchRealtime";
 import { setListChangedRealtimeIO } from "../../services/listChangedRealtime";
 import { setJointHumanReadRealtimeIO } from "../../services/jointHumanReadRealtime";
 import { configureJointHostSideArchiveEffects } from "../../services/jointHostSideArchive";
@@ -61,8 +62,8 @@ type StubAgentOrchestrator = {
   resetAgent: (agentId: string, mode: "restart" | "session" | "full", options?: { restartIfStopped?: boolean }) => Promise<void>;
   evictCache: (agentId: string) => void;
   liftWakeBlockForConfigChange: (agentId: string, options?: { runtimeValuesChanged?: boolean; runtimeOrModelChanged?: boolean }) => Promise<void>;
-  /** Reconciler step 11b: as for a daemon without the config push, so routes keep their fallback. */
-  applyAgentConfig: (agentId: string) => Promise<"pushed" | "not_pushed">;
+  /** Reconciler step 11b + #proj-runtime:#80: as for a daemon without the config push. */
+  applyAgentConfig: (agentId: string, options?: { fallbackRestartMode?: "restart" | "session"; terminalControl?: "runtime_config_changed" }) => Promise<"pushed" | "pushed_busy" | "pushed_restarted" | "fallback_restarted" | "fallback_when_idle" | "not_pushed">;
   shutdown: () => void;
   setIO: () => void;
   hasMachineLocally: (machineId: string) => boolean;
@@ -228,6 +229,7 @@ export async function createTestApp(port = 0, opts: TestAppOptions = {}) {
 
   app.set("io", io);
   setActivityRealtimeIO(io);
+  setObjectWatchRealtimeIO(io);
   setListChangedRealtimeIO(io);
   setJointHumanReadRealtimeIO(io, (userId, serverId, scopes) => onConversationsRead(io, userId, serverId, scopes));
   app.set("agentOrchestrator", agentOrchestrator);

@@ -44,6 +44,7 @@ import type { SidebarCreateActions } from "../hooks/useSidebarCreateActions";
 import type { SidebarItems } from "../hooks/useSidebarItems";
 import type { SidebarProjection } from "../hooks/useSidebarProjection";
 import type { SidebarDnd } from "../hooks/useSidebarDnd";
+import type { SidebarBrowserInUseMarks } from "../hooks/useSidebarBrowserInUse";
 import { stagedRowIds } from "../hooks/useStagedSidebarRows";
 
 const EMPTY_SIDEBAR_ITEM_IDS: string[] = [];
@@ -67,7 +68,7 @@ const SIDEBAR_DND_MEASURING = { droppable: { strategy: MeasuringStrategy.Always 
  * The Chat rail's sections (Pinned, custom sections, Joint Channels, Channels,
  * Direct Messages) in their drag-and-drop context.
  */
-export function SidebarChatSections({ data, view, sync, rowHandlers, route, createActions, items, projection, dnd }: {
+export function SidebarChatSections({ data, view, sync, rowHandlers, route, createActions, items, projection, dnd, browserInUse }: {
   data: SidebarData;
   view: SidebarViewState;
   sync: SidebarSync;
@@ -77,6 +78,7 @@ export function SidebarChatSections({ data, view, sync, rowHandlers, route, crea
   items: SidebarItems;
   projection: SidebarProjection;
   dnd: SidebarDnd;
+  browserInUse: SidebarBrowserInUseMarks;
 }) {
   const {
     formatMessage, channelsLoading, agents, serverPublicPageLive, pinnedHeld, channelSectionsHeld, dmsHeld,
@@ -107,6 +109,8 @@ export function SidebarChatSections({ data, view, sync, rowHandlers, route, crea
     sidebarCollisionDetection, resetSidebarDnd, handleSidebarDragStart, handleSidebarDragOver,
     handleSidebarDragEnd,
   } = dnd;
+  // The built-in browser's mark: a row's, and a folded section head's for its hidden rows (Raft Desktop).
+  const { rowBrowserInUse, sectionBrowserInUse } = browserInUse;
 
   const renderSortMenu = (
     section: SidebarSortSection,
@@ -152,6 +156,7 @@ export function SidebarChatSections({ data, view, sync, rowHandlers, route, crea
       onContextMenu={openCtxMenu}
       makeLongPress={makeLongPressHandlers}
       serverPublicPageLive={serverPublicPageLive}
+      browserInUse={rowBrowserInUse(channel.id)}
     />
   );
 
@@ -175,6 +180,7 @@ export function SidebarChatSections({ data, view, sync, rowHandlers, route, crea
         onSelect={handleSelectLounge}
         onContextMenu={openCtxMenu}
         makeLongPress={makeLongPressHandlers}
+        browserInUse={rowBrowserInUse(lounge.channelId)}
       />
     );
   };
@@ -194,6 +200,7 @@ export function SidebarChatSections({ data, view, sync, rowHandlers, route, crea
         onSelect={handleSelectAgentDm}
         onContextMenu={openCtxMenu}
         makeLongPress={makeLongPressHandlers}
+        browserInUse={rowBrowserInUse(dmId)}
       />
     );
   };
@@ -228,6 +235,7 @@ export function SidebarChatSections({ data, view, sync, rowHandlers, route, crea
         agentExternal={matchingAgent ? matchingAgent.external === true || isExternalAgentRuntime(matchingAgent.runtime) : false}
         appBot={Boolean(matchingAgent?.managedByAppInstallId)}
         appBotAppName={matchingAgent?.managedByApp?.name ?? null}
+        browserInUse={rowBrowserInUse(dm.id)}
       />
     );
   };
@@ -291,6 +299,7 @@ export function SidebarChatSections({ data, view, sync, rowHandlers, route, crea
             aria-expanded={!collapsed.pinned}
             aria-controls="sidebar-section-pinned"
             data-testid="sidebar-section-toggle-pinned"
+            browserInUse={collapsed.pinned ? sectionBrowserInUse[SIDEBAR_PINNED_CONTAINER_ID] : null}
           >
             <SidebarSectionChevronIcon open={!collapsed.pinned} />
             <SidebarSectionTitle>{formatMessage({ id: "layout.sidebar.pinned" })}</SidebarSectionTitle>
@@ -365,6 +374,7 @@ export function SidebarChatSections({ data, view, sync, rowHandlers, route, crea
                 sectionKey={section.id}
                 onToggleSection={toggleCustomSection}
                 aria-expanded={!collapsedCustom}
+                browserInUse={collapsedCustom ? sectionBrowserInUse[containerId] : null}
               >
                 <SidebarSectionChevronIcon open={!collapsedCustom} />
                 {section.emoji && <span aria-hidden>{section.emoji}</span>}
@@ -423,6 +433,7 @@ export function SidebarChatSections({ data, view, sync, rowHandlers, route, crea
             aria-expanded={!collapsed.jointChannels}
             aria-controls="sidebar-section-joint-channels"
             data-testid="sidebar-section-toggle-joint-channels"
+            browserInUse={collapsed.jointChannels ? sectionBrowserInUse[SIDEBAR_JOINT_CHANNELS_CONTAINER_ID] : null}
           >
             <SidebarSectionChevronIcon open={!collapsed.jointChannels} />
             <SidebarSectionTitle>{formatMessage({ id: jointSectionLabelId })}</SidebarSectionTitle>
@@ -489,6 +500,7 @@ export function SidebarChatSections({ data, view, sync, rowHandlers, route, crea
         aria-expanded={!collapsed.channels}
         aria-controls="sidebar-section-channels"
         data-testid="sidebar-section-toggle-channels"
+        browserInUse={collapsed.channels ? sectionBrowserInUse[SIDEBAR_CHANNELS_CONTAINER_ID] : null}
       >
         <SidebarSectionChevronIcon open={!collapsed.channels} />
         <SidebarSectionTitle>{formatMessage({ id: "layout.sidebar.channels" })}</SidebarSectionTitle>
@@ -561,6 +573,7 @@ export function SidebarChatSections({ data, view, sync, rowHandlers, route, crea
             aria-expanded={agentsExpanded}
             aria-controls="sidebar-section-direct-messages"
             data-testid="sidebar-section-toggle-dms"
+            browserInUse={collapsed.agents ? sectionBrowserInUse[SIDEBAR_DMS_CONTAINER_ID] : null}
           >
             <SidebarSectionChevronIcon open={!collapsed.agents} />
             <SidebarSectionTitle>{formatMessage({ id: "layout.sidebar.directMessages" })}</SidebarSectionTitle>

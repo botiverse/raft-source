@@ -52,8 +52,11 @@
 import { and, asc, eq, gt, gte, lt, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import {
+  ARTIFACT_CHECK_ELEMENT_MAX_CHARS,
+  ARTIFACT_CHECK_HOLD_STYLES,
   ARTIFACT_CHECK_MAX_BLOCKED_RESOURCES,
   ARTIFACT_CHECK_MAX_CONSOLE_ERRORS,
+  ARTIFACT_CHECK_MAX_HELD_BY,
   ARTIFACT_CHECK_SHOT_MAX_BYTES,
   ARTIFACT_CHECK_TEXT_MAX_CHARS,
   ARTIFACT_CHECK_TIMING_MAX_MS,
@@ -63,6 +66,8 @@ import {
   currentDate,
   isArtifactCheckedKind,
   isArtifactFramedKind,
+  type ArtifactCheckCantScroll,
+  type ArtifactCheckHoldStyle,
   type ArtifactCheckLease,
   type ArtifactCheckShot,
   type ArtifactCheckTiming,
@@ -73,7 +78,7 @@ import { getDb, type DatabaseExecutor } from "../../platform/db";
 import { claimObjectFile, ObjectFileRefusedError, putObjectFile } from "../../platform/objectFiles";
 import { AppObjectStorageUnavailableError } from "../../platform/storage";
 import { recordAppEvent } from "../../platform/tracing";
-import { itemServerEnabled } from "./apiCommon";
+import { itemWritable } from "./apiCommon";
 import { signCheckFrame } from "./checkFrame";
 import { ARTIFACT_CHECK_LEASE_MS, artifactFileObject, checkShotPart, keepNewestCheckShots, mayStartCheck } from "./checks";
 import {
@@ -127,7 +132,7 @@ async function verdictOf(tx: DatabaseExecutor, { check, version, item }: Candida
   if (!isArtifactFramedKind(kind)) return { kind: "fail", errorClass: "not_framed" };
   // A Markdown or PDF version recorded before checks left it out (shared ARTIFACT_CHECKED_KINDS).
   if (!isArtifactCheckedKind(kind)) return { kind: "fail", errorClass: "not_checked" };
-  if (!(await itemServerEnabled(item))) return { kind: "fail", errorClass: "disabled" };
+  if (!(await itemWritable(item))) return { kind: "fail", errorClass: "disabled" };
   // A retry (running, its lease run out) passed the caps when it first started.
   if (check.status === "pending") {
     const allowance = await mayStartCheck(tx, check, item.serverId, { env });
@@ -247,6 +252,30 @@ function parsedTiming(value: unknown): ArtifactCheckTiming | null {
   return { browserMs, prepareMs, loadMs, settleMs, shotsMs };
 }
 
+/**
+ * The report's `pageCantScroll` as sent, else none: a soft hint, so one entry that isn't one is
+ * left out and the report still stands (as `timing`: an older or newer Worker never loses a check
+ * to it). At most one entry a shot (the first kept), at most ARTIFACT_CHECK_MAX_HELD_BY elements
+ * each, an element's name (the page's own) kept as text and cut to ARTIFACT_CHECK_ELEMENT_MAX_CHARS.
+ */
+function parsedCantScroll(value: unknown): ArtifactCheckCantScroll[] {
+  if (!Array.isArray(value)) return [];
+  const kept: ArtifactCheckCantScroll[] = [];
+  for (const entry of value.slice(0, ARTIFACT_CHECK_VIEWPORTS.length)) {
+    if (!isRecord(entry) || !ARTIFACT_CHECK_VIEWPORTS.some((v) => v.shot === entry.shot) || kept.some((k) => k.shot === entry.shot)) continue;
+    const { viewportWidth, viewportHeight, contentHeight, hiddenHeight, heldBy } = entry;
+    if (!isCount(viewportWidth) || !isCount(viewportHeight) || !isCount(contentHeight) || !isCount(hiddenHeight) || !Array.isArray(heldBy)) continue;
+    const held: ArtifactCheckCantScroll["heldBy"] = [];
+    for (const by of heldBy.slice(0, ARTIFACT_CHECK_MAX_HELD_BY)) {
+      if (!isRecord(by) || typeof by.element !== "string" || !ARTIFACT_CHECK_HOLD_STYLES.includes(by.style as ArtifactCheckHoldStyle)) continue;
+      const element = [...keptText(by.element).trim()].slice(0, ARTIFACT_CHECK_ELEMENT_MAX_CHARS).join("");
+      if (element !== "") held.push({ element, style: by.style as ArtifactCheckHoldStyle });
+    }
+    kept.push({ shot: entry.shot as ArtifactCheckShot, viewportWidth, viewportHeight, contentHeight, hiddenHeight, heldBy: held });
+  }
+  return kept;
+}
+
 /** A page's text as kept: no control characters (so the stored JSON stays near its length), cut to ARTIFACT_CHECK_TEXT_MAX_CHARS code points. */
 function keptText(value: string): string {
   // eslint-disable-next-line no-control-regex
@@ -263,7 +292,7 @@ const isCount = (value: unknown): value is number => typeof value === "number" &
  */
 export function parseCheckReport(value: unknown): ParsedCheckReport | null {
   if (!isRecord(value)) return null;
-  const { checkId, lease, load, consoleErrors, blockedResources, blank, phoneOverflow, timing } = value;
+  const { checkId, lease, load, consoleErrors, blockedResources, blank, phoneOverflow, pageCantScroll, timing } = value;
   if (typeof checkId !== "string" || typeof lease !== "string" || !isRecord(load)) return null;
   const leaseAt = new Date(lease);
   if (Number.isNaN(leaseAt.getTime()) || leaseAt.toISOString() !== lease) return null;
@@ -290,7 +319,10 @@ export function parseCheckReport(value: unknown): ParsedCheckReport | null {
     if (!isRecord(phoneOverflow) || !isCount(phoneOverflow.contentWidth) || !isCount(phoneOverflow.viewportWidth)) return null;
     overflow = { contentWidth: phoneOverflow.contentWidth, viewportWidth: phoneOverflow.viewportWidth };
   }
-  return { checkId, lease: leaseAt, load: parsedLoad, findings: { consoleErrors: errors, blockedResources: blocked, blank: blank ?? false, phoneOverflow: overflow }, timing: parsedTiming(timing) };
+  const findings: ArtifactCheckFindings = { consoleErrors: errors, blockedResources: blocked, blank: blank ?? false, phoneOverflow: overflow };
+  const cantScroll = parsedCantScroll(pageCantScroll);
+  if (cantScroll.length > 0) findings.pageCantScroll = cantScroll;
+  return { checkId, lease: leaseAt, load: parsedLoad, findings, timing: parsedTiming(timing) };
 }
 
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);

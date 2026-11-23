@@ -59,6 +59,11 @@
  * with it in its address (a reload) drops it first. The App also keeps a limit of its own: a page whose script never
  * runs says nothing.
  *
+ * `hostConversation=<conversation id>` with the host shell (#proj-workspace:#309, Lagoon): the conversation the App
+ * opened the Artifact from (its message card, its Files). The page's own bar (`hostMenu`) then makes the title the
+ * menu of the Artifacts recently opened there, as the side card beside a conversation does (#proj-workspace:#291).
+ * Latched with the rest and kept in the URL by the keeper, so picking another one (a new address) keeps it.
+ *
  * Legacy `embed=1` is deliberately NOT supported (@artin: 不用兼容). An old client
  * therefore falls back to a normal page — one extra web header, not a double header.
  */
@@ -91,12 +96,21 @@ export interface EmbedMode {
    * App's order). Present only when at least one is known. Latched with the rest, and kept in the URL by the keeper.
    */
   hostMenu?: readonly HostMenuItem[];
+  /**
+   * `hostConversation=<id>` with the host shell: the conversation the App opened the Artifact from (an id's
+   * characters only, else ignored). Latched with the rest, and kept in the URL by the keeper.
+   */
+  hostConversation?: string;
 }
 
-/** An item of the App's own that the page's ⋯ offers, asked for through `#host=<item>` (artifactPageOpening). */
-export type HostMenuItem = "desktop-mode" | "open-in-browser";
+/**
+ * Something the App does itself when the page asks through `#host=<item>` (artifactPageOpening): `desktop-mode` and
+ * `open-in-browser` are items of the page's ⋯; `copy-link` is the page's own Copy link, done with the system clipboard
+ * (a WebView may refuse the page's clipboard write; Lagoon, mobile #4870).
+ */
+export type HostMenuItem = "desktop-mode" | "open-in-browser" | "copy-link";
 
-const HOST_MENU_ITEMS: readonly HostMenuItem[] = ["desktop-mode", "open-in-browser"];
+const HOST_MENU_ITEMS: readonly HostMenuItem[] = ["desktop-mode", "open-in-browser", "copy-link"];
 
 function parseHostMenu(value: string | null): HostMenuItem[] {
   if (!value) return [];
@@ -123,7 +137,16 @@ export function parseEmbedMode(search: string): EmbedMode {
     ...(params.get("chrome") === "none" ? { chromeless: true as const } : {}),
     ...(params.get("back") === "host" ? { hostBack: true as const } : {}),
     ...hostMenuOf(params),
+    ...hostConversationOf(params),
   };
+}
+
+/** A conversation id as the App writes it (a UUID; letters, digits, `-` and `_`, at most 64): anything else is ignored. */
+const CONVERSATION_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+function hostConversationOf(params: URLSearchParams): { hostConversation?: string } {
+  const value = params.get("hostConversation");
+  return value !== null && CONVERSATION_ID.test(value) ? { hostConversation: value } : {};
 }
 
 function hostMenuOf(params: URLSearchParams): { hostMenu?: readonly HostMenuItem[] } {
@@ -202,6 +225,12 @@ export function hostMenuItems(): readonly HostMenuItem[] {
   return mode.embedded && mode.shell === "host" ? mode.hostMenu ?? NO_HOST_MENU : NO_HOST_MENU;
 }
 
+/** The conversation the App opened the Artifact from (`hostConversation=`, with the host shell): null when it named none. */
+export function hostConversationId(): string | null {
+  const mode = getEmbedMode();
+  return mode.embedded && mode.shell === "host" ? mode.hostConversation ?? null : null;
+}
+
 /**
  * Whether the page has drawn the only bar (title, version and the App's items), so the App may drop its own:
  * `hostToolbar=1`, written once the toolbar is up and kept by the keeper from then on. Only for an App that
@@ -278,6 +307,7 @@ export function withEmbedParams(current: URLSearchParams): URLSearchParams {
   // The App's items and the bar's flag, so a reload keeps one bar; Desktop mode only where the query lost it (the App
   // writes it, and a value it wrote is never overwritten with an older one).
   if (mode.hostMenu && !next.has("hostMenu")) next.set("hostMenu", mode.hostMenu.join(","));
+  if (mode.hostConversation && !next.has("hostConversation")) next.set("hostConversation", mode.hostConversation);
   if (toolbarDrawn) next.set("hostToolbar", "1");
   if (lastHostDesktop !== null && !next.has("hostDesktop")) next.set("hostDesktop", lastHostDesktop ? "on" : "off");
   return next;
@@ -307,6 +337,7 @@ export function needsEmbedRepair(search: string): boolean {
   const params = new URLSearchParams(search);
   return params.get("embed") !== SUPPORTED_EMBED || params.get("shell") !== mode.shell || (mode.hostBack === true && params.get("back") !== "host")
     || (mode.hostMenu !== undefined && !params.has("hostMenu"))
+    || (mode.hostConversation !== undefined && !params.has("hostConversation"))
     || (toolbarDrawn && params.get("hostToolbar") !== "1")
     || (lastHostDesktop !== null && !params.has("hostDesktop"));
 }

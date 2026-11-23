@@ -25,6 +25,7 @@ import { ArtifactVersionBadge } from "./ArtifactMessageCard";
 import { ArtifactMetaRow } from "./ArtifactMetaRow";
 import ArtifactScopeLabel from "./ArtifactScopeLabel";
 import { artifactHostOf, artifactOpenFocusReason, returnArtifactFocus, useArtifactViewerStore } from "./artifactViewerStore";
+import { WINDOW_TITLE_BAR } from "./artifactWindowTitleBar";
 
 /**
  * The side card while the viewer's code downloads (its first open before the
@@ -43,6 +44,7 @@ export default function ArtifactViewerPlaceholder({
   onToggleExpanded,
   onClose,
   onRetry,
+  inWindow = false,
 }: {
   target: ArtifactLinkTarget;
   covering: boolean;
@@ -52,12 +54,14 @@ export default function ArtifactViewerPlaceholder({
   onClose: () => void;
   /** Set when the download failed: the body offers to try again. */
   onRetry?: () => void;
+  /** An Artifact's object window (ArtifactViewer `inWindow`): its head is the window's title bar, with no Expand or Close. */
+  inWindow?: boolean;
 }) {
   const { formatMessage } = useIntl();
   const seed = useMemo(() => artifactCardSeed(target), [target]);
   const closeLabel = formatMessage({ id: "artifacts.viewer.close" });
   const expandLabel = formatMessage({ id: expanded ? "artifacts.viewer.restore" : "artifacts.viewer.expand" });
-  const inRow = useRowInRow("artifact");
+  const inRow = useRowInRow("artifact") && !inWindow;
   // As the viewer's head: the side window's switch chip, where the built-in browser is open behind it.
   const lead = useContext(PanelHeadLeadContext);
   const panelRef = useRef<HTMLElement | null>(null);
@@ -65,16 +69,19 @@ export default function ArtifactViewerPlaceholder({
   // plan rule 2, artifactOpenFocusReason), back to the opener on close (not when the viewer takes over).
   useEffect(() => {
     requestFocus(() => panelRef.current, { reason: artifactOpenFocusReason() });
+    // An object window gives focus back itself, in the main window.
+    if (inWindow) return;
     const host = artifactHostOf(panelRef.current, useArtifactViewerStore.getState().open?.conversationId);
     return () => {
       if (useArtifactViewerStore.getState().open === null) returnArtifactFocus(host);
     };
-  }, []);
+  }, [inWindow]);
   const handleKeyDown = useCallback((event: KeyboardEvent<HTMLElement>) => {
-    if (event.key !== "Escape" || event.defaultPrevented) return;
+    // An object window is not closed by Esc: its own close and ⌘W close it (ArtifactViewer `inWindow`).
+    if (event.key !== "Escape" || event.defaultPrevented || inWindow) return;
     event.preventDefault();
     onClose();
-  }, [onClose]);
+  }, [onClose, inWindow]);
   const failed = onRetry !== undefined;
   return (
     <Panel
@@ -88,7 +95,7 @@ export default function ArtifactViewerPlaceholder({
       data-testid="artifact-viewer-placeholder"
       data-side-card-focus=""
     >
-      <PanelHeader>
+      <PanelHeader {...(inWindow ? WINDOW_TITLE_BAR : null)}>
         {covering ? (
           <PanelAction aria-label={closeLabel} onClick={onClose} className={ownBack ? undefined : "max-md:hidden"} data-testid="artifact-viewer-placeholder-back">
             <ArrowLeft />
@@ -106,9 +113,10 @@ export default function ArtifactViewerPlaceholder({
             <PanelHeading><ArtifactSplashTitlePlaceholder /></PanelHeading>
           )}
           {seed ? (
-            // The viewer's own meta row, as tall as the readers' stack, so nothing moves when it takes over.
-            <ArtifactMetaRow text={<ArtifactScopeLabel home={seed.home} fromAnotherServer={seed.fromAnotherServer} />} />
-          ) : failed ? null : <ArtifactMetaRow text={<ArtifactSplashMetaPlaceholder />} />}
+            // The viewer's own meta row on a phone, as tall as the readers' stack, so nothing moves when it takes over;
+            // a desktop head is one line.
+            <ArtifactMetaRow text={<ArtifactScopeLabel home={seed.home} fromAnotherServer={seed.fromAnotherServer} />} phoneOnly />
+          ) : failed ? null : <ArtifactMetaRow text={<ArtifactSplashMetaPlaceholder />} phoneOnly />}
         </PanelHeaderContent>
         <PanelActions>
           {/* A column of the planned row (#189): the row's Expand (rule 5). */}
@@ -119,7 +127,7 @@ export default function ArtifactViewerPlaceholder({
               </PanelToggleAction>
             </Tooltip>
           ) : null}
-          {covering ? null : (
+          {covering || inWindow ? null : (
             <Tooltip content={closeLabel}>
               <PanelAction aria-label={closeLabel} onClick={onClose} data-testid="artifact-viewer-placeholder-close">
                 <X />

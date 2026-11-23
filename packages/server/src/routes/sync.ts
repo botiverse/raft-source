@@ -17,16 +17,24 @@
 //                  change's channel (listChannelTaskRows).
 // Not in the list for this viewer (deleted, archived, no longer visible):
 // the change goes out as a delete.
+//
+// `capabilities=inbox_row` (comma-separated list; unknown names ignored), with
+// the server's sync_inbox_rows_v0 flag on: also `inbox_row` changes, each the
+// GET /api/channels/inbox?ids= row (readInboxRowsForSync), a message position
+// in the cursor, and `inboxReset` (services/syncInboxRows.ts). Otherwise the
+// response is exactly as without the parameter.
 import { Router, type Router as RouterType } from "express";
 import { inArray } from "drizzle-orm";
 import {
   isSubConversationType,
+  SYNC_CAPABILITY_INBOX_ROW,
   SYNC_SNAPSHOT_NAMES,
   type SyncChange,
   type SyncChangesResponse,
   type ServerRole,
   type SyncSnapshotName,
 } from "@botiverse/raft-shared";
+import { observeMetricSafely, syncChangesResetTotal } from "../metrics";
 import { getDb } from "../db/index";
 import { channels } from "../db/schema";
 import * as channelService from "../services/channelService";
@@ -45,11 +53,12 @@ import { mapWithConcurrency } from "../lib/mapWithConcurrency";
 import { actorRoleHasServerCapability, getActorServerRoleInServer } from "../lib/actorPermissions";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
 import { addTraceEvent, createTraceDbQueryTracer, withTraceChildSpan } from "../tracing/semanticTrace";
-import { evaluateFeatureFlag, SYNC_CHANGES_API_FEATURE_FLAG_KEY } from "../services/featureFlagService";
+import { evaluateFeatureFlag, SYNC_CHANGES_API_FEATURE_FLAG_KEY, SYNC_INBOX_ROWS_FEATURE_FLAG_KEY, SYNC_INBOX_STAGING_HELD_FEATURE_FLAG_KEY } from "../services/featureFlagService";
+import { withSyncInboxRows, type SyncInboxRowsResult } from "../services/syncInboxRows";
 import { cachedServerFlagAnswers } from "../services/featureFlagReadCache";
 import { sendJsonServerError } from "./errorResponse";
 import { refuse } from "../lib/refusal";
-import { buildChannelMembersView } from "./channels";
+import { buildChannelMembersView, readInboxRowsForSync } from "./channels";
 import { buildAgentListItems } from "./agents";
 import { buildMachineList, loadSidebarOrderResponse } from "./servers";
 import { readVisibleMessageRow } from "./messages";
@@ -325,7 +334,48 @@ async function syncChangesServed(serverId: string): Promise<boolean> {
   }
 }
 
-// GET /api/sync/changes?since=<cursor>&limit=<n>
+/** SYNC_INBOX_ROWS_FEATURE_FLAG_KEY for this server: on only when the flag says so; a failed read is off. */
+async function syncInboxRowsServed(serverId: string): Promise<boolean> {
+  try {
+    const [served] = await cachedServerFlagAnswers([serverId], SYNC_INBOX_ROWS_FEATURE_FLAG_KEY, async () => {
+      const evaluation = await evaluateFeatureFlag({ key: SYNC_INBOX_ROWS_FEATURE_FLAG_KEY, serverId });
+      return [evaluation.enabled];
+    });
+    return served === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * SYNC_INBOX_STAGING_HELD_FEATURE_FLAG_KEY for this server, read only on a
+ * staging deployment (any other: off, no read); a failed read is off.
+ */
+async function syncInboxStagingHeld(serverId: string, env: NodeJS.ProcessEnv = process.env): Promise<boolean> {
+  if (env.DEPLOYMENT_ENV !== "staging") return false;
+  try {
+    const [held] = await cachedServerFlagAnswers([serverId], SYNC_INBOX_STAGING_HELD_FEATURE_FLAG_KEY, async () => {
+      const evaluation = await evaluateFeatureFlag({ key: SYNC_INBOX_STAGING_HELD_FEATURE_FLAG_KEY, serverId });
+      return [evaluation.enabled];
+    });
+    return held === true;
+  } catch {
+    return false;
+  }
+}
+
+/** The `capabilities` query parameter: a comma-separated list (or repeated); unknown names are ignored. */
+function parseCapabilities(raw: unknown): Set<string> {
+  const values = Array.isArray(raw) ? raw : [raw];
+  const names = new Set<string>();
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    for (const part of value.split(",")) if (part.trim()) names.add(part.trim());
+  }
+  return names;
+}
+
+// GET /api/sync/changes?since=<cursor>&limit=<n>[&capabilities=inbox_row]
 // No `since`: the current cursor and no changes (snapshot, then pull from it).
 syncRouter.get("/changes", async (req, res) => {
   try {
@@ -350,22 +400,39 @@ syncRouter.get("/changes", async (req, res) => {
       ? SYNC_CHANGES_DEFAULT_LIMIT
       : Math.min(Math.max(Number(rawLimit), 1), SYNC_CHANGES_MAX_LIMIT);
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
+    const wantsInboxRows = parseCapabilities(req.query.capabilities).has(SYNC_CAPABILITY_INBOX_ROW)
+      && await syncInboxRowsServed(req.serverId!);
 
     const body = await withTraceChildSpan(
       "server.sync.changes.read",
       { surface: "server", kind: "internal", attrs: { since_present: Boolean(since), limit } },
-      async (): Promise<SyncChangesResponse & { stats: Awaited<ReturnType<typeof readSyncChanges>>["stats"] }> => {
+      async (): Promise<SyncChangesResponse & { stats: Awaited<ReturnType<typeof readSyncChanges>>["stats"] & { inboxRows?: SyncInboxRowsResult["stats"] } }> => {
         // Inside the span: its time and failures are the read's.
         const role = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
         const viewer: Viewer = { userId: req.userId!, serverId: req.serverId!, isGuest: role === "guest" };
         const refusals = viewerRefusals(role);
-        const read = await readSyncChanges({ viewer, since, limit, traceQuery: createTraceDbQueryTracer("sync.changes.read") });
+        const traceQuery = createTraceDbQueryTracer("sync.changes.read");
+        // A guest's Activity is read from Postgres, and without RisingWave there is no read model to wait for:
+        // the capability is ignored there (the response is the non-capable one).
+        const inboxRows = wantsInboxRows && !viewer.isGuest && channelService.activityReadServedByRisingWave();
+        // Only a capable read reads the inbox_row log rows (otherwise they are left out in SQL).
+        const read = await readSyncChanges({ viewer, since, limit, traceQuery, inboxRows });
+        const changes = read.changes.length > 0 ? await buildChanges(viewer, read.changes, { agentOrchestrator, app: req.app }, refusals) : [];
+        const reset = read.reset ? { reason: read.reset, snapshots: allowedSnapshots(SYNC_SNAPSHOT_NAMES, refusals) } : null;
+        if (!inboxRows) {
+          return { cursor: read.cursor, hasMore: read.hasMore, changes, reset, stats: read.stats };
+        }
+        const reader = { userId: viewer.userId, serverId: viewer.serverId, sessionFamilyId: req.sessionFamilyId ?? null };
+        const stagingHeld = await syncInboxStagingHeld(viewer.serverId);
+        const inbox = await withSyncInboxRows({ viewer, since, read, changes, readRows: (ids, options) => readInboxRowsForSync(reader, ids, options), traceQuery, stagingHeld });
         return {
-          cursor: read.cursor,
-          hasMore: read.hasMore,
-          changes: read.changes.length > 0 ? await buildChanges(viewer, read.changes, { agentOrchestrator, app: req.app }, refusals) : [],
-          reset: read.reset ? { reason: read.reset, snapshots: allowedSnapshots(SYNC_SNAPSHOT_NAMES, refusals) } : null,
-          stats: read.stats,
+          cursor: inbox.cursor,
+          hasMore: inbox.hasMore,
+          changes: inbox.changes,
+          reset,
+          inboxReset: inbox.inboxReset,
+          ...(inbox.retryAfterMs === null ? {} : { retryAfterMs: inbox.retryAfterMs }),
+          stats: { ...read.stats, inboxRows: inbox.stats },
         };
       },
       {
@@ -376,11 +443,22 @@ syncRouter.get("/changes", async (req, res) => {
           changes_count: result.changes.length,
           has_more: result.hasMore,
           ...(result.reset ? { reset_reason: result.reset.reason } : {}),
+          ...(result.inboxReset ? { inbox_reset_reason: result.inboxReset.reason } : {}),
+          ...(result.stats.inboxRows ? {
+            inbox_message_rows: result.stats.inboxRows.messageRows,
+            inbox_log_rows: result.stats.inboxRows.logRows,
+            inbox_held_rows: result.stats.inboxRows.held,
+            inbox_rows_failed: result.stats.inboxRows.failed,
+          } : {}),
           ...(result.stats.horizonLag === null ? {} : { horizon_lag: result.stats.horizonLag }),
         }),
       },
     );
     const { stats: _stats, ...response } = body;
+    if (response.reset) {
+      const reason = response.reset.reason;
+      observeMetricSafely(() => syncChangesResetTotal.inc({ reason }));
+    }
     res.json(response satisfies SyncChangesResponse);
   } catch (err) {
     sendJsonServerError(req, res, {

@@ -112,7 +112,8 @@ test("standard OIDC discovery, authorization, PKCE, ID token, JWKS, and email cl
     assert.equal(discovery.userinfo_endpoint, "https://api.raft.test/api/oauth/userinfo");
     assert.equal(discovery.jwks_uri, "https://api.raft.test/api/oauth/jwks");
     assert.deepEqual(discovery.response_types_supported, ["code"]);
-    assert.deepEqual(discovery.id_token_signing_alg_values_supported, ["ES256"]);
+    // ID tokens are ES256; RS256 is listed for agent tokens of Apps set to RS256.
+    assert.deepEqual(discovery.id_token_signing_alg_values_supported, ["ES256", "RS256"]);
     assert.deepEqual(discovery.code_challenge_methods_supported, ["S256"]);
     assert.ok((discovery.scopes_supported as string[]).includes("email"));
 
@@ -121,7 +122,7 @@ test("standard OIDC discovery, authorization, PKCE, ID token, JWKS, and email cl
     const jwks = await jwksResponse.json() as {
       keys: Array<Record<string, unknown>>;
     };
-    assert.equal(jwks.keys.length, 1);
+    assert.equal(jwks.keys.length, 2, "the ES256 key, then the RS256 key (dev/test: derived from JWT_SECRET)");
     assert.deepEqual(
       {
         kty: jwks.keys[0]?.kty,
@@ -132,6 +133,8 @@ test("standard OIDC discovery, authorization, PKCE, ID token, JWKS, and email cl
       { kty: "EC", crv: "P-256", use: "sig", alg: "ES256" },
     );
     assert.equal("d" in jwks.keys[0]!, false);
+    assert.deepEqual(Object.keys(jwks.keys[1]!).sort(), ["alg", "e", "kid", "kty", "n", "use"], "the RSA key has public members only");
+    assert.deepEqual([jwks.keys[1]!.kty, jwks.keys[1]!.alg, jwks.keys[1]!.use], ["RSA", "RS256", "sig"]);
 
     const verifier = "oidc-standard-verifier-abcdefghijklmnopqrstuvwxyz-0123456789";
     const challenge = codeChallenge(verifier);

@@ -57,6 +57,8 @@ export type CeremonyOptions = {
   rpId?: string;
   /** User verified (default true). */
   userVerified?: boolean;
+  /** User present (default true). */
+  userPresent?: boolean;
 };
 
 export class SoftwareAuthenticator {
@@ -101,7 +103,7 @@ export class SoftwareAuthenticator {
   }
 
   private authData(options: CeremonyOptions, counter: number, attested: boolean): Buffer {
-    const flags = UP
+    const flags = (options.userPresent === false ? 0 : UP)
       | (options.userVerified === false ? 0 : UV)
       | (this.synced ? BE | BS : 0)
       | (attested ? AT : 0);

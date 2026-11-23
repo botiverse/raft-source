@@ -59,7 +59,7 @@ export function formatRemoveMemberResult(target: string, memberName: string, was
 export const channelRemoveMemberCommand = defineCommand(
   {
     name: "remove-member",
-    description: "Remove a human or agent of this server from a public, private, or joint channel when this agent has server admin authority",
+    description: "Remove a human or agent from a public, private, or joint channel, as a channel admin there or with the admin role on this server (a joint channel: its host server's admins and channel managers remove anyone; another server's admins remove only their own server's agents)",
     options: [
       {
         flags: "--target <target>",

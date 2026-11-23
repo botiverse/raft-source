@@ -15,6 +15,11 @@
  *   case's message and its mention rows;
  * - isMessageUnreadEligibleForReceiver / countsTowardTaskConversationUnread
  *   (inboxUnreadEligibility.ts), the application-side copy of the rule.
+ * - `moves` against RisingWave's muted prefix: a muted row's latest_seq takes
+ *   only messages inside the boundary (rw_inbox_muted_prefix_v2, the same
+ *   boundary as its count), and rw_inbox_serving_v9 shows that latest_seq.
+ *   The canonical Postgres read picks the row's latest message the same way
+ *   (legacyChatLatestActivityMessageSql, pinned in inboxPolicyModel.test.ts).
  *
  * `mention` is checked against the Postgres @ rule only: in RisingWave the @ is
  * the mention arm (rw_inbox_mention_v7), not the unread FILTER. Client-only
@@ -45,7 +50,7 @@ type Message = {
   mentions?: { type: string; id: string }[];
 };
 type Scope = { rowKind: "channel" | "dm" | "thread" | "task"; threadFollowed?: boolean; activityMuted?: boolean; readOnArrival?: boolean };
-type Verdict = { counts: boolean | null; mention: boolean };
+type Verdict = { counts: boolean | null; mention: boolean; moves: boolean };
 type PredicateCase = {
   id: string;
   rule: string;
@@ -81,6 +86,23 @@ const MUTE_BOUNDARY = (() => {
   assert.ok(match, "no mute boundary in rw_inbox_muted_prefix_v2");
   return match[1]!.replaceAll("a.", "s.");
 })();
+
+/** The muted prefix's latest_seq join: the message (seq 101) is inside it, so it can become the row's latest_seq. */
+const MUTED_LATEST_BOUNDARY = (() => {
+  const view = sql075.slice(sql075.indexOf("CREATE MATERIALIZED VIEW rw_inbox_muted_prefix_v2"));
+  const match = /ON m\.target_id = s\.target_id AND (m\.seq < COALESCE\(s\.mute_from_seq, 9223372036854775807\))/.exec(view);
+  assert.ok(match, "no latest_seq boundary in rw_inbox_muted_prefix_v2");
+  return match[1]!;
+})();
+
+async function sqlMoves({ given }: PredicateCase): Promise<boolean> {
+  const muted = given.scope.activityMuted && given.scope.rowKind !== "thread" && given.scope.rowKind !== "task";
+  if (!muted) return true;
+  const result = await db.query<{ moves: boolean }>(
+    `SELECT (${MUTED_LATEST_BOUNDARY}) AS moves FROM (VALUES (101::bigint)) AS m(seq), (VALUES (100::bigint)) AS s(mute_from_seq)`,
+  );
+  return result.rows[0]!.moves;
+}
 
 /** Why the server has no rule to check for this case, or null. */
 function notServerDecided({ given }: PredicateCase): string | null {
@@ -220,6 +242,7 @@ describe("activity row predicate cases against the server's unread rule", () => 
       assert.equal(postgres.counts, expected, "Postgres inboxRowMessageCountsUnreadSql");
       if (!mentionNotRuleDecided(contractCase)) assert.equal(postgres.mention, verdict!.mention, "Postgres inboxPersonalMentionSql");
       assert.equal(applicationCounts(contractCase), expected, "isMessageUnreadEligibleForReceiver");
+      assert.equal(await sqlMoves(contractCase), verdict!.moves, "RisingWave rw_inbox_muted_prefix_v2 latest_seq boundary");
     });
   }
 });

@@ -22,7 +22,7 @@
 
   "jsPlugins": [
     { "name": "react-doctor", "specifier": "oxlint-plugin-react-doctor" },
-    "./scripts/oxlint-plugins/raft-test/index.ts"
+    { "name": "raft-test", "specifier": "@botiverse/lint/test" }
   ],
   "plugins": ["typescript", "import", "react", "react-perf"],
 
@@ -241,17 +241,39 @@
     "react-doctor/no-access-key": "error",
     "react-doctor/no-distracting-elements": "error",
 
-    // ── React Compiler rules introduced in oxlint 1.83 (disabled per #proj-frontend:52311f41 decision).
-    // The 245 warnings across the repo come from these 7 new compiler rules:
-    // refs (134), set-state-in-effect (67), preserve-manual-memoization (23),
-    // void-use-memo (14), immutability (4), purity (2), incompatible-library (1).
-    // These will be addressed in a dedicated compiler cleanup pass rather than broadening the RUI PR.
-    "react/refs": "off",
+    // ── React Compiler rules (new in oxlint 1.83). React Compiler is not enabled
+    // in any build here, so these are code hygiene, not build correctness.
+    // On: purity — a clock or random value read while rendering (`Date.now()`,
+    //   `new Date()`, `Math.random()`); with no timer behind it, a page left open
+    //   keeps showing a stale "N minutes ago". Read the time through a clock that
+    //   re-renders (hooks/liveTimeClock.ts, hooks/useCurrentDay.ts) or keep it in state.
+    // On: void-use-memo — a `useMemo` whose callback returns nothing, or whose
+    //   result is thrown away: that is an effect, not a memo. Off for
+    //   visual-testing/** only (see "overrides").
+    // On: immutability — a value React owns (props, state, a hook's arguments
+    //   or result) written in place, a variable reassigned while rendering, or a
+    //   `const` used above its declaration. It also reads a write to a ref
+    //   object passed in, or to a DOM node in an effect, as such a write: those
+    //   carry a one-line suppression with the reason.
+    // Warn, held by a per-file count ratchet: refs — a ref's `.current` read or
+    //   written while rendering (a read can show a stale value; the common
+    //   write is the "latest value" line `xRef.current = x`). Too many to fix
+    //   at once, so scripts/lint-app.ts, which runs this config for `lint`,
+    //   reads the findings from that same run and holds each file to its count
+    //   in scripts/refs-ratchet-baseline.json: a file may not gain one, a new
+    //   file may not have any, and a count that drops must be lowered there
+    //   (`pnpm --filter @botiverse/raft-web run lint:refs-baseline`). Keep it
+    //   "warn": every other warning still fails `lint`. Desktop, which extends
+    //   this config, has none and sets it to "error".
+    // Off to stay: set-state-in-effect (the react-doctor rules above already
+    //   enforce it), preserve-manual-memoization and incompatible-library (they
+    //   only matter with React Compiler enabled).
+    "react/purity": "error",
+    "react/void-use-memo": "error",
+    "react/immutability": "error",
+    "react/refs": "warn",
     "react/set-state-in-effect": "off",
     "react/preserve-manual-memoization": "off",
-    "react/void-use-memo": "off",
-    "react/immutability": "off",
-    "react/purity": "off",
     "react/incompatible-library": "off",
 
     // ───────────────────────── Tier-1 (error) ─────────────────────────
@@ -338,6 +360,15 @@
           }
         ]
       }
+    },
+    // Visual-testing cases prime the stores before the first render with
+    // `useMemo(() => prime(caseId), [caseId])` and discard the result, so the
+    // first paint (the one the screenshot takes) already has the fixture data;
+    // an effect would paint an empty frame first. Deliberate there, and only
+    // there: product code keeps the rule.
+    {
+      "files": ["visual-testing/**"],
+      "rules": { "react/void-use-memo": "off" }
     }
   ]
 }

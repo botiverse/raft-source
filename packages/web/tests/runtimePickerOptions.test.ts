@@ -42,31 +42,31 @@ test("create: ready first, then needs a Raft Computer update; not installed only
   assert.deepEqual([builtin?.label, builtin?.availabilitySuffix, builtin?.availabilitySuffixInList], ["Built-in Pi", " (update required)", false]);
 });
 
-test("onboarding's flat list keeps each row's availability suffix and Experimental flag", () => {
+test("onboarding's flat list keeps each row's availability suffix and hint", () => {
   const rows: RuntimePickerRow[] = [
     ...ROWS,
-    { value: "qoder", label: "Qoder", availabilitySuffix: " (not installed)", experimental: true, disabled: true, capabilityStatus: "not_installed" },
+    { value: "qoder", label: "Qoder", availabilitySuffix: " (not installed)", hint: "Uses more tokens.", disabled: true, capabilityStatus: "not_installed" },
   ];
-  assert.deepEqual(flatRuntimePickerOptions(rows).map((option) => [option.label, option.availabilitySuffix, option.availabilitySuffixInList, option.experimental ?? false]), [
-    ["Claude Code", undefined, undefined, false],
-    ["Codex CLI", " (not installed)", undefined, false],
-    ["Built-in Pi", " (update required)", undefined, false],
-    ["Kimi Code", undefined, undefined, false],
-    ["Qoder", " (not installed)", undefined, true],
+  assert.deepEqual(flatRuntimePickerOptions(rows).map((option) => [option.label, option.availabilitySuffix, option.availabilitySuffixInList, option.hint]), [
+    ["Claude Code", undefined, undefined, undefined],
+    ["Codex CLI", " (not installed)", undefined, undefined],
+    ["Built-in Pi", " (update required)", undefined, undefined],
+    ["Kimi Code", undefined, undefined, undefined],
+    ["Qoder", " (not installed)", undefined, "Uses more tokens."],
   ]);
 });
 
-test("an experimental runtime keeps its Experimental flag in every group, its label plain", () => {
+test("a runtime's hint stays on its option in every group (the field's description once chosen), its label plain", () => {
   const rows: RuntimePickerRow[] = [
     ...ROWS,
-    { value: "qoder", label: "Qoder", availabilitySuffix: " (not installed)", experimental: true, disabled: true, capabilityStatus: "not_installed" },
+    { value: "qoder", label: "Qoder", availabilitySuffix: " (not installed)", hint: "Uses more tokens.", disabled: true, capabilityStatus: "not_installed" },
   ];
   const qoder = grouped(rows, true).options.find((option) => option.value === "qoder");
   assert.deepEqual(qoder, {
     value: "qoder",
     label: "Qoder",
     disabled: true,
-    experimental: true,
+    hint: "Uses more tokens.",
     availabilitySuffix: " (not installed)",
     availabilitySuffixInList: false,
     group: "Not installed on this computer",
@@ -105,7 +105,7 @@ test("with nothing else to offer, not-installed rows show without the toggle", (
 test("only a runtime this server does not offer besides not-installed ones: the not-installed rows show without the toggle", () => {
   const rows: RuntimePickerRow[] = [
     ...ROWS.filter((row) => row.capabilityStatus === "not_installed"),
-    { value: "qwen", label: "Qwen Code", experimental: true, disabled: true, selectable: false, capabilityStatus: "available" },
+    { value: "qwen", label: "Qwen Code", disabled: true, selectable: false, capabilityStatus: "available" },
   ];
   const result = grouped(rows, false, "");
   assert.deepEqual(result.options.map((option) => option.value), ["codex"], "not an empty list behind a toggle");
@@ -115,23 +115,21 @@ test("only a runtime this server does not offer besides not-installed ones: the 
 test("a runtime the computer has but this server does not let you pick is not listed", () => {
   const rows: RuntimePickerRow[] = [
     ...ROWS,
-    { value: "qwen", label: "Qwen Code", experimental: true, disabled: true, selectable: false, capabilityStatus: "available" },
+    { value: "qwen", label: "Qwen Code", disabled: true, selectable: false, capabilityStatus: "available" },
   ];
   const { options } = grouped(rows, false, "");
   assert.equal(options.find((option) => option.value === "qwen"), undefined);
   assert.deepEqual(options.map((option) => option.value), ["claude", "kimi-sdk", "builtin"]);
 });
 
-test("a runtime the computer has and this server lets you pick is listed under Ready, a revived deprecated one too", () => {
-  // Antigravity is deprecated in the bundled catalog; a server with
-  // `agent_runtime_oar_antigravity` on offers it again (canSelectInThisContext).
+test("a runtime the computer has and this server lets you pick is listed under Ready", () => {
   const rows: RuntimePickerRow[] = [
     ...ROWS,
-    { value: "qwen", label: "Qwen Code", experimental: true, disabled: false, selectable: true, capabilityStatus: "available" },
+    { value: "qwen", label: "Qwen Code", disabled: false, selectable: true, capabilityStatus: "available" },
     { value: "antigravity", label: "Antigravity CLI", disabled: false, selectable: true, capabilityStatus: "available" },
   ];
   const { options } = grouped(rows, false, "");
-  assert.deepEqual(options.find((option) => option.value === "qwen"), { value: "qwen", label: "Qwen Code", disabled: false, experimental: true, group: "Ready on this computer" });
+  assert.deepEqual(options.find((option) => option.value === "qwen"), { value: "qwen", label: "Qwen Code", disabled: false, group: "Ready on this computer" });
   assert.deepEqual(options.find((option) => option.value === "antigravity"), { value: "antigravity", label: "Antigravity CLI", disabled: false, group: "Ready on this computer" });
   assert.deepEqual(options.map((option) => option.value), ["claude", "kimi-sdk", "qwen", "antigravity", "builtin"]);
 });
@@ -139,11 +137,11 @@ test("a runtime the computer has and this server lets you pick is listed under R
 test("as the field's value, a runtime this server does not let you pick shows under Not available, not Ready", () => {
   const rows: RuntimePickerRow[] = [
     ...ROWS,
-    { value: "qwen", label: "Qwen Code", experimental: true, disabled: true, selectable: false, capabilityStatus: "available" },
+    { value: "qwen", label: "Qwen Code", disabled: true, selectable: false, capabilityStatus: "available" },
   ];
   const { options } = grouped(rows, false, "qwen");
   const qwen = options.find((option) => option.value === "qwen");
-  assert.deepEqual(qwen, { value: "qwen", label: "Qwen Code", disabled: true, experimental: true, group: "Not available on this server" });
+  assert.deepEqual(qwen, { value: "qwen", label: "Qwen Code", disabled: true, group: "Not available on this server" });
   assert.deepEqual(options.map((option) => option.value), ["claude", "kimi-sdk", "qwen", "builtin"], "after Ready, before the rest");
 });
 

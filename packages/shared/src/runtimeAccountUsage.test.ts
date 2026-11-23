@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 
 import type { ServerToMachineMessage } from "./index";
+import { runtimeAccountUsageAccountHomeEnv, runtimeAccountUsageAccountHomes } from "./index";
 import {
   RUNTIME_LIMIT_RESET_KINDS,
   allModelsUsageAccount,
@@ -14,6 +15,10 @@ import {
   maskRuntimeAccountEmail,
   runtimeLimitResetResultSchema,
   safeParseRuntimeAccountUsageSnapshot,
+  withoutCredits,
+  withoutUnsupportedReasons,
+  RUNTIME_ACCOUNT_USAGE_UNSUPPORTED_REASONS,
+  RUNTIME_USAGE_UNSUPPORTED_REASON_CLIENT_CAPABILITY,
   withoutLimitResets,
   withoutModelsScopes,
   withoutWindowScopes,
@@ -22,6 +27,13 @@ import {
   runtimeUsageWindowScopeClientVersion,
   runtimeAccountUsageReadableWith,
   DAEMON_CAPABILITY_RUNTIME_ACCOUNT_USAGE_ANTIGRAVITY,
+  RUNTIME_USAGE_ACCOUNT_FOLDERS_CLIENT_CAPABILITY,
+  RUNTIME_USAGE_CREDITS_CLIENT_CAPABILITY,
+  RUNTIME_USAGE_WINDOW_SCOPE_CLIENT_CAPABILITY,
+  defaultRuntimeUsageAccount,
+  parseRuntimeAccountUsageAccountHomes,
+  runtimeUsageAccountsForAgent,
+  withoutHiddenAccountAgentIds,
   type RuntimeAccountUsageSnapshot,
 } from "./runtimeAccountUsage";
 
@@ -137,6 +149,50 @@ test("withoutLimitResets gives an older server's strict schema only what it know
   assert.equal(withoutLimitResets(without), without, "nothing to strip: the same snapshot");
 });
 
+test("credits are optional, a closed shape, and a balance is a number string", () => {
+  const withCredits = (value: unknown) => ({ ...validSnapshot, accounts: [{ ...validSnapshot.accounts[0], credits: value }] });
+  for (const ok of [{ available: true, balance: "30784" }, { available: false }, { available: true, unlimited: true }, { available: true, balance: "1,234.50" }, { available: false, balance: "-3" }]) {
+    assert.equal(safeParseRuntimeAccountUsageSnapshot(withCredits(ok)).success, true, JSON.stringify(ok));
+  }
+  for (const bad of [{}, { available: "yes" }, { available: true, balance: 30784 }, { available: true, balance: "30784 USD" }, { available: true, balance: "" }, { available: true, extra: 1 }, null]) {
+    assert.equal(safeParseRuntimeAccountUsageSnapshot(withCredits(bad)).success, false, JSON.stringify(bad));
+  }
+});
+
+test("withoutCredits gives an older server or web bundle only what it knows; the web gets credits only when it declares them", () => {
+  const parsed = safeParseRuntimeAccountUsageSnapshot({ ...validSnapshot, accounts: [{ ...validSnapshot.accounts[0], credits: { available: true, balance: "30784" } }] });
+  assert.ok(parsed.success);
+  const stripped = withoutCredits(parsed.data);
+  assert.equal("credits" in stripped.accounts[0]!, false);
+  assert.deepEqual(stripped, safeParseRuntimeAccountUsageSnapshot(validSnapshot).data);
+  const without = safeParseRuntimeAccountUsageSnapshot(validSnapshot).data!;
+  assert.equal(withoutCredits(without), without, "nothing to strip: the same snapshot");
+
+  assert.equal(runtimeAccountUsageSnapshotForClient(parsed.data, undefined).accounts[0]!.credits, undefined, "an older bundle");
+  assert.equal(runtimeAccountUsageSnapshotForClient(parsed.data, RUNTIME_USAGE_WINDOW_SCOPE_CLIENT_CAPABILITY).accounts[0]!.credits, undefined);
+  assert.deepEqual(
+    runtimeAccountUsageSnapshotForClient(parsed.data, `${RUNTIME_USAGE_WINDOW_SCOPE_CLIENT_CAPABILITY}, ${RUNTIME_USAGE_CREDITS_CLIENT_CAPABILITY}`).accounts[0]!.credits,
+    { available: true, balance: "30784" },
+  );
+});
+
+test("unsupportedReason: a known OAR reason, only on an unsupported account; stripped for an older server or a web bundle that does not declare it", () => {
+  const unsupported = (extra: Record<string, unknown>) => ({ ...validSnapshot, accounts: [{ accountKey: validSnapshot.accounts[0].accountKey, health: "unsupported", windows: [], ...extra }] });
+  for (const reason of RUNTIME_ACCOUNT_USAGE_UNSUPPORTED_REASONS) {
+    assert.equal(safeParseRuntimeAccountUsageSnapshot(unsupported({ unsupportedReason: reason })).success, true, reason);
+  }
+  assert.equal(safeParseRuntimeAccountUsageSnapshot(unsupported({ unsupportedReason: "made_up" })).success, false);
+  assert.equal(safeParseRuntimeAccountUsageSnapshot({ ...validSnapshot, accounts: [{ ...validSnapshot.accounts[0], unsupportedReason: "quota_unavailable" }] }).success, false, "only with unsupported health");
+
+  const parsed = safeParseRuntimeAccountUsageSnapshot(unsupported({ unsupportedReason: "quota_unavailable" }));
+  assert.ok(parsed.success);
+  assert.equal("unsupportedReason" in withoutUnsupportedReasons(parsed.data).accounts[0]!, false);
+  const plain = safeParseRuntimeAccountUsageSnapshot(unsupported({})).data!;
+  assert.equal(withoutUnsupportedReasons(plain), plain, "nothing to strip: the same snapshot");
+  assert.equal(runtimeAccountUsageSnapshotForClient(parsed.data, RUNTIME_USAGE_CREDITS_CLIENT_CAPABILITY).accounts[0]!.unsupportedReason, undefined, "an older bundle");
+  assert.equal(runtimeAccountUsageSnapshotForClient(parsed.data, `${RUNTIME_USAGE_CREDITS_CLIENT_CAPABILITY},${RUNTIME_USAGE_UNSUPPORTED_REASON_CLIENT_CAPABILITY}`).accounts[0]!.unsupportedReason, "quota_unavailable");
+});
+
 test("a window's scope is optional: the account, or one model by the runtime's name", () => {
   const withScope = (scope: unknown) => ({
     ...validSnapshot,
@@ -241,7 +297,7 @@ test("limit-reset kinds are the four Claude Code holds, and a redeem message may
 });
 
 test("the Claude driver's refusals are redeem results; consent_required belongs to a read only", () => {
-  for (const reason of ["unsupported_version", "unsupported_platform", "not_attempted"]) {
+  for (const reason of ["unsupported_version", "unsupported_platform", "not_attempted", "onboarding_required"]) {
     assert.equal(runtimeLimitResetResultSchema.safeParse({ kind: "unsupported", reason }).success, true, reason);
     assert.equal(runtimeLimitResetsReadResultSchema.safeParse({ kind: "unsupported", reason }).success, true, reason);
   }
@@ -331,4 +387,106 @@ test("an older Computer's scope-less Claude windows: a model's label is its mode
   assert.equal(allModelsUsageAccount(inferClaudeUsageWindowScopes(snapshot("claude", "limit_reached")).accounts[0]!).account.health, "rate_limited");
   const codex = snapshot("codex", "ok");
   assert.equal(inferClaudeUsageWindowScopes(codex), codex, "another provider's labels are not read");
+});
+
+describe("agents' own account folders", () => {
+  const account = (key: string, agentIds?: string[]) => ({
+    accountKey: key.repeat(64),
+    health: "ok" as const,
+    windows: [{ id: "current_session", label: "Current session", status: "ok" as const, usedRatio: 0.2 }],
+    ...(agentIds ? { agentIds } : {}),
+  });
+  const folders = (accounts: RuntimeAccountUsageSnapshot["accounts"]): RuntimeAccountUsageSnapshot => ({
+    ...validSnapshot,
+    accounts,
+  } as RuntimeAccountUsageSnapshot);
+
+  it("an account may list the agents read under its folder: valid ids, bounded", () => {
+    assert.ok(safeParseRuntimeAccountUsageSnapshot(folders([account("a"), account("b", ["agent-1", "0f8e2c1a-7d1e-4c3b-9a55-0b8d2a7c6e11"])])).success);
+    assert.equal(safeParseRuntimeAccountUsageSnapshot(folders([account("a", [])])).success, false, "an empty list is no list");
+    assert.equal(safeParseRuntimeAccountUsageSnapshot(folders([account("a", ["../etc"])])).success, false);
+    assert.equal(safeParseRuntimeAccountUsageSnapshot(folders([account("a", Array.from({ length: 501 }, (_, i) => `a${i}`))])).success, false);
+  });
+
+  it("an agent reads its own folder's account, else the default account; a snapshot without folders reads as before", () => {
+    const snapshot = folders([account("a"), account("b", ["agent-1"]), account("c", ["agent-2", "agent-3"])]);
+    assert.deepEqual(runtimeUsageAccountsForAgent(snapshot, "agent-1").map((a) => a.accountKey[0]), ["b"]);
+    assert.deepEqual(runtimeUsageAccountsForAgent(snapshot, "agent-3").map((a) => a.accountKey[0]), ["c"]);
+    assert.deepEqual(runtimeUsageAccountsForAgent(snapshot, "agent-9").map((a) => a.accountKey[0]), ["a"]);
+    assert.deepEqual(runtimeUsageAccountsForAgent(snapshot, null).map((a) => a.accountKey[0]), ["a"]);
+    const older = folders([account("a"), account("b")]);
+    assert.deepEqual(runtimeUsageAccountsForAgent(older, "agent-1").map((a) => a.accountKey[0]), ["a", "b"]);
+    assert.deepEqual(runtimeUsageAccountsForAgent(null, "agent-1"), []);
+  });
+
+  it("the default account is the first without agents, else the first", () => {
+    assert.equal(defaultRuntimeUsageAccount(folders([account("b", ["agent-1"]), account("a")]))?.accountKey[0], "a");
+    assert.equal(defaultRuntimeUsageAccount(folders([account("b", ["agent-1"])]))?.accountKey[0], "b");
+    assert.equal(defaultRuntimeUsageAccount(null), null);
+  });
+
+  it("the 5-hour limit reads the default account only, even beside agents' folders", () => {
+    const snapshot = folders([account("a"), { ...account("b", ["agent-1"]), health: "rate_limited", windows: [{ id: "current_session", label: "Current session", status: "limit_reached", usedRatio: 1 }] }]);
+    assert.equal(claudeFiveHourLimitOf(snapshot), "not_at_limit");
+    assert.equal(claudeFiveHourLimitOf(folders([account("a"), account("b")])), "unknown", "two default accounts: no answer, as before");
+  });
+
+  it("a web client gets agentIds only when it declares it reads them", () => {
+    const snapshot = folders([account("a"), account("b", ["agent-1"])]);
+    assert.equal(runtimeAccountUsageSnapshotForClient(snapshot, RUNTIME_USAGE_WINDOW_SCOPE_CLIENT_CAPABILITY).accounts[1]!.agentIds, undefined);
+    assert.deepEqual(runtimeAccountUsageSnapshotForClient(snapshot, `${RUNTIME_USAGE_WINDOW_SCOPE_CLIENT_CAPABILITY},${RUNTIME_USAGE_ACCOUNT_FOLDERS_CLIENT_CAPABILITY}`).accounts[1]!.agentIds, ["agent-1"]);
+    assert.ok(safeParseRuntimeAccountUsageSnapshot(runtimeAccountUsageSnapshotForClient(snapshot, undefined)).success);
+  });
+
+  it("an agent the viewer may not find leaves every account; an account left listing no one is dropped, never read as the default", () => {
+    const snapshot = folders([account("a"), account("b", ["assistant"]), account("c", ["assistant", "agent-1"])]);
+    const seen = withoutHiddenAccountAgentIds(snapshot, new Set(["assistant"]));
+    assert.deepEqual(seen.accounts.map((a) => [a.accountKey[0], a.agentIds ?? null]), [["a", null], ["c", ["agent-1"]]]);
+    assert.ok(safeParseRuntimeAccountUsageSnapshot(seen).success);
+    assert.equal(withoutHiddenAccountAgentIds(snapshot, new Set()), snapshot);
+  });
+
+  it("a refresh's accountHomes keep only folder providers, valid ids and HOME plus the folder key", () => {
+    assert.equal(parseRuntimeAccountUsageAccountHomes("codex", undefined), undefined);
+    assert.equal(parseRuntimeAccountUsageAccountHomes("kimi", [{ agentIds: ["a"], env: { HOME: "/x" } }]), undefined);
+    assert.deepEqual(parseRuntimeAccountUsageAccountHomes("codex", [
+      { agentIds: ["a", "a", "../x"], env: { CODEX_HOME: "/srv/codex-a", OPENAI_API_KEY: "sk", PATH: "/bin" } },
+      { agentIds: ["b"], env: { CLAUDE_CONFIG_DIR: "/srv/claude" } },
+      { agentIds: [], env: { HOME: "/srv/home" } },
+      { agentIds: ["c"], env: { HOME: "   " } },
+      "junk",
+    ]), [{ agentIds: ["a"], env: { CODEX_HOME: "/srv/codex-a" } }]);
+    assert.deepEqual(parseRuntimeAccountUsageAccountHomes("claude", [{ agentIds: ["d"], env: { HOME: "/h", CLAUDE_CONFIG_DIR: "rel" } }]), [{ agentIds: ["d"], env: { HOME: "/h", CLAUDE_CONFIG_DIR: "rel" } }]);
+    const message: ServerToMachineMessage = { type: "machine:runtime_account_usage:refresh", requestId: "r", provider: "codex", reason: "scheduled", accountHomes: [{ agentIds: ["a"], env: { CODEX_HOME: "/x" } }] };
+    assert.equal(message.type, "machine:runtime_account_usage:refresh");
+  });
+
+  it("the server sends an agent's folder env only for the provider's own default-provider agents without an API key", () => {
+    assert.deepEqual(runtimeAccountUsageAccountHomeEnv("codex", { runtime: "codex", envVars: { CODEX_HOME: "/srv/a", TEAM: "x" } }), { CODEX_HOME: "/srv/a" });
+    assert.deepEqual(runtimeAccountUsageAccountHomeEnv("codex", { runtime: "codex", envVars: { HOME: "/home/b" } }), { HOME: "/home/b" });
+    assert.equal(runtimeAccountUsageAccountHomeEnv("codex", { runtime: "codex", envVars: { CODEX_HOME: "/srv/a", OPENAI_API_KEY: "sk-x" } }), null);
+    assert.equal(runtimeAccountUsageAccountHomeEnv("codex", { runtime: "codex" }), null);
+    assert.equal(runtimeAccountUsageAccountHomeEnv("codex", { runtime: "claude", envVars: { CODEX_HOME: "/srv/a" } }), null);
+    assert.deepEqual(runtimeAccountUsageAccountHomeEnv("claude", { runtime: null, envVars: { CLAUDE_CONFIG_DIR: "/srv/c" } }), { CLAUDE_CONFIG_DIR: "/srv/c" });
+    assert.equal(runtimeAccountUsageAccountHomeEnv("claude", { runtime: "claude", envVars: { CLAUDE_CONFIG_DIR: "/srv/c", ANTHROPIC_AUTH_TOKEN: "t" } }), null);
+    assert.equal(runtimeAccountUsageAccountHomeEnv("claude", {
+      runtime: "claude",
+      envVars: { CLAUDE_CONFIG_DIR: "/srv/c", ANTHROPIC_BASE_URL: "https://gateway.example.test/v1", ANTHROPIC_API_KEY: "sk-ant-test" },
+    }), null, "a custom provider has no signed-in account");
+  });
+
+  it("agents with the same folder env share one accountHomes entry, deterministically", () => {
+    const homes = runtimeAccountUsageAccountHomes("codex", [
+      { id: "b2", runtime: "codex", envVars: { CODEX_HOME: "/srv/b" } },
+      { id: "a1", runtime: "codex", envVars: { CODEX_HOME: "/srv/a" } },
+      { id: "b1", runtime: "codex", envVars: { CODEX_HOME: "/srv/b" } },
+      { id: "d1", runtime: "codex" },
+      { id: "k1", runtime: "codex", envVars: { CODEX_HOME: "/srv/k", OPENAI_API_KEY: "sk" } },
+      { id: "c1", runtime: "claude", envVars: { CODEX_HOME: "/srv/c" } },
+    ]);
+    assert.deepEqual(homes, [
+      { agentIds: ["a1"], env: { CODEX_HOME: "/srv/a" } },
+      { agentIds: ["b1", "b2"], env: { CODEX_HOME: "/srv/b" } },
+    ]);
+  });
 });

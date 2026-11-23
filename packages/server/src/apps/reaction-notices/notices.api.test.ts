@@ -22,6 +22,7 @@ import { getDb } from "../../db/index";
 import { messageReactions, messages, thirdPartyAgentEvents } from "../../db/schema";
 import { INBOX_ITEMS_LAUNCH_AT_ENV, listAgentAppItems, readAgentAppItemPage } from "../../services/agentInboxItems";
 import { mintAgentCredential } from "../../services/agentCredentialService";
+import { recordAgentCliInboxItems } from "../../services/agentCliInboxItems";
 import { createAgent } from "../../services/agentService";
 import { addAgent, getOrCreateThreadForChannel, removeAgent } from "../../services/channelService";
 import { AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY, createFeatureFlag } from "../../services/featureFlagService";
@@ -67,6 +68,8 @@ async function seedWorld(seed: ReturnType<typeof createSeed>, app: TestApp, opts
   const other = await createAgent(server.id, `Other${suffix}`, { runtime: "claude", model: "sonnet" });
   await addAgent(channel.id, author.id);
   await addAgent(channel.id, other.id);
+  // The author's CLI lists app inbox items, so its notices on one message share one wake (#proj-apps:#88).
+  await recordAgentCliInboxItems(author.id, null, true);
   if (opts.items !== false) await createFeatureFlag({ key: AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY, randomizationUnit: "server", defaultEnabled: true });
   if (opts.notices !== false) await createFeatureFlag({ key: AGENT_REACTION_NOTICES_FEATURE_FLAG_KEY, randomizationUnit: "server", defaultEnabled: true });
   const key = async (agentId: string) => (await mintAgentCredential({ agentId, scopes: ["read", "send", "reactions"], name: `rn-${suffix}`, issuedVia: "computer", createdByUserId: null })).apiKey;

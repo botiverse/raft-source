@@ -268,7 +268,7 @@ export const DELEGABLE_CARD_ROUTES: Readonly<Record<DelegableRouteKey, Delegable
           channel: "the channel, as #name",
           member: "the channel admin's handle (@name; @name~human or @name~agent when a person and an agent share it)",
         },
-        confirmer: "a server owner or admin, or a channel admin of that channel",
+        confirmer: "a server owner or admin, or a channel admin of that channel (on a joint channel, an owner or admin of its host server)",
         example: { channel: "#ops", member: "@alice" },
       },
     },

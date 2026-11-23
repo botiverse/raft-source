@@ -24,6 +24,24 @@
 // stops with exit 3 and prints the --after-id to resume from.
 //   DATABASE_URL=... node --import @oxc-node/core/register scripts/message-server-timeline-backfill.ts \
 //     --search-vector [--batch-size 2000] [--sleep-ms 200] [--after-id <uuid>] [--verify-only] [--build-index]
+//
+// --conversation-id (0764): fill message_server_timeline.conversation_id on the
+// rows of joint_storage servers, each server walked in
+// idx_message_server_timeline_server_created's order (keyset on created_at,
+// message_id; same CDC slot rule and exit 3). --after-position
+// <serverId>,<createdAt>,<messageId> resumes it from the after_position of the
+// last batch line. A batch that hits the statement timeout is retried at half
+// its size (then grows back), so a cold cache slows the run instead of
+// stopping it. Then it verifies the whole timeline: every joint
+// storage row carries its channel's conversation root (at most two levels up;
+// a joint storage channel nested deeper counts as divergent), every other row NULL
+// ([MESSAGE_TIMELINE_CONVERSATION_VERIFY], --verify-only --after-id resumes a
+// cancelled verify). On 0 missing / 0 divergent over a full verify it builds
+// idx_message_server_timeline_conversation_created CONCURRENTLY
+// ([MESSAGE_TIMELINE_CONVERSATION_INDEX] ... valid). Only then may an operator
+// turn search_joint_conversation_walk_v0 on: verify 0/0 + index valid.
+//   DATABASE_URL=... node --import @oxc-node/core/register scripts/message-server-timeline-backfill.ts \
+//     --conversation-id [--batch-size 2000] [--sleep-ms 200] [--after-position <position>] [--verify-only [--after-id <uuid>]]
 import "dotenv/config";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { sql, type SQL } from "drizzle-orm";
@@ -31,8 +49,12 @@ import pg from "pg";
 import {
   buildMessageServerTimelineSearchIndex,
   runMessageServerTimelineBackfill,
+  runMessageServerTimelineConversationBackfill,
   runMessageServerTimelineSearchVectorBackfill,
   verifyMessageServerTimeline,
+  verifyMessageServerTimelineConversationAndBuildIndex,
+  formatConversationPosition,
+  parseConversationPosition,
   verifyMessageServerTimelineSearchVector,
 } from "../src/services/messageServerTimelineBackfill";
 
@@ -75,6 +97,42 @@ async function main(): Promise<void> {
   const db = drizzle(pool);
   const run = async (query: SQL) => (await db.execute(query)).rows as Array<Record<string, unknown>>;
   try {
+    if (process.argv.includes("--conversation-id")) {
+      const verifyOnly = process.argv.includes("--verify-only");
+      if (!verifyOnly) {
+        const rawPosition = flag("--after-position");
+        const afterPosition = rawPosition === undefined ? undefined : parseConversationPosition(rawPosition);
+        if (afterPosition === null) {
+          console.error(`[MESSAGE_TIMELINE_BACKFILL_FAILED] invalid --after-position: ${rawPosition}`);
+          process.exitCode = 1;
+          return;
+        }
+        const result = await runMessageServerTimelineConversationBackfill(run, {
+          batchSize: intFlag("--batch-size", 2000),
+          sleepMs: intFlag("--sleep-ms", 200),
+          afterPosition,
+          log: (line) => console.log(line),
+        });
+        console.log(`[MESSAGE_TIMELINE_CONVERSATION_BACKFILL_REPORT] ${JSON.stringify(result)}`);
+        if (result.stoppedBy && result.lastPosition) {
+          console.error(`[MESSAGE_TIMELINE_CONVERSATION_BACKFILL] stopped by the CDC slot; resume with --after-position ${formatConversationPosition(result.lastPosition)}`);
+          process.exitCode = 3;
+          return;
+        }
+        if (result.stoppedBy) {
+          console.error("[MESSAGE_TIMELINE_CONVERSATION_BACKFILL] stopped by the CDC slot before the first batch; rerun");
+          process.exitCode = 3;
+          return;
+        }
+      }
+      const gate = await verifyMessageServerTimelineConversationAndBuildIndex(run, {
+        batchSize: intFlag("--batch-size", 2000),
+        afterId: verifyOnly ? afterId : undefined,
+        log: (line) => console.log(line),
+      });
+      if (gate.divergence.missingRows !== 0 || gate.divergence.divergentRows !== 0) process.exitCode = 2;
+      return;
+    }
     if (process.argv.includes("--search-vector")) {
       const verifyOnly = process.argv.includes("--verify-only");
       if (!verifyOnly) {

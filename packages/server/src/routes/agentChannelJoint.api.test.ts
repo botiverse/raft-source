@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 
 import { getDb } from "../db/index";
-import { serverAgentMembers, serverMembers } from "../db/schema";
+import { jointChannels, jointChannelServers, messages, serverAgentMembers, serverMembers } from "../db/schema";
 import { addMember } from "../services/serverService";
 import { createAgent } from "../services/agentService";
 import { mintAgentCredential } from "../services/agentCredentialService";
@@ -112,7 +112,7 @@ test("an admin agent of the host adds its own server's members to a joint channe
     channelId: f.hostProjectionId,
     body: { userId: hostMember.id },
   });
-  assert.equal(added.status, 200, JSON.stringify(added.body));
+  assert.equal(added.status, 200, JSON.stringify(added));
   assert.equal(await isChannelHuman(f.hostProjectionId, hostMember.id), true);
 
   // Candidates resolve from the acting server only: the other server's owner
@@ -133,7 +133,7 @@ test("an admin agent of the host adds its own server's members to a joint channe
     channelId: f.hostProjectionId,
     body: { userId: hostMember.id },
   });
-  assert.equal(removed.status, 200, JSON.stringify(removed.body));
+  assert.equal(removed.status, 200, JSON.stringify(removed));
   assert.equal(await isChannelHuman(f.hostProjectionId, hostMember.id), false);
   assert.equal(await isChannelHuman(f.targetProjectionId, f.targetOwner.id), true);
 });
@@ -150,7 +150,7 @@ test("an admin agent renames a joint channel for every server and cannot change 
     body: { name: newName, description: "shared description" },
     io: app.app.get("io"),
   });
-  assert.equal(updated.status, 200, JSON.stringify(updated.body));
+  assert.equal(updated.status, 200, JSON.stringify(updated));
   assert.equal((await getChannel(f.hostProjectionId))?.name, newName);
   assert.equal((await getChannel(f.targetProjectionId))?.name, newName);
   // The other server's open clients get the new metadata without a reload.
@@ -191,7 +191,7 @@ test("an admin agent archives and unarchives a joint channel for every server; a
     archived: true,
     io: app.app.get("io"),
   });
-  assert.equal(archived.status, 200, JSON.stringify(archived.body));
+  assert.equal(archived.status, 200, JSON.stringify(archived));
   assert.ok((await getChannel(f.hostProjectionId))?.archivedAt);
   assert.ok((await getChannel(f.targetProjectionId))?.archivedAt);
   assert.ok(
@@ -205,7 +205,7 @@ test("an admin agent archives and unarchives a joint channel for every server; a
     channelId: f.hostProjectionId,
     archived: false,
   });
-  assert.equal(unarchived.status, 200, JSON.stringify(unarchived.body));
+  assert.equal(unarchived.status, 200, JSON.stringify(unarchived));
   assert.equal((await getChannel(f.hostProjectionId))?.archivedAt, null);
   assert.equal((await getChannel(f.targetProjectionId))?.archivedAt, null);
 });
@@ -220,6 +220,16 @@ test("an agent's joint member listing names every server a person takes part thr
   ]);
   await addHuman(f.hostProjectionId, dual.id);
   await addHuman(f.targetProjectionId, dual.id);
+  // In through the peer first, then also a member of the agent's server: the
+  // peer stays listed and the agent's own server shows only as `role`.
+  const bothName = `joint-badges-both-${randomUUID().slice(0, 8)}`;
+  const both = await seedUser(`${bothName}@slock.test`, bothName);
+  await getDb().insert(serverMembers).values([
+    { serverId: f.hostServer.id, userId: both.id, role: "member" },
+    { serverId: f.targetServer.id, userId: both.id, role: "member" },
+  ]);
+  await addHuman(f.targetProjectionId, both.id);
+  await addHuman(f.hostProjectionId, both.id);
   const credential = await mintAgentCredential({
     agentId: f.agent.id,
     scopes: ["channels"],
@@ -232,13 +242,20 @@ test("an agent's joint member listing names every server a person takes part thr
     headers: { Authorization: `Bearer ${credential.apiKey}` },
   });
   assert.equal(res.status, 200, await res.clone().text());
-  const body = await res.json() as { humans: Array<{ name: string; role?: string; servers?: Array<{ name: string; slug: string; yours?: true }> }> };
+  const body = await res.json() as { humans: Array<{ name: string; role?: string; servers?: Array<{ id?: string; name: string; slug: string; yours?: true }> }> };
   const byName = new Map(body.humans.map((human) => [human.name, human]));
-  const target = { name: f.targetServer.name, slug: f.targetServer.slug };
+  // The id lets programs match a person by (server id, handle); no person id is added.
+  const target = { id: f.targetServer.id, name: f.targetServer.name, slug: f.targetServer.slug };
   // Already in through the host: adding them through the target records no second source.
   assert.equal(byName.get(dual.name)?.servers, undefined, "the current entry is omitted; no other source");
   assert.deepEqual(byName.get(f.targetOwner.name)?.servers, [target], "a peer-only person names the peer server");
   assert.equal(byName.get(f.hostOwner.name)?.servers, undefined, "a person only on the agent's server is listed as before");
+  // `role` is present exactly when the person is a member of the agent's own
+  // server (the contract's promise; Stamp matches on it).
+  assert.equal(byName.get(dual.name)?.role, "member", "on the agent's server: role present");
+  assert.equal(byName.get(f.hostOwner.name)?.role, "member", "the agent's server's owner: role present");
+  assert.deepEqual(byName.get(both.name)?.servers, [target], "also in through the peer: the peer is listed");
+  assert.equal(byName.get(both.name)?.role, "member", "and the agent's own server shows as role");
   // No server role is public in a joint roster (computed membership): not
   // even the agent's own server's owner shows one.
   assert.equal("role" in (byName.get(f.targetOwner.name) ?? {}), false);
@@ -261,11 +278,11 @@ test("an admin agent that is not in a joint channel cannot add members to it, sa
     channelId: f.hostProjectionId,
     body: { userId: hostMember.id },
   });
-  assert.equal(refused.status, 404, JSON.stringify(refused.body));
+  assert.equal(refused.status, 404, JSON.stringify(refused));
   assert.equal(await isChannelHuman(f.hostProjectionId, hostMember.id), false);
 });
 
-test("a joint roster shows another server's people and agents without their roles", async ({ app }) => {
+test("a joint roster shows another server's people and agents without their server roles, as admin only when they manage the channel", async ({ app }) => {
   const f = await setupJoint(app, "joint-roles");
   type RosterRow = { id: string; serverRole?: string | null; channelRole?: string | null; role?: string | null; effectiveChannelRole?: string; channelAdminBasis?: string | null };
   const roster = async (owner: { email: string }, serverId: string, channelId: string) => {
@@ -276,12 +293,13 @@ test("a joint roster shows another server's people and agents without their role
   };
 
   // The target server's owner reads: the host's admin agent and owner are
-  // another organization's, so they read as plain members.
+  // another organization's, so no server role; both manage the channel from
+  // the host, so both read as its admins.
   const fromTarget = await roster(f.targetOwner, f.targetServer.id, f.targetProjectionId);
   const peerAgent = fromTarget.agents.get(f.agent.id);
   assert.deepEqual(
     [peerAgent?.serverRole, peerAgent?.channelRole, peerAgent?.effectiveChannelRole, peerAgent?.channelAdminBasis],
-    [null, null, "member", null],
+    [null, "admin", "admin", null],
   );
   const peerOwner = fromTarget.humans.get(f.hostOwner.id);
   // No foreign role; the host's owner manages the channel, which every copy shows.
@@ -292,4 +310,35 @@ test("a joint roster shows another server's people and agents without their role
   assert.equal(fromHost.agents.get(f.agent.id)?.effectiveChannelRole, "admin");
   // The host's owner manages the channel: shown as its admin.
   assert.equal(fromHost.humans.get(f.hostOwner.id)?.effectiveChannelRole, "admin");
+});
+
+// slock issue 15637 step 2: membership and rename notices in a joint channel
+// were stored in this server's copy (which owns no storage) and reached no
+// other server. They are stored in canonical storage and fan out to every copy.
+test("a joint channel's rename and agent membership notices are stored in canonical storage, not the host's copy", async ({ app }) => {
+  const f = await setupJoint(app, "joint-notices");
+  const hostToken = await tokenForHuman(f.hostOwner.email);
+  const [projection] = await getDb().select({ canonicalChannelId: jointChannels.canonicalChannelId })
+    .from(jointChannelServers).innerJoin(jointChannels, eq(jointChannels.id, jointChannelServers.jointChannelId))
+    .where(eq(jointChannelServers.localChannelId, f.hostProjectionId));
+  const canonicalId = projection!.canonicalChannelId;
+  const noticesIn = async (channelId: string) => (await getDb().select({ subtype: messages.systemSubtype, content: messages.content })
+    .from(messages).where(eq(messages.channelId, channelId))).filter((row) => /renamed this channel|was (added to|removed from) this channel/.test(row.content));
+
+  const renamed = await fetch(`${app.baseUrl}/api/channels/${f.hostProjectionId}`, {
+    method: "PATCH", headers: headers(hostToken, f.hostServer.id), body: JSON.stringify({ name: `joint-notices-renamed-${randomUUID().slice(0, 8)}` }),
+  });
+  assert.equal(renamed.status, 200, await renamed.clone().text());
+  const second = await createAgent(f.hostServer.id, `joint-notices-agent2-${randomUUID().slice(0, 8)}`, { runtime: "codex" });
+  const added = await fetch(`${app.baseUrl}/api/channels/${f.hostProjectionId}/members`, {
+    method: "POST", headers: headers(hostToken, f.hostServer.id), body: JSON.stringify({ agentId: second.id }),
+  });
+  assert.equal(added.status, 200, await added.clone().text());
+
+  // Notices are written after the response; wait briefly for both.
+  for (let i = 0; i < 50 && (await noticesIn(canonicalId)).length < 2; i += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(await noticesIn(f.hostProjectionId), [], "nothing stored in the host's copy");
+  const inCanonical = await noticesIn(canonicalId);
+  assert.ok(inCanonical.some((row) => /renamed this channel/.test(row.content)), JSON.stringify(inCanonical));
+  assert.ok(inCanonical.some((row) => /was added to this channel/.test(row.content)), JSON.stringify(inCanonical));
 });

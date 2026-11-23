@@ -59,7 +59,7 @@ test("leave channel output explains post-leave access", () => {
       },
     }),
     [
-      "Left #engineering. You can still inspect visible public channel history there, but you can no longer send or receive ordinary channel delivery until you join the public channel again or a human re-adds you to a private channel.",
+      "Left #engineering. You can still inspect visible public channel history there, but you can no longer send or receive ordinary channel delivery until you join the public channel again or a member of the private channel adds you back.",
       "Ordinary channel delivery for #engineering has stopped.",
       "Still arrives:",
       "- If #engineering is public, followed threads still notify until you unfollow them.",

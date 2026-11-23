@@ -91,7 +91,7 @@ test("an agent joining #all gets ok without announcing itself; a human leaving #
   const actor = { id: f.agent.id, name: f.agent.name, serverId: f.server.id };
   const removeFromAll = await removeChannelMemberForAgent({ actor, serverId: f.server.id, channelId: all.id, body: { userId: f.peer.id } });
   assert.equal(removeFromAll.status, 403);
-  assert.equal((removeFromAll.body as { code?: string }).code, "all_channel_membership_fixed");
+  assert.equal("refusal" in removeFromAll ? removeFromAll.refusal.code : undefined, "all_channel_membership_fixed");
 });
 
 test("an agent gets 404 for a DM or private channel it cannot see, whatever the type", async ({ app }) => {
@@ -102,7 +102,7 @@ test("an agent gets 404 for a DM or private channel it cannot see, whatever the 
   const actor = { id: f.agent.id, name: f.agent.name, serverId: f.server.id };
 
   const addToDm = await addChannelMemberForAgent({ actor, serverId: f.server.id, channelId: dm.id, body: { userId: f.peer.id } });
-  assert.equal(addToDm.status, 404, JSON.stringify(addToDm.body));
+  assert.equal(addToDm.status, 404, JSON.stringify(addToDm));
 
   const missing = await fetch(`${app.baseUrl}/internal/agent-api/channels/${randomUUID()}/join`, {
     method: "POST",
@@ -135,8 +135,8 @@ test("remove-member and leave answer 404 for a channel the agent cannot see, sam
   const leaveBodies: unknown[] = [];
   for (const channelId of [dm.id, privateChannel.id, jointChannel.id, thread.id, randomUUID()]) {
     const remove = await removeChannelMemberForAgent({ actor, serverId: f.server.id, channelId, body: { userId: f.peer.id } });
-    assert.equal(remove.status, 404, `remove ${channelId}: ${JSON.stringify(remove.body)}`);
-    assert.deepEqual(remove.body, { error: "Channel not found" });
+    assert.equal(remove.status, 404, `remove ${channelId}: ${JSON.stringify(remove)}`);
+    assert.deepEqual("refusal" in remove ? remove.refusal : remove, { code: "channel_not_found", error: "Channel not found" });
 
     const leave = await fetch(`${app.baseUrl}/internal/agent-api/channels/${channelId}/leave`, {
       method: "POST",
@@ -162,15 +162,15 @@ test("an agent that can see a DM or thread still gets the type-specific refusal"
   const actor = { id: f.agent.id, name: f.agent.name, serverId: f.server.id };
 
   const addToDm = await addChannelMemberForAgent({ actor, serverId: f.server.id, channelId: dm.id, body: { userId: f.peer.id } });
-  assert.equal(addToDm.status, 400, JSON.stringify(addToDm.body));
-  assert.match((addToDm.body as { error: string }).error, /Only public, private, or joint channels/);
+  assert.equal(addToDm.status, 400, JSON.stringify(addToDm));
+  assert.match("refusal" in addToDm ? addToDm.refusal.error : "", /Only public, private, or joint channels/);
 
   const addToThread = await addChannelMemberForAgent({ actor, serverId: f.server.id, channelId: thread.id, body: { userId: f.peer.id } });
-  assert.equal(addToThread.status, 400, JSON.stringify(addToThread.body));
-  assert.match((addToThread.body as { error: string }).error, /follow\/unfollow/);
+  assert.equal(addToThread.status, 400, JSON.stringify(addToThread));
+  assert.match("refusal" in addToThread ? addToThread.refusal.error : "", /follow\/unfollow/);
 
   const removeFromDm = await removeChannelMemberForAgent({ actor, serverId: f.server.id, channelId: dm.id, body: { userId: f.owner.id } });
-  assert.equal(removeFromDm.status, 400, JSON.stringify(removeFromDm.body));
+  assert.equal(removeFromDm.status, 400, JSON.stringify(removeFromDm));
 
   const leaveDm = await fetch(`${app.baseUrl}/internal/agent-api/channels/${dm.id}/leave`, {
     method: "POST",

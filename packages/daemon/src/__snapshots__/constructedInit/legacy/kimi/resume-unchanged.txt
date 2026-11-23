@@ -1,0 +1,14 @@
+host: legacy
+runtime: kimi
+scenario: resume-unchanged
+promptSource: resume_empty
+note: driver: supportsNativeStandingPrompt=true standingPromptRefreshesOnResume=false deferSpawnUntilMessage=false
+
+## standing prompt
+= standing-prompt.md
+
+## carrier
+SpawnContext.standingPrompt: = standing prompt
+
+## first input (120 chars, sha256:ff860092fb9fea97, does not contain the standing prompt)
+No new messages while you were away. If you were in the middle of a task, continue it; otherwise stop (no reply needed).

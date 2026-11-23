@@ -10,8 +10,9 @@ import type { RowTimeCopy } from "../../utils/timeFormatting";
  * An Activity row's time, at the end of its first line (raft-design
  * patterns/lists.md, "Times in list rows"). Today's rows, and any row under an
  * hour old, show it short at rest; an older row shows its clock on hover or
- * keyboard focus, and on a touch screen not at all. `wordsId` names the time in
- * words for the row's trigger, on every row, shown or not.
+ * keyboard focus, and at rest on a touch screen, where nothing hovers (raft-ui
+ * 0.102.10). `wordsId` names the time in words for the row's trigger, on every
+ * row, shown or not.
  *
  * Its own component with its own clock: the row around it is memoized and has
  * none, so a time read at the row's render went stale. This re-renders alone,

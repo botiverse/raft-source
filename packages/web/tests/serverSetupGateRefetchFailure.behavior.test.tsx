@@ -3,6 +3,7 @@ import "./helpers/domSetup";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import api from "../src/api/client";
+import { flushProductEvents, resetProductEventsForTest } from "../src/analytics/track";
 import ServerSetupProjectionGate from "../src/components/onboarding/ServerSetupProjectionGate";
 import { useServerSetupRevision } from "../src/components/onboarding/serverSetupProjection";
 import { useMachineStore } from "../src/store/machineStore";
@@ -52,6 +53,7 @@ afterEach(() => {
   api.get = originalGet as typeof api.get;
   api.post = originalPost as typeof api.post;
   cleanup();
+  resetProductEventsForTest();
   useMachineStore.setState(useMachineStore.getInitialState(), true);
   useOnboardingAnnouncementGateStore.setState({ byServerId: {} });
   delete (window as unknown as { RaftHost?: unknown }).RaftHost;
@@ -521,4 +523,103 @@ test("Start over from S1 offline recovery requires confirmation and cancel stays
     screen.getByTestId("server-setup-confirm-start-over").click();
   });
   await waitFor(() => assert.equal(resetCalls, 1, "confirm resets setup exactly once"));
+});
+
+test("Start over twice before its confirm shows (a double click, a held key) opens one confirm and records start_over once", async () => {
+  const PROJECTION = {
+    surface: "computer_runtime",
+    phase: "in_progress",
+    currentStep: "computer_runtime",
+    blocksChat: true,
+    allowedExits: ["reset", "return_to_server"],
+    sideEffectState: { transitions: "enabled", completion: "disabled" },
+    gateReason: "computer_offline",
+    computerStatus: "offline",
+    runtimeStatus: "unknown",
+    hasConnectedComputer: true,
+    offlineComputers: [{
+      id: "computer-1",
+      name: "Cindy MacAir",
+      lastHeartbeat: null,
+      isComputer: true,
+    }],
+    postSetup: { surveyPending: false, handoffPending: false },
+  };
+  api.get = (async (url: string) => {
+    if (!url.includes("/setup-projection")) return { data: [] };
+    return { data: PROJECTION };
+  }) as typeof api.get;
+  const sent: Array<{ event: string; properties: Record<string, unknown> }> = [];
+  window.localStorage.setItem("slock_access_token", "token-1");
+  resetProductEventsForTest(async (url, init) => {
+    if (url.endsWith("/product-events/config")) return new Response(JSON.stringify({ clientEventsAllowed: true }), { status: 200 });
+    sent.push(...(JSON.parse(String(init?.body)) as { events: typeof sent }).events);
+    return new Response(JSON.stringify({ accepted: 1 }), { status: 202 });
+  });
+
+  renderGate(null, true);
+  await waitFor(() => assert.ok(screen.getByRole("heading", { name: "Start your computer" })));
+  const startOver = screen.getByRole("button", { name: "Start over", exact: true });
+  // Both in one tick, as a double click or a held key's repeats arrive before a render.
+  await act(async () => {
+    fireEvent.click(startOver);
+    fireEvent.click(startOver);
+  });
+  await waitFor(() => assert.ok(screen.getByText("Start over?")));
+  assert.equal(screen.getAllByText("Start over?").length, 1, "one confirm");
+  await flushProductEvents();
+  const startOvers = () => sent.filter((event) => event.event === "server_setup_step_action" && event.properties.action === "start_over");
+  assert.equal(startOvers().length, 1, "start_over recorded once");
+
+  // Cancel, then Start over again: a new confirm and a new start_over.
+  await act(async () => {
+    screen.getByRole("button", { name: "Cancel" }).click();
+  });
+  await waitFor(() => assert.ok(screen.queryByText("Start over?") === null));
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Start over", exact: true }));
+  });
+  await waitFor(() => assert.ok(screen.getByText("Start over?")));
+  await flushProductEvents();
+  assert.equal(startOvers().length, 2, "a later Start over is recorded");
+  window.localStorage.removeItem("slock_access_token");
+});
+
+test("Let's Go whose re-read FAILS leaves the handoff step's button live, and the next press tries again", async () => {
+  const HANDOFF_PENDING = {
+    ...KNOWN_PROJECTION,
+    surface: "complete",
+    phase: "complete",
+    currentStep: null,
+    blocksChat: false,
+    gateReason: "setup_complete",
+    postSetup: { surveyPending: false, upgradePending: false, handoffPending: true },
+  };
+  let failReads = false;
+  api.get = (async (url: string) => {
+    if (!url.includes("/setup-projection")) return { data: [] };
+    if (failReads) throw new Error("socket closed mid-redeploy");
+    return { data: HANDOFF_PENDING };
+  }) as typeof api.get;
+  let handoffCalls = 0;
+  api.post = (async (url: string) => {
+    if (!url.includes("/setup-handoff")) throw new Error(`Unexpected POST ${url}`);
+    handoffCalls += 1;
+    return { data: HANDOFF_PENDING };
+  }) as typeof api.post;
+
+  renderGate(null, true);
+  await waitFor(() => assert.ok(screen.getByTestId("server-setup-handoff-done")));
+  // The acknowledgment succeeds; the re-read after it fails, so the gate keeps the stale step.
+  failReads = true;
+  await act(async () => {
+    fireEvent.click(screen.getByTestId("server-setup-handoff-done"));
+  });
+  await waitFor(() => assert.equal(handoffCalls, 1));
+  await waitFor(() => assert.equal((screen.getByTestId("server-setup-handoff-done") as HTMLButtonElement).disabled, false, "the footer is enabled again"));
+
+  await act(async () => {
+    fireEvent.click(screen.getByTestId("server-setup-handoff-done"));
+  });
+  await waitFor(() => assert.equal(handoffCalls, 2, "the next press calls the API again"));
 });

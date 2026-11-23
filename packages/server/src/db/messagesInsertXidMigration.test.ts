@@ -84,6 +84,10 @@ test("insert_xid stays out of the drizzle table and its snapshot: no ORM read ca
     // over a skip record's seq range; selects seq and created_at only, and
     // relies on the trigger's pg_current_xact_id() and NULL for old rows.
     "src/services/agentInboxLateRows.ts",
+    // Incremental sync inbox rows (#15312): `insert_xid < H` on the seq scan and
+    // `insert_xid >= mh AND < H` on the late window; selects id, channel, server,
+    // seq and created_at only, and relies on the same trigger and NULL rule.
+    "src/services/syncInboxRows.ts",
     "src/db/postMigrationIndexes.ts",
     "src/db/pgliteMigrations.ts",
     "src/db/schema.ts",

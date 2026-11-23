@@ -6,7 +6,7 @@ import type { AgentOrchestrator } from "../services/agentOrchestrator";
 import * as channelService from "../services/channelService";
 import * as messageService from "../services/messageService";
 import { addTraceEvent, errorClassOf } from "../tracing/semanticTrace";
-import { agentServerRoleRequiredBody } from "../lib/agentServerRoleRequired";
+import { AGENT_CHANNEL_ID_NOT_FOUND_REFUSAL, AGENT_NO_LONGER_EXISTS_REFUSAL, agentServerRoleRequiredBody, type AgentRouteResult } from "../lib/agentServerRoleRequired";
 import { ExternalChannelLimitError } from "../services/externalChannelLimitService";
 
 export interface AgentChannelLifecycleActor {
@@ -15,10 +15,7 @@ export interface AgentChannelLifecycleActor {
   serverId: string;
 }
 
-export interface AgentChannelLifecycleResult {
-  status: number;
-  body: Record<string, unknown>;
-}
+export type AgentChannelLifecycleResult = AgentRouteResult;
 
 export async function setChannelArchivedForAgent(input: {
   actor: AgentChannelLifecycleActor;
@@ -30,6 +27,7 @@ export async function setChannelArchivedForAgent(input: {
 }): Promise<AgentChannelLifecycleResult> {
   const { actor, serverId, channelId, archived, io, agentOrchestrator } = input;
   const action = archived ? "archive" : "unarchive";
+  const unsupportedCode = archived ? "channel_archive_unsupported" : "channel_unarchive_unsupported";
   addTraceEvent("agent_channel_lifecycle.request.started", {
     action,
     actor_server_match: actor.serverId === serverId,
@@ -41,7 +39,7 @@ export async function setChannelArchivedForAgent(input: {
       reason: "agent_server_mismatch",
       status_code: 401,
     });
-    return { status: 401, body: { error: "Agent no longer exists" } };
+    return { ok: false, status: 401, refusal: AGENT_NO_LONGER_EXISTS_REFUSAL };
   }
 
   const channel = await channelService.getChannel(channelId);
@@ -51,7 +49,7 @@ export async function setChannelArchivedForAgent(input: {
       reason: "channel_not_found",
       status_code: 404,
     });
-    return { status: 404, body: { error: "Channel not found" } };
+    return { ok: false, status: 404, refusal: AGENT_CHANNEL_ID_NOT_FOUND_REFUSAL };
   }
   if (channel.type !== "channel" && channel.type !== "private" && channel.type !== "joint") {
     addTraceEvent("agent_channel_lifecycle.request.failed", {
@@ -60,8 +58,9 @@ export async function setChannelArchivedForAgent(input: {
       status_code: 400,
     });
     return {
+      ok: false,
       status: 400,
-      body: { error: `Only public, private, or joint channels can be ${archived ? "archived" : "unarchived"}` },
+      refusal: { code: unsupportedCode, error: `Only public, private, or joint channels can be ${archived ? "archived" : "unarchived"}` },
     };
   }
   if (!await channelService.canAgentAccessChannel(channel.id, actor.id)) {
@@ -70,7 +69,7 @@ export async function setChannelArchivedForAgent(input: {
       reason: "channel_not_visible",
       status_code: 404,
     });
-    return { status: 404, body: { error: "Channel not found" } };
+    return { ok: false, status: 404, refusal: AGENT_CHANNEL_ID_NOT_FOUND_REFUSAL };
   }
   // Archiving a joint channel archives it for every connected server: the
   // authority is the host's (channelActorHasCapability), exactly as the human
@@ -89,8 +88,9 @@ export async function setChannelArchivedForAgent(input: {
       status_code: 403,
     });
     return {
+      ok: false,
       status: 403,
-      body: await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["archiveChannels"], action: `${action} channels`, channelAdminIn: channel.type === "joint" ? undefined : channel.name }),
+      refusal: await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["archiveChannels"], action: `${action} channels`, ...(channel.type === "joint" ? { jointChannel: channel.name } : { channelAdminIn: channel.name }) }),
     };
   }
 
@@ -130,7 +130,8 @@ export async function setChannelArchivedForAgent(input: {
           // request. This makes concurrent idempotent retries observably
           // exact-once: only the conditional-write winner emits, and no
           // delayed duplicate can arrive after both responses settle.
-          await messageService.broadcastSystemMessage(
+          // Joint-aware: a joint's notice goes to canonical storage, fanned out to every server (slock issue 15637).
+          await messageService.broadcastSystemMessageToLocalSurfaces(
             io,
             agentOrchestrator,
             updated.id,
@@ -158,16 +159,16 @@ export async function setChannelArchivedForAgent(input: {
       changed,
       channel_visibility: updated.type === "private" ? "private" : "public",
     });
-    return { status: 200, body: updated };
+    return { ok: true, status: 200, body: updated };
   } catch (err) {
     // Unarchiving would put a free server in a second external channel: the admission's 409.
     if (err instanceof ExternalChannelLimitError) {
       addTraceEvent("agent_channel_lifecycle.request.failed", { action, reason: "free_external_limit", status_code: 409 });
-      return { status: 409, body: { error: err.message, code: err.code, limitSide: err.limitSide, limitServerId: err.limitServerId } };
+      return { ok: false, status: 409, refusal: { code: err.code, error: err.message } };
     }
     const message = err instanceof Error ? err.message : "";
     if (message === "Channel capability required") {
-      return { status: 403, body: await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["archiveChannels"], action: `${action} channels`, channelAdminIn: channel.type === "joint" ? undefined : channel.name }) };
+      return { ok: false, status: 403, refusal: await agentServerRoleRequiredBody({ serverId, agentId: actor.id, capabilities: ["archiveChannels"], action: `${action} channels`, ...(channel.type === "joint" ? { jointChannel: channel.name } : { channelAdminIn: channel.name }) }) };
     }
     if (message.includes("#all") || message.includes("Only regular")) {
       addTraceEvent("agent_channel_lifecycle.request.failed", {
@@ -175,10 +176,10 @@ export async function setChannelArchivedForAgent(input: {
         reason: "forbidden_channel",
         status_code: 400,
       });
-      return { status: 400, body: { error: message } };
+      return { ok: false, status: 400, refusal: { code: unsupportedCode, error: message } };
     }
     if (message === "Channel not found") {
-      return { status: 404, body: { error: message } };
+      return { ok: false, status: 404, refusal: AGENT_CHANNEL_ID_NOT_FOUND_REFUSAL };
     }
     addTraceEvent("agent_channel_lifecycle.request.failed", {
       action,
@@ -186,6 +187,6 @@ export async function setChannelArchivedForAgent(input: {
       status_code: 500,
       error_class: errorClassOf(err),
     });
-    return { status: 500, body: { error: `Failed to ${action} channel` } };
+    return { ok: false, status: 500, body: { error: `Failed to ${action} channel` } };
   }
 }

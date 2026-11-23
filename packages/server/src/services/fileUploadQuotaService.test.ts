@@ -10,6 +10,7 @@ import { createChannel } from "./channelService";
 import { isChannelReadOnlyByBillingFeature } from "./planService";
 import { createServer } from "./serverService";
 import {
+  FILE_UPLOAD_APPSUMO_QUOTA_EXCEEDED_MESSAGE,
   FileUploadQuotaExceededError,
   buildFileUploadQuotaExceededResponse,
   getFileUploadQuotaSummary,
@@ -152,14 +153,42 @@ test("Free upload quota exceeded response includes Billing URL and a next action
     const body = await buildFileUploadQuotaExceededResponse(server.id, err, "human");
     assert.equal(body.errorCode, "FILE_UPLOAD_QUOTA_EXCEEDED");
     assert.equal(body.billingUrl, `https://app.example.test/s/${server.slug}/settings/billing`);
-    assert.equal(body.suggestedNextAction, `Ask a server owner to open Settings > Billing and upgrade to Pro: https://app.example.test/s/${server.slug}/settings/billing`);
+    assert.equal(body.suggestedNextAction, `Ask a server owner to open Settings > Plan & billing and upgrade to Pro: https://app.example.test/s/${server.slug}/settings/billing`);
     // An agent says why in the conversation, and may suggest Pro: Raft never requires payment (cindyz).
     const agentBody = await buildFileUploadQuotaExceededResponse(server.id, err, "agent");
     assert.deepEqual({ ...agentBody, suggestedNextAction: undefined }, { ...body, suggestedNextAction: undefined }, "only the next action differs");
     assert.equal(
       agentBody.suggestedNextAction,
-      `Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: https://app.example.test/s/${server.slug}/settings/billing`,
+      `Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Plan & billing: https://app.example.test/s/${server.slug}/settings/billing`,
     );
+  } finally {
+    if (previousAppUrl === undefined) delete process.env.APP_URL;
+    else process.env.APP_URL = previousAppUrl;
+  }
+});
+
+test("AppSumo upload quota exceeded response names the AppSumo plan and Plan & billing, not Pro", async () => {
+  const previousAppUrl = process.env.APP_URL;
+  process.env.APP_URL = "https://app.example.test";
+  try {
+    await openTestDatabase("pglite://");
+    const owner = await seedUser("quota-appsumo-owner");
+    const server = await createServer("Quota AppSumo", `quota-appsumo-${randomUUID()}`, owner.id);
+    const now = new Date("2026-06-23T12:00:00Z");
+    await withFileUploadQuota(server.id, FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES, async () => "ok", now);
+    const summary = await getFileUploadQuotaSummary(server.id, now);
+    // The summary an AppSumo server's refusal carries (its lifetime tier's allowance).
+    const err = new FileUploadQuotaExceededError({ ...summary, appsumo: { tier: 1, lifetime: true } }, 1);
+
+    for (const reader of ["human", "agent"] as const) {
+      const body = await buildFileUploadQuotaExceededResponse(server.id, err, reader);
+      assert.equal(body.error, FILE_UPLOAD_APPSUMO_QUOTA_EXCEEDED_MESSAGE, reader);
+      assert.equal(
+        body.suggestedNextAction,
+        `Ask the server owner to review the AppSumo plan and monthly usage in Settings > Plan & billing: https://app.example.test/s/${server.slug}/settings/billing`,
+        reader,
+      );
+    }
   } finally {
     if (previousAppUrl === undefined) delete process.env.APP_URL;
     else process.env.APP_URL = previousAppUrl;

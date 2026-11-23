@@ -7,6 +7,7 @@ import type {
   AgentInboxAppItem,
   AgentServerFeatures,
   AgentMessage,
+  AgentStartOpenTasks,
   AgentSubagentInterruptOutcome,
   AgentTurnInterruptOutcome,
   MentionDeliveryIdentitySnapshot,
@@ -92,6 +93,8 @@ export interface AgentStartRequest {
   config: AgentConfig;
   wakeMessage?: AgentMessage;
   unreadSummary?: Record<string, number>;
+  /** The open tasks the server's resume start named (`agent:start` `openTasks`). */
+  openTasks?: AgentStartOpenTasks;
   resumePrompt?: string;
   launchId?: string;
   wakeMessageTransient: boolean;
@@ -118,6 +121,7 @@ export interface AgentLifecycleHost {
     catchupBatchId?: string,
     recoveryGrant?: RecoveryGrant | null,
     claimedConnectionEpochId?: string | null,
+    openTasks?: AgentStartOpenTasks,
   ): Promise<AgentStartOutcome>;
   getAgentStartAcceptance(agentId: string): AgentStartAcceptance;
   stopAgent(agentId: string, options?: { wait?: boolean; silent?: boolean }): Promise<void>;
@@ -180,7 +184,7 @@ export interface AgentLifecycleHost {
    * drifted is stopped once idle. Optional on test stand-ins (the core calls
    * it as `?.`).
    */
-  applyConfig?(agentId: string, config: AgentConfig, revision: number): void;
+  applyConfig?(agentId: string, config: AgentConfig, revision: number, options?: { interrupt?: boolean }): void;
   /**
    * Reconciler step 13 (agentDrain.ts): hold new message deliveries,
    * reminders, notices and agent starts, and resolve once every live process

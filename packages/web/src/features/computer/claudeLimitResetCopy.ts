@@ -44,14 +44,16 @@ export function claudeLimitResetNote(
  * `endpoint_unavailable`, an installation or version it cannot drive): the
  * card stops offering them and says "not supported on this Computer", never
  * "upgrade" (that is only for a Computer without the capability). Not for
- * nothing-was-attempted, a missing Claude Code, the consent step, or
+ * nothing-was-attempted, a missing Claude Code, `consent_required`,
  * `capability_unavailable` (a kind this account cannot use here yet: Claude
- * Code's flags do not show the newer reset program).
+ * Code's flags do not show the newer reset program), or
+ * `onboarding_required` (Claude Code's first-run setup is unfinished there).
  */
 export function claudeLimitResetsNotSupportedHere(result: RuntimeLimitResetResult | RuntimeLimitResetsReadResult): boolean {
   if (result.kind !== "unsupported") return false;
   switch (result.reason) {
     case "not_attempted":
+    case "onboarding_required":
     case "not_installed":
     case "consent_required":
     case "capability_unavailable":
@@ -90,6 +92,8 @@ export function claudeLimitResetRefusal(
           ? formatMessage({ id: "machine.runtimeUsage.claudeReset.notAttemptedAtLimit" }, { kind: name })
           : formatMessage({ id: "machine.runtimeUsage.claudeReset.notAttempted" });
       case "not_installed": return formatMessage({ id: "machine.runtimeAuth.error.notInstalled" }, { runtime: "Claude Code" });
+      // Claude Code stopped at a first-run page the Computer does not answer for the person.
+      case "onboarding_required": return formatMessage({ id: "machine.runtimeUsage.claudeReset.onboardingRequired" });
       // The Computer typed nothing: Claude Code does not show this account the newer reset program yet.
       case "capability_unavailable": return formatMessage({ id: "machine.runtimeUsage.claudeReset.notAvailableYet" }, { kind: name });
       default: return formatMessage({ id: claudeLimitResetsNotSupportedMessageId(result) });
@@ -98,13 +102,24 @@ export function claudeLimitResetRefusal(
   return formatMessage({ id: "machine.runtimeUsage.claudeReset.unknown" });
 }
 
-export function claudeKindMeta(formatMessage: IntlShape["formatMessage"], status: RuntimeLimitResetKindStatus): string {
+/**
+ * What Claude Code showed for one kind, its own way: "2 left · use by Nov 19,
+ * 4:59pm" under a confirm (`useBy`), "2 left · until Nov 19, 4:59pm" on a row
+ * of the list (`until`). Only what the read said; no date is made up.
+ */
+export function claudeKindMeta(
+  formatMessage: IntlShape["formatMessage"],
+  status: RuntimeLimitResetKindStatus,
+  deadline: "useBy" | "until" = "useBy",
+): string {
   switch (status.state) {
     case "available": {
       const parts: string[] = [];
       if (status.resetsLeft !== undefined) parts.push(formatMessage({ id: "machine.runtimeUsage.claudeReset.state.left" }, { count: status.resetsLeft }));
       else parts.push(formatMessage({ id: "machine.runtimeUsage.claudeReset.state.available" }));
-      if (status.expiresText) parts.push(formatMessage({ id: "machine.runtimeUsage.claudeReset.state.useBy" }, { date: status.expiresText }));
+      if (status.expiresText) {
+        parts.push(formatMessage({ id: deadline === "until" ? "machine.runtimeUsage.claudeReset.state.until" : "machine.runtimeUsage.claudeReset.state.useBy" }, { date: status.expiresText }));
+      }
       return parts.join(" · ");
     }
     case "none": return formatMessage({ id: "machine.runtimeUsage.claudeReset.state.none" });
@@ -112,4 +127,59 @@ export function claudeKindMeta(formatMessage: IntlShape["formatMessage"], status
     case "not_offered": return formatMessage({ id: "machine.runtimeUsage.claudeReset.state.notOffered" });
     default: return formatMessage({ id: "machine.runtimeUsage.claudeReset.state.unknown" });
   }
+}
+
+/** "Kept your weekly reset · nothing was used · use by …": the person said "No, keep it" before anything was sent. */
+export function claudeLimitResetKeptNote(
+  formatMessage: IntlShape["formatMessage"],
+  kind: RuntimeLimitResetKind,
+  status: RuntimeLimitResetKindStatus | null,
+): string {
+  const kept = formatMessage({ id: "machine.runtimeUsage.claudeReset.kept" }, { kind: claudeKindName(formatMessage, kind) });
+  return status?.state === "available" && status.expiresText
+    ? `${kept} · ${formatMessage({ id: "machine.runtimeUsage.claudeReset.state.useBy" }, { date: status.expiresText })}`
+    : kept;
+}
+
+export type ClaudeLimitResetAvailable = Extract<RuntimeLimitResetKindStatus, { state: "available" }>;
+
+/**
+ * What comes after a read, as Claude Code's bare `/limit-reset` goes on
+ * (docs/contracts/runtime-account-usage.md, "Limit resets (Claude, server and
+ * web)"): on Claude's older program the read itself was the command, so it
+ * ends with a line (`fiveHourSpent`: it used the 5-hour reset); on the newer
+ * one, one usable kind goes straight to its confirm, several to the choice,
+ * none ends with a line. At the 5-hour limit only a 5-hour reset is usable from
+ * here (the Computer types no other command there); the line says where the
+ * others are.
+ */
+export type ClaudeLimitResetReadStep =
+  | { step: "note"; messageId: MessageId; usageChanged: boolean }
+  | { step: "confirm"; status: ClaudeLimitResetAvailable }
+  | { step: "choose"; usable: ClaudeLimitResetAvailable[] };
+
+export function claudeLimitResetReadStep(
+  result: Extract<RuntimeLimitResetsReadResult, { kind: "read" }>,
+  atFiveHourLimit: boolean,
+): ClaudeLimitResetReadStep {
+  if (result.fiveHourSpent) return { step: "note", messageId: "machine.runtimeUsage.claudeReset.legacyReset", usageChanged: true };
+  if (result.program === "legacy") {
+    const fiveHour = result.resets.find((reset) => reset.kind === "five_hour");
+    // Only what the read shows: a 5-hour reset still held below the limit was kept; at the
+    // limit, opening the command is the spend, so anything but "none" is unconfirmed.
+    const messageId: MessageId = fiveHour?.state === "none"
+      ? "machine.runtimeUsage.claudeReset.legacyUsed"
+      : fiveHour?.state === "available" && !atFiveHourLimit
+        ? "machine.runtimeUsage.claudeReset.legacyKept"
+        : "machine.runtimeUsage.claudeReset.legacyUnconfirmed";
+    return { step: "note", messageId, usageChanged: messageId === "machine.runtimeUsage.claudeReset.legacyUnconfirmed" };
+  }
+  const available = result.resets.filter((reset): reset is ClaudeLimitResetAvailable => reset.state === "available");
+  const usable = available.filter((reset) => !atFiveHourLimit || reset.kind === "five_hour");
+  if (usable.length === 1) return { step: "confirm", status: usable[0]! };
+  if (usable.length > 1) return { step: "choose", usable };
+  const fiveHourUnread = result.resets.some((reset) => reset.kind === "five_hour" && reset.state === "unknown");
+  if (available.length > 0 && !fiveHourUnread) return { step: "note", messageId: "machine.runtimeUsage.claudeReset.noneAtLimit", usageChanged: false };
+  if (result.resets.some((reset) => reset.state === "unknown")) return { step: "note", messageId: "machine.runtimeUsage.claudeReset.readFailed", usageChanged: false };
+  return { step: "note", messageId: "machine.runtimeUsage.claudeReset.noneToUse", usageChanged: false };
 }

@@ -533,7 +533,7 @@ test("review with images: the server's quota or storage refusing an upload is th
     assert.equal(full.stderr, [
       "Error: Not stored: this server's monthly file upload quota is used up (100 MiB of 100 MiB used this month). The Free plan includes 100 MB of uploads a month, and comment images count against it as attachments do. Nothing of the review was posted.",
       "Code: FILE_UPLOAD_QUOTA_EXCEEDED",
-      `Next action: Say in the conversation that the image wasn't stored and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: ${billingUrl}. Until then, take "images" out of the JSON and run the same command again (describe the images in words instead).`,
+      `Next action: Say in the conversation that the image wasn't stored and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Plan & billing: ${billingUrl}. Until then, take "images" out of the JSON and run the same command again (describe the images in words instead).`,
       "",
     ].join("\n"));
     // Storage not set up (a deliberate 503): the Server's sentence (apiCommon STORAGE_UNAVAILABLE_ERROR), then that nothing of the review was posted.

@@ -5,28 +5,19 @@ import { randomUUID } from "node:crypto";
 
 import { eq } from "drizzle-orm";
 
-import { PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY, RUNTIME_CONFIG_VERSION } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import {
   agentCredentials,
   computers,
   users,
   agents,
-  featureFlagRules,
-  providerConnections,
-  providerProbeIntents,
-  providerProbeReceipts,
 } from "../db/schema";
 import { createServer } from "../services/serverService";
-import { createAgent, updateAgent } from "../services/agentService";
+import { createAgent } from "../services/agentService";
 import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { deleteMachine, registerMachine } from "../services/machineService";
 import { mintAgentCredential, RUNNER_MACHINE_CHANGED_REVOKE_REASON, type AgentCredentialIssuance } from "../services/agentCredentialService";
 import { generateComputerApiKeyMaterial } from "../services/computerCredentialService";
-import {
-  createProviderConnection,
-  resolveProviderConnectionSelection,
-} from "../services/providerConnectionService";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
@@ -123,146 +114,19 @@ async function seedComputerWithAgent(): Promise<{
   };
 }
 
-test("provider materialization is Computer/Agent-bound and the ordinary launch config stays reference-only", async ({ app }) => {
-
-  const previousKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
-  process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 9).toString("base64");
-  try {
-    const f = await seedComputerWithAgent();
-    const connection = await createProviderConnection({
-      serverId: f.serverId,
-      userId: f.userId,
-      name: "Runner DeepSeek",
-      providerId: "deepseek",
-      apiKey: "provider-materialization-secret",
-    });
-    await getDb().update(providerConnections).set({ status: "ready" }).where(eq(providerConnections.id, connection.id));
-    const selection = await resolveProviderConnectionSelection(f.serverId, connection.id);
-    await updateAgent(f.agentId, {
-      runtimeConfig: {
-        version: RUNTIME_CONFIG_VERSION,
-        runtime: "builtin",
-        provider: { kind: "connection", connectionId: connection.id },
-        model: { kind: "preset", id: "deepseek/deepseek-v4-pro" },
-        mode: { kind: "default" },
-        hostUserState: "forbidden",
-      },
-      providerConnection: { ...selection, updatedByUserId: f.userId },
-    });
-
-    const gatedResponse = await fetch(
-      `${app.baseUrl}/internal/computer/runners/${f.agentId}/provider-connection`,
-      {
-        method: "POST",
-        headers: authHeaders(f.computerApiKey),
-        body: JSON.stringify({ connectionId: connection.id }),
-      },
-    );
-    assert.equal(gatedResponse.status, 404);
-    assert.equal((await gatedResponse.json() as { code?: string }).code, "provider_connections_disabled");
-
-    await getDb().insert(featureFlagRules).values({
-      flagKey: PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY,
-      stage: "server",
-      priority: -100,
-      decision: "allow",
-      values: [f.serverId],
-    });
-
-    // Launch materialization does not require a fresh Computer verification receipt;
-    // an enabled connection with valid credentials materializes directly.
-    const initialLaunch = await fetch(
-      `${app.baseUrl}/internal/computer/runners/${f.agentId}/provider-connection`,
-      {
-        method: "POST",
-        headers: authHeaders(f.computerApiKey),
-        body: JSON.stringify({ connectionId: connection.id }),
-      },
-    );
-    assert.equal(initialLaunch.status, 200);
-    assert.deepEqual(await initialLaunch.json(), {
-      envVars: { DEEPSEEK_API_KEY: "provider-materialization-secret" },
-      providerConnection: {
-        providerId: "deepseek",
-        endpointUrl: null,
-        supportsImageInput: false,
-      },
-    });
-
-    const probeId = randomUUID();
-    await getDb().insert(providerProbeIntents).values({
-      id: probeId,
-      serverId: f.serverId,
-      connectionId: connection.id,
-      configVersion: selection.configVersion,
-      credentialVersion: selection.credentialVersion,
-      computerId: f.machineId,
-      runtime: "claude",
-      model: "deepseek/deepseek-v4-pro",
-      probeKind: "canary",
-      probeRequestId: `probe-req-${probeId}`,
-      requestDigest: `digest-${probeId}`,
-      intentDigest: `intent-${probeId}`,
-      expiresAt: new Date(Date.now() + 60_000),
-      dispatchedAt: new Date(),
-      closeReason: "receipt",
-      closedAt: new Date(),
-    });
-    await getDb().insert(providerProbeReceipts).values({
-      probeId,
-      serverId: f.serverId,
-      outcome: "success",
-      latencyMs: 12,
-      responseSha256: "a".repeat(64),
-      responseBytes: 42,
-      resultDigest: `result-${probeId}`,
-      intentDigest: `intent-${probeId}`,
-      authorityIdentity: "runners-test-authority",
-    });
-
-    const response = await fetch(
-      `${app.baseUrl}/internal/computer/runners/${f.agentId}/provider-connection`,
-      {
-        method: "POST",
-        headers: authHeaders(f.computerApiKey),
-        body: JSON.stringify({ connectionId: connection.id }),
-      },
-    );
-    assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), {
-      envVars: { DEEPSEEK_API_KEY: "provider-materialization-secret" },
-      providerConnection: {
-        providerId: "deepseek",
-        endpointUrl: null,
-        supportsImageInput: false,
-      },
-    });
-
-    const otherMachine = await fetch(
-      `${app.baseUrl}/internal/computer/runners/${f.sameServerOtherMachineAgentId}/provider-connection`,
-      {
-        method: "POST",
-        headers: authHeaders(f.computerApiKey),
-        body: JSON.stringify({ connectionId: connection.id }),
-      },
-    );
-    assert.equal(otherMachine.status, 404);
-    assert.equal((await otherMachine.json() as { code?: string }).code, "agent_missing");
-
-    const alias = await fetch(
-      `${app.baseUrl}/internal/computer/runners/${f.agentId}/provider-connection`,
-      {
-        method: "POST",
-        headers: authHeaders(f.computerApiKey),
-        body: JSON.stringify({ connectionId: connection.id, apiKey: "alias-must-fail" }),
-      },
-    );
-    assert.equal(alias.status, 400);
-  } finally {
-    if (previousKey === undefined) delete process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
-    else process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = previousKey;
-    await app.close();
-  }
+// Saved provider connections are removed. An older Computer whose agent still
+// names one asks this route at launch; it is gone, and such a daemon treats
+// any non-2xx as a failed materialization (its providerConnectionLaunch.ts;
+// current daemons no longer ask).
+test("the removed provider materialization route answers a Computer with a refusal, never a credential", async ({ app }) => {
+  const f = await seedComputerWithAgent();
+  const res = await fetch(`${app.baseUrl}/internal/computer/runners/${f.agentId}/provider-connection`, {
+    method: "POST",
+    headers: authHeaders(f.computerApiKey),
+    body: JSON.stringify({ connectionId: randomUUID() }),
+  });
+  assert.ok(res.status >= 400 && res.status < 500, `${res.status}: ${await res.clone().text()}`);
+  assert.equal(JSON.stringify(await res.json().catch(() => null)).includes("envVars"), false);
 });
 
 test("runners list: default scope is this machine and §12 whitelist enforced server-side", async ({ app }) => {
@@ -401,6 +265,49 @@ for (const operation of ["mint", "stop", "revoke"] as const) {
     assert.equal(response.status, 404, await response.text());
   });
 }
+
+// #4482: agents.id is a uuid column; a malformed :agentId used to reach the
+// query and come back as an opaque 500 (Postgres 22P02). It names no agent,
+// so it gets the unknown agent's answer.
+test("runner routes: a malformed :agentId answers like an unknown agent (404 agent_missing), never 500", async ({ app }) => {
+  const f = await seedComputerWithAgent();
+  const own = await mintAgentCredential({ agentId: f.agentId, scopes: ["read"], name: "runner:own", issuedVia: "computer", issuedByMachineId: f.machineId, createdByUserId: null });
+  const call = (agentId: string, method: string, suffix: string, body?: unknown) =>
+    fetch(`${app.baseUrl}/internal/computer/runners/${agentId}/${suffix}`, {
+      method,
+      headers: authHeaders(f.computerApiKey),
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+  const routes = [
+    { method: "POST", suffix: "stop", body: {} },
+    { method: "POST", suffix: "credentials", body: {} },
+    { method: "DELETE", suffix: `credentials/${own.credentialId}` },
+  ];
+  for (const route of routes) {
+    const unknown = await call(randomUUID(), route.method, route.suffix, route.body);
+    const unknownBody = await unknown.json();
+    for (const malformed of ["not-a-uuid", "123", `${f.agentId}x`]) {
+      const res = await call(malformed, route.method, route.suffix, route.body);
+      assert.equal(res.status, unknown.status, `${route.method} ${route.suffix} ${malformed}`);
+      assert.deepEqual(await res.json(), unknownBody, `${route.method} ${route.suffix} ${malformed}`);
+    }
+  }
+  assert.deepEqual(await (await call("not-a-uuid", "POST", "stop", {})).json(), { error: "Agent not found", code: "agent_missing", errorCode: "agent_missing" });
+  // Routes that check other things first still never reach the uuid cast.
+  for (const route of [
+    { method: "POST", suffix: "credentials/renew", body: { credentialId: own.credentialId } },
+  ]) {
+    const res = await call("not-a-uuid", route.method, route.suffix, route.body);
+    assert.equal(res.status, 404, `${route.suffix}: ${await res.clone().text()}`);
+    assert.equal((await res.json() as { code?: string }).code, "agent_missing", route.suffix);
+  }
+  // A malformed :credentialId of its own agent: the unknown credential's answer.
+  const unknownCredential = await call(f.agentId, "DELETE", `credentials/${randomUUID()}`);
+  const malformedCredential = await call(f.agentId, "DELETE", "credentials/not-a-uuid");
+  assert.equal(malformedCredential.status, 404);
+  assert.equal(unknownCredential.status, 404);
+  assert.deepEqual(await malformedCredential.json(), await unknownCredential.json());
+});
 
 test("runner credential revoke: the Computer's own credential → 204 and revoked", async ({ app }) => {
   const f = await seedComputerWithAgent();

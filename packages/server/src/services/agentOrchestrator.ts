@@ -1,4 +1,7 @@
 import { LocalAgentInboxes } from "./localAgentInboxes";
+import { assertNoEncryptedAgentSecrets, openAgentRowSecrets, openAgentRowSecretsIsolated } from "./agentSecretCrypto";
+import { getReplicaAgentConfigSealModeSync } from "./agentSecretFlags";
+import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import { recordAgentSystemRestart } from "./agentOperatorEvents";
 import { inboxItemsLaunch, inboxItemsOnWith } from "./inboxItemsLaunch";
 import { EventEmitter } from "node:events";
@@ -23,10 +26,27 @@ import {
   DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR,
   DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK,
   DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR_PI,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CLAUDE,
+  DAEMON_CAPABILITY_TURN_END_COMPACTION_V2,
+  DAEMON_CAPABILITY_AGENT_FOCUS_V1,
+  AGENT_FOCUS_FEATURE_FLAG_KEY,
   DAEMON_CAPABILITY_AGENT_CONFIG_PUSH,
+  DAEMON_CAPABILITY_AGENT_CONFIG_INTERRUPT,
+  DAEMON_CAPABILITY_CODEX_SERVICE_TIER_V1,
   DAEMON_CAPABILITY_CONTROL_START_CATCHUP_V1,
   DAEMON_CAPABILITY_SEQUENCED_STATUS,
   DAEMON_CAPABILITY_INTERRUPT_SUBAGENT,
+  DAEMON_CAPABILITY_PROC_STOP,
+  capProcJobsSnapshotJobs,
+  PROC_JOB_STOP_OUTCOMES,
+  safeParseProcJobsSnapshot,
+  COMPUTER_CHECK_IDS,
+  COMPUTER_CHECKS_FEATURE_FLAG_KEY,
+  COMPUTER_CHECKS_CLOCK_SKEW_MS,
+  DAEMON_CAPABILITY_COMPUTER_CHECKS,
+  type ComputerChecksEnabled,
+  type ProcJobStopOutcome,
   DAEMON_CAPABILITY_INTERRUPT_TURN,
   DAEMON_CAPABILITY_AGENT_SIDE_ASK,
   AGENT_SIDE_ASK_ANSWER_MAX_CHARS,
@@ -40,8 +60,12 @@ import {
   parseCredentialRestoredMessage,
   parseRuntimeReadinessReport,
   RUNTIME_AUTH_LOGOUT_RELAY_BUDGET_MS,
+  RUNTIME_UPGRADE_RELAY_BUDGET_MS,
+  RUNTIME_INSTALL_RELAY_BUDGET_MS,
+  RUNTIME_INSTALL_PLAN_RELAY_BUDGET_MS,
   RUNTIME_AUTH_PROVIDER_RELAY_BUDGET_MS,
   RUNTIME_AUTH_RUNTIMES,
+  isRuntimeAccountUsageProvider,
   asRuntimeAuthLoginId,
   runtimeAuthLoginEventSchema,
   runtimeAuthLoginResultSchema,
@@ -55,6 +79,9 @@ import {
   type RuntimeAuthLoginEventPush,
   type RuntimeAuthLoginResultPush,
   type RuntimeAuthLogoutResult,
+  type RuntimeUpgradeResult,
+  type RuntimeInstallPlan,
+  type RuntimeInstallResult,
   type RuntimeAuthProviderConnectInput,
   type RuntimeAuthProviderConnectResult,
   type RuntimeAuthProvidersResult,
@@ -80,28 +107,33 @@ import {
   getStaticRuntimeModelSourceSet,
   getToolActivityLabel,
   hydrateRuntimeConfig,
+  isBuiltInRuntimeConfigMissingProvider,
   sharedCredentialsAuthRuntime,
+  isRuntimeAccountUsageFolderProvider,
+  runtimeAccountUsageAccountHomes,
   isAgentActivityDetailKind,
   isExternalAgentRuntime,
   noopTracer,
   normalizeActivity,
-  PROVIDER_PROBE_BUDGET_MS,
-  PROVIDER_PROBE_RELAY_BUDGET_MS,
   RUNTIME_ACCOUNT_USAGE_RELAY_BUDGET_MS,
   RUNTIME_LIMIT_RESET_RELAY_BUDGET_MS,
   RUNTIME_LIMIT_RESET_CLAUDE_RELAY_BUDGET_MS,
   DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET,
+  DAEMON_CAPABILITY_RUNTIME_UPGRADE,
+  DAEMON_CAPABILITY_RUNTIME_INSTALL,
   runtimeAccountUsageReadableWith,
   DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET_CLAUDE_KINDS,
   normalizeActivityDetailKind,
   parseTraceparent,
   runtimeConfigForLaunch,
+  runtimeConfigWithoutServiceTier,
   runtimeConfigToLaunchFields,
   runtimeModelSourceOutcomeFromSet,
   runtimeModelDetectionRequestTimeoutMs,
   setClockTimeout,
   type ActiveSpan,
   type AgentMessage,
+  type AgentStartOpenTasks,
   type MentionDeliveryIdentitySnapshot,
   type ServerToMachineMessage,
   type MachineToServerMessage,
@@ -115,6 +147,8 @@ import {
   type AgentConfig,
   type AgentServerFeatures,
   TASK_V2_CONVERSATIONS_FEATURE_FLAG_KEY,
+  CONTINUATION_TOOL_FEATURE_FLAG_KEY,
+  INBOX_NOTICE_SERVER_ROWS_FEATURE_FLAG_KEY,
   AGENT_CONTEXT_VIEW_FEATURE_FLAG_KEY,
   AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY,
   AGENT_CONTEXT_VIEW_AVAILABILITY_TYPE,
@@ -156,6 +190,7 @@ import {
   type FeedbackTranscriptUploadOutcome,
   type FeedbackMachineLogTailOutcome,
   type FeedbackTranscriptWindow,
+  type RuntimeAccountUsageAccountHome,
   type RuntimeAccountUsageProvider,
   type RuntimeErrorActivityDiagnostic,
   type RuntimeErrorRequiredAction,
@@ -170,6 +205,8 @@ import {
   isComputerMigratedFrom,
   parseComputerInstallerRepairHint,
   type ComputerInstallerRepairHint,
+  parseComputerUpgradeScope,
+  type ComputerUpgradeScopeUnavailable,
   type DaemonInstallKind,
   normalizeOsRelease,
   normalizeOsId,
@@ -177,6 +214,7 @@ import {
   AGENT_MIGRATION_CAPABILITY,
   AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY,
   AGENT_MIGRATION_TARGET_IGNORED_PARTIAL_CAPABILITY,
+  AGENT_MIGRATION_TARGET_SKIPPED_UNREADABLE_CAPABILITY,
   MODEL_SEEN_MAX_ITEMS_PER_REPORT,
   MACHINE_DUPLICATE_CONNECTION_CLOSE_CODE,
   MACHINE_DUPLICATE_CONNECTION_CLOSE_REASON,
@@ -207,8 +245,9 @@ import {
 import { wakeRequestAppRefTraceAttrs } from "./wakeRequestAppRef";
 import type { AppConfigWireSnapshot } from "@botiverse/raft-shared/src/appConfigTransport";
 import { RouteFailureError } from "../tracing/routeFailure";
+import { ComputerReadUnavailableError } from "./computerProbeCacheService";
 import type { RelayedMachineResponse } from "../machineResponseRelay";
-import { applyAgentModelSeen as applyAgentModelSeenToReadPosition } from "./agentModelSeen";
+import { applyAgentModelSeen as applyAgentModelSeenToReadPosition, applyAgentModelSeenWithReplay } from "./agentModelSeen";
 import { TurnEndUnreadSnapshots, snapshotForUnreadSummary, type UnreadSummarySnapshotTargets } from "./turnEndUnreadSnapshot";
 import { owedReadBacklogTargets, settleUnowedReadBacklog, type UnowedReadBacklogTarget } from "./unowedReadBacklog";
 import { getDb } from "../db/index";
@@ -252,6 +291,8 @@ import {
 import * as agentService from "./agentService";
 import * as agentMigrationService from "./agentMigrationService";
 import * as agentRuntimeProfileService from "./agentRuntimeProfileService";
+import { focusOnDelivery } from "./agentFocusAuto";
+import { stampFocus, withoutFocusTags } from "./agentFocusDelivery";
 import { listModelLimitsAgents, parseAgentModelLimitsFrame, recordAgentModelLimitsReport } from "./agentModelLimitsService";
 import * as machineService from "./machineService";
 import { computerVersionFloor as sharedComputerVersionFloor } from "./computerVersionFloorService";
@@ -293,15 +334,17 @@ import { previewAgentTaskReplyTarget } from "./agentTypingTaskTarget";
 import { agentProgressAtMs } from "./agentProgressMarks";
 import { RepeatedWakeGuard, type RepeatedWakeTrip } from "./agentRepeatedWakeGuard";
 import { claimRepeatedWakeNotice, clearRepeatedWakeExclusion, repeatedWakeExclusion, setRepeatedWakeExclusion } from "./agentRepeatedWakeStore";
-import { AGENT_REPEATED_WAKE_GUARD_FEATURE_FLAG_KEY, READY_WAKE_LOST_DELIVERIES_FEATURE_FLAG_KEY, RUNNER_CREDENTIAL_RECONCILE_FEATURE_FLAG_KEY, agentRuntimeOarDisabled, agentRuntimeOarFeatureFlagKey, evaluateFeatureFlag, evaluateFeatureFlags, PASSIVE_AX_FEATURE_FLAG_KEY, PI_SESSION_ROTATION_FEATURE_FLAG_KEY, REMINDER_APP_FEATURE_FLAG_KEY, WAKE_RECYCLE_OAR_FEATURE_FLAG_KEY, WAKE_RECYCLE_TIER_GATE_FEATURE_FLAG_KEY, WAKE_RECYCLE_WARM_FEATURE_FLAG_KEY, TURN_END_COMPACTION_FEATURE_FLAG_KEY, SUBAGENT_DELEGATION_FEATURE_FLAG_KEY, VAULT_APP_FEATURE_FLAG_KEY, type AgentRuntimeOarFeatureFlagKey } from "./featureFlagService";
+import { AGENT_REPEATED_WAKE_GUARD_FEATURE_FLAG_KEY, READY_WAKE_LOST_DELIVERIES_FEATURE_FLAG_KEY, RUNNER_CREDENTIAL_RECONCILE_FEATURE_FLAG_KEY, agentRuntimeOarDisabled, agentRuntimeOarFeatureFlagKey, DM_REPLY_PLACEMENT_FEATURE_FLAG_KEY, evaluateFeatureFlag, evaluateFeatureFlags, PASSIVE_AX_FEATURE_FLAG_KEY, PI_SESSION_ROTATION_FEATURE_FLAG_KEY, REMINDER_APP_FEATURE_FLAG_KEY, WAKE_RECYCLE_OAR_FEATURE_FLAG_KEY, WAKE_RECYCLE_TIER_GATE_FEATURE_FLAG_KEY, WAKE_RECYCLE_WARM_FEATURE_FLAG_KEY, TURN_END_COMPACTION_FEATURE_FLAG_KEY, SILENT_TURN_END_FEATURE_FLAG_KEY, SUBAGENT_DELEGATION_FEATURE_FLAG_KEY, VAULT_APP_FEATURE_FLAG_KEY, type AgentRuntimeOarFeatureFlagKey } from "./featureFlagService";
 import { runtimeAccountUsageCacheService } from "./runtimeAccountUsageCacheService";
+import { procJobsCacheService } from "./procJobsCacheService";
+import { computerChecksCacheService } from "./computerChecksCacheService";
 import { runtimeAuthService } from "./runtimeAuthService";
 import { openAfterReplicaHop, sealForReplicaHop, type ReplicaHopRefusal } from "./runtimeAuthReplicaSeal";
 import { usageLimitAttentionService } from "./usageLimitAttentionService";
 import { applyRuntimeModelCatalogReport, machineRuntimeModelCatalogService } from "./machineRuntimeModelCatalogService";
 import { getComputerLinkedMachineAttachers } from "./computerCredentialService";
 import { findAccessRevokedMachineIds } from "./computerAgents";
-import { RUNNER_CREDENTIAL_RECONCILE_GRACE_MS, countRunnerCredentialsNotHeld, revokeRunnerCredentialsNotHeld } from "./agentCredentialService";
+import { RUNNER_CREDENTIAL_RECONCILE_GRACE_MS, captureRunnerCredentialsNotHeld, countRunnerCredentialsNotHeld, countRunnerCredentialsUsedSince, readDatabaseNow, revokeAgentRunnerCredentialsForReset, revokeRunnerCredentialsNotHeld } from "./agentCredentialService";
 import {
   evaluateBroadcastPolicy,
   isQueuedComputerUpgradePolicyCompatible,
@@ -332,6 +375,7 @@ import { DEFAULT_WAKE_CRASH_LOOP_RULES, PAUSE_RETRY_BASE_MS, PAUSE_RETRY_MAX_MS,
 import { postAgentActionRequiredNotice } from "./agentActionRequiredNoticeService";
 import { readinessNoticeKey, readinessNoticePlan, releaseReadinessNotices, storeRuntimeReadinessReport } from "./runtimeReadinessService";
 import { postAutomaticWakePausedNotice } from "./automaticWakePausedNotice";
+import { listAgentResumeOpenTasks } from "./agentResumeOpenTasks";
 import { isLegacyStartFailureDetail, isLegacyUnkindedStartFailure, legacySpawnFailureCarrier } from "./legacySpawnFailure";
 import { normalizeExternalSubagentMarker } from "./externalSubagentMarker";
 import { normalizeSpawnFailureActivityDiagnostic } from "./spawnFailureActivityDiagnostic";
@@ -373,6 +417,7 @@ import {
   reduceRuntimeProfileControlLifecycle,
   reduceStartLifecycle,
   reduceStopLifecycle,
+  planActivityLivenessRefresh,
   type DaemonReportedAgentStatus,
   type LifecycleObservationClass,
   type LifecycleArbitrationVerdict,
@@ -417,6 +462,7 @@ import {
   StartIntentRemoteError,
   StartIntentTimeoutError,
   StartIntentTransportError,
+  broadcastAgentCredentialRevocation,
   replicaSupportsOwnerIntents,
   type OwnerIntent,
   type StartIntentRequest,
@@ -451,7 +497,13 @@ import {
 } from "../tracing/migrationTraceContext";
 import {
   agentDeliveryAckSeconds,
+  agentDeliveryE2eSeconds,
   agentDeliveryOutcomesTotal,
+  agentDeliveryQueueSeconds,
+  agentWakeStartSeconds,
+  observeMessagePushLag,
+  observeMetricSafely,
+  secondsSince,
   provideAgentDeliveryPending,
   daemonVersionLabel,
   releaseAgentDeliveryPending,
@@ -479,7 +531,6 @@ import {
   builtInCatalogSelection,
   type BuiltInModelCatalogValidation,
 } from "./builtinModelCatalogCompatibility";
-import { providerConnectionProviderId } from "./providerConnectionService";
 
 export type MachineConnectionPrincipalKind = "computer" | "legacy_machine" | "unknown";
 
@@ -495,6 +546,12 @@ interface MachineConnection {
   // application heartbeat above. Null when disabled.
   wsPingTimer: unknown | null;
   runtimeAccountUsageTimer: unknown | null;
+  /** The newest `reportedAt` (ms) of a proc jobs snapshot this connection sent; an older one arriving later is dropped. */
+  procJobsReportedAtMs?: number;
+  /** The newest `computer:checks:report` `checkedAt` this connection sent (an older one is dropped). */
+  computerChecksCheckedAtMs?: number;
+  /** This connection's `computer:checks:report`s, handled one at a time in arrival order. */
+  computerChecksIngest?: Promise<unknown>;
   lastPong: number;
   lastIngressAt: number;
   // When this connection was accepted; SLI 4 failure outcomes are bucketed by
@@ -556,6 +613,10 @@ interface MachineConnection {
   // the machine (`ready.installerRepairHint`, then `machine:installer_repair_hint`);
   // null when there is nothing to hint and for Computers that never report it.
   installerRepairHint?: ComputerInstallerRepairHint | null;
+  // `ready.upgradeScope`: the Computer's systemd manager refuses the scope a
+  // web upgrade's installer needs; every ready replaces it (absent = null =
+  // allowed or unknown, also for Computers that never report it).
+  upgradeScope?: ComputerUpgradeScopeUnavailable | null;
   migrationTransport: MachineMigrationTransportState | null;
   shutdownIntent: MachineShutdownIntent | null;
   traceContext?: MachineConnectTraceContext;
@@ -756,7 +817,7 @@ export interface MachineRuntimeModelDetection {
  * the startup input, on old and new versions alike, so no protocol field.
  */
 export const RESUME_CATCHUP_UNAVAILABLE_PROMPT =
-  "Messages that arrived while you were away could not be checked: the inbox source was unavailable when you started. Run `raft message check` once to see what is pending, then handle it or stop.";
+  "Messages that arrived while you were away could not be checked: the inbox source was unavailable when you started. Run `raft inbox check` once to see what is pending, then handle it or stop.";
 
 function normalizeMigrationTransportReady(
   input: AgentMigrationTransportReady | undefined,
@@ -784,6 +845,11 @@ function normalizeMigrationTransportReady(
 /** `MachineMeta.installerRepairHint`: JSON of the report, or null when there is nothing to hint. */
 function installerRepairHintMeta(hint: ComputerInstallerRepairHint | null): string | null {
   return hint ? JSON.stringify(hint) : null;
+}
+
+/** `MachineMeta.upgradeScope`: JSON of the refusal, or null (allowed or unknown). */
+function upgradeScopeMeta(report: ComputerUpgradeScopeUnavailable | null): string | null {
+  return report ? JSON.stringify(report) : null;
 }
 
 function machineMetaFromMigrationTransport(
@@ -1002,6 +1068,12 @@ const COMPUTER_LIFECYCLE_DISCONNECT_OBSERVATION_TIMEOUT_MS = 1000;
 const MACHINE_DISCONNECT_PROJECTION_GRACE_MS = 2000;
 /** Fire the retry-once retry just after its hold ends, so the gate never sees it a tick early. */
 const START_FAILURE_RETRY_SLACK_MS = 250;
+/**
+ * #wg-rbac:#80: how long after a count-only reconcile its follow-up recounts
+ * which of the unlisted keys were used after the ready (a live process the
+ * list missed). Long enough for an idle background user to call the server.
+ */
+export const RUNNER_CREDENTIAL_RECONCILE_FOLLOWUP_DELAY_MS = 30 * 60_000;
 export function normalizeRuntimeProfileReportSource(source: unknown): string {
   return typeof source === "string" && RUNTIME_PROFILE_REPORT_SOURCES.has(source) ? source : "unknown";
 }
@@ -1153,6 +1225,14 @@ interface PendingAgentDeliveryAck {
   firstAttemptAt: number;
   lastAttemptAt: number;
   /**
+   * When the delivery entered the send path on this replica; the start of
+   * slock_agent_delivery_queue_seconds. Usually the same as firstAttemptAt,
+   * earlier by the render and version-hold checks.
+   */
+  enqueuedAt: number;
+  /** First agent:deliver frame written to the daemon socket from this replica (queue segment end). */
+  firstSentAt?: number;
+  /**
    * When this record began its current wait for an ack on a live connection:
    * the first send, a reconnect re-send, or the re-send after a park. The
    * give-up bounds count from here, so time offline never counts against a
@@ -1216,6 +1296,8 @@ interface PendingAgentStartAck {
   createdAt: number;
   lastAttemptAt: number;
   nextRetryAt: number | null;
+  /** First agent:start frame written to the daemon socket from this replica (slock_agent_wake_start_seconds start). */
+  firstSentAt?: number;
 }
 
 interface StartAgentOptions {
@@ -1318,16 +1400,78 @@ class CrossReplicaQueueReceiptUnavailableError extends Error {
 export class KimiReasoningEffortUpgradeRequiredError extends Error {
   readonly code = "upgrade_required" as const;
 
-  constructor() {
-    super("Update Raft on this computer before starting a Kimi agent with an explicit reasoning setting");
+  /** `message`: the owner replica's words, when a routed start is rebuilt here (rehydrateStartIntentError). */
+  constructor(message = "Update Raft on this computer before starting a Kimi agent with an explicit reasoning setting") {
+    super(message);
     this.name = "KimiReasoningEffortUpgradeRequiredError";
+  }
+}
+
+/**
+ * A Built-in agent whose stored config has no provider cannot launch. The
+ * start refuses it in plain words instead of failing later with a bare
+ * TypeError in the launch projection. (The parser's own wording,
+ * BUILTIN_RUNTIME_PROVIDER_REQUIRED_REASON, names an internal field path and
+ * is not for people.) Its code is not the daemon's `runtime_config_invalid`
+ * spawn-failure reason, which means the runtime rejected its configuration.
+ */
+export class BuiltInProviderMissingStartError extends Error {
+  readonly code = "builtin_provider_missing" as const;
+
+  /** `message`: the owner replica's words, when a routed start is rebuilt here (rehydrateStartIntentError). */
+  constructor(message = "This agent has no model provider. Open its settings, choose a provider and save, then start it again.") {
+    super(message);
+    this.name = "BuiltInProviderMissingStartError";
   }
 }
 
 type StopAgentReason = "manual" | "internal";
 
-/** Reconciler step 11b: whether `applyAgentConfig` sent the agent's daemon its new config. */
-export type AgentConfigApplyOutcome = "pushed" | "not_pushed";
+/**
+ * Reconciler step 11b + #proj-runtime:#80: options for `applyAgentConfig`.
+ * When `fallbackRestartMode` is provided and the agent runs on an older
+ * Computer without `agent:config-push-v1`, the server restarts it immediately
+ * if idle or queues the restart for the next observed idle point if busy.
+ */
+export interface ApplyAgentConfigOptions {
+  fallbackRestartMode?: "restart" | "session";
+  terminalControl?: "runtime_config_changed";
+}
+
+/**
+ * Reconciler step 11b + #proj-runtime:#80: outcome of `applyAgentConfig`.
+ * - `pushed`: sent `agent:config` to a capable daemon while the agent was idle (daemon stops old process immediately).
+ * - `pushed_busy`: sent `agent:config` to a capable daemon without `agent:config-interrupt-v1` while running a foreground turn (applies after turn).
+ * - `pushed_restarted`: sent `agent:config` `{ interrupt: true }` to a daemon with `agent:config-interrupt-v1` while busy and immediately restarted it so interrupted work resumes.
+ * - `fallback_restarted`: older daemon without push, agent was idle, server restarted it immediately.
+ * - `fallback_when_idle`: older daemon without push, agent was busy, server queued restart for when it goes idle.
+ * - `not_pushed`: agent not running, machine disconnected, or no fallback restart requested on an older daemon.
+ */
+export type AgentConfigApplyOutcome =
+  | "pushed"
+  | "pushed_busy"
+  | "pushed_restarted"
+  | "fallback_restarted"
+  | "fallback_when_idle"
+  | "not_pushed";
+
+type PendingLegacyConfigRestart = {
+  machineId: string;
+  mode: "restart" | "session";
+  revision: number;
+  terminalControl?: "runtime_config_changed";
+  queuedAtMs: number;
+};
+
+/**
+ * How long a person's reset keeps watching for its stopped launch's exit to
+ * revoke the agent's old runner keys (`resetStopExitTimeoutMs`), off the
+ * start path: a runtime that ignores SIGTERM is SIGKILLed after the daemon's
+ * 10 s stop grace (AGENT_STOP_KILL_GRACE_MS).
+ */
+export const RESET_STOP_EXIT_TIMEOUT_MS = 15_000;
+
+type ResetStopExitWaiter = { machineId: string; launchId: string; connectionEpochId: string; settle: (exited: boolean) => void };
 
 /** Whether the stop reached the daemon. False: only the server-side state changed. */
 export interface AgentStopResult {
@@ -1344,6 +1488,16 @@ export interface ResetAgentOptions {
    * restart is an automatic start for that breaker.
    */
   terminalControl?: "human_reset" | "runtime_config_changed";
+  /**
+   * A person's Restart / Reset (the reset route): revoke the agent's runner
+   * credentials created before the reset began
+   * (revokeAgentRunnerCredentialsForReset), audited with this person as the
+   * actor, once the daemon reports the stopped launch gone (or right after
+   * the stop when nothing ran), off the start path; else none
+   * (`skipped_stop_unconfirmed`, applyResetPlan). Absent (automatic resets: a
+   * settings change, an MCP change): none are revoked.
+   */
+  revokeRunnerCredentials?: { actorUserId: string };
 }
 type PersistedAgentRow = NonNullable<Awaited<ReturnType<typeof agentService.getAgent>>>;
 
@@ -1368,7 +1522,6 @@ interface CachedAgentState {
   description: string | null;
   model: string;
   runtime: string;
-  runtimeConfig: RuntimeConfig;
   lastRuntimeError: AgentRuntimeErrorState | null;
   /**
    * Ephemeral runtime-process presence/state observed from daemon signals.
@@ -1376,7 +1529,6 @@ interface CachedAgentState {
    */
   runtimeState: LifecycleRuntimeState;
   reasoningEffort: RuntimeReasoningEffort | null;
-  envVars: Record<string, string> | null;
 }
 
 /**
@@ -1398,6 +1550,17 @@ export type AgentTurnInterruptRequestResult =
   | { outcome: AgentTurnInterruptOutcome; toolName?: string; stuckForMs?: number }
   | { outcome: "computer_offline" | "computer_upgrade_required" };
 
+/**
+ * A person's Stop of one `raft proc` job: the daemon's stop grace (10 s,
+ * SIGTERM then SIGKILL), its kill confirmation and the exit's collection, and
+ * the answer's trip back.
+ */
+const PROC_JOB_STOP_RELAY_BUDGET_MS = 25_000;
+
+export type ProcJobStopRequestResult =
+  | { outcome: ProcJobStopOutcome }
+  | { outcome: "computer_offline" | "computer_upgrade_required" };
+
 export type AgentSubagentInterruptRequestResult =
   | { outcome: AgentSubagentInterruptOutcome }
   | { outcome: "computer_offline" | "computer_upgrade_required" };
@@ -1408,6 +1571,13 @@ type ActivitySnapshot = {
   detailKind: AgentActivityDetailKind;
   observedAtMs?: number;
   updatedAt: number;
+  /**
+   * #oar-raft:#22: server receive time of the latest daemon heartbeat that
+   * repeated exactly this activity (planActivityLivenessRefresh). Read and
+   * sweep ages use the later of this and the observed time; the kernel's
+   * ordering clock (observedAtMs) never does. A write of other content drops it.
+   */
+  livenessAtMs?: number;
   /**
    * task #1116: present only while detailKind === "delivery_unconsumed". The
    * daemon's typed observation carrier, passed through unchanged for the web.
@@ -1439,6 +1609,7 @@ type ActivitySnapshot = {
 type ActivityClockSnapshot = {
   observedAtMs?: number;
   updatedAt: number;
+  livenessAtMs?: number;
 };
 
 type VisibleActivity = {
@@ -1707,9 +1878,34 @@ interface AgentActivitySnapshotWriteResult {
 
 type ActivityPersistenceOutcome = "applied" | "deduped" | "error";
 
+/** A Raft action recorded in an agent's activity (agentOrchestrator.recordAgentRaftAction). */
+type RaftActionEvent = {
+  title: string;
+  text: string;
+  producerFactId?: string;
+  activity?: AgentActivity;
+  activityDetail?: string;
+  dedupeKey?: string;
+};
+
+/** What recording a Raft action leaves to wait on: its row's write, when one was made. */
+type RaftActionRecordResult = { persistence?: Promise<ActivityPersistenceOutcome> };
+
+function raftActionHistoryEntries(event: RaftActionEvent): TrajectoryEntry[] {
+  return [{
+    // Ordinary `slock_action` entries append durable workspace history only.
+    // Callers with a real status transition must pass explicit activity
+    // fields so reload recovery sees the same status as the live envelope.
+    kind: "slock_action",
+    title: event.title,
+    text: event.text,
+    ...(event.producerFactId ? { producerFactId: event.producerFactId } : {}),
+  }];
+}
+
 type DeliveryAckTurnActiveGate = {
   admit: boolean;
-  reason: "runtime_liveness_failed_or_unknown" | "stale_runtime_observation" | null;
+  reason: "runtime_liveness_failed_or_unknown" | "stale_runtime_observation" | "provider_limit_error_holds" | null;
   runtimeState: LifecycleRuntimeState;
   currentActivity: AgentActivityKind | null;
   observedAgeSec: number | null;
@@ -2414,6 +2610,11 @@ function rehydrateStartIntentError(error: unknown): unknown {
     }
   }
   if (name === "CrossReplicaQueueReceiptUnavailableError") return new CrossReplicaQueueReceiptUnavailableError();
+  // Refusals the routes answer with their own status (409 upgrade_required,
+  // 422 builtin_provider_missing): rebuilt by name, keeping the owner's words,
+  // so a start that ran on another replica is not answered 500.
+  if (name === "KimiReasoningEffortUpgradeRequiredError") return new KimiReasoningEffortUpgradeRequiredError(message);
+  if (name === "BuiltInProviderMissingStartError") return new BuiltInProviderMissingStartError(message);
   return error;
 }
 
@@ -3048,6 +3249,8 @@ type ResetApplyContext = {
   machineId: string | null;
   /** RFC 071 §5: this reset is an E3 (a human reset, or a real runtime-config change). */
   terminalControl?: "human_reset" | "runtime_config_changed";
+  /** ResetAgentOptions.revokeRunnerCredentials. */
+  revokeRunnerCredentials?: { actorUserId: string };
 };
 
 export interface AgentLifecycleEvent {
@@ -3114,6 +3317,15 @@ function agentDeliverySloLabels(pending: PendingAgentDeliveryAck): {
     delivery_kind: pending.msg.mentionDelivery ? "mention" : "plain",
     daemon_version: pending.daemonVersion,
   };
+}
+
+/** The delivery-segment labels (queue, e2e): the SLI 4 labels without daemon_version. */
+function agentDeliverySegmentLabels(pending: PendingAgentDeliveryAck): {
+  online_at_first_attempt: string;
+  delivery_kind: "mention" | "plain";
+} {
+  const { online_at_first_attempt, delivery_kind } = agentDeliverySloLabels(pending);
+  return { online_at_first_attempt, delivery_kind };
 }
 
 /** Rejection message of `deleteMachineWorkspaceDir` when the Computer has not answered yet. */
@@ -3279,6 +3491,15 @@ export class AgentOrchestrator extends EventEmitter {
   private activityDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private agentStateCache = new Map<string, CachedAgentState>();
   private resetInProgress = new Map<string, "restart" | "session" | "full">();
+  /**
+   * A person's reset watching for the daemon to report its stopped launch
+   * gone (`awaitResetStopExit`) to revoke the agent's old runner keys.
+   */
+  private resetStopExitWaiters = new Map<string, Set<ResetStopExitWaiter>>();
+  /** How long it watches (RESET_STOP_EXIT_TIMEOUT_MS); then it revokes nothing. */
+  protected resetStopExitTimeoutMs = RESET_STOP_EXIT_TIMEOUT_MS;
+  /** The revokes those watches run after their reset returned; shutdown waits for them. */
+  private resetRevokesInFlight = new Set<Promise<void>>();
   private lastReadyOnlineBroadcastAt = new Map<string, number>();
   private lifecycleEventsByAgent = new Map<string, AgentLifecycleRingBuffer>();
   private staleActivityTimer: unknown | null = null;
@@ -3343,9 +3564,24 @@ export class AgentOrchestrator extends EventEmitter {
   /** RFC 069 §8: last applied sequenced status per agent. */
   private sequencedStatusVersions = new Map<string, SequencedStatusVersion>();
   private runtimeProfileHeartbeatNudgeSentAt = new Map<string, number>();
+  /**
+   * #proj-runtime:#80: queued idle-safe fallback restarts for active agents on
+   * older Computers lacking `agent:config-push-v1` whose config changed mid-turn.
+   * Lives on the owner replica that holds the machine socket and receives its
+   * `agent:activity` frames; fired as soon as the agent transitions to idle.
+   */
+  private pendingLegacyConfigRestarts = new Map<string, PendingLegacyConfigRestart>();
 
   /** Max seconds a transient activity (working/thinking) can stay before auto-reset */
   private static ACTIVITY_STALE_SEC = 90;
+  /**
+   * #oar-raft:#22: age past which a read serves a transient activity as
+   * online. Longer than the sweep's ACTIVITY_STALE_SEC so the sweep (every
+   * 30 s) gets to probe a quiet agent and the 5 s probe answer lands first:
+   * 90 + 30 + 5 plus margin. A live agent's 60 s heartbeat keeps the age far
+   * below it; a dead agent's reads still fall back to online.
+   */
+  private static ACTIVITY_READ_STALE_SEC = 150;
   /**
    * Soft timeout for an `agent:activity_probe` round-trip. If the
    * daemon doesn't respond within this window, the sweep falls back
@@ -4419,6 +4655,25 @@ export class AgentOrchestrator extends EventEmitter {
       };
     }
 
+    // #proj-runtime:#66: the agent shows a provider limit (a used-up quota,
+    // a throttle) or a billing error, which only model output clears. Its
+    // daemon accepts and acks a delivery while that limit holds, but holds it
+    // until the limit resets: no turn starts, so the ack is no "Message
+    // received". Writing it here replaced the error, and the daemon's next
+    // frame (stamped with its own, earlier send time) lost to it as stale.
+    if (
+      current?.activity === "error"
+      && runtimeErrorClearsOnlyOnModelOutput(this.agentStateCache.get(agentId)?.lastRuntimeError ?? agent?.lastRuntimeError ?? null)
+    ) {
+      return {
+        admit: false,
+        reason: "provider_limit_error_holds",
+        runtimeState,
+        currentActivity: current.activity,
+        observedAgeSec,
+      };
+    }
+
     return {
       admit: true,
       reason: null,
@@ -4490,9 +4745,13 @@ export class AgentOrchestrator extends EventEmitter {
       event.outcome && event.outcome !== "succeeded" ? `status: ${event.outcome}` : null,
     ].filter((line): line is string => Boolean(line));
 
+    // Callers do not await it (a log row and its push): a failure is logged here.
     return this.broadcastRaftAction(agentId, {
       title: summary,
       text: lines.join("\n"),
+    }).catch((err): null => {
+      console.warn(`[ActivityLog ${agentId}] Failed to record activity producer event:`, err);
+      return null;
     });
   }
 
@@ -4520,7 +4779,7 @@ export class AgentOrchestrator extends EventEmitter {
       dedupeKey?: string;
     },
   ): Promise<void> {
-    const result = this.broadcastRaftAction(agentId, event);
+    const result = await this.broadcastRaftAction(agentId, event);
     await result.persistence;
   }
 
@@ -4896,17 +5155,128 @@ export class AgentOrchestrator extends EventEmitter {
     }
   }
 
-  private broadcastRaftAction(
-    agentId: string,
-    event: {
-      title: string;
-      text: string;
-      producerFactId?: string;
-      activity?: AgentActivity;
-      activityDetail?: string;
-      dedupeKey?: string;
-    },
-  ): ActivityBroadcastTraceResult {
+  private async broadcastRaftAction(agentId: string, event: RaftActionEvent): Promise<RaftActionRecordResult> {
+    // A history append claims no status: it carries the agent's current one.
+    // Only the replica holding the agent's Computer knows that in memory; an
+    // agent API request can land on any other, whose copy may be missing (it
+    // then showed `online`, mid-turn) or stale.
+    const historyAppend = !(event.activity && event.activityDetail);
+    if (historyAppend && !(await this.isAgentComputerHere(agentId))) {
+      return this.appendRaftActionOnOtherReplica(agentId, event);
+    }
+    return this.broadcastRaftActionHere(agentId, event);
+  }
+
+  /**
+   * Whether this replica may carry the agent's status on a Raft action: only
+   * when it holds the agent's Computer. An agent with none (an external agent:
+   * its status comes in over HTTP on any replica) has no replica whose memory
+   * of its status is authoritative, so it takes the row-only path too.
+   */
+  private async isAgentComputerHere(agentId: string): Promise<boolean> {
+    let agent: { machineId?: string | null } | null | undefined = this.agentStateCache.get(agentId);
+    if (!agent) {
+      try {
+        agent = await this.getCachedAgent(agentId);
+      } catch {
+        return false;
+      }
+      if (!agent) return false;
+    }
+    return this.agentComputerIsHere(agent.machineId);
+  }
+
+  private agentComputerIsHere(machineId: string | null | undefined): boolean {
+    return Boolean(machineId) && this.hasMachineLocally(machineId!);
+  }
+
+  /** This process's replica identity (a seam so tests can run two replicas in one process). */
+  protected get coarseStateReplicaId(): string {
+    return REPLICA_ID;
+  }
+
+  /**
+   * No other replica holds the Computer: the agent has none, it is connected
+   * nowhere (or its record names this replica), or the shared record cannot be
+   * read (one replica, or Redis down: as before, every replica pushes).
+   */
+  private async noOtherReplicaHoldsComputer(machineId: string | null | undefined): Promise<boolean> {
+    if (!machineId || !this.replicaStateStore.isAvailable()) return true;
+    try {
+      const owner = await this.replicaStateStore.getMachineReplicaOwner(machineId);
+      return !owner || owner === this.coarseStateReplicaId;
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * A Raft action of an agent whose Computer is not on this replica (on another
+   * one, nowhere, or it has none): only its row is stored. Nothing is written to
+   * the agent's status and nothing is pushed: a push from here carries a status
+   * read from the shared record, which can be older than the owner's next write
+   * yet newer by serverSeq, and so stick on pages. A refresh-only push would not
+   * help: the web applies its status too, and does not reload the log on it.
+   * Known gap: an open activity tab shows the row on its next reload, i.e. on
+   * the agent's next status push. While the agent is in a turn one follows
+   * soon; for an action on an idle agent (one a person triggered) it may not.
+   * The row needs a status (the latest row is the restart hint): the owner's
+   * mirrored one, else what the latest row would be served as now.
+   */
+  private async appendRaftActionOnOtherReplica(agentId: string, event: RaftActionEvent): Promise<RaftActionRecordResult> {
+    const { activity, detail, source } = await this.statusForOtherReplicaLogRow(agentId);
+    this.recordEvent("activity.raft_action.other_replica_append", { agent_id: agentId, status_source: source, activity_kind: activity });
+    const persistence = this.persistActivityEvent(agentId, activity, detail, raftActionHistoryEntries(event), new Date(this.clock.now()), event.dedupeKey)
+      .then((inserted): ActivityPersistenceOutcome => inserted ? "applied" : "deduped")
+      .catch((err): ActivityPersistenceOutcome => {
+        console.warn(`[ActivityLog ${agentId}] Failed to persist activity event:`, err);
+        return "error";
+      });
+    return { persistence };
+  }
+
+  /**
+   * The status a log-only row written away from the agent's Computer carries.
+   * The shared record when there is one (the owner's), else the latest row's;
+   * either way a busy state older than ACTIVITY_STALE_SEC is taken as online
+   * (isStaleBusyForLogRow). With no record at all: online (what every reader
+   * defaults to).
+   */
+  private async statusForOtherReplicaLogRow(agentId: string): Promise<{ activity: AgentActivityKind; detail: string; source: "shared" | "shared_stale_busy" | "latest_row" | "latest_row_stale_busy" | "none" }> {
+    if (this.replicaStateStore.isAvailable()) {
+      try {
+        const mirrored = await this.replicaStateStore.getAgentActivity(agentId);
+        if (mirrored) {
+          return this.isStaleBusyForLogRow(mirrored)
+            ? { activity: "online", detail: "", source: "shared_stale_busy" }
+            : { activity: mirrored.activity, detail: mirrored.detail, source: "shared" };
+        }
+      } catch (err) {
+        console.warn(`[ActivityLog ${agentId}] Shared activity unreadable; using the latest row:`, err);
+      }
+    }
+    let latest: PersistedAgentActivityHint | null = null;
+    try {
+      latest = await this.loadLatestPersistedActivityHint(agentId);
+    } catch (err) {
+      console.warn(`[ActivityLog ${agentId}] Latest activity row unreadable:`, err);
+    }
+    if (!latest) return { activity: "online", detail: "", source: "none" };
+    if (this.isStaleBusyForLogRow(latest)) return { activity: "online", detail: "", source: "latest_row_stale_busy" };
+    return { activity: latest.activity, detail: latest.detail, source: "latest_row" };
+  }
+
+  /**
+   * A busy (working / thinking, starting included) state last known current
+   * more than ACTIVITY_STALE_SEC ago: copied into a fresh row it would read as
+   * fresh busy again (broadcastReadyOnline's fresh_busy_persisted), so the row
+   * takes online instead.
+   */
+  private isStaleBusyForLogRow(snapshot: ActivityClockSnapshot & { activity: string }): boolean {
+    return this.isTransientActivity(snapshot.activity) && this.getActivityAgeSec(snapshot) > AgentOrchestrator.ACTIVITY_STALE_SEC;
+  }
+
+  private broadcastRaftActionHere(agentId: string, event: RaftActionEvent): ActivityBroadcastTraceResult {
     const current = this.agentActivity.get(agentId);
     const envelopeActivity = event.activity ?? current?.activity ?? "online";
     const envelopeDetail = event.activityDetail ?? current?.detail ?? "";
@@ -4921,15 +5291,7 @@ export class AgentOrchestrator extends EventEmitter {
             ...(event.producerFactId ? { producerFactId: event.producerFactId } : {}),
           }]
         : []),
-      {
-        // Ordinary `slock_action` entries append durable workspace history only.
-        // Callers with a real status transition must pass explicit activity
-        // fields so reload recovery sees the same status as the live envelope.
-        kind: "slock_action",
-        title: event.title,
-        text: event.text,
-        ...(event.producerFactId ? { producerFactId: event.producerFactId } : {}),
-      },
+      ...raftActionHistoryEntries(event),
     ];
     // gamma-2 shadow: the two caller families are distinguishable and
     // classify differently (gamma-2.1, Kai calibration v3 §B split):
@@ -5022,6 +5384,10 @@ export class AgentOrchestrator extends EventEmitter {
   }
 
   private readonly pauseRetryTimers = new Map<string, unknown>();
+  /** #wg-rbac:#80: the pending follow-up recount per Machine (scheduleRunnerCredentialReconcileFollowup). */
+  private readonly runnerCredentialReconcileFollowups = new Map<string, { timer: unknown; attrs: TraceAttributes }>();
+  /** Set by shutdown: a count still in flight then schedules no follow-up. */
+  private runnerCredentialReconcileFollowupsStopped = false;
 
   /**
    * The pause-retry timer lives in this replica's memory only, so a restart,
@@ -5830,6 +6196,15 @@ export class AgentOrchestrator extends EventEmitter {
     return this.formatActivity("error", boundedRuntimeErrorDetail(error.message));
   }
 
+  /**
+   * The activity a stored runtime error is served as, or null: a failed
+   * start (`spawnFailureReason`) is not, its `runtime_unavailable` snapshot
+   * (carrier, pause verdict) is (rememberStartFailureRuntimeError).
+   */
+  private storedRuntimeErrorActivity(error: AgentRuntimeErrorState | null | undefined): VisibleActivity | null {
+    return error && !error.spawnFailureReason ? this.formatRuntimeErrorActivity(error) : null;
+  }
+
   private async rememberRuntimeError(agentId: string, error: AgentRuntimeErrorState): Promise<boolean> {
     // Redis is an authority only for a value the durable row accepted. Publish
     // nothing (including the process-local shadow) when persistence is a no-op
@@ -5867,6 +6242,70 @@ export class AgentOrchestrator extends EventEmitter {
     });
     await this.mirrorAgentRuntimeError(agentId, durable);
     return true;
+  }
+
+  /**
+   * A failed start (`runtime_unavailable` with its typed carrier) becomes the
+   * agent's stored runtime error, so its managers can read why (the start's
+   * own error text, or an older daemon's fixed copy) where they read any
+   * runtime error (projectRuntimeErrorState: managers only). Unlike
+   * rememberRuntimeError it writes no `error` activity: the failed start's
+   * `runtime_unavailable` snapshot, with its carrier and pause verdict, stays
+   * what every viewer sees (resolveLastRuntimeErrorActivity skips it too).
+   * It replaces only no error or an earlier failed start: any runtime error
+   * (a provider limit, a BillingError, a typed sign-in or model error) stays,
+   * here by this replica's cache and in the database by its own condition
+   * (agentService.setAgentLastRuntimeError). Redis and open pages
+   * (`agent:updated`) hear of it only when the stored record changed: the
+   * daemon repeats its last failed start on every delivery it rejects.
+   * Cleared by the next successful start (runtime ready, progress, a session
+   * report) and by a runtime or model change. Best effort: a failed write
+   * never fails the frame's ingest.
+   */
+  private async rememberStartFailureRuntimeError(agentId: string, error: AgentRuntimeErrorState): Promise<boolean> {
+    try {
+      const cachedBefore = this.agentStateCache.get(agentId);
+      const current = cachedBefore?.lastRuntimeError ?? null;
+      if (current && !current.spawnFailureReason) {
+        this.recordEvent("runtime_error_state.preserved", {
+          reason: "runtime_error_over_start_failure",
+          detail_kind: "runtime_unavailable",
+          error_class: current.errorClass ?? "untyped",
+        });
+        return false;
+      }
+      const durable = await this.persistAgentLastRuntimeError(agentId, error);
+      if (!durable) return false;
+      if (!durable.spawnFailureReason) {
+        // The row holds a runtime error this cache missed: it stays, the cache learns it.
+        this.recordEvent("runtime_error_state.preserved", {
+          reason: "runtime_error_over_start_failure_in_store",
+          detail_kind: "runtime_unavailable",
+          error_class: durable.errorClass ?? "untyped",
+        });
+        await this.syncCachedRuntimeError(agentId, durable);
+        return false;
+      }
+      if (JSON.stringify(current) === JSON.stringify(durable)) {
+        this.recordEvent("runtime_error_state.unchanged", { source: "start_failure", detail_kind: "runtime_unavailable" });
+        return false;
+      }
+      this.updateCache(agentId, { lastRuntimeError: durable });
+      await this.mirrorAgentRuntimeError(agentId, durable);
+      this.recordEvent("runtime_error_state.persisted", {
+        action_required: true,
+        source: "start_failure",
+        detail_kind: "runtime_unavailable",
+        spawn_failure_reason: durable.spawnFailureReason,
+      });
+      // Open agent pages re-read the record (as after a clear).
+      await this.broadcastRuntimeErrorCleared(agentId, cachedBefore);
+      return true;
+    } catch (err) {
+      console.warn(`[Orchestrator] Storing agent ${agentId}'s start failure as its runtime error failed:`, err instanceof Error ? err.message : err);
+      this.recordEvent("runtime_error_state.write_failed", { reason: "start_failure", error_class: errorClassOf(err) });
+      return false;
+    }
   }
 
   /**
@@ -5913,6 +6352,58 @@ export class AgentOrchestrator extends EventEmitter {
     }
     await this.mirrorAgentRuntimeError(agentId, null);
     await this.broadcastRuntimeErrorCleared(agentId, cachedBefore);
+  }
+
+  /**
+   * The agent's next successful start (`agent:runtime:ready`: the runtime of
+   * the launch this server started produced its first output) ends an error
+   * an earlier launch left behind (it used to stay up until the agent's next
+   * real turn). Only the launch the guard expects counts: a replica that
+   * did not arm it cannot tell an old launch's replayed ready from the current
+   * one's. An error this same launch reported stays: the ready frame carries no
+   * sequence to tell it apart, and after the daemon's own crash restart (same
+   * launch id) the error is older than the new process, but the restart's
+   * queued wake runs a turn whose progress clears it. A provider-limit or
+   * billing error stays too: a start is not model
+   * output (runtimeErrorClearsOnlyOnModelOutput). A machine `ready` (a
+   * reconnect) clears nothing. Acts on what this replica's cache shows, like
+   * the session-report clear; the database still keeps a BillingError.
+   */
+  private async clearStaleRuntimeErrorOnRuntimeReady(
+    agent: CachedAgentState,
+    launchId: string,
+  ): Promise<"none" | "cleared" | "preserved"> {
+    const current = this.agentStateCache.get(agent.id) ?? agent;
+    const error = current.lastRuntimeError ?? null;
+    if (!error) return "none";
+    const preservedReason = current.launchGuardMode !== "guarded" || current.expectedLaunchId !== launchId
+      ? "runtime_ready_not_current_launch"
+      // A failed start of this launch is over once its runtime is ready
+      // (a daemon-local restart reuses the launch id): only a runtime error
+      // this launch reported may still be current.
+      : error.launchId === launchId && !error.spawnFailureReason
+        ? "runtime_ready_same_launch"
+        : runtimeErrorClearsOnlyOnModelOutput(error)
+          ? error.errorClass === "BillingError" ? "billing_runtime_ready" : "provider_limit_runtime_ready"
+          : null;
+    if (preservedReason !== null) {
+      this.recordEvent("runtime_error_state.preserved", { reason: preservedReason, detail_kind: "runtime_ready" });
+      return "preserved";
+    }
+    // Best effort: a failed clear keeps the error (shown longer) and never
+    // fails this frame's ingest (the start's progress is already recorded).
+    const cleared = await this.clearLastRuntimeError(agent.id).catch((err: unknown) => {
+      console.warn(`[Orchestrator] Clearing agent ${agent.id}'s runtime error on runtime ready failed:`, err);
+      return false;
+    });
+    if (cleared) {
+      this.recordEvent("runtime_error_state.cleared", { reason: "runtime_ready", detail_kind: "runtime_ready" });
+      return "cleared";
+    }
+    // The row kept a BillingError this cache missed, held no error (the cache
+    // now takes what the row has), or the clear failed.
+    this.recordEvent("runtime_error_state.preserved", { reason: "runtime_ready_not_cleared_in_store", detail_kind: "runtime_ready" });
+    return "preserved";
   }
 
   /** task #1351: a stale replica cache takes the stored error the database just reported. */
@@ -5994,6 +6485,8 @@ export class AgentOrchestrator extends EventEmitter {
     /** task #1351: the setting frame's daemon process and sequence (kept for a BillingError). */
     daemonInstanceId?: string;
     clientSeq?: number;
+    /** A failed start's typed reason (rememberStartFailureRuntimeError). */
+    spawnFailureReason?: SpawnFailureActivityDiagnostic["reason"];
   }): AgentRuntimeErrorState {
     const typed = input.typed ? {
       errorClass: input.typed.errorClass,
@@ -6009,6 +6502,7 @@ export class AgentOrchestrator extends EventEmitter {
       ...(input.launchId !== undefined ? { launchId: input.launchId } : {}),
       actionRequired: true,
       ...typed,
+      ...(input.spawnFailureReason ? { spawnFailureReason: input.spawnFailureReason } : {}),
       // task #1351: a BillingError is cleared only by proof against its own
       // occurrence and set-frame evidence; other classes keep their shape.
       ...(input.typed?.errorClass === "BillingError" ? {
@@ -6145,7 +6639,9 @@ export class AgentOrchestrator extends EventEmitter {
     }
 
     const agent = await this.getCachedAgent(agentId);
-    if (agent?.lastRuntimeError) {
+    // A stored failed start is not shown as the error activity, so it does
+    // not hold back the machine-ready online either (as before it was stored).
+    if (agent?.lastRuntimeError && !agent.lastRuntimeError.spawnFailureReason) {
       span?.addEvent("ready_online.resolve", { agent_id: agentId, outcome: "skip", reason: "runtime_error_state" });
       return;
     }
@@ -6200,10 +6696,11 @@ export class AgentOrchestrator extends EventEmitter {
             if (agent) agent.lastRuntimeError = mirror.error;
           }
           const error = localMatches ? localError : mirror.error;
+          const activity = this.storedRuntimeErrorActivity(error);
           return {
             agent,
-            activity: error ? this.formatRuntimeErrorActivity(error) : null,
-            source: error ? (localMatches ? "runtime-error-l1" : "runtime-error-redis") : null,
+            activity,
+            source: activity ? (localMatches ? "runtime-error-l1" : "runtime-error-redis") : null,
           };
         }
 
@@ -6214,12 +6711,11 @@ export class AgentOrchestrator extends EventEmitter {
         if (freshAgent) {
           await this.mirrorAgentRuntimeError(agentId, freshAgent.lastRuntimeError);
         }
+        const activity = this.storedRuntimeErrorActivity(freshAgent?.lastRuntimeError);
         return {
           agent: freshAgent,
-          activity: freshAgent?.lastRuntimeError
-            ? this.formatRuntimeErrorActivity(freshAgent.lastRuntimeError)
-            : null,
-          source: freshAgent?.lastRuntimeError ? "runtime-error-persisted" : null,
+          activity,
+          source: activity ? "runtime-error-persisted" : null,
         };
       } catch (err) {
         // Treat an unreachable Redis command exactly like isAvailable=false.
@@ -6232,17 +6728,22 @@ export class AgentOrchestrator extends EventEmitter {
     }
 
     const freshAgent = await loadAuthoritativeAgent();
+    const activity = this.storedRuntimeErrorActivity(freshAgent?.lastRuntimeError);
     return {
       agent: freshAgent,
-      activity: freshAgent?.lastRuntimeError
-        ? this.formatRuntimeErrorActivity(freshAgent.lastRuntimeError)
-        : null,
-      source: freshAgent?.lastRuntimeError ? "runtime-error-persisted" : null,
+      activity,
+      source: activity ? "runtime-error-persisted" : null,
     };
   }
 
+  /**
+   * When the snapshot's state was last known current: its observation time
+   * (else its write time), or a later same-content heartbeat's server receive
+   * time (#oar-raft:#22). Ages only; arbitration orders by observedAtMs alone.
+   */
   private getActivityObservedAtMs(snapshot: ActivityClockSnapshot): number {
-    return snapshot.observedAtMs ?? snapshot.updatedAt;
+    const observedAtMs = snapshot.observedAtMs ?? snapshot.updatedAt;
+    return snapshot.livenessAtMs !== undefined ? Math.max(observedAtMs, snapshot.livenessAtMs) : observedAtMs;
   }
 
   private getActivityAgeSec(snapshot: ActivityClockSnapshot): number {
@@ -6288,18 +6789,21 @@ export class AgentOrchestrator extends EventEmitter {
     agentId: string,
     snapshot: ActivitySnapshot,
     source: ActivityHintSource,
-  ): VisibleActivity | null {
+  ): { visible: VisibleActivity; ageSec: number; staleAfterSec: number } | null {
+    const ageSec = this.getActivityAgeSec(snapshot);
+    const staleAfterSec = AgentOrchestrator.ACTIVITY_READ_STALE_SEC;
     const action = planStaleTransientNormalizationAction({
       isTransient: this.isTransientActivity(snapshot.activity),
-      ageSec: this.getActivityAgeSec(snapshot),
-      staleAfterSec: AgentOrchestrator.ACTIVITY_STALE_SEC,
+      ageSec,
+      staleAfterSec,
     });
-    return this.applyStaleTransientNormalizationAction({
+    const visible = this.applyStaleTransientNormalizationAction({
       action,
       agentId,
       source,
       now: this.clock.now(),
     });
+    return visible ? { visible, ageSec, staleAfterSec } : null;
   }
 
   protected applyStaleTransientNormalizationAction(
@@ -6421,9 +6925,13 @@ export class AgentOrchestrator extends EventEmitter {
       span.addEvent("activity.hint.normalized", {
         source,
         activity: snapshot.activity,
-        result: normalized.activity,
+        result: normalized.visible.activity,
+        // #oar-raft:#22: why the hint was replaced, and by how much.
+        reason: "observed_at_stale",
+        age_sec: Math.round(normalized.ageSec),
+        stale_after_sec: normalized.staleAfterSec,
       });
-      return normalized;
+      return normalized.visible;
     }
 
     span.addEvent("activity.hint.candidate", {
@@ -6610,27 +7118,26 @@ export class AgentOrchestrator extends EventEmitter {
   }
 
   private cachedStateFromPersistedAgent(agent: PersistedAgentRow, existing?: CachedAgentState): CachedAgentState {
-    const runtimeConfig = hydrateRuntimeConfig(agent);
+    const openedAgent = openAgentRowSecretsIsolated(agent);
+    const runtimeConfig = hydrateRuntimeConfig(openedAgent);
     const launchRuntimeFields = runtimeConfigToLaunchFields(runtimeConfig);
     return {
-      id: agent.id,
-      status: agent.status,
-      machineId: agent.machineId,
-      sessionId: agent.sessionId,
+      id: openedAgent.id,
+      status: openedAgent.status,
+      machineId: openedAgent.machineId,
+      sessionId: openedAgent.sessionId,
       expectedLaunchId: existing?.expectedLaunchId ?? null,
       launchGuardMode: existing?.launchGuardMode ?? "legacy",
-      serverId: agent.serverId,
-      assistantOwnerUserId: agent.assistantOwnerUserId,
-      name: agent.name,
-      displayName: agent.displayName,
-      description: agent.description,
+      serverId: openedAgent.serverId,
+      assistantOwnerUserId: openedAgent.assistantOwnerUserId,
+      name: openedAgent.name,
+      displayName: openedAgent.displayName,
+      description: openedAgent.description,
       model: launchRuntimeFields.model,
       runtime: launchRuntimeFields.runtime,
-      lastRuntimeError: agent.lastRuntimeError ?? null,
-      runtimeState: existing?.machineId === agent.machineId ? existing.runtimeState : "unknown",
+      lastRuntimeError: openedAgent.lastRuntimeError ?? null,
+      runtimeState: existing?.machineId === openedAgent.machineId ? existing.runtimeState : "unknown",
       reasoningEffort: launchRuntimeFields.reasoningEffort,
-      runtimeConfig,
-      envVars: launchRuntimeFields.envVars,
     };
   }
 
@@ -7152,6 +7659,157 @@ export class AgentOrchestrator extends EventEmitter {
         errorClass: errorClassOf(error),
       });
     }
+  }
+
+  /** Ids of the agents assigned to this machine now (not deleted): the only ones whose jobs a snapshot may carry. */
+  protected async loadProcJobsAssignedAgentIds(machineId: string): Promise<Set<string>> {
+    return new Set((await agentService.getAgentsForMachine(machineId)).map((agent) => agent.id));
+  }
+
+  protected async writeProcJobsSnapshot(machineId: string, snapshot: unknown): Promise<void> {
+    await procJobsCacheService.write(machineId, snapshot);
+  }
+
+  /**
+   * `machine:proc_jobs:snapshot` (docs/contracts/proc-jobs.md): kept only from
+   * the current connection of a Computer someone attached (the usage
+   * snapshot's boundary), read with the strict schema (no command, argv,
+   * cwd, env or log path can be in it), cut to the agents assigned to this
+   * machine and to the caps (capProcJobsSnapshotJobs). Anything else is
+   * dropped whole.
+   */
+  protected async ingestProcJobsSnapshot(machineId: string, conn: MachineConnection, value: unknown): Promise<boolean> {
+    if (!await this.isRuntimeAccountUsageDataBoundaryAuthorized(machineId, conn)) {
+      this.recordEvent("server.machine.proc_jobs_snapshot", { machine_id: machineId, outcome: "unauthorized" });
+      return false;
+    }
+    const parsed = safeParseProcJobsSnapshot(value);
+    if (!parsed.success) {
+      this.recordEvent("server.machine.proc_jobs_snapshot", { machine_id: machineId, outcome: "invalid" });
+      return false;
+    }
+    // Snapshots of one connection are handled concurrently: one that is older
+    // than one already seen (or seen while the agents were read) is dropped,
+    // so it can't land after and overwrite the newer one.
+    const reportedAtMs = Date.parse(parsed.data.reportedAt);
+    const isStale = () => reportedAtMs < (conn.procJobsReportedAtMs ?? -Infinity);
+    if (isStale()) {
+      this.recordEvent("server.machine.proc_jobs_snapshot", { machine_id: machineId, outcome: "stale" });
+      return false;
+    }
+    conn.procJobsReportedAtMs = reportedAtMs;
+    const assigned = await this.loadProcJobsAssignedAgentIds(machineId);
+    // The connection may have been replaced while the agents were read.
+    if (this.machineConnections.get(machineId) !== conn) return false;
+    if (isStale()) {
+      this.recordEvent("server.machine.proc_jobs_snapshot", { machine_id: machineId, outcome: "stale" });
+      return false;
+    }
+    const jobs = capProcJobsSnapshotJobs(parsed.data.jobs, assigned);
+    await this.writeProcJobsSnapshot(machineId, { ...parsed.data, jobs });
+    this.recordEvent("server.machine.proc_jobs_snapshot", {
+      machine_id: machineId,
+      outcome: "stored",
+      job_count: jobs.length,
+      dropped_count: parsed.data.jobs.length - jobs.length,
+    });
+    return true;
+  }
+
+  /**
+   * "On this computer" checks (docs/contracts/computer-checks.md) for this
+   * server: off unless `computer_checks_v0` is on for it (an evaluation
+   * failure reads as off). On, every check is enabled: per-server switches
+   * per check need a settings home (a migration) and come later.
+   */
+  async computerChecksEnabledFor(serverId: string): Promise<ComputerChecksEnabled | null> {
+    try {
+      if ((await evaluateFeatureFlag({ key: COMPUTER_CHECKS_FEATURE_FLAG_KEY, serverId })).enabled !== true) return null;
+    } catch {
+      return null;
+    }
+    // TODO(computer-checks): per-check switches per server (a settings column); all on until then.
+    return Object.fromEntries(COMPUTER_CHECK_IDS.map((id) => [id, true])) as ComputerChecksEnabled;
+  }
+
+  /** Whether this Computer runs the checks: offline (no live carrier fact), or without the capability (an older Computer). */
+  async computerChecksAvailability(machineId: string): Promise<"ok" | "computer_offline" | "unsupported"> {
+    const fact = await this.readProbeCarrierFact(machineId);
+    if (!fact) return "computer_offline";
+    return fact.capabilities.includes(DAEMON_CAPABILITY_COMPUTER_CHECKS) ? "ok" : "unsupported";
+  }
+
+  /** On `ready`: this server's check switches, only to a Computer that runs the checks, only while the flag is on. */
+  protected async sendComputerChecksConfig(machineId: string, conn: MachineConnection): Promise<void> {
+    try {
+      if (!conn.capabilities.has(DAEMON_CAPABILITY_COMPUTER_CHECKS)) return;
+      const enabled = await this.computerChecksEnabledFor(conn.serverId);
+      if (!enabled || this.machineConnections.get(machineId) !== conn) return;
+      await this.sendToMachine(machineId, { type: "computer:checks:config", enabled });
+    } catch (error) {
+      console.warn(`[Machine ${machineId}] computer checks config failed: ${errorClassOf(error)}`);
+    }
+  }
+
+  /**
+   * Ask a Computer for one round of checks (the route decided who may and
+   * claimed the 30 s limit): its config first, so a Computer that reconnected
+   * since `ready` still has one, then the refresh. Fire-and-forget: the
+   * report arrives as `computer:checks:report`. False: nothing sent (flag
+   * off, offline, an older Computer).
+   */
+  async requestComputerChecksRefresh(machineId: string, serverId: string): Promise<boolean> {
+    if (await this.computerChecksAvailability(machineId) !== "ok") return false;
+    const enabled = await this.computerChecksEnabledFor(serverId);
+    if (!enabled) return false;
+    if (!await this.sendToMachine(machineId, { type: "computer:checks:config", enabled })) return false;
+    const sent = await this.sendToMachine(machineId, { type: "computer:checks:refresh" });
+    this.recordEvent("server.machine.computer_checks_refresh", { machine_id: machineId, outcome: sent ? "sent" : "not_sent" });
+    return sent;
+  }
+
+  protected async writeComputerChecksReport(machineId: string, report: unknown): Promise<boolean> {
+    return (await computerChecksCacheService.write(machineId, report)) !== null;
+  }
+
+  /**
+   * `computer:checks:report`: untrusted. Kept only from the current
+   * connection of a Computer someone attached (the usage snapshot's
+   * boundary), while this server's `computer_checks_v0` is on, re-read with
+   * the wire schema, scrubbed, replacing the last one. A connection's reports
+   * are handled one at a time, so an older round can never land after a newer
+   * one. Never logged: only counts and the outcome are traced.
+   */
+  protected ingestComputerChecksReport(machineId: string, conn: MachineConnection, value: unknown): Promise<boolean> {
+    const next = (conn.computerChecksIngest ?? Promise.resolve())
+      .catch(() => {})
+      .then(() => this.ingestComputerChecksReportNow(machineId, conn, value));
+    conn.computerChecksIngest = next;
+    return next;
+  }
+
+  private async ingestComputerChecksReportNow(machineId: string, conn: MachineConnection, value: unknown): Promise<boolean> {
+    const drop = (outcome: string) => {
+      this.recordEvent("server.machine.computer_checks_report", { machine_id: machineId, outcome });
+      return false;
+    };
+    if (!await this.isRuntimeAccountUsageDataBoundaryAuthorized(machineId, conn)) return drop("unauthorized");
+    // Off for this server (or turned off since the refresh): nothing is kept.
+    if (!await this.computerChecksEnabledFor(conn.serverId)) return drop("disabled");
+    const checkedAt = typeof value === "object" && value !== null ? Date.parse(String((value as { checkedAt?: unknown }).checkedAt)) : Number.NaN;
+    // A report from the future would make every later one look older: refused.
+    if (Number.isFinite(checkedAt) && checkedAt > currentTimeMs() + COMPUTER_CHECKS_CLOCK_SKEW_MS) return drop("future");
+    if (Number.isFinite(checkedAt) && checkedAt < (conn.computerChecksCheckedAtMs ?? -Infinity)) return drop("stale");
+    // The connection may have been replaced while the flag was read.
+    if (this.machineConnections.get(machineId) !== conn) return drop("unauthorized");
+    if (!await this.writeComputerChecksReport(machineId, value)) return drop("invalid");
+    if (Number.isFinite(checkedAt)) conn.computerChecksCheckedAtMs = checkedAt;
+    this.recordEvent("server.machine.computer_checks_report", {
+      machine_id: machineId,
+      outcome: "stored",
+      plugin_count: Array.isArray((value as { plugins?: unknown }).plugins) ? (value as { plugins: unknown[] }).plugins.length : 0,
+    });
+    return true;
   }
 
   protected async collectScheduledRuntimeAccountUsage(machineId: string, conn: MachineConnection): Promise<void> {
@@ -8420,6 +9078,23 @@ export class AgentOrchestrator extends EventEmitter {
     }
   }
 
+  /**
+   * The Computer's last `ready.upgradeScope` (owner memory, else the Redis
+   * mirror): an explicit refusal of the scope a web upgrade's installer needs,
+   * or null when allowed, unknown or never reported (older Computers).
+   */
+  async getMachineUpgradeScope(machineId: string): Promise<ComputerUpgradeScopeUnavailable | null> {
+    const local = this.machineConnections.get(machineId);
+    if (local) return local.upgradeScope ?? null;
+    if (!this.replicaStateStore.isAvailable()) return null;
+    try {
+      const raw = (await this.replicaStateStore.getMachineMeta(machineId))?.upgradeScope;
+      return raw ? parseComputerUpgradeScope(JSON.parse(raw)) : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Latest disk report of a connected machine (owner memory, else the Redis mirror). */
   async getMachineDiskStatus(machineId: string): Promise<MachineDiskStatus | null> {
     const local = this.machineConnections.get(machineId);
@@ -8972,6 +9647,7 @@ export class AgentOrchestrator extends EventEmitter {
       ...msg,
       ...(capabilities.includes(AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY) ? { targetAcceptsIgnoreSources: true } : {}),
       ...(capabilities.includes(AGENT_MIGRATION_TARGET_IGNORED_PARTIAL_CAPABILITY) ? { targetAcceptsIgnoredPartial: true } : {}),
+      ...(capabilities.includes(AGENT_MIGRATION_TARGET_SKIPPED_UNREADABLE_CAPABILITY) ? { targetAcceptsSkippedUnreadable: true } : {}),
     };
   }
 
@@ -9332,6 +10008,8 @@ export class AgentOrchestrator extends EventEmitter {
 
   /** Close all machine connections and timers (for graceful shutdown). */
   async shutdown(): Promise<void> {
+    for (const waiters of [...this.resetStopExitWaiters.values()]) for (const waiter of [...waiters]) waiter.settle(false);
+    await this.resetRevokesSettled();
     this.stopReadyOwedWakePasses();
     this.localInboxes.clearAll();
     if (this.spawnErrorRetryTimer) {
@@ -9348,10 +10026,14 @@ export class AgentOrchestrator extends EventEmitter {
     this.activityDebounceTimers.clear();
     for (const timer of this.pauseRetryTimers.values()) this.clock.clearTimeout(timer);
     this.pauseRetryTimers.clear();
+    this.runnerCredentialReconcileFollowupsStopped = true;
+    for (const followup of this.runnerCredentialReconcileFollowups.values()) this.clock.clearTimeout(followup.timer);
+    this.runnerCredentialReconcileFollowups.clear();
     for (const pending of this.pendingMachineDisconnects.values()) {
       this.clock.clearTimeout(pending.timer);
     }
     this.pendingMachineDisconnects.clear();
+    this.pendingLegacyConfigRestarts.clear();
     let shutdownPending = 0;
     let shutdownPendingParked = 0;
     for (const pending of this.pendingAgentDeliveryAcks.values()) {
@@ -9444,6 +10126,7 @@ export class AgentOrchestrator extends EventEmitter {
       this.machineLastDisconnectAt.set(machineId, this.clock.now());
       await this.clearMachineConnection(machineId, false);
       this.agentTyping.endForMachine(machineId);
+      this.clearPendingLegacyConfigRestartsForMachine(machineId);
       this.agentActivityStateFanout.resetMachine(machineId);
       this.dispatchComputerLifecycleDisconnectObservation({
         machineId,
@@ -9910,43 +10593,95 @@ export class AgentOrchestrator extends EventEmitter {
   /**
    * #wg-rbac:#27: the first `ready` of a connection said which runner
    * credentials the daemon holds; revoke this Machine's others
-   * (revokeRunnerCredentialsNotHeld). Not awaited: it delays nothing in the
-   * ready, and a failure only leaves them for the next connection.
+   * (revokeRunnerCredentialsNotHeld: never on a list with no id, only keys
+   * unused for 7 days). Not awaited: it delays nothing in the ready, and a
+   * failure only leaves them for the next connection. With the switch off it
+   * counts instead, and schedules the follow-up recount (#wg-rbac:#80).
    */
-  private startRunnerCredentialReconcile(machineId: string, serverId: string, heldIds: string[], readyAtMs: number): void {
+  private startRunnerCredentialReconcile(conn: MachineConnection, heldIds: string[], readyAtMs: number): void {
+    const { machineId, serverId } = conn;
     const now = new Date(this.clock.now());
+    const input = { machineId, heldIds, issuedBefore: new Date(readyAtMs - RUNNER_CREDENTIAL_RECONCILE_GRACE_MS), now };
     void (async () => {
       if ((await evaluateFeatureFlag({ key: RUNNER_CREDENTIAL_RECONCILE_FEATURE_FLAG_KEY, serverId })).enabled !== true) {
         // Switch off: count what it would revoke (writes nothing) and log it per Machine.
-        const counted = await countRunnerCredentialsNotHeld({
-          machineId,
-          heldIds,
-          issuedBefore: new Date(readyAtMs - RUNNER_CREDENTIAL_RECONCILE_GRACE_MS),
-          now,
-        });
+        // would_revoke_count is the current rule (0 on a list with no id);
+        // the _15m_rule count and would_revoke_used_24h_count are the first
+        // rule's, as logged before, so the series stay comparable.
+        const counted = await countRunnerCredentialsNotHeld(input);
         this.recordEvent("server.machine.runner_credentials.reconciled", {
           outcome: counted === null ? "refused_too_many" : "count_only",
           machine_id: machineId,
           held_count: heldIds.length,
           would_revoke_count: counted?.wouldRevoke ?? 0,
+          would_revoke_count_15m_rule: counted?.wouldRevoke15mRule ?? 0,
           would_revoke_used_24h_count: counted?.usedLast24h ?? 0,
         });
+        if (counted === null) return;
+        const captured = await captureRunnerCredentialsNotHeld(input);
+        if (captured) this.scheduleRunnerCredentialReconcileFollowup(conn, heldIds.length, readyAtMs, captured);
         return;
       }
-      const revoked = await revokeRunnerCredentialsNotHeld({
-        machineId,
-        heldIds,
-        issuedBefore: new Date(readyAtMs - RUNNER_CREDENTIAL_RECONCILE_GRACE_MS),
-        now,
-      });
+      const result = await revokeRunnerCredentialsNotHeld(input);
       this.recordEvent("server.machine.runner_credentials.reconciled", {
-        outcome: revoked === null ? "refused_too_many" : "ok",
+        outcome: result.outcome,
+        machine_id: machineId,
         held_count: heldIds.length,
-        revoked_count: revoked ?? 0,
+        revoked_count: result.outcome === "ok" ? result.revoked : 0,
+        // Ids only (at most RUNNER_CREDENTIAL_RECONCILE_BATCH): with no audit row
+        // per reconcile revoke, this is how a broken agent's key is traced back.
+        revoked_credential_ids: result.outcome === "ok" ? result.revokedIds.join(",") : "",
       });
     })().catch((error) => {
-      this.recordEvent("server.machine.runner_credentials.reconciled", { outcome: "error", error_class: errorClassOf(error) });
+      this.recordEvent("server.machine.runner_credentials.reconciled", { outcome: "error", machine_id: machineId, error_class: errorClassOf(error) });
     });
+  }
+
+  /**
+   * #wg-rbac:#80: RUNNER_CREDENTIAL_RECONCILE_FOLLOWUP_DELAY_MS after a
+   * count-only reconcile, count which of the keys the ready did not list were
+   * used after it arrived: a live process the list missed, which a revoke
+   * would have broken (`would_revoke_used_since_ready_count`: of those the
+   * current rule would take). One timer per Machine, process-local and best
+   * effort: a newer connection's first ready, a disconnect or a reconnect
+   * before it fires makes it `superseded`; shutdown drops it unlogged.
+   */
+  private scheduleRunnerCredentialReconcileFollowup(
+    conn: MachineConnection,
+    heldCount: number,
+    readyAtMs: number,
+    captured: { ids: string[]; wouldRevokeIds: string[]; truncated: boolean },
+  ): void {
+    if (this.runnerCredentialReconcileFollowupsStopped) return;
+    const { machineId } = conn;
+    const base = { machine_id: machineId, held_count: heldCount, candidate_count: captured.ids.length, truncated: captured.truncated };
+    const previous = this.runnerCredentialReconcileFollowups.get(machineId);
+    if (previous) {
+      this.clock.clearTimeout(previous.timer);
+      this.recordEvent("server.machine.runner_credentials.reconcile_followup", { ...previous.attrs, outcome: "superseded" });
+    }
+    const current = () => this.machineConnections.get(machineId) === conn && conn.ws.readyState === 1;
+    if (!current()) {
+      this.runnerCredentialReconcileFollowups.delete(machineId);
+      this.recordEvent("server.machine.runner_credentials.reconcile_followup", { ...base, outcome: "superseded" });
+      return;
+    }
+    const timer = this.scheduleUnrefOnClock(() => {
+      if (this.runnerCredentialReconcileFollowups.get(machineId)?.timer === timer) this.runnerCredentialReconcileFollowups.delete(machineId);
+      if (!current()) {
+        this.recordEvent("server.machine.runner_credentials.reconcile_followup", { ...base, outcome: "superseded" });
+        return;
+      }
+      void countRunnerCredentialsUsedSince({ ids: captured.ids, wouldRevokeIds: captured.wouldRevokeIds, since: new Date(readyAtMs) })
+        .then((counted) => this.recordEvent("server.machine.runner_credentials.reconcile_followup", {
+          ...base,
+          outcome: "ok",
+          used_since_ready_count: counted.usedSince,
+          would_revoke_used_since_ready_count: counted.wouldRevokeUsedSince,
+        }))
+        .catch((error) => this.recordEvent("server.machine.runner_credentials.reconcile_followup", { ...base, outcome: "error", error_class: errorClassOf(error) }));
+    }, RUNNER_CREDENTIAL_RECONCILE_FOLLOWUP_DELAY_MS);
+    this.runnerCredentialReconcileFollowups.set(machineId, { timer, attrs: base });
   }
 
   async handleMachineMessage(machineId: string, msg: MachineToServerMessage, ws?: WebSocket) {
@@ -10080,6 +10815,25 @@ export class AgentOrchestrator extends EventEmitter {
         break;
       }
 
+      case "computer:checks:report":
+      {
+        // Untrusted: this connection of an attached Computer, the wire
+        // schema, the credential scrubber (ingestComputerChecksReport).
+        if (!conn) break;
+        await this.ingestComputerChecksReport(machineId, conn, (msg as { report?: unknown }).report);
+        break;
+      }
+
+      case "machine:proc_jobs:snapshot":
+      {
+        // Untrusted: the boundary the usage snapshot has (this connection,
+        // a Computer someone attached), then the strict schema, the caps and
+        // only agents assigned to this Computer (ingestProcJobsSnapshot).
+        if (!conn) break;
+        await this.ingestProcJobsSnapshot(machineId, conn, (msg as { snapshot?: unknown }).snapshot);
+        break;
+      }
+
       case "machine:runtime_account_usage:snapshot":
       {
         // Re-authorize at the source-to-cache boundary. Raw/legacy principals
@@ -10111,6 +10865,10 @@ export class AgentOrchestrator extends EventEmitter {
           await this.writeRuntimeAccountUsageSnapshot(machineId, msg.snapshot).catch((error: unknown) => {
             addTraceEvent("runtime_account_usage.limit_reset.snapshot_write_failed", { machine_id: machineId, error_class: errorClassOf(error) });
           });
+          const provider: unknown = (msg.snapshot as { provider?: unknown } | null)?.provider;
+          if (isRuntimeAccountUsageFolderProvider(provider)) {
+            void this.refreshRuntimeAccountUsageFoldersAfterLimitReset(machineId, provider).catch(() => {});
+          }
         }
         const { snapshot: _snapshot, ...withoutSnapshot } = msg;
         void this.getMachineResponseRelay().forward(machineId, authorized ? msg : withoutSnapshot,
@@ -10128,7 +10886,13 @@ export class AgentOrchestrator extends EventEmitter {
           addTraceEvent("runtime_auth.status.rejected", { machine_id: machineId });
           break;
         }
-        await runtimeAuthService.recordStatus(machineId, parsed.data);
+        // `upgradable`, `installable` and `updates` are kept apart: an older replica's strict schema would refuse a stored report with them.
+        const { upgradable, installable, updates, ...statusReport } = parsed.data;
+        await runtimeAuthService.recordStatus(machineId, statusReport);
+        if (upgradable) await runtimeAuthService.recordUpgradable(machineId, upgradable);
+        if (installable) await runtimeAuthService.recordInstallable(machineId, installable);
+        // Each report's `updates` replaces the last (a runtime missing from it: no answer yet); one with `upgradable` but no `updates` (a Computer from before the check) clears it.
+        if (updates || upgradable) await runtimeAuthService.recordUpdates(machineId, updates ?? {});
         // Content-free: each viewer re-reads the machine through its own permission check.
         this.io?.to(`server:${conn.serverId}`).emit("machine:runtime_auth:updated", { machineId });
         break;
@@ -10177,6 +10941,10 @@ export class AgentOrchestrator extends EventEmitter {
       }
 
       case "machine:runtime_auth:logout:result":
+      case "machine:runtime:upgrade:result":
+      // Install: the plan (display strings) and the outcome, relayed to the person who asked only.
+      case "machine:runtime:install_plan:result":
+      case "machine:runtime:install:result":
       case "machine:runtime_auth:providers:result":
       case "machine:runtime_auth:connect_provider:result":
       // Which Claude limit resets the account holds: no snapshot, nothing cached; relayed to the person who asked.
@@ -10613,6 +11381,8 @@ export class AgentOrchestrator extends EventEmitter {
               conn.computerVersion = msg.computerVersion ?? null;
               conn.migrationTransport = migrationTransport;
               conn.installerRepairHint = parseComputerInstallerRepairHint(msg.installerRepairHint);
+              // Replaced on every ready: absent clears an earlier refusal.
+              conn.upgradeScope = parseComputerUpgradeScope(msg.upgradeScope);
               void this.dispatchPendingComputerLifecycleOperations().catch(() => {});
               // Only this Computer: a sweep of every Computer on the replica per
               // `ready` multiplied in reconnect waves (prod 10-16 20:54Z, one ECS
@@ -10638,6 +11408,7 @@ export class AgentOrchestrator extends EventEmitter {
                   hostname: msg.hostname ?? null,
                   os: msg.os ?? null,
                   installerRepairHint: installerRepairHintMeta(parseComputerInstallerRepairHint(msg.installerRepairHint)),
+                  upgradeScope: upgradeScopeMeta(parseComputerUpgradeScope(msg.upgradeScope)),
                   ...machineMetaFromMigrationTransport(migrationTransport),
                   ...(conn ? this.probeCarrierMetaFields(conn, runtimeVersions) : {}),
                 })
@@ -10757,6 +11528,7 @@ export class AgentOrchestrator extends EventEmitter {
             }
             if (conn) this.startRuntimeAccountUsageSchedule(machineId, conn);
             if (conn) void this.requestHostIdentity(machineId, conn.serverId);
+            if (conn) void this.sendComputerChecksConfig(machineId, conn);
 
             // Reconcile all agents assigned to this machine:
             // - running now => mark active
@@ -10895,7 +11667,7 @@ export class AgentOrchestrator extends EventEmitter {
             this.startThirdPartyEventReconnectPass(machineId, readyManagedAgentIds, conn);
             // F9: wake the agents whose wake the restart lost. Not awaited.
             this.startReadyOwedWakePass(machineId, readyOwedWakeCandidates, conn);
-            if (heldRunnerCredentialIds && conn) this.startRunnerCredentialReconcile(machineId, conn.serverId, heldRunnerCredentialIds, readyCapturedAtMs);
+            if (heldRunnerCredentialIds && conn) this.startRunnerCredentialReconcile(conn, heldRunnerCredentialIds, readyCapturedAtMs);
             span.end("ok", {
               attrs: {
                 outcome: "processed",
@@ -10967,6 +11739,9 @@ export class AgentOrchestrator extends EventEmitter {
               finish("dropped", { reason: sequenced.kind });
               return;
             }
+            // Before the lifecycle guard, which may drop the stopped launch's
+            // frames in the reset window: this one says that launch is gone.
+            if (msg.status === "inactive") this.observeResetStopExit(machineId, conn?.connectionEpochId ?? null, msg.agentId, msg.launchId ?? null);
             if (!this.shouldAcceptLifecycleEvent(machineId, agent, msg.type, msg.launchId, span)) {
               this.recordEvent("agent.status.lifecycle_guard.checked", {
                 outcome: "rejected",
@@ -11538,15 +12313,25 @@ export class AgentOrchestrator extends EventEmitter {
             }
             // task #1123: same discipline for the typed spawn-failure reason on a
             // failed-start frame. Observation only — the reason picks web copy.
+            let startFailureRuntimeError: { reason: SpawnFailureActivityDiagnostic["reason"]; detail: string } | null = null;
             const legacyUnkindedStartFailure = isLegacyUnkindedStartFailure({
               detailKind: msg.detailKind,
               activity: declaredActivity,
               detail: msg.detail,
             });
             if (detailKind === "runtime_unavailable" || legacyUnkindedStartFailure) {
-              const normalizedSpawnFailure = normalizeSpawnFailureActivityDiagnostic(
+              const normalizedSpawnFailureWithMessage = normalizeSpawnFailureActivityDiagnostic(
                 (msg as { spawnFailure?: SpawnFailureActivityDiagnostic | Record<string, unknown> | null }).spawnFailure ?? null,
               );
+              // The start's own error text is for the agent's managers only:
+              // kept apart here, stored as its runtime error below, never in
+              // the carrier (which every viewer of the activity receives).
+              const startFailureMessage = normalizedSpawnFailureWithMessage?.message;
+              let normalizedSpawnFailure: SpawnFailureActivityDiagnostic | null = null;
+              if (normalizedSpawnFailureWithMessage) {
+                const { message: _message, ...carrier } = normalizedSpawnFailureWithMessage;
+                normalizedSpawnFailure = carrier;
+              }
               // A daemon older than the carrier still reported a failed start
               // (one of its fixed messages): count it too, or nothing ever
               // stops its automatic wakes.
@@ -11574,8 +12359,19 @@ export class AgentOrchestrator extends EventEmitter {
                   })
                   : null,
               );
+              // Only a typed carrier (not a legacy fixed message) records the
+              // start failure as the agent's runtime error.
+              if (detailKind === "runtime_unavailable" && normalizedSpawnFailure) {
+                startFailureRuntimeError = {
+                  reason: normalizedSpawnFailure.reason,
+                  detail: startFailureMessage ?? (typeof msg.detail === "string" ? msg.detail : ""),
+                };
+              }
             }
+            // A stored failed start is not the shown activity (its snapshot
+            // is), so there is no error activity to keep in front.
             const shouldPreserveVisibleRuntimeError = currentRuntimeError
+              && !currentRuntimeError.spawnFailureReason
               && runtimeErrorAction === "preserve"
               && (activity === "online" || activity === "working" || activity === "thinking");
             if (shouldPreserveVisibleRuntimeError) {
@@ -11594,6 +12390,9 @@ export class AgentOrchestrator extends EventEmitter {
               if (msg.probeId) {
                 this.handleActivityProbeResponse(msg.probeId);
                 this.recordEvent("activity.probe.response_consumed", { probe_id_present: true });
+              }
+              if (activity === "online") {
+                this.maybeTriggerPendingLegacyConfigRestart(msg.agentId);
               }
               span.end("ok", {
                 attrs: {
@@ -11651,6 +12450,13 @@ export class AgentOrchestrator extends EventEmitter {
               this.pendingToolStuck.delete(msg.agentId);
               this.pendingCredentialHold.delete(msg.agentId);
             });
+            if (startFailureRuntimeError) {
+              await this.rememberStartFailureRuntimeError(msg.agentId, this.buildRuntimeErrorState({
+                detail: startFailureRuntimeError.detail,
+                launchId: msg.launchId,
+                spawnFailureReason: startFailureRuntimeError.reason,
+              }));
+            }
             if (runtimeErrorAction === "set") {
               const persisted = await this.rememberRuntimeError(msg.agentId, this.buildRuntimeErrorState({
                 detail: msg.detail,
@@ -12284,7 +13090,12 @@ export class AgentOrchestrator extends EventEmitter {
             // A runtime of the agent runs again: its queued app events go out
             // (the ones an abnormal end dropped, thirdPartyAgentEventRedelivery).
             this.startThirdPartyEventNextStartPass(machineId, msg.agentId, conn);
-            return { outcome: progress.changed ? "streak_cleared" : "unchanged", unpaused: progress.unpaused };
+            const runtimeError = await this.clearStaleRuntimeErrorOnRuntimeReady(agent, msg.launchId);
+            return {
+              outcome: progress.changed ? "streak_cleared" : "unchanged",
+              unpaused: progress.unpaused,
+              runtime_error: runtimeError,
+            };
           },
           (attrs) => ({ attrs }),
         );
@@ -12414,9 +13225,14 @@ export class AgentOrchestrator extends EventEmitter {
         break;
       }
 
+      case "agent:process_exited":
+        // RFC 071: sent on the process's confirmed exit, even after a later
+        // start (which suppresses the stop's `inactive` status).
+        this.observeResetStopExit(machineId, conn?.connectionEpochId ?? null, msg.agentId, msg.launchId);
+        await this.handleRuntimeOutcomeOutboxMessage(machineId, conn, msg);
+        break;
       case "agent:runtime:outcome":
       case "agent:process_spawned":
-      case "agent:process_exited":
       case "agent:start:outcome":
       case "agent:runtime:outcome_gap":
       case "agent:runtime:outcome_cross_instance_unknown": {
@@ -12856,7 +13672,8 @@ export class AgentOrchestrator extends EventEmitter {
         const serverId = conn?.serverId ?? null;
         if (!serverId || typeof msg.requestId !== "string" || !msg.requestId || msg.requestId.length > 128) break;
         try {
-          const features = await this.agentServerFeaturesStrict(serverId);
+          // #proj-runtime:#67: per connection, so a daemon without the capability stays off here too.
+          const features = this.gateMachineServerFeatures(await this.agentServerFeaturesStrict(serverId), machineId, serverId, "server_features");
           const sendResult = await this.trySendAppTransport(machineId, {
             type: "server:features",
             requestId: msg.requestId,
@@ -12882,6 +13699,8 @@ export class AgentOrchestrator extends EventEmitter {
       case "agent:interrupt-turn:result":
       // #proj-runtime:#41: the daemon's answer to a stop-this-sub-agent request.
       case "agent:interrupt-subagent:result":
+      // docs/contracts/proc-jobs.md: the daemon's answer to a person's Stop of one job.
+      case "machine:proc_job:stop:result":
       // #wg-runtime-form:#22: the daemon's answer to a voice status or side question.
       case "agent:side-ask:result":
         this.emit(`machine:response:${machineId}`, msg);
@@ -12895,7 +13714,6 @@ export class AgentOrchestrator extends EventEmitter {
       case "machine:workspace:delete_result":
       case "machine:migration:source_workspace_archive_result":
       case "machine:runtime_models:result":
-      case "machine:provider_probe:result":
       case "agent:diagnostic:session_transcript_result":
       case "agent:diagnostic:feedback_transcript_result":
         if (msg.type === "agent:diagnostic:feedback_transcript_result") this.observeLateFeedbackTranscriptResult(machineId, msg);
@@ -12904,7 +13722,6 @@ export class AgentOrchestrator extends EventEmitter {
         if (
           msg.type === "machine:runtime_models:result"
           || msg.type === "machine:migration:source_workspace_archive_result"
-          || msg.type === "machine:provider_probe:result"
         ) {
           void this.getMachineResponseRelay().forward(machineId, msg,
             (event, attrs) => this.recordMachineResponseRelay(event, attrs));
@@ -13651,12 +14468,14 @@ export class AgentOrchestrator extends EventEmitter {
           if (!conn) return false;
           conn.ws.send(JSON.stringify(msg));
           this.noteRepeatedWakeFrameSent(msg);
+          this.noteMachineFrameSentForMetrics(msg);
           return true;
         },
-        // A provider connect's API key crosses Redis sealed (runtimeAuthReplicaSeal.ts).
+        // Credential-bearing frames cross Redis sealed (runtimeAuthReplicaSeal.ts).
+        // Sync mode read only: never await DB on the cross-replica frame path so frames stay in order.
         reroute: () => this.routeMachineCommandCrossReplica(
           machineId,
-          sealForReplicaHop(machineId, msg),
+          sealForReplicaHop(machineId, msg, undefined, getReplicaAgentConfigSealModeSync()),
           this.getRoutableLocalMachineIds(),
         ),
         onRouteResult: options.onRouteResult,
@@ -13685,8 +14504,8 @@ export class AgentOrchestrator extends EventEmitter {
         const routeResult = await this.routeMachineCommand(context);
         context.onRouteResult?.(routeResult);
         if (routeResult.routed) return true;
-      } catch (err: any) {
-        console.error(`[ReplicaRouter] Failed to route to machine ${context.machineId}:`, err.message);
+      } catch (err: unknown) {
+        console.error(`[ReplicaRouter] Failed to route to machine ${context.machineId}:`, serializeErrorForLog(err));
       }
     }
 
@@ -13818,6 +14637,13 @@ export class AgentOrchestrator extends EventEmitter {
     const terminalTraceAttrs = this.startDispatchTraceAttrs(pending);
     this.pendingAgentStartAcks.delete(startDispatchId);
     this.rememberTerminalStartDispatch(startDispatchId, reason);
+    if (pending.firstSentAt !== undefined) {
+      const firstSentAt = pending.firstSentAt;
+      observeMetricSafely(() => agentWakeStartSeconds.observe(
+        { outcome: reason, human_start: String(pending.msg.humanStart === true) },
+        Math.max(0, this.clock.now() - firstSentAt) / 1000,
+      ));
+    }
     this.recordEvent("server.agent.start_dispatch.terminal", {
       ...terminalTraceAttrs,
       outcome,
@@ -13909,7 +14735,10 @@ export class AgentOrchestrator extends EventEmitter {
   }
 
   protected applyAgentModelSeen(input: Parameters<typeof applyAgentModelSeenToReadPosition>[0]) {
-    return applyAgentModelSeenToReadPosition(input);
+    // What the settle window keeps back is looked at once more (see applyAgentModelSeenWithReplay).
+    return applyAgentModelSeenWithReplay(input, {
+      record: (event) => this.recordEvent("server.agent.model_seen.replay", { ...event }),
+    });
   }
 
   /** Whether this replica sent `agentId` a start, on any machine, that is not acknowledged yet. */
@@ -14217,7 +15046,7 @@ export class AgentOrchestrator extends EventEmitter {
   private trackPendingAgentDeliveryAck(
     machineId: string,
     msg: Extract<ServerToMachineMessage, { type: "agent:deliver" }>,
-    options: { scheduleTimeout?: boolean } = {},
+    options: { scheduleTimeout?: boolean; enqueuedAt?: number } = {},
   ): void {
     const scheduleTimeout = options.scheduleTimeout ?? true;
     const key = this.agentDeliveryAckKey(msg);
@@ -14244,6 +15073,7 @@ export class AgentOrchestrator extends EventEmitter {
       parked: false,
       firstAttemptAt: now,
       lastAttemptAt: now,
+      enqueuedAt: Math.min(options.enqueuedAt ?? now, now),
       ackWaitStartedAt: now,
       ackWaits: 0,
       onlineAtFirstAttempt: this.hasMachineLocally(machineId),
@@ -14301,10 +15131,42 @@ export class AgentOrchestrator extends EventEmitter {
           agentDeliverySloLabels(pending),
           (this.clock.now() - pending.firstAttemptAt) / 1000,
         );
+        this.observeAgentDeliveryE2e(pending);
       }
       this.recordAgentDeliveryOutcome(pending, outcome);
     }
     return this.pendingAgentDeliveryAcks.delete(key);
+  }
+
+  /** slock_agent_delivery_e2e_seconds: message createdAt (AgentMessage.timestamp) to arrival at the daemon. */
+  private observeAgentDeliveryE2e(pending: PendingAgentDeliveryAck): void {
+    observeMetricSafely(() => {
+      const seconds = secondsSince(pending.msg.message?.timestamp, this.clock.now());
+      if (seconds !== null) agentDeliveryE2eSeconds.observe(agentDeliverySegmentLabels(pending), seconds);
+    });
+  }
+
+  /**
+   * Called after a frame is written to a local daemon socket. The first
+   * agent:deliver write of a tracked record ends its queue segment and is the
+   * `agent` push-lag point; the first agent:start write of a tracked dispatch
+   * starts slock_agent_wake_start_seconds. Metrics only: never throws.
+   */
+  private noteMachineFrameSentForMetrics(msg: ServerToMachineMessage): void {
+    observeMetricSafely(() => {
+      if (msg.type === "agent:deliver") {
+        // The key trackPendingAgentDeliveryAck stored the record under: an exact lookup on the send path.
+        const pending = this.pendingAgentDeliveryAcks.get(this.agentDeliveryAckKey(msg));
+        if (!pending || pending.firstSentAt !== undefined) return;
+        const now = this.clock.now();
+        pending.firstSentAt = now;
+        agentDeliveryQueueSeconds.observe(agentDeliverySegmentLabels(pending), Math.max(0, now - pending.enqueuedAt) / 1000);
+        observeMessagePushLag("agent", msg.message?.timestamp, now);
+      } else if (msg.type === "agent:start" && msg.startDispatchId) {
+        const pending = this.pendingAgentStartAcks.get(msg.startDispatchId);
+        if (pending && pending.firstSentAt === undefined) pending.firstSentAt = this.clock.now();
+      }
+    });
   }
 
   private recordAgentDeliveryOutcome(pending: PendingAgentDeliveryAck, outcome: AgentDeliveryOutcome): void {
@@ -14427,12 +15289,14 @@ export class AgentOrchestrator extends EventEmitter {
         });
         if (recovery.status !== "claimed") continue;
       }
-      await this.enqueueToLocalInboxIfStillActive(agentId, identity.machineId, row.deliveryPayload);
+      // A stored payload is sent again without deliverMessage: decide its tag now (a copy; a stored tag is not trusted).
+      const [payload] = await this.stampFocusForAgent(agentId, this.agentStateCache.get(agentId)?.serverId, identity.machineId, [row.deliveryPayload]) as [AgentMessage];
+      await this.enqueueToLocalInboxIfStillActive(agentId, identity.machineId, payload);
       await this.sendAgentDeliveryWithAckRetry(identity.machineId, {
         type: "agent:deliver",
         agentId,
-        message: row.deliveryPayload,
-        seq: row.deliveryPayload.seq ?? 0,
+        message: payload,
+        seq: payload.seq ?? 0,
         deliveryId: row.occurrenceId,
         mentionDelivery: identity,
       }, `durable mention recovery failed for agent ${agentId}`);
@@ -14536,6 +15400,7 @@ export class AgentOrchestrator extends EventEmitter {
     const now = this.clock.now();
     pending.arrivedAt = now;
     agentDeliveryAckSeconds.observe(agentDeliverySloLabels(pending), (now - pending.firstAttemptAt) / 1000);
+    this.observeAgentDeliveryE2e(pending);
     if (pending.timer) this.clock.clearTimeout(pending.timer);
     pending.parked = false;
     pending.parkedReason = undefined;
@@ -14927,6 +15792,8 @@ export class AgentOrchestrator extends EventEmitter {
   ): Promise<void> {
     if (!payload) return;
     console.warn("[MentionDelivery] terminal error; redelivering untracked", { agentId, code, seq: payload.seq ?? 0 });
+    // A stored payload is sent again without deliverMessage: decide its tag now (a stored tag is not trusted).
+    [payload] = await this.stampFocusForAgent(agentId, this.agentStateCache.get(agentId)?.serverId, machineId, [payload]) as [AgentMessage];
     await this.sendAgentDeliveryWithAckRetry(machineId, {
       type: "agent:deliver",
       agentId,
@@ -14941,6 +15808,8 @@ export class AgentOrchestrator extends EventEmitter {
     msg: Extract<ServerToMachineMessage, { type: "agent:deliver" }>,
     errorContext: string,
   ): Promise<boolean> {
+    // Start of slock_agent_delivery_queue_seconds for the record tracked below.
+    const enqueuedAt = this.clock.now();
     // An app event's content as the pull paths hand it over: an external app's
     // inert, Raft's own system apps' as a message (agentFacingContent.ts). Done
     // before tracking, so a retry or a delivery-rejected wake reuses it.
@@ -14960,7 +15829,7 @@ export class AgentOrchestrator extends EventEmitter {
     // Below the Computer version floor: hold the delivery, unsent, until the
     // machine reconnects on a supported version (the park probe re-checks).
     if (await this.isMachineAgentWorkHeld(machineId).catch(() => false)) {
-      this.trackPendingAgentDeliveryAck(machineId, msg);
+      this.trackPendingAgentDeliveryAck(machineId, msg, { enqueuedAt });
       const key = this.findAgentDeliveryAckKey(msg.agentId, msg.seq, msg.deliveryId);
       const pending = key ? this.pendingAgentDeliveryAcks.get(key) : undefined;
       if (key && pending) this.parkPendingAgentDeliveryAck(key, pending, "computer_version_held");
@@ -14968,17 +15837,17 @@ export class AgentOrchestrator extends EventEmitter {
     }
     const localAtSend = this.hasMachineLocally(machineId);
     if (localAtSend) {
-      this.trackPendingAgentDeliveryAck(machineId, msg);
+      this.trackPendingAgentDeliveryAck(machineId, msg, { enqueuedAt });
     }
     try {
       const sent = await this.sendToMachine(machineId, msg);
       if (!sent && !this.findAgentDeliveryAckKey(msg.agentId, msg.seq, msg.deliveryId)) {
-        this.trackPendingAgentDeliveryAck(machineId, msg);
+        this.trackPendingAgentDeliveryAck(machineId, msg, { enqueuedAt });
       }
       return sent;
     } catch (err) {
       if (!this.findAgentDeliveryAckKey(msg.agentId, msg.seq, msg.deliveryId)) {
-        this.trackPendingAgentDeliveryAck(machineId, msg);
+        this.trackPendingAgentDeliveryAck(machineId, msg, { enqueuedAt });
       }
       console.warn(`[Machine ${machineId}] ${errorContext}:`, err);
       return false;
@@ -15035,6 +15904,7 @@ export class AgentOrchestrator extends EventEmitter {
     if (!conn || conn.ws.readyState !== 1) return false;
     conn.ws.send(JSON.stringify(msg));
     this.noteRepeatedWakeFrameSent(msg);
+    this.noteMachineFrameSentForMetrics(msg);
     return true;
   }
 
@@ -15145,11 +16015,20 @@ export class AgentOrchestrator extends EventEmitter {
       machineId,
       localMachineIds,
       () => {
-        // A provider connect arrives sealed; only the socket's own replica opens it.
-        const opened = openAfterReplicaHop(machineId, msg);
+        // Credential-bearing frames arrive sealed; only the socket's own replica opens them.
+        // Sync mode read only: never await DB on the cross-replica receive path so frames stay in order.
+        const opened = openAfterReplicaHop(machineId, msg, undefined, getReplicaAgentConfigSealModeSync());
         if (opened.ok) return this.handleLocalRoutedMachineCommand(machineId, opened.message);
-        this.refuseSealedConnect(machineId, opened.reason, opened.requestId);
-        return true;
+        if (msg.type === "machine:runtime_auth:connect_provider") {
+          this.refuseSealedConnect(machineId, opened.reason, opened.requestId);
+          return true;
+        }
+        this.recordEvent("server.machine.command.replica_seal_refused", {
+          machine_id: machineId,
+          msg_type: msg.type,
+          reason: opened.reason,
+        });
+        return false;
       },
       async () => normalizeMachineCommandRouteResult(
         await this.routeMachineCommandCrossReplica(machineId, msg, localMachineIds),
@@ -15874,11 +16753,54 @@ export class AgentOrchestrator extends EventEmitter {
    * them: a boolean present only when on. Lenient: an evaluation group that
    * fails reads as off (each per-server flag, the Reminder app's install
    * check, the first-party apps), and the other groups still count. The same
-   * evaluation as agentServerFeaturesStrict, so the two never drift.
+   * evaluation as agentServerFeaturesStrict, so the two never drift. Then
+   * gated on the machine's connection (gateMachineServerFeatures), as the
+   * `server:features` answer to that connection is.
    */
-  protected async agentServerFeatures(serverId: string | null): Promise<AgentServerFeatures> {
+  protected async agentServerFeatures(serverId: string | null, machineId: string | null | undefined): Promise<AgentServerFeatures> {
     if (!serverId) return { enabledApps: [] };
-    return this.evaluateAgentServerFeatures(serverId, "off");
+    return this.gateMachineServerFeatures(await this.evaluateAgentServerFeatures(serverId, "off"), machineId, serverId, "agent_config");
+  }
+
+  /**
+   * #proj-runtime:#67: the server features a flag alone does not decide.
+   * `turnEndCompaction` stays on only for a connection that advertised
+   * DAEMON_CAPABILITY_TURN_END_COMPACTION_V2: Computers from 1.0.69 obey the
+   * flag, but only that daemon resets its context facts after a compaction
+   * boundary and waits for a held or deferred inbox drain. Every other daemon
+   * (no connection here, an older Computer, a reconnect before its `ready`)
+   * stays off whatever `turn_end_compaction` says, in `agent:start`,
+   * `agent:config` and `server:features` alike. Traced only while the flag is
+   * on (`turn_end_compaction_gate`).
+   *
+   * `agentFocus` likewise stays on only for a connection that advertised
+   * DAEMON_CAPABILITY_AGENT_FOCUS_V1, so `agent_focus_v0` changes nothing on
+   * any other daemon.
+   */
+  private gateMachineServerFeatures(
+    features: AgentServerFeatures,
+    machineId: string | null | undefined,
+    serverId: string,
+    path: "agent_config" | "server_features",
+  ): AgentServerFeatures {
+    if (features.agentFocus === true && !this.hasMachineCapability(machineId, DAEMON_CAPABILITY_AGENT_FOCUS_V1)) {
+      const { agentFocus: _withheld, ...rest } = features;
+      features = rest;
+    }
+    if (features.turnEndCompaction !== true) return features;
+    const capable = this.hasMachineCapability(machineId, DAEMON_CAPABILITY_TURN_END_COMPACTION_V2);
+    this.tracer.emitEvent("server.agent.turn_end_compaction_gate", {
+      surface: "server",
+      attrs: {
+        machine_id: machineId ?? null,
+        server_id: serverId,
+        path,
+        turn_end_compaction_gate: capable ? "capability_present" : "capability_missing",
+      },
+    });
+    if (capable) return features;
+    const { turnEndCompaction: _withheld, ...rest } = features;
+    return rest;
   }
 
   /**
@@ -15919,14 +16841,24 @@ export class AgentOrchestrator extends EventEmitter {
       WAKE_RECYCLE_TIER_GATE_FEATURE_FLAG_KEY,
       // Native compaction at a turn end past a size threshold (#proj-runtime:#54 phase 3).
       TURN_END_COMPACTION_FEATURE_FLAG_KEY,
+      // Ending a turn silent for 60 minutes with nothing waiting (task #triage:#496).
+      SILENT_TURN_END_FEATURE_FLAG_KEY,
       // Warm wake recycle: a large session is stopped at a clean turn end and starts fresh (#proj-runtime:#54, RFC 070 §6.5).
       WAKE_RECYCLE_WARM_FEATURE_FLAG_KEY,
       // Task v2: the prompt teaches task conversations (`raft task reply`, refs).
       TASK_V2_CONVERSATIONS_FEATURE_FLAG_KEY,
+      // DM reply placement: the task-conversations prompt adds the DM rule (#triage:#540).
+      DM_REPLY_PLACEMENT_FEATURE_FLAG_KEY,
       // View Context: the daemon keeps its send index and answers view requests.
       AGENT_CONTEXT_VIEW_FEATURE_FLAG_KEY,
       // RFC 081: the wake-up and the prompt teach `raft inbox read` only where the server answers it.
       AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY,
+      // The daemon's answer_continuation tool (#wg-ax:#5); the daemon also checks the runtime (CONTINUATIONS_PILOT_RUNTIMES).
+      CONTINUATION_TOOL_FEATURE_FLAG_KEY,
+      // Focus: focused deliveries arrive tagged (agentFocusDelivery.ts); sent only to a daemon with the capability.
+      AGENT_FOCUS_FEATURE_FLAG_KEY,
+      // The wake-up notice asks the Server for its unread rows (#wg-ax:#42); the daemon also needs inbox items on.
+      INBOX_NOTICE_SERVER_ROWS_FEATURE_FLAG_KEY,
     ] as const;
     const readFlags = async (batch: readonly (typeof keys)[number][]) => {
       const answers = await evaluateFeatureFlags(batch.map((key) => ({ key, serverId })));
@@ -15966,9 +16898,14 @@ export class AgentOrchestrator extends EventEmitter {
     if (on.has(WAKE_RECYCLE_OAR_FEATURE_FLAG_KEY)) features.wakeRecycleOar = true;
     if (on.has(WAKE_RECYCLE_TIER_GATE_FEATURE_FLAG_KEY)) features.wakeRecycleTierGate = true;
     if (on.has(TURN_END_COMPACTION_FEATURE_FLAG_KEY)) features.turnEndCompaction = true;
+    if (on.has(SILENT_TURN_END_FEATURE_FLAG_KEY)) features.silentTurnEnd = true;
     if (on.has(WAKE_RECYCLE_WARM_FEATURE_FLAG_KEY)) features.wakeRecycleWarm = true;
     if (on.has(TASK_V2_CONVERSATIONS_FEATURE_FLAG_KEY)) features.taskConversations = true;
+    if (on.has(DM_REPLY_PLACEMENT_FEATURE_FLAG_KEY)) features.dmReplyPlacement = true;
     if (on.has(AGENT_CONTEXT_VIEW_FEATURE_FLAG_KEY)) features.agentContextView = true;
+    if (on.has(CONTINUATION_TOOL_FEATURE_FLAG_KEY)) features.continuationTool = true;
+    if (on.has(AGENT_FOCUS_FEATURE_FLAG_KEY)) features.agentFocus = true;
+    if (on.has(INBOX_NOTICE_SERVER_ROWS_FEATURE_FLAG_KEY)) features.inboxNoticeServerRows = true;
     // RFC 081: the flag and a launch time (RAFT_INBOX_ITEMS_LAUNCH_AT), the same switch the inbox routes answer by.
     // The launch time rides beside it (only then), so the daemon can tell reminders fired after launch (D9, D16).
     const inboxItemsLaunchAt = inboxItemsOnWith(on.has(AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY)) ? inboxItemsLaunch()?.at.toISOString() : undefined;
@@ -16007,18 +16944,25 @@ export class AgentOrchestrator extends EventEmitter {
     // No legacy driver to choose instead: its flag admitted it at create/switch.
     if (isOarOnlyRuntime(runtime)) return true;
     if (agentRuntimeOarDisabled()) return false;
-    // Codex: no flag (retired, #raft-architecture:#32). Earlier Computers
-    // advertise the OAR host with an unfinished Codex launch, so the
-    // capability alone decides.
+    // Codex, Antigravity & OpenCode: code-side flags retired
+    // (#raft-architecture:#32, #oar-raft:#46). Earlier Computers advertise
+    // `runtime-host:oar` with an unfinished Codex launch (so Codex checks
+    // `runtime-host:oar:codex`), without Antigravity OAR (which hands the start
+    // back itself), or without OpenCode OAR / on Windows (so OpenCode checks
+    // `runtime-host:oar:opencode` and older CLIs hand back to legacy driver).
     if (runtime === "codex") return hasCapability(DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX);
+    if (runtime === "antigravity") return true;
+    if (runtime === "opencode") return hasCapability(DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE);
     const key = agentRuntimeOarFeatureFlagKey(runtime);
     if (!key) return false;
     // Earlier Computers carry a Grok launch without the fixes it needs by default (#oar-raft:#4).
     if (runtime === "grok" && !hasCapability(DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK)) return false;
     // #oar-raft:#10: only a Computer that can load the Cursor SDK (Linux, non-SEA) runs Cursor on OAR.
     if (runtime === "cursor" && !hasCapability(DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR)) return false;
-    // Earlier Computers have no OpenCode launch on their OAR host.
-    if (runtime === "opencode" && !hasCapability(DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE)) return false;
+    // #oar-raft:#48: only a Computer with Pi's OAR subprocess RPC support runs Pi on OAR.
+    if (runtime === "pi" && !hasCapability(DAEMON_CAPABILITY_RUNTIME_HOST_OAR_PI)) return false;
+    // #oar-raft:#48: only a Computer with Claude OAR support runs Claude on OAR.
+    if (runtime === "claude" && !hasCapability(DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CLAUDE)) return false;
     return this.startConfigFlagEnabled(key, serverId);
   }
 
@@ -16186,8 +17130,18 @@ export class AgentOrchestrator extends EventEmitter {
       case "reset":
         await this.resetAgentHere(request.agentId, intent.mode, intent.options);
         return { outcome: "done" };
-      case "config":
-        return { outcome: "config", pushed: await this.applyAgentConfigHere(request.agentId) === "pushed" };
+      case "config": {
+        const outcome = await this.applyAgentConfigHere(request.agentId, {
+          ...(intent.fallbackRestartMode ? { fallbackRestartMode: intent.fallbackRestartMode } : {}),
+          ...(intent.terminalControl ? { terminalControl: intent.terminalControl } : {}),
+        });
+        if (outcome === "pushed") return { outcome: "config", pushed: true, busy: false };
+        if (outcome === "pushed_busy") return { outcome: "config", pushed: true, busy: true };
+        if (outcome === "pushed_restarted") return { outcome: "config", pushed: true, restarted: true };
+        if (outcome === "fallback_restarted") return { outcome: "config", pushed: false, fallback: "restarted" };
+        if (outcome === "fallback_when_idle") return { outcome: "config", pushed: false, fallback: "when_idle" };
+        return { outcome: "config", pushed: false };
+      }
     }
   }
 
@@ -16236,7 +17190,8 @@ export class AgentOrchestrator extends EventEmitter {
    * no cache write, wake lock or catalog authority (the start takes those).
    */
   protected async buildAgentConfig(agent: PersistedAgentRow): Promise<AgentConfig> {
-    const normalizedRuntimeConfig = hydrateRuntimeConfig(agent);
+    const openedAgent = openAgentRowSecrets(agent);
+    const normalizedRuntimeConfig = hydrateRuntimeConfig(openedAgent);
     const launchRuntimeFields = runtimeConfigToLaunchFields(normalizedRuntimeConfig);
     const machine = agent.machineId ? await this.loadRuntimeContextMachine(asMachineId(agent.machineId)) : null;
     const daemonVersion = agent.machineId ? this.getMachineDaemonVersion(agent.machineId) : null;
@@ -16248,8 +17203,12 @@ export class AgentOrchestrator extends EventEmitter {
       runtime: launchRuntimeFields.runtime,
       // As it launches: a daemon derives launch flags from this with its own
       // bundled rules, so a model that no longer runs fast is sent without fast
-      // mode for daemons that predate that rule.
-      runtimeConfig: runtimeConfigForLaunch(normalizedRuntimeConfig),
+      // mode for daemons that predate that rule; and a named speed tier only to
+      // a daemon that reads it (an older one's strict parse would mark the spec
+      // unreadable and stop drift detection, #wg-runtime-form:#27).
+      runtimeConfig: this.hasMachineCapability(agent.machineId, DAEMON_CAPABILITY_CODEX_SERVICE_TIER_V1)
+        ? runtimeConfigForLaunch(normalizedRuntimeConfig)
+        : runtimeConfigWithoutServiceTier(runtimeConfigForLaunch(normalizedRuntimeConfig)),
       reasoningEffort: launchRuntimeFields.reasoningEffort,
       executionMode: agent.executionMode,
       envVars: launchRuntimeFields.envVars,
@@ -16277,8 +17236,9 @@ export class AgentOrchestrator extends EventEmitter {
     if (runtimeProfileControl) {
       config.runtimeProfileControl = runtimeProfileControl;
     }
-    // The Server's flag-derived fields, the same ones `server:features` answers.
-    Object.assign(config, await this.agentServerFeatures(agent.serverId));
+    // The Server's flag-derived fields, the same ones `server:features` answers
+    // this machine's connection (turnEndCompaction only where it advertised the capability).
+    Object.assign(config, await this.agentServerFeatures(agent.serverId, agent.machineId));
     // RFC 060: run this launch on the daemon's OAR host (capable daemons only, per-runtime flag).
     if (await this.agentRuntimeOarRequested(agent.machineId, agent.serverId, launchRuntimeFields.runtime)) {
       config.runtimeHost = "oar";
@@ -16327,8 +17287,9 @@ export class AgentOrchestrator extends EventEmitter {
     try {
       Object.assign(config, await agentConfigRevisionInputs(agent.serverId, agent.id));
     } catch (err) {
-      console.warn(`[Agent ${agent.id}] Config revision inputs unavailable; leaving them out:`, err instanceof Error ? err.message : err);
+      console.warn(`[Agent ${agent.id}] Config revision inputs unavailable; leaving them out:`, serializeErrorForLog(err));
     }
+    assertNoEncryptedAgentSecrets(config.runtimeConfig, config.envVars);
     return config;
   }
 
@@ -16495,7 +17456,20 @@ export class AgentOrchestrator extends EventEmitter {
       throw new Error("No machine assigned. Please assign a machine to this agent first.");
     }
 
-    const normalizedRuntimeConfig = hydrateRuntimeConfig(agent);
+    const openedAgent = openAgentRowSecrets(agent);
+    const normalizedRuntimeConfig = hydrateRuntimeConfig(openedAgent);
+    if (isBuiltInRuntimeConfigMissingProvider(normalizedRuntimeConfig)) {
+      this.recordLifecycleEvent({
+        agentId,
+        machineId: agent.machineId,
+        action: "start",
+        outcome: "failed",
+        cause: startCause,
+        previousStatus,
+        detail: "builtin_provider_missing",
+      });
+      throw new BuiltInProviderMissingStartError();
+    }
     const launchRuntimeFields = runtimeConfigToLaunchFields(normalizedRuntimeConfig);
     if (launchRuntimeFields.runtime === "kimi-sdk" && launchRuntimeFields.reasoningEffort !== null) {
       const detected = await this.detectMachineRuntimeModels(agent.machineId, "kimi-sdk");
@@ -16530,16 +17504,9 @@ export class AgentOrchestrator extends EventEmitter {
       ReturnType<AgentOrchestrator["validateBuiltInPresetForMachine"]>
     > = null;
     try {
-      // A typed id through a saved preset connection is checked like a direct one.
-      const connectionProviderId = normalizedRuntimeConfig.runtime === "builtin"
-        && normalizedRuntimeConfig.provider.kind === "connection"
-        && normalizedRuntimeConfig.model.kind === "custom"
-        ? await providerConnectionProviderId(agent.serverId, normalizedRuntimeConfig.provider.connectionId)
-        : null;
       catalogValidation = await this.validateBuiltInPresetForMachine(
         agent.machineId,
         normalizedRuntimeConfig,
-        connectionProviderId,
       );
     } catch (error) {
       if (error instanceof BuiltInModelCatalogError) {
@@ -16601,10 +17568,8 @@ export class AgentOrchestrator extends EventEmitter {
       model: launchRuntimeFields.model,
       runtime: launchRuntimeFields.runtime,
       lastRuntimeError: agent.lastRuntimeError ?? null,
-      runtimeConfig: normalizedRuntimeConfig,
       runtimeState: "starting",
       reasoningEffort: launchRuntimeFields.reasoningEffort,
-      envVars: launchRuntimeFields.envVars,
     };
     this.agentStateCache.set(agentId, state);
 
@@ -16640,9 +17605,12 @@ export class AgentOrchestrator extends EventEmitter {
     // RFC 071 §6: every start while a terminal obligation exists builds the
     // catch-up from the durable chain, even with no session, and folds a wake.
     const catchupReplacesWake = (catchupOwed || terminalObligation !== null) && wakeMessage !== undefined && !wakeMessageTransient;
-    // F9: a `ready` owed wake carries no wake message; the catch-up is what it
-    // owes, so it is built with or without a session.
-    if (agent.sessionId || catchupOwed || terminalObligation !== null || options.startCause === "ready_owed") {
+    // #proj-runtime:#80: every start (including fresh starts after a model
+    // switch, runtime switch, migration, or manual session reset) checks the
+    // durable inbox for unread summary and catch-up messages so fresh sessions
+    // receive the same constructed initial context as resumes. Brand-new agents
+    // have an empty inbox and proceed cleanly with no overhead.
+    {
       const span = this.tracer.startSpan("server.agent.resume_catchup.prepare", {
         surface: "server",
         kind: "internal",
@@ -16770,6 +17738,23 @@ export class AgentOrchestrator extends EventEmitter {
       }
     }
 
+    // A start with nothing to deliver (no wake message, no resume prompt, no
+    // catch-up messages, and the catch-up was read) names the open tasks the
+    // agent holds so it continues them — on both resumed sessions and fresh
+    // sessions (#proj-runtime:#80: model switch, runtime switch, migration,
+    // manual session reset). Brand-new agents hold no open tasks (`null`).
+    let openTasks: AgentStartOpenTasks | null = null;
+    let openTasksTraceAttrs: Record<string, string | number> = {};
+    if (!wakeMessage && !resumePrompt && !catchupUnverified && !(resumeMessages && resumeMessages.length > 0)) {
+      try {
+        openTasks = await listAgentResumeOpenTasks({ id: agentId, serverId: agent.serverId });
+        openTasksTraceAttrs = { open_tasks_count: openTasks ? openTasks.tasks.length + openTasks.more : 0 };
+      } catch (err) {
+        openTasksTraceAttrs = { open_tasks_error: errorClassOf(err) };
+        console.warn(`[Agent ${agentId}] open tasks for the resume start not read: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
     // Only set launch guard if the daemon supports it (>= 0.30.1).
     // Old daemons ignore the launchId field and never echo it back,
     // which causes all their lifecycle events to be silently dropped.
@@ -16877,11 +17862,16 @@ export class AgentOrchestrator extends EventEmitter {
         start_dispatch_id: startDispatchId,
         start_cause: startCause,
         resume_prompt_source: resumePrompt ? "caller" : startResumePrompt ? "catchup_unverified" : "none",
+        ...openTasksTraceAttrs,
       },
     });
     // App events in the wake and resume messages as the pull paths hand them over (agentFacingContent.ts).
     if (wakeMessage) [wakeMessage] = await renderPushedMessages([wakeMessage], agentId, agent.serverId);
     if (resumeMessages) resumeMessages = await renderPushedMessages(resumeMessages, agentId, agent.serverId);
+    // Focus tag, decided now: the catch-up rows come from the database untagged, and a wake message may carry
+    // a tag from before a focus, flag or capability change.
+    if (wakeMessage) [wakeMessage] = await this.stampFocusForAgent(agentId, agent.serverId, agent.machineId, [wakeMessage]);
+    if (resumeMessages) resumeMessages = await this.stampFocusForAgent(agentId, agent.serverId, agent.machineId, resumeMessages);
     const startFields = {
       agentId,
       config,
@@ -16892,6 +17882,7 @@ export class AgentOrchestrator extends EventEmitter {
       ...(resumeMessages ? { resumeMessages } : {}),
       unreadSummary,
       resumePrompt: startResumePrompt,
+      ...(openTasks ? { openTasks } : {}),
       launchId,
       startDispatchId,
       traceparent: formatTraceparent(startDispatchSpan.context),
@@ -17174,6 +18165,7 @@ export class AgentOrchestrator extends EventEmitter {
   ): Promise<AgentStopResult> {
     // Agent typing line: a stopped (or about-to-be-deleted) agent is not typing.
     this.agentTyping.endForAgent(agentId);
+    this.pendingLegacyConfigRestarts.delete(agentId);
     // task #1119: an operator stop is intent, not a crash; forget the streak.
     // It also lifts a block (a person's "try again", e.g. Retry on a rejected
     // credential): reconciler step 4b traces that lift.
@@ -17343,22 +18335,33 @@ export class AgentOrchestrator extends EventEmitter {
   }
 
   /**
-   * Reconciler step 11b: send the agent's current config to the daemon that
-   * runs it, which restarts the agent on it once idle. Runs on the replica
-   * that holds the machine's socket (only the intent's kind crosses replicas).
-   * `not_pushed`: nothing was sent (the daemon lacks
-   * `DAEMON_CAPABILITY_AGENT_CONFIG_PUSH`, the agent is not running there, the
-   * machine is not connected, or the owner replica is an older build), and
-   * the caller applies its own fallback. Never throws: the change it follows
-   * has already committed.
+   * Reconciler step 11b + #proj-runtime:#80: send the agent's current config to
+   * the daemon that runs it, or trigger an idle-safe fallback restart on an
+   * older Computer that lacks `DAEMON_CAPABILITY_AGENT_CONFIG_PUSH`. Runs on
+   * the replica that holds the machine's socket (only the intent's kind and
+   * fallback mode cross Redis). Never throws: the change it follows has already
+   * committed.
    */
-  async applyAgentConfig(agentId: string): Promise<AgentConfigApplyOutcome> {
+  async applyAgentConfig(agentId: string, options: ApplyAgentConfigOptions = {}): Promise<AgentConfigApplyOutcome> {
     try {
       if (this.mayRunOnOwner(agentId)) {
-        const routed = await this.runOnOwner(agentId, { kind: "config" });
-        if (routed) return routed.outcome === "config" && routed.pushed ? "pushed" : "not_pushed";
+        const routed = await this.runOnOwner(agentId, {
+          kind: "config",
+          ...(options.fallbackRestartMode ? { fallbackRestartMode: options.fallbackRestartMode } : {}),
+          ...(options.terminalControl ? { terminalControl: options.terminalControl } : {}),
+        });
+        if (routed && routed.outcome === "config") {
+          if (routed.pushed) {
+            if (routed.restarted === true) return "pushed_restarted";
+            return routed.busy === true ? "pushed_busy" : "pushed";
+          }
+          if (routed.fallback === "restarted") return "fallback_restarted";
+          if (routed.fallback === "when_idle") return "fallback_when_idle";
+          return "not_pushed";
+        }
+        if (routed) return "not_pushed";
       }
-      return await this.applyAgentConfigHere(agentId);
+      return await this.applyAgentConfigHere(agentId, options);
     } catch (error) {
       const unanswered = error instanceof StartIntentRemoteError && error.failure.name === START_INTENT_UNANSWERED;
       this.recordEvent("server.agent.config_push", {
@@ -17371,7 +18374,72 @@ export class AgentOrchestrator extends EventEmitter {
     }
   }
 
-  protected async applyAgentConfigHere(agentId: string): Promise<AgentConfigApplyOutcome> {
+  private async isAgentForegroundBusy(agentId: string): Promise<boolean> {
+    const current = this.agentActivity.get(agentId);
+    if (current) return this.isFreshBusyActivity(current);
+    const shared = this.replicaStateStore.isAvailable()
+      ? await this.replicaStateStore.getAgentActivity(agentId).catch(() => null)
+      : null;
+    if (shared) return this.isFreshBusyActivity(shared);
+    const persisted = await this.loadLatestPersistedActivityHint(agentId);
+    return Boolean(persisted && this.isFreshBusyActivity(persisted));
+  }
+
+  private isFreshTransientOrStartingActivity(snapshot: ActivitySnapshot | PersistedAgentActivityHint): boolean {
+    if (!this.isTransientActivity(snapshot.activity)) return false;
+    return this.getActivityAgeSec(snapshot) <= AgentOrchestrator.ACTIVITY_STALE_SEC;
+  }
+
+  private async isAgentBusyOrStarting(agentId: string): Promise<boolean> {
+    const current = this.agentActivity.get(agentId);
+    if (current) return this.isFreshTransientOrStartingActivity(current);
+    const shared = this.replicaStateStore.isAvailable()
+      ? await this.replicaStateStore.getAgentActivity(agentId).catch(() => null)
+      : null;
+    if (shared) return this.isFreshTransientOrStartingActivity(shared);
+    const persisted = await this.loadLatestPersistedActivityHint(agentId);
+    return Boolean(persisted && this.isFreshTransientOrStartingActivity(persisted));
+  }
+
+  private clearPendingLegacyConfigRestartsForMachine(machineId: string): void {
+    for (const [agentId, pending] of this.pendingLegacyConfigRestarts) {
+      if (pending.machineId === machineId) {
+        this.pendingLegacyConfigRestarts.delete(agentId);
+      }
+    }
+  }
+
+  private maybeTriggerPendingLegacyConfigRestart(agentId: string): void {
+    const pending = this.pendingLegacyConfigRestarts.get(agentId);
+    if (!pending) return;
+    if (!this.machineConnections.has(pending.machineId)) {
+      this.pendingLegacyConfigRestarts.delete(agentId);
+      return;
+    }
+    if (this.resetInProgress.has(agentId)) return;
+    this.pendingLegacyConfigRestarts.delete(agentId);
+    this.recordEvent("server.agent.config_fallback_restart_triggered", {
+      agent_id: agentId,
+      machine_id: pending.machineId,
+      mode: pending.mode,
+      revision: pending.revision,
+      waited_ms: Math.max(0, this.clock.now() - pending.queuedAtMs),
+    });
+    void this.resetAgent(agentId, pending.mode, {
+      restartIfStopped: false,
+      restartEvenIfInactive: false,
+      ...(pending.terminalControl ? { terminalControl: pending.terminalControl } : {}),
+    }).catch((error: unknown) => {
+      this.recordEvent("server.agent.config_fallback_restart_failed", {
+        agent_id: agentId,
+        machine_id: pending.machineId,
+        mode: pending.mode,
+        error_class: errorClassOf(error),
+      });
+    });
+  }
+
+  protected async applyAgentConfigHere(agentId: string, options: ApplyAgentConfigOptions = {}): Promise<AgentConfigApplyOutcome> {
     const notPushed = (reason: string): AgentConfigApplyOutcome => {
       this.recordEvent("server.agent.config_push", { agent_id: agentId, outcome: "not_pushed", reason });
       return "not_pushed";
@@ -17380,25 +18448,96 @@ export class AgentOrchestrator extends EventEmitter {
     const machineId = agent?.machineId;
     if (!agent || !machineId) return notPushed("no_machine");
     if (!this.machineConnections.has(machineId)) return notPushed("machine_not_local");
-    if (!this.hasMachineCapability(machineId, DAEMON_CAPABILITY_AGENT_CONFIG_PUSH)) return notPushed("daemon_without_capability");
     // `active`: the agent runs, or is being started, on that machine (a
     // process exit or a stop persists `inactive`/`stopped`). A config change
     // for an agent that does not run reaches it with its next start.
     if (agent.status !== "active") return notPushed("agent_not_running");
+    if (!this.hasMachineCapability(machineId, DAEMON_CAPABILITY_AGENT_CONFIG_PUSH)) {
+      if (!options.fallbackRestartMode) return notPushed("daemon_without_capability");
+      const busy = await this.isAgentForegroundBusy(agentId);
+      if (busy) {
+        const existing = this.pendingLegacyConfigRestarts.get(agentId);
+        const mode: "restart" | "session" = existing?.mode === "session" || options.fallbackRestartMode === "session"
+          ? "session"
+          : "restart";
+        this.pendingLegacyConfigRestarts.set(agentId, {
+          machineId,
+          mode,
+          revision: agent.configRevision,
+          terminalControl: options.terminalControl ?? existing?.terminalControl,
+          queuedAtMs: existing?.queuedAtMs ?? this.clock.now(),
+        });
+        this.recordEvent("server.agent.config_push", {
+          agent_id: agentId,
+          machine_id: machineId,
+          outcome: "fallback_when_idle",
+          reason: "daemon_without_capability_busy",
+          mode,
+          revision: agent.configRevision,
+        });
+        return "fallback_when_idle";
+      }
+      this.pendingLegacyConfigRestarts.delete(agentId);
+      await this.resetAgent(agentId, options.fallbackRestartMode, {
+        restartIfStopped: false,
+        restartEvenIfInactive: false,
+        ...(options.terminalControl ? { terminalControl: options.terminalControl } : {}),
+      });
+      this.recordEvent("server.agent.config_push", {
+        agent_id: agentId,
+        machine_id: machineId,
+        outcome: "fallback_restarted",
+        reason: "daemon_without_capability",
+        mode: options.fallbackRestartMode,
+        revision: agent.configRevision,
+      });
+      return "fallback_restarted";
+    }
+    const canInterrupt = Boolean(
+      options.fallbackRestartMode
+      && this.hasMachineCapability(machineId, DAEMON_CAPABILITY_AGENT_CONFIG_INTERRUPT),
+    );
+    const busy = canInterrupt
+      ? await this.isAgentBusyOrStarting(agentId)
+      : await this.isAgentForegroundBusy(agentId);
+    const willInterrupt = Boolean(canInterrupt && busy && options.fallbackRestartMode);
     const frame: ServerToMachineMessage = {
       type: "agent:config",
       agentId,
       config: await this.buildAgentConfig(agent),
       revision: agent.configRevision,
+      ...(willInterrupt ? { interrupt: true } : {}),
     };
     if (!this.sendAgentConfigLocally(machineId, frame)) return notPushed("send_failed");
+    this.pendingLegacyConfigRestarts.delete(agentId);
+    if (willInterrupt && options.fallbackRestartMode) {
+      // #proj-runtime:#80: Computer advertises `agent:config-interrupt-v1`.
+      // `agent:config` `{ interrupt: true }` went first (FIFO) so the daemon
+      // records `<interrupted-turn>` before stopping; restart immediately so
+      // interrupted work resumes without waiting for a human poke.
+      await this.resetAgent(agentId, options.fallbackRestartMode, {
+        restartIfStopped: false,
+        restartEvenIfInactive: true,
+        ...(options.terminalControl ? { terminalControl: options.terminalControl } : {}),
+      });
+      this.recordEvent("server.agent.config_push", {
+        agent_id: agentId,
+        machine_id: machineId,
+        outcome: "pushed_restarted",
+        busy: true,
+        mode: options.fallbackRestartMode,
+        revision: agent.configRevision,
+      });
+      return "pushed_restarted";
+    }
     this.recordEvent("server.agent.config_push", {
       agent_id: agentId,
       machine_id: machineId,
-      outcome: "pushed",
+      outcome: busy ? "pushed_busy" : "pushed",
+      busy,
       revision: agent.configRevision,
     });
-    return "pushed";
+    return busy ? "pushed_busy" : "pushed";
   }
 
   /**
@@ -17461,6 +18600,7 @@ export class AgentOrchestrator extends EventEmitter {
       });
       return;
     }
+    this.pendingLegacyConfigRestarts.delete(agentId);
     this.resetInProgress.set(agentId, mode);
     try {
       // Get machine info before stopping (cache may be populated)
@@ -17482,6 +18622,7 @@ export class AgentOrchestrator extends EventEmitter {
         previousStatus,
         machineId: agentBefore?.machineId ?? null,
         ...(options.terminalControl ? { terminalControl: options.terminalControl } : {}),
+        ...(options.revokeRunnerCredentials ? { revokeRunnerCredentials: options.revokeRunnerCredentials } : {}),
       };
       this.recordLifecycleEvent({
         agentId,
@@ -17497,9 +18638,155 @@ export class AgentOrchestrator extends EventEmitter {
     }
   }
 
+  /**
+   * A failure is logged and traced, and the reset goes on: the agent is
+   * restarted rather than left stopped (its old keys stay live, as they were
+   * before the reset), the same as a reset's failed restart, which is recorded
+   * and not thrown. A person can reset again or revoke the key on the agent's
+   * credentials page.
+   */
+  protected async revokeRunnerCredentialsForReset(agentId: string, serverId: string, actorUserId: string, createdBefore: string, stopped: "exit_seen" | "no_process"): Promise<void> {
+    try {
+      const revoked = await revokeAgentRunnerCredentialsForReset({ agentId, serverId, actorUserId, createdBefore });
+      this.recordEvent("server.agent.reset.runner_credentials_revoked", { agent_id: agentId, outcome: "ok", revoked_count: revoked.length, stopped });
+      // After commit: close the revoked keys' open streams on every replica.
+      if (revoked.length > 0) await broadcastAgentCredentialRevocation(agentId);
+    } catch (error) {
+      console.error(`[Agent ${agentId}] reset: revoking its runner credentials failed:`, error);
+      this.recordEvent("server.agent.reset.runner_credentials_revoked", { agent_id: agentId, outcome: "error", error_class: errorClassOf(error) });
+    }
+  }
+
+  /**
+   * Resolves true once the agent's Computer reports the stopped launch
+   * (`launchId`) gone, on the connection the stop went out on: its
+   * `agent:process_exited`, or its `inactive` status. Either names the
+   * launch the process last ran; a start rebound onto a live process gives it
+   * the new launch, so neither names a launch a live process still runs.
+   * False after `resetStopExitTimeoutMs`, on `cancel`, or on shutdown; it
+   * settles once, and its timer and registration go with it. Registered
+   * before the stop is sent.
+   */
+  protected awaitResetStopExit(agentId: string, machineId: string, launchId: string, connectionEpochId: string): { exited: Promise<boolean>; cancel: () => void } {
+    const waiters = this.resetStopExitWaiters.get(agentId) ?? new Set<ResetStopExitWaiter>();
+    this.resetStopExitWaiters.set(agentId, waiters);
+    let resolve: (exited: boolean) => void = () => {};
+    const exited = new Promise<boolean>((r) => { resolve = r; });
+    let timer: unknown = null;
+    let settled = false;
+    const waiter: ResetStopExitWaiter = {
+      machineId,
+      launchId,
+      connectionEpochId,
+      settle: (value) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) this.clock.clearTimeout(timer);
+        waiters.delete(waiter);
+        if (waiters.size === 0 && this.resetStopExitWaiters.get(agentId) === waiters) this.resetStopExitWaiters.delete(agentId);
+        resolve(value);
+      },
+    };
+    waiters.add(waiter);
+    timer = this.scheduleOnClock(() => waiter.settle(false), this.resetStopExitTimeoutMs);
+    return { exited, cancel: () => waiter.settle(false) };
+  }
+
+  private observeResetStopExit(machineId: string, connectionEpochId: string | null, agentId: string, launchId: string | null): void {
+    for (const waiter of [...(this.resetStopExitWaiters.get(agentId) ?? [])]) {
+      if (waiter.machineId !== machineId || waiter.connectionEpochId !== connectionEpochId || waiter.launchId !== launchId) continue;
+      waiter.settle(true);
+    }
+  }
+
+  private trackResetRevoke(work: Promise<void>): void {
+    const tracked = work.catch((error: unknown) => {
+      console.error("[Orchestrator] reset: the revoke after the stopped launch's exit failed:", error);
+    }).finally(() => this.resetRevokesInFlight.delete(tracked));
+    this.resetRevokesInFlight.add(tracked);
+  }
+
+  /** The revokes reset exits set off so far, settled. */
+  protected async resetRevokesSettled(): Promise<void> {
+    while (this.resetRevokesInFlight.size > 0) await Promise.allSettled([...this.resetRevokesInFlight]);
+  }
+
+  private recordResetRevokeSkipped(agentId: string, reason: string, attrs: Record<string, string | number> = {}): void {
+    this.recordEvent("server.agent.reset.runner_credentials_revoked", { agent_id: agentId, outcome: "skipped_stop_unconfirmed", reason, ...attrs });
+  }
+
+  /**
+   * The server's view, before the reset's stop, that its agent has no process
+   * on `machineId` (the start's ack or the daemon's status said so: an
+   * inactive report, a ready without it, a start that never ran). The
+   * daemon sends nothing for a stop of an agent it runs nothing for, so no
+   * exit is waited for then.
+   */
+  private resetSeesNoRunningProcess(agentId: string, machineId: string): boolean {
+    const cached = this.agentStateCache.get(agentId);
+    return cached?.machineId === machineId && cached.runtimeState === "not_running";
+  }
+
   protected async applyResetPlan(context: ResetApplyContext, plan: ResetPlanAction[]) {
+    // A person's reset revokes the agent's old runner keys (created before the
+    // reset began, by the database's clock: the new launch's key is minted
+    // only after the start) once the stopped launch is seen gone: a daemon
+    // has no way to replace a running process's revoked key, and a process
+    // the stop did not reach (the Computer offline; the stop is not queued)
+    // keeps running when it reconnects. The start does not wait for it.
+    let revoke = context.revokeRunnerCredentials && context.serverId
+      ? { serverId: context.serverId, actorUserId: context.revokeRunnerCredentials.actorUserId, createdBefore: "" }
+      : null;
+    if (revoke) {
+      try {
+        revoke.createdBefore = await readDatabaseNow();
+      } catch (error) {
+        console.error(`[Agent ${context.agentId}] reset: reading the database clock failed; revoking no runner credentials:`, error);
+        this.recordEvent("server.agent.reset.runner_credentials_revoked", { agent_id: context.agentId, outcome: "error", error_class: errorClassOf(error) });
+        revoke = null;
+      }
+    }
     if (plan.includes("stop-internal")) {
-      await this.stopAgent(context.agentId, "internal", { withinReset: true });
+      const machineId = context.machineId;
+      // Read before the stop, which itself marks the agent not running.
+      const noProcess = revoke && machineId ? this.resetSeesNoRunningProcess(context.agentId, machineId) : false;
+      const stoppedLaunchId = this.snapshotLaunchGuard(context.agentId).expectedLaunchId;
+      const connectionEpochId = machineId ? this.machineConnections.get(machineId)?.connectionEpochId ?? null : null;
+      const exit = revoke && machineId && !noProcess && stoppedLaunchId && connectionEpochId
+        ? this.awaitResetStopExit(context.agentId, machineId, stoppedLaunchId, connectionEpochId)
+        : null;
+      let delivered: boolean;
+      try {
+        delivered = (await this.stopAgent(context.agentId, "internal", { withinReset: true })).delivered;
+      } catch (error) {
+        exit?.cancel();
+        throw error;
+      }
+      if (revoke && !machineId) {
+        this.recordResetRevokeSkipped(context.agentId, "no_computer");
+      } else if (revoke && !delivered) {
+        exit?.cancel();
+        this.recordResetRevokeSkipped(context.agentId, "computer_offline");
+      } else if (revoke && noProcess) {
+        // Nothing ran there to exit (and the daemon reports nothing for it).
+        await this.revokeRunnerCredentialsForReset(context.agentId, revoke.serverId, revoke.actorUserId, revoke.createdBefore, "no_process");
+      } else if (revoke && !exit) {
+        // No launch to tie an exit report to (or no connection to hear it on).
+        this.recordResetRevokeSkipped(context.agentId, "launch_unknown");
+      } else if (revoke && exit && machineId) {
+        const { agentId } = context;
+        const { serverId, actorUserId, createdBefore } = revoke;
+        this.trackResetRevoke(exit.exited.then(async (seen) => {
+          if (!seen) {
+            this.recordResetRevokeSkipped(agentId, "exit_not_seen", { timeout_ms: this.resetStopExitTimeoutMs });
+          } else if (this.machineConnections.get(machineId)?.connectionEpochId !== connectionEpochId) {
+            // The stop's connection went: it may not have reached the daemon.
+            this.recordResetRevokeSkipped(agentId, "connection_changed");
+          } else {
+            await this.revokeRunnerCredentialsForReset(agentId, serverId, actorUserId, createdBefore, "exit_seen");
+          }
+        }));
+      }
     }
     // RFC 071 §5: an E3 reset lifts the terminal-failure breaker whether or
     // not the plan restarts (session / full drop the failing session). The
@@ -17611,23 +18898,52 @@ export class AgentOrchestrator extends EventEmitter {
     return this.sendToMachine(machineId, { type: "machine:runtimes:rescan" });
   }
 
+  /**
+   * The account folders of the agents on this Computer that set their own
+   * (Codex, Claude; `runtimeAccountUsageAccountHomes`), for a refresh's
+   * `accountHomes`: the Computer reads each beside its default account. None
+   * for another provider, no such agent, or when the agents cannot be read
+   * (the refresh then reads the default account, as before).
+   */
+  protected async runtimeAccountUsageAccountHomesFor(machineId: string, provider: RuntimeAccountUsageProvider): Promise<RuntimeAccountUsageAccountHome[] | undefined> {
+    if (!isRuntimeAccountUsageFolderProvider(provider)) return undefined;
+    try {
+      const machineAgents = (await this.loadAgentsForReadyReconcile(machineId)).map((row) => openAgentRowSecretsIsolated(row));
+      const homes = runtimeAccountUsageAccountHomes(provider, machineAgents);
+      return homes.length > 0 ? homes : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   async requestRuntimeAccountUsageRefresh(
     machineId: string,
     provider: RuntimeAccountUsageProvider,
     reason: "manual" | "stale_or_missing" | "scheduled",
   ): Promise<boolean> {
+    const accountHomes = await this.runtimeAccountUsageAccountHomesFor(machineId, provider);
     return this.sendToMachine(machineId, {
       type: "machine:runtime_account_usage:refresh",
       requestId: crypto.randomUUID(),
       provider,
       reason,
+      ...(accountHomes ? { accountHomes } : {}),
     });
   }
 
   /**
+   * The usage read after a limit reset is the default account's only, and
+   * replaces the cached snapshot: read the agents' own folders again too, so
+   * their agents do not show the default account until the next schedule.
+   */
+  private async refreshRuntimeAccountUsageFoldersAfterLimitReset(machineId: string, provider: RuntimeAccountUsageProvider): Promise<void> {
+    if (!await this.runtimeAccountUsageAccountHomesFor(machineId, provider)) return;
+    await this.requestRuntimeAccountUsageRefresh(machineId, provider, "stale_or_missing");
+  }
+
+  /**
    * Manual runtime-account usage refresh: send the refresh command and wait
-   * for the correlated snapshot through the cross-replica relay (same carrier
-   * shape as requestProviderProbe). Background refreshes
+   * for the correlated snapshot through the cross-replica relay. Background refreshes
    * (scheduled/stale_or_missing) stay fire-and-forget on
    * requestRuntimeAccountUsageRefresh — only the manual route blocks on the
    * machine's reply. The snapshot message itself still flows through the
@@ -17641,6 +18957,7 @@ export class AgentOrchestrator extends EventEmitter {
     provider: RuntimeAccountUsageProvider,
   ): Promise<Extract<MachineToServerMessage, { type: "machine:runtime_account_usage:snapshot" }>> {
     const requestId = crypto.randomUUID();
+    const accountHomes = await this.runtimeAccountUsageAccountHomesFor(machineId, provider);
     const response = await this.getMachineResponseRelay().request({
       requestId, machineId, type: "machine:runtime_account_usage:snapshot",
     }, RUNTIME_ACCOUNT_USAGE_RELAY_BUDGET_MS, () => this.sendRequiredToMachine(machineId, {
@@ -17648,6 +18965,7 @@ export class AgentOrchestrator extends EventEmitter {
       requestId,
       provider,
       reason: "manual",
+      ...(accountHomes ? { accountHomes } : {}),
     }), (event, attrs) => this.recordMachineResponseRelay(event, attrs));
     if (response.type !== "machine:runtime_account_usage:snapshot") throw new Error("Unexpected runtime account usage response");
     return response;
@@ -17687,7 +19005,17 @@ export class AgentOrchestrator extends EventEmitter {
     const result = runtimeAuthLoginResultSchema.safeParse(msg.result);
     const checked = result.success ? result.data : { kind: "failed" as const, reason: "process_failed" as const };
     await runtimeAuthService.endLogin(session);
-    if (checked.kind === "logged_in") await this.liftRuntimeCredentialBlocks(machineId, session.runtime, "login");
+    if (checked.kind === "logged_in") {
+      await this.liftRuntimeCredentialBlocks(machineId, session.runtime, "login");
+      // The usage card still shows what the Computer read signed out: ask for
+      // a fresh read now (it lands through the snapshot push), not at the next
+      // refresh (#oar-raft:#52). Only where this Computer reads that provider's
+      // usage (its data boundary was checked before the relay).
+      const conn = this.machineConnections.get(machineId);
+      if (isRuntimeAccountUsageProvider(session.runtime) && conn && runtimeAccountUsageReadableWith(session.runtime, conn.capabilities)) {
+        void this.requestRuntimeAccountUsageRefresh(machineId, session.runtime, "stale_or_missing").catch(() => undefined);
+      }
+    }
     const push: RuntimeAuthLoginResultPush & { serverId: string } = { serverId: session.serverId, machineId, runtime: session.runtime, loginId, result: checked };
     this.io?.to(room).emit("runtime_auth:login:result", push);
     addTraceEvent("runtime_auth.login.result", {
@@ -17764,6 +19092,84 @@ export class AgentOrchestrator extends EventEmitter {
   }
 
   /**
+   * Upgrade on the web: whether this Computer is online and its daemon runs a
+   * runtime's own updater (DAEMON_CAPABILITY_RUNTIME_UPGRADE).
+   */
+  async runtimeUpgradeAvailability(machineId: string): Promise<"ok" | "computer_offline" | "computer_upgrade_required"> {
+    const fact = await this.readProbeCarrierFact(machineId);
+    if (!fact) return "computer_offline";
+    return fact.capabilities.includes(DAEMON_CAPABILITY_RUNTIME_UPGRADE) ? "ok" : "computer_upgrade_required";
+  }
+
+  /**
+   * Runs the runtime's own updater on the Computer (a person pressed Upgrade)
+   * and returns its answer as sent, unchecked: the caller parses it with
+   * `runtimeUpgradeResultSchema`. The Computer re-detects its runtimes
+   * afterwards on its own.
+   */
+  async upgradeRuntime(machineId: string, runtime: RuntimeAuthRuntime): Promise<RuntimeUpgradeResult> {
+    const requestId = crypto.randomUUID();
+    const response = await this.getMachineResponseRelay().request({
+      requestId, machineId, type: "machine:runtime:upgrade:result",
+    }, RUNTIME_UPGRADE_RELAY_BUDGET_MS, () => this.sendRequiredToMachine(machineId, {
+      type: "machine:runtime:upgrade",
+      requestId,
+      runtime,
+    }), (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+    if (response.type !== "machine:runtime:upgrade:result") throw new Error("Unexpected upgrade response");
+    // As the Computer sent it: the route checks it (runtimeUpgradeResultSchema) before anything of it is used.
+    return response.result;
+  }
+
+  /**
+   * Install on the web: whether this Computer is online and its daemon runs a
+   * runtime's own installer (DAEMON_CAPABILITY_RUNTIME_INSTALL).
+   */
+  async runtimeInstallAvailability(machineId: string): Promise<"ok" | "computer_offline" | "computer_upgrade_required"> {
+    const fact = await this.readProbeCarrierFact(machineId);
+    if (!fact) return "computer_offline";
+    return fact.capabilities.includes(DAEMON_CAPABILITY_RUNTIME_INSTALL) ? "ok" : "computer_upgrade_required";
+  }
+
+  /**
+   * What the runtime's own installer would run on the Computer (a person
+   * pressed Install), read there without running it; returned as sent,
+   * unchecked: the caller parses it with `runtimeInstallPlanSchema`. Only the
+   * runtime goes to the Computer.
+   */
+  async runtimeInstallPlan(machineId: string, runtime: RuntimeAuthRuntime): Promise<RuntimeInstallPlan> {
+    const requestId = crypto.randomUUID();
+    const response = await this.getMachineResponseRelay().request({
+      requestId, machineId, type: "machine:runtime:install_plan:result",
+    }, RUNTIME_INSTALL_PLAN_RELAY_BUDGET_MS, () => this.sendRequiredToMachine(machineId, {
+      type: "machine:runtime:install_plan",
+      requestId,
+      runtime,
+    }), (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+    if (response.type !== "machine:runtime:install_plan:result") throw new Error("Unexpected install plan response");
+    return response.result;
+  }
+
+  /**
+   * Runs the runtime's own installer on the Computer (a person confirmed its
+   * plan) and returns its answer as sent, unchecked: the caller parses it with
+   * `runtimeInstallResultSchema`. Only the runtime goes to the Computer; what
+   * runs is OAR's there. The Computer re-detects its runtimes afterwards on its own.
+   */
+  async installRuntime(machineId: string, runtime: RuntimeAuthRuntime): Promise<RuntimeInstallResult> {
+    const requestId = crypto.randomUUID();
+    const response = await this.getMachineResponseRelay().request({
+      requestId, machineId, type: "machine:runtime:install:result",
+    }, RUNTIME_INSTALL_RELAY_BUDGET_MS, () => this.sendRequiredToMachine(machineId, {
+      type: "machine:runtime:install",
+      requestId,
+      runtime,
+    }), (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+    if (response.type !== "machine:runtime:install:result") throw new Error("Unexpected install response");
+    return response.result;
+  }
+
+  /**
    * Whether this Computer's daemon reads the provider's usage
    * (`runtimeAccountUsageReadableWith`): `unknown` while it is offline (the
    * cache answers then).
@@ -17803,13 +19209,17 @@ export class AgentOrchestrator extends EventEmitter {
    * a reset was spent, so the caller retries with the same key. `kind`: the
    * one Claude reset the person chose (only to a Computer with
    * DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET_CLAUDE_KINDS); Claude Code takes
-   * longer, so it has its own relay budget.
+   * longer, so it has its own relay budget. `onboardingRequiredReason`: the
+   * person's web page reads `unsupported: onboarding_required` (it said so in
+   * its request); only then is the Computer told it may answer it, so an
+   * older bundle's strict parse never meets it.
    */
   async redeemRuntimeLimitReset(
     machineId: string,
     provider: RuntimeAccountUsageProvider,
     idempotencyKey: RuntimeLimitResetIdempotencyKey,
     kind?: RuntimeLimitResetKind,
+    onboardingRequiredReason = false,
   ): Promise<Extract<MachineToServerMessage, { type: "machine:runtime_account_usage:limit_reset:result" }>> {
     const requestId = crypto.randomUUID();
     const response = await this.getMachineResponseRelay().request({
@@ -17820,6 +19230,7 @@ export class AgentOrchestrator extends EventEmitter {
       provider,
       idempotencyKey,
       ...(kind ? { kind } : {}),
+      ...(onboardingRequiredReason ? { onboardingRequiredReason: true as const } : {}),
     }), (event, attrs) => this.recordMachineResponseRelay(event, attrs));
     if (response.type !== "machine:runtime_account_usage:limit_reset:result") throw new Error("Unexpected limit reset response");
     return response;
@@ -17831,12 +19242,14 @@ export class AgentOrchestrator extends EventEmitter {
    * cancels it). Only on a person's click. `atFiveHourLimit` is what the
    * cached usage says (anything but a clear "not at the limit" is `true`);
    * the Computer refuses a read there unless `atFiveHourLimitConsent`.
-   * Rejects with RouteFailureError daemon_offline / daemon_timeout.
+   * `onboardingRequiredReason`: the person's page reads `unsupported:
+   * onboarding_required` (see redeemRuntimeLimitReset). Rejects with
+   * RouteFailureError daemon_offline / daemon_timeout.
    */
   async readRuntimeLimitResets(
     machineId: string,
     provider: RuntimeAccountUsageProvider,
-    input: { atFiveHourLimit: boolean; atFiveHourLimitConsent: boolean; includeFiveHour: boolean },
+    input: { atFiveHourLimit: boolean; atFiveHourLimitConsent: boolean; includeFiveHour: boolean; onboardingRequiredReason?: boolean },
   ): Promise<Extract<MachineToServerMessage, { type: "machine:runtime_account_usage:limit_resets:read:result" }>> {
     const requestId = crypto.randomUUID();
     const response = await this.getMachineResponseRelay().request({
@@ -17848,6 +19261,7 @@ export class AgentOrchestrator extends EventEmitter {
       atFiveHourLimit: input.atFiveHourLimit,
       ...(input.atFiveHourLimitConsent ? { atFiveHourLimitConsent: true } : {}),
       ...(input.includeFiveHour ? { includeFiveHour: true } : {}),
+      ...(input.onboardingRequiredReason ? { onboardingRequiredReason: true as const } : {}),
     }), (event, attrs) => this.recordMachineResponseRelay(event, attrs));
     if (response.type !== "machine:runtime_account_usage:limit_resets:read:result") throw new Error("Unexpected limit resets read response");
     return response;
@@ -18056,6 +19470,32 @@ export class AgentOrchestrator extends EventEmitter {
   }
 
   /**
+   * A person stops one `raft proc` job from the Computer page
+   * (docs/contracts/proc-jobs.md); the route decided who may. The job is
+   * named by its agent and name only; `stoppedBy` is that person's handle,
+   * read by the route from the signed-in person. Same carrier and relay as
+   * interruptAgentTurn.
+   */
+  async stopProcJob(machineId: string, agentId: string, name: string, stoppedBy: string | null): Promise<ProcJobStopRequestResult> {
+    const fact = await this.readProbeCarrierFact(machineId);
+    if (!fact) return { outcome: "computer_offline" };
+    if (!fact.capabilities.includes(DAEMON_CAPABILITY_PROC_STOP)) return { outcome: "computer_upgrade_required" };
+    const requestId = crypto.randomUUID();
+    const response = await this.getMachineResponseRelay().request({
+      requestId, machineId, type: "machine:proc_job:stop:result", agentId,
+    }, PROC_JOB_STOP_RELAY_BUDGET_MS, () => this.sendRequiredToMachine(machineId, {
+      type: "machine:proc_job:stop",
+      requestId,
+      agentId,
+      name,
+      stoppedBy,
+    }), (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+    if (response.type !== "machine:proc_job:stop:result") throw new Error("Unexpected proc job stop response");
+    // The daemon's word: an outcome this server does not know is a failure.
+    return { outcome: (PROC_JOB_STOP_OUTCOMES as readonly unknown[]).includes(response.outcome) ? response.outcome : "failed" };
+  }
+
+  /**
    * #wg-runtime-form:#22 (Raft voice): what the agent is doing now, or one
    * question answered by a read-only fork of its session, from its Computer
    * (agentVoiceService decides who may ask). Same carrier and relay as
@@ -18094,23 +19534,6 @@ export class AgentOrchestrator extends EventEmitter {
       outcome: response.outcome,
       ...(typeof response.text === "string" ? { text: response.text.slice(0, AGENT_SIDE_ASK_ANSWER_MAX_CHARS) } : {}),
     };
-  }
-
-  async requestProviderProbe(
-    machineId: string,
-    input: { requestId: string; probeId: string; runtime: string; model: string },
-  ): Promise<Extract<MachineToServerMessage, { type: "machine:provider_probe:result" }>> {
-    const response = await this.getMachineResponseRelay().request({
-      requestId: input.requestId, machineId, type: "machine:provider_probe:result", probeId: input.probeId,
-    }, PROVIDER_PROBE_RELAY_BUDGET_MS, () => this.sendRequiredToMachine(machineId, {
-      type: "machine:provider_probe:request",
-      requestId: input.requestId,
-      probeId: input.probeId,
-      runtime: input.runtime,
-      model: input.model,
-    }), (event, attrs) => this.recordMachineResponseRelay(event, attrs));
-    if (response.type !== "machine:provider_probe:result") throw new Error("Unexpected probe response");
-    return response;
   }
 
   /**
@@ -18317,15 +19740,13 @@ export class AgentOrchestrator extends EventEmitter {
   async validateBuiltInPresetForMachine(
     machineId: string,
     config: RuntimeConfig,
-    /** A saved connection's provider, when the caller resolved it (builtInCatalogSelection). */
-    connectionProviderId: string | null,
   ): Promise<
     | (BuiltInModelCatalogValidation & {
         authority: MachineConnectionGeneration;
       })
     | null
   > {
-    const selection = builtInCatalogSelection(config, connectionProviderId);
+    const selection = builtInCatalogSelection(config);
     if (!selection) return null;
     const requestedModel = selection.model.kind === "preset" ? selection.model.id : selection.model.name;
     let detection: MachineRuntimeModelDetection;
@@ -18356,7 +19777,6 @@ export class AgentOrchestrator extends EventEmitter {
         daemonVersion: detection.daemonVersion,
         computerVersion: detection.computerVersion,
       },
-      connectionProviderId,
     );
     return validation
       ? { ...validation, authority: detection.authority }
@@ -18532,7 +19952,7 @@ export class AgentOrchestrator extends EventEmitter {
     return { activeCount, retainedTimeoutCount };
   }
 
-  async getAgentSkills(agentId: string, runtime?: string): Promise<{ global: SkillInfo[]; workspace: SkillInfo[] }> {
+  async getAgentSkills(agentId: string, runtime?: string): Promise<{ global: SkillInfo[]; workspace: SkillInfo[]; builtin?: SkillInfo[] }> {
     const result = await this.getMachineForAgent(agentId);
     if (!result) throw new RouteFailureError("daemon_offline", "Agent has no connected machine");
     const { machineId } = result;
@@ -18609,12 +20029,20 @@ export class AgentOrchestrator extends EventEmitter {
         }
         settled = true;
         cleanup();
+        if (msg.unavailable) {
+          // OAR could not read them: the last list (stale) or unavailable with Retry, never an empty list.
+          endSpan("error", { outcome: "skills_unavailable", unavailable_reason: msg.unavailable.reason });
+          reject(new ComputerReadUnavailableError(msg.unavailable.reason));
+          return;
+        }
         endSpan("ok", {
           outcome: "result_received",
           global_count: msg.global.length,
           workspace_count: msg.workspace.length,
+          ...(msg.builtin ? { builtin_count: msg.builtin.length } : {}),
         });
-        resolve({ global: msg.global, workspace: msg.workspace });
+        // `builtin` only when the daemon sent it (older daemons do not).
+        resolve({ global: msg.global, workspace: msg.workspace, ...(msg.builtin ? { builtin: msg.builtin } : {}) });
       };
 
       const disconnectHandler = (context: MachineDisconnectContext = {}) => {
@@ -18713,7 +20141,7 @@ export class AgentOrchestrator extends EventEmitter {
     try {
       const agent = await this.loadAgentForDelivery(agentId);
       if (!agent) return null;
-      const launch = runtimeConfigToLaunchFields(hydrateRuntimeConfig(agent));
+      const launch = runtimeConfigToLaunchFields(hydrateRuntimeConfig(openAgentRowSecrets(agent)));
       return {
         runtime: launch.runtime,
         model: launch.model,
@@ -18722,7 +20150,7 @@ export class AgentOrchestrator extends EventEmitter {
         sessionId: agent.sessionId,
       };
     } catch (err) {
-      console.warn(`[Agent ${agentId}] Feedback transcript session lookup unavailable; the daemon will use its own memory:`, err instanceof Error ? err.message : err);
+      console.warn(`[Agent ${agentId}] Feedback transcript session lookup unavailable; the daemon will use its own memory:`, serializeErrorForLog(err));
       return null;
     }
   }
@@ -19566,6 +20994,51 @@ export class AgentOrchestrator extends EventEmitter {
   }
 
   /**
+   * The Focus tag for messages on their way to this agent
+   * (agentFocusDelivery.ts stampFocus): `focused: true` where the
+   * conversation is in the agent's focus set now, and no `focused` anywhere
+   * else, whatever the message carried (copies; the input is not changed).
+   * An agent with no Computer has nothing to read the tag: no lookup at all.
+   * The capability is read from any replica, because the replica that
+   * delivers is not always the one the Computer is connected to. Never throws.
+   */
+  protected async stampFocusForAgent(
+    agentId: string,
+    serverId: string | null | undefined,
+    machineId: string | null | undefined,
+    messages: readonly AgentMessage[],
+  ): Promise<AgentMessage[]> {
+    if (!machineId) return [...withoutFocusTags(messages)];
+    return [...await stampFocus({
+      agentId,
+      serverId,
+      messages,
+      machineCapable: () => this.machineAdvertisesCapability(machineId, DAEMON_CAPABILITY_AGENT_FOCUS_V1),
+    })];
+  }
+
+  /**
+   * stampFocusForAgent for the live delivery path, where a message can also
+   * focus its conversation by itself and carry the notice of it
+   * (agentFocusAuto.ts focusOnDelivery). An agent with no Computer gets
+   * neither, and costs no lookup. Never throws.
+   */
+  protected async focusOnLiveDelivery(
+    agentId: string,
+    serverId: string | null | undefined,
+    machineId: string | null | undefined,
+    message: AgentMessage,
+  ): Promise<AgentMessage> {
+    if (!machineId) return withoutFocusTags([message])[0]!;
+    return focusOnDelivery({
+      agentId,
+      serverId,
+      message,
+      machineCapable: () => this.machineAdvertisesCapability(machineId, DAEMON_CAPABILITY_AGENT_FOCUS_V1),
+    });
+  }
+
+  /**
    * Deliver one message to one agent. `gates` carries this agent's row and
    * channel access when the caller already read them for a whole channel
    * (deliverMessagesOnChannel); without it the gates are read for this agent.
@@ -19626,6 +21099,17 @@ export class AgentOrchestrator extends EventEmitter {
     }
     if (!options.intrinsic && !await this.canAgentAccessDeliveryTarget(agentId, agent, message, gates?.access.get(agentId))) {
       return { status: "dropped", reason: "target_access_changed" };
+    }
+    // Focus: auto-focus, then the tag. It sits after the access check on
+    // purpose: a focus row can outlive the agent's access, so only a message
+    // that passed the check is tagged, and only such a message focuses its
+    // conversation by itself (a mention in a thread, a DM; agentFocusAuto.ts).
+    // An intrinsic delivery skipped the check (and may carry a label as its
+    // channel id), so it does neither. Everything below (routing to the owner
+    // replica, the inbox, the wake) carries the tagged copy; the re-send and
+    // start paths decide the tag again before they send.
+    if (!options.intrinsic) {
+      message = await this.focusOnLiveDelivery(agentId, agent.serverId, agent.machineId, message);
     }
     // A tracked mention carries the launch/session identity the daemon checks
     // it against. Only the socket owner holds the current identity, so hand
@@ -19807,12 +21291,14 @@ export class AgentOrchestrator extends EventEmitter {
       identity,
     });
     if (!claimed) return { status: "CAS_MISMATCH" };
-    await this.enqueueToLocalInboxIfStillActive(agentId, identity.machineId, row.deliveryPayload);
+    // A stored payload is sent again without deliverMessage: decide its tag now (a stored tag is not trusted).
+    const [payload] = await this.stampFocusForAgent(agentId, agent.serverId, identity.machineId, [row.deliveryPayload]) as [AgentMessage];
+    await this.enqueueToLocalInboxIfStillActive(agentId, identity.machineId, payload);
     await this.sendAgentDeliveryWithAckRetry(identity.machineId, {
       type: "agent:deliver",
       agentId,
-      message: row.deliveryPayload,
-      seq: row.deliveryPayload.seq ?? 0,
+      message: payload,
+      seq: payload.seq ?? 0,
       deliveryId: row.occurrenceId,
       mentionDelivery: identity,
     }, `operator mention redrive failed for agent ${agentId}`);
@@ -19845,7 +21331,8 @@ export class AgentOrchestrator extends EventEmitter {
       };
       const decision = await mentionDeliveryOccurrenceService.recordMentionDeliveryServerDecision({
         occurrenceId: context.mentionDeliveryOccurrenceId,
-        payload: message,
+        // Stored without the Focus tag and without `focus_change`: a re-send decides the tag again and tells nothing twice.
+        payload: withoutFocusTags([message])[0]!,
         identity: mentionDelivery,
       });
       if (!decision) {
@@ -20512,6 +21999,7 @@ export class AgentOrchestrator extends EventEmitter {
       launchId: options.launchId,
       observedAtMs: options.observedAtMs,
       arbitration: options.arbitration,
+      isHeartbeat: options.isHeartbeat === true,
     });
 
     if (writeResult.action === "kernel-preserve") {
@@ -20574,6 +22062,12 @@ export class AgentOrchestrator extends EventEmitter {
       ...(options.isHeartbeat !== undefined ? { isHeartbeat: options.isHeartbeat } : {}),
     });
 
+    if (nextActivity === "online" || nextActivity === "error") {
+      this.maybeTriggerPendingLegacyConfigRestart(agentId);
+    } else if (nextActivity === "offline") {
+      this.pendingLegacyConfigRestarts.delete(agentId);
+    }
+
     return {
       action,
       arbitration: writeResult.arbitration,
@@ -20598,6 +22092,8 @@ export class AgentOrchestrator extends EventEmitter {
       launchId?: string;
       observedAtMs?: number;
       arbitration?: ActivityBroadcastArbitrationInput;
+      /** Producer-declared heartbeat bit of the daemon frame behind this write. */
+      isHeartbeat?: boolean;
     } = {},
   ): AgentActivitySnapshotWriteResult {
     const observedAtMs = options.observedAtMs ?? now;
@@ -20608,6 +22104,27 @@ export class AgentOrchestrator extends EventEmitter {
       observationClass: "observed" as const,
       signalSite: "lifecycle_plan" as const,
     };
+    // #oar-raft:#22: a heartbeat repeating the stored activity refreshes only
+    // the liveness stamp, at this server's receive time (never the daemon's
+    // clock, never nowOverride), under both arbitration modes.
+    const expectedLaunchId = this.agentStateCache.get(agentId)?.expectedLaunchId ?? null;
+    const liveness = planActivityLivenessRefresh({
+      declaredHeartbeat: options.isHeartbeat === true,
+      observationClass: arbitration.observationClass,
+      staleLaunch: options.launchId !== undefined && expectedLaunchId !== null && options.launchId !== expectedLaunchId,
+      incoming: { activity, detail, detailKind },
+      ...(current ? { current } : {}),
+    });
+    const livenessAtMs = liveness.action === "liveness_refresh" ? this.clock.now() : undefined;
+    if (options.isHeartbeat === true) {
+      this.recordEvent("activity.liveness.refresh", {
+        action: liveness.action,
+        reason: liveness.reason,
+        activity_kind: activity,
+        detail_kind: detailKind,
+        ...(current ? { liveness_age_sec: Math.round((this.clock.now() - this.getActivityObservedAtMs(current)) / 1000) } : {}),
+      });
+    }
     const arbitrationDecision = this.planActivityBroadcastArbitration({
       activity,
       current,
@@ -20620,6 +22137,10 @@ export class AgentOrchestrator extends EventEmitter {
     });
 
     if (!arbitrationDecision.admit) {
+      // The kernel gives a replay no projection authority (preserve /
+      // replayed_no_authority): the state, its observed clock, the log and
+      // the clients stay untouched. Liveness is the one allowed time-only write.
+      if (current && livenessAtMs !== undefined) this.refreshActivityLiveness(agentId, current, livenessAtMs);
       return {
         action: "kernel-preserve" as const,
         arbitration: {
@@ -20668,12 +22189,23 @@ export class AgentOrchestrator extends EventEmitter {
         : current?.credentialHold)
       : undefined;
     this.pendingCredentialHold.delete(agentId);
+    // The stamp belongs to the content it proved: refreshed by this heartbeat,
+    // kept by another write of the same content, dropped by a change.
+    const nextLivenessAtMs = livenessAtMs ?? (
+      current
+        && current.activity === nextActivity
+        && current.detail === nextDetail
+        && current.detailKind === nextDetailKind
+        ? current.livenessAtMs
+        : undefined
+    );
     const snapshot: ActivitySnapshot = {
       activity: nextActivity,
       detail: nextDetail,
       detailKind: nextDetailKind,
       ...(nextObservedAtMs !== undefined ? { observedAtMs: nextObservedAtMs } : {}),
       updatedAt: now,
+      ...(nextLivenessAtMs !== undefined ? { livenessAtMs: nextLivenessAtMs } : {}),
       ...(deliveryConsumption ? { deliveryConsumption } : {}),
       ...(wakeCrashLoop ? { wakeCrashLoop } : {}),
       ...(spawnFailure ? { spawnFailure } : {}),
@@ -20687,7 +22219,7 @@ export class AgentOrchestrator extends EventEmitter {
     // typed carrier rides the same write so a non-owner replica's refresh
     // read-back exposes it (task #1116).
     this.replicaStateStore
-      .setAgentActivity(agentId, nextActivity, nextDetail, nextDetailKind, nextObservedAtMs, snapshotTypedCarriers(snapshot))
+      .setAgentActivity(agentId, nextActivity, nextDetail, nextDetailKind, nextObservedAtMs, snapshotTypedCarriers(snapshot), nextLivenessAtMs)
       .catch(() => {});
 
     return {
@@ -20701,6 +22233,29 @@ export class AgentOrchestrator extends EventEmitter {
       nextActivity,
       snapshot,
     };
+  }
+
+  /**
+   * #oar-raft:#22: time-only liveness write for a same-content heartbeat the
+   * kernel did not admit. Same snapshot (activity, detail, carriers, observed
+   * and write clocks) with a new liveness stamp, locally and in the owner's
+   * Redis mirror that other replicas read. No state change, activity log row
+   * or client broadcast.
+   */
+  private refreshActivityLiveness(agentId: string, current: ActivitySnapshot, livenessAtMs: number): void {
+    const snapshot: ActivitySnapshot = { ...current, livenessAtMs };
+    this.agentActivity.set(agentId, snapshot);
+    this.replicaStateStore
+      .setAgentActivity(
+        agentId,
+        snapshot.activity,
+        snapshot.detail,
+        snapshot.detailKind,
+        snapshot.observedAtMs,
+        snapshotTypedCarriers(snapshot),
+        livenessAtMs,
+      )
+      .catch(() => {});
   }
 
   private isAgentActivityKernelArbitrationEnabled(): boolean {
@@ -21199,6 +22754,9 @@ export class AgentOrchestrator extends EventEmitter {
   ) {
     const agent = await this.getCachedAgent(agentId);
     if (agent) {
+      // Decided before the seq is taken: no await between the seq and the emit.
+      const holdsComputer = this.agentComputerIsHere(agent.machineId);
+      const feedsCoarseState = holdsComputer || await this.noOtherReplicaHoldsComputer(agent.machineId);
       // Bump the monotonic seq before emit so the client can
       // drop pushes that arrive out-of-order during reconnect storms
       // (a race between socket-pushed updates and an in-flight
@@ -21283,7 +22841,21 @@ export class AgentOrchestrator extends EventEmitter {
           this.io?.to(agentEventRoom(agent.serverId, agent.assistantOwnerUserId)).except(agentActivityCapableServerRoom(agent.serverId)).emit("agent:activity", publicPayload);
           this.io?.to(agentActivityRoom(agentId)).emit("agent:activity", publicPayload);
         }
-        this.agentActivityStateFanout.observe(agentActivityStateRoom(agent.serverId, agent.assistantOwnerUserId), agentId, activity, timestamp, nextSeq, agent.machineId);
+        // Only the replica holding the agent's Computer (or any, while no replica
+        // holds it) feeds the coarse state, so what the owner last sent is what
+        // clients show and its change-only dedupe holds (agentActivityStateFanout.ts).
+        // Change-only dedupe only as the Computer's owner: with no owner, any
+        // replica may push, so what this one last sent is no guide.
+        if (feedsCoarseState) {
+          this.agentActivityStateFanout.observe(agentActivityStateRoom(agent.serverId, agent.assistantOwnerUserId), agentId, activity, timestamp, nextSeq, agent.machineId, { dedupe: holdsComputer });
+        } else {
+          // Counted to decide whether such writes must go to the owner
+          // (runOnOwner). Every skip, not only one that differs from the shared
+          // record: this replica has already mirrored its own status there
+          // (writeAgentActivitySnapshot), so a read-back would match itself.
+          // An upper bound: a skip of the status the owner has too loses nothing.
+          this.recordEvent("activity.coarse_state.other_replica_skip", { agent_id: agentId, activity_kind: activity, detail_kind: detailKind });
+        }
         // Joint membership exposes basic presence, never the agent's unrelated
         // work summary, diagnostics, or runtime correlation identifiers.
         void this.emitJointActivityToProjectionRooms(agent.id, agent.serverId, {

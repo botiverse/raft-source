@@ -1,12 +1,12 @@
-import { useCallback, useEffect, useId, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useIntl } from "react-intl";
 import { Laptop } from "lucide-react";
-import { Banner, BannerAction, BannerClose, BannerDescription, BannerTitle, Button, Checkbox, TextLink } from "@botiverse/raft-ui";
+import { Banner, BannerAction, BannerClose, BannerDescription, BannerTitle, Button, TextLink } from "@botiverse/raft-ui";
 import api from "../../api/client";
 import { trackDesktopDownloadClicked } from "../../analytics/appDownload";
 import type { MessageId } from "../../i18n/messages";
 import { useAuthStore } from "../../store/authStore";
-import { quietLinkOpenOffer, useLinkOpenPreference, useLinkOpenQuiet, writeLinkOpenPreference } from "../../store/linkOpenPreference";
+import { forgetLegacyLinkOpenChoice } from "../../store/linkOpenPreference";
 import { isAppClaimedPath } from "../../utils/appClaimedPath";
 import { DESKTOP_APP_OPENING_MS, desktopAppDeepLink, offersDesktopAppInThisWindow, openInDesktopApp } from "../../utils/desktopAppLink";
 import { desktopDownloadUrl } from "../../utils/desktopDownload";
@@ -51,15 +51,15 @@ import { useOpenInAppOfferFlag, usePageLanding } from "./deepLinksFlag";
  * it: answered on the sign-in page, the workspace that loads after sign-in
  * does not ask again (utils/pageLanding.ts).
  *
- * Remembered (this browser only; "Remember my choice", or Settings ›
- * Appearance › How links open): "web" hides the banner for good; "app" shows
- * it without the hint, the download and the checkbox. Continue on Web without
- * remembering puts it away in this browser for 7 days (the preference stays
- * "ask"), so someone who stays on the web isn't asked on every new tab; Open
- * in Desktop App starts no such quiet time.
+ * Nothing is remembered: every Raft link that lands from outside asks again,
+ * since the point is to bring people to Raft Desktop (stdrc, 2026-11-17,
+ * #raft-feature-flag:9a4baa11). Continue on Web is for this link only. The
+ * old "Remember my choice", Settings › Appearance › How links open and the 7
+ * days of quiet after Continue on Web are gone (store/linkOpenPreference.ts
+ * clears what they left in storage).
  *
  * Raft Design System › Banner: info tint, the title and one line, then
- * BannerAction holding the checkbox, the dismiss-like ghost Continue on Web
+ * BannerAction holding the dismiss-like ghost Continue on Web
  * and the one ink-bordered button (a banner's button is never pink, so Open
  * in Desktop App is `default`, not the mockup's pink). The download is not a
  * second button: it is a text link (`TextLink` strong) in the description's
@@ -114,8 +114,8 @@ export default function DesktopAppLinkBanner() {
   return <DesktopAppLinkBannerGate pathname={landing.pathname} search={landing.search} />;
 }
 
-/** What the banner knows about Raft Desktop here: this browser was told, the account used it lately, or nothing. */
-type DesktopAppSign = "remembered" | "used" | "none";
+/** What the banner knows about Raft Desktop here: the account used it lately, or nothing. */
+type DesktopAppSign = "used" | "none";
 
 /** Asking; then, after Open in Desktop App, saying so for a while; then gone. */
 type DesktopAppOfferPhase = "offer" | "opening" | "done";
@@ -127,11 +127,9 @@ function initialPhase(): DesktopAppOfferPhase {
 function DesktopAppLinkBannerGate({ pathname, search }: { pathname: string; search: string }) {
   const enabled = useOpenInAppOfferFlag();
   const signedIn = useAuthStore((s) => s.user !== null);
-  const preference = useLinkOpenPreference();
-  // Continue on Web, some days ago: "ask" is quiet until its time is up.
-  const quiet = useLinkOpenQuiet() && preference === "ask";
+  useEffect(forgetLegacyLinkOpenChoice, []);
   // Signed out there is no account to have a hint, and /auth/me is not asked.
-  const hint = useDesktopAppHint(enabled && signedIn && preference === "ask" && !quiet);
+  const hint = useDesktopAppHint(enabled && signedIn);
   const [phase, setPhase] = useState(initialPhase);
   const answer = useCallback((next: "opening" | "done") => {
     answerPageLandingOffer();
@@ -141,17 +139,17 @@ function DesktopAppLinkBannerGate({ pathname, search }: { pathname: string; sear
   // What the offer's events say about it (utils/openInAppTrace: kinds, never the address).
   const link = openInAppLinkOf(pathname, search);
   const event = useMemo<OpenInAppContext>(() => ({ surface: "desktop_banner", link, signedIn }), [link, signedIn]);
-  const offered = enabled && phase === "offer" && preference !== "web" && !quiet && !(preference === "ask" && signedIn && hint === null);
+  const offered = enabled && phase === "offer" && !(signedIn && hint === null);
   // Once for this offer, once it can be sent (openInAppTrace reportOncePerOffer: not lost on a cold start).
   const [reportOffered] = useState(() => reportOncePerOffer(reportOpenInAppOffered));
   const offerShown = useCallback(() => reportOffered(event), [reportOffered, event]);
-  if (!enabled || phase === "done" || preference === "web") return null;
+  if (!enabled || phase === "done") return null;
   if (phase === "opening") return <DesktopAppOpeningBanner event={event} onClose={close} />;
   if (!offered) return null;
   return (
     <>
       <DesktopAppLinkBannerView
-        sign={preference === "app" ? "remembered" : hint ? "used" : "none"}
+        sign={hint ? "used" : "none"}
         message={parseMessageLink(pathname, search) !== null}
         deepLink={desktopAppDeepLink({ pathname, search })}
         event={event}
@@ -250,23 +248,17 @@ function DesktopAppLinkBannerView({
   onAnswer: (next: "opening" | "done") => void;
 }) {
   const { formatMessage } = useIntl();
-  const rememberId = useId();
-  const [remember, setRemember] = useState(false);
-  const handleRememberChange = useCallback((checked: boolean) => setRemember(checked), []);
 
   const openApp = useCallback(() => {
-    if (remember) writeLinkOpenPreference("app");
-    reportOpenInAppOpen(event, remember);
+    reportOpenInAppOpen(event);
     openInDesktopApp(deepLink);
     onAnswer("opening");
-  }, [deepLink, event, onAnswer, remember]);
+  }, [deepLink, event, onAnswer]);
+  // For this link only: the next Raft link asks again.
   const stayOnWeb = useCallback(() => {
-    if (remember) writeLinkOpenPreference("web");
-    // Not remembered, and not where this browser was told "app" (no checkbox there): quiet for 7 days.
-    else if (sign !== "remembered") quietLinkOpenOffer();
-    reportOpenInAppStay(event, remember);
+    reportOpenInAppStay(event);
     onAnswer("done");
-  }, [event, onAnswer, remember, sign]);
+  }, [event, onAnswer]);
 
   return (
     <div className="shrink-0 border-b border-line-seam" data-testid="desktop-app-link-banner">
@@ -274,22 +266,9 @@ function DesktopAppLinkBannerView({
         <Laptop aria-hidden="true" />
         <BannerTitle>{formatMessage({ id: message ? "desktopAppLink.banner.title" : "desktopAppLink.banner.titlePage" })}</BannerTitle>
         {sign === "none" ? <DesktopAppDownload messageId="desktopAppLink.banner.download" event={event} /> : (
-          <BannerDescription>
-            {formatMessage({ id: sign === "remembered" ? "desktopAppLink.banner.descriptionRemembered" : "desktopAppLink.banner.description" })}
-          </BannerDescription>
+          <BannerDescription>{formatMessage({ id: "desktopAppLink.banner.description" })}</BannerDescription>
         )}
         <BannerAction>
-          {sign === "remembered" ? null : (
-            <label htmlFor={rememberId} className="mr-2 inline-flex items-center gap-2 text-callout text-foreground-muted">
-              <Checkbox
-                id={rememberId}
-                checked={remember}
-                onCheckedChange={handleRememberChange}
-                data-testid="desktop-app-link-remember"
-              />
-              {formatMessage({ id: "desktopAppLink.banner.remember" })}
-            </label>
-          )}
           <Button variant="ghost" size="md" onClick={stayOnWeb} data-testid="desktop-app-link-stay">
             {formatMessage({ id: "desktopAppLink.banner.stay" })}
           </Button>

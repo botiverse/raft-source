@@ -22,6 +22,7 @@
 // for one): the daemon that saw it holds the agents, and a lost "recovered"
 // report must not block them here forever.
 
+import { openAgentRowSecretsIsolated } from "./agentSecretCrypto";
 import {
   agentReadinessChain,
   composeReadiness,
@@ -44,6 +45,7 @@ import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import { agents, computerOutageOccurrences, computerReadinessReports, computers, computerUpgradeRequests, machines, serverMembers, users } from "../db/schema";
 import { mapWithConcurrency } from "../lib/mapWithConcurrency";
+import { computerOutageIsOpen } from "./computerOutageNotificationService";
 import { agentFindableBy, type AgentFinder } from "./agentMemberListPolicy";
 
 // ── Server facts ──
@@ -350,9 +352,17 @@ export async function loadComputerReadinessInputs(
     loadRuntimeReadinessFacts(ids, executor),
     executor.select({ machineId: computers.machineId }).from(computers)
       .where(and(inArray(computers.machineId, ids), isNull(computers.revokedAt))),
+    // Through `machines` so the lookup is on (server_id, machine_id), the open-only
+    // index's key. With bound ids alone the generic plan skips that index and
+    // walks every pending/notified entry of (state, notify_after) on each call.
     executor.select({ machineId: computerOutageOccurrences.machineId, state: computerOutageOccurrences.state, firstOfflineAt: computerOutageOccurrences.firstOfflineAt })
-      .from(computerOutageOccurrences)
-      .where(and(inArray(computerOutageOccurrences.machineId, ids), inArray(computerOutageOccurrences.state, ["pending", "notified"]))),
+      .from(machines)
+      .innerJoin(computerOutageOccurrences, and(
+        eq(computerOutageOccurrences.serverId, machines.serverId),
+        eq(computerOutageOccurrences.machineId, machines.id),
+        computerOutageIsOpen,
+      ))
+      .where(inArray(machines.id, ids)),
     executor.select({ machineId: computerUpgradeRequests.machineId, requestedAt: computerUpgradeRequests.requestedAt, deadlineAt: computerUpgradeRequests.deadlineAt })
       .from(computerUpgradeRequests)
       .where(and(inArray(computerUpgradeRequests.machineId, ids), isNull(computerUpgradeRequests.outcome))),
@@ -510,7 +520,7 @@ export async function loadReadinessAgentsByMachine(machineIds: readonly string[]
   }).from(agents).where(and(inArray(agents.machineId, [...new Set(machineIds)]), isNull(agents.deletedAt), agentFindableBy(finder)));
   for (const { machineId, ...agent } of rows) {
     if (!machineId) continue;
-    byMachine.set(machineId, [...(byMachine.get(machineId) ?? []), agent]);
+    byMachine.set(machineId, [...(byMachine.get(machineId) ?? []), openAgentRowSecretsIsolated(agent)]);
   }
   return byMachine;
 }

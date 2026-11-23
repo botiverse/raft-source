@@ -12,6 +12,12 @@
 // (resetMachine), and a sent state older than SENT_STATE_TRUST_MS no longer
 // holds back a send. Sending a state twice is harmless (clients order by
 // serverSeq); holding back a real change leaves every tab on the old state.
+//
+// So the skip applies only to the replica holding the agent's Computer, the
+// one replica that feeds it then (emitActivity). While no replica holds it (an
+// agent without a Computer, one connected nowhere, or Redis unreadable) any
+// replica may push, and observe is called with `dedupe: false`: every push is
+// sent, still at most once per interval.
 import {
   AGENT_ACTIVITY_STATE_MIN_INTERVAL_MS,
   coarseAgentActivityState,
@@ -35,6 +41,8 @@ interface AgentEntry {
   sentState: AgentActivityCoarseState | null;
   sentAt: number | null;
   timer: unknown | null;
+  /** Whether the last push may be skipped as already sent (observe's `dedupe`). */
+  dedupe: boolean;
 }
 
 export class AgentActivityStateFanout {
@@ -47,19 +55,29 @@ export class AgentActivityStateFanout {
   ) {}
 
   /** A detailed activity was emitted for `agentId`: send its coarse state to `room` if it changed, within the interval. */
-  observe(room: string, agentId: string, activity: string, timestamp: number, serverSeq: number, machineId: string | null = null): void {
+  observe(
+    room: string,
+    agentId: string,
+    activity: string,
+    timestamp: number,
+    serverSeq: number,
+    machineId: string | null = null,
+    options: { dedupe?: boolean } = {},
+  ): void {
+    const dedupe = options.dedupe ?? true;
     const latest: AgentActivityStatePayload = { agentId, state: coarseAgentActivityState(activity), activity, timestamp, serverSeq };
     let entry = this.agents.get(agentId);
     if (!entry) {
-      entry = { room, machineId, latest, sentState: null, sentAt: null, timer: null };
+      entry = { room, machineId, latest, sentState: null, sentAt: null, timer: null, dedupe };
       this.agents.set(agentId, entry);
     } else {
       entry.room = room;
       entry.machineId = machineId;
       entry.latest = latest;
+      entry.dedupe = dedupe;
     }
     if (entry.timer !== null) return;
-    if (this.trustedSentState(entry) === latest.state) return;
+    if (this.alreadySent(entry)) return;
     const wait = entry.sentAt === null ? 0 : entry.sentAt + this.intervalMs - this.clock.now();
     if (wait <= 0) {
       this.flush(entry);
@@ -95,8 +113,12 @@ export class AgentActivityStateFanout {
     return entry.sentState;
   }
 
+  private alreadySent(entry: AgentEntry): boolean {
+    return entry.dedupe && this.trustedSentState(entry) === entry.latest.state;
+  }
+
   private flush(entry: AgentEntry): void {
-    if (this.trustedSentState(entry) === entry.latest.state) return;
+    if (this.alreadySent(entry)) return;
     entry.sentState = entry.latest.state;
     entry.sentAt = this.clock.now();
     this.send(entry.room, entry.latest);

@@ -6,6 +6,7 @@ import api from "../../api/client";
 import { useAppNavigate } from "../../hooks/useAppNavigate";
 import { useRaftPermalinkHostnames } from "../../store/raftAppHosts";
 import { useServerStore } from "../../store/serverStore";
+import { resolveMessageLinkIds } from "../../store/threadLinkIds";
 
 /**
  * Opening a Raft message permalink from a text the message renderer draws
@@ -62,6 +63,20 @@ export function useOpenRaftPermalink(): (href: string) => Promise<void> {
     }
 
     if (serverSlug && permalink.serverSlug === serverSlug) {
+      // A link may name its message, its thread parent or (cut short) its
+      // channel by a short id; the routes it opens take UUIDs only (#503).
+      const { serverEpoch } = useServerStore.getState();
+      const resolved = await resolveMessageLinkIds(permalink);
+      if (useServerStore.getState().serverEpoch !== serverEpoch) return;
+      if (typeof resolved === "string") {
+        toast.error(formatMessageRef.current({
+          id: resolved === "transient"
+            ? "message.messageItem.linkResolutionUnavailable"
+            : permalink.threadParentMessageId ? "message.messageItem.threadUnavailable" : "messageLink.unavailable.title",
+        }));
+        return;
+      }
+      permalink = resolved;
       if (permalink.threadParentMessageId) {
         nav.toThreadMessage(
           permalink.channelId,

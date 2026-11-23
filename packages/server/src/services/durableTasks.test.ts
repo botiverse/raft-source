@@ -4,6 +4,7 @@ import { eq } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { durableTasks } from "../db/schema";
 import {
+  DurableTaskDeferral,
   DurableTaskPermanentError,
   DurableTaskRegistry,
   claimExpiredDurableTasks,
@@ -112,6 +113,28 @@ test("failures back off, then need attention; permanent errors skip the retries"
   const permanent = await getDb().transaction((tx) => createDurableTask(tx, { definition, payload: { value: "permanent" }, now }));
   assert.equal(await runDurableTask(permanent, registry, { clock: () => now }), "needs_attention");
   assert.equal((await row(permanent.task.id)).lastError, "NOT_RECOVERABLE");
+});
+
+test("a deferral hands the task back after its delay without spending an attempt, however often it happens", async ({ db }) => {
+  let busy = true;
+  const definition = echo(async () => { if (busy) throw new DurableTaskDeferral(5_000, "BUSY"); }, { maxAttempts: 2 });
+  const registry = new DurableTaskRegistry().register(definition);
+  let now = t0;
+  let claim = await getDb().transaction((tx) => createDurableTask(tx, { definition, payload: { value: "d" }, now }));
+  // Many more deferrals than the attempt budget: still open, never needs_attention.
+  for (let i = 0; i < 5; i += 1) {
+    assert.equal(await runDurableTask(claim, registry, { clock: () => now }), "deferred");
+    const task = await row(claim.task.id);
+    assert.deepEqual([task.state, task.claimedBy, task.lastError], ["open", null, "BUSY"]);
+    assert.equal(task.maxAttempts - task.attempts, 2, "the whole budget is still left");
+    assert.equal(task.leaseUntil.getTime(), now.getTime() + 5_000);
+    assert.deepEqual(await claimExpiredDurableTasks({ workerId: "r", registry, now }), [], "not due before the delay");
+    now = new Date(now.getTime() + 5_001);
+    [claim] = (await claimExpiredDurableTasks({ workerId: "r", registry, now })) as [typeof claim];
+    assert.equal(claim.attempt, i + 2);
+  }
+  busy = false;
+  assert.equal(await runDurableTask(claim, registry, { clock: () => now }), "succeeded");
 });
 
 test("an attempt that crashed on its last try is moved to needs_attention, not retried", async ({ db }) => {

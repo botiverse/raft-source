@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { useOwnerDocument } from "../../utils/ownerDocument";
 import { pushShortcutLayer } from "./dispatcher";
 import type { LayerOptions, ShortcutHandler } from "./dispatcher";
 import type { ShortcutScope } from "./registry";
@@ -23,9 +24,12 @@ export function useShortcutLayer(scope: ShortcutScope, open: boolean, options: U
   const { modal, phase, ignoreDefaultPrevented, stopPropagation } = options;
   const hasEscape = !!options.onEscape;
   const hasKey = !!options.onKey;
+  // Open in the document this component is drawn in (an object window's, features/objectWindows).
+  const doc = useOwnerDocument();
   useEffect(() => {
     if (!open) return;
     return pushShortcutLayer(scope, {
+      doc,
       modal,
       phase,
       ignoreDefaultPrevented,
@@ -33,5 +37,5 @@ export function useShortcutLayer(scope: ShortcutScope, open: boolean, options: U
       onEscape: hasEscape ? () => (event) => optionsRef.current.onEscape?.(event) : undefined,
       onKey: hasKey ? () => (event) => optionsRef.current.onKey?.(event) : undefined,
     });
-  }, [scope, open, modal, phase, ignoreDefaultPrevented, stopPropagation, hasEscape, hasKey]);
+  }, [scope, open, modal, phase, ignoreDefaultPrevented, stopPropagation, hasEscape, hasKey, doc]);
 }

@@ -24,8 +24,8 @@ import { usePageLandingLifetime } from "./deepLinksFlag";
  * An offer answered on the sign-in page is not made again by the workspace
  * that loads after it.
  */
-export function OpenInAppOffers({ slot }: { slot: "top" | "bottom" }) {
-  return slot === "top" ? <OpenInAppTopOffer /> : <OpenInAppOffer />;
+export function OpenInAppOffers({ slot, signedOutHint = false }: { slot: "top" | "bottom"; signedOutHint?: boolean }) {
+  return slot === "top" ? <OpenInAppTopOffer /> : <OpenInAppOffer signedOutHint={signedOutHint} />;
 }
 
 function OpenInAppTopOffer() {

@@ -7,14 +7,14 @@ import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { and, eq } from "drizzle-orm";
 import { closeDatabase, getDb, initDatabase } from "../db/index";
 import { agents, serverMembers, servers, users } from "../db/schema";
-import { transitionMemberRole, updateServerOnboardingSettings } from "./serverService";
+import { linkOfficialOnboardingAgent, transitionMemberRole } from "./serverService";
 
 /**
  * #4883 concurrency regression — opt-in, real PostgreSQL only (PGlite runs statements serially and
  * cannot exhibit this). Set PROMOTED_OWNER_REAL_PG_URL to an admin PG URL to run it.
  *
  * Review (John) found a lost-update race: owner-entry (`transitionMemberRole` / `addMember`) and a
- * checkpoint setter (`updateServerOnboardingSettings` / `updateServerOnboardingAgent`) touch the
+ * checkpoint setter (`linkOfficialOnboardingAgent`; picking a greeter is no longer one) touch the
  * same (owner × checkpoint) set in opposite orders, so under snapshot isolation each misses the
  * other's uncommitted change and a promoted owner is left `not_started`. The fix serializes both
  * on one lock order — `servers` row first, then `server_members`.
@@ -89,7 +89,7 @@ test(
             targetUserId: coOwnerId,
             nextRole: "owner",
           }),
-          updateServerOnboardingSettings(serverId, { onboardingAgentId: agent.id }),
+          linkOfficialOnboardingAgent(serverId, agent.id),
         ]);
 
         const [row] = await db.select({

@@ -202,6 +202,20 @@ export function beginRightPanelSearchTransition(
   };
 }
 
+/**
+ * Locates `messageId` in the conversation open now, as the thread jump pill does: highlights it where it is loaded
+ * (a new highlightNonce restarts its located highlight), else loads its window, which highlights it; a message
+ * behind the plan's history window lands on the history paywall (ChatPanel, CONTEXT_BEYOND_HISTORY_ERROR).
+ */
+export function locateMessageInOpenConversation(channelId: string, messageId: string): void {
+  const messageStore = useMessageStore.getState();
+  if (messageStore.channelMessages[channelId]?.some((message) => message.id === messageId)) {
+    messageStore.setHighlightedMessageId(messageId);
+  } else if (channelId) {
+    void messageStore.loadMessageContext(channelId, messageId);
+  }
+}
+
 export function transitionThreadToParentMessage({
   pathname,
   parentMessageId,
@@ -211,17 +225,19 @@ export function transitionThreadToParentMessage({
   recordMobileBackNavigation = recordSynchronousMobileBackNavigation,
 }: {
   pathname: string;
-  parentMessageId: string;
+  /** Null: open the conversation alone, at its latest (the parent was deleted: nothing to locate). */
+  parentMessageId: string | null;
   navigate: StringNavigateLike;
   replace?: boolean;
   recordMobileBack?: boolean;
   recordMobileBackNavigation?: RecordMobileBackNavigationLike;
 }): void {
-  const nextSearch = `?msg=${parentMessageId}`;
+  const nextSearch = parentMessageId ? `?msg=${parentMessageId}` : "";
   // Hands 52c09462: the same `?msg=` anchor (the thread was opened from a link
   // to its parent, from Activity, or after an earlier jump) doesn't reload the
   // channel, which is what locates a new anchor; this jump locates it itself.
-  const sameAnchor = typeof window !== "undefined"
+  const sameAnchor = parentMessageId !== null
+    && typeof window !== "undefined"
     && window.location?.pathname === pathname
     && new URLSearchParams(window.location.search).get("msg") === parentMessageId;
   beginRightPanelSearchTransition(nextSearch, pathname);
@@ -238,15 +254,8 @@ export function transitionThreadToParentMessage({
   // same event so a busy destination render cannot leave the old thread
   // mounted while the canonical parent URL is already visible.
   useThreadStore.getState().closeThread();
-  if (sameAnchor) {
-    // As the thread jump pill does: highlight a loaded parent, else load its window (which highlights it).
-    const messageStore = useMessageStore.getState();
-    const channelId = pathname.slice(pathname.lastIndexOf("/") + 1);
-    if (messageStore.channelMessages[channelId]?.some((message) => message.id === parentMessageId)) {
-      messageStore.setHighlightedMessageId(parentMessageId);
-    } else if (channelId) {
-      void messageStore.loadMessageContext(channelId, parentMessageId);
-    }
+  if (sameAnchor && parentMessageId) {
+    locateMessageInOpenConversation(pathname.slice(pathname.lastIndexOf("/") + 1), parentMessageId);
   }
 }
 
@@ -262,20 +271,30 @@ export function openThreadParentMessageRoute({
   isDesktop: boolean;
   navigate: StringNavigateLike;
   parentChannelId: string;
-  parentMessageId: string;
+  /** Null: open the parent conversation without locating anything in it (a deleted parent). */
+  parentMessageId: string | null;
   parentRouteKind: "channel" | "dm";
   serverSlug?: string;
   recordMobileBackNavigation?: RecordMobileBackNavigationLike;
 }): void {
-  const base = serverSlug ? `/s/${serverSlug}` : "";
   transitionThreadToParentMessage({
-    pathname: `${base}/${parentRouteKind}/${parentChannelId}`,
+    pathname: threadParentConversationPath({ parentChannelId, parentRouteKind, serverSlug }),
     parentMessageId,
     navigate,
     replace: !isDesktop,
     recordMobileBack: !isDesktop,
     recordMobileBackNavigation,
   });
+}
+
+/** The route of a thread's parent conversation. */
+export function threadParentConversationPath({ parentChannelId, parentRouteKind, serverSlug }: {
+  parentChannelId: string;
+  parentRouteKind: "channel" | "dm";
+  serverSlug?: string;
+}): string {
+  const base = serverSlug ? `/s/${serverSlug}` : "";
+  return `${base}/${parentRouteKind}/${parentChannelId}`;
 }
 
 export function hasRightPanelThreadAnchorChanged(

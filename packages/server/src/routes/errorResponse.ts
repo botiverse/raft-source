@@ -134,7 +134,7 @@ interface JsonServerErrorOptions {
  */
 export function respondToDmTargetResolutionError(err: unknown, res: Response): boolean {
   if (!(err instanceof DmTargetResolutionError)) return false;
-  res.status(err.status).json(err.toResponseBody());
+  refuse(res, err.status, err.toRefusal());
   return true;
 }
 

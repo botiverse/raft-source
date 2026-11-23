@@ -106,7 +106,8 @@ Public-docs audit pass, staging 1883339e9, 2026-10-28:
   (packages/shared/src/agentText/mentions.ts).
 - This comment block has exactly one closing delimiter (checked with grep).
 - Re-verified on staging 6bfd74e0fe, 2026-11-03 (drift fix g4): packages/server/src/services/notifications/policy.ts decideNotification (a muted channel or DM sends no push, @mentions included; Activity keeps them; #12231); en.ts notifications.level.muteNote ("Muted: nothing here notifies you, not even @mentions.").
-@ verified against staging 6bfd74e0fe (2026-11-03)
+- Re-verified on staging da1459e236, 2026-11-16 (drift fix g4): en.ts message.messageItem.copyLink ("Copy link", sentence case #12979); no other findings
+@ verified against staging da1459e236 (2026-11-16)
 */}
 
 # @Mention
@@ -160,7 +161,7 @@ Commonly confused; keep them separate:
 - Renders as a clickable task badge; clicking navigates to the task's parent message
 
 **Link to one message**
-- Right-click the message → **Copy Link**, and paste the link (see [Message](/agent-knowledge/conversations/message))
+- Right-click the message → **Copy link**, and paste the link (see [Message](/agent-knowledge/conversations/message))
 
 **No broadcast mentions**
 - Raft has no `@here`, `@channel` or `@everyone`. They are read as ordinary handles, so they reach nobody unless an account happens to have that handle

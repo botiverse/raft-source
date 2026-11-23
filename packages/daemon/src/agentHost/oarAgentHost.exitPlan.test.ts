@@ -32,10 +32,11 @@ import { harness, makeConfig, message, request, sleep, until, type Harness } fro
 /** What a test does to one OAR session: its exit code, its failed turns' class, a runtime that answers `busy`. */
 interface SessionControl {
   exitCode: number | null;
+  exitReason?: string;
   failure: FailureClass;
   refusePrompts: boolean;
-  /** The runtime process ends on its own with `code`. */
-  exit(code: number | null): Promise<void>;
+  /** The runtime process ends on its own with `code` (and optional `reason`). */
+  exit(code: number | null, reason?: string): Promise<void>;
 }
 
 /**
@@ -47,10 +48,12 @@ interface SessionControl {
 function controlled(session: Session, controls: SessionControl[], failure: FailureClass): Session {
   const control: SessionControl = {
     exitCode: 0,
+    exitReason: undefined,
     failure,
     refusePrompts: false,
-    exit: async (code) => {
+    exit: async (code, reason) => {
       control.exitCode = code;
+      control.exitReason = reason;
       await session.dispose();
     },
   };
@@ -60,7 +63,7 @@ function controlled(session: Session, controls: SessionControl[], failure: Failu
       if (property === "events") {
         return (observer: EventObserver, options?: EventsOptions) => target.events((event: Event) => {
           if (event.kind === "exited") {
-            observer({ ...event, code: control.exitCode });
+            observer({ ...event, code: control.exitCode, ...(control.exitReason === undefined ? {} : { reason: control.exitReason }) });
             return;
           }
           if (event.kind === "turn_ended" && event.outcome.kind === "failed") {
@@ -485,7 +488,8 @@ test("D5 capped: the fifth unclassified crash in a row is handed to the server: 
     assert.equal(stopped[0]!.runtime_error_reported, true);
     const detail = "Grok Build crashed 5 times in a row (last: exit code 1). Raft stopped restarting it; restart the agent to try again.";
     const failedStart = h.framesOf("agent:activity").find((frame) => "spawnFailure" in frame && frame.spawnFailure);
-    assert.deepEqual(failedStart?.spawnFailure, { reason: "runtime_spawn_failed" });
+    // The carrier's message is the runtime's last error text (scrubbed, capped), not the shown copy.
+    assert.deepEqual(failedStart?.spawnFailure, { reason: "runtime_spawn_failed", message: "Error: something went wrong while loading the conversation" });
     assert.equal(failedStart?.detail, detail);
     const last = h.framesOf("agent:activity").at(-1)!;
     assert.equal(last.detailKind, "runtime_error");
@@ -707,5 +711,53 @@ test("D6 on OAR: a session that exits 0 with work held and no output backs off a
     assert.equal(h.host.owns("agent-1"), false);
   } finally {
     await h.cleanup();
+  }
+});
+
+test("OAR 0.124.0: exited.reason 'Descendant cleanup could not be verified' is never treated as a crash or restart trigger", async () => {
+  const cleanupReason = "Descendant cleanup could not be verified: process table check timed out";
+
+  // 1. Clean self-exit (code 0) carrying the unverified cleanup reason: planned as clean_exit, crashStreak 0, no restart.
+  {
+    const { h, controls, streaks } = await exitHarness({
+      turns: [() => {}],
+    });
+    try {
+      await h.host.start(request());
+      await idle(h, 1);
+      await controls[0]!.exit(0, cleanupReason);
+      await until(() => planned(h).length === 1, "clean exit planned");
+      assert.equal(planned(h)[0]!.plan_kind, "clean");
+      assert.equal(planned(h)[0]!.plan_start, "next_wake");
+      assert.equal(planned(h)[0]!.crash_streak, 0);
+      assert.equal(streaks.crashStreak("agent-1"), 0);
+      assert.equal(h.opened.length, 1, "no automatic restart");
+      assert.equal(h.host.owns("agent-1"), false);
+    } finally {
+      await h.cleanup();
+    }
+  }
+
+  // 2. Daemon-initiated stop whose dispose emits exited with that reason: listeners are released first, never planned as a crash.
+  {
+    const { h, controls, streaks } = await exitHarness({
+      turns: [() => {}],
+    });
+    try {
+      await h.host.start(request());
+      await idle(h, 1);
+      controls[0]!.exitCode = 0;
+      controls[0]!.exitReason = cleanupReason;
+      await h.host.stopAgent("agent-1");
+      assert.equal(planned(h).length, 1, "explicit stop planned once (never re-entered via onExited)");
+      assert.equal(planned(h)[0]!.plan_kind, "stopped");
+      assert.equal(planned(h)[0]!.plan_start, "none");
+      assert.equal(planned(h)[0]!.crash_streak, 0);
+      assert.equal(streaks.crashStreak("agent-1"), 0);
+      assert.equal(h.opened.length, 1);
+      assert.equal(h.host.owns("agent-1"), false);
+    } finally {
+      await h.cleanup();
+    }
   }
 });

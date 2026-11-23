@@ -62,16 +62,22 @@ test("§6.5: the mark needs both facts, a window of at least 400k and a context 
   assert.deepEqual(at(500_001, 1_000_000), { mark: true, band: "ceiling", contextTokens: 500_001, windowTokens: 1_000_000 });
 });
 
-test("§6.5: only runtimes whose next start can read resume facts: Claude on the legacy host; Codex and Grok on the OAR host with wake_recycle_oar", () => {
+test("§6.5: only sessions whose next start can read resume facts: Claude on the legacy host; on the OAR host, an installation OAR declares the context size for, with wake_recycle_oar", () => {
   assert.equal(warmRecycleCoversRuntime("legacy", "claude", {}), true);
-  for (const runtime of ["pi", "builtin", "kimi-sdk", "codex", "grok", "opencode"]) {
+  for (const runtime of ["pi", "builtin", "kimi-sdk", "codex", "grok", "opencode", "cursor", "antigravity"]) {
     assert.equal(warmRecycleCoversRuntime("legacy", runtime, { wakeRecycleOar: true }), false, `legacy ${runtime}`);
   }
-  assert.equal(warmRecycleCoversRuntime("oar", "codex", { wakeRecycleOar: true }), true);
-  assert.equal(warmRecycleCoversRuntime("oar", "grok", { wakeRecycleOar: true }), true);
-  assert.equal(warmRecycleCoversRuntime("oar", "codex", {}), false, "no summary facts without wake_recycle_oar");
-  assert.equal(warmRecycleCoversRuntime("oar", "pi", { wakeRecycleOar: true }), false);
-  assert.equal(warmRecycleCoversRuntime("oar", "claude", { wakeRecycleOar: true }), false);
+  // The OAR host: OAR's contextUsage declaration for the session's installation, never the runtime id.
+  const declared = { tokens: true, contextWindow: true };
+  for (const runtime of ["claude", "codex", "grok", "opencode", "cursor", "qwen", "antigravity", "pi"]) {
+    assert.equal(warmRecycleCoversRuntime("oar", runtime, { wakeRecycleOar: true }, declared), true, `oar ${runtime}: declared`);
+    assert.equal(warmRecycleCoversRuntime("oar", runtime, { wakeRecycleOar: true }), false, `oar ${runtime}: unmeasured installation`);
+  }
+  assert.equal(warmRecycleCoversRuntime("oar", "cursor", { wakeRecycleOar: true }, { tokens: true, contextWindow: false }), true, "tokens without a window");
+  assert.equal(warmRecycleCoversRuntime("oar", "qoder", { wakeRecycleOar: true }, { tokens: false, contextWindow: false }), false, "qoder: OAR declares no trustworthy size");
+  assert.equal(warmRecycleCoversRuntime("oar", "dsh", { wakeRecycleOar: true }, declared), false, "dsh: not a runtime RFC 070 enables, so its start would never recycle");
+  assert.equal(warmRecycleCoversRuntime("oar", "codex", {}, declared), false, "no summary facts without wake_recycle_oar");
+  assert.equal(warmRecycleCoversRuntime("oar", "claude", {}, declared), false, "no summary facts without wake_recycle_oar");
 });
 
 test("§6.5 marks: no delivery for the quiet period runs the stop; the stop is kept for exactly one start", () => {

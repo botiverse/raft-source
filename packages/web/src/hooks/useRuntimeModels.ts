@@ -17,7 +17,7 @@ import type {
 } from "@botiverse/raft-shared";
 import api from "../api/client";
 import { useServerStore } from "../store/serverStore";
-import { catalogModelLabel, useModelLabelCatalogStore } from "../store/modelLabelCatalogStore";
+import { catalogModelLabel, refreshModelLabelCatalogAfterLiveDetect } from "../store/modelLabelCatalogStore";
 import { canonicalizeCodexPresentation } from "../utils/codexModelOrder";
 
 export type RuntimeModelSourceState =
@@ -268,9 +268,7 @@ function loadRuntimeModelSource(serverId: string, machineId: string, runtime: st
       // side; refresh our copy so the dropdown never shows the older cached
       // name (Kai's review of #8639). Only when the app already uses the
       // catalog: nothing to align otherwise (and no stray request).
-      if (source.kind === "live" && useModelLabelCatalogStore.getState().byServer[serverId]) {
-        useModelLabelCatalogStore.getState().load(serverId, { force: true });
-      }
+      if (source.kind === "live") refreshModelLabelCatalogAfterLiveDetect(serverId);
       return { source, freshness: parseRuntimeModelFreshness(res.data) };
     })
     .catch((): RuntimeModelLoad => ({ source: { kind: "error", retryable: true }, freshness: FRESH }));

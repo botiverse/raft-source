@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { currentDate, MESSAGE_CARD_CAPABILITIES, type MessageCardCapability } from "@botiverse/raft-shared";
 import {
-  appLinkPreviewResponseSchema, appLinkReadUrls, dropInvalidLinkCardBadgeColors, LINK_CARD_CAPABILITIES, UNREVIEWED_APP_CAPABILITY, linkCardBadgeColorsForCapabilities, linkCardExecuteActions,
-  matchesAppPreview, parseAppLinkPreviewV2, parseAppLinkPreviewV3,
+  appLinkPreviewResponseSchema, appLinkReadUrls, dropInvalidLinkCardBadgeColors, LINK_CARD_CAPABILITIES, LINK_CARD_CHANGED_CAPABILITY, UNREVIEWED_APP_CAPABILITY, linkCardBadgeColorsForCapabilities, linkCardExecuteActions,
+  matchesAppPreview, parseAppLinkPreviewV2, parseAppLinkPreviewV3, takeLinkCardObjectRef,
   linkCardInlineForCapabilities, linkCardInlineToneForCapabilities, linkCardPlacementForCapabilities, publicPreviewUrl, stripLinkCardActions,
   type AppLinkPreviewContent, type AppLinkPreviewItem, type AppLinkPreviewPrompt, type AppLinkPreviewV2Response, type AppLinkPreviewV3Response,
-  type LinkCardActionTier, type LinkCardCapability,
+  type LinkCardActionTier, type LinkCardCapability, type LinkCardObjectKeySha256, type LinkCardObjectRef,
 } from "@botiverse/raft-shared/src/appLinkPreview";
 import { canonicalJsonSha256 } from "../lib/canonicalJson";
 import { parseStrictJson } from "../lib/strictJson";
@@ -24,13 +24,17 @@ import { oidcIssuer, signAppLinkPreviewAssertion } from "./oidcService";
 import { isApprovedOfficialAppClient } from "./officialAppAutoInstallService";
 import { unreviewedActionsBasis } from "./linkCardExecuteEligibility";
 import { recordTraceEvent } from "../tracing/semanticTrace";
+import { linkCardObjectKeySha256, recordLinkCardReaders } from "./linkCardReaders";
 
 // The batched link-card read (RFC 076 §6.1; protocol v3.2.3 §4, addenda 1, 2
 // and 4): `POST /api/messages/:messageId/link-cards/read` reads every preview
 // link of one visible message (at most ten) in one request, each with its own
-// credential and its own App call. It writes nothing: no Postgres row, no
-// Redis key, no proof recheck (that writes last_checked_at; the sweep worker
-// rechecks instead). Tickets and handles are signed, not stored.
+// credential and its own App call. It writes no Postgres row and no proof
+// recheck (that writes last_checked_at; the sweep worker rechecks instead).
+// Tickets and handles are signed, not stored. Its one write: where
+// `link_card_changed_hints` is on, a shown card whose App named its object
+// (`object_ref`) records this viewer as a recent reader of it, in Redis, in
+// the background (linkCardReaders.ts), never failing or delaying the read.
 //
 // A client without card.v2, or an App that did not declare 2 in
 // preview_versions: the version 1 callback, exactly as the GET sends it, and
@@ -126,14 +130,16 @@ export function parseLinkCardReadBody(body: unknown): LinkCardReadRequest | null
  * (RFC 076 §17); never present otherwise.
  */
 export type LinkCardReadApp = { id: string; name: string; icon: string | null; reviewed?: false };
+/** Only for a card whose App named its object, read by a client that declared `card.changed.v1`. */
+type LinkCardObjectKeyField = { object_key_sha256?: LinkCardObjectKeySha256 };
 /** A version 2 answer that shows something: `link` is omitted (F11). */
 export type LinkCardV2Preview = Exclude<AppLinkPreviewV2Response, { display: "link" }>;
 type LinkCardActionHandles = { ticket: LinkCardReadTicket | null; actions: { action_id: string; handle: LinkCardHandle }[] };
 export type LinkCardReadItem =
-  | { url: string; kind: "v1"; app: LinkCardReadApp; preview: AppLinkPreviewContent }
-  | { url: string; kind: "v2"; app: LinkCardReadApp; preview: LinkCardV2Preview } & LinkCardActionHandles
+  | { url: string; kind: "v1"; app: LinkCardReadApp; preview: AppLinkPreviewContent } & LinkCardObjectKeyField
+  | { url: string; kind: "v2"; app: LinkCardReadApp; preview: LinkCardV2Preview } & LinkCardActionHandles & LinkCardObjectKeyField
   /** Only for a client that declared `preview.v3`, whichever version the App answered (RFC 076 §14). */
-  | { url: string; kind: "v3"; app: LinkCardReadApp; preview: AppLinkPreviewV3Response } & LinkCardActionHandles
+  | { url: string; kind: "v3"; app: LinkCardReadApp; preview: AppLinkPreviewV3Response } & LinkCardActionHandles & LinkCardObjectKeyField
   | { url: string; kind: "rate_limited"; retry_after: number };
 export type LinkCardReadResult = { items: LinkCardReadItem[]; prompts: AppLinkPreviewPrompt[] };
 
@@ -186,8 +192,8 @@ export function linkCardActionTier(input: { official: boolean; unreviewed: boole
 
 type Plan = { url: string; entry: RegisteredApp };
 /** The answer to a version 2 callback (version 2 or 3) that shows something, as version 3 items (never `[]`). */
-type V2Shown = { version: "v2"; plan: Plan; items: AppLinkPreviewItem[] };
-type V1Shown = { version: "v1"; plan: Plan; answer: AppLinkPreviewContent };
+type V2Shown = { version: "v2"; plan: Plan; items: AppLinkPreviewItem[]; objectRef: LinkCardObjectRef | null };
+type V1Shown = { version: "v1"; plan: Plan; answer: AppLinkPreviewContent; objectRef: LinkCardObjectRef | null };
 type Outcome = V1Shown | V2Shown | { version: "omit"; plan: Plan } | { version: "rate_limited"; plan: Plan; retryAfter: number };
 
 async function callPreview(plan: Plan, input: { serverId: string; userId: string; request: LinkCardReadRequest }, v2: boolean): Promise<V1Shown | V2Shown | null> {
@@ -200,8 +206,10 @@ async function callPreview(plan: Plan, input: { serverId: string; userId: string
   const http = previewTransport();
   if (!v2) {
     const result = await http(entry.config.endpoint, JSON.stringify({ version: 1, url, request_id: requestId }), assertion, { response: "preview" });
-    const parsed = appLinkPreviewResponseSchema.safeParse(result);
-    return parsed.success ? { version: "v1", plan, answer: parsed.data } : null;
+    // The App's object_ref is taken out before the strict schema reads the answer.
+    const { answer, objectRef } = takeLinkCardObjectRef(result);
+    const parsed = appLinkPreviewResponseSchema.safeParse(answer);
+    return parsed.success ? { version: "v1", plan, answer: parsed.data, objectRef } : null;
   }
   const body = { version: 2, url, request_id: requestId, client_capabilities: input.request.capabilities, locale: input.request.locale };
   const text = await http(entry.config.endpoint, JSON.stringify(body), assertion, { acceptLanguage: input.request.locale, response: "text" });
@@ -212,7 +220,7 @@ async function callPreview(plan: Plan, input: { serverId: string; userId: string
   if (!answer) return null;
   if (answer.invalidColors) recordBadgeColorsStripped(entry.app.id, answer.invalidColors, "invalid");
   // `[]` (version 2's `link`): the App knows this viewer may not see the object (F11).
-  return answer.items.length ? { version: "v2", plan, items: answer.items } : null;
+  return answer.items.length ? { version: "v2", plan, items: answer.items, objectRef: answer.objectRef } : null;
 }
 
 /**
@@ -241,22 +249,25 @@ const withoutType = <T extends { type: string }>({ type: _type, ...rest }: T) =>
  * answer (`invalidColors` counts them): the schema is strict about colours, as
  * the clients that read Raft's answer are, so an invalid one would otherwise
  * refuse the whole card, and a colour is only cosmetic (RFC 076 §15).
+ *
+ * The App's `object_ref` (version 2 at the top, version 3 on its card item)
+ * is taken out first, the same way (takeLinkCardObjectRef): an invalid one
+ * only loses the label. `objectRef` is kept only when the answer has a card.
  */
-function answerItems(raw: Record<string, unknown>, origin: string): { items: AppLinkPreviewItem[]; invalidColors: number } | null {
-  const { answer: colored, dropped: invalidColors } = dropInvalidLinkCardBadgeColors(raw);
+function answerItems(raw: Record<string, unknown>, origin: string): { items: AppLinkPreviewItem[]; invalidColors: number; objectRef: LinkCardObjectRef | null } | null {
+  const taken = takeLinkCardObjectRef(raw);
+  const { answer: colored, dropped: invalidColors } = dropInvalidLinkCardBadgeColors(taken.answer as Record<string, unknown>);
+  const shown = (items: AppLinkPreviewItem[]) => ({ items, invalidColors, objectRef: itemOf(items, "card") ? taken.objectRef : null });
   if (colored.version === 3) {
     const items = parseAppLinkPreviewV3(colored, origin)?.items;
-    return items ? { items, invalidColors } : null;
+    return items ? shown(items) : null;
   }
   const answer = parseAppLinkPreviewV2(colored, origin);
   if (!answer) return null;
-  if (answer.display === "link") return { items: [], invalidColors };
-  if (answer.display === "connect_account") return { items: [{ type: "connect_account", connect_url: answer.connect_url }], invalidColors };
+  if (answer.display === "link") return shown([]);
+  if (answer.display === "connect_account") return shown([{ type: "connect_account", connect_url: answer.connect_url }]);
   const { title, card_revision, business_revision, card, inline, placement } = answer;
-  return {
-    items: [...(inline ? [{ type: "inline" as const, ...inline }] : []), { type: "card", placement: placement ?? "hover", title, card_revision, business_revision, card }],
-    invalidColors,
-  };
+  return shown([...(inline ? [{ type: "inline" as const, ...inline }] : []), { type: "card", placement: placement ?? "hover", title, card_revision, business_revision, card }]);
 }
 
 /**
@@ -297,11 +308,12 @@ async function runPooled<T, R>(items: readonly T[], limit: number, run: (item: T
  * only how or where the answer is drawn, never what a viewer may execute (RFC
  * 076 §6.6, Tenny 0cd01252): `block.v1` moves the card (§13), `preview.v3`
  * changes the answer's version (§14), `badge.color.v1` keeps a card Badge's
- * colour (§15). The App still gets them in `client_capabilities`, but a view's ticket
+ * colour (§15), `card.changed.v1` adds the card's object key (only a digest
+ * to match nudges with). The App still gets them in `client_capabilities`, but a view's ticket
  * and handles are the same with and without them, so the block card and the
  * chip's popover, or a version 2 and a version 3 read, are one view's chain.
  */
-const UNBOUND_CAPABILITIES: ReadonlySet<LinkCardCapability> = new Set(["block.v1", "preview.v3", "badge.color.v1"]);
+const UNBOUND_CAPABILITIES: ReadonlySet<LinkCardCapability> = new Set(["block.v1", "preview.v3", "badge.color.v1", LINK_CARD_CHANGED_CAPABILITY]);
 const boundCapabilities = (capabilities: readonly LinkCardCapability[]) => capabilities.filter((capability) => !UNBOUND_CAPABILITIES.has(capability));
 const capabilitySet = (values: readonly string[]) => [...new Set(values)].sort().join(" ");
 const sameBinding = (a: LinkCardViewBinding, b: LinkCardViewBinding) =>
@@ -429,13 +441,23 @@ export async function readLinkCards(input: {
     tiers.set(app.id, linkCardActionTier({ official, unreviewed: acts, actionEndpoint: now.config.actionEndpoint, suspended: now.config.suspendedAt !== null }));
   }
   const messageContentSha256 = linkCardMessageContentSha256(input.content);
+  // Cards whose App named their object: the client that declared
+  // card.changed.v1 gets each one's key, and the viewer is recorded as a
+  // recent reader of all of them (in the background; never fails the read).
+  const readObjects: LinkCardObjectKeySha256[] = [];
+  const objectKeyOf = (outcome: V1Shown | V2Shown): LinkCardObjectKeyField => {
+    if (!outcome.objectRef) return {};
+    const objectKey = linkCardObjectKeySha256(outcome.plan.entry.app.id, outcome.objectRef);
+    readObjects.push(objectKey);
+    return input.request.capabilities.includes(LINK_CARD_CHANGED_CAPABILITY) ? { object_key_sha256: objectKey } : {};
+  };
   const items = outcomes.flatMap((outcome): LinkCardReadItem[] => {
     const { url, entry } = outcome.plan;
     if (outcome.version === "rate_limited") return [{ url, kind: "rate_limited", retry_after: outcome.retryAfter }];
     if (outcome.version === "omit" || !stillValid(entry)) return [];
     // The icon is the one Raft stores for the App, never a URL from the answer.
     const app: LinkCardReadApp = { id: entry.app.id, name: entry.app.name, icon: entry.app.icon };
-    if (outcome.version === "v1") return [{ url, kind: "v1", app, preview: outcome.answer }];
+    if (outcome.version === "v1") return [{ url, kind: "v1", app, preview: outcome.answer, ...objectKeyOf(outcome) }];
     if (unreviewed.has(entry.app.id)) app.reviewed = false;
     try {
       const { capabilities } = input.request;
@@ -461,11 +483,12 @@ export async function readLinkCards(input: {
       if (capabilities.includes("preview.v3")) {
         // Every item; besides the colours above, only the inline badge's tone depends on the client (inline.tone.v2).
         const preview = { version: 3 as const, items: items.map((item) => item.type === "inline" ? linkCardInlineToneForCapabilities(item, capabilities) : item) };
-        return [{ url, kind: "v3", app, preview, ...tokens }];
+        return [{ url, kind: "v3", app, preview, ...tokens, ...objectKeyOf(outcome) }];
       }
       const preview = v2Preview(items, capabilities);
-      return preview ? [{ url, kind: "v2", app, preview, ...tokens }] : [];
+      return preview ? [{ url, kind: "v2", app, preview, ...tokens, ...objectKeyOf(outcome) }] : [];
     } catch { return []; }
   });
+  recordLinkCardReaders({ serverId: input.serverId, viewerId: input.userId, objectKeys: readObjects });
   return { items, prompts };
 }

@@ -1132,10 +1132,12 @@ export async function buildConstructedPanel(args: {
   recentMessagesMax?: number;
   /** A warm recycle (§6.5): add the last notes and open todos, and a longer action tail. */
   warm?: boolean;
+  /** #proj-runtime:#80: allow short sessions (<5 tool actions) to still render messages/notes/todos, matching `buildConstructedPanelFromSummary`. */
+  allowShortSession?: boolean;
 }): Promise<AxSurfaceText | null> {
   const budget = args.budgetTokens ?? DEFAULT_PANEL_BUDGET_TOKENS;
   const actions = await parseTranscriptActions(args.transcriptPath);
-  if (actions.length < 5) return null;
+  if (!args.allowShortSession && actions.length < 5) return null;
   const recentMessagesMax = args.recentMessagesMax ?? RECENT_MESSAGES_DEFAULT;
   const messages = recentMessagesMax > 0
     ? await collectRecentMessages(args.transcriptPath, recentMessagesMax)
@@ -1200,14 +1202,17 @@ export async function buildConstructedPanel(args: {
     const atMs = Date.parse(at);
     return !Number.isFinite(atMs) || lastTsMs - atMs <= OBJECT_IN_PLAY_WINDOW_MS;
   };
+  const notes = state.notes.filter((note) => inWindow(note.at));
+  const todos = state.todos && inWindow(state.todos.at) ? state.todos : null;
+  if (messages.length === 0 && actions.length === 0 && notes.length === 0 && !todos) return null;
   return formatConstructedPanel({
     messages,
     objects,
     tail: actions.slice(-WARM_RECENT_ACTIONS).map(maskedAction),
     totalActions: actions.length,
     budgetTokens: budget,
-    notes: state.notes.filter((note) => inWindow(note.at)),
-    todos: state.todos && inWindow(state.todos.at) ? state.todos : null,
+    notes,
+    todos,
     actionLineMaxChars: WARM_ACTION_LINE_MAX_CHARS,
     warm: true,
   });

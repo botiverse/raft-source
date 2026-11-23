@@ -17,7 +17,7 @@
     "typecheck:tsc": "tsc --noEmit"
   },
   "dependencies": {
-    "@botiverse/porthole": "0.16.0",
+    "@botiverse/porthole": "0.17.2",
     "@botiverse/raft-shared": "workspace:*",
     "marked": "^16.1.1",
     "pdfjs-dist": "6.4.299"

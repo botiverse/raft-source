@@ -64,7 +64,7 @@ test("⭐ a recommended App takes its endpoint and sign-in from Raft, and the re
   const view = await create({ kind: "template", templateKey: "notion" });
   assert.equal(view.server.endpointUrl, "https://mcp.notion.com/mcp");
   assert.equal(view.server.authKind, "oauth");
-  assert.deepEqual(view.source, { kind: "template", templateKey: "notion", maintainedByRaft: true });
+  assert.deepEqual(view.source, { kind: "template", templateKey: "notion", maintainedByRaft: true, publisherName: "Notion" });
   assert.deepEqual(view.connections, [], "an App starts with no Connection");
   const [row] = await appRows(f.server.id);
   assert.equal(row.provider, "notion", "older binaries still recognise it");
@@ -94,7 +94,7 @@ test("⭐ a URL App is probed server-side: unreachable writes nothing, auth-less
   assert.deepEqual(view.server.tools, [{ name: "search" }]);
   assert.deepEqual(view.server.serverInfo, { protocolVersion: "2025-06-18", name: "Stub" });
   assert.equal(view.profile.category, "Developer Tools");
-  assert.deepEqual(view.source, { kind: "url", templateKey: null, maintainedByRaft: false });
+  assert.deepEqual(view.source, { kind: "url", templateKey: null, maintainedByRaft: false, publisherName: null });
 
   const oauth = await createMcpApp({
     serverId: f.server.id, userId: f.owner.id, source: { kind: "url", endpointUrl: "https://other.example.test/mcp" }, profile: { name: "Signed" },
@@ -175,7 +175,7 @@ test("⭐ moving a URL App to another origin clears every Connection's secrets; 
   assert.deepEqual(after.toolCatalog, []);
 });
 
-test("the App list says which MCP Apps are maintained by Raft, including rows older than MCP Apps", async () => {
+test("the App list says which MCP Apps are maintained by Raft and who publishes them, including rows older than MCP Apps", async () => {
   const f = await seed();
   await createMcpApp({ serverId: f.server.id, userId: f.owner.id, source: { kind: "template", templateKey: "linear" }, profile: { name: "Linear" } });
   await createMcpApp({
@@ -185,12 +185,69 @@ test("the App list says which MCP Apps are maintained by Raft, including rows ol
   await getDb().insert(managedMcpServers).values({
     serverId: f.server.id, name: "Old Notion", provider: "notion", endpointUrl: "https://mcp.notion.com/mcp", authMode: "oauth", createdByUserId: f.owner.id,
   });
-  const sources = Object.fromEntries((await listMcpApps(f.server.id)).map((app) => [app.name, app.source]));
-  assert.deepEqual(sources, {
-    Keyed: { kind: "url", templateKey: null, maintainedByRaft: false },
-    Linear: { kind: "template", templateKey: "linear", maintainedByRaft: true },
-    "Old Notion": { kind: "template", templateKey: "notion", maintainedByRaft: true },
+  // A retired template still names its publisher; an unknown key or a template without one names none.
+  await getDb().update(mcpAppTemplates).set({ status: "retired" }).where(eq(mcpAppTemplates.key, "notion"));
+  await getDb().insert(managedMcpServers).values({
+    serverId: f.server.id, name: "Gone", provider: "custom", sourceKind: "template", templateKey: "no-such-template",
+    endpointUrl: "https://gone.example.test/mcp", authMode: "oauth", createdByUserId: f.owner.id,
   });
+  const sources = Object.fromEntries((await listMcpApps(f.server.id, f.owner.id)).map((app) => [app.name, app.source]));
+  assert.deepEqual(sources, {
+    Gone: { kind: "template", templateKey: "no-such-template", maintainedByRaft: true, publisherName: null },
+    Keyed: { kind: "url", templateKey: null, maintainedByRaft: false, publisherName: null },
+    Linear: { kind: "template", templateKey: "linear", maintainedByRaft: true, publisherName: "Linear" },
+    "Old Notion": { kind: "template", templateKey: "notion", maintainedByRaft: true, publisherName: "Notion" },
+  });
+  await getDb().update(mcpAppTemplates).set({ publisherName: null }).where(eq(mcpAppTemplates.key, "linear"));
+  const linear = (await listMcpApps(f.server.id, f.owner.id)).find((app) => app.name === "Linear");
+  assert.equal(linear?.source.publisherName, null);
+  const [row] = await getDb().select({ id: managedMcpServers.id }).from(managedMcpServers).where(eq(managedMcpServers.name, "Old Notion"));
+  assert.equal((await getMcpAppView(f.server.id, row!.id, f.member.id)).source.publisherName, "Notion", "the detail view resolves it the same way");
+});
+
+test("the App list shows the default Connection's status only to people who manage integrations", async () => {
+  const f = await seed();
+  const create = (name: string, endpointUrl: string) => createMcpApp({
+    serverId: f.server.id, userId: f.owner.id, source: { kind: "url", endpointUrl }, profile: { name }, requiredHeaderNames: ["X-Api-Key"],
+  }, { probe: probeAs({ outcome: "headers" }) });
+  const withDefault = await create("With default", ENDPOINT);
+  const noDefault = await create("No default", "https://other.example.test/mcp");
+  await create("No Connection", "https://third.example.test/mcp");
+  const connection = (mcpServerId: string, isServerDefault: boolean, authStatus: "ready" | "needs_auth") => ({
+    serverId: f.server.id, mcpServerId, isServerDefault, name: `C ${randomUUID().slice(0, 4)}`, authKind: "headers" as const, authStatus, headerNames: ["X-Api-Key"],
+  });
+  await getDb().insert(managedMcpCredentials).values([
+    connection(withDefault.id, true, "needs_auth"),
+    connection(withDefault.id, false, "ready"),
+    connection(noDefault.id, false, "ready"),
+  ]);
+  const statuses = async (viewer: string | null) => Object.fromEntries((await listMcpApps(f.server.id, viewer))
+    .map((app) => [app.name, [app.status.connectionCount, app.status.defaultConnectionStatus]]));
+  assert.deepEqual(await statuses(f.owner.id), { "No Connection": [0, null], "No default": [1, null], "With default": [2, "needs_auth"] });
+  assert.deepEqual(await statuses(f.member.id), { "No Connection": [0, null], "No default": [1, null], "With default": [2, null] }, "a member sees no status");
+  assert.deepEqual(await statuses(null), { "No Connection": [0, null], "No default": [1, null], "With default": [2, null] }, "no viewer sees no status");
+  const connectionIds = (await getDb().select({ id: managedMcpCredentials.id }).from(managedMcpCredentials)).map((row) => row.id);
+  const listed = JSON.stringify(await listMcpApps(f.server.id, f.owner.id));
+  assert.equal(connectionIds.some((id) => listed.includes(id)), false, "the list never carries Connection ids");
+});
+
+test("the App view passes on each tool's boolean hints and omits annotations a tool did not declare", async () => {
+  const f = await seed();
+  const view = await createMcpApp({
+    serverId: f.server.id, userId: f.owner.id, source: { kind: "url", endpointUrl: ENDPOINT }, profile: { name: "Docs" },
+  }, { probe: probeAs({ outcome: "ready" }, [{ name: "search", inputSchema: { type: "object" } }]) });
+  await getDb().update(managedMcpServers).set({ toolCatalog: [
+    { name: "search", title: "Search", inputSchema: { type: "object" }, annotations: { readOnlyHint: true, openWorldHint: false } },
+    { name: "delete", inputSchema: { type: "object" }, annotations: { destructiveHint: true, idempotentHint: true, title: "Delete" } as never },
+    { name: "empty", inputSchema: { type: "object" }, annotations: {} },
+    { name: "plain", inputSchema: { type: "object" } },
+  ] }).where(eq(managedMcpServers.id, view.id));
+  assert.deepEqual((await getMcpAppView(f.server.id, view.id, f.member.id)).server.tools, [
+    { name: "search", title: "Search", annotations: { readOnlyHint: true, openWorldHint: false } },
+    { name: "delete", annotations: { destructiveHint: true, idempotentHint: true } },
+    { name: "empty" },
+    { name: "plain" },
+  ]);
 });
 
 test("the App view shows Connections only to people who manage integrations", async () => {
@@ -443,6 +500,7 @@ test("fresh migrated catalog matches the bundled fallback, including the Supabas
     endpointUrl: mcpAppTemplates.endpointUrl,
     authKind: mcpAppTemplates.authKind,
     oauthClientMode: mcpAppTemplates.oauthClientMode,
+    publisherName: mcpAppTemplates.publisherName,
   }).from(mcpAppTemplates);
   assert.deepEqual(migrated.sort((a, b) => a.key.localeCompare(b.key)), bundled);
   // The marketing URL redirects to documentation; redirect-refusing MCP clients need this resource URL.

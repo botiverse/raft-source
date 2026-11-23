@@ -1,31 +1,37 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
-import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
-import { getRuntimeInfo, setClockTimeout } from "@botiverse/raft-shared";
+import { getRuntimeInfo, RECOMMENDED_RUNTIME_IDS, setClockTimeout } from "@botiverse/raft-shared";
 import type { RuntimeInfo, RuntimeSelectionOption } from "@botiverse/raft-shared";
-import { Check, ChevronRight, Copy, KeyRound, Monitor, Terminal, X } from "lucide-react";
+import { Check, Monitor, Terminal, X } from "lucide-react";
 import type { HostedCindyTestEntryFailureCode, ServerSetupRuntimeStatus } from "./serverSetupProjection";
 import { connectionMotionReducer, startConnectionMotion } from "./connectionMotion";
 import { formatRelativeTime } from "../../utils/relativeTime";
 import { compareRuntimeCatalogOrder } from "../../utils/runtimeCatalogOrder";
+import { isLimitedRuntime, runtimeCapabilityHintId } from "../../utils/runtimeCapabilityHint";
+import type { MessageId } from "../../i18n/messages/en";
 import ComputerCommandGuide from "../machine/ComputerCommandGuide";
 import type { CopyTarget } from "../machine/ComputerCommandGuide";
+import { ComputerAccessNotice } from "../machine/ComputerAccessNotice";
 import Banner from "../ui/Banner";
-import SectionEyebrow from "../ui/SectionEyebrow";
-import { Badge, Button, Card, CardDescription, CardHeader, CardTitle, DialogSurface, ScrollArea, Separator, Spinner, Status, TextLink } from "@botiverse/raft-ui";
-import Tooltip from "../ui/Tooltip";
+import { Button, Card, CardDescription, CardHeader, CardTitle, DialogSurface, ScrollArea, Separator, Spinner, Status, TextLink } from "@botiverse/raft-ui";
 import SetupSessionFooter from "./SetupSessionFooter";
+import { RecoveryCommandRow } from "./RecoveryCommandRow";
 import { useLocalComputerHost } from "../machine/localComputer/useLocalComputerHost";
 import UseThisComputerCard from "../machine/localComputer/UseThisComputerCard";
 import { AddThisMac } from "../machine/localComputer/AddThisMac";
 import { InstallOnAnotherComputer } from "../machine/localComputer/InstallOnAnotherComputer";
 import { localComputerOnboardingErrorMessage } from "../machine/localComputer/localComputerCopy";
 import { useServerStore } from "../../store/serverStore";
-import { RUNTIME_INSTALL_COMMANDS } from "../machine/runtimeInstallCommands";
+import { useMachineStore } from "../../store/machineStore";
+import { useRuntimeAuthView } from "../machine/useRuntimeAuthView";
+import { runtimeAuthClient as defaultRuntimeAuthClient } from "../../utils/runtimeAuthClient";
+import type { RuntimeAuthClient } from "../../utils/runtimeAuthClient";
+import { pickSignedInRuntime, runtimeSignInState } from "../../utils/runtimeSignInState";
+import type { RuntimeSignInState } from "../../utils/runtimeSignInState";
+import { OwnApiKeyRow, RuntimeGroupLabel, RuntimeRow } from "./ServerSetupRuntimeRows";
+import { RuntimesNotReportedHint } from "./RuntimesNotReportedHint";
 import { SetupDesktopDownload } from "./SetupDesktopDownload";
 import { useDesktopFirstOffer } from "./useDesktopFirstOffer";
-
-const RECOMMENDED_RUNTIME_IDS = ["claude", "codex"] as const;
 
 export type ServerSetupComputer = {
   id: string;
@@ -39,6 +45,10 @@ export type ServerSetupComputer = {
 export type ServerSetupRuntimeCatalogEntry = RuntimeInfo & {
   detected: boolean;
   recommended: boolean;
+  /** What it lacks in Raft, under its name (runtimeCapabilityHint.ts); none for a recommended or deprecated one. */
+  capabilityHintId: MessageId | null;
+  /** Can't take new messages while working (isLimitedRuntime): a Limited badge after its name. */
+  limited: boolean;
 };
 
 export type ServerSetupComputerRuntimeStepProps = {
@@ -106,6 +116,12 @@ export type ServerSetupComputerRuntimeStepProps = {
   /** In a browser: the Raft Desktop installer link (`download_app`) or "Install with a command" (`install_myself`). */
   onChooseConnectWay?: (way: "download_app" | "install_myself") => void;
   onLeaveSetup?: (way: "switch_server" | "server_settings") => void;
+  /** The server, for the Computer's runtime sign-in read (rows and Sign In). Absent: no sign-in state. */
+  serverId?: string | null;
+  /** Tests only: the runtime-auth client. */
+  runtimeAuthClient?: RuntimeAuthClient;
+  /** Online, runtimes not reported for a while: ask the Computer again (the hint's Check Again). */
+  onRetryRuntimes?: () => void;
 };
 
 /** The server's rows the bundled catalog can name, in the catalog's order. */
@@ -128,6 +144,10 @@ export function getServerSetupRuntimeCatalog(runtimeOptions: readonly RuntimeSel
     ...runtime,
     detected: option.capabilityStatus === "available",
     recommended: RECOMMENDED_RUNTIME_IDS.some((id) => id === runtime.id),
+    capabilityHintId: RECOMMENDED_RUNTIME_IDS.includes(runtime.id) || option.admissionReason === "deprecated"
+      ? null
+      : runtimeCapabilityHintId(runtime.id),
+    limited: option.admissionReason !== "deprecated" && !RECOMMENDED_RUNTIME_IDS.includes(runtime.id) && isLimitedRuntime(runtime.id),
   });
   const recommended = RECOMMENDED_RUNTIME_IDS.flatMap((id) => {
     const entry = visible.find(({ runtime }) => runtime.id === id);
@@ -140,17 +160,25 @@ export function getServerSetupRuntimeCatalog(runtimeOptions: readonly RuntimeSel
   return { recommended, supported };
 }
 
-function getPreferredReadyRuntime(runtimeOptions: readonly RuntimeSelectionOption[]) {
-  return namedRuntimeRows(runtimeOptions).find(({ option }) => option.canSelectInThisContext)?.runtime ?? null;
+/**
+ * The runtime Screen B leads with: of the selectable rows in catalog order, the
+ * first known signed in, else the first not known signed out; null when every
+ * selectable one is signed out (pickSignedInRuntime). A bundled runtime is
+ * always "available" and so selectable, signed in or not (mail #214).
+ */
+function getPreferredReadyRuntime(runtimeOptions: readonly RuntimeSelectionOption[], signInOf: (runtimeId: string) => RuntimeSignInState) {
+  const selectable = namedRuntimeRows(runtimeOptions).filter(({ option }) => option.canSelectInThisContext).map(({ runtime }) => runtime);
+  const id = pickSignedInRuntime(selectable.map((runtime) => runtime.id), signInOf);
+  return { preferred: selectable.find((runtime) => runtime.id === id) ?? null, firstSelectable: selectable[0] ?? null };
 }
 
 // Everything the computer actually found. The log used to name only the first one
 // ("Runtime detected: Claude Code.") on a machine that also had Codex, OpenCode and Pi —
 // it reads as though detection stopped at the first hit.
-function getDetectedRuntimeNames(runtimeOptions: readonly RuntimeSelectionOption[]): string[] {
+function getDetectedRuntimes(runtimeOptions: readonly RuntimeSelectionOption[]): RuntimeInfo[] {
   return namedRuntimeRows(runtimeOptions)
     .filter(({ runtime, option }) => option.capabilityStatus === "available" && runtime.id !== "builtin")
-    .map(({ runtime }) => runtime.displayName);
+    .map(({ runtime }) => runtime);
 }
 
 const NO_OFFLINE_COMPUTERS: NonNullable<ServerSetupComputerRuntimeStepProps["offlineComputers"]> = [];
@@ -183,6 +211,9 @@ export default function ServerSetupComputerRuntimeStep({
   onUseThisComputer,
   onChooseConnectWay,
   onLeaveSetup,
+  serverId = null,
+  runtimeAuthClient = defaultRuntimeAuthClient,
+  onRetryRuntimes,
 }: ServerSetupComputerRuntimeStepProps) {
   const intl = useIntl();
   const { formatMessage } = intl;
@@ -223,8 +254,23 @@ export default function ServerSetupComputerRuntimeStep({
   const connectionMotionPlayedRef = useRef(false);
   const verifyingComputer = !!computer && !computerOnline;
   const catalog = getServerSetupRuntimeCatalog(runtimeOptions);
-  const preferredRuntime = getPreferredReadyRuntime(runtimeOptions);
-  const detectedRuntimeNames = getDetectedRuntimeNames(runtimeOptions);
+  // The Computer's sign-in state per runtime (the same read as the runtime picker's notice).
+  const signInTarget = useMemo(() => (computerOnline && computer && serverId
+    ? { serverId, machineId: computer.id, client: runtimeAuthClient }
+    : null), [computer, computerOnline, runtimeAuthClient, serverId]);
+  const { view: runtimeAuthView } = useRuntimeAuthView(runtimeAuthClient, serverId ?? "", computer?.id ?? "", signInTarget !== null);
+  const signInOf = useCallback((runtimeId: string) => runtimeSignInState(runtimeAuthView, runtimeId), [runtimeAuthView]);
+  const { preferred: preferredRuntime, firstSelectable } = getPreferredReadyRuntime(runtimeOptions, signInOf);
+  // Check Again: ask the Computer to list its runtimes again; the gate re-reads on the change.
+  const rescanRuntimes = useMachineStore((state) => state.rescanRuntimes);
+  const computerId = computer?.id ?? null;
+  const retryRuntimes = useCallback(() => {
+    if (computerId) void rescanRuntimes(computerId, serverId).catch(() => undefined);
+  }, [computerId, rescanRuntimes, serverId]);
+  // A detected runtime the Computer reports signed out says so in the log too (Cat): "Kimi Code (not signed in)".
+  const detectedRuntimeNames = useMemo(() => getDetectedRuntimes(runtimeOptions).map((runtime) => (signInOf(runtime.id) === "signed_out"
+    ? formatMessage({ id: "onboarding.computerRuntime.runtimeNameNotSignedIn" }, { runtime: runtime.displayName })
+    : runtime.displayName)), [formatMessage, runtimeOptions, signInOf]);
   // ONE question, ONE answer — and five possible answers, not two.
   //
   // The server decides; the browser draws. The first pass of this change replaced only
@@ -240,7 +286,10 @@ export default function ServerSetupComputerRuntimeStep({
   // server has issued no verdict, so the screen shows "Detecting runtime…" and nothing
   // else. That absence is the whole point — an un-answered question is not a finding.
   const runtimeAnswered = runtimeStatus === "not_ready" || runtimeStatus === "error";
-  const defaultExpandedRuntimeId = preferredRuntime?.id ?? "claude";
+  // Usable runtimes, every one of them signed out: put the person on Sign In,
+  // the recommended one open, instead of a Next that starts a silent agent.
+  const signInNeeded = ready && !preferredRuntime && firstSelectable !== null;
+  const defaultExpandedRuntimeId = preferredRuntime?.id ?? firstSelectable?.id ?? "claude";
   const activeExpandedRuntimeId = expandedRuntimeId ?? defaultExpandedRuntimeId;
   const runtimeVisible = computerOnline && connectionMotionPhase !== "success";
   // They connected a computer before; it is just not running. Do NOT hand them the install
@@ -250,6 +299,8 @@ export default function ServerSetupComputerRuntimeStep({
   // and onboarding simply never used the answer. Two screens, one fact, two attitudes: the
   // computer page recognised the user, this one asked who they were.
   const recovering = !computerOnline && hasConnectedComputer;
+  // Snapshotted at mount: a fresh connect keeps the notice once online; a return with a connected computer never shows it.
+  const [showAccessNotice] = useState(() => !hasConnectedComputer);
   const desktopFirst = !computerHost && !recovering && desktopOffer.offered;
   const recoveringMany = recovering && offlineComputers.length > 1;
   // The computer has actually answered the runtime question (whatever the answer was),
@@ -261,6 +312,7 @@ export default function ServerSetupComputerRuntimeStep({
   // stays, finished, with these lines (no separate log under it).
   const hostOutcome = useMemo(() => connectProgressLines(formatMessage, {
     showApproval: false, computerName: computer?.name ?? null, computerOnline, waiting: verifyingComputer,
+    // Its Steps have no warning state: the names say "(not signed in)", the mark stays the check.
     runtimeReady: ready, runtimeNames: detectedRuntimeNames, runtimesReported,
   }), [computer?.name, computerOnline, detectedRuntimeNames, formatMessage, ready, runtimesReported, verifyingComputer]);
   const recoveryComputers = useMemo(() => (offlineComputers.length > 0
@@ -324,9 +376,16 @@ export default function ServerSetupComputerRuntimeStep({
         </p>
       </header>
 
-      {/* The body scrolls between header and footer from md, in a raft-ui ScrollArea; below
-          md it keeps its content's height (no shrink) and the dialog grows with it. */}
-      <ScrollArea className="max-md:shrink-0 md:min-h-0 md:flex-1" contentClassName="stack-y-3 px-5 py-4 sm:px-9">
+      {/* The body scrolls between header and footer, in a raft-ui ScrollArea, wherever the
+          step has a fixed height: from md, and in the phone's sheet (data-narrow=sheet, 90dvh,
+          clipped), where a body that kept its content's height left everything under the fold,
+          footer included, out of reach. Below md on the dedicated page it keeps its content's
+          height (no shrink) and the page scrolls. */}
+      <ScrollArea
+        className="shrink-0 md:min-h-0 md:flex-1 in-data-[narrow=sheet]:min-h-0 in-data-[narrow=sheet]:flex-1"
+        contentClassName="stack-y-3 px-5 py-4 sm:px-9"
+        data-testid="server-setup-computer-body"
+      >
         {error ? <Banner intent="warning" density="sm">{error}</Banner> : null}
         {/* The cloud attempt failed. Say which thing did NOT happen and what is still true:
             nothing was created, and connecting a computer is untouched. A silent failure
@@ -361,6 +420,7 @@ export default function ServerSetupComputerRuntimeStep({
           data-motion-state={connectionMotionPhase}
           data-testid={computerOnline ? "onboarding-computer-connected" : undefined}
         >
+          {showAccessNotice && !recovering ? <ComputerAccessNotice density="sm" /> : null}
           {/* The SAME component Add Computer uses. Platform-specific shell commands stay in
               the shared builder/guide so onboarding cannot invent a WSL or daemon-only
               Windows path that disagrees with the Computer page. */}
@@ -416,9 +476,20 @@ export default function ServerSetupComputerRuntimeStep({
             runtimeReady={ready}
             runtimeNames={detectedRuntimeNames}
             runtimesReported={runtimesReported}
+            runtimeSignInNeeded={signInNeeded}
           />
           )}
         </div>
+
+        {/* Online, and the runtime list never came: after a while say so, with a way on.
+            Keyed on the wait, so each new wait (offline -> online again) starts its own 15 s. */}
+        <RuntimesNotReportedHint
+          key={computerOnline && !runtimesReported ? "waiting" : "answered"}
+          waiting={computerOnline && !runtimesReported}
+          computerName={computer?.name ?? formatMessage({ id: "onboarding.computerRuntime.yourComputer" })}
+          onCheckAgain={onRetryRuntimes ?? retryRuntimes}
+          onStartOver={canReset ? onStartOver : undefined}
+        />
 
         {/* No separate "Detect Runtime" step. Runtime detection is not something the
             user does, it is something that happens; the log above ticks it off as it
@@ -431,16 +502,18 @@ export default function ServerSetupComputerRuntimeStep({
             not a finding, it is simply an unanswered question — rendering the box there
             made it appear and vanish again the moment the list landed. The log's
             "Detecting runtime…" spinner is the honest thing to show while we wait. */}
-        {runtimeVisible && !ready && runtimeAnswered ? (
+        {runtimeVisible && ((!ready && runtimeAnswered) || signInNeeded) ? (
         <Card
           variant="inset"
           className={connectionMotionPhase === "handoff" ? "onboarding-runtime-reveal" : undefined}
           data-motion-state={connectionMotionPhase}
         >
           <CardHeader>
-            <CardTitle render={<h2>{formatMessage({ id: "onboarding.computerRuntime.noRuntimeTitle" })}</h2>} className="text-subhead font-bold" />
+            <CardTitle render={<h2>{formatMessage({ id: signInNeeded ? "onboarding.computerRuntime.signInTitle" : "onboarding.computerRuntime.noRuntimeTitle" })}</h2>} className="text-subhead font-bold" />
             <CardDescription render={<p />}>
-              {formatMessage({ id: "onboarding.computerRuntime.noRuntimeBody" })}
+              {signInNeeded
+                ? formatMessage({ id: "onboarding.computerRuntime.signInBody" }, { computer: computer?.name ?? formatMessage({ id: "onboarding.computerRuntime.yourComputer" }), name: formatMessage({ id: "agent.create.cindyName" }) })
+                : formatMessage({ id: "onboarding.computerRuntime.noRuntimeBody" })}
             </CardDescription>
           </CardHeader>
 
@@ -456,6 +529,8 @@ export default function ServerSetupComputerRuntimeStep({
               expanded={activeExpandedRuntimeId === runtime.id}
               onToggle={toggleExpandedRuntime}
               onCopyInstallCommand={onCopyInstallCommand}
+              signIn={signInOf(runtime.id)}
+              signInTarget={signInTarget}
             />
           ))}
 
@@ -470,6 +545,8 @@ export default function ServerSetupComputerRuntimeStep({
               onToggle={toggleExpandedRuntime}
               onCopyInstallCommand={onCopyInstallCommand}
               quiet={!runtime.detected}
+              signIn={signInOf(runtime.id)}
+              signInTarget={signInTarget}
             />
           ))}
           {showOwnApiKey ? (
@@ -532,43 +609,6 @@ export default function ServerSetupComputerRuntimeStep({
  * says so in the same words; onboarding is finally reusing the answer instead of shipping
  * a second opinion.
  */
-function RecoveryCommandRow({
-  command,
-  testId,
-  copied,
-  onCopy,
-}: {
-  command: string;
-  testId: string;
-  copied: string | null;
-  onCopy: (command: string) => void;
-}) {
-  const { formatMessage } = useIntl();
-  const handleCopy = useCallback(() => onCopy(command), [command, onCopy]);
-  return (
-    <div className="flex items-center gap-2">
-      <code
-        className="min-h-10 min-w-0 flex-1 rounded-control border border-line-hairline bg-layer-code px-3 py-2.5 font-mono text-mono-code text-foreground break-all"
-        data-testid={testId}
-      >
-        {command}
-      </code>
-      <Tooltip content={formatMessage({ id: "onboarding.computerRuntime.copyCommand" }, { command })}>
-        <Button
-          type="button"
-          onClick={handleCopy}
-          size="icon-md"
-          variant="outline"
-          className="shrink-0"
-          aria-label={formatMessage({ id: "onboarding.computerRuntime.copyCommand" }, { command })}
-        >
-          {copied === command ? <Check size={14} /> : <Copy size={14} />}
-        </Button>
-      </Tooltip>
-    </div>
-  );
-}
-
 function OfflineComputerRecovery({
   computers,
   serverSlug,
@@ -726,14 +766,16 @@ interface ConnectProgressInput {
   runtimeNames: readonly string[];
   // The computer has answered the runtime question, whatever the answer was.
   runtimesReported?: boolean;
+  /** Detected, and every usable runtime is signed out: the runtime line takes the rows' warning mark. */
+  runtimeSignInNeeded?: boolean;
 }
 
-export type ConnectProgressLine = { key: string; text: string; done: boolean; pending: boolean; failed?: boolean };
+export type ConnectProgressLine = { key: string; text: string; done: boolean; pending: boolean; failed?: boolean; attention?: boolean };
 
 /** What the connect step reports, line by line (the log; on Raft Desktop, Add This Mac's finished state). */
 function connectProgressLines(
   formatMessage: ReturnType<typeof useIntl>["formatMessage"],
-  { showApproval = true, computerName, computerOnline, waiting, runtimeReady, runtimeNames, runtimesReported = false }: ConnectProgressInput,
+  { showApproval = true, computerName, computerOnline, waiting, runtimeReady, runtimeNames, runtimesReported = false, runtimeSignInNeeded = false }: ConnectProgressInput,
 ): ConnectProgressLine[] {
   const lines: ConnectProgressLine[] = [];
   if (showApproval) lines.push(
@@ -791,9 +833,10 @@ function connectProgressLines(
               ? "onboarding.computerRuntime.logNoRuntime"
               : "onboarding.computerRuntime.logDetecting",
           }),
-      done: runtimeReady,
+      done: runtimeReady && !runtimeSignInNeeded,
       pending: !runtimeReady && !detectionFailed,
       failed: detectionFailed,
+      attention: runtimeReady && runtimeSignInNeeded,
     });
   }
   return lines;
@@ -813,7 +856,7 @@ function ConnectProgressLog(props: ConnectProgressInput) {
           key={line.key}
           className="flex items-start gap-2"
           data-line={line.key}
-          data-state={line.done ? "done" : line.failed ? "failed" : line.pending ? "pending" : "idle"}
+          data-state={line.done ? "done" : line.failed ? "failed" : line.attention ? "attention" : line.pending ? "pending" : "idle"}
         >
           <span className="mt-0.5 flex size-4 shrink-0 items-center justify-center" aria-hidden="true">
             {line.done ? (
@@ -824,11 +867,14 @@ function ConnectProgressLog(props: ConnectProgressInput) {
               <span className="flex size-4 items-center justify-center rounded-sticker border-[1.5px] border-sticker-ink bg-warning text-sticker-ink">
                 <X size={10} strokeWidth={3} />
               </span>
+            ) : line.attention ? (
+              // The rows' "not signed in" mark (DS Status, warning).
+              <Status variant="warning" />
             ) : line.pending ? (
               <Spinner size="sm"  aria-label={formatMessage({ id: "common.loadingLabel" })} />
             ) : null}
           </span>
-          <span className={line.done || line.failed ? "font-bold text-foreground" : "text-foreground-muted"}>{line.text}</span>
+          <span className={line.done || line.failed || line.attention ? "font-bold text-foreground" : "text-foreground-muted"}>{line.text}</span>
         </li>
       ))}
     </ol>
@@ -882,161 +928,3 @@ function ConnectComputerInstructions({ platform }: { platform: "mac-linux" | "wi
   );
 }
 
-
-function RuntimeGroupLabel({ children, note }: { children: ReactNode; note?: string }) {
-  return (
-    <div className="px-3.5 pb-1 pt-3">
-      <SectionEyebrow>{children}</SectionEyebrow>
-      {note ? <span className="ml-2 text-caption text-foreground-hint">{note}</span> : null}
-    </div>
-  );
-}
-
-function RuntimeRow({
-  runtime,
-  computerName,
-  expanded,
-  onToggle,
-  onCopyInstallCommand,
-  quiet = false,
-}: {
-  runtime: ServerSetupRuntimeCatalogEntry;
-  computerName: string | null;
-  expanded: boolean;
-  onToggle: (runtimeId: string) => void;
-  onCopyInstallCommand?: (runtimeId: string, command: string) => void;
-  quiet?: boolean;
-}) {
-  const { formatMessage } = useIntl();
-  const command = RUNTIME_INSTALL_COMMANDS[runtime.id];
-  const runtimeId = runtime.id;
-  const handleToggle = useCallback(() => onToggle(runtimeId), [onToggle, runtimeId]);
-  // Says so where the click happened, instead of throwing a toast across the screen.
-  const [copied, setCopied] = useState(false);
-  const handleCopyInstallCommand = useCallback(() => {
-    if (!command || !onCopyInstallCommand) return;
-    onCopyInstallCommand(runtimeId, command);
-    setCopied(true);
-    setClockTimeout(() => setCopied(false), 2_000);
-  }, [command, onCopyInstallCommand, runtimeId]);
-  return (
-    <>
-    <Separator />
-    <div className={expanded ? "bg-info-soft" : ""}>
-      <button
-        type="button"
-        className={`flex min-h-11 w-full items-center gap-2.5 px-3.5 py-2 text-left outline-none hover:bg-fill-subtle focus-visible:shadow-[inset_0_0_0_2px_var(--foreground)] ${quiet ? "text-foreground-hint" : "text-foreground"}`}
-        aria-expanded={expanded}
-        onClick={handleToggle}
-      >
-        <span className={`flex shrink-0 items-center justify-center bg-fill-muted font-mono text-mono-meta font-bold text-foreground-muted ${runtime.recommended ? "size-[27px] rounded-chip" : "size-6 rounded-sticker"}`}>
-          {runtime.abbreviation}
-        </span>
-        <span className={`min-w-0 flex-1 font-semibold ${runtime.recommended ? "text-callout" : "text-footnote"}`}>
-          {runtime.displayName}
-        </span>
-        {/* DS StatusChip: a soft wash, a square pixel, one word. */}
-        <Badge variant={runtime.detected ? "success" : "muted"} appearance="soft" className="shrink-0">
-          <Status variant={runtime.detected ? "success" : "default"} aria-hidden="true" />
-          {formatMessage({
-            id: runtime.detected
-              ? "onboarding.computerRuntime.detected"
-              : "onboarding.computerRuntime.notDetected",
-          })}
-        </Badge>
-        <ChevronRight size={16} className={`shrink-0 text-foreground-muted transition-transform ${expanded ? "rotate-90" : ""}`} />
-      </button>
-      {expanded ? (
-        <div className="px-3.5 pb-3 pl-12 text-footnote text-foreground-muted">
-          {runtime.detected ? (
-            <p>
-              {/* Was a sentence plus a leading-space fragment concatenated in JSX.
-                  Two whole messages instead: a translation cannot be expected to
-                  produce a trailing clause that happens to start with a space. */}
-              {formatMessage(
-                {
-                  id: runtime.id === "claude"
-                    ? "onboarding.computerRuntime.runtimeFoundBestTested"
-                    : "onboarding.computerRuntime.runtimeFound",
-                },
-                {
-                  computer: computerName ?? formatMessage({ id: "onboarding.computerRuntime.yourComputer" }),
-                  b: (chunks: ReactNode) => <strong key="b" className="text-foreground">{chunks}</strong>,
-                },
-              )}
-            </p>
-          ) : (
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <p>
-                {formatMessage(
-                  { id: "onboarding.computerRuntime.runtimeInstallHint" },
-                  {
-                    runtime: runtime.displayName,
-                    b: (chunks: ReactNode) => <strong key="b" className="text-foreground">{chunks}</strong>,
-                  },
-                )}
-              </p>
-              {command && onCopyInstallCommand ? (
-                <TextLink
-                  onClick={handleCopyInstallCommand}
-                  className="inline-flex items-center gap-1"
-                >
-                  {copied ? <Check size={12} strokeWidth={3} /> : <Copy size={12} />}
-                  {formatMessage({
-                    id: copied
-                      ? "onboarding.computerRuntime.copied"
-                      : "onboarding.computerRuntime.copyInstallCommand",
-                  })}
-                </TextLink>
-              ) : null}
-            </div>
-          )}
-        </div>
-      ) : null}
-    </div>
-    </>
-  );
-}
-
-function OwnApiKeyRow({
-  expanded,
-  onToggle,
-  onOpenSettings,
-}: {
-  expanded: boolean;
-  onToggle: () => void;
-  onOpenSettings?: () => void;
-}) {
-  const { formatMessage } = useIntl();
-  return (
-    <>
-    <Separator />
-    <div className={expanded ? "bg-info-soft" : ""}>
-      <button type="button" className="flex min-h-11 w-full items-center gap-2.5 px-3.5 py-2 text-left text-foreground outline-none hover:bg-fill-subtle focus-visible:shadow-[inset_0_0_0_2px_var(--foreground)]" aria-expanded={expanded} onClick={onToggle}>
-        <span className="flex size-6 shrink-0 items-center justify-center rounded-sticker bg-fill-muted text-foreground-muted">
-          <KeyRound size={14} />
-        </span>
-        <span className="min-w-0 flex-1 text-footnote font-semibold">
-          {formatMessage({ id: "onboarding.computerRuntime.ownApiKey" })}
-        </span>
-        <Badge variant="muted" appearance="soft" className="shrink-0">
-          {formatMessage({ id: "onboarding.computerRuntime.notSet" })}
-        </Badge>
-        <ChevronRight size={16} className={`shrink-0 text-foreground-muted transition-transform ${expanded ? "rotate-90" : ""}`} />
-      </button>
-      {expanded ? (
-        <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 pb-3 pl-12 text-footnote text-foreground-muted">
-          <p>
-            {formatMessage({ id: "onboarding.computerRuntime.ownApiKeyHint" })}
-          </p>
-          {onOpenSettings ? (
-            <TextLink onClick={onOpenSettings}>
-              {formatMessage({ id: "onboarding.computerRuntime.addApiKey" })}
-            </TextLink>
-          ) : null}
-        </div>
-      ) : null}
-    </div>
-    </>
-  );
-}

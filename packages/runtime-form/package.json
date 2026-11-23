@@ -18,6 +18,8 @@
   "scripts": {
     "contract:generate": "node --import @oxc-node/core/register contract/generate.ts",
     "contract:check": "node --import @oxc-node/core/register contract/generate.ts --check",
+    "kitchen-sink:generate": "node --import @oxc-node/core/register kitchen-sink/generate.ts",
+    "kitchen-sink:check": "node --import @oxc-node/core/register kitchen-sink/generate.ts --check",
     "test": "vitest run",
     "typecheck": "tsrs --noEmit",
     "typecheck:tsc": "tsc --noEmit"

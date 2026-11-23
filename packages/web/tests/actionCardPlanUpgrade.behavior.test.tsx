@@ -176,7 +176,9 @@ test("without a gate the card has no note, and its button opens the general upgr
     cardMessageId: messageId,
   });
   await waitFor(() => assert.ok(screen.getByRole("dialog", { name: "Upgrade Acme to Pro" })));
-  assert.ok(screen.getByText("Pro lifts the Free limits on chat history, file uploads and external channels."));
+  assert.ok(screen.getByText("Pro lifts the Free limits on message history, file uploads and external channels."));
+  // The dialog's list doesn't explain external channels (cindyz, #proj-commercial:ba39bee1); Plan & billing does.
+  assert.ok(screen.queryByText(/people outside your server/) === null, "absent");
   assert.ok(screen.getByTestId("upgrade-dialog-checkout"));
 
   // `general` named outright reads the same as no gate.
@@ -185,8 +187,13 @@ test("without a gate the card has no note, and its button opens the general upgr
   assert.deepEqual(notices(named), []);
   assert.deepEqual(upgradeGateCopy(intl.formatMessage, "general", "Acme"), {
     title: "Upgrade Acme to Pro",
-    hint: "Pro lifts the Free limits on chat history, file uploads and external channels.",
+    hint: "Pro lifts the Free limits on message history, file uploads and external channels.",
   });
+  // After a downgrade the dialog names every Free limit, not "Pro features are off".
+  assert.equal(
+    upgradeGateCopy(intl.formatMessage, "plan_downgraded", "Acme").hint,
+    "Acme is on Free now: messages older than 30 days are hidden, file uploads are limited to 100\u00a0MB a month and 50\u00a0MB per file, it can be in 1 external channel, and agents can't move between computers. Upgrading brings it all back.",
+  );
 });
 
 test("an owner's press opens the upgrade dialog for the card's server, as an agent card, and runs nothing", async () => {

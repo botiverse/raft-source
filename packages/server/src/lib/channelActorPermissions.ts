@@ -212,6 +212,36 @@ export async function resolveChannelActorContextsMany(
   return contexts;
 }
 
+/**
+ * Who manages a joint channel (edits and archives it): a member on the host's
+ * entry who is a host owner/admin (`inherited`) or holds a channel admin
+ * appointment on the host's copy (`appointed`). A stored admin on another
+ * server's copy, or that server's owner/admin role, manages nothing. A joint
+ * roster's `admin` is this rule: an agent's in getChannelMembers, a person's
+ * `isManager` (getComputedJointHumanPublicRowsForScopes, the same in SQL).
+ */
+export function jointAuthorityManagesChannel(
+  authority: { isHostEntry: boolean; inherited: boolean; appointed: boolean },
+): boolean {
+  return authority.isHostEntry && (authority.inherited || authority.appointed);
+}
+
+/**
+ * Whether the actor, in the joint channel this context resolves, manages it
+ * (jointAuthorityManagesChannel: from the host's entry, a host owner/admin
+ * or the host's appointed channel manager) while in it: never a guest, never
+ * on a deleted copy, never one outside the channel. False for a channel that
+ * is not a joint. The rule channelActorHasCapability applies to editing and
+ * archiving a joint channel, asked on its own by what a joint's manager may
+ * do beyond the channel itself (a closed server's Artifact kept there:
+ * platform/visibility closedServerJointObjectManagedBy).
+ */
+export function managesJointChannel(context: ChannelActorContext): boolean {
+  const authority = context.jointAuthority;
+  if (!authority || context.agentLounge || context.serverRole === "guest" || context.channelDeletedAt || !context.canAccessChannel) return false;
+  return jointAuthorityManagesChannel(authority);
+}
+
 export function channelActorHasCapability(
   context: ChannelActorContext,
   capability: ServerCapability,
@@ -232,7 +262,7 @@ export function channelActorHasCapability(
     if (capability === "removeChannelMembers") return isHostEntry ? inherited || appointed : memberTargetType === "agent" && inherited;
     if (capability === "changeChannelMemberRoles") return isHostEntry && inherited;
     if (capability === "editChannelMetadata" || capability === "archiveChannels") {
-      return isHostEntry && (inherited || appointed);
+      return jointAuthorityManagesChannel({ isHostEntry, inherited, appointed });
     }
     // A Guest in a joint channel (P3) manages nothing (guard above). External server invites
     // belong to host owner/admin, never an explicit manager or another entry.

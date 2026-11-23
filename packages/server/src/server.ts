@@ -7,9 +7,15 @@ import { setAppSumoPlanChangeSink } from "./services/appSumoLifecycleService";
 import { startAppSumoReconciliationWorker } from "./services/appSumoReconciliationWorker";
 import { startRaftbenchWorker } from "./raftbench/worker";
 import { runChangeLogMaintenance } from "./services/changeLogMaintenance";
+import { startMaintenanceCycle } from "./services/maintenanceCycle";
 import { sweepRecoveryRequests } from "./services/secondFactor/recovery";
 import { runAccountDeletionCleanup } from "./services/accountDeletion/cleanup";
 import { runClosedServerPurge } from "./services/closedServerPurge";
+import { runDataExportMaintenance } from "./services/dataExport/maintenance";
+import { dataExportTaskRegistry } from "./services/dataExport/runner";
+import { dataExportProducers } from "./services/dataExport/producer";
+import { personalDataExportProducer } from "./services/dataExport/personalProducer";
+import { serverDataExportProducer } from "./services/dataExport/serverProducer";
 import { featureFlagDefaultPolicyStartupLine } from "./services/featureFlagService";
 import { getChannelConversionAudienceCutover, applyChannelConversionAudienceRealtimeCutover } from "./services/channelConversionService";
 import { startChannelConversionWorker } from "./services/channelConversionWorker";
@@ -31,6 +37,8 @@ import { createApp } from "./app";
 import { countSocketClients, setupSocket } from "./socket/index";
 import { setupMachineWebSocket } from "./routes/daemon";
 import { AgentOrchestrator } from "./services/agentOrchestrator";
+import { assertAgentSecretKeyConfigured } from "./services/agentSecretCrypto";
+import { refreshReplicaAgentConfigSealMode, startReplicaAgentConfigSealModeSync } from "./services/agentSecretFlags";
 import { startOnboardingBriefingOnActivation } from "./services/onboardingBriefingOnActivation";
 import { registerHostedCindyTriggers, startHostedCindyRecapWorker } from "./services/hostedCindyService";
 import { startHostedRuntimeDailySpendWorker } from "./services/hostedRuntimeDailySpend";
@@ -39,6 +47,7 @@ import { triggerOwnerOnboardingOnAgentActivation } from "./services/onboardingSe
 import { startOnboardingHeldWakeRelease } from "./services/onboardingHeldWakes";
 import { setIO as setBillingIO, cleanupWebhookEvents } from "./services/billingService";
 import { setActivityRealtimeIO } from "./services/activityRealtime";
+import { setObjectWatchRealtimeIO } from "./services/objectWatchRealtime";
 import { setListChangedRealtimeIO } from "./services/listChangedRealtime";
 import { setProductFeedbackUnreadRealtimeIO } from "./services/productFeedbackUnreadRealtime";
 import { startProductFeedbackUnreadReconcileWorker } from "./services/productFeedbackUnreadReconcile";
@@ -65,6 +74,7 @@ import { sweepExpiredSsoTransactions } from "./services/sso/ssoTransactions";
 import { sweepExpiredSamlAssertions } from "./services/sso/ssoSaml";
 import { assertRequiredSystemAppDeliveryGuards } from "./services/systemAppDeliveryGuards";
 import { logProductFeedbackTriageNoticeConfig, setProductFeedbackTriageNoticeDeliverer } from "./services/productFeedbackTriageNotice";
+import { setAgentFocusCapabilityReader } from "./services/agentFocusAuto";
 import { getCdnStorage, getStorage, setStorageTracer } from "./services/storageService";
 import { reportOpsCpuProfileStartup } from "./routes/opsCpuProfile";
 import {
@@ -124,6 +134,7 @@ import { startEventLoopDelaySampler } from "./tracing/eventLoopDelay";
 import { startProcessMemorySampler } from "./tracing/processMemory";
 import { startEventLoopStallDetector, trackHttpServer } from "./tracing/eventLoopStall";
 import { startDbLatencyProbe } from "./db/latencyProbe";
+import { startPgActivityMonitor } from "./db/pgActivityMonitor";
 import { startReplicationSlotMonitor } from "./db/replicationSlotMonitor";
 import { warmupServerWorkerPool } from "./services/workerPool/serverWorkerPool";
 import { setReplicaRouterTracer } from "./replicaRouter";
@@ -144,7 +155,7 @@ import { DEFAULT_DRAIN_CLOSE_SPREAD_MS, spreadClosesForDrain } from "./services/
 import { sharedSseStreamRegistry } from "./services/sseStreamRegistry";
 import { markDraining, setDrainRefusalSink } from "./services/drainState";
 import { isRisingWaveConfigured } from "./db/risingwave";
-import { warmContractSchemas } from "@botiverse/raft-shared";
+import { DAEMON_CAPABILITY_AGENT_FOCUS_V1, warmContractSchemas } from "@botiverse/raft-shared";
 
 
 const PORT = Number(process.env.PORT) || 3001;
@@ -168,6 +179,15 @@ if (!process.env.JWT_SECRET) {
 // since an RP ID cannot change once passkeys are registered under it.
 try {
   readWebauthnRelyingParty();
+} catch (err) {
+  console.error(err instanceof Error ? err.message : err);
+  process.exit(1);
+}
+
+// Customer agent secrets at rest (#proj-runtime:#79): production and staging
+// fail fast if SLOCK_PROVIDER_CREDENTIAL_KEY is missing or malformed.
+try {
+  assertAgentSecretKeyConfigured();
 } catch (err) {
   console.error(err instanceof Error ? err.message : err);
   process.exit(1);
@@ -222,6 +242,12 @@ async function bootstrap() {
   // Initialize PostgreSQL database
   await initDatabase(DATABASE_URL!, DATABASE_URL_READ_REPLICA);
   console.log("[Slock] Database connected");
+
+  // Seed the cross-replica agent-config seal flag before serving traffic so new
+  // replicas never send unsealed frames under `strict`, then refresh in the
+  // background so cross-replica frame hops stay synchronous and ordered (#proj-runtime:#79).
+  await refreshReplicaAgentConfigSealMode();
+  const stopReplicaSealModeSync = startReplicaAgentConfigSealModeSync();
 
   // Initialize Redis (optional — enables multi-replica support)
   const REDIS_URL = process.env.REDIS_URL;
@@ -347,6 +373,8 @@ async function bootstrap() {
   // Setup Agent Orchestrator
   const agentOrchestrator = new AgentOrchestrator(undefined, undefined, serverTracer.tracer);
   app.set("agentOrchestrator", agentOrchestrator);
+  // Focus: a claim focuses the task for the claimer only when its Computer reads the Focus tag.
+  setAgentFocusCapabilityReader((machineId) => agentOrchestrator.machineAdvertisesCapability(machineId, DAEMON_CAPABILITY_AGENT_FOCUS_V1));
   setProductFeedbackTriageNoticeDeliverer(agentOrchestrator);
   logProductFeedbackTriageNoticeConfig();
 
@@ -420,6 +448,7 @@ async function bootstrap() {
     io.to(`server:${serverId}`).emit("server:plan-updated", { serverId, plan });
   });
   setActivityRealtimeIO(io);
+  setObjectWatchRealtimeIO(io);
   setListChangedRealtimeIO(io);
   setProductFeedbackUnreadRealtimeIO(io);
   // A marketplace review decision's side effects (marketplace_review_outbox), sent by the worker below.
@@ -450,7 +479,6 @@ async function bootstrap() {
   const onboardingFunnelWorker = startOnboardingFunnelWorker({ tracer: serverTracer.tracer });
 
   // Hourly maintenance — downgrade enforcement + webhook event cleanup
-  const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
   const runMaintenance = () => {
     runBackgroundWork(
       "server.background.maintenance",
@@ -689,6 +717,16 @@ async function bootstrap() {
     ).catch((err) => {
       console.error("[Slock] Account deletion cleanup failed:", serializeErrorForLog(err));
     });
+    // Data exports (services/dataExport/maintenance.ts): expire ready archives
+    // past 7 days, fail stuck jobs, delete what ended jobs left in storage, and
+    // abort multipart uploads under data-exports/ that no running job owns.
+    runBackgroundWork(
+      "server.background.maintenance",
+      { site: "data_export_maintenance" },
+      () => runDataExportMaintenance(),
+    ).catch((err) => {
+      console.error("[Slock] Data export maintenance failed:", serializeErrorForLog(err));
+    });
     // Closed servers past 30 days, behind the closed_server_purge flag: a
     // server with the variant `delete` is purged (on the primary, under a
     // lease, within the run's guards: services/closedServerPurgeDelete.ts);
@@ -704,8 +742,10 @@ async function bootstrap() {
       console.error("[Slock] Closed server purge failed:", serializeErrorForLog(err));
     });
   };
-  setTimeout(runMaintenance, 10_000); // Run once 10s after startup
-  setInterval(runMaintenance, MAINTENANCE_INTERVAL_MS);
+  // One replica runs each cycle, about once an hour, at a random point
+  // (services/maintenanceCycle.ts, #proj-deploy:#14); before, every replica
+  // ran all of it at start and then hourly from its own start.
+  startMaintenanceCycle({ run: runMaintenance, tracer: serverTracer.tracer });
 
   const stopAttachmentUploadSessionCleanup = attachmentUploadSessionService
     ? startAttachmentUploadSessionCleanup(attachmentUploadSessionService, serverTracer.tracer)
@@ -808,6 +848,10 @@ async function bootstrap() {
   const jointHostSideArchiveRecovery = startDurableTaskRecovery({ registry: jointHostSideArchiveRegistry, tracer: serverTracer.tracer, enabled: true });
   // Retired server-admin notices: queued rows are drained (completed, nothing sent), always, as above.
   const serverAdminNoticeRecovery = startDurableTaskRecovery({ registry: serverAdminNoticeRegistry, tracer: serverTracer.tracer, enabled: true });
+  // The data export kinds this process writes (docs/development/data-export.md); still behind data_export_v0.
+  dataExportProducers.register(personalDataExportProducer).register(serverDataExportProducer);
+  // Data exports whose inline run was lost (services/dataExport/runner.ts): always, as above.
+  const dataExportRecovery = startDurableTaskRecovery({ registry: dataExportTaskRegistry, tracer: serverTracer.tracer, enabled: true });
   const conversionWorker = startChannelConversionWorker(async job => {
     applyChannelConversionAudienceRealtimeCutover(io, await getChannelConversionAudienceCutover(job.id));
     if (job.status === "done" || job.status === "canceled" || job.status === "failed") await emitChannelConversionCompletion(io, job.id, job.sourceChannelId);
@@ -850,6 +894,7 @@ async function bootstrap() {
     startEventLoopStallDetector(serverTracer.tracer);
     startDbLatencyProbe(serverTracer.tracer);
     startReplicationSlotMonitor();
+    startPgActivityMonitor();
     // Pre-warm one preview worker so the first xlsx preview request does not
     // pay the spawn+compile cost. Fire-and-forget: warmup failure must never
     // take startup down.
@@ -921,6 +966,7 @@ async function bootstrap() {
     jointDepartureRecovery.stop();
     jointHostSideArchiveRecovery.stop();
     serverAdminNoticeRecovery.stop();
+    dataExportRecovery.stop();
     channelMembershipRoleOutboxWorker.stop();
     marketplaceReviewOutboxWorker.stop();
     // Stops claiming now; shutdown waits (bounded) for the provider call in flight.
@@ -1095,6 +1141,7 @@ async function bootstrap() {
     // until the deadline.
     beginGoingAway("signal", "sigterm");
     // Already stopped at drain start on the ECS path; this returns the same promise.
+    stopReplicaSealModeSync();
     const provisionWorkerStopped = stopBackgroundWorkers();
     // Leaves the same 5 s before the exit deadline as the SIGTERM spread,
     // for the close below and the Redis shutdown after it.

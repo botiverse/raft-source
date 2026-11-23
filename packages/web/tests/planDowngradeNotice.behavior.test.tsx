@@ -88,7 +88,7 @@ test("an owner is told what Free took away and offered the upgrade", () => {
   assert.ok(entry);
   assert.equal(entry.kind, "warning");
   assert.equal(entry.title, "Lumen Studio is on Free now");
-  assert.equal(text(entry.body), "Messages over 30 days old are hidden. Pro features are off.");
+  assert.equal(text(entry.body), "Messages over 30 days old are hidden, and Free limits apply again.");
   assert.equal(entry.action?.label, "Upgrade");
 });
 
@@ -106,7 +106,7 @@ test("admins, members and guests see the same notice without an Upgrade button",
 
     assert.ok(entry, role);
     assert.equal(entry.title, "Lumen Studio is on Free now");
-    assert.equal(text(entry.body), "Messages over 30 days old are hidden. Pro features are off.", role);
+    assert.equal(text(entry.body), "Messages over 30 days old are hidden, and Free limits apply again.", role);
     assert.equal(entry.action, undefined, role);
     cleanup();
   }
@@ -163,7 +163,7 @@ test("the notice follows the app locale", () => {
   const entry = downgradeNotice(makeServer("member"), "zh-cn");
 
   assert.ok(entry);
-  assert.equal(text(entry.body), "30 天前的消息看不到了，Pro 功能也关了。");
+  assert.equal(text(entry.body), "30 天前的消息看不到了，免费版的各项限制也恢复了。");
 });
 
 test("Plan & Billing shows the same sentence, the upgrade half only to an owner", () => {
@@ -174,7 +174,7 @@ test("Plan & Billing shows the same sentence, the upgrade half only to an owner"
     </TestIntlProvider>,
   );
   assert.match(owner.container.textContent ?? "", /^Lumen Studio is on Free now/);
-  assert.match(owner.container.textContent ?? "", /Messages over 30 days old are hidden\. Pro features are off\. Upgrade to bring them back\.$/);
+  assert.match(owner.container.textContent ?? "", /Messages over 30 days old are hidden, and Free limits apply again\. Upgrade to lift them\.On Free, file uploads are limited to 100 MB a month and 50 MB per file, the server can be in 1 external channel, and agents can't move between computers\.$/);
   cleanup();
 
   const admin = render(
@@ -182,7 +182,7 @@ test("Plan & Billing shows the same sentence, the upgrade half only to an owner"
       <DowngradeWarningCard server={makeServer("admin")} canManageBilling={false} />
     </TestIntlProvider>,
   );
-  assert.match(admin.container.textContent ?? "", /Pro features are off\.$/);
+  assert.match(admin.container.textContent ?? "", /Free limits apply again\.On Free, file uploads are limited to 100 MB a month and 50 MB per file, the server can be in 1 external channel, and agents can't move between computers\.$/);
   cleanup();
 
   const later = render(

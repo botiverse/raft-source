@@ -115,6 +115,17 @@ test("isRaftAuthorizeUrl: Raft's sign-in for another site, on a Raft host only",
   for (const path of ["/api/oauth/authorize//", "/api//oauth/authorize", "//api/oauth/authorize", "/api/oauth//authorize", "/oidc//api/oauth/authorize", "/oidc/a/api/oauth/authorize//", "/api/oauth/authorizes"]) {
     assert.equal(isRaftAuthorizeUrl(`https://api.raft.test${path}`, raft), false, path);
   }
+  // The consent page under its two older names (App.tsx routes them to it), in either case, with one trailing slash or none.
+  for (const path of [
+    "/login-with-slock/setup", "/Login-With-Slock/Setup/", "/login-with-slock-human/setup", "/LOGIN-WITH-SLOCK-HUMAN/SETUP/",
+    "/login-with-raft/setup", "/LOGIN-WITH-RAFT/SETUP",
+  ]) {
+    assert.equal(isRaftAuthorizeUrl(`https://app.raft.build${path}?client_id=deck&return_to=https%3A%2F%2Fdeck.example%2Fcb`, raft), true, path);
+  }
+  for (const path of ["/login-with-slockx/setup", "/login-with-slock-humans/setup", "/login-with-slack/setup", "/x/login-with-slock/setup"]) {
+    assert.equal(isRaftAuthorizeUrl(`https://app.raft.build${path}`, raft), false, path);
+  }
+  assert.equal(isRaftAuthorizeUrl("https://example.com/login-with-slock/setup?client_id=deck", raft), false, "not a Raft host");
   assert.equal(isRaftAuthorizeUrl("https://app.raft.build/s/x/channel/y", raft), false);
   assert.equal(isRaftAuthorizeUrl("https://example.com/api/oauth/authorize", raft), false);
   assert.equal(isRaftAuthorizeUrl("https://example.com/API/OAuth/Authorize/", raft), false);

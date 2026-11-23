@@ -6,9 +6,10 @@ import { serverMembers, servers } from "../db/schema";
  * Projection-only server-wide setup completion, derived from the durable rows we already have.
  *
  * `server_members.setup_status` records which owner actually ran the flow, but setup is
- * not owed once per owner: one completed owner completes the server for every owner. The
- * onboarding-agent pointer is kept as a compatibility checkpoint for servers whose member
- * rows drifted before that invariant was enforced.
+ * not owed once per owner: one completed owner completes the server for every owner.
+ * Neither onboarding-agent pointer is read: the greeter (`onboarding_agent_id`) is any agent
+ * an admin picks, and servers whose official Cindy was their only completion record were
+ * given owner rows by the migration that split the two (official_onboarding_agent).
  *
  * This is deliberately separate from the reset-safety question. Do not use this projection
  * predicate to authorize destructive reset. Reset keeps its own independently named guard;
@@ -19,11 +20,10 @@ export async function hasServerCompletedSetupForProjection(
   serverId: string,
 ): Promise<boolean> {
   const [server] = await db
-    .select({ onboardingAgentId: servers.onboardingAgentId })
+    .select({ id: servers.id })
     .from(servers)
     .where(and(eq(servers.id, serverId), isNull(servers.deletedAt)));
   if (!server) return false;
-  if (server.onboardingAgentId) return true;
 
   // Do not filter by the member's current role. Completion is monotonic: an owner who
   // completed setup may later be demoted without making the server incomplete again.

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raft.build/contract-cases/activity-row/case.schema.json",
   "title": "Activity row contract case",
-  "description": "One Activity row rule web, the app and the server must agree on: the per-row position rule (a served row plus live messages, answers and reads, and whether the row is re-read) or the unread predicate (does a live message count for this viewer). See README.md in this directory.",
+  "description": "One Activity row rule web, the app and the server must agree on: the per-row position rule (a served row plus live messages, answers and reads, and whether the row is re-read) the unread predicate (does a live message count for this viewer), or how a sync inbox_row change applies to a held row. See README.md in this directory.",
   "type": "object",
   "additionalProperties": false,
   "required": ["formatVersion", "id", "rule", "title", "status", "given", "steps"],
@@ -17,8 +17,8 @@
       "pattern": "^[a-z][a-z0-9_]*$"
     },
     "rule": {
-      "description": "position: the per-row position rule (given.row, steps, expect.row/reread). predicate: the unread predicate (given.viewer/scope/message, no steps, expect.verdict).",
-      "enum": ["position", "predicate"]
+      "description": "position: the per-row position rule (given.row, steps, expect.row/reread). predicate: the unread predicate (given.viewer/scope/message, no steps, expect.verdict). sync_inbox_row: GET /api/sync/changes inbox_row changes on a held row (given.row; an upsert is an `answer` step, a delete a `syncDelete` step; expect.row/reread/removed).",
+      "enum": ["position", "predicate", "sync_inbox_row"]
     },
     "title": { "type": "string", "minLength": 1 },
     "why": { "description": "Why the rule is what it is, in a sentence or two.", "type": "string" },
@@ -75,7 +75,18 @@
       "then": {
         "properties": {
           "given": { "type": "object", "required": ["row"], "properties": { "row": true, "viewer": false, "scope": false, "message": false } },
+          "steps": { "type": "array", "items": { "type": "object", "properties": { "act": { "not": { "const": "syncDelete" } } } } },
+          "checkpoints": { "type": "array", "items": { "type": "object", "properties": { "removed": false } } },
           "expect": { "$ref": "#/$defs/positionExpectation" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "rule": { "const": "sync_inbox_row" } } },
+      "then": {
+        "properties": {
+          "given": { "type": "object", "required": ["row"], "properties": { "row": true, "viewer": false, "scope": false, "message": false } },
+          "expect": { "$ref": "#/$defs/syncExpectation" }
         }
       }
     },
@@ -123,7 +134,8 @@
           "description": "The row's latestActivitySeq (a decimal string): the highest seq this answer counted. null: the server could not pair it with the row's latest message; the row takes no live patches.",
           "anyOf": [{ "$ref": "#/$defs/seq" }, { "type": "null" }]
         },
-        "mentionOnly": { "description": "A mention with nothing else unread; the position is the highest mention seq.", "type": "boolean" }
+        "mentionOnly": { "description": "A mention with nothing else unread; the position is the highest mention seq.", "type": "boolean" },
+        "readSeq": { "description": "Optional: the viewer's read position served with the row (its maxReadSeq). Merged as a read is: the row keeps the higher read seq (a Mark as Unread ceiling still holds).", "$ref": "#/$defs/seq" }
       }
     },
     "given": {
@@ -190,7 +202,8 @@
             "act": { "const": "liveMessage" },
             "seq": { "$ref": "#/$defs/seq" },
             "counts": { "description": "The predicate's verdict. null: cannot be judged (re-read).", "type": ["boolean", "null"] },
-            "mentionsViewer": { "type": "boolean" }
+            "mentionsViewer": { "type": "boolean" },
+            "moves": { "description": "The predicate's moves (absent = true). false: not the row's activity (past a channel or DM mute, no mention of the viewer); the row stays as it is.", "type": "boolean" }
           }
         },
         {
@@ -209,6 +222,24 @@
           "properties": {
             "act": { "const": "read" },
             "seq": { "$ref": "#/$defs/seq" }
+          }
+        },
+        {
+          "description": "The viewer marks the conversation unread (the read cursor moves back): the row's read seq is cleared and kept as a ceiling a later read must pass to raise it again.",
+          "additionalProperties": false,
+          "required": ["act"],
+          "properties": {
+            "act": { "const": "markUnread" }
+          }
+        },
+        {
+          "description": "sync_inbox_row only: a GET /api/sync/changes inbox_row delete arrives. It removes the row when position is null or at or past the row's shown position; below it, the row is kept.",
+          "additionalProperties": false,
+          "required": ["act", "position", "reason"],
+          "properties": {
+            "act": { "const": "syncDelete" },
+            "position": { "anyOf": [{ "$ref": "#/$defs/seq" }, { "type": "null" }] },
+            "reason": { "enum": ["done", "left"] }
           }
         }
       ]
@@ -232,10 +263,16 @@
       "properties": {
         "row": { "$ref": "#/$defs/rowState" },
         "reread": { "description": "Some step since the case started asked to re-read this one row (not which request; never the list).", "type": "boolean" },
+        "removed": { "description": "sync_inbox_row only: the row is no longer held (a syncDelete applied). With true, `row` is not given.", "type": "boolean" },
         "verdict": { "$ref": "#/$defs/verdict" }
       }
     },
     "positionExpectation": {
+      "type": "object",
+      "required": ["reread"],
+      "properties": { "reread": true, "verdict": false, "removed": false }
+    },
+    "syncExpectation": {
       "type": "object",
       "required": ["reread"],
       "properties": { "reread": true, "verdict": false }
@@ -243,16 +280,17 @@
     "predicateExpectation": {
       "type": "object",
       "required": ["verdict"],
-      "properties": { "verdict": true, "row": false, "reread": false }
+      "properties": { "verdict": true, "row": false, "reread": false, "removed": false }
     },
     "verdict": {
       "description": "The unread predicate's answer.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["counts", "mention"],
+      "required": ["counts", "mention", "moves"],
       "properties": {
         "counts": { "description": "One more unread on the row. null: cannot be judged from the event (the row is re-read).", "type": ["boolean", "null"] },
-        "mention": { "description": "It @-mentions the viewer: the row's @ lights.", "type": "boolean" }
+        "mention": { "description": "It @-mentions the viewer: the row's @ lights.", "type": "boolean" },
+        "moves": { "description": "It becomes the row's latest activity (position, preview, order). false only past a channel or DM mute without a mention of the viewer: the server keeps the row at its last message before the mute.", "type": "boolean" }
       }
     },
     "checkpoint": {
@@ -263,7 +301,8 @@
       "properties": {
         "afterStep": { "description": "1-based index into `steps`.", "type": "integer", "minimum": 1 },
         "row": { "$ref": "#/$defs/rowState" },
-        "reread": { "description": "Some step up to this one asked to re-read the row.", "type": "boolean" }
+        "reread": { "description": "Some step up to this one asked to re-read the row.", "type": "boolean" },
+        "removed": { "description": "sync_inbox_row only: the row is no longer held after this step.", "type": "boolean" }
       }
     },
     "decision": {

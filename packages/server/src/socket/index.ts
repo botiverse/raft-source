@@ -9,8 +9,7 @@ import {
   AGENT_ACTIVITY_UNSUBSCRIBE_EVENT,
   agentActivityCapableServerRoom,
   agentActivityRoom,
-  READ_PROGRESS_UNWATCH_EVENT,
-  READ_PROGRESS_WATCH_EVENT,
+  asServerId,
   SOCKET_NOT_SERVER_MEMBER_ERROR,
   SOCKET_SSO_REQUIRED_ERROR,
   socketHandshakeCapabilities,
@@ -36,14 +35,22 @@ import { socketsFailingSso, SSO_SOCKET_RECHECK_MS } from "../services/sso/ssoEnf
 import { isDraining, recordDrainRefusal } from "../services/drainState";
 import { publishLocalChannelUpdate } from "../services/channelRealtimeEvents";
 import { getActorServerRoleInServer } from "../lib/actorPermissions";
-import {
-  registerAgentReadProgressSocketServer,
-  unregisterAgentReadProgressSocketServer,
-  unwatchAgentReadProgress,
-  watchAgentReadProgress,
-} from "../services/agentReadProgressService";
+import { registerThreadFollowerSocketServer, unregisterThreadFollowerSocketServer } from "../services/threadFollowerRealtimeService";
+import { registeredObjectKind } from "../apps/firstPartyApps";
+import { attachObjectWatchHandlers, type ObjectWatchResolver } from "./objectWatch";
 
 const HEARTBEAT_INTERVAL_MS = 15_000;
+
+/**
+ * `object:watch`'s check (socket/objectWatch.ts): the registered kind's own
+ * read rule (AppObjectKind.watch) as the socket's person in its server; a
+ * kind that registered none is never watched.
+ */
+const resolveObjectWatch: ObjectWatchResolver = async (kind, viewer, ref) => {
+  const watch = registeredObjectKind(kind)?.objectKind.watch;
+  if (!watch) return null;
+  return watch({ userId: viewer.userId, serverId: asServerId(viewer.serverId), sessionFamilyId: viewer.sessionFamilyId }, ref);
+};
 const socketHost = hostname();
 
 type SocketHandshakeAuth =
@@ -320,9 +327,9 @@ export function setupSocket(server: http.Server, corsOrigin: string | string[]) 
   }
   // The notification dispatcher's socket transports emit on this server.
   registerNotificationSocketServer(io);
-  // Agent read progress frames go out on it too (agentReadProgressService).
-  registerAgentReadProgressSocketServer(io);
-  server.once("close", () => unregisterAgentReadProgressSocketServer(io));
+  // So does a thread's `thread:followers-updated` when an agent follows it again.
+  registerThreadFollowerSocketServer(io);
+  server.once("close", () => unregisterThreadFollowerSocketServer(io));
 
   // Track only pending transports, not a global epoch or permanent per-user
   // tombstones. An unrelated user's revocation cannot poison this handshake.
@@ -590,15 +597,14 @@ export function setupSocket(server: http.Server, corsOrigin: string | string[]) 
       for (const id of parseAgentActivitySubscriptionIds(body)) socket.leave(agentActivityRoom(id));
     });
 
-    // Agent read progress for the conversations this socket shows
-    // (agentReadProgressService; contract in packages/shared/src/agentReadProgress.ts).
-    socket.on(READ_PROGRESS_WATCH_EVENT, (body: unknown) => {
-      void watchAgentReadProgress(socket, { userId, serverId, body }).catch(() => {});
-    });
+    // An open page's object (an Artifact's viewer): its rooms, after the app's read check (./objectWatch.ts).
+    attachObjectWatchHandlers(socket, { userId, serverId: serverId ?? null, sessionFamilyId: typeof socket.data.familyId === "string" ? socket.data.familyId : null }, resolveObjectWatch);
 
-    socket.on(READ_PROGRESS_UNWATCH_EVENT, (body: unknown) => {
-      unwatchAgentReadProgress(socket, body);
-    });
+    // Agent read progress was removed (agent_read_progress_v0, #raft-feature-flag:#9).
+    // Older web and desktop clients still send these; accept and ignore them.
+    // They never needed an answer: the flag was off, and they ignore one.
+    socket.on("read_progress:watch", () => {});
+    socket.on("read_progress:unwatch", () => {});
 
     attachPresenceActivityHandler(socket, { userId, clientKind });
 

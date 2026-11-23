@@ -1,6 +1,7 @@
 // POST /internal/agent-api/tasks/idle-nudge (#wg-task-v2:#9): the idle task
 // reminder through the agent API, as a Computer asks it with the agent's
-// credential. Flag off it answers `disabled`; on, a task someone assigned to
+// credential. Flag off it answers `disabled`, except a new session's ask,
+// which lists the agent's open tasks (#wg-task-v2:#26); on, a task someone assigned to
 // the agent through the real assign path is listed once with the notice text.
 // The decision rules themselves: services/idleTaskReminderService.*.test.ts.
 import assert from "node:assert/strict";
@@ -9,6 +10,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 
 import { mintAgentCredential } from "../services/agentCredentialService";
+import { agentProgressAtMs } from "../services/agentProgressMarks";
 import { createAgent } from "../services/agentService";
 import { addAgent, addHuman, createChannel } from "../services/channelService";
 import { createServer } from "../services/serverService";
@@ -62,14 +64,21 @@ async function idleNudge(baseUrl: string, apiKey: string, body: unknown) {
   return { status: res.status, body: await res.json() as any };
 }
 
-test("flag off: 200 send false, reason disabled", async ({ app }) => {
+test("flag off: 200 send false, reason disabled; a new session's ask lists the agent's open task", async ({ app }) => {
   const { owner, channel, agent, apiKey } = await setup("idle-off", { flag: false });
   const { tasks: [task] } = await taskService.createTasks(channel.id, "user", owner.id, [{ title: "waiting" }]);
   assert.equal(typeof await taskService.assignTask(task!.id, { type: "agent", id: agent.id }, "user", owner.id), "object");
 
-  const res = await idleNudge(app.baseUrl, apiKey, { freshSession: true });
+  const res = await idleNudge(app.baseUrl, apiKey, {});
   assert.equal(res.status, 200, JSON.stringify(res.body));
   assert.deepEqual(res.body, { send: false, reason: "disabled", items: [], backlog: [], text: "" });
+
+  const fresh = await idleNudge(app.baseUrl, apiKey, { freshSession: true });
+  assert.equal(fresh.status, 200, JSON.stringify(fresh.body));
+  assert.equal(fresh.body.send, true);
+  assert.deepEqual(fresh.body.items.map((item: { taskNumber: number; reason: string }) => [item.taskNumber, item.reason]), [[task!.taskNumber, "new_session"]]);
+  assert.match(fresh.body.text, /waiting — new session/);
+  assert.match(fresh.body.text, /say why in its thread\./);
 });
 
 test("a bad body is refused before anything runs", async ({ app }) => {
@@ -148,4 +157,28 @@ test("a todo with no assignee the agent created: past 8h it passes the response 
     why: "no assignee, you created it (untouched for 9h)",
   }]);
   assert.ok(String(due.body.text).includes("raft task claim"), due.body.text);
+});
+
+test("#proj-runtime:#62: the Computer's idle ask is not the agent's progress; a write the agent makes is", async ({ app }) => {
+  const { owner, channel, agent, apiKey } = await setup("idle-progress", { flag: true });
+  const { tasks: [task] } = await taskService.createTasks(channel.id, "user", owner.id, [{ title: "Open work" }]);
+
+  // Asked by the Computer after every turn end: counted as progress, it
+  // cleared a looping agent's repeated-wake streak each turn.
+  const nudge = await idleNudge(app.baseUrl, apiKey, {});
+  assert.equal(nudge.status, 200, JSON.stringify(nudge.body));
+  assert.equal(await agentProgressAtMs(agent.id), null);
+
+  const before = Date.now();
+  const claim = await fetch(`${app.baseUrl}/internal/agent-api/tasks/claim`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ channel: `#${channel.name}`, task_numbers: [task!.taskNumber] }),
+  });
+  const claimed = await claim.json() as any;
+  assert.ok(claim.ok, `${claim.status} ${JSON.stringify(claimed)}`);
+  // A claim with no success still answers 200: make sure this one wrote.
+  assert.equal(claimed.results?.[0]?.success, true, JSON.stringify(claimed));
+  const marked = await agentProgressAtMs(agent.id);
+  assert.ok(marked !== null && marked >= before, `claim marks progress; got ${marked}`);
 });

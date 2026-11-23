@@ -105,6 +105,11 @@ export function noteChannelOpenResult(channelId: string, error: unknown): void {
     clearChannelUnavailable(channelId);
     return;
   }
+  markChannelUnavailable(channelId);
+}
+
+/** Marks `channelId` unavailable as a denial does: also an id no channel route takes (a link's short id, threadLinkIds). */
+export function markChannelUnavailable(channelId: string): void {
   if (useChannelAccessLossStore.getState().unavailable[channelId]) return;
   useChannelAccessLossStore.setState(({ unavailable }) => ({ unavailable: { ...unavailable, [channelId]: true } }));
 }

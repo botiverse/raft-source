@@ -19,11 +19,13 @@ import { and, asc, desc, eq, gte, isNotNull, lt, ne, or } from "drizzle-orm";
 import {
   AGENT_API_ARTIFACT_TEXT_CONTENT_MAX_BYTES,
   ARTIFACT_INLINE_IMAGE_TYPES,
+  artifactDownloadFileName,
   artifactFileType,
   artifactFramedPagePath,
   asChannelId,
   isArtifactFramedKind,
   isWellFormedArtifactFilePath,
+  type ArtifactCardUnseen,
   type ArtifactFramedKind,
   type ArtifactPresence,
   type ArtifactViewerData,
@@ -43,6 +45,8 @@ import {
   json,
   readableVersion,
   readTextPrefix,
+  keepsOwnStateOn,
+  readsAsOutsider,
   takesPartIn,
   versionFileOf,
   versionSummaries,
@@ -52,7 +56,7 @@ import { versionZipOf, zipBaseName } from "./versionZip";
 import { isFollowing } from "./comments";
 import { contentSubject, contentViewer, signContentFrame } from "./contentWorker";
 import { webOriginOf } from "./origin";
-import { artifactCardFacts, cardAuthorRef, cardsOf } from "./webCards";
+import { artifactCardFacts, cardAuthorRef, cardsOf, viewerUnseenOf } from "./webCards";
 import {
   answerWeb,
   ArtifactWebFailure,
@@ -222,26 +226,31 @@ export function servedContentType(path: string): string {
  * count and home, capabilities, the original home, following, savedFrom,
  * origin) beside the versions, then what needs the shown version (its files,
  * the names, the versions' changed paths) and the read position's move.
+ * The viewer route's answer also says what was new to the reader before
+ * this open moved their read position (`unseenAtOpen`, viewerUnseenOf; null
+ * where they keep no state), and so does `unseen` (the details route's, which
+ * moves nothing); the other routes' answers leave it out.
  */
 export async function viewerDataOf(
   reader: ArtifactWebReader,
   item: ArtifactItemRow,
   requested: number | undefined,
-  opts: { advanceRead?: boolean } = {},
+  opts: { advanceRead?: boolean; unseen?: boolean } = {},
 ): Promise<{ body: ArtifactViewerData; version: ArtifactVersionRow; current: ArtifactVersionRow | null }> {
   const access = accessOf(reader, item);
-  const takesPart = await takesPartIn(readerViewActor(reader), item);
+  // Taking part (comments, follows) and the reader's own state (its read position, which a closed server's kept Artifact keeps too).
+  const [takesPart, ownState] = await Promise.all([takesPartIn(readerViewActor(reader), item), keepsOwnStateOn(readerViewActor(reader), item)]);
   const pinned = requested !== undefined;
   // The one conversation a narrowing may return it to (#75), read beside the rest; used only for one who may move it.
   const mayHaveOriginal = access.inside && item.homeKind !== "conversation" && item.originalHomeChannelId !== null;
   const [shown, facts, [deletes, widens, renames], seenOriginal, following, savedFrom, origin] = await Promise.all([
-    shownWithVersions(reader, item, requested, opts.advanceRead === true && takesPart),
+    shownWithVersions(reader, item, requested, { move: opts.advanceRead === true && ownState, unseen: (opts.advanceRead === true || opts.unseen === true) && ownState }),
     // The card's screenshots by the version asked (null: the current one), read beside the versions.
     artifactCardFacts(reader, [item], [{ item, number: requested ?? null }]),
     // One standing read for the three (rename: rename.ts mayRename's rule; outside its server none, as mayPublish).
     access.inside ? mayManageArtifactActions(readerViewActor(reader), item, ["delete", "widen", "rename"]) : [false, false, false],
     mayHaveOriginal ? shownOriginalHome(readerViewActor(reader), item) : null,
-    takesPart ? isFollowing(item.id, readerActor(reader)) : false,
+    ownState ? isFollowing(item.id, readerActor(reader)) : false,
     savedFromOf(reader, item),
     webOriginOf(reader, item),
   ]);
@@ -268,6 +277,7 @@ export async function viewerDataOf(
     savedFrom,
     origin,
     originalHome: originalHome === null ? null : { conversationId: asChannelId(originalHome) },
+    ...(opts.advanceRead === true || opts.unseen === true ? { unseenAtOpen: shown.unseen } : {}),
   };
   return { body, version, current };
 }
@@ -277,13 +287,14 @@ export async function viewerDataOf(
  * (viewerVersionsOf), then at once its files, the names (the author, the
  * card's, the reader, the publishers: one lookup) and the versions' summaries
  * (publishers as refs, named by the caller), with the read position moved
- * beside them when `advanceRead` and the current version is shown.
+ * beside them when `move` and the current version is shown, and what was new
+ * to the reader before it moved (`unseen`; null unless asked).
  */
-async function shownWithVersions(reader: ArtifactWebReader, item: ArtifactItemRow, requested: number | undefined, advanceRead: boolean) {
+async function shownWithVersions(reader: ArtifactWebReader, item: ArtifactItemRow, requested: number | undefined, read: { move: boolean; unseen: boolean }) {
   const access = accessOf(reader, item);
   const { version, current, versions } = await viewerVersionsOf(reader, item, requested);
   const pinned = requested !== undefined;
-  const [files, actorOf, summaries] = await Promise.all([
+  const [files, actorOf, summaries, unseen] = await Promise.all([
     getDb().select().from(artifactVersionFiles).where(eq(artifactVersionFiles.versionId, version.id)).orderBy(asc(artifactVersionFiles.path)),
     profiler([
       { type: item.createdByType, id: item.createdById },
@@ -293,9 +304,23 @@ async function shownWithVersions(reader: ArtifactWebReader, item: ArtifactItemRo
     ]),
     versionSummaries(item, versions, (publisher) => publisher, access.historyLimited, access.historyLimited ? undefined : versions),
     // Opening the current version is looking at everything up to now (as an agent's read); presence reads it.
-    advanceRead && version.id === current?.id ? advanceReadPosition(readerActor(reader), item.id, item.lastPosition) : null,
+    read.unseen ? unseenThenRead(reader, item, read.move && version.id === current?.id) : null,
   ]);
-  return { version, current, files, actorOf, versions: summaries };
+  return { version, current, files, actorOf, versions: summaries, unseen };
+}
+
+/**
+ * What was new to the reader before this open (viewerUnseenOf; null for one
+ * who reads it as an outsider) and, when it shows the current version
+ * (`moves`), the open's move of their read position, read and moved in one
+ * statement: the "new" is from where the move started.
+ */
+async function unseenThenRead(reader: ArtifactWebReader, item: ArtifactItemRow, moves: boolean): Promise<ArtifactCardUnseen | null> {
+  if (readsAsOutsider(reader.serverId, item)) {
+    if (moves) await advanceReadPosition(readerActor(reader), item.id, item.lastPosition);
+    return null;
+  }
+  return viewerUnseenOf(reader, item, moves ? item.lastPosition : null);
 }
 
 /**
@@ -343,7 +368,7 @@ export async function viewerAnswerOf(reader: ArtifactWebReader, item: ArtifactIt
 }
 
 export function createViewerOperations() {
-  /** The file at `path` of the shown version, and its blob's reader. */
+  /** The file at `path` of the shown version (and the item and version), and its blob's reader. */
   async function fileOf(reader: ArtifactWebReader, id: string, path: string, query: { version?: unknown }) {
     const item = await readableItemFor(reader, id);
     if (!isWellFormedArtifactFilePath(path)) throw new ArtifactWebFailure(webInvalidPath(path));
@@ -354,7 +379,7 @@ export function createViewerOperations() {
     const found = await versionFileOf(item, version, path);
     if (found.kind === "missing") return missing();
     if (found.kind === "unavailable") throw new ArtifactWebFailure(webContentUnavailable());
-    return { ...found, version, missing };
+    return { ...found, item, version, missing };
   }
 
   return {
@@ -363,14 +388,14 @@ export function createViewerOperations() {
 
     /** `GET /:id/details`: the viewer's answer without `frame` (no ticket signed), and no read position moved. */
     details: (reader: ArtifactWebReader, id: string, query: { version?: unknown }): Promise<ArtifactApiJson<ArtifactViewerData> | ArtifactWebApiError> => answerWeb(async () =>
-      json((await viewerDataOf(reader, await readableItemFor(reader, id), parseVersionQuery(query.version))).body)),
+      json((await viewerDataOf(reader, await readableItemFor(reader, id), parseVersionQuery(query.version), { unseen: true })).body)),
 
     /** The viewer's answer without `frame` (no ticket signed): what save-attachment answers the Artifact with. */
     viewerWithoutFrame: (reader: ArtifactWebReader, id: string): Promise<ArtifactApiJson<ArtifactViewerData> | ArtifactWebApiError> => answerWeb(async () =>
       json((await openViewer(reader, id, {})).body)),
 
     file: (reader: ArtifactWebReader, id: string, path: string, query: { version?: unknown }): Promise<ArtifactApiBytes | ArtifactWebApiError> => answerWeb(async () => {
-      const { file, blob, reader: blobReader, missing } = await fileOf(reader, id, path, query);
+      const { file, blob, item, version, reader: blobReader, missing } = await fileOf(reader, id, path, query);
       const bytes = await blobReader.read(blob);
       if (!bytes) return missing();
       return {
@@ -378,7 +403,8 @@ export function createViewerOperations() {
         stream: bytes.stream,
         size: bytes.size,
         contentType: servedContentType(file.path),
-        contentDisposition: attachmentDisposition(file.path),
+        // A version of one file: named by the title (`周计划.html`), as the web names it.
+        contentDisposition: attachmentDisposition(artifactDownloadFileName({ title: item.title, fileCount: version.fileCount, path: file.path })),
       };
     }),
 

@@ -1,0 +1,21 @@
+host: oar
+runtime: qoder
+scenario: resume-wake-message
+promptSource: wake_inbox_update
+note: launch.options.resume: session-1
+
+## standing prompt
+= standing-prompt.md
+
+## carrier
+launch.options.systemPrompt: = standing prompt
+launch.options.appendSystemPrompt: (absent)
+launch.options.env.OPENCODE_CONFIG_CONTENT: (absent)
+
+## first input (543 chars, sha256:aae69a8dc9469218, does not contain the standing prompt)
+[Raft inbox notice:
+Inbox update: 1 message pending your read across all conversations; 1 changed target
+#general  pending: 1 message · first msg=wake-1 · latest sender @bob · latest msg=wake-1
+  latest @bob: "Can you check the deploy notes?" (preview; still unread, full text: raft message read --target "#general" --unread)
+]
+These messages have not been read. Choose when to read them: `raft message read --target <target> --unread` reads one conversation's unread messages; `raft inbox check` lists every conversation with unread messages.

@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 
 import { test } from "vitest";
 
-import { TASK_ASSIGN_REASON_UNCHANGED, TASK_ASSIGN_REASON_UNCHANGED_MESSAGE } from "@botiverse/raft-shared";
+import { PROFILE_DESCRIPTION_MAX_LENGTH, profileDescriptionTooLong, TASK_ASSIGN_REASON_UNCHANGED, TASK_ASSIGN_REASON_UNCHANGED_MESSAGE } from "@botiverse/raft-shared";
 import { refusalBody, type RefusalInput } from "../lib/refusal";
 import { agentHistoryLimitedRefusal } from "../services/historyWindow";
 import { channelBillingReadOnlyRefusal } from "../services/planService";
@@ -13,7 +13,13 @@ import { attachmentTooLargeRefusal } from "./attachments";
 import {
   ACTION_TYPE_NOT_PREPARABLE_REFUSAL,
   agentLoginNotFoundRefusal,
+  agentLoginServiceRefusal,
   appMetadataInvalidRefusal,
+  profileHandleAmbiguousRefusal,
+  profileNotFoundRefusal,
+  profileTargetInvalidRefusal,
+  taskNotFoundRefusal,
+  taskResourceReceiptRefusal,
   AGENT_NOT_ON_THIS_COMPUTER_REFUSAL,
   MACHINE_AGENT_NOT_FOUND_REFUSAL,
   MACHINE_AUTH_REQUIRED_REFUSAL,
@@ -21,6 +27,7 @@ import {
   MACHINE_SERVER_GONE_REFUSAL,
   MESSAGE_NOT_FOUND_REFUSAL,
   messageResolveRefusal,
+  forwardedMessageRefusal,
   serviceMessageRefusal,
   SINCE_SEQ_INVALID_REFUSAL,
   SINCE_TIME_INVALID_REFUSAL,
@@ -37,7 +44,7 @@ import {
   APP_NOT_FOUND_REFUSAL,
   APP_NOT_PUBLISHED_REFUSAL,
   APP_PUBLISHED_NOT_DELETABLE_REFUSAL,
-  APP_RETURN_URL_EMPTY_REFUSAL,
+  APP_RETURN_URL_INVALID_REFUSAL,
   APP_STATUS_LOOKUP_INVALID_REFUSAL,
   APP_TRANSFER_FIELDS_REQUIRED_REFUSAL,
   APP_UPDATE_NO_FIELDS_REFUSAL,
@@ -53,7 +60,6 @@ import {
   agentProfileUpdateFields,
   AVATAR_BAD_FORMAT_REFUSAL,
   AVATAR_FILE_REQUIRED_REFUSAL,
-  MAX_AGENT_PROFILE_DESCRIPTION_LENGTH,
   MAX_AGENT_PROFILE_DISPLAY_NAME_LENGTH,
   AGENT_GONE_REFUSAL,
   AGENT_JWT_NOT_AUTHORIZED_REFUSAL,
@@ -64,7 +70,6 @@ import {
   APP_CARD_TARGET_REQUIRED_REFUSAL,
   APP_CATEGORY_INVALID_REFUSAL,
   APP_NAME_REQUIRED_REFUSAL,
-  APP_RETURN_URL_REQUIRED_REFUSAL,
   APP_SCOPE_UNKNOWN_REFUSAL,
   APP_UPDATE_CARD_DISABLED_REFUSAL,
   AVATAR_TOO_LARGE_REFUSAL,
@@ -131,8 +136,39 @@ test("a profile update keeps the fields it was given, trimmed, or refuses the fi
   assert.equal(refused({}), "PROFILE_UPDATE_NO_FIELDS");
   for (const avatarUrl of [7, "", "https://x.example/a.png"]) assert.equal(refused({ avatarUrl }), "PROFILE_AVATAR_URL_BAD_FORMAT");
   for (const displayName of [null, "   ", "x".repeat(MAX_AGENT_PROFILE_DISPLAY_NAME_LENGTH + 1)]) assert.equal(refused({ displayName }), "profile_display_name_invalid");
-  for (const description of [3, "", "x".repeat(MAX_AGENT_PROFILE_DESCRIPTION_LENGTH + 1)]) assert.equal(refused({ description }), "profile_description_invalid");
+  for (const description of [3, "", "x".repeat(PROFILE_DESCRIPTION_MAX_LENGTH + 1)]) assert.equal(refused({ description }), "profile_description_invalid");
   for (const refusal of [AVATAR_FILE_REQUIRED_REFUSAL, AVATAR_BAD_FORMAT_REFUSAL]) assert.doesNotThrow(() => refusalBody(refusal), refusal.code);
+});
+
+test("a new or changed description fits the 300 limit; one stored under the older limit saves unchanged", () => {
+  assert.equal(PROFILE_DESCRIPTION_MAX_LENGTH, 300);
+  const fits = "x".repeat(PROFILE_DESCRIPTION_MAX_LENGTH);
+  const legacy = "y".repeat(412);
+  const accepted = (description: string, stored?: string | null) => {
+    const out = agentProfileUpdateFields({ description }, stored);
+    assert.equal(out.ok, true, `${description.length} chars, stored ${stored?.length ?? "none"}`);
+    return out.ok ? out.fields.description : undefined;
+  };
+  const refusedCode = (description: string, stored?: string | null) => {
+    const out = agentProfileUpdateFields({ description }, stored);
+    assert.equal(out.ok, false, `${description.length} chars, stored ${stored?.length ?? "none"}`);
+    if (out.ok) throw new Error("unreachable");
+    assert.doesNotThrow(() => refusalBody(out.refusal), out.refusal.code);
+    assert.match(out.refusal.error, /300 characters/);
+    return out.refusal.code;
+  };
+  // Within the limit: always, whatever is stored.
+  assert.equal(accepted(fits), fits);
+  assert.equal(accepted(fits, legacy), fits);
+  // Over it and new or changed: refused.
+  assert.equal(refusedCode(`${fits}!`), "profile_description_invalid");
+  assert.equal(refusedCode(`${fits}!`, null), "profile_description_invalid");
+  assert.equal(refusedCode(`${legacy}z`, legacy), "profile_description_invalid");
+  assert.equal(refusedCode(legacy.slice(1), legacy), "profile_description_invalid", "shortened, still over: refused");
+  // Over it but unchanged (whitespace at the ends aside): saved as it is.
+  assert.equal(accepted(legacy, legacy), legacy);
+  assert.equal(accepted(` ${legacy}\n`, legacy), ` ${legacy}\n`);
+  assert.equal(profileDescriptionTooLong(legacy, `${legacy}  `), false);
 });
 
 test("profile and integration refusals pass the refusal rules and keep the codes clients and tests read", () => {
@@ -152,7 +188,6 @@ test("profile and integration refusals pass the refusal rules and keep the codes
     [APP_SCOPE_UNKNOWN_REFUSAL, "INVALID_SCOPE"],
     [APP_CATEGORY_INVALID_REFUSAL, "INVALID_CATEGORY"],
     [APP_NAME_REQUIRED_REFUSAL, "app_name_required"],
-    [APP_RETURN_URL_REQUIRED_REFUSAL, "return_url_required"],
   ];
   for (const [refusal, code] of cases) {
     assert.equal(refusal.code, code);
@@ -183,7 +218,7 @@ test("app management refusals pass the refusal rules and keep the codes the CLI 
     [appTransferTargetNotFoundRefusal("helper"), "target_agent_not_found"],
     [appTransferTargetNotFoundRefusal("x\n--flag"), "target_agent_not_found"],
     [APP_UPDATE_NO_FIELDS_REFUSAL, "app_update_no_fields"],
-    [APP_RETURN_URL_EMPTY_REFUSAL, "RETURN_URL_REQUIRED"],
+    [APP_RETURN_URL_INVALID_REFUSAL, "RETURN_URL_INVALID"],
     [shareLinkTargetNotApplicableRefusal("request_publish"), "SHARE_LINK_TARGET_NOT_APPLICABLE"],
     [SHARE_LINK_TARGET_INVALID_REFUSAL, "SHARE_LINK_TARGET_INVALID"],
     [SHARE_LINK_TARGET_REQUIRED_REFUSAL, "SHARE_LINK_TARGET_REQUIRED"],
@@ -228,6 +263,9 @@ test("slice 11 refusals pass the refusal rules and keep the codes clients and te
     [messageResolveRefusal("Message not found"), "NOT_FOUND"],
     [messageResolveRefusal("Message short id is ambiguous"), "AMBIGUOUS_ID"],
     [messageResolveRefusal("Message id must be a full UUID or 8-character short id"), "INVALID_ARG"],
+    [forwardedMessageRefusal(0), "NOT_A_FORWARD"],
+    [forwardedMessageRefusal(1), "FORWARDED_OUT_OF_RANGE"],
+    [forwardedMessageRefusal(4), "FORWARDED_OUT_OF_RANGE"],
     [threadAnchorNotFoundRefusal("#dx-parent"), "NOT_FOUND"],
     [threadAnchorNotFoundRefusal("#x\n--flag"), "NOT_FOUND"],
     [SINCE_SEQ_INVALID_REFUSAL, "since_invalid"],
@@ -288,4 +326,39 @@ test("a message lookup that finds nothing reads the same whatever the reason, an
 test("a service message that would break the sentence is replaced by the fallback", () => {
   assert.equal(serviceMessageRefusal("x_invalid", "scope is required", "Fallback sentence here.").error, "scope is required");
   assert.equal(serviceMessageRefusal("x_invalid", "use --force\nnow", "Fallback sentence here.").error, "Fallback sentence here.");
+});
+
+test("a message id lookup answers by its resolver's fixed messages: the reminder resolver's lower-case ones too", () => {
+  assert.equal(messageResolveRefusal("message not found"), MESSAGE_NOT_FOUND_REFUSAL);
+  assert.equal(messageResolveRefusal("msgId short id is ambiguous").code, "AMBIGUOUS_ID");
+  assert.equal(messageResolveRefusal("msgId must be a full UUID or 8-char short id").code, "INVALID_ARG");
+});
+
+test("a resource receipt refusal has its kind's status, and a missing task is the plain task not-found", () => {
+  assert.deepEqual(
+    taskResourceReceiptRefusal({ refused: "not_found", code: "task_not_found", reason: "task not found" }, "#ops", 7),
+    { status: 404, refusal: taskNotFoundRefusal("#ops", 7) },
+  );
+  assert.deepEqual(
+    taskResourceReceiptRefusal({ refused: "invalid", code: "task_resource_receipt_invalid", reason: "resource receipt expiry must be in the future" }, "#ops", 7),
+    { status: 400, refusal: { code: "task_resource_receipt_invalid", error: "resource receipt expiry must be in the future" } },
+  );
+  assert.deepEqual(
+    taskResourceReceiptRefusal({ refused: "conflict", code: "task_resource_receipt_already_recorded", reason: "resource receipt is already recorded" }, "#ops", 7),
+    { status: 409, refusal: { code: "task_resource_receipt_already_recorded", error: "resource receipt is already recorded" } },
+  );
+});
+
+test("an Agent Login service name and a profile target are refused in their own words, with a code per case", () => {
+  assert.equal(agentLoginServiceRefusal({ status: 400, error: "service is required" }).code, "service_required");
+  assert.equal(agentLoginServiceRefusal({ status: 409, error: "Service name is ambiguous; use the service id or client id" }).code, "service_ambiguous");
+  assert.deepEqual(agentLoginServiceRefusal({ status: 404, error: "Registered service not found" }), { code: "service_not_found", error: "Registered service not found" });
+  assert.deepEqual(profileTargetInvalidRefusal("target must start with @"), { code: "profile_target_invalid", error: "target must start with @" });
+  assert.deepEqual(profileNotFoundRefusal("alice"), { code: "profile_not_found", error: "Profile @alice not found" });
+  assert.deepEqual(profileHandleAmbiguousRefusal("alice"), { code: "profile_handle_ambiguous", error: "Profile handle @alice is ambiguous" });
+  // A handle that would break the sentence is left out.
+  assert.equal(profileNotFoundRefusal("x".repeat(300)).error, "No profile you can see has that handle");
+  for (const refusal of [profileNotFoundRefusal("a\nb"), profileHandleAmbiguousRefusal("--force"), profileNotFoundRefusal("x".repeat(300))]) {
+    assert.doesNotThrow(() => refusalBody(refusal));
+  }
 });

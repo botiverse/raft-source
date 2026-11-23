@@ -1,8 +1,10 @@
 # Server integration tests
 
 Use Vitest fixtures to remove per-case migrations, login setup, and cleanup
-boilerplate. Every case gets a fresh PGlite restored from a migrated template
-file built once per run. Commits and inner transaction rollbacks remain real.
+boilerplate. A file's cases share one PGlite restored from a migrated template
+file built once per run, cleared back to the template between cases (see
+[One database per file](#one-database-per-file)). Commits and inner transaction
+rollbacks remain real.
 
 ```ts
 import assert from "node:assert/strict";
@@ -62,7 +64,34 @@ boundary tests must run against real PostgreSQL:
 Run existing shard commands. `RAFT_TEST_PROFILE=1` adds per-case elapsed time,
 DB/app/seed/cleanup timings and process memory. `cleanup` contains the close
 subphases; do not add overlapping phases. Use `lifecycle.measure("operation", fn)`
-for an explicit operation measurement.
+for an explicit operation measurement. Without the flag, each file's phase totals
+still reach the shard's `[serverShardTimings]` lines (one line per file).
+
+## One database per file
+
+A file's first `dbTest` / `apiTest` case restores a fresh database; when a case ends, `reuseProbe.ts`
+reclaims it for the next case (#triage:#516, step 2): `DISCARD ALL` resets the session (settings,
+prepared statements, cursors, LISTEN, advisory locks, SET ROLE), then a check discards the database,
+and the next case restores a fresh one, if the case failed, left a transaction open or aborted, made
+temp tables, moved the catalogs (DDL, roles, comments, its own TRUNCATE) or a sequence no table owns.
+Otherwise the tables the case wrote are truncated with identities restarted, changed seeded tables
+are restored, sequences go back to the template's values, and with `RAFT_TEST_DB_REUSE_CHECK` on (the
+default) a self-check against the template must pass, or the database is discarded (never the case).
+Kept databases are detached between cases (`isDatabaseInitialized()` is false) and closed with the
+file. Explicit `openTestDatabase` / `openTestApp` calls and a case that closes its own database never
+share one. Counts (`restored` / `reused`, `reusable`, `drop.<reason>`, `discarded.<kind>`,
+`selfCheckFailed`, `probeError`, `probeTimeout`, `closeTimeout`, `writtenTables`, `seededRestored`, `setting.<name>`,
+`sequence.<name>`) reach the `[serverShardTimings]` lines as `reuse`, time as the `reuseBaseline`,
+`reuseCheck`, `reuseDiscard`, `reuseTruncate`, `reuseSeeded`, `reuseSequences` and `reuseSelfCheck`
+phases (inside `databaseClose`, itself inside `cleanup`). `RAFT_TEST_DB_REUSE=0` restores a fresh
+database for every case; a file on `REUSE_OPT_OUT` (reuseProbe.ts, with a one-line reason) does so for
+its own cases (counted as `optedOut`).
+
+A test PGlite closes only once no `query` / `exec` / `transaction` call runs on it (`pgliteClose.ts`):
+PGlite spins forever, synchronously, when a statement runs on an instance closed under it, and work a
+case never awaited (an `AgentOrchestrator`'s `setIO` sweeps) can still be querying when the case's
+database closes. From the close on, new calls are refused ("PGlite is closing"). A database still busy
+5 s later is left open and counted as `closeTimeout`: a stuck case costs one database, not the file.
 
 ## PGlite template file
 
@@ -72,6 +101,8 @@ for an explicit operation measurement.
 - The key hashes the drizzle journal, every migration's SQL, the PGlite
   compatibility statements, the installed `@electric-sql/pglite` version and
   `TEMPLATE_FORMAT_VERSION`; `migratePglite` still runs after each restore.
+- A worker reads the template file once and restores every fresh database from
+  that one in-memory copy (Vitest gives each test file its own worker).
 - `RAFT_TEST_PGLITE_TEMPLATE=rebuild` forces a fresh build; `=off` disables it.
 - A Vitest worker without the template warns and migrates per file; under CI it
   fails. Playwright servers and scripts keep a process-local snapshot.

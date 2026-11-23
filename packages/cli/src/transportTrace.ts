@@ -75,7 +75,8 @@ export type CliTraceSpanName =
   | "cli.continuation.created"
   | "cli.continuation.answered"
   | "cli.continuation.refused"
-  | "cli.guidance.decision";
+  | "cli.guidance.decision"
+  | "cli.held_once";
 
 /** Flat scalar attributes only; undefined, null and "" are left off the record. */
 export type CliTraceSpanAttrs = Readonly<Record<string, string | number | boolean | null | undefined>>;

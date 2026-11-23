@@ -15,6 +15,8 @@ import type { SidebarCtxKind, SidebarLongPress } from "../sidebarContextMenu";
 import { sidebarItemClass } from "./sidebarRowClasses";
 import { ChannelUnreadSegments } from "./ChannelUnreadSegments";
 import { SidebarActivityMutedMark } from "./SidebarActivityMutedMark";
+import { SidebarBrowserInUseMark } from "./SidebarBrowserInUseMark";
+import type { SidebarBrowserInUse } from "./SidebarBrowserInUseMark";
 
 // Per-row leaf components. Two properties make them the fix for the
 // channel-switch freeze:
@@ -44,10 +46,13 @@ export const ChannelRow = memo(function ChannelRow({
   onContextMenu,
   makeLongPress,
   serverPublicPageLive = false,
+  browserInUse = null,
 }: {
   channel: Channel;
   /** The current server's public page is live; with a Guest-visible channel, anyone can read it there. */
   serverPublicPageLive?: boolean;
+  /** The built-in browser's kept pages of this conversation use a device or play sound; never for the one on screen. */
+  browserInUse?: SidebarBrowserInUse | null;
   selected: boolean;
   menuOpen: boolean;
   onSelect: (channel: Channel, clickCount: number) => void;
@@ -138,6 +143,8 @@ export const ChannelRow = memo(function ChannelRow({
         </SidebarItemIndicator>
         </Tooltip>
       )}
+      {/* After the name and the @, before the count / dot / pencil. */}
+      <SidebarBrowserInUseMark inUse={browserInUse} />
       {showLoudUnreadBadge ? (
         <SidebarItemCount className="ml-auto">
           {unreadSegments}

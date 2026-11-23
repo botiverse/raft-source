@@ -17,7 +17,7 @@ import { writeText, NL } from "../../core/renderer";
 import { PEER_KIND_OPTION, type TargetAliasOpts } from "../_target";
 import { formatTaskAssigned } from "./_format";
 import { resolveTaskWriteAddress } from "./_taskAddress";
-import { writeHeldTaskWrite } from "../freshness/_taskHold";
+import { exitIfHeldTaskWrite } from "../freshness/_taskHold";
 
 interface AssignOpts extends TargetAliasOpts {
   number: string;
@@ -150,7 +150,7 @@ export const taskAssignCommand = defineCommand(
         message: "Agent API taskAssign returned an empty response body",
       });
     }
-    if (writeHeldTaskWrite(ctx, agentContext.agentId, "task_assign", body, res.data)) return;
+    exitIfHeldTaskWrite(ctx, agentContext.agentId, "task_assign", body, res.data);
     writeText(ctx.io, formatTaskAssigned(taskNumber, assignee, res.data.taskRef), NL);
   },
 );

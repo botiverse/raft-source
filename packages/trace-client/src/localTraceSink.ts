@@ -366,9 +366,7 @@ const DIAGNOSTIC_ID_ATTRS = new Set([
  * every assignment rather than at one declaration.
  *
  * `provider_id` — every route is closed and guarded: preset =>
- *   BuiltInRuntimeProviderId, gateway => BuiltInRuntimeGatewayProviderId,
- *   and the connection fallback => ProviderConnectionProviderId, guarded at
- *   runtime by `isProviderConnectionProviderId` (shared/providerConnections.ts).
+ *   BuiltInRuntimeProviderId, gateway => BuiltInRuntimeGatewayProviderId.
  * `model_id`   — written only when `model.kind === "preset"`, and builtin+preset
  *   additionally passes `isBuiltInProviderModel`.
  *
@@ -813,6 +811,27 @@ export class LocalRotatingTraceSink implements TraceSink {
 
   getCurrentFile(): string | null {
     return this.currentFile;
+  }
+
+  /**
+   * Close the current file now, so an uploader may take it before its age or
+   * size would have rotated it (a daemon flushing telemetry after a failed
+   * agent start, or on shutdown).
+   *
+   * Returns the closed file's path, or null when nothing was closed: no file
+   * is open, or the open one holds no records yet (closing it would only
+   * leave an empty file behind per call). The next write opens a fresh file
+   * through the normal rotation path (0o600, prune, unique sequence).
+   *
+   * Every write is synchronous and finishes inside one `writeLine`, so a call
+   * can never land between a record's append and its accounting: no record is
+   * split across files or lost.
+   */
+  rotateNow(): string | null {
+    const file = this.currentFile;
+    if (!file || this.currentSize <= 0) return null;
+    this.abandonCurrentFile();
+    return file;
   }
 
   private ensureFile(nextBytes: number): void {

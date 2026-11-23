@@ -1,0 +1,27 @@
+{
+  "formatVersion": 1,
+  "id": "mark_unread_then_late_read_ack",
+  "rule": "position",
+  "title": "Mark as Unread, then a late ack of the read from before it, then an answer: the unread stays",
+  "why": "Mark as Unread clears the row's read seq and keeps it as a ceiling. A read ack at or below the ceiling (the read from before the mark, acknowledged late) does not raise the read seq again, so the answer after the mark keeps its unread. A read past the ceiling lifts it and records as usual (Scout, #15301 review).",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow: markUnread, readSeqCeiling)"
+    ],
+    "app": [
+      "compose/shared/src/commonMain/kotlin/build/raft/app/data/ActivityRowPosition.kt (reduceActivityRow: MarkUnread, readSeqCeiling)"
+    ]
+  },
+  "given": { "row": { "unreadCount": 1, "hasMention": false, "position": "101", "mentionOnly": false } },
+  "steps": [
+    { "act": "read", "seq": "101" },
+    { "act": "markUnread" },
+    { "act": "read", "seq": "101" },
+    { "act": "answer", "row": { "unreadCount": 1, "hasMention": false, "position": "101", "mentionOnly": false } }
+  ],
+  "checkpoints": [
+    { "afterStep": 1, "row": { "unreadCount": 0, "position": "101" }, "reread": false }
+  ],
+  "expect": { "row": { "unreadCount": 1, "hasMention": false, "position": "101" }, "reread": false }
+}

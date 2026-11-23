@@ -1,0 +1,24 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "kitchen-sink-choices",
+  "schemaVersion": "kitchen-sink-choices.create.v1",
+  "sourceId": "dependentCombobox",
+  "kind": "dependent_select",
+  "pointer": "/dependentCombobox",
+  "dependsOn": "/selectFilled",
+  "optionsByValue": {
+    "beta": [
+      {
+        "value": "b1",
+        "label": "Beta one"
+      }
+    ]
+  },
+  "defaultValueByValue": {
+    "beta": "b1"
+  },
+  "customValueAllowedByValue": {
+    "beta": true
+  },
+  "status": "live"
+}

@@ -16,6 +16,7 @@ import { COMPUTER_VERSION } from "./version";
 
 const SERVER_A = "11111111-1111-4111-8111-111111111111";
 const SERVER_B = "22222222-2222-4222-8222-222222222222";
+const SERVER_C = "33333333-3333-4333-8333-333333333333";
 const SECRET_TOKEN = "user-access-token-DO-NOT-LEAK-abc123";
 const SECRET_KEY_A = "sk_computer_AAA-DO-NOT-LEAK-aaaaaaaaaaaa";
 const SECRET_KEY_B = "sk_computer_BBB-DO-NOT-LEAK-bbbbbbbbbbbb";
@@ -152,7 +153,7 @@ test("status: corrupted user-session.json is explicit and secret-free", async ()
       return true;
     }) as typeof process.stdout.write;
     try {
-      await runStatus();
+      await runStatus({ readComputerSelf: async () => assert.fail("no attachment, so no server read") });
     } finally {
       process.stdout.write = oldWrite;
     }
@@ -178,6 +179,24 @@ test("status: multiple attachments → servers[] aggregates; sk_computer_* NEVER
     const blob = JSON.stringify(r);
     assert.ok(!blob.includes(SECRET_KEY_A), "leaked sk_computer_* (A)");
     assert.ok(!blob.includes(SECRET_KEY_B), "leaked sk_computer_* (B)");
+  });
+});
+
+test("status: an adopted file without machineId reports its legacyMachineId; a plain one stays null", async () => {
+  await withHome(async (home) => {
+    await writeUnder(home, `servers/${SERVER_A}/runner.state.json`, JSON.stringify({
+      kind: "computer-attachment",
+      serverId: SERVER_A,
+      serverMachineId: "cm-adopted",
+      apiKey: SECRET_KEY_A,
+      serverUrl: "https://api.example.test",
+      adoptedFromLegacy: true,
+      legacyMachineId: "mch-legacy-1",
+    }));
+    await writeAttach(home, SERVER_B, SECRET_KEY_B);
+    const r = await buildStatusReport(home);
+    assert.equal(r.servers.find((s) => s.serverId === SERVER_A)?.machineId, "mch-legacy-1");
+    assert.equal(r.servers.find((s) => s.serverId === SERVER_B)?.machineId, null);
   });
 });
 
@@ -222,13 +241,25 @@ test("status: human output prints service and per-server server-runner log paths
       lines.push(String(chunk));
       return true;
     }) as typeof process.stdout.write;
+    const asked: string[] = [];
     try {
-      await runStatus();
+      await runStatus({
+        readComputerSelf: async (a) => {
+          asked.push(a.serverId);
+          return {
+            status: "success",
+            computer: { computerId: "c-1", computerName: "key", serverId: a.serverId, machineId: "m-1", machineName: "Renamed\u001b[31m Box", agentCount: 2 },
+          };
+        },
+      });
     } finally {
       process.stdout.write = oldWrite;
     }
 
     const out = lines.join("");
+    assert.deepEqual(asked, [SERVER_A]);
+    // The name the server shows now, read live; control characters never reach the terminal.
+    assert.match(out, /Name on server: "Renamed \[31m Box"/);
     assert.match(out, new RegExp(`Service log: ${join(home, "computer", "run", "service\\.log")}`));
     assert.match(out, /\/alpha\s+offline\s+no\s+stopped/);
     assert.match(
@@ -237,6 +268,38 @@ test("status: human output prints service and per-server server-runner log paths
     );
     assert.ok(!out.includes(SECRET_TOKEN), "human output leaked accessToken");
     assert.ok(!out.includes(SECRET_KEY_A), "human output leaked sk_computer_*");
+  });
+});
+
+test("status: a server that cannot say the name → says why; a legacy key is not asked", async () => {
+  await withHome(async (home) => {
+    await writeAttach(home, SERVER_A, SECRET_KEY_A);
+    await writeAttach(home, SERVER_B, "legacy-machine-key");
+    await writeAttach(home, SERVER_C, "sk_computer_CCC");
+    const asked: string[] = [];
+    const lines: string[] = [];
+    const oldWrite = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      await runStatus({
+        readComputerSelf: async (a) => {
+          asked.push(a.serverId);
+          if (a.serverId === SERVER_A) throw new Error("timeout");
+          return { status: "error", code: "bad\u001b]0;x\u0007code" };
+        },
+      });
+    } finally {
+      process.stdout.write = oldWrite;
+    }
+    assert.deepEqual(asked.sort(), [SERVER_A, SERVER_C].sort());
+    const out = lines.join("");
+    assert.equal(out.match(/Name on server: could not read \(request_failed\)/g)?.length, 1);
+    // The reason is server-set text too: no control characters reach the terminal.
+    assert.match(out, /Name on server: could not read \(bad \]0;x code\)/);
+    assert.equal(out.match(/Name on server/g)?.length, 2);
   });
 });
 

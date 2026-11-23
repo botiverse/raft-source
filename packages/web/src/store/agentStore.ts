@@ -2,7 +2,7 @@ import { useSyncExternalStore } from "react";
 import { create } from "zustand";
 import api from "../api/client";
 import { currentTimeMs, EXTERNAL_AGENT_ONLINE_WINDOW_MS, isExternalAgentRuntime, normalizeActivity, normalizeActivityDetailKind } from "@botiverse/raft-shared";
-import type { AgentActivity, AgentArchiveWorkspaceChoice, Readiness, AgentActivityDetailKind, AgentHostedRuntimeSummary, AgentBlockedReason, ExternalAgentDiagnosticsView, AgentRuntimeErrorState, RuntimeErrorCode, AgentRuntimeProviderKind, AgentStatus, CredentialHoldActivityDiagnostic, DeliveryConsumptionActivityDiagnostic, ReasoningEffort, RuntimeConfig, RuntimeFormDefinitionRef, ServerRole, SpawnFailureActivityDiagnostic, ToolStuckActivityDiagnostic, TrajectoryEntry, WakeCrashLoopActivityDiagnostic } from "@botiverse/raft-shared";
+import type { AgentActivity, AgentArchiveWorkspaceChoice, DescriptionLinkWarning, Readiness, AgentActivityDetailKind, AgentHostedRuntimeSummary, AgentBlockedReason, ExternalAgentDiagnosticsView, AgentRuntimeErrorState, RuntimeErrorCode, AgentRuntimeProviderKind, AgentStatus, CredentialHoldActivityDiagnostic, DeliveryConsumptionActivityDiagnostic, ReasoningEffort, RuntimeConfig, RuntimeFormDefinitionRef, ServerRole, SpawnFailureActivityDiagnostic, ToolStuckActivityDiagnostic, TrajectoryEntry, WakeCrashLoopActivityDiagnostic } from "@botiverse/raft-shared";
 import type { RuntimeFormV2SubmitRef } from "@botiverse/raft-runtime-form";
 import { useServerStore } from "./serverStore";
 import { runtimeFormV2SubmitRequestConfig } from "../utils/runtimeFormV2ClientCapabilities";
@@ -31,11 +31,12 @@ import type {
   TrajectoryLogEntry,
 } from "./events/agentActivityEvents";
 import { notifyAllChannelMembersChanged } from "./channelMemberEvents";
+import { loadForCurrentGeneration } from "./trajectoryLogLoad";
 
 /** What `POST /agents/:id/interrupt-turn` reports for a stop that went through. */
 export type AgentTurnStopOutcome = "interrupted" | "restarted" | "not_running";
-/** `PATCH /agents/:id`: `when_idle` at the running agent's next idle point, `restarted` now (restartMode), `saved` at its next start. */
-export type AgentConfigApply = "when_idle" | "restarted" | "saved";
+/** `PATCH /agents/:id`: `applied` immediately on idle capable daemon, `restarted` immediately (busy on `agent:config-interrupt-v1` daemon or idle older daemon), `when_idle` after the current turn on older daemons, `saved` at next start. */
+export type AgentConfigApply = "applied" | "when_idle" | "restarted" | "saved";
 
 // Re-export for consumers that previously imported from this file
 export type { AgentActivity } from "@botiverse/raft-shared";
@@ -454,12 +455,15 @@ interface AgentState {
   retryHostedRuntimeProvisioning: (agentId: string, options?: { model?: string | null }) => Promise<AgentHostedRuntimeSummary | null>;
   fetchOnboardingIdentityAdoption: (agentId: string) => Promise<OnboardingIdentityAdoptionPreview>;
   adoptOnboardingIdentity: (agentId: string) => Promise<OnboardingIdentityAdoptionResult>;
-  /** The agent as saved, and `configApply`: how the server applies a runtime change (reconciler step 11b; absent from an older server). */
+  /**
+   * The agent as saved, and `configApply`: how the server applies a runtime change (reconciler step 11b; absent from an older server),
+   * and `warnings`: links in a new description some of its readers can't open (#457; the save stands). Neither is kept on the stored agent.
+   */
   updateAgent: (
     agentId: string,
     fields: { displayName?: string | null; description?: string | null; avatarUrl?: string | null; serverRole?: Extract<ServerRole, "admin" | "member">; model?: string; runtime?: string; runtimeConfig?: RuntimeConfig | null; formDefinitionRef?: RuntimeFormDefinitionRef | RuntimeFormV2SubmitRef; formValues?: Record<string, unknown>; reasoningEffort?: ReasoningEffort | null; envVars?: Record<string, string> | null },
     opts?: { restartMode?: "restart" | "session" },
-  ) => Promise<Agent & { configApply?: AgentConfigApply }>;
+  ) => Promise<Agent & { configApply?: AgentConfigApply; configApplyNewSession?: boolean; warnings?: DescriptionLinkWarning[] }>;
   startAgent: (agentId: string) => Promise<void>;
   stopAgent: (agentId: string) => Promise<void>;
   /** Interrupt the agent's running turn (the agent stays). Throws when the stop failed. */
@@ -1148,11 +1152,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   },
 
   updateAgent: async (agentId, fields, opts) => {
-    const { data } = await api.patch<Agent & { configApply?: AgentConfigApply }>(`/agents/${agentId}`, {
+    const { data } = await api.patch<Agent & { configApply?: AgentConfigApply; configApplyNewSession?: boolean; warnings?: DescriptionLinkWarning[] }>(`/agents/${agentId}`, {
       ...fields,
       ...(opts?.restartMode ? { restartMode: opts.restartMode } : {}),
     }, runtimeFormV2SubmitRequestConfig((fields as { formDefinitionRef?: unknown }).formDefinitionRef));
-    const { configApply: _configApply, ...saved } = data;
+    const { configApply: _configApply, configApplyNewSession: _configApplyNewSession, warnings: _warnings, ...saved } = data;
     set((state) => ({
       ...(() => {
         if (opts?.restartMode !== "session") {
@@ -1402,7 +1406,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
 
   // As many as the live log keeps: the Sub-agents list is built from it, so a
   // reload must not show fewer than the page had (#proj-runtime:#43).
-  loadTrajectoryLog: async (agentId, limit = MAX_TRAJECTORY_ENTRIES) => {
+  loadTrajectoryLog: (agentId, limit = MAX_TRAJECTORY_ENTRIES) => loadForCurrentGeneration(`${agentId}:${limit}`, () => get().trajectoryHydrateGeneration, async () => {
     const hydrateGeneration = get().trajectoryHydrateGeneration;
     let incoming: TrajectoryLogEntry[];
     try {
@@ -1430,7 +1434,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       if (transition.reconcileSuggested) scheduleAgentActivityReconcile();
       return transition.touched === 0 ? {} : applyAgentActivityDomainPatch(state, next);
     });
-  },
+  }),
 
   getActivityLog: (agentId) => get().activityLogs[agentId] || [],
 

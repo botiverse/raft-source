@@ -44,6 +44,7 @@ import SecondFactorStepUpHost from "./components/settings/SecondFactorStepUpHost
 import { DesktopBrowserSignInHost } from "./features/desktopBrowserSignIn/DesktopBrowserSignInHost";
 import { AccountDeletionGate } from "./pages/AccountDeletionGate";
 import MediaPreviewHost from "./components/message/MediaPreviewHost";
+import { AgentVoiceCallWindow } from "./features/agent/AgentVoiceCallWindow";
 import MainLayout from "./components/layout/MainLayout";
 import MessageSelectionShortcut from "./components/message/MessageSelectionShortcut";
 import DesktopNativeNotifications from "./notifications/desktopNative/DesktopNativeNotifications";
@@ -57,19 +58,15 @@ import { getRestoreTimeoutAction } from "./utils/restoreTimeoutPolicy";
 import { shouldRecoverAuthOnBrowserSignal } from "./utils/browserRecoveryPolicy";
 import { PENDING_INVITE_STORAGE_KEY, takePendingInviteRedirectPath } from "./utils/socialAuth";
 import { ssoTestLandingPath } from "./utils/ssoSignIn";
+import { dataExportLandingPath } from "./utils/dataExportLink";
 import { requiresAccountProfileSetup } from "./utils/accountProfileSetup";
-import { useLastLocationResume } from "./hooks/useLastLocationResume";
 import { useEmbedParamsKeeper } from "./hooks/useEmbedParamsKeeper";
-import { readServerSurfaceMemory } from "./hooks/useTabRouteMemory";
+import { placeFor } from "./hooks/placeMemory";
 import {
   consumeServerSelectionRequest,
-  isServerSelectionRequested,
   requestServerSelection,
 } from "./utils/serverSelectionRequest";
-import {
-  isChangePasswordIntentPath,
-  serverEntryPath,
-} from "./utils/changePasswordNavigation";
+import { isChangePasswordIntentPath, serverEntryPath } from "./utils/changePasswordNavigation";
 import { NavigationDepthTracker, useAppNavigate, useHasInAppPageBehind } from "./hooks/useAppNavigate";
 import { useJoinCommunityFlow } from "./hooks/useJoinCommunityFlow";
 import { bootRequestsServerListEarly, isAuthHandoffPage, opensServerFrame } from "./boot/serverFrame";
@@ -89,9 +86,7 @@ import {
   isSlockdevEnvironment,
   shouldAutoLoginSlockdev,
 } from "./utils/devMode";
-import type {
-  AuthView,
-} from "./utils/devMode";
+import type { AuthView } from "./utils/devMode";
 import { emitAuthTraceAndFlush } from "./utils/webAuthTrace";
 import { jointInviteAcceptErrorMessage } from "./utils/jointChannelLimit";
 import { showToast } from "./components/toastBridge";
@@ -108,12 +103,10 @@ import { SecondFactorStepFrame } from "./components/auth/SignInPageFrame";
 import {
   MobileDownloadChooserPage,
   ChineseCommunityPage,
-  AppSumoRedemptionPage,
-  AppSumoServerCreationPage,
-  DeviceLoginPage,
-  DeviceLoginRevokePage,
+  AppSumoRedemptionPage, AppSumoServerCreationPage,
+  DeviceLoginPage, DeviceLoginRevokePage,
   SecondFactorRecoveryLinkPage,
-  AppLoginPage,
+  AppLoginPage, AppStepUpPage,
   HumanLoginSetupPage,
   IntegrationInvitePage,
   ExternalInvitePage,
@@ -166,6 +159,7 @@ function getUrlParams() {
   return {
     authCallback: params.get("auth_callback"),
     appLoginHandoff: !!matchPath("/login/app", window.location.pathname),
+    appStepUp: !!matchPath("/login/app/verify", window.location.pathname), // AppStepUpPage: no web sign-in, the request decides
     verifyToken: params.get("verify"),
     // The verification link's page to land on after verifying (#88); validated by the server and again before use.
     verifyReturnTo: params.get("verify") ? params.get("returnTo") : null,
@@ -459,13 +453,13 @@ function EnvironmentDebugPanel(props: EnvironmentDebugPanelProps) {
   );
 }
 
-/** ServerSelector pick → make it current and open its remembered surface. */
+/** ServerSelector pick → make it current and open its place (placeMemory). */
 function useOpenSelectedServer(replace: boolean) {
   const setCurrent = useServerStore((s) => s.setCurrent);
   const navigate = useNavigate();
   return useCallback((server: Server) => {
     setCurrent(server);
-    navigate(readServerSurfaceMemory(server.slug) ?? `/s/${server.slug}`, { replace });
+    navigate(placeFor(server.slug), { replace });
   }, [navigate, replace, setCurrent]);
 }
 
@@ -485,7 +479,7 @@ export function ServerAccessDeniedPage() {
 
   const leave = useCallback(() => {
     if (fallbackServer) {
-      navigate(readServerSurfaceMemory(fallbackServer.slug) ?? `/s/${fallbackServer.slug}`, { replace: true });
+      navigate(placeFor(fallbackServer.slug), { replace: true });
       return;
     }
     // No known server to go back to, so "/" has none to restore: it shows the picker.
@@ -834,7 +828,7 @@ export function ArtifactPermalinkRoute() {
   const leave = useCallback(() => {
     void serverListSettled().then(() => {
       const slug = artifactLinkLeaveServer(useServerStore.getState().servers, serverPersistence.readLastServerSlug());
-      navigate(slug ? (readServerSurfaceMemory(slug) ?? `/s/${slug}`) : "/", { replace: true });
+      navigate(slug ? placeFor(slug) : "/", { replace: true });
     });
   }, [navigate]);
   const account = useAuthStore((s) => s.user?.email ?? null);
@@ -926,7 +920,7 @@ export function ServerRedirect() {
     // would just re-run ServerRedirect and bounce forward again.
     navigate(serverEntryPath({
       serverSlug: server.slug,
-      rememberedSurface: readServerSurfaceMemory(server.slug),
+      place: placeFor(server.slug),
       changePasswordIntent,
     }), { replace: true });
   }, [changePasswordIntent, navigate, setCurrent]);
@@ -941,18 +935,17 @@ export function ServerRedirect() {
     return <ServerSelector onSelect={openSelectedServer} />;
   }
 
-  // Back from an SSO connection's test sign-in: that Server's SSO settings show the result.
-  const ssoTestLanding = ssoTestLandingPath(location.search, servers);
-  if (ssoTestLanding) return <Navigate to={ssoTestLanding} replace />;
-  // Auto-redirect to last used server
+  // Back from an SSO test sign-in (that Server's SSO settings) or the data export email's link (Account); else the last server used.
   const lastSlug = serverPersistence.readLastServerSlug();
+  const settingsLanding = ssoTestLandingPath(location.search, servers) ?? dataExportLandingPath(location.search, servers, lastSlug);
+  if (settingsLanding) return <Navigate to={settingsLanding} replace />;
   const lastServer = lastSlug ? servers.find((s) => s.slug === lastSlug) : null;
   if (lastServer) {
     return (
       <Navigate
         to={serverEntryPath({
           serverSlug: lastServer.slug,
-          rememberedSurface: readServerSurfaceMemory(lastServer.slug),
+          place: placeFor(lastServer.slug),
           changePasswordIntent,
         })}
         replace
@@ -1213,7 +1206,7 @@ export function AppShell() {
 
   // App handoff and OAuth completion need account identity, not the workspace.
   // The callback navigates to its return URL once authentication completes.
-  const deferServerBootstrap = appLoginHandoff || urlParamsRef.authCallback === "social" || urlParamsRef.authCallback === "sso";
+  const deferServerBootstrap = appLoginHandoff || urlParamsRef.appStepUp || urlParamsRef.authCallback === "social" || urlParamsRef.authCallback === "sso";
 
   // Identity setup is account-global and must complete before any server data
   // or pending invite side effects are loaded. By person and verification, not
@@ -1252,21 +1245,8 @@ export function AppShell() {
     return startServerFeatureFlagRefreshOnFocus();
   }, [signedIn]);
 
-  // Precise PWA resume: restore the last deep location on cold start from `/`.
-  // Only active once the user is authenticated and there's no pending invite,
-  // so it doesn't fight with login / email-verification / invite redirects.
-  const hasPendingInvite = !!localStorage.getItem(PENDING_INVITE_STORAGE_KEY);
-  const canResumeLocation = !!user
-    && !deferServerBootstrap
-    && user.emailVerified
-    && !profileSetupRequired
-    && !urlParams.inviteToken
-    && !urlParams.resetToken
-    && !hasPendingInvite
-    && !serverLoading
-    && !isServerSelectionRequested();
-  const isJoinedServerSlug = useCallback((slug: string) => servers.some((server) => server.slug === slug), [servers]);
-  useLastLocationResume(canResumeLocation, isJoinedServerSlug);
+  // A cold PWA resume lands on `/` (the manifest start_url): ServerRedirect
+  // takes it to the last server's place (placeMemory), the one `/` entry.
 
   // Resume pending invite from localStorage (set during invite flow → login/register)
   // through the invite page, so login completion never mutates membership by
@@ -1284,7 +1264,7 @@ export function AppShell() {
     // oxlint react-doctor/no-chain-state-updates statically rejects listing
     // urlParams.resetToken as a dep. Depending on the mount-frozen ref avoids that
     // while keeping exhaustive-deps satisfied.
-    if (urlParamsRef.resetToken || urlParamsRef.appLoginHandoff || urlParamsRef.deviceLoginRevokeToken || urlParamsRef.secondFactorRecoveryLink || urlParamsRef.accountDeletionCancelLink) return;
+    if (urlParamsRef.resetToken || urlParamsRef.appLoginHandoff || urlParamsRef.appStepUp || urlParamsRef.deviceLoginRevokeToken || urlParamsRef.secondFactorRecoveryLink || urlParamsRef.accountDeletionCancelLink) return;
     const pendingInviteRedirect = takePendingInviteRedirectPath();
     if (!pendingInviteRedirect) return;
 
@@ -1356,6 +1336,8 @@ export function AppShell() {
 
   if (urlParams.authCallback === "social" || urlParams.authCallback === "sso") {
     content = urlParams.authCallback === "sso" ? <Landing><SsoAuthCallbackPage /></Landing> : <Landing><SocialAuthCallbackPage /></Landing>;
+  } else if (urlParams.appStepUp) { // Before any sign-in state: the request names the account, only its passkey answers.
+    content = <Landing><AppStepUpPage /></Landing>;
   } else if (authBootstrapView === "restoring" && offlineUser) {
     // Offline with the last session on the device: its workspace, marked
     // Offline, instead of "Restoring session…" for as long as the network is gone.
@@ -1420,14 +1402,18 @@ export function AppShell() {
       );
     } else if (showPublicArtifact) {
       content = (
-        <Suspense fallback={<ArtifactLinkLoading />}>
-          <PublicArtifactPage
-            id={publicArtifactId ?? undefined}
-            version={publicArtifactVersion}
-            reader={publicArtifactReader}
-            onUnavailable={dismissPublicArtifact}
-          />
-        </Suspense>
+        <div className="flex min-h-0 flex-1 flex-col">
+          <OpenInAppOffers slot="top" />
+          <Suspense fallback={<ArtifactLinkLoading />}>
+            <PublicArtifactPage
+              id={publicArtifactId ?? undefined}
+              version={publicArtifactVersion}
+              reader={publicArtifactReader}
+              onUnavailable={dismissPublicArtifact}
+            />
+          </Suspense>
+          <OpenInAppOffers slot="bottom" />
+        </div>
       );
     } else if (externalInviteToken && !externalInviteLandingDismissed) {
       content = <Landing><ExternalInviteLandingPage token={externalInviteToken} onChoose={leaveExternalInviteLanding} /></Landing>;
@@ -1522,6 +1508,8 @@ export function AppShell() {
       <ImageLightboxHost />
       <DocumentPreviewHost />
       <MediaPreviewHost />
+      {/* Raft voice calls: the call window, kept across navigation (one call at a time). */}
+      {user ? <AgentVoiceCallWindow /> : null}
       {/* Raft Desktop only: Login with Raft for a page of the built-in browser (desktop_browser_raft_sign_in_v0). */}
       <DesktopBrowserSignInHost />
       {/* "Verify it's you" before a sensitive action (secondFactorStepUp.ts). */}

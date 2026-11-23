@@ -47,7 +47,8 @@ import { InlineAudioKeepAliveContext, useInlineAudioKeepAliveScope } from "../..
 import { useAllTimelineRowsMounted } from "../../utils/timelineMountAll";
 import { useTimelineTimeReveal } from "./useTimelineTimeReveal";
 import { useTimelineWidthAnchor } from "./timelineWidthAnchor";
-import { messageRowElements, topVisibleMessage, useSpotBeforeReload } from "./timelineTopRow";
+import type { TimelineTopAnchor } from "./timelineTopRow";
+import { messageRowElements, topAnchorDelta, topVisibleMessage, useSpotBeforeReload } from "./timelineTopRow";
 import { rowViewportPositionOfList, useViewportChangeNotifier, visibleMessageIdsOfList } from "./timelineVisibleRows";
 import type {
   MessageTimelineHandle,
@@ -207,7 +208,7 @@ const VirtualMessageTimeline = forwardRef<MessageTimelineHandle, MessageTimeline
 
     // A layout anchor taken before an expected width change (thread open):
     // the top message and its offset, put back exactly once the list resizes.
-    const layoutAnchorRef = useRef<{ id: string; offset: number; until: number } | null>(null);
+    const layoutAnchorRef = useRef<(TimelineTopAnchor & { until: number }) | null>(null);
     const widthAnchor = useTimelineWidthAnchor(keepTopOnWidthChange, listEl, topVisibleMessage, followRef);
 
     // A programmatic jump owns its scroll events: a gesture just before it
@@ -221,6 +222,7 @@ const VirtualMessageTimeline = forwardRef<MessageTimelineHandle, MessageTimeline
     // the list (raft-ui 0.12.0) holds the jump's row by key.
     const scrollToKey = useCallback((messageId: string, align: "start" | "center" | "end", smooth = false) => {
       dropGestureAttribution();
+      layoutAnchorRef.current = null;
       const key = rowKeyOfMessageId(messageId);
       parentAnchorRef.current = key.startsWith("parent:");
       apiRef.current?.scrollTo({
@@ -228,16 +230,19 @@ const VirtualMessageTimeline = forwardRef<MessageTimelineHandle, MessageTimeline
         align,
         behavior: smooth ? "smooth" : "instant",
       });
-    }, [dropGestureAttribution, rowKeyOfMessageId]);
+      widthAnchor.note();
+    }, [dropGestureAttribution, rowKeyOfMessageId, widthAnchor]);
 
     // While a smooth scroll to the bottom runs, its frames are short of the
     // bottom without being a reason to stop following.
     const smoothBottomUntilRef = useRef(0);
     const scrollToBottom = useCallback((smooth = false) => {
+      layoutAnchorRef.current = null;
       parentAnchorRef.current = false;
       if (smooth) smoothBottomUntilRef.current = performance.now() + 1000;
       apiRef.current?.scrollTo({ position: "bottom", behavior: smooth ? "smooth" : "instant" });
-    }, []);
+      widthAnchor.note();
+    }, [widthAnchor]);
 
     // The message rows in view, plus as many again below them: roughly one
     // viewport of lookahead (the rows below the view aren't mounted, so the
@@ -388,7 +393,9 @@ const VirtualMessageTimeline = forwardRef<MessageTimelineHandle, MessageTimeline
       }
       scheduleVisibleWindowReport();
       maybeLoadEdges();
-      widthAnchor.note();
+      if (followRef.current || !(layoutAnchorRef.current !== null && performance.now() <= layoutAnchorRef.current.until)) {
+        widthAnchor.note();
+      }
       notifyVisible();
     }, [listEl, maybeLoadEdges, notifyVisible, scheduleVisibleWindowReport, updateAtBottom, widthAnchor]);
 
@@ -419,9 +426,11 @@ const VirtualMessageTimeline = forwardRef<MessageTimelineHandle, MessageTimeline
       const focus = sourceRef.current.initialFocusMessageId;
       if (!focus && sourceRef.current.initialAtStart && rowsRef.current[0]) {
         // The history paywall a jump to an old message lands on: the top.
+        layoutAnchorRef.current = null;
         followRef.current = false;
         restoredRef.current = true;
         apiRef.current?.scrollTo({ key: messageTimelineRowKey(rowsRef.current[0]), align: "start", behavior: "instant" });
+        widthAnchor.note();
         return;
       }
       const saved = persistKeyRef.current ? recallScroll(persistKeyRef.current) : undefined;
@@ -445,7 +454,7 @@ const VirtualMessageTimeline = forwardRef<MessageTimelineHandle, MessageTimeline
         followRef.current = true;
         scrollToBottom();
       }
-    }, [hasRowFor, messages, scrollToBottom, scrollToKey]);
+    }, [hasRowFor, messages, scrollToBottom, scrollToKey, widthAnchor]);
 
     useLayoutEffect(() => {
       const jump = pendingJumpRef.current;
@@ -482,11 +491,13 @@ const VirtualMessageTimeline = forwardRef<MessageTimelineHandle, MessageTimeline
       prevAtStartKeyRef.current = atStartKey;
       const first = rowsRef.current[0];
       if (atStartKey === null || !didInitialRef.current || !first) return;
+      layoutAnchorRef.current = null;
       followRef.current = false;
       armedFollowRef.current = false;
       restoredRef.current = true;
       apiRef.current?.scrollTo({ key: messageTimelineRowKey(first), align: "start", behavior: "instant" });
-    }, [atStartKey]);
+      widthAnchor.note();
+    }, [atStartKey, widthAnchor]);
 
     // Appends while following the bottom stay pinned. Prepends need nothing:
     // keepAnchorOnItemsChange keeps the row on screen in place.
@@ -529,14 +540,35 @@ const VirtualMessageTimeline = forwardRef<MessageTimelineHandle, MessageTimeline
       return () => cancelAnimationFrame(id);
     }, [listEl, messages, maybeLoadEdges, scheduleVisibleWindowReport, updateAtBottom]);
 
+    const restoreLayoutAnchor = useCallback((): boolean => {
+      const anchor = layoutAnchorRef.current;
+      if (!anchor) return false;
+      if (performance.now() > anchor.until) {
+        layoutAnchorRef.current = null;
+        return false;
+      }
+      const el = listEl();
+      const row = el?.querySelector<HTMLElement>(messageRowSelector(anchor.id));
+      if (!el || !row) return true;
+      const delta = topAnchorDelta(el, row, anchor);
+      if (Math.abs(delta) > 0.5) el.scrollTop += delta;
+      // Kept across a width change and every reply fits again: follow it again.
+      if (keepTopOnWidthChange && el.scrollHeight - el.clientHeight <= 1) {
+        followRef.current = true;
+        layoutAnchorRef.current = null;
+        widthAnchor.note();
+      }
+      return true;
+    }, [keepTopOnWidthChange, listEl, widthAnchor]);
+
     // Rows growing or shrinking (images, reactions, edits, a reply streaming
     // in, the typing line in the footer) change the content's height: stay on
-    // the bottom while following it.
+    // the bottom while following it, or re-pin an active width-change anchor.
     const onContentResize = useCallback(() => {
       if (followRef.current && !sourceRef.current.hasNewer) scrollToBottom();
-      widthAnchor.note();
+      else if (!restoreLayoutAnchor()) widthAnchor.note();
       notifyVisible();
-    }, [notifyVisible, scrollToBottom, widthAnchor]);
+    }, [notifyVisible, restoreLayoutAnchor, scrollToBottom, widthAnchor]);
 
     // The scroller resized (a thread opening beside the channel, the window,
     // the soft keyboard): re-pin while following, else put back the anchor
@@ -552,31 +584,10 @@ const VirtualMessageTimeline = forwardRef<MessageTimelineHandle, MessageTimeline
         if (kept !== "end") armedFollowRef.current = false;
         layoutAnchorRef.current = kept === "end" ? null : { ...kept, until: performance.now() + ANCHOR_PRESERVE_LAYOUT_CHANGE_MS };
       }
-      if (followRef.current && !sourceRef.current.hasNewer) {
-        scrollToBottom();
-        return;
-      }
-      const anchor = layoutAnchorRef.current;
-      if (!anchor) return;
-      if (performance.now() > anchor.until) {
-        layoutAnchorRef.current = null;
-        return;
-      }
-      const adjust = () => {
-        const el = listEl();
-        const row = el?.querySelector<HTMLElement>(messageRowSelector(anchor.id));
-        if (!el || !row) return;
-        const delta = row.getBoundingClientRect().top - el.getBoundingClientRect().top - anchor.offset;
-        if (Math.abs(delta) > 0.5) el.scrollTop += delta;
-        // Kept across a width change and still at the end (the replies fit again): follow it again.
-        if (keepTopOnWidthChange && distanceFromBottom(el) <= 1) followRef.current = true;
-        widthAnchor.note();
-      };
-      // A width change has laid the rows out already: put the message back now too (a list with every row mounted
-      // runs no adjusting task), and again as the rows are measured.
-      if (kept) adjust();
-      apiRef.current?.submitScrollAdjustingTask(adjust);
-    }, [keepTopOnWidthChange, listEl, notifyVisible, scrollToBottom, widthAnchor]);
+      if (followRef.current && !sourceRef.current.hasNewer) { scrollToBottom(); return; }
+      if (!restoreLayoutAnchor()) return;
+      apiRef.current?.submitScrollAdjustingTask(() => { restoreLayoutAnchor(); });
+    }, [listEl, notifyVisible, restoreLayoutAnchor, scrollToBottom, widthAnchor]);
 
     const preserveViewport = useCallback(() => {
       // An in-message expansion is a reading action: stop following so the
@@ -599,15 +610,17 @@ const VirtualMessageTimeline = forwardRef<MessageTimelineHandle, MessageTimeline
         const rect = row.getBoundingClientRect();
         const align = rect.bottom <= view.top ? "start" : rect.top >= view.bottom ? "end" : null;
         if (!align) return;
+        layoutAnchorRef.current = null;
         followRef.current = false;
         armedFollowRef.current = false;
         apiRef.current?.scrollTo({ key: rowKeyOfMessageId(messageId), align });
+        widthAnchor.note();
       });
       // Called on the click, before the collapse renders: the observer's
       // first report comes after that render's layout, before paint.
       ro.observe(row);
       const timeout = window.setTimeout(() => ro.disconnect(), 1000);
-    }, [listEl, rowKeyOfMessageId]);
+    }, [listEl, rowKeyOfMessageId, widthAnchor]);
 
     useImperativeHandle(ref, (): MessageTimelineHandle => ({
       scrollToTop: () => {
@@ -622,13 +635,13 @@ const VirtualMessageTimeline = forwardRef<MessageTimelineHandle, MessageTimeline
         // replayed as rows are measured, so it lands.
         parentAnchorRef.current = false;
         apiRef.current?.scrollTo({ position: "top" });
+        widthAnchor.note();
       },
       scrollToBottom: ({ smooth = false } = {}) => {
         pendingJumpRef.current = null;
         const key = persistKeyRef.current;
         if (key) forgetScroll(key);
         restoredRef.current = false;
-        layoutAnchorRef.current = null;
         followRef.current = true;
         armedFollowRef.current = true;
         dropGestureAttribution();
@@ -642,7 +655,6 @@ const VirtualMessageTimeline = forwardRef<MessageTimelineHandle, MessageTimeline
         pendingJumpRef.current = null;
         followRef.current = false;
         armedFollowRef.current = false;
-        layoutAnchorRef.current = null;
         scrollToKey(id, align, smooth);
       },
       isAtBottom: () => atBottom,
@@ -660,11 +672,12 @@ const VirtualMessageTimeline = forwardRef<MessageTimelineHandle, MessageTimeline
         layoutAnchorRef.current = null;
         armedFollowRef.current = true;
         followRef.current = true;
+        widthAnchor.note();
       },
       getMessages: () => messageTimelineMessages(leadingRowsRef.current, messagesRef.current),
       getVisibleMessageIds: (options) => visibleMessageIdsOfList(apiRef.current, rowsRef.current, options?.bottomOcclusion),
       getMessageViewportPosition: (id, options) => rowViewportPositionOfList(apiRef.current, rowsRef.current, rowKeyOfMessageId(id), options?.bottomOcclusion),
-    }), [atBottom, dropGestureAttribution, hasRowFor, listEl, rowKeyOfMessageId, scrollToBottom, scrollToKey]);
+    }), [atBottom, dropGestureAttribution, hasRowFor, listEl, rowKeyOfMessageId, scrollToBottom, scrollToKey, widthAnchor]);
 
     const renderRow = useCallback(
       ({ domRef, item, index, style }: VirtualListItemRenderProps<MessageTimelineRow>) => {

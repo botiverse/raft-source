@@ -1,5 +1,5 @@
 import { STORED_ACTION_CARD_ACTION_TYPES, type StoredActionCardActionType } from "./actionCards";
-import type { ServerCapability } from "./serverPermissions";
+import { createChannelCapabilityFor, type ServerCapability } from "./serverPermissions";
 
 /**
  * What a person needs, beyond operating cards in the card's channel, to run
@@ -7,7 +7,8 @@ import type { ServerCapability } from "./serverPermissions";
  * exhaustive table: a new type does not compile without its row.
  *
  * - `capability`: the server capability the action itself takes, the same one
- *   its own route asks for (POST /api/channels takes createChannels, ...).
+ *   its own route asks for (POST /api/channels takes createPublicChannels or
+ *   createPrivateChannels by the card's `visibility`, ...).
  * - `agent`: the capability, or the authority over the card's Agent its own
  *   route accepts instead (its creator / assistant owner).
  * - `none`: the type takes no server permission; `why` says what decides instead.
@@ -24,10 +25,17 @@ function assertNeverActionCardType(type: never): never {
   throw new Error(`Action card type without an authority row: ${String(type)}`);
 }
 
-export function actionCardTypeAuthority(type: StoredActionCardActionType): ActionCardTypeAuthority {
+/**
+ * `payload` is the card's stored action; only channel:create reads it (its
+ * `visibility`). Without it a channel:create card is taken as public, its
+ * schema's default.
+ */
+export function actionCardTypeAuthority(type: StoredActionCardActionType, payload?: unknown): ActionCardTypeAuthority {
   switch (type) {
-    case "channel:create":
-      return { kind: "capability", capability: "createChannels", why: "creates a channel, as POST /api/channels" };
+    case "channel:create": {
+      const visibility = (payload as { visibility?: unknown } | null | undefined)?.visibility;
+      return { kind: "capability", capability: createChannelCapabilityFor(visibility), why: "creates a channel of the card's visibility, as POST /api/channels" };
+    }
     case "agent:create":
       return { kind: "capability", capability: "createAgents", why: "creates an Agent, as the Create Agent dialog" };
     case "channel:add_member":

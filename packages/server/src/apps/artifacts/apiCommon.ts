@@ -35,7 +35,7 @@ import {
 import { consumeAgentObjectNotices, markObjectRead } from "../../platform/activity";
 import { actorKey, actorNames } from "../../platform/actors";
 import type { AppNoticeOutbox, AppPaywallHit } from "../../platform/apps";
-import { agentConversationRefs, conversationNames, type ConversationName, type ConversationType } from "../../platform/conversations";
+import { agentConversationRefs, conversationNames, UNRESOLVED_JOINT_HOME, unresolvedJointHomes, type ConversationName, type ConversationType } from "../../platform/conversations";
 import { getDb, type DatabaseExecutor } from "../../platform/db";
 import {
   agentQuotaUpgradeHint,
@@ -45,10 +45,10 @@ import {
   type FileUploadQuotaExceededResponse,
   type UpgradeCardUploadSubject,
 } from "../../platform/fileUploadQuota";
-import { appEnabled, appEnabledOnLiveServer, appEnabledOnLiveServers } from "../../platform/flags";
+import { appEnabled } from "../../platform/flags";
 import { appUrl, serverNames } from "../../platform/links";
 import { refusalBody, type RefusalInput } from "../../platform/refusals";
-import { seenThroughJoint, type ServerViewActor } from "../../platform/visibility";
+import { objectServersAnswer, seenThroughJoint, type ObjectAccess, type ServerViewActor } from "../../platform/visibility";
 import { artifactR2Store, type ArtifactBlobBytes, type ArtifactBlobReader } from "./blobStore";
 // Registers what answers workspace_artifacts_v0 (the deployment, not Feature Flag Admin) before anything here asks it.
 import "./deployment";
@@ -68,6 +68,7 @@ import {
 } from "./schema";
 import { namedForLookup, titledForLookup } from "./names";
 import { ARTIFACT_OBJECT_KIND, ARTIFACTS_SYSTEM_APP } from "./kinds";
+import { reopenedOf, settledOf, settledServers, type SettledState } from "./settledState";
 import { canViewArtifacts, type ArtifactVisibilitySubject } from "./visibility";
 
 /** The calling agent, from its credential. */
@@ -181,7 +182,7 @@ export interface QuotaCardPlace {
  * them there and as `details` (FILE_UPLOAD_QUOTA_EXCEEDED is in
  * REFUSAL_CODES). The agent API's (CLI and SDK publish, save, import), so the
  * next action is the agent's: say why the file wasn't uploaded, and a server
- * owner can look at Settings > Billing. `via`: the write refused, for the
+ * owner can look at Settings > Plan & billing. `via`: the write refused, for the
  * `paywall_hit` core records with it (an agent's: no person).
  *
  * `card` (QuotaCardPlace): the agent, the conversation an upgrade card for
@@ -344,7 +345,7 @@ export function unseenChangesError(what: "push" | "comment" | "review", counts: 
  * takesPartIn: another server's public one): it sees the Artifact already, so
  * saying why tells nothing more.
  */
-export const takePartForbiddenError = (verb: "comment on it" | "follow it" | "review it" | "push to it" | "comment on it or follow it" | "resolve or reopen its threads"): string =>
+export const takePartForbiddenError = (verb: "comment on it" | "follow it" | "review it" | "push to it" | "comment on it or follow it" | "resolve or reopen its threads" | "settle or unsettle it"): string =>
   `You can see this artifact but can't ${verb}: only members and agents of its own server, or of the joint channel it lives in, can, so ask one of them instead.`;
 
 export const mayNotTakePart = (verb: Parameters<typeof takePartForbiddenError>[0]): ArtifactApiError => fail(403, { code: "FORBIDDEN", error: takePartForbiddenError(verb) });
@@ -382,21 +383,61 @@ export function artifactsEnabled(serverId: ServerId, opts?: { executor?: Databas
   return appEnabled(serverId, WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY, opts);
 }
 
+/** An item's own server and home, as whether it is read or written at all asks them. */
+type ItemServerHome = Pick<ArtifactItemRow, "serverId" | "homeKind" | "homeChannelId">;
+
 /**
- * Whether an Artifact of this server is read at all: Artifacts is on for the
- * deployment (artifactsEnabled: one answer, the reader's server's and the
- * Artifact's can't differ) and the item's own server still exists. A
- * soft-deleted server keeps its rows, and none of its Artifacts is read any
- * more, by another server's reader, a joint's other side or a signed-out
- * visitor (platform/flags appEnabledOnLiveServer; Tenny on #11397).
+ * Whether an Artifact is read at all, one answer per item in input order:
+ * Artifacts is on for the deployment (artifactsEnabled: one answer, the
+ * reader's server's and the Artifact's can't differ) and the item's own
+ * server still exists, or was closed but the item is kept in a joint channel
+ * that server is still in (platform/visibility objectServersAnswer `read`,
+ * closedServerJointObjects): such an Artifact is read-only
+ * (requireWritable), read by the joint's people on live servers as before.
+ * Any other Artifact of a soft-deleted server is read by no one, another
+ * server's reader, a joint's other side or a signed-out visitor alike (Tenny
+ * on #11397). Who reads it is canViewArtifacts's.
  */
-export function itemServerEnabled(item: Pick<ArtifactItemRow, "serverId">): Promise<boolean> {
-  return appEnabledOnLiveServer(item.serverId, WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY);
+export function itemsReadable(items: readonly ItemServerHome[]): Promise<boolean[]> {
+  return objectServersAnswer(items, WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY, { access: "read" });
 }
 
-/** itemServerEnabled for many Artifacts, one answer per item in input order, in one batched read. */
-export function itemsServerEnabled(items: ReadonlyArray<Pick<ArtifactItemRow, "serverId">>): Promise<boolean[]> {
-  return appEnabledOnLiveServers(items.map((item) => item.serverId), WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY);
+/** itemsReadable for one item. */
+export async function itemReadable(item: ItemServerHome): Promise<boolean> {
+  return (await itemsReadable([item]))[0]!;
+}
+
+/**
+ * The one sentence every write to a closed server's Artifact is refused with
+ * (403 FORBIDDEN): kept in a joint channel its server is still in, it is
+ * read there and never changed (requireWritable), but taken down or
+ * restored by the joint's managers on its host (takedown.ts).
+ */
+export const CLOSED_SERVER_READ_ONLY_ERROR = "This artifact's server was closed, so the artifact is read-only now: it can still be opened and read here, but nobody can publish to it, comment on it, follow it, move, rename or delete it any more. Only the people who manage this shared channel on its host server can take it down: ask one of them to.";
+
+/** The refusal of a write to a closed server's Artifact (requireWritable, the web's visibleItemFor): 403 FORBIDDEN. */
+export const CLOSED_SERVER_READ_ONLY = { code: "FORBIDDEN", error: CLOSED_SERVER_READ_ONLY_ERROR } as const;
+
+/**
+ * Refuse an agent's write (a version, a comment or reply, a review, a
+ * resolve, a follow, a move, a delete) to an item whose own server is
+ * closed: 403 CLOSED_SERVER_READ_ONLY. For an item the caller already sees
+ * (it resolved it, itemsReadable): one of a closed server is then one kept
+ * in a joint. Nobody acts from a closed server, so every write to it would
+ * come from another server's person or agent.
+ */
+export async function requireWritable(item: ItemServerHome): Promise<void> {
+  if (!(await itemWritable(item))) throw new ArtifactApiFailure(fail(403, CLOSED_SERVER_READ_ONLY));
+}
+
+/**
+ * Whether an item may be written at all (a version, a comment, a publish
+ * check's run): Artifacts on for the deployment and the item's own server
+ * live (objectServersAnswer `write`). False for a closed server's Artifact,
+ * kept in a joint or not.
+ */
+export async function itemWritable(item: ItemServerHome): Promise<boolean> {
+  return (await objectServersAnswer([item], WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY, { access: "write" }))[0]!;
 }
 
 /**
@@ -415,18 +456,19 @@ export async function requireEnabled(caller: { serverId: ServerId }): Promise<vo
   if (!(await artifactsEnabled(caller.serverId))) throw new ArtifactApiFailure(ARTIFACTS_NOT_ENABLED);
 }
 
-/** Of `candidates`, those the viewer can see whose own server still exists (itemServerEnabled). */
+/** Of `candidates`, those the viewer can see that are read at all (itemsReadable). */
 async function seenOf(viewer: ServerViewActor, candidates: ArtifactItemRow[]): Promise<ArtifactItemRow[]> {
   if (candidates.length === 0) return [];
-  const [visible, enabled] = await Promise.all([canViewArtifacts(viewer, candidates), itemsServerEnabled(candidates)]);
-  return candidates.filter((_, index) => visible[index] && enabled[index]);
+  const [visible, readable] = await Promise.all([canViewArtifacts(viewer, candidates), itemsReadable(candidates)]);
+  return candidates.filter((_, index) => visible[index] && readable[index]);
 }
 
 /**
  * The Artifact `ref` names if Artifacts is on for the deployment
  * (requireEnabled, first: 403 ARTIFACTS_NOT_ENABLED before reading
- * anything), the agent can see it and the Artifact's own server still
- * exists (itemServerEnabled); otherwise 404 NOT_VISIBLE. `ref`, trimmed, is
+ * anything), the agent can see it and it is read at all (itemsReadable);
+ * otherwise 404 NOT_VISIBLE. For a `write`, then, one of a closed server
+ * (kept in a joint, read-only) is 403 FORBIDDEN (requireWritable). `ref`, trimmed, is
  * looked up in this order, the first that finds a visible Artifact winning
  * (#proj-workspace:98241a2e: an Artifact is its id and its title):
  *
@@ -453,6 +495,7 @@ const REFUSAL_SENTENCE_MAX_CHARS = 500;
 function homeWords(home: AgentApiArtifactHome): string {
   if (home.kind === "server") return home.serverName ? `everyone in ${home.serverName}` : "the whole server";
   if (home.kind === "public") return "anyone with the link";
+  if (home.conversation.target === null && home.conversation.type === "joint") return "a shared channel your server is no longer in";
   return home.conversation.target ?? "a deleted conversation";
 }
 
@@ -477,7 +520,7 @@ export function quotedPath(path: string): string {
   return JSON.stringify(chars.length > 160 ? `${chars.slice(0, 159).join("")}…` : path);
 }
 
-export async function resolveVisibleItem(agent: ArtifactAgent, rawRef: string): Promise<ArtifactItemRow> {
+export async function resolveVisibleItem(agent: ArtifactAgent, rawRef: string, access: ObjectAccess): Promise<ArtifactItemRow> {
   await requireEnabled(agent);
   const ref = rawRef.trim();
   const id = parseArtifactId(ref);
@@ -503,25 +546,28 @@ export async function resolveVisibleItem(agent: ArtifactAgent, rawRef: string): 
       details: { ref, candidates: seen.map((item) => ({ id: item.id, title: item.title, home: homes.get(item.id)! })) },
     }));
   }
+  if (access === "write") await requireWritable(seen[0]!);
   return seen[0]!;
 }
 
 /**
  * The Artifact `ref` names by its id alone (a `pt_…` id, a short id or a
  * link's, parseArtifactId), if Artifacts is on for the deployment
- * (requireEnabled, first), `viewer` can see it and its own server still
- * exists (itemServerEnabled); otherwise the one 404 NOT_VISIBLE. No title or
+ * (requireEnabled, first), `viewer` can see it and it is read at all
+ * (itemsReadable); otherwise the one 404 NOT_VISIBLE; for a `write`, one of
+ * a closed server is then 403 FORBIDDEN (requireWritable). No title or
  * old name is looked up: a caller that already holds the id (a person's
  * write through their assistant, publishAs.ts) names one Artifact, never an
  * ambiguous few, so no other Artifact's home is ever named to it.
  */
-export async function resolveVisibleItemById(viewer: ServerViewActor, rawRef: string): Promise<ArtifactItemRow> {
+export async function resolveVisibleItemById(viewer: ServerViewActor, rawRef: string, access: ObjectAccess): Promise<ArtifactItemRow> {
   await requireEnabled(viewer);
   const id = parseArtifactId(rawRef.trim());
   if (id === null) throw new ArtifactApiFailure(notVisible());
   const [item] = await getDb().select().from(artifactItems).where(eq(artifactItems.id, id)).limit(1);
   const [seen] = item ? await seenOf(viewer, [item]) : [];
   if (!seen) throw new ArtifactApiFailure(notVisible());
+  if (access === "write") await requireWritable(seen);
   return seen;
 }
 
@@ -571,7 +617,8 @@ export const readsAsOutsider = (serverId: ServerId, item: Pick<ArtifactItemRow, 
  * see. `inside`: the item is its own server's, so it may see who else is
  * there and manage it. `historyLimited` and no `comments`: it reads as an
  * outsider (readsAsOutsider), so the current version only and no comments.
- * Taking part (commenting, following, a read position) is takesPartIn's.
+ * Taking part (commenting, following) is takesPartIn's; the reader's own
+ * state (a read position, stopping a follow) keepsOwnStateOn's.
  */
 export function accessOf(reader: { serverId: ServerId }, item: Pick<ArtifactItemRow, "serverId" | "homeKind">): { inside: boolean; historyLimited: boolean; comments: boolean } {
   const outsider = readsAsOutsider(reader.serverId, item);
@@ -580,15 +627,35 @@ export function accessOf(reader: { serverId: ServerId }, item: Pick<ArtifactItem
 
 /**
  * Whether a reader (a person on the web, an agent) takes part in an item:
- * comments, replies, reviews and follows it and keeps a read position on it.
+ * comments, replies, reviews and follows it (its own state on it, a read
+ * position, is keepsOwnStateOn's).
  * The item is its own server's, or another server's homed in a joint channel
  * the reader sees it through, as it writes in that channel (Tenny on #68):
  * platform/visibility seenThroughJoint, the rule core's Activity asks of
- * another server's rows too, so leaving the joint ends both at once. Only
+ * another server's rows too, so leaving the joint ends both at once (asked
+ * for `write`: nobody takes part in a closed server's Artifact, which
+ * Activity still lists, read-only). Only
  * the caller's sight of the item is assumed (it resolved it); no other way of
  * seeing another server's item (a public one) lets it take part.
  */
-export async function takesPartIn(reader: ServerViewActor, item: ArtifactVisibilitySubject & Pick<ArtifactItemRow, "id">): Promise<boolean> {
+export function takesPartIn(reader: ServerViewActor, item: ArtifactVisibilitySubject & Pick<ArtifactItemRow, "id">): Promise<boolean> {
+  return insideOrThroughJoint(reader, item, "write");
+}
+
+/**
+ * Whether a reader keeps its own state on an item it reads: its read
+ * position (which reads its Activity row too) and stopping its own follow.
+ * takesPartIn's rule asked for `read`: the same readers, and also on a closed
+ * server's Artifact kept in a joint (read-only, where takesPartIn is false).
+ * Nothing it lets through writes to the Artifact; an outsider of a public
+ * one still keeps none.
+ */
+export function keepsOwnStateOn(reader: ServerViewActor, item: ArtifactVisibilitySubject & Pick<ArtifactItemRow, "id">): Promise<boolean> {
+  return insideOrThroughJoint(reader, item, "read");
+}
+
+/** The item is the reader's own server's, or seen through a joint (seenThroughJoint, for `access`). */
+async function insideOrThroughJoint(reader: ServerViewActor, item: ArtifactVisibilitySubject & Pick<ArtifactItemRow, "id">, access: ObjectAccess): Promise<boolean> {
   if (item.serverId === reader.serverId) return true;
   const seen = await seenThroughJoint(reader, [{
     id: item.id,
@@ -596,7 +663,7 @@ export async function takesPartIn(reader: ServerViewActor, item: ArtifactVisibil
     homeKind: item.homeKind,
     homeChannelId: item.homeChannelId,
     author: { type: item.createdByType, id: item.createdById },
-  }], WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY);
+  }], WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY, { access });
   return seen.has(item.id);
 }
 
@@ -737,12 +804,15 @@ export async function homesOf(agent: ArtifactAgent, items: readonly ArtifactItem
     channelIds.length > 0 ? agentConversationRefs(agent, channelIds) : new Map<string, { id: string; type: ConversationType; target: string | null }>(),
     serverNames(serverIds),
   ]);
+  // A joint the agent's server has no projection of: no id (never the joint's storage channel's), a joint, so its words say so.
+  const unresolvedJoints = await unresolvedJointHomes(channelIds, refs);
   return new Map(items.map((item): [string, AgentApiArtifactHome] => {
     if (item.homeKind === "server") {
       const serverName = names.get(item.serverId);
       return [item.id, serverName === undefined ? { kind: "server" } : { kind: "server", serverName }];
     }
     if (item.homeKind !== "conversation") return [item.id, { kind: item.homeKind }];
+    if (item.homeChannelId && unresolvedJoints.has(item.homeChannelId)) return [item.id, { kind: "conversation", conversation: { id: UNRESOLVED_JOINT_HOME.id, type: UNRESOLVED_JOINT_HOME.type, target: UNRESOLVED_JOINT_HOME.target } }];
     const ref = item.homeChannelId ? refs.get(item.homeChannelId) : undefined;
     return [item.id, { kind: "conversation", conversation: { id: ref?.id ?? item.homeChannelId, type: ref?.type ?? null, target: ref?.target ?? null } }];
   }));
@@ -752,7 +822,7 @@ export async function summarize(
   agent: ArtifactAgent,
   items: readonly ArtifactItemRow[],
 ): Promise<AgentApiArtifactSummary[]> {
-  return summariesWith(items, await homesOf(agent, items));
+  return summariesWith(agent.serverId, items, await homesOf(agent, items));
 }
 
 /**
@@ -772,19 +842,28 @@ export async function summarizeForPerson(
     channelIds.length > 0 ? conversationNames(reader, channelIds) : new Map<string, ConversationName>(),
     serverNames(items.flatMap((item) => (item.homeKind === "server" ? [item.serverId] : []))),
   ]);
+  const unresolvedJoints = await unresolvedJointHomes(channelIds, names);
   const homes = new Map(items.map((item): [string, AgentApiArtifactHome] => {
     if (item.homeKind === "server") {
       const serverName = servers.get(item.serverId);
       return [item.id, serverName === undefined ? { kind: "server" } : { kind: "server", serverName }];
     }
     if (item.homeKind !== "conversation") return [item.id, { kind: item.homeKind }];
+    if (item.homeChannelId && unresolvedJoints.has(item.homeChannelId)) return [item.id, { kind: "conversation", conversation: { id: UNRESOLVED_JOINT_HOME.id, type: UNRESOLVED_JOINT_HOME.type, target: null } }];
     const named = item.homeChannelId ? names.get(item.homeChannelId) : undefined;
     return [item.id, { kind: "conversation", conversation: { id: named?.id ?? item.homeChannelId, type: named?.type ?? null, target: null } }];
   }));
-  return summariesWith(items, homes);
+  return summariesWith(reader.serverId, items, homes);
 }
 
+/**
+ * The summaries of `items` for a reader of `readerServerId`: with `settled`
+ * and `reopened` (#334, settle.ts) where the item's server has Settled on and
+ * the reader isn't an outsider to it (another server's public Artifact, as
+ * the signed-out page shows no Settled either); absent otherwise.
+ */
 async function summariesWith(
+  readerServerId: ServerId,
   items: readonly ArtifactItemRow[],
   homes: ReadonlyMap<string, AgentApiArtifactHome>,
 ): Promise<AgentApiArtifactSummary[]> {
@@ -796,8 +875,25 @@ async function summariesWith(
       .where(and(inArray(artifactVersions.id, currentIds), isNull(artifactVersions.revokedAt), isNotNull(artifactVersions.position)))
     : [];
   const currentById = new Map(currents.map((version) => [version.id, version]));
-  const name = await namer(items.map((item) => ({ type: item.createdByType, id: item.createdById })));
+  const settling = items.filter((item) => !readsAsOutsider(readerServerId, item));
+  const settledOn = await settledServers(settling.map((item) => item.serverId));
+  const shownSettled = (item: ArtifactItemRow): boolean => settledOn.has(item.serverId) && !readsAsOutsider(readerServerId, item);
+  const settlers = items.filter(shownSettled).flatMap((item) => {
+    const settle = settledOf(item) ?? reopenedOf(item)?.was;
+    return settle ? [settle.by] : [];
+  });
+  const name = await namer([...items.map((item) => ({ type: item.createdByType, id: item.createdById })), ...settlers]);
   const origin = appUrl();
+  const settledFields = (item: ArtifactItemRow): Pick<AgentApiArtifactSummary, "settled" | "reopened"> => {
+    if (!shownSettled(item)) return {};
+    const settled = settledOf(item);
+    const reopened = reopenedOf(item);
+    const shown = (settle: SettledState) => ({ by: name(settle.by), at: settle.at.toISOString(), version: settle.version });
+    return {
+      settled: settled ? shown(settled) : null,
+      reopened: reopened ? { version: reopened.version, was: shown(reopened.was) } : null,
+    };
+  };
   return items.map((item) => {
     const current = item.currentVersionId ? currentById.get(item.currentVersionId) : undefined;
     return {
@@ -812,6 +908,7 @@ async function summariesWith(
       author: name({ type: item.createdByType, id: item.createdById }),
       createdAt: item.createdAt.toISOString(),
       updatedAt: item.updatedAt.toISOString(),
+      ...settledFields(item),
     };
   });
 }

@@ -17,6 +17,8 @@
 
 import {
   bothComputerVersionsKnown,
+  compareComputerVersions,
+  isComputerSemver,
   isComputerOutdated,
   normalizeComputerReleaseNotes,
 } from "@botiverse/raft-shared";
@@ -102,7 +104,51 @@ export function getLatestComputerReleaseNotes(): ComputerReleaseNotes | null {
   return notes.version === cachedLatestComputerVersion ? notes : null;
 }
 
+/** The Hands channels an install command can name: prod installs `main`, staging `alpha`. */
+export type ComputerInstallChannel = "main" | "alpha";
+export const COMPUTER_INSTALL_CHANNELS: readonly ComputerInstallChannel[] = ["main", "alpha"];
+
+const channelVersionCache = new Map<ComputerInstallChannel, { version: string; fetchedAt: number }>();
+/** How long a caller waits for Hands when the channel's version is not cached. */
+export const CHANNEL_VERSION_LOOKUP_TIMEOUT_MS = 2_000;
+
+/**
+ * The version a fresh install from `channel` gets right now, for decisions
+ * that must hold for the command a person is about to run (Add Computer's
+ * pairing). Unlike getLatestComputerVersion this waits for Hands when nothing
+ * fresh is cached, bounded by a timeout; unknown (privacy mode, Hands down or
+ * slow, an unparseable answer) is null, and callers treat null as "no".
+ */
+export async function getInstallableComputerVersion(
+  channel: ComputerInstallChannel,
+  timeoutMs = CHANNEL_VERSION_LOOKUP_TIMEOUT_MS,
+): Promise<string | null> {
+  if (isPrivacyModeOn()) return null;
+  const cached = channelVersionCache.get(channel);
+  if (cached && Date.now() - cached.fetchedAt < REFRESH_INTERVAL_MS) return cached.version;
+  try {
+    const url = "https://hands.build/public/v2/apps/raft-computer-cli/updates/check" +
+      `?product_type=cli-binary&current_version=0.0.0&platform=linux&arch=x64&channel=${channel}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { release?: { version?: unknown } } | null;
+    const version = data?.release?.version;
+    if (typeof version !== "string" || !isComputerSemver(version)) return null;
+    channelVersionCache.set(channel, { version, fetchedAt: Date.now() });
+    return version;
+  } catch {
+    return null;
+  }
+}
+
+/** `version` is known, parseable and at least `minimum` (SemVer precedence). */
+export function computerVersionAtLeast(version: string | null | undefined, minimum: string): boolean {
+  if (!version || !isComputerSemver(version)) return false;
+  return compareComputerVersions(version, minimum) >= 0;
+}
+
 export function __resetLatestComputerVersionForTest(): void {
+  channelVersionCache.clear();
   cachedLatestComputerVersion = null;
   cachedLatestComputerReleaseNotes = null;
   lastFetchTime = 0;

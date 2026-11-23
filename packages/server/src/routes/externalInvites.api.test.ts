@@ -8,7 +8,7 @@ import { getDb } from "../db/index";
 import { EXTERNAL_CHANNELS_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import { channelExternalInvites, channelHumans, channels, featureFlagRules, serverMembers, servers, userAnalyticsIds, users } from "../db/schema";
 import { addHuman, archiveChannel, createChannel, findOrCreateUserDM, getOrCreateThread, getSystemAllChannel, updateChannel } from "../services/channelService";
-import { createServer } from "../services/serverService";
+import { createServer, removeMember } from "../services/serverService";
 import { createMessage } from "../services/messageService";
 import { EXTERNAL_CHANNEL_MAX_SLOTS } from "../services/externalChannelLimitService";
 import { captureEmails, enableExternalChannelsFlag, login, seedUser, seedWorld, sha256, tokenOf } from "../test/externalInviteFixture";
@@ -53,7 +53,7 @@ test("with external_channels_v1 off, preview, send and resend are 404; list and 
   ]);
   for (const response of gated) {
     assert.equal(response.status, 404);
-    assert.deepEqual(await response.json(), { error: "Not found" });
+    assert.deepEqual(await response.json(), { error: "Not found", code: "not_found", errorCode: "not_found" });
   }
 
   // Same permission checks as with the flag on: members, channel admins and Guests are refused.
@@ -155,6 +155,7 @@ test("preview classifies valid, duplicate, invalid, already pending and already 
     alreadyPending: ["pending@example.com"],
     alreadyMembers: [],
     alreadyInChannel: [world.member.email, world.guest.email],
+    alreadyInChannelMembers: [world.member.email],
     guestsElsewhere: [],
     // The host, seedWorld's Guest and the one open invite take three slots.
     slotsLeft: EXTERNAL_CHANNEL_MAX_SLOTS - 3,
@@ -201,6 +202,7 @@ test("preview: a Server member not in the channel will be added; Guests of anoth
     alreadyPending: [],
     alreadyMembers: [people.serverMember.email],
     alreadyInChannel: [world.member.email],
+    alreadyInChannelMembers: [world.member.email],
     guestsElsewhere: [
       { email: people.guestShared.email, channelName: people.shared.name },
       { email: people.guestHidden.email, channelName: null },
@@ -233,6 +235,7 @@ test("send adds the Server's members to the channel, invites the outsiders, and 
       alreadyPending: [],
       alreadyMembers: [],
       alreadyInChannel: [],
+      alreadyInChannelMembers: [],
       guestsElsewhere: [{ email: people.guestShared.email, channelName: people.shared.name }],
     });
     assert.deepEqual(mail.deliveries.map((delivery) => delivery.to), ["outside@example.com"]);
@@ -261,6 +264,7 @@ test("the review before Create Channel makes an External channel: flag-gated, ho
     alreadyPending: [],
     alreadyMembers: [world.member.email],
     alreadyInChannel: [],
+    alreadyInChannelMembers: [],
     guestsElsewhere: [{ email: people.guestShared.email, channelName: people.shared.name }],
     // A new channel's slots: the host's only.
     slotsLeft: EXTERNAL_CHANNEL_MAX_SLOTS - 1,
@@ -287,7 +291,7 @@ test("send creates one pending invite per new address, emails each its own link,
     assert.equal(response.status, 200);
     const body = (await response.json()) as { sent: Array<{ id: string; email: string; expiresAt: string }>; skipped: Record<string, string[]> };
     assert.deepEqual(body.sent.map((invite) => invite.email), ["one@example.com", "two@example.com"]);
-    assert.deepEqual(body.skipped, { duplicates: ["one@example.com"], invalid: ["bad"], alreadyPending: [], alreadyMembers: [], alreadyInChannel: [world.admin.email], guestsElsewhere: [] });
+    assert.deepEqual(body.skipped, { duplicates: ["one@example.com"], invalid: ["bad"], alreadyPending: [], alreadyMembers: [], alreadyInChannel: [world.admin.email], alreadyInChannelMembers: [world.admin.email], guestsElsewhere: [] });
     for (const invite of body.sent) {
       const lifetime = new Date(invite.expiresAt).getTime() - before;
       assert.ok(lifetime >= 14 * DAY_MS && lifetime < 14 * DAY_MS + 60_000, "expires 14 days out");
@@ -850,4 +854,177 @@ test("P3: an invite from a joint channel offers the guest way in, and accepting 
   assert.deepEqual(member, { role: "guest", guestChannelId: hostProjection.id });
   const read = await fetch(`${app.baseUrl}/api/messages/channel/${hostProjection.id}`, { headers: { ...auth, "X-Server-Id": world.server.id } });
   assert.equal(read.status, 200, await read.text());
+});
+
+// ── Invite to connect: a member of the host gets an invite too (sent_to_host_member) ──
+
+/** A member of the host Server who is not in `world.room`. */
+async function seedHostMember(world: World, label: string) {
+  const user = await seedUser(`ext-${label}-${world.tag}`);
+  await getDb().insert(serverMembers).values({ serverId: world.server.id, userId: user.id, role: "member" });
+  return user;
+}
+
+async function sendWith(world: World, channelId: string, body: Record<string, unknown>) {
+  const mail = captureEmails();
+  try {
+    const response = await world.call("owner", "POST", `${channelId}/external-invites`, body);
+    return { response, deliveries: mail.deliveries };
+  } finally {
+    mail.stop();
+  }
+}
+
+test("Invite to connect: a checked member is added to the channel and sent an ordinary invite (its own email and link, listed, resent as one); an unchecked member is only added", async ({ app }) => {
+  const world = await seedWorld(app.baseUrl);
+  const checked = await seedHostMember(world, "checked");
+  const unchecked = await seedHostMember(world, "unchecked");
+  const { response, deliveries } = await sendWith(world, world.room.id, {
+    emails: ["outside@example.com", checked.email, unchecked.email],
+    // Case as typed; an outsider here is invited once, as any outsider.
+    connectInviteMemberEmails: [checked.email.toUpperCase(), "outside@example.com"],
+  });
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as { sent: Array<{ id: string; email: string }>; added: string[] };
+  assert.deepEqual(body.sent.map((invite) => invite.email).sort(), ["outside@example.com", checked.email].sort());
+  assert.deepEqual(body.added.sort(), [checked.email, unchecked.email].sort());
+  assert.deepEqual(deliveries.map((delivery) => delivery.to).sort(), ["outside@example.com", checked.email].sort());
+  assert.equal(await isInChannel(world.room.id, checked.id), true, "the checked member is added directly");
+  assert.equal(await isInChannel(world.room.id, unchecked.id), true, "the unchecked member too");
+  const rows = await inviteRows(world.room.id);
+  assert.deepEqual(rows.map((row) => ({ email: row.email, origin: row.origin, status: row.status, member: row.sentToHostMember })).sort((a, b) => a.email.localeCompare(b.email)), [
+    { email: checked.email, origin: "external_invite", status: "pending", member: true },
+    { email: "outside@example.com", origin: "external_invite", status: "pending", member: false },
+  ].sort((a, b) => a.email.localeCompare(b.email)));
+  const memberInvite = rows.find((row) => row.email === checked.email)!;
+  assert.equal(memberInvite.expiresAt.getTime() - memberInvite.createdAt.getTime() > 13 * DAY_MS, true, "the same 14 days");
+
+  const listed = (await (await world.call("owner", "GET", `${world.room.id}/external-invites`)).json()) as { invites: Array<{ email: string }> };
+  assert.ok(listed.invites.some((invite) => invite.email === checked.email), "listed with the channel's open invites");
+  const mail = captureEmails();
+  try {
+    assert.equal((await world.call("owner", "POST", `${world.room.id}/external-invites/${memberInvite.id}/resend`)).status, 200);
+  } finally {
+    mail.stop();
+  }
+  const resent = (await inviteRows(world.room.id)).find((row) => row.email === checked.email && row.status === "pending")!;
+  assert.notEqual(resent.id, memberInvite.id);
+  assert.equal(resent.sentToHostMember, true, "a resend keeps it a member's invite");
+  assert.equal((await world.call("owner", "DELETE", `${world.room.id}/external-invites/${resent.id}`)).status, 200, "withdrawn as any invite");
+});
+
+test("Invite to connect: a member already in the channel, checked, is sent a member's invite and not added again; unchecked, nothing; the channel's own Guest, nothing", async ({ app }) => {
+  const world = await seedWorld(app.baseUrl);
+  const before = await getDb().select({ userId: channelHumans.userId }).from(channelHumans).where(eq(channelHumans.channelId, world.room.id));
+  const { response, deliveries } = await sendWith(world, world.room.id, {
+    emails: [world.member.email, world.admin.email, world.guest.email],
+    connectInviteMemberEmails: [world.member.email, world.guest.email],
+  });
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as { sent: Array<{ email: string }>; added: string[]; skipped: { alreadyInChannel: string[]; alreadyInChannelMembers: string[] } };
+  assert.deepEqual(body.sent.map((invite) => invite.email), [world.member.email]);
+  assert.deepEqual(body.added, [], "already in: not added again");
+  assert.deepEqual(body.skipped.alreadyInChannel.sort(), [world.member.email, world.admin.email, world.guest.email].sort());
+  assert.deepEqual(body.skipped.alreadyInChannelMembers.sort(), [world.member.email, world.admin.email].sort(), "the channel's Guest is not a member of the host");
+  assert.deepEqual(deliveries.map((delivery) => delivery.to), [world.member.email]);
+  assert.deepEqual((await inviteRows(world.room.id)).map((row) => ({ email: row.email, member: row.sentToHostMember, status: row.status })), [
+    { email: world.member.email, member: true, status: "pending" },
+  ]);
+  const after = await getDb().select({ userId: channelHumans.userId }).from(channelHumans).where(eq(channelHumans.channelId, world.room.id));
+  assert.equal(after.length, before.length, "no membership changed");
+
+  // A public channel the member is already in (added unchecked, which sends
+  // nothing): their invite makes it private, as any send that invites.
+  const room = await createChannel(world.server.id, `ext-pubin-${world.tag}`, undefined, "channel", { type: "user", id: world.owner.id });
+  const typeOf = async () => (await getDb().select({ type: channels.type }).from(channels).where(eq(channels.id, room.id)))[0]!.type;
+  const joiner = await seedHostMember(world, "pubin");
+  assert.equal((await sendWith(world, room.id, { emails: [joiner.email], makePrivate: true })).response.status, 200);
+  assert.equal(await isInChannel(room.id, joiner.id), true);
+  assert.equal((await sendWith(world, room.id, { emails: [joiner.email], makePrivate: true })).response.status, 200);
+  assert.equal(await typeOf(), "channel", "unchecked: nothing sent, still public");
+  const checked = await sendWith(world, room.id, { emails: [joiner.email], makePrivate: true, connectInviteMemberEmails: [joiner.email] });
+  assert.equal(checked.response.status, 200);
+  assert.deepEqual(checked.deliveries.map((delivery) => delivery.to), [joiner.email]);
+  assert.equal(await typeOf(), "private");
+  assert.deepEqual((await inviteRows(room.id)).map((row) => row.sentToHostMember), [true]);
+});
+
+test("Invite to connect on a public channel: only a send that invites someone makes it private", async ({ app }) => {
+  const world = await seedWorld(app.baseUrl);
+  const member = await seedHostMember(world, "pubmember");
+  const room = await createChannel(world.server.id, `ext-pub-${world.tag}`, undefined, "channel", { type: "user", id: world.owner.id });
+  const typeOf = async () => (await getDb().select({ type: channels.type }).from(channels).where(eq(channels.id, room.id)))[0]!.type;
+  assert.equal((await sendWith(world, room.id, { emails: [member.email], makePrivate: true })).response.status, 200);
+  assert.equal(await typeOf(), "channel", "adding a member only, as before");
+  const other = await seedHostMember(world, "pubmember2");
+  const { response } = await sendWith(world, room.id, { emails: [other.email], makePrivate: true, connectInviteMemberEmails: [other.email] });
+  assert.equal(response.status, 200);
+  assert.equal(await typeOf(), "private", "a member's invite is an invite sent");
+  const malformed = await world.call("owner", "POST", `${room.id}/external-invites`, { emails: [other.email], connectInviteMemberEmails: "x" });
+  assert.equal(malformed.status, 400);
+  assert.equal(((await malformed.json()) as { code: string }).code, "invalid_input");
+});
+
+test("Invite to connect takes none of the channel's slots, even when it is full, and no Free plan allowance; ordinary invites keep both rules", async ({ app }) => {
+  const world = await seedWorld(app.baseUrl);
+  // The host, seedWorld's Guest and 20 more: 22 parties; 8 invites fill it.
+  await seedGuests(world, world.room.id, 20);
+  assert.equal((await send(world, world.room.id, Array.from({ length: 8 }, (_, index) => `fill${index}@example.com`))).status, 200);
+  const slotsLeft = async () => ((await (await world.call("owner", "GET", `${world.room.id}/external-invites`)).json()) as { slotsLeft: number }).slotsLeft;
+  assert.equal(await slotsLeft(), 0);
+  const member = await seedHostMember(world, "fullmember");
+  const { response } = await sendWith(world, world.room.id, { emails: [member.email], connectInviteMemberEmails: [member.email] });
+  assert.equal(response.status, 200, "a full channel still takes a member's invite");
+  assert.deepEqual(((await response.json()) as { sent: Array<{ email: string }> }).sent.map((invite) => invite.email), [member.email]);
+  assert.equal(await slotsLeft(), 0, "and it holds no slot");
+  await expectRefusal(await send(world, world.room.id, ["late@example.com"]), "channel_full");
+
+  // Free plan: a host with no external channel yet. A member's invite to one
+  // channel does not take the one external channel; an ordinary invite to
+  // another does, and the first still takes members' invites, not outsiders'.
+  const fresh = await seedWorld(app.baseUrl);
+  await getDb().delete(serverMembers).where(and(eq(serverMembers.serverId, fresh.server.id), eq(serverMembers.userId, fresh.guest.id)));
+  const first = await createChannel(fresh.server.id, `ext-mfirst-${fresh.tag}`, undefined, "private", { type: "user", id: fresh.owner.id });
+  const second = await createChannel(fresh.server.id, `ext-msecond-${fresh.tag}`, undefined, "private", { type: "user", id: fresh.owner.id });
+  const m1 = await seedHostMember(fresh, "free1");
+  const m2 = await seedHostMember(fresh, "free2");
+  assert.equal((await sendWith(fresh, first.id, { emails: [m1.email], connectInviteMemberEmails: [m1.email] })).response.status, 200);
+  assert.deepEqual(await (await fresh.call("owner", "GET", "external-availability")).json(), { freeLimitReached: false }, "no allowance taken");
+  assert.equal((await send(fresh, second.id, ["outsider@example.com"])).status, 200, "the other channel may still be the external one");
+  assert.equal((await sendWith(fresh, first.id, { emails: [m2.email], connectInviteMemberEmails: [m2.email] })).response.status, 200, "a member's invite needs no allowance");
+  await expectRefusal(await send(fresh, first.id, ["third@example.com"]), "free_external_limit");
+  assert.deepEqual((await inviteRows(first.id)).map((row) => row.sentToHostMember), [true, true]);
+});
+
+test("Invite to connect, the invitee's page: no guest way in while they are a member of the host (the accept refuses it), connecting a server offered; once they left the host it is an ordinary invite and they may join as a guest", async ({ app }) => {
+  const world = await seedWorld(app.baseUrl);
+  const member = await seedHostMember(world, "pagemember");
+  const own = await createServer("Member's own", `ext-own-${world.tag}`, member.id);
+  const { response, deliveries } = await sendWith(world, world.room.id, { emails: [member.email], connectInviteMemberEmails: [member.email] });
+  assert.equal(response.status, 200);
+  const token = tokenOf(deliveries.find((delivery) => delivery.to === member.email)!);
+  const auth = { Authorization: `Bearer ${await login(app.baseUrl, member.email)}` };
+  type Page = { options: { guest: boolean; connect: { servers: Array<{ id: string }>; slotsLeft?: number }; newServer: boolean } };
+  const page = async () => {
+    const answer = await fetch(`${app.baseUrl}/api/external-invites/${token}`, { headers: auth });
+    assert.equal(answer.status, 200);
+    return (await answer.json()) as Page;
+  };
+  const asMember = await page();
+  assert.equal(asMember.options.guest, false, "no guest way in for a member of the host");
+  assert.deepEqual(asMember.options.connect.servers.map((server) => server.id), [own.id]);
+  // The host and seedWorld's Guest: the member's invite gives back no slot of its own.
+  assert.equal(asMember.options.connect.slotsLeft, EXTERNAL_CHANNEL_MAX_SLOTS - 2);
+  assert.equal(asMember.options.newServer, true);
+  const refused = await fetch(`${app.baseUrl}/api/external-invites/${token}/accept-as-guest`, { method: "POST", headers: auth });
+  assert.equal(refused.status, 409);
+  assert.equal(((await refused.json()) as { code: string }).code, "already_member");
+
+  await removeMember(world.server.id, member.id, { reason: "left", actorUserId: member.id });
+  assert.equal((await page()).options.guest, true, "left the host: the invite is an ordinary one");
+  const accepted = await fetch(`${app.baseUrl}/api/external-invites/${token}/accept-as-guest`, { method: "POST", headers: auth });
+  assert.equal(accepted.status, 200, await accepted.clone().text());
+  const [seat] = await getDb().select({ role: serverMembers.role, guestChannelId: serverMembers.guestChannelId }).from(serverMembers)
+    .where(and(eq(serverMembers.serverId, world.server.id), eq(serverMembers.userId, member.id)));
+  assert.deepEqual(seat, { role: "guest", guestChannelId: world.room.id });
 });

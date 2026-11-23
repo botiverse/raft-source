@@ -148,7 +148,7 @@ export default function MentionLink({ mentionType, mentionId, onNavigate, onNavi
         >
           {children}
         </PreviewCardTrigger>
-        <PreviewCardContent sideOffset={6} collisionPadding={6}>
+        <PreviewCardContent sideOffset={6}>
           <ExternalIdentityPreviewBody
             displayName={fallbackExternal?.displayName ?? fallbackLabel ?? ""}
             provider={fallbackExternal?.provider}
@@ -176,7 +176,7 @@ export default function MentionLink({ mentionType, mentionId, onNavigate, onNavi
       >
         {mentionContent}
       </PreviewCardTrigger>
-      <PreviewCardContent sideOffset={6} collisionPadding={6}>
+      <PreviewCardContent sideOffset={6}>
         <ProfilePreviewCardContent
           mentionType={mentionType}
           mentionId={mentionId}

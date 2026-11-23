@@ -21,7 +21,8 @@ import {
   serverRunnerLogReadFallback,
   serverConnectedMarkerPath,
 } from "./paths";
-import { formatServerSlugDisplay, listServerAttachments } from "./serverState";
+import { formatServerSlugDisplay, listServerAttachments, type ServerAttachment } from "./serverState";
+import { ComputerSelfClient, type ComputerSelfResult } from "./apiClient";
 import { canonicalizeServerUrl } from "./serverUrl";
 import { readPidfileAt, isProcessAlive, readProcessStartTimeMs } from "./internal/process-primitives";
 import { findLiveServicePidReadOnly, type ServicePidIdentityDeps } from "./internal/service-pid-fallback";
@@ -356,7 +357,9 @@ export async function buildStatusReport(installRoot: string, deps: StatusReportD
       serverId: a.serverId,
       serverSlug: a.serverSlug ?? null,
       serverMachineId: a.serverMachineId,
-      machineId: a.machineId ?? null,
+      // An adopted file may predate storing `machineId`; its legacyMachineId is
+      // the same `machines.id` (the adopt route returns machines.id there).
+      machineId: a.machineId ?? (a.adoptedFromLegacy ? a.legacyMachineId : undefined) ?? null,
       serverUrl: a.serverUrl,
       attachedAt: a.attachedAt ?? null,
       serverRunnerLogPath: await visibleRunnerLogPath(installRoot, a.serverId),
@@ -399,13 +402,53 @@ function formatVersionStatus(version: ProcessVersionStatus): string {
   return version.version ?? "unknown (no live version evidence)";
 }
 
+/** How long text `status` waits for each server to say what it calls this Computer. */
+export const SERVER_NAME_READ_TIMEOUT_MS = 3_000;
+
+/** Server-set text bound for the terminal: no control characters reach it. */
+export function terminalSafe(text: string): string {
+  return text.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+}
+
+/** What a server calls this Computer, by server id: its name, or why it could not be read. */
+export type ServerComputerNames = Map<string, { name: string } | { unavailable: string }>;
+
+/**
+ * The name each attached server shows for this Computer, read live with the
+ * Computer's own key (GET /internal/computer/self), so a rename in Raft shows
+ * at once (#wg-ax:#38). Only text `status` reads it: `--json` (polled by Raft
+ * Desktop) and the service's status IPC stay local and network-free. Keys
+ * stay here; only the names reach the output.
+ */
+export async function readServerComputerNames(
+  installRoot: string,
+  deps: { readComputerSelf?: (attachment: ServerAttachment) => Promise<ComputerSelfResult> } = {},
+): Promise<ServerComputerNames> {
+  const read = deps.readComputerSelf
+    ?? ((a: ServerAttachment) => new ComputerSelfClient(a.serverUrl, a.apiKey).self({ signal: AbortSignal.timeout(SERVER_NAME_READ_TIMEOUT_MS) }));
+  const attachments = await listServerAttachments(installRoot);
+  const names: ServerComputerNames = new Map();
+  await Promise.all(attachments.map(async (a) => {
+    // Older attachments hold a legacy machine key, which this route refuses.
+    if (!a.apiKey.startsWith("sk_computer_")) return;
+    const self = await read(a).catch((): ComputerSelfResult => ({ status: "error", code: "request_failed" }));
+    if (self.status === "success") {
+      names.set(a.serverId, { name: terminalSafe(self.computer.machineName) });
+    } else {
+      // The code comes from the server's response body too.
+      names.set(a.serverId, { unavailable: self.status === "route_unavailable" ? "server too old" : terminalSafe(self.code) });
+    }
+  }));
+  return names;
+}
+
 /**
  * Human formatter for a `ComputerStatusReport`. CLI-layer presentation only —
  * separated from `buildStatusReport` (the pure logic) so the CLI action can do
  * `api.getStatus()` then `formatStatusReport(report)`. Writes to stdout via
  * `info()`; never reads env or mutates state.
  */
-export function formatStatusReport(report: ComputerStatusReport): void {
+export function formatStatusReport(report: ComputerStatusReport, names?: ServerComputerNames): void {
   info("");
   info(`SLOCK_HOME:   ${report.slockHome}`);
   // A user session is no longer needed: each server is added with a
@@ -456,6 +499,10 @@ export function formatStatusReport(report: ComputerStatusReport): void {
       info(
         `  ${pad(formatServerSlugDisplay(s.serverSlug), 24)}${pad(s.health, 12)}${pad(s.serverConnected ? "yes" : "no", 12)}${pad(dcol, 24)}${pad(s.serverMachineId, 38)}${s.serverUrl}`,
       );
+      const named = names?.get(s.serverId);
+      if (named) {
+        info(`    Name on server: ${"name" in named ? JSON.stringify(named.name) : `could not read (${named.unavailable})`}`);
+      }
       info(`    Runner version: ${formatVersionStatus(s.runnerVersion)}`);
       info(`    Server runner log: ${s.serverRunnerLogPath}`);
     }
@@ -496,9 +543,10 @@ export function formatStatusReport(report: ComputerStatusReport): void {
  * `buildStatusReport`); this wrapper exists for callers/tests that drive the
  * end-to-end stdout path directly.
  */
-export async function runStatus(): Promise<void> {
+export async function runStatus(deps: Parameters<typeof readServerComputerNames>[1] = {}): Promise<void> {
   const home = resolveRaftHome();
-  formatStatusReport(await buildStatusReport(home));
+  const [report, names] = await Promise.all([buildStatusReport(home), readServerComputerNames(home, deps)]);
+  formatStatusReport(report, names);
   await printProcJobsStatus(home);
 }
 

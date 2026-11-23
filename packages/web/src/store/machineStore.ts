@@ -16,7 +16,7 @@ import type {
 import type { CreatorSummary } from "./agentStore";
 import type { AcceptedComputerUpgrade } from "../utils/computerUpgradeInFlight";
 import { currentTimeMs, normalizeComputerReleaseNotes } from "@botiverse/raft-shared";
-import type { ComputerReadiness, ReadinessAttention, ComputerInstallerRepairHint, ComputerReleaseNotes, ComputerUpgradeFailureHint, ComputerVersionGate, MachineDiskStatus, MachineMemoryStatus } from "@botiverse/raft-shared";
+import type { ComputerReadiness, ReadinessAttention, ComputerInstallerRepairHint, ComputerUpgradeScopeUnavailable, ComputerReleaseNotes, ComputerUpgradeFailureHint, ComputerVersionGate, MachineDiskStatus, MachineMemoryStatus } from "@botiverse/raft-shared";
 
 export interface MachineRuntimeDetection {
   status: "pending" | "complete" | "incomplete";
@@ -69,9 +69,9 @@ export interface Machine {
   computerAttachedByCurrentUser?: boolean;
   // True when the current user is this machine's controller as the server's
   // routes decide it (computerControllerUserId): the person the live Computer
-  // is attached by, else the one its most recently revoked Computer was, else
-  // the machine row's owner. Unlike computerAttachedByCurrentUser it survives
-  // a key revoke. Absent on older server responses.
+  // is attached by, and no one else (false after a key revoke, for a raw
+  // daemon, or when the live record names no one; then only owners and admins
+  // act). Absent on older server responses.
   controlledByCurrentUser?: boolean;
   // The machine row's owner (`machines.userId`, sent with every machine row:
   // machineReadModel.ts spreads it). It can differ from who attached the
@@ -135,6 +135,10 @@ export interface Machine {
   // looks like it needs a repair run on the machine. Never changes whether
   // Upgrade is offered; absent = an older server or Computer.
   installerRepairHint?: ComputerInstallerRepairHint | null;
+  // The Computer's systemd manager refuses the scope a web upgrade's installer
+  // needs (a system service run as a non-root user): no web Upgrade, the host
+  // upgrade instead. Absent / null = allowed or unknown: as before.
+  upgradeScope?: ComputerUpgradeScopeUnavailable | null;
   lastHeartbeat: string | null;
   createdAt: string;
 }
@@ -264,7 +268,8 @@ interface MachineState {
 
   loadMachines: () => Promise<void>;
   /** Ask a computer to re-detect its installed runtimes. Fresh list arrives via the capabilities push. */
-  rescanRuntimes: (machineId: string) => Promise<void>;
+  /** `serverId`: the server the caller shows (setup's own); defaults to the current one. */
+  rescanRuntimes: (machineId: string, serverId?: string | null) => Promise<void>;
   registerMachine: (
     name: string,
   ) => Promise<{ machine: Machine; apiKey: string }>;
@@ -274,6 +279,8 @@ interface MachineState {
     updates: { name?: string; description?: string | null },
   ) => Promise<void>;
   deleteMachine: (machineId: string) => Promise<void>;
+  /** Drops a machine the server already removed (revoke-computer-key with `delete: true`) from the list. */
+  forgetRemovedMachine: (machineId: string) => void;
   /** Computer owner v1: set who Raft records as the owner (null = Public); the answer's machine replaces the row. */
   setMachineOwner: (machineId: string, ownerUserId: string | null) => Promise<void>;
   applyMachineStatusEvent: (
@@ -397,8 +404,8 @@ export const useMachineStore = create<MachineState>((set, get) => {
       set({ computerUpgradeSubmitting: next });
     },
 
-    rescanRuntimes: async (machineId: string) => {
-      const serverId = useServerStore.getState().current?.id;
+    rescanRuntimes: async (machineId: string, forServerId?: string | null) => {
+      const serverId = forServerId || useServerStore.getState().current?.id;
       if (!serverId) return;
       // Fire-and-forget: the daemon answers by re-emitting its capabilities, which
       // land through the normal machine:capabilities push. Nothing to await here.
@@ -520,6 +527,10 @@ export const useMachineStore = create<MachineState>((set, get) => {
       const serverId = useServerStore.getState().current?.id;
       if (!serverId) throw new Error("No server selected");
       await api.delete(`/servers/${serverId}/machines/${machineId}`);
+      get().forgetRemovedMachine(machineId);
+    },
+
+    forgetRemovedMachine: (machineId: string) => {
       set((state) => ({
         machines: state.machines.filter((m) => m.id !== machineId),
         selectedMachineId:

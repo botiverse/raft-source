@@ -27,6 +27,16 @@
  * Closing the browser's prompt is not an error: the autofill says nothing,
  * and after the link the page only says the prompt was closed (design
  * login-passkey-cancel).
+ *
+ * Passkeys under the old RP ID (raft.build → app.raft.build,
+ * #proj-landing:3bfc5b9c): options take `rp: "current" | "legacy"`; the
+ * autofill and the link ask for the default (current) group, and only while
+ * the server also verifies the old one does its answer carry `rp`. Then, when
+ * the link's prompt ends in NotAllowedError (nothing to pick for the current
+ * RP ID, or closed), "Use an earlier passkey" shows under it: a click asks
+ * for `rp: "legacy"` and prompts again. Never a second prompt on its own; 404
+ * `passkey_rp_unavailable` takes the line away. An earlier passkey keeps
+ * working as it is: nothing asks to replace it (artin, #proj-mobile:#188).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useIntl } from "react-intl";
@@ -41,14 +51,19 @@ import {
   getPasskeyAssertion,
   isPasskeyCancel,
 } from "./webauthn";
+import type { PasskeyRpGroup } from "./passkeyRpGroups";
 import type { PasskeyRequestOptionsJSON } from "./webauthn";
 
 /** The email field's autocomplete with the passkey autofill (invisible without a passkey). */
 export const EMAIL_AUTOCOMPLETE_WITH_PASSKEYS = "username webauthn";
 
-async function startPasskeySignIn(): Promise<PasskeyRequestOptionsJSON> {
-  const { data } = await api.post<{ options: PasskeyRequestOptionsJSON; expiresAt: string }>("/auth/passkey/options", {});
-  return data.options;
+/** `legacyRp`: the server also verifies passkeys under the old RP ID (its answer names the group). */
+async function startPasskeySignIn(rp: PasskeyRpGroup = "current"): Promise<{ options: PasskeyRequestOptionsJSON; legacyRp: boolean }> {
+  const { data } = await api.post<{ options: PasskeyRequestOptionsJSON; expiresAt: string; rp?: PasskeyRpGroup }>(
+    "/auth/passkey/options",
+    rp === "legacy" ? { rp } : {},
+  );
+  return { options: data.options, legacyRp: typeof data.rp === "string" };
 }
 
 export type PasskeySignInNotice = { intent: "info" | "warning"; message: string };
@@ -65,6 +80,8 @@ export function usePasskeySignIn(enabled: boolean) {
   const [unavailable, setUnavailable] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<PasskeySignInNotice | null>(null);
+  // "Use an earlier passkey": after the link's prompt found nothing to pick (see the file comment).
+  const [legacyOffered, setLegacyOffered] = useState(false);
   // Bumped after a failed attempt: the autofill starts again with fresh options.
   const [round, setRound] = useState(0);
   const autofill = useRef<AbortController | null>(null);
@@ -126,7 +143,7 @@ export function usePasskeySignIn(enabled: boolean) {
     if (!(await canAutofillPasskeys()) || signal.aborted) return;
     let options: PasskeyRequestOptionsJSON;
     try {
-      options = await startPasskeySignIn();
+      ({ options } = await startPasskeySignIn());
     } catch (err) {
       // Nothing to show for the autofill; without passkeys on the server the link goes too.
       if (getApiErrorResponse(err)?.code === "passkeys_unavailable") setUnavailable(true);
@@ -147,31 +164,38 @@ export function usePasskeySignIn(enabled: boolean) {
     };
   }, [enabled, round, runAutofill, unavailable]);
 
-  const runLink = useCallback(async () => {
+  const runLink = useCallback(async (rp: PasskeyRpGroup) => {
     // One WebAuthn request at a time: the link's prompt replaces the autofill.
     autofill.current?.abort();
     setNotice(null);
     setBusy(true);
-    let options: PasskeyRequestOptionsJSON;
+    let started: Awaited<ReturnType<typeof startPasskeySignIn>>;
     try {
-      options = await startPasskeySignIn();
+      started = await startPasskeySignIn(rp);
     } catch (err) {
       setBusy(false);
-      if (getApiErrorResponse(err)?.code === "passkeys_unavailable") setUnavailable(true);
+      const code = getApiErrorResponse(err)?.code;
+      if (code === "passkeys_unavailable") setUnavailable(true);
       else setNotice({ intent: "warning", message: formatMessage({ id: "pages.login.failed" }) });
+      // The server no longer verifies passkeys under the old RP ID.
+      if (code === "passkey_rp_unavailable") setLegacyOffered(false);
       setRound((current) => current + 1);
       return;
     }
+    const { options, legacyRp } = started;
     let cancelled = false;
+    let nothingPicked = false;
     const signedIn = await finish(options, async () => {
       try {
         // A prompt (not the autofill): it also offers a passkey on another device.
         return await getPasskeyAssertion(options);
       } catch (err) {
         cancelled = isPasskeyCancel(err);
+        nothingPicked = err instanceof Error && err.name === "NotAllowedError";
         throw err;
       }
     });
+    if (rp === "current" && nothingPicked && legacyRp) setLegacyOffered(true);
     if (cancelled) {
       setNotice({ intent: "info", message: formatMessage({ id: "auth.passkey.cancelled" }) });
       setRound((current) => current + 1);
@@ -179,18 +203,22 @@ export function usePasskeySignIn(enabled: boolean) {
     if (!signedIn) setBusy(false);
   }, [finish, formatMessage]);
 
-  const signInWithLink = useCallback(async () => {
+  const signInWithLink = useCallback(async (rp: PasskeyRpGroup) => {
     if (busy || linkPending.current) return;
     linkPending.current = true;
     try {
-      await runLink();
+      await runLink(rp);
     } finally {
       linkPending.current = false;
     }
   }, [busy, runLink]);
 
   const handleLinkClick = useCallback(() => {
-    void signInWithLink();
+    void signInWithLink("current");
+  }, [signInWithLink]);
+
+  const handleLegacyClick = useCallback(() => {
+    void signInWithLink("legacy");
   }, [signInWithLink]);
 
   return {
@@ -199,5 +227,8 @@ export function usePasskeySignIn(enabled: boolean) {
     busy,
     notice,
     signInWithLink: handleLinkClick,
+    /** Show "Use an earlier passkey" under the link (see the file comment). */
+    legacyShown: supported && !unavailable && legacyOffered,
+    signInWithLegacy: handleLegacyClick,
   };
 }

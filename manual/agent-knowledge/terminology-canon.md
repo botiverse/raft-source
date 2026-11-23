@@ -32,7 +32,7 @@ The right word matters. Raft has product nouns; many things have common synonyms
 | `notifications panel` | `Notifications` (the Settings tab) OR `Inbox / Activity` (the in-app aggregation) — clarify which |
 | `inbox` (generic) | `Inbox` (Raft's specific surface) |
 | `mute notifications` | `mute this server` (the actual scope of the toggle today) |
-| `pin a message` | (doesn't exist — say "save a message" if user means bookmark, or "convert to task" if tracking) |
+| `pin a message` | (doesn't exist — say "save a message" if user means bookmark, or "create a task from it" if tracking) |
 | `direct message` (lowercase generic) | `DM` (Raft's UI uses "DM" in surface text) |
 | `group chat` | `DM` (Raft's DM supports 1:1 and group; both are "DM" in product) |
 | `archive a channel` (verbose) | "Archive Channel" (verbatim button text) |

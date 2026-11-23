@@ -24,7 +24,7 @@ import { SelectShareLightbox } from "../../components/message/DeferredSelectShar
 import { useSelectShareErrorToast } from "../../components/message/useSelectShareErrorToast";
 import { useLocation, useNavigate } from "react-router-dom";
 import { usePaywallUpgrade } from "../../hooks/usePaywallUpgrade";
-import { openThreadParentMessageRoute } from "../../components/layout/rightPanelUrlSync";
+import { useThreadHeaderTitle } from "./useThreadHeaderTitle";
 import { VisibleMessageTranslations, useVisibleMessageWindowStore } from "../../components/message/VisibleMessageTranslations";
 import { EMPTY_MESSAGES } from "./threadMessages";
 import { threadSelectableIds, useThreadSelectionActions } from "./useThreadSelectionActions";
@@ -42,7 +42,7 @@ import { ThreadPanelHeader } from "./ThreadPanelHeader";
 import { ThreadSearchBar } from "./ThreadSearchBar";
 import { ThreadPanelReplies } from "./ThreadPanelReplies";
 import { MessageSelectIntentProvider } from "../../components/message/MessageSelectIntentProvider";
-import { AgentReadProgressContext } from "../../components/message/agentReadProgressContext";
+import { QuotedMessageLocalJumpContext, useThreadLocalQuoteJump } from "../../components/message/useJumpToQuotedMessage";
 import { ThreadPanelComposer } from "./ThreadPanelComposer";
 
 /** A stable empty Lounge list for a store state written without the slice. */
@@ -276,7 +276,7 @@ export function AuthenticatedThreadPanel({
     picCapturing,
     picCaptureProgress,
     cancelPicCapture,
-    picPreview,
+    picPreview, picFilename,
     picError,
     setPicError,
     copiedMd,
@@ -375,9 +375,12 @@ export function AuthenticatedThreadPanel({
     handleRetryRepliesLoad,
   } = useThreadTimeline({ threadChannelId, parentMessageId, parentTaskId, focusedMessageId, isTaskModalSurface, threadBucket, messages, setMessages, coerceThreadIngress, consumeFocusedMessage, formatMessage });
   const outlineRail = useThreadOutlineRail(jumpToReply, jumpToThreadStart, { parentChannelId, parentMessageId, parentRouteKind, parentTaskId, serverSlug });
+  const handleLocalThreadQuoteJump = useThreadLocalQuoteJump(parentMessageId, messages, outlineRail.onJump);
 
   const {
     parentMessage,
+    parentHistoryGlimpse,
+    parentUnavailable,
     displayedParentMessageWithThreadId,
     displayedParentTask,
     displayedParentThreadSummary,
@@ -480,7 +483,6 @@ export function AuthenticatedThreadPanel({
   }, [joinChannel, parentChannelId]);
 
   const {
-    agentReadProgress,
     threadPaywallScope,
     threadFoldedMessageIds,
     getPreviewSenderAgent,
@@ -508,24 +510,13 @@ export function AuthenticatedThreadPanel({
     handleRetryOpenThread();
   }, [handleRetryOpenThread]);
   useSelectShareErrorToast({ picError, setPicError, onRetry: handleRetryPicCapture });
-  const handleOpenParentChannelAction = useCallback(() => {
-    if (!parentMessageId || !parentChannelId) return;
-    const routeKind = parentRouteKind === "dm" ? "dm" : "channel";
-    // Reserve the canonical ?msg= URL before navigating, then clear the store
-    // synchronously. BrowserRouter commits route state in a transition; the
-    // ownership marker prevents an already-queued origin effect from racing
-    // stale thread params back into the store before that commit lands.
-    // Desktop preserves its existing PUSH semantics, while mobile replaces the
-    // current thread detail entry and records the synchronous mobile-back step.
-    openThreadParentMessageRoute({
-      isDesktop,
-      parentRouteKind: routeKind,
-      parentChannelId,
-      parentMessageId,
-      serverSlug,
-      navigate: routeNavigate,
-    });
-  }, [parentMessageId, parentChannelId, parentRouteKind, isDesktop, serverSlug, routeNavigate]);
+  // The head's title names the message the thread started from once it scrolls out of view (#proj-chat:#31 v3);
+  // its place name and View in channel locate that message in its conversation.
+  const { headerOriginal, parentOutOfView, handleOpenParentChannelAction } = useThreadHeaderTitle({
+    parentMessage: displayedParentMessageWithThreadId, parentHistoryGlimpse, parentUnavailable, hideParentMessage, showHeader, conversationKey, replyRegionRef,
+    agentById, memberById, currentUser, formatMessage, isDesktop, presentation, pathname: location.pathname,
+    parentChannelId, parentMessageId, parentRouteKind, serverSlug, navigate: routeNavigate,
+  });
   // A host-drawn header's More menu (the task dialog) runs the same command.
   useEffect(() => {
     if (!searchCommandRef) return;
@@ -608,7 +599,7 @@ export function AuthenticatedThreadPanel({
   const selectShareLightbox = picPreview ? (
     <SelectShareLightbox
       images={picPreview}
-      filename={`raft-thread-${new Date().toISOString().slice(0, 10)}.png`}
+      filename={picFilename}
       onClose={handleClosePicPreview}
       onSaved={handlePicPreviewSaved}
     />
@@ -646,6 +637,8 @@ export function AuthenticatedThreadPanel({
         repliesLoadFailed={repliesLoadFailed}
         handleOpenParentChannelAction={handleOpenParentChannelAction}
         handleOpenThreadSearch={handleOpenThreadSearch}
+        original={headerOriginal}
+        originalOutOfView={parentOutOfView}
         allowExpand={allowExpand}
       />}
       {/* Folded to its head by a region expanded in its column (#189 rule 5), its content stays laid out out of sight
@@ -674,7 +667,8 @@ export function AuthenticatedThreadPanel({
       {/* The reply region stays from the first frame: busy while the
           replies load (DS Feedback), and where Retry leaves focus. */}
       {/* The replies' agent read progress (null: off here), and their select intent: a range takes what select-all would. */}
-      <AgentReadProgressContext.Provider value={agentReadProgress}><MessageSelectIntentProvider timelineRef={timelineRef} selectableIds={selectableIds}>
+      <QuotedMessageLocalJumpContext.Provider value={handleLocalThreadQuoteJump}>
+      <MessageSelectIntentProvider timelineRef={timelineRef} selectableIds={selectableIds}>
       <ThreadPanelReplies
         replyRegionRef={replyRegionRef}
         threadContentLayerClassName={threadContentLayerClassName}
@@ -728,7 +722,7 @@ export function AuthenticatedThreadPanel({
         outlineRail={outlineRail}
         focusTargetId={effectiveFocusId}
       />
-      </MessageSelectIntentProvider></AgentReadProgressContext.Provider>
+      </MessageSelectIntentProvider>
 
       {/* In thread-mode select, the toolbar replaces the input. */}
       {/* Stryker disable all: composer ownership and chrome are browser-smoke verified. */}
@@ -778,6 +772,7 @@ export function AuthenticatedThreadPanel({
         joiningParentChannel={joiningParentChannel}
       />
       ) : null}
+      </QuotedMessageLocalJumpContext.Provider>
       </ThreadPanelContent>
       {/* Stryker restore all */}
       {selectShareLightbox}

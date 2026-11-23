@@ -6,7 +6,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { agents, serverMembers, servers, users } from "../db/schema";
 import { createAgent } from "./agentService";
-import { addMember, createServer, transitionMemberRole, updateServerOnboardingAgent, updateServerOnboardingSettings } from "./serverService";
+import { addMember, createServer, linkOfficialOnboardingAgent, transitionMemberRole, updateServerOnboardingSettings } from "./serverService";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
@@ -28,8 +28,9 @@ async function seedUser(label: string) {
   return user;
 }
 
-// Give the server a Cindy: create an agent and point servers.onboarding_agent_id at it — the
-// exact fact the projection reads as `everHadAgent` / "checkpoint crossed".
+// Give the server a Cindy the way creating her does: the agent, the owner stamped `normal`
+// (createAgent's markServerSetupCompleteOnFirstAgent), and the official pointer (also the
+// greeter). Server completion is read from that owner row, not from either pointer.
 async function giveServerCindy(serverId: string) {
   const db = getDb();
   const [agent] = await db.insert(agents).values({
@@ -40,7 +41,10 @@ async function giveServerCindy(serverId: string) {
     avatarUrl: "pixel:mug",
     runtime: "claude",
   }).returning();
-  await db.update(servers).set({ onboardingAgentId: agent.id }).where(eq(servers.id, serverId));
+  const [server] = await db.select({ ownerId: servers.ownerId }).from(servers).where(eq(servers.id, serverId));
+  await db.update(serverMembers).set({ setupStatus: "complete", setupCompletionReason: "normal" })
+    .where(and(eq(serverMembers.serverId, serverId), eq(serverMembers.userId, server.ownerId)));
+  await db.update(servers).set({ onboardingAgentId: agent.id, officialOnboardingAgentId: agent.id }).where(eq(servers.id, serverId));
   return agent;
 }
 
@@ -243,13 +247,36 @@ test("one owner's completion immediately reconciles a co-owner; Cindy checkpoint
     serverId: server.id, name: "Cindy", displayName: "Onboarding Assistant",
     description: "official", avatarUrl: "pixel:mug", runtime: "claude",
   }).returning();
-  await updateServerOnboardingAgent(server.id, agent.id);
+  await linkOfficialOnboardingAgent(server.id, agent.id);
 
   assert.deepEqual(await readSetup(server.id, coOwner.id), { role: "owner", status: "complete", reason: "grandfathered" }, "the inherited reason is preserved on checkpoint crossing");
   assert.deepEqual(await readSetup(server.id, owner.id), { role: "owner", status: "complete", reason: "normal" }, "the original owner's normal completion is preserved");
 });
 
-test("crossing the checkpoint via Settings (onboarding-settings) also sweeps a pre-existing co-owner", async ({ app }) => {
+test("linking the official Cindy sweeps a co-owner who existed before her", async ({ app }) => {
+  const db = getDb();
+  const owner = await seedUser("link-owner");
+  const coOwner = await seedUser("link-coowner");
+  const server = await createServer("Link", `link-${randomUUID()}`, owner.id);
+  await joinAsMember(server.id, coOwner.id);
+  await promoteToOwner(server.id, owner.id, coOwner.id); // nobody complete yet ⇒ stays not_started
+
+  const [agent] = await db.insert(agents).values({
+    serverId: server.id, name: "Cindy", displayName: "Cindy",
+    description: "Onboarding Assistant", avatarUrl: "pixel:mug", runtime: "claude",
+  }).returning();
+  // Creating her stamps the creating owner (createAgent), then the route links her.
+  await db.update(serverMembers).set({ setupStatus: "complete", setupCompletionReason: "normal" })
+    .where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, owner.id)));
+  await linkOfficialOnboardingAgent(server.id, agent.id);
+
+  assert.deepEqual(await readSetup(server.id, coOwner.id), { role: "owner", status: "complete", reason: "grandfathered" });
+  const [row] = await db.select({ greeter: servers.onboardingAgentId, official: servers.officialOnboardingAgentId })
+    .from(servers).where(eq(servers.id, server.id));
+  assert.deepEqual(row, { greeter: agent.id, official: agent.id }, "a fresh Cindy is also the greeter when none is set");
+});
+
+test("picking a greeter in Settings (onboarding-settings) completes nobody's setup", async ({ app }) => {
   const db = getDb();
   const owner = await seedUser("settings-owner");
   const coOwner = await seedUser("settings-coowner");
@@ -257,18 +284,15 @@ test("crossing the checkpoint via Settings (onboarding-settings) also sweeps a p
   await joinAsMember(server.id, coOwner.id);
   await promoteToOwner(server.id, owner.id, coOwner.id); // no Cindy yet ⇒ stays not_started
 
-  const [agent] = await db.insert(agents).values({
-    serverId: server.id, name: "Cindy", displayName: "Onboarding Assistant",
-    description: "official", avatarUrl: "pixel:mug", runtime: "claude",
+  const [helper] = await db.insert(agents).values({
+    serverId: server.id, name: "Helper", displayName: "Helper", runtime: "claude",
   }).returning();
-  // The Settings path (PATCH /onboarding-settings) is a distinct checkpoint setter.
-  await updateServerOnboardingSettings(server.id, { onboardingAgentId: agent.id });
+  await updateServerOnboardingSettings(server.id, { onboardingAgentId: helper.id });
 
-  assert.deepEqual(
-    await readSetup(server.id, coOwner.id),
-    { role: "owner", status: "complete", reason: "grandfathered" },
-    "setting the onboarding agent through Settings must reconcile owners too",
-  );
+  assert.deepEqual(await readSetup(server.id, owner.id), { role: "owner", status: "not_started", reason: null });
+  assert.deepEqual(await readSetup(server.id, coOwner.id), { role: "owner", status: "not_started", reason: null });
+  const [row] = await db.select({ official: servers.officialOnboardingAgentId }).from(servers).where(eq(servers.id, server.id));
+  assert.equal(row.official, null, "the greeter is not the official onboarding agent");
 });
 
 // Mirrors drizzle/0193 — kept in sync so the backfill LOGIC is exercised against seeded drift.

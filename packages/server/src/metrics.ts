@@ -6,12 +6,36 @@ import { readBuildIdentityStatus, SERVER_VERSION, type BuildIdentityStatus } fro
 // Dedicated registry (avoids polluting the global default)
 export const register = new Registry();
 
-// `service_version` is the server semver (package.json, bumped with every
-// release), the same value traces carry as `service.version`. It lets every
-// application metric be split by release, so a deploy can compare the old and
-// the new version side by side. One value per process, so it adds no series:
-// each task already has its own `service_instance_id`.
-const BASE_DEFAULT_LABELS = { app: "slock-server", service_version: SERVER_VERSION };
+const INITIAL_BUILD_IDENTITY = readBuildIdentityStatus();
+
+/**
+ * `service_version` label value: on `release/v*` and `candidate/v*` branches
+ * (where `release-candidate.yml` stamps `package.json`), emit the exact semver
+ * (`1.30.0`). On non-release branches such as `staging` (where `package.json`
+ * is not stamped per commit), emit `<branch>-<sha8>` (e.g. `staging-2a583382`)
+ * so staging metrics do not stay stuck on an old `package.json` version and
+ * side-by-side deploy panels distinguish consecutive staging builds. Falls back
+ * to `serverVersion` when build identity env vars are absent (local dev/tests).
+ */
+export function serviceVersionLabel(
+  status: BuildIdentityStatus,
+  serverVersion: string = SERVER_VERSION,
+): string {
+  if (!status.ok) return serverVersion;
+  const { branch, sha } = status.identity;
+  if (/^(?:release|candidate)\/v\d+\.\d+\.\d+/i.test(branch)) {
+    return serverVersion;
+  }
+  const safeBranch = branch.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32) || "dev";
+  return `${safeBranch}-${sha.slice(0, 8)}`;
+}
+
+// One value per process, so it adds no series: each task already has its own
+// `service_instance_id`.
+const BASE_DEFAULT_LABELS = {
+  app: "slock-server",
+  service_version: serviceVersionLabel(INITIAL_BUILD_IDENTITY),
+};
 register.setDefaultLabels(BASE_DEFAULT_LABELS);
 
 export function configureMetricsDeploymentIdentity(identity: TraceDeploymentIdentity) {
@@ -47,7 +71,7 @@ export const appMetricsInfo = new Gauge({
   labelNames: ["git_sha"] as const,
   registers: [register],
 });
-appMetricsInfo.set({ git_sha: releaseShaLabel(readBuildIdentityStatus()) }, 1);
+appMetricsInfo.set({ git_sha: releaseShaLabel(INITIAL_BUILD_IDENTITY) }, 1);
 
 // Labels never include caller-supplied service names or Agent/token identifiers.
 // First-party apps' operations (platform/tracing countAppOperation): `app`
@@ -144,6 +168,57 @@ export const syncResumeTotal = new Counter({
   name: "slock_socketio_sync_resume_total",
   help: "Total sync:resume requests",
   labelNames: ["outcome"] as const, // ok, error, has_more
+  registers: [register],
+});
+
+/**
+ * Messages one successful `sync:resume` response replayed (socket/syncResume.ts).
+ * kind="page": seq above the client's lastSeq (at most RESUME_LIMIT, 500);
+ * kind="late": at or below lastSeq but committed after the client's
+ * sinceHorizon (at most SYNC_LATE_CAP, 500). Observed for both kinds on every
+ * successful response, 0 included, so _count is responses served.
+ */
+export const syncResumeReplayedMessages = new Histogram({
+  name: "slock_socketio_resume_replayed_messages",
+  help: "Messages replayed by one sync:resume response, by kind",
+  labelNames: ["kind"] as const, // page, late
+  buckets: [0, 1, 5, 10, 25, 50, 100, 250, 500],
+  registers: [register],
+});
+
+/**
+ * `sync:resume` responses with `horizonReset: true`: more late messages
+ * qualified than SYNC_LATE_CAP, so none were sent and the client must refetch
+ * its visible scope instead of gap-filling.
+ */
+export const syncResumeHorizonResetTotal = new Counter({
+  name: "slock_socketio_resume_horizon_reset_total",
+  help: "sync:resume responses that could not gap-fill and told the client to refetch",
+  registers: [register],
+});
+
+/**
+ * slock_socketio_resume_replayed_messages{kind} and
+ * slock_socketio_resume_horizon_reset_total for one successful sync:resume
+ * response (socket/syncResume.ts). Never throws into the resume.
+ */
+export function observeSyncResumeReplay(input: { pageCount: number; lateCount: number; horizonReset: boolean }): void {
+  observeMetricSafely(() => {
+    syncResumeReplayedMessages.observe({ kind: "page" }, Math.max(0, input.pageCount));
+    syncResumeReplayedMessages.observe({ kind: "late" }, Math.max(0, input.lateCount));
+    if (input.horizonReset) syncResumeHorizonResetTotal.inc();
+  });
+}
+
+/**
+ * GET /api/sync/changes responses that told the client to reload its
+ * snapshots instead of applying changes, by the closed SyncResetReason
+ * (too_old, too_many, forced; packages/shared/src/syncChanges.ts).
+ */
+export const syncChangesResetTotal = new Counter({
+  name: "slock_sync_changes_reset_total",
+  help: "GET /api/sync/changes responses that required a snapshot reload, by reason",
+  labelNames: ["reason"] as const,
   registers: [register],
 });
 
@@ -342,6 +417,135 @@ export const agentDeliveryPending = new Gauge({
     }
   },
 });
+
+// ---------------------------------------------------------------------------
+// Message push latency and agent delivery segments
+// (docs/observability/aws-prod-app-metrics-amp.md#message-push-latency)
+// ---------------------------------------------------------------------------
+
+/** Buckets shared by the push-latency histograms below (seconds). */
+export const PUSH_LATENCY_BUCKETS_SECONDS = [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60];
+
+/**
+ * Receiver classes of slock_message_push_lag_seconds. `web`: the first
+ * Socket.IO `message:new` emit of a persisted or system message; `agent`: the
+ * first agent:deliver frame written to the daemon socket for a delivery
+ * record; `desktop`: the `notification:desktop` emit; `web_push` and
+ * `mobile_push` (APNs/FCM): the first provider send that succeeded for a
+ * notification row. Closed set; never ids.
+ */
+export type MessagePushReceiver = "web" | "agent" | "mobile_push" | "desktop" | "web_push";
+
+/**
+ * Message createdAt to the server sending it to a receiver class, once per
+ * message per receiver class (per delivery record for agents). createdAt is
+ * the row's insert time, not its commit time, so a long transaction makes the
+ * lag read slightly low.
+ */
+export const messagePushLagSeconds = new Histogram({
+  name: "slock_message_push_lag_seconds",
+  help: "Time from message createdAt to the server sending it to a receiver class",
+  labelNames: ["receiver"] as const,
+  buckets: PUSH_LATENCY_BUCKETS_SECONDS,
+  registers: [register],
+});
+
+/**
+ * Agent delivery queue segment: the delivery entering the ack-retry path on
+ * this replica (sendAgentDeliveryWithAckRetry, or the routed command on the
+ * owning replica) to its first agent:deliver frame written to the daemon
+ * socket. Offline, parked and version-held time is in here. Observed once per
+ * delivery record; a record never sent from this replica is not observed.
+ */
+export const agentDeliveryQueueSeconds = new Histogram({
+  name: "slock_agent_delivery_queue_seconds",
+  help: "Time from an agent delivery entering the send path to its first send to the daemon",
+  labelNames: ["online_at_first_attempt", "delivery_kind"] as const,
+  buckets: PUSH_LATENCY_BUCKETS_SECONDS,
+  registers: [register],
+});
+
+/**
+ * Agent delivery end to end: the message's createdAt to its arrival at the
+ * daemon, at the same points and with the same once-per-record rule as
+ * slock_agent_delivery_ack_seconds (the ack, or `daemon_pending` for a
+ * tracked mention).
+ */
+export const agentDeliveryE2eSeconds = new Histogram({
+  name: "slock_agent_delivery_e2e_seconds",
+  help: "Time from message createdAt to the daemon ack of its agent delivery",
+  labelNames: ["online_at_first_attempt", "delivery_kind"] as const,
+  buckets: PUSH_LATENCY_BUCKETS_SECONDS,
+  registers: [register],
+});
+
+/**
+ * Agent start dispatch: the first agent:start frame written to the daemon
+ * socket to the dispatch ending. outcome is the closed
+ * AgentStartDispatchTerminalReason (acked, stopped, superseded,
+ * machine_reassigned, retry_exhausted, stale_dispatch); read outcome="acked"
+ * for start-to-ack latency. human_start: the start was a person's explicit
+ * start (agent:start `humanStart`), not an automatic wake. A dispatch never
+ * sent from this replica, or handed to another replica, is not observed.
+ */
+export const agentWakeStartSeconds = new Histogram({
+  name: "slock_agent_wake_start_seconds",
+  help: "Time from the first agent:start send to the daemon ack (or other end) of the start dispatch",
+  labelNames: ["outcome", "human_start"] as const,
+  buckets: PUSH_LATENCY_BUCKETS_SECONDS,
+  registers: [register],
+});
+
+/**
+ * Seconds from `createdAt` to `nowMs`, or null when createdAt is missing or
+ * unparseable (the observation is skipped). A createdAt in the future (clock
+ * skew between the database and this replica) is clamped to 0 so the event is
+ * still counted.
+ */
+export function secondsSince(createdAt: Date | string | number | null | undefined, nowMs: number): number | null {
+  if (createdAt === null || createdAt === undefined || createdAt === "") return null;
+  const ms = createdAt instanceof Date ? createdAt.getTime() : typeof createdAt === "number" ? createdAt : Date.parse(createdAt);
+  if (!Number.isFinite(ms) || !Number.isFinite(nowMs)) return null;
+  return Math.max(0, (nowMs - ms) / 1000);
+}
+
+/** Runs a metric observation; a metric must never throw into or change the path it measures. */
+export function observeMetricSafely(observe: () => void): void {
+  try {
+    observe();
+  } catch (error) {
+    console.warn("[Metrics] observation failed:", error instanceof Error ? error.message : String(error));
+  }
+}
+
+/** Observes slock_message_push_lag_seconds; skips a missing createdAt, never throws. */
+export function observeMessagePushLag(
+  receiver: MessagePushReceiver,
+  createdAt: Date | string | number | null | undefined,
+  nowMs: number = Date.now(),
+): void {
+  observeMetricSafely(() => {
+    const seconds = secondsSince(createdAt, nowMs);
+    if (seconds !== null) messagePushLagSeconds.observe({ receiver }, seconds);
+  });
+}
+
+/**
+ * A function that observes the push lag the first time it is called and does
+ * nothing afterwards: one observation per message per receiver class however
+ * many rooms or devices the send fans out to.
+ */
+export function oncePushLagObserver(
+  receiver: MessagePushReceiver,
+  createdAt: Date | string | number | null | undefined,
+): () => void {
+  let observed = false;
+  return () => {
+    if (observed) return;
+    observed = true;
+    observeMessagePushLag(receiver, createdAt);
+  };
+}
 
 /**
  * `daemon_version` label value: the version the daemon reported, "unknown"
@@ -695,6 +899,27 @@ export const dbReplicationSlotWalStatus = new Gauge({
 export const dbReplicationSlotCheckErrorsTotal = new Counter({
   name: "slock_db_replication_slot_check_errors_total",
   help: "Replication slot checks that failed; the slot gauges keep their last values meanwhile",
+  registers: [register],
+});
+
+// Active transactions and heavyweight lock waits on the primary
+// (db/pgActivityMonitor.ts), read every 30 s. Every task reads the same
+// database, so rules take max() across tasks.
+export const dbOldestXactAgeSeconds = new Gauge({
+  name: "slock_db_oldest_xact_age_seconds",
+  help: "Age in seconds of the oldest non-idle client transaction on the primary (0 when none)",
+  registers: [register],
+});
+
+export const dbLockWaitingBackends = new Gauge({
+  name: "slock_db_lock_waiting_backends",
+  help: "Active client backends on the primary waiting on a heavyweight lock (wait_event_type=Lock) for over 5 s",
+  registers: [register],
+});
+
+export const dbActivityCheckErrorsTotal = new Counter({
+  name: "slock_db_activity_check_errors_total",
+  help: "pg_stat_activity checks that failed; the activity gauges keep their last values meanwhile",
   registers: [register],
 });
 

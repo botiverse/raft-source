@@ -1,7 +1,7 @@
-import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useEffectEvent, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
-import { ArrowLeft, ArrowUpRight, FileX, Maximize2, Minimize2, X } from "lucide-react";
+import { ArrowLeft, FileX, Maximize2, Minimize2, PanelsTopLeft, X } from "lucide-react";
 import {
   Panel,
   PanelAction,
@@ -17,13 +17,11 @@ import type { ArtifactCard, ArtifactCommentId } from "@botiverse/raft-shared";
 
 import EmptyState from "../../components/ui/EmptyState";
 import Tooltip from "../../components/ui/Tooltip";
-import { useMediaQuery } from "../../hooks/effectPrimitives";
 import { trackArtifactOpened, trackArtifactViewerAction } from "./artifactAnalytics";
 import type { ArtifactOpenSource } from "./artifactAnalytics";
 import { artifactCardSeed, prefetchArtifactContentDns } from "./artifactOpenIntent";
-import { artifactUrl } from "./artifactLinks";
 import type { ArtifactLinkTarget } from "./artifactLinks";
-import { PHONE_QUERY } from "./artifactPhoneHistory";
+import { useArtifactPhoneLayout } from "./artifactPhoneLayout";
 import { useArtifactViewer } from "./artifactSource";
 import { ArtifactLoadingArea, ArtifactSplashMetaPlaceholder, ArtifactSplashScope, ArtifactSplashTitlePlaceholder } from "./ArtifactLoadingSplash";
 import { artifactHostOf, artifactOpenFocusReason, returnArtifactFocus, useArtifactViewerStore } from "./artifactViewerStore";
@@ -37,15 +35,19 @@ import { ArtifactShownFilePath } from "./ArtifactShownFilePath";
 import ArtifactScopeLabel from "./ArtifactScopeLabel";
 import type { ArtifactCommentsReview } from "./ArtifactCommentsContext";
 import { ArtifactShownFileProvider } from "./ArtifactShownFileProvider";
-import { ArtifactSurfaceActions, ArtifactSurfaceMain, ArtifactSurfaceMeta, ArtifactSurfaceProvider, ArtifactSurfaceTitle, ArtifactSurfaceVersionTag, useArtifactSurface, useArtifactSurfaceKeyDown } from "./ArtifactSurface";
+import { ArtifactSurfaceActions, ArtifactSurfaceMain, ArtifactSurfaceProvider, useArtifactSurface, useArtifactSurfaceKeyDown } from "./ArtifactSurface";
+import { ArtifactSurfaceMeta, ArtifactSurfaceTitle, ArtifactSurfaceVersionTag } from "./ArtifactSurfaceHead";
+import { ArtifactDetailsTitle } from "./ArtifactDetailsTitle";
 import type { PickVersion } from "./ArtifactVersionHistory";
 import { HEAD_ACTION_GAP, HEAD_ACTION_WIDTH, PanelHeadChromeContext, PanelHeadLeadContext, RowExpandAction, RowRegionBody, shownOwnActions, useHeadWidth, useRowExpand, useRowInRow } from "../../components/layout/appPanelHead";
 import { requestFocus } from "../../utils/focusRequest";
+import { resizeObserverOf } from "../../utils/ownerDocument";
 import { useArtifactComments } from "./ArtifactCommentsContext";
 import { useArtifactReview } from "./ArtifactReviewContext";
 import { useArtifactFind, useArtifactFindBodyShortcut } from "./artifactFind";
 import { offersForkInRaft } from "./artifactForkInRaft";
-import { artifactOpenLabelId, openArtifactWindow } from "./artifactWindow";
+import { WINDOW_TITLE_BAR } from "./artifactWindowTitleBar";
+import { ArtifactMessageOpeningContext } from "./useArtifactBacklinks";
 
 interface ViewerChrome {
   expanded: boolean;
@@ -62,12 +64,37 @@ interface ViewerChrome {
   ownBack?: boolean;
   onToggleExpanded?: () => void;
   onClose: () => void;
+  /** The whole page of an Artifact's object window (ArtifactWindowChrome), not a card of the main window. */
+  inWindow?: ArtifactWindowChrome | null;
+}
+
+/**
+ * The viewer as an Artifact's object window (#337 PR3, ArtifactObjectWindow.tsx; VS Code's auxiliary window): its
+ * head is the window's title bar, one slim row marked `data-raft-titlebar` (titleBar.css pads it clear of the macOS
+ * traffic lights or the Windows / Linux caption buttons, from the object window's own frame, objectWindowChrome.ts,
+ * and makes it the drag region; its controls stay pressable), with the title, the version, the surface's actions,
+ * Copy link (a button: the window has room for it), ⋯ (ArtifactViewerMenu: Open in system browser in place of Open
+ * in new page) and Open in main window where Expand and Close are (the window's own close or ⌘W closes it, never
+ * Esc, whose other meanings stay: a menu, the find bar, a card, comment mode). Laid out as on
+ * a desktop at every window width (the comment list over the page where the window is narrow), never as on a phone:
+ * the phone's history entry and sheets are the main window's. Focus moves in as it opens; giving it back when the
+ * window closes is the object window's (to the row that opened it), never the main viewer's.
+ */
+export interface ArtifactWindowChrome {
+  /** Open in main window: the main window's viewer shows this Artifact, and this window closes. */
+  onOpenInMain: () => void;
 }
 
 /**
  * The Artifact viewer: the Task v2 card in the channel's side column (F41),
- * on the DS panel parts: PanelHeader (title, version, where it lives and its
- * original message in the meta line; ⋯, expand, close) over the content.
+ * on the DS panel parts: PanelHeader over the content. On a desktop the head
+ * is one line at the row's shared height (#proj-workspace, variant D): the
+ * title, which opens the details (ArtifactDetailsTitle: where it lives, its
+ * original message, versions, who's seen it, the recent Artifacts), the
+ * version tag, then a fixed set of buttons by the page shown: the comment
+ * control (ArtifactReviewHeaderActions), Find in page, ⋯ (Open in New Page
+ * its first item), Expand, close. On a phone it keeps its two lines (the meta
+ * line under the title) and its fold.
  *
  * Focus moves into it when it opens and Escape closes it. While it loads,
  * the header is the card its opener showed (title, version, where it lives:
@@ -79,8 +106,8 @@ interface ViewerChrome {
  * the Artifact's own page (ArtifactStandalonePage, every link) places, so
  * the two can't drift apart. This file decides only how they are laid out:
  * expand and close (Back where it covers its channel), the side column's
- * width, the header folding by the card's width (HeaderFoldContext: Comments
- * into ⋯), the comment list
+ * width, a phone's header folding by the card's width (HeaderFoldContext:
+ * Comments into ⋯), the comment list
  * beside or over the content as the card's width allows (`fit="measure"`), a
  * bottom sheet on a phone (`fit="sheet"`),
  * the phone's history entry (the
@@ -120,7 +147,7 @@ export default function ArtifactViewer({ target, source, opening, onOpenedMessag
   /**
    * The title of the Artifact shown, once its viewer data has loaded (and as it is renamed), and null when it
    * goes: where the viewer is the page (the Artifacts home), for the tab's title. Never while it loads from the
-   * opener's card, nor for one the reader can't open.
+   * opener's card; null for one the reader can't open.
    */
   onShownTitle?: (title: string | null) => void;
 }) {
@@ -143,7 +170,8 @@ export default function ArtifactViewer({ target, source, opening, onOpenedMessag
   const { onClose } = chrome;
   // The card the page already showed for what it opens: the header while the viewer data loads.
   const seed = useMemo(() => artifactCardSeed(target), [target]);
-  const phone = useMediaQuery(PHONE_QUERY);
+  // An object window is a desktop's at every width (ArtifactWindowChrome, useArtifactPhoneLayout).
+  const phone = useArtifactPhoneLayout();
   // Shown: its frame will load from its content origin, so the connection opens now, beside the viewer read.
   useEffect(() => {
     prefetchArtifactContentDns(target.id);
@@ -181,8 +209,10 @@ export default function ArtifactViewer({ target, source, opening, onOpenedMessag
         busy
         label={seed.title}
         artifactId={seed.id}
+        phone={phone}
         title={<ViewerTitle card={seed} />}
-        meta={<ArtifactMetaRow text={<ArtifactScopeLabel home={seed.home} fromAnotherServer={seed.fromAnotherServer} />} />}
+        // A desktop head is one line (the details are its title's, once loaded); a phone's has the line under it.
+        meta={phone ? <ArtifactMetaRow text={<ArtifactScopeLabel home={seed.home} fromAnotherServer={seed.fromAnotherServer} />} /> : null}
       >
         <ViewerLoading kind={seed.kind} />
       </ViewerFrame>,
@@ -195,14 +225,16 @@ export default function ArtifactViewer({ target, source, opening, onOpenedMessag
         label={formatMessage({ id: "artifacts.viewer.regionLabel" })}
         busy={loading}
         // Nothing is known yet (a link, an address): still placeholders where the title and the meta line go.
+        phone={phone}
         title={loading ? <ArtifactSplashTitlePlaceholder /> : undefined}
-        meta={loading ? <ArtifactMetaRow text={<ArtifactSplashMetaPlaceholder />} /> : undefined}
+        meta={loading && phone ? <ArtifactMetaRow text={<ArtifactSplashMetaPlaceholder />} /> : undefined}
         {...chrome}
       >
         {result.status === "unavailable" ? (
           // One state for no access, not found and deleted (F11): nothing
           // about the Artifact, not even that it exists.
           <div className="flex flex-1 items-center justify-center p-6" data-testid="artifact-viewer-unavailable">
+            <NamesNothing onShownTitle={onShownTitle} />
             <EmptyState
               icon={<FileX size={36} />}
               title={formatMessage({ id: "artifacts.viewer.unavailableTitle" })}
@@ -247,6 +279,15 @@ export default function ArtifactViewer({ target, source, opening, onOpenedMessag
   );
 }
 
+/** One the reader can't open names nothing (`onShownTitle(null)`, as it shows): the host's own name, not the last Artifact's. */
+function NamesNothing({ onShownTitle }: { onShownTitle?: (title: string | null) => void }) {
+  const namesNothing = useEffectEvent(() => onShownTitle?.(null));
+  useEffect(() => {
+    namesNothing();
+  }, []);
+  return null;
+}
+
 /** The loaded viewer: the card's frame around the surface's parts. */
 function LoadedViewer({ chrome, switching, failedVersion, onRetry, phone, onOpenedMessage, onShownTitle }: {
   chrome: ViewerChrome;
@@ -265,30 +306,39 @@ function LoadedViewer({ chrome, switching, failedVersion, onRetry, phone, onOpen
     shownTitleRef.current?.(card.title);
   }, [card.title]);
   useEffect(() => () => shownTitleRef.current?.(null), []);
-  const openInNewPage = useCallback(() => {
-    // Addresses are built from the id, never taken from the payload.
-    openArtifactWindow(artifactUrl(card.id, card.pinned ? card.version : null), card.id);
-  }, [card.id, card.pinned, card.version]);
+  const messageOpening = useMemo(() => ({ replace: phone, onOpened: onOpenedMessage }), [phone, onOpenedMessage]);
   return (
     <ViewerFrame
       {...chrome}
+      phone={phone}
       busy={switching}
       label={card.title}
       artifactId={card.id}
-      onOpenInNewPage={openInNewPage}
       fork={offersForkInRaft(card)}
-      actions={<ViewerActions />}
-      title={<ViewerTitle card={card} record title={<ArtifactSurfaceTitle testId="artifact-viewer-title" />} after={<ArtifactShownFilePath data={data} />} version={<ArtifactSurfaceVersionTag />} />}
+      actions={<ViewerActions copyLinkHere={!!chrome.inWindow} />}
+      title={phone ? (
+        <ViewerTitle card={card} record title={<ArtifactSurfaceTitle testId="artifact-viewer-title" />} after={<ArtifactShownFilePath data={data} />} version={<ArtifactSurfaceVersionTag />} />
+      ) : (
+        // One line: the title opens the details, where the meta line's parts are.
+        <>
+          <ArtifactDetailsTitle testId="artifact-viewer-title" onOpenedMessage={onOpenedMessage} />
+          <PanelStatus><ArtifactSurfaceVersionTag /></PanelStatus>
+        </>
+      )}
       // On a phone the viewer is a page with its own history entry: the message takes its place.
-      meta={<ViewerMeta replace={phone} onOpened={onOpenedMessage} />}
+      meta={phone ? <ViewerMeta replace onOpened={onOpenedMessage} /> : null}
     >
-      <ArtifactSurfaceMain switching={switching} failedVersion={failedVersion} onRetry={onRetry} />
+      {/* "Linked from"'s discussions open as the original message does here (#proj-workspace:#336 step 2). */}
+      <ArtifactMessageOpeningContext.Provider value={messageOpening}>
+        <ArtifactSurfaceMain switching={switching} failedVersion={failedVersion} onRetry={onRetry} />
+      </ArtifactMessageOpeningContext.Provider>
     </ViewerFrame>
   );
 }
 
 /**
- * The header's title and version, from the viewer data or, while it loads, the opener's card
+ * The header's title and version (a phone's; a desktop's loaded one is ArtifactDetailsTitle), from the viewer data or,
+ * while it loads, the opener's card
  * (`title`: the surface's own title; `version`: the
  * surface's tag, which switches versions; else the plain title and tag). Beside a conversation
  * the title may be the menu of the Artifacts recently opened there (ArtifactRecentTitle; `record`:
@@ -321,30 +371,35 @@ interface ShownVersion {
 }
 
 /**
- * How the header gives way as the card narrows (raft-design patterns/
- * responsive.md, When a row runs out of room): the title keeps its room, so
- * Comments goes into the ⋯ menu, and Fork in Raft (another server's public
- * Artifact) becomes its first item. Expand never does: it changes the view
- * itself, so it stays one press away at any width (stdrc, #proj-raft-ui:#179).
- * Open in New Page stays until a column of the row has no room left for it
- * (#189 rule 6: it folds like the head's other own actions, the last to).
- * Decided on the card's own width, not the window's: the ⋯ menu's content is
- * in a portal, out of a container query's reach, so the card is measured.
+ * How the header gives way as the card narrows. On a desktop it doesn't: the
+ * head is one line with a fixed set of buttons by the page shown (the comment
+ * control, Find in page, ⋯, Expand, close; #proj-workspace, variant D), the
+ * same at every column width, so a button is always where it was; only Fork in
+ * Raft (another server's public Artifact, a labelled button) goes into ⋯ in a
+ * column under 440px, so a long label never squeezes the title.
+ *
+ * A phone's head keeps today's fold (raft-design patterns/responsive.md, When
+ * a row runs out of room; #189 rule 6, headFit): the title keeps its room, so
+ * Comments goes into the ⋯ menu, the last own action first, the visibility
+ * chip with the last. Expand never does: it changes the view itself, so it
+ * stays one press away at any width (stdrc, #proj-raft-ui:#179). Decided on
+ * the card's own width, not the window's: the ⋯ menu's content is in a
+ * portal, out of a container query's reach, so the card is measured.
  */
 /** Fork in Raft's labelled `md` Button in the head (its longest label, es / pt-br, about this). */
 const FORK_WIDTH = 120;
 const HEADER_ACTIONS_MIN_WIDTH = 440;
 
 interface HeaderFold {
-  /** Comments and Fork in Raft in the ⋯ menu (Expand stays in the header). */
+  /** A phone's compact head: Find in page, the Comments toggle and Fork in Raft in the ⋯ menu (Expand stays). */
   actions: boolean;
-  /** The comment controls in ⋯, comment mode's or the Comments toggle (#189 rule 6: own actions fold, the last first). */
+  /** A phone's comment controls in ⋯, comment mode's or the Comments toggle (#189 rule 6: own actions fold, the last first). */
   review?: boolean;
-  /** Find in page in ⋯ (after the comment controls, before Fork in Raft). */
+  /** A phone's Find in page in ⋯ (after the comment controls, before Fork in Raft). */
   find?: boolean;
-  /** Open in New Page in ⋯ (it folds last, the visibility chip with it; ⋯, Expand and Close never do). */
-  openInNewPage?: boolean;
-  /** Fork in Raft in ⋯ (the last own action: it folds first). */
+  /** A phone's visibility chip in ⋯ (where none of its own actions fit). */
+  scope?: boolean;
+  /** Fork in Raft in ⋯ (the last own action: it folds first; on a desktop, under 440px). */
   fork?: boolean;
   expanded: boolean;
   onToggleExpanded?: () => void;
@@ -359,8 +414,10 @@ function useWidth(element: HTMLElement | null): number {
     if (!element) return;
     const update = () => setWidth(Math.round(element.getBoundingClientRect().width));
     update();
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(update);
+    // The element's own window's observer (an object window's, #337 PR3).
+    const Observer = resizeObserverOf(element);
+    if (!Observer) return;
+    const observer = new Observer(update);
     observer.observe(element);
     return () => observer.disconnect();
   }, [element]);
@@ -368,37 +425,38 @@ function useWidth(element: HTMLElement | null): number {
 }
 
 /**
- * The head's own actions' widths, in its order: Open in New Page, then comment mode's controls (the Comment button
- * and its ▾, with Continue / Submit N / Retry where shown) or, where comment mode isn't offered, the Comments toggle.
- * `comments`: there is a comment control (comment mode's folds as one into ⋯ items). Then Find in page where the
- * page may be searched (`find`), then Fork in Raft, where offered.
+ * A phone's head's own actions' widths, in its order: the slot Open in New Page had (its fold is as it was: the
+ * phone's head never showed the button, ⋯ has it), then comment mode's controls (the Comment button and its ▾, with
+ * Retry where shown) or, where comment mode isn't offered, the Comments toggle. `comments`: there is a comment control
+ * (comment mode's folds as one into ⋯ items). Then Find in page where the page may be searched (`find`), then Fork in
+ * Raft, where offered.
  */
-function useViewerHeadOwn(openInNewPage: boolean, fork: boolean): { widths: number[]; comments: boolean; find: boolean } {
+function useViewerHeadOwn(phone: boolean, fork: boolean): { widths: number[]; comments: boolean; find: boolean } {
   const review = useArtifactReview();
   const comments = useArtifactComments();
   const find = useArtifactFind()?.offered ?? false;
   const offered = review?.canComment ?? false;
   const extra = offered && (review?.draftsFailed || review?.draftCount) ? 1 : 0;
   const widths = useMemo(() => {
-    const list: number[] = openInNewPage ? [HEAD_ACTION_WIDTH] : [];
+    const list: number[] = phone ? [HEAD_ACTION_WIDTH] : [];
     if (offered) list.push(HEAD_ACTION_WIDTH + 20 + extra * (56 + HEAD_ACTION_GAP));
     else if (comments) list.push(HEAD_ACTION_WIDTH);
     if (find) list.push(HEAD_ACTION_WIDTH);
     if (fork) list.push(FORK_WIDTH);
     return list;
-  }, [comments, extra, find, fork, offered, openInNewPage]);
+  }, [comments, extra, find, fork, offered, phone]);
   return { widths, comments: offered || comments !== null, find };
 }
 
-/** The surface's header actions, folded as the card's width says. */
-function ViewerActions() {
+/** The surface's header actions: a desktop's fixed set, a phone's folded as the card's width says; Copy link a button in an object window. */
+function ViewerActions({ copyLinkHere }: { copyLinkHere: boolean }) {
   const fold = useContext(HeaderFoldContext);
-  return <ArtifactSurfaceActions compact={fold.actions} commentsInMenu={fold.actions || !!fold.review} copyLinkHere={false} reviewInMenu={fold.review} openInNewPageInMenu={fold.openInNewPage} findInMenuHere={fold.find} forkInMenuHere={fold.fork} scopeInMenu={fold.openInNewPage} />;
+  return <ArtifactSurfaceActions compact={fold.actions} commentsInMenu={fold.actions || !!fold.review} copyLinkHere={copyLinkHere} reviewInMenu={fold.review} findInMenuHere={fold.find} forkInMenuHere={fold.fork} scopeInMenu={fold.scope} />;
 }
 
-/** The surface's meta line, its visibility chip folded into ⋯ with Open in New Page (#189 rule 6). */
+/** A phone's meta line, its visibility chip folded into ⋯ where none of the head's own actions fit (#189 rule 6). */
 function ViewerMeta({ replace, onOpened }: { replace: boolean; onOpened?: () => void }) {
-  return <ArtifactSurfaceMeta replace={replace} onOpened={onOpened} scopeInMenu={useContext(HeaderFoldContext).openInNewPage} />;
+  return <ArtifactSurfaceMeta replace={replace} onOpened={onOpened} scopeInMenu={useContext(HeaderFoldContext).scope} />;
 }
 
 /** The panel, its header and the shared actions (expand, close); Escape closes. */
@@ -415,17 +473,18 @@ function ViewerFrame({
   onClose,
   children,
   artifactId,
-  onOpenInNewPage,
+  phone = false,
   fork = false,
+  inWindow = null,
 }: ViewerChrome & {
   label: string;
   busy?: boolean;
   title?: ReactNode;
   meta?: ReactNode;
-  /** The surface's header actions (ArtifactSurfaceActions), before Open in New Page, Expand and close. */
+  /** The surface's header actions (ArtifactSurfaceActions), before Expand and close. */
   actions?: ReactNode;
-  /** Opens the Artifact on its own page (a new tab); a header button beside Expand, not in ⋯. */
-  onOpenInNewPage?: () => void;
+  /** Laid out as on a phone: the head keeps its two lines and its fold. */
+  phone?: boolean;
   /** The actions hold Fork in Raft (another server's public Artifact): the head's last own action. */
   fork?: boolean;
   artifactId?: string;
@@ -434,7 +493,7 @@ function ViewerFrame({
   const { formatMessage } = useIntl();
   const closeLabel = formatMessage({ id: "artifacts.viewer.close" });
   const expandLabel = formatMessage({ id: expanded ? "artifacts.viewer.restore" : "artifacts.viewer.expand" });
-  const openInNewPageLabel = formatMessage({ id: artifactOpenLabelId("artifacts.card.openInNewPage") });
+  const openInMainLabel = formatMessage({ id: "artifacts.window.openInMain" });
   // A section of the planned row (#189, the side area's RowRegionChrome): the grip that moves it (rule 7), and where
   // its column holds the columns the row couldn't give 160, their tabs in place of its title (rule 4).
   const chrome = useContext(PanelHeadChromeContext);
@@ -442,8 +501,9 @@ function ViewerFrame({
   // The side window's switch chip while the built-in browser is open behind this Artifact (Raft Desktop,
   // desktop_web_preview_view_v0); null everywhere else, and the head is as it is without it.
   const lead = useContext(PanelHeadLeadContext);
-  // A column of the planned row (#189): its Expand is the row's (rule 5), not the viewer's own.
-  const inRow = useRowInRow("artifact");
+  // A column of the planned row (#189): its Expand is the row's (rule 5), not the viewer's own. An object window's
+  // viewer is in no row (the main window's plan is about the main window).
+  const inRow = useRowInRow("artifact") && !inWindow;
   // Focus moves in when the viewer opens, and back to the card that opened
   // it when it closes (not when it switches to another Artifact).
   const panelRef = useRef<HTMLElement | null>(null);
@@ -453,19 +513,19 @@ function ViewerFrame({
     setPanelElement(element);
   }, []);
   const width = useWidth(panelElement);
-  const foldActions = width > 0 && width < HEADER_ACTIONS_MIN_WIDTH;
+  const narrow = width > 0 && width < HEADER_ACTIONS_MIN_WIDTH;
   // Expanding (not restoring) is `maximize`.
   const toggleExpanded = useMemo(() => (onToggleExpanded ? () => {
     if (!expanded) trackArtifactViewerAction("maximize");
     onToggleExpanded();
   } : undefined), [expanded, onToggleExpanded]);
   const trackMaximize = useCallback(() => trackArtifactViewerAction("maximize"), []);
-  // The head always fits its column (#189 rule 6, as headFit): past the title's room its own actions fold into ⋯, the
-  // last first (comment mode's controls, then Open in New Page); ⋯, Expand and Close never fold.
+  // A phone's head always fits its column (#189 rule 6, as headFit): past the title's room its own actions fold into
+  // ⋯, the last first; ⋯, Expand and Close never fold. Measured on a phone only: a desktop's set is fixed.
   const [measureHead, headWidth, headElement] = useHeadWidth();
   // The readers beside the title, and the title as the recent Artifacts' trigger (its chevron), are room it needs.
-  const readersWidth = useHeadReadersWidth(headElement) + useRecentTitleExtraWidth();
-  const headOwn = useViewerHeadOwn(!!onOpenInNewPage, fork);
+  const readersWidth = useHeadReadersWidth(phone ? headElement : null) + useRecentTitleExtraWidth();
+  const headOwn = useViewerHeadOwn(phone, fork);
   const rowExpand = useRowExpand("artifact");
   const ownShown = shownOwnActions({
     width: headWidth,
@@ -476,28 +536,35 @@ function ViewerFrame({
     content: readersWidth,
     leadWidth: lead?.width,
   });
-  // In the head's order: Open in New Page, the comment controls, Find in page, Fork in Raft; the last folds first.
+  // In a phone's head's order: Open in New Page's slot, the comment controls, Find in page, Fork in Raft; the last folds first.
   const ownCount = headOwn.widths.length;
   const foldFork = fork && ownShown < ownCount;
   const foldFind = headOwn.find && ownShown < ownCount - (fork ? 1 : 0);
   const foldReview = headOwn.comments && ownShown < ownCount - (fork ? 1 : 0) - (headOwn.find ? 1 : 0);
-  const foldOpen = !!onOpenInNewPage && ownShown === 0;
+  const foldScope = ownShown === 0;
   const fold = useMemo<HeaderFold>(
-    () => ({ actions: foldActions, review: foldReview, openInNewPage: foldOpen, find: foldFind, fork: foldFork, expanded, onToggleExpanded: toggleExpanded }),
-    [expanded, foldActions, foldFind, foldFork, foldOpen, foldReview, toggleExpanded],
+    () => (phone
+      ? { actions: narrow, review: foldReview, scope: foldScope, find: foldFind, fork: foldFork, expanded, onToggleExpanded: toggleExpanded }
+      : { actions: false, fork: fork && narrow, expanded, onToggleExpanded: toggleExpanded }),
+    [expanded, fork, foldFind, foldFork, foldReview, foldScope, narrow, phone, toggleExpanded],
   );
+  const windowed = inWindow !== null;
   useEffect(() => {
     // Maybe well after the press that opened it (the viewer's chunk downloading): focus the person put in a text field
     // or a dialog meanwhile stays there (focus plan rule 2: artifactOpenFocusReason).
     requestFocus(() => panelRef.current, { reason: artifactOpenFocusReason() });
+    // An object window gives focus back itself, in the main window (features/objectWindows: to its opener).
+    if (windowed) return;
     // The channel panel it is in (or open beside), for when the opener can't take focus back.
     const host = artifactHostOf(panelRef.current, useArtifactViewerStore.getState().open?.conversationId);
     return () => {
       if (useArtifactViewerStore.getState().open === null) returnArtifactFocus(host);
     };
-  }, []);
+  }, [windowed]);
   // The surface's Esc (a comment's card, the list, comment mode); anything else closes the viewer.
-  const handleKeyDown = useArtifactSurfaceKeyDown(onClose);
+  // An object window is not closed by Esc (Kirby: easy to hit by accident, and VS Code's auxiliary windows aren't):
+  // its own close and ⌘W close it; Esc keeps its other meanings there (menus, the find bar, a card, comment mode).
+  const handleKeyDown = useArtifactSurfaceKeyDown(windowed ? undefined : onClose);
   // Cmd/Ctrl+F with the focus fallen to the body, the viewer having had it last: the find bar's too.
   useArtifactFindBodyShortcut(panelElement);
   return (
@@ -516,11 +583,11 @@ function ViewerFrame({
       data-artifact-id={artifactId}
     >
       {/* The panel head every column has, as Task v2's sections
-          (ChannelSideCard): PanelHeader, 56px with a seam under it and the
-          20px margin, so stacked above Tasks and Files its title and buttons
-          line up with theirs. Covering, the Back comes first (on a phone the
+          (ChannelSideCard): PanelHeader with a seam under it, so stacked above
+          Tasks and Files, and beside the conversation in the row, its title,
+          buttons and seam line up with theirs. Covering, the Back comes first (on a phone the
           channel header's Back stands for it). */}
-      <PanelHeader data-testid="artifact-viewer-header" {...(covering ? null : chrome?.props)} ref={measureHead}>
+      <PanelHeader data-testid="artifact-viewer-header" {...(covering ? null : chrome?.props)} {...(windowed ? WINDOW_TITLE_BAR : null)} ref={measureHead}>
         {covering ? (
           // A narrow desktop panel has no header Back, so the card keeps its
           // own, labelled as the close it stands for (Task v2's ChannelSideCard).
@@ -531,32 +598,25 @@ function ViewerFrame({
         {lead?.node}
         <PanelHeaderContent className="@container">
           {rowTabs ?? (title ? <PanelHeading>{title}</PanelHeading> : null)}
-          {/* The line under the title (ArtifactMetaRow): it holds its own PanelMeta, the readers beside it. */}
+          {/* A phone's line under the title (ArtifactMetaRow): it holds its own PanelMeta, the readers beside it. A
+              desktop head has none: one line, at the row's shared height, its title opening the details. */}
           {rowTabs ? null : meta}
           {/* Absolute along the head's top edge: not one of the head's first or last controls. */}
           {covering ? null : chrome?.grip}
         </PanelHeaderContent>
         <PanelActions data-testid="artifact-viewer-actions">
-          {/* Open in New Page first among the viewer's own actions, before ⋯
-              (raft-design panel.md, Rules); where the column has no room it
-              folds into ⋯ like the others, the last to (#189 rule 6). Expand
-              is a window control, right before Close, never in ⋯ (stdrc,
-              2026-11-03). A phone has neither: the viewer is the whole screen
-              there, and ⋯ keeps Open in New Page. */}
-          {onOpenInNewPage && !foldOpen ? (
-            <Tooltip content={openInNewPageLabel}>
-              <PanelAction
-                aria-label={openInNewPageLabel}
-                onClick={onOpenInNewPage}
-                data-testid="artifact-viewer-open-in-new-page"
-                className="max-md:hidden"
-              >
-                <ArrowUpRight />
+          {/* The viewer's own actions, then ⋯ (Open in New Page is its first item: raft-design panel.md's order, the
+              head's one-line set). Expand is a window control, right before Close, never in ⋯ (stdrc, 2026-11-03).
+              A phone has no Expand: the viewer is the whole screen there. */}
+          {actions}
+          {inWindow ? (
+            // Where Expand and Close are: the window's own close closes it (ArtifactWindowChrome).
+            <Tooltip content={openInMainLabel}>
+              <PanelAction aria-label={openInMainLabel} onClick={inWindow.onOpenInMain} data-testid="artifact-window-open-in-main">
+                <PanelsTopLeft />
               </PanelAction>
             </Tooltip>
-          ) : null}
-          {actions}
-          {inRow ? <RowExpandAction region="artifact" testId="artifact-viewer-expand" onExpand={trackMaximize} /> : toggleExpanded ? (
+          ) : inRow ? <RowExpandAction region="artifact" testId="artifact-viewer-expand" onExpand={trackMaximize} /> : toggleExpanded ? (
             <Tooltip content={expandLabel}>
               <PanelToggleAction
                 aria-label={expandLabel}
@@ -569,7 +629,7 @@ function ViewerFrame({
               </PanelToggleAction>
             </Tooltip>
           ) : null}
-          {covering ? null : (
+          {covering || windowed ? null : (
             <Tooltip content={closeLabel}>
               <PanelAction aria-label={closeLabel} onClick={onClose} data-testid="artifact-viewer-close">
                 <X />

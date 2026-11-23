@@ -1,24 +1,40 @@
 import { useCallback, useMemo } from "react";
 import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
+import { artifactDownloadFileName, artifactSafeFileName } from "@botiverse/raft-shared";
 import type { ArtifactViewerData } from "@botiverse/raft-shared";
 
-import { showToast } from "../../components/toastBridge";
+import { useToast } from "@botiverse/raft-ui";
 import { trackArtifactViewerAction } from "./artifactAnalytics";
 import { artifactErrorCode } from "./artifactApi";
 import { readsInOwnServer } from "./artifactOwnServer";
 import { artifactSource } from "./artifactSource";
 import type { ArtifactFileTarget } from "./artifactSource";
+import { POLITE_ERROR } from "./artifactToasts";
 
 // Saving an Artifact's files on the person's device: one file (the viewer's
 // Download, the Files panel's rows), or every file of a version in one zip
 // (Download all, #proj-workspace:#239). The bytes come from Raft's own
 // API at an address built from the id, the version and the path (never one
 // a payload gives), through the API client (its auth and X-Server-Id).
+// Saved by the name the server's Content-Disposition gives the same file.
 
-/** Download: bytes from Raft's API, saved through a blob: URL that is revoked right after. */
-export async function downloadArtifactFile(file: ArtifactFileTarget): Promise<void> {
-  saveBlob(await artifactSource().readBytes(file), file.path.slice(file.path.lastIndexOf("/") + 1));
+/** The version shown, as a download needs it: its id, number and title, and how many files it has. */
+type ShownVersion = Pick<ArtifactViewerData, "card" | "files">;
+
+/**
+ * Download: the file at `path` of the version shown, saved as
+ * artifactDownloadFileName names it (a version of one file by its title:
+ * `周计划.html`; otherwise the file's own name).
+ */
+export async function downloadArtifactFile(data: ShownVersion, path: string): Promise<void> {
+  const file: ArtifactFileTarget = { id: data.card.id, version: data.card.version, path };
+  saveBlob(await artifactSource().readBytes(file), artifactFileDownloadName(data, path));
+}
+
+/** The name the file at `path` of the version shown is saved as: the server's Content-Disposition for it. */
+export function artifactFileDownloadName(data: ShownVersion, path: string): string {
+  return artifactDownloadFileName({ title: data.card.title, fileCount: data.files.length, path });
 }
 
 /**
@@ -30,11 +46,17 @@ export async function downloadArtifactZip(target: { id: ArtifactFileTarget["id"]
   saveBlob(await artifactSource().readZip(target), artifactZipName(target.title, target.version));
 }
 
-/** The archive's file name, as the server's Content-Disposition writes it: the title's letters, digits, spaces, dots, dashes and underscores, then the version. */
+/** The archive's file name, as the server's Content-Disposition writes it (artifactSafeFileName), then the version. */
 export function artifactZipName(title: string, version: number): string {
-  const safe = title.normalize("NFKD").replace(/[^A-Za-z0-9 ._-]+/g, " ").replace(/\s+/g, " ").trim().replace(/^\.+/, "").slice(0, 80).trim();
-  return `${safe || "artifact"} v${version}.zip`;
+  return `${artifactSafeFileName(title) || "artifact"} v${version}.zip`;
 }
+
+/**
+ * How long a download's blob: URL is kept after its click. The mobile App's
+ * Android web view reads the blob only after the click (Lagoon), so it must
+ * outlive a slow read.
+ */
+const BLOB_URL_REVOKE_DELAY_MS = 60_000;
 
 function saveBlob(blob: Blob, name: string): void {
   const url = URL.createObjectURL(blob);
@@ -43,13 +65,16 @@ function saveBlob(blob: Blob, name: string): void {
   link.download = name;
   link.rel = "noopener";
   link.click();
-  // Revoke once the browser has taken the download.
-  window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  // Revoke once the download has been taken (BLOB_URL_REVOKE_DELAY_MS).
+  window.setTimeout(() => URL.revokeObjectURL(url), BLOB_URL_REVOKE_DELAY_MS);
 }
 
+/** The toasts of the window the download was asked in (useToast: the nearest provider, an object window's own; #337 PR3). */
+export type ArtifactToasts = ReturnType<typeof useToast>;
+
 /** A file that couldn't be downloaded (any refusal, offline): said in a toast, as a refused zip is. */
-export function fileDownloadFailed(formatMessage: IntlShape["formatMessage"]): void {
-  showToast({ title: formatMessage({ id: "artifacts.download.fileFailed" }), type: "error" });
+export function fileDownloadFailed(formatMessage: IntlShape["formatMessage"], toast: ArtifactToasts): void {
+  toast.error(formatMessage({ id: "artifacts.download.fileFailed" }), POLITE_ERROR);
 }
 
 /** What a refused Download All (Zip) says, by the server's code. */
@@ -73,6 +98,7 @@ function zipRefusal(code: string | null) {
  */
 export function useArtifactDownload(data: ArtifactViewerData): { all: boolean; download: () => void } | null {
   const { formatMessage } = useIntl();
+  const toast = useToast();
   const { id, version, title } = data.card;
   const entry = data.files.find((file) => file.entry) ?? data.files[0];
   const entryPath = entry?.path ?? null;
@@ -81,12 +107,12 @@ export function useArtifactDownload(data: ArtifactViewerData): { all: boolean; d
     trackArtifactViewerAction("download");
     if (all) {
       void downloadArtifactZip({ id, version, title }).catch((error: unknown) => {
-        showToast({ title: formatMessage({ id: zipRefusal(artifactErrorCode(error)) }), type: "error" });
+        toast.error(formatMessage({ id: zipRefusal(artifactErrorCode(error)) }), POLITE_ERROR);
       });
     } else if (entryPath) {
-      void downloadArtifactFile({ id, version, path: entryPath }).catch(() => fileDownloadFailed(formatMessage));
+      void downloadArtifactFile(data, entryPath).catch(() => fileDownloadFailed(formatMessage, toast));
     }
-  }, [all, id, version, title, entryPath, formatMessage]);
+  }, [all, data, id, version, title, entryPath, formatMessage, toast]);
   const offered = entryPath !== null && readsInOwnServer(data.card);
   return useMemo(() => (offered ? { all, download } : null), [offered, all, download]);
 }

@@ -365,7 +365,7 @@ async function main() {
       // run holds its channel, an agent runtime profile holds its machine.
       await db.execute(sql`delete from workflow_instances where server_id in ${oldIds}`);
       await db.execute(sql`delete from agent_runtime_profiles where server_id in ${oldIds}`);
-      await db.execute(sql`update servers set onboarding_agent_id = null where id in ${oldIds}`);
+      await db.execute(sql`update servers set onboarding_agent_id = null, official_onboarding_agent_id = null where id in ${oldIds}`);
       for (const id of oldIds) {
         await db.delete(servers).where(eq(servers.id, id));
       }
@@ -646,7 +646,7 @@ async function main() {
       const maggie = await createAgent(ws.id, { name: "Maggie", description: "Docs writer and reviewer", runtime: "cursor", model: "composer-2", machineId: macbook.id });
       const walter = await createAgent(ws.id, { name: "Walter", description: "Research coordinator", runtime: "claude", model: "sonnet", machineId: macbook.id });
       const scout = await createAgent(ws.id, { name: "Scout", description: "Release notes scout", runtime: "pi", model: "default", machineId: macbook.id, status: "stopped" });
-      await db.update(servers).set({ onboardingAgentId: cindy.id }).where(eq(servers.id, ws.id));
+      await db.update(servers).set({ onboardingAgentId: cindy.id, officialOnboardingAgentId: cindy.id }).where(eq(servers.id, ws.id));
       // Statuses for the lifecycle page: Cindy online (derived), Koda working,
       // Maggie error, Scout offline (stopped).
       const maggieError: AgentRuntimeErrorState = { message: "Cursor CLI exited during startup", at: at(4).toISOString(), actionRequired: false };
@@ -909,7 +909,7 @@ async function main() {
     await addMember(tut.id, alex, "owner");
     const tutMac = await createMachine(tut.id, { name: "Alex MacBook Pro", hostname: "alex-macbook-pro", runtimes: ["claude", "codex", "builtin", "kimi-sdk", "pi"] });
     const tCindy = await createAgent(tut.id, { name: "Cindy", description: "Onboarding Agent", runtime: "claude", model: "opus", machineId: tutMac.id });
-    await db.update(servers).set({ onboardingAgentId: tCindy.id }).where(eq(servers.id, tut.id));
+    await db.update(servers).set({ onboardingAgentId: tCindy.id, officialOnboardingAgentId: tCindy.id }).where(eq(servers.id, tut.id));
     const C = G(tCindy);
     const tAll = await createChannel(tut.id, "all", "General channel for all members", "channel");
     const tOwner = await createChannel(tut.id, "onboarding-owner", "Your private onboarding space", "private");

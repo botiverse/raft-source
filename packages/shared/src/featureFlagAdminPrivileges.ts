@@ -1,6 +1,7 @@
 export const FEATURE_FLAG_ADMIN_OPERATOR_ROLE = "feature_flag_admin_operator";
 export const FEATURE_FLAG_ADMIN_ANNOUNCEMENT_RULES_REACH_FUNCTION = "public.announcement_rules_reach(jsonb, text, uuid[], uuid[], timestamptz)";
 export const FEATURE_FLAG_ADMIN_SERVER_PLAN_ENTITLEMENT_INPUTS_FUNCTION = "public.ffa_server_plan_entitlement_inputs(uuid, timestamptz)";
+export const FEATURE_FLAG_ADMIN_CHANGE_SERVER_PLAN_FUNCTION = "public.ffa_change_server_plan(text, text, text, text, text, text, text, text, text, text, text)";
 
 export const REQUIRED_FEATURE_FLAG_ADMIN_PRIVILEGES = [
   { kind: "schema", object: "public", privilege: "USAGE" },
@@ -144,6 +145,9 @@ export const REQUIRED_FEATURE_FLAG_ADMIN_PRIVILEGES = [
   // Single-server plan entitlement inputs for feature-flag preview, 0716: non-secret fields only,
   // so appsumo_licenses, appsumo_license_bindings, and prepaid_pro_purchases remain unreadable.
   { kind: "function", object: FEATURE_FLAG_ADMIN_SERVER_PLAN_ENTITLEMENT_INPUTS_FUNCTION, privilege: "EXECUTE" },
+  // Change one server's plan, 0724: a compare-and-set SECURITY DEFINER function, so the role still
+  // holds no UPDATE on servers and cannot touch subscription, AppSumo or prepaid rows.
+  { kind: "function", object: FEATURE_FLAG_ADMIN_CHANGE_SERVER_PLAN_FUNCTION, privilege: "EXECUTE" },
 ] as const;
 
 // Column-level writes the operator may hold on lab_definitions (0303). Anything else stays unexpected.
@@ -256,6 +260,7 @@ export const FORBIDDEN_FEATURE_FLAG_ADMIN_PRIVILEGES = [
   { kind: "schema", object: "public", privilege: "CREATE" },
   { kind: "function", object: FEATURE_FLAG_ADMIN_ANNOUNCEMENT_RULES_REACH_FUNCTION, privilege: "EXECUTE WITH GRANT OPTION" },
   { kind: "function", object: FEATURE_FLAG_ADMIN_SERVER_PLAN_ENTITLEMENT_INPUTS_FUNCTION, privilege: "EXECUTE WITH GRANT OPTION" },
+  { kind: "function", object: FEATURE_FLAG_ADMIN_CHANGE_SERVER_PLAN_FUNCTION, privilege: "EXECUTE WITH GRANT OPTION" },
   { kind: "schema", object: "public", privilege: "USAGE WITH GRANT OPTION" },
   { kind: "schema", object: "public", privilege: "CREATE WITH GRANT OPTION" },
   { kind: "table", object: "public.announcements", privilege: "SELECT WITH GRANT OPTION" },

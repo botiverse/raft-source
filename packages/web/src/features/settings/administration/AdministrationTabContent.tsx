@@ -1,5 +1,4 @@
 import { useServerPermissions } from "../../../hooks/useServerPermissions";
-import { WorkspaceProductAnalyticsSection } from "../../../components/settings/UsageDataSettings";
 import { AdminsSection } from "./AdminsSection";
 import { SystemChannelsSection } from "./SystemChannelsSection";
 import { InvitesSection } from "./InvitesSection";
@@ -10,6 +9,8 @@ import { ServerTranslationSection } from "./ServerTranslationSection";
 import { MemberPermissionsSection } from "./MemberPermissionsSection";
 import { ContextViewGrantsSection } from "./ContextViewGrantsSection";
 import { ServerSsoSection } from "../sso/ServerSsoSection";
+import { WorkspaceProductAnalyticsSection } from "../../../components/settings/UsageDataSettings";
+import { ServerDataPrivacySection } from "./ServerDataPrivacySection";
 
 export function AdministrationTabContent() {
   const { capabilities } = useServerPermissions();
@@ -23,7 +24,10 @@ export function AdministrationTabContent() {
       {capabilities.editServerSettings && <ServerSsoSection />}
       <OnboardingAgentSection />
       <ServerTranslationSection />
-      {capabilities.editServerSettings && <WorkspaceProductAnalyticsSection />}
+      {/* Product analytics and, for owners, the server's data export: one Data & privacy section. */}
+      {capabilities.exportServerData
+        ? <ServerDataPrivacySection />
+        : capabilities.editServerSettings && <WorkspaceProductAnalyticsSection />}
       <MemberPermissionsSection />
       <ContextViewGrantsSection />
     </>

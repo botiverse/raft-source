@@ -123,7 +123,18 @@ test("creating a channel: who can see the archived holder is told which one; who
   assert.equal(ownerResult.body.archivedChannelName, "secret-room");
   assert.equal(ownerResult.body.canUnarchiveArchivedChannel, true);
 
-  assertGenericTaken(await createAs(baseUrl, f.memberToken, f, "secret-room"), "secret-room");
+  const hiddenHolder = await createAs(baseUrl, f.memberToken, f, "secret-room");
+  assertGenericTaken(hiddenHolder, "secret-room");
+
+  // A live channel holding the name answers exactly as the hidden archived
+  // holder does (only the quoted name differs), so trying a name can't tell
+  // the two apart.
+  const liveHolder = await createAs(baseUrl, f.memberToken, f, "owner-room");
+  assertGenericTaken(liveHolder, "owner-room");
+  assert.deepEqual(
+    { status: liveHolder.status, body: JSON.stringify(liveHolder.body).replace("owner-room", "secret-room") },
+    { status: hiddenHolder.status, body: JSON.stringify(hiddenHolder.body) },
+  );
 
   const memberPublic = await createAs(baseUrl, f.memberToken, f, "old-room");
   assert.equal(memberPublic.status, 409);
@@ -156,9 +167,9 @@ test("an agent that can't see the private archived holder gets the plain answer"
   const f = await seed(baseUrl);
   const hidden = await createChannelForAgent({ actor: f.agent, serverId: f.serverId, body: { name: "secret-room" } });
   assert.equal(hidden.status, 409);
-  assert.deepEqual(hidden.body, { error: `Channel name "secret-room" is already taken` });
+  assert.deepEqual("body" in hidden ? hidden.body : hidden, { error: `Channel name "secret-room" is already taken` });
 
   const visible = await createChannelForAgent({ actor: f.agent, serverId: f.serverId, body: { name: "old-room" } });
   assert.equal(visible.status, 409);
-  assert.equal((visible.body as Record<string, unknown>).code, "archived_name_collision");
+  assert.equal("body" in visible ? visible.body.code : undefined, "archived_name_collision");
 });

@@ -1244,29 +1244,6 @@
       }
     },
     {
-      "id": "ai-providers",
-      "page": "providers",
-      "section": "connections",
-      "platforms": [
-        "web",
-        "desktop"
-      ],
-      "aliases": {
-        "en": [
-          "api key",
-          "anthropic",
-          "openai",
-          "claude",
-          "provider"
-        ],
-        "zh-cn": [
-          "AI 提供方",
-          "密钥",
-          "API 密钥"
-        ]
-      }
-    },
-    {
       "id": "desktop-app",
       "page": "about",
       "section": "about",

@@ -5,6 +5,7 @@ import type { ServerTaskBoardFilters, ServerTaskCounts } from "../components/tas
 import { LANE_PAGE_SIZE, sortKeyOf } from "../components/task/tasksPage/tasksPageModel";
 import type { LaneReadState, LaneSpec } from "../components/task/tasksPage/tasksPageModel";
 import { registerServerReset } from "./serverResetRegistry";
+import { useServerStore } from "./serverStore";
 import { currentLiveSequence, pruneLiveChanges } from "./serverTaskMerge";
 import { ingestServerTaskQueryPage, useTaskStore } from "./taskStore";
 
@@ -50,7 +51,7 @@ export interface LaneReadOptions {
 interface TasksPageState {
   lanes: Record<string, LaneState>;
   counts: Record<string, CountsState>;
-  /** Groups / columns folded by hand, by name (`mine:<relation>`, `all:<status>`). */
+  /** Board columns folded by hand, by name (`board:<status>`); kept per server in localStorage. */
   collapsed: Record<string, boolean>;
   /** Read the lane's next page (its first when never read, or with `restart`). No-op while reading or once complete. */
   loadLanePage: (lane: LaneSpec, options?: LaneReadOptions) => Promise<void>;
@@ -93,10 +94,48 @@ function pruneCoveredLiveChanges(lanes: Record<string, LaneState>): void {
 /** Server cap on a page; a re-read asks for as many rows as the lane shows (up to it), so it keeps its length. */
 const SERVER_PAGE_MAX = 500;
 
+/**
+ * The folds a person sets on the Tasks page (its board columns, `board:<status>`) are
+ * kept per server in this browser, so a column folded once stays folded after
+ * a server switch or a reload (#triage:c5cf6495). Storage that refuses them
+ * (blocked, full) leaves the folds for this page only.
+ */
+export const TASKS_PAGE_FOLDS_STORAGE_PREFIX = "raft.tasksPage.folds.";
+
+function currentServerId(): string | null {
+  try {
+    return useServerStore.getState().current?.id ?? null;
+  } catch {
+    // Read while the modules are still loading: no server yet; the switch fills the folds in.
+    return null;
+  }
+}
+
+export function readStoredFolds(serverId: string | null): Record<string, boolean> {
+  if (!serverId) return {};
+  try {
+    const raw = window.localStorage.getItem(TASKS_PAGE_FOLDS_STORAGE_PREFIX + serverId);
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, boolean] => typeof entry[1] === "boolean"));
+  } catch {
+    return {};
+  }
+}
+
+function writeStoredFolds(serverId: string | null, folds: Readonly<Record<string, boolean>>): void {
+  if (!serverId) return;
+  try {
+    window.localStorage.setItem(TASKS_PAGE_FOLDS_STORAGE_PREFIX + serverId, JSON.stringify(folds));
+  } catch {
+    // Storage blocked or full: the folds hold for this page only.
+  }
+}
+
 export const useTasksPageStore = create<TasksPageState>((set, get) => ({
   lanes: {},
   counts: {},
-  collapsed: {},
+  collapsed: readStoredFolds(currentServerId()),
 
   loadLanePage: async (lane, options = {}) => {
     const current = get().lanes[lane.key] ?? EMPTY_LANE;
@@ -220,7 +259,10 @@ export const useTasksPageStore = create<TasksPageState>((set, get) => ({
     await get().loadCounts(filters);
   },
 
-  setCollapsed: (name, collapsed) => set((state) => ({ collapsed: { ...state.collapsed, [name]: collapsed } })),
+  setCollapsed: (name, collapsed) => {
+    set((state) => ({ collapsed: { ...state.collapsed, [name]: collapsed } }));
+    writeStoredFolds(currentServerId(), get().collapsed);
+  },
 
   evictCompletedSince: (since) => {
     // Keys carry the filters' query string (laneKey, countsKey). A read in flight under it lands in no lane shown.
@@ -246,5 +288,6 @@ useTaskStore.subscribe((state, previous) => {
 
 registerServerReset(() => {
   useTasksPageStore.getState().reset();
-  useTasksPageStore.setState({ collapsed: {} });
+  // The switch has set the new current server: its own folds come back.
+  useTasksPageStore.setState({ collapsed: readStoredFolds(currentServerId()) });
 });

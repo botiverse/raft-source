@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compareArms } from "./abCompare";
+import { compareArms, compareStartupArms } from "./abCompare";
 import type { WorkSplit } from "./workSplit";
 
 const split = (styleMs: number, passes: number, more: Partial<WorkSplit> = {}): WorkSplit => ({ windowMs: 3000, recordedMs: 3000, taskMs: 600, scriptMs: 400, styleMs, layoutMs: 40, forcedMs: 100, stylePasses: 40, styleElements: passes * 1000, layouts: 12, largeStylePasses: Array.from({ length: passes }, (_, i) => ({ atMs: i * 100, ms: 20, elements: 1000 })), ...more });
@@ -41,5 +41,26 @@ describe("compareArms", () => {
     expect(c.pairs).toBe(0);
     expect(c.timings.styleMs.verdict).toBe("unknown");
     expect(c.counts.largeStylePasses).toEqual({ base: null, pr: null, everyPairLower: false, everyPairHigher: false });
+  });
+});
+
+describe("compareStartupArms", () => {
+  it("judges paintedMs, responseToPaintMs and post-response script/style splits across alternating startup pairs", () => {
+    const mkSample = (paintedMs: number, rtpMs: number, scriptMs: number) => ({
+      paintedMs,
+      rowMs: paintedMs - 16,
+      messagesEndMs: paintedMs - rtpMs,
+      responseToPaintMs: rtpMs,
+      longTasksMs: scriptMs - 50,
+      split: split(80, 2, { taskMs: scriptMs + 80, scriptMs }),
+    });
+    const base = [1420, 1450, 1410, 1440, 1430, 1425].map((p) => ({ samples: [mkSample(p, p - 300, 950)] }));
+    const pr = [1040, 1060, 1030, 1055, 1045, 1050].map((p) => ({ samples: [mkSample(p, p - 300, 570)] }));
+    const cmp = compareStartupArms(base, pr);
+    expect(cmp.pairs).toBe(6);
+    expect(cmp.timings.paintedMs.verdict).toBe("better");
+    expect(cmp.timings.responseToPaintMs.verdict).toBe("better");
+    expect(cmp.timings.scriptMs.verdict).toBe("better");
+    expect(cmp.timings.responseToPaintMs.confidence).toBe("settled");
   });
 });

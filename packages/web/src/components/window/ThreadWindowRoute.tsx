@@ -20,6 +20,7 @@ import { resolveThreadHostTask } from "../layout/threadHostTask";
 import { buildTaskChannelUrl, closeThreadWindow } from "./closeThreadWindow";
 import { ContentLoading } from "../ui/ContentLoading";
 import { CONTROL_END_PULL } from "../ui/headEdges";
+import { resolveThreadAnchorIds } from "../../store/threadLinkIds";
 
 const NON_INTERACTIVE_TOOLTIP_PROPS = { className: "pointer-events-none" };
 
@@ -206,8 +207,16 @@ export default function ThreadWindowRoute() {
     if (!parentChannelId || !parentMessageId) {
       return () => { cancelled = true; };
     }
-    const focusedMessageId = readFocusedMessageId();
-    void ensureChannel(parentChannelId).then((resolved) => {
+    const linkFocusedMessageId = readFocusedMessageId();
+    // A short id in the address names no channel or thread the routes take:
+    // resolve it first (#503); canonical ids pass through with no request.
+    void resolveThreadAnchorIds(parentChannelId, parentMessageId).then(async (anchor) => {
+      if (cancelled) return;
+      if (typeof anchor === "string") {
+        fail();
+        return;
+      }
+      const resolved = await ensureChannel(anchor.parentChannelId);
       if (cancelled) return;
       if (!resolved) {
         fail();
@@ -215,9 +224,10 @@ export default function ThreadWindowRoute() {
       }
       return openThread({
         serverSlug,
-        parentChannelId,
-        parentMessageId,
-        focusedMessageId,
+        parentChannelId: anchor.parentChannelId,
+        parentMessageId: anchor.parentMessageId,
+        threadChannelId: anchor.threadChannelId,
+        focusedMessageId: linkFocusedMessageId ?? anchor.focusedMessageId,
         intent: taskIntent ? "task" : "thread",
       });
     }).catch(() => {

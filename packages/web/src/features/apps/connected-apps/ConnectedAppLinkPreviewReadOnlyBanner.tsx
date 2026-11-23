@@ -6,7 +6,7 @@ import { opensInNewTabAriaLabel } from "../../../components/ui/LeavingRaftMark";
 const LINK_PREVIEWS_DOCS_URL = "https://docs.raft.build/developers/raft-apps/link-previews/";
 
 /**
- * On the App's page under My Apps, for an App that did not declare version 2
+ * In the editor of an App built here (under Yours), for an App that did not declare version 2
  * (#proj-apps:#55). Info, not warning: the App works, its previews are the
  * simpler kind. It also shows a registration that dropped the field by accident.
  */

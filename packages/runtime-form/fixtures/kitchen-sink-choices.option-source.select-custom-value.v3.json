@@ -1,0 +1,25 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "kitchen-sink-choices",
+  "schemaVersion": "kitchen-sink-choices.create.v1",
+  "sourceId": "selectCustomValue",
+  "kind": "select",
+  "pointer": "/selectCustomValue",
+  "options": [
+    {
+      "value": "alpha",
+      "label": "Alpha"
+    },
+    {
+      "value": "beta",
+      "label": "Beta"
+    },
+    {
+      "value": "gamma",
+      "label": "Gamma"
+    }
+  ],
+  "defaultValue": "alpha",
+  "status": "live",
+  "customValueAllowed": true
+}

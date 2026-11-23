@@ -82,7 +82,9 @@ import { guardUuidPathParams } from "../lib/uuidPathParams";
 import { hideUnfindableAgentsByParam } from "./unfindableAgentGate";
 import { OAuthClientKeyTakenError } from "../services/oauthClientKeys";
 import { refuse, RefusalError } from "../lib/refusal";
+import { serviceMessageRefusal } from "./agentRouteRefusals";
 import { enforceOAuthAppRegistrationRate } from "../services/oauthClientRegistrationLimits";
+import { ownerDispatchRequestId } from "../services/ownerDispatchContext";
 
 export const integrationRouter: RouterType = Router();
 export const integrationInviteRouter: RouterType = Router();
@@ -116,6 +118,14 @@ function isMarketplaceReviewer(userId: string) {
 
 function currentUserHasServerCapability(req: Request, capability: ServerCapability) {
   return actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, capability);
+}
+
+/**
+ * The person themself in their own sign-in: not their assistant acting as them, not a confirmed
+ * card's dispatch. Also the MCP App server vouch (routes/managedMcp.ts).
+ */
+export function isPersonsOwnSession(req: Request): boolean {
+  return req.sessionScope === "full" && !req.viaAssistant && ownerDispatchRequestId() === null;
 }
 
 /**
@@ -158,11 +168,11 @@ async function currentServerOwnsOAuthClient(req: Request, clientId: string) {
 /** Shared with the MCP App logo route, so both answer a bad upload the same way. */
 export function handleLogoUploadError(err: unknown, res: Response) {
   if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
-    res.status(400).json({ error: PROFILE_AVATAR_TOO_LARGE_MESSAGE });
+    refuse(res, 400, { code: "PROFILE_AVATAR_TOO_LARGE", error: PROFILE_AVATAR_TOO_LARGE_MESSAGE });
     return true;
   }
   if (err instanceof Error && err.message.includes(PROFILE_AVATAR_BAD_FORMAT_MESSAGE)) {
-    res.status(400).json({ error: err.message });
+    refuse(res, 400, serviceMessageRefusal("PROFILE_AVATAR_BAD_FORMAT", err.message, PROFILE_AVATAR_BAD_FORMAT_MESSAGE));
     return true;
   }
   return false;
@@ -184,13 +194,13 @@ integrationLogoPublicRouter.get("/:clientId/:filename", async (req, res) => {
   try {
     const { clientId, filename } = req.params;
     if (!/^[0-9a-f]{32}\.webp$/.test(filename)) {
-      res.status(400).json({ error: "Invalid filename" });
+      refuse(res, 400, { code: "invalid_input", error: "Invalid filename" });
       return;
     }
     const contentHash = filename.slice(0, -".webp".length);
     const storageKey = await oauthService.getOAuthClientLogoStorageKey({ clientId, contentHash });
     if (!storageKey) {
-      res.status(404).json({ error: "Logo not found" });
+      refuse(res, 404, { code: "not_found", error: "Logo not found" });
       return;
     }
 
@@ -206,7 +216,7 @@ integrationLogoPublicRouter.get("/:clientId/:filename", async (req, res) => {
     await streamStorageResponse(stream, res);
   } catch {
     if (res.destroyed || res.headersSent) return;
-    res.status(404).json({ error: "Logo not found" });
+    refuse(res, 404, { code: "not_found", error: "Logo not found" });
   }
 });
 
@@ -229,7 +239,7 @@ integrationRouter.get("/permission-updates", async (req, res) => {
   res.setHeader("Cache-Control", "private, no-store");
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can manage integrations" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage integrations" });
       return;
     }
     // `count` drives the permission-update notice; `needsAdminReview` the
@@ -250,7 +260,9 @@ integrationRouter.get("/marketplace", denyServerGuests, async (req, res) => {
       oauthService.listMarketplaceOAuthClients(req.serverId!),
       needsAdminReviewFields(req),
     ]);
-    res.json(clients.map((client) => ({ ...client, ...adminReview(client.id) })));
+    // Which agents can use it: for an App installed here (the installed detail), null otherwise.
+    const agentAccess = await oauthService.oauthAppAgentAccess(req.serverId!, clients.filter((client) => client.installationId).map((client) => client.id));
+    res.json(clients.map((client) => ({ ...client, ...adminReview(client.id), agentAccess: agentAccess.get(client.id) ?? null })));
   } catch (err) {
     sendJsonServerError(req, res, { error: "Failed to list marketplace OAuth clients", logPrefix: "List marketplace OAuth clients error:", err });
   }
@@ -265,7 +277,7 @@ integrationRouter.get("/marketplace/listings", denyServerGuests, async (req, res
   try {
     const parsed = parseMarketplaceListingsQuery(req.query);
     if (!parsed.ok) {
-      res.status(400).json({ error: parsed.error, code: parsed.code });
+      refuse(res, 400, { code: parsed.code, error: parsed.error });
       return;
     }
     res.json(await listMarketplaceListings({
@@ -280,9 +292,9 @@ integrationRouter.get("/marketplace/listings", denyServerGuests, async (req, res
 integrationRouter.get("/clients/:clientId/setup", denyServerGuests, async (req, res) => {
   res.setHeader("Cache-Control", "private, no-store");
   try {
-    if (!UUID_RE.test(req.params.clientId)) { res.status(400).json({ error: "clientId must be an App ID" }); return; }
+    if (!UUID_RE.test(req.params.clientId)) { refuse(res, 400, { code: "invalid_input", error: "clientId must be an App ID" }); return; }
     const setup = await getAppInstallationSetup({ clientId: req.params.clientId, serverId: req.serverId! });
-    if (!setup) { res.status(404).json({ error: "Active installation not found" }); return; }
+    if (!setup) { refuse(res, 404, { code: "installation_not_found", error: "Active installation not found" }); return; }
     const canConfigure = await currentUserHasServerCapability(req, "manageIntegrations");
     res.json({ ...setup, canConfigure, url: canConfigure ? setup.url : null });
   } catch (err) {
@@ -299,7 +311,12 @@ integrationRouter.get("/clients", denyServerGuests, async (req, res) => {
       linkPreviewReadOnlyFields(req),
       officialAppFields(req),
     ]);
-    res.json(clients.map((client) => ({ ...client, ...adminReview(client.id), ...linkPreviewReadOnly(client.id), ...official(client.id) })));
+    // Which of this Server's agents can use each App (its detail's agent avatars).
+    const agentAccess = await oauthService.oauthAppAgentAccess(req.serverId!, clients.map((client) => client.id));
+    res.json(clients.map((client) => ({
+      ...client, ...adminReview(client.id), ...linkPreviewReadOnly(client.id), ...official(client.id),
+      agentAccess: agentAccess.get(client.id) ?? null,
+    })));
   } catch (err) {
     sendJsonServerError(req, res, { error: "Failed to list OAuth clients", logPrefix: "List OAuth clients error:", err });
   }
@@ -308,10 +325,10 @@ integrationRouter.get("/clients", denyServerGuests, async (req, res) => {
 integrationRouter.post("/clients", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can manage integrations" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage integrations" });
       return;
     }
-    const { name, description, whenToUse, homepageUrl, returnUrl, agentManifestUrl, setupUrl, setupDescription, clientId, allowedScopes, category } = req.body ?? {};
+    const { name, description, whenToUse, homepageUrl, returnUrl, agentManifestUrl, setupUrl, setupDescription, clientId, allowedScopes, category, agentTokenSigningAlg, agentTokenType } = req.body ?? {};
     // Creating an app answers with its first client secret: as regenerating one.
     if (await refuseWithoutRecentSecondFactor(res, req.userId!, webSessionFamilyOf(req), "integration_app_register")) return;
     await enforceOAuthAppRegistrationRate(req.serverId!);
@@ -327,6 +344,11 @@ integrationRouter.post("/clients", async (req, res) => {
       clientId,
       allowedScopes,
       category,
+      agentTokenSigningAlg,
+      // The `typ` of its agent tokens (at+jwt | JWT, JWT only without a returnUrl); validated by the service.
+      agentTokenType,
+      // A server owner or admin creating it vouches for it; createOAuthClient checks the capability.
+      vouchAsCreator: isPersonsOwnSession(req),
     });
     res.json(created);
   } catch (err: any) {
@@ -336,7 +358,7 @@ integrationRouter.post("/clients", async (req, res) => {
     }
     const message = err?.message || "Failed to create OAuth client";
     if (err instanceof OAuthClientKeyTakenError) {
-      res.status(409).json({ error: "Client ID is already taken" });
+      refuse(res, 409, { code: "CLIENT_KEY_TAKEN", error: "Client ID is already taken" });
       return;
     }
     if (
@@ -346,7 +368,9 @@ integrationRouter.post("/clients", async (req, res) => {
       message.includes("scope") ||
       message.includes("category") ||
       message.includes("returnUrl") ||
-      message.includes("whenToUse")
+      message.includes("whenToUse") ||
+      message.includes("agentTokenSigningAlg") ||
+      message.includes("agentTokenType")
     ) {
       res.status(400).json({ error: message });
       return;
@@ -395,13 +419,43 @@ async function broadcastManagedBotProfileUpdates(req: Request, clientDbId: strin
   }
 }
 
+/** The fields `PATCH /clients/:clientId` reads; any other field is refused, never dropped. */
+const OAUTH_CLIENT_PATCH_FIELDS = new Set([
+  "name", "description", "whenToUse", "homepageUrl", "returnUrl", "agentManifestUrl", "setupUrl",
+  "setupDescription", "allowedScopes", "category", "enableBot", "agentTokenSigningAlg", "agentTokenType", "clientId",
+]);
+
+/**
+ * A field this route does not read is a 400 naming it, not a silent 200: `{ enabled: false }`
+ * answered 200 and left the App issuing tokens, so the caller believed it was off. An owner
+ * cannot disable an App here; deleting it is how an owner turns it off.
+ */
+function unknownOAuthClientPatchFieldsRefusal(body: unknown): { code: string; error: string } | null {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const unknown = Object.keys(body).filter((key) => !OAUTH_CLIENT_PATCH_FIELDS.has(key));
+  if (unknown.length === 0) return null;
+  const named = unknown.map((key) => JSON.stringify(key)).join(", ");
+  const hint = unknown.includes("enabled")
+    ? " An App can't be disabled through this route; delete the App to turn it off."
+    : "";
+  return {
+    code: "APP_UPDATE_UNKNOWN_FIELD",
+    error: `This route can't change ${named}. Fields it accepts: ${[...OAUTH_CLIENT_PATCH_FIELDS].join(", ")}.${hint}`,
+  };
+}
+
 integrationRouter.patch("/clients/:clientId", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can manage integrations" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage integrations" });
       return;
     }
-    const { name, description, whenToUse, homepageUrl, returnUrl, agentManifestUrl, setupUrl, setupDescription, allowedScopes, category, enableBot, clientId: newClientKey } = req.body ?? {};
+    const unknownFields = unknownOAuthClientPatchFieldsRefusal(req.body);
+    if (unknownFields) {
+      refuse(res, 400, unknownFields);
+      return;
+    }
+    const { name, description, whenToUse, homepageUrl, returnUrl, agentManifestUrl, setupUrl, setupDescription, allowedScopes, category, enableBot, agentTokenSigningAlg, agentTokenType, clientId: newClientKey } = req.body ?? {};
     const removedBots: Array<{ serverId: string; agentId: string }> = [];
     const updated = await getDb().transaction(async (tx) => {
       const row = await oauthService.updateOAuthClient({
@@ -417,6 +471,10 @@ integrationRouter.patch("/clients/:clientId", async (req, res) => {
         allowedScopes,
         category,
         enableBot,
+        // How Raft signs this App's agent tokens (ES256 | RS256); validated by the service.
+        agentTokenSigningAlg,
+        // The `typ` of its agent tokens (at+jwt | JWT); the service refuses JWT next to a returnUrl under the row lock.
+        agentTokenType,
         // The App's own Server changing its client id (RFC 084); a form sends it unchanged, which is no change.
         ...(typeof newClientKey === "string" ? { newClientKey } : {}),
       }, tx);
@@ -434,7 +492,7 @@ integrationRouter.patch("/clients/:clientId", async (req, res) => {
       return row;
     });
     if (!updated) {
-      res.status(404).json({ error: "OAuth client not found" });
+      refuse(res, 404, { code: "APP_NOT_FOUND", error: "OAuth client not found" });
       return;
     }
     for (const bot of removedBots) await broadcastManagedBotListingChanged(req, bot);
@@ -454,7 +512,7 @@ integrationRouter.patch("/clients/:clientId", async (req, res) => {
       return;
     }
     const message = err?.message || "Failed to update OAuth client";
-    if (message.includes("required") || message.includes("agentManifestUrl") || message.includes("setup") || message.includes("scope") || message.includes("category") || message.includes("returnUrl") || message.includes("whenToUse")) {
+    if (message.includes("required") || message.includes("agentManifestUrl") || message.includes("setup") || message.includes("scope") || message.includes("category") || message.includes("returnUrl") || message.includes("whenToUse") || message.includes("agentTokenSigningAlg") || message.includes("agentTokenType")) {
       res.status(400).json({ error: message });
       return;
     }
@@ -462,6 +520,49 @@ integrationRouter.patch("/clients/:clientId", async (req, res) => {
   }
 });
 
+/**
+ * Vouch for this Server's own server_local App, or end the vouch: `{ vouched: boolean }`. A
+ * vouched App is granted to every agent here automatically (autoGrantAgentClientRule), whatever
+ * its creator's role. manageExternalAuth, as approving or granting an agent's App access; a
+ * person's own session only (never delegable, no agent API). Ending it stops future automatic
+ * grants only; existing grants stay. Answers the editor row.
+ */
+integrationRouter.put("/clients/:clientId/server-vouch", async (req, res) => {
+  try {
+    if (!isPersonsOwnSession(req)) {
+      refuse(res, 403, { code: "SERVER_VOUCH_PERSON_ONLY", error: "Only a server owner or admin, signed in themselves, can vouch for an App." });
+      return;
+    }
+    if (!await currentUserHasServerCapability(req, "manageExternalAuth")) {
+      refuse(res, 403, { code: "SERVER_VOUCH_FORBIDDEN", error: "Only server owners and admins can vouch for an App." });
+      return;
+    }
+    const vouched = req.body?.vouched;
+    if (typeof vouched !== "boolean") {
+      refuse(res, 400, { code: "SERVER_VOUCH_INVALID", error: "Send vouched as true or false." });
+      return;
+    }
+    // Vouching lets every agent here use the App: the same second step as approving one agent's access.
+    if (vouched && await refuseUnverifiedApprover(res, req.userId!, webSessionFamilyOf(req), "Confirm it's you with your second step before letting every agent use this app.")) return;
+    const result = await oauthService.setOAuthClientServerVouch({
+      serverId: req.serverId!,
+      clientId: req.params.clientId,
+      actorUserId: req.userId!,
+      vouched,
+    });
+    if (result.status === "not_found") {
+      refuse(res, 404, OWN_SERVER_APP_NOT_FOUND);
+      return;
+    }
+    if (result.status === "not_server_local") {
+      refuse(res, 409, { code: "SERVER_VOUCH_NOT_SERVER_LOCAL", error: "Only an App built on this Server, not a published one, can be vouched for here." });
+      return;
+    }
+    res.json(await oauthService.getOAuthClientWithInstallState(req.serverId!, req.params.clientId));
+  } catch (err) {
+    sendJsonServerError(req, res, { error: "Failed to update the App's server vouch", logPrefix: "Server vouch error:", err });
+  }
+});
 
 // Agent JWT is built in (no per-App or per-installation switch). These two
 // routes only answer web bundles from the previous release; remove both next release.
@@ -469,7 +570,7 @@ integrationRouter.get("/clients/:clientId/agent-jwt", async (req, res) => {
   res.setHeader("Cache-Control", "private, no-store");
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can read Agent JWT access" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can read Agent JWT access" });
       return;
     }
     res.json(await getLegacyAppAgentJwtSettings(req.serverId!, req.params.clientId));
@@ -487,7 +588,7 @@ integrationRouter.put("/clients/:clientId/agent-jwt", (_req, res) => {
 integrationRouter.get("/clients/:clientId/app-notifications", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only an owner or admin of the app source server can read App Notifications settings" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only an owner or admin of the app source server can read App Notifications settings" });
       return;
     }
     const state = await getAppNotificationDeveloperState({
@@ -495,7 +596,7 @@ integrationRouter.get("/clients/:clientId/app-notifications", async (req, res) =
       sourceServerId: req.serverId!,
     });
     if (!state) {
-      res.status(404).json({ error: "App not found" });
+      refuse(res, 404, { code: "APP_NOT_FOUND", error: "App not found" });
       return;
     }
     res.setHeader("Cache-Control", "private, no-store");
@@ -535,7 +636,7 @@ integrationRouter.put("/clients/:clientId/app-notifications/permissions", async 
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")
       || !await currentServerOwnsOAuthClient(req, req.params.clientId)) {
-      res.status(403).json({ error: "Only an owner or admin of the app source server can update App Notifications permissions" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only an owner or admin of the app source server can update App Notifications permissions" });
       return;
     }
     const result = await createAppOutboundPermissionRevision({
@@ -545,7 +646,7 @@ integrationRouter.put("/clients/:clientId/app-notifications/permissions", async 
       events: req.body?.events,
     });
     if (!result) {
-      res.status(404).json({ error: "OAuth client not found" });
+      refuse(res, 404, { code: "APP_NOT_FOUND", error: "OAuth client not found" });
       return;
     }
     res.json({
@@ -559,7 +660,7 @@ integrationRouter.put("/clients/:clientId/app-notifications/permissions", async 
     });
   } catch (error) {
     if (error instanceof AppOutboundPermissionError) {
-      res.status(400).json({ error: error.message });
+      refuse(res, 400, { code: "invalid_input", error: error.message });
       return;
     }
     sendJsonServerError(req, res, { error: "Failed to update App Notifications permission request", logPrefix: "Update App Notifications permission request error:", err: error });
@@ -576,7 +677,7 @@ integrationRouter.get("/clients/:clientId/prompt-text", async (req, res) => {
       && state!.serverId === req.serverId
       && await currentUserHasServerCapability(req, "manageIntegrations");
     if (!state || (!isSourceAdmin && !canReview)) {
-      res.status(404).json({ error: "App not found" });
+      refuse(res, 404, { code: "APP_NOT_FOUND", error: "App not found" });
       return;
     }
     res.setHeader("Cache-Control", "private, no-store");
@@ -597,18 +698,18 @@ const PROMPT_TEXT_REVISION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4
 integrationRouter.post("/clients/:clientId/prompt-text/review", async (req, res) => {
   try {
     if (!isMarketplaceReviewer(req.userId!)) {
-      res.status(403).json({ error: "Only marketplace reviewers can review an app's prompt text" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only marketplace reviewers can review an app's prompt text" });
       return;
     }
     const decision = req.body?.decision;
     const expectedRevisionId = typeof req.body?.expected_revision_id === "string" ? req.body.expected_revision_id.trim() : "";
     const reason = typeof req.body?.reason === "string" ? req.body.reason.trim().slice(0, 2_000) : null;
     if ((decision !== "approve" && decision !== "reject") || !PROMPT_TEXT_REVISION_ID.test(expectedRevisionId)) {
-      res.status(400).json({ error: "Send decision (approve or reject) and expected_revision_id, the pending revision shown to the reviewer" });
+      refuse(res, 400, { code: "invalid_input", error: "Send decision (approve or reject) and expected_revision_id, the pending revision shown to the reviewer" });
       return;
     }
     if (decision === "reject" && !reason) {
-      res.status(400).json({ error: "A rejection needs a reason the developer can act on" });
+      refuse(res, 400, { code: "invalid_input", error: "A rejection needs a reason the developer can act on" });
       return;
     }
     const result = await reviewPendingPromptText({
@@ -619,10 +720,11 @@ integrationRouter.post("/clients/:clientId/prompt-text/review", async (req, res)
       reason,
     });
     if (result.kind === "not_found") {
-      res.status(404).json({ error: "No prompt text is waiting for review" });
+      refuse(res, 404, { code: "not_found", error: "No prompt text is waiting for review" });
       return;
     }
     if (result.kind === "stale") {
+      // refusal-ok: top-level pending_revision_id names the revision now waiting for the reviewer; refuse() writes no top-level fields
       res.status(409).json({
         error: "The developer replaced the text you reviewed. Reload and review the latest version.",
         code: PROMPT_TEXT_REVIEW_STALE,
@@ -648,7 +750,7 @@ integrationRouter.get("/clients/:clientId/action-endpoint", async (req, res) => 
       ? await getActionEndpointState(req.params.clientId, req.serverId!)
       : null;
     if (!state) {
-      res.status(404).json({ error: "App not found" });
+      refuse(res, 404, { code: "APP_NOT_FOUND", error: "App not found" });
       return;
     }
     res.setHeader("Cache-Control", "private, no-store");
@@ -803,7 +905,7 @@ async function sendCardButtonsResult(res: Response, clientId: string, serverId: 
 // enabled, installed here and registered for link previews, or the answer is
 // a uniform 404. Declining is also how previews are turned off later.
 function sendLinkPreviewAppNotFound(res: Response) {
-  res.status(404).json({ error: "App not found", code: LINK_PREVIEW_APP_NOT_FOUND });
+  refuse(res, 404, { code: LINK_PREVIEW_APP_NOT_FOUND, error: "App not found" });
 }
 
 integrationRouter.post("/clients/:clientId/link-preview-consent", async (req, res) => {
@@ -815,7 +917,7 @@ integrationRouter.post("/clients/:clientId/link-preview-consent", async (req, re
       return;
     }
     if (result.kind === "scopes_not_allowed") {
-      res.status(409).json({ error: "This App is not allowed to receive your Raft profile", code: LINK_PREVIEW_SCOPES_NOT_ALLOWED });
+      refuse(res, 409, { code: LINK_PREVIEW_SCOPES_NOT_ALLOWED, error: "This App is not allowed to receive your Raft profile" });
       return;
     }
     res.json({ app: result.app, scopes: result.scopes, source: result.source, granted_at: result.grantedAt.toISOString() });
@@ -856,7 +958,7 @@ integrationRouter.get("/link-preview-consents", async (req, res) => {
 integrationRouter.put("/clients/:clientId/prompt-text/confirm", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can confirm an app's prompt text" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can confirm an app's prompt text" });
       return;
     }
     const expectedRevisionId = typeof req.body?.expected_revision_id === "string" ? req.body.expected_revision_id.trim() : "";
@@ -871,10 +973,11 @@ integrationRouter.put("/clients/:clientId/prompt-text/confirm", async (req, res)
       expectedRevisionId,
     });
     if (result.kind === "not_found") {
-      res.status(404).json({ error: "App not found" });
+      refuse(res, 404, { code: "APP_NOT_FOUND", error: "App not found" });
       return;
     }
     if (result.kind === "changed") {
+      // refusal-ok: top-level current_text_revision_id and current_text carry the text to review again (web/src/lib/appPromptText.ts reads them); refuse() writes no top-level fields
       res.status(409).json({
         error: "The app's text changed after it was shown. Review the current text and confirm again.",
         code: APP_PERMISSIONS_CHANGED,
@@ -894,7 +997,7 @@ integrationRouter.put("/clients/:clientId/app-notifications/webhook", async (req
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")
       || !await currentServerOwnsOAuthClient(req, req.params.clientId)) {
-      res.status(403).json({ error: "Only an owner or admin of the app source server can configure its webhook" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only an owner or admin of the app source server can configure its webhook" });
       return;
     }
     const configured = await configureAppWebhook({
@@ -903,7 +1006,7 @@ integrationRouter.put("/clients/:clientId/app-notifications/webhook", async (req
       endpointUrl: req.body?.endpointUrl ?? req.body?.endpoint_url,
     });
     if (!configured) {
-      res.status(404).json({ error: "OAuth client not found" });
+      refuse(res, 404, { code: "APP_NOT_FOUND", error: "OAuth client not found" });
       return;
     }
     res.json({
@@ -926,7 +1029,7 @@ integrationRouter.post("/clients/:clientId/app-notifications/webhook/rotate-secr
   try {
     if (!await currentUserHasServerCapability(req, "rotateServerSecrets")
       || !await currentServerOwnsOAuthClient(req, req.params.clientId)) {
-      res.status(403).json({ error: "Only an owner or admin of the app source server can rotate its webhook secret" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only an owner or admin of the app source server can rotate its webhook secret" });
       return;
     }
     if (await refuseWithoutRecentSecondFactor(res, req.userId!, webSessionFamilyOf(req), "integration_webhook_secret_rotate")) return;
@@ -936,7 +1039,7 @@ integrationRouter.post("/clients/:clientId/app-notifications/webhook/rotate-secr
       emergency: req.body?.emergency === true,
     });
     if (!rotated) {
-      res.status(404).json({ error: "Active webhook configuration not found" });
+      refuse(res, 404, { code: "not_found", error: "Active webhook configuration not found" });
       return;
     }
     res.json({
@@ -958,12 +1061,12 @@ integrationRouter.delete("/clients/:clientId/app-notifications/webhook", async (
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")
       || !await currentServerOwnsOAuthClient(req, req.params.clientId)) {
-      res.status(403).json({ error: "Only an owner or admin of the app source server can disable its webhook" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only an owner or admin of the app source server can disable its webhook" });
       return;
     }
     const disabled = await disableAppWebhook({ clientId: req.params.clientId, actorUserId: req.userId! });
     if (!disabled) {
-      res.status(404).json({ error: "Webhook configuration not found" });
+      refuse(res, 404, { code: "not_found", error: "Webhook configuration not found" });
       return;
     }
     res.json({ config_revision: disabled.revision, enabled: disabled.enabled });
@@ -975,7 +1078,7 @@ integrationRouter.delete("/clients/:clientId/app-notifications/webhook", async (
 integrationRouter.post("/clients/:clientId/regenerate-secret", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "rotateServerSecrets")) {
-      res.status(403).json({ error: "Only server owners and admins can manage integrations" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage integrations" });
       return;
     }
     if (await refuseWithoutRecentSecondFactor(res, req.userId!, webSessionFamilyOf(req), "integration_client_secret_regenerate")) return;
@@ -985,7 +1088,7 @@ integrationRouter.post("/clients/:clientId/regenerate-secret", async (req, res) 
       actorUserId: req.userId!,
     });
     if (!regenerated) {
-      res.status(404).json({ error: "OAuth client not found" });
+      refuse(res, 404, { code: "APP_NOT_FOUND", error: "OAuth client not found" });
       return;
     }
     res.json(regenerated);
@@ -997,7 +1100,7 @@ integrationRouter.post("/clients/:clientId/regenerate-secret", async (req, res) 
 integrationRouter.post("/clients/:clientId/request-publish", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can manage integrations" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage integrations" });
       return;
     }
     const updated = await oauthService.requestOAuthClientPublish({
@@ -1006,7 +1109,7 @@ integrationRouter.post("/clients/:clientId/request-publish", async (req, res) =>
       requestedByUserId: req.userId!,
     });
     if (!updated) {
-      res.status(404).json({ error: "OAuth client not found" });
+      refuse(res, 404, { code: "APP_NOT_FOUND", error: "OAuth client not found" });
       return;
     }
     // Respond with the install-joined editor row (same shape as GET /clients):
@@ -1030,7 +1133,7 @@ integrationRouter.post("/clients/:clientId/request-publish", async (req, res) =>
 integrationRouter.post("/clients/:clientId/withdraw-publish", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can manage integrations" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage integrations" });
       return;
     }
     const updated = await oauthService.withdrawOAuthClientPublishRequest({
@@ -1039,7 +1142,7 @@ integrationRouter.post("/clients/:clientId/withdraw-publish", async (req, res) =
       requestedByUserId: req.userId!,
     });
     if (!updated) {
-      res.status(404).json({ error: "No marketplace publish request is waiting for review" });
+      refuse(res, 404, { code: "not_found", error: "No marketplace publish request is waiting for review" });
       return;
     }
     res.json(updated);
@@ -1051,7 +1154,7 @@ integrationRouter.post("/clients/:clientId/withdraw-publish", async (req, res) =
 integrationRouter.post("/clients/:clientId/request-unpublish", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can manage integrations" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage integrations" });
       return;
     }
     const updated = await oauthService.requestOAuthClientUnpublish({
@@ -1060,7 +1163,7 @@ integrationRouter.post("/clients/:clientId/request-unpublish", async (req, res) 
       requestedByUserId: req.userId!,
     });
     if (!updated) {
-      res.status(404).json({ error: "Published marketplace app not found" });
+      refuse(res, 404, { code: "not_found", error: "Published marketplace app not found" });
       return;
     }
     res.json(updated);
@@ -1076,7 +1179,7 @@ integrationRouter.post("/clients/:clientId/request-unpublish", async (req, res) 
 integrationRouter.get("/clients/:clientId/share-links", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can manage integrations" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage integrations" });
       return;
     }
     const links = await oauthService.listOAuthClientShareLinks({
@@ -1084,7 +1187,7 @@ integrationRouter.get("/clients/:clientId/share-links", async (req, res) => {
       clientId: req.params.clientId,
     });
     if (!links) {
-      res.status(404).json({ error: "OAuth client not found" });
+      refuse(res, 404, { code: "APP_NOT_FOUND", error: "OAuth client not found" });
       return;
     }
     res.json({ links });
@@ -1096,14 +1199,14 @@ integrationRouter.get("/clients/:clientId/share-links", async (req, res) => {
 integrationRouter.post("/clients/:clientId/share-links", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can manage integrations" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage integrations" });
       return;
     }
     const targetServerSlug = oauthService.normalizeShareLinkTargetServerSlug(req.body?.targetServerSlug);
     if (!targetServerSlug) {
-      res.status(400).json({
-        error: "targetServerSlug is required: the slug of the one server this link installs the app on",
+      refuse(res, 400, {
         code: "share_link_target_required",
+        error: "targetServerSlug is required: the slug of the one server this link installs the app on",
       });
       return;
     }
@@ -1115,7 +1218,7 @@ integrationRouter.post("/clients/:clientId/share-links", async (req, res) => {
       expiresInDays: typeof req.body?.expiresInDays === "number" ? req.body.expiresInDays : undefined,
     });
     if (!created) {
-      res.status(404).json({ error: "OAuth client not found" });
+      refuse(res, 404, { code: "APP_NOT_FOUND", error: "OAuth client not found" });
       return;
     }
     res.json(created);
@@ -1127,7 +1230,7 @@ integrationRouter.post("/clients/:clientId/share-links", async (req, res) => {
 integrationRouter.delete("/clients/:clientId/share-links/:linkId", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can manage integrations" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage integrations" });
       return;
     }
     const [link] = await oauthService.revokeOAuthClientShareLinks({
@@ -1137,7 +1240,7 @@ integrationRouter.delete("/clients/:clientId/share-links/:linkId", async (req, r
       revokedByUserId: req.userId!,
     }) ?? [];
     if (!link) {
-      res.status(404).json({ error: "OAuth client share link not found" });
+      refuse(res, 404, { code: "not_found", error: "OAuth client share link not found" });
       return;
     }
     res.json(link);
@@ -1153,7 +1256,7 @@ integrationRouter.delete("/clients/:clientId/share-links/:linkId", async (req, r
  * Server. The same status and body on both routes, so none can be told apart.
  */
 function sendPrivateAppInviteInvalid(res: Response) {
-  res.status(404).json({ error: "This private app invite is invalid or has expired", code: "private_app_invite_invalid" });
+  refuse(res, 404, { code: "private_app_invite_invalid", error: "This private app invite is invalid or has expired" });
 }
 
 /**
@@ -1161,6 +1264,7 @@ function sendPrivateAppInviteInvalid(res: Response) {
  * Server, so naming it tells them nothing new, only whom to ask.
  */
 function sendPrivateAppInviteAdminRequired(res: Response, targetServer: { name: string; slug: string }) {
+  // refusal-ok: top-level targetServer names the Server whose admin to ask (web/src/pages/IntegrationInvitePage.tsx reads it); refuse() writes no top-level fields
   res.status(403).json({
     error: `An owner or admin of ${targetServer.name} needs to install this app`,
     code: "private_app_invite_admin_required",
@@ -1198,7 +1302,7 @@ integrationInviteRouter.post("/:token/install", async (req, res) => {
   try {
     const serverId = typeof req.body?.serverId === "string" ? req.body.serverId.trim() : "";
     if (!serverId) {
-      res.status(400).json({ error: "serverId is required" });
+      refuse(res, 400, { code: "invalid_input", error: "serverId is required" });
       return;
     }
     const expected = parseExpectedAppPermissions(req.body);
@@ -1210,7 +1314,7 @@ integrationInviteRouter.post("/:token/install", async (req, res) => {
     // decline it (false); absent leaves the choice for later ("pending").
     const bot: unknown = req.body?.bot;
     if (bot !== undefined && typeof bot !== "boolean") {
-      res.status(400).json({ error: "bot must be a boolean" });
+      refuse(res, 400, { code: "invalid_input", error: "bot must be a boolean" });
       return;
     }
     // Installing grants the app access to the server: as the marketplace install.
@@ -1239,9 +1343,9 @@ integrationInviteRouter.post("/:token/install", async (req, res) => {
 // sends them back, and only an exact match with the app's current declaration
 // passes.
 function sendExpectedPermissionsRequired(res: Response) {
-  res.status(400).json({
-    error: "Send expected_scopes, expected_groups and expected_text_revision_id as shown to the admin. Reload the page and try again.",
+  refuse(res, 400, {
     code: EXPECTED_PERMISSIONS_REQUIRED,
+    error: "Send expected_scopes, expected_groups and expected_text_revision_id as shown to the admin. Reload the page and try again.",
   });
 }
 
@@ -1250,6 +1354,7 @@ function promptTextBody(text: AppPromptText) {
 }
 
 function sendAppPermissionsChanged(res: Response, error: AppPermissionsChangedError) {
+  // refusal-ok: top-level current_scopes, current_groups, current_text_revision_id and current_text carry the set to review again (web/src/lib/appPermissionExpectation.ts reads them); refuse() writes no top-level fields
   res.status(409).json({
     error: error.message,
     code: APP_PERMISSIONS_CHANGED,
@@ -1276,7 +1381,7 @@ function sendInstallExpectationError(res: Response, error: unknown): boolean {
 integrationRouter.post("/marketplace/:clientId/install", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can install marketplace apps" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can install marketplace apps" });
       return;
     }
     const expected = parseExpectedAppPermissions(req.body);
@@ -1288,7 +1393,7 @@ integrationRouter.post("/marketplace/:clientId/install", async (req, res) => {
     // same transaction; absent leaves the choice for later ("pending").
     const bot: unknown = req.body?.bot;
     if (bot !== undefined && typeof bot !== "boolean") {
-      res.status(400).json({ error: "bot must be a boolean" });
+      refuse(res, 400, { code: "invalid_input", error: "bot must be a boolean" });
       return;
     }
     // Installing grants the app access to the server, as the install card
@@ -1302,7 +1407,7 @@ integrationRouter.post("/marketplace/:clientId/install", async (req, res) => {
       bot,
     });
     if (!installed) {
-      res.status(404).json({ error: "Marketplace app not found" });
+      refuse(res, 404, { code: "APP_NOT_FOUND", error: "Marketplace app not found" });
       return;
     }
     // The install added the App's bot (bot: true): member lists show it now (#11295).
@@ -1320,7 +1425,7 @@ integrationRouter.post("/marketplace/:clientId/install", async (req, res) => {
 integrationRouter.get("/marketplace/:clientId/install/app-notifications", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can read installed App Notifications settings" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can read installed App Notifications settings" });
       return;
     }
     const state = await getAppNotificationInstallationState({
@@ -1328,7 +1433,7 @@ integrationRouter.get("/marketplace/:clientId/install/app-notifications", async 
       serverId: req.serverId!,
     });
     if (!state) {
-      res.status(404).json({ error: "Active app installation not found" });
+      refuse(res, 404, { code: "installation_not_found", error: "Active app installation not found" });
       return;
     }
     res.setHeader("Cache-Control", "private, no-store");
@@ -1367,7 +1472,7 @@ integrationRouter.get("/marketplace/:clientId/install/app-notifications", async 
 integrationRouter.put("/marketplace/:clientId/install/app-notifications/grant", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can approve App Notifications permissions" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can approve App Notifications permissions" });
       return;
     }
     const [install] = await getDb().select({ id: oauthClientInstalls.id })
@@ -1378,7 +1483,7 @@ integrationRouter.put("/marketplace/:clientId/install/app-notifications/grant", 
         eq(oauthClientInstalls.status, "active"),
       )).limit(1);
     if (!install) {
-      res.status(404).json({ error: "Active app installation not found" });
+      refuse(res, 404, { code: "installation_not_found", error: "Active app installation not found" });
       return;
     }
     const expected = parseExpectedAppPermissions(req.body);
@@ -1394,7 +1499,7 @@ integrationRouter.put("/marketplace/:clientId/install/app-notifications/grant", 
       expected,
     });
     if (!updated) {
-      res.status(404).json({ error: "Active app installation not found" });
+      refuse(res, 404, { code: "installation_not_found", error: "Active app installation not found" });
       return;
     }
     res.json({
@@ -1410,7 +1515,7 @@ integrationRouter.put("/marketplace/:clientId/install/app-notifications/grant", 
   } catch (error) {
     if (sendInstallExpectationError(res, error)) return;
     if (error instanceof AppOutboundPermissionError) {
-      res.status(400).json({ error: error.message });
+      refuse(res, 400, { code: "invalid_input", error: error.message });
       return;
     }
     sendJsonServerError(req, res, { error: "Failed to update installed App Notifications permissions", logPrefix: "Update installed App Notifications permissions error:", err: error });
@@ -1420,7 +1525,7 @@ integrationRouter.put("/marketplace/:clientId/install/app-notifications/grant", 
 integrationRouter.delete("/marketplace/:clientId/install", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can uninstall marketplace apps" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can uninstall marketplace apps" });
       return;
     }
     const result = await oauthService.uninstallMarketplaceOAuthClient({
@@ -1429,7 +1534,7 @@ integrationRouter.delete("/marketplace/:clientId/install", async (req, res) => {
       revokedByUserId: req.userId!,
     });
     if (!result) {
-      res.status(404).json({ error: "Marketplace app not found" });
+      refuse(res, 404, { code: "APP_NOT_FOUND", error: "Marketplace app not found" });
       return;
     }
     res.json(result);
@@ -1445,12 +1550,12 @@ integrationRouter.delete("/marketplace/:clientId/install", async (req, res) => {
 integrationRouter.post("/clients/:clientId/install/bot", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can manage the app bot" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage the app bot" });
       return;
     }
     const action = typeof req.body?.action === "string" ? req.body.action : "grant";
     if (action !== "grant" && action !== "revoke") {
-      res.status(400).json({ error: "action must be 'grant' or 'revoke'" });
+      refuse(res, 400, { code: "invalid_input", error: "action must be 'grant' or 'revoke'" });
       return;
     }
     // Adding the app's bot gives the app a bot identity here (its bot key);
@@ -1486,7 +1591,7 @@ integrationRouter.post("/clients/:clientId/install/bot", async (req, res) => {
       });
     });
     if (!result) {
-      res.status(404).json({ error: "Active app installation not found" });
+      refuse(res, 404, { code: "installation_not_found", error: "Active app installation not found" });
       return;
     }
     const { listingChanged, ...body } = result;
@@ -1497,19 +1602,19 @@ integrationRouter.post("/clients/:clientId/install/bot", async (req, res) => {
     const errCode = (err as { code?: string })?.code;
     const errMsg = err instanceof Error ? err.message : String(err);
     if (errCode === "app_bot_handle_conflict" || errName === "AppBotHandleConflictError") {
-      res.status(409).json({ error: errMsg, code: "app_bot_handle_conflict" });
+      refuse(res, 409, { code: "app_bot_handle_conflict", error: errMsg });
       return;
     }
     if (errCode === "app_bot_agent_deleted" || errName === "AppBotAgentDeletedError") {
-      res.status(409).json({ error: errMsg, code: "app_bot_agent_deleted" });
+      refuse(res, 409, { code: "app_bot_agent_deleted", error: errMsg });
       return;
     }
     if (errCode === "app_bot_install_not_granted" || errName === "AppBotInstallNotGrantedError") {
-      res.status(403).json({ error: errMsg });
+      refuse(res, 403, { code: "app_bot_install_not_granted", error: errMsg });
       return;
     }
     if (errCode === "app_bot_already_bound" || errName === "AppBotAlreadyBoundError") {
-      res.status(409).json({ error: errMsg });
+      refuse(res, 409, { code: "app_bot_already_bound", error: errMsg });
       return;
     }
     sendJsonServerError(req, res, { error: "Failed to manage app bot", logPrefix: "App bot grant error:", err });
@@ -1519,12 +1624,12 @@ integrationRouter.post("/clients/:clientId/install/bot", async (req, res) => {
 integrationRouter.post("/clients/:clientId/logo", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can manage integrations" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage integrations" });
       return;
     }
     const file = await runSingleLogoUpload(req);
     if (!file) {
-      res.status(400).json({ error: "No logo file provided" });
+      refuse(res, 400, { code: "invalid_input", error: "No logo file provided" });
       return;
     }
     // The logo IS every bound bot's avatar (all servers): one transaction, so
@@ -1541,7 +1646,7 @@ integrationRouter.post("/clients/:clientId/logo", async (req, res) => {
       return { ...logo, bots };
     });
     if (!written) {
-      res.status(404).json({ error: "OAuth client not found" });
+      refuse(res, 404, { code: "APP_NOT_FOUND", error: "OAuth client not found" });
       return;
     }
     // Committed: only now is the replaced logo object unreferenced.
@@ -1563,7 +1668,7 @@ integrationRouter.post("/clients/:clientId/logo", async (req, res) => {
 integrationRouter.delete("/clients/:clientId/logo", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can manage integrations" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage integrations" });
       return;
     }
     // Clearing the logo clears every bound bot's avatar: same transaction and
@@ -1579,7 +1684,7 @@ integrationRouter.delete("/clients/:clientId/logo", async (req, res) => {
       return { ...logo, bots };
     });
     if (!written) {
-      res.status(404).json({ error: "OAuth client not found" });
+      refuse(res, 404, { code: "APP_NOT_FOUND", error: "OAuth client not found" });
       return;
     }
     // Committed: only now is the removed logo object unreferenced.
@@ -1600,7 +1705,7 @@ integrationRouter.delete("/clients/:clientId/logo", async (req, res) => {
 integrationRouter.delete("/clients/:clientId", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "manageIntegrations")) {
-      res.status(403).json({ error: "Only server owners and admins can manage integrations" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage integrations" });
       return;
     }
     // The App's bots (all servers) fall back to the generated avatar in the
@@ -1620,7 +1725,7 @@ integrationRouter.delete("/clients/:clientId", async (req, res) => {
       return { ...deleted, bots };
     });
     if (!written) {
-      res.status(404).json({ error: "OAuth client not found" });
+      refuse(res, 404, { code: "APP_NOT_FOUND", error: "OAuth client not found" });
       return;
     }
     oauthService.deleteStaleIntegrationLogo(written.staleLogoStorageKey);
@@ -1650,7 +1755,7 @@ async function canManageAgentAccess(
 integrationRouter.post("/requests/:requestId/approve", async (req, res) => {
   try {
     if (!await canManageAgentAccess(req, await oauthService.getAgentForAccessRequest(req.serverId!, req.params.requestId))) {
-      res.status(403).json({ error: "Only server owners and admins can manage integrations" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage integrations" });
       return;
     }
     if (await refuseUnverifiedApprover(res, req.userId!, webSessionFamilyOf(req), "Confirm it's you with your second step before approving this app's access.")) return;
@@ -1664,6 +1769,7 @@ integrationRouter.post("/requests/:requestId/approve", async (req, res) => {
     res.json(result);
   } catch (err: any) {
     if (err instanceof oauthService.AgentScopeNotApprovedError) {
+      // refusal-ok: top-level unapprovedScopes lists the scopes the installation has not approved; refuse() writes no top-level fields
       res.status(409).json({ error: err.message, code: "scope_not_approved", unapprovedScopes: err.unapprovedScopes });
       return;
     }
@@ -1679,7 +1785,7 @@ integrationRouter.post("/requests/:requestId/approve", async (req, res) => {
 integrationRouter.post("/requests/:requestId/deny", async (req, res) => {
   try {
     if (!await canManageAgentAccess(req, await oauthService.getAgentForAccessRequest(req.serverId!, req.params.requestId))) {
-      res.status(403).json({ error: "Only server owners and admins can manage integrations" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage integrations" });
       return;
     }
     const updated = await oauthService.denyAccessRequest({
@@ -1688,7 +1794,7 @@ integrationRouter.post("/requests/:requestId/deny", async (req, res) => {
       resolvedByUserId: req.userId!,
     });
     if (!updated) {
-      res.status(404).json({ error: "Access request not found" });
+      refuse(res, 404, { code: "not_found", error: "Access request not found" });
       return;
     }
     res.json(updated);
@@ -1700,7 +1806,7 @@ integrationRouter.post("/requests/:requestId/deny", async (req, res) => {
 integrationRouter.post("/grants/:grantId/revoke", async (req, res) => {
   try {
     if (!await canManageAgentAccess(req, await oauthService.getAgentForGrant(req.serverId!, req.params.grantId))) {
-      res.status(403).json({ error: "Only server owners and admins can manage integrations" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can manage integrations" });
       return;
     }
     const updated = await oauthService.revokeGrant({
@@ -1709,7 +1815,7 @@ integrationRouter.post("/grants/:grantId/revoke", async (req, res) => {
       revokedByUserId: req.userId!,
     });
     if (!updated) {
-      res.status(404).json({ error: "Grant not found" });
+      refuse(res, 404, { code: "not_found", error: "Grant not found" });
       return;
     }
     res.json(updated);
@@ -1724,7 +1830,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 async function loadAgentInServer(req: Request, res: Response) {
   const agentId = String(req.params.agentId);
   if (!UUID_RE.test(agentId)) {
-    res.status(404).json({ error: "Agent not found" });
+    refuse(res, 404, { code: "agent_not_found", error: "Agent not found" });
     return null;
   }
   const [agent] = await getDb().select({
@@ -1735,7 +1841,7 @@ async function loadAgentInServer(req: Request, res: Response) {
     assistantOwnerUserId: agents.assistantOwnerUserId,
   }).from(agents).where(and(eq(agents.id, agentId), isNull(agents.deletedAt))).limit(1);
   if (!agent || agent.serverId !== req.serverId) {
-    res.status(404).json({ error: "Agent not found" });
+    refuse(res, 404, { code: "agent_not_found", error: "Agent not found" });
     return null;
   }
   return agent;
@@ -1750,7 +1856,7 @@ async function loadInspectableAgent(req: Request, res: Response): Promise<{ id: 
   if (!agent) return null;
   const role = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
   if (!role || !roleCanInspectAgentPrivateSurfaces(role, req.userId!, agent)) {
-    res.status(403).json({ error: "Only the agent's creator and server owners and admins can view its app events" });
+    refuse(res, 403, { code: "insufficient_role", error: "Only the agent's creator and server owners and admins can view its app events" });
     return null;
   }
   return agent;
@@ -1763,14 +1869,14 @@ integrationRouter.get("/agents/:agentId/events", async (req, res) => {
     if (!agent) return;
     const { clientId, before, limit } = req.query;
     if (clientId !== undefined && (typeof clientId !== "string" || !(UUID_RE.test(clientId) || clientId === SYSTEM_ASSISTANT_APP))) {
-      res.status(400).json({ error: "clientId must be an app id" });
+      refuse(res, 400, { code: "invalid_input", error: "clientId must be an app id" });
       return;
     }
     let cursor: { createdAt: Date; id: string } | undefined;
     if (before !== undefined) {
       cursor = typeof before === "string" ? decodeAgentAppEventCursor(before) ?? undefined : undefined;
       if (!cursor) {
-        res.status(400).json({ error: "before must be a cursor returned by this endpoint" });
+        refuse(res, 400, { code: "invalid_input", error: "before must be a cursor returned by this endpoint" });
         return;
       }
     }
@@ -1778,7 +1884,7 @@ integrationRouter.get("/agents/:agentId/events", async (req, res) => {
     if (limit !== undefined) {
       pageSize = typeof limit === "string" && /^\d+$/.test(limit) ? Number(limit) : Number.NaN;
       if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > AGENT_APP_EVENTS_MAX_LIMIT) {
-        res.status(400).json({ error: `limit must be an integer from 1 to ${AGENT_APP_EVENTS_MAX_LIMIT}` });
+        refuse(res, 400, { code: "invalid_input", error: `limit must be an integer from 1 to ${AGENT_APP_EVENTS_MAX_LIMIT}` });
         return;
       }
     }
@@ -1795,7 +1901,7 @@ integrationRouter.get("/agents/:agentId/events/:eventId", async (req, res) => {
     if (!agent) return;
     const event = await getAgentAppEvent({ agentId: agent.id, eventId: req.params.eventId });
     if (!event) {
-      res.status(404).json({ error: "Event not found" });
+      refuse(res, 404, { code: "not_found", error: "Event not found" });
       return;
     }
     res.setHeader("Cache-Control", "private, no-store");
@@ -1811,7 +1917,7 @@ integrationRouter.get("/agents/:agentId/grantable-apps", async (req, res) => {
     const agent = await loadAgentInServer(req, res);
     if (!agent) return;
     if (!await canManageAgentAccess(req, agent)) {
-      res.status(403).json({ error: "Only the agent's creator and server owners and admins can grant app access" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only the agent's creator and server owners and admins can grant app access" });
       return;
     }
     res.json({ apps: await oauthService.listGrantableAgentApps(req.serverId!) });
@@ -1826,12 +1932,12 @@ integrationRouter.post("/agents/:agentId/grants", async (req, res) => {
     const agent = await loadAgentInServer(req, res);
     if (!agent) return;
     if (!await canManageAgentAccess(req, agent)) {
-      res.status(403).json({ error: "Only the agent's creator and server owners and admins can grant app access" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only the agent's creator and server owners and admins can grant app access" });
       return;
     }
     const { clientId, scopes } = req.body ?? {};
     if (typeof clientId !== "string" || !UUID_RE.test(clientId)) {
-      res.status(400).json({ error: "clientId must be an app id" });
+      refuse(res, 400, { code: "invalid_input", error: "clientId must be an app id" });
       return;
     }
     const result = await oauthService.grantAgentAccessOnBehalf({
@@ -1854,14 +1960,14 @@ integrationRouter.post("/agents/:agentId/grants", async (req, res) => {
 integrationRouter.get("/agents/:agentId", async (req, res) => {
   try {
     if (!await currentUserHasServerCapability(req, "viewAgents")) {
-      res.status(403).json({ error: "Only server owners and admins can view agent integrations" });
+      refuse(res, 403, { code: "insufficient_role", error: "Only server owners and admins can view agent integrations" });
       return;
     }
 
     const db = getDb();
     const [agent] = await db.select({ id: agents.id, serverId: agents.serverId }).from(agents).where(eq(agents.id, req.params.agentId)).limit(1);
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, { code: "agent_not_found", error: "Agent not found" });
       return;
     }
 

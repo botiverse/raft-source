@@ -1,9 +1,8 @@
-import { useCallback, useMemo } from "react";
+import { useCallback } from "react";
 import type { ReactNode } from "react";
-import { ArrowDownUp, LayoutList, Shapes, X } from "lucide-react";
+import { LayoutList, Store, X } from "lucide-react";
 import { useIntl } from "react-intl";
 import {
-  DropdownMenuSeparator,
   Select,
   SelectContent,
   SelectItem,
@@ -13,24 +12,23 @@ import {
   SelectTrigger,
 } from "@botiverse/raft-ui";
 import { FitToolbar, FitToolbarButton, FitToolbarGroup, FitToolbarPicker, FitToolbarSearch } from "@botiverse/raft-ui/wip";
-import { MARKETPLACE_LISTING_SORTS, MARKETPLACE_LISTING_TYPES, MARKETPLACE_LISTINGS_QUERY_MAX_CHARS, OAUTH_CLIENT_CATEGORIES } from "@botiverse/raft-shared";
-import type { MarketplaceListingSort, MarketplaceListingType, OAuthClientCategory } from "@botiverse/raft-shared";
+import { MARKETPLACE_LISTINGS_QUERY_MAX_CHARS, OAUTH_CLIENT_CATEGORIES } from "@botiverse/raft-shared";
+import type { OAuthClientCategory } from "@botiverse/raft-shared";
 import { CONNECTED_APP_CATEGORY_LABEL_ID } from "../../features/apps/connected-apps/connectedAppCatalog";
-import type { ConnectedAppsViewMode } from "../../features/apps/connected-apps/connectedAppTypes";
 import type { ConnectedAppsTab } from "../settings/SettingsSegmentedControls";
 import { LIST_TOOLBAR_AIR_CLASS, LIST_TOOLBAR_STEP, LIST_TOOLBAR_MORE_GROUP_CLASS } from "../ui/listToolbar";
-import { ListScope, ListToolbarMore, MoreMenuChoices } from "../ui/ListToolbarParts";
+import { ListScope, ListToolbarMore } from "../ui/ListToolbarParts";
 import type { ListScopeOption } from "../ui/ListToolbarParts";
-import { APPS_SORT_LABEL_ID, APPS_TYPE_LABEL_ID, hasActiveAppsFilters } from "./appsFilters";
-import type { AppsFilters } from "./appsFilters";
+import { APPS_ORIGIN_FILTERS, APPS_ORIGIN_LABEL_ID, hasActiveAppsFilters } from "./appsFilters";
+import type { AppsFilters, AppsOriginFilter } from "./appsFilters";
 
 const CATEGORY_VALUES: readonly (OAuthClientCategory | "all")[] = ["all", ...OAUTH_CLIENT_CATEGORIES];
-const VIEW_MODES: readonly ConnectedAppsViewMode[] = ["grid", "list"];
 
 function FilterSelect<T extends string>({
   value,
   values,
   labelOf,
+  nameOf,
   icon,
   applied,
   labelOrder,
@@ -40,6 +38,8 @@ function FilterSelect<T extends string>({
   value: T;
   values: readonly T[];
   labelOf: (value: T) => string;
+  /** The trigger's accessible name when the value alone doesn't say the filter ("Source: All"); it holds the visible text. */
+  nameOf?: (value: T) => string;
   icon: ReactNode;
   applied: boolean;
   labelOrder: number;
@@ -59,7 +59,7 @@ function FilterSelect<T extends string>({
         trigger={<SelectTrigger />}
         icon={icon}
         labelOrder={labelOrder}
-        aria-label={labelOf(value)}
+        aria-label={nameOf ? nameOf(value) : labelOf(value)}
         data-has-value={applied ? "" : undefined}
         data-active={applied ? "" : undefined}
         data-testid={testId}
@@ -83,26 +83,23 @@ function FilterSelect<T extends string>({
 /**
  * The Apps list's toolbar, the toolbar over a list (Raft DS › Patterns ›
  * Responsive › The toolbar over a list), on raft-ui's FitToolbar: the scope
- * (Installed, Marketplace, Developer, with their counts) at its start, the
- * search filling the line, the filters Type and Category (the applied first,
- * Clear All pinned at their end once one narrows the list), then the
- * Marketplace's Sort, the grid/list switch and Add App, the primary action,
- * last. As it narrows: the sort and the switch show their icons, the filters
- * theirs, the filters move to a scrolling second line with their words back,
- * Add App becomes +, the scope becomes a Select, the sort and the switch fold
- * into ⋯, and last an empty search becomes its button.
+ * (Yours, Discover, with their counts; none for a member, who has Yours alone) at its start, the search filling the
+ * line, the scope's one filter (Yours: where the App came from; Discover:
+ * its Category), Clear All pinned after it once something narrows the list,
+ * then Add App, the primary action, last. No view switch: Apps are always
+ * cards. No scope names an App type (R4), and neither has a Sort: Discover
+ * keeps the server's order, the most used first. As it narrows: the filter
+ * shows its icon, then moves to a scrolling second line with its words back,
+ * Add App becomes +, the scope becomes a Select, and last an empty search
+ * becomes its button.
  */
 export function AppsToolbar({
   tab,
   tabs,
   onTabChange,
   filters,
-  showSort,
   onChange,
   onClearAll,
-  view,
-  onViewChange,
-  viewSwitch,
   addApp,
   variant = "page",
 }: {
@@ -110,81 +107,63 @@ export function AppsToolbar({
   tabs: readonly ListScopeOption<ConnectedAppsTab>[];
   onTabChange: (tab: ConnectedAppsTab) => void;
   filters: AppsFilters;
-  /** Sort orders the Marketplace; Installed and My Apps keep their own order. */
-  showSort: boolean;
   onChange: (patch: Partial<AppsFilters>) => void;
   onClearAll: () => void;
-  view: ConnectedAppsViewMode;
-  onViewChange: (view: ConnectedAppsViewMode) => void;
-  /** The grid/list switch, at the line's end. */
-  viewSwitch: ReactNode;
-  /** Add App, the primary action, after it (a FitToolbarButton opening its menu); the page's only. */
+  /** Add App, the primary action, at the line's end (a FitToolbarButton opening its menu); the page's only. */
   addApp?: ReactNode;
   /** The Apps page (a line of the toolbar over a list, edge to edge) or the Settings section (inside its column, no line of its own). */
   variant?: "page" | "settings";
 }) {
   const { formatMessage } = useIntl();
   const handleSearch = useCallback((search: string) => onChange({ search }), [onChange]);
-  const handleType = useCallback((type: MarketplaceListingType) => onChange({ type }), [onChange]);
+  const handleOrigin = useCallback((origin: AppsOriginFilter) => onChange({ origin }), [onChange]);
+  const originLabel = useCallback((origin: AppsOriginFilter) => formatMessage({ id: APPS_ORIGIN_LABEL_ID[origin] }), [formatMessage]);
+  const originName = useCallback(
+    (origin: AppsOriginFilter) => formatMessage({ id: "apps.filter.originName" }, { value: formatMessage({ id: APPS_ORIGIN_LABEL_ID[origin] }) }),
+    [formatMessage],
+  );
   const handleCategory = useCallback((category: OAuthClientCategory | "all") => onChange({ category }), [onChange]);
-  const handleSort = useCallback((sort: MarketplaceListingSort) => onChange({ sort }), [onChange]);
-  const typeLabel = useCallback((type: MarketplaceListingType) => formatMessage({ id: APPS_TYPE_LABEL_ID[type] }), [formatMessage]);
   const categoryLabel = useCallback(
     (category: OAuthClientCategory | "all") => formatMessage({ id: CONNECTED_APP_CATEGORY_LABEL_ID[category] ?? "settings.connectedApps.categoryOther" }),
     [formatMessage],
   );
-  const sortLabel = useCallback((sort: MarketplaceListingSort) => formatMessage({ id: APPS_SORT_LABEL_ID[sort] }), [formatMessage]);
-  const sortOptions = useMemo(() => MARKETPLACE_LISTING_SORTS.map((value) => ({ value, label: sortLabel(value) })), [sortLabel]);
-  const viewOptions = useMemo(() => VIEW_MODES.map((value) => ({
-    value,
-    label: formatMessage({ id: value === "grid" ? "settings.connectedApps.gridView" : "settings.connectedApps.listView" }),
-  })), [formatMessage]);
-  // "Apps, Installed": not confusable with the grid/list switch.
+  // "Apps, Yours".
   const scopeLabel = formatMessage({ id: "apps.page.title" });
 
-  const filterItems = [
-    {
-      key: "type",
-      applied: filters.type !== "all",
-      node: (
-        <FilterSelect
-          key="type"
-          value={filters.type}
-          values={MARKETPLACE_LISTING_TYPES}
-          labelOf={typeLabel}
-          icon={<Shapes />}
-          applied={filters.type !== "all"}
-          labelOrder={LIST_TOOLBAR_STEP.filterLabels}
-          onChange={handleType}
-          testId="apps-filter-type"
-        />
-      ),
-    },
-    {
-      key: "category",
-      applied: filters.category !== "all",
-      node: (
-        <FilterSelect
-          key="category"
-          value={filters.category}
-          values={CATEGORY_VALUES}
-          labelOf={categoryLabel}
-          icon={<LayoutList />}
-          applied={filters.category !== "all"}
-          labelOrder={LIST_TOOLBAR_STEP.filterLabels}
-          onChange={handleCategory}
-          testId="connected-apps-category-filter"
-        />
-      ),
-    },
-  ];
-  // The applied filters first, so they are in view before any scrolling.
-  const orderedFilters = [...filterItems.filter((item) => item.applied), ...filterItems.filter((item) => !item.applied)];
+  // One filter per scope, a button that shows its value (Raft DS › Select ›
+  // Filters), as the Computers page's: Yours' Source, Discover's Category.
+  const filter = tab === "yours" ? (
+    <FilterSelect
+      key="origin"
+      value={filters.origin}
+      values={APPS_ORIGIN_FILTERS}
+      labelOf={originLabel}
+      nameOf={originName}
+      icon={<Store />}
+      applied={filters.origin !== "all"}
+      labelOrder={LIST_TOOLBAR_STEP.filterLabels}
+      onChange={handleOrigin}
+      testId="apps-filter-origin"
+    />
+  ) : (
+    <FilterSelect
+      key="category"
+      value={filters.category}
+      values={CATEGORY_VALUES}
+      labelOf={categoryLabel}
+      icon={<LayoutList />}
+      applied={filters.category !== "all"}
+      labelOrder={LIST_TOOLBAR_STEP.filterLabels}
+      onChange={handleCategory}
+      testId="connected-apps-category-filter"
+    />
+  );
 
   return (
     <div className={variant === "page" ? `px-4 md:px-(--surface-inset) ${LIST_TOOLBAR_AIR_CLASS}` : undefined} data-testid="connected-apps-filters">
       <FitToolbar aria-label={formatMessage({ id: "apps.page.title" })} wrap className="gap-2">
-        <ListScope value={tab} options={tabs} onValueChange={onTabChange} label={scopeLabel} testId="connected-apps-tabs" selectTestId="connected-apps-scope-select" />
+        {/* A member's page has Yours alone (R15): no scope to switch. */}
+        {tabs.length > 1 ? <ListScope value={tab} options={tabs} onValueChange={onTabChange} label={scopeLabel} testId="connected-apps-tabs" selectTestId="connected-apps-scope-select" /> : null}
         <FitToolbarSearch
           value={filters.search}
           onValueChange={handleSearch}
@@ -201,44 +180,13 @@ export function AppsToolbar({
           wrapOrder={LIST_TOOLBAR_STEP.filtersWrap}
           className="gap-2"
           data-testid="apps-filter-strip"
-          end={hasActiveAppsFilters(filters) ? (
+          end={hasActiveAppsFilters(filters, tab) ? (
             <FitToolbarButton variant="ghost" collapsedIcon={<X />} labelOrder={LIST_TOOLBAR_STEP.filterLabels} onClick={onClearAll} data-testid="apps-filter-clear-all">
               {formatMessage({ id: "apps.filter.clearAll" })}
             </FitToolbarButton>
           ) : null}
         >
-          {orderedFilters.map((item) => item.node)}
-        </FitToolbarGroup>
-        <FitToolbarGroup
-          firstLine
-          className="gap-2"
-          moreOrder={LIST_TOOLBAR_STEP.displayMore}
-          data-testid="apps-toolbar-trailing"
-          moreItem={(
-            <>
-              {showSort ? (
-                <>
-                  <MoreMenuChoices heading={formatMessage({ id: "ui.listToolbar.sort" })} value={filters.sort} options={sortOptions} onValueChange={handleSort} testId="apps-more-sort" />
-                  <DropdownMenuSeparator />
-                </>
-              ) : null}
-              <MoreMenuChoices heading={formatMessage({ id: "ui.listToolbar.view" })} value={view} options={viewOptions} onValueChange={onViewChange} testId="apps-more-view" />
-            </>
-          )}
-        >
-          {showSort ? (
-            <FilterSelect
-              value={filters.sort}
-              values={MARKETPLACE_LISTING_SORTS}
-              labelOf={sortLabel}
-              icon={<ArrowDownUp />}
-              applied={filters.sort !== "installs"}
-              labelOrder={LIST_TOOLBAR_STEP.displayLabels}
-              onChange={handleSort}
-              testId="apps-filter-sort"
-            />
-          ) : null}
-          {viewSwitch}
+          {filter}
         </FitToolbarGroup>
         <FitToolbarGroup firstLine className={addApp ? "gap-2" : LIST_TOOLBAR_MORE_GROUP_CLASS}>
           <ListToolbarMore testId="apps-toolbar-more" />

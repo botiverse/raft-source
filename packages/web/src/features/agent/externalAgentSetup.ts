@@ -1,6 +1,8 @@
 // What an external agent is told to connect with (#wg-external-agent-ux:#2): the prompt for an existing agent's
 // CLI login, and the SDK's install command and first lines. One agent credential serves both.
 import type { useIntl } from "react-intl";
+import { useAgentStore } from "../../store/agentStore";
+import { useAuthStore } from "../../store/authStore";
 import { getServerUrl } from "../../utils/server";
 
 export type ExternalSetupMethod = "existing_agent" | "sdk";
@@ -18,8 +20,24 @@ export function externalProfileSlug(agent: Created): string {
   return agent.name.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || agent.id.slice(0, 8);
 }
 
-/** The prompt an existing agent is given: install the CLI, sign in as this agent, ask for the credential. */
-export function existingAgentPrompt(agent: Created, formatMessage: ReturnType<typeof useIntl>["formatMessage"]): string {
+/**
+ * The person pasting the prompt, as the agent names them in `dm:@…`: the viewer's handle, `~human` when an
+ * agent here has the same name. Null while unknown (the prompt then leaves out "tell me you are connected").
+ */
+export function usePromptRecipientHandle(): string | null {
+  const name = useAuthStore((s) => s.user?.name ?? null);
+  const agentHasName = useAgentStore((s) => name !== null && s.agents.some((agent) => agent.name === name));
+  if (!name) return null;
+  return agentHasName ? `${name}~human` : name;
+}
+
+/**
+ * The prompt an existing agent is given: what Raft is, install the CLI, sign in as this agent, ask for the
+ * credential, then use its profile, read the manual the login names, say it is connected, and check its inbox
+ * (Sage, #wg-ax:2438df62: Raft does not start an external agent when a message arrives).
+ */
+export function existingAgentPrompt(agent: Created, formatMessage: ReturnType<typeof useIntl>["formatMessage"], me: string | null): string {
+  const slug = externalProfileSlug(agent);
   return [
     formatMessage({ id: "agent.createExternal.promptIntro" }, { name: agent.name }),
     "",
@@ -27,9 +45,12 @@ export function existingAgentPrompt(agent: Created, formatMessage: ReturnType<ty
     "npm i -g @botiverse/raft@latest",
     "",
     formatMessage({ id: "agent.createExternal.promptLogin" }),
-    `raft agent login --server ${getServerUrl()} --agent ${agent.id} --profile-slug ${externalProfileSlug(agent)}`,
-    "",
+    `raft agent login --server ${getServerUrl()} --agent ${agent.id} --profile-slug ${slug}`,
     formatMessage({ id: "agent.createExternal.promptCredential" }),
+    "",
+    me
+      ? formatMessage({ id: "agent.createExternal.promptAfter" }, { slug, me })
+      : formatMessage({ id: "agent.createExternal.promptAfterNoRecipient" }, { slug }),
   ].join("\n");
 }
 

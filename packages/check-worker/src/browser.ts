@@ -32,6 +32,7 @@ import type { ArtifactCheckViewport } from "@botiverse/raft-shared/src/artifactC
 
 import { sessionViewport, thrownAt, type CdpSend } from "./cdpPage";
 import type { CheckBrowser, CheckContext, CheckPage, OpenResult } from "./checkPage";
+import { measurePage } from "./measurePage";
 import type { PageMeasure } from "./pageChecks";
 import { openWith } from "./open";
 import { createSessionPool, pooledCheckBrowser, type PoolBackend, type PoolDeps, type SessionHandle } from "./pool";
@@ -200,11 +201,8 @@ function pageOf(page: Page, cdp: CDPSession): CheckPage {
       return typeof said === "string" ? said : null;
     },
     async measure(): Promise<PageMeasure> {
-      return page.evaluate(() => {
-        const body = document.body;
-        const scroller = document.scrollingElement ?? document.documentElement;
-        return { textLength: body ? body.innerText.trim().length : 0, scrollWidth: scroller.scrollWidth, innerWidth: window.innerWidth };
-      });
+      // One call in the page (measurePage.ts: self-contained, as puppeteer sends its text alone).
+      return page.evaluate(measurePage);
     },
     screenshot() {
       return viewport.screenshot();

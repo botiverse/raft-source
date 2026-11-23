@@ -1,3 +1,4 @@
+import { useLocale } from "../../i18n/LocaleProvider";
 import { useMemo } from "react";
 import { useAgentStore } from "../../store/agentStore";
 import { useAuthStore } from "../../store/authStore";
@@ -12,6 +13,7 @@ import { useServerStore } from "../../store/serverStore";
 import type { ComposerSuggestionSearchEntry } from "../../utils/composerSuggestionSearch";
 import { selectRecentConversationEntities } from "./recentConversations";
 import { buildSearchEntityEntries } from "./searchEntities";
+import { selectCatalogChannels, selectCatalogDmChannels } from "./searchEntityCatalogSources";
 import type { SearchEntityResult } from "./searchEntities";
 
 // One resolution of "the conversations you were in most recently" for every
@@ -41,18 +43,20 @@ const EMPTY_CATALOG: SearchEntityCatalog = Object.freeze({
  * but the O(destinations) work runs once per tree).
  */
 export function useSearchEntityCatalog(provided?: SearchEntityCatalog): SearchEntityCatalog {
-  const channels = useChannelStore((s) => s.channels);
-  const dmChannels = useChannelStore((s) => s.dmChannels);
+  // Projections that keep their identity across patches the catalog does not read (#532).
+  const channels = useChannelStore((s) => selectCatalogChannels(s.channels));
+  const dmChannels = useChannelStore((s) => selectCatalogDmChannels(s.dmChannels));
   const members = useServerStore((s) => s.members);
   const hiddenDmIds = useServerStore((s) => s.sidebarOrder.hiddenDmIds);
   const agents = useAgentStore((s) => s.agents);
   const machines = useMachineStore((s) => s.machines);
   const currentUser = useAuthStore((s) => s.user);
+  const { locale } = useLocale();
   const skip = provided !== undefined;
 
   const entries = useMemo(
-    () => (skip ? EMPTY_CATALOG.entries : buildSearchEntityEntries({ channels, members, agents, machines, currentUser, dmChannels })),
-    [agents, channels, currentUser, dmChannels, machines, members, skip],
+    () => (skip ? EMPTY_CATALOG.entries : buildSearchEntityEntries({ channels, members, agents, machines, currentUser, dmChannels, locale })),
+    [agents, channels, currentUser, dmChannels, locale, machines, members, skip],
   );
   const eligibleEntityKeys = useMemo(() => {
     if (skip) return EMPTY_CATALOG.eligibleEntityKeys;

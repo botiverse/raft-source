@@ -5,6 +5,7 @@
 import { AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT, AGENT_API_MESSAGE_SEARCH_MAX_LIMIT } from "../agentApiContract";
 import { AGENT_BODY_CONTINUATION_PREFIX, foldAgentOneLineText, formatAgentPostedByHeaderField, formatAgentTaskCurrentProjection, indentAgentBodyContinuationLines, type AgentMessageTaskCurrentProjectionLike } from "../agentMessageText";
 import { formatHint, formatHintFlag, RAFT_HINTS, type RaftHintStyle } from "../agentOps/hint";
+import { RAFT_MENTION_LEFT_BOUNDARY_PATTERN, RAFT_REF_CHANNEL_NAME_PATTERN, RAFT_REF_USER_NAME_PATTERN } from "../raftRefs";
 
 export interface AgentSearchResultLike {
   id: string;
@@ -129,24 +130,41 @@ function findSearchMatch(content: string, query: string): SearchMatchRange | nul
   return null;
 }
 
+// The ref grammar of raftRefs.ts (Unicode letters and digits), so `@庄天翼`,
+// `#频道` and `dm:@庄天翼` are neutralised like ASCII refs. A handle starts
+// with a letter or digit and a channel with a letter, as before: `#5` and
+// `@_x` stay text.
+const USER_NAME = String.raw`(?=[\p{L}\p{N}])${RAFT_REF_USER_NAME_PATTERN}`;
+const CHANNEL_NAME = String.raw`(?=\p{L})${RAFT_REF_CHANNEL_NAME_PATTERN}`;
+// Not RAFT_REF_DM_PEER_PATTERN: that is ASCII (`\w`), so `dm:@庄天翼` is no DM
+// ref, but its `@庄天翼` is a live mention (createRaftUserRefRegex), so the
+// whole peer is neutralised with the user-name grammar.
+const DM_PEER = String.raw`${USER_NAME}(?:~(?:agent|human))?`;
+// `\b` sits before the ASCII `dm` / `task`, so a non-ASCII character before
+// them still counts as a boundary (more is neutralised, never less).
+// Before `@` / `#`: the left boundary of the live mention grammar
+// (createRaftUserRefRegex), so everything it would route is neutralised:
+// `a,@x`, `**@x**`, `cc:@x`, `/@x`, `<@x>`, `，@庄天翼`. A letter or digit
+// before `@` is no mention (`a@b.com`, `草案@庄天翼`) and is left as it is.
+const REF_PREFIX = RAFT_MENTION_LEFT_BOUNDARY_PATTERN;
+// Global: `replace` and `matchAll` each start from 0 (matchAll on a copy).
+const DM_REF_RE = new RegExp(String.raw`\bdm:@(${DM_PEER})`, "gu");
+const TASK_REF_RE = new RegExp(String.raw`\btask #([0-9]+)\b`, "gu");
+const USER_REF_RE = new RegExp(String.raw`${REF_PREFIX}@(${USER_NAME})`, "gu");
+const CHANNEL_REF_RE = new RegExp(String.raw`${REF_PREFIX}#(${CHANNEL_NAME})`, "gu");
+
 function* findRaftRefLiteralRanges(content: string): Generator<SearchMatchRange> {
-  for (const match of content.matchAll(/\bdm:@[A-Za-z0-9][A-Za-z0-9_-]*(?:~(?:agent|human))?/g)) {
-    if (match.index !== undefined) yield { start: match.index, end: match.index + match[0].length };
+  for (const re of [DM_REF_RE, TASK_REF_RE]) {
+    for (const match of content.matchAll(re)) {
+      if (match.index !== undefined) yield { start: match.index, end: match.index + match[0].length };
+    }
   }
-  for (const match of content.matchAll(/\btask #[0-9]+\b/g)) {
-    if (match.index !== undefined) yield { start: match.index, end: match.index + match[0].length };
-  }
-  for (const match of content.matchAll(/(^|[\n\s([{"'`;])(@[A-Za-z0-9][A-Za-z0-9_-]*)/g)) {
-    if (match.index === undefined) continue;
-    const prefix = match[1] ?? "";
-    const ref = match[2] ?? "";
-    yield { start: match.index + prefix.length, end: match.index + prefix.length + ref.length };
-  }
-  for (const match of content.matchAll(/(^|[\n\s([{"'`;])(#[A-Za-z][A-Za-z0-9_-]*)/g)) {
-    if (match.index === undefined) continue;
-    const prefix = match[1] ?? "";
-    const ref = match[2] ?? "";
-    yield { start: match.index + prefix.length, end: match.index + prefix.length + ref.length };
+  for (const re of [USER_REF_RE, CHANNEL_REF_RE]) {
+    for (const match of content.matchAll(re)) {
+      if (match.index === undefined) continue;
+      const prefix = match[1] ?? "";
+      yield { start: match.index + prefix.length, end: match.index + match[0].length };
+    }
   }
 }
 
@@ -184,10 +202,16 @@ function escapeSearchComponentLiterals(text: string): string {
 /** Neutralise `@handle`, `#channel`, `dm:@peer`, and `task #N` literals so quoted text cannot route attention. */
 export function neutralizeAgentRaftRefLiterals(text: string): string {
   return text
-    .replace(/\bdm:@([A-Za-z0-9][A-Za-z0-9_-]*(?:~(?:agent|human))?)/g, "dm:user:$1")
-    .replace(/\btask #([0-9]+)\b/g, "task:$1")
-    .replace(/(^|[\n\s([{"'`;])@([A-Za-z0-9][A-Za-z0-9_-]*)/g, "$1user:$2")
-    .replace(/(^|[\n\s([{"'`;])#([A-Za-z][A-Za-z0-9_-]*)/g, "$1channel:$2");
+    .replace(DM_REF_RE, "dm:user:$1")
+    .replace(TASK_REF_RE, "task:$1")
+    .replace(USER_REF_RE, (_ref, prefix: string, name: string) => `${inertPrefix(prefix)}user:${name}`)
+    .replace(CHANNEL_REF_RE, (_ref, prefix: string, name: string) => `${inertPrefix(prefix)}channel:${name}`);
+}
+
+// `@@x` or `@#x`: the `@` before the ref would start a live `@user` /
+// `@channel` once the ref is rewritten, so a space keeps it apart (`#` too).
+function inertPrefix(prefix: string): string {
+  return prefix === "@" || prefix === "#" ? `${prefix} ` : prefix;
 }
 
 export function renderAgentSearchPreviewText(text: string): string {
@@ -318,7 +342,7 @@ export function formatAgentSearchResults(
     const senderType = result.senderType ? ` (${result.senderType})` : "";
     const delegated = result.delegated_by?.name ? ` delegated_by=@${neutralizeAgentRaftRefLiterals(result.delegated_by.name)}` : "";
     const postedBy = formatAgentPostedByHeaderField(result.posted_by);
-    const taskProjection = formatAgentTaskCurrentProjection(result.taskCurrentProjection, result.taskNumber, renderAgentSearchPreviewText).trimStart();
+    const taskProjection = formatAgentTaskCurrentProjection(result.taskCurrentProjection, result.taskNumber, renderAgentSearchPreviewText, "below").trimStart();
     return [
       `<result ref="${ref}">`,
       `Source: ${renderSearchSource(result)}`,

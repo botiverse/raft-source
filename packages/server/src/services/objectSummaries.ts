@@ -6,9 +6,11 @@
  * 1. the app reports where each object lives (AppObjectKind.homes: server,
  *    standard home columns, author; anything it leaves out is unavailable);
  * 2. only while the app's flag is on for the reader's server and for the
- *    object's own server, and that server isn't soft-deleted (one batched
- *    evaluation and one query however many servers): a reader whose server
- *    has the app off gets every reference unavailable;
+ *    object's own server, and that server isn't soft-deleted, or is but the
+ *    object is kept in a joint it is still in, read-only
+ *    (platform/visibility objectServersAnswer `read`; a constant number of
+ *    queries however many servers): a reader whose server has the app off
+ *    gets every reference unavailable;
  * 3. the home, by the platform's rule (visibilityService.canViewHomedObjects:
  *    standing in the server, top-level conversations of the object's server,
  *    a joint's canonical channel through the reader's server's projection,
@@ -32,7 +34,7 @@
 import type { ObjectSummary, ServerId } from "@botiverse/raft-shared";
 import type { AppObjectDeleted, AppObjectHome, AppObjectKind, AppObjectRef, AppWebReader, FirstPartyApp } from "../platform/apps";
 import { appEnabledOnLiveServers } from "../platform/flags";
-import { homeOf } from "../platform/visibility";
+import { homeOf, objectServersAnswer } from "../platform/visibility";
 import { canViewHomedObjects, type ViewActor } from "./visibilityService";
 
 /** A registered object kind and the app that owns it (apps/firstPartyApps.ts registeredObjectKind). */
@@ -99,12 +101,13 @@ async function visibleAmong(viewer: ViewActor, registered: RegisteredObjectKind,
     const home = homes.get(id);
     return home ? [{ id, ...home }] : [];
   });
-  const servers = [...new Set([viewer.serverId, ...located.map((object) => object.serverId)])];
-  // An object of a soft-deleted server is seen by no one (platform/flags appEnabledOnLiveServers).
-  const enabled = await appEnabledOnLiveServers(servers, registered.app.flag);
-  const enabledServers = new Set<ServerId>(servers.filter((_, index) => enabled[index]));
-  if (!enabledServers.has(viewer.serverId)) return new Set();
-  const asked = located.filter((object) => enabledServers.has(object.serverId));
+  // An object of a soft-deleted server is seen by no one, unless kept in a joint it is still in (read-only).
+  const [[viewerOn], answered] = await Promise.all([
+    appEnabledOnLiveServers([viewer.serverId], registered.app.flag),
+    objectServersAnswer(located, registered.app.flag, { access: "read" }),
+  ]);
+  if (!viewerOn) return new Set();
+  const asked = located.filter((_, index) => answered[index]);
   const answers = await canViewHomedObjects(viewer, asked.map((object) => ({ serverId: object.serverId, home: homeOf(object), author: object.author })));
   return new Set(asked.filter((_, index) => answers[index]).map((object) => object.id));
 }

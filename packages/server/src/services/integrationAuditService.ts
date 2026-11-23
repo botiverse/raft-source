@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ServerRole } from "@botiverse/raft-shared";
-import { and, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, ne, notInArray, sql } from "drizzle-orm";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import { agents, integrationAuditEvents, oauthClients, servers, users } from "../db/schema";
 import { ownerDispatchRequestId } from "./ownerDispatchContext";
@@ -36,6 +36,26 @@ export const INTEGRATION_AUDIT_EVENT_TYPES = [
   // Metadata: the `kid`, never the key.
   "app.card_encryption_key_set",
   "app.card_encryption_key_removed",
+  // A server_local App's or an MCP App's own Server vouched for it (every agent there is granted
+  // it automatically), or that vouch ended: by an owner or admin, at creation, by the 0731 / 0732
+  // backfill (`backfill`), or by an agent widening its scopes (reason `scope_widened`). An MCP
+  // App's rows target `managed_mcp_server` and name it in `appName` (it has no client key).
+  "app.server_vouched",
+  "app.server_unvouched",
+  // An MCP App's Connection (an account; RFC 087 §7.4), shared or a member's own, by a person:
+  // created; signed in (an OAuth sign-in completed, or an API key saved); deleted (`revokedBy` when
+  // someone other than its owner deleted a member's own); which Agents use it changed (a personal
+  // grant, a shared pin, or the shared "All agents" default); and an App's "Members can connect
+  // their own account" switched. Server-scoped (owners and admins read them). Ids only: never the
+  // account label or email, the endpoint or a secret.
+  "mcp_connection.created",
+  "mcp_connection.signed_in",
+  "mcp_connection.deleted",
+  // An OAuth sign-in removed (tokens deleted, the Connection kept): `revokedBy` when an admin signed
+  // out a member's own.
+  "mcp_connection.signed_out",
+  "mcp_connection.agents_changed",
+  "mcp_connection.members_can_connect_changed",
   "official_app.registry_created",
   "official_app.registry_updated",
   "official_app.registry_removed",
@@ -108,14 +128,6 @@ export const INTEGRATION_AUDIT_EVENT_TYPES = [
   "webhook.rotated",
   "webhook.disabled",
   "managed_mcp.tool_invocation_admitted",
-  "provider_connection.created",
-  "provider_connection.updated",
-  "provider_connection.credential_rotated",
-  "provider_connection.tested",
-  "provider_connection.assignment_detached",
-  "provider_connection.probe_issued",
-  "provider_connection.probe_receipt",
-  "provider_connection.deleted",
   // The closed-server purge's revoke of a credential at its provider (Slack
   // auth.revoke, OAuth token revocation): one event per attempt, success or
   // failure; a failure is retried on a later day (closedServerPurgeRevoke.ts).
@@ -141,6 +153,10 @@ export const INTEGRATION_AUDIT_EVENT_TYPES = [
   "agent_runtime.approval_ended",
   // Server-wide audit (#wg-rbac): high-impact server actions share this table.
   "server.profile_updated",
+  // A platform operator changed servers.plan through Feature Flag Admin
+  // (public.ffa_change_server_plan, migration 0724), written in SQL by that
+  // function in the same transaction as the change.
+  "server.plan_changed",
   // A public channel of a public server made visible to signed-out visitors,
   // or hidden again (PATCH /api/channels/:id visitorVisible). Only plain
   // public channels can carry it, so owners and admins may read it.
@@ -198,6 +214,25 @@ export const INTEGRATION_AUDIT_EVENT_TYPES = [
   // have left since). Never a machine that already had someone else's Computer.
   // Written in the adoption's commit, once, when the old key is retired.
   "computer.legacy_adopted_by_other",
+  // A server owner or admin who did not connect a Computer spent one of its
+  // runtime account's limit resets (Claude Code or Codex; the limit-reset
+  // redeem, or a Claude read on which the older program spent the 5-hour
+  // reset; routes/runtimeAuthRoutes.ts): actor the person who used it,
+  // subject the person who connected the Computer (who is emailed). Only for
+  // an answer that says a reset was spent (`answer` in the metadata).
+  "computer.limit_reset_used_by_other",
+  // A person pressed Install on a Computer's runtime and confirmed the plan
+  // (POST …/runtimes/:runtime/install, routes/runtimeAuthRoutes.ts): actor the
+  // person, target the Computer's machine, written once the attempt ends,
+  // whatever its end (the Computer's outcome, no answer in time, offline).
+  // The Computer's activity record of installs; never a command or output.
+  "computer.runtime_install",
+  // A person pressed Stop on one of an agent's `raft proc` jobs on the Computer
+  // page (POST …/proc-jobs/stop, routes/computerProcJobsRoutes.ts): actor the
+  // person, target the Computer's machine, written for every attempt that
+  // passed the permission checks, whatever its end (the Computer's outcome,
+  // offline, needs an upgrade, no answer in time). Never a command or a pid.
+  "computer.proc_job_stopped",
   // A person asking to delete their account unbound other people's agents from
   // their Computers (forceAgentIds, services/accountDeletion/requests.ts).
   // One record per server those agents are in, written with that server's id
@@ -320,6 +355,27 @@ const EVENT_METADATA_ALLOWLIST: Record<IntegrationAuditEventType, readonly strin
   "app.card_encryption_key_set": ["clientKey", "kid", "previousKid"],
   // reason: removed (by the App), registration_deleted (by the App), taken_over (system).
   "app.card_encryption_key_removed": ["clientKey", "kid", "reason"],
+  // reason: created_by_admin, vouched, backfill, legacy_no_creator (0732, an MCP App with no
+  // recorded creator) / unvouched, scope_widened. appName: an MCP App's.
+  "app.server_vouched": ["clientKey", "appName", "reason", "backfill"],
+  "app.server_unvouched": ["clientKey", "appName", "reason"],
+  // appId/appName: the MCP App; connectionId, ownerKind (shared | personal), ownerUserId (personal).
+  // connectionCreatedBy / byConnectionCreator: who added the Connection, and whether that is the
+  // actor (an admin pinning Agents to a shared Connection someone else added shows as false).
+  "mcp_connection.created": ["appId", "appName", "connectionId", "ownerKind", "ownerUserId", "authKind", ...SERVER_AUDIT_CONTEXT_KEYS],
+  "mcp_connection.signed_in": ["appId", "appName", "connectionId", "ownerKind", "ownerUserId", "authKind", ...SERVER_AUDIT_CONTEXT_KEYS],
+  // revokedBy: who deleted a member's own Connection, when not its owner; agentIds: the Agents it was given to.
+  "mcp_connection.deleted": ["appId", "appName", "connectionId", "ownerKind", "ownerUserId", "revokedBy", "wasServerDefault", "agentIds", ...SERVER_AUDIT_CONTEXT_KEYS],
+  "mcp_connection.signed_out": ["appId", "appName", "connectionId", "ownerKind", "ownerUserId", "revokedBy", ...SERVER_AUDIT_CONTEXT_KEYS],
+  // granted_by: who chose; added/removed: Agent ids; moved_from: [{ agentId, connectionId, ownerKind, ownerUserId }]
+  // for each added Agent that used another Connection's this way before; allAgents: the shared
+  // default set (true) or given up (false); via: agents_api | assignments | sign_in | default (PUT
+  // /apps/:appId/default) | api_key (an API-key Connection created as the default).
+  "mcp_connection.agents_changed": [
+    "appId", "appName", "connectionId", "ownerKind", "ownerUserId", "granted_by", "added", "removed", "moved_from",
+    "allAgents", "connectionCreatedBy", "byConnectionCreator", "via", ...SERVER_AUDIT_CONTEXT_KEYS,
+  ],
+  "mcp_connection.members_can_connect_changed": ["appId", "appName", "enabled", "previous", ...SERVER_AUDIT_CONTEXT_KEYS],
   "official_app.registry_created": ["clientKey", "publisherServerId", "revision", "autoInstall", "status", "purpose"],
   "official_app.registry_updated": ["clientKey", "publisherServerId", "revision", "autoInstall", "status", "purpose", "changedFields"],
   "official_app.registry_removed": ["clientKey", "publisherServerId", "revision", "autoInstall", "status", "purpose"],
@@ -337,8 +393,10 @@ const EVENT_METADATA_ALLOWLIST: Record<IntegrationAuditEventType, readonly strin
   "link_card.operation_first_send_expired": ["operationId", "actionId", "providerKind", "providerKey"],
   // A person answers an App's first-view link-preview prompt for themselves on
   // one Server (or turns previews back on or off). Never the message or URL.
-  "link_preview.consent_granted": ["clientKey", "consentSource", "removedDecline"],
-  "link_preview.declined": ["clientKey"],
+  // loginMode: "account" when the answer is for every Server (an account-mode
+  // App, RFC 079 D17); absent in server mode.
+  "link_preview.consent_granted": ["clientKey", "consentSource", "removedDecline", "loginMode"],
+  "link_preview.declined": ["clientKey", "loginMode"],
   "oauth.redirect_mismatch": ["clientKey", "errorCode"],
   "agent.jwt_issued": ["clientKey", "grantId", "jti", "expiresAt"],
   "app.agent_jwt_updated": ["clientKey", "enabled"],
@@ -399,14 +457,6 @@ const EVENT_METADATA_ALLOWLIST: Record<IntegrationAuditEventType, readonly strin
   "webhook.rotated": ["clientKey", "configRevision", "endpointOrigin", "previousValidUntil", "emergency"],
   "webhook.disabled": ["clientKey", "configRevision"],
   "managed_mcp.tool_invocation_admitted": ["toolName"],
-  "provider_connection.created": ["providerId", "configVersion", "credentialVersion", "status"],
-  "provider_connection.updated": ["changedFields", "configVersion", "enabled"],
-  "provider_connection.credential_rotated": ["configVersion", "credentialVersion", "status"],
-  "provider_connection.tested": ["configVersion", "credentialVersion", "status"],
-  "provider_connection.assignment_detached": ["providerId", "configVersion", "credentialVersion", "agentId", "reason"],
-  "provider_connection.probe_issued": ["probeId", "computerId", "runtime", "modelDigest", "configVersion", "credentialVersion", "probeKind"],
-  "provider_connection.probe_receipt": ["probeId", "computerId", "runtime", "modelDigest", "configVersion", "credentialVersion", "category", "latencyMs"],
-  "provider_connection.deleted": ["providerId", "configVersion", "credentialVersion"],
   "closed_server_purge.credential_revoke": ["credentialKind", "attempt", "failure", "gaveUp"],
   "agent_connection.connect_initiated": ["connectionProvider", "access", "connectorId", "actingRole", "scopes", "errorCode"],
   "agent_connection.confirmed": ["connectionProvider", "account", "connectorId", "errorCode"],
@@ -420,6 +470,10 @@ const EVENT_METADATA_ALLOWLIST: Record<IntegrationAuditEventType, readonly strin
   // Server-wide audit. Ids and roles only: never key material, prefixes or hashes.
   // Every server-wide type also takes SERVER_AUDIT_CONTEXT_KEYS (actorRole, operationId).
   "server.profile_updated": ["changedFields", "agentServerRole", ...SERVER_AUDIT_CONTEXT_KEYS],
+  "server.plan_changed": [
+    "serverSlug", "fromPlan", "toPlan", "planDowngradedAt", "reason",
+    "actorId", "actorName", "approvedBy", "approvalMessageId", "via",
+  ],
   "channel.visitor_visibility_changed": ["channelId", "visitorVisible", ...SERVER_AUDIT_CONTEXT_KEYS],
   "membership.role_changed": ["previousRole", "nextRole", ...SERVER_AUDIT_CONTEXT_KEYS],
   "membership.agent_role_changed": ["agentId", "previousRole", "nextRole", "grantedBy", ...SERVER_AUDIT_CONTEXT_KEYS],
@@ -475,6 +529,18 @@ const EVENT_METADATA_ALLOWLIST: Record<IntegrationAuditEventType, readonly strin
   // via: migrate_grant (a computer_migrate approval, with its grantId) / session.
   "computer.legacy_adopted_by_other": ["machineId", "machineName", "computerId", "computerName", "machineAddedByUserId", "via", "grantId", ...SERVER_AUDIT_CONTEXT_KEYS],
   "computer.revoke_unbound_others_agents": ["agentIds", "machineId", "computerId", "via", ...SERVER_AUDIT_CONTEXT_KEYS],
+  // provider: the runtime account (`claude`, `codex`); resetKind: the Claude reset spent (five_hour, weekly, fable, full);
+  // requestedKind: the one asked for when Claude's older program spent its 5-hour reset instead; via: redeem / read;
+  // answer: reset / already_redeemed / five_hour_spent (services/runtimeLimitResetUsedByOther.ts).
+  "computer.limit_reset_used_by_other": ["machineId", "machineName", "provider", "resetKind", "requestedKind", "via", "answer", ...SERVER_AUDIT_CONTEXT_KEYS],
+  // runtime: the sign-in id (`grok`, `qwen`, ...); result: the Computer's outcome kind (installed / already_installed /
+  // failed / unsupported / error) or the request's end without one (computer_timeout / computer_offline / request_failed);
+  // version (a plain release version), exitCode, reason (OAR's unsupported reason), errorCode (in_progress / internal).
+  "computer.runtime_install": ["machineId", "machineName", "runtime", "result", "version", "exitCode", "reason", "errorCode", ...SERVER_AUDIT_CONTEXT_KEYS],
+  // agentId, jobName (a `raft proc` name: letters, digits, - and _); result: the Computer's outcome (stopped /
+  // not_found / already_exited / failed) or the request's end without one (computer_offline /
+  // computer_upgrade_required / computer_timeout / request_failed).
+  "computer.proc_job_stopped": ["machineId", "machineName", "agentId", "jobName", "result", ...SERVER_AUDIT_CONTEXT_KEYS],
   // Ids only: the agents unbound in this server and the person's machines they were on.
   "account.deletion_unbound_others_agents": ["agentIds", "machineIds"],
   // Ids and the method only: never a secret, a TOTP code or a backup code.
@@ -532,6 +598,15 @@ const EVENT_CATEGORY: Record<IntegrationAuditEventType, IntegrationAuditEventCat
   "app.link_card_actions_off": "revocation",
   "app.card_encryption_key_set": "registration",
   "app.card_encryption_key_removed": "revocation",
+  "app.server_vouched": "membership",
+  "app.server_unvouched": "membership",
+  // Who acts as whom for this Server's agents: in the server audit owners and admins read, like the vouch.
+  "mcp_connection.created": "membership",
+  "mcp_connection.signed_in": "membership",
+  "mcp_connection.deleted": "membership",
+  "mcp_connection.signed_out": "membership",
+  "mcp_connection.agents_changed": "membership",
+  "mcp_connection.members_can_connect_changed": "membership",
   "official_app.registry_created": "registration",
   "official_app.registry_updated": "registration",
   "official_app.registry_removed": "revocation",
@@ -585,14 +660,6 @@ const EVENT_CATEGORY: Record<IntegrationAuditEventType, IntegrationAuditEventCat
   "webhook.rotated": "revocation",
   "webhook.disabled": "revocation",
   "managed_mcp.tool_invocation_admitted": "runtime",
-  "provider_connection.created": "registration",
-  "provider_connection.updated": "registration",
-  "provider_connection.credential_rotated": "revocation",
-  "provider_connection.tested": "runtime",
-  "provider_connection.assignment_detached": "revocation",
-  "provider_connection.probe_issued": "runtime",
-  "provider_connection.probe_receipt": "runtime",
-  "provider_connection.deleted": "revocation",
   "closed_server_purge.credential_revoke": "revocation",
   "agent_connection.connect_initiated": "scope",
   "agent_connection.confirmed": "scope",
@@ -607,6 +674,7 @@ const EVENT_CATEGORY: Record<IntegrationAuditEventType, IntegrationAuditEventCat
   "agent_runtime.approval_decided": "runtime",
   "agent_runtime.approval_ended": "runtime",
   "server.profile_updated": "server_profile",
+  "server.plan_changed": "server_profile",
   "channel.visitor_visibility_changed": "server_profile",
   "membership.role_changed": "membership",
   "membership.agent_role_changed": "membership",
@@ -631,6 +699,9 @@ const EVENT_CATEGORY: Record<IntegrationAuditEventType, IntegrationAuditEventCat
   "computer.revoke_unbound_others_agents": "computer",
   "computer.owner_changed": "computer",
   "computer.legacy_adopted_by_other": "computer",
+  "computer.limit_reset_used_by_other": "computer",
+  "computer.runtime_install": "computer",
+  "computer.proc_job_stopped": "computer",
   "account.deletion_unbound_others_agents": "computer",
   "account.second_factor_totp_confirmed": "account_security",
   "account.second_factor_enabled": "account_security",
@@ -668,6 +739,8 @@ const DIFF_ALLOWLIST = new Set([
   "returnUrl",
   "agentManifestUrl",
   "allowedScopes",
+  "agentTokenSigningAlg",
+  "agentTokenType",
   "category",
   "logoUrl",
   "enabled",
@@ -679,6 +752,7 @@ const DIFF_ALLOWLIST = new Set([
   "hideHumansFromMembers",
   "avatarChanged",
   "role",
+  "plan",
 ]);
 
 const CREDENTIAL_KEY_PATTERN = /(^|_)(authorization|bearer|client_secret|code|cookie|jwt|password|secret|token)(_|$)/i;
@@ -995,6 +1069,43 @@ export const SERVER_AUDIT_HIDDEN_EVENT_TYPES = [
   "channel.source_readmitted",
 ] as const satisfies readonly IntegrationAuditEventType[];
 
+/** What the owners' server audit page keeps of a `server.plan_changed` row (Tenny, #15250 follow-up). */
+const SERVER_PLAN_CHANGED_OWNER_METADATA_KEYS = ["fromPlan", "toPlan"] as const;
+
+/**
+ * A platform operator changed the plan through Feature Flag Admin
+ * (`server.plan_changed`, written by public.ffa_change_server_plan). Owners
+ * and admins see only that a platform admin changed it, from which plan to
+ * which, and when. The operator's reason, the approval it acted on
+ * (`approvedBy`, the approver's own words, and `approvalMessageId`) and the
+ * operator's identity (`actor_id`, `actorId`, `actorName`) stay
+ * platform-admin only (listIntegrationAuditEventsForAppAdmin returns the full
+ * row).
+ */
+export function projectServerPlanChangedForServerAudit<T extends {
+  eventType: string;
+  actorId: string | null;
+  metadata: Record<string, unknown>;
+}>(event: T): T & { summary?: { zh: string; en: string } } {
+  if (event.eventType !== "server.plan_changed") return event;
+  const source = event.metadata ?? {};
+  const metadata: Record<string, unknown> = { actorRole: "platform_admin" };
+  for (const key of SERVER_PLAN_CHANGED_OWNER_METADATA_KEYS) {
+    if (key in source) metadata[key] = source[key];
+  }
+  const from = String(source.fromPlan ?? "?");
+  const to = String(source.toPlan ?? "?");
+  return {
+    ...event,
+    actorId: null,
+    metadata,
+    summary: {
+      zh: `平台管理员把 plan 从 ${from} 改成 ${to}`,
+      en: `A platform admin changed the plan from ${from} to ${to}`,
+    },
+  };
+}
+
 /** A person or agent named by an event on the page, resolved at read time. */
 export interface ServerAuditPerson {
   type: "human" | "agent";
@@ -1010,7 +1121,9 @@ export interface ServerAuditPerson {
  * Newest-first audit events of one server, in the server-audit categories
  * only and none of SERVER_AUDIT_HIDDEN_EVENT_TYPES, for its owners and
  * admins. Keyset-paged on (created_at, id) DESC: `nextCursor` is null on
- * the last page. Request correlation stays internal:
+ * the last page. A `server.plan_changed` row is shown through
+ * projectServerPlanChangedForServerAudit (no approval text, no operator
+ * identity). Request correlation stays internal:
  * request ids are never returned and a metadata `requestIdHash` is stripped.
  * `people` resolves every human and agent the page names (actor, requester,
  * subject, target, metadata `agentId`), keyed `${type}:${id}`.
@@ -1054,6 +1167,9 @@ export async function listServerAuditEvents(serverId: string, options: {
       notInArray(integrationAuditEvents.eventType, [...SERVER_AUDIT_HIDDEN_EVENT_TYPES]),
       filters.actorType ? eq(integrationAuditEvents.actorType, filters.actorType) : undefined,
       filters.actorId ? eq(integrationAuditEvents.actorId, filters.actorId) : undefined,
+      // The operator behind a server.plan_changed is not shown to owners, so
+      // an actor filter must not reveal it either.
+      filters.actorId ? ne(integrationAuditEvents.eventType, "server.plan_changed") : undefined,
       filters.since ? sql`${integrationAuditEvents.createdAt} >= ${filters.since}::timestamptz` : undefined,
       filters.until ? sql`${integrationAuditEvents.createdAt} < ${filters.until}::timestamptz` : undefined,
       options.cursor
@@ -1064,7 +1180,8 @@ export async function listServerAuditEvents(serverId: string, options: {
     .limit(limit + 1);
   const page = rows.slice(0, limit);
   const last = page[page.length - 1];
-  const events = page.map(({ cursorCreatedAt: _cursor, ...row }) => ({ ...row, metadata: stripRequestIdHash(row.metadata) }));
+  const events = page.map(({ cursorCreatedAt: _cursor, ...row }) =>
+    projectServerPlanChangedForServerAudit({ ...row, metadata: stripRequestIdHash(row.metadata) }));
   return {
     events,
     nextCursor: rows.length > limit && last ? encodeServerAuditCursor({ createdAt: last.cursorCreatedAt, id: last.id }) : null,

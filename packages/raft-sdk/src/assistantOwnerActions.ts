@@ -1,3 +1,4 @@
+import { fetchWithoutRedirect } from "@botiverse/raft-shared/src/fetchWithoutRedirect";
 import type { AgentApiClient } from "@botiverse/raft-shared/src/agentApiClient";
 import type { AgentApiAssistantOwnerAction } from "@botiverse/raft-shared/src/agentApiContract";
 
@@ -255,12 +256,11 @@ export function createRaftAssistantOwnerActions(deps: Deps): RaftAssistantOwnerA
       let response: Response;
       try {
         const search = query.toString();
-        response = await deps.fetch(`${deps.serverUrl}${path}${search ? `?${search}` : ""}`, {
+        response = await fetchWithoutRedirect(deps.fetch, `${deps.serverUrl}${path}${search ? `?${search}` : ""}`, {
           method: action.method,
           headers: { ...deps.headers, authorization: deps.authorization, "content-type": "application/json", "x-server-id": context.serverId },
           ...(action.method === "GET" ? {} : { body: JSON.stringify(body) }),
           cache: "no-store",
-          redirect: "error",
         });
       } catch {
         return fail("TRANSPORT_ERROR", `Couldn't reach Raft to run ${tool}. Try again.`);

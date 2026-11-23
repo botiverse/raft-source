@@ -120,13 +120,14 @@ export function SidebarTopBar({ mobileInline, hideTitle, data, view, sync, home 
         </SidebarHeader>
       )}
 
-      {/* Task #164: the unread counts may be the last known ones; say so
-          once under the head: Home's bar on a phone, the sidebar head on a
-          desktop (behind SHOW_STALE_COUNTS_NOTICE_IN_DESKTOP_SIDEBAR). */}
+      {/* Task #164: the unread counts may be the last known ones; they
+          update silently. Only reads that cannot catch up on their own
+          (RisingWave not configured) say so, once under the head: Home's bar
+          on a phone, the sidebar head on a desktop (behind
+          SHOW_STALE_COUNTS_NOTICE_IN_DESKTOP_SIDEBAR). */}
       {railMode === "chat" && !isServerPushedPage && (mobileInline || SHOW_STALE_COUNTS_NOTICE_IN_DESKTOP_SIDEBAR) && (
         <StaleCountsNotice
           surfaces={UNREAD_COUNT_SURFACES}
-          messageId="layout.sidebar.staleCountsNotice"
           unavailableMessageId="layout.sidebar.countsUnavailableNotice"
           data-testid="sidebar-stale-notice"
         />

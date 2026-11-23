@@ -1,0 +1,12 @@
+{
+  "protocolVersion": 1,
+  "runtimeId": "kitchen-sink-choices",
+  "schemaVersion": "kitchen-sink-choices.create.v1",
+  "sourceId": "selectUnavailableOptional",
+  "kind": "select",
+  "pointer": "/selectUnavailableOptional",
+  "options": [],
+  "status": "unavailable",
+  "reason": "unsupported",
+  "retryable": false
+}

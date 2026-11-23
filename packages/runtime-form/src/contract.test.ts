@@ -217,7 +217,7 @@ const BATCH_3B_FORMS: Record<string, string[]> = {
   "cursor.edit.json": ["select.custom_value"],
   // Copilot CLI is deprecated: edit-only, so it ships an edit fixture and no create form.
   "copilot.edit.json": ["select.custom_value"],
-  // Antigravity (catalog-deprecated, revived on the OAR host): the same live-list form.
+  // Antigravity: the same live-list form.
   "antigravity.edit.json": ["select.custom_value"],
 };
 // Forms with a reasoning effort, whose choices carry labels.
@@ -306,7 +306,7 @@ const V3_SOURCES = [
   "builtin.option-source.provider.saved-connections.v3.json", "codex.option-source.reasoning-effort.v3.json",
   "claude.option-source.reasoning-effort.v3.json", "kimi-sdk.option-source.reasoning-effort.v3.json",
   "pi.option-source.reasoning-effort.v3.json", "pi.option-source.provider-reasoning-effort.v3.json",
-  "antigravity.option-source.reasoning-effort.v3.json",
+  "antigravity.option-source.reasoning-effort.v3.json", "codex.option-source.speed.v3.json",
 ];
 
 test("v3 fixtures conform to the contract and parse as protocol 3 with nothing unsupported", () => {
@@ -333,7 +333,9 @@ test("v3 fixtures conform to the contract and parse as protocol 3 with nothing u
     assert.equal(violation(body, { $ref: "#/$defs/OptionSource" }, name), null);
     for (const option of (body.options ?? []) as Array<Record<string, unknown>>) assert.equal("unavailable" in option, false, `${name}: ${String(option.value)}`);
     for (const options of Object.values((body.optionsByValue ?? {}) as Record<string, Array<{ value: string; label: string }>>)) {
-      assert.deepEqual(options[0], { value: "", label: "Default" }, `${name}: the server-sent Default comes first`);
+      // An effort's "" is the server-sent Default; Codex speed's "" is Standard (default speed).
+      if (name.includes("reasoning-effort")) assert.deepEqual(options[0], { value: "", label: "Default" }, `${name}: the server-sent Default comes first`);
+      else assert.equal(options[0]?.value, "", `${name}: "" comes first`);
     }
   }
 });

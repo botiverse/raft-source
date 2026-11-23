@@ -1,0 +1,23 @@
+{
+  "formatVersion": 1,
+  "id": "sync_upsert_equal_position_replaces",
+  "rule": "sync_inbox_row",
+  "title": "An inbox_row upsert at the held row's position replaces it, but what it counts at or below the row's read seq stays read",
+  "why": "An inbox_row upsert is a GET /api/channels/inbox?ids= answer delivered by the sync pull, applied through the same merge: an equal position is a newer answer of the same row (a read, a Done or a follow change moves no position) and replaces it. The merge keeps the higher read seq (the row's and the answer's), so an upsert computed before a read that reached the client first does not bring that unread back (Tenny, #triage:#244).",
+  "status": "agreed",
+  "sources": {
+    "web": ["packages/shared/src/activityRowPosition.ts (applySyncInboxRowChange, mergeAnswer: readSeq)"],
+    "server": ["packages/server/src/services/syncInboxRows.ts (row = the ?ids= answer, rebuilt per pull)"]
+  },
+  "given": { "row": { "unreadCount": 1, "hasMention": false, "position": "100", "mentionOnly": false } },
+  "steps": [
+    { "act": "answer", "row": { "unreadCount": 2, "hasMention": true, "position": "100", "mentionOnly": false } },
+    { "act": "read", "seq": "100" },
+    { "act": "answer", "row": { "unreadCount": 2, "hasMention": true, "position": "100", "mentionOnly": false, "readSeq": "99" } }
+  ],
+  "checkpoints": [
+    { "afterStep": 1, "row": { "unreadCount": 2, "hasMention": true, "position": "100" }, "reread": false },
+    { "afterStep": 2, "row": { "unreadCount": 0, "hasMention": false, "position": "100" }, "reread": false }
+  ],
+  "expect": { "row": { "unreadCount": 0, "hasMention": false, "position": "100", "mentionOnly": false }, "reread": false }
+}

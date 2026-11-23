@@ -6,6 +6,7 @@ import { channels, jointChannels, jointChannelServers, tasks, threadFollows } fr
 import { UUID_RE } from "../lib/messageId";
 import { withChannelWriterFence } from "./channelConversionFenceService";
 import { getActiveJointChannelProjectionsByLocalChannel } from "./channelService";
+import { onlineMoveCanonicalForRoot } from "./channelConversionReadScope";
 import { isTaskV2ConversationsEnabled } from "./taskConversationsGate";
 import { pendingTaskConversationFollowerSql, taskUsesOwnConversation } from "./taskV2Mode";
 
@@ -35,9 +36,10 @@ import { pendingTaskConversationFollowerSql, taskUsesOwnConversation } from "./t
  *
  * Who follows (spec §4): when the conversation is created, the task's creator
  * (reason `authored`) and its current assignee (`assigned`), in the creating
- * transaction; later an assignee (`assigned`; self-claim too), anyone who
- * replies or is @mentioned (send path), manual follow. The source message's
- * author gets nothing.
+ * transaction, plus for a pre-v2 task whoever still follows its host
+ * message's thread (carryHostThreadFollowsInTransaction); later an assignee
+ * (`assigned`; self-claim too), anyone who replies or is @mentioned (send
+ * path), manual follow. The source message's author gets nothing.
  */
 
 export function taskConversationChannelName(taskId: string): string {
@@ -75,9 +77,21 @@ export async function createTaskConversationsInTransaction(
 ): Promise<Map<string, CreatedTaskConversation>> {
   const created = new Map<string, CreatedTaskConversation>();
   if (input.tasks.length === 0) return created;
-  const jointProjections = await getActiveJointChannelProjectionsByLocalChannel(input.storageChannel.id, tx);
+  // An ordinary root in an online move (channel_conversion_online_move_v1):
+  // its not yet moved tasks' conversations start in the shape the move's
+  // start gave the existing ones: canonical under its canonical channel, the
+  // host's local face under the root. The caller's writer fence (shared
+  // conversion lock) keeps the start and the cancel out meanwhile.
+  const onlineCanonicalId = input.storageChannel.type === "channel" || input.storageChannel.type === "private"
+    ? await onlineMoveCanonicalForRoot(tx, input.storageChannel.id)
+    : null;
+  const onlineCanonical = onlineCanonicalId
+    ? (await tx.select({ id: channels.id, serverId: channels.serverId, type: channels.type }).from(channels).where(eq(channels.id, onlineCanonicalId)).limit(1))[0]
+    : undefined;
+  const storageChannel = onlineCanonical ?? input.storageChannel;
+  const jointProjections = await getActiveJointChannelProjectionsByLocalChannel(storageChannel.id, tx);
   const isJointStorage = jointProjections.length > 0
-    && jointProjections.every((projection) => projection.localChannelId !== input.storageChannel.id);
+    && jointProjections.every((projection) => projection.localChannelId !== storageChannel.id);
 
   const existing = await tx
     .select({ id: tasks.id, conversationChannelId: tasks.conversationChannelId })
@@ -97,7 +111,7 @@ export async function createTaskConversationsInTransaction(
     const canonicalId = randomUUID();
     await tx.insert(channels).values({
       id: canonicalId,
-      serverId: input.storageChannel.serverId,
+      serverId: storageChannel.serverId,
       name: taskConversationChannelName(task.id),
       type: "task",
       taskId: task.id,
@@ -106,7 +120,7 @@ export async function createTaskConversationsInTransaction(
       // same value when it is left NULL, but schema-pushed dev databases
       // (raftdev) have no trigger, and a NULL parent makes the conversation
       // unreachable (no access, no listings).
-      parentChannelId: task.channelId,
+      parentChannelId: onlineCanonical && task.channelId === input.storageChannel.id ? onlineCanonical.id : task.channelId,
     });
     await tx.update(tasks).set({ conversationChannelId: canonicalId }).where(eq(tasks.id, task.id));
 
@@ -130,7 +144,7 @@ export async function createTaskConversationsInTransaction(
         localByServer.set(projection.serverId, { localChannelId: local.localChannelId, localParentChannelId: projection.localChannelId });
       }
     } else {
-      localByServer.set(input.storageChannel.serverId, { localChannelId: canonicalId, localParentChannelId: input.storageChannel.id });
+      localByServer.set(storageChannel.serverId, { localChannelId: canonicalId, localParentChannelId: storageChannel.id });
     }
     created.set(task.id, { taskId: task.id, canonicalChannelId: canonicalId, jointChannelId, localByServer });
   }
@@ -498,6 +512,82 @@ export async function insertTaskConversationCreationFollows(
 }
 
 /**
+ * A pre-v2 task's conversation inherits its host message thread's followers
+ * (#wg-task-v2:#27): whoever still follows that thread (the person who asked,
+ * anyone who replied there) keeps getting the task's discussion when it moves
+ * into the new conversation. Written in the transaction that creates the
+ * conversation, after the creator / assignee follows, which win (insert only).
+ * An explicit unfollow of the thread is not carried; a thread marked Done
+ * carries as an ordinary follow (the conversation is new) with its explicit
+ * notification level. `saved` follows stay on the thread with the saved
+ * message. Joint: each follower lands on the conversation of the server whose
+ * thread projection they followed.
+ */
+export async function carryHostThreadFollowsInTransaction(
+  tx: DatabaseExecutor,
+  conversation: CreatedTaskConversation,
+  hostMessageId: string,
+): Promise<number> {
+  const [canonicalThread] = await tx
+    .select({ id: channels.id, serverId: channels.serverId })
+    .from(channels)
+    .where(and(eq(channels.parentMessageId, hostMessageId), eq(channels.type, "thread"), isNull(channels.deletedAt)))
+    .limit(1);
+  if (!canonicalThread) return 0;
+  const serverByThread = new Map<string, string>([[canonicalThread.id, canonicalThread.serverId]]);
+  const projections = await tx
+    .select({ localChannelId: jointChannelServers.localChannelId, serverId: jointChannelServers.serverId })
+    .from(jointChannels)
+    .innerJoin(jointChannelServers, eq(jointChannelServers.jointChannelId, jointChannels.id))
+    .where(and(
+      eq(jointChannels.canonicalChannelId, canonicalThread.id),
+      eq(jointChannels.status, "active"),
+      eq(jointChannelServers.status, "active"),
+    ));
+  for (const projection of projections) {
+    if (projection.localChannelId) serverByThread.set(projection.localChannelId, projection.serverId);
+  }
+  const follows = await tx
+    .select({
+      threadChannelId: threadFollows.threadChannelId,
+      followerType: threadFollows.followerType,
+      followerId: threadFollows.followerId,
+      reason: threadFollows.reason,
+      notificationLevel: threadFollows.notificationLevel,
+    })
+    .from(threadFollows)
+    .where(and(
+      inArray(threadFollows.threadChannelId, [...serverByThread.keys()]),
+      isNull(threadFollows.unfollowedAt),
+    ));
+  let carried = 0;
+  for (const follow of follows) {
+    if (follow.reason === "saved") continue;
+    const follower: TaskConversationActor = { type: follow.followerType, id: follow.followerId };
+    const local = conversation.localByServer.get(serverByThread.get(follow.threadChannelId)!)?.localChannelId
+      ?? await resolveFollowerLocalTaskConversation(conversation, follower, { executor: tx });
+    if (!local) continue;
+    const inserted = await tx
+      .insert(threadFollows)
+      .values({
+        threadChannelId: local,
+        followerType: follower.type,
+        followerId: follower.id,
+        parentMessageId: null,
+        parentTaskId: conversation.taskId,
+        reason: follow.reason,
+        doneAt: null,
+        unfollowedAt: null,
+        notificationLevel: follow.notificationLevel,
+      })
+      .onConflictDoNothing()
+      .returning({ threadChannelId: threadFollows.threadChannelId });
+    carried += inserted.length;
+  }
+  return carried;
+}
+
+/**
  * Lazy conversation (no backfill): the first write (reply, lifecycle line,
  * follow) creates it, and the task's creator and assignee follow it from then
  * on. Per-task mode (./taskV2Mode): a task created the v2 way
@@ -542,6 +632,10 @@ export async function ensureTaskConversation(
     const conversation = created.get(task.id);
     if (!conversation) return null;
     await insertTaskConversationCreationFollows(tx, conversation, task, initiatingServerId);
+    // A pre-v2 task: its discussion so far is its host message's thread.
+    if (!task.ownConversation && task.messageId) {
+      await carryHostThreadFollowsInTransaction(tx, conversation, task.messageId);
+    }
     return { conversation, created: true };
   };
   return opts.executor ? write(opts.executor) : withChannelWriterFence(observed.task.channelId, write);

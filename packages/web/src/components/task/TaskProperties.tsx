@@ -20,6 +20,7 @@ import { TaskAssigneeAvatar, TaskAssigneeLabel } from "./TaskAssignee";
 import { TaskBacklogReasonPopover } from "./TaskBacklogReasonPopover";
 import { TaskHandoffReasonPanel } from "./TaskHandoffReasonPanel";
 
+import { useCanWriteTaskChannel } from "./taskChannelWrite";
 import { STATUS_STYLES, canEditTaskStatus, getTaskStatusOptions, toRuiTaskStatus } from "./taskStatusUi";
 import { StatusBadge } from "./StatusBadge";
 import { dedupeTaskAssigneeMembers } from "./taskAssigneeCandidates";
@@ -103,12 +104,15 @@ export default function TaskProperties({ task, sourceRow, trailingRows, assignee
   );
 
   const canManageServer = capabilities.deleteAnyTask;
-  const canEditStatus = canEditTaskStatus(task, currentUser?.id, canManageServer);
+  // Someone reading a public channel they have not joined sees its tasks; the
+  // server refuses their writes, so status and assignee are read-only for them.
+  const canWriteChannel = useCanWriteTaskChannel(task.channelId);
+  const canEditStatus = canEditTaskStatus(task, currentUser?.id, canManageServer, canWriteChannel);
   // Completed tasks are immutable by contract: the server freezes their
   // assignee so the completion record remains historically accurate. Keep the
   // control read-only here too, instead of showing a picker that can only fail
   // with `task is done` after the user makes a selection.
-  const canEditAssignee = task.status !== "done" && authorizeTaskAction({ action: "assign", canReadChannel: true, canWriteChannel: true, readOnlyReason: task.readOnlyReason });
+  const canEditAssignee = task.status !== "done" && authorizeTaskAction({ action: "assign", canReadChannel: true, canWriteChannel, readOnlyReason: task.readOnlyReason });
   const assigneeReadOnlyTitle = task.readOnlyReason
     ? formatMessage({ id: "task.permissions.historicalJoint" })
     : task.status === "done"

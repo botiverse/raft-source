@@ -18,6 +18,9 @@
  *   and an optional `  latest @x: "<JSON string>" (preview; …)` line; and
  *   RFC 081's rows (`inboxRowV2`), which read alongside: contexts recorded
  *   before keep the old ones.
+ * - `[Raft inbox notice: <header>` … a line `]` (formatAgentInboxNotice in
+ *   inboxNotice.ts; `inboxWithHeader`): the opener itself says why the notice
+ *   came, the rows follow, and nothing follows the bracket.
  * - `[Raft task notice: N tasks are waiting on you.` … `No change → no reply
  *   needed.]` (formatIdleTaskReminderNotice in
  *   packages/shared/src/agentText/idleTaskReminder.ts), one task per line:
@@ -48,7 +51,15 @@ type Range = { start: number; end: number };
 
 export type RaftNoticeSegment = Range & (
   | { kind: "text" }
-  | { kind: "inbox"; pendingTotal: number | null; targets: RaftInboxTarget[] }
+  | {
+    kind: "inbox";
+    pendingTotal: number | null;
+    targets: RaftInboxTarget[];
+    /** Only a notice whose opener carries its header: why it came (`idle`: nothing new). */
+    reason?: "new" | "away" | "idle";
+    /** Its `Older unread:` line, null when it has none. */
+    older?: { messages: number; targets: number } | null;
+  }
   | { kind: "task"; count: number | null; tasks: RaftTaskItem[] }
   | {
     kind: "message";
@@ -145,13 +156,16 @@ const INBOX_ROW = /^(\S.*?) {2}pending: (\d+) messages?(.*)$/;
 const INBOX_PREVIEW = /^ {2}latest(?: @([^:]+))?: ("(?:[^"\\]|\\.)*")/;
 /**
  * RFC 081 rows (#13788, behind its flag): `<target> · <part> · <part>…`, parts
- * in order and only when present: `N unread`, `first msg=<8>`, `mentions you`
- * / `mentions you Nx`, `N new, not yet delivered`, `N suppressed (not
- * delivered)`, `latest @x`, `attention_hint=<json>`; a task's target reads
- * `task #ch:#7`; the third-party row `Third-party app events · N pending · …`,
- * with inbox items on `… · N not in this list · …` (#13807).
- * Under a row: `  "<JSON>" (preview)` / `(truncated preview)`, `  read: …`, and
- * an indented `[Raft notice: …]` for a non-member mention.
+ * in order and only when present: `N unread`, `mentions you` / `mentions you
+ * Nx`, `N new, not yet delivered`, `latest @x` (contexts recorded before
+ * 2026-11-20 also carry `first msg=<8>`, `N suppressed (not delivered)` and
+ * `attention_hint=<json>`, which read as parts that count for nothing); a
+ * task's target reads `task #ch:#7`; the third-party row `Third-party app
+ * events · N pending · …`, with inbox items on `… · N not in this list · …`
+ * (#13807).
+ * Under a row: `  "<JSON>" (preview)` / `(truncated preview)`, `  read: …`,
+ * `  hint: …` (an attention hint) and an indented `[Raft notice: …]` for a
+ * non-member mention.
  */
 const INBOX_ROW_V2 = /^(\S[^·]*?) · (.+)$/;
 const INBOX_PREVIEW_V2 = /^ {2}("(?:[^"\\]|\\.)*") \((?:truncated )?preview\)/;
@@ -170,7 +184,7 @@ function inboxRowV2(line: string): RaftInboxTarget | null {
   const latest = parts.map((part) => /^latest @(\S+)$/.exec(part)?.[1]).find((sender) => sender !== undefined);
   return {
     target: row[1]!.replace(/^task /, ""),
-    pending: count(/^(\d+) unread$/) ?? count(/^(\d+) new, not yet delivered$/) ?? count(/^(\d+) pending$/) ?? count(/^(\d+) not in this list$/),
+    pending: count(/^(\d+) unread$/) ?? count(/^(\d+) new, not yet delivered$/) ?? count(/^(\d+) pending$/) ?? count(/^(\d+) not in this list$/) ?? count(/^(\d+) messages? below$/),
     latestSender: latest ?? null,
     preview: null,
     mentioned: parts.some((part) => /^mentions you(?: \d+x)?$/.test(part)),
@@ -186,8 +200,70 @@ function unquote(value: string): string | null {
   }
 }
 
+/**
+ * The opener of a notice that carries its header (formatAgentInboxNotice):
+ * `[Raft inbox notice: new since your last notice, in 2 targets`,
+ * `… unread from while you were away, in 1 target`, and
+ * `… nothing new[, N task(s) waiting on you][, K reminder(s) not acked]`.
+ */
+const INBOX_OPENER = /^\[Raft inbox notice: (?:(new since your last notice|unread from while you were away), in \d+ targets?|nothing new(?:, \d+ tasks? waiting on you)?(?:, \d+ reminders? not acked)?)$/;
+const INBOX_OLDER = /^Older unread: (\d+) messages? in (\d+) targets?\./;
+
+/**
+ * A notice whose opener carries its header. Up to the first blank line every
+ * line that starts at column 0 is a row, with or without ` · ` parts (a row
+ * the Server gave no number for is its label alone), and the indented lines
+ * under it are its details: the preview is read, the rest (`read:`, `hint:`,
+ * a message printed under its row) only stays inside the notice. After a
+ * blank line comes the Computer's own app items section, read as before (a
+ * line with ` · ` parts is a row). The notice ends at its `]` line.
+ */
+function inboxWithHeader(scan: Scan, index: number, opener: RegExpExecArray): Found {
+  const { lines } = scan;
+  const limit = noticeLimit(scan, index);
+  let close = -1;
+  for (let at = index + 1; at <= limit; at++) {
+    if (lines[at]!.text === "]") {
+      close = at;
+      break;
+    }
+  }
+  if (close === -1) return generic(scan, index);
+  const targets: RaftInboxTarget[] = [];
+  let older: { messages: number; targets: number } | null = null;
+  let localSection = false;
+  // The row the indented lines belong to; none under an app item that is not read as a row.
+  let current: RaftInboxTarget | null = null;
+  for (let at = index + 1; at < close; at++) {
+    const text = lines[at]!.text;
+    if (text.trim() === "") {
+      localSection = true;
+      continue;
+    }
+    if (text.startsWith(" ")) {
+      const preview = current ? INBOX_PREVIEW_V2.exec(text) : null;
+      if (preview && current) current.preview = unquote(preview[1]!);
+      continue;
+    }
+    const olderLine = INBOX_OLDER.exec(text);
+    if (olderLine) {
+      older = { messages: Number(olderLine[1]), targets: Number(olderLine[2]) };
+      continue;
+    }
+    current = inboxRowV2(text) ?? (localSection ? null : { target: text.replace(/^task /, ""), pending: null, latestSender: null, preview: null, mentioned: false });
+    if (current) targets.push(current);
+  }
+  const reason = opener[1] === undefined ? "idle" : opener[1].startsWith("new") ? "new" : "away";
+  return {
+    segment: { kind: "inbox", pendingTotal: null, targets, reason, older, start: lines[index]!.start, end: lineEnd(lines[close]!) },
+    next: close + 1,
+  };
+}
+
 function inbox(scan: Scan, index: number): Found {
   const { lines } = scan;
+  const opener = INBOX_OPENER.exec(lines[index]!.text);
+  if (opener) return inboxWithHeader(scan, index, opener);
   const limit = noticeLimit(scan, index);
   let close = -1;
   for (let at = index + 1; at <= limit; at++) {

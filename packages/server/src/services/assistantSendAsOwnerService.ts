@@ -36,6 +36,7 @@ import { agents, attachmentProjectionRevocations, attachments, externalChannelBi
 export const DELEGATED_RETRACT_REVOKE_REASON = "delegated_message_retracted";
 import type { AgentOrchestrator } from "./agentOrchestrator";
 import * as channelService from "./channelService";
+import { onlineMovePairForChannel } from "./channelConversionReadScope";
 import * as messageService from "./messageService";
 import * as userService from "./userService";
 import { assistantReadsOwnerDms, dmScopeOf, OWNER_RESOLVE_AMBIGUOUS_CODE, resolveNameForOwner } from "./assistantService";
@@ -45,6 +46,8 @@ import { recordIntegrationAuditEventBestEffort } from "./integrationAuditService
 import { clearActionCardSubmittedInput, emitActionCardMessageUpdated } from "./actionCardsService";
 import { recordTraceEvent } from "../tracing/semanticTrace";
 import { removeAttachmentObjectHoldsWithExecutor } from "./attachmentObjectHoldService";
+import { logInboxRowChanged } from "./messageChangeLog";
+import { deleteMessageReferences } from "./messageReferences";
 import { asServerId, DELEGATED_RECEIPT_KIND, isMessageCardMetadata, type DelegatedReceiptEntry, type DelegatedReceiptMetadata } from "@botiverse/raft-shared";
 
 export const ASSISTANT_SEND_AS_OWNER_MAX_LENGTH = 32_000;
@@ -469,7 +472,16 @@ export async function retractDelegatedMessage(input: {
   messageId: string;
 }): Promise<{ messageId: string; deletedAt: string }> {
   const [row] = await getDb().select().from(messages).where(eq(messages.id, input.messageId)).limit(1);
-  const channel = row ? await channelService.getChannel(row.channelId) : null;
+  const storedIn = row ? await channelService.getChannel(row.channelId) : null;
+  // A message sent during an online move (channel_conversion_online_move_v1)
+  // is stored in the move's canonical channel, on the joint storage server:
+  // it belongs to the root it was sent to (the source, on this server).
+  const onlineMove = storedIn && storedIn.serverId !== input.serverId
+    ? await onlineMovePairForChannel(getDb(), storedIn.id)
+    : null;
+  const channel = onlineMove && onlineMove.canonicalChannelId === storedIn?.id
+    ? await channelService.getChannel(onlineMove.sourceChannelId)
+    : storedIn;
   // RFC 082: a card message's text changes only through its sender's card
   // update; a retraction (which rewrites the content) leaves a message card
   // alone. A delegated message is a person's, never a card: this only holds
@@ -499,6 +511,16 @@ export async function retractDelegatedMessage(input: {
       .where(and(eq(messages.id, row.id), isNull(messages.deletedAt)))
       .returning({ id: messages.id });
     if (!updated) return [];
+    // Its links to first-party objects go with its text (object_references,
+    // #proj-workspace:#336), in this transaction: a write of them still to
+    // come finds the message retracted and writes nothing
+    // (services/messageReferences.ts). No query when its text had no address
+    // on Raft's hosts (it has no rows).
+    await deleteMessageReferences(tx, row.id, row.content);
+    // Activity rows showing it (its preview) changed: incremental sync's inbox_row
+    // capability rebuilds them (logged here so a rollback logs nothing; the
+    // realtime update goes after the commit, below).
+    await logInboxRowChanged(tx, { channelId: row.channelId });
     // Its attachments go with it (task #6): every projection is revoked in the same
     // transaction, so no list, preview or download shows them again, and each
     // releases its hold on the bytes (attachment_object_holds). Bytes with no

@@ -6,7 +6,7 @@ import { AgentComputerOfflineStatusLink } from "../agent/AgentComputerOfflineSta
 import { formatRuntimeLabelWithStatus } from "../../utils/runtimeAvailabilityLabel";
 import { useRuntimeDeprecatedHere } from "../../hooks/useServerRuntimeCatalog";
 import { useIntl } from "react-intl";
-import { isExternalAgentRuntime, REASONING_EFFORT_RUNTIMES, runtimeConfigModelValue } from "@botiverse/raft-shared";
+import { isExternalAgentRuntime, runtimeConfigModelValue } from "@botiverse/raft-shared";
 import { useAgentDisplayState, useAgentStore } from "../../store/agentStore";
 import type { Agent } from "../../store/agentStore";
 import { useMachineStore } from "../../store/machineStore";
@@ -19,6 +19,8 @@ import { useAuthStore } from "../../store/authStore";
 import { canViewAgentPrivateSurfaces } from "../../utils/agentVisibility";
 import { formatAgentDisplayStateText } from "../../utils/activity";
 import { hydrateRuntimeConfigForm } from "../../utils/runtimeConfigForm";
+import { reasoningEffortDisplayLabel } from "../../utils/reasoningEffortOptions";
+import { useModelLabelCatalog } from "../../store/modelLabelCatalogStore";
 import { projectRuntimeModelLabelPresentation, useRuntimeModels } from "../../hooks/useRuntimeModels";
 import AvatarSlot from "../ui/AvatarSlot";
 import StatusDot from "../ui/StatusDot";
@@ -140,6 +142,9 @@ export default function ProfilePreviewCardContent({ mentionType, mentionId, fall
   // Passive surface: share one probe across hovers and reuse a recent live
   // catalog instead of making the Computer run the runtime's CLI on every hover.
   const runtimeModels = useRuntimeModels(profileAgent?.machineId, runtimeConfig?.runtime ?? "", { reuseRecentMs: 60_000 });
+  // The label below reads the shared model-label catalog synchronously; subscribe
+  // so a catalog reload (after a live detect) re-renders it (#triage:#548).
+  useModelLabelCatalog();
 
   useEffect(() => {
     if (!canViewPrivateAgentSurfaces || mentionType !== "agent" || trajectoryLog !== undefined) return;
@@ -238,9 +243,8 @@ export default function ProfilePreviewCardContent({ mentionType, mentionId, fall
       const modelLabel = modelPresentation.kind === "pending"
         ? formatMessage({ id: "common.loading" })
         : modelPresentation.label;
-      const reasoningLabel = REASONING_EFFORT_RUNTIMES.has(runtimeId)
-        ? runtimeConfig?.reasoningEffort || formatMessage({ id: "message.profilePreview.reasoningDefault" })
-        : null;
+      // Labelled as the profile's Reasoning row labels it ("Extra high", a runtime's own level as-is).
+      const reasoningLabel = reasoningEffortDisplayLabel({ runtime: runtimeId, reasoningEffort: runtimeConfig?.reasoningEffort }, formatMessage);
       const isExternalAgent = profileAgent.external === true || isExternalAgentRuntime(runtimeId);
       const computerLabel = isExternalAgent
         ? formatMessage({ id: "message.profilePreview.externalRuntime" })
@@ -313,7 +317,7 @@ export default function ProfilePreviewCardContent({ mentionType, mentionId, fall
                 {reasoningLabel ? (
                   <>
                     <dt className="text-caption text-foreground-hint">{formatMessage({ id: "message.profilePreview.labelReasoning" })}</dt>
-                    <Tooltip content={reasoningLabel}><dd className="min-w-0 truncate font-mono text-mono-meta capitalize text-foreground-muted">{reasoningLabel}</dd></Tooltip>
+                    <Tooltip content={reasoningLabel}><dd className="min-w-0 truncate font-mono text-mono-meta text-foreground-muted">{reasoningLabel}</dd></Tooltip>
                   </>
                 ) : null}
               </dl></> : null}

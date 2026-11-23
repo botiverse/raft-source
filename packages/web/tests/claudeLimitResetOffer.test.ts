@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import { claudeLimitResetOffer } from "../src/features/computer/claudeLimitResetOffer";
 
 // What the usage card offers about Claude limit resets (#triage:#373): a
-// person who cannot use them may still read the list where the server lets
-// them; where they could do nothing at all they get no entry, not a button
-// beside a note explaining why it leads nowhere.
+// person the server says cannot use them (an owner or admin, on an older
+// server that kept them to the person who connected the Computer) may still
+// read the list; where they could do nothing at all they get no entry, not a
+// button beside a note explaining why it leads nowhere. The current server
+// lets everyone it sends them to use them.
 
 const CONNECTED = { canUse: true, canConsent: true };
 const NOT_CONNECTED = { canUse: false, canConsent: false };
@@ -20,16 +22,16 @@ const offer = (over: Partial<Offer> = {}) => claudeLimitResetOffer({
   ...over,
 });
 
-test("the person who connected the Computer is offered its Claude limit resets", () => {
+test("a viewer the server lets use them (the person who connected the Computer, an owner or admin) is offered its Claude limit resets", () => {
   assert.equal(offer(), "ok");
   assert.equal(offer({ atFiveHourLimit: true }), "ok");
 });
 
-test("an owner or admin who did not connect the Computer can only view the list, where the read needs no consent", () => {
+test("a viewer an older server says cannot use them can only view the list, where the read needs no consent", () => {
   assert.equal(offer({ authView: { claudeLimitResets: "ok", claudeLimitResetAccess: NOT_CONNECTED } }), "view_only");
 });
 
-test("an owner or admin who did not connect the Computer gets no entry at the 5-hour limit, where the read needs consent", () => {
+test("a viewer an older server says cannot use them gets no entry at the 5-hour limit, where the read needs consent", () => {
   assert.equal(offer({ atFiveHourLimit: true, authView: { claudeLimitResets: "ok", claudeLimitResetAccess: NOT_CONNECTED } }), null);
 });
 

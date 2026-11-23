@@ -556,7 +556,7 @@ test("monthly file upload quota: a Free server without room is refused FILE_UPLO
   assert.equal(agent.body.details.quota.limitBytes, FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES);
   assert.equal(agent.body.details.quota.usedBytes, used);
   assert.match(agent.body.details.billingUrl, /\/settings\/billing$/);
-  assert.equal(agent.body.suggestedNextAction, `Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: ${agent.body.details.billingUrl}`);
+  assert.equal(agent.body.suggestedNextAction, `Say in the conversation that the file wasn't uploaded and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Plan & billing: ${agent.body.details.billingUrl}`);
 
   await captured.expect(1, "the agent's import");
 

@@ -73,6 +73,8 @@ class FakeHTMLRewriter {
           handler.element({ append: (text: string, options?: { html?: boolean }) => { html = html.replace("</head>", `${content(text, options)}</head>`); } });
         } else if (selector === "#root") {
           handler.element({ prepend: (text: string, options?: { html?: boolean }) => { html = html.replace(/(<div id="root"[^>]*>)/, `$1${content(text, options)}`); } });
+        } else if (selector === "meta[data-raft-default-og]") {
+          handler.element({ remove: () => { html = html.replace(/<meta\b[^>]*\bdata-raft-default-og\b[^>]*\/?>[ \t]*\r?\n?/gi, ""); } });
         } else {
           throw new Error(`unexpected selector ${selector}`);
         }
@@ -134,10 +136,13 @@ describe("public Artifact page preview head", () => {
       `<meta property="og:description" content="Revenue grew 12% on the quarter.">`,
       `<meta property="og:type" content="article">`,
       `<meta property="og:url" content="https://app.raft.build/artifacts/${ID}">`,
-      `<meta property="og:image" content="https://app.raft.build/android-chrome-512x512.png">`,
-      `<meta name="twitter:card" content="summary">`,
+      `<meta property="og:image" content="${API}/api/public/artifacts/${ID}/og-image.png?v=${encodeURIComponent(META.updatedAt)}">`,
+      `<meta property="og:image:width" content="1200">`,
+      `<meta property="og:image:height" content="630">`,
+      `<meta name="twitter:card" content="summary_large_image">`,
       `<meta name="twitter:title" content="Q3 report">`,
       `<meta name="twitter:description" content="Revenue grew 12% on the quarter.">`,
+      `<meta name="twitter:image" content="${API}/api/public/artifacts/${ID}/og-image.png?v=${encodeURIComponent(META.updatedAt)}">`,
       `<link rel="canonical" href="https://app.raft.build/artifacts/${ID}">`,
       `<link rel="alternate" type="text/markdown" href="${API}/api/public/artifacts/${ID}/index.md">`,
       `<link rel="alternate" type="text/html" title="Source" href="${API}/api/public/artifacts/${ID}/files/index.html">`,
@@ -145,9 +150,8 @@ describe("public Artifact page preview head", () => {
       assert.ok(html.includes(tag), tag);
     }
     assert.ok(html.indexOf("og:title") < html.indexOf("</head>"), "in the head");
-    assert.ok(!html.includes("summary_large_image"), "a small card: the image is the square app icon");
-    // The image is a file that exists.
-    readFileSync(resolve(webRoot, "public/android-chrome-512x512.png"));
+    // The static brand image file referenced by default/social cards exists.
+    readFileSync(resolve(webRoot, "public/brand/og-raft.png"));
   });
 
   test("a pinned version's page (/v/<n>) gets the same head, its canonical the Artifact's address", async () => {
@@ -604,7 +608,18 @@ describe("crawler-facing files", () => {
     const rules = robots.split("\n").filter((line) => line && !line.startsWith("#"));
     // Every AI training crawler is turned away from every path, first; then the `*` rules every other fetcher follows.
     const training = AI_TRAINING_CRAWLERS.flatMap((agent) => [`User-agent: ${agent}`, "Disallow: /"]);
-    assert.deepEqual(rules, [...training, "User-agent: *", "Allow: /artifacts/", "Allow: /android-chrome-512x512.png", "Allow: /llms.txt", "Disallow: /"]);
+    assert.deepEqual(rules, [
+      ...training,
+      "User-agent: *",
+      "Allow: /artifacts/",
+      "Allow: /s/",
+      "Allow: /join/",
+      "Allow: /external-invite/",
+      "Allow: /brand/og-raft.png",
+      "Allow: /android-chrome-512x512.png",
+      "Allow: /llms.txt",
+      "Disallow: /",
+    ]);
     for (const fetcher of ["ChatGPT-User", "Claude-User", "Perplexity-User"]) assert.ok(!robots.includes(fetcher + "\n"), `${fetcher} follows the * rules`);
     assert.match(robots, /noindex/);
     // The card's image is fetched under these rules too: disallowed, X shows a blank card.
@@ -677,5 +692,164 @@ describe("the diagnostic header says why an Artifact page is or isn't rewritten"
     assert.equal(other.headers.get(DIAGNOSTIC), null);
     const skipped = await worker.handleRequest(request(), env(), { apiOrigin: null, fetch: api(metaAnswer()).fetch, HTMLRewriter: FakeHTMLRewriter });
     assert.equal(skipped.headers.get("x-raft-artifact-preview"), null, "an unrewritten shell is still the app's shell to the service worker");
+  });
+});
+
+describe("social link previews (public servers, public channels, invites, generic fallback)", () => {
+  const SHELL_WITH_DEFAULT_OG = readFileSync(resolve(webRoot, "index.html"), "utf8");
+  const envWithDefaultOg = () => ({
+    ASSETS: {
+      fetch: async () => new Response(SHELL_WITH_DEFAULT_OG, {
+        status: 200,
+        headers: { "Content-Type": "text/html; charset=utf-8", ETag: "\"default-og\"" },
+      }),
+    },
+  });
+  const CHANNEL_ID = "11111111-2222-4333-8444-555555555555";
+  const PRIVATE_CHANNEL_ID = "99999999-8888-4777-8666-555555555555";
+
+  test("index.html carries a complete generic 1200x630 fallback card for private and unknown links", () => {
+    assert.ok(SHELL_WITH_DEFAULT_OG.includes(`data-raft-default-og property="og:title" content="Raft"`));
+    assert.ok(SHELL_WITH_DEFAULT_OG.includes(`data-raft-default-og property="og:image" content="https://app.raft.build/brand/og-raft.png"`));
+    assert.ok(SHELL_WITH_DEFAULT_OG.includes(`data-raft-default-og name="twitter:card" content="summary_large_image"`));
+  });
+
+  test("rewriting a public Artifact strips default fallback OG tags so there are no duplicate og:title or og:image tags", async () => {
+    const stub = api(metaAnswer());
+    const res = await worker.handleRequest(
+      new Request(`https://app.raft.build/artifacts/${ID}`),
+      envWithDefaultOg(),
+      { apiOrigin: API, fetch: stub.fetch, HTMLRewriter: FakeHTMLRewriter },
+    );
+    const html = await res.text();
+    assert.equal((html.match(/property="og:title"/g) ?? []).length, 1);
+    assert.equal((html.match(/property="og:image"/g) ?? []).length, 1);
+    assert.ok(!html.includes("data-raft-default-og"));
+    assert.ok(html.includes(`property="og:image" content="${API}/api/public/artifacts/${ID}/og-image.png?v=${encodeURIComponent(META.updatedAt)}"`));
+  });
+
+  test("public server and public channel previews are checked live (no-store); private/nonexistent servers and private channels fall back to byte-identical generic card", async () => {
+    const calls: string[] = [];
+    const fetchStub = async (url: string) => {
+      calls.push(url);
+      if (url === `${API}/api/public/servers/open-lab`) {
+        return Response.json({
+          server: { id: "s1", name: "Open Lab", description: "Public research space" },
+          channels: [{ id: CHANNEL_ID, name: "announcements", description: "Release updates" }],
+        });
+      }
+      return Response.json({ error: "Not found" }, { status: 404 });
+    };
+    const deps: Deps = { apiOrigin: API, fetch: fetchStub, HTMLRewriter: FakeHTMLRewriter };
+
+    const serverRes = await worker.handleRequest(new Request("https://app.raft.build/s/open-lab", { headers: { "User-Agent": "Slackbot-LinkExpanding 1.0" } }), envWithDefaultOg(), deps);
+    const serverHtml = await serverRes.text();
+    assert.equal(serverRes.headers.get("cache-control"), "no-store");
+    assert.equal(serverRes.headers.get("x-robots-tag"), "noindex, nofollow");
+    assert.equal(serverRes.headers.get("x-raft-artifact-preview"), "1");
+    assert.ok(serverHtml.includes(`<meta property="og:title" content="Open Lab">`));
+    assert.ok(serverHtml.includes(`<meta property="og:description" content="Public research space">`));
+    assert.equal((serverHtml.match(/property="og:title"/g) ?? []).length, 1);
+
+    const chanRes = await worker.handleRequest(new Request(`https://app.raft.build/s/open-lab/channel/${CHANNEL_ID}`), envWithDefaultOg(), deps);
+    const chanHtml = await chanRes.text();
+    assert.ok(chanHtml.includes(`<meta property="og:title" content="#announcements · Open Lab">`));
+    assert.ok(chanHtml.includes(`<meta property="og:description" content="Release updates">`));
+
+    // Private channel inside a public server, private server, and nonexistent server must all return the exact generic shell with no-store + noindex.
+    const privateChanRes = await worker.handleRequest(new Request(`https://app.raft.build/s/open-lab/channel/${PRIVATE_CHANNEL_ID}`), envWithDefaultOg(), deps);
+    const privateServerRes = await worker.handleRequest(new Request("https://app.raft.build/s/secret-org"), envWithDefaultOg(), deps);
+    const missingServerRes = await worker.handleRequest(new Request("https://app.raft.build/s/does-not-exist"), envWithDefaultOg(), deps);
+    for (const fallbackRes of [privateChanRes, privateServerRes, missingServerRes]) {
+      assert.equal(fallbackRes.headers.get("cache-control"), "no-store");
+      assert.equal(fallbackRes.headers.get("x-robots-tag"), "noindex, nofollow");
+      assert.equal(fallbackRes.headers.get("etag"), null);
+    }
+    assert.equal(await privateChanRes.text(), SHELL_WITH_DEFAULT_OG);
+    assert.equal(await privateServerRes.text(), SHELL_WITH_DEFAULT_OG);
+    assert.equal(await missingServerRes.text(), SHELL_WITH_DEFAULT_OG);
+  });
+
+  test("server join cards honor insideCountsHidden and fall back to generic card for expired/unknown tokens", async () => {
+    const fetchStub = async (url: string) => {
+      if (url.endsWith("token=visible-token")) {
+        return Response.json({ serverName: "Acme Team", memberCount: 12, agentCount: 8, insideCountsHidden: false });
+      }
+      if (url.endsWith("token=hidden-counts")) {
+        return Response.json({ serverName: "Stealth Team", memberCount: 47, agentCount: 83, insideCountsHidden: true });
+      }
+      return Response.json({ error: "Invalid or expired invite" }, { status: 404 });
+    };
+    const deps: Deps = { apiOrigin: API, fetch: fetchStub, HTMLRewriter: FakeHTMLRewriter };
+
+    const visibleHtml = await (await worker.handleRequest(new Request("https://app.raft.build/join/visible-token"), envWithDefaultOg(), deps)).text();
+    assert.ok(visibleHtml.includes(`<meta property="og:title" content="Join Acme Team on Raft">`));
+    assert.ok(visibleHtml.includes(`<meta property="og:description" content="12 members, 8 agents on Raft.">`));
+
+    const hiddenHtml = await (await worker.handleRequest(new Request("https://app.raft.build/join/hidden-counts"), envWithDefaultOg(), deps)).text();
+    assert.ok(hiddenHtml.includes(`<meta property="og:title" content="Join Stealth Team on Raft">`));
+    assert.ok(hiddenHtml.includes(`<meta property="og:description" content="Join this workspace on Raft.">`));
+    assert.ok(!hiddenHtml.includes("47"), "must not leak member count when insideCountsHidden is true");
+    assert.ok(!hiddenHtml.includes("83"), "must not leak agent count when insideCountsHidden is true");
+    assert.ok(!hiddenHtml.includes("member"), "must not mention member count when insideCountsHidden is true");
+    assert.ok(!hiddenHtml.includes("agent"), "must not mention agent count when insideCountsHidden is true");
+
+    const expiredHtml = await (await worker.handleRequest(new Request("https://app.raft.build/join/expired-token"), envWithDefaultOg(), deps)).text();
+    assert.equal(expiredHtml, SHELL_WITH_DEFAULT_OG);
+  });
+
+  test("external invite cards never reveal channel, server, inviter or email and send a bot User-Agent", async () => {
+    const seenHeaders: Array<HeadersInit | undefined> = [];
+    const fetchStub = async (url: string, init?: RequestInit) => {
+      seenHeaders.push(init?.headers);
+      if (url.endsWith("/valid-ext/preview")) {
+        return Response.json({ invitedEmailMasked: "a***@example.com" });
+      }
+      return Response.json({ error: "This invite link is not valid" }, { status: 404 });
+    };
+    const deps: Deps = { apiOrigin: API, fetch: fetchStub, HTMLRewriter: FakeHTMLRewriter };
+
+    const validHtml = await (await worker.handleRequest(new Request("https://app.raft.build/external-invite/valid-ext"), envWithDefaultOg(), deps)).text();
+    assert.ok(validHtml.includes(`<meta property="og:title" content="Channel invitation">`));
+    assert.ok(!validHtml.includes("example.com"), "never expose even masked email in public unfurl card");
+    assert.equal((seenHeaders[0] as Record<string, string>)["User-Agent"], "RaftLinkPreview/1.0");
+
+    const invalidHtml = await (await worker.handleRequest(new Request("https://app.raft.build/external-invite/revoked-ext"), envWithDefaultOg(), deps)).text();
+    assert.equal(invalidHtml, SHELL_WITH_DEFAULT_OG);
+  });
+
+  test("interactive browser navigations skip social preview API calls (zero latency overhead), while in-app chat webviews still enrich", async () => {
+    const calls: string[] = [];
+    const fetchStub = async (url: string) => {
+      calls.push(url);
+      return Response.json({ server: { id: "s1", name: "Open Lab", description: "" }, channels: [] });
+    };
+    const deps: Deps = { apiOrigin: API, fetch: fetchStub, HTMLRewriter: FakeHTMLRewriter };
+
+    const chromeNav = await worker.handleRequest(
+      new Request("https://app.raft.build/s/open-lab", {
+        headers: {
+          "Sec-Fetch-Mode": "navigate",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+        },
+      }),
+      envWithDefaultOg(),
+      deps,
+    );
+    assert.deepEqual(calls, [], "normal desktop/mobile browsers must not incur an extra API RTT");
+    assert.equal(await chromeNav.text(), SHELL_WITH_DEFAULT_OG);
+
+    const wechatWebview = await worker.handleRequest(
+      new Request("https://app.raft.build/s/open-lab", {
+        headers: {
+          "Sec-Fetch-Mode": "navigate",
+          "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) MicroMessenger/8.0.50",
+        },
+      }),
+      envWithDefaultOg(),
+      deps,
+    );
+    assert.equal(calls.length, 1);
+    assert.ok((await wechatWebview.text()).includes(`<meta property="og:title" content="Open Lab">`));
   });
 });

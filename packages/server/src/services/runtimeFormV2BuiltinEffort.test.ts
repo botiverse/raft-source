@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { vi } from "vitest";
 import { PI_REASONING_EFFORTS } from "@botiverse/raft-shared";
 import {
   initialRuntimeFormV2Values,
@@ -17,9 +16,6 @@ import {
   runtimeFormValuesFromRuntimeConfig,
   type RuntimeFormOptionSourceContext,
 } from "./runtimeFormV2Registry";
-
-vi.mock("./providerConnectionFeature", () => ({ isProviderConnectionsEnabled: vi.fn(async () => false) }));
-vi.mock("./providerConnectionService", () => ({ listProviderConnections: vi.fn(async () => []) }));
 
 const preset = { providerId: "deepseek", apiKey: "test-key", model: "deepseek/deepseek-flash" };
 
@@ -44,11 +40,10 @@ test("Built-in v2 offers every Pi effort without changing the released v1 form",
   assert.equal(releasedRuntimeFormDefinition("builtin-pi.create.v3")!.dataSchema.properties.reasoningEffort, undefined);
 });
 
-test("preset, gateway and saved connection edits round-trip effort and allow explicit default", () => {
+test("preset and gateway edits round-trip effort and allow explicit default", () => {
   const providers = [
     preset,
     { providerId: "openai-compatible", apiKey: "test-key", baseUrl: "https://example.test/v1", model: "custom-model" },
-    { providerId: "connection:c1", model: "custom-model" },
   ];
   for (const values of providers) {
     for (const effort of PI_REASONING_EFFORTS) {

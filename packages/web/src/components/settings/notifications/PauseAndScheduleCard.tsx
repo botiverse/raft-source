@@ -2,7 +2,7 @@
 // for a while, and daily quiet hours in the browser's time zone. Account-wide:
 // the server applies them on every device.
 
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { ChangeEvent, KeyboardEvent } from "react";
 import { useIntl } from "react-intl";
 import { Moon } from "lucide-react";
@@ -25,8 +25,10 @@ import {
   SelectValue,
   Switch,
 } from "@botiverse/raft-ui";
+import { currentTimeMs } from "@botiverse/raft-shared";
 import type { NotificationQuietHours } from "@botiverse/raft-shared";
 import type { MessageId } from "../../../i18n/messages";
+import { subscribeLiveTime } from "../../../hooks/liveTimeClock";
 import { useTimeFormatter } from "../../../hooks/useTimeFormatter";
 import { detectBrowserTimezone } from "../../../utils/timeFormatting";
 import { PAUSE_PRESETS, pausedUntilForPreset } from "../../../notifications/pause";
@@ -151,10 +153,14 @@ export function PauseAndScheduleCard() {
   }, [save]);
 
   const handleCustomChange = useCallback((event: ChangeEvent<HTMLInputElement>) => setCustom(event.target.value), []);
-  const customDate = useMemo(() => {
+  const customAt = useMemo(() => {
     const at = new Date(custom);
-    return Number.isFinite(at.getTime()) && at.getTime() > Date.now() ? at : null;
+    return Number.isFinite(at.getTime()) ? at : null;
   }, [custom]);
+  // Still ahead, by the live clock: a time left in the field until it has passed can no longer be applied.
+  const readCustomAhead = () => customAt !== null && customAt.getTime() > currentTimeMs();
+  const customAhead = useSyncExternalStore(subscribeLiveTime, readCustomAhead, readCustomAhead);
+  const customDate = customAhead ? customAt : null;
   const applyCustom = useCallback(() => {
     if (!customDate) return;
     void save({ pausedUntil: customDate.toISOString() }).then((ok) => { if (ok) setChoice(null); });

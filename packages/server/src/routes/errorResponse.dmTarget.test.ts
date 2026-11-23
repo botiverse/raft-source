@@ -48,3 +48,21 @@ test("routes with a bespoke catch report the typed error through the shared help
   assert.equal(sent.status, 409);
   assert.equal((sent.body as { code: string }).code, "DM_TARGET_AMBIGUOUS");
 });
+
+test("a DM target refusal is the envelope, its sentence names no command, and a raw target that would break it is left out", () => {
+  const { res, sent } = fakeResponse();
+  respondToDmTargetResolutionError(DmTargetResolutionError.ambiguous("Twin"), res);
+  const body = sent.body as { error: string; code: string; errorCode: string; suggestedNextAction: string };
+  assert.equal(body.errorCode, "DM_TARGET_AMBIGUOUS");
+  assert.doesNotMatch(body.error, /raft [a-z]|--[a-z]/);
+  assert.match(body.error, /dm:@Twin~agent for the agent, or dm:@Twin~human for the human\.$/);
+
+  const kept = DmTargetResolutionError.invalidPeerKind("Twin~bot", "bot");
+  assert.match(kept.message, /^dm:@Twin~bot has an unknown peer kind "bot"\./);
+  for (const raw of ["Twin~a\nb", "x raft y~bot", `${"y".repeat(300)}~bot`]) {
+    const refused = fakeResponse();
+    respondToDmTargetResolutionError(DmTargetResolutionError.invalidPeerKind(raw, raw.split("~")[1]), refused.res);
+    assert.equal(refused.sent.status, 400, JSON.stringify(raw));
+    assert.equal((refused.sent.body as { error: string }).error, "That DM target has an unknown peer kind. Use dm:@<name>, dm:@<name>~agent or dm:@<name>~human.");
+  }
+});

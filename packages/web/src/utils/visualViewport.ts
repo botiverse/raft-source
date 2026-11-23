@@ -171,6 +171,21 @@ export function readSoftKeyboardOpen(): boolean {
   return document.getElementById("root")?.dataset.softKeyboard === "open";
 }
 
+/**
+ * While the on-screen keyboard is up (`readSoftKeyboardOpen`), the visible
+ * area in the layout viewport's coordinates: `bottom`, where the keyboard's top
+ * edge is, and `inset`, how far that is above the layout viewport's bottom
+ * (what an overlay fixed to the bottom and portaled outside #root rises by).
+ * `null` while it is down, or with no VisualViewport API.
+ */
+export function readSoftKeyboardBox(): { bottom: number; inset: number; height: number } | null {
+  if (typeof window === "undefined") return null;
+  const vv = window.visualViewport;
+  if (!vv || !readSoftKeyboardOpen()) return null;
+  const bottom = vv.offsetTop + vv.height;
+  return { bottom, inset: Math.max(0, window.innerHeight - bottom), height: vv.height };
+}
+
 export function subscribeSoftKeyboard(onChange: () => void): () => void {
   if (typeof document === "undefined" || typeof MutationObserver === "undefined") return () => {};
   const shell = document.getElementById("root");

@@ -659,17 +659,6 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "idx_managed_mcp_oauth_attempts_mcp_serv
 `,
   },
   {
-    name: "idx_provider_probe_intents_connection",
-    table: "provider_probe_intents",
-    unique: false,
-    columns: ["connection_id"],
-    predicate: null,
-    createSql: `
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "idx_provider_probe_intents_connection"
-  ON "provider_probe_intents" USING btree ("connection_id")
-`,
-  },
-  {
     name: "idx_official_app_auto_install_transitions_installation",
     table: "official_app_auto_install_transitions",
     unique: false,
@@ -748,6 +737,21 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "idx_official_app_auto_install_transitio
     createSql: `
 CREATE INDEX CONCURRENTLY IF NOT EXISTS "idx_oauth_agent_auto_grant_blocks_client"
   ON "oauth_agent_auto_grant_blocks" USING btree ("client_id")
+`,
+  },
+  {
+    // Live threads by name (migration channels_thread_server_name_index):
+    // resolveThreadByShortId read every channel row of the server (13k pages,
+    // 89 ms on production's largest). channels is hot: never a locking build.
+    name: "idx_channels_thread_server_name",
+    table: "channels",
+    unique: false,
+    columns: ["server_id", "name"],
+    predicate: "((type = 'thread'::text) AND (deleted_at IS NULL))",
+    createSql: `
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "idx_channels_thread_server_name"
+  ON "channels" USING btree ("server_id", "name")
+  WHERE type = 'thread' AND deleted_at IS NULL
 `,
   },
 ];

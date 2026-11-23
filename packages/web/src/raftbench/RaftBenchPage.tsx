@@ -10,7 +10,6 @@ import { BenchIcon } from "./BenchIcon";
 import PanelHeader from "../components/ui/PanelHeader";
 import type { ChangeEvent, MouseEvent } from "react";
 import { useIntl } from "react-intl";
-import { useNavigate } from "react-router-dom";
 import { useAppNavigate, useMobileBack } from "../hooks/useAppNavigate";
 import {
   Badge,
@@ -178,7 +177,6 @@ const GATE_HEADER_PROPS = { className: "md:hidden" };
 
 function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
   const { formatMessage: t, formatDate, formatTime } = useIntl();
-  const navigate = useNavigate();
   const appNav = useAppNavigate();
   const server = useServerStore((s) => s.current);
   const principalId = useAuthStore((s) => s.user?.id ?? null);
@@ -373,9 +371,9 @@ function RaftBenchAdminPage({ analysisAllowed }: { analysisAllowed: boolean }) {
     },
     [finding, review, reviews],
   );
-  const backToWorkspace = useCallback(() => {
-    navigate(`/s/${server?.slug}/settings`);
-  }, [navigate, server?.slug]);
+  // Back to the page before it (Raft DS › Navigation, rule a); Settings, the
+  // page it is listed in, only when there is none in this app on this server.
+  const backToWorkspace = useMobileBack(server?.slug ? `/s/${server.slug}/settings` : "/");
   const mobileBackProps = useMemo(
     () => ({ "aria-label": t({ id: "raftbench.back" }) }),
     [t],

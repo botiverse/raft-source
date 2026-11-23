@@ -55,6 +55,7 @@ const CONNECT_ERROR_STATUS: Record<externalInviteConnectService.ExternalConnectE
   membership_changed: 409,
   guest_has_computer: 409,
   connect_unavailable: 409,
+  channel_name_taken: 409,
 };
 
 /**
@@ -165,7 +166,8 @@ export function recordServerConnectOutcomes(
       const refusal = externalConnectRefusal(outcome.error);
       refused.push(refusal ? refusal.body.code ?? INVALID_INVITE_TRACE_CODE : "internal_error");
     } else {
-      finished = { result: outcome.state };
+      // A repeated choice of a server already in: its own result, not a second connect (#wg-rbac:#94).
+      finished = { result: outcome.state === "connected" && outcome.alreadyConnected ? "already_connected" : outcome.state };
     }
     return {
       path: input.path === "connect" && askedApproval ? "request_approval" : input.path,
@@ -184,6 +186,7 @@ export function recordServerConnectOutcomes(
  * logged and answered `internal_error`).
  */
 export function serializeServerConnectOutcome(outcome: externalInviteConnectService.ServerConnectOutcome) {
+  if (outcome.state === "connected") return { serverId: outcome.serverId, state: outcome.state, channelId: outcome.channelId };
   if (outcome.state !== "refused") return outcome;
   const refusal = externalConnectRefusal(outcome.error);
   if (!refusal) {

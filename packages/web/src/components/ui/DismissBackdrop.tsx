@@ -1,5 +1,6 @@
 import { createPortal } from "react-dom";
 import { dismissLayerProps } from "./dismissLayer";
+import { usePortalTarget } from "./portalTarget";
 
 /**
  * Invisible click-outside catcher for context menus and drawer overlays.
@@ -30,6 +31,9 @@ export default function DismissBackdrop({
   /** If true, stops propagation instead of calling onDismiss (iOS phantom-click shield). */
   stopPropagation?: boolean;
 }) {
+  // The body of the window it is drawn in (an object window's, portalTarget.ts).
+  const target = usePortalTarget();
+  if (!target) return null;
   return createPortal(
     <div
       // The dismiss-layer marker: a full-window dismiss layer (task #121).
@@ -47,6 +51,6 @@ export default function DismissBackdrop({
           : undefined
       }
     />,
-    document.body
+    target
   );
 }

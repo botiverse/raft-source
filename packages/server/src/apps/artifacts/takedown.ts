@@ -6,8 +6,17 @@
 // - `member`: the owners and admins of the Artifact's own server, while
 //   standing in it (mayManageArtifact "moderate", platform/visibility
 //   canManageObject; never its author or an agent's manager as such, never
-//   another server's people, an agent or an assistant acting for its owner).
-//   Like a delete, they needn't see it. One who may not: forbidden if they
+//   another server's people but as below, an agent or an assistant acting
+//   for its owner). Like a delete, they needn't see it. A closed server's Artifact kept in a
+//   joint (platform/visibility closedServerJointObjects), which nobody of
+//   its server can act on any more: the people who manage that joint
+//   channel from its host (platform/visibility
+//   closedServerJointObjectManagedBy: a host owner/admin or the host's
+//   appointed channel manager, in the channel; never another participant's
+//   owner or admin; a person, as above) take it down and restore it, the
+//   audit row naming the host's server and copy (`joint_manager`). Tenny:
+//   takedown and restore only, never a delete (that stays the read-only 403;
+//   removing it for good stays the operator's purge). One who may not: forbidden if they
 //   see it, else not_visible; a taken-down Artifact is seen by no one, so a
 //   restore by one who may not is always not_visible.
 // - `ops`: a Raft operator, through the operator's script
@@ -21,7 +30,8 @@
 // `now()`, so a restore finds exactly those), writes the audit row
 // (`taken_down`: the reason, how many versions), drops its pending notices
 // and its people's Activity rows (forgetArtifactActivity; the caller
-// announces them after the commit). Every read leaves a revoked item out
+// announces them after the commit), and its links to other Artifacts
+// (references.ts forgetArtifactReferences). Every read leaves a revoked item out
 // (visibility.ts; the content Worker's authorize, contentRoutes.ts), with
 // the deleted one's refusal (the one 404, `deleted` to the Worker). Its
 // search row stays: search lists live items only (liveArtifactsIn), so a
@@ -31,16 +41,18 @@
 // `revoked_at` on the item and on the versions the takedown revoked, and
 // writes the audit row (`restored`, the reason). Another live Artifact of
 // its home took its name meanwhile: name_taken. Not down: `changed: false`.
-// What the takedown dropped (Activity rows, pending notices) stays dropped.
+// What the takedown dropped (Activity rows, pending notices) stays dropped;
+// its links are read again after the commit (references.ts).
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { ARTIFACT_TAKEDOWN_REASON_MAX_CHARS, asArtifactId, type ArtifactWebTakedown } from "@botiverse/raft-shared";
 import type { ForgottenActivityRow } from "../../platform/activity";
 import { getDb, type DatabaseExecutor } from "../../platform/db";
-import { assertNeverViewActor, type ViewActor } from "../../platform/visibility";
+import { assertNeverViewActor, closedServerJointObjectManagedBy, type KeptJointManagement, type ViewActor } from "../../platform/visibility";
 import { forgetArtifactActivity } from "./activity";
-import type { ArtifactActorRef } from "./apiCommon";
+import { CLOSED_SERVER_READ_ONLY_ERROR, itemWritable, type ArtifactActorRef } from "./apiCommon";
 import { ARTIFACT_OPS_MODERATION_ACTOR } from "./import";
 import { mayManageArtifact, type ArtifactManageRefusal } from "./manage";
+import { fillArtifactReferences, forgetArtifactReferences } from "./references";
 import { isNameTakenInHome, isUniqueViolation, type ArtifactHomeRef } from "./names";
 import { artifactAudit, artifactItems, artifactPendingNotices, artifactVersions, type ArtifactItemRow } from "./schema";
 import { canViewArtifacts } from "./visibility";
@@ -71,14 +83,23 @@ export function takedownReason(raw: unknown): string | null {
   return reason.length > 0 && reason.length <= ARTIFACT_TAKEDOWN_REASON_MAX_CHARS ? reason : null;
 }
 
+/** What a kept Artifact's takedown or restore adds to its audit row (`after`): the host's server and copy the person manages the joint from. */
+type KeptModerationAudit = { joint_manager?: { server_id: string; channel_id: string } };
+
+const keptModerationAudit = (via: KeptJointManagement): KeptModerationAudit => ({ joint_manager: { server_id: via.serverId, channel_id: via.channelId } });
+
 /** Who acts, as the audit and the versions record it, or the refusal (the header's rule). */
-async function moderatorOf(tx: DatabaseExecutor, by: ArtifactModerator, item: ArtifactItemRow): Promise<{ actor: ArtifactActorRef; ops?: { operator: string } }> {
-  if (by.kind === "ops") return { actor: ARTIFACT_OPS_MODERATION_ACTOR, ops: { operator: by.operator } };
+async function moderatorOf(tx: DatabaseExecutor, by: ArtifactModerator, item: ArtifactItemRow): Promise<{ actor: ArtifactActorRef; recorded: KeptModerationAudit & { ops?: { operator: string } } }> {
+  if (by.kind === "ops") return { actor: ARTIFACT_OPS_MODERATION_ACTOR, recorded: { ops: { operator: by.operator } } };
   const { actor } = by;
   switch (actor.type) {
-    case "user":
-      if (await mayManageArtifact(actor, item, "moderate", { executor: tx })) return { actor: { type: "user", id: actor.id } };
+    case "user": {
+      if (await mayManageArtifact(actor, item, "moderate", { executor: tx })) return { actor: { type: "user", id: actor.id }, recorded: {} };
+      // A closed server's, kept in a joint: the joint's managers on its host (the header).
+      const via = await closedServerJointObjectManagedBy(actor, item, { executor: tx });
+      if (via) return { actor: { type: "user", id: actor.id }, recorded: keptModerationAudit(via) };
       break;
+    }
     // Only a person moderates: an agent, or one acting for a person, never does.
     case "agent":
     case "delegated":
@@ -87,8 +108,9 @@ async function moderatorOf(tx: DatabaseExecutor, by: ArtifactModerator, item: Ar
       return assertNeverViewActor(actor);
   }
   // One who may not learns nothing about an Artifact they can't see (a taken-down one: nobody sees it).
+  // One who sees a closed server's (kept in a joint) is told it is read-only.
   const [visible] = await canViewArtifacts(actor, [item], { executor: tx });
-  throw new Refused(visible ? MAY_NOT_MODERATE : { kind: "not_visible" });
+  throw new Refused(!visible ? { kind: "not_visible" } : (await itemWritable(item)) ? MAY_NOT_MODERATE : { kind: "forbidden", reason: CLOSED_SERVER_READ_ONLY_ERROR });
 }
 
 async function run(work: () => Promise<ArtifactTakedownOutcome>, itemId: string): Promise<ArtifactTakedownOutcome> {
@@ -110,7 +132,7 @@ export function takedownArtifact(by: ArtifactModerator, itemId: string, reason: 
   return run(() => getDb().transaction(async (tx) => {
     const [locked] = await tx.select().from(artifactItems).where(eq(artifactItems.id, itemId)).for("update");
     if (!locked) throw new Refused({ kind: "not_visible" });
-    const { actor, ops } = await moderatorOf(tx, by, locked);
+    const { actor, recorded } = await moderatorOf(tx, by, locked);
     if (locked.revokedAt !== null) return { kind: "done" as const, item: locked, changed: false, forgotten: [] };
 
     const [revoked] = await tx.update(artifactItems).set({ revokedAt: sql`now()` }).where(eq(artifactItems.id, locked.id)).returning();
@@ -124,11 +146,12 @@ export function takedownArtifact(by: ArtifactModerator, itemId: string, reason: 
       actorId: actor.id,
       action: "taken_down",
       before: { revoked_at: null },
-      after: { revoked_at: revoked!.revokedAt!.toISOString(), reason, versions_revoked: versions.length, ...(ops ? { ops } : {}) },
+      after: { revoked_at: revoked!.revokedAt!.toISOString(), reason, versions_revoked: versions.length, ...recorded },
     });
     // Nothing about it goes out any more, nor is it in anyone's Activity (as a delete).
     await tx.delete(artifactPendingNotices).where(eq(artifactPendingNotices.itemId, locked.id));
     const forgotten = await forgetArtifactActivity(tx, locked.id);
+    await forgetArtifactReferences(tx, locked.id);
     return { kind: "done" as const, item: revoked!, changed: true, forgotten };
   }), itemId);
 }
@@ -140,11 +163,18 @@ const nameHomeOf = (item: ArtifactItemRow): ArtifactHomeRef | null => {
 };
 
 /** Undo a takedown (the header's checks and writes). `reason`: takedownReason's. */
-export function restoreArtifact(by: ArtifactModerator, itemId: string, reason: string): Promise<ArtifactTakedownOutcome> {
+export async function restoreArtifact(by: ArtifactModerator, itemId: string, reason: string): Promise<ArtifactTakedownOutcome> {
+  const outcome = await restoreInTransaction(by, itemId, reason);
+  // Its links to other Artifacts, read again: bounded, never failing the restore (references.ts); none for a deleted one.
+  if (outcome.kind === "done" && outcome.changed && outcome.item.deletedAt === null) await fillArtifactReferences(outcome.item);
+  return outcome;
+}
+
+function restoreInTransaction(by: ArtifactModerator, itemId: string, reason: string): Promise<ArtifactTakedownOutcome> {
   return run(() => getDb().transaction(async (tx) => {
     const [locked] = await tx.select().from(artifactItems).where(eq(artifactItems.id, itemId)).for("update");
     if (!locked) throw new Refused({ kind: "not_visible" });
-    const { actor, ops } = await moderatorOf(tx, by, locked);
+    const { actor, recorded } = await moderatorOf(tx, by, locked);
     if (locked.revokedAt === null) return { kind: "done" as const, item: locked, changed: false, forgotten: [] };
     const home = nameHomeOf(locked);
     if (locked.deletedAt === null && home && locked.name !== null && (await isNameTakenInHome(tx, locked.serverId, home, locked.name))) {
@@ -166,7 +196,7 @@ export function restoreArtifact(by: ArtifactModerator, itemId: string, reason: s
       actorId: actor.id,
       action: "restored",
       before: { revoked_at: locked.revokedAt.toISOString() },
-      after: { revoked_at: null, reason, versions_restored: versions.length, ...(ops ? { ops } : {}) },
+      after: { revoked_at: null, reason, versions_restored: versions.length, ...recorded },
     });
     return { kind: "done" as const, item: restored!, changed: true, forgotten: [] };
   }), itemId);

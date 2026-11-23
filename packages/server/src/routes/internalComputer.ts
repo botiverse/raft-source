@@ -50,16 +50,6 @@ import {
 } from "../services/agentCredentialService";
 import { refuse, rateLimitRefusal, type RefusalStatus } from "../lib/refusal";
 import { broadcastAgentCredentialRevocation } from "../replicaRouter";
-import {
-  ProviderConnectionError,
-  resolveProviderConnectionLaunch,
-} from "../services/providerConnectionService";
-import { isProviderConnectionsEnabled, isProviderProbesEnabled } from "../services/providerConnectionFeature";
-import {
-  materializeProviderProbe,
-  ProviderProbeError,
-} from "../services/providerProbeService";
-import { isProviderProbeId } from "@botiverse/raft-shared";
 // task #30 PR-A: preflight derives its principal/path view DIRECTLY from the
 // live auth registry — never a copied/static `EXPECTED_PRINCIPALS` list. A
 // registry gap therefore fails preflight and real auth identically (the
@@ -102,8 +92,18 @@ import {
 import { sendJsonServerError } from "./errorResponse";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import { setRequestTraceComputerCaller } from "../middleware/requestObservability";
+import { guardUuidPathParams } from "../lib/uuidPathParams";
 
 export const internalComputerRouter: RouterType = Router();
+
+// #4482: agents.id and agent_credentials.id are uuid columns; a malformed id
+// would raise Postgres 22P02 and come back as an opaque 500. It names no
+// agent, so it gets the unknown agent's (credential's) answer. Every route of
+// this router with these params is a /runners/:agentId/* route.
+guardUuidPathParams(internalComputerRouter, {
+  agentId: { error: "Agent not found", code: "agent_missing" },
+  credentialId: { error: "Credential not found", code: "credential_missing" },
+});
 
 const AGENT_MIGRATION_TRANSPORT_FAILURE_CODES: ReadonlySet<AgentMigrationTransportFailureCode> =
   new Set(AGENT_MIGRATION_TERMINAL_FAILURE_CODES);
@@ -282,9 +282,9 @@ async function ownComputerOrRefuse(
   res: Response,
 ): Promise<OwnComputer | null> {
   if (req.machineId) {
-    res.status(403).json({
-      error: "This route needs a Computer key (sk_computer_*); a legacy machine key cannot use it",
+    refuse(res, 403, {
       code: "computer_key_required",
+      error: "This route needs a Computer key (sk_computer_*); a legacy machine key cannot use it",
     });
     return null;
   }
@@ -298,11 +298,11 @@ async function ownComputerOrRefuse(
     .where(and(eq(computers.id, req.computerId), eq(computers.serverId, req.serverId), isNull(computers.revokedAt)))
     .limit(1);
   if (!row) {
-    res.status(401).json({ error: "This Computer's key was revoked", code: "computer_revoked" });
+    refuse(res, 401, { code: "computer_revoked", error: "This Computer's key was revoked" });
     return null;
   }
   if (!row.machineId) {
-    res.status(409).json({ error: "This Computer has no machine on the server", code: "machine_binding_missing" });
+    refuse(res, 409, { code: "machine_binding_missing", error: "This Computer has no machine on the server" });
     return null;
   }
   return { computerId: row.id, serverId: row.serverId, machineId: row.machineId, name: row.name };
@@ -329,26 +329,26 @@ internalComputerRouter.post("/lifecycle-operations", async (req, res) => {
     const operationId = body.operationId;
     const parentOperationId = body.parentOperationId;
     if (typeof action !== "string" || !MACHINE_LOCAL_LIFECYCLE_ACTIONS.has(action)) {
-      res.status(400).json({ error: "Unknown Computer lifecycle action", code: "unknown_action" });
+      refuse(res, 400, { code: "unknown_action", error: "Unknown Computer lifecycle action" });
       return;
     }
     if (typeof operationId !== "string" || !LIFECYCLE_UUID_RE.test(operationId)) {
-      res.status(400).json({ error: "A valid operationId is required", code: "invalid_operation_id" });
+      refuse(res, 400, { code: "invalid_operation_id", error: "A valid operationId is required" });
       return;
     }
     if (typeof parentOperationId !== "string" || !LIFECYCLE_UUID_RE.test(parentOperationId)) {
-      res.status(400).json({ error: "A valid parentOperationId is required", code: "invalid_parent_operation_id" });
+      refuse(res, 400, { code: "invalid_parent_operation_id", error: "A valid parentOperationId is required" });
       return;
     }
     if (body.targetVersion !== undefined || body.completionMode !== undefined) {
-      res.status(400).json({ error: "Only start, stop and restart are recorded here", code: "invalid_target_version" });
+      refuse(res, 400, { code: "invalid_target_version", error: "Only start, stop and restart are recorded here" });
       return;
     }
     const own = await ownComputerOrRefuse(req, res);
     if (!own) return;
     if ((body.machineId !== undefined && body.machineId !== own.machineId)
       || (body.serverId !== undefined && body.serverId !== own.serverId)) {
-      res.status(403).json({ error: "A Computer records only its own lifecycle", code: "computer_machine_mismatch" });
+      refuse(res, 403, { code: "computer_machine_mismatch", error: "A Computer records only its own lifecycle" });
       return;
     }
     const orchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
@@ -363,11 +363,11 @@ internalComputerRouter.post("/lifecycle-operations", async (req, res) => {
       ? orchestrator.getMachineConnectionEpoch?.(own.machineId) ?? null
       : null;
     if (action === "start" && connectionEpoch) {
-      res.status(409).json({ error: "Computer is already online", code: "computer_already_online" });
+      refuse(res, 409, { code: "computer_already_online", error: "Computer is already online" });
       return;
     }
     if (action !== "start" && !connectionEpoch) {
-      res.status(409).json({ error: "Computer is not online", code: "computer_offline" });
+      refuse(res, 409, { code: "computer_offline", error: "Computer is not online" });
       return;
     }
     // Under a share lock on this key's live row: a revoke (web, link, detach)
@@ -390,11 +390,11 @@ internalComputerRouter.post("/lifecycle-operations", async (req, res) => {
       }, { executor: tx });
     });
     if (operation === "revoked") {
-      res.status(401).json({ error: "This Computer's key was revoked", code: "computer_revoked" });
+      refuse(res, 401, { code: "computer_revoked", error: "This Computer's key was revoked" });
       return;
     }
     if (!operation) {
-      res.status(409).json({ error: "Operation identity does not match", code: "computer_lifecycle_operation_conflict" });
+      refuse(res, 409, { code: "computer_lifecycle_operation_conflict", error: "Operation identity does not match" });
       return;
     }
     addTraceEvent("operation.intent.recorded", {
@@ -434,7 +434,7 @@ internalComputerRouter.get("/self", async (req, res) => {
       .where(and(eq(machines.id, own.machineId), eq(machines.serverId, own.serverId)))
       .limit(1);
     if (!machine) {
-      res.status(409).json({ error: "This Computer has no machine on the server", code: "machine_binding_missing" });
+      refuse(res, 409, { code: "machine_binding_missing", error: "This Computer has no machine on the server" });
       return;
     }
     const [count] = await db
@@ -495,7 +495,7 @@ internalComputerRouter.post("/detach", async (req, res) => {
     const rawForce = jsonBody(req).forceAgentIds;
     const forceAgentIds = rawForce === undefined ? [] : parseAgentIdList(rawForce);
     if (!forceAgentIds) {
-      res.status(400).json({ error: "forceAgentIds must be a list of at most 200 agent ids.", code: "invalid_force_agent_ids" });
+      refuse(res, 400, { code: "invalid_force_agent_ids", error: "forceAgentIds must be a list of at most 200 agent ids." });
       return;
     }
     const now = currentDate();
@@ -550,7 +550,7 @@ internalComputerRouter.post("/detach", async (req, res) => {
       // Revoked by something else between auth and here: the key is dead, its
       // cascade ran with that revoke (this call repaired anything still live).
       if (result) await closeDeviceSessionKeys(result.reach);
-      res.status(401).json({ error: "This Computer's key was revoked", code: "computer_revoked" });
+      refuse(res, 401, { code: "computer_revoked", error: "This Computer's key was revoked" });
       return;
     }
     await closeDeviceSessionKeys(result.reach);
@@ -574,6 +574,7 @@ internalComputerRouter.post("/detach", async (req, res) => {
     res.status(200).json({ ok: true, computerId: own.computerId, machineId: own.machineId, unboundAgentIds: outcome.unbound.map((agent) => agent.agentId) });
   } catch (err) {
     if (err instanceof OthersAgentsOnComputerError && gate.attacherUserId) {
+      // refusal-ok: top-level `agents`, the list the person detaching is shown
       res.status(409).json({
         error: "Other people's agents run on this computer. Ask their owners to move them first, or name them to unbind them.",
         code: "others_agents_on_computer",
@@ -695,9 +696,9 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/cancel-ack", a
       ? body.outcome
       : null;
     if (!migrationRef || !transportGeneration || !cancelGeneration || !role || !outcome) {
-      res.status(400).json({
-        error: "migrationRef, transportGeneration, cancelGeneration, role, and outcome are required",
+      refuse(res, 400, {
         code: "migration_cancel_ack_input_required",
+        error: "migrationRef, transportGeneration, cancelGeneration, role, and outcome are required",
       });
       return;
     }
@@ -739,7 +740,7 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/resumable/sour
     const body = jsonBody(req);
     const receipt = body.receipt;
     if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) {
-      res.status(400).json({ error: "receipt is required", code: "migration_source_quiesce_receipt_required" });
+      refuse(res, 400, { code: "migration_source_quiesce_receipt_required", error: "receipt is required" });
       return;
     }
     const migration = await recordAgentMigrationSourceQuiesced({
@@ -791,7 +792,7 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/resumable/cont
     }
     const control = jsonBody(req).control;
     if (!control || typeof control !== "object" || Array.isArray(control)) {
-      res.status(400).json({ error: "control is required", code: "migration_control_manifest_required" });
+      refuse(res, 400, { code: "migration_control_manifest_required", error: "control is required" });
       return;
     }
     const registered = await registerAgentMigrationControlManifest({
@@ -966,7 +967,7 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/start-transfer
     }
     const migrationGeneration = requiredString(jsonBody(req), "migrationGeneration");
     if (!migrationGeneration) {
-      res.status(400).json({ error: "migrationGeneration is required", code: "migration_generation_required" });
+      refuse(res, 400, { code: "migration_generation_required", error: "migrationGeneration is required" });
       return;
     }
     const view = await startAgentMigrationTargetImport({
@@ -991,7 +992,7 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/flip-machine",
     }
     const migrationGeneration = requiredString(jsonBody(req), "migrationGeneration");
     if (!migrationGeneration) {
-      res.status(400).json({ error: "migrationGeneration is required", code: "migration_generation_required" });
+      refuse(res, 400, { code: "migration_generation_required", error: "migrationGeneration is required" });
       return;
     }
     const view = await flipAgentMigrationTargetImport({
@@ -1021,17 +1022,17 @@ internalComputerRouter.post("/agent-migrations/by-id/:migrationId/arrived", asyn
     const body = jsonBody(req);
     const migrationGeneration = requiredString(body, "migrationGeneration");
     if (!migrationGeneration) {
-      res.status(400).json({ error: "migrationGeneration is required", code: "migration_generation_required" });
+      refuse(res, 400, { code: "migration_generation_required", error: "migrationGeneration is required" });
       return;
     }
     const reportPath = body.reportPath === undefined || body.reportPath === null ? null : requiredString(body, "reportPath");
     const reportSha256 = body.reportSha256 === undefined || body.reportSha256 === null ? null : requiredString(body, "reportSha256");
     if (body.reportPath !== undefined && body.reportPath !== null && !reportPath) {
-      res.status(400).json({ error: "reportPath must be a non-empty string", code: "report_path_invalid" });
+      refuse(res, 400, { code: "report_path_invalid", error: "reportPath must be a non-empty string" });
       return;
     }
     if (body.reportSha256 !== undefined && body.reportSha256 !== null && !reportSha256) {
-      res.status(400).json({ error: "reportSha256 must be a non-empty string", code: "report_sha256_invalid" });
+      refuse(res, 400, { code: "report_sha256_invalid", error: "reportSha256 must be a non-empty string" });
       return;
     }
     const orchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
@@ -1181,7 +1182,7 @@ internalComputerRouter.get("/runners", async (req, res) => {
     }
     const scope = typeof req.query.scope === "string" ? req.query.scope : null;
     if (scope && scope !== "machine" && scope !== "server") {
-      res.status(400).json({ error: "Invalid runners scope", code: "invalid_scope" });
+      refuse(res, 400, { code: "invalid_scope", error: "Invalid runners scope" });
       return;
     }
     const db = getDb();
@@ -1263,7 +1264,7 @@ internalComputerRouter.post("/runners/:agentId/stop", async (req, res) => {
       .where(and(eq(agents.id, targetAgentId), isNull(agents.deletedAt)));
     if (!agentRow || agentRow.serverId !== serverId || agentRow.machineId !== context.machineId) {
       // Uniform 404 — never leak whether another server's agent exists.
-      res.status(404).json({ error: "Agent not found", code: "agent_missing" });
+      refuse(res, 404, { code: "agent_missing", error: "Agent not found" });
       return;
     }
 
@@ -1352,13 +1353,13 @@ internalComputerRouter.post("/runners/:agentId/credentials", async (req, res) =>
       .from(agents)
       .where(and(eq(agents.id, targetAgentId), isNull(agents.deletedAt)));
     if (!agentRow) {
-      res.status(404).json({ error: "Agent not found", code: "agent_missing" });
+      refuse(res, 404, { code: "agent_missing", error: "Agent not found" });
       return;
     }
     if (agentRow.serverId !== serverId || agentRow.machineId !== context.machineId) {
       // Same 404 shape as agent_missing — don't leak existence of other
       // servers' agents to a Computer attached to a different server.
-      res.status(404).json({ error: "Agent not found", code: "agent_missing" });
+      refuse(res, 404, { code: "agent_missing", error: "Agent not found" });
       return;
     }
 
@@ -1368,33 +1369,33 @@ internalComputerRouter.post("/runners/:agentId/credentials", async (req, res) =>
     if (body.scopes === undefined) {
       scopes = [...COMPUTER_MINTABLE_AGENT_CAPABILITIES];
     } else if (!Array.isArray(body.scopes)) {
-      res.status(400).json({
-        error: "scopes must be an array of capability literals",
+      refuse(res, 400, {
         code: "scopes_invalid",
+        error: "scopes must be an array of capability literals",
       });
       return;
     } else {
       try {
         scopes = normalizeAgentCapabilities(body.scopes as readonly string[]);
       } catch {
-        res.status(400).json({
-          error: `scopes must each be one of: ${ALLOWED_AGENT_CAPABILITIES.join(", ")}`,
+        refuse(res, 400, {
           code: "scopes_invalid",
+          error: `scopes must each be one of: ${ALLOWED_AGENT_CAPABILITIES.join(", ")}`,
         });
         return;
       }
       if (scopes.length === 0) {
-        res.status(400).json({
-          error: "scopes must include at least one capability",
+        refuse(res, 400, {
           code: "scopes_empty",
+          error: "scopes must include at least one capability",
         });
         return;
       }
       const beyondCeiling = scopes.filter((scope) => !COMPUTER_MINTABLE_AGENT_CAPABILITY_SET.has(scope));
       if (beyondCeiling.length > 0) {
-        res.status(403).json({
-          error: `A Computer may issue only: ${COMPUTER_MINTABLE_AGENT_CAPABILITIES.join(", ")}`,
+        refuse(res, 403, {
           code: "scope_not_allowed_for_computer",
+          error: `A Computer may issue only: ${COMPUTER_MINTABLE_AGENT_CAPABILITIES.join(", ")}`,
         });
         return;
       }
@@ -1403,9 +1404,9 @@ internalComputerRouter.post("/runners/:agentId/credentials", async (req, res) =>
     let name: string | null = null;
     if (body.name !== undefined && body.name !== null) {
       if (typeof body.name !== "string" || body.name.length === 0 || body.name.length > 200) {
-        res.status(400).json({
-          error: "name must be a non-empty string up to 200 chars",
+        refuse(res, 400, {
           code: "name_invalid",
+          error: "name must be a non-empty string up to 200 chars",
         });
         return;
       }
@@ -1452,7 +1453,7 @@ internalComputerRouter.post("/runners/:agentId/credentials", async (req, res) =>
       }, { executor: tx });
     });
     if (!minted) {
-      res.status(401).json({ error: "This Computer's key was revoked", code: "computer_revoked" });
+      refuse(res, 401, { code: "computer_revoked", error: "This Computer's key was revoked" });
       return;
     }
 
@@ -1469,7 +1470,7 @@ internalComputerRouter.post("/runners/:agentId/credentials", async (req, res) =>
     });
   } catch (err) {
     if (err instanceof Error && err.message === "agent_missing") {
-      res.status(404).json({ error: "Agent not found", code: "agent_missing" });
+      refuse(res, 404, { code: "agent_missing", error: "Agent not found" });
       return;
     }
     sendJsonServerError(req, res, { error: "Failed to mint runner credential", logPrefix: "internal.computer.runners.credentials.mint error:", err });
@@ -1623,124 +1624,6 @@ internalComputerRouter.post("/runners/:agentId/credentials/renew", async (req, r
 });
 
 /**
- * POST /internal/computer/runners/:agentId/provider-connection
- *
- * Materializes the exact provider assignment only for the Computer currently
- * hosting the Agent. The ordinary agent:start payload remains credential-free.
- */
-internalComputerRouter.post("/runners/:agentId/provider-connection", async (req, res) => {
-  try {
-    const context = await computerMigrationContext(req, res);
-    if (!context) {
-      res.status(500).json({ error: "Computer authentication state missing" });
-      return;
-    }
-    if (!await isProviderConnectionsEnabled(context.serverId)) {
-      res.status(404).json({
-        error: "Provider connections are not enabled for this server",
-        code: "provider_connections_disabled",
-      });
-      return;
-    }
-    const body = jsonBody(req);
-    if (Object.keys(body).length !== 1 || typeof body.connectionId !== "string" || !body.connectionId) {
-      res.status(400).json({ error: "connectionId is required", code: "provider_connection_invalid" });
-      return;
-    }
-
-    const targetAgentId = req.params.agentId;
-    const [agentRow] = await getDb()
-      .select({ id: agents.id })
-      .from(agents)
-      .where(and(
-        eq(agents.id, targetAgentId),
-        eq(agents.serverId, context.serverId),
-        eq(agents.machineId, context.machineId),
-        isNull(agents.deletedAt),
-      ));
-    if (!agentRow) {
-      res.status(404).json({ error: "Agent not found", code: "agent_missing" });
-      return;
-    }
-
-    const launch = await resolveProviderConnectionLaunch({
-      serverId: context.serverId,
-      agentId: targetAgentId,
-      connectionId: body.connectionId,
-    });
-    res.status(200).json(launch);
-  } catch (error) {
-    if (error instanceof ProviderConnectionError) {
-      // The try-block locals are not visible here, so derive the observability
-      // context straight from the request.
-      const failure = providerConnectionLaunchFailureResponse(error, {
-        serverId: req.serverId ?? "",
-        connectionId: typeof req.body?.connectionId === "string" ? req.body.connectionId : "",
-        agentId: req.params.agentId,
-      });
-      res.status(failure.status).json(failure.body);
-      return;
-    }
-    sendJsonServerError(req, res, { error: "Failed to materialize provider connection", logPrefix: "internal.computer.runners.provider-connection error:", err: error });
-  }
-});
-
-/**
- * POST /internal/computer/probes/:probeId/materialize
- *
- * One-time, machine-authenticated materialization for a probe claim. The
- * machine command never carries credentials; this endpoint is the only place
- * a probe sees them, and the intent's claim column group makes it exactly
- * once per carrier (same claimant may retry inside the lease).
- */
-internalComputerRouter.post("/probes/:probeId/materialize", async (req, res) => {
-  try {
-    const context = await computerMigrationContext(req, res);
-    if (!context) {
-      res.status(500).json({ error: "Computer authentication state missing" });
-      return;
-    }
-    if (!await isProviderProbesEnabled(context.serverId)) {
-      res.status(404).json({ error: "Provider probes are not enabled for this server", code: "probe_disabled" });
-      return;
-    }
-    const probeId = req.params.probeId;
-    if (!isProviderProbeId(probeId)) {
-      res.status(400).json({ error: "Provider probe id is invalid", code: "probe_invalid" });
-      return;
-    }
-    const body = jsonBody(req);
-    if (Object.keys(body).length !== 1 || typeof body.claimRequestId !== "string" || !body.claimRequestId) {
-      res.status(400).json({ error: "claimRequestId is required", code: "probe_invalid" });
-      return;
-    }
-    const orchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
-    const fact = await orchestrator?.readProbeCarrierFact(context.machineId) ?? null;
-    const payload = await materializeProviderProbe({
-      serverId: context.serverId,
-      probeId,
-      machineId: context.machineId,
-      claimRequestId: body.claimRequestId,
-      fact,
-    });
-    res.status(200).json(payload);
-  } catch (error) {
-    if (error instanceof ProviderProbeError) {
-      const status = error.code === "probe_not_found" || error.code === "probe_disabled"
-        ? 404
-        : error.code === "probe_invalid"
-          ? 400
-          : error.code === "probe_expired"
-            ? 410
-            : 409;
-      res.status(status).json({ error: error.message, code: error.code });
-      return;
-    }
-    sendJsonServerError(req, res, { error: "Failed to materialize probe", logPrefix: "internal.computer.probes.materialize error:", err: error });
-  }
-});
-
-/**
  * DELETE /internal/computer/runners/:agentId/credentials/:credentialId
  *
  * Managed-runner launch cleanup. External/bootstrap credentials can be
@@ -1760,7 +1643,7 @@ internalComputerRouter.delete("/runners/:agentId/credentials/:credentialId", asy
       eq(agents.machineId, context.machineId), isNull(agents.deletedAt),
     ));
     if (!agent) {
-      res.status(404).json({ error: "Agent not found", code: "agent_missing" });
+      refuse(res, 404, { code: "agent_missing", error: "Agent not found" });
       return;
     }
     const outcome = await revokeAgentCredentialWithOutcome({
@@ -1771,16 +1654,16 @@ internalComputerRouter.delete("/runners/:agentId/credentials/:credentialId", asy
       issuedByMachineId: context.machineId,
     });
     if (outcome === null) {
-      res.status(404).json({ error: "Credential not found", code: "credential_missing" });
+      refuse(res, 404, { code: "credential_missing", error: "Credential not found" });
       return;
     }
     if (outcome === "not_issued_by_machine") {
       // Human, app, provision and other Machines' credentials of this agent
       // stay valid. Daemons send this DELETE once and only trace the status,
       // so a distinct code is enough for them not to retry.
-      res.status(403).json({
-        error: "This Computer did not issue this credential",
+      refuse(res, 403, {
         code: "credential_not_issued_by_this_computer",
+        error: "This Computer did not issue this credential",
       });
       return;
     }
@@ -1794,28 +1677,3 @@ internalComputerRouter.delete("/runners/:agentId/credentials/:credentialId", asy
     });
   }
 });
-
-/**
- * Launch-failure mapping for the provider materialization exit. The
- * enforcement-blocked case keeps its own response code AND a structured log
- * line so the post-flip 24h monitor can count it separately from generic
- * unavailability (Cardy P1 on the flip runbook).
- */
-export function providerConnectionLaunchFailureResponse(
-  error: ProviderConnectionError,
-  context: { serverId: string; connectionId: string; agentId: string },
-): { status: number; body: { error: string; code: string } } {
-  if (error.code === "provider_connection_key_missing") {
-    return { status: 503, body: { error: "Provider connection is unavailable", code: "provider_connection_key_missing" } };
-  }
-  if (error.code === "provider_connection_unverified") {
-    console.warn("[provider-probe] launch blocked: no fresh Computer verification", {
-      serverId: context.serverId,
-      connectionId: context.connectionId,
-      agentId: context.agentId,
-      code: error.code,
-    });
-    return { status: 409, body: { error: "Provider connection lacks a fresh Computer verification", code: "provider_connection_unverified" } };
-  }
-  return { status: 409, body: { error: "Provider connection is unavailable", code: "provider_connection_unavailable" } };
-}

@@ -7,6 +7,28 @@ import type { FrameBox } from "./artifactTrackedPlaces";
 
 // The comments context's shapes (ArtifactCommentsContext re-exports them).
 
+/**
+ * Live anchor metadata captured atomically at the moment an `AnnotationRect`
+ * was measured (never lazily during render): `dx`/`dy` are the rect's offset
+ * from `element.getBoundingClientRect()` at capture time so later scroll or
+ * resize shifts the virtual anchor without drift across re-renders or
+ * compose -> thread handoffs (`revealSent`).
+ */
+export interface LiveAnchorSpec {
+  element: Element;
+  dx: number;
+  dy: number;
+}
+
+export function captureLiveAnchor(
+  rect: AnnotationRect | null | undefined,
+  element: Element | null | undefined,
+): LiveAnchorSpec | null {
+  if (!rect || !element || !element.isConnected) return null;
+  const origin = element.getBoundingClientRect();
+  return { element, dx: rect.x - origin.left, dy: rect.y - origin.top };
+}
+
 /** Where a new comment goes: the whole Artifact, or a file (and a place in it). */
 export type ArtifactCommentTarget =
   | { scope: "artifact" }
@@ -37,8 +59,8 @@ export interface ArtifactBubbleKeyboard {
  * (useUnsentCommentOffer), so it takes no focus (no keyboard pops up on a phone).
  */
 export type ArtifactCommentBubble =
-  | { kind: "thread"; threadId: ArtifactCommentId; rect: AnnotationRect; key: number; fromFrame: boolean; pinned: boolean; sent?: ArtifactCommentId; keyboard?: ArtifactBubbleKeyboard | null }
-  | { kind: "compose"; target: ArtifactCommentTarget; rect: AnnotationRect | null; key: number; fromPage: { draft: string | null } | null; restored?: boolean };
+  | { kind: "thread"; threadId: ArtifactCommentId; rect: AnnotationRect; liveAnchor?: LiveAnchorSpec | null; key: number; fromFrame: boolean; pinned: boolean; sent?: ArtifactCommentId; keyboard?: ArtifactBubbleKeyboard | null }
+  | { kind: "compose"; target: ArtifactCommentTarget; rect: AnnotationRect | null; liveAnchor?: LiveAnchorSpec | null; key: number; fromPage: { draft: string | null } | null; restored?: boolean };
 
 /**
  * A review the list is opened at, and how to leave it (the address that names it is its owner's).
@@ -64,6 +86,7 @@ export type ShownReview =
 /** Where a comment was sent from that closes when it sends: its card's place, and the new comment's card it was (null: a selection's). */
 export interface SentFrom {
   rect: AnnotationRect | null;
+  liveAnchor?: LiveAnchorSpec | null;
   bubbleKey: number | null;
 }
 
@@ -96,4 +119,6 @@ export interface ArtifactFrameLayer {
   handle?: Ref<PortholeFrameHandle>;
   /** The comments' own: what the frame is drawn in (ArtifactFrame), where a card that took no focus finds it to give it the focus. */
   box?: RefObject<HTMLDivElement | null>;
+  /** Captures a live anchor offset against `anchorEl` (or the frame container) at the moment `rect` was measured. */
+  captureAnchor?: (rect: AnnotationRect | null, anchorEl?: Element | null) => LiveAnchorSpec | null;
 }

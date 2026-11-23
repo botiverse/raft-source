@@ -15,6 +15,7 @@ import {
   type ComputerAuthDenyReason,
 } from "../services/computerCredentialService";
 import { getServer } from "../services/serverService";
+import { legacyMachineKeyStanding } from "../lib/legacyMachineKeyStanding";
 import type {
   AgentOrchestrator,
   MachineConnectionPrincipalKind,
@@ -59,6 +60,7 @@ type AuthStage =
   | "machine_lookup"
   | "legacy_migration"
   | "server_lookup"
+  | "registrant_membership"
   | "exception";
 type UpgradeAuthResult =
   | { outcome: "accepted"; principalKind: PrincipalKind; machine: MatchedMachine; computerId?: string }
@@ -122,9 +124,15 @@ async function resolveUpgradeAuth(apiKey: string | null, argon2Stats: Argon2Veri
   if (legacyKeyMigratedAt) {
     return { outcome: "rejected", principalKind, reason: "legacy_machine_key_migrated", stage: "legacy_migration" };
   }
-  const server = await getServer(machine.serverId);
-  if (!server) {
+  // A live server, and the person who registered the machine still a member
+  // of it (#wg-rbac:#78). A departed registrant's key answers as an invalid
+  // key, which a daemon stops retrying.
+  const standing = await legacyMachineKeyStanding(machine);
+  if (standing === "server_gone") {
     return { outcome: "rejected", principalKind, reason: "server_not_found", stage: "server_lookup" };
+  }
+  if (standing === "registrant_departed") {
+    return { outcome: "rejected", principalKind, reason: "machine_key_invalid", stage: "registrant_membership" };
   }
   return { outcome: "accepted", principalKind, machine };
 }

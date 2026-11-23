@@ -71,6 +71,8 @@ export function blockedNoticeNames(message: string, url: string): boolean {
  * their click, and the view it would open would take the place of what they are using.
  */
 export function readerInFrame(frameRoot: Element | null): boolean {
-  const active = document.activeElement;
-  return active === null || active === document.body || (frameRoot !== null && frameRoot.contains(active));
+  // The frame's own document (an object window's has its own focus, #337 PR3).
+  const doc = frameRoot?.ownerDocument ?? document;
+  const active = doc.activeElement;
+  return active === null || active === doc.body || (frameRoot !== null && frameRoot.contains(active));
 }

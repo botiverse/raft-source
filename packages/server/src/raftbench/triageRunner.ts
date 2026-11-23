@@ -3,14 +3,14 @@ import { and, eq, gte, inArray, lt, sql } from "drizzle-orm";
 import { currentDate } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import { messages, raftbenchConfigs, raftbenchMessageLabels, raftbenchTriageBatches } from "../db/schema";
-import { evaluateFeatureFlag } from "../services/featureFlagService";
+import { evaluateFeatureFlag, RAFTBENCH_TRIAGE_FEATURE_FLAG_KEY } from "../services/featureFlagService";
 import { recordTraceEvent } from "../tracing/semanticTrace";
 import { assertLiveSources, RaftbenchError, sourceContentVersion } from "./service";
 import { withSenderNames } from "./sourcePage";
 import { estimateTokens, packTriageBatches, TRIAGE_BATCH_TOKENS, parseTriageOutput, type TriageBatch, type TriageThread } from "./triage";
 import { TRIAGE_MODEL, TriageModelError, triageModelClient, type TriageModelClient } from "./triageModel";
 
-export const TRIAGE_FLAG = "raftbench_triage_v0";
+export const TRIAGE_FLAG = RAFTBENCH_TRIAGE_FEATURE_FLAG_KEY;
 const SERVER_CONCURRENCY = 4, GLOBAL_CONCURRENCY = 8;
 // Weighted tokens: input + 5 × output, matching Haiku's price ratio, and 5× again above
 // 100k input tokens, where the price tier changes. Provisional until the budget is approved.

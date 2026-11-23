@@ -7,8 +7,10 @@ import {
   parseRuntimeConfig,
   runtimeConfigToLaunchFields,
   runtimeModelSupportsFastMode,
+  runtimeServiceTierText,
   stripControlledRuntimeEnvVars,
   isControlledRuntimeEnvKey,
+  isBuiltInRuntimeConfigMissingProvider,
   type ReasoningEffort,
 } from "./index";
 
@@ -477,41 +479,33 @@ test("Built-in runtime accepts only the preset provider and forbids host user st
   assert.equal(runtimeConfigToLaunchFields(result.config).reasoningEffort, "high");
 });
 
-test("Built-in managed connection persists only a reference and emits no provider credential env", () => {
-  const result = parseRuntimeConfig({
-    runtimeConfig: {
-      version: 1 as const,
-      runtime: "builtin",
-      provider: { kind: "connection", connectionId: "11111111-1111-4111-8111-111111111111" },
-      model: { kind: "preset", id: "deepseek/deepseek-v4-pro" },
-      mode: { kind: "default" },
-      envVars: {
-        DEEPSEEK_API_KEY: "must-be-scrubbed",
-        TEAM_FLAG: "enabled",
-      },
+test("Built-in saved connection: a write is refused, a stored one still hydrates without provider credential env", () => {
+  const stored = {
+    version: 1 as const,
+    runtime: "builtin",
+    provider: { kind: "connection", connectionId: "11111111-1111-4111-8111-111111111111" },
+    model: { kind: "preset", id: "deepseek/deepseek-v4-pro" },
+    mode: { kind: "default" },
+    envVars: {
+      DEEPSEEK_API_KEY: "must-be-scrubbed",
+      TEAM_FLAG: "enabled",
     },
-  });
+  };
+  // Saved provider connections are removed: no write may bind one.
+  const written = parseRuntimeConfig({ runtimeConfig: stored });
+  assert.equal(written.ok, false);
+  if (!written.ok) assert.equal(written.trace.reason, "invalid_provider");
 
-  assert.equal(result.ok, true);
-  if (!result.ok) return;
-  assert.deepEqual(result.config.provider, {
+  // A Computer reading an older config keeps parsing it (hydration is lenient).
+  const config = hydrateRuntimeConfig({ runtime: "builtin", model: "deepseek/deepseek-v4-pro", runtimeConfig: stored });
+  assert.deepEqual(config.runtime === "builtin" ? config.provider : null, {
     kind: "connection",
     connectionId: "11111111-1111-4111-8111-111111111111",
   });
-  const plan = buildLaunchPlan(result.config);
+  const plan = buildLaunchPlan(config);
   assert.equal(plan.trace.provider_kind, "connection");
   assert.equal(plan.trace.provider_key_present, false);
-  assert.equal(plan.trace.provider_key_source, undefined);
-  assert.deepEqual(plan.envVars, { TEAM_FLAG: "enabled" });
-
-  const poisoned = parseRuntimeConfig({
-    runtimeConfig: {
-      ...result.config,
-      provider: { ...result.config.provider, apiKey: "must-not-be-accepted" },
-    },
-  });
-  assert.equal(poisoned.ok, false);
-  if (!poisoned.ok) assert.equal(poisoned.trace.reason, "unknown_field");
+  assert.equal(plan.envVars?.DEEPSEEK_API_KEY, undefined);
 });
 
 test("Built-in runtime maps official providers and strips provider-owned env keys", () => {
@@ -1496,4 +1490,75 @@ test("runtimeSessionHomeEnvVars keeps only the env vars a runtime's session dire
   assert.equal(runtimeSessionHomeEnvVars("codex", null), null);
   assert.equal(runtimeSessionHomeEnvVars("codex", { CODEX_HOME: 7 }), null, "not a string: dropped");
   assert.deepEqual(Object.keys(RUNTIME_SESSION_HOME_ENV_KEYS).sort(), ["codex", "grok", "kimi-sdk"]);
+});
+
+test("a Built-in row that lost its provider is detectable and does not crash the launch projection", () => {
+  // Hydration is lenient: a legacy Built-in row with no versioned config keeps no provider.
+  const config = hydrateRuntimeConfig({ runtime: "builtin", model: "deepseek/deepseek-v4-pro", envVars: null });
+  assert.equal(isBuiltInRuntimeConfigMissingProvider(config), true);
+  // Before: `normalized.provider.kind` threw a bare TypeError here.
+  const plan = buildLaunchPlan(config);
+  assert.equal(plan.trace.provider_kind, "none");
+  assert.equal(plan.trace.provider_key_present, false);
+  assert.doesNotThrow(() => runtimeConfigToLaunchFields(config));
+
+  const complete = parseRuntimeConfig({
+    runtimeConfig: {
+      version: 1 as const,
+      runtime: "builtin",
+      provider: { kind: "preset", providerId: "deepseek", apiKey: "sk-ds-test" },
+      model: { kind: "preset", id: "deepseek/deepseek-v4-pro" },
+      mode: { kind: "default" },
+    },
+  });
+  assert.equal(complete.ok, true);
+  if (!complete.ok) return;
+  assert.equal(isBuiltInRuntimeConfigMissingProvider(complete.config), false);
+  assert.equal(isBuiltInRuntimeConfigMissingProvider(hydrateRuntimeConfig({ runtime: "codex", model: "gpt-5", envVars: null })), false);
+});
+
+// #wg-runtime-form:#27: a named fast tier (Codex ultrafast).
+const codexFastConfig = (mode: unknown, runtime = "codex", model = "gpt-6.2-astra") => ({
+  runtimeConfig: { version: 1, runtime, model: { kind: "preset", id: model }, mode, reasoningEffort: null, envVars: null },
+});
+
+test("a Codex fast mode keeps a named service tier through parse and launch", () => {
+  const result = parseRuntimeConfig(codexFastConfig({ kind: "fast", serviceTier: "ultrafast" }));
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepEqual(result.config.mode, { kind: "fast", serviceTier: "ultrafast" });
+  assert.deepEqual(runtimeConfigToLaunchFields(result.config).mode, { kind: "fast", serviceTier: "ultrafast" });
+});
+
+test("a named service tier is refused off fast mode, off Codex, and when malformed", () => {
+  const refused = (input: ReturnType<typeof codexFastConfig>) => {
+    const result = parseRuntimeConfig(input);
+    assert.equal(result.ok, false);
+    return result.ok ? "" : result.error;
+  };
+  assert.equal(refused(codexFastConfig({ kind: "default", serviceTier: "ultrafast" })), "runtimeConfig.mode.serviceTier is only valid with fast mode");
+  assert.equal(refused(codexFastConfig({ kind: "fast", serviceTier: "Ultra Fast" })), "runtimeConfig.mode.serviceTier is invalid");
+  assert.equal(refused(codexFastConfig({ kind: "fast", serviceTier: 7 })), "runtimeConfig.mode.serviceTier is invalid");
+  assert.equal(
+    refused(codexFastConfig({ kind: "fast", serviceTier: "ultrafast" }, "claude", "claude-opus-5-5")),
+    "runtimeConfig.mode.serviceTier is not supported for runtime: claude",
+  );
+});
+
+test("hydration keeps a well-formed stored tier and drops a malformed one", () => {
+  const stored = (mode: unknown) => hydrateRuntimeConfig({
+    runtime: "codex",
+    model: "gpt-6.2-astra",
+    runtimeConfig: { version: 1, runtime: "codex", model: { kind: "preset", id: "gpt-6.2-astra" }, mode },
+  } as never).mode;
+  assert.deepEqual(stored({ kind: "fast", serviceTier: "ultrafast" }), { kind: "fast", serviceTier: "ultrafast" });
+  assert.deepEqual(stored({ kind: "fast", serviceTier: "<b>" }), { kind: "fast" });
+  assert.deepEqual(stored({ kind: "fast" }), { kind: "fast" });
+});
+
+test("tier copy from a runtime is one bounded line without control, bidi or zero-width characters", () => {
+  assert.equal(runtimeServiceTierText("Up to 4.5x\nspeed\u202e\u200b", 120), "Up to 4.5x speed");
+  assert.equal(runtimeServiceTierText("x".repeat(50), 10), `${"x".repeat(9)}…`);
+  assert.equal(runtimeServiceTierText("  \u200b ", 10), undefined);
+  assert.equal(runtimeServiceTierText(7, 10), undefined);
 });

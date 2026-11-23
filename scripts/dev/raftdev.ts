@@ -47,6 +47,7 @@ import { basename, dirname, join } from "node:path";
 import { homedir, hostname, tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseReaderStartedAtMs, runTraceCli, traceBannerLines } from "./raftdev-trace";
+import { webViteFloorProblem } from "./raftdev-vite-floor";
 import {
   prepareDevEnvDir,
   recordDevEnvProcesses,
@@ -57,6 +58,12 @@ import {
   type DevEnvDir,
 } from "./raftdev-cache";
 import { POST_MIGRATION_INDEXES } from "../../packages/server/src/db/postMigrationIndexes";
+import {
+  callerAgentId,
+  RAFTDEV_AGENT_LABEL,
+  RAFTDEV_MANAGED_LABEL as SHARED_RAFTDEV_MANAGED_LABEL,
+  SLOCK_AGENT_ID_ENV,
+} from "../../packages/shared/src/agentLeftovers";
 import {
   PREVIEW_CLEANER_PATH,
   PREVIEW_DOCKER_MEMORY_CAPS,
@@ -123,8 +130,22 @@ import {
 export const PROJECT_DIR = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
 /** Durable Docker ownership marker. Cleanup never owns an unlabeled resource. */
-export const RAFTDEV_MANAGED_LABEL = "com.botiverse.raftdev.managed";
+export const RAFTDEV_MANAGED_LABEL: "com.botiverse.raftdev.managed" = SHARED_RAFTDEV_MANAGED_LABEL;
 const RAFTDEV_MANAGED_LABEL_ARG = `${RAFTDEV_MANAGED_LABEL}=true`;
+
+/**
+ * `--label com.botiverse.raftdev.agent=<id>` for a caller with an agent id
+ * (SLOCK_AGENT_ID): `raft-computer leftovers` shows which agent created each
+ * container (#raft-architecture:#34). Nothing without one.
+ */
+export function raftdevAgentLabelArgs(agentId: string | null | undefined): string[] {
+  return agentId ? ["--label", `${RAFTDEV_AGENT_LABEL}=${agentId}`] : [];
+}
+
+/** The agent running raftdev, when it has a usable SLOCK_AGENT_ID. */
+function raftdevCallerAgentId(): string | null {
+  return callerAgentId(process.env);
+}
 
 const out = (s = ""): void => { process.stdout.write(s + "\n"); };
 
@@ -501,7 +522,7 @@ export function risingWaveDockerRunArgs(
   e: RisingWaveDockerEnv,
   image: string = DEFAULT_RISINGWAVE_IMAGE,
   network?: string,
-  opts: { owner?: string; memoryBytes?: number; configFile?: string } = {},
+  opts: { owner?: string; memoryBytes?: number; configFile?: string; agentId?: string | null } = {},
 ): string[] {
   const memoryBytes = opts.memoryBytes ?? DEFAULT_RISINGWAVE_MEMORY_BYTES;
   const dockerLimit = String(memoryBytes + RISINGWAVE_DOCKER_HEADROOM_BYTES);
@@ -509,6 +530,7 @@ export function risingWaveDockerRunArgs(
     "run", "-d", "--pull=always", "--name", e.RISINGWAVE_CONTAINER,
     "--label", RAFTDEV_MANAGED_LABEL_ARG,
     ...(opts.owner ? ["--label", `${RAFTDEV_OWNER_LABEL}=${opts.owner}`] : []),
+    ...raftdevAgentLabelArgs(opts.agentId),
     ...(network ? ["--network", network] : []),
     "-p", `127.0.0.1:${e.RISINGWAVE_PORT}:4566`,
     "-p", `127.0.0.1:${e.RISINGWAVE_DASHBOARD_PORT}:5691`,
@@ -523,15 +545,16 @@ export function risingWaveDockerRunArgs(
   ];
 }
 
-export function postgresDockerRunArgs(e: PostgresDockerEnv, cdcEnabled = false): string[] {
+export function postgresDockerRunArgs(e: PostgresDockerEnv, cdcEnabled = false, agentId: string | null = null): string[] {
   return [
     "run", "-d", "--name", e.CONTAINER,
     "--label", RAFTDEV_MANAGED_LABEL_ARG,
+    ...raftdevAgentLabelArgs(agentId),
     ...(cdcEnabled ? ["--network", e.RISINGWAVE_NETWORK] : []),
     "-e", "POSTGRES_DB=slock",
     "-e", "POSTGRES_USER=postgres",
     "-e", `POSTGRES_PASSWORD=${e.POSTGRES_PASSWORD}`,
-    "-p", `${e.PG_PORT}:5432`,
+    "-p", `127.0.0.1:${e.PG_PORT}:5432`,
     "postgres:16-alpine",
     ...(cdcEnabled ? [
       "-c", "wal_level=logical",
@@ -1149,6 +1172,27 @@ function sh(
     stdio: [opts.input !== undefined ? "pipe" : opts.quiet ? "ignore" : "inherit", "pipe", "pipe"],
   });
   return { code: r.status ?? 1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
+/** tmux 3.2 added `new-session -e`; an unknown version (`master`, none) counts as older. */
+export function tmuxSupportsSessionEnv(versionText: string): boolean {
+  const match = /(\d+)\.(\d+)/.exec(versionText);
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return major > 3 || (major === 3 && minor >= 2);
+}
+
+/**
+ * `new-session -e SLOCK_AGENT_ID=<caller's>`: panes inherit the tmux
+ * SERVER's environment, so on a server another agent started they would
+ * carry that agent's id. The session's own value names the caller for its
+ * panes (#raft-architecture:#34). Nothing without a caller id or on a tmux
+ * older than 3.2.
+ */
+export function tmuxSessionAgentEnvArgs(env: NodeJS.ProcessEnv, tmuxVersionText: string): string[] {
+  const agentId = callerAgentId(env);
+  return agentId && tmuxSupportsSessionEnv(tmuxVersionText) ? ["-e", `${SLOCK_AGENT_ID_ENV}=${agentId}`] : [];
 }
 
 function runRequiredTmux(args: string[], windowName: string): void {
@@ -3163,6 +3207,12 @@ function cmdStart(args: string[], preview?: PreviewStartHooks): void {
     out(`ERROR: ${(error as Error).message}`);
     process.exit(1);
   }
+  // Before anything starts: an old Vite in this worktree's node_modules must never reach a tunnel.
+  const viteProblem = webViteFloorProblem(PROJECT_DIR);
+  if (viteProblem) {
+    out(`ERROR: ${viteProblem}`);
+    process.exit(1);
+  }
   const e = setupEnv(name);
   let risingWave: RisingWaveDependencyConfig;
   try {
@@ -3488,7 +3538,7 @@ function cmdStart(args: string[], preview?: PreviewStartHooks): void {
   } else {
     out(`Creating PostgreSQL container ${e.CONTAINER}...`);
     const launch = sh("docker", withDockerMemoryCap(
-      postgresDockerRunArgs(e, risingWaveFull),
+      postgresDockerRunArgs(e, risingWaveFull, raftdevCallerAgentId()),
       preview ? PREVIEW_DOCKER_MEMORY_CAPS.postgres : undefined,
     ), { quiet: true });
     preview?.containerCreated(e.CONTAINER);
@@ -3511,7 +3561,8 @@ function cmdStart(args: string[], preview?: PreviewStartHooks): void {
     sh("docker", withDockerMemoryCap([
       "run", "-d", "--name", e.REDIS_CONTAINER,
       "--label", RAFTDEV_MANAGED_LABEL_ARG,
-      "-p", `${e.REDIS_PORT}:6379`,
+      ...raftdevAgentLabelArgs(raftdevCallerAgentId()),
+      "-p", `127.0.0.1:${e.REDIS_PORT}:6379`,
       "redis:7-alpine",
     ], preview ? PREVIEW_DOCKER_MEMORY_CAPS.redis : undefined), { quiet: true });
     preview?.containerCreated(e.REDIS_CONTAINER);
@@ -3564,6 +3615,7 @@ function cmdStart(args: string[], preview?: PreviewStartHooks): void {
           owner: raftdevOwner(PROJECT_DIR),
           memoryBytes: parseRisingWaveMemoryBytes(process.env.RAFTDEV_RW_MEMORY_BYTES),
           configFile: risingWaveConfigFile,
+          agentId: raftdevCallerAgentId(),
         },
       ),
       { quiet: true },
@@ -3599,12 +3651,13 @@ function cmdStart(args: string[], preview?: PreviewStartHooks): void {
     sh("docker", withDockerMemoryCap([
       "run", "-d", "--name", e.RUSTFS_CONTAINER,
       "--label", RAFTDEV_MANAGED_LABEL_ARG,
+      ...raftdevAgentLabelArgs(raftdevCallerAgentId()),
       "-e", "RUSTFS_ADDRESS=:9000",
       "-e", `RUSTFS_ACCESS_KEY=${e.RUSTFS_ACCESS_KEY}`,
       "-e", `RUSTFS_SECRET_KEY=${e.RUSTFS_SECRET_KEY}`,
       "-e", "RUSTFS_CONSOLE_ENABLE=true",
-      "-p", `${e.RUSTFS_PORT}:9000`,
-      "-p", `${e.RUSTFS_CONSOLE_PORT}:9001`,
+      "-p", `127.0.0.1:${e.RUSTFS_PORT}:9000`,
+      "-p", `127.0.0.1:${e.RUSTFS_CONSOLE_PORT}:9001`,
       "-v", `${e.RUSTFS_VOLUME}:/data`,
       "mirror.gcr.io/rustfs/rustfs:latest",
       "/data",
@@ -3884,6 +3937,8 @@ function cmdStart(args: string[], preview?: PreviewStartHooks): void {
       "MOBILE_OAUTH_RETURN_URI",
       "MOBILE_OAUTH_ALLOWED_RETURN_URIS",
       "SLOCK_MCP_CREDENTIAL_KEY",
+      "SLOCK_PROVIDER_CREDENTIAL_KEY",
+      "SLOCK_PROVIDER_CREDENTIAL_KEY_PREVIOUS",
       "SLOCK_E2E_AUTO_VERIFY_EMAIL",
     ]) serverCmd += `${passthrough(v)} `;
     serverCmd += "pnpm --filter @botiverse/raft-server dev";
@@ -3893,7 +3948,11 @@ function cmdStart(args: string[], preview?: PreviewStartHooks): void {
   // Window 0: server (replica 1) — creates the tmux session. This is byte-for-
   // byte the historical single-replica server window when replicas === 1.
   runRequiredTmux(
-    ["new-session", "-d", "-s", e.TMUX_SESSION, "-n", replicaWindowName(1), "-c", PROJECT_DIR, runTmuxShellCommand(buildServerCmd(1))],
+    [
+      "new-session", "-d",
+      ...tmuxSessionAgentEnvArgs(process.env, sh("tmux", ["-V"], { quiet: true }).stdout),
+      "-s", e.TMUX_SESSION, "-n", replicaWindowName(1), "-c", PROJECT_DIR, runTmuxShellCommand(buildServerCmd(1)),
+    ],
     replicaWindowName(1),
   );
   preview?.tmuxStarted();
@@ -4031,6 +4090,7 @@ function cmdStart(args: string[], preview?: PreviewStartHooks): void {
       `docker rm -f ${shellQuote(e.OTELCOL_CONTAINER)} >/dev/null 2>&1; ` +
       `exec docker run --rm --name ${shellQuote(e.OTELCOL_CONTAINER)} ` +
       `--label ${shellQuote(RAFTDEV_MANAGED_LABEL_ARG)} ` +
+      raftdevAgentLabelArgs(raftdevCallerAgentId()).map((arg) => `${shellQuote(arg)} `).join("") +
       (preview
         ? `--memory ${PREVIEW_DOCKER_MEMORY_CAPS.otelcol} --memory-swap ${PREVIEW_DOCKER_MEMORY_CAPS.otelcol} `
         : "") +

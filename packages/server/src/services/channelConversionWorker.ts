@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { noopTracer, type Tracer } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import { channelConversionJobs } from "../db/schema";
@@ -29,7 +29,9 @@ export async function runChannelConversionWorkerPass(
   const db = getDb();
   const jobs = await db.select({ id: channelConversionJobs.id }).from(channelConversionJobs)
     .where(or(
-      inArray(channelConversionJobs.status, ["pending", "running"]),
+      // An online move waits for its mover and switch (later steps), not for a
+      // phase: never picked, so it cannot crowd runnable jobs out of the 8.
+      and(inArray(channelConversionJobs.status, ["pending", "running"]), ne(channelConversionJobs.phase, "online_move")),
       and(inArray(channelConversionJobs.status, ["done", "canceled", "failed"]), sql`${channelConversionJobs.progress}->>'completionBroadcastAt' IS NULL`),
     ))
     .orderBy(asc(channelConversionJobs.updatedAt)).limit(8);
@@ -49,9 +51,21 @@ export async function runChannelConversionWorkerPass(
     }
     await onProgress?.(job);
     if ((job.status === "done" || job.status === "canceled" || job.status === "failed") && onProgress) {
+      // Mark only the finished job we broadcast: a retry keeps the epoch
+      // (unless it rolled back) and can fail again, so status + epoch alone
+      // could mark a newer failure nobody was told about; updated_at tells
+      // them apart. Compare at the JS Date's millisecond precision: the column
+      // keeps microseconds (a row default or SQL now()), and an exact match
+      // against the truncated Date never lands, so every pass re-broadcast
+      // the job forever (2026-11-19 incident).
       await db.update(channelConversionJobs).set({
         progress: sql`${channelConversionJobs.progress} || jsonb_build_object('completionBroadcastAt', now())`,
-      }).where(and(eq(channelConversionJobs.id, job.id), eq(channelConversionJobs.conversionEpoch, job.conversionEpoch), eq(channelConversionJobs.status, job.status), eq(channelConversionJobs.updatedAt, job.updatedAt)));
+      }).where(and(
+        eq(channelConversionJobs.id, job.id),
+        eq(channelConversionJobs.conversionEpoch, job.conversionEpoch),
+        eq(channelConversionJobs.status, job.status),
+        sql`date_trunc('milliseconds', ${channelConversionJobs.updatedAt}) = ${job.updatedAt.toISOString()}::timestamptz`,
+      ));
     }
   }
   await runExternalConnectWorkerPass(onExternalConnected);

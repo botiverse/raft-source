@@ -3,8 +3,9 @@
 // answer, its expiry or a refusal: every span carries the continuation id
 // and the agent's runtime. Never the command's arguments, an answer's text
 // or the journal: the choice is an option key, the rest are ids, codes and
-// times.
-import type { AskSpec } from "@botiverse/raft-shared/src/continuations/index";
+// times. A span written while answering (`cont`, or the daemon's
+// answer_continuation tool) also carries `via`: how the answer came in.
+import type { AskSpec, ContinuationAnswerVia } from "@botiverse/raft-shared/src/continuations/index";
 
 import { cliTraceRuntime, emitCliTraceSpan } from "../../transportTrace";
 import { normalizeVersion, readCliVersion } from "../../version";
@@ -13,6 +14,12 @@ export interface ContinuationTraceScope {
   agentId: string;
   serverId: string | null;
   env: NodeJS.ProcessEnv;
+  /**
+   * Set while answering a continuation: "tool" when the daemon's answer tool
+   * started this `raft __continue` (RAFT_CONTINUATION_VIA=tool), else "cont".
+   * Absent on a command's own first run, which no answer started.
+   */
+  via?: ContinuationAnswerVia;
 }
 
 /** Which kind of ask paused the command: options only, options one of which takes text, or text alone. */
@@ -33,7 +40,7 @@ function emit(
     emitCliTraceSpan(
       name,
       // `cli_version`: readings split by CLI version (the span's resource carries none).
-      { producer: "cli", ...attrs, runtime: cliTraceRuntime(scope.env), cli_version: normalizeVersion(readCliVersion()) ?? undefined, serverId: scope.serverId, agentId: scope.agentId },
+      { producer: "cli", ...attrs, ...(scope.via ? { via: scope.via } : {}), runtime: cliTraceRuntime(scope.env), cli_version: normalizeVersion(readCliVersion()) ?? undefined, serverId: scope.serverId, agentId: scope.agentId },
       { status, kind: "internal" },
       scope.env,
     );

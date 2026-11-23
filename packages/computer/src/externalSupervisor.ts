@@ -277,9 +277,16 @@ export const UPGRADE_SAFE_KILL_MODES: readonly string[] = ["process", "mixed"];
  */
 export type SystemdScopeProbe = (scope: SupervisorScope) => Promise<SystemctlResult>;
 
-/** The installer's own `systemd-run` shape, with `true` for the work. */
+/**
+ * The installer's own `systemd-run` shape, with `true` for the work, plus
+ * `--no-ask-password`: never a polkit prompt (a desktop agent could otherwise
+ * show one), a refusal is answered at once. It leaves nothing behind: `true`
+ * exits at once, the scope ends with it and `--collect` drops the unit even
+ * when it failed. Used before a web upgrade's spawn and at runner start
+ * (upgradeScope.ts, `ready.upgradeScope`).
+ */
 export function systemdScopeProbeArgs(scope: SupervisorScope): string[] {
-  return [...(scope === "user" ? ["--user"] : []), "--scope", "--quiet", "--collect", "--", "true"];
+  return [...(scope === "user" ? ["--user"] : []), "--scope", "--quiet", "--collect", "--no-ask-password", "--", "true"];
 }
 
 export const runSystemdScopeProbe: SystemdScopeProbe = (scope) => runBounded("systemd-run", systemdScopeProbeArgs(scope));

@@ -25,30 +25,33 @@ export type RuntimeFormV2Choices =
   | { kind: "select"; options: RuntimeFormV2ChoiceOption[]; allowEmpty: boolean; allowCustom: boolean }
   | { kind: "free_text" };
 
-export type RuntimeFormV2ErrorCode =
-  | "required"
-  | "invalid_url"
-  | "not_a_choice"
-  | "unsupported_required"
+/** Every validation error code validateRuntimeFormV2 reports; the kitchen-sink fixture covers each one it can reach. */
+export const RUNTIME_FORM_V2_ERROR_CODES = [
+  "required",
+  "invalid_url",
+  "not_a_choice",
+  "unsupported_required",
   /** A required field whose option source is `unavailable` (`option_source.status`): retry, or wait. */
-  | "source_unavailable"
+  "source_unavailable",
   /**
    * The selected saved provider connection option is marked `unavailable`
    * (capability `provider.saved_connection`): the stored binding stays visible
    * but cannot be saved over; pick something else.
    */
-  | "connection_unavailable"
+  "connection_unavailable",
   /**
    * The current value is an `OptionSource.unavailableOptions` entry (v3: e.g. a
    * bound saved connection that is disabled) on a source that takes no typed
    * value: shown selected-and-unavailable, pick something else to save.
    */
-  | "option_unavailable"
+  "option_unavailable",
   /**
    * Edit: a blank secret that cannot keep the stored value because a field it
    * is bound to changed (`writeOnlyKeepRequiresUnchanged`); a new one is needed.
    */
-  | "secret_reentry_required";
+  "secret_reentry_required",
+] as const;
+export type RuntimeFormV2ErrorCode = (typeof RUNTIME_FORM_V2_ERROR_CODES)[number];
 
 /** A source that is not live (`option_source.status`); null when live or when the source says nothing. */
 export type RuntimeFormV2SourceStatus = {
@@ -139,6 +142,32 @@ export function runtimeFormV2Choices(
     return { kind: "select", options, allowEmpty: true, allowCustom: false };
   }
   return null;
+}
+
+/** Why a derived effort field offers no level: none for the model, or they could not be read (with the runtime's reason). */
+export type RuntimeFormV2EffortUnavailable =
+  | { kind: "none" }
+  | { kind: "unreadable"; reason: string };
+
+/**
+ * For a derived_select over a model's reasoning efforts that offers nothing:
+ * why, from the selected model option (`reasoningEffortUnavailableReason`,
+ * `reasoningEffortNone`). Null when it offers levels, or when the empty list
+ * was not explained (an older Computer, a model whose id names its level):
+ * the field stays hidden then, as before.
+ */
+export function runtimeFormV2EffortUnavailable(
+  field: RuntimeFormV2Field,
+  sources: RuntimeFormV2Sources,
+  values: RuntimeFormV2Values,
+): RuntimeFormV2EffortUnavailable | null {
+  if (field.kind !== "derived_select" || field.derivedFrom?.attribute !== "supportedReasoningEfforts") return null;
+  const selected = selectedOption(field.derivedFrom.key, sources, values);
+  const levels = selected?.supportedReasoningEfforts;
+  if (!selected || (Array.isArray(levels) && levels.some((level) => typeof level === "string"))) return null;
+  const reason = typeof selected.reasoningEffortUnavailableReason === "string" ? selected.reasoningEffortUnavailableReason.trim() : "";
+  if (reason) return { kind: "unreadable", reason };
+  return selected.reasoningEffortNone === true ? { kind: "none" } : null;
 }
 
 /**
@@ -249,7 +278,8 @@ function defaultFor(field: RuntimeFormV2Field, sources: RuntimeFormV2Sources, va
  * starts at "" (Default), never at the parent's default
  * (`defaultValueByValue` / `defaultAttribute`): saving untouched must not turn
  * Default into the model's default effort. The parent's default applies on
- * create, and on edit only once the parent changes (applyRuntimeFormV2Change).
+ * create, and on edit when a parent change drops the current value
+ * (applyRuntimeFormV2Change).
  */
 export function initialRuntimeFormV2Values(form: ParsedRuntimeFormV2, sources: RuntimeFormV2Sources): RuntimeFormV2Values {
   const values: RuntimeFormV2Values = {};
@@ -294,9 +324,14 @@ function storedFits(field: RuntimeFormV2Field, stored: unknown): stored is Runti
 }
 
 /**
- * Set one field and cascade: fields whose choices depend on it are reset to
- * their defaults, recursively, so a stale model can never survive a provider
- * change.
+ * Set one field and cascade: a field whose choices depend on it keeps its
+ * value while the new parent still lists it (switching models keeps the
+ * chosen reasoning effort, xxchan #wg-runtime-form:2b064209), and otherwise
+ * resets to its default, recursively, so a stale model can never survive a
+ * provider change. An unlisted value (one typed for the old parent) resets.
+ * "" (Default) is kept only where both the old and the new parent offer a
+ * list: a Default that only fell out of a model with no levels is not a
+ * choice, so the next model with levels starts at its own default.
  */
 export function applyRuntimeFormV2Change(
   form: ParsedRuntimeFormV2,
@@ -310,7 +345,7 @@ export function applyRuntimeFormV2Change(
   for (const field of dependencyOrder(form.fields)) {
     const parent = field.dependsOn ?? field.derivedFrom?.key;
     if (parent && changed.has(parent)) {
-      next[field.key] = defaultFor(field, sources, next);
+      if (!stillListed(field, sources, next, values)) next[field.key] = defaultFor(field, sources, next);
       changed.add(field.key);
     }
   }
@@ -323,6 +358,24 @@ export function applyRuntimeFormV2Change(
     }
   }
   return next;
+}
+
+/**
+ * The field's value is one of the choices it lists under `next`. "" (Default)
+ * counts only where the new parent offers Default and the old parent (`before`)
+ * listed choices, i.e. Default was picked from a list rather than left over.
+ */
+function stillListed(field: RuntimeFormV2Field, sources: RuntimeFormV2Sources, next: RuntimeFormV2Values, before: RuntimeFormV2Values): boolean {
+  const value = next[field.key];
+  if (typeof value !== "string") return false;
+  const choices = runtimeFormV2Choices(field, sources, next);
+  if (choices?.kind !== "select") return false;
+  if (value === "") {
+    const offered = choices.allowEmpty || choices.options.some((option) => option.value === "");
+    const old = runtimeFormV2Choices(field, sources, before);
+    return offered && old?.kind === "select" && old.options.length > 0;
+  }
+  return choices.options.some((option) => option.value === value);
 }
 
 /**
@@ -343,6 +396,16 @@ function visibilityValuesOf(key: string, values: RuntimeFormV2Values, sources?: 
   return [raw];
 }
 
+function hiddenByVisibilityRule(
+  field: RuntimeFormV2Field,
+  values: RuntimeFormV2Values,
+  sources?: RuntimeFormV2Sources,
+): boolean {
+  if (field.rule && evaluateRuntimeFormV3Condition(field.rule.condition, values) !== (field.rule.effect === "SHOW")) return true;
+  return !field.visibleWhen.every((rule) =>
+    visibilityValuesOf(rule.key, values, sources).some((candidate) => rule.in.includes(candidate)));
+}
+
 /**
  * Visibility rules (v2 `visibility`, v3 `rules`), plus (when `sources` is
  * given) `option_source.status`: an optional field whose source is
@@ -354,10 +417,8 @@ export function isRuntimeFormV2FieldVisible(
   values: RuntimeFormV2Values,
   sources?: RuntimeFormV2Sources,
 ): boolean {
-  if (field.rule && evaluateRuntimeFormV3Condition(field.rule.condition, values) !== (field.rule.effect === "SHOW")) return false;
-  if (hiddenAsUnavailable(field, values, sources)) return false;
-  return field.visibleWhen.every((rule) =>
-    visibilityValuesOf(rule.key, values, sources).some((candidate) => rule.in.includes(candidate)));
+  if (hiddenByVisibilityRule(field, values, sources)) return false;
+  return !hiddenAsUnavailable(field, values, sources);
 }
 
 /**
@@ -484,12 +545,15 @@ export function runtimeFormV2Submission(
     // is selected — not even as empty strings. The server refuses any value
     // for them on a connection submit (contract, provider.saved_connection).
     if (connectionActive && field.connectionOwned) continue;
+    // A field hidden by its explicit visibility rule (SHOW/HIDE) does not apply
+    // to the current form values and must never carry a stale stored value over
+    // into submission (even if its dependent option source also lacks a key).
+    if (field.kind !== "unsupported" && hiddenByVisibilityRule(field, values, sources)) continue;
     if (hiddenAsUnavailable(field, values, sources)) {
       const stored = form.values?.[field.key];
       if (stored !== undefined) out[field.key] = stored;
       continue;
     }
-    if (field.kind !== "unsupported" && !isRuntimeFormV2FieldVisible(field, values, sources)) continue;
     const value = values[field.key];
     if (value === undefined) continue;
     out[field.key] = typeof value === "string" ? value.trim() || (field.kind === "derived_select" ? null : "") : value;

@@ -2,8 +2,6 @@ import type { IntlShape } from "react-intl";
 import {
   FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES,
   FREE_SINGLE_FILE_UPLOAD_LIMIT_BYTES,
-  MAX_FREE_SERVER_HOSTED_JOINT_CHANNELS,
-  MAX_JOINT_CHANNEL_FREE_SERVERS,
   PLAN_CONFIG,
   PRO_SINGLE_FILE_UPLOAD_LIMIT_BYTES,
 } from "@botiverse/raft-shared";
@@ -30,33 +28,45 @@ export const UPGRADE_RENEW_FROM_PARAM = "upgradeRenewFrom";
 /** Where on the page the paywall was met, so a cancelled payment reopened there still counts from it. */
 export const UPGRADE_SURFACE_PARAM = "upgradeSurface";
 /**
+ * The external channel freeze's start (ISO), when its notice opened the
+ * dialog before it (`freeze_upcoming`): the return reopens, or says it's
+ * paid, in the words for before the freeze.
+ */
+export const UPGRADE_FREEZE_AT_PARAM = "upgradeFreezeAt";
+/**
  * The server paid for, when it isn't the current one: a page outside the app
  * (the invite and approval pages) upgrades a server of the viewer's in place
  * (ServerUpgradeDialog), and Stripe brings them back to that page.
  */
 export const UPGRADE_SERVER_PARAM = "upgradeServer";
 /** Every parameter of a Stripe return. */
-export const UPGRADE_RETURN_PARAMS = [UPGRADE_RETURN_PARAM, UPGRADE_CANCELED_PARAM, UPGRADE_SOURCE_PARAM, UPGRADE_ENTRY_PARAM, UPGRADE_RENEW_FROM_PARAM, UPGRADE_SURFACE_PARAM, UPGRADE_SERVER_PARAM] as const;
+export const UPGRADE_RETURN_PARAMS = [UPGRADE_RETURN_PARAM, UPGRADE_CANCELED_PARAM, UPGRADE_SOURCE_PARAM, UPGRADE_ENTRY_PARAM, UPGRADE_RENEW_FROM_PARAM, UPGRADE_SURFACE_PARAM, UPGRADE_SERVER_PARAM, UPGRADE_FREEZE_AT_PARAM] as const;
 
 type GateCopy = { title: MessageId; hint: MessageId; ask: MessageId; done: MessageId };
 // No specific limit (an agent's upgrade card without a gate): what Pro lifts overall.
 const GENERAL_COPY: GateCopy = { title: "upgradeDialog.general.title", hint: "upgradeDialog.general.hint", ask: "upgradeDialog.general.ask", done: "upgradeDialog.general.done" };
+const EXTERNAL_LIMIT_COPY: GateCopy = { title: "upgradeDialog.externalLimit.title", hint: "upgradeDialog.externalLimit.hint", ask: "upgradeDialog.externalLimit.ask", done: "upgradeDialog.externalLimit.done" };
+const EXTERNAL_FROZEN_COPY: GateCopy = { title: "upgradeDialog.externalFrozen.title", hint: "upgradeDialog.externalFrozen.hint", ask: "upgradeDialog.externalFrozen.ask", done: "upgradeDialog.externalFrozen.done" };
 export const GATE_COPY: Record<UpgradeGate, GateCopy> = {
   history_30d: { title: "upgradeDialog.history.title", hint: "upgradeDialog.history.hint", ask: "upgradeDialog.history.ask", done: "upgradeDialog.history.done" },
   upload_monthly_quota: { title: "upgradeDialog.uploadQuota.title", hint: "upgradeDialog.uploadQuota.hint", ask: "upgradeDialog.uploadQuota.ask", done: "upgradeDialog.uploadQuota.done" },
   upload_file_size: { title: "upgradeDialog.fileSize.title", hint: "upgradeDialog.fileSize.hint", ask: "upgradeDialog.fileSize.ask", done: "upgradeDialog.fileSize.done" },
-  joint_channel_free_cap: { title: "upgradeDialog.jointFreeCap.title", hint: "upgradeDialog.jointFreeCap.hint", ask: "upgradeDialog.jointFreeCap.ask", done: "upgradeDialog.jointFreeServers.done" },
-  joint_channel_host_limit: { title: "upgradeDialog.jointHostLimit.title", hint: "upgradeDialog.jointHostLimit.hint", ask: "upgradeDialog.jointHostLimit.ask", done: "upgradeDialog.jointHostLimit.done" },
-  joint_channel_over_limit: { title: "upgradeDialog.jointOverLimit.title", hint: "upgradeDialog.jointOverLimit.hint", ask: "upgradeDialog.jointOverLimit.ask", done: "upgradeDialog.jointFreeServers.done" },
-  joint_channel_read_only: { title: "upgradeDialog.jointReadOnly.title", hint: "upgradeDialog.jointReadOnly.hint", ask: "upgradeDialog.jointReadOnly.ask", done: "upgradeDialog.jointFreeServers.done" },
+  // The legacy Joint Channel gates: an agent's older upgrade card, or a server whose
+  // joint rules still apply. The external channel rules replaced them for every server
+  // (external_channels_v1 on since 2026-11-18, Warden), so they say what Free allows
+  // now: the one external channel, or the read-only state past it (cindyz, #28).
+  joint_channel_free_cap: EXTERNAL_LIMIT_COPY,
+  joint_channel_host_limit: EXTERNAL_LIMIT_COPY,
+  joint_channel_over_limit: EXTERNAL_FROZEN_COPY,
+  joint_channel_read_only: EXTERNAL_FROZEN_COPY,
   agent_migration: { title: "upgradeDialog.migration.title", hint: "upgradeDialog.migration.hint", ask: "upgradeDialog.migration.ask", done: "upgradeDialog.migration.done" },
   plan_downgraded: { title: "upgradeDialog.downgraded.title", hint: "upgradeDialog.downgraded.hint", ask: "upgradeDialog.downgraded.ask", done: "upgradeDialog.downgraded.done" },
   pro_theme: { title: "upgradeDialog.proTheme.title", hint: "upgradeDialog.proTheme.hint", ask: "upgradeDialog.proTheme.ask", done: "upgradeDialog.proTheme.done" },
   // The Free plan's one external channel (cindyz, Warden): the server's slot is
   // in use (its words for a named channel: externalLimitCopy), or the server is
   // in more than one and read-only in all of them.
-  external_channel_free_limit: { title: "upgradeDialog.externalLimit.title", hint: "upgradeDialog.externalLimit.hint", ask: "upgradeDialog.externalLimit.ask", done: "upgradeDialog.externalLimit.done" },
-  external_channel_frozen: { title: "upgradeDialog.externalFrozen.title", hint: "upgradeDialog.externalFrozen.hint", ask: "upgradeDialog.externalFrozen.ask", done: "upgradeDialog.externalFrozen.done" },
+  external_channel_free_limit: EXTERNAL_LIMIT_COPY,
+  external_channel_frozen: EXTERNAL_FROZEN_COPY,
   general: GENERAL_COPY,
 };
 
@@ -67,9 +77,39 @@ export function gateValues(server: string) {
     monthly: `${FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES / (1024 * 1024)} MB`,
     single: `${FREE_SINGLE_FILE_UPLOAD_LIMIT_BYTES / (1024 * 1024)} MB`,
     proSingle: `${PRO_SINGLE_FILE_UPLOAD_LIMIT_BYTES / (1024 * 1024)} MB`,
-    freeServers: MAX_JOINT_CHANNEL_FREE_SERVERS,
-    hosts: MAX_FREE_SERVER_HOSTED_JOINT_CHANNELS,
   };
+}
+
+/**
+ * The external channel freeze's start as the notice and the dialog say it,
+ * in the viewer's locale and time zone (`deadline`: ISO).
+ */
+export function formatFreezeDeadline(formatDate: IntlShape["formatDate"], deadline: string): string {
+  return formatDate(new Date(deadline), { dateStyle: "medium", timeStyle: "short" });
+}
+
+/**
+ * The external context the dialog for `gate` reads (ExternalLimitContext):
+ * a slot or a channel to connect to for `external_channel_free_limit`, the
+ * freeze's deadline for `external_channel_frozen`. Any other pairing: none,
+ * the gate's own words.
+ */
+export function externalContextForGate(gate: UpgradeGate, context: ExternalLimitContext | undefined): ExternalLimitContext | undefined {
+  if (!context) return undefined;
+  if (gate === "external_channel_free_limit") return context.kind === "slot" || context.kind === "connect" ? context : undefined;
+  if (gate === "external_channel_frozen") return context.kind === "freeze_upcoming" ? context : undefined;
+  return undefined;
+}
+
+/**
+ * The line of the "paid" toast for `gate`: the gate's own `done`, except the
+ * freeze's before it starts (`freeze_upcoming`), where the server never
+ * stopped posting, so it says it keeps posting rather than "again".
+ */
+export function upgradeDoneMessageId(gate: UpgradeGate, externalContext: ExternalLimitContext | undefined): MessageId {
+  return externalContextForGate(gate, externalContext)?.kind === "freeze_upcoming"
+    ? "upgradeDialog.externalFreezeUpcoming.done"
+    : GATE_COPY[gate].done;
 }
 
 /**
@@ -80,7 +120,9 @@ export function gateValues(server: string) {
  * to 100 characters and the copy names it up to twice). The external channel
  * limit's names the channel holding the slot when `externalContext` has one;
  * a channel name too long for that (names have no limit, and the channel is
- * never cut) falls back to the message that names none.
+ * never cut) falls back to the message that names none. The freeze's, before
+ * it starts (`freeze_upcoming`), says from when the server can't post
+ * (formatted with `formatDate`; without it, the gate's own ask).
  */
 export function askOwnerPrefill(
   formatMessage: IntlShape["formatMessage"],
@@ -88,10 +130,13 @@ export function askOwnerPrefill(
   serverName: string,
   max: number,
   externalContext?: ExternalLimitContext,
+  formatDate?: IntlShape["formatDate"],
 ): string {
-  const channel = gate === "external_channel_free_limit" && externalContext?.kind === "slot" ? externalContext.channel : undefined;
-  const id: MessageId = channel ? "upgradeDialog.externalLimit.askChannel" : GATE_COPY[gate].ask;
-  const ask = (server: string) => formatMessage({ id }, { ...gateValues(server), channel });
+  const context = externalContextForGate(gate, externalContext);
+  const channel = context?.kind === "slot" ? context.channel : undefined;
+  const deadline = context?.kind === "freeze_upcoming" && formatDate ? formatFreezeDeadline(formatDate, context.deadline) : undefined;
+  const id: MessageId = channel ? "upgradeDialog.externalLimit.askChannel" : deadline ? "upgradeDialog.externalFreezeUpcoming.ask" : GATE_COPY[gate].ask;
+  const ask = (server: string) => formatMessage({ id }, { ...gateValues(server), channel, deadline });
   const length = (text: string) => Array.from(text).length;
   const full = ask(serverName);
   if (length(full) <= max) return full;
@@ -127,14 +172,26 @@ export function upgradeGateCopy(
  * title or line, when its Upgrade said where it was met: the channel holding
  * the server's one Free slot (or the open invite to it), or, upgrading this
  * server to connect it to another server's channel, that channel. Nothing for
- * a slot without a channel: the gate's own words.
+ * a slot without a channel: the gate's own words. The freeze's dialog before
+ * the freeze (`freeze_upcoming`): from when the server can't post, formatted
+ * with `formatDate`. The caller pairs the context with its gate
+ * (externalContextForGate).
  */
 export function externalLimitCopy(
   formatMessage: IntlShape["formatMessage"],
   context: ExternalLimitContext | undefined,
   serverName: string,
+  formatDate: IntlShape["formatDate"],
 ): { title?: string; hint?: string } {
-  if (!context?.channel) return {};
+  if (!context) return {};
+  if (context.kind === "freeze_upcoming") {
+    const values = { ...gateValues(serverName), deadline: formatFreezeDeadline(formatDate, context.deadline) };
+    return {
+      title: formatMessage({ id: "upgradeDialog.externalFreezeUpcoming.title" }, values),
+      hint: formatMessage({ id: "upgradeDialog.externalFreezeUpcoming.hint" }, values),
+    };
+  }
+  if (!context.channel) return {};
   const values = { ...gateValues(serverName), channel: context.channel };
   if (context.kind === "connect") {
     return {

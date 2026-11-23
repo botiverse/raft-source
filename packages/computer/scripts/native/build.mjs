@@ -43,6 +43,7 @@ import { createGzip } from "node:zlib";
 import { assertBuildOutputFresh } from "./dependency-freshness.mjs";
 import {
   SEA_ASSET_CLI,
+  SEA_ASSET_BEDROCK,
   SEA_ASSET_CLI_UNDICI,
   SEA_ASSET_FULL,
   SEA_ASSET_KIMI,
@@ -359,28 +360,97 @@ const SEA_UNREACHABLE_ALIASES = {
 // cannot find a bare package name in a single binary.
 const SEA_LAZY_ASSET_SHIMS = {
   "@botiverse/kimi-code-sdk": join(HERE, "sea-lazy-kimi.cjs"),
+  "@aws-sdk/client-bedrock-runtime": join(HERE, "sea-lazy-bedrock.cjs"),
+  "@smithy/node-http-handler": join(HERE, "sea-lazy-bedrock.cjs"),
+};
+// What each of those assets bundles, and where its packages resolve from: the
+// directory of the package that imports them, so the asset gets the copy
+// computer.cjs would have inlined. An asset with several packages exports the
+// names of all of them (bundleLazyAssetCjs checks they do not collide).
+// `importers`, when set, are the only modules allowed to import the asset's
+// packages (assertLazyShimImporters).
+const SEA_LAZY_ASSET_PACKAGES = {
+  [SEA_ASSET_KIMI]: { packages: ["@botiverse/kimi-code-sdk"], resolveFrom: () => DAEMON_ROOT },
+  [SEA_ASSET_BEDROCK]: {
+    packages: ["@aws-sdk/client-bedrock-runtime", "@smithy/node-http-handler"],
+    resolveFrom: () => realpath(join(DAEMON_ROOT, "node_modules", "@earendil-works", "pi-ai")),
+    // The alias sends every import of these (common) packages to this asset,
+    // built from pi-ai's copies: another importer, even a dynamic one, would
+    // load the whole Bedrock asset and get pi-ai's version instead of its own.
+    importers: [/\/node_modules\/@earendil-works\/pi-ai\/dist\/api\/bedrock-converse-stream\.js$/],
+  },
 };
 // The same for cli.cjs (seaEntries.mjs SEA_CLI_LAZY_ASSETS).
 const SEA_CLI_LAZY_ASSET_SHIMS = {
   undici: join(HERE, "sea-lazy-undici.cjs"),
 };
 
-// The alias catches every import of a lazy package, so a static one would
-// quietly require the shim at startup and load the asset in every process of
-// that bundle. Only dynamic imports may reach a shim.
+// The alias catches every import of a lazy package, so a static import from
+// code that runs at startup would quietly require the shim and load the asset
+// in every process of that bundle. A shim may only be reached through a dynamic
+// import: directly, or from a module that is itself only imported dynamically
+// (esbuild evaluates such a module, and its static imports, on that import()).
+// Walking the static imports from the entry finds every module evaluated at
+// startup; no shim may be among them.
 function assertLazyShimsDynamicOnly(result, shims, where) {
-  const shimPaths = new Set(Object.values(shims).map((shim) => relative(REPO_ROOT, shim).replaceAll("\\", "/")));
-  const eagerShimImports = Object.entries(result.metafile.inputs).flatMap(([importer, input]) =>
-    input.imports
-      .filter((record) => shimPaths.has(relative(REPO_ROOT, resolve(record.path)).replaceAll("\\", "/")) && record.kind !== "dynamic-import")
-      .map((record) => `${importer} (${record.kind} of ${record.original ?? record.path})`),
-  );
-  if (eagerShimImports.length > 0) {
+  const norm = (path) => relative(REPO_ROOT, resolve(path)).replaceAll("\\", "/");
+  const shimPaths = new Set(Object.values(shims).map(norm));
+  const inputs = new Map(Object.entries(result.metafile.inputs).map(([path, input]) => [norm(path), input]));
+  const entries = Object.values(result.metafile.outputs).flatMap((output) => (output.entryPoint ? [norm(output.entryPoint)] : []));
+  if (entries.length === 0) throw new Error(`${where}: the bundle's metafile names no entry point to walk from`);
+  const via = new Map(entries.map((entry) => [entry, null]));
+  const queue = [...entries];
+  while (queue.length > 0) {
+    const importer = queue.shift();
+    for (const record of inputs.get(importer)?.imports ?? []) {
+      if (record.kind === "dynamic-import" || record.external) continue;
+      const imported = norm(record.path);
+      if (via.has(imported)) continue;
+      via.set(imported, importer);
+      queue.push(imported);
+    }
+  }
+  const eager = [...shimPaths].filter((shim) => via.has(shim)).map((shim) => {
+    const chain = [];
+    for (let at = shim; at !== null; at = via.get(at)) chain.unshift(at);
+    return chain.join(" -> ");
+  });
+  if (eager.length > 0) {
     throw new Error(
-      `a lazily loaded SEA package is imported eagerly, which would load its asset in ${where}: ${eagerShimImports.join(", ")}; use a dynamic import()`,
+      `a lazily loaded SEA package is imported eagerly, which would load its asset in ${where}: ${eager.join("; ")}; reach it through a dynamic import()`,
     );
   }
 }
+
+// A lazy asset that lists `importers` (SEA_LAZY_ASSET_PACKAGES) may be imported,
+// in any way, only by those modules.
+function assertLazyShimImporters(result) {
+  const norm = (path) => relative(REPO_ROOT, resolve(path)).replaceAll("\\", "/");
+  const unexpected = [];
+  for (const { packages, importers } of Object.values(SEA_LAZY_ASSET_PACKAGES)) {
+    if (!importers) continue;
+    const shims = new Set(packages.map((name) => norm(SEA_LAZY_ASSET_SHIMS[name])));
+    for (const [importer, input] of Object.entries(result.metafile.inputs)) {
+      for (const record of input.imports) {
+        if (record.external || !shims.has(norm(record.path))) continue;
+        const from = norm(importer);
+        if (!importers.some((pattern) => pattern.test(`/${from}`))) unexpected.push(`${from} (${record.kind} of ${record.original ?? record.path})`);
+      }
+    }
+  }
+  if (unexpected.length > 0) {
+    throw new Error(
+      `a lazily loaded SEA package is imported by a module its asset was not built for: ${unexpected.join(", ")}; ` +
+        `it would load the whole asset and get another package's copy (SEA_LAZY_ASSET_PACKAGES importers)`,
+    );
+  }
+}
+
+// Inputs of a bundle that come from inside a lazily loaded package.
+function lazyPackageInputs(result, packages) {
+  return bundledInputs(result).filter((input) => packages.some((name) => input.includes(`node_modules/${name}/`)));
+}
+const SEA_LAZY_PACKAGE_NAMES = Object.values(SEA_LAZY_ASSET_PACKAGES).flatMap((asset) => asset.packages);
 
 // esbuild options both Computer bundles share. Each bundle function spells out
 // its entry, `bundle` and `packages` itself: carrier-version-closure-gate reads
@@ -442,9 +512,10 @@ async function bundleLiteCjs({ version, daemonVersion, cliVersion, buildSha, wor
     outfile,
     external: SEA_LITE_EXTERNAL,
   });
-  const runnerInputs = bundledInputs(result).filter((input) =>
-    /^packages\/(daemon|cli)\//.test(input) || input.includes("node_modules/@botiverse/kimi-code-sdk/"),
-  );
+  const runnerInputs = [
+    ...bundledInputs(result).filter((input) => /^packages\/(daemon|cli)\//.test(input)),
+    ...lazyPackageInputs(result, SEA_LAZY_PACKAGE_NAMES),
+  ];
   if (runnerInputs.length > 0) {
     throw new Error(`Computer lite bundle pulled in runner code: ${runnerInputs.slice(0, 5).join(", ")}`);
   }
@@ -452,15 +523,24 @@ async function bundleLiteCjs({ version, daemonVersion, cliVersion, buildSha, wor
   return outfile;
 }
 
-// The kimi SDK on its own (asset kimi.cjs), evaluated by the SEA loader the
-// first time a runner requires it. It must expose exactly the package's
-// exports, or a Kimi launch would fail only once a user starts one.
-async function bundleKimiCjs({ workDir, minify = true }) {
+// A lazily loaded package set on its own (SEA_LAZY_ASSET_PACKAGES: kimi.cjs,
+// bedrock.cjs), evaluated by the SEA loader the first time a runner requires
+// it. It must expose exactly the packages' exports, or a launch would fail
+// only once a user starts one.
+async function bundleLazyAssetCjs({ asset, workDir, minify = true }) {
   const { build } = await import("esbuild");
-  const outfile = join(workDir, "kimi-bundle.cjs");
-  const specifier = Object.keys(SEA_LAZY_ASSETS).find((id) => SEA_LAZY_ASSETS[id] === SEA_ASSET_KIMI);
+  const { packages, resolveFrom } = SEA_LAZY_ASSET_PACKAGES[asset];
+  if (!Object.values(SEA_LAZY_ASSETS).includes(asset) || !packages.every((name) => SEA_LAZY_ASSET_SHIMS[name])) {
+    throw new Error(`${asset}: every package needs a shim (SEA_LAZY_ASSET_SHIMS) and the asset a hook id (seaEntries.mjs SEA_LAZY_ASSETS)`);
+  }
+  const resolveDir = await resolveFrom();
+  const outfile = join(workDir, asset.replace(/\.cjs$/, "-bundle.cjs"));
   await build({
-    stdin: { contents: `export * from ${JSON.stringify(specifier)};`, resolveDir: DAEMON_ROOT, sourcefile: "kimi-entry.mjs" },
+    stdin: {
+      contents: packages.map((name) => `export * from ${JSON.stringify(name)};`).join("\n"),
+      resolveDir,
+      sourcefile: asset.replace(/\.cjs$/, "-entry.mjs"),
+    },
     bundle: true,
     platform: "node",
     format: "cjs",
@@ -471,22 +551,28 @@ async function bundleKimiCjs({ workDir, minify = true }) {
     minifyWhitespace: minify,
     logLevel: "info",
   });
+  // Node names a CommonJS package's whole exports "module.exports" (and
+  // "default") in its ESM namespace; neither is a name the importers use.
   const check = spawnSync(
     process.execPath,
     [
       "--input-type=module",
       "-e",
       `import { createRequire } from "node:module";
-       const bundled = Object.keys(createRequire(import.meta.url)(${JSON.stringify(outfile)})).filter((k) => k !== "__esModule").sort();
-       const pkg = Object.keys(await import(${JSON.stringify(specifier)})).filter((k) => k !== "default").sort();
+       const own = (keys) => keys.filter((k) => k !== "__esModule" && k !== "default" && k !== "module.exports").sort();
+       const bundled = own(Object.keys(createRequire(import.meta.url)(${JSON.stringify(outfile)})));
+       const each = [];
+       for (const name of ${JSON.stringify(packages)}) each.push(...own(Object.keys(await import(name))));
+       const pkg = [...new Set(each)].sort();
+       if (pkg.length !== each.length) { console.error("export names collide: " + each.filter((k, i) => each.indexOf(k) !== i).join(", ")); process.exit(1); }
        if (JSON.stringify(bundled) !== JSON.stringify(pkg)) { console.error(JSON.stringify({ bundled, pkg })); process.exit(1); }`,
     ],
-    { cwd: DAEMON_ROOT, encoding: "utf8" },
+    { cwd: resolveDir, encoding: "utf8" },
   );
   if (check.status !== 0) {
-    throw new Error(`${SEA_ASSET_KIMI} does not expose the kimi SDK's exports: ${check.stderr.slice(0, 2000)}`);
+    throw new Error(`${asset} does not expose the exports of ${packages.join(" + ")}: ${check.stderr.slice(0, 2000)}`);
   }
-  if (minify) await finalizeSeaBundleSource(outfile, SEA_ASSET_KIMI);
+  if (minify) await finalizeSeaBundleSource(outfile, asset);
   return outfile;
 }
 
@@ -505,11 +591,12 @@ async function bundleCjs({ version, daemonVersion, cliVersion, buildSha, workDir
     outfile,
     alias: { ...SEA_SOURCE_ALIASES, ...SEA_UNREACHABLE_ALIASES, ...SEA_LAZY_ASSET_SHIMS },
   });
-  const lazyInputs = bundledInputs(result).filter((input) => input.includes("node_modules/@botiverse/kimi-code-sdk/"));
+  const lazyInputs = lazyPackageInputs(result, SEA_LAZY_PACKAGE_NAMES);
   if (lazyInputs.length > 0) {
-    throw new Error(`Computer SEA bundle inlined the kimi SDK, which must load from ${SEA_ASSET_KIMI}: ${lazyInputs[0]}`);
+    throw new Error(`Computer SEA bundle inlined a lazily loaded package, which must load from its own asset (SEA_LAZY_ASSET_PACKAGES): ${lazyInputs[0]}`);
   }
   assertLazyShimsDynamicOnly(result, SEA_LAZY_ASSET_SHIMS, "every runner");
+  assertLazyShimImporters(result);
   const distInputs = bundledInputs(result).filter((input) => /^packages\/[^/]+\/dist\//.test(input));
   if (distInputs.length > 0) {
     throw new Error(
@@ -558,7 +645,7 @@ async function copyPhotonWasmSidecar(outDir) {
   console.log(`[build] photon wasm: ${outWasm} (${digest})`);
 }
 
-async function makeBlob({ loaderPath, bundlePath, liteBundlePath, kimiBundlePath, cliBundlePath, cliUndiciBundlePath, workDir, nodeVersion }) {
+async function makeBlob({ loaderPath, bundlePath, liteBundlePath, kimiBundlePath, bedrockBundlePath, cliBundlePath, cliUndiciBundlePath, workDir, nodeVersion }) {
   const hostMajor = process.versions.node.split(".")[0];
   const targetMajor = String(nodeVersion).split(".")[0];
   if (hostMajor !== targetMajor) {
@@ -581,6 +668,7 @@ async function makeBlob({ loaderPath, bundlePath, liteBundlePath, kimiBundlePath
           [SEA_ASSET_FULL]: bundlePath,
           [SEA_ASSET_LITE]: liteBundlePath,
           [SEA_ASSET_KIMI]: kimiBundlePath,
+          [SEA_ASSET_BEDROCK]: bedrockBundlePath,
           [SEA_ASSET_CLI]: cliBundlePath,
           [SEA_ASSET_CLI_UNDICI]: cliUndiciBundlePath,
         },
@@ -742,6 +830,22 @@ function smokeNativeBinary({ outBinary, platform, arch, version, daemonVersion, 
   }
   console.log(`[verify] ${outBinary} kimi SDK asset loaded`);
 
+  // The same for the AWS SDK behind pi's Bedrock provider (bedrock.cjs): one
+  // Bedrock request to a loopback server loads it the way an agent's would.
+  const bedrockResult = spawnSync(outBinary, ["__verify-bundled-bedrock"], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 30_000,
+    env: smokeEnv,
+  });
+  if (bedrockResult.status !== 0 || bedrockResult.stdout.trim() !== "bedrock-bundle-ok") {
+    throw new Error(
+      `native Bedrock asset smoke failed with ${bedrockResult.status ?? bedrockResult.signal}: ` +
+        `${bedrockResult.stderr || bedrockResult.stdout || bedrockResult.error}`,
+    );
+  }
+  console.log(`[verify] ${outBinary} Bedrock AWS SDK asset loaded`);
+
   // The daemon's View Context restore child re-executes the binary: a request on
   // stdin, a header line and the result body on stdout. A missing file exercises
   // the routing and the protocol; the heap limit goes through NODE_OPTIONS, which
@@ -781,7 +885,7 @@ function smokeNativeBinary({ outBinary, platform, arch, version, daemonVersion, 
   }
   console.log(`[verify] ${outBinary} context view restore child answered, heap limit ${restoreHeapLimit} MB`);
 
-  // RFC 060: the OAR host loads OAR's runtimes (grok, qwen, qoder), their
+  // RFC 060: the OAR host loads OAR's runtimes (grok, qwen, qoder, dsh), their
   // session paths and the observe entry lazily; load them from the binary as a
   // launch would.
   const oarResult = spawnSync(outBinary, ["__verify-bundled-oar"], {
@@ -908,10 +1012,11 @@ async function main() {
 
   const bundlePath = await bundleCjs({ version, daemonVersion, cliVersion, buildSha, workDir, minify: !noMinify });
   const liteBundlePath = await bundleLiteCjs({ version, daemonVersion, cliVersion, buildSha, workDir, minify: !noMinify });
-  const kimiBundlePath = await bundleKimiCjs({ workDir, minify: !noMinify });
+  const kimiBundlePath = await bundleLazyAssetCjs({ asset: SEA_ASSET_KIMI, workDir, minify: !noMinify });
+  const bedrockBundlePath = await bundleLazyAssetCjs({ asset: SEA_ASSET_BEDROCK, workDir, minify: !noMinify });
   if (bundleOnly) {
     console.log(
-      `[build] bundle-only contract passed: ${bundlePath}, ${liteBundlePath}, ${kimiBundlePath}${noMinify ? " (unminified, not shippable)" : ""}`,
+      `[build] bundle-only contract passed: ${bundlePath}, ${liteBundlePath}, ${kimiBundlePath}, ${bedrockBundlePath}${noMinify ? " (unminified, not shippable)" : ""}`,
     );
     return;
   }
@@ -924,6 +1029,7 @@ async function main() {
       [SEA_ASSET_FULL]: bundlePath,
       [SEA_ASSET_LITE]: liteBundlePath,
       [SEA_ASSET_KIMI]: kimiBundlePath,
+      [SEA_ASSET_BEDROCK]: bedrockBundlePath,
       [SEA_ASSET_CLI]: cliBundlePath,
       [SEA_ASSET_CLI_UNDICI]: cliUndiciBundlePath,
     },
@@ -934,6 +1040,7 @@ async function main() {
     bundlePath,
     liteBundlePath,
     kimiBundlePath,
+    bedrockBundlePath,
     cliBundlePath,
     cliUndiciBundlePath,
     workDir,

@@ -15,6 +15,7 @@ export function ConnectedAppDetailModal({
   onClose,
   closeLabel,
   identity,
+  actions,
   footer,
   children,
 }: {
@@ -23,6 +24,11 @@ export function ConnectedAppDetailModal({
   onClose: () => void;
   closeLabel: string;
   identity: ReactNode;
+  /**
+   * The detail's own action at the head's top-right, before × (Discover's Add
+   * for an App this Server hasn't added, R41). Nothing for most details.
+   */
+  actions?: ReactNode;
   footer: ReactNode;
   children: ReactNode;
 }) {
@@ -42,7 +48,15 @@ export function ConnectedAppDetailModal({
         aria-labelledby={labelledBy}
         header={(
           <DialogHeader className="items-start">
-            {identity}
+            {/* The head is two columns, content and ×; the actions share the
+                first with the identity, so × stays at the top-right (and a
+                direct child, as a phone sheet needs). */}
+            {actions ? (
+              <div className="flex min-w-0 items-start gap-3">
+                <div className="min-w-0 flex-1">{identity}</div>
+                <div className="flex shrink-0 items-center gap-2" data-testid="connected-app-detail-actions">{actions}</div>
+              </div>
+            ) : identity}
             <DialogClose aria-label={closeLabel} />
           </DialogHeader>
         )}

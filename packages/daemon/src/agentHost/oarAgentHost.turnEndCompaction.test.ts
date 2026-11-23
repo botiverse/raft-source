@@ -1,10 +1,12 @@
 // #proj-runtime:#54 phase 3: native compaction at a turn end past the size
-// threshold, on the OAR host (Codex, Grok: OAR `Session.compact()`). The
+// threshold, on the OAR host (OAR `Session.compact()`), for an installation
+// OAR declares manual compaction and a trustworthy context size and window
+// for (`turnEndCompactionDeclared`; the tests fake that declaration). The
 // scripted runtime reports a small context on a 200k window, so these tests
 // lower the threshold and the window floor through the agent's env; the
 // scripted session has no compact of its own, so `wrapSession` gives it one.
 import assert from "node:assert/strict";
-import type { Session } from "@botiverse/oar";
+import type { Session, SessionCapabilityDeclaration } from "@botiverse/oar";
 import type { AgentConfig } from "@botiverse/raft-shared";
 import { harness, makeConfig, message, request, until, type Harness } from "../testing/oarAgentHostHarness";
 
@@ -17,11 +19,14 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const completed = (): CompactResult => ({ kind: "completed", request: {} as never, frame: {} as never });
 const refused = (): CompactResult => ({ kind: "rejected", request: {} as never, response: {} as never, code: "busy", reason: "a goal is active" });
 
-/** A harness whose sessions compact through `compact`, recording every call. */
-async function compactHarness(compact: () => Promise<CompactResult>, idleNotices: string[] = []) {
+/** What an installation that takes turn-end compaction declares. */
+const DECLARED: SessionCapabilityDeclaration = { manualCompaction: { kind: "supported", activeTurn: "reject" }, contextUsage: { tokens: true, contextWindow: true } };
+
+/** A harness whose sessions compact through `compact`, recording every call; the installation declares `capabilities`. */
+async function compactHarness(compact: () => Promise<CompactResult>, idleNotices: string[] = [], capabilities: SessionCapabilityDeclaration = DECLARED) {
   const calls: number[] = [];
   const h = await harness({
-    deps: { onAgentWorkingToIdle: (agentId: string) => idleNotices.push(agentId) },
+    deps: { onAgentWorkingToIdle: (agentId: string) => idleNotices.push(agentId), sessionCapabilities: async () => capabilities },
     wrapSession: (session) => new Proxy(session, {
       get(target, prop) {
         if (prop === "compact") return async () => { calls.push(Date.now()); return compact(); };
@@ -62,6 +67,49 @@ test("#54 phase 3: past the threshold at a turn end with nothing waiting, the OA
     await until(() => h.inputs.length === 2, "the second turn");
     await until(() => outcomes(h).includes("skipped:not_rearmed"), "the second turn end's decision");
     assert.equal(calls.length, 1, "not re-armed: the context never dropped to the threshold");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("#54 phase 3: an installation that does not declare manual compaction and a trustworthy context size and window is never compacted, whatever its runtime id", async () => {
+  const cases: Array<[string, SessionCapabilityDeclaration]> = [
+    ["no window (Grok, Cursor in OAR 0.123)", { manualCompaction: { kind: "supported", activeTurn: "reject" }, contextUsage: { tokens: true, contextWindow: false } }],
+    ["no size (Qoder)", { manualCompaction: { kind: "supported", activeTurn: "reject" }, contextUsage: { tokens: false, contextWindow: false } }],
+    ["unmeasured context usage (Codex below 0.151.0)", { manualCompaction: { kind: "supported", activeTurn: "reject" } }],
+    ["manual compaction unsupported (Qwen, OpenCode 1)", { manualCompaction: { kind: "unsupported", reason: "no completion signal" }, contextUsage: { tokens: true, contextWindow: true } }],
+    ["nothing declared", {}],
+  ];
+  for (const [label, capabilities] of cases) {
+    const { h, calls } = await compactHarness(async () => completed(), [], capabilities);
+    try {
+      await firstTurn(h);
+      await sleep(40);
+      assert.equal(calls.length, 0, label);
+      assert.deepEqual(events(h), [], label);
+    } finally {
+      await h.cleanup();
+    }
+  }
+});
+
+test("#54 phase 3: unreadable capabilities are off", async () => {
+  const calls: number[] = [];
+  const h = await harness({
+    deps: { sessionCapabilities: async () => { throw new Error("runtime failed to load"); } },
+    wrapSession: (session) => new Proxy(session, {
+      get(target, prop) {
+        if (prop === "compact") return async () => { calls.push(Date.now()); return completed(); };
+        const value: unknown = Reflect.get(target, prop);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }),
+  });
+  try {
+    await firstTurn(h);
+    await sleep(40);
+    assert.equal(calls.length, 0);
+    assert.deepEqual(events(h), []);
   } finally {
     await h.cleanup();
   }

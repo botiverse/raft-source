@@ -274,7 +274,7 @@ export async function channelAnnouncementChange(input: {
   if (!input.canEditChannelMetadata) {
     return refused(403, {
       code: "channel_announcement_forbidden",
-      error: `Only the owner of ${target} (one of its channel admins) or a server owner or admin can set or remove its announcement.`,
+      error: `Only a channel admin of ${target} or a server owner or admin can set or remove its announcement.`,
       suggestedNextAction: `Ask one of them to set it, or post what you wanted to announce as a message in ${target}.`,
     });
   }
@@ -359,13 +359,20 @@ export async function channelAnnouncementAudience(
 }
 
 /**
+ * Why channelAnnouncementPushRefusal refuses: the channel (as `#name`) whose
+ * announcement it is, or `elsewhere` when that is a joint the actor's server
+ * has no copy of (no channel the actor could name, so none is named).
+ */
+export type ChannelAnnouncementPushRefusal = { channel: string } | { elsewhere: true };
+
+/**
  * While an object is a channel's announcement, a new version of it needs the
  * same right as choosing it (Tenny, PR review): editChannelMetadata on that
  * channel, the actor's own server's copy for a joint. Null when the push may
  * go (no live channel has it as its announcement with the flag on there, and
  * for a joint on every side; or
  * the actor may set each such channel's announcement); else the channel (as
- * `#name`) that refuses it. Once it stops being the announcement, the app's
+ * `#name`) that refuses it, or `elsewhere`. Once it stops being the announcement, the app's
  * own push rule alone applies again.
  */
 export async function channelAnnouncementPushRefusal(
@@ -373,7 +380,7 @@ export async function channelAnnouncementPushRefusal(
   homeChannelId: string | null,
   actor: { type: "user" | "agent"; id: string; serverId: string },
   executor: DatabaseExecutor = getDb(),
-): Promise<{ channel: string } | null> {
+): Promise<ChannelAnnouncementPushRefusal | null> {
   if (homeChannelId === null) return null;
   const ids = await channelAnnouncementChannelIdsOf(homeChannelId, executor);
   const rows = (await executor.select({ id: channels.id, serverId: channels.serverId, name: channels.name, type: channels.type }).from(channels).where(and(
@@ -389,9 +396,14 @@ export async function channelAnnouncementPushRefusal(
   const withoutOne = await jointsWithoutAnnouncements(rows.filter((row) => row.type === "joint").map((row) => row.id), executor);
   const live = rows.filter((row) => on.has(row.serverId) && !withoutOne.has(row.id));
   if (live.length === 0) return null;
-  // Rights are the actor's own server's: on another server's copy of a joint it has none.
+  // Rights are the actor's own server's: on another server's copy of a joint it has none. Named by its own
+  // server's copy when it has one, else as `elsewhere`, naming no other server's (#460).
   const own = live.filter((row) => row.serverId === actor.serverId);
-  if (own.length === 0) return { channel: `#${live[0]!.name}` };
+  if (own.length === 0) {
+    const [ownCopy] = await executor.select({ name: channels.name }).from(channels)
+      .where(and(inArray(channels.id, ids), eq(channels.serverId, actor.serverId), isNull(channels.deletedAt))).limit(1);
+    return ownCopy ? { channel: `#${ownCopy.name}` } : { elsewhere: true };
+  }
   for (const row of own) {
     if (!await actorHasChannelCapability(row.serverId, row.id, actor.type, actor.id, "editChannelMetadata", executor)) return { channel: `#${row.name}` };
   }

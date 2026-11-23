@@ -8,7 +8,10 @@
 // conversation and gate within a day answers with the card already there; and
 // after an agent's upgrade card of any gate, the conversation gets no other
 // one for a cooldown (14 days; cindyz #proj-apps:5eafd481: don't disturb
-// people), which a card deleted since still holds. No flag gates any of it
+// people), which a card deleted since still holds; and an agent's upgrade card
+// for a gate anywhere on the server keeps any other conversation from getting
+// another one for that gate for 7 days (409 UPGRADE_CARD_ALREADY_OFFERED, with
+// where that card is). No flag gates any of it
 // (`agent_upgrade_card` is retired, #raft-architecture:#32).
 // `agentUpgradeCardHint` is the line Till's 30-day read-limit messages append for agents, and the next
 // action of an agent's upload a Free limit refused; it says nothing where the
@@ -46,6 +49,15 @@ export const AGENT_UPGRADE_CARD_REPEAT_WINDOW_MS = DAY_MS;
  * release (#raft-architecture:#32).
  */
 export const AGENT_UPGRADE_CARD_COOLDOWN_DAYS = 14;
+
+/**
+ * After an agent's upgrade card for a gate anywhere on a server, the days
+ * during which no other one for that gate goes to any other conversation
+ * there: prepare answers 409 UPGRADE_CARD_ALREADY_OFFERED with where that card
+ * is (cindyz, approved on Nova's data: one server got 6 cards in a week from 5
+ * agents, and the per-conversation cooldown never fired).
+ */
+export const AGENT_UPGRADE_CARD_SERVER_DEDUP_DAYS = 7;
 
 /**
  * Whether the server is on Free, by its billing entitlement (an entitling
@@ -151,6 +163,70 @@ export async function findAgentUpgradeCardCooldown(
     .limit(1);
   if (!row) return null;
   return { offeredAt: row.createdAt, endsAt: new Date(row.createdAt.getTime() + windowMs) };
+}
+
+/** An agent's upgrade card for a gate somewhere on the server: its carrier message and the conversation storing it. */
+export interface ServerAgentUpgradeCard {
+  messageId: string;
+  /** The carrier's storage channel: a channel, DM or thread. */
+  channelId: string;
+}
+
+/**
+ * Serializes `plan:upgrade` prepares for one server and gate across its
+ * conversations (the source lock only serializes one conversation), so two
+ * agents in two conversations cannot both miss each other's card
+ * (findServerAgentUpgradeCard). Taken after the source lock, in every prepare.
+ */
+export async function lockServerAgentUpgradeCardGate(executor: DatabaseExecutor, input: { serverId: string; gate: UpgradeGate }): Promise<void> {
+  await executor.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${`agent-upgrade-card:${input.serverId}:${input.gate}`}, 0))`);
+}
+
+/**
+ * The newest upgrade card for this gate (none: `general`) an agent posted
+ * anywhere on the server in the last AGENT_UPGRADE_CARD_SERVER_DEDUP_DAYS (by
+ * `action_cards.created_at`), in any conversation. Only an agent's card counts
+ * (its carrier is the agent's), as for the cooldown, and only one still there
+ * (not deleted): the refusal points the agent to it. Null when there is none.
+ * Call it under lockServerAgentUpgradeCardGate.
+ */
+export async function findServerAgentUpgradeCard(
+  executor: DatabaseExecutor,
+  input: { serverId: string; gate: UpgradeGate; now?: Date },
+): Promise<ServerAgentUpgradeCard | null> {
+  const since = new Date((input.now ?? currentDate()).getTime() - AGENT_UPGRADE_CARD_SERVER_DEDUP_DAYS * DAY_MS);
+  const [row] = await executor
+    .select({ messageId: actionCards.messageId, channelId: messages.channelId })
+    .from(actionCards)
+    .innerJoin(messages, eq(messages.id, actionCards.messageId))
+    .where(and(
+      eq(actionCards.serverId, input.serverId),
+      eq(actionCards.actionType, "plan:upgrade"),
+      sql`coalesce(${actionCards.payload} ->> 'gate', ${GENERAL_UPGRADE_GATE}) = ${input.gate}`,
+      eq(messages.senderType, "agent"),
+      isNull(messages.deletedAt),
+      gt(actionCards.createdAt, since),
+    ))
+    .orderBy(desc(actionCards.createdAt))
+    .limit(1);
+  return row ?? null;
+}
+
+/**
+ * The 409 UPGRADE_CARD_ALREADY_OFFERED refusal's words: one sentence, the
+ * rule and what to do instead, in both `error` (what the CLI prints) and
+ * `suggestedNextAction` (what raft-sdk shows). `address` is the card as this
+ * agent addresses it (`#general msg=7c41e2a0`, a thread's
+ * `#general:1a2b3c4d msg=…`), given only for a card in a public channel of
+ * the server or a thread of one; null otherwise (a private channel, a DM):
+ * then it is not named, and the person is sent to Plan & Billing, where an
+ * owner can upgrade (what the card's button would have led to).
+ */
+export function agentUpgradeCardAlreadyOfferedRefusal(address: string | null): { error: string; suggestedNextAction: string } {
+  const sentence = address
+    ? `An upgrade card for this limit was already offered on this server in the last ${AGENT_UPGRADE_CARD_SERVER_DEDUP_DAYS} days (${address}): don't offer another; tell the person the limit and point them to that card.`
+    : `An upgrade card for this limit was already offered on this server in the last ${AGENT_UPGRADE_CARD_SERVER_DEDUP_DAYS} days, in a conversation not everyone here can open: don't offer another; tell the person the limit and why, without a card, and that a server owner can upgrade in Settings → Plan & Billing.`;
+  return { error: sentence, suggestedNextAction: sentence };
 }
 
 /** A UTC calendar date, YYYY-MM-DD. */

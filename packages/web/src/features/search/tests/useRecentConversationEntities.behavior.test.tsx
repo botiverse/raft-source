@@ -124,3 +124,25 @@ test("re-renders when a visit is recorded (store subscription)", () => {
   act(() => { useRecentConversationStore.getState().recordVisit("server-1:user-1", "channel-2", 2); });
   assert.deepEqual(ids(result.current), ["channel-2", "channel-3"]);
 });
+
+// #532: a channel patch the catalog does not read (an unread count, a member
+// count) must not rebuild it; one it does read (a rename) must.
+test("the catalog keeps its identity across channel patches to fields it does not read", () => {
+  seed();
+  const { result } = renderHook(() => useSearchEntityCatalog());
+  const first = result.current;
+  act(() => {
+    useChannelStore.setState((state) => ({
+      channels: state.channels.map((channel) => (channel.id === "channel-1" ? { ...channel, memberCount: 42 } as Channel : channel)),
+      dmChannels: state.dmChannels.map((channel) => ({ ...channel, peerName: "Renamed peer" })),
+    }));
+  });
+  assert.equal(result.current, first);
+  act(() => {
+    useChannelStore.setState((state) => ({
+      channels: state.channels.map((channel) => (channel.id === "channel-1" ? { ...channel, name: "renamed" } : channel)),
+    }));
+  });
+  assert.notEqual(result.current, first);
+  assert.ok(result.current.entries.some((entry) => entry.suggestion.title === "renamed"));
+});

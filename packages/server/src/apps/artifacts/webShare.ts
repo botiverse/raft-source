@@ -75,7 +75,7 @@ import type { AppMessagePoster } from "../../platform/apps";
 import { attachmentSources } from "../../platform/attachments";
 import { conversationMembers } from "../../platform/conversations";
 import { getDb } from "../../platform/db";
-import { artifactAppUrl, itemsServerEnabled, json, TARGET_NOT_FOUND_ERROR, type ArtifactApiJson } from "./apiCommon";
+import { artifactAppUrl, itemsReadable, json, TARGET_NOT_FOUND_ERROR, type ArtifactApiJson } from "./apiCommon";
 import { widenArtifactHome, widerHomeChoices, type ArtifactManageRefusal, type ArtifactWiderHome } from "./manage";
 import { ALREADY_SAVED_ERROR, ATTACHMENT_NOT_FOUND_ERROR, attachmentTooLargeError, liveItem, saveAttachment } from "./save";
 import { artifactAttachmentSaves, artifactItems } from "./schema";
@@ -315,7 +315,7 @@ export function createShareOperations(viewerOf: (reader: ArtifactWebReader, id: 
       const shown = saves.filter((_, index) => seen[index] !== null);
       const items = [...new Map(shown.map((save) => [save.item.id, save.item])).values()];
       // As the viewer route decides: visible, and (another server's public one) its server's flag on.
-      const [canSee, enabled] = await Promise.all([canViewArtifacts(viewer, items), itemsServerEnabled(items)]);
+      const [canSee, enabled] = await Promise.all([canViewArtifacts(viewer, items), itemsReadable(items)]);
       const visible = items.map((_, index) => canSee[index]! && enabled[index]!);
       const atCurrent = await atCurrentVersions(items.filter((_, index) => visible[index]));
       const actorOf = await profiler(atCurrent.map(cardAuthorRef));

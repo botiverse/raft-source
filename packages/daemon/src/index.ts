@@ -3,6 +3,7 @@ import { DaemonCore, DAEMON_CLI_USAGE, parseDaemonCliArgs } from "./core";
 import { CONTEXT_VIEW_RESTORE_CHILD_MODE, runContextViewRestoreChildMain } from "./agentContextView/contextViewRestoreChild";
 import { RUNTIME_DETECTION_CHILD_MODE, runRuntimeDetectionChildMain } from "./runtimeDetectionChild";
 import { privacyModeFromEnv } from "@botiverse/raft-shared";
+import { installSystemCaTrust } from "@botiverse/raft-shared/src/systemTrust";
 
 // task #1268: `<daemon> __detect-runtimes` is the detection child the running
 // daemon spawns for one runtime detection round (streams JSON lines, exits).
@@ -15,6 +16,9 @@ if (process.argv[2] === CONTEXT_VIEW_RESTORE_CHILD_MODE) {
 }
 
 function runDaemonMain(): void {
+// Trust the OS certificate store before any server connection (best-effort;
+// never fails startup). The Computer's `__run` daemons install it in its entry.
+installSystemCaTrust();
 const parsedArgs = parseDaemonCliArgs(process.argv.slice(2));
 
 if (!parsedArgs) {

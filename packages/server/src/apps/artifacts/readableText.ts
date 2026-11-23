@@ -19,6 +19,10 @@
 // markdownExcerpt, at the end, is a card's excerpt of a Markdown entry
 // (excerpt.ts stores it): a rule of its own, not covered by that version.
 // excerptBlocks.ts makes the same start as data, with what is exported here.
+//
+// htmlLinks reads a document's `<a href>` and `<area href>` with the same
+// tokenizer, for contentLinks.ts (links to other Artifacts), whose own
+// CONTENT_LINKS_EXTRACTOR covers it.
 import { ARTIFACT_EXCERPT_MAX_CHARS, ARTIFACT_PUBLIC_DESCRIPTION_MAX_CHARS, plainActionCardText } from "@botiverse/raft-shared";
 
 /**
@@ -224,6 +228,89 @@ export function htmlReadableText(html: string): string {
     }
   }
   return tidyLines(out.join(""));
+}
+
+/** A link in an HTML document's markup (htmlLinks). */
+export interface HtmlLink {
+  /** The `href` as written, its character references decoded. */
+  href: string;
+  /** The text the link shows, references decoded, whitespace collapsed; "" for an `<area>` or a link of images only. */
+  text: string;
+  /** Where its start tag begins in the input. */
+  offset: number;
+}
+
+/** Elements whose contents hold no link a reader follows: raw text, or never shown (a template's, a script's or a style's). */
+const LINKLESS = new Set(["script", "style", "noscript", "template", "title", "textarea", "xmp"]);
+/** The most of a link's text kept: compared with its href only, which is shorter (contentLinks.ts). */
+const LINK_TEXT_MAX_CHARS = 4096;
+
+/**
+ * Every `<a href>` and `<area href>` of an HTML document, in order, by the
+ * tokenizer's rules above (comments, doctypes and processing instructions
+ * dropped; an unterminated tag ends the reading): none inside a comment or
+ * the elements in LINKLESS. An `<a>` ends at the next `<a>` or `</a>` (they
+ * don't nest), or the end. One pass, linear in the input. For
+ * contentLinks.ts, which decides which of them name an Artifact.
+ */
+export function htmlLinks(html: string): HtmlLink[] {
+  const lower = html.toLowerCase();
+  const links: HtmlLink[] = [];
+  let open: { href: string; offset: number; text: string } | null = null;
+  const text = (chunk: string) => {
+    if (open && open.text.length < LINK_TEXT_MAX_CHARS) open.text += chunk.slice(0, LINK_TEXT_MAX_CHARS - open.text.length);
+  };
+  const close = () => {
+    if (!open) return;
+    links.push({ href: open.href, offset: open.offset, text: decodeCharacterReferences(open.text).replace(/\s+/g, " ").trim() });
+    open = null;
+  };
+  let i = 0;
+  while (i < html.length) {
+    const lt = html.indexOf("<", i);
+    if (lt < 0) {
+      text(html.slice(i));
+      break;
+    }
+    text(html.slice(i, lt));
+    if (lower.startsWith("<!--", lt)) {
+      const end = html.indexOf("-->", lt + 4);
+      i = end < 0 ? html.length : end + 3;
+      continue;
+    }
+    const next = html[lt + 1] ?? "";
+    if (next === "!" || next === "?") {
+      const end = html.indexOf(">", lt + 2);
+      i = end < 0 ? html.length : end + 1;
+      continue;
+    }
+    const closing = next === "/";
+    const nameMatch = /^[a-zA-Z][a-zA-Z0-9:-]*/.exec(html.slice(lt + (closing ? 2 : 1), lt + (closing ? 2 : 1) + 64));
+    if (!nameMatch) {
+      text("<");
+      i = lt + 1;
+      continue;
+    }
+    const end = tagEnd(html, lt);
+    if (end < 0) break;
+    const name = nameMatch[0].toLowerCase();
+    i = end;
+    if (!closing && LINKLESS.has(name) && html[end - 2] !== "/") {
+      // Its contents are skipped; its end tag is then read as any other.
+      i = rawTextEnd(lower, name, end);
+      continue;
+    }
+    if (name === "a") {
+      close();
+      const href = closing ? null : attributeOf(html.slice(lt, end), "href");
+      if (href !== null) open = { href: decodeCharacterReferences(href), offset: lt, text: "" };
+    } else if (name === "area" && !closing) {
+      const href = attributeOf(html.slice(lt, end), "href");
+      if (href !== null) links.push({ href: decodeCharacterReferences(href), offset: lt, text: "" });
+    }
+  }
+  close();
+  return links;
 }
 
 /** Lines without trailing whitespace, no more than one blank line in a row, none at either end. */

@@ -101,6 +101,7 @@ const VISIBLE_CONSUMED_SOURCES = [
   "agent_api_inbox_check", "agent_api_history", "agent_api_events_local", "agent_api_events_server", "agent_api_send_commit",
   "spawn_wake_message", "spawn_resume_catchup_inbox", "spawn_starting_inbox_update",
   "stdin_thread_context_delivery", "busy_stdin_notification", "stdin_idle_delivery", "stdin_busy_delivery",
+  "stdin_focus_body_delivery",
 ] as const;
 const TURN_REASONS = [
   "spawn", "stdin-idle-delivery", "runtime-profile", "runtime-progress", "app-inbox-notice",
@@ -109,7 +110,7 @@ const TURN_REASONS = [
 export const AGENT_EVENT_TAIL_RUNTIME_INPUT_SOURCE_BASES = [
   "runtime_profile_control", "runtime_profile_control_message", "resume_prompt", "wake_inbox_update", "wake_thread_context",
   "transient_wake_message", "resume_catchup_inbox", "starting_thread_context", "starting_inbox_update",
-  "resume_unread_summary", "resume_empty", "cold_start",
+  "resume_unread_summary", "fresh_unread_summary", "resume_open_tasks", "fresh_open_tasks", "resume_empty", "cold_start",
 ] as const;
 
 const count = (...from: string[]): AgentEventTailAttrSource => ({ spec: { kind: "count" }, from });
@@ -214,6 +215,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 function isRuntimeInputSource(value: string): boolean {
   let base = value;
   if (base.startsWith("recycled_")) base = base.slice("recycled_".length);
+  else if (base.startsWith("constructed_")) base = base.slice("constructed_".length);
   if (base.endsWith("_with_memory")) base = base.slice(0, -"_with_memory".length);
   return (AGENT_EVENT_TAIL_RUNTIME_INPUT_SOURCE_BASES as readonly string[]).includes(base);
 }

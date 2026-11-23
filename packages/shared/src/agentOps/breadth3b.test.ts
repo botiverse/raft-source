@@ -17,7 +17,12 @@ import {
   searchManual,
   searchMessages,
   uploadAttachment,
+  ARTIFACT_NOT_A_PAGE_HOLD_MS,
+  memoryArtifactPageHoldStore,
+  type ArtifactPageHoldStore,
 } from "./index";
+import { artifactPushTargetFor, attachmentArtifactHold } from "./attachmentArtifactHold";
+import { formatAttachmentPreferArtifactHold } from "../agentText/artifacts";
 
 type Scripted = (path: string, init: RequestInit) => Response | Promise<Response>;
 
@@ -75,6 +80,147 @@ test("attachments: upload resolves the target, posts multipart with file + chann
 
   const empty = await uploadAttachment(api, transport, { target: "#proj-sdk", filename: "e", bytes: new Uint8Array(0) });
   assert.equal(empty.ok ? null : empty.error.code, "INVALID_REQUEST");
+});
+
+// ── an HTML or Markdown file uploaded, held once (#347) ──
+
+/** The upload op against a fake Server: what it asked for, and whether the file went up. */
+function uploadRecorder() {
+  const calls: Array<{ method: string; path: string; body: unknown; init: RequestInit }> = [];
+  const uploads: string[] = [];
+  const api = client((path) => {
+    if (path === "/internal/agent-api/attachment-upload-capabilities") return Response.json({ directUploadEnabled: false, directUploadThresholdBytes: null, maxBytes: 50_000_000, sessionExpiresInSeconds: null });
+    if (path === "/internal/agent-api/resolve-channel") return Response.json({ channelId: "11111111-1111-4111-8111-111111111111" });
+    return new Response("unexpected", { status: 500 });
+  }, calls);
+  const transport = {
+    serverUrl: "https://raft.example",
+    headers: {},
+    authorization: "Bearer sk_agent_test",
+    fetch: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const file = (init?.body as FormData).get("file") as File;
+      uploads.push(file.name);
+      return Response.json({ id: UUID_A, filename: file.name, mimeType: file.type, sizeBytes: file.size, thumbnailUrl: null });
+    }) as typeof fetch,
+  };
+  return { api, transport, calls, uploads };
+}
+
+/** A hold store in a Map, as the SDK's (memoryArtifactPageHoldStore), that can be told to fail. */
+function uploadHoldStore(fail: { read?: true; write?: true } = {}) {
+  const held = new Map<string, number>();
+  const store: ArtifactPageHoldStore = {
+    heldAt: (key) => { if (fail.read) throw new Error("ledger unreadable"); return held.get(key); },
+    hold: (key, at) => { if (fail.write) throw new Error("ledger read-only"); held.set(key, at); },
+    release: (key) => { held.delete(key); },
+  };
+  return { store, held };
+}
+
+test("attachments: an HTML or Markdown file is held once before any request (a held-once failure with no code of its own); the same upload again goes through and forgets the hold", async () => {
+  const { api, transport, calls, uploads } = uploadRecorder();
+  const { store, held } = uploadHoldStore();
+  const request = { target: "#proj-workspace", filename: "plan.md", bytes: new TextEncoder().encode("# Plan") };
+  const hold = { store, path: "/abs/dir/plan.md", push: { dir: "/abs/dir/plan", copyFrom: "/abs/dir/plan.md" } };
+
+  const first = await uploadAttachment(api, transport, request, { hold: attachmentArtifactHold(hold) });
+  assert.ok(!first.ok);
+  assert.equal(first.error.code, "CONFLICT");
+  assert.deepEqual([first.error.heldOnce, first.error.serverCode], [true, undefined]);
+  assert.equal(first.error.retryable, false);
+  const text = formatAttachmentPreferArtifactHold({ file: "plan.md", target: "#proj-workspace", title: "plan", dir: "/abs/dir/plan", copyFrom: "/abs/dir/plan.md" });
+  assert.equal(first.error.message, text.message);
+  assert.equal(first.error.nextAction, text.nextAction);
+  assert.equal(calls.length + uploads.length, 0, "nothing sent");
+  assert.equal(held.size, 1, "the hold is recorded");
+  assert.ok([...held.keys()][0]!.startsWith("prefer-artifact/"), "under its own prefix in the push hold's store");
+
+  const again = await uploadAttachment(api, transport, request, { hold: attachmentArtifactHold(hold) });
+  assert.ok(again.ok, again.ok ? "" : again.text);
+  assert.deepEqual(uploads, ["plan.md"], "uploaded");
+  assert.equal(held.size, 0, "the hold is forgotten once the upload went through");
+
+  const third = await uploadAttachment(api, transport, request, { hold: attachmentArtifactHold(hold) });
+  assert.ok(!third.ok && third.error.heldOnce === true, "the same file uploaded once more is held again");
+});
+
+test("attachments: a held HTML or Markdown upload is held again once its content, file or target changes, or after 10 minutes", async () => {
+  const { api, transport, uploads } = uploadRecorder();
+  const { store } = uploadHoldStore();
+  let now = Date.parse("2026-11-20T10:00:00.000Z");
+  const hold = (path = "/w/notes.md") => ({ store, path, now: () => now });
+  const upload = (content: string, target = "#ops") => ({ target, filename: "notes.md", bytes: new TextEncoder().encode(content) });
+  const isHeld = (out: Awaited<ReturnType<typeof uploadAttachment>>) => !out.ok && out.error.heldOnce === true;
+
+  assert.ok(isHeld(await uploadAttachment(api, transport, upload("# v1"), { hold: attachmentArtifactHold(hold()) })));
+  now += 60_000;
+  assert.ok(isHeld(await uploadAttachment(api, transport, upload("# v2"), { hold: attachmentArtifactHold(hold()) })), "the content changed: held again");
+  assert.ok(isHeld(await uploadAttachment(api, transport, upload("# v2"), { hold: attachmentArtifactHold(hold("/x/notes.md")) })), "another file: held");
+  assert.ok(isHeld(await uploadAttachment(api, transport, upload("# v2", "#other"), { hold: attachmentArtifactHold(hold()) })), "another target: held");
+  now += ARTIFACT_NOT_A_PAGE_HOLD_MS + 1;
+  assert.ok(isHeld(await uploadAttachment(api, transport, upload("# v2"), { hold: attachmentArtifactHold(hold()) })), "more than 10 minutes later: held again");
+  assert.equal(uploads.length, 0, "nothing sent yet");
+  now += ARTIFACT_NOT_A_PAGE_HOLD_MS;
+  const within = await uploadAttachment(api, transport, upload("# v2", " #ops "), { hold: attachmentArtifactHold(hold()) });
+  assert.ok(within.ok, within.ok ? "" : within.text);
+  assert.deepEqual(uploads, ["notes.md"], "the same upload again within 10 minutes (the target trimmed) goes through");
+});
+
+test("attachments: never held: a file that is not HTML or Markdown, an upload without a hold store, or a store that can't record; any case of .html/.htm/.md/.markdown is", async () => {
+  const { api, transport, uploads } = uploadRecorder();
+  const bytes = new TextEncoder().encode("x");
+  for (const filename of ["report.pdf", "chart.png", "log.txt", "data.csv", "page.html.zip"]) {
+    const out = await uploadAttachment(api, transport, { target: "#ops", filename, bytes }, { hold: attachmentArtifactHold({ store: uploadHoldStore().store }) });
+    assert.ok(out.ok, `${filename}: ${out.ok ? "" : out.text}`);
+  }
+  const page = { target: "#ops", filename: "plan.md", bytes };
+  assert.ok((await uploadAttachment(api, transport, page)).ok, "no hold store (a direct caller of the op)");
+  assert.ok((await uploadAttachment(api, transport, page, { hold: attachmentArtifactHold({ store: uploadHoldStore({ read: true, write: true }).store }) })).ok, "a store that can't record");
+  assert.ok((await uploadAttachment(api, transport, page, { hold: attachmentArtifactHold({ store: uploadHoldStore({ write: true }).store }) })).ok, "a store that can't write");
+  assert.equal(uploads.length, 8);
+  for (const filename of ["a.HTML", "b.htm", "c.MD", "d.markdown"]) {
+    const out = await uploadAttachment(api, transport, { target: "#ops", filename, bytes }, { hold: attachmentArtifactHold({ store: memoryArtifactPageHoldStore() }) });
+    assert.ok(!out.ok && out.error.heldOnce === true, filename);
+  }
+});
+
+test("attachments: the push takes the upload's target, a thread's as it is; a task ref pushes into its conversation and posts in the task; any other target is never held", () => {
+  assert.deepEqual(artifactPushTargetFor("#proj-workspace"), { target: "#proj-workspace" });
+  assert.deepEqual(artifactPushTargetFor(" dm:@alice~human "), { target: "dm:@alice~human" });
+  assert.deepEqual(artifactPushTargetFor("#proj-workspace:abcd1234"), { target: "#proj-workspace:abcd1234" }, "a thread: homed in its conversation by the push itself");
+  assert.deepEqual(artifactPushTargetFor("dm:@alice:abcd1234"), { target: "dm:@alice:abcd1234" });
+  assert.deepEqual(artifactPushTargetFor("#proj-workspace:#7"), { target: "#proj-workspace", postIn: "#proj-workspace:#7" });
+  assert.deepEqual(artifactPushTargetFor("dm:@alice:#3"), { target: "dm:@alice", postIn: "dm:@alice:#3" });
+  for (const target of ["task #7", "#proj-workspace:abc123", "@alice", "11111111-1111-4111-8111-111111111111", "#proj-workspace msg=abcd1234"]) {
+    assert.equal(artifactPushTargetFor(target), null, target);
+  }
+});
+
+test("attachments: an upload to a thread holds with the thread's target; to a task, with the task's conversation and the task to post in; to a target push can't name, never", async () => {
+  const { api, transport, uploads } = uploadRecorder();
+  const bytes = new TextEncoder().encode("# Plan");
+  const thread = await uploadAttachment(api, transport, { target: "#proj-workspace:abcd1234", filename: "plan.md", bytes }, { hold: attachmentArtifactHold({ store: memoryArtifactPageHoldStore(), path: "/abs/dir/plan.md", push: { dir: "/abs/dir" } }) });
+  assert.ok(!thread.ok);
+  assert.equal(thread.error.nextAction, formatAttachmentPreferArtifactHold({ file: "plan.md", target: "#proj-workspace:abcd1234", title: "plan", dir: "/abs/dir" }).nextAction);
+  const task = await uploadAttachment(api, transport, { target: "#proj-workspace:#7", filename: "plan.md", bytes }, { hold: attachmentArtifactHold({ store: memoryArtifactPageHoldStore(), path: "/abs/dir/plan.md", push: { dir: "/abs/dir" } }) });
+  assert.ok(!task.ok);
+  assert.equal(task.error.nextAction, formatAttachmentPreferArtifactHold({ file: "plan.md", target: "#proj-workspace", postIn: "#proj-workspace:#7", title: "plan", dir: "/abs/dir" }).nextAction);
+  assert.equal(uploads.length, 0);
+  const { store, held } = uploadHoldStore();
+  const legacy = await uploadAttachment(api, transport, { target: "task #7", filename: "plan.md", bytes }, { hold: attachmentArtifactHold({ store }) });
+  assert.ok(legacy.ok, legacy.ok ? "" : legacy.text);
+  assert.equal(held.size, 0, "nothing recorded");
+});
+
+test("attachments: the hold in tool style is the push call; an HTML file's own <title> needs no title", async () => {
+  const { api, transport } = uploadRecorder();
+  const out = await uploadAttachment(api, transport, { target: "#proj-workspace", filename: "site.html", bytes: new TextEncoder().encode("<title>Q3 plan</title><p>x</p>") }, { hints: "tool", hold: attachmentArtifactHold({ store: memoryArtifactPageHoldStore() }, "tool") });
+  assert.ok(!out.ok);
+  assert.equal(out.error.nextAction, formatAttachmentPreferArtifactHold({ file: "site.html", target: "#proj-workspace" }, "tool").nextAction);
+  assert.ok(!/\braft [a-z]/.test(out.text), out.text);
+  const untitled = await uploadAttachment(api, transport, { target: "#proj-workspace", filename: "site.html", bytes: new TextEncoder().encode("<p>x</p>") }, { hints: "tool", hold: attachmentArtifactHold({ store: memoryArtifactPageHoldStore() }, "tool") });
+  assert.ok(!untitled.ok);
+  assert.equal(untitled.error.nextAction, formatAttachmentPreferArtifactHold({ file: "site.html", target: "#proj-workspace", title: "site" }, "tool").nextAction);
 });
 
 test("attachments: comments render the CLI text", async () => {

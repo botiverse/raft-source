@@ -2,9 +2,9 @@ import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase, openTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { managedMcpCredentials, managedMcpServers, users } from "../db/schema";
+import { agents, managedMcpCredentials, managedMcpServers, serverMembers, users } from "../db/schema";
 import { createAgent } from "./agentService";
 import { addMember, createServer } from "./serverService";
 import { encryptManagedMcpHeaders } from "./managedMcpCredentialService";
@@ -59,11 +59,13 @@ async function seed() {
   await addMember(server.id, member.id, "member");
   const ownersAgent = await createAgent(server.id, `owners-${randomUUID().slice(0, 8)}`, { creatorType: "user", creatorId: owner.id });
   const membersAgent = await createAgent(server.id, `members-${randomUUID().slice(0, 8)}`, { creatorType: "user", creatorId: member.id });
-  const app = async (createdBy: string | null, name = `App ${randomUUID().slice(0, 6)}`) => {
-    const created = await createManagedMcpServer({ serverId: server.id, userId: owner.id, name, endpointUrl: "https://open.example.test/mcp" });
+  /** `vouched`: the Server vouched for it (`server_vouched_at`), as an owner or admin creating it does. */
+  const app = async (createdBy: string | null, vouched = false) => {
+    const created = await createManagedMcpServer({ serverId: server.id, userId: owner.id, name: `App ${randomUUID().slice(0, 6)}`, endpointUrl: "https://open.example.test/mcp" });
     await getDb().update(managedMcpServers).set({
       createdByUserId: createdBy,
       toolCatalog: [{ name: "search", inputSchema: { type: "object" } }],
+      ...(vouched ? { serverVouchedAt: new Date(), serverVouchedByUserId: owner.id } : {}),
     }).where(eq(managedMcpServers.id, created.id));
     return created;
   };
@@ -85,14 +87,45 @@ function call(serverId: string, agentId: string, app: { id: string; configVersio
   }, async () => ({ content: [], isError: false }));
 }
 
-test("⭐ an App made by someone who manages external auth is granted automatically to every Agent", async () => {
+test("⭐ an App the Server vouched for is granted automatically to every Agent", async () => {
   const { owner, server, ownersAgent, membersAgent, app } = await seed();
-  const byOwner = await app(owner.id);
+  const byOwner = await app(owner.id, true);
   for (const agent of [ownersAgent, membersAgent]) {
     assert.deepEqual(await grantOf(server.id, agent.id, byOwner.id), { grant: "automatic", mode: "default" });
     assert.equal(await offered(server.id, agent.id, byOwner.id), true);
     await call(server.id, agent.id, byOwner);
   }
+});
+
+test("⭐ the creator's current role is not read: an owner's App nobody vouched for reaches only the owner's Agents", async () => {
+  const { owner, server, ownersAgent, membersAgent, app } = await seed();
+  const byOwner = await app(owner.id);
+  assert.deepEqual(await grantOf(server.id, ownersAgent.id, byOwner.id), { grant: "automatic", mode: "default" });
+  assert.deepEqual(await grantOf(server.id, membersAgent.id, byOwner.id), { grant: "not_granted", mode: "off" });
+  assert.equal(await offered(server.id, membersAgent.id, byOwner.id), false);
+  await assert.rejects(call(server.id, membersAgent.id, byOwner), { code: "managed_mcp_app_off" });
+});
+
+test("⭐ a vouch outlives its creator's demotion and departure", async () => {
+  const { owner, member, server, ownersAgent, membersAgent, app } = await seed();
+  const admin = await seedUser("admin");
+  await addMember(server.id, admin.id, "admin");
+  const byAdmin = await app(admin.id, true);
+  const membership = and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, admin.id));
+  await getDb().update(serverMembers).set({ role: "member" }).where(membership);
+  for (const agent of [ownersAgent, membersAgent]) {
+    assert.deepEqual(await grantOf(server.id, agent.id, byAdmin.id), { grant: "automatic", mode: "default" }, "demoted");
+    await call(server.id, agent.id, byAdmin);
+  }
+  await getDb().delete(serverMembers).where(membership);
+  assert.equal(await offered(server.id, membersAgent.id, byAdmin.id), true, "left");
+  assert.equal(await isMcpConnectionAuthorized(getDb(), server.id, membersAgent.id, byAdmin.id), true);
+  const view = await getMcpAppView(server.id, byAdmin.id, owner.id);
+  assert.equal(view.agentAccess.allAgents, true);
+  assert.deepEqual([...view.agentAccess.agentIds].sort(), [ownersAgent.id, membersAgent.id].sort());
+  assert.equal(view.agentsSummary.off, 0);
+  assert.equal(view.serverVouched, true);
+  assert.equal((await getMcpAppView(server.id, byAdmin.id, member.id)).serverVouched, true, "a member sees it too");
 });
 
 test("⭐ an App made by someone without manageExternalAuth is granted automatically only to their own Agents", async () => {
@@ -117,18 +150,52 @@ test("⭐ an App made by someone without manageExternalAuth is granted automatic
   await call(server.id, ownersAgent.id, byMember);
 });
 
-test("⭐ an App with no recorded creator stays granted to every Agent (legacy rows keep today's behaviour)", async () => {
-  const { server, ownersAgent, membersAgent, app } = await seed();
+test("⭐ fail-closed: an App with no recorded creator reaches no Agent automatically unless the Server vouched for it", async () => {
+  const { owner, server, ownersAgent, membersAgent, app } = await seed();
   const legacy = await app(null);
   for (const agent of [ownersAgent, membersAgent]) {
-    assert.deepEqual(await grantOf(server.id, agent.id, legacy.id), { grant: "automatic", mode: "default" });
-    assert.equal(await offered(server.id, agent.id, legacy.id), true);
+    assert.deepEqual(await grantOf(server.id, agent.id, legacy.id), { grant: "not_granted", mode: "off" });
+    assert.equal(await offered(server.id, agent.id, legacy.id), false);
+    await assert.rejects(call(server.id, agent.id, legacy), { code: "managed_mcp_app_off" });
   }
+  assert.deepEqual((await getMcpAppView(server.id, legacy.id, owner.id)).agentAccess,
+    { allAgents: false, agentIds: [], exceptAgentIds: [ownersAgent.id, membersAgent.id] });
+  // A person grants it to one Agent: only that one.
+  await setManagedMcpAssignment({ serverId: server.id, userId: owner.id, agentId: membersAgent.id, mcpServerId: legacy.id, enabled: true });
+  assert.deepEqual(await grantOf(server.id, membersAgent.id, legacy.id), { grant: "person", mode: "default" });
+  assert.equal(await offered(server.id, ownersAgent.id, legacy.id), false);
+  // Vouched (as migration 0732 does for one on a live Server, reason legacy_no_creator): every Agent.
+  const vouched = await app(null, true);
+  for (const agent of [ownersAgent, membersAgent]) {
+    assert.deepEqual(await grantOf(server.id, agent.id, vouched.id), { grant: "automatic", mode: "default" });
+    await call(server.id, agent.id, vouched);
+  }
+});
+
+test("⭐ a retired creator's App nobody vouched for reaches no other Agent; only Agents still created by them", async () => {
+  const { owner, server, ownersAgent, membersAgent, app } = await seed();
+  const admin = await seedUser("retiring-admin");
+  await addMember(server.id, admin.id, "admin");
+  const adminsAgent = await createAgent(server.id, `admins-${randomUUID().slice(0, 8)}`, { creatorType: "user", creatorId: admin.id });
+  const byAdmin = await app(admin.id);
+  // What retirement leaves behind: the account retired, the membership gone.
+  await getDb().update(users).set({ retiredAt: new Date() }).where(eq(users.id, admin.id));
+  await getDb().delete(serverMembers).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, admin.id)));
+  for (const agent of [ownersAgent, membersAgent]) {
+    assert.deepEqual(await grantOf(server.id, agent.id, byAdmin.id), { grant: "not_granted", mode: "off" });
+    await assert.rejects(call(server.id, agent.id, byAdmin), { code: "managed_mcp_app_off" });
+  }
+  // An Agent still created by them (retirement skips an App-managed or migrating one) keeps it by the creator branch.
+  assert.deepEqual(await grantOf(server.id, adminsAgent.id, byAdmin.id), { grant: "automatic", mode: "default" });
+  // Retirement hands their other Agents to the Server owner (creator_id becomes the owner's): no longer covered.
+  await getDb().update(agents).set({ creatorType: "user", creatorId: owner.id }).where(eq(agents.id, adminsAgent.id));
+  assert.deepEqual(await grantOf(server.id, adminsAgent.id, byAdmin.id), { grant: "not_granted", mode: "off" });
+  assert.deepEqual((await getMcpAppView(server.id, byAdmin.id, owner.id)).agentAccess.agentIds, []);
 });
 
 test("⭐ revoking blocks the automatic grant for that Agent until someone grants it again", async () => {
   const { owner, server, ownersAgent, membersAgent, app } = await seed();
-  const byOwner = await app(owner.id);
+  const byOwner = await app(owner.id, true);
   await setManagedMcpAssignment({ serverId: server.id, userId: owner.id, agentId: membersAgent.id, mcpServerId: byOwner.id, enabled: false });
   assert.deepEqual(await grantOf(server.id, membersAgent.id, byOwner.id), { grant: "revoked", mode: "off" });
   assert.equal(await offered(server.id, membersAgent.id, byOwner.id), false);
@@ -168,6 +235,32 @@ test("App summaries and default-change impact count Agents without the App as of
   assert.equal(impact.offUnchanged, 1);
   await setManagedMcpAssignment({ serverId: server.id, userId: owner.id, agentId: membersAgent.id, mcpServerId: byMember.id, enabled: false });
   assert.equal((await getMcpAppView(server.id, byMember.id, owner.id)).agentsSummary.off, 2);
+});
+
+test("the App view names which listed Agents have the App, by the summary's rule, oldest first", async () => {
+  const { owner, member, server, ownersAgent, membersAgent, app } = await seed();
+  const at = (agentId: string, iso: string) => getDb().update(agents).set({ createdAt: new Date(iso) }).where(eq(agents.id, agentId));
+  await at(ownersAgent.id, "2026-01-01T00:00:00Z");
+  await at(membersAgent.id, "2026-01-02T00:00:00Z");
+  const third = await createAgent(server.id, `third-${randomUUID().slice(0, 8)}`, { creatorType: "user", creatorId: owner.id });
+  await at(third.id, "2026-01-03T00:00:00Z");
+  // Neither a deleted Agent nor someone's personal assistant is named (the summary still counts the assistant).
+  const gone = await createAgent(server.id, `gone-${randomUUID().slice(0, 8)}`, { creatorType: "user", creatorId: owner.id });
+  await getDb().update(agents).set({ deletedAt: new Date() }).where(eq(agents.id, gone.id));
+  const assistant = await createAgent(server.id, `assistant-${randomUUID().slice(0, 8)}`, { creatorType: "user", creatorId: member.id });
+  await getDb().update(agents).set({ assistantOwnerUserId: member.id }).where(eq(agents.id, assistant.id));
+  const access = async (appId: string) => (await getMcpAppView(server.id, appId, member.id)).agentAccess;
+
+  const byOwner = await app(owner.id, true);
+  assert.deepEqual(await access(byOwner.id), { allAgents: true, agentIds: [ownersAgent.id, membersAgent.id, third.id], exceptAgentIds: [] });
+  assert.equal((await getMcpAppView(server.id, byOwner.id, member.id)).agentsSummary.total, 4);
+
+  await setManagedMcpAssignment({ serverId: server.id, userId: owner.id, agentId: membersAgent.id, mcpServerId: byOwner.id, enabled: false });
+  assert.deepEqual(await access(byOwner.id), { allAgents: false, agentIds: [ownersAgent.id, third.id], exceptAgentIds: [membersAgent.id] }, "revoked");
+
+  // Automatic only for its creator's Agents: the owner's are excepted.
+  const byMember = await app(member.id);
+  assert.deepEqual(await access(byMember.id), { allAgents: false, agentIds: [membersAgent.id], exceptAgentIds: [ownersAgent.id, third.id] });
 });
 
 test("⭐ switching an OAuth App back on for an Agent pinned to a signed-in Connection works while the default is not signed in", async () => {

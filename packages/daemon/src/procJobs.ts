@@ -46,6 +46,31 @@
  *   own, `detached`) and start identity are the command's. Without user
  *   systemd the job stays in the service's cgroup and `start` says it stops
  *   with the service (`stopsWithService`). The ledger records `scope`.
+ * - Memory (#proj-raft-computer:#114): each job runs under a cap, read at
+ *   its start from the owner's `<Raft home>/computer/proc.json`
+ *   (`readProcMemoryMaxBytes`; default `PROC_MEMORY_MAX_DEFAULT_BYTES`, 4 GB).
+ *   In a scope of its own (`created`) the scope gets `MemoryMax` and
+ *   `MemorySwapMax=0`, plus `OOMPolicy=kill` where scopes take it (systemd
+ *   253 on), so an OOM kill ends the whole scope, not one process in it. The
+ *   kernel is trusted to enforce it (`memoryEnforcedBy: "kernel"`) only with
+ *   `OOMPolicy` and once the job's own cgroup is seen to carry the cap
+ *   (`memory.max`; a user manager without the memory controller accepts
+ *   `MemoryMax` and ignores it); otherwise the job is sampled as below. A
+ *   capped scope is started without `--collect`, under a unit name of its own
+ *   (`<procScopeUnitName>-<start time>`, so an earlier failed unit never
+ *   blocks a start): its cgroup (and `memory.events`) is gone by the time the
+ *   job's exit is seen, and only a unit kept as failed still says why
+ *   (`Result=oom-kill`, which systemd takes from the cgroup's `oom_kill`
+ *   count); it is read once the unit has settled, then reset
+ *   (`ProcScopeUnitOps`). Anywhere else (macOS, Linux without user systemd, a
+ *   job in the agent's scope) the daemon samples the job's process group
+ *   every 15 s (`sampleMemory`, resident memory from `ps`, which counts pages
+ *   shared between the group's processes once per process) and stops it, as
+ *   `--force` does, after `PROC_MEMORY_OVER_CAP_SAMPLES` samples in a row over
+ *   the cap. A process that left the group (`setsid`), or outlived the job's
+ *   lead process, is not counted there: a known gap. Either way the job's
+ *   record says `exitReason: "memory_limit"` and the agent gets one Inbox
+ *   notice per job (`onMemoryLimit`, apps/proc). A job is never restarted.
  * - Windows: not in v1 (no daemon support, `proc@1` not declared).
  *
  * Invariant: a job runs as the daemon's user, outside the agent's runtime,
@@ -82,16 +107,23 @@ import {
   CLI_STABLE_ENTRY_DIRNAME,
   daemonApiProcStartBodySchema,
   isValidProcName,
+  isValidProcStoppedBy,
   parseProcJobLedger,
   PROC_CAPABILITY,
+  PROC_CONFIG_FILE,
+  PROC_CONFIG_MEMORY_MAX_KEY,
   PROC_JOB_LEDGER_FILE,
   PROC_LOG_MAX_BYTES,
   PROC_LOGS_DEFAULT_TAIL,
   PROC_LOGS_MAX_TAIL,
   PROC_MAX_JOBS_PER_AGENT,
+  PROC_MEMORY_MAX_DEFAULT_BYTES,
   PROC_NAME_MAX_LENGTH,
   type ProcErrorCode,
+  type ProcExitReason,
   type ProcJobLedgerEntry,
+  type ProcJobStopOutcome,
+  type ProcJobsSnapshotJob,
 } from "@botiverse/raft-shared";
 import { AGENT_STOP_KILL_CONFIRM_MS, AGENT_STOP_KILL_GRACE_MS } from "./drivers/processStop";
 import { ancestorChain, readProcessIdentity, type ProcessIdentityDeps, type ProcessTreeDeps } from "./drivers/processTree";
@@ -104,11 +136,32 @@ import { ambientProcessEnv } from "./processEnvPatch";
 import { runtimeRunsWithFullAccess } from "./procRuntimeAccess";
 
 export { PROC_JOB_LEDGER_FILE };
+
+/**
+ * Whether this daemon runs `raft proc` jobs on `platform`: it starts its
+ * `ProcJobManager` (and so declares `proc@1`) with the machine lock, which it
+ * takes before any agent starts, everywhere but Windows (v1). The standing
+ * prompt's Background jobs entry follows the same answer (cliTransport.ts).
+ */
+export function daemonRunsProcJobs(platform: NodeJS.Platform = process.platform): boolean {
+  return platform !== "win32";
+}
 /** Exited jobs one agent's list keeps (the newest), so `list` can show how a job ended. */
 const PROC_EXITED_KEPT_PER_AGENT = 8;
 const PROC_ROTATE_INTERVAL_MS = 15_000;
 const PROC_LOGS_TAIL_READ_BYTES = 1024 * 1024;
 const PROC_LOGS_FOLLOW_READ_BYTES = 256 * 1024;
+/** Samples in a row over its cap before a sampled job is stopped (one 15 s sample alone may catch a spike). */
+export const PROC_MEMORY_OVER_CAP_SAMPLES = 2;
+const SYSTEMCTL_TIMEOUT_MS = 3_000;
+/** Every job scope (`systemctl --user reset-failed` takes a glob). */
+export const PROC_FAILED_SCOPES_PATTERN = "raft-proc-*";
+/** How long an ended scope may take to settle (inactive or failed) before its `Result` is read. */
+const SCOPE_SETTLE_MS = 3_000;
+/** The first systemd whose scope units take `OOMPolicy=` (its NEWS, "CHANGES WITH 253"). */
+export const SYSTEMD_SCOPE_OOM_POLICY_VERSION = 253;
+/** How long a new scoped job's cgroup is looked for, to see that it carries the cap. */
+const SCOPE_CAP_CONFIRM_MS = 1_000;
 
 // The per-session CLI channel (cliTransport.ts). Named here, not imported:
 // cliTransport imports the proxy, which serves these jobs.
@@ -129,7 +182,7 @@ const PER_SESSION_ENV = [
 ] as const;
 
 export type ProcScope = "none" | "agent" | "created";
-export type ProcStopReason = "agent" | "force" | "owner_stop" | "agent_deleted" | "migrated" | "uninstall";
+export type ProcStopReason = "agent" | "force" | "owner_stop" | "agent_deleted" | "migrated" | "uninstall" | "memory_limit";
 
 /**
  * The job stop an `agent:stop` brings, from its optional `reason` (read as an
@@ -153,6 +206,12 @@ export function procStopReasonForAgentStop(reason: unknown): ProcStopReason | nu
 /** One ledger entry (shared `ProcJobLedgerEntry`: `raft-computer` reads the same file). */
 export type ProcJobRecord = ProcJobLedgerEntry & { scope: ProcScope };
 
+/** The `systemd-run --version` major (`systemd 259 (...)`), or null. */
+export function parseSystemdVersion(text: string): number | null {
+  const match = /^systemd (\d+)\b/m.exec(text);
+  return match ? Number(match[1]) : null;
+}
+
 interface ProcLedgerFile {
   version: 1;
   jobs: ProcJobRecord[];
@@ -170,6 +229,10 @@ export interface ProcJobWire {
   logPath: string;
   scope: ProcScope;
   adopted: boolean;
+  memoryMaxBytes: number | null;
+  exitReason: ProcExitReason | null;
+  /** With `owner_stop`: the handle of the person who stopped it; null: not known. */
+  stoppedBy: string | null;
 }
 
 export type ProcTrace = (name: string, attrs: Record<string, unknown>, status?: "ok" | "error") => void;
@@ -198,6 +261,25 @@ export interface ProcJobManagerOptions {
   tree?: ProcessTreeDeps;
   /** The agent's runtime processes, from the runtime ledger (`AgentProcessManager.runtimeProcessesForAgent`). */
   runtimeRoots?: (agentId: string) => readonly ProcRuntimeRoot[];
+  /** A new job's memory cap in bytes, null for none; read at each start. Default: `PROC_MEMORY_MAX_DEFAULT_BYTES`. */
+  memoryMaxBytes?: () => number | null;
+  /** Resident memory per process group (bytes); groups it can't see are absent. Default: `ps`. */
+  memoryUsage?: (pgids: readonly number[]) => Promise<Map<number, number>>;
+  /** A job scope's systemd unit (Linux, `created`). Default: `systemctl --user`. */
+  scopeUnits?: ProcScopeUnitOps;
+  /** The Computer stopped the job at its cap; called once per stop, after the record says so. */
+  onMemoryLimit?: (job: ProcJobRecord) => void;
+  /** A person stopped the job from the Computer page (`stopByOwner`); called after the record says so. */
+  onOwnerStop?: (job: ProcJobRecord) => void;
+  /** The jobs changed (a start, an exit, a stop, adoption): called on every ledger write. */
+  onChange?: () => void;
+}
+
+export interface ProcScopeUnitOps {
+  /** The scope's `Result` (`oom-kill`, `success`, ...), or null when the unit is gone or unreadable. */
+  result(unit: string): Promise<string | null>;
+  /** Drop a failed scope, so the name can be used again. Never throws. */
+  resetFailed(unit: string): Promise<void>;
 }
 
 export interface ProcCgroupDeps {
@@ -445,9 +527,99 @@ export function procScopeUnitName(agentId: string, name: string): string | null 
   return `raft-proc-${agentShort}-${name}`;
 }
 
-/** The argv that runs `argv` in a transient user scope (no shell: systemd-run execs it). */
-export function procScopeArgv(systemdRun: string, unit: string, argv: readonly string[]): string[] {
-  return [systemdRun, "--user", "--scope", "--unit", unit, "--collect", "--", ...argv];
+/**
+ * The argv that runs `argv` in a transient user scope (no shell: systemd-run
+ * execs it). With a memory cap the kernel enforces it on the whole scope, and
+ * the scope is kept when it fails, so its `Result` can say `oom-kill` (see the
+ * header); without one it is collected at once.
+ */
+export function procScopeArgv(
+  systemdRun: string,
+  unit: string,
+  argv: readonly string[],
+  memoryMaxBytes: number | null = null,
+  options: { oomPolicy?: boolean } = {},
+): string[] {
+  const limits = memoryMaxBytes
+    ? ["-p", `MemoryMax=${memoryMaxBytes}`, "-p", "MemorySwapMax=0", ...(options.oomPolicy ? ["-p", "OOMPolicy=kill"] : [])]
+    : ["--collect"];
+  return [systemdRun, "--user", "--scope", "--unit", unit, ...limits, "--", ...argv];
+}
+
+/** `systemctl --user` for job scopes, found on `pathEnv`; every call gives up after 3 s. */
+export function systemctlScopeUnitOps(pathEnv: string): ProcScopeUnitOps {
+  const run = (args: string[]) => new Promise<string | null>((resolve) => {
+    const systemctl = whichOnPath("systemctl", pathEnv);
+    if (!systemctl) return resolve(null);
+    execFile(systemctl, ["--user", ...args], { env: ambientProcessEnv(), timeout: SYSTEMCTL_TIMEOUT_MS, windowsHide: true }, (err, stdout) => {
+      resolve(err ? null : String(stdout ?? "").trim());
+    });
+  });
+  return {
+    // systemd records the OOM kill when it handles the cgroup's event, which
+    // may come after the job's exit is seen: wait (bounded) for the unit to
+    // settle before reading why it ended.
+    result: async (unit) => {
+      for (let waited = 0; ; waited += 200) {
+        const state = await run(["show", "--property=ActiveState", "--value", `${unit}.scope`]);
+        if (state === null || !["active", "activating", "deactivating"].includes(state) || waited >= SCOPE_SETTLE_MS) break;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      return (await run(["show", "--property=Result", "--value", `${unit}.scope`])) || null;
+    },
+    resetFailed: async (unit) => { await run(["reset-failed", `${unit}.scope`]); },
+  };
+}
+
+/** Whether this host's scopes take `OOMPolicy=` (`systemd-run --version`). */
+function scopesTakeOomPolicy(systemdRun: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile(systemdRun, ["--version"], { env: ambientProcessEnv(), timeout: SYSTEMCTL_TIMEOUT_MS, windowsHide: true }, (err, stdout) => {
+      const version = err ? null : parseSystemdVersion(String(stdout ?? ""));
+      resolve(version !== null && version >= SYSTEMD_SCOPE_OOM_POLICY_VERSION);
+    });
+  });
+}
+
+/** Resident memory per process group from one `ps` listing (macOS and Linux), in bytes. */
+export function readGroupMemoryBytes(pgids: readonly number[]): Promise<Map<number, number>> {
+  return new Promise((resolve, reject) => {
+    execFile("ps", ["-A", "-o", "pgid=,rss="], { env: ambientProcessEnv(), timeout: 5_000, maxBuffer: 8 * 1024 * 1024, windowsHide: true }, (err, stdout) => {
+      if (err) return reject(err);
+      resolve(sumGroupMemoryBytes(String(stdout), pgids));
+    });
+  });
+}
+
+/** `ps -o pgid=,rss=` rows (rss in KiB, as macOS and procps print it) summed per wanted group, in bytes. */
+export function sumGroupMemoryBytes(psOutput: string, pgids: readonly number[]): Map<number, number> {
+  const wanted = new Set(pgids);
+  const totals = new Map<number, number>();
+  for (const line of psOutput.split("\n")) {
+    const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+    if (!match) continue;
+    const pgid = Number(match[1]);
+    if (!wanted.has(pgid)) continue;
+    totals.set(pgid, (totals.get(pgid) ?? 0) + Number(match[2]) * 1024);
+  }
+  return totals;
+}
+
+/**
+ * The owner's cap for new jobs from `<Raft home>/computer/proc.json`
+ * (`{ "memoryMaxMb": 4096 }`): a whole number of MB, 0 for none. No file, or
+ * one that can't be read as that, gives the default.
+ */
+export function readProcMemoryMaxBytes(raftHome: string, read: (file: string) => string = (file) => readFileSync(file, "utf8")): number | null {
+  let value: unknown;
+  try {
+    value = (JSON.parse(read(path.join(raftHome, "computer", PROC_CONFIG_FILE))) as Record<string, unknown> | null)?.[PROC_CONFIG_MEMORY_MAX_KEY];
+  } catch {
+    return PROC_MEMORY_MAX_DEFAULT_BYTES;
+  }
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return PROC_MEMORY_MAX_DEFAULT_BYTES;
+  if (value === 0) return null;
+  return Number.isSafeInteger(value * 1024 * 1024) ? value * 1024 * 1024 : PROC_MEMORY_MAX_DEFAULT_BYTES;
 }
 
 /** An automatic name: the command's basename in the name alphabet, unique among the agent's jobs. */
@@ -497,6 +669,31 @@ export function procJobToWire(job: ProcJobRecord): ProcJobWire {
     logPath: job.logPath,
     scope: job.scope,
     adopted: job.adopted,
+    memoryMaxBytes: job.memoryMaxBytes ?? null,
+    exitReason: job.exitReason ?? null,
+    stoppedBy: job.exitReason === "owner_stop" ? job.stoppedBy ?? null : null,
+  };
+}
+
+/**
+ * One job as the Computer's owner sees it (`machine:proc_jobs:snapshot`,
+ * shared procJobsSnapshot.ts): never its command, arguments, directory,
+ * environment, log path or pid. `rssBytes`: its process group's resident
+ * memory at the last sample, for a job the daemon samples (absent otherwise).
+ */
+export function procJobToSnapshot(job: ProcJobRecord, rssBytes?: number): ProcJobsSnapshotJob {
+  return {
+    agentId: job.agentId,
+    name: job.name,
+    state: job.state,
+    startedAt: new Date(job.startedAtMs).toISOString(),
+    exitedAt: job.exitedAtMs === null ? null : new Date(job.exitedAtMs).toISOString(),
+    exitCode: job.exitCode,
+    exitSignal: job.exitSignal && /^SIG[A-Z0-9]{1,16}$/.test(job.exitSignal) ? job.exitSignal : null,
+    exitReason: job.exitReason ?? null,
+    stoppedBy: job.exitReason === "owner_stop" && isValidProcStoppedBy(job.stoppedBy) ? job.stoppedBy : null,
+    memoryMaxBytes: job.memoryMaxBytes ?? null,
+    ...(job.state === "running" && rssBytes !== undefined && Number.isSafeInteger(rssBytes) && rssBytes >= 0 ? { rssBytes } : {}),
   };
 }
 
@@ -543,6 +740,15 @@ export class ProcJobManager {
   private timer: ReturnType<typeof setInterval> | null = null;
   /** The absolute `systemd-run` when user systemd takes jobs; detected once. */
   private userSystemdRun: Promise<string | null> | null = null;
+  /** Whether its scopes take `OOMPolicy=`; detected once. */
+  private scopeOomPolicy: Promise<boolean> | null = null;
+  /** Samples in a row a sampled job was over its cap. */
+  private readonly overCap = new WeakMap<ProcJobRecord, number>();
+  /** A sampled job's process group's resident memory at the last sample (bytes). */
+  private readonly lastRss = new WeakMap<ProcJobRecord, number>();
+  private sampling = false;
+  /** Exit classifications under way (a scope's `Result`); `settled()` waits for them. */
+  private readonly pending = new Set<Promise<void>>();
 
   private constructor(private readonly options: ProcJobManagerOptions) {
     this.file = path.join(options.machineDir, PROC_JOB_LEDGER_FILE);
@@ -570,7 +776,10 @@ export class ProcJobManager {
     const manager = new ProcJobManager(options);
     const interval = options.rotateIntervalMs ?? PROC_ROTATE_INTERVAL_MS;
     if (interval > 0) {
-      manager.timer = setInterval(() => manager.sweep(), interval);
+      manager.timer = setInterval(() => {
+        manager.sweep();
+        void manager.sampleMemory();
+      }, interval);
       manager.timer.unref?.();
     }
     return manager;
@@ -610,6 +819,16 @@ export class ProcJobManager {
     return this.userSystemdRun;
   }
 
+  /** The cap a job started now gets: the owner's setting, read each time (a bad reading is the default). */
+  private memoryCap(): number | null {
+    try {
+      const value = this.options.memoryMaxBytes ? this.options.memoryMaxBytes() : PROC_MEMORY_MAX_DEFAULT_BYTES;
+      return value !== null && Number.isSafeInteger(value) && value > 0 ? value : null;
+    } catch {
+      return PROC_MEMORY_MAX_DEFAULT_BYTES;
+    }
+  }
+
   get maxJobsPerAgent(): number {
     return this.maxJobs;
   }
@@ -626,6 +845,18 @@ export class ProcJobManager {
     if (this.closed) return;
     mkdirSync(this.options.machineDir, { recursive: true });
     writeLedgerFileAtomic(this.file, { version: 1, jobs: [...this.jobs.values()] } satisfies ProcLedgerFile);
+    try {
+      this.options.onChange?.();
+    } catch {
+      // A listener never breaks the record.
+    }
+  }
+
+  /** Every job it knows, of every agent, as the Computer's owner sees them (`procJobToSnapshot`), oldest first. */
+  snapshotJobs(): ProcJobsSnapshotJob[] {
+    return [...this.jobs.values()]
+      .sort((a, b) => a.startedAtMs - b.startedAtMs)
+      .map((job) => procJobToSnapshot(job, this.lastRss.get(job)));
   }
 
   private agentJobs(agentId: string): ProcJobRecord[] {
@@ -660,6 +891,133 @@ export class ProcJobManager {
         agent_count: new Set(recorded.filter((job) => job.adopted && job.state === "running").map((job) => job.agentId)).size,
       });
     }
+      // Failed job scopes nothing reset (the lead exited before its scope
+    // settled, a daemon that died first): dropped once per daemon start,
+    // after the exits found above are classified. A running scope is never
+    // failed, so none is touched.
+    if (this.userSystemdEnabled()) {
+      const ops = this.scopeUnitOps();
+      // The classifications started above, not this sweep itself.
+      const sweep = Promise.all([...this.pending]).then(() => ops.resetFailed(PROC_FAILED_SCOPES_PATTERN)).catch(() => {});
+      this.pending.add(sweep);
+      void sweep.finally(() => this.pending.delete(sweep));
+    }
+  }
+
+  private scopeUnitOps(): ProcScopeUnitOps {
+    return this.options.scopeUnits ?? systemctlScopeUnitOps((this.options.userSystemd || undefined)?.pathEnv ?? process.env.PATH ?? "");
+  }
+
+  /**
+   * Whether the job runs in its scope's cgroup and that cgroup's `memory.max`
+   * is the cap. `systemd-run --scope` moves itself into the scope before it
+   * execs the job, so the cgroup is looked for a little while.
+   */
+  private async scopeCarriesCap(pid: number, unit: string, memoryMaxBytes: number): Promise<boolean> {
+    const cgroup = this.options.cgroup ?? defaultCgroup;
+    for (let waited = 0; waited <= SCOPE_CAP_CONFIRM_MS; waited += 50) {
+      let cgroupPath: string | null = null;
+      try {
+        cgroupPath = cgroupV2Path(cgroup.read(`/proc/${pid}/cgroup`));
+      } catch {
+        return false;
+      }
+      if (cgroupPath?.endsWith(`/${unit}.scope`)) {
+        try {
+          return cgroup.read(path.join(cgroup.root, cgroupPath, "memory.max")).trim() === String(memoryMaxBytes);
+        } catch {
+          return false;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return false;
+  }
+
+  /** Settles once every exit classification started so far has. */
+  async settled(): Promise<void> {
+    while (this.pending.size > 0) await Promise.all([...this.pending]);
+  }
+
+  /**
+   * A capped job's own scope ended: whether the kernel's OOM kill ended it
+   * (its unit kept as failed, `Result=oom-kill`), then the failed unit is
+   * dropped so the name can be used again.
+   */
+  private classifyScopeExit(job: ProcJobRecord): void {
+    if (job.scope !== "created" || !job.memoryMaxBytes || job.exitReason) return;
+    const unit = job.scopeUnit;
+    if (!unit) return;
+    const ops = this.scopeUnitOps();
+    const run = (async () => {
+      const result = await ops.result(unit).catch(() => null);
+      if (result === "oom-kill") this.recordMemoryLimit(job, "kernel");
+      await ops.resetFailed(unit).catch(() => {});
+    })().finally(() => this.pending.delete(run));
+    this.pending.add(run);
+  }
+
+  private recordMemoryLimit(job: ProcJobRecord, enforcedBy: "kernel" | "sampler", usedBytes?: number): void {
+    if (job.exitReason === "memory_limit") return;
+    job.exitReason = "memory_limit";
+    if (this.jobs.get(key(job.agentId, job.name)) === job) this.persist();
+    this.trace("daemon.proc.memory_limit", {
+      agentId: job.agentId,
+      enforced_by: enforcedBy,
+      cap_mb: Math.round((job.memoryMaxBytes ?? 0) / (1024 * 1024)),
+      ...(usedBytes !== undefined ? { used_mb: Math.round(usedBytes / (1024 * 1024)) } : {}),
+      run_ms: Math.max(0, (job.exitedAtMs ?? this.now()) - job.startedAtMs),
+    });
+    try {
+      this.options.onMemoryLimit?.(job);
+    } catch {
+      // A notice never breaks the record.
+    }
+  }
+
+  /**
+   * Stop a sampled job (not in a capped scope of its own) whose process group
+   * was over its cap in `PROC_MEMORY_OVER_CAP_SAMPLES` samples in a row:
+   * SIGKILL at once, as `--force`. Called on the sweep timer; one run at a
+   * time.
+   */
+  async sampleMemory(): Promise<void> {
+    if (this.sampling || this.closed) return;
+    this.sampling = true;
+    try {
+      await this.ready;
+      const watched = [...this.jobs.values()].filter((job) => job.state === "running"
+        && job.memoryMaxBytes
+        && job.memoryEnforcedBy === "sampler"
+        && job.startIdentity !== null);
+      if (watched.length === 0) return;
+      let usage: Map<number, number>;
+      try {
+        usage = await (this.options.memoryUsage ?? readGroupMemoryBytes)(watched.map((job) => job.pgid));
+      } catch (err) {
+        // Nothing measured, nothing stopped; said once per failing sample.
+        this.trace("daemon.proc.memory_sample_failed", { job_count: watched.length, code: (err as NodeJS.ErrnoException).code ?? "unknown" }, "error");
+        return;
+      }
+      for (const job of watched) {
+        const used = usage.get(job.pgid);
+        if (used !== undefined) this.lastRss.set(job, used);
+        if (job.state !== "running" || used === undefined || used <= job.memoryMaxBytes!) {
+          this.overCap.delete(job);
+          continue;
+        }
+        const count = (this.overCap.get(job) ?? 0) + 1;
+        if (count < PROC_MEMORY_OVER_CAP_SAMPLES) {
+          this.overCap.set(job, count);
+          continue;
+        }
+        this.overCap.delete(job);
+        const result = await this.stop(job.agentId, job.name, { force: true, reason: "memory_limit" });
+        if (result.ok && result.outcome !== "already_exited") this.recordMemoryLimit(job, "sampler", used);
+      }
+    } finally {
+      this.sampling = false;
+    }
   }
 
   private identityDeps(): ProcessIdentityDeps {
@@ -671,6 +1029,7 @@ export class ProcJobManager {
     job.exitCode = code;
     job.exitSignal = signal;
     job.exitedAtMs ??= this.now();
+    this.classifyScopeExit(job);
     if (this.exitTraced.has(job)) return;
     this.exitTraced.add(job);
     this.trace("daemon.proc.exited", {
@@ -781,6 +1140,7 @@ export class ProcJobManager {
     }
     // No scope of the agent's: a user scope of the job's own, where user systemd answers.
     const systemdRun = scope.kind === "none" ? await this.detectUserSystemdOnce() : null;
+    const oomPolicy = systemdRun ? await (this.scopeOomPolicy ??= scopesTakeOomPolicy(systemdRun).catch(() => false)) : false;
     // Make sure adopted jobs that ended no longer count.
     await Promise.all(this.agentJobs(agentId).map((job) => this.refresh(job)));
 
@@ -796,7 +1156,10 @@ export class ProcJobManager {
     const autoNamed = input.name === undefined;
     const name = input.name ?? automaticName(input.argv[0], (candidate) => mine.some((job) => job.name === candidate));
     const jobEnv = procJobEnvironment(input.env, input.stableEntryDir, this.platform);
+    const memoryMaxBytes = this.memoryCap();
+    const startedAtMs = this.now();
     let argv = input.argv;
+    let scopeUnit: string | null = null;
     if (systemdRun) {
       const unit = procScopeUnitName(agentId, name);
       if (!unit) {
@@ -818,7 +1181,10 @@ export class ProcJobManager {
       for (const variable of ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] as const) {
         if (jobEnv[variable] === undefined && process.env[variable]) jobEnv[variable] = process.env[variable]!;
       }
-      argv = procScopeArgv(systemdRun, unit, input.argv);
+      // A capped scope is kept when it fails (to read why): its own name, so
+      // a failed one left behind never blocks this name's next start.
+      scopeUnit = memoryMaxBytes ? `${unit}-${startedAtMs.toString(36)}` : unit;
+      argv = procScopeArgv(systemdRun, scopeUnit, input.argv, memoryMaxBytes, { oomPolicy });
     }
     const jobScope: ProcScope = systemdRun ? "created" : scope.kind;
     const logPath = procJobLogPath(this.options.machineDir, agentId, name);
@@ -866,7 +1232,7 @@ export class ProcJobManager {
       pgid: pid,
       startIdentity: null,
       command: path.basename(input.argv[0]),
-      startedAtMs: this.now(),
+      startedAtMs,
       logPath,
       scope: jobScope,
       state: "running",
@@ -874,6 +1240,11 @@ export class ProcJobManager {
       exitSignal: null,
       exitedAtMs: null,
       adopted: false,
+      memoryMaxBytes,
+      exitReason: null,
+      // Until the scope is seen to carry the cap, it is sampled.
+      memoryEnforcedBy: memoryMaxBytes ? "sampler" : null,
+      ...(scopeUnit && memoryMaxBytes ? { scopeUnit } : {}),
     };
     this.jobs.set(key(agentId, name), job);
     child.once("exit", (code, signal) => {
@@ -889,6 +1260,9 @@ export class ProcJobManager {
       job.startIdentity = identity.startIdentity;
       job.pgid = identity.pgid;
     }
+    if (oomPolicy && job.scopeUnit && job.memoryMaxBytes && await this.scopeCarriesCap(pid, job.scopeUnit, job.memoryMaxBytes)) {
+      job.memoryEnforcedBy = "kernel";
+    }
     this.persist();
     this.trace("daemon.proc.started", {
       agentId,
@@ -896,6 +1270,8 @@ export class ProcJobManager {
       auto_named: autoNamed,
       running_count: running.length + 1,
       identity_read: job.startIdentity !== null,
+      cap_mb: memoryMaxBytes === null ? 0 : Math.round(memoryMaxBytes / (1024 * 1024)),
+      memory_enforced_by: job.memoryEnforcedBy ?? "none",
     });
     // Linux, in the service's cgroup: a restart of the Computer service ends it.
     const stopsWithService = this.userSystemdEnabled() && jobScope === "none";
@@ -933,7 +1309,7 @@ export class ProcJobManager {
       confirmMs: this.confirmMs,
       ...(this.options.identity ? { identity: this.options.identity } : {}),
     });
-    const reason: ProcStopReason = options.force ? "force" : options.reason ?? "agent";
+    const reason: ProcStopReason = options.reason ?? (options.force ? "force" : "agent");
     if (result.stillAlive.length > 0) {
       this.trace("daemon.proc.stopped", { agentId, reason, outcome: "unconfirmed", grace_ms: graceMs }, "error");
       return failure(500, "proc_stop_unconfirmed", `${name} (pid ${job.pid}) was sent SIGKILL but was not seen to exit`);
@@ -952,6 +1328,31 @@ export class ProcJobManager {
     this.persist();
     this.trace("daemon.proc.stopped", { agentId, reason, outcome, grace_ms: graceMs, adopted: job.adopted });
     return { ok: true, job, outcome, graceMs };
+  }
+
+  /**
+   * A person's Stop from the Computer page (`machine:proc_job:stop`): the job
+   * named by its agent and name in this manager's own records (no pid crosses
+   * the wire), stopped as the agent's own stop is (SIGTERM, the grace, then
+   * SIGKILL), its exit recorded as `owner_stop` by `stoppedBy` (a handle the
+   * server filled in; anything else is not kept).
+   */
+  async stopByOwner(agentId: string, name: string, stoppedBy: string | null): Promise<ProcJobStopOutcome> {
+    if (!isValidProcName(name)) return "not_found";
+    const result = await this.stop(agentId, name, { reason: "owner_stop" });
+    if (!result.ok) return result.code === "proc_not_found" ? "not_found" : "failed";
+    if (result.outcome === "already_exited") return "already_exited";
+    const job = result.job;
+    job.exitReason = "owner_stop";
+    if (isValidProcStoppedBy(stoppedBy)) job.stoppedBy = stoppedBy;
+    else delete job.stoppedBy;
+    if (this.jobs.get(key(agentId, name)) === job) this.persist();
+    try {
+      this.options.onOwnerStop?.(job);
+    } catch {
+      // A notice never breaks the record.
+    }
+    return "stopped";
   }
 
   /**

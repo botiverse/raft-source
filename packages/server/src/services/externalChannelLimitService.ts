@@ -59,7 +59,9 @@ type ExternalInviteStatus = typeof channelExternalInvites.$inferSelect.status;
  * self_connecting (a self_connect operation's reservation) is open like
  * connecting. Counting (countOpenInvites, hasOtherInvitedChannel) takes
  * every row in them whatever its origin: an unknown origin's row still holds
- * its slot, so it only ever refuses more.
+ * its slot, so it only ever refuses more. The one exception is an invite sent
+ * to a member of the host (sent_to_host_member), which holds no slot and no
+ * Free allowance while open.
  */
 export const OPEN_EXTERNAL_INVITE_STATUSES: readonly ExternalInviteStatus[] = ["pending", "awaiting_approval", "connecting", "self_connecting"];
 
@@ -314,7 +316,10 @@ async function activeServerIds(executor: DatabaseExecutor, serverIds: readonly s
 
 // ── At send time (plan §5: "pending invites count at send time, final check at accept") ──
 // Sending an external invite is checked against the same two limits, with the
-// channel's open invites counted as if accepted. These are early answers for
+// channel's open invites counted as if accepted. An invite sent to a member of
+// the host (sent_to_host_member) is neither counted nor checked at send time:
+// the member is in the channel already, and connecting a server with it is
+// checked as any connection is. These are early answers for
 // the host's owner/admin; accepting (assertCanAdmitExternalGuest,
 // assertCanConnectExternalServer) stays the authoritative check.
 
@@ -341,7 +346,13 @@ export async function countChannelParties(
   return guests + Math.max(1, row?.n ?? 0);
 }
 
-/** The channel's open, unexpired external invites. */
+/**
+ * The channel's open, unexpired external invites that hold a slot: every one
+ * but an invite sent to a member of the host (sent_to_host_member, the
+ * review's "Invite to connect"), which takes none at send time; its
+ * connection is checked like any other (assertCanConnectExternalServer,
+ * checkJointAdmission).
+ */
 async function countOpenInvites(executor: DatabaseExecutor, channelId: string, now: Date): Promise<number> {
   const [row] = await executor
     .select({ n: count() })
@@ -350,11 +361,17 @@ async function countOpenInvites(executor: DatabaseExecutor, channelId: string, n
       eq(channelExternalInvites.channelId, channelId),
       inArray(channelExternalInvites.status, OPEN_EXTERNAL_INVITE_STATUSES),
       gt(channelExternalInvites.expiresAt, now),
+      eq(channelExternalInvites.sentToHostMember, false),
     ));
   return row?.n ?? 0;
 }
 
-/** Whether a live channel of the server other than `exceptChannelId` holds an open, unexpired external invite. */
+/**
+ * Whether a live channel of the server other than `exceptChannelId` holds an
+ * open, unexpired external invite that counts as the channel it would make
+ * external: not one sent to a member of the host (sent_to_host_member, as
+ * countOpenInvites).
+ */
 async function hasOtherInvitedChannel(executor: DatabaseExecutor, serverId: string, exceptChannelId: string, now: Date): Promise<boolean> {
   const [row] = await executor
     .select({ id: channelExternalInvites.id })
@@ -366,6 +383,7 @@ async function hasOtherInvitedChannel(executor: DatabaseExecutor, serverId: stri
       ne(channelExternalInvites.channelId, exceptChannelId),
       inArray(channelExternalInvites.status, OPEN_EXTERNAL_INVITE_STATUSES),
       gt(channelExternalInvites.expiresAt, now),
+      eq(channelExternalInvites.sentToHostMember, false),
       isNull(channels.deletedAt),
       isNull(channels.archivedAt),
     ))

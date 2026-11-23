@@ -81,6 +81,8 @@ export interface PersistedAgentActivity {
   detailKind: AgentActivityDetailKind;
   observedAtMs?: number;
   updatedAt: number;
+  /** #oar-raft:#22: server receive time of the latest same-content heartbeat (ages only). */
+  livenessAtMs?: number;
   carriers?: PersistedActivityTypedCarriers;
 }
 import type { AgentContextViewRequestId, AgentRuntimeErrorState, MachineId } from "@botiverse/raft-shared";
@@ -125,6 +127,7 @@ export interface ReplicaStateStore {
     detailKind: AgentActivityDetailKind,
     observedAtMs?: number,
     carriers?: PersistedActivityTypedCarriers,
+    livenessAtMs?: number,
   ): Promise<void>;
   getAgentActivity(agentId: string): Promise<PersistedAgentActivity | null>;
   setAgentRuntimeError(agentId: string, error: AgentRuntimeErrorState | null): Promise<void>;

@@ -166,6 +166,7 @@ export function RuntimeSignInDialog({
   runtime,
   client,
   onClose,
+  onSignedIn,
   provider,
 }: {
   serverId: string;
@@ -176,6 +177,8 @@ export function RuntimeSignInDialog({
   runtime: RuntimeAuthRuntime;
   client: RuntimeAuthClient;
   onClose: () => void;
+  /** The sign-in ended signed in (its result arrived). */
+  onSignedIn?: () => void;
   /**
    * The provider to sign in, for a runtime that signs in per provider (Pi,
    * OpenCode): the dialog is named after it, and `paste` says what its paste
@@ -234,7 +237,8 @@ export function RuntimeSignInDialog({
     }
     dispatch({ type: "result", result });
     client.invalidate(serverId, machineId);
-  }, [client, machineId, oauthMethod, providerId, releaseLogin, runtime, serverId]);
+    if (result.kind === "logged_in") onSignedIn?.();
+  }, [client, machineId, oauthMethod, onSignedIn, providerId, releaseLogin, runtime, serverId]);
 
   // Started once on open and again from Retry, never by a re-run effect:
   // StrictMode's second effect pass would start a second login.

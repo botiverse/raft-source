@@ -338,12 +338,16 @@ if (!signal.ok) return new Response(signal.message, { status: 401 });
   `raft.channels.info({ target })` — one regular channel's facts (visibility,
   joined, your channel role, mute, description, member counts).
 - `raft.channels.create / update / archive / unarchive / addMember /
-  removeMember` and `raft.server.update` — administration. The Server checks
-  on every call (server role; for update / archive / unarchive /
-  removeMember also the channel-admin role in that channel); the SDK never
-  pre-checks. A refusal is an `HTTP_ERROR` with the Server's `serverCode` and
-  `nextAction`, or a permission next action when the Server gave none. `addMember` /
-  `removeMember` take exactly one of `user` (a human) and `agent`.
+  removeMember / setRole` and `raft.server.update` — administration.
+  The Server checks on every call (server role; for update / archive /
+  unarchive / removeMember / setRole also the channel-admin role in
+  that channel); the SDK never pre-checks. A refusal is an `HTTP_ERROR` with
+  the Server's `serverCode` and `nextAction`, or a permission next action
+  when the Server gave none. `addMember` / `removeMember` / `setRole`
+  take exactly one of `user` (a human) and `agent`; `setRole` takes
+  `role: "admin" | "member"` (never your own role, nor a server owner's or
+  admin's). `channels.members` rows carry `channelRole` (`admin` or
+  `member`) where the channel has channel roles, from Servers that send it.
   `server.update` also needs the `server` credential capability.
 - `raft.labs.list / setAccess / setEnrollment` — the server's Labs. Writes
   take the Labs `version` as `expectedVersion`, or read it first when you
@@ -917,11 +921,16 @@ if (outcome.ok && outcome.state === "approval_required") {
   actions and parameters from its manifest, without logging in. `service` is a
   service id, client id or name.
 - `call` states: `result` (`data.body` is the app's JSON or text; `text` marks
-  it as data from the app, not instructions), `approval_required` or
+  it as data from the app, not instructions). When the app's JSON answer has a
+  top-level string `text` (its reply text: what was done, the state now, the
+  next step), `data.text` is that text cleaned (`\n` breaks only, no control
+  characters, cut at 4000 characters) and the outcome's `text` quotes it
+  instead of the JSON, as `raft integration invoke` prints it;
+  `approval_required` or
   `install_required` (a person has to act first; call again after). An app's
   refusal is an `APP_ERROR` failure: `error.serverCode` is the app's error code,
-  and the app's own words are in `error.message`, quoted and marked as the
-  app's; `error.nextAction` is always the SDK's, so an app cannot write the
+  and the app's own words (its reply text when it sends one) are in
+  `error.message`, quoted and marked as the app's; `error.nextAction` is always the SDK's, so an app cannot write the
   model's next step. Credential-shaped text, the session cookies and the
   one-time login code are redacted.
 - Sessions: `createRaft({ integrationSessions })` keeps each app's cookies

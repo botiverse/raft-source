@@ -19,6 +19,7 @@ import {
   reduceRuntimeErrorActivityAction,
   runtimeErrorClearsOnlyOnModelOutput,
   isModelOutputRecoveryFrame,
+  planActivityLivenessRefresh,
   reduceStartLifecycle,
   reduceStopLifecycle,
   shouldEmitLiveActivity,
@@ -934,4 +935,44 @@ test("claude_root_privileges establishes durable authority only with a valid typ
     currentErrorPresent: true,
     isHeartbeat: false,
   }), "preserve");
+});
+
+// #oar-raft:#22: the one write a replayed heartbeat may make is a time-only
+// liveness refresh, and only for a declared heartbeat of the current launch
+// that repeats exactly the stored activity.
+const livenessWorking = { activity: "working", detail: "Running tests", detailKind: "running_command" } as const;
+const livenessBase = {
+  declaredHeartbeat: true,
+  observationClass: "replayed",
+  staleLaunch: false,
+  incoming: livenessWorking,
+  current: livenessWorking,
+} as const;
+
+test("planActivityLivenessRefresh: a declared same-content heartbeat refreshes liveness", () => {
+  assert.deepEqual(planActivityLivenessRefresh(livenessBase), { action: "liveness_refresh", reason: "replayed_heartbeat_same_content" });
+});
+
+test("planActivityLivenessRefresh: a heartbeat with changed activity, detail or detail kind keeps the ordinary path", () => {
+  for (const incoming of [
+    { ...livenessWorking, activity: "thinking" },
+    { ...livenessWorking, detail: "Running lint" },
+    { ...livenessWorking, detailKind: "other" },
+  ] as const) {
+    assert.deepEqual(planActivityLivenessRefresh({ ...livenessBase, incoming }), { action: "none", reason: "content_changed" });
+  }
+});
+
+test("planActivityLivenessRefresh: a stale launch's heartbeat does not refresh", () => {
+  assert.deepEqual(planActivityLivenessRefresh({ ...livenessBase, staleLaunch: true }), { action: "none", reason: "stale_launch" });
+});
+
+test("planActivityLivenessRefresh: only the declared bit qualifies: a markerless or observed repeat, or a probe answer, is not a liveness refresh", () => {
+  assert.deepEqual(planActivityLivenessRefresh({ ...livenessBase, declaredHeartbeat: false }), { action: "none", reason: "not_declared_heartbeat" });
+  assert.deepEqual(planActivityLivenessRefresh({ ...livenessBase, observationClass: "observed" }), { action: "none", reason: "not_replayed" });
+});
+
+test("planActivityLivenessRefresh: nothing to refresh without a stored snapshot", () => {
+  const { current: _current, ...withoutCurrent } = livenessBase;
+  assert.deepEqual(planActivityLivenessRefresh(withoutCurrent), { action: "none", reason: "no_current_snapshot" });
 });

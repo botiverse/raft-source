@@ -47,26 +47,47 @@ export function selectionToMarkdown(
     .join("\n\n");
 }
 
+/**
+ * Where a copy is made: the window the person pressed Copy in (an object
+ * window's, features/objectWindows: a browser lets only the focused
+ * document write the clipboard). Default: the main window.
+ */
+export interface ClipboardTarget {
+  view?: Window | null;
+}
+
+function clipboardViewOf(target: ClipboardTarget | undefined): Window {
+  return target?.view ?? globalThis.window;
+}
+
 export async function copyTextToClipboard(
   text: string,
   formatMessage?: FormatMessage,
+  target?: ClipboardTarget,
 ): Promise<void> {
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text);
-    return;
+  const view = clipboardViewOf(target);
+  const clipboard = view === globalThis.window ? navigator.clipboard : view.navigator?.clipboard;
+  if (clipboard?.writeText) {
+    try {
+      await clipboard.writeText(text);
+      return;
+    } catch {
+      // Refused (some Android WebViews do): the fallback below.
+    }
   }
-  // Fallback for older WebKit / non-secure contexts. Insert a hidden
-  // textarea, select its contents, run document.execCommand("copy"). This
-  // is intentionally minimal — Slock targets modern browsers.
-  const ta = document.createElement("textarea");
+  // Fallback for older WebKit / non-secure contexts, and where writeText was
+  // refused. Insert a hidden textarea, select its contents, run
+  // document.execCommand("copy"). This is intentionally minimal.
+  const doc = view === globalThis.window ? document : view.document;
+  const ta = doc.createElement("textarea");
   ta.value = text;
   ta.style.position = "fixed";
   ta.style.left = "-9999px";
-  document.body.appendChild(ta);
+  doc.body.appendChild(ta);
   ta.focus();
   ta.select();
   try {
-    if (!document.execCommand("copy")) {
+    if (!doc.execCommand("copy")) {
       throw new Error(
         formatMessage
           ? formatMessage({ id: "message.share.clipboardRejected" })
@@ -86,11 +107,22 @@ export async function copyTextToClipboard(
  * matters in WebKit, which can reject an image copy if we await `fetch()`
  * before invoking the clipboard API.
  */
-export function isPngClipboardSupported(): boolean {
-  if (typeof ClipboardItem === "undefined" || typeof navigator.clipboard?.write !== "function") {
+/** The window's ClipboardItem and clipboard (the main window's: the globals, as a test stubs them). */
+function pngClipboardOf(target: ClipboardTarget | undefined): { Item: typeof ClipboardItem | undefined; clipboard: Clipboard | undefined } {
+  const view = clipboardViewOf(target);
+  if (view === globalThis.window) {
+    return { Item: typeof ClipboardItem === "undefined" ? undefined : ClipboardItem, clipboard: navigator.clipboard };
+  }
+  const own = view as Window & { ClipboardItem?: typeof ClipboardItem };
+  return { Item: own.ClipboardItem, clipboard: own.navigator?.clipboard };
+}
+
+export function isPngClipboardSupported(target?: ClipboardTarget): boolean {
+  const { Item, clipboard } = pngClipboardOf(target);
+  if (Item === undefined || typeof clipboard?.write !== "function") {
     return false;
   }
-  return typeof ClipboardItem.supports !== "function" || ClipboardItem.supports("image/png");
+  return typeof Item.supports !== "function" || Item.supports("image/png");
 }
 
 export interface PngClipboardCapability {
@@ -99,13 +131,15 @@ export interface PngClipboardCapability {
 }
 
 /** Resolve support + the browser's current clipboard-write permission. */
-export async function resolvePngClipboardCapability(): Promise<PngClipboardCapability> {
-  if (!isPngClipboardSupported()) return { available: false, permissionStatus: null };
-  if (typeof navigator.permissions?.query !== "function") {
+export async function resolvePngClipboardCapability(target?: ClipboardTarget): Promise<PngClipboardCapability> {
+  if (!isPngClipboardSupported(target)) return { available: false, permissionStatus: null };
+  const view = clipboardViewOf(target);
+  const permissions = view === globalThis.window ? navigator.permissions : view.navigator?.permissions;
+  if (typeof permissions?.query !== "function") {
     return { available: true, permissionStatus: null };
   }
   try {
-    const permissionStatus = await navigator.permissions.query({
+    const permissionStatus = await permissions.query({
       name: "clipboard-write" as PermissionName,
     });
     return { available: permissionStatus.state !== "denied", permissionStatus };
@@ -117,10 +151,12 @@ export async function resolvePngClipboardCapability(): Promise<PngClipboardCapab
   }
 }
 
-export async function copyPngDataUrlToClipboard(dataUrl: string): Promise<void> {
-  if (!isPngClipboardSupported()) {
+export async function copyPngDataUrlToClipboard(dataUrl: string, target?: ClipboardTarget): Promise<void> {
+  if (!isPngClipboardSupported(target)) {
     throw new Error("Image clipboard is not supported in this browser");
   }
+  const { Item, clipboard } = pngClipboardOf(target);
+  if (!Item || !clipboard) throw new Error("Image clipboard is not supported in this browser");
 
   // Decoded in place, not fetched: Raft Desktop's page policy refuses `fetch` of a data URL (#triage:#352).
   const pngBlob = Promise.resolve().then(() => {
@@ -128,8 +164,8 @@ export async function copyPngDataUrlToClipboard(dataUrl: string): Promise<void> 
     return blob.type === "image/png" ? blob : new Blob([blob], { type: "image/png" });
   });
 
-  await navigator.clipboard.write([
-    new ClipboardItem({
+  await clipboard.write([
+    new Item({
       "image/png": pngBlob,
     }),
   ]);

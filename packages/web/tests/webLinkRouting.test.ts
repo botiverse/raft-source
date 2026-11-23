@@ -54,6 +54,48 @@ describe("routeShellLink", () => {
   });
 });
 
+describe("openUrl: the tab that shows the link (a shell that keeps no list)", () => {
+  const conversation = "c1";
+  const link = "https://example.com/a";
+  const store = () => useBrowserTabsStore.getState();
+  const labels = () => store().browsers[conversation]!.tabs.map((tab) => `${tab.id === store().browsers[conversation]!.activeId ? "*" : ""}${tab.url}`);
+  const report = (url: string, loading: boolean) => store().applyState(conversation, { tabId: store().browsers[conversation]!.tabs[0]!.id, url, title: "", canGoBack: false, canGoForward: false, loading });
+  beforeEach(() => {
+    useBrowserTabsStore.setState({ browsers: {} });
+    store().openUrl(conversation, link);
+    store().openUrl(conversation, "https://example.com/b");
+  });
+
+  // As a shell reports a tab: on did-start-loading (the address before, loading), each commit, and did-stop-loading.
+  it("comes to the front while it is on the link, or still on the load the link asked for (redirected by the server or a script)", () => {
+    store().openUrl(conversation, link);
+    expect(labels()).toEqual([`*${link}`, "https://example.com/b"]);
+    // A report of the page before the load started is not the load stopping.
+    report("about:blank", false);
+    report("about:blank", true);
+    report(link, true);
+    // The shortener's page sends it on by script before it stops: still the asked load.
+    report("https://sso.example/hop", true);
+    report("https://example.com/landed", true);
+    report("https://example.com/landed", false);
+    store().openUrl(conversation, "https://example.com/b");
+    store().openUrl(conversation, link);
+    expect(labels()).toEqual(["*https://example.com/landed", "https://example.com/b"]);
+  });
+
+  it("is a new tab once the page went on to another address after that load stopped", () => {
+    report("about:blank", true);
+    report("https://example.com/landed", true);
+    report("https://example.com/landed", false);
+    // A link in the page: did-start-loading still at the address before, then the new one, then the stop.
+    report("https://example.com/landed", true);
+    report("https://example.com/next", true);
+    report("https://example.com/next", false);
+    store().openUrl(conversation, link);
+    expect(labels()).toEqual(["https://example.com/next", "https://example.com/b", `*${link}`]);
+  });
+});
+
 describe("openUrlInTab: a tab a page or a new-tab click asked for", () => {
   const conversation = "c1";
   const store = () => useBrowserTabsStore.getState();

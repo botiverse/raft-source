@@ -2,8 +2,8 @@
   "formatVersion": 1,
   "id": "predicate_muted_channel_message",
   "rule": "predicate",
-  "title": "In a muted channel, a new message does not count",
-  "why": "A muted conversation counts only messages before the mute (rw_inbox_muted_prefix_v2: seq < mute_from_seq). Decided (Tenny, #14988 review): follow the server (RisingWave).",
+  "title": "In a muted channel, a new message does not count and does not move the row",
+  "why": "A muted conversation counts only messages before the mute (rw_inbox_muted_prefix_v2: seq < mute_from_seq). Decided (Tenny, #14988 review): follow the server (RisingWave). It does not move the row either: RisingWave keeps the row at its last message before the mute (rw_inbox_muted_prefix_v2's latest_seq, shown by rw_inbox_serving_v9), so the row keeps its position and preview (Tenny, #triage:#244, 2026-11-16; position case muted_message_leaves_row).",
   "status": "agreed",
   "sources": {
     "web": [
@@ -37,7 +37,8 @@
   "expect": {
     "verdict": {
       "counts": false,
-      "mention": false
+      "mention": false,
+      "moves": false
     }
   }
 }

@@ -289,3 +289,81 @@ test("without the dedicated attachment bucket the writer keeps legacy keys inste
     resetStorageForTests();
   }
 });
+
+test("an image's preview is written while its original is still uploading, not after it (#triage:#545)", async () => {
+  const input = await fixture();
+  const releaseOriginal = deferred();
+  const previewWritten = deferred();
+  const original: StorageBackend = {
+    put: async () => { await releaseOriginal.promise; },
+    get: async () => Readable.from([]),
+    delete: async () => undefined,
+  };
+  const cdnStorage: StorageBackend = {
+    put: async () => { previewWritten.resolve(); },
+    get: async () => Readable.from([]),
+    delete: async () => undefined,
+  };
+
+  const upload = uploadAttachmentBuffers({
+    serverId: input.server.id,
+    channelId: input.channel.id,
+    uploaderId: input.owner.id,
+    uploaderType: "user",
+    files: [{ buffer: Buffer.from("png"), filename: "shot.png", mimeType: "image/png" }],
+    storage: original,
+    cdnStorage,
+    preview: { ...svgPreviewWriter, isSvg: () => false },
+    now: new Date("2026-08-12T00:00:00.000Z"),
+  });
+
+  // Back to back, the preview would wait for this PUT and the test would hang.
+  await previewWritten.promise;
+  releaseOriginal.resolve();
+  const [row] = await upload;
+  assert.equal(typeof row.thumbnailKey, "string");
+});
+
+test("a failed original waits for its in-flight preview before the transfer is failed (no preview lands after cleanup)", async () => {
+  const input = await fixture();
+  const previewEntered = deferred();
+  const releasePreview = deferred();
+  const original: StorageBackend = {
+    put: async () => { throw new Error("injected original PUT failure"); },
+    get: async () => Readable.from([]),
+    delete: async () => undefined,
+  };
+  const cdnStorage: StorageBackend = {
+    put: async () => { previewEntered.resolve(); await releasePreview.promise; },
+    get: async () => Readable.from([]),
+    delete: async () => undefined,
+  };
+
+  const outcome = uploadAttachmentBuffers({
+    serverId: input.server.id,
+    channelId: input.channel.id,
+    uploaderId: input.owner.id,
+    uploaderType: "user",
+    files: [{ buffer: Buffer.from("png"), filename: "shot.png", mimeType: "image/png" }],
+    storage: original,
+    cdnStorage,
+    preview: { ...svgPreviewWriter, isSvg: () => false },
+    now: new Date("2026-08-12T00:00:00.000Z"),
+  }).then(() => ({ status: "fulfilled" as const }), (error: unknown) => ({ status: "rejected" as const, error }));
+
+  await previewEntered.promise;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(
+    (await getDb().select().from(attachmentTransferIntents)).every((intent) => intent.state !== "failed"),
+    true,
+    "the transfer must not be failed (and so sweepable) while the preview PUT is in flight",
+  );
+
+  releasePreview.resolve();
+  const completed = await outcome;
+  assert.equal(completed.status, "rejected");
+  assert.equal(
+    (await getDb().select().from(attachmentTransferIntents)).every((intent) => intent.state === "failed"),
+    true,
+  );
+});

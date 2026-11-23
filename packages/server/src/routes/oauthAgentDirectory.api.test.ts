@@ -24,7 +24,7 @@ async function setup() {
   const deleted = await createAgent(server.id, "DeletedAgent", { runtime: "external", model: "external" });
   await getDb().update(agents).set({ deletedAt: new Date() }).where(eq(agents.id, deleted.id));
   const { client, clientSecret } = await createOAuthClient({
-    serverId: server.id, createdByUserId: owner.id, clientId: `directory-${suffix.slice(0, 8)}`,
+    serverId: server.id, createdByUserId: owner.id, clientId: `directory-${suffix.slice(0, 8)}`, vouchAsCreator: true,
     name: "Directory only", returnUrl: "https://directory.example.test/callback",
     allowedScopes: ["openid", "profile", "agent:read"],
   });

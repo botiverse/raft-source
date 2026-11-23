@@ -2,6 +2,7 @@ import type { Dispatch, SetStateAction } from "react";
 import { compareMessagesForDisplay, isMatchingOptimisticMessage, mergeIncomingMessage } from "../../store/messageStore";
 import type { Message } from "../../store/messageStore";
 import { isCanonicalMessageReaction } from "../../store/normalizedMessageReactions";
+import { coerceWireMessageSeq } from "../../store/wireMessageSeq";
 
 export const EMPTY_MESSAGES: Message[] = [];
 export const THREAD_LATEST_WINDOW_LIMIT = 50;
@@ -53,7 +54,11 @@ export function sameMessageList(a: Message[], b: Message[]): boolean {
       left.id !== right.id ||
       left.seq !== right.seq ||
       left.content !== right.content ||
-      left.createdAt !== right.createdAt
+      left.createdAt !== right.createdAt ||
+      left.deletedAt !== right.deletedAt ||
+      left.actionMetadata !== right.actionMetadata ||
+      left.commentRef !== right.commentRef ||
+      left.taskCurrentProjection !== right.taskCurrentProjection
     ) {
       return false;
     }
@@ -230,4 +235,14 @@ export function syncThreadParentMessageFromStore(
   setParentMessage: Dispatch<SetStateAction<Message | null>>,
 ): void {
   if (storeParentMessage) setParentMessage(storeParentMessage);
+}
+
+export function applyThreadParentMessagePatch(
+  parentMessageId: string | null,
+  update: Pick<Message, "id" | "channelId"> & Partial<Message>,
+  setParentMessage: Dispatch<SetStateAction<Message | null>>,
+): void {
+  if (!parentMessageId || update.id !== parentMessageId) return;
+  const coerced = coerceWireMessageSeq(update);
+  setParentMessage((current) => (current ? mergeIncomingMessage(current, coerced) : current));
 }

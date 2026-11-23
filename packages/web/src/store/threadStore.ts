@@ -33,8 +33,9 @@ import type {
 } from "../utils/taskMetadata";
 import { isTaskConversationRow, normalizeTaskConversationRow } from "../utils/taskConversation";
 import type { SubConversationKind } from "../utils/taskConversation";
-import { beginViewSwitch, threadView } from "../observability/viewSwitchSpan";
+import { beginViewSwitch, taskView, threadView } from "../observability/viewSwitchSpan";
 import { prefetchResolvedThreadReplies, prefetchThreadReplies } from "./threadRepliesPrefetch";
+import { withCanonicalThreadIds } from "./threadLinkIds";
 
 // The reply-preview type is owned by the read model (the SDK contract surface),
 // NOT redefined here. One definition, one place — two copies of a contract type
@@ -190,17 +191,15 @@ export function isThreadAbsentLookupError(err: unknown): boolean {
 }
 
 /**
- * The lookup's answer that this server can't show the thread to this reader
- * (403, or a 404 that isn't "no thread yet"): the channel isn't visible from
- * the current server. A joint channel the reader takes part in only through
- * another server answers this way. Retry can still help right after a
- * private→public conversion (#417), so the panel keeps it; only the copy
- * changes.
+ * The lookup's answer that this server can't show the thread to this reader:
+ * a 403, which the server sends only to a reader who had access (a joint
+ * channel they take part in only through another server). A 404 is the same
+ * bytes for missing, other-server and stranger (server channelAccessDenial.ts)
+ * and for a malformed id (#503), so it is the generic failure. Retry can still
+ * help right after a private→public conversion (#417); only the copy changes.
  */
 export function isThreadUnavailableLookupError(err: unknown): boolean {
-  if (isThreadAbsentLookupError(err)) return false;
-  const status = (err as { response?: { status?: unknown } } | null)?.response?.status;
-  return status === 403 || status === 404;
+  return (err as { response?: { status?: unknown } } | null)?.response?.status === 403;
 }
 
 export interface OpenThreadRequest {
@@ -244,7 +243,7 @@ interface TaskModalAnchor {
    *  a second jump to the same reply restarts its located highlight. */
   focusNonce: number;
   loading: boolean;
-  error: { parentChannelId: string | null; parentMessageId: string | null; unavailable?: boolean } | null;
+  error: { parentChannelId: string | null; parentMessageId: string | null; unavailable?: boolean; unresolved?: boolean } | null;
 }
 
 /** Task v2: open the task dialog for a task's own conversation. */
@@ -260,7 +259,7 @@ export interface OpenTaskConversationRequest {
   focusedMessageId?: string | null;
 }
 
-interface ThreadState {
+export interface ThreadState {
   /** Parent message ID of the currently open thread */
   openParentMessageId: string | null;
   /** Thread channel ID of the currently open thread */
@@ -316,7 +315,7 @@ interface ThreadState {
    * OR an actionable error — never an unbounded spinner. Originating bug:
    * #engineering task #417 (private→public channel thread permalink hang).
    */
-  openThreadError: { parentChannelId: string; parentMessageId: string; unavailable?: boolean } | null;
+  openThreadError: { parentChannelId: string; parentMessageId: string; unavailable?: boolean; unresolved?: boolean } | null;
   /** True only while the read-only existing-thread lookup is in flight. */
   openThreadLoading: boolean;
   /** Open a thread panel for a message */
@@ -572,7 +571,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
   taskUpdatesByMessageId: {},
 
 
-  openThread: async ({
+  openThread: withCanonicalThreadIds("thread", get, set, async ({
     serverSlug,
     parentChannelId,
     parentMessageId,
@@ -702,7 +701,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
           : {},
       );
     }
-  },
+  }),
 
   ensureOpenThreadChannel: async () => {
     const {
@@ -832,7 +831,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
     });
   },
 
-  openTaskModal: async ({
+  openTaskModal: withCanonicalThreadIds("task", get, set, async ({
     serverSlug,
     parentChannelId,
     parentMessageId,
@@ -856,6 +855,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       null;
     // The task already up picked again: its open read won't re-run (as openThread).
     const reopenedUnread = isReopenedTaskUnread(state, knownThreadChannelId);
+    beginViewSwitch({ target: focusedMessageId ? "message_jump" : "task", view: taskView(parentMessageId), matches: [parentMessageId, knownThreadChannelId, focusedMessageId], requireInput: true });
 
     set({
       taskModal: {
@@ -939,7 +939,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
           : {},
       );
     }
-  },
+  }),
 
   openTaskConversation: ({ serverSlug, taskId, parentChannelId, conversationChannelId = null, focusedMessageId = null }) => {
     const currentServer = useServerStore.getState().current;
@@ -955,6 +955,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       : null;
     const threadChannelId = conversationChannelId ?? keptChannelId;
     const reopenedUnread = isReopenedTaskUnread(get(), threadChannelId);
+    beginViewSwitch({ target: focusedMessageId ? "message_jump" : "task", view: taskView(taskId), matches: [taskId, threadChannelId, focusedMessageId], requireInput: true });
     set({
       taskModal: {
         parentMessageId: null,

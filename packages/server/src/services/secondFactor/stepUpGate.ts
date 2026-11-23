@@ -46,6 +46,10 @@
  * (approverSecondFactorCheck), Login with Raft consent and approving an
  * app's agent access request, installing an app and approving an installed
  * app's new permissions (approverSecondFactorCheck), account deletion (routes/accountDeletion.ts).
+ *
+ * Starting a data export (routes/dataExports.ts) is step-up here for a person
+ * with two-step verification (`data_export`); the others re-authenticate by
+ * password or an emailed code (services/sensitiveReauth.ts).
  */
 import { currentDate } from "@botiverse/raft-shared";
 
@@ -75,6 +79,8 @@ export const STEP_UP_ACTIONS = {
   integration_app_register: "Confirm it's you with your second step before registering an app.",
   // DELETE /api/me/sessions/:familyId and POST /api/me/sessions/revoke-others with `reason: "lost_device"` (routes/mySessions.ts).
   session_revoke: "Confirm it's you with your second step before disconnecting a lost device.",
+  // POST /api/me/data-exports and POST /api/servers/:id/data-exports (routes/dataExports.ts): copies data out of Raft.
+  data_export: "Confirm it's you with your second step before exporting data.",
 } as const;
 
 export type StepUpAction = keyof typeof STEP_UP_ACTIONS;

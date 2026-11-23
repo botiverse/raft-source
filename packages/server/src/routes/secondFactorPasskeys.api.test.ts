@@ -20,6 +20,7 @@ import { createSession } from "../services/sessionService";
 import { signInForTest } from "../test/integration/credentials";
 import { enrollSecondFactor, leaveRetiredSecondFactorFlagRowOff, totpCode, useTotpSecretKey } from "../test/integration/secondFactor";
 import { SoftwareAuthenticator } from "../test/integration/softwareAuthenticator";
+import { androidApkKeyHashOrigin } from "../services/secondFactor/webauthn";
 import { legacyWebauthnUserHandle } from "../services/secondFactor/webauthn";
 
 const test = createApiTest();
@@ -27,10 +28,14 @@ useTotpSecretKey();
 
 const RP_ID = "raft.test";
 const ORIGIN = "https://app.raft.test";
+// The Android app's signing certificate (a made-up one) and the native origin it gives.
+const ANDROID_CERT_SHA256 = Array.from({ length: 32 }, (_, i) => (i * 7 + 3).toString(16).padStart(2, "0").toUpperCase()).join(":");
+const ANDROID_ORIGIN = androidApkKeyHashOrigin(ANDROID_CERT_SHA256);
 const ENV = {
   APP_URL: ORIGIN,
   WEBAUTHN_RP_ID: RP_ID,
   WEBAUTHN_ORIGINS: ORIGIN,
+  WEBAUTHN_ANDROID_APK_KEY_HASHES: ANDROID_CERT_SHA256,
   AGENT_BOOTSTRAP_TOKEN_PEPPER: "second-factor-passkeys-test-pepper-0123456789",
 } as const;
 const previousEnv = Object.fromEntries(Object.keys(ENV).map((key) => [key, process.env[key]]));
@@ -409,6 +414,23 @@ test("step-up and turning it off with a passkey; options are bound to the signed
   assert.equal((await auditsOf(human.id, "account.second_factor_backup_code_used")).length, 0, "no backup code was used");
 });
 
+test("native Android: an allow-listed apk-key-hash origin answers the step-up; any other apk-key-hash, or registering from it, is refused", async ({ app, seed }) => {
+  const { session, device } = await enforcedWithPasskey(app.baseUrl, seed);
+  const otherApp = androidApkKeyHashOrigin(ANDROID_CERT_SHA256.replace(/^..:/, "00:"));
+  for (const origin of [otherApp, "android:apk-key-hash:", "android:apk-key-hash:*", `${ANDROID_ORIGIN}=`, "ios:bundle-id:build.raft.app"]) {
+    const refused = await post(app.baseUrl, `${BASE}/step-up`, { webauthn: device.assert(await stepUpOptions(app.baseUrl, session.token), { origin }) }, session.token);
+    assert.equal(refused.status, 400, origin);
+    assert.equal(refused.body.code, "second_factor_code_invalid", origin);
+  }
+  const registration = await registrationOptions(app.baseUrl, session.token, { webauthn: device.assert(await stepUpOptions(app.baseUrl, session.token)) });
+  const fromApp = await post(app.baseUrl, `${BASE}/passkeys/registration/verify`, { response: authenticator().register(registration, { origin: ANDROID_ORIGIN }) }, session.token);
+  assert.notEqual(fromApp.status, 200, "registration stays web-only");
+
+  const stepped = await post(app.baseUrl, `${BASE}/step-up`, { webauthn: device.assert(await stepUpOptions(app.baseUrl, session.token), { origin: ANDROID_ORIGIN }) }, session.token);
+  assert.equal(stepped.status, 200, JSON.stringify(stepped.body));
+  assert.deepEqual(stepped.body, { verified: true });
+});
+
 test("turning it on with an existing passkey (A9): backup codes, this sign-in verified by passkey, others signed out", async ({ app, seed }) => {
   const human = await seed.human();
   const session = await signInForTest(human.id);
@@ -522,4 +544,17 @@ test("adding a passkey with two-step verification on: a passkey bound to this si
   await registerPasskey(app.baseUrl, session.token, second, { webauthn: device.assert(await stepUpOptions(app.baseUrl, session.token)) });
   assert.equal((await storedPasskeys(human.id)).filter((row) => !row.revokedAt).length, 2);
   assert.equal(await unused(), before, "no backup code spent");
+});
+
+test("an unverified email can't add a passkey; verified, it can", async ({ app, seed }) => {
+  const human = await seed.human({ emailVerified: false });
+  const { token } = await signInForTest(human.id);
+  const refused = await post(app.baseUrl, `${BASE}/passkeys/registration/options`, {}, token);
+  assert.equal(refused.status, 403);
+  assert.equal(refused.body.code, "email_verification_required");
+  assert.equal((await getDb().select().from(authChallenges).where(eq(authChallenges.userId, human.id))).length, 0);
+
+  await getDb().update(users).set({ emailVerified: true }).where(eq(users.id, human.id));
+  await registerPasskey(app.baseUrl, token, authenticator());
+  assert.equal((await storedPasskeys(human.id)).length, 1);
 });

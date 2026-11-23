@@ -48,8 +48,22 @@ import type { AgentActivityDetailKind, AgentActivityKind } from "@botiverse/raft
 export const REPEATED_WAKE_THRESHOLD = 10;
 export const REPEATED_WAKE_MAX_GAP_MS = 10 * 60_000;
 
-/** Working kinds that are not the agent working on input: a start or a reconnect opens no turn. */
-const NOT_A_TURN: ReadonlySet<AgentActivityDetailKind> = new Set<AgentActivityDetailKind>(["starting", "runtime_starting", "runtime_reconnecting", "stalled_recovery"]);
+/**
+ * Working kinds that are not the agent working on input: a start or a
+ * reconnect opens no turn, and neither does a compaction (#proj-runtime:#67):
+ * the daemon's own turn-end compaction (a `/compact` turn after the agent's
+ * turn ended) shows only these two, so it is no empty turn of its own. A
+ * compaction inside a real turn changes nothing: that turn is opened by its
+ * other frames.
+ */
+const NOT_A_TURN: ReadonlySet<AgentActivityDetailKind> = new Set<AgentActivityDetailKind>([
+  "starting",
+  "runtime_starting",
+  "runtime_reconnecting",
+  "stalled_recovery",
+  "compacting_context",
+  "compaction_finished",
+]);
 
 /** What the server last offered the agent: the ids, the newest one named. */
 export type RepeatedWakeInput = {

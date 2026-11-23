@@ -78,7 +78,13 @@ export interface ArtifactUploadLimitsHost {
   quotaRefused: (quota: unknown, file: { name: string; sizeBytes: number }) => boolean;
 }
 
-/** What the host (core) does for "Send to conversation" and the viewer's original message. */
+/** A person or an agent to open: an ArtifactActor's `type` and `id`. */
+export interface ArtifactPerson {
+  type: "user" | "agent";
+  id: string;
+}
+
+/** What the host (core) does for "Send to conversation", the viewer's original message and the people it names. */
 export interface ArtifactShareHost {
   /**
    * "Send to conversation": core's Forward dialog with this Artifact as what
@@ -106,6 +112,19 @@ export interface ArtifactShareHost {
    * from anywhere else.
    */
   useConversation: (conversationId: ChannelId | null) => ArtifactHostConversation | null;
+  /**
+   * A hook: useConversation's rule for a list of conversations at once ("Linked from"'s discussions,
+   * #proj-workspace:#336 step 2): a function naming each as the reader's own channel list has it, null
+   * while it isn't there; a new one as the list changes. Absent: none is named (the rows stay hidden).
+   */
+  useConversationNames?: () => (conversationId: ChannelId) => ArtifactHostConversation | null;
+  /**
+   * A hook: opens a person's or an agent's profile the way a message's avatar
+   * or a mention does (the profile panel beside what is open), or, where there
+   * is no panel to open it in (the Artifact's own page), at the profile's
+   * address. Null: people aren't opened here (their rows stay plain text).
+   */
+  useOpenPerson: () => ((person: ArtifactPerson) => void) | null;
   /** The conversation a message is in, for saving its attachment (the fake names the home from it). */
   conversationOf: (conversationId: string) => ArtifactHostConversation | null;
   /** The upload quota for Save as Artifact; absent: no limit is acted on here (the server still refuses). */
@@ -132,8 +151,9 @@ export function artifactLinkSendNoteKey(link: string): string {
 
 const NoForwardDialog = () => null;
 const noOpen = () => () => {};
+const noOpenPerson = () => null;
 
-const emptyHost: ArtifactShareHost = { ForwardDialog: NoForwardDialog, useOpenMessage: noOpen, useConversation: () => null, conversationOf: () => null };
+const emptyHost: ArtifactShareHost = { ForwardDialog: NoForwardDialog, useOpenMessage: noOpen, useOpenPerson: noOpenPerson, useConversation: () => null, conversationOf: () => null };
 
 let host: ArtifactShareHost = emptyHost;
 

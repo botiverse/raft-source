@@ -53,6 +53,7 @@ import { dirname } from "node:path";
 import {
   LegacyMachinesClient,
   ServersClient,
+  type DevicePairingRequest,
   type LegacyMachineManualEntry,
   type LegacyMachineManualRosterResult,
 } from "./apiClient";
@@ -83,6 +84,7 @@ import {
   type AdoptCredential,
 } from "./services/adoptLegacy";
 import { requestMigrateApproval } from "./services/migrateGrant";
+import type { LoopbackLoginOptions } from "./services/login";
 import {
   diagnosticsPush as diagnosticsPushService,
   type DiagnosticsPushResult,
@@ -97,6 +99,7 @@ import { attach as attachService } from "./services/attach";
 import { attachWithApproval as attachWithApprovalService } from "./services/attachGrant";
 import { createComputerApi } from "./lib/api";
 import { createComputerTracer } from "./lib/computerTracer";
+import { createLoopbackLoginPresenter } from "./loopbackLoginPrompt";
 import {
   hasUnexpiredUserSessionShape,
   readUserSessionIdentity,
@@ -130,10 +133,32 @@ export interface SetupOptions {
    * row binding; caller row ownership and local owner.json are not required.
    */
   machine?: string;
+  /** `--device-code`: approve with a code even when the browser is on this machine. */
+  deviceCode?: boolean;
+  /** `--pair`, already checked (pairFlag.ts): sent on a device-code approval only. */
+  pairingId?: string;
+}
+
+/**
+ * The `--pair` window for this setup's FIRST approval only (services/login.ts
+ * `LoginOptions.pairing`). A setup that moves an old daemon over and then
+ * attaches asks for two approvals; the server voids a pairing a second request
+ * brings (design #110 §11 B, rule 1), so the later one is an ordinary code.
+ */
+function setupPairing(opts: SetupOptions): { pairing?: DevicePairingRequest } {
+  if (!opts.pairingId) return {};
+  const pairing = { pairingId: opts.pairingId, serverSlug: normalizeServerSlug(opts.serverSlug) };
+  opts.pairingId = undefined;
+  return { pairing };
 }
 
 export interface SetupDeps {
   isTty?: boolean;
+  /**
+   * The terminal's loopback offer for the one-time approvals (runSetup builds
+   * it; services/login.ts). Absent: device code, as before.
+   */
+  loopback?: LoopbackLoginOptions;
   /**
    * The user-session login: the legacy-daemon migration branch runs it only
    * on a server too old for a computer_migrate approval.
@@ -1197,6 +1222,11 @@ async function startFromSetup(
   }
 }
 
+/** The loopback approval's events, which setup's presenter prints and traces. */
+function isLoopbackLoginEvent(event: ComputerApiEvent): boolean {
+  return event.kind === "login.mode" || event.kind === "login.loopback-waiting" || event.kind === "login.loopback.result";
+}
+
 async function attachFromSetup(
   slockHome: string,
   opts: SetupOptions,
@@ -1216,6 +1246,8 @@ async function attachFromSetup(
       start: false,
       orchestrated: true,
       ...(auth === "user-session" ? { useUserSession: true } : {}),
+      ...(opts.deviceCode ? { deviceCode: true } : {}),
+      ...(opts.pairingId ? { pairingId: opts.pairingId } : {}),
     });
     return;
   }
@@ -1236,8 +1268,10 @@ async function attachFromSetup(
         { ...input, retryCommand: `raft-computer setup ${formatServerSlugDisplay(opts.serverSlug)}` },
         {
           onEvent: (event) => {
-            if (event.kind === "login.device-code" || event.kind === "attach.session-fallback") onEvent(event);
+            if (event.kind === "login.device-code" || event.kind === "attach.session-fallback" || isLoopbackLoginEvent(event)) onEvent(event);
           },
+          ...(deps.loopback ? { loopback: deps.loopback } : {}),
+          ...setupPairing(opts),
         },
       );
     }
@@ -1408,8 +1442,10 @@ export async function setupCore(
       },
       {
         onEvent: (event) => {
-          if (event.kind === "login.device-code") onEvent(event);
+          if (event.kind === "login.device-code" || isLoopbackLoginEvent(event)) onEvent(event);
         },
+        ...(deps.loopback ? { loopback: deps.loopback } : {}),
+        ...setupPairing(opts),
       },
     ).catch((err: unknown) => {
       if (err instanceof ComputerServiceError) throw new ComputerError(err.code, err.message);
@@ -1428,7 +1464,7 @@ export async function setupCore(
       emit("This server is too old to approve moving an old daemon over in one step; signing in with a user session instead.");
       // Sign in at the server the approval was asked from (it may come from
       // the saved session's URL, which `login` alone would not resolve).
-      await login({ serverUrl: approval.baseUrl, orchestrated: true });
+      await login({ serverUrl: approval.baseUrl, orchestrated: true, ...(opts.deviceCode ? { deviceCode: true } : {}) });
       emit("Logging in… done.");
     } else {
       emit("This server does not support one-time approvals yet, so this machine signed in with a user session instead.");
@@ -1923,11 +1959,14 @@ export async function setupCore(
  */
 export async function runSetup(opts: SetupOptions, deps: SetupDeps = {}): Promise<void> {
   const slockHome = resolveRaftHome();
-  const api = createComputerApi(slockHome, { tracer: createComputerTracer(slockHome, "computer.cli") });
+  const tracer = createComputerTracer(slockHome, "computer.cli");
+  const api = createComputerApi(slockHome, { tracer });
+  const loopback = createLoopbackLoginPresenter({ deviceCode: opts.deviceCode, tracer });
   let cleanupEnterToOpen: (() => void) | undefined;
   await present(async () => {
     try {
-      await api.setup(opts, deps, (event) => {
+      await api.setup(opts, { loopback: loopback.options, ...deps }, (event) => {
+        if (loopback.handleEvent(event)) return;
         if (event.kind === "log.line") {
           // Anything setup prints after the prompt means the approval is done.
           cleanupEnterToOpen?.();
@@ -1943,6 +1982,7 @@ export async function runSetup(opts: SetupOptions, deps: SetupDeps = {}): Promis
         }
       });
     } finally {
+      loopback.cleanup();
       cleanupEnterToOpen?.();
     }
   });

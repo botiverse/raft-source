@@ -35,6 +35,16 @@ test("ignoreUntoldInbox drops only the untold inbox: background tasks, stdin, qu
   assert.equal(agentNotIdleReason({ ...IDLE, untoldInbox: true, trackedMentionOpen: true }, quiet), "mention_in_flight");
 });
 
+test("ignoreBackgroundTasks drops only background tasks: a running foreground turn, stdin, queued input and mentions still count (#proj-runtime:#80)", () => {
+  const opts = { ignoreBackgroundTasks: true };
+  assert.equal(agentNotIdleReason({ ...IDLE, backgroundTasks: 2 }, opts), null);
+  assert.equal(agentNotIdleReason({ ...IDLE, backgroundTasks: 2, turnEnded: false }, opts), "agent_busy");
+  assert.equal(agentNotIdleReason({ ...IDLE, backgroundTasks: 2, untoldInbox: true }, opts), "delivery_in_flight");
+  assert.equal(agentNotIdleReason({ ...IDLE, backgroundTasks: 2, unconsumedStdin: 1 }, opts), "delivery_in_flight");
+  assert.equal(agentNotIdleReason({ ...IDLE, backgroundTasks: 2, queuedInputPending: true }, opts), "delivery_in_flight");
+  assert.equal(agentNotIdleReason({ ...IDLE, backgroundTasks: 2, trackedMentionOpen: true }, opts), "mention_in_flight");
+});
+
 test("input written into a turn is pending at its end only until a new turn starts, or the settle window passes", async () => {
   const { DeliveryConsumptionWatch, QUEUED_INPUT_SETTLE_MS } = await import("./deliveryConsumptionWatch");
   const watch = new DeliveryConsumptionWatch();

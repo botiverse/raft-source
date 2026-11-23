@@ -407,8 +407,8 @@ test("read_state:updated_bulk clears channel and followed thread state without e
     return { data: {} };
   }) as typeof api.post;
 
-  const channelItem = makeChannelItem({ channelId: "channel-read-state", unreadCount: 2 });
-  const threadItem = makeThreadItem({ threadChannelId: "thread-read-state", unreadCount: 1 });
+  const channelItem = makeChannelItem({ channelId: "channel-read-state", unreadCount: 2, readStateLatestActivitySeq: "1" });
+  const threadItem = makeThreadItem({ threadChannelId: "thread-read-state", unreadCount: 1, readStateLatestActivitySeq: "1" });
   resetInbox([channelItem, threadItem]);
   resetThreadStore([makeFollowedThread({ threadChannelId: "thread-read-state", unreadCount: 1 })]);
   useMessageStore.setState({
@@ -562,6 +562,7 @@ test("read-state projection reports incomplete shape when cache cannot prove pro
 test("read-state fact projects later message hydration without reverting Activity", () => {
   resetAll();
   const item = makeChannelItem({
+    readStateLatestActivitySeq: "2",
     unreadCount: 2,
     firstUnreadMessageId: "message-1",
     firstMentionMessageId: null,
@@ -833,6 +834,7 @@ test("addMessage preserves unread when a live gap transition makes the window in
 test("read_state:updated reprojects accepted fact for a later single live message", () => {
   resetAll();
   const item = makeChannelItem({
+    readStateLatestActivitySeq: "2",
     unreadCount: 2,
     firstUnreadMessageId: "message-1",
     firstMentionMessageId: null,
@@ -861,6 +863,7 @@ test("read_state:updated reprojects accepted fact for a later single live messag
 test("read_state:updated keeps a late live message read when it is covered by accepted cursor", () => {
   resetAll();
   const item = makeChannelItem({
+    readStateLatestActivitySeq: "2",
     unreadCount: 1,
     firstUnreadMessageId: "message-1",
     firstMentionMessageId: null,
@@ -895,6 +898,7 @@ test("read_state:updated keeps a late live message read when it is covered by ac
 test("loadUnreadCounts applies server summary when accepted projection predates the request", async () => {
   resetAll();
   const item = makeChannelItem({
+    readStateLatestActivitySeq: "2",
     unreadCount: 2,
     firstUnreadMessageId: "message-1",
     firstMentionMessageId: null,
@@ -1282,6 +1286,7 @@ test("read_state:updated preserves current mention when in-flight summary races 
 test("read_state:updated excludes self-authored messages from projected unread", () => {
   resetAll();
   const item = makeChannelItem({
+    readStateLatestActivitySeq: "4",
     unreadCount: 3,
     firstUnreadMessageId: "message-1",
     firstMentionMessageId: null,
@@ -1365,6 +1370,7 @@ test("read_state:updated projects only current-user mentions from unread cached 
 test("read_state:updated clears mention projection when no current user is known", () => {
   resetAll();
   const item = makeChannelItem({
+    readStateLatestActivitySeq: "2",
     firstMentionMessageId: "message-old",
     hasMention: true,
   });

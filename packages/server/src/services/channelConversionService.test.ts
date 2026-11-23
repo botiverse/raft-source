@@ -52,10 +52,12 @@ import {
   describeChannelConversionPreJobFailure,
   retryChannelConversionJob,
   runChannelConversionJob,
+  setConversionRollbackFailureForTest,
   startChannelToJointConversion,
   type ChannelConversionPhase,
 } from "./channelConversionService";
 import { insertAttachmentsWithObjects } from "../test/attachmentObjectFixture";
+import { runChannelConversionWorkerPass } from "./channelConversionWorker";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
@@ -909,6 +911,42 @@ test("a conversion retries a failed persisted job and emits phase spans", async 
   assert.ok(phaseSpans.every((span) => span.attrs?.channel_id === fixture.channel.id));
 });
 
+test("the worker broadcasts a finished job once even when its updated_at has microseconds", async ({ db }) => {
+  void db;
+  // 2026-11-19 incident: updated_at keeps microseconds, the job's JS Date only
+  // milliseconds, so the completion mark never matched and every pass
+  // re-broadcast the failed job (~30 channel:updated/s to clients).
+  const prefix = `convert-broadcast-once-${randomUUID().slice(0, 8)}`;
+  const { owner, member, server, agent } = await seedConversionActors(prefix);
+  const fixture = await seedOrdinaryChannel({
+    serverId: server.id, ownerId: owner.id, memberId: member.id, agentId: agent.id, name: `${prefix}-room`, type: "channel",
+  });
+  const job = await startChannelToJointConversion({ serverId: server.id, sourceChannelId: fixture.channel.id, createdByUserId: owner.id });
+  const failed = await runChannelConversionJob(job.id, { failBeforePhase: "prepare" });
+  assert.equal(failed.status, "failed");
+  await getDb().update(channelConversionJobs)
+    .set({ updatedAt: sql`date_trunc('milliseconds', ${channelConversionJobs.updatedAt}) + interval '0.000281 seconds'` })
+    .where(eq(channelConversionJobs.id, job.id));
+  const [stored] = await getDb().select({
+    micros: sql<number>`(extract(microseconds from ${channelConversionJobs.updatedAt})::bigint % 1000)::int`,
+    broadcastAt: sql<string | null>`${channelConversionJobs.progress}->>'completionBroadcastAt'`,
+  }).from(channelConversionJobs).where(eq(channelConversionJobs.id, job.id));
+  assert.equal(stored.micros, 281, "the database keeps sub-millisecond precision");
+  assert.equal(stored.broadcastAt, null);
+
+  const broadcasts: string[] = [];
+  const onProgress = async (receipt: { id: string; status: string }) => {
+    if (receipt.id === job.id) broadcasts.push(receipt.status);
+  };
+  await runChannelConversionWorkerPass(onProgress);
+  await runChannelConversionWorkerPass(onProgress);
+  assert.deepEqual(broadcasts, ["failed"], "one broadcast over two passes");
+  const [marked] = await getDb().select({
+    broadcastAt: sql<string | null>`${channelConversionJobs.progress}->>'completionBroadcastAt'`,
+  }).from(channelConversionJobs).where(eq(channelConversionJobs.id, job.id));
+  assert.ok(marked.broadcastAt, "the completion mark landed");
+});
+
 test("converting preserves direct and thread task identity", async ({ app }) => {
   const prefix = `convert-task-preserve-${randomUUID().slice(0, 8)}`;
   const { owner, member, server, agent } = await seedConversionActors(prefix);
@@ -1142,4 +1180,52 @@ test("channel → joint conversion rollback restores a task conversation it had 
   assert.notEqual(converted.task.conversationChannelId, seeded.conversationId, "retry converts the conversation again");
   assert.equal(converted.projections.length, 1);
   assert.equal(converted.conversations.length, 2);
+});
+
+test("a failure whose rollback also fails is still recorded, so the worker stops picking the job up", async ({ app }) => {
+  assert.ok(app.baseUrl);
+  const prefix = `convert-rb-fail-${randomUUID().slice(0, 8)}`;
+  const { owner, member, server, agent } = await seedConversionActors(prefix);
+  const fixture = await seedOrdinaryChannel({
+    serverId: server.id, ownerId: owner.id, memberId: member.id, agentId: agent.id, name: `${prefix}-room`,
+  });
+  const job = await startChannelToJointConversion({ serverId: server.id, sourceChannelId: fixture.channel.id, createdByUserId: owner.id });
+  setConversionRollbackFailureForTest(true);
+  let failed;
+  try {
+    failed = await runChannelConversionJob(job.id, { failBeforePhase: "verify" });
+  } finally {
+    setConversionRollbackFailureForTest(false);
+  }
+  assert.equal(failed.status, "failed", "the failure commits although its rollback timed out");
+  assert.equal(failed.phase, "verify");
+  assert.equal(failed.progress.sourceLock, "retained", "unrestored: the source stays fenced");
+  assert.equal(failed.progress.rollbackState, undefined);
+  assert.match(failed.error ?? "", /Retry to finish the conversion/);
+  const [row] = await getDb().select({ status: channelConversionJobs.status }).from(channelConversionJobs).where(eq(channelConversionJobs.id, job.id));
+  assert.equal(row!.status, "failed", "a failed job is not pending/running, so the worker does not run it again");
+
+  const completed = await runChannelConversionJob((await retryChannelConversionJob(job.id)).id);
+  assert.equal(completed.status, "done", "retry resumes the failed phase and finishes forward");
+});
+
+test("an audience-phase failure does not run the compensation under the members' users locks", async ({ app }) => {
+  assert.ok(app.baseUrl);
+  const prefix = `convert-aud-fail-${randomUUID().slice(0, 8)}`;
+  const { owner, member, server, agent } = await seedConversionActors(prefix);
+  const fixture = await seedOrdinaryChannel({
+    serverId: server.id, ownerId: owner.id, memberId: member.id, agentId: agent.id, name: `${prefix}-room`,
+  });
+  const job = await startChannelToJointConversion({ serverId: server.id, sourceChannelId: fixture.channel.id, createdByUserId: owner.id });
+  let current = (await getChannelConversionJob(job.id))!;
+  for (let i = 0; i < 12 && current.phase !== "audience_cutover"; i += 1) {
+    current = await runChannelConversionJob(job.id, { maxPhases: 1 });
+  }
+  assert.equal(current.phase, "audience_cutover");
+  const failed = await runChannelConversionJob(job.id, { maxPhases: 1, failBeforePhase: "residual_cleanup" });
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.progress.sourceLock, "retained", "no rollback inside the transaction that holds the users rows");
+  assert.equal(failed.progress.rollbackState, undefined);
+  const canceled = await cancelChannelConversionJob(job.id);
+  assert.equal(canceled.status, "canceled", "Cancel restores the source outside the audience phase");
 });

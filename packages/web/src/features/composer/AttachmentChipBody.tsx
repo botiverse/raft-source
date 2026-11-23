@@ -1,5 +1,5 @@
 import { memo, useCallback } from "react";
-import type { KeyboardEvent } from "react";
+import type { KeyboardEvent, MouseEvent } from "react";
 import { useIntl } from "react-intl";
 import { X, FileText, Image as ImageIcon } from "lucide-react";
 import { ComposerAttachmentBody, ComposerAttachmentFailedOverlay, ComposerAttachmentFile, ComposerAttachmentImage, ComposerAttachmentMeta, ComposerAttachmentRemove, ComposerAttachmentTitle, ComposerAttachmentUploadingOverlay, ComposerAttachmentUploadProgressBar, Spinner } from "@botiverse/raft-ui";
@@ -7,6 +7,16 @@ import type { DraggableSyntheticListeners } from "@dnd-kit/core";
 import Tooltip from "../../components/ui/Tooltip";
 import { transparentImageBackgroundClass } from "../../utils/imagePreviewStyles";
 import type { PendingFile } from "./composerTypes";
+
+/**
+ * Pressing Remove with the mouse or a finger does not take the focus: the
+ * button goes away with its chip, so focus taken by it would drop to the page
+ * and the text box someone was typing in would lose it (#triage:db62c967).
+ * Keyboard Remove is unchanged.
+ */
+function keepFocusOnRemovePress(event: MouseEvent) {
+  event.preventDefault();
+}
 
 /**
  * What a pending attachment chip shows inside its sortable shell (SortableAttachment): the drag handle with the image
@@ -143,6 +153,7 @@ export const AttachmentChipBody = memo(function AttachmentChipBody({
           the phones/tablets where a hover-only ✕ disappears. It stays
           OUTSIDE the drag-handle body above so taps reach onRemove. */}
       <ComposerAttachmentRemove
+        onMouseDown={keepFocusOnRemovePress}
         onClick={handleRemove}
         aria-label={formatMessage({ id: "message.composer.removeAttachment" }, { file: fileName })}
       >

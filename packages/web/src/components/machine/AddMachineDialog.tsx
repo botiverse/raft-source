@@ -14,7 +14,7 @@ import { useNavigate } from "react-router-dom";
 import { getServerUrl } from "../../utils/server";
 // The baseline/resolver import staging still carries is gone here: this dialog's
 // connect state machine lives in useComputerConnectionWatch now, shared with onboarding.
-import { getComputerCommands } from "../../utils/computerSetupCommand";
+import { computerInstallChannel, getComputerCommands } from "../../utils/computerSetupCommand";
 import { PLAN_CONFIG, getEffectiveLimits } from "@botiverse/raft-shared";
 import type { ServerPlan } from "@botiverse/raft-shared";
 import DialogCard from "../ui/DialogCard";
@@ -22,6 +22,7 @@ import FormField from "../ui/FormField";
 import Banner from "../ui/Banner";
 import KeyValueRow from "../ui/KeyValueRow";
 import ComputerCommandGuide from "./ComputerCommandGuide";
+import { ComputerAccessNotice } from "./ComputerAccessNotice";
 import MachineRuntimeChips from "./MachineRuntimeChips";
 import { useAuthStore } from "../../store/authStore";
 import { useServerPermissions } from "../../hooks/useServerPermissions";
@@ -34,6 +35,11 @@ import { AddThisComputerDialog } from "./localComputer/AddThisComputerDialog";
 import { setupForServer, startAddThisComputer, useAddThisComputerStore } from "./localComputer/addThisComputerStore";
 import { useAddComputerOnDesktop } from "./localComputer/useAddComputerOnDesktop";
 import { thisDevicePath } from "./localComputer/thisDeviceRoute";
+import { useAddComputerCode } from "../../features/computer/useAddComputerCode";
+import { AddComputerCodeEntry } from "../../features/computer/AddComputerCodeEntry";
+import { AddComputerCodeReview } from "../../features/computer/AddComputerCodeReview";
+import { useComputerPairing } from "../../features/computer/useComputerPairing";
+import { DEVICE_LOGIN_PATH, codeReviewTitle } from "../../features/computer/addComputerCode";
 
 type DialogStep = "type" | "waiting" | "connected";
 export const WAITING_HINT_DELAY_MS = 45_000;
@@ -93,6 +99,9 @@ function AddMachineDialogBody({ onClose, host }: { onClose: () => void; host: Lo
   // server until a machine actually connects.
   // oxlint-disable-next-line react-doctor/no-event-handler -- A one-time seed of the wizard's first step when the dialog opens (it mounts per open), not a mirror of `host`.
   const [step, setStep] = useState<DialogStep>(() => initialStep(host));
+  // What agents can do on a connected computer is said once, before anything
+  // is connected: on the choice, or on the command when the dialog opens there.
+  const [openedOnCommand] = useState(() => step === "waiting");
   // Picked by the person; until then This computer when it can be added, else their own.
   const [pickedType, setPickedType] = useState<MachineType | null>(null);
   const thisComputer = useAddComputerOnDesktop(host);
@@ -108,6 +117,7 @@ function AddMachineDialogBody({ onClose, host }: { onClose: () => void; host: Lo
   const renameMachine = useMachineStore((s) => s.renameMachine);
   const serverSlug = useServerStore((s) => s.current?.slug);
   const serverId = useServerStore((s) => s.current?.id ?? null);
+  const serverName = useServerStore((s) => s.current?.name ?? "");
   const currentUserId = useAuthStore((s) => s.user?.id ?? null);
   const { capabilities } = useServerPermissions();
   const machines = useMachineStore((s) => s.machines);
@@ -125,6 +135,27 @@ function AddMachineDialogBody({ onClose, host }: { onClose: () => void; host: Lo
   }, []);
 
   const serverUrl = getServerUrl();
+  // The terminal shows a code (setup run over SSH): approve it here, for this
+  // server, instead of on the device login page (features/computer/AddComputerCode*).
+  const codeEntry = useAddComputerCode();
+  const codeTitle = step === "waiting" ? codeReviewTitle(formatMessage, codeEntry.approval.step, serverId) : null;
+  // No code at all: while the command is on screen the window holds a pairing,
+  // the one-paste command carries it, and the Computer that runs it shows up
+  // here for the same confirm screen (features/computer/useComputerPairing.ts).
+  const pairingServer = useMemo(
+    () => (serverId && serverSlug ? { id: serverId, slug: serverSlug, name: serverName } : null),
+    [serverId, serverSlug, serverName],
+  );
+  const pairing = useComputerPairing({
+    active: step === "waiting",
+    server: pairingServer,
+    channel: computerInstallChannel(import.meta.env?.VITE_DEPLOYMENT_ENV),
+    approval: codeEntry.approval,
+  });
+  const openDeviceLoginPage = useCallback(() => {
+    onClose();
+    navigate(DEVICE_LOGIN_PATH);
+  }, [navigate, onClose]);
 
 
   // Watch for the machine coming online. The detection, the baseline, and the
@@ -278,7 +309,7 @@ function AddMachineDialogBody({ onClose, host }: { onClose: () => void; host: Lo
   }, [onClose, nav]);
 
   const deploymentEnv = import.meta.env?.VITE_DEPLOYMENT_ENV;
-  const computerCommands = getComputerCommands(serverSlug, deploymentEnv, serverUrl);
+  const computerCommands = getComputerCommands(serverSlug, deploymentEnv, serverUrl, { pairingId: pairing.pairingId });
   const windowsComputerCommands = getComputerCommands(serverSlug, deploymentEnv, serverUrl, {
     platform: "windows",
   });
@@ -290,13 +321,13 @@ function AddMachineDialogBody({ onClose, host }: { onClose: () => void; host: Lo
 
   // On Raft Desktop the command is for another computer: "Install on another
   // computer", until it is connected.
-  const dialogTitle = anotherComputer && step === "waiting"
+  const dialogTitle = codeTitle ?? (anotherComputer && step === "waiting"
     ? formatMessage({ id: "computerHost.thisDevice.installAnother" })
     : step === "type"
       ? formatMessage({ id: "machine.add.title.add" })
       : step === "waiting"
         ? formatMessage({ id: "machine.add.title.connect" })
-        : formatMessage({ id: "machine.add.title.connected" });
+        : formatMessage({ id: "machine.add.title.connected" }));
 
   // The shared product dialog shell (Raft DS Dialog): backdrop, Escape and the
   // close button all run the same handler the hand-rolled header used.
@@ -325,6 +356,7 @@ function AddMachineDialogBody({ onClose, host }: { onClose: () => void; host: Lo
         {/* Step 1: Choose machine type */}
         {step === "type" && (
           <div>
+            {atLimit ? null : <ComputerAccessNotice className="mb-4" />}
             <Field className="mb-4">
               <FieldLabel id={whichComputerId}>{formatMessage({ id: "machine.add.whichComputer" })}</FieldLabel>
               <ChoiceList
@@ -364,14 +396,27 @@ function AddMachineDialogBody({ onClose, host }: { onClose: () => void; host: Lo
           </div>
         )}
 
+        {/* Step 2, a typed code's confirm screen in the command's place */}
+        {step === "waiting" && codeTitle !== null ? (
+          <AddComputerCodeReview entry={codeEntry} serverId={serverId} onOpenDevicePage={openDeviceLoginPage} />
+        ) : null}
+
         {/* Step 2: Waiting for connection */}
-        {step === "waiting" && (
+        {step === "waiting" && codeTitle === null && (
           <div>
+            {openedOnCommand ? <ComputerAccessNotice className="mb-4" /> : null}
             {/* On Raft Desktop the command is for the other computer, not this one. */}
             {/* In a browser: any machine of the person's own, a cloud server too. */}
             <p className="mb-2 text-callout text-foreground-muted" data-testid={anotherComputer ? "add-machine-other-computer-hint" : "add-machine-own-computer-hint"}>
               {formatMessage({ id: anotherComputer ? "computerHost.addDialog.otherComputerHint" : "machine.add.ownComputerHint" })}
             </p>
+            {pairing.conflict ? (
+              // The command ran on more than one machine (or twice on one): neither
+              // request is approvable here, and the command below is a new one.
+              <Banner intent="warning" withIcon className="mb-4" data-testid="add-machine-pairing-conflict">
+                {formatMessage({ id: "machine.add.pairing.conflict" })}
+              </Banner>
+            ) : null}
             <ComputerCommandGuide
               className="mb-4"
               computerCommand={computerSetupCommand}
@@ -380,6 +425,7 @@ function AddMachineDialogBody({ onClose, host }: { onClose: () => void; host: Lo
               windowsComputerCommand={windowsComputerSetupCommand}
               windowsComputerInstallCommand={windowsComputerInstall}
             />
+            <AddComputerCodeEntry entry={codeEntry} serverName={serverName} onOpenDevicePage={openDeviceLoginPage} />
 
             {/* Waiting indicator */}
             <Banner

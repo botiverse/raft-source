@@ -22,7 +22,7 @@
  */
 import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
 import type { Server as SocketServer } from "socket.io";
-import { effectiveRaftTheme, raftThemeDecorShown, type RaftThemeId } from "@botiverse/raft-shared";
+import { effectiveRaftTheme, RAFT_THEME_IDS, raftThemeDecorShown, type RaftThemeId } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import { agents, integrationAuditEvents, serverMembers, servers, users } from "../db/schema";
 import { parseDisplayLanguage, parsePreferredTimezone } from "../lib/accountPreferenceParsers";
@@ -63,12 +63,18 @@ export type OwnerSettings = {
 
 export const OWNER_SETTING_CHANGED_EVENT = "assistant.owner_setting_changed" as const;
 
-/** A refusal, with the status and `{ error }` body the owner's own web route answers. */
+/**
+ * A refusal, with the status and (where it is a sentence) the words the
+ * owner's own web route answers, and a code for the agent API's envelope.
+ */
 export class AssistantOwnerSettingsError extends Error {
-  constructor(readonly status: number, message: string) {
+  constructor(readonly status: number, readonly code: string, message: string) {
     super(message);
   }
 }
+
+/** The web answers an unknown theme with the bare `invalid_theme`; the agent API with a sentence. */
+const INVALID_THEME_ERROR = `theme must be one of ${RAFT_THEME_IDS.join(", ")}`;
 
 type OwnerScope = { agentId: string; serverId: string; ownerUserId: string };
 
@@ -78,23 +84,30 @@ type OwnerSettingsPatch = { appearance: MemberAppearanceInput; displayLanguage?:
 export function parseOwnerSettingsPatch(body: unknown): OwnerSettingsPatch {
   const record = body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : {};
   const appearance = parseMemberAppearanceInput(record.theme, record.themeDecor);
-  if (!appearance.ok) throw new AssistantOwnerSettingsError(400, appearance.error);
-  let displayLanguage: string | null | undefined;
-  let preferredTimezone: string | null | undefined;
-  try {
-    displayLanguage = parseDisplayLanguage(record.displayLanguage);
-    preferredTimezone = parsePreferredTimezone(record.preferredTimezone);
-  } catch (err) {
-    throw new AssistantOwnerSettingsError(400, err instanceof Error ? err.message : "Invalid account preference");
+  if (!appearance.ok) {
+    throw appearance.error === "invalid_theme"
+      ? new AssistantOwnerSettingsError(400, "invalid_theme", INVALID_THEME_ERROR)
+      : new AssistantOwnerSettingsError(400, "theme_decor_invalid", appearance.error);
   }
+  const displayLanguage = parseAccountPreference("display_language_invalid", () => parseDisplayLanguage(record.displayLanguage));
+  const preferredTimezone = parseAccountPreference("preferred_timezone_invalid", () => parsePreferredTimezone(record.preferredTimezone));
   if (Object.keys(appearance.input).length === 0 && displayLanguage === undefined && preferredTimezone === undefined) {
-    throw new AssistantOwnerSettingsError(400, "theme, themeDecor, displayLanguage or preferredTimezone is required");
+    throw new AssistantOwnerSettingsError(400, "owner_settings_required", "theme, themeDecor, displayLanguage or preferredTimezone is required");
   }
   return {
     appearance: appearance.input,
     ...(displayLanguage !== undefined ? { displayLanguage } : {}),
     ...(preferredTimezone !== undefined ? { preferredTimezone } : {}),
   };
+}
+
+/** One account preference through the web's own parser; its message is the refusal. */
+function parseAccountPreference(code: string, parse: () => string | null | undefined): string | null | undefined {
+  try {
+    return parse();
+  } catch (err) {
+    throw new AssistantOwnerSettingsError(400, code, err instanceof Error ? err.message : "Invalid account preference");
+  }
 }
 
 async function readStoredOwnerSettings(serverId: string, ownerUserId: string, db: DatabaseExecutor): Promise<StoredOwnerSettings> {
@@ -105,7 +118,7 @@ async function readStoredOwnerSettings(serverId: string, ownerUserId: string, db
     .where(eq(users.id, ownerUserId))
     .limit(1);
   // resolveAssistantOwner already found the owner a member here.
-  if (!appearance || !user) throw new AssistantOwnerSettingsError(404, "Server not found");
+  if (!appearance || !user) throw new AssistantOwnerSettingsError(404, "server_not_found", "Server not found");
   return {
     theme: appearance.theme,
     themeDecor: appearance.themeDecor,

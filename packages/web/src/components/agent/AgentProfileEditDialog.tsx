@@ -23,7 +23,8 @@ import {
   Text,
   Textarea,
 } from "@botiverse/raft-ui";
-import type { ServerRole } from "@botiverse/raft-shared";
+import { PROFILE_DESCRIPTION_MAX_LENGTH, profileDescriptionTooLong } from "@botiverse/raft-shared";
+import type { DescriptionLinkWarning, ServerRole } from "@botiverse/raft-shared";
 import api from "../../api/client";
 import { useAgentStore } from "../../store/agentStore";
 import type { Agent } from "../../store/agentStore";
@@ -31,7 +32,9 @@ import { avatarUploadApiErrorMessage, isAvatarFileTooLarge, isAvatarTooLargeErro
 import type { MessageId } from "../../i18n/messages";
 import AvatarSlot from "../ui/AvatarSlot";
 import FormField from "../ui/FormField";
+import StableField from "./StableField";
 import Tooltip from "../ui/Tooltip";
+import { DescriptionLinkWarnings } from "../message/DescriptionLinkWarnings";
 import { DialogActions, DialogCommit, NarrowDialogContent } from "../ui/NarrowDialog";
 import type { DialogNarrow } from "../ui/NarrowDialog";
 import { AVATAR_SERIES, DEFAULT_AVATAR_KEY, isCustomAvatar, parsePixelAvatar } from "./PixelAvatar";
@@ -39,7 +42,6 @@ import { AVATAR_SERIES, DEFAULT_AVATAR_KEY, isCustomAvatar, parsePixelAvatar } f
 export type AgentProfileEditField = "displayName" | "description" | "role" | "avatar";
 type EditableRole = Extract<ServerRole, "admin" | "member">;
 
-export const MAX_AGENT_DESCRIPTION_LENGTH = 3000;
 
 const TITLE_ID = {
   displayName: "agent.detail.editDisplayName",
@@ -93,7 +95,7 @@ export type AgentProfileEditDialogProps = {
 export default function AgentProfileEditDialog({ agent, open, field, onClose, roleOptions }: AgentProfileEditDialogProps) {
   const { formatMessage } = useIntl();
   const updateAgent = useAgentStore((s) => s.updateAgent);
-  const ids = { name: useId(), description: useId(), role: useId(), avatar: useId(), title: useId() };
+  const ids = { name: useId(), role: useId(), avatar: useId(), title: useId() };
   const currentRole: EditableRole | null = agent.serverRole === "admin" || agent.serverRole === "member" ? agent.serverRole : null;
   const canEditRole = currentRole !== null && roleOptions.length > 0;
 
@@ -104,6 +106,8 @@ export default function AgentProfileEditDialog({ agent, open, field, onClose, ro
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [confirmDiscard, setConfirmDiscard] = useState(false);
+  // #457: a saved description's links some of its readers can't open; the dialog stays open on them until closed.
+  const [linkWarnings, setLinkWarnings] = useState<DescriptionLinkWarning[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // The dialog is mounted per opening, so the initial state above is always the
@@ -127,13 +131,17 @@ export default function AgentProfileEditDialog({ agent, open, field, onClose, ro
   const roleChanged = field === "role" && canEditRole && role !== currentRole;
   const avatarChanged = field === "avatar" && avatar.kind !== "unchanged";
   const dirty = nameChanged || descriptionChanged || roleChanged || avatarChanged;
-  const descriptionTooLong = field === "description" && trimmedDescription.length > MAX_AGENT_DESCRIPTION_LENGTH;
+  // Saved, with warnings to read: Close instead of Cancel and Save (editing again brings them back).
+  const showingLinkWarnings = linkWarnings.length > 0;
+  // One saved under the older, longer limit stays as it is; once edited, the limit applies.
+  const descriptionTooLong = field === "description" && profileDescriptionTooLong(trimmedDescription, agent.description);
 
   const requestClose = useCallback(() => {
     if (saving) return;
-    if (dirty) setConfirmDiscard(true);
+    // Saved (the warnings say so): nothing to discard.
+    if (dirty && !showingLinkWarnings) setConfirmDiscard(true);
     else onClose();
-  }, [saving, dirty, onClose]);
+  }, [saving, dirty, showingLinkWarnings, onClose]);
 
   const handleDialogOpenChange = useCallback((next: boolean) => {
     if (!next) requestClose();
@@ -145,6 +153,7 @@ export default function AgentProfileEditDialog({ agent, open, field, onClose, ro
 
   const handleDescriptionChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setDescription(e.target.value);
+    setLinkWarnings((current) => (current.length > 0 ? [] : current));
   }, []);
 
   const handleRoleChange = useCallback((next: string) => {
@@ -205,7 +214,11 @@ export default function AgentProfileEditDialog({ agent, open, field, onClose, ro
       if (roleChanged && role) fields.serverRole = role;
       if (avatar.kind === "preset") fields.avatarUrl = `pixel:${avatar.key}`;
       if (avatar.kind === "default") fields.avatarUrl = null;
-      if (Object.keys(fields).length > 0) await updateAgent(agent.id, fields);
+      const saved = Object.keys(fields).length > 0 ? await updateAgent(agent.id, fields) : null;
+      if (saved?.warnings && saved.warnings.length > 0) {
+        setLinkWarnings(saved.warnings);
+        return;
+      }
       onClose();
     } catch (err: unknown) {
       if (avatar.kind === "upload" && isAvatarTooLargeError(err)) {
@@ -279,15 +292,17 @@ export default function AgentProfileEditDialog({ agent, open, field, onClose, ro
             </FormField>
             ) : null}
             {field === "description" ? (
-            <FormField
+            <StableField
               label={formatMessage({ id: "machine.detail.description" })}
-              htmlFor={ids.description}
+              hint={formatMessage({ id: "agent.detail.descriptionHint" })}
               error={descriptionTooLong
-                ? formatMessage({ id: "agent.detail.descriptionMaxLength" }, { count: MAX_AGENT_DESCRIPTION_LENGTH })
+                ? formatMessage({ id: "agent.detail.descriptionMaxLength" }, { count: PROFILE_DESCRIPTION_MAX_LENGTH })
                 : undefined}
+              // Persistent, so one saved under the older limit reads e.g. 412/300 before it is edited.
+              counter={`${trimmedDescription.length}/${PROFILE_DESCRIPTION_MAX_LENGTH}`}
+              reserveMessage={false}
             >
               <Textarea
-                id={ids.description}
                 value={description}
                 rows={3}
                 autoFocus={field === "description"}
@@ -295,7 +310,7 @@ export default function AgentProfileEditDialog({ agent, open, field, onClose, ro
                 onChange={handleDescriptionChange}
                 data-testid="agent-profile-edit-description"
               />
-            </FormField>
+            </StableField>
             ) : null}
             {field === "role" && canEditRole && role ? (
               <RadioGroup
@@ -381,13 +396,26 @@ export default function AgentProfileEditDialog({ agent, open, field, onClose, ro
             </div>
             ) : null}
             {error ? <Banner status="warning" size="sm" role="alert">{error}</Banner> : null}
+            <DescriptionLinkWarnings owner="agent" warnings={linkWarnings} onDismiss={requestClose} />
           </DialogBody>
           <DialogActions as={DialogFooter}>
-            <Button type="button" variant="ghost" size="lg" onClick={requestClose} disabled={saving}>
-              {formatMessage({ id: "common.confirm.cancel" })}
-            </Button>
+            {showingLinkWarnings ? null : (
+              <Button type="button" variant="ghost" size="lg" onClick={requestClose} disabled={saving}>
+                {formatMessage({ id: "common.confirm.cancel" })}
+              </Button>
+            )}
             <DialogCommit>
-              {(inHead) => (
+              {(inHead) => (showingLinkWarnings ? (
+                <Button
+                  type="button"
+                  variant="accent"
+                  size={inHead ? "md" : "lg"}
+                  onClick={requestClose}
+                  data-testid="agent-profile-edit-done"
+                >
+                  {formatMessage({ id: "common.close" })}
+                </Button>
+              ) : (
                 <Button
                   type="button"
                   variant="accent"
@@ -399,7 +427,7 @@ export default function AgentProfileEditDialog({ agent, open, field, onClose, ro
                 >
                   {formatMessage({ id: "machine.detail.save" })}
                 </Button>
-              )}
+              ))}
             </DialogCommit>
           </DialogActions>
         </NarrowDialogContent>

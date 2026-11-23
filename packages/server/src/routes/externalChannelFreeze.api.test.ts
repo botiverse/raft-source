@@ -5,8 +5,10 @@
 // it hosts can't post there, the other servers of a joint still can, and
 // cleanup unfreezes it in the same transaction.
 import assert from "node:assert/strict";
+import { vi } from "vitest";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
+import * as dbModule from "../db/index";
 import { getDb } from "../db/index";
 import { channels, externalFreezeLaunchBackfill, jointChannelServers, messages, serverAgentMembers, serverExternalFreezes, serverMembers, servers } from "../db/schema";
 import { createAgent } from "../services/agentService";
@@ -38,6 +40,7 @@ import { createApiTest } from "../test/integration/apiTest";
 import { enableTaskV2ConversationsForServer } from "../test/integration/taskV2Flag";
 import { enableExternalChannelsFlag, login, seedUser, seedWorld } from "../test/externalInviteFixture";
 import { capturePaywallHits } from "../test/integration/paywallHits";
+import * as tracing from "../tracing/semanticTrace";
 import { seedBoundGuest } from "../test/guestFixture";
 import { setChannelArchivedForAgent } from "./agentChannelLifecycle";
 
@@ -336,9 +339,14 @@ test("the sweep and the launch backfill: nothing is created before the backfill 
   // In grace: still writable.
   assert.equal((await post(app.baseUrl, sOwner, s.id, (await connectedLocal(s.id)).id)).status, 200);
 
-  // The sweep keeps the backfilled time, clears a server no longer over...
+  // The sweep keeps the backfilled time, clears a server no longer over
+  // (once the flag is on for it: flag off, its row is left alone)...
   await setPlan(other.s.id, "pro");
   const third = await freeParticipantInTwoJoints(app.baseUrl);
+  await getDb().delete(serverExternalFreezes).where(eq(serverExternalFreezes.serverId, third.s.id));
+  assert.equal((await sweepExternalChannelFreezes()).cleared, 0, "flag off: nothing cleared");
+  assert.equal((await storedFreezeAt(other.s.id))?.getTime(), kept.getTime(), "flag off: kept");
+  await enableExternalChannelsFlag(other.s.id);
   await getDb().delete(serverExternalFreezes).where(eq(serverExternalFreezes.serverId, third.s.id));
   const swept = await sweepExternalChannelFreezes();
   assert.equal(swept.backfillDone, true);
@@ -354,6 +362,78 @@ async function connectedLocal(serverId: string) {
     .where(eq(jointChannelServers.serverId, serverId)).limit(1);
   return row!;
 }
+
+/** A free server, flag off, in two joint channels, given its launch grace by the backfill (freeze_at = launch + 14 days). */
+async function backfilledWhileFlagOff(baseUrl: string) {
+  const world = await freeParticipantInTwoJoints(baseUrl, { flag: false });
+  const launchAt = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const applied = await runExternalFreezeLaunchBackfill({ apply: true, launchAt });
+  assert.equal(applied.inserted, 1);
+  const graceEnd = launchAt.getTime() + EXTERNAL_FREEZE_LAUNCH_GRACE_MS;
+  assert.equal((await storedFreezeAt(world.s.id))?.getTime(), graceEnd);
+  return { ...world, graceEnd };
+}
+
+test("regression: flag off, a backfilled freeze row survives the sweep and every reconcile; the flag turned on later keeps the original freeze_at (no re-freeze at now)", async ({ app }) => {
+  const { sOwner, s, first, graceEnd } = await backfilledWhileFlagOff(app.baseUrl);
+
+  // The sweep (staged rollout: the flag off for this server) leaves the row and its time.
+  const swept = await sweepExternalChannelFreezes();
+  assert.equal(swept.cleared, 0);
+  assert.equal((await storedFreezeAt(s.id))?.getTime(), graceEnd, "sweep, flag off: row and freeze_at kept");
+
+  // A clearOnly reconcile: archiving one of its channels (another external channel, a Guest's).
+  const guestChannel = await seedBoundGuest({ serverId: s.id, userId: (await person(app.baseUrl, "fz-off-guest")).id });
+  await archiveChannel(guestChannel, sOwner.id);
+  assert.equal((await storedFreezeAt(s.id))?.getTime(), graceEnd, "archive, flag off: kept");
+  // A billing change, and a direct reconcile.
+  assert.equal(await reconcileExternalFreezeForBillingChange(s.id), "none");
+  assert.equal(await reconcileServerExternalFreeze(getDb(), s.id, new Date()), "none");
+  assert.equal((await storedFreezeAt(s.id))?.getTime(), graceEnd, "billing change / reconcile, flag off: kept");
+  // The read side ignores the row while the flag is off.
+  assert.equal((await post(app.baseUrl, sOwner, s.id, first.targetLocal.id)).status, 200);
+
+  // The flag turned on: the sweep keeps the original grace, not now.
+  await enableExternalChannelsFlag(s.id);
+  const afterOn = await sweepExternalChannelFreezes();
+  assert.equal(afterOn.frozen, 0);
+  assert.equal(afterOn.cleared, 0);
+  assert.equal((await storedFreezeAt(s.id))?.getTime(), graceEnd, "flag on: the backfilled freeze_at, never now");
+  assert.equal(await reconcileServerExternalFreeze(getDb(), s.id, new Date()), "kept");
+  assert.equal((await storedFreezeAt(s.id))?.getTime(), graceEnd);
+  // Still in its grace: writes allowed, the metadata shows the coming freeze.
+  assert.equal((await post(app.baseUrl, sOwner, s.id, first.targetLocal.id)).status, 200);
+  assert.equal(await getExternalFreezeOfChannel(first.targetLocal.id, s.id), null);
+  assert.deepEqual(await getExternalFreezeOfChannel(first.targetLocal.id, s.id, new Date(graceEnd)), { freezeAt: new Date(graceEnd) });
+});
+
+test("regression: flag on, a backfilled server down to one external channel loses its row", async ({ app }) => {
+  const { sOwner, s, second } = await backfilledWhileFlagOff(app.baseUrl);
+  await enableExternalChannelsFlag(s.id);
+  await disconnectJointChannel(second.targetLocal.id, sOwner.id);
+  assert.equal(await storedFreezeAt(s.id), null, "the disconnect's reconcile deletes it");
+});
+
+test("regression: flag off, a deleted server's row is still deleted by the sweep", async ({ app }) => {
+  const { s } = await backfilledWhileFlagOff(app.baseUrl);
+  await getDb().update(servers).set({ deletedAt: new Date() }).where(eq(servers.id, s.id));
+  const swept = await sweepExternalChannelFreezes();
+  assert.equal(swept.cleared, 1);
+  assert.equal(await storedFreezeAt(s.id), null);
+});
+
+test("regression: flag off, an upgrade to Pro leaves the row (the read side ignores it); once the flag is on, the sweep clears it", async ({ app }) => {
+  const { sOwner, s, first, graceEnd } = await backfilledWhileFlagOff(app.baseUrl);
+  await setPlan(s.id, "pro");
+  assert.equal(await reconcileExternalFreezeForBillingChange(s.id), "none");
+  assert.equal((await sweepExternalChannelFreezes()).cleared, 0);
+  assert.equal((await storedFreezeAt(s.id))?.getTime(), graceEnd, "flag off: untouched");
+  assert.equal(await getExternalFreezeOfChannel(first.targetLocal.id, s.id, new Date(graceEnd)), null, "ignored while the flag is off");
+  assert.equal((await post(app.baseUrl, sOwner, s.id, first.targetLocal.id)).status, 200);
+  await enableExternalChannelsFlag(s.id);
+  assert.equal((await sweepExternalChannelFreezes()).cleared, 1);
+  assert.equal(await storedFreezeAt(s.id), null, "flag on and paid: cleared");
+});
 
 test("the write gate re-checks the rule: a server that left the limit on a path that did not reconcile writes at once", async ({ app }) => {
   await markLaunchBackfillDone();
@@ -466,8 +546,9 @@ test("unarchiving a joint channel is refused when a free server in it already ha
   await getDb().update(serverAgentMembers).set({ role: "admin" }).where(and(eq(serverAgentMembers.serverId, h2.id), eq(serverAgentMembers.agentId, agent.id)));
   await addAgent(j2.hostLocal.id, agent.id);
   const byAgent = await setChannelArchivedForAgent({ actor: { id: agent.id, name: agent.name, serverId: h2.id }, serverId: h2.id, channelId: j2.hostLocal.id, archived: false });
-  assert.equal(byAgent.status, 409, JSON.stringify(byAgent.body));
-  assert.deepEqual(byAgent.body, { error: OTHER_SERVER, code: "free_external_limit", limitSide: "connecting", limitServerId: s.id });
+  assert.equal(byAgent.status, 409, JSON.stringify(byAgent));
+  // The agent route answers the refusal alone: no agent client reads limitSide/limitServerId (the web reads them on its own routes).
+  assert.deepEqual("refusal" in byAgent ? byAgent.refusal : byAgent, { error: OTHER_SERVER, code: "free_external_limit" });
 
   // Stopped by another organisation's limit, a person and an agent: no paywall hit, for either server (#wg-rbac:#60).
   await paywall.expect(0, "another server's limit");
@@ -523,4 +604,54 @@ test("the billing summary counts every external channel the server is in, hosted
   // Archived: not external.
   await getDb().update(channels).set({ archivedAt: new Date() }).where(eq(channels.id, guestChannel));
   assert.equal(await total(sOwner), 2);
+});
+
+test("the sweep records its counts on the maintenance span (external_channel_freeze.sweep.finished): a flag-off server is not_applicable, then over once the flag is on", async ({ app }) => {
+  const { s } = await backfilledWhileFlagOff(app.baseUrl);
+  const trace = vi.spyOn(tracing, "safeAddTraceEvent");
+  const finished = () => trace.mock.calls.filter(([name]) => name === "external_channel_freeze.sweep.finished").map(([, attrs]) => attrs());
+  try {
+    const off = await sweepExternalChannelFreezes();
+    assert.deepEqual(finished(), [{
+      outcome: "ok",
+      backfill_done: true,
+      scanned_count: off.scanned,
+      over_count: off.over,
+      not_applicable_count: off.notApplicable,
+      frozen_count: off.frozen,
+      cleared_count: off.cleared,
+    }]);
+    assert.ok(off.notApplicable >= 1, "flag off: counted as not applicable");
+
+    trace.mockClear();
+    await enableExternalChannelsFlag(s.id);
+    const on = await sweepExternalChannelFreezes();
+    assert.equal(on.notApplicable, off.notApplicable - 1, "flag on: no longer not applicable");
+    assert.equal(on.over, off.over + 1, "flag on: over");
+    assert.equal(finished()[0]?.not_applicable_count, on.notApplicable);
+    assert.equal(finished()[0]?.over_count, on.over);
+  } finally {
+    trace.mockRestore();
+  }
+});
+
+test("a sweep that throws still records external_channel_freeze.sweep.finished, with outcome error, and rethrows", async () => {
+  const trace = vi.spyOn(tracing, "safeAddTraceEvent");
+  const db = vi.spyOn(dbModule, "getDb").mockImplementationOnce(() => { throw new Error("db down"); });
+  try {
+    await assert.rejects(sweepExternalChannelFreezes(), /db down/);
+    const finished = trace.mock.calls.filter(([name]) => name === "external_channel_freeze.sweep.finished").map(([, attrs]) => attrs());
+    assert.deepEqual(finished, [{
+      outcome: "error",
+      backfill_done: false,
+      scanned_count: 0,
+      over_count: 0,
+      not_applicable_count: 0,
+      frozen_count: 0,
+      cleared_count: 0,
+    }]);
+  } finally {
+    db.mockRestore();
+    trace.mockRestore();
+  }
 });
